@@ -1,0 +1,317 @@
+"""アシストモデル タスク別プロンプト管理（§7.1.2）
+
+アシストモデルの4タスク（RAG判定・クエリ拡張・ツール呼び出し・ノート進化）
+それぞれに専用プロンプトを持ち、読込み・更新・履歴管理を行う。
+SystemPromptManager のアシスト版。全エディション共通。
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+from backend.free.agent._prompt_store_helpers import (
+    archive_to_history,
+    body_exists,
+    list_history_entries,
+    read_body,
+    read_history_version,
+    read_meta_dict,
+    write_body,
+    write_meta_dict,
+)
+from backend.free.agent.prompt_utils import (
+    dedupe_paragraphs,
+    restore_protected_sections,
+    validate_protected_sections,
+)
+from backend.log_config import get_logger
+from backend.utils import utc_now as _now
+
+logger = get_logger("agent.assist_prompt_manager")
+
+
+@dataclass
+class AssistPromptMeta:
+    """アシストプロンプトメタ情報"""
+    task: str
+    version: int = 1
+    updated_at: str = ""
+    source: str = "default"  # "default" | "manual" | "evolution"
+    fitness_score: float = 0.0
+
+
+# デフォルトプロンプト
+DEFAULT_ASSIST_PROMPTS: dict[str, str] = {
+    "rag_judge": """\
+# RAG 検索必要性判定
+
+ユーザーのクエリを分析し、RAG 検索が必要かどうかを判定してください。
+
+## 判定基準
+- 事実情報・知識を必要とする質問 → search_needed
+- 雑談・挨拶・感想 → no_search
+- プロジェクト固有の情報を問う質問 → search_needed
+- 直前の会話文脈で回答可能 → no_search
+
+<!-- PROTECTED -->
+## 出力形式
+"search_needed" または "no_search" のみを出力してください。
+<!-- /PROTECTED -->
+""",
+    "query_expand": """\
+# RAG 品質判定・クエリ拡張
+
+検索結果の品質を判定し、不十分な場合はクエリを拡張してください。
+
+## 判定基準
+- 検索結果がクエリに対して十分な情報を含む → sufficient
+- 情報が不足している → 拡張クエリを生成
+
+<!-- PROTECTED -->
+## 出力形式
+- 十分な場合: "sufficient"
+- 不十分な場合: 拡張されたクエリ文字列を出力
+<!-- /PROTECTED -->
+""",
+    "tool_call": """\
+# ツール呼び出し判定
+
+ユーザーのリクエストを分析し、ツールの使用が必要かどうかを判定してください。
+
+## 重要な前提
+- **知識・How-to 質問への文書検索 (カートリッジ・RAG・記憶) は別パスで自動的に実行されます**。あなたが知識検索のためにツールを呼ぶ必要はありません。
+- ツールは「ファイル操作」「コマンド実行」「Web 取得」「明示的な履歴検索」等、明確な副作用や外部アクセスを伴う操作のみで使用します。
+
+## 判定基準
+- ファイルの読み書きが明示的に必要 → 該当ツールを選択
+- シェルコマンドの実行が必要 → run_command を選択
+- コード検索・ファイル検索が必要 → search_code を選択
+- URL の取得・ウェブアクセスが必要 → fetch_url
+- ユーザーが **明示的に** 過去の会話履歴を検索したいと述べた場合 → search_history
+- 知識・説明・How-to・使い方・手順・とは・教えて → no_tool
+- 直前の会話で十分回答可能 → no_tool
+
+## 引数の扱い
+- 任意 (optional) の引数は、ユーザーが明示していない場合は含めない (空文字列も含めない)。
+- 日付範囲 (`date_from` / `date_to`) は、ユーザーが具体的な期間を指定した場合のみ設定する。古い既定値や推測値を入れない。
+
+<!-- PROTECTED -->
+## 出力形式
+JSON で出力してください:
+- ツールが必要: {{"tool": "ツール名", "args": {{"引数名": "値"}}}}
+- ツールが不要: "no_tool"
+
+注意: 利用可能なツール一覧はシステムプロンプトに動的に注入されます。
+一覧にないツール名を出力しないでください。
+<!-- /PROTECTED -->
+""",
+    "note_evolve": """\
+# メモリノート文脈説明生成
+
+以下のメモリノートの暗黙的な意味・トピック・重要性を捉えた簡潔な文脈説明を生成してください。
+この説明は将来の検索精度向上に使用されます。
+
+## 要件
+- 1〜2文で簡潔に記述
+- ノートの核心的な情報を要約
+- 検索キーワードとして機能する語彙を含める
+
+<!-- PROTECTED -->
+## 出力形式
+文脈説明のみを出力してください。前置きや説明は不要です。
+<!-- /PROTECTED -->
+""",
+}
+
+
+class AssistPromptManager:
+    """アシストモデル タスク別プロンプト管理
+
+    4タスクそれぞれに .md（本文）+ .meta.json（メタ情報）を管理する。
+    SystemPromptManager と同じパターンだが、モードではなくタスク単位。
+    """
+
+    TASKS = ["rag_judge", "query_expand", "tool_call", "note_evolve"]
+
+    def __init__(self, prompt_dir: Path) -> None:
+        """
+        Args:
+            prompt_dir: プロンプトディレクトリ（local/prompts/）
+        """
+        self.prompt_dir = prompt_dir
+        self.contents: dict[str, str] = {}
+        self.metas: dict[str, AssistPromptMeta] = {}
+        self._load_all()
+
+    def _load_all(self) -> None:
+        """起動時に全タスクのプロンプトとメタ情報をロード"""
+        self.prompt_dir.mkdir(parents=True, exist_ok=True)
+        for task in self.TASKS:
+            key = f"assist_{task}"
+            if body_exists(self.prompt_dir, key):
+                self.contents[task] = read_body(self.prompt_dir, key)
+                meta_data = read_meta_dict(self.prompt_dir, key)
+                if meta_data is not None:
+                    self.metas[task] = self._meta_from_dict(meta_data, task)
+                else:
+                    self.metas[task] = AssistPromptMeta(task=task)
+                    self._save_meta(task)
+            else:
+                self._create_default(task)
+
+    def get_assist_prompt(self, task: str) -> str:
+        """タスク別プロンプト本文を取得
+
+        Args:
+            task: タスク名 ("rag_judge" | "query_expand" | "tool_call" | "note_evolve")
+
+        Returns:
+            プロンプト本文
+
+        Raises:
+            ValueError: 不明なタスク名
+        """
+        if task not in self.contents:
+            raise ValueError(f"Unknown assist task: {task}")
+        return self.contents[task]
+
+    def get_meta(self, task: str) -> AssistPromptMeta:
+        """メタ情報を取得"""
+        if task not in self.metas:
+            raise ValueError(f"Unknown assist task: {task}")
+        return self.metas[task]
+
+    def update_assist_prompt(
+        self,
+        task: str,
+        content: str,
+        fitness: float,
+    ) -> None:
+        """Level 1 進化: 最良候補を採用
+
+        保護セクション（<!-- PROTECTED --> マーカー）が現在のプロンプトに含まれている場合、
+        進化候補がそれを維持しているか検証し、欠落時は強制復元する。
+
+        Args:
+            task: タスク名
+            content: 新しいプロンプト本文
+            fitness: 適応度スコア
+        """
+        if task not in self.TASKS:
+            raise ValueError(f"Unknown assist task: {task}")
+
+        # 保護セクション最終ゲート
+        from backend.free.agent.prompt_manager import _normalized_equal
+        current = self.contents.get(task, "")
+
+        # 段落レベル重複を最終正規化
+        content = dedupe_paragraphs(content)
+
+        if not validate_protected_sections(current, content):
+            logger.warning(
+                "Evolved assist prompt for %s lost protected sections, force-restoring",
+                task,
+            )
+            content = restore_protected_sections(current, content)
+            content = dedupe_paragraphs(content)
+
+        # 意味的同一性ガード - 正規化後 current と同じなら no-op
+        if _normalized_equal(current, content):
+            logger.warning(
+                "Evolved assist prompt for %s is semantically identical to current "
+                "(fitness=%.3f), skipping update",
+                task, fitness,
+            )
+            return
+
+        self._archive_current(task)
+        write_body(self.prompt_dir, f"assist_{task}", content)
+        self.contents[task] = content
+        meta = self.metas[task]
+        meta.version += 1
+        meta.updated_at = _now()
+        meta.source = "evolution"
+        meta.fitness_score = fitness
+        self._save_meta(task)
+        logger.info(
+            "Assist prompt evolved: task=%s, version=%d, fitness=%.3f",
+            task, meta.version, fitness,
+        )
+
+    def update_manual(self, task: str, content: str) -> None:
+        """手動編集によるプロンプト更新"""
+        if task not in self.TASKS:
+            raise ValueError(f"Unknown assist task: {task}")
+        self._archive_current(task)
+        write_body(self.prompt_dir, f"assist_{task}", content)
+        self.contents[task] = content
+        meta = self.metas[task]
+        meta.version += 1
+        meta.updated_at = _now()
+        meta.source = "manual"
+        self._save_meta(task)
+        logger.info("Assist prompt manual update: task=%s, version=%d", task, meta.version)
+
+    def get_history(self, task: str) -> list[dict]:
+        """タスクの履歴一覧を取得"""
+        if task not in self.TASKS:
+            raise ValueError(f"Unknown assist task: {task}")
+        return list_history_entries(self.prompt_dir, f"assist_{task}")
+
+    def rollback(self, task: str, version: int) -> None:
+        """特定バージョンにロールバック"""
+        if task not in self.TASKS:
+            raise ValueError(f"Unknown assist task: {task}")
+        content = read_history_version(self.prompt_dir, f"assist_{task}", version)
+        self._archive_current(task)
+        write_body(self.prompt_dir, f"assist_{task}", content)
+        self.contents[task] = content
+        meta = self.metas[task]
+        meta.version += 1
+        meta.updated_at = _now()
+        meta.source = "manual"
+        self._save_meta(task)
+        logger.info(
+            "Assist prompt rollback: task=%s to v%03d, new version=%d",
+            task, version, meta.version,
+        )
+
+    def _archive_current(self, task: str) -> None:
+        """現在のプロンプトを history/ に退避"""
+        if task not in self.contents:
+            return
+        archive_to_history(
+            self.prompt_dir,
+            f"assist_{task}",
+            self.metas[task].version,
+            self.contents[task],
+        )
+
+    def _create_default(self, task: str) -> None:
+        """デフォルトプロンプトを生成"""
+        content = DEFAULT_ASSIST_PROMPTS.get(
+            task, f"# assist_{task}\nDefault assist prompt.\n",
+        )
+        write_body(self.prompt_dir, f"assist_{task}", content)
+        self.contents[task] = content
+        self.metas[task] = AssistPromptMeta(
+            task=task, version=1, updated_at=_now(), source="default",
+        )
+        self._save_meta(task)
+        logger.info("Created default assist prompt: task=%s", task)
+
+    def _save_meta(self, task: str) -> None:
+        """メタ情報を JSON ファイルに保存 (infra 層 `_prompt_store_helpers` に委譲)"""
+        write_meta_dict(self.prompt_dir, f"assist_{task}", asdict(self.metas[task]))
+
+    @staticmethod
+    def _meta_from_dict(data: dict, task: str) -> AssistPromptMeta:
+        """`read_meta_dict` の結果を `AssistPromptMeta` にハイドレートする (純粋関数)"""
+        return AssistPromptMeta(
+            task=data.get("task", task),
+            version=data.get("version", 1),
+            updated_at=data.get("updated_at", ""),
+            source=data.get("source", "default"),
+            fitness_score=data.get("fitness_score", 0.0),
+        )

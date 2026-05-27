@@ -1,0 +1,110 @@
+# EvorefMem 自動 Pin 検出のトリガ語辞書
+#
+# 構成:
+#   positive:  pin を発火させる肯定形トリガ語 (mode 別 + common)
+#   negative:  pin を抑制する否定形トリガ語 (両モード共通)
+#
+# マッチング規則 (pin_detector.py):
+#   1. content を NFKC + lowercase 化
+#   2. negative に該当 → pin 発火しない (negated)
+#      - 「覚えなくていい」「忘れて」等。誤発火対策
+#   3. positive (該当 mode) または positive.common に該当 → pin 発火
+#   4. マッチした最初のトリガ語を ``reason`` に格納する
+#
+# i18n: ja / en の両言語をフラットに混在させる。文字列マッチなので
+# 言語切替なしで両方拾える。新言語追加時はここに追記すれば
+# pin_detector.py の変更不要。
+#
+# 注意: 否定語は positive より優先される (negative-first 評価)。
+# 「忘れないで」のように肯定意図でも "忘れ" を含むケースは
+# negative パターンに含めない (= positive で拾う)。
+
+positive:
+  common:
+    # 強いマーカー (どのモードでも高優先)
+    - 重要
+    - 重要だ
+    - 重要です
+    - 大事
+    - 大事だ
+    - 大事です
+    - 必須
+    - マスト
+    - 絶対
+    - 必ず守って
+    - "忘れないで"
+    - "忘れないでください"
+    - 忘れずに
+    - 記憶して
+    - 記憶しておいて
+    - メモして
+    - "important"
+    - "must remember"
+    - "do not forget"
+    - "don't forget"
+    - "never forget"
+    - "always remember"
+    - "keep in mind"
+    - "make a note"
+    - "take note"
+
+  chat:
+    # チャットモード固有: 個人的事実・嗜好・感情を「覚えて」と言うパターン
+    - 覚えて
+    - 覚えてて
+    - 覚えておいて
+    - 覚えておいてください
+    - 覚えてほしい
+    - "覚えていてね"
+    - ピン留め
+    - "remember this"
+    - "remember that"
+    - "please remember"
+    - "pin this"
+
+  coding:
+    # コーディングモード固有: ルール・規約・制約を強調する語
+    - ルール
+    - 規約
+    - 制約
+    - 守ってください
+    - 必ず適用
+    - 常に
+    - "プロジェクトルール"
+    - "必須要件"
+    - "rule:"
+    - "convention:"
+    - "always use"
+    - "must use"
+    - "never use"
+    - "do not use"
+    - "don't use"
+    - "constraint:"
+    - "policy:"
+
+negative:
+  common:
+    # Pin 発火を抑制する否定形 (覚えなくていい等)
+    - 覚えなくていい
+    - 覚えなくて良い
+    - 覚えなくてもいい
+    - 覚えなくてもよい
+    - 覚えないで
+    - 覚えないでください
+    - 忘れて
+    - 忘れていい
+    - 忘れていいよ
+    - 忘れてください
+    - 忘れてもいい
+    - もう覚えなくて
+    - 記憶しなくていい
+    - 記憶しないで
+    - "forget it"
+    - "forget that"
+    - "don't remember"
+    - "do not remember"
+    - "no need to remember"
+    - "you can forget"
+    - "ignore this"
+    - "nevermind"
+    - "never mind"

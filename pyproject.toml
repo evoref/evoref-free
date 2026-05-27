@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evoref"
+dynamic = ["version"]
+description = "自己進化型ローカルLLMアシスタント"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = []  # 実行時依存は backend/requirements.txt で管理
+
+[project.scripts]
+evoref = "evoref_cli:main"
+
+[tool.setuptools]
+py-modules = ["evoref_cli"]
+
+# version SSOT は backend/free/__version__.py
+# 一括 bump は `python scripts/bump_version.py <new-version>` 経由。
+[tool.setuptools.dynamic]
+version = { attr = "backend.free.__version__.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["backend*"]
+
+# === テストカバレッジ計測 (pytest-cov / coverage) ===
+# ローカル実行前提
+# Free 版ベースラインを取得するため backend/pro/* は除外する。
+# 詳細: docs/c_08_testing_strategy.md §7.6
+[tool.coverage.run]
+source = ["backend"]
+branch = true
+omit = [
+    "*/tests/*",
+    "*/conftest.py",
+    "backend/pro/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+
+# === 内部時刻は UTC 固定、naive datetime を禁止 ===
+# `datetime.now()` (DTZ005) / `datetime.utcnow()` (DTZ003) / `datetime()` (DTZ001)
+# の直接使用を lint で検知する。必要な場合は `backend.utils.utc_now_dt()` を経由する。
+[tool.ruff]
+target-version = "py312"
+extend-exclude = [
+    "frontend",
+    "local",
+    "models",
+    "docs",
+    "scripts",
+]
+
+[tool.ruff.lint]
+select = ["DTZ001", "DTZ003", "DTZ005"]
+
+[tool.ruff.lint.per-file-ignores]
+# 例外なし。naive datetime が必要な場合は `backend.utils.utc_now_dt()` を使うこと。

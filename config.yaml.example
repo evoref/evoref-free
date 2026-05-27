@@ -1,0 +1,1010 @@
+# ============================================================
+# evoref 設定ファイル テンプレート
+# ============================================================
+# このファイルを config.yaml にコピーして、環境に合わせて編集してください。
+#   cp config.yaml.example config.yaml
+#
+# 詳細は docs/02_system_architecture.md セクション 2.3 を参照。
+# ============================================================
+
+# ===== 個体名称 =====
+# PC単位で動作する個体としての設定。
+# 名前はシステムプロンプト・UI・CLIに反映される。
+instance:
+  name: evoref                    # このPC上のアシスタントの名前（自由に設定可）
+  # 例: name: アリス / name: Jarvis / name: evo-work
+
+# ===== サーバー設定 =====
+server:
+  host: 0.0.0.0
+  port: 8000                      # FastAPI バックエンドのポート
+  frontend_port: 5173             # SvelteKit 開発サーバーのポート
+  timeout: 30                     # リクエストタイムアウト（秒）
+
+# ===== 実行環境 =====
+# GPU / CPU 等、llama-server 群を起動するハードウェアの制約を表現する。
+# `scripts/launch_llama.py --all` が参照し、GPU オフロード対象モデルの
+# VRAM 使用量推定合計がこの予算を超える場合は警告してアボートする。
+# `--force` オプションで強制起動可能。main.py lifespan でも起動時に
+# GPU/CPU 配置サマリを INFO ログに出力する。
+runtime:
+  # VRAM のソフト上限 (MB)。null なら検査を行わない (従来挙動と同一)。
+  # 例: RTX 3060 (12GB) → 11000 程度、RTX 4060 Ti (8GB) → 7000 程度が目安。
+  total_vram_budget_mb: null
+
+  # llama-server の最低 build 番号。null なら検査を行わない
+  # 形式: "b<整数>" (例: "b8946") または "<整数>" (例: "8946")。
+  # b8946 は CVE-2026-21869 (server: heap-buffer-overflow on negative
+  # n_discard) と SWA-full ロジック修正を取り込んだ最低ビルド。
+  # `scripts/launch_llama.py` 起動時に `llama-server --version` を実行し、
+  # 抽出した build 番号と比較する。検出失敗時 (カスタムビルド等) は警告のみ。
+  min_llamacpp_build: "b8946"
+  # true の場合、最低 build 未満を検出すると exit code 3 でアボート。
+  # false の場合は stderr 警告のみで起動継続。
+  enforce_min_llamacpp_build: false
+
+  # llama-fit-params -fitp on ベースの Tier 1 VRAM 推定
+  # ``--fit-print on`` で device 別の使用 MiB (model / context / compute) を
+  # stdout に出力する。本フラグが true で同バイナリが利用可能なら、モデル
+  # 単位で正確な VRAM 推定値が得られる。バイナリ未存在 / タイムアウト時は
+  # 自動的に Tier 2 (GGUF サイズベースのヒューリスティック) にフォールバック
+  # するため、PATH に通っていなくても従来通り動作する。
+  fit_params_enabled: true              # false で Tier 1 を一律スキップ
+  fit_params_timeout_sec: 10.0          # 1 モデルあたりの subprocess タイムアウト秒数
+  fit_params_binary: "llama-fit-params" # PATH 上のコマンド名または絶対パス
+
+  # llama-server エンドポイント利用ポリシー宣言
+  # "oai-only" (既定) で OpenAI 互換 (/v1/chat/completions / /v1/embeddings /
+  # /v1/rerank / /tokenize / /health / /props) のみ採用、
+  # "messages-allowed" は将来 /v1/messages 採用判断を行った場合の予約値。
+  # 実体の検証は backend/free/tests/test_llama_endpoint_policy.py の静的検査
+  # で担保する。詳細 docs/e_05_llama_server_endpoint_policy.md。
+  llama_endpoint_policy: "oai-only"
+
+  # llama.gpu_layers / assist_model.local.gpu_layers が "auto" の場合に
+  # GPU 物理容量から差し引く Vulkan host buffer 予約量 (MiB)。
+  # iGPU 環境で embed/reranker (CPU モード) が起動時に確保する pinned buffer 用
+  # の余裕。既定 4 GiB は AMD Radeon 890M + 既定の embed/reranker モデル構成での
+  # 実測 ceiling。dedicated GPU でメモリに余裕があれば 0 にしても良い。
+  vulkan_host_buffer_headroom_mib: 4096
+
+  # gpu_layers="auto" 時に実際に自動段階縮小を行う kill switch。
+  # false にすると "auto" 指定があっても従来挙動 (-ngl 999) にフォールバックし
+  # WARNING ログを 1 行出す。GGUF parse や llama-fit-params に異常が出た場合の
+  # 緊急回避用。
+  gpu_auto_tune_enabled: true
+
+# ===== llama.cpp 設定 =====
+# llama-server の起動オプション。scripts/launch_llama.py が読み込む。
+#
+# --- VRAM 見積もり目安（Qwen3.5-9B Q4_K_M, slots=2）---
+# | context_size | cache K/V | KVキャッシュ概算 | モデル+KV 合計 |
+# |-------------|-----------|----------------|--------------|
+# |       4,096 | q8_0/q8_0 |       ~512 MB  |    ~3.2 GB   |
+# |       8,192 | q8_0/q8_0 |      ~1024 MB  |    ~3.7 GB   |
+# |       8,192 | q4_0/q4_0 |       ~512 MB  |    ~3.2 GB   |
+# |      16,384 | q4_0/q4_0 |      ~1024 MB  |    ~3.7 GB   |
+# |      16,384 | q8_0/q4_1 |      ~1280 MB  |    ~4.0 GB   |  ← K/V非対称
+# |      32,768 | q4_0/q4_0 |      ~2048 MB  |    ~4.7 GB   |  ← slots:1推奨
+#
+# --- 長コンテキスト設定レシピ ---
+# ■ 8K コンテキスト（VRAM 4GB〜）:
+#   context_size: 8192, cache_type_k: q8_0, cache_type_v: q8_0
+#
+# ■ 16K コンテキスト（VRAM 6GB〜）:
+#   context_size: 16384, cache_type_k: q8_0, cache_type_v: q4_1, slots: 1
+#   extra_args: ["--rope-scaling", "linear", "--rope-scale", "4"]
+#   ※ モデルの学習時コンテキスト長を超える場合は RoPE スケーリングが必要
+#
+# ■ 32K コンテキスト（VRAM 8GB〜）:
+#   context_size: 32768, cache_type_k: q4_1, cache_type_v: q4_0, slots: 1
+#   extra_args: ["--rope-scaling", "yarn", "--rope-scale", "8"]
+#   ※ YaRN は linear より長距離で安定。品質はモデル依存
+llama:
+  host: localhost
+  port: 8080                      # llama-server のポート
+  context_size: 8192              # -c / コンテキストサイズ
+                                  # 推奨: 4096〜8192（VRAM に応じて調整）
+                                  # 4096 だと fetch_url の長い結果 (Yahoo / news 等) で
+                                  # ツール結果 + RAG + system prompt が context を超過するため、
+                                  # 既定を 8192 に引き上げ。VRAM 余裕があれば 16384 以上も可。
+                                  # 16384以上は cache_type の見直し + RoPE スケーリングを検討
+                                  # モデルの学習時コンテキスト長は GET /props の n_ctx_train で確認可能
+  gpu_layers: 999                 # -ngl / GPU にオフロードするレイヤー数（999=全層、CPU only なら 0）
+  threads: 0                      # -t / スレッド数（0=自動検出）
+  batch_size: 512                 # -b / バッチサイズ
+  flash_attn: true                # -fa / Flash Attention の有効化
+  mlock: false                    # --mlock / モデルを RAM に固定
+  cache_prompt: true              # KVキャッシュ再利用（共通プレフィックスの再計算をスキップ）
+  slots: 2                        # -np / 並列スロット数（1=単一, 2=チャット+バックグラウンド分離）
+                                  # 2: チャットとバックグラウンド処理の KV キャッシュを分離（推奨）
+                                  # 1: VRAM 節約（KV キャッシュ半減）。長コンテキスト時に検討
+  cache_type_k: q8_0              # --cache-type-k / KV key 量子化
+                                  #   f16: 基準（VRAM最大）, bf16: bf16学習モデル向け
+                                  #   q8_0: 推奨（VRAM半減、品質劣化ほぼゼロ）
+                                  #   q5_1/q5_0: 中間（VRAM 65-70%削減）
+                                  #   q4_1: q4_0より高品質, q4_0: 最大圧縮（品質モデル依存）
+                                  #   ※ K は V より量子化に敏感。K: q8_0 / V: q4_1 の非対称設定も有効
+  cache_type_v: q8_0              # --cache-type-v / KV value 量子化（選択肢は cache_type_k と同一）
+  max_tokens: 1024                # チャット応答の最大トークン数（0=無制限、暴走防止に設定推奨）
+  lora_target: auto               # LoRA ターゲット自動判定: auto | "q_proj,v_proj" | "linear_proj" 等（Pro 専用）
+  enable_thinking: false          # 思考トークンの有効化（/no_think 制御、モデル対応時のみ）
+  stream_first_token_timeout_sec: 60.0  # SSE 受信開始までの read timeout (秒)
+                                  # llama-server 再起動直後の冷えた KV キャッシュ + 長プロンプトで
+                                  # prefill が長引く環境 (iGPU 等) では 90〜120 に引き上げる。
+  # --- idle slot offload ---
+  # cache_ram_mib: -1=無制限 / 0=disable / >0=MiB 上限
+  #   上流デフォルト 8192 を黙従しないよう launch_llama.py が常に明示付与する。
+  #   evoref では agentic ワークロード前提で 4096 を既定値とする。
+  # cache_idle_slots: 上流既定 true (idle slot を退避対象にする)。
+  #   false で機構自体を OFF（``--no-cache-idle-slots`` 付与）。
+  # kv_unified: null=auto (cache_ram_mib>0 かつ slots>1 で ``--kv-unified`` 自動付与) /
+  #             true|false で明示上書き。slots>1 で cache-ram を機能させるには unified KV cache が必要。
+  cache_ram_mib: 4096
+  cache_idle_slots: true
+  kv_unified: null
+  # --- self-speculative decoding ---
+  # Pro 限定。``evoref code`` モード (Pro デフォルト) の base モデルで
+  # コーディング系ワークロードのスループット改善を狙う。Free では
+  # ``enabled=true`` でも launch_llama.py 側で warning + 無効化される。
+  # mode の意味:
+  #   "default":      ``--spec-default`` 単独 (上流プリセット ngram-mod, n=24, min=48, max=64)
+  #   "ngram-mod" /
+  #   "ngram-cache" /
+  #   "ngram-simple" /
+  #   "ngram-map-k" /
+  #   "ngram-map-k4v": self-speculative ngram 系 (draft モデル不要)
+  #   "draft-model":   外部 draft モデル経路 (``draft_model_path`` 必須)
+  speculative:
+    enabled: false                # Pro でも opt-in
+    mode: default                 # default | ngram-mod | ngram-cache | ngram-simple | ngram-map-k | ngram-map-k4v | draft-model
+    draft_max: 64                 # ``--draft-max`` (1 サイクルの最大 draft トークン数)
+    draft_min: 48                 # ``--draft-min``
+    draft_p_min: null             # ``--draft-p-min`` (greedy 採択の確率閾値、null=未指定)
+    ctx_size_draft: 0             # ``-cd`` (0 = model から取得、上流既定)
+    ngram_size_n: 24              # ``--spec-ngram-size-n``
+    ngram_size_m: null            # ``--spec-ngram-size-m`` (null=未指定)
+    # mode="draft-model" 時のみ使用
+    draft_model_path: null        # 外部 draft GGUF パス (相対 / 絶対)
+    gpu_layers_draft: null        # ``-ngld`` (null=auto, 整数, "all" を許容)
+  extra_args: []                  # 上記以外の任意オプションを文字列リストで追加
+  # --- RoPE スケーリング（モデルの学習時コンテキスト長を超える場合）---
+  # linear: シンプル、短〜中距離向け
+  #   例: ["--rope-scaling", "linear", "--rope-scale", "2"]  # context_size × 2
+  # yarn: 長距離で安定、品質劣化が少ない
+  #   例: ["--rope-scaling", "yarn", "--rope-scale", "4"]    # context_size × 4
+  # ※ スケール倍率 = 目標コンテキスト長 ÷ モデルの学習時コンテキスト長
+
+# ===== モード別生成パラメータ =====
+# ベースモデル (= チャット用) + コーディング用モデル の 2 モデル構成。
+# - chat: 常に model_paths.base_model を使用 (独立 model フィールド無し)
+# - coding: 生成パラメータのみ。モデルパスは model_paths.coding_model に指定
+modes:
+  chat:
+    temperature: 0.7                # 生成温度（0.0〜2.0）— 高いほど多様な応答
+    top_p: 0.9                      # Top-P サンプリング（0.0〜1.0）
+    top_k: 40                       # Top-K サンプリング（0=無効、1〜1000）
+    presence_penalty: 0.0           # 存在ペナルティ（-2.0〜2.0）— 正で話題の多様性を促進
+  coding:
+    temperature: 0.3                # コーディングは低温度で正確性重視
+    top_p: 0.95                     # やや高めで十分な候補を確保
+    top_k: 20                       # 低めで的確なトークン選択
+    presence_penalty: 0.0           # コーディングではペナルティなし
+
+# ===== CLI 設定 =====
+# CLI が FastAPI バックエンドに HTTP リクエストを送る際のタイムアウト (秒)。
+# カートリッジ install/rebuild/create はサーバ側の処理時間が長い
+# ため、default より大きい値を設定している。
+cli:
+  timeouts:
+    default: 30                   # 一般的な GET/DELETE 系リクエスト
+    install: 300                  # /cartridges/install (ベクトル化を含む)
+    rebuild: 300                  # /cartridges/{id}/rebuild
+    create: 600                   # /cartridges/create (チャンク生成 + 埋め込み)
+
+# ===== テーマ設定 =====
+# 統合テーマシステム（GUI + CLI 両対応）。詳細は docs/c_11_theme_system.md 参照。
+theme:
+  active: ''                      # 有効なテーマ ID（空文字列ならテーマ未適用、frontend 既定 CSS で描画）
+  color_mode: dark                # dark / light
+  trusted: []                     # 信頼済み外部テーマ ID リスト（slots / cli-modules を有効化したい ID を明示登録）
+  cli_layout_mode: auto           # auto / split / sequential
+                                  # auto: テーマの cli-theme.json に従う
+                                  # split: 画面分割（上部スクロール出力 + 下部固定入力）
+                                  # sequential: 従来の逐次出力
+
+# ===== モデルパス =====
+# GGUF モデルファイルのパス。
+# 相対パスはプロジェクトルートからの相対、絶対パスはそのまま使用。
+model_paths:
+  base_model: models/Qwen3.5-9B-Q4_K_M.gguf         # ベース GGUF モデル（download_model.py が自動配置）
+  assist_model: models/Qwen3.5-4B-Q4_K_M.gguf       # アシスト GGUF モデル（メモリ・RAG処理用）
+  embed_model: models/Qwen3-Embedding-0.6B-Q8_0.gguf # 埋め込み用 GGUF モデル（llama-cpp バックエンド用）
+  reranker_model: models/Qwen3-Reranker-4B.Q5_K_M.gguf  # リランカー用 GGUF モデル（Qwen3-Reranker-4B、instruction-aware）
+  coding_model: null                                 # コーディングモード用 GGUF（null/空欄 = base_model にフォールバック）
+
+# ===== ベースモデル移行 / 起動時整合性チェック =====
+model_migration:
+  # true にすると local/model_state.json と model_paths.base_model の
+  # ファイル名不一致を検出したとき RuntimeError で起動をブロックする。
+  # false の場合は ERROR ログ + /api/model/state 経由で警告のみ。
+  # ベースモデル切替は必ず /migrate-model 経由で行うこと。
+  strict_startup_check: false
+  # true にすると起動時 mismatch を検出した際に自動マイグレーションを
+  # 実行する。LoRA アーカイブ・経験バッファ更新・
+  # プロンプト meta / eval_core リセット・model_state.json 更新を一括実行。
+  # auto_migrate と strict の両方を true にした場合は auto_migrate を
+  # 優先し、失敗したときのみ RuntimeError で起動をブロックする。
+  auto_migrate_on_startup: false
+
+# ===== llama-server プロセス管理 =====
+# enabled=true で lifespan 起動時に 4 種 (base/assist/embedding/reranker) の
+# llama-server を自動 spawn し、`POST /api/model/{component}/migrate` 実行時に
+# 自動再起動 + クライアント差し替えを行う。false (デフォルト) の場合は
+# 従来通り `scripts/launch_llama.py` を別途実行するワークフロー互換。
+process_manager:
+  enabled: false           # 自動 spawn / 自動再起動を有効化
+  health_timeout: 60       # 起動後ヘルスチェック待機時間 (秒)
+  stop_timeout: 10         # SIGTERM 後のグレースフル終了待機時間 (秒)
+
+# ===== ローカルパス（読み書き）=====
+# データ・状態ファイルのパス。
+# LocalPathsConfig は extra='forbid' のため、未定義キーや typo は起動時に
+# ValidationError で検出される。
+local_paths:
+  themes_dir: local/themes/              # テーマパッケージディレクトリ
+  # LoRA / アシスト LoRA / 埋め込み LoRA (Pro 限定機能 — Free では未使用だが PathResolver が参照する)
+  lora_adapter: local/models/adapter.gguf                          # ベース LoRA アダプタ
+  lora_versions_dir: local/lora_versions/                          # ベース LoRA スナップショット
+  lora_archive_dir: local/lora_archive/                            # ベース LoRA アーカイブ (古い世代)
+  assist_lora_adapter: local/models/assist_adapter.gguf            # アシスト LoRA アダプタ
+  assist_lora_versions_dir: local/models/assist_lora_versions/     # アシスト LoRA スナップショット
+  embed_lora_adapter: local/models/embed_adapter.gguf              # 埋め込み LoRA アダプタ
+  embed_lora_versions_dir: local/models/embed_lora_versions/       # 埋め込み LoRA スナップショット
+  # RAG / メモリ
+  vectors_dir: local/vectors/                # RAG ベクトルインデックス
+  knowledge_dir: local/knowledge/            # RAG 用ソースドキュメント
+  memory_dir: local/memory/                  # メモリシステム永続化
+  prompts_dir: local/prompts/                # モード別システムプロンプト
+  cartridges_dir: local/cartridges/          # カートリッジ（パッケージ + 埋め込み）
+  history_dir: local/history/                # 会話履歴アーカイブ
+  triggers_dir: local/triggers/              # EvorefMem トリガ辞書の user override 先 (任意、空ディレクトリで可)
+  # 学習・経験・状態
+  experience_file: local/experience.json             # ベースモデル経験バッファ
+  experience_assist_file: local/experience_assist.json   # アシストモデル経験バッファ
+  eval_core_file: local/eval_core.json               # ベースモデル コア評価セット
+  eval_assist_file: local/eval_assist.json           # アシストモデル コア評価セット
+  learned_patterns_file: local/learned_patterns.json # 学習済みパターン検出キーワード
+  model_state_file: local/model_state.json           # モデル切替・LoRA 装着状態の永続化
+  local_state_file: local/state.json                 # EvorefMem ローカル状態
+  # マイグレーション
+  migration_archive_dir: local/migration_archive/    # SchemaMigrator バックアップ / 旧 prompts 退避先 (EvorefMem 移行で 30 日保持)
+
+# ===== 会話履歴設定 =====
+history:
+  auto_save: true                 # 自動保存の有効/無効
+  checkpoint_interval: 10         # チェックポイント間隔（ターン数）
+  retention_full_days: 90         # 原文保持期間（日）
+  retention_compressed_days: 365  # 圧縮保持期間（日）
+  max_storage_mb: 200             # 履歴全体の上限サイズ（MB）
+  compress_preview_chars: 100     # 圧縮時に保持するアシスタントターンの先頭文字数
+  summary_batch_size: 5           # sleep-time での要約生成バッチサイズ
+
+# ===== RAG 設定 =====
+rag:
+  chunk_size: 512                 # チャンクサイズ（トークン数）
+  chunk_overlap: 128              # チャンク間オーバーラップ（トークン数）
+  chunking_strategy: semantic     # チャンキング方式: semantic（推奨）/ fixed
+  semantic_min_chunk: 64          # セマンティックチャンクの最小トークン数
+  semantic_max_chunk: 512         # セマンティックチャンクの最大トークン数
+  top_k: 5                        # 検索結果の上位 K 件
+  hybrid_search: true             # BM25+Vector ハイブリッド検索（false でベクトルのみ）
+  # NOTE: 以下の重み (0.3 / 0.7) は Qwen3-Embedding の vector 品質を前提に
+  # 調整した既定値。BGE-M3 / nomic-embed-text 等に切替えた場合は BM25 と
+  # vector の相対品質が変化するため、ベンチで再測定して再調整すること。
+  bm25_weight: 0.3                # RRF 不使用時の BM25 スコア重み（vector_weight と合計 1.0）
+  vector_weight: 0.7              # RRF 不使用時の Vector スコア重み
+  fusion_method: rrf              # スコア融合方式: rrf（推奨）/ weighted
+  rrf_k: 60                       # RRF 平滑化定数（論文推奨値: 60）
+  # --- BM25 チューニング ---
+  bm25_k1: 1.5                    # BM25 の TF 飽和度パラメータ（短チャンクなら 1.0〜1.2）
+  bm25_b: 0.75                    # BM25 の長さ正規化係数（チャンク長が均一なら 0.5 前後）
+  bm25_delta: 1.0                 # BM25Plus の delta 項
+  bm25_use_trigrams: false        # true にすると文字 3-gram も併用（index サイズ増）
+  bm25_split_ascii: true          # camelCase / snake_case を分割して部分一致向上
+  # bm25_stopword_bigrams:
+  #   null → 既定ストップワード（日本語助詞中心の bi-gram 集）を使用
+  #   []   → ストップワード無効
+  #   list → 指定リストで上書き
+  bm25_stopword_bigrams: null
+  # --- Contextual Retrieval ---
+  # チャンク登録時にアシストモデルでドキュメント文脈プレフィックスを生成し、
+  # 埋め込み・BM25 の両方で検索精度を向上させる。
+  # 参考: https://www.anthropic.com/news/contextual-retrieval
+  contextual_prefix:
+    enabled: true                # Contextual Retrieval の有効/無効（アシストモデル必須）
+    # eager: Sleep-time Step 5.8 で未生成 chunk を一括生成 (従来動作)
+    # lazy : retrieval 時に hit した chunk のみ on-demand 生成 (大規模カートリッジ向け)
+    mode: eager
+    max_tokens: 128              # プレフィックス生成の最大トークン数
+    max_doc_chars: 6000          # プレフィックス生成時のドキュメント全文上限文字数（超過時はトランケート）。assist_model.local.context_size を超えないよう注意
+    batch_size: 10               # sleep-time で 1 回に処理するチャンク数上限
+    # 生成対象の最小チャンクトークン数。短文は prefix の retrieval 寄与が薄いためスキップ
+    min_chunk_tokens: 200
+    # lazy モード時: retrieval でこの回数以上 hit した chunk のみ prefix を永続化
+    lazy_hit_threshold: 2
+    # プレフィックス生成プロンプト。プレースホルダ {document} {chunk} 必須。
+    # 空 (既定) で日本語テンプレートを使用。英語専用 / 中国語専用アシスト
+    # モデルに切替えた場合はここをアシストモデルの学習言語のテンプレートに
+    # 差し替えること (品質低下を防ぐため)。
+    prompt_template: ""
+  # --- ベクトル量子化 ---
+  quantization: int8             # ベクトル量子化方式: int8（ストレージ75%削減、精度~99%維持）
+  rescore_candidates: 50         # int8 粗検索後の float32 rescore 候補数（0 で自動: max(50, top_k*3)）
+  # --- memmap ---
+  memmap_threshold: 10000        # この件数以上で numpy.memmap に切替（OS ページキャッシュに委譲しメモリ削減）
+  # --- Cartridge スケーラビリティ運用制限 ---
+  max_loaded_cartridges: 20       # 同時 loaded 可能なカートリッジ上限 (0 以下で無制限)。超過時は LRU で最古参を unload
+  large_cartridge_warn_chunks: 50000  # load 時にチャンク数がこの閾値以上なら WARNING ログを出す
+  cartridge_search_timeout_ms: 3000   # カートリッジ検索全体のタイムアウト (ms)。超過時は空結果を返しチャット応答を止めない (0 で無効)
+  # Cartridge Gate: centroid 事前フィルタ。多数カートリッジ装着時に無関係な cart をベクトル検索前にスキップ
+  cartridge_gate:
+    enabled: true                     # 有効化。centroid 未構築 cart は常に通過するため既存環境でも安全
+    # NOTE: threshold=0.3 は Qwen3-Embedding の cosine 分布前提。BGE-M3 等に
+    # 切替えた場合は cosine 分布特性が変わるため、ベンチで全 cart skip / 全
+    # 通過になっていないか確認して再調整すること。
+    threshold: 0.3                    # cosine 類似度閾値。未満の cart はスキップ
+    max_cartridges: 10                # gate 通過上限 (0 で無制限)
+    # 全カートリッジが threshold 未満の場合の挙動:
+    #   false (既定): カートリッジ検索を skip し chunk を返さない。雑談や
+    #                ファイル生成依頼などロード中カートリッジと無関係な発話で
+    #                RAG chunk が混入するのを防ぐ。STM/LTM 検索は影響なし。
+    #   true       : 旧挙動 (全件フォールバック = recall 重視)。
+    fallback_when_empty: false
+  # Cluster Index: 巨大カートリッジ (> threshold 件) を IVF-KMeans で高速化。numpy のみで実装
+  cluster_index:
+    enabled: true                     # 有効化。閾値未満の cart はブルートフォースのまま
+    threshold: 5000                   # この件数以上の VectorStore で IVF インデックスを構築
+    n_probe_ratio: 0.125              # K = max(16, sqrt(N)) のうち n_probe_ratio × K 個のクラスタを探索
+  # --- Self-RAG 品質判定閾値 ---
+  # NOTE: 以下 3 閾値 (0.65/0.50/0.80) は Qwen3-Embedding + Qwen3-Reranker の
+  # スコア分布を前提に調整した既定値。BGE-M3 + BGE-Reranker-v2-m3 等の
+  # 別 family に切替えた場合、reranker の relevance スコアが「全て low」or
+  # 「全て high」に倒れないよう、ベンチで分布を観察して再調整すること。
+  relevance_threshold: 0.65      # 関連性判定の閾値（0.0〜1.0）
+  support_threshold: 0.50        # 根拠支持判定の閾値（0.0〜1.0）
+  confidence_threshold: 0.80     # 信頼度判定の閾値（0.0〜1.0）
+  hysteresis_band: 0.02          # ヒステリシス幅（閾値近傍の揺れを吸収）
+  # --- Self-RAG 補助機能 ---
+  self_rag:
+    assist_judge:
+      enabled: true               # アシストモデルによる品質再判定（marginal 結果の救済）
+      max_per_session: 5          # 1 セッション内の発火上限 (0 以下で無制限)
+      max_per_query: 1            # 1 クエリ内の発火上限 (0 以下で無制限)
+      only_when_quality: ["medium"]  # 発火条件の quality ラベル (high/medium/low から指定)
+    assist_necessity:
+      # 検索必要性のハイブリッド 3 値判定 (Phase 1 で旧 2 値から拡張)。
+      # ルール層 (URL含む / 明示fetch動詞 / TRIVIAL / 長文 question) で
+      # `retrieve` / `fetch` / `skip` が確定するケースはアシスト 0 呼び出しで即返す。
+      # それ以外の uncertain ケースだけ アシストモデルに 3 値 JSON
+      # ({"action": "retrieve" | "fetch" | "skip"}) を問い合わせる。
+      # `fetch` は外部 fetch_url ツールに委ねるシグナルで、search_pipeline は
+      # `skip` 同等にローカル RAG をスキップする。
+      # 失敗 / タイムアウト / 上限到達時は安全側 (`retrieve`) にフォールバック。
+      enabled: true               # uncertain 時のアシスト発火 (false で完全ルール運用)
+      max_per_session: 10         # 1 セッション内の発火上限 (0 以下で無制限)
+      max_per_query: 1            # 1 クエリ内の発火上限 (0 以下で無制限)
+      only_when_quality: ["uncertain"]  # tracker キー (互換、変更非推奨)
+      timeout_s: 5.0              # アシスト wall-clock 上限 (秒)
+      context_turns: 2            # アシストプロンプトに含める直前ターン数 (0 で会話文脈なし)
+
+# ===== 埋め込みモデル設定 =====
+embedding:
+  backend: llama-cpp              # 埋め込みバックエンド: llama-cpp
+  llama_host: localhost            # llama-server ホスト（backend: llama-cpp 時）
+  llama_port: 8082                 # llama-server ポート（backend: llama-cpp 時）
+  dim: 1024                        # 埋め込みベクトルの次元数（Qwen3-Embedding-0.6B: 1024）
+  timeout: 30.0                    # 埋め込みリクエストのタイムアウト（秒）
+  model_name: Qwen/Qwen3-Embedding-0.6B       # HuggingFace モデル名
+  max_length: 8192                # 入力最大トークン長
+  # 埋め込みモデルの GPU オフロード層数
+  # null は CPU フォールバック (-ngl 0) が既定。GPU に載せたい場合は
+  # 明示的に 999 等を指定する。ベースモデルの llama.gpu_layers には追従しない。
+  gpu_layers: null                # 既定: CPU 配置 (弱い GPU 環境での OOM 回避)
+  # 物理バッチサイズ。llama-server デフォルト 512 のままだと長文ノート (>512 tok)
+  # の単一埋め込みリクエストで 500 エラーになり、EvorefMem sleep-time update が連鎖失敗する。
+  # 4096 は rag.chunk_size (既定 512) + STM ノート (通常 <2048 tok) を十分カバーし、
+  # メモリも 8192 と比べて省ける妥当値。長文ファイル (>4096 tok の単一リクエスト) を
+  # 扱う場合のみ 8192 に上げる選択肢が残る。
+  # 注意: ggml-vulkan の pinned memory warning は batch_size とは独立に出る
+  # (model loading 時の host buffer 確保で発生、ggml-vulkan.cpp:14079)。batch_size
+  # を下げても警告は消えない。CPU buffer フォールバックで動作上は問題なし。
+  batch_size: 4096                # -b: 論理バッチサイズ
+  ubatch_size: 4096               # -ub: 物理バッチサイズ
+  # --- 永続埋め込みキャッシュ ---
+  # チャンクテキストのハッシュをキーに埋め込みベクトルをディスクにキャッシュ。
+  # 再登録・rebuild 時に同一チャンクの埋め込み計算をスキップする。
+  cache_enabled: true             # 永続埋め込みキャッシュの有効/無効
+  cache_max_mb: 100               # キャッシュ上限サイズ（MB、超過時は LRU eviction）
+  cache_dir: local/cache/embeddings/  # キャッシュ保存先ディレクトリ
+  # 起動時に embedder dim と既存ベクトルの不整合を検出した際の自動再構築。
+  # false (既定): WARNING ログのみ出して embedding_dim_mismatch フラグを立て、
+  #              運用者の `evoref reindex` 手動実行を待つ。
+  # true       : run_reindex を自動実行 (モデル切替直後の RAG ダウンタイムを縮める)。
+  auto_reindex_on_mismatch: false
+  # idle slot offload。埋め込みは chat slots を使わないため
+  # 上流既定 8192 MiB の RAM 予約は無意味。0 で明示 disable する。
+  cache_ram_mib: 0
+  # instruction-aware モデル (Qwen3 等) 用の mode 別 task description。
+  # mode は chat / coding のいずれか。
+  instructions:
+    chat: "Given a user question, retrieve relevant passages that answer the query"
+    coding: "Given a code search query, retrieve relevant code snippets"
+  # クエリ整形テンプレート。{task} (= instructions[mode]) と {query} を埋め込む。
+  # 既定は Qwen3-Embedding 公式仕様。BGE-M3 等の非 instruction-aware モデルに
+  # 切り替える場合は "" (空文字列) を指定し prefix を一切付与しない。
+  query_template: "Instruct: {task}\nQuery: {query}"
+  # ドキュメント整形テンプレート。Qwen3 仕様では空 (prefix なし)。
+  # 対称型埋め込み (例: e5) で文書側にも prefix が要る場合のみ設定。
+  doc_template: ""
+
+# ===== リランカー設定 =====
+reranker:
+  enabled: true                   # リランカーの有効/無効
+  backend: llama-cpp              # バックエンド: llama-cpp
+  host: localhost
+  port: 8083                      # リランカー用 llama-server のポート
+  model_name: Qwen/Qwen3-Reranker-4B  # モデル識別名（Qwen3-Reranker-4B、instruction-aware）
+  timeout: 30.0                   # タイムアウト（秒）
+  candidates_multiplier: 3        # リランカーに渡す候補数の倍率（top_k × N）
+  # リランカーの GPU オフロード層数
+  # null は CPU フォールバック (-ngl 0) が既定。GPU に載せたい場合は
+  # 明示的に 999 等を指定する。ベースモデルの llama.gpu_layers には追従しない。
+  gpu_layers: null                # 既定: CPU 配置 (弱い GPU 環境での OOM 回避)
+  # リランカーへ投入する候補数の上限
+  # 未指定なら top_k * candidates_multiplier (= 15 with defaults)。
+  # forward pass がドキュメント数に線形でかかるため、merged が膨らんだ際に
+  # 上位スコア順で切り詰めて再順位付けの計算量を抑える。
+  rerank_candidate_cap: 15
+  # 物理バッチサイズ。query + doc の入力トークン数を超える値が必要。
+  # 既定の rag.chunk_size=512 / max_doc_chars=4096 文字 (~1500 tok) 構成では
+  # 4096 で十分。rag.chunk_size を大きく取る (例: benchmark で 2048+ tok) 場合
+  # のみ 8192 へ。batch < 入力トークン数だとリランクが 500 で全滅する
+  # (#reranker-500) ので注意。
+  # 注意: ggml-vulkan の pinned memory warning は batch_size とは独立に出る
+  # (embedding 側コメント参照)。batch_size 調整では消えないが動作上は問題なし。
+  batch_size: 4096
+  ubatch_size: 4096
+  # 1 ペア (query + doc) のドキュメント側文字数上限。リランカーモデルの
+  # n_ctx を超えて 500 エラーになるのを防止する。0 でトランケーション無効。
+  max_doc_chars: 4096
+  # ファストパスタイムアウト。この時間内に /v1/rerank が応答
+  # しなければリランクをスキップして入力順序を返す。3.0 だと GPU
+  # ウォームアップ直後や他リクエスト競合時に間に合わず連続タイムアウト
+  # → サーキットブレーカー OPEN を招くため、12.0 を推奨。8.0 でも頻繁に
+  # タイムアウトする場合 SSE keepalive を有効にして 15.0 程度まで上げる。
+  fast_path_timeout: 12.0
+  # サーキットブレーカー: 連続失敗回数がこの値に達すると
+  # トリップし、cb_cooldown_sec 秒の間はリランクをスキップする。
+  cb_failure_threshold: 5
+  cb_cooldown_sec: 30.0
+  # idle slot offload。リランカーは短時間推論を大量に行うため
+  # offload の恩恵が薄く、長時間運用時のキャッシュ破損リスクを排除するため
+  # 0 で明示 disable する (従来の ``--cache-ram 0`` ハードコードを config 駆動化)。
+  cache_ram_mib: 0
+  # llama-server 起動時の追加引数（リランカー用）
+  extra_args: []
+  # instruction-aware リランカー (Qwen3 等) 用の mode 別 task description。
+  instructions:
+    chat: "Given a user question, retrieve relevant passages that answer the query"
+    coding: "Given a code search query, retrieve relevant code snippets"
+  # クエリ整形テンプレート。{task} (= instructions[mode]) と {query} を埋め込み
+  # /v1/rerank の query フィールドへ送る (Qwen3-Reranker のチャットテンプレート上の
+  # <Query> 位置に流し込まれる)。BGE-Reranker-v2-m3 等の非 instruction-aware
+  # モデルに切り替える場合は "" を指定し素のクエリを送る。
+  query_template: "<Instruct>: {task}\n<Query>: {query}"
+  # --- Quality-aware skip ---
+  # 融合後の top スコア / gap / 候補数から reranker を通す価値が薄いケース
+  # を検出し、cross-encoder forward pass を短絡する。いずれか 1 つでも条件を
+  # 満たせば skip (OR 判定)。全て 0 では skip 判定自体を行わず従来挙動のまま。
+  #
+  # しきい値は fusion 後の raw スコアに適用される:
+  #   - unified_search 経路 (チャット応答): cosine 類似度 (0.0-1.0 レンジ)
+  #   - HybridRetriever 経路 (benchmark): RRF スコア (k=60 で最大 ~0.033)
+  #
+  # 既定値 (チャット応答経路向け): top-1 cosine ≥ 0.85 または gap ≥ 0.30 で
+  # 自明ケース判定。fast_path_timeout (12s) のロスを排除するための既定有効化。
+  # benchmark/RRF 経路は値域が異なるため事実上影響しない。
+  skip:
+    hybrid_top_score_threshold: 0.85 # top-1 スコアがこの値以上なら skip (0.0=無効)
+    score_gap_threshold: 0.30        # top-1 と top-2 の差がこの値以上なら skip (0.0=無効)
+    min_candidates: 3                # 融合後の候補数がこの値未満なら skip (0=無効)
+
+# ===== メモリシステム設定 =====
+memory:
+  schema_version: 1               # EvorefMem スキーマバージョン
+  # --- Subject 正規化辞書 ---
+  subject_dictionary:
+    enabled: true                                              # 正規化を有効化
+    file: local/memory/semantic/subject_dictionary.json        # 辞書ファイルのパス
+    auto_expand: false                                         # 自動拡張は仕様で禁止
+  # --- ファクト抽出 ---
+  facts:
+    extraction_skip_subject_canonicalize_regex: '^harness\.'   # ハーネス系 subject は辞書スキップ
+    enable_extraction: true                                    # Step 8 Extractor 全体オンオフ
+    trigger: idle_full_only                                    # 抽出トリガ (Trigger B = run_full のみ)
+    extract_from_mdp_trace: true                               # agent_trace.jsonl から MDP 抽出
+    ingest_mdp_trace_to_ltm: true                              # agent_trace.jsonl を episodic LTM に投入
+    extraction_max_pinned_per_session: -1                      # pinned 由来の上限 (-1=無制限)
+    extraction_max_per_session:                                # セッションあたりの抽出上限
+      chat: 10
+      coding: 5
+  # --- Pin 機能 ---
+  # トリガ辞書 (pin_triggers.yaml / fact_triggers.yaml / classify_triggers.yaml) は
+  # 同梱 default を backend/free/memory/_defaults/triggers/ に配置し、user override
+  # は local/triggers/<name>.yaml に置く 2 段階解決 (override 優先)。config では指定しない。
+  pin:
+    auto_detect: true                                          # 自動 Pin 検出 (覚えて/重要/忘れないで等)
+    auto_detect_confirm: false                                 # 検出時に確認を要求するか
+    unlimited: true                                            # pin 数上限なし
+  # --- プライベートセッション ---
+  # private: true のターンは memory_only で動作し、LTM/SemMem への昇格と
+  # 会話履歴のディスク永続化をスキップする。セッション終了時に揮発する。
+  private:
+    default: false                                             # セッション開始時のデフォルト private モード
+    history_storage: memory_only                               # memory_only | skip — WM/STM のみ保持し永続化スキップ
+  # --- SemMem コンフリクト解消 ---
+  conflict:
+    default_mode: auto                                         # auto: 例外を除き自動マージ / manual: 全件 pending
+    confirm_window_hours: 1.0                                  # 同 source / N 時間以内は微妙ケースとして pending
+    project_tag_always_manual: true                            # project / policy タグは基本ユーザー確認必須
+    auto_for_evolved_policies: true                            # 例外: auto_evolved=True の policy のみ自動マージ
+  # --- MemoryInjector ---
+  # NOTE: policy ファクトの active 閾値は learning.policy.activation_min_confidence
+  # に集約されている
+  # MemoryInjector / PolicyInterpreter / LoopFactView 等すべて同一閾値で動作する。
+  injection:
+    chat_budget_tokens: 800                                    # チャットモードの注入予算 (tokens)
+    coding_budget_tokens: 2000                                 # コーディングモードの注入予算 (tokens)
+    tier_ratios:
+      chat: [0.40, 0.35, 0.15, 0.10]                           # Tier 1〜4 比率 (合計 1.0)
+      coding: [0.40, 0.35, 0.15, 0.10]                         # Tier 1〜4 比率 (合計 1.0)
+  working_max_turns: 10           # ワーキングメモリの最大ターン数
+  working_max_tokens: 2048        # ワーキングメモリの最大トークン数
+  # 推奨: 512〜(context_size * 0.6) の範囲で設定
+  # | context_size | 上限目安 | 推奨値 |
+  # |       4,096  |    2,457 |  2,048 |
+  # |       8,192  |    4,915 |  4,096 |
+  # |      16,384  |    9,830 |  8,192 |
+  # |      32,768  |   19,660 | 16,384 |
+  # 下限 512: これ以下だと毎ターン圧縮が発動し会話が成立しない
+  short_term_max_notes: 100       # 短期メモリの最大ノート数
+  lightmem_decay_days: 7          # LightMem スコアの減衰日数 (デフォルト半減期)
+  # --- タグ別半減期 (日)。未指定タグは lightmem_decay_days を使用 ---
+  # `policy` / `progress_marker` / `project` は実質無限 (9999)、
+  # `failure_pattern` は中期 (60)、`belief` は長期 (180)。
+  half_life_days_by_tag:
+    personal_fact: 90
+    world_fact: 14
+    preference: 60
+    emotion: 30
+    opinion: 21
+    belief: 180
+    decision: 60
+    commitment: 30
+    project: 9999
+    coding: 60
+    task: 14
+    coding_task: 14
+    policy: 9999
+    fewshot: 9999        # policy subtype から独立
+    failure_pattern: 60
+    progress_marker: 9999
+  # --- SemMem 容量上限 + GC ---
+  # sleep-time Step 9 内で type 別に上限超過分を gc_strategy に従って削除する。
+  # pinned ファクトと supersede 済ファクトは対象外。スコアは
+  # eval_metric.fitness > confidence の順で評価し、低いものから削除する。
+  semmem_limits:
+    personal_fact: 10000
+    world_fact: 5000
+    preference: 5000
+    emotion: 3000
+    opinion: 3000
+    belief: 1000
+    decision: 5000
+    commitment: 2000
+    project: 10000
+    coding: 10000
+    task: 5000
+    coding_task: 5000
+    policy: 5000
+    fewshot: 2000                 # policy subtype から独立
+    failure_pattern: 2000
+    progress_marker: 5000
+    enforcement: hard             # hard | soft (soft は削除しない計測専用)
+    gc_strategy: lowest_score     # 削除戦略 (現在は lowest_score のみ)
+  # --- プロジェクトアーカイブ ---
+  # 指定日数アクセスのないプロジェクトを semantic/archive/ に物理移動する
+  # (自動削除はしない)。0 で無効化。
+  project:
+    auto_archive_inactive_days: 180
+    archive_dir: local/memory/semantic/archive
+  # --- FadeMem 適応的忘却 (arXiv:2601.18642) ---
+  fade_alpha: 0.4                 # 関連性の重み（コーディング用途は 0.5 推奨）
+  fade_beta: 0.3                  # アクセス頻度の重み（alpha + beta + gamma = 1.0）
+  fade_gamma: 0.3                 # 時間減衰の重み
+  fade_threshold: 0.15            # これ以下のスコアを削除候補に
+  conflict_similarity_threshold: 0.85  # これ以上の類似ノートをコンフリクト候補に
+  conflict_batch_size: 5          # コンフリクト解決のバッチサイズ
+  # --- A-MEM ノート進化 (arXiv:2502.12110) ---
+  note_evolution_enabled: true    # sleep-time でノート文脈説明を LLM が生成
+  note_evolution_batch: 10        # 1 回の sleep-time で処理するノート上限
+  note_evolution_context_k: 3     # 進化時に参照する関連ノート数
+  llm_call_base_interval: 1.0    # LLM 呼び出し間の基本待機秒数（7B モデル基準、モデルサイズで自動調整）
+  # --- A-MEM リンク張り直し + クラスタリング (LLM 不要) ---
+  note_link_rebuild_enabled: true # sleep-time Step 7 で STM ノート間リンクを再構築
+  note_link_top_k: 5              # 各ノートに張るリンクの上限
+  note_link_threshold: 0.5        # コサイン類似度しきい値 (これ未満は張らない)
+  note_clustering_enabled: true   # union-find で連結成分から cluster_id を割り当てる
+  # --- NoteEvolver / ConflictResolver の LLM スキップ閾値 ---
+  note_evolver:
+    # confidence がこの値以上のノートは LLM 進化をスキップ (ルールベースのみ)
+    # 0.0 で全ノート LLM 進化 (現行挙動と同等)、1.0 で LLM 進化を完全停止
+    confidence_threshold: 0.7
+    # 1 サイクルあたり LLM 進化呼び出しの上限 (note_evolution_batch と小さい方を採用)
+    max_per_cycle: 10
+  conflict_resolver:
+    # LLM 統合を実行する最小類似度。detect 閾値 (conflict_similarity_threshold)
+    # 以上 / この値未満の中間帯は LLM 呼び出しをスキップし低優先度扱いにする
+    min_merge_similarity: 0.85
+    # 1 サイクルあたり LLM 統合呼び出しの上限 (conflict_batch_size と小さい方を採用)
+    max_per_cycle: 5
+
+# ===== スケジューラ tz 設定 =====
+# 内部時刻は全て UTC で扱うが、「夜間 N 時に学習を実行」のような
+# ユーザ体感のローカル時刻で判定したい処理はこの tz で UTC→ローカル変換する。
+# サーバの OS tz には依存しない。ZoneInfo (IANA) 形式で指定する。
+schedule:
+  local_tz: Asia/Tokyo            # 例: Asia/Tokyo / UTC / America/Los_Angeles
+
+# ===== 学習サイクル設定 =====
+learning:
+  level1_min_experiences: 20      # Level 1 トリガーに必要な最小経験数
+  level1_generations: 10          # Level 1 の世代数
+  level1_population_size: 5       # Level 1 の集団サイズ
+  level2_min_failures: 50         # Level 2 トリガーに必要な最小失敗数
+  # アイドル判定タイマー
+  full_idle_minutes: 10           # Trigger B: sleep-time Full の起動アイドル時間（分）
+  level1_idle_minutes: 30         # Trigger C: Level 1 の起動アイドル時間（分）
+  level1_recheck_interval_sec: 60 # Level 1 ループ再評価間隔（秒）
+  priority_threshold_ratio: 0.5   # 優先 Level 1 の経験数閾値緩和率
+  active_minutes: 5               # user_active 判定閾値（分）— Level 2 中断判定
+  level2_spsa_iterations: 500     # Level 2 SPSA の反復回数
+  level2_sparse_params: 200       # Level 2 のスパースパラメータ数
+  level2_schedule_hour: 3         # Level 2 の実行スケジュール時刻
+  # パターン検出キーワード学習
+  pattern_max_patterns: 200       # 学習済みパターンの最大数
+  pattern_initial_weight: 0.5     # 新規パターンの初期重み
+  pattern_decay_rate: 0.05        # sleep-time ごとの重み減衰量
+  pattern_boost_amount: 0.15      # 訂正検出時のブースト量
+  pattern_min_weight: 0.1         # この重み未満のパターンは削除
+  pattern_match_threshold: 0.3    # マッチング時の最小重み閾値
+  # ツールパターン学習
+  tool_pattern_boost_success: 0.03    # 成功時のブースト量
+  tool_pattern_decay_false_pos: 0.1   # 誤検出時の減衰量
+  tool_pattern_match_threshold: 0.4   # マッチ閾値（通常パターンより高め）
+  # Few-shot プール
+  fewshot_pool_size: 50               # モード別最大プールサイズ
+  fewshot_min_fitness: 0.7            # プール追加の最低 fitness
+  fewshot_max_examples: 3             # プロンプトに埋め込む最大 Few-shot 数
+  fewshot_diversity_threshold: 0.8    # 重複判定のコサイン類似度上限
+  # Level 2 アシストモデル
+  assist_level2_min_experiences: 30   # アシストモデル Level 2 の最小経験数
+  assist_spsa_iterations: 300         # アシストモデル SPSA 反復回数
+  assist_sparse_params: 100           # アシストモデルのスパースパラメータ数
+  # トークン予算進化
+  budget_generations: 5               # トークン予算進化の世代数
+  budget_sigma: 0.05                  # トークン予算進化の摂動スケール
+  budget_max_total_ratio: 0.7         # 各戦略の比率合計の上限
+  # 変異生成 LLM 設定
+  prompt_mutator_base: main           # ベースモデル変異生成の LLM（main / assist）
+  prompt_mutator_assist: main         # アシストモデル変異生成の LLM（main / assist）
+  # ポリシー / 進化結果書き戻し設定
+  # PolicyInterpreter / PolicyParamEvolver / FewShotPool の永続化先と進化挙動。
+  #
+  # - source:
+  #     yaml   : 従来通り local/policies/*.json のみを参照 (既定)
+  #     hybrid : YAML を seed としてロード後、SemMem の active な policy ファクト
+  #              (subject 先頭が `learn.policy.`) で上書き
+  #     semmem : 導入予定 (現状は hybrid と同等)
+  # - activation_min_confidence: SemMem 上の policy ファクトを active と
+  #   見なす最小 confidence。これ未満は YAML 値が温存される。
+  #   PolicyInterpreter / LoopFactView / MetaCognitiveAgent / SelfCartridge /
+  #   bootstrap_loop_context_at_startup が共通参照する。
+  # - evolve_writeback: 進化結果の書き戻し先
+  #     yaml   : local/prompts/policy_evolver_state.json / fewshot_pool.json (既定)
+  #     semmem : SemMem の policy / fewshot ファクトに書き戻し
+  policy:
+    source: yaml                      # yaml | hybrid | semmem
+    activation_min_confidence: 0.7
+    evolve_writeback: yaml            # yaml | semmem (D-2 で semmem 化予定)
+
+# ===== ストリーミング設定 =====
+streaming:
+  keepalive_interval_sec: 15.0    # Meta-Cognitive 層のキープアライブ送信間隔（秒）
+
+# ===== エージェント設定 =====
+agent:
+  step_compaction_enabled: true          # ステップ結果圧縮の有効/無効
+  step_compaction_rag_lines: 2           # RAG 圧縮時に各チャンクから残す行数
+  step_compaction_command_head_tail: 5   # コマンド出力の先頭/末尾行数
+  reminders_enabled: true                # イベント駆動リマインダーの有効/無効
+  max_reminders_per_turn: 2              # 1 回の LLM 呼び出しに注入する最大リマインダー数
+  dangerous_command_block: true          # 危険コマンドをブロック（false=警告のみ）
+  tool_judge_enabled: false              # アシストモデルによるツール呼び出し判定（true で有効化）
+  meta_cognitive_enabled: true           # Meta-Cognitive 層（計画+多段推論+ツールループ）の有効/無効
+  meta_cognitive_min_budget: 512         # Meta-Cognitive 発動に必要な最小ループ予算（トークン数）
+  executable_command_fallback_enabled: true   # 4 層判定が全て no-tool の時、assist で環境依存事実クエリを run_command に橋渡しする 5 層目（false で無効化）
+  executable_command_fallback_min_chars: 5    # 5 層目 assist 呼出をスキップするクエリ長閾値（これ未満は呼ばない）
+
+# ===== ツール設定 =====
+tools:
+  fetch_url_enabled: true         # fetch_url ツールの有効化（true で URL フェッチを許可）
+  fetch_url_timeout: 10           # fetch_url のタイムアウト（秒）
+  fetch_url_allow_private_ip: false  # true で localhost / private IP / link-local への接続を許可（既定 false で SSRF 対策）
+  # ── URL リコール (Phase 1) ──
+  # 過去質問で正しく fetch_url できた URL を新規の類似質問で再利用する。
+  # 書込は sleep-time の url_curator が担当（アシスト自己採点）、引き当ては
+  # ToolCallJudge が embedding 類似度 + 過去採点平均で決定論的に行う。
+  url_recall_enabled: true            # URL リコール機能の有効/無効
+  url_recall_topk: 5                  # 引き当て時に走査する近傍ファクト数
+  url_recall_min_score: 0.7           # 引き当てに必要な質問 embedding 類似度閾値
+  url_recall_min_record_score: 0.6    # 引き当てに必要な過去採点平均の閾値
+  url_recall_record_history_size: 10  # 1 URL fact あたり保持する採点履歴件数
+  url_recall_ttl_days: 30             # 最終 fetch から N 日経過で score を半減 (0=TTL 無効)
+  # ── executable command リコール ──
+  # 過去成功した run_command を新規の類似クエリで再利用する。
+  # 書込は sleep-time の executable_command_curator (tool_command_success を記録)、
+  # 引き当ては ToolCallJudge が embedding 類似度 + 過去成功率で決定論的に行う。
+  executable_command_recall_enabled: true            # executable command リコールの有効/無効
+  executable_command_recall_topk: 5                  # 引き当て時に走査する近傍ファクト数
+  executable_command_recall_min_score: 0.7           # 引き当てに必要なクエリ embedding 類似度閾値
+  executable_command_recall_min_record_score: 0.6    # 引き当てに必要な過去成功率の閾値
+  executable_command_recall_record_history_size: 10  # 1 command fact あたり保持する成否履歴件数
+  executable_command_recall_ttl_days: 30             # 最終実行から N 日経過で score を半減 (0=TTL 無効)
+
+# ===== ウィジェットプロキシ設定 =====
+# テーマのスロットコンポーネントから外部 API と連携する際のプロキシ設定。
+widget_proxy:
+  enabled: false                  # true でウィジェットプロキシを有効化
+  global_rate_limit: 60/min       # 全 API 合算のレート制限
+  request_timeout_sec: 10         # プロキシリクエストのタイムアウト（秒）
+  max_response_size_kb: 512       # レスポンスサイズ上限（KB）
+  cache_ttl_sec: 60               # レスポンスキャッシュの TTL（秒、0=無効）
+  apis: []                        # 許可する外部 API 定義（テーマインストール時に追加）
+  # 例:
+  # apis:
+  #   - name: weather
+  #     base_url: https://api.openweathermap.org
+  #     api_key_env: OPENWEATHER_API_KEY
+  #     rate_limit: 10/min
+  #     allowed_paths:
+  #       - /data/2.5/weather
+  #       - /data/2.5/forecast
+
+# ===== i18n 設定 =====
+i18n:
+  locale: ja                      # 表示言語: ja / en
+  fallback: ja                    # フォールバック言語
+  prompt_locale: ja               # プロンプト言語: ja / en（切替時にデフォルトに戻り再学習）
+
+# ===== デバッグ設定 =====
+# 旧 `debug:` セクションは削除されました。develop モードのログ制御は
+# CLI フラグ `--develop=<level>` (debug | investigate | evolve) の SSOT に
+# 集約されています。`config.yaml` に `debug:` セクションを書くと起動時
+# (Pydantic バリデーション) で ValidationError になります。
+#
+# レベル別仕様:
+#   - debug       : Free / Pro 共通。requests.jsonl のみ。即時 BUG 解析向け。
+#   - investigate : Pro 限定。requests/rag/memory/long_form。挙動把握向け。
+#   - evolve      : Pro 限定。既存 6 系統 + decision/outcome (PR-C で追加)。
+#                   loop 自己学習向け。
+#
+# 通常起動 (--develop 未指定) では backend.log が INFO+ で固定されます。
+
+# ===== アシストモデル設定 =====
+# メモリ・RAG 処理用の補助 llama-server インスタンス。
+# 全エディションで必須。ベースモデルとは別インスタンスで起動する。
+assist_model:
+  enabled: true                    # false でアシストモデル無効化。health_check を経由せず None を注入し、
+                                   # ツール判定・メモリ進化・長文プラン・検索品質判定は
+                                   # フォールバックモードで動作する
+  local:
+    host: 127.0.0.1               # アシストモデル llama-server のホスト
+    port: 8081                     # アシストモデル llama-server のポート
+    context_size: 8192             # アシストモデルのコンテキストサイズ（デフォルト: 8192）
+                                   # Contextual Retrieval のプレフィックス生成や note_evolve の入力を
+                                   # 収容するため、2048 ではオーバーフローで空応答となるので避ける
+                                   # ベースモデルの context_size とは独立して設定可能
+    # idle slot offload。アシストは purpose 別セマフォで多重化される
+    # ため slots>1 運用時に ``--kv-unified`` が自動付与される。
+    cache_ram_mib: 2048
+    cache_idle_slots: true
+    kv_unified: null
+    # アシストモデルのパラメータ数 (B 単位) を明示指定する。
+    # null (既定) で model 名の正規表現 (\d+B) → /props の順に推定する。
+    # モデル名に B 表記がない GGUF (例: custom-1.7b-q4.gguf の小文字 b) や、
+    # 量子化版で実効性能が異なる場合に明示指定する。note_evolver /
+    # conflict_resolver の sleep-time インターバル計算で 7B 基準のスケーリ
+    # ングに使われる。
+    params_b: null
+  model_path: ""                   # アシストモデルパス（通常は model_paths.assist_model を参照）
+  timeout: 30.0                    # タイムアウト（秒）. CogWriter Plan 生成 (max_tokens=1024) 等の長め応答を許容するため 30 秒を推奨
+  # 用途別セマフォ。realtime / background / learning を独立
+  # スロット化し、Sleep-time (Step 5.8 contextual_prefix 等) / Level 2
+  # (critique_synthesis) が並行稼働してもチャット応答パスの realtime
+  # リクエストがキュー待ちしないようにする。purpose → priority の対応は
+  # AssistModelClient._PURPOSE_PRIORITY_MAP を参照。
+  concurrency:
+    realtime: 1                    # self_rag_judge / tool_judgment / conflict_resolution
+    background: 1                  # contextual_prefix / long_form / ralph_loop / note_evolution
+    learning: 1                    # critique_synthesis / policy_evolution / spsa
+  # JSON 応答 purpose に GBNF/json_schema 制約サンプリングを適用するか
+  # true: OAI 互換 ``response_format: {"type": "json_schema", ...}`` を /v1/chat/completions
+  #   に送信し、Pydantic schema (backend/free/llm/json_schemas.py) で文法外トークンを抑制。
+  #   小規模 LLM の JSON 応答エラー率を構文レベルで 0 化できる。
+  # false: 旧来の json_extract.py フォールバック (コードフェンス除去 / balanced 抽出) のみ。
+  #   古い llama-server build (response_format: json_schema 未対応) や、パースエラー切り
+  #   分け用に使用する。
+  response_format_enabled: true
+  # 用途別タイムアウト (秒)
+  # 解決優先順:
+  #   1. 明示指定 (`timeout` 引数)
+  #   2. `assist_model.timeouts[purpose]` (このセクション)
+  #   3. `PURPOSE_TIMEOUT_DEFAULTS[purpose]` (コード既定 / `backend/free/llm/assist_client.py`)
+  #   4. `assist_model.timeout` (グローバル既定)
+  # 本セクションを省略しても、DEFAULTS により以下と同等値が自動適用される。
+  # 明示する場合はサイト固有チューニング、または DEFAULTS にない purpose の追加で使う。
+  timeouts:
+    contextual_prefix: 60.0           # Sleep-time Step 5.8 の長文 document prefix 生成
+    long_form_planning: 90.0          # CogWriter Plan 生成 (4-8k tok 入力)
+    long_form_code_review: 90.0       # CogWriter コードレビュー
+    long_form_text_review: 90.0       # CogWriter テキストレビュー
+    conflict_resolution: 15.0         # 短文マージ判定 (thinking 不要)
+    critique_synthesis: 45.0          # 失敗クラスタ解析
+    policy_evolution: 45.0            # PolicyParamEvolver 候補 JSON 生成
+    note_evolution: 20.0              # A-MEM note 進化の軽量要約
+    meta_cognitive_plan: 30.0         # coding mode タスク分解
+    summarize: 30.0                   # Recurrent 戦略の summary 再帰更新
+  # 用途別 reasoning_budget (thinking token 上限)
+  # ``chat_template_kwargs.reasoning_budget`` として送信される。
+  # -1 = 無制限 / 0 = 即終了 / N>0 = N トークン上限。
+  # サーバ側 ``-rea off`` (= `local.reasoning: off`) で起動している場合 (推奨) は
+  # そもそも thinking が disable されるため本値は no-op だが、``-rea auto`` / ``on``
+  # 運用時に purpose 単位で budget を絞る安全側デフォルトとして機能する。
+  # 本セクションを省略しても、PURPOSE_REASONING_BUDGET_DEFAULTS により以下と同等値が
+  # 自動適用される。
+  reasoning_budgets:
+    long_form_planning: 2048
+    long_form_code_review: 2048
+    long_form_text_review: 2048
+    contextual_prefix: 256
+    critique_synthesis: 512
+    conflict_resolution: 0            # マージ判定は thinking 不要
+    policy_evolution: 1024
+    meta_cognitive_plan: 0            # 機械的なタスク分解
+    summarize: 0                      # 機械的な再要約
+  # 全 assist リクエストに per-request で注入する chat_template_kwargs。
+  # 上記 reasoning_budgets は本マップに自動マージされる。
+  # - Qwen3 / Gemma-4 / DeepSeek-R1 等の thinking モデル: {"enable_thinking": false} (既定)
+  #   jinja template が受理した場合に thinking を抑制する保険として機能。
+  # - Llama 3 / Mistral 等の非 thinking モデル: {} を指定し、未知 kwarg
+  #   送信を完全停止する。
+  chat_template_kwargs:
+    enable_thinking: false
+
+# ===== エディタ設定（Pro ワークモード）=====
+editor:
+  font_family: monospace            # フォントファミリー
+  font_size: 14                     # フォントサイズ（8〜48）
+  line_height: 1.5                  # 行高（1.0〜3.0）
+  tab_size: 4                       # タブサイズ（1〜8）
+  word_wrap: false                  # 折り返し
+  show_line_numbers: true           # 行番号表示
+  show_active_line: true            # アクティブ行ハイライト
+  show_toolbar: true                # ツールバー表示
+  default_encoding: utf-8           # デフォルトエンコーディング: utf-8 / shift_jis / euc-jp / iso-2022-jp
+  default_line_ending: lf           # 改行コード: lf / crlf / cr
+  highlight_languages:              # シンタックスハイライト対応言語
+    - markdown
+    - python
+    - javascript
+    - typescript
+    - json
+    - html
+    - css
+    - yaml
+    - xml
+    - sql
+    - php
+
+# ===== 自律ループ driver =====
+# driver 骨組み、品質ゲートアダプタ
+# (pytest / typecheck / lint) を実装済み。executor 接続 / failure_pattern /
+# bootstrap / progress_marker は別層で接続する
+loop:
+  enabled: true
+  driver: semmem_task                          # task ファクトを駆動源にする
+  executor: ralph                              # ralph | noop
+  max_iterations: 50                           # 1 セッションあたり最大イテレーション
+  max_actions_per_task: 10                     # 1 task あたりの Action 実行上限
+  max_wall_time_sec: 1800.0                    # started_at からの壁時間上限
+  max_consecutive_failures: 3                  # 連続失敗で停止する閾値
+  tick_interval_sec: 0.0                       # 各イテレーション後の sleep 秒 (0=即時)
+  context_reset_threshold_tokens: 24000        # クリーンコンテキスト再起動のしきい値
+  sleep_time_every_n: 5                        # N イテレーションごとに sleep-time partial run
+  on_gate_fail: retry                          # retry | skip | abort
+  retry_limit_per_task: 2                      # 失敗時の最大リトライ回数
+  event_bus_max_queue: 128                     # SSE 進捗配信のキュー上限 (subscriber 単位)
+  quality_gates:
+    # 実装済み (backend/free/loop/quality_gate.py)
+    # 失敗時はコミットせず、rollback_working_tree() で作業ツリーを破棄する。
+    pytest: true                               # python scripts/safe_pytest.py
+    typecheck: true                            # cd frontend && npm run check
+    lint: false                                # cd frontend && npm run lint
+  sandbox:
+    # ラルフループのサンドボックス (ActionRunner)
+    allowed_write_roots:                       # edit_file の書込先 allowlist
+      - local/loop_sandbox
+    allowed_commands:                          # run_command の先頭要素 allowlist
+      - python
+      - node
+      - npm
+      - git
+    command_timeout_sec: 120.0
+
+# ===== 長文生成設定 =====
+# 長文生成エンジン。詳細は docs/f_09_long_form_engine.md 参照。
+long_form:
+  max_units: 20                     # 最大ユニット数
+  unit_max_tokens: 2000             # ユニットあたり最大トークン数
+  rolling_short_term_chars: 1000    # ローリング短期メモリの文字数
+  review_enabled: true              # レビューフェーズの有効/無効
+  max_revisions: 1                  # 最大修正回数（0=レビューのみ）
+  rag_per_unit: true                # ユニットごとにRAG検索を実行
+  rag_top_k_per_unit: 3             # ユニットごとのRAG上位件数
+
+# ──────────────────────────────────────────────────────────────────────
+# Pro 専用機能
+# ──────────────────────────────────────────────────────────────────────
+# - terminal: Pro 限定 Web ターミナル (PTY + xterm.js)
+#   * enabled=true で /api/terminal/* + /terminal ページが利用可能
+#   * セキュリティ 4 重ガード (Origin / Host / token / 127.0.0.1 bind 強制)
+#   * server.host=0.0.0.0 + enabled=true は起動エラーで拒否される
+#   * POSIX / Windows 両対応:
+#     POSIX は ptyprocess、Windows は pywinpty (ConPTY) を OS 別に利用
+#   * shell=auto:
+#       POSIX → $SHELL → bash → zsh → sh
+#       Windows → pwsh.exe → powershell.exe → cmd.exe
+#   * agent_write_enabled=true でエージェント
+#     からの PTY 書込を有効化。LLM 生成文字列を shell に渡すため攻撃面が
+#     大きい — 既定は false、有効化時は allowlist + dangerous pattern + 監査
+#     ログの 3 重ガードで保護される
+pro:
+  terminal:
+    enabled: false                     # Pro 限定。既定無効
+    shell: auto                        # auto | bash | pwsh | powershell | zsh | sh | cmd
+    allowed_origins:
+      - http://127.0.0.1:5173
+      - http://localhost:5173
+    max_sessions: 4                    # 同時セッション数の上限
+    idle_timeout_sec: 1800             # idle 検出時 SIGTERM までの秒数
+    token_ttl_sec: 60                  # POST /session で発行する token の TTL
+    # エージェント主導の PTY 書込
+    agent_write_enabled: false         # 既定無効。有効化時は LLM が任意のコマンドを shell に渡せる
+    agent_command_allowlist: []        # 正規表現リスト。空=全許可、1 件以上指定でホワイトリスト方式
+    agent_read_timeout_sec: 10         # terminal_exec の結果読取り最大秒数
+  url_recall:
+    # Pro 限定: ToolCallJudge の URL リコールに team プロファイルを追加で
+    # 引き当て対象に含める。Free build では設定しても効果なし (起動時に WARNING)。
+    team_profile_ids: []               # 例: ["team:default"] で team profile の URL fact も読込候補に

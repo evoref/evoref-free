@@ -1,0 +1,86 @@
+# ============================================================
+# Project-specific
+# ============================================================
+
+# Config (environment-specific, generated from config.yaml.example)
+config.yaml
+
+# Models (large binary files, keep directory structure only)
+models/*
+!models/.gitkeep
+
+# Local data (PC-specific, not shared)
+# EvorefMem トリガ辞書の user override (local/triggers/*.yaml) もここに含まれる。
+# 同梱 default は backend/free/memory/_defaults/triggers/ 配下で tracked。
+# ディレクトリ構造のみ保持するため .gitkeep のみ git 管理する。
+local/**
+!local/
+!local/**/
+!local/**/.gitkeep
+# 相対パス解決が cwd=backend/ で起きた際に生成される迷子データの保険。
+backend/local/
+
+# Release sync artifacts (scripts/release_free_sync.py の生成物 / lock / tmp)
+# `release/free/` `release/pro/` は sync スクリプトが毎回再生成するため tracked しない。
+# `.sync.lock` は acquire_lock() が起動時に作成する一時ファイル。
+release/
+
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# ============================================================
+# Node.js / SvelteKit
+# ============================================================
+node_modules/
+.svelte-kit/
+
+# ============================================================
+# Tool caches
+# ============================================================
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ============================================================
+# Test reports & coverage
+# ============================================================
+reports/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+frontend/coverage/
+
+# ============================================================
+# IDE / Editor
+# ============================================================
+.vscode/*
+# settings.json はテスト自動発見を無効化する安全設定のため共有する
+!.vscode/settings.json
+.idea/
+
+# ============================================================
+# Claude Code
+# ============================================================
+# .claude/ 配下 (CLAUDE.md / settings*.json / rules/ / skills/ 等) はすべて個人/未確定資産で ignore。
+.claude/
+
+# ============================================================
+# OS
+# ============================================================
+.DS_Store
+Thumbs.db
+
+# ============================================================
+# Logs & Backup
+# ============================================================
+*.log
+*.bak

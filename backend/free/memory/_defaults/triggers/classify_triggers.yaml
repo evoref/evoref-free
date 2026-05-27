@@ -1,0 +1,57 @@
+# EvorefMem — history summary 分類 (decision / commitment) 辞書
+#
+# 本ファイル: classify_summary_type で使う commitment キーワードの外部化
+#
+# 構成:
+#   commitment:
+#     ja: [str, ...]    # 日本語部分一致 (大文字小文字は **区別する**)
+#     en: [str, ...]    # 英語部分一致 (大文字小文字は **区別しない**)
+#
+# マッチング規則 (sleep.promotion.classify_summary_type):
+#   1. 要約テキスト ``summary`` を対象に:
+#      - ``commitment.ja`` のいずれかが **生文字列に** ``in`` マッチ → "commitment"
+#      - ``commitment.en`` のいずれかが ``summary.lower()`` に ``in`` マッチ → "commitment"
+#   2. いずれもヒットしなければ "decision"
+#   3. ``summary`` が空文字 / None → "decision"
+#
+# 注意: 日本語キーワードは大文字小文字を区別する (``TODO`` と ``todo`` は
+# 独立エントリ)。英語キーワードは前処理で ``summary`` 側を lowercase 化する
+# ため、YAML には **小文字** で書くこと。
+#
+# pin_triggers.yaml / fact_triggers.yaml と異なり、大文字小文字の扱いが
+# 言語で違うため ja / en を分離してある。
+#
+# ユーザー上書き: ``local/triggers/classify_triggers.yaml`` に同名ファイルを
+# 置くと package 同梱 default に代えて読み込まれる。
+
+commitment:
+  ja:
+    - 予定
+    - 明日
+    - 来週
+    - 今度
+    - あとで
+    - 後で
+    - やる
+    - やります
+    - 実装する
+    - 対応する
+    - 対応します
+    - 進める
+    - 進めます
+    - TODO
+    - todo
+    - to-do
+    - 宿題
+    - 次回
+  en:
+    - "will "
+    - "going to "
+    - "schedule"
+    - "plan to"
+    - "todo"
+    - "to-do"
+    - "next time"
+    - "later"
+    - "tomorrow"
+    - "next week"
