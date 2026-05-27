@@ -1,0 +1,159 @@
+@import 'tailwindcss';
+
+/*
+ * テーマなし状態（default テーマも含めて何もアクティブでない状態）の
+ * フォールバック配色。意図的にモノトーン（グレースケール）で構成し、
+ * テーマがロードされた場合は theme.ts の applyThemeColors() によって
+ * <head> 末尾に注入される #evoref-theme-colors スタイルで上書きされる。
+ */
+:root[data-theme='light'] {
+	--bg-primary: #f5f5f5;
+	--bg-secondary: #e8e8e8;
+	--text-primary: #1a1a1a;
+	--text-secondary: #333333;
+	--text-muted: #707070;
+	--accent: #404040;
+	--border: rgba(64, 64, 64, 0.35);
+	--code-bg: #e8e8e8;
+	--code-text: #2a2a2a;
+	--color-success: #555555;
+	--color-warning: #555555;
+	--color-error: #1a1a1a;
+	--color-info: #555555;
+	--error: #1a1a1a;
+	--text-on-accent: #ffffff;
+	--overlay-bg: rgba(0, 0, 0, 0.3);
+	--shadow-dialog: rgba(0, 0, 0, 0.12);
+	--sidebar-bg-start: rgba(232, 232, 232, 0.92);
+	--sidebar-bg-end: rgba(224, 224, 224, 0.96);
+	--sidebar-border: rgba(64, 64, 64, 0.30);
+	--card-bg: linear-gradient(145deg, rgba(232, 232, 232, 1) 0%, rgba(224, 224, 224, 0.97) 100%);
+	--card-border: rgba(64, 64, 64, 0.35);
+	--input-bg: rgba(232, 232, 232, 0.7);
+	--input-border: rgba(64, 64, 64, 0.50);
+	--control-bg: rgba(232, 232, 232, 0.6);
+	--app-bg: linear-gradient(160deg, #f5f5f5 0%, #ececec 50%, #f0f0f0 100%);
+
+	/* Markdown テキスト装飾 */
+	--md-bold: #1a1a1a;
+	--md-heading: #1a1a1a;
+	--md-heading-border: rgba(26, 26, 26, 0.2);
+
+	/* スクロールバー */
+	--scrollbar-thumb: rgba(64, 64, 64, 0.35);
+	--scrollbar-thumb-hover: rgba(64, 64, 64, 0.55);
+	--scrollbar-track: transparent;
+
+	/* エディタ */
+	--editor-bg: #efefef;
+	--editor-text: #1a1a1a;
+	--editor-gutter-bg: #e4e4e4;
+	--editor-gutter-text: rgba(26, 26, 26, 0.5);
+	--editor-cursor: #1a1a1a;
+	--editor-selection: rgba(64, 64, 64, 0.18);
+	--editor-active-line: rgba(64, 64, 64, 0.06);
+	--editor-tab-bg: #e4e4e4;
+	--editor-tab-active-bg: rgba(64, 64, 64, 0.20);
+	--editor-tab-text: #333333;
+	--editor-tab-active-text: #000000;
+	--editor-toolbar-bg: #e4e4e4;
+	--editor-toolbar-text: #333333;
+	--editor-toolbar-hover: #404040;
+	--editor-border: rgba(64, 64, 64, 0.35);
+}
+
+:root[data-theme='dark'] {
+	--bg-primary: #141414;
+	--bg-secondary: #1f1f1f;
+	--text-primary: #f5f5f5;
+	--text-secondary: #d4d4d4;
+	--text-muted: #808080;
+	--accent: #a0a0a0;
+	--border: rgba(160, 160, 160, 0.30);
+	--code-bg: #1f1f1f;
+	--code-text: #d0d0d0;
+	--color-success: #b0b0b0;
+	--color-warning: #b0b0b0;
+	--color-error: #f5f5f5;
+	--color-info: #b0b0b0;
+	--error: #f5f5f5;
+	--text-on-accent: #000000;
+	--overlay-bg: rgba(0, 0, 0, 0.5);
+	--shadow-dialog: rgba(0, 0, 0, 0.4);
+	--sidebar-bg-start: rgba(28, 28, 28, 0.85);
+	--sidebar-bg-end: rgba(20, 20, 20, 0.92);
+	--sidebar-border: rgba(160, 160, 160, 0.25);
+	--card-bg: linear-gradient(145deg, rgba(36, 36, 36, 0.97) 0%, rgba(28, 28, 28, 0.95) 100%);
+	--card-border: rgba(160, 160, 160, 0.35);
+	--input-bg: rgba(36, 36, 36, 0.6);
+	--input-border: rgba(160, 160, 160, 0.45);
+	--control-bg: rgba(36, 36, 36, 0.6);
+	--app-bg: linear-gradient(160deg, #1a1a1a 0%, #141414 50%, #101010 100%);
+
+	/* Markdown テキスト装飾 */
+	--md-bold: #f5f5f5;
+	--md-heading: #e0e0e0;
+	--md-heading-border: rgba(224, 224, 224, 0.25);
+
+	/* スクロールバー */
+	--scrollbar-thumb: rgba(160, 160, 160, 0.30);
+	--scrollbar-thumb-hover: rgba(160, 160, 160, 0.50);
+	--scrollbar-track: transparent;
+
+	/* エディタ */
+	--editor-bg: #1c1c1c;
+	--editor-text: #d4d4d4;
+	--editor-gutter-bg: #181818;
+	--editor-gutter-text: rgba(212, 212, 212, 0.4);
+	--editor-cursor: #f5f5f5;
+	--editor-selection: rgba(160, 160, 160, 0.25);
+	--editor-active-line: rgba(160, 160, 160, 0.08);
+	--editor-tab-bg: #181818;
+	--editor-tab-active-bg: rgba(160, 160, 160, 0.20);
+	--editor-tab-text: #d4d4d4;
+	--editor-tab-active-text: #ffffff;
+	--editor-toolbar-bg: #181818;
+	--editor-toolbar-text: #d4d4d4;
+	--editor-toolbar-hover: #a0a0a0;
+	--editor-border: rgba(160, 160, 160, 0.30);
+}
+
+:root {
+	--sidebar-width: 180px;
+	--font-size-base: 14px;
+	--border-radius: 8px;
+	--spacing-unit: 4px;
+}
+
+body {
+	margin: 0;
+	font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+		sans-serif;
+	font-size: var(--font-size-base);
+	background-color: var(--bg-primary);
+	color: var(--text-primary);
+}
+
+a {
+	color: var(--accent);
+}
+
+/* Scrollbar — テーマ連動 */
+* {
+	scrollbar-width: thin;
+	scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+*::-webkit-scrollbar {
+	width: 6px;
+	height: 6px;
+}
+*::-webkit-scrollbar-track {
+	background: var(--scrollbar-track);
+}
+*::-webkit-scrollbar-thumb {
+	background: var(--scrollbar-thumb);
+	border-radius: 3px;
+}
+*::-webkit-scrollbar-thumb:hover {
+	background: var(--scrollbar-thumb-hover);
+}

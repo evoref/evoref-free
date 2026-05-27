@@ -1,0 +1,930 @@
+"""モデル移行: model_state.json 管理 + 移行処理
+
+設計書 docs/22_base_model_migration.md に準拠。
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+
+import yaml
+
+from backend.log_config import get_logger
+from backend.utils import utc_now as _now
+
+logger = get_logger("core.model_migration")
+
+
+# ────────────────────────────────────────────
+# 補助モデル: コンポーネント定義
+# ────────────────────────────────────────────
+
+ModelComponent = Literal["assist", "embedding", "reranker"]
+ALL_COMPONENTS: tuple[str, ...] = ("assist", "embedding", "reranker")
+
+# config.yaml の model_paths 配下のキー対応
+COMPONENT_CONFIG_KEY: dict[str, str] = {
+    "assist": "assist_model",
+    "embedding": "embed_model",
+    "reranker": "reranker_model",
+}
+
+
+# ────────────────────────────────────────────
+# ModelState: local/model_state.json 管理
+# ────────────────────────────────────────────
+
+
+@dataclass
+class ModelCurrent:
+    """現在のベースモデル情報"""
+    filename: str = ""
+    chat_template_name: str = ""
+    has_system_role: bool = True
+    activated_at: str = ""
+
+
+@dataclass
+class MigrationHistoryEntry:
+    """移行履歴の 1 エントリ"""
+    from_model: str = ""
+    to_model: str = ""
+    migrated_at: str = ""
+    lora_archived_to: str = ""
+
+
+@dataclass
+class ComponentState:
+    """assist / embedding / reranker の current + history"""
+    current: ModelCurrent = field(default_factory=ModelCurrent)
+    history: list[MigrationHistoryEntry] = field(default_factory=list)
+
+
+class ModelState:
+    """local/model_state.json の読み書き管理"""
+
+    def __init__(self, state_path: Path):
+        self.path = state_path
+        self._current = ModelCurrent()
+        self._lora_compatible = True
+        self._migration_history: list[MigrationHistoryEntry] = []
+        self._components: dict[str, ComponentState] = {
+            name: ComponentState() for name in ALL_COMPONENTS
+        }
+        self._load()
+
+    # ── プロパティ ──
+
+    @property
+    def current_filename(self) -> str:
+        return self._current.filename
+
+    @property
+    def current(self) -> ModelCurrent:
+        return self._current
+
+    @property
+    def lora_compatible(self) -> bool:
+        return self._lora_compatible
+
+    @lora_compatible.setter
+    def lora_compatible(self, value: bool) -> None:
+        self._lora_compatible = value
+
+    @property
+    def migration_history(self) -> list[MigrationHistoryEntry]:
+        return self._migration_history
+
+    # ── コンポーネント ──
+
+    def get_component(self, name: str) -> ComponentState:
+        if name not in self._components:
+            raise ValueError(f"Unknown component: {name}")
+        return self._components[name]
+
+    def get_component_current_filename(self, name: str) -> str:
+        return self.get_component(name).current.filename
+
+    def update_component_current(self, name: str, filename: str) -> None:
+        comp = self.get_component(name)
+        comp.current = ModelCurrent(filename=filename, activated_at=_now())
+
+    def add_component_migration(
+        self, name: str, from_model: str, to_model: str,
+    ) -> None:
+        comp = self.get_component(name)
+        comp.history.append(MigrationHistoryEntry(
+            from_model=from_model,
+            to_model=to_model,
+            migrated_at=_now(),
+            lora_archived_to="",
+        ))
+
+    def get_component_last_migration(
+        self, name: str,
+    ) -> MigrationHistoryEntry | None:
+        comp = self.get_component(name)
+        return comp.history[-1] if comp.history else None
+
+    # ── 永続化 ──
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            current = data.get("current", {})
+            self._current = ModelCurrent(
+                filename=current.get("filename", ""),
+                chat_template_name=current.get("chat_template_name", ""),
+                has_system_role=current.get("has_system_role", True),
+                activated_at=current.get("activated_at", ""),
+            )
+            self._lora_compatible = data.get("lora_compatible", True)
+            for h in data.get("migration_history", []):
+                self._migration_history.append(MigrationHistoryEntry(
+                    from_model=h.get("from", ""),
+                    to_model=h.get("to", ""),
+                    migrated_at=h.get("migrated_at", ""),
+                    lora_archived_to=h.get("lora_archived_to", ""),
+                ))
+            # コンポーネント
+            comps = data.get("components", {}) or {}
+            for name in ALL_COMPONENTS:
+                raw = comps.get(name, {}) or {}
+                cur = raw.get("current", {}) or {}
+                comp = ComponentState(
+                    current=ModelCurrent(
+                        filename=cur.get("filename", ""),
+                        chat_template_name=cur.get("chat_template_name", ""),
+                        has_system_role=cur.get("has_system_role", True),
+                        activated_at=cur.get("activated_at", ""),
+                    ),
+                    history=[
+                        MigrationHistoryEntry(
+                            from_model=h.get("from", ""),
+                            to_model=h.get("to", ""),
+                            migrated_at=h.get("migrated_at", ""),
+                            lora_archived_to="",
+                        )
+                        for h in (raw.get("history", []) or [])
+                    ],
+                )
+                self._components[name] = comp
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning("Failed to load model_state.json: %s", e)
+
+    def save(self) -> None:
+        """model_state.json をディスクに保存"""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "current": {
+                "filename": self._current.filename,
+                "chat_template_name": self._current.chat_template_name,
+                "has_system_role": self._current.has_system_role,
+                "activated_at": self._current.activated_at,
+            },
+            "lora_compatible": self._lora_compatible,
+            "migration_history": [
+                {
+                    "from": h.from_model,
+                    "to": h.to_model,
+                    "migrated_at": h.migrated_at,
+                    "lora_archived_to": h.lora_archived_to,
+                }
+                for h in self._migration_history
+            ],
+            "components": {
+                name: {
+                    "current": {
+                        "filename": comp.current.filename,
+                        "chat_template_name": comp.current.chat_template_name,
+                        "has_system_role": comp.current.has_system_role,
+                        "activated_at": comp.current.activated_at,
+                    },
+                    "history": [
+                        {
+                            "from": h.from_model,
+                            "to": h.to_model,
+                            "migrated_at": h.migrated_at,
+                        }
+                        for h in comp.history
+                    ],
+                }
+                for name, comp in self._components.items()
+            },
+        }
+        self.path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    # ── 更新操作 ──
+
+    def update_current(
+        self,
+        filename: str,
+        chat_template_name: str = "",
+        has_system_role: bool = True,
+    ) -> None:
+        """現在のモデル情報を更新"""
+        self._current = ModelCurrent(
+            filename=filename,
+            chat_template_name=chat_template_name,
+            has_system_role=has_system_role,
+            activated_at=_now(),
+        )
+
+    def add_migration(
+        self,
+        from_model: str,
+        to_model: str,
+        lora_archived_to: str = "",
+    ) -> None:
+        """移行履歴にエントリを追加"""
+        self._migration_history.append(MigrationHistoryEntry(
+            from_model=from_model,
+            to_model=to_model,
+            migrated_at=_now(),
+            lora_archived_to=lora_archived_to,
+        ))
+
+    def get_last_migration(self) -> MigrationHistoryEntry | None:
+        """直前の移行履歴を取得"""
+        if not self._migration_history:
+            return None
+        return self._migration_history[-1]
+
+    def initialize_from_config(self, config: dict) -> None:
+        """model_state.json が存在しない場合に config.yaml から初期化"""
+        model_paths = config.get("model_paths", {}) or {}
+        base_model = model_paths.get("base_model", "")
+        filename = Path(base_model).name if base_model else ""
+        changed = False
+        if not self._current.filename:
+            self._current = ModelCurrent(
+                filename=filename,
+                activated_at=_now(),
+            )
+            changed = True
+            logger.info("ModelState initialized from config: %s", filename)
+
+        # コンポーネント
+        for name in ALL_COMPONENTS:
+            comp = self._components[name]
+            if comp.current.filename:
+                continue
+            cfg_key = COMPONENT_CONFIG_KEY[name]
+            raw = model_paths.get(cfg_key, "")
+            if not raw:
+                continue
+            comp.current = ModelCurrent(
+                filename=Path(raw).name,
+                activated_at=_now(),
+            )
+            changed = True
+            logger.info(
+                "ModelState component initialized: %s = %s",
+                name, comp.current.filename,
+            )
+
+        if changed:
+            self.save()
+
+
+# ────────────────────────────────────────────
+# MigrationResult
+# ────────────────────────────────────────────
+
+
+@dataclass
+class MigrationResult:
+    """移行結果"""
+    dry_run: bool = False
+    old_model: str = ""
+    new_model: str = ""
+    lora_action: str = "archived"
+    data_summary: dict = field(default_factory=dict)
+    calibration: dict | None = None
+    recommendations: list[str] = field(default_factory=list)
+
+
+# ────────────────────────────────────────────
+# ModelMigrator: 移行処理の実行
+# ────────────────────────────────────────────
+
+
+class ModelMigrator:
+    """ベースモデル移行処理（§22.4.2 フロー）"""
+
+    def __init__(
+        self,
+        config: dict,
+        project_root: Path,
+        model_state: ModelState,
+        experience_buf=None,
+        prompt_manager=None,
+        eval_core_manager=None,
+        learning_scheduler=None,
+        short_term_memory=None,
+        vector_store=None,
+        cartridge_manager=None,
+    ):
+        self.config = config
+        self.project_root = project_root
+        self.model_state = model_state
+        self.experience_buf = experience_buf
+        self.prompt_manager = prompt_manager
+        self.eval_core_manager = eval_core_manager
+        self.learning_scheduler = learning_scheduler
+        self.short_term_memory = short_term_memory
+        self._vector_store = vector_store
+        self._cartridge_manager = cartridge_manager
+
+    def migrate(
+        self,
+        new_model_path: str,
+        *,
+        try_lora: bool = False,
+        regenerate_context: bool = False,
+        dry_run: bool = False,
+    ) -> MigrationResult:
+        """移行を実行（§22.4.2 Step 1〜9）
+
+        Args:
+            new_model_path: 新モデルの GGUF ファイルパス
+            try_lora: LoRA 互換性テストを試みるか
+            regenerate_context: context_description を再生成するか
+            dry_run: ドライラン（変更しない）
+
+        Returns:
+            MigrationResult
+
+        Raises:
+            MigrationError: 事前検証エラー
+            MigrationBusyError: 学習サイクル実行中
+        """
+        resolved_path = Path(new_model_path)
+        if not resolved_path.is_absolute():
+            resolved_path = self.project_root / resolved_path
+
+        new_model_filename = resolved_path.name
+        old_model_filename = self._get_current_filename()
+
+        result = MigrationResult(
+            dry_run=dry_run,
+            old_model=old_model_filename,
+            new_model=new_model_filename,
+        )
+
+        # Step 1: 事前検証
+        self._validate(resolved_path)
+
+        # データ集計
+        result.data_summary = self._gather_data_summary()
+
+        if dry_run:
+            result.lora_action = "archived" if not try_lora else "kept"
+            result.recommendations = self._build_recommendations(dry_run=True)
+            return result
+
+        # Step 3: LoRA アーカイブ
+        lora_action = self._archive_lora(old_model_filename, try_lora)
+        result.lora_action = lora_action
+
+        # Step 4: 経験バッファ更新
+        self._update_experience_buffer(old_model_filename)
+
+        # Step 5: プロンプトメタ情報更新
+        self._update_prompt_meta(old_model_filename)
+
+        # Step 6: コア評価セット準備
+        self._reset_eval_core()
+
+        # Step 7 (部分): config.yaml 更新
+        self._update_config(new_model_path)
+
+        # Step 8: メモリノート処理（オプション）
+        if regenerate_context:
+            self._mark_context_regeneration()
+
+        # Step 9: model_state 更新
+        archive_dir = f"local/lora_archive/{Path(old_model_filename).stem}/"
+        self.model_state.add_migration(
+            from_model=old_model_filename,
+            to_model=new_model_filename,
+            lora_archived_to=archive_dir if lora_action != "kept" else "",
+        )
+        self.model_state.update_current(filename=new_model_filename)
+        self.model_state.lora_compatible = (try_lora and lora_action == "kept")
+        self.model_state.save()
+
+        result.recommendations = self._build_recommendations(dry_run=False)
+        logger.info(
+            "Migration completed: %s -> %s (lora: %s)",
+            old_model_filename, new_model_filename, lora_action,
+        )
+        return result
+
+    def rollback(self, target_model: str | None = None) -> dict:
+        """ロールバック処理（§22.6）
+
+        Args:
+            target_model: ロールバック先モデル名。省略時は直前の移行元
+
+        Returns:
+            {"rolled_back_to": str, "lora_restored": bool}
+
+        Raises:
+            MigrationError: 履歴なし / ロールバック不能
+        """
+        last = self.model_state.get_last_migration()
+        if last is None:
+            raise MigrationError("No migration history found")
+
+        rollback_target = target_model or last.from_model
+        if not rollback_target:
+            raise MigrationError("Cannot determine rollback target model")
+
+        # LoRA 復元
+        lora_restored = self._restore_lora(rollback_target)
+
+        # config.yaml 更新
+        old_base_model = self.config.get("model_paths", {}).get("base_model", "")
+        model_dir = Path(old_base_model).parent if old_base_model else Path("models")
+        rollback_path = str(model_dir / rollback_target)
+        self._update_config(rollback_path)
+
+        # プロンプト model_calibrated_for 更新
+        if self.prompt_manager:
+            for mode in self.prompt_manager.MODES:
+                try:
+                    meta = self.prompt_manager.get_meta(mode)
+                    meta.model_calibrated_for = rollback_target
+                    self.prompt_manager._save_meta(mode)
+                except ValueError:
+                    continue
+
+        # model_state 更新
+        self.model_state.update_current(filename=rollback_target)
+        self.model_state.lora_compatible = lora_restored
+        self.model_state.save()
+
+        logger.info(
+            "Rollback completed: -> %s (lora_restored=%s)",
+            rollback_target, lora_restored,
+        )
+        return {
+            "rolled_back_to": rollback_target,
+            "lora_restored": lora_restored,
+        }
+
+    # ── コンポーネント移行 ──
+
+    def migrate_component(
+        self,
+        component: str,
+        new_model_path: str,
+        *,
+        dry_run: bool = False,
+    ) -> MigrationResult:
+        """assist / embedding / reranker モデルを切り替える
+
+        base モデルと違い、LoRA・経験バッファ・プロンプトメタなどの
+        付帯処理は不要。config.yaml 更新と model_state 記録のみを行う。
+        実際の llama-server 再起動とクライアント差し替えは L2 で対応する。
+        """
+        if component not in ALL_COMPONENTS:
+            raise MigrationError(
+                f"Unknown component: {component}. "
+                f"Expected one of {ALL_COMPONENTS}",
+            )
+
+        resolved = Path(new_model_path)
+        if not resolved.is_absolute():
+            resolved = self.project_root / resolved
+
+        new_filename = resolved.name
+        old_filename = self._get_component_current(component)
+
+        result = MigrationResult(
+            dry_run=dry_run,
+            old_model=old_filename,
+            new_model=new_filename,
+            lora_action="n/a",
+        )
+
+        # 検証
+        if not resolved.exists():
+            raise MigrationError(f"New model file not found: {resolved}")
+        if not resolved.is_file():
+            raise MigrationError(f"Not a file: {resolved}")
+        if (
+            self.learning_scheduler
+            and getattr(self.learning_scheduler, "running", False)
+        ):
+            raise MigrationBusyError("Learning cycle is currently running")
+
+        if dry_run:
+            result.recommendations = self._build_component_recommendations(
+                component, dry_run=True,
+            )
+            return result
+
+        # config.yaml 更新
+        self._update_component_config(component, new_model_path)
+
+        # model_state 更新
+        self.model_state.add_component_migration(
+            component, old_filename, new_filename,
+        )
+        self.model_state.update_component_current(component, new_filename)
+        self.model_state.save()
+
+        result.recommendations = self._build_component_recommendations(
+            component, dry_run=False,
+        )
+        logger.info(
+            "Component migration completed: %s: %s -> %s",
+            component, old_filename, new_filename,
+        )
+        return result
+
+    def rollback_component(
+        self, component: str, target_model: str | None = None,
+    ) -> dict:
+        """コンポーネントモデルをロールバック"""
+        if component not in ALL_COMPONENTS:
+            raise MigrationError(f"Unknown component: {component}")
+
+        last = self.model_state.get_component_last_migration(component)
+        if last is None:
+            raise MigrationError(
+                f"No migration history for component: {component}",
+            )
+        rollback_target = target_model or last.from_model
+        if not rollback_target:
+            raise MigrationError(
+                f"Cannot determine rollback target for {component}",
+            )
+
+        # 既存の config 値を流用してパスを推定
+        cfg_key = COMPONENT_CONFIG_KEY[component]
+        old_path = self.config.get("model_paths", {}).get(cfg_key, "")
+        model_dir = Path(old_path).parent if old_path else Path("models")
+        rollback_path = str(model_dir / rollback_target)
+
+        self._update_component_config(component, rollback_path)
+        self.model_state.update_component_current(component, rollback_target)
+        self.model_state.save()
+
+        logger.info(
+            "Component rollback completed: %s -> %s",
+            component, rollback_target,
+        )
+        return {
+            "rolled_back_to": rollback_target,
+            "lora_restored": False,
+        }
+
+    def _get_component_current(self, component: str) -> str:
+        cur = self.model_state.get_component_current_filename(component)
+        if cur:
+            return cur
+        cfg_key = COMPONENT_CONFIG_KEY[component]
+        raw = self.config.get("model_paths", {}).get(cfg_key, "")
+        return Path(raw).name if raw else "unknown"
+
+    def _update_component_config(
+        self, component: str, new_model_path: str,
+    ) -> None:
+        config_path = self.project_root / "config.yaml"
+        if not config_path.exists():
+            logger.warning("config.yaml not found, skipping update")
+            return
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        cfg.setdefault("model_paths", {})[COMPONENT_CONFIG_KEY[component]] = (
+            new_model_path
+        )
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(
+                cfg, f,
+                default_flow_style=False,
+                allow_unicode=True,
+                sort_keys=False,
+            )
+        # in-memory config も同期
+        self.config.setdefault("model_paths", {})[
+            COMPONENT_CONFIG_KEY[component]
+        ] = new_model_path
+        logger.info(
+            "config.yaml updated: model_paths.%s = %s",
+            COMPONENT_CONFIG_KEY[component], new_model_path,
+        )
+
+    def _build_component_recommendations(
+        self, component: str, *, dry_run: bool,
+    ) -> list[str]:
+        if dry_run:
+            return [
+                "ドライラン完了。--dry-run を外して実行すると切替が反映されます",
+            ]
+        return [
+            f"{component} モデルの llama-server 再起動が必要です。"
+            "process_manager.enabled=true で自動再起動されます "
+            "(無効時は手動再起動、または POST /api/model/process/{component}/restart)",
+        ]
+
+    # ── 内部メソッド ──
+
+    def _get_current_filename(self) -> str:
+        """現在のモデルファイル名を取得"""
+        if self.model_state.current_filename:
+            return self.model_state.current_filename
+        base_model = self.config.get("model_paths", {}).get("base_model", "")
+        return Path(base_model).name if base_model else "unknown"
+
+    def _validate(self, new_model_path: Path) -> None:
+        """Step 1: 事前検証"""
+        if not new_model_path.exists():
+            raise MigrationError(
+                f"New model file not found: {new_model_path}"
+            )
+        if not new_model_path.is_file():
+            raise MigrationError(f"Not a file: {new_model_path}")
+
+        # 学習サイクル実行中チェック
+        if self.learning_scheduler and self.learning_scheduler.running:
+            raise MigrationBusyError("Learning cycle is currently running")
+
+    def _gather_data_summary(self) -> dict:
+        """移行対象データの集計"""
+        summary: dict = {
+            "memory_notes": 0,
+            "experience_entries": 0,
+            "perplexity_reset": 0,
+            "rag_chunks": 0,
+            "cartridges": 0,
+            "prompts_modes": [],
+        }
+
+        if self.experience_buf:
+            summary["experience_entries"] = self.experience_buf.count
+            summary["perplexity_reset"] = sum(
+                1 for e in self.experience_buf.entries
+                if e.signals.perplexity is not None
+            )
+
+        if self.prompt_manager:
+            summary["prompts_modes"] = list(self.prompt_manager.MODES)
+
+        if self.short_term_memory:
+            summary["memory_notes"] = len(
+                getattr(self.short_term_memory, "notes", [])
+            )
+
+        # RAG / カートリッジは非依存データのため集計のみ
+        if self._vector_store:
+            summary["rag_chunks"] = self._vector_store.count
+        if self._cartridge_manager:
+            summary["cartridges"] = len(getattr(self._cartridge_manager, "installed", {}))
+
+        return summary
+
+    def _archive_lora(self, old_model_name: str, try_lora: bool) -> str:
+        """Step 3: LoRA アーカイブ"""
+        lp = self.config.get("local_paths", {})
+        lora_path = self._resolve_path(
+            lp.get("lora_adapter", "local/models/adapter.gguf")
+        )
+        lora_versions_dir = self._resolve_path(
+            lp.get("lora_versions_dir", "local/lora_versions/")
+        )
+
+        if not lora_path.exists():
+            logger.info("No LoRA adapter found, skipping archive")
+            return "archived"
+
+        if try_lora:
+            logger.info("--try-lora: keeping LoRA for compatibility test")
+            return "kept"
+
+        archive_dir = (
+            self.project_root / "local" / "lora_archive"
+            / Path(old_model_name).stem
+        )
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        # adapter.gguf コピー
+        shutil.copy2(str(lora_path), str(archive_dir / "adapter.gguf"))
+        logger.info(
+            "LoRA archived: %s -> %s",
+            lora_path, archive_dir / "adapter.gguf",
+        )
+
+        # lora_versions/ コピー
+        if lora_versions_dir.exists() and any(lora_versions_dir.iterdir()):
+            versions_archive = archive_dir / "versions"
+            if versions_archive.exists():
+                shutil.rmtree(str(versions_archive))
+            shutil.copytree(str(lora_versions_dir), str(versions_archive))
+            logger.info(
+                "LoRA versions archived: %s -> %s",
+                lora_versions_dir, versions_archive,
+            )
+
+        # 元の LoRA を削除
+        lora_path.unlink()
+        logger.info("Original LoRA adapter removed: %s", lora_path)
+
+        # lora_versions を空にする
+        if lora_versions_dir.exists():
+            for f in lora_versions_dir.iterdir():
+                if f.is_file():
+                    f.unlink()
+                elif f.is_dir():
+                    shutil.rmtree(str(f))
+            logger.info("LoRA versions cleared: %s", lora_versions_dir)
+
+        return "archived"
+
+    def _update_experience_buffer(self, old_model_name: str) -> None:
+        """Step 4: 経験バッファ更新"""
+        if self.experience_buf is None:
+            return
+
+        for entry in self.experience_buf.entries:
+            if not entry.base_model:
+                entry.base_model = old_model_name
+            entry.signals.perplexity = None
+
+        # 永続化
+        exp_file = self._resolve_path(
+            self.config.get("local_paths", {}).get(
+                "experience_file", "local/experience.json"
+            )
+        )
+        self.experience_buf.save(exp_file)
+
+        logger.info(
+            "Experience buffer updated: %d entries, perplexity reset",
+            self.experience_buf.count,
+        )
+
+    def _update_prompt_meta(self, old_model_name: str) -> None:
+        """Step 5: プロンプトメタ情報更新"""
+        if self.prompt_manager is None:
+            return
+
+        for mode in self.prompt_manager.MODES:
+            try:
+                meta = self.prompt_manager.get_meta(mode)
+                meta.model_calibrated_for = old_model_name
+                meta.candidates = []
+                self.prompt_manager._save_meta(mode)
+                logger.info(
+                    "Prompt meta updated: %s.meta.json "
+                    "(model_calibrated_for=%s)",
+                    mode, old_model_name,
+                )
+            except ValueError:
+                continue
+
+    def _reset_eval_core(self) -> None:
+        """Step 6: コア評価セット準備"""
+        if self.eval_core_manager is None:
+            return
+
+        eval_set = self.eval_core_manager.load()
+        for case in eval_set.cases:
+            case.max_perplexity = None
+        eval_set.version += 1
+        self.eval_core_manager.save(eval_set)
+        logger.info("Eval core reset: %d cases", len(eval_set.cases))
+
+    def _update_config(self, new_model_path: str) -> None:
+        """Step 7 (部分): config.yaml の base_model を更新"""
+        config_path = self.project_root / "config.yaml"
+        if not config_path.exists():
+            logger.warning("config.yaml not found, skipping update")
+            return
+
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+
+        cfg.setdefault("model_paths", {})["base_model"] = new_model_path
+
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(
+                cfg, f,
+                default_flow_style=False,
+                allow_unicode=True,
+                sort_keys=False,
+            )
+
+        logger.info(
+            "config.yaml updated: model_paths.base_model = %s",
+            new_model_path,
+        )
+
+    def _mark_context_regeneration(self) -> None:
+        """Step 8: メモリノートの context_description 再生成マーク"""
+        if self.short_term_memory is None:
+            return
+
+        count = 0
+        for note in getattr(self.short_term_memory, "notes", []):
+            if getattr(note, "context_description", ""):
+                note.evolution_pending = True
+                count += 1
+
+        if count > 0:
+            logger.info(
+                "Marked %d notes for context regeneration", count,
+            )
+
+    def _restore_lora(self, target_model: str) -> bool:
+        """ロールバック時の LoRA 復元"""
+        lp = self.config.get("local_paths", {})
+        lora_path = self._resolve_path(
+            lp.get("lora_adapter", "local/models/adapter.gguf")
+        )
+        lora_versions_dir = self._resolve_path(
+            lp.get("lora_versions_dir", "local/lora_versions/")
+        )
+
+        archive_dir = (
+            self.project_root / "local" / "lora_archive"
+            / Path(target_model).stem
+        )
+
+        if not archive_dir.exists():
+            logger.info("No LoRA archive found for %s", target_model)
+            return False
+
+        lora_restored = False
+
+        # adapter.gguf 復元
+        archived_adapter = archive_dir / "adapter.gguf"
+        if archived_adapter.exists():
+            lora_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(archived_adapter), str(lora_path))
+            lora_restored = True
+            logger.info(
+                "LoRA adapter restored: %s -> %s",
+                archived_adapter, lora_path,
+            )
+
+        # versions 復元
+        archived_versions = archive_dir / "versions"
+        if archived_versions.exists():
+            if lora_versions_dir.exists():
+                shutil.rmtree(str(lora_versions_dir))
+            shutil.copytree(str(archived_versions), str(lora_versions_dir))
+            logger.info("LoRA versions restored: %s", lora_versions_dir)
+
+        return lora_restored
+
+    def _build_recommendations(self, *, dry_run: bool) -> list[str]:
+        """推奨アクションを生成"""
+        if dry_run:
+            return [
+                "ドライラン完了。--dry-run を外して実行すると移行が実行されます",
+            ]
+        return [
+            "llama-server を新モデルで再起動してください",
+            "通常通り使用を開始してください（経験が自動蓄積されます）",
+            "プロンプトの再最適化: evoref optimize --level1 で手動実行可能",
+        ]
+
+    def _resolve_path(self, raw: str) -> Path:
+        """パスを絶対パスに解決"""
+        path = Path(raw)
+        return path if path.is_absolute() else self.project_root / path
+
+
+# ────────────────────────────────────────────
+# 例外クラス
+# ────────────────────────────────────────────
+
+
+class MigrationError(Exception):
+    """移行エラー（400 Bad Request に対応）"""
+    pass
+
+
+class MigrationBusyError(MigrationError):
+    """学習サイクル実行中エラー（409 Conflict に対応）"""
+    pass
+
+
+# ────────────────────────────────────────────
+# ヘルパー
+# ────────────────────────────────────────────
+
+

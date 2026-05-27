@@ -1,0 +1,124 @@
+<script lang="ts">
+	import { t } from '$lib/i18n';
+	import { layout } from '$lib/free/stores/theme';
+	import type { ChatMessage } from '$lib/free/stores/chat';
+	import AgenticSteps from './AgenticSteps.svelte';
+	import RagDebugPanel from './RagDebugPanel.svelte';
+	import MarkdownRenderer from './MarkdownRenderer.svelte';
+	import { formatTime } from '$lib/free/utils/format';
+
+	let {
+		message,
+		instanceName = 'evoref',
+		streaming = false,
+		mode = 'chat'
+	}: { message: ChatMessage; instanceName?: string; streaming?: boolean; mode?: string } = $props();
+	let isUser = $derived(message.role === 'user');
+	let isCoding = $derived(mode === 'coding');
+	// コーディングモードではコードをエディタへ流すため、チャット側は
+	// プレースホルダに置換する。'chat' 明示指示時のみコードを表示。
+	let suppressCode = $derived(isCoding && message.editor_route !== 'chat');
+	let showTimestamp = $derived($layout.chat.show_timestamps);
+	let showSpinner = $derived(!isUser && streaming && message.content === '');
+</script>
+
+<div class="message-bubble" class:user={isUser} class:assistant={!isUser} class:coding={isCoding}>
+	{#if !isCoding}
+		<div class="message-header" class:header-right={isUser}>
+			<span class="role-label">{isUser ? $t('chat.you') : instanceName}</span>
+			{#if showTimestamp}
+				<span class="timestamp">&nbsp;{formatTime(message.timestamp)}</span>
+			{/if}
+		</div>
+	{/if}
+
+	{#if !isUser && (message.agentic_steps?.length || message.step_results?.length || showSpinner)}
+		<AgenticSteps steps={message.agentic_steps} results={message.step_results} {showSpinner} />
+	{/if}
+
+	{#if !showSpinner}
+		<div class="message-content">
+			{#if isUser}
+				<p class="whitespace-pre-wrap">{message.content}</p>
+			{:else}
+				<MarkdownRenderer content={message.content} {suppressCode} />
+			{/if}
+		</div>
+	{/if}
+
+	{#if !isUser && message.rag_debug}
+		<RagDebugPanel ragDebug={message.rag_debug} />
+	{/if}
+
+</div>
+
+<style>
+	.message-bubble {
+		max-width: 85%;
+		padding: 10px 14px;
+		border-radius: var(--border-radius);
+		margin-bottom: 12px;
+	}
+	/* --- チャットモード --- */
+	.message-bubble.user:not(.coding) {
+		align-self: flex-end;
+		background-color: color-mix(in srgb, var(--accent) 18%, var(--bg-secondary));
+		color: var(--text-primary);
+		border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+		border-bottom-right-radius: 2px;
+	}
+	.message-bubble.assistant:not(.coding) {
+		align-self: flex-start;
+		background-color: var(--bg-secondary);
+		color: var(--text-primary);
+		border-bottom-left-radius: 2px;
+	}
+	/* --- コーディングモード: 横幅いっぱい --- */
+	.message-bubble.coding {
+		max-width: 100%;
+		width: 100%;
+		margin-bottom: 2px;
+	}
+	.message-bubble.coding.user {
+		align-self: flex-start;
+		background-color: var(--bg-secondary);
+		color: var(--text-primary);
+		border: 1px solid var(--border);
+		border-bottom-left-radius: 2px;
+	}
+	.message-bubble.coding.assistant {
+		background-color: transparent;
+		border: none;
+		padding: 0 0 10px;
+	}
+	.message-header {
+		display: flex;
+		align-items: baseline;
+		margin-bottom: 4px;
+		font-size: 0.85rem;
+	}
+	.message-header.header-right {
+		justify-content: flex-end;
+	}
+	.role-label {
+		font-weight: 600;
+		opacity: 0.8;
+	}
+	.timestamp {
+		opacity: 0.6;
+		font-size: 0.8rem;
+	}
+	.message-content {
+		line-height: 1.5;
+		word-break: break-word;
+	}
+	/* user メッセージは plain text の <p> のみ。
+	 * assistant メッセージの Markdown 系スタイル (h1-h6 / pre / code / table 等) は
+	 * MarkdownRenderer.svelte 側で完結させる。 */
+	.message-content :global(p) {
+		margin: 0 0 8px;
+	}
+	.message-content :global(p:last-child) {
+		margin-bottom: 0;
+	}
+</style>

@@ -1,0 +1,329 @@
+"""レスポンス記録（メモリ・デバッグログ・フィードバック・履歴）"""
+
+from __future__ import annotations
+
+import time
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
+from backend.app_state import AppState
+from backend.free.history.history_manager import SessionData, get_history_manager
+from backend.log_config import get_logger
+
+if TYPE_CHECKING:
+    from backend.free.memory.stores.working import WorkingMemory
+    from backend.free.memory.stores.short_term import ShortTermMemory
+
+logger = get_logger("api.chat.recorder")
+
+# セッション別の開始時刻（初回リクエスト時に記録）
+_session_started: dict[str, str] = {}
+
+# セッション別の全ターン蓄積（WM のエビクションに依存しない完全な履歴）
+_session_turns: dict[str, list[dict]] = {}
+
+
+def _accumulate_turn(
+    session_id: str, role: str, content: str, *, private: bool = False,
+) -> None:
+    """セッションのターンを蓄積
+
+    WorkingMemory はターン数・トークン数上限で古いターンを押し出すため、
+    履歴保存用に全ターンを独立して蓄積する。
+
+    ``private=True`` のターンはディスク永続化対象から
+    除外する (memory_only)。蓄積バッファ自体に追加しない。
+    """
+    if private:
+        logger.debug(
+            "accumulate skipped (private turn): role=%s, session=%s, len=%d",
+            role, session_id, len(content),
+        )
+        return
+    if session_id not in _session_turns:
+        _session_turns[session_id] = []
+    _session_turns[session_id].append({
+        "role": role,
+        "content": content,
+        "timestamp": time.time(),
+    })
+
+
+def clear_session_data(session_id: str) -> None:
+    """セッション切替時にセッション固有データをクリーンアップ"""
+    _session_started.pop(session_id, None)
+    _session_turns.pop(session_id, None)
+
+
+def _save_session_to_history(
+    state: AppState, session_id: str, mode: str,
+) -> None:
+    """蓄積した全ターンを HistoryManager で保存する
+
+    レスポンス完了後に呼ばれ、会話履歴をディスクに永続化する。
+    同一 session_id のファイルは上書きされるため冪等。
+    WorkingMemory ではなく _session_turns を使用し、
+    WM のエビクションで古いターンが失われる問題を回避する。
+    """
+    turns = _session_turns.get(session_id, [])
+    if not turns:
+        return
+
+    try:
+        from backend.config import get_config
+        cfg = get_config()
+        mgr = get_history_manager()
+
+        # 開始時刻を記録（初回のみ）
+        if session_id not in _session_started:
+            first_ts = turns[0].get("timestamp")
+            if first_ts:
+                _session_started[session_id] = datetime.fromtimestamp(
+                    first_ts, tz=timezone.utc,
+                ).isoformat()
+            else:
+                _session_started[session_id] = datetime.now(timezone.utc).isoformat()
+
+        started_at = _session_started[session_id]
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # ターンを履歴用フォーマットに変換
+        history_turns = []
+        for t in turns:
+            entry = {"role": t["role"], "content": t["content"]}
+            ts = t.get("timestamp")
+            if ts:
+                entry["timestamp"] = datetime.fromtimestamp(
+                    ts, tz=timezone.utc,
+                ).isoformat()
+            history_turns.append(entry)
+
+        instance_name = cfg.get("instance", {}).get("name", "evoref")
+        # ユーザーの最初のメッセージを summary に使用（検索用）
+        first_user = next(
+            (t["content"] for t in history_turns if t.get("role") == "user"), None,
+        )
+        summary = first_user[:200] if first_user else None
+
+        session = SessionData(
+            session_id=session_id,
+            started_at=started_at,
+            ended_at=now_iso,
+            mode=mode,
+            modes_used=[mode],
+            instance_name=instance_name,
+            source="auto",
+            turns=history_turns,
+            turn_count=len(history_turns),
+            summary=summary,
+        )
+
+        path = mgr.save_session(session)
+        if path:
+            logger.debug("Session saved to history: %s (%d turns)", session_id, len(history_turns))
+    except Exception as e:
+        logger.warning("Failed to save session to history: %s", e)
+
+
+def drain_evicted_to_stm(
+    wm: WorkingMemory, stm: ShortTermMemory, session_id: str,
+) -> None:
+    """WorkingMemory から押し出されたターンを ShortTermMemory に吸収"""
+    evicted = wm.drain_evicted()
+    for turn in evicted:
+        stm.absorb(turn, session_id)
+    if evicted:
+        total_chars = sum(len(t.get("content", "")) for t in evicted)
+        logger.debug(
+            "Drained %d turns to STM: total_chars=%d, session=%s",
+            len(evicted), total_chars, session_id,
+        )
+        logger.info("Drained %d evicted turns to STM", len(evicted))
+
+
+def record_response(
+    state: AppState, full_response: str, messages: list[dict],
+    session_id: str, user_query: str, mode: str,
+    tokens_generated: int,
+    *,
+    private: bool = False,
+    tool_command: str | None = None,
+    tool_command_name: str | None = None,
+    tool_command_success: bool | None = None,
+) -> None:
+    """応答をメモリ・デバッグログ・経験バッファに記録する
+
+    ``private=True`` の場合は WM/STM までの伝搬のみ行い
+    会話履歴ディスク永続化と feedback collector への記録をスキップする。
+
+    ``tool_command`` / ``tool_command_name`` / ``tool_command_success`` は
+    run_command 実行ターンの learning メタで、assistant note に載せて
+    sleep-time の executable_command_curator が参照する (それ以外は None)。
+    """
+    # メモリに応答を記録
+    mem_sys = state.get_memory_system()
+    if mem_sys and full_response:
+        wm, stm, _ltm = mem_sys
+        wm.add_turn(
+            "assistant", full_response,
+            private=private, mode=mode, source="assistant",
+            tool_command=tool_command,
+            tool_command_name=tool_command_name,
+            tool_command_success=tool_command_success,
+        )
+        drain_evicted_to_stm(wm, stm, session_id)
+
+    # デバッグログ
+    dl = state.debug_logger
+    if dl:
+        dl.log_request(tokens_generated, messages, full_response)
+
+    # 経験バッファに記録 (Level 0) — private は学習対象外
+    fc = state.feedback_collector
+    if fc and full_response and not private:
+        try:
+            fc.record(query=user_query, response=full_response, mode=mode)
+        except Exception as e:
+            logger.warning("FeedbackCollector.record failed: %s", e)
+
+    # sleep-time update をスケジュール
+    scheduler = state.sleep_scheduler
+    if scheduler:
+        scheduler.on_response_sent()
+
+    # ターンを蓄積（WM エビクションに依存しない完全な履歴）
+    _accumulate_turn(session_id, "user", user_query, private=private)
+    if full_response:
+        _accumulate_turn(session_id, "assistant", full_response, private=private)
+
+    # 会話履歴をディスクに保存 (private なら蓄積されていないので no-op)
+    if not private:
+        _save_session_to_history(state, session_id, mode)
+
+
+def record_meta_cognitive_response(
+    state: AppState, full_response: str, messages: list[dict],
+    session_id: str, user_query: str, mode: str,
+    tokens_generated: int, step_credits: list,
+    *,
+    private: bool = False,
+) -> None:
+    """Meta-Cognitive 層の応答をメモリ・経験バッファに記録（クレジット付き）
+
+    ``private=True`` の場合は WM/STM までの伝搬のみ
+    """
+    # メモリに応答を記録
+    mem_sys = state.get_memory_system()
+    if mem_sys and full_response:
+        wm, stm, _ltm = mem_sys
+        wm.add_turn(
+            "assistant", full_response,
+            private=private, mode=mode, source="assistant",
+        )
+        drain_evicted_to_stm(wm, stm, session_id)
+
+    # デバッグログ
+    dl = state.debug_logger
+    if dl:
+        dl.log_request(tokens_generated, messages, full_response)
+
+    # 経験バッファに記録 (Level 0) — ステップクレジット付き / private は対象外
+    fc = state.feedback_collector
+    if fc and full_response and not private:
+        try:
+            credits_dicts = [
+                {"step_index": c.step_index, "action": c.action, "credit": c.credit}
+                for c in step_credits
+            ] if step_credits else []
+            fc.record(
+                query=user_query,
+                response=full_response,
+                mode=mode,
+                step_credits=credits_dicts,
+            )
+        except Exception as e:
+            logger.warning("FeedbackCollector.record failed (meta-cognitive): %s", e)
+
+    # sleep-time update をスケジュール
+    scheduler = state.sleep_scheduler
+    if scheduler:
+        scheduler.on_response_sent()
+
+    # ターンを蓄積（WM エビクションに依存しない完全な履歴）
+    _accumulate_turn(session_id, "user", user_query, private=private)
+    if full_response:
+        _accumulate_turn(session_id, "assistant", full_response, private=private)
+
+    # 会話履歴をディスクに保存 (private は no-op)
+    if not private:
+        _save_session_to_history(state, session_id, mode)
+
+
+def record_long_form_response(
+    state: AppState, full_response: str, messages: list[dict],
+    session_id: str, user_query: str, mode: str,
+    tokens_generated: int, metrics: dict,
+    *,
+    private: bool = False,
+) -> None:
+    """長文生成の応答をメモリ・経験バッファに記録
+
+    ``private=True`` の場合は WM/STM までの伝搬のみ
+    """
+    # メモリに応答を記録
+    mem_sys = state.get_memory_system()
+    if mem_sys and full_response:
+        wm, stm, _ltm = mem_sys
+        wm.add_turn(
+            "assistant", full_response,
+            private=private, mode=mode, source="assistant",
+        )
+        drain_evicted_to_stm(wm, stm, session_id)
+
+    # デバッグログ
+    dl = state.debug_logger
+    if dl:
+        dl.log_request(tokens_generated, messages, full_response)
+
+    # 経験バッファに記録 (Level 0) — 長文生成メトリクス付き / private は対象外
+    fc = state.feedback_collector
+    if fc and full_response and not private:
+        try:
+            # 長文生成が成功したと判定できる条件:
+            #   - units_completed > 0 (1 ユニット以上生成)
+            #   - validation_errors == 0 (検証エラーなし)
+            # 失敗時は long_form_success=False のままで、learned_patterns への
+            # boost は走らない (新規追加もなし)。
+            units_completed = int(metrics.get("units_completed", 0) or 0)
+            validation_errors = int(metrics.get("validation_errors", 0) or 0)
+            long_form_success = units_completed > 0 and validation_errors == 0
+
+            fc.record(
+                query=user_query,
+                response=full_response,
+                mode=mode,
+                long_form_used=True,
+                long_form_content_type=metrics.get("content_type"),
+                long_form_strategy=metrics.get("strategy"),
+                long_form_units_total=metrics.get("units_total", 0),
+                long_form_units_completed=units_completed,
+                long_form_validation_errors=validation_errors,
+                long_form_budget_used_pct=metrics.get("budget_used_pct"),
+                long_form_success=long_form_success,
+            )
+        except Exception as e:
+            logger.warning("FeedbackCollector.record failed (long-form): %s", e)
+
+    # sleep-time update をスケジュール
+    scheduler = state.sleep_scheduler
+    if scheduler:
+        scheduler.on_response_sent()
+
+    # ターンを蓄積（WM エビクションに依存しない完全な履歴）
+    _accumulate_turn(session_id, "user", user_query, private=private)
+    if full_response:
+        _accumulate_turn(session_id, "assistant", full_response, private=private)
+
+    # 会話履歴をディスクに保存 (private は no-op)
+    if not private:
+        _save_session_to_history(state, session_id, mode)

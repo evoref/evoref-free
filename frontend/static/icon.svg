@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120">
+  <defs>
+    <linearGradient id="topGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#7B2D8E" />
+      <stop offset="100%" style="stop-color:#C03B7E" />
+    </linearGradient>
+    <linearGradient id="bottomGrad" x1="100%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" style="stop-color:#1A1B4B" />
+      <stop offset="100%" style="stop-color:#7B2D8E;stop-opacity:0.7" />
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="120" height="120" fill="#FAFAFA" rx="8"/>
+
+  <g transform="translate(57, 61)">
+
+    <!-- TOP HALF: shifted slightly right -->
+    <path d="M-36 -2
+             A 42 42 0 0 1 48 -2"
+          fill="url(#topGrad)" opacity="0.95"
+          transform="translate(4, 0)"/>
+
+    <!-- BOTTOM HALF: shifted slightly left, with "e" mouth opening extending down -->
+    <path d="M42 2
+             A 42 42 0 0 1 -42 2
+             L -42 -9
+             L 30 -9
+             L 30 2
+             A 26 26 0 0 0 6 38
+             L 2 42
+             A 42 42 0 0 1 42 2
+             Z"
+          fill="url(#bottomGrad)" opacity="0.9"
+          transform="translate(-4, 0)"/>
+
+    <!-- Accent dot -->
+    <circle cx="0" cy="35" r="3" fill="#C03B7E" opacity="0.8"/>
+
+  </g>
+</svg>

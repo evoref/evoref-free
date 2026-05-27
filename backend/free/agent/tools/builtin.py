@@ -1,0 +1,843 @@
+"""ビルトインツール群の定義と登録"""
+
+from __future__ import annotations
+
+import asyncio
+import ast
+import os
+import re
+import socket
+import subprocess
+from ipaddress import ip_address
+from pathlib import Path
+from typing import TYPE_CHECKING
+from urllib.parse import urlparse
+
+from backend.free.llm.utils import extract_content
+from backend.log_config import get_logger
+from backend.utils import utc_compact_stamp
+
+if TYPE_CHECKING:
+    from backend.free.history.history_manager import HistoryManager
+    from backend.free.llm.assist_client import AssistModelClient
+    from backend.free.llm.local_client import LocalClient
+
+logger = get_logger("agent.tools.builtin")
+
+# 最後の run_command 全文出力バッファ（/page コマンド用）
+_last_full_output: str = ""
+_last_full_output_lines: int = 0
+
+# 出力切り詰めマーカー（共通定数モジュールから import）
+from backend.free.constants import TRUNCATION_MARKER
+
+# 安全な計算用に許可するノード
+_SAFE_NODES = {
+    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow, ast.FloorDiv,
+    ast.USub, ast.UAdd,
+}
+
+
+def calculate(expression: str) -> str:
+    """数式を安全に計算する"""
+    try:
+        tree = ast.parse(expression, mode="eval")
+        for node in ast.walk(tree):
+            if type(node) not in _SAFE_NODES:
+                return f"Error: Unsafe expression (disallowed node: {type(node).__name__})"
+        result = eval(compile(tree, "<calc>", "eval"), {"__builtins__": {}})
+        return str(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def read_file(file_path: str) -> str:
+    """ファイルの内容を読み込む"""
+    p = Path(file_path)
+    if not p.exists():
+        return f"Error: File not found: {file_path}"
+    if not p.is_file():
+        return f"Error: Not a file: {file_path}"
+    try:
+        content = p.read_text(encoding="utf-8")
+        # 大きすぎるファイルは切り詰め
+        if len(content) > 50000:
+            return content[:50000] + "\n\n... (truncated, file too large)"
+        return content
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def verify_syntax(file_path: str) -> str:
+    """Python ファイルの構文を検証する（__pycache__ を生成しない）"""
+    p = Path(file_path)
+    if not p.exists():
+        return f"Error: file not found: {file_path}"
+    if not p.is_file():
+        return f"Error: not a file: {file_path}"
+    if p.suffix != ".py":
+        return f"Error: not a Python file: {file_path}"
+    try:
+        import py_compile
+        import os
+        import tempfile
+        # cfile を一時ファイルに指定し、__pycache__ の生成を防止
+        fd, tmp_pyc = tempfile.mkstemp(suffix=".pyc")
+        os.close(fd)
+        try:
+            py_compile.compile(str(p), cfile=tmp_pyc, doraise=True)
+        finally:
+            # 一時 .pyc ファイルを削除
+            try:
+                os.unlink(tmp_pyc)
+            except OSError:
+                pass
+        return f"Syntax OK: {file_path}"
+    except py_compile.PyCompileError as e:
+        return f"Syntax error: {e}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def write_file(file_path: str, content: str) -> str:
+    """ファイルに書き込む
+
+    ``file_path`` が既存ディレクトリを指している場合は配下に
+    ``output_<UTC>.txt`` を自動付与して書き込む。エージェント
+    (deliberative / long_form) がディレクトリ末尾でパスを切り出した場合の
+    "directory, not a file" 失敗を回避するための一般化対応。
+    """
+    p = Path(file_path)
+    if p.is_dir():
+        auto_name = f"output_{utc_compact_stamp()}.txt"
+        p = p / auto_name
+        file_path = str(p)
+        logger.info("write_file: directory target detected; auto-naming → %s", file_path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return f"Written {len(content)} bytes to {file_path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def search_code(pattern: str, directory: str = ".", max_results: int = 20) -> str:
+    """コードを正規表現パターンで検索する"""
+    try:
+        regex = re.compile(pattern)
+    except re.error as e:
+        return f"Error: Invalid regex: {e}"
+
+    results: list[str] = []
+    base = Path(directory)
+    if not base.exists():
+        return f"Error: Directory not found: {directory}"
+
+    for root, dirs, files in os.walk(base):
+        # 隠しディレクトリ・一般的な除外をスキップ
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"node_modules", "__pycache__", ".git"}]
+        for fname in files:
+            fpath = Path(root) / fname
+            try:
+                text = fpath.read_text(encoding="utf-8", errors="ignore")
+                for i, line in enumerate(text.splitlines(), 1):
+                    if regex.search(line):
+                        results.append(f"{fpath}:{i}: {line.strip()}")
+                        if len(results) >= max_results:
+                            return "\n".join(results) + f"\n... (limited to {max_results} results)"
+            except (OSError, UnicodeDecodeError):
+                continue
+
+    if not results:
+        return f"No matches found for pattern: {pattern}"
+    return "\n".join(results)
+
+
+def list_directory(directory: str = ".", max_depth: int = 3) -> str:
+    """ディレクトリ構造を表示する"""
+    base = Path(directory)
+    if not base.exists():
+        return f"Error: Directory not found: {directory}"
+
+    lines: list[str] = []
+    _walk_tree(base, lines, prefix="", depth=0, max_depth=max_depth)
+
+    if not lines:
+        return "(empty directory)"
+    return "\n".join(lines[:200])
+
+
+def _walk_tree(path: Path, lines: list[str], prefix: str, depth: int, max_depth: int) -> None:
+    """ディレクトリツリーを再帰的に構築"""
+    if depth > max_depth:
+        return
+    entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name))
+    skip_dirs = {".git", "node_modules", "__pycache__", ".svelte-kit", "dist"}
+    for i, entry in enumerate(entries):
+        if entry.name.startswith(".") and entry.is_dir():
+            continue
+        if entry.name in skip_dirs:
+            continue
+        is_last = i == len(entries) - 1
+        connector = "└── " if is_last else "├── "
+        suffix = "/" if entry.is_dir() else ""
+        lines.append(f"{prefix}{connector}{entry.name}{suffix}")
+        if entry.is_dir():
+            extension = "    " if is_last else "│   "
+            _walk_tree(entry, lines, prefix + extension, depth + 1, max_depth)
+
+
+def apply_diff(file_path: str, diff_text: str) -> str:
+    """unified diff をファイルに適用する
+
+    失敗時は原文を保持し、エラーメッセージを返す。
+    """
+    p = Path(file_path)
+    if not p.exists():
+        return f"Error: File not found: {file_path}"
+
+    original = p.read_text(encoding="utf-8")
+
+    try:
+        result = subprocess.run(
+            ["patch", "-p0", "--no-backup-if-mismatch"],
+            input=diff_text,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=p.parent,
+        )
+        if result.returncode == 0:
+            return f"Diff applied successfully to {file_path}"
+        # 適用失敗: 原文を復元
+        p.write_text(original, encoding="utf-8")
+        return f"Error: Diff failed: {result.stderr.strip()}"
+    except FileNotFoundError:
+        return "Error: 'patch' command not found. Install GNU patch."
+    except subprocess.TimeoutExpired:
+        p.write_text(original, encoding="utf-8")
+        return "Error: Diff application timed out"
+
+
+async def run_command(command: str, timeout: int = 30, config: dict | None = None) -> str:
+    """シェルコマンドを非同期で実行する（危険コマンドガード + 対話的コマンドガード付き）
+
+    config['agent']['dangerous_command_block'] が true（デフォルト）の場合、
+    DANGEROUS_PATTERNS にマッチするコマンドの実行をブロックする。
+
+    対話的コマンド（vim, python REPL 等）は TTY パススルーが必要なため、
+    バックエンド側では実行せずにシェルアウト要求メッセージを返す（設計書 09 §9.4.4）。
+
+    長時間実行プロセス（GUI アプリ等）はタイムアウト後もプロセスを終了させず
+    バックグラウンドで継続させる。
+    """
+    cfg = config or {}
+    if cfg.get("agent", {}).get("dangerous_command_block", True):
+        from backend.free.agent.safety_patterns import DANGEROUS_PATTERNS
+        from backend.i18n_helper import msg
+
+        if any(re.search(p, command) for p in DANGEROUS_PATTERNS):
+            logger.warning("Dangerous command blocked: %s", command[:100])
+            return msg("agent.dangerous_command_blocked", command=command[:80])
+
+    # 対話的コマンドガード（設計書 09 §9.4.4）
+    from backend.free.cli.shell_out import is_interactive_command
+
+    if is_interactive_command(command):
+        logger.info("Interactive command detected, shell-out required: %s", command[:100])
+        from backend.i18n_helper import msg
+        return msg("agent.interactive_command_blocked", command=command[:80])
+
+    # mkdir コマンドは OS 差異を吸収するため Python で実行
+    mkdir_match = re.match(r'^\s*(?:mkdir(?:\s+-p)?)\s+(.+)$', command)
+    if mkdir_match:
+        return _mkdir_safe(mkdir_match.group(1).strip().strip('"').strip("'"))
+
+    return await _run_command_async_impl(command, timeout)
+
+
+def _mkdir_safe(dir_path: str) -> str:
+    """mkdir を exist_ok=True で安全に実行する（Windows/Unix 差異を吸収）"""
+    try:
+        Path(dir_path).mkdir(parents=True, exist_ok=True)
+        return f"Directory ensured: {dir_path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+async def _run_command_async_impl(cmd: str, timeout: int = 30) -> str:
+    """シェルコマンドの非同期実行本体
+
+    stdlib subprocess.Popen をワーカースレッド経由で呼び出すことでイベントループを
+    ブロックしない。タイムアウト時はプロセスを終了させず、バックグラウンドで継続させる。
+
+    asyncio.create_subprocess_shell を使わないのは、Windows の ProactorEventLoop が
+    生成するパイプトランスポートが、タイムアウト時に Process オブジェクトを放置する
+    と GC 時 (loop 終了後) に `_ProactorBasePipeTransport.__del__` から
+    `ValueError: I/O operation on closed pipe` を投げるため
+    stdlib のパイプは __del__ で警告を投げないので安全に放置できる。
+    """
+    global _last_full_output, _last_full_output_lines
+    try:
+        proc = subprocess.Popen(  # noqa: S602  # shell=True は設計上必要
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                asyncio.to_thread(proc.communicate), timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            # プロセスがタイムアウト内に終了しなかった（GUI/デーモン/長時間処理）
+            # プロセスは終了させずバックグラウンドで継続させる
+            logger.info(
+                "Process still running after %ds, left in background: PID=%s, cmd=%s",
+                timeout, proc.pid, cmd[:100],
+            )
+            _last_full_output = ""
+            _last_full_output_lines = 0
+            return (
+                f"Process (PID {proc.pid}) is still running after {timeout}s. "
+                "It was left running in the background."
+            )
+
+        output = stdout_bytes.decode("utf-8", errors="replace")
+        if stderr_bytes:
+            output += f"\n[stderr] {stderr_bytes.decode('utf-8', errors='replace')}"
+        if proc.returncode != 0:
+            output += f"\n[exit code: {proc.returncode}]"
+        # 出力を切り詰め（設計書 09 §9.5.3: 200行超で先頭100行+末尾100行）
+        lines = output.splitlines()
+        if len(lines) > 200:
+            # 全文を /page 用バッファに保存
+            _last_full_output = output
+            _last_full_output_lines = len(lines)
+            head = lines[:100]
+            tail = lines[-100:]
+            skipped = len(lines) - 200
+            output = "\n".join(head) + f"\n\n… ({skipped}{TRUNCATION_MARKER}) …\n\n" + "\n".join(tail)
+        else:
+            _last_full_output = ""
+            _last_full_output_lines = 0
+        return output or "(no output)"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def get_last_full_output() -> tuple[str, int]:
+    """最後の run_command の全文出力を返す（/page コマンド用）
+
+    Returns:
+        (output, total_lines): 全文と行数。切り詰めが無かった場合は空文字列。
+    """
+    return _last_full_output, _last_full_output_lines
+
+
+def clear_last_full_output() -> None:
+    """全文出力バッファをクリア"""
+    global _last_full_output, _last_full_output_lines
+    _last_full_output = ""
+    _last_full_output_lines = 0
+
+
+# fetch_url で除去する HTML タグ（ノイズ源）
+_STRIP_TAGS = [
+    "script", "style", "nav", "footer", "header", "aside",
+    "noscript", "iframe", "form", "svg", "meta", "link",
+]
+
+
+def _strip_html_fallback(html: str) -> str:
+    """BeautifulSoup なしで HTML タグを除去するフォールバック
+
+    stdlib の html.parser を使い、タグ構造を正確にパースする。
+    """
+    from html.parser import HTMLParser
+
+    class _TextExtractor(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self._result: list[str] = []
+            self._skip_depth = 0  # スキップ中のタグのネスト深度
+
+        def handle_starttag(self, tag: str, attrs):
+            if tag.lower() in _STRIP_TAGS:
+                self._skip_depth += 1
+
+        def handle_endtag(self, tag: str):
+            if tag.lower() in _STRIP_TAGS and self._skip_depth > 0:
+                self._skip_depth -= 1
+
+        def handle_data(self, data: str):
+            if self._skip_depth == 0:
+                stripped = data.strip()
+                if stripped:
+                    self._result.append(stripped)
+
+        def get_text(self) -> str:
+            return "\n".join(self._result)
+
+    extractor = _TextExtractor()
+    try:
+        extractor.feed(html)
+    except Exception:
+        # パース失敗時は最低限の正規表現フォールバック
+        import re as _re
+        text = _re.sub(r"<[^>]+>", "", html)
+        text = _re.sub(r"\n\s*\n", "\n", text)
+        return text.strip()
+    return extractor.get_text()
+
+
+_FETCH_URL_USER_AGENT = "evoref-fetch/1.0"
+_FETCH_URL_MAX_BYTES = 5_000_000  # 5 MB (raw body) — DoS 抑止
+_FETCH_URL_MAX_REDIRECTS = 5
+_FETCH_URL_ALLOWED_SCHEMES = ("http", "https")
+_FETCH_URL_TEXT_CONTENT_TYPE_PREFIXES = (
+    "text/",
+    "application/xhtml",
+    "application/xml",
+    "application/json",
+)
+# fetch_url 結果のプロンプト合流時の最大文字数。
+# 20_000 ではベース LLM のプリフィルが 30〜50 秒に達して
+# フロント側 SSE chunk timeout を引き起こしていたため 8_000 に抑制。
+_FETCH_URL_MAX_TEXT_CHARS = 8_000
+# fetch_url の戻り値がこの文字数を超えた場合、アシストモデルで
+# 要約してからベース LLM に渡す。assist_client が未注入の場合は
+# 従来通り truncate のみで返す (degraded mode 安全縮退)。
+_FETCH_URL_SUMMARIZE_THRESHOLD = 4_000
+# fetch_url 要約プロンプト (英語固定でアシストモデルへ指示)。
+_FETCH_URL_SUMMARIZE_SYSTEM = (
+    "You are a precise summarizer for retrieved web content. "
+    "Summarize the user-provided text in 500-1000 characters while preserving "
+    "important facts, numbers, names, and dates. Output the summary directly "
+    "without markdown fences, headings, or meta-commentary."
+)
+
+
+def _validate_fetch_url(url: str, *, allow_private_ip: bool) -> str | None:
+    """fetch_url の URL を検証する。エラー時はユーザー向け文字列、安全なら None。
+
+    theme_installer.install_from_url の検証パターンをミラー。
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in _FETCH_URL_ALLOWED_SCHEMES:
+        return f"Error: Unsupported URL scheme: {parsed.scheme!r}"
+    if not parsed.hostname:
+        return "Error: URL has no hostname"
+    if allow_private_ip:
+        return None
+    try:
+        resolved = socket.getaddrinfo(parsed.hostname, None)
+    except socket.gaierror as e:
+        return f"Error: Failed to resolve hostname {parsed.hostname!r}: {e}"
+    for _, _, _, _, sockaddr in resolved:
+        addr = ip_address(sockaddr[0])
+        if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
+            return (
+                "Error: Access to private/reserved addresses is not allowed "
+                "(set tools.fetch_url_allow_private_ip: true to override)"
+            )
+    return None
+
+
+def _redact_url_for_log(url: str) -> str:
+    """ログ用に URL のクエリ文字列・fragment を除去 (PII / token 漏洩対策)"""
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+
+async def fetch_url(
+    url: str,
+    timeout: int = 10,
+    *,
+    allow_private_ip: bool = False,
+) -> str:
+    """URL を取得してテキスト化する"""
+    if not url:
+        return "Error: URL is required"
+
+    err = _validate_fetch_url(url, allow_private_ip=allow_private_ip)
+    if err:
+        return err
+
+    import httpx as _httpx
+
+    body_bytes = bytearray()
+    truncated = False
+    encoding = "utf-8"
+    try:
+        async with _httpx.AsyncClient(
+            follow_redirects=True,
+            max_redirects=_FETCH_URL_MAX_REDIRECTS,
+            timeout=timeout,
+            headers={"User-Agent": _FETCH_URL_USER_AGENT},
+        ) as client:
+            async with client.stream("GET", url) as r:
+                r.raise_for_status()
+                ctype = r.headers.get("content-type", "").lower()
+                if not any(ctype.startswith(p) for p in _FETCH_URL_TEXT_CONTENT_TYPE_PREFIXES):
+                    return f"Error: Unsupported content-type: {ctype or '(none)'}"
+                encoding = r.encoding or "utf-8"
+                async for chunk in r.aiter_bytes():
+                    body_bytes.extend(chunk)
+                    if len(body_bytes) >= _FETCH_URL_MAX_BYTES:
+                        truncated = True
+                        break
+    except Exception as e:
+        logger.warning("fetch_url failed: url=%s err=%r", _redact_url_for_log(url), e)
+        return f"Error fetching URL ({type(e).__name__}): {e}"
+
+    html_text = bytes(body_bytes).decode(encoding, errors="replace")
+
+    # BeautifulSoup が使えれば使う、なければ stdlib HTMLParser フォールバック
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_text, "html.parser")
+        for tag in soup(_STRIP_TAGS):
+            tag.decompose()
+        text = soup.get_text(separator="\n", strip=True)
+    except ImportError:
+        logger.warning("bs4 not available, falling back to stdlib HTML parser")
+        text = _strip_html_fallback(html_text)
+
+    if len(text) > _FETCH_URL_MAX_TEXT_CHARS:
+        text = text[:_FETCH_URL_MAX_TEXT_CHARS] + "\n... (truncated)"
+    if truncated:
+        text += f"\n... (response body truncated at {_FETCH_URL_MAX_BYTES} bytes)"
+    return text
+
+
+def _make_fetch_url(cfg: dict, assist_client: "AssistModelClient | None" = None):
+    """fetch_url ツールハンドラを生成（config / assist_client をクロージャでバインド）
+
+    ``assist_client`` が与えられている場合、戻り値が
+    ``_FETCH_URL_SUMMARIZE_THRESHOLD`` を超えていれば
+    アシストモデル (purpose=``summarize``) で要約してから返す。
+    要約失敗・assist_client=None の場合は truncate 済み原文で安全縮退する。
+    """
+    tools_cfg = cfg.get("tools", {})
+    default_timeout = int(tools_cfg.get("fetch_url_timeout", 10))
+    allow_private_ip = bool(tools_cfg.get("fetch_url_allow_private_ip", False))
+
+    async def _fetch_url(url: str, timeout: int = default_timeout) -> str:
+        text = await fetch_url(
+            url, timeout=timeout, allow_private_ip=allow_private_ip,
+        )
+        if (
+            assist_client is None
+            or text.startswith("Error")
+            or len(text) <= _FETCH_URL_SUMMARIZE_THRESHOLD
+        ):
+            return text
+        try:
+            messages = [
+                {"role": "system", "content": _FETCH_URL_SUMMARIZE_SYSTEM},
+                {
+                    "role": "user",
+                    "content": (
+                        f"URL: {url}\n\nContent:\n{text}\n\n"
+                        "Provide the summary now."
+                    ),
+                },
+            ]
+            result = await assist_client.generate(
+                messages, stream=False, purpose="summarize",
+            )
+            summary = extract_content(result).strip()
+            if summary:
+                logger.info(
+                    "fetch_url summarized: url=%s, %d -> %d chars",
+                    _redact_url_for_log(url), len(text), len(summary),
+                )
+                return f"(Summary of {url})\n{summary}"
+        except Exception as e:
+            logger.warning(
+                "fetch_url summarize failed: url=%s err=%r; "
+                "falling back to truncated raw text",
+                _redact_url_for_log(url), e,
+            )
+        return text
+
+    return _fetch_url
+
+
+def _make_summarize(client: LocalClient):
+    """summarize ツールハンドラを生成（LocalClient をクロージャでバインド）"""
+
+    async def summarize(text: str) -> str:
+        """テキストを要約する"""
+        messages = [
+            {"role": "system", "content": "You are a summarization assistant. Summarize the given text concisely."},
+            {"role": "user", "content": f"Summarize the following text:\n\n{text}"},
+        ]
+        try:
+            result = await client.generate(
+                messages, stream=False, temperature=0.3,
+                id_slot=client.background_slot,
+            )
+            return extract_content(result)
+        except Exception as e:
+            logger.error("summarize tool failed: %s", e)
+            return f"Error: {e}"
+
+    return summarize
+
+
+def _make_translate(client: LocalClient):
+    """translate ツールハンドラを生成（LocalClient をクロージャでバインド）"""
+
+    async def translate(text: str, target_lang: str) -> str:
+        """テキストを指定言語に翻訳する"""
+        messages = [
+            {"role": "system", "content": "You are a translation assistant. Translate the given text accurately."},
+            {"role": "user", "content": f"Translate the following text to {target_lang}:\n\n{text}"},
+        ]
+        try:
+            result = await client.generate(
+                messages, stream=False, temperature=0.3,
+                id_slot=client.background_slot,
+            )
+            return extract_content(result)
+        except Exception as e:
+            logger.error("translate tool failed: %s", e)
+            return f"Error: {e}"
+
+    return translate
+
+
+def _make_draft_document(client: LocalClient):
+    """draft_document ツールハンドラを生成（LocalClient をクロージャでバインド）"""
+
+    async def draft_document(instruction: str, format: str = "markdown") -> str:
+        """指示に基づいてドキュメントを生成する"""
+        messages = [
+            {"role": "system", "content": f"You are a document drafting assistant. Generate documents in {format} format."},
+            {"role": "user", "content": instruction},
+        ]
+        try:
+            result = await client.generate(
+                messages, stream=False, temperature=0.7,
+                id_slot=client.background_slot,
+            )
+            return extract_content(result)
+        except Exception as e:
+            logger.error("draft_document tool failed: %s", e)
+            return f"Error: {e}"
+
+    return draft_document
+
+
+def _make_run_command(config: dict):
+    """run_command ハンドラを生成（config をクロージャでバインド）
+
+    ToolsRegistry 経由の呼び出しで config.agent.dangerous_command_block 設定を反映するため、
+    config をクロージャで捕捉する（設計書 §6.8.8）。
+    """
+
+    async def wrapped(command: str, timeout: int = 30) -> str:
+        return await run_command(command, timeout, config)
+
+    return wrapped
+
+
+def _make_search_history(manager: HistoryManager):
+    """search_history ツールハンドラを生成（HistoryManager をクロージャでバインド）"""
+
+    def search_history(query: str, mode: str | None = None, limit: int = 10,
+                       date_from: str | None = None, date_to: str | None = None) -> str:
+        """過去の会話履歴を検索する"""
+        try:
+            results = manager.search_sessions(
+                query=query, mode=mode, limit=limit, search_turns=False,
+                date_from=date_from, date_to=date_to,
+            )
+            # 結果が少ない場合のみターン検索で再検索
+            if len(results) < limit:
+                results = manager.search_sessions(
+                    query=query, mode=mode, limit=limit, search_turns=True,
+                    date_from=date_from, date_to=date_to,
+                )
+            if not results:
+                return f"No results found for: {query}"
+
+            lines: list[str] = []
+            for r in results:
+                header = f"[{r['started_at']}] mode={r['mode']} score={r['relevance_score']:.1f}"
+                if r.get("summary"):
+                    header += f" | {r['summary']}"
+                lines.append(header)
+                for turn in r.get("matched_turns", []):
+                    lines.append(f"  turn#{turn['index']} ({turn['role']}): {turn['content_preview']}")
+            return "\n".join(lines)
+        except Exception as e:
+            logger.error("search_history tool failed: %s", e)
+            return f"Error: {e}"
+
+    return search_history
+
+
+def register_builtin_tools(
+    registry,
+    config: dict | None = None,
+    local_client: LocalClient | None = None,
+    history_manager: HistoryManager | None = None,
+    *,
+    assist_client: "AssistModelClient | None" = None,
+) -> None:
+    """ビルトインツールをレジストリに一括登録
+
+    ``assist_client`` が与えられた場合、fetch_url の戻り値が長文の場合に
+    アシストモデル (purpose="summarize") で要約してから返す。
+    None の場合は従来通り truncate のみで動作する。
+    """
+    cfg = config or {}
+
+    registry.register(
+        name="calculate",
+        func=calculate,
+        description="Evaluate a mathematical expression safely",
+        parameters={
+            "expression": {"type": "string", "description": "Math expression to evaluate"},
+        },
+    )
+
+    registry.register(
+        name="read_file",
+        func=read_file,
+        description="Read the contents of a file",
+        parameters={
+            "file_path": {"type": "string", "description": "Path to the file to read"},
+        },
+    )
+
+    registry.register(
+        name="write_file",
+        func=write_file,
+        description="Write content to a file (parent directories are created automatically, no mkdir needed)",
+        parameters={
+            "file_path": {"type": "string", "description": "Path to the file to write"},
+            "content": {"type": "string", "description": "Content to write"},
+        },
+        modes=["coding"],
+    )
+
+    registry.register(
+        name="search_code",
+        func=search_code,
+        description="Search code files using a regex pattern",
+        parameters={
+            "pattern": {"type": "string", "description": "Regex pattern to search for"},
+            "directory": {"type": "string", "description": "Directory to search in"},
+        },
+        modes=["coding"],
+    )
+
+    registry.register(
+        name="list_directory",
+        func=list_directory,
+        description="List the directory structure",
+        parameters={
+            "directory": {"type": "string", "description": "Directory to list"},
+        },
+    )
+
+    registry.register(
+        name="apply_diff",
+        func=apply_diff,
+        description="Apply a unified diff to a file",
+        parameters={
+            "file_path": {"type": "string", "description": "Path to the file to patch"},
+            "diff_text": {"type": "string", "description": "Unified diff content"},
+        },
+        modes=["coding"],
+    )
+
+    registry.register(
+        name="run_command",
+        func=_make_run_command(cfg),
+        description="Execute a shell command (CLI only)",
+        parameters={
+            "command": {"type": "string", "description": "Shell command to execute"},
+        },
+        modes=["coding"],
+    )
+
+    registry.register(
+        name="verify_syntax",
+        func=verify_syntax,
+        description="Verify Python file syntax (checks existence and runs py_compile)",
+        parameters={
+            "file_path": {"type": "string", "description": "Path to the Python file to verify"},
+        },
+        modes=["coding"],
+    )
+
+    # fetch_url（デフォルト有効、config で無効化可能）
+    if cfg.get("tools", {}).get("fetch_url_enabled", True):
+        fetch_timeout = cfg.get("tools", {}).get("fetch_url_timeout", 10)
+        registry.register(
+            name="fetch_url",
+            func=_make_fetch_url(cfg, assist_client=assist_client),
+            description="Fetch a URL and extract text content",
+            parameters={
+                "url": {"type": "string", "description": "URL to fetch"},
+                "timeout": {"type": "integer", "description": f"Request timeout (default: {fetch_timeout})"},
+            },
+        )
+
+    # LLM ツール（summarize / translate / draft_document）
+    if local_client is not None:
+        registry.register(
+            name="summarize",
+            func=_make_summarize(local_client),
+            description="Summarize the given text concisely",
+            parameters={
+                "text": {"type": "string", "description": "Text to summarize"},
+            },
+            modes=["chat"],
+        )
+
+        registry.register(
+            name="translate",
+            func=_make_translate(local_client),
+            description="Translate text to a target language",
+            parameters={
+                "text": {"type": "string", "description": "Text to translate"},
+                "target_lang": {"type": "string", "description": "Target language (e.g. 'English', 'Japanese')"},
+            },
+            modes=["chat"],
+        )
+
+        registry.register(
+            name="draft_document",
+            func=_make_draft_document(local_client),
+            description="Generate a document based on instructions",
+            parameters={
+                "instruction": {"type": "string", "description": "Instructions for document generation"},
+                "format": {"type": "string", "description": "Output format (e.g. 'markdown', 'plain')"},
+            },
+            modes=["chat"],
+        )
+
+    # 会話履歴検索ツール
+    if history_manager is not None:
+        registry.register(
+            name="search_history",
+            func=_make_search_history(history_manager),
+            description="Search past conversation history by keyword and/or date range",
+            parameters={
+                "query": {"type": "string", "description": "Search query"},
+                "mode": {"type": "string", "description": "Filter by mode (chat/coding)"},
+                "limit": {"type": "integer", "description": "Maximum number of results (default: 10)"},
+                "date_from": {"type": "string", "description": "Start date in ISO 8601 format (e.g. '2026-03-01')"},
+                "date_to": {"type": "string", "description": "End date in ISO 8601 format (e.g. '2026-03-31')"},
+            },
+        )
+
+    logger.info("Registered %d builtin tools", registry.count)

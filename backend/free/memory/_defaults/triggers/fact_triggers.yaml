@@ -1,0 +1,149 @@
+# EvorefMem — ChatNoteBuilder / CodingNoteBuilder 候補ファクト判定辞書
+#
+# 本ファイル: FACT_TRIGGERS の外部化 (config → YAML)
+#
+# 構成:
+#   mode (chat | coding)
+#     └ fact_type (personal_fact / world_fact / preference / emotion / opinion /
+#                  project / decision / commitment / task / coding)
+#         └ triggers: [str, ...]   # 部分一致、lowercase 化後に比較
+#
+# マッチング規則 (note_builder.candidate_fact_tags):
+#   1. 入力テキストを ``str.lower()``
+#   2. mode 対応セクションの各 fact_type の trigger 一覧に対し、
+#      1 語でも ``in`` マッチした fact_type を候補タグとして返す
+#   3. 複数 fact_type が当たった場合は全てを返す (重複なし)
+#
+# sleep-time Step 8 の Chat/CodingExtractor は ``candidate_fact_tags`` の
+# 戻り値をそのまま利用するため、ここを拡張すると Extractor にも追随する。
+#
+# i18n: ja / en をフラットに混在させる。pin_triggers.yaml と同じ方針。
+#
+# ユーザー上書き: ``local/triggers/fact_triggers.yaml`` に同名ファイルを置くと
+# package 同梱 default に代えて読み込まれる。
+
+chat:
+  personal_fact:
+    - 私は
+    - 僕は
+    - 俺は
+    - 自分は
+    - うちの
+    - 私の
+    - 僕の
+    - 俺の
+    - "i am "
+    - "i'm "
+    - "my name"
+    - "my favorite"
+  world_fact:
+    - である
+    - とは
+    - と呼ばれる
+    - 定義
+    - は事実
+    - " is a "
+    - " are "
+    - " was "
+    - " were "
+  preference:
+    - 好き
+    - 嫌い
+    - お気に入り
+    - いつも
+    - よく使う
+    - 苦手
+    - "i like"
+    - "i love"
+    - "i hate"
+    - "i prefer"
+  emotion:
+    - 嬉しい
+    - 楽しい
+    - 悲しい
+    - 怒
+    - つらい
+    - 不安
+    - 嫌だ
+    - 最高
+    - 最悪
+    - "happy"
+    - "sad"
+    - "angry"
+    - "excited"
+    - "frustrated"
+  opinion:
+    - と思う
+    - と考える
+    - 気がする
+    - に違いない
+    - べきだ
+    - "i think"
+    - "i believe"
+    - "in my opinion"
+    - "i feel that"
+
+coding:
+  project:
+    - このプロジェクト
+    - 本プロジェクト
+    - このリポジトリ
+    - 本リポジトリ
+    - リポジトリ全体
+    - evoref
+    - "this project"
+    - "this repo"
+    - "this repository"
+  decision:
+    - 決めた
+    - 決定
+    - ことにした
+    - 採用
+    - 不採用
+    - やめる
+    - ロールバック
+    - "we decided"
+    - "decided to"
+    - "going with"
+    - "switching to"
+  commitment:
+    - 予定
+    - つもり
+    - までに
+    - 締切
+    - デッドライン
+    - リリース予定
+    - "deadline"
+    - "by tomorrow"
+    - "by next "
+    - "will ship"
+  task:
+    - 実装して
+    - 修正して
+    - 直して
+    - 追加して
+    - 作って
+    - 教えて
+    - 確認して
+    - レビュー
+    - やって
+    - テストして
+    - "please implement"
+    - "fix the"
+    - "add the"
+    - "refactor"
+  coding:
+    - "python"
+    - "javascript"
+    - "typescript"
+    - "class "
+    - "def "
+    - "import "
+    - "function"
+    - バグ
+    - リファクタ
+    - ユニットテスト
+    - 型エラー
+    - "stack trace"
+    - "exception"
+    - "traceback"

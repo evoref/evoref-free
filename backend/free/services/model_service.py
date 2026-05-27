@@ -1,0 +1,186 @@
+"""モデル情報・ヘルスチェック統合サービス
+
+config.yaml と各ポートのヘルスチェックからモデル情報一覧を構築する。
+CLI (main.py, command_handlers.py) と GUI から共通利用される。
+sync / async 両対応。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+from backend.log_config import get_logger
+
+logger = get_logger("services.model_service")
+
+
+@dataclass
+class ModelInfoItem:
+    """モデル情報の1行分"""
+    label: str
+    name: str
+    connected: bool
+
+
+def build_model_info_sync(
+    project_root: Path,
+    status_data: dict | None,
+) -> tuple[list[ModelInfoItem], int | None]:
+    """config.yaml + /api/status からモデル情報一覧を構築（同期版）"""
+    import yaml
+
+    from backend.free.services.health_service import check_health_sync
+
+    models: list[ModelInfoItem] = []
+    context_size: int | None = None
+
+    try:
+        cfg = yaml.safe_load(
+            (project_root / "config.yaml").read_text(encoding="utf-8"),
+        )
+    except Exception:
+        return models, context_size
+
+    sp = cfg.get("model_paths", {})
+    llama_cfg = cfg.get("llama", {})
+    context_size = llama_cfg.get("context_size")
+
+    # llama-server 接続状態
+    llama_connected = False
+    if status_data:
+        ls = status_data.get("llama_server", {})
+        llama_connected = ls.get("connected", False)
+
+    # ベースモデル
+    base = sp.get("base_model", "")
+    if base:
+        models.append(ModelInfoItem(
+            label="base",
+            name=Path(base).stem,
+            connected=llama_connected,
+        ))
+
+    # アシストモデル
+    assist = sp.get("assist_model", "")
+    if assist:
+        assist_connected = False
+        if status_data:
+            assist_cfg = cfg.get("assist_model", {}).get("local", {})
+            if assist_cfg:
+                assist_host = assist_cfg.get("host", "127.0.0.1")
+                assist_port = assist_cfg.get("port", 8081)
+                assist_connected = check_health_sync(assist_host, assist_port)
+        models.append(ModelInfoItem(
+            label="assist",
+            name=Path(assist).stem,
+            connected=assist_connected,
+        ))
+
+    # 埋め込みモデル
+    embed = sp.get("embed_model", "")
+    embed_cfg = cfg.get("embedding", {})
+    if embed or embed_cfg.get("backend"):
+        if embed:
+            embed_port = embed_cfg.get("port", 8082)
+            embed_connected = check_health_sync("127.0.0.1", embed_port)
+            models.append(ModelInfoItem(
+                label="embed",
+                name=Path(embed).stem,
+                connected=embed_connected,
+            ))
+
+    # リランカーモデル
+    reranker = sp.get("reranker_model", "")
+    reranker_cfg = cfg.get("reranker", {})
+    if reranker and reranker_cfg.get("enabled", False):
+        reranker_port = reranker_cfg.get("port", 8083)
+        reranker_connected = check_health_sync("127.0.0.1", reranker_port)
+        models.append(ModelInfoItem(
+            label="reranker",
+            name=Path(reranker).stem,
+            connected=reranker_connected,
+        ))
+
+    return models, context_size
+
+
+async def build_model_info_async(
+    project_root: Path,
+    status_data: dict | None,
+) -> tuple[list[ModelInfoItem], int | None]:
+    """config.yaml + 各ポートの非同期ヘルスチェックからモデル情報を構築（非同期版）"""
+    import yaml
+
+    from backend.free.services.health_service import check_health_async
+
+    models: list[ModelInfoItem] = []
+    context_size: int | None = None
+
+    try:
+        cfg = yaml.safe_load(
+            (project_root / "config.yaml").read_text(encoding="utf-8"),
+        )
+    except Exception:
+        return models, context_size
+
+    sp = cfg.get("model_paths", {})
+    llama_cfg = cfg.get("llama", {})
+    context_size = llama_cfg.get("context_size")
+
+    # llama-server 接続状態
+    llama_connected = False
+    if status_data:
+        ls = status_data.get("llama_server", {})
+        llama_connected = ls.get("connected", False)
+
+    # ベースモデル
+    base = sp.get("base_model", "")
+    if base:
+        models.append(ModelInfoItem(
+            label="base",
+            name=Path(base).stem,
+            connected=llama_connected,
+        ))
+
+    # アシストモデル
+    assist = sp.get("assist_model", "")
+    if assist:
+        assist_connected = False
+        assist_cfg = cfg.get("assist_model", {}).get("local", {})
+        if assist_cfg and status_data:
+            assist_host = assist_cfg.get("host", "127.0.0.1")
+            assist_port = assist_cfg.get("port", 8081)
+            assist_connected = await check_health_async(assist_host, assist_port)
+        models.append(ModelInfoItem(
+            label="assist",
+            name=Path(assist).stem,
+            connected=assist_connected,
+        ))
+
+    # 埋め込みモデル
+    embed = sp.get("embed_model", "")
+    embed_cfg = cfg.get("embedding", {})
+    if embed or embed_cfg.get("backend"):
+        if embed:
+            embed_port = embed_cfg.get("port", 8082)
+            embed_connected = await check_health_async("127.0.0.1", embed_port)
+            models.append(ModelInfoItem(
+                label="embed",
+                name=Path(embed).stem,
+                connected=embed_connected,
+            ))
+
+    # リランカーモデル
+    reranker = sp.get("reranker_model", "")
+    reranker_cfg = cfg.get("reranker", {})
+    if reranker and reranker_cfg.get("enabled", False):
+        reranker_port = reranker_cfg.get("port", 8083)
+        reranker_connected = await check_health_async("127.0.0.1", reranker_port)
+        models.append(ModelInfoItem(
+            label="reranker",
+            name=Path(reranker).stem,
+            connected=reranker_connected,
+        ))
+
+    return models, context_size
