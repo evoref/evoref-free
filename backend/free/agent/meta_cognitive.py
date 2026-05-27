@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 from backend.free.agent.agent_state import AgentState
@@ -168,9 +169,12 @@ class MetaCognitiveAgent:
         self._execute_max_tokens = max(ctx_size - 512, 1024)
         self._reminder_budget = 100
 
-        self._content_gen_timeout = agent_cfg.get("content_gen_timeout", 60)
+        # content gen の総上限 (低速 GPU でも完走できるよう緩和)。トークン間
+        # アイドルタイムアウト (無出力検知) と併用する。
+        self._content_gen_timeout = agent_cfg.get("content_gen_timeout", 600)
+        self._content_gen_idle_timeout = agent_cfg.get("content_gen_idle_timeout", 30)
         self._llm_call_timeout = agent_cfg.get("llm_call_timeout", 90)
-        self._total_timeout = agent_cfg.get("total_timeout", 180)
+        self._total_timeout = agent_cfg.get("total_timeout", 900)
 
         # ── EvorefMem: @self 仮想カートリッジ ──
         # SemanticFactStore 直参照を廃止し LoopFactView 経由に統一
@@ -1637,23 +1641,37 @@ class MetaCognitiveAgent:
         messages: list[dict],
         gen_max_tokens: int,
     ) -> str:
-        """LLM ストリーミング生成 + 後処理（フェンス除去・繰り返し切除）"""
-        async def _consume_stream() -> str:
-            stream = await llm_client.generate(
-                messages, stream=True,
-                max_tokens=gen_max_tokens,
-                id_slot=getattr(llm_client, 'background_slot', -1),
-            )
-            chunks: list[str] = []
-            async for token in stream:
-                chunks.append(token)
-            return "".join(chunks).strip()
+        """LLM ストリーミング生成 + 後処理（フェンス除去・繰り返し切除）
 
+        トークン間アイドル (無出力) タイムアウトで「停止したストリーム」を
+        素早く諦めつつ、低速だが進行中の生成は総上限 (``content_gen_timeout``)
+        まで継続させる。総ウォールクロックで一律に打ち切らない。
+        """
+        stream = await llm_client.generate(
+            messages, stream=True,
+            max_tokens=gen_max_tokens,
+            id_slot=getattr(llm_client, 'background_slot', -1),
+        )
+        agen = stream.__aiter__()
+        chunks: list[str] = []
+        start = time.monotonic()
         try:
-            raw = await asyncio.wait_for(
-                _consume_stream(),
-                timeout=self._content_gen_timeout,
-            )
+            while True:
+                try:
+                    token = await asyncio.wait_for(
+                        agen.__anext__(),
+                        timeout=self._content_gen_idle_timeout,
+                    )
+                except StopAsyncIteration:
+                    break
+                chunks.append(token)
+                if time.monotonic() - start > self._content_gen_timeout:
+                    logger.warning(
+                        "Content generation exceeded total cap %ds",
+                        self._content_gen_timeout,
+                    )
+                    return f"(Content generation failed: timeout after {self._content_gen_timeout}s)"
+            raw = "".join(chunks).strip()
             content = strip_markdown_wrapper(raw)
             content = truncate_repetition(content)
             if not content:
@@ -1663,13 +1681,23 @@ class MetaCognitiveAgent:
             return content
         except asyncio.TimeoutError:
             logger.warning(
-                "Content generation timed out after %ds",
-                self._content_gen_timeout,
+                "Content generation stalled (no token for %ds)",
+                self._content_gen_idle_timeout,
             )
-            return f"(Content generation failed: timeout after {self._content_gen_timeout}s)"
+            return (
+                f"(Content generation failed: stalled after "
+                f"{self._content_gen_idle_timeout}s without output)"
+            )
         except Exception as e:
             logger.error("Content generation failed: %s", e)
             return f"(Content generation failed: {e})"
+        finally:
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # フォールバック / 応答組み立て
