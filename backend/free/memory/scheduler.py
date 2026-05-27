@@ -9,7 +9,7 @@ Trigger D: 夜間（schedule_hour）に Level 2 をトリガー
 
 import asyncio
 import time
-from datetime import timedelta, timezone
+from datetime import timedelta, timezone, tzinfo
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -60,15 +60,7 @@ class SleepTimeScheduler:
         self._debug_logger: "DebugLogger | None" = debug_logger
         schedule_cfg = config.get("schedule", {}) or {}
         self.local_tz_name: str = schedule_cfg.get("local_tz", self.DEFAULT_LOCAL_TZ)
-        try:
-            self._local_tz = ZoneInfo(self.local_tz_name)
-        except ZoneInfoNotFoundError:
-            logger.warning(
-                "Unknown schedule.local_tz=%r, falling back to %s",
-                self.local_tz_name, self.DEFAULT_LOCAL_TZ,
-            )
-            self.local_tz_name = self.DEFAULT_LOCAL_TZ
-            self._local_tz = ZoneInfo(self.DEFAULT_LOCAL_TZ)
+        self._local_tz = self._resolve_local_tz(self.local_tz_name)
         # Trigger B: Full sleep-time のアイドル閾値
         self.full_idle_minutes: float = learning.get("full_idle_minutes", 10)
         # Trigger C: Level 1 のアイドル閾値（独立常駐ループから参照）
@@ -96,6 +88,37 @@ class SleepTimeScheduler:
         self._assist_lora_path = None  # Path to assist LoRA adapter for Level 2
         self._assist_model_path = None  # Path to assist model GGUF for LoRA target resolution
         self._running = False
+
+    def _resolve_local_tz(self, tz_name: str) -> tzinfo:
+        """設定 tz 名を tzinfo に解決する（解決不能時は段階的に縮退）
+
+        Windows の ``zoneinfo`` は ``tzdata`` パッケージ無しだと IANA tz DB を
+        参照できず、任意の tz 名で ``ZoneInfoNotFoundError`` になる。その場合に
+        startup を落とさないよう、未知の tz 名 → 既定 (Asia/Tokyo) → UTC の順で
+        縮退する。最終的に UTC に倒れた場合は ``self.local_tz_name`` も更新する。
+        """
+        try:
+            return ZoneInfo(tz_name)
+        except ZoneInfoNotFoundError:
+            pass
+        if tz_name != self.DEFAULT_LOCAL_TZ:
+            try:
+                tz = ZoneInfo(self.DEFAULT_LOCAL_TZ)
+                logger.warning(
+                    "Unknown schedule.local_tz=%r, falling back to %s",
+                    tz_name, self.DEFAULT_LOCAL_TZ,
+                )
+                self.local_tz_name = self.DEFAULT_LOCAL_TZ
+                return tz
+            except ZoneInfoNotFoundError:
+                pass
+        logger.warning(
+            "Time zone database unavailable (tz=%r); install 'tzdata'. "
+            "Falling back to UTC for schedule calculations.",
+            tz_name,
+        )
+        self.local_tz_name = "UTC"
+        return timezone.utc
 
     def set_worker(self, worker) -> None:
         """SleepTimeWorker を設定"""
@@ -533,7 +556,7 @@ class SleepTimeScheduler:
             trace_id_var.reset(token)
 
     @staticmethod
-    def _seconds_until_hour(target_hour: int, local_tz: ZoneInfo) -> float:
+    def _seconds_until_hour(target_hour: int, local_tz: tzinfo) -> float:
         """指定ローカル時刻 (tz-aware) までの秒数を計算
 
         内部時刻は UTC で扱い、設定された ``schedule.local_tz`` で

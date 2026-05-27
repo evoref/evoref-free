@@ -190,6 +190,13 @@ class AgentConfig(BaseModel):
     # クエリを判定し run_command に橋渡しする 5 層目のゲート。
     executable_command_fallback_enabled: bool = True
     executable_command_fallback_min_chars: int = Field(default=5, ge=0, le=80)
+    # ── コンテンツ生成タイムアウト (Meta-Cognitive 層) ──
+    # ファイル内容生成はトークン間アイドル (無出力) タイムアウトで「停止した
+    # ストリーム」を素早く諦めつつ、低速だが進行中の生成は総上限まで継続する。
+    content_gen_idle_timeout: int = Field(default=30, ge=5, le=300)
+    content_gen_timeout: int = Field(default=600, ge=30)
+    llm_call_timeout: int = Field(default=90, ge=10)
+    total_timeout: int = Field(default=900, ge=60)
 
 
 class ToolsConfig(BaseModel):

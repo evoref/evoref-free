@@ -4,7 +4,7 @@
 	import { t } from '$lib/i18n';
 	import { colorMode, toggleColorMode, sidebarCollapsed, layout, themeSlots } from '$lib/free/stores/theme';
 	import { locale, availableLocales, setLocale } from '$lib/i18n';
-	import { isPro, edition } from '$lib/edition';
+	import { isPro, isDevelop, edition } from '$lib/edition';
 	import { appVersion } from '$lib/free/stores/app';
 	import { currentMode, clearMessages, switchMode, modeRestartStatus } from '$lib/free/stores/chat';
 	import { addToast } from '$lib/free/stores/toast';
@@ -145,9 +145,11 @@
 				{/if}
 			</div>
 
-			<div class="sidebar-version">
-				evoref {#if $appVersion}v{$appVersion} {/if}{edition}
-			</div>
+			{#if !isDevelop}
+				<div class="sidebar-version">
+					evoref {#if $appVersion}v{$appVersion} {/if}{edition}
+				</div>
+			{/if}
 		{/if}
 	</aside>
 {/if}
