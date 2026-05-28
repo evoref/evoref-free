@@ -59,7 +59,10 @@ POLICY_MAX_TOKENS_KEYS = ("max_tokens", "assist_max_tokens")
 POLICY_TOP_K_KEYS = ("top_k", "assist_top_k")
 
 DEFAULT_TEMPERATURE = 0.4
-DEFAULT_MAX_TOKENS = 1024
+# 1024 tokens (~4000 chars) では actions JSON が途中切断され parse 失敗する
+# 事象が発生したため 2048 に引き上げる。assist_client の ralph_loop timeout
+# (120s) に対し 2048 tokens 生成は実測 ~10s で十分収まる。
+DEFAULT_MAX_TOKENS = 2048
 
 
 @dataclass
@@ -148,7 +151,8 @@ class RalphExecutor:
                 notes={
                     "executor": self.name,
                     "stage": "parse",
-                    "response_head": response_text[:200],
+                    "response_head": response_text[:1000],
+                    "response_length": str(len(response_text)),
                     "generate_ms": f"{gen_ms:.0f}",
                 },
             )

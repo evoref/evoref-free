@@ -46,10 +46,13 @@ def parse_actions(text: str) -> list[Action]:
     Raises:
         ParseError: 期待フォーマットに合致するブロックが無いか、JSON として
             不正、または ``action_from_dict`` で復元できないエントリを含む。
+            原因が ``<actions>`` 開始タグはあるが終端タグが無い (max_tokens
+            切断) 場合や、配列が開いたまま閉じない場合は、その旨を区別
+            可能なメッセージで返す。
     """
     payload = _extract_payload(text)
     if payload is None:
-        raise ParseError("no <actions>/```actions```/```json``` block found")
+        raise ParseError(_no_block_message(text))
     try:
         decoded = json.loads(payload)
     except json.JSONDecodeError as exc:
@@ -78,6 +81,40 @@ def _extract_payload(text: str) -> str | None:
     if (m := _FENCE_JSON_RE.search(text)) is not None:
         return m.group(1).strip()
     return _extract_balanced_array(text)
+
+
+_OPEN_TAG_RE = re.compile(r"<actions>", re.IGNORECASE)
+_CLOSE_TAG_RE = re.compile(r"</actions>", re.IGNORECASE)
+
+
+def _no_block_message(text: str) -> str:
+    """parse 失敗時の詳細メッセージを構築する。
+
+    - ``<actions>`` 開始タグはあるが ``</actions>`` 終端タグが無い:
+      max_tokens 切断の典型パターン
+    - ``[`` はあるが ``]`` でバランスしない: 配列が閉じていない (切断 or
+      malformed)
+    - それ以外: そもそも対応ブロックが見当たらない
+    """
+    has_open_tag = _OPEN_TAG_RE.search(text) is not None
+    has_close_tag = _CLOSE_TAG_RE.search(text) is not None
+    if has_open_tag and not has_close_tag:
+        return (
+            "<actions> tag opened but </actions> closing tag missing "
+            "(likely truncated at max_tokens; raise max_tokens or shrink scope)"
+        )
+    if "[" in text and not _has_balanced_array(text):
+        return (
+            "JSON array opened with '[' but never balanced "
+            "(likely truncated or malformed; check action schema and "
+            "max_tokens budget)"
+        )
+    return "no <actions>/```actions```/```json``` block found"
+
+
+def _has_balanced_array(text: str) -> bool:
+    """``_extract_balanced_array`` が None 以外を返すか判定する軽量版。"""
+    return _extract_balanced_array(text) is not None
 
 
 def _extract_balanced_array(text: str) -> str | None:

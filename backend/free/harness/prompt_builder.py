@@ -35,6 +35,12 @@ SYSTEM_PROMPT_HEADER = (
     "- {\"kind\": \"run_command\", \"command\": [str, ...], \"cwd\": str | null}\n"
     "- {\"kind\": \"search\", \"query\": str}\n"
     "- {\"kind\": \"noop\", \"reason\": str}\n\n"
+    "STRICT: \"path\" is a string (NOT an array). \"old\" and \"new\" are "
+    "top-level keys of the edit_file object (NOT nested inside \"path\"). "
+    "Only \"command\" is an array.\n\n"
+    "Correct example (a single edit_file action):\n"
+    "<actions>[{\"kind\": \"edit_file\", \"path\": \"backend/foo.py\", "
+    "\"old\": \"return 1\", \"new\": \"return 2\"}]</actions>\n\n"
     "Use \"noop\" when the task is already satisfied or you need more "
     "information."
 )

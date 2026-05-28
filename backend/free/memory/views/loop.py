@@ -708,6 +708,7 @@ class LoopFactView(FactViewBase):
         last_actions: list[str],
         mitigation: str | None = None,
         outcome_label: str | None = None,
+        output_tail: str | None = None,
         confidence: float = 0.7,
         trace_id: str | None = None,
         now: float | None = None,
@@ -716,6 +717,8 @@ class LoopFactView(FactViewBase):
 
         低レベルプリミティブ。``GateResult`` から signature を計算するのは
         呼び出し側の責務。``outcome_label`` を渡すと ``outcomes_history`` に追記する。
+        ``output_tail`` を渡すと最新の gate stdout/stderr 末尾を ``object`` に
+        含める (次イテレーションの LLM に失敗の生出力を観測させる用途)。
         """
         self._assert_write("failure_pattern")
         t = time.time() if now is None else float(now)
@@ -731,6 +734,8 @@ class LoopFactView(FactViewBase):
         }
         if mitigation is not None:
             payload["mitigation"] = mitigation
+        if output_tail:
+            payload["output_tail"] = output_tail
 
         existing = self._writeback_store.search_by_subject(subject)
         active = [f for f in existing if not f.superseded_by]
@@ -746,6 +751,10 @@ class LoopFactView(FactViewBase):
                 payload["outcomes_history"] = merged_outcomes[-5:]
             if "mitigation" not in payload and "mitigation" in prev_payload:
                 payload["mitigation"] = prev_payload["mitigation"]
+            # output_tail は最新失敗のものを優先 (古いものは捨てる)。
+            # 新しい値が無い場合のみ過去の値を維持する。
+            if "output_tail" not in payload and "output_tail" in prev_payload:
+                payload["output_tail"] = prev_payload["output_tail"]
             return self._writeback_store.update_fact(
                 prev.id,
                 object=json.dumps(payload, ensure_ascii=False, sort_keys=True),

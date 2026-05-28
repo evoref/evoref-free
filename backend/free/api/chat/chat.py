@@ -483,6 +483,32 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     logger.info("Agent layer: %s for query: %s", agent_layer, req.message[:80])
 
     if agent_layer == "reactive":
+        # URL recall プリチェック: 過去会話で fetch 済みの URL fact が
+        # クエリに意味的にヒットする場合、reactive で前知識のみ応答せず
+        # deliberative にエスカレートして fetch_url を実行させる。
+        # ``recall_url_judgement`` は閾値・TTL・profile match まで判定
+        # 済みのため、ヒット時のみ True/None を返す軽量チェック。
+        if (
+            state.tool_call_judge is not None
+            and state.tools_registry is not None
+        ):
+            try:
+                recall_judgement = await state.tool_call_judge.recall_url_judgement(
+                    req.message, state.tools_registry,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "URL recall pre-check failed (continuing as reactive): %s", exc,
+                )
+                recall_judgement = None
+            if recall_judgement is not None and recall_judgement.tool_needed:
+                agent_layer = "deliberative"
+                logger.info(
+                    "Reactive escalated to deliberative due to URL recall hit: %s",
+                    req.message[:80],
+                )
+
+    if agent_layer == "reactive":
         reactive_response = _try_reactive_layer(
             req, state, session_id, instance_name, context_size,
         )
