@@ -29,14 +29,22 @@ export interface RagDebugInfo {
 	search_time_ms: number;
 }
 
+/** 出力先パス未指定時にエディタペインへ直接流す生成コード片 */
+export interface EditorCodeArtifact {
+	content: string;
+	language: string;
+	filename: string | null;
+}
+
 export interface ChatStreamEvent {
-	type: 'token' | 'token_info' | 'done' | 'error' | 'step' | 'rag_debug' | 'editor_route';
+	type: 'token' | 'token_info' | 'done' | 'error' | 'step' | 'rag_debug' | 'editor_route' | 'editor_code';
 	token?: string;
 	token_info?: TokenInfo;
 	error?: string;
 	step?: ChatStreamStep;
 	rag_debug?: RagDebugInfo;
 	editor_route?: { target: 'editor' | 'chat' };
+	editor_code?: EditorCodeArtifact;
 }
 
 /** SSE ストリーミングチャット */
@@ -154,6 +162,9 @@ export async function* chatStream(
 					}
 					if (parsed.editor_route) {
 						yield { type: 'editor_route', editor_route: parsed.editor_route };
+					}
+					if (parsed.editor_code) {
+						yield { type: 'editor_code', editor_code: parsed.editor_code };
 					}
 				} catch (e) {
 					parseErrorCount++;

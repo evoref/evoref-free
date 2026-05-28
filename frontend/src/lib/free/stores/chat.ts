@@ -1,5 +1,5 @@
 import { writable, derived, get } from 'svelte/store';
-import type { TokenInfo, RagDebugInfo } from '$lib/free/api';
+import type { TokenInfo, RagDebugInfo, EditorCodeArtifact } from '$lib/free/api';
 import { switchModeApi } from '$lib/free/api';
 import { MODE_RESTART_STATUS_TIMEOUT_MS } from '$lib/free/constants';
 
@@ -110,6 +110,26 @@ export function setRagDebugToLastAssistant(ragDebug: RagDebugInfo): void {
 		}
 		return msgs;
 	});
+}
+
+/**
+ * 出力先パス未指定時にエディタペインへ流す生成コード片の受け皿。
+ *
+ * バックエンドの `editor_code` SSE フレームを ChatInput が push し、Pro の
+ * EditorPanel が購読して `loadGeneratedCode` へ渡す (Free→Pro 越境を作らない
+ * ための共有ストア。`messages`/`isStreaming` を Pro が読む構図と同型)。
+ * Free ビルドでは購読側が存在せず no-op。
+ */
+export const generatedEditorCode = writable<EditorCodeArtifact[]>([]);
+
+/** 生成コード片を 1 件追加する (editor_code SSE フレーム受信時) */
+export function pushGeneratedEditorCode(artifact: EditorCodeArtifact): void {
+	generatedEditorCode.update((list) => [...list, artifact]);
+}
+
+/** 生成コード片の受け皿をクリアする (消費後 / 新ターン開始時) */
+export function clearGeneratedEditorCode(): void {
+	generatedEditorCode.set([]);
 }
 
 /** 最後のアシスタントメッセージに生成コードの出力先をセット */

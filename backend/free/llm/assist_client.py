@@ -107,8 +107,10 @@ _DEFAULT_PRIORITY: Priority = "background"
 #   - policy_evolution (45s)  : PolicyParamEvolver の候補 JSON 生成
 #   - note_evolution (20s)    : A-MEM note 進化の軽量要約
 #   - conflict_resolution (15s): 短文マージ判定
-#   - retrieval_quality_judge / tool_judgment: 既定 ``timeout`` を
-#     そのまま使う (短時間で済むため override 不要) のでマップには載せない
+#   - retrieval_quality_judge: 既定 ``timeout`` をそのまま使う (短時間で済む)
+#   - tool_judgment (8s): チャット応答パスで同期発火。アシスト接続時は
+#     モード非依存で常時有効化されるため呼出頻度が上がる。realtime セマフォを
+#     長く専有しないよう短く打ち切る。
 PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "contextual_prefix": 60.0,
     "long_form_planning": 90.0,
@@ -125,6 +127,10 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # tool_call_judge から発火する。is_executable: bool + command: str の
     # 短い JSON を返すだけのため、低レイテンシで打ち切る。
     "executable_command_synth": 8.0,
+    # ツール呼出判定 ({"tool": ..., "args": {...}} の小さな JSON)。チャット
+    # 応答パスで Deliberative / MetaCognitive から同期発火し、アシスト接続時は
+    # 常時有効。realtime セマフォを長く占有しないよう短く打ち切る。
+    "tool_judgment": 8.0,
     # meta-cognitive 計画 (タスク分解) は coding mode の
     # 応答パスで発火するため、長すぎるとユーザ体感を阻害する。30s で打ち切り。
     "meta_cognitive_plan": 30.0,
@@ -179,6 +185,9 @@ PURPOSE_REASONING_BUDGET_DEFAULTS: dict[str, int] = {
     # executable query 判定 + コマンド合成は機械的な抜き出し + 短文生成で
     # thinking 不要。response_format (ExecutableCommandSynth) で構造を固定する。
     "executable_command_synth": 0,
+    # ツール呼出判定は機械的な分類 + 引数抽出で thinking 不要。
+    # response_format (ToolJudgmentResult) で構造を固定する。
+    "tool_judgment": 0,
     # meta-cognitive 計画は機械的なタスク分解で thinking 不要
     "meta_cognitive_plan": 0,
     # 既存要約 + 新セクションの再要約は機械的処理で thinking 不要

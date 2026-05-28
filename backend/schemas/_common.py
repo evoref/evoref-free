@@ -7,7 +7,7 @@ assist_model) に属さない Config を置く。
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class InstanceConfig(BaseModel):
@@ -182,7 +182,9 @@ class AgentConfig(BaseModel):
     reminders_enabled: bool = True
     max_reminders_per_turn: int = Field(default=2, ge=0)
     dangerous_command_block: bool = True
-    tool_judge_enabled: bool = False
+    # アシスト接続時はモード非依存で常時有効 (False で明示オプトアウト)。
+    # アシスト未接続時はこの値に関わらず無効 (決定論ショートカットのみ)。
+    tool_judge_enabled: bool = True
     meta_cognitive_enabled: bool = True
     meta_cognitive_min_budget: int = Field(default=512, ge=0)
     # tool_judge_enabled=True (coding mode 等) で 4 層フォールバックが全て
@@ -193,10 +195,36 @@ class AgentConfig(BaseModel):
     # ── コンテンツ生成タイムアウト (Meta-Cognitive 層) ──
     # ファイル内容生成はトークン間アイドル (無出力) タイムアウトで「停止した
     # ストリーム」を素早く諦めつつ、低速だが進行中の生成は総上限まで継続する。
+    # 最初の1トークンまでは別枠の長めタイムアウト (サーバが他生成で busy の間
+    # 待機中のリクエストを誤って「停止」扱いしないため) を使う。
+    content_gen_first_token_timeout: int = Field(default=120, ge=10, le=600)
     content_gen_idle_timeout: int = Field(default=30, ge=5, le=300)
     content_gen_timeout: int = Field(default=600, ge=30)
     llm_call_timeout: int = Field(default=90, ge=10)
     total_timeout: int = Field(default=900, ge=60)
+
+    @model_validator(mode="after")
+    def _validate_content_gen_timeout_order(self) -> "AgentConfig":
+        """content_gen タイムアウト 3 値の整合性チェック。
+
+        意味的には ``idle <= first_token <= total`` でなければ「最初のトークン
+        受信前に idle で打ち切る」等の矛盾挙動になる。`Field(ge/le)` の単体
+        範囲制約では検出できないため、起動時に明示エラーで止める。
+        """
+        if self.content_gen_idle_timeout > self.content_gen_first_token_timeout:
+            raise ValueError(
+                "content_gen_idle_timeout "
+                f"({self.content_gen_idle_timeout}) must be <= "
+                f"content_gen_first_token_timeout "
+                f"({self.content_gen_first_token_timeout})"
+            )
+        if self.content_gen_first_token_timeout > self.content_gen_timeout:
+            raise ValueError(
+                "content_gen_first_token_timeout "
+                f"({self.content_gen_first_token_timeout}) must be <= "
+                f"content_gen_timeout ({self.content_gen_timeout})"
+            )
+        return self
 
 
 class ToolsConfig(BaseModel):

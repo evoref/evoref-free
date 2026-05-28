@@ -217,6 +217,48 @@ _KNOWLEDGE_PATTERNS = [
     re.compile(r"(?:what is|tell me|explain|describe)\b", re.IGNORECASE),
 ]
 
+# ユーザー自身の行動宣言パターン — アシスタントへの依頼ではない雑談発話。
+# 「探してみるね」のような一人称の意思表明をツール起動と誤解しないための除外。
+# 依頼形 (「探してみて(ください)」= て止め) とは区別する (こちらは末尾が「て」)。
+_SELF_ACTION_PATTERNS = [
+    # 「〜てみる(ね/よ/わ/かな/から)」自分で試す宣言 (文末)
+    re.compile(r"(?:て|で)みる(?:ね|よ|わ|な|かな|から)?[\s　!！。.…]*$"),
+    # 「〜しておく/やっておく/調べておく(ね/よ)」自己完結の行動宣言 (文末)
+    re.compile(r"(?:してお|やってお|探してお|調べてお|見てお|やっと)く(?:ね|よ|わ|から)?[\s　!！。.…]*$"),
+    # 一人称主語で自分が行う宣言
+    re.compile(r"(?:自分で|自分が|私が|僕が|俺が|わたしが|こっちで|こちらで)"),
+]
+
+
+def _query_has_tool_signal(query: str) -> bool:
+    """クエリにツール操作シグナル (ツールパターン / Windows・Unix パス / URL) を含むか。"""
+    return (
+        any(p.search(query) for p in _TOOL_PATTERNS)
+        or bool(re.search(r"[A-Za-z]:\\|(?:^|[\s　])(?:/[\w._-]+){2,}|https?://", query))
+    )
+
+
+def _is_conversational_query_without_tool_signal(query: str) -> bool:
+    """ツールシグナルが無く、知識質問 or 自己行動宣言の雑談発話か (assist 判定スキップ条件)。
+
+    True の場合、層4 (tool_judgment) / 層5 (executable synth) の realtime
+    assist 呼出を省いて no-tool 即決してよい。対象は:
+
+    - 知識質問 (「とは」「教えて」等) — RAG / LLM 知識で答える
+    - ユーザー自身の行動宣言 (「探してみるね」「自分で調べる」等) — 依頼ではない
+
+    時刻・スペック等の実行可能事実クエリやファイルパス・URL を含むクエリは
+    ``_TOOL_PATTERNS`` / パスシグナルで弾かれるため、誤って no-tool に倒さない。
+    依頼形 (「探してみて」) は ``_SELF_ACTION_PATTERNS`` が文末「てみる」に限定して
+    いるためマッチしない。
+    """
+    if _query_has_tool_signal(query):
+        return False
+    return (
+        any(p.search(query) for p in _KNOWLEDGE_PATTERNS)
+        or any(p.search(query) for p in _SELF_ACTION_PATTERNS)
+    )
+
 
 @dataclass
 class ToolJudgement:
@@ -310,8 +352,16 @@ class ToolCallJudge:
 
     @property
     def enabled(self) -> bool:
-        """ツール判定が有効かどうか（config 設定値）"""
-        return self._config.get("agent", {}).get("tool_judge_enabled", False)
+        """ツール判定が有効かどうか。
+
+        アシストモデル接続時はモード非依存で **既定有効**。
+        ``agent.tool_judge_enabled=false`` で明示的にオプトアウトできる。
+        アシスト未接続 (degraded) 時は常に無効で、決定論ショートカット
+        (明示 URL / 実行可能事実コマンド) のみに縮退する。
+        """
+        if self._assist_client is None:
+            return False
+        return self._config.get("agent", {}).get("tool_judge_enabled", True)
 
     async def judge(
         self,
@@ -437,7 +487,21 @@ class ToolCallJudge:
         # 4. アシストモデル判定（有効時のみ）
         # tool を選んだ場合のみ即 return する。no-tool の場合は 5 層目
         # (executable command fallback) に fall-through させる。
-        if self.enabled and self._assist_client is not None:
+        #
+        # 雑談プレフィルタ: ツールシグナルが無く、知識質問 or ユーザー自身の
+        # 行動宣言 (「探してみるね」等) のクエリは、広範な tool_judgment 呼出を
+        # スキップする。アシスト接続時の常時有効化で純粋な雑談のたびに
+        # tool_judgment を呼ぶ無駄打ちと誤発火 (例: 「探してみるね」→ search_history)
+        # を抑える狙い。ただし 5 層目 (executable_command_synth) はスキップしない
+        # — 「Chrome のバージョン教えて」のように雑談風だが実行可能な事実クエリを
+        # 拾うため (旧 chat early-return の synth 呼出と同等のベースラインを維持)。
+        skip_judgment = _is_conversational_query_without_tool_signal(query)
+        if skip_judgment:
+            logger.debug(
+                "Skipping tool_judgment for conversational query w/o tool signal: %s",
+                query[:50],
+            )
+        if self.enabled and self._assist_client is not None and not skip_judgment:
             try:
                 assist_result = await self._judge_with_assist(
                     query, tools_registry, mode, conversation,
@@ -1056,10 +1120,7 @@ class ToolCallJudge:
         # 知識質問はツール不要（RAG パイプラインで処理）
         # ただしツールパターン・ファイルパス・URL にもマッチするクエリは
         # ツール操作の可能性が高いため知識質問判定を適用しない
-        has_tool_signal = (
-            any(p.search(query) for p in _TOOL_PATTERNS)
-            or bool(re.search(r"[A-Za-z]:\\|(?:^|[\s　])(?:/[\w._-]+){2,}|https?://", query))
-        )
+        has_tool_signal = _query_has_tool_signal(query)
         if not has_tool_signal and any(p.search(query) for p in _KNOWLEDGE_PATTERNS):
             logger.debug("Rule-based: knowledge query detected, skipping tool: %s", query[:50])
             return ToolJudgement(tool_needed=False, source="rule")
@@ -1487,6 +1548,7 @@ _DEFAULT_SYSTEM_PROMPT = """\
 - シェルコマンドの実行が必要 → run_command を選択
 - コード検索が必要 → search_code を選択
 - ツールが不要な質問（知識・説明・会話） → ツール不要 (tool="")
+- ユーザー自身が行う宣言（「探してみるね」「自分で調べる」等の一人称の意思表明）→ 依頼ではないためツール不要 (tool="")
 
 ## 出力形式
 必ず JSON オブジェクトで出力してください:

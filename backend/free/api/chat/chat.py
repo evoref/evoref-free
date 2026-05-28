@@ -18,6 +18,7 @@ from backend.free.api.schemas import (
     CancelRequest, CancelResponse, ChatRequest, ChatResponse, TokenInfo,
 )
 from backend.free.api.chat._editor_routing import detect_editor_route
+from backend.free.agent.tool_call_judge import _extract_file_path
 from backend.free.api.chat.chat_recorder import record_response
 from backend.free.api.chat.chat_service import (
     build_chat_messages, build_semmem_injection, convert_file_contexts,
@@ -344,6 +345,7 @@ async def _dispatch_meta_cognitive(
     search_error_wrapper: StreamWrapper,
     timer: StageTimer,
     semmem_block: str | None = None,
+    output_target: str = "file",
 ) -> StreamingResponse | ChatResponse:
     """Meta-Cognitive (通常) 経路: 計画 + ツールループ。"""
     # @self 仮想カートリッジ用 LoopFactView 配線
@@ -378,6 +380,7 @@ async def _dispatch_meta_cognitive(
                 keepalive_interval=keepalive_sec,
                 timer=timer,
                 private=req.private,
+                output_target=output_target,
             ))),
             media_type="text/event-stream",
         )
@@ -389,6 +392,7 @@ async def _dispatch_meta_cognitive(
             generation_params=gen_params,
             timer=timer,
             private=req.private,
+            output_target=output_target,
         )
 
 
@@ -487,8 +491,22 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         agent_layer = "deliberative"
         logger.info("Reactive returned None, escalating to deliberative")
 
-    # coding モードのみ生成コードの出力先 (editor/chat) を判定し SSE 冒頭で通知。
-    editor_route = detect_editor_route(req.message) if req.mode == "coding" else None
+    # coding モードのみ生成コードの出力先を決定する。
+    # - 出力先パス明示 → "file" (従来どおり write_file でディスクへ)
+    # - 否定指示 ("エディタに出さず…") → "chat" (チャット本文にコードブロック)
+    # - 既定 → "editor" (ディスク書込せず editor_code チャネルでエディタペインへ)
+    # editor_route SSE フレームはフロント表示制御 (suppressCode) 用に併せて通知する。
+    if req.mode == "coding":
+        if _extract_file_path(req.message):
+            output_target = "file"
+        elif detect_editor_route(req.message) == "chat":
+            output_target = "chat"
+        else:
+            output_target = "editor"
+        editor_route = "editor" if output_target == "editor" else "chat"
+    else:
+        output_target = "file"
+        editor_route = None
 
     timer = StageTimer()
     messages, search_error_wrapper, semmem_block = await _build_messages_with_search(
@@ -509,6 +527,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 session_id, instance_name, context_size,
                 messages, search_error_wrapper, timer,
                 semmem_block=semmem_block,
+                output_target=output_target,
             )
         case _:
             return await _dispatch_deliberative(

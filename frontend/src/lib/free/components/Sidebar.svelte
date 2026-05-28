@@ -145,11 +145,13 @@
 				{/if}
 			</div>
 
-			{#if !isDevelop}
-				<div class="sidebar-version">
-					evoref {#if $appVersion}v{$appVersion} {/if}{edition}
-				</div>
-			{/if}
+			<div class="sidebar-version">
+				{isDevelop
+					? 'evoref develop'
+					: $appVersion
+						? `evoref v${$appVersion} ${edition}`
+						: `evoref ${edition}`}
+			</div>
 		{/if}
 	</aside>
 {/if}

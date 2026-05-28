@@ -741,13 +741,14 @@ agent:
   reminders_enabled: true                # イベント駆動リマインダーの有効/無効
   max_reminders_per_turn: 2              # 1 回の LLM 呼び出しに注入する最大リマインダー数
   dangerous_command_block: true          # 危険コマンドをブロック（false=警告のみ）
-  tool_judge_enabled: false              # アシストモデルによるツール呼び出し判定（true で有効化）
+  tool_judge_enabled: true               # ツール判定。アシスト接続時はモード非依存で常時有効。false で明示オプトアウト（アシスト未接続時は本値に関わらず無効）
   meta_cognitive_enabled: true           # Meta-Cognitive 層（計画+多段推論+ツールループ）の有効/無効
   meta_cognitive_min_budget: 512         # Meta-Cognitive 発動に必要な最小ループ予算（トークン数）
   executable_command_fallback_enabled: true   # 4 層判定が全て no-tool の時、assist で環境依存事実クエリを run_command に橋渡しする 5 層目（false で無効化）
   executable_command_fallback_min_chars: 5    # 5 層目 assist 呼出をスキップするクエリ長閾値（これ未満は呼ばない）
   # ── コンテンツ生成タイムアウト (Meta-Cognitive 層) ──
-  content_gen_idle_timeout: 30           # トークン間の無出力許容秒数（超過で「停止」とみなし中断）
+  content_gen_first_token_timeout: 120   # 最初のトークン到達までの許容秒数（サーバ混雑時の待機。idle と分離）
+  content_gen_idle_timeout: 30           # トークン間の無出力許容秒数（2トークン目以降、超過で「停止」とみなし中断）
   content_gen_timeout: 600               # ファイル内容生成の総上限秒数（低速 GPU でも完走できるよう緩和）
   llm_call_timeout: 90                   # 計画生成など単発 LLM 呼出のタイムアウト（秒）
   total_timeout: 900                     # Meta-Cognitive 全体のタイムアウト（秒、content_gen_timeout を内包）
