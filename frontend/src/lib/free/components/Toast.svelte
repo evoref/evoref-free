@@ -42,20 +42,20 @@
 		animation: toast-slide-in 0.2s ease-out;
 	}
 	.toast--error {
-		background-color: var(--color-error, #d32f2f);
-		color: #fff;
+		background-color: var(--toast-error-bg, #d32f2f);
+		color: var(--toast-error-fg, #fff);
 	}
 	.toast--success {
-		background-color: var(--color-success, #43a047);
-		color: #fff;
+		background-color: var(--toast-success-bg, #43a047);
+		color: var(--toast-success-fg, #fff);
 	}
 	.toast--warning {
-		background-color: var(--color-warning, #fb8c00);
-		color: #fff;
+		background-color: var(--toast-warning-bg, #fb8c00);
+		color: var(--toast-warning-fg, #fff);
 	}
 	.toast--info {
-		background-color: var(--accent, #4fc3f7);
-		color: #fff;
+		background-color: var(--toast-info-bg, #4fc3f7);
+		color: var(--toast-info-fg, #fff);
 	}
 	.toast-message {
 		flex: 1;

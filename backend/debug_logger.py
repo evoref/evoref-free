@@ -176,6 +176,8 @@ class DebugLogger:
         resolved_timeout: float | None = None,
         cache_metrics: dict | None = None,
         response_format_used: bool = False,
+        finish_reason: str = "",
+        response_length: int = 0,
     ) -> None:
         """アシストモデルのリクエスト/レスポンスを記録
 
@@ -197,6 +199,13 @@ class DebugLogger:
                 由来の ``response_format`` が ``/v1/chat/completions`` に付与
                 されたことを意味する。フラグ無効化 / 古い build 経路と切り
                 分けるための効果測定用フィールド。
+            finish_reason: llama-server レスポンスの ``choices[0].finish_reason``
+                (``"stop"`` / ``"length"`` / ``"tool_calls"`` 等)。``"length"``
+                は max_tokens 切断を示し、後段の parse 失敗の根本原因切り分け
+                に使う。空文字列なら記録しない。
+            response_length: 応答 ``content`` 文字数。``response_preview``
+                は 200 文字に縮める仕様だが、実体の長さを別途記録することで
+                truncation の有無を JSONL から判定できる。``0`` なら記録しない。
         """
         if not self.enabled or not self.log_requests:
             return
@@ -214,6 +223,10 @@ class DebugLogger:
             entry["resolved_timeout"] = round(float(resolved_timeout), 3)
         if cache_metrics:
             entry["cache"] = cache_metrics
+        if finish_reason:
+            entry["finish_reason"] = finish_reason
+        if response_length:
+            entry["response_length"] = int(response_length)
         self._emit("requests", entry)
 
     def log_retry_attempt(

@@ -649,6 +649,19 @@ class ToolCallJudge:
             source="rule",
         )
 
+    async def recall_url_judgement(
+        self,
+        query: str,
+        tools_registry: ToolsRegistry,
+    ) -> "ToolJudgement | None":
+        """外部から URL recall のみを問い合わせる公開 API.
+
+        Reactive レイヤの escalation 判定など、judge() フル実行前に
+        「URL recall だけ」をチェックしたい呼び元向け。判定本体は
+        ``_judge_with_url_recall`` を共有し、戻り値も同じ。
+        """
+        return await self._judge_with_url_recall(query, tools_registry)
+
     async def _maybe_recall_url(
         self, result: "ToolJudgement", query: str,
     ) -> None:

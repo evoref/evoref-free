@@ -640,6 +640,12 @@ class AssistModelClient(BaseHTTPClient):
         if dl:
             content = extract_content(result)
             cache_metrics = _extract_cache_metrics(result) if cache_prompt else None
+            choices = result.get("choices") or []
+            finish_reason = ""
+            if choices:
+                fr = choices[0].get("finish_reason")
+                if isinstance(fr, str):
+                    finish_reason = fr
             dl.log_assist_request(
                 messages_count=len(messages),
                 response_preview=content,
@@ -649,6 +655,8 @@ class AssistModelClient(BaseHTTPClient):
                 resolved_timeout=effective_timeout,
                 cache_metrics=cache_metrics,
                 response_format_used=resolved_response_format is not None,
+                finish_reason=finish_reason,
+                response_length=len(content),
             )
 
         return result

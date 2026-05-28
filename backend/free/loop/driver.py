@@ -1151,13 +1151,24 @@ class LoopDriver:
         action_stderr = "\n".join(
             r.error for r in outcome.action_results if r.error
         )
+        # parse 失敗時の LLM 応答先頭を観測材料として stdout_tail に積む。
+        # output_tail として failure_pattern.object に乗り、次イテレーションで
+        # 同じ malformed JSON を繰り返さないためのヒントになる。
+        notes = outcome.notes or {}
+        response_head = notes.get("response_head", "")
+        response_length = notes.get("response_length", "")
+        stdout_parts: list[str] = []
+        if response_length:
+            stdout_parts.append(f"[response_length={response_length}]")
+        if response_head:
+            stdout_parts.append(f"[response_head]\n{response_head}")
         synthetic = GateResult(
             name="executor",
             ok=False,
             skipped=False,
             returncode=None,
             duration_ms=0,
-            stdout_tail="",
+            stdout_tail="\n".join(stdout_parts),
             stderr_tail=action_stderr or err_text,
             error=err_text,
         )

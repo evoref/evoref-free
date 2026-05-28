@@ -61,8 +61,11 @@ _PATH_SEPARATOR = "/"
 #: 保持する outcomes_history 最大エントリ数
 MAX_OUTCOMES_HISTORY = 5
 
-#: object 文字列の最大長
-MAX_OBJECT_LEN = 2000
+#: object 文字列の最大長 (output_tail を含むため 2000 → 4000 に拡大)
+MAX_OBJECT_LEN = 4000
+
+#: output_tail に保持する文字数 (gate stdout/stderr 結合後の末尾)
+MAX_OUTPUT_TAIL_LEN = 1500
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -85,6 +88,7 @@ class FailurePayload:
     occurrences: int
     outcomes_history: list[str]
     mitigation: str | None = None
+    output_tail: str | None = None
 
     def to_json(self) -> str:
         payload: dict[str, Any] = {
@@ -96,34 +100,27 @@ class FailurePayload:
         }
         if self.mitigation is not None:
             payload["mitigation"] = self.mitigation
+        if self.output_tail:
+            payload["output_tail"] = self.output_tail
         text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         if len(text) > MAX_OBJECT_LEN:
-            trimmed = FailurePayload(
-                error_type=self.error_type,
-                normalized_file_path=self.normalized_file_path,
-                last_actions=self.last_actions,
-                occurrences=self.occurrences,
-                outcomes_history=self.outcomes_history[-1:],
-                mitigation=(
-                    self.mitigation[:200] if self.mitigation is not None else None
-                ),
-            )
-            text = json.dumps(
-                {
-                    "error_type": trimmed.error_type,
-                    "normalized_file_path": trimmed.normalized_file_path,
-                    "last_actions": trimmed.last_actions,
-                    "occurrences": trimmed.occurrences,
-                    "outcomes_history": trimmed.outcomes_history,
-                    **(
-                        {"mitigation": trimmed.mitigation}
-                        if trimmed.mitigation is not None
-                        else {}
-                    ),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            )
+            trimmed_tail: str | None
+            if self.output_tail:
+                trimmed_tail = self.output_tail[-500:]
+            else:
+                trimmed_tail = None
+            trimmed_payload: dict[str, Any] = {
+                "error_type": self.error_type,
+                "normalized_file_path": self.normalized_file_path,
+                "last_actions": list(self.last_actions),
+                "occurrences": int(self.occurrences),
+                "outcomes_history": list(self.outcomes_history[-1:]),
+            }
+            if self.mitigation is not None:
+                trimmed_payload["mitigation"] = self.mitigation[:200]
+            if trimmed_tail:
+                trimmed_payload["output_tail"] = trimmed_tail
+            text = json.dumps(trimmed_payload, ensure_ascii=False, sort_keys=True)
         return text
 
 
@@ -273,6 +270,30 @@ def _gate_outcome_label(gate_result: GateResult) -> str:
     return "; ".join(parts)
 
 
+def _build_output_tail(
+    gate_result: GateResult, max_chars: int = MAX_OUTPUT_TAIL_LEN,
+) -> str:
+    """``GateResult.stderr_tail`` + ``stdout_tail`` の末尾を結合して返す。
+
+    LLM が次イテレーションで参照できるよう失敗の生出力を保存する用途。
+    stderr → stdout の順で連結し、合計が ``max_chars`` を超える場合は末尾を
+    優先して切り詰める (失敗トレースは末尾に出ることが多いため)。
+    """
+    parts: list[str] = []
+    stderr = (gate_result.stderr_tail or "").strip()
+    if stderr:
+        parts.append("[stderr]\n" + stderr)
+    stdout = (gate_result.stdout_tail or "").strip()
+    if stdout:
+        parts.append("[stdout]\n" + stdout)
+    if not parts:
+        return ""
+    text = "\n".join(parts)
+    if len(text) <= max_chars:
+        return text
+    return "..." + text[-(max_chars - 3):]
+
+
 def write_failure_note(
     view: LoopFactView,
     *,
@@ -314,6 +335,7 @@ def write_failure_note(
         last_actions=last_actions,
     )
     outcome_label = _gate_outcome_label(gate_result)
+    output_tail = _build_output_tail(gate_result)
     fact = view.write_failure_pattern(
         project_id=project_id,
         signature=signature,
@@ -322,6 +344,7 @@ def write_failure_note(
         last_actions=last_actions,
         mitigation=mitigation,
         outcome_label=outcome_label if outcome_label else None,
+        output_tail=output_tail if output_tail else None,
         confidence=confidence,
         trace_id=trace_id,
         now=now,
@@ -413,6 +436,7 @@ __all__ = [
     "FailurePayload",
     "MAX_OBJECT_LEN",
     "MAX_OUTCOMES_HISTORY",
+    "MAX_OUTPUT_TAIL_LEN",
     "compute_failure_signature_from_gate",
     "compute_failure_signatures_from_outcome",
     "consolidate_failure_patterns",
