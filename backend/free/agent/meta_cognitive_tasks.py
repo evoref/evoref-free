@@ -27,6 +27,14 @@ class TaskItem:
 
 
 @dataclass
+class EditorArtifact:
+    """エディタ出力用の生成コード片（ディスク書込せずフロントのエディタへ流す）"""
+    content: str
+    language: str = "python"
+    filename: str | None = None
+
+
+@dataclass
 class MetaCognitiveResponse:
     """Meta-Cognitive 層の応答"""
     content: str
@@ -35,6 +43,8 @@ class MetaCognitiveResponse:
     steps: int = 0
     episode_id: str = ""
     step_credits: list[StepCredit] = field(default_factory=list)
+    # 出力先パス未指定時にエディタペインへ流す生成コード（write_file は行わない）
+    editor_artifacts: list[EditorArtifact] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

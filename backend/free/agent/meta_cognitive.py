@@ -15,6 +15,7 @@ from backend.free.agent.self_cartridge import (
     gather_constants,
 )
 from backend.free.agent.meta_cognitive_tasks import (
+    EditorArtifact,
     MetaCognitiveResponse,
     TaskItem,
     determine_task_status,
@@ -75,21 +76,26 @@ Output a JSON object with a single field "tasks", which is an array of strings �
 each entry being one task description.
 
 IMPORTANT rules:
+- NEVER invent a file path. Only include a file path in a task when the USER explicitly \
+gave one. If the user did not specify an output location, describe the task WITHOUT any path.
+  BAD  (user gave no path): {"tasks": ["Create e:\\\\app\\\\tetris.py with full game implementation"]}
+  GOOD (user gave no path): {"tasks": ["Generate a full Tetris game implementation"]}
+  GOOD (user said save to e:\\\\app\\\\tetris.py): {"tasks": ["Create e:\\\\app\\\\tetris.py with full game implementation"]}
 - Creating or rewriting a SINGLE file is always ONE task, not multiple tasks.
   BAD:  {"tasks": ["Create grid logic", "Add rotation", "Add input handling"]}
-  GOOD: {"tasks": ["Create e:\\\\app\\\\tetris.py with full game implementation"]}
+  GOOD: {"tasks": ["Generate a full Tetris game implementation"]}
 - Only split into multiple tasks when genuinely different files or operations are needed.
 - Each task should have a SINGLE action type. Do NOT combine "fetch/read" and "write/create" \
 in one task.
   BAD:  {"tasks": ["Fetch URL and create script"]}
-  GOOD: {"tasks": ["Fetch URL content", "Create script from fetched content"]}
+  GOOD: {"tasks": ["Fetch URL content", "Generate script from fetched content"]}
 - For information-only requests (explain, summarize, list, show), use fetch_url or read_file \
 as the task — do NOT plan to create files.
   BAD:  {"tasks": ["Create script to scrape website"]}
   GOOD: {"tasks": ["Fetch URL and summarize the content"]}
 - Each task should be self-contained and produce a concrete result.
 
-Example: {"tasks": ["Read foo.py", "Create bar.py with refactored code", "Run tests"]}
+Example: {"tasks": ["Read foo.py", "Generate refactored code", "Run tests"]}
 Output the JSON object and nothing else."""
 
 EXECUTE_SYSTEM_PROMPT = """\
@@ -117,6 +123,25 @@ Generate the requested content below. Output ONLY the content itself, \
 no explanations, no markdown fences, no surrounding text. \
 Do NOT include the file path as a comment at the top.
 """
+
+# 拡張子 → 言語識別子 (エディタ出力片のシンタックスハイライト用、best-effort)
+_EXT_LANGUAGE_MAP: dict[str, str] = {
+    "py": "python", "js": "javascript", "mjs": "javascript", "cjs": "javascript",
+    "ts": "typescript", "mts": "typescript", "cts": "typescript",
+    "tsx": "typescript", "jsx": "javascript",
+    "json": "json", "html": "html", "htm": "html", "css": "css",
+    "xml": "xml", "yaml": "yaml", "yml": "yaml", "sql": "sql",
+    "php": "php", "md": "markdown", "sh": "bash", "rb": "ruby",
+    "go": "go", "rs": "rust", "java": "java", "c": "c", "cpp": "cpp", "cs": "csharp",
+}
+
+# クエリ中の言語名キーワード → 言語識別子 (拡張子が無い場合のフォールバック、先頭優先)
+_LANGUAGE_KEYWORDS: list[tuple[str, str]] = [
+    ("typescript", "typescript"), ("javascript", "javascript"),
+    ("python", "python"), ("html", "html"), ("css", "css"),
+    ("rust", "rust"), ("golang", "go"), ("java", "java"),
+    ("ruby", "ruby"), ("bash", "bash"), ("sql", "sql"),
+]
 
 
 class MetaCognitiveAgent:
@@ -172,6 +197,9 @@ class MetaCognitiveAgent:
         # content gen の総上限 (低速 GPU でも完走できるよう緩和)。トークン間
         # アイドルタイムアウト (無出力検知) と併用する。
         self._content_gen_timeout = agent_cfg.get("content_gen_timeout", 600)
+        self._content_gen_first_token_timeout = agent_cfg.get(
+            "content_gen_first_token_timeout", 120,
+        )
         self._content_gen_idle_timeout = agent_cfg.get("content_gen_idle_timeout", 30)
         self._llm_call_timeout = agent_cfg.get("llm_call_timeout", 90)
         self._total_timeout = agent_cfg.get("total_timeout", 900)
@@ -202,16 +230,22 @@ class MetaCognitiveAgent:
         generation_params: dict | None = None,
         session_id: str = "",
         mode: str = "coding",
+        output_target: str = "file",
     ) -> MetaCognitiveResponse:
         """Meta-Cognitive 層で計画立案 → タスク実行ループ
 
         全体をタイムアウトで保護し、失敗時はプレーン LLM にフォールバック。
+
+        ``output_target`` は生成コードの出力先 (coding モードのみ意味を持つ):
+        ``"file"`` (既定、明示パスへ write_file) / ``"editor"`` (ディスク書込せず
+        ``editor_artifacts`` へ) / ``"chat"`` (コードフェンスで ``content`` に返す)。
         """
         try:
             return await asyncio.wait_for(
                 self._process_impl(
                     query, system_prompt, conversation, llm_client,
                     tools_registry, search_result, on_step,
+                    output_target=output_target,
                     generation_params=generation_params,
                     session_id=session_id,
                     mode=mode,
@@ -311,6 +345,7 @@ class MetaCognitiveAgent:
         search_result=None,
         on_step=None,
         *,
+        output_target: str = "file",
         generation_params: dict | None = None,
         session_id: str = "",
         mode: str = "coding",
@@ -319,6 +354,11 @@ class MetaCognitiveAgent:
         from backend.free.agent.credit_assigner import assign_credit, compute_final_outcome
 
         all_tool_calls: list[dict] = []
+        # 出力先パス未指定 (editor/chat 経路) で生成したコードの蓄積先。
+        # process 呼び出しごとにリセット (meta_agent はリクエスト毎に生成される)。
+        self._output_target = output_target
+        self._editor_artifacts: list[EditorArtifact] = []
+        self._chat_code_parts: list[str] = []
 
         # MDP トレース: エピソード開始
         tracer = self._agent_tracer
@@ -370,7 +410,11 @@ class MetaCognitiveAgent:
             )
 
         # Step 3: 最終応答を組み立て
-        content = self._build_final_response(tasks, context_parts)
+        if output_target == "chat" and self._chat_code_parts:
+            # チャット経路: 生成コードをコードフェンス付きで本文に返す
+            content = "\n\n".join(self._chat_code_parts)
+        else:
+            content = self._build_final_response(tasks, context_parts)
         logger.info("MetaCognitive completed: %d steps, %d tool calls",
                      steps, len(all_tool_calls))
 
@@ -397,6 +441,7 @@ class MetaCognitiveAgent:
             steps=steps,
             episode_id=episode_id,
             step_credits=step_credits,
+            editor_artifacts=self._editor_artifacts,
         )
 
     async def _plan(
@@ -539,16 +584,28 @@ class MetaCognitiveAgent:
                     "status": "running",
                 })
 
-            result, tool_calls = await self._execute_task(
-                task, query, system_prompt, conversation,
-                llm_client, tools_registry, context_parts,
-                on_step=on_step,
-                task_index=i + 1,
-                total_tasks=total_tasks,
-                generation_params=generation_params,
-            )
-            task.result = result
-            task.status = determine_task_status(task, result, tool_calls)
+            if (
+                self._output_target in ("editor", "chat")
+                and task_expects_write(task.description)
+            ):
+                # 出力先パス未指定: ディスク書込せずコードを生成しエディタ/チャットへ
+                result, tool_calls = await self._execute_editor_task(
+                    task, query, llm_client, on_step,
+                    task_index=i + 1, total_tasks=total_tasks,
+                )
+                task.result = result
+                task.status = "failed" if result.startswith("Error:") else "done"
+            else:
+                result, tool_calls = await self._execute_task(
+                    task, query, system_prompt, conversation,
+                    llm_client, tools_registry, context_parts,
+                    on_step=on_step,
+                    task_index=i + 1,
+                    total_tasks=total_tasks,
+                    generation_params=generation_params,
+                )
+                task.result = result
+                task.status = determine_task_status(task, result, tool_calls)
 
             all_tool_calls.extend(tool_calls)
             context_parts.append(f"[{task.description}]: {result[:200]}")
@@ -582,6 +639,67 @@ class MetaCognitiveAgent:
                 )
 
         return steps
+
+    async def _execute_editor_task(
+        self,
+        task: TaskItem,
+        original_query: str,
+        llm_client,
+        on_step,
+        *,
+        task_index: int,
+        total_tasks: int,
+    ) -> tuple[str, list[dict]]:
+        """出力先パス未指定時のタスク実行: ディスク書込せずコードを生成する。
+
+        ``output_target == "editor"`` なら ``editor_artifacts`` に蓄積し、
+        ``"chat"`` ならコードフェンス付きで ``_chat_code_parts`` に蓄積する。
+        ``write_file`` は一切呼ばない。戻り値の tool_calls は常に空。
+        """
+        prefix = f"[{task_index}/{total_tasks}]"
+        if on_step:
+            await call_callback(on_step, {
+                "type": "task_progress",
+                "detail": f"{prefix} コンテンツ生成中...",
+                "status": "running",
+            })
+        content = await self._generate_content(
+            original_query, task.description, llm_client,
+        )
+        if content.startswith("(Content generation failed:"):
+            return f"Error: {content}", []
+        filename, language = self._guess_artifact_meta(
+            task.description, original_query,
+        )
+        if self._output_target == "chat":
+            self._chat_code_parts.append(f"```{language}\n{content}\n```")
+            return f"Generated {len(content)} chars (chat)", []
+        self._editor_artifacts.append(
+            EditorArtifact(content=content, language=language, filename=filename),
+        )
+        return f"Generated {len(content)} chars → editor", []
+
+    @staticmethod
+    def _guess_artifact_meta(
+        task_description: str, query: str,
+    ) -> tuple[str | None, str]:
+        """エディタ出力片のファイル名と言語を推定する (best-effort)。
+
+        明示パス/ファイル名があれば拡張子から言語を引き、無ければクエリ中の
+        言語名キーワードで判定、最終フォールバックは ``"python"``。
+        """
+        from backend.free.agent.tool_call_judge import _extract_file_path
+        path = _extract_file_path(task_description) or _extract_file_path(query)
+        if path:
+            name = Path(path).name
+            if name and "." in name:
+                ext = name.rsplit(".", 1)[-1].lower()
+                return name, _EXT_LANGUAGE_MAP.get(ext, "python")
+        combined = f"{task_description} {query}".lower()
+        for keyword, language in _LANGUAGE_KEYWORDS:
+            if keyword in combined:
+                return None, language
+        return None, "python"
 
     @staticmethod
     def _append_write_context(
@@ -1643,9 +1761,13 @@ class MetaCognitiveAgent:
     ) -> str:
         """LLM ストリーミング生成 + 後処理（フェンス除去・繰り返し切除）
 
-        トークン間アイドル (無出力) タイムアウトで「停止したストリーム」を
-        素早く諦めつつ、低速だが進行中の生成は総上限 (``content_gen_timeout``)
-        まで継続させる。総ウォールクロックで一律に打ち切らない。
+        最初の1トークンまでは別枠の長めタイムアウト
+        (``content_gen_first_token_timeout``) で待つ。これは llama-server が他の
+        生成で busy な間にキュー待ちしているリクエストを「停止」と誤判定しないため。
+        2トークン目以降はトークン間アイドル (無出力) タイムアウト
+        (``content_gen_idle_timeout``) で「停止したストリーム」を素早く諦めつつ、
+        低速だが進行中の生成は総上限 (``content_gen_timeout``) まで継続させる。
+        総ウォールクロックで一律に打ち切らない。
         """
         stream = await llm_client.generate(
             messages, stream=True,
@@ -1655,15 +1777,41 @@ class MetaCognitiveAgent:
         agen = stream.__aiter__()
         chunks: list[str] = []
         start = time.monotonic()
+        first_token = True
         try:
             while True:
+                wait_timeout = (
+                    self._content_gen_first_token_timeout
+                    if first_token
+                    else self._content_gen_idle_timeout
+                )
                 try:
                     token = await asyncio.wait_for(
                         agen.__anext__(),
-                        timeout=self._content_gen_idle_timeout,
+                        timeout=wait_timeout,
                     )
                 except StopAsyncIteration:
                     break
+                except asyncio.TimeoutError:
+                    if first_token:
+                        logger.warning(
+                            "Content generation produced no first token within "
+                            "%ds (llama-server likely busy with another generation)",
+                            self._content_gen_first_token_timeout,
+                        )
+                        return (
+                            f"(Content generation failed: no output within "
+                            f"{self._content_gen_first_token_timeout}s)"
+                        )
+                    logger.warning(
+                        "Content generation stalled (no token for %ds)",
+                        self._content_gen_idle_timeout,
+                    )
+                    return (
+                        f"(Content generation failed: stalled after "
+                        f"{self._content_gen_idle_timeout}s without output)"
+                    )
+                first_token = False
                 chunks.append(token)
                 if time.monotonic() - start > self._content_gen_timeout:
                     logger.warning(
@@ -1679,15 +1827,6 @@ class MetaCognitiveAgent:
                 return "(Content generation failed: empty output)"
             logger.debug("Content generated: %d chars", len(content))
             return content
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Content generation stalled (no token for %ds)",
-                self._content_gen_idle_timeout,
-            )
-            return (
-                f"(Content generation failed: stalled after "
-                f"{self._content_gen_idle_timeout}s without output)"
-            )
         except Exception as e:
             logger.error("Content generation failed: %s", e)
             return f"(Content generation failed: {e})"

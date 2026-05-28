@@ -483,6 +483,7 @@ def _build_meta_cognitive_agent_runner(
     generation_params: GenerationParams | None,
     step_queue: "asyncio.Queue[dict | None]",
     result_holder: dict,
+    output_target: str = "file",
 ):
     """MetaCognitive agent.process() をバックグラウンド実行するコルーチンを生成。
 
@@ -504,6 +505,7 @@ def _build_meta_cognitive_agent_runner(
                 generation_params=generation_params,
                 session_id=session_id,
                 mode=mode,
+                output_target=output_target,
             )
             result_holder["resp"] = resp
         except Exception as e:  # noqa: BLE001
@@ -542,6 +544,12 @@ async def _emit_meta_cognitive_result_frames(resp) -> AsyncIterator[str]:
     """MetaCognitive 応答から最終フレーム（task_result または token）を yield する。"""
     if resp is None:
         return
+
+    # エディタ経路: 生成コードを専用チャネルで送出 (チャット本文には混ぜない)
+    # editor_artifacts は dataclass の field(default_factory=list) で常にリスト
+    if resp.editor_artifacts:
+        for art in resp.editor_artifacts:
+            yield sse.editor_code(art.content, language=art.language, filename=art.filename)
 
     if resp.tasks:
         logger.debug(
@@ -613,6 +621,7 @@ async def stream_meta_cognitive(
     keepalive_interval: float = 15.0,
     timer: StageTimer | None = None,
     private: bool = False,
+    output_target: str = "file",
 ):
     """Meta-Cognitive 層の SSE ストリーミング（ステップフレーム付き）
 
@@ -633,6 +642,7 @@ async def stream_meta_cognitive(
             session_id=session_id, mode=mode,
             generation_params=generation_params,
             step_queue=step_queue, result_holder=result_holder,
+            output_target=output_target,
         )
 
         try:
@@ -703,6 +713,7 @@ async def sync_meta_cognitive(
     *, generation_params: GenerationParams | None = None,
     timer: StageTimer | None = None,
     private: bool = False,
+    output_target: str = "file",
 ) -> ChatResponse:
     """Meta-Cognitive 層の同期応答"""
     try:
@@ -718,14 +729,25 @@ async def sync_meta_cognitive(
             generation_params=generation_params,
             session_id=session_id,
             mode=mode,
+            output_target=output_target,
         )
 
         if timer:
             timer.stop("llm_total_ms")
 
-        estimated_tokens = max(1, _estimate_tokens(resp.content))
+        # 非ストリームではエディタチャネルが無いため、エディタ経路の生成コードは
+        # コードブロックとして応答本文に畳み込む (CLI 等で内容を失わない)。
+        response_text = resp.content
+        editor_artifacts = getattr(resp, "editor_artifacts", None)
+        if editor_artifacts:
+            blocks = "\n\n".join(
+                f"```{art.language}\n{art.content}\n```" for art in editor_artifacts
+            )
+            response_text = blocks if not response_text else f"{response_text}\n\n{blocks}"
+
+        estimated_tokens = max(1, _estimate_tokens(response_text))
         record_meta_cognitive_response(
-            state, resp.content, messages, session_id,
+            state, response_text, messages, session_id,
             query, mode, estimated_tokens, resp.step_credits,
             private=private,
         )
@@ -735,7 +757,7 @@ async def sync_meta_cognitive(
         token_info_dict = make_token_info(messages, estimated_tokens,
                                           context_size, instance_name)
         return ChatResponse(
-            response=resp.content,
+            response=response_text,
             token_info=TokenInfo(**token_info_dict),
             session_id=session_id,
             agent_layer="meta_cognitive",

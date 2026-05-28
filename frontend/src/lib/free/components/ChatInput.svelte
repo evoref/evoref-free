@@ -8,6 +8,8 @@
 		addStepResultToLastAssistant,
 		setRagDebugToLastAssistant,
 		setEditorRouteToLastAssistant,
+		pushGeneratedEditorCode,
+		clearGeneratedEditorCode,
 		nextMessageId,
 		tokenInfo,
 		tokenSpeed,
@@ -46,6 +48,7 @@
 
 		inputText = '';
 		clearFiles();
+		clearGeneratedEditorCode();
 		isStreaming.set(true);
 		tokenSpeed.set(0);
 		cancelled = false;
@@ -91,6 +94,8 @@
 					setRagDebugToLastAssistant(event.rag_debug);
 				} else if (event.type === 'editor_route' && event.editor_route) {
 					setEditorRouteToLastAssistant(event.editor_route.target);
+				} else if (event.type === 'editor_code' && event.editor_code) {
+					pushGeneratedEditorCode(event.editor_code);
 				} else if (event.type === 'error') {
 					appendToLastAssistant(`\n\n**Error:** ${event.error}`);
 				}

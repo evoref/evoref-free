@@ -84,12 +84,18 @@ def _resolve_develop_level() -> str:
     if raw in _DEVELOP_ONLY_DEVELOP_LEVELS:
         from backend.edition import is_develop
         if not is_develop():
-            logger.error(
-                "--develop=%s requires Develop edition. "
-                "Use --develop=debug or --develop=investigate instead.",
+            # ログ詳細度 (observability) の不整合でサーバ全体を落とさない。
+            # evolve は Develop 限定だが、非 Develop で要求された場合は
+            # investigate に縮退して起動を継続する (assist degraded / tz
+            # フォールバックと同じ degraded-mode 方針)。原因は WARNING で示す。
+            logger.warning(
+                "--develop=%s requires Develop edition (current edition is "
+                "lower); falling back to 'investigate'. Set EVOREF_EDITION="
+                "develop (or leave it unset when the develop package is "
+                "available) to enable evolve.",
                 raw,
             )
-            sys.exit(1)
+            return "investigate"
 
     return raw
 
