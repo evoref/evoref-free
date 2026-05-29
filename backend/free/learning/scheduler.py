@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from backend.log_config import get_logger
+from backend.policy_helpers import get_policy_value
 from backend.utils import utc_now
 from backend.free.learning.learning_state_store import (
     LearningState,
@@ -223,12 +224,7 @@ class LearningScheduler:
 
     def _lp(self, key: str, default: int | float) -> int | float:
         """learning ポリシーからパラメータ取得（フォールバック付き）"""
-        if self._policy is None:
-            return default
-        try:
-            return self._policy.get("learning", key)
-        except KeyError:
-            return default
+        return get_policy_value(self._policy, "learning", key, default)
 
     @property
     def running(self) -> bool:

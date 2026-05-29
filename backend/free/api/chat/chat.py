@@ -288,8 +288,14 @@ async def _dispatch_long_form(
     messages: list,
     search_error_wrapper: StreamWrapper,
     timer: StageTimer,
+    output_target: str = "file",
 ) -> StreamingResponse | ChatResponse:
-    """Meta-Cognitive (long_form) 経路: 長文生成オーケストレータを起動する。"""
+    """Meta-Cognitive (long_form) 経路: 長文生成オーケストレータを起動する。
+
+    ``output_target`` は coding モード時の出力先 (``"file"`` / ``"editor"`` /
+    ``"chat"``) を ``stream_long_form`` / ``sync_long_form`` に伝播する。
+    既定 ``"file"`` (チャット応答パス互換)。
+    """
     base_ok, client = await ensure_base_model_health(client, state, cfg)
     if not base_ok:
         if req.stream:
@@ -317,6 +323,7 @@ async def _dispatch_long_form(
                 messages, existing_content,
                 timer=timer,
                 private=req.private,
+                output_target=output_target,
             ))),
             media_type="text/event-stream",
         )
@@ -327,6 +334,7 @@ async def _dispatch_long_form(
             messages, existing_content,
             timer=timer,
             private=req.private,
+            output_target=output_target,
         )
 
 
@@ -546,6 +554,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             return await _dispatch_long_form(
                 req, client, state, cfg, gen_params, session_id,
                 instance_name, context_size, messages, search_error_wrapper, timer,
+                output_target=output_target,
             )
         case "meta_cognitive":
             return await _dispatch_meta_cognitive(

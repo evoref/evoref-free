@@ -11,7 +11,6 @@ import ast
 import logging
 import time
 from collections.abc import AsyncIterator
-from graphlib import TopologicalSorter
 from typing import TYPE_CHECKING
 
 from backend.exceptions import UnitGenerationError
@@ -26,14 +25,17 @@ from backend.free.generation.models import (
 )
 from backend.free.generation.rolling_context import RollingContext
 from backend.free.generation.strategy_common import (
-    TEXT_UNIT_CONTINUATION_SYSTEM,
-    TEXT_UNIT_SYSTEM,
     build_code_unit_messages,
+    build_text_unit_messages,
+    excerpt_continuation_content,
+    excerpt_for_expand,
     fallback_plan,
+    finalize_plan_units,
+    generate_plan_json,
     parse_plan,
+    resolve_max_units,
 )
 from backend.free.generation.token_budget import TokenBudget
-from backend.free.llm.json_schemas import CodePlan, TextPlan
 
 if TYPE_CHECKING:
     from backend.free.llm.assist_client import AssistModelClient
@@ -356,37 +358,6 @@ class ReviewIssue:
         self.fix = fix
 
 
-# ── ユーティリティ ──
-
-def _excerpt_for_expand(existing_content: str) -> str:
-    """EXPAND/SPLIT モード用に既存テキストを抜粋する。
-
-    継続モードの 500+800 char (合計 1300) より大きく取り、planner が機能境界を
-    識別できる解像度を確保する。LLM コンテキストと plan ``max_tokens=1024``
-    制約のバランスを考慮して 2000+2000 char に設定。
-    """
-    if len(existing_content) <= 4000:
-        return existing_content
-    return (
-        existing_content[:2000]
-        + "\n\n[...中略...]\n\n"
-        + existing_content[-2000:]
-    )
-
-
-def resolve_generation_order(units: list[CodeUnit]) -> list[CodeUnit]:
-    """依存関係に基づくトポロジカルソート"""
-    graph = {u.name: set(u.depends_on) for u in units}
-    sorter = TopologicalSorter(graph)
-    try:
-        order = list(sorter.static_order())
-    except Exception:
-        logger.warning("Topological sort failed, using original order")
-        return units
-    unit_map = {u.name: u for u in units}
-    return [unit_map[name] for name in order if name in unit_map]
-
-
 # ── CogWriter 戦略本体 ──
 
 class CogWriterStrategy:
@@ -440,7 +411,7 @@ class CogWriterStrategy:
         ):
             # EXPAND/SPLIT モード: 既存テキストを詳細仕様書として再構成する。
             # 抜粋を継続モードより広く取り (4000 char) 機能列挙の精度を上げる。
-            excerpt = _excerpt_for_expand(existing_content)
+            excerpt = excerpt_for_expand(existing_content)
             # target_length は「ユーザー指定 > 入力長 × 1.5 > 最小 3000」
             user_target = extract_target_chars(instruction, default=0)
             input_scaled = int(len(existing_content) * 1.5)
@@ -466,16 +437,8 @@ class CogWriterStrategy:
                     title_hint="詳細仕様書",
                 )
         elif existing_content:
-            # 追記モード: 既存テキストを含む専用プロンプトを使用
-            # 既存テキストが長すぎる場合は冒頭と末尾を抜粋
-            if len(existing_content) > 1500:
-                excerpt = (
-                    existing_content[:500]
-                    + "\n\n[...中略...]\n\n"
-                    + existing_content[-800:]
-                )
-            else:
-                excerpt = existing_content
+            # 追記モード: 既存テキストを含む専用プロンプトを使用 (冒頭+末尾を抜粋)
+            excerpt = excerpt_continuation_content(existing_content)
             # target_length をユーザー指示から推定（デフォルト1000字）
             target_length = extract_target_chars(instruction, default=1000)
             prompt = _TEXT_PLAN_CONTINUATION_PROMPT.format(
@@ -493,23 +456,9 @@ class CogWriterStrategy:
             )
 
         # EXPAND/SPLIT モードでは下限 8 を保証 (機能ごとセクション化のため)
-        max_units = self._lf_config.get("max_units", 20)
-        if long_form_mode in (LongFormMode.EXPAND, LongFormMode.SPLIT):
-            max_units = max(max_units, 8)
-        # content_type に応じて schema を選択。CogWriter のプラン
-        # は code/text で units の構造が異なるため、purpose 自動解決ではなく
-        # 明示指定する。
-        plan_schema = CodePlan if content_type == ContentType.CODE else TextPlan
-        try:
-            data = await self.assist_client.generate_json(
-                prompt, max_tokens=1024, temperature=0.3,
-                purpose="long_form_planning",
-                list_key="units",
-                response_schema=plan_schema,
-            )
-        except Exception as e:
-            logger.warning("Plan generation failed: %s", e)
-            data = {}
+        max_units = resolve_max_units(self._lf_config, long_form_mode)
+        # content_type に応じた schema 選択と例外フォールバックは共通化
+        data = await generate_plan_json(self.assist_client, prompt, content_type)
 
         if not data or "units" not in data:
             logger.warning(
@@ -519,18 +468,8 @@ class CogWriterStrategy:
         else:
             plan = parse_plan(data, content_type, instruction)
 
-        # ユニット数上限
-        if len(plan.units) > max_units:
-            logger.warning(
-                "Plan has %d units, truncating to %d",
-                len(plan.units), max_units,
-            )
-            plan.units = plan.units[:max_units]
-
-        # コード用: 依存順ソート
-        if content_type == ContentType.CODE:
-            code_units = [u for u in plan.units if isinstance(u, CodeUnit)]
-            plan.units = resolve_generation_order(code_units)
+        # ユニット数上限 + コード用依存順ソート (共通後処理)
+        finalize_plan_units(plan, max_units, content_type)
 
         elapsed = time.monotonic() - t0
         logger.info(
@@ -664,64 +603,14 @@ class CogWriterStrategy:
         unit: SectionPlan,
         rolling: RollingContext,
     ) -> list[dict]:
-        """テキスト生成用のメッセージを構築"""
-        budget = rolling.budget
-        plan = rolling.plan
+        """テキスト生成用のメッセージを構築 (共通スケルトンに委譲)。
 
-        # セクション見出し一覧
-        section_headings = ", ".join(
-            u.heading for u in plan.units if isinstance(u, SectionPlan)
+        CogWriter は長期要約スロットを持たないため
+        ``include_long_term_summary=False``。
+        """
+        return build_text_unit_messages(
+            unit, rolling, _TEXT_UNIT_USER, include_long_term_summary=False,
         )
-
-        # 直前セクション（追記モードでは既存テキスト末尾が入る）
-        short_term = budget.fit_content("short_term", rolling.short_term)
-
-        # ユニットごとの目標文字数を計算
-        total_estimated = sum(
-            u.estimated_tokens for u in plan.units if isinstance(u, SectionPlan)
-        ) or 1
-        unit_ratio = unit.estimated_tokens / total_estimated
-        unit_target_chars = max(int(plan.target_length * unit_ratio), 200)
-
-        # 追記モードでは専用のシステムプロンプトを使用
-        system_template = (
-            TEXT_UNIT_CONTINUATION_SYSTEM
-            if rolling.has_existing_context
-            else TEXT_UNIT_SYSTEM
-        )
-        system = budget.fit_content(
-            "system_prompt",
-            system_template.format(
-                global_context=plan.global_context,
-                unit_target_chars=unit_target_chars,
-            ),
-        )
-
-        # 追記モードの場合、short_term のラベルを「直前テキスト末尾」に変更
-        short_term_label = (
-            "# 直前テキスト末尾（この直後に自然に続く文章を書いてください）"
-            if rolling.has_existing_context
-            else "# 直前セクション末尾"
-        )
-
-        user = _TEXT_UNIT_USER.format(
-            title=plan.title,
-            section_headings=section_headings,
-            short_term=short_term or "(なし)",
-            heading=unit.heading,
-            key_points=", ".join(unit.key_points),
-            rag_context="(なし)",  # RAGはOrchestratorが注入
-        )
-        # 追記モード: ユーザープロンプトの short_term ラベルを差し替え
-        if rolling.has_existing_context:
-            user = user.replace(
-                "# 直前セクション末尾", short_term_label,
-            )
-
-        return [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
 
     # ── レビュー実装 ──
 

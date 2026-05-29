@@ -2,11 +2,12 @@
 
 import time
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 
 from backend.app_state import AppState, get_app_state
 from backend.config import get_path_resolver
 from backend.edition import get_pro_handler, is_pro
+from backend.free.api._error_responses import api_error
 from backend.free.api.learning._learning_collectors import (
     extract_executed_phases,
     map_active_session,
@@ -72,17 +73,17 @@ async def trigger_learning(req: TriggerRequest, state: AppState = Depends(get_ap
     """
     logger.debug("POST /api/learning/trigger: level=%s", req.level)
     if req.level not in ("level1", "full"):
-        raise HTTPException(status_code=400, detail={
-            "code": "E0400", "message": "level must be 'level1' or 'full'",
-            "i18n_key": "api.learning_invalid_level", "context": {},
-        })
+        raise api_error(
+            400, "E0400", "level must be 'level1' or 'full'",
+            "api.learning_invalid_level",
+        )
 
     scheduler = state.learning_scheduler
     if scheduler is None:
-        raise HTTPException(status_code=503, detail={
-            "code": "E0503", "message": "Learning scheduler not initialized",
-            "i18n_key": "api.learning_scheduler_not_initialized", "context": {},
-        })
+        raise api_error(
+            503, "E0503", "Learning scheduler not initialized",
+            "api.learning_scheduler_not_initialized",
+        )
 
     # Full モード: まず sleep-time update を実行する。
     # アシストモデルを優先し、利用不可の場合のみベースモデルにフォールバックする。

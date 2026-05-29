@@ -16,6 +16,7 @@ import httpx
 import numpy as np
 
 from backend.free.llm._base_client import (
+    BaseHTTPClient,
     async_retry_http_call,
     make_retry_logger,
 )
@@ -23,17 +24,13 @@ from backend.free.rag.embedding_backend import (
     DEFAULT_MODE,
     QueryCacheMixin,
 )
+from backend.free.rag.instruction_resolver import format_with_instruction
 from backend.log_config import get_logger
 
 logger = get_logger("rag.embedding_llamacpp")
 
-# instructions 設定が空 / 不正な場合のフォールバック (起動失敗回避)
-_FALLBACK_INSTRUCTION = (
-    "Given a user question, retrieve relevant passages that answer the query"
-)
 
-
-class LlamaCppEmbedder(QueryCacheMixin):
+class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
     """llama-server /v1/embeddings 経由の埋め込み生成"""
 
     def __init__(
@@ -49,10 +46,10 @@ class LlamaCppEmbedder(QueryCacheMixin):
         doc_template: str = "",
         debug_logger=None,
     ):
+        super().__init__(timeout=timeout)
         self._url = f"http://{host}:{port}/v1/embeddings"
         self._model_name = model_name_str
         self._dim = dim_size
-        self._timeout = timeout
         # 入力長クランプ (Fail Safe)
         # Qwen3-Embedding 系の日本語トークナイズは概ね 1 tok ≈ 2-3 文字なので、
         # `max_length * 2` の文字数に安全側で切り詰める。llama-server の
@@ -67,7 +64,6 @@ class LlamaCppEmbedder(QueryCacheMixin):
         # 空文字列の場合は prefix を一切付与せず素のテキストを送る (BGE-M3 等)。
         self._query_template = query_template
         self._doc_template = doc_template
-        self._client: httpx.AsyncClient | None = None
         self._debug_logger = debug_logger
         # 初回レスポンスフラグ: 初回は次元 auto-detect を許可
         # 2 回目以降の変化は異常とみなして例外送出する
@@ -81,44 +77,18 @@ class LlamaCppEmbedder(QueryCacheMixin):
             self._query_template, self._doc_template,
         )
 
-    def _resolve_instruction(self, mode: str) -> str:
-        """``mode`` から instruction 文字列を解決する
-
-        順序: ``instructions[mode]`` → ``instructions["chat"]`` →
-        モジュール定数フォールバック。
-        """
-        if mode in self._instructions:
-            return self._instructions[mode]
-        if DEFAULT_MODE in self._instructions:
-            logger.warning(
-                "embed_query: unknown mode=%r, falling back to %r",
-                mode, DEFAULT_MODE,
-            )
-            return self._instructions[DEFAULT_MODE]
-        logger.warning(
-            "embed_query: no instructions configured (mode=%r), using fallback",
-            mode,
-        )
-        return _FALLBACK_INSTRUCTION
-
     def _format_text(self, text: str, *, is_query: bool, mode: str) -> str:
         """テンプレート駆動でテキストを整形する
 
         ``is_query=True`` で ``query_template``、``False`` で ``doc_template``
         を適用する。テンプレートが空文字列なら素のテキストを返す
-        (BGE-M3 等の非 instruction-aware モデル向け fast-path)。
+        (BGE-M3 等の非 instruction-aware モデル向け fast-path)。instruction
+        解決とフォーマットは :mod:`instruction_resolver` に委譲する。
         """
         template = self._query_template if is_query else self._doc_template
-        if not template:
-            return text
-        instruction = self._resolve_instruction(mode)
-        return template.format(task=instruction, query=text)
-
-    def _ensure_client(self) -> httpx.AsyncClient:
-        """遅延初期化で AsyncClient を取得"""
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self._timeout)
-        return self._client
+        return format_with_instruction(
+            text, template, self._instructions, mode, backend_label="embed_query",
+        )
 
     async def embed(
         self,
@@ -137,7 +107,7 @@ class LlamaCppEmbedder(QueryCacheMixin):
         if not texts:
             return np.array([]).reshape(0, self._dim)
 
-        client = self._ensure_client()
+        client = self._get_http_client()
 
         logger.debug(
             "embed: batch_size=%d, is_query=%s, mode=%s",
@@ -313,7 +283,7 @@ class LlamaCppEmbedder(QueryCacheMixin):
         ConnectError / Timeout 系は False を返し、例外を握りつぶす。
         """
         try:
-            client = self._ensure_client()
+            client = self._get_http_client()
             base_url = self._url.rsplit("/v1/embeddings", 1)[0]
             resp = await client.get(f"{base_url}/health", timeout=5.0)
             healthy = resp.status_code == 200
@@ -325,9 +295,3 @@ class LlamaCppEmbedder(QueryCacheMixin):
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPError) as e:
             logger.debug("Embedding health check failed: %s", e)
             return False
-
-    async def aclose(self) -> None:
-        """HTTP クライアントを閉じる"""
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None

@@ -15,6 +15,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from backend.io import atomic_write_text
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -647,8 +648,10 @@ class PolicyInterpreter:
                 if domain not in self._data:
                     continue
                 path = self._policies_dir / filename
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(self._data[domain], f, ensure_ascii=False, indent=2)
+                atomic_write_text(
+                    path,
+                    json.dumps(self._data[domain], ensure_ascii=False, indent=2),
+                )
 
         logger.info("Policies saved to %s", self._policies_dir)
 
@@ -677,8 +680,10 @@ class PolicyInterpreter:
                 # デフォルトで生成
                 self._data[domain] = copy.deepcopy(defaults[domain])
                 try:
-                    with open(path, "w", encoding="utf-8") as f:
-                        json.dump(self._data[domain], f, ensure_ascii=False, indent=2)
+                    atomic_write_text(
+                        path,
+                        json.dumps(self._data[domain], ensure_ascii=False, indent=2),
+                    )
                     logger.info("Created default policy: %s", path)
                 except OSError as e:
                     logger.warning("Failed to write default policy %s: %s", path, e)

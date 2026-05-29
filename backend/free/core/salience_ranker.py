@@ -18,6 +18,7 @@ import re
 from typing import TYPE_CHECKING
 
 from backend.log_config import get_logger
+from backend.policy_helpers import get_policy_value
 from backend.utils import estimate_tokens
 
 if TYPE_CHECKING:
@@ -72,12 +73,10 @@ class SalienceRanker:
 
     def _p(self, key: str, default: float) -> float:
         """ポリシーからパラメータ取得（フォールバック付き）"""
-        if self._policy is None:
-            return default
-        try:
-            return float(self._policy.get("search", key, self._mode))
-        except (KeyError, TypeError, ValueError):
-            return default
+        return get_policy_value(
+            self._policy, "search", key, default,
+            mode=self._mode, coerce_type=float,
+        )
 
     def rank(
         self,

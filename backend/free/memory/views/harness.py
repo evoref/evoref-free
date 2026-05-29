@@ -24,7 +24,10 @@ from collections.abc import Iterable
 from backend.free.memory.ownership import Pillar
 from backend.free.memory.protocols import SemanticFactStoreProtocol
 from backend.free.memory.types import MemoryMode, SemanticFact
-from backend.free.memory.views.base import FactViewBase
+from backend.free.memory.views.base import (
+    FactViewBase,
+    merge_active_facts_across_stores,
+)
 
 
 class HarnessFactView(FactViewBase):
@@ -60,19 +63,9 @@ class HarnessFactView(FactViewBase):
     ) -> list[SemanticFact]:
         """``mode`` 付きで有効な policy を返す (superseded 除外)。"""
         self._assert_read("policy")
-        result: list[SemanticFact] = []
-        seen: set[str] = set()
-        for store in self._stores:
-            for fact in store.search_by_type("policy"):
-                if fact.id in seen or fact.superseded_by:
-                    continue
-                if fact.confidence < min_confidence:
-                    continue
-                if mode is not None and fact.mode_origin != mode:
-                    continue
-                result.append(fact)
-                seen.add(fact.id)
-        return result
+        return merge_active_facts_across_stores(
+            self._stores, "policy", min_confidence=min_confidence, mode=mode,
+        )
 
     def get_active_fewshots(
         self,
@@ -82,19 +75,9 @@ class HarnessFactView(FactViewBase):
     ) -> list[SemanticFact]:
         """``mode`` 付きで有効な fewshot を返す (superseded 除外)。"""
         self._assert_read("fewshot")
-        result: list[SemanticFact] = []
-        seen: set[str] = set()
-        for store in self._stores:
-            for fact in store.search_by_type("fewshot"):
-                if fact.id in seen or fact.superseded_by:
-                    continue
-                if fact.confidence < min_fitness:
-                    continue
-                if mode is not None and fact.mode_origin != mode:
-                    continue
-                result.append(fact)
-                seen.add(fact.id)
-        return result
+        return merge_active_facts_across_stores(
+            self._stores, "fewshot", min_confidence=min_fitness, mode=mode,
+        )
 
     def get_recent_failures(
         self,

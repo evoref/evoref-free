@@ -22,13 +22,12 @@ from backend.free.generation.models import (
     extract_target_chars,
 )
 from backend.free.generation.rolling_context import RollingContext
-from backend.free.generation.strategy_cogwriter import (
-    CogWriterStrategy,
-    resolve_generation_order,
-)
+from backend.free.generation.strategy_cogwriter import CogWriterStrategy
+from backend.free.generation.strategy_common import resolve_generation_order
 from backend.free.generation.strategy_recurrent import RecurrentStrategy
 from backend.free.generation.token_budget import TokenBudget, truncate_tail
 from backend.free.generation.validators import validate_python
+from backend.policy_helpers import get_policy_value
 from backend.utils import estimate_tokens
 
 if TYPE_CHECKING:
@@ -604,12 +603,7 @@ class LongFormOrchestrator:
         self, key: str, mode: str, default: int | float,
     ) -> int | float:
         """long_form ポリシーからパラメータ取得（フォールバック付き）"""
-        if self._policy is None:
-            return default
-        try:
-            return self._policy.get("long_form", key, mode)
-        except KeyError:
-            return default
+        return get_policy_value(self._policy, "long_form", key, default, mode=mode)
 
 
 def _call_step(on_step: Callable[[dict], Any], data: dict) -> None:

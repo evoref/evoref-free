@@ -48,7 +48,11 @@ from backend.free.memory.types import (
     TaskStatus,
     make_fact,
 )
-from backend.free.memory.views.base import FactViewBase
+from backend.free.memory.views.base import (
+    FactViewBase,
+    merge_active_facts_across_stores,
+    safe_json_loads as _safe_json_loads,
+)
 
 # ──────────────────────────────────────────────────────────────────────────
 # 定数 (loop/ モジュールと整合)
@@ -147,16 +151,6 @@ class LoopBootstrapResult:
 # ──────────────────────────────────────────────────────────────────────────
 # 内部ユーティリティ (JSON パース / subject 生成)
 # ──────────────────────────────────────────────────────────────────────────
-
-
-def _safe_json_loads(s: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(s)
-        if isinstance(payload, dict):
-            return payload
-        return {}
-    except (json.JSONDecodeError, TypeError):
-        return {}
 
 
 def _parse_task_status(fact: SemanticFact) -> TaskStatus:
@@ -478,19 +472,9 @@ class LoopFactView(FactViewBase):
     ) -> list[SemanticFact]:
         """Loop が参照する有効 policy 群 (superseded 除外)。"""
         self._assert_read("policy")
-        result: list[SemanticFact] = []
-        seen: set[str] = set()
-        for store in self._stores:
-            for fact in store.search_by_type("policy"):
-                if fact.id in seen or fact.superseded_by:
-                    continue
-                if fact.confidence < min_confidence:
-                    continue
-                if mode is not None and fact.mode_origin != mode:
-                    continue
-                result.append(fact)
-                seen.add(fact.id)
-        return result
+        return merge_active_facts_across_stores(
+            self._stores, "policy", min_confidence=min_confidence, mode=mode,
+        )
 
     def get_active_fewshots(
         self,
@@ -500,19 +484,9 @@ class LoopFactView(FactViewBase):
     ) -> list[SemanticFact]:
         """Loop が参照する有効 fewshot 群 (superseded 除外)。"""
         self._assert_read("fewshot")
-        result: list[SemanticFact] = []
-        seen: set[str] = set()
-        for store in self._stores:
-            for fact in store.search_by_type("fewshot"):
-                if fact.id in seen or fact.superseded_by:
-                    continue
-                if fact.confidence < min_confidence:
-                    continue
-                if mode is not None and fact.mode_origin != mode:
-                    continue
-                result.append(fact)
-                seen.add(fact.id)
-        return result
+        return merge_active_facts_across_stores(
+            self._stores, "fewshot", min_confidence=min_confidence, mode=mode,
+        )
 
     # ──────────────────────────────────────────────────────────────────
     # 読取系 — pinned / user profile

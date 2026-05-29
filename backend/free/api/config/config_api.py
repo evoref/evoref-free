@@ -9,6 +9,7 @@ from backend.app_state import AppState, get_app_state
 from backend.config import get_config, save_config_section
 from backend.schemas import EvorefConfig
 from backend.edition import current_edition, Edition
+from backend.free.api._error_responses import api_error
 from backend.free.api.schemas import (
     ConfigFullResponse,
     ConfigUpdateRequest,
@@ -63,10 +64,10 @@ async def update_locale(req: LocaleRequest):
     """ロケール切り替え"""
     locales = available_locales()
     if req.locale not in locales:
-        raise HTTPException(status_code=400, detail={
-            "code": "E0400", "message": f"Unsupported locale: {req.locale}",
-            "i18n_key": "api.config_unsupported_locale", "context": {"locale": req.locale},
-        })
+        raise api_error(
+            400, "E0400", f"Unsupported locale: {req.locale}",
+            "api.config_unsupported_locale", locale=req.locale,
+        )
 
     set_locale(req.locale)
     logger.info("Locale changed to %s", req.locale)
@@ -118,17 +119,17 @@ async def update_config_section(
     """設定セクション更新"""
     # セクション名チェック
     if section not in VALID_SECTIONS:
-        raise HTTPException(status_code=404, detail={
-            "code": "E0404", "message": f"Unknown config section: {section}",
-            "i18n_key": "api.config_unknown_section", "context": {"section": section},
-        })
+        raise api_error(
+            404, "E0404", f"Unknown config section: {section}",
+            "api.config_unknown_section", section=section,
+        )
 
     # Free で Pro 専用セクションへの書き込みを拒否
     if not _is_pro() and section in PRO_ONLY_SECTIONS:
-        raise HTTPException(status_code=403, detail={
-            "code": "E0403", "message": f"Section '{section}' requires Pro edition",
-            "i18n_key": "api.config_pro_only", "context": {"section": section},
-        })
+        raise api_error(
+            403, "E0403", f"Section '{section}' requires Pro edition",
+            "api.config_pro_only", section=section,
+        )
 
     # api_key マスク値の場合は既存値を保持
     data = dict(req.data)
@@ -149,10 +150,7 @@ async def update_config_section(
         })
     except Exception as e:
         logger.error("Failed to save config section '%s': %s", section, e)
-        raise HTTPException(status_code=500, detail={
-            "code": "E0500", "message": str(e),
-            "i18n_key": "", "context": {},
-        })
+        raise api_error(500, "E0500", str(e))
 
     logger.info("Config section '%s' updated", section)
 
@@ -166,10 +164,10 @@ async def update_config_section(
 async def validate_config_section(section: str, req: ConfigUpdateRequest):
     """設定セクションのバリデーションのみ（保存しない）"""
     if section not in VALID_SECTIONS:
-        raise HTTPException(status_code=404, detail={
-            "code": "E0404", "message": f"Unknown config section: {section}",
-            "i18n_key": "api.config_unknown_section", "context": {"section": section},
-        })
+        raise api_error(
+            404, "E0404", f"Unknown config section: {section}",
+            "api.config_unknown_section", section=section,
+        )
 
     # 現在の設定に対象セクションだけマージして検証
     from backend.config import _deep_merge

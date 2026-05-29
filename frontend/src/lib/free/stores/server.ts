@@ -3,6 +3,7 @@ import type { ComponentStatus, DebugStatusInfo, MemoryStats, ServerName } from '
 import { getStatus } from '$lib/free/api';
 import { handleApiCall } from '$lib/free/utils/error';
 import { instanceName, appVersion } from '$lib/free/stores/app';
+import { createPoller } from '$lib/free/stores/_polling';
 
 export interface ServerState {
 	/** バックエンドに到達可能か */
@@ -33,8 +34,6 @@ export const serverState = writable<ServerState>(initial);
  */
 export const busyServer = writable<ServerName | null>(null);
 
-let intervalId: ReturnType<typeof setInterval> | null = null;
-
 /** ステータスを1回取得して store を更新 */
 export async function refreshServerStatus(): Promise<void> {
 	const status = await handleApiCall(() => getStatus(), {
@@ -55,17 +54,14 @@ export async function refreshServerStatus(): Promise<void> {
 	}
 }
 
+const _poller = createPoller(refreshServerStatus, 30_000);
+
 /** ポーリング開始（デフォルト30秒間隔） */
-export function startPolling(intervalMs = 30_000): void {
-	stopPolling();
-	refreshServerStatus();
-	intervalId = setInterval(refreshServerStatus, intervalMs);
+export function startPolling(intervalMs?: number): void {
+	_poller.start(intervalMs);
 }
 
 /** ポーリング停止 */
 export function stopPolling(): void {
-	if (intervalId !== null) {
-		clearInterval(intervalId);
-		intervalId = null;
-	}
+	_poller.stop();
 }

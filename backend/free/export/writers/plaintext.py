@@ -11,11 +11,13 @@ from typing import override
 
 from backend.export._writer_base import BytesWriterBase
 from backend.export.base import ContentBlock, ExportContent
+from backend.export.markdown_patterns import (
+    RE_BOLD as _RE_BOLD,
+    RE_INLINE_CODE as _RE_CODE,
+    RE_ITALIC as _RE_ITALIC,
+)
 
-# inline Markdown 書式除去パターン
-_RE_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
-_RE_ITALIC = re.compile(r"\*(.+?)\*|_(.+?)_")
-_RE_CODE = re.compile(r"`(.+?)`")
+# inline Markdown 書式除去パターン (link/image は URL を捨てる plaintext 固有)
 _RE_LINK = re.compile(r"\[(.+?)\]\(.+?\)")
 _RE_IMAGE = re.compile(r"!\[.*?\]\(.+?\)")
 

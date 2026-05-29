@@ -14,10 +14,9 @@ import { writable } from 'svelte/store';
 import type { VramStatusResponse } from '$lib/free/api';
 import { getVramStatus } from '$lib/free/api';
 import { handleApiCall } from '$lib/free/utils/error';
+import { createPoller } from '$lib/free/stores/_polling';
 
 export const vramStatus = writable<VramStatusResponse | null>(null);
-
-let intervalId: ReturnType<typeof setInterval> | null = null;
 
 /** 1 回だけ取得して store を更新 */
 export async function refreshVramStatus(): Promise<void> {
@@ -32,17 +31,14 @@ export async function refreshVramStatus(): Promise<void> {
 	}
 }
 
+const _poller = createPoller(refreshVramStatus, 10_000);
+
 /** ポーリング開始 (既定 10 秒) */
-export function startVramPolling(intervalMs = 10_000): void {
-	stopVramPolling();
-	refreshVramStatus();
-	intervalId = setInterval(refreshVramStatus, intervalMs);
+export function startVramPolling(intervalMs?: number): void {
+	_poller.start(intervalMs);
 }
 
 /** ポーリング停止 */
 export function stopVramPolling(): void {
-	if (intervalId !== null) {
-		clearInterval(intervalId);
-		intervalId = null;
-	}
+	_poller.stop();
 }

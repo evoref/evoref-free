@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -23,8 +22,10 @@ from backend.free.cli.session_persistence import (
     auto_save_session,
     finalize_session,
 )
+from backend.free.history.utils import parse_iso
 from backend.i18n_helper import msg
 from backend.log_config import get_logger
+from backend.utils import utc_now_dt
 
 logger = get_logger("cli.command_handlers")
 
@@ -137,7 +138,7 @@ def _cmd_save(args: str, state: SessionState, console) -> CommandResult:
     session_data = {
         "session_id": state.session_id,
         "name": name,
-        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "saved_at": utc_now_dt().isoformat(),
         "mode": state.mode,
         "source": "manual",
         "instance_name": state.instance_name,
@@ -846,13 +847,10 @@ async def _learn_status(state: SessionState, console) -> CommandResult:
                 """UTC ISO文字列をローカル時刻 (YYYY-MM-DD HH:MM:SS) に変換"""
                 if not iso_str:
                     return "never"
-                from datetime import datetime
-                try:
-                    utc = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-                    local = utc.astimezone()
-                    return local.strftime("%Y-%m-%d %H:%M:%S")
-                except (ValueError, TypeError):
+                dt = parse_iso(iso_str)
+                if dt is None:
                     return iso_str
+                return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
             lines = [
                 "=== Learning Status ===",
