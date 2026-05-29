@@ -9,9 +9,37 @@ from __future__ import annotations
 
 import ast
 import builtins
+import re
 from dataclasses import dataclass
 
 PYTHON_BUILTINS: frozenset[str] = frozenset(dir(builtins))
+
+# バッククォート 3 個以上の markdown コードフェンス区切り。言語タグ (python 等) は任意。
+# CODE ユニットは区切り無しに連結されるため、閉じフェンス ``` と次ユニットの開きフェンス
+# ```python が結合して ``````python (6 個) になったり、コード行末に ```python が結合する
+# ことがある。`{3,}` で連数を問わず捕捉する。
+# - 行全体がフェンスのみ → 行ごと削除
+# - コード行末に結合したフェンス → 末尾フェンスのみ除去 (本文と改行は残す)
+_FENCE_ONLY_LINE_RE = re.compile(r"^[ \t]*`{3,}[A-Za-z0-9_+\-.]*[ \t]*$")
+_TRAILING_FENCE_RE = re.compile(r"[ \t]*`{3,}[A-Za-z0-9_+\-.]*[ \t]*$")
+
+
+def remove_code_fences(code: str) -> str:
+    """組み立て済みコードから markdown コードフェンス (```python / ``` / ``````python 等) を除去する。
+
+    行全体がフェンスのみの行は丸ごと削除し、コード行末に結合したフェンス
+    (例 ``ALIVE = 1```python``) は末尾フェンスのみ除去する。文字列リテラル内の
+    ``` (例 ``x = "```"``) は行末に来ないため保持される。
+
+    ``backend.free.llm.json_extract.strip_code_fences`` (単一ブロックの外側のみ剥がす
+    JSON 用) とは別物。
+    """
+    out: list[str] = []
+    for line in code.splitlines():
+        if _FENCE_ONLY_LINE_RE.match(line):
+            continue
+        out.append(_TRAILING_FENCE_RE.sub("", line))
+    return "\n".join(out)
 
 
 @dataclass
@@ -35,6 +63,24 @@ def _extract_used_names(tree: ast.Module) -> set[str]:
     return names
 
 
+def _target_names(target: ast.expr) -> set[str]:
+    """代入 / ループ対象から束縛される名前を再帰的に抽出する。
+
+    Tuple / List のアンパック (``a, b = ...`` / ``for a, b in ...``)、Starred
+    (``a, *rest = ...``)、ネストした分解に対応する。Attribute / Subscript
+    (``obj.x`` / ``d[k]``) は新規束縛ではないため無視する。
+    """
+    names: set[str] = set()
+    if isinstance(target, ast.Name):
+        names.add(target.id)
+    elif isinstance(target, ast.Starred):
+        names |= _target_names(target.value)
+    elif isinstance(target, ast.Tuple | ast.List):
+        for elt in target.elts:
+            names |= _target_names(elt)
+    return names
+
+
 def _extract_defined_names(tree: ast.Module) -> set[str]:
     """AST から定義されている名前を抽出"""
     names: set[str] = set()
@@ -45,23 +91,22 @@ def _extract_defined_names(tree: ast.Module) -> set[str]:
             names.add(node.name)
         elif isinstance(node, ast.Assign):
             for target in node.targets:
-                if isinstance(target, ast.Name):
-                    names.add(target.id)
-                elif isinstance(target, ast.Tuple | ast.List):
-                    for elt in target.elts:
-                        if isinstance(elt, ast.Name):
-                            names.add(elt.id)
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            names.add(node.target.id)
-        elif isinstance(node, ast.For) and isinstance(node.target, ast.Name):
-            names.add(node.target.id)
-        elif isinstance(node, ast.With):
+                names |= _target_names(target)
+        elif isinstance(node, ast.AnnAssign):
+            names |= _target_names(node.target)
+        elif isinstance(node, ast.NamedExpr):  # walrus (n := ...)
+            names |= _target_names(node.target)
+        elif isinstance(node, ast.For | ast.AsyncFor):
+            names |= _target_names(node.target)
+        elif isinstance(node, ast.With | ast.AsyncWith):
             for item in node.items:
-                if item.optional_vars and isinstance(item.optional_vars, ast.Name):
-                    names.add(item.optional_vars.id)
+                if item.optional_vars is not None:
+                    names |= _target_names(item.optional_vars)
         elif isinstance(node, ast.comprehension):
-            if isinstance(node.target, ast.Name):
-                names.add(node.target.id)
+            names |= _target_names(node.target)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:  # except ... as e
+                names.add(node.name)
     # 関数引数
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):

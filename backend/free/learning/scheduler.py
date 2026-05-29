@@ -742,8 +742,11 @@ class LearningScheduler:
             # FewShotPool / 失敗クリティーク / policy fitness プロバイダへ還流する
             await self._run_feedback_pipe()
             try:
+                # 進化対象は名前プレフィックス無しの raw 本文。get_prompt() の
+                # 出力 (プレフィックス付き) を渡すと進化後本文へ名前が焼き込まれ、
+                # ランタイムの二重付与で設定名が反映されなくなる (_collect_mode_prompt_texts と同じ契約)。
                 prompt_texts = {
-                    mode: self.prompt_manager.get_prompt(mode)
+                    mode: self.prompt_manager.get_raw_prompt(mode)
                     for mode in self.MODES
                 }
                 mutator_client = self._resolve_mutator_client("base", llm_client)

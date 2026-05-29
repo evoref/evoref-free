@@ -8,8 +8,11 @@
 		addStepResultToLastAssistant,
 		setRagDebugToLastAssistant,
 		setEditorRouteToLastAssistant,
+		setLongFormProgressToLastAssistant,
 		pushGeneratedEditorCode,
 		clearGeneratedEditorCode,
+		setStreamingEditorCode,
+		clearStreamingEditorCode,
 		nextMessageId,
 		tokenInfo,
 		tokenSpeed,
@@ -31,6 +34,16 @@
 	let textarea: HTMLTextAreaElement | undefined = $state();
 	let abortController: AbortController | null = null;
 	let cancelled = false;
+	/** このターンで partial editor_code を受信したか (final を streaming タブへ確定するため) */
+	let sawPartialEditor = false;
+
+	/** long_form ユニットステップの detail ("[3/9] GameGrid: 803 tokens") を進捗に分解する */
+	function parseLongFormProgress(detail: string, done: boolean) {
+		const m = detail.match(/\[(\d+)\/(\d+)\]\s*(.+)$/);
+		if (!m) return null;
+		const label = m[3].split(/[:(]/)[0].trim();
+		return { current: Number(m[1]), total: Number(m[2]), label, done };
+	}
 
 	async function handleSend() {
 		const text = inputText.trim();
@@ -49,6 +62,8 @@
 		inputText = '';
 		clearFiles();
 		clearGeneratedEditorCode();
+		clearStreamingEditorCode();
+		sawPartialEditor = false;
 		isStreaming.set(true);
 		tokenSpeed.set(0);
 		cancelled = false;
@@ -82,7 +97,15 @@
 						// Meta-Cognitive 最終タスク結果 → 結果ボックスのみ
 						addStepResultToLastAssistant(event.step.detail, event.step.status ?? 'done');
 					} else {
-						// 通常のステップ → AgenticSteps 欄のみ
+						// long_form ユニットステップ → 進捗をチャットに常時表示
+						if (event.step.type === 'long_form_unit_start' || event.step.type === 'long_form_unit_done') {
+							const p = parseLongFormProgress(
+								event.step.detail,
+								event.step.type === 'long_form_unit_done'
+							);
+							if (p) setLongFormProgressToLastAssistant(p);
+						}
+						// 通常のステップ → AgenticSteps 欄 (詳細ログ、折りたたみ)
 						addStepToLastAssistant({
 							type: event.step.type,
 							detail: event.step.detail,
@@ -95,7 +118,17 @@
 				} else if (event.type === 'editor_route' && event.editor_route) {
 					setEditorRouteToLastAssistant(event.editor_route.target);
 				} else if (event.type === 'editor_code' && event.editor_code) {
-					pushGeneratedEditorCode(event.editor_code);
+					// partial=true: long_form 生成途中の逐次更新 → streaming タブへ上書き。
+					// final: partial を受けていれば streaming タブを確定、そうでなければ
+					// (meta_cognitive 等の単発出力) 従来通り新規タブへ流す。
+					if (event.editor_code.partial) {
+						sawPartialEditor = true;
+						setStreamingEditorCode(event.editor_code);
+					} else if (sawPartialEditor) {
+						setStreamingEditorCode(event.editor_code);
+					} else {
+						pushGeneratedEditorCode(event.editor_code);
+					}
 				} else if (event.type === 'error') {
 					appendToLastAssistant(`\n\n**Error:** ${event.error}`);
 				}

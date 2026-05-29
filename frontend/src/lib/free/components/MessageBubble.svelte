@@ -32,8 +32,8 @@
 		</div>
 	{/if}
 
-	{#if !isUser && (message.agentic_steps?.length || message.step_results?.length || showSpinner)}
-		<AgenticSteps steps={message.agentic_steps} results={message.step_results} {showSpinner} />
+	{#if !isUser && (message.agentic_steps?.length || message.step_results?.length || message.long_form_progress || showSpinner)}
+		<AgenticSteps steps={message.agentic_steps} results={message.step_results} progress={message.long_form_progress} {showSpinner} />
 	{/if}
 
 	{#if !showSpinner}

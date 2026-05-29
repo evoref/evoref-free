@@ -54,6 +54,22 @@ _PREFIX_TEMPLATES: dict[str, str] = {
     "en": "Your name is \"{name}\". When asked your name, respond with this name.\n\n",
 }
 
+
+def _strip_name_prefix(body: str) -> str:
+    """本文先頭に焼き込まれた名前プレフィックス段落を 1 個だけ除去する。
+
+    名前プレフィックスは get_prompt() がランタイムで付与するため、本文 (.md) 側に
+    含まれていてはならない。過去に Level 1 進化が get_prompt() の出力 (プレフィックス
+    付き) を誤って本文へ保存した汚染を、load / 保存時に自己修復する。
+    _PREFIX_TEMPLATES から locale 非依存のパターンを生成し、先頭一致分のみ取り除く。
+    """
+    for template in _PREFIX_TEMPLATES.values():
+        pattern = re.escape(template).replace(re.escape("{name}"), ".*?")
+        match = re.match(pattern, body, re.DOTALL)
+        if match:
+            return body[match.end():]
+    return body
+
 # デフォルトプロンプト（言語別）
 DEFAULT_PROMPTS: dict[str, dict[str, str]] = {
     "ja": {
@@ -191,7 +207,7 @@ class SystemPromptManager:
         self.prompt_dir.mkdir(parents=True, exist_ok=True)
         for mode in self.MODES:
             if body_exists(self.prompt_dir, mode):
-                self.contents[mode] = read_body(self.prompt_dir, mode)
+                self.contents[mode] = _strip_name_prefix(read_body(self.prompt_dir, mode))
                 meta_data = read_meta_dict(self.prompt_dir, mode)
                 if meta_data is not None:
                     self.metas[mode] = self._meta_from_dict(meta_data, mode)
@@ -279,6 +295,10 @@ class SystemPromptManager:
         """
         if mode not in self.MODES:
             raise ValueError(f"Unknown mode: {mode}")
+
+        # 名前プレフィックスが進化結果に混入していても本文へ焼き込まない (防御)。
+        # プレフィックスはランタイムで get_prompt() が付与する唯一の供給源。
+        content = _strip_name_prefix(content)
 
         # 保護セクション最終ゲート
         current = self.contents.get(mode, "")

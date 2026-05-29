@@ -22,6 +22,14 @@ export interface StepResult {
 	status: string;
 }
 
+/** long_form 生成の進捗 (ユニット i/total と現在のユニット名)。チャットに常時表示する */
+export interface LongFormProgress {
+	current: number;
+	total: number;
+	label: string;
+	done: boolean;
+}
+
 export interface ChatMessage {
 	id: number;
 	role: 'user' | 'assistant';
@@ -33,6 +41,8 @@ export interface ChatMessage {
 	rag_debug?: RagDebugInfo;
 	/** コーディングモードでの生成コード出力先 ('editor' 既定 / 'chat' 明示指示時) */
 	editor_route?: 'editor' | 'chat';
+	/** long_form 生成の進捗 (ユニット i/total)。生成中のみセットされ常時表示される */
+	long_form_progress?: LongFormProgress;
 }
 
 /** モード別メッセージバッファ */
@@ -132,12 +142,44 @@ export function clearGeneratedEditorCode(): void {
 	generatedEditorCode.set([]);
 }
 
+/**
+ * long_form 生成の逐次更新コード (ユニット完了ごとの累積本文)。
+ *
+ * `editor_code` SSE フレームの `partial=true` を ChatInput がここへ set し、Pro の
+ * EditorPanel が購読して同一タブを上書き更新する (生成途中の経過を可視化)。
+ * 終端の確定本文 (`partial=false`) も同経路で流し、最後に EditorPanel が clear する。
+ * `generatedEditorCode` (確定本文を新規タブへ流す既存経路) とは独立。Free ビルドでは
+ * 購読側が存在せず no-op。
+ */
+export const streamingEditorCode = writable<EditorCodeArtifact | null>(null);
+
+/** 逐次更新コードを set する (partial / final 共通) */
+export function setStreamingEditorCode(artifact: EditorCodeArtifact): void {
+	streamingEditorCode.set(artifact);
+}
+
+/** 逐次更新コードの受け皿をクリアする (確定反映後 / 新ターン開始時) */
+export function clearStreamingEditorCode(): void {
+	streamingEditorCode.set(null);
+}
+
 /** 最後のアシスタントメッセージに生成コードの出力先をセット */
 export function setEditorRouteToLastAssistant(target: 'editor' | 'chat'): void {
 	messages.update((msgs) => {
 		const last = msgs[msgs.length - 1];
 		if (last?.role === 'assistant') {
 			return [...msgs.slice(0, -1), { ...last, editor_route: target }];
+		}
+		return msgs;
+	});
+}
+
+/** 最後のアシスタントメッセージに long_form 進捗をセット (生成中の常時表示用) */
+export function setLongFormProgressToLastAssistant(progress: LongFormProgress): void {
+	messages.update((msgs) => {
+		const last = msgs[msgs.length - 1];
+		if (last?.role === 'assistant') {
+			return [...msgs.slice(0, -1), { ...last, long_form_progress: progress }];
 		}
 		return msgs;
 	});
