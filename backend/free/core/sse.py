@@ -63,18 +63,35 @@ class SSEFrameBuilder:
         return f"data: {json.dumps({'editor_route': {'target': target}}, ensure_ascii=False)}\n\n"
 
     @staticmethod
-    def editor_code(content: str, language: str = "python", filename: str | None = None) -> str:
+    def editor_code(
+        content: str,
+        language: str = "python",
+        filename: str | None = None,
+        partial: bool = False,
+    ) -> str:
         """エディタコードフレーム: 生成コード本文をエディタペインへ直接送る（coding モードのみ）
 
         出力先パス未指定 (editor 経路) のとき、ディスク書込の代わりに生成コードを
-        専用チャネルでフロントへ送出する。チャット本文とは独立に 1 ファイル 1 度送る。
+        専用チャネルでフロントへ送出する。チャット本文とは独立に送る。
+
+        ``partial=True`` は long_form 生成のユニット完了ごとに送る逐次更新フレーム
+        (累積コードを丸ごと含む)。フロントは同一タブを上書き更新する。終端では
+        ``partial=False`` で最終本文を 1 度送る。
 
         Args:
             content: 生成されたコード本文（コードフェンスなし）
             language: 言語識別子（フロント側で normalize される）
             filename: 推定ファイル名（未指定時は ``None``）
+            partial: 生成途中の逐次更新フレームか (既定 ``False`` = 確定本文)
         """
-        payload = {"editor_code": {"content": content, "language": language, "filename": filename}}
+        payload = {
+            "editor_code": {
+                "content": content,
+                "language": language,
+                "filename": filename,
+                "partial": partial,
+            }
+        }
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     @staticmethod

@@ -26,7 +26,7 @@ from backend.free.generation.strategy_cogwriter import CogWriterStrategy
 from backend.free.generation.strategy_common import resolve_generation_order
 from backend.free.generation.strategy_recurrent import RecurrentStrategy
 from backend.free.generation.token_budget import TokenBudget, truncate_tail
-from backend.free.generation.validators import validate_python
+from backend.free.generation.validators import remove_code_fences, validate_python
 from backend.policy_helpers import get_policy_value
 from backend.utils import estimate_tokens
 
@@ -67,6 +67,9 @@ class LongFormOrchestrator:
         self._debug_logger = debug_logger
         self._generation_params = generation_params or {}
         self._policy = policy
+        # 直近 generate() の content_type ("code" / "text")。コンシューマが生成途中で
+        # コード/テキストを判定するために参照する。generate() 開始時に確定する。
+        self.last_content_type: str | None = None
 
         # Recurrent も計画 / 要約再帰をアシストモデルで実行する
         # ため ``assist_client`` を渡す。``None`` の場合は Recurrent 内部で
@@ -186,7 +189,7 @@ class LongFormOrchestrator:
                 "detail": f"{len(revisions)} issues",
                 "status": "done",
             })
-        max_revisions = self.config.get("long_form", {}).get("max_revisions", 1)
+        max_revisions = self.config.get("long_form", {}).get("max_revisions", 3)
         for rev in revisions[:max_revisions]:
             async for token in self.strategy.revise_unit(rev, rolling, content_type):
                 yield token
@@ -200,7 +203,9 @@ class LongFormOrchestrator:
         """コード検証 + SSE 通知 + デバッグログ。`(error_count, warning_count)` を返す。"""
         if content_type != ContentType.CODE or not rolling.generated_units:
             return 0, 0
-        assembled = "\n\n".join(rolling.generated_units)
+        assembled = "\n\n".join(
+            remove_code_fences(u) for u in rolling.generated_units
+        )
         errors = validate_python(assembled)
         validation_errors = sum(1 for e in errors if e.severity == "error")
         warning_count = sum(1 for e in errors if e.severity == "warning")
@@ -283,6 +288,10 @@ class LongFormOrchestrator:
 
         # 1. コンテンツ種別判定
         content_type = detect_content_type(instruction, mode)
+        # コンシューマ (chat_streaming) が生成途中でも code/text を判定できるよう、
+        # 確定した content_type をインスタンス属性に保持する (リクエストごとの一時
+        # インスタンスなので並行リクエストでも競合しない)。
+        self.last_content_type = content_type.value
 
         # 2. メモリ・RAG からコンテキスト収集
         context = await self._gather_context(instruction)

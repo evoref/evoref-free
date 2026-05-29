@@ -16,6 +16,8 @@
 		"clear_history": "チャット履歴をリセット",
 		"agentic_steps": "Agenticステップ",
 		"agentic_steps_done": "完了 ({elapsed})",
+		"long_form_progress": "コード生成 {current}/{total}: {label}",
+		"long_form_done": "コード生成 完了 ({total} ユニット)",
 		"agentic_step_elapsed": "{elapsed}s",
 		"step_complete": "✓ {detail}",
 		"rag_hits": "RAG検索: {count}件ヒット",

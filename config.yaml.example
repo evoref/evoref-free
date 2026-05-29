@@ -976,7 +976,7 @@ long_form:
   unit_max_tokens: 2000             # ユニットあたり最大トークン数
   rolling_short_term_chars: 1000    # ローリング短期メモリの文字数
   review_enabled: true              # レビューフェーズの有効/無効
-  max_revisions: 1                  # 最大修正回数（0=レビューのみ）
+  max_revisions: 3                  # 最大修正回数（0=レビューのみ）
   rag_per_unit: true                # ユニットごとにRAG検索を実行
   rag_top_k_per_unit: 3             # ユニットごとのRAG上位件数
 

@@ -2,9 +2,9 @@
 	import { t } from '$lib/i18n';
 	import { layout } from '$lib/free/stores/theme';
 	import { isStreaming } from '$lib/free/stores/chat';
-	import type { AgenticStep, StepResult } from '$lib/free/stores/chat';
+	import type { AgenticStep, StepResult, LongFormProgress } from '$lib/free/stores/chat';
 
-	let { steps = [], results = [], showSpinner = false }: { steps?: AgenticStep[]; results?: StepResult[]; showSpinner?: boolean } = $props();
+	let { steps = [], results = [], showSpinner = false, progress = undefined }: { steps?: AgenticStep[]; results?: StepResult[]; showSpinner?: boolean; progress?: LongFormProgress } = $props();
 	let showMode = $derived($layout.chat.show_agentic_steps);
 	let expanded = $state(false);
 
@@ -28,8 +28,19 @@
 	});
 </script>
 
-{#if showMode !== 'hidden' && (steps.length > 0 || results.length > 0 || showSpinner)}
+{#if progress || (showMode !== 'hidden' && (steps.length > 0 || results.length > 0 || showSpinner))}
 	<div class="agentic-steps">
+		{#if progress}
+			<div class="lf-progress" class:done={progress.done && !$isStreaming}>
+				<span class="lf-icon">{progress.done && !$isStreaming ? '✓' : '⚙'}</span>
+				{#if $isStreaming}
+					{$t('chat.long_form_progress', { current: progress.current, total: progress.total, label: progress.label })}
+				{:else}
+					{$t('chat.long_form_done', { total: progress.total })}
+				{/if}
+			</div>
+		{/if}
+		{#if showMode !== 'hidden'}
 		{#if showSpinner && !steps.length}
 			<div class="thinking-spinner" aria-label={$t('chat.thinking')}>
 				<span class="spinner-dot"></span>
@@ -77,6 +88,7 @@
 				{/each}
 			</div>
 		{/if}
+		{/if}
 	</div>
 {/if}
 
@@ -88,6 +100,23 @@
 		background-color: transparent;
 		border-radius: var(--border-radius);
 		border-bottom-left-radius: 2px;
+	}
+	.lf-progress {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 2px 0 6px;
+		font-size: 0.82rem;
+		color: var(--accent);
+		font-weight: 600;
+	}
+	.lf-progress.done {
+		color: var(--text-secondary);
+		font-weight: normal;
+	}
+	.lf-icon {
+		display: inline-block;
+		flex-shrink: 0;
 	}
 	.toggle {
 		background: none;

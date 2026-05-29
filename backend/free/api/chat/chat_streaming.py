@@ -39,6 +39,7 @@ from backend.free.core.stream_filter import (
 from backend.free.core.stream_pipeline import StreamPipeline
 from backend.free.llm.local_client import LocalClient
 from backend.free.generation.orchestrator import LongFormOrchestrator
+from backend.free.generation.validators import remove_code_fences
 from backend.utils import estimate_tokens as _estimate_tokens, utc_compact_stamp
 from backend.log_config import get_logger
 
@@ -310,6 +311,21 @@ def _editor_language_for_extension(ext: str) -> str:
     return _EDITOR_LANGUAGE_MAP.get(ext, "markdown")
 
 
+def _resolve_editor_output_format(query: str, is_code: bool) -> tuple[str, str]:
+    """エディタ出力の ``(拡張子, 言語)`` を解決する。
+
+    ``query`` に markdown ヒントがあれば markdown を優先し、無ければ
+    ``content_type == "code"`` のとき python (.py)、それ以外は従来通り
+    markdown (.md) を返す。``_infer_output_extension`` は ``.py`` を判定
+    できないため、コード生成が markdown 扱いになる問題をここで補正する。
+    """
+    if _MD_EXT_HINT_RE.search(query):
+        return ".md", "markdown"
+    if is_code:
+        return ".py", "python"
+    return ".md", "markdown"
+
+
 def _resolve_long_form_target_path(file_path: str, query: str = "") -> str:
     """`long_form_write_file` 用の保存先パスを解決する。
 
@@ -517,6 +533,11 @@ async def long_form_write_file(
     # ディレクトリ指定の場合は配下に自動ファイル名を付与。
     # 既存ファイル + READ 参照意図の場合は出力先をシフトして元ファイルを保護。
     file_path = _resolve_long_form_target_path(file_path, query)
+
+    # コード拡張子 (.py / .js 等) の場合は LLM が付ける markdown コードフェンスを除去。
+    # markdown / txt ではフェンスは本文の一部なので除去しない。
+    if _editor_language_for_extension(Path(file_path).suffix) != "markdown":
+        content = remove_code_fences(content)
 
     # 生成テキストのクリーニング（見出し行除去・空行圧縮）
     content = clean_generated_text(content)
@@ -1005,12 +1026,14 @@ async def _finalize_long_form_stream(
     if output_target == "editor":
         # エディタ経路: ディスクには書込みせず生成本文を editor_code フレームで送出。
         # SPLIT モードでもエディタ送出を優先 (per-unit ファイルは on_step 側で完了済み)。
-        ext = _infer_output_extension(query, default=".md")
-        language = _editor_language_for_extension(ext)
+        is_code = getattr(orchestrator, "last_content_type", None) == "code"
+        ext, language = _resolve_editor_output_format(query, is_code)
+        # コード生成時は LLM が付ける markdown コードフェンスを除去。
+        body = remove_code_fences(state.full_response) if is_code else state.full_response
         # 空行を含む連続改行を単一 \n に圧縮 (markdown 見出しは保持)。
-        editor_text = _normalize_editor_text(state.full_response)
+        editor_text = _normalize_editor_text(body)
         # 本文先頭の見出し → query → タイムスタンプ の優先順で命名。
-        filename = _suggest_editor_filename(state.full_response, query, ext)
+        filename = _suggest_editor_filename(body, query, ext)
         yield sse.editor_code(
             editor_text, language=language, filename=filename,
         )
@@ -1119,6 +1142,34 @@ async def stream_long_form(
             extension=split_extension,
         )
 
+        async def _flush_with_editor():
+            """step をフラッシュしつつ、editor 経路ではユニット完了ごとに
+            累積コードを ``editor_code(partial=True)`` で逐次送出する。
+
+            フロント側は同一タブを上書き更新し、生成途中の経過を可視化する。
+            終端の確定本文は ``_finalize_long_form_stream`` が partial=False で送る。
+            """
+            saw_unit_done = editor_output_mode and any(
+                s.get("type") == "long_form_unit_done" for s in step_queue
+            )
+            async for frame in _flush():
+                yield frame
+            if saw_unit_done and stream_state.full_response.strip():
+                # content_type は generate() 開始直後に確定するため、unit 完了が
+                # 見えている時点では必ず set 済み。code ならフェンス除去 + python 表示。
+                is_code = getattr(orchestrator, "last_content_type", None) == "code"
+                _ext, language = _resolve_editor_output_format(query, is_code)
+                body = (
+                    remove_code_fences(stream_state.full_response)
+                    if is_code else stream_state.full_response
+                )
+                yield sse.editor_code(
+                    _normalize_editor_text(body),
+                    language=language,
+                    filename=None,
+                    partial=True,
+                )
+
         try:
             async for frame in _emit_long_form_init_steps(query, file_output_mode):
                 yield frame
@@ -1156,8 +1207,8 @@ async def stream_long_form(
                 )
                 if pending not in done:
                     # 同一 `pending` を維持したまま keepalive を送出。
-                    # 蓄積中の step も流して進行を可視化する。
-                    async for frame in _flush():
+                    # 蓄積中の step + editor 逐次更新も流して進行を可視化する。
+                    async for frame in _flush_with_editor():
                         yield frame
                     yield sse.keepalive()
                     last_frame_at = time.monotonic()
@@ -1170,7 +1221,7 @@ async def stream_long_form(
                 pending = None
 
                 step_frame_yielded = False
-                async for frame in _flush():
+                async for frame in _flush_with_editor():
                     yield frame
                     step_frame_yielded = True
                 if step_frame_yielded:
@@ -1292,6 +1343,9 @@ async def sync_long_form(
 
         if output_target == "editor":
             write_result = None
+            # コード生成時は editor 表示前に markdown コードフェンスを除去。
+            if getattr(orchestrator, "last_content_type", None) == "code":
+                full_response = remove_code_fences(full_response)
         else:
             write_result = await long_form_write_file(
                 query, full_response, state,

@@ -305,7 +305,7 @@ class LongFormConfig(BaseModel):
     unit_max_tokens: int = Field(default=2000, ge=100)
     rolling_short_term_chars: int = Field(default=1000, ge=100)
     review_enabled: bool = True
-    max_revisions: int = Field(default=1, ge=0)
+    max_revisions: int = Field(default=3, ge=0)
     rag_per_unit: bool = True
     rag_top_k_per_unit: int = Field(default=3, ge=1)
 

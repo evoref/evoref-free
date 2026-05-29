@@ -34,6 +34,8 @@ export interface EditorCodeArtifact {
 	content: string;
 	language: string;
 	filename: string | null;
+	/** long_form 生成途中のユニット完了ごとの逐次更新フレームか (終端の確定本文は false) */
+	partial?: boolean;
 }
 
 export interface ChatStreamEvent {
