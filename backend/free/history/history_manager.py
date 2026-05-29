@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 from backend.free.history.utils import parse_iso, snippet_around
+from backend.io import atomic_write_text
 from backend.log_config import get_logger
+from backend.utils import utc_now_dt
 
 logger = get_logger("history.manager")
 
@@ -102,23 +103,12 @@ _SEARCH_TEXT_MAX = 5000  # インデックスに保存する検索テキスト�
 
 
 def _atomic_write_json(filepath: Path, data: dict) -> None:
-    """一時ファイルに書き出してから rename するアトミック書き込み
+    """JSON を atomic に書き込む (:func:`backend.io.atomic_write_text` 経由)。
 
-    書き込み中のクラッシュでもデータが失われないことを保証する。
+    書き込み中のクラッシュでもデータが失われないことを保証する。Windows の
+    書き込み競合時リトライは ``backend.io._retry`` が担う。
     """
-    dir_path = filepath.parent
-    fd, tmp_path = tempfile.mkstemp(suffix=".tmp", dir=dir_path)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, filepath)
-    except BaseException:
-        # 書き込み失敗時は一時ファイルを削除
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(filepath, json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def _build_search_text(
@@ -290,7 +280,7 @@ class HistoryManager:
 
     def _resolve_session_path(self, session: SessionData) -> Path:
         """保存先パスの決定"""
-        started = parse_iso(session.started_at) or datetime.now(timezone.utc)
+        started = parse_iso(session.started_at) or utc_now_dt()
         month_dir = self.history_dir / started.strftime("%Y-%m")
         month_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{started.strftime('%Y%m%d_%H%M%S')}_{session.session_id[:8]}.json"
@@ -564,7 +554,7 @@ class HistoryManager:
             {"compressed": int, "summarized": int, "deleted": int, "freed_mb": float}
         """
         result = {"compressed": 0, "summarized": 0, "deleted": 0, "freed_mb": 0.0}
-        now = datetime.now(timezone.utc)
+        now = utc_now_dt()
         compress_cutoff = now - timedelta(days=self.retention_full_days)
         summary_cutoff = now - timedelta(days=self.retention_compressed_days)
         index = self._load_index()
@@ -814,7 +804,7 @@ class HistoryManager:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now_dt().isoformat()
 
 
 # ── シングルトンファクトリ ──

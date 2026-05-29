@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from backend.io import atomic_write_text
 from backend.log_config import get_logger
 
 logger = get_logger("loop.log_ingestor")
@@ -127,15 +128,15 @@ class _BufferedDecisions:
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    """``path`` に JSON を tempfile + rename で原子的に書き込む。
+    """``path`` に JSON を原子的に書き込む (:func:`backend.io.atomic_write_text` 経由)。
 
-    途中クラッシュで壊れた JSON を残さないため。Windows / Unix 共通。
+    途中クラッシュで壊れた JSON を残さないため。Windows の書き込み競合時
+    リトライと並行プロセス間の tmp 名衝突回避は ``backend.io`` が担う。
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
-    tmp.replace(path)
+    atomic_write_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+    )
 
 
 @dataclass

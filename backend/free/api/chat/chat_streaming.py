@@ -30,6 +30,7 @@ from backend.free.api.chat.chat_types import GenerationParams, StepCallback
 from backend.free.api.schemas import ChatResponse, TokenInfo
 from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
+from backend.free.agent.meta_cognitive_utils import is_tool_error
 from backend.free.agent.tool_call_judge import _extract_file_path
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.core.stream_filter import (
@@ -173,7 +174,7 @@ async def read_existing_for_append(
 
     try:
         content = await registry.execute("read_file", file_path=file_path)
-        if content.startswith("Error:"):
+        if is_tool_error(content):
             return ""
         logger.info(
             "Read existing file for context: %d chars from %s",
@@ -192,6 +193,72 @@ def clean_generated_text(text: str) -> str:
     # 連続する空行を1つに圧縮
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+
+# エディタ出力用: 連続改行 (途中に whitespace のみの空行を含む) を単一 \n に圧縮する。
+# file 経路の clean_generated_text とは異なり markdown 見出しは保持する。
+_EDITOR_BLANK_LINE_RE = re.compile(r"\n\s*\n+")
+
+# エディタ出力用 ファイル名 sanitize: Windows 禁則文字 + 制御文字を `_` 化。
+_FILENAME_SANITIZE_RE = re.compile(r'[\\/:*?"<>|\r\n\t]+')
+
+# 本文先頭から markdown 見出しを 1 つ取る (1 行マッチ)。
+_HEADING_LINE_PICK_RE = re.compile(r"^#{1,6}\s+(.+?)\s*$")
+
+
+def _normalize_editor_text(text: str) -> str:
+    """エディタ出力用に空行を完全除去し前後空白を整える。
+
+    LLM 生成本文は orchestrator がユニット間に ``\\n\\n`` を挿入する仕様 + LLM 自身が
+    段落区切りで空行を入れるため、エディタへ流すと「1 行飛ばし」表示になる。
+    エディタ経路では markdown 段落構造より「行を詰める」見え方を優先する。
+    """
+    return _EDITOR_BLANK_LINE_RE.sub("\n", text).strip()
+
+
+def _sanitize_filename_stem(stem: str, max_len: int = 50) -> str:
+    """ファイル名 (拡張子無し) を Windows 互換に sanitize する。"""
+    cleaned = _FILENAME_SANITIZE_RE.sub("_", stem)
+    cleaned = cleaned.strip(" ._")
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip(" ._")
+    return cleaned
+
+
+def _extract_first_heading(text: str, max_lines: int = 5) -> str:
+    """本文先頭の最大 ``max_lines`` 行から markdown 見出しを 1 つ取り出す。
+
+    空行はスキップする。見出しが見つからなければ空文字を返す。
+    """
+    for line in text.splitlines()[:max_lines]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        m = _HEADING_LINE_PICK_RE.match(stripped)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _suggest_editor_filename(text: str, query: str, ext: str) -> str:
+    """エディタ出力用のファイル名を本文先頭見出し → query → タイムスタンプの順で推定する。
+
+    Args:
+        text: 生成本文 (見出し抽出に使う。正規化前/後いずれでも見出しは保持される)
+        query: ユーザー指示文 (本文に見出しが無い場合のフォールバック)
+        ext: 拡張子 (先頭ドット付き、例 ``.md``)
+    """
+    heading = _extract_first_heading(text)
+    if heading:
+        stem = _sanitize_filename_stem(heading)
+        if stem:
+            return f"{stem}{ext}"
+    q = (query or "").strip()
+    if q:
+        stem = _sanitize_filename_stem(q[:30])
+        if stem:
+            return f"{stem}{ext}"
+    return f"long_form_{utc_compact_stamp()}{ext}"
 
 
 # Markdown 出力意図を示すヒント。``md 形式`` / ``.md ファイル`` / ``markdown`` 等。
@@ -222,6 +289,25 @@ def _infer_output_extension(query: str, default: str = ".txt") -> str:
     if _MD_EXT_HINT_RE.search(query):
         return ".md"
     return default
+
+
+# エディタ出力時の言語識別子マップ (フロント側 Monaco の syntax highlight 用)。
+# 長文生成 (仕様書 / 設計書 / 画面設計) はほぼ markdown 整形なので、
+# 未知拡張子は markdown にフォールバックする。
+_EDITOR_LANGUAGE_MAP = {
+    ".md": "markdown",
+    ".txt": "markdown",
+    ".py": "python",
+    ".html": "html",
+    ".css": "css",
+    ".js": "javascript",
+    ".ts": "typescript",
+}
+
+
+def _editor_language_for_extension(ext: str) -> str:
+    """エディタ出力用の言語識別子を拡張子から推論する。"""
+    return _EDITOR_LANGUAGE_MAP.get(ext, "markdown")
 
 
 def _resolve_long_form_target_path(file_path: str, query: str = "") -> str:
@@ -439,7 +525,7 @@ async def long_form_write_file(
         # 追記モード: 既存ファイルの内容に連結
         if _APPEND_HINT_RE.search(query) and registry.has("read_file"):
             existing = await registry.execute("read_file", file_path=file_path)
-            if not existing.startswith("Error:"):
+            if not is_tool_error(existing):
                 content = existing.rstrip() + "\n\n" + content
                 logger.info("Long-form append mode: prepended %d chars from %s", len(existing), file_path)
 
@@ -889,20 +975,25 @@ async def _finalize_long_form_stream(
     private: bool = False,
     long_form_mode: LongFormMode = LongFormMode.CONTINUE,
     split_written: list[dict] | None = None,
+    output_target: str = "file",
 ) -> AsyncIterator[str]:
     """長文生成終端処理: timer 停止 + record + write_file + token_info + done。
 
     SPLIT モード時は単一ファイル書込みをスキップし、INDEX.md を生成する。
     ``split_written`` は ``stream_long_form`` 内で `long_form_unit_file` を
     受けて書き込んだ各ファイルの ``[{"path", "heading", "idx"}]``。
+
+    ``output_target == "editor"`` の場合はディスク書込みをスキップし、
+    `sse.editor_code` で生成本文をエディタペインへ送出する (coding モードの
+    ``_dispatch_meta_cognitive`` 経路の挙動に揃える)。
     """
     if timer:
         timer.stop("llm_total_ms")
     elapsed = time.monotonic() - t_start
     logger.info(
-        "Long-form stream complete: strategy=%s, tokens=%d, elapsed=%.2fs, session=%s, file_mode=%s, lf_mode=%s",
+        "Long-form stream complete: strategy=%s, tokens=%d, elapsed=%.2fs, session=%s, file_mode=%s, lf_mode=%s, output_target=%s",
         orchestrator.strategy_name, state.tokens_generated, elapsed,
-        session_id, file_output_mode, long_form_mode.value,
+        session_id, file_output_mode, long_form_mode.value, output_target,
     )
     metrics = getattr(orchestrator, "last_metrics", {})
     record_long_form_response(
@@ -911,7 +1002,20 @@ async def _finalize_long_form_stream(
         private=private,
     )
 
-    if long_form_mode == LongFormMode.SPLIT and split_written is not None:
+    if output_target == "editor":
+        # エディタ経路: ディスクには書込みせず生成本文を editor_code フレームで送出。
+        # SPLIT モードでもエディタ送出を優先 (per-unit ファイルは on_step 側で完了済み)。
+        ext = _infer_output_extension(query, default=".md")
+        language = _editor_language_for_extension(ext)
+        # 空行を含む連続改行を単一 \n に圧縮 (markdown 見出しは保持)。
+        editor_text = _normalize_editor_text(state.full_response)
+        # 本文先頭の見出し → query → タイムスタンプ の優先順で命名。
+        filename = _suggest_editor_filename(state.full_response, query, ext)
+        yield sse.editor_code(
+            editor_text, language=language, filename=filename,
+        )
+        write_result = None
+    elif long_form_mode == LongFormMode.SPLIT and split_written is not None:
         # SPLIT: per-unit 書込みは既に on_step で完了。INDEX.md だけ生成。
         base_path = _extract_file_path(query) or ""
         if base_path:
@@ -961,8 +1065,14 @@ async def stream_long_form(
     *,
     timer: StageTimer | None = None,
     private: bool = False,
+    output_target: str = "file",
 ):
-    """長文生成の SSE ストリーミング（long_form_* ステップフレーム付き）"""
+    """長文生成の SSE ストリーミング（long_form_* ステップフレーム付き）
+
+    ``output_target`` は coding モード時の出力先 (``"file"`` / ``"editor"`` /
+    ``"chat"``)。``"editor"`` の場合はトークンの逐次送出を抑止して終端で
+    `sse.editor_code` を送る (`_dispatch_meta_cognitive` 経路の挙動に揃える)。
+    """
     async with cancel_scope(session_id):
         t_start = time.monotonic()
         stream_state = _LongFormStreamState()
@@ -972,6 +1082,10 @@ async def stream_long_form(
         file_output_mode = bool(
             _WRITE_HINT_RE.search(query) and _extract_file_path(query)
         )
+        # エディタ経路: トークンは chat へ流さず終端で editor_code 送出に切替える。
+        editor_output_mode = (output_target == "editor")
+        # token を sse.token としてチャットへ流さない条件を共通化。
+        suppress_chat_token_stream = file_output_mode or editor_output_mode
         # 出力モード判定 (EXPAND / SPLIT / CONTINUE)。
         # SPLIT/EXPAND は P2/P3 で挙動分岐するが、P1 では CONTINUE と同じ動作。
         long_form_mode = detect_long_form_mode(
@@ -1069,11 +1183,11 @@ async def stream_long_form(
                 stream_state.full_response += token
                 stream_state.tokens_generated += 1
 
-                if not file_output_mode:
+                if not suppress_chat_token_stream:
                     yield sse.token(token)
                     last_frame_at = time.monotonic()
                 elif time.monotonic() - last_frame_at >= DEFAULT_KEEPALIVE_INTERVAL_SEC:
-                    # file_output_mode はトークンを送出しないため、
+                    # file_output_mode / editor_output_mode はトークンを送出しないため、
                     # 長時間 unit でフロントの chunk timeout を防ぐ keepalive を送る。
                     yield sse.keepalive()
                     last_frame_at = time.monotonic()
@@ -1088,6 +1202,7 @@ async def stream_long_form(
                 private=private,
                 long_form_mode=long_form_mode,
                 split_written=split_written,
+                output_target=output_target,
             ):
                 yield frame
             outcome_success = True
@@ -1111,6 +1226,7 @@ async def stream_long_form(
                     quality_signals={
                         "agent_layer": "long_form",
                         "file_output_mode": file_output_mode,
+                        "output_target": output_target,
                     },
                 )
 
@@ -1124,8 +1240,14 @@ async def sync_long_form(
     *,
     timer: StageTimer | None = None,
     private: bool = False,
+    output_target: str = "file",
 ) -> ChatResponse:
-    """長文生成の同期応答"""
+    """長文生成の同期応答
+
+    ``output_target == "editor"`` の場合はディスク書込みをスキップし、
+    生成本文をそのまま ``ChatResponse.response`` として返す (フロント側で
+    エディタペインに流す前提)。
+    """
     try:
         full_response = ""
         tokens_generated = 0
@@ -1168,7 +1290,12 @@ async def sync_long_form(
             private=private,
         )
 
-        write_result = await long_form_write_file(query, full_response, state)
+        if output_target == "editor":
+            write_result = None
+        else:
+            write_result = await long_form_write_file(
+                query, full_response, state,
+            )
 
         _emit_timing(state, timer, "meta_cognitive", tokens_generated)
 

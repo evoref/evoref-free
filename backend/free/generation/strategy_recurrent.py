@@ -24,14 +24,17 @@ from backend.free.generation.models import (
 )
 from backend.free.generation.rolling_context import RollingContext
 from backend.free.generation.strategy_common import (
-    TEXT_UNIT_CONTINUATION_SYSTEM,
-    TEXT_UNIT_SYSTEM,
     build_code_unit_messages,
+    build_text_unit_messages,
+    excerpt_continuation_content,
+    excerpt_for_expand,
     fallback_plan,
+    finalize_plan_units,
+    generate_plan_json,
     parse_plan,
+    resolve_max_units,
 )
 from backend.free.generation.token_budget import TokenBudget
-from backend.free.llm.json_schemas import CodePlan, TextPlan
 from backend.free.llm.utils import extract_content
 
 if TYPE_CHECKING:
@@ -231,14 +234,7 @@ class RecurrentStrategy:
             LongFormMode.EXPAND, LongFormMode.SPLIT,
         ):
             # EXPAND/SPLIT モード: 詳細仕様書として再構成
-            if len(existing_content) > 4000:
-                excerpt = (
-                    existing_content[:2000]
-                    + "\n\n[...中略...]\n\n"
-                    + existing_content[-2000:]
-                )
-            else:
-                excerpt = existing_content
+            excerpt = excerpt_for_expand(existing_content)
             user_target = extract_target_chars(instruction, default=0)
             target_length = max(user_target, int(len(existing_content) * 1.5), 3000)
             per_unit_tokens = max(600, target_length // 12)
@@ -252,14 +248,7 @@ class RecurrentStrategy:
             )
         elif existing_content and content_type == ContentType.TEXT:
             # 追記モード: 既存テキストを含む専用プロンプト
-            if len(existing_content) > 1500:
-                excerpt = (
-                    existing_content[:500]
-                    + "\n\n[...中略...]\n\n"
-                    + existing_content[-800:]
-                )
-            else:
-                excerpt = existing_content
+            excerpt = excerpt_continuation_content(existing_content)
             prompt = _CONTINUATION_PLAN_PROMPT.format(
                 instruction=instruction,
                 existing_content=excerpt,
@@ -273,33 +262,10 @@ class RecurrentStrategy:
                 format_instruction=format_instruction,
             )
 
-        max_units = self._lf_config.get("max_units", 20)
-        if long_form_mode in (LongFormMode.EXPAND, LongFormMode.SPLIT):
-            max_units = max(max_units, 8)
+        max_units = resolve_max_units(self._lf_config, long_form_mode)
 
-        data: dict = {}
-        if self.assist_client is None:
-            logger.warning(
-                "Recurrent create_plan: assist_client is None, "
-                "falling back to single-unit plan",
-            )
-        else:
-            # CogWriter と同じく content_type ごとに schema を切替
-            plan_schema = (
-                CodePlan if content_type == ContentType.CODE else TextPlan
-            )
-            try:
-                data = await self.assist_client.generate_json(
-                    prompt,
-                    max_tokens=1024,
-                    temperature=0.3,
-                    purpose="long_form_planning",
-                    list_key="units",
-                    response_schema=plan_schema,
-                )
-            except Exception as e:  # noqa: BLE001 — assist 例外で fallback
-                logger.warning("Plan generation failed: %s", e)
-                data = {}
+        # content_type に応じた schema 選択・assist None / 例外フォールバックは共通化
+        data = await generate_plan_json(self.assist_client, prompt, content_type)
 
         if not data or "units" not in data:
             logger.warning(
@@ -309,21 +275,8 @@ class RecurrentStrategy:
         else:
             plan = parse_plan(data, content_type, instruction)
 
-        # ユニット数上限
-        if len(plan.units) > max_units:
-            logger.warning(
-                "Plan has %d units, truncating to %d",
-                len(plan.units), max_units,
-            )
-            plan.units = plan.units[:max_units]
-
-        # コード用: 依存順ソート（CogWriter の resolve_generation_order と共通）
-        if content_type == ContentType.CODE:
-            from backend.free.generation.strategy_cogwriter import (
-                resolve_generation_order,
-            )
-            code_units = [u for u in plan.units if isinstance(u, CodeUnit)]
-            plan.units = resolve_generation_order(code_units)
+        # ユニット数上限 + コード用依存順ソート (共通後処理)
+        finalize_plan_units(plan, max_units, content_type)
 
         elapsed = time.monotonic() - t0
         logger.info(
@@ -420,57 +373,11 @@ class RecurrentStrategy:
         unit: SectionPlan,
         rolling: RollingContext,
     ) -> list[dict]:
-        """テキスト生成用のメッセージを構築（Recurrentは要約スロットあり）"""
-        budget = rolling.budget
-        plan = rolling.plan
+        """テキスト生成用のメッセージを構築 (共通スケルトンに委譲)。
 
-        section_headings = ", ".join(
-            u.heading for u in plan.units if isinstance(u, SectionPlan)
+        Recurrent は長期要約スロットを持つため
+        ``include_long_term_summary=True``。
+        """
+        return build_text_unit_messages(
+            unit, rolling, _TEXT_UNIT_USER, include_long_term_summary=True,
         )
-
-        long_term_summary = budget.fit_content(
-            "skeleton_or_summary",
-            rolling.long_term_summary,
-        )
-        short_term = budget.fit_content("short_term", rolling.short_term)
-
-        # ユニットごとの目標文字数を計算
-        total_estimated = sum(
-            u.estimated_tokens for u in plan.units if isinstance(u, SectionPlan)
-        ) or 1
-        unit_ratio = unit.estimated_tokens / total_estimated
-        unit_target_chars = max(int(plan.target_length * unit_ratio), 200)
-
-        # 追記モードでは専用のシステムプロンプトを使用
-        system_template = (
-            TEXT_UNIT_CONTINUATION_SYSTEM
-            if rolling.has_existing_context
-            else TEXT_UNIT_SYSTEM
-        )
-        system = budget.fit_content(
-            "system_prompt",
-            system_template.format(
-                global_context=plan.global_context,
-                unit_target_chars=unit_target_chars,
-            ),
-        )
-        user = _TEXT_UNIT_USER.format(
-            title=plan.title,
-            section_headings=section_headings,
-            long_term_summary=long_term_summary or "(なし)",
-            short_term=short_term or "(なし)",
-            heading=unit.heading,
-            key_points=", ".join(unit.key_points),
-            rag_context="(なし)",
-        )
-        # 追記モード: short_term ラベルを差し替え
-        if rolling.has_existing_context:
-            user = user.replace(
-                "# 直前セクション末尾",
-                "# 直前テキスト末尾（この直後に自然に続く文章を書いてください）",
-            )
-
-        return [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]

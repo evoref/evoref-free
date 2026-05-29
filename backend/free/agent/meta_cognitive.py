@@ -29,6 +29,7 @@ from backend.free.agent.meta_cognitive_tools import (
 )
 from backend.free.agent.meta_cognitive_utils import (
     iter_balanced_brace_substrings,
+    is_tool_error,
     try_parse_tool_dict,
     call_callback,
     fix_json_backslashes,
@@ -594,7 +595,7 @@ class MetaCognitiveAgent:
                     task_index=i + 1, total_tasks=total_tasks,
                 )
                 task.result = result
-                task.status = "failed" if result.startswith("Error:") else "done"
+                task.status = "failed" if is_tool_error(result) else "done"
             else:
                 result, tool_calls = await self._execute_task(
                     task, query, system_prompt, conversation,
@@ -1020,7 +1021,7 @@ class MetaCognitiveAgent:
     ) -> int:
         """直近 step_results に応じて consecutive_errors を更新する。"""
         last_step = step_results[-1] if step_results else None
-        if last_step and last_step.output.startswith("Error:"):
+        if last_step and is_tool_error(last_step.output):
             return current + 1
         return 0
 
@@ -1178,7 +1179,7 @@ class MetaCognitiveAgent:
         """ツール実行結果 (`status=done|failed`) のコールバック emit。"""
         if on_step is None:
             return
-        is_error = tool_result_text.startswith("Error:")
+        is_error = is_tool_error(tool_result_text)
         await call_callback(on_step, {
             "type": "tool_call",
             "detail": f"{prefix} {tool_name}: {tool_result_text[:100]}",
@@ -1236,7 +1237,7 @@ class MetaCognitiveAgent:
         tool_result_text = await self._execute_tool(
             tool_name, tool_args, tools_registry, state,
         )
-        tool_call_entry["success"] = not tool_result_text.startswith("Error:")
+        tool_call_entry["success"] = not is_tool_error(tool_result_text)
 
         state.pending_tool = None
         state.pending_args = {}
@@ -1244,7 +1245,7 @@ class MetaCognitiveAgent:
         await self._emit_loop_tool_result(on_step, prefix, tool_name, tool_result_text)
 
         # 連続エラー検出 → ループ打ち切り
-        if tool_result_text.startswith("Error:"):
+        if is_tool_error(tool_result_text):
             consecutive_errors += 1
             if consecutive_errors >= max_consecutive_errors:
                 logger.warning(
@@ -1262,7 +1263,7 @@ class MetaCognitiveAgent:
         ))
 
         # write_file 成功 → タスク完了
-        if not tool_result_text.startswith("Error:") and tool_name == "write_file":
+        if not is_tool_error(tool_result_text) and tool_name == "write_file":
             logger.info(
                 "Stopping loop: write_file succeeded (%s)",
                 tool_args.get("file_path", ""),
@@ -1360,7 +1361,7 @@ class MetaCognitiveAgent:
         tool_name: str, tool_result_text: str, consecutive_errors: int,
     ) -> str:
         """ツール実行結果を次ループ用メッセージに変換する"""
-        is_success = not tool_result_text.startswith("Error:")
+        is_success = not is_tool_error(tool_result_text)
         if is_success:
             return (
                 f"Tool result ({tool_name}): {tool_result_text}"
@@ -1464,7 +1465,7 @@ class MetaCognitiveAgent:
         try:
             result = await tools_registry.execute(tool_name, **tool_args)
             result_text = str(result)
-            is_success = not result_text.startswith("Error:")
+            is_success = not is_tool_error(result_text)
         except Exception as e:
             result_text = f"Error: {e}"
             is_success = False
@@ -1563,7 +1564,7 @@ class MetaCognitiveAgent:
         try:
             result = await tools_registry.execute("write_file", **tool_args)
             result_text = str(result)
-            is_success = not result_text.startswith("Error:")
+            is_success = not is_tool_error(result_text)
         except Exception as e:
             result_text = f"Error: {e}"
             is_success = False
@@ -1646,7 +1647,7 @@ class MetaCognitiveAgent:
         try:
             result = await tools_registry.execute("write_file", **tool_args)
             result_text = str(result)
-            is_success = not result_text.startswith("Error:")
+            is_success = not is_tool_error(result_text)
             logger.info("Auto-recovery write_file: %s → %s", file_path, result_text[:100])
 
             if on_step:

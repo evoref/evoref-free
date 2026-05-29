@@ -6,16 +6,16 @@
 from __future__ import annotations
 
 import html
-import re
 from typing import override
 
 from backend.export._writer_base import BytesWriterBase
 from backend.export.base import ContentBlock, ExportContent
-
-_RE_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
-_RE_ITALIC = re.compile(r"\*(.+?)\*|_(.+?)_")
-_RE_CODE = re.compile(r"`(.+?)`")
-_RE_LINK = re.compile(r"\[(.+?)\]\((.+?)\)")
+from backend.export.markdown_patterns import (
+    RE_BOLD as _RE_BOLD,
+    RE_INLINE_CODE as _RE_CODE,
+    RE_ITALIC as _RE_ITALIC,
+    RE_LINK as _RE_LINK,
+)
 
 _MINIMAL_CSS = """\
 body { font-family: sans-serif; max-width: 800px; margin: 2em auto; padding: 0 1em; line-height: 1.6; color: #333; }

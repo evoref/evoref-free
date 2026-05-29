@@ -466,7 +466,7 @@ async def stop_server(
         elif name == "embed":
             # embedder オブジェクトは残すが httpx クライアントだけ閉じて
             # 死んだサーバへの kept-alive socket を破棄する。次回 embed 呼び出しで
-            # _ensure_client が新しい AsyncClient を作る。
+            # _get_http_client が新しい AsyncClient を作る。
             if state.embedder is not None and hasattr(state.embedder, "aclose"):
                 try:
                     await state.embedder.aclose()

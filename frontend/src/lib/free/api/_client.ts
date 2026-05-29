@@ -153,3 +153,24 @@ export async function requestFormDataVoid(
 	});
 	await throwIfNotOk(res);
 }
+
+/**
+ * ストリーミング操作 (install / create 等) のキャンセル要求共通ヘルパー。
+ *
+ * `endpoint` は BASE_URL からの相対パス (例: '/cartridges/install/cancel')。
+ * 非 ok 時は例外を投げず `{ cancelled: false }` を返す (キャンセルは best-effort)。
+ */
+export async function cancelStreamingOperation(
+	endpoint: string,
+	sessionId: string
+): Promise<{ cancelled: boolean }> {
+	const res = await fetch(`${BASE_URL}${endpoint}`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ session_id: sessionId })
+	});
+	if (!res.ok) {
+		return { cancelled: false };
+	}
+	return res.json();
+}

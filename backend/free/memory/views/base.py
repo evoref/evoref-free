@@ -25,6 +25,10 @@ Issue 本文では書込違反の例外名が ``WriteOwnershipError`` と記載�
 
 from __future__ import annotations
 
+import json
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
+
 from backend.free.memory.ownership import (
     Pillar,
     PillarOwnershipError,
@@ -38,6 +42,10 @@ from backend.free.memory.notes.subject_ns import (
     validate_subject_namespace,
 )
 from backend.free.memory.types import FactType
+
+if TYPE_CHECKING:
+    from backend.free.memory.protocols import SemanticFactStoreProtocol
+    from backend.free.memory.types import MemoryMode, SemanticFact
 
 # ──────────────────────────────────────────────────────────────────────────
 # 例外エイリアス
@@ -152,9 +160,67 @@ class FactViewBase:
             )
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# View 共通ユーティリティ
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def safe_json_loads(s: str) -> dict[str, Any]:
+    """JSON 文字列を dict にパースする。dict 以外 / パース失敗時は空 dict。
+
+    Fact の payload (JSON) を読む際の共通ヘルパ。loop / learn View で
+    AST 一致していた ``_safe_json_loads`` を集約したもの。
+    """
+    try:
+        payload = json.loads(s)
+        if isinstance(payload, dict):
+            return payload
+        return {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def merge_active_facts_across_stores(
+    stores: Iterable[SemanticFactStoreProtocol],
+    fact_type: FactType,
+    *,
+    min_confidence: float = 0.0,
+    mode: MemoryMode | None = None,
+) -> list[SemanticFact]:
+    """複数 store を横断して有効な ``fact_type`` を集約する (superseded / 重複除外)。
+
+    ``get_active_policies`` / ``get_active_fewshots`` 系で harness / loop / learn
+    View に AST 一致で重複していた走査ロジックを集約する。
+
+    Args:
+        stores: 走査対象の store 群 (global + project スコープ等)。
+        fact_type: 対象 FactType ("policy" / "fewshot" 等)。
+        min_confidence: この confidence 未満の fact を除外する閾値。
+        mode: 指定時は ``mode_origin`` が一致する fact のみ採用する。
+
+    Returns:
+        store 走査順・初出順を保った有効 fact のリスト (id 重複は最初の 1 件)。
+    """
+    result: list[SemanticFact] = []
+    seen: set[str] = set()
+    for store in stores:
+        for fact in store.search_by_type(fact_type):
+            if fact.id in seen or fact.superseded_by:
+                continue
+            if fact.confidence < min_confidence:
+                continue
+            if mode is not None and fact.mode_origin != mode:
+                continue
+            result.append(fact)
+            seen.add(fact.id)
+    return result
+
+
 __all__ = [
     "FactViewBase",
     "PillarReadAccessError",
     "SubjectNamespaceError",
     "WriteOwnershipError",
+    "merge_active_facts_across_stores",
+    "safe_json_loads",
 ]

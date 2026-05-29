@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from backend.log_config import get_logger
+from backend.policy_helpers import get_policy_value
 from backend.utils import estimate_tokens as _estimate_tokens
 
 if TYPE_CHECKING:
@@ -49,12 +50,7 @@ class StepCompactor:
 
     def _p(self, key: str, default: int | float) -> int | float:
         """ポリシーからパラメータ取得（フォールバック付き）"""
-        if self._policy is None:
-            return default
-        try:
-            return self._policy.get("agent", key)
-        except KeyError:
-            return default
+        return get_policy_value(self._policy, "agent", key, default)
 
     def compact(
         self, steps: list[StepResult], budget: int

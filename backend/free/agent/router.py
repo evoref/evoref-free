@@ -6,6 +6,7 @@ import re
 from typing import TYPE_CHECKING
 
 from backend.log_config import get_logger
+from backend.policy_helpers import get_policy_value
 
 if TYPE_CHECKING:
     from backend.free.agent.learned_patterns import LearnedPatternStore
@@ -351,12 +352,7 @@ class ComplexityClassifier:
         self, domain: str, key: str, mode: str, default: int | float,
     ) -> int | float:
         """PolicyInterpreter からパラメータを取得（フォールバック付き）"""
-        if self._policy is None:
-            return default
-        try:
-            return self._policy.get(domain, key, mode)
-        except KeyError:
-            return default
+        return get_policy_value(self._policy, domain, key, default, mode=mode)
 
 
 def _can_use_meta_cognitive(
@@ -369,12 +365,9 @@ def _can_use_meta_cognitive(
     history_budget = config.get("memory", {}).get("working_max_tokens", 2048)
     loop_budget = ctx_size - 512 - 400 - history_budget
 
-    if policy is not None:
-        try:
-            min_budget = policy.get("agent", "meta_cognitive_min_budget", mode)
-        except KeyError:
-            min_budget = config.get("agent", {}).get("meta_cognitive_min_budget", 512)
-    else:
-        min_budget = config.get("agent", {}).get("meta_cognitive_min_budget", 512)
+    cfg_default = config.get("agent", {}).get("meta_cognitive_min_budget", 512)
+    min_budget = get_policy_value(
+        policy, "agent", "meta_cognitive_min_budget", cfg_default, mode=mode,
+    )
 
     return loop_budget >= min_budget

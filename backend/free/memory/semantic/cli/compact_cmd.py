@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -34,6 +33,7 @@ from backend.free.memory.semantic.manifest import (
     update_manifest,
 )
 from backend.free.memory.semantic.store import FACTS_FILENAME
+from backend.io import AtomicWriter
 
 
 @dataclass
@@ -179,19 +179,11 @@ def apply_compact_scope(
     shutil.copy2(facts_path, backup_target)
     res.backup_path = str(backup_target)
 
-    tmp = facts_path.with_suffix(facts_path.suffix + ".tmp")
-    try:
-        with tmp.open("w", encoding="utf-8") as f:
-            for line in rewritten:
-                f.write(line + "\n")
-        os.replace(tmp, facts_path)
-    except OSError:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-        raise
+    # AtomicWriter が tmp 書込 → os.replace (Windows retry 付き) を担い、
+    # 途中例外時は tmp を unlink して facts_path を不変のまま残す。
+    with AtomicWriter(facts_path) as f:
+        for line in rewritten:
+            f.write(line + "\n")
     res.bytes_after = facts_path.stat().st_size
     res.applied = True
     return res

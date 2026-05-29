@@ -40,7 +40,11 @@ from backend.free.memory.types import (
     SemanticFact,
     make_fact,
 )
-from backend.free.memory.views.base import FactViewBase
+from backend.free.memory.views.base import (
+    FactViewBase,
+    merge_active_facts_across_stores,
+    safe_json_loads as _safe_json_loads,
+)
 
 
 class LearnFactView(FactViewBase):
@@ -134,19 +138,9 @@ class LearnFactView(FactViewBase):
     ) -> list[SemanticFact]:
         """有効 policy を返す (Learn は owner なので readers 自動含有)。"""
         self._assert_read("policy")
-        result: list[SemanticFact] = []
-        seen: set[str] = set()
-        for store in self._stores:
-            for fact in store.search_by_type("policy"):
-                if fact.id in seen or fact.superseded_by:
-                    continue
-                if fact.confidence < min_confidence:
-                    continue
-                if mode is not None and fact.mode_origin != mode:
-                    continue
-                result.append(fact)
-                seen.add(fact.id)
-        return result
+        return merge_active_facts_across_stores(
+            self._stores, "policy", min_confidence=min_confidence, mode=mode,
+        )
 
     def get_fewshot_examples(
         self,
@@ -539,16 +533,6 @@ class LearnFactView(FactViewBase):
 # ──────────────────────────────────────────────────────────────────────────
 # 内部ユーティリティ
 # ──────────────────────────────────────────────────────────────────────────
-
-
-def _safe_json_loads(s: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(s)
-        if isinstance(payload, dict):
-            return payload
-        return {}
-    except (json.JSONDecodeError, TypeError):
-        return {}
 
 
 __all__ = ["LearnFactView"]

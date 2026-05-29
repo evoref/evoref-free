@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from backend.free.agent.meta_cognitive_utils import is_tool_error
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -77,7 +78,7 @@ def determine_task_status(
     task: TaskItem, result: str, tool_calls: list[dict],
 ) -> str:
     """タスク実行結果からステータスを決定する"""
-    if result.startswith("Error:") or "Step limit reached" in result:
+    if is_tool_error(result) or "Step limit reached" in result:
         return "failed"
 
     if task_expects_write(task.description) and not any(

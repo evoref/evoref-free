@@ -14,10 +14,10 @@ from backend.free.generation.models import (
 )
 from backend.free.generation.rolling_context import RollingContext
 from backend.free.generation.token_budget import TokenBudget
+from backend.free.generation.strategy_common import resolve_generation_order
 from backend.free.generation.strategy_cogwriter import (
     CogWriterStrategy,
     ReviewIssue,
-    resolve_generation_order,
 )
 from backend.free.generation.orchestrator import LongFormOrchestrator
 from backend.free.generation.strategy_recurrent import RecurrentStrategy

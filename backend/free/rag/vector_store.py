@@ -1,13 +1,14 @@
 """numpy ベースのベクトルインデックス（int8 量子化 + memmap 対応）"""
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
 from backend.exceptions import VectorDimensionMismatchError
+from backend.io import atomic_write_text
 from backend.log_config import get_logger
+from backend.utils import utc_now_dt
 
 logger = get_logger("rag.vector_store")
 
@@ -122,15 +123,19 @@ class VectorStore:
         self.cluster_assignments: np.ndarray | None = None  # int32 (N,)
         self.cluster_n_probe: int = 0
 
+    def _ensure_dirs(self) -> None:
+        """ベクトル / chunk / source_text ディレクトリを作成する (冪等)。"""
+        self.vectors_dir.mkdir(parents=True, exist_ok=True)
+        self.chunks_dir.mkdir(parents=True, exist_ok=True)
+        self.source_texts_dir.mkdir(parents=True, exist_ok=True)
+
     def load(self) -> None:
         """ディスクからインデックスをロード（int8 量子化形式）
 
         メタデータを先に読込み、件数が memmap_threshold 以上なら
         memmap モードでベクトルをロードする（OS ページキャッシュに委譲）。
         """
-        self.vectors_dir.mkdir(parents=True, exist_ok=True)
-        self.chunks_dir.mkdir(parents=True, exist_ok=True)
-        self.source_texts_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_dirs()
 
         # メタデータを先に読込み（件数で memmap 判定するため）
         if self.metadata_path.exists():
@@ -276,9 +281,7 @@ class VectorStore:
 
     def save(self) -> None:
         """インデックスをディスクに永続化（int8 量子化形式）"""
-        self.vectors_dir.mkdir(parents=True, exist_ok=True)
-        self.chunks_dir.mkdir(parents=True, exist_ok=True)
-        self.source_texts_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_dirs()
 
         # memmap 中のファイルへの書き込みを防ぐため通常配列に変換
         self._ensure_writable()
@@ -286,8 +289,10 @@ class VectorStore:
 
         # _store_info をヘッダーとして metadata.json の先頭に書き出す
         payload = self._pack_metadata()
-        with open(self.metadata_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        atomic_write_text(
+            self.metadata_path,
+            json.dumps(payload, ensure_ascii=False, indent=2),
+        )
 
     # ── _store_info 永続化ヘルパー ──────────────────────
 
@@ -361,7 +366,7 @@ class VectorStore:
                 "embedding_model": embedding_model,
                 "embedding_backend": embedding_backend,
                 "embedding_dim": int(embedding_dim),
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": utc_now_dt().isoformat(),
                 "last_reindex_at": None,
             }
             return True
@@ -384,7 +389,7 @@ class VectorStore:
         embedding_dim: int,
     ) -> None:
         """reindex 完了時に store_info を更新する"""
-        now = datetime.now(timezone.utc).isoformat()
+        now = utc_now_dt().isoformat()
         if not self.store_info:
             self.store_info = {"created_at": now}
         self.store_info["embedding_model"] = embedding_model
@@ -446,7 +451,7 @@ class VectorStore:
 
         start_id = len(self.metadata)
         chunk_ids = []
-        now = datetime.now(timezone.utc).isoformat()
+        now = utc_now_dt().isoformat()
 
         for i, chunk in enumerate(chunks):
             chunk_id = f"{start_id + i:04d}"

@@ -8,7 +8,10 @@ from dataclasses import dataclass, field
 
 from backend.free.agent.agent_state import AgentState
 from backend.free.agent.event_reminder import EventReminderSystem
-from backend.free.agent.meta_cognitive_utils import strip_markdown_wrapper
+from backend.free.agent.meta_cognitive_utils import (
+    is_tool_error,
+    strip_markdown_wrapper,
+)
 from backend.free.agent.tool_call_judge import ToolCallJudge, ToolJudgement
 from backend.free.api.chat.chat_constants import (
     CONTENT_MAX_TOKENS_MIN, CONTENT_SYSTEM_RESERVE,
@@ -212,7 +215,7 @@ class DeliberativeAgent:
         self._append_tool_result_to_last_user(
             messages, judgement.tool_name, tool_result_text,
         )
-        success = not tool_result_text.startswith("Error:")
+        success = not is_tool_error(tool_result_text)
         logger.info(
             "Tool executed: %s, result_length=%d, source=%s, success=%s",
             judgement.tool_name, len(tool_result_text), judgement.source,

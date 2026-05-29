@@ -8,6 +8,7 @@
 
 import {
 	BASE_URL,
+	cancelStreamingOperation,
 	request,
 	requestVoid
 } from './_client';
@@ -105,13 +106,5 @@ export async function* installCartridgeStreaming(
 export async function cancelCartridgeInstall(
 	sessionId: string
 ): Promise<{ cancelled: boolean }> {
-	const res = await fetch(`${BASE_URL}/cartridges/install/cancel`, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ session_id: sessionId })
-	});
-	if (!res.ok) {
-		return { cancelled: false };
-	}
-	return res.json();
+	return cancelStreamingOperation('/cartridges/install/cancel', sessionId);
 }

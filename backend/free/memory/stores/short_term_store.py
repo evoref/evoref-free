@@ -21,6 +21,7 @@ from pathlib import Path
 import numpy as np
 
 from backend.free.memory.stores.short_term import MemoryNote
+from backend.io import atomic_write_text
 from backend.log_config import get_logger
 
 logger = get_logger("memory.short_term_store")
@@ -54,10 +55,8 @@ class ShortTermMemoryStore:
     def save(notes: dict[str, MemoryNote], path: str | Path) -> None:
         """`notes` を JSON ファイルに書き出す。親ディレクトリは自動作成。"""
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
         data = ShortTermMemoryStore.serialize(notes)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
         logger.info("Saved %d notes to %s", len(data), path)
 
     @staticmethod

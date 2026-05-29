@@ -40,7 +40,6 @@ SCHEMA_VERSION=1 を据え置き のため、DEFAULT_MIGRATIONS には登録
 from __future__ import annotations
 
 import json
-import os
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -69,6 +68,7 @@ from backend.free.memory.types import (
     deserialize_fact_jsonl,
     serialize_fact_jsonl,
 )
+from backend.io import AtomicWriter
 from backend.log_config import get_logger
 
 logger = get_logger("memory.semantic.subject_migration")
@@ -267,37 +267,29 @@ class SubjectCategoryRenameMigration(Migration):
         if not facts_path.exists():
             return stats
 
-        tmp_path = facts_path.with_suffix(facts_path.suffix + ".tmp")
-        try:
-            with facts_path.open("r", encoding="utf-8") as src, \
-                 tmp_path.open("w", encoding="utf-8") as dst:
-                for raw in src:
-                    line = raw.strip()
-                    if not line:
-                        continue
-                    stats.total += 1
-                    try:
-                        fact = deserialize_fact_jsonl(line)
-                    except (ValueError, KeyError) as exc:
-                        logger.warning(
-                            "SubjectCategoryRenameMigration: skip malformed "
-                            "fact line in %s: %s", facts_path, exc,
-                        )
-                        # 破損行は保持しない (writer 出力から除外)
-                        continue
-                    if self._should_rename(fact):
-                        new_subject = self._rename_subject(fact.subject)
-                        fact.subject = new_subject
-                        stats.matched += 1
-                    dst.write(serialize_fact_jsonl(fact) + "\n")
-            os.replace(tmp_path, facts_path)
-        except OSError:
-            if tmp_path.exists():
+        # AtomicWriter が tmp 書込 → os.replace (Windows retry 付き) を担い、
+        # 途中例外時は tmp を unlink して facts_path を不変のまま残す。
+        with AtomicWriter(facts_path) as dst, \
+             facts_path.open("r", encoding="utf-8") as src:
+            for raw in src:
+                line = raw.strip()
+                if not line:
+                    continue
+                stats.total += 1
                 try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
-            raise
+                    fact = deserialize_fact_jsonl(line)
+                except (ValueError, KeyError) as exc:
+                    logger.warning(
+                        "SubjectCategoryRenameMigration: skip malformed "
+                        "fact line in %s: %s", facts_path, exc,
+                    )
+                    # 破損行は保持しない (writer 出力から除外)
+                    continue
+                if self._should_rename(fact):
+                    new_subject = self._rename_subject(fact.subject)
+                    fact.subject = new_subject
+                    stats.matched += 1
+                dst.write(serialize_fact_jsonl(fact) + "\n")
         return stats
 
     def _should_rename(self, fact: SemanticFact) -> bool:

@@ -15,6 +15,8 @@ import httpx
 
 from backend.free.cli.chat_loop import chat_stream, _main_loop
 from backend.free.cli.command_parser import SessionState
+from backend.free.cli.develop_mode_setup import setup_develop_mode
+from backend.free.cli.edition_validator import validate_edition_arg
 from backend.free.cli.session_persistence import recover_checkpoints
 from backend.free.cli.config_loader import (
     _find_project_root,
@@ -540,32 +542,13 @@ def _try_recover_checkpoints(state: SessionState, console) -> None:
 def _setup_develop_mode_async(
     args: argparse.Namespace, console,
 ) -> int | None:
-    """`--develop=<level>` / `--isolate-data` の環境セットアップ
+    """`--develop=<level>` / `--isolate-data` の環境セットアップ (共通実装へ委譲)。
 
     ``debug`` レベルは Free / Pro 共通、``investigate`` / ``evolve`` は Pro 限定
     (Free 環境では起動時に sys.exit で拒否される)。``--isolate-data`` は
     Pro 拡張のみで効果があり、Free では no-op。
     """
-    from backend.free.cli.develop_hook import get_develop_hook
-    hook = get_develop_hook()
-
-    develop_level = getattr(args, "develop", None)
-    if develop_level is not None:
-        hook.setup_develop_env(develop_level)
-        if getattr(args, "isolate_data", False):
-            hook.setup_isolate_data_env()
-        hook.print_develop_banner(develop_level)
-
-    if getattr(args, "no_learning", False):
-        os.environ["EVOREF_LEARNING_DISABLED"] = "1"
-        print(msg("cli.learning_disabled_banner"), file=sys.stderr)
-
-    if develop_level is not None:
-        return None
-    if getattr(args, "isolate_data", False):
-        render_error(console, msg("cli.isolate_data_requires_develop"))
-        return 1
-    return None
+    return setup_develop_mode(args, console)
 
 
 def _apply_develop_port_offset(
@@ -606,34 +589,8 @@ def _resolve_cli_mode(args: argparse.Namespace) -> None:
 def _validate_edition_arg_async(
     args: argparse.Namespace, console,
 ) -> int | None:
-    """`--edition` 整合性検証 + 環境変数設定。エラー時 1。"""
-    if args.edition is None:
-        return None
-    if getattr(args, "develop", None) is None:
-        render_error(console, msg("cli.edition_requires_develop"))
-        return 1
-    from backend.edition import develop_available, pro_available
-    if args.edition == "pro" and not pro_available():
-        render_error(console, msg("cli.edition_pro_unavailable"))
-        return 1
-    if args.edition == "develop" and not develop_available():
-        render_error(console, msg("cli.edition_develop_unavailable"))
-        return 1
-    # backend lifespan の深部で sys.exit(1) する代わりに、CLI 側で先に拒否する
-    # (親プロセスからは "process died during startup" としか見えないため)。
-    # - --edition=free|pro + evolve : Develop 必須
-    from backend.free.cli.develop_hook import DEVELOP_ONLY_DEVELOP_LEVELS
-    if (
-        args.edition in ("free", "pro")
-        and args.develop in DEVELOP_ONLY_DEVELOP_LEVELS
-    ):
-        render_error(
-            console, msg("cli.develop_level_develop_only", level=args.develop),
-        )
-        return 1
-    os.environ["EVOREF_EDITION"] = args.edition
-    print(msg("cli.edition_override", edition=args.edition), file=sys.stderr)
-    return None
+    """`--edition` 整合性検証 + 環境変数設定 (共通実装へ委譲)。エラー時 1。"""
+    return validate_edition_arg(args, console, set_env_var=True)
 
 
 def _run_interactive_startup_checks(project_root: Path, console) -> int | None:

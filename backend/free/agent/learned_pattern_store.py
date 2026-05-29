@@ -22,6 +22,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from backend.free.agent.learned_patterns_types import LearnedPattern
+from backend.io import atomic_write_text
 from backend.log_config import get_logger
 
 logger = get_logger("agent.learned_pattern_store")
@@ -61,10 +62,8 @@ class LearnedPatternRepository:
     def save(patterns: dict[str, LearnedPattern], path: str | Path) -> None:
         """`patterns` を JSON ファイルに書き出す。親ディレクトリは自動作成。"""
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
         data = LearnedPatternRepository.serialize(patterns)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
         logger.info("Saved %d learned patterns to %s", len(data), path)
 
     @staticmethod

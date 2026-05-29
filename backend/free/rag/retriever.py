@@ -12,6 +12,7 @@ from backend.free.rag.reranker_skip import (
     is_skip_config_active,
 )
 from backend.log_config import get_logger
+from backend.policy_helpers import get_policy_value
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
@@ -21,6 +22,24 @@ if TYPE_CHECKING:
 from backend.free.rag.reranker_backend import RerankerBackend
 
 logger = get_logger("rag.retriever")
+
+
+def _accumulate_normalized(
+    scores: dict[str, float],
+    results: list[tuple[str, float]],
+    weight: float,
+) -> None:
+    """``results`` を max 正規化し、``weight`` 倍して ``scores`` に加算する。
+
+    max スコアが 0 以下 (全て 0 / 空) の場合は寄与なし。重み付き融合で
+    ベクトル側 / BM25 側を同一ロジックで処理するための共通ヘルパ。
+    """
+    if not results:
+        return
+    max_s = max(s for _, s in results)
+    for cid, s in results:
+        norm_s = s / max_s if max_s > 0 else 0
+        scores[cid] = scores.get(cid, 0.0) + norm_s * weight
 
 
 class HybridRetriever:
@@ -200,32 +219,14 @@ class HybridRetriever:
         bm25_w: float | None = None,
         vector_w: float | None = None,
     ) -> list[tuple[str, float]]:
-        """重み付き融合"""
+        """重み付き融合 (max 正規化 + 重み付き加算)"""
         _bm25_w = bm25_w if bm25_w is not None else self.bm25_weight
         _vec_w = vector_w if vector_w is not None else self.vector_weight
         scores: dict[str, float] = {}
-
-        # ベクトルスコア正規化
-        if vec_results:
-            max_vec = max(s for _, s in vec_results)
-            for cid, s in vec_results:
-                norm_s = s / max_vec if max_vec > 0 else 0
-                scores[cid] = scores.get(cid, 0.0) + norm_s * _vec_w
-
-        # BM25スコア正規化
-        if bm25_results:
-            max_bm25 = max(s for _, s in bm25_results)
-            for cid, s in bm25_results:
-                norm_s = s / max_bm25 if max_bm25 > 0 else 0
-                scores[cid] = scores.get(cid, 0.0) + norm_s * _bm25_w
-
+        _accumulate_normalized(scores, vec_results, _vec_w)
+        _accumulate_normalized(scores, bm25_results, _bm25_w)
         return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
     def _resolve(self, key: str, default: int | float, mode: str) -> int | float:
         """ポリシーからパラメータ取得（フォールバック付き）"""
-        if self._policy is None:
-            return default
-        try:
-            return self._policy.get("search", key, mode)
-        except KeyError:
-            return default
+        return get_policy_value(self._policy, "search", key, default, mode=mode)

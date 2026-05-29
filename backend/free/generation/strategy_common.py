@@ -9,28 +9,33 @@
 - コードユニット生成用メッセージ構築 (:func:`build_code_unit_messages`)
 - 共通プロンプトテンプレート定数
 
-`_build_text_unit_messages` は両戦略間で差分 (recurrent 側のみ要約スロット
-``long_term_summary`` を含む) があるため、本モジュールでは扱わない。
+テキストユニットメッセージ構築 (:func:`build_text_unit_messages`) は
+``include_long_term_summary`` フラグで recurrent 側の要約スロット
+(``long_term_summary``) 差を吸収し、両戦略で共通化する。
 """
 
 from __future__ import annotations
 
 import logging
+from graphlib import TopologicalSorter
 from typing import TYPE_CHECKING
 
 from backend.free.generation.models import (
     CodeUnit,
     ContentType,
     GenerationPlan,
+    LongFormMode,
     SectionPlan,
     chars_to_tokens,
     extract_target_chars,
 )
+from backend.free.llm.json_schemas import CodePlan, TextPlan
 
 logger = logging.getLogger("backend.free.generation.strategy_common")
 
 if TYPE_CHECKING:
     from backend.free.generation.rolling_context import RollingContext
+    from backend.free.llm.assist_client import AssistModelClient
 
 
 # ── 共通プロンプトテンプレート ──
@@ -240,6 +245,179 @@ def build_code_unit_messages(
         depends_on=", ".join(unit.depends_on) or "(なし)",
         rag_context="(なし)",  # RAG は Orchestrator 側で注入
     )
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+# ── 既存テキスト抜粋 (continuation / expand) ──
+
+def excerpt_continuation_content(existing: str) -> str:
+    """継続(追記)モード用に既存テキストを抜粋する (冒頭 500 + 末尾 800 char)。
+
+    1500 char 以下はそのまま返す。LLM コンテキストと計画精度のバランスを
+    考慮した固定値。
+    """
+    if len(existing) > 1500:
+        return existing[:500] + "\n\n[...中略...]\n\n" + existing[-800:]
+    return existing
+
+
+def excerpt_for_expand(existing_content: str) -> str:
+    """EXPAND/SPLIT モード用に既存テキストを抜粋する (冒頭 2000 + 末尾 2000 char)。
+
+    継続モード (500+800=1300) より広く取り、planner が機能境界を識別できる
+    解像度を確保する。plan ``max_tokens=1024`` 制約とのバランスで 4000 char 上限。
+    """
+    if len(existing_content) <= 4000:
+        return existing_content
+    return (
+        existing_content[:2000]
+        + "\n\n[...中略...]\n\n"
+        + existing_content[-2000:]
+    )
+
+
+# ── 計画の最大ユニット数 / 生成順序 ──
+
+def resolve_max_units(config: dict, long_form_mode: LongFormMode) -> int:
+    """長文生成の最大ユニット数。EXPAND/SPLIT では機能ごと節分割のため下限 8 を保証。"""
+    max_units = config.get("max_units", 20)
+    if long_form_mode in (LongFormMode.EXPAND, LongFormMode.SPLIT):
+        max_units = max(max_units, 8)
+    return max_units
+
+
+def resolve_generation_order(units: list[CodeUnit]) -> list[CodeUnit]:
+    """依存関係に基づくトポロジカルソート (Recurrent / CogWriter 共通)。"""
+    graph = {u.name: set(u.depends_on) for u in units}
+    sorter = TopologicalSorter(graph)
+    try:
+        order = list(sorter.static_order())
+    except Exception:
+        logger.warning("Topological sort failed, using original order")
+        return units
+    unit_map = {u.name: u for u in units}
+    return [unit_map[name] for name in order if name in unit_map]
+
+
+def finalize_plan_units(
+    plan: GenerationPlan,
+    max_units: int,
+    content_type: ContentType,
+) -> None:
+    """計画ユニットを ``max_units`` に切り詰め、コードなら依存順ソートする (in-place)。
+
+    両戦略の create_plan 末尾で共通の後処理。
+    """
+    if len(plan.units) > max_units:
+        logger.warning(
+            "Plan has %d units, truncating to %d", len(plan.units), max_units,
+        )
+        plan.units = plan.units[:max_units]
+    if content_type == ContentType.CODE:
+        code_units = [u for u in plan.units if isinstance(u, CodeUnit)]
+        plan.units = resolve_generation_order(code_units)
+
+
+# ── 計画 JSON 生成 ──
+
+async def generate_plan_json(
+    assist_client: AssistModelClient | None,
+    prompt: str,
+    content_type: ContentType,
+) -> dict:
+    """アシストモデルで計画 JSON を生成する。
+
+    ``content_type`` に応じた schema (CodePlan / TextPlan) を明示選択し、
+    ``assist_client is None`` (degraded) / 例外時は空 dict を返して呼出側の
+    単一ユニットフォールバックに委ねる。
+    """
+    if assist_client is None:
+        logger.warning(
+            "create_plan: assist_client is None, falling back to single-unit plan",
+        )
+        return {}
+    plan_schema = CodePlan if content_type == ContentType.CODE else TextPlan
+    try:
+        return await assist_client.generate_json(
+            prompt,
+            max_tokens=1024,
+            temperature=0.3,
+            purpose="long_form_planning",
+            list_key="units",
+            response_schema=plan_schema,
+        )
+    except Exception as e:  # noqa: BLE001 — assist 例外で fallback
+        logger.warning("Plan generation failed: %s", e)
+        return {}
+
+
+# ── テキストユニットメッセージ構築 ──
+
+def build_text_unit_messages(
+    unit: SectionPlan,
+    rolling: RollingContext,
+    text_unit_user_template: str,
+    *,
+    include_long_term_summary: bool = False,
+) -> list[dict]:
+    """テキストユニット生成用のメッセージ列を構築する (両戦略共通スケルトン)。
+
+    ``text_unit_user_template`` は各戦略が保持する ``_TEXT_UNIT_USER`` 定数を渡す
+    (Recurrent 側は ``{long_term_summary}`` プレースホルダを含む)。
+    ``include_long_term_summary=True`` のとき要約スロットを埋める (Recurrent)。
+    """
+    budget = rolling.budget
+    plan = rolling.plan
+
+    section_headings = ", ".join(
+        u.heading for u in plan.units if isinstance(u, SectionPlan)
+    )
+    short_term = budget.fit_content("short_term", rolling.short_term)
+
+    total_estimated = sum(
+        u.estimated_tokens for u in plan.units if isinstance(u, SectionPlan)
+    ) or 1
+    unit_ratio = unit.estimated_tokens / total_estimated
+    unit_target_chars = max(int(plan.target_length * unit_ratio), 200)
+
+    system_template = (
+        TEXT_UNIT_CONTINUATION_SYSTEM
+        if rolling.has_existing_context
+        else TEXT_UNIT_SYSTEM
+    )
+    system = budget.fit_content(
+        "system_prompt",
+        system_template.format(
+            global_context=plan.global_context,
+            unit_target_chars=unit_target_chars,
+        ),
+    )
+
+    fmt_kwargs = {
+        "title": plan.title,
+        "section_headings": section_headings,
+        "short_term": short_term or "(なし)",
+        "heading": unit.heading,
+        "key_points": ", ".join(unit.key_points),
+        "rag_context": "(なし)",  # RAG は Orchestrator 側で注入
+    }
+    if include_long_term_summary:
+        fmt_kwargs["long_term_summary"] = budget.fit_content(
+            "skeleton_or_summary",
+            rolling.long_term_summary,
+        ) or "(なし)"
+
+    user = text_unit_user_template.format(**fmt_kwargs)
+    # 追記モード: short_term ラベルを差し替え
+    if rolling.has_existing_context:
+        user = user.replace(
+            "# 直前セクション末尾",
+            "# 直前テキスト末尾（この直後に自然に続く文章を書いてください）",
+        )
 
     return [
         {"role": "system", "content": system},

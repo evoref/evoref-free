@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from backend.log_config import get_logger
+from backend.policy_helpers import get_policy_value
 
 if TYPE_CHECKING:
     from backend.free.core.policy_interpreter import PolicyInterpreter
@@ -73,12 +74,7 @@ class FadeMemScorer:
 
     def _p(self, key: str, default: int | float) -> int | float:
         """ポリシーからパラメータ取得（フォールバック付き）"""
-        if self._policy is None:
-            return default
-        try:
-            return self._policy.get("memory", key)
-        except KeyError:
-            return default
+        return get_policy_value(self._policy, "memory", key, default)
 
     def _select_half_life_seconds(self, item: Any) -> float:
         """対象アイテムのタグ/型から半減期 (秒) を選ぶ。
@@ -188,18 +184,13 @@ class MemoryEviction:
             return 0
 
         # ポリシー優先、フォールバックは config → デフォルト
-        if self._policy is not None:
-            try:
-                threshold = self._policy.get("memory", "fade_threshold")
-            except KeyError:
-                threshold = config.get("memory", {}).get("fade_threshold", 0.15)
-            try:
-                eviction_ratio = self._policy.get("memory", "eviction_ratio")
-            except KeyError:
-                eviction_ratio = self.EVICTION_RATIO
-        else:
-            threshold = config.get("memory", {}).get("fade_threshold", 0.15)
-            eviction_ratio = self.EVICTION_RATIO
+        threshold = get_policy_value(
+            self._policy, "memory", "fade_threshold",
+            config.get("memory", {}).get("fade_threshold", 0.15),
+        )
+        eviction_ratio = get_policy_value(
+            self._policy, "memory", "eviction_ratio", self.EVICTION_RATIO,
+        )
 
         # FadeMem スコアで全ノートをソート
         scored = [(n, scorer.compute(n)) for n in short_term.notes.values()]

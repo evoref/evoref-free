@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from backend.app_state import AppState
 from backend.free.history.history_manager import SessionData, get_history_manager
 from backend.log_config import get_logger
+from backend.utils import utc_now_dt
 
 if TYPE_CHECKING:
     from backend.free.memory.stores.working import WorkingMemory
@@ -82,10 +83,10 @@ def _save_session_to_history(
                     first_ts, tz=timezone.utc,
                 ).isoformat()
             else:
-                _session_started[session_id] = datetime.now(timezone.utc).isoformat()
+                _session_started[session_id] = utc_now_dt().isoformat()
 
         started_at = _session_started[session_id]
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = utc_now_dt().isoformat()
 
         # ターンを履歴用フォーマットに変換
         history_turns = []

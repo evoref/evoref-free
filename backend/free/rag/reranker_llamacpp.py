@@ -15,9 +15,11 @@ import time
 import httpx
 
 from backend.free.llm._base_client import (
+    BaseHTTPClient,
     async_retry_http_call,
     make_retry_logger,
 )
+from backend.free.rag.instruction_resolver import format_with_instruction
 from backend.log_config import get_logger
 
 logger = get_logger("rag.reranker_llamacpp")
@@ -42,11 +44,6 @@ _DEFAULT_MAX_DOC_CHARS = 4096
 # Qwen3-Reranker 公式の instruction-aware フォーマット (既定値)
 _DEFAULT_QUERY_TEMPLATE = "<Instruct>: {task}\n<Query>: {query}"
 
-# instructions 設定が空 / 不正な場合のフォールバック (起動失敗回避)
-_FALLBACK_INSTRUCTION = (
-    "Given a user question, retrieve relevant passages that answer the query"
-)
-
 # モード未指定時のデフォルト
 _DEFAULT_MODE = "chat"
 
@@ -55,7 +52,7 @@ _SELFTEST_QUERY = "test query"
 _SELFTEST_DOCS = ["relevant document", "irrelevant document"]
 
 
-class LlamaCppReranker:
+class LlamaCppReranker(BaseHTTPClient):
     """llama-server /v1/rerank 経由のリランキング"""
 
     def __init__(
@@ -72,9 +69,9 @@ class LlamaCppReranker:
         query_template: str = _DEFAULT_QUERY_TEMPLATE,
         debug_logger=None,
     ):
+        super().__init__(timeout=timeout)
         self._url = f"http://{host}:{port}/v1/rerank"
         self._model_name = model_name
-        self._timeout = timeout
         self._max_doc_chars = max_doc_chars
         self._fast_path_timeout = fast_path_timeout
         self._cb_failure_threshold = cb_failure_threshold
@@ -84,7 +81,6 @@ class LlamaCppReranker:
         # クエリ整形テンプレート。空文字列で instruction prefix を一切付与しない
         # (BGE-Reranker-v2-m3 等の非 instruction-aware モデル運用)。
         self._query_template = query_template
-        self._client: httpx.AsyncClient | None = None
         self._debug_logger = debug_logger
 
         # サーキットブレーカー状態
@@ -101,43 +97,22 @@ class LlamaCppReranker:
             self._query_template,
         )
 
-    def _resolve_instruction(self, mode: str) -> str:
-        """``mode`` から instruction 文字列を解決する"""
-        if mode in self._instructions:
-            return self._instructions[mode]
-        if _DEFAULT_MODE in self._instructions:
-            logger.warning(
-                "rerank: unknown mode=%r, falling back to %r",
-                mode, _DEFAULT_MODE,
-            )
-            return self._instructions[_DEFAULT_MODE]
-        logger.warning(
-            "rerank: no instructions configured (mode=%r), using fallback",
-            mode,
-        )
-        return _FALLBACK_INSTRUCTION
-
     def _format_query(self, query: str, mode: str) -> str:
         """テンプレート駆動でクエリを整形する
 
         ``query_template`` が空文字列のときは素のクエリを返す
         (BGE-Reranker-v2-m3 等の非 instruction-aware モデル向け fast-path)。
+        instruction 解決とフォーマットは :mod:`instruction_resolver` に委譲する。
         """
-        if not self._query_template:
-            return query
-        instruction = self._resolve_instruction(mode)
-        return self._query_template.format(task=instruction, query=query)
+        return format_with_instruction(
+            query, self._query_template, self._instructions, mode,
+            backend_label="rerank",
+        )
 
     @property
     def is_active(self) -> bool:
         """LlamaCppReranker は常に有効"""
         return True
-
-    def _ensure_client(self) -> httpx.AsyncClient:
-        """遅延初期化で AsyncClient を取得"""
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self._timeout)
-        return self._client
 
     def _cb_is_open(self) -> bool:
         """サーキットブレーカーがオープン（トリップ中）か判定
@@ -276,7 +251,7 @@ class LlamaCppReranker:
         self, query: str, documents: list[str], top_n: int
     ) -> list[tuple[int, float]]:
         """リランキングの実処理"""
-        client = self._ensure_client()
+        client = self._get_http_client()
 
         # ドキュメント長トランケーション — n_ctx 超過による 500 エラーを予防
         documents = self._truncate_docs(documents)
@@ -331,7 +306,7 @@ class LlamaCppReranker:
         起動時に呼び出し、失敗時は NullReranker にフォールバックできる。
         """
         try:
-            client = self._ensure_client()
+            client = self._get_http_client()
             # llama-server の /health エンドポイントで確認
             base_url = self._url.rsplit("/v1/rerank", 1)[0]
             resp = await client.get(f"{base_url}/health", timeout=5.0)
@@ -354,7 +329,7 @@ class LlamaCppReranker:
         empty results / リトライ枯渇) した場合は ``False`` を返し、
         ``reranker_factory`` 側で NullReranker フォールバックに切替える。
         """
-        client = self._ensure_client()
+        client = self._get_http_client()
         payload = {
             "model": self._model_name,
             "query": _SELFTEST_QUERY,
@@ -398,9 +373,3 @@ class LlamaCppReranker:
             return True
         logger.warning("Reranker selftest: 200 but empty results: %s", data)
         return False
-
-    async def aclose(self) -> None:
-        """HTTP クライアントを閉じる"""
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None

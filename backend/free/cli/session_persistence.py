@@ -10,7 +10,9 @@ from pathlib import Path
 from backend.free.cli.command_parser import CommandResult, SessionState
 from backend.free.cli.renderer import render_error, render_info
 from backend.i18n_helper import msg
+from backend.io import atomic_write_text
 from backend.log_config import get_logger
+from backend.utils import utc_now_dt
 
 logger = get_logger("cli.session_persistence")
 
@@ -38,7 +40,7 @@ def _should_auto_save(state: SessionState) -> bool:
 
 def _build_history_data(state: SessionState) -> dict:
     """自動保存用のセッションデータを構築"""
-    now = datetime.now(timezone.utc)
+    now = utc_now_dt()
     pct = int(state.token_used / state.token_limit * 100) if state.token_limit > 0 else 0
     started = datetime.fromtimestamp(state.started_at, tz=timezone.utc)
     duration = int(now.timestamp() - state.started_at)
@@ -194,15 +196,11 @@ def save_checkpoint(state: SessionState) -> bool:
         return False
 
     checkpoint_dir = state.history_dir / ".checkpoint"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     path = checkpoint_dir / f"{state.session_id}.json"
 
     data = _build_history_data(state)
     try:
-        path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
         logger.debug("checkpoint: wrote %s (%d turns)", path, len(state.turns))
         return True
     except OSError as e:
@@ -246,22 +244,18 @@ def recover_checkpoints(history_dir: Path) -> int:
                     dt = datetime.fromisoformat(started_at)
                     month_str = dt.strftime("%Y-%m")
                 except ValueError:
-                    month_str = datetime.now(timezone.utc).strftime("%Y-%m")
+                    month_str = utc_now_dt().strftime("%Y-%m")
             else:
-                month_str = datetime.now(timezone.utc).strftime("%Y-%m")
+                month_str = utc_now_dt().strftime("%Y-%m")
 
             month_dir = history_dir / month_str
-            month_dir.mkdir(parents=True, exist_ok=True)
 
             # ファイル名を生成
-            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            ts = utc_now_dt().strftime("%Y%m%d_%H%M%S")
             dest = month_dir / f"{ts}_{session_id}.json"
 
             # アーカイブとして移動（source を維持）
-            dest.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            atomic_write_text(dest, json.dumps(data, ensure_ascii=False, indent=2))
             cp_file.unlink()
             recovered += 1
             logger.debug("checkpoint recovery: %s -> %s", cp_file.name, dest)
