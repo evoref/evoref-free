@@ -54,9 +54,13 @@ logger = get_logger("llm._base_client")
 
 # 共通リトライ定数 (LocalClient / AssistModelClient / Embedder / Reranker で同一値)。
 # ``stop_after_attempt(MAX_ATTEMPTS)`` で全試行回数 (初回含む) を制御する。
-# 旧実装の ``MAX_RETRIES=3`` (= 4 試行) から ``MAX_ATTEMPTS=3`` (= 3 試行)
-# に変更し、worst case 待機 (0.5 + 1.0 + 2.0 = 3.5s + jitter) と per-attempt
-# timeout を組み合わせても purpose timeout の予算内に収まるようにする
+# 旧実装の ``MAX_RETRIES=3`` (= 4 試行) から ``MAX_ATTEMPTS=3`` (= 3 試行) に変更し、
+# worst case のバックオフ待機 (0.5 + 1.0 + 2.0 = 3.5s + jitter) を抑える。
+# 注意: ここで制御するのは試行回数とバックオフ待機のみで、``timeout`` は
+# **per-attempt** に適用される (3 試行なら最悪 timeout×3 + 待機の壁時計時間)。
+# realtime 用途の purpose timeout を「総予算」として守りたい場合は、呼出側
+# (AssistModelClient._request_with_retry) でリトライループ全体を asyncio.timeout
+# で囲む必要がある。
 MAX_ATTEMPTS = 3
 RETRY_WAIT_INITIAL = 0.5  # 秒、wait_exponential_jitter の初期値
 RETRY_WAIT_MAX = 4.0  # 秒、wait_exponential_jitter の上限

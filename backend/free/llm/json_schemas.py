@@ -236,6 +236,25 @@ class ToolJudgmentResult(_StrictModel):
     )
 
 
+# ── エディタ出力ファイル名導出 (editor_filename) ──
+
+class EditorFilenameResult(_StrictModel):
+    """`backend/free/llm/editor_filename.py` のエディタタブ名導出.
+
+    コーディングモードで生成したコード/仕様書を Pro エディタへタブ表示する際、
+    生成内容から **拡張子なしの ASCII snake_case** ファイル名 stem を 1 つ
+    導出する。日本語見出しをそのまま流用するとタブ名が日本語化するため、
+    アシストモデルに英語の簡潔名を生成させる (SPLIT モードの ``file_name`` と
+    同思想)。
+
+    - ``file_name``: 英小文字 + 数字 + アンダースコアのみ、拡張子なし。
+      呼出側が言語に応じた拡張子を付与する。LLM が日本語/記号を返しても
+      呼出側で ASCII slug 化 + 言語別フォールバックするため安全。
+    """
+
+    file_name: str = ""
+
+
 # ── purpose -> schema 自動解決マップ ──
 #
 # 呼出側が ``response_schema`` を明示しない場合、AssistClient が purpose
@@ -252,6 +271,7 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "meta_cognitive_plan": MetaCognitivePlan,
     "cartridge_eval_generation": CartridgeEvalQAList,
     "url_relevance_score": UrlRelevanceJudgement,
+    "editor_filename": EditorFilenameResult,
 }
 
 
@@ -399,6 +419,7 @@ __all__ = [
     "CartridgeEvalQAItem",
     "CartridgeEvalQAList",
     "UrlRelevanceJudgement",
+    "EditorFilenameResult",
     "PURPOSE_SCHEMAS",
     "make_response_format",
     "resolve_response_format_for_purpose",

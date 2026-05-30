@@ -308,6 +308,10 @@ class LongFormConfig(BaseModel):
     max_revisions: int = Field(default=3, ge=0)
     rag_per_unit: bool = True
     rag_top_k_per_unit: int = Field(default=3, ge=1)
+    # 長文生成 1 リクエストの総ウォールクロック上限 (秒)。0 で無効化。
+    # 低速ローカル GPU では正当な生成が 10-20 分かかるため既定は余裕を持たせる。
+    # 超過時は生成済みユニットで打ち切り、部分結果を返す (無限ハング防止)。
+    total_timeout_sec: float = Field(default=1800.0, ge=0.0)
 
 
 class ChatModeConfig(BaseModel):

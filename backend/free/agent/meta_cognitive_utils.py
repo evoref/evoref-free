@@ -7,6 +7,7 @@ import json
 import re
 from typing import Iterator
 
+from backend.free.constants import COMMAND_EXIT_CODE_PREFIX
 from backend.log_config import get_logger
 
 logger = get_logger("agent.meta_cognitive.utils")
@@ -39,6 +40,23 @@ def is_tool_error(text: str) -> bool:
     (マーカー変更時の修正漏れ耐性)。
     """
     return text.startswith(TOOL_ERROR_PREFIX)
+
+
+def command_run_failed(text: str) -> bool:
+    """``run_command`` の結果文字列が失敗 (非ゼロ終了) を示すかを判定する。
+
+    ``run_command`` (``tools/builtin.py:_run_command_async_impl``) は実行した
+    プログラム自身が非ゼロ終了したときのみ末尾へ ``[exit code: N]`` を付与する。
+    ``is_tool_error`` (``Error:`` プレフィックス) はツールラッパ自身の失敗
+    (例外 / 危険コマンドブロック等) しか拾えず、走ったが失敗したコマンド
+    (SyntaxError / 非ゼロ終了) を success と誤判定する。このマーカー検出で補完し、
+    誤った成功が SemMem (executable_command) 学習を汚染するのを防ぐ。
+
+    出力切り詰め (200 行超で head+tail) でもマーカーは末尾 tail に残るため、
+    切り詰め後の文字列でも検出できる。``run_command`` 以外の結果には付与
+    されないため、呼出側は ``run_command`` のときだけ参照すること。
+    """
+    return COMMAND_EXIT_CODE_PREFIX in text
 
 
 # ---------------------------------------------------------------------------

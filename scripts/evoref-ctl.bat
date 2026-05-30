@@ -11,16 +11,41 @@ set "PYTHONIOENCODING=utf-8"
 
 if "%~1"=="" goto usage
 if /i "%~1"=="start" goto start
+if /i "%~1"=="start-core" goto start_core
 if /i "%~1"=="stop" goto stop
 if /i "%~1"=="restart" goto restart
 if /i "%~1"=="status" goto status
 goto usage
 
-rem ── サービス起動 ──
+rem ── サービス起動 (全サービス: llama + backend + frontend) ──
 :start
-call :check_dep python "python.org or winget install Python.Python.3"
-if errorlevel 1 exit /b 1
 call :check_dep npm "nodejs.org or winget install OpenJS.NodeJS"
+if errorlevel 1 exit /b 1
+
+call :start_core
+if errorlevel 1 exit /b 1
+
+echo [start] Starting SvelteKit dev server on :5173...
+start "evoref-frontend" /min cmd /c "cd frontend && npm run dev -- --host 0.0.0.0"
+
+echo.
+echo === evoref is running ===
+echo   Web UI:   http://localhost:5173
+echo   API:      http://localhost:8000
+echo   llama:    http://localhost:8080 (base)
+echo   embed:    http://localhost:8082 (embedding, if llama-cpp)
+echo   rerank:   http://localhost:8083 (reranker, if enabled)
+echo.
+echo Close the terminal windows to stop services,
+echo or run: %~nx0 stop
+goto :eof
+
+rem ── コアサービス起動 (llama + backend のみ、frontend は起動しない) ──
+rem `:start` から call され、reset_local_data.py の再起動からは `start-core`
+rem コマンドとして直接呼ばれる。frontend(vite:5173) を生かしたまま llama と
+rem backend だけを再起動する用途。stop が効くようウィンドウタイトルは維持する。
+:start_core
+call :check_dep python "python.org or winget install Python.Python.3"
 if errorlevel 1 exit /b 1
 
 rem 仮想環境の有効化
@@ -45,20 +70,6 @@ powershell -NoProfile -Command "$elapsed=0; do { Start-Sleep 2; $elapsed+=2; try
 
 echo [start] Starting FastAPI backend on :8000...
 start "evoref-backend" /min cmd /c ""%VENV_UVICORN%" backend.main:app --host 0.0.0.0 --port 8000"
-
-echo [start] Starting SvelteKit dev server on :5173...
-start "evoref-frontend" /min cmd /c "cd frontend && npm run dev -- --host 0.0.0.0"
-
-echo.
-echo === evoref is running ===
-echo   Web UI:   http://localhost:5173
-echo   API:      http://localhost:8000
-echo   llama:    http://localhost:8080 (base)
-echo   embed:    http://localhost:8082 (embedding, if llama-cpp)
-echo   rerank:   http://localhost:8083 (reranker, if enabled)
-echo.
-echo Close the terminal windows to stop services,
-echo or run: %~nx0 stop
 goto :eof
 
 rem ── サービス停止 ──

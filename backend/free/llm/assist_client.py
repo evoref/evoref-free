@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import contextlib
 import json
 import time
 from typing import Literal
@@ -68,6 +69,10 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     # 同期発火する (タスク分解後に他のエージェントが実行される) ため
     # realtime に分類する。
     "meta_cognitive_plan": "realtime",
+    # エディタタブ名導出。coding mode のチャット応答パス (long_form /
+    # meta_cognitive のエディタ出力終端) で同期発火し、ユーザはタブ名表示を
+    # 待つ。max_tokens 数十・budget 0 の極短呼出なので realtime に乗せる。
+    "editor_filename": "realtime",
     # background — Sleep-time / 自律ループ / 長文生成
     "contextual_prefix": "background",
     "long_form_planning": "background",
@@ -134,6 +139,9 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # meta-cognitive 計画 (タスク分解) は coding mode の
     # 応答パスで発火するため、長すぎるとユーザ体感を阻害する。30s で打ち切り。
     "meta_cognitive_plan": 30.0,
+    # エディタタブ名導出 ({"file_name": "..."} の極短 JSON)。応答パスで
+    # 同期発火するため短く打ち切る。失敗時は言語別 fallback stem に倒す。
+    "editor_filename": 8.0,
     # Recurrent 戦略の summary 再帰更新。1 セクション末尾を
     # 短文要約するだけのため 30s で十分。
     "summarize": 30.0,
@@ -190,6 +198,9 @@ PURPOSE_REASONING_BUDGET_DEFAULTS: dict[str, int] = {
     "tool_judgment": 0,
     # meta-cognitive 計画は機械的なタスク分解で thinking 不要
     "meta_cognitive_plan": 0,
+    # エディタタブ名導出は機械的な命名で thinking 不要。
+    # response_format (EditorFilenameResult) で構造を固定する。
+    "editor_filename": 0,
     # 既存要約 + 新セクションの再要約は機械的処理で thinking 不要
     "summarize": 0,
     # cartridge eval.json QA ペア生成は機械的な抜き出しで
@@ -786,62 +797,73 @@ class AssistModelClient(BaseHTTPClient):
             self._debug_logger, backend="assist", purpose=purpose,
         )
 
+        # realtime は purpose timeout を「総ウォールクロック予算」として強制する。
+        # per-attempt timeout (client.post) は維持しつつ、リトライ + バックオフ込みの
+        # 総時間が effective_timeout を超えたら打ち切り、チャット応答パスの体感
+        # レイテンシを保証する (旧実装は per-attempt timeout × リトライで 8s 予算が
+        # 14-24s に膨張していた)。background / learning は信頼性優先で従来挙動を維持。
+        deadline = (
+            asyncio.timeout(effective_timeout)
+            if priority == "realtime"
+            else contextlib.nullcontext()
+        )
         try:
-            async for attempt in AsyncRetrying(
-                retry=retry_predicate,
-                stop=stop_after_attempt(MAX_ATTEMPTS),
-                wait=wait_exponential_jitter(
-                    initial=RETRY_WAIT_INITIAL, max=RETRY_WAIT_MAX,
-                ),
-                before_sleep=_assist_before_sleep_callback(
-                    purpose=purpose, retry_logger=retry_logger,
-                ),
-                reraise=True,
-            ):
-                with attempt:
-                    # セマフォ取得 (リトライごとに再取得し、待機中は解放)
-                    try:
-                        await asyncio.wait_for(
-                            semaphore.acquire(),
-                            timeout=_SEMAPHORE_ACQUIRE_TIMEOUT,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "Semaphore acquire timed out after %.0fs "
-                            "(priority=%s, slots=%d)",
-                            _SEMAPHORE_ACQUIRE_TIMEOUT, priority, slot_count,
-                        )
-                        # セマフォ獲得失敗自体はリトライ対象外として
-                        # 即座に伝播させる (overload 状態の自己回復は別系統)
-                        raise TimeoutError(
-                            f"Assist model overloaded: semaphore timeout "
-                            f"after {_SEMAPHORE_ACQUIRE_TIMEOUT}s "
-                            f"(priority={priority})"
-                        )
-
-                    try:
-                        resp = await client.post(
-                            f"{self.url}/v1/chat/completions",
-                            json=payload,
-                            timeout=effective_timeout,
-                        )
-                        resp.raise_for_status()
-                        data = resp.json()
-                        content = extract_content(data)
-                        if len(content) == 0:
-                            last_empty_data = data
-                            self._log_empty_response(
-                                data, attempt.retry_state.attempt_number - 1,
+            async with deadline:
+                async for attempt in AsyncRetrying(
+                    retry=retry_predicate,
+                    stop=stop_after_attempt(MAX_ATTEMPTS),
+                    wait=wait_exponential_jitter(
+                        initial=RETRY_WAIT_INITIAL, max=RETRY_WAIT_MAX,
+                    ),
+                    before_sleep=_assist_before_sleep_callback(
+                        purpose=purpose, retry_logger=retry_logger,
+                    ),
+                    reraise=True,
+                ):
+                    with attempt:
+                        # セマフォ取得 (リトライごとに再取得し、待機中は解放)
+                        try:
+                            await asyncio.wait_for(
+                                semaphore.acquire(),
+                                timeout=_SEMAPHORE_ACQUIRE_TIMEOUT,
                             )
-                            raise _EmptyResponseError(data)
-                        logger.debug(
-                            "Generate complete: response_length=%d chars, attempt=%d",
-                            len(content),
-                            attempt.retry_state.attempt_number,
-                        )
-                        return data
-                    finally:
-                        semaphore.release()
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "Semaphore acquire timed out after %.0fs "
+                                "(priority=%s, slots=%d)",
+                                _SEMAPHORE_ACQUIRE_TIMEOUT, priority, slot_count,
+                            )
+                            # セマフォ獲得失敗自体はリトライ対象外として
+                            # 即座に伝播させる (overload 状態の自己回復は別系統)
+                            raise TimeoutError(
+                                f"Assist model overloaded: semaphore timeout "
+                                f"after {_SEMAPHORE_ACQUIRE_TIMEOUT}s "
+                                f"(priority={priority})"
+                            )
+
+                        try:
+                            resp = await client.post(
+                                f"{self.url}/v1/chat/completions",
+                                json=payload,
+                                timeout=effective_timeout,
+                            )
+                            resp.raise_for_status()
+                            data = resp.json()
+                            content = extract_content(data)
+                            if len(content) == 0:
+                                last_empty_data = data
+                                self._log_empty_response(
+                                    data, attempt.retry_state.attempt_number - 1,
+                                )
+                                raise _EmptyResponseError(data)
+                            logger.debug(
+                                "Generate complete: response_length=%d chars, attempt=%d",
+                                len(content),
+                                attempt.retry_state.attempt_number,
+                            )
+                            return data
+                        finally:
+                            semaphore.release()
         except _EmptyResponseError:
             # 空応答で枯渇した場合は最後のレスポンスをそのまま返す
             # (呼び出し側の既存の空応答ハンドリング経路を壊さないため)
@@ -856,6 +878,14 @@ class AssistModelClient(BaseHTTPClient):
                         scope="request",
                     )
                 return last_empty_data
+            raise
+        except TimeoutError:
+            # realtime 総予算超過 or セマフォ overload。caller は degraded fallback へ倒す。
+            logger.warning(
+                "Assist request aborted by timeout "
+                "(purpose=%s, priority=%s, budget=%.1fs)",
+                purpose, priority, effective_timeout,
+            )
             raise
 
         # AsyncRetrying は reraise=True で必ず例外を上げるか値を return するため

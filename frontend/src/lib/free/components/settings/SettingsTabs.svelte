@@ -15,7 +15,8 @@
 		integration: 'settings.tab_integration',
 		generation: 'settings.tab_generation',
 		editor: 'settings.tab_editor',
-		prompts: 'settings.tab_prompts'
+		prompts: 'settings.tab_prompts',
+		develop: 'settings.tab_develop'
 	};
 
 	/** Pro 機能を含むタブ (バッジ表示対象)
@@ -35,10 +36,10 @@
 	 * Free ビルドでは visibleTabs から完全に除外する。
 	 */
 	const PRO_ONLY_TABS = new Set(['editor']);
-	const DEVELOP_ONLY_TABS = new Set<string>();
+	const DEVELOP_ONLY_TABS = new Set(['develop']);
 
 	let visibleTabs = $derived(
-		[...TAB_IDS, 'prompts'].filter((tabId) => {
+		[...TAB_IDS, 'prompts', 'develop'].filter((tabId) => {
 			if (!isPro && PRO_ONLY_TABS.has(tabId)) return false;
 			if (!isDevelop && DEVELOP_ONLY_TABS.has(tabId)) return false;
 			return true;

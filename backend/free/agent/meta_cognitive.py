@@ -42,6 +42,7 @@ from backend.free.agent.meta_cognitive_utils import (
 )
 from backend.free.agent.step_compactor import StepCompactor, StepResult
 from backend.free.core.inference import build_messages_for_loop
+from backend.free.llm.editor_filename import derive_editor_filename_stem
 from backend.utils import estimate_tokens as _estimate_tokens
 from backend.log_config import get_logger
 
@@ -134,6 +135,16 @@ _EXT_LANGUAGE_MAP: dict[str, str] = {
     "xml": "xml", "yaml": "yaml", "yml": "yaml", "sql": "sql",
     "php": "php", "md": "markdown", "sh": "bash", "rb": "ruby",
     "go": "go", "rs": "rust", "java": "java", "c": "c", "cpp": "cpp", "cs": "csharp",
+}
+
+# 言語識別子 → 主要拡張子 (エディタ出力片のファイル名生成用、best-effort)。
+# `_EXT_LANGUAGE_MAP` の逆引き。未知言語は呼出側で ``txt`` フォールバック。
+_LANGUAGE_EXT_MAP: dict[str, str] = {
+    "python": "py", "javascript": "js", "typescript": "ts",
+    "json": "json", "html": "html", "css": "css", "xml": "xml",
+    "yaml": "yaml", "sql": "sql", "php": "php", "markdown": "md",
+    "bash": "sh", "ruby": "rb", "go": "go", "rust": "rs",
+    "java": "java", "c": "c", "cpp": "cpp", "csharp": "cs",
 }
 
 # クエリ中の言語名キーワード → 言語識別子 (拡張子が無い場合のフォールバック、先頭優先)
@@ -675,6 +686,14 @@ class MetaCognitiveAgent:
         if self._output_target == "chat":
             self._chat_code_parts.append(f"```{language}\n{content}\n```")
             return f"Generated {len(content)} chars (chat)", []
+        if filename is None:
+            # 明示パス由来のファイル名が無い場合、生成内容からアシストモデルで
+            # ASCII snake_case 名を導出する (日本語タブ名を出さないため)。
+            stem = await derive_editor_filename_stem(
+                self._assist_client,
+                content=content, hint=original_query, language=language,
+            )
+            filename = f"{stem}.{_LANGUAGE_EXT_MAP.get(language, 'txt')}"
         self._editor_artifacts.append(
             EditorArtifact(content=content, language=language, filename=filename),
         )

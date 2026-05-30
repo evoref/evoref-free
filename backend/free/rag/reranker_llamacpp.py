@@ -48,8 +48,16 @@ _DEFAULT_QUERY_TEMPLATE = "<Instruct>: {task}\n<Query>: {query}"
 _DEFAULT_MODE = "chat"
 
 # セルフテスト用定数
-_SELFTEST_QUERY = "test query"
-_SELFTEST_DOCS = ["relevant document", "irrelevant document"]
+# セルフテストは明確に識別可能なペアを使う (1 件目が関連・2 件目が無関連)。
+# 退化したリランカー (全候補スコア 0 / 無分散) を起動時に検出するため、
+# 動作する reranker なら 1 件目が高スコアになる質問とドキュメントにする。
+_SELFTEST_QUERY = "How do I read a file in Python?"
+_SELFTEST_DOCS = [
+    "Use the built-in open() function to read a file in Python.",
+    "The weather in Tokyo is sunny with a high of 18 degrees today.",
+]
+# relevance_score がこの値未満なら実質ゼロとみなす (退化スコア判定の閾値)。
+_SELFTEST_SCORE_EPSILON = 1e-6
 
 
 class LlamaCppReranker(BaseHTTPClient):
@@ -365,11 +373,35 @@ class LlamaCppReranker(BaseHTTPClient):
             logger.warning("Reranker selftest exception: %s: %s", type(e).__name__, e)
             return False
         results = data.get("results", [])
-        if results:
-            logger.info(
-                "Reranker selftest passed: %d results, top_score=%.4f",
-                len(results), results[0].get("relevance_score", 0.0),
+        if not results:
+            logger.warning("Reranker selftest: 200 but empty results: %s", data)
+            return False
+
+        scores = [float(r.get("relevance_score", 0.0)) for r in results]
+        max_abs = max(abs(s) for s in scores)
+        if max_abs < _SELFTEST_SCORE_EPSILON:
+            # 全候補が実質ゼロ = ランキング信号ゼロ。Qwen3-Reranker と
+            # llama.cpp --reranking (rank pooling) の流儀不整合などで退化した
+            # ケースに該当する。active のままだと毎クエリ 2-3s を空費して並びを
+            # 一切変えないため、selftest を失敗させ reranker_factory 側で
+            # LazyReranker (no-op + 定期再試行) に倒す。
+            logger.warning(
+                "Reranker selftest: degenerate all-zero scores %s — reranker "
+                "produces no ranking signal; failing selftest to fall back to "
+                "no-op. Check model / --reranking compatibility.",
+                [f"{s:.4f}" for s in scores],
             )
-            return True
-        logger.warning("Reranker selftest: 200 but empty results: %s", data)
-        return False
+            return False
+        if max(scores) - min(scores) < _SELFTEST_SCORE_EPSILON:
+            # 非ゼロだが全候補同値 = 識別力が無い。誤判定回避のため致命扱いには
+            # せず WARNING のみ (弱いテストペアで同値になる可能性を考慮)。
+            logger.warning(
+                "Reranker selftest: scores show no variance %s (weak "
+                "discrimination); leaving active but ranking value is low.",
+                [f"{s:.4f}" for s in scores],
+            )
+        logger.info(
+            "Reranker selftest passed: %d results, top_score=%.4f",
+            len(results), results[0].get("relevance_score", 0.0),
+        )
+        return True

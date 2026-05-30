@@ -669,13 +669,28 @@ class LearningScheduler:
     def _finalize_completed_level1(
         self, session: Level1Session, results: dict,
     ) -> str:
-        """全モード完了時の後処理: 最良 prompt 保存 + state 更新 + session archive."""
+        """全モード完了時の後処理: 最良 prompt 保存 + state 更新 + session archive.
+
+        採用ゲート: fitness が initial を上回った mode のみ update_evolved する。
+        無改善 (final <= initial) で採用すると、目的関数を改善しないまま version を
+        bump し続ける (embed_instruction 系の採用パスと挙動を揃える)。
+        """
         for mode, result in results.items():
+            if result.final_fitness <= result.initial_fitness:
+                logger.info(
+                    "Level 1 %s: no adoption (fitness %.4f → %.4f, no improvement)",
+                    mode, result.initial_fitness, result.final_fitness,
+                )
+                continue
             try:
                 self.prompt_manager.update_evolved(
                     mode,
                     result.best_candidate.text,
                     result.final_fitness,
+                )
+                logger.info(
+                    "Level 1 %s: adopted evolved prompt (fitness %.4f → %.4f)",
+                    mode, result.initial_fitness, result.final_fitness,
                 )
             except Exception as e:  # noqa: BLE001 — 個別 mode 失敗は警告して継続
                 logger.warning("Failed to save prompt for %s: %s", mode, e)

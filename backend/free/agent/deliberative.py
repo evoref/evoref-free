@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from backend.free.agent.agent_state import AgentState
 from backend.free.agent.event_reminder import EventReminderSystem
 from backend.free.agent.meta_cognitive_utils import (
+    command_run_failed,
     is_tool_error,
     strip_markdown_wrapper,
 )
@@ -216,6 +217,11 @@ class DeliberativeAgent:
             messages, judgement.tool_name, tool_result_text,
         )
         success = not is_tool_error(tool_result_text)
+        # run_command は走ったが非ゼロ終了したケース (SyntaxError 等) を
+        # is_tool_error が拾えない。exit code マーカーで失敗を反映し、
+        # 誤った success が executable_command の SemMem 学習を汚染するのを防ぐ。
+        if success and judgement.tool_name == "run_command":
+            success = not command_run_failed(tool_result_text)
         logger.info(
             "Tool executed: %s, result_length=%d, source=%s, success=%s",
             judgement.tool_name, len(tool_result_text), judgement.source,

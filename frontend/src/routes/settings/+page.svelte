@@ -15,6 +15,7 @@
 	import EditorSettings from '$lib/free/components/settings/EditorSettings.svelte';
 	import ModeGenerationSettings from '$lib/free/components/settings/ModeGenerationSettings.svelte';
 	import PromptSettings from '$lib/free/components/settings/PromptSettings.svelte';
+	import DeveloperSettings from '$lib/free/components/settings/DeveloperSettings.svelte';
 	import { loadConfig, activeTab, configLoaded, configLoadError } from '$lib/free/stores/settings';
 
 	/** タブID → コンポーネントのレジストリ
@@ -31,7 +32,8 @@
 		integration: IntegrationSettings,
 		generation: ModeGenerationSettings,
 		editor: EditorSettings,
-		prompts: PromptSettings
+		prompts: PromptSettings,
+		develop: DeveloperSettings
 	};
 
 	onMount(() => {
