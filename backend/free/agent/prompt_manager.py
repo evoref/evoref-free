@@ -87,6 +87,7 @@ DEFAULT_PROMPTS: dict[str, dict[str, str]] = {
 ## 制約
 - 回答は日本語で行う
 - 技術的な話題では正確性を最優先する
+- 天気・ニュース・株価・スポーツの最新結果など最新の外部データを要する質問では、実際に取得できたデータが無い場合に具体的な数値や事実を創作しない。取得できなかった旨と確認方法を正直に伝える
 
 ## 出力形式
 - 回答のみを出力する
@@ -140,6 +141,7 @@ You are a friendly and intelligent assistant.
 ## Constraints
 - Respond in English
 - Prioritize accuracy for technical topics
+- For questions needing up-to-date external data (weather, news, stock prices, latest sports results), do not invent specific numbers or facts when no actually-retrieved data is available; honestly state that it could not be retrieved and how to verify it
 
 ## Output Format
 - Output only the response

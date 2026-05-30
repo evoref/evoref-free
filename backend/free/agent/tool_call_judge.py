@@ -8,10 +8,12 @@
 from __future__ import annotations
 
 import re
+import shlex
 import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from backend.free.agent.reactive import GREETING_RESPONSES
@@ -27,6 +29,59 @@ if TYPE_CHECKING:
     from backend.free.rag.embedding_backend import EmbeddingBackend
 
 logger = get_logger("agent.tool_call_judge")
+
+# executable_command_synth が合成したコマンドの事後検証用。
+# synth プロンプトは「環境依存事実のみ・副作用/ネットワーク送信なし」を要求するが、
+# アシストがこれを破ってネットワークコマンドや構文エラーの python -c を返すため、
+# コード側で enforce する (壊れたコマンドの実行・ユーザ露出・誤 success 学習の防止)。
+_NETWORK_EGRESS_MARKERS = (
+    "http://", "https://",
+    "import requests", "requests.",
+    "import urllib", "urllib.request",
+    "import httpx", "httpx.",
+    "import socket", "socket.socket",
+    "curl ", "wget ",
+)
+
+
+def _extract_python_c_payload(command: str) -> str | None:
+    """``python -c <code>`` 形式ならその ``<code>`` を返す。それ以外は ``None``。"""
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    base = Path(tokens[0]).name.lower()
+    if not (base.startswith("python") or base in {"py", "py.exe"}):
+        return None
+    for i, tok in enumerate(tokens[:-1]):
+        if tok == "-c":
+            return tokens[i + 1]
+    return None
+
+
+def _reject_synthesized_command(command: str) -> str | None:
+    """合成 executable command が synth プロンプトのスコープを逸脱していれば理由を返す。
+
+    1. ネットワーク送信 (requests / urllib / httpx / socket / http(s):// /
+       curl / wget) を含む → synth プロンプトの「ネットワーク送信なし」違反。
+    2. ``python -c`` ペイロードが構文エラー → compile() で検出。
+
+    問題なければ ``None``。呼出側は ``None`` 以外なら is_executable=False に降格する。
+    """
+    lowered = command.lower()
+    for marker in _NETWORK_EGRESS_MARKERS:
+        if marker in lowered:
+            return f"network egress not allowed (matched {marker!r})"
+    payload = _extract_python_c_payload(command)
+    if payload is not None:
+        try:
+            compile(payload, "<synthesized-command>", "exec")
+        except SyntaxError as e:
+            return f"python -c payload has SyntaxError: {e.msg}"
+    return None
+
 
 # ルールベースフォールバック用パターン
 # 注意: 「検索」等の汎用語は知識質問にもマッチするため、
@@ -1062,10 +1117,20 @@ class ToolCallJudge:
         command = str(data.get("command", "")).strip()
         # is_executable=True と主張するが command が空のケースは
         # 「コマンド合成失敗」とみなして False に降格する。
-        if is_executable and not command:
+        if not is_executable or not command:
             value = (False, "")
         else:
-            value = (is_executable, command if is_executable else "")
+            # synth プロンプトのスコープ (ネットワーク送信なし・構文妥当) を
+            # コード側で enforce。逸脱コマンドは実行させず False に降格する。
+            reject = _reject_synthesized_command(command)
+            if reject is not None:
+                logger.warning(
+                    "executable_command_synth rejected command (%s): %s",
+                    reject, command[:120],
+                )
+                value = (False, "")
+            else:
+                value = (True, command)
         self._command_cache_store(query, value)
         return value
 

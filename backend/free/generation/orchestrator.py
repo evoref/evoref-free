@@ -314,9 +314,34 @@ class LongFormOrchestrator:
 
         total_tokens = 0
         units_completed = 0
+        # 長文生成 1 リクエストの総ウォールクロック上限 (低速ローカル GPU での
+        # 無限ハング防止)。0 で無効。超過時はユニット境界で打ち切り部分結果を返す。
+        total_timeout = float(
+            self.config.get("long_form", {}).get("total_timeout_sec", 1800.0) or 0.0
+        )
+        timed_out = False
 
         for i, unit in enumerate(plan.units):
             rolling.current_unit_idx = i
+
+            # 総時間上限チェック (ユニット境界で判定し、生成済みで打ち切る)
+            if total_timeout and (time.monotonic() - t_start) > total_timeout:
+                timed_out = True
+                logger.warning(
+                    "long_form: total budget %.0fs exceeded after %d/%d units; "
+                    "stopping with partial result",
+                    total_timeout, units_completed, len(plan.units),
+                )
+                if on_step:
+                    _call_step(on_step, {
+                        "type": "long_form_unit_done",
+                        "detail": (
+                            f"総時間 {total_timeout:.0f}s 超過のため "
+                            f"{units_completed}/{len(plan.units)} ユニットで打ち切り"
+                        ),
+                        "status": "done",
+                    })
+                break
 
             label = unit.name if isinstance(unit, CodeUnit) else unit.heading
             if on_step:
@@ -380,18 +405,21 @@ class LongFormOrchestrator:
                     "elapsed_sec": round(time.monotonic() - t_start, 3),
                 })
 
-        # 7. ポスト生成: 目標文字数エンフォースメント
-        async for token in self._extend_to_target(
-            rolling, instruction, content_type, on_step,
-        ):
-            total_tokens += 1
-            yield token
+        # 7-8. ポスト生成 (目標文字数エンフォース) + レビュー/リライト。
+        # 総時間超過で打ち切った場合は省略し、生成済みユニットをそのまま確定する。
+        if not timed_out:
+            # 7. ポスト生成: 目標文字数エンフォースメント
+            async for token in self._extend_to_target(
+                rolling, instruction, content_type, on_step,
+            ):
+                total_tokens += 1
+                yield token
 
-        # 8. レビュー & リライト (CogWriter のみ)
-        async for token in self._apply_review_revisions(
-            rolling, content_type, on_step,
-        ):
-            yield token
+            # 8. レビュー & リライト (CogWriter のみ)
+            async for token in self._apply_review_revisions(
+                rolling, content_type, on_step,
+            ):
+                yield token
 
         # 9. コード検証
         validation_errors, _warning_count = self._validate_generated_code(

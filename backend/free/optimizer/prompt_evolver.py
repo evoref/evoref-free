@@ -166,28 +166,33 @@ class PromptEvolver:
 
         base_score = (score / total_weight + 1) / 2
 
-        # プロンプト候補の特徴によるボーナス/ペナルティ
-        # （同一経験でも異なるプロンプトが異なる fitness を持つようにする）
+        # プロンプト候補の特徴によるボーナス/ペナルティ。
+        # 1 回の進化ランでは experiences が固定なので base_score は全候補で同一に
+        # なる。候補テキスト由来の差分をここで与えないと全候補が同 fitness に潰れ、
+        # _run_one_generation の strict > 置換が一度も発火せず進化が no-op 化する
+        # (initial==final が 10 世代続く)。base_score を支配項に保ちつつ、候補間を
+        # 識別できる有界な重みを与えて選択圧を回復する (重みは base_score を覆さない)。
         candidate_lower = candidate.lower()
         bonus = 0.0
 
-        # 失敗パターンに対応するキーワードが含まれていればボーナス
+        # 失敗した経験のクエリ主要語を、その候補がどれだけカバーしているか
+        # (カバー率)。候補ごとに値が変わるため候補間識別の主因。最大 +0.1。
+        failure_keywords: set[str] = set()
         for exp in experiences:
             signals = exp.get("signals", {})
             if signals.get("rephrased_query") or signals.get("user_correction"):
-                query = exp.get("query", "").lower()
-                # プロンプトにクエリの主要語が含まれていればわずかにボーナス
-                words = [w for w in query.split() if len(w) >= 3]
-                for w in words[:3]:
-                    if w in candidate_lower:
-                        bonus += 0.005
+                query = str(exp.get("query", "")).lower()
+                failure_keywords.update(w for w in query.split() if len(w) >= 3)
+        if failure_keywords:
+            covered = sum(1 for w in failure_keywords if w in candidate_lower)
+            bonus += 0.1 * (covered / len(failure_keywords))
 
         # プロンプト長の適切さ（短すぎず長すぎない）
         prompt_len = len(candidate)
         if prompt_len < 50:
-            bonus -= 0.02
+            bonus -= 0.05
         elif prompt_len > 2000:
-            bonus -= 0.01
+            bonus -= 0.02
 
         raw = base_score + bonus
         return max(0.0, min(1.0, raw))

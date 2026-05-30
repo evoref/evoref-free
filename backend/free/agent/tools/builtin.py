@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import ast
+import locale
 import os
 import re
 import socket
 import subprocess
+import sys
 from ipaddress import ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -28,8 +30,8 @@ logger = get_logger("agent.tools.builtin")
 _last_full_output: str = ""
 _last_full_output_lines: int = 0
 
-# 出力切り詰めマーカー（共通定数モジュールから import）
-from backend.free.constants import TRUNCATION_MARKER
+# 出力切り詰めマーカー / exit code マーカー（共通定数モジュールから import）
+from backend.free.constants import COMMAND_EXIT_CODE_PREFIX, TRUNCATION_MARKER
 
 # 安全な計算用に許可するノード
 _SAFE_NODES = {
@@ -266,6 +268,30 @@ def _mkdir_safe(dir_path: str) -> str:
         return f"Error: {e}"
 
 
+def _decode_subprocess_output(raw: bytes) -> str:
+    """子プロセス出力をロケール依存で安全にデコードする。
+
+    Windows の子プロセス (cmd / git / python 等) は OEM コードページ
+    (日本語環境では cp932) で出力するため、utf-8 固定 decode では日本語が
+    mojibake 化する。OEM/mbcs → ロケール推奨エンコーディング → utf-8(replace)
+    の順でフォールバックする (cli/pid_manager._decode_windows_console_output と同方針)。
+    """
+    if not raw:
+        return ""
+    candidates: list[str] = []
+    if sys.platform == "win32":
+        candidates.extend(["oem", "mbcs"])
+    pref = locale.getpreferredencoding(False)
+    if pref and pref.lower() not in {c.lower() for c in candidates}:
+        candidates.append(pref)
+    for enc in candidates:
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 async def _run_command_async_impl(cmd: str, timeout: int = 30) -> str:
     """シェルコマンドの非同期実行本体
 
@@ -305,11 +331,11 @@ async def _run_command_async_impl(cmd: str, timeout: int = 30) -> str:
                 "It was left running in the background."
             )
 
-        output = stdout_bytes.decode("utf-8", errors="replace")
+        output = _decode_subprocess_output(stdout_bytes)
         if stderr_bytes:
-            output += f"\n[stderr] {stderr_bytes.decode('utf-8', errors='replace')}"
+            output += f"\n[stderr] {_decode_subprocess_output(stderr_bytes)}"
         if proc.returncode != 0:
-            output += f"\n[exit code: {proc.returncode}]"
+            output += f"\n{COMMAND_EXIT_CODE_PREFIX} {proc.returncode}]"
         # 出力を切り詰め（設計書 09 §9.5.3: 200行超で先頭100行+末尾100行）
         lines = output.splitlines()
         if len(lines) > 200:

@@ -38,6 +38,7 @@ from backend.free.core.stream_filter import (
 )
 from backend.free.core.stream_pipeline import StreamPipeline
 from backend.free.llm.local_client import LocalClient
+from backend.free.llm.editor_filename import derive_editor_filename_stem
 from backend.free.generation.orchestrator import LongFormOrchestrator
 from backend.free.generation.validators import remove_code_fences
 from backend.utils import estimate_tokens as _estimate_tokens, utc_compact_stamp
@@ -200,12 +201,6 @@ def clean_generated_text(text: str) -> str:
 # file 経路の clean_generated_text とは異なり markdown 見出しは保持する。
 _EDITOR_BLANK_LINE_RE = re.compile(r"\n\s*\n+")
 
-# エディタ出力用 ファイル名 sanitize: Windows 禁則文字 + 制御文字を `_` 化。
-_FILENAME_SANITIZE_RE = re.compile(r'[\\/:*?"<>|\r\n\t]+')
-
-# 本文先頭から markdown 見出しを 1 つ取る (1 行マッチ)。
-_HEADING_LINE_PICK_RE = re.compile(r"^#{1,6}\s+(.+?)\s*$")
-
 
 def _normalize_editor_text(text: str) -> str:
     """エディタ出力用に空行を完全除去し前後空白を整える。
@@ -215,51 +210,6 @@ def _normalize_editor_text(text: str) -> str:
     エディタ経路では markdown 段落構造より「行を詰める」見え方を優先する。
     """
     return _EDITOR_BLANK_LINE_RE.sub("\n", text).strip()
-
-
-def _sanitize_filename_stem(stem: str, max_len: int = 50) -> str:
-    """ファイル名 (拡張子無し) を Windows 互換に sanitize する。"""
-    cleaned = _FILENAME_SANITIZE_RE.sub("_", stem)
-    cleaned = cleaned.strip(" ._")
-    if len(cleaned) > max_len:
-        cleaned = cleaned[:max_len].rstrip(" ._")
-    return cleaned
-
-
-def _extract_first_heading(text: str, max_lines: int = 5) -> str:
-    """本文先頭の最大 ``max_lines`` 行から markdown 見出しを 1 つ取り出す。
-
-    空行はスキップする。見出しが見つからなければ空文字を返す。
-    """
-    for line in text.splitlines()[:max_lines]:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        m = _HEADING_LINE_PICK_RE.match(stripped)
-        if m:
-            return m.group(1).strip()
-    return ""
-
-
-def _suggest_editor_filename(text: str, query: str, ext: str) -> str:
-    """エディタ出力用のファイル名を本文先頭見出し → query → タイムスタンプの順で推定する。
-
-    Args:
-        text: 生成本文 (見出し抽出に使う。正規化前/後いずれでも見出しは保持される)
-        query: ユーザー指示文 (本文に見出しが無い場合のフォールバック)
-        ext: 拡張子 (先頭ドット付き、例 ``.md``)
-    """
-    heading = _extract_first_heading(text)
-    if heading:
-        stem = _sanitize_filename_stem(heading)
-        if stem:
-            return f"{stem}{ext}"
-    q = (query or "").strip()
-    if q:
-        stem = _sanitize_filename_stem(q[:30])
-        if stem:
-            return f"{stem}{ext}"
-    return f"long_form_{utc_compact_stamp()}{ext}"
 
 
 # Markdown 出力意図を示すヒント。``md 形式`` / ``.md ファイル`` / ``markdown`` 等。
@@ -1023,6 +973,25 @@ async def _finalize_long_form_stream(
         private=private,
     )
 
+    # 構文エラーを含むコードがエディタ/ディスクへそのまま出力されると、
+    # ユーザは破損に気づけない (validate は事後計測でブロックしない)。
+    # validation_errors > 0 のときは警告ステップを surface して認識させる。
+    validation_errors = int(metrics.get("validation_errors", 0) or 0)
+    if validation_errors > 0:
+        logger.warning(
+            "Long-form output has %d validation error(s) (session=%s); "
+            "surfacing warning to user",
+            validation_errors, session_id,
+        )
+        yield sse.step({
+            "type": "task_result",
+            "detail": (
+                f"⚠ 生成コードに構文エラーが {validation_errors} 件検出されました。"
+                "そのまま実行する前に内容を確認してください。"
+            ),
+            "status": "failed",
+        })
+
     if output_target == "editor":
         # エディタ経路: ディスクには書込みせず生成本文を editor_code フレームで送出。
         # SPLIT モードでもエディタ送出を優先 (per-unit ファイルは on_step 側で完了済み)。
@@ -1032,8 +1001,12 @@ async def _finalize_long_form_stream(
         body = remove_code_fences(state.full_response) if is_code else state.full_response
         # 空行を含む連続改行を単一 \n に圧縮 (markdown 見出しは保持)。
         editor_text = _normalize_editor_text(body)
-        # 本文先頭の見出し → query → タイムスタンプ の優先順で命名。
-        filename = _suggest_editor_filename(body, query, ext)
+        # 生成内容からアシストモデルで ASCII snake_case のファイル名を導出する
+        # (日本語見出しをそのまま流用するとタブ名が日本語化するため)。
+        stem = await derive_editor_filename_stem(
+            sess_state.assist_client, content=body, hint=query, language=language,
+        )
+        filename = f"{stem}{ext}"
         yield sse.editor_code(
             editor_text, language=language, filename=filename,
         )

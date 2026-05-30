@@ -21,3 +21,4 @@ export * from './lora';
 export * from './memory';
 export * from './model';
 export * from './loop';
+export * from './develop';
