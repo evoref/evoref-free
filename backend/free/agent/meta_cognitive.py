@@ -509,6 +509,13 @@ class MetaCognitiveAgent:
         prompt = f"{PLAN_SYSTEM_PROMPT}\n\n{user_content}"
 
         try:
+            # 二重 timeout の意図: 内側の assist realtime 経路が
+            # PURPOSE_TIMEOUT_DEFAULTS["meta_cognitive_plan"]=30s を
+            # asyncio.timeout で総予算強制するため、realtime 運用では実効上限は
+            # 内側 30s 側。外側 wait_for(=_llm_call_timeout, 既定 90s) は
+            # (a) config timeouts.meta_cognitive_plan を 90s 超に上書きした場合、
+            # または (b) 将来 priority が realtime 以外へ退化し内側 asyncio.timeout
+            # が nullcontext 化した場合に、計画生成の総時間を保証する保険。
             data = await asyncio.wait_for(
                 self._assist_client.generate_json(
                     prompt,

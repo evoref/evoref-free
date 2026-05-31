@@ -15,7 +15,7 @@ class ModelPathsConfig(BaseModel):
     base_model: str = "models/qwen3.5-4b-q4_k_m.gguf"
     assist_model: str = "models/Qwen3.5-4B-Q4_K_M.gguf"
     embed_model: str = "models/Qwen3-Embedding-0.6B-Q8_0.gguf"
-    reranker_model: str = "models/Qwen3-Reranker-4B.Q5_K_M.gguf"
+    reranker_model: str = "models/Qwen3-Reranker-0.6B.Q8_0.gguf"
     coding_model: str | None = Field(
         default=None,
         description="コーディングモード用 GGUF パス。未指定 (None / 空文字列) の場合は base_model にフォールバック",

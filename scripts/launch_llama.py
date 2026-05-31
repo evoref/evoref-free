@@ -540,6 +540,12 @@ def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | 
         "-ngl", str(_resolve_embed_gpu_layers(cfg)),
     ]
 
+    # 文脈長。モデル既定 n_ctx (Qwen3-Embedding=32768) は過剰なので
+    # embedding.context_size (既定 8192 = max_length) に縮小して KV を節約する。
+    # max_length を下回ると長い入力で 500 になるため context_size >= max_length を維持する。
+    context_size = emb_cfg.get("context_size", 8192)
+    cmd += ["-c", str(context_size)]
+
     # エンベッド LoRA アダプタ（存在する場合のみ）
     embed_lora = lp.get("embed_lora_adapter", "local/models/embed_adapter.gguf")
     embed_lora_path = Path(embed_lora)

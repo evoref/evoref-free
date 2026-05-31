@@ -220,7 +220,7 @@ model_paths:
   base_model: models/Qwen3.5-9B-Q4_K_M.gguf         # ベース GGUF モデル（download_model.py が自動配置）
   assist_model: models/Qwen3.5-4B-Q4_K_M.gguf       # アシスト GGUF モデル（メモリ・RAG処理用）
   embed_model: models/Qwen3-Embedding-0.6B-Q8_0.gguf # 埋め込み用 GGUF モデル（llama-cpp バックエンド用）
-  reranker_model: models/Qwen3-Reranker-4B.Q5_K_M.gguf  # リランカー用 GGUF モデル（Qwen3-Reranker-4B、instruction-aware）
+  reranker_model: models/Qwen3-Reranker-0.6B.Q8_0.gguf  # リランカー用 GGUF モデル（Qwen3-Reranker-0.6B、instruction-aware。llama.cpp rerank 対応の正変換版）
   coding_model: null                                 # コーディングモード用 GGUF（null/空欄 = base_model にフォールバック）
 
 # ===== ベースモデル移行 / 起動時整合性チェック =====
@@ -407,6 +407,10 @@ embedding:
   timeout: 30.0                    # 埋め込みリクエストのタイムアウト（秒）
   model_name: Qwen/Qwen3-Embedding-0.6B       # HuggingFace モデル名
   max_length: 8192                # 入力最大トークン長
+  # 文脈長 (-c)。必ず max_length 以上にすること (下回ると長入力で 500)。
+  # モデル既定 n_ctx=32768 は過剰なので max_length に合わせて縮小し KV を節約する
+  # (実測 0.6B で active WorkingSet 7.5GB→4.2GB、速度・次元は同等)。
+  context_size: 8192
   # 埋め込みモデルの GPU オフロード層数
   # null は CPU フォールバック (-ngl 0) が既定。GPU に載せたい場合は
   # 明示的に 999 等を指定する。ベースモデルの llama.gpu_layers には追従しない。
@@ -454,7 +458,7 @@ reranker:
   backend: llama-cpp              # バックエンド: llama-cpp
   host: localhost
   port: 8083                      # リランカー用 llama-server のポート
-  model_name: Qwen/Qwen3-Reranker-4B  # モデル識別名（Qwen3-Reranker-4B、instruction-aware）
+  model_name: Qwen/Qwen3-Reranker-0.6B  # モデル識別名（Qwen3-Reranker-0.6B、instruction-aware）
   timeout: 30.0                   # タイムアウト（秒）
   candidates_multiplier: 3        # リランカーに渡す候補数の倍率（top_k × N）
   # リランカーの GPU オフロード層数
@@ -468,13 +472,13 @@ reranker:
   rerank_candidate_cap: 15
   # 物理バッチサイズ。query + doc の入力トークン数を超える値が必要。
   # 既定の rag.chunk_size=512 / max_doc_chars=4096 文字 (~1500 tok) 構成では
-  # 4096 で十分。rag.chunk_size を大きく取る (例: benchmark で 2048+ tok) 場合
-  # のみ 8192 へ。batch < 入力トークン数だとリランクが 500 で全滅する
-  # (#reranker-500) ので注意。
+  # 2048 で十分 (rag.chunk_size=512、max_doc_chars 4096字≈≤1600tok < 2048)。
+  # rag.chunk_size を大きく取る場合のみ 4096/8192 へ。batch < 入力トークン数だと
+  # リランクが 500 で全滅する (#reranker-500) ので、必ず最大入力 tok 以上を保つ。
   # 注意: ggml-vulkan の pinned memory warning は batch_size とは独立に出る
   # (embedding 側コメント参照)。batch_size 調整では消えないが動作上は問題なし。
-  batch_size: 4096
-  ubatch_size: 4096
+  batch_size: 2048
+  ubatch_size: 2048
   # 1 ペア (query + doc) のドキュメント側文字数上限。リランカーモデルの
   # n_ctx を超えて 500 エラーになるのを防止する。0 でトランケーション無効。
   max_doc_chars: 4096
@@ -492,8 +496,12 @@ reranker:
   # offload の恩恵が薄く、長時間運用時のキャッシュ破損リスクを排除するため
   # 0 で明示 disable する (従来の ``--cache-ram 0`` ハードコードを config 駆動化)。
   cache_ram_mib: 0
-  # llama-server 起動時の追加引数（リランカー用）
-  extra_args: []
+  # llama-server 起動時の追加引数（リランカー用）。
+  # -c 4096: リランクに必要な文脈へ縮小する。llama-server 既定の n_ctx=40960 は
+  # rerank (query+doc 1 ペア / 生成なし) には過剰で、KV キャッシュを無駄に確保する。
+  # 4096 へ縮めると WorkingSet が大幅減 (実測 0.6B で 6.9GB→2.2GB、速度・スコア同等)。
+  # max_doc_chars を増やす場合は -c もそれ以上に保つこと。
+  extra_args: ["-c", "4096"]
   # instruction-aware リランカー (Qwen3 等) 用の mode 別 task description。
   instructions:
     chat: "Given a user question, retrieve relevant passages that answer the query"
@@ -852,8 +860,8 @@ assist_model:
   # リクエストがキュー待ちしないようにする。purpose → priority の対応は
   # AssistModelClient._PURPOSE_PRIORITY_MAP を参照。
   concurrency:
-    realtime: 1                    # self_rag_judge / tool_judgment / conflict_resolution
-    background: 1                  # contextual_prefix / long_form / ralph_loop / note_evolution
+    realtime: 1                    # self_rag_judge / tool_judgment / meta_cognitive_plan
+    background: 1                  # contextual_prefix / long_form / ralph_loop / note_evolution / conflict_resolution
     learning: 1                    # critique_synthesis / policy_evolution / spsa
   # JSON 応答 purpose に GBNF/json_schema 制約サンプリングを適用するか
   # true: OAI 互換 ``response_format: {"type": "json_schema", ...}`` を /v1/chat/completions

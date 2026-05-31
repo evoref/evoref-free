@@ -31,8 +31,11 @@ ASSIST_MODEL = {
 }
 
 RERANKER_MODEL = {
-    "repo": "mradermacher/Qwen3-Reranker-4B-GGUF",
-    "file": "Qwen3-Reranker-4B.Q5_K_M.gguf",
+    # llama.cpp の /v1/rerank (--reranking, rank pooling) 対応の正変換版。
+    # 汎用コンバータ版 (mradermacher 等) は cls.output.weight 分類ヘッドが
+    # 欠落し全候補が ~1e-22 の退化スコアになるため使用しない。
+    "repo": "Voodisss/Qwen3-Reranker-0.6B-GGUF-llama_cpp",
+    "file": "Qwen3-Reranker-0.6B.Q8_0.gguf",
     "dest": "models",
 }
 

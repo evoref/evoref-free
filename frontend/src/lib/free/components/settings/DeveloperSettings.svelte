@@ -181,7 +181,7 @@
 	}
 	.btn-danger {
 		background: var(--color-error);
-		color: #fff;
+		color: var(--text-on-accent);
 		border: none;
 		border-radius: 6px;
 		padding: 8px 16px;
