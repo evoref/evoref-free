@@ -253,6 +253,12 @@ class EmbeddingConfig(BaseModel):
     dim: int = Field(default=1024, ge=1)
     timeout: float = Field(default=30.0, ge=0.1)
     max_length: int = Field(default=8192, ge=1)
+    # 文脈長 (llama-server ``-c``)。埋め込みは max_length トークンまでの入力を
+    # 扱うため、必ず max_length 以上にすること (下回ると長い入力で 500)。モデル
+    # 既定 n_ctx (例: Qwen3-Embedding-0.6B=32768) は過剰で KV を浪費するため、
+    # max_length に合わせて縮小する (実測 0.6B で active WorkingSet 7.5GB→4.3GB、
+    # 速度・次元は同等)。
+    context_size: int = Field(default=8192, ge=1)
     # 共通
     model_name: str = "qwen3-embedding"
     # Qwen3-Embedding 系の instruction-aware プレフィックス
@@ -345,7 +351,7 @@ class RerankerConfig(BaseModel):
     backend: str = Field(default="llama-cpp", pattern=r"^(llama-cpp)$")
     host: str = "localhost"
     port: int = Field(default=8083, ge=1024, le=65535)
-    model_name: str = "reranker"
+    model_name: str = "Qwen/Qwen3-Reranker-0.6B"
     timeout: float = Field(default=30.0, ge=0.1)
     candidates_multiplier: int = Field(default=3, ge=1, le=10)
     # GPU オフロード層数
@@ -353,9 +359,11 @@ class RerankerConfig(BaseModel):
     # ベースモデルの ``llama.gpu_layers`` には追従せず、GPU 割り当ては opt-in。
     gpu_layers: int | None = Field(default=None, ge=-1)
     # 物理バッチサイズ。rag.chunk_size + クエリ + 特殊トークンを収容できる値にする。
-    # llama-server デフォルト 512 のままだと chunk_size=512 のドキュメントで 500 エラーになる。
-    batch_size: int | None = Field(default=None, ge=1)
-    ubatch_size: int | None = Field(default=None, ge=1)
+    # 既定 2048 は chunk_size=512 / max_doc_chars=4096字(≈≤1600tok) を収容しつつ
+    # compute buffer を抑える。None で llama-server デフォルト(512)に委譲するが、
+    # 512 のままだと長い入力で 500 エラーになるため明示値を推奨。
+    batch_size: int | None = Field(default=2048, ge=1)
+    ubatch_size: int | None = Field(default=2048, ge=1)
     # リランカー入力候補の上限。None の場合は top_k * candidates_multiplier を使用
     rerank_candidate_cap: int | None = Field(default=None, ge=1)
     # ドキュメントトランケーション上限 (文字数)。1 ペア (query + doc) が
@@ -376,8 +384,12 @@ class RerankerConfig(BaseModel):
     # するため 0 で明示 disable する (従来の ``--cache-ram 0`` ハードコードを
     # config 駆動化)。
     cache_ram_mib: int = Field(default=0, ge=-1)
-    # llama-server 起動時の追加引数
-    extra_args: list[str] = Field(default_factory=list)
+    # llama-server 起動時の追加引数。
+    # 既定の ["-c", "4096"] は rerank に必要な文脈へ n_ctx を縮小する。
+    # llama-server 既定 n_ctx=40960 は query+doc 1 ペア (生成なし) には過剰で
+    # KV キャッシュを浪費するため、4096 へ縮小して WorkingSet を大幅削減する
+    # (実測 0.6B で 6.9GB→2.2GB、速度・スコアは同等)。
+    extra_args: list[str] = Field(default_factory=lambda: ["-c", "4096"])
     # Qwen3-Reranker 系の instruction-aware フォーマット
     # ``rerank()`` 呼出時に ``query_template`` でクエリを整形してから
     # llama-server ``/v1/rerank`` に送る。``mode`` は ``chat`` / ``coding`` のいずれか。

@@ -64,7 +64,6 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     # executable query (環境依存事実) のコマンド合成。チャット応答パスで
     # tool_call_judge から同期発火するため realtime。
     "executable_command_synth": "realtime",
-    "conflict_resolution": "realtime",
     # meta-cognitive 計画は coding mode のチャット応答パスで
     # 同期発火する (タスク分解後に他のエージェントが実行される) ため
     # realtime に分類する。
@@ -74,6 +73,12 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     # 待つ。max_tokens 数十・budget 0 の極短呼出なので realtime に乗せる。
     "editor_filename": "realtime",
     # background — Sleep-time / 自律ループ / 長文生成
+    # conflict_resolution は SleepTimeWorker._step6_resolve_conflicts (run_full)
+    # からのみ発火する sleep-time 専用処理。チャット応答パスから同期発火しない
+    # ため background。realtime セマフォ (concurrency=1) を Full サイクル中の
+    # ノートマージで専有し、チャット判定 (tool_judgment 等) をブロックしないよう
+    # background スロットに乗せる。
+    "conflict_resolution": "background",
     "contextual_prefix": "background",
     "long_form_planning": "background",
     "long_form_code_review": "background",
