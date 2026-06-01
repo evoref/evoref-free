@@ -191,6 +191,8 @@
 		"tab_generation": "Generation",
 		"tab_develop": "Develop",
 		"develop": {
+			"server_title": "Server control",
+			"server_hint": "Start/stop the base / assist / embedding / reranker servers and view their memory usage.",
 			"title": "Danger Zone",
 			"description": "Developer-only maintenance actions. These are destructive and only available in the Develop edition.",
 			"reset_title": "Reset local data",

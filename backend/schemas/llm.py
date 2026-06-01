@@ -115,4 +115,8 @@ class LlamaConfig(BaseModel):
     kv_unified: bool | None = None
     # self-speculative decoding。Pro 限定機能
     speculative: LlamaSpeculativeConfig = Field(default_factory=LlamaSpeculativeConfig)
+    # モデル arch 別の起動フラグ / sampling 自動決定。true で GGUF メタデータ +
+    # 同梱 model_profiles から --jinja / --reasoning-format / MoE / sampling 既定を
+    # 解決する (base / assist 共通)。false で全機構 OFF (従来挙動)。
+    auto_model_flags: bool = True
     extra_args: list[str] = Field(default_factory=list)

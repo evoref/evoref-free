@@ -217,6 +217,71 @@ def save_config_section(section: str, data: dict) -> dict:
     return validated
 
 
+# モデル arch プロファイルの sampling 既定キャッシュ。((絶対パス, mtime_ns) -> dict)
+# GGUF ヘッダ読取を毎回走らせないため。モデル差し替えで mtime が変わり自動 miss する。
+_profile_sampling_cache: dict[tuple[str, int], dict] = {}
+
+# プロファイル sampling として採用する既知キー
+_PROFILE_SAMPLING_KEYS = (
+    "temperature", "top_p", "top_k", "presence_penalty", "repetition_penalty",
+)
+
+
+def _resolve_profile_sampling_for_mode(cfg: dict, mode: str) -> dict:
+    """アクティブモデルの arch プロファイルから sampling 既定を解決する。
+
+    ``llama.auto_model_flags`` が false / GGUF 読取失敗 / arch 不明 / プロファイル
+    不在のときは ``{}`` を返す。結果は (絶対パス, mtime) でキャッシュする。
+    起動フラグ側 (scripts/launch_llama.py) と同じ GGUF reader / プロファイル
+    ローダを流用し、SSOT を一本化する。
+    """
+    if not (cfg.get("llama", {}) or {}).get("auto_model_flags", True):
+        return {}
+
+    model_paths = cfg.get("model_paths", {})
+    base_model = model_paths.get("base_model", "")
+    if mode == "coding":
+        model_rel = model_paths.get("coding_model") or base_model
+    else:
+        model_rel = base_model
+    if not model_rel:
+        return {}
+
+    project_root = get_project_root()
+    model_path = Path(model_rel)
+    if not model_path.is_absolute():
+        model_path = project_root / model_path
+
+    try:
+        mtime = model_path.stat().st_mtime_ns
+    except OSError:
+        return {}
+
+    cache_key = (str(model_path), mtime)
+    if cache_key in _profile_sampling_cache:
+        return _profile_sampling_cache[cache_key]
+
+    sampling: dict = {}
+    try:
+        from scripts.launch_llama import load_model_profile, read_gguf_metadata
+
+        meta = read_gguf_metadata(model_path)
+        profile = load_model_profile(meta.get("architecture"), project_root)
+        raw = profile.get("sampling") or {}
+        if isinstance(raw, dict):
+            sampling = {
+                k: v
+                for k, v in raw.items()
+                if k in _PROFILE_SAMPLING_KEYS and v is not None
+            }
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Profile sampling resolution failed for mode %s: %s", mode, e)
+        sampling = {}
+
+    _profile_sampling_cache[cache_key] = sampling
+    return sampling
+
+
 def get_mode_generation_params(mode: str) -> dict:
     """指定モードの生成パラメータを取得
 
@@ -257,7 +322,12 @@ def get_mode_generation_params(mode: str) -> dict:
     mode_cfg = dict(modes_cfg.get(mode, {}))
     # 生成パラメータのみを採用 (model はここには存在しない)
     mode_cfg.pop("model", None)
-    params = {**defaults[mode], **mode_cfg}
+    # モデル arch プロファイルの sampling 既定を、汎用 modes.* より優先で適用する
+    # (モデル切替時にモデル推奨値を自動反映する目的)。空 {} なら従来どおり。
+    # 上書きしたい場合は local/profiles/<arch>.yaml か auto_model_flags:false。
+    # 学習デルタは後段 (apply_deltas) で最優先に適用される。
+    profile_sampling = _resolve_profile_sampling_for_mode(cfg, mode)
+    params = {**defaults[mode], **mode_cfg, **profile_sampling}
 
     # ベースモデル。chat は常にここを採用。
     # coding は model_paths.coding_model 指定が無い/空の場合のみフォールバック。

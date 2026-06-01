@@ -9,7 +9,6 @@
 	import { currentMode, clearMessages, switchMode, modeRestartStatus } from '$lib/free/stores/chat';
 	import { addToast } from '$lib/free/stores/toast';
 	import { serverState } from '$lib/free/stores/server';
-	import ServerStatus from './ServerStatus.svelte';
 
 	let { instanceName = 'evoref' }: { instanceName?: string } = $props();
 	let position = $derived($layout.sidebar.position);
@@ -81,10 +80,6 @@
 			{/if}
 
 			<div class="sidebar-footer">
-				<div class="footer-row">
-					<ServerStatus />
-				</div>
-				<div class="footer-divider"></div>
 				<div class="footer-row">
 					<span class="footer-label">{$t('settings.light')}/{$t('settings.dark')}</span>
 					<button
@@ -292,10 +287,6 @@
 		display: flex;
 		flex-direction: column;
 		gap: 8px;
-	}
-	.footer-divider {
-		border-top: 0.5px solid var(--sidebar-border);
-		margin: 0 -6px;
 	}
 	.footer-row {
 		display: flex;

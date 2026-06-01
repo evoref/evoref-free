@@ -502,6 +502,20 @@ def build_llama_cmd(
     )
     cmd += spec_args
 
+    # モデル arch 別の自動フラグ (--jinja / --reasoning-format / MoE)。
+    # extra_args の直前に挿入し、ユーザー指定 (extra_args) を最終 override とする。
+    cmd += resolve_auto_model_flags(
+        cfg,
+        base_model_path,
+        fixed_flags={
+            "-m", "--port", "-c", "-ngl", "-b", "-t", "-fa", "--mlock",
+            "-np", "--cache-type-k", "--cache-type-v", "--cache-ram",
+            "--kv-unified", "--lora",
+        },
+        project_root=project_root,
+        warn=lambda m: print(m, file=sys.stderr),
+    )
+
     # 追加オプション
     cmd += lc.get("extra_args", [])
 
@@ -676,6 +690,21 @@ def build_assist_cmd(cfg: dict, project_root: Path | None = None) -> list[str] |
     # 有効化する。通常運用では jinja の利点を失うため false を推奨。
     if local_cfg.get("skip_chat_parsing", False):
         cmd += ["--skip-chat-parsing"]
+
+    # モデル arch 別の自動フラグ。base と同様 extra_args の直前に挿入し、
+    # llama.auto_model_flags で base と一括制御する。
+    cmd += resolve_auto_model_flags(
+        cfg,
+        assist_model_path,
+        fixed_flags={
+            "-m", "--port", "-c", "-ngl", "-b", "-ub", "-t", "-fa", "--mlock",
+            "-np", "--cache-type-k", "--cache-type-v", "--cache-reuse",
+            "--cache-ram", "--kv-unified", "-rea", "--reasoning-budget",
+            "--reasoning-budget-message", "--skip-chat-parsing",
+        },
+        project_root=project_root,
+        warn=lambda m: print(m, file=sys.stderr),
+    )
 
     # 追加オプション
     extra_args = local_cfg.get("extra_args", [])
@@ -879,6 +908,170 @@ def _read_gguf_layer_count(gguf_path: Path) -> int | None:
     except (OSError, struct.error, UnicodeDecodeError, ValueError):
         return None
     return None
+
+
+def read_gguf_metadata(gguf_path: Path) -> dict:
+    """GGUF ヘッダから起動フラグ決定に必要なメタデータを 1 パスで読む。
+
+    Returns (失敗時・キー不在時も同じ shape):
+        ``{"architecture": str | None, "context_length": int | None,
+           "expert_count": int, "has_chat_template": bool}``
+
+    ``expert_count`` は対応キーが無い dense モデルで 0。パース失敗・I/O
+    エラーは安全な既定値を返し、呼び出し側 (default プロファイル /
+    フラグ無付与) に委ねる。``_read_gguf_layer_count`` と同じ struct ベース
+    最小 parser を流用する。backend (sampling 注入経路) からも import される
+    ため public 名とする。
+    """
+    result: dict = {
+        "architecture": None,
+        "context_length": None,
+        "expert_count": 0,
+        "has_chat_template": False,
+    }
+    try:
+        with gguf_path.open("rb") as f:
+            magic = f.read(4)
+            if magic != _GGUF_MAGIC:
+                return result
+            (version,) = struct.unpack("<I", f.read(4))
+            if version < 2:
+                return result
+            n_tensors, n_kv = struct.unpack("<QQ", f.read(16))
+            _ = n_tensors  # 未使用
+            for _ in range(n_kv):
+                (key_len,) = struct.unpack("<Q", f.read(8))
+                key = f.read(key_len).decode("utf-8", errors="replace")
+                (vtype,) = struct.unpack("<I", f.read(4))
+                if key == "general.architecture":
+                    val = _gguf_read_scalar(f, vtype)
+                    result["architecture"] = str(val) if val is not None else None
+                elif key.endswith(".context_length"):
+                    try:
+                        result["context_length"] = int(_gguf_read_scalar(f, vtype))
+                    except (TypeError, ValueError):
+                        pass
+                elif key.endswith(".expert_count"):
+                    try:
+                        result["expert_count"] = int(_gguf_read_scalar(f, vtype))
+                    except (TypeError, ValueError):
+                        pass
+                elif key == "tokenizer.chat_template":
+                    result["has_chat_template"] = True
+                    _gguf_skip_value(f, vtype)
+                else:
+                    _gguf_skip_value(f, vtype)
+    except (OSError, struct.error, UnicodeDecodeError, ValueError):
+        return result
+    return result
+
+
+# モデルプロファイル: arch 単位の起動フラグ / sampling 既定。
+# 同梱ベース (tracked, models/profiles/) + local override の 2 段階解決。
+# default フォールバックは持たない (プロファイルの無い arch はフラグ無付与)。
+# ``models/`` 自体は .gitignore 対象だが models/profiles/ は再包含例外で tracked。
+_MODEL_PROFILE_BASE_DIR = "models/profiles"
+_MODEL_PROFILE_OVERRIDE_DIR = "local/profiles"
+
+
+def load_model_profile(arch: str | None, project_root: Path) -> dict:
+    """arch 名からモデルプロファイル dict を解決する (2 段階)。
+
+    解決順: ``local/profiles/<arch>.yaml`` (user override) →
+    同梱 ``models/profiles/<arch>.yaml`` (base)。いずれも無い / ``arch`` が
+    None の場合は ``{}`` (フォールバックなし)。override は wholesale 置換
+    (deep merge しない)。
+    """
+    if not arch:
+        return {}
+
+    override_dir = project_root / _MODEL_PROFILE_OVERRIDE_DIR
+    base_dir = project_root / _MODEL_PROFILE_BASE_DIR
+    for base in (override_dir, base_dir):
+        path = base / f"{arch}.yaml"
+        if path.exists():
+            try:
+                data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except (OSError, yaml.YAMLError):
+                continue
+            if isinstance(data, dict):
+                return data
+    return {}
+
+
+def _dedupe_flags(candidate: list[str], fixed_flags: set[str]) -> list[str]:
+    """既に固定フラグで出力済みのフラグを candidate から除外する。
+
+    ``--xxx value`` / ``--flag`` (値なし) のペア単位で扱い、``fixed_flags`` に
+    含まれるフラグは引数ごとスキップする。
+    """
+    out: list[str] = []
+    i = 0
+    n = len(candidate)
+    while i < n:
+        tok = candidate[i]
+        if tok.startswith("-"):
+            has_value = (i + 1 < n) and not candidate[i + 1].startswith("-")
+            if tok in fixed_flags:
+                i += 2 if has_value else 1
+                continue
+            out.append(tok)
+            if has_value:
+                out.append(candidate[i + 1])
+                i += 2
+            else:
+                i += 1
+        else:
+            out.append(tok)
+            i += 1
+    return out
+
+
+def resolve_auto_model_flags(
+    cfg: dict,
+    model_path: Path,
+    *,
+    fixed_flags: set[str],
+    project_root: Path,
+    warn: Callable[[str], None] | None = None,
+) -> list[str]:
+    """GGUF メタデータ + arch プロファイルから llama-server 起動フラグを決定する。
+
+    - ``llama.auto_model_flags`` が false なら何も付与しない (現行挙動)。
+    - profile.launch_flags をベースに、MoE (GGUF が expert を報告 +
+      profile.moe.enabled + n_cpu_moe が明示 int) なら ``--n-cpu-moe N`` を付与。
+    - ``fixed_flags`` に既出のフラグは除外して二重付与を避ける。
+    - GGUF 読取失敗 / arch 不明時は default プロファイルにフォールバック。
+    """
+    lc = cfg.get("llama", {}) or {}
+    if not lc.get("auto_model_flags", True):
+        return []
+
+    meta = read_gguf_metadata(model_path)
+    profile = load_model_profile(meta.get("architecture"), project_root)
+    if not profile:
+        return []
+
+    candidate: list[str] = list(profile.get("launch_flags", []) or [])
+
+    # MoE: GGUF が expert を報告し、プロファイルが MoE 有効かつ n_cpu_moe を
+    # 明示している場合のみ --n-cpu-moe を付与 (auto=null では推測しない)。
+    moe_cfg = profile.get("moe", {}) or {}
+    expert_count = int(meta.get("expert_count", 0) or 0)
+    n_cpu_moe = moe_cfg.get("n_cpu_moe")
+    if moe_cfg.get("enabled", False) and expert_count > 0 and n_cpu_moe is not None:
+        candidate += ["--n-cpu-moe", str(int(n_cpu_moe))]
+
+    # context 乖離は警告のみ (-c は config 優先で自動上書きしない)。
+    ctx_train = meta.get("context_length")
+    cfg_ctx = lc.get("context_size")
+    if warn and ctx_train and cfg_ctx and int(cfg_ctx) > int(ctx_train):
+        warn(
+            f"[launch] WARNING: llama.context_size={cfg_ctx} exceeds model "
+            f"n_ctx_train={ctx_train}; consider lowering context_size"
+        )
+
+    return _dedupe_flags(candidate, fixed_flags)
 
 
 def _estimate_via_gguf_size(

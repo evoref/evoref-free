@@ -239,6 +239,29 @@ def _stop_server(name: ServerName) -> bool:
     return True
 
 
+def _resolve_endpoint(name: ServerName, cfg: dict) -> tuple[str, int] | None:
+    """サーバー名から (host, port) を config から直接解決する (停止経路専用)
+
+    `_build_cmd` と違い `enabled` / モデルパス有無のゲートに依存しない。
+    「無効化と同時にプロセスを停止する」経路では config が既に
+    `enabled=false` になっており、`build_reranker_cmd` 等が ``None`` を返して
+    停止対象ポートを失う。停止に cmd は不要でポートだけ要るためこちらを使う。
+    """
+    if name == "base":
+        lc = cfg.get("llama", {}) or {}
+        return lc.get("host", "127.0.0.1"), int(lc.get("port", 8080))
+    if name == "assist":
+        local_cfg = (cfg.get("assist_model", {}) or {}).get("local", {}) or {}
+        return local_cfg.get("host", "127.0.0.1"), int(local_cfg.get("port", 8081))
+    if name == "embed":
+        emb = cfg.get("embedding", {}) or {}
+        return emb.get("llama_host", "127.0.0.1"), int(emb.get("llama_port", 8082))
+    if name == "reranker":
+        rer = cfg.get("reranker", {}) or {}
+        return rer.get("host", "127.0.0.1"), int(rer.get("port", 8083))
+    return None
+
+
 def _stop_external_server(name: ServerName, cfg: dict) -> tuple[bool, str]:
     """外部起動された llama-server をポート占有 PID から特定して停止する
 
@@ -246,17 +269,20 @@ def _stop_external_server(name: ServerName, cfg: dict) -> tuple[bool, str]:
     `python scripts/launch_llama.py --all` 等で外部起動されたプロセスにも
     UI の停止ボタンが効くようフォールバックさせる。
 
+    ポートは `_resolve_endpoint` で config から直接引く。`_build_cmd` 経由だと
+    reranker.enabled=false 等で cmd が ``None`` になりポートを失い、無効化と同時の
+    停止が機能しなくなる。
+
     Returns:
         (success, message)
     """
     from backend.free.cli.pid_manager import find_port_occupant, kill_port_occupants
 
-    project_root = _find_project_root()
-    result = _build_cmd(name, cfg, project_root)
-    if result is None:
+    endpoint = _resolve_endpoint(name, cfg)
+    if endpoint is None:
         return (False, "not configured")
 
-    _, _host, port = result
+    _host, port = endpoint
     occupant = find_port_occupant(port)
     if occupant is None:
         return (False, "no process listening on port")
