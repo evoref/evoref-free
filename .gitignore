@@ -8,6 +8,8 @@ config.yaml
 # Models (large binary files, keep directory structure only)
 models/*
 !models/.gitkeep
+# arch 別プロファイル (models/profiles/<arch>.yaml) は同梱ベースとして tracked
+!models/profiles/
 
 # Local data (PC-specific, not shared)
 # EvorefMem トリガ辞書の user override (local/triggers/*.yaml) もここに含まれる。

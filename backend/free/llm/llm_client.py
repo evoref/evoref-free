@@ -90,6 +90,7 @@ class LLMClient:
         top_p: float | None = None,
         top_k: int | None = None,
         presence_penalty: float | None = None,
+        repetition_penalty: float | None = None,
         id_slot: int | None = None,
     ) -> dict | AsyncIterator[str]:
         """推論リクエスト
@@ -115,6 +116,7 @@ class LLMClient:
             top_p=top_p,
             top_k=top_k,
             presence_penalty=presence_penalty,
+            repetition_penalty=repetition_penalty,
             id_slot=id_slot,
         )
 

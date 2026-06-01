@@ -1,0 +1,22 @@
+# LiquidAI LFM2.5-8B-A1B / LFM2-8B-A1B (arch "lfm2moe"・MoE・reasoning)。
+# GGUF の general.architecture が "lfm2moe" を報告するためファイル名も lfm2moe。
+# (dense 版 LFM2 は別アーキ "lfm2" → lfm2.yaml で扱う)
+#
+# 推奨 sampling はモデルカード準拠: temperature 0.2 / top_k 80 / repetition_penalty 1.05。
+# モデルカードは top_p / min_p / presence_penalty を推奨しないため設定しない
+# (それらは mode 既定値がそのまま使われる)。
+#
+# MoE オフロードは既定で付けない (n_cpu_moe: null)。8.3B総/1.5Bアクティブで多くの GPU に
+# 収まるため。VRAM が厳しい場合は local/profiles/lfm2moe.yaml で moe.n_cpu_moe を
+# 整数指定すると expert を CPU 退避できる。
+launch_flags:
+  - "--jinja"
+  - "--reasoning-format"
+  - "auto"
+moe:
+  enabled: true
+  n_cpu_moe: null
+sampling:
+  temperature: 0.2
+  top_k: 80
+  repetition_penalty: 1.05

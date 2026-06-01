@@ -15,9 +15,8 @@
 
 	const SERVER_NAMES: ServerName[] = ['base', 'assist', 'embed', 'reranker'];
 
-	// サイドバーで起動状態と VRAM を見せる対象は base / assist のみに絞る
-	// (embed / reranker は CPU 既定で 0 MB 表示になり混乱を招くため非表示)
-	const VISIBLE_NAMES: readonly ServerName[] = ['base', 'assist'];
+	// 開発パネルでは全サーバー (base / assist / embed / reranker) を一覧表示し、
+	// 各々の起動状態・メモリ使用量・起動/停止を確認できるようにする。
 
 	let refreshing = $state(false);
 
@@ -102,7 +101,6 @@
 	{:else}
 		<div class="component-list">
 			{#each $serverState.components as comp, i}
-				{#if VISIBLE_NAMES.includes(SERVER_NAMES[i])}
 				{@const busy = $busyServer === SERVER_NAMES[i]}
 				{@const failed = lastStartFailed === SERVER_NAMES[i]}
 				{@const m = $vramStatus?.models?.find((x) => x.name === SERVER_NAMES[i])}
@@ -147,7 +145,6 @@
 						</button>
 					</div>
 				</div>
-				{/if}
 			{/each}
 		</div>
 	{/if}
@@ -264,11 +261,11 @@
 	.action-btn {
 		background: none;
 		border: 1px solid var(--input-border);
-		border-radius: 3px;
+		border-radius: 4px;
 		color: var(--text-secondary);
 		cursor: pointer;
-		font-size: 9px;
-		padding: 1px 4px;
+		font-size: 13px;
+		padding: 5px 12px;
 		line-height: 1.2;
 		opacity: 0.7;
 		transition: opacity 0.15s, color 0.15s, border-color 0.15s;
@@ -298,6 +295,6 @@
 	}
 	.action-icon {
 		display: inline-block;
-		font-size: 11px;
+		font-size: 14px;
 	}
 </style>

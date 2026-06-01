@@ -1,0 +1,14 @@
+# LiquidAI LFM2 dense 系 (arch "lfm2"・非 MoE)。
+# MoE 版 (LFM2-8B-A1B / LFM2.5-8B-A1B) は別アーキ "lfm2moe" を報告するため
+# lfm2moe.yaml 側で扱う (sampling 等もそちらが本命)。
+#
+# dense 版の推奨 sampling は公式に明示が無いため空にし、mode 別 (modes.*) の
+# 設定に委ねる。内蔵 ChatML テンプレートを使うため --jinja のみ付与する。
+launch_flags:
+  - "--jinja"
+  - "--reasoning-format"
+  - "auto"
+moe:
+  enabled: false
+  n_cpu_moe: null
+sampling: {}

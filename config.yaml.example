@@ -167,7 +167,14 @@ llama:
     # mode="draft-model" 時のみ使用
     draft_model_path: null        # 外部 draft GGUF パス (相対 / 絶対)
     gpu_layers_draft: null        # ``-ngld`` (null=auto, 整数, "all" を許容)
-  extra_args: []                  # 上記以外の任意オプションを文字列リストで追加
+  # モデル arch 別の起動フラグ / sampling 自動決定 (base / assist 共通)。
+  # true: GGUF の general.architecture を読み、models/profiles/<arch>.yaml (同梱)
+  #       ＋ local/profiles/<arch>.yaml (任意 override) から
+  #       --jinja / --reasoning-format / MoE / sampling 既定を解決する。
+  #       プロファイルの無い arch には何も付与しない。モデル切替時も自動再評価。
+  # false: 本機構を完全 OFF にし、従来どおり extra_args 手動指定のみで運用する。
+  auto_model_flags: true
+  extra_args: []                  # 上記以外の任意オプションを文字列リストで追加 (auto_model_flags より優先)
   # --- RoPE スケーリング（モデルの学習時コンテキスト長を超える場合）---
   # linear: シンプル、短〜中距離向け
   #   例: ["--rope-scaling", "linear", "--rope-scale", "2"]  # context_size × 2

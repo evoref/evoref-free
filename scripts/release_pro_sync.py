@@ -223,6 +223,9 @@ def should_exclude_path(relative_path: Path) -> bool:
     for prefix in EXCLUDE_PATH_PREFIXES:
         if posix.startswith(prefix):
             return True
+    # models/profiles/ 配下の arch 別プロファイル同梱ベースは配布対象 (tracked)
+    if posix.startswith("models/profiles/"):
+        return False
     # local/ と models/ は .gitkeep 以外を除外
     if posix.startswith("local/") or posix.startswith("models/"):
         return True
@@ -716,6 +719,7 @@ def _collect_commits(range_spec: str) -> list[CommitEntry]:
         "frontend/src/lib/i18n/",
         "frontend/src/lib/edition.ts",
         "scripts/",
+        "models/profiles/",
     ]
     cmd = [
         "git",

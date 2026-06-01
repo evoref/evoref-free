@@ -1,0 +1,17 @@
+# Qwen3 / Qwen3.5 dense 系 (arch "qwen3"・非 MoE)。
+#
+# sampling は意図的に空にする: プロファイル sampling は modes.* を上書きするため、
+# ここで値を入れると chat (temp 0.7) と coding (temp 0.3) のモード別チューニングを
+# 一律に潰してしまう。Qwen3 はモード別の温度差が有効なので modes.* に委ねるのが最適。
+# (Qwen3 公式の非 thinking 推奨は temp 0.7 / top_p 0.8 / top_k 20 だが、単一 arch
+#  プロファイルでは chat/coding を区別できないため採用しない。)
+#
+# dense なので MoE 無効。内蔵テンプレートを使うため --jinja を付与。
+launch_flags:
+  - "--jinja"
+  - "--reasoning-format"
+  - "auto"
+moe:
+  enabled: false
+  n_cpu_moe: null
+sampling: {}

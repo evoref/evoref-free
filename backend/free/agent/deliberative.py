@@ -320,7 +320,7 @@ class DeliberativeAgent:
             kwargs["max_tokens"] = max_tokens
         # モード別生成パラメータを適用
         if generation_params:
-            for k in ("temperature", "top_p", "top_k", "presence_penalty"):
+            for k in ("temperature", "top_p", "top_k", "presence_penalty", "repetition_penalty"):
                 if k in generation_params:
                     kwargs[k] = generation_params[k]
         result = await llm_client.generate(messages, **kwargs)
@@ -350,7 +350,7 @@ class DeliberativeAgent:
             kwargs["max_tokens"] = max_tokens
         # モード別生成パラメータを適用
         if generation_params:
-            for k in ("temperature", "top_p", "top_k", "presence_penalty"):
+            for k in ("temperature", "top_p", "top_k", "presence_penalty", "repetition_penalty"):
                 if k in generation_params:
                     kwargs[k] = generation_params[k]
         token_gen = await llm_client.generate(messages, **kwargs)
