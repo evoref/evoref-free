@@ -35,7 +35,8 @@
 		"stream_timeout": "Response timed out",
 		"cancel": "Cancel",
 		"cancelled": "Generation cancelled",
-		"code_in_editor": "→ Sent to editor ({lang})"
+		"code_in_editor": "→ Sent to editor ({lang})",
+		"code_output_done": "Completed"
 	},
 	"sidebar": {
 		"chat": "Chat",
@@ -175,6 +176,31 @@
 		"applied": "Settings applied",
 		"apply_failed": "Failed to apply settings",
 		"reset": "Reset",
+		"presets": {
+			"title": "Performance preset",
+			"description": "Switch inference / RAG settings in one click to match your hardware.",
+			"light": {
+				"label": "Lightweight",
+				"description": "Minimal VRAM/RAM. Smaller KV cache, reranker off. For weak GPU / iGPU."
+			},
+			"balanced": {
+				"label": "Balanced",
+				"description": "Standard settings. 8K context, reranker off. Default for most setups."
+			},
+			"performance": {
+				"label": "High performance",
+				"description": "2 parallel slots, reranker on. Prioritizes RAG quality and response concurrency. For GPUs with headroom."
+			},
+			"confirm": "Apply the \"{name}\" preset? Inference / RAG settings will be overwritten.",
+			"applied": "Preset applied",
+			"apply_failed": "Failed to apply preset",
+			"restart_required": "A server restart is required to take effect",
+			"restart_button": "Restart servers",
+			"restarting": "Restarting...",
+			"restart_done": "Servers restarted",
+			"restart_failed": "Failed to restart servers",
+			"current_badge": "Active"
+		},
 		"unsaved_changes": "Unsaved changes",
 		"show": "Show",
 		"hide": "Hide",
@@ -502,8 +528,8 @@
 			"select_prompt": "Select Prompt",
 			"mode_chat": "(Base) Chat",
 			"mode_coding": "(Base) Coding",
-			"task_rag_judge": "(Assist) RAG Judge",
-			"task_query_expand": "(Assist) Query Expand",
+			"task_rag_necessity": "(Assist) Retrieval Necessity",
+			"task_rag_quality": "(Assist) Retrieval Quality",
 			"task_tool_call": "(Assist) Tool Call",
 			"task_note_evolve": "(Assist) Note Evolve",
 			"content": "Prompt Content",

@@ -52,7 +52,7 @@ __all__ = [
 
 # Level 1 で集計対象とするモード / アシストタスクのリスト
 _LEVEL1_MODES = ["coding", "chat"]
-_ASSIST_TASKS = ["rag_judge", "query_expand", "tool_call", "note_evolve"]
+_ASSIST_TASKS = ["rag_necessity", "rag_quality", "tool_call", "note_evolve"]
 
 
 # ── エンドポイント ──

@@ -476,9 +476,11 @@ def build_llama_cmd(
         cmd += ["--mlock"]
 
     # KVキャッシュ最適化
-    slots = lc.get("slots", 1)
-    if slots > 1:
-        cmd += ["-np", str(slots)]
+    # slots は常に ``-np`` で明示する。未指定だと新しい llama-server が
+    # n_parallel=auto (=4) を選び、slots=1 (単一スロット = 省メモリ) の意図が
+    # 効かなくなるため (slots レバーが slots=1 で no-op 化していた)。
+    slots = max(1, int(lc.get("slots", 1) or 1))
+    cmd += ["-np", str(slots)]
     cache_type_k = lc.get("cache_type_k")
     if cache_type_k and cache_type_k != "f16":
         cmd += ["--cache-type-k", str(cache_type_k)]
@@ -652,10 +654,10 @@ def build_assist_cmd(cfg: dict, project_root: Path | None = None) -> list[str] |
     if local_cfg.get("mlock", False):
         cmd += ["--mlock"]
 
-    # 並列スロット数（1 の場合は付与しない = llama-server デフォルト）
-    slots = local_cfg.get("slots", 1)
-    if slots and slots > 1:
-        cmd += ["-np", str(slots)]
+    # 並列スロット数。常に ``-np`` で明示する (build_llama_cmd と同じ理由:
+    # 未指定だと n_parallel=auto で単一スロット意図が崩れる)。
+    slots = max(1, int(local_cfg.get("slots", 1) or 1))
+    cmd += ["-np", str(slots)]
 
     # KV キャッシュ量子化（指定があれば）
     cache_type_k = local_cfg.get("cache_type_k")
@@ -915,8 +917,11 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
 
     Returns (失敗時・キー不在時も同じ shape):
         ``{"architecture": str | None, "context_length": int | None,
-           "expert_count": int, "has_chat_template": bool}``
+           "expert_count": int, "has_chat_template": bool,
+           "block_count" / "head_count_kv" / "head_count" / "key_length" /
+           "value_length" / "embedding_length": int | None}``
 
+    後半 6 キーは KV キャッシュ VRAM 推定 (``estimate_kv_cache_mb``) 用。
     ``expert_count`` は対応キーが無い dense モデルで 0。パース失敗・I/O
     エラーは安全な既定値を返し、呼び出し側 (default プロファイル /
     フラグ無付与) に委ねる。``_read_gguf_layer_count`` と同じ struct ベース
@@ -928,6 +933,13 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
         "context_length": None,
         "expert_count": 0,
         "has_chat_template": False,
+        # KV キャッシュ VRAM 推定用 (estimate_kv_cache_mb)
+        "block_count": None,
+        "head_count_kv": None,
+        "head_count": None,
+        "key_length": None,
+        "value_length": None,
+        "embedding_length": None,
     }
     try:
         with gguf_path.open("rb") as f:
@@ -954,6 +966,36 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
                 elif key.endswith(".expert_count"):
                     try:
                         result["expert_count"] = int(_gguf_read_scalar(f, vtype))
+                    except (TypeError, ValueError):
+                        pass
+                elif key.endswith(".block_count"):
+                    try:
+                        result["block_count"] = int(_gguf_read_scalar(f, vtype))
+                    except (TypeError, ValueError):
+                        pass
+                elif key.endswith(".attention.head_count_kv"):
+                    try:
+                        result["head_count_kv"] = int(_gguf_read_scalar(f, vtype))
+                    except (TypeError, ValueError):
+                        pass
+                elif key.endswith(".attention.head_count"):
+                    try:
+                        result["head_count"] = int(_gguf_read_scalar(f, vtype))
+                    except (TypeError, ValueError):
+                        pass
+                elif key.endswith(".attention.key_length"):
+                    try:
+                        result["key_length"] = int(_gguf_read_scalar(f, vtype))
+                    except (TypeError, ValueError):
+                        pass
+                elif key.endswith(".attention.value_length"):
+                    try:
+                        result["value_length"] = int(_gguf_read_scalar(f, vtype))
+                    except (TypeError, ValueError):
+                        pass
+                elif key.endswith(".embedding_length"):
+                    try:
+                        result["embedding_length"] = int(_gguf_read_scalar(f, vtype))
                     except (TypeError, ValueError):
                         pass
                 elif key == "tokenizer.chat_template":
@@ -1074,6 +1116,83 @@ def resolve_auto_model_flags(
     return _dedupe_flags(candidate, fixed_flags)
 
 
+# KV キャッシュ量子化タイプ別の 1 要素あたりバイト数 (概算)。
+# llama.cpp のブロックサイズ由来 (q8_0=34B/32, q5_1=24B/32, q4_1=20B/32 ...)。
+_KV_BYTES_PER_ELEM: dict[str, float] = {
+    "f32": 4.0, "f16": 2.0, "bf16": 2.0,
+    "q8_0": 1.0625, "q5_1": 0.75, "q5_0": 0.6875,
+    "q4_1": 0.625, "q4_0": 0.5625,
+}
+
+
+def _kv_bytes_per_elem(cache_type: str | None) -> float:
+    """KV キャッシュ量子化タイプ → 1 要素バイト数。未指定/不明は f16 (2.0)。"""
+    if not cache_type:
+        return 2.0
+    return _KV_BYTES_PER_ELEM.get(str(cache_type).lower(), 2.0)
+
+
+def estimate_kv_cache_mb(
+    meta: dict,
+    n_ctx: int,
+    cache_type_k: str | None,
+    cache_type_v: str | None,
+) -> int | None:
+    """GGUF メタデータと文脈長から KV キャッシュ VRAM 量 (MiB) を概算する。
+
+    ``KV(bytes) = n_ctx × block_count × head_count_kv
+                  × (key_length × bpe(K) + value_length × bpe(V))``
+
+    必要メタデータ (block_count / head_count_kv / key_length 等) が欠ける、
+    または ``n_ctx<=0`` の場合は ``None`` を返し、呼び出し側で KV 加算を
+    スキップさせる (= 従来のファイルサイズのみ推定にフォールバック)。
+
+    ``--kv-unified`` (slots=1 含む) を前提に slots 倍は掛けない (unified KV は
+    n_ctx 総量で頭打ちになるため)。host RAM 退避 (``--cache-ram``) は VRAM 側
+    では差し引かない (概算であり安全側に多めに見積もる)。
+    """
+    if not n_ctx or n_ctx <= 0:
+        return None
+    n_layers = meta.get("block_count")
+    n_head_kv = meta.get("head_count_kv")
+    head_dim_k = meta.get("key_length")
+    head_dim_v = meta.get("value_length") or head_dim_k
+    # key_length 欠落時は embedding_length / head_count で head_dim を代替
+    if not head_dim_k:
+        n_embd = meta.get("embedding_length")
+        n_head = meta.get("head_count")
+        if n_embd and n_head:
+            head_dim_k = n_embd // n_head
+            head_dim_v = head_dim_k
+    if not (n_layers and n_head_kv and head_dim_k and head_dim_v):
+        return None
+    bytes_k = n_ctx * n_layers * n_head_kv * head_dim_k * _kv_bytes_per_elem(cache_type_k)
+    bytes_v = n_ctx * n_layers * n_head_kv * head_dim_v * _kv_bytes_per_elem(cache_type_v)
+    return int(round((bytes_k + bytes_v) / (1024 * 1024)))
+
+
+_gguf_meta_cache: dict[tuple[str, int, int], dict] = {}
+
+
+def _read_gguf_metadata_cached(path: Path) -> dict:
+    """``read_gguf_metadata`` の (path, size, mtime) キャッシュ付きラッパ。
+
+    VRAM モニタは 10 秒間隔でポーリングするため、同一モデルファイルの
+    ヘッダを毎回パースしないようプロセス内でキャッシュする。ファイルが
+    差し替われば (size/mtime 変化) キーが変わり自動で再読込される。
+    """
+    try:
+        st = path.stat()
+        key = (str(path), st.st_size, st.st_mtime_ns)
+    except OSError:
+        return read_gguf_metadata(path)
+    cached = _gguf_meta_cache.get(key)
+    if cached is None:
+        cached = read_gguf_metadata(path)
+        _gguf_meta_cache[key] = cached
+    return cached
+
+
 def _estimate_via_gguf_size(
     cfg: dict, project_root: Path,
 ) -> dict[str, dict]:
@@ -1119,13 +1238,27 @@ def _estimate_via_gguf_size(
                 ) or int(ngld_raw) > 0:
                     base_vram += draft_size_mb
 
+    # KV キャッシュ VRAM を加算 (GPU 配置時のみ)。GGUF メタデータが
+    # 読めない場合は None となり加算しない (従来のサイズのみ推定に縮退)。
+    base_kv_mb: int | None = None
+    if base_ngl > 0 and base_size is not None:
+        lc = cfg.get("llama", {}) or {}
+        base_kv_mb = estimate_kv_cache_mb(
+            _read_gguf_metadata_cached(base_path),
+            int(lc.get("context_size", 4096) or 4096),
+            lc.get("cache_type_k"),
+            lc.get("cache_type_v"),
+        )
+        if base_kv_mb:
+            base_vram += base_kv_mb
+
     result["base"] = {
         "model_mb": base_size,
         "gpu_layers": base_ngl,
         "vram_mb": base_vram,
         "present": base_size is not None,
         "path": str(base_path),
-        "context_mb": None,
+        "context_mb": base_kv_mb,
         "compute_mb": None,
         "device": None,
         "estimated_via": "gguf-size",
@@ -1143,13 +1276,25 @@ def _estimate_via_gguf_size(
         assist_path = _resolve_model_path(cfg, "assist_model", "", project_root)
         assist_ngl = _resolve_assist_gpu_layers(cfg, project_root)
         assist_size = _file_size_mb(assist_path)
+        assist_vram = (assist_size or 0) if assist_ngl > 0 else 0
+        # KV キャッシュ VRAM を加算 (assist は cache_type 未指定時 f16)
+        assist_kv_mb: int | None = None
+        if assist_ngl > 0 and assist_size is not None:
+            assist_kv_mb = estimate_kv_cache_mb(
+                _read_gguf_metadata_cached(assist_path),
+                int(local_cfg.get("context_size", 8192) or 8192),
+                local_cfg.get("cache_type_k"),
+                local_cfg.get("cache_type_v"),
+            )
+            if assist_kv_mb:
+                assist_vram += assist_kv_mb
         result["assist"] = {
             "model_mb": assist_size,
             "gpu_layers": assist_ngl,
-            "vram_mb": (assist_size or 0) if assist_ngl > 0 else 0,
+            "vram_mb": assist_vram,
             "present": assist_size is not None,
             "path": str(assist_path),
-            "context_mb": None,
+            "context_mb": assist_kv_mb,
             "compute_mb": None,
             "device": None,
             "estimated_via": "gguf-size",

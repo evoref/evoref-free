@@ -35,7 +35,8 @@
 		"stream_timeout": "応答がタイムアウトしました",
 		"cancel": "キャンセル",
 		"cancelled": "生成を中断しました",
-		"code_in_editor": "→ エディタに出力しました（{lang}）"
+		"code_in_editor": "→ エディタに出力しました（{lang}）",
+		"code_output_done": "完了しました"
 	},
 	"sidebar": {
 		"chat": "チャット",
@@ -175,6 +176,31 @@
 		"applied": "設定を適用しました",
 		"apply_failed": "設定の適用に失敗しました",
 		"reset": "リセット",
+		"presets": {
+			"title": "パフォーマンスプリセット",
+			"description": "ハードウェアに合わせて推論・RAG の設定を一括で切り替えます。",
+			"light": {
+				"label": "軽量",
+				"description": "VRAM/RAM を最小化。KV キャッシュ縮小・リランカー OFF。非力な GPU / iGPU 向け。"
+			},
+			"balanced": {
+				"label": "バランス",
+				"description": "標準設定。8K コンテキスト・リランカー OFF。多くの環境の既定。"
+			},
+			"performance": {
+				"label": "高性能",
+				"description": "並列スロット 2・リランカー ON。RAG 精度と応答並列性を優先。VRAM に余裕がある環境向け。"
+			},
+			"confirm": "プリセット「{name}」を適用しますか？推論・RAG の設定が一括で上書きされます。",
+			"applied": "プリセットを適用しました",
+			"apply_failed": "プリセットの適用に失敗しました",
+			"restart_required": "反映にはサーバーの再起動が必要です",
+			"restart_button": "サーバーを再起動",
+			"restarting": "再起動中...",
+			"restart_done": "サーバーを再起動しました",
+			"restart_failed": "サーバーの再起動に失敗しました",
+			"current_badge": "適用中"
+		},
 		"unsaved_changes": "未保存の変更があります",
 		"show": "表示",
 		"hide": "非表示",
@@ -502,8 +528,8 @@
 			"select_prompt": "プロンプトを選択",
 			"mode_chat": "(Base)チャット",
 			"mode_coding": "(Base)コーディング",
-			"task_rag_judge": "(Assist)RAG判定",
-			"task_query_expand": "(Assist)クエリ拡張",
+			"task_rag_necessity": "(Assist)検索必要性判定",
+			"task_rag_quality": "(Assist)検索品質判定",
 			"task_tool_call": "(Assist)ツール呼出",
 			"task_note_evolve": "(Assist)ノート進化",
 			"content": "プロンプト内容",

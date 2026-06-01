@@ -18,7 +18,7 @@ import { addToast } from './toast';
 /** 選択中のプロンプト識別子 */
 export interface PromptSelection {
 	category: PromptCategory;
-	id: string; // mode (chat/coding) or task (rag_judge/...)
+	id: string; // mode (chat/coding) or task (rag_necessity/...)
 }
 
 // PromptCategory と PromptDetailWithScore を re-export
@@ -58,7 +58,7 @@ export const historyOpen = writable(false);
 let originalContent = '';
 
 /** アシストプロンプトのデフォルトタスク一覧 */
-const DEFAULT_ASSIST_TASKS = ['rag_judge', 'query_expand', 'tool_call', 'note_evolve'];
+const DEFAULT_ASSIST_TASKS = ['rag_necessity', 'rag_quality', 'tool_call', 'note_evolve'];
 
 /** API未取得時のフォールバック用アシストプロンプト一覧 */
 function defaultAssistPrompts(): AssistPromptListItem[] {

@@ -1,6 +1,6 @@
 """アシストモデル タスク別プロンプト管理（§7.1.2）
 
-アシストモデルの4タスク（RAG判定・クエリ拡張・ツール呼び出し・ノート進化）
+アシストモデルの4タスク（検索必要性判定・検索品質判定・ツール呼び出し・ノート進化）
 それぞれに専用プロンプトを持ち、読込み・更新・履歴管理を行う。
 SystemPromptManager のアシスト版。全エディション共通。
 """
@@ -43,35 +43,29 @@ class AssistPromptMeta:
 
 # デフォルトプロンプト
 DEFAULT_ASSIST_PROMPTS: dict[str, str] = {
-    "rag_judge": """\
-# RAG 検索必要性判定
+    "rag_necessity": """\
+ユーザーの最新クエリを、3つの検索アクションのいずれかに分類してください。
 
-ユーザーのクエリを分析し、RAG 検索が必要かどうかを判定してください。
+- retrieve: ローカルの知識ベース（アップロード文書・過去の会話・導入済みカートリッジ）から答えるのが最適なもの。使い方・定義・既知の内容への意見・以前の話題への言及など。
+- fetch: 静的な知識ベースでは提供できない最新／ライブの外部情報を要するもの。最新ニュース、現在の株価・天気・スポーツのスコア、本日の見出し、特定サイトのリアルタイムな状態など。システムはローカル検索ではなく Web 取得ツールを使う。
+- skip: 検索も取得も不要な些末なもの。現在時刻・日付・曜日、簡単な挨拶、自己同一性、雑談のフィラーなど。
 
-## 判定基準
-- 事実情報・知識を必要とする質問 → search_needed
-- 雑談・挨拶・感想 → no_search
-- プロジェクト固有の情報を問う質問 → search_needed
-- 直前の会話文脈で回答可能 → no_search
+直前のローカルな話題を指す短いフォローアップ質問は retrieve を優先する。外部の最新状態を尋ねるものは fetch を優先する。
 
 <!-- PROTECTED -->
-## 出力形式
-"search_needed" または "no_search" のみを出力してください。
+JSON形式で回答: {"action": "retrieve"} / {"action": "fetch"} / {"action": "skip"}
 <!-- /PROTECTED -->
 """,
-    "query_expand": """\
-# RAG 品質判定・クエリ拡張
+    "rag_quality": """\
+以下のクエリに対する検索結果の関連性を判定してください。
 
-検索結果の品質を判定し、不十分な場合はクエリを拡張してください。
-
-## 判定基準
-- 検索結果がクエリに対して十分な情報を含む → sufficient
-- 情報が不足している → 拡張クエリを生成
+判定基準:
+- high: 検索結果がクエリに直接的に関連し、十分な情報を含む
+- medium: 部分的に関連するが、情報が不十分
+- low: 検索結果がクエリにほぼ関連しない
 
 <!-- PROTECTED -->
-## 出力形式
-- 十分な場合: "sufficient"
-- 不十分な場合: 拡張されたクエリ文字列を出力
+JSON形式で回答: {"quality": "high" or "medium" or "low"}
 <!-- /PROTECTED -->
 """,
     "tool_call": """\
@@ -132,7 +126,7 @@ class AssistPromptManager:
     SystemPromptManager と同じパターンだが、モードではなくタスク単位。
     """
 
-    TASKS = ["rag_judge", "query_expand", "tool_call", "note_evolve"]
+    TASKS = ["rag_necessity", "rag_quality", "tool_call", "note_evolve"]
 
     def __init__(self, prompt_dir: Path) -> None:
         """
@@ -157,6 +151,11 @@ class AssistPromptManager:
                 else:
                     self.metas[task] = AssistPromptMeta(task=task)
                     self._save_meta(task)
+                # 自己修復: 未編集 (source=default) のままコード側デフォルトが
+                # 更新された場合、ディスクの旧デフォルトを現行デフォルトに書き直し、
+                # デフォルト更新を既存インストールへ伝播させる。手動編集 (manual) /
+                # 進化 (evolution) で更新されたプロンプトは保護する。
+                self._refresh_default_if_stale(task)
             else:
                 self._create_default(task)
 
@@ -164,7 +163,7 @@ class AssistPromptManager:
         """タスク別プロンプト本文を取得
 
         Args:
-            task: タスク名 ("rag_judge" | "query_expand" | "tool_call" | "note_evolve")
+            task: タスク名 ("rag_necessity" | "rag_quality" | "tool_call" | "note_evolve")
 
         Returns:
             プロンプト本文
@@ -286,6 +285,34 @@ class AssistPromptManager:
             f"assist_{task}",
             self.metas[task].version,
             self.contents[task],
+        )
+
+    def _refresh_default_if_stale(self, task: str) -> None:
+        """source=default のプロンプトがコード側デフォルトと乖離していれば再生成する。
+
+        デフォルト更新を既存インストールへ伝播させるための起動時自己修復。
+        ``source`` が ``manual`` (手動編集) / ``evolution`` (進化採用) のものは
+        ユーザー資産として保護し、書き換えない。``source=default`` かつディスク
+        内容が現行 ``DEFAULT_ASSIST_PROMPTS[task]`` と異なる場合のみ書き直す。
+        一致していれば no-op (毎回起動で再書き込みしない / 冪等)。
+        """
+        meta = self.metas.get(task)
+        if meta is None or meta.source != "default":
+            return
+        default = DEFAULT_ASSIST_PROMPTS.get(task)
+        if default is None or self.contents.get(task) == default:
+            return
+        write_body(self.prompt_dir, f"assist_{task}", default)
+        self.contents[task] = default
+        meta.version = 1
+        meta.updated_at = _now()
+        meta.source = "default"
+        meta.fitness_score = 0.0
+        self._save_meta(task)
+        logger.info(
+            "Refreshed stale default assist prompt: task=%s "
+            "(on-disk default differed from current code default)",
+            task,
         )
 
     def _create_default(self, task: str) -> None:

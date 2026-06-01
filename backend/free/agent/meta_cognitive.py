@@ -18,6 +18,7 @@ from backend.free.agent.meta_cognitive_tasks import (
     EditorArtifact,
     MetaCognitiveResponse,
     TaskItem,
+    collapse_editor_write_tasks,
     determine_task_status,
     merge_same_file_tasks,
     task_expects_write,
@@ -390,6 +391,10 @@ class MetaCognitiveAgent:
 
         # 同一ファイル対象のタスクをマージ
         tasks = merge_same_file_tasks(tasks)
+        # editor/chat 経路 (パス未指定) は merge_same_file_tasks がすり抜けるため、
+        # 過分割された書き込みタスクを 1 件へ集約する (1 リクエスト=1 タブ)。
+        if self._output_target in ("editor", "chat"):
+            tasks = collapse_editor_write_tasks(tasks)
         logger.info("Plan generated: %d tasks", len(tasks))
 
         if on_step:

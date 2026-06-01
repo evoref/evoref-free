@@ -110,32 +110,27 @@ CODE_DOC_GEN_INTENT_PATTERNS = re.compile(
 # にマッチした時点で retrieve に倒す (情報量があるため検索の便益が高い前提)。
 _UNCERTAIN_QUERY_MAX_CHARS = 30
 
-# アシストモデルへの検索必要性判定プロンプト (英語固定、3 値 action 応答)
-# `{context}` は直前の会話ターンを埋め込むスロット (空文字列も許容)
-_NECESSITY_PROMPT = (
-    "Classify the user's latest query into one of three retrieval actions.\n"
+# アシストモデルへの検索必要性判定プロンプトの指示部 (日本語、3 値 action 応答)。
+# AssistPromptManager (task=rag_necessity) 未注入時のフォールバック既定値。
+# 動的データ (直前文脈 / クエリ) は judge_with_assist が末尾に連結するため、
+# ここにフォーマットスロットは含めない (str.format は使わない)。
+_NECESSITY_INSTRUCTIONS = (
+    "ユーザーの最新クエリを、3つの検索アクションのいずれかに分類してください。\n"
     "\n"
-    "- retrieve: The answer is best found in the user's local knowledge"
-    " base — uploaded documents, past conversations, or installed"
-    " cartridges. Use for how-to questions, definitions, opinions on"
-    " known content, references to previous topics.\n"
-    "- fetch: The answer requires fresh / live external information that"
-    " a static knowledge base cannot provide — latest news, current"
-    " stock / weather / sports scores, today's headlines, real-time"
-    " status of a specific website. The system will use a web fetch"
-    " tool, NOT local search.\n"
-    "- skip: Trivial queries that need neither search nor fetch — current"
-    " time / date / weekday, simple greetings, self-identity, casual"
-    " chat fillers.\n"
+    "- retrieve: ローカルの知識ベース（アップロード文書・過去の会話・"
+    "導入済みカートリッジ）から答えるのが最適なもの。使い方・定義・"
+    "既知の内容への意見・以前の話題への言及など。\n"
+    "- fetch: 静的な知識ベースでは提供できない最新／ライブの外部情報を"
+    "要するもの。最新ニュース、現在の株価・天気・スポーツのスコア、"
+    "本日の見出し、特定サイトのリアルタイムな状態など。システムは"
+    "ローカル検索ではなく Web 取得ツールを使う。\n"
+    "- skip: 検索も取得も不要な些末なもの。現在時刻・日付・曜日、"
+    "簡単な挨拶、自己同一性、雑談のフィラーなど。\n"
     "\n"
-    "If a short follow-up question refers back to a previous local"
-    " topic, prefer retrieve. If it asks for the latest state of"
-    " something external, prefer fetch.\n"
+    "直前のローカルな話題を指す短いフォローアップ質問は retrieve を"
+    "優先する。外部の最新状態を尋ねるものは fetch を優先する。\n"
     "\n"
-    'Reply JSON only: {{"action": "retrieve"}} or {{"action": "fetch"}}'
-    ' or {{"action": "skip"}}.\n'
-    "{context}"
-    "Latest query: {q}"
+    'JSON形式で回答: {"action": "retrieve"} / {"action": "fetch"} / {"action": "skip"}'
 )
 
 # アシストプロンプトへ含める直前ターン数の既定値 (user/assistant 合計)
@@ -176,7 +171,7 @@ def _format_context_for_assist(
         lines.append(f"{role}: {content}")
     if not lines:
         return ""
-    return "Recent conversation:\n" + "\n".join(lines) + "\n"
+    return "直近の会話:\n" + "\n".join(lines) + "\n"
 
 # デフォルト閾値
 DEFAULT_RELEVANCE_THRESHOLD = 0.65
@@ -214,6 +209,19 @@ class RetrievalNecessityJudge:
     モデルへ問い合わせ、失敗時は安全側の `"retrieve"` にフォールバック
     する (現状挙動と一致させ回帰防止)。
     """
+
+    def __init__(self, necessity_instructions: str | None = None) -> None:
+        """
+        Args:
+            necessity_instructions: アシスト必要性判定プロンプトの指示部。
+                AssistPromptManager (task=rag_necessity) 由来の編集可能テキストを
+                composition 層 (api/chat) から注入する。``None`` の場合は
+                ``_NECESSITY_INSTRUCTIONS`` 既定値にフォールバックする
+                (degraded-safe)。
+        """
+        self._necessity_instructions = (
+            necessity_instructions or _NECESSITY_INSTRUCTIONS
+        )
 
     def _judge_rule(self, query: str, context_count: int = 0) -> str:
         """純ルール判定 (3 値 + uncertain).
@@ -399,7 +407,9 @@ class RetrievalNecessityJudge:
         context_block = _format_context_for_assist(
             recent_context, max_turns=context_turns,
         )
-        prompt = _NECESSITY_PROMPT.format(q=query, context=context_block)
+        prompt = (
+            f"{self._necessity_instructions}\n{context_block}最新のクエリ: {query}"
+        )
         if context_block:
             logger.debug(
                 "Necessity assist: context_block included (chars=%d, turns=%d)",
@@ -479,6 +489,19 @@ class RetrievalNecessityJudge:
         return action
 
 
+# 検索結果品質判定プロンプトの指示部 (日本語、3 値 quality 応答)。
+# AssistPromptManager (task=rag_quality) 未注入時のフォールバック既定値。
+# クエリ / 検索結果は judge_with_assist が末尾に連結する。
+_QUALITY_INSTRUCTIONS = (
+    "以下のクエリに対する検索結果の関連性を判定してください。\n\n"
+    "判定基準:\n"
+    "- high: 検索結果がクエリに直接的に関連し、十分な情報を含む\n"
+    "- medium: 部分的に関連するが、情報が不十分\n"
+    "- low: 検索結果がクエリにほぼ関連しない\n\n"
+    'JSON形式で回答: {"quality": "high" or "medium" or "low"}'
+)
+
+
 class RetrievalQualityJudge:
     """検索結果品質のベクトル閾値判定"""
 
@@ -486,6 +509,7 @@ class RetrievalQualityJudge:
         self,
         thresholds: QualityThresholds | None = None,
         debug_logger: "DebugLogger | None" = None,
+        quality_instructions: str | None = None,
     ):
         """
         Args:
@@ -493,9 +517,17 @@ class RetrievalQualityJudge:
                 marginal 判定時の rule-based vs assist 救済の選択 (decision_point=
                 ``self_rag_judge_path``) を ``decision.jsonl`` に記録する。
                 ``evolve`` レベル限定で実発火、それ以外は no-op。
+            quality_instructions: アシスト品質判定プロンプトの指示部。
+                AssistPromptManager (task=rag_quality) 由来の編集可能テキストを
+                composition 層 (api/chat) から注入する。``None`` の場合は
+                ``_QUALITY_INSTRUCTIONS`` 既定値にフォールバックする
+                (degraded-safe)。
         """
         self.thresholds = thresholds or QualityThresholds()
         self._debug_logger = debug_logger
+        self._quality_instructions = (
+            quality_instructions or _QUALITY_INSTRUCTIONS
+        )
 
     def judge(
         self,
@@ -579,14 +611,9 @@ class RetrievalQualityJudge:
                 for _, score, text in top_results
             )
             prompt = (
-                "以下のクエリに対する検索結果の関連性を判定してください。\n\n"
+                f"{self._quality_instructions}\n\n"
                 f"クエリ: {query}\n\n"
-                f"検索結果:\n{formatted}\n\n"
-                '判定基準:\n'
-                '- high: 検索結果がクエリに直接的に関連し、十分な情報を含む\n'
-                '- medium: 部分的に関連するが、情報が不十分\n'
-                '- low: 検索結果がクエリにほぼ関連しない\n\n'
-                'JSON形式で回答: {"quality": "high" or "medium" or "low"}'
+                f"検索結果:\n{formatted}"
             )
 
             result = await assist_client.generate_json(

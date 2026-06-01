@@ -8,12 +8,16 @@
 import {
 	getConfig,
 	getStatus,
+	getPresets,
+	applyConfigPreset,
 	updateConfigSection,
 	validateConfigSection,
 	switchPromptLocale as switchPromptLocaleApi,
 	type ConfigFullResponse,
 	type ConfigUpdateResponse,
 	type ConfigValidateResponse,
+	type PresetListResponse,
+	type PresetApplyResult,
 	type StatusResponse
 } from '$lib/free/api';
 
@@ -41,6 +45,16 @@ export async function validateSection(
 /** サーバーステータスを取得 */
 export async function fetchStatus(): Promise<StatusResponse> {
 	return getStatus();
+}
+
+/** パフォーマンスプリセット一覧 + 現在一致するプリセットを取得 */
+export async function fetchPresets(): Promise<PresetListResponse> {
+	return getPresets();
+}
+
+/** パフォーマンスプリセットを適用 */
+export async function applyPreset(id: string): Promise<PresetApplyResult> {
+	return applyConfigPreset(id);
 }
 
 /**

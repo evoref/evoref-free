@@ -227,6 +227,18 @@ async def run_search_pipeline(
         # WorkingMemory 側で常に同期されている (セッション切替時に
         # prepare_memory_context が wm.session_id を更新する)。
         session_id = getattr(wm, "session_id", None) or "default"
+        # アシスト判定プロンプト (AssistPromptManager 由来) を plain str で解決し注入する。
+        # search_pipeline (EvorefMem) / self_rag_judge (EvorefGen) から agent ピラーへ
+        # 越境 import しないため、composition 層 (api/chat) で文字列に解決して渡す。
+        # manager 未初期化や task 欠落時は None → judge 側の既定指示にフォールバック。
+        mgr = state.assist_prompt_manager
+        necessity_prompt = quality_prompt = None
+        if mgr is not None:
+            try:
+                necessity_prompt = mgr.get_assist_prompt("rag_necessity")
+                quality_prompt = mgr.get_assist_prompt("rag_quality")
+            except (ValueError, KeyError):
+                necessity_prompt = quality_prompt = None
         search_result = await unified_search(
             query=query,
             query_vec=query_vec,
@@ -245,6 +257,8 @@ async def run_search_pipeline(
             lazy_contextual=state.lazy_contextual,
             session_id=session_id,
             assist_judge_tracker=state.assist_judge_tracker,
+            necessity_prompt=necessity_prompt,
+            quality_prompt=quality_prompt,
         )
         if not search_result.skipped and search_result.sources:
             rag_chunks = [content for _, _, content in search_result.sources]
