@@ -616,6 +616,29 @@ class ConfigValidateResponse(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class PresetInfo(BaseModel):
+    """パフォーマンスプリセットの 1 件"""
+    id: str
+
+
+class PresetListResponse(BaseModel):
+    """プリセット一覧 + 現在一致するプリセット"""
+    presets: list[PresetInfo] = Field(default_factory=list)
+    current: str | None = None
+
+
+class PresetApplyResponse(BaseModel):
+    """プリセット適用結果
+
+    ``restart_servers`` は起動引数が変わり再起動が必要な llama-server 名
+    ("base" / "assist" / "embed") の配列。reranker は enabled 切替で自動
+    起動/停止されるため含まない。
+    """
+    applied: str
+    changed_sections: list[str] = Field(default_factory=list)
+    restart_servers: list[str] = Field(default_factory=list)
+
+
 # ===== Sessions =====
 
 class SessionRegisterRequest(BaseModel):

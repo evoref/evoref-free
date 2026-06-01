@@ -402,6 +402,8 @@ async def unified_search(
     *,
     session_id: str = "default",
     assist_judge_tracker: "AssistJudgeUsageTracker | None" = None,
+    necessity_prompt: str | None = None,
+    quality_prompt: str | None = None,
 ) -> SearchResult:
     """統合検索パイプライン: Self-RAG + 3層メモリ + (任意) リランカー
 
@@ -435,11 +437,13 @@ async def unified_search(
     )
 
     # Step 1: Self-RAG 検索必要性判定 (rule + uncertain 時のみアシスト)
-    necessity_judge = RetrievalNecessityJudge()
+    # necessity_prompt は AssistPromptManager (task=rag_necessity) 由来の編集可能
+    # 指示部。composition 層から plain str で注入され、None なら judge 側既定に倒す。
+    necessity_judge = RetrievalNecessityJudge(necessity_instructions=necessity_prompt)
     full_context = working_mem.get_context()
     context_count = len(full_context)
     # 末尾ターンは現在のユーザクエリ自身 (chat service が search 前に
-    # WorkingMemory.add_turn 済) なので、アシストプロンプトの "Latest query"
+    # WorkingMemory.add_turn 済) なので、アシストプロンプトの "最新のクエリ"
     # と重複しないよう除外する。末尾が user role でない (テスト経路等) なら
     # 全件をそのまま渡す。
     if full_context and full_context[-1].get("role") == "user":
@@ -498,7 +502,10 @@ async def unified_search(
     # Step 5: Self-RAG 品質判定 + (オプション) アシスト強化（< 0.1ms）
     thresholds = QualityThresholds.from_config(rag_cfg)
     # decision.jsonl に記録 (decision_point=``self_rag_judge_path``)
-    quality_judge = RetrievalQualityJudge(thresholds, debug_logger=debug_logger)
+    quality_judge = RetrievalQualityJudge(
+        thresholds, debug_logger=debug_logger,
+        quality_instructions=quality_prompt,
+    )
     quality = quality_judge.judge(merged)
     logger.debug("Step 5 quality: %s", quality)
     if timer is not None:

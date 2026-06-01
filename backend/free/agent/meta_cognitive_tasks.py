@@ -149,3 +149,26 @@ def merge_same_file_tasks(tasks: list[TaskItem]) -> list[TaskItem]:
         "Task merging: %d tasks → %d tasks", len(tasks), len(merged),
     )
     return merged
+
+
+def collapse_editor_write_tasks(tasks: list[TaskItem]) -> list[TaskItem]:
+    """editor/chat 出力 (パス未指定) で過分割された書き込みタスクを単一生成へ集約する。
+
+    merge_same_file_tasks はパスを持つタスクのみ統合するため editor/chat 経路では
+    機能しない。ローカル LLM が単一ファイル要求を複数の書き込みタスクに分割すると、
+    タスクごとに独立生成され editor_artifact が複数 (= エディタに同名タブが複数) でき
+    る。書き込みタスクが 2 つ以上ある場合、最初の書き込みタスクだけ残し残りを除去する。
+    非書き込みタスク (read/verify 等) と順序は保持。コード生成は _generate_content が
+    original_query (要求全体) を主体に行うため、残した 1 タスクで完全なファイルになる。
+    1 リクエスト=1 生成=1 タブを保証する防御策。
+    """
+    write_idx = [i for i, t in enumerate(tasks) if task_expects_write(t.description)]
+    if len(write_idx) <= 1:
+        return tasks
+    drop = set(write_idx[1:])  # 最初の書き込みタスクだけ残す
+    collapsed = [t for i, t in enumerate(tasks) if i not in drop]
+    logger.info(
+        "Editor task collapsing: %d tasks → %d tasks (%d write tasks → 1)",
+        len(tasks), len(collapsed), len(write_idx),
+    )
+    return collapsed

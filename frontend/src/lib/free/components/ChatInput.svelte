@@ -36,6 +36,8 @@
 	let cancelled = false;
 	/** このターンで partial editor_code を受信したか (final を streaming タブへ確定するため) */
 	let sawPartialEditor = false;
+	/** このターンでエディタへコードを出力したか (editor_code 受信)。完了通知の発火条件 */
+	let sawEditorCode = false;
 
 	/** long_form ユニットステップの detail ("[3/9] GameGrid: 803 tokens") を進捗に分解する */
 	function parseLongFormProgress(detail: string, done: boolean) {
@@ -64,6 +66,7 @@
 		clearGeneratedEditorCode();
 		clearStreamingEditorCode();
 		sawPartialEditor = false;
+		sawEditorCode = false;
 		isStreaming.set(true);
 		tokenSpeed.set(0);
 		cancelled = false;
@@ -118,6 +121,7 @@
 				} else if (event.type === 'editor_route' && event.editor_route) {
 					setEditorRouteToLastAssistant(event.editor_route.target);
 				} else if (event.type === 'editor_code' && event.editor_code) {
+					sawEditorCode = true;
 					// partial=true: long_form 生成途中の逐次更新 → streaming タブへ上書き。
 					// final: partial を受けていれば streaming タブを確定、そうでなければ
 					// (meta_cognitive 等の単発出力) 従来通り新規タブへ流す。
@@ -132,6 +136,10 @@
 				} else if (event.type === 'error') {
 					appendToLastAssistant(`\n\n**Error:** ${event.error}`);
 				}
+			}
+			// コーディングモードでエディタへコードを出力したターンの完了通知
+			if (!cancelled && get(currentMode) === 'coding' && sawEditorCode) {
+				addStepResultToLastAssistant($t('chat.code_output_done'), 'done');
 			}
 		} catch (e) {
 			if (!cancelled) {

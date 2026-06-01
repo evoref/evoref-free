@@ -1,0 +1,22 @@
+# Qwen2.5 / Qwen2 dense 系 (arch "qwen2"・非 MoE)。
+#
+# Qwen2.5-Coder (7B / 14B 等) や Qwen2 系の GGUF は general.architecture="qwen2"
+# を報告する (Qwen2.5 は llama.cpp 上では qwen2 アーキ)。Qwen3 / Qwen3.5 と異なり
+# reasoning / thinking 非対応の dense モデル。
+#
+# sampling は意図的に空: プロファイル sampling は modes.* を上書きするため、
+# ここで値を入れると chat (temp 0.7) と coding (temp 0.3) のモード別チューニングを
+# 一律に潰してしまう。Qwen2.5-Coder はコーディング用途で coding モードの低温度が
+# 有効なので modes.* に委ねる。
+#
+# dense なので MoE 無効。内蔵 ChatML テンプレートを使うため --jinja を付与。
+# --reasoning-format auto は非 reasoning モデルでは実質 no-op (既定 auto と同じ) だが、
+# 他プロファイル (qwen3 / qwen35 / lfm2) と挙動を揃えるため明示する。
+launch_flags:
+  - "--jinja"
+  - "--reasoning-format"
+  - "auto"
+moe:
+  enabled: false
+  n_cpu_moe: null
+sampling: {}

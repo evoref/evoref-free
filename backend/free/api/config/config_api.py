@@ -18,6 +18,9 @@ from backend.free.api.schemas import (
     LocaleRequest,
     LocaleResponse,
     LocalesResponse,
+    PresetApplyResponse,
+    PresetInfo,
+    PresetListResponse,
 )
 from backend.i18n_helper import set_locale, get_locale, available_locales
 from backend.log_config import get_logger
@@ -80,6 +83,87 @@ async def get_locales():
     return LocalesResponse(
         locales=available_locales(),
         current=get_locale(),
+    )
+
+
+# ── パフォーマンスプリセット（固定パス、{section} より先に定義） ──
+
+
+@router.get("/presets", response_model=PresetListResponse)
+async def list_presets():
+    """利用可能なパフォーマンスプリセット一覧と、現在一致するプリセット"""
+    from backend.free.api.config.presets import PRESET_IDS, detect_current
+
+    return PresetListResponse(
+        presets=[PresetInfo(id=pid) for pid in PRESET_IDS],
+        current=detect_current(get_config()),
+    )
+
+
+@router.post("/presets/{preset_id}/apply", response_model=PresetApplyResponse)
+async def apply_preset(
+    preset_id: str, state: AppState = Depends(get_app_state),
+):
+    """パフォーマンスプリセットを適用する（推論・RAG の資源設定を一括更新）"""
+    from backend.config import _deep_merge
+    from backend.free.api.config.presets import CONFIG_PRESETS, compute_changed
+
+    if preset_id not in CONFIG_PRESETS:
+        raise api_error(
+            404, "E0404", f"Unknown preset: {preset_id}",
+            "api.config_unknown_preset", preset=preset_id,
+        )
+
+    preset = CONFIG_PRESETS[preset_id]
+
+    # 保存前の現状から変更対象セクションと再起動対象を算出
+    changed_sections, restart_servers = compute_changed(get_config(), preset_id)
+
+    # アトミック検証: 全セクションをマージした完全 config を一括検証
+    merged = copy.deepcopy(get_config())
+    for section, data in preset.items():
+        if section in merged and isinstance(merged[section], dict):
+            merged[section] = _deep_merge(merged[section], data)
+        else:
+            merged[section] = copy.deepcopy(data)
+    try:
+        EvorefConfig.model_validate(merged)
+    except ValidationError as e:
+        errors = [str(err["msg"]) for err in e.errors()]
+        raise HTTPException(status_code=422, detail={
+            "code": "E0422", "message": str(e),
+            "i18n_key": "", "context": {},
+            "errors": errors,
+        })
+
+    # 検証通過後に変更セクションのみ保存
+    try:
+        for section in changed_sections:
+            save_config_section(section, preset[section])
+    except ValidationError as e:
+        errors = [str(err["msg"]) for err in e.errors()]
+        raise HTTPException(status_code=422, detail={
+            "code": "E0422", "message": str(e),
+            "i18n_key": "", "context": {},
+            "errors": errors,
+        })
+    except Exception as e:
+        logger.error("Failed to apply preset '%s': %s", preset_id, e)
+        raise api_error(500, "E0500", str(e))
+
+    logger.info(
+        "Preset '%s' applied (changed=%s, restart=%s)",
+        preset_id, changed_sections, restart_servers,
+    )
+
+    # 変更セクションのコンポーネント再生成（reranker は enabled 切替で自動 起動/停止）
+    for section in changed_sections:
+        await _reload_components_if_needed(section, state)
+
+    return PresetApplyResponse(
+        applied=preset_id,
+        changed_sections=changed_sections,
+        restart_servers=restart_servers,
     )
 
 

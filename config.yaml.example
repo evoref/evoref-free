@@ -116,9 +116,10 @@ llama:
   flash_attn: true                # -fa / Flash Attention の有効化
   mlock: false                    # --mlock / モデルを RAM に固定
   cache_prompt: true              # KVキャッシュ再利用（共通プレフィックスの再計算をスキップ）
-  slots: 2                        # -np / 並列スロット数（1=単一, 2=チャット+バックグラウンド分離）
-                                  # 2: チャットとバックグラウンド処理の KV キャッシュを分離（推奨）
-                                  # 1: VRAM 節約（KV キャッシュ半減）。長コンテキスト時に検討
+  slots: 1                        # -np / 並列スロット数（1=単一, 2=チャット+バックグラウンド分離）
+                                  # 1: VRAM 節約（KV キャッシュ半減）が既定。チャットとバックグラウンド
+                                  #    処理が 1 スロットを共有・直列化する
+                                  # 2: チャットとバックグラウンド処理の KV キャッシュを分離（VRAM 余裕時）
   cache_type_k: q8_0              # --cache-type-k / KV key 量子化
                                   #   f16: 基準（VRAM最大）, bf16: bf16学習モデル向け
                                   #   q8_0: 推奨（VRAM半減、品質劣化ほぼゼロ）
@@ -135,12 +136,13 @@ llama:
   # --- idle slot offload ---
   # cache_ram_mib: -1=無制限 / 0=disable / >0=MiB 上限
   #   上流デフォルト 8192 を黙従しないよう launch_llama.py が常に明示付与する。
-  #   evoref では agentic ワークロード前提で 4096 を既定値とする。
+  #   既定 slots=1 では退避対象の idle slot が存在しないため 0 で無効化し
+  #   host RAM 予約を省く。slots を 2 以上に上げる場合は 4096 程度を検討。
   # cache_idle_slots: 上流既定 true (idle slot を退避対象にする)。
   #   false で機構自体を OFF（``--no-cache-idle-slots`` 付与）。
   # kv_unified: null=auto (cache_ram_mib>0 かつ slots>1 で ``--kv-unified`` 自動付与) /
   #             true|false で明示上書き。slots>1 で cache-ram を機能させるには unified KV cache が必要。
-  cache_ram_mib: 4096
+  cache_ram_mib: 0
   cache_idle_slots: true
   kv_unified: null
   # --- self-speculative decoding ---
@@ -461,7 +463,9 @@ embedding:
 
 # ===== リランカー設定 =====
 reranker:
-  enabled: true                   # リランカーの有効/無効
+  enabled: false                  # リランカーの有効/無効
+                                  # 既定 false = 4 つ目の llama-server (:8083) を起動せず省メモリ。
+                                  # RAG は reranker 無しでも縮退動作する。検索精度を上げたい場合 true。
   backend: llama-cpp              # バックエンド: llama-cpp
   host: localhost
   port: 8083                      # リランカー用 llama-server のポート
@@ -847,9 +851,10 @@ assist_model:
                                    # Contextual Retrieval のプレフィックス生成や note_evolve の入力を
                                    # 収容するため、2048 ではオーバーフローで空応答となるので避ける
                                    # ベースモデルの context_size とは独立して設定可能
-    # idle slot offload。アシストは purpose 別セマフォで多重化される
-    # ため slots>1 運用時に ``--kv-unified`` が自動付与される。
-    cache_ram_mib: 2048
+    # idle slot offload。アシストは既定 slots=1 (本セクションに slots キー無し)
+    # のため退避対象の idle slot が無く 0 で無効化し host RAM 予約を省く。
+    # slots>1 運用時は ``--kv-unified`` が自動付与されるので 2048 等へ戻す。
+    cache_ram_mib: 0
     cache_idle_slots: true
     kv_unified: null
     # アシストモデルのパラメータ数 (B 単位) を明示指定する。
