@@ -191,6 +191,8 @@
 		"tab_generation": "生成パラメータ",
 		"tab_develop": "開発",
 		"develop": {
+			"server_title": "サーバー制御",
+			"server_hint": "ベース / アシスト / 埋め込み / リランカー各サーバーの起動・停止とメモリ使用量。",
 			"title": "Danger Zone",
 			"description": "開発者向けのメンテナンス操作です。破壊的な操作で、Develop エディションでのみ利用できます。",
 			"reset_title": "ローカルデータの初期化",

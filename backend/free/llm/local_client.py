@@ -376,6 +376,7 @@ class LocalClient(BaseHTTPClient):
         top_p: float | None = None,
         top_k: int | None = None,
         presence_penalty: float | None = None,
+        repetition_penalty: float | None = None,
         id_slot: int | None = None,
         **extra,
     ) -> dict:
@@ -395,6 +396,8 @@ class LocalClient(BaseHTTPClient):
             payload["top_k"] = top_k
         if presence_penalty is not None:
             payload["presence_penalty"] = presence_penalty
+        if repetition_penalty is not None:
+            payload["repetition_penalty"] = repetition_penalty
 
         # KVキャッシュ最適化
         if self._cache_prompt:
@@ -432,6 +435,7 @@ class LocalClient(BaseHTTPClient):
         top_p: float | None = None,
         top_k: int | None = None,
         presence_penalty: float | None = None,
+        repetition_penalty: float | None = None,
         id_slot: int | None = None,
     ) -> dict | AsyncIterator[str]:
         """llama-server に推論リクエストを送信
@@ -452,6 +456,7 @@ class LocalClient(BaseHTTPClient):
             top_p=top_p,
             top_k=top_k,
             presence_penalty=presence_penalty,
+            repetition_penalty=repetition_penalty,
             id_slot=id_slot,
         )
 
