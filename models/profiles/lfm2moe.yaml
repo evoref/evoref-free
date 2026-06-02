@@ -20,3 +20,11 @@ sampling:
   temperature: 0.2
   top_k: 80
   repetition_penalty: 1.05
+# reasoning (thinking)。LFM2.5-8B-A1B は reasoning モデルだが、chat_template に
+# enable_thinking トグルが無い (Qwen3 と異なる)。<think> は履歴の thinking 描画用のみで、
+# 生成プロンプトは素の <|im_start|>assistant で OFF スイッチが無い → mode: always。
+# enable_thinking は送らず (テンプレが解釈しない)、reasoning_budget で思考量を抑制する
+# (budget=0 で実質抑止。--reasoning-format auto が <think> をパースする前提)。
+# 出力に残る <think> は _ReasoningFilter が post-strip する。
+reasoning:
+  mode: always

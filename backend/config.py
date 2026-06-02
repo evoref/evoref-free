@@ -226,6 +226,26 @@ _PROFILE_SAMPLING_KEYS = (
     "temperature", "top_p", "top_k", "presence_penalty", "repetition_penalty",
 )
 
+# モデル arch プロファイルの reasoning 既定キャッシュ。((絶対パス, mtime_ns) -> dict)
+_profile_reasoning_cache: dict[tuple[str, int], dict] = {}
+
+# template family -> reasoning mode の fallback 対応 (プロファイル無宣言時に
+# detect_template_family の結果から推定する)。
+#   toggle = enable_thinking で ON/OFF 可 (Qwen3)
+#   always = 常時 reasoning・OFF 不可 (DeepSeek-R1 / gpt-oss harmony)。enable_thinking は
+#            送らないが reasoning_budget は honor しうる
+#   none   = reasoning 非対応 (Gemma / Llama3 / 素の ChatML)
+# unknown は map に載せず None (= 不明、ゲートしない / 後方互換) とする。
+_TEMPLATE_FAMILY_REASONING_MODE: dict[str, str] = {
+    "qwen3_thinking": "toggle",
+    "deepseek_r1": "always",
+    "harmony": "always",
+    "gemma": "none",
+    "llama3": "none",
+    "chatml": "none",
+}
+_REASONING_MODES = frozenset({"toggle", "always", "none"})
+
 
 def _resolve_profile_sampling_for_mode(cfg: dict, mode: str) -> dict:
     """アクティブモデルの arch プロファイルから sampling 既定を解決する。
@@ -280,6 +300,117 @@ def _resolve_profile_sampling_for_mode(cfg: dict, mode: str) -> dict:
 
     _profile_sampling_cache[cache_key] = sampling
     return sampling
+
+
+def _resolve_profile_reasoning(cfg: dict, slot: str) -> dict:
+    """slot ("base"|"assist") のモデル arch プロファイルから ``reasoning`` を返す。
+
+    ``auto_model_flags=false`` / モデル未設定 / GGUF 読取失敗 / プロファイル不在 /
+    ``reasoning`` 不在のときは ``{}``。((絶対パス, mtime) でキャッシュ)。
+    """
+    if not (cfg.get("llama", {}) or {}).get("auto_model_flags", True):
+        return {}
+    model_paths = cfg.get("model_paths", {}) or {}
+    key = "base_model" if slot == "base" else "assist_model"
+    model_rel = model_paths.get(key, "")
+    if not model_rel:
+        return {}
+    project_root = get_project_root()
+    model_path = Path(model_rel)
+    if not model_path.is_absolute():
+        model_path = project_root / model_path
+    try:
+        mtime = model_path.stat().st_mtime_ns
+    except OSError:
+        return {}
+    cache_key = (str(model_path), mtime)
+    if cache_key in _profile_reasoning_cache:
+        return _profile_reasoning_cache[cache_key]
+
+    reasoning: dict = {}
+    try:
+        from scripts.launch_llama import load_model_profile, read_gguf_metadata
+
+        meta = read_gguf_metadata(model_path)
+        profile = load_model_profile(meta.get("architecture"), project_root)
+        raw = profile.get("reasoning") or {}
+        if isinstance(raw, dict):
+            reasoning = raw
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Profile reasoning resolution failed for slot %s: %s", slot, e)
+        reasoning = {}
+
+    _profile_reasoning_cache[cache_key] = reasoning
+    return reasoning
+
+
+def resolve_reasoning_mode(
+    cfg: dict, slot: str, *, chat_template: str | None = None,
+) -> str | None:
+    """slot ("base"|"assist") のモデル arch の reasoning mode を返す。
+
+    戻り値: ``"toggle"`` | ``"always"`` | ``"none"`` | ``None`` (不明)。
+      - toggle : ``enable_thinking`` で ON/OFF 可 (Qwen3)
+      - always : 常時 reasoning・OFF 不可 (DeepSeek-R1 / gpt-oss)。``enable_thinking`` は
+                 送らないが ``reasoning_budget`` は honor しうる
+      - none   : reasoning 非対応 (Qwen2 / dense LFM2 等)。reasoning 系 kwarg を送らない
+
+    プロファイル ``reasoning.mode`` を最優先。未宣言かつ ``chat_template`` 提供時は
+    ``detect_template_family()`` から fallback 推定する。どちらでも不明なら ``None``。
+    """
+    mode = _resolve_profile_reasoning(cfg, slot).get("mode")
+    if mode in _REASONING_MODES:
+        return mode
+    if chat_template:
+        try:
+            from backend.free.llm.model_metadata import detect_template_family
+
+            return _TEMPLATE_FAMILY_REASONING_MODE.get(
+                detect_template_family(chat_template),
+            )
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def resolve_enable_thinking(
+    cfg: dict,
+    slot: str,
+    *,
+    explicit: bool | None,
+    chat_template: str | None = None,
+) -> bool | None:
+    """slot のモデルへ送る ``enable_thinking`` 値を解決する (能力判定 + 優先順位)。
+
+    reasoning mode が ``none`` (思考しない) / ``always`` (常時思考・OFF 不可) の場合は
+    ``enable_thinking`` を送らない (``None``)。``toggle`` / 不明 (``None``) の場合は
+    優先順位 config 明示 (``explicit``) > プロファイル ``reasoning.enable_thinking`` 既定
+    > ``None`` で解決する。
+
+    Args:
+        slot: ``"base"`` | ``"assist"``。
+        explicit: config 明示値 (base=``llama.enable_thinking`` / assist=
+            ``chat_template_kwargs.enable_thinking``)。未指定は ``None``。
+        chat_template: 取得済みなら渡す (base は ``metadata.chat_template``)。能力 fallback 用。
+
+    Returns:
+        送信すべき ``enable_thinking``、または ``None`` (送らない)。
+    """
+    mode = resolve_reasoning_mode(cfg, slot, chat_template=chat_template)
+    if mode in ("none", "always"):
+        if explicit is not None:
+            logger.warning(
+                "enable_thinking ignored for %s model: reasoning mode=%s does not "
+                "support enable_thinking toggle (override via "
+                "models/profiles/<arch>.yaml reasoning.mode)",
+                slot, mode,
+            )
+        return None
+
+    if explicit is not None:
+        return explicit
+    default = _resolve_profile_reasoning(cfg, slot).get("enable_thinking")
+    return default if isinstance(default, bool) else None
 
 
 def get_mode_generation_params(mode: str) -> dict:

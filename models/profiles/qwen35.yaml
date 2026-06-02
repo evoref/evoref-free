@@ -17,3 +17,12 @@ moe:
   enabled: false
   n_cpu_moe: null
 sampling: {}
+# reasoning (thinking)。mode は toggle (enable_thinking で ON/OFF 可) / always
+# (常時思考・OFF 不可、例 DeepSeek-R1) / none (非対応) の3値。
+# toggle/always のみ reasoning_budget を送信、toggle のみ enable_thinking を送信する
+# (非対応 arch には送らず HTTP 400 回避)。enable_thinking は config
+# (llama.enable_thinking / assist の chat_template_kwargs) 未指定時の既定値。
+# Qwen3.5 は thinking 切替対応 (toggle)・既定 OFF (速度優先)。
+reasoning:
+  mode: toggle
+  enable_thinking: false

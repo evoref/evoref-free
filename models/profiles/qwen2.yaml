@@ -20,3 +20,7 @@ moe:
   enabled: false
   n_cpu_moe: null
 sampling: {}
+# reasoning (thinking)。Qwen2.5 / Qwen2 は非 reasoning (mode: none)。
+# enable_thinking / reasoning_budget を送らない (HTTP 400 回避)。
+reasoning:
+  mode: none

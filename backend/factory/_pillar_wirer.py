@@ -104,12 +104,18 @@ async def _init_llama_server(
             f"{llama_url}/health", label="llama-server (base)",
         )
         metadata = await fetch_model_metadata(llama_url, debug_logger=debug_logger)
+        from backend.config import resolve_enable_thinking
+        base_enable_thinking = resolve_enable_thinking(
+            cfg, "base",
+            explicit=llama_cfg.get("enable_thinking"),
+            chat_template=getattr(metadata, "chat_template", None),
+        )
         client = LocalClient(
             llama_url,
             metadata,
             cache_prompt=llama_cfg.get("cache_prompt", True),
             slots=llama_cfg.get("slots", 1),
-            enable_thinking=llama_cfg.get("enable_thinking", None),
+            enable_thinking=base_enable_thinking,
             stream_first_token_timeout=llama_cfg.get(
                 "stream_first_token_timeout_sec", 60.0,
             ),

@@ -851,6 +851,21 @@ def _gguf_read_scalar(f, vtype: int) -> object:
     raise ValueError(f"unsupported GGUF scalar type: {vtype}")
 
 
+def _gguf_read_scalar_or_skip(f, vtype: int) -> object:
+    """スカラーは値を返す。ARRAY (ハイブリッド/MoE の per-layer 値等) は
+    バイト列を消費して ``None`` を返し、ストリーム同期を維持する。
+
+    ``_gguf_read_scalar`` は ARRAY を扱えず即 ``ValueError`` を送出するが、
+    その際に配列バイト列を一切消費しないため、呼び出し側が例外を握りつぶすと
+    ファイルポインタが取り残されて以降のパースが全て desync する
+    (例: LFM2-MoE の ``attention.head_count_kv`` は ARRAY[int32])。
+    """
+    if vtype == _GGUF_TYPE_ARRAY:
+        _gguf_skip_value(f, vtype)
+        return None
+    return _gguf_read_scalar(f, vtype)
+
+
 def _gguf_skip_value(f, vtype: int) -> None:
     """GGUF metadata 値を読み飛ばす (block_count 抽出に不要な値の高速 skip)。"""
     if vtype == _GGUF_TYPE_ARRAY:
@@ -907,7 +922,7 @@ def _read_gguf_layer_count(gguf_path: Path) -> int | None:
                     except (TypeError, ValueError):
                         return None
                 _gguf_skip_value(f, vtype)
-    except (OSError, struct.error, UnicodeDecodeError, ValueError):
+    except (OSError, struct.error, UnicodeDecodeError, ValueError, MemoryError):
         return None
     return None
 
@@ -956,46 +971,46 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
                 key = f.read(key_len).decode("utf-8", errors="replace")
                 (vtype,) = struct.unpack("<I", f.read(4))
                 if key == "general.architecture":
-                    val = _gguf_read_scalar(f, vtype)
+                    val = _gguf_read_scalar_or_skip(f, vtype)
                     result["architecture"] = str(val) if val is not None else None
                 elif key.endswith(".context_length"):
                     try:
-                        result["context_length"] = int(_gguf_read_scalar(f, vtype))
+                        result["context_length"] = int(_gguf_read_scalar_or_skip(f, vtype))
                     except (TypeError, ValueError):
                         pass
                 elif key.endswith(".expert_count"):
                     try:
-                        result["expert_count"] = int(_gguf_read_scalar(f, vtype))
+                        result["expert_count"] = int(_gguf_read_scalar_or_skip(f, vtype))
                     except (TypeError, ValueError):
                         pass
                 elif key.endswith(".block_count"):
                     try:
-                        result["block_count"] = int(_gguf_read_scalar(f, vtype))
+                        result["block_count"] = int(_gguf_read_scalar_or_skip(f, vtype))
                     except (TypeError, ValueError):
                         pass
                 elif key.endswith(".attention.head_count_kv"):
                     try:
-                        result["head_count_kv"] = int(_gguf_read_scalar(f, vtype))
+                        result["head_count_kv"] = int(_gguf_read_scalar_or_skip(f, vtype))
                     except (TypeError, ValueError):
                         pass
                 elif key.endswith(".attention.head_count"):
                     try:
-                        result["head_count"] = int(_gguf_read_scalar(f, vtype))
+                        result["head_count"] = int(_gguf_read_scalar_or_skip(f, vtype))
                     except (TypeError, ValueError):
                         pass
                 elif key.endswith(".attention.key_length"):
                     try:
-                        result["key_length"] = int(_gguf_read_scalar(f, vtype))
+                        result["key_length"] = int(_gguf_read_scalar_or_skip(f, vtype))
                     except (TypeError, ValueError):
                         pass
                 elif key.endswith(".attention.value_length"):
                     try:
-                        result["value_length"] = int(_gguf_read_scalar(f, vtype))
+                        result["value_length"] = int(_gguf_read_scalar_or_skip(f, vtype))
                     except (TypeError, ValueError):
                         pass
                 elif key.endswith(".embedding_length"):
                     try:
-                        result["embedding_length"] = int(_gguf_read_scalar(f, vtype))
+                        result["embedding_length"] = int(_gguf_read_scalar_or_skip(f, vtype))
                     except (TypeError, ValueError):
                         pass
                 elif key == "tokenizer.chat_template":
@@ -1003,7 +1018,9 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
                     _gguf_skip_value(f, vtype)
                 else:
                     _gguf_skip_value(f, vtype)
-    except (OSError, struct.error, UnicodeDecodeError, ValueError):
+    except (OSError, struct.error, UnicodeDecodeError, ValueError, MemoryError):
+        # MemoryError は desync で巨大な length を読んだ場合の backstop。
+        # docstring の「パース失敗は安全な既定値を返す」契約に合わせる。
         return result
     return result
 

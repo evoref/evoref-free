@@ -91,12 +91,18 @@ async def _try_lazy_connect(state: AppState, llama_url: str, llama_cfg: dict) ->
     debug_logger = getattr(state, "debug_logger", None)
     try:
         metadata = await fetch_model_metadata(llama_url, debug_logger=debug_logger)
+        from backend.config import resolve_enable_thinking
+        base_enable_thinking = resolve_enable_thinking(
+            get_config(), "base",
+            explicit=llama_cfg.get("enable_thinking"),
+            chat_template=getattr(metadata, "chat_template", None),
+        )
         client = LocalClient(
             llama_url,
             metadata,
             cache_prompt=llama_cfg.get("cache_prompt", True),
             slots=llama_cfg.get("slots", 1),
-            enable_thinking=llama_cfg.get("enable_thinking", None),
+            enable_thinking=base_enable_thinking,
             debug_logger=debug_logger,
         )
         if await client.health_check():
