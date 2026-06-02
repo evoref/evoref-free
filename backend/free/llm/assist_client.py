@@ -436,6 +436,26 @@ class AssistModelClient(BaseHTTPClient):
             dict(raw_kwargs) if isinstance(raw_kwargs, dict) else {}
         )
 
+        # 能力ゲート: assist モデルの reasoning mode を解決し、enable_thinking /
+        # reasoning_budget の送信可否を決める。
+        #   none   = reasoning 系を一切送らない (非 thinking モデルでの HTTP 400 回避)
+        #   always = enable_thinking は送らない (OFF 不可) が reasoning_budget は送る
+        #            (budget=0 等で常時思考を抑制できるため)
+        #   toggle = 従来どおり enable_thinking + reasoning_budget
+        from backend.config import resolve_enable_thinking, resolve_reasoning_mode
+
+        self._reasoning_mode = resolve_reasoning_mode(config, "assist")
+        # reasoning_budget は mode="none" のときだけ送らない (always/toggle は honor しうる)
+        self._reasoning_capability_off = self._reasoning_mode == "none"
+        resolved_enable_thinking = resolve_enable_thinking(
+            config, "assist",
+            explicit=self._chat_template_kwargs.get("enable_thinking"),
+        )
+        if resolved_enable_thinking is None:
+            self._chat_template_kwargs.pop("enable_thinking", None)
+        else:
+            self._chat_template_kwargs["enable_thinking"] = resolved_enable_thinking
+
         # モデルサイズ推定 (LLM 呼び出しインターバル計算用)
         # 優先順位:
         #   1. assist_model.local.params_b (config 明示指定)
@@ -630,9 +650,11 @@ class AssistModelClient(BaseHTTPClient):
         # 指定し、かつ purpose 別 ``reasoning_budgets`` も未設定にすれば、本処理は
         # ``chat_template_kwargs`` キー自体をペイロードから外す。
         chat_template_kwargs = dict(self._chat_template_kwargs)
-        budget = self._resolve_reasoning_budget(purpose)
-        if budget is not None:
-            chat_template_kwargs["reasoning_budget"] = budget
+        # thinking 非対応 arch には reasoning_budget も送らない (能力ゲート)。
+        if not self._reasoning_capability_off:
+            budget = self._resolve_reasoning_budget(purpose)
+            if budget is not None:
+                chat_template_kwargs["reasoning_budget"] = budget
         if chat_template_kwargs:
             payload["chat_template_kwargs"] = chat_template_kwargs
 

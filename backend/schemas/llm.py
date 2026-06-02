@@ -98,7 +98,9 @@ class LlamaConfig(BaseModel):
     )
     max_tokens: int = Field(default=1024, ge=0)  # 0=無制限
     lora_target: str = "auto"
-    enable_thinking: bool | None = False
+    # None = 未指定 (arch プロファイルの reasoning.enable_thinking / 能力判定で決定。
+    # 非対応 arch には送らない)。True/False = ユーザー明示でプロファイルを上書き。
+    enable_thinking: bool | None = None
     # SSE ストリーミング受信開始までの read timeout (秒)。
     # llama-server 再起動直後の冷えた KV キャッシュ + 長いプロンプトで prefill が
     # 30s を超える環境 (iGPU 等) では 60〜120s に引き上げる。

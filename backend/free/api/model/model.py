@@ -537,12 +537,18 @@ async def reload_model(state: AppState = Depends(get_app_state)):
 
         debug_logger = getattr(state, "debug_logger", None)
         metadata = await fetch_model_metadata(llama_url, debug_logger=debug_logger)
+        from backend.config import resolve_enable_thinking
+        base_enable_thinking = resolve_enable_thinking(
+            cfg, "base",
+            explicit=llama_cfg.get("enable_thinking"),
+            chat_template=getattr(metadata, "chat_template", None),
+        )
         client = LocalClient(
             llama_url,
             metadata,
             cache_prompt=llama_cfg.get("cache_prompt", True),
             slots=llama_cfg.get("slots", 1),
-            enable_thinking=llama_cfg.get("enable_thinking", None),
+            enable_thinking=base_enable_thinking,
             debug_logger=debug_logger,
         )
         if not await client.health_check():

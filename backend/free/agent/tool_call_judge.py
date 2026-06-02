@@ -801,11 +801,19 @@ class ToolCallJudge:
         import time as _time
         now = _time.time()
 
+        # recall miss の理由を後から追えるよう、最良 (= 最高 sim) の
+        # ``mem.world.url.*`` 候補を記録しておく (candidates は score 降順想定)。
+        best_subject: str | None = None
+        best_sim: float | None = None
+        best_reason = "no_url_candidate"
+
         for fact, sim in candidates:
             if fact.type != "world_fact":
                 continue
             if not fact.subject.startswith("mem.world.url."):
                 continue
+            if best_subject is None:
+                best_subject, best_sim, best_reason = fact.subject, sim, "sim_below_min"
             if sim < min_sim:
                 # candidates は score 降順想定。閾値未満は以降全て無効。
                 break
@@ -834,6 +842,23 @@ class ToolCallJudge:
 
             if url and effective_score >= min_avg:
                 return str(url)
+            # sim は満たしたが score_avg/TTL で落ちたケースを記録 (最初の 1 件のみ)
+            if best_subject == fact.subject and best_reason == "sim_below_min":
+                best_reason = "score_avg_below_min"
+
+        # 引き当て無し: なぜ外れたかを DEBUG で可視化する (閾値チューニングの根拠)。
+        if best_subject is None:
+            logger.debug(
+                "URL recall: no mem.world.url candidate in top-%d for query=%r",
+                top_k, query[:50],
+            )
+        else:
+            logger.debug(
+                "URL recall: no match for query=%r; best candidate subject=%s "
+                "sim=%.3f (min_sim=%.2f) min_record=%.2f reason=%s",
+                query[:50], best_subject, best_sim or 0.0, min_sim,
+                min_avg, best_reason,
+            )
         return None
 
     async def _judge_with_executable_command_recall(
@@ -1604,14 +1629,26 @@ def _normalize_path_separators(path: str) -> str:
 
 
 def _json_to_judgement(data: dict) -> ToolJudgement:
-    """JSON dict を ToolJudgement に変換"""
+    """JSON dict を ToolJudgement に変換
+
+    アシスト応答は ``response_format`` 無効 / 古い llama-server / max_tokens 切断
+    時に ``json_repair`` で機械修復されるため、``tool`` / ``args`` が非想定型
+    (list / str 等) になりうる。``ToolJudgement.tool_args`` は dict 契約なので、
+    下流 (``deliberative._execute_tool`` の ``dict(tool_args)`` 等) が落ちないよう
+    ここで強制正規化する。
+    """
     tool = data.get("tool", "")
+    if not isinstance(tool, str):
+        tool = ""
     if not tool or tool == "no_tool":
         return ToolJudgement(tool_needed=False, source="assist")
+    args = data.get("args", {})
+    if not isinstance(args, dict):
+        args = {}
     return ToolJudgement(
         tool_needed=True,
         tool_name=tool,
-        tool_args=data.get("args", {}),
+        tool_args=args,
         source="assist",
     )
 

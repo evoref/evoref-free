@@ -12,3 +12,7 @@ moe:
   enabled: false
   n_cpu_moe: null
 sampling: {}
+# reasoning (thinking)。dense LFM2 は非 reasoning 想定 (mode: none)。
+# enable_thinking / reasoning_budget を送らない (HTTP 400 回避)。
+reasoning:
+  mode: none

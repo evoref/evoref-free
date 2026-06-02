@@ -15,3 +15,8 @@ moe:
   enabled: false
   n_cpu_moe: null
 sampling: {}
+# reasoning (thinking)。Qwen3 は thinking 切替対応 (mode: toggle)・既定 OFF (速度優先)。
+# mode の意味は qwen35.yaml のコメント参照。
+reasoning:
+  mode: toggle
+  enable_thinking: false

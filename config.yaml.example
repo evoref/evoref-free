@@ -129,7 +129,11 @@ llama:
   cache_type_v: q8_0              # --cache-type-v / KV value 量子化（選択肢は cache_type_k と同一）
   max_tokens: 1024                # チャット応答の最大トークン数（0=無制限、暴走防止に設定推奨）
   lora_target: auto               # LoRA ターゲット自動判定: auto | "q_proj,v_proj" | "linear_proj" 等（Pro 専用）
-  enable_thinking: false          # 思考トークンの有効化（/no_think 制御、モデル対応時のみ）
+  enable_thinking: false          # 思考トークン制御。true/false=明示（プロファイルを上書き）
+                                  # 未設定/コメントアウト時は arch プロファイル (models/profiles/<arch>.yaml)
+                                  # の reasoning.mode/enable_thinking で決定。
+                                  # mode=toggle のみ enable_thinking を送信。mode=always(常時思考・OFF不可)/
+                                  # none(非対応) の arch には enable_thinking を送らない (HTTP 400 回避)
   stream_first_token_timeout_sec: 60.0  # SSE 受信開始までの read timeout (秒)
                                   # llama-server 再起動直後の冷えた KV キャッシュ + 長プロンプトで
                                   # prefill が長引く環境 (iGPU 等) では 90〜120 に引き上げる。
@@ -926,6 +930,10 @@ assist_model:
   #   jinja template が受理した場合に thinking を抑制する保険として機能。
   # - Llama 3 / Mistral 等の非 thinking モデル: {} を指定し、未知 kwarg
   #   送信を完全停止する。
+  # ※ assist モデルの arch プロファイル reasoning.mode による能力ゲート:
+  #   none   = enable_thinking / reasoning_budget を一切送らない (HTTP 400 回避)
+  #   always = enable_thinking は送らない (OFF 不可) が reasoning_budget は送る (budget=0 で抑制可)
+  #   toggle = 本設定どおり enable_thinking + reasoning_budget を送る
   chat_template_kwargs:
     enable_thinking: false
 

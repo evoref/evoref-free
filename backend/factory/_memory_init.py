@@ -306,6 +306,18 @@ def _init_memory(
     set_default_triggers_dir(triggers_dir)
     stm = ShortTermMemory(cfg, triggers_dir=triggers_dir)
 
+    # 他の永続ストア (vector store / experience / learned patterns) と同様、
+    # 前回終了時のスナップショット (_lifespan._shutdown_stm_save が保存) を
+    # 起動時に復元する。これが無いと restart 跨ぎでノートを失い、sleep-time の
+    # URL/コマンド curation や fact 抽出が再起動前のノートを取りこぼす。
+    # stm.load() はファイル未存在なら no-op。save とパスは完全一致させる。
+    try:
+        stm.load(resolver.resolve_local("memory_dir") / "short_term_notes.json")
+        if stm.notes:
+            logger.info("STM loaded on startup: %d notes", len(stm.notes))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("STM load on startup skipped: %s", e)
+
     # ベクトルストア初期化（LTM 用）
     vs = None
     try:

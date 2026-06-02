@@ -471,7 +471,10 @@ class DeliberativeAgent:
             return None
 
         tool_name = judgement.tool_name
-        tool_args = dict(judgement.tool_args)  # コピー
+        # tool_args は dict 契約だが、アシスト応答の機械修復経路で非 dict が
+        # 紛れ込むことがあるため防御的にガードする (cf. _judge_and_execute_tool)。
+        raw_args = judgement.tool_args
+        tool_args = dict(raw_args) if isinstance(raw_args, dict) else {}  # コピー
 
         if not self._tools_registry.has(tool_name):
             logger.warning("Tool not found: %s", tool_name)
