@@ -20,12 +20,8 @@
 		{ value: 'q4_1', label: 'q4_1' },
 		{ value: 'q4_0', label: 'q4_0' }
 	];
-
-	const thinkingOptions = [
-		{ value: 'true', label: 'ON', i18nLabel: 'settings.option.on' },
-		{ value: 'false', label: 'OFF', i18nLabel: 'settings.option.off' },
-		{ value: 'null', label: 'Auto', i18nLabel: 'settings.option.auto' }
-	];
+	// reasoning (enable_thinking) はモデルプロファイル (models/profiles/<arch>.yaml) が
+	// SSOT・起動時のみ反映。管理画面からの実行時切替は持たない (docs/c_15)。
 </script>
 
 <SettingsSection tabId="inference">
@@ -50,7 +46,6 @@
 		<SelectField label="settings.llama.cache_type_v" value={String(llama.cache_type_v ?? 'q8_0')} options={cacheTypeOptions} onchange={fieldUpdater('llama', 'cache_type_v')} />
 		<NumberField label="settings.llama.max_tokens" value={Number(llama.max_tokens ?? 1024)} min={0} description="settings.llama.max_tokens_desc" onchange={fieldUpdater('llama', 'max_tokens')} />
 		<TextField label="settings.llama.lora_target" value={String(llama.lora_target ?? 'auto')} onchange={fieldUpdater('llama', 'lora_target')} />
-		<SelectField label="settings.llama.enable_thinking" value={llama.enable_thinking == null ? 'null' : String(llama.enable_thinking)} options={thinkingOptions} onchange={fieldUpdater('llama', 'enable_thinking')} />
 		<TagListField label="settings.llama.extra_args" value={(llama.extra_args as string[]) ?? []} placeholder="--arg value" onchange={fieldUpdater('llama', 'extra_args')} />
 	</FieldGroup>
 </SettingsSection>

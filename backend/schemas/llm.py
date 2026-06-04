@@ -122,3 +122,42 @@ class LlamaConfig(BaseModel):
     # 解決する (base / assist 共通)。false で全機構 OFF (従来挙動)。
     auto_model_flags: bool = True
     extra_args: list[str] = Field(default_factory=list)
+
+
+class ProfileReasoningConfig(BaseModel):
+    """``models/profiles/<arch>.yaml`` の ``reasoning`` セクション (docs/c_15)。
+
+    reasoning ハンドリングの SSOT。**起動時のプロファイル読込でのみ反映**され、
+    UI/管理画面からの実行時切替は持たない。``server_control`` で 2 経路へ振り分ける:
+    - True (llama.cpp が reasoning を認識する Qwen3/DeepSeek 系): 起動フラグ
+      (``-rea`` / ``--reasoning-format`` / ``--reasoning-budget``) でサーバ側制御。
+    - False (lfm2moe 等 ``thinking=0``): クライアント側ハンドリング
+      (``_ReasoningFilter`` のマーカー駆動除去 / watchdog / 履歴除外)。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 能力宣言
+    mode: Literal["toggle", "always", "none"] = "none"
+    enable_thinking: bool | None = None  # toggle 型の既定
+
+    # サーバ側制御 (server_control=True; 起動フラグへ。AssistModelLocalConfig と同型)
+    # 配線状況の SSOT は docs/c_15 §2.7。reasoning_format は未消費 (--reasoning-format は
+    # profile launch_flags 由来)、budget_default/budget_message のみ起動フラグへ反映。
+    server_control: bool = False
+    reasoning_format: Literal["auto", "deepseek", "deepseek-legacy", "none"] = "auto"
+    budget_default: int = Field(default=-1, ge=-1)
+    budget_message: str = ""
+
+    # クライアント側ハンドリング (server_control=False)
+    # 現状 client_think_budget (watchdog) のみ消費。client_handling は strip 相当のみ・
+    # marker_style/think_open/think_close は _ReasoningFilter のハードコードで未消費・
+    # on_runaway は値保持のみ (watchdog は値に依らず一律 stream 中断)・exclude_from_history は
+    # strip 副作用で達成 (明示配線なし)。詳細は docs/c_15 §2.7。
+    client_handling: Literal["strip", "channel", "passthrough"] = "strip"
+    marker_style: Literal["think_tags", "harmony", "custom"] = "think_tags"
+    think_open: str = "<think>"
+    think_close: str = "</think>"
+    client_think_budget: int = Field(default=512, ge=0)
+    on_runaway: Literal["reask", "truncate", "fallback"] = "fallback"
+    exclude_from_history: bool = True

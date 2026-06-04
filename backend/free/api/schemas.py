@@ -98,6 +98,26 @@ class DebugStatusInfo(BaseModel):
     )
 
 
+class CapabilityInfo(BaseModel):
+    """モデル能力プローブ結果 (docs/c_15_model_capability_adaptation.md)。
+
+    起動/切替時に実機へカナリアを投げて観測した能力。未プローブ / プローブ無効時は
+    ``probed=False`` で観測フィールドは ``None``。``probe_divergence`` は宣言と
+    実機の食い違い (例: json_schema grammar 非強制 / <think> 未閉じ) の記録。
+    """
+    slot: str = ""  # "base" | "assist"
+    model_id: str = ""
+    probed: bool = False
+    effective_reasoning_mode: str | None = None
+    reasoning_separated: bool | None = None
+    emits_think_tags: bool | None = None
+    closes_think_tags: bool | None = None
+    json_schema_enforced: bool | None = None
+    needs_lenient_json: bool = False
+    probe_divergence: list[str] = Field(default_factory=list)
+    probed_at: str = ""
+
+
 class StatusResponse(BaseModel):
     status: str = "ok"
     edition: str = "free"
@@ -113,6 +133,7 @@ class StatusResponse(BaseModel):
     memory: MemoryStats = Field(default_factory=MemoryStats)
     cartridges_loaded: int = 0
     debug: DebugStatusInfo = Field(default_factory=DebugStatusInfo)
+    capabilities: list[CapabilityInfo] = Field(default_factory=list)
 
 
 # ===== Assist Model =====

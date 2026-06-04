@@ -1,0 +1,37 @@
+# Google Gemma-4 系 (arch "gemma4"・非 MoE・reasoning)。
+# gemma-4-E4B-it / gemma-4-E2B-it / gemma-4-12B-it 等の GGUF は
+# general.architecture="gemma4" を報告するため、プロファイル名は gemma4.yaml
+# でなければマッチしない (Gemma3 系 "gemma3" / "gemma3n" とは別アーキ)。
+# E2B/E4B は MatFormer の effective param 表記、12B 等は通常の dense サイズで、
+# いずれもアーキ名は gemma4 (サイズ非依存・本プロファイルで共通カバー)。
+#
+# sampling は意図的に空: プロファイル sampling は modes.* を上書きするため、
+# ここで値を入れると chat (temp 0.7) と coding (temp 0.3) のモード別チューニングを
+# 一律に潰してしまう。Gemma 公式推奨 (temp 1.0 / top_k 64 / top_p 0.95) は単一 arch
+# プロファイルでは chat/coding を区別できないため採用せず、modes.* に委ねる。
+#
+# dense なので MoE 無効 (expert_count=0)。内蔵テンプレートを使うため --jinja を付与。
+launch_flags:
+  - "--jinja"
+  - "--reasoning-format"
+  - "auto"
+moe:
+  enabled: false
+  n_cpu_moe: null
+sampling: {}
+# reasoning (thinking)。chat_template 実測で thinking 切替対応 (mode: toggle)・
+# 既定 OFF (速度優先)。enable_thinking=true で <|think|> を first system turn に注入し、
+# 思考は harmony 系 channel マーカー (<|channel>thought ... <channel|>) で区切られる
+# (Qwen3 の <think>...</think> とは異なる)。
+#
+# server_control: true — クライアント側 _ReasoningFilter は <think> タグをハードコードで
+# 扱い channel マーカーを除去できないため、思考の分離は llama.cpp の gemma4 server 側
+# パーサ (--reasoning-format auto) に委ねる。実機が channel reasoning を分離するかは
+# c_15 capability probe が起動時に観測し、宣言 (prior) を override する。
+# budget_default: -1 (制限なし) なので起動時に --reasoning-budget は付与されない。
+reasoning:
+  mode: toggle
+  enable_thinking: false
+  server_control: true
+  reasoning_format: auto
+  budget_default: -1

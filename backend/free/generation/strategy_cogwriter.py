@@ -54,6 +54,18 @@ _CODE_PLAN_PROMPT = """\
 【既存コード情報（RAG）】{rag_context}
 【関連メモリ】{memory_context}
 
+設計方針:
+- **【ユーザー指示】で要求されたプログラムを正確に実装する**。【既存コード情報（RAG）】
+  【関連メモリ】に別プログラム（別のゲーム等）のコードや設計が含まれていても、それを
+  流用・模倣しない。参考情報がユーザー指示と矛盾する場合は **ユーザー指示を最優先** する。
+- units は **単一責務ごとに細かく分割** する (1 関数 / 1 クラス / 1 型定義 = 1 unit)。
+  大きな関数は補助 unit に分け各 unit を小さく保つ (ローカル LLM が 1 回の生成で
+  安定して出力できる粒度にする = 品質向上)。
+- 規模が大きい場合は **論理的なまとまりごとに別ファイル** へ分割し、各 unit の
+  file_path を適切に振り分ける (例: 本体 / ユーティリティ / 型定義 / テスト)。
+  単一ファイルで十分なら全 unit を同じ file_path にする。
+- depends_on で unit 間の依存を明示し、生成順を正す。
+
 出力形式:
 {{
   "content_type": "code",
@@ -65,10 +77,18 @@ _CODE_PLAN_PROMPT = """\
     {{
       "kind": "types",
       "name": "TokenBudget",
-      "file_path": "backend/free/generation/token_budget.py",
+      "file_path": "token_budget.py",
       "spec": "context_sizeから比率ベースで予算を算出するdataclass",
       "depends_on": [],
-      "estimated_tokens": 400
+      "estimated_tokens": 300
+    }},
+    {{
+      "kind": "function",
+      "name": "compute_budget",
+      "file_path": "token_budget.py",
+      "spec": "TokenBudget を生成する純関数。境界値を検証する",
+      "depends_on": ["TokenBudget"],
+      "estimated_tokens": 300
     }}
   ]
 }}

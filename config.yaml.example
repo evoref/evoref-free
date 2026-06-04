@@ -61,6 +61,12 @@ runtime:
   # で担保する。詳細 docs/e_05_llama_server_endpoint_policy.md。
   llama_endpoint_policy: "oai-only"
 
+  # モデル接続/切替時に実挙動プローブを実行し、宣言と実機の食い違いを観測して
+  # 処理を自動適応するか。true (既定) でバックグラウンド実行 (起動遅延なし)。
+  # プローブ失敗時は prior (プロファイル宣言) にフォールバック。
+  # 詳細 docs/c_15_model_capability_adaptation.md。
+  capability_probe: true
+
   # llama.gpu_layers / assist_model.local.gpu_layers が "auto" の場合に
   # GPU 物理容量から差し引く Vulkan host buffer 予約量 (MiB)。
   # iGPU 環境で embed/reranker (CPU モード) が起動時に確保する pinned buffer 用
@@ -410,6 +416,20 @@ rag:
       only_when_quality: ["uncertain"]  # tracker キー (互換、変更非推奨)
       timeout_s: 5.0              # アシスト wall-clock 上限 (秒)
       context_turns: 2            # アシストプロンプトに含める直前ターン数 (0 で会話文脈なし)
+    content_gate:
+      # 取得直後 (Step 4 マージ後) の chunk 内容精査ゲート。低価値 chunk を
+      # 事前 pruning し、quality judge / query expansion / reranker の候補数を
+      # 縮小する。coding mode を主対象 (chat mode は近似重複除去のみ)。判断に
+      # 迷う marginal band の prose チャンクだけ assist で 1 回関連性を判定する。
+      enabled: true               # coding-mode 事前精査を有効化 (false で無効)
+      relevance_floor: 0.45       # cosine スコア下限 (これ未満を pruning)
+      marginal_band: 0.10         # [floor, floor+band) を assist 判定対象帯とする
+      min_keep: 3                 # 最低保持件数 (生成を枯渇させない)
+      dedup_jaccard: 0.85         # token-set Jaccard 近似重複しきい値 (1.0 で無効)
+      coding_code_signal: true    # coding mode: marginal 帯のコードシグナル判定
+      assist_enabled: true        # marginal band の assist 救済 (false で純ルール)
+      max_per_session: 5          # 1 セッション内の assist 発火上限 (0 以下で無制限)
+      max_per_query: 1            # 1 クエリ内の assist 発火上限 (0 以下で無制限)
 
 # ===== 埋め込みモデル設定 =====
 embedding:
@@ -775,6 +795,7 @@ agent:
   content_gen_timeout: 600               # ファイル内容生成の総上限秒数（低速 GPU でも完走できるよう緩和）
   llm_call_timeout: 90                   # 計画生成など単発 LLM 呼出のタイムアウト（秒）
   total_timeout: 900                     # Meta-Cognitive 全体のタイムアウト（秒、content_gen_timeout を内包）
+  delegate_codegen_to_longform: true     # coding: editor/chat のコード生成を LongForm 細粒度生成へ委譲(複数ファイル可)。false で単一ショット生成
 
 # ===== ツール設定 =====
 tools:
@@ -1005,6 +1026,8 @@ long_form:
   rolling_short_term_chars: 1000    # ローリング短期メモリの文字数
   review_enabled: true              # レビューフェーズの有効/無効
   max_revisions: 3                  # 最大修正回数（0=レビューのみ）
+  repair_enabled: true              # 生成後の検証ゲート付きコードリペア(文法/未定義名の自動修正)
+  max_repair_rounds: 2              # コードリペアの最大ラウンド数(0=無効)。Python は AST 厳密検証、他言語は assist 自己点検
   rag_per_unit: true                # ユニットごとにRAG検索を実行
   rag_top_k_per_unit: 3             # ユニットごとのRAG上位件数
   total_timeout_sec: 1800           # 1リクエストの総時間上限(秒)。0=無効。超過時は生成済みユニットで部分結果打ち切り

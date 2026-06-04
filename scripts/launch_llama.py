@@ -251,6 +251,45 @@ def _append_reasoning_args(cmd: list[str], section_cfg: dict) -> None:
         cmd += ["--reasoning-budget-message", message]
 
 
+def _profile_reasoning_for_model(model_path: Path, project_root: Path) -> dict:
+    """モデルパスから arch プロファイルの ``reasoning`` セクション (raw dict) を返す。
+
+    GGUF arch 検出 → ``load_model_profile`` で解決。失敗 / 不在時は ``{}``。
+    検証は backend 側 ``_resolve_profile_reasoning`` (ProfileReasoningConfig) で行うため
+    ここでは raw を返す (docs/c_15)。
+    """
+    try:
+        meta = read_gguf_metadata(model_path)
+        profile = load_model_profile(meta.get("architecture"), project_root)
+        r = profile.get("reasoning")
+        return r if isinstance(r, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _append_base_reasoning_args(cmd: list[str], reasoning: dict) -> None:
+    """ベースモデルの ``profile.reasoning`` から server 側 reasoning 起動フラグを付与する。
+
+    ``server_control: true`` (llama.cpp が reasoning を認識する Qwen3/DeepSeek 系) の
+    ときのみ、思考の上限化 (``--reasoning-budget``) と budget message を付与する。
+    ``--reasoning-format`` は profile ``launch_flags`` 由来を尊重し、on/off は
+    ``enable_thinking`` (リクエスト側 ``_build_payload``) で制御するため、ここでは emit しない。
+    ``server_control: false`` (``thinking=0`` = lfm2moe 等) は no-op
+    (クライアント側 ``_ReasoningFilter`` で扱う、docs/c_15)。
+    """
+    if not reasoning.get("server_control"):
+        return
+    try:
+        budget = int(reasoning.get("budget_default", -1))
+    except (TypeError, ValueError):
+        budget = -1
+    if budget >= 0:
+        cmd += ["--reasoning-budget", str(budget)]
+    message = reasoning.get("budget_message", "")
+    if isinstance(message, str) and message:
+        cmd += ["--reasoning-budget-message", message]
+
+
 # ── self-speculative decoding 解決 ───────────────────────
 
 
@@ -504,6 +543,14 @@ def build_llama_cmd(
     )
     cmd += spec_args
 
+    # profile.reasoning (server_control:true = Qwen3/DeepSeek 系) から server 側
+    # reasoning 起動フラグ (--reasoning-budget 等) を付与する。resolve_auto_model_flags
+    # の前に置き fixed_flags で重複を防ぐ (docs/c_15)。on/off は enable_thinking
+    # (リクエスト側 _build_payload) が担い、thinking=0 モデルは no-op。
+    _append_base_reasoning_args(
+        cmd, _profile_reasoning_for_model(base_model_path, project_root),
+    )
+
     # モデル arch 別の自動フラグ (--jinja / --reasoning-format / MoE)。
     # extra_args の直前に挿入し、ユーザー指定 (extra_args) を最終 override とする。
     cmd += resolve_auto_model_flags(
@@ -512,7 +559,7 @@ def build_llama_cmd(
         fixed_flags={
             "-m", "--port", "-c", "-ngl", "-b", "-t", "-fa", "--mlock",
             "-np", "--cache-type-k", "--cache-type-v", "--cache-ram",
-            "--kv-unified", "--lora",
+            "--kv-unified", "--lora", "--reasoning-budget", "--reasoning-budget-message",
         },
         project_root=project_root,
         warn=lambda m: print(m, file=sys.stderr),

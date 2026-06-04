@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from backend.free.agent.agent_state import AgentState
+from backend.free.agent.code_artifact_generator import CodeArtifactGenerator
 from backend.free.agent.event_reminder import EventReminderSystem
 from backend.free.agent.self_cartridge import (
     AgentConstants,
@@ -79,14 +80,18 @@ Output a JSON object with a single field "tasks", which is an array of strings �
 each entry being one task description.
 
 IMPORTANT rules:
+- Implement EXACTLY the program/feature the user requested, using the user's own terms. \
+NEVER substitute a different or merely "similar" program. IGNORE any unrelated program \
+names that appear in the examples below or in prior conversation context — they are \
+illustrations of FORMAT only, not of WHAT to build.
 - NEVER invent a file path. Only include a file path in a task when the USER explicitly \
 gave one. If the user did not specify an output location, describe the task WITHOUT any path.
-  BAD  (user gave no path): {"tasks": ["Create e:\\\\app\\\\tetris.py with full game implementation"]}
-  GOOD (user gave no path): {"tasks": ["Generate a full Tetris game implementation"]}
-  GOOD (user said save to e:\\\\app\\\\tetris.py): {"tasks": ["Create e:\\\\app\\\\tetris.py with full game implementation"]}
+  BAD  (user gave no path): {"tasks": ["Create e:\\\\app\\\\solution.py with the full implementation"]}
+  GOOD (user gave no path): {"tasks": ["Generate the full program the user requested"]}
+  GOOD (user said save to e:\\\\app\\\\solution.py): {"tasks": ["Create e:\\\\app\\\\solution.py with the full implementation"]}
 - Creating or rewriting a SINGLE file is always ONE task, not multiple tasks.
-  BAD:  {"tasks": ["Create grid logic", "Add rotation", "Add input handling"]}
-  GOOD: {"tasks": ["Generate a full Tetris game implementation"]}
+  BAD:  {"tasks": ["Create the core logic", "Add feature A", "Add input handling"]}
+  GOOD: {"tasks": ["Generate the full program the user requested in a single file"]}
 - Only split into multiple tasks when genuinely different files or operations are needed.
 - Each task should have a SINGLE action type. Do NOT combine "fetch/read" and "write/create" \
 in one task.
@@ -178,6 +183,7 @@ class MetaCognitiveAgent:
         assist_client: "AssistModelClient | None" = None,
         debug_logger: "DebugLogger | None" = None,
         semmem_block: str | None = None,
+        code_generator: CodeArtifactGenerator | None = None,
     ) -> None:
         self.max_steps = max_steps
         cfg = config or {}
@@ -186,6 +192,10 @@ class MetaCognitiveAgent:
         # (チャット初回ターンと同じ MemoryInjector 出力。reactive 以外の
         #  全ターンで policy / failure_pattern facts を維持するため)
         self._semmem_block = semmem_block
+        # coding モードで editor/chat 出力のコード生成を LongForm 細粒度生成へ
+        # 委譲する (composition が注入)。None なら従来の単一ショット生成。
+        self._code_generator = code_generator
+        self._mode = "coding"
         self.compactor = StepCompactor(cfg, policy=policy)
         self.reminder_system = EventReminderSystem(cfg)
         self._tool_judge = tool_judge
@@ -370,6 +380,7 @@ class MetaCognitiveAgent:
         # 出力先パス未指定 (editor/chat 経路) で生成したコードの蓄積先。
         # process 呼び出しごとにリセット (meta_agent はリクエスト毎に生成される)。
         self._output_target = output_target
+        self._mode = mode
         self._editor_artifacts: list[EditorArtifact] = []
         self._chat_code_parts: list[str] = []
 
@@ -664,6 +675,18 @@ class MetaCognitiveAgent:
 
         return steps
 
+    async def _delegate_code_generation(
+        self, original_query: str, on_step,
+    ) -> list[EditorArtifact]:
+        """code_generator へ委譲。失敗時は空リストでフォールバックさせる。"""
+        if self._code_generator is None:
+            return []
+        try:
+            return await self._code_generator(original_query, on_step)
+        except Exception as e:  # noqa: BLE001 — 委譲失敗は単一生成へフォールバック
+            logger.warning("Code generation delegation failed: %s", e)
+            return []
+
     async def _execute_editor_task(
         self,
         task: TaskItem,
@@ -687,6 +710,19 @@ class MetaCognitiveAgent:
                 "detail": f"{prefix} コンテンツ生成中...",
                 "status": "running",
             })
+        # coding モード: LongForm 細粒度生成へ委譲 (複数ファイル可)。空リスト
+        # (テキスト判定 / degraded / 失敗) なら従来の単一ショット生成へフォールバック。
+        if self._mode == "coding":
+            artifacts = await self._delegate_code_generation(original_query, on_step)
+            if artifacts:
+                if self._output_target == "chat":
+                    for art in artifacts:
+                        self._chat_code_parts.append(
+                            f"```{art.language}\n{art.content}\n```"
+                        )
+                else:
+                    self._editor_artifacts.extend(artifacts)
+                return f"Generated {len(artifacts)} file(s)", []
         content = await self._generate_content(
             original_query, task.description, llm_client,
         )

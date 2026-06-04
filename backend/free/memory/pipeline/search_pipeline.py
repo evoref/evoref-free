@@ -11,6 +11,7 @@ import numpy as np
 
 from backend.log_config import get_logger
 from backend.trace_context import run_in_executor_with_context
+from backend.free.rag.chunk_content_gate import ChunkContentGate, GateConfig
 from backend.free.rag.reranker_skip import (
     evaluate_reranker_skip,
     is_skip_config_active,
@@ -498,6 +499,22 @@ async def unified_search(
     # Step 4: 結果マージ + スコア正規化（< 0.5ms）
     merged = _merge_results(stm_results, ltm_results, cart_results)
     logger.debug("Step 4 merge: %d unique results after dedup", len(merged))
+
+    # Step 4.5: 取得直後の内容精査ゲート — 低価値 chunk を pruning し、後続の
+    # 品質判定 / クエリ拡張 / reranker forward pass の候補数を縮小する。
+    # coding mode を主対象 (chat mode は近似重複除去のみ)。marginal band の
+    # prose のみ assist で 1 回関連性判定する (assist 無/cap 超過/error は純ルール)。
+    gate_cfg = GateConfig.from_rag_cfg(rag_cfg)
+    if gate_cfg.enabled and merged:
+        merged = await ChunkContentGate(
+            gate_cfg, debug_logger=debug_logger,
+        ).filter(
+            query, merged, mode,
+            assist_client=assist_client,
+            tracker=assist_judge_tracker,
+            session_id=session_id,
+        )
+        logger.debug("Step 4.5 content gate: %d results after prune", len(merged))
 
     # Step 5: Self-RAG 品質判定 + (オプション) アシスト強化（< 0.1ms）
     thresholds = QualityThresholds.from_config(rag_cfg)

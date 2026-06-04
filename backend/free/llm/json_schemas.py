@@ -60,6 +60,19 @@ class RetrievalNecessityJudgement(_StrictModel):
     action: Literal["retrieve", "fetch", "skip"]
 
 
+# ── 取得直後 content gate の関連性判定 (retrieval_chunk_gate) ──
+
+class ChunkGateRelevance(_StrictModel):
+    """`backend/free/rag/chunk_content_gate.py` の marginal band 関連性判定。
+
+    クエリに関連する候補チャンクの 0 始まりインデックスのみを返す。OpenAI
+    strict / llama.cpp 制約サンプリングは top-level に object が必要なため
+    ``relevant_indices`` キーで配列をラップする (``list_key`` で裸配列も救済)。
+    """
+
+    relevant_indices: list[int]
+
+
 # ── 失敗パターン分析 (critique_synthesis) ──
 
 class CritiqueSynthesisResult(_StrictModel):
@@ -263,6 +276,7 @@ class EditorFilenameResult(_StrictModel):
 PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "retrieval_quality_judge": RetrievalQualityJudgement,
     "retrieval_necessity_judge": RetrievalNecessityJudgement,
+    "retrieval_chunk_gate": ChunkGateRelevance,
     "critique_synthesis": CritiqueSynthesisResult,
     "long_form_code_review": ReviewIssues,
     "long_form_text_review": ReviewIssues,
@@ -406,6 +420,7 @@ def resolve_response_format_for_purpose(purpose: str) -> dict[str, Any] | None:
 __all__ = [
     "RetrievalQualityJudgement",
     "RetrievalNecessityJudgement",
+    "ChunkGateRelevance",
     "CritiqueSynthesisResult",
     "CodeUnitPlan",
     "SectionUnitPlan",
