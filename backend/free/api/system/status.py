@@ -13,6 +13,7 @@ from backend.free.api.system._status_collectors import (
     resolve_log_dir,
 )
 from backend.free.api.schemas import (
+    CapabilityInfo,
     ComponentStatus,
     DebugStatusInfo,
     LlamaServerInfo,
@@ -91,12 +92,13 @@ async def _try_lazy_connect(state: AppState, llama_url: str, llama_cfg: dict) ->
     debug_logger = getattr(state, "debug_logger", None)
     try:
         metadata = await fetch_model_metadata(llama_url, debug_logger=debug_logger)
-        from backend.config import resolve_enable_thinking
+        from backend.config import resolve_client_reasoning, resolve_enable_thinking
         base_enable_thinking = resolve_enable_thinking(
             get_config(), "base",
             explicit=llama_cfg.get("enable_thinking"),
             chat_template=getattr(metadata, "chat_template", None),
         )
+        think_budget, on_runaway = resolve_client_reasoning(get_config(), "base")
         client = LocalClient(
             llama_url,
             metadata,
@@ -104,6 +106,8 @@ async def _try_lazy_connect(state: AppState, llama_url: str, llama_cfg: dict) ->
             slots=llama_cfg.get("slots", 1),
             enable_thinking=base_enable_thinking,
             debug_logger=debug_logger,
+            client_think_budget=think_budget,
+            on_runaway=on_runaway,
         )
         if await client.health_check():
             state.set_local_client(client)
@@ -112,6 +116,37 @@ async def _try_lazy_connect(state: AppState, llama_url: str, llama_cfg: dict) ->
     except Exception as e:
         logger.debug("llama-server lazy-connect failed: %s", e)
     return False
+
+
+def _collect_capabilities(state: AppState) -> list[CapabilityInfo]:
+    """base / assist クライアントの能力プローブ結果を Status 用に収集する (docs/c_15)。
+
+    プローブ未完了 / 無効 (``capabilities is None``) の slot は含めない。
+    """
+    from backend.free.llm.capability import CapabilitySnapshot
+
+    out: list[CapabilityInfo] = []
+    for slot, client in (("base", state.local_client), ("assist", state.assist_client)):
+        snap = getattr(client, "capabilities", None) if client is not None else None
+        # 実 snapshot のみ採用 (MagicMock の自動属性 / None を弾く)
+        if not isinstance(snap, CapabilitySnapshot):
+            continue
+        out.append(
+            CapabilityInfo(
+                slot=slot,
+                model_id=snap.model_id or "",
+                probed=snap.probed,
+                effective_reasoning_mode=snap.effective_reasoning_mode,
+                reasoning_separated=snap.reasoning_separated,
+                emits_think_tags=snap.emits_think_tags,
+                closes_think_tags=snap.closes_think_tags,
+                json_schema_enforced=snap.json_schema_enforced,
+                needs_lenient_json=snap.needs_lenient_json,
+                probe_divergence=list(snap.probe_divergence or []),
+                probed_at=snap.probed_at or "",
+            ),
+        )
+    return out
 
 
 def _collect_debug_info(cfg: dict, state: AppState) -> DebugStatusInfo:
@@ -247,4 +282,5 @@ async def get_status(state: AppState = Depends(get_app_state)):
         components=components,
         memory=memory,
         debug=debug_info,
+        capabilities=_collect_capabilities(state),
     )

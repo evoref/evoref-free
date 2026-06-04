@@ -458,6 +458,44 @@ class DebugLogger:
             entry["source"] = source
         self._emit("rag", entry)
 
+    def log_content_gate(
+        self,
+        *,
+        query_preview: str,
+        mode: str,
+        input_count: int,
+        kept_count: int,
+        dropped_floor: int,
+        dropped_dedup: int,
+        assist_used: bool,
+        assist_dropped: int,
+        assist_skipped_reason: str = "",
+    ) -> None:
+        """取得直後 content gate の prune 結果を ``rag.jsonl`` に記録
+
+        Step 4 マージ後に低価値 chunk を pruning した内訳 (relevance floor /
+        近似重複除去 / 境界 assist) を ``op="content_gate"`` で書き出す。
+        coding/chat mode 別の pruning 率と assist 発火状況を後追いし、
+        しきい値チューニングと品質回帰のモニタリングを可能にする。
+        """
+        if not self.enabled or not self.log_rag:
+            return
+        entry: dict = {
+            "timestamp": _now(),
+            "op": "content_gate",
+            "query_preview": query_preview[:100],
+            "mode": mode,
+            "input_count": input_count,
+            "kept_count": kept_count,
+            "dropped_floor": dropped_floor,
+            "dropped_dedup": dropped_dedup,
+            "assist_used": assist_used,
+            "assist_dropped": assist_dropped,
+        }
+        if assist_skipped_reason:
+            entry["assist_skipped_reason"] = assist_skipped_reason
+        self._emit("rag", entry)
+
     def log_assist_judge(
         self,
         *,

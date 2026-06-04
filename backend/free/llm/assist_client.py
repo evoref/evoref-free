@@ -60,6 +60,9 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     # realtime — チャット応答パス
     "retrieval_quality_judge": "realtime",
     "retrieval_necessity_judge": "realtime",
+    # 取得直後 content gate の marginal band 関連性判定。チャット応答パス
+    # (coding mode) で同期発火するため realtime。
+    "retrieval_chunk_gate": "realtime",
     "tool_judgment": "realtime",
     # executable query (環境依存事実) のコマンド合成。チャット応答パスで
     # tool_call_judge から同期発火するため realtime。
@@ -72,6 +75,9 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     # meta_cognitive のエディタ出力終端) で同期発火し、ユーザはタブ名表示を
     # 待つ。max_tokens 数十・budget 0 の極短呼出なので realtime に乗せる。
     "editor_filename": "realtime",
+    # ツール結果からユーザ質問の答えに必要な要点を抽出する digest。Deliberative の
+    # チャット応答パスで base 生成の直前に同期発火するため realtime。
+    "tool_result_digest": "realtime",
     # background — Sleep-time / 自律ループ / 長文生成
     # conflict_resolution は SleepTimeWorker._step6_resolve_conflicts (run_full)
     # からのみ発火する sleep-time 専用処理。チャット応答パスから同期発火しない
@@ -83,6 +89,9 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     "long_form_planning": "background",
     "long_form_code_review": "background",
     "long_form_text_review": "background",
+    # コードリペア (長文生成末尾の検証ゲート付き修正)。生成完了後に発火する
+    # 重い修正パスで long_form_* と同列。background スロット。
+    "code_repair": "background",
     "ralph_loop": "background",
     "note_evolution": "background",
     "summarize": "background",
@@ -126,6 +135,8 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "long_form_planning": 90.0,
     "long_form_code_review": 90.0,
     "long_form_text_review": 90.0,
+    # コードリペアは assembled 全体を再出力するため long_form_* と同等に確保。
+    "code_repair": 90.0,
     "conflict_resolution": 15.0,
     "critique_synthesis": 45.0,
     "policy_evolution": 45.0,
@@ -133,6 +144,9 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # 検索必要性判定 (1 bit JSON)。チャット応答パスの先頭で同期発火する
     # ため、ユーザ体感を阻害しないよう短く打ち切る。
     "retrieval_necessity_judge": 5.0,
+    # 取得直後 content gate の marginal band 関連性判定 (1 回の batched JSON)。
+    # チャット応答パスで同期発火するため短く打ち切る。
+    "retrieval_chunk_gate": 5.0,
     # executable query 判定 + コマンド合成。チャット応答パスで
     # tool_call_judge から発火する。is_executable: bool + command: str の
     # 短い JSON を返すだけのため、低レイテンシで打ち切る。
@@ -150,6 +164,9 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # Recurrent 戦略の summary 再帰更新。1 セクション末尾を
     # 短文要約するだけのため 30s で十分。
     "summarize": 30.0,
+    # ツール結果 (最大 4096 chars) からの query 連動抽出。チャット応答パスで
+    # 同期発火するが、コスト無視・品質優先方針で余裕を持たせ 20s。
+    "tool_result_digest": 20.0,
     # cartridge eval.json 生成。最大 4000 chars の document を
     # 連結したプロンプトから最大 10 QA を生成する。アシストモデルが
     # thinking 抑制下で QA を逐次出力するのに 60s 程度を想定。長文プラン
@@ -189,12 +206,16 @@ PURPOSE_REASONING_BUDGET_DEFAULTS: dict[str, int] = {
     "long_form_planning": 2048,
     "long_form_code_review": 2048,
     "long_form_text_review": 2048,
+    # コードリペアは検出エラーを明示して渡す機械的修正。thinking 不要で即終了。
+    "code_repair": 0,
     "contextual_prefix": 256,
     "critique_synthesis": 512,
     "conflict_resolution": 0,
     "policy_evolution": 1024,
     # 検索必要性判定は機械的な 1 bit 分類で thinking 不要
     "retrieval_necessity_judge": 0,
+    # content gate の関連性判定も機械的な index 選別で thinking 不要
+    "retrieval_chunk_gate": 0,
     # executable query 判定 + コマンド合成は機械的な抜き出し + 短文生成で
     # thinking 不要。response_format (ExecutableCommandSynth) で構造を固定する。
     "executable_command_synth": 0,
@@ -208,6 +229,8 @@ PURPOSE_REASONING_BUDGET_DEFAULTS: dict[str, int] = {
     "editor_filename": 0,
     # 既存要約 + 新セクションの再要約は機械的処理で thinking 不要
     "summarize": 0,
+    # ツール結果からの要点抽出は機械的処理で thinking 不要 (assist の思考暴走回避)
+    "tool_result_digest": 0,
     # cartridge eval.json QA ペア生成は機械的な抜き出しで
     # thinking 不要。response_format (CartridgeEvalQAList) で構造を固定する。
     "cartridge_eval_generation": 0,
@@ -384,6 +407,11 @@ class AssistModelClient(BaseHTTPClient):
         host = local_cfg.get("host", "127.0.0.1")
         port = local_cfg.get("port", 8081)
         self.url = f"http://{host}:{port}"
+
+        # モデル能力スナップショット (capability probe が背景で確定する; docs/c_15)。
+        # 型: CapabilitySnapshot | None。未プローブ / プローブ無効時は None。
+        self.capabilities = None
+        self._capability_probe_task = None
 
         self.timeout: float = float(assist_cfg.get("timeout", 30))
         super().__init__(timeout=self.timeout)

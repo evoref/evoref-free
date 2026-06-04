@@ -162,11 +162,11 @@ def _load_config_ports(project_root: Path) -> list[int]:
         return default_ports
 
 
-def _taskkill_window_titles() -> None:
+def _taskkill_window_titles(titles: tuple[str, ...] = _WINDOW_TITLES) -> None:
     """Windows: evoref-ctl.bat が立てたウィンドウタイトル単位でツリー kill。"""
     if sys.platform != "win32":
         return
-    for title in _WINDOW_TITLES:
+    for title in titles:
         try:
             subprocess.run(
                 ["taskkill", "/F", "/T", "/FI", f"WINDOWTITLE eq {title}"],
@@ -197,17 +197,33 @@ def _wait_ports_free(ports: list[int], timeout: float, interval: float = 0.5) ->
     return not find_port_occupants(ports)
 
 
-def stop_services(project_root: Path, *, wait_timeout: float = 30.0) -> dict:
-    """全サービス (backend + llama-server) を停止する。frontend は残す。
+def stop_services(
+    project_root: Path,
+    *,
+    wait_timeout: float = 30.0,
+    stop_frontend: bool = False,
+) -> dict:
+    """全サービス (backend + llama-server) を停止する。
+
+    ``stop_frontend=True`` のとき frontend (vite:5173) も停止する
+    (初期化ボタンの「全停止して終了」用)。``False`` のときは従来どおり
+    frontend を残す (再起動経路で生きた vite を保つため)。
 
     ポート占有 kill (backend serve / uvicorn 経路に強い) と
     ウィンドウタイトル kill (evoref-ctl.bat 経路に強い) を併用する。
     """
     config_ports = _load_config_ports(project_root)
-    target_ports = [p for p in config_ports if p != _FRONTEND_PORT]
+    if stop_frontend:
+        target_ports = list(config_ports)
+        if _FRONTEND_PORT not in target_ports:
+            target_ports.append(_FRONTEND_PORT)
+    else:
+        target_ports = [p for p in config_ports if p != _FRONTEND_PORT]
 
     # 1. ウィンドウタイトル + 実行ファイル名で kill (evoref-ctl.bat 起動分)。
-    _taskkill_window_titles()
+    #    全停止時は frontend ウィンドウ (evoref-ctl.bat の "evoref-frontend") も対象。
+    titles = _WINDOW_TITLES + (("evoref-frontend",) if stop_frontend else ())
+    _taskkill_window_titles(titles)
     # 2. ポート占有 PID を kill (evoref serve 起動分 / 取りこぼし)。
     #    自身 (このヘルパー) は対象ポートを LISTEN しないが念のため除外する。
     own_pid = os.getpid()
@@ -289,13 +305,22 @@ def run(
     initial_delay: float = 2.0,
     do_restart: bool = True,
 ) -> int:
-    """停止 → wipe → 再起動の全工程を実行する。"""
+    """停止 → wipe → (再起動) の全工程を実行する。
+
+    ``do_restart=False`` (初期化ボタンの「全停止して終了」) のときは frontend も
+    含めて全サービスを停止し、再起動しない。
+    """
     # backend が 202 を返してブラウザへ届くまでの猶予 (親 backend を kill する前)。
     if initial_delay > 0:
         time.sleep(initial_delay)
 
-    print("[reset] stopping services (backend + llama-server)...")
-    stop_result = stop_services(project_root)
+    shutdown = not do_restart
+    label = (
+        "all services (backend + llama-server + frontend)"
+        if shutdown else "services (backend + llama-server)"
+    )
+    print(f"[reset] stopping {label}...")
+    stop_result = stop_services(project_root, stop_frontend=shutdown)
     print(f"[reset] stop result: {stop_result}")
     if not stop_result["ports_freed"]:
         # ポートが解放されきらなくても wipe は試みる (best-effort)。
@@ -316,6 +341,22 @@ def run(
 
 
 def main(argv: list[str] | None = None) -> int:
+    # pythonw.exe で起動された場合 stdout/stderr が None で print() が失敗する。
+    # ウィンドウを残さず終了するため pythonw で起動するので、進捗ログは temp の
+    # ファイルへ差し替える (local/logs は wipe 対象なので使わない)。
+    if sys.stdout is None or sys.stderr is None:
+        import tempfile
+
+        try:
+            _logf = open(
+                Path(tempfile.gettempdir()) / "evoref_reset.log",
+                "a", encoding="utf-8",
+            )
+            sys.stdout = _logf
+            sys.stderr = _logf
+        except OSError:
+            pass
+
     parser = argparse.ArgumentParser(
         description="Reset local/ data to fresh setup.bat skeleton (Develop only)",
     )

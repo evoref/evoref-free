@@ -43,6 +43,21 @@ export interface DebugStatusInfo {
 	learning: LearningBriefStatus;
 }
 
+/** モデル能力プローブ結果 (docs/c_15)。未プローブ時は probed=false。 */
+export interface CapabilityInfo {
+	slot: string; // "base" | "assist"
+	model_id: string;
+	probed: boolean;
+	effective_reasoning_mode: string | null;
+	reasoning_separated: boolean | null;
+	emits_think_tags: boolean | null;
+	closes_think_tags: boolean | null;
+	json_schema_enforced: boolean | null;
+	needs_lenient_json: boolean;
+	probe_divergence: string[];
+	probed_at: string;
+}
+
 export interface StatusResponse {
 	status: string;
 	edition: string;
@@ -55,6 +70,7 @@ export interface StatusResponse {
 	memory: MemoryStats;
 	cartridges_loaded: number;
 	debug: DebugStatusInfo;
+	capabilities?: CapabilityInfo[];
 }
 
 /** ステータス取得 */

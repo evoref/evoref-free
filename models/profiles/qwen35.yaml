@@ -26,3 +26,6 @@ sampling: {}
 reasoning:
   mode: toggle
   enable_thinking: false
+  server_control: true        # Qwen3.5 系は llama.cpp 認識 (thinking != 0) → サーバ側 reasoning 制御可
+  reasoning_format: auto      # 認識モデルは auto で <think> を reasoning_content に分離
+  budget_default: -1

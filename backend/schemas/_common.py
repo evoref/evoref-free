@@ -109,6 +109,13 @@ class RuntimeConfig(BaseModel):
     # に何らかの異常が出た場合の緊急回避用。
     gpu_auto_tune_enabled: bool = True
 
+    # モデル接続/切替時に実挙動プローブ (reasoning 分離 / <think> / json_schema 強制)
+    # を実行し、宣言と実機の食い違いを観測して処理を自動適応するか。
+    # True (既定) でバックグラウンド実行 (起動遅延なし、完了後に観測値へ切替)。
+    # プローブ失敗時は prior (プロファイル宣言) にフォールバックする。
+    # 詳細 docs/c_15_model_capability_adaptation.md。
+    capability_probe: bool = True
+
 
 class ThemeConfig(BaseModel):
     """テーマ設定"""
@@ -202,6 +209,10 @@ class AgentConfig(BaseModel):
     content_gen_timeout: int = Field(default=600, ge=30)
     llm_call_timeout: int = Field(default=90, ge=10)
     total_timeout: int = Field(default=900, ge=60)
+    # coding モードで editor/chat 出力のコード生成を LongForm 細粒度生成
+    # (CodeUnit 計画 → ファイル別生成・検証・修正) へ委譲する。大規模実装は
+    # 複数ファイルへ分割出力可能。False で従来の単一ショット生成に戻す。
+    delegate_codegen_to_longform: bool = True
 
     @model_validator(mode="after")
     def _validate_content_gen_timeout_order(self) -> "AgentConfig":
@@ -306,6 +317,11 @@ class LongFormConfig(BaseModel):
     rolling_short_term_chars: int = Field(default=1000, ge=100)
     review_enabled: bool = True
     max_revisions: int = Field(default=3, ge=0)
+    # 検証ゲート付きコードリペア: 生成後に assembled を検証し、文法/未定義
+    # エラーが残ればアシストモデルで修正→再検証を繰り返す。Python は AST で
+    # 厳密検証 (構文 + 未定義名)、他言語は assist による軽い構文自己点検。
+    repair_enabled: bool = True
+    max_repair_rounds: int = Field(default=2, ge=0)
     rag_per_unit: bool = True
     rag_top_k_per_unit: int = Field(default=3, ge=1)
     # 長文生成 1 リクエストの総ウォールクロック上限 (秒)。0 で無効化。

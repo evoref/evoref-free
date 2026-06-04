@@ -254,6 +254,14 @@ class _ReasoningFilter:
         self._state = self._NORMAL
         return out
 
+    @property
+    def in_think(self) -> bool:
+        """現在 ``<think>`` 領域 (または Harmony 非 final チャンネル) 内か。
+
+        watchdog (docs/c_15 B3) が「未閉じ思考が続いている」判定に使う。
+        """
+        return self._state in (self._IN_THINK, self._HARMONY_SUPPRESS)
+
 
 @dataclass
 class _ReasoningTimeoutTracker:
@@ -314,6 +322,8 @@ class LocalClient(BaseHTTPClient):
         enable_thinking: bool | None = None,
         stream_first_token_timeout: float = STREAM_FIRST_TOKEN_TIMEOUT,
         debug_logger=None,
+        client_think_budget: int = 0,
+        on_runaway: str = "fallback",
     ):
         super().__init__(timeout=120.0)
         self.url = llama_url
@@ -323,6 +333,20 @@ class LocalClient(BaseHTTPClient):
         self._enable_thinking = enable_thinking
         self._stream_first_token_timeout = stream_first_token_timeout
         self._debug_logger = debug_logger
+        # 暴走 reasoning watchdog (docs/c_15 B3)。profile.reasoning から解決。
+        # client_think_budget>0 のとき、未閉じ <think> がこの chunk 数を超えたら
+        # ストリームを中断する (thinking=0 モデルの runaway 上限化)。サーバ側で
+        # reasoning が分離されるモデルは content に <think> が出ないため発火しない。
+        self._client_think_budget = max(0, int(client_think_budget or 0))
+        self._on_runaway = on_runaway or "fallback"
+        # モデル能力スナップショット (capability probe が背景で確定する; docs/c_15)。
+        # 型: CapabilitySnapshot | None。未プローブ / プローブ無効時は None (prior 動作)。
+        self.capabilities = None
+        self._capability_probe_task = None
+        # モデル能力スナップショット (capability probe が背景で確定する; docs/c_15)。
+        # 型: CapabilitySnapshot | None。未プローブ / プローブ無効時は None (prior 動作)。
+        self.capabilities = None
+        self._capability_probe_task = None
 
     @property
     def chat_slot(self) -> int:
@@ -615,6 +639,7 @@ class LocalClient(BaseHTTPClient):
         reasoning_timer = _ReasoningTimeoutTracker()
         reasoning_filter = _ReasoningFilter()
         first_data_received = False
+        think_chunk_count = 0  # watchdog: 未閉じ <think> 内の連続 chunk 数 (docs/c_15 B3)
         try:
             # ストリーミング専用の新規クライアント（接続プール共有による stale 接続を回避）
             async with httpx.AsyncClient(timeout=120.0) as stream_client:
@@ -655,6 +680,27 @@ class LocalClient(BaseHTTPClient):
                         if content:
                             first_data_received = True
                             filtered = reasoning_filter.feed(content)
+                            # 暴走 reasoning watchdog (docs/c_15 B3): 未閉じ <think> が
+                            # client_think_budget chunk を超えたらストリームを中断する
+                            # (thinking=0 モデルの runaway 上限化)。サーバ側で reasoning が
+                            # 分離されるモデルは content に <think> が出ないため発火しない。
+                            if reasoning_filter.in_think:
+                                think_chunk_count += 1
+                                if (
+                                    self._client_think_budget
+                                    and think_chunk_count > self._client_think_budget
+                                ):
+                                    logger.warning(
+                                        "Reasoning watchdog: unclosed <think> exceeded %d "
+                                        "chunks, aborting stream (on_runaway=%s)",
+                                        self._client_think_budget, self._on_runaway,
+                                    )
+                                    # on_runaway はログ表示のみ。reask(二段生成)/truncate の
+                                    # variant 別挙動は未配線で、現状いずれも stream 中断
+                                    # (docs/c_15 §2.7)。
+                                    break
+                            else:
+                                think_chunk_count = 0
                             if filtered:
                                 token_count += 1
                                 yield filtered

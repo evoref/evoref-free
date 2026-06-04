@@ -14,10 +14,12 @@ from backend.free.agent.meta_cognitive_utils import (
     strip_markdown_wrapper,
 )
 from backend.free.agent.tool_call_judge import ToolCallJudge, ToolJudgement
+from backend.free.agent.tool_result_digest import digest_tool_result
 from backend.free.api.chat.chat_constants import (
     CONTENT_MAX_TOKENS_MIN, CONTENT_SYSTEM_RESERVE,
     DEFAULT_CONTEXT_SIZE,
-    TOOL_EXECUTION_TIMEOUT_SEC, TOOL_RESULT_MAX_CHARS,
+    TOOL_EXECUTION_TIMEOUT_SEC, TOOL_GROUNDED_TEMPERATURE,
+    TOOL_RESULT_MAX_CHARS,
     TOOL_RESULT_HEAD_RATIO, TOOL_RESULT_OMISSION_CHARS,
 )
 from backend.free.api.chat.chat_types import GenerationParams, StepCallback
@@ -126,11 +128,14 @@ class DeliberativeAgent:
         config: dict | None = None,
         tool_judge: ToolCallJudge | None = None,
         tools_registry=None,
+        assist_client=None,
     ):
         self.config = config or {}
         self.reminder_system = EventReminderSystem(self.config)
         self._tool_judge = tool_judge
         self._tools_registry = tools_registry
+        # ツール結果の query 連動抽出 (base の接地負荷軽減) に使う。None なら raw を渡す。
+        self._assist_client = assist_client
 
         # コンテンツ生成用の max_tokens
         ctx_size = self.config.get("llama", {}).get("context_size", DEFAULT_CONTEXT_SIZE)
@@ -149,6 +154,7 @@ class DeliberativeAgent:
         messages: list[dict],
         tool_name: str,
         tool_result_text: str,
+        query: str | None = None,
     ) -> None:
         """最後の user メッセージにツール実行結果を追記する。
 
@@ -156,14 +162,32 @@ class DeliberativeAgent:
         テンプレートで 400 エラーになるため、必ず user に統合する。
         """
         truncated = _truncate_tool_result(tool_result_text, TOOL_RESULT_MAX_CHARS)
+        # 話題再フォーカス: 弱いモデルは前ターンの話題に引きずられ、今回の質問
+        # (例: ニュース) を取り違える (実機確認: 前ターンが天気だとニュース質問に
+        # 天気で誤答)。今回の質問を明示して前話題を無視させる。
+        refocus = ""
+        if query:
+            q = query if len(query) <= 200 else query[:200] + "…"
+            refocus = (
+                f"今回ユーザーが答えてほしい質問は『{q}』である。"
+                f"会話履歴の前の話題は無関係なので無視し、この質問にのみ答えること。\n"
+            )
         tool_msg = (
             f"\n\n## ツール実行結果\n"
             f"ツール: {tool_name}\n"
             f"結果:\n{truncated}\n\n"
-            f"上記のツール結果を踏まえて回答してください。"
-            f"ツール結果が質問への直接の答えを含まない場合は、"
-            f"システムプロンプトに含まれる参考コンテキスト (カートリッジ・記憶等) も併用してください。"
-            f"ツールが取得したファイル内容や外部応答については、その内容を超える推測はしないでください。"
+            f"{refocus}"
+            # capability assertion: 弱いモデルは「自分はブラウズ/取得できない」という
+            # 思い込みでツール結果を無視し拒否することがある (実機確認)。結果が
+            # 実際に取得された本物データであると明示して上書きする。
+            f"上記の ## ツール実行結果 は、システムが {tool_name} ツールで実際にアクセスして"
+            f"取得した本物のデータである。あなたにはこのツールがあり、取得は既に成功している。"
+            f"この結果を唯一の事実根拠として、内容 (数値・名称・日付・条件など) を読み取り、"
+            f"それに基づいて具体的に回答すること。"
+            f"「ブラウズできない」「取得できない」「アクセスできない」とは言わないこと。"
+            f"「取得できない」「データがない」と答えてよいのは、結果が空かエラーの場合のみ。"
+            f"結果に該当が無い場合のみ、システムプロンプトの参考コンテキスト (カートリッジ・記憶等) も併用してよい。"
+            f"結果に無い数値・事実は創作しないこと。"
         )
         for i in range(len(messages) - 1, -1, -1):
             if messages[i]["role"] == "user":
@@ -213,8 +237,17 @@ class DeliberativeAgent:
             # 実行されたが結果 None (失敗)。command は penalize 用に返す。
             return None, judgement.tool_name, command, False
 
+        # ツール結果を assist で query 連動抽出し、base 文脈には digest を注入して
+        # 弱い base の接地負荷を下げる。抽出不能/assist 不在時は raw へ退避 (現挙動)。
+        # 戻り値の tool_result_text(raw) は UI 表示用にそのまま保つ。
+        digest = await digest_tool_result(
+            self._assist_client,
+            query=query,
+            tool_name=judgement.tool_name,
+            tool_result=tool_result_text,
+        )
         self._append_tool_result_to_last_user(
-            messages, judgement.tool_name, tool_result_text,
+            messages, judgement.tool_name, digest or tool_result_text, query=query,
         )
         success = not is_tool_error(tool_result_text)
         # run_command は走ったが非ゼロ終了したケース (SyntaxError 等) を
@@ -280,6 +313,17 @@ class DeliberativeAgent:
             tool_capture["command"] = tool_command
             tool_capture["command_name"] = tool_name_used if tool_command else None
             tool_capture["success"] = tool_success
+
+        # ツール結果に基づく接地回答は創作不要。chat 既定 0.7 のままだと weak base が
+        # 非決定的に拒否/話題混同しやすい (実機: ニュースで 0.7→~25%拒否、0.2→安定)。
+        # ツール使用ターンのみ温度を下げて決定性を上げる (既に低ければ据え置く)。
+        if tool_result_text is not None:
+            gp = dict(generation_params or {})
+            gp["temperature"] = min(
+                gp.get("temperature", TOOL_GROUNDED_TEMPERATURE),
+                TOOL_GROUNDED_TEMPERATURE,
+            )
+            generation_params = gp
 
         # リマインダー注入
         messages = self.reminder_system.inject(messages, state)

@@ -20,11 +20,15 @@ sampling:
   temperature: 0.2
   top_k: 80
   repetition_penalty: 1.05
-# reasoning (thinking)。LFM2.5-8B-A1B は reasoning モデルだが、chat_template に
-# enable_thinking トグルが無い (Qwen3 と異なる)。<think> は履歴の thinking 描画用のみで、
-# 生成プロンプトは素の <|im_start|>assistant で OFF スイッチが無い → mode: always。
-# enable_thinking は送らず (テンプレが解釈しない)、reasoning_budget で思考量を抑制する
-# (budget=0 で実質抑止。--reasoning-format auto が <think> をパースする前提)。
-# 出力に残る <think> は _ReasoningFilter が post-strip する。
+# reasoning (thinking)。LFM2.5-8B-A1B は OFF スイッチ無しの強制 reasoning モデル。
+# 実機検証 (c_15 Step0) で llama.cpp が thinking=0 (peg-native) で reasoning 領域を認識せず、
+# --reasoning-format / --reasoning-budget / -rea が全て no-op であることが確定。
+# よって server_control: false とし、思考はクライアント側 (_ReasoningFilter) で除去する。
 reasoning:
   mode: always
+  server_control: false      # llama.cpp 非認識 (thinking=0) → サーバ側 reasoning 制御不可 (Step0 実証)
+  client_handling: strip     # <think> を回答から除去 (隠す)
+  marker_style: think_tags
+  client_think_budget: 4096  # watchdog 上限。LFM2.5 は難問で思考が 1000+ tok に達してから </think> を閉じるため、512 では回答到達前に stream 中断 (content 0) していた (実機実測)
+  on_runaway: fallback
+  exclude_from_history: true # 思考を履歴/WM に残さない (多ターン汚染防止)

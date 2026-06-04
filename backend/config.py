@@ -333,9 +333,21 @@ def _resolve_profile_reasoning(cfg: dict, slot: str) -> dict:
 
         meta = read_gguf_metadata(model_path)
         profile = load_model_profile(meta.get("architecture"), project_root)
-        raw = profile.get("reasoning") or {}
-        if isinstance(raw, dict):
-            reasoning = raw
+        raw = profile.get("reasoning")
+        # reasoning セクションが宣言されている場合のみ ProfileReasoningConfig で
+        # 検証し、既定を埋めた dict を返す (docs/c_15、profile=SSOT)。未宣言時は
+        # ``{}`` を保ち template family fallback (resolve_reasoning_mode) に委ねる。
+        if isinstance(raw, dict) and raw:
+            from backend.schemas.llm import ProfileReasoningConfig
+
+            try:
+                reasoning = ProfileReasoningConfig(**raw).model_dump()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Invalid reasoning profile for slot %s (using defaults): %s",
+                    slot, e,
+                )
+                reasoning = {}
     except Exception as e:  # noqa: BLE001
         logger.debug("Profile reasoning resolution failed for slot %s: %s", slot, e)
         reasoning = {}
@@ -346,6 +358,7 @@ def _resolve_profile_reasoning(cfg: dict, slot: str) -> dict:
 
 def resolve_reasoning_mode(
     cfg: dict, slot: str, *, chat_template: str | None = None,
+    observed_reasoning_mode: str | None = None,
 ) -> str | None:
     """slot ("base"|"assist") のモデル arch の reasoning mode を返す。
 
@@ -355,12 +368,19 @@ def resolve_reasoning_mode(
                  送らないが ``reasoning_budget`` は honor しうる
       - none   : reasoning 非対応 (Qwen2 / dense LFM2 等)。reasoning 系 kwarg を送らない
 
-    プロファイル ``reasoning.mode`` を最優先。未宣言かつ ``chat_template`` 提供時は
-    ``detect_template_family()`` から fallback 推定する。どちらでも不明なら ``None``。
+    優先順位 (docs/c_15、profile=SSOT): プロファイル ``reasoning.mode`` を**権威**とする。
+    プロファイル未宣言時のみ、実機プローブ観測 (``observed_reasoning_mode``、未知モデルの
+    シード) → ``chat_template`` の template family fallback の順で補う。**観測は profile を
+    上書きしない** (宣言と実機の食い違いはプローブが WARNING + Status で可視化し、ユーザーが
+    ``local/profiles/<arch>.yaml`` で是正する)。どれでも不明なら ``None``。
     """
+    # プロファイル宣言が最優先 (profile = SSOT)。
     mode = _resolve_profile_reasoning(cfg, slot).get("mode")
     if mode in _REASONING_MODES:
         return mode
+    # 以降は profile 未宣言時の fallback: 観測 (未知モデルのシード) → template family。
+    if observed_reasoning_mode in _REASONING_MODES:
+        return observed_reasoning_mode
     if chat_template:
         try:
             from backend.free.llm.model_metadata import detect_template_family
@@ -379,6 +399,7 @@ def resolve_enable_thinking(
     *,
     explicit: bool | None,
     chat_template: str | None = None,
+    observed_reasoning_mode: str | None = None,
 ) -> bool | None:
     """slot のモデルへ送る ``enable_thinking`` 値を解決する (能力判定 + 優先順位)。
 
@@ -396,7 +417,10 @@ def resolve_enable_thinking(
     Returns:
         送信すべき ``enable_thinking``、または ``None`` (送らない)。
     """
-    mode = resolve_reasoning_mode(cfg, slot, chat_template=chat_template)
+    mode = resolve_reasoning_mode(
+        cfg, slot, chat_template=chat_template,
+        observed_reasoning_mode=observed_reasoning_mode,
+    )
     if mode in ("none", "always"):
         if explicit is not None:
             logger.warning(
@@ -411,6 +435,23 @@ def resolve_enable_thinking(
         return explicit
     default = _resolve_profile_reasoning(cfg, slot).get("enable_thinking")
     return default if isinstance(default, bool) else None
+
+
+def resolve_client_reasoning(cfg: dict, slot: str) -> tuple[int, str]:
+    """slot のモデル profile から client 側 reasoning watchdog 設定を返す (docs/c_15 B3)。
+
+    戻り値: ``(client_think_budget, on_runaway)``。profile 未宣言時は ``(0, "fallback")``
+    で watchdog 無効。``LocalClient`` に渡され、未閉じ ``<think>`` が budget chunk を超えたら
+    ストリームを中断する。サーバ側で reasoning が分離されるモデルは content に ``<think>`` が
+    出ないため発火しない。
+    """
+    reasoning = _resolve_profile_reasoning(cfg, slot)
+    try:
+        budget = int(reasoning.get("client_think_budget", 0) or 0)
+    except (TypeError, ValueError):
+        budget = 0
+    on_runaway = reasoning.get("on_runaway") or "fallback"
+    return max(0, budget), str(on_runaway)
 
 
 def get_mode_generation_params(mode: str) -> dict:

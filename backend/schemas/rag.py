@@ -131,6 +131,43 @@ class SelfRagAssistNecessityConfig(BaseModel):
     context_turns: int = Field(default=2, ge=0, le=10)
 
 
+class SelfRagContentGateConfig(BaseModel):
+    """取得直後の chunk 内容精査ゲート設定 (heuristics-first + 境界 assist)
+
+    ``unified_search`` の Step 4 マージ直後に低価値 chunk を pruning し、
+    quality judge / query expansion / reranker forward pass の候補数を縮小
+    する。coding mode を主対象とし (chat mode は近似重複除去のみ)、安価な
+    ヒューリスティック (relevance floor / 近似重複除去 / コードシグナル) で
+    大半を裁き、判断に迷う marginal band の prose チャンクだけアシストモデル
+    で 1 回判定する。``assist_client=None`` / cap 超過 / error 時はヒューリス
+    ティックのみで確定する。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 機能の有効/無効。スキーマ既定は保守的に OFF (config.yaml.example 側で
+    # true を記載し、新規セットアップでは coding-mode 精査が有効になる)。
+    enabled: bool = False
+    # relevance スコア下限 (cosine スケール 0-1)。これ未満を pruning する。
+    # unified_search は STM/LTM/カートリッジの cosine 類似度が基準。
+    relevance_floor: float = Field(default=0.45, ge=0.0, le=1.0)
+    # [floor, floor+marginal_band) を「判断に迷う帯」とし、coding mode では
+    # この帯の prose チャンクのみ assist 判定に回す。
+    marginal_band: float = Field(default=0.10, ge=0.0, le=0.5)
+    # 最低保持件数。pruning がこれを下回ったら上位から補填し生成を枯渇させない。
+    min_keep: int = Field(default=3, ge=1)
+    # 近似重複除去の token-set Jaccard しきい値 (1.0 で重複除去を無効化)。
+    dedup_jaccard: float = Field(default=0.85, ge=0.0, le=1.0)
+    # coding mode で marginal 帯のコードシグナル判定を有効化する。
+    coding_code_signal: bool = True
+    # marginal band の assist 救済を有効化する (false で純ヒューリスティック)。
+    assist_enabled: bool = True
+    # 1 セッションでの assist 発火上限 (0 以下で無制限)。
+    max_per_session: int = Field(default=5, ge=0)
+    # 1 クエリでの assist 発火上限 (0 以下で無制限)。
+    max_per_query: int = Field(default=1, ge=0)
+
+
 class SelfRagConfig(BaseModel):
     """Self-RAG 設定ルート
 
@@ -145,6 +182,9 @@ class SelfRagConfig(BaseModel):
     )
     assist_necessity: SelfRagAssistNecessityConfig = Field(
         default_factory=SelfRagAssistNecessityConfig,
+    )
+    content_gate: SelfRagContentGateConfig = Field(
+        default_factory=SelfRagContentGateConfig,
     )
 
 

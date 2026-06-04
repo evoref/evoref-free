@@ -37,6 +37,29 @@ from backend.log_config import get_logger
 logger = get_logger("memory.note_builder")
 
 
+# reasoning モデル (LFM2 / Qwen3 等) が応答に残す <think>...</think> を除去する。
+# メモリ抽出が思考を STM ノートに焼き込むと、後続チャットで意味検索により再注入され
+# 話題汚染 (例: ニュース質問に過去の天気ノートで返答) を招く。
+# cf. backend.free.optimizer.prompt_evolver の同名処理 (pillar 境界のため非共有)。
+_THINK_TAG_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
+
+
+def _strip_think_tags(text: str) -> str:
+    """``<think>...</think>`` (未閉鎖含む) を除去する。
+
+    閉じたブロックは削除し、未閉鎖 ``<think>`` (暴走/打ち切り) 以降はすべて思考と
+    みなして破棄する。本文に思考が無ければ原文をそのまま返す。
+    """
+    if "<think" not in text.lower():
+        return text
+    text = _THINK_TAG_RE.sub("", text)
+    m = _THINK_OPEN_RE.search(text)
+    if m:
+        text = text[: m.start()]
+    return text.strip()
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # 候補ファクト判定用トリガ辞書のロード
 # ──────────────────────────────────────────────────────────────────────────
@@ -235,6 +258,10 @@ class NoteBuilder:
         Returns:
             ``MemoryNote`` 構築用の dict
         """
+        # reasoning モデルの思考漏れ (<think>...</think>) をノート化しない。
+        # 残すと STM に焼き込まれ後続チャットへ再注入され話題汚染を招く。
+        content = _strip_think_tags(content)
+
         effective_source: NoteSource = source if source is not None else (
             "assistant" if role == "assistant" else "user"
         )

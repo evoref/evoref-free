@@ -12,16 +12,12 @@
 	import { isDevelop } from '$lib/edition';
 	import DialogShell from '$lib/free/components/DialogShell.svelte';
 	import ServerStatus from '$lib/free/components/ServerStatus.svelte';
-	import { resetLocalData, getStatus, ApiError } from '$lib/free/api';
+	import { resetLocalData, ApiError } from '$lib/free/api';
 
-	type Phase = 'idle' | 'confirming' | 'resetting' | 'restarting' | 'error';
+	type Phase = 'idle' | 'confirming' | 'resetting' | 'stopped' | 'error';
 
 	let phase = $state<Phase>('idle');
 	let errorMessage = $state<string | null>(null);
-	let restartTimedOut = $state(false);
-
-	const RESTART_POLL_INTERVAL_MS = 2000;
-	const RESTART_TIMEOUT_MS = 180_000;
 
 	function openConfirm() {
 		errorMessage = null;
@@ -37,44 +33,20 @@
 		errorMessage = null;
 		try {
 			await resetLocalData(true);
-			// 202 受領 = ヘルパー起動済み。以降 backend は停止に向かう。
-			phase = 'restarting';
-			pollForRestart();
 		} catch (e) {
-			// backend が応答前に落ちた場合もここに来うるが、その時は実際には
-			// リセットが進行している可能性が高いので restart 監視へ倒す。
+			// ApiError (403/400/500 等) は本物のエラー。それ以外 (ネットワーク切断 =
+			// backend が応答前に停止) はヘルパーが進行中とみなし stopped へ倒す。
 			if (e instanceof ApiError) {
 				errorMessage = e.message;
 				phase = 'error';
-			} else {
-				phase = 'restarting';
-				pollForRestart();
-			}
-		}
-	}
-
-	async function pollForRestart() {
-		const deadline = Date.now() + RESTART_TIMEOUT_MS;
-		// 一旦 backend が確実に落ちる猶予を取ってからポーリング開始する
-		// (停止前の生きた /api/status を「復帰」と誤検知しないため)。
-		await sleep(RESTART_POLL_INTERVAL_MS * 3);
-		while (Date.now() < deadline) {
-			try {
-				await getStatus();
-				// 応答が返った = backend 復帰。少し待ってからフルリロード。
-				await sleep(1000);
-				location.reload();
 				return;
-			} catch {
-				// まだ落ちている / 再起動途中。待って再試行。
 			}
-			await sleep(RESTART_POLL_INTERVAL_MS);
 		}
-		restartTimedOut = true;
-	}
-
-	function sleep(ms: number): Promise<void> {
-		return new Promise((resolve) => setTimeout(resolve, ms));
+		// 202 受領 (またはネットワーク切断) = ヘルパー起動済み。全サービスは停止に向かう。
+		// 自動再起動はしないので、このタブを閉じる (best-effort)。スクリプトで開いて
+		// いない通常タブはブラウザ仕様で閉じられないため、その場合は stopped 案内が残る。
+		phase = 'stopped';
+		window.close();
 	}
 </script>
 
@@ -130,19 +102,20 @@
 	</DialogShell>
 {/if}
 
-{#if phase === 'resetting' || phase === 'restarting'}
-	<div class="overlay" role="alertdialog" aria-modal="true" aria-label={$t('settings.develop.restart_wait')}>
+{#if phase === 'resetting'}
+	<div class="overlay" role="alertdialog" aria-modal="true" aria-label={$t('settings.develop.stopping_wait')}>
 		<div class="overlay-card">
-			{#if !restartTimedOut}
-				<div class="spinner" aria-hidden="true"></div>
-				<p class="overlay-title">{$t('settings.develop.restart_wait')}</p>
-				<p class="overlay-sub">{$t('settings.develop.restart_sub')}</p>
-			{:else}
-				<p class="overlay-title">{$t('settings.develop.restart_timeout')}</p>
-				<button class="btn-cancel" onclick={() => location.reload()}>
-					{$t('settings.develop.reload_now')}
-				</button>
-			{/if}
+			<div class="spinner" aria-hidden="true"></div>
+			<p class="overlay-title">{$t('settings.develop.stopping_wait')}</p>
+		</div>
+	</div>
+{/if}
+
+{#if phase === 'stopped'}
+	<div class="overlay" role="alertdialog" aria-modal="true" aria-label={$t('settings.develop.stopped_title')}>
+		<div class="overlay-card">
+			<p class="overlay-title">{$t('settings.develop.stopped_title')}</p>
+			<p class="overlay-sub">{$t('settings.develop.stopped_body')}</p>
 		</div>
 	</div>
 {/if}

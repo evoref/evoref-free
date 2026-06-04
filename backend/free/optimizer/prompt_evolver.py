@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -37,6 +38,26 @@ CB_MAX_CONSECUTIVE_FAILURES: int = 3
 # 失敗率がこの閾値を超えたら早期終了（最低 CB_MIN_ATTEMPTS 回試行後）
 CB_FAILURE_RATE_THRESHOLD: float = 0.5
 CB_MIN_ATTEMPTS: int = 4
+
+# reasoning モデルが content に吐く <think>...</think> ブロック (閉じたもの)
+_THINK_TAG_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.DOTALL | re.IGNORECASE)
+# 未閉鎖の <think> 開始タグ (暴走/打ち切りで </think> が無いケース)
+_THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
+
+
+def _strip_think_tags(text: str) -> str:
+    """reasoning モデルが content に吐く ``<think>...</think>`` を除去する。
+
+    Qwen3 / LFM2 等の reasoning ベース/アシストでプロンプトを変異させると、思考が
+    そのまま変異後プロンプトに焼き込まれ system プロンプト (chat.md) を汚染する。
+    閉じたブロックは除去し、未閉鎖 ``<think>`` (暴走/打ち切り) は以降をすべて思考と
+    みなして破棄する (残った本文が空なら呼出側で無効判定させる)。
+    """
+    text = _THINK_TAG_RE.sub("", text)
+    m = _THINK_OPEN_RE.search(text)
+    if m:
+        text = text[: m.start()]
+    return text.strip()
 
 
 @dataclass
@@ -248,13 +269,25 @@ class PromptEvolver:
             result = await llm_client.generate(**generate_kwargs)
             mutated = result["choices"][0]["message"]["content"].strip()
 
+            # reasoning モデル (Qwen3 / LFM2 等) が content に吐く <think>...</think> を
+            # 除去する。未除去だと思考が変異後プロンプトに焼き込まれ chat.md を汚染する。
+            mutated = _strip_think_tags(mutated)
+
             # コードブロックで囲まれている場合は除去
             if mutated.startswith("```"):
                 lines = mutated.split("\n")
                 lines = [l for l in lines if not l.startswith("```")]
                 mutated = "\n".join(lines).strip()
 
-            return mutated if mutated else None
+            # 思考が残る / 空になった場合は汚染とみなし無効化 (rule-based 変異へフォールバック)
+            if not mutated or "<think>" in mutated.lower():
+                logger.warning(
+                    "Prompt mutation produced contaminated/empty output "
+                    "(<think> residue or empty); rejecting for rule-based fallback",
+                )
+                return None
+
+            return mutated
 
         except Exception as e:
             logger.warning("Prompt mutation failed: %s: %s", type(e).__name__, e)

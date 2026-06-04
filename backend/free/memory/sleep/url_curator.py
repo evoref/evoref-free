@@ -198,6 +198,19 @@ def _record_score(
     return extra
 
 
+def _coerce_bare_score(content: str | None) -> str | None:
+    """裸の数値応答 ("0.7" 等) から最初の float トークンを取り出す。
+
+    LFM2 系 hybrid/recurrent モデルは response_format(json_schema) を強制できず、
+    スキーマ ({"score": ...}) ではなくスカラ ("0.7") を返すことがある。その場合に
+    後段の ``float()`` へ渡せる文字列を返す (見つからなければ ``None``)。
+    """
+    if not content:
+        return None
+    m = re.search(r"-?\d+(?:\.\d+)?", content)
+    return m.group(0) if m else None
+
+
 async def _score_url(
     assist_client: "AssistModelClient",
     *,
@@ -225,10 +238,15 @@ async def _score_url(
 
     content = extract_content(result)
     parsed = extract_json_object(content)
-    if not isinstance(parsed, dict):
-        logger.debug("url_curator: failed to parse score JSON: %s", content[:120])
-        return None
-    raw = parsed.get("score")
+    if isinstance(parsed, dict):
+        raw = parsed.get("score")
+    else:
+        # LFM2 系 hybrid モデルは json_schema grammar が強制されず、裸の数値
+        # ("0.7") を返すことがある。その数値をそのまま score として採用する。
+        raw = _coerce_bare_score(content)
+        if raw is None:
+            logger.debug("url_curator: failed to parse score JSON: %s", content[:120])
+            return None
     try:
         score = float(raw)
     except (TypeError, ValueError):

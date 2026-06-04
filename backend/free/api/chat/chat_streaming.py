@@ -967,8 +967,18 @@ async def _finalize_long_form_stream(
         session_id, file_output_mode, long_form_mode.value, output_target,
     )
     metrics = getattr(orchestrator, "last_metrics", {})
+    # coding の editor/file 出力は orchestrator が検証・修正した assembled
+    # (last_code_output) を配信する。生ストリーム (full_response) は review の
+    # revise トークンが二重追記されるため、コード出力の確定本文には使わない。
+    is_code = getattr(orchestrator, "last_content_type", None) == "code"
+    code_output = getattr(orchestrator, "last_code_output", None)
+    delivered = (
+        code_output
+        if (is_code and isinstance(code_output, str) and code_output)
+        else state.full_response
+    )
     record_long_form_response(
-        sess_state, state.full_response, messages, session_id,
+        sess_state, delivered, messages, session_id,
         query, mode, state.tokens_generated, metrics,
         private=private,
     )
@@ -995,10 +1005,10 @@ async def _finalize_long_form_stream(
     if output_target == "editor":
         # エディタ経路: ディスクには書込みせず生成本文を editor_code フレームで送出。
         # SPLIT モードでもエディタ送出を優先 (per-unit ファイルは on_step 側で完了済み)。
-        is_code = getattr(orchestrator, "last_content_type", None) == "code"
         ext, language = _resolve_editor_output_format(query, is_code)
-        # コード生成時は LLM が付ける markdown コードフェンスを除去。
-        body = remove_code_fences(state.full_response) if is_code else state.full_response
+        # コード生成時は確定本文 (delivered = 検証・修正済み assembled) を使い、
+        # markdown コードフェンスを除去する。
+        body = remove_code_fences(delivered) if is_code else delivered
         # 空行を含む連続改行を単一 \n に圧縮 (markdown 見出しは保持)。
         editor_text = _normalize_editor_text(body)
         # 生成内容からアシストモデルで ASCII snake_case のファイル名を導出する
@@ -1037,7 +1047,7 @@ async def _finalize_long_form_stream(
         write_result = None
     else:
         write_result = await long_form_write_file(
-            query, state.full_response, sess_state,
+            query, delivered, sess_state,
         )
     if write_result:
         logger.debug("Long-form file write result: %s", write_result[:120])
@@ -1062,6 +1072,7 @@ async def stream_long_form(
     timer: StageTimer | None = None,
     private: bool = False,
     output_target: str = "file",
+    prefetched_rag: list[tuple[str, float, str]] | None = None,
 ):
     """長文生成の SSE ストリーミング（long_form_* ステップフレーム付き）
 
@@ -1164,6 +1175,7 @@ async def stream_long_form(
                 on_step=on_step,
                 existing_content=existing_content,
                 long_form_mode=long_form_mode,
+                prefetched_rag=prefetched_rag,
             )
             aiter = token_gen.__aiter__()
             pending: asyncio.Task[str] | None = None
@@ -1265,6 +1277,7 @@ async def sync_long_form(
     timer: StageTimer | None = None,
     private: bool = False,
     output_target: str = "file",
+    prefetched_rag: list[tuple[str, float, str]] | None = None,
 ) -> ChatResponse:
     """長文生成の同期応答
 
@@ -1297,6 +1310,7 @@ async def sync_long_form(
             mode=mode,
             existing_content=existing_content,
             long_form_mode=long_form_mode,
+            prefetched_rag=prefetched_rag,
         ):
             if not first_token_recorded and timer:
                 timer.stop("llm_first_token_ms")
@@ -1308,6 +1322,12 @@ async def sync_long_form(
             timer.stop("llm_total_ms")
 
         metrics = getattr(orchestrator, "last_metrics", {})
+        # coding の editor/file 出力は検証・修正済み assembled (last_code_output)
+        # を配信する (生ストリームの revise 二重追記を解消)。
+        is_code = getattr(orchestrator, "last_content_type", None) == "code"
+        code_output = getattr(orchestrator, "last_code_output", None)
+        if is_code and isinstance(code_output, str) and code_output:
+            full_response = code_output
         record_long_form_response(
             state, full_response, messages, session_id,
             query, mode, tokens_generated, metrics,
@@ -1317,7 +1337,7 @@ async def sync_long_form(
         if output_target == "editor":
             write_result = None
             # コード生成時は editor 表示前に markdown コードフェンスを除去。
-            if getattr(orchestrator, "last_content_type", None) == "code":
+            if is_code:
                 full_response = remove_code_fences(full_response)
         else:
             write_result = await long_form_write_file(

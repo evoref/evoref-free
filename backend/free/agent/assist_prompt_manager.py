@@ -53,6 +53,7 @@ DEFAULT_ASSIST_PROMPTS: dict[str, str] = {
 直前のローカルな話題を指す短いフォローアップ質問は retrieve を優先する。外部の最新状態を尋ねるものは fetch を優先する。
 
 <!-- PROTECTED -->
+## 出力形式
 JSON形式で回答: {"action": "retrieve"} / {"action": "fetch"} / {"action": "skip"}
 <!-- /PROTECTED -->
 """,
@@ -65,6 +66,7 @@ JSON形式で回答: {"action": "retrieve"} / {"action": "fetch"} / {"action": "
 - low: 検索結果がクエリにほぼ関連しない
 
 <!-- PROTECTED -->
+## 出力形式
 JSON形式で回答: {"quality": "high" or "medium" or "low"}
 <!-- /PROTECTED -->
 """,

@@ -12,6 +12,8 @@ import time
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
 
+from backend.free.generation.code_repair import CodeRepairer, infer_language
+from backend.free.generation.import_wirer import wire_imports
 from backend.free.generation.code_skeleton import CodeSkeleton, update_skeleton
 from backend.free.generation.content_detector import detect_content_type
 from backend.free.generation.models import (
@@ -35,6 +37,16 @@ if TYPE_CHECKING:
     from backend.free.core.policy_interpreter import PolicyInterpreter
 
 logger = logging.getLogger("backend.free.generation.orchestrator")
+
+# 長文生成の plan コンテキストへ注入する RAG 予算。``_gather_context`` は
+# ``_build_plan_for_generation`` の TokenBudget 算出前に走るため、ここでは
+# 固定値で plan プロンプトの肥大を防ぐ。
+RAG_MAX_CHUNKS = 3
+RAG_CHUNK_CHAR_CAP = 300
+RAG_TOTAL_TOKEN_BUDGET = 256
+
+# CodeUnit に file_path が無い (degraded fallback 等) 場合の既定ファイル名。
+_DEFAULT_CODE_FILE = "output.py"
 
 
 class LongFormOrchestrator:
@@ -70,6 +82,14 @@ class LongFormOrchestrator:
         # 直近 generate() の content_type ("code" / "text")。コンシューマが生成途中で
         # コード/テキストを判定するために参照する。generate() 開始時に確定する。
         self.last_content_type: str | None = None
+        # 直近 generate() のコード出力 (検証・修正済み assembled)。chat_streaming の
+        # finalize が coding の editor/file 出力に使う (生ストリーム二重追記の解消)。
+        self.last_code_output: str | None = None
+        # 直近コードの推定言語 (検証を Python のみ AST 検証に限定するため)。
+        self._code_language: str = "python"
+        # 直近コードのファイル別 (file_path → 検証・修正済みコード)。複数ファイル
+        # 計画時に Agentic 経路が複数 EditorArtifact として配信するために使う。
+        self.last_code_files: dict[str, str] = {}
 
         # Recurrent も計画 / 要約再帰をアシストモデルで実行する
         # ため ``assist_client`` を渡す。``None`` の場合は Recurrent 内部で
@@ -194,19 +214,106 @@ class LongFormOrchestrator:
             async for token in self.strategy.revise_unit(rev, rolling, content_type):
                 yield token
 
+    async def _repair_generated_code(
+        self,
+        rolling: RollingContext,
+        content_type: ContentType,
+        on_step,
+    ) -> None:
+        """生成コードを検証ゲート付きでリペアし ``last_code_output`` に保持する。
+
+        review 後の ``generated_units`` を assemble → 検証 → assist 修正 → 再検証。
+        coding の editor/file 出力はこの結果を配信する (生ストリームの revise
+        二重追記の解消)。リペア無効 / degraded 時は素の assembled をそのまま保持。
+        """
+        if content_type != ContentType.CODE or not rolling.generated_units:
+            return
+        repairer = CodeRepairer(
+            self.assist_client, self.config, debug_logger=self._debug_logger,
+        )
+        # plan.units と generated_units は位置対応 (CODE は _extend_to_target で
+        # append せず、revise は in-place 更新)。timeout 部分生成でも安全なよう
+        # zip で生成済み分だけ走査する。
+        coded = [
+            (u, remove_code_fences(text))
+            for u, text in zip(rolling.plan.units, rolling.generated_units)
+            if isinstance(u, CodeUnit)
+        ]
+        if not coded:
+            # CodeUnit が取れない (degraded plan 等) → 全体を 1 ファイル扱い。
+            assembled = "\n\n".join(
+                remove_code_fences(u) for u in rolling.generated_units
+            )
+            self._code_language = "python"
+            repaired = await repairer.repair(assembled, language="python")
+            self.last_code_output = repaired
+            self.last_code_files = {_DEFAULT_CODE_FILE: repaired}
+            if on_step and repaired != assembled:
+                _call_step(on_step, {
+                    "type": "long_form_repair",
+                    "detail": "コードを検証・修正しました (1 file)",
+                    "status": "done",
+                })
+            return
+        # file_path 別にグルーピングし、ファイル単位で検証・修正する。
+        groups: dict[str, list[str]] = {}
+        for unit, text in coded:
+            groups.setdefault(unit.file_path or _DEFAULT_CODE_FILE, []).append(text)
+        files: dict[str, str] = {}
+        changed = False
+        # 複数ファイル分割時は他ファイル定義シンボル参照の undefined 誤検知を避け、
+        # ファイル単位の修正を構文エラーのみに限定する (未定義名は全体検証側で扱う)。
+        multi_file = len(groups) > 1
+        for path, texts in groups.items():
+            group_code = "\n\n".join(texts)
+            repaired_group = await repairer.repair(
+                group_code, language=infer_language([path]), syntax_only=multi_file,
+            )
+            if repaired_group != group_code:
+                changed = True
+            files[path] = repaired_group
+        if multi_file:
+            # 複数ファイルは相互 import が欠落するため AST ベースで補完する
+            # (cross-file 配線 + stdlib 伝播)。実行時ロジックは対象外。
+            files = wire_imports(files)
+        self.last_code_files = files
+        self.last_code_output = "\n\n".join(files.values())
+        self._code_language = infer_language(list(groups.keys()))
+        if on_step and changed:
+            _call_step(on_step, {
+                "type": "long_form_repair",
+                "detail": f"コードを検証・修正しました ({len(files)} file)",
+                "status": "done",
+            })
+
     def _validate_generated_code(
         self,
         rolling: RollingContext,
         content_type: ContentType,
         on_step,
     ) -> tuple[int, int]:
-        """コード検証 + SSE 通知 + デバッグログ。`(error_count, warning_count)` を返す。"""
+        """コード検証 + SSE 通知 + デバッグログ。`(error_count, warning_count)` を返す。
+
+        リペア後の出力 (``last_code_output``) を対象に検証する。``validate_python``
+        は Python 専用のため、他言語では AST 検証をスキップする (Python として
+        誤検出しないため)。
+        """
         if content_type != ContentType.CODE or not rolling.generated_units:
             return 0, 0
-        assembled = "\n\n".join(
-            remove_code_fences(u) for u in rolling.generated_units
-        )
-        errors = validate_python(assembled)
+        if getattr(self, "_code_language", "python") != "python":
+            if on_step:
+                _call_step(on_step, {
+                    "type": "long_form_validate",
+                    "detail": f"skipped (language={self._code_language})",
+                    "status": "done",
+                })
+            return 0, 0
+        code = self.last_code_output
+        if code is None:
+            code = "\n\n".join(
+                remove_code_fences(u) for u in rolling.generated_units
+            )
+        errors = validate_python(code)
         validation_errors = sum(1 for e in errors if e.severity == "error")
         warning_count = sum(1 for e in errors if e.severity == "warning")
         if on_step:
@@ -267,6 +374,7 @@ class LongFormOrchestrator:
         on_step: Callable[[dict], Any] | None = None,
         existing_content: str = "",
         long_form_mode: LongFormMode = LongFormMode.CONTINUE,
+        prefetched_rag: list[tuple[str, float, str]] | None = None,
     ) -> AsyncIterator[str]:
         """長文生成のエントリポイント。トークンを yield する。
 
@@ -294,7 +402,8 @@ class LongFormOrchestrator:
         self.last_content_type = content_type.value
 
         # 2. メモリ・RAG からコンテキスト収集
-        context = await self._gather_context(instruction)
+        # prefetched_rag があれば retriever を呼ばず取得済みチャンクを再利用する。
+        context = await self._gather_context(instruction, prefetched_rag=prefetched_rag)
         if existing_content:
             context["existing_content"] = existing_content
         # 出力モード (EXPAND / SPLIT 等) は strategy.create_plan() に
@@ -421,7 +530,12 @@ class LongFormOrchestrator:
             ):
                 yield token
 
-        # 9. コード検証
+        # 8.5 検証ゲート付きコードリペア (CODE のみ)。review 後の generated_units を
+        # assemble → 検証 → assist 修正 → 再検証し、last_code_output に保持する。
+        # 総時間超過時も最終出力品質のため実行する (max_repair_rounds で有界)。
+        await self._repair_generated_code(rolling, content_type, on_step)
+
+        # 9. コード検証 (リペア後を対象、Python のみ AST 検証)
         validation_errors, _warning_count = self._validate_generated_code(
             rolling, content_type, on_step,
         )
@@ -433,8 +547,17 @@ class LongFormOrchestrator:
             validation_errors, total_tokens, elapsed,
         )
 
-    async def _gather_context(self, instruction: str) -> dict:
-        """メモリ3層 + RAG からコンテキストを収集"""
+    async def _gather_context(
+        self,
+        instruction: str,
+        prefetched_rag: list[tuple[str, float, str]] | None = None,
+    ) -> dict:
+        """メモリ3層 + RAG からコンテキストを収集
+
+        ``prefetched_rag`` (search pipeline 取得済み ``(chunk_id, score, text)``)
+        があれば retriever を呼ばずそれを再利用する。``None``/空なら従来の
+        retriever 経路 (注入時のみ) に倒し、いずれも無ければ RAG なし。
+        """
         context: dict[str, str] = {"rag": "", "memory": ""}
 
         # メモリコンテキスト（WorkingMemory のターン履歴）
@@ -452,19 +575,56 @@ class LongFormOrchestrator:
             except Exception as e:
                 logger.warning("Failed to gather memory context: %s", e)
 
-        # RAG コンテキスト（retriever が利用可能な場合）
-        if self.retriever is not None and self.embedder is not None:
+        # RAG コンテキスト。
+        # 優先: search pipeline 取得済みの scored_chunks (prefetched_rag)。
+        # long_form 経路は retriever を注入しないため二重取得を避け、上流で
+        # reranker / 品質判定 / content gate を通った結果をそのまま再利用する。
+        # 従来の retriever 経路は retriever 注入時 (ユニットテスト等) のみ温存。
+        if prefetched_rag:
+            context["rag"] = self._format_prefetched_rag(prefetched_rag)
+        elif self.retriever is not None and self.embedder is not None:
             try:
-                results = await self.retriever.search(instruction, top_k=3)
+                results = await self.retriever.search(
+                    instruction, top_k=RAG_MAX_CHUNKS,
+                )
                 if results:
                     rag_parts = []
-                    for chunk_text, score, source in results[:3]:
-                        rag_parts.append(f"[{source}] (score={score:.2f})\n{chunk_text[:300]}")
+                    for chunk_text, score, source in results[:RAG_MAX_CHUNKS]:
+                        rag_parts.append(
+                            f"[{source}] (score={score:.2f})\n"
+                            f"{chunk_text[:RAG_CHUNK_CHAR_CAP]}"
+                        )
                     context["rag"] = "\n---\n".join(rag_parts)
             except Exception as e:
                 logger.warning("Failed to gather RAG context: %s", e)
 
         return context
+
+    @staticmethod
+    def _format_prefetched_rag(
+        scored_chunks: list[tuple[str, float, str]],
+    ) -> str:
+        """search pipeline 取得済み scored_chunks を plan コンテキスト文字列へ整形。
+
+        ``scored_chunks`` は ``(chunk_id, score, text)`` (search pipeline 形式)。
+        入力順 (salience / reranker 順) を維持し上位 ``RAG_MAX_CHUNKS`` 件を
+        各 ``RAG_CHUNK_CHAR_CAP`` 字に丸め、全体 ``RAG_TOTAL_TOKEN_BUDGET``
+        トークンに収まる範囲だけ採用する (plan プロンプト肥大の防止)。
+        """
+        parts: list[str] = []
+        used_tokens = 0
+        for chunk_id, score, text in scored_chunks[:RAG_MAX_CHUNKS]:
+            snippet = (text or "")[:RAG_CHUNK_CHAR_CAP]
+            if not snippet:
+                continue
+            part = f"[{chunk_id}] (score={score:.2f})\n{snippet}"
+            part_tokens = estimate_tokens(part)
+            # 1 件目は予算超過でも必ず含める (RAG を空にしない)。
+            if parts and used_tokens + part_tokens > RAG_TOTAL_TOKEN_BUDGET:
+                break
+            parts.append(part)
+            used_tokens += part_tokens
+        return "\n---\n".join(parts)
 
     async def _update_rolling_context(
         self, rolling: RollingContext, text: str, content_type: ContentType,

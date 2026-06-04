@@ -104,12 +104,13 @@ async def _init_llama_server(
             f"{llama_url}/health", label="llama-server (base)",
         )
         metadata = await fetch_model_metadata(llama_url, debug_logger=debug_logger)
-        from backend.config import resolve_enable_thinking
+        from backend.config import resolve_client_reasoning, resolve_enable_thinking
         base_enable_thinking = resolve_enable_thinking(
             cfg, "base",
             explicit=llama_cfg.get("enable_thinking"),
             chat_template=getattr(metadata, "chat_template", None),
         )
+        think_budget, on_runaway = resolve_client_reasoning(cfg, "base")
         client = LocalClient(
             llama_url,
             metadata,
@@ -120,6 +121,8 @@ async def _init_llama_server(
                 "stream_first_token_timeout_sec", 60.0,
             ),
             debug_logger=debug_logger,
+            client_think_budget=think_budget,
+            on_runaway=on_runaway,
         )
         if await client.health_check():
             state.local_client = client
@@ -127,11 +130,73 @@ async def _init_llama_server(
                 "llama-server connected: %s (cache_prompt=%s, slots=%d, enable_thinking=%s)",
                 llama_url, client._cache_prompt, client._slots, client._enable_thinking,
             )
+            _start_capability_probe(
+                client, cfg, metadata, llama_url, llama_cfg, debug_logger,
+            )
             return client
         logger.warning("llama-server health check failed: %s", llama_url)
     except Exception as e:
         logger.warning("llama-server not available: %s", e)
     return None
+
+
+def _start_capability_probe(
+    client: "LocalClient",
+    cfg: dict[str, Any],
+    metadata: Any,
+    llama_url: str,
+    llama_cfg: dict,
+    debug_logger: "DebugLogger",
+) -> None:
+    """ベースモデルの実挙動プローブをバックグラウンドで起動する (docs/c_15)。
+
+    ``runtime.capability_probe`` (既定 True) が False なら no-op。プローブ完了時に
+    ``client.capabilities`` を確定し、観測 reasoning mode で ``enable_thinking`` を
+    再解決して in-place 更新する。起動はブロックせず、完了までは prior (宣言) で動作。
+    失敗時は prior を維持 (degraded 安全)。
+    """
+    if not (cfg.get("runtime", {}) or {}).get("capability_probe", True):
+        return
+
+    import asyncio
+
+    from backend.config import resolve_enable_thinking, resolve_reasoning_mode
+    from backend.free.llm.capability import (
+        make_llama_chat_fn,
+        probe_model_capabilities,
+    )
+
+    chat_template = getattr(metadata, "chat_template", None)
+
+    async def _run() -> None:
+        try:
+            declared = resolve_reasoning_mode(cfg, "base", chat_template=chat_template)
+            snapshot = await probe_model_capabilities(
+                model_id=getattr(metadata, "model_id", ""),
+                template_family=getattr(metadata, "template_family", "unknown"),
+                declared_reasoning_mode=declared,
+                chat_fn=make_llama_chat_fn(llama_url, debug_logger=debug_logger),
+                probe_json=False,  # base はチャットのみ。json purpose は assist 側で観測
+            )
+            client.capabilities = snapshot
+            new_enable = resolve_enable_thinking(
+                cfg, "base",
+                explicit=llama_cfg.get("enable_thinking"),
+                chat_template=chat_template,
+                observed_reasoning_mode=snapshot.effective_reasoning_mode,
+            )
+            if new_enable != client._enable_thinking:
+                logger.info(
+                    "Capability probe adjusted base enable_thinking: %s -> %s "
+                    "(observed reasoning mode=%s)",
+                    client._enable_thinking, new_enable,
+                    snapshot.effective_reasoning_mode,
+                )
+                client._enable_thinking = new_enable
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Capability probe task failed (prior retained): %s", e)
+
+    client._capability_probe_task = asyncio.create_task(_run())
 
 
 async def _init_pro_gen_pillar(
@@ -259,6 +324,7 @@ async def _init_assist_model(
             assist_client.url,
             cc["realtime"], cc["background"], cc["learning"],
         )
+        _start_assist_capability_probe(assist_client, cfg, debug_logger)
         return assist_client
     except Exception as e:
         logger.warning(
@@ -267,6 +333,52 @@ async def _init_assist_model(
             e,
         )
         return None
+
+
+def _start_assist_capability_probe(
+    assist_client: Any, cfg: dict[str, Any], debug_logger: "DebugLogger",
+) -> None:
+    """アシストモデルの実挙動プローブをバックグラウンドで起動する (docs/c_15)。
+
+    json purpose を持つため ``probe_json=True``。観測結果 (特に json_schema grammar
+    が強制されるか) を ``assist_client.capabilities`` に保持し、divergence をログ化する
+    (``needs_lenient_json`` の可視化)。``runtime.capability_probe`` False で no-op。
+    失敗時は prior を維持 (degraded 安全)。
+    """
+    if not (cfg.get("runtime", {}) or {}).get("capability_probe", True):
+        return
+
+    import asyncio
+
+    from backend.config import resolve_reasoning_mode
+    from backend.free.llm.capability import (
+        make_llama_chat_fn,
+        probe_model_capabilities,
+    )
+    from backend.free.llm.model_metadata import fetch_model_metadata
+
+    url = getattr(assist_client, "url", None)
+    if not url:
+        return
+
+    async def _run() -> None:
+        try:
+            meta = await fetch_model_metadata(url, debug_logger=debug_logger)
+            declared = resolve_reasoning_mode(
+                cfg, "assist", chat_template=getattr(meta, "chat_template", None),
+            )
+            snapshot = await probe_model_capabilities(
+                model_id=getattr(meta, "model_id", ""),
+                template_family=getattr(meta, "template_family", "unknown"),
+                declared_reasoning_mode=declared,
+                chat_fn=make_llama_chat_fn(url, debug_logger=debug_logger),
+                probe_json=True,  # assist は json purpose (url_relevance_score 等) を持つ
+            )
+            assist_client.capabilities = snapshot
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Assist capability probe failed (prior retained): %s", e)
+
+    assist_client._capability_probe_task = asyncio.create_task(_run())
 
 
 def _init_cartridge_manager(state: AppState, cfg: dict[str, Any], resolver: Any) -> None:

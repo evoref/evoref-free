@@ -39,6 +39,9 @@ from backend.free.agent.reactive import ReactiveAgent
 from backend.free.agent.router import ComplexityClassifier
 from backend.free.core.stage_timer import StageTimer
 from backend.free.generation.orchestrator import LongFormOrchestrator
+from backend.free.generation.content_detector import detect_content_type
+from backend.free.generation.models import ContentType
+from backend.free.agent.meta_cognitive_tasks import EditorArtifact
 from backend.log_config import get_logger
 from backend.trace_context import generate_trace_id, set_trace_id
 
@@ -203,8 +206,10 @@ async def _build_messages_with_search(
     max_tokens: int | None,
     timer: StageTimer,
     editor_route: str | None = None,
-) -> tuple[list, StreamWrapper, str | None]:
-    """統合検索を実行し ``messages`` / SSE 通知ラッパ / semmem ブロックを構築する。"""
+) -> tuple[list, StreamWrapper, str | None, list[tuple[str, float, str]] | None]:
+    """統合検索を実行し ``messages`` / SSE 通知ラッパ / semmem ブロック / 取得済み
+    scored_chunks を構築する。``scored_chunks`` は long_form 経路が orchestrator に
+    再利用注入するために返す (非 long_form 経路は ``messages`` 側で消費するため未使用)。"""
     timer.start("search_ms")
     search_result = await run_search_pipeline(
         req.message, state, cfg, mode=req.mode, timer=timer,
@@ -251,7 +256,7 @@ async def _build_messages_with_search(
         async for frame in inner_gen:
             yield frame
 
-    return messages, _wrapper, semmem_block
+    return messages, _wrapper, semmem_block, scored_chunks
 
 
 def _build_rag_debug_frame(
@@ -276,6 +281,109 @@ def _build_rag_debug_frame(
     return sse_notify.rag_debug(rag_debug_chunks, search_time_ms)
 
 
+def _build_long_form_orchestrator(
+    client, state: AppState, cfg: dict, gen_params: dict,
+) -> LongFormOrchestrator:
+    """LongFormOrchestrator を構築する (long_form ディスパッチ / コード委譲で共用)。"""
+    mem_sys = state.get_memory_system()
+    return LongFormOrchestrator(
+        main_client=client,
+        assist_client=state.assist_client,
+        memory_wm=mem_sys[0] if mem_sys else None,
+        memory_stm=mem_sys[1] if mem_sys else None,
+        config=cfg,
+        debug_logger=state.debug_logger,
+        generation_params=gen_params,
+        policy=state.policy_interpreter,
+    )
+
+
+# editor タブ表示用の拡張子 → 言語ラベル (フロントのシンタックスハイライト向け)。
+_CODE_EXT_LANG: dict[str, str] = {
+    "py": "python", "pyi": "python",
+    "ts": "typescript", "tsx": "typescript",
+    "js": "javascript", "jsx": "javascript", "mjs": "javascript",
+    "svelte": "svelte", "vue": "vue",
+    "rs": "rust", "go": "go", "java": "java", "kt": "kotlin",
+    "c": "c", "h": "c", "cpp": "cpp", "cc": "cpp", "hpp": "cpp",
+    "rb": "ruby", "php": "php", "cs": "csharp", "swift": "swift",
+    "sh": "bash", "bash": "bash", "sql": "sql",
+    "css": "css", "scss": "scss", "html": "html",
+    "json": "json", "yaml": "yaml", "yml": "yaml", "md": "markdown",
+}
+
+
+def _artifact_from_file(path: str, code: str) -> EditorArtifact:
+    """orchestrator の last_code_files エントリを EditorArtifact に変換する。"""
+    from pathlib import PurePosixPath
+
+    pp = PurePosixPath(path) if path else None
+    name = pp.name if pp else ""
+    ext = pp.suffix.lstrip(".").lower() if pp else ""
+    return EditorArtifact(
+        content=code,
+        language=_CODE_EXT_LANG.get(ext, "python"),
+        filename=name or None,
+    )
+
+
+def _clamp_long_form_timeout(cfg: dict) -> dict:
+    """coding 委譲時、orchestrator の total_timeout_sec を agent 上限未満にする。
+
+    agent (`_total_timeout` 既定 900s、超過時に artifacts 破棄) より短く打ち切り、
+    orchestrator 側でユニット境界の部分結果 + repair を確定させる (artifacts 喪失回避)。
+    """
+    agent_total = float((cfg.get("agent") or {}).get("total_timeout", 900) or 900)
+    clamped = max(300.0, agent_total - 90.0)
+    lf_cfg = dict(cfg.get("long_form") or {})
+    existing = float(lf_cfg.get("total_timeout_sec", 1800.0) or 0.0)
+    lf_cfg["total_timeout_sec"] = clamped if existing <= 0 else min(existing, clamped)
+    return {**cfg, "long_form": lf_cfg}
+
+
+def make_code_artifact_generator(
+    client, state: AppState, cfg: dict, gen_params: dict, session_id: str,
+):
+    """coding の editor/chat 出力向け code_generator を返す (MetaCognitiveAgent に注入)。
+
+    指示文を LongFormOrchestrator の細粒度 CodeUnit 計画で生成し、ファイル別の
+    検証・修正済みコードを EditorArtifact 群 (複数ファイル可) として返す。テキスト
+    判定 / 生成失敗時は空リストを返し、agent の単一ショット生成にフォールバックさせる。
+    """
+    gen_cfg = _clamp_long_form_timeout(cfg)
+
+    async def _generate(instruction: str, on_step=None) -> list[EditorArtifact]:
+        if detect_content_type(instruction, "coding") != ContentType.CODE:
+            return []
+        orchestrator = _build_long_form_orchestrator(
+            client, state, gen_cfg, gen_params,
+        )
+        try:
+            # orchestrator の _call_step は sync 呼出 (on_step(data)) だが、
+            # MetaCognitive ランナーの on_step は async。委譲時に転送すると
+            # 「coroutine never awaited」で進捗フレームを取りこぼすため転送しない
+            # (進捗は agent 側の task_progress が表示する)。
+            async for _token in orchestrator.generate(
+                instruction=instruction, session_id=session_id,
+                mode="coding", on_step=None,
+            ):
+                pass
+        except Exception as e:  # noqa: BLE001 — 失敗時は agent 側でフォールバック
+            logger.warning("Delegated code generation failed: %s", e)
+            return []
+        files = orchestrator.last_code_files or (
+            {"output.py": orchestrator.last_code_output}
+            if orchestrator.last_code_output else {}
+        )
+        return [
+            _artifact_from_file(path, code)
+            for path, code in files.items()
+            if code and code.strip()
+        ]
+
+    return _generate
+
+
 async def _dispatch_long_form(
     req: ChatRequest,
     client,
@@ -289,6 +397,7 @@ async def _dispatch_long_form(
     search_error_wrapper: StreamWrapper,
     timer: StageTimer,
     output_target: str = "file",
+    prefetched_rag: list[tuple[str, float, str]] | None = None,
 ) -> StreamingResponse | ChatResponse:
     """Meta-Cognitive (long_form) 経路: 長文生成オーケストレータを起動する。
 
@@ -302,17 +411,7 @@ async def _dispatch_long_form(
             return _llm_unavailable_response(req.stream)
         raise HTTPException(status_code=503, detail="llama-server not connected")
 
-    mem_sys = state.get_memory_system()
-    orchestrator = LongFormOrchestrator(
-        main_client=client,
-        assist_client=state.assist_client,
-        memory_wm=mem_sys[0] if mem_sys else None,
-        memory_stm=mem_sys[1] if mem_sys else None,
-        config=cfg,
-        debug_logger=state.debug_logger,
-        generation_params=gen_params,
-        policy=state.policy_interpreter,
-    )
+    orchestrator = _build_long_form_orchestrator(client, state, cfg, gen_params)
     existing_content = await read_existing_for_append(req.message, state)
 
     if req.stream:
@@ -324,6 +423,7 @@ async def _dispatch_long_form(
                 timer=timer,
                 private=req.private,
                 output_target=output_target,
+                prefetched_rag=prefetched_rag,
             ))),
             media_type="text/event-stream",
         )
@@ -335,6 +435,7 @@ async def _dispatch_long_form(
             timer=timer,
             private=req.private,
             output_target=output_target,
+            prefetched_rag=prefetched_rag,
         )
 
 
@@ -358,6 +459,16 @@ async def _dispatch_meta_cognitive(
     """Meta-Cognitive (通常) 経路: 計画 + ツールループ。"""
     # @self 仮想カートリッジ用 LoopFactView 配線
     loop_view = _resolve_loop_view_for_agent(state)
+    # coding モード: editor/chat 出力のコード生成を LongForm 細粒度生成へ委譲する
+    # generator を注入する (複数ファイル可)。非 coding / 無効時は None。
+    code_generator = None
+    if (
+        req.mode == "coding"
+        and cfg.get("agent", {}).get("delegate_codegen_to_longform", True)
+    ):
+        code_generator = make_code_artifact_generator(
+            client, state, cfg, gen_params, session_id,
+        )
     meta_agent = MetaCognitiveAgent(
         config=cfg,
         tool_judge=state.tool_call_judge,
@@ -374,6 +485,7 @@ async def _dispatch_meta_cognitive(
         debug_logger=state.debug_logger,
         # ツールループ全反復で SemMem メモリを維持 (初回ターンと同じ block)
         semmem_block=semmem_block,
+        code_generator=code_generator,
     )
     keepalive_sec = cfg.get("streaming", {}).get(
         "keepalive_interval_sec", DEFAULT_KEEPALIVE_INTERVAL_SEC,
@@ -424,6 +536,7 @@ async def _dispatch_deliberative(
         config=cfg,
         tool_judge=state.tool_call_judge,
         tools_registry=state.tools_registry,
+        assist_client=state.assist_client,
     )
 
     if req.stream:
@@ -543,10 +656,12 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         editor_route = None
 
     timer = StageTimer()
-    messages, search_error_wrapper, semmem_block = await _build_messages_with_search(
-        req, state, cfg, system_prompt, history, file_contexts,
-        context_size, max_tokens, timer,
-        editor_route=editor_route,
+    messages, search_error_wrapper, semmem_block, scored_chunks = (
+        await _build_messages_with_search(
+            req, state, cfg, system_prompt, history, file_contexts,
+            context_size, max_tokens, timer,
+            editor_route=editor_route,
+        )
     )
 
     match agent_layer:
@@ -555,6 +670,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 req, client, state, cfg, gen_params, session_id,
                 instance_name, context_size, messages, search_error_wrapper, timer,
                 output_target=output_target,
+                prefetched_rag=scored_chunks,
             )
         case "meta_cognitive":
             return await _dispatch_meta_cognitive(
