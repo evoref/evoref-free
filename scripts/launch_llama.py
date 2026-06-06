@@ -490,7 +490,7 @@ def build_llama_cmd(
         "llama-server",
         "-m", str(base_model_path),
         "--port", str(lc.get("port", 8080)),
-        "-c", str(lc.get("context_size", 4096)),
+        "-c", str(resolve_context_size_for(cfg, "base", project_root)),
         "-ngl", str(_resolve_base_gpu_layers(cfg, project_root)),
         "-b", str(lc.get("batch_size", 512)),
     ]
@@ -502,6 +502,48 @@ def build_llama_cmd(
         lora_full = project_root / lora_full
     if lora_full.exists():
         cmd += ["--lora", str(lora_full)]
+
+    # Level 2 base=C: control vector (残差ストリーム操舵)。
+    # learning.level2_base_method=='cvector' かつファイルが存在するときのみ適用する。
+    # config 駆動のみ (backend.pro / backend.edition の import は行わない = 横断スクリプト)。
+    # Free は control_vector.gguf を生成しないので inert。適用は次回起動時。
+    learning_cfg = cfg.get("learning", {}) or {}
+    if learning_cfg.get("level2_base_method") == "cvector":
+        cvec_path = lp.get("control_vector_adapter", "local/models/control_vector.gguf")
+        cvec_full = Path(cvec_path)
+        if not cvec_full.is_absolute():
+            cvec_full = project_root / cvec_full
+        if cvec_full.exists():
+            # 既定 1.0。``or`` フォールバックは使わない (0.0 は診断用の正当な値で、
+            # falsy 畳み込みすると 1.0=full strength に化けるため)。dict 既定が欠損を
+            # 補い、schema が非 Optional float なので None は来ない。
+            scale = float(learning_cfg.get("cvector_scale", 1.0))
+            if scale == 1.0:
+                # --control-vector は FNAME のみ取るため、Windows のドライブレター
+                # (E:) のコロンとも衝突しない (絶対パスで安全)。
+                cmd += ["--control-vector", str(cvec_full)]
+            else:
+                # スケール指定時のみ --control-vector-scaled FNAME:SCALE。FNAME に
+                # Windows 絶対パス (E:\...) を渡すとドライブレターのコロンが FNAME:SCALE
+                # のセパレータと衝突するため、project_root 相対 POSIX パスを渡す
+                # (llama-server は CWD=project_root 基準で解決; standalone 起動は
+                # _start_and_wait が cwd=project_root を設定)。project_root 外の絶対
+                # パスは衝突を避けられないため fail-fast する。
+                try:
+                    rel = cvec_full.relative_to(project_root).as_posix()
+                except ValueError as e:
+                    raise ValueError(
+                        "cvector_scale != 1.0 requires control_vector_adapter to "
+                        "resolve under project_root (relative path); an absolute path "
+                        "outside project_root collides with the --control-vector-scaled "
+                        "FNAME:SCALE separator.",
+                    ) from e
+                cmd += ["--control-vector-scaled", f"{rel}:{scale}"]
+            layer_range = str(learning_cfg.get("cvector_layer_range", "") or "").strip()
+            if layer_range:
+                parts = layer_range.replace(",", " ").split()
+                if len(parts) == 2:
+                    cmd += ["--control-vector-layer-range", parts[0], parts[1]]
 
     # オプション
     threads = lc.get("threads", 0)
@@ -560,6 +602,7 @@ def build_llama_cmd(
             "-m", "--port", "-c", "-ngl", "-b", "-t", "-fa", "--mlock",
             "-np", "--cache-type-k", "--cache-type-v", "--cache-ram",
             "--kv-unified", "--lora", "--reasoning-budget", "--reasoning-budget-message",
+            "--control-vector", "--control-vector-scaled", "--control-vector-layer-range",
         },
         project_root=project_root,
         warn=lambda m: print(m, file=sys.stderr),
@@ -636,10 +679,20 @@ def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | 
     return cmd
 
 
-def build_assist_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | None:
+def build_assist_cmd(
+    cfg: dict,
+    project_root: Path | None = None,
+    *,
+    lora_override: str | Path | None = None,
+    port_override: int | None = None,
+) -> list[str] | None:
     """config.yaml の assist_model セクションからアシストモデル用 llama-server コマンドを生成
 
     assist_model.local セクションがあり、model_paths.assist_model が存在する場合のみコマンドを返す。
+
+    Level 2 assist=B の候補評価では ``lora_override`` (候補 GGUF LoRA パス) と
+    ``port_override`` (スクラッチポート) を指定して ephemeral サーバを起動する。
+    どちらも未指定 (通常運用) のときは従来挙動と完全に等価。
     """
     assist_cfg = cfg.get("assist_model", {})
     local_cfg = assist_cfg.get("local", {})
@@ -659,7 +712,7 @@ def build_assist_cmd(cfg: dict, project_root: Path | None = None) -> list[str] |
     if not assist_model_path.is_absolute():
         assist_model_path = project_root / assist_model_path
 
-    port = local_cfg.get("port", 8081)
+    port = port_override if port_override is not None else local_cfg.get("port", 8081)
 
     # GPU layers: assist 側で明示指定があればそちらを優先し、なければ
     # llama セクションの値にフォールバックする（従来挙動）。
@@ -671,9 +724,24 @@ def build_assist_cmd(cfg: dict, project_root: Path | None = None) -> list[str] |
         "llama-server",
         "-m", str(assist_model_path),
         "--port", str(port),
-        "-c", str(local_cfg.get("context_size", 8192)),
+        "-c", str(resolve_context_size_for(cfg, "assist", project_root)),
         "-ngl", str(gpu_layers),
     ]
+
+    # LoRA アダプタ。lora_override (Level 2 assist=B 候補評価) は無条件で付与する
+    # (候補 GGUF は harness が起動直前に書き出すため exists チェックしない)。
+    # 通常運用は local_paths.assist_lora_adapter が存在するときのみ付与し、採用済み
+    # assist LoRA を次回起動で反映する。
+    if lora_override is not None:
+        cmd += ["--lora", str(Path(lora_override))]
+    else:
+        lp = cfg.get("local_paths", {})
+        assist_lora = lp.get("assist_lora_adapter", "local/models/assist_adapter.gguf")
+        assist_lora_full = Path(assist_lora)
+        if not assist_lora_full.is_absolute():
+            assist_lora_full = project_root / assist_lora_full
+        if assist_lora_full.exists():
+            cmd += ["--lora", str(assist_lora_full)]
 
     # 物理バッチサイズ（指定があれば）
     batch_size = local_cfg.get("batch_size")
@@ -749,7 +817,7 @@ def build_assist_cmd(cfg: dict, project_root: Path | None = None) -> list[str] |
             "-m", "--port", "-c", "-ngl", "-b", "-ub", "-t", "-fa", "--mlock",
             "-np", "--cache-type-k", "--cache-type-v", "--cache-reuse",
             "--cache-ram", "--kv-unified", "-rea", "--reasoning-budget",
-            "--reasoning-budget-message", "--skip-chat-parsing",
+            "--reasoning-budget-message", "--skip-chat-parsing", "--lora",
         },
         project_root=project_root,
         warn=lambda m: print(m, file=sys.stderr),
@@ -1309,7 +1377,7 @@ def _estimate_via_gguf_size(
         lc = cfg.get("llama", {}) or {}
         base_kv_mb = estimate_kv_cache_mb(
             _read_gguf_metadata_cached(base_path),
-            int(lc.get("context_size", 4096) or 4096),
+            resolve_context_size_for(cfg, "base", project_root),
             lc.get("cache_type_k"),
             lc.get("cache_type_v"),
         )
@@ -1346,7 +1414,7 @@ def _estimate_via_gguf_size(
         if assist_ngl > 0 and assist_size is not None:
             assist_kv_mb = estimate_kv_cache_mb(
                 _read_gguf_metadata_cached(assist_path),
-                int(local_cfg.get("context_size", 8192) or 8192),
+                resolve_context_size_for(cfg, "assist", project_root),
                 local_cfg.get("cache_type_k"),
                 local_cfg.get("cache_type_v"),
             )
@@ -1527,26 +1595,74 @@ def _parse_device_memory(text: str) -> dict[str, tuple[int, int]]:
     return result
 
 
-def _resolve_context_size_for(cfg: dict, name: str) -> int:
-    """Tier 1 推定で ``-c`` に渡す context_size を解決する。
+# config 明示も arch プロファイル宣言も無い場合の context_size slot 別既定。
+# backend/config.py::_CONTEXT_SIZE_FALLBACK と一致させること (サーバ ``-c`` と
+# ランタイム token budget の値を揃えるため)。
+_CONTEXT_SIZE_DEFAULTS: dict[str, int] = {
+    "base": 8192, "assist": 8192, "embed": 8192, "reranker": 8192,
+}
 
-    各モデルの context 設定を優先し、未設定時はモデル種別ごとに妥当な
-    既定値 (チャット系 4096 / アシスト 8192 / 埋め込み・リランカー 8192)
-    を採用する。
+
+def _profile_context_size_for_model(
+    model_path: Path, project_root: Path,
+) -> int | None:
+    """モデルパスから arch プロファイルの ``context_size`` を返す。
+
+    GGUF arch 検出 → ``load_model_profile`` で解決。未宣言 / 512 未満 / 不正値 /
+    読取失敗はすべて ``None`` (呼び出し側で slot 別既定にフォールバック)。
     """
+    try:
+        meta = read_gguf_metadata(model_path)
+        profile = load_model_profile(meta.get("architecture"), project_root)
+        raw = profile.get("context_size")
+        if raw is None:
+            return None
+        value = int(raw)
+        return value if value >= 512 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def resolve_context_size_for(
+    cfg: dict, name: str, project_root: Path | None = None,
+) -> int:
+    """slot の ``-c`` (context_size) を解決する。
+
+    優先順位 (docs/c_15、profile=arch 既定): config 明示 > arch プロファイル
+    ``context_size`` > slot 別既定 (``_CONTEXT_SIZE_DEFAULTS``)。config 側
+    (``llama.context_size`` / ``assist_model.local.context_size``) が ``None``
+    (未指定) のときのみ profile を参照する。プロファイル参照は base / assist の
+    み、かつ ``project_root`` 指定時のみ (未指定なら config + 既定で解決)。
+    embed / reranker は profile 非対象 (従来挙動)。
+    """
+    default = _CONTEXT_SIZE_DEFAULTS.get(name, 8192)
     if name == "base":
-        return int((cfg.get("llama") or {}).get("context_size", 4096))
-    if name == "assist":
-        return int(
-            ((cfg.get("assist_model") or {}).get("local") or {}).get(
-                "context_size", 8192,
-            )
+        explicit = (cfg.get("llama") or {}).get("context_size")
+        model_key = "base_model"
+    elif name == "assist":
+        explicit = ((cfg.get("assist_model") or {}).get("local") or {}).get(
+            "context_size",
         )
-    if name == "embed":
-        return int((cfg.get("embedding") or {}).get("context_size", 8192))
-    if name == "reranker":
-        return int((cfg.get("reranker") or {}).get("context_size", 8192))
-    return 4096
+        model_key = "assist_model"
+    elif name == "embed":
+        return int((cfg.get("embedding") or {}).get("context_size", default))
+    elif name == "reranker":
+        return int((cfg.get("reranker") or {}).get("context_size", default))
+    else:
+        return default
+
+    if explicit is not None:
+        return int(explicit)
+    if project_root is not None:
+        model_rel = (cfg.get("model_paths") or {}).get(model_key, "")
+        if model_rel:
+            model_path = Path(model_rel)
+            if not model_path.is_absolute():
+                model_path = project_root / model_path
+            profile_ctx = _profile_context_size_for_model(model_path, project_root)
+            if profile_ctx is not None:
+                return profile_ctx
+    return default
 
 
 def _run_fit_params(
@@ -1784,8 +1900,8 @@ def _resolve_auto_gpu_layers(
         return None
 
     # fit-params で全 offload 時の VRAM 推定 + device 容量を取得
-    base_ctx = _resolve_context_size_for(cfg, "base")
-    assist_ctx = _resolve_context_size_for(cfg, "assist")
+    base_ctx = resolve_context_size_for(cfg, "base", project_root)
+    assist_ctx = resolve_context_size_for(cfg, "assist", project_root)
     base_full, base_devmem = _run_fit_params_with_meta(
         binary, str(base_model_path), base_ctx, 999, timeout,
     )
@@ -1841,6 +1957,7 @@ def _resolve_auto_gpu_layers(
 
 def _try_estimate_via_fit_params(
     cfg: dict, base_estimates: dict[str, dict],
+    project_root: Path | None = None,
 ) -> dict[str, dict]:
     """Tier 1: ``llama-fit-params`` で base_estimates を上書きする
 
@@ -1865,7 +1982,7 @@ def _try_estimate_via_fit_params(
         path = entry.get("path") or ""
         if not path:
             continue
-        ctx = _resolve_context_size_for(cfg, name)
+        ctx = resolve_context_size_for(cfg, name, project_root)
         ngl = int(entry["gpu_layers"])
         tier1 = _run_fit_params(binary, path, ctx, ngl, timeout)
         if tier1 is None:
@@ -1934,7 +2051,7 @@ def estimate_vram_usage_mb(
     if not runtime_cfg.get("fit_params_enabled", True):
         return base_result
 
-    return _try_estimate_via_fit_params(cfg, base_result)
+    return _try_estimate_via_fit_params(cfg, base_result, project_root)
 
 
 def suggest_total_vram_budget_mb(
@@ -2246,11 +2363,16 @@ def wait_for_health(host: str, port: int, timeout: int = 30) -> bool:
 
 def _start_and_wait(
     cmd: list[str], name: str, host: str, port: int,
-    *, env: dict | None = None,
+    *, env: dict | None = None, cwd: str | Path | None = None,
 ) -> subprocess.Popen:
-    """llama-server プロセスを起動しヘルスチェック"""
+    """llama-server プロセスを起動しヘルスチェック
+
+    ``cwd`` を渡すと相対パス引数 (例: --control-vector-scaled の相対 FNAME) が
+    project_root 基準で解決される。canonical 起動 (service_manager) は cwd 設定済で、
+    本 standalone 経路でも揃える。``None`` は親プロセスの CWD を継承 (従来挙動)。
+    """
     print(f"[launch] {name}: {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, env=env)
+    proc = subprocess.Popen(cmd, env=env, cwd=cwd)
     print(f"[launch] Waiting for {name} at {host}:{port}...")
     if wait_for_health(host, port):
         print(f"[launch] {name} is ready")
@@ -2321,7 +2443,7 @@ if __name__ == "__main__":
             cmd = build_llama_cmd(cfg, project_root)
             host = cfg["llama"].get("host", "localhost")
             port = cfg["llama"].get("port", 8080)
-            procs.append(_start_and_wait(cmd, "base-model", host, port))
+            procs.append(_start_and_wait(cmd, "base-model", host, port, cwd=project_root))
 
         # アシストモデル
         if launch_assist:
@@ -2330,7 +2452,7 @@ if __name__ == "__main__":
                 assist_cfg = cfg.get("assist_model", {}).get("local", {})
                 host = assist_cfg.get("host", "127.0.0.1")
                 port = assist_cfg.get("port", 8081)
-                procs.append(_start_and_wait(assist_cmd, "assist-model", host, port))
+                procs.append(_start_and_wait(assist_cmd, "assist-model", host, port, cwd=project_root))
             else:
                 print("[launch] Assist model not configured, skipping")
 
@@ -2346,7 +2468,7 @@ if __name__ == "__main__":
                 # buffer size が Vulkan device->max_buffer_size を超えると warning
                 # (ggml_vulkan: Failed to allocate pinned memory) が出るが CPU buffer に
                 # 自動フォールバックするため機能影響は無い (ggml-vulkan.cpp:14079 / :2671)。
-                procs.append(_start_and_wait(embed_cmd, "embedding", host, port))
+                procs.append(_start_and_wait(embed_cmd, "embedding", host, port, cwd=project_root))
             else:
                 print("[launch] Embedding backend is not llama-cpp, skipping")
 
@@ -2359,7 +2481,7 @@ if __name__ == "__main__":
                 port = reranker_cfg.get("port", 8083)
                 # embed と同じ pinned-memory warning が出る可能性あり (詳細はembed側
                 # コメント参照)。CPU buffer フォールバックで動作継続。
-                procs.append(_start_and_wait(reranker_cmd, "reranker", host, port))
+                procs.append(_start_and_wait(reranker_cmd, "reranker", host, port, cwd=project_root))
             else:
                 print("[launch] Reranker not configured or not llama-cpp, skipping")
 

@@ -116,6 +116,9 @@ llama:
                                   # 既定を 8192 に引き上げ。VRAM 余裕があれば 16384 以上も可。
                                   # 16384以上は cache_type の見直し + RoPE スケーリングを検討
                                   # モデルの学習時コンテキスト長は GET /props の n_ctx_train で確認可能
+                                  # null にすると arch プロファイル (models/profiles/<arch>.yaml の
+                                  # context_size) を使用。明示 int は常にプロファイルより優先される
+                                  # (解決順: ここの明示値 > profile > 8192)
   gpu_layers: 999                 # -ngl / GPU にオフロードするレイヤー数（999=全層、CPU only なら 0）
   threads: 0                      # -t / スレッド数（0=自動検出）
   batch_size: 512                 # -b / バッチサイズ
@@ -278,6 +281,9 @@ local_paths:
   lora_archive_dir: local/lora_archive/                            # ベース LoRA アーカイブ (古い世代)
   assist_lora_adapter: local/models/assist_adapter.gguf            # アシスト LoRA アダプタ
   assist_lora_versions_dir: local/models/assist_lora_versions/     # アシスト LoRA スナップショット
+  control_vector_adapter: local/models/control_vector.gguf            # base=C control vector 本体 (Pro)
+  control_vector_versions_dir: local/models/control_vector_versions/  # control vector スナップショット (Pro)
+  cvector_work_dir: local/cvector/                                 # control vector 生成の positive/negative 作業用 (Pro)
   embed_lora_adapter: local/models/embed_adapter.gguf              # 埋め込み LoRA アダプタ
   embed_lora_versions_dir: local/models/embed_lora_versions/       # 埋め込み LoRA スナップショット
   # RAG / メモリ
@@ -724,7 +730,22 @@ learning:
   active_minutes: 5               # user_active 判定閾値（分）— Level 2 中断判定
   level2_spsa_iterations: 500     # Level 2 SPSA の反復回数
   level2_sparse_params: 200       # Level 2 のスパースパラメータ数
-  level2_schedule_hour: 3         # Level 2 の実行スケジュール時刻
+  level2_schedule_hour: 3         # Level 2 の優先窓ヒント時刻（強制ではない）
+  level2_recheck_interval_sec: 300  # Level 2 常駐ループの再評価間隔（秒、再起動耐性）
+  level2_overdue_hours: 24.0      # 前回実行からこの時間超で overdue 発火
+  level2_bootstrap_enabled: false # 初回 full-train（初期 LoRA 生成）。実 llama-server ロード検証後に true 推奨
+  level2_bootstrap_rank: 8        # bootstrap LoRA の rank
+  level2_bootstrap_init_sigma: 0.0001  # lora_a 初期ガウス標準偏差（lora_b=0）
+  level2_bootstrap_min_failures: 20    # 初回 bootstrap の最小失敗数（本学習 50 より低め）
+  # Level 2 base=C: ベースモデルを control vector で操舵 (Pro 限定)。実 --control-vector ロード検証後に cvector へ
+  level2_base_method: lora             # lora（既存・既定）/ cvector
+  cvector_method: pca                  # pca / mean (llama-cvector-generator --method)
+  cvector_pca_batch: 100               # --pca-batch
+  cvector_pca_iter: 1000               # --pca-iter
+  cvector_layer_range: ""              # 空=block_count から全層自動 / "START END" 指定可
+  cvector_scale: 1.0                   # --control-vector-scaled FNAME:SCALE
+  cvector_seed_pairs_file: ""          # キュレーション種ペア JSON（空=組込デフォルト軸）
+  cvector_min_experiences: 40          # HYBRID 対照例（種＋経験）の最小数
   # パターン検出キーワード学習
   pattern_max_patterns: 200       # 学習済みパターンの最大数
   pattern_initial_weight: 0.5     # 新規パターンの初期重み
@@ -743,14 +764,25 @@ learning:
   fewshot_diversity_threshold: 0.8    # 重複判定のコサイン類似度上限
   # Level 2 アシストモデル
   assist_level2_min_experiences: 30   # アシストモデル Level 2 の最小経験数
-  assist_spsa_iterations: 300         # アシストモデル SPSA 反復回数
+  assist_spsa_iterations: 300         # アシストモデル SPSA 反復回数（assist=B 使用時は ~30 推奨: 1 iter=候補サーバ2回起動）
   assist_sparse_params: 100           # アシストモデルのスパースパラメータ数
+  # Level 2 assist=B: assist LoRA 候補を ephemeral サーバに実ロードして実推論評価 (Pro 限定)。実 --lora ロード検証後に spsa-real-eval へ
+  level2_assist_method: none          # none（既存・既定 no-op）/ spsa-real-eval
+  assist_eval_scratch_port: 8090      # 候補評価サーバのスクラッチポート
+  assist_eval_loss_w1: 0.7            # keyword/pattern 一致項の重み
+  assist_eval_loss_w2: 0.3            # mean neg-logprob 項の重み
+  assist_eval_max_tokens: 64          # 候補評価生成のトークン上限
+  assist_eval_max_cases: 20           # 候補評価に使う held-out ケース上限
+  assist_eval_health_timeout: 120     # 候補サーバ起動の health 待ち秒数
+  level2_assist_bootstrap_enabled: false  # assist B=0 種生成。実 --lora ロード検証後に true
+  level2_assist_bootstrap_rank: 8     # assist bootstrap LoRA の rank
+  level2_assist_bootstrap_init_sigma: 0.0001  # lora_a 初期ガウス標準偏差（lora_b=0）
   # トークン予算進化
   budget_generations: 5               # トークン予算進化の世代数
   budget_sigma: 0.05                  # トークン予算進化の摂動スケール
   budget_max_total_ratio: 0.7         # 各戦略の比率合計の上限
   # 変異生成 LLM 設定
-  prompt_mutator_base: main           # ベースモデル変異生成の LLM（main / assist）
+  prompt_mutator_base: assist         # ベースモデル変異生成の LLM（main / assist）。低速 base のタイムアウト回避のため既定 assist
   prompt_mutator_assist: main         # アシストモデル変異生成の LLM（main / assist）
   # ポリシー / 進化結果書き戻し設定
   # PolicyInterpreter / PolicyParamEvolver / FewShotPool の永続化先と進化挙動。
@@ -794,7 +826,7 @@ agent:
   content_gen_idle_timeout: 30           # トークン間の無出力許容秒数（2トークン目以降、超過で「停止」とみなし中断）
   content_gen_timeout: 600               # ファイル内容生成の総上限秒数（低速 GPU でも完走できるよう緩和）
   llm_call_timeout: 90                   # 計画生成など単発 LLM 呼出のタイムアウト（秒）
-  total_timeout: 900                     # Meta-Cognitive 全体のタイムアウト（秒、content_gen_timeout を内包）
+  total_timeout: 1800                    # Meta-Cognitive 全体のタイムアウト（秒、content_gen_timeout / 長文 codegen を内包）。低速 GPU の長文生成を完走させるため余裕を持たせる
   delegate_codegen_to_longform: true     # coding: editor/chat のコード生成を LongForm 細粒度生成へ委譲(複数ファイル可)。false で単一ショット生成
 
 # ===== ツール設定 =====
@@ -876,6 +908,9 @@ assist_model:
                                    # Contextual Retrieval のプレフィックス生成や note_evolve の入力を
                                    # 収容するため、2048 ではオーバーフローで空応答となるので避ける
                                    # ベースモデルの context_size とは独立して設定可能
+                                   # null にすると assist モデルの arch プロファイル
+                                   # (models/profiles/<arch>.yaml の context_size) を使用
+                                   # (解決順: ここの明示値 > profile > 8192)
     # idle slot offload。アシストは既定 slots=1 (本セクションに slots キー無し)
     # のため退避対象の idle slot が無く 0 で無効化し host RAM 予約を省く。
     # slots>1 運用時は ``--kv-unified`` が自動付与されるので 2048 等へ戻す。

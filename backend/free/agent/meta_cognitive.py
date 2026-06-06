@@ -6,6 +6,7 @@ import asyncio
 import time
 from pathlib import Path
 
+from backend.config import resolve_context_size
 from backend.free.agent.agent_state import AgentState
 from backend.free.agent.code_artifact_generator import CodeArtifactGenerator
 from backend.free.agent.event_reminder import EventReminderSystem
@@ -30,8 +31,10 @@ from backend.free.agent.meta_cognitive_tools import (
     normalize_write_file_args,
 )
 from backend.free.agent.meta_cognitive_utils import (
+    contains_code_indicator,
     iter_balanced_brace_substrings,
     is_tool_error,
+    parse_template_tool_call,
     try_parse_tool_dict,
     call_callback,
     fix_json_backslashes,
@@ -84,6 +87,12 @@ IMPORTANT rules:
 NEVER substitute a different or merely "similar" program. IGNORE any unrelated program \
 names that appear in the examples below or in prior conversation context — they are \
 illustrations of FORMAT only, not of WHAT to build.
+- When the user asks to BUILD, CREATE, MAKE, or WRITE a program, script, app, or game, \
+the task MUST be an action that PRODUCES that program (e.g. "Generate the full program the \
+user requested"). Do NOT reduce a build request to only a "Design/Analyze/Plan the structure" \
+task — that yields just an explanation and no usable program.
+  BAD  (user asked to build): {"tasks": ["Design the game structure and core logic"]}
+  GOOD (user asked to build): {"tasks": ["Generate the full program the user requested"]}
 - NEVER invent a file path. Only include a file path in a task when the USER explicitly \
 gave one. If the user did not specify an output location, describe the task WITHOUT any path.
   BAD  (user gave no path): {"tasks": ["Create e:\\\\app\\\\solution.py with the full implementation"]}
@@ -161,6 +170,14 @@ _LANGUAGE_KEYWORDS: list[tuple[str, str]] = [
     ("ruby", "ruby"), ("bash", "bash"), ("sql", "sql"),
 ]
 
+# text_looks_like_code の code indicator が信頼できる言語。これら言語の生成物が
+# コードに見えない場合は散文 (例: "設計します..." のみ) の false-success とみなす。
+# markdown/html/css/json/yaml/xml/text は indicator 不在でも正当なため除外する。
+_CODE_LANGUAGES: frozenset[str] = frozenset({
+    "python", "javascript", "typescript", "go", "rust",
+    "java", "c", "cpp", "csharp", "ruby", "php", "bash",
+})
+
 
 class MetaCognitiveAgent:
     """Meta-Cognitive 層: 計画立案 + 多段推論 + ツール実行ループ
@@ -210,7 +227,7 @@ class MetaCognitiveAgent:
         agent_cfg = cfg.get("agent", {})
         self.max_tool_iterations = agent_cfg.get("max_tool_iterations", 5)
 
-        ctx_size = cfg.get("llama", {}).get("context_size", 4096)
+        ctx_size = resolve_context_size(cfg, "base")
         history_budget = cfg.get("memory", {}).get("working_max_tokens", 2048)
         self.loop_budget = ctx_size - 512 - 400 - history_budget
 
@@ -225,7 +242,7 @@ class MetaCognitiveAgent:
         )
         self._content_gen_idle_timeout = agent_cfg.get("content_gen_idle_timeout", 30)
         self._llm_call_timeout = agent_cfg.get("llm_call_timeout", 90)
-        self._total_timeout = agent_cfg.get("total_timeout", 900)
+        self._total_timeout = agent_cfg.get("total_timeout", 1800)
 
         # ── EvorefMem: @self 仮想カートリッジ ──
         # SemanticFactStore 直参照を廃止し LoopFactView 経由に統一
@@ -280,6 +297,19 @@ class MetaCognitiveAgent:
                 "MetaCognitive process timed out after %ds, falling back",
                 self._total_timeout,
             )
+            salvaged = self._salvage_partial_response()
+            if salvaged is not None:
+                logger.info(
+                    "Salvaged %d editor artifact(s) after timeout",
+                    len(salvaged.editor_artifacts),
+                )
+                if on_step:
+                    await call_callback(on_step, {
+                        "type": "task_progress",
+                        "detail": "タイムアウト — 生成済みコードを返します",
+                        "status": "done",
+                    })
+                return salvaged
             if on_step:
                 await call_callback(on_step, {
                     "type": "task_progress",
@@ -293,6 +323,13 @@ class MetaCognitiveAgent:
             logger.error(
                 "MetaCognitive process failed unexpectedly, falling back: %s", e,
             )
+            salvaged = self._salvage_partial_response()
+            if salvaged is not None:
+                logger.info(
+                    "Salvaged %d editor artifact(s) after error",
+                    len(salvaged.editor_artifacts),
+                )
+                return salvaged
             if on_step:
                 await call_callback(on_step, {
                     "type": "task_progress",
@@ -553,12 +590,36 @@ class MetaCognitiveAgent:
 
         tasks_raw = data.get("tasks") if isinstance(data, dict) else None
         if isinstance(tasks_raw, list):
-            return [TaskItem(description=str(t)) for t in tasks_raw if t]
+            tasks = [TaskItem(description=str(t)) for t in tasks_raw if t]
+            return self._ensure_build_task(query, tasks)
 
         logger.warning(
             "Plan response did not contain a 'tasks' list: %r", data,
         )
         return []
+
+    @staticmethod
+    def _ensure_build_task(
+        query: str, tasks: list[TaskItem],
+    ) -> list[TaskItem]:
+        """build 意図のクエリで plan が write タスクを 1 つも返さなかった場合に補正する。
+
+        ユーザーが「作成 / 生成 / create / implement…」等で明確にプログラム生成を求めて
+        いるのに、plan が "Design the game structure…" のような設計・分析タスクのみを返すと、
+        codegen 経路 (条件: ``task_expects_write`` が True) に乗らず実ファイルが生成されない
+        (status=done でもテキストの設計文書しか出ない)。その退化時に限り、全体を単一の生成
+        タスクへ正規化して codegen に乗せる。実際の生成内容は ``original_query`` 駆動なので、
+        タスク記述はルーティング用途で十分。
+        """
+        if not tasks or not task_expects_write(query):
+            return tasks
+        if any(task_expects_write(t.description) for t in tasks):
+            return tasks
+        logger.warning(
+            "Plan produced no write task for a build request; normalizing to a "
+            "single generate task (query=%r)", query[:80],
+        )
+        return [TaskItem(description="Generate the full program the user requested")]
 
     @staticmethod
     def _build_plan_user_content(
@@ -731,6 +792,21 @@ class MetaCognitiveAgent:
         filename, language = self._guess_artifact_meta(
             task.description, original_query,
         )
+        # coding モードでコード系言語が期待されるのに散文 ("設計します..." のみ)
+        # が返った場合は成果物として採用せず failed に倒す。これを done のまま
+        # 通すと reward=1.0 で記録され Level 0/1 が誤強化される (false-success)。
+        # contains_code_indicator は長さ・改行に依存しないため、1 行の短い
+        # 正当コード (print(...) 等) を誤って弾かず、指標皆無の散文だけを拒否する。
+        if (
+            self._mode == "coding"
+            and language in _CODE_LANGUAGES
+            and not contains_code_indicator(content)
+        ):
+            logger.warning(
+                "Editor task produced prose, not %s code; marking failed: %s",
+                language, task.description[:80],
+            )
+            return f"Error: generated content is prose, not {language} code", []
         if self._output_target == "chat":
             self._chat_code_parts.append(f"```{language}\n{content}\n```")
             return f"Generated {len(content)} chars (chat)", []
@@ -1029,17 +1105,84 @@ class MetaCognitiveAgent:
         gen_kwargs: dict,
         loop: int,
     ) -> tuple[str, bool]:
-        """LLM 呼び出しを timeout 付きで実行。`(text, timed_out)` を返す。"""
+        """ツールループの LLM 呼び出しをストリーミングで実行し ``(text, timed_out)`` を返す。
+
+        非ストリーミング + 総ウォールクロック打ち切りだと低速 GPU が長い応答を生成しきる
+        前に殺されるため、``_stream_text_with_idle_timeout`` (first-token / idle / total) を
+        使う。``max_tokens`` は利用可能コンテキストに収める。後処理はしない (ツールコール
+        JSON のパースに生テキストが必要なため)。
+        """
+        prompt_text = "".join(m.get("content", "") for m in injected_messages)
+        ctx_size = resolve_context_size(self.config, "base")
+        sampling = {
+            k: v for k, v in gen_kwargs.items()
+            if k not in ("max_tokens", "id_slot", "stream")
+        }
+        text, timed_out = await self._stream_text_with_idle_timeout(
+            llm_client, injected_messages,
+            max_tokens=self._calc_gen_max_tokens(prompt_text, ctx_size),
+            id_slot=gen_kwargs.get("id_slot", -1),
+            **sampling,
+        )
+        if timed_out:
+            logger.warning("LLM call timed out in tool loop iteration %d", loop)
+        return text.strip(), timed_out
+
+    async def _stream_text_with_idle_timeout(
+        self,
+        llm_client,
+        messages: list[dict],
+        *,
+        max_tokens: int,
+        id_slot: int = -1,
+        **sampling,
+    ) -> tuple[str, bool]:
+        """ストリーミング生成をトークン間アイドルタイムアウトで読み取り ``(text, timed_out)`` を返す。
+
+        最初の1トークンは ``content_gen_first_token_timeout``、以降はトークン間アイドル
+        ``content_gen_idle_timeout`` で待ち、総上限 ``content_gen_timeout`` まで継続する。
+        総ウォールクロックでは一律に打ち切らない (進行中の生成を殺さない)。無出力で停止した
+        時だけ ``timed_out=True``。後処理はしない (生テキストを返す)。``_call_llm_in_loop`` /
+        ``_fallback_plain_llm`` が共有する。
+        """
         try:
-            result = await asyncio.wait_for(
-                llm_client.generate(injected_messages, **gen_kwargs),
-                timeout=self._llm_call_timeout,
+            stream = await llm_client.generate(
+                messages, stream=True,
+                max_tokens=max_tokens, id_slot=id_slot, **sampling,
             )
         except asyncio.TimeoutError:
-            logger.warning("LLM call timed out in tool loop iteration %d", loop)
             return "", True
-        text = result["choices"][0]["message"]["content"].strip()
-        return text, False
+        agen = stream.__aiter__()
+        chunks: list[str] = []
+        start = time.monotonic()
+        first_token = True
+        try:
+            while True:
+                wait_timeout = (
+                    self._content_gen_first_token_timeout
+                    if first_token
+                    else self._content_gen_idle_timeout
+                )
+                try:
+                    token = await asyncio.wait_for(
+                        agen.__anext__(), timeout=wait_timeout,
+                    )
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    return "", True
+                first_token = False
+                chunks.append(token)
+                if time.monotonic() - start > self._content_gen_timeout:
+                    return "", True
+        finally:
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:
+                    pass
+        return "".join(chunks), False
 
     @staticmethod
     def _append_timeout_recovery_messages(messages: list[dict]) -> None:
@@ -1187,7 +1330,7 @@ class MetaCognitiveAgent:
     ) -> None:
         """コンテキスト使用率を計算して AgentState に設定"""
         total_chars = sum(len(m.get("content", "")) for m in messages)
-        ctx_size = self.config.get("llama", {}).get("context_size", 4096)
+        ctx_size = resolve_context_size(self.config, "base")
         state.context_usage_pct = min(
             100,
             int(_estimate_tokens("x" * total_chars) / ctx_size * 100),
@@ -1196,9 +1339,8 @@ class MetaCognitiveAgent:
     def _build_gen_kwargs(
         self, generation_params: dict | None,
     ) -> dict:
-        """LLM 生成パラメータを組み立てる"""
+        """LLM 生成パラメータを組み立てる (stream は呼び出し側で指定)"""
         gen_kwargs: dict = {
-            "stream": False,
             "max_tokens": self._execute_max_tokens,
             "id_slot": -1,
         }
@@ -1503,6 +1645,13 @@ class MetaCognitiveAgent:
             if parsed is not None:
                 return parsed
 
+        # 3. テンプレート形式 (<|tool_call>call:NAME(...)<tool_call|>) を試す。
+        #    base モデルが OAI JSON でなくチャットテンプレート由来の生テキストで
+        #    ツールコールを吐く場合 (tool_calls=0 の原因) を救済する。
+        template = parse_template_tool_call(text)
+        if template is not None:
+            return template
+
         return None
 
     # ------------------------------------------------------------------
@@ -1746,7 +1895,7 @@ class MetaCognitiveAgent:
         file_path: str = "",
     ) -> str:
         """write_file 用のコンテンツを LLM に生成させる"""
-        ctx_size = self.config.get("llama", {}).get("context_size", 4096)
+        ctx_size = resolve_context_size(self.config, "base")
 
         existing_content = self._read_existing_file(file_path)
         user_prompt = f"{original_query}\n\nタスク: {task_description}"
@@ -1910,6 +2059,29 @@ class MetaCognitiveAgent:
     # フォールバック / 応答組み立て
     # ------------------------------------------------------------------
 
+    def _salvage_partial_response(self) -> MetaCognitiveResponse | None:
+        """中断 (タイムアウト/例外) 時に、生成済みコードがあれば破棄せず返す。
+
+        ``_process_impl`` は editor/chat 出力を ``_editor_artifacts`` /
+        ``_chat_code_parts`` (インスタンス属性) に逐次蓄積するため、メイン処理が途中で
+        打ち切られても既に確定した成果は残る。1 つでもあればそれを返し、無ければ ``None``
+        (呼び出し側は通常のフォールバックへ)。``_process_impl`` 開始前の中断にも備えて
+        ``getattr`` で防御的に参照する。
+        """
+        artifacts = list(getattr(self, "_editor_artifacts", None) or [])
+        chat_parts = list(getattr(self, "_chat_code_parts", None) or [])
+        if not artifacts and not chat_parts:
+            return None
+        content = (
+            "\n\n".join(chat_parts) if chat_parts
+            else "生成済みのコードを返しました（処理は時間切れで中断されました）。"
+        )
+        return MetaCognitiveResponse(
+            content=content,
+            editor_artifacts=artifacts,
+            steps=0,
+        )
+
     async def _fallback_plain_llm(
         self,
         query: str,
@@ -1918,31 +2090,35 @@ class MetaCognitiveAgent:
         llm_client,
         on_step=None,
     ) -> MetaCognitiveResponse:
-        """緊急フォールバック: ツール・計画なしの直接 LLM 応答"""
+        """緊急フォールバック: ツール・計画なしの直接 LLM 応答 (ストリーミング)。
+
+        旧実装は ``stream=False`` + 30 秒の総ウォールクロックで、低速モデルではほぼ確実に
+        タイムアウトしていた (#1 と同じアンチパターン)。``_stream_text_with_idle_timeout``
+        で進行中の生成を殺さず読み取る。
+        """
         try:
             messages = [
                 {"role": "system", "content": system_prompt},
                 *conversation[-4:],
                 {"role": "user", "content": query},
             ]
-            result = await asyncio.wait_for(
-                llm_client.generate(
-                    messages, stream=False, max_tokens=1024,
-                    id_slot=getattr(llm_client, "background_slot", -1),
-                ),
-                timeout=30,
+            text, timed_out = await self._stream_text_with_idle_timeout(
+                llm_client, messages,
+                max_tokens=1024,
+                id_slot=getattr(llm_client, "background_slot", -1),
             )
-            content = result["choices"][0]["message"]["content"].strip()
+            content = text.strip()
+            if timed_out or not content:
+                raise RuntimeError(
+                    f"fallback empty or timed out (timed_out={timed_out})",
+                )
             if on_step:
                 await call_callback(on_step, {
                     "type": "task_progress",
                     "detail": "フォールバック応答を生成しました",
                     "status": "done",
                 })
-            return MetaCognitiveResponse(
-                content=content or "リクエストを処理できませんでした。",
-                steps=0,
-            )
+            return MetaCognitiveResponse(content=content, steps=0)
         except Exception as e2:
             logger.error("Fallback plain LLM also failed: %s", e2)
             if on_step:

@@ -12,7 +12,11 @@ class AssistModelLocalConfig(BaseModel):
 
     host: str = "127.0.0.1"
     port: int = Field(default=8081, ge=1024, le=65535)
-    context_size: int = Field(default=8192, ge=512)
+    # ``-c`` / アシストモデルのコンテキスト長。``None`` (既定) は arch プロファイル
+    # (``models/profiles/<arch>.yaml`` の ``context_size``) を参照し、それも
+    # 未宣言なら 8192 にフォールバックする。明示 int でプロファイルを上書き
+    # (解決順: config 明示 > profile > 8192)。ベース ``llama.context_size`` とは独立。
+    context_size: int | None = Field(default=None, ge=512)
     # llama-server チューニング項目。いずれも省略時は build_assist_cmd で
     # フラグを付与せず、llama-server のデフォルト挙動に任せる。
     # 整数 (-1 / 0 / 999 等) / None (llama 継承) / ``"auto"`` 文字列。

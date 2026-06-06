@@ -70,15 +70,23 @@ class SleepTimeScheduler:
             learning.get("level1_recheck_interval_sec", 60)
         )
         self.active_minutes: float = learning.get("active_minutes", 5)
+        # level2_schedule_hour は優先窓のヒント (_seconds_until_hour で利用可能)。
+        # 実発火は再起動耐性のある overdue/idle 判定 (Level 2 常駐ループ) で行う。
         self.level2_schedule_hour: int = learning.get("level2_schedule_hour", 3)
+        self.level2_recheck_interval_sec: float = float(
+            learning.get("level2_recheck_interval_sec", 300)
+        )
+        self.level2_overdue_hours: float = float(
+            learning.get("level2_overdue_hours", 24.0)
+        )
 
         self._last_user_input: float = 0.0
         self._last_response: float = 0.0
         self._light_task: asyncio.Task | None = None
         self._full_task: asyncio.Task | None = None
-        self._level2_task: asyncio.Task | None = None
-        # Level 1 独立常駐ループ
+        # Level 1 / Level 2 独立常駐ループ
         self._level1_loop_task: asyncio.Task | None = None
+        self._level2_loop_task: asyncio.Task | None = None
         self._worker = None  # SleepTimeWorker, set via set_worker()
         self._llm_client = None  # LocalClient for Full mode
         self._assist_llm_client = None  # AssistModelClient for Full mode (preferred)
@@ -178,12 +186,7 @@ class SleepTimeScheduler:
         # 現世代を完走させて Level1Session に進捗を残し、次回 tick で resume する
         if self._learning_scheduler is not None:
             self._learning_scheduler.cancel(graceful=True)
-
-        # Level 2 スケジュールタスクをキャンセル
-        if self._level2_task is not None and not self._level2_task.done():
-            self._level2_task.cancel()
-            self._level2_task = None
-            logger.info("Level 2 schedule cancelled by user input")
+        # Level 2 常駐ループは停止しない (各 tick で is_user_active を見て自律 skip)。
 
     def on_llm_start(self) -> None:
         """LLM 応答生成開始通知: Trigger A (Light) を即座に実行（§8.1）
@@ -215,14 +218,8 @@ class SleepTimeScheduler:
         self._full_task = asyncio.create_task(
             self._schedule_full()
         )
-
-        # Level 2 夜間スケジュール（まだ未起動の場合のみ）
-        if (
-            self._level2_task is None or self._level2_task.done()
-        ) and self._learning_scheduler is not None:
-            self._level2_task = asyncio.create_task(
-                self._schedule_level2()
-            )
+        # Level 2 は on_response_sent では起動しない。再起動耐性のある
+        # 独立常駐ループ (start_level2_loop) が overdue/idle で発火する。
 
     def is_idle(self) -> bool:
         """ユーザーが full_idle_minutes 以上非アクティブかどうか（Trigger B 用）"""
@@ -487,73 +484,98 @@ class SleepTimeScheduler:
         )
         trace_id_var.reset(token)
 
-    async def _schedule_level2(self) -> None:
-        """Trigger C: 夜間 (schedule_hour) に Level 2 をトリガー"""
-        # bg_task wrapper として trace_id を発行し、終了時に
-        # outcome.jsonl へ結末記録 (evolve 限定)。
+    # ── Level 2 独立常駐ループ (再起動耐性) ───────
+
+    def start_level2_loop(self) -> None:
+        """Level 2 独立常駐ループを起動する (lifespan startup で一度だけ)。
+
+        旧実装は 03:00 まで ``asyncio.sleep`` するため、それ以前の再起動で
+        毎回キャンセルされ Level 2 が永遠に発火しなかった。本ループは
+        ``level2_recheck_interval_sec`` ごとに overdue (前回実行から
+        ``level2_overdue_hours`` 超過) + 非アクティブを判定して発火するため、
+        再起動を跨いでも ``_last_level2_run`` (永続化) を基準に継続する。
+        """
+        if self._level2_loop_task is not None and not self._level2_loop_task.done():
+            return
+        self._level2_loop_task = asyncio.create_task(self._schedule_level2_loop())
+        logger.info(
+            "Level 2 loop started (interval=%.0fs, overdue=%.1fh)",
+            self.level2_recheck_interval_sec, self.level2_overdue_hours,
+        )
+
+    async def stop_level2_loop(self) -> None:
+        """Level 2 常駐ループを停止する (lifespan shutdown 用)"""
+        if self._level2_loop_task is None or self._level2_loop_task.done():
+            return
+        self._level2_loop_task.cancel()
+        try:
+            await self._level2_loop_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        self._level2_loop_task = None
+        logger.info("Level 2 loop stopped")
+
+    async def _schedule_level2_loop(self) -> None:
+        """常駐ループ。overdue + 非アクティブで Level 2 をトリガーする。
+
+        bg_task wrapper として最外殻に trace_id を発行し、ループ停止 (cancel)
+        時に outcome.jsonl へ結末記録する。
+        """
         token = trace_id_var.set(generate_trace_id())
         t_start = time.monotonic()
-        success = False
-        cancelled = False
-        triggered = False
-        skipped_reason: str | None = None
-        try:
-            # 次の schedule_hour まで待機
-            seconds = self._seconds_until_hour(
-                self.level2_schedule_hour, self._local_tz,
-            )
-            if seconds <= 0:
-                seconds = 86400  # 24時間後
+        cancelled_ok = False
+        overdue_sec = self.level2_overdue_hours * 3600.0
+        while True:
+            try:
+                await asyncio.sleep(self.level2_recheck_interval_sec)
 
-            logger.info(
-                "Level 2 scheduled in %.0f seconds (at %02d:00)",
-                seconds, self.level2_schedule_hour,
-            )
-            await asyncio.sleep(seconds)
+                ls = self._learning_scheduler
+                if ls is None:
+                    continue
+                if self.is_user_active():
+                    continue
+                # 前回実行から overdue_hours 未満なら待機 (未実行は inf=即 overdue)
+                if ls.seconds_since_level2_run() < overdue_sec:
+                    continue
 
-            # ユーザーがアクティブなら実行しない
-            if self.is_user_active():
-                logger.info("Level 2 schedule: skipped, user is active")
-                success = True
-                skipped_reason = "user_active"
-                return
+                triggered = False
+                try:
+                    triggered = bool(ls.check_level2(
+                        is_user_active=self.is_user_active(),
+                        lora_path=self._lora_path,
+                        base_model_path=self._base_model_path,
+                        assist_lora_path=self._assist_lora_path,
+                        assist_model_path=self._assist_model_path,
+                    ))
+                except Exception as e:
+                    logger.error("Level 2 check failed: %s", e, exc_info=True)
+                if triggered:
+                    logger.info("Level 2 LoRA tuning triggered (overdue loop)")
+                    _emit_bg_task_outcome(
+                        self._debug_logger,
+                        task_name="level2_schedule",
+                        success=True,
+                        duration_ms=0.0,
+                        extra={"triggered": True},
+                    )
 
-            if self._learning_scheduler is None:
-                success = True
-                skipped_reason = "no_learning_scheduler"
-                return
+            except asyncio.CancelledError:
+                logger.info("Level 2 loop cancelled")
+                cancelled_ok = True
+                break
+            except Exception as e:
+                logger.error("Level 2 loop iteration failed: %s", e, exc_info=True)
+                # ループ自体は継続 (次 interval で再評価)
 
-            started = self._learning_scheduler.check_level2(
-                is_user_active=self.is_user_active(),
-                lora_path=self._lora_path,
-                base_model_path=self._base_model_path,
-                assist_lora_path=self._assist_lora_path,
-                assist_model_path=self._assist_model_path,
-            )
-            triggered = bool(started)
-            if started:
-                logger.info("Level 2 LoRA tuning triggered at scheduled time")
-            success = True
-
-        except asyncio.CancelledError:
-            logger.debug("Level 2 schedule cancelled")
-            cancelled = True
-            raise
-        except Exception as e:
-            logger.error("Level 2 schedule failed: %s", e)
-        finally:
-            elapsed_ms = (time.monotonic() - t_start) * 1000
-            extra: dict = {"cancelled": cancelled, "triggered": triggered}
-            if skipped_reason is not None:
-                extra["skipped_reason"] = skipped_reason
-            _emit_bg_task_outcome(
-                self._debug_logger,
-                task_name="level2_schedule",
-                success=success,
-                duration_ms=elapsed_ms,
-                extra=extra,
-            )
-            trace_id_var.reset(token)
+        elapsed_ms = (time.monotonic() - t_start) * 1000
+        _emit_bg_task_outcome(
+            self._debug_logger,
+            task_name="level2_loop",
+            success=cancelled_ok,
+            duration_ms=elapsed_ms,
+            extra={"cancelled": cancelled_ok},
+        )
+        trace_id_var.reset(token)
 
     @staticmethod
     def _seconds_until_hour(target_hour: int, local_tz: tzinfo) -> float:

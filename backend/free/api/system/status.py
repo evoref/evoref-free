@@ -21,7 +21,7 @@ from backend.free.api.schemas import (
     ModelInfo,
     StatusResponse,
 )
-from backend.config import get_config
+from backend.config import get_config, resolve_context_size
 from backend.edition import current_edition
 from backend.log_config import get_logger
 from backend.version import get_runtime_version, get_version_info
@@ -242,7 +242,7 @@ async def get_status(state: AppState = Depends(get_app_state)):
             name=client.metadata.model_id or None,
             chat_template=client.metadata.chat_template,
             has_system_role=client.metadata.has_system_role,
-            context_size=llama_cfg.get("context_size", 4096),
+            context_size=resolve_context_size(cfg, "base"),
         )
 
     # --- 各コンポーネントのステータス ---

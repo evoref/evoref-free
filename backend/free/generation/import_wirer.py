@@ -21,6 +21,7 @@ free 参照を確実に拾い、兄弟 export 名が別関数ローカルと衝�
 from __future__ import annotations
 
 import ast
+import sys
 from pathlib import PurePosixPath
 
 from backend.free.generation.validators import (
@@ -31,6 +32,9 @@ from backend.free.generation.validators import (
 from backend.log_config import get_logger
 
 logger = get_logger("generation.import_wirer")
+
+# stdlib モジュール名 (py3.10+)。幻覚 import 除去の際に実在 stdlib を誤除去しないため。
+_STDLIB_MODULES: frozenset[str] = frozenset(getattr(sys, "stdlib_module_names", ()))
 
 
 def _top_level_defs(tree: ast.Module) -> set[str]:
@@ -120,38 +124,117 @@ def _insert_imports(code: str, tree: ast.Module, import_lines: list[str]) -> str
     return result
 
 
+def _is_bogus_sibling_import(
+    node: ast.stmt,
+    sibling_modules: set[str],
+    symbol_modules: dict[str, set[str]],
+) -> bool:
+    """``from <flat_module> import a, b`` が「実在しない兄弟モジュール参照」かを判定する。
+
+    LLM がフラットな snake_case のローカル風モジュール名 (例 ``game_engine_constants``)
+    を幻覚し、その import 名が実際には別の兄弟ファイルで定義されている、というパターン
+    を検出する。除去対象とするのは以下を**すべて**満たす場合のみ:
+
+    - ``from <module> import ...`` (相対 / ``__future__`` / dotted は対象外)。
+    - ``<module>`` が実在の兄弟 stem でない (= 正しい sibling import ではない)。
+    - ``<module>`` が stdlib モジュール名でない (実在 stdlib を誤除去しない)。
+    - import される**全名**が他の兄弟ファイルで top-level 定義されている (= 除去後に
+      ``wire_imports`` が正しい ``from <real_module> import`` を再配線できる)。
+
+    この保守的条件により、幻覚 import が ``import_map`` を汚染して正しい cross-file 配線を
+    阻害する問題を解消しつつ、実在の外部 import の誤除去を避ける。
+    """
+    if not isinstance(node, ast.ImportFrom):
+        return False
+    module = node.module
+    if (node.level or 0) > 0 or not module or "." in module:
+        return False
+    if module in sibling_modules or module in _STDLIB_MODULES:
+        return False
+    names = [alias.name for alias in node.names if alias.name != "*"]
+    if not names:
+        return False
+    return all(symbol_modules.get(name) for name in names)
+
+
+def _strip_import_lines(code: str, nodes: list[ast.stmt]) -> str:
+    """``nodes`` の各文をソース行ごと削除した新コードを返す (1-based lineno 範囲)。"""
+    drop: set[int] = set()
+    for node in nodes:
+        end = getattr(node, "end_lineno", None) or node.lineno
+        drop.update(range(node.lineno, end + 1))
+    lines = code.splitlines()
+    kept = [ln for i, ln in enumerate(lines, start=1) if i not in drop]
+    result = "\n".join(kept)
+    if code.endswith("\n") and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _safe_parse(code: str) -> ast.Module | None:
+    """``ast.parse`` 失敗時は ``None`` (防御的)。"""
+    try:
+        return ast.parse(code)
+    except SyntaxError:
+        return None
+
+
 def wire_imports(files: dict[str, str]) -> dict[str, str]:
     """複数ファイル生成コードへ cross-file / stdlib import を補完する。
 
     ``len(files) <= 1`` は無変更。``ast.parse`` 失敗ファイルは据え置き、表からも
     除外する。冪等 (補完済みを再適用しても増えない)。
+
+    補完の前に「実在しない兄弟モジュールからの幻覚 import」を除去する pre-pass を
+    走らせる。これをしないと幻覚 import が ``import_map`` を汚染し、その名前を必要とする
+    他ファイルの正しい cross-file 配線が ``name not in import_map`` ガードで skip されて
+    しまう (実測: 1 つの bogus import が複数ファイルの配線を阻害する)。
     """
     if len(files) <= 1:
         return files
 
-    parsed: dict[str, ast.Module | None] = {}
-    for path, code in files.items():
-        try:
-            parsed[path] = ast.parse(code)
-        except SyntaxError:
-            parsed[path] = None
-
+    work = dict(files)
+    parsed: dict[str, ast.Module | None] = {
+        path: _safe_parse(code) for path, code in work.items()
+    }
     module_of = {path: PurePosixPath(path).stem for path in files}
+    sibling_modules = set(module_of.values())
 
-    # name -> それを top-level 定義する module 集合 (import 可能な export)
+    # name -> それを top-level 定義する module 集合 (import 可能な export)。
+    # prune は import のみ除去し定義は変えないため、prune 前に確定してよい。
     symbol_modules: dict[str, set[str]] = {}
-    # bound_name -> 伝播用 import 文 (stdlib/3rd-party)
-    import_map: dict[str, str] = {}
     for path, tree in parsed.items():
         if tree is None:
             continue
         mod = module_of[path]
         for name in _top_level_defs(tree):
             symbol_modules.setdefault(name, set()).add(mod)
+
+    # pre-pass: 幻覚 sibling import を除去 (import_map 構築前)。
+    for path, tree in parsed.items():
+        if tree is None:
+            continue
+        bogus = [
+            node for node in tree.body
+            if _is_bogus_sibling_import(node, sibling_modules, symbol_modules)
+        ]
+        if bogus:
+            work[path] = _strip_import_lines(work[path], bogus)
+            parsed[path] = _safe_parse(work[path])
+            logger.debug(
+                "import_wirer: %s から %d 件の幻覚 import を除去", path, len(bogus),
+            )
+
+    # bound_name -> 伝播用 import 文 (stdlib/3rd-party)。prune 後の import から構築し
+    # 汚染を回避する。
+    import_map: dict[str, str] = {}
+    for path, tree in parsed.items():
+        if tree is None:
+            continue
         for bound, stmt in _iter_top_level_imports(tree):
             import_map.setdefault(bound, stmt)
 
-    out = dict(files)
+    out = dict(work)
     for path, tree in parsed.items():
         if tree is None:
             continue
@@ -179,7 +262,7 @@ def wire_imports(files: dict[str, str]) -> dict[str, str]:
         new_lines.extend(propagated)
         if not new_lines:
             continue
-        out[path] = _insert_imports(files[path], tree, sorted(new_lines))
+        out[path] = _insert_imports(work[path], tree, sorted(new_lines))
         logger.debug(
             "import_wirer: %s に %d 行の import を補完", path, len(new_lines),
         )

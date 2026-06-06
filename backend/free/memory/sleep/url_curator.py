@@ -225,7 +225,9 @@ async def _score_url(
                 {"role": "system", "content": _PROMPT_SYSTEM},
                 {"role": "user", "content": _build_user_prompt(query, answer, url)},
             ],
-            max_tokens=128,
+            # 128 だと score/relevant の後ろで reason(最大200字) を出力中に
+            # finish_reason=length で頻繁に切れ json_repair 依存になるため 256。
+            max_tokens=256,
             temperature=0.1,
             purpose="url_relevance_score",
             response_schema=UrlRelevanceJudgement,

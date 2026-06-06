@@ -1007,13 +1007,34 @@ def _wire_sleep_scheduler_models(
 
     sleep_scheduler.set_learning_scheduler(learning_scheduler)
 
+    # LoRA パスは不在でも常に設定する: Level 2 初回 full-train (bootstrap) が
+    # この位置に初期アダプタを書き込むため、存在判定は trainer 側で行う。
     lora_path = resolver.resolve_local("lora_adapter")
-    if lora_path.exists():
-        sleep_scheduler.set_lora_path(lora_path)
+    sleep_scheduler.set_lora_path(lora_path)
 
     base_model_path = resolver.resolve_model("base_model")
     if base_model_path.exists():
         sleep_scheduler.set_base_model_path(base_model_path)
+
+    # Level 2 (base) の version_manager / eval_core_manager を running scheduler に
+    # 後注入する (Pro 限定、未注入だと _check_and_run_base が None で停止する)。
+    from backend.edition import get_pro_handler
+
+    vm_cls = get_pro_handler("lora_version_manager")
+    if vm_cls is not None:
+        try:
+            versions_dir = resolver.resolve_local("lora_versions_dir")
+            learning_scheduler.set_version_manager(vm_cls(versions_dir, lora_path))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Base LoRA version_manager injection skipped: %s", e)
+
+    ecm_cls = get_pro_handler("eval_core_manager")
+    if ecm_cls is not None:
+        try:
+            eval_core_path = resolver.resolve_local("eval_core_file")
+            learning_scheduler.set_eval_core_manager(ecm_cls(eval_core_path))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("eval_core_manager injection skipped: %s", e)
 
 
 def _inject_level2_runner(
@@ -1082,6 +1103,9 @@ def _start_level1_loop(
         )
     sleep_scheduler.start_level1_loop()
     logger.info("Level 1 independent loop started")
+    # Level 2 も再起動耐性のある独立常駐ループで起動する (overdue/idle 発火)。
+    sleep_scheduler.start_level2_loop()
+    logger.info("Level 2 independent loop started")
     logger.info("Learning cycle initialized")
 
 

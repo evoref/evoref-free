@@ -107,6 +107,9 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     # learning — 学習サイクル
     "critique_synthesis": "learning",
     "policy_evolution": "learning",
+    # Level 1 プロンプト進化の mutation 生成。低速 base 占有を避けるため
+    # assist へ寄せる (learning スロットで直列実行)。
+    "prompt_evolution": "learning",
     "spsa": "learning",
     "memory_scoring": "learning",
 }
@@ -140,6 +143,9 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "conflict_resolution": 15.0,
     "critique_synthesis": 45.0,
     "policy_evolution": 45.0,
+    # プロンプト変異 (~1024 tok のテキスト生成)。assist は base の約5倍速で
+    # 1024 tok ≈ 35-40s のため 45s で安全マージン。
+    "prompt_evolution": 45.0,
     "note_evolution": 20.0,
     # 検索必要性判定 (1 bit JSON)。チャット応答パスの先頭で同期発火する
     # ため、ユーザ体感を阻害しないよう短く打ち切る。
@@ -212,6 +218,9 @@ PURPOSE_REASONING_BUDGET_DEFAULTS: dict[str, int] = {
     "critique_synthesis": 512,
     "conflict_resolution": 0,
     "policy_evolution": 1024,
+    # プロンプト変異は機械的なテキスト書き換え。<think> は _strip_think_tags で
+    # 除去・汚染判定の対象であり thinking は有害なため即終了。
+    "prompt_evolution": 0,
     # 検索必要性判定は機械的な 1 bit 分類で thinking 不要
     "retrieval_necessity_judge": 0,
     # content gate の関連性判定も機械的な index 選別で thinking 不要
@@ -392,6 +401,10 @@ class AssistModelClient(BaseHTTPClient):
     ストリーミング非対応（バックグラウンド処理のため不要）。
     セマフォで同時呼び出し数を制限し、アシストモデルの過負荷を防止する。
     """
+
+    # 呼出側が base (LocalClient) と assist を区別するための capability マーカー。
+    # base クライアントは本属性を持たないため getattr(..., False) で判別できる。
+    is_assist_client: bool = True
 
     def __init__(self, config: dict, debug_logger=None):
         """アシストモデルクライアントを初期化

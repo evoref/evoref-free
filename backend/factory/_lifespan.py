@@ -57,11 +57,15 @@ def _log_timings(label: str, timings: dict[str, float], total_ms: float) -> None
 
 
 async def _shutdown_level1_loop(sleep_scheduler: "SleepTimeScheduler") -> None:
-    """Level 1 常駐ループ停止（新規起動を防ぐ）"""
+    """Level 1 / Level 2 常駐ループ停止（新規起動を防ぐ）"""
     try:
         await sleep_scheduler.stop_level1_loop()
     except Exception as e:
         logger.warning("Level 1 loop stop failed: %s", e)
+    try:
+        await sleep_scheduler.stop_level2_loop()
+    except Exception as e:
+        logger.warning("Level 2 loop stop failed: %s", e)
 
 
 async def _shutdown_learning_cancel(learning_scheduler: "LearningScheduler") -> None:
@@ -102,6 +106,18 @@ def _shutdown_stm_save(stm: "ShortTermMemory", resolver: Any) -> None:
         logger.info("STM saved on shutdown: %d notes", len(stm.notes))
     except Exception as e:
         logger.warning("STM save on shutdown failed: %s", e)
+
+
+def _shutdown_vector_store_save(state: AppState) -> None:
+    """LTM ベクトルインデックスを永続化 (sleep-time が走らずに終了した場合の保険)"""
+    vs = getattr(state, "vector_store", None)
+    if vs is None or vs.count == 0:
+        return
+    try:
+        vs.save()
+        logger.info("Vector store (LTM) saved on shutdown: %d vectors", vs.count)
+    except Exception as e:
+        logger.warning("Vector store save on shutdown failed: %s", e)
 
 
 def _shutdown_experience_save(exp_buf: "ExperienceBuffer", exp_file: Path) -> None:
@@ -263,6 +279,8 @@ async def _run_lifespan_shutdown(
         _shutdown_wm_flush(ctx.wm, ctx.stm)
     with _timed(shutdown_timings, "stm_save"):
         _shutdown_stm_save(ctx.stm, ctx.resolver)
+    with _timed(shutdown_timings, "vector_store_save"):
+        _shutdown_vector_store_save(state)
     with _timed(shutdown_timings, "experience_save"):
         _shutdown_experience_save(ctx.exp_buf, ctx.exp_file)
     with _timed(shutdown_timings, "patterns_save"):

@@ -212,6 +212,27 @@ def looks_like_path_not_content(content: str, file_path: str) -> bool:
     return False
 
 
+_CODE_INDICATORS: tuple[str, ...] = (
+    "import ", "from ", "def ", "class ", "function ",
+    "const ", "let ", "var ", "return ", "if __name__",
+    "#include", "package ", "public class",
+    "#!/", "# -*- coding",
+    "pygame", "print(", "console.log",
+)
+
+
+def contains_code_indicator(text: str) -> bool:
+    """テキストにコードらしさを示すマーカーが1つ以上含まれるかを判定する。
+
+    長さ・改行に依存しないため、1 行の短いコード片でも検出できる。
+    散文 (例: "...を設計します。" のみ) は指標を含まず False になる。
+    """
+    if not text:
+        return False
+    text_lower = text.lower()
+    return any(ind.lower() in text_lower for ind in _CODE_INDICATORS)
+
+
 def text_looks_like_code(text: str) -> bool:
     """テキストがプログラムコードに見えるかを判定する
 
@@ -222,16 +243,7 @@ def text_looks_like_code(text: str) -> bool:
         return False
     if "\n" not in text:
         return False
-    code_indicators = [
-        "import ", "from ", "def ", "class ", "function ",
-        "const ", "let ", "var ", "return ", "if __name__",
-        "#include", "package ", "public class",
-        "#!/", "# -*- coding",
-        "pygame", "print(", "console.log",
-    ]
-    text_lower = text.lower()
-    indicator_count = sum(1 for ind in code_indicators if ind.lower() in text_lower)
-    return indicator_count >= 1
+    return contains_code_indicator(text)
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +307,67 @@ def try_parse_tool_dict(text: str) -> dict | None:
     if isinstance(data, dict) and "tool" in data:
         return data
     return None
+
+
+# テンプレート由来のツールコール (OAI JSON でない生テキスト) 抽出。
+# gemma 系: <|tool_call>call:NAME(k: "v", k2: "v2")<tool_call|>
+# マーカーの揺れ (<|tool_call|> / <tool_call> / </tool_call>) を寛容に許容する。
+_TEMPLATE_TOOL_CALL_RE = re.compile(
+    r"<\|?tool_call\|?>\s*call:\s*(?P<name>\w+)\s*\((?P<args>.*?)\)\s*</?\|?tool_call\|?>",
+    re.DOTALL,
+)
+# タグ内が JSON の Qwen 系: <tool_call>{...}</tool_call>
+_TEMPLATE_JSON_CALL_RE = re.compile(
+    r"<\|?tool_call\|?>\s*(\{.*?\})\s*</?\|?tool_call\|?>",
+    re.DOTALL,
+)
+
+
+def _parse_template_args(args_str: str) -> dict:
+    """``call:NAME(...)`` の引数文字列を best-effort で dict 化する。
+
+    ``key: "value"`` / ``key=value`` 形式を抽出する。位置引数や解釈不能な
+    断片は無視し、後段の引数正規化 (normalize_*_args) に委ねる。
+    """
+    args: dict = {}
+    if not args_str.strip():
+        return args
+    for m in re.finditer(
+        r'(\w+)\s*[:=]\s*(?:"([^"]*)"|\'([^\']*)\'|([^,]+?))(?:,|$)',
+        args_str,
+    ):
+        key = m.group(1)
+        value = m.group(2)
+        if value is None:
+            value = m.group(3)
+        if value is None:
+            value = (m.group(4) or "").strip()
+        args[key] = value
+    return args
+
+
+def parse_template_tool_call(text: str) -> dict | None:
+    """テンプレート形式のツールコール生テキストを ``{"tool", "args"}`` に変換する。
+
+    base モデル (gemma 系等) が OAI JSON ではなくチャットテンプレート由来の
+    ``<|tool_call>call:NAME(args)<tool_call|>`` 形式を ``message.content`` に
+    そのまま吐くケースを救済する。Qwen 系の ``<tool_call>{json}</tool_call>``
+    はタグ内が JSON のため try_parse_tool_dict へ委譲する。
+    返り値は OAI JSON パーサ (try_parse_tool_dict) と同形。
+    """
+    if not text or "tool_call" not in text:
+        return None
+    # Qwen 系: タグ内が JSON
+    m_json = _TEMPLATE_JSON_CALL_RE.search(text)
+    if m_json is not None:
+        parsed = try_parse_tool_dict(m_json.group(1))
+        if parsed is not None:
+            return parsed
+    # gemma 系: call:NAME(args)
+    m = _TEMPLATE_TOOL_CALL_RE.search(text)
+    if m is None:
+        return None
+    return {"tool": m.group("name"), "args": _parse_template_args(m.group("args"))}
 
 
 def _find_matching_close_brace(text: str, start: int) -> int | None:
