@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from backend.config import resolve_context_size
 from backend.log_config import get_logger
 from backend.policy_helpers import get_policy_value
 
@@ -361,7 +362,7 @@ def _can_use_meta_cognitive(
     mode: str = "chat",
 ) -> bool:
     """コンテキスト予算が Meta-Cognitive ループに十分か判定"""
-    ctx_size = config.get("llama", {}).get("context_size", 4096)
+    ctx_size = resolve_context_size(config, "base")
     history_budget = config.get("memory", {}).get("working_max_tokens", 2048)
     loop_budget = ctx_size - 512 - 400 - history_budget
 

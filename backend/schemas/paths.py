@@ -36,6 +36,12 @@ class LocalPathsConfig(BaseModel):
     lora_versions_dir: str = "local/lora_versions/"
     assist_lora_adapter: str = "local/models/assist_adapter.gguf"
     assist_lora_versions_dir: str = "local/models/assist_lora_versions/"
+    # Level 2 base=C: control vector (llama-cvector-generator 生成) の本体 / 版管理 /
+    # positive.txt・negative.txt 作業用ディレクトリ。Pro 限定だが PathResolver が
+    # 参照するため Free でもフィールドは存在する (extra="forbid" のため明示必須)。
+    control_vector_adapter: str = "local/models/control_vector.gguf"
+    control_vector_versions_dir: str = "local/models/control_vector_versions/"
+    cvector_work_dir: str = "local/cvector/"
     experience_assist_file: str = "local/experience_assist.json"
     eval_assist_file: str = "local/eval_assist.json"
     lora_archive_dir: str = "local/lora_archive/"

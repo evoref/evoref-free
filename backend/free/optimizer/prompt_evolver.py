@@ -258,15 +258,29 @@ class PromptEvolver:
             f"{protected_instruction}"
         )
 
+        messages = [{"role": "user", "content": mutation_query}]
         try:
-            generate_kwargs: dict = {
-                "messages": [{"role": "user", "content": mutation_query}],
-                "stream": False,
-                "temperature": 0.5,
-                "max_tokens": 1024,
-                "id_slot": getattr(llm_client, 'background_slot', -1),
-            }
-            result = await llm_client.generate(**generate_kwargs)
+            # 変異生成器が assist (AssistModelClient) か base (LocalClient) かで
+            # generate のシグネチャが異なる: assist は purpose 必須・id_slot 無視、
+            # base は purpose 非対応・id_slot 使用。低速 base のタイムアウトを避け
+            # mutation は assist へ寄せる (learning スロット)。purpose は purpose
+            # 監査 (test_assist_purpose_audit) が静的検出できるようリテラルで分岐する。
+            if getattr(llm_client, "is_assist_client", False):
+                result = await llm_client.generate(
+                    messages=messages,
+                    stream=False,
+                    temperature=0.5,
+                    max_tokens=1024,
+                    purpose="prompt_evolution",
+                )
+            else:
+                result = await llm_client.generate(
+                    messages=messages,
+                    stream=False,
+                    temperature=0.5,
+                    max_tokens=1024,
+                    id_slot=getattr(llm_client, "background_slot", -1),
+                )
             mutated = result["choices"][0]["message"]["content"].strip()
 
             # reasoning モデル (Qwen3 / LFM2 等) が content に吐く <think>...</think> を

@@ -873,3 +873,14 @@ class SleepTimeWorker:
                 self.experience_buf.save(exp_file)
             except Exception as e:
                 logger.warning("Failed to save experience buffer: %s", e)
+
+        # LTM ベクトルインデックスを永続化 (absorb_from_short_term は in-memory
+        # 追加のみで save しないため、ここでまとめてディスクへ書き戻す)
+        if self.vector_store is not None and self.vector_store.count > 0:
+            try:
+                self.vector_store.save()
+                logger.info(
+                    "Vector store (LTM) saved: %d vectors", self.vector_store.count,
+                )
+            except Exception as e:
+                logger.warning("Vector store save on sleep failed: %s", e)

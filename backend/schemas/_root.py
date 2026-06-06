@@ -163,6 +163,14 @@ class EvorefConfig(BaseModel):
                 self.learning.optimizer == "full-cma-es",
             ),
             (
+                "learning.level2_base_method",
+                self.learning.level2_base_method == "cvector",
+            ),
+            (
+                "learning.level2_assist_method",
+                self.learning.level2_assist_method == "spsa-real-eval",
+            ),
+            (
                 "pro.url_recall.team_profile_ids",
                 bool(self.pro.url_recall.team_profile_ids),
             ),

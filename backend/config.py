@@ -24,6 +24,10 @@ class PathResolver:
         "lora_versions_dir": "local/lora_versions/",
         "assist_lora_adapter": "local/models/assist_adapter.gguf",
         "assist_lora_versions_dir": "local/models/assist_lora_versions/",
+        # Level 2 base=C: control vector 本体 / 版管理 / 作業用ディレクトリ
+        "control_vector_adapter": "local/models/control_vector.gguf",
+        "control_vector_versions_dir": "local/models/control_vector_versions/",
+        "cvector_work_dir": "local/cvector/",
         "experience_assist_file": "local/experience_assist.json",
         "eval_assist_file": "local/eval_assist.json",
         "lora_archive_dir": "local/lora_archive/",
@@ -228,6 +232,15 @@ _PROFILE_SAMPLING_KEYS = (
 
 # モデル arch プロファイルの reasoning 既定キャッシュ。((絶対パス, mtime_ns) -> dict)
 _profile_reasoning_cache: dict[tuple[str, int], dict] = {}
+
+# モデル arch プロファイルの context_size キャッシュ。((絶対パス, mtime_ns) -> int | None)
+# チャット応答パスから毎リクエスト呼ばれるため GGUF ヘッダ読取をキャッシュする。
+_profile_context_cache: dict[tuple[str, int], int | None] = {}
+
+# config 明示も arch プロファイル宣言も無い場合の context_size 既定。
+# scripts/launch_llama.py::_CONTEXT_SIZE_DEFAULTS と一致させること
+# (サーバ起動値 ``-c`` とランタイム token budget の値を揃えるため)。
+_CONTEXT_SIZE_FALLBACK = 8192
 
 # template family -> reasoning mode の fallback 対応 (プロファイル無宣言時に
 # detect_template_family の結果から推定する)。
@@ -452,6 +465,74 @@ def resolve_client_reasoning(cfg: dict, slot: str) -> tuple[int, str]:
         budget = 0
     on_runaway = reasoning.get("on_runaway") or "fallback"
     return max(0, budget), str(on_runaway)
+
+
+def _resolve_profile_context_size(cfg: dict, slot: str) -> int | None:
+    """slot ("base"|"assist") の arch プロファイルから ``context_size`` を返す。
+
+    ``auto_model_flags=false`` / モデル未設定 / GGUF 読取失敗 / プロファイル不在 /
+    ``context_size`` 未宣言・512 未満のときは ``None``。((絶対パス, mtime) でキャッシュ)。
+    起動フラグ側 (scripts/launch_llama.py) と同じ GGUF reader / プロファイルローダを
+    流用し、サーバ ``-c`` とランタイム値を揃える。
+    """
+    if not (cfg.get("llama", {}) or {}).get("auto_model_flags", True):
+        return None
+    model_paths = cfg.get("model_paths", {}) or {}
+    key = "base_model" if slot == "base" else "assist_model"
+    model_rel = model_paths.get(key, "")
+    if not model_rel:
+        return None
+    project_root = get_project_root()
+    model_path = Path(model_rel)
+    if not model_path.is_absolute():
+        model_path = project_root / model_path
+    try:
+        mtime = model_path.stat().st_mtime_ns
+    except OSError:
+        return None
+    cache_key = (str(model_path), mtime)
+    if cache_key in _profile_context_cache:
+        return _profile_context_cache[cache_key]
+
+    value: int | None = None
+    try:
+        from scripts.launch_llama import load_model_profile, read_gguf_metadata
+
+        meta = read_gguf_metadata(model_path)
+        profile = load_model_profile(meta.get("architecture"), project_root)
+        raw = profile.get("context_size")
+        if raw is not None:
+            ivalue = int(raw)
+            if ivalue >= 512:
+                value = ivalue
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Profile context_size resolution failed for slot %s: %s", slot, e)
+        value = None
+
+    _profile_context_cache[cache_key] = value
+    return value
+
+
+def resolve_context_size(cfg: dict, slot: str) -> int:
+    """slot ("base"|"assist") の有効 context_size を解決する (docs/c_15)。
+
+    優先順位: config 明示 (``llama.context_size`` / ``assist_model.local.context_size``)
+    > arch プロファイル ``context_size`` > 既定 (``_CONTEXT_SIZE_FALLBACK``)。
+    起動フラグ ``-c`` (scripts/launch_llama.py::resolve_context_size_for) と同じ
+    優先順位で解決し、llama-server 起動値とランタイム値 (token budget 表示等) を
+    一致させる。
+    """
+    if slot == "assist":
+        local = (cfg.get("assist_model") or {}).get("local") or {}
+        explicit = local.get("context_size")
+    else:
+        explicit = (cfg.get("llama") or {}).get("context_size")
+    if explicit is not None:
+        return int(explicit)
+    profile_ctx = _resolve_profile_context_size(cfg, slot)
+    if profile_ctx is not None:
+        return profile_ctx
+    return _CONTEXT_SIZE_FALLBACK
 
 
 def get_mode_generation_params(mode: str) -> dict:

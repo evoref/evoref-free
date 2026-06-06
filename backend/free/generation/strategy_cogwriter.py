@@ -671,7 +671,10 @@ class CogWriterStrategy:
 
         try:
             data = await self.assist_client.generate_json(
-                prompt, max_tokens=512, temperature=0.3,
+                # 複数 ReviewIssue(unit_idx/issue/fix) を配列で返すため 512 では
+                # finish_reason=length で約半数が途中切断され json_repair 依存に
+                # なる。1024 へ拡張して切断を抑える。
+                prompt, max_tokens=1024, temperature=0.3,
                 purpose="long_form_code_review",
                 list_key="issues",
             )
@@ -713,7 +716,8 @@ class CogWriterStrategy:
 
         try:
             data = await self.assist_client.generate_json(
-                prompt, max_tokens=512, temperature=0.3,
+                # code_review と同様、複数 issue 配列で 512 切断が起きるため 1024。
+                prompt, max_tokens=1024, temperature=0.3,
                 purpose="long_form_text_review",
                 list_key="issues",
             )

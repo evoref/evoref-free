@@ -15,9 +15,9 @@ from backend.free.agent.meta_cognitive_utils import (
 )
 from backend.free.agent.tool_call_judge import ToolCallJudge, ToolJudgement
 from backend.free.agent.tool_result_digest import digest_tool_result
+from backend.config import resolve_context_size
 from backend.free.api.chat.chat_constants import (
     CONTENT_MAX_TOKENS_MIN, CONTENT_SYSTEM_RESERVE,
-    DEFAULT_CONTEXT_SIZE,
     TOOL_EXECUTION_TIMEOUT_SEC, TOOL_GROUNDED_TEMPERATURE,
     TOOL_RESULT_MAX_CHARS,
     TOOL_RESULT_HEAD_RATIO, TOOL_RESULT_OMISSION_CHARS,
@@ -138,7 +138,7 @@ class DeliberativeAgent:
         self._assist_client = assist_client
 
         # コンテンツ生成用の max_tokens
-        ctx_size = self.config.get("llama", {}).get("context_size", DEFAULT_CONTEXT_SIZE)
+        ctx_size = resolve_context_size(self.config, "base")
         self._content_max_tokens = max(ctx_size - CONTENT_SYSTEM_RESERVE, CONTENT_MAX_TOKENS_MIN)
 
     @staticmethod

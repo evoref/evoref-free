@@ -15,6 +15,14 @@ launch_flags:
   - "--jinja"
   - "--reasoning-format"
   - "auto"
+# context_size (-c)。Gemma-4 の学習時最大コンテキスト (n_ctx_train)。E2B/E4B (小型) は 32768。
+# 12B 等の大型は最大 131072 まで対応するが、サイズ共通プロファイルでは小型に合わせ 32768 とする
+# (12B でさらに伸ばす場合は config の llama.context_size 明示、または
+#  local/profiles/gemma4.yaml で 131072 + RoPE スケーリングを指定)。
+# config.yaml の llama.context_size が未指定 / null のとき採用 (解決順: config 明示 > profile > 8192)。
+# 32768 は KV キャッシュ VRAM が 8192 比で約4倍。VRAM が厳しい場合は config 側で context_size を
+# 明示 (8192 等) して上書きするか cache_type_k/v を量子化する。
+context_size: 32768
 moe:
   enabled: false
   n_cpu_moe: null

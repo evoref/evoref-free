@@ -39,14 +39,18 @@ if TYPE_CHECKING:
 def build_model_detail_response(
     client: object | None,
     llama_cfg: dict[str, Any],
+    context_size: int | None = None,
 ) -> ModelDetailResponse:
     """`/api/model/info` のレスポンス構築。
 
     `client` が `metadata` を持つ場合は client metadata を優先し、
-    なければ `llama_cfg` のみで既定値を返す。`context_size` /
-    `gpu_layers` / `flash_attn` は常に `llama_cfg` から取得。
+    なければ `llama_cfg` のみで既定値を返す。`gpu_layers` / `flash_attn` は
+    常に `llama_cfg` から取得。`context_size` は解決済み値 (config 明示 >
+    arch プロファイル > 8192、backend.config.resolve_context_size) を呼び出し側で
+    渡す。未指定時は後方互換で `llama_cfg` から読む (None なら 4096)。
     """
-    context_size = int(llama_cfg.get("context_size", 4096))
+    if context_size is None:
+        context_size = int(llama_cfg.get("context_size") or 4096)
     gpu_layers = int(llama_cfg.get("gpu_layers", 0))
     flash_attn = bool(llama_cfg.get("flash_attn", False))
 

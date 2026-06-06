@@ -109,6 +109,55 @@ class LearningScheduler:
         self.optimizer_type: str = learning.get("optimizer", "spsa")
         self.cma_sigma0: float = learning.get("cma_sigma0", 0.1)
         self.cma_popsize: int = learning.get("cma_popsize", 0)
+        # Level 2 初回 full-train (bootstrap)。既定 OFF (実 llama-server ロード検証後に有効化)
+        self.bootstrap_enabled: bool = bool(learning.get("level2_bootstrap_enabled", False))
+        self.bootstrap_rank: int = int(learning.get("level2_bootstrap_rank", 8))
+        self.bootstrap_init_sigma: float = float(
+            learning.get("level2_bootstrap_init_sigma", 1e-4)
+        )
+        self.bootstrap_min_failures: int = int(
+            learning.get("level2_bootstrap_min_failures", 20)
+        )
+        # Level 2 base=C: control vector (既定 'lora' = 既存 SPSA/LoRA 経路、挙動変更なし)
+        self.level2_base_method: str = learning.get("level2_base_method", "lora")
+        self.cvector_method: str = learning.get("cvector_method", "pca")
+        self.cvector_pca_batch: int = int(learning.get("cvector_pca_batch", 100))
+        self.cvector_pca_iter: int = int(learning.get("cvector_pca_iter", 1000))
+        # cvector_scale は適用時に scripts/launch_llama.py が config から直接読むため、
+        # scheduler 属性としては保持しない (runtime reader 不在)。
+        self.cvector_seed_pairs_file: str = learning.get("cvector_seed_pairs_file", "")
+        self.cvector_min_experiences: int = int(
+            learning.get("cvector_min_experiences", 40)
+        )
+        # Level 2 assist=B: 実推論 eval (既定 'none' = 現状の no-op eval_func を維持)
+        self.level2_assist_method: str = learning.get("level2_assist_method", "none")
+        self.assist_eval_scratch_port: int = int(
+            learning.get("assist_eval_scratch_port", 8090)
+        )
+        self.assist_eval_loss_w1: float = float(
+            learning.get("assist_eval_loss_w1", 0.7)
+        )
+        self.assist_eval_loss_w2: float = float(
+            learning.get("assist_eval_loss_w2", 0.3)
+        )
+        self.assist_eval_max_tokens: int = int(
+            learning.get("assist_eval_max_tokens", 64)
+        )
+        self.assist_eval_max_cases: int = int(
+            learning.get("assist_eval_max_cases", 20)
+        )
+        self.assist_eval_health_timeout: int = int(
+            learning.get("assist_eval_health_timeout", 120)
+        )
+        self.assist_bootstrap_enabled: bool = bool(
+            learning.get("level2_assist_bootstrap_enabled", False)
+        )
+        self.assist_bootstrap_rank: int = int(
+            learning.get("level2_assist_bootstrap_rank", 8)
+        )
+        self.assist_bootstrap_init_sigma: float = float(
+            learning.get("level2_assist_bootstrap_init_sigma", 1e-4)
+        )
 
     def _init_phase4_and_mutator_config(self, learning: dict) -> None:
         """トークン予算進化 + §7.1.3 変異生成 LLM 設定"""
@@ -301,9 +350,31 @@ class LearningScheduler:
         self._last_level2_run = time.time()
         self._save_state()
 
+    def seconds_since_level2_run(self) -> float:
+        """前回 Level 2 実行からの経過秒。未実行 (_last_level2_run<=0) は inf。
+
+        `_last_level2_run` は learning_state に永続化されるため、再起動を跨いで
+        overdue 判定が継続する (SleepTimeScheduler の Level 2 常駐ループが参照)。
+        """
+        if self._last_level2_run <= 0:
+            return float("inf")
+        return max(0.0, time.time() - self._last_level2_run)
+
     def set_user_active_checker(self, checker) -> None:
         """ユーザーアクティブ判定関数を設定（Level 2 中断用）"""
         self._user_active_checker = checker
+
+    def set_version_manager(self, version_manager) -> None:
+        """ベースモデル LoRA バージョンマネージャを設定（Pro、lifespan から注入）。
+
+        構築時は None 既定で、Pro ハンドラ登録後に running scheduler へ後注入する。
+        未注入だと Level 2 (base) は version_manager is None で停止する。
+        """
+        self.version_manager = version_manager
+
+    def set_eval_core_manager(self, eval_core_manager) -> None:
+        """評価コアマネージャを設定（Pro、lifespan から注入）。"""
+        self.eval_core_manager = eval_core_manager
 
     def set_embedder(self, embedder) -> None:
         """embed instruction 進化用のエンベッダを設定（lifespan から注入）

@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from backend.config import resolve_context_size
 from backend.log_config import get_logger
 
 logger = get_logger("services.model_service")
@@ -43,8 +44,7 @@ def build_model_info_sync(
         return models, context_size
 
     sp = cfg.get("model_paths", {})
-    llama_cfg = cfg.get("llama", {})
-    context_size = llama_cfg.get("context_size")
+    context_size = resolve_context_size(cfg, "base")
 
     # llama-server 接続状態
     llama_connected = False
@@ -125,8 +125,7 @@ async def build_model_info_async(
         return models, context_size
 
     sp = cfg.get("model_paths", {})
-    llama_cfg = cfg.get("llama", {})
-    context_size = llama_cfg.get("context_size")
+    context_size = resolve_context_size(cfg, "base")
 
     # llama-server 接続状態
     llama_connected = False

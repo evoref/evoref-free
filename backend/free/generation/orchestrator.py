@@ -12,6 +12,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
 
+from backend.config import resolve_context_size
 from backend.free.generation.code_repair import CodeRepairer, infer_language
 from backend.free.generation.import_wirer import wire_imports
 from backend.free.generation.code_skeleton import CodeSkeleton, update_skeleton
@@ -28,7 +29,12 @@ from backend.free.generation.strategy_cogwriter import CogWriterStrategy
 from backend.free.generation.strategy_common import resolve_generation_order
 from backend.free.generation.strategy_recurrent import RecurrentStrategy
 from backend.free.generation.token_budget import TokenBudget, truncate_tail
-from backend.free.generation.validators import remove_code_fences, validate_python
+from backend.free.generation.validators import (
+    ValidationError,
+    collapse_runaway_repetition,
+    remove_code_fences,
+    validate_python,
+)
 from backend.policy_helpers import get_policy_value
 from backend.utils import estimate_tokens
 
@@ -90,6 +96,10 @@ class LongFormOrchestrator:
         # 直近コードのファイル別 (file_path → 検証・修正済みコード)。複数ファイル
         # 計画時に Agentic 経路が複数 EditorArtifact として配信するために使う。
         self.last_code_files: dict[str, str] = {}
+        # 直近生成の post-repair 検証で残った error 行 (severity=error のみ)。
+        # 配信側 (make_code_artifact_generator) が「壊れたコードを成功として
+        # 渡さない」ためユーザーへ提示する。
+        self.last_validation_errors: list[str] = []
 
         # Recurrent も計画 / 要約再帰をアシストモデルで実行する
         # ため ``assist_client`` を渡す。``None`` の場合は Recurrent 内部で
@@ -119,7 +129,7 @@ class LongFormOrchestrator:
         1 リクエストが使える実効値は context_size // slots になる。
         """
         llama_cfg = self.config.get("llama", {})
-        total_ctx = llama_cfg.get("context_size", 4096)
+        total_ctx = resolve_context_size(self.config, "base")
         slots = max(llama_cfg.get("slots", 1), 1)
         return total_ctx // slots
 
@@ -294,9 +304,14 @@ class LongFormOrchestrator:
     ) -> tuple[int, int]:
         """コード検証 + SSE 通知 + デバッグログ。`(error_count, warning_count)` を返す。
 
-        リペア後の出力 (``last_code_output``) を対象に検証する。``validate_python``
-        は Python 専用のため、他言語では AST 検証をスキップする (Python として
-        誤検出しないため)。
+        リペア後の出力を対象に検証する。``validate_python`` は Python 専用のため、
+        他言語では AST 検証をスキップする (Python として誤検出しないため)。
+
+        複数ファイル生成時は ``last_code_files`` を**ファイル単位**で検証して集約する。
+        全ファイルを結合して検証すると、あるファイルの未 import 参照が別ファイルの
+        定義で「定義済み」と誤判定され cross-file の未定義が同一名前空間でマスクされる
+        (実測: 結合検証は 0 件、ファイル単位だと未定義を検出)。import 配線
+        (``wire_imports``) 後を対象とするため、配線で解決済みなら誤検知しない。
         """
         if content_type != ContentType.CODE or not rolling.generated_units:
             return 0, 0
@@ -308,14 +323,27 @@ class LongFormOrchestrator:
                     "status": "done",
                 })
             return 0, 0
-        code = self.last_code_output
-        if code is None:
-            code = "\n\n".join(
-                remove_code_fences(u) for u in rolling.generated_units
-            )
-        errors = validate_python(code)
+        files = self.last_code_files
+        if files and len(files) > 1:
+            errors = [
+                ValidationError(
+                    e.error_type, f"{path}: {e.message}", severity=e.severity,
+                )
+                for path in sorted(files)
+                for e in validate_python(files[path])
+            ]
+        else:
+            code = self.last_code_output
+            if code is None:
+                code = "\n\n".join(
+                    remove_code_fences(u) for u in rolling.generated_units
+                )
+            errors = validate_python(code)
         validation_errors = sum(1 for e in errors if e.severity == "error")
         warning_count = sum(1 for e in errors if e.severity == "warning")
+        self.last_validation_errors = [
+            str(e) for e in errors if e.severity == "error"
+        ]
         if on_step:
             has_errors = validation_errors > 0
             if errors:
@@ -475,6 +503,19 @@ class LongFormOrchestrator:
                 text += token
                 yield token
 
+            # 退化反復 (トークン生成ループ) を確定ユニットから切除する。ライブ
+            # ストリームには既に流れているが、assemble / 後続ユニットのコンテキスト
+            # 汚染を防ぐため保存前にクリーンにする。
+            raw_len = len(text)
+            text = collapse_runaway_repetition(text)
+            if len(text) < raw_len and self._debug_logger:
+                self._debug_logger.log_long_form_event({
+                    "phase": "repetition_collapsed",
+                    "unit_name": label,
+                    "unit_idx": i,
+                    "chars_before": raw_len,
+                    "chars_after": len(text),
+                })
             rolling.generated_units.append(text)
             await self._update_rolling_context(rolling, text, content_type)
             unit_tokens = estimate_tokens(text)

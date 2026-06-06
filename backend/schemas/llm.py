@@ -61,7 +61,11 @@ class LlamaConfig(BaseModel):
 
     host: str = "localhost"
     port: int = Field(default=8080, ge=1024, le=65535)
-    context_size: int = Field(default=8192, ge=512)
+    # ``-c`` / コンテキスト長。``None`` (既定) は arch プロファイル
+    # (``models/profiles/<arch>.yaml`` の ``context_size``) を参照し、それも
+    # 未宣言なら 8192 にフォールバックする。明示 int を設定するとプロファイル
+    # より優先される (解決順: config 明示 > profile > 8192)。
+    context_size: int | None = Field(default=None, ge=512)
     # 整数 (-1 / 0 / 999 等) または ``"auto"`` 文字列。
     # ``"auto"`` 指定時は scripts/launch_llama.py の resolve 関数が
     # GPU 物理容量 + GGUF layer 数 + Vulkan host buffer headroom から

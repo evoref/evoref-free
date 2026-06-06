@@ -7,9 +7,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from backend.app_state import AppState, get_app_state
-from backend.config import get_config, get_mode_generation_params
+from backend.config import get_config, get_mode_generation_params, resolve_context_size
 from backend.free.api.chat.chat_constants import (
-    DEFAULT_CONTEXT_SIZE, DEFAULT_KEEPALIVE_INTERVAL_SEC, DEFAULT_MAX_TOKENS,
+    DEFAULT_KEEPALIVE_INTERVAL_SEC, DEFAULT_MAX_TOKENS,
     MAX_FILE_CONTEXT_TOTAL_CHARS, MAX_FILE_CONTEXT_TOTAL_CHUNKS,
     MAX_MESSAGE_LENGTH,
     SESSION_ID_MAX_LENGTH, SESSION_ID_MIN_LENGTH,
@@ -327,6 +327,26 @@ def _artifact_from_file(path: str, code: str) -> EditorArtifact:
     )
 
 
+def _validation_issues_artifact(errors: list[str]) -> EditorArtifact:
+    """リペア後も残った検証エラーを提示する markdown artifact を生成する。
+
+    生成コードは best-effort で配信しつつ、未解決エラーをユーザーに明示し、
+    壊れたコードを無言で「成功」扱いしないための可視化。
+    """
+    lines = "\n".join(f"- {e}" for e in errors)
+    content = (
+        f"# ⚠️ 自動検証で未解決のエラーが {len(errors)} 件あります\n\n"
+        "生成されたコードには以下の検証エラーが残っています。"
+        "実行前に修正してください。\n\n"
+        f"{lines}\n"
+    )
+    return EditorArtifact(
+        content=content,
+        language="markdown",
+        filename="GENERATION_ISSUES.md",
+    )
+
+
 def _clamp_long_form_timeout(cfg: dict) -> dict:
     """coding 委譲時、orchestrator の total_timeout_sec を agent 上限未満にする。
 
@@ -375,11 +395,18 @@ def make_code_artifact_generator(
             {"output.py": orchestrator.last_code_output}
             if orchestrator.last_code_output else {}
         )
-        return [
+        artifacts = [
             _artifact_from_file(path, code)
             for path, code in files.items()
             if code and code.strip()
         ]
+        # 「壊れたコードを成功として渡さない」: リペア後も残った検証エラーがあれば、
+        # 生成物は best-effort で返しつつ、未解決エラーを可視化する artifact を添える。
+        if artifacts and orchestrator.last_validation_errors:
+            artifacts.append(_validation_issues_artifact(
+                orchestrator.last_validation_errors,
+            ))
+        return artifacts
 
     return _generate
 
@@ -584,7 +611,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         raise HTTPException(status_code=503, detail="llama-server not connected")
 
     instance_name = cfg.get("instance", {}).get("name", "evoref")
-    context_size = cfg.get("llama", {}).get("context_size", DEFAULT_CONTEXT_SIZE)
+    context_size = resolve_context_size(cfg, "base")
     max_tokens = cfg.get("llama", {}).get("max_tokens", DEFAULT_MAX_TOKENS) or None
     gen_params = get_mode_generation_params(req.mode)
 

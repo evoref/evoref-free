@@ -31,7 +31,7 @@ from backend.free.api.schemas import (
     RollbackResponse,
 )
 from backend.app_state import AppState, get_app_state
-from backend.config import get_config, get_path_resolver
+from backend.config import get_config, get_path_resolver, resolve_context_size
 from backend.edition import get_pro_handler
 from backend.log_config import get_logger
 
@@ -46,7 +46,9 @@ async def get_model_info(state: AppState = Depends(get_app_state)):
     logger.debug("GET /api/model/info")
     cfg = get_config()
     llama_cfg = cfg.get("llama", {})
-    return build_model_detail_response(state.local_client, llama_cfg)
+    return build_model_detail_response(
+        state.local_client, llama_cfg, resolve_context_size(cfg, "base"),
+    )
 
 
 # ────────────────────────────────────────────

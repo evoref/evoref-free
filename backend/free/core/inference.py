@@ -8,6 +8,7 @@ from backend.free.api.chat.chat_constants import (
     DEFAULT_CONTEXT_SIZE, DEFAULT_GENERATION_RESERVE,
     DEFAULT_MAX_TOKENS, DEFAULT_WORKING_MAX_TOKENS,
 )
+from backend.config import resolve_context_size
 from backend.log_config import get_logger
 from backend.utils import compress_turn, estimate_tokens as _estimate_tokens
 
@@ -296,7 +297,7 @@ def build_messages_for_loop(
         compacted_steps: StepResult のリスト（圧縮済み）
         cfg: config.yaml の辞書
     """
-    ctx = cfg.get("llama", {}).get("context_size", DEFAULT_CONTEXT_SIZE)
+    ctx = resolve_context_size(cfg, "base")
     max_tok = cfg.get("llama", {}).get("max_tokens", DEFAULT_MAX_TOKENS) or DEFAULT_GENERATION_RESERVE
     generation_reserve = max_tok if max_tok else DEFAULT_GENERATION_RESERVE
     budget = ctx - generation_reserve
