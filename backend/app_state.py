@@ -21,6 +21,8 @@ from fastapi import Request
 from backend.log_config import DevelopLevel
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from backend.debug_logger import DebugLogger
     from backend.free.agent.assist_prompt_manager import AssistPromptManager
     from backend.free.core.llama_process_manager import LlamaProcessManager
@@ -132,11 +134,17 @@ class AppState:
     # ── model_state.json / config.yaml 整合性 ──
     # 不一致検出時のみ dict を格納 (current_filename / config_filename / recommendation)
     model_state_mismatch: dict | None = None
+    # component (assist/embed/reranker) の不一致。{config_key: {model_state, config}}
+    component_state_mismatches: dict = field(default_factory=dict)
 
     # ── エージェント / プロンプト ──
     prompt_manager: SystemPromptManager | None = None
     assist_prompt_manager: AssistPromptManager | None = None
     feedback_collector: FeedbackCollector | None = None
+    # assist 経験記録 closure (Pro/Develop 起動時のみ非 None)。primitive 4 引数
+    # (action_type, input_context, output, outcome) を受け、Pro の assist 経験バッファへ
+    # 記録する。factory 層で構築し、Free 側 (chat_service / judge) は Pro 型非依存で呼ぶ。
+    assist_experience_recorder: "Callable[[str, str, str, float], None] | None" = None
     file_manager: SessionFileManager | None = None
     learned_patterns_store: LearnedPatternStore | None = None
     tools_registry: ToolsRegistry | None = None

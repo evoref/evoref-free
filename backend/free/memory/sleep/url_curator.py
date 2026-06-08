@@ -44,7 +44,9 @@ if TYPE_CHECKING:
 
 logger = get_logger("memory.sleep.url_curator")
 
-_URL_RE = re.compile(r"https?://[^\s\]\)」』、,]+", re.IGNORECASE)
+# 非 ASCII (CJK 等) も除外し、「URL + 日本語」入力で末尾テキストを
+# URL に取り込まないようにする (例: https://news.yahoo.co.jp/で取得して...)。
+_URL_RE = re.compile(r"(?i:https?)://[^\s\]\)」』、,\u0080-\U0010ffff]+")
 _SUBJECT_PREFIX = "mem.world.url."
 
 # fetch_url が失敗した時にユーザ応答に残る代表的なシグナル文字列。

@@ -24,6 +24,7 @@ from backend.free.generation.models import (
     extract_target_chars,
 )
 from backend.free.generation.rolling_context import RollingContext
+from backend.free.generation.spec_renderer import render_spec_for_prompt
 from backend.free.generation.strategy_common import (
     build_code_unit_messages,
     build_text_unit_messages,
@@ -36,6 +37,7 @@ from backend.free.generation.strategy_common import (
     resolve_max_units,
 )
 from backend.free.generation.token_budget import TokenBudget
+from backend.free.llm.json_schemas import CodeSpec
 
 if TYPE_CHECKING:
     from backend.free.llm.assist_client import AssistModelClient
@@ -46,11 +48,54 @@ logger = logging.getLogger("backend.free.generation.strategy_cogwriter")
 
 # ── プロンプトテンプレート ──
 
-_CODE_PLAN_PROMPT = """\
-あなたはソフトウェアアーキテクトです。
-以下の指示に基づき、実装計画をJSON形式で生成してください。
+# 事前準備: コード生成の前に固める共有設計仕様 (contract)。後続の plan 生成と
+# 全ユニット生成に注入され、ファイル横断のモジュール名 / データモデル /
+# シグネチャ / エントリポイント / プロトコルを統一する。f_08 §3 参照。
+_CODE_SPEC_PROMPT = """\
+あなたは熟練ソフトウェアアーキテクトです。
+以下の指示を実装するための「設計仕様(契約)」をJSON形式で出力してください。
+この仕様は後続の全コードユニット生成に共有され、ファイル間の整合性を保証します。
+矛盾の無い単一の整合した設計にしてください。
 
 【ユーザー指示】{instruction}
+【既存コード情報（RAG）】{rag_context}
+【関連メモリ】{memory_context}
+
+必ず次を厳密に定義してください:
+- modules: 正準なファイル構成 (各 path と purpose)。後続コードはこの path 以外を import しない。\
+存在しないモジュール (例: 集約用の架空 models.py) を作らない。
+- data_models: ファイル横断で共有する型 (name / module / kind / fields[name,type])。\
+**全ファイルがこのフィールド名・型に厳密に従う**。同じ型を別フィールドで再定義しない。
+- interfaces: 公開する関数/メソッドのシグネチャ (module / signature)。送受信する側が一致させる。
+- entry_point: 実行起点。CLI/アプリなら必ず設定する \
+(例: module="main.py", invocation="if __name__ == '__main__': asyncio.run(main())")。\
+ライブラリで起点が無い場合のみ module を空文字列にする。
+- protocol: コンポーネント間のデータ/通信契約 \
+(例: クライアントとサーバが送受信する JSON のキーと型)。無ければ空文字列。
+- constraints: 言語/バージョン/規約などの制約。
+
+JSON のみ出力してください。"""
+
+_FLOWCHART_PROMPT = """\
+あなたはソフトウェア設計者です。
+以下の設計仕様に基づき、プログラムの制御/データフローを表す
+mermaid フローチャート (flowchart TD) を生成してください。
+
+【ユーザー指示】{instruction}
+【設計仕様】
+{spec}
+
+"mermaid" キーに mermaid 記法の文字列のみ (先頭は flowchart TD)、
+補足があれば "notes" キーに入れた JSON を返してください。
+mermaid 値にコードフェンス (```) は含めないでください。"""
+
+_CODE_PLAN_PROMPT = """\
+あなたはソフトウェアアーキテクトです。
+以下の指示と設計仕様(契約)に基づき、実装計画をJSON形式で生成してください。
+
+【ユーザー指示】{instruction}
+【設計仕様(契約) — この通りのモジュール名・型・シグネチャで計画する】
+{spec}
 【既存コード情報（RAG）】{rag_context}
 【関連メモリ】{memory_context}
 
@@ -58,6 +103,8 @@ _CODE_PLAN_PROMPT = """\
 - **【ユーザー指示】で要求されたプログラムを正確に実装する**。【既存コード情報（RAG）】
   【関連メモリ】に別プログラム（別のゲーム等）のコードや設計が含まれていても、それを
   流用・模倣しない。参考情報がユーザー指示と矛盾する場合は **ユーザー指示を最優先** する。
+- **設計仕様(契約)が与えられている場合、各 unit の file_path は契約の modules の path に一致させ、
+  扱うデータモデルは契約の data_models のフィールド/型に厳密準拠する**。
 - units は **単一責務ごとに細かく分割** する (1 関数 / 1 クラス / 1 型定義 = 1 unit)。
   大きな関数は補助 unit に分け各 unit を小さく保つ (ローカル LLM が 1 回の生成で
   安定して出力できる粒度にする = 品質向上)。
@@ -65,6 +112,7 @@ _CODE_PLAN_PROMPT = """\
   file_path を適切に振り分ける (例: 本体 / ユーティリティ / 型定義 / テスト)。
   単一ファイルで十分なら全 unit を同じ file_path にする。
 - depends_on で unit 間の依存を明示し、生成順を正す。
+- entry_point が契約で指定されている場合、それを実装する unit を必ず含める。
 
 出力形式:
 {{
@@ -420,9 +468,17 @@ class CogWriterStrategy:
             "long_form_mode", LongFormMode.CONTINUE,
         )
 
+        # コード生成は事前準備として設計仕様 (契約) を先に合成し、plan と
+        # 全ユニット生成に注入する。合成失敗 / 無効化時は None で従来挙動。
+        code_spec: CodeSpec | None = None
+
         if content_type == ContentType.CODE:
+            code_spec = await self._synthesize_code_spec(
+                instruction, rag_context, memory_context,
+            )
             prompt = _CODE_PLAN_PROMPT.format(
                 instruction=instruction,
+                spec=render_spec_for_prompt(code_spec) or "(なし)",
                 rag_context=rag_context,
                 memory_context=memory_context,
             )
@@ -484,12 +540,19 @@ class CogWriterStrategy:
             logger.warning(
                 "Plan JSON parse failed, falling back to single unit"
             )
-            plan = fallback_plan(instruction, content_type)
+            plan = fallback_plan(instruction, content_type, code_spec=code_spec)
         else:
-            plan = parse_plan(data, content_type, instruction)
+            plan = parse_plan(data, content_type, instruction, code_spec=code_spec)
 
         # ユニット数上限 + コード用依存順ソート (共通後処理)
         finalize_plan_units(plan, max_units, content_type)
+
+        # 任意: 設計仕様から mermaid フローチャートを合成し plan に同伴する
+        # (config code_flowchart_enabled=True 時のみ、既定 OFF)。SPEC.md に埋込。
+        if content_type == ContentType.CODE and code_spec is not None:
+            plan.code_flowchart = await self._synthesize_flowchart(
+                instruction, code_spec,
+            )
 
         elapsed = time.monotonic() - t0
         logger.info(
@@ -506,6 +569,87 @@ class CogWriterStrategy:
             })
 
         return plan
+
+    async def _synthesize_code_spec(
+        self,
+        instruction: str,
+        rag_context: str,
+        memory_context: str,
+    ) -> CodeSpec | None:
+        """コード生成の事前準備として共有設計仕様 (契約) を合成する。
+
+        ``assist_client=None`` (degraded) / config 無効化 / 合成失敗時は
+        ``None`` を返し、呼出側は仕様なしの従来挙動にフォールバックする。
+        """
+        if self.assist_client is None:
+            return None
+        if not self._lf_config.get("code_spec_enabled", True):
+            return None
+
+        prompt = _CODE_SPEC_PROMPT.format(
+            instruction=instruction,
+            rag_context=rag_context,
+            memory_context=memory_context,
+        )
+        t0 = time.monotonic()
+        try:
+            data = await self.assist_client.generate_json(
+                prompt, max_tokens=3072, temperature=0.3,
+                purpose="code_spec_synthesis",
+            )
+            if not isinstance(data, dict):
+                logger.warning("Code spec synthesis returned non-dict; skipping")
+                return None
+            spec = CodeSpec.model_validate(data)
+        except Exception as e:  # noqa: BLE001 — 合成失敗は従来挙動に倒す
+            logger.warning("Code spec synthesis failed: %s", e)
+            return None
+
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "Code spec synthesized: modules=%d, data_models=%d, elapsed=%.2fs",
+            len(spec.modules), len(spec.data_models), elapsed,
+        )
+        if self._debug_logger:
+            self._debug_logger.log_long_form_event({
+                "phase": "code_spec",
+                "strategy": "cogwriter",
+                "modules": len(spec.modules),
+                "data_models": len(spec.data_models),
+                "interfaces": len(spec.interfaces),
+                "elapsed_sec": round(elapsed, 3),
+            })
+        return spec
+
+    async def _synthesize_flowchart(
+        self,
+        instruction: str,
+        spec: CodeSpec,
+    ) -> str:
+        """設計仕様から mermaid フローチャートを合成する (config 任意・既定 OFF)。
+
+        ``code_flowchart_enabled`` が False / ``assist_client=None`` / 合成失敗時は
+        空文字列を返し、SPEC.md にフローチャート節を付けない。
+        """
+        if self.assist_client is None:
+            return ""
+        if not self._lf_config.get("code_flowchart_enabled", False):
+            return ""
+
+        prompt = _FLOWCHART_PROMPT.format(
+            instruction=instruction,
+            spec=render_spec_for_prompt(spec),
+        )
+        try:
+            data = await self.assist_client.generate_json(
+                prompt, max_tokens=1024, temperature=0.3,
+                purpose="flowchart_synthesis",
+            )
+            if isinstance(data, dict):
+                return str(data.get("mermaid", "") or "")
+        except Exception as e:  # noqa: BLE001 — 合成失敗は無効化と同じ扱い
+            logger.warning("Flowchart synthesis failed: %s", e)
+        return ""
 
     async def generate_unit(
         self,

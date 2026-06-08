@@ -23,6 +23,8 @@ from backend.free.rag.self_rag_judge import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from backend.debug_logger import DebugLogger
     from backend.free.core.policy_interpreter import PolicyInterpreter
     from backend.free.core.stage_timer import StageTimer
@@ -242,6 +244,7 @@ async def _maybe_assist_judge_quality(
     session_id: str = "default",
     tracker: "AssistJudgeUsageTracker | None" = None,
     debug_logger: "DebugLogger | None" = None,
+    assist_experience_recorder: "Callable[[str, str, str, float], None] | None" = None,
 ) -> str:
     """marginal 境界 + アシスト有効時のみ LLM 品質再判定を行う
 
@@ -279,6 +282,7 @@ async def _maybe_assist_judge_quality(
             return quality
         new_quality = await quality_judge.judge_with_assist(
             query, merged, assist_client, quality,
+            record_assist=assist_experience_recorder,
         )
         logger.debug("Step 5b assist judge (no tracker): %s", new_quality)
         return new_quality
@@ -310,6 +314,7 @@ async def _maybe_assist_judge_quality(
     started = _time.perf_counter()
     new_quality = await quality_judge.judge_with_assist(
         query, merged, assist_client, quality,
+        record_assist=assist_experience_recorder,
     )
     elapsed = _time.perf_counter() - started
     session_count_after = tracker.record(session_id)
@@ -405,6 +410,7 @@ async def unified_search(
     assist_judge_tracker: "AssistJudgeUsageTracker | None" = None,
     necessity_prompt: str | None = None,
     quality_prompt: str | None = None,
+    assist_experience_recorder: "Callable[[str, str, str, float], None] | None" = None,
 ) -> SearchResult:
     """統合検索パイプライン: Self-RAG + 3層メモリ + (任意) リランカー
 
@@ -462,6 +468,7 @@ async def unified_search(
             tracker=assist_judge_tracker,
             debug_logger=debug_logger,
             config=necessity_cfg,
+            record_assist=assist_experience_recorder,
         )
     else:
         necessity = necessity_judge.judge(query, context_count=context_count)
@@ -534,6 +541,7 @@ async def unified_search(
             session_id=session_id,
             tracker=assist_judge_tracker,
             debug_logger=debug_logger,
+            assist_experience_recorder=assist_experience_recorder,
         )
     finally:
         if timer is not None:

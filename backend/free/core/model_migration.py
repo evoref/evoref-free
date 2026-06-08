@@ -33,6 +33,15 @@ COMPONENT_CONFIG_KEY: dict[str, str] = {
     "reranker": "reranker_model",
 }
 
+# config.yaml の model_paths 配下で model_state.json と同期されるキー。
+# これらは migrate API (POST /api/model/migrate, /api/model/{component}/migrate)
+# 経由でしか変更できない。config を直書きすると model_state.json と desync し、
+# 起動時に mismatch を起こすため API 層で遮断する。coding_model は model_state
+# 非追跡 (未指定時は base_model にフォールバック) のため対象外。
+MODEL_STATE_TRACKED_KEYS: frozenset[str] = frozenset(
+    ("base_model", *COMPONENT_CONFIG_KEY.values()),
+)
+
 
 # ────────────────────────────────────────────
 # ModelState: local/model_state.json 管理
@@ -294,6 +303,37 @@ class ModelState:
 
         if changed:
             self.save()
+
+
+def detect_mismatches(
+    model_state: "ModelState", config: dict,
+) -> dict[str, dict[str, str]]:
+    """config.yaml の model_paths と model_state.json の current filename を比較する。
+
+    base_model と各 component (assist/embed/reranker) について、
+    config と model_state の双方が非空かつ basename が異なるキーだけを返す。
+    片方でも空 (初回起動で未初期化等) のキーは誤検知を避けるため除外する。
+
+    Returns:
+        ``{config_key: {"model_state": <filename>, "config": <filename>}}``。
+        ``config_key`` は ``"base_model"`` または component の config キー
+        (``assist_model`` / ``embed_model`` / ``reranker_model``)。
+    """
+    model_paths = config.get("model_paths", {}) or {}
+    result: dict[str, dict[str, str]] = {}
+
+    ms_base = model_state.current_filename
+    cfg_base = Path(model_paths.get("base_model", "") or "").name
+    if ms_base and cfg_base and ms_base != cfg_base:
+        result["base_model"] = {"model_state": ms_base, "config": cfg_base}
+
+    for component, cfg_key in COMPONENT_CONFIG_KEY.items():
+        ms_name = model_state.get_component_current_filename(component)
+        cfg_name = Path(model_paths.get(cfg_key, "") or "").name
+        if ms_name and cfg_name and ms_name != cfg_name:
+            result[cfg_key] = {"model_state": ms_name, "config": cfg_name}
+
+    return result
 
 
 # ────────────────────────────────────────────

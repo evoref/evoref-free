@@ -130,6 +130,79 @@ class TextPlan(_StrictModel):
     units: list[SectionUnitPlan]
 
 
+# ── コード設計仕様 (code_spec_synthesis) ──
+#
+# コード生成の「事前準備」段階で合成する、ファイル横断の共有契約。
+# CodePlan を生成する前にこれを固めることで、各ユニット (小ブロック) が
+# 同一のモジュール名・データモデル・公開シグネチャ・エントリポイント・
+# 通信プロトコルに準拠する。f_08 §3 参照。
+
+class CodeSpecField(_StrictModel):
+    """共有データモデルの 1 フィールド。"""
+
+    name: str
+    type: str
+
+
+class CodeSpecModule(_StrictModel):
+    """正準なモジュール (ファイル) 構成の 1 エントリ。"""
+
+    path: str
+    purpose: str
+
+
+class CodeSpecDataModel(_StrictModel):
+    """ファイル横断で共有するデータモデル (dataclass / class / enum 等)。"""
+
+    name: str
+    module: str
+    kind: Literal[
+        "dataclass", "class", "enum", "typeddict", "pydantic", "namedtuple", "other"
+    ] = "dataclass"
+    fields: list[CodeSpecField] = Field(default_factory=list)
+
+
+class CodeSpecInterface(_StrictModel):
+    """公開する関数 / メソッドのシグネチャ契約。"""
+
+    module: str
+    signature: str
+
+
+class CodeSpecEntryPoint(_StrictModel):
+    """プログラムの起点。空文字列なら起点なし (ライブラリ等)。"""
+
+    module: str = ""
+    invocation: str = ""
+
+
+class CodeSpec(_StrictModel):
+    """コード生成の共有設計仕様 (contract)。
+
+    `backend/free/generation/strategy_cogwriter.py` の create_plan が
+    purpose="code_spec_synthesis" で合成し、CodePlan の生成と各ユニット
+    プロンプトに注入する。SPEC.md として成果物にも出力する。
+    """
+
+    title: str = ""
+    summary: str = ""
+    modules: list[CodeSpecModule] = Field(default_factory=list)
+    data_models: list[CodeSpecDataModel] = Field(default_factory=list)
+    interfaces: list[CodeSpecInterface] = Field(default_factory=list)
+    entry_point: CodeSpecEntryPoint = Field(default_factory=CodeSpecEntryPoint)
+    protocol: str = ""
+    constraints: list[str] = Field(default_factory=list)
+
+
+# ── フローチャート生成 (flowchart_synthesis) ──
+
+class FlowchartSpec(_StrictModel):
+    """CodeSpec から導く mermaid フローチャート (config で任意 ON)。"""
+
+    mermaid: str = ""
+    notes: str = ""
+
+
 # ── 長文生成レビュー (long_form_*_review) ──
 
 class ReviewIssueItem(_StrictModel):
@@ -280,6 +353,8 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "critique_synthesis": CritiqueSynthesisResult,
     "long_form_code_review": ReviewIssues,
     "long_form_text_review": ReviewIssues,
+    "code_spec_synthesis": CodeSpec,
+    "flowchart_synthesis": FlowchartSpec,
     "tool_judgment": ToolJudgmentResult,
     "executable_command_synth": ExecutableCommandSynth,
     "meta_cognitive_plan": MetaCognitivePlan,

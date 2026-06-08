@@ -129,6 +129,7 @@ class DeliberativeAgent:
         tool_judge: ToolCallJudge | None = None,
         tools_registry=None,
         assist_client=None,
+        assist_experience_recorder=None,
     ):
         self.config = config or {}
         self.reminder_system = EventReminderSystem(self.config)
@@ -136,6 +137,9 @@ class DeliberativeAgent:
         self._tools_registry = tools_registry
         # ツール結果の query 連動抽出 (base の接地負荷軽減) に使う。None なら raw を渡す。
         self._assist_client = assist_client
+        # assist 由来ツール判定の実行成否を assist 経験へ記録する closure。
+        # Pro/Develop 起動時のみ非 None (factory 層が注入)。None なら記録 no-op。
+        self._assist_experience_recorder = assist_experience_recorder
 
         # コンテンツ生成用の max_tokens
         ctx_size = resolve_context_size(self.config, "base")
@@ -197,6 +201,20 @@ class DeliberativeAgent:
                 }
                 break
 
+    def _record_tool_call_outcome(
+        self, query: str, judgement: ToolJudgement, success: bool,
+    ) -> None:
+        """assist 由来ツール判定の実行成否を assist 経験へ記録する (best-effort)。
+
+        rule / learned / cartridge 由来は assist モデル出力ではないため記録しない
+        (assist=B が学ぶのは assist のツール判定のみ)。recorder 未注入
+        (Free / --no-learning) なら no-op。例外は recorder 側で握り潰される。
+        """
+        rec = self._assist_experience_recorder
+        if rec is None or judgement.source != "assist":
+            return
+        rec("tool_call", query, judgement.tool_name or "", 1.0 if success else 0.0)
+
     async def _judge_and_execute_tool(
         self,
         query: str,
@@ -235,6 +253,7 @@ class DeliberativeAgent:
         )
         if tool_result_text is None:
             # 実行されたが結果 None (失敗)。command は penalize 用に返す。
+            self._record_tool_call_outcome(query, judgement, False)
             return None, judgement.tool_name, command, False
 
         # ツール結果を assist で query 連動抽出し、base 文脈には digest を注入して
@@ -260,6 +279,7 @@ class DeliberativeAgent:
             judgement.tool_name, len(tool_result_text), judgement.source,
             success,
         )
+        self._record_tool_call_outcome(query, judgement, success)
         return tool_result_text, judgement.tool_name, command, success
 
     async def process(

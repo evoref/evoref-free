@@ -29,6 +29,7 @@ from backend.free.generation.models import (
     chars_to_tokens,
     extract_target_chars,
 )
+from backend.free.generation.spec_renderer import render_spec_for_prompt
 from backend.free.llm.json_schemas import CodePlan, TextPlan
 
 logger = logging.getLogger("backend.free.generation.strategy_common")
@@ -36,6 +37,7 @@ logger = logging.getLogger("backend.free.generation.strategy_common")
 if TYPE_CHECKING:
     from backend.free.generation.rolling_context import RollingContext
     from backend.free.llm.assist_client import AssistModelClient
+    from backend.free.llm.json_schemas import CodeSpec
 
 
 # ── 共通プロンプトテンプレート ──
@@ -111,6 +113,7 @@ def parse_plan(
     data: dict,
     content_type: ContentType,
     instruction: str = "",
+    code_spec: CodeSpec | None = None,
 ) -> GenerationPlan:
     """JSON 辞書から :class:`GenerationPlan` を構築する。
 
@@ -168,12 +171,14 @@ def parse_plan(
         global_context=data.get("global_context", ""),
         constraints=data.get("constraints", []),
         units=units,
+        code_spec=code_spec,
     )
 
 
 def fallback_plan(
     instruction: str,
     content_type: ContentType,
+    code_spec: CodeSpec | None = None,
 ) -> GenerationPlan:
     """JSON 解析失敗時の単一ユニット フォールバック計画を返す。"""
     target_length = extract_target_chars(instruction, default=1000)
@@ -201,6 +206,7 @@ def fallback_plan(
         global_context="",
         constraints=[],
         units=[unit],
+        code_spec=code_spec,
     )
 
 
@@ -230,10 +236,19 @@ def build_code_unit_messages(
 
     short_term = budget.fit_content("short_term", rolling.short_term)
 
-    system = budget.fit_content(
-        "system_prompt",
-        CODE_UNIT_SYSTEM.format(global_context=plan.global_context),
-    )
+    # 共有設計仕様 (契約) を全ユニットに注入する。これにより小ブロックが
+    # 同一のモジュール名・データモデルのフィールド/型・公開シグネチャ・
+    # エントリポイント・プロトコルに準拠し、ファイル横断の不整合を防ぐ。
+    system_text = CODE_UNIT_SYSTEM.format(global_context=plan.global_context)
+    spec_text = render_spec_for_prompt(plan.code_spec)
+    if spec_text:
+        system_text = (
+            f"{system_text}\n\n# 設計仕様 (契約 — 厳密準拠せよ)\n{spec_text}\n\n"
+            "上記のモジュール名・データモデルのフィールド名/型・公開シグネチャ・"
+            "エントリポイント・プロトコルを変更しない。存在しないモジュールから"
+            "import しない。"
+        )
+    system = budget.fit_content("system_prompt", system_text)
     user = CODE_UNIT_USER.format(
         file_path=unit.file_path,
         unit_names=unit_names,

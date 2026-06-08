@@ -543,6 +543,13 @@ class SleepTimeScheduler:
                     triggered = bool(ls.check_level2(
                         is_user_active=self.is_user_active(),
                         lora_path=self._lora_path,
+                        # 現在の base モデルファイル名でモデル隔離フィルタを有効化。
+                        # FeedbackCollector が刻む base_model (= 同じ GGUF ファイル名)
+                        # と一致するため、現モデルの経験のみが Level 2 に渡る。
+                        current_model=(
+                            self._base_model_path.name
+                            if self._base_model_path else ""
+                        ),
                         base_model_path=self._base_model_path,
                         assist_lora_path=self._assist_lora_path,
                         assist_model_path=self._assist_model_path,

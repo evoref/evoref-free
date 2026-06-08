@@ -20,26 +20,32 @@
 
 	type Props = {
 		component: ModelComponent;
-		newModelPath: string;
+		currentModel?: string;
+		/** migrate/rollback 成功後に config を再取得させるコールバック */
+		onMigrated?: () => void;
 	};
 
-	let { component, newModelPath }: Props = $props();
+	let { component, currentModel = '', onMigrated }: Props = $props();
 
+	// 新モデルパスは migrate ボタン専用の入力 (config の TextField とは独立)。
+	// これにより model_paths の追跡キーは config 直保存経路に乗らず desync しない。
+	let newPath = $state('');
 	let busy = $state(false);
 	let result = $state<ComponentMigrateResponse | null>(null);
 	let error = $state<string | null>(null);
 	let canRollback = $derived(result !== null && !result.dry_run);
 
 	async function apply() {
-		if (!newModelPath || busy) return;
+		if (!newPath || busy) return;
 		busy = true;
 		error = null;
 		result = null;
 		try {
 			result = await migrateComponent(component, {
-				new_model_path: newModelPath,
+				new_model_path: newPath,
 				auto_restart: true
 			});
+			onMigrated?.();
 		} catch (e) {
 			if (e instanceof ApiError) {
 				error = e.message;
@@ -67,6 +73,7 @@
 				restarted: false,
 				recommendations: [$t('settings.model_migrate.rollback_done')]
 			};
+			onMigrated?.();
 		} catch (e) {
 			if (e instanceof ApiError) {
 				error = e.message;
@@ -82,11 +89,21 @@
 </script>
 
 <div class="component-migrate">
+	<div class="current" data-testid="component-current">
+		{$t('settings.model_migrate.current_model', { model: currentModel || '—' })}
+	</div>
+	<input
+		type="text"
+		class="path-input"
+		placeholder={$t('settings.model_migrate.new_model_path')}
+		bind:value={newPath}
+		disabled={busy}
+	/>
 	<div class="actions">
 		<button
 			type="button"
 			class="apply-btn"
-			disabled={busy || !newModelPath}
+			disabled={busy || !newPath}
 			onclick={apply}
 		>
 			{busy ? $t('settings.model_migrate.applying') : $t('settings.model_migrate.apply')}
@@ -135,6 +152,18 @@
 		flex-direction: column;
 		gap: 0.5rem;
 		margin-top: 0.5rem;
+	}
+	.current {
+		font-size: 0.85rem;
+		color: var(--text-secondary, #555);
+	}
+	.path-input {
+		padding: 0.4rem 0.6rem;
+		border-radius: 4px;
+		border: 1px solid var(--border-color, #999);
+		background: var(--bg-primary, #fff);
+		color: var(--text-primary, #222);
+		font-size: 0.9rem;
 	}
 	.actions {
 		display: flex;

@@ -17,6 +17,12 @@ from backend.free.generation.code_repair import CodeRepairer, infer_language
 from backend.free.generation.import_wirer import wire_imports
 from backend.free.generation.code_skeleton import CodeSkeleton, update_skeleton
 from backend.free.generation.content_detector import detect_content_type
+from backend.free.generation.smoke_validator import (
+    check_integrity,
+    normalize_relative_imports,
+    run_import_smoke,
+)
+from backend.free.generation.spec_renderer import render_spec_markdown
 from backend.free.generation.models import (
     CodeUnit,
     ContentType,
@@ -283,6 +289,10 @@ class LongFormOrchestrator:
                 changed = True
             files[path] = repaired_group
         if multi_file:
+            # flat 配信では解決不能な相対 import (from .x import) を先に除去し、
+            # その後 wire_imports が兄弟定義から正しい絶対 import を再配線する。
+            # (今回の LINE アプリ失敗の主因 `from .models import` の決定的修正)
+            files = normalize_relative_imports(files)
             # 複数ファイルは相互 import が欠落するため AST ベースで補完する
             # (cross-file 配線 + stdlib 伝播)。実行時ロジックは対象外。
             files = wire_imports(files)
@@ -365,6 +375,89 @@ class LongFormOrchestrator:
                 "warning_count": warning_count,
             })
         return validation_errors, warning_count
+
+    def _run_integrity_and_smoke(
+        self,
+        rolling: RollingContext,
+        content_type: ContentType,
+        on_step,
+    ) -> None:
+        """整合ゲート (静的) + import スモークテスト (config 任意) を実行する。
+
+        検出した**実エラー** (相対 import 残存 / エントリポイント欠落 / cross-file
+        の ModuleNotFoundError / dataclass 引数違い等) を ``last_validation_errors``
+        に追加し、配信側が「壊れたコードを成功として渡さない」よう可視化する。
+        スモークテスト (サブプロセス) は ``long_form.code_smoke_test_enabled``
+        (コード既定 False / 配布 config 既定 True) で gate する。
+        """
+        if content_type != ContentType.CODE or not self.last_code_files:
+            return
+        if getattr(self, "_code_language", "python") != "python":
+            return
+
+        files = self.last_code_files
+        spec = rolling.plan.code_spec
+
+        issues = check_integrity(files, spec)
+
+        lf = self.config.get("long_form", {})
+        warnings: list[str] = []
+        if lf.get("code_smoke_test_enabled", False):
+            timeout = float(lf.get("code_smoke_timeout_sec", 10.0) or 10.0)
+            smoke = run_import_smoke(files, timeout_sec=timeout)
+            issues.extend(smoke.errors)
+            warnings = smoke.warnings
+
+        if issues:
+            self.last_validation_errors.extend(issues)
+        if on_step:
+            if issues:
+                detail = "; ".join(issues[:5])
+                status = "failed"
+            else:
+                detail = "OK" + (
+                    f" ({len(warnings)} warnings)" if warnings else ""
+                )
+                status = "done"
+            _call_step(on_step, {
+                "type": "long_form_integrity",
+                "detail": detail,
+                "status": status,
+            })
+        if self._debug_logger:
+            self._debug_logger.log_long_form_event({
+                "phase": "integrity",
+                "errors": issues,
+                "warnings": warnings,
+            })
+
+    def _attach_spec_artifact(
+        self,
+        rolling: RollingContext,
+        content_type: ContentType,
+        on_step,
+    ) -> None:
+        """設計仕様を ``SPEC.md`` として ``last_code_files`` に添付する (CODE のみ)。
+
+        ``rolling.plan.code_spec`` が無い (合成失敗 / 無効化) / コードが空の場合は
+        何もしない。flowchart (Phase 2) があれば mermaid を埋め込む。
+        """
+        if content_type != ContentType.CODE:
+            return
+        spec = rolling.plan.code_spec
+        if spec is None or not self.last_code_files:
+            return
+        flowchart = getattr(rolling.plan, "code_flowchart", "") or ""
+        markdown = render_spec_markdown(spec, flowchart_mermaid=flowchart)
+        if not markdown.strip():
+            return
+        self.last_code_files["SPEC.md"] = markdown
+        if on_step:
+            _call_step(on_step, {
+                "type": "long_form_spec",
+                "detail": "SPEC.md (設計仕様) を生成しました",
+                "status": "done",
+            })
 
     def _record_final_metrics(
         self,
@@ -580,6 +673,13 @@ class LongFormOrchestrator:
         validation_errors, _warning_count = self._validate_generated_code(
             rolling, content_type, on_step,
         )
+
+        # 9.5 整合ゲート (相対 import 残存 / エントリポイント) + import スモーク
+        # テスト (config 任意)。AST 検証が見逃す実行時 import エラー等を捕捉する。
+        self._run_integrity_and_smoke(rolling, content_type, on_step)
+
+        # 9.6 設計仕様を SPEC.md 成果物として添付 (CODE のみ)。
+        self._attach_spec_artifact(rolling, content_type, on_step)
 
         # 10. メトリクス確定
         elapsed = time.monotonic() - t_start

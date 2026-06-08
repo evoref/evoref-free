@@ -17,7 +17,6 @@ from urllib.parse import urlparse
 
 from backend.free.llm.utils import extract_content
 from backend.log_config import get_logger
-from backend.utils import utc_compact_stamp
 
 if TYPE_CHECKING:
     from backend.free.history.history_manager import HistoryManager
@@ -105,17 +104,19 @@ def verify_syntax(file_path: str) -> str:
 def write_file(file_path: str, content: str) -> str:
     """ファイルに書き込む
 
-    ``file_path`` が既存ディレクトリを指している場合は配下に
-    ``output_<UTC>.txt`` を自動付与して書き込む。エージェント
-    (deliberative / long_form) がディレクトリ末尾でパスを切り出した場合の
-    "directory, not a file" 失敗を回避するための一般化対応。
+    ``file_path`` が既存ディレクトリを指している場合はエラーを返す。
+    以前は配下に ``output_<UTC>.txt`` を自動付与していたが、read/verify 指示が
+    ツール判定で write と誤認された際に、配下へ生成内容を捏造投棄する原因と
+    なっていたため廃止した。長文生成経路は書込み前に
+    ``_resolve_long_form_target_path`` でディレクトリ→ファイル名を解決済みのため
+    影響しない。ディレクトリ配下の点検は list_directory / read_file を使う。
     """
     p = Path(file_path)
     if p.is_dir():
-        auto_name = f"output_{utc_compact_stamp()}.txt"
-        p = p / auto_name
-        file_path = str(p)
-        logger.info("write_file: directory target detected; auto-naming → %s", file_path)
+        return (
+            f"Error: '{file_path}' is a directory, not a file. "
+            "Provide a file path, or use list_directory/read_file to inspect it."
+        )
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")

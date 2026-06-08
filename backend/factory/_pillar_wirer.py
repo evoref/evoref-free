@@ -461,12 +461,48 @@ def _init_learning_core(
     if state.cartridge_manager is not None:
         state.cartridge_manager.set_learned_patterns(learned_patterns_store)
 
+    # 経験に現在ロード中のモデル名 (GGUF ファイル名) を刻む。Level 2 base=C の
+    # build_contrastive_pairs は current_model でこの base_model を一致フィルタする
+    # ため、空のままだと母集団が seed のみに縮退する (cvector が学習信号を失う)。
+    _model_paths = cfg.get("model_paths", {})
+    _base_model_name = Path(_model_paths.get("base_model", "")).name
+    _embed_model_name = Path(_model_paths.get("embed_model", "")).name
     fc = FeedbackCollector(
         exp_buf, debug_logger=debug_logger,
         learned_patterns=learned_patterns_store,
         disabled=state.learning_disabled,
+        base_model_name=_base_model_name,
+        embedding_model_name=_embed_model_name,
     )
     state.feedback_collector = fc
+
+    # assist 経験記録 closure: assist 由来の RAG 必要性 / RAG 品質 / ツール判定の
+    # outcome を Pro の assist 経験バッファへ best-effort で記録する (Level 2
+    # assist=B / assist bootstrap の学習信号)。Free / --no-learning / Pro 未配置は
+    # no-op。Pro 型を import せず buffer.record() をポリモーフィックに呼ぶことで
+    # pillar 境界 (Free→Pro 禁止) を侵さない。buffer は call 時に遅延参照する
+    # (Pro learn pillar の構築順に依存しない)。例外は握り潰し、記録失敗が
+    # チャット応答パスを壊さないようにする。
+    def _record_assist_experience(
+        action_type: str, input_context: str, output: str, outcome: float,
+    ) -> None:
+        if state.learning_disabled:
+            return
+        pro = state.pro
+        learn = pro.learn if pro is not None else None
+        buf = getattr(learn, "assist_experience_buffer", None) if learn else None
+        if buf is None:
+            return
+        try:
+            cart_ids = (
+                list(state.cartridge_manager.loaded)
+                if state.cartridge_manager is not None else []
+            )
+            buf.record(action_type, input_context[:2000], output, outcome, cart_ids)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("assist experience record skipped: %s", e)
+
+    state.assist_experience_recorder = _record_assist_experience
 
     # 7b. プロンプトマネージャ（§6.6.4: モード別システムプロンプト）
     prompt_dir = resolver.resolve_local("prompts_dir")
@@ -1419,6 +1455,53 @@ def _validate_model_state(
         logger.debug("model_state.json validation skipped: %s", e)
 
 
+def _validate_component_model_state(
+    cfg: dict[str, Any], resolver: Any, state: Any = None,
+) -> None:
+    """9b. component (assist/embed/reranker) の model_state 検証
+
+    base は `_validate_model_state` が担当。本関数は component の
+    config↔model_state 不一致を ERROR ログ + `AppState.component_state_mismatches`
+    に surface する (現状 component は無検証で desync しても黙るため)。
+    component は migrate ボタン経由なら同期されるが、config 直書きや手動編集で
+    desync しうる。`model_migration.strict_startup_check` が true なら起動をブロック。
+    """
+    try:
+        from backend.free.core.model_migration import (
+            ModelState,
+            detect_mismatches,
+        )
+
+        ms = ModelState(resolver.resolve_local("model_state_file"))
+        if not ms.current_filename:
+            ms.initialize_from_config(cfg)
+
+        mismatches = detect_mismatches(ms, cfg)
+        component_mm = {k: v for k, v in mismatches.items() if k != "base_model"}
+        if not component_mm:
+            return
+
+        for cfg_key, mm in component_mm.items():
+            logger.error(
+                "Component model mismatch: %s model_state.json=%s, config.yaml=%s. "
+                "Run the component migrate (POST /api/model/<component>/migrate) or "
+                "revert config.yaml model_paths.%s to '%s'.",
+                cfg_key, mm["model_state"], mm["config"], cfg_key, mm["model_state"],
+            )
+        if state is not None:
+            state.component_state_mismatches = component_mm
+
+        if bool(cfg.get("model_migration", {}).get("strict_startup_check", False)):
+            raise RuntimeError(
+                "Startup blocked by model_migration.strict_startup_check: "
+                f"component model mismatch {sorted(component_mm)}",
+            )
+    except RuntimeError:
+        raise
+    except Exception as e:
+        logger.debug("component model_state validation skipped: %s", e)
+
+
 def _auto_migrate_base_model(
     cfg: dict[str, Any],
     resolver: Any,
@@ -2083,6 +2166,7 @@ def _finalize_base(
         _init_theme_manager(state, cfg, resolver)
     with _timed(timings, "model_state"):
         _validate_model_state(cfg, resolver, state)
+        _validate_component_model_state(cfg, resolver, state)
     with _timed(timings, "edition_check"):
         _check_edition_downgrade(resolver)
 

@@ -103,11 +103,7 @@
 				onrollback={handleRollback}
 			/>
 			<components.PerformanceChart scores={improvementScores} />
-			<components.RAGStats
-				chunkCount={ragStats.chunkCount}
-				vectorCount={ragStats.vectorCount}
-				indexSizeMb={ragStats.indexSizeMb}
-			/>
+			<components.RAGStats stats={ragStats} />
 		</div>
 	{:else if isPro}
 		<div class="loading">{$t('common.loading')}</div>

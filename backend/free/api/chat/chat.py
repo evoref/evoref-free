@@ -564,6 +564,7 @@ async def _dispatch_deliberative(
         tool_judge=state.tool_call_judge,
         tools_registry=state.tools_registry,
         assist_client=state.assist_client,
+        assist_experience_recorder=state.assist_experience_recorder,
     )
 
     if req.stream:
