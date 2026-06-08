@@ -59,6 +59,33 @@ def _is_pro() -> bool:
     return current_edition() >= Edition.PRO
 
 
+def _guard_model_paths_immutable(data: dict) -> None:
+    """model_paths の model_state 追跡キー変更を 403 で遮断する。
+
+    base/assist/embed/reranker のモデルは migrate API 経由でしか変更できない。
+    config を直書きすると model_state.json と desync し起動時 mismatch を招くため、
+    現在値と異なる追跡キーが含まれていれば 403 を返す。coding_model 等の非追跡
+    キーは通常通り編集可能 (現在値と一致する追跡キーが同梱されていても許可)。
+    """
+    from backend.free.core.model_migration import MODEL_STATE_TRACKED_KEYS
+
+    current = get_config().get("model_paths", {}) or {}
+    changed = sorted(
+        k
+        for k in MODEL_STATE_TRACKED_KEYS
+        if k in data and str(data[k] or "") != str(current.get(k, "") or "")
+    )
+    if changed:
+        raise api_error(
+            403,
+            "E0403",
+            f"model_paths keys are migrate-only: {', '.join(changed)}. "
+            f"Use POST /api/model/migrate or /api/model/{{component}}/migrate.",
+            "api.config_model_paths_immutable",
+            keys=", ".join(changed),
+        )
+
+
 # ── 固定パスのエンドポイント（{section} より先に定義） ──
 
 
@@ -115,6 +142,10 @@ async def apply_preset(
         )
 
     preset = CONFIG_PRESETS[preset_id]
+
+    # preset が model_paths の追跡キーを変えるなら migrate 専用ポリシーで遮断
+    if "model_paths" in preset:
+        _guard_model_paths_immutable(preset["model_paths"])
 
     # 保存前の現状から変更対象セクションと再起動対象を算出
     changed_sections, restart_servers = compute_changed(get_config(), preset_id)
@@ -214,6 +245,10 @@ async def update_config_section(
             403, "E0403", f"Section '{section}' requires Pro edition",
             "api.config_pro_only", section=section,
         )
+
+    # model_paths の model_state 追跡キーは migrate 専用 (config 直書きを遮断)
+    if section == "model_paths":
+        _guard_model_paths_immutable(req.data)
 
     # api_key マスク値の場合は既存値を保持
     data = dict(req.data)

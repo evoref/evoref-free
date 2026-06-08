@@ -112,10 +112,23 @@ export interface DashboardRagStats {
 	chunkCount: number;
 	vectorCount: number;
 	indexSizeMb: number;
+	/** 取り込み元ドキュメント（distinct source）数 */
+	sourceCount: number;
+	/** チャンク分割戦略（semantic 等） */
+	chunkingStrategy: string;
+	/** BM25 + ベクトルのハイブリッド検索が有効か */
+	hybridSearch: boolean;
+	/** スコア融合手法（rrf 等） */
+	fusionMethod: string;
 	/** 埋め込み次元と保存済みストアの次元が不一致 */
 	embeddingDimMismatch: boolean;
 	embeddingDimStored: number | null;
 	embeddingDimCurrent: number;
+	/** 運用情報（store_info 由来。バックエンド未提供時は null） */
+	createdAt: string | null;
+	lastReindexAt: string | null;
+	embeddingModel: string | null;
+	embeddingBackend: string | null;
 }
 
 /** 改善カーブのポイント */

@@ -322,7 +322,8 @@ class LlamaCppReranker(BaseHTTPClient):
             logger.debug("Reranker health check: status=%d, healthy=%s", resp.status_code, healthy)
             return healthy
         except (httpx.ConnectError, httpx.TimeoutException) as e:
-            logger.warning("Reranker health check failed: %s", e)
+            # %r で型名を残す: TimeoutException 等は __str__ が空になり得る。
+            logger.warning("Reranker health check failed: %r", e)
             return False
 
     async def selftest(self) -> bool:

@@ -27,6 +27,8 @@ import numpy as np
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from backend.debug_logger import DebugLogger
     from backend.free.rag.assist_judge_tracker import AssistJudgeUsageTracker
 
@@ -344,6 +346,7 @@ class RetrievalNecessityJudge:
         tracker: "AssistJudgeUsageTracker | None" = None,
         debug_logger: "DebugLogger | None" = None,
         config: dict | None = None,
+        record_assist: "Callable[[str, str, str, float], None] | None" = None,
     ) -> str:
         """ルール判定 + uncertain 時のアシスト救済 (3 値返却).
 
@@ -486,6 +489,10 @@ class RetrievalNecessityJudge:
                 context={"action": action},
                 scope="request",
             )
+        # assist が有効判定を返したケースのみ assist 経験に記録 (outcome=1.0)。
+        # tracker_skipped / timeout / 例外 / 不正応答の fallback 経路では呼ばない。
+        if record_assist is not None:
+            record_assist("rag_necessity", query, action, 1.0)
         return action
 
 
@@ -589,6 +596,7 @@ class RetrievalQualityJudge:
         results: list[tuple[str, float, str]],
         assist_client,
         rule_based_quality: str,
+        record_assist: "Callable[[str, str, str, float], None] | None" = None,
     ) -> str:
         """アシストモデルで閾値境界の品質を再判定する。
 
@@ -658,6 +666,11 @@ class RetrievalQualityJudge:
                     },
                     scope="request",
                 )
+            # assist が有効 quality を返したケースのみ記録。
+            # outcome は high/medium/low を 1.0/0.5/0.0 にマップ。fallback は記録しない。
+            if record_assist is not None:
+                _q_outcome = {"high": 1.0, "medium": 0.5, "low": 0.0}.get(quality, 0.5)
+                record_assist("rag_quality", query, quality, _q_outcome)
             return quality
 
         except Exception as e:

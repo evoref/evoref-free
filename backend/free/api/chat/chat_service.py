@@ -105,6 +105,10 @@ async def prepare_memory_context(
             # 張り付くのを防ぐ。
             if state.assist_judge_tracker is not None:
                 state.assist_judge_tracker.reset_session(old_session_id)
+            # 旧会話の経験に conversation_ended を反映 (Level 2 base=C positive 抽出用)。
+            # disabled 時は FeedbackCollector 内ガードで no-op。
+            if state.feedback_collector is not None:
+                state.feedback_collector.mark_conversation_ended()
 
         wm.add_turn(
             "user",
@@ -259,6 +263,7 @@ async def run_search_pipeline(
             assist_judge_tracker=state.assist_judge_tracker,
             necessity_prompt=necessity_prompt,
             quality_prompt=quality_prompt,
+            assist_experience_recorder=state.assist_experience_recorder,
         )
         if not search_result.skipped and search_result.sources:
             rag_chunks = [content for _, _, content in search_result.sources]

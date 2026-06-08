@@ -132,6 +132,7 @@ async def get_rag_stats(state: AppState = Depends(get_app_state)):
     index_size_mb = 0.0
     sources_map: dict[str, dict] = {}
     stored_dim: int | None = None
+    store_info: dict = {}
 
     if store is not None:
         total_chunks = store.count
@@ -139,6 +140,7 @@ async def get_rag_stats(state: AppState = Depends(get_app_state)):
         stored_dim = store.stored_dim()
         index_size_mb = compute_index_size_mb(store.index_path)
         sources_map = aggregate_sources(store.metadata)
+        store_info = store.store_info
 
     embedder_dim = (
         state.embedder.dim() if state.embedder is not None
@@ -156,6 +158,10 @@ async def get_rag_stats(state: AppState = Depends(get_app_state)):
         chunking_strategy=rag_cfg.get("chunking_strategy", "semantic"),
         hybrid_search=rag_cfg.get("hybrid_search", True),
         fusion_method=rag_cfg.get("fusion_method", "rrf"),
+        created_at=store_info.get("created_at"),
+        last_reindex_at=store_info.get("last_reindex_at"),
+        embedding_model=store_info.get("embedding_model"),
+        embedding_backend=store_info.get("embedding_backend"),
         sources=[RagSourceInfo(**s) for s in sources_map.values()],
     )
 

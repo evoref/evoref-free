@@ -1066,6 +1066,10 @@ long_form:
   rag_per_unit: true                # ユニットごとにRAG検索を実行
   rag_top_k_per_unit: 3             # ユニットごとのRAG上位件数
   total_timeout_sec: 1800           # 1リクエストの総時間上限(秒)。0=無効。超過時は生成済みユニットで部分結果打ち切り
+  code_spec_enabled: true           # コード生成前に共有設計仕様(contract)を合成し全ユニットに注入 + SPEC.md 出力
+  code_flowchart_enabled: false     # 設計仕様から mermaid フローチャートを合成し SPEC.md に埋込(既定OFF)
+  code_smoke_test_enabled: true     # 生成物の import スモークテスト(ModuleNotFoundError/dataclass引数違い等の実行時エラー捕捉)
+  code_smoke_timeout_sec: 10        # import スモークテストのサブプロセスタイムアウト(秒)
 
 # ──────────────────────────────────────────────────────────────────────
 # Pro 専用機能

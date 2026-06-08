@@ -9,7 +9,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from backend.free.llm.json_schemas import CodeSpec
 
 
 # ── ユーティリティ ──
@@ -104,3 +107,10 @@ class GenerationPlan:
     global_context: str
     constraints: list[str]
     units: list[CodeUnit | SectionPlan] = field(default_factory=list)
+    # コード生成の事前準備で合成した共有設計仕様 (contract)。CODE 経路でのみ
+    # 設定され、各ユニットのプロンプトに注入 + SPEC.md として出力する。
+    # 合成失敗 / TEXT 経路では None (従来挙動)。
+    code_spec: CodeSpec | None = None
+    # 任意の mermaid フローチャート (config code_flowchart_enabled=True 時のみ)。
+    # SPEC.md に埋め込む。既定 OFF のため通常は空文字列。
+    code_flowchart: str = ""

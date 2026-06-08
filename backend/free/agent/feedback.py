@@ -50,11 +50,20 @@ class FeedbackCollector:
         debug_logger: DebugLogger | None = None,
         learned_patterns: LearnedPatternStore | None = None,
         disabled: bool = False,
+        base_model_name: str = "",
+        embedding_model_name: str = "",
     ) -> None:
         self.buffer = experience_buffer
         self._debug_logger = debug_logger
         self._learned_patterns = learned_patterns
         self._prev_query: str | None = None
+        # 現在ロード中のモデル名 (GGUF ファイル名)。record() の base_model /
+        # embedding_model が明示指定されないとき既定値として埋める。
+        self._base_model_name = base_model_name
+        self._embedding_model_name = embedding_model_name
+        # 現会話セッションで record した entry の参照。会話終了時に
+        # mark_conversation_ended() がまとめて conversation_ended=True にする。
+        self._session_entries: list[ExperienceEntry] = []
         # 自己学習無効化フラグ (--no-learning 経由)。True の場合 record() は
         # シグナル検出も ExperienceBuffer 書込も行わずダミーの ExperienceEntry を返す
         self._disabled = disabled
@@ -102,8 +111,8 @@ class FeedbackCollector:
                 mode=mode,
                 query=query,
                 response_summary=response[:200],
-                base_model=base_model,
-                embedding_model=embedding_model,
+                base_model=base_model or self._base_model_name,
+                embedding_model=embedding_model or self._embedding_model_name,
                 cartridge_ids=cartridge_ids or [],
                 signals=FeedbackSignals(),
             )
@@ -139,8 +148,8 @@ class FeedbackCollector:
             mode=mode,
             query=query,
             response_summary=response[:200],
-            base_model=base_model,
-            embedding_model=embedding_model,
+            base_model=base_model or self._base_model_name,
+            embedding_model=embedding_model or self._embedding_model_name,
             cartridge_ids=cartridge_ids or [],
             signals=signals,
         )
@@ -163,6 +172,7 @@ class FeedbackCollector:
             self._learn_long_form_from_signal(query)
 
         self.buffer.record(entry)
+        self._session_entries.append(entry)
         self._prev_query = query
 
         logger.info(
@@ -187,11 +197,20 @@ class FeedbackCollector:
         return entry
 
     def mark_conversation_ended(self) -> None:
-        """直近のエントリに conversation_ended フラグを設定"""
+        """現会話セッションで record した全エントリに conversation_ended を設定
+
+        record() は会話途中の各応答ごとに新規 entry を作るため、会話終了時に
+        当該セッションの全 entry へまとめて反映する (approach a)。マーク後は
+        セッション参照と直前クエリをリセットし、次会話を新セッション扱いにする。
+        buffer ローテーションで切り捨てられた entry も参照経由で安全 (生存 entry のみ
+        buffer に効き、切捨て済みは GC 対象)。
+        """
         if self._disabled:
             return
-        if self.buffer.entries:
-            self.buffer.entries[-1].signals.conversation_ended = True
+        for entry in self._session_entries:
+            entry.signals.conversation_ended = True
+        self._session_entries.clear()
+        self._prev_query = None
 
     def _detect_rephrase(self, query: str) -> bool:
         """直前の質問との類似度で言い換えを検出（簡易版: 文字重複率）"""

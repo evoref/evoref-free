@@ -184,6 +184,10 @@ class RagStatsResponse(BaseModel):
     chunking_strategy: str
     hybrid_search: bool
     fusion_method: str
+    created_at: str | None = None
+    last_reindex_at: str | None = None
+    embedding_model: str | None = None
+    embedding_backend: str | None = None
     sources: list[RagSourceInfo] = Field(default_factory=list)
 
 

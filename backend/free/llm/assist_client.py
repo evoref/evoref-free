@@ -89,6 +89,11 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     "long_form_planning": "background",
     "long_form_code_review": "background",
     "long_form_text_review": "background",
+    # コード生成の事前準備: 共有設計仕様 (contract) 合成とフローチャート生成。
+    # コード生成完了前のプラン段階で発火する重い JSON 合成のため long_form_*
+    # と同列の background スロット。
+    "code_spec_synthesis": "background",
+    "flowchart_synthesis": "background",
     # コードリペア (長文生成末尾の検証ゲート付き修正)。生成完了後に発火する
     # 重い修正パスで long_form_* と同列。background スロット。
     "code_repair": "background",
@@ -130,14 +135,19 @@ _DEFAULT_PRIORITY: Priority = "background"
 #   - note_evolution (20s)    : A-MEM note 進化の軽量要約
 #   - conflict_resolution (15s): 短文マージ判定
 #   - retrieval_quality_judge: 既定 ``timeout`` をそのまま使う (短時間で済む)
-#   - tool_judgment (8s): チャット応答パスで同期発火。アシスト接続時は
-#     モード非依存で常時有効化されるため呼出頻度が上がる。realtime セマフォを
-#     長く専有しないよう短く打ち切る。
+#   - tool_judgment (12s): チャット応答パスで同期発火。アシスト接続時は
+#     モード非依存で常時有効化されるため呼出頻度が上がる。base との GPU 競合で
+#     8s では空振りしやすいため 12s に緩める (失敗時はルールベースに fallback)。
 PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "contextual_prefix": 60.0,
     "long_form_planning": 90.0,
     "long_form_code_review": 90.0,
     "long_form_text_review": 90.0,
+    # 設計仕様合成は modules/data_models/interfaces 等を含む大きめ JSON を
+    # 返すため long_form_planning と同等の 90s。フローチャートは mermaid 文字列
+    # 1 本のため 45s。
+    "code_spec_synthesis": 90.0,
+    "flowchart_synthesis": 45.0,
     # コードリペアは assembled 全体を再出力するため long_form_* と同等に確保。
     "code_repair": 90.0,
     "conflict_resolution": 15.0,
@@ -155,12 +165,14 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "retrieval_chunk_gate": 5.0,
     # executable query 判定 + コマンド合成。チャット応答パスで
     # tool_call_judge から発火する。is_executable: bool + command: str の
-    # 短い JSON を返すだけのため、低レイテンシで打ち切る。
-    "executable_command_synth": 8.0,
+    # 短い JSON を返すだけだが、base モデルとの GPU 競合で 8s では空振り
+    # しやすいため 12s に緩める。失敗時は regex フォールバックが正しさを担保。
+    "executable_command_synth": 12.0,
     # ツール呼出判定 ({"tool": ..., "args": {...}} の小さな JSON)。チャット
     # 応答パスで Deliberative / MetaCognitive から同期発火し、アシスト接続時は
-    # 常時有効。realtime セマフォを長く占有しないよう短く打ち切る。
-    "tool_judgment": 8.0,
+    # 常時有効。base モデルとの GPU 競合で 8s では空振りしやすいため 12s に
+    # 緩める。失敗時はルールベース判定にフォールバックする。
+    "tool_judgment": 12.0,
     # meta-cognitive 計画 (タスク分解) は coding mode の
     # 応答パスで発火するため、長すぎるとユーザ体感を阻害する。30s で打ち切り。
     "meta_cognitive_plan": 30.0,
@@ -212,6 +224,10 @@ PURPOSE_REASONING_BUDGET_DEFAULTS: dict[str, int] = {
     "long_form_planning": 2048,
     "long_form_code_review": 2048,
     "long_form_text_review": 2048,
+    # 設計仕様合成は API/データモデル/依存の設計探索のため広めに確保。
+    # フローチャートは構造抽出が主で中程度。
+    "code_spec_synthesis": 2048,
+    "flowchart_synthesis": 512,
     # コードリペアは検出エラーを明示して渡す機械的修正。thinking 不要で即終了。
     "code_repair": 0,
     "contextual_prefix": 256,

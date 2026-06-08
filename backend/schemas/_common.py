@@ -324,6 +324,15 @@ class LongFormConfig(BaseModel):
     max_repair_rounds: int = Field(default=2, ge=0)
     rag_per_unit: bool = True
     rag_top_k_per_unit: int = Field(default=3, ge=1)
+    # コード生成の事前準備: 設計仕様 (contract) 合成。各ユニットへ注入 +
+    # SPEC.md として出力し、ファイル横断の整合性を担保する。
+    code_spec_enabled: bool = True
+    # 設計仕様から mermaid フローチャートを合成し SPEC.md に埋め込む (既定 OFF)。
+    code_flowchart_enabled: bool = False
+    # 生成物の import スモークテスト (temp dir でサブプロセス import 検証)。
+    # ModuleNotFoundError / dataclass 引数違い等の実行時エラーを捕捉する。
+    code_smoke_test_enabled: bool = True
+    code_smoke_timeout_sec: float = Field(default=10.0, ge=1.0)
     # 長文生成 1 リクエストの総ウォールクロック上限 (秒)。0 で無効化。
     # 低速ローカル GPU では正当な生成が 10-20 分かかるため既定は余裕を持たせる。
     # 超過時は生成済みユニットで打ち切り、部分結果を返す (無限ハング防止)。

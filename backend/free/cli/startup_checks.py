@@ -432,10 +432,9 @@ def _check_model_state_consistency(
         )
 
     try:
-        import json
-        with open(state_path, encoding="utf-8") as f:
-            data = json.load(f)
-        current_filename = (data.get("current") or {}).get("filename", "")
+        from backend.free.core.model_migration import ModelState, detect_mismatches
+        ms = ModelState(state_path)
+        mismatches = detect_mismatches(ms, config)
     except Exception as e:
         logger.warning("Failed to read model_state.json: %s", e)
         return CheckResult(
@@ -445,10 +444,7 @@ def _check_model_state_consistency(
             message=msg("cli.startup_model_state_read_failed", detail=str(e)),
         )
 
-    config_base_model = config.get("model_paths", {}).get("base_model", "")
-    config_filename = Path(config_base_model).name if config_base_model else ""
-
-    if not (current_filename and config_filename):
+    if not mismatches:
         return CheckResult(
             level=CheckLevel.INFO,
             status=CheckStatus.OK,
@@ -456,10 +452,13 @@ def _check_model_state_consistency(
             message=msg("cli.startup_model_state_ok"),
         )
 
-    if current_filename != config_filename:
+    # base mismatch を優先表示 (ユーザが起動時に見る主エラー)
+    base_mm = mismatches.get("base_model")
+    if base_mm:
+        config_base_model = config.get("model_paths", {}).get("base_model", "")
         logger.error(
             "Model mismatch: model_state.json=%s vs config.yaml=%s",
-            current_filename, config_filename,
+            base_mm["model_state"], base_mm["config"],
         )
         return CheckResult(
             level=CheckLevel.WARNING,
@@ -467,17 +466,20 @@ def _check_model_state_consistency(
             name="model_state",
             message=msg(
                 "cli.startup_model_state_mismatch",
-                current=current_filename,
-                config=config_filename,
+                current=base_mm["model_state"],
+                config=base_mm["config"],
                 new_model=config_base_model,
             ),
         )
 
+    # component (assist/embed/reranker) のみの不一致
+    keys = ", ".join(sorted(mismatches))
+    logger.error("Component model mismatch: %s", keys)
     return CheckResult(
-        level=CheckLevel.INFO,
-        status=CheckStatus.OK,
+        level=CheckLevel.WARNING,
+        status=CheckStatus.WARN,
         name="model_state",
-        message=msg("cli.startup_model_state_ok"),
+        message=msg("cli.startup_component_model_state_mismatch", keys=keys),
     )
 
 

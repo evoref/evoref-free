@@ -39,6 +39,11 @@ async def register(req: SessionRegisterRequest, state: AppState = Depends(get_ap
 async def unregister(session_id: str, state: AppState = Depends(get_app_state)):
     """セッションを登録解除"""
     logger.debug("DELETE /api/sessions/%s", session_id)
+    # セッション終了 = 会話終了。経験に conversation_ended を反映 (Level 2 base=C
+    # positive 抽出用)。CLI/フロントの session 解除で確実に発火させる。disabled 時は
+    # FeedbackCollector 内ガードで no-op。
+    if state.feedback_collector is not None:
+        state.feedback_collector.mark_conversation_ended()
     ok = state.unregister_session(session_id)
     if not ok:
         logger.debug("Session not found for unregister: %s", session_id)

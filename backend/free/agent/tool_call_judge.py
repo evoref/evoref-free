@@ -130,6 +130,11 @@ _DRIVE_LETTER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# クエリ先頭の URL を抽出する。非 ASCII (CJK 等) を除外し、「URL + 日本語」
+# 入力で末尾テキストを URL に取り込まないようにする
+# (例: https://news.yahoo.co.jp/で取得して... → https://news.yahoo.co.jp/ のみ)。
+_URL_IN_QUERY_RE = re.compile(r"(https?://[^\s\]）」』\u0080-\U0010ffff]+)")
+
 
 def _build_spec_command(query: str) -> str:
     """システムスペックコマンドを生成する
@@ -479,7 +484,7 @@ class ToolCallJudge:
             # クエリに URL が明示的に含まれる場合は tool_judge_enabled に
             # 関係なく fetch_url を返す。ユーザが URL を書く = 「これを読んで」
             # の強い意図表明であり、LLM 判断を仰がず決定論的に拾う
-            url_match = re.search(r'(https?://[^\s\]）」』]+)', query)
+            url_match = _URL_IN_QUERY_RE.search(query)
             if url_match and tools_registry.has("fetch_url"):
                 logger.debug(
                     "Chat mode explicit URL detected: %s", query[:50],
@@ -567,7 +572,7 @@ class ToolCallJudge:
                     return assist_result
             except Exception as e:
                 logger.warning(
-                    "Assist model tool judgement failed: %s", e,
+                    "Assist model tool judgement failed: %r", e,
                 )
 
         # 5. executable command フォールバック (環境依存事実クエリの救済)
@@ -841,6 +846,14 @@ class ToolCallJudge:
                         )
 
             if url and effective_score >= min_avg:
+                # 非 ASCII を含む URL は壊れている可能性が高い (旧 URL 抽出 regex が
+                # 末尾の日本語を取り込んだ残骸など)。fetch で 404 になるため引き当てない。
+                if not str(url).isascii():
+                    logger.warning(
+                        "URL recall: skipping non-ASCII (likely malformed) url=%s",
+                        url,
+                    )
+                    continue
                 return str(url)
             # sim は満たしたが score_avg/TTL で落ちたケースを記録 (最初の 1 件のみ)
             if best_subject == fact.subject and best_reason == "sim_below_min":
@@ -1122,7 +1135,7 @@ class ToolCallJudge:
             )
         except Exception as e:  # noqa: BLE001
             logger.warning(
-                "executable_command_synth assist call failed: %s", e,
+                "executable_command_synth assist call failed: %r", e,
             )
             return None
         content = (
@@ -1341,7 +1354,7 @@ class ToolCallJudge:
 
         # URL フェッチパターン（他のパターンより優先）
         # URL を含むクエリは fetch_url で処理する（run_command + curl に落ちるのを防止）
-        url_match = re.search(r'(https?://[^\s\]）」』]+)', query)
+        url_match = _URL_IN_QUERY_RE.search(query)
         if url_match and tools_registry.has("fetch_url"):
             return "fetch_url", {"url": url_match.group(1)}
         if re.search(
@@ -1364,20 +1377,31 @@ class ToolCallJudge:
                 return "verify_syntax", {"file_path": path}
 
         # ファイル読込みパターン
-        # 「確認」「見せて」「内容」等は実質的にファイル読み取りを必要とする
+        # 「確認」「チェック」「見せて」「内容」等は実質的にファイル読み取りを必要とする。
+        # カタカナ「チェック」は日本語で頻出するため明示的に含める (ASCII "check" だけ
+        # ではカタカナ表記を取りこぼし、後続の write パターンへ誤って落ちる)。
         if re.search(
-            r"(?:読[みむ]込|読んで|開いて|見せて|見て|確認|正し[いく]|合って|内容|中身"
+            r"(?:読[みむ]込|読んで|開いて|見せて|見て|確認|チェック|確かめ"
+            r"|正し[いく]|合って|内容|中身"
             r"|read|show|check|verify|correct|content|view)",
             q,
         ):
             path = _extract_file_path(query)
-            if path and tools_registry.has("read_file"):
-                return "read_file", {"file_path": path}
+            if path:
+                # ディレクトリ指定 (配下のファイルを点検する文脈) は read_file だと
+                # "Not a file" になるため list_directory に振り分ける。
+                if Path(path).is_dir() and tools_registry.has("list_directory"):
+                    return "list_directory", {"directory": path}
+                if tools_registry.has("read_file"):
+                    return "read_file", {"file_path": path}
 
         # ファイル書き込み/出力パターン
+        # ディレクトリを書込み先に取ると write_file が配下に output_<UTC>.txt を
+        # 捏造する (記述的な「出力」誤マッチで read 指示がここへ落ちるケースを含む)。
+        # ディレクトリは書込み対象から除外する。
         if re.search(r"(?:書[きく]込|書いて|出力|保存|生成|作成|write|save|output)", q):
             path = _extract_file_path(query)
-            if path and tools_registry.has("write_file"):
+            if path and not Path(path).is_dir() and tools_registry.has("write_file"):
                 return "write_file", {"file_path": path}
 
         # コマンド実行パターン
