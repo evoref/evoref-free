@@ -71,6 +71,40 @@ def persist_facts(
     return written
 
 
+def _drop_facts_with_existing_subject(
+    store: "SemanticFactStore",
+    result: "ExtractionResult",
+) -> int:
+    """既に同一 subject の active fact が存在する候補を ``result`` から除外する。
+
+    ``MDPTraceExtractor`` は決定的な subject
+    (``mem.decision.<episode_id>`` / ``loop.failure.<signature>``) でファクトを
+    生成する。プロセス再起動で抽出器の in-memory ``_processed_episode_ids`` が
+    失われると同一エピソードが再抽出されるが、ここで既存 subject を弾くことで
+    新しい ``fact_id`` での重複追記を防ぐ (store が dedup の永続状態を兼ねる)。
+    ``chat`` / ``coding`` 抽出器は同一 subject の再アサートで内容を更新する設計の
+    ため、この dedup は MDP 経路にのみ適用する。
+
+    Returns:
+        除外した件数。
+    """
+    if not result.facts:
+        return 0
+    kept = []
+    dropped = 0
+    for fact in result.facts:
+        if store.search_by_subject(fact.subject, include_superseded=False):
+            dropped += 1
+            continue
+        kept.append(fact)
+    if dropped:
+        result.facts = kept
+        logger.debug(
+            "Step 8 [mdp_trace]: skipped %d duplicate-subject facts", dropped,
+        )
+    return dropped
+
+
 def extract_semantic_facts(
     notes: list["MemoryNote"],
     *,
@@ -173,6 +207,7 @@ def extract_semantic_facts(
             else:
                 mdp_trace_extractor = MDPTraceExtractor()
         mdp_result = mdp_trace_extractor.extract(notes, ctx)
+        _drop_facts_with_existing_subject(project_store, mdp_result)
         total_extracted += persist_facts(
             project_store, mdp_result, "mdp_trace",
         )
