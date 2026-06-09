@@ -70,6 +70,25 @@ def _is_failure_outcome(outcome: str) -> bool:
     return any(k in s for k in _FAILURE_KEYWORDS)
 
 
+def _episode_task_and_result(steps: list[dict[str, Any]]) -> tuple[str, str]:
+    """エピソードの最終ステップから ``state.task`` と ``observation`` を取り出す。
+
+    agent_tracer (meta_cognitive.py) は step に ``state.task`` (ユーザー要求) と
+    ``observation`` (生成結果サマリ) を記録する。``action`` は tool 呼び出し名で、
+    単発生成では ``"none"`` になる。decision/failure ファクトの object は ``action``
+    だけでは無内容になるため、task/observation を併用して意味のある要約にする。
+    """
+    if not steps:
+        return "", ""
+    last = steps[-1]
+    state = last.get("state")
+    task = ""
+    if isinstance(state, dict):
+        task = str(state.get("task") or "")
+    observation = str(last.get("observation") or "")
+    return task, observation
+
+
 def compute_failure_signature(
     *,
     error_type: str,
@@ -199,6 +218,7 @@ class MDPTraceExtractor(BaseExtractor):
             outcome = str(end.get("outcome") or "")
             steps = ep["steps"]
             last_actions = [str(s.get("action") or "") for s in steps[-3:]]
+            task_desc, last_observation = _episode_task_and_result(steps)
             if _is_failure_outcome(outcome):
                 fact = self._build_failure_fact(
                     episode_id=episode_id,
@@ -213,6 +233,8 @@ class MDPTraceExtractor(BaseExtractor):
                     episode_id=episode_id,
                     outcome=outcome,
                     last_actions=last_actions,
+                    task_desc=task_desc,
+                    observation=last_observation,
                     scope=scope,
                     ctx=ctx,
                 )
@@ -287,13 +309,22 @@ class MDPTraceExtractor(BaseExtractor):
         last_actions: list[str],
         scope: str,
         ctx: ExtractionContext,
+        task_desc: str = "",
+        observation: str = "",
     ) -> SemanticFact:
         # episode_id は ep_xxx 形式なので ``mem.<kind>.<parts>`` の parts 要件を満たす
         subject = f"{MEM_DECISION_PREFIX}{episode_id}"
-        object_text = self.truncate(
-            f"outcome={outcome}; last_actions={'/'.join(last_actions)}",
-            self.MAX_OBJECT_LEN,
-        )
+        # object は task (要求) / result (生成結果) を主とし、意味のある action のみ併記。
+        # action は単発生成で "none" になるため、それ単体だと無内容になる。
+        parts = [f"outcome={outcome}"]
+        if task_desc:
+            parts.append(f"task={task_desc}")
+        if observation:
+            parts.append(f"result={observation}")
+        meaningful_actions = [a for a in last_actions if a and a != "none"]
+        if meaningful_actions:
+            parts.append(f"actions={'/'.join(meaningful_actions)}")
+        object_text = self.truncate("; ".join(parts), self.MAX_OBJECT_LEN)
         return self.make_fact(
             subject=subject,
             predicate="resolved",
