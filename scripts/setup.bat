@@ -169,7 +169,6 @@ if defined SHARED_PATH (
     echo   1. Base model      - Qwen3.5-9B ^(chat/coding, ~2.6GB^)
     echo   2. Assist model    - Qwen3.5-4B ^(memory/RAG processing, ~1.4GB^)
     echo   3. Embedding model - Qwen3-Embedding-0.6B ^(vector search^)
-    echo   4. Reranker model  - Qwen3-Reranker-0.6B ^(search re-ranking^)
     echo.
 
     set /p "DL_BASE=Download base model (Qwen3.5-9B)? [Y/n]: "
@@ -191,13 +190,6 @@ if defined SHARED_PATH (
         python scripts\download_model.py --embed !FORCE_FLAG!
     ) else (
         echo   Skipped embedding model
-    )
-
-    set /p "DL_RERANKER=Download reranker model (Qwen3-Reranker-0.6B)? [Y/n]: "
-    if /i not "!DL_RERANKER!"=="n" (
-        python scripts\download_model.py --reranker !FORCE_FLAG!
-    ) else (
-        echo   Skipped reranker model
     )
     echo   Done
 )

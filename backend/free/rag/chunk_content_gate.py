@@ -1,7 +1,7 @@
 """取得直後の chunk 内容精査ゲート (heuristics-first + 境界 assist)
 
 ``unified_search`` の Step 4 マージ直後に走り、低価値 chunk を pruning して
-quality judge / query expansion / reranker forward pass の候補数を縮小する。
+quality judge / query expansion の候補数を縮小する。
 coding mode を主対象とし、安価なヒューリスティック (relevance floor /
 近似重複除去 / コードシグナル) で大半を裁き、判断に迷う marginal band の
 prose チャンクだけアシストモデルで 1 回だけ関連性を判定する

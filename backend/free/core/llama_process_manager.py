@@ -1,6 +1,6 @@
 """llama-server プロセスマネージャ
 
-base / assist / embedding / reranker の 4 種 llama-server プロセスを
+base / assist / embedding の 3 種 llama-server プロセスを
 単一のレジストリで管理する。`migrate_component` API がモデル切替成功後に
 `restart()` を呼び出し、無停止 (ユーザーが手動シェル操作不要) でモデルを
 切り替える。
@@ -30,8 +30,8 @@ from backend.log_config import get_logger
 logger = get_logger("core.llama_process_manager")
 
 
-# 4 種のコンポーネント名 (assist/embedding/reranker は L1 と一致)
-PROCESS_COMPONENTS: tuple[str, ...] = ("base", "assist", "embedding", "reranker")
+# 3 種のコンポーネント名 (assist/embedding は L1 と一致)
+PROCESS_COMPONENTS: tuple[str, ...] = ("base", "assist", "embedding")
 
 
 class ProcessManagerError(Exception):
@@ -64,9 +64,6 @@ def _resolve_endpoint(component: str, cfg: dict) -> tuple[str, int]:
             emb.get("llama_host", "127.0.0.1"),
             int(emb.get("llama_port", 8082)),
         )
-    if component == "reranker":
-        rer = cfg.get("reranker", {}) or {}
-        return rer.get("host", "127.0.0.1"), int(rer.get("port", 8083))
     raise ProcessManagerError(f"Unknown component: {component}")
 
 
@@ -92,8 +89,6 @@ def _build_cmd(component: str, cfg: dict, project_root: Path) -> list[str] | Non
         return mod.build_assist_cmd(cfg, project_root)
     if component == "embedding":
         return mod.build_embed_cmd(cfg, project_root)
-    if component == "reranker":
-        return mod.build_reranker_cmd(cfg, project_root)
     raise ProcessManagerError(f"Unknown component: {component}")
 
 

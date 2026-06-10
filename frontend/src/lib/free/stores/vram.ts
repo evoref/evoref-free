@@ -1,8 +1,8 @@
 /**
  * VRAM 使用量ストア
  *
- * ``GET /api/system/vram_status`` を定期ポーリングして 4 モデル
- * (base / assist / embed / reranker) の推定値 + 実測値を保持する。
+ * ``GET /api/system/vram_status`` を定期ポーリングして 3 モデル
+ * (base / assist / embed) の推定値 + 実測値を保持する。
  *
  * ポーリング間隔はサーバ負荷を考慮して 10 秒既定 (issue の非スコープに
  * 明示記載: "WebSocket push 更新は不要。polling で 5 秒間隔程度で十分。

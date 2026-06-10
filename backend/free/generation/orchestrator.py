@@ -719,7 +719,7 @@ class LongFormOrchestrator:
         # RAG コンテキスト。
         # 優先: search pipeline 取得済みの scored_chunks (prefetched_rag)。
         # long_form 経路は retriever を注入しないため二重取得を避け、上流で
-        # reranker / 品質判定 / content gate を通った結果をそのまま再利用する。
+        # 品質判定 / content gate を通った結果をそのまま再利用する。
         # 従来の retriever 経路は retriever 注入時 (ユニットテスト等) のみ温存。
         if prefetched_rag:
             context["rag"] = self._format_prefetched_rag(prefetched_rag)
@@ -748,7 +748,7 @@ class LongFormOrchestrator:
         """search pipeline 取得済み scored_chunks を plan コンテキスト文字列へ整形。
 
         ``scored_chunks`` は ``(chunk_id, score, text)`` (search pipeline 形式)。
-        入力順 (salience / reranker 順) を維持し上位 ``RAG_MAX_CHUNKS`` 件を
+        入力順 (salience 順) を維持し上位 ``RAG_MAX_CHUNKS`` 件を
         各 ``RAG_CHUNK_CHAR_CAP`` 字に丸め、全体 ``RAG_TOTAL_TOKEN_BUDGET``
         トークンに収まる範囲だけ採用する (plan プロンプト肥大の防止)。
         """

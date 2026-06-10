@@ -341,6 +341,28 @@ class EditorFilenameResult(_StrictModel):
     file_name: str = ""
 
 
+# ── pending 競合のチャット回答判定 (conflict_chat_judge) ──
+
+class ChatConflictJudgement(_StrictModel):
+    """`backend/free/memory/pipeline/conflict_review.py` のチャット回答判定。
+
+    SemMem の pending 競合をチャットでユーザーに確認した後、直近の
+    ユーザー発話が「どの競合への、どの解決指示か」を分類する。
+
+    - ``is_answer``: 発話が競合への回答なら True。雑談・無関係・曖昧なら False
+    - ``group_index``: 注入ブロックの ``[C1]`` 採番に対応 (1 始まり)。
+      非該当時は 0
+    - ``action``: ``keep_old`` (古い方を残す) / ``keep_new`` (新しい方を残す) /
+      ``merge`` (両立・統合) / ``none`` (判定不能)
+    - ``merged_object``: ``action="merge"`` のときの統合後の値
+    """
+
+    is_answer: bool = False
+    group_index: int = 0
+    action: Literal["keep_old", "keep_new", "merge", "none"] = "none"
+    merged_object: str = ""
+
+
 # ── purpose -> schema 自動解決マップ ──
 #
 # 呼出側が ``response_schema`` を明示しない場合、AssistClient が purpose
@@ -361,6 +383,7 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "cartridge_eval_generation": CartridgeEvalQAList,
     "url_relevance_score": UrlRelevanceJudgement,
     "editor_filename": EditorFilenameResult,
+    "conflict_chat_judge": ChatConflictJudgement,
 }
 
 
@@ -510,6 +533,7 @@ __all__ = [
     "CartridgeEvalQAList",
     "UrlRelevanceJudgement",
     "EditorFilenameResult",
+    "ChatConflictJudgement",
     "PURPOSE_SCHEMAS",
     "make_response_format",
     "resolve_response_format_for_purpose",

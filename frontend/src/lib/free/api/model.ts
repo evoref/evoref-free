@@ -2,7 +2,7 @@
  * Model migration API client
  *
  * - base モデル切替 (migrate / rollback / reload / process restart)
- * - assist / embedding / reranker のコンポーネント切替・ロールバック
+ * - assist / embedding のコンポーネント切替・ロールバック
  */
 
 import { request } from './_client';
@@ -83,7 +83,7 @@ export async function restartBaseProcess(): Promise<ProcessRestartResponse> {
 	return request<ProcessRestartResponse>('POST', '/model/process/base/restart', {});
 }
 
-export type ModelComponent = 'assist' | 'embedding' | 'reranker';
+export type ModelComponent = 'assist' | 'embedding';
 
 export interface ComponentMigrateRequest {
 	new_model_path: string;

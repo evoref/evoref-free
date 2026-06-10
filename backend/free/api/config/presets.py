@@ -4,8 +4,8 @@
 (軽量 / バランス / 高性能) に一括調整するためのプリセット定義とヘルパ。
 
 調整対象は VRAM/RAM 消費に直結する llama-server 起動引数
-(slots / context_size / KV キャッシュ量子化 / cache-ram) と reranker の
-有効化のみ。メモリ/学習の挙動には触れない。すべて config.yaml に既存の
+(slots / context_size / KV キャッシュ量子化 / cache-ram) のみ。
+メモリ/学習の挙動には触れない。すべて config.yaml に既存の
 キーで、スキーマ変更・新規キー追加は伴わない。
 
 `balanced` は現行 config.yaml.example の出荷既定値と一致させた安全ベースライン。
@@ -28,7 +28,6 @@ CONFIG_PRESETS: dict[str, dict[str, dict]] = {
         },
         "assist_model": {"local": {"context_size": 4096}},
         "embedding": {"max_length": 4096, "context_size": 4096},
-        "reranker": {"enabled": False},
     },
     "balanced": {
         "llama": {
@@ -40,7 +39,6 @@ CONFIG_PRESETS: dict[str, dict[str, dict]] = {
         },
         "assist_model": {"local": {"context_size": 8192}},
         "embedding": {"max_length": 8192, "context_size": 8192},
-        "reranker": {"enabled": False},
     },
     "performance": {
         "llama": {
@@ -52,12 +50,10 @@ CONFIG_PRESETS: dict[str, dict[str, dict]] = {
         },
         "assist_model": {"local": {"context_size": 8192}},
         "embedding": {"max_length": 8192, "context_size": 8192},
-        "reranker": {"enabled": True},
     },
 }
 
 # 起動引数を変更するセクション -> 再起動が必要な llama-server 名。
-# reranker は enabled 切替で component_reload が自動 起動/停止するため除外。
 _RESTART_SERVER_BY_SECTION: dict[str, str] = {
     "llama": "base",
     "assist_model": "assist",

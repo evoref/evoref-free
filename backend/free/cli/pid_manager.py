@@ -365,10 +365,4 @@ def collect_configured_ports(config: dict) -> list[int]:
     if embed_cfg.get("backend") == "llama-cpp" and embed_cfg.get("llama_port"):
         ports.append(embed_cfg["llama_port"])
 
-    # リランカー
-    reranker_cfg = config.get("reranker", {})
-    if reranker_cfg.get("enabled") and reranker_cfg.get("backend") == "llama-cpp":
-        if reranker_cfg.get("port"):
-            ports.append(reranker_cfg["port"])
-
     return ports

@@ -70,7 +70,7 @@ class LlamaConfig(BaseModel):
     # ``"auto"`` 指定時は scripts/launch_llama.py の resolve 関数が
     # GPU 物理容量 + GGUF layer 数 + Vulkan host buffer headroom から
     # 段階的に縮小した値 (100% / 80% / 60% / 40% / 0%) を算出する。
-    # iGPU 環境で base/assist の GPU メモリ占有を抑え、embed/reranker の
+    # iGPU 環境で base/assist の GPU メモリ占有を抑え、embed の
     # Vulkan host buffer 確保失敗 (ErrorOutOfDeviceMemory) を回避する用途。
     gpu_layers: int | Literal["auto"] = Field(default=999)
 

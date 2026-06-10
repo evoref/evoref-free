@@ -536,7 +536,9 @@ class CartridgeManager:
         chunker = SemanticChunker(
             chunk_size=self.rag_config.get("chunk_size", 512),
             chunk_overlap=self.rag_config.get("chunk_overlap", 128),
-            max_chunk=self.rag_config.get("max_chunk", 512),
+            min_chunk=self.rag_config.get("semantic_min_chunk", 64),
+            max_chunk=self.rag_config.get("semantic_max_chunk", 512),
+            strategy=self.rag_config.get("chunking_strategy", "semantic"),
         )
 
         # 事前にループ対象を確定 (進捗 total を確定するため)
@@ -697,7 +699,7 @@ class CartridgeManager:
 
         ラウンドロビンにより各カートリッジが少なくとも 1 件は結果に含まれる
         ことが保証される。最終件数は ``top_k * n_loaded`` を上限とし、上流の
-        reranker / salience ranker / `_ensure_cartridge_fairness` で最終的な
+        salience ranker / `_ensure_cartridge_fairness` で最終的な
         絞り込みを行う。
         """
         if not self._loaded:

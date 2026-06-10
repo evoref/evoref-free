@@ -1,6 +1,6 @@
 """LLM クライアントの HTTP プラミング共通化
 
-`LocalClient` / `AssistModelClient` / `LlamaCppEmbedder` / `LlamaCppReranker`
+`LocalClient` / `AssistModelClient` / `LlamaCppEmbedder`
 は llama-server への HTTP 呼び出しという共通の責務を持ち、以下のロジックが
 重複していた:
 
@@ -52,7 +52,7 @@ from backend.trace_context import get_trace_id
 logger = get_logger("llm._base_client")
 
 
-# 共通リトライ定数 (LocalClient / AssistModelClient / Embedder / Reranker で同一値)。
+# 共通リトライ定数 (LocalClient / AssistModelClient / Embedder で同一値)。
 # ``stop_after_attempt(MAX_ATTEMPTS)`` で全試行回数 (初回含む) を制御する。
 # 旧実装の ``MAX_RETRIES=3`` (= 4 試行) から ``MAX_ATTEMPTS=3`` (= 3 試行) に変更し、
 # worst case のバックオフ待機 (0.5 + 1.0 + 2.0 = 3.5s + jitter) を抑える。
@@ -286,8 +286,7 @@ async def wait_for_server_ready(
 
     本ヘルパは例外を raise せず常に bool を返す。タイムアウト時は WARNING
     を 1 行出力するのみで、後続の ``health_check`` / ``fetch_model_metadata``
-    の失敗パスがそのまま既存の degraded mode (``None`` 返却 / LazyReranker
-    フォールバック) を担う。
+    の失敗パスがそのまま既存の degraded mode (``None`` 返却) を担う。
 
     Args:
         health_url: ``http://host:port/health`` 形式のヘルスチェック URL

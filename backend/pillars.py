@@ -46,7 +46,6 @@ if TYPE_CHECKING:
     from backend.free.memory.stores.working import WorkingMemory
     from backend.free.rag.cartridge_manager import CartridgeManager
     from backend.free.rag.embedding_backend import EmbeddingBackend
-    from backend.free.rag.reranker_backend import RerankerBackend
     from backend.free.rag.retriever import HybridRetriever
     from backend.free.rag.vector_store import VectorStore
     from backend.pro.assist_components import ProAssistComponents
@@ -61,7 +60,6 @@ class GenPillar:
         llm_client: LocalClient を束ねたファサード (chat_in_flight / is_serving_user を提供)。
         assist_client: アシストモデル LLM クライアント。未設定時は ``None``。
         embedder: 埋め込みバックエンド (llama-cpp server 経由)。未初期化時は ``None``。
-        reranker: リランカー (llama-cpp / NullReranker)。未初期化時は ``None``。
         hybrid_retriever: BM25 + Vector ハイブリッド検索器 (ベンチマーク専用)。
     """
 
@@ -69,7 +67,6 @@ class GenPillar:
     llm_client: "LLMClient | None" = None
     assist_client: "AssistModelClient | None" = None
     embedder: "EmbeddingBackend | None" = None
-    reranker: "RerankerBackend | None" = None
     hybrid_retriever: "HybridRetriever | None" = None
 
 

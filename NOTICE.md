@@ -69,20 +69,6 @@ Hugging Face から `models/` 配下にダウンロードします。モデル�
 
 ---
 
-## bge-reranker-v2-m3 (リランカーモデル — 既定)
-
-- **提供元**: BAAI (Beijing Academy of Artificial Intelligence)
-- **リポジトリ**: https://huggingface.co/BAAI/bge-reranker-v2-m3
-- **ライセンス**: Apache License 2.0
-- **用途**: RAG パイプラインにおける Cross-encoder リランキング (`reranker.enabled: false` で無効化可能)。
-
-### Attribution / 帰属表示
-
-> bge-reranker-v2-m3 is developed and provided by [BAAI](https://huggingface.co/BAAI) (Beijing Academy of Artificial Intelligence).
-> Licensed under [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
-
----
-
 ## 過去に使用していたモデル (現在は不使用)
 
 ### BGE-M3

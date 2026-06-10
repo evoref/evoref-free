@@ -290,7 +290,7 @@ class RetrievalNecessityJudge:
         # 例: "C:\path\spec.txt を参照してテトリスを Python で作成"
         # ユーザが提示したファイルを文脈とする新規生成タスクで、
         # local KB (SemMem / 履歴) には引き当てるべき情報がない。
-        # この時点で RAG 全工程 (assist 判定 + embedding + LTM + rerank) を
+        # この時点で RAG 全工程 (assist 判定 + embedding + LTM) を
         # 早期 skip して 10 秒以上のレイテンシを排除する。
         if FILE_PATH_PATTERN.search(query_stripped) and \
                 CODE_DOC_GEN_INTENT_PATTERNS.search(query_stripped):

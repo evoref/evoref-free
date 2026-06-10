@@ -1,6 +1,6 @@
 """サーバー管理 API: llama-server プロセスの起動・停止
 
-フロントエンドからベース/アシスト/埋め込み/リランカーの
+フロントエンドからベース/アシスト/埋め込みの
 llama-server プロセスを個別に起動・停止できるようにする。
 """
 
@@ -28,7 +28,7 @@ router = APIRouter(prefix="/api/servers", tags=["server-control"])
 # プロセス管理コンテナ（モジュールレベルシングルトン）
 # ────────────────────────────────────────────
 
-ServerName = Literal["base", "assist", "embed", "reranker"]
+ServerName = Literal["base", "assist", "embed"]
 
 
 @dataclass
@@ -105,7 +105,6 @@ def _build_cmd(
         build_llama_cmd,
         build_assist_cmd,
         build_embed_cmd,
-        build_reranker_cmd,
     )
 
     if name == "base":
@@ -131,15 +130,6 @@ def _build_cmd(
         embed_cfg = cfg.get("embedding", {})
         host = embed_cfg.get("llama_host", "127.0.0.1")
         port = embed_cfg.get("llama_port", 8082)
-        return (cmd, host, port)
-
-    if name == "reranker":
-        cmd = build_reranker_cmd(cfg, project_root)
-        if cmd is None:
-            return None
-        reranker_cfg = cfg.get("reranker", {})
-        host = reranker_cfg.get("host", "127.0.0.1")
-        port = reranker_cfg.get("port", 8083)
         return (cmd, host, port)
 
     return None
@@ -244,7 +234,7 @@ def _resolve_endpoint(name: ServerName, cfg: dict) -> tuple[str, int] | None:
 
     `_build_cmd` と違い `enabled` / モデルパス有無のゲートに依存しない。
     「無効化と同時にプロセスを停止する」経路では config が既に
-    `enabled=false` になっており、`build_reranker_cmd` 等が ``None`` を返して
+    `enabled=false` になっており、cmd ビルダーが ``None`` を返して
     停止対象ポートを失う。停止に cmd は不要でポートだけ要るためこちらを使う。
     """
     if name == "base":
@@ -256,9 +246,6 @@ def _resolve_endpoint(name: ServerName, cfg: dict) -> tuple[str, int] | None:
     if name == "embed":
         emb = cfg.get("embedding", {}) or {}
         return emb.get("llama_host", "127.0.0.1"), int(emb.get("llama_port", 8082))
-    if name == "reranker":
-        rer = cfg.get("reranker", {}) or {}
-        return rer.get("host", "127.0.0.1"), int(rer.get("port", 8083))
     return None
 
 
@@ -270,7 +257,7 @@ def _stop_external_server(name: ServerName, cfg: dict) -> tuple[bool, str]:
     UI の停止ボタンが効くようフォールバックさせる。
 
     ポートは `_resolve_endpoint` で config から直接引く。`_build_cmd` 経由だと
-    reranker.enabled=false 等で cmd が ``None`` になりポートを失い、無効化と同時の
+    enabled=false 等で cmd が ``None`` になりポートを失い、無効化と同時の
     停止が機能しなくなる。
 
     Returns:
@@ -498,12 +485,6 @@ async def stop_server(
                     await state.embedder.aclose()
                 except Exception as e:
                     logger.warning("server_control: failed to close embedder client: %s", e)
-        elif name == "reranker":
-            if state.reranker is not None and hasattr(state.reranker, "aclose"):
-                try:
-                    await state.reranker.aclose()
-                except Exception as e:
-                    logger.warning("server_control: failed to close reranker client: %s", e)
 
     return ServerActionResponse(
         name=name,
@@ -520,7 +501,7 @@ async def _try_reconnect(
 ) -> None:
     """サーバー起動後にバックエンドのクライアントを再接続
 
-    base/assist だけでなく embed/reranker も再構築する。再構築しないと
+    base/assist だけでなく embed も再構築する。再構築しないと
     httpx.AsyncClient の kept-alive が前世代の死んだサーバの socket を
     保持したままになり、起動直後の health_check / embed 呼び出しが
     フライング失敗する。
@@ -543,10 +524,3 @@ async def _try_reconnect(
             await reload_embedder(state)
         except Exception as e:
             logger.warning("server_control: embed reload after start failed: %s", e)
-
-    elif name == "reranker":
-        from backend.free.api.config.component_reload import reload_reranker
-        try:
-            await reload_reranker(state)
-        except Exception as e:
-            logger.warning("server_control: reranker reload after start failed: %s", e)

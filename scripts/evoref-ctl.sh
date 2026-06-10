@@ -18,7 +18,7 @@ start_all() {
     activate_venv
     setup_utf8
 
-    echo "[start] Starting llama-server (base + embedding + reranker)..."
+    echo "[start] Starting llama-server (base + assist + embedding)..."
     python scripts/launch_llama.py config.yaml --all &
     PIDS+=($!)
     sleep 3
@@ -39,7 +39,6 @@ start_all() {
     echo "  API:      http://localhost:8000"
     echo "  llama:    http://localhost:8080 (base)"
     echo "  embed:    http://localhost:8082 (embedding, if llama-cpp)"
-    echo "  rerank:   http://localhost:8083 (reranker, if enabled)"
     echo ""
     echo "Press Ctrl+C to stop all services"
 

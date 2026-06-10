@@ -22,7 +22,7 @@ import { layout } from './theme';
 const BASE_TAB_SECTIONS: Readonly<Record<string, readonly string[]>> = {
 	general: ['instance', 'server', 'theme', 'i18n'],
 	inference: ['llama'],
-	model: ['model_paths', 'assist_model', 'embedding', 'reranker'],
+	model: ['model_paths', 'assist_model', 'embedding'],
 	rag: ['rag'],
 	memory: ['memory'],
 	learning: ['learning', 'agent'],
@@ -294,7 +294,6 @@ const SERVER_AFFECTING_SECTIONS = new Set([
 	'model_paths',
 	'assist_model',
 	'embedding',
-	'reranker',
 	'llama'
 ]);
 

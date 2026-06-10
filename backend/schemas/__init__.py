@@ -13,7 +13,7 @@
   I18n / Debug / LongForm / Modes / Editor / ProcessManager / Terminal /
   Pro / ModelMigration)
 - ``llm.py``    : ``LlamaConfig`` / ``LlamaSpeculativeConfig``
-- ``rag.py``    : RAG / Embedding / Reranker / Self-RAG / Cartridge 系
+- ``rag.py``    : RAG / Embedding / Self-RAG / Cartridge 系
 - ``memory.py`` : EvorefMem 関連 + ``VALID_FACT_TYPES``
 - ``learning.py``: 学習サイクル + ``ScheduleConfig``
 - ``loop.py``   : 自律ループ driver
@@ -86,8 +86,6 @@ from backend.schemas.rag import (
     ContextualPrefixConfig,
     EmbeddingConfig,
     RAGConfig,
-    RerankerConfig,
-    RerankerSkipConfig,
     SelfRagAssistJudgeConfig,
     SelfRagConfig,
 )
@@ -136,8 +134,6 @@ __all__ = [
     "ProConfig",
     "ProcessManagerConfig",
     "RAGConfig",
-    "RerankerConfig",
-    "RerankerSkipConfig",
     "RuntimeConfig",
     "ScheduleConfig",
     "SelfRagAssistJudgeConfig",

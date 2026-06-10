@@ -46,7 +46,6 @@ if TYPE_CHECKING:
     from backend.free.memory.scheduler import SleepTimeScheduler
     from backend.free.memory.stores.short_term import ShortTermMemory
     from backend.free.rag.embedding_backend import EmbeddingBackend
-    from backend.free.rag.reranker_backend import RerankerBackend
     from backend.free.rag.retriever import HybridRetriever
     from backend.free.rag.vector_store import VectorStore
     from backend.pillars import GenPillar, LearnPillar, LoopPillar, MemPillar
@@ -535,37 +534,26 @@ def _init_learning_core(
     )
 
 
-async def _init_embedding_reranker(
+async def _init_embedding(
     state: AppState,
     cfg: dict[str, Any],
     project_root: Path,
     debug_logger: "DebugLogger",
-) -> tuple["EmbeddingBackend | None", "RerankerBackend | None"]:
-    """7d. EmbeddingBackend + RerankerBackend ファクトリ生成"""
+) -> "EmbeddingBackend | None":
+    """7d. EmbeddingBackend ファクトリ生成"""
     embedder = None
-    reranker = None
     try:
         from backend.free.rag.embedding_factory import create_embedding_backend
-        from backend.free.rag.reranker_factory import create_reranker_backend_async
 
         embedder = create_embedding_backend(cfg, project_root, debug_logger=debug_logger)
-        reranker = await create_reranker_backend_async(cfg, debug_logger=debug_logger)
         state.embedder = embedder
-        state.reranker = reranker
         logger.info(
             "EmbeddingBackend initialized: backend=%s, model=%s",
             embedder.backend_type(), embedder.model_name(),
         )
-        from backend.free.rag.reranker_factory import LazyReranker
-        if reranker.is_active:
-            logger.info("Reranker: enabled (llama-cpp)")
-        elif isinstance(reranker, LazyReranker):
-            logger.info("Reranker: pending (LazyReranker, will retry)")
-        else:
-            logger.info("Reranker: disabled (NullReranker)")
     except Exception as e:
         logger.warning("EmbeddingBackend init skipped: %s", e)
-    return embedder, reranker
+    return embedder
 
 
 async def _check_embedding_dim(state: AppState, cfg: dict[str, Any]) -> None:
@@ -619,7 +607,6 @@ async def _check_embedding_dim(state: AppState, cfg: dict[str, Any]) -> None:
 def _build_hybrid_retriever(
     vs: "VectorStore | None",
     embedder: "EmbeddingBackend | None",
-    reranker: "RerankerBackend | None",
     debug_logger: "DebugLogger",
     policy_interpreter: "PolicyInterpreter",
     cfg: dict[str, Any] | None = None,
@@ -663,7 +650,6 @@ def _build_hybrid_retriever(
             vector_store=vs,
             bm25_retriever=bm25,
             embedder=embedder,
-            reranker=reranker,
             fusion_method=str(rag_cfg.get("fusion_method", "rrf")),
             rrf_k=int(rag_cfg.get("rrf_k", 60)),
             bm25_weight=float(rag_cfg.get("bm25_weight", 0.3)),
@@ -1458,7 +1444,7 @@ def _validate_model_state(
 def _validate_component_model_state(
     cfg: dict[str, Any], resolver: Any, state: Any = None,
 ) -> None:
-    """9b. component (assist/embed/reranker) の model_state 検証
+    """9b. component (assist/embed) の model_state 検証
 
     base は `_validate_model_state` が担当。本関数は component の
     config↔model_state 不一致を ERROR ログ + `AppState.component_state_mismatches`
@@ -1670,7 +1656,7 @@ def _log_gpu_cpu_placement(cfg: dict[str, Any], project_root: Path) -> None:
                 logger.warning(
                     "  total estimated VRAM %d MB exceeds runtime.total_vram_budget_mb "
                     "(%d MB). Run `python scripts/launch_llama.py --all` to re-check, "
-                    "or set embedding.gpu_layers / reranker.gpu_layers to 0 (CPU fallback).",
+                    "or set embedding.gpu_layers to 0 (CPU fallback).",
                     total_vram_mb, int(budget_mb),
                 )
             else:
@@ -1736,10 +1722,10 @@ async def _build_gen_pillar(
     project_root: Path,
     timings: dict[str, float],
 ) -> tuple["GenPillar", ProShutdownHook, DevelopShutdownHook]:
-    """EvorefGen pillar の core 部分 (LLM / 埋め込み / リランカー) を構築する。
+    """EvorefGen pillar の core 部分 (LLM / 埋め込み) を構築する。
 
     並列 I/O (llama_server / pro_gen_pillar / develop_gen_pillar / assist_model /
-    embedding_reranker) で TaskGroup 内でまとめて初期化し、LLMClient ファサードを
+    embedding) で TaskGroup 内でまとめて初期化し、LLMClient ファサードを
     組み立てる。Pro エディション起動時は ``setup_pro_gen`` が ``state.pro.gen`` を、
     Develop エディション起動時は ``setup_develop_gen`` が ``state.develop.gen`` を
     設定する (Develop はスケルトン段階で通常 no-op)。
@@ -1779,15 +1765,15 @@ async def _build_gen_pillar(
         )
         t_embed = tg.create_task(
             _timed_task(
-                timings, "embedding_reranker",
-                _init_embedding_reranker(state, cfg, project_root, debug_logger),
+                timings, "embedding",
+                _init_embedding(state, cfg, project_root, debug_logger),
             ),
         )
     client = t_llama.result()
     pro_shutdown = t_pro_gen.result()
     develop_shutdown = t_develop_gen.result()
     assist_client = t_assist.result()
-    embedder, reranker = t_embed.result()
+    embedder = t_embed.result()
 
     with _timed(timings, "llm_client"):
         _init_llm_client(state, client)
@@ -1798,7 +1784,6 @@ async def _build_gen_pillar(
         llm_client=state.llm_client,
         assist_client=assist_client,
         embedder=embedder,
-        reranker=reranker,
     )
     return gen, pro_shutdown, develop_shutdown
 
@@ -1892,7 +1877,7 @@ def _build_gen_pillar_retrieval(
 
     with _timed(timings, "hybrid_retriever"):
         hybrid_retriever = _build_hybrid_retriever(
-            mem.vector_store, gen.embedder, gen.reranker,
+            mem.vector_store, gen.embedder,
             debug_logger, policy_interpreter, cfg,
         )
         gen.hybrid_retriever = hybrid_retriever

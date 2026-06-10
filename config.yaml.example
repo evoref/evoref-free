@@ -55,7 +55,7 @@ runtime:
 
   # llama-server エンドポイント利用ポリシー宣言
   # "oai-only" (既定) で OpenAI 互換 (/v1/chat/completions / /v1/embeddings /
-  # /v1/rerank / /tokenize / /health / /props) のみ採用、
+  # /tokenize / /health / /props) のみ採用、
   # "messages-allowed" は将来 /v1/messages 採用判断を行った場合の予約値。
   # 実体の検証は backend/free/tests/test_llama_endpoint_policy.py の静的検査
   # で担保する。詳細 docs/e_05_llama_server_endpoint_policy.md。
@@ -69,8 +69,8 @@ runtime:
 
   # llama.gpu_layers / assist_model.local.gpu_layers が "auto" の場合に
   # GPU 物理容量から差し引く Vulkan host buffer 予約量 (MiB)。
-  # iGPU 環境で embed/reranker (CPU モード) が起動時に確保する pinned buffer 用
-  # の余裕。既定 4 GiB は AMD Radeon 890M + 既定の embed/reranker モデル構成での
+  # iGPU 環境で embed (CPU モード) が起動時に確保する pinned buffer 用
+  # の余裕。既定 4 GiB は AMD Radeon 890M + 既定の embed モデル構成での
   # 実測 ceiling。dedicated GPU でメモリに余裕があれば 0 にしても良い。
   vulkan_host_buffer_headroom_mib: 4096
 
@@ -242,7 +242,6 @@ model_paths:
   base_model: models/Qwen3.5-9B-Q4_K_M.gguf         # ベース GGUF モデル（download_model.py が自動配置）
   assist_model: models/Qwen3.5-4B-Q4_K_M.gguf       # アシスト GGUF モデル（メモリ・RAG処理用）
   embed_model: models/Qwen3-Embedding-0.6B-Q8_0.gguf # 埋め込み用 GGUF モデル（llama-cpp バックエンド用）
-  reranker_model: models/Qwen3-Reranker-0.6B.Q8_0.gguf  # リランカー用 GGUF モデル（Qwen3-Reranker-0.6B、instruction-aware。llama.cpp rerank 対応の正変換版）
   coding_model: null                                 # コーディングモード用 GGUF（null/空欄 = base_model にフォールバック）
 
 # ===== ベースモデル移行 / 起動時整合性チェック =====
@@ -260,7 +259,7 @@ model_migration:
   auto_migrate_on_startup: false
 
 # ===== llama-server プロセス管理 =====
-# enabled=true で lifespan 起動時に 4 種 (base/assist/embedding/reranker) の
+# enabled=true で lifespan 起動時に 3 種 (base/assist/embedding) の
 # llama-server を自動 spawn し、`POST /api/model/{component}/migrate` 実行時に
 # 自動再起動 + クライアント差し替えを行う。false (デフォルト) の場合は
 # 従来通り `scripts/launch_llama.py` を別途実行するワークフロー互換。
@@ -323,6 +322,19 @@ rag:
   semantic_min_chunk: 64          # セマンティックチャンクの最小トークン数
   semantic_max_chunk: 512         # セマンティックチャンクの最大トークン数
   top_k: 5                        # 検索結果の上位 K 件
+  # LTM / cartridge の取得件数を top_k*N に拡張する (1=拡張なし、上限5)。
+  # STM は stm_top_k 固定で拡張対象外。
+  # 「広く取って絞る」第1段として候補プールを広げる。LTM は内部で更に *2 する。
+  # 目安: LTM 主体なら 2-3 / カートリッジ多装着環境は 1-2。
+  fetch_multiplier: 1
+  # クロスレイヤ・スコア正規化方式: none / minmax / rank。
+  # STM(cosine*0.6+lightmem*0.4) / LTM(raw cosine) / cartridge(cosine*priority、priority 無上限)
+  # の異種スケールを層内正規化で揃え、最終順位付けの歪みを抑える。none=従来 (生スコア降順)。
+  # 品質判定は常に生スコアで行うため閾値の意味は変わらない。
+  score_normalization: none
+  # NOTE: hybrid_search / fusion_method / rrf_k / bm25_weight / vector_weight / bm25_* は
+  # チャット応答経路 (unified_search の STM/LTM/cartridge) では no-op。これらが効くのは
+  # HybridRetriever 経路 (ベンチ評価 / sleep-time の BM25 取り出し) のみ。
   hybrid_search: true             # BM25+Vector ハイブリッド検索（false でベクトルのみ）
   # NOTE: 以下の重み (0.3 / 0.7) は Qwen3-Embedding の vector 品質を前提に
   # 調整した既定値。BGE-M3 / nomic-embed-text 等に切替えた場合は BM25 と
@@ -364,8 +376,12 @@ rag:
     # 差し替えること (品質低下を防ぐため)。
     prompt_template: ""
   # --- ベクトル量子化 ---
-  quantization: int8             # ベクトル量子化方式: int8（ストレージ75%削減、精度~99%維持）
-  rescore_candidates: 50         # int8 粗検索後の float32 rescore 候補数（0 で自動: max(50, top_k*3)）
+  # 注: 現状 VectorStore は常に int8 固定で格納・検索する (quantization は未配線 / no-op)。
+  # 検索は「全件 int8 粗検索 → 候補のみ float32 rescore」の 2 段で、none を選んでも float32 化しない。
+  quantization: int8             # ベクトル量子化方式（現状 no-op、常時 int8）
+  # 注: チャット応答経路 (LTM/cartridge) には未配線。VectorStore.search 内部既定
+  # max(50, top_k*3) が常時適用される (本キーの値は届かない)。
+  rescore_candidates: 50         # int8 粗検索後の float32 rescore 候補数（現状チャット経路では no-op）
   # --- memmap ---
   memmap_threshold: 10000        # この件数以上で numpy.memmap に切替（OS ページキャッシュに委譲しメモリ削減）
   # --- Cartridge スケーラビリティ運用制限 ---
@@ -392,10 +408,10 @@ rag:
     threshold: 5000                   # この件数以上の VectorStore で IVF インデックスを構築
     n_probe_ratio: 0.125              # K = max(16, sqrt(N)) のうち n_probe_ratio × K 個のクラスタを探索
   # --- Self-RAG 品質判定閾値 ---
-  # NOTE: 以下 3 閾値 (0.65/0.50/0.80) は Qwen3-Embedding + Qwen3-Reranker の
-  # スコア分布を前提に調整した既定値。BGE-M3 + BGE-Reranker-v2-m3 等の
-  # 別 family に切替えた場合、reranker の relevance スコアが「全て low」or
-  # 「全て high」に倒れないよう、ベンチで分布を観察して再調整すること。
+  # NOTE: 以下 3 閾値はチャット応答経路 (unified_search) の Self-RAG 品質判定に適用される。
+  # 判定入力は STM(cosine*0.6+lightmem*0.4) / LTM(raw cosine) / cartridge(cosine*priority) を
+  # 無正規化マージした merged スコア。embedding family を切替えた場合は
+  # cosine 分布が変わるので、全 low / 全 high に倒れないようベンチで分布を観察して再調整すること。
   relevance_threshold: 0.65      # 関連性判定の閾値（0.0〜1.0）
   support_threshold: 0.50        # 根拠支持判定の閾値（0.0〜1.0）
   confidence_threshold: 0.80     # 信頼度判定の閾値（0.0〜1.0）
@@ -424,7 +440,7 @@ rag:
       context_turns: 2            # アシストプロンプトに含める直前ターン数 (0 で会話文脈なし)
     content_gate:
       # 取得直後 (Step 4 マージ後) の chunk 内容精査ゲート。低価値 chunk を
-      # 事前 pruning し、quality judge / query expansion / reranker の候補数を
+      # 事前 pruning し、quality judge / query expansion の候補数を
       # 縮小する。coding mode を主対象 (chat mode は近似重複除去のみ)。判断に
       # 迷う marginal band の prose チャンクだけ assist で 1 回関連性を判定する。
       enabled: true               # coding-mode 事前精査を有効化 (false で無効)
@@ -453,6 +469,8 @@ embedding:
   # 埋め込みモデルの GPU オフロード層数
   # null は CPU フォールバック (-ngl 0) が既定。GPU に載せたい場合は
   # 明示的に 999 等を指定する。ベースモデルの llama.gpu_layers には追従しない。
+  # 補足: 埋め込みの GPU オフロードはクエリ時最大の速度ノブ。base/assist との
+  # VRAM 競合に注意し、設定変更時は起動時サマリで VRAM 予算を確認すること。
   gpu_layers: null                # 既定: CPU 配置 (弱い GPU 環境での OOM 回避)
   # 物理バッチサイズ。llama-server デフォルト 512 のままだと長文ノート (>512 tok)
   # の単一埋め込みリクエストで 500 エラーになり、EvorefMem sleep-time update が連鎖失敗する。
@@ -490,84 +508,6 @@ embedding:
   # ドキュメント整形テンプレート。Qwen3 仕様では空 (prefix なし)。
   # 対称型埋め込み (例: e5) で文書側にも prefix が要る場合のみ設定。
   doc_template: ""
-
-# ===== リランカー設定 =====
-reranker:
-  enabled: false                  # リランカーの有効/無効
-                                  # 既定 false = 4 つ目の llama-server (:8083) を起動せず省メモリ。
-                                  # RAG は reranker 無しでも縮退動作する。検索精度を上げたい場合 true。
-  backend: llama-cpp              # バックエンド: llama-cpp
-  host: localhost
-  port: 8083                      # リランカー用 llama-server のポート
-  model_name: Qwen/Qwen3-Reranker-0.6B  # モデル識別名（Qwen3-Reranker-0.6B、instruction-aware）
-  timeout: 30.0                   # タイムアウト（秒）
-  candidates_multiplier: 3        # リランカーに渡す候補数の倍率（top_k × N）
-  # リランカーの GPU オフロード層数
-  # null は CPU フォールバック (-ngl 0) が既定。GPU に載せたい場合は
-  # 明示的に 999 等を指定する。ベースモデルの llama.gpu_layers には追従しない。
-  gpu_layers: null                # 既定: CPU 配置 (弱い GPU 環境での OOM 回避)
-  # リランカーへ投入する候補数の上限
-  # 未指定なら top_k * candidates_multiplier (= 15 with defaults)。
-  # forward pass がドキュメント数に線形でかかるため、merged が膨らんだ際に
-  # 上位スコア順で切り詰めて再順位付けの計算量を抑える。
-  rerank_candidate_cap: 15
-  # 物理バッチサイズ。query + doc の入力トークン数を超える値が必要。
-  # 既定の rag.chunk_size=512 / max_doc_chars=4096 文字 (~1500 tok) 構成では
-  # 2048 で十分 (rag.chunk_size=512、max_doc_chars 4096字≈≤1600tok < 2048)。
-  # rag.chunk_size を大きく取る場合のみ 4096/8192 へ。batch < 入力トークン数だと
-  # リランクが 500 で全滅する (#reranker-500) ので、必ず最大入力 tok 以上を保つ。
-  # 注意: ggml-vulkan の pinned memory warning は batch_size とは独立に出る
-  # (embedding 側コメント参照)。batch_size 調整では消えないが動作上は問題なし。
-  batch_size: 2048
-  ubatch_size: 2048
-  # 1 ペア (query + doc) のドキュメント側文字数上限。リランカーモデルの
-  # n_ctx を超えて 500 エラーになるのを防止する。0 でトランケーション無効。
-  max_doc_chars: 4096
-  # ファストパスタイムアウト。この時間内に /v1/rerank が応答
-  # しなければリランクをスキップして入力順序を返す。3.0 だと GPU
-  # ウォームアップ直後や他リクエスト競合時に間に合わず連続タイムアウト
-  # → サーキットブレーカー OPEN を招くため、12.0 を推奨。8.0 でも頻繁に
-  # タイムアウトする場合 SSE keepalive を有効にして 15.0 程度まで上げる。
-  fast_path_timeout: 12.0
-  # サーキットブレーカー: 連続失敗回数がこの値に達すると
-  # トリップし、cb_cooldown_sec 秒の間はリランクをスキップする。
-  cb_failure_threshold: 5
-  cb_cooldown_sec: 30.0
-  # idle slot offload。リランカーは短時間推論を大量に行うため
-  # offload の恩恵が薄く、長時間運用時のキャッシュ破損リスクを排除するため
-  # 0 で明示 disable する (従来の ``--cache-ram 0`` ハードコードを config 駆動化)。
-  cache_ram_mib: 0
-  # llama-server 起動時の追加引数（リランカー用）。
-  # -c 4096: リランクに必要な文脈へ縮小する。llama-server 既定の n_ctx=40960 は
-  # rerank (query+doc 1 ペア / 生成なし) には過剰で、KV キャッシュを無駄に確保する。
-  # 4096 へ縮めると WorkingSet が大幅減 (実測 0.6B で 6.9GB→2.2GB、速度・スコア同等)。
-  # max_doc_chars を増やす場合は -c もそれ以上に保つこと。
-  extra_args: ["-c", "4096"]
-  # instruction-aware リランカー (Qwen3 等) 用の mode 別 task description。
-  instructions:
-    chat: "Given a user question, retrieve relevant passages that answer the query"
-    coding: "Given a code search query, retrieve relevant code snippets"
-  # クエリ整形テンプレート。{task} (= instructions[mode]) と {query} を埋め込み
-  # /v1/rerank の query フィールドへ送る (Qwen3-Reranker のチャットテンプレート上の
-  # <Query> 位置に流し込まれる)。BGE-Reranker-v2-m3 等の非 instruction-aware
-  # モデルに切り替える場合は "" を指定し素のクエリを送る。
-  query_template: "<Instruct>: {task}\n<Query>: {query}"
-  # --- Quality-aware skip ---
-  # 融合後の top スコア / gap / 候補数から reranker を通す価値が薄いケース
-  # を検出し、cross-encoder forward pass を短絡する。いずれか 1 つでも条件を
-  # 満たせば skip (OR 判定)。全て 0 では skip 判定自体を行わず従来挙動のまま。
-  #
-  # しきい値は fusion 後の raw スコアに適用される:
-  #   - unified_search 経路 (チャット応答): cosine 類似度 (0.0-1.0 レンジ)
-  #   - HybridRetriever 経路 (benchmark): RRF スコア (k=60 で最大 ~0.033)
-  #
-  # 既定値 (チャット応答経路向け): top-1 cosine ≥ 0.85 または gap ≥ 0.30 で
-  # 自明ケース判定。fast_path_timeout (12s) のロスを排除するための既定有効化。
-  # benchmark/RRF 経路は値域が異なるため事実上影響しない。
-  skip:
-    hybrid_top_score_threshold: 0.85 # top-1 スコアがこの値以上なら skip (0.0=無効)
-    score_gap_threshold: 0.30        # top-1 と top-2 の差がこの値以上なら skip (0.0=無効)
-    min_candidates: 3                # 融合後の候補数がこの値未満なら skip (0=無効)
 
 # ===== メモリシステム設定 =====
 memory:
@@ -608,6 +548,11 @@ memory:
     confirm_window_hours: 1.0                                  # 同 source / N 時間以内は微妙ケースとして pending
     project_tag_always_manual: true                            # project / policy タグは基本ユーザー確認必須
     auto_for_evolved_policies: true                            # 例外: auto_evolved=True の policy のみ自動マージ
+    # pending 競合のチャット確認フロー。チャット注入で AI がユーザーに確認し、
+    # 回答を assist (conflict_chat_judge) で判定して即時解決する。
+    chat_review:
+      enabled: true                                            # false で注入・判定とも停止
+      max_groups: 0                                            # 注入グループ上限 (0=無制限、超過分は件数のみ要約)
   # --- MemoryInjector ---
   # NOTE: policy ファクトの active 閾値は learning.policy.activation_min_confidence
   # に集約されている

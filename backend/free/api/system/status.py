@@ -36,7 +36,7 @@ _start_time = time.time()
 async def _collect_component_statuses(
     cfg: dict, state: AppState, client: object | None, base_connected: bool,
 ) -> list[ComponentStatus]:
-    """各コンポーネント (base / assist / embed / reranker) のステータスを収集する"""
+    """各コンポーネント (base / assist / embed) のステータスを収集する"""
     from pathlib import Path
 
     components: list[ComponentStatus] = []
@@ -69,17 +69,6 @@ async def _collect_component_statuses(
         except Exception:
             pass
     components.append(ComponentStatus(name=embed_name, connected=embed_connected))
-
-    # reranker
-    reranker_cfg = cfg.get("reranker", {})
-    reranker_name = reranker_cfg.get("model_name", "")
-    reranker_connected = False
-    if state.reranker is not None and hasattr(state.reranker, "health_check"):
-        try:
-            reranker_connected = await state.reranker.health_check()
-        except Exception:
-            pass
-    components.append(ComponentStatus(name=reranker_name, connected=reranker_connected))
 
     return components
 

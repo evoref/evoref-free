@@ -134,16 +134,6 @@ export interface EmbeddingConfig {
 	cache_dir: string;
 }
 
-export interface RerankerConfig {
-	enabled: boolean;
-	backend: 'llama-cpp';
-	host: string;
-	port: number;
-	model_name: string;
-	timeout: number;
-	candidates_multiplier: number;
-}
-
 export interface MemoryConfig {
 	working_max_turns: number;
 	working_max_tokens: number;
@@ -319,7 +309,6 @@ export interface ConfigData {
 	history: HistoryConfig;
 	rag: RAGConfig;
 	embedding: EmbeddingConfig;
-	reranker: RerankerConfig;
 	memory: MemoryConfig;
 	learning: LearningConfig;
 	agent: AgentConfig;

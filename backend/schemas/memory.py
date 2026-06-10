@@ -138,6 +138,22 @@ class ConflictResolverConfig(BaseModel):
     max_per_cycle: int = Field(default=5, ge=0)
 
 
+class ConflictChatReviewConfig(BaseModel):
+    """pending 競合のチャット確認フロー設定
+
+    ``review_status="pending"`` の競合をチャットの SemMem 注入で提示し、
+    ユーザー回答を assist (``conflict_chat_judge``) で判定して即時解決する
+    フローを制御する。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # チャットでの pending 確認・解決フロー全体の有効/無効
+    enabled: bool = True
+    # 注入するグループ数の上限 (0 = 無制限)。超過分は件数のみ要約する。
+    max_groups: int = Field(default=0, ge=0)
+
+
 class SemMemConflictConfig(BaseModel):
     """SemMem コンフリクト解消設定
 
@@ -152,6 +168,7 @@ class SemMemConflictConfig(BaseModel):
       確認モードに振り分ける。
     - ``default_mode``: ``auto`` で例外を除き自動マージ、``manual`` で全件を
       ``review_status="pending"`` に振り分ける。
+    - ``chat_review``: pending をチャットで確認・解決するフローの制御。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -160,6 +177,9 @@ class SemMemConflictConfig(BaseModel):
     confirm_window_hours: float = Field(default=1.0, ge=0.0)
     project_tag_always_manual: bool = True
     auto_for_evolved_policies: bool = True
+    chat_review: ConflictChatReviewConfig = Field(
+        default_factory=ConflictChatReviewConfig,
+    )
 
 
 class InjectionTierRatios(BaseModel):

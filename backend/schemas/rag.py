@@ -135,7 +135,7 @@ class SelfRagContentGateConfig(BaseModel):
     """取得直後の chunk 内容精査ゲート設定 (heuristics-first + 境界 assist)
 
     ``unified_search`` の Step 4 マージ直後に低価値 chunk を pruning し、
-    quality judge / query expansion / reranker forward pass の候補数を縮小
+    quality judge / query expansion の候補数を縮小
     する。coding mode を主対象とし (chat mode は近似重複除去のみ)、安価な
     ヒューリスティック (relevance floor / 近似重複除去 / コードシグナル) で
     大半を裁き、判断に迷う marginal band の prose チャンクだけアシストモデル
@@ -199,6 +199,18 @@ class RAGConfig(BaseModel):
     semantic_min_chunk: int = Field(default=64, ge=1)
     semantic_max_chunk: int = Field(default=512, ge=1)
     top_k: int = Field(default=5, ge=1, le=50)
+    # LTM / cartridge の取得件数を top_k*N へ拡張する倍率
+    # (STM は stm_top_k 固定で拡張対象外)。
+    # 既定 1 = 拡張なし。「広く取って絞る」第1段として候補プールを広げる。
+    # LTM は内部で更に top_k*2 するため VectorStore 実 fetch は
+    # top_k*N*2 となり、上限 5 を超えると N>=5000+IVF 環境で recall ガード経由の
+    # 全件走査フォールバックに倒れやすくなるため le=5 で制限する。
+    fetch_multiplier: int = Field(default=1, ge=1, le=5)
+    # クロスレイヤ・スコア正規化方式。STM (cosine*0.6+lightmem*0.4)
+    # / LTM (raw cosine) / cartridge (cosine*priority, priority 無上限) という異種スケールを
+    # 層内正規化で [0,1] に揃えてから融合し、最終順位付けの歪みを抑える。
+    # none (既定) = 従来 (生スコア降順)。minmax = 層内 min-max。rank = 層内ランク減衰。
+    score_normalization: str = Field(default="none", pattern=r"^(none|minmax|rank)$")
     hybrid_search: bool = True
     bm25_weight: float = Field(default=0.3, ge=0.0, le=1.0)
     vector_weight: float = Field(default=0.7, ge=0.0, le=1.0)
@@ -277,9 +289,6 @@ _DEFAULT_INSTRUCTIONS: dict[str, str] = {
 # {task} = instructions[mode] / {query} = 元クエリ
 _DEFAULT_EMBED_QUERY_TEMPLATE = "Instruct: {task}\nQuery: {query}"
 
-# リランカークエリ整形テンプレート (Qwen3-Reranker 公式仕様)
-_DEFAULT_RERANK_QUERY_TEMPLATE = "<Instruct>: {task}\n<Query>: {query}"
-
 
 class EmbeddingConfig(BaseModel):
     """埋め込みモデル設定"""
@@ -343,103 +352,3 @@ class EmbeddingConfig(BaseModel):
     auto_reindex_on_mismatch: bool = False
 
 
-class RerankerSkipConfig(BaseModel):
-    """Reranker quality-aware skip 条件
-
-    hybrid 融合後の top スコアや候補数から「reranker を通す必要が薄い」
-    ケースを検出し、cross-encoder forward pass を短絡することで GPU VRAM
-    / CPU を節約する。いずれか 1 つでも条件を満たせば skip する (OR 判定)。
-
-    しきい値がすべて既定値 (0) の場合は skip 判定自体をスキップし、
-    従来通りリランカーを常に実行する (DoD: 既存挙動維持)。
-
-    ``hybrid_top_score_threshold`` / ``score_gap_threshold`` は fusion 後の
-    raw スコアに対して適用される。``unified_search`` 経路は STM/LTM/
-    カートリッジから得られる cosine 類似度 (0.0-1.0) が基準となるが、
-    ``HybridRetriever`` 経路は RRF スコア (k=60 で最大 ~0.033) となるため、
-    利用する fusion に合わせてしきい値を選定すること。
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    # 融合後 top-1 スコアがこの値以上なら reranker を skip (0.0=無効)。
-    # cosine 類似度経路では 0.8-0.9、RRF では 0.03 程度が目安。
-    hybrid_top_score_threshold: float = Field(default=0.0, ge=0.0)
-    # top-1 と top-2 のスコア差がこの値以上なら reranker を skip (0.0=無効)。
-    # 1 位が 2 位を十分引き離している場合、再順位付けの期待効用が低い。
-    score_gap_threshold: float = Field(default=0.0, ge=0.0)
-    # 融合後の候補数がこの値未満なら reranker を skip (0=無効)。
-    # 候補が少ないと reranker を通しても順位変動のメリットが小さい。
-    min_candidates: int = Field(default=0, ge=0)
-
-    @property
-    def is_active(self) -> bool:
-        """いずれかのしきい値が有効 (非デフォルト) なら True。"""
-        return (
-            self.hybrid_top_score_threshold > 0.0
-            or self.score_gap_threshold > 0.0
-            or self.min_candidates > 0
-        )
-
-
-class RerankerConfig(BaseModel):
-    """リランカー設定"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False
-    backend: str = Field(default="llama-cpp", pattern=r"^(llama-cpp)$")
-    host: str = "localhost"
-    port: int = Field(default=8083, ge=1024, le=65535)
-    model_name: str = "Qwen/Qwen3-Reranker-0.6B"
-    timeout: float = Field(default=30.0, ge=0.1)
-    candidates_multiplier: int = Field(default=3, ge=1, le=10)
-    # GPU オフロード層数
-    # None の場合は CPU フォールバック (``-ngl 0``) が既定となる。
-    # ベースモデルの ``llama.gpu_layers`` には追従せず、GPU 割り当ては opt-in。
-    gpu_layers: int | None = Field(default=None, ge=-1)
-    # 物理バッチサイズ。rag.chunk_size + クエリ + 特殊トークンを収容できる値にする。
-    # 既定 2048 は chunk_size=512 / max_doc_chars=4096字(≈≤1600tok) を収容しつつ
-    # compute buffer を抑える。None で llama-server デフォルト(512)に委譲するが、
-    # 512 のままだと長い入力で 500 エラーになるため明示値を推奨。
-    batch_size: int | None = Field(default=2048, ge=1)
-    ubatch_size: int | None = Field(default=2048, ge=1)
-    # リランカー入力候補の上限。None の場合は top_k * candidates_multiplier を使用
-    rerank_candidate_cap: int | None = Field(default=None, ge=1)
-    # ドキュメントトランケーション上限 (文字数)。1 ペア (query + doc) が
-    # リランカーモデルの n_ctx を超えて 500 エラーになるのを防止する。
-    # 0 の場合はトランケーションしない。
-    max_doc_chars: int = Field(default=4096, ge=0)
-    # ファストパスタイムアウト: この時間内に応答がなければ
-    # リランクをスキップして入力順序を返す。GPU ウォームアップ直後や
-    # 他リクエストとの競合で短いと連続タイムアウト→サーキットブレーカー
-    # OPEN を招くため、環境に合わせて調整する。
-    fast_path_timeout: float = Field(default=12.0, ge=0.1)
-    # サーキットブレーカー: 連続失敗回数がこの値に達するとトリップし、
-    # cb_cooldown_sec 秒の間はリランクをスキップする。
-    cb_failure_threshold: int = Field(default=5, ge=1)
-    cb_cooldown_sec: float = Field(default=30.0, ge=0.1)
-    # idle slot offload。リランカーは短時間推論を大量に行うため
-    # idle slot offload の恩恵が薄く、長時間運用時のキャッシュ破損リスクを排除
-    # するため 0 で明示 disable する (従来の ``--cache-ram 0`` ハードコードを
-    # config 駆動化)。
-    cache_ram_mib: int = Field(default=0, ge=-1)
-    # llama-server 起動時の追加引数。
-    # 既定の ["-c", "4096"] は rerank に必要な文脈へ n_ctx を縮小する。
-    # llama-server 既定 n_ctx=40960 は query+doc 1 ペア (生成なし) には過剰で
-    # KV キャッシュを浪費するため、4096 へ縮小して WorkingSet を大幅削減する
-    # (実測 0.6B で 6.9GB→2.2GB、速度・スコアは同等)。
-    extra_args: list[str] = Field(default_factory=lambda: ["-c", "4096"])
-    # Qwen3-Reranker 系の instruction-aware フォーマット
-    # ``rerank()`` 呼出時に ``query_template`` でクエリを整形してから
-    # llama-server ``/v1/rerank`` に送る。``mode`` は ``chat`` / ``coding`` のいずれか。
-    instructions: dict[str, str] = Field(
-        default_factory=lambda: dict(_DEFAULT_INSTRUCTIONS),
-    )
-    # クエリ整形テンプレート。プレースホルダ ``{task}`` (= instructions[mode])
-    # と ``{query}`` をサポートする。空文字列にすると instruction prefix を
-    # 一切付与しない (BGE-Reranker-v2-m3 等の非 instruction-aware モデル運用)。
-    # Qwen3-Reranker 既定: ``"<Instruct>: {task}\n<Query>: {query}"``
-    query_template: str = Field(default=_DEFAULT_RERANK_QUERY_TEMPLATE)
-    # Quality-aware skip: 高 confidence 時に reranker を短絡
-    skip: RerankerSkipConfig = Field(default_factory=RerankerSkipConfig)

@@ -11,10 +11,10 @@ JSONL カテゴリの enabled / max_log_mb / log_retention_days を内部マッ�
 導出する。``config.yaml`` の ``debug:`` セクションは廃止 (起動時に拒否)。
 
 公開 API (``log_request`` / ``log_assist_request`` / ``log_rag_result`` /
-``log_embedding`` / ``log_rerank_result`` / ``log_assist_judge`` /
+``log_embedding`` / ``log_assist_judge`` /
 ``log_memory_state`` / ``log_memory_op`` / ``log_learning_cycle`` /
 ``log_long_form_event`` / ``log_agent_trace_event`` / ``log_request_timing`` /
-``log_retry_attempt`` / ``log_assist_json_repair`` / ``log_rerank_skipped``)
+``log_retry_attempt`` / ``log_assist_json_repair``)
 のシグネチャは変更しないため、注入点 (CLAUDE.md §9 / `.claude/rules/backend.md`
 チェックリスト) の修正は不要。
 """
@@ -243,16 +243,15 @@ class DebugLogger:
         """tenacity リトライ発火を ``requests.jsonl`` に記録
 
         ``async_retry_http_call`` の ``before_sleep`` callback から呼ばれ、
-        backend (``base`` / ``assist`` / ``embedding`` / ``reranker``) ごとの
+        backend (``base`` / ``assist`` / ``embedding``) ごとの
         リトライ頻度・原因例外・status code をモニタする。
 
         Args:
             backend: リトライを発火させた HTTP クライアントの種別。
                 ``"base"`` (LocalClient) / ``"assist"`` (AssistModelClient) /
-                ``"embedding"`` (LlamaCppEmbedder) /
-                ``"reranker"`` (LlamaCppReranker) のいずれか。
+                ``"embedding"`` (LlamaCppEmbedder) のいずれか。
             purpose: assist リクエストの purpose 文字列。
-                base / embedding / reranker では空文字列。
+                base / embedding では空文字列。
             attempt: 1-based attempt 番号 (リトライ発火直前の試行回数)。
             wait_sec: 次の試行までの待機秒数 (jitter 込みの実値)。
             exception: 直前の例外クラス名 (``ReadTimeout`` / ``ConnectError`` /
@@ -398,65 +397,6 @@ class DebugLogger:
             "cache_hit": cache_hit,
             "elapsed_sec": round(elapsed_sec, 4),
         })
-
-    def log_rerank_result(
-        self,
-        query_preview: str,
-        doc_count: int,
-        top_scores: list[float],
-        elapsed_sec: float,
-    ) -> None:
-        """リランカーの実行結果を記録"""
-        if not self.enabled or not self.log_rag:
-            return
-        self._emit("rag", {
-            "timestamp": _now(),
-            "op": "rerank",
-            "query_preview": query_preview[:100],
-            "doc_count": doc_count,
-            "top_scores": [round(s, 4) for s in top_scores[:5]],
-            "elapsed_sec": round(elapsed_sec, 4),
-        })
-
-    def log_rerank_skipped(
-        self,
-        query_preview: str,
-        candidates_count: int,
-        reason: str,
-        *,
-        top_score: float = 0.0,
-        gap: float = 0.0,
-        source: str = "",
-    ) -> None:
-        """Reranker quality-aware skip を記録
-
-        hybrid top score / gap / 候補数による skip 条件で reranker を
-        短絡した際に ``rag.jsonl`` に ``op="rerank_skip"`` として書き出す。
-        skip 率を後追いすることで、しきい値チューニングと品質回帰の
-        モニタリングを可能にする。
-
-        Args:
-            query_preview: クエリ先頭 100 文字 (プライバシー保護のため切詰)。
-            candidates_count: skip 判定時点の融合後候補数。
-            reason: ``high_score`` / ``large_gap`` / ``few_candidates`` のいずれか。
-            top_score: 融合後 top-1 スコア (未算出時は 0.0)。
-            gap: top-1 と top-2 のスコア差 (候補 1 件以下なら 0.0)。
-            source: 呼び出し経路識別子 (``hybrid_retriever`` / ``unified_search``)。
-        """
-        if not self.enabled or not self.log_rag:
-            return
-        entry: dict = {
-            "timestamp": _now(),
-            "op": "rerank_skip",
-            "query_preview": query_preview[:100],
-            "candidates_count": candidates_count,
-            "reason": reason,
-            "top_score": round(float(top_score), 4),
-            "gap": round(float(gap), 4),
-        }
-        if source:
-            entry["source"] = source
-        self._emit("rag", entry)
 
     def log_content_gate(
         self,
@@ -745,7 +685,7 @@ class DebugLogger:
                 (chat 以外の outcome では基本的に ``None``)。
             tokens_out: 出力トークン数。``None`` ならフィールド省略。
             quality_signals: 品質指標 (例:
-                ``{"json_repair_count": 0, "retry_count": 0, "rerank_skipped": false}``)。
+                ``{"json_repair_count": 0, "retry_count": 0}``)。
                 outcome 種別ごとに任意の信号を入れられる。
                 ``_redaction_processor`` が dict を再帰走査するため、
                 ユーザー入力を含む文字列を入れた場合も自動的にマスクされる。

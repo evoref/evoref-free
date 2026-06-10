@@ -34,8 +34,8 @@ if TYPE_CHECKING:
 logger = get_logger("core.vram_monitor")
 
 
-# 4 種モデルの固定順序 (GUI 表示順と合わせる)
-MODEL_NAMES: tuple[str, ...] = ("base", "assist", "embed", "reranker")
+# 3 種モデルの固定順序 (GUI 表示順と合わせる)
+MODEL_NAMES: tuple[str, ...] = ("base", "assist", "embed")
 
 
 # LlamaProcessManager の component 名は "embedding"、本モジュールの GUI 表示 key は
@@ -44,7 +44,6 @@ _MODEL_TO_COMPONENT: dict[str, str] = {
     "base": "base",
     "assist": "assist",
     "embed": "embedding",
-    "reranker": "reranker",
 }
 
 
@@ -156,10 +155,10 @@ def nvidia_smi_snapshot(timeout_sec: float = 3.0) -> dict[int, int] | None:
 def _get_managed_pids(
     process_manager: LlamaProcessManager | None,
 ) -> dict[str, int]:
-    """LlamaProcessManager から 4 モデルの PID を抽出する
+    """LlamaProcessManager から 3 モデルの PID を抽出する
 
     Returns:
-        dict[model_name ("base"/"assist"/"embed"/"reranker"), pid]。
+        dict[model_name ("base"/"assist"/"embed"), pid]。
         manager が None / 該当 component が未管理の場合はその key を含まない。
     """
     result: dict[str, int] = {}
@@ -263,7 +262,6 @@ def collect_vram_status(
         "base": "base_model",
         "assist": "assist_model",
         "embed": "embed_model",
-        "reranker": "reranker_model",
     }
     for name, key in _KEY_MAP.items():
         raw_path = model_paths_cfg.get(key, "")

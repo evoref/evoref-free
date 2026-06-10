@@ -537,17 +537,8 @@ def _build_assist_cmd(project_root: Path, cfg: dict | None = None) -> list[str] 
     return build_assist_cmd(cfg, project_root)
 
 
-def _build_reranker_cmd(project_root: Path, cfg: dict | None = None) -> list[str] | None:
-    """config.yaml からリランカー用 llama-server コマンドを構築（設定時のみ）"""
-    from scripts.launch_llama import build_reranker_cmd
-
-    if cfg is None:
-        cfg = _load_config(project_root)
-    return build_reranker_cmd(cfg, project_root)
-
-
 # ────────────────────────────────────────────
-# 追加サーバー起動（アシスト・埋め込み・リランカー）
+# 追加サーバー起動（アシスト・埋め込み）
 # ────────────────────────────────────────────
 
 # (name, config_key, port_key, default_port, build_cmd_func) の定義
@@ -555,7 +546,6 @@ _EXTRA_SERVERS: list[tuple[str, str, str, int]] = [
     # (表示名, config セクションキー, ポートキー, デフォルトポート)
     ("assist", "assist_model.local", "port", 8081),
     ("embed", "embedding", "llama_port", 8082),
-    ("reranker", "reranker", "port", 8083),
 ]
 
 def _get_nested_config(cfg: dict, dotted_key: str) -> dict:
@@ -575,7 +565,7 @@ def _spawn_extra_servers(
     stderr_files: list,
     console,
 ) -> dict[str, tuple[str, int]]:
-    """補助サーバー（assist/embed/reranker）を一括スポーン（ヘルスチェックなし）
+    """補助サーバー（assist/embed）を一括スポーン（ヘルスチェックなし）
 
     Popen はノンブロッキングなので全サーバーを即座にスポーンし、
     ヘルスチェックは呼び出し元の _wait_for_health_all() に委譲する。
@@ -586,7 +576,6 @@ def _spawn_extra_servers(
     builders = {
         "assist": _build_assist_cmd,
         "embed": _build_embed_cmd,
-        "reranker": _build_reranker_cmd,
     }
     servers: dict[str, tuple[str, int]] = {}
 
@@ -693,7 +682,7 @@ async def ensure_extra_servers(
     project_root: Path,
     auto_serve_state: "AutoServeState",
 ) -> None:
-    """設定済みだが未起動の補助サーバー（assist/embed/reranker）を自動起動
+    """設定済みだが未起動の補助サーバー（assist/embed）を自動起動
 
     バックエンドが既に起動している状態で、--auto-serve を使わずに
     evoref code を実行した場合に補助サーバーを補完する。
@@ -702,7 +691,6 @@ async def ensure_extra_servers(
     builders = {
         "assist": _build_assist_cmd,
         "embed": _build_embed_cmd,
-        "reranker": _build_reranker_cmd,
     }
 
     for name, config_key, port_key, default_port in _EXTRA_SERVERS:
@@ -745,7 +733,7 @@ def _spawn_all_servers(
 ) -> dict[str, tuple[str, int]]:
     """全 llama-server を一括スポーン（並列起動、ヘルスチェックなし）
 
-    base + assist + embed + reranker を同時に起動し、
+    base + assist + embed を同時に起動し、
     ヘルスチェックは呼び出し元の _health_check_loop に委譲する。
 
     Args:
@@ -758,7 +746,6 @@ def _spawn_all_servers(
     builders = {
         "assist": _build_assist_cmd,
         "embed": _build_embed_cmd,
-        "reranker": _build_reranker_cmd,
     }
 
     # ── base llama-server ──
@@ -784,7 +771,7 @@ def _spawn_all_servers(
         except (FileNotFoundError, ValueError, OSError) as e:
             logger.warning("auto-serve: base llama-server start failed: %s", e)
 
-    # ── extra servers (assist / embed / reranker) ──
+    # ── extra servers (assist / embed) ──
     for name, config_key, port_key, default_port in _EXTRA_SERVERS:
         build_fn = builders[name]
         try:
@@ -1150,7 +1137,7 @@ async def _maybe_spawn_auto_serve_llama(
         )
         render_info(console, msg("cli.auto_serve_llama_exists"))
         state.llama_port = llama_port_val
-    # ベースが既存でも、assist/embed/reranker は未起動の可能性があるため常にスポーン
+    # ベースが既存でも、assist/embed は未起動の可能性があるため常にスポーン
     return _spawn_all_servers(
         project_root, cfg, state,
         skip_base=llama_already_running,

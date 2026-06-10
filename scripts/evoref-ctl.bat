@@ -34,7 +34,6 @@ echo   Web UI:   http://localhost:5173
 echo   API:      http://localhost:8000
 echo   llama:    http://localhost:8080 (base)
 echo   embed:    http://localhost:8082 (embedding, if llama-cpp)
-echo   rerank:   http://localhost:8083 (reranker, if enabled)
 echo.
 echo Close the terminal windows to stop services,
 echo or run: %~nx0 stop
@@ -62,7 +61,7 @@ if exist ".venv\Scripts\python.exe" (
     set "VENV_UVICORN=uvicorn"
 )
 
-echo [start] Starting llama-server (base + embedding + reranker)...
+echo [start] Starting llama-server (base + assist + embedding)...
 start "llama-server" /min cmd /c ""%VENV_PYTHON%" scripts\launch_llama.py config.yaml --all"
 
 echo [start] Waiting for llama-server to be ready (up to 60s)...

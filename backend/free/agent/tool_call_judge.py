@@ -1586,11 +1586,23 @@ def _extract_file_path(query: str) -> str:
 
     # 2. ドライブレター + 自然言語でのファイル名指定
     #    例: 「e:\直下にa.txtのファイル名で」→ e:\a.txt
+    #    ディレクトリとファイル名が日本語/全角スペースで分断されていても、
+    #    ディレクトリ部 (Pattern 3 と同じ捕捉) を取り出してファイル名と結合し、
+    #    サブ階層を保持する。深い階層が無い (ドライブ直下指定) 場合のみ
+    #    従来どおりドライブ直下へフォールバックする。
     #    \w は日本語にもマッチするため ASCII 限定で検索
     drive_match = re.search(r"([A-Za-z]):\\", query)
     file_match = re.search(r"([A-Za-z0-9_-]+\.[A-Za-z0-9]{1,10})(?=[^A-Za-z0-9_.]|$)", query)
     if drive_match and file_match:
-        return f"{drive_match.group(1)}:\\{file_match.group(1)}"
+        filename = file_match.group(1)
+        dir_match = re.search(
+            r"([A-Za-z]:\\[A-Za-z0-9_.\\/ -]*[A-Za-z0-9_])(?=[\\/\s]|$)",
+            query,
+        )
+        if dir_match:
+            directory = _normalize_path_separators(dir_match.group(1)).rstrip("\\/")
+            return f"{directory}\\{filename}"
+        return f"{drive_match.group(1)}:\\{filename}"
 
     # 3. ディレクトリパスのみ（ファイル名なし）: E:\xxx\ や E:\xxx 等
     #    配下のファイルを参照する文脈では、ディレクトリパスを返す。

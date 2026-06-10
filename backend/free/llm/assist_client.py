@@ -78,6 +78,10 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     # ツール結果からユーザ質問の答えに必要な要点を抽出する digest。Deliberative の
     # チャット応答パスで base 生成の直前に同期発火するため realtime。
     "tool_result_digest": "realtime",
+    # SemMem pending 競合のチャット回答判定。pending 存在ターンのチャット
+    # 応答パスで同期発火するため realtime。sleep-time のノートマージ
+    # (conflict_resolution、background) とは別 purpose。
+    "conflict_chat_judge": "realtime",
     # background — Sleep-time / 自律ループ / 長文生成
     # conflict_resolution は SleepTimeWorker._step6_resolve_conflicts (run_full)
     # からのみ発火する sleep-time 専用処理。チャット応答パスから同期発火しない
@@ -151,6 +155,10 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # コードリペアは assembled 全体を再出力するため long_form_* と同等に確保。
     "code_repair": 90.0,
     "conflict_resolution": 15.0,
+    # pending 競合のチャット回答判定。チャット応答パスで同期発火し、
+    # base との GPU 競合があるため tool_judgment と同根拠で 12s
+    # (失敗時は no-op で pending 維持)。
+    "conflict_chat_judge": 12.0,
     "critique_synthesis": 45.0,
     "policy_evolution": 45.0,
     # プロンプト変異 (~1024 tok のテキスト生成)。assist は base の約5倍速で
@@ -233,6 +241,8 @@ PURPOSE_REASONING_BUDGET_DEFAULTS: dict[str, int] = {
     "contextual_prefix": 256,
     "critique_synthesis": 512,
     "conflict_resolution": 0,
+    # チャット回答の機械的分類。thinking 不要 → 即終了
+    "conflict_chat_judge": 0,
     "policy_evolution": 1024,
     # プロンプト変異は機械的なテキスト書き換え。<think> は _strip_think_tags で
     # 除去・汚染判定の対象であり thinking は有害なため即終了。

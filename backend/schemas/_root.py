@@ -32,7 +32,7 @@ from backend.schemas.llm import LlamaConfig
 from backend.schemas.loop import LoopConfig
 from backend.schemas.memory import MemoryConfig
 from backend.schemas.paths import LocalPathsConfig, ModelPathsConfig
-from backend.schemas.rag import EmbeddingConfig, RAGConfig, RerankerConfig
+from backend.schemas.rag import EmbeddingConfig, RAGConfig
 
 logger = get_logger("schemas")
 
@@ -77,7 +77,6 @@ class EvorefConfig(BaseModel):
     history: HistoryConfig = Field(default_factory=HistoryConfig)
     rag: RAGConfig = Field(default_factory=RAGConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
-    reranker: RerankerConfig = Field(default_factory=RerankerConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     learning: LearningConfig = Field(default_factory=LearningConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
@@ -125,6 +124,27 @@ class EvorefConfig(BaseModel):
                 ". Develop logging is controlled exclusively via "
                 "the --develop=<level> CLI flag (debug | investigate | evolve). "
                 "Remove the 'debug:' section from config.yaml.",
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_reranker_section(cls, data: dict) -> dict:
+        """``reranker:`` セクションを起動時に明示的に拒否する
+
+        リランカー機能は削除され、検索フローは fetch_multiplier 拡張 +
+        score_normalization に一本化された。``EvorefConfig`` は
+        ``extra="allow"`` のため残存セクションは黙って透過してしまうが、
+        過去設定の残存に気付かせるため明示的に ``ValueError`` を上げる。
+        """
+        if isinstance(data, dict) and "reranker" in data:
+            raise ValueError(
+                "config.yaml must not contain a 'reranker:' section anymore. "
+                "The reranker feature has been removed; retrieval now uses "
+                "rag.fetch_multiplier and rag.score_normalization instead. "
+                "Remove the 'reranker:' section (and the "
+                "'model_paths.reranker_model' line if present) from "
+                "config.yaml.",
             )
         return data
 
