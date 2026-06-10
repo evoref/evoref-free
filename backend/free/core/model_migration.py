@@ -23,14 +23,13 @@ logger = get_logger("core.model_migration")
 # 補助モデル: コンポーネント定義
 # ────────────────────────────────────────────
 
-ModelComponent = Literal["assist", "embedding", "reranker"]
-ALL_COMPONENTS: tuple[str, ...] = ("assist", "embedding", "reranker")
+ModelComponent = Literal["assist", "embedding"]
+ALL_COMPONENTS: tuple[str, ...] = ("assist", "embedding")
 
 # config.yaml の model_paths 配下のキー対応
 COMPONENT_CONFIG_KEY: dict[str, str] = {
     "assist": "assist_model",
     "embedding": "embed_model",
-    "reranker": "reranker_model",
 }
 
 # config.yaml の model_paths 配下で model_state.json と同期されるキー。
@@ -68,7 +67,7 @@ class MigrationHistoryEntry:
 
 @dataclass
 class ComponentState:
-    """assist / embedding / reranker の current + history"""
+    """assist / embedding の current + history"""
     current: ModelCurrent = field(default_factory=ModelCurrent)
     history: list[MigrationHistoryEntry] = field(default_factory=list)
 
@@ -310,14 +309,14 @@ def detect_mismatches(
 ) -> dict[str, dict[str, str]]:
     """config.yaml の model_paths と model_state.json の current filename を比較する。
 
-    base_model と各 component (assist/embed/reranker) について、
+    base_model と各 component (assist/embed) について、
     config と model_state の双方が非空かつ basename が異なるキーだけを返す。
     片方でも空 (初回起動で未初期化等) のキーは誤検知を避けるため除外する。
 
     Returns:
         ``{config_key: {"model_state": <filename>, "config": <filename>}}``。
         ``config_key`` は ``"base_model"`` または component の config キー
-        (``assist_model`` / ``embed_model`` / ``reranker_model``)。
+        (``assist_model`` / ``embed_model``)。
     """
     model_paths = config.get("model_paths", {}) or {}
     result: dict[str, dict[str, str]] = {}
@@ -532,7 +531,7 @@ class ModelMigrator:
         *,
         dry_run: bool = False,
     ) -> MigrationResult:
-        """assist / embedding / reranker モデルを切り替える
+        """assist / embedding モデルを切り替える
 
         base モデルと違い、LoRA・経験バッファ・プロンプトメタなどの
         付帯処理は不要。config.yaml 更新と model_state 記録のみを行う。

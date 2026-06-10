@@ -1,12 +1,12 @@
 """モデル・ローカル状態のパス系スキーマ"""
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ModelPathsConfig(BaseModel):
     """モデルファイルパス
 
-    標準 4 モデル (base/assist/embed/reranker) を明示フィールドとして定義。
+    標準 3 モデル (base/assist/embed) を明示フィールドとして定義。
     カスタムモデル種を追加できるよう ``extra="allow"`` を維持する。
     """
 
@@ -15,11 +15,26 @@ class ModelPathsConfig(BaseModel):
     base_model: str = "models/qwen3.5-4b-q4_k_m.gguf"
     assist_model: str = "models/Qwen3.5-4B-Q4_K_M.gguf"
     embed_model: str = "models/Qwen3-Embedding-0.6B-Q8_0.gguf"
-    reranker_model: str = "models/Qwen3-Reranker-0.6B.Q8_0.gguf"
     coding_model: str | None = Field(
         default=None,
         description="コーディングモード用 GGUF パス。未指定 (None / 空文字列) の場合は base_model にフォールバック",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_reranker_model(cls, data: dict) -> dict:
+        """旧 ``reranker_model`` キーを明示的に拒否する
+
+        リランカー機能の削除に伴い廃止。``extra="allow"`` のため黙って透過
+        してしまうが、過去設定の残存に気付かせるため ``ValueError`` を上げる。
+        """
+        if isinstance(data, dict) and "reranker_model" in data:
+            raise ValueError(
+                "model_paths must not contain 'reranker_model' anymore. "
+                "The reranker feature has been removed. Remove the "
+                "'model_paths.reranker_model' line from config.yaml.",
+            )
+        return data
 
 
 class LocalPathsConfig(BaseModel):

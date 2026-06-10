@@ -9,13 +9,12 @@
 	const COMPONENT_LABELS = [
 		'sidebar.component_base',
 		'sidebar.component_assist',
-		'sidebar.component_embed',
-		'sidebar.component_reranker'
+		'sidebar.component_embed'
 	];
 
-	const SERVER_NAMES: ServerName[] = ['base', 'assist', 'embed', 'reranker'];
+	const SERVER_NAMES: ServerName[] = ['base', 'assist', 'embed'];
 
-	// 開発パネルでは全サーバー (base / assist / embed / reranker) を一覧表示し、
+	// 開発パネルでは全サーバー (base / assist / embed) を一覧表示し、
 	// 各々の起動状態・メモリ使用量・起動/停止を確認できるようにする。
 
 	let refreshing = $state(false);

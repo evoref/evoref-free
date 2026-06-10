@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from backend.app_state import AppState
@@ -14,9 +15,14 @@ from backend.free.llm.llm_client import LLMClient
 from backend.free.memory.pipeline.search_pipeline import unified_search
 from backend.utils import estimate_tokens as _estimate_tokens
 from backend.log_config import get_logger
+from backend.trace_context import get_trace_id
 
 if TYPE_CHECKING:
     from backend.free.core.stage_timer import StageTimer
+    from backend.free.memory.pipeline.conflict_review import (
+        PendingConflictGroup,
+        ResolutionResult,
+    )
 
 logger = get_logger("api.chat.service")
 
@@ -255,7 +261,6 @@ async def run_search_pipeline(
             debug_logger=state.debug_logger,
             mode=mode,
             policy=state.policy_interpreter,
-            reranker=state.reranker,
             timer=timer,
             semmem_stats=_collect_semmem_stats(state),
             lazy_contextual=state.lazy_contextual,
@@ -282,8 +287,145 @@ async def run_search_pipeline(
     return SearchPipelineResult()
 
 
+@dataclass
+class ConflictTurnContext:
+    """1 ターン分の pending 競合コンテキスト。
+
+    ``maybe_resolve_pending_conflicts`` が構築し、同ターンの SemMem 注入
+    (``build_semmem_injection``) に渡される。``resolved`` が非 None の場合、
+    直前のユーザー発話で解決が反映済み (注入には確認通知を含める)。
+    """
+
+    pending_groups: list["PendingConflictGroup"] = field(default_factory=list)
+    resolved: "ResolutionResult | None" = None
+    resolved_index: int = 0
+
+
+def _iter_scopes(state: AppState):
+    """(scope 名, store) を global → project の順で yield する。"""
+    pid = state.current_project_id
+    for scope in ("global", f"project:{pid}" if pid else None):
+        if scope is None:
+            continue
+        try:
+            yield scope, state.get_semantic_store(scope)
+        except Exception:  # noqa: BLE001 — store 解決失敗はスキップ
+            continue
+
+
+def _collect_all_pending_groups(state: AppState) -> list:
+    """global + project ストアの pending 競合グループを集約する (読取のみ)。"""
+    from backend.free.memory.pipeline.conflict_review import collect_pending_groups
+
+    groups: list = []
+    for scope, store in _iter_scopes(state):
+        try:
+            groups.extend(collect_pending_groups(store, scope))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("collect pending conflicts failed (%s): %s", scope, exc)
+    return groups
+
+
+def _chat_review_cfg(cfg: dict) -> dict:
+    return ((cfg.get("memory") or {}).get("conflict") or {}).get(
+        "chat_review",
+    ) or {}
+
+
+async def maybe_resolve_pending_conflicts(
+    state: AppState, cfg: dict, history: list[dict], user_message: str,
+) -> ConflictTurnContext:
+    """pending 競合のユーザー回答を assist で判定し、有効なら即時反映する。
+
+    SemMem 書込は sleep-time に閉じる不変則の例外 2 例目
+    (``conflict_review.apply_resolution``、CLAUDE.md §6.2)。
+
+    ゲート:
+    - ``memory.conflict.chat_review.enabled=false`` → 全体スキップ
+    - pending 無し → 即 return
+    - ``assist_client is None`` → 判定スキップ (注入は情報提示のみで継続)
+    - history に assistant 発話なし (= まだ確認を出していない) → 判定スキップ
+
+    全例外は warning + 素通しでチャットを止めない。
+    """
+    ctx = ConflictTurnContext()
+    review_cfg = _chat_review_cfg(cfg)
+    if not review_cfg.get("enabled", True):
+        return ctx
+    try:
+        ctx.pending_groups = _collect_all_pending_groups(state)
+        if not ctx.pending_groups:
+            return ctx
+        if state.assist_client is None:
+            return ctx
+        last_assistant = next(
+            (
+                m.get("content", "")
+                for m in reversed(history)
+                if m.get("role") == "assistant"
+            ),
+            "",
+        )
+        if not last_assistant:
+            return ctx
+
+        from backend.free.memory.pipeline.conflict_review import (
+            apply_resolution,
+            judge_user_reply,
+        )
+
+        judgement = await judge_user_reply(
+            state.assist_client,
+            groups=ctx.pending_groups,
+            user_message=user_message,
+            last_assistant_message=last_assistant,
+        )
+        if judgement is None:
+            return ctx
+
+        index = judgement["group_index"]
+        group = ctx.pending_groups[index - 1]
+        action = judgement["action"]
+        winner = group.oldest if action == "keep_old" else group.newest
+        losers = [f.id for f in group.facts if f.id != winner.id]
+        store = state.get_semantic_store(group.scope)
+        result = apply_resolution(
+            store,
+            scope=group.scope,
+            action=action,
+            winner_id=winner.id,
+            loser_ids=losers,
+            merged_object=judgement["merged_object"] or None,
+            decision_source="user_chat",
+            trace_id=get_trace_id(),
+        )
+        ctx.resolved = result
+        ctx.resolved_index = index
+        logger.info(
+            "SemMem conflict resolved via chat: scope=%s action=%s winner=%s",
+            group.scope, action, winner.id,
+        )
+        if state.debug_logger is not None:
+            state.debug_logger.log_memory_op(
+                "semmem_conflict_user_resolve",
+                {
+                    "scope": group.scope,
+                    "action": action,
+                    "winner_id": result.winner_id,
+                    "superseded": len(result.superseded_ids),
+                    "new_fact_id": result.new_fact_id or "",
+                },
+            )
+        # 解決を同ターンの注入へ反映するため pending を再収集
+        ctx.pending_groups = _collect_all_pending_groups(state)
+    except Exception as exc:  # noqa: BLE001 — 競合確認の失敗でチャットを止めない
+        logger.warning("pending conflict chat review failed: %s", exc)
+    return ctx
+
+
 def build_semmem_injection(
     state: AppState, cfg: dict, mode: str = "chat",
+    conflict_ctx: ConflictTurnContext | None = None,
 ) -> str | None:
     """SemMem facts + STM notes を MemoryInjector で tier 整形し、
     プロンプト注入用テキストを返す。
@@ -291,11 +433,16 @@ def build_semmem_injection(
     chat 応答パスでは SemMem は読み取りのみ (EvorefMem 設計原則 2/7)。
     RAG とは独立して呼び出し、検索ヒットの有無に関わらずメモリを注入する。
     失敗時は None を返してチャットを止めない。
+
+    ``conflict_ctx`` に pending 競合がある場合、Tier パッキングとは独立した
+    「記憶の競合」セクションを末尾に連結する (Tier 予算の drop 対象に
+    しないことで毎ターンの注入を保証する)。
     """
     mem_sys = state.get_memory_system()
     if not mem_sys:
         return None
     inj_mode = mode if mode in ("chat", "coding") else "chat"
+    rendered: str | None = None
     try:
         from backend.free.memory.pipeline.injector import MemoryInjector
 
@@ -314,18 +461,57 @@ def build_semmem_injection(
             except Exception:
                 continue
         stm_notes = list(getattr(stm, "notes", {}).values())
-        if not facts and not stm_notes:
-            return None
-        plan = MemoryInjector(cfg).inject(
-            mode=inj_mode,
-            facts=facts,
-            stm_notes=stm_notes,
-            current_project_id=pid,
-            failure_signatures=(),
-        )
-        return plan.render() or None
+        if facts or stm_notes:
+            plan = MemoryInjector(cfg).inject(
+                mode=inj_mode,
+                facts=facts,
+                stm_notes=stm_notes,
+                current_project_id=pid,
+                failure_signatures=(),
+            )
+            rendered = plan.render() or None
     except Exception as e:
         logger.warning("semmem injection skipped: %s", e)
+        rendered = None
+
+    conflict_block = _render_conflict_section(state, cfg, conflict_ctx)
+    if conflict_block:
+        rendered = f"{rendered}\n\n{conflict_block}" if rendered else conflict_block
+    return rendered
+
+
+def _render_conflict_section(
+    state: AppState, cfg: dict, conflict_ctx: ConflictTurnContext | None,
+) -> str | None:
+    """pending 競合セクション (+ 解決済み通知) を組み立てる。失敗時は None。"""
+    if conflict_ctx is None:
+        return None
+    if not conflict_ctx.pending_groups and conflict_ctx.resolved is None:
+        return None
+    try:
+        from backend.free.memory.pipeline.conflict_review import (
+            render_pending_conflicts_block,
+            render_resolved_notice,
+        )
+
+        review_cfg = _chat_review_cfg(cfg)
+        parts: list[str] = []
+        block = render_pending_conflicts_block(
+            conflict_ctx.pending_groups,
+            instruct=state.assist_client is not None,
+            max_groups=int(review_cfg.get("max_groups", 0) or 0),
+        )
+        if block:
+            parts.append(block)
+        if conflict_ctx.resolved is not None:
+            parts.append(
+                render_resolved_notice(
+                    conflict_ctx.resolved, conflict_ctx.resolved_index,
+                ),
+            )
+        return "\n".join(parts) or None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("conflict section render failed: %s", exc)
         return None
 
 

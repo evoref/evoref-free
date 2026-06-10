@@ -148,7 +148,7 @@ def wipe_local_to_skeleton(
 
 def _load_config_ports(project_root: Path) -> list[int]:
     """config.yaml から停止対象ポートを収集する。失敗時は既定ポート群へ縮退。"""
-    default_ports = [8000, 8080, 8081, 8082, 8083]
+    default_ports = [8000, 8080, 8081, 8082]
     config_path = project_root / "config.yaml"
     try:
         import yaml

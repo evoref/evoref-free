@@ -54,9 +54,6 @@
 					<button class="new-chat-btn" onclick={handleNewChat} aria-label={$t('sidebar.new_chat')} title={$t('sidebar.new_chat')}>+</button>
 				</div>
 				<a href="/history" class="nav-item" class:active={isActive('/history')}>{$t('sidebar.history')}</a>
-				{#if isPro}
-					<a href="/memory" class="nav-item" class:active={isActive('/memory')}>{$t('sidebar.memory')}</a>
-				{/if}
 				<a href="/cartridge" class="nav-item" class:active={isActive('/cartridge')}>{$t('sidebar.cartridges')}</a>
 				<a href="/themes" class="nav-item" class:active={isActive('/themes')}>{$t('sidebar.themes')}</a>
 				<a href="/loop" class="nav-item" class:active={isActive('/loop')}>{$t('sidebar.loop')}</a>

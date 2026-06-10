@@ -218,10 +218,10 @@ async def rollback_model(req: RollbackRequest, state: AppState = Depends(get_app
 
 
 # ────────────────────────────────────────────
-# コンポーネント (assist / embedding / reranker) 移行 API
+# コンポーネント (assist / embedding) 移行 API
 # ────────────────────────────────────────────
 
-_VALID_COMPONENTS = ("assist", "embedding", "reranker")
+_VALID_COMPONENTS = ("assist", "embedding")
 
 
 def _validate_component(component: str) -> None:
@@ -241,7 +241,7 @@ async def migrate_component(
     req: ComponentMigrateRequest,
     state: AppState = Depends(get_app_state),
 ):
-    """assist / embedding / reranker モデルを切り替える
+    """assist / embedding モデルを切り替える
 
     L2: `auto_restart=True` (既定) かつ LlamaProcessManager が当該
     コンポーネントを管理している場合、config.yaml 反映後に llama-server を
@@ -409,7 +409,7 @@ async def get_component_migration_history(component: str):
 # llama-server プロセス管理 API
 # ────────────────────────────────────────────
 
-_ALL_PROCESS_COMPONENTS = ("base", "assist", "embedding", "reranker")
+_ALL_PROCESS_COMPONENTS = ("base", "assist", "embedding")
 
 
 def _validate_process_component(component: str) -> None:

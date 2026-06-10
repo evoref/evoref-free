@@ -90,18 +90,6 @@ def build_model_info_sync(
                 connected=embed_connected,
             ))
 
-    # リランカーモデル
-    reranker = sp.get("reranker_model", "")
-    reranker_cfg = cfg.get("reranker", {})
-    if reranker and reranker_cfg.get("enabled", False):
-        reranker_port = reranker_cfg.get("port", 8083)
-        reranker_connected = check_health_sync("127.0.0.1", reranker_port)
-        models.append(ModelInfoItem(
-            label="reranker",
-            name=Path(reranker).stem,
-            connected=reranker_connected,
-        ))
-
     return models, context_size
 
 
@@ -169,17 +157,5 @@ async def build_model_info_async(
                 name=Path(embed).stem,
                 connected=embed_connected,
             ))
-
-    # リランカーモデル
-    reranker = sp.get("reranker_model", "")
-    reranker_cfg = cfg.get("reranker", {})
-    if reranker and reranker_cfg.get("enabled", False):
-        reranker_port = reranker_cfg.get("port", 8083)
-        reranker_connected = await check_health_async("127.0.0.1", reranker_port)
-        models.append(ModelInfoItem(
-            label="reranker",
-            name=Path(reranker).stem,
-            connected=reranker_connected,
-        ))
 
     return models, context_size

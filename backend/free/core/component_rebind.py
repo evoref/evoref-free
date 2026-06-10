@@ -1,8 +1,8 @@
 """コンポーネントクライアント差し替えヘルパー
 
 `migrate_component` API が llama-server を再起動した後、in-memory に
-保持しているクライアント (AssistModelClient / EmbeddingBackend /
-RerankerBackend) を新しいモデルメタデータで作り直して `AppState` に再注入する。
+保持しているクライアント (AssistModelClient / EmbeddingBackend) を
+新しいモデルメタデータで作り直して `AppState` に再注入する。
 
 `rebind_component()` は失敗しても呼び出し側でロールバック判定できるよう
 例外を伝播する。`auto_restart` フローでは migrate_component → restart →
@@ -71,34 +71,6 @@ async def rebind_component(
             except Exception as e:  # noqa: BLE001
                 logger.warning("old embedder close failed: %s", e)
         logger.info("embedding backend rebound")
-        return
-
-    if component == "reranker":
-        from backend.free.rag.reranker_factory import (
-            create_reranker_backend_async,
-        )
-
-        old = state.reranker
-        new = await create_reranker_backend_async(
-            cfg, debug_logger=debug_logger,
-        )
-        if hasattr(new, "health_check"):
-            healthy = await new.health_check()
-            if not healthy and getattr(new, "is_active", False):
-                try:
-                    await new.aclose()
-                except Exception:  # noqa: BLE001
-                    pass
-                raise RuntimeError(
-                    "reranker health_check failed after restart",
-                )
-        state.reranker = new
-        if old is not None:
-            try:
-                await old.aclose()
-            except Exception as e:  # noqa: BLE001
-                logger.warning("old reranker close failed: %s", e)
-        logger.info("reranker backend rebound")
         return
 
     raise ValueError(f"Unknown component: {component}")

@@ -334,142 +334,6 @@ class PinnedFactsResponse(BaseModel):
     facts: list[PinnedFactInfo]
 
 
-# ===== Memory Inspector =====
-
-
-class FactInfo(BaseModel):
-    """SemanticFact 一覧表示用 DTO
-
-    `PinnedFactInfo` が pin 専用のミニビューだったのに対し、こちらは
-    インスペクタ用にフィールドを拡張する (eval_metric / failure_signature /
-    auto_evolved / supersedes 等を含む)。
-    """
-
-    id: str
-    subject: str
-    predicate: str
-    object: str
-    type: str
-    scope: str
-    confidence: float
-    pinned: bool
-    pin_locked_until: float | None = None
-    mode_origin: str
-    created_at: float
-    accessed_at: float
-    access_count: int
-    superseded_by: str | None = None
-    supersedes: list[str] = Field(default_factory=list)
-    auto_evolved: bool = False
-    failure_signature: str | None = None
-    eval_metric: dict[str, float] | None = None
-    trace_id: str | None = None
-    private: bool = False
-    requires_user_review: bool = False
-    review_status: str = "none"
-
-
-class FactsResponse(BaseModel):
-    """汎用 facts 一覧レスポンス"""
-
-    scope: str
-    total: int
-    facts: list[FactInfo]
-
-
-class TaskFactInfo(BaseModel):
-    """task ファクト一覧表示用 DTO
-
-    `backend.free.loop.driver.TaskFactView` の構造化ビューを API シリアライズ
-    可能な形に転写したもの。`object` の生 JSON も保持しておくことで、
-    フロントでデバッグ表示しやすくしている。
-    """
-
-    fact_id: str
-    task_id: str
-    project_id: str
-    title: str
-    description: str = ""
-    depends_on: list[str] = Field(default_factory=list)
-    salience: float = 0.5
-    status: str = "open"
-    source_path: str | None = None
-    created_at: float = 0.0
-    accessed_at: float = 0.0
-    access_count: int = 0
-
-
-class TaskFactsResponse(BaseModel):
-    scope: str
-    total: int
-    tasks: list[TaskFactInfo]
-
-
-# ===== Conflict Resolution =====
-
-
-class ConflictGroupInfo(BaseModel):
-    """1 つの競合グループ
-
-    `pending` 状態のグループは UI で keep_old / keep_new / merge を選んで解消する。
-    `auto_resolved` 系は read-only timeline で表示する。
-    """
-
-    scope: str
-    subject: str
-    predicate: str
-    type: str
-    facts: list[FactInfo] = Field(default_factory=list)
-    detected_at: float | None = None
-    decision: str | None = None  # "auto" | "pending"
-    reason: str | None = None
-    winner_id: str | None = None
-    loser_ids: list[str] = Field(default_factory=list)
-
-
-class ConflictsResponse(BaseModel):
-    """`/api/memory/conflicts` レスポンス。
-
-    `pending`: 現在 review_status="pending" の active ファクト群 (UI で解消対象)
-    `auto_resolved_history`: conflicts_resolved.jsonl から読み込んだ自動マージ履歴
-        (`auto_evolved=True` policy の自動マージを timeline 表示する)
-    """
-
-    scope: str
-    pending: list[ConflictGroupInfo] = Field(default_factory=list)
-    auto_resolved_history: list[ConflictGroupInfo] = Field(default_factory=list)
-
-
-class ResolveConflictRequest(BaseModel):
-    """競合解消アクション (POST /api/memory/conflicts/resolve)
-
-    Args:
-        scope: ストアの scope ("global" または "project:<id>")
-        winner_id: ユーザーが残すと決めたファクト ID。
-            ``action="merge"`` の場合は、新規ファクトの subject/predicate/type を
-            借用する基準ファクトの ID。
-        loser_ids: supersede 対象のファクト ID 一覧。
-        action: 解消アクション。
-            ``keep_old`` / ``keep_new`` は ``winner_id`` を残し、loser を supersede。
-            ``merge`` は新規ファクトを作成して winner + losers をすべて supersede。
-        merged_object: ``action="merge"`` のときに必須。新規ファクトの ``object``。
-    """
-
-    scope: str
-    winner_id: str
-    loser_ids: list[str] = Field(default_factory=list)
-    action: str  # keep_old | keep_new | merge
-    merged_object: str | None = None
-
-
-class ResolveConflictResponse(BaseModel):
-    scope: str
-    action: str
-    winner_id: str
-    superseded_ids: list[str] = Field(default_factory=list)
-    new_fact_id: str | None = None  # action=merge のとき新規 fact id
-
-
 # ===== Model =====
 
 class ModelDetailResponse(BaseModel):
@@ -535,10 +399,10 @@ class RollbackResponse(BaseModel):
     lora_restored: bool
 
 
-# --- Component (assist / embedding / reranker) migration ---
+# --- Component (assist / embedding) migration ---
 
 class ComponentMigrateRequest(BaseModel):
-    """assist / embedding / reranker モデルの切替リクエスト"""
+    """assist / embedding モデルの切替リクエスト"""
     new_model_path: str
     dry_run: bool = False
     # L2: 既定で auto_restart=True。LlamaProcessManager が当該
@@ -656,8 +520,7 @@ class PresetApplyResponse(BaseModel):
     """プリセット適用結果
 
     ``restart_servers`` は起動引数が変わり再起動が必要な llama-server 名
-    ("base" / "assist" / "embed") の配列。reranker は enabled 切替で自動
-    起動/停止されるため含まない。
+    ("base" / "assist" / "embed") の配列。
     """
     applied: str
     changed_sections: list[str] = Field(default_factory=list)
@@ -852,10 +715,10 @@ class VramModelInfo(BaseModel):
     ``source="actual"`` は ``nvidia-smi`` 実測値で更新できたケース。
     ``source="estimate"`` は GGUF ファイルサイズ + ``gpu_layers`` からの推定値。
     ``present=False`` のモデルは設定未配置 / モデルファイル未配置 / 該当
-    backend 無効 (例: ``reranker.enabled=false``) 等のケース。
+    backend 無効等のケース。
     """
 
-    name: str  # "base" | "assist" | "embed" | "reranker"
+    name: str  # "base" | "assist" | "embed"
     present: bool = False
     vram_mb: int = 0
     gpu_layers: int = 0

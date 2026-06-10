@@ -71,7 +71,8 @@ async def ingest_document(
         chunker = SemanticChunker(
             chunk_size=rag_cfg.get("chunk_size", 512),
             chunk_overlap=rag_cfg.get("chunk_overlap", 128),
-            max_chunk=rag_cfg.get("max_chunk", 512),
+            min_chunk=rag_cfg.get("semantic_min_chunk", 64),
+            max_chunk=rag_cfg.get("semantic_max_chunk", 512),
             strategy=rag_cfg.get("chunking_strategy", "semantic"),
         )
         chunks = chunker.chunk(text)

@@ -21,9 +21,10 @@ from backend.free.api.chat._editor_routing import detect_editor_route
 from backend.free.agent.tool_call_judge import _extract_file_path
 from backend.free.api.chat.chat_recorder import record_response
 from backend.free.api.chat.chat_service import (
+    ConflictTurnContext,
     build_chat_messages, build_semmem_injection, convert_file_contexts,
     ensure_base_model_health,
-    ensure_llm_client, prepare_memory_context,
+    ensure_llm_client, maybe_resolve_pending_conflicts, prepare_memory_context,
     run_search_pipeline,
 )
 from backend.free.api.chat.chat_streaming import (
@@ -206,6 +207,7 @@ async def _build_messages_with_search(
     max_tokens: int | None,
     timer: StageTimer,
     editor_route: str | None = None,
+    conflict_ctx: ConflictTurnContext | None = None,
 ) -> tuple[list, StreamWrapper, str | None, list[tuple[str, float, str]] | None]:
     """統合検索を実行し ``messages`` / SSE 通知ラッパ / semmem ブロック / 取得済み
     scored_chunks を構築する。``scored_chunks`` は long_form 経路が orchestrator に
@@ -227,8 +229,10 @@ async def _build_messages_with_search(
         )
 
     # SemMem facts + STM notes を MemoryInjector で tier 整形して注入
-    # (RAG とは独立、読み取りのみ)
-    semmem_block = build_semmem_injection(state, cfg, mode=req.mode)
+    # (RAG とは独立、読み取りのみ)。pending 競合セクションも併せて連結する。
+    semmem_block = build_semmem_injection(
+        state, cfg, mode=req.mode, conflict_ctx=conflict_ctx,
+    )
 
     messages = build_chat_messages(
         system_prompt, history, rag_chunks, file_contexts,
@@ -620,6 +624,11 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         state.sleep_scheduler.on_user_input()
 
     history, session_id = await prepare_memory_context(req, state)
+    # pending 競合のユーザー回答判定 + 即時反映 (不変則例外 (b)、
+    # 解決結果は同ターンの semmem 注入へ反映する)
+    conflict_ctx = await maybe_resolve_pending_conflicts(
+        state, cfg, history, req.message,
+    )
     file_contexts = convert_file_contexts(req)
     system_prompt = _resolve_system_prompt(state, req.mode, instance_name)
 
@@ -689,6 +698,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             req, state, cfg, system_prompt, history, file_contexts,
             context_size, max_tokens, timer,
             editor_route=editor_route,
+            conflict_ctx=conflict_ctx,
         )
     )
 

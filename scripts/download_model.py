@@ -30,15 +30,6 @@ ASSIST_MODEL = {
     "dest": "models",
 }
 
-RERANKER_MODEL = {
-    # llama.cpp の /v1/rerank (--reranking, rank pooling) 対応の正変換版。
-    # 汎用コンバータ版 (mradermacher 等) は cls.output.weight 分類ヘッドが
-    # 欠落し全候補が ~1e-22 の退化スコアになるため使用しない。
-    "repo": "Voodisss/Qwen3-Reranker-0.6B-GGUF-llama_cpp",
-    "file": "Qwen3-Reranker-0.6B.Q8_0.gguf",
-    "dest": "models",
-}
-
 HF_BASE = "https://huggingface.co"
 
 
@@ -118,29 +109,16 @@ def download_assist(project_root: Path, force: bool = False) -> None:
     print("  Assist model ready")
 
 
-def download_reranker(project_root: Path, force: bool = False) -> None:
-    """リランカーモデル（GGUF）をダウンロード"""
-    repo = RERANKER_MODEL["repo"]
-    filename = RERANKER_MODEL["file"]
-    dest = project_root / RERANKER_MODEL["dest"] / filename
-
-    print(f"Downloading reranker model: {repo}/{filename}")
-    url = f"{HF_BASE}/{repo}/resolve/main/{filename}"
-    download_file(url, dest, filename, force=force)
-    print("  Reranker model ready")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download models for evoref")
     parser.add_argument("--embed", action="store_true", help="Download embedding model (GGUF)")
     parser.add_argument("--llm", action="store_true", help="Download LLM model (GGUF)")
     parser.add_argument("--assist", action="store_true", help="Download assist model (GGUF)")
-    parser.add_argument("--reranker", action="store_true", help="Download reranker model (GGUF)")
     parser.add_argument("--all", action="store_true", help="Download all models")
     parser.add_argument("--force", action="store_true", help="Force re-download even if files already exist")
     args = parser.parse_args()
 
-    if not (args.embed or args.llm or args.assist or args.reranker or args.all):
+    if not (args.embed or args.llm or args.assist or args.all):
         parser.print_help()
         sys.exit(1)
 
@@ -157,8 +135,6 @@ def main() -> None:
             download_llm(project_root, force=force)
         if args.assist or args.all:
             download_assist(project_root, force=force)
-        if args.reranker or args.all:
-            download_reranker(project_root, force=force)
     except RuntimeError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

@@ -46,7 +46,6 @@ if TYPE_CHECKING:
     from backend.free.rag.assist_judge_tracker import AssistJudgeUsageTracker
     from backend.free.rag.embedding_backend import EmbeddingBackend
     from backend.free.rag.lazy_contextual import LazyContextualPrefixService
-    from backend.free.rag.reranker_backend import RerankerBackend
     from backend.free.rag.cartridge_manager import CartridgeManager
     from backend.free.rag.vector_store import VectorStore
     from backend.free.themes.theme_service import ThemeManager
@@ -113,7 +112,6 @@ class AppState:
     # ── RAG ──
     vector_store: VectorStore | None = None
     embedder: EmbeddingBackend | None = None
-    reranker: RerankerBackend | None = None
     cartridge_manager: CartridgeManager | None = None
     # Lazy Contextual Retrieval — retrieval 時に on-demand で
     # プレフィックスを生成するサービス。``rag.contextual_prefix.mode=lazy``
@@ -134,7 +132,7 @@ class AppState:
     # ── model_state.json / config.yaml 整合性 ──
     # 不一致検出時のみ dict を格納 (current_filename / config_filename / recommendation)
     model_state_mismatch: dict | None = None
-    # component (assist/embed/reranker) の不一致。{config_key: {model_state, config}}
+    # component (assist/embed) の不一致。{config_key: {model_state, config}}
     component_state_mismatches: dict = field(default_factory=dict)
 
     # ── エージェント / プロンプト ──

@@ -1,19 +1,18 @@
 """llama-server 起動スクリプト
 
-config.yaml の llama / embedding / reranker セクションから起動コマンドを組み立て、
+config.yaml の llama / embedding セクションから起動コマンドを組み立て、
 サブプロセスとして llama-server を起動する。
 
 サブコマンド:
   (なし)     ベースモデル llama-server のみ起動
-  --all      ベース + エンベッド + リランカー（設定時）を一括起動
+  --all      ベース + アシスト + エンベッドを一括起動
   --embed    エンベッド用 llama-server のみ起動
-  --reranker リランカー用 llama-server のみ起動
 
   --all 起動時に ``runtime.total_vram_budget_mb`` (config.yaml) を参照し、
   GPU オフロード対象モデルの VRAM 使用量推定合計が予算を超過する場合は
   警告してアボートする。``--force`` で強制起動可能。
-  埋め込み / リランカー の ``-ngl`` 既定値は 0 (CPU フォールバック) とし、
-  GPU 割り当ては ``embedding.gpu_layers`` / ``reranker.gpu_layers`` による
+  埋め込みの ``-ngl`` 既定値は 0 (CPU フォールバック) とし、
+  GPU 割り当ては ``embedding.gpu_layers`` による
   明示 opt-in でのみ有効化される。
 
   起動時に ``llama-server --version`` を実行し build 番号をログに出力する。
@@ -23,8 +22,8 @@ config.yaml の llama / embedding / reranker セクションから起動コマ�
   検出失敗 (None) として警告のみで継続。
 
   llama.cpp
-  slot 退避機構 (``--cache-ram`` / ``--cache-idle-slots``) を全 4 サーバ
-  (base / assist / embed / reranker) で明示制御する。``cache_ram_mib`` /
+  slot 退避機構 (``--cache-ram`` / ``--cache-idle-slots``) を全 3 サーバ
+  (base / assist / embed) で明示制御する。``cache_ram_mib`` /
   ``cache_idle_slots`` を ``config.yaml`` から駆動し、上流のデフォルト
   (8192 MiB / true) を黙従する状態を解消する。``slots > 1`` かつ
   ``cache_ram_mib > 0`` の場合は idle slot offload が動作するよう
@@ -47,7 +46,7 @@ config.yaml の llama / embedding / reranker セクションから起動コマ�
   Pro 限定で有効化する。``evoref code`` モード
   の base モデルが対象。``EVOREF_EDITION`` 環境変数 + ``backend.pro`` パッケー
   ジ存在で Pro 判定し、Free 環境では ``llama.speculative.enabled=true`` でも
-  warning + 無効化する。assist / embed / reranker は対象外 (Issue 文 §スコープ)。
+  warning + 無効化する。assist / embed は対象外 (Issue 文 §スコープ)。
 """
 
 import os
@@ -72,19 +71,6 @@ def _resolve_embed_gpu_layers(cfg: dict) -> int:
     """
     emb_cfg = cfg.get("embedding", {}) or {}
     gpu_layers = emb_cfg.get("gpu_layers")
-    if gpu_layers is None:
-        return 0
-    return int(gpu_layers)
-
-
-def _resolve_reranker_gpu_layers(cfg: dict) -> int:
-    """リランカー用 ``-ngl`` の解決
-
-    ``reranker.gpu_layers`` が明示されていればそれを、未指定の場合は CPU
-    フォールバックとして 0 を返す。
-    """
-    reranker_cfg = cfg.get("reranker", {}) or {}
-    gpu_layers = reranker_cfg.get("gpu_layers")
     if gpu_layers is None:
         return 0
     return int(gpu_layers)
@@ -831,63 +817,6 @@ def build_assist_cmd(
     return cmd
 
 
-def build_reranker_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | None:
-    """config.yaml の reranker セクションからリランカー用 llama-server コマンドを生成
-
-    reranker が有効で backend が llama-cpp の場合のみコマンドを返す。
-    ``-ngl`` 既定値は 0
-    """
-    reranker_cfg = cfg.get("reranker", {})
-    if not reranker_cfg.get("enabled", False):
-        return None
-    if reranker_cfg.get("backend", "llama-cpp") != "llama-cpp":
-        return None
-
-    if project_root is None:
-        project_root = Path.cwd()
-
-    sp = cfg.get("model_paths", {})
-
-    # リランカーモデルパス
-    reranker_model = sp.get("reranker_model", "models/reranker.gguf")
-    reranker_model_path = Path(reranker_model)
-    if not reranker_model_path.is_absolute():
-        reranker_model_path = project_root / reranker_model_path
-
-    port = reranker_cfg.get("port", 8083)
-
-    cmd = [
-        "llama-server",
-        "-m", str(reranker_model_path),
-        "--port", str(port),
-        "--reranking",
-        "-ngl", str(_resolve_reranker_gpu_layers(cfg)),
-    ]
-
-    # idle slot offload は短時間推論を大量に行うリランカーでは恩恵が薄く、
-    # 長時間運用時のキャッシュ破損リスクを排除するため既定 0 で明示 disable
-    # する
-    cache_ram_mib = _resolve_cache_ram_mib(reranker_cfg, default=0)
-    cmd += ["--cache-ram", str(cache_ram_mib)]
-
-    # 物理バッチサイズ (config 駆動)。指定が無ければ llama-server のデフォルトに任せる。
-    # rag.chunk_size を超える入力で 500 エラーになるのを防ぐため、reranker.batch_size /
-    # reranker.ubatch_size で明示的にチューニングする。
-    batch_size = reranker_cfg.get("batch_size")
-    if batch_size is not None:
-        cmd += ["-b", str(batch_size)]
-    ubatch_size = reranker_cfg.get("ubatch_size")
-    if ubatch_size is not None:
-        cmd += ["-ub", str(ubatch_size)]
-
-    # 追加オプション（ユーザーによるチューニング用）
-    extra_args = reranker_cfg.get("extra_args", [])
-    if extra_args:
-        cmd += list(extra_args)
-
-    return cmd
-
-
 # ── VRAM 予算検査 ─────────────────────────────────
 
 
@@ -1464,33 +1393,6 @@ def _estimate_via_gguf_size(
             "estimated_via": "gguf-size",
         }
 
-    # リランカー
-    reranker_cfg = cfg.get("reranker", {}) or {}
-    reranker_enabled = bool(reranker_cfg.get("enabled", False))
-    reranker_backend_ok = reranker_cfg.get("backend", "llama-cpp") == "llama-cpp"
-    if reranker_enabled and reranker_backend_ok:
-        rr_path = _resolve_model_path(cfg, "reranker_model", "", project_root)
-        rr_ngl = _resolve_reranker_gpu_layers(cfg)
-        rr_size = _file_size_mb(rr_path)
-        result["reranker"] = {
-            "model_mb": rr_size,
-            "gpu_layers": rr_ngl,
-            "vram_mb": (rr_size or 0) if rr_ngl > 0 else 0,
-            "present": rr_size is not None,
-            "path": str(rr_path),
-            "context_mb": None,
-            "compute_mb": None,
-            "device": None,
-            "estimated_via": "gguf-size",
-        }
-    else:
-        result["reranker"] = {
-            "model_mb": None, "gpu_layers": 0, "vram_mb": 0,
-            "present": False, "path": "",
-            "context_mb": None, "compute_mb": None, "device": None,
-            "estimated_via": "gguf-size",
-        }
-
     return result
 
 
@@ -1599,7 +1501,7 @@ def _parse_device_memory(text: str) -> dict[str, tuple[int, int]]:
 # backend/config.py::_CONTEXT_SIZE_FALLBACK と一致させること (サーバ ``-c`` と
 # ランタイム token budget の値を揃えるため)。
 _CONTEXT_SIZE_DEFAULTS: dict[str, int] = {
-    "base": 8192, "assist": 8192, "embed": 8192, "reranker": 8192,
+    "base": 8192, "assist": 8192, "embed": 8192,
 }
 
 
@@ -1633,7 +1535,7 @@ def resolve_context_size_for(
     (``llama.context_size`` / ``assist_model.local.context_size``) が ``None``
     (未指定) のときのみ profile を参照する。プロファイル参照は base / assist の
     み、かつ ``project_root`` 指定時のみ (未指定なら config + 既定で解決)。
-    embed / reranker は profile 非対象 (従来挙動)。
+    embed は profile 非対象 (従来挙動)。
     """
     default = _CONTEXT_SIZE_DEFAULTS.get(name, 8192)
     if name == "base":
@@ -1646,8 +1548,6 @@ def resolve_context_size_for(
         model_key = "assist_model"
     elif name == "embed":
         return int((cfg.get("embedding") or {}).get("context_size", default))
-    elif name == "reranker":
-        return int((cfg.get("reranker") or {}).get("context_size", default))
     else:
         return default
 
@@ -2091,7 +1991,7 @@ def format_placement_summary(estimates: dict[str, dict]) -> list[str]:
     が含まれる場合は subline として draft GGUF 情報を追加表示する。
     """
     lines: list[str] = []
-    for name in ("base", "assist", "embed", "reranker"):
+    for name in ("base", "assist", "embed"):
         entry = estimates.get(name, {})
         if not entry.get("present"):
             lines.append(
@@ -2190,7 +2090,7 @@ def check_vram_budget(
             return True, total_vram_mb, int(budget_mb), estimates, "\n".join(lines)
         lines.append(
             "[launch] Aborting. Re-run with --force to override, or set "
-            "embedding.gpu_layers / reranker.gpu_layers to 0 (CPU fallback) "
+            "embedding.gpu_layers to 0 (CPU fallback) "
             "or raise runtime.total_vram_budget_mb to continue."
         )
         return False, total_vram_mb, int(budget_mb), estimates, "\n".join(lines)
@@ -2389,7 +2289,6 @@ if __name__ == "__main__":
     parser.add_argument("--all", action="store_true", help="Launch all configured servers")
     parser.add_argument("--embed", action="store_true", help="Launch embedding server only")
     parser.add_argument("--assist", action="store_true", help="Launch assist model server only")
-    parser.add_argument("--reranker", action="store_true", help="Launch reranker server only")
     parser.add_argument(
         "--force",
         action="store_true",
@@ -2408,14 +2307,13 @@ if __name__ == "__main__":
 
     procs: list[subprocess.Popen] = []
 
-    launch_base = not args.embed and not args.assist and not args.reranker
+    launch_base = not args.embed and not args.assist
     launch_embed = args.embed or args.all
     launch_assist = args.assist or args.all
-    launch_reranker = args.reranker or args.all
 
     # llama-server バージョン検査。--all / 個別起動を問わず
     # llama-server バイナリを起動する全パスで一度だけ build 番号を確認する。
-    # ベース / アシスト / 埋め込み / リランカーは同一バイナリを使うため、
+    # ベース / アシスト / 埋め込みは同一バイナリを使うため、
     # 起動前に 1 回プローブして INFO ログに出力する。
     build_ok, _detected, _required, build_messages = check_llamacpp_build(cfg)
     for line in build_messages:
@@ -2427,7 +2325,7 @@ if __name__ == "__main__":
         sys.exit(3)
 
     # VRAM 予算検査は --all (全モデル一括起動) 時のみ実行する。
-    # 個別起動 (--embed / --assist / --reranker) では既存プロセスとの
+    # 個別起動 (--embed / --assist) では既存プロセスとの
     # 合算が読み取れないため検査をスキップする。
     if args.all:
         ok, _total, _budget, _estimates, message = check_vram_budget(
@@ -2471,19 +2369,6 @@ if __name__ == "__main__":
                 procs.append(_start_and_wait(embed_cmd, "embedding", host, port, cwd=project_root))
             else:
                 print("[launch] Embedding backend is not llama-cpp, skipping")
-
-        # リランカー
-        if launch_reranker:
-            reranker_cmd = build_reranker_cmd(cfg, project_root)
-            if reranker_cmd:
-                reranker_cfg = cfg.get("reranker", {})
-                host = reranker_cfg.get("host", "localhost")
-                port = reranker_cfg.get("port", 8083)
-                # embed と同じ pinned-memory warning が出る可能性あり (詳細はembed側
-                # コメント参照)。CPU buffer フォールバックで動作継続。
-                procs.append(_start_and_wait(reranker_cmd, "reranker", host, port, cwd=project_root))
-            else:
-                print("[launch] Reranker not configured or not llama-cpp, skipping")
 
         if procs:
             for proc in procs:

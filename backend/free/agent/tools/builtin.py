@@ -101,6 +101,41 @@ def verify_syntax(file_path: str) -> str:
         return f"Error: {e}"
 
 
+# リッチ(バイナリ)文書形式: プレーンテキスト書込みでは壊れたファイルになるため、
+# backend.export レジストリ経由で実体 (OOXML / OPF 等) を生成する。Writer 未登録の
+# Free 単体でも「リッチ形式の意図」を検知して明示エラーにするための最小定数
+# (backend.pro は import しない)。
+_EXPORT_DOC_EXTS = frozenset(
+    {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".epub"},
+)
+
+
+def _write_rich_document(p: Path, content: str) -> str:
+    """``.docx`` 等のリッチ形式を export フレームワーク経由で実ファイル化する。
+
+    Pro Writer (python-docx 等) がグローバルレジストリに登録・利用可能なら
+    OOXML 等を生成する。未登録 / ライブラリ未導入の場合は壊れたファイルを
+    書かず、必要パッケージを案内する明示エラーを返す (fail clearly)。
+    """
+    from backend.export import get_writer_registry
+    from backend.export.base import ExportContent
+
+    ext = p.suffix.lower()
+    registry = get_writer_registry()
+    writer = registry.get_writer(ext)
+    if writer is None or not writer.is_available():
+        requires = ", ".join(writer.requires) if writer else "python-docx"
+        return (
+            f"Error: '{ext}' output requires {requires} (Pro edition). "
+            "Install the package, or use a text format such as .txt / .md."
+        )
+    try:
+        result = registry.write(ExportContent(raw_markdown=content), p)
+        return f"Written {result.size_bytes} bytes to {p}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
 def write_file(file_path: str, content: str) -> str:
     """ファイルに書き込む
 
@@ -110,6 +145,9 @@ def write_file(file_path: str, content: str) -> str:
     なっていたため廃止した。長文生成経路は書込み前に
     ``_resolve_long_form_target_path`` でディレクトリ→ファイル名を解決済みのため
     影響しない。ディレクトリ配下の点検は list_directory / read_file を使う。
+
+    ``.docx`` 等のリッチ文書形式 (``_EXPORT_DOC_EXTS``) は export フレームワーク
+    経由で実体を生成する。それ以外は UTF-8 テキストとして書き込む。
     """
     p = Path(file_path)
     if p.is_dir():
@@ -117,6 +155,8 @@ def write_file(file_path: str, content: str) -> str:
             f"Error: '{file_path}' is a directory, not a file. "
             "Provide a file path, or use list_directory/read_file to inspect it."
         )
+    if p.suffix.lower() in _EXPORT_DOC_EXTS:
+        return _write_rich_document(p, content)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")

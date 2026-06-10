@@ -17,7 +17,6 @@
 	let local = $derived((assistModel.local ?? {}) as AssistModelLocalConfig);
 	let concurrency = $derived((assistModel.concurrency ?? {}) as Record<string, number>);
 	let embedding = $derived(configSection($configData, 'embedding'));
-	let reranker = $derived(configSection($configData, 'reranker'));
 </script>
 
 <SettingsSection tabId="model">
@@ -67,17 +66,5 @@
 		<ToggleField label="settings.embedding.cache_enabled" value={Boolean(embedding.cache_enabled ?? true)} onchange={fieldUpdater('embedding', 'cache_enabled')} />
 		<NumberField label="settings.embedding.cache_max_mb" value={Number(embedding.cache_max_mb ?? 100)} min={1} onchange={fieldUpdater('embedding', 'cache_max_mb')} />
 		<TextField label="settings.embedding.cache_dir" value={String(embedding.cache_dir ?? '')} onchange={fieldUpdater('embedding', 'cache_dir')} />
-	</FieldGroup>
-
-	<!-- リランカー -->
-	<FieldGroup label="settings.group_model_reranker">
-		<ToggleField label="settings.reranker.enabled" value={Boolean(reranker.enabled ?? false)} onchange={fieldUpdater('reranker', 'enabled')} />
-		<ComponentMigrateButton component="reranker" currentModel={String(models.reranker_model ?? '')} onMigrated={loadConfig} />
-		<TextField label="settings.reranker.backend" value={String(reranker.backend ?? 'llama-cpp')} onchange={fieldUpdater('reranker', 'backend')} />
-		<TextField label="settings.reranker.host" value={String(reranker.host ?? 'localhost')} onchange={fieldUpdater('reranker', 'host')} />
-		<NumberField label="settings.reranker.port" value={Number(reranker.port ?? 8083)} min={1024} max={65535} onchange={fieldUpdater('reranker', 'port')} />
-		<TextField label="settings.reranker.model_name" value={String(reranker.model_name ?? '')} onchange={fieldUpdater('reranker', 'model_name')} />
-		<NumberField label="settings.reranker.timeout" value={Number(reranker.timeout ?? 30)} min={0.1} step={0.5} onchange={fieldUpdater('reranker', 'timeout')} />
-		<NumberField label="settings.reranker.candidates_multiplier" value={Number(reranker.candidates_multiplier ?? 3)} min={1} max={10} onchange={fieldUpdater('reranker', 'candidates_multiplier')} />
 	</FieldGroup>
 </SettingsSection>

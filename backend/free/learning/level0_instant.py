@@ -20,7 +20,6 @@ class FeedbackSignals:
     rag_used: bool = False
     rag_source: str | None = None
     rag_top1_score: float | None = None
-    rag_reranked: bool = False
     agent_loops: int = 0
     user_correction: str | None = None
     correction_detected_by: str | None = None  # "hardcoded" | "learned" | None
@@ -147,7 +146,6 @@ class ExperienceBuffer(JsonStateStore):
                     rag_used=signals_data.get("rag_used", False),
                     rag_source=signals_data.get("rag_source"),
                     rag_top1_score=signals_data.get("rag_top1_score"),
-                    rag_reranked=signals_data.get("rag_reranked", False),
                     agent_loops=signals_data.get("agent_loops", 0),
                     user_correction=signals_data.get("user_correction"),
                     correction_detected_by=signals_data.get("correction_detected_by"),

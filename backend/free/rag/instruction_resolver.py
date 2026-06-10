@@ -1,11 +1,10 @@
 """instruction-aware モデル共通の instruction 解決・テンプレート整形ヘルパ。
 
-Qwen3-Embedding (``embedding_llamacpp``) と Qwen3-Reranker
-(``reranker_llamacpp``) で AST 一致していた ``_resolve_instruction`` /
+Qwen3-Embedding (``embedding_llamacpp``) の ``_resolve_instruction`` /
 テンプレート整形ロジックを集約する (EvorefGen / RAG pillar 内)。
 
 ログのバックエンド識別子は呼び出し側が ``backend_label`` で渡す
-(``"embed_query"`` / ``"rerank"`` 等。元実装のログ prefix を保つ)。
+(``"embed_query"`` 等。元実装のログ prefix を保つ)。
 """
 
 from __future__ import annotations

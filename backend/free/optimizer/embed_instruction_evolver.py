@@ -59,14 +59,7 @@ class EmbedInstructionEvolver(PromptEvolver):
             top1 = signals.get("rag_top1_score")
             if top1 is None:
                 continue
-
-            # リランカー未使用時のスコアを優先
-            reranked = signals.get("rag_reranked", False)
-            if reranked:
-                # リランカー効果を含むため、やや割り引いて評価
-                scores.append(top1 * 0.8)
-            else:
-                scores.append(top1)
+            scores.append(top1)
 
         if not scores:
             return 0.0

@@ -12,10 +12,6 @@ import numpy as np
 from backend.log_config import get_logger
 from backend.trace_context import run_in_executor_with_context
 from backend.free.rag.chunk_content_gate import ChunkContentGate, GateConfig
-from backend.free.rag.reranker_skip import (
-    evaluate_reranker_skip,
-    is_skip_config_active,
-)
 from backend.free.rag.self_rag_judge import (
     QualityThresholds,
     RetrievalNecessityJudge,
@@ -30,7 +26,6 @@ if TYPE_CHECKING:
     from backend.free.core.stage_timer import StageTimer
     from backend.free.rag.assist_judge_tracker import AssistJudgeUsageTracker
     from backend.free.rag.lazy_contextual import LazyContextualPrefixService
-    from backend.free.rag.reranker_backend import RerankerBackend
 
 logger = get_logger("memory.search_pipeline")
 
@@ -47,44 +42,20 @@ class SearchResult:
     skipped: bool = False
 
 
-def _resolve_candidates_multiplier(
-    cfg: dict, reranker: "RerankerBackend | None",
-) -> int:
-    """reranker 有効時の候補拡張倍率を解決する。
+def _resolve_fetch_multiplier(cfg: dict) -> int:
+    """候補拡張倍率を解決する。
 
-    無効時は 1（拡張なし）を返す。
+    ``rag.fetch_multiplier`` (既定 1 = 拡張なし) を用いて LTM / カートリッジの
+    取得件数を ``top_k * N`` へ広げ、「広く取って絞る」第1段として候補プールを
+    確保する (STM は ``stm_top_k`` 固定で拡張対象外)。値は [1, 5] にクランプする。
     """
-    if reranker is None or not getattr(reranker, "is_active", False):
-        return 1
-    reranker_cfg = cfg.get("reranker") or {}
-    multiplier = reranker_cfg.get("candidates_multiplier", 3)
+    rag_cfg = cfg.get("rag") or {}
+    multiplier = rag_cfg.get("fetch_multiplier", 1)
     try:
         multiplier = int(multiplier)
     except (TypeError, ValueError):
-        multiplier = 3
-    return max(1, multiplier)
-
-
-def _resolve_rerank_candidate_cap(cfg: dict, top_k: int, multiplier: int) -> int:
-    """リランカーへ投入する候補数の上限を解決する
-
-    計測の結果 merged が STM(3) + LTM(fetch_k) + cart(fetch_k) のユニオン
-    として 25 件前後まで膨らみ、リランカーが 1 件あたり ~55ms かかる構造が
-    判明した。本上限はリランカーへ渡す前に hybrid score 上位のみへ縮小し、
-    forward pass を線形に短縮する。検索品質判定 (Step 5) は merged 全件で
-    動作するため、この上限は順位付けの計算量にのみ影響する。
-
-    未指定時のデフォルトは ``top_k * candidates_multiplier`` (例: 5*3=15)。
-    ``top_k`` 未満には絶対に下げない（リランカーが top_k を返せなくなるため）。
-    """
-    reranker_cfg = cfg.get("reranker") or {}
-    cap = reranker_cfg.get("rerank_candidate_cap")
-    if cap is None:
-        return max(top_k, top_k * multiplier)
-    try:
-        return max(top_k, int(cap))
-    except (TypeError, ValueError):
-        return max(top_k, top_k * multiplier)
+        multiplier = 1
+    return max(1, min(5, multiplier))
 
 
 def _resolve_search_params(
@@ -239,7 +210,6 @@ async def _maybe_assist_judge_quality(
     query: str,
     assist_client,
     rag_cfg: dict,
-    reranker: "RerankerBackend | None" = None,
     *,
     session_id: str = "default",
     tracker: "AssistJudgeUsageTracker | None" = None,
@@ -253,24 +223,11 @@ async def _maybe_assist_judge_quality(
     制御する。上限超過・無効・quality 非該当の場合は ``debug_logger``
     へ ``op="assist_judge"`` + ``assist_judge_skipped_reason`` を記録し、
     ルールベース判定をそのまま返す。
-
-    リランカーが有効な場合は LLM 品質再判定をスキップする
-    リランカーがクロスエンコーダで merged を強力に再順位付けするため、
-    assist LLM による medium→low 再分類 (→ クエリ拡張トリガー) の効果は
-    限定的。1 回の assist LLM 呼び出し (generate_json, 中央値 ~500-800ms)
-    が `search_ms` 残差の長い裾を支配していたため削減対象とする。
     """
     aj_cfg = _resolve_assist_judge_cfg(rag_cfg)
 
     # 前提条件: assist_client が無ければ判定不能 (skip ログは出さない)
     if assist_client is None:
-        return quality
-
-    # リランカー有効時は skip (skip ログは出さない — 既存挙動維持)
-    if reranker is not None and getattr(reranker, "is_active", False):
-        logger.debug(
-            "Step 5b assist judge skipped: reranker active"
-        )
         return quality
 
     # tracker が無いとセッション累計を追えないので、記録対象から外す
@@ -401,7 +358,6 @@ async def unified_search(
     debug_logger=None,
     mode: str = "chat",
     policy: PolicyInterpreter | None = None,
-    reranker: "RerankerBackend | None" = None,
     timer: "StageTimer | None" = None,
     semmem_stats: dict | None = None,
     lazy_contextual: "LazyContextualPrefixService | None" = None,
@@ -412,7 +368,7 @@ async def unified_search(
     quality_prompt: str | None = None,
     assist_experience_recorder: "Callable[[str, str, str, float], None] | None" = None,
 ) -> SearchResult:
-    """統合検索パイプライン: Self-RAG + 3層メモリ + (任意) リランカー
+    """統合検索パイプライン: Self-RAG + 3層メモリ
 
     デフォルトはルールベース + ベクトル演算で完結（ベースモデル呼び出しゼロ）。
     ``rag.self_rag.assist_judge.enabled=true`` (既定) 時、
@@ -421,9 +377,8 @@ async def unified_search(
     ``max_per_session`` / ``max_per_query`` の発火上限とセッション単位の
     カウンタを追加し、ユーザ体感レイテンシへの影響を抑制する。
     STM / LTM / カートリッジ検索を asyncio.gather で並列実行する。
-    `reranker` 指定時かつ `is_active=True` の場合、各層の取得件数を
-    `top_k * candidates_multiplier` に拡張し、マージ後にリランカーで
-    `top_k` 件まで再順位付けする
+    ``rag.fetch_multiplier`` が 2 以上の場合、LTM / カートリッジの取得件数を
+    `top_k * N` に拡張する (STM は `stm_top_k` 固定)。
 
     Args:
         session_id: assist_judge の発火カウンタキー
@@ -436,7 +391,7 @@ async def unified_search(
     cfg = config or {}
     rag_cfg = cfg.get("rag", {})
     top_k, stm_top_k, noise_sigma = _resolve_search_params(policy, rag_cfg, mode)
-    multiplier = _resolve_candidates_multiplier(cfg, reranker)
+    multiplier = _resolve_fetch_multiplier(cfg)
     fetch_k = top_k * multiplier
     logger.debug(
         "unified_search: query=%r, top_k=%d, fetch_k=%d (mult=%d)",
@@ -482,7 +437,7 @@ async def unified_search(
         return SearchResult(skipped=True, from_memory=True)
 
     # Step 2-3: STM / LTM / カートリッジを asyncio.gather で並列実行（設計書 4.10.1）
-    # reranker 有効時は fetch_k 件を取得し、後段でリランカーが top_k に絞る
+    # fetch_multiplier >= 2 のときは fetch_k 件を取得し、後段で top_k に絞る
     cart_timeout_ms = int(rag_cfg.get("cartridge_search_timeout_ms", 3000))
     stm_results, ltm_results, cart_results = await asyncio.gather(
         _search_stm_layer(short_term, query_vec, stm_top_k),
@@ -503,41 +458,61 @@ async def unified_search(
             name=f"lazy_contextual_hits[{len(ltm_chunk_ids)}]",
         )
 
-    # Step 4: 結果マージ + スコア正規化（< 0.5ms）
-    merged = _merge_results(stm_results, ltm_results, cart_results)
-    logger.debug("Step 4 merge: %d unique results after dedup", len(merged))
+    # Step 4: 結果マージ。merged_raw は生スコア (品質判定 / gate / クエリ拡張用)、
+    # merged は最終順位付け用。score_normalization でクロスレイヤ正規化を適用し、
+    # STM/LTM/cartridge の異種スコアスケールの歪みを吸収する。
+    norm = rag_cfg.get("score_normalization", "none")
+    merged_raw = _merge_results(stm_results, ltm_results, cart_results)
+    if norm == "none":
+        merged = merged_raw
+    else:
+        merged = _merge_results(
+            stm_results, ltm_results, cart_results, normalization=norm,
+        )
+    logger.debug(
+        "Step 4 merge: %d unique results after dedup (normalization=%s)",
+        len(merged_raw), norm,
+    )
 
     # Step 4.5: 取得直後の内容精査ゲート — 低価値 chunk を pruning し、後続の
-    # 品質判定 / クエリ拡張 / reranker forward pass の候補数を縮小する。
+    # 品質判定 / クエリ拡張の候補数を縮小する。
     # coding mode を主対象 (chat mode は近似重複除去のみ)。marginal band の
     # prose のみ assist で 1 回関連性判定する (assist 無/cap 超過/error は純ルール)。
+    # gate は生スコア (relevance_floor は cosine 前提) で判定するため merged_raw に
+    # 適用し、残った chunk_id 集合を正規化側 merged にも射影する。
     gate_cfg = GateConfig.from_rag_cfg(rag_cfg)
-    if gate_cfg.enabled and merged:
-        merged = await ChunkContentGate(
+    if gate_cfg.enabled and merged_raw:
+        merged_raw = await ChunkContentGate(
             gate_cfg, debug_logger=debug_logger,
         ).filter(
-            query, merged, mode,
+            query, merged_raw, mode,
             assist_client=assist_client,
             tracker=assist_judge_tracker,
             session_id=session_id,
         )
-        logger.debug("Step 4.5 content gate: %d results after prune", len(merged))
+        if norm == "none":
+            merged = merged_raw
+        else:
+            kept = {cid for cid, _, _ in merged_raw}
+            merged = [t for t in merged if t[0] in kept]
+        logger.debug("Step 4.5 content gate: %d results after prune", len(merged_raw))
 
     # Step 5: Self-RAG 品質判定 + (オプション) アシスト強化（< 0.1ms）
+    # 判定は常に生スコア (merged_raw) に対して行う。品質3閾値は cosine 分布前提の
+    # ため、正規化スコアを渡すと閾値の意味が崩れる。
     thresholds = QualityThresholds.from_config(rag_cfg)
     # decision.jsonl に記録 (decision_point=``self_rag_judge_path``)
     quality_judge = RetrievalQualityJudge(
         thresholds, debug_logger=debug_logger,
         quality_instructions=quality_prompt,
     )
-    quality = quality_judge.judge(merged)
+    quality = quality_judge.judge(merged_raw)
     logger.debug("Step 5 quality: %s", quality)
     if timer is not None:
         timer.start("assist_judge_ms")
     try:
         quality = await _maybe_assist_judge_quality(
-            quality_judge, quality, merged, query, assist_client, rag_cfg,
-            reranker=reranker,
+            quality_judge, quality, merged_raw, query, assist_client, rag_cfg,
             session_id=session_id,
             tracker=assist_judge_tracker,
             debug_logger=debug_logger,
@@ -547,33 +522,29 @@ async def unified_search(
         if timer is not None:
             timer.stop("assist_judge_ms")
 
-    # Step 6: 品質不足時のクエリ拡張フォールバック
-    merged, quality = await _try_quality_expansion(
-        quality, merged, quality_judge, query, query_vec,
+    # Step 6: 品質不足時のクエリ拡張フォールバック (生スコアで再検索)。
+    # 拡張が発火した場合 (quality=="low" の稀ケース) は結果集合が変わるため、
+    # 正規化側 merged も生順 (拡張結果込み) にフォールバックして確実に届ける。
+    expanded, quality = await _try_quality_expansion(
+        quality, merged_raw, quality_judge, query, query_vec,
         working_mem, long_term, top_k, noise_sigma,
     )
+    if expanded is not merged_raw:
+        merged_raw = expanded
+        merged = expanded
 
-    # Step 7: リランカー適用
-    # 上位 N 件にキャップしてリランカー forward pass を短縮
-    # reranker.skip の quality-aware 条件で高 confidence 時は短絡
-    # ``mode`` を reranker へ伝搬し instruction-aware に切替
-    candidate_cap = _resolve_rerank_candidate_cap(cfg, top_k, multiplier)
-    final_sources = await _maybe_rerank(
-        reranker, query, merged, top_k,
-        timer=timer, candidate_cap=candidate_cap,
-        cfg=cfg, debug_logger=debug_logger, mode=mode,
-    )
+    # Step 7: 最終順位付け (merged はスコア降順) から top_k 件を採用
+    final_sources = merged[:top_k]
 
     # Step 7.5: カートリッジ公平性保証
-    # ロード済みカートリッジが reranker / 上位選別で完全に欠落するのを防ぐ
+    # ロード済みカートリッジが上位選別で完全に欠落するのを防ぐ
     final_sources = _ensure_cartridge_fairness(
         final_sources, cart_results, top_k,
     )
 
     logger.info(
-        "Search completed: %d results, quality=%s, from_memory=%s, reranked=%s",
+        "Search completed: %d results, quality=%s, from_memory=%s",
         len(final_sources), quality, bool(stm_results),
-        bool(reranker and getattr(reranker, "is_active", False) and merged),
     )
     _log_memory_search_state(
         debug_logger, context_count, stm_results, ltm_results,
@@ -585,84 +556,6 @@ async def unified_search(
         quality=quality,
         from_memory=bool(stm_results),
     )
-
-
-async def _maybe_rerank(
-    reranker: "RerankerBackend | None",
-    query: str,
-    merged: list[tuple[str, float, str]],
-    top_k: int,
-    timer: "StageTimer | None" = None,
-    candidate_cap: int | None = None,
-    cfg: dict | None = None,
-    debug_logger: "DebugLogger | None" = None,
-    mode: str = "chat",
-) -> list[tuple[str, float, str]]:
-    """リランカー有効時に merged を再順位付けし top_k 件返す。
-
-    無効/空入力/失敗時は単純に `merged[:top_k]` を返す。
-    `timer` 指定時は `rerank_ms` ステージとして計測を記録する。
-    `candidate_cap` 指定時は hybrid score 上位 N 件のみリランカーへ渡し、
-    forward pass のコストを抑える。``None`` または
-    ``len(merged)`` 以上の値は無視され、従来通り全件投入する。
-
-    ``cfg`` に ``reranker.skip`` のしきい値が設定されている場合
-    融合後 top スコア / gap / 候補数を評価し、高 confidence 時は cross-encoder
-    forward pass を skip する。skip 時は ``debug_logger.log_rerank_skipped``
-    を介して ``rag.jsonl`` に ``op="rerank_skip"`` エントリを書き出す。
-    """
-    if not merged:
-        return []
-    if reranker is None or not getattr(reranker, "is_active", False):
-        return merged[:top_k]
-
-    if candidate_cap is not None and 0 < candidate_cap < len(merged):
-        candidates = merged[:candidate_cap]
-    else:
-        candidates = merged
-
-    # quality-aware skip 条件を評価
-    if is_skip_config_active(cfg):
-        decision = evaluate_reranker_skip(candidates, cfg)
-        if decision.should_skip:
-            logger.debug(
-                "Reranker skipped by quality gate: reason=%s, top_score=%.4f, "
-                "gap=%.4f, candidates=%d",
-                decision.reason, decision.top_score,
-                decision.gap, decision.candidates_count,
-            )
-            if debug_logger is not None:
-                debug_logger.log_rerank_skipped(
-                    query_preview=query,
-                    candidates_count=decision.candidates_count,
-                    reason=decision.reason,
-                    top_score=decision.top_score,
-                    gap=decision.gap,
-                    source="unified_search",
-                )
-            return candidates[:top_k]
-
-    docs = [text for _, _, text in candidates]
-    try:
-        if timer is not None:
-            timer.start("rerank_ms")
-        # mode 別 instruction を reranker へ伝搬
-        ranked = await reranker.rerank(query, docs, top_k, mode=mode)
-    except Exception as e:  # noqa: BLE001 — 失敗時は元順序にフォールバック
-        logger.warning("Reranker failed in unified_search: %s", e)
-        return merged[:top_k]
-    finally:
-        if timer is not None:
-            timer.stop("rerank_ms")
-
-    if not ranked:
-        return merged[:top_k]
-    # rerank スコアで置換しつつ chunk_id / text を保持
-    return [
-        (candidates[idx][0], float(score), candidates[idx][2])
-        for idx, score in ranked
-        if 0 <= idx < len(candidates)
-    ][:top_k]
 
 
 def _cartridge_id_of(chunk_id: str) -> str | None:
@@ -689,16 +582,23 @@ def _ensure_cartridge_fairness(
     その入力チャンクの先頭 (= ラウンドロビン優先順位の最高) を最終結果に
     強制的に含める。
 
-    リランカー / グローバルスコアソートが特定カートリッジを完全に除外する
+    グローバルスコアソートが特定カートリッジを完全に除外する
     挙動を補正することが目的。複数カートリッジが存在しないケースでは
     `final` をそのまま返す (no-op)。
 
     既に `final` の長さが `top_k` 未満なら末尾追加し、満杯の場合は最低
     スコアの非カートリッジ要素または別カートリッジで重複代表されている
     要素を差し替える。
+
+    注入エントリのスコアは `final` 内の最低スコアへ揃える。`final` は
+    score_normalization 適用済み [0,1] であり、
+    `cart_results` の生スコア (cosine*priority、無上限) を持ち込むと下流の
+    SalienceRanker min-max が歪むため。強制注入 = 最下位相当の意味付け。
     """
     if not cart_results or not final:
         return final
+
+    floor_score = min(s for _, s, _ in final)
 
     input_carts: list[str] = []
     seen_input: set[str] = set()
@@ -732,9 +632,10 @@ def _ensure_cartridge_fairness(
     result = list(final)
 
     for cart_id in missing:
-        chunk = cart_top_chunk[cart_id]
-        if chunk[0] in existing_ids:
+        raw = cart_top_chunk[cart_id]
+        if raw[0] in existing_ids:
             continue
+        chunk = (raw[0], floor_score, raw[2])
         if len(result) < top_k:
             result.append(chunk)
             existing_ids.add(chunk[0])
@@ -790,15 +691,58 @@ def _find_replaceable_index(
     return None
 
 
+def _normalize_layer(
+    layer: list[tuple[str, float, str]],
+    method: str,
+) -> list[tuple[str, float, str]]:
+    """1 層 (STM/LTM/cartridge) 内でスコアを正規化する。
+
+    ``minmax``: 層内 min-max で [0, 1] へ写像。レンジ 0 (1 件 / 全同値) は
+        0 に潰さず一律 1.0 とする (単独層を層間で不利にしないため)。
+    ``rank``: 1 位=1.0 … 最下位=1/n の線形ランク減衰。n=1 は 1.0。
+    ``none`` / 未知: 入力をそのまま返す (no-op)。空層は空リスト。
+
+    combined スコアをスカラとして正規化するため、STM の blended
+    (cosine*0.6+lightmem*0.4) や cartridge の cosine*priority の内訳は壊さない
+    (層内相対順位は不変、層間スケールのみ揃う)。cartridge priority は無上限だが
+    層内 min-max が層内相対順位を保ったまま [0,1] に収めるため歪みを吸収する。
+    """
+    n = len(layer)
+    if n == 0:
+        return []
+    if method == "minmax":
+        scores = [s for _, s, _ in layer]
+        lo = min(scores)
+        hi = max(scores)
+        rng = hi - lo
+        if rng <= 1e-12:
+            return [(cid, 1.0, text) for cid, _, text in layer]
+        return [(cid, (s - lo) / rng, text) for cid, s, text in layer]
+    if method == "rank":
+        order = sorted(range(n), key=lambda i: -layer[i][1])
+        norm = [0.0] * n
+        for rank, idx in enumerate(order):
+            norm[idx] = (n - rank) / n
+        return [(layer[i][0], norm[i], layer[i][2]) for i in range(n)]
+    return layer
+
+
 def _merge_results(
     *result_lists: list[tuple[str, float, str]],
+    normalization: str = "none",
 ) -> list[tuple[str, float, str]]:
-    """結果をマージしてスコア降順でソート（重複排除）"""
+    """結果をマージしてスコア降順でソート（重複排除）。
+
+    ``normalization`` が ``minmax`` / ``rank`` のとき、各 result_list を 1 層と
+    みなして層内でスコアを正規化してからマージし、STM/LTM/cartridge の異種
+    スコアスケールを吸収する。``none`` (既定) は従来どおり生スコアでマージする。
+    重複は最初に出現した層の要素を採用する (先勝ち、スコアに非依存=現状一致)。
+    """
     seen: set[str] = set()
     merged: list[tuple[str, float, str]] = []
 
     for results in result_lists:
-        for chunk_id, score, text in results:
+        for chunk_id, score, text in _normalize_layer(results, normalization):
             if chunk_id not in seen:
                 seen.add(chunk_id)
                 merged.append((chunk_id, score, text))

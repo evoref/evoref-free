@@ -102,7 +102,6 @@ class _Bucket:
         duration_count: duration を観測したペアの数 (平均算出用)。
         retry_max: ``quality_signals.retry_count`` の最大値。
         json_repair_count: ``quality_signals.json_repair_count > 0`` の件数。
-        rerank_skipped_count: ``quality_signals.rerank_skipped == True`` の件数。
         orphan_count: outcome 欠損 (orphan) の数。
         last_mode: 最後に観測した ``mode_origin``。
         last_trace_id: 最後に観測した trace_id (デバッグ用)。
@@ -117,7 +116,6 @@ class _Bucket:
     duration_count: int = 0
     retry_max: int = 0
     json_repair_count: int = 0
-    rerank_skipped_count: int = 0
     orphan_count: int = 0
     last_mode: str = "chat"
     last_trace_id: str = ""
@@ -330,8 +328,6 @@ class PolicyAdjuster:
                 jr = qs.get("json_repair_count")
                 if isinstance(jr, (int, float)) and int(jr) > 0:
                     bucket.json_repair_count += 1
-                if qs.get("rerank_skipped") is True:
-                    bucket.rerank_skipped_count += 1
 
         # 閾値判定 → 必要なら emit
         await self._maybe_emit(bucket)
@@ -462,8 +458,6 @@ class PolicyAdjuster:
             quality_signals["retry_max"] = bucket.retry_max
         if bucket.json_repair_count > 0:
             quality_signals["json_repair_count"] = bucket.json_repair_count
-        if bucket.rerank_skipped_count > 0:
-            quality_signals["rerank_skipped_count"] = bucket.rerank_skipped_count
         if quality_signals:
             payload["quality_signals"] = quality_signals
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -482,7 +476,6 @@ class PolicyAdjuster:
         bucket.duration_ms_sum *= f
         bucket.duration_count = int(bucket.duration_count * f)
         bucket.json_repair_count = int(bucket.json_repair_count * f)
-        bucket.rerank_skipped_count = int(bucket.rerank_skipped_count * f)
         # retry_max は max 値なので decay しない (履歴の最悪値を保持)
 
 

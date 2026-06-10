@@ -62,7 +62,7 @@ def _is_pro() -> bool:
 def _guard_model_paths_immutable(data: dict) -> None:
     """model_paths の model_state 追跡キー変更を 403 で遮断する。
 
-    base/assist/embed/reranker のモデルは migrate API 経由でしか変更できない。
+    base/assist/embed のモデルは migrate API 経由でしか変更できない。
     config を直書きすると model_state.json と desync し起動時 mismatch を招くため、
     現在値と異なる追跡キーが含まれていれば 403 を返す。coding_model 等の非追跡
     キーは通常通り編集可能 (現在値と一致する追跡キーが同梱されていても許可)。
@@ -187,7 +187,7 @@ async def apply_preset(
         preset_id, changed_sections, restart_servers,
     )
 
-    # 変更セクションのコンポーネント再生成（reranker は enabled 切替で自動 起動/停止）
+    # 変更セクションのコンポーネント再生成
     for section in changed_sections:
         await _reload_components_if_needed(section, state)
 
@@ -310,7 +310,6 @@ async def validate_config_section(section: str, req: ConfigUpdateRequest):
 # 設定変更時にコンポーネント再生成が必要なセクション
 _RELOAD_HANDLERS: dict[str, str] = {
     "embedding": "reload_embedder",
-    "reranker": "reload_reranker",
     "assist_model": "reload_assist_model",
     "instance": "reload_prompt_manager",
 }
@@ -326,12 +325,10 @@ async def _reload_components_if_needed(section: str, state: AppState) -> None:
         reload_assist_model,
         reload_embedder,
         reload_prompt_manager,
-        reload_reranker,
     )
 
     handlers = {
         "reload_embedder": reload_embedder,
-        "reload_reranker": reload_reranker,
         "reload_assist_model": reload_assist_model,
         "reload_prompt_manager": reload_prompt_manager,
     }

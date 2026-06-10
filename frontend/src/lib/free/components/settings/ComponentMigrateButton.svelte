@@ -2,7 +2,7 @@
 	/**
 	 * コンポーネントモデル切替ボタン
 	 *
-	 * assist / embedding / reranker のいずれかについて、入力済みの新モデルパスで
+	 * assist / embedding のいずれかについて、入力済みの新モデルパスで
 	 * `POST /api/model/{component}/migrate` を実行する。LlamaProcessManager 管理下なら
 	 * 自動再起動 + クライアント差し替えが行われる (バックエンドで rebind 失敗時は
 	 * 旧モデルへ自動ロールバック)。

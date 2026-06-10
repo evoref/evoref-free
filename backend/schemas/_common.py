@@ -94,13 +94,13 @@ class RuntimeConfig(BaseModel):
 
     # ``llama.gpu_layers`` / ``assist_model.local.gpu_layers`` が ``"auto"``
     # の場合の Vulkan host buffer 予約量 (MiB)。
-    # iGPU 環境では embed/reranker (CPU モード) でも llama.cpp が Vulkan
+    # iGPU 環境では embed (CPU モード) でも llama.cpp が Vulkan
     # backend を初期化し model loading 時に host (pinned) buffer を要求する。
-    # base/assist が GPU メモリを占有しすぎると後発の embed/reranker で
+    # base/assist が GPU メモリを占有しすぎると後発の embed で
     # ``ggml_vulkan: Failed to allocate pinned memory (ErrorOutOfDeviceMemory)``
     # 警告が出るため、自動段階縮小ロジックはこの分を GPU 容量から差し引いて
     # 予算を計算する。既定 4 GiB は AMD Radeon 890M + Qwen3-Embedding-0.6B
-    # + Qwen3-Reranker-4B の実測 ceiling から決定。
+    # 構成での実測 ceiling から決定。
     vulkan_host_buffer_headroom_mib: int = Field(default=4096, ge=0)
 
     # ``"auto"`` 指定された ``gpu_layers`` を実際に縮小する kill switch。
@@ -413,7 +413,7 @@ class EditorSettingsConfig(BaseModel):
 class ProcessManagerConfig(BaseModel):
     """llama-server プロセスマネージャ設定
 
-    `enabled=True` で lifespan 起動時に 4 種 (base/assist/embedding/reranker)
+    `enabled=True` で lifespan 起動時に 3 種 (base/assist/embedding)
     の llama-server を自動 spawn し、`migrate_component` API からの自動
     再起動を有効化する。`False` (デフォルト) は従来通り
     `scripts/launch_llama.py` を別途実行するワークフロー互換。
