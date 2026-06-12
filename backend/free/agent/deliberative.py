@@ -224,8 +224,13 @@ class DeliberativeAgent:
         llm_client,
         state: AgentState,
         on_step: StepCallback,
+        tool_judge_task: "asyncio.Task | None" = None,
     ) -> tuple[str | None, str | None, str | None, bool | None]:
         """ツール判定 → 実行 → messages へのツール結果注入を一括で行う。
+
+        ``tool_judge_task`` が渡された場合は chat() が先行起動した tool 判定
+        タスクを await して再利用する (直列待ちの短縮)。タスクが例外で終わった
+        場合は直接 judge を再実行してフォールバックする (挙動同等性優先)。
 
         Returns:
             ``(tool_result_text, tool_name, command, success)``。
@@ -235,11 +240,27 @@ class DeliberativeAgent:
             executable_command 学習 (sleep-time curator) のデータ源になる。
         """
         if self._tool_judge is None or self._tools_registry is None:
+            # 判定経路が無いなら precomputed タスクも使えない。残っていれば破棄。
+            if tool_judge_task is not None and not tool_judge_task.done():
+                tool_judge_task.cancel()
             return None, None, None, None
 
-        judgement = await self._tool_judge.judge(
-            query, self._tools_registry, mode, conversation or [],
-        )
+        if tool_judge_task is not None:
+            try:
+                judgement = await tool_judge_task
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Precomputed tool judge task failed, re-judging: %r", exc,
+                )
+                judgement = await self._tool_judge.judge(
+                    query, self._tools_registry, mode, conversation or [],
+                )
+        else:
+            judgement = await self._tool_judge.judge(
+                query, self._tools_registry, mode, conversation or [],
+            )
         if not (judgement.tool_needed and judgement.tool_name):
             return None, None, None, None
 
@@ -295,6 +316,7 @@ class DeliberativeAgent:
         on_step: StepCallback = None,
         generation_params: GenerationParams | None = None,
         tool_capture: dict | None = None,
+        tool_judge_task: "asyncio.Task | None" = None,
     ) -> DeliberativeResponse | AsyncIterator[str]:
         """Deliberative 層で LLM 推論を実行
 
@@ -308,6 +330,8 @@ class DeliberativeAgent:
             max_tokens: 最大生成トークン数
             on_step: ステップ進行コールバック (step_dict) -> None
             generation_params: モード別生成パラメータ（temperature, top_p 等）
+            tool_judge_task: chat() が先行起動した tool 判定タスク (並列化時)。
+                None なら判定をここで直列実行する。
 
         Returns:
             stream=False: DeliberativeResponse
@@ -323,6 +347,7 @@ class DeliberativeAgent:
             tool_result_text, tool_name_used, tool_command, tool_success,
         ) = await self._judge_and_execute_tool(
             query, mode, conversation, messages, llm_client, state, on_step,
+            tool_judge_task=tool_judge_task,
         )
 
         # streaming 経路は DeliberativeResponse を返さないため、command を

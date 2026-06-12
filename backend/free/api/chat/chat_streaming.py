@@ -55,6 +55,44 @@ logger = get_logger("api.chat.streaming")
 sse = SSEFrameBuilder()
 
 
+def meta_tool_routing_success(resp) -> bool:
+    """meta-cognitive 応答でツールが 1 件以上実行成功したか (tool_routing 正例)。
+
+    deliberative の ``tool_command_success is True`` と同義 (ツールが呼ばれ成功)。
+    meta は複数ツールを呼ぶため any (1 件でも成功なら誘導は妥当)。tool_calls 空
+    (= ツール未使用) は False。phase7 がクエリ単位の弱い正例として消費する。
+    """
+    if resp is None:
+        return False
+    return any(tc.get("success") for tc in (getattr(resp, "tool_calls", None) or []))
+
+
+def meta_tool_routing_false_positive(resp) -> bool:
+    """meta-cognitive 応答でツールを呼んだが全て失敗したか (tool_routing 誤検出)。
+
+    deliberative の ``tool_command is not None and tool_command_success is False``
+    と同義 (ルーティングしたが結果が伴わなかった同一ターンの明確な失敗)。tool_calls
+    空 (未使用) は False。phase7 + パターン decay がクエリ単位で消費する。
+    """
+    if resp is None:
+        return False
+    tool_calls = getattr(resp, "tool_calls", None) or []
+    return bool(tool_calls) and not any(tc.get("success") for tc in tool_calls)
+
+
+def rag_signals_from_chunks(
+    scored: list[tuple[str, float, str]] | None,
+) -> tuple[bool, float | None]:
+    """``scored_chunks`` から Level 0 経験記録用の ``(rag_used, rag_top1_score)`` を導出。
+
+    ``scored_chunks`` は ``(chunk_id, score, content)`` の salience 降順リスト。
+    空 / None なら ``(False, None)`` (RAG 未使用)。
+    """
+    if not scored:
+        return False, None
+    return True, scored[0][1]
+
+
 def _emit_timing(
     state: AppState, timer: StageTimer | None,
     agent_layer: str, tokens_generated: int,
@@ -643,6 +681,8 @@ def _finalize_meta_cognitive_stream(
     timer: "StageTimer | None",
     t_start: float,
     private: bool = False,
+    rag_used: bool = False,
+    rag_top1_score: float | None = None,
 ) -> TokenInfo:
     """MetaCognitive ストリーム完了時の記録・タイミング計測を行い TokenInfo を返す。"""
     if timer:
@@ -663,6 +703,11 @@ def _finalize_meta_cognitive_stream(
         state, content, messages, session_id,
         query, mode, estimated_tokens, step_credits,
         private=private,
+        agent_loops=steps,
+        rag_used=rag_used,
+        rag_top1_score=rag_top1_score,
+        tool_routing_success=meta_tool_routing_success(resp),
+        tool_routing_false_positive=meta_tool_routing_false_positive(resp),
     )
 
     _emit_timing(state, timer, "meta_cognitive", estimated_tokens)
@@ -679,6 +724,8 @@ async def stream_meta_cognitive(
     timer: StageTimer | None = None,
     private: bool = False,
     output_target: str = "file",
+    rag_used: bool = False,
+    rag_top1_score: float | None = None,
 ):
     """Meta-Cognitive 層の SSE ストリーミング（ステップフレーム付き）
 
@@ -732,6 +779,8 @@ async def stream_meta_cognitive(
                 query=query, mode=mode, instance_name=instance_name,
                 context_size=context_size, timer=timer, t_start=t_start,
                 private=private,
+                rag_used=rag_used,
+                rag_top1_score=rag_top1_score,
             )
             yield sse.token_info(ti)
             yield sse.done()
@@ -771,6 +820,8 @@ async def sync_meta_cognitive(
     timer: StageTimer | None = None,
     private: bool = False,
     output_target: str = "file",
+    rag_used: bool = False,
+    rag_top1_score: float | None = None,
 ) -> ChatResponse:
     """Meta-Cognitive 層の同期応答"""
     try:
@@ -807,6 +858,11 @@ async def sync_meta_cognitive(
             state, response_text, messages, session_id,
             query, mode, estimated_tokens, resp.step_credits,
             private=private,
+            agent_loops=resp.steps,
+            rag_used=rag_used,
+            rag_top1_score=rag_top1_score,
+            tool_routing_success=meta_tool_routing_success(resp),
+            tool_routing_false_positive=meta_tool_routing_false_positive(resp),
         )
 
         _emit_timing(state, timer, "meta_cognitive", estimated_tokens)
@@ -947,6 +1003,8 @@ async def _finalize_long_form_stream(
     long_form_mode: LongFormMode = LongFormMode.CONTINUE,
     split_written: list[dict] | None = None,
     output_target: str = "file",
+    rag_used: bool = False,
+    rag_top1_score: float | None = None,
 ) -> AsyncIterator[str]:
     """長文生成終端処理: timer 停止 + record + write_file + token_info + done。
 
@@ -981,6 +1039,8 @@ async def _finalize_long_form_stream(
         sess_state, delivered, messages, session_id,
         query, mode, state.tokens_generated, metrics,
         private=private,
+        rag_used=rag_used,
+        rag_top1_score=rag_top1_score,
     )
 
     # 構文エラーを含むコードがエディタ/ディスクへそのまま出力されると、
@@ -1073,6 +1133,7 @@ async def stream_long_form(
     private: bool = False,
     output_target: str = "file",
     prefetched_rag: list[tuple[str, float, str]] | None = None,
+    file_context_block: str | None = None,
 ):
     """長文生成の SSE ストリーミング（long_form_* ステップフレーム付き）
 
@@ -1176,6 +1237,7 @@ async def stream_long_form(
                 existing_content=existing_content,
                 long_form_mode=long_form_mode,
                 prefetched_rag=prefetched_rag,
+                file_context_block=file_context_block,
             )
             aiter = token_gen.__aiter__()
             pending: asyncio.Task[str] | None = None
@@ -1231,6 +1293,7 @@ async def stream_long_form(
             async for frame in _flush():
                 yield frame
 
+            _lf_rag_used, _lf_rag_top1 = rag_signals_from_chunks(prefetched_rag)
             async for frame in _finalize_long_form_stream(
                 stream_state, state, orchestrator, query, messages,
                 session_id, mode, instance_name, context_size,
@@ -1239,6 +1302,8 @@ async def stream_long_form(
                 long_form_mode=long_form_mode,
                 split_written=split_written,
                 output_target=output_target,
+                rag_used=_lf_rag_used,
+                rag_top1_score=_lf_rag_top1,
             ):
                 yield frame
             outcome_success = True
@@ -1278,6 +1343,7 @@ async def sync_long_form(
     private: bool = False,
     output_target: str = "file",
     prefetched_rag: list[tuple[str, float, str]] | None = None,
+    file_context_block: str | None = None,
 ) -> ChatResponse:
     """長文生成の同期応答
 
@@ -1311,6 +1377,7 @@ async def sync_long_form(
             existing_content=existing_content,
             long_form_mode=long_form_mode,
             prefetched_rag=prefetched_rag,
+            file_context_block=file_context_block,
         ):
             if not first_token_recorded and timer:
                 timer.stop("llm_first_token_ms")
@@ -1328,10 +1395,13 @@ async def sync_long_form(
         code_output = getattr(orchestrator, "last_code_output", None)
         if is_code and isinstance(code_output, str) and code_output:
             full_response = code_output
+        _lf_rag_used, _lf_rag_top1 = rag_signals_from_chunks(prefetched_rag)
         record_long_form_response(
             state, full_response, messages, session_id,
             query, mode, tokens_generated, metrics,
             private=private,
+            rag_used=_lf_rag_used,
+            rag_top1_score=_lf_rag_top1,
         )
 
         if output_target == "editor":
@@ -1519,6 +1589,8 @@ async def _finalize_deliberative_stream(
     timer: StageTimer | None,
     t_start: float,
     private: bool = False,
+    rag_used: bool = False,
+    rag_top1_score: float | None = None,
 ) -> AsyncIterator[str]:
     """Deliberative ストリーム終端処理: timer 停止 + record + token_info + done."""
     if timer:
@@ -1536,6 +1608,9 @@ async def _finalize_deliberative_stream(
         tool_command=state.tool_command,
         tool_command_name=state.tool_command_name,
         tool_command_success=state.tool_command_success,
+        tool_routing_success=state.tool_command_success is True,
+        rag_used=rag_used,
+        rag_top1_score=rag_top1_score,
     )
     _emit_timing(sess_state, timer, "deliberative", state.tokens_generated)
     ti = make_token_info(
@@ -1554,6 +1629,9 @@ async def stream_deliberative(
     generation_params: GenerationParams | None = None,
     timer: StageTimer | None = None,
     private: bool = False,
+    rag_used: bool = False,
+    rag_top1_score: float | None = None,
+    tool_judge_task: "asyncio.Task | None" = None,
 ):
     """Deliberative 層の SSE ストリーミング
 
@@ -1598,6 +1676,7 @@ async def stream_deliberative(
                 on_step=on_step,
                 generation_params=generation_params,
                 tool_capture=tool_capture,
+                tool_judge_task=tool_judge_task,
             )
             stream_state.tool_command = tool_capture.get("command")
             stream_state.tool_command_name = tool_capture.get("command_name")
@@ -1620,6 +1699,8 @@ async def stream_deliberative(
                 stream_state, state, query, messages, session_id,
                 mode, instance_name, context_size, timer, t_start,
                 private=private,
+                rag_used=rag_used,
+                rag_top1_score=rag_top1_score,
             ):
                 yield frame
             outcome_success = True
@@ -1632,6 +1713,11 @@ async def stream_deliberative(
             yield sse.error(str(e))
             yield sse.done()
         finally:
+            # クライアント切断等でジェネレータが中断された場合、未完了の
+            # precomputed tool 判定タスクが残らないよう cancel する (衛生)。
+            # 正常経路では process() 内で既に await 済み (done) のため no-op。
+            if tool_judge_task is not None and not tool_judge_task.done():
+                tool_judge_task.cancel()
             # CancelledError 経路でも finally に入るため client cancel
             # 検知 (success=False) が確実に行える。
             dl = getattr(state, "debug_logger", None)
@@ -1655,6 +1741,9 @@ async def sync_deliberative(
     generation_params: GenerationParams | None = None,
     timer: StageTimer | None = None,
     private: bool = False,
+    rag_used: bool = False,
+    rag_top1_score: float | None = None,
+    tool_judge_task: "asyncio.Task | None" = None,
 ) -> ChatResponse:
     """Deliberative 層の非ストリーミング応答"""
     logger.debug("Sync deliberative: session=%s, messages=%d", session_id, len(messages))
@@ -1675,6 +1764,7 @@ async def sync_deliberative(
             conversation=conversation,
             max_tokens=max_tokens,
             generation_params=generation_params,
+            tool_judge_task=tool_judge_task,
         )
 
         if timer:
@@ -1688,6 +1778,9 @@ async def sync_deliberative(
             tool_command=resp.tool_command,
             tool_command_name=resp.tool_name if resp.tool_command else None,
             tool_command_success=resp.tool_command_success,
+            tool_routing_success=resp.tool_command_success is True,
+            rag_used=rag_used,
+            rag_top1_score=rag_top1_score,
         )
 
         _emit_timing(state, timer, "deliberative", estimated_tokens)
@@ -1705,3 +1798,8 @@ async def sync_deliberative(
     except Exception as e:
         logger.error("Deliberative error: %s", e)
         raise HTTPException(status_code=503, detail=str(e))
+    finally:
+        # process() が判定タスクを await する前に例外で抜けた場合の衛生。
+        # 正常経路では process() 内で await 済み (done) のため no-op。
+        if tool_judge_task is not None and not tool_judge_task.done():
+            tool_judge_task.cancel()

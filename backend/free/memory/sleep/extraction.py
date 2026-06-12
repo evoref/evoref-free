@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -75,15 +76,20 @@ def _drop_facts_with_existing_subject(
     store: "SemanticFactStore",
     result: "ExtractionResult",
 ) -> int:
-    """既に同一 subject の active fact が存在する候補を ``result`` から除外する。
+    """既に同一 subject の active fact が存在する ``decision`` 候補を除外する。
 
-    ``MDPTraceExtractor`` は決定的な subject
-    (``mem.decision.<episode_id>`` / ``loop.failure.<signature>``) でファクトを
-    生成する。プロセス再起動で抽出器の in-memory ``_processed_episode_ids`` が
-    失われると同一エピソードが再抽出されるが、ここで既存 subject を弾くことで
-    新しい ``fact_id`` での重複追記を防ぐ (store が dedup の永続状態を兼ねる)。
-    ``chat`` / ``coding`` 抽出器は同一 subject の再アサートで内容を更新する設計の
-    ため、この dedup は MDP 経路にのみ適用する。
+    ``MDPTraceExtractor`` は ``decision`` を ``mem.decision.<episode_id>``
+    (エピソード毎に一意) で生成する。プロセス再起動で抽出器の in-memory
+    ``_processed_episode_ids`` が失われると同一エピソードが再抽出されるが、
+    既存 subject を弾くことで新しい ``fact_id`` での重複追記を防ぐ (store が
+    dedup の永続状態を兼ねる)。``chat`` / ``coding`` 抽出器は同一 subject の再
+    アサートで内容を更新する設計のため、この dedup は MDP 経路にのみ適用する。
+
+    ``failure_pattern`` (loop 所有) は呼出側で事前に分離され
+    :func:`_persist_failure_patterns_via_view` が ``LoopFactView`` 経由で
+    signature 単位の in-place occurrences 加算として書くため、本 dedup には
+    渡らない (別エピソードでの同一 signature 再発を弾くと再発頻度が失われる)。
+    よって本関数の対象は ``decision`` のみ。
 
     Returns:
         除外した件数。
@@ -93,7 +99,10 @@ def _drop_facts_with_existing_subject(
     kept = []
     dropped = 0
     for fact in result.facts:
-        if store.search_by_subject(fact.subject, include_superseded=False):
+        # decision のみ subject 一意性 dedup。failure_pattern は Step 13 に委ねる。
+        if fact.type == "decision" and store.search_by_subject(
+            fact.subject, include_superseded=False,
+        ):
             dropped += 1
             continue
         kept.append(fact)
@@ -103,6 +112,63 @@ def _drop_facts_with_existing_subject(
             "Step 8 [mdp_trace]: skipped %d duplicate-subject facts", dropped,
         )
     return dropped
+
+
+def _persist_failure_patterns_via_view(
+    project_store: "SemanticFactStore",
+    failure_facts: list,
+    project_id: str,
+) -> int:
+    """MDP 由来の ``failure_pattern`` を ``LoopFactView`` 経由で書き込む。
+
+    ``failure_pattern`` は loop 所有 FactType のため、mem pillar が
+    ``store.add_fact`` で直書きすると ownership enforcement を素通りする。
+    :meth:`LoopFactView.write_failure_pattern` 経由にすることで owner 検証を
+    通し、同一 signature を **in-place で occurrences 加算** する
+    (failure_consolidator が LoopFactView を使うのと同じ前例)。MDP 抽出器が
+    組み立てた JSON object (``error_type`` / ``normalized_file_path`` /
+    ``last_actions`` / ``outcomes_history``) を分解して低レベル API に渡す。
+
+    Returns:
+        書き込んだ failure_pattern 数。
+    """
+    if not failure_facts:
+        return 0
+    from backend.free.memory.views.loop import LoopFactView
+
+    view = LoopFactView(stores=[project_store], writeback_store=project_store)
+    written = 0
+    for f in failure_facts:
+        signature = f.failure_signature or ""
+        if not signature:
+            continue
+        try:
+            payload = json.loads(f.object)
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        outcomes = payload.get("outcomes_history") or []
+        try:
+            view.write_failure_pattern(
+                project_id=project_id,
+                signature=signature,
+                error_type=str(payload.get("error_type", "")),
+                normalized_file_path=str(payload.get("normalized_file_path", "")),
+                last_actions=list(payload.get("last_actions") or []),
+                outcome_label=str(outcomes[0]) if outcomes else None,
+                trace_id=f.trace_id,
+            )
+            written += 1
+        except Exception as exc:  # noqa: BLE001 — 1 件失敗で sleep を止めない
+            logger.warning(
+                "Step 8 [mdp_trace]: failure_pattern write_via_view failed "
+                "(sig=%s): %s", signature, exc,
+            )
+    if written:
+        logger.debug(
+            "Step 8 [mdp_trace]: persisted %d failure_pattern via LoopFactView",
+            written,
+        )
+    return written
 
 
 def extract_semantic_facts(
@@ -207,9 +273,19 @@ def extract_semantic_facts(
             else:
                 mdp_trace_extractor = MDPTraceExtractor()
         mdp_result = mdp_trace_extractor.extract(notes, ctx)
+        # failure_pattern は loop 所有なので LoopFactView 経由で書く (ownership
+        # 準拠 + signature 単位の in-place occurrences 加算)。decision は mem の
+        # store 直書き経路 (subject 一意 dedup) のまま。
+        failure_facts = [f for f in mdp_result.facts if f.type == "failure_pattern"]
+        mdp_result.facts = [
+            f for f in mdp_result.facts if f.type != "failure_pattern"
+        ]
         _drop_facts_with_existing_subject(project_store, mdp_result)
         total_extracted += persist_facts(
             project_store, mdp_result, "mdp_trace",
+        )
+        total_extracted += _persist_failure_patterns_via_view(
+            project_store, failure_facts, current_project_id,
         )
 
     if total_extracted:

@@ -19,9 +19,12 @@ EvorefMem 統合仕様 における意味記憶 (SemMem) の永続化層を提�
 - `index.jsonl` は :class:`backend.io.IncrementalIndexUpdater` 上に
   ``{fact_id: {subject, type, pillar, pinned}}`` を持つ正規化形の統合索引。
   add / update / delete のたびに差分 1 行を append し、閾値超過で tombstone を
-  畳んで compact する。SCHEMA_VERSION=2 で旧 4 索引
-  (``facts_by_subject.idx`` / ``facts_by_type.idx`` / ``facts_by_pillar.idx`` /
-  ``pinned.idx``) を統合した形 (起動時 ``IndexV1ToV2Migration`` で lazy 変換)。
+  畳んで compact する。旧 4 索引 (``facts_by_subject.idx`` /
+  ``facts_by_type.idx`` / ``facts_by_pillar.idx`` / ``pinned.idx``) を統合した形。
+  ``index.jsonl`` は起動時 :meth:`_reconcile_index` が facts.jsonl
+  (source of truth) と突合して自己修復する (未生成なら生成、欠落分は backfill)
+  ため、SCHEMA_VERSION の bump 無しに常に facts.jsonl と整合する。
+  ``IndexV1ToV2Migration`` (from=1/to=2) は将来の bump 用に休眠登録のまま。
 - supersession は `superseded_by` / `supersedes` フィールドで表現する。
   検索系 API はデフォルトで `superseded_by` が立っているファクトを除外する。
 - 後方互換は提供しない
@@ -180,6 +183,10 @@ class SemanticFactStore:
         self._index_dual_write_enabled = False
         self._load()
         self._index_dual_write_enabled = True
+        # index.jsonl を facts.jsonl (source of truth) と突合して自己修復する。
+        # 新規ストア (index.jsonl 未生成) や前回 shutdown での pending 喪失を、
+        # SCHEMA_VERSION の bump 無しに毎起動で埋める。
+        self._reconcile_index()
         self._verify_embedding_dim_against_manifest()
 
     def _init_embedding_store(self) -> EmbeddingStore:
@@ -322,17 +329,41 @@ class SemanticFactStore:
         with self._facts_path().open("a", encoding="utf-8") as f:
             f.write(line + "\n")
 
-    def _persist_indexes(self) -> None:
-        """旧 4 索引ファイルへの全件 dump (M5-d で no-op 化)。
+    def flush_index(self) -> None:
+        """``index.jsonl`` の pending dual-write を永続化する (lifespan shutdown 用)。
 
-        M5-d 以降、SemMem の索引永続化は :class:`IncrementalIndexUpdater`
-        経由の ``index.jsonl`` (fact_id 正規化形) に統一された。本メソッドは
-        後方互換のためシグネチャを残す (CLI / 外部テストの呼出を破壊しない)。
-        旧 4 索引ファイル (``facts_by_subject.idx`` 等) は起動時 lazy migration
-        (:class:`IndexV1ToV2Migration`) で archive に退避され、以降は再生成
-        されない。
+        :class:`IncrementalIndexUpdater` は ``flush_interval_writes`` 未満の
+        pending op を in-memory buffer に保持するため、明示 flush しないと
+        プロセス終了で最大 ``flush_interval-1`` 件が失われる。次回起動の
+        :meth:`_reconcile_index` が facts.jsonl から復元するが、shutdown で
+        flush しておけば余分な再構築 I/O を避けられる。
         """
-        # M5-d: no-op (旧 4 索引書出は廃止、新形式は _add/_remove_from_indexes 経由)
+        self._index_updater.flush()
+
+    def _reconcile_index(self) -> None:
+        """``index.jsonl`` を facts.jsonl (source of truth) と突合して自己修復する。
+
+        起動時、index.jsonl の pending 喪失 / 未生成 (新規ストア) で facts.jsonl と
+        乖離している分を upsert / remove で埋め、差分があるときだけ flush する
+        (clean 起動では I/O ゼロ)。``_index_dual_write_enabled=True`` の状態で
+        呼ぶこと (upsert/remove が index.jsonl に反映される)。
+        """
+        indexed = self._index_updater.load()
+        changed = False
+        for fact_id, fact in self._facts.items():
+            attrs = _fact_to_index_attrs(fact)
+            if indexed.get(fact_id) != attrs:
+                self._index_updater.upsert(fact_id, attrs)
+                changed = True
+        for stale_id in indexed.keys() - self._facts.keys():
+            self._index_updater.remove(stale_id)
+            changed = True
+        if changed:
+            self._index_updater.flush()
+            logger.debug(
+                "index.jsonl reconciled against facts.jsonl at %s "
+                "(facts=%d)", self.root_dir, len(self._facts),
+            )
 
     def _upsert_embedding(self, fact_id: str, vec: np.ndarray) -> None:
         """EmbeddingStore に委譲する薄いラッパ (内部 API の見掛け互換用)."""
@@ -360,7 +391,6 @@ class SemanticFactStore:
         self._facts[fact.id] = fact
         self._add_to_indexes(fact)
         self._append_fact_line(fact)
-        self._persist_indexes()
         if fact.embedding is not None:
             self._upsert_embedding(fact.id, fact.embedding)
         logger.debug(
@@ -396,9 +426,14 @@ class SemanticFactStore:
         fact.accessed_at = time.time()
         self._add_to_indexes(fact)
         self._append_fact_line(fact)
-        self._persist_indexes()
-        if "embedding" in changes and fact.embedding is not None:
-            self._upsert_embedding(fact.id, fact.embedding)
+        if "embedding" in changes:
+            # embedding を明示的に None へクリアした場合は EmbeddingStore からも
+            # 除去する。さもないと vectors.npy に stale ベクトルが残り、
+            # search_by_embedding が更新後も古いベクトルでヒットし続ける。
+            if fact.embedding is not None:
+                self._upsert_embedding(fact.id, fact.embedding)
+            else:
+                self._remove_embedding(fact.id)
         logger.debug("update_fact: id=%s changes=%s", fact_id, sorted(changes.keys()))
         return fact
 
@@ -418,7 +453,6 @@ class SemanticFactStore:
         self._remove_from_indexes(fact)
         self._remove_embedding(fact_id)
         self._rewrite_facts_log()
-        self._persist_indexes()
         logger.debug("delete_fact: id=%s subject=%s", fact_id, fact.subject)
         return True
 

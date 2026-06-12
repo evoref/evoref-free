@@ -15,7 +15,6 @@
 		clearStreamingEditorCode,
 		nextMessageId,
 		tokenInfo,
-		tokenSpeed,
 		sessionId,
 		currentMode,
 		attachedFiles,
@@ -25,8 +24,6 @@
 	import { get } from 'svelte/store';
 	import { themeSlots } from '$lib/free/stores/theme';
 	import { addToast } from '$lib/free/stores/toast';
-	import { TOKEN_SPEED_UPDATE_THRESHOLD_S } from '$lib/free/constants';
-	import TokenBar from './TokenBar.svelte';
 	import FileUpload from './FileUpload.svelte';
 	import FilePreview from './FilePreview.svelte';
 
@@ -68,7 +65,6 @@
 		sawPartialEditor = false;
 		sawEditorCode = false;
 		isStreaming.set(true);
-		tokenSpeed.set(0);
 		cancelled = false;
 		abortController = new AbortController();
 
@@ -79,16 +75,9 @@
 			timestamp: Date.now()
 		});
 
-		let streamStart = 0;
-		let tokenCount = 0;
-
 		try {
 			for await (const event of chatStream(text, get(currentMode), get(sessionId), files, abortController.signal)) {
 				if (event.type === 'token' && event.token) {
-					if (tokenCount === 0) streamStart = performance.now();
-					tokenCount++;
-					const elapsed = (performance.now() - streamStart) / 1000;
-					if (elapsed > TOKEN_SPEED_UPDATE_THRESHOLD_S) tokenSpeed.set(tokenCount / elapsed);
 					appendToLastAssistant(event.token);
 				} else if (event.type === 'token_info' && event.token_info) {
 					tokenInfo.set(event.token_info);
@@ -234,7 +223,6 @@
 			<InputSuffix />
 		{/if}
 	</div>
-	<TokenBar used={$tokenInfo.used} limit={$tokenInfo.limit} speed={$tokenSpeed} />
 </div>
 
 <style>

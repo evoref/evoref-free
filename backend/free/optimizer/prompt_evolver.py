@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -14,7 +15,6 @@ import numpy as np
 from backend.free.agent.prompt_utils import (
     dedupe_paragraphs,
     extract_protected_sections,
-    format_fewshot_section,
     restore_protected_sections,
     strip_orphan_protected_markers,
     text_contains_sentence,
@@ -24,13 +24,23 @@ from backend.log_config import get_logger
 
 if TYPE_CHECKING:
     from backend.free.learning.critique_synthesizer import CritiqueSynthesizer
-    from backend.free.learning.fewshot_pool import FewShotPool
     from backend.free.learning.level1_session import Level1Session
 
 logger = get_logger("optimizer.prompt_evolver")
 
 # 突然変異リトライ上限
 MAX_MUTATION_RETRIES = 3
+
+# プロンプト変異の生成トークン上限。システムプロンプト全文 (coding.md ~1350字) の
+# 再生成 + reasoning モデルの思考漏れ分の途中切断を避けるため広めに取る。
+_MUTATION_MAX_TOKENS = 2048
+
+# _is_text_similar の判定閾値。SequenceMatcher.ratio がこれ以上、かつ長さ差が
+# _TEXT_LEN_DELTA 以内なら「実質同一」とみなす。長さ差は空白・句読点程度の自明な
+# 差のみを許容する小さい値とし、ルール追記など内容が増える変異 (長文への短い
+# 追記を含む) は非類似=採用に倒す (no-op 誤判定で全変異を棄却した旧バグの逆方向)。
+_TEXT_SIMILARITY_THRESHOLD = 0.97
+_TEXT_LEN_DELTA = 5
 
 # ── サーキットブレーカー閾値 ──
 # 連続失敗回数がこの閾値以上で早期終了
@@ -58,6 +68,34 @@ def _strip_think_tags(text: str) -> str:
     if m:
         text = text[: m.start()]
     return text.strip()
+
+
+# fitness 識別用キーワード抽出: ASCII 語 (3 文字以上) + CJK 文字 bi-gram。
+# ひらがなのみの bi-gram は機能語ノイズ (「して」「ください」等) のため除外し、
+# 漢字・カタカナを含む内容語だけを残す。
+_ASCII_WORD_RE = re.compile(r"[a-z0-9_]{3,}")
+# U+3040-30FF (ひらがな/カタカナ) U+3400-4DBF U+4E00-9FFF (漢字) U+F900-FAFF (互換漢字)
+_CJK_RUN_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿]+")
+_HIRAGANA_ONLY_RE = re.compile(r"^[぀-ゟ]+$")
+
+
+def _extract_query_terms(text: str) -> set[str]:
+    """クエリから fitness のカバレッジ判定に使う語彙を抽出する。
+
+    空白 split のみだと日本語クエリが 1 トークンに潰れ、候補プロンプトが
+    クエリ全文を含まない限りカバー率が常に 0 になる (全候補が同 fitness に
+    縮退して進化が no-op 化する)。BM25 の日本語トークナイズと同方針で
+    CJK 連続文字列を文字 bi-gram に分解して識別力を確保する。
+    """
+    lowered = text.lower()
+    terms = set(_ASCII_WORD_RE.findall(lowered))
+    for run in _CJK_RUN_RE.findall(lowered):
+        terms.update(
+            bigram
+            for bigram in (run[i:i + 2] for i in range(len(run) - 1))
+            if not _HIRAGANA_ONLY_RE.match(bigram)
+        )
+    return terms
 
 
 @dataclass
@@ -111,11 +149,14 @@ class _CircuitBreaker:
 
 @dataclass
 class PromptCandidate:
-    """プロンプト候補"""
+    """プロンプト候補 (instruction-only)。
+
+    few-shot 例は推論時に FewShotPool.select_top_k が query 依存で動的選択する
+    ため、進化では instruction テキストのみを最適化する (co-evolution 廃止)。
+    """
     text: str
     fitness: float = 0.0
     generation: int = 0
-    fewshot_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -202,8 +243,9 @@ class PromptEvolver:
         for exp in experiences:
             signals = exp.get("signals", {})
             if signals.get("rephrased_query") or signals.get("user_correction"):
-                query = str(exp.get("query", "")).lower()
-                failure_keywords.update(w for w in query.split() if len(w) >= 3)
+                failure_keywords.update(
+                    _extract_query_terms(str(exp.get("query", ""))),
+                )
         if failure_keywords:
             covered = sum(1 for w in failure_keywords if w in candidate_lower)
             bonus += 0.1 * (covered / len(failure_keywords))
@@ -217,6 +259,21 @@ class PromptEvolver:
 
         raw = base_score + bonus
         return max(0.0, min(1.0, raw))
+
+    async def _score_candidate(
+        self,
+        candidate: str,
+        experiences: list[dict],
+    ) -> float:
+        """候補の fitness を返す async seam。
+
+        基底は同期 ``_calc_fitness`` をそのまま委譲する (挙動不変)。実測評価が
+        必要なサブクラス (EmbedInstructionEvolver) はここを override して await
+        ベースの実測 fitness に差し替える。進化ループ
+        (``_build_initial_population`` / ``_run_one_generation``) は本メソッド
+        経由で fitness を算出する。
+        """
+        return self._calc_fitness(candidate, experiences)
 
     async def _mutate_prompt(
         self,
@@ -270,7 +327,7 @@ class PromptEvolver:
                     messages=messages,
                     stream=False,
                     temperature=0.5,
-                    max_tokens=1024,
+                    max_tokens=_MUTATION_MAX_TOKENS,
                     purpose="prompt_evolution",
                 )
             else:
@@ -278,7 +335,7 @@ class PromptEvolver:
                     messages=messages,
                     stream=False,
                     temperature=0.5,
-                    max_tokens=1024,
+                    max_tokens=_MUTATION_MAX_TOKENS,
                     id_slot=getattr(llm_client, "background_slot", -1),
                 )
             mutated = result["choices"][0]["message"]["content"].strip()
@@ -287,10 +344,15 @@ class PromptEvolver:
             # 除去する。未除去だと思考が変異後プロンプトに焼き込まれ chat.md を汚染する。
             mutated = _strip_think_tags(mutated)
 
-            # コードブロックで囲まれている場合は除去
+            # 応答全体が ``` でラップされている場合のみ外側フェンスを外す。
+            # 全フェンス行を無差別除去すると、プロンプト本文中のコード例フェンス
+            # (```python ... ```) まで剥がれてコード例が壊れるため、先頭フェンスと
+            # 対応する末尾フェンスのペアだけを除去し本文中のフェンスは保護する。
             if mutated.startswith("```"):
                 lines = mutated.split("\n")
-                lines = [l for l in lines if not l.startswith("```")]
+                lines = lines[1:]  # 先頭フェンス行 (```lang 含む) を除去
+                if lines and lines[-1].strip().startswith("```"):
+                    lines = lines[:-1]  # 対応する末尾フェンスを除去
                 mutated = "\n".join(lines).strip()
 
             # 思考が残る / 空になった場合は汚染とみなし無効化 (rule-based 変異へフォールバック)
@@ -443,44 +505,25 @@ class PromptEvolver:
         return hints
 
     def _is_text_similar(self, text1: str, text2: str) -> bool:
-        """2つのテキストが実質的に同一かどうかを判定"""
-        # 正規化して比較
+        """2つのテキストが実質的に同一かどうかを判定する。
+
+        旧実装は共通プレフィックス率で判定していたため、LLM 変異の最頻形
+        (末尾にルールを追記する) を prefix 一致率 1.0 で「同一」と誤判定し
+        棄却していた (先頭を変える変異だけが生き残るバイアス)。長さが有意に
+        変わる変異 (追記等) は非類似=採用とし、長さがほぼ同じ場合のみ
+        ``difflib.SequenceMatcher.ratio`` の全体一致率で同一性を測る。
+        """
         t1 = text1.strip().lower()
         t2 = text2.strip().lower()
 
         if t1 == t2:
             return True
-
-        # 文字レベルの類似度（短いテキストの90%以上一致なら同一扱い）
-        shorter = min(len(t1), len(t2))
-        if shorter == 0:
+        if not t1 or not t2:
             return True
-
-        # 共通プレフィックス長で簡易判定
-        common = 0
-        for c1, c2 in zip(t1, t2):
-            if c1 == c2:
-                common += 1
-            else:
-                break
-
-        return common / shorter > 0.9
-
-    def _calc_fitness_with_fewshot(
-        self,
-        instruction: str,
-        fewshot_ids: list[str],
-        experiences: list[dict],
-        fewshot_pool: FewShotPool | None,
-        mode: str,
-    ) -> float:
-        """指示テキスト + Few-shot 例の結合テキストで fitness を計算する"""
-        if fewshot_pool is None or not fewshot_ids:
-            return self._calc_fitness(instruction, experiences)
-
-        examples = fewshot_pool.get_by_ids(fewshot_ids, mode)
-        combined = instruction + format_fewshot_section(examples)
-        return self._calc_fitness(combined, experiences)
+        # 長さが有意に変われば実質的な変更 (末尾追記など) → 非類似
+        if abs(len(t1) - len(t2)) > _TEXT_LEN_DELTA:
+            return False
+        return difflib.SequenceMatcher(None, t1, t2).ratio() >= _TEXT_SIMILARITY_THRESHOLD
 
     async def _prepare_failure_hints(
         self,
@@ -504,25 +547,6 @@ class PromptEvolver:
         except Exception as e:
             logger.warning("Critique phase failed, using raw hints: %s", e)
         return failure_hints
-
-    def _init_fewshot_selection(
-        self,
-        fewshot_pool: FewShotPool | None,
-        mode: str,
-        seed: int | None,
-    ) -> tuple[list[str], bool]:
-        """Few-shot プール の初期選択。`(initial_ids, has_fewshot)` を返す"""
-        has_fewshot = fewshot_pool is not None and fewshot_pool.count(mode) > 0
-        if not has_fewshot:
-            return [], False
-        initial_selection = fewshot_pool.select(mode, seed=seed)
-        initial_fewshot_ids = [ex.id for ex in initial_selection]
-        logger.info(
-            "Fewshot co-evolution enabled: %d candidates in pool, %d initially selected",
-            fewshot_pool.count(mode),
-            len(initial_fewshot_ids),
-        )
-        return initial_fewshot_ids, True
 
     async def _try_initial_mutation(
         self,
@@ -576,12 +600,7 @@ class PromptEvolver:
         llm_client,
         population_size: int,
         has_protected: bool,
-        has_fewshot: bool,
-        initial_fewshot_ids: list[str],
-        fewshot_pool: FewShotPool | None,
-        mode: str,
         experiences: list[dict],
-        rng: np.random.Generator,
         cb: _CircuitBreaker,
     ) -> tuple[list[PromptCandidate], float]:
         """現在プロンプト + LLM 変異で初期集団を構築する。
@@ -589,14 +608,8 @@ class PromptEvolver:
         `(population, initial_fitness)` を返す。サーキットブレーカー発火時は
         `cb.tripped = True` をセットして部分集団を返す。
         """
-        population = [PromptCandidate(
-            text=current,
-            generation=0,
-            fewshot_ids=list(initial_fewshot_ids),
-        )]
-        initial_fitness = self._calc_fitness_with_fewshot(
-            current, initial_fewshot_ids, experiences, fewshot_pool, mode,
-        )
+        population = [PromptCandidate(text=current, generation=0)]
+        initial_fitness = await self._score_candidate(current, experiences)
         population[0].fitness = initial_fitness
 
         for _ in range(population_size - 1):
@@ -623,21 +636,8 @@ class PromptEvolver:
             if has_protected:
                 mutated_text = restore_protected_sections(current, mutated_text)
 
-            # Few-shot 選択の変異
-            cand_fewshot_ids = list(initial_fewshot_ids)
-            if has_fewshot and fewshot_pool is not None:
-                cand_fewshot_ids = fewshot_pool.mutate_selection(
-                    cand_fewshot_ids, mode, seed=int(rng.integers(0, 2**31)),
-                )
-
-            candidate = PromptCandidate(
-                text=mutated_text,
-                generation=0,
-                fewshot_ids=cand_fewshot_ids,
-            )
-            candidate.fitness = self._calc_fitness_with_fewshot(
-                mutated_text, cand_fewshot_ids, experiences, fewshot_pool, mode,
-            )
+            candidate = PromptCandidate(text=mutated_text, generation=0)
+            candidate.fitness = await self._score_candidate(mutated_text, experiences)
             population.append(candidate)
 
         return population, initial_fitness
@@ -651,12 +651,8 @@ class PromptEvolver:
         failure_hints: list[str],
         llm_client,
         has_protected: bool,
-        has_fewshot: bool,
-        fewshot_pool: FewShotPool | None,
-        mode: str,
         experiences: list[dict],
         seed: int | None,
-        rng: np.random.Generator,
         cb: _CircuitBreaker,
     ) -> None:
         """1 世代分の親選択・交叉・変異・置換を実行する (population を in-place 更新)"""
@@ -683,30 +679,8 @@ class PromptEvolver:
         if has_protected:
             child_text = restore_protected_sections(current, child_text)
 
-        # Few-shot 交叉 + 変異
-        child_fewshot_ids: list[str] = []
-        if has_fewshot and fewshot_pool is not None:
-            # 交叉: 両親の Few-shot を結合しランダムに max_examples 個選択
-            merged = list(dict.fromkeys(
-                parents[0].fewshot_ids + parents[1].fewshot_ids,
-            ))
-            max_ex = fewshot_pool.max_examples
-            if len(merged) > max_ex:
-                sel = rng.choice(len(merged), size=max_ex, replace=False)
-                merged = [merged[i] for i in sel]
-            # 変異: add/remove/swap
-            child_fewshot_ids = fewshot_pool.mutate_selection(
-                merged, mode, seed=int(rng.integers(0, 2**31)),
-            )
-
-        child = PromptCandidate(
-            text=child_text,
-            generation=gen,
-            fewshot_ids=child_fewshot_ids,
-        )
-        child.fitness = self._calc_fitness_with_fewshot(
-            child_text, child_fewshot_ids, experiences, fewshot_pool, mode,
-        )
+        child = PromptCandidate(text=child_text, generation=gen)
+        child.fitness = await self._score_candidate(child_text, experiences)
 
         # 最弱を置換
         population.sort(key=lambda c: c.fitness)
@@ -762,12 +736,8 @@ class PromptEvolver:
         llm_client,
         generations: int,
         has_protected: bool,
-        has_fewshot: bool,
-        fewshot_pool: FewShotPool | None,
-        mode: str,
         experiences: list[dict],
         seed: int | None,
-        rng: np.random.Generator,
         cb: _CircuitBreaker,
         on_generation_complete: Callable[[int, PromptCandidate], None] | None,
         yield_check: Callable[[], bool] | None,
@@ -791,12 +761,8 @@ class PromptEvolver:
                 failure_hints=failure_hints,
                 llm_client=llm_client,
                 has_protected=has_protected,
-                has_fewshot=has_fewshot,
-                fewshot_pool=fewshot_pool,
-                mode=mode,
                 experiences=experiences,
                 seed=seed,
-                rng=rng,
                 cb=cb,
             )
             generations_run = gen
@@ -824,12 +790,6 @@ class PromptEvolver:
         if has_protected and not validate_protected_sections(current, best.text):
             logger.warning("Best candidate lost protected sections, force-restoring")
             best.text = restore_protected_sections(current, best.text)
-        if best.fewshot_ids:
-            logger.info(
-                "Best candidate uses %d fewshot examples: %s",
-                len(best.fewshot_ids),
-                best.fewshot_ids,
-            )
         return best
 
     async def _darwinian_evolve(
@@ -842,12 +802,10 @@ class PromptEvolver:
         seed: int | None = None,
         *,
         critique_synthesizer: CritiqueSynthesizer | None = None,
-        fewshot_pool: FewShotPool | None = None,
-        mode: str = "chat",
         yield_check: Callable[[], bool] | None = None,
         on_generation_complete: Callable[[int, PromptCandidate], None] | None = None,
     ) -> EvolutionResult:
-        """進化ループ
+        """進化ループ (instruction-only)
 
         Args:
             current: 現在のプロンプト
@@ -857,20 +815,18 @@ class PromptEvolver:
             population_size: 集団サイズ
             seed: 乱数シード
             critique_synthesizer: 批評合成器。指定時は変異前に批評を実行
-            fewshot_pool: Few-shot 候補プール。指定時は Few-shot も同時進化
-            mode: 対象モード（Few-shot 選択のフィルタに使用）
 
         Returns:
             進化結果
+
+        Note:
+            few-shot 例は推論時に FewShotPool.select_top_k が query 依存で動的選択
+            するため、進化は instruction テキストのみを最適化する (co-evolution 廃止)。
         """
         failure_hints = await self._prepare_failure_hints(experiences, critique_synthesizer)
         has_protected = bool(extract_protected_sections(current))
-        initial_fewshot_ids, has_fewshot = self._init_fewshot_selection(
-            fewshot_pool, mode, seed,
-        )
 
         cb = _CircuitBreaker()
-        rng = np.random.default_rng(seed)
 
         population, initial_fitness = await self._build_initial_population(
             current=current,
@@ -878,12 +834,7 @@ class PromptEvolver:
             llm_client=llm_client,
             population_size=population_size,
             has_protected=has_protected,
-            has_fewshot=has_fewshot,
-            initial_fewshot_ids=initial_fewshot_ids,
-            fewshot_pool=fewshot_pool,
-            mode=mode,
             experiences=experiences,
-            rng=rng,
             cb=cb,
         )
 
@@ -904,12 +855,8 @@ class PromptEvolver:
             llm_client=llm_client,
             generations=generations,
             has_protected=has_protected,
-            has_fewshot=has_fewshot,
-            fewshot_pool=fewshot_pool,
-            mode=mode,
             experiences=experiences,
             seed=seed,
-            rng=rng,
             cb=cb,
             on_generation_complete=on_generation_complete,
             yield_check=yield_check,
@@ -1027,7 +974,6 @@ class PromptEvolver:
         seed: int | None = None,
         *,
         critique_synthesizer: CritiqueSynthesizer | None = None,
-        fewshot_pool: FewShotPool | None = None,
         session: Level1Session | None = None,
         yield_check: Callable[[], bool] | None = None,
         save_session: Callable[[Level1Session], None] | None = None,
@@ -1042,7 +988,6 @@ class PromptEvolver:
             population_size: 集団サイズ
             seed: 乱数シード
             critique_synthesizer: 批評合成器
-            fewshot_pool: Few-shot 候補プール
             session: Level1Session（resume / 進捗保存用）
             yield_check: 各世代/モード終端で呼ばれる協調 yield 判定
             save_session: 各モード完了時に呼ばれる session 永続化コールバック
@@ -1091,8 +1036,6 @@ class PromptEvolver:
                 population_size=population_size,
                 seed=seed,
                 critique_synthesizer=critique_synthesizer,
-                fewshot_pool=fewshot_pool,
-                mode=mode,
                 yield_check=yield_check,
             )
             results[mode] = result

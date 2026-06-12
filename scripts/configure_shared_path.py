@@ -26,7 +26,7 @@ def main() -> int:
     updated = False
 
     # model_paths.base_model の更新
-    old_model = "base_model: models/Qwen3.5-9B-Q4_K_M.gguf"
+    old_model = "base_model: models/gemma-4-12b-it-qat-q4_0.gguf"
     if old_model in content:
         content = content.replace(old_model, f"base_model: {gguf}")
         updated = True

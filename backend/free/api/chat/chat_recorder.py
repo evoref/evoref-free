@@ -56,6 +56,18 @@ def clear_session_data(session_id: str) -> None:
     _session_turns.pop(session_id, None)
 
 
+def _loaded_cartridge_ids(state: AppState) -> list[str]:
+    """現在ロード中のカートリッジ ID を返す (degraded 時は空)。
+
+    Level 0 経験に刻み、Level 2 のカートリッジ汚染フィルタ / 依存度メタ /
+    get_cartridge_impact (自動ロールバック) が参照する。
+    """
+    mgr = getattr(state, "cartridge_manager", None)
+    if mgr is None:
+        return []
+    return list(mgr.loaded)
+
+
 def _save_session_to_history(
     state: AppState, session_id: str, mode: str,
 ) -> None:
@@ -151,6 +163,9 @@ def record_response(
     tool_command: str | None = None,
     tool_command_name: str | None = None,
     tool_command_success: bool | None = None,
+    tool_routing_success: bool = False,
+    rag_used: bool = False,
+    rag_top1_score: float | None = None,
 ) -> None:
     """応答をメモリ・デバッグログ・経験バッファに記録する
 
@@ -183,7 +198,15 @@ def record_response(
     fc = state.feedback_collector
     if fc and full_response and not private:
         try:
-            fc.record(query=user_query, response=full_response, mode=mode)
+            # 同一ターンの明確な失敗 = ツールをルーティングしたが失敗 → false_positive。
+            tool_fp = tool_command is not None and tool_command_success is False
+            fc.record(
+                query=user_query, response=full_response, mode=mode,
+                tool_routing_success=tool_routing_success,
+                tool_routing_false_positive=tool_fp,
+                cartridge_ids=_loaded_cartridge_ids(state),
+                rag_used=rag_used, rag_top1_score=rag_top1_score,
+            )
         except Exception as e:
             logger.warning("FeedbackCollector.record failed: %s", e)
 
@@ -208,6 +231,11 @@ def record_meta_cognitive_response(
     tokens_generated: int, step_credits: list,
     *,
     private: bool = False,
+    agent_loops: int = 0,
+    rag_used: bool = False,
+    rag_top1_score: float | None = None,
+    tool_routing_success: bool = False,
+    tool_routing_false_positive: bool = False,
 ) -> None:
     """Meta-Cognitive 層の応答をメモリ・経験バッファに記録（クレジット付き）
 
@@ -240,6 +268,12 @@ def record_meta_cognitive_response(
                 query=user_query,
                 response=full_response,
                 mode=mode,
+                agent_loops=agent_loops,
+                rag_used=rag_used,
+                rag_top1_score=rag_top1_score,
+                tool_routing_success=tool_routing_success,
+                tool_routing_false_positive=tool_routing_false_positive,
+                cartridge_ids=_loaded_cartridge_ids(state),
                 step_credits=credits_dicts,
             )
         except Exception as e:
@@ -266,6 +300,8 @@ def record_long_form_response(
     tokens_generated: int, metrics: dict,
     *,
     private: bool = False,
+    rag_used: bool = False,
+    rag_top1_score: float | None = None,
 ) -> None:
     """長文生成の応答をメモリ・経験バッファに記録
 
@@ -311,6 +347,13 @@ def record_long_form_response(
                 long_form_validation_errors=validation_errors,
                 long_form_budget_used_pct=metrics.get("budget_used_pct"),
                 long_form_success=long_form_success,
+                # 長文経路に入ったが 1 ユニットも生成できなかった = 長文分類の明確な
+                # 誤検出 → false_positive (パターン重み decay の対象)。units>0 で
+                # validation_errors のみのケースは長文ルーティング自体は妥当なので除外。
+                long_form_false_positive=units_completed == 0,
+                cartridge_ids=_loaded_cartridge_ids(state),
+                rag_used=rag_used,
+                rag_top1_score=rag_top1_score,
             )
         except Exception as e:
             logger.warning("FeedbackCollector.record failed (long-form): %s", e)

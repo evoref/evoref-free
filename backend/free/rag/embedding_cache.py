@@ -280,6 +280,22 @@ class CachedEmbeddingBackend:
     def supports_instructions(self) -> bool:
         return self._inner.supports_instructions()
 
+    def set_instruction(self, text: str, *, mode: str | None = None) -> None:
+        """進化採用 instruction を内部バックエンドへ委譲する (Learn→Gen 動的更新)。
+
+        本番経路は cache_enabled=True で本ラッパが ``state.embedder`` になるため、
+        委譲しないと採用しても runtime に効かないサイレント失敗になる。doc 側の
+        ディスクキャッシュは instruction 非依存なので触らない (inner 側で query
+        LRU のみ clear される)。
+        """
+        if hasattr(self._inner, "set_instruction"):
+            self._inner.set_instruction(text, mode=mode)
+
+    def clear_query_cache(self) -> None:
+        """query 埋め込みキャッシュの clear を内部バックエンドへ委譲する。"""
+        if hasattr(self._inner, "clear_query_cache"):
+            self._inner.clear_query_cache()
+
     async def health_check(self) -> bool:
         """内部バックエンドのヘルスチェックを委譲する。
 

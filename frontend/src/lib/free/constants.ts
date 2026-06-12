@@ -6,9 +6,6 @@ export const MODE_RESTART_STATUS_TIMEOUT_MS = 3000;
 /** コピー通知の表示時間 (ms) */
 export const COPY_NOTIFICATION_TIMEOUT_MS = 1500;
 
-/** トークン速度更新の最小経過時間閾値 (秒) */
-export const TOKEN_SPEED_UPDATE_THRESHOLD_S = 0.2;
-
 /** SSE ストリーミングのチャンク間タイムアウト (ms) — サーバー無応答検知
  *
  * ベース LLM のプリフィルが長文コンテキスト時に 30〜50 秒に達するため、

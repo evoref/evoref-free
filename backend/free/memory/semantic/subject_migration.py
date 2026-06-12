@@ -19,9 +19,11 @@ EvorefMem の semantic スコープ (``global`` / ``projects/<project_id>``) は
 - **idempotent**: 既に new_category に移行済の fact には触れない
 - **rollback**: ``SchemaMigrator`` が退避した backup dir 配下の
   ``facts.jsonl`` / ``.idx`` を復元するだけで状態を戻せる
-- **索引は再生成**: 書換後に ``facts_by_*.idx`` / ``pinned.idx`` を削除し、
-  次回の :class:`SemanticFactStore` 起動時に ``_rebuild_indexes`` が走る
-  ようにする (索引を自前で差し替えるよりバグ面積が小さい)
+- **索引は再生成**: 書換後に旧 ``facts_by_*.idx`` / ``pinned.idx`` (v1 索引)
+  を削除する。統合 ``index.jsonl`` は次回の :class:`SemanticFactStore` 起動時に
+  :meth:`SemanticFactStore._reconcile_index` が書換後の facts.jsonl と突合して
+  subject/pillar 属性を自己修復するため、本 Migration では index.jsonl に触れない
+  (索引を自前で差し替えるよりバグ面積が小さい)
 - **predicate optional**: category 一致に追加して任意の fact 条件を
   掛けられる (例: ``lambda fact: fact.type == "coding_task"``)
 - **from_version / to_version 可変**: 本 Migration は「カテゴリ rename」

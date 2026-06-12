@@ -29,9 +29,9 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --shared-path <path>  NAS shared path for multi-PC setup"
-            echo "                        Skips model downloads and uses shared resources"
+            echo "                        Uses shared models/ (no model checks)"
             echo "  --force               Force reinstall (recreate .venv, reinstall packages,"
-            echo "                        re-download models, overwrite config.yaml)"
+            echo "                        overwrite config.yaml)"
             echo "  -h, --help            Show this help message"
             exit 0
             ;;
@@ -145,7 +145,7 @@ if [[ -n "$SHARED_PATH" ]] && [ -f "config.yaml" ]; then
         fi
     done
     if [[ -z "$GGUF_PATH" ]]; then
-        GGUF_PATH="$SHARED_PATH/models/Qwen3.5-9B-Q4_K_M.gguf"
+        GGUF_PATH="$SHARED_PATH/models/gemma-4-12b-it-qat-q4_0.gguf"
         echo "  WARNING: No .gguf file found in $SHARED_PATH/models/"
         echo "           Please update model_paths.base_model in config.yaml manually."
     fi
@@ -154,44 +154,14 @@ if [[ -n "$SHARED_PATH" ]] && [ -f "config.yaml" ]; then
     echo "  Updated config.yaml with shared paths"
 fi
 
-# ── 5. モデルダウンロード ──
-echo "[5/6] Downloading models..."
+# ── 5. モデル配置チェック ──
+echo "[5/6] Checking models..."
 if [[ -n "$SHARED_PATH" ]]; then
-    echo "  Skipping model downloads (using shared path)..."
-    echo "  Models available at: $SHARED_PATH/models/"
+    echo "  Using shared path. Models expected at: $SHARED_PATH/models/"
 else
-    FORCE_FLAG=""
-    if [[ -n "$FORCE" ]]; then
-        FORCE_FLAG="--force"
-    fi
-    echo ""
-    echo "Available models:"
-    echo "  1. Base model      - Qwen3.5-9B (chat/coding, ~2.6GB)"
-    echo "  2. Assist model    - Qwen3.5-4B (memory/RAG processing, ~1.4GB)"
-    echo "  3. Embedding model - Qwen3-Embedding-0.6B (vector search)"
-    echo ""
-
-    read -rp "Download base model (Qwen3.5-9B)? [Y/n]: " DL_BASE
-    if [[ ! "$DL_BASE" =~ ^[Nn]$ ]]; then
-        python scripts/download_model.py --llm $FORCE_FLAG
-    else
-        echo "  Skipped base model"
-    fi
-
-    read -rp "Download assist model (Qwen3.5-4B)? [Y/n]: " DL_ASSIST
-    if [[ ! "$DL_ASSIST" =~ ^[Nn]$ ]]; then
-        python scripts/download_model.py --assist $FORCE_FLAG
-    else
-        echo "  Skipped assist model"
-    fi
-
-    read -rp "Download embedding model (Qwen3-Embedding-0.6B)? [Y/n]: " DL_EMBED
-    if [[ ! "$DL_EMBED" =~ ^[Nn]$ ]]; then
-        python scripts/download_model.py --embed $FORCE_FLAG
-    else
-        echo "  Skipped embedding model"
-    fi
-    echo "  Done"
+    # 自動ダウンロードは廃止。GGUF は models/ へ手動配置する。
+    # 未配置でも setup は継続させる (チェックは情報提供のみ)。
+    python scripts/download_model.py || true
 fi
 
 # ── 6. ローカルディレクトリ ──

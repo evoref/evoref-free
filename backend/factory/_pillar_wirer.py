@@ -727,7 +727,12 @@ def _init_assist_judge_tracker(state: AppState) -> None:
     """
     from backend.free.rag.assist_judge_tracker import AssistJudgeUsageTracker
     state.assist_judge_tracker = AssistJudgeUsageTracker()
-    logger.info("AssistJudgeUsageTracker initialized")
+    # conflict_chat_judge のセッション内発火上限用に別インスタンスを生成
+    # (RAG 判定とカウントを混在させない)。
+    state.conflict_judge_tracker = AssistJudgeUsageTracker()
+    logger.info(
+        "AssistJudgeUsageTracker initialized (self_rag + conflict_chat_judge)",
+    )
 
 
 def _init_sleep_time_worker(
@@ -862,10 +867,36 @@ def _init_learning_scheduler(
     )
     learning_scheduler.set_learned_patterns(learned_patterns_store)
 
+    # 7f-1a. Level 1 プロンプト変異の assist ルーティング (#5)。既定
+    # prompt_mutator_base="assist" だが、scheduler への assist_llm_client 注入は
+    # 従来 Pro の setup_pro_learn でしか行われず、Free では低速 base に黙って縮退して
+    # いた。アシスト必須アーキテクチャの state.assist_client を Free 配線でも注入する
+    # (Pro の _inject_assist_components は同一オブジェクトで後から上書き = 冪等)。
+    if state.assist_client is not None:
+        learning_scheduler.assist_llm_client = state.assist_client
+
     # 7f-1b. EmbedInstructionEvolver (Level 1 phase3, f_04 §4.2)
     # embedder が instruction-aware の場合のみ embed 検索指示プロンプトの進化が有効。
     if state.embedder is not None:
         learning_scheduler.set_embedder(state.embedder)
+        # 候補 instruction の実測評価器を注入 (Learn→Gen は EmbedEvalProtocol の
+        # duck-typing 注入で境界を保つ)。embedder + vector_store が揃い
+        # instruction-aware のときのみ有効。未注入時は記録済み rag_top1_score 平均へ
+        # degrade する。
+        if (
+            state.vector_store is not None
+            and hasattr(state.embedder, "supports_instructions")
+            and state.embedder.supports_instructions()
+        ):
+            from backend.free.rag.embed_instruction_eval import EmbedInstructionEval
+            _emb_cfg = cfg.get("embedding", {}) or {}
+            learning_scheduler.set_embed_eval(EmbedInstructionEval(
+                embedder=state.embedder,
+                vector_store=state.vector_store,
+                query_template=_emb_cfg.get(
+                    "query_template", "Instruct: {task}\nQuery: {query}",
+                ),
+            ))
 
     # 7f-1c. GenerationParamEvolver (Level 1 phase6)
     # 進化したデルタは config.get_generation_params() が読む
@@ -934,6 +965,10 @@ def _init_learning_scheduler(
         learn_view=learn_view,
         semmem_writeback_scope=semmem_writeback_scope,
         evolve_writeback=evolve_writeback,
+        # #8: proven delta 昇格の目標 confidence (PolicyInterpreter の適用閾値と一致)。
+        activation_min_confidence=float(
+            learning_policy_cfg.get("activation_min_confidence", 0.7),
+        ),
     )
     # 旧 JSON ステートが残っていれば読み込みのみ行う (semmem モードでも
     # fitness 履歴の継続性を保つため)。書き出しは scheduler 側で
@@ -981,6 +1016,12 @@ def _init_learning_scheduler(
     else:
         fewshot_pool.load(prompt_mgr.prompt_dir / "fewshot_pool.json")
     learning_scheduler.set_fewshot_pool(fewshot_pool)
+    # 推論時 query 依存 few-shot 選択器を prompt_manager に注入 (Loop→Learn は
+    # FewShotSelector Protocol + duck-typing で境界を保つ)。読み込み系のため
+    # learning_disabled でも注入する (fewshot_pool 構築自体スキップされない)。
+    prompt_mgr.set_fewshot_selector(
+        fewshot_pool, k=learning_cfg.get("fewshot_max_examples", 3),
+    )
     logger.info(
         "FewShotPool initialized (evolve_writeback=%s, scope=%s, total=%d)",
         fewshot_pool.evolve_writeback,

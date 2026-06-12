@@ -313,6 +313,10 @@ async def curate_url_facts(
     now_fn = now_provider or time.time
     written = 0
     for user_note, assistant_note, urls in pairs:
+        # 処理済みアンカー (user note) はスキップ。STM に残り続ける同一 QA ペアを
+        # Full サイクルごとに再採点 (assist 浪費) / fetch_count 水増しするのを防ぐ。
+        if user_note.url_curated_at is not None:
+            continue
         seen_urls: set[str] = set()
         fetch_failed = _has_fetch_failure(assistant_note.content)
         for raw_url in urls:
@@ -428,6 +432,10 @@ async def curate_url_facts(
                     written += 1
             except Exception as exc:  # noqa: BLE001
                 logger.warning("url_curator: persist failed for %s: %s", host, exc)
+
+        # ペア処理完了 — score < min_record / fetch 失敗を含む全分岐で必ず
+        # マークし、次サイクルで同じペアを assist に再採点させない。
+        user_note.url_curated_at = now_fn()
 
     if written and debug_logger is not None:
         try:

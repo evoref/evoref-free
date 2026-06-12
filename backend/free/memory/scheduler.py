@@ -221,13 +221,6 @@ class SleepTimeScheduler:
         # Level 2 は on_response_sent では起動しない。再起動耐性のある
         # 独立常駐ループ (start_level2_loop) が overdue/idle で発火する。
 
-    def is_idle(self) -> bool:
-        """ユーザーが full_idle_minutes 以上非アクティブかどうか（Trigger B 用）"""
-        if self._last_user_input == 0:
-            return False
-        elapsed = time.time() - self._last_user_input
-        return elapsed >= self.full_idle_minutes * 60
-
     def is_user_active(self) -> bool:
         """ユーザーがフォアグラウンド対応中かどうか
 
@@ -321,8 +314,15 @@ class SleepTimeScheduler:
             logger.info("Trigger B: starting Full sleep-time update")
             self._running = True
             executed = True
-            # アシストモデル優先、なければベースモデルにフォールバック（§5.5.2）
-            llm_for_sleep = self._assist_llm_client or self._llm_client
+            # sleep-time の LLM ステージはアシストモデルでのみ実行する。
+            # アシスト未接続 (degraded) 時はベースモデルへフォールバックせず
+            # None を渡し、run_full が Step 5.8-10 をクリーンスキップする
+            # (c_14 §6.2: degraded はメモリ抽出をスキップし次回起動で再実行)。
+            # ベースモデルにメモリ抽出/要約/判定をさせない不変則
+            # (CLAUDE.md §6.1) とも整合する。run_full の各 LLM 呼出は
+            # purpose= 付きで LocalClient が受けられないため、フォールバックは
+            # 元々 TypeError を握り潰す死に配線だった。
+            llm_for_sleep = self._assist_llm_client
             await self._worker.run_full(llm_for_sleep)
             success = True
 

@@ -9,9 +9,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from math import sqrt
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -43,6 +44,18 @@ DEFAULT_MIN_FITNESS = 0.7         # プール追加の最低 fitness
 DEFAULT_MAX_EXAMPLES = 3          # プロンプトに埋め込む最大 Few-shot 数
 DEFAULT_DIVERSITY_THRESHOLD = 0.8  # コサイン類似度の上限（これ以上は重複とみなす）
 
+# _calc_experience_fitness の生スコア理論域 (係数の総和)。
+# min = -(rephrase 0.5 + correction 0.8 + loops 0.3 + verr 0.3) = -1.9
+# max = (ended 1.0 + rag 0.3 + long_form 完了 0.3 + lf_success 0.1) = +1.7
+# 係数を変えたらこの 2 定数も更新する。
+_FITNESS_LO = -1.9
+_FITNESS_HI = 1.7
+
+# select_top_k のスコア合成: query 適合を主項に fitness を従に。
+_TOPK_SIM_WEIGHT = 0.7
+# select_top_k で類似計算する候補数の上限 (fitness 上位で足切りし hot path 遅延を抑制)。
+_TOPK_SELECT_CAP = 64
+
 # SemMem 書き戻し時の subject prefix
 # ``harness.fewshot.*`` から ``learn.fewshot.*`` に移行済。owner は EvorefLearn。
 LEARN_FEWSHOT_SUBJECT_PREFIX: str = "learn.fewshot."
@@ -53,6 +66,11 @@ DEFAULT_FEWSHOT_PREDICATE: str = "example_for"
 """Few-shot ファクトの predicate (常に固定)"""
 
 EvolveWriteback = Literal["yaml", "semmem"]
+
+#: _from_payload で JSON から復元する FewShotExample のキー集合。
+#: 未知キー (旧スキーマ / フィールド削除) を無視して TypeError によるプール
+#: 全消失を防ぐ (level0_instant の FeedbackSignals 復元と対称)。
+_EXAMPLE_FIELD_NAMES = frozenset(f.name for f in fields(FewShotExample))
 
 
 def _char_bigrams(text: str) -> Counter:
@@ -77,16 +95,50 @@ def _cosine_similarity(a: Counter, b: Counter) -> float:
 
 
 def _calc_experience_fitness(signals: dict) -> float:
-    """経験のシグナルから fitness を計算する（PromptEvolver と同じ基準）"""
+    """経験 1 件のシグナルから段階的 fitness を計算する。
+
+    基準項 (conversation_ended / rephrased_query / user_correction) の係数は
+    PromptEvolver._calc_fitness と揃える。これに RAG ヒット品質・エージェント
+    反復・長文生成の完了率/検証エラーを段階項として加減算し [0,1] に正規化する。
+    欠損シグナル (None / 0 / False) は加点も減点もせず中立に倒すため、シグナル
+    未配線のモードでも従来の基準項のみで評価される。連続値を返すことで、
+    プールに入った例の fitness が 1.0 に縮退せず select() の重み付けと
+    garbage_collect の lowest-fitness eviction が意味を持つ。
+    """
     score = 0.0
+
+    # ── 基準項 (係数は PromptEvolver._calc_fitness と同一) ──
     if signals.get("conversation_ended", False):
         score += 1.0
     if signals.get("rephrased_query", False):
         score -= 0.5
     if signals.get("user_correction") is not None:
         score -= 0.8
-    # 正規化: [-1.3, 1.0] → [0.0, 1.0]
-    return max(0.0, min(1.0, (score + 1.3) / 2.3))
+
+    # ── 段階項: RAG ヒット品質 (top1 cos 類似が高いほど根拠が強い)。欠損は中立 ──
+    rag_top1 = signals.get("rag_top1_score")
+    if rag_top1 is not None:
+        score += 0.3 * max(0.0, min(1.0, float(rag_top1)))
+
+    # ── 段階項: エージェント反復。<=1 は中立、多反復ほど停滞として減点 ──
+    loops = int(signals.get("agent_loops", 0) or 0)
+    if loops > 1:
+        score -= min(0.3, 0.1 * (loops - 1))
+
+    # ── 段階項: 長文生成 (used のときだけ評価)。完了率で加点・検証エラーで減点 ──
+    if signals.get("long_form_used", False):
+        total = int(signals.get("long_form_units_total", 0) or 0)
+        completed = int(signals.get("long_form_units_completed", 0) or 0)
+        if total > 0:
+            score += 0.3 * min(1.0, completed / total)
+        verr = int(signals.get("long_form_validation_errors", 0) or 0)
+        if verr > 0:
+            score -= min(0.3, 0.1 * verr)
+        if signals.get("long_form_success", False):
+            score += 0.1
+
+    # 正規化: score の理論域 [_FITNESS_LO, _FITNESS_HI] を [0,1] へ線形写像。
+    return max(0.0, min(1.0, (score - _FITNESS_LO) / (_FITNESS_HI - _FITNESS_LO)))
 
 
 class FewShotPool(JsonStateStore):
@@ -140,8 +192,11 @@ class FewShotPool(JsonStateStore):
 
         # モード別のプール: mode → list[FewShotExample]
         self._pools: dict[str, list[FewShotExample]] = {}
-        # キャッシュ: id → bi-gram Counter
+        # キャッシュ: id → bi-gram Counter (採用済 example のみ)
         self._bigram_cache: dict[str, Counter] = {}
+        # 明示 dedup 用: mode → {content_hash}。プール内の example と 1:1 で同期する
+        # (採用で add、eviction で discard)。diversity_threshold と独立に厳密重複を排除。
+        self._seen_hashes: dict[str, set[str]] = {}
 
     # ── SemMem 書き戻しヘルパ ───────────────────────────
 
@@ -294,6 +349,10 @@ class FewShotPool(JsonStateStore):
             seen_ids.add(example.id)
             pool = self._pools.setdefault(example.mode, [])
             pool.append(example)
+            # dedup ハッシュをプールと同期 (#6 整合)
+            self._seen_hashes.setdefault(example.mode, set()).add(
+                self._content_hash(example.query, example.response),
+            )
             loaded += 1
         if loaded:
             logger.info(
@@ -323,15 +382,54 @@ class FewShotPool(JsonStateStore):
         return self._bigram_cache[example.id]
 
     def _is_diverse(self, new: FewShotExample, existing: list[FewShotExample]) -> bool:
-        """新しい例が既存の例と十分に異なるか判定する"""
+        """新しい例が既存の例と十分に異なるか判定する。
+
+        ``new`` の bi-gram はキャッシュに登録しない (不採用候補が
+        ``_bigram_cache`` に残留するリークを防ぐ)。採用済 ``existing`` 側のみ
+        ``_get_bigrams`` でキャッシュする。
+        """
         if not existing:
             return True
-        new_bg = self._get_bigrams(new)
+        new_bg = _char_bigrams(f"{new.query} {new.response}")
         for ex in existing:
             sim = _cosine_similarity(new_bg, self._get_bigrams(ex))
             if sim >= self.diversity_threshold:
                 return False
         return True
+
+    @staticmethod
+    def _content_hash(query: str, response: str) -> str:
+        """query + response の正規化 (trim + lower) ハッシュ。厳密重複判定用。"""
+        norm = f"{query.strip().lower()}\x00{response.strip().lower()}"
+        return hashlib.blake2b(norm.encode("utf-8"), digest_size=16).hexdigest()
+
+    def _try_accept(self, example: FewShotExample) -> FewShotExample | None:
+        """候補 1 件の採否判定 + 採用処理を一手に行う (両投入経路で共有)。
+
+        手順: 厳密重複 dedup → 多様性チェック → append → SemMem 書き戻し →
+        プールサイズ GC (yaml モードのみ)。採用なら ``example`` を、棄却なら
+        ``None`` を返す。``_seen_hashes`` はプール内 example と 1:1 に保つ。
+        """
+        pool = self._pools.setdefault(example.mode, [])
+        seen = self._seen_hashes.setdefault(example.mode, set())
+        h = self._content_hash(example.query, example.response)
+        if h in seen:
+            return None
+        if not self._is_diverse(example, pool):
+            return None
+
+        pool.append(example)
+        seen.add(h)
+        self._writeback_example_fact(example)
+
+        # プールサイズ制限: SemMem 書き戻しモードでは GC を SemMem 側
+        # (semmem_limits.policy + gc_strategy=lowest_score) に委譲し局所 GC を停止。
+        if len(pool) > self.pool_size and not self.is_semmem_writeback_active():
+            pool.sort(key=lambda e: e.fitness)
+            removed = pool.pop(0)
+            self._bigram_cache.pop(removed.id, None)
+            seen.discard(self._content_hash(removed.query, removed.response))
+        return example
 
     def add_from_experiences(self, experiences: list[dict]) -> int:
         """経験バッファから高品質な例を候補プールに追加する
@@ -358,7 +456,9 @@ class FewShotPool(JsonStateStore):
                 continue
 
             query = exp.get("query", "").strip()
-            response = exp.get("response_summary", "").strip()
+            # few-shot 例には切り詰めていない全文を優先採用 (採用例の途中切れ防止)。
+            # 旧 experience.json / response_full 欠落時は要約へフォールバック。
+            response = (exp.get("response_full") or exp.get("response_summary", "")).strip()
             mode = exp.get("mode", "chat")
 
             # クエリと応答が存在するか
@@ -373,30 +473,8 @@ class FewShotPool(JsonStateStore):
                 added_at=exp.get("timestamp", ""),
             )
 
-            pool = self._pools.setdefault(mode, [])
-
-            # 多様性チェック
-            if not self._is_diverse(example, pool):
-                continue
-
-            pool.append(example)
-            added += 1
-
-            # SemMem 書き戻しモードでは
-            # 新規 example を ``learn.fewshot.<mode>.<id>`` ファクトとして書き出す。
-            self._writeback_example_fact(example)
-
-            # プールサイズ制限: fitness が最も低い候補を除去
-            # SemMem 書き戻しモードでは GC を SemMem 側
-            # ``semmem_limits.policy`` + ``gc_strategy=lowest_score`` に
-            # 委譲し、プール側の局所 GC は停止する。
-            if (
-                len(pool) > self.pool_size
-                and not self.is_semmem_writeback_active()
-            ):
-                pool.sort(key=lambda e: e.fitness)
-                removed = pool.pop(0)
-                self._bigram_cache.pop(removed.id, None)
+            if self._try_accept(example) is not None:
+                added += 1
 
         if added:
             pool_counts = {m: len(p) for m, p in self._pools.items()}
@@ -448,19 +526,9 @@ class FewShotPool(JsonStateStore):
             fitness=float(fitness),
             added_at=added_at,
         )
-        pool = self._pools.setdefault(mode, [])
-        if not self._is_diverse(example, pool):
+        accepted = self._try_accept(example)
+        if accepted is None:
             return None
-
-        pool.append(example)
-        self._writeback_example_fact(example)
-        if (
-            len(pool) > self.pool_size
-            and not self.is_semmem_writeback_active()
-        ):
-            pool.sort(key=lambda e: e.fitness)
-            removed = pool.pop(0)
-            self._bigram_cache.pop(removed.id, None)
 
         dl = self._debug_logger
         if dl:
@@ -469,10 +537,10 @@ class FewShotPool(JsonStateStore):
                 "op": "accept_from_artifact",
                 "mode": mode,
                 "fitness": float(fitness),
-                "example_id": example.id,
-                "pool_size": len(pool),
+                "example_id": accepted.id,
+                "pool_size": len(self._pools.get(mode, [])),
             })
-        return example
+        return accepted
 
     def select(
         self,
@@ -498,10 +566,21 @@ class FewShotPool(JsonStateStore):
             return list(pool)
 
         rng = np.random.default_rng(seed)
-        # fitness による重み付きサンプリング（高 fitness を優先）
-        fitnesses = np.array([ex.fitness for ex in pool])
-        weights = fitnesses / fitnesses.sum()
-        indices = rng.choice(len(pool), size=min(n, len(pool)), replace=False, p=weights)
+        # fitness による重み付きサンプリング（高 fitness を優先）。
+        # 全ゼロ fitness (bootstrap で fitness 欠損=0.0 復元等) だと sum=0 →
+        # 0/0=NaN で rng.choice がクラッシュする。非ゼロ重み数 < size でも
+        # replace=False で ValueError。これらを一様重みにフォールバックして防ぐ。
+        size = min(n, len(pool))
+        fitnesses = np.array([ex.fitness for ex in pool], dtype=float)
+        fitnesses = np.nan_to_num(fitnesses, nan=0.0, posinf=0.0, neginf=0.0)
+        fitnesses = np.clip(fitnesses, 0.0, None)
+        total = float(fitnesses.sum())
+        nonzero = int((fitnesses > 0).sum())
+        if total <= 0.0 or nonzero < size:
+            weights = np.full(len(pool), 1.0 / len(pool))
+        else:
+            weights = fitnesses / total
+        indices = rng.choice(len(pool), size=size, replace=False, p=weights)
         selected = [pool[i] for i in indices]
 
         dl = self._debug_logger
@@ -514,6 +593,52 @@ class FewShotPool(JsonStateStore):
                 "requested": n,
                 "selected_ids": [ex.id for ex in selected],
                 "selected_fitnesses": [ex.fitness for ex in selected],
+            })
+        return selected
+
+    def select_top_k(
+        self,
+        mode: str,
+        query: str,
+        k: int | None = None,
+    ) -> list[FewShotExample]:
+        """query 類似度 (char bi-gram cosine) × fitness 重み付けで上位 k を返す。
+
+        推論時の動的 few-shot 選択器 (FewShotSelector Protocol の実装)。埋め込み
+        サーバは使わず同期・低遅延。``combined = SIM_W * sim + (1-SIM_W) * fitness``。
+        pool が大きい場合は fitness 上位 ``_TOPK_SELECT_CAP`` 件に足切りしてから
+        類似計算する (hot path のレイテンシ抑制)。query/pool が空なら ``[]``。
+        """
+        k = k or self.max_examples
+        pool = self._pools.get(mode, [])
+        q = (query or "").strip()
+        if not pool or not q:
+            return []
+        # fitness 上位 cap 件に足切り (全件 cosine を避ける)
+        if len(pool) > _TOPK_SELECT_CAP:
+            pool = sorted(pool, key=lambda e: -e.fitness)[:_TOPK_SELECT_CAP]
+        q_bg = _char_bigrams(q)  # query bi-gram は 1 回だけ計算
+        scored: list[tuple[float, FewShotExample]] = [
+            (
+                _TOPK_SIM_WEIGHT * _cosine_similarity(q_bg, self._get_bigrams(ex))
+                + (1.0 - _TOPK_SIM_WEIGHT) * ex.fitness,
+                ex,
+            )
+            for ex in pool
+        ]
+        scored.sort(key=lambda t: -t[0])
+        selected = [ex for _, ex in scored[:k]]
+
+        dl = self._debug_logger
+        if dl:
+            dl.log_learning_cycle(cycle_num=0, data={
+                "component": "fewshot_pool",
+                "op": "select_top_k",
+                "mode": mode,
+                "pool_considered": len(pool),
+                "query_len": len(q),
+                "selected_ids": [ex.id for ex in selected],
+                "scores": [round(s, 4) for s, _ in scored[:k]],
             })
         return selected
 
@@ -624,9 +749,11 @@ class FewShotPool(JsonStateStore):
                 continue
             pool.sort(key=lambda e: e.fitness)
             excess = len(pool) - self.pool_size
+            seen = self._seen_hashes.setdefault(mode, set())
             for _ in range(excess):
                 removed = pool.pop(0)
                 self._bigram_cache.pop(removed.id, None)
+                seen.discard(self._content_hash(removed.query, removed.response))
             removed_per_mode[mode] = excess
 
         removed_total = sum(removed_per_mode.values())
@@ -671,10 +798,21 @@ class FewShotPool(JsonStateStore):
             raise TypeError(
                 f"fewshot_pool.json must be a dict, got {type(payload).__name__}"
             )
-        for mode, entries in payload.items():
-            self._pools[mode] = [FewShotExample(**entry) for entry in entries]
-        # bi-gram キャッシュをリビルド
+        # 二重 load / bootstrap 後 load で旧モードが残らないよう全状態をリセット。
+        self._pools.clear()
         self._bigram_cache.clear()
+        self._seen_hashes.clear()
+        for mode, entries in payload.items():
+            pool: list[FewShotExample] = []
+            seen = self._seen_hashes.setdefault(mode, set())
+            for entry in entries:
+                # 未知キーを無視して復元 (旧スキーマ耐性、TypeError 全消失を防ぐ)。
+                ex = FewShotExample(**{
+                    k: v for k, v in entry.items() if k in _EXAMPLE_FIELD_NAMES
+                })
+                pool.append(ex)
+                seen.add(self._content_hash(ex.query, ex.response))
+            self._pools[mode] = pool
 
     def _on_save_success(self, path: Path) -> None:
         logger.info("Fewshot pool saved: %s (%d total)", path, self.total_count)

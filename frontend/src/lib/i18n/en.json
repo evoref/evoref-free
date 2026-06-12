@@ -579,11 +579,6 @@
 			"presence_penalty_desc": "Penalty for existing tokens (positive=more diversity)"
 		}
 	},
-	"token_bar": {
-		"usage": "{used}/{limit} token",
-		"progress_label": "Token usage",
-		"warning_tooltip": "Warning at 80%, reset recommended at 95%"
-	},
 	"file": {
 		"attach": "Attach File",
 		"upload_area": "Drag and drop or click to add files",

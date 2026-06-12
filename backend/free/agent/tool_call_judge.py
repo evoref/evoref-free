@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import shlex
 import time
@@ -423,6 +424,16 @@ class ToolCallJudge:
             return False
         return self._config.get("agent", {}).get("tool_judge_enabled", True)
 
+    def _speculation_enabled(self) -> bool:
+        """層4 (tool_judgment) と層5 (executable_command_synth) の投機並走可否.
+
+        assist の realtime セマフォが 2 以上 (= チャット応答パスの並列化が
+        有効) のときだけ True。セマフォ=1 のまま投機すると層5 synth が先に
+        スロットを取って層4 judgment を遅らせる優先度逆転が起きるため、
+        並列度が確保された構成でのみ投機する。
+        """
+        return getattr(self._assist_client, "realtime_concurrency", 1) >= 2
+
     async def judge(
         self,
         query: str,
@@ -544,57 +555,100 @@ class ToolCallJudge:
             self._log_tool_decision(result, "learned_pattern_matched")
             return result
 
-        # 4. アシストモデル判定（有効時のみ）
-        # tool を選んだ場合のみ即 return する。no-tool の場合は 5 層目
-        # (executable command fallback) に fall-through させる。
-        #
         # 雑談プレフィルタ: ツールシグナルが無く、知識質問 or ユーザー自身の
-        # 行動宣言 (「探してみるね」等) のクエリは、広範な tool_judgment 呼出を
-        # スキップする。アシスト接続時の常時有効化で純粋な雑談のたびに
-        # tool_judgment を呼ぶ無駄打ちと誤発火 (例: 「探してみるね」→ search_history)
-        # を抑える狙い。ただし 5 層目 (executable_command_synth) はスキップしない
-        # — 「Chrome のバージョン教えて」のように雑談風だが実行可能な事実クエリを
-        # 拾うため (旧 chat early-return の synth 呼出と同等のベースラインを維持)。
+        # 行動宣言 (「探してみるね」等) のクエリは層4 (tool_judgment) をスキップ
+        # する (詳細は下の try 内コメント)。
         skip_judgment = _is_conversational_query_without_tool_signal(query)
         if skip_judgment:
             logger.debug(
                 "Skipping tool_judgment for conversational query w/o tool signal: %s",
                 query[:50],
             )
-        if self.enabled and self._assist_client is not None and not skip_judgment:
-            try:
-                assist_result = await self._judge_with_assist(
-                    query, tools_registry, mode, conversation,
-                )
-                assist_result = self._suppress_unfetchable_fetch_url(assist_result)
-                if assist_result.tool_needed:
-                    self._log_tool_decision(assist_result, "assist_judgement")
-                    return assist_result
-            except Exception as e:
-                logger.warning(
-                    "Assist model tool judgement failed: %r", e,
-                )
-
-        # 5. executable command フォールバック (環境依存事実クエリの救済)
-        # 4 層全てが no-tool を返した場合、assist (executable_command_synth)
-        # で「これは run_command で取れる事実か?」を判定する。Free chat mode
-        # は judge() 冒頭の early-return で既に処理済みのため、ここに到達する
-        # のは coding mode / tool_judge_enabled=True パス。
-        fallback_result = await self._judge_with_executable_fallback(
-            query, tools_registry,
+        run_layer4 = (
+            self.enabled and self._assist_client is not None and not skip_judgment
         )
-        if fallback_result is not None:
-            self._log_tool_decision(
-                fallback_result, "executable_command_fallback",
+
+        # 投機実行: 層4 を走らせる場合かつ realtime 並列度が確保されている
+        # とき、層5 (executable_command_synth) を先回りで起動して層4 と
+        # 並走させる。層4 が tool を返したら finally で破棄、no-tool なら
+        # await して回収する。層4 を走らせない (skip_judgment / 無効) 場合は
+        # 層5 が最初の assist 呼出なので投機の意味がなく、直列実行する。
+        spec_task: asyncio.Task | None = None
+        if run_layer4 and self._speculation_enabled():
+            spec_task = asyncio.create_task(
+                self._judge_with_executable_fallback(query, tools_registry),
             )
-            return fallback_result
+        try:
+            # 4. アシストモデル判定（有効時のみ）
+            # tool を選んだ場合のみ即 return する。no-tool の場合は 5 層目
+            # (executable command fallback) に fall-through させる。
+            #
+            # 雑談プレフィルタ: ツールシグナルが無く、知識質問 or ユーザー自身の
+            # 行動宣言 (「探してみるね」等) のクエリは、広範な tool_judgment 呼出を
+            # スキップする。アシスト接続時の常時有効化で純粋な雑談のたびに
+            # tool_judgment を呼ぶ無駄打ちと誤発火 (例: 「探してみるね」→ search_history)
+            # を抑える狙い。ただし 5 層目 (executable_command_synth) はスキップしない
+            # — 「Chrome のバージョン教えて」のように雑談風だが実行可能な事実クエリを
+            # 拾うため (旧 chat early-return の synth 呼出と同等のベースラインを維持)。
+            if run_layer4:
+                try:
+                    assist_result = await self._judge_with_assist(
+                        query, tools_registry, mode, conversation,
+                    )
+                    assist_result = self._suppress_unfetchable_fetch_url(
+                        assist_result,
+                    )
+                    if assist_result.tool_needed:
+                        self._log_tool_decision(assist_result, "assist_judgement")
+                        return assist_result  # finally が spec_task を cancel
+                except Exception as e:
+                    logger.warning(
+                        "Assist model tool judgement failed: %r", e,
+                    )
 
-        # 6. 全フォールバック失敗時の no_tool 結末を記録
-        no_tool_result = ToolJudgement(tool_needed=False, source="rule")
-        self._log_tool_decision(
-            no_tool_result, "no_match_in_any_layer",
-        )
-        return no_tool_result
+            # 5. executable command フォールバック (環境依存事実クエリの救済)
+            # 4 層全てが no-tool を返した場合、assist (executable_command_synth)
+            # で「これは run_command で取れる事実か?」を判定する。Free chat mode
+            # は judge() 冒頭の early-return で既に処理済みのため、ここに到達する
+            # のは coding mode / tool_judge_enabled=True パス。
+            # 投機タスクがあれば await で回収、なければ直列実行する。
+            if spec_task is not None:
+                task, spec_task = spec_task, None  # 消費済 (finally で cancel しない)
+                try:
+                    fallback_result = await task
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "Speculative executable_command_synth failed: %r", e,
+                    )
+                    fallback_result = None
+            else:
+                fallback_result = await self._judge_with_executable_fallback(
+                    query, tools_registry,
+                )
+            if fallback_result is not None:
+                self._log_tool_decision(
+                    fallback_result, "executable_command_fallback",
+                )
+                return fallback_result
+
+            # 6. 全フォールバック失敗時の no_tool 結末を記録
+            no_tool_result = ToolJudgement(tool_needed=False, source="rule")
+            self._log_tool_decision(
+                no_tool_result, "no_match_in_any_layer",
+            )
+            return no_tool_result
+        finally:
+            # 層4 が tool を返した / 例外で抜けた場合、投機タスクが未消費なら
+            # 破棄する。キャンセルされた synth は ``_synthesize_command_via_assist``
+            # の ``except Exception`` が CancelledError を捕まえないため LRU
+            # キャッシュを汚さない (= 失敗時キャッシュなしの現行挙動と同じ)。
+            # なお非ストリーミング assist 呼出はサーバ側で切断検知できず、
+            # 破棄した synth が最大 max_tokens 分 slot を占有しうるが、
+            # slots>=2 構成が前提のため他スロットは空く。
+            if spec_task is not None and not spec_task.done():
+                spec_task.cancel()
 
     async def _judge_with_executable_fallback(
         self, query: str, tools_registry: ToolsRegistry,

@@ -276,6 +276,29 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
         """検索指示プレフィックスの動的変更が可能"""
         return True
 
+    def set_instruction(self, text: str, *, mode: str | None = None) -> None:
+        """進化採用された検索 instruction を稼働中に反映する (Learn→Gen 動的更新)。
+
+        ``mode=None`` で全 mode (既存キー + ``DEFAULT_MODE``) を同一 instruction で
+        共通 override する (進化器・eval が構造上 mode 非フィルタなため、単一の
+        進化結果を全 mode に適用するのが整合的)。``mode`` 指定でそのキーのみ更新。
+        instruction を変えると旧 prefix で計算済みの query 埋め込みキャッシュが
+        stale になるため必ず :meth:`clear_query_cache` する。
+        """
+        text = text.strip()
+        if not text:
+            return
+        if mode is None:
+            for key in set(self._instructions) | {DEFAULT_MODE}:
+                self._instructions[key] = text
+        else:
+            self._instructions[mode] = text
+        self.clear_query_cache()
+        logger.info(
+            "Embed instruction updated at runtime (mode=%s, modes=%s)",
+            mode or "ALL", sorted(self._instructions.keys()),
+        )
+
     async def health_check(self) -> bool:
         """埋め込み用 llama-server のヘルスチェック
 

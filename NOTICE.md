@@ -19,8 +19,9 @@ Pro 拡張 (`backend/pro/` / `frontend/src/lib/pro/`) はプロプライエタ�
 # Third-Party Notices
 
 本プロジェクトは以下のサードパーティ製モデル・ソフトウェアを使用しています。
-モデル本体は同梱せず、`scripts/setup.sh` / `setup.bat` (内部で `scripts/download_model.py` を呼ぶ) が
-Hugging Face から `models/` 配下にダウンロードします。モデル自体の改変は行っていません。
+モデル本体は同梱せず、また自動ダウンロードも行いません。利用者が GGUF を
+`models/` 配下へ手動配置します (`scripts/download_model.py` は配置状況の確認のみ)。
+モデル自体の改変は行っていません。
 
 `config.yaml` の `model_paths` を変更することで、別の GGUF モデルにも差し替え可能です。
 標準構成は `config.yaml.example` を参照してください。

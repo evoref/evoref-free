@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from backend.free.memory.extractors.mdp_trace import episode_task_and_result
 from backend.free.memory.stores.short_term import MemoryNote
 from backend.log_config import get_logger
 
@@ -288,16 +289,26 @@ class MDPIngester:
           一意化されるためここでは episode 毎に固定)
         - ``mode`` は begin event の値 (デフォルト coding)
         - ``trace_id`` はイベントから引き継ぎ (contextvars 由来)
-        - ``content`` は ``outcome`` + 直近 3 アクションの 1 行サマリ
+        - ``content`` は ``outcome`` + task/observation + 直近 3 アクションの
+          1 行サマリ (ツール無しの単発生成でも無内容にならないよう enrich)
         """
         ts = now if now is not None else time.time()
         steps = episode.steps
         last_actions = [str(s.get("action") or "") for s in steps[-3:]]
         outcome = episode.outcome() or "unknown"
+        # ツール無しの単発生成では action が "none" になり、outcome + actions だけ
+        # では無内容なノート (`actions=none`) が LTM/RAG を汚染する。decision ファクト
+        # と同じ enrich を共有し、最終ステップの task (ユーザー要求) と
+        # observation (生成結果) を content に含める。
+        task_desc, observation = episode_task_and_result(steps)
         content_parts = [
             f"[mdp_trace] episode={episode.episode_id}",
             f"outcome={outcome}",
         ]
+        if task_desc:
+            content_parts.append(f"task={task_desc[:300]}")
+        if observation:
+            content_parts.append(f"result={observation[:300]}")
         if last_actions:
             content_parts.append("actions=" + " > ".join(last_actions))
         if conv := episode.conversation_id():
@@ -307,7 +318,9 @@ class MDPIngester:
         note = MemoryNote(
             id=f"mdp_{episode.episode_id}",
             content=content,
-            keywords=[a for a in last_actions if a][:5],
+            # "none" (ツール無し単発生成のプレースホルダ action) は検索語として
+            # 無意味なので keywords から除く。
+            keywords=[a for a in last_actions if a and a != "none"][:5],
             tags=["mdp_trace"],
             created_at=ts,
             accessed_at=ts,

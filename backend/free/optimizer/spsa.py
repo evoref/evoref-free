@@ -58,7 +58,8 @@ class SPSAOptimizer:
         eval_func: Callable[[np.ndarray], float],
         c_k: float,
         rng: np.random.Generator,
-    ) -> np.ndarray:
+        invalid_loss: float | None = None,
+    ) -> tuple[np.ndarray, float, float, np.ndarray]:
         """同時摂動による勾配近似
 
         Bernoulli ±1 の摂動ベクトルを生成し、
@@ -69,9 +70,14 @@ class SPSAOptimizer:
             eval_func: 評価関数（小さいほど良い）
             c_k: 摂動量
             rng: 乱数生成器
+            invalid_loss: 評価不能を表す番兵値（例: 候補サーバ起動失敗）。±いずれかの
+                探索点がこの値なら有限差分が暴発するため勾配を 0 にして当該反復の
+                更新をスキップする。None なら従来どおり常に勾配を計算する。
 
         Returns:
-            勾配近似ベクトル
+            (勾配近似ベクトル, loss_plus, loss_minus, perturbation)。呼出側が探索点
+            (params ± perturbation) を追加評価なしで再構成し best 追跡できるよう
+            損失・摂動も返す。
         """
         # Bernoulli ±1 摂動
         delta = rng.choice([-1.0, 1.0], size=params.shape)
@@ -81,10 +87,15 @@ class SPSAOptimizer:
         loss_plus = eval_func(params + perturbation)
         loss_minus = eval_func(params - perturbation)
 
-        # 勾配近似
-        gradient = (loss_plus - loss_minus) / (2.0 * perturbation)
+        # 勾配近似（片側でも番兵値なら 0 勾配でスキップ）
+        if invalid_loss is not None and (
+            abs(loss_plus - invalid_loss) < 1e-9 or abs(loss_minus - invalid_loss) < 1e-9
+        ):
+            gradient = np.zeros_like(params)
+        else:
+            gradient = (loss_plus - loss_minus) / (2.0 * perturbation)
 
-        return gradient
+        return gradient, loss_plus, loss_minus, perturbation
 
     def optimize(
         self,
@@ -93,6 +104,9 @@ class SPSAOptimizer:
         iterations: int = 500,
         seed: int | None = None,
         callback: Callable[[int, np.ndarray, float], None] | None = None,
+        initial_loss: float | None = None,
+        eval_current_params: bool = True,
+        invalid_loss: float | None = None,
     ) -> tuple[np.ndarray, float]:
         """SPSA 最適化ループ
 
@@ -102,6 +116,14 @@ class SPSAOptimizer:
             iterations: イテレーション数
             seed: 乱数シード
             callback: 各イテレーション後のコールバック (iteration, params, loss)
+            initial_loss: 初期点の損失（事前計算済み）。指定すると初期評価を 1 回省く
+                （高コスト eval — 例: 候補 LoRA の実サーバ評価 — の重複を避ける）。
+            eval_current_params: 各反復で更新後パラメータを追加評価して best 追跡する
+                （既定 True = 従来挙動、3 eval/iter）。False なら追加評価を省き、2 つの
+                探索点 (probe) の良い方で best を更新する（2 eval/iter）。高コスト eval
+                での反復あたり起動回数を 1/3 削減する。
+            invalid_loss: 評価不能を表す番兵値。探索点がこの値なら勾配 0 でスキップし、
+                best 追跡からも除外する（番兵による暴発・誤採用を防ぐ）。
 
         Returns:
             (最適化後パラメータ, 最終損失値)
@@ -109,7 +131,7 @@ class SPSAOptimizer:
         rng = np.random.default_rng(seed)
         params = initial_params.copy().astype(np.float64)
         best_params = params.copy()
-        best_loss = eval_func(params)
+        best_loss = initial_loss if initial_loss is not None else eval_func(params)
 
         logger.info(
             "SPSA optimization: %d params, %d iterations, initial loss=%.6f",
@@ -119,27 +141,43 @@ class SPSAOptimizer:
         for k in range(1, iterations + 1):
             a_k, c_k = self._decay_schedule(k)
 
-            # 勾配近似
-            gradient = self._compute_gradient(params, eval_func, c_k, rng)
+            # 勾配近似（探索点の損失・摂動も受け取る）
+            gradient, loss_plus, loss_minus, perturbation = self._compute_gradient(
+                params, eval_func, c_k, rng, invalid_loss=invalid_loss,
+            )
 
-            # パラメータ更新
-            params = params - a_k * gradient
+            # パラメータ更新（番兵スキップ時は gradient=0 で据え置き）
+            prev_params = params
+            params = prev_params - a_k * gradient
 
-            # 現在の損失
-            current_loss = eval_func(params)
-
-            # 最良結果の追跡
-            if current_loss < best_loss:
-                best_loss = current_loss
-                best_params = params.copy()
+            if eval_current_params:
+                # 更新後パラメータを評価して best 追跡（従来挙動）
+                current_loss = eval_func(params)
+                if current_loss < best_loss:
+                    best_loss = current_loss
+                    best_params = params.copy()
+                cb_loss = current_loss
+            else:
+                # 追加評価を省き、2 探索点 (prev_params ± perturbation) の良い方で
+                # best 更新。番兵値の探索点は best 候補から除外する。
+                for ploss, ppoint in (
+                    (loss_plus, prev_params + perturbation),
+                    (loss_minus, prev_params - perturbation),
+                ):
+                    if invalid_loss is not None and abs(ploss - invalid_loss) < 1e-9:
+                        continue
+                    if ploss < best_loss:
+                        best_loss = ploss
+                        best_params = ppoint.copy()
+                cb_loss = min(loss_plus, loss_minus)
 
             if callback:
-                callback(k, params, current_loss)
+                callback(k, params, cb_loss)
 
             if k % 100 == 0 or k == iterations:
                 logger.info(
                     "SPSA iter %d/%d: loss=%.6f, best=%.6f, a_k=%.6f, c_k=%.6f",
-                    k, iterations, current_loss, best_loss, a_k, c_k,
+                    k, iterations, cb_loss, best_loss, a_k, c_k,
                 )
 
         return best_params, best_loss

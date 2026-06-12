@@ -1,9 +1,14 @@
 """
 
 EvorefMem pillar の内部で全 :class:`~backend.free.memory.types.FactType` に
-対するフルアクセスを提供する Fact View。sleep-time worker /
-conflict resolver / GC / Step 9 promotion 等が本 View を通じて
-:class:`~backend.free.memory.semantic.store.SemanticFactStore` を操作する。
+対するフルアクセスを提供する Fact View。Mem 所有 FactType に対する
+**sanctioned な書込/読取 API** を定義する。
+
+注: Mem 内部の sleep-time worker / conflict resolver / GC / Step 9 promotion は
+現状 :class:`~backend.free.memory.semantic.store.SemanticFactStore` を直接
+操作している (Mem 内部の store 直参照は pillar boundary test で許容)。本 View の
+高レベル API は将来それらを集約する受け皿であり、現時点で全メソッドが production
+から呼ばれているわけではない (越境 reader の入口としての利用が主)。
 
 ## スコープ
 

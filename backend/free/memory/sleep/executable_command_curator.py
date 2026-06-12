@@ -196,6 +196,10 @@ async def curate_executable_command_facts(
     written = 0
     seen_subjects: set[str] = set()
     for user_note, assistant_note in pairs:
+        # 処理済みアンカー (assistant note) はスキップ。STM に残り続ける同一
+        # コマンドを Full サイクルごとに再記録 (exec_count 水増し) するのを防ぐ。
+        if assistant_note.command_curated_at is not None:
+            continue
         command = assistant_note.tool_command or ""
         if not command:
             continue
@@ -205,6 +209,9 @@ async def curate_executable_command_facts(
             continue
         subject = _make_subject(mode, normalized)
         if subject in seen_subjects:
+            # 同一サイクル内で既出のコマンド — このノートも処理済みにマークして
+            # 次サイクルで重複記録しない。
+            assistant_note.command_curated_at = now_fn()
             continue
         seen_subjects.add(subject)
         success = bool(assistant_note.tool_command_success)
@@ -268,6 +275,10 @@ async def curate_executable_command_facts(
             logger.warning(
                 "executable_command_curator: persist failed: %s", exc,
             )
+
+        # コマンド処理完了 (成功/失敗/既存更新の全分岐) — 次サイクルで同一
+        # コマンドを再記録しないようマークする。
+        assistant_note.command_curated_at = now
 
     if written and debug_logger is not None:
         try:

@@ -353,6 +353,36 @@ class PolicyInterpreter:
         mode_params = params.get(mode, {})
         return dict(mode_params)
 
+    def get_constraints(self, domain: str) -> dict:
+        """指定ドメインの constraints を返す (読み取り専用想定の浅いコピー)。
+
+        PolicyEvolver の摂動範囲算出用。``_data`` 直アクセスを避けるための公開 API。
+        """
+        policy = self._data.get(domain)
+        if policy is None:
+            raise KeyError(f"Unknown policy domain: {domain}")
+        return dict(policy.get("constraints", {}))
+
+    def restore_params(self, domain: str, snapshot: dict, mode: str = "chat") -> None:
+        """与えた params スナップショットで当該 mode を丸ごと置換する。
+
+        PolicyEvolver が best_fitness 更新時に取得した params で復元するための API。
+        単段の apply_delta スナップショット (``_snapshots``) は当該キーを破棄し、
+        二重管理を残さない (``rollback`` と同じ ``_default`` モード分岐を踏襲)。
+        """
+        with self._lock:
+            policy = self._data.get(domain)
+            if policy is None:
+                raise KeyError(f"Unknown policy domain: {domain}")
+            params = policy["params"]
+            actual_mode = "_default" if "_default" in params else mode
+            params[actual_mode] = copy.deepcopy(snapshot)
+            self._snapshots.pop((domain, mode), None)
+            logger.info(
+                "Policy params restored to best snapshot: domain=%s, mode=%s",
+                domain, mode,
+            )
+
     def reload(self) -> None:
         """ポリシーファイルを再読み込みする。
 

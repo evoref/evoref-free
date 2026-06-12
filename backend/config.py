@@ -17,7 +17,7 @@ class PathResolver:
     """モデルパスとローカルパスを統一的に解決"""
 
     MODEL_DEFAULTS = {
-        "base_model": "models/qwen3.5-4b-q4_k_m.gguf",
+        "base_model": "models/gemma-4-12b-it-qat-q4_0.gguf",
     }
     LOCAL_DEFAULTS = {
         "lora_adapter": "local/models/adapter.gguf",
@@ -585,7 +585,7 @@ def get_mode_generation_params(mode: str) -> dict:
     # ベースモデル。chat は常にここを採用。
     # coding は model_paths.coding_model 指定が無い/空の場合のみフォールバック。
     model_paths = cfg.get("model_paths", {})
-    base_model = model_paths.get("base_model", "models/qwen3.5-4b-q4_k_m.gguf")
+    base_model = model_paths.get("base_model", "models/gemma-4-12b-it-qat-q4_0.gguf")
     if mode == "coding":
         params["model"] = model_paths.get("coding_model") or base_model
     else:

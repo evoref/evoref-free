@@ -55,6 +55,28 @@ _LEVEL1_MODES = ["coding", "chat"]
 _ASSIST_TASKS = ["rag_necessity", "rag_quality", "tool_call", "note_evolve"]
 
 
+def _level2_methods(scheduler) -> dict:
+    """Level 2 の有効メソッドと実行可否を返す (#3a)。
+
+    base=lora / assist=none は no-op 経路でトリガ段階 skip されるため、実メソッド
+    (base=cvector / assist=spsa-real-eval) が有効かを ``will_run`` で示す。
+    """
+    base_method = getattr(scheduler, "level2_base_method", "lora") if scheduler else "lora"
+    assist_method = getattr(scheduler, "level2_assist_method", "none") if scheduler else "none"
+    if base_method == "cvector":
+        active = "cvector"
+    elif assist_method == "spsa-real-eval":
+        active = "spsa-real-eval"
+    else:
+        active = "none"
+    return {
+        "base_method": base_method,
+        "assist_method": assist_method,
+        "active_method": active,
+        "will_run": active != "none",
+    }
+
+
 # ── エンドポイント ──
 
 
@@ -111,6 +133,7 @@ async def optimize_status(state: AppState = Depends(get_app_state)):
             sparse_params=params["sparse_params"],
             min_failures=params["min_failures"],
             lora_adapter_exists=lora_adapter_exists,
+            **_level2_methods(scheduler),
         ),
     )
 
@@ -170,33 +193,45 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
             message="Level 2 optimization requires Pro edition",
         )
 
+    # #3a: base=lora / assist=none は no-op 経路でトリガ段階 skip されるため、
+    # 実メソッドが無効なら「データ不足」ではなく「メソッド未有効」を明示する。
+    methods = _level2_methods(scheduler)
+    if not methods["will_run"]:
+        return OptimizeTriggerResponse(
+            triggered=False,
+            level="level2",
+            message=(
+                "Level 2 real methods not enabled (base=lora/assist=none are no-op "
+                "and trigger-skipped). Set level2_base_method=cvector or "
+                "level2_assist_method=spsa-real-eval."
+            ),
+        )
+
+    # 実メソッド有効: 全パス集合を渡して trainer に委譲 (SleepTimeWorker と同形)。
+    # cvector は LoRA 不要、base/assist bootstrap は adapter 不在時に走るため、
+    # adapter 存在を入口で要求しない (パス未解決は None で degraded に倒す)。
     resolver = get_path_resolver()
-    try:
-        lora_path = resolver.resolve_local("lora_adapter")
-    except Exception:
-        return OptimizeTriggerResponse(
-            triggered=False,
-            level="level2",
-            message="LoRA adapter path not configured",
-        )
 
-    if not lora_path.exists():
-        return OptimizeTriggerResponse(
-            triggered=False,
-            level="level2",
-            message="LoRA adapter not found",
-        )
+    def _safe(resolve, key):
+        try:
+            return resolve(key)
+        except Exception:
+            return None
 
+    base_model_path = _safe(resolver.resolve_model, "base_model")
     started = scheduler.check_level2(
         is_user_active=False,
-        lora_path=lora_path,
+        lora_path=_safe(resolver.resolve_local, "lora_adapter"),
+        current_model=base_model_path.name if base_model_path else "",
+        base_model_path=base_model_path,
+        assist_lora_path=_safe(resolver.resolve_local, "assist_lora_adapter"),
+        assist_model_path=_safe(resolver.resolve_model, "assist_model"),
     )
 
-    if started:
-        message = "Level 2 SPSA optimization triggered"
-    else:
-        message = "Level 2 trigger conditions not met (check failures count, version manager, eval core)"
-
+    message = (
+        "Level 2 optimization triggered" if started
+        else "Level 2 not started (idle/experience/corpus requirements not met)"
+    )
     return OptimizeTriggerResponse(
         triggered=started,
         level="level2",

@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from backend.log_config import get_logger
-from backend.free.memory.notes.note_builder import NoteBuilder, get_note_builder
+from backend.free.memory.notes.note_builder import get_note_builder
 from backend.free.memory.notes.pin_detector import (
     PinTriggers,
     detect_pin,
@@ -17,11 +17,6 @@ from backend.free.memory.notes.pin_detector import (
 from backend.free.memory.types import MemoryMode, NoteSource, TaskStatus
 
 logger = get_logger("memory.short_term")
-
-# モード別ビルダを使う。基底 ``NoteBuilder`` は他モジュール
-# (sleep_update.py の tag refine 等) からの ``extract_keywords`` /
-# ``auto_tag`` 直接呼び出しの後方互換のために import を残す。
-_DEFAULT_BUILDER = NoteBuilder()  # noqa: F841 — keep symbol for legacy callers
 
 
 @dataclass
@@ -114,6 +109,15 @@ class MemoryNote:
     """所属クラスタ ID。``rebuild_links_and_clusters`` が union-find で算出する。
     None の場合は未クラスタリング (孤立ノートまたは未実行)。"""
 
+    # ── sleep-time curator の処理済みマーカー ─────────
+    url_curated_at: float | None = None
+    """url_curator (Step 8.5) がこの user note を処理済みにした時刻。
+    None は未処理。次サイクルで同一ペアを再採点・再記録しないための冪等マーカー。"""
+
+    command_curated_at: float | None = None
+    """executable_command_curator (Step 8.6) がこの assistant note を処理済みに
+    した時刻。None は未処理。次サイクルで同一コマンドを再記録しないためのマーカー。"""
+
 
 class ShortTermMemory:
     """Layer 2: A-MEM ノート + LightMem スコア"""
@@ -137,11 +141,11 @@ class ShortTermMemory:
         # package 同梱 default の 2 段階で解決する。``triggers_dir=None`` の
         # 場合は override を使わず default のみ (テスト / 最小 config 用途)。
         self._pin_triggers_dir: str | Path | None = triggers_dir
-        # auto_detect_confirm はノート時点では使わない
-        # ここではフィールドだけ保持し、CLI/API 層が参照できるようにしておく。
-        self._pin_auto_detect_confirm: bool = bool(
-            pin_cfg.get("auto_detect_confirm", False)
-        )
+        # NOTE: config キー ``memory.pin.auto_detect_confirm`` は将来の
+        # 「自動 pin 検出時にユーザー確認を挟む」フローのための予約 (未実装)。
+        # 現状この値を消費するコードは無いため、ここでは読み込まない
+        # (config.yaml.example には予約キーとして残す)。確認フローを実装する際に
+        # 本クラス or pin_detector で参照する。
 
     def _load_pin_triggers(self) -> PinTriggers:
         """Pin トリガ辞書をプロセス内シングルトンから取得 (パスごと cache)。"""
@@ -232,6 +236,7 @@ class ShortTermMemory:
             accessed_at=data["accessed_at"],
             access_count=data["access_count"],
             session_id=data["session_id"],
+            confidence=data["confidence"],
             source=data["source"],
             mode=data["mode"],
             project_id=data["project_id"],

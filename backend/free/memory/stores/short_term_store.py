@@ -122,6 +122,8 @@ def _note_to_dict(note: MemoryNote) -> dict:
         "trace_id": note.trace_id,
         "links": list(note.links),
         "cluster_id": note.cluster_id,
+        "url_curated_at": note.url_curated_at,
+        "command_curated_at": note.command_curated_at,
     }
 
 
@@ -165,6 +167,11 @@ def _note_from_dict(d: dict) -> MemoryNote:
         depends_on=list(d.get("depends_on", [])),
         failure_signature=d.get("failure_signature"),
         trace_id=d.get("trace_id"),
-        links=list(d["links"]),
-        cluster_id=d["cluster_id"],
+        # 他フィールドと同じく防御的に読む。links / cluster_id だけ直アクセスだと
+        # 1 ノートで両キーを欠くスナップショットが KeyError で deserialize 全体を
+        # 失敗させ、起動時ロードが STM を空で開始して前回の全ノートを失う。
+        links=list(d.get("links", [])),
+        cluster_id=d.get("cluster_id"),
+        url_curated_at=d.get("url_curated_at"),
+        command_curated_at=d.get("command_curated_at"),
     )

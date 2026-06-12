@@ -200,6 +200,8 @@ class MetaCognitiveAgent:
         assist_client: "AssistModelClient | None" = None,
         debug_logger: "DebugLogger | None" = None,
         semmem_block: str | None = None,
+        rag_block: str | None = None,
+        file_block: str | None = None,
         code_generator: CodeArtifactGenerator | None = None,
     ) -> None:
         self.max_steps = max_steps
@@ -209,6 +211,13 @@ class MetaCognitiveAgent:
         # (チャット初回ターンと同じ MemoryInjector 出力。reactive 以外の
         #  全ターンで policy / failure_pattern facts を維持するため)
         self._semmem_block = semmem_block
+        # search pipeline 取得済み RAG チャンク (STM/LTM/cartridge) を整形した
+        # ブロック。long_form の prefetched_rag と同じ取得結果を meta 経路でも
+        # ツールループ system に維持する (semmem_block と同じ消費形)。
+        self._rag_block = rag_block
+        # ユーザー添付ファイルを整形したブロック (deliberative の messages 注入と
+        # 等価)。meta 経路は messages を LLM に渡さないためここで維持する。
+        self._file_block = file_block
         # coding モードで editor/chat 出力のコード生成を LongForm 細粒度生成へ
         # 委譲する (composition が注入)。None なら従来の単一ショット生成。
         self._code_generator = code_generator
@@ -265,7 +274,6 @@ class MetaCognitiveAgent:
         conversation: list[dict],
         llm_client,
         tools_registry=None,
-        search_result=None,
         on_step=None,
         generation_params: dict | None = None,
         session_id: str = "",
@@ -284,7 +292,7 @@ class MetaCognitiveAgent:
             return await asyncio.wait_for(
                 self._process_impl(
                     query, system_prompt, conversation, llm_client,
-                    tools_registry, search_result, on_step,
+                    tools_registry, on_step,
                     output_target=output_target,
                     generation_params=generation_params,
                     session_id=session_id,
@@ -402,7 +410,6 @@ class MetaCognitiveAgent:
         conversation: list[dict],
         llm_client,
         tools_registry=None,
-        search_result=None,
         on_step=None,
         *,
         output_target: str = "file",
@@ -1072,6 +1079,12 @@ class MetaCognitiveAgent:
         # SemMem メモリをループ全反復の system に維持する
         if self._semmem_block:
             prompt = f"{prompt}\n\n[関連する記憶]\n{self._semmem_block}"
+        # search pipeline 取得済み RAG チャンクを参考コンテキストとして維持する
+        if self._rag_block:
+            prompt = f"{prompt}\n\n[参考コンテキスト]\n{self._rag_block}"
+        # ユーザー添付ファイルをループ全反復の system に維持する
+        if self._file_block:
+            prompt = f"{prompt}\n\n[添付ファイル]\n{self._file_block}"
         return prompt
 
     def _rebuild_loop_messages(

@@ -759,15 +759,18 @@ async def _expand_and_research(
     top_k: int,
     noise_sigma: float = 0.05,
 ) -> list[tuple[str, float, str]]:
-    """ルールベースのクエリ拡張で再検索（LLM なし）"""
-    # 会話コンテキストからキーワードを抽出して拡張
-    context_keywords: list[str] = []
-    for turn in working_mem.get_context()[-3:]:
-        content = turn.get("content", "")
-        words = content.split()[:5]
-        context_keywords.extend(words)
+    """クエリベクトル摂動による簡易再検索（LLM なし）。
 
-    if not context_keywords or long_term is None:
+    直近の会話コンテキストがある場合に限り、クエリベクトルを微小ノイズで
+    摂動させて近傍を再取得する。会話コンテキストの内容自体は (キーワード抽出
+    等で) 検索条件に反映しない簡易拡張。
+    """
+    # 直近 3 ターンに非空の発話があるときだけ拡張する。
+    has_context = any(
+        (turn.get("content", "") or "").strip()
+        for turn in working_mem.get_context()[-3:]
+    )
+    if not has_context or long_term is None:
         return []
 
     # クエリベクトルを少し摂動させて再検索（簡易的な拡張）

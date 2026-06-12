@@ -71,6 +71,9 @@ class ActiveSessionInfo(BaseModel):
 class SchedulerStatusModel(BaseModel):
     """学習スケジューラの状態"""
     running: bool = False
+    # --no-learning (自己学習 OFF) で起動中かどうか。GUI/CLI が学習無効状態を
+    # 観測できるように surface する (scheduler.get_status の is_disabled を伝播)。
+    is_disabled: bool = False
     experience_count: int = 0
     new_experience_count: int = 0
     min_experiences: int = 0

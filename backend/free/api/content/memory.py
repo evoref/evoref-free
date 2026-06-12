@@ -1,5 +1,7 @@
 """メモリ API"""
 
+from typing import get_args
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from backend.app_state import AppState, get_app_state
@@ -32,7 +34,7 @@ from backend.free.memory.pipeline.stats_calculator import (
     compute_ltm_stats,
     compute_stm_stats,
 )
-from backend.free.memory.types import SemanticFact, make_fact
+from backend.free.memory.types import FactType, SemanticFact, make_fact
 from backend.log_config import get_logger
 
 logger = get_logger("api.memory")
@@ -42,12 +44,9 @@ router = APIRouter(prefix="/api/memory", tags=["memory"])
 
 # 受け入れ可能な FactType (SemanticFact.type に渡せる文字列)。
 # FactType Literal と同期
-_ALLOWED_FACT_TYPES: frozenset[str] = frozenset({
-    "personal_fact", "world_fact", "preference", "emotion", "opinion",
-    "belief", "decision", "commitment", "project", "policy", "fewshot",
-    "failure_pattern", "progress_marker", "task", "coding_task",
-    "artifact", "coding", "model",
-})
+# FactType Literal から直接導出して set のドリフトを防ぐ
+# (旧ハードコードは learned_failure_pattern を取りこぼしていた)。
+_ALLOWED_FACT_TYPES: frozenset[str] = frozenset(get_args(FactType))
 
 
 def _resolve_store(state: AppState, scope: str) -> SemanticFactStore:
@@ -288,8 +287,16 @@ async def pin_memory(
             status_code=400,
             detail="either fact_id or content/object must be provided",
         )
+    # subject はストア境界で正規化する。SubjectKey.parse は前後空白を strip して
+    # pillar を判定するため、" mem.user" のような raw subject をそのまま保存すると
+    # by_pillar バケットには入るが search_by_subject / search_by_pillar_prefix の
+    # raw 文字列一致では永久に不可視になる。抽出経路 (SubjectCanonicalizer) と
+    # 違い API 直書きは正規化を欠くため、ここで最低限 strip して整合させる。
+    subject = req.subject.strip()
+    if not subject:
+        raise HTTPException(status_code=400, detail="subject must be non-empty")
     new_fact = make_fact(
-        subject=req.subject,
+        subject=subject,
         predicate=req.predicate,
         object_=obj,
         type=req.type,  # type: ignore[arg-type]

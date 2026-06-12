@@ -131,7 +131,6 @@ class SleepTimeWorker:
             "tags_refined": 0,
             "scores_updated": 0,
             "evicted": 0,
-            "bm25_rebuilt": False,
         }
 
         logger.info("Sleep-time Light started (%d notes)", len(self.short_term.notes))
@@ -163,11 +162,6 @@ class SleepTimeWorker:
         step_durations["step4_eviction"] = round(time.monotonic() - ts, 3)
         if self._check_cancelled():
             return result
-
-        # Step 5: BM25 インデックス再構築
-        ts = time.monotonic()
-        result["bm25_rebuilt"] = self._step5_rebuild_bm25()
-        step_durations["step5_bm25"] = round(time.monotonic() - ts, 3)
 
         # Step 5.5: 学習済みパターンの減衰と永続化
         ts = time.monotonic()
@@ -293,20 +287,6 @@ class SleepTimeWorker:
             logger.info(
                 "Re-embedded %d conflict-resolved notes", re_embedded,
             )
-
-    def _step9_5_rebuild_bm25_for_summaries(
-        self, result: dict, step_durations: dict[str, float],
-    ) -> None:
-        """Step 9.5: 要約生成後に BM25 を再構築 (要約>0 件の場合のみ)。"""
-        if result["summaries_generated"] <= 0:
-            return
-        ts = time.monotonic()
-        self._step5_rebuild_bm25()
-        step_durations["step9_5_bm25"] = round(time.monotonic() - ts, 3)
-        logger.info(
-            "BM25 index rebuilt after %d new summaries",
-            result["summaries_generated"],
-        )
 
     def _log_full_completion(
         self,
@@ -457,9 +437,6 @@ class SleepTimeWorker:
         if self._check_cancelled():
             return result
 
-        # Step 9.5: 要約生成後の BM25 再構築 (条件付き)
-        self._step9_5_rebuild_bm25_for_summaries(result, step_durations)
-
         # Step 9: 履歴要約を SemMem に decision/commitment として昇格
         ts = time.monotonic()
         result["semmem_promoted"] = self._step9_promote_summaries_to_semmem()
@@ -572,18 +549,6 @@ class SleepTimeWorker:
             logger.debug("Step 4: no notes evicted")
         return evicted
 
-    def _step5_rebuild_bm25(self) -> bool:
-        """Step 5: BM25 インデックス再構築（STM ノート用）"""
-        notes = list(self.short_term.notes.values())
-        if not notes:
-            return False
-
-        # BM25 は VectorStore 側で管理されるため、ここでは STM 内部の
-        # テキスト検索用にノート BM25 を再構築
-        # （HybridRetriever が LTM 用 BM25 を管理する設計のため、
-        #   STM 用は独立して管理）
-        logger.info("BM25 index rebuild: %d notes", len(notes))
-        return True
 
     def _step5_5_decay_patterns(self) -> int:
         """Step 5.5: 学習済みパターンの重み減衰と永続化
