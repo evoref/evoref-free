@@ -123,6 +123,12 @@ class AppState:
     # ``rag.self_rag.assist_judge.max_per_session`` / ``max_per_query`` の
     # 上限判定とセッション切替時のリセット (``reset_session``) を担う。
     assist_judge_tracker: "AssistJudgeUsageTracker | None" = None
+    # conflict_chat_judge のセッション単位発火カウンタ (RAG 用とは別インスタンス)。
+    # ``maybe_resolve_pending_conflicts`` が ``memory.conflict.chat_review
+    # .max_judge_per_session`` の上限判定とセッション切替リセットに使う。
+    # ``check()`` は使わず ``record`` / ``get_session_count`` / ``reset_session``
+    # のみ利用する。
+    conflict_judge_tracker: "AssistJudgeUsageTracker | None" = None
     # 埋め込みモデルとストアの次元不一致フラグ
     embedding_dim_mismatch: bool = False
     # 不一致時の参考情報（fronend のバナー表示用）
@@ -297,6 +303,12 @@ class AppState:
         judge = self.tool_call_judge
         if judge is not None and hasattr(judge, "_assist_client"):
             judge._assist_client = client
+
+        # LearningScheduler.assist_llm_client を同期 (Level 1 プロンプト変異の
+        # assist ルーティング #5)。lazy_connect で assist が後から起きた場合も縮退を防ぐ。
+        ls = self.learning_scheduler
+        if ls is not None and client is not None and hasattr(ls, "assist_llm_client"):
+            ls.assist_llm_client = client
 
     # ── セッション管理 ──
 

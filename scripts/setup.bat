@@ -38,9 +38,9 @@ echo Usage: setup.bat [--shared-path ^<path^>] [--force]
 echo.
 echo Options:
 echo   --shared-path ^<path^>  NAS shared path for multi-PC setup
-echo                          Skips model downloads and uses shared resources
+echo                          Uses shared models/ (no model checks)
 echo   --force                 Force reinstall (recreate .venv, reinstall packages,
-echo                          re-download models, overwrite config.yaml)
+echo                          overwrite config.yaml)
 echo   -h, --help              Show this help message
 exit /b 0
 
@@ -147,7 +147,7 @@ if defined SHARED_PATH if exist "config.yaml" (
         )
     )
     if not defined GGUF_PATH (
-        set "GGUF_PATH=!SHARED_PATH!\models\Qwen3.5-9B-Q4_K_M.gguf"
+        set "GGUF_PATH=!SHARED_PATH!\models\gemma-4-12b-it-qat-q4_0.gguf"
         echo   WARNING: No .gguf file found in !SHARED_PATH!\models\
         echo            Please update model_paths.base_model in config.yaml manually.
     )
@@ -156,42 +156,13 @@ if defined SHARED_PATH if exist "config.yaml" (
     echo   Updated config.yaml with shared paths
 )
 
-rem ── 5. モデルダウンロード ──
-echo [5/6] Downloading models...
+rem ── 5. モデル配置チェック ──
+echo [5/6] Checking models...
 if defined SHARED_PATH (
-    echo   Skipping model downloads ^(using shared path^)...
-    echo   Models available at: !SHARED_PATH!\models\
+    echo   Using shared path. Models expected at: !SHARED_PATH!\models\
 ) else (
-    set "FORCE_FLAG="
-    if defined FORCE set "FORCE_FLAG=--force"
-    echo.
-    echo Available models:
-    echo   1. Base model      - Qwen3.5-9B ^(chat/coding, ~2.6GB^)
-    echo   2. Assist model    - Qwen3.5-4B ^(memory/RAG processing, ~1.4GB^)
-    echo   3. Embedding model - Qwen3-Embedding-0.6B ^(vector search^)
-    echo.
-
-    set /p "DL_BASE=Download base model (Qwen3.5-9B)? [Y/n]: "
-    if /i not "!DL_BASE!"=="n" (
-        python scripts\download_model.py --llm !FORCE_FLAG!
-    ) else (
-        echo   Skipped base model
-    )
-
-    set /p "DL_ASSIST=Download assist model (Qwen3.5-4B)? [Y/n]: "
-    if /i not "!DL_ASSIST!"=="n" (
-        python scripts\download_model.py --assist !FORCE_FLAG!
-    ) else (
-        echo   Skipped assist model
-    )
-
-    set /p "DL_EMBED=Download embedding model (Qwen3-Embedding-0.6B)? [Y/n]: "
-    if /i not "!DL_EMBED!"=="n" (
-        python scripts\download_model.py --embed !FORCE_FLAG!
-    ) else (
-        echo   Skipped embedding model
-    )
-    echo   Done
+    rem 自動ダウンロードは廃止。GGUF は models\ へ手動配置する。
+    python scripts\download_model.py
 )
 
 rem ── 6. ローカルディレクトリ ──

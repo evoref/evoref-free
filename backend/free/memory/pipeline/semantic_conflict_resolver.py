@@ -9,7 +9,8 @@ EvorefMem 統合仕様 における sleep-time **Step 6** の SemMem 対応分
 
 1. ``project_tag_always_manual: true`` を基本とする。
    ``project`` / ``policy`` タグの競合は ``review_status="pending"`` に
-   振り分け、UI で人手解決する
+   振り分け、チャット確認フロー (``conflict_review`` /
+   ``conflict_chat_judge``) で人手解決する (専用 UI は PR #106 で撤去済)
 2. 例外として、``auto_for_evolved_policies: true`` かつ winner が
    ``auto_evolved=True`` の ``policy`` ファクトの場合のみ自動マージする
    (PolicyEvolver 由来の進化結果)。
@@ -18,6 +19,11 @@ EvorefMem 統合仕様 における sleep-time **Step 6** の SemMem 対応分
    以内) は pending に振り分ける。
 4. ``default_mode: manual`` では全件 pending。
 5. pinned ファクトを含む競合は常に pending (誤って自動消失するのを防ぐ)。
+6. ``pending_auto_resolve_days`` (既定 3 日) 超過の滞留 pending は
+   ``resolve()`` 冒頭の TTL pre-pass (``_resolve_expired_pending``) が
+   keep_new で自動解消する (``conflicts_resolved.jsonl`` に
+   ``decision="ttl_auto"``)。pinned / project / policy は対象外。
+   ``default_mode=manual`` でも有効、0 で無効。
 
 ファイル出力 (1 ストアあたり)::
 
@@ -100,6 +106,10 @@ class SemanticConflictResolver:
         self.auto_for_evolved_policies: bool = bool(
             cfg.get("auto_for_evolved_policies", True),
         )
+        # pending 競合の TTL 自動解消 (秒)。0 で無効。
+        self.pending_ttl_sec: float = (
+            float(cfg.get("pending_auto_resolve_days", 3.0)) * 86400.0
+        )
         self._now_provider = now_provider or time.time
 
     # ── public API ────────────────────────────────────────────────────
@@ -107,15 +117,23 @@ class SemanticConflictResolver:
     def resolve(self) -> dict[str, int]:
         """ストア内の競合を検出 → 判定 → 適用する。
 
+        先頭で TTL pre-pass (``_resolve_expired_pending``) を実行し、滞留した
+        pending を keep_new で自動解消してから新規競合を検出する。pre-pass で
+        解消した winner は singleton 化するため、同サイクルの ``_detect_groups``
+        で別 active ファクトとの新競合があれば正しく拾える。
+
         Returns:
-            ``{"detected", "auto_resolved", "pending", "groups"}`` のサマリ。
+            ``{"detected", "auto_resolved", "pending", "groups",
+            "ttl_auto_resolved"}`` のサマリ。
         """
         result = {
             "detected": 0,
             "auto_resolved": 0,
             "pending": 0,
             "groups": 0,
+            "ttl_auto_resolved": 0,
         }
+        self._resolve_expired_pending(result)
         groups = self._detect_groups()
         for facts in groups:
             result["groups"] += 1
@@ -132,6 +150,68 @@ class SemanticConflictResolver:
                 self._infer_scope(),
             )
         return result
+
+    # ── TTL pre-pass ──────────────────────────────────────────────────
+
+    def _resolve_expired_pending(self, result: dict[str, int]) -> None:
+        """TTL 超過の pending 競合グループを keep_new で自動解消する (pre-pass)。
+
+        グループ内最新ファクトの ``created_at`` から ``pending_ttl_sec`` 経過した
+        グループが対象。pinned を含む / type に project・policy を含むグループは
+        除外する (チャット回答でのみ解決)。``default_mode=manual`` でも有効で、
+        無効化は ``pending_auto_resolve_days=0`` を指定する。``result`` の
+        ``ttl_auto_resolved`` を解消グループ数だけ加算する。
+        """
+        if self.pending_ttl_sec <= 0:
+            return
+        # conflict_review はモジュールトップで本モジュールの定数を import して
+        # いるため、循環回避でここで遅延 import する (同一 pillar EvorefMem 内)。
+        from backend.free.memory.pipeline.conflict_review import (
+            AlreadyResolvedError,
+            apply_resolution,
+            collect_pending_groups,
+        )
+        scope = self._infer_scope()
+        now = float(self._now_provider())
+        for group in collect_pending_groups(self.store, scope):
+            if any(f.pinned for f in group.facts):
+                continue
+            if {f.type for f in group.facts} & _MANUAL_BASE_TAGS:
+                continue
+            if now - group.newest.created_at < self.pending_ttl_sec:
+                continue
+            loser_ids = [f.id for f in group.facts if f.id != group.newest.id]
+            try:
+                apply_resolution(
+                    self.store,
+                    scope=scope,
+                    action="keep_new",
+                    winner_id=group.newest.id,
+                    loser_ids=loser_ids,
+                    decision_source="ttl_auto",
+                )
+            except AlreadyResolvedError:
+                # 競合がチャット回答で既に解決済み (失敗ではなく稀な競合)。
+                logger.debug(
+                    "TTL pending group %s.%s already resolved (skip)",
+                    group.subject, group.predicate,
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001
+                # sleep-time は best-effort。apply_resolution の I/O 失敗
+                # (OSError 等) や想定外で 1 グループが落ちても、残りの解消と
+                # sleep サイクル全体を止めない。
+                logger.warning(
+                    "TTL auto-resolve failed for %s %s: %r",
+                    group.subject, group.predicate, exc,
+                )
+                continue
+            result["ttl_auto_resolved"] += 1
+        if result["ttl_auto_resolved"]:
+            logger.info(
+                "SemMem pending TTL auto-resolve: %d group(s) (scope=%s)",
+                result["ttl_auto_resolved"], scope,
+            )
 
     # ── 検出 ─────────────────────────────────────────────────────────
 
@@ -319,7 +399,13 @@ def resolve_semmem_conflicts(
     sleep-time Step 6 のヘルパ。``stores`` は ``[global_store, project_store]``
     を想定するが任意個に対応する。集計サマリを返す。
     """
-    total = {"detected": 0, "auto_resolved": 0, "pending": 0, "groups": 0}
+    total = {
+        "detected": 0,
+        "auto_resolved": 0,
+        "pending": 0,
+        "groups": 0,
+        "ttl_auto_resolved": 0,
+    }
     for store in stores:
         if store is None:
             continue

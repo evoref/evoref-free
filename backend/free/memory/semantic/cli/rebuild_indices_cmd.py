@@ -190,6 +190,20 @@ def run_rebuild_indices(
             rep.scopes.append(apply_rebuild_scope(scope, backup_root))
         else:
             rep.scopes.append(plan_rebuild_scope(scope))
+
+    # 索引を実際に再構築した場合は manifest の index_generations を世代 +1 する
+    # (manifest が存在する場合のみ。index 再構築の監査用)。
+    if apply and any(s.applied for s in rep.scopes):
+        from backend.free.memory.semantic.manifest import (
+            load_manifest,
+            update_manifest,
+        )
+
+        manifest = load_manifest(memory_dir)
+        if manifest is not None:
+            gens = dict(manifest.index_generations)
+            gens["index_jsonl"] = gens.get("index_jsonl", 1) + 1
+            update_manifest(memory_dir, index_generations=gens)
     return rep
 
 

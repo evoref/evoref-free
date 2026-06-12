@@ -72,9 +72,6 @@ export const tokenInfo = writable<TokenInfo>({ used: 0, limit: 4096, pct: 0, ins
 /** ストリーミング中フラグ */
 export const isStreaming = writable<boolean>(false);
 
-/** トークン生成速度 (tok/s)。ストリーミング中のみ更新、終了後は最終値を保持 */
-export const tokenSpeed = writable<number>(0);
-
 /** 添付ファイル一覧 */
 export const attachedFiles = writable<File[]>([]);
 

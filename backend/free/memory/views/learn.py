@@ -29,9 +29,7 @@ subject は必ず ``learn.policy.*`` / ``learn.fewshot.*`` / ``learn.metric.*``
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable
-from typing import Any
 
 from backend.free.memory.ownership import Pillar
 from backend.free.memory.protocols import SemanticFactStoreProtocol
@@ -224,6 +222,25 @@ class LearnFactView(FactViewBase):
                 f"(old={old.type!r} new={new.type!r})",
             )
         self._writeback_store.supersede(old_id, new_id)
+
+    def promote_policy_confidence(
+        self, *, fact_id: str, confidence: float,
+    ) -> SemanticFact | None:
+        """active policy fact の confidence を単調増加で昇格する (in-place)。
+
+        自動進化 policy ファクトは初期 confidence (0.5) で書かれ、PolicyInterpreter の
+        ``activation_min_confidence`` (0.7) 未満のため適用されない。一定サイクル生存した
+        proven な delta をこのメソッドで昇格し、活性化させる。新規 fact を作らず in-place
+        更新するため supersede チェーンを膨らませない。confidence が現在値以下 / type が
+        policy でない / superseded 済 の場合は no-op。
+        """
+        self._assert_write("policy")
+        f = self._writeback_store.get_fact(fact_id)
+        if f is None or f.type != "policy" or f.superseded_by:
+            return f
+        if confidence <= f.confidence:
+            return f  # 単調増加のみ
+        return self._writeback_store.update_fact(fact_id, confidence=float(confidence))
 
     # ──────────────────────────────────────────────────────────────────
     # 書込系 — fewshot

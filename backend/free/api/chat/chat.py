@@ -1,5 +1,6 @@
 """チャット API（SSE ストリーミング + 3層エージェントディスパッチ）"""
 
+import asyncio
 import re
 from collections.abc import AsyncIterator, Callable
 
@@ -22,6 +23,7 @@ from backend.free.agent.tool_call_judge import _extract_file_path
 from backend.free.api.chat.chat_recorder import record_response
 from backend.free.api.chat.chat_service import (
     ConflictTurnContext,
+    SearchPipelineResult,
     build_chat_messages, build_semmem_injection, convert_file_contexts,
     ensure_base_model_health,
     ensure_llm_client, maybe_resolve_pending_conflicts, prepare_memory_context,
@@ -29,6 +31,7 @@ from backend.free.api.chat.chat_service import (
 )
 from backend.free.api.chat.chat_streaming import (
     _cancel_flags,
+    rag_signals_from_chunks,
     read_existing_for_append,
     stream_deliberative, stream_long_form, stream_meta_cognitive, stream_reactive,
     sync_deliberative, sync_long_form, sync_meta_cognitive,
@@ -155,11 +158,16 @@ def _llm_unavailable_response(stream: bool) -> StreamingResponse:
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
-def _resolve_system_prompt(state: AppState, mode: str, instance_name: str) -> str:
-    """システムプロンプトを取得（PromptManager 未設定時はフォールバック）"""
+def _resolve_system_prompt(
+    state: AppState, mode: str, instance_name: str, query: str | None = None,
+) -> str:
+    """システムプロンプトを取得（PromptManager 未設定時はフォールバック）。
+
+    ``query`` を渡すと PromptManager 内で query 類似の動的 few-shot 選択に使われる。
+    """
     prompt_mgr = state.prompt_manager
     if prompt_mgr:
-        return prompt_mgr.get_prompt(mode)
+        return prompt_mgr.get_prompt(mode, query=query)
     return f"You are {instance_name}, a helpful AI assistant."
 
 
@@ -196,6 +204,42 @@ def _try_reactive_layer(
     )
 
 
+def _realtime_parallel_enabled(state: AppState) -> bool:
+    """チャット応答パスの assist 判定を並列化してよいか。
+
+    assist の realtime セマフォが 2 以上 (= サーバ側 slots とセットで並列度が
+    確保された構成) のときだけ True。1 (既定) では現行の直列フローを維持する。
+    """
+    client = state.assist_client
+    if client is None:
+        return False
+    return getattr(client, "realtime_concurrency", 1) >= 2
+
+
+async def _run_search_timed(
+    req: ChatRequest, state: AppState, cfg: dict, timer: StageTimer,
+) -> SearchPipelineResult:
+    """検索パイプラインを ``search_ms`` 計測付きで実行する。
+
+    chat() で ``asyncio.create_task`` 化して conflict 判定 / tool 判定と並走
+    させる入口。``run_search_pipeline`` は内部で例外を握って
+    ``SearchPipelineResult(error=...)`` を返すため、ここでは計測のみ担う。
+    """
+    timer.start("search_ms")
+    try:
+        return await run_search_pipeline(
+            req.message, state, cfg, mode=req.mode, timer=timer,
+        )
+    finally:
+        timer.stop("search_ms")
+
+
+def _cancel_pending_task(task: "asyncio.Task | None") -> None:
+    """投機タスクが未完了なら cancel する (reactive 早期 return / 経路不一致時)。"""
+    if task is not None and not task.done():
+        task.cancel()
+
+
 async def _build_messages_with_search(
     req: ChatRequest,
     state: AppState,
@@ -208,15 +252,24 @@ async def _build_messages_with_search(
     timer: StageTimer,
     editor_route: str | None = None,
     conflict_ctx: ConflictTurnContext | None = None,
+    search_task: "asyncio.Task | None" = None,
 ) -> tuple[list, StreamWrapper, str | None, list[tuple[str, float, str]] | None]:
     """統合検索を実行し ``messages`` / SSE 通知ラッパ / semmem ブロック / 取得済み
     scored_chunks を構築する。``scored_chunks`` は long_form 経路が orchestrator に
-    再利用注入するために返す (非 long_form 経路は ``messages`` 側で消費するため未使用)。"""
-    timer.start("search_ms")
-    search_result = await run_search_pipeline(
-        req.message, state, cfg, mode=req.mode, timer=timer,
-    )
-    timer.stop("search_ms")
+    再利用注入するために返す (非 long_form 経路は ``messages`` 側で消費するため未使用)。
+
+    ``search_task`` が渡された場合は chat() が先行起動した検索タスクを await して
+    回収する (conflict 判定 / tool 判定との並走)。None の場合はここで直列実行する。"""
+    if search_task is not None:
+        try:
+            search_result = await search_task
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Search task failed, continuing without RAG: %s", exc)
+            search_result = SearchPipelineResult(error=str(exc))
+    else:
+        search_result = await _run_search_timed(req, state, cfg, timer)
     rag_chunks = search_result.chunks
     search_error = search_result.error
     scored_chunks = search_result.scored_chunks
@@ -285,6 +338,70 @@ def _build_rag_debug_frame(
     return sse_notify.rag_debug(rag_debug_chunks, search_time_ms)
 
 
+# meta_cognitive ループ system へ渡す RAG 参考ブロックの整形上限。
+# long_form の prefetched_rag と同じ取得結果を、salience 順 (search pipeline 順)
+# のまま上位数件・各チャンク要約で連結する。
+_META_RAG_MAX_CHUNKS = 5
+_META_RAG_CHAR_CAP = 1200
+
+
+def _format_rag_block_for_meta(
+    scored_chunks: list[tuple[str, float, str]] | None,
+) -> str | None:
+    """search pipeline 取得済み ``scored_chunks`` を meta ループ用ブロックに整形。
+
+    deliberative 経路は ``messages`` 側で RAG を消費するが、meta_cognitive 経路は
+    ``messages`` を LLM に渡さないため、取得済みチャンクをループ system に注入する
+    (semmem_block と同じ消費形)。整形できる内容が無ければ ``None``。
+    """
+    if not scored_chunks:
+        return None
+    parts: list[str] = []
+    for i, (_chunk_id, score, text) in enumerate(
+        scored_chunks[:_META_RAG_MAX_CHUNKS]
+    ):
+        snippet = (text or "")[:_META_RAG_CHAR_CAP]
+        if not snippet:
+            continue
+        parts.append(f"[参考情報 {i + 1}] (score={score:.2f})\n{snippet}")
+    if not parts:
+        return None
+    return "\n\n".join(parts)
+
+
+# meta / long_form 経路へ渡す添付ファイルブロックの整形上限。
+_FILE_BLOCK_CHAR_CAP = 4000
+
+
+def _format_file_block(
+    file_contexts: list | None,
+) -> str | None:
+    """``convert_file_contexts`` 出力 (``{filename, chunks}`` のリスト) を、
+    meta / long_form 経路の system へ注入するブロック文字列に整形する。
+
+    deliberative 経路は ``messages`` 側でファイルを消費するが、meta_cognitive /
+    long_form 経路は ``messages`` を LLM に渡さないため、添付内容を別途注入する。
+    整形できる内容が無ければ ``None``。
+    """
+    if not file_contexts:
+        return None
+    sections: list[str] = []
+    used = 0
+    for fc in file_contexts:
+        filename = fc.get("filename", "unknown")
+        chunks = fc.get("chunks", []) or []
+        body = "\n\n".join(chunks)
+        section = f"[ファイル: {filename}]\n{body}" if body else f"[ファイル: {filename}]"
+        section = section[:_FILE_BLOCK_CHAR_CAP]
+        if used + len(section) > _FILE_BLOCK_CHAR_CAP and sections:
+            break
+        sections.append(section)
+        used += len(section)
+    if not sections:
+        return None
+    return "\n\n---\n\n".join(sections)
+
+
 def _build_long_form_orchestrator(
     client, state: AppState, cfg: dict, gen_params: dict,
 ) -> LongFormOrchestrator:
@@ -294,7 +411,6 @@ def _build_long_form_orchestrator(
         main_client=client,
         assist_client=state.assist_client,
         memory_wm=mem_sys[0] if mem_sys else None,
-        memory_stm=mem_sys[1] if mem_sys else None,
         config=cfg,
         debug_logger=state.debug_logger,
         generation_params=gen_params,
@@ -429,6 +545,7 @@ async def _dispatch_long_form(
     timer: StageTimer,
     output_target: str = "file",
     prefetched_rag: list[tuple[str, float, str]] | None = None,
+    file_context_block: str | None = None,
 ) -> StreamingResponse | ChatResponse:
     """Meta-Cognitive (long_form) 経路: 長文生成オーケストレータを起動する。
 
@@ -455,6 +572,7 @@ async def _dispatch_long_form(
                 private=req.private,
                 output_target=output_target,
                 prefetched_rag=prefetched_rag,
+                file_context_block=file_context_block,
             ))),
             media_type="text/event-stream",
         )
@@ -467,6 +585,7 @@ async def _dispatch_long_form(
             private=req.private,
             output_target=output_target,
             prefetched_rag=prefetched_rag,
+            file_context_block=file_context_block,
         )
 
 
@@ -485,7 +604,11 @@ async def _dispatch_meta_cognitive(
     search_error_wrapper: StreamWrapper,
     timer: StageTimer,
     semmem_block: str | None = None,
+    rag_block: str | None = None,
+    file_block: str | None = None,
     output_target: str = "file",
+    rag_used: bool = False,
+    rag_top1_score: float | None = None,
 ) -> StreamingResponse | ChatResponse:
     """Meta-Cognitive (通常) 経路: 計画 + ツールループ。"""
     # @self 仮想カートリッジ用 LoopFactView 配線
@@ -516,6 +639,10 @@ async def _dispatch_meta_cognitive(
         debug_logger=state.debug_logger,
         # ツールループ全反復で SemMem メモリを維持 (初回ターンと同じ block)
         semmem_block=semmem_block,
+        # search pipeline 取得済み RAG を維持 (long_form の prefetched_rag と同型)
+        rag_block=rag_block,
+        # 添付ファイル内容を維持 (deliberative の messages 注入と等価)
+        file_block=file_block,
         code_generator=code_generator,
     )
     keepalive_sec = cfg.get("streaming", {}).get(
@@ -532,6 +659,8 @@ async def _dispatch_meta_cognitive(
                 timer=timer,
                 private=req.private,
                 output_target=output_target,
+                rag_used=rag_used,
+                rag_top1_score=rag_top1_score,
             ))),
             media_type="text/event-stream",
         )
@@ -544,6 +673,8 @@ async def _dispatch_meta_cognitive(
             timer=timer,
             private=req.private,
             output_target=output_target,
+            rag_used=rag_used,
+            rag_top1_score=rag_top1_score,
         )
 
 
@@ -561,8 +692,14 @@ async def _dispatch_deliberative(
     messages: list,
     search_error_wrapper: StreamWrapper,
     timer: StageTimer,
+    rag_used: bool = False,
+    rag_top1_score: float | None = None,
+    tool_judge_task: "asyncio.Task | None" = None,
 ) -> StreamingResponse | ChatResponse:
-    """Deliberative 経路: ツール判定 + LLM 推論。"""
+    """Deliberative 経路: ツール判定 + LLM 推論。
+
+    ``tool_judge_task`` が渡された場合は chat() が先行起動した tool 判定タスクを
+    再利用する (process() 内で await)。None の場合は process() が判定を直列実行。"""
     delib_agent = DeliberativeAgent(
         config=cfg,
         tool_judge=state.tool_call_judge,
@@ -581,6 +718,9 @@ async def _dispatch_deliberative(
                 generation_params=gen_params,
                 timer=timer,
                 private=req.private,
+                rag_used=rag_used,
+                rag_top1_score=rag_top1_score,
+                tool_judge_task=tool_judge_task,
             ))),
             media_type="text/event-stream",
         )
@@ -593,6 +733,9 @@ async def _dispatch_deliberative(
             generation_params=gen_params,
             timer=timer,
             private=req.private,
+            rag_used=rag_used,
+            rag_top1_score=rag_top1_score,
+            tool_judge_task=tool_judge_task,
         )
 
 
@@ -624,14 +767,13 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         state.sleep_scheduler.on_user_input()
 
     history, session_id = await prepare_memory_context(req, state)
-    # pending 競合のユーザー回答判定 + 即時反映 (不変則例外 (b)、
-    # 解決結果は同ターンの semmem 注入へ反映する)
-    conflict_ctx = await maybe_resolve_pending_conflicts(
-        state, cfg, history, req.message,
-    )
     file_contexts = convert_file_contexts(req)
-    system_prompt = _resolve_system_prompt(state, req.mode, instance_name)
+    system_prompt = _resolve_system_prompt(
+        state, req.mode, instance_name, query=req.message,
+    )
 
+    # classify は conflict 結果に依存しない (req.message のみ) ため先に確定し、
+    # 並列モードでの投機タスク (tool 判定 / 検索) 起動のゲートに使う。
     classifier = ComplexityClassifier(
         config=cfg,
         learned_patterns=getattr(state, "learned_patterns_store", None),
@@ -640,90 +782,183 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     agent_layer = classifier.classify(req.message, mode=req.mode)
     logger.info("Agent layer: %s for query: %s", agent_layer, req.message[:80])
 
-    if agent_layer == "reactive":
-        # URL recall プリチェック: 過去会話で fetch 済みの URL fact が
-        # クエリに意味的にヒットする場合、reactive で前知識のみ応答せず
-        # deliberative にエスカレートして fetch_url を実行させる。
-        # ``recall_url_judgement`` は閾値・TTL・profile match まで判定
-        # 済みのため、ヒット時のみ True/None を返す軽量チェック。
-        if (
-            state.tool_call_judge is not None
-            and state.tools_registry is not None
-        ):
-            try:
-                recall_judgement = await state.tool_call_judge.recall_url_judgement(
-                    req.message, state.tools_registry,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "URL recall pre-check failed (continuing as reactive): %s", exc,
-                )
-                recall_judgement = None
-            if recall_judgement is not None and recall_judgement.tool_needed:
-                agent_layer = "deliberative"
-                logger.info(
-                    "Reactive escalated to deliberative due to URL recall hit: %s",
-                    req.message[:80],
-                )
-
-    if agent_layer == "reactive":
-        reactive_response = _try_reactive_layer(
-            req, state, session_id, instance_name, context_size,
-        )
-        if reactive_response is not None:
-            return reactive_response
-        agent_layer = "deliberative"
-        logger.info("Reactive returned None, escalating to deliberative")
-
-    # coding モードのみ生成コードの出力先を決定する。
-    # - 出力先パス明示 → "file" (従来どおり write_file でディスクへ)
-    # - 否定指示 ("エディタに出さず…") → "chat" (チャット本文にコードブロック)
-    # - 既定 → "editor" (ディスク書込せず editor_code チャネルでエディタペインへ)
-    # editor_route SSE フレームはフロント表示制御 (suppressCode) 用に併せて通知する。
-    if req.mode == "coding":
-        if _extract_file_path(req.message):
-            output_target = "file"
-        elif detect_editor_route(req.message) == "chat":
-            output_target = "chat"
-        else:
-            output_target = "editor"
-        editor_route = "editor" if output_target == "editor" else "chat"
-    else:
-        output_target = "file"
-        editor_route = None
-
     timer = StageTimer()
-    messages, search_error_wrapper, semmem_block, scored_chunks = (
-        await _build_messages_with_search(
-            req, state, cfg, system_prompt, history, file_contexts,
-            context_size, max_tokens, timer,
-            editor_route=editor_route,
-            conflict_ctx=conflict_ctx,
-        )
-    )
+    # pending 競合のユーザー回答判定 + 即時反映 (不変則例外 (b)、解決結果は
+    # 同ターンの semmem 注入へ反映)。private ターンは SemMem へ書かない契約のため
+    # allow_write=False (注入のみ継続)。
+    #
+    # realtime 並列化が有効なときは conflict 判定 / 検索パイプライン / tool 判定を
+    # 同時起動して直列待ちを畳む。依存順は守る:
+    #   - conflict_ctx は build_semmem_injection より前に await 済みとし、解決
+    #     通知の同ターン注入契約を維持する。検索パイプラインは SemMem facts を
+    #     注入に使わない (読取は injection 側) ため conflict 書込と競合しない。
+    #   - tool 判定 (judge) は preliminary layer が meta_cognitive 以外のときのみ
+    #     投機する (meta は task 記述単位で judge するため query 単位の流用不可、
+    #     long_form は meta_cognitive 分類配下なので自動的に除外される)。
+    #   - 検索は preliminary layer が reactive 以外のときのみ投機する (reactive
+    #     即応答は検索結果を使わない)。reactive→deliberative にエスカレートした
+    #     場合は search_task=None で _build_messages_with_search が直列実行する。
+    judge_task: asyncio.Task | None = None
+    search_task: asyncio.Task | None = None
+    try:
+        if _realtime_parallel_enabled(state):
+            conflict_task = asyncio.create_task(
+                maybe_resolve_pending_conflicts(
+                    state, cfg, history, req.message,
+                    allow_write=not req.private, session_id=session_id,
+                )
+            )
+            if (
+                agent_layer != "meta_cognitive"
+                and state.tool_call_judge is not None
+                and state.tools_registry is not None
+            ):
+                judge_task = asyncio.create_task(
+                    state.tool_call_judge.judge(
+                        req.message, state.tools_registry, req.mode, history,
+                    )
+                )
+            if agent_layer != "reactive":
+                search_task = asyncio.create_task(
+                    _run_search_timed(req, state, cfg, timer),
+                )
+            try:
+                conflict_ctx = await conflict_task
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Conflict review task failed (degrading): %s", exc)
+                conflict_ctx = ConflictTurnContext()
+        else:
+            conflict_ctx = await maybe_resolve_pending_conflicts(
+                state, cfg, history, req.message,
+                allow_write=not req.private, session_id=session_id,
+            )
 
-    match agent_layer:
-        case "meta_cognitive" if classifier.is_long_form:
-            return await _dispatch_long_form(
-                req, client, state, cfg, gen_params, session_id,
-                instance_name, context_size, messages, search_error_wrapper, timer,
-                output_target=output_target,
-                prefetched_rag=scored_chunks,
+        # pending / 解決済み競合がある場合、reactive 早期 return では競合セクション
+        # (build_semmem_injection 経由) が注入されず、解決通知・確認指示が両方
+        # ドロップされる。deliberative へエスカレートして必ず surface させる。
+        if agent_layer == "reactive" and (
+            conflict_ctx.pending_groups or conflict_ctx.resolved is not None
+        ):
+            agent_layer = "deliberative"
+            logger.info(
+                "Reactive escalated to deliberative due to pending/resolved memory conflict",
             )
-        case "meta_cognitive":
-            return await _dispatch_meta_cognitive(
-                req, client, state, cfg, gen_params, system_prompt, history,
-                session_id, instance_name, context_size,
-                messages, search_error_wrapper, timer,
-                semmem_block=semmem_block,
-                output_target=output_target,
+
+        if agent_layer == "reactive":
+            # URL recall プリチェック: 過去会話で fetch 済みの URL fact が
+            # クエリに意味的にヒットする場合、reactive で前知識のみ応答せず
+            # deliberative にエスカレートして fetch_url を実行させる。
+            # ``recall_url_judgement`` は閾値・TTL・profile match まで判定
+            # 済みのため、ヒット時のみ True/None を返す軽量チェック。
+            if (
+                state.tool_call_judge is not None
+                and state.tools_registry is not None
+            ):
+                try:
+                    recall_judgement = await state.tool_call_judge.recall_url_judgement(
+                        req.message, state.tools_registry,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "URL recall pre-check failed (continuing as reactive): %s", exc,
+                    )
+                    recall_judgement = None
+                if recall_judgement is not None and recall_judgement.tool_needed:
+                    agent_layer = "deliberative"
+                    logger.info(
+                        "Reactive escalated to deliberative due to URL recall hit: %s",
+                        req.message[:80],
+                    )
+
+        if agent_layer == "reactive":
+            reactive_response = _try_reactive_layer(
+                req, state, session_id, instance_name, context_size,
             )
-        case _:
-            return await _dispatch_deliberative(
-                req, client, state, cfg, gen_params, history,
-                session_id, instance_name, context_size, max_tokens,
-                messages, search_error_wrapper, timer,
+            if reactive_response is not None:
+                # reactive 即応答は検索/tool 判定結果を使わない。投機タスクを破棄。
+                _cancel_pending_task(judge_task)
+                _cancel_pending_task(search_task)
+                return reactive_response
+            agent_layer = "deliberative"
+            logger.info("Reactive returned None, escalating to deliberative")
+
+        # coding モードのみ生成コードの出力先を決定する。
+        # - 出力先パス明示 → "file" (従来どおり write_file でディスクへ)
+        # - 否定指示 ("エディタに出さず…") → "chat" (チャット本文にコードブロック)
+        # - 既定 → "editor" (ディスク書込せず editor_code チャネルでエディタペインへ)
+        # editor_route SSE フレームはフロント表示制御 (suppressCode) 用に併せて通知する。
+        if req.mode == "coding":
+            if _extract_file_path(req.message):
+                output_target = "file"
+            elif detect_editor_route(req.message) == "chat":
+                output_target = "chat"
+            else:
+                output_target = "editor"
+            editor_route = "editor" if output_target == "editor" else "chat"
+        else:
+            output_target = "file"
+            editor_route = None
+
+        messages, search_error_wrapper, semmem_block, scored_chunks = (
+            await _build_messages_with_search(
+                req, state, cfg, system_prompt, history, file_contexts,
+                context_size, max_tokens, timer,
+                editor_route=editor_route,
+                conflict_ctx=conflict_ctx,
+                search_task=search_task,
             )
+        )
+
+        # 添付ファイルは deliberative 経路では messages 側で消費されるが、
+        # meta_cognitive / long_form 経路は messages を LLM に渡さないため別途注入する。
+        file_block = _format_file_block(file_contexts)
+
+        # Level 0 経験記録用 RAG シグナル。long_form 経路は prefetched_rag から
+        # 自前で導出するため、ここでは meta_cognitive / deliberative へ伝播する。
+        rag_used, rag_top1_score = rag_signals_from_chunks(scored_chunks)
+
+        match agent_layer:
+            case "meta_cognitive" if classifier.is_long_form:
+                # long_form は precomputed tool 判定を使わない (judge_task は通常 None)。
+                _cancel_pending_task(judge_task)
+                return await _dispatch_long_form(
+                    req, client, state, cfg, gen_params, session_id,
+                    instance_name, context_size, messages, search_error_wrapper, timer,
+                    output_target=output_target,
+                    prefetched_rag=scored_chunks,
+                    file_context_block=file_block,
+                )
+            case "meta_cognitive":
+                # meta は task 記述単位で judge するため query 単位の precomputed は
+                # 流用不可 (judge_task は通常 None)。念のため破棄する。
+                _cancel_pending_task(judge_task)
+                return await _dispatch_meta_cognitive(
+                    req, client, state, cfg, gen_params, system_prompt, history,
+                    session_id, instance_name, context_size,
+                    messages, search_error_wrapper, timer,
+                    semmem_block=semmem_block,
+                    rag_block=_format_rag_block_for_meta(scored_chunks),
+                    file_block=file_block,
+                    output_target=output_target,
+                    rag_used=rag_used,
+                    rag_top1_score=rag_top1_score,
+                )
+            case _:
+                return await _dispatch_deliberative(
+                    req, client, state, cfg, gen_params, history,
+                    session_id, instance_name, context_size, max_tokens,
+                    messages, search_error_wrapper, timer,
+                    rag_used=rag_used,
+                    rag_top1_score=rag_top1_score,
+                    tool_judge_task=judge_task,
+                )
+    except BaseException:
+        # 例外が伝播する経路 (build/dispatch 等) で未消費の投機タスクが残らない
+        # よう破棄する。reactive 即応答や streaming dispatch の正常 return では
+        # 発火しない (return は except を通らない)。
+        _cancel_pending_task(judge_task)
+        _cancel_pending_task(search_task)
+        raise
 
 
 @router.post("/chat/cancel", response_model=CancelResponse)

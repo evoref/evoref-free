@@ -108,8 +108,13 @@ class NoteEvolverConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    # confidence がこの値以上のノートは LLM 進化をスキップ (ルールベースのみ)。
-    # 0.0 にすると全ノート LLM 進化 (現行挙動と同等)。1.0 超の値は設定不可。
+    # confidence がこの値以上のノートは LLM 進化をスキップ (ルールベースのみ)、
+    # 未満のノートのみ LLM 進化 (context_description 生成) の対象になる。
+    # ノートの初期 confidence は発生源で決まる (NoteBuilder.source_confidence:
+    # user=1.0 / assistant=0.5 / rag=system=0.6)。既定 0.7 では user 発話は
+    # ルールベース、assistant / rag / system 由来が LLM 進化に回る。
+    # 0.0 にすると全ノートがスキップ (LLM 進化なし)、1.0 にすると
+    # confidence<1.0 の全ノートが LLM 進化対象になる。1.0 超は設定不可。
     confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
     # 1 サイクルあたり LLM 進化呼び出しの上限。既存 ``note_evolution_batch`` と
     # 比較して小さい方が採用される。0 を設定すると LLM 進化を完全に停止する。
@@ -152,6 +157,10 @@ class ConflictChatReviewConfig(BaseModel):
     enabled: bool = True
     # 注入するグループ数の上限 (0 = 無制限)。超過分は件数のみ要約する。
     max_groups: int = Field(default=0, ge=0)
+    # conflict_chat_judge (assist) のセッション内発火上限。上限到達後は
+    # 同一セッションでの判定と pending 注入を停止し、滞留 pending が
+    # 毎ターン realtime スロットを専有するのを防ぐ。0 = 無制限 (従来動作)。
+    max_judge_per_session: int = Field(default=3, ge=0)
 
 
 class SemMemConflictConfig(BaseModel):
@@ -177,6 +186,11 @@ class SemMemConflictConfig(BaseModel):
     confirm_window_hours: float = Field(default=1.0, ge=0.0)
     project_tag_always_manual: bool = True
     auto_for_evolved_policies: bool = True
+    # pending 競合の TTL 自動解消 (日)。グループ内最新ファクトの created_at から
+    # N 日経過した pending を sleep-time Step 6B が keep_new で自動解消する。
+    # pinned / project / policy タグを含むグループは対象外 (チャット回答でのみ解決)。
+    # default_mode=manual でも有効 (無効化は 0 を指定)。
+    pending_auto_resolve_days: float = Field(default=3.0, ge=0.0)
     chat_review: ConflictChatReviewConfig = Field(
         default_factory=ConflictChatReviewConfig,
     )

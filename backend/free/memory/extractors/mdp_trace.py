@@ -70,13 +70,14 @@ def _is_failure_outcome(outcome: str) -> bool:
     return any(k in s for k in _FAILURE_KEYWORDS)
 
 
-def _episode_task_and_result(steps: list[dict[str, Any]]) -> tuple[str, str]:
+def episode_task_and_result(steps: list[dict[str, Any]]) -> tuple[str, str]:
     """エピソードの最終ステップから ``state.task`` と ``observation`` を取り出す。
 
     agent_tracer (meta_cognitive.py) は step に ``state.task`` (ユーザー要求) と
     ``observation`` (生成結果サマリ) を記録する。``action`` は tool 呼び出し名で、
     単発生成では ``"none"`` になる。decision/failure ファクトの object は ``action``
     だけでは無内容になるため、task/observation を併用して意味のある要約にする。
+    episodic LTM ノート (mdp_ingester) でも同じ enrich を共有する。
     """
     if not steps:
         return "", ""
@@ -218,7 +219,7 @@ class MDPTraceExtractor(BaseExtractor):
             outcome = str(end.get("outcome") or "")
             steps = ep["steps"]
             last_actions = [str(s.get("action") or "") for s in steps[-3:]]
-            task_desc, last_observation = _episode_task_and_result(steps)
+            task_desc, last_observation = episode_task_and_result(steps)
             if _is_failure_outcome(outcome):
                 fact = self._build_failure_fact(
                     episode_id=episode_id,
@@ -284,9 +285,21 @@ class MDPTraceExtractor(BaseExtractor):
             last_actions=last_actions,
         )
         subject = f"{LOOP_FAILURE_PREFIX}{signature}"
-        object_text = self.truncate(
-            f"outcome={outcome}; last_actions={'/'.join(last_actions)}",
-            self.MAX_OBJECT_LEN,
+        # object は loop.failure_note.FailurePayload と同じ JSON 形式で書く。
+        # plain text だと Step 13 consolidation (LoopFactView) や
+        # loop/report の集計が _safe_json_loads でパースできず occurrences /
+        # outcomes_history を取りこぼす。同一 signature の再発は別ファクトとして
+        # 作られ、Step 13 が occurrences を合算して 1 件に統合する。
+        outcome_label = (outcome or "")[:200]
+        object_payload = {
+            "error_type": error_type,
+            "normalized_file_path": normalized_file_path,
+            "last_actions": list(last_actions)[-3:],
+            "occurrences": 1,
+            "outcomes_history": [outcome_label] if outcome_label else [],
+        }
+        object_text = json.dumps(
+            object_payload, ensure_ascii=False, sort_keys=True,
         )
         return self.make_fact(
             subject=subject,

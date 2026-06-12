@@ -239,8 +239,8 @@ theme:
 # GGUF モデルファイルのパス。
 # 相対パスはプロジェクトルートからの相対、絶対パスはそのまま使用。
 model_paths:
-  base_model: models/Qwen3.5-9B-Q4_K_M.gguf         # ベース GGUF モデル（download_model.py が自動配置）
-  assist_model: models/Qwen3.5-4B-Q4_K_M.gguf       # アシスト GGUF モデル（メモリ・RAG処理用）
+  base_model: models/gemma-4-12b-it-qat-q4_0.gguf    # ベース GGUF モデル（models/ に配置）
+  assist_model: models/gemma-4-E4B_q4_0-it.gguf      # アシスト GGUF モデル（メモリ・RAG処理用）
   embed_model: models/Qwen3-Embedding-0.6B-Q8_0.gguf # 埋め込み用 GGUF モデル（llama-cpp バックエンド用）
   coding_model: null                                 # コーディングモード用 GGUF（null/空欄 = base_model にフォールバック）
 
@@ -548,11 +548,20 @@ memory:
     confirm_window_hours: 1.0                                  # 同 source / N 時間以内は微妙ケースとして pending
     project_tag_always_manual: true                            # project / policy タグは基本ユーザー確認必須
     auto_for_evolved_policies: true                            # 例外: auto_evolved=True の policy のみ自動マージ
+    # pending 競合の TTL 自動解消: グループ内最新ファクトの created_at から
+    # N 日経過した pending を sleep-time Step 6B が keep_new で自動解消する。
+    # pinned / project / policy を含むグループは対象外 (チャット回答でのみ解決)。
+    # default_mode: manual でも有効。0 で無効。
+    pending_auto_resolve_days: 3.0
     # pending 競合のチャット確認フロー。チャット注入で AI がユーザーに確認し、
     # 回答を assist (conflict_chat_judge) で判定して即時解決する。
     chat_review:
       enabled: true                                            # false で注入・判定とも停止
       max_groups: 0                                            # 注入グループ上限 (0=無制限、超過分は件数のみ要約)
+      # conflict_chat_judge (assist) のセッション内発火上限。上限到達後は同一
+      # セッションでの判定と pending 注入を停止する (滞留 pending が毎ターン
+      # realtime スロットを専有するのを防ぐ)。0 = 無制限。
+      max_judge_per_session: 3
   # --- MemoryInjector ---
   # NOTE: policy ファクトの active 閾値は learning.policy.activation_min_confidence
   # に集約されている
@@ -683,7 +692,7 @@ learning:
   level2_bootstrap_init_sigma: 0.0001  # lora_a 初期ガウス標準偏差（lora_b=0）
   level2_bootstrap_min_failures: 20    # 初回 bootstrap の最小失敗数（本学習 50 より低め）
   # Level 2 base=C: ベースモデルを control vector で操舵 (Pro 限定)。実 --control-vector ロード検証後に cvector へ
-  level2_base_method: lora             # lora（既存・既定）/ cvector
+  level2_base_method: lora             # lora（既定=base は #3a で trigger-skip、何も起動しない）/ cvector（base 実学習）
   cvector_method: pca                  # pca / mean (llama-cvector-generator --method)
   cvector_pca_batch: 100               # --pca-batch
   cvector_pca_iter: 1000               # --pca-iter
@@ -712,7 +721,7 @@ learning:
   assist_spsa_iterations: 300         # アシストモデル SPSA 反復回数（assist=B 使用時は ~30 推奨: 1 iter=候補サーバ2回起動）
   assist_sparse_params: 100           # アシストモデルのスパースパラメータ数
   # Level 2 assist=B: assist LoRA 候補を ephemeral サーバに実ロードして実推論評価 (Pro 限定)。実 --lora ロード検証後に spsa-real-eval へ
-  level2_assist_method: none          # none（既存・既定 no-op）/ spsa-real-eval
+  level2_assist_method: none          # none（既定=assist は #3a で trigger-skip、何も起動しない）/ spsa-real-eval（assist 実学習）
   assist_eval_scratch_port: 8090      # 候補評価サーバのスクラッチポート
   assist_eval_loss_w1: 0.7            # keyword/pattern 一致項の重み
   assist_eval_loss_w2: 0.3            # mean neg-logprob 項の重み
@@ -856,6 +865,10 @@ assist_model:
                                    # null にすると assist モデルの arch プロファイル
                                    # (models/profiles/<arch>.yaml の context_size) を使用
                                    # (解決順: ここの明示値 > profile > 8192)
+    # slots: 既定 1 (本セクションに slots キー無し = -np 1)。チャット応答パスの
+    # assist 判定を並列化する場合は slots: 2 を追加し、``concurrency.realtime: 2``
+    # とセットで設定する。slots>1 では context_size が slot 毎に分割される
+    # (8192 → 4096/slot) が、各判定プロンプトは ~1-3K tok で収まる。
     # idle slot offload。アシストは既定 slots=1 (本セクションに slots キー無し)
     # のため退避対象の idle slot が無く 0 で無効化し host RAM 予約を省く。
     # slots>1 運用時は ``--kv-unified`` が自動付与されるので 2048 等へ戻す。
@@ -876,8 +889,15 @@ assist_model:
   # (critique_synthesis) が並行稼働してもチャット応答パスの realtime
   # リクエストがキュー待ちしないようにする。purpose → priority の対応は
   # AssistModelClient._PURPOSE_PRIORITY_MAP を参照。
+  #
+  # realtime を 2 にすると、チャット 1 ターン内の assist 判定 (conflict 判定 /
+  # 検索必要性判定 / tool 判定 + 層5 投機 synth) が並列化され、短い応答の直列
+  # 待ちが縮む。効果を得るには assist llama-server 側の ``local.slots`` も 2 に
+  # 揃える (片方だけだとクライアントかサーバのどちらかでキュー待ちになり効果
+  # ゼロ)。並列時は assist 同士の GPU バッチ競合で個々の判定が 1.3-1.6 倍に
+  # 延びるが、壁時計時間では短縮する (タイムアウト既定は 15s に調整済み)。
   concurrency:
-    realtime: 1                    # self_rag_judge / tool_judgment / meta_cognitive_plan
+    realtime: 1                    # self_rag_judge / tool_judgment / meta_cognitive_plan (2 で並列化、local.slots:2 とセット)
     background: 1                  # contextual_prefix / long_form / ralph_loop / note_evolution / conflict_resolution
     learning: 1                    # critique_synthesis / policy_evolution / spsa
   # JSON 応答 purpose に GBNF/json_schema 制約サンプリングを適用するか

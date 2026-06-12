@@ -1,15 +1,41 @@
 """Level 0 即時学習: 経験バッファ"""
 
-import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
 from backend.log_config import get_logger
+from backend.utils import utc_now
 
 logger = get_logger("learning.level0")
 
 MAX_ENTRIES = 1000
+
+#: バッファ表示・集計用の応答要約の最大長 (従来の response[:200])。
+RESPONSE_SUMMARY_CAP = 200
+#: few-shot 採用時に保持する全文応答の上限。response_summary (200字) では
+#: 文の途中で切れた応答が few-shot 例として注入されるため、採用候補向けに
+#: より長い全文を文境界で切り詰めて保持する。experience.json 肥大を避けるため
+#: 青天井にはしない (cap × MAX_ENTRIES が永続化サイズの上限)。
+RESPONSE_FULL_CAP = 4000
+
+
+def truncate_at_boundary(text: str, cap: int) -> str:
+    """``cap`` 字以内で文境界 (。．.!?改行) を優先して切り詰める。
+
+    cap 未満は無加工。末尾付近 (cap*0.6 以降) に文境界があればそこで切り、
+    無ければハード cap。few-shot 応答が文の途中でぶつ切りになるのを避ける。
+    """
+    if len(text) <= cap:
+        return text
+    head = text[:cap]
+    floor = int(cap * 0.6)
+    best = -1
+    for ch in ("。", "．", ".", "!", "?", "\n"):
+        idx = head.rfind(ch)
+        if idx >= floor and idx > best:
+            best = idx
+    return head[: best + 1] if best >= floor else head
 
 
 @dataclass
@@ -47,6 +73,11 @@ class FeedbackSignals:
     step_credits: list[dict] = field(default_factory=list)
 
 
+#: ``_from_payload`` で JSON から復元するシグナルのキー集合。FeedbackSignals の
+#: 全フィールドにデフォルト値がある前提 (欠損キーは dataclass 既定にフォールバック)。
+_SIGNAL_FIELD_NAMES = frozenset(f.name for f in fields(FeedbackSignals))
+
+
 @dataclass
 class ExperienceEntry:
     """経験バッファの1エントリ"""
@@ -54,6 +85,10 @@ class ExperienceEntry:
     mode: str = "chat"
     query: str = ""
     response_summary: str = ""
+    # few-shot 採用例用の全文応答 (文境界で RESPONSE_FULL_CAP に切り詰め)。
+    # 表示・集計・cvector は response_summary を使い、本フィールドは
+    # fewshot_pool.add_from_experiences が切れていない応答例を採るためだけに使う。
+    response_full: str = ""
     base_model: str = ""
     embedding_model: str = ""
     cartridge_ids: list[str] = field(default_factory=list)
@@ -72,7 +107,7 @@ class ExperienceBuffer(JsonStateStore):
     def record(self, entry: ExperienceEntry) -> None:
         """エントリを追加"""
         if not entry.timestamp:
-            entry.timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            entry.timestamp = utc_now()
 
         self.entries.append(entry)
 
@@ -116,6 +151,7 @@ class ExperienceBuffer(JsonStateStore):
                 "mode": entry.mode,
                 "query": entry.query,
                 "response_summary": entry.response_summary,
+                "response_full": entry.response_full,
                 "base_model": entry.base_model,
                 "embedding_model": entry.embedding_model,
                 "cartridge_ids": entry.cartridge_ids,
@@ -137,34 +173,17 @@ class ExperienceBuffer(JsonStateStore):
                 mode=d.get("mode", "chat"),
                 query=d.get("query", ""),
                 response_summary=d.get("response_summary", ""),
+                response_full=d.get("response_full", ""),
                 base_model=d.get("base_model", ""),
                 embedding_model=d.get("embedding_model", ""),
                 cartridge_ids=d.get("cartridge_ids", []),
-                signals=FeedbackSignals(
-                    conversation_ended=signals_data.get("conversation_ended", False),
-                    rephrased_query=signals_data.get("rephrased_query", False),
-                    rag_used=signals_data.get("rag_used", False),
-                    rag_source=signals_data.get("rag_source"),
-                    rag_top1_score=signals_data.get("rag_top1_score"),
-                    agent_loops=signals_data.get("agent_loops", 0),
-                    user_correction=signals_data.get("user_correction"),
-                    correction_detected_by=signals_data.get("correction_detected_by"),
-                    perplexity=signals_data.get("perplexity"),
-                    long_form_used=signals_data.get("long_form_used", False),
-                    long_form_content_type=signals_data.get("long_form_content_type"),
-                    long_form_strategy=signals_data.get("long_form_strategy"),
-                    long_form_units_total=signals_data.get("long_form_units_total", 0),
-                    long_form_units_completed=signals_data.get("long_form_units_completed", 0),
-                    long_form_validation_errors=signals_data.get("long_form_validation_errors", 0),
-                    long_form_budget_used_pct=signals_data.get("long_form_budget_used_pct"),
-                    tool_routing_success=signals_data.get("tool_routing_success", False),
-                    tool_routing_false_positive=signals_data.get("tool_routing_false_positive", False),
-                    tool_routing_false_negative=signals_data.get("tool_routing_false_negative", False),
-                    long_form_success=signals_data.get("long_form_success", False),
-                    long_form_false_positive=signals_data.get("long_form_false_positive", False),
-                    long_form_false_negative=signals_data.get("long_form_false_negative", False),
-                    step_credits=signals_data.get("step_credits", []),
-                ),
+                # JSON に存在するキーのみ採用 (欠損キーは FeedbackSignals の
+                # 既定値に委ねる)。新シグナル追加時もここの編集は不要。
+                signals=FeedbackSignals(**{
+                    k: signals_data[k]
+                    for k in _SIGNAL_FIELD_NAMES
+                    if k in signals_data
+                }),
             )
             self.entries.append(entry)
 

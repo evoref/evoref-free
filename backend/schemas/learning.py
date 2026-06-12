@@ -113,8 +113,9 @@ class LearningConfig(BaseModel):
     level2_bootstrap_min_failures: int = Field(default=20, ge=1)
     # Level 2 base=C: ベースモデルの自己進化を control vector (残差ストリーム操舵) で行う。
     # llama-cvector-generator (forward-only) で生成し、llama-server --control-vector-scaled
-    # で次回起動時に適用する。'cvector' 指定が enable (Pro 限定)。実 llama-server への
-    # ロード検証が済むまで既定 'lora' (= 既存 SPSA/LoRA 経路、挙動変更なし)。
+    # で次回起動時に適用する。'cvector' 指定が enable (Pro 限定)。既定 'lora' の SPSA 改良は
+    # no-op (対称摂動で勾配 0) のためトリガ段階で skip され Level 2 base は何も起動しない
+    # (#3a)。base の実学習は 'cvector' で有効化する (実 llama-server ロード検証後)。
     level2_base_method: Literal["lora", "cvector"] = "lora"
     cvector_method: Literal["pca", "mean"] = "pca"
     cvector_pca_batch: int = Field(default=100, ge=1)
@@ -144,12 +145,17 @@ class LearningConfig(BaseModel):
     # Level 2 アシストモデル
     assist_level2_min_experiences: int = Field(default=30, ge=1)
     assist_spsa_iterations: int = Field(default=300, ge=1)
+    # assist=B 実推論 eval 有効時の SPSA 反復数 (1 反復 = 候補サーバを 2 回起動するため
+    # コスト天井として低く設定。assist_spsa_iterations は no-op eval 時のみ使われる)。
+    assist_realeval_spsa_iterations: int = Field(default=30, ge=1)
     assist_sparse_params: int = Field(default=100, ge=1)
     # Level 2 assist=B: assist LoRA 候補を ephemeral llama-server に実ロードして
     # held-out 構造化判定 (rag_necessity/rag_quality/tool_call) を実推論評価する。
-    # 'spsa-real-eval' 指定が enable (Pro 限定)。実 --lora ロード検証が済むまで既定
-    # 'none' (= 現状の no-op eval_func を維持、挙動変更なし)。
-    # 注意: 1 SPSA iter = 候補サーバ 2 回起動。assist_spsa_iterations は低 (~30) 推奨。
+    # 'spsa-real-eval' 指定が enable (Pro 限定)。既定 'none' では改良 SPSA がトリガ段階で
+    # skip され Level 2 assist は何も起動しない (#3a)。assist の実学習は 'spsa-real-eval' で
+    # 有効化する (実 --lora ロード検証後)。
+    # コスト: SPSA は eval_current_params=False で 1 iter = 候補サーバ 2 回起動 (probe ±)、
+    # + 初回 1 回。反復数は assist_realeval_spsa_iterations (既定 30) を使う。
     level2_assist_method: Literal["none", "spsa-real-eval"] = "none"
     assist_eval_scratch_port: int = Field(default=8090, ge=1024, le=65535)
     assist_eval_loss_w1: float = Field(default=0.7, ge=0.0, le=1.0)  # keyword/pattern 一致項

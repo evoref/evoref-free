@@ -139,9 +139,11 @@ _DEFAULT_PRIORITY: Priority = "background"
 #   - note_evolution (20s)    : A-MEM note 進化の軽量要約
 #   - conflict_resolution (15s): 短文マージ判定
 #   - retrieval_quality_judge: 既定 ``timeout`` をそのまま使う (短時間で済む)
-#   - tool_judgment (12s): チャット応答パスで同期発火。アシスト接続時は
-#     モード非依存で常時有効化されるため呼出頻度が上がる。base との GPU 競合で
-#     8s では空振りしやすいため 12s に緩める (失敗時はルールベースに fallback)。
+#   - tool_judgment (15s): チャット応答パスで同期発火。アシスト接続時は
+#     モード非依存で常時有効化されるため呼出頻度が上がる。base との GPU 競合に
+#     加え、realtime 並列化 (concurrency.realtime>=2) 時は assist 同士の
+#     バッチ競合で個々の応答が 1.3-1.6 倍に延びるため 15s に緩める
+#     (失敗時はルールベースに fallback)。
 PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "contextual_prefix": 60.0,
     "long_form_planning": 90.0,
@@ -156,9 +158,9 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "code_repair": 90.0,
     "conflict_resolution": 15.0,
     # pending 競合のチャット回答判定。チャット応答パスで同期発火し、
-    # base との GPU 競合があるため tool_judgment と同根拠で 12s
-    # (失敗時は no-op で pending 維持)。
-    "conflict_chat_judge": 12.0,
+    # base との GPU 競合 + realtime 並列化時の assist 相互競合があるため
+    # tool_judgment と同根拠で 15s (失敗時は no-op で pending 維持)。
+    "conflict_chat_judge": 15.0,
     "critique_synthesis": 45.0,
     "policy_evolution": 45.0,
     # プロンプト変異 (~1024 tok のテキスト生成)。assist は base の約5倍速で
@@ -173,14 +175,16 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "retrieval_chunk_gate": 5.0,
     # executable query 判定 + コマンド合成。チャット応答パスで
     # tool_call_judge から発火する。is_executable: bool + command: str の
-    # 短い JSON を返すだけだが、base モデルとの GPU 競合で 8s では空振り
-    # しやすいため 12s に緩める。失敗時は regex フォールバックが正しさを担保。
-    "executable_command_synth": 12.0,
+    # 短い JSON を返すだけだが、base モデルとの GPU 競合 + realtime 並列化時の
+    # 投機実行 (tool_judgment との並走) で 8s では空振りしやすいため 15s に
+    # 緩める。失敗時は regex フォールバックが正しさを担保。
+    "executable_command_synth": 15.0,
     # ツール呼出判定 ({"tool": ..., "args": {...}} の小さな JSON)。チャット
-    # 応答パスで Deliberative / MetaCognitive から同期発火し、アシスト接続時は
-    # 常時有効。base モデルとの GPU 競合で 8s では空振りしやすいため 12s に
-    # 緩める。失敗時はルールベース判定にフォールバックする。
-    "tool_judgment": 12.0,
+    # 応答パスで Deliberative / MetaCognitive から同期発火し、アシスト接続は
+    # 常時有効。base モデルとの GPU 競合 + realtime 並列化時の assist 相互競合で
+    # 8s では空振りしやすいため 15s に緩める。失敗時はルールベース判定に
+    # フォールバックする。
+    "tool_judgment": 15.0,
     # meta-cognitive 計画 (タスク分解) は coding mode の
     # 応答パスで発火するため、長すぎるとユーザ体感を阻害する。30s で打ち切り。
     "meta_cognitive_plan": 30.0,
@@ -565,6 +569,17 @@ class AssistModelClient(BaseHTTPClient):
         外部 (API レスポンス / ログ) から参照するための公開プロパティ。
         """
         return dict(self._concurrency)
+
+    @property
+    def realtime_concurrency(self) -> int:
+        """realtime セマフォスロット数 (チャット応答パスの並列度)
+
+        チャット応答パス (chat.py / tool_call_judge.py) が assist 判定の
+        並列化・投機実行を有効化するかの判定に使う。``>=2`` で並列化 ON、
+        ``1`` (既定) で現行の直列フローを維持する。assist llama-server 側の
+        ``slots`` とセットで設定する前提 (片方だけではキュー待ちで効果ゼロ)。
+        """
+        return self._concurrency["realtime"]
 
     async def update_params_from_server(self) -> None:
         """llama-server /props から実際のモデル名を取得してパラメータ数を更新

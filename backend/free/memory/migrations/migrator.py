@@ -198,6 +198,21 @@ class SchemaMigrator:
         # ランナーが集中管理する。rollback 時は書き換えていないため戻す必要はない。
         write_schema_marker(memory_dir, to_version)
 
+        # manifest の監査タイムスタンプ last_migrated_at を更新する
+        # (manifest が存在する場合のみ。compact_cmd の last_compacted_at と同様)。
+        from backend.free.memory.semantic.manifest import (
+            load_manifest,
+            update_manifest,
+        )
+
+        if load_manifest(memory_dir) is not None:
+            update_manifest(
+                memory_dir,
+                last_migrated_at=time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(),
+                ),
+            )
+
         logger.info(
             "SchemaMigrator.upgrade completed: %d -> %d, "
             "steps=%d total_elapsed=%.1fms",

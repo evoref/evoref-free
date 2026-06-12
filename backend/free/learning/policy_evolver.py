@@ -55,6 +55,9 @@ ROLLBACK_THRESHOLD: int = 3
 # fitness 改善判定の最小差
 FITNESS_EPSILON: float = 0.001
 
+# fitness 履歴の保持上限 (無上限 append によるメモリ・永続化肥大を防ぐ)
+_FITNESS_HISTORY_CAP: int = 100
+
 # SemMem 書き戻し時の subject prefix と初期値。owner pillar は EvorefLearn。
 LEARN_POLICY_SUBJECT_PREFIX: str = "learn.policy."
 """SemMem 上のポリシーファクト subject prefix。
@@ -64,6 +67,14 @@ DEFAULT_AUTO_EVOLVED_CONFIDENCE: float = 0.5
 """自動進化された policy ファクトの初期 confidence。
 ``learning.policy.activation_min_confidence`` (デフォルト 0.7) より低くする
 ことで、評価期間中は active 化されない (旧 ``harness.*`` から移行済)。"""
+
+DEFAULT_ACTIVATION_MIN_CONFIDENCE: float = 0.7
+"""PolicyInterpreter が policy ファクトを適用する最小 confidence のデフォルト。
+昇格 (promotion) 時の目標値として使う (``learning.policy.activation_min_confidence``)。"""
+
+PROMOTION_SURVIVAL_CYCLES: int = 2
+"""rollback されずに連続生存した evolve サイクル数がこの値に達したら、active な
+policy ファクトを activation_min まで昇格する (proven とみなす評価期間)。"""
 
 EvolveWriteback = Literal["yaml", "semmem"]
 
@@ -88,6 +99,7 @@ class PolicyParamEvolver(JsonStateStore):
         semmem_writeback_scope: str = "global",
         evolve_writeback: EvolveWriteback = "yaml",
         policy_confidence_init: float = DEFAULT_AUTO_EVOLVED_CONFIDENCE,
+        activation_min_confidence: float = DEFAULT_ACTIVATION_MIN_CONFIDENCE,
     ) -> None:
         """
         Args:
@@ -117,6 +129,7 @@ class PolicyParamEvolver(JsonStateStore):
         self._semmem_writeback_scope: str = semmem_writeback_scope
         self._evolve_writeback: EvolveWriteback = evolve_writeback
         self._policy_confidence_init: float = float(policy_confidence_init)
+        self._activation_min_confidence: float = float(activation_min_confidence)
 
         # 経路 3: 実環境成功率プロバイダ
         # callable(domain: str, mode: str) -> float | None
@@ -131,6 +144,14 @@ class PolicyParamEvolver(JsonStateStore):
 
         # (domain, mode) → 最良 fitness
         self._best_fitness: dict[tuple[str, str], float] = {}
+
+        # (domain, mode) → best_fitness 達成時の params スナップショット。
+        # rollback 時に単段 _snapshots ではなくこれで丸ごと復元する (#1)。
+        self._best_params: dict[tuple[str, str], dict] = {}
+
+        # (domain, mode) → rollback されずに連続生存した evolve サイクル数 (#8)。
+        # PROMOTION_SURVIVAL_CYCLES 到達で active fact を昇格する。rollback でリセット。
+        self._survived_count: dict[tuple[str, str], int] = {}
 
     # ── SemMem 書き戻しヘルパ ───────────────────────────
 
@@ -270,25 +291,37 @@ class PolicyParamEvolver(JsonStateStore):
             self._decline_count[key] = 0
             if fitness > prev_best:
                 self._best_fitness[key] = fitness
+                # best 達成時の params を丸ごと捕捉 (rollback の復元先)。
+                try:
+                    self._best_params[key] = dict(self._policy.get_all(domain, mode))
+                except KeyError:
+                    pass
             return None
 
         self._decline_count[key] = self._decline_count.get(key, 0) + 1
         if self._decline_count[key] < ROLLBACK_THRESHOLD:
             return None
 
-        rolled_back = self._policy.rollback(domain, mode)
-        if rolled_back:
+        # 単段 _snapshots は「直近 apply の 1 段前」までしか戻れず低下起点デルタが
+        # 焼き付くため、best 達成時の params スナップショットで丸ごと復元する。
+        # best 未確立時のみ従来の単段 rollback にフォールバックする。
+        best = self._best_params.get(key)
+        if best is not None:
+            self._policy.restore_params(domain, best, mode)
             self._policy.save()
-            # SemMem の supersedes チェーンを 1 段戻す
-            # PolicyInterpreter snapshot で内部値は既に prior に巻き戻されて
-            # いるので、書き込み先ストア内に同一 subject の active fact が
-            # 存在するキーについて、巻き戻し後の値で新規ファクトを書き出し
-            # supersede する。これにより SemMem 履歴が `evolved → rollback`
-            # のチェーンとして残る
-            if self.is_semmem_writeback_active():
-                self._writeback_rollback_facts(domain, mode, fitness, sigma, phase)
+            rolled_back = True
+        else:
+            rolled_back = self._policy.rollback(domain, mode)
+            if rolled_back:
+                self._policy.save()
+        if rolled_back and self.is_semmem_writeback_active():
+            # SemMem 履歴を evolved → rollback のチェーンとして残す。
+            self._writeback_rollback_facts(domain, mode, fitness, sigma, phase)
         self._decline_count[key] = 0
-        # ロールバック後は最後の良好 fitness を消去して再評価を促す
+        # rollback したので生存カウントをリセット (#8: 評価期間を最初からやり直す)。
+        self._survived_count[key] = 0
+        # 直近に積んだ「低下した」fitness を履歴から除き、復元後の best から
+        # 再評価を始められるようにする (良好値の消去ではない)。
         if history:
             history.pop()
 
@@ -384,6 +417,17 @@ class PolicyParamEvolver(JsonStateStore):
                     fitness, sigma, phase,
                 )
 
+        # 生存カウント更新 + proven 昇格 (#8、semmem モードのみ)。rollback されずに
+        # PROMOTION_SURVIVAL_CYCLES 連続で evolved できた = proven とみなし、今書いた
+        # active fact を activation_min まで昇格して PolicyInterpreter が適用できるように
+        # する。次サイクルの摂動が新 0.5 fact で supersede するため適用は断続的だが、
+        # 安定領域では周期的に活性化される (conservative)。
+        if self.is_semmem_writeback_active():
+            key = (domain, mode)
+            self._survived_count[key] = self._survived_count.get(key, 0) + 1
+            if self._survived_count[key] >= PROMOTION_SURVIVAL_CYCLES:
+                self._promote_active_facts(domain, mode, delta_keys)
+
         logger.info(
             "Policy evolved: domain=%s, mode=%s, fitness=%.4f, "
             "sigma=%.4f, phase=%s, delta_keys=%s",
@@ -399,6 +443,24 @@ class PolicyParamEvolver(JsonStateStore):
             "sigma": sigma,
             "phase": phase,
         }
+
+    def _promote_active_facts(
+        self, domain: str, mode: str, keys: list[str],
+    ) -> None:
+        """指定 delta キーの active policy fact を activation_min まで昇格する (#8)。"""
+        view = self._learn_view
+        if view is None:
+            return
+        target = self._activation_min_confidence
+        for key in keys:
+            subject = self._build_subject(mode, domain, key)
+            fact = self._find_active_fact_in_writeback_store(subject)
+            if fact is not None and fact.confidence < target:
+                view.promote_policy_confidence(fact_id=fact.id, confidence=target)
+                logger.info(
+                    "Policy fact promoted: subject=%s, confidence=%.2f->%.2f",
+                    subject, fact.confidence, target,
+                )
 
     def set_semmem_success_provider(
         self,
@@ -420,13 +482,15 @@ class PolicyParamEvolver(JsonStateStore):
         self,
         domain: str,
         mode: str,
-        base: float,
-    ) -> float:
+        base: float | None,
+    ) -> float | None:
         """calc_fitness に SemMem 成功率項を加重合成する。
 
         プロバイダ未設定 / 重み 0 / プロバイダが ``None`` を返した場合は
-        ``base`` をそのまま返す。
+        ``base`` をそのまま返す。``base`` が ``None`` (無情報) なら素通し。
         """
+        if base is None:
+            return None
         if (
             self._semmem_success_provider is None
             or self._semmem_success_weight <= 0.0
@@ -474,11 +538,23 @@ class PolicyParamEvolver(JsonStateStore):
         """
         key = (domain, mode)
 
-        # 1. 現在の fitness を算出 + 履歴更新
+        # 1. 現在の fitness を算出。無情報 (該当シグナルゼロ) なら None が返る。
+        # この場合は履歴に積まず摂動もせず即 skip し、無情報ドメインの乱歩を防ぐ。
         base_fitness = calc_fitness(domain, experiences)
+        if base_fitness is None:
+            sigma = self._exploration.get_mutation_scale(domain, mode)
+            phase = self._exploration.get_phase(domain, mode)
+            self._log_evolution(domain, mode, "skipped_no_signal", 0.0, sigma, phase)
+            return {
+                "action": "skipped_no_signal", "fitness": None,
+                "sigma": sigma, "phase": phase,
+            }
+
         fitness = self._blend_semmem_success_rate(domain, mode, base_fitness)
         history = self._fitness_history.setdefault(key, [])
         history.append(fitness)
+        if len(history) > _FITNESS_HISTORY_CAP:
+            del history[:-_FITNESS_HISTORY_CAP]
 
         # 2. ExplorationController に fitness 履歴をフィードバック
         self._exploration.update(domain, mode, history)
@@ -492,6 +568,16 @@ class PolicyParamEvolver(JsonStateStore):
         )
         if rollback_result is not None:
             return rollback_result
+
+        # 3.5. decline 継続中 (ロールバック閾値未満の連続低下) は新摂動を打たず hold。
+        # 劣化中に摂動を重ねて複利的に悪化するのを断つ。
+        if self._decline_count.get(key, 0) > 0:
+            self._log_evolution(domain, mode, "hold", fitness, sigma, phase)
+            return {
+                "action": "hold", "fitness": fitness,
+                "sigma": sigma, "phase": phase,
+                "decline_count": self._decline_count[key],
+            }
 
         # 4-5. ガウス摂動でデルタ生成 → ACE 適用
         return self._apply_evolved_step(domain, mode, fitness, sigma, phase)
@@ -564,6 +650,14 @@ class PolicyParamEvolver(JsonStateStore):
                 f"{d}:{m}": f
                 for (d, m), f in self._best_fitness.items()
             },
+            "best_params": {
+                f"{d}:{m}": p
+                for (d, m), p in self._best_params.items()
+            },
+            "survived_count": {
+                f"{d}:{m}": c
+                for (d, m), c in self._survived_count.items()
+            },
         }
 
     def _from_payload(self, payload: JsonPayload) -> None:
@@ -590,6 +684,18 @@ class PolicyParamEvolver(JsonStateStore):
             parts = key_str.split(":", 1)
             if len(parts) == 2:
                 self._best_fitness[(parts[0], parts[1])] = fitness
+
+        self._best_params.clear()
+        for key_str, params in payload.get("best_params", {}).items():
+            parts = key_str.split(":", 1)
+            if len(parts) == 2 and isinstance(params, dict):
+                self._best_params[(parts[0], parts[1])] = params
+
+        self._survived_count.clear()
+        for key_str, count in payload.get("survived_count", {}).items():
+            parts = key_str.split(":", 1)
+            if len(parts) == 2:
+                self._survived_count[(parts[0], parts[1])] = count
 
     def _on_save_success(self, path: Path) -> None:
         logger.debug("PolicyEvolver state saved: %s", path)
@@ -618,12 +724,10 @@ class PolicyParamEvolver(JsonStateStore):
         """
         try:
             current_params = self._policy.get_all(domain, mode)
+            # 制約情報を取得 (公開 API 経由。_data 直アクセスを避ける)
+            constraints = self._policy.get_constraints(domain)
         except KeyError:
             return {}
-
-        # 制約情報を取得
-        policy_data = self._policy._data.get(domain, {})
-        constraints = policy_data.get("constraints", {})
 
         # 進化可能なパラメータを抽出（bool / str 除外）
         evolvable_keys = []
@@ -707,7 +811,7 @@ class PolicyParamEvolver(JsonStateStore):
 # ── ドメイン別 fitness 関数 ──
 
 
-def calc_fitness(domain: str, experiences: list[dict]) -> float:
+def calc_fitness(domain: str, experiences: list[dict]) -> float | None:
     """ドメインに適した fitness 値を算出する
 
     Args:
@@ -715,20 +819,21 @@ def calc_fitness(domain: str, experiences: list[dict]) -> float:
         experiences: そのモードの経験リスト
 
     Returns:
-        fitness 値 [0.0, 1.0]
+        fitness 値 [0.0, 1.0]。該当シグナルが無く評価不能なら ``None``
+        (呼出側は履歴に積まず進化を skip する)。
     """
     fn = _FITNESS_FUNCTIONS.get(domain, _calc_fitness_default)
     return fn(experiences)
 
 
-def _calc_fitness_router(experiences: list[dict]) -> float:
+def _calc_fitness_router(experiences: list[dict]) -> float | None:
     """router fitness: ルーティング精度（ユーザー修正率の逆数）
 
-    修正・言い換えが少ないほど高スコア。
+    修正・言い換えが少ないほど高スコア。経験ゼロは評価不能 (None)。
     """
     total = len(experiences)
     if total == 0:
-        return 0.5
+        return None
 
     bad = sum(
         1 for e in experiences
@@ -738,14 +843,14 @@ def _calc_fitness_router(experiences: list[dict]) -> float:
     return 1.0 - (bad / total)
 
 
-def _calc_fitness_memory(experiences: list[dict]) -> float:
+def _calc_fitness_memory(experiences: list[dict]) -> float | None:
     """memory fitness: 会話品質指標
 
-    会話完了（good）と修正・言い換え（bad）のバランスで評価。
+    会話完了（good）と修正・言い換え（bad）のバランスで評価。経験ゼロは None。
     """
     total = len(experiences)
     if total == 0:
-        return 0.5
+        return None
 
     good = sum(
         1 for e in experiences
@@ -761,17 +866,17 @@ def _calc_fitness_memory(experiences: list[dict]) -> float:
     return max(0.0, min(1.0, raw + 0.5))
 
 
-def _calc_fitness_search(experiences: list[dict]) -> float:
+def _calc_fitness_search(experiences: list[dict]) -> float | None:
     """search fitness: RAG チャンク使用率
 
-    rag_top1_score の平均値。RAG 未使用経験は除外。
+    rag_top1_score の平均値。RAG 未使用経験は除外。RAG 経験ゼロは評価不能 (None)。
     """
     rag_exps = [
         e for e in experiences
         if e.get("signals", {}).get("rag_used")
     ]
     if not rag_exps:
-        return 0.5
+        return None
 
     scores = [
         e["signals"]["rag_top1_score"]
@@ -779,22 +884,23 @@ def _calc_fitness_search(experiences: list[dict]) -> float:
         if e.get("signals", {}).get("rag_top1_score") is not None
     ]
     if not scores:
-        return 0.5
+        return None
 
     return max(0.0, min(1.0, sum(scores) / len(scores)))
 
 
-def _calc_fitness_agent(experiences: list[dict]) -> float:
+def _calc_fitness_agent(experiences: list[dict]) -> float | None:
     """agent fitness: ステップ効率
 
     エージェントループ数が少なく、会話が完了しているほど高スコア。
+    agent 経験ゼロは評価不能 (None)。
     """
     agent_exps = [
         e for e in experiences
         if e.get("signals", {}).get("agent_loops", 0) > 0
     ]
     if not agent_exps:
-        return 0.5
+        return None
 
     scores = []
     for e in agent_exps:
@@ -810,17 +916,17 @@ def _calc_fitness_agent(experiences: list[dict]) -> float:
     return sum(scores) / len(scores)
 
 
-def _calc_fitness_long_form(experiences: list[dict]) -> float:
+def _calc_fitness_long_form(experiences: list[dict]) -> float | None:
     """long_form fitness: 長文生成の完了率と品質
 
-    ユニット完了率とバリデーションエラー率で評価。
+    ユニット完了率とバリデーションエラー率で評価。長文経験ゼロは評価不能 (None)。
     """
     lf_exps = [
         e for e in experiences
         if e.get("signals", {}).get("long_form_used")
     ]
     if not lf_exps:
-        return 0.5
+        return None
 
     scores = []
     for e in lf_exps:
@@ -835,16 +941,16 @@ def _calc_fitness_long_form(experiences: list[dict]) -> float:
             scores.append(max(0.0, min(1.0, completion_rate - error_penalty)))
 
     if not scores:
-        return 0.5
+        return None
 
     return sum(scores) / len(scores)
 
 
-def _calc_fitness_default(experiences: list[dict]) -> float:
-    """デフォルト fitness: 会話完了率ベース"""
+def _calc_fitness_default(experiences: list[dict]) -> float | None:
+    """デフォルト fitness: 会話完了率ベース。経験ゼロは評価不能 (None)。"""
     total = len(experiences)
     if total == 0:
-        return 0.5
+        return None
 
     good = sum(
         1 for e in experiences
@@ -858,7 +964,7 @@ def _calc_fitness_default(experiences: list[dict]) -> float:
     return max(0.0, min(1.0, (good - bad * 0.5) / total + 0.5))
 
 
-_FITNESS_FUNCTIONS: dict[str, Callable[..., float]] = {
+_FITNESS_FUNCTIONS: dict[str, Callable[..., float | None]] = {
     "router": _calc_fitness_router,
     "memory": _calc_fitness_memory,
     "search": _calc_fitness_search,

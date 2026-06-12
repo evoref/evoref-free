@@ -10,6 +10,12 @@ EvorefLoop pillar が書き込む ``task`` / ``progress_marker`` /
 等が依存していたタスク管理 / 失敗パターン統計 / artifact 一覧 / orphan 回収 /
 user profile 収集 API を本 View に集約する。
 
+注: 本 View は loop 所有 FactType の sanctioned な書込/読取 API 面であり、
+全メソッドが現時点で production から呼ばれているわけではない (例:
+``count_artifact_facts`` は API 面として提供するが現状呼出元なし)。
+``write_failure_pattern`` は ralph loop に加え sleep-time の MDP 抽出
+(``extraction._persist_failure_patterns_via_view``) からも利用される。
+
 ## スコープと store 分離
 
 Loop driver は複数スコープ (``global`` + ``project:<id>``) を横断する。

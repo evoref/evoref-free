@@ -86,12 +86,13 @@ async def trigger_learning(req: TriggerRequest, state: AppState = Depends(get_ap
         )
 
     # Full モード: まず sleep-time update を実行する。
-    # アシストモデルを優先し、利用不可の場合のみベースモデルにフォールバックする。
-    # 通常のスケジュール経路 (scheduler.py _run_level1_loop) と同じ優先順位に揃える。
+    # sleep-time の LLM ステージはアシストモデルでのみ実行する (degraded 時は
+    # ベースへフォールバックせず run_full(None) が Step 5.8-10 をスキップ)。
+    # 通常のスケジュール経路 (scheduler.py の Full) と同じ方針 (c_14 §6.2)。
     if req.level == "full":
         sleep_sched = state.sleep_scheduler
         if sleep_sched is not None and sleep_sched._worker is not None:
-            sleep_client = state.assist_client or state.local_client
+            sleep_client = state.assist_client
             if sleep_client:
                 try:
                     logger.info(
@@ -250,6 +251,7 @@ def _build_scheduler_status(scheduler: object | None) -> SchedulerStatusModel:
 
     return SchedulerStatusModel(
         running=raw.get("running", False),
+        is_disabled=raw.get("is_disabled", False),
         experience_count=raw.get("experience_count", 0),
         new_experience_count=raw.get("new_experience_count", 0),
         min_experiences=raw.get("min_experiences", 0),

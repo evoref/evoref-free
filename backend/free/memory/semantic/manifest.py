@@ -75,7 +75,10 @@ DEFAULT_COMPONENT_VERSIONS: dict[str, int] = {
   (``embeddings/<model_id>/vectors.npy`` + ``row_to_id.json`` の model_id 別ディレクトリ構成)
 - ``index``: 索引ファイルのフォーマット (v1=4 ファイル、v2=統合 ``index.jsonl``)
 
-``SCHEMA_VERSION`` は M5-d で 1 → 2 に bump (索引形式の統合)。
+``SCHEMA_VERSION`` は現状 1 のまま (``init_evorefmem.SCHEMA_VERSION`` が SSOT)。
+統合 ``index.jsonl`` は ``SemanticFactStore._reconcile_index`` が起動時に
+facts.jsonl から自己修復するため、bump 無しで運用する。``IndexV1ToV2Migration``
+(from=1/to=2) は将来の破壊的変更で bump する際の経路として休眠登録のまま。
 """
 
 DEFAULT_INDEX_GENERATIONS: dict[str, int] = {

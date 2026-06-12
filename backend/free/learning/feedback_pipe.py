@@ -226,7 +226,7 @@ class FeedbackPipe:
                 fitness=float(marker.confidence),
                 added_at=time.strftime(
                     "%Y-%m-%dT%H:%M:%S",
-                    time.gmtime(getattr(marker, "created_at", time.time())),
+                    time.gmtime(marker.created_at),
                 ),
             )
             if ex is not None:

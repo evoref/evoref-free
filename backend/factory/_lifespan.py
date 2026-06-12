@@ -120,6 +120,26 @@ def _shutdown_vector_store_save(state: AppState) -> None:
         logger.warning("Vector store save on shutdown failed: %s", e)
 
 
+def _shutdown_semmem_index_flush(state: AppState) -> None:
+    """SemMem 各スコープの index.jsonl pending dual-write を flush する。
+
+    IncrementalIndexUpdater は flush 閾値未満の pending op を in-memory に
+    保持するため、明示 flush しないとプロセス終了で消失する。次回起動の
+    ``_reconcile_index`` が facts.jsonl から復元するが、ここで flush して
+    おけば余分な再構築 I/O を避けられる。
+    """
+    stores = getattr(state, "_semantic_stores", None)
+    if not stores:
+        return
+    for scope, store in list(stores.items()):
+        try:
+            store.flush_index()
+        except Exception as e:  # noqa: BLE001 — flush 失敗で shutdown を止めない
+            logger.warning(
+                "SemMem index flush on shutdown failed (%s): %s", scope, e,
+            )
+
+
 def _shutdown_experience_save(exp_buf: "ExperienceBuffer", exp_file: Path) -> None:
     """経験バッファを保存"""
     try:
@@ -281,6 +301,8 @@ async def _run_lifespan_shutdown(
         _shutdown_stm_save(ctx.stm, ctx.resolver)
     with _timed(shutdown_timings, "vector_store_save"):
         _shutdown_vector_store_save(state)
+    with _timed(shutdown_timings, "semmem_index_flush"):
+        _shutdown_semmem_index_flush(state)
     with _timed(shutdown_timings, "experience_save"):
         _shutdown_experience_save(ctx.exp_buf, ctx.exp_file)
     with _timed(shutdown_timings, "patterns_save"):

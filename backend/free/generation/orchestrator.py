@@ -73,7 +73,6 @@ class LongFormOrchestrator:
         main_client,
         assist_client=None,
         memory_wm=None,
-        memory_stm=None,
         retriever=None,
         embedder=None,
         config: dict | None = None,
@@ -84,7 +83,6 @@ class LongFormOrchestrator:
         self.main_client = main_client
         self.assist_client = assist_client
         self.memory_wm = memory_wm
-        self.memory_stm = memory_stm
         self.retriever = retriever
         self.embedder = embedder
         self.config = config or {}
@@ -496,6 +494,7 @@ class LongFormOrchestrator:
         existing_content: str = "",
         long_form_mode: LongFormMode = LongFormMode.CONTINUE,
         prefetched_rag: list[tuple[str, float, str]] | None = None,
+        file_context_block: str | None = None,
     ) -> AsyncIterator[str]:
         """長文生成のエントリポイント。トークンを yield する。
 
@@ -505,6 +504,8 @@ class LongFormOrchestrator:
             mode: "coding" | "chat"
             on_step: SSEステップ通知コールバック
             existing_content: 追記モード時の既存ファイル内容
+            file_context_block: ユーザー添付ファイルを整形したブロック。
+                指定時は plan コンテキストの参考情報チャネルへ合流させる。
             long_form_mode: 出力モード。
                 :attr:`LongFormMode.CONTINUE` (既定) は従来挙動。
                 :attr:`LongFormMode.EXPAND` / :attr:`LongFormMode.SPLIT` は
@@ -524,7 +525,11 @@ class LongFormOrchestrator:
 
         # 2. メモリ・RAG からコンテキスト収集
         # prefetched_rag があれば retriever を呼ばず取得済みチャンクを再利用する。
-        context = await self._gather_context(instruction, prefetched_rag=prefetched_rag)
+        context = await self._gather_context(
+            instruction,
+            prefetched_rag=prefetched_rag,
+            file_context_block=file_context_block,
+        )
         if existing_content:
             context["existing_content"] = existing_content
         # 出力モード (EXPAND / SPLIT 等) は strategy.create_plan() に
@@ -692,12 +697,17 @@ class LongFormOrchestrator:
         self,
         instruction: str,
         prefetched_rag: list[tuple[str, float, str]] | None = None,
+        file_context_block: str | None = None,
     ) -> dict:
         """メモリ3層 + RAG からコンテキストを収集
 
         ``prefetched_rag`` (search pipeline 取得済み ``(chunk_id, score, text)``)
         があれば retriever を呼ばずそれを再利用する。``None``/空なら従来の
         retriever 経路 (注入時のみ) に倒し、いずれも無ければ RAG なし。
+
+        ``file_context_block`` (ユーザー添付ファイル) があれば参考情報チャネル
+        (``context["rag"]``) の先頭へ合流させる。両 strategy が ``rag`` を参照
+        コンテキストとして消費するため、strategy 側の変更を要さない。
         """
         context: dict[str, str] = {"rag": "", "memory": ""}
 
@@ -738,6 +748,14 @@ class LongFormOrchestrator:
                     context["rag"] = "\n---\n".join(rag_parts)
             except Exception as e:
                 logger.warning("Failed to gather RAG context: %s", e)
+
+        # 添付ファイルを参考情報チャネルへ合流 (RAG チャンクより前に置く)。
+        if file_context_block:
+            existing_rag = context["rag"]
+            context["rag"] = (
+                f"{file_context_block}\n---\n{existing_rag}"
+                if existing_rag else file_context_block
+            )
 
         return context
 

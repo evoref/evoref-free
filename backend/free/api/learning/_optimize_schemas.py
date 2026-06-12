@@ -46,6 +46,12 @@ class Level2Status(BaseModel):
     sparse_params: int
     min_failures: int
     lora_adapter_exists: bool
+    # #3a: 既定 (base=lora / assist=none) は no-op でトリガ段階 skip される。UI が
+    # 「設定済・待機中」と誤解しないよう、有効メソッドと実行可否を明示する。
+    base_method: str = "lora"          # lora | cvector
+    assist_method: str = "none"        # none | spsa-real-eval
+    active_method: str = "none"        # cvector | spsa-real-eval | none
+    will_run: bool = False             # 実メソッドが有効か (no-op skip でないか)
 
 
 class OptimizeStatusResponse(BaseModel):

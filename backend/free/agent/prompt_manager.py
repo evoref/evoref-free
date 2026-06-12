@@ -18,6 +18,7 @@ from backend.free.agent._prompt_store_helpers import (
 )
 from backend.free.agent.prompt_utils import (
     FewShotExample,
+    FewShotSelector,
     dedupe_paragraphs,
     format_fewshot_section,
     restore_protected_sections,
@@ -193,7 +194,18 @@ class SystemPromptManager:
         self.instance_name = instance_name
         self.contents: dict[str, str] = {}
         self.metas: dict[str, PromptMeta] = {}
+        # 推論時 query 依存 few-shot 選択器 (FewShotSelector)。wire_pillars で後注入。
+        # None の場合は従来の meta.candidates (進化凍結) を使う。
+        self._fewshot_selector: FewShotSelector | None = None
+        self._fewshot_k: int = 3
         self._load_all()
+
+    def set_fewshot_selector(
+        self, selector: FewShotSelector | None, *, k: int = 3,
+    ) -> None:
+        """推論時 query 依存の few-shot 選択器を注入する (wire_pillars 後注入)。"""
+        self._fewshot_selector = selector
+        self._fewshot_k = k
 
     def _current_locale(self) -> str:
         """config.yaml からプロンプトロケールを取得"""
@@ -219,8 +231,13 @@ class SystemPromptManager:
             else:
                 self._create_default(mode)
 
-    def get_prompt(self, mode: str) -> str:
-        """推論時: メモリ上の本文にインスタンス名 + Few-shot 例を付与して返す（0ms）"""
+    def get_prompt(self, mode: str, query: str | None = None) -> str:
+        """推論時: メモリ上の本文にインスタンス名 + Few-shot 例を付与して返す。
+
+        ``query`` と selector が両方あれば query 類似で動的に few-shot を選ぶ
+        (主経路)。無ければ進化が凍結した ``meta.candidates`` にフォールバック
+        (後方互換)。
+        """
         if mode not in self.contents:
             raise ValueError(f"Unknown mode: {mode}")
         locale = self._get_prompt_locale(mode)
@@ -228,10 +245,27 @@ class SystemPromptManager:
         prefix = template.format(name=self.instance_name)
         base = prefix + self.contents[mode]
 
-        # Few-shot 例を付加
+        examples = self._resolve_fewshot(mode, query)
+        if examples:
+            base += format_fewshot_section(examples)
+        return base
+
+    def _resolve_fewshot(
+        self, mode: str, query: str | None,
+    ) -> list[FewShotExample]:
+        """few-shot 例を解決する: 動的 selector 優先、無ければ凍結 candidates。"""
+        selector = self._fewshot_selector
+        if query and selector is not None:
+            try:
+                examples = selector.select_top_k(mode, query, self._fewshot_k)
+                if examples:
+                    return examples
+            except Exception as e:  # selector 障害は静的経路へ縮退
+                logger.warning("fewshot select_top_k failed, fallback: %s", e)
+        # フォールバック: 進化が凍結した meta.candidates
         meta = self.metas.get(mode)
         if meta and meta.candidates:
-            examples = [
+            return [
                 FewShotExample(
                     query=c.get("query", ""),
                     response=c.get("response", ""),
@@ -239,9 +273,7 @@ class SystemPromptManager:
                 for c in meta.candidates
                 if c.get("query") and c.get("response")
             ]
-            if examples:
-                base += format_fewshot_section(examples)
-        return base
+        return []
 
     def _get_prompt_locale(self, mode: str) -> str:
         """プロンプトのロケールを取得（メタ情報 > config > デフォルト）"""
@@ -282,18 +314,20 @@ class SystemPromptManager:
         mode: str,
         content: str,
         fitness: float,
-        fewshot_examples: list[dict] | None = None,
     ) -> None:
-        """Level 1 進化: 最良候補を本番に採用
+        """Level 1 進化: 最良候補 (instruction) を本番に採用
 
         保護セクション（<!-- PROTECTED --> マーカー）が現在のプロンプトに含まれている場合、
         進化候補がそれを維持しているか検証し、欠落時は強制復元する。
+
+        few-shot 例は推論時に FewShotSelector (select_top_k) が query 依存で動的選択
+        するため、本メソッドは ``meta.candidates`` を変更しない (co-evolution 廃止)。
+        既存の candidates は selector 未注入時のフォールバックとして温存される。
 
         Args:
             mode: 対象モード
             content: 進化後のプロンプト本文
             fitness: 最終 fitness スコア
-            fewshot_examples: 選択された Few-shot 例のリスト
         """
         if mode not in self.MODES:
             raise ValueError(f"Unknown mode: {mode}")
@@ -332,11 +366,10 @@ class SystemPromptManager:
         meta.version += 1
         meta.updated_at = _now()
         meta.source = "evolution"
-        meta.candidates = fewshot_examples or []
         self._save_meta(mode)
         logger.info(
-            "Evolved update: mode=%s, version=%d, fitness=%.3f, fewshot=%d",
-            mode, meta.version, fitness, len(meta.candidates),
+            "Evolved update: mode=%s, version=%d, fitness=%.3f",
+            mode, meta.version, fitness,
         )
 
     def reload(self, mode: str) -> None:

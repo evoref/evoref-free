@@ -12,8 +12,8 @@ class ModelPathsConfig(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    base_model: str = "models/qwen3.5-4b-q4_k_m.gguf"
-    assist_model: str = "models/Qwen3.5-4B-Q4_K_M.gguf"
+    base_model: str = "models/gemma-4-12b-it-qat-q4_0.gguf"
+    assist_model: str = "models/gemma-4-E4B_q4_0-it.gguf"
     embed_model: str = "models/Qwen3-Embedding-0.6B-Q8_0.gguf"
     coding_model: str | None = Field(
         default=None,

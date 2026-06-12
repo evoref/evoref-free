@@ -579,11 +579,6 @@
 			"presence_penalty_desc": "既出トークンへのペナルティ（正=多様性向上）"
 		}
 	},
-	"token_bar": {
-		"usage": "{used}/{limit} token",
-		"progress_label": "トークン使用量",
-		"warning_tooltip": "80%超で警告、95%超でリセット推奨"
-	},
 	"file": {
 		"attach": "ファイル追加",
 		"upload_area": "ファイルをドラッグ＆ドロップまたはクリックして追加",

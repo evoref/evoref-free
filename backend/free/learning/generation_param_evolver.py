@@ -87,9 +87,12 @@ class GenerationParamEvolver:
                 "deltas": {},
             }
 
-        # 現在のデルタ
+        # 現在のデルタ。現行も候補と同一尺度 (_evaluate_with_deltas) で評価して
+        # 比較を対称化する。現行を方向ボーナス無しの素評価にすると、候補側にだけ
+        # ボーナスが乗って improved が常時 True になる (偽の改善)。current が空 {}
+        # なら全 *_delta=0.0 で方向ボーナスは乗らず素のシグナルフィットネスと一致。
         current = self._deltas.get(mode, {})
-        current_fitness = self._evaluate_fitness(mode_exp)
+        current_fitness = self._evaluate_with_deltas(mode_exp, current)
 
         best_deltas = dict(current)
         best_fitness = current_fitness
@@ -153,10 +156,6 @@ class GenerationParamEvolver:
                 score -= 0.8
             if signals.get("rephrased_query"):
                 score -= 0.5
-            # 応答品質
-            response_time = signals.get("response_time_sec")
-            if response_time is not None and response_time < 5.0:
-                score += 0.1
 
         return max(0.0, min(1.0, (score / len(experiences) + 1) / 2))
 

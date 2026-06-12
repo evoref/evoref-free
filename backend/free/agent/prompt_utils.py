@@ -25,6 +25,7 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 # ─────────────────────────────────────────────────────────────────────
 # FewShotExample / format_fewshot_section
@@ -45,6 +46,22 @@ class FewShotExample:
     def __post_init__(self) -> None:
         if not self.id:
             self.id = uuid.uuid4().hex[:12]
+
+
+@runtime_checkable
+class FewShotSelector(Protocol):
+    """query 依存で few-shot 例を選ぶ最小 API。
+
+    実装は EvorefLearn の ``FewShotPool``。``SystemPromptManager`` (EvorefLoop) が
+    ``FewShotPool`` を直接 import すると pillar 境界 (Loop→Learn) を侵すため、
+    Protocol を Loop 所有の本モジュールに置き、wire 時に実体を注入する
+    (LoopWriteAPIProtocol と同様式)。``FewShotExample`` も本モジュール所有なので
+    境界はクリーン。
+    """
+
+    def select_top_k(
+        self, mode: str, query: str, k: int = 3,
+    ) -> list[FewShotExample]: ...
 
 
 def format_fewshot_section(examples: list[FewShotExample]) -> str:
@@ -226,6 +243,7 @@ def restore_protected_sections(original: str, candidate: str) -> str:
 
 __all__ = [
     "FewShotExample",
+    "FewShotSelector",
     "dedupe_paragraphs",
     "extract_protected_sections",
     "format_fewshot_section",

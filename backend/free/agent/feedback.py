@@ -8,11 +8,18 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from typing import TYPE_CHECKING
 
-from backend.free.learning.level0_instant import ExperienceBuffer, ExperienceEntry, FeedbackSignals
+from backend.free.learning.level0_instant import (
+    RESPONSE_FULL_CAP,
+    RESPONSE_SUMMARY_CAP,
+    ExperienceBuffer,
+    ExperienceEntry,
+    FeedbackSignals,
+    truncate_at_boundary,
+)
 from backend.log_config import get_logger
+from backend.utils import utc_now
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
@@ -22,7 +29,7 @@ logger = get_logger("agent.feedback")
 
 # ユーザー訂正パターン（ハードコード: 高確度）
 CORRECTION_PATTERNS = [
-    re.compile(r"違[うい]", re.IGNORECASE),
+    re.compile(r"違[うわえおっく]|違い(?:ます|ません|まし)", re.IGNORECASE),
     re.compile(r"間違[いっ]", re.IGNORECASE),
     re.compile(r"そうじゃ", re.IGNORECASE),
     re.compile(r"そうではな", re.IGNORECASE),
@@ -30,7 +37,7 @@ CORRECTION_PATTERNS = [
     re.compile(r"訂正", re.IGNORECASE),
     re.compile(r"not correct", re.IGNORECASE),
     re.compile(r"that'?s wrong", re.IGNORECASE),
-    re.compile(r"actually", re.IGNORECASE),
+    re.compile(r"^\s*actually\b", re.IGNORECASE),
 ]
 
 # 言い換えパターン（同じ質問の言い直し検出用）
@@ -57,6 +64,12 @@ class FeedbackCollector:
         self._debug_logger = debug_logger
         self._learned_patterns = learned_patterns
         self._prev_query: str | None = None
+        # 直前ターンの entry と capability 使用状況 (false_negative の事後検出用)。
+        # 「前ターンが capability 未使用 → 当ターンで明示訂正 → 当ターンで capability
+        # 使用」の遷移を検出したら前 entry へ遡及マークし、前クエリから学習する。
+        self._prev_entry: ExperienceEntry | None = None
+        self._prev_routed_tool: bool = False
+        self._prev_used_long_form: bool = False
         # 現在ロード中のモデル名 (GGUF ファイル名)。record() の base_model /
         # embedding_model が明示指定されないとき既定値として埋める。
         self._base_model_name = base_model_name
@@ -106,10 +119,11 @@ class FeedbackCollector:
             # 呼出側 (chat_recorder) は戻り値を直接参照しないが、署名互換のため
             # 最小限のダミーエントリを返す
             return ExperienceEntry(
-                timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                timestamp=utc_now(),
                 mode=mode,
                 query=query,
-                response_summary=response[:200],
+                response_summary=response[:RESPONSE_SUMMARY_CAP],
+                response_full=truncate_at_boundary(response, RESPONSE_FULL_CAP),
                 base_model=base_model or self._base_model_name,
                 embedding_model=embedding_model or self._embedding_model_name,
                 cartridge_ids=cartridge_ids or [],
@@ -142,15 +156,34 @@ class FeedbackCollector:
         )
 
         entry = ExperienceEntry(
-            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            timestamp=utc_now(),
             mode=mode,
             query=query,
-            response_summary=response[:200],
+            response_summary=response[:RESPONSE_SUMMARY_CAP],
+            response_full=truncate_at_boundary(response, RESPONSE_FULL_CAP),
             base_model=base_model or self._base_model_name,
             embedding_model=embedding_model or self._embedding_model_name,
             cartridge_ids=cartridge_ids or [],
             signals=signals,
         )
+
+        # false_negative 事後検出 (訂正ゲート + capability 弁別):
+        # 「前ターンが capability 未使用 → 当ターンで明示訂正 → 当ターンで capability
+        # 使用」= 前ターンは capability を要すべきだった、という低ノイズの強い証拠。
+        # 前 entry へ遡及マーク (Level 1 バッチ消費側が前クエリから学習: 正しい帰属) し、
+        # 即時にも前クエリから学習する。前ターンが既に capability を使っていたケースは
+        # 同一ターン false_positive (chat_recorder で検出) の領分なので扱わない。
+        # 訂正学習 (_learn_from_correction) より先に処理する: パターンは keyword 単位
+        # キーイング (add_pattern) のため、より具体的な tool_routing/long_form の主張を
+        # 一般的な correction カテゴリより優先させ shadow を防ぐ。
+        current_routed_tool = tool_routing_success or tool_routing_false_positive
+        if correction_text is not None and self._prev_entry is not None:
+            if current_routed_tool and not self._prev_routed_tool:
+                self._prev_entry.signals.tool_routing_false_negative = True
+                self._learn_tool_routing_from_false_negative(self._prev_entry.query)
+            if long_form_used and not self._prev_used_long_form:
+                self._prev_entry.signals.long_form_false_negative = True
+                self._learn_long_form_from_signal(self._prev_entry.query)
 
         # 訂正・言い直し検出時にパターンを学習
         if correction_text is not None:
@@ -158,20 +191,22 @@ class FeedbackCollector:
         if signals.rephrased_query:
             self._learn_from_rephrase(query)
 
-        # ツールルーティング false_negative 時: ユーザーの言い直しからキーワードを学習
+        # ツールルーティング false_negative 時: 明示注入 (テスト等) では当該クエリから学習。
         if tool_routing_false_negative:
             self._learn_tool_routing_from_false_negative(query)
 
         # 長文ルーティング 成功 / false_negative 時: クエリからキーワードを
         # ``category="long_form"`` として学習する。
         # success 時はクエリ全体が長文分類のヒントになるため正例として学習。
-        # false_negative はユーザの言い直しから手動で長文要求を検知したケース。
         if long_form_success or long_form_false_negative:
             self._learn_long_form_from_signal(query)
 
         self.buffer.record(entry)
         self._session_entries.append(entry)
         self._prev_query = query
+        self._prev_entry = entry
+        self._prev_routed_tool = current_routed_tool
+        self._prev_used_long_form = long_form_used
 
         logger.info(
             "Recorded experience: mode=%s, rephrase=%s, correction=%s (by=%s)",
@@ -209,6 +244,9 @@ class FeedbackCollector:
             entry.signals.conversation_ended = True
         self._session_entries.clear()
         self._prev_query = None
+        self._prev_entry = None
+        self._prev_routed_tool = False
+        self._prev_used_long_form = False
 
     def _detect_rephrase(self, query: str) -> bool:
         """直前の質問との類似度で言い換えを検出（簡易版: 文字重複率）"""
@@ -239,9 +277,11 @@ class FeedbackCollector:
             if pattern.search(query):
                 return query, "hardcoded"
 
-        # 2. 学習済みパターン
+        # 2. 学習済みパターン (correction カテゴリのみ参照。category 未指定だと
+        # long_form / tool_routing / rephrase で学習した語まで横断ヒットし、
+        # 一般的な意図語が訂正として誤検知される)
         if self._learned_patterns is not None:
-            matches = self._learned_patterns.match(query)
+            matches = self._learned_patterns.match(query, category="correction")
             if matches:
                 logger.debug(
                     "Learned pattern matched: %s",

@@ -179,3 +179,15 @@ class QueryCacheMixin:
             "size": len(self._query_cache),
             "maxsize": self._cache_maxsize,
         }
+
+    def clear_query_cache(self) -> None:
+        """クエリ埋め込み LRU を破棄する。
+
+        instruction (検索 prefix) を変更した後に呼ぶ。旧 instruction で計算済みの
+        ベクトルがそのまま返ると進化が逆効果 (古い prefix で検索) になるため、
+        変更後は必ず clear する。累積統計 (hits/misses) は観測連続性のため残す。
+        """
+        n = len(self._query_cache)
+        self._query_cache.clear()
+        if n:
+            logger.info("Query embedding cache cleared (%d entries)", n)

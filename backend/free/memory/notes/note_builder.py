@@ -301,6 +301,7 @@ class NoteBuilder:
             "tags": merged_tags,
             "embedding": None,
             "lightmem_score": self.initial_score(content, role),
+            "confidence": self.source_confidence(effective_source),
             "created_at": now,
             "accessed_at": now,
             "access_count": 0,
@@ -354,6 +355,23 @@ class NoteBuilder:
         if role == "user":
             score += 0.1
         return min(1.0, score)
+
+    # 発生源別の初期 confidence。NoteEvolver はこの値が
+    # ``memory.note_evolver.confidence_threshold`` (既定 0.7) 未満のノートのみ
+    # LLM 進化 (context_description 生成) の対象にする。ユーザー発話は権威性が
+    # 高く LLM 進化不要なので閾値以上、assistant / rag / system 由来のノートは
+    # context 補強の価値があるので閾値未満に置く。
+    _SOURCE_CONFIDENCE: dict[str, float] = {
+        "user": 1.0,
+        "assistant": 0.5,
+        "rag": 0.6,
+        "system": 0.6,
+    }
+
+    @classmethod
+    def source_confidence(cls, source: str) -> float:
+        """発生源 (``NoteSource``) 別の初期 confidence を返す。"""
+        return cls._SOURCE_CONFIDENCE.get(source, 1.0)
 
     @classmethod
     def _detect_code_block(cls, content: str) -> bool:

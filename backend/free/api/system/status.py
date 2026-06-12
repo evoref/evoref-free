@@ -253,11 +253,14 @@ async def get_status(state: AppState = Depends(get_app_state)):
     debug_info = _collect_debug_info(cfg, state)
     version_info = get_version_info()
 
+    cart_mgr = getattr(state, "cartridge_manager", None)
+    cartridges_loaded = cart_mgr.loaded_count if cart_mgr is not None else 0
     return StatusResponse(
         status=status,
         edition=current_edition().name.lower(),
         instance_name=instance_name,
         version=get_runtime_version(),
+        cartridges_loaded=cartridges_loaded,
         free_version=version_info.free,
         pro_version=version_info.pro,
         schema_version=version_info.schema,

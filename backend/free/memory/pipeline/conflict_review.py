@@ -2,13 +2,14 @@
 
 ``semantic_conflict_resolver.py`` (sleep-time Step 6B) が ``review_status=
 "pending"`` に振り分けた競合を、ユーザーの意思決定で解決するための共通
-ロジックを提供する。チャット確認フロー (``conflict_chat_judge``) と
-API 層の双方から再利用される。
+ロジックを提供する。チャット確認フロー (``conflict_chat_judge`` /
+``chat_service.maybe_resolve_pending_conflicts``) から利用する
+(専用 API 層は PR #106 のメモリインスペクタ削除で撤去済)。
 
 提供する操作:
 
-- :func:`collect_pending_groups` — pending ファクトの (subject, predicate,
-  type) グルーピング (読取のみ)
+- :func:`collect_pending_groups` — pending ファクトの (subject, predicate)
+  グルーピング (読取のみ)
 - :func:`apply_resolution` — keep_old / keep_new / merge の supersede 反映 +
   ``conflicts.jsonl`` の pending 行掃除 + ``conflicts_resolved.jsonl`` への
   audit 追記までを一体で実行する
@@ -46,16 +47,19 @@ _RESOLVED_ACTION_TO_STATUS: dict[str, str] = {
 class AlreadyResolvedError(ValueError):
     """対象ファクトが既に supersede 済み (= 解決済み) の場合に送出する。
 
-    API 層は本例外を 409 Conflict に対応付ける。
+    チャット確認フロー (``chat_service.maybe_resolve_pending_conflicts``) では
+    汎用 except に吸収され pending 維持で no-op になる (専用 API 層と 409 への
+    対応付けは PR #106 のメモリインスペクタ削除で撤去済)。
     """
 
 
 @dataclass(frozen=True)
 class PendingConflictGroup:
-    """pending 競合の 1 グループ (同 subject / predicate / type)。
+    """pending 競合の 1 グループ (同 subject / predicate)。
 
-    ``facts`` は ``created_at`` 昇順。keep_new の winner は ``facts[-1]``、
-    keep_old の winner は ``facts[0]``。
+    ``type`` は表示用に member facts から導出した文字列 (混在時は
+    ``"a/b"`` 形式)。``facts`` は ``created_at`` 昇順。keep_new の winner は
+    ``facts[-1]``、keep_old の winner は ``facts[0]``。
     """
 
     scope: str
@@ -87,27 +91,35 @@ class ResolutionResult:
 def collect_pending_groups(
     store: SemanticFactStore, scope: str,
 ) -> list[PendingConflictGroup]:
-    """``review_status="pending"`` の active ファクトを (subject, predicate,
-    type) でグルーピングして返す。
+    """``review_status="pending"`` の active ファクトを (subject, predicate)
+    でグルーピングして返す。
+
+    グルーピングキーは producer ``SemanticConflictResolver._detect_groups``
+    (``(subject, predicate)``) と一致させること。type を加えると、producer が
+    同 (subject, predicate) で type 混在の競合を pending に振り分けた場合に
+    consumer 側で type ごとに単独バケット化して両方除外され、その競合が
+    チャットに一度も注入されず永久に pending のまま残る (再検出も skip される)。
 
     単独 pending (グループとして競合になっていないもの) は除外する。
-    並びは ``(scope, subject, predicate, type)`` の決定的順序 —
-    チャット注入の ``[C1]`` 採番と assist 判定プロンプトで同一の番号を
-    共有するため、呼び出しタイミングに依らず安定であること。
+    並びは ``(scope, subject, predicate)`` の決定的順序 — チャット注入の
+    ``[C1]`` 採番と assist 判定プロンプトで同一の番号を共有するため、
+    呼び出しタイミングに依らず安定であること。
     """
     pending = [
         f for f in store.all_facts(include_superseded=False)
         if f.review_status == "pending"
     ]
-    buckets: dict[tuple[str, str, str], list[SemanticFact]] = {}
+    buckets: dict[tuple[str, str], list[SemanticFact]] = {}
     for f in pending:
-        buckets.setdefault((f.subject, f.predicate, f.type), []).append(f)
+        buckets.setdefault((f.subject, f.predicate), []).append(f)
 
     groups: list[PendingConflictGroup] = []
-    for (subject, predicate, type_), facts in buckets.items():
+    for (subject, predicate), facts in buckets.items():
         if len(facts) < 2:
             continue
         facts.sort(key=lambda f: f.created_at)
+        # type 混在グループの表示用に member facts から導出する。
+        type_ = "/".join(sorted({f.type for f in facts}))
         groups.append(PendingConflictGroup(
             scope=scope,
             subject=subject,
@@ -130,13 +142,20 @@ def append_resolution_log(
     decision: str = "user",
     trace_id: str | None = None,
 ) -> None:
-    """ユーザー解消を ``conflicts_resolved.jsonl`` に追記する (audit trail)。
+    """解消を ``conflicts_resolved.jsonl`` に追記する (audit trail)。
 
     ``decision`` は解決経路の識別子 — ``"user"`` (API 経由) /
-    ``"user_chat"`` (チャット確認フロー経由)。
+    ``"user_chat"`` (チャット確認フロー経由) / ``"ttl_auto"`` (sleep-time の
+    pending TTL 自動解消)。``reason`` は user 経路では ``"user_<action>"``、
+    それ以外の経路では ``"<decision>_<action>"`` (例 ``"ttl_auto_keep_new"``)。
     """
     path = store.root_dir / CONFLICTS_RESOLVED_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
+    reason = (
+        f"user_{action}"
+        if decision in ("user", "user_chat")
+        else f"{decision}_{action}"
+    )
     entry: dict = {
         "ts": time.time(),
         "scope": scope,
@@ -146,7 +165,7 @@ def append_resolution_log(
         "winner_id": new_fact_id or winner.id,
         "loser_ids": loser_ids if not new_fact_id else [winner.id, *loser_ids],
         "decision": decision,
-        "reason": f"user_{action}",
+        "reason": reason,
     }
     if trace_id:
         entry["trace_id"] = trace_id
@@ -381,15 +400,20 @@ def render_pending_conflicts_block(
     return "\n".join(lines)
 
 
-def render_resolved_notice(result: ResolutionResult, index: int) -> str:
+def render_resolved_notice(
+    result: ResolutionResult, group: PendingConflictGroup,
+) -> str:
     """直前のユーザー回答で解決した競合の確認通知行を返す。
 
     同ターンの注入ブロック末尾に追加し、AI に「記憶を更新した」旨を
-    一言返させる。
+    一言返させる。解決後は pending ブロックの ``[C1..]`` が再収集で振り直される
+    ため、``[C{index}]`` 参照は同一ターン内ですら別の競合を指し得る。それを
+    避けるため、解決した競合は番号ではなく内容 (subject / predicate) で示す。
     """
     return (
-        f"(直前のユーザー回答により [C{index}] を {result.action} で解決し、"
-        "記憶を更新済み。応答の冒頭で一言だけ反映した旨を伝えること。)"
+        f"(直前のユーザー回答により記憶の競合「{group.subject} {group.predicate}」を "
+        f"{result.action} で解決し、記憶を更新済み。"
+        "応答の冒頭で一言だけ反映した旨を伝えること。)"
     )
 
 

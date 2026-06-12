@@ -111,6 +111,9 @@ async def prepare_memory_context(
             # 張り付くのを防ぐ。
             if state.assist_judge_tracker is not None:
                 state.assist_judge_tracker.reset_session(old_session_id)
+            # conflict_chat_judge のセッション内発火カウンタも同様にリセット。
+            if state.conflict_judge_tracker is not None:
+                state.conflict_judge_tracker.reset_session(old_session_id)
             # 旧会話の経験に conversation_ended を反映 (Level 2 base=C positive 抽出用)。
             # disabled 時は FeedbackCollector 内ガードで no-op。
             if state.feedback_collector is not None:
@@ -298,7 +301,8 @@ class ConflictTurnContext:
 
     pending_groups: list["PendingConflictGroup"] = field(default_factory=list)
     resolved: "ResolutionResult | None" = None
-    resolved_index: int = 0
+    # 解決した競合グループ (解決通知を番号でなく内容で示すため保持する)。
+    resolved_group: "PendingConflictGroup | None" = None
 
 
 def _iter_scopes(state: AppState):
@@ -334,6 +338,7 @@ def _chat_review_cfg(cfg: dict) -> dict:
 
 async def maybe_resolve_pending_conflicts(
     state: AppState, cfg: dict, history: list[dict], user_message: str,
+    *, allow_write: bool = True, session_id: str = "default",
 ) -> ConflictTurnContext:
     """pending 競合のユーザー回答を assist で判定し、有効なら即時反映する。
 
@@ -343,8 +348,12 @@ async def maybe_resolve_pending_conflicts(
     ゲート:
     - ``memory.conflict.chat_review.enabled=false`` → 全体スキップ
     - pending 無し → 即 return
+    - ``allow_write=False`` (private ターン等) → 判定/書込スキップ (注入は継続)
     - ``assist_client is None`` → 判定スキップ (注入は情報提示のみで継続)
     - history に assistant 発話なし (= まだ確認を出していない) → 判定スキップ
+    - ``chat_review.max_judge_per_session`` 到達 → 判定**と注入**を停止
+      (回答されないまま毎ターン assist スロットを専有するのを避ける。pending は
+      次セッション or sleep-time TTL で解消する)
 
     全例外は warning + 素通しでチャットを止めない。
     """
@@ -355,6 +364,27 @@ async def maybe_resolve_pending_conflicts(
     try:
         ctx.pending_groups = _collect_all_pending_groups(state)
         if not ctx.pending_groups:
+            return ctx
+        # セッション内発火上限: 到達済みなら判定も注入も止める。allow_write
+        # チェックより前に置き、private ターンでも注入を止める。
+        cap = int(review_cfg.get("max_judge_per_session", 3) or 0)
+        tracker = state.conflict_judge_tracker
+        if (
+            cap > 0
+            and tracker is not None
+            and tracker.get_session_count(session_id) >= cap
+        ):
+            logger.debug(
+                "conflict_chat_judge session cap reached (%d), "
+                "suppressing pending injection for session=%s",
+                cap, session_id,
+            )
+            ctx.pending_groups = []
+            return ctx
+        if not allow_write:
+            # private ターン: pending の提示 (注入) はするが、ユーザー回答判定に
+            # よる SemMem 書込 (apply_resolution) は行わない。private 契約
+            # (LTM/SemMem/履歴へ書かない) を競合解決経路でも守る。
             return ctx
         if state.assist_client is None:
             return ctx
@@ -373,6 +403,29 @@ async def maybe_resolve_pending_conflicts(
             apply_resolution,
             judge_user_reply,
         )
+
+        # assist を呼びに行く時点でカウント (タイムアウトでも realtime スロットは
+        # 消費されるため、呼出前に数える)。pending 無し / private / assist 未接続 /
+        # assistant 履歴なしの早期 return はここに到達せずカウントしない。
+        if tracker is not None:
+            count = tracker.record(session_id)
+            # 並行リクエストが上の cap チェックと record の間に割り込んで cap を
+            # 超えた場合、record の atomic な戻り値で判定し、このターンは judge を
+            # 打たず注入も止める (発火数が cap を超えないようにする)。
+            if cap > 0 and count > cap:
+                logger.debug(
+                    "conflict_chat_judge over session cap (%d/%d) for "
+                    "session=%s (concurrent); skipping judge this turn",
+                    count, cap, session_id,
+                )
+                ctx.pending_groups = []
+                return ctx
+            if cap > 0 and count >= cap:
+                logger.info(
+                    "conflict_chat_judge reached session cap (%d/%d) for "
+                    "session=%s; further turns skip judging and injection",
+                    count, cap, session_id,
+                )
 
         judgement = await judge_user_reply(
             state.assist_client,
@@ -400,22 +453,27 @@ async def maybe_resolve_pending_conflicts(
             trace_id=get_trace_id(),
         )
         ctx.resolved = result
-        ctx.resolved_index = index
+        ctx.resolved_group = group
         logger.info(
             "SemMem conflict resolved via chat: scope=%s action=%s winner=%s",
             group.scope, action, winner.id,
         )
         if state.debug_logger is not None:
-            state.debug_logger.log_memory_op(
-                "semmem_conflict_user_resolve",
-                {
-                    "scope": group.scope,
-                    "action": action,
-                    "winner_id": result.winner_id,
-                    "superseded": len(result.superseded_ids),
-                    "new_fact_id": result.new_fact_id or "",
-                },
-            )
+            # 監査ログ失敗で後続の pending 再収集 (同ターン注入の整合) を
+            # 落とさないよう、debug ログ単体を握る。
+            try:
+                state.debug_logger.log_memory_op(
+                    "semmem_conflict_user_resolve",
+                    {
+                        "scope": group.scope,
+                        "action": action,
+                        "winner_id": result.winner_id,
+                        "superseded": len(result.superseded_ids),
+                        "new_fact_id": result.new_fact_id or "",
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("conflict resolve audit log failed: %s", exc)
         # 解決を同ターンの注入へ反映するため pending を再収集
         ctx.pending_groups = _collect_all_pending_groups(state)
     except Exception as exc:  # noqa: BLE001 — 競合確認の失敗でチャットを止めない
@@ -503,10 +561,10 @@ def _render_conflict_section(
         )
         if block:
             parts.append(block)
-        if conflict_ctx.resolved is not None:
+        if conflict_ctx.resolved is not None and conflict_ctx.resolved_group is not None:
             parts.append(
                 render_resolved_notice(
-                    conflict_ctx.resolved, conflict_ctx.resolved_index,
+                    conflict_ctx.resolved, conflict_ctx.resolved_group,
                 ),
             )
         return "\n".join(parts) or None

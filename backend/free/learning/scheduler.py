@@ -102,6 +102,12 @@ class LearningScheduler:
         self.assist_spsa_iterations: int = learning.get(
             "assist_spsa_iterations", 300,
         )
+        # assist=B 実推論 eval は 1 反復で候補サーバを複数回起動するため、real-eval
+        # 有効時 (harness 利用可) は専用の低い反復数を使う (既定 30)。no-op eval 時は
+        # 従来の assist_spsa_iterations を使う。
+        self.assist_realeval_spsa_iterations: int = learning.get(
+            "assist_realeval_spsa_iterations", 30,
+        )
         self.assist_sparse_params: int = learning.get(
             "assist_sparse_params", 100,
         )
@@ -174,6 +180,9 @@ class LearningScheduler:
         # エンベッド検索指示プロンプト進化
         self._embedder = None
         self._embed_instruction_evolver = None
+        # 候補 instruction の実測評価器 (EmbedEvalProtocol)。後注入され、
+        # set_embedder 順に依存しないよう scheduler 側にも保持する。
+        self._embed_eval = None
         # パターン重み進化
         self._learned_patterns = None
         # 生成パラメータ進化
@@ -326,19 +335,19 @@ class LearningScheduler:
     def _save_policy_evolver_state(self) -> None:
         """PolicyEvolver + ExplorationController の状態を永続化する。
 
-        ``evolve_writeback=semmem`` の場合は policy
-        パラメータが SemMem の ``policy`` ファクトとして書き戻されるため、
-        ``policy_evolver_state.json`` への書き込みは廃止する
-        (ExplorationController の探索フェーズ状態は引き続き永続化する)。
+        ``policy_evolver_state.json`` は **ランタイム評価状態** (fitness_history /
+        decline_count / best_params / survived_count) であり、SemMem の policy ファクト
+        (= 活性化された policy 値) とは別物。semmem モードでも保存する (#8 Part B)。
+        従来は semmem モードでスキップしていたため、rollback の best_params 復元先や
+        昇格用 survived_count が再起動ごとにリセットされていた。
         """
         if self._policy_param_evolver is None:
             return
         try:
             state_dir = self.prompt_manager.prompt_dir
-            if not self._policy_param_evolver.is_semmem_writeback_active():
-                self._policy_param_evolver.save(
-                    state_dir / "policy_evolver_state.json",
-                )
+            self._policy_param_evolver.save(
+                state_dir / "policy_evolver_state.json",
+            )
             self._policy_param_evolver._exploration.save(
                 state_dir / "exploration_state.json",
             )
@@ -386,10 +395,39 @@ class LearningScheduler:
             from backend.free.optimizer.embed_instruction_evolver import (
                 EmbedInstructionEvolver,
             )
-            self._embed_instruction_evolver = EmbedInstructionEvolver()
-            logger.info("embed instruction evolver enabled")
+            # set_embed_eval が先に呼ばれていれば実測評価器を引き継ぐ。
+            self._embed_instruction_evolver = EmbedInstructionEvolver(
+                embed_eval=self._embed_eval,
+            )
+            logger.info(
+                "embed instruction evolver enabled (real_eval=%s)",
+                self._embed_eval is not None,
+            )
+            # 起動時反映: 過去に進化採用された embed_instruction.md が存在すれば
+            # runtime embedder へ適用する (再起動後も進化結果を runtime に乗せる)。
+            # ファイル不在時は何もしない (config 既定 instruction を尊重し、
+            # _load_embed_instruction がデフォルトを書き出す副作用も避ける)。
+            ei_path = self.prompt_manager.prompt_dir / "embed_instruction.md"
+            if ei_path.exists():
+                try:
+                    txt = ei_path.read_text(encoding="utf-8").strip()
+                    if txt:
+                        self._apply_embed_instruction_runtime(txt)
+                        logger.info("Loaded evolved embed instruction at startup")
+                except OSError as e:
+                    logger.warning("Failed to load embed_instruction.md at startup: %s", e)
         else:
             logger.info("embed instruction evolver disabled (embedder lacks instruction support)")
+
+    def set_embed_eval(self, embed_eval) -> None:
+        """候補 instruction の実測評価器を注入する (wire_pillars から後注入)。
+
+        set_embedder の前後どちらで呼ばれても整合するよう scheduler 側に保持し、
+        既に evolver が生成済みなら即反映する。
+        """
+        self._embed_eval = embed_eval
+        if self._embed_instruction_evolver is not None:
+            self._embed_instruction_evolver.set_embed_eval(embed_eval)
 
     def set_learned_patterns(self, learned_patterns) -> None:
         """学習済みパターンストアを設定（lifespan から注入）"""
@@ -414,7 +452,7 @@ class LearningScheduler:
     def set_policy_param_evolver(self, evolver) -> None:
         """ポリシーパラメータ進化器を設定"""
         self._policy_param_evolver = evolver
-        logger.info
+        logger.info("Policy param evolver enabled")
         # 経路 3: feedback_pipe が先に設定済なら即プロバイダを結線
         self._wire_feedback_success_provider()
 
@@ -738,13 +776,22 @@ class LearningScheduler:
         }
 
     def _finalize_completed_level1(
-        self, session: Level1Session, results: dict,
+        self,
+        session: Level1Session,
+        results: dict,
+        *,
+        extra_results: dict[str, dict] | None = None,
+        experiences: list[dict] | None = None,
     ) -> str:
         """全モード完了時の後処理: 最良 prompt 保存 + state 更新 + session archive.
 
         採用ゲート: fitness が initial を上回った mode のみ update_evolved する。
         無改善 (final <= initial) で採用すると、目的関数を改善しないまま version を
         bump し続ける (embed_instruction 系の採用パスと挙動を揃える)。
+
+        統計永続化 (`_last_level1_results` / `_fitness_history` / レート
+        スナップショット) は `_level1_finalize` に委譲し、手動トリガー経路
+        (`_run_level1`) と同じ状態が `/api/learning/status` から見えるようにする。
         """
         for mode, result in results.items():
             if result.final_fitness <= result.initial_fitness:
@@ -766,14 +813,62 @@ class LearningScheduler:
             except Exception as e:  # noqa: BLE001 — 個別 mode 失敗は警告して継続
                 logger.warning("Failed to save prompt for %s: %s", mode, e)
 
-        self._last_run = time.time()
-        self._level1_run_count += 1
-        self._save_state()
+        stats: dict[str, dict] = {
+            mode: {
+                "improved": result.final_fitness > result.initial_fitness,
+                "fitness_before": result.initial_fitness,
+                "fitness_after": result.final_fitness,
+            }
+            for mode, result in results.items()
+        }
+        if extra_results:
+            stats.update(extra_results)
+        self._level1_finalize(experiences or [], stats)
         archived_path = self.archive_active_session(session)
         logger.info(
             "Level 1 session completed and archived: %s", archived_path,
         )
         return archived_path
+
+    async def _run_extra_optimizations(
+        self,
+        experiences: list[dict],
+        llm_client,
+        results: dict[str, dict],
+        phase_durations: dict[str, float],
+    ) -> None:
+        """Level 1 追加最適化 (f_04 §4): prompt 進化以外の evolver 群を一括実行する
+
+        `_run_level1` (手動トリガー) と `run_or_resume_level1` (常駐ループ) の
+        両経路から共有される。各 phase は未注入コンポーネント・経験不足・
+        cancel を自身でガードして no-op する。
+        """
+        await self._level1_phase2_assist_prompt(
+            experiences, llm_client, results, phase_durations,
+        )
+        await self._level1_phase3_embed_instruction(
+            experiences, llm_client, results, phase_durations,
+        )
+        await self._level1_phase4_token_budget(
+            experiences, results, phase_durations,
+        )
+        self._level1_phase5_pattern_weights(
+            experiences, results, phase_durations,
+        )
+        self._level1_phase6_generation_params(
+            experiences, results, phase_durations,
+        )
+        self._level1_phase7_tool_routing(
+            experiences, results, phase_durations,
+        )
+        # Step 12 — PolicyEvolver 評価/書き戻し
+        self._step12_policy_evolver(
+            experiences, results, phase_durations,
+        )
+        # Step 14 — Few-shot プール GC
+        # finalize() 前に実行することで、yaml モードでは保存される
+        # fewshot_pool.json が GC 後の状態で書き出される。
+        self._step14_fewshot_gc(results, phase_durations)
 
     async def run_or_resume_level1(
         self,
@@ -785,9 +880,12 @@ class LearningScheduler:
         """Level 1 進化を新規実行 or SUSPENDED から再開する。
 
         `_schedule_level1_loop` から呼ばれるエントリポイント
-        本メソッドは prompt evolution 部分のみを Level1Session で管理する。
-        追加最適化（embed instruction / pattern weights / 等）は
-        既存の `_run_level1` 経路で扱う。
+        本メソッドは prompt evolution 部分を Level1Session で管理し、
+        全モード完了時に追加最適化 (`_run_extra_optimizations`: assist prompt /
+        embed instruction / token budget / pattern weights / generation params /
+        tool routing / policy evolver / fewshot GC) を続けて実行する。
+        yield された場合は prompt evolution の再開を優先し、追加最適化は
+        セッション完了まで持ち越す。
 
         Args:
             llm_client: 学習に使用する LLM クライアント
@@ -821,13 +919,20 @@ class LearningScheduler:
         success = False
         any_yielded = False
         results: dict = {}
+        extra_results: dict[str, dict] = {}
         try:
             self.reset_yield_event()
             self._running = True
-            # Level 1 tick 冒頭で feedback_pipe を実行し、品質ゲート結果を
-            # FewShotPool / 失敗クリティーク / policy fitness プロバイダへ還流する
-            await self._run_feedback_pipe()
             try:
+                # Level 1 tick 冒頭で feedback_pipe を実行し、品質ゲート結果を
+                # FewShotPool / 失敗クリティーク / policy fitness プロバイダへ還流する
+                await self._run_feedback_pipe()
+                # 進化前に経験から few-shot プールを補充する (f_04 §3)。
+                # resume 時は同一スナップショットの再投入になるが
+                # FewShotPool 側の多様性チェックが重複を弾く。
+                self._update_fewshot_pool_from_experiences(
+                    session.experience_snapshot,
+                )
                 # 進化対象は名前プレフィックス無しの raw 本文。get_prompt() の
                 # 出力 (プレフィックス付き) を渡すと進化後本文へ名前が焼き込まれ、
                 # ランタイムの二重付与で設定名が反映されなくなる (_collect_mode_prompt_texts と同じ契約)。
@@ -843,37 +948,55 @@ class LearningScheduler:
                     generations=self.generations,
                     population_size=self.population_size,
                     critique_synthesizer=self._critique_synthesizer,
-                    fewshot_pool=self._fewshot_pool,
                     session=session,
                     yield_check=self.should_yield,
                     save_session=self.save_active_session,
                 )
-            finally:
-                self._running = False
 
-            any_yielded = any(r.yielded for r in results.values())
-            if any_yielded:
-                # session は save_session 経由で最新状態が保存済み
-                logger.info(
-                    "Level 1 session yielded: id=%s completed_phases=%s",
-                    session.session_id, session.completed_phases,
+                any_yielded = any(r.yielded for r in results.values())
+                if any_yielded:
+                    # session は save_session 経由で最新状態が保存済み
+                    logger.info(
+                        "Level 1 session yielded: id=%s completed_phases=%s",
+                        session.session_id, session.completed_phases,
+                    )
+                    success = True
+                    return {
+                        "session_id": session.session_id,
+                        "yielded": True,
+                        "completed_phases": list(session.completed_phases),
+                        "modes": self._format_modes_summary(results),
+                    }
+
+                # 追加最適化 (f_04 §4)。prompt 進化の採用結果と session archive
+                # を失わないため、失敗しても警告のみで finalize へ進む。
+                phase_durations: dict[str, float] = {}
+                try:
+                    await self._run_extra_optimizations(
+                        session.experience_snapshot, llm_client,
+                        extra_results, phase_durations,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Level 1 extra optimizations failed: %s: %s",
+                        type(exc).__name__, exc,
+                    )
+
+                self._finalize_completed_level1(
+                    session, results,
+                    extra_results=extra_results,
+                    experiences=session.experience_snapshot,
                 )
                 success = True
                 return {
                     "session_id": session.session_id,
-                    "yielded": True,
+                    "yielded": False,
                     "completed_phases": list(session.completed_phases),
                     "modes": self._format_modes_summary(results),
+                    "extra_phases": sorted(extra_results.keys()),
                 }
-
-            self._finalize_completed_level1(session, results)
-            success = True
-            return {
-                "session_id": session.session_id,
-                "yielded": False,
-                "completed_phases": list(session.completed_phases),
-                "modes": self._format_modes_summary(results),
-            }
+            finally:
+                self._running = False
         finally:
             # outcome.jsonl への結末記録 (evolve 限定)
             dl = self._debug_logger
@@ -881,7 +1004,7 @@ class LearningScheduler:
                 duration_ms = (time.monotonic() - t0) * 1000
                 improved_count = sum(
                     1 for r in results.values()
-                    if hasattr(r, "improved") and getattr(r, "improved", False)
+                    if r.final_fitness > r.initial_fitness
                 )
                 dl.log_outcome(
                     kind="learning_cycle_l1",
@@ -894,6 +1017,7 @@ class LearningScheduler:
                         "yielded": any_yielded,
                         "completed_phases": len(session.completed_phases),
                         "modes_improved": improved_count,
+                        "extra_phases": sorted(extra_results.keys()),
                     },
                 )
             trace_id_var.reset(trace_token)
@@ -950,6 +1074,7 @@ class LearningScheduler:
                 "mode": e.mode,
                 "query": e.query,
                 "response_summary": e.response_summary,
+                "response_full": e.response_full,
                 "base_model": e.base_model,
                 "cartridge_ids": e.cartridge_ids,
                 "signals": asdict(e.signals),
@@ -1119,6 +1244,10 @@ class LearningScheduler:
         Returns:
             (triggered, message)
         """
+        if self._disabled:
+            # --no-learning 中は手動トリガーでも副作用 (プロンプト書戻し等) を起こさない。
+            return False, "learning disabled"
+
         if self._running:
             return False, "Learning cycle already running"
 
@@ -1205,32 +1334,9 @@ class LearningScheduler:
                     logger.info("Level 1 evolution was cancelled")
                 return results
 
-            await self._level1_phase2_assist_prompt(
+            await self._run_extra_optimizations(
                 experiences, llm_client, results, phase_durations,
             )
-            await self._level1_phase3_embed_instruction(
-                experiences, llm_client, results, phase_durations,
-            )
-            await self._level1_phase4_token_budget(
-                experiences, results, phase_durations,
-            )
-            self._level1_phase5_pattern_weights(
-                experiences, results, phase_durations,
-            )
-            self._level1_phase6_generation_params(
-                experiences, results, phase_durations,
-            )
-            self._level1_phase7_tool_routing(
-                experiences, results, phase_durations,
-            )
-            # Step 12 — PolicyEvolver 評価/書き戻し
-            self._step12_policy_evolver(
-                experiences, results, phase_durations,
-            )
-            # Step 14 — Few-shot プール GC
-            # finalize() 前に実行することで、yaml モードでは保存される
-            # fewshot_pool.json が GC 後の状態で書き出される。
-            self._step14_fewshot_gc(results, phase_durations)
 
             self._level1_finalize(experiences, results)
             elapsed = round(time.monotonic() - t0, 3)
@@ -1311,7 +1417,7 @@ class LearningScheduler:
         # 変異生成 LLM を解決（§7.1.3）
         base_mutator = self._resolve_mutator_client("base", llm_client)
         if base_mutator is not llm_client:
-            logger.info
+            logger.info("Resolved separate base mutator client for prompt evolution")
 
         tp = time.monotonic()
         # Step 11 で先行実行済みなら結果を再利用する
@@ -1325,7 +1431,6 @@ class LearningScheduler:
             generations=self.generations,
             population_size=self.population_size,
             critique_synthesizer=critique_for_phase1,
-            fewshot_pool=self._fewshot_pool,
         )
         phase_durations["phase1_base_prompt"] = round(time.monotonic() - tp, 3)
 
@@ -1345,7 +1450,6 @@ class LearningScheduler:
             "improved": improved,
             "fitness_before": evo_result.initial_fitness,
             "fitness_after": evo_result.final_fitness,
-            "fewshot_count": len(evo_result.best_candidate.fewshot_ids),
         }
 
         if not improved:
@@ -1355,31 +1459,17 @@ class LearningScheduler:
             )
             return
 
-        # Few-shot 例を PromptMeta.candidates に保存
-        fewshot_examples = self._build_fewshot_examples(mode, evo_result)
+        # instruction-only 進化: few-shot は推論時に select_top_k が動的選択するため
+        # candidates への焼き込みはしない (co-evolution 廃止)。
         self.prompt_manager.update_evolved(
             mode=mode,
             content=evo_result.best_candidate.text,
             fitness=evo_result.final_fitness,
-            fewshot_examples=fewshot_examples,
         )
         logger.info(
-            "Mode %s prompt evolved: fitness %.4f → %.4f (fewshot: %d)",
+            "Mode %s prompt evolved: fitness %.4f → %.4f",
             mode, evo_result.initial_fitness, evo_result.final_fitness,
-            len(evo_result.best_candidate.fewshot_ids),
         )
-
-    def _build_fewshot_examples(self, mode: str, evo_result) -> list[dict] | None:
-        """進化結果の fewshot_ids から PromptMeta.candidates 用の dict 一覧を構築"""
-        if self._fewshot_pool is None or not evo_result.best_candidate.fewshot_ids:
-            return None
-        examples = self._fewshot_pool.get_by_ids(
-            evo_result.best_candidate.fewshot_ids, mode,
-        )
-        return [
-            {"query": ex.query, "response": ex.response, "fitness": ex.fitness}
-            for ex in examples
-        ]
 
     async def _level1_phase2_assist_prompt(
         self,
@@ -1396,7 +1486,7 @@ class LearningScheduler:
 
         assist_experiences = self._get_filtered_assist_experiences()
         if not assist_experiences:
-            logger.info
+            logger.info("Level 1 assist prompt evolution skipped: no assist experiences")
             return
 
         logger.info(
@@ -1472,6 +1562,8 @@ class LearningScheduler:
         )
         if improved and evo_result.final_fitness > ADOPTION_THRESHOLD:
             self._save_embed_instruction(evo_result.best_candidate.text)
+            # 永続化に加えて稼働中の embedder へ即時反映 (再起動不要)。
+            self._apply_embed_instruction_runtime(evo_result.best_candidate.text)
             logger.info(
                 "Embed instruction evolved: fitness %.4f → %.4f",
                 evo_result.initial_fitness, evo_result.final_fitness,
@@ -1770,6 +1862,23 @@ class LearningScheduler:
 
     # ── エンベッド検索指示プロンプト I/O ──
 
+    def _apply_embed_instruction_runtime(self, text: str) -> None:
+        """採用 instruction を稼働中の embedder へ即時反映 + query キャッシュ clear。
+
+        instruction-aware embedder かつ ``set_instruction`` を実装する場合のみ。
+        進化器・eval が mode 非フィルタなため ``mode=None`` で全 mode に共通適用する。
+        非 instruction-aware モデル / embedder 未注入時は no-op (安全縮退)。
+        """
+        emb = self._embedder
+        if emb is None or not (
+            hasattr(emb, "supports_instructions")
+            and emb.supports_instructions()
+            and hasattr(emb, "set_instruction")
+        ):
+            return
+        emb.set_instruction(text, mode=None)
+        logger.info("Applied evolved embed instruction to live embedder")
+
     def _load_embed_instruction(self) -> str:
         """embed_instruction.md を読み込む（なければデフォルト生成）"""
         from backend.free.optimizer.embed_instruction_evolver import (
@@ -1814,10 +1923,16 @@ class LearningScheduler:
     # ── パターン重み進化 ──
 
     def _evolve_pattern_weights(self, experiences: list[dict]) -> dict | None:
-        """学習済みパターンの重みを経験バッファに基づいて進化させる
+        """correction パターンの重みを経験バッファに基づいて進化させる
 
-        訂正検出で使われたパターンの重みをブースト、
-        訂正なし応答のパターンの重みを微減衰させる。LLM 不要。
+        学習パターンが訂正を正しく検出できた経験ではマッチした correction
+        パターンをブーストし、訂正でない正常終了の経験で correction パターンが
+        ヒットした場合は誤検知とみなして減衰させる (誤検知し続ける弱パターンは
+        ``decay_one`` の min_weight 割れ削除で自然淘汰される)。対象は
+        ``category="correction"`` に限定する (category 未指定だと tool_routing /
+        long_form / rephrase で学習した語まで横断ヒットし無関係なパターンを
+        汚染する)。boost / decay 量は store の ``pattern_boost_amount`` /
+        ``pattern_decay_rate`` 設定に委ねる。LLM 不要。
 
         Returns:
             {"boosted": int, "decayed": int, "total": int} or None
@@ -1830,31 +1945,24 @@ class LearningScheduler:
             return None
 
         boosted = 0
+        decayed = 0
 
-        # 訂正があった経験のクエリからパターンをブースト
         for exp in experiences:
             signals = exp.get("signals", {})
-            if signals.get("correction_detected_by") == "learned":
-                query = exp.get("query", "")
-                matches = store.match(query)
-                for kw, _ in matches:
-                    key = kw.lower()
-                    if key in store.patterns:
-                        pattern = store.patterns[key]
-                        pattern.weight = min(1.0, pattern.weight + 0.05)
-                        boosted += 1
+            query = exp.get("query", "")
 
-            # 訂正なし・正常終了の経験ではパターン精度の信頼性が増す
+            if signals.get("correction_detected_by") == "learned":
+                # 学習パターンが訂正を正しく検出 → correction 検出器を強化
+                for kw, _ in store.match(query, category="correction"):
+                    store.boost(kw)
+                    boosted += 1
+
             elif signals.get("conversation_ended") and not signals.get("user_correction"):
-                # 正常終了した会話のクエリにマッチするパターンは有用
-                query = exp.get("query", "")
-                matches = store.match(query)
-                for kw, _ in matches:
-                    key = kw.lower()
-                    if key in store.patterns:
-                        pattern = store.patterns[key]
-                        pattern.weight = min(1.0, pattern.weight + 0.02)
-                        boosted += 1
+                # 訂正でない正常終了で correction パターンがヒット = 誤検知
+                # → 減衰させ、誤検知し続ける弱パターンは min_weight 割れで自然削除
+                for kw, _ in store.match(query, category="correction"):
+                    store.decay_one(kw)
+                    decayed += 1
 
         # 永続化
         try:
@@ -1866,11 +1974,12 @@ class LearningScheduler:
             logger.warning("Failed to save learned patterns after evolution: %s", e)
 
         logger.info(
-            "pattern evolution: boosted=%d, total=%d patterns",
-            boosted, store.count,
+            "pattern evolution: boosted=%d, decayed=%d, total=%d patterns",
+            boosted, decayed, store.count,
         )
         return {
             "boosted": boosted,
+            "decayed": decayed,
             "total": store.count,
         }
 
@@ -1930,8 +2039,8 @@ class LearningScheduler:
             resolver = get_path_resolver()
             patterns_file = resolver.resolve_local("learned_patterns_file")
             store.save(patterns_file)
-        except Exception as e:  # noqa: F841  (元から logger.warning が呼ばれていない既存 bug、本 PR スコープ外)
-            logger.warning
+        except Exception:
+            logger.warning("tool routing pattern persistence failed")
 
         logger.info(
             "tool routing evolution: boosted=%d, decayed=%d, added=%d, total=%d",
@@ -2095,12 +2204,13 @@ class LearningScheduler:
                 completion_rate = completed / total
                 score += 0.2 * completion_rate
 
-            # 効率シグナル（重み: 0.1）
+            # 効率シグナル（重み: 0.1）。budget_used_pct は 0-100 パーセント
+            # (producer orchestrator.py が *100 で出力) なので閾値もパーセントで判定する。
             budget_pct = signals.get("long_form_budget_used_pct")
             if budget_pct is not None:
-                if 0.5 <= budget_pct <= 0.9:
+                if 50.0 <= budget_pct <= 90.0:
                     score += 0.1  # 適切な使用率
-                elif budget_pct > 0.95:
+                elif budget_pct > 95.0:
                     score -= 0.1  # 予算超過
 
         return max(0.0, min(1.0, (score / len(experiences) + 1) / 2))
