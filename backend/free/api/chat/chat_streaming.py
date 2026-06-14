@@ -1577,6 +1577,33 @@ async def _retry_zero_tokens_deliberative(
     )
 
 
+def _maybe_cache_reactive_response(
+    sess_state: AppState,
+    query: str,
+    response: str,
+    *,
+    private: bool,
+    tool_command: str | None,
+    session_id: str,
+) -> None:
+    """deliberative / 軽量パス応答を ReactiveAgent キャッシュへ蓄積する。
+
+    再訪クエリ (5 分以内・同一文) を reactive 層が即応答できるようにする。
+    除外: private ターン / ツール使用応答 (時刻・環境依存で再利用不可) /
+    キャンセル済み (部分テキスト) / 空応答。
+    """
+    agent = getattr(sess_state, "reactive_agent", None)
+    if agent is None:
+        return
+    if private or tool_command is not None:
+        return
+    if _cancel_flags.get(session_id):
+        return
+    if not response or not response.strip():
+        return
+    agent.cache_response(query, response)
+
+
 async def _finalize_deliberative_stream(
     state: _DeliberativeStreamState,
     sess_state: AppState,
@@ -1612,6 +1639,10 @@ async def _finalize_deliberative_stream(
         rag_used=rag_used,
         rag_top1_score=rag_top1_score,
     )
+    _maybe_cache_reactive_response(
+        sess_state, query, state.full_response,
+        private=private, tool_command=state.tool_command, session_id=session_id,
+    )
     _emit_timing(sess_state, timer, "deliberative", state.tokens_generated)
     ti = make_token_info(
         messages, state.tokens_generated, context_size, instance_name,
@@ -1632,6 +1663,7 @@ async def stream_deliberative(
     rag_used: bool = False,
     rag_top1_score: float | None = None,
     tool_judge_task: "asyncio.Task | None" = None,
+    escalated_from: str | None = None,
 ):
     """Deliberative 層の SSE ストリーミング
 
@@ -1648,6 +1680,9 @@ async def stream_deliberative(
         # (asyncio.CancelledError) 時も finally で確実に emit するため、
         # finalize 完了まで到達した場合のみ True にする。
         outcome_success = False
+        # genuine error (except Exception) と client cancel
+        # (CancelledError/GeneratorExit; except を素通り) を区別する。
+        errored = False
 
         try:
             yield sse.agent_layer("deliberative")
@@ -1677,6 +1712,7 @@ async def stream_deliberative(
                 generation_params=generation_params,
                 tool_capture=tool_capture,
                 tool_judge_task=tool_judge_task,
+                session_id=session_id,
             )
             stream_state.tool_command = tool_capture.get("command")
             stream_state.tool_command_name = tool_capture.get("command_name")
@@ -1706,6 +1742,7 @@ async def stream_deliberative(
             outcome_success = True
 
         except Exception as e:
+            errored = True
             logger.error("Deliberative stream error: %s", e)
             if timer:
                 timer.stop("llm_total_ms")
@@ -1723,12 +1760,19 @@ async def stream_deliberative(
             dl = getattr(state, "debug_logger", None)
             if dl is not None:
                 elapsed_ms = (time.monotonic() - t_start) * 1000
+                signals: dict = {"agent_layer": "deliberative"}
+                if escalated_from:
+                    signals["escalated_from"] = escalated_from
+                # success=False かつ genuine error でない = client cancel。
+                # evolve fitness がユーザーキャンセルを失敗計上しないよう区別する。
+                if not outcome_success and not errored:
+                    signals["cancelled"] = True
                 dl.log_outcome(
                     kind="chat_response",
                     success=outcome_success,
                     duration_ms=elapsed_ms,
                     tokens_out=stream_state.tokens_generated,
-                    quality_signals={"agent_layer": "deliberative"},
+                    quality_signals=signals,
                 )
 
 
@@ -1744,8 +1788,9 @@ async def sync_deliberative(
     rag_used: bool = False,
     rag_top1_score: float | None = None,
     tool_judge_task: "asyncio.Task | None" = None,
+    escalated_from: str | None = None,
 ) -> ChatResponse:
-    """Deliberative 層の非ストリーミング応答"""
+    """Deliberative 層の非ストリーミング応答 (escalated_from は API 一貫性用、未使用)"""
     logger.debug("Sync deliberative: session=%s, messages=%d", session_id, len(messages))
     try:
         # Trigger A: LLM 生成開始直後に sleep-time Light を並列実行（§8.1）
@@ -1765,6 +1810,7 @@ async def sync_deliberative(
             max_tokens=max_tokens,
             generation_params=generation_params,
             tool_judge_task=tool_judge_task,
+            session_id=session_id,
         )
 
         if timer:
@@ -1781,6 +1827,10 @@ async def sync_deliberative(
             tool_routing_success=resp.tool_command_success is True,
             rag_used=rag_used,
             rag_top1_score=rag_top1_score,
+        )
+        _maybe_cache_reactive_response(
+            state, query, resp.content,
+            private=private, tool_command=resp.tool_command, session_id=session_id,
         )
 
         _emit_timing(state, timer, "deliberative", estimated_tokens)
@@ -1803,3 +1853,182 @@ async def sync_deliberative(
         # 正常経路では process() 内で await 済み (done) のため no-op。
         if tool_judge_task is not None and not tool_judge_task.done():
             tool_judge_task.cancel()
+
+
+def _apply_generation_params(gen_kwargs: dict, generation_params: "GenerationParams | None") -> None:
+    """モード別生成パラメータを client.generate の kwargs へ転写する。"""
+    if not generation_params:
+        return
+    for k in ("temperature", "top_p", "top_k", "presence_penalty", "repetition_penalty"):
+        if k in generation_params:
+            gen_kwargs[k] = generation_params[k]
+
+
+async def stream_reactive_light(
+    query: str,
+    messages: list[dict],
+    client: LocalClient,
+    state: AppState,
+    session_id: str,
+    instance_name: str,
+    context_size: int,
+    *,
+    mode: str = "chat",
+    max_tokens: int | None = None,
+    generation_params: "GenerationParams | None" = None,
+    timer: "StageTimer | None" = None,
+    private: bool = False,
+):
+    """Reactive 軽量パス: few-shot/RAG/semmem/tool なしの最小プロンプトで base 1 ターン。
+
+    agent.process を介さず client.generate を直接叩き、deliberative のストリーミング
+    ヘルパー (フィルタ / 0トークンリトライ / timing / cache) を再利用する。
+    SSE 上の agent_layer は "reactive"。
+    """
+    async with cancel_scope(session_id):
+        stream_state = _DeliberativeStreamState()
+        t_start = time.monotonic()
+        outcome_success = False
+        errored = False
+        try:
+            yield sse.agent_layer("reactive")
+
+            scheduler = state.sleep_scheduler
+            if scheduler:
+                scheduler.on_llm_start()
+
+            if timer:
+                timer.start("llm_total_ms")
+                timer.start("llm_first_token_ms")
+
+            gen_kwargs: dict = {"stream": True, "id_slot": client.chat_slot}
+            if max_tokens is not None:
+                gen_kwargs["max_tokens"] = max_tokens
+            _apply_generation_params(gen_kwargs, generation_params)
+            token_stream = await client.generate(list(messages), **gen_kwargs)
+
+            async for frame in _stream_filtered_token_pipeline(
+                token_stream, stream_state, session_id, timer,
+            ):
+                yield frame
+
+            async for frame in _retry_zero_tokens_deliberative(
+                stream_state, messages, client, max_tokens, session_id,
+            ):
+                yield frame
+
+            if timer:
+                timer.stop("llm_total_ms")
+            record_response(
+                state, stream_state.full_response, messages, session_id,
+                query, mode, stream_state.tokens_generated,
+                private=private,
+                rag_used=False,
+            )
+            _maybe_cache_reactive_response(
+                state, query, stream_state.full_response,
+                private=private, tool_command=None, session_id=session_id,
+            )
+            _emit_timing(state, timer, "reactive", stream_state.tokens_generated)
+            ti = make_token_info(
+                messages, stream_state.tokens_generated, context_size, instance_name,
+            )
+            yield sse.token_info(ti)
+            yield sse.done()
+            outcome_success = True
+
+        except Exception as e:
+            errored = True
+            logger.error("Reactive-light stream error: %s", e)
+            if timer:
+                timer.stop("llm_total_ms")
+            _emit_timing(state, timer, "reactive", 0)
+            yield sse.error(str(e))
+            yield sse.done()
+        finally:
+            dl = getattr(state, "debug_logger", None)
+            if dl is not None:
+                elapsed_ms = (time.monotonic() - t_start) * 1000
+                signals: dict = {"agent_layer": "reactive", "reactive_light": True}
+                # success=False かつ genuine error でない = client cancel。
+                if not outcome_success and not errored:
+                    signals["cancelled"] = True
+                dl.log_outcome(
+                    kind="chat_response",
+                    success=outcome_success,
+                    duration_ms=elapsed_ms,
+                    tokens_out=stream_state.tokens_generated,
+                    quality_signals=signals,
+                )
+
+
+async def sync_reactive_light(
+    query: str,
+    messages: list[dict],
+    client: LocalClient,
+    state: AppState,
+    session_id: str,
+    instance_name: str,
+    context_size: int,
+    *,
+    mode: str = "chat",
+    max_tokens: int | None = None,
+    generation_params: "GenerationParams | None" = None,
+    timer: "StageTimer | None" = None,
+    private: bool = False,
+) -> ChatResponse:
+    """Reactive 軽量パスの非ストリーミング応答。"""
+    from backend.free.llm.utils import extract_content
+
+    t_start = time.monotonic()
+    try:
+        scheduler = state.sleep_scheduler
+        if scheduler:
+            scheduler.on_llm_start()
+
+        if timer:
+            timer.start("llm_total_ms")
+        gen_kwargs: dict = {"stream": False, "id_slot": client.chat_slot}
+        if max_tokens is not None:
+            gen_kwargs["max_tokens"] = max_tokens
+        _apply_generation_params(gen_kwargs, generation_params)
+        data = await client.generate(list(messages), **gen_kwargs)
+        content = extract_content(data) if isinstance(data, dict) else str(data)
+        if timer:
+            timer.stop("llm_total_ms")
+
+        estimated_tokens = max(1, _estimate_tokens(content))
+        record_response(
+            state, content, messages, session_id,
+            query, mode, estimated_tokens,
+            private=private,
+            rag_used=False,
+        )
+        _maybe_cache_reactive_response(
+            state, query, content,
+            private=private, tool_command=None, session_id=session_id,
+        )
+        _emit_timing(state, timer, "reactive", estimated_tokens)
+
+        dl = getattr(state, "debug_logger", None)
+        if dl is not None:
+            dl.log_outcome(
+                kind="chat_response",
+                success=True,
+                duration_ms=(time.monotonic() - t_start) * 1000,
+                tokens_out=estimated_tokens,
+                quality_signals={"agent_layer": "reactive", "reactive_light": True},
+            )
+
+        token_info_dict = make_token_info(
+            messages, estimated_tokens, context_size, instance_name,
+        )
+        return ChatResponse(
+            response=content,
+            token_info=TokenInfo(**token_info_dict),
+            session_id=session_id,
+            agent_layer="reactive",
+        )
+    except Exception as e:
+        logger.error("Reactive-light sync error: %s", e)
+        raise HTTPException(status_code=503, detail=str(e))

@@ -267,6 +267,10 @@ _EXECUTABLE_COMMAND_SYNTH_SYSTEM_PROMPT = """\
 
 ## rationale
 1 行で判定理由を述べる (UI 非表示、ログ用)。
+
+## 出力形式
+JSON は **1 行のコンパクト形式** (改行・余分な空白なし) で出力する。
+grammar 非強制モデルでも余計な空白で token を浪費して切り詰められないようにする。
 """
 
 
@@ -1092,7 +1096,10 @@ class ToolCallJudge:
 
         result = await self._assist_client.generate(
             messages,
-            max_tokens=128,
+            # 256: E4B 等 json_schema grammar 非強制モデルが空白パディング JSON
+            # を返すと 128 token では閉じ括弧前に finish_reason=length で切れる。
+            # executable_command_synth (256) / conflict_chat_judge (192) と整合。
+            max_tokens=256,
             temperature=0.1,
             purpose="tool_judgment",
         )
@@ -1756,7 +1763,9 @@ _DEFAULT_SYSTEM_PROMPT = """\
 - ユーザー自身が行う宣言（「探してみるね」「自分で調べる」等の一人称の意思表明）→ 依頼ではないためツール不要 (tool="")
 
 ## 出力形式
-必ず JSON オブジェクトで出力してください:
+必ず JSON オブジェクトで出力してください (**1 行のコンパクト形式**、改行・余分な空白なし):
 - ツールが必要: {"tool": "ツール名", "args": {"引数名": "値"}}
 - ツールが不要: {"tool": "", "args": {}}
+
+grammar 非強制モデルでも余計な空白で token を浪費し切り詰められないよう、空白は最小化する。
 """

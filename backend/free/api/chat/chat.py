@@ -13,6 +13,7 @@ from backend.free.api.chat.chat_constants import (
     DEFAULT_KEEPALIVE_INTERVAL_SEC, DEFAULT_MAX_TOKENS,
     MAX_FILE_CONTEXT_TOTAL_CHARS, MAX_FILE_CONTEXT_TOTAL_CHUNKS,
     MAX_MESSAGE_LENGTH,
+    REACTIVE_LIGHT_HISTORY_TURNS, REACTIVE_LIGHT_MAX_TOKENS,
     SESSION_ID_MAX_LENGTH, SESSION_ID_MIN_LENGTH,
 )
 from backend.free.api.schemas import (
@@ -24,6 +25,7 @@ from backend.free.api.chat.chat_recorder import record_response
 from backend.free.api.chat.chat_service import (
     ConflictTurnContext,
     SearchPipelineResult,
+    _render_conflict_section,
     build_chat_messages, build_semmem_injection, convert_file_contexts,
     ensure_base_model_health,
     ensure_llm_client, maybe_resolve_pending_conflicts, prepare_memory_context,
@@ -34,7 +36,8 @@ from backend.free.api.chat.chat_streaming import (
     rag_signals_from_chunks,
     read_existing_for_append,
     stream_deliberative, stream_long_form, stream_meta_cognitive, stream_reactive,
-    sync_deliberative, sync_long_form, sync_meta_cognitive,
+    stream_reactive_light,
+    sync_deliberative, sync_long_form, sync_meta_cognitive, sync_reactive_light,
 )
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.agent.deliberative import DeliberativeAgent
@@ -159,16 +162,33 @@ def _llm_unavailable_response(stream: bool) -> StreamingResponse:
 
 
 def _resolve_system_prompt(
-    state: AppState, mode: str, instance_name: str, query: str | None = None,
+    state: AppState, mode: str, instance_name: str,
 ) -> str:
-    """システムプロンプトを取得（PromptManager 未設定時はフォールバック）。
+    """静的システムプロンプトを取得（PromptManager 未設定時はフォールバック）。
 
-    ``query`` を渡すと PromptManager 内で query 類似の動的 few-shot 選択に使われる。
+    query 非依存 (few-shot を含まない) なので連続リクエスト間で安定し、
+    llama-server の prefix KV キャッシュが効く。few-shot は
+    ``_resolve_fewshot_block`` で別途取得し最後の user メッセージへ前置する。
     """
     prompt_mgr = state.prompt_manager
     if prompt_mgr:
-        return prompt_mgr.get_prompt(mode, query=query)
+        get_static = getattr(prompt_mgr, "get_prompt_static", None)
+        if get_static is not None:
+            return get_static(mode)
+        # 後方互換: get_prompt_static 未実装の Mock 等は query なし get_prompt へ縮退
+        return prompt_mgr.get_prompt(mode)
     return f"You are {instance_name}, a helpful AI assistant."
+
+
+def _resolve_fewshot_block(state: AppState, mode: str, query: str | None) -> str:
+    """query 依存の few-shot ブロックを取得 ("" = 無し / PromptManager 未設定)。"""
+    prompt_mgr = state.prompt_manager
+    if prompt_mgr is None:
+        return ""
+    get_block = getattr(prompt_mgr, "get_fewshot_block", None)
+    if get_block is None:
+        return ""
+    return get_block(mode, query)
 
 
 def _try_reactive_layer(
@@ -179,7 +199,9 @@ def _try_reactive_layer(
     context_size: int,
 ) -> StreamingResponse | ChatResponse | None:
     """Reactive 層でのパターンマッチ即応答。マッチしなければ None。"""
-    reactive_agent = ReactiveAgent()
+    # 常駐インスタンスを使う (LRU キャッシュをセッション跨ぎで温める)。
+    # 未配線環境 (テスト等) では新規生成にフォールバック。
+    reactive_agent = state.reactive_agent or ReactiveAgent()
     reactive_resp = reactive_agent.process(req.message)
     if reactive_resp is None:
         return None
@@ -202,6 +224,111 @@ def _try_reactive_layer(
         session_id=session_id,
         agent_layer="reactive",
     )
+
+
+async def _completed(value):
+    """既知の値を返す done タスク化用コルーチン (judge 結果を deliberative へ流用)。"""
+    return value
+
+
+def _log_layer_escalation(state: AppState, *, chosen: str, reason: str) -> None:
+    """reactive→light/deliberative の分岐を decision.jsonl へ記録 (evolve レベル限定)。"""
+    dl = getattr(state, "debug_logger", None)
+    if dl is None:
+        return
+    dl.log_decision(
+        decision_point="layer_escalation",
+        chosen=chosen,
+        candidates=["reactive_rule", "reactive_light", "deliberative"],
+        reason=reason,
+        scope="request",
+    )
+
+
+async def _gate_reactive_light(
+    req: ChatRequest,
+    state: AppState,
+    cfg: dict,
+    history: list,
+    judge_task: "asyncio.Task | None",
+) -> tuple[str, "asyncio.Task | None", str]:
+    """reactive ルール miss 後、軽量パス採否を判定する。
+
+    Returns ``(decision, judge_task, reason)``:
+      - decision: ``"light"`` (base 1 ターン軽量パス) | ``"deliberative"`` (エスカレート)
+      - judge_task: deliberative へ流用する done 済み判定タスク (light / None もありうる)
+      - reason: log_decision / ログ用の英語識別子
+    """
+    if not cfg.get("agent", {}).get("reactive_light_enabled", True):
+        return "deliberative", judge_task, "light_disabled"
+    # 添付ファイルを無視した軽量応答は品質事故 → deliberative
+    if getattr(req, "file_contexts", None):
+        return "deliberative", judge_task, "file_context"
+    if state.tool_call_judge is None or state.tools_registry is None:
+        return "deliberative", judge_task, "judge_unavailable"
+
+    try:
+        if judge_task is not None:
+            judgement = await judge_task  # 投機起動済み (並列構成)、残り時間のみ待つ
+        else:
+            judgement = await state.tool_call_judge.judge(  # 直列構成で直接実行
+                req.message, state.tools_registry, req.mode, history,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("reactive-light judge failed, escalating: %s", exc)
+        return "deliberative", judge_task, "judge_error"
+
+    if judgement is not None and judgement.tool_needed:
+        # deliberative へ流用 (直列構成なら done タスク化して再 judge を防ぐ)
+        if judge_task is None:
+            judge_task = asyncio.create_task(_completed(judgement))
+        return "deliberative", judge_task, "tool_needed"
+    return "light", judge_task, "judge_no_tool"
+
+
+async def _dispatch_reactive_light(
+    req: ChatRequest,
+    client,
+    state: AppState,
+    gen_params: dict,
+    history: list,
+    session_id: str,
+    instance_name: str,
+    context_size: int,
+    max_tokens: int | None,
+    timer: StageTimer,
+    conflict_notice: str | None = None,
+) -> "StreamingResponse | ChatResponse":
+    """Reactive 軽量パス dispatch: 静的 system + 履歴末尾で base 1 ターン (few-shot/RAG/semmem なし)。
+
+    ``conflict_notice`` が指定された場合のみ、記憶の競合セクション
+    (解決通知・確認指示) を system プロンプトに連結して surface する。
+    deliberative の build_semmem_injection と同じ注入機構だが、軽量パスを
+    維持したまま通知を出すための最小注入。
+    """
+    system_prompt = _resolve_system_prompt(state, req.mode, instance_name)
+    if conflict_notice:
+        system_prompt = f"{system_prompt}\n\n{conflict_notice}"
+    light_messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    light_messages.extend(history[-REACTIVE_LIGHT_HISTORY_TURNS:])
+    light_max = min(max_tokens or REACTIVE_LIGHT_MAX_TOKENS, REACTIVE_LIGHT_MAX_TOKENS)
+    if req.stream:
+        return StreamingResponse(
+            _with_chat_in_flight(client, stream_reactive_light(
+                req.message, light_messages, client, state, session_id,
+                instance_name, context_size,
+                mode=req.mode, max_tokens=light_max,
+                generation_params=gen_params, timer=timer, private=req.private,
+            )),
+            media_type="text/event-stream",
+        )
+    async with client.chat_in_flight():
+        return await sync_reactive_light(
+            req.message, light_messages, client, state, session_id,
+            instance_name, context_size,
+            mode=req.mode, max_tokens=light_max,
+            generation_params=gen_params, timer=timer, private=req.private,
+        )
 
 
 def _realtime_parallel_enabled(state: AppState) -> bool:
@@ -253,13 +380,17 @@ async def _build_messages_with_search(
     editor_route: str | None = None,
     conflict_ctx: ConflictTurnContext | None = None,
     search_task: "asyncio.Task | None" = None,
+    fewshot_block: str | None = None,
 ) -> tuple[list, StreamWrapper, str | None, list[tuple[str, float, str]] | None]:
     """統合検索を実行し ``messages`` / SSE 通知ラッパ / semmem ブロック / 取得済み
     scored_chunks を構築する。``scored_chunks`` は long_form 経路が orchestrator に
     再利用注入するために返す (非 long_form 経路は ``messages`` 側で消費するため未使用)。
 
     ``search_task`` が渡された場合は chat() が先行起動した検索タスクを await して
-    回収する (conflict 判定 / tool 判定との並走)。None の場合はここで直列実行する。"""
+    回収する (conflict 判定 / tool 判定との並走)。None の場合はここで直列実行する。
+
+    ``system_prompt`` は静的 (query 非依存)、``fewshot_block`` 等の query 依存部は
+    build_messages 内で最後の user メッセージへ前置される (KV キャッシュ対応)。"""
     if search_task is not None:
         try:
             search_result = await search_task
@@ -293,6 +424,7 @@ async def _build_messages_with_search(
         rag_scored_chunks=scored_chunks,
         salience_ranker=salience_ranker,
         semmem_block=semmem_block,
+        fewshot_block=fewshot_block,
     )
 
     sse_notify = SSEFrameBuilder()
@@ -695,17 +827,20 @@ async def _dispatch_deliberative(
     rag_used: bool = False,
     rag_top1_score: float | None = None,
     tool_judge_task: "asyncio.Task | None" = None,
+    escalated_from: str | None = None,
 ) -> StreamingResponse | ChatResponse:
     """Deliberative 経路: ツール判定 + LLM 推論。
 
     ``tool_judge_task`` が渡された場合は chat() が先行起動した tool 判定タスクを
-    再利用する (process() 内で await)。None の場合は process() が判定を直列実行。"""
+    再利用する (process() 内で await)。None の場合は process() が判定を直列実行。
+    ``escalated_from`` は reactive からエスカレートした場合の出自 (outcome 観測用)。"""
     delib_agent = DeliberativeAgent(
         config=cfg,
         tool_judge=state.tool_call_judge,
         tools_registry=state.tools_registry,
         assist_client=state.assist_client,
         assist_experience_recorder=state.assist_experience_recorder,
+        agent_tracer=state.agent_tracer,
     )
 
     if req.stream:
@@ -721,6 +856,7 @@ async def _dispatch_deliberative(
                 rag_used=rag_used,
                 rag_top1_score=rag_top1_score,
                 tool_judge_task=tool_judge_task,
+                escalated_from=escalated_from,
             ))),
             media_type="text/event-stream",
         )
@@ -736,6 +872,7 @@ async def _dispatch_deliberative(
             rag_used=rag_used,
             rag_top1_score=rag_top1_score,
             tool_judge_task=tool_judge_task,
+            escalated_from=escalated_from,
         )
 
 
@@ -768,9 +905,10 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
 
     history, session_id = await prepare_memory_context(req, state)
     file_contexts = convert_file_contexts(req)
-    system_prompt = _resolve_system_prompt(
-        state, req.mode, instance_name, query=req.message,
-    )
+    # system は静的 (query 非依存) に保ち KV キャッシュを効かせる。query 依存の
+    # few-shot は動的ブロックとして最後の user メッセージへ前置する (build_messages)。
+    system_prompt = _resolve_system_prompt(state, req.mode, instance_name)
+    fewshot_block = _resolve_fewshot_block(state, req.mode, req.message)
 
     # classify は conflict 結果に依存しない (req.message のみ) ため先に確定し、
     # 並列モードでの投機タスク (tool 判定 / 検索) 起動のゲートに使う。
@@ -833,16 +971,21 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 allow_write=not req.private, session_id=session_id,
             )
 
-        # pending / 解決済み競合がある場合、reactive 早期 return では競合セクション
-        # (build_semmem_injection 経由) が注入されず、解決通知・確認指示が両方
-        # ドロップされる。deliberative へエスカレートして必ず surface させる。
+        # reactive→deliberative エスカレート時に Level 0 経験記録の出自を残す。
+        escalated_from: str | None = None
+
+        # pending / 解決済み競合がある場合、競合セクション (解決通知・確認指示) を
+        # 必ず surface する必要がある。従来は full deliberative へ昇格していたが、
+        # 雑談返信でも 32-140s かかる。通知ブロックを軽量パス (reactive_light) の
+        # プロンプトへ差し込めば、同じ base 生成機構で surface しつつ重経路を回避
+        # できる (注入機構は deliberative と同一: プロンプト連結 + base 生成。
+        # むしろ短いプロンプトで通知が目立つ)。rule-instant の canned 応答だけは
+        # 通知を運べないため、競合時はスキップして必ず LLM ターンを経由させる。
+        conflict_notice: str | None = None
         if agent_layer == "reactive" and (
             conflict_ctx.pending_groups or conflict_ctx.resolved is not None
         ):
-            agent_layer = "deliberative"
-            logger.info(
-                "Reactive escalated to deliberative due to pending/resolved memory conflict",
-            )
+            conflict_notice = _render_conflict_section(state, cfg, conflict_ctx)
 
         if agent_layer == "reactive":
             # URL recall プリチェック: 過去会話で fetch 済みの URL fact が
@@ -865,22 +1008,53 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                     recall_judgement = None
                 if recall_judgement is not None and recall_judgement.tool_needed:
                     agent_layer = "deliberative"
+                    escalated_from = "reactive"
+                    _log_layer_escalation(state, chosen="deliberative", reason="url_recall_hit")
                     logger.info(
                         "Reactive escalated to deliberative due to URL recall hit: %s",
                         req.message[:80],
                     )
 
         if agent_layer == "reactive":
-            reactive_response = _try_reactive_layer(
-                req, state, session_id, instance_name, context_size,
+            # 競合通知がある場合は canned 即応答 (挨拶/日時/キャッシュ) では通知を
+            # 運べないため rule-instant をスキップし、必ず LLM ターン経由で surface する。
+            reactive_response = (
+                None if conflict_notice
+                else _try_reactive_layer(
+                    req, state, session_id, instance_name, context_size,
+                )
             )
             if reactive_response is not None:
-                # reactive 即応答は検索/tool 判定結果を使わない。投機タスクを破棄。
+                # reactive 即応答 (挨拶/日時/キャッシュ) は検索/tool 判定結果を
+                # 使わない。投機タスクを破棄。
                 _cancel_pending_task(judge_task)
                 _cancel_pending_task(search_task)
                 return reactive_response
+
+            # ルールベース miss → 軽量パス gating。tool 判定 (judge) で tool 不要
+            # なら base 1 ターンの軽量パス、tool 必要なら deliberative へエスカレート。
+            decision, judge_task, gate_reason = await _gate_reactive_light(
+                req, state, cfg, history, judge_task,
+            )
+            if decision == "light":
+                # 軽量パスは検索を使わない。judge_task も tool 不要なので破棄。
+                _cancel_pending_task(judge_task)
+                _cancel_pending_task(search_task)
+                _log_layer_escalation(
+                    state, chosen="reactive_light",
+                    reason="conflict_notice" if conflict_notice else gate_reason,
+                )
+                return await _dispatch_reactive_light(
+                    req, client, state, gen_params, history,
+                    session_id, instance_name, context_size, max_tokens, timer,
+                    conflict_notice=conflict_notice,
+                )
+            # deliberative へエスカレート (judge_task は tool 実行用に流用される)。
+            # 競合通知は conflict_ctx 経由で build_semmem_injection が surface する。
             agent_layer = "deliberative"
-            logger.info("Reactive returned None, escalating to deliberative")
+            escalated_from = "reactive"
+            _log_layer_escalation(state, chosen="deliberative", reason=gate_reason)
+            logger.info("Reactive escalated to deliberative (%s)", gate_reason)
 
         # coding モードのみ生成コードの出力先を決定する。
         # - 出力先パス明示 → "file" (従来どおり write_file でディスクへ)
@@ -906,6 +1080,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 editor_route=editor_route,
                 conflict_ctx=conflict_ctx,
                 search_task=search_task,
+                fewshot_block=fewshot_block,
             )
         )
 
@@ -931,9 +1106,13 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             case "meta_cognitive":
                 # meta は task 記述単位で judge するため query 単位の precomputed は
                 # 流用不可 (judge_task は通常 None)。念のため破棄する。
+                # meta 経路は messages を生成に使わず system_prompt + history から
+                # 再構築するため、従来の get_prompt(mode, query) と同一になるよう
+                # static system に few-shot を結合して渡す (挙動同等)。
                 _cancel_pending_task(judge_task)
                 return await _dispatch_meta_cognitive(
-                    req, client, state, cfg, gen_params, system_prompt, history,
+                    req, client, state, cfg, gen_params,
+                    system_prompt + fewshot_block, history,
                     session_id, instance_name, context_size,
                     messages, search_error_wrapper, timer,
                     semmem_block=semmem_block,
@@ -951,6 +1130,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                     rag_used=rag_used,
                     rag_top1_score=rag_top1_score,
                     tool_judge_task=judge_task,
+                    escalated_from=escalated_from,
                 )
     except BaseException:
         # 例外が伝播する経路 (build/dispatch 等) で未消費の投機タスクが残らない

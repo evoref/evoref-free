@@ -581,8 +581,13 @@ def build_chat_messages(
     rag_scored_chunks: list[tuple[str, float, str]] | None = None,
     salience_ranker=None,
     semmem_block: str | None = None,
+    fewshot_block: str | None = None,
 ) -> list[dict]:
-    """messages 組み立て（build_messages で file_contexts・メモリ・RAG・履歴を統合）"""
+    """messages 組み立て（build_messages で few-shot・file・メモリ・RAG・履歴を統合）。
+
+    ``system_prompt`` は静的 (query 非依存)、``fewshot_block`` 等の query 依存部は
+    build_messages 内で最後の user メッセージへ前置される (KV キャッシュ対応)。
+    """
     messages = build_messages(
         system_prompt, history,
         rag_chunks=rag_chunks,
@@ -592,6 +597,7 @@ def build_chat_messages(
         rag_scored_chunks=rag_scored_chunks,
         salience_ranker=salience_ranker,
         semmem_block=semmem_block,
+        fewshot_block=fewshot_block,
     )
     logger.debug("Messages assembled: %d messages for LLM", len(messages))
     return messages

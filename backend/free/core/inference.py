@@ -21,6 +21,15 @@ logger = get_logger("core.inference")
 _RAG_HEADER = "以下の参考情報を踏まえて回答してください:\n\n"
 _FILES_HEADER = "以下のファイルがコンテキストとして提供されています:\n\n"
 
+# 動的コンテキストブロックと生クエリの境界に挟む固定文。
+# few-shot 例 / 参考情報をユーザー発言と混同させないための区切り。固定文字列
+# なのでターン内の prefix divergence (KV キャッシュ) には影響しない (どうせ tail)。
+_DYNAMIC_CONTEXT_DELIMITER = (
+    "\n\n---\n"
+    "上記はシステムが用意した参考情報・応答例です。"
+    "以下のユーザーの発言にのみ回答してください。\n\n"
+)
+
 
 def _build_file_section(fc: dict) -> str:
     """単一の file_context エントリを 1 セクション文字列へ整形する。"""
@@ -186,6 +195,49 @@ def _select_semmem_block(
     return labeled, remaining - cost
 
 
+def _select_fewshot_block(
+    fewshot_block: str | None,
+    remaining: int,
+) -> tuple[str | None, int]:
+    """few-shot ブロックを予算内なら採用する (全采否、部分切り出しなし)。
+
+    ``format_fewshot_section`` の出力は先頭に改行を含むため lstrip して返す
+    (動的ブロックの先頭要素になるため)。
+    """
+    if not fewshot_block or remaining <= 0:
+        return None, remaining
+    block = fewshot_block.lstrip("\n")
+    if not block:
+        return None, remaining
+    cost = _estimate_tokens(block)
+    if cost > remaining:
+        logger.debug(
+            "fewshot block dropped (%d tokens > remaining %d)", cost, remaining,
+        )
+        return None, remaining
+    logger.debug("fewshot block injected: %d tokens", cost)
+    return block, remaining - cost
+
+
+def _prepend_dynamic_block(trimmed: list[dict], dyn_text: str) -> bool:
+    """trimmed の最後の user メッセージ content 先頭に動的ブロックを前置する。
+
+    最後の user メッセージを **新しい dict で置換** する (入力要素は mutate しない。
+    ``_trim_history`` が返す未圧縮ターンは history の dict 参照を共有するため)。
+    動的ブロックは ``dyn_text + デリミタ + 元 content`` の順で、生クエリは末尾に残る
+    (deliberative のツール結果はさらにその後ろへ追記されるため両立)。
+
+    user メッセージが見つからなければ ``False`` を返す (呼び出し側が system へ fallback)。
+    """
+    for i in range(len(trimmed) - 1, -1, -1):
+        if trimmed[i].get("role") == "user":
+            original = trimmed[i].get("content", "")
+            new_content = dyn_text + _DYNAMIC_CONTEXT_DELIMITER + original
+            trimmed[i] = {**trimmed[i], "content": new_content}
+            return True
+    return False
+
+
 def build_messages(
     system_prompt: str,
     history: list[dict],
@@ -197,6 +249,7 @@ def build_messages(
     rag_scored_chunks: list[tuple[str, float, str]] | None = None,
     salience_ranker: SalienceRanker | None = None,
     semmem_block: str | None = None,
+    fewshot_block: str | None = None,
 ) -> list[dict]:
     """
     messages リストを組み立て、トークン予算内に収める。
@@ -205,17 +258,19 @@ def build_messages(
     ここではロール・内容の組み立てのみを担う。
 
     予算 = context_size - generation_reserve から
-    system → file_contexts → rag_chunks → history の優先順で配分。
+    system → fewshot → file_contexts → semmem → rag_chunks → history の優先順で配分。
 
     サリエンスランカーが指定されている場合、RAG チャンクを5因子スコアで
     再評価し、トークン予算内で情報量を最大化するチャンク集合を選別する。
 
-    多くの LLM テンプレート（Qwen3.5 等）は system メッセージが
-    先頭に 1 つだけであることを要求するため、system_prompt / file_contexts /
-    rag_chunks をすべて単一の system メッセージに結合して返す。
+    **KV キャッシュ対応レイアウト**: system メッセージは ``system_prompt`` のみ
+    (query 非依存・静的) とし、query 依存の動的部 (few-shot / file / semmem / RAG)
+    は最後の user メッセージの content 先頭に前置する。これにより llama-server の
+    prefix KV キャッシュが ``system + 過去履歴`` の範囲で再利用され、再プリフィルは
+    最後の user ターンのみに限定される。gemma 系の「system は先頭 1 個」制約は維持。
 
     Args:
-        system_prompt: インスタンス名プレフィックス付きのシステムプロンプト。
+        system_prompt: インスタンス名プレフィックス付きの静的システムプロンプト。
         file_contexts: ファイルコンテキストのリスト。
             各要素は {"filename": str, "chunks": list[str]} の辞書。
         context_size: コンテキストウィンドウサイズ（トークン数）。
@@ -223,13 +278,14 @@ def build_messages(
         rag_scored_chunks: スコア付き検索結果 [(chunk_id, score, text), ...]。
             salience_ranker と同時に指定した場合、rag_chunks より優先される。
         salience_ranker: BudgetMem 式サリエンスランカー。
+        fewshot_block: ``format_fewshot_section`` 整形済みの few-shot ブロック
+            (query 依存)。動的ブロックの先頭に置く。``None`` / 空なら付与しない。
     """
     generation_reserve = max_tokens if max_tokens is not None else DEFAULT_GENERATION_RESERVE
     budget = context_size - generation_reserve
     total_rag = len(rag_chunks) if rag_chunks else 0
     total_fc = len(file_contexts) if file_contexts else 0
 
-    sys_parts: list[str] = [system_prompt]
     sys_tokens = _estimate_tokens(system_prompt)
     remaining = budget - sys_tokens
 
@@ -241,33 +297,50 @@ def build_messages(
         total_rag, total_fc,
     )
 
+    # 動的ブロック (query 依存) を優先順に積む。system には含めない。
+    dyn_parts: list[str] = []
+
+    # 1. few-shot 例（query 依存、動的ブロック先頭）
+    fewshot_part, remaining = _select_fewshot_block(fewshot_block, remaining)
+    if fewshot_part:
+        dyn_parts.append(fewshot_part)
+
     # 2. ファイルコンテキスト（ユーザー明示 → RAG より優先）
     fc_block, remaining, injected_fc = _inject_file_contexts(
         file_contexts, remaining, total_fc,
     )
     if fc_block:
-        sys_parts.append(fc_block)
+        dyn_parts.append(fc_block)
 
     # 2.5 セマンティックメモリ注入（MemoryInjector、RAG より優先）
     semmem_part, remaining = _select_semmem_block(semmem_block, remaining)
     if semmem_part:
-        sys_parts.append(semmem_part)
+        dyn_parts.append(semmem_part)
 
     # 3. RAG チャンク（サリエンス優先 → フォールバック）
     rag_block, remaining, injected_rag = _select_rag_block(
         rag_chunks, rag_scored_chunks, salience_ranker, remaining, total_rag,
     )
     if rag_block:
-        sys_parts.append(rag_block)
+        dyn_parts.append(rag_block)
 
-    # 単一 system メッセージへ結合
-    messages: list[dict] = [
-        {"role": "system", "content": "\n\n".join(sys_parts)}
-    ]
+    # 静的 system メッセージ (動的部は含めない)
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
 
     # 4. 会話履歴（残余予算と working_max_tokens の小さい方で管理）
     history_budget = max(0, min(remaining, working_max_tokens))
     trimmed = _trim_history(history, history_budget)
+
+    # 5. 動的ブロックを最後の user メッセージ先頭へ前置 (KV キャッシュ対応)。
+    #    user ターンが無い場合のみ従来どおり system へ結合して情報を落とさない。
+    if dyn_parts:
+        dyn_text = "\n\n".join(dyn_parts)
+        if not _prepend_dynamic_block(trimmed, dyn_text):
+            messages[0] = {
+                "role": "system",
+                "content": system_prompt + "\n\n" + dyn_text,
+            }
+
     messages.extend(trimmed)
 
     logger.debug(

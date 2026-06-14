@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from backend.free.agent.file_manager import SessionFileManager
     from backend.free.agent.learned_patterns import LearnedPatternStore
     from backend.free.agent.prompt_manager import SystemPromptManager
+    from backend.free.agent.reactive import ReactiveAgent
     from backend.free.agent.tool_call_judge import ToolCallJudge
     from backend.free.agent.tools_registry import ToolsRegistry
     from backend.free.learning.scheduler import LearningScheduler
@@ -153,6 +154,9 @@ class AppState:
     learned_patterns_store: LearnedPatternStore | None = None
     tools_registry: ToolsRegistry | None = None
     tool_call_judge: ToolCallJudge | None = None
+    # Reactive 層 (挨拶/日時/キャッシュ即応) の常駐インスタンス。リクエスト毎に
+    # 生成すると LRU キャッシュが温まらないため AppState に保持する。
+    reactive_agent: "ReactiveAgent | None" = None
     agent_tracer: AgentTracer | None = None
 
     # ── スケジューラ ──

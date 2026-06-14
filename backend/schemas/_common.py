@@ -194,6 +194,10 @@ class AgentConfig(BaseModel):
     tool_judge_enabled: bool = True
     meta_cognitive_enabled: bool = True
     meta_cognitive_min_budget: int = Field(default=512, ge=0)
+    # reactive 分類クエリがルールベース即応 (挨拶/日時/キャッシュ) に該当しない場合、
+    # tool 判定 (assist judge) で tool 不要と判定されたら base 1 ターンの軽量パスで
+    # 応答する。tool 必要なら deliberative へエスカレート。False で常に deliberative。
+    reactive_light_enabled: bool = True
     # tool_judge_enabled=True (coding mode 等) で 4 層フォールバックが全て
     # no-tool を返した際、assist (executable_command_synth) で環境依存事実
     # クエリを判定し run_command に橋渡しする 5 層目のゲート。

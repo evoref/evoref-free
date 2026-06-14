@@ -421,8 +421,15 @@ class VectorStore:
         category: str = "document",
         embedding_model: str = "",
         embedding_backend: str = "",
+        has_context: bool = False,
     ) -> list[str]:
-        """ベクトル（float32）を受け取り、int8 量子化して追加"""
+        """ベクトル（float32）を受け取り、int8 量子化して追加
+
+        has_context=True は「コンテキストプレフィックス生成の対象外」を表す。
+        自己完結したチャンク（memory ノート等）は prefix を付けても価値が薄く、
+        Step 5.8 (contextual) の source text 探索を空振りさせるだけのため、
+        最初から has_context=True で登録し未処理スキャンから除外する。
+        """
         if len(vectors) != len(chunks):
             raise ValueError("vectors and chunks must have the same length")
 
@@ -465,6 +472,8 @@ class VectorStore:
                 "category": category,
                 "tokens": max(1, len(chunk) // 2),
             }
+            if has_context:
+                meta_entry["has_context"] = True
             if embedding_model:
                 meta_entry["embedding_model"] = embedding_model
             if embedding_backend:
