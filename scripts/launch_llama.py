@@ -555,6 +555,14 @@ def build_llama_cmd(
     if cache_type_v and cache_type_v != "f16":
         cmd += ["--cache-type-v", str(cache_type_v)]
 
+    # 共通 prefix 自動再利用（0 は無効）。多ターン chat で system/RAG 接頭辞の
+    # KV を再 prefill せず再利用する。assist 側 build_assist_cmd と同じ扱い。
+    # 注: SWA モデル (gemma-4 等) では llama.cpp が cache_reuse を自動無効化する
+    # ため no-op (フラグ付与は無害)。非 SWA base のみ実効。
+    cache_reuse = lc.get("cache_reuse", 0)
+    if cache_reuse and int(cache_reuse) > 0:
+        cmd += ["--cache-reuse", str(int(cache_reuse))]
+
     # idle slot offload。base は agentic ワークロード前提で
     # 既定 4096 MiB の RAM 退避バッファを確保する。slots>1 のときは
     # ``--cache-ram`` が動作するよう ``--kv-unified`` を自動付与する。
@@ -586,7 +594,7 @@ def build_llama_cmd(
         base_model_path,
         fixed_flags={
             "-m", "--port", "-c", "-ngl", "-b", "-t", "-fa", "--mlock",
-            "-np", "--cache-type-k", "--cache-type-v", "--cache-ram",
+            "-np", "--cache-type-k", "--cache-type-v", "--cache-reuse", "--cache-ram",
             "--kv-unified", "--lora", "--reasoning-budget", "--reasoning-budget-message",
             "--control-vector", "--control-vector-scaled", "--control-vector-layer-range",
         },

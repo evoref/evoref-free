@@ -16,7 +16,7 @@ logger = get_logger("agent.reactive")
 class ReactiveResponse:
     """Reactive 層の応答"""
     content: str
-    source: str  # "pattern" | "cache" | "rag" | "memory"
+    source: str  # "pattern" | "datetime" | "cache"
     elapsed_ms: float = 0.0
 
 
@@ -86,16 +86,11 @@ class ReactiveAgent:
     def __init__(self, cache_max_size: int = 100, cache_ttl_sec: int = 300):
         self.cache = ResponseCache(max_size=cache_max_size, ttl_sec=cache_ttl_sec)
 
-    def process(
-        self,
-        query: str,
-        rag_results: list[tuple[str, float, str]] | None = None,
-        memory_context: list[dict] | None = None,
-    ) -> ReactiveResponse | None:
-        """Reactive 層で応答を試みる
+    def process(self, query: str) -> ReactiveResponse | None:
+        """Reactive 層で応答を試みる (ルールベース + キャッシュのみ、LLM ゼロ)。
 
         Returns:
-            ReactiveResponse: 応答できた場合
+            ReactiveResponse: 応答できた場合 (挨拶パターン / 日時クエリ / キャッシュ命中)
             None: 応答できない場合（上位層にエスカレーション）
         """
         start = time.perf_counter()
@@ -118,24 +113,14 @@ class ReactiveAgent:
                 content=dt_response, source="datetime", elapsed_ms=elapsed,
             )
 
-        # 2. キャッシュ検索
+        # 2. キャッシュ検索 (上位層の応答を cache_response() で蓄積したもの)
         cached = self.cache.get(self._cache_key(query))
         if cached is not None:
             elapsed = (time.perf_counter() - start) * 1000
             logger.info("Cache hit: %.1fms", elapsed)
             return ReactiveResponse(content=cached, source="cache", elapsed_ms=elapsed)
 
-        # 3. 高スコア RAG ヒット（score > 0.8）→ 直接応答
-        if rag_results:
-            top_score = rag_results[0][1]
-            if top_score > 0.8:
-                content = rag_results[0][2]
-                elapsed = (time.perf_counter() - start) * 1000
-                self.cache.put(self._cache_key(query), content)
-                logger.info("High-score RAG hit (%.2f): %.1fms", top_score, elapsed)
-                return ReactiveResponse(content=content, source="rag", elapsed_ms=elapsed)
-
-        # Reactive 層では対応不可
+        # Reactive 層 (ルールベース) では対応不可 → 上位層へエスカレート
         return None
 
     def cache_response(self, query: str, response: str) -> None:

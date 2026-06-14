@@ -130,6 +130,7 @@ class DeliberativeAgent:
         tools_registry=None,
         assist_client=None,
         assist_experience_recorder=None,
+        agent_tracer=None,
     ):
         self.config = config or {}
         self.reminder_system = EventReminderSystem(self.config)
@@ -140,6 +141,11 @@ class DeliberativeAgent:
         # assist 由来ツール判定の実行成否を assist 経験へ記録する closure。
         # Pro/Develop 起動時のみ非 None (factory 層が注入)。None なら記録 no-op。
         self._assist_experience_recorder = assist_experience_recorder
+        # MDP トレース。develop モード時のみ非 None (factory 層が注入)。
+        # deliberative の tool 判定/実行を 1 step エピソードとして記録し、
+        # sleep-time Step 7.5 が episodic LTM へ取込 → Level 1 agent ドメインの
+        # 学習信号にする (これが無いと agent ドメインは skipped_no_signal)。
+        self._agent_tracer = agent_tracer
 
         # コンテンツ生成用の max_tokens
         ctx_size = resolve_context_size(self.config, "base")
@@ -317,6 +323,7 @@ class DeliberativeAgent:
         generation_params: GenerationParams | None = None,
         tool_capture: dict | None = None,
         tool_judge_task: "asyncio.Task | None" = None,
+        session_id: str = "",
     ) -> DeliberativeResponse | AsyncIterator[str]:
         """Deliberative 層で LLM 推論を実行
 
@@ -348,6 +355,13 @@ class DeliberativeAgent:
         ) = await self._judge_and_execute_tool(
             query, mode, conversation, messages, llm_client, state, on_step,
             tool_judge_task=tool_judge_task,
+        )
+
+        # MDP トレース: tool 判定/実行を 1 step エピソードとして記録する。
+        # ``_judge_and_execute_tool`` は stream 返却前に完了済みのため、ここで
+        # begin→step→end を同期完結できる (生成は応答であり agent action ではない)。
+        self._trace_tool_episode(
+            session_id, mode, query, tool_name_used, tool_result_text, tool_success,
         )
 
         # streaming 経路は DeliberativeResponse を返さないため、command を
@@ -390,6 +404,42 @@ class DeliberativeAgent:
             tool_command=tool_command, tool_command_success=tool_success,
             generation_params=generation_params,
         )
+
+    def _trace_tool_episode(
+        self,
+        session_id: str,
+        mode: str,
+        query: str,
+        tool_name: str | None,
+        tool_result: str | None,
+        tool_success: bool | None,
+    ) -> None:
+        """deliberative の tool 実行を 1 step MDP エピソードとして記録する。
+
+        tracer 未注入 (通常起動) / session_id 空 / tool 未実行なら no-op。
+        tool を実行したターンのみを記録対象とし、no_tool ルーティング signal は
+        record_response の tool_routing_success (経験記録) 側に委ねて episodic LTM
+        の膨張を避ける。reward は tool 実行成否。
+        """
+        tracer = self._agent_tracer
+        if tracer is None or not session_id or tool_result is None:
+            return
+        from backend.free.agent.agent_tracer import MDPStep
+
+        reward = 1.0 if tool_success else 0.0
+        try:
+            episode_id = tracer.begin_episode(session_id, mode)
+            tracer.record_step(episode_id, MDPStep(
+                step_index=0,
+                state={"query": query[:200], "agent_layer": "deliberative"},
+                action=tool_name or "tool",
+                observation=tool_result[:200],
+                reward=reward,
+            ))
+            tracer.end_episode(episode_id, "success" if tool_success else "partial")
+            tracer.cleanup_episode(episode_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("deliberative MDP trace failed (continuing): %s", exc)
 
     async def _sync_response(
         self,

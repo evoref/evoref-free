@@ -1181,10 +1181,11 @@ def _init_tools(
     assist_prompt_mgr: "AssistPromptManager",
     embedder: "EmbeddingBackend | None" = None,
 ) -> None:
-    """7j. ToolsRegistry + ToolCallJudge 初期化（3層エージェントディスパッチ用）"""
+    """7j. ToolsRegistry + ToolCallJudge + ReactiveAgent 初期化（3層エージェントディスパッチ用）"""
     from backend.free.agent.tools_registry import ToolsRegistry
     from backend.free.agent.tools.builtin import register_builtin_tools
     from backend.free.agent.tool_call_judge import ToolCallJudge
+    from backend.free.agent.reactive import ReactiveAgent
     from backend.free.history.history_manager import get_history_manager
 
     tools_reg = ToolsRegistry()
@@ -1233,6 +1234,11 @@ def _init_tools(
     )
     state.tool_call_judge = tool_judge
     logger.info("ToolCallJudge initialized: enabled=%s", tool_judge.enabled)
+
+    # Reactive 層を常駐化 (リクエスト毎生成だと LRU キャッシュが温まらない)。
+    # 既定 cache (100 件 / TTL 300s) のまま。LLM 非依存なので構築コストはほぼゼロ。
+    state.reactive_agent = ReactiveAgent()
+    logger.info("ReactiveAgent initialized (resident)")
 
 
 def _init_agent_tracer(state: AppState, debug_logger: "DebugLogger") -> None:

@@ -100,6 +100,14 @@ class LlamaConfig(BaseModel):
     cache_type_v: str = Field(
         default="q8_0", pattern=r"^(f16|bf16|q8_0|q5_1|q5_0|q4_1|q4_0)$"
     )
+    # 共通 prefix 自動再利用 (上流 ``--cache-reuse``)。0=無効。N>0 で N トークン
+    # 以上の連続接頭辞一致を再 prefill せず KV を再利用する。多ターン chat で
+    # system/RAG 接頭辞の prefill コストを削減する用途。
+    # ⚠️ SWA (sliding window attention) モデル (gemma-4 等) では llama.cpp が
+    # ``cache_reuse is not supported by this context`` で自動無効化し、毎ターン
+    # full re-prefill するため **no-op** (フラグは無害に無視される)。非 SWA base
+    # に差し替えた場合のみ有効。AssistModelLocalConfig.cache_reuse と同型。
+    cache_reuse: int = Field(default=0, ge=0)
     max_tokens: int = Field(default=1024, ge=0)  # 0=無制限
     lora_target: str = "auto"
     # None = 未指定 (arch プロファイルの reasoning.enable_thinking / 能力判定で決定。

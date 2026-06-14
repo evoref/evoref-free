@@ -136,6 +136,8 @@ llama:
                                   #   q4_1: q4_0より高品質, q4_0: 最大圧縮（品質モデル依存）
                                   #   ※ K は V より量子化に敏感。K: q8_0 / V: q4_1 の非対称設定も有効
   cache_type_v: q8_0              # --cache-type-v / KV value 量子化（選択肢は cache_type_k と同一）
+  cache_reuse: 256                # --cache-reuse / 共通 prefix 自動再利用（0=無効）。多ターン chat の prefill コスト削減。
+                                  #   ⚠️ SWA モデル（gemma-4 等）では llama.cpp が自動無効化し no-op（毎ターン full re-prefill）。非 SWA base のみ有効
   max_tokens: 1024                # チャット応答の最大トークン数（0=無制限、暴走防止に設定推奨）
   lora_target: auto               # LoRA ターゲット自動判定: auto | "q_proj,v_proj" | "linear_proj" 等（Pro 専用）
   enable_thinking: false          # 思考トークン制御。true/false=明示（プロファイルを上書き）
@@ -773,6 +775,7 @@ agent:
   tool_judge_enabled: true               # ツール判定。アシスト接続時はモード非依存で常時有効。false で明示オプトアウト（アシスト未接続時は本値に関わらず無効）
   meta_cognitive_enabled: true           # Meta-Cognitive 層（計画+多段推論+ツールループ）の有効/無効
   meta_cognitive_min_budget: 512         # Meta-Cognitive 発動に必要な最小ループ予算（トークン数）
+  reactive_light_enabled: true           # reactive 分類かつルール即応に該当しないクエリを、tool 判定で tool 不要なら base 1 ターンの軽量パスで応答（false で常に deliberative）
   executable_command_fallback_enabled: true   # 4 層判定が全て no-tool の時、assist で環境依存事実クエリを run_command に橋渡しする 5 層目（false で無効化）
   executable_command_fallback_min_chars: 5    # 5 層目 assist 呼出をスキップするクエリ長閾値（これ未満は呼ばない）
   # ── コンテンツ生成タイムアウト (Meta-Cognitive 層) ──

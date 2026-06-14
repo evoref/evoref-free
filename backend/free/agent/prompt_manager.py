@@ -231,24 +231,37 @@ class SystemPromptManager:
             else:
                 self._create_default(mode)
 
-    def get_prompt(self, mode: str, query: str | None = None) -> str:
-        """推論時: メモリ上の本文にインスタンス名 + Few-shot 例を付与して返す。
+    def get_prompt_static(self, mode: str) -> str:
+        """インスタンス名プレフィックス + 本文のみ (few-shot を含まない静的 system)。
 
-        ``query`` と selector が両方あれば query 類似で動的に few-shot を選ぶ
-        (主経路)。無ければ進化が凍結した ``meta.candidates`` にフォールバック
-        (後方互換)。
+        query 非依存なので連続リクエスト間で安定し、llama-server の prefix KV
+        キャッシュが効く。few-shot は ``get_fewshot_block`` で別途取得し、推論時に
+        最後の user メッセージへ前置する (build_messages 側)。
         """
         if mode not in self.contents:
             raise ValueError(f"Unknown mode: {mode}")
         locale = self._get_prompt_locale(mode)
         template = _PREFIX_TEMPLATES.get(locale, _PREFIX_TEMPLATES["ja"])
         prefix = template.format(name=self.instance_name)
-        base = prefix + self.contents[mode]
+        return prefix + self.contents[mode]
 
+    def get_fewshot_block(self, mode: str, query: str | None = None) -> str:
+        """query 依存の Few-shot 例を整形済みブロックで返す ("" = 無し)。
+
+        ``query`` と selector が両方あれば query 類似で動的選択 (主経路)、無ければ
+        進化が凍結した ``meta.candidates`` にフォールバック (後方互換)。
+        """
         examples = self._resolve_fewshot(mode, query)
-        if examples:
-            base += format_fewshot_section(examples)
-        return base
+        return format_fewshot_section(examples) if examples else ""
+
+    def get_prompt(self, mode: str, query: str | None = None) -> str:
+        """推論時: 静的 system + Few-shot 例を結合して返す (後方互換 API)。
+
+        KV キャッシュ対応のチャット経路は ``get_prompt_static`` /
+        ``get_fewshot_block`` を個別に使う。本メソッドは meta_cognitive 経路や
+        表示 API 等、両者を結合した従来形が必要な呼び出し向けに残す。
+        """
+        return self.get_prompt_static(mode) + self.get_fewshot_block(mode, query)
 
     def _resolve_fewshot(
         self, mode: str, query: str | None,

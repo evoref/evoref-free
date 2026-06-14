@@ -60,11 +60,15 @@ class LongTermMemory:
             return None
 
         vec = note.embedding.reshape(1, -1)
+        # memory ノートは自己完結したチャンクで contextual prefix の価値が薄く、
+        # source text も保存しないため has_context=True で登録し、sleep-time
+        # Step 5.8 の「source text not found」空振りスキャンから除外する。
         chunk_ids = self.vectors.add_vectors(
             vec,
             [note.content],
             source=f"memory:{note.session_id}",
             category="memory",
+            has_context=True,
         )
 
         chunk_id = chunk_ids[0]
