@@ -53,10 +53,12 @@ class AssistModelLocalConfig(BaseModel):
         default=None, pattern=r"^(f16|bf16|q8_0|q5_1|q5_0|q4_1|q4_0)$"
     )
     cache_reuse: int = Field(default=0, ge=0)
-    # idle slot offload。アシストは purpose 別セマフォで
-    # 多重化されるため slots>1 運用時に ``--kv-unified`` が自動付与される。
+    # idle slot offload (host RAM 退避)。cache_ram_mib: -1=無制限 / 0=disable /
+    # >0=MiB 上限。kv-unified とは独立 (RAM 退避の要否のみを制御)。
     cache_ram_mib: int = Field(default=2048, ge=-1)
     cache_idle_slots: bool = True
+    # null=auto (slots>1 で ``--kv-unified`` 自動付与。per-seq context が
+    # n_ctx/slots に半減するのを防ぐ) / true|false で明示上書き。
     kv_unified: bool | None = None
     # 起動時に ``-rea`` / ``--reasoning-budget`` / ``--reasoning-budget-message``
     # を付与し、リクエストごとに ``chat_template_kwargs.enable_thinking=false``

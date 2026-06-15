@@ -168,6 +168,11 @@ class EvolutionResult:
     initial_fitness: float = 0.0
     final_fitness: float = 0.0
     yielded: bool = False  # 協調 yield により途中終了したか
+    # LLM 変異 (mutation) の試行/失敗回数。``learning_cycle_l1`` の outcome が
+    # 「変異が systemic に失敗して何も学習できていない」ことを「改善なし (収束)」と
+    # 区別できるよう、サーキットブレーカー集計を結果へ伝播する。
+    mutation_attempts: int = 0
+    mutation_failures: int = 0
 
 
 class PromptEvolver:
@@ -871,6 +876,8 @@ class PromptEvolver:
             initial_fitness=initial_fitness,
             final_fitness=best.fitness,
             yielded=yielded,
+            mutation_attempts=cb.total_attempts,
+            mutation_failures=cb.total_failures,
         )
 
     @staticmethod

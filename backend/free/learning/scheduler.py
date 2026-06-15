@@ -44,6 +44,52 @@ if TYPE_CHECKING:
 logger = get_logger("learning.scheduler")
 
 
+# 変異 (prompt mutation) が systemic に失敗したと判定する失敗率閾値。
+# この比率以上の変異が失敗し、かつ採用改善が 0 の場合、learning_cycle_l1 の
+# success を True と偽らない (ReadTimeout 等で実質何も学習できていないため。
+# 一方、変異は成功したが改善が無い「健全な収束」は success=True を維持する)。
+_MUTATION_DEGRADED_RATE = 0.5
+
+
+def _aggregate_mutation_health(results: dict) -> tuple[int, int]:
+    """Level 1 結果集合から変異 (mutation) の総試行/総失敗回数を集計する。
+
+    ``results`` の値は ``EvolutionResult`` (run_or_resume_level1) か結果 dict
+    (_run_level1 の phase 別 dict) のいずれか。変異統計を持たない phase
+    (assist/embed/extra) は 0 として扱う。``(attempts, failures)`` を返す。
+    """
+    attempts = 0
+    failures = 0
+    for r in results.values():
+        if isinstance(r, dict):
+            attempts += int(r.get("mutation_attempts", 0) or 0)
+            failures += int(r.get("mutation_failures", 0) or 0)
+        else:
+            attempts += int(getattr(r, "mutation_attempts", 0) or 0)
+            failures += int(getattr(r, "mutation_failures", 0) or 0)
+    return attempts, failures
+
+
+def _mutation_health_signals(results: dict, improved_count: int) -> tuple[bool, dict]:
+    """変異の失敗状況から degraded 判定と outcome 用シグナルを返す。
+
+    Returns:
+        ``(mutations_degraded, signals)``。``mutations_degraded`` は
+        「変異が systemic に失敗し、かつ改善が 0」のとき ``True``。``signals`` は
+        ``quality_signals`` に合流させる観測値 dict。
+    """
+    attempts, failures = _aggregate_mutation_health(results)
+    rate = (failures / attempts) if attempts else 0.0
+    degraded = attempts > 0 and rate >= _MUTATION_DEGRADED_RATE and improved_count == 0
+    signals = {
+        "mutation_attempts": attempts,
+        "mutation_failures": failures,
+        "mutation_failure_rate": round(rate, 3),
+        "mutations_degraded": degraded,
+    }
+    return degraded, signals
+
+
 class _CachedCritiqueProxy:
     """1 Level 1 run 内で ``CritiqueResult`` を再利用するための薄いプロキシ。
 
@@ -1006,9 +1052,14 @@ class LearningScheduler:
                     1 for r in results.values()
                     if r.final_fitness > r.initial_fitness
                 )
+                # 変異が systemic に失敗して実質何も学習できていない場合は
+                # success を True と偽らない (健全な収束 = 改善なしとは区別する)。
+                mutations_degraded, mutation_signals = _mutation_health_signals(
+                    results, improved_count,
+                )
                 dl.log_outcome(
                     kind="learning_cycle_l1",
-                    success=success,
+                    success=success and not mutations_degraded,
                     duration_ms=duration_ms,
                     quality_signals={
                         "entry": "run_or_resume_level1",
@@ -1018,6 +1069,7 @@ class LearningScheduler:
                         "completed_phases": len(session.completed_phases),
                         "modes_improved": improved_count,
                         "extra_phases": sorted(extra_results.keys()),
+                        **mutation_signals,
                     },
                 )
             trace_id_var.reset(trace_token)
@@ -1361,9 +1413,14 @@ class LearningScheduler:
                     1 for r in results.values()
                     if isinstance(r, dict) and r.get("improved") is True
                 )
+                # 変異が systemic に失敗して実質何も学習できていない場合は
+                # success を True と偽らない (健全な収束 = 改善なしとは区別する)。
+                mutations_degraded, mutation_signals = _mutation_health_signals(
+                    results, improved_count,
+                )
                 dl.log_outcome(
                     kind="learning_cycle_l1",
-                    success=success and not cancelled,
+                    success=success and not cancelled and not mutations_degraded,
                     duration_ms=duration_ms,
                     quality_signals={
                         "entry": "_run_level1",
@@ -1371,6 +1428,7 @@ class LearningScheduler:
                         "phases_completed": len(results),
                         "phases_improved": improved_count,
                         "cancelled": cancelled,
+                        **mutation_signals,
                     },
                 )
             trace_id_var.reset(trace_token)
@@ -1450,6 +1508,8 @@ class LearningScheduler:
             "improved": improved,
             "fitness_before": evo_result.initial_fitness,
             "fitness_after": evo_result.final_fitness,
+            "mutation_attempts": getattr(evo_result, "mutation_attempts", 0),
+            "mutation_failures": getattr(evo_result, "mutation_failures", 0),
         }
 
         if not improved:

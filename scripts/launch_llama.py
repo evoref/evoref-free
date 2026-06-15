@@ -143,24 +143,28 @@ def _resolve_cache_idle_slots(section_cfg: dict, default: bool = True) -> bool:
     return bool(value)
 
 
-def _resolve_kv_unified(
-    section_cfg: dict, slots: int, cache_ram_mib: int,
-) -> bool:
+def _resolve_kv_unified(section_cfg: dict, slots: int) -> bool:
     """``kv_unified`` の解決
 
     上流挙動:
       - ``-np 1`` (slots 自動 / 単一 slot): unified KV cache がデフォルト ON
       - ``-np >1`` (明示複数 slot): デフォルトで非 unified 配置 (slot 毎に
-        独立 KV cell プール) になり、``--cache-ram`` の idle slot offload が
-        動作しない
+        独立 KV cell プール) になり、(a) ``--cache-ram`` の idle slot offload が
+        動作せず、(b) per-seq context が ``n_ctx / n_parallel`` に分割される
+        (``-c 8192 -np 2`` なら各 slot 4096 に半減)
 
-    したがって ``cache_ram_mib > 0 AND slots > 1`` の場合は ``--kv-unified``
-    を自動付与する (auto)。``kv_unified`` を ``true``/``false`` で明示指定
-    した場合は auto 判定を上書きしてその値をそのまま尊重する。
+    したがって ``slots > 1`` の場合は ``--kv-unified`` を自動付与する。unified KV
+    は multi-slot でも VRAM を増やさずに各シーケンスへ full ``n_ctx`` を与え
+    (総 KV セル数は同じ)、かつ ``--cache-ram`` の動作前提でもある。``kv_unified``
+    を ``true``/``false`` で明示指定した場合は auto 判定を上書きして尊重する。
+
+    NOTE: 旧実装は auto 条件を ``cache_ram_mib > 0 AND slots > 1`` としていたが、
+    ``cache_ram_mib: 0`` + ``slots > 1`` (例: assist) で per-seq context が黙って
+    半減する footgun があったため、cache-ram から切り離した。
     """
     explicit = section_cfg.get("kv_unified")
     if explicit is None:
-        return cache_ram_mib > 0 and slots > 1
+        return slots > 1
     return bool(explicit)
 
 
@@ -181,15 +185,13 @@ def _append_cache_ram_args(
 
 
 def _append_kv_unified_args(
-    cmd: list[str], section_cfg: dict, *, slots: int, default_mib: int,
+    cmd: list[str], section_cfg: dict, *, slots: int,
 ) -> None:
     """``--kv-unified`` を必要に応じて ``cmd`` に追加する
 
-    ``cache_ram_mib > 0 AND slots > 1`` の場合に自動付与する。``kv_unified``
-    を明示指定した場合は auto 判定を上書きする。
+    ``slots > 1`` の場合に自動付与する (``kv_unified`` の明示指定で上書き可)。
     """
-    cache_ram_mib = _resolve_cache_ram_mib(section_cfg, default=default_mib)
-    if _resolve_kv_unified(section_cfg, slots=slots, cache_ram_mib=cache_ram_mib):
+    if _resolve_kv_unified(section_cfg, slots=slots):
         cmd += ["--kv-unified"]
 
 
@@ -567,7 +569,7 @@ def build_llama_cmd(
     # 既定 4096 MiB の RAM 退避バッファを確保する。slots>1 のときは
     # ``--cache-ram`` が動作するよう ``--kv-unified`` を自動付与する。
     _append_cache_ram_args(cmd, lc, default_mib=4096)
-    _append_kv_unified_args(cmd, lc, slots=int(slots), default_mib=4096)
+    _append_kv_unified_args(cmd, lc, slots=int(slots))
 
     # self-speculative decoding。Pro 限定機能。Free 判定では
     # ``enabled=true`` でも warning + フラグ未付与で素通りさせる。
@@ -785,7 +787,7 @@ def build_assist_cmd(
     # アシストモデルは purpose 別セマフォで多重化されるため slots>1 で
     # 運用するケースもあり、その場合 ``--kv-unified`` を自動付与する。
     _append_cache_ram_args(cmd, local_cfg, default_mib=2048)
-    _append_kv_unified_args(cmd, local_cfg, slots=int(slots), default_mib=2048)
+    _append_kv_unified_args(cmd, local_cfg, slots=int(slots))
 
     # reasoning OS-fence。thinking モデルをアシスト用途で
     # 使う場合の token 浪費を起動時点で抑止する。リクエスト側の

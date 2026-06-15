@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import json
 import time
+from pathlib import Path
 from typing import Literal
 
 import httpx
@@ -287,6 +288,63 @@ def resolve_priority(purpose: str) -> Priority:
     return _PURPOSE_PRIORITY_MAP.get(purpose, _DEFAULT_PRIORITY)
 
 
+# ── purpose 別 timeout の反応的自己較正 ───────────────────────────────
+# モデル切替後、``PURPOSE_TIMEOUT_DEFAULTS`` が新モデル (特に低速 iGPU 上の
+# アシスト) のレイテンシに合わず ReadTimeout を頻発させる問題への対処。
+# ``generate()`` で timeout を観測する度に当該 purpose の timeout 天井を
+# ``_CALIB_BUMP_FACTOR`` 倍ずつ引き上げ、base (DEFAULTS) の
+# ``_CALIB_MAX_SCALE`` 倍を上限とする。引き上げ値はアシストモデル名でキー化して
+# ``local/assist_calibration.json`` に永続化し、次回起動時に同一モデルなら
+# 再利用する (別モデルに戻した場合は適用しない)。config の
+# ``assist_model.timeouts[purpose]`` が明示された purpose はユーザー権威として
+# 較正対象外 (clobber しない)。
+#
+# per-attempt timeout を引き上げるため、background / learning では総ウォール
+# クロック ≈ ``per_attempt * MAX_ATTEMPTS + backoff`` になる点を踏まえ
+# ``_CALIB_MAX_SCALE`` は控えめ (3.0 = 3 attempt で実質 ~9x 上限) に留める。
+_CALIB_BUMP_FACTOR = 1.5
+_CALIB_MAX_SCALE = 3.0
+
+
+class _PurposeStat:
+    """purpose 単位のレイテンシ観測 (反応的較正用)。
+
+    成功レイテンシの EWMA と連続 timeout 回数を保持する。EWMA は較正の引き金
+    には使わず観測値 (WARNING ログ / 将来の /api/status 露出) として用いる。
+    較正のトリガは timeout イベントそのもの。
+    """
+
+    __slots__ = ("ewma", "consecutive_timeouts", "samples")
+
+    def __init__(self) -> None:
+        self.ewma: float | None = None
+        self.consecutive_timeouts: int = 0
+        self.samples: int = 0
+
+    def observe_success(self, elapsed: float, *, alpha: float = 0.3) -> None:
+        """成功レイテンシを EWMA に取り込む。"""
+        self.samples += 1
+        if self.ewma is None:
+            self.ewma = elapsed
+        else:
+            self.ewma = alpha * elapsed + (1.0 - alpha) * self.ewma
+
+
+def _resolve_assist_model_filename(config: dict, local_cfg: dict) -> str:
+    """アシストモデルの GGUF ファイル名 (basename) を解決する。
+
+    較正値を model-scoped に保存 / ロードするためのキー。
+    優先: ``local.model`` / ``local.model_path`` → ``model_paths.assist_model``。
+    解決できない場合は空文字列 (較正の永続化を無効化)。
+    """
+    raw = local_cfg.get("model") or local_cfg.get("model_path") or ""
+    if not raw:
+        raw = (config.get("model_paths") or {}).get("assist_model", "")
+    if not raw:
+        return ""
+    return Path(str(raw)).name
+
+
 def _extract_cache_metrics(result: dict) -> dict | None:
     """llama-server レスポンスから KV キャッシュ命中率を抽出する
 
@@ -496,6 +554,44 @@ class AssistModelClient(BaseHTTPClient):
         self._purpose_reasoning_budgets: dict[str, int] = {
             str(k): int(v) for k, v in raw_budgets.items()
         }
+
+        # purpose 別 timeout の反応的自己較正 (model-keyed)。アシストモデル名で
+        # キー化した較正値を起動時にロードし、``generate()`` で timeout を観測する
+        # 度に天井を引き上げて ``local/assist_calibration.json`` に永続化する。
+        # config の ``assist_model.timeouts[purpose]`` が明示された purpose は
+        # ユーザー権威として較正対象外。
+        self._latency_stats: dict[str, _PurposeStat] = {}
+        self._assist_model_filename = _resolve_assist_model_filename(
+            config, local_cfg,
+        )
+        self._calibrated_timeouts: dict[str, float] = {}
+        self._calibration_path: Path | None = None
+        try:
+            from backend.config import get_path_resolver
+            self._calibration_path = get_path_resolver().resolve_local(
+                "assist_calibration_file",
+            )
+        except Exception:  # noqa: BLE001 — config 未ロード (単体テスト等) では
+            # 永続化を無効化し、in-memory 較正のみ動作させる。
+            self._calibration_path = None
+        if self._calibration_path is not None and self._assist_model_filename:
+            from backend.free.llm.assist_calibration_store import (
+                AssistCalibrationStore,
+            )
+            loaded = AssistCalibrationStore.load_timeouts(
+                self._calibration_path, self._assist_model_filename,
+            )
+            # config 明示 purpose は権威として上書きしない。
+            self._calibrated_timeouts = {
+                p: v for p, v in loaded.items()
+                if p not in self._purpose_timeouts
+            }
+            if self._calibrated_timeouts:
+                logger.info(
+                    "Loaded assist timeout calibration for model=%s "
+                    "(%d purposes)",
+                    self._assist_model_filename, len(self._calibrated_timeouts),
+                )
 
         # 全 assist リクエストに per-request で注入する chat_template_kwargs。
         # 非 thinking モデル運用時は空 dict を指定して注入そのものを停止する。
@@ -749,11 +845,23 @@ class AssistModelClient(BaseHTTPClient):
         priority = resolve_priority(purpose)
 
         t0 = time.monotonic()
-        result = await self._request_with_retry(
-            payload, timeout=effective_timeout, priority=priority,
-            purpose=purpose,
-        )
+        try:
+            result = await self._request_with_retry(
+                payload, timeout=effective_timeout, priority=priority,
+                purpose=purpose,
+            )
+        except (httpx.TimeoutException, TimeoutError):
+            # timeout を purpose 別較正シグナルとして記録し、天井を反応的に
+            # 引き上げてから例外を再送出する (caller の degraded fallback は不変)。
+            self._record_assist_latency(
+                purpose, time.monotonic() - t0,
+                timed_out=True, budget=effective_timeout,
+            )
+            raise
         elapsed = time.monotonic() - t0
+        self._record_assist_latency(
+            purpose, elapsed, timed_out=False, budget=effective_timeout,
+        )
 
         # DebugLogger にアシストモデルリクエストを記録
         dl = self._debug_logger
@@ -1049,6 +1157,70 @@ class AssistModelClient(BaseHTTPClient):
             return PURPOSE_REASONING_BUDGET_DEFAULTS[purpose]
         return None
 
+    def _record_assist_latency(
+        self, purpose: str, elapsed: float, *,
+        timed_out: bool, budget: float,
+    ) -> None:
+        """``generate()`` のレイテンシ観測を purpose 別の反応的較正に反映する。
+
+        observability が応答パスを壊さないよう、本メソッドは例外を外へ伝播しない。
+        config で timeout を明示している purpose (ユーザー権威) は較正対象外。
+        """
+        if not purpose or purpose in self._purpose_timeouts:
+            return
+        try:
+            stat = self._latency_stats.get(purpose)
+            if stat is None:
+                stat = _PurposeStat()
+                self._latency_stats[purpose] = stat
+            if timed_out:
+                stat.consecutive_timeouts += 1
+                self._bump_calibrated_timeout(purpose, budget)
+            else:
+                stat.consecutive_timeouts = 0
+                stat.observe_success(elapsed)
+        except Exception:  # noqa: BLE001 — 観測は応答パスを壊さない
+            logger.debug("assist latency recording failed", exc_info=True)
+
+    def _bump_calibrated_timeout(self, purpose: str, budget: float) -> None:
+        """timeout を観測した purpose の較正天井を反応的に引き上げる。
+
+        base = ``PURPOSE_TIMEOUT_DEFAULTS[purpose]`` (無ければ ``self.timeout``)
+        を基準に ``_CALIB_BUMP_FACTOR`` 倍ずつ、``base * _CALIB_MAX_SCALE`` を
+        上限に上げる。値が変化した場合のみ WARNING ログ + 永続化する。
+        """
+        base = PURPOSE_TIMEOUT_DEFAULTS.get(purpose, self.timeout)
+        ceiling = base * _CALIB_MAX_SCALE
+        current = self._calibrated_timeouts.get(purpose, base)
+        new = min(current * _CALIB_BUMP_FACTOR, ceiling)
+        if new <= current + 1e-6:
+            # 既に上限。これ以上引き上げない (無限増殖防止)。
+            return
+        self._calibrated_timeouts[purpose] = new
+        logger.warning(
+            "Assist purpose '%s' timed out (budget=%.1fs); raising calibrated "
+            "timeout %.1fs -> %.1fs (cap=%.1fs, model=%s)",
+            purpose, budget, current, new, ceiling,
+            self._assist_model_filename or "unknown",
+        )
+        self._persist_calibration()
+
+    def _persist_calibration(self) -> None:
+        """較正値をアシストモデル名でキー化して ``local/`` に永続化する。"""
+        if self._calibration_path is None or not self._assist_model_filename:
+            return
+        try:
+            from backend.free.llm.assist_calibration_store import (
+                AssistCalibrationStore,
+            )
+            AssistCalibrationStore.save_timeouts(
+                self._calibration_path,
+                self._assist_model_filename,
+                self._calibrated_timeouts,
+            )
+        except OSError as e:
+            logger.warning("Failed to persist assist calibration: %s", e)
+
     def _resolve_timeout(
         self, explicit: float | None, purpose: str,
     ) -> float:
@@ -1057,18 +1229,23 @@ class AssistModelClient(BaseHTTPClient):
         優先順位:
             1. 明示指定 (``timeout`` 引数)
             2. ``assist_model.timeouts[purpose]`` (config 上書き)
-            3. ``PURPOSE_TIMEOUT_DEFAULTS[purpose]``
-            4. ``assist_model.timeout`` (グローバル既定)
+            3. 反応的較正値 (``_calibrated_timeouts[purpose]``、ReadTimeout 観測で
+               引き上げ・model-keyed 永続化)
+            4. ``PURPOSE_TIMEOUT_DEFAULTS[purpose]``
+            5. ``assist_model.timeout`` (グローバル既定)
 
         config で purpose 別 override を明示していなくても、重いタスク
         (long_form_planning / contextual_prefix / critique_synthesis 等)
-        が CLAUDE.md の既定仕様通り延長されることを保証する。
+        が CLAUDE.md の既定仕様通り延長されることを保証する。config 明示
+        purpose は較正値より優先され、ユーザー設定を上書きしない。
         """
         if explicit is not None:
             return float(explicit)
         if purpose:
             if purpose in self._purpose_timeouts:
                 return self._purpose_timeouts[purpose]
+            if purpose in self._calibrated_timeouts:
+                return self._calibrated_timeouts[purpose]
             if purpose in PURPOSE_TIMEOUT_DEFAULTS:
                 return PURPOSE_TIMEOUT_DEFAULTS[purpose]
         return self.timeout
