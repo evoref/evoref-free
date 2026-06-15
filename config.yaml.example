@@ -149,14 +149,16 @@ llama:
                                   # llama-server 再起動直後の冷えた KV キャッシュ + 長プロンプトで
                                   # prefill が長引く環境 (iGPU 等) では 90〜120 に引き上げる。
   # --- idle slot offload ---
-  # cache_ram_mib: -1=無制限 / 0=disable / >0=MiB 上限
+  # cache_ram_mib: -1=無制限 / 0=disable / >0=MiB 上限 (host RAM 退避量。VRAM 非依存)
   #   上流デフォルト 8192 を黙従しないよう launch_llama.py が常に明示付与する。
   #   既定 slots=1 では退避対象の idle slot が存在しないため 0 で無効化し
-  #   host RAM 予約を省く。slots を 2 以上に上げる場合は 4096 程度を検討。
+  #   host RAM 予約を省く。slots を 2 以上にしても per-seq context は kv_unified
+  #   (下記) が守るので、cache_ram_mib は RAM 退避が欲しい時のみ >0 にすればよい。
   # cache_idle_slots: 上流既定 true (idle slot を退避対象にする)。
   #   false で機構自体を OFF（``--no-cache-idle-slots`` 付与）。
-  # kv_unified: null=auto (cache_ram_mib>0 かつ slots>1 で ``--kv-unified`` 自動付与) /
-  #             true|false で明示上書き。slots>1 で cache-ram を機能させるには unified KV cache が必要。
+  # kv_unified: null=auto (slots>1 で ``--kv-unified`` 自動付与) / true|false で明示上書き。
+  #   非 unified だと per-seq context が n_ctx/slots に半減する (-c 8192 -np 2 で 4096)。
+  #   unified は VRAM 増なしに各 seq へ full n_ctx を与える。cache_ram_mib とは独立。
   cache_ram_mib: 0
   cache_idle_slots: true
   kv_unified: null
@@ -300,6 +302,7 @@ local_paths:
   experience_assist_file: local/experience_assist.json   # アシストモデル経験バッファ
   eval_core_file: local/eval_core.json               # ベースモデル コア評価セット
   eval_assist_file: local/eval_assist.json           # アシストモデル コア評価セット
+  assist_calibration_file: local/assist_calibration.json # アシスト purpose 別 timeout の反応的自己較正値 (モデル切替後に自動調整)
   learned_patterns_file: local/learned_patterns.json # 学習済みパターン検出キーワード
   model_state_file: local/model_state.json           # モデル切替・LoRA 装着状態の永続化
   local_state_file: local/state.json                 # EvorefMem ローカル状態
@@ -870,13 +873,14 @@ assist_model:
                                    # (解決順: ここの明示値 > profile > 8192)
     # slots: 既定 1 (本セクションに slots キー無し = -np 1)。チャット応答パスの
     # assist 判定を並列化する場合は slots: 2 を追加し、``concurrency.realtime: 2``
-    # とセットで設定する。slots>1 では context_size が slot 毎に分割される
-    # (8192 → 4096/slot) が、各判定プロンプトは ~1-3K tok で収まる。
-    # idle slot offload。アシストは既定 slots=1 (本セクションに slots キー無し)
-    # のため退避対象の idle slot が無く 0 で無効化し host RAM 予約を省く。
-    # slots>1 運用時は ``--kv-unified`` が自動付与されるので 2048 等へ戻す。
+    # とセットで設定する。slots>1 では ``--kv-unified`` が自動付与され (下記
+    # kv_unified)、per-seq context は full context_size を維持する (分割されない)。
+    # idle slot offload。cache_ram_mib は host RAM 退避量で kv-unified とは独立。
+    # 既定 slots=1 では退避対象の idle slot が無いため 0。slots>1 で idle slot の
+    # RAM 退避も欲しい場合のみ 2048 等にする (per-seq context には影響しない)。
     cache_ram_mib: 0
     cache_idle_slots: true
+    # null=auto (slots>1 で ``--kv-unified`` 自動付与) / true|false で明示上書き。
     kv_unified: null
     # アシストモデルのパラメータ数 (B 単位) を明示指定する。
     # null (既定) で model 名の正規表現 (\d+B) → /props の順に推定する。

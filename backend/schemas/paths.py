@@ -59,6 +59,9 @@ class LocalPathsConfig(BaseModel):
     cvector_work_dir: str = "local/cvector/"
     experience_assist_file: str = "local/experience_assist.json"
     eval_assist_file: str = "local/eval_assist.json"
+    # アシスト purpose 別 timeout の反応的自己較正値 (model-keyed)。
+    # AssistModelClient が ReadTimeout 観測から引き上げた天井を永続化する。
+    assist_calibration_file: str = "local/assist_calibration.json"
     lora_archive_dir: str = "local/lora_archive/"
     embed_lora_adapter: str = "local/models/embed_adapter.gguf"
     embed_lora_versions_dir: str = "local/models/embed_lora_versions/"

@@ -123,9 +123,10 @@ class LlamaConfig(BaseModel):
     cache_ram_mib: int = Field(default=4096, ge=-1)
     # 上流既定 true (idle slot を退避対象にする)。false で機構自体を OFF。
     cache_idle_slots: bool = True
-    # null=auto (cache_ram_mib>0 かつ slots>1 で ``--kv-unified`` 自動付与) /
-    # true|false で明示上書き。slots>1 で cache-ram を機能させるには unified
-    # KV cache が必要なため、launch_llama.py が状況に応じて付与する。
+    # null=auto (slots>1 で ``--kv-unified`` 自動付与) / true|false で明示上書き。
+    # unified KV は multi-slot で VRAM 増なく各シーケンスへ full n_ctx を与え
+    # (非 unified だと per-seq context が n_ctx/slots に半減)、かつ cache-ram の
+    # 動作前提でもある。cache_ram_mib とは独立。
     kv_unified: bool | None = None
     # self-speculative decoding。Pro 限定機能
     speculative: LlamaSpeculativeConfig = Field(default_factory=LlamaSpeculativeConfig)

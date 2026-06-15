@@ -866,6 +866,12 @@ class ModelMigrator:
                 sort_keys=False,
             )
 
+        # in-memory config も同期 (_update_component_config と対称)。
+        # 未同期だと移行後 restart 前に get_config() が旧 base_model を返し、
+        # /api/model/reload が model_state.current を旧モデル名で上書きして
+        # 再起動時に model_state↔config の mismatch ERROR を生む。
+        self.config.setdefault("model_paths", {})["base_model"] = new_model_path
+
         logger.info(
             "config.yaml updated: model_paths.base_model = %s",
             new_model_path,

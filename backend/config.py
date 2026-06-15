@@ -30,6 +30,7 @@ class PathResolver:
         "cvector_work_dir": "local/cvector/",
         "experience_assist_file": "local/experience_assist.json",
         "eval_assist_file": "local/eval_assist.json",
+        "assist_calibration_file": "local/assist_calibration.json",
         "lora_archive_dir": "local/lora_archive/",
         "embed_lora_adapter": "local/models/embed_adapter.gguf",
         "embed_lora_versions_dir": "local/models/embed_lora_versions/",
