@@ -186,6 +186,15 @@ llama:
     # mode="draft-model" 時のみ使用
     draft_model_path: null        # 外部 draft GGUF パス (相対 / 絶対)
     gpu_layers_draft: null        # ``-ngld`` (null=auto, 整数, "all" を許容)
+  # --- MTP (Multi-Token Prediction) self-speculative ---
+  # Free/Pro 共通。モデル内蔵の MTP ヘッド (NextN 層) を draft に使う自己投機で、
+  # 外部 draft モデル不要。MTP ヘッドを内蔵した GGUF (Qwen3.5/3.6 等) でのみ有効。
+  # 非対応モデル (gemma-4 / lfm2 等) では launch_llama.py が warning を出して素通り。
+  # speculative と同時 enabled の場合は MTP が優先され speculative は無効化される。
+  # 起動フラグ: --spec-type draft-mtp + --spec-draft-n-max <draft_n_max>
+  mtp:
+    enabled: false                # 対応モデルで true にすると MTP を有効化
+    draft_n_max: 3                # ``--spec-draft-n-max`` (1 サイクルの draft トークン数、上流既定 3)
   # モデル arch 別の起動フラグ / sampling 自動決定 (base / assist 共通)。
   # true: GGUF の general.architecture を読み、models/profiles/<arch>.yaml (同梱)
   #       ＋ local/profiles/<arch>.yaml (任意 override) から
@@ -889,6 +898,13 @@ assist_model:
     # conflict_resolver の sleep-time インターバル計算で 7B 基準のスケーリ
     # ングに使われる。
     params_b: null
+    # MTP (Multi-Token Prediction) self-speculative。Free/Pro 共通。アシストモデル
+    # 内蔵の MTP ヘッド (NextN 層) を draft に使う自己投機 (外部 draft モデル不要)。
+    # MTP ヘッド内蔵モデルでのみ有効、非対応モデルでは warning + 素通り。
+    # 既定 null (フラグ未付与)。有効化する場合のみ下記ブロックを設定する。
+    # mtp:
+    #   enabled: false               # 対応モデルで true にすると MTP を有効化
+    #   draft_n_max: 3               # ``--spec-draft-n-max`` (上流既定 3)
   model_path: ""                   # アシストモデルパス（通常は model_paths.assist_model を参照）
   timeout: 30.0                    # タイムアウト（秒）. CogWriter Plan 生成 (max_tokens=1024) 等の長め応答を許容するため 30 秒を推奨
   # 用途別セマフォ。realtime / background / learning を独立

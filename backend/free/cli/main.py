@@ -42,6 +42,7 @@ from backend.free.cli.service_manager import (
     _check_backend,
     _register_session,
     _run_serve,
+    _sync_server_mode,
     ensure_extra_servers,
     _unregister_session,
 )
@@ -582,6 +583,10 @@ def _resolve_cli_mode(args: argparse.Namespace) -> None:
     resolved, downgraded = coerce_cli_mode(requested)
     if downgraded:
         print(msg("cli.mode_coding_pro_only_warning"), file=sys.stderr)
+        logger.warning(
+            "CLI mode downgraded to chat (requested=coding, Free edition)",
+        )
+    logger.debug("CLI mode resolved: %s (requested=%s)", resolved, requested)
     args._resolved_mode = resolved
     get_coding_hook().on_mode_resolved(resolved)
 
@@ -788,6 +793,10 @@ async def async_main(args: argparse.Namespace) -> int:
         )
         _auto_serve_cleanup(auto_serve_state, console)
         return 1
+
+    # 解決モードを base サーバへ反映 (coding_model が別 GGUF の構成で coding
+    # モデルをロードさせる)。同一モード / coding_model 未設定なら no-op。
+    await _sync_server_mode(state.backend_url, state.mode)
 
     if non_interactive:
         return await _run_non_interactive_chat(args, state, console, auto_serve_state)

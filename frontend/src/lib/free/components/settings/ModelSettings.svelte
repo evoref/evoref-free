@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { configData, updateField, loadConfig } from '$lib/free/stores/settings';
-	import { configSection, fieldUpdater, nestedFieldUpdater } from '$lib/free/stores/settingsHelpers';
+	import { configSection, fieldUpdater, nestedFieldUpdater, deepNestedFieldUpdater } from '$lib/free/stores/settingsHelpers';
 	import type { AssistModelLocalConfig } from '$lib/types/settings';
 	import SettingsSection from './SettingsSection.svelte';
 	import ProSection from './ProSection.svelte';
@@ -16,6 +16,7 @@
 	let assistModel = $derived(configSection($configData, 'assist_model'));
 	let local = $derived((assistModel.local ?? {}) as AssistModelLocalConfig);
 	let concurrency = $derived((assistModel.concurrency ?? {}) as Record<string, number>);
+	let assistMtp = $derived((local.mtp ?? {}) as Record<string, unknown>);
 	let embedding = $derived(configSection($configData, 'embedding'));
 </script>
 
@@ -40,6 +41,8 @@
 		<NumberField label="settings.assist_model.concurrency_realtime" value={Number(concurrency.realtime ?? 1)} min={1} onchange={nestedFieldUpdater('assist_model', 'concurrency', 'realtime')} />
 		<NumberField label="settings.assist_model.concurrency_background" value={Number(concurrency.background ?? 1)} min={1} onchange={nestedFieldUpdater('assist_model', 'concurrency', 'background')} />
 		<NumberField label="settings.assist_model.concurrency_learning" value={Number(concurrency.learning ?? 1)} min={1} onchange={nestedFieldUpdater('assist_model', 'concurrency', 'learning')} />
+		<ToggleField label="settings.assist_model.mtp_enabled" value={Boolean(assistMtp.enabled ?? false)} description="settings.assist_model.mtp_enabled_desc" onchange={deepNestedFieldUpdater('assist_model', 'local', 'mtp', 'enabled')} />
+		<NumberField label="settings.assist_model.mtp_draft_n_max" value={Number(assistMtp.draft_n_max ?? 3)} min={1} description="settings.assist_model.mtp_draft_n_max_desc" onchange={deepNestedFieldUpdater('assist_model', 'local', 'mtp', 'draft_n_max')} />
 		<ProSection>
 			<SelectField
 				label="settings.assist_model.backend"

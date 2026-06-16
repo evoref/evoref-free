@@ -514,6 +514,72 @@ def _resolve_profile_context_size(cfg: dict, slot: str) -> int | None:
     return value
 
 
+def _resolve_profile_context_size_for_mode(cfg: dict, mode: str) -> int | None:
+    """アクティブモードのモデル arch プロファイルから ``context_size`` を返す。
+
+    ``_resolve_profile_sampling_for_mode`` と対称で、``mode=="coding"`` のときは
+    ``model_paths.coding_model`` (未設定なら base_model) を、それ以外は base_model
+    を参照する。``auto_model_flags=false`` / モデル未設定 / 読取失敗 / プロファイル
+    不在・512 未満は ``None``。((絶対パス, mtime) でキャッシュ、slot 版と共有)。
+    """
+    if not (cfg.get("llama", {}) or {}).get("auto_model_flags", True):
+        return None
+    model_paths = cfg.get("model_paths", {}) or {}
+    base_model = model_paths.get("base_model", "")
+    if mode == "coding":
+        model_rel = model_paths.get("coding_model") or base_model
+    else:
+        model_rel = base_model
+    if not model_rel:
+        return None
+    project_root = get_project_root()
+    model_path = Path(model_rel)
+    if not model_path.is_absolute():
+        model_path = project_root / model_path
+    try:
+        mtime = model_path.stat().st_mtime_ns
+    except OSError:
+        return None
+    cache_key = (str(model_path), mtime)
+    if cache_key in _profile_context_cache:
+        return _profile_context_cache[cache_key]
+
+    value: int | None = None
+    try:
+        from scripts.launch_llama import load_model_profile, read_gguf_metadata
+
+        meta = read_gguf_metadata(model_path)
+        profile = load_model_profile(meta.get("architecture"), project_root)
+        raw = profile.get("context_size")
+        if raw is not None:
+            ivalue = int(raw)
+            if ivalue >= 512:
+                value = ivalue
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Profile context_size resolution failed for mode %s: %s", mode, e)
+        value = None
+
+    _profile_context_cache[cache_key] = value
+    return value
+
+
+def resolve_context_size_for_mode(cfg: dict, mode: str) -> int:
+    """アクティブモード ("chat"|"coding") の有効 context_size を解決する。
+
+    coding モードで ``model_paths.coding_model`` が base と別 arch (別 context
+    window) の場合に、その実窓を反映する。優先順位は :func:`resolve_context_size`
+    と同じ: config 明示 (``llama.context_size``) > arch プロファイル > 既定。
+    ``llama.context_size`` の明示はモードに依らず手動 pin として優先する。
+    """
+    explicit = (cfg.get("llama") or {}).get("context_size")
+    if explicit is not None:
+        return int(explicit)
+    profile_ctx = _resolve_profile_context_size_for_mode(cfg, mode)
+    if profile_ctx is not None:
+        return profile_ctx
+    return _CONTEXT_SIZE_FALLBACK
+
+
 def resolve_context_size(cfg: dict, slot: str) -> int:
     """slot ("base"|"assist") の有効 context_size を解決する (docs/c_15)。
 

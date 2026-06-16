@@ -95,7 +95,7 @@ def rag_signals_from_chunks(
 
 def _emit_timing(
     state: AppState, timer: StageTimer | None,
-    agent_layer: str, tokens_generated: int,
+    agent_layer: str, tokens_generated: int, mode: str = "",
 ) -> None:
     """StageTimer の計測結果をデバッグログに出力し、直近メトリクスを更新する"""
     if timer is None:
@@ -121,7 +121,7 @@ def _emit_timing(
     if timing:
         dl.log_request_timing(
             timing, agent_layer=agent_layer,
-            tokens_generated=tokens_generated,
+            tokens_generated=tokens_generated, mode=mode,
         )
 
 # ---------------------------------------------------------------------------
@@ -710,7 +710,7 @@ def _finalize_meta_cognitive_stream(
         tool_routing_false_positive=meta_tool_routing_false_positive(resp),
     )
 
-    _emit_timing(state, timer, "meta_cognitive", estimated_tokens)
+    _emit_timing(state, timer, "meta_cognitive", estimated_tokens, mode=mode)
     return make_token_info(messages, estimated_tokens, context_size, instance_name)
 
 
@@ -790,7 +790,7 @@ async def stream_meta_cognitive(
             logger.error("MetaCognitive stream error: %s", e)
             if timer:
                 timer.stop("llm_total_ms")
-            _emit_timing(state, timer, "meta_cognitive", 0)
+            _emit_timing(state, timer, "meta_cognitive", 0, mode=mode)
             yield sse.error(str(e))
             yield sse.done()
         finally:
@@ -865,7 +865,7 @@ async def sync_meta_cognitive(
             tool_routing_false_positive=meta_tool_routing_false_positive(resp),
         )
 
-        _emit_timing(state, timer, "meta_cognitive", estimated_tokens)
+        _emit_timing(state, timer, "meta_cognitive", estimated_tokens, mode=mode)
 
         token_info_dict = make_token_info(messages, estimated_tokens,
                                           context_size, instance_name)
@@ -1114,7 +1114,7 @@ async def _finalize_long_form_stream(
         yield sse.step({
             "type": "task_result", "detail": write_result, "status": "done",
         })
-    _emit_timing(sess_state, timer, "meta_cognitive", state.tokens_generated)
+    _emit_timing(sess_state, timer, "meta_cognitive", state.tokens_generated, mode=mode)
     ti = make_token_info(
         messages, state.tokens_generated, context_size, instance_name,
     )
@@ -1312,7 +1312,7 @@ async def stream_long_form(
             logger.error("Long-form stream error: %s", e, exc_info=True)
             if timer:
                 timer.stop("llm_total_ms")
-            _emit_timing(state, timer, "meta_cognitive", stream_state.tokens_generated)
+            _emit_timing(state, timer, "meta_cognitive", stream_state.tokens_generated, mode=mode)
             yield sse.error(str(e))
             yield sse.done()
         finally:
@@ -1414,7 +1414,7 @@ async def sync_long_form(
                 query, full_response, state,
             )
 
-        _emit_timing(state, timer, "meta_cognitive", tokens_generated)
+        _emit_timing(state, timer, "meta_cognitive", tokens_generated, mode=mode)
 
         response_text = write_result if write_result else full_response
 
@@ -1643,7 +1643,7 @@ async def _finalize_deliberative_stream(
         sess_state, query, state.full_response,
         private=private, tool_command=state.tool_command, session_id=session_id,
     )
-    _emit_timing(sess_state, timer, "deliberative", state.tokens_generated)
+    _emit_timing(sess_state, timer, "deliberative", state.tokens_generated, mode=mode)
     ti = make_token_info(
         messages, state.tokens_generated, context_size, instance_name,
     )
@@ -1746,7 +1746,7 @@ async def stream_deliberative(
             logger.error("Deliberative stream error: %s", e)
             if timer:
                 timer.stop("llm_total_ms")
-            _emit_timing(state, timer, "deliberative", 0)
+            _emit_timing(state, timer, "deliberative", 0, mode=mode)
             yield sse.error(str(e))
             yield sse.done()
         finally:
@@ -1833,7 +1833,7 @@ async def sync_deliberative(
             private=private, tool_command=resp.tool_command, session_id=session_id,
         )
 
-        _emit_timing(state, timer, "deliberative", estimated_tokens)
+        _emit_timing(state, timer, "deliberative", estimated_tokens, mode=mode)
 
         token_info_dict = make_token_info(
             messages, estimated_tokens, context_size, instance_name,
@@ -1929,7 +1929,7 @@ async def stream_reactive_light(
                 state, query, stream_state.full_response,
                 private=private, tool_command=None, session_id=session_id,
             )
-            _emit_timing(state, timer, "reactive", stream_state.tokens_generated)
+            _emit_timing(state, timer, "reactive", stream_state.tokens_generated, mode=mode)
             ti = make_token_info(
                 messages, stream_state.tokens_generated, context_size, instance_name,
             )
@@ -1942,7 +1942,7 @@ async def stream_reactive_light(
             logger.error("Reactive-light stream error: %s", e)
             if timer:
                 timer.stop("llm_total_ms")
-            _emit_timing(state, timer, "reactive", 0)
+            _emit_timing(state, timer, "reactive", 0, mode=mode)
             yield sse.error(str(e))
             yield sse.done()
         finally:
@@ -2008,7 +2008,7 @@ async def sync_reactive_light(
             state, query, content,
             private=private, tool_command=None, session_id=session_id,
         )
-        _emit_timing(state, timer, "reactive", estimated_tokens)
+        _emit_timing(state, timer, "reactive", estimated_tokens, mode=mode)
 
         dl = getattr(state, "debug_logger", None)
         if dl is not None:

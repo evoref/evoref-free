@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
-from backend.config import resolve_context_size
+from backend.config import resolve_context_size_for_mode
 from backend.log_config import get_logger
 from backend.policy_helpers import get_policy_value
 
@@ -164,18 +164,18 @@ class ComplexityClassifier:
         rag_results = rag_results or []
         self.is_long_form = False
         self._classify_mode = mode
+        self._last_classify_reason = "default"
 
         # 1. 挨拶・定型パターン → reactive
         if self._is_greeting(query):
-            logger.info("Classified as reactive (greeting): %s", query[:50])
-            return "reactive"
+            return self._record_classification("reactive", "greeting", query)
 
         # 1.5. 長文生成判定 → meta_cognitive（Orchestrator に委任）
         if self._detect_long_form(query):
             self.is_long_form = True
-            layer = self._guard_meta_cognitive()
-            logger.info("Classified as %s (long-form): %s", layer, query[:50])
-            return layer
+            return self._record_classification(
+                self._guard_meta_cognitive(), "long_form", query,
+            )
 
         # 2. 知識質問の検出 → ツール/Meta-Cognitive エスカレーションをスキップ
         # コーディングモードでもカートリッジ検索による知識質問は有効。
@@ -190,36 +190,38 @@ class ComplexityClassifier:
         # を取りこぼす。executable_query_keywords は明確なツール経路シグナル
         # なので is_knowledge 判定を外して常時評価する。
         if self._contains_executable_query_keywords(query):
-            logger.info("Classified as deliberative (executable query): %s", query[:50])
-            return "deliberative"
+            return self._record_classification(
+                "deliberative", "executable_query", query,
+            )
 
         # 2.6. 知識質問でも学習済み tool_routing パターンにマッチする場合は
         # deliberative に昇格してツール実行を誘導する
         if is_knowledge and self._contains_learned_tool_patterns(query):
-            logger.info("Classified as deliberative (learned tool pattern): %s", query[:50])
-            return "deliberative"
+            return self._record_classification(
+                "deliberative", "learned_tool_pattern", query,
+            )
 
         # 3. コーディングモードでツール操作が必要 → meta_cognitive
         if mode == "coding" and not is_knowledge and self._needs_tools(query):
-            layer = self._guard_meta_cognitive()
-            logger.info("Classified as %s (coding tools): %s", layer, query[:50])
-            return layer
+            return self._record_classification(
+                self._guard_meta_cognitive(), "coding_tools", query,
+            )
 
         # 4. Meta-Cognitive キーワード検出（コーディングモード）
         if mode == "coding" and not is_knowledge and self._has_meta_keywords(query):
-            layer = self._guard_meta_cognitive()
-            logger.info("Classified as %s (meta keywords): %s", layer, query[:50])
-            return layer
+            return self._record_classification(
+                self._guard_meta_cognitive(), "coding_meta_keywords", query,
+            )
 
         # 5. 履歴参照キーワード → deliberative（短いクエリより優先）
         if self._has_history_keywords(query):
-            logger.info("Classified as deliberative (history ref): %s", query[:50])
-            return "deliberative"
+            return self._record_classification("deliberative", "history_ref", query)
 
         # 6. 複雑キーワード → deliberative
         if self._has_complex_keywords(query):
-            logger.info("Classified as deliberative (complex keywords): %s", query[:50])
-            return "deliberative"
+            return self._record_classification(
+                "deliberative", "complex_keywords", query,
+            )
 
         # 7. クエリ長の判定（日本語はスペース分割できないため文字数も考慮）
         is_short = self._is_short_query(query, mode)
@@ -227,28 +229,37 @@ class ComplexityClassifier:
         # 8. 短いクエリ + 高スコア RAG ヒット → reactive
         rag_threshold = self._get_policy("router", "rag_score_threshold", mode, 0.8)
         if is_short and rag_results and rag_results[0][1] > rag_threshold:
-            logger.info("Classified as reactive (short + high RAG): %s", query[:50])
-            return "reactive"
+            return self._record_classification("reactive", "short_high_rag", query)
 
         # 9. 短いクエリ（単純な質問）→ reactive
         if is_short:
-            logger.info("Classified as reactive (short query): %s", query[:50])
-            return "reactive"
+            return self._record_classification("reactive", "short_query", query)
 
         # 10. RAG 結果がない → deliberative（検索が必要）
         if not rag_results:
-            logger.info("Classified as deliberative (no RAG results): %s", query[:50])
-            return "deliberative"
+            return self._record_classification(
+                "deliberative", "no_rag_results", query,
+            )
 
         # 11. ツール操作が必要 → meta_cognitive
         if self._needs_tools(query):
-            layer = self._guard_meta_cognitive()
-            logger.info("Classified as %s (tool patterns): %s", layer, query[:50])
-            return layer
+            return self._record_classification(
+                self._guard_meta_cognitive(), "tool_patterns", query,
+            )
 
         # 12. デフォルト: reactive
-        logger.info("Classified as reactive (default): %s", query[:50])
-        return "reactive"
+        return self._record_classification("reactive", "default", query)
+
+    def _record_classification(self, layer: str, reason: str, query: str) -> str:
+        """分類結果をログし matched-rule 識別子を保持して layer を返す。
+
+        ``self._last_classify_reason`` に matched-rule 識別子を残す。chat 側が
+        primary routing を decision.jsonl に記録する際の ``reason`` に使う
+        (context={"mode": ...} と併せて policy_adjuster の mode 別学習へ供給)。
+        """
+        self._last_classify_reason = reason
+        logger.info("Classified as %s (%s): %s", layer, reason, query[:50])
+        return layer
 
     def _guard_meta_cognitive(self) -> str:
         """Meta-Cognitive 層のランタイムガード
@@ -362,7 +373,7 @@ def _can_use_meta_cognitive(
     mode: str = "chat",
 ) -> bool:
     """コンテキスト予算が Meta-Cognitive ループに十分か判定"""
-    ctx_size = resolve_context_size(config, "base")
+    ctx_size = resolve_context_size_for_mode(config, mode)
     history_budget = config.get("memory", {}).get("working_max_tokens", 2048)
     loop_budget = ctx_size - 512 - 400 - history_budget
 

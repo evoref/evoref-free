@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from backend.schemas.llm import MtpConfig
+
 
 class AssistModelLocalConfig(BaseModel):
     """アシストモデルローカル接続設定"""
@@ -75,6 +77,10 @@ class AssistModelLocalConfig(BaseModel):
     reasoning: Literal["on", "off", "auto"] | None = None
     reasoning_budget_default: int = Field(default=-1, ge=-1)
     reasoning_budget_message: str = ""
+    # MTP (Multi-Token Prediction) self-speculative decoding。MTP ヘッド内蔵
+    # モデルでのみ有効 (非対応モデルは launch 側で warning + 素通り)。``None``
+    # (既定) は MTP フラグを付与しない。詳細は backend.schemas.llm.MtpConfig。
+    mtp: MtpConfig | None = None
     # true で起動するとサーバ側で reasoning / tool calls の構造解析を完全に
     # スキップし、すべて ``message.content`` に出力される。``<think>...</think>``
     # の post-strip は Python 側 ``_ReasoningFilter`` が肩代わ

@@ -18,6 +18,11 @@ export interface ServerConfig {
 	timeout: number;
 }
 
+export interface MtpConfig {
+	enabled: boolean;
+	draft_n_max: number;
+}
+
 export interface LlamaConfig {
 	host: string;
 	port: number;
@@ -35,6 +40,7 @@ export interface LlamaConfig {
 	lora_target: string;
 	enable_thinking: boolean | null;
 	extra_args: string[];
+	mtp?: MtpConfig;
 }
 
 export interface ThemeConfig {
@@ -240,6 +246,7 @@ export interface AssistModelLocalConfig {
 	host: string;
 	port: number;
 	context_size: number;
+	mtp?: MtpConfig;
 	[key: string]: unknown;
 }
 

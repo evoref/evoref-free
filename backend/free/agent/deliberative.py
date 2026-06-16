@@ -15,7 +15,7 @@ from backend.free.agent.meta_cognitive_utils import (
 )
 from backend.free.agent.tool_call_judge import ToolCallJudge, ToolJudgement
 from backend.free.agent.tool_result_digest import digest_tool_result
-from backend.config import resolve_context_size
+from backend.config import resolve_context_size_for_mode
 from backend.free.api.chat.chat_constants import (
     CONTENT_MAX_TOKENS_MIN, CONTENT_SYSTEM_RESERVE,
     TOOL_EXECUTION_TIMEOUT_SEC, TOOL_GROUNDED_TEMPERATURE,
@@ -131,6 +131,7 @@ class DeliberativeAgent:
         assist_client=None,
         assist_experience_recorder=None,
         agent_tracer=None,
+        mode: str = "chat",
     ):
         self.config = config or {}
         self.reminder_system = EventReminderSystem(self.config)
@@ -147,8 +148,8 @@ class DeliberativeAgent:
         # 学習信号にする (これが無いと agent ドメインは skipped_no_signal)。
         self._agent_tracer = agent_tracer
 
-        # コンテンツ生成用の max_tokens
-        ctx_size = resolve_context_size(self.config, "base")
+        # コンテンツ生成用の max_tokens (coding 時は coding_model の実窓に合わせる)
+        ctx_size = resolve_context_size_for_mode(self.config, mode)
         self._content_max_tokens = max(ctx_size - CONTENT_SYSTEM_RESERVE, CONTENT_MAX_TOKENS_MIN)
 
     @staticmethod

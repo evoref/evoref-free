@@ -471,7 +471,7 @@ class ToolCallJudge:
         # と「過去 URL は SemMem にあるのに fetch されない」という不整合が起きる
         # ため、ここで先回りで引き当てる。
         url_recall_result = await self._judge_with_url_recall(
-            query, tools_registry,
+            query, tools_registry, mode=mode,
         )
         if url_recall_result is not None:
             self._log_tool_decision(url_recall_result, "url_recall_matched")
@@ -483,7 +483,7 @@ class ToolCallJudge:
         # 短絡させることで、学習済みクエリでは assist (合成 / 5 層目) を一切
         # 呼ばずにコマンドを確定できる。
         cmd_recall_result = await self._judge_with_executable_command_recall(
-            query, tools_registry,
+            query, tools_registry, mode=mode,
         )
         if cmd_recall_result is not None:
             self._log_tool_decision(
@@ -538,7 +538,7 @@ class ToolCallJudge:
             # run_command の場合は assist でコマンド合成を試行 (assist=None
             # / 失敗時は regex 由来の既存コマンドを維持)
             result = await self._maybe_upgrade_command_via_assist(result, query)
-            await self._maybe_recall_url(result, query)
+            await self._maybe_recall_url(result, query, mode=mode)
             result = self._suppress_unfetchable_fetch_url(result)
             self._log_tool_decision(result, "rule_pattern_matched")
             return result
@@ -554,7 +554,7 @@ class ToolCallJudge:
         result = self._judge_with_learned_patterns(query, tools_registry, mode)
         if result.tool_needed:
             result = await self._maybe_upgrade_command_via_assist(result, query)
-            await self._maybe_recall_url(result, query)
+            await self._maybe_recall_url(result, query, mode=mode)
             result = self._suppress_unfetchable_fetch_url(result)
             self._log_tool_decision(result, "learned_pattern_matched")
             return result
@@ -738,6 +738,7 @@ class ToolCallJudge:
         self,
         query: str,
         tools_registry: ToolsRegistry,
+        mode: str = "coding",
     ) -> "ToolJudgement | None":
         """URL リコール単独で fetch_url 判定を返す (mode / enabled 非依存).
 
@@ -754,7 +755,7 @@ class ToolCallJudge:
             return None
         if self._mem_view is None or self._embedder is None:
             return None
-        recalled = await self._try_recall_url(query)
+        recalled = await self._try_recall_url(query, mode=mode)
         if not recalled:
             return None
         logger.info(
@@ -771,6 +772,7 @@ class ToolCallJudge:
         self,
         query: str,
         tools_registry: ToolsRegistry,
+        mode: str = "coding",
     ) -> "ToolJudgement | None":
         """外部から URL recall のみを問い合わせる公開 API.
 
@@ -778,10 +780,10 @@ class ToolCallJudge:
         「URL recall だけ」をチェックしたい呼び元向け。判定本体は
         ``_judge_with_url_recall`` を共有し、戻り値も同じ。
         """
-        return await self._judge_with_url_recall(query, tools_registry)
+        return await self._judge_with_url_recall(query, tools_registry, mode=mode)
 
     async def _maybe_recall_url(
-        self, result: "ToolJudgement", query: str,
+        self, result: "ToolJudgement", query: str, mode: str = "coding",
     ) -> None:
         """rule / learned 層が ``fetch_url`` を返したが URL が空の場合、
         過去質問で正しく fetch できた URL (``mem.world.url.*``) を引き当てる。
@@ -794,7 +796,7 @@ class ToolCallJudge:
             return
         if result.tool_args and result.tool_args.get("url"):
             return
-        recalled = await self._try_recall_url(query)
+        recalled = await self._try_recall_url(query, mode=mode)
         if not recalled:
             return
         if result.tool_args is None:
@@ -802,7 +804,7 @@ class ToolCallJudge:
         result.tool_args["url"] = recalled
         logger.debug("URL recall: matched url=%s for query=%s", recalled, query[:50])
 
-    async def _try_recall_url(self, query: str) -> str | None:
+    async def _try_recall_url(self, query: str, mode: str = "coding") -> str | None:
         """過去質問の URL fact から類似質問の URL を返す。
 
         条件:
@@ -825,7 +827,7 @@ class ToolCallJudge:
         if not query:
             return None
         try:
-            embeddings = await self._embedder.embed([query], is_query=True)
+            embeddings = await self._embedder.embed([query], is_query=True, mode=mode)
         except Exception as exc:  # noqa: BLE001
             logger.warning("URL recall: embed failed: %s", exc)
             return None
@@ -936,6 +938,7 @@ class ToolCallJudge:
         self,
         query: str,
         tools_registry: ToolsRegistry,
+        mode: str = "coding",
     ) -> "ToolJudgement | None":
         """SemMem の過去成功コマンド引き当てで run_command 判定を返す.
 
@@ -955,7 +958,7 @@ class ToolCallJudge:
             return None
         if self._mem_view is None or self._embedder is None:
             return None
-        recalled = await self._try_recall_executable_command(query)
+        recalled = await self._try_recall_executable_command(query, mode=mode)
         if not recalled:
             return None
         logger.info(
@@ -969,7 +972,9 @@ class ToolCallJudge:
             source="rule",
         )
 
-    async def _try_recall_executable_command(self, query: str) -> str | None:
+    async def _try_recall_executable_command(
+        self, query: str, mode: str = "coding",
+    ) -> str | None:
         """過去成功した run_command を SemMem から類似クエリで引き当てる.
 
         ``_try_recall_url`` と対称。条件:
@@ -993,7 +998,7 @@ class ToolCallJudge:
         if not query:
             return None
         try:
-            embeddings = await self._embedder.embed([query], is_query=True)
+            embeddings = await self._embedder.embed([query], is_query=True, mode=mode)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Executable command recall: embed failed: %s", exc)
             return None

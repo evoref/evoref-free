@@ -6,7 +6,7 @@ import asyncio
 import time
 from pathlib import Path
 
-from backend.config import resolve_context_size
+from backend.config import resolve_context_size_for_mode
 from backend.free.agent.agent_state import AgentState
 from backend.free.agent.code_artifact_generator import CodeArtifactGenerator
 from backend.free.agent.event_reminder import EventReminderSystem
@@ -202,7 +202,9 @@ class MetaCognitiveAgent:
         semmem_block: str | None = None,
         rag_block: str | None = None,
         file_block: str | None = None,
+        fewshot_block: str | None = None,
         code_generator: CodeArtifactGenerator | None = None,
+        mode: str = "coding",
     ) -> None:
         self.max_steps = max_steps
         cfg = config or {}
@@ -218,10 +220,17 @@ class MetaCognitiveAgent:
         # ユーザー添付ファイルを整形したブロック (deliberative の messages 注入と
         # 等価)。meta 経路は messages を LLM に渡さないためここで維持する。
         self._file_block = file_block
+        # Level 1 で進化したモード別 few-shot ブロック。meta 経路は固定の
+        # PLAN/EXECUTE/CONTENT scaffold を使うため、deliberative のように最後の
+        # user メッセージへ前置できない。ツールループ / コンテンツ生成 / fallback
+        # の system に [参考例] として注入し、進化を coding 生成へ効かせる。
+        self._fewshot_block = fewshot_block
         # coding モードで editor/chat 出力のコード生成を LongForm 細粒度生成へ
         # 委譲する (composition が注入)。None なら従来の単一ショット生成。
         self._code_generator = code_generator
-        self._mode = "coding"
+        # 構築時モード (内部 loop/token 予算の context_size 解決に使う)。
+        # process() でも同値を再設定する (呼出側が同じ req.mode を渡す契約)。
+        self._mode = mode
         self.compactor = StepCompactor(cfg, policy=policy)
         self.reminder_system = EventReminderSystem(cfg)
         self._tool_judge = tool_judge
@@ -236,7 +245,7 @@ class MetaCognitiveAgent:
         agent_cfg = cfg.get("agent", {})
         self.max_tool_iterations = agent_cfg.get("max_tool_iterations", 5)
 
-        ctx_size = resolve_context_size(cfg, "base")
+        ctx_size = resolve_context_size_for_mode(cfg, mode)
         history_budget = cfg.get("memory", {}).get("working_max_tokens", 2048)
         self.loop_budget = ctx_size - 512 - 400 - history_budget
 
@@ -450,7 +459,10 @@ class MetaCognitiveAgent:
         # 過分割された書き込みタスクを 1 件へ集約する (1 リクエスト=1 タブ)。
         if self._output_target in ("editor", "chat"):
             tasks = collapse_editor_write_tasks(tasks)
-        logger.info("Plan generated: %d tasks", len(tasks))
+        logger.info(
+            "Plan generated: %d tasks (mode=%s, output=%s)",
+            len(tasks), self._mode, self._output_target,
+        )
 
         if on_step:
             task_names = " / ".join(t.description[:50] for t in tasks)
@@ -487,8 +499,10 @@ class MetaCognitiveAgent:
             content = "\n\n".join(self._chat_code_parts)
         else:
             content = self._build_final_response(tasks, context_parts)
-        logger.info("MetaCognitive completed: %d steps, %d tool calls",
-                     steps, len(all_tool_calls))
+        logger.info(
+            "MetaCognitive completed: %d steps, %d tool calls (mode=%s, output=%s)",
+            steps, len(all_tool_calls), self._mode, self._output_target,
+        )
 
         # MDP トレース: エピソード終了 + クレジット割当
         step_credits = []
@@ -1085,6 +1099,9 @@ class MetaCognitiveAgent:
         # ユーザー添付ファイルをループ全反復の system に維持する
         if self._file_block:
             prompt = f"{prompt}\n\n[添付ファイル]\n{self._file_block}"
+        # Level 1 で進化した few-shot を参考例として維持する
+        if self._fewshot_block:
+            prompt = f"{prompt}\n\n[参考例]\n{self._fewshot_block}"
         return prompt
 
     def _rebuild_loop_messages(
@@ -1126,7 +1143,7 @@ class MetaCognitiveAgent:
         JSON のパースに生テキストが必要なため)。
         """
         prompt_text = "".join(m.get("content", "") for m in injected_messages)
-        ctx_size = resolve_context_size(self.config, "base")
+        ctx_size = resolve_context_size_for_mode(self.config, self._mode)
         sampling = {
             k: v for k, v in gen_kwargs.items()
             if k not in ("max_tokens", "id_slot", "stream")
@@ -1343,7 +1360,7 @@ class MetaCognitiveAgent:
     ) -> None:
         """コンテキスト使用率を計算して AgentState に設定"""
         total_chars = sum(len(m.get("content", "")) for m in messages)
-        ctx_size = resolve_context_size(self.config, "base")
+        ctx_size = resolve_context_size_for_mode(self.config, self._mode)
         state.context_usage_pct = min(
             100,
             int(_estimate_tokens("x" * total_chars) / ctx_size * 100),
@@ -1908,7 +1925,7 @@ class MetaCognitiveAgent:
         file_path: str = "",
     ) -> str:
         """write_file 用のコンテンツを LLM に生成させる"""
-        ctx_size = resolve_context_size(self.config, "base")
+        ctx_size = resolve_context_size_for_mode(self.config, self._mode)
 
         existing_content = self._read_existing_file(file_path)
         user_prompt = f"{original_query}\n\nタスク: {task_description}"
@@ -1916,13 +1933,18 @@ class MetaCognitiveAgent:
             user_prompt, existing_content, file_path, ctx_size,
         )
 
+        # Level 1 で進化した few-shot を参考例として system に注入する
+        system_content = CONTENT_GENERATION_PROMPT
+        if self._fewshot_block:
+            system_content = f"{system_content}\n\n[参考例]\n{self._fewshot_block}"
+
         messages = [
-            {"role": "system", "content": CONTENT_GENERATION_PROMPT},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": user_prompt},
         ]
 
         gen_max_tokens = self._calc_gen_max_tokens(
-            CONTENT_GENERATION_PROMPT + user_prompt, ctx_size,
+            system_content + user_prompt, ctx_size,
         )
 
         return await self._stream_and_clean(
@@ -2110,8 +2132,13 @@ class MetaCognitiveAgent:
         で進行中の生成を殺さず読み取る。
         """
         try:
+            # few-shot は従来 system_prompt へ結合して渡されていたが、現在は
+            # instance block 化したためここで明示的に注入する (fallback でも維持)。
+            system_content = system_prompt
+            if self._fewshot_block:
+                system_content = f"{system_content}\n\n[参考例]\n{self._fewshot_block}"
             messages = [
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": system_content},
                 *conversation[-4:],
                 {"role": "user", "content": query},
             ]

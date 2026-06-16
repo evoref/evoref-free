@@ -857,6 +857,43 @@ async def _register_session(
         return True  # 登録失敗は致命的でない — 処理を続行
 
 
+async def _sync_server_mode(url: str, mode: str) -> None:
+    """CLI の解決モードをバックエンドへ反映し base サーバの load モデルを揃える。
+
+    CLI は ``/api/chat`` に mode を載せるだけで base サーバの再起動は web UI の
+    ``/api/mode/switch`` 経由でしか起きないため、``coding_model`` が base と別
+    GGUF の構成だと ``evoref code`` でも chat モデル上で生成されてしまう。起動時
+    に1回 ``/api/mode/switch`` を叩いて要求モードのモデルをロードさせる。
+
+    同一モード (chat→chat 等) は endpoint 側ガードで no-op。``coding_model`` が
+    base と同一なら ``model_changed=False`` で再起動も発生しない。ベストエフォート
+    で、失敗しても CLI 起動は継続する (モデル再起動は最大 30s の health 待ちが
+    あるため read timeout を長めに取る)。
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{url}/api/mode/switch",
+                json={"mode": mode},
+                timeout=httpx.Timeout(connect=5.0, read=90.0, write=5.0, pool=5.0),
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "Mode sync unexpected status %d (mode=%s)", resp.status_code, mode,
+                )
+                return
+            data = resp.json()
+            if data.get("model_changed") and not data.get("restart_initiated"):
+                logger.warning("Mode sync to %s: base server restart failed", mode)
+            else:
+                logger.debug(
+                    "Mode synced to %s (model_changed=%s)",
+                    mode, data.get("model_changed"),
+                )
+    except (httpx.ConnectError, httpx.TimeoutException, OSError) as e:
+        logger.debug("Mode sync failed (ignored): %s", e)
+
+
 async def _unregister_session(url: str, session_id: str) -> None:
     """バックエンドからセッションを解除（ベストエフォート）"""
     try:

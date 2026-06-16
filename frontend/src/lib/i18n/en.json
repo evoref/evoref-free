@@ -287,6 +287,7 @@
 		"group_llama_server": "Server Connection",
 		"group_llama_performance": "Performance",
 		"group_llama_generation": "Cache & Generation",
+		"group_llama_mtp": "MTP (Multi-Token Prediction)",
 		"group_llm_call": "LLM Call",
 		"group_editor_font": "Font",
 		"group_editor_display": "Display",
@@ -352,7 +353,11 @@
 			"max_tokens_desc": "0 = unlimited",
 			"lora_target": "LoRA Target",
 			"enable_thinking": "Thinking Mode",
-			"extra_args": "Extra Arguments"
+			"extra_args": "Extra Arguments",
+			"mtp_enabled": "Enable MTP",
+			"mtp_enabled_desc": "Only effective on supported models (built-in MTP heads: Qwen3.5/3.6 etc.); ignored otherwise. Applied on next base model restart",
+			"mtp_draft_n_max": "MTP draft tokens",
+			"mtp_draft_n_max_desc": "Number of draft tokens per cycle (default 3)"
 		},
 		"rag": {
 			"chunk_size": "Chunk Size",
@@ -514,6 +519,10 @@
 			"concurrency_realtime": "Realtime concurrency",
 			"concurrency_background": "Background concurrency",
 			"concurrency_learning": "Learning concurrency",
+			"mtp_enabled": "Enable MTP",
+			"mtp_enabled_desc": "Only effective on supported models (built-in MTP heads); saving restarts the assist model to apply",
+			"mtp_draft_n_max": "MTP draft tokens",
+			"mtp_draft_n_max_desc": "Number of draft tokens per cycle (default 3)",
 			"local": {
 				"host": "Host",
 				"port": "Port",

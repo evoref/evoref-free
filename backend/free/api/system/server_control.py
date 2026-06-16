@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -315,6 +316,28 @@ def stop_server_process(
             )
 
     return _stop_external_server(name, cfg)
+
+
+def wait_port_released(name: ServerName, cfg: dict, timeout: float = 10.0) -> bool:
+    """指定サーバの port が LISTENING でなくなるまで待つ (停止後の再 spawn 前ガード)。
+
+    旧サーバを kill した直後に新プロセスを spawn すると、旧サーバの graceful
+    shutdown 残響で ``wait_for_health`` が旧サーバの ``/health`` 200 を拾う窓が
+    残る。再 spawn 前に port 解放を確認することでこの窓を潰す。``find_port_occupant``
+    は LISTENING のみマッチするため TIME_WAIT は拾わない (実害なし)。
+    """
+    from backend.free.cli.pid_manager import find_port_occupant
+
+    endpoint = _resolve_endpoint(name, cfg)
+    if endpoint is None:
+        return True
+    _host, port = endpoint
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if find_port_occupant(port) is None:
+            return True
+        time.sleep(0.5)
+    return find_port_occupant(port) is None
 
 
 async def start_server_process(name: ServerName, cfg: dict) -> tuple[bool, str]:

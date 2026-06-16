@@ -631,15 +631,26 @@ class FewShotPool(JsonStateStore):
 
         dl = self._debug_logger
         if dl:
+            selected_ids = [ex.id for ex in selected]
+            scores = [round(s, 4) for s, _ in scored[:k]]
+            # evolve 専用 learning カテゴリ (従来通り)
             dl.log_learning_cycle(cycle_num=0, data={
                 "component": "fewshot_pool",
                 "op": "select_top_k",
                 "mode": mode,
                 "pool_considered": len(pool),
                 "query_len": len(q),
-                "selected_ids": [ex.id for ex in selected],
-                "scores": [round(s, 4) for s, _ in scored[:k]],
+                "selected_ids": selected_ids,
+                "scores": scores,
             })
+            # debug / investigate でも見える rag カテゴリへ並行出力
+            dl.log_fewshot_select(
+                mode=mode,
+                query_len=len(q),
+                pool_considered=len(pool),
+                selected_ids=selected_ids,
+                scores=scores,
+            )
         return selected
 
     def mutate_selection(

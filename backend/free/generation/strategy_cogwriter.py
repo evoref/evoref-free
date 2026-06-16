@@ -604,8 +604,13 @@ class CogWriterStrategy:
         )
         t0 = time.monotonic()
         try:
+            # max_tokens は CodeSpec (modules/data_models/interfaces) を網羅できる
+            # 範囲で最小化する。iGPU + 4B assist では decode 長が支配項で、3072 は
+            # purpose timeout を超えて ReadTimeout+retry を誘発していた (~130s の
+            # 無駄待ち)。1536 で単一〜少数モジュールの spec は収まり、超過時は
+            # 下の except で spec=None → 非 CogWriter 経路へ安全にフォールバックする。
             data = await self.assist_client.generate_json(
-                prompt, max_tokens=3072, temperature=0.3,
+                prompt, max_tokens=1536, temperature=0.3,
                 purpose="code_spec_synthesis",
             )
             if not isinstance(data, dict):

@@ -64,11 +64,6 @@ class ConflictResolver:
         else:
             self.llm_call_interval = compute_llm_call_interval(base, params_b)
 
-        # バックグラウンド処理用タイムアウト（デフォルトの半分）
-        assist_cfg = config.get("assist_model", {})
-        default_timeout = float(assist_cfg.get("timeout", 10))
-        self._bg_timeout: float = default_timeout * 0.5
-
         # memory.jsonl へ LLM 呼び出し/スキップ件数を記録する任意ロガー
         self._debug_logger: DebugLogger | None = debug_logger
 
@@ -299,14 +294,16 @@ class ConflictResolver:
         ]
 
         try:
-            # バックグラウンド処理用の短いタイムアウトを使用
+            # timeout は明示せず purpose="conflict_resolution" の解決に委ねる。
+            # 明示 timeout は反応的自己較正 (_calibrated_timeouts) より優先されて
+            # しまい、低速 assist (iGPU + 4B) で 15s 固定のまま ReadTimeout を連発し
+            # SemMem auto-merge と学習を停滞させていた。purpose 既定 15s + 較正で
+            # 実レイテンシに追従させる (背景処理なので per-attempt 延長の体感影響なし)。
             gen_kwargs: dict = {
                 "stream": False,
                 "max_tokens": 512,
                 "id_slot": getattr(llm_client, "background_slot", -1),
             }
-            if hasattr(llm_client, "timeout"):
-                gen_kwargs["timeout"] = self._bg_timeout
 
             result = await llm_client.generate(
                 messages, purpose="conflict_resolution", **gen_kwargs,

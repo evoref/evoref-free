@@ -287,6 +287,7 @@
 		"group_llama_server": "サーバー接続",
 		"group_llama_performance": "パフォーマンス",
 		"group_llama_generation": "キャッシュ・生成",
+		"group_llama_mtp": "MTP (Multi-Token Prediction)",
 		"group_llm_call": "LLM呼出し",
 		"group_editor_font": "フォント",
 		"group_editor_display": "表示",
@@ -352,7 +353,11 @@
 			"max_tokens_desc": "0 = 無制限",
 			"lora_target": "LoRAターゲット",
 			"enable_thinking": "思考モード",
-			"extra_args": "追加引数"
+			"extra_args": "追加引数",
+			"mtp_enabled": "MTP を有効化",
+			"mtp_enabled_desc": "対応モデル (MTP ヘッド内蔵: Qwen3.5/3.6 等) でのみ有効。非対応モデルでは無視されます。次回ベースモデル再起動で反映",
+			"mtp_draft_n_max": "MTP draft トークン数",
+			"mtp_draft_n_max_desc": "1 サイクルで先読みする draft トークン数 (既定 3)"
 		},
 		"rag": {
 			"chunk_size": "チャンクサイズ",
@@ -514,6 +519,10 @@
 			"concurrency_realtime": "realtime 並行数",
 			"concurrency_background": "background 並行数",
 			"concurrency_learning": "learning 並行数",
+			"mtp_enabled": "MTP を有効化",
+			"mtp_enabled_desc": "対応モデル (MTP ヘッド内蔵) でのみ有効。保存でアシストモデルが再起動され反映されます",
+			"mtp_draft_n_max": "MTP draft トークン数",
+			"mtp_draft_n_max_desc": "1 サイクルで先読みする draft トークン数 (既定 3)",
 			"local": {
 				"host": "ホスト",
 				"port": "ポート",

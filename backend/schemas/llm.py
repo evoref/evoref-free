@@ -5,6 +5,30 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+class MtpConfig(BaseModel):
+    """MTP (Multi-Token Prediction) self-speculative decoding 設定。
+
+    モデル自身に内蔵された MTP ヘッド (NextN 層) を draft に使う自己投機方式。
+    外部 draft モデル不要のため追加 VRAM もトークナイザ整合の懸念もなく、Free /
+    Pro 共通で利用できる (Pro 限定の :class:`LlamaSpeculativeConfig` とは別系統)。
+
+    **MTP ヘッドを内蔵した GGUF でのみ有効** (Qwen3.5/3.6 等。GGUF メタデータ
+    ``<arch>.nextn_predict_layers > 0`` で判定)。非対応モデルに対しては
+    ``scripts/launch_llama.py`` 側で warning + フラグ未付与で素通りさせる
+    (graceful degrade)。base / assist で共有する。
+
+    起動フラグ (llama-server): ``--spec-type draft-mtp`` +
+    ``--spec-draft-n-max <draft_n_max>``。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    # 1 サイクルで先読みする draft トークン数 (上流 ``--spec-draft-n-max``)。
+    # 上流既定 3。
+    draft_n_max: int = Field(default=3, ge=1)
+
+
 class LlamaSpeculativeConfig(BaseModel):
     """self-speculative decoding 設定
 
@@ -130,6 +154,9 @@ class LlamaConfig(BaseModel):
     kv_unified: bool | None = None
     # self-speculative decoding。Pro 限定機能
     speculative: LlamaSpeculativeConfig = Field(default_factory=LlamaSpeculativeConfig)
+    # MTP (Multi-Token Prediction)。Free/Pro 共通。MTP ヘッド内蔵モデルでのみ有効。
+    # speculative と同時 enabled の場合は launch 側で MTP 優先 + speculative 無効化。
+    mtp: MtpConfig = Field(default_factory=MtpConfig)
     # モデル arch 別の起動フラグ / sampling 自動決定。true で GGUF メタデータ +
     # 同梱 model_profiles から --jinja / --reasoning-format / MoE / sampling 既定を
     # 解決する (base / assist 共通)。false で全機構 OFF (従来挙動)。

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { configData } from '$lib/free/stores/settings';
-	import { configSection, fieldUpdater } from '$lib/free/stores/settingsHelpers';
+	import { configSection, fieldUpdater, nestedFieldUpdater } from '$lib/free/stores/settingsHelpers';
 	import SettingsSection from './SettingsSection.svelte';
 	import FieldGroup from './fields/FieldGroup.svelte';
 	import TextField from './fields/TextField.svelte';
@@ -10,6 +10,7 @@
 	import TagListField from './fields/TagListField.svelte';
 
 	let llama = $derived(configSection($configData, 'llama'));
+	let mtp = $derived((llama.mtp ?? {}) as Record<string, unknown>);
 
 	const cacheTypeOptions = [
 		{ value: 'f16', label: 'f16' },
@@ -47,5 +48,10 @@
 		<NumberField label="settings.llama.max_tokens" value={Number(llama.max_tokens ?? 1024)} min={0} description="settings.llama.max_tokens_desc" onchange={fieldUpdater('llama', 'max_tokens')} />
 		<TextField label="settings.llama.lora_target" value={String(llama.lora_target ?? 'auto')} onchange={fieldUpdater('llama', 'lora_target')} />
 		<TagListField label="settings.llama.extra_args" value={(llama.extra_args as string[]) ?? []} placeholder="--arg value" onchange={fieldUpdater('llama', 'extra_args')} />
+	</FieldGroup>
+
+	<FieldGroup label="settings.group_llama_mtp">
+		<ToggleField label="settings.llama.mtp_enabled" value={Boolean(mtp.enabled ?? false)} description="settings.llama.mtp_enabled_desc" onchange={nestedFieldUpdater('llama', 'mtp', 'enabled')} />
+		<NumberField label="settings.llama.mtp_draft_n_max" value={Number(mtp.draft_n_max ?? 3)} min={1} description="settings.llama.mtp_draft_n_max_desc" onchange={nestedFieldUpdater('llama', 'mtp', 'draft_n_max')} />
 	</FieldGroup>
 </SettingsSection>
