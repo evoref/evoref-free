@@ -5,6 +5,7 @@
 	import PageLayout from '$lib/free/components/PageLayout.svelte';
 	import { messages, sessionId, switchMode, nextMessageId } from '$lib/free/stores/chat';
 	import type { ChatMessage } from '$lib/free/stores/chat';
+	import { isPro } from '$lib/edition';
 	import { groupByDate } from '$lib/free/utils/history';
 	import type { SessionSummary, SessionDetailData } from '$lib/free/types/history';
 	import {
@@ -86,7 +87,7 @@
 
 	// ── 続きから再開 ──
 
-	function resumeSession() {
+	async function resumeSession() {
 		if (!detail) return;
 		const restored: ChatMessage[] = detail.turns.map((turn) => ({
 			id: nextMessageId(),
@@ -94,7 +95,10 @@
 			content: turn.content,
 			timestamp: turn.timestamp ? new Date(turn.timestamp).getTime() : Date.now(),
 		}));
-		switchMode(detail.mode);
+		// Free では coding セッションを chat に丸める (Sidebar の露出方針に合わせる)。
+		// switchMode は await 後にモード別バッファで messages/sessionId を上書き
+		// するため、復元値が勝つよう先に await してから set する。
+		await switchMode(isPro ? detail.mode : 'chat');
 		messages.set(restored);
 		sessionId.set(detail.session_id);
 		goto('/');
@@ -156,7 +160,9 @@
 			<select class="mode-select" bind:value={modeFilter} onchange={handleModeChange}>
 				<option value="">{$t('history_page.mode_all')}</option>
 				<option value="chat">{$t('sidebar.mode_chat')}</option>
-				<option value="coding">{$t('sidebar.mode_coding')}</option>
+				{#if isPro}
+					<option value="coding">{$t('sidebar.mode_coding')}</option>
+				{/if}
 			</select>
 		</div>
 	{/snippet}

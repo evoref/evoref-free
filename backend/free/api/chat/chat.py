@@ -8,7 +8,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from backend.app_state import AppState, get_app_state
-from backend.config import get_config, get_mode_generation_params, resolve_context_size
+from backend.config import (
+    get_config,
+    get_mode_generation_params,
+    resolve_context_size_for_mode,
+)
 from backend.free.api.chat.chat_constants import (
     DEFAULT_KEEPALIVE_INTERVAL_SEC, DEFAULT_MAX_TOKENS,
     MAX_FILE_CONTEXT_TOTAL_CHARS, MAX_FILE_CONTEXT_TOTAL_CHUNKS,
@@ -738,6 +742,7 @@ async def _dispatch_meta_cognitive(
     semmem_block: str | None = None,
     rag_block: str | None = None,
     file_block: str | None = None,
+    fewshot_block: str | None = None,
     output_target: str = "file",
     rag_used: bool = False,
     rag_top1_score: float | None = None,
@@ -775,7 +780,11 @@ async def _dispatch_meta_cognitive(
         rag_block=rag_block,
         # 添付ファイル内容を維持 (deliberative の messages 注入と等価)
         file_block=file_block,
+        # Level 1 進化 few-shot を維持 (固定 scaffold の [参考例] に注入)
+        fewshot_block=fewshot_block,
         code_generator=code_generator,
+        # 内部 loop/token 予算を coding_model の実窓に合わせる
+        mode=req.mode,
     )
     keepalive_sec = cfg.get("streaming", {}).get(
         "keepalive_interval_sec", DEFAULT_KEEPALIVE_INTERVAL_SEC,
@@ -841,6 +850,8 @@ async def _dispatch_deliberative(
         assist_client=state.assist_client,
         assist_experience_recorder=state.assist_experience_recorder,
         agent_tracer=state.agent_tracer,
+        # コンテンツ生成 max_tokens を coding_model の実窓に合わせる
+        mode=req.mode,
     )
 
     if req.stream:
@@ -896,7 +907,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         raise HTTPException(status_code=503, detail="llama-server not connected")
 
     instance_name = cfg.get("instance", {}).get("name", "evoref")
-    context_size = resolve_context_size(cfg, "base")
+    context_size = resolve_context_size_for_mode(cfg, req.mode)
     max_tokens = cfg.get("llama", {}).get("max_tokens", DEFAULT_MAX_TOKENS) or None
     gen_params = get_mode_generation_params(req.mode)
 
@@ -918,7 +929,23 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         policy=state.policy_interpreter,
     )
     agent_layer = classifier.classify(req.message, mode=req.mode)
-    logger.info("Agent layer: %s for query: %s", agent_layer, req.message[:80])
+    logger.info(
+        "Agent layer: %s (mode=%s) for query: %s",
+        agent_layer, req.mode, req.message[:80],
+    )
+    # primary routing を decision.jsonl に記録 (evolve 限定)。後続の reactive→
+    # light/deliberative escalation (_log_layer_escalation) は別 decision_point。
+    # context={"mode"} は policy_adjuster が mode 別 routing 学習に使う (load-bearing)。
+    dl = getattr(state, "debug_logger", None)
+    if dl is not None:
+        dl.log_decision(
+            decision_point="layer_classification",
+            chosen=agent_layer,
+            candidates=["reactive", "deliberative", "meta_cognitive"],
+            reason=getattr(classifier, "_last_classify_reason", "default"),
+            context={"mode": req.mode},
+            scope="request",
+        )
 
     timer = StageTimer()
     # pending 競合のユーザー回答判定 + 即時反映 (不変則例外 (b)、解決結果は
@@ -999,7 +1026,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             ):
                 try:
                     recall_judgement = await state.tool_call_judge.recall_url_judgement(
-                        req.message, state.tools_registry,
+                        req.message, state.tools_registry, mode=req.mode,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -1106,18 +1133,20 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             case "meta_cognitive":
                 # meta は task 記述単位で judge するため query 単位の precomputed は
                 # 流用不可 (judge_task は通常 None)。念のため破棄する。
-                # meta 経路は messages を生成に使わず system_prompt + history から
-                # 再構築するため、従来の get_prompt(mode, query) と同一になるよう
-                # static system に few-shot を結合して渡す (挙動同等)。
+                # meta 経路は固定の PLAN/EXECUTE/CONTENT scaffold を使うため、
+                # few-shot は system へ結合せず instance block (fewshot_block) として
+                # 渡し、ツールループ / コンテンツ生成 / fallback の system に
+                # [参考例] として注入する (Level 1 進化を coding 生成へ反映)。
                 _cancel_pending_task(judge_task)
                 return await _dispatch_meta_cognitive(
                     req, client, state, cfg, gen_params,
-                    system_prompt + fewshot_block, history,
+                    system_prompt, history,
                     session_id, instance_name, context_size,
                     messages, search_error_wrapper, timer,
                     semmem_block=semmem_block,
                     rag_block=_format_rag_block_for_meta(scored_chunks),
                     file_block=file_block,
+                    fewshot_block=fewshot_block,
                     output_target=output_target,
                     rag_used=rag_used,
                     rag_top1_score=rag_top1_score,

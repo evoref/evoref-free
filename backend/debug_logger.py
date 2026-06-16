@@ -331,17 +331,21 @@ class DebugLogger:
         *,
         agent_layer: str = "",
         tokens_generated: int = 0,
+        mode: str = "",
     ) -> None:
         """リクエスト処理のステージ別タイミング内訳を記録"""
         if not self.enabled or not self.log_requests:
             return
-        self._emit("requests", {
+        entry = {
             "timestamp": _now(),
             "op": "timing",
             "agent_layer": agent_layer,
             "tokens_generated": tokens_generated,
             "timing": timing,
-        })
+        }
+        if mode:
+            entry["mode"] = mode
+        self._emit("requests", entry)
 
     def log_kv_cache(self, *, tokens_prompt: int, tokens_cached: int) -> None:
         """KV キャッシュヒット状況を記録（llama-server usage.prompt_tokens_details から）"""
@@ -374,6 +378,34 @@ class DebugLogger:
             "query": query[:100],
             "num_chunks": len(chunks),
             "top_scores": [c[1] for c in chunks[:5]],
+        })
+
+    def log_fewshot_select(
+        self,
+        *,
+        mode: str,
+        query_len: int,
+        pool_considered: int,
+        selected_ids: list[str],
+        scores: list[float],
+    ) -> None:
+        """推論時の few-shot 選択結果を ``rag.jsonl`` に記録
+
+        どの example をどのスコアで前置したかはチャット応答パスのホットな
+        判断だが、``log_learning_cycle`` (learning カテゴリ) は evolve でしか
+        出ない。debug / investigate で有効な requests と並ぶ rag カテゴリにも
+        出すことで、モード別 few-shot 選択をリクエスト粒度で観測できる。
+        """
+        if not self.enabled or not self.log_rag:
+            return
+        self._emit("rag", {
+            "timestamp": _now(),
+            "op": "fewshot_select",
+            "mode": mode,
+            "query_len": query_len,
+            "pool_considered": pool_considered,
+            "selected_ids": selected_ids,
+            "scores": scores,
         })
 
     def log_embedding(

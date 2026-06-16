@@ -150,10 +150,12 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "long_form_planning": 90.0,
     "long_form_code_review": 90.0,
     "long_form_text_review": 90.0,
-    # 設計仕様合成は modules/data_models/interfaces 等を含む大きめ JSON を
-    # 返すため long_form_planning と同等の 90s。フローチャートは mermaid 文字列
-    # 1 本のため 45s。
-    "code_spec_synthesis": 90.0,
+    # 設計仕様合成は modules/data_models/interfaces 等を含む JSON を返す。
+    # max_tokens は 1536 に抑制済 (strategy_cogwriter) だが、iGPU + 低速 assist で
+    # cold prefill 時に 90s を超えると ReadTimeout+retry で ~90s 余分に待つため、
+    # 1 attempt で完了させるマージンとして 120s を採る。フローチャートは mermaid
+    # 文字列 1 本のため 45s。
+    "code_spec_synthesis": 120.0,
     "flowchart_synthesis": 45.0,
     # コードリペアは assembled 全体を再出力するため long_form_* と同等に確保。
     "code_repair": 90.0,

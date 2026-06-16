@@ -452,6 +452,50 @@ def build_speculative_args(
     return args
 
 
+def build_mtp_args(
+    model_cfg: dict,
+    model_path: Path,
+    *,
+    warn: Callable[[str], None] | None = None,
+) -> list[str]:
+    """``mtp`` セクションから MTP self-speculative の ``--spec-*`` フラグを組み立てる。
+
+    Free / Pro 共通 (Pro 限定の :func:`build_speculative_args` とは別系統)。
+    モデル自身の MTP ヘッド (NextN 層) を draft に使うため外部 draft モデル不要。
+
+    **MTP ヘッド内蔵モデルでのみ有効**。GGUF メタデータ
+    ``<arch>.nextn_predict_layers > 0`` で判定し、非対応モデルには warning を
+    出してフラグを付与しない (graceful degrade)。``enabled=false`` / ``mtp``
+    未設定なら warning なしで ``[]``。
+
+    Args:
+        model_cfg: base なら ``cfg["llama"]``、assist なら
+            ``cfg["assist_model"]["local"]`` の dict。``mtp`` サブ dict を読む。
+        model_path: 解決済みモデル GGUF パス (MTP ヘッド検出用)。
+        warn: warning 出力先。``None`` なら何もしない。
+
+    Returns:
+        ``llama-server`` に追加すべき引数のリスト。無効 / 非対応時は ``[]``。
+    """
+    mtp_cfg = model_cfg.get("mtp") or {}
+    if not mtp_cfg.get("enabled", False):
+        return []
+
+    meta = read_gguf_metadata(model_path)
+    if int(meta.get("nextn_predict_layers", 0) or 0) <= 0:
+        if warn is not None:
+            warn(
+                "[launch] WARNING: mtp.enabled=true but the model has no MTP "
+                f"heads (nextn_predict_layers=0): {model_path.name}. Skipping "
+                "--spec-type draft-mtp (MTP requires a model such as "
+                "Qwen3.5/3.6 with a built-in NextN layer)."
+            )
+        return []
+
+    draft_n_max = int(mtp_cfg.get("draft_n_max", 3) or 3)
+    return ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(draft_n_max)]
+
+
 def build_llama_cmd(
     cfg: dict,
     project_root: Path | None = None,
@@ -478,7 +522,9 @@ def build_llama_cmd(
         "llama-server",
         "-m", str(base_model_path),
         "--port", str(lc.get("port", 8080)),
-        "-c", str(resolve_context_size_for(cfg, "base", project_root)),
+        "-c", str(resolve_context_size_for(
+            cfg, "base", project_root, model_override=model_override,
+        )),
         "-ngl", str(_resolve_base_gpu_layers(cfg, project_root)),
         "-b", str(lc.get("batch_size", 512)),
     ]
@@ -571,15 +617,34 @@ def build_llama_cmd(
     _append_cache_ram_args(cmd, lc, default_mib=4096)
     _append_kv_unified_args(cmd, lc, slots=int(slots))
 
-    # self-speculative decoding。Pro 限定機能。Free 判定では
-    # ``enabled=true`` でも warning + フラグ未付与で素通りさせる。
-    spec_args = build_speculative_args(
+    # MTP (Multi-Token Prediction) self-speculative。Free/Pro 共通。MTP ヘッド
+    # 内蔵モデルでのみ有効 (非対応は warning + 素通り)。MTP と Pro speculative は
+    # どちらも ``--spec-type`` を出力するため排他: MTP が実効なら speculative を
+    # スキップする (両 enabled なら MTP 優先 + warning)。
+    mtp_args = build_mtp_args(
         lc,
-        is_pro=_resolve_pro_edition(),
-        project_root=project_root,
+        base_model_path,
         warn=lambda msg: print(msg, file=sys.stderr),
     )
-    cmd += spec_args
+    if mtp_args:
+        cmd += mtp_args
+        if (lc.get("speculative") or {}).get("enabled", False):
+            print(
+                "[launch] WARNING: both llama.mtp.enabled and "
+                "llama.speculative.enabled are true; MTP takes precedence and "
+                "--spec-* (speculative) flags are skipped.",
+                file=sys.stderr,
+            )
+    else:
+        # self-speculative decoding。Pro 限定機能。Free 判定では
+        # ``enabled=true`` でも warning + フラグ未付与で素通りさせる。
+        spec_args = build_speculative_args(
+            lc,
+            is_pro=_resolve_pro_edition(),
+            project_root=project_root,
+            warn=lambda msg: print(msg, file=sys.stderr),
+        )
+        cmd += spec_args
 
     # profile.reasoning (server_control:true = Qwen3/DeepSeek 系) から server 側
     # reasoning 起動フラグ (--reasoning-budget 等) を付与する。resolve_auto_model_flags
@@ -789,6 +854,15 @@ def build_assist_cmd(
     _append_cache_ram_args(cmd, local_cfg, default_mib=2048)
     _append_kv_unified_args(cmd, local_cfg, slots=int(slots))
 
+    # MTP (Multi-Token Prediction) self-speculative。Free/Pro 共通。MTP ヘッド
+    # 内蔵モデルでのみ有効 (非対応は warning + 素通り)。assist は speculative を
+    # 持たないため排他考慮は不要。
+    cmd += build_mtp_args(
+        local_cfg,
+        assist_model_path,
+        warn=lambda msg: print(msg, file=sys.stderr),
+    )
+
     # reasoning OS-fence。thinking モデルをアシスト用途で
     # 使う場合の token 浪費を起動時点で抑止する。リクエスト側の
     # ``chat_template_kwargs.enable_thinking=false`` (assist_client.py) と
@@ -986,7 +1060,8 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
 
     Returns (失敗時・キー不在時も同じ shape):
         ``{"architecture": str | None, "context_length": int | None,
-           "expert_count": int, "has_chat_template": bool,
+           "expert_count": int, "nextn_predict_layers": int,
+           "has_chat_template": bool,
            "block_count" / "head_count_kv" / "head_count" / "key_length" /
            "value_length" / "embedding_length": int | None}``
 
@@ -1001,6 +1076,9 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
         "architecture": None,
         "context_length": None,
         "expert_count": 0,
+        # MTP (Multi-Token Prediction) ヘッド数。``<arch>.nextn_predict_layers``。
+        # >0 で MTP 対応 (Qwen3.5/3.6 等)。0 / 不在で非対応。
+        "nextn_predict_layers": 0,
         "has_chat_template": False,
         # KV キャッシュ VRAM 推定用 (estimate_kv_cache_mb)
         "block_count": None,
@@ -1035,6 +1113,13 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
                 elif key.endswith(".expert_count"):
                     try:
                         result["expert_count"] = int(_gguf_read_scalar_or_skip(f, vtype))
+                    except (TypeError, ValueError):
+                        pass
+                elif key.endswith(".nextn_predict_layers"):
+                    try:
+                        result["nextn_predict_layers"] = int(
+                            _gguf_read_scalar_or_skip(f, vtype)
+                        )
                     except (TypeError, ValueError):
                         pass
                 elif key.endswith(".block_count"):
@@ -1537,6 +1622,7 @@ def _profile_context_size_for_model(
 
 def resolve_context_size_for(
     cfg: dict, name: str, project_root: Path | None = None,
+    *, model_override: str | None = None,
 ) -> int:
     """slot の ``-c`` (context_size) を解決する。
 
@@ -1546,6 +1632,12 @@ def resolve_context_size_for(
     (未指定) のときのみ profile を参照する。プロファイル参照は base / assist の
     み、かつ ``project_root`` 指定時のみ (未指定なら config + 既定で解決)。
     embed は profile 非対象 (従来挙動)。
+
+    ``model_override`` 指定時 (例: /api/mode/switch で coding_model に差し替えて
+    base を再起動する経路) は、その実モデルの profile から ``context_size`` を
+    引く。これにより ``-m`` で渡すモデルと ``-c`` が一致する (旧実装は常に
+    base_model profile から ``-c`` を引いていた)。``llama.context_size`` の明示は
+    手動 pin として override より優先する。
     """
     default = _CONTEXT_SIZE_DEFAULTS.get(name, 8192)
     if name == "base":
@@ -1564,7 +1656,7 @@ def resolve_context_size_for(
     if explicit is not None:
         return int(explicit)
     if project_root is not None:
-        model_rel = (cfg.get("model_paths") or {}).get(model_key, "")
+        model_rel = model_override or (cfg.get("model_paths") or {}).get(model_key, "")
         if model_rel:
             model_path = Path(model_rel)
             if not model_path.is_absolute():
@@ -2256,15 +2348,51 @@ def check_llamacpp_build(
     return True, detected, required, messages
 
 
-def wait_for_health(host: str, port: int, timeout: int = 30) -> bool:
-    """llama-server のヘルスチェックをポーリング"""
+def _props_model_matches(host: str, port: int, expected_model_id: str) -> bool:
+    """``/props`` の load 済みモデルが ``expected_model_id`` と一致するか。
+
+    モデル切替の再起動で、旧サーバが生き残って ``/health`` 200 を返す/新サーバが
+    まだ別モデルをロード中、といったケースを弾くための同一性検証。``/props`` の
+    ``model_alias`` → ``model_path`` → ``default_generation_settings.model`` の順で
+    load 済みモデルを引き、basename で比較する (alias がフルパス/別名のことがある)。
+    """
+    try:
+        resp = httpx.get(f"http://{host}:{port}/props", timeout=2.0)
+        if resp.status_code != 200:
+            return False
+        props = resp.json()
+    except (httpx.ConnectError, httpx.TimeoutException, ValueError):
+        return False
+    loaded = props.get("model_alias") or props.get("model_path") or ""
+    if not loaded:
+        gen = props.get("default_generation_settings")
+        if isinstance(gen, dict):
+            loaded = gen.get("model", "")
+    if not loaded:
+        return False
+    return Path(str(loaded)).name == Path(expected_model_id).name
+
+
+def wait_for_health(
+    host: str, port: int, timeout: int = 30,
+    expected_model_id: str | None = None,
+) -> bool:
+    """llama-server のヘルスチェックをポーリング。
+
+    ``expected_model_id`` を渡すと ``/health`` 200 に加えて ``/props`` の load 済み
+    モデルが一致するまで待つ。モデル切替の再起動で、旧サーバの 200 や新サーバの
+    ロード途中を成功と誤判定しないための同一性検証 (``None`` なら従来挙動)。
+    """
     url = f"http://{host}:{port}/health"
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             resp = httpx.get(url, timeout=2.0)
             if resp.status_code == 200:
-                return True
+                if expected_model_id is None:
+                    return True
+                if _props_model_matches(host, port, expected_model_id):
+                    return True
         except (httpx.ConnectError, httpx.TimeoutException):
             pass
         time.sleep(1.0)

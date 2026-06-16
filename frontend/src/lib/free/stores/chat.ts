@@ -226,8 +226,15 @@ export async function switchMode(newMode: string): Promise<void> {
 			modeRestartStatus.set('idle');
 		}
 	} catch {
-		// API 失敗: UI はそのまま（ロールバック不要 — まだ更新していない）
+		// API 失敗 (接続エラー等の一過性): UI はそのまま（ロールバック不要 —
+		// まだ currentMode を更新していない）。'ready' と対称に一定時間後
+		// 'idle' へ自動復帰させ、失敗表示が出っぱなしになるのを防ぐ。
+		// (model_changed && !restart_initiated の 'failed' は実モデル未起動を
+		//  反映するため sticky のまま据え置く)
 		modeRestartStatus.set('failed');
+		setTimeout(() => {
+			if (get(modeRestartStatus) === 'failed') modeRestartStatus.set('idle');
+		}, MODE_RESTART_STATUS_TIMEOUT_MS);
 	}
 }
 

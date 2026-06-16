@@ -423,7 +423,7 @@ async def _cmd_pin(args: str, state: SessionState, console) -> CommandResult:
         "subject": "user.pinned",
         "predicate": "remember",
         "type": "personal_fact",
-        "mode_origin": "chat",
+        "mode_origin": state.mode,
     }
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:

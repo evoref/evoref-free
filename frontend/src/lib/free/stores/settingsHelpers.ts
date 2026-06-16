@@ -6,7 +6,7 @@
  */
 
 import type { ConfigData } from '$lib/types/settings';
-import { updateField, updateNestedField } from './settings';
+import { updateField, updateNestedField, updateDeepNestedField } from './settings';
 
 /**
  * configData から指定セクションを型安全に取得する
@@ -55,6 +55,16 @@ export function fieldUpdater(section: string, key: string) {
 /** ネストされたセクションの onchange コールバックを生成 */
 export function nestedFieldUpdater(section: string, parent: string, key: string) {
 	return (value: unknown) => updateNestedField(section, parent, key, value);
+}
+
+/** 2 段ネスト (section.parent.child.key) の onchange コールバックを生成 */
+export function deepNestedFieldUpdater(
+	section: string,
+	parent: string,
+	child: string,
+	key: string
+) {
+	return (value: unknown) => updateDeepNestedField(section, parent, child, key, value);
 }
 
 // ── ビジネスロジックヘルパー ──

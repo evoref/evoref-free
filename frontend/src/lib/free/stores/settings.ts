@@ -208,6 +208,28 @@ export function updateNestedField(
 	checkDirty(section);
 }
 
+/** 2 段ネスト (section.parent.child.key) のフィールド値を更新 */
+export function updateDeepNestedField(
+	section: string,
+	parentKey: string,
+	childKey: string,
+	leafKey: string,
+	value: unknown
+): void {
+	configData.update((config) => {
+		const sectionData = { ...(config[section] || {}) };
+		const parent = { ...(sectionData[parentKey] as Record<string, unknown> || {}) };
+		const child = { ...(parent[childKey] as Record<string, unknown> || {}) };
+		child[leafKey] = value;
+		parent[childKey] = child;
+		sectionData[parentKey] = parent;
+		config = { ...config, [section]: sectionData };
+		return config;
+	});
+
+	checkDirty(section);
+}
+
 /** セクションの dirty 状態をチェック */
 function checkDirty(section: string): void {
 	const config = get(configData);

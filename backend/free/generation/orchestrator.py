@@ -12,7 +12,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
 
-from backend.config import resolve_context_size
+from backend.config import resolve_context_size_for_mode
 from backend.free.generation.code_repair import CodeRepairer, infer_language
 from backend.free.generation.import_wirer import wire_imports
 from backend.free.generation.code_skeleton import CodeSkeleton, update_skeleton
@@ -89,6 +89,9 @@ class LongFormOrchestrator:
         self._debug_logger = debug_logger
         self._generation_params = generation_params or {}
         self._policy = policy
+        # 直近 generate() のモード。_effective_context_size が coding_model の
+        # 実窓を反映するために参照する。generate() 開始時に確定する。
+        self._mode = "coding"
         # 直近 generate() の content_type ("code" / "text")。コンシューマが生成途中で
         # コード/テキストを判定するために参照する。generate() 開始時に確定する。
         self.last_content_type: str | None = None
@@ -133,7 +136,7 @@ class LongFormOrchestrator:
         1 リクエストが使える実効値は context_size // slots になる。
         """
         llama_cfg = self.config.get("llama", {})
-        total_ctx = resolve_context_size(self.config, "base")
+        total_ctx = resolve_context_size_for_mode(self.config, self._mode)
         slots = max(llama_cfg.get("slots", 1), 1)
         return total_ctx // slots
 
@@ -515,6 +518,8 @@ class LongFormOrchestrator:
             生成トークン文字列
         """
         t_start = time.monotonic()
+        # リクエストモードを保持 (_effective_context_size が実窓解決に参照)
+        self._mode = mode
 
         # 1. コンテンツ種別判定
         content_type = detect_content_type(instruction, mode)
@@ -529,6 +534,7 @@ class LongFormOrchestrator:
             instruction,
             prefetched_rag=prefetched_rag,
             file_context_block=file_context_block,
+            mode=mode,
         )
         if existing_content:
             context["existing_content"] = existing_content
@@ -698,6 +704,7 @@ class LongFormOrchestrator:
         instruction: str,
         prefetched_rag: list[tuple[str, float, str]] | None = None,
         file_context_block: str | None = None,
+        mode: str = "coding",
     ) -> dict:
         """メモリ3層 + RAG からコンテキストを収集
 
@@ -736,7 +743,7 @@ class LongFormOrchestrator:
         elif self.retriever is not None and self.embedder is not None:
             try:
                 results = await self.retriever.search(
-                    instruction, top_k=RAG_MAX_CHUNKS,
+                    instruction, top_k=RAG_MAX_CHUNKS, mode=mode,
                 )
                 if results:
                     rag_parts = []
