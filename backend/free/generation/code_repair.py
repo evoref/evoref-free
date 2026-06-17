@@ -94,16 +94,21 @@ def infer_language(file_paths: list[str]) -> str:
     return _EXT_LANG.get(top_ext, "python")
 
 
+# 複数ファイル分割時に「ファイル単位で安全に修正できる」 intra-file エラー種別。
+# undefined は他ファイル定義シンボル参照 (cross-file) の誤検知を含むため除外し、
+# wire_imports の再配線に委ねる。dataclass-call / syntax は同一ファイル内で完結する
+# ため複数ファイル時も修正対象に含める。
+_INTRA_FILE_ERROR_TYPES: frozenset[str] = frozenset({"syntax", "dataclass-call"})
+
+
 def _py_error_count(
-    code: str, *, syntax_only: bool = False,
+    code: str, *, intra_file_only: bool = False,
 ) -> tuple[int, list[ValidationError]]:
     errors = validate_python(code)
-    if syntax_only:
-        # 複数ファイル分割時、他ファイル定義シンボルの参照が undefined と誤検知
-        # されるため、ファイル単位の修正は構文エラーのみを対象にする。
+    if intra_file_only:
         n = sum(
             1 for e in errors
-            if e.severity == "error" and e.error_type == "syntax"
+            if e.severity == "error" and e.error_type in _INTRA_FILE_ERROR_TYPES
         )
     else:
         n = sum(1 for e in errors if e.severity == "error")
@@ -132,13 +137,15 @@ class CodeRepairer:
         self._debug_logger = debug_logger
 
     async def repair(
-        self, assembled: str, *, language: str = "python", syntax_only: bool = False,
+        self, assembled: str, *, language: str = "python",
+        intra_file_only: bool = False,
     ) -> str:
         """assembled を検証→修正→再検証し、エラー最小版を返す。例外時は原文。
 
-        ``syntax_only=True`` (複数ファイル分割時) は Python の未定義名チェックを
-        スキップし構文エラーのみ修正する (他ファイル定義シンボルの参照を
-        undefined と誤検知して不要な placeholder を生成するのを防ぐ)。
+        ``intra_file_only=True`` (複数ファイル分割時) は cross-file 参照の誤検知を
+        含む undefined を修正対象から外し、同一ファイル内で完結するエラー
+        (構文 / dataclass 引数不整合) のみ修正する。undefined の解決は後段の
+        ``wire_imports`` に委ねる (他ファイル定義シンボルへの placeholder 乱造を防ぐ)。
         """
         if not self._lf.get("repair_enabled", True):
             return assembled
@@ -149,22 +156,30 @@ class CodeRepairer:
             return assembled
         try:
             if language == "python":
-                return await self._repair_python(assembled, max_rounds, syntax_only)
+                return await self._repair_python(
+                    assembled, max_rounds, intra_file_only,
+                )
             return await self._selfcheck_generic(assembled, language)
         except Exception as e:  # noqa: BLE001 — リペアは出力経路を止めない
             logger.warning("code repair failed, returning original: %s", e)
             return assembled
 
     async def _repair_python(
-        self, code: str, max_rounds: int, syntax_only: bool = False,
+        self, code: str, max_rounds: int, intra_file_only: bool = False,
     ) -> str:
         best = code
-        best_n, errors = _py_error_count(best, syntax_only=syntax_only)
+        best_n, errors = _py_error_count(best, intra_file_only=intra_file_only)
         if best_n == 0:
             return best  # 対象エラー無し → 何もしない
         attempts = 0
         for _ in range(max_rounds):
-            err_lines = [str(e) for e in errors if e.severity == "error"][:10]
+            # intra_file_only 時はプロンプトにも対象種別のエラーのみ提示し、cross-file
+            # undefined を見せて placeholder を捏造させない。
+            err_lines = [
+                str(e) for e in errors
+                if e.severity == "error"
+                and (not intra_file_only or e.error_type in _INTRA_FILE_ERROR_TYPES)
+            ][:10]
             candidate = await self._ask(
                 _PYTHON_REPAIR_PROMPT.format(
                     errors="\n".join(err_lines), code=best,
@@ -174,7 +189,7 @@ class CodeRepairer:
             attempts += 1
             if not candidate:
                 break
-            n, errs = _py_error_count(candidate, syntax_only=syntax_only)
+            n, errs = _py_error_count(candidate, intra_file_only=intra_file_only)
             if n < best_n:
                 best, best_n, errors = candidate, n, errs
             if best_n == 0:

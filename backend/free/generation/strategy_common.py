@@ -318,6 +318,94 @@ def resolve_generation_order(units: list[CodeUnit]) -> list[CodeUnit]:
     return [unit_map[name] for name in order if name in unit_map]
 
 
+# エントリポイント相当とみなすユニット名 (これらが entry file に既にあれば二重生成しない)。
+_ENTRY_UNIT_NAMES: frozenset[str] = frozenset({
+    "main", "__main__", "__entry__", "run", "app", "cli", "entry", "entrypoint",
+})
+
+
+def _entry_leaf(entry_module: str) -> str:
+    """エントリモジュール表記から末尾モジュール名 (stem) を取り出す。
+
+    ``main.py`` / ``tetris`` / ``game_of_life.main`` のいずれも末尾セグメントを返す
+    (``game_of_life.main`` → ``main``)。
+    """
+    ep = entry_module[:-3] if entry_module.endswith(".py") else entry_module
+    return ep.replace("\\", "/").replace("/", ".").rsplit(".", 1)[-1]
+
+
+def _path_stem(path: str) -> str:
+    """ファイルパスから拡張子・ディレクトリを除いた stem を返す。"""
+    stem = (path or "").replace("\\", "/").rsplit("/", 1)[-1]
+    return stem[:-3] if stem.endswith(".py") else stem
+
+
+def _resolve_entry_file(
+    entry_module: str, code_units: list[CodeUnit], spec: "CodeSpec",
+) -> str:
+    """合成するエントリユニットを書き込む file_path を決める。
+
+    既存ユニット → ``spec.modules`` の順で entry stem に一致する path を優先し、
+    単一ファイル構成ならそのファイル、無ければ ``<leaf>.py`` を生成する。
+    """
+    leaf = _entry_leaf(entry_module)
+    for u in code_units:
+        if _path_stem(u.file_path) == leaf:
+            return u.file_path
+    for m in spec.modules:
+        if _path_stem(m.path) == leaf:
+            return m.path
+    paths = {u.file_path for u in code_units if u.file_path}
+    if len(paths) == 1:
+        return next(iter(paths))
+    return f"{leaf}.py"
+
+
+def _ensure_entry_unit(plan: GenerationPlan) -> None:
+    """``spec.entry_point`` があるのに対応ユニットが計画に無い場合、合成して追加する。
+
+    planner プロンプトは「entry_point を実装する unit を必ず含める」と指示するが、
+    weak local model はこれを無視して ``main()`` / ``if __name__ == '__main__'`` ガードを
+    生成しないことがある (起動不能なプログラム = 検証で「__main__ ガードが無い」/
+    「エントリポイントが存在しない」エラーになる)。本処理はその指示を計画段階で
+    決定的に enforce する。合成ユニットは全ユニットに依存させ最後に生成する
+    (rolling context で他ユニットの skeleton を参照できる)。
+    """
+    spec = plan.code_spec
+    if spec is None or not spec.entry_point or not spec.entry_point.module:
+        return
+    code_units = [u for u in plan.units if isinstance(u, CodeUnit)]
+    if not code_units:
+        return
+    entry_file = _resolve_entry_file(spec.entry_point.module, code_units, spec)
+    # 既にエントリ相当の unit が同一ファイルにあれば二重生成しない。
+    for u in code_units:
+        if u.file_path == entry_file and (
+            u.name.lower() in _ENTRY_UNIT_NAMES or "__main__" in u.spec
+        ):
+            return
+    invocation = (spec.entry_point.invocation or "").strip()
+    unit_spec = (
+        "プログラムのエントリポイントを実装する。これまでのユニットを統合して動作させる "
+        'main() 関数と、`if __name__ == "__main__":` ガード (その中で main を起動する) を'
+        "必ず含めること。"
+    )
+    if invocation:
+        unit_spec += f" 起動方法の契約: {invocation}"
+    plan.units.append(CodeUnit(
+        kind="function",
+        name="__entry__",
+        file_path=entry_file,
+        spec=unit_spec,
+        depends_on=[u.name for u in code_units],
+        estimated_tokens=500,
+    ))
+    logger.info(
+        "Injected synthetic entry-point unit for module '%s' (file=%s)",
+        spec.entry_point.module, entry_file,
+    )
+
+
 def finalize_plan_units(
     plan: GenerationPlan,
     max_units: int,
@@ -325,7 +413,8 @@ def finalize_plan_units(
 ) -> None:
     """計画ユニットを ``max_units`` に切り詰め、コードなら依存順ソートする (in-place)。
 
-    両戦略の create_plan 末尾で共通の後処理。
+    両戦略の create_plan 末尾で共通の後処理。コードはエントリポイント契約がある場合、
+    切り詰め後に合成エントリユニットを保証する (truncation で落とさない)。
     """
     if len(plan.units) > max_units:
         logger.warning(
@@ -333,6 +422,7 @@ def finalize_plan_units(
         )
         plan.units = plan.units[:max_units]
     if content_type == ContentType.CODE:
+        _ensure_entry_unit(plan)
         code_units = [u for u in plan.units if isinstance(u, CodeUnit)]
         plan.units = resolve_generation_order(code_units)
 

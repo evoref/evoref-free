@@ -278,13 +278,15 @@ class LongFormOrchestrator:
             groups.setdefault(unit.file_path or _DEFAULT_CODE_FILE, []).append(text)
         files: dict[str, str] = {}
         changed = False
-        # 複数ファイル分割時は他ファイル定義シンボル参照の undefined 誤検知を避け、
-        # ファイル単位の修正を構文エラーのみに限定する (未定義名は全体検証側で扱う)。
+        # 複数ファイル分割時は cross-file 参照の undefined 誤検知を避けるため undefined を
+        # 修正対象から外すが、同一ファイル内で完結するエラー (構文 / dataclass 引数不整合)
+        # は修正する。undefined の解決は後段の wire_imports に委ねる。
         multi_file = len(groups) > 1
         for path, texts in groups.items():
             group_code = "\n\n".join(texts)
             repaired_group = await repairer.repair(
-                group_code, language=infer_language([path]), syntax_only=multi_file,
+                group_code, language=infer_language([path]),
+                intra_file_only=multi_file,
             )
             if repaired_group != group_code:
                 changed = True
