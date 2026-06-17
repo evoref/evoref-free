@@ -129,27 +129,36 @@ def _is_bogus_sibling_import(
     sibling_modules: set[str],
     symbol_modules: dict[str, set[str]],
 ) -> bool:
-    """``from <flat_module> import a, b`` が「実在しない兄弟モジュール参照」かを判定する。
+    """``from <module> import a, b`` が「flat 配信で解決不能な兄弟参照」かを判定する。
 
-    LLM がフラットな snake_case のローカル風モジュール名 (例 ``game_engine_constants``)
-    を幻覚し、その import 名が実際には別の兄弟ファイルで定義されている、というパターン
-    を検出する。除去対象とするのは以下を**すべて**満たす場合のみ:
+    2 つの退化パターンを検出する:
 
-    - ``from <module> import ...`` (相対 / ``__future__`` / dotted は対象外)。
-    - ``<module>`` が実在の兄弟 stem でない (= 正しい sibling import ではない)。
-    - ``<module>`` が stdlib モジュール名でない (実在 stdlib を誤除去しない)。
+    1. **幻覚モジュール**: LLM がフラットなローカル風モジュール名 (例
+       ``game_engine_constants``) を幻覚し、その import 名が実際には別の兄弟ファイルで
+       定義されている。
+    2. **パッケージ絶対 self-import**: 生成物が ``pkg/`` サブディレクトリ前提のとき
+       LLM が ``from game_of_life.grid import Grid`` のような dotted 絶対 import を書く。
+       flat 配信では ``ModuleNotFoundError`` になるうえ、その import 名が
+       ``import_map`` を汚染して他ファイルの正しい cross-file 配線を阻害する。
+
+    除去対象とするのは以下を**すべて**満たす場合のみ:
+
+    - ``from <module> import ...`` (相対 / ``__future__`` は対象外)。
+    - ``<module>`` が実在の兄弟 stem でない (= 正しい flat sibling import ではない)。
+    - ``<module>`` の先頭セグメントが stdlib でない (実在 stdlib ``os.path`` 等を誤除去
+      しない)。
     - import される**全名**が他の兄弟ファイルで top-level 定義されている (= 除去後に
       ``wire_imports`` が正しい ``from <real_module> import`` を再配線できる)。
 
-    この保守的条件により、幻覚 import が ``import_map`` を汚染して正しい cross-file 配線を
-    阻害する問題を解消しつつ、実在の外部 import の誤除去を避ける。
+    最後の条件 (全名が兄弟定義) があるため、dotted な実在 3rd-party import
+    (``from foo.bar import Baz``) は ``Baz`` が兄弟定義でない限り除去されない。
     """
     if not isinstance(node, ast.ImportFrom):
         return False
     module = node.module
-    if (node.level or 0) > 0 or not module or "." in module:
+    if (node.level or 0) > 0 or not module:
         return False
-    if module in sibling_modules or module in _STDLIB_MODULES:
+    if module in sibling_modules or module.split(".")[0] in _STDLIB_MODULES:
         return False
     names = [alias.name for alias in node.names if alias.name != "*"]
     if not names:

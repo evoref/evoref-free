@@ -37,12 +37,23 @@ def _stems(paths) -> set[str]:
 
 
 def _resolve_entry_code(files: dict[str, str], entry_module: str) -> str | None:
-    """エントリポイントモジュールに対応する生成ファイルの内容を返す (無ければ None)。"""
+    """エントリポイントに対応する生成ファイルの内容を返す (無ければ None)。
+
+    ``entry_module`` は 3 形態を取り得る: ファイル名 (``main.py``)、素のモジュール名
+    (``tetris``)、dotted パッケージ修飾 (``game_of_life.main``)。dotted 修飾は Python
+    モジュール表記なので末尾セグメントがファイル stem に対応する
+    (``game_of_life.main`` → ``main``)。``os.path.splitext`` で dotted 名を分解すると
+    ``.main`` を拡張子として落として ``game_of_life`` を stem 扱いしてしまうため、
+    モジュール表記 (``/`` → ``.``) に正規化して full / leaf の両方で一致を見る。
+    """
     if entry_module in files:
         return files[entry_module]
-    ep_stem = os.path.splitext(os.path.basename(entry_module))[0]
+    ep = entry_module[:-3] if entry_module.endswith(".py") else entry_module
+    ep_full = ep.replace("\\", "/").replace("/", ".")
+    ep_leaf = ep_full.rsplit(".", 1)[-1]
     for path, code in files.items():
-        if os.path.splitext(os.path.basename(path))[0] == ep_stem:
+        mod_full = os.path.splitext(path)[0].replace("\\", "/").replace("/", ".")
+        if mod_full == ep_full or mod_full.rsplit(".", 1)[-1] == ep_leaf:
             return code
     return None
 
