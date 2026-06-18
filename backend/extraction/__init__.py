@@ -43,38 +43,29 @@ def _reinitialize_registry() -> None:
     global _registry
     _registry = ExtractorRegistry()
 
-    # Free Extractor の再登録
+    # 全 Extractor の再登録（Free 同梱: 基本4 + Office/ODF/メール/RTF/LaTeX）
     try:
         from backend.free.extraction.extractors.plaintext import PlaintextExtractor
         from backend.free.extraction.extractors.html import HtmlExtractor
         from backend.free.extraction.extractors.pdf import PdfExtractor
         from backend.free.extraction.extractors.csv_tsv import CsvTsvExtractor
+        from backend.free.extraction.extractors.docx import DocxExtractor
+        from backend.free.extraction.extractors.xlsx import XlsxExtractor
+        from backend.free.extraction.extractors.pptx import PptxExtractor
+        from backend.free.extraction.extractors.rtf import RtfExtractor
+        from backend.free.extraction.extractors.email_eml import EmailEmlExtractor
+        from backend.free.extraction.extractors.odf import OdfExtractor
+        from backend.free.extraction.extractors.latex import LatexExtractor
         _registry.register(PlaintextExtractor())
         _registry.register(HtmlExtractor())
         _registry.register(PdfExtractor())
         _registry.register(CsvTsvExtractor())
-    except ImportError:
-        pass
-
-    # Pro Extractor の再登録（利用可能な場合のみ）
-    try:
-        from backend.pro.extraction.extractors.docx import DocxExtractor
-        from backend.pro.extraction.extractors.xlsx import XlsxExtractor
-        from backend.pro.extraction.extractors.pptx import PptxExtractor
-        from backend.pro.extraction.extractors.rtf import RtfExtractor
-        from backend.pro.extraction.extractors.email_eml import EmailEmlExtractor
-        from backend.pro.extraction.extractors.email_msg import EmailMsgExtractor
-        from backend.pro.extraction.extractors.odf import OdfExtractor
-        from backend.pro.extraction.extractors.epub import EpubExtractor
-        from backend.pro.extraction.extractors.latex import LatexExtractor
         _registry.register(DocxExtractor())
         _registry.register(XlsxExtractor())
         _registry.register(PptxExtractor())
         _registry.register(RtfExtractor())
         _registry.register(EmailEmlExtractor())
-        _registry.register(EmailMsgExtractor())
         _registry.register(OdfExtractor())
-        _registry.register(EpubExtractor())
         _registry.register(LatexExtractor())
     except ImportError:
         pass

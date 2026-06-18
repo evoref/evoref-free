@@ -1,6 +1,6 @@
 """バイナリソースを扱う Extractor の共通テンプレート
 
-`pdf` / `docx` / `xlsx` / `epub` / `odf` / `pptx` / `email_msg` 等、外部ライブラリで
+`pdf` / `docx` / `xlsx` / `odf` / `pptx` 等、外部ライブラリで
 バイナリ (zip / OLE 等) を処理する Extractor は、以下のパターンが完全に重複していた:
 
 1. ライブラリの遅延 import (失敗時 ``ExtractionError("missing_library", ...)``)

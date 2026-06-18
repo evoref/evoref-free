@@ -27,8 +27,8 @@ def _get_supported_extensions() -> set[str]:
     return {
         ".md", ".txt", ".json", ".html", ".htm", ".pdf", ".csv", ".tsv",
         ".docx", ".xlsx", ".pptx",
-        # Pro 拡張: レジストリに登録されていれば自動的に利用可能
-        ".rtf", ".eml", ".msg", ".odt", ".ods", ".odp", ".epub", ".tex",
+        # Office/ODF/メール(eml)/RTF/LaTeX（Free 同梱）
+        ".rtf", ".eml", ".odt", ".ods", ".odp", ".tex",
     }
 
 

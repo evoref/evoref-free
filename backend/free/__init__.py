@@ -72,10 +72,10 @@ def setup_free(app: FastAPI) -> None:
     app.include_router(loop_router)
     app.include_router(system_router)
 
-    # テキスト抽出 Extractor の登録（Free 4種）
+    # テキスト抽出 Extractor の登録（Free 11種）
     import backend.free.extraction  # noqa: F401
 
-    # ファイル書出し Writer の登録（Free 5種）
+    # ファイル書出し Writer の登録（Free 9種）
     import backend.free.export  # noqa: F401
 
     register_free()

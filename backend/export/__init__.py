@@ -46,32 +46,25 @@ def _reinitialize_writer_registry() -> None:
     global _registry
     _registry = WriterRegistry()
 
-    # Free Writer の再登録
+    # 全 Writer の再登録（Free 同梱: 基本5 + Office/ODF）
     try:
         from backend.free.export.writers.plaintext import PlaintextWriter
         from backend.free.export.writers.html import HtmlWriter
         from backend.free.export.writers.csv_tsv import CsvTsvWriter
         from backend.free.export.writers.json_yaml import JsonYamlWriter
         from backend.free.export.writers.latex import LatexWriter
+        from backend.free.export.writers.docx import DocxWriter
+        from backend.free.export.writers.xlsx import XlsxWriter
+        from backend.free.export.writers.pptx import PptxWriter
+        from backend.free.export.writers.odf import OdfWriter
         _registry.register(PlaintextWriter())
         _registry.register(HtmlWriter())
         _registry.register(CsvTsvWriter())
         _registry.register(JsonYamlWriter())
         _registry.register(LatexWriter())
-    except ImportError:
-        pass
-
-    # Pro Writer の再登録（利用可能な場合のみ）
-    try:
-        from backend.pro.export.writers.docx import DocxWriter
-        from backend.pro.export.writers.xlsx import XlsxWriter
-        from backend.pro.export.writers.pptx import PptxWriter
-        from backend.pro.export.writers.odf import OdfWriter
-        from backend.pro.export.writers.epub import EpubWriter
         _registry.register(DocxWriter())
         _registry.register(XlsxWriter())
         _registry.register(PptxWriter())
         _registry.register(OdfWriter())
-        _registry.register(EpubWriter())
     except ImportError:
         pass
