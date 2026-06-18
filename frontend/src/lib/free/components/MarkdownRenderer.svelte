@@ -13,8 +13,13 @@
 	import { marked, type Token } from 'marked';
 	import DOMPurify from 'dompurify';
 	import CodeViewer from './CodeViewer.svelte';
+	import MermaidDiagram from './MermaidDiagram.svelte';
 	import { normalizeLanguage } from '$lib/free/utils/code_blocks';
 	import { t } from '$lib/i18n';
+
+	function isMermaid(lang: string | undefined): boolean {
+		return (lang ?? '').toLowerCase().trim() === 'mermaid';
+	}
 
 	// suppressCode: コーディングモードでコードをエディタへ流す場合、チャット側の
 	// コードブロックを「エディタに出力」プレースホルダに置換する。
@@ -32,7 +37,10 @@
 <div class="markdown-renderer">
 	{#each tokens as token, i (i)}
 		{#if token.type === 'code'}
-			{#if suppressCode}
+			{#if isMermaid(token.lang)}
+				<!-- 設計フローチャート等: suppressCode でも図は描画する -->
+				<MermaidDiagram code={token.text} />
+			{:else if suppressCode}
 				<div class="code-in-editor">{$t('chat.code_in_editor', { lang: normalizeLanguage(token.lang) })}</div>
 			{:else}
 				<CodeViewer content={token.text} language={normalizeLanguage(token.lang)} />

@@ -72,6 +72,9 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     # 同期発火する (タスク分解後に他のエージェントが実行される) ため
     # realtime に分類する。
     "meta_cognitive_plan": "realtime",
+    # staged コーディングのタスクグラフ合成。coding mode のチャット応答パス
+    # 冒頭で同期発火し、ユーザは plan 確定を待つ (meta_cognitive_plan と同根拠)。
+    "coding_task_graph": "realtime",
     # エディタタブ名導出。coding mode のチャット応答パス (long_form /
     # meta_cognitive のエディタ出力終端) で同期発火し、ユーザはタブ名表示を
     # 待つ。max_tokens 数十・budget 0 の極短呼出なので realtime に乗せる。
@@ -99,6 +102,9 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     # と同列の background スロット。
     "code_spec_synthesis": "background",
     "flowchart_synthesis": "background",
+    # staged コーディングの spec 工程: 設計仕様 (spec.md) のテキスト生成。
+    # 自律ループ内 (inline 駆動) で発火する重いテキスト生成のため background。
+    "coding_spec_doc": "background",
     # コードリペア (長文生成末尾の検証ゲート付き修正)。生成完了後に発火する
     # 重い修正パスで long_form_* と同列。background スロット。
     "code_repair": "background",
@@ -191,6 +197,11 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # meta-cognitive 計画 (タスク分解) は coding mode の
     # 応答パスで発火するため、長すぎるとユーザ体感を阻害する。30s で打ち切り。
     "meta_cognitive_plan": 30.0,
+    # staged コーディングのタスクグラフ合成 (summary + modules[] の JSON)。
+    # meta_cognitive_plan より構造が大きいため 45s。失敗時は longform へ fallback。
+    "coding_task_graph": 45.0,
+    # staged コーディングの spec.md テキスト生成。long_form_* と同等に確保。
+    "coding_spec_doc": 90.0,
     # エディタタブ名導出 ({"file_name": "..."} の極短 JSON)。応答パスで
     # 同期発火するため短く打ち切る。失敗時は言語別 fallback stem に倒す。
     "editor_filename": 8.0,
@@ -266,6 +277,10 @@ PURPOSE_REASONING_BUDGET_DEFAULTS: dict[str, int] = {
     "tool_judgment": 0,
     # meta-cognitive 計画は機械的なタスク分解で thinking 不要
     "meta_cognitive_plan": 0,
+    # タスクグラフ合成も機械的な分割で thinking 不要 (response_format で構造固定)。
+    "coding_task_graph": 0,
+    # spec.md 生成は設計の言語化で中程度の推論余地が有効。
+    "coding_spec_doc": 1024,
     # エディタタブ名導出は機械的な命名で thinking 不要。
     # response_format (EditorFilenameResult) で構造を固定する。
     "editor_filename": 0,
@@ -345,6 +360,21 @@ def _resolve_assist_model_filename(config: dict, local_cfg: dict) -> str:
     if not raw:
         return ""
     return Path(str(raw)).name
+
+
+def _finish_reason_of(result: dict) -> str:
+    """llama-server レスポンスから ``choices[0].finish_reason`` を取り出す。
+
+    取得できない場合は空文字列。``"length"`` は max_tokens 切断を示す。
+    """
+    if not isinstance(result, dict):
+        return ""
+    choices = result.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        fr = choices[0].get("finish_reason")
+        if isinstance(fr, str):
+            return fr
+    return ""
 
 
 def _extract_cache_metrics(result: dict) -> dict | None:
@@ -902,6 +932,7 @@ class AssistModelClient(BaseHTTPClient):
         list_key: str | None = None,
         response_format: dict | None = None,
         response_schema: type[BaseModel] | None = None,
+        telemetry: dict | None = None,
     ) -> dict:
         """アシストモデルで JSON 出力を生成・パース
 
@@ -920,6 +951,10 @@ class AssistModelClient(BaseHTTPClient):
                 purpose 別自動解決より優先して制約サンプリングに使われる
 。``content_type`` で schema が分岐する purpose
                 (``long_form_planning``) で利用する。
+            telemetry: 省略可の out-param dict。指定すると ``finish_reason`` /
+                ``truncated`` (max_tokens 切断か) / ``repair_used`` を書き戻す。
+                plan/spec 合成側が「JSON が途中切断されモジュール/ユニットが
+                欠落した可能性」を検知するために使う。
 
         Returns:
             パースされた JSON dict。パース失敗時は空 dict。
@@ -933,18 +968,39 @@ class AssistModelClient(BaseHTTPClient):
         )
         content = extract_content(result)
 
+        # finish_reason="length" (max_tokens 切断) を検知して可視化する。
+        # 切断された JSON は下の json-repair で部分復元され「成功」に見えるが、
+        # plan/spec ではモジュール/ユニットが黙って欠落する原因になるため、
+        # WARNING + out-param telemetry で呼出側が気付けるようにする。
+        finish_reason = _finish_reason_of(result)
+        truncated = finish_reason == "length"
+        if telemetry is not None:
+            telemetry["finish_reason"] = finish_reason
+            telemetry["truncated"] = truncated
+            # WARNING は telemetry を渡した「切断を気にする」呼出 (plan/spec/
+            # task-graph 合成) のみに限定する。long_form_*_review 等は設計上
+            # 毎回 length 切断され json-repair で復元する purpose なので、
+            # 無条件 WARNING だと backend.log を汚す。
+            if truncated:
+                logger.warning(
+                    "assist JSON truncated (purpose=%s): output hit max_tokens=%s; "
+                    "result may be incomplete (partial JSON will be repaired)",
+                    purpose or "<unspecified>", max_tokens,
+                )
+
         # JSON 部分を抽出してパース
         # ``response_format`` 制約サンプリングが効く llama-server build では
         # ``content`` がそのまま valid JSON になるため戦略 1 で即パースされる。
         # 古い build / フラグ無効時 / max_tokens 切断時の保険として戦略 2-3
-        # と json-repair を残置。telemetry out-param で
-        # repair 使用の有無を受け取り、発生時のみ DebugLogger に
+        # と json-repair を残置。repair 使用の有無は DebugLogger に
         # ``op="json_repair"`` を別エントリとして書き出す。
-        telemetry: dict = {}
+        repair_telemetry: dict = {}
         parsed = extract_json_object(
-            content, list_key=list_key, telemetry=telemetry,
+            content, list_key=list_key, telemetry=repair_telemetry,
         )
-        if telemetry.get("repair_used") and self._debug_logger is not None:
+        if telemetry is not None:
+            telemetry["repair_used"] = bool(repair_telemetry.get("repair_used"))
+        if repair_telemetry.get("repair_used") and self._debug_logger is not None:
             self._debug_logger.log_assist_json_repair(
                 purpose=purpose,
                 list_key=list_key,

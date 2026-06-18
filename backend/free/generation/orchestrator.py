@@ -19,6 +19,7 @@ from backend.free.generation.code_skeleton import CodeSkeleton, update_skeleton
 from backend.free.generation.content_detector import detect_content_type
 from backend.free.generation.smoke_validator import (
     check_integrity,
+    dedup_top_level_defs,
     normalize_relative_imports,
     run_import_smoke,
 )
@@ -258,9 +259,10 @@ class LongFormOrchestrator:
         ]
         if not coded:
             # CodeUnit が取れない (degraded plan 等) → 全体を 1 ファイル扱い。
-            assembled = "\n\n".join(
+            # 生成パスの二重連結による同名 def/class 重複を決定論的に除去する。
+            assembled = dedup_top_level_defs("\n\n".join(
                 remove_code_fences(u) for u in rolling.generated_units
-            )
+            ))
             self._code_language = "python"
             repaired = await repairer.repair(assembled, language="python")
             self.last_code_output = repaired
@@ -283,7 +285,9 @@ class LongFormOrchestrator:
         # は修正する。undefined の解決は後段の wire_imports に委ねる。
         multi_file = len(groups) > 1
         for path, texts in groups.items():
-            group_code = "\n\n".join(texts)
+            # 同一ファイルへ複数ユニットを連結する際、同名 def/class の重複
+            # (生成パス二重連結 = 後勝ちで前定義が死ぬ) を repair 前に決定論的除去。
+            group_code = dedup_top_level_defs("\n\n".join(texts))
             repaired_group = await repairer.repair(
                 group_code, language=infer_language([path]),
                 intra_file_only=multi_file,
@@ -500,6 +504,7 @@ class LongFormOrchestrator:
         long_form_mode: LongFormMode = LongFormMode.CONTINUE,
         prefetched_rag: list[tuple[str, float, str]] | None = None,
         file_context_block: str | None = None,
+        content_type_override: "ContentType | None" = None,
     ) -> AsyncIterator[str]:
         """長文生成のエントリポイント。トークンを yield する。
 
@@ -515,6 +520,10 @@ class LongFormOrchestrator:
                 :attr:`LongFormMode.CONTINUE` (既定) は従来挙動。
                 :attr:`LongFormMode.EXPAND` / :attr:`LongFormMode.SPLIT` は
                 planning プロンプトと unit イベントを切り替える (P2/P3 で実装)。
+            content_type_override: 指定時は ``detect_content_type`` をスキップして
+                強制する。staged コーディングの code/test 工程は spec/フローチャート
+                の散文を多く含む指示になり TEXT と誤判定されるため、
+                :attr:`ContentType.CODE` を強制する用途で使う。
 
         Yields:
             生成トークン文字列
@@ -523,8 +532,8 @@ class LongFormOrchestrator:
         # リクエストモードを保持 (_effective_context_size が実窓解決に参照)
         self._mode = mode
 
-        # 1. コンテンツ種別判定
-        content_type = detect_content_type(instruction, mode)
+        # 1. コンテンツ種別判定 (override 指定時は検出をスキップ)
+        content_type = content_type_override or detect_content_type(instruction, mode)
         # コンシューマ (chat_streaming) が生成途中でも code/text を判定できるよう、
         # 確定した content_type をインスタンス属性に保持する (リクエストごとの一時
         # インスタンスなので並行リクエストでも競合しない)。

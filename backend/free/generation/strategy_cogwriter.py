@@ -45,6 +45,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("backend.free.generation.strategy_cogwriter")
 
+# code_spec 合成の出力トークン上限。iGPU + 4B assist では 3072 が purpose timeout
+# (120s) を超えて ReadTimeout+retry を誘発したため基底は 1536 に抑える。切断時のみ
+# 出力を増やし timeout を明示延長して 1 回だけ再合成する (モジュール/インタフェース
+# 欠落 → 後続ファイルの黙殺欠落を防ぐ)。
+_CODE_SPEC_MAX_TOKENS = 1536
+_CODE_SPEC_RETRY_MAX_TOKENS = 2560
+_CODE_SPEC_RETRY_TIMEOUT_SEC = 180.0
+
 
 # ── プロンプトテンプレート ──
 
@@ -545,7 +553,24 @@ class CogWriterStrategy:
         # EXPAND/SPLIT モードでは下限 8 を保証 (機能ごとセクション化のため)
         max_units = resolve_max_units(self._lf_config, long_form_mode)
         # content_type に応じた schema 選択と例外フォールバックは共通化
-        data = await generate_plan_json(self.assist_client, prompt, content_type)
+        plan_telemetry: dict = {}
+        data = await generate_plan_json(
+            self.assist_client, prompt, content_type, telemetry=plan_telemetry,
+        )
+        # max_tokens 切断でユニットが黙って欠落する事象を可視化する
+        # (例: 多モジュールのコード計画で末尾モジュールが落ちる)。
+        if plan_telemetry.get("truncated"):
+            logger.warning(
+                "Plan JSON truncated (content_type=%s): planned units may be "
+                "missing; output can be incomplete",
+                content_type.value,
+            )
+            if self._debug_logger:
+                self._debug_logger.log_long_form_event({
+                    "phase": "plan_truncated",
+                    "strategy": "cogwriter",
+                    "content_type": content_type.value,
+                })
 
         if not data or "units" not in data:
             logger.warning(
@@ -607,12 +632,39 @@ class CogWriterStrategy:
             # max_tokens は CodeSpec (modules/data_models/interfaces) を網羅できる
             # 範囲で最小化する。iGPU + 4B assist では decode 長が支配項で、3072 は
             # purpose timeout を超えて ReadTimeout+retry を誘発していた (~130s の
-            # 無駄待ち)。1536 で単一〜少数モジュールの spec は収まり、超過時は
-            # 下の except で spec=None → 非 CogWriter 経路へ安全にフォールバックする。
+            # 無駄待ち)。基底 1536 で単一〜少数モジュールの spec は収まり、超過時は
+            # 下で延長 timeout 付き再合成 → なお切断/失敗なら spec=None で安全に縮退。
+            spec_telemetry: dict = {}
             data = await self.assist_client.generate_json(
-                prompt, max_tokens=1536, temperature=0.3,
-                purpose="code_spec_synthesis",
+                prompt, max_tokens=_CODE_SPEC_MAX_TOKENS, temperature=0.3,
+                purpose="code_spec_synthesis", telemetry=spec_telemetry,
             )
+            # spec 切断はモジュール/インタフェース欠落 → 後続ファイルの黙殺欠落を招く。
+            # 出力を増やし timeout を明示延長して 1 回だけ再合成する。
+            if spec_telemetry.get("truncated"):
+                logger.warning(
+                    "Code spec JSON truncated at max_tokens=%d; retrying at %d "
+                    "(timeout=%.0fs)",
+                    _CODE_SPEC_MAX_TOKENS, _CODE_SPEC_RETRY_MAX_TOKENS,
+                    _CODE_SPEC_RETRY_TIMEOUT_SEC,
+                )
+                try:
+                    retry_tel: dict = {}
+                    data_retry = await self.assist_client.generate_json(
+                        prompt, max_tokens=_CODE_SPEC_RETRY_MAX_TOKENS,
+                        temperature=0.3, purpose="code_spec_synthesis",
+                        timeout=_CODE_SPEC_RETRY_TIMEOUT_SEC, telemetry=retry_tel,
+                    )
+                    if isinstance(data_retry, dict) and data_retry:
+                        data, spec_telemetry = data_retry, retry_tel
+                except Exception as e:  # noqa: BLE001 — 再合成失敗は元結果を維持
+                    logger.warning("Code spec retry failed: %s", e)
+                # 再合成してもなお切断なら可視化する (欠落の可能性を残す)。
+                if spec_telemetry.get("truncated") and self._debug_logger:
+                    self._debug_logger.log_long_form_event({
+                        "phase": "code_spec_truncated",
+                        "strategy": "cogwriter",
+                    })
             if not isinstance(data, dict):
                 logger.warning("Code spec synthesis returned non-dict; skipping")
                 return None

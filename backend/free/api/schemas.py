@@ -638,6 +638,7 @@ class TaskInfo(BaseModel):
     project_id: str
     created_at: float = 0.0
     accessed_at: float = 0.0
+    stage: str | None = None  # staged コーディング工程 (spec/code/test)。通常タスクは None
 
 
 class TaskListResponse(BaseModel):

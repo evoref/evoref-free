@@ -44,12 +44,16 @@ if TYPE_CHECKING:
 
 CODE_UNIT_SYSTEM = """\
 あなたはPythonプログラマーです。以下の計画に従い、指定ユニットのコードを生成してください。
+他ユニット (別ファイル・別関数/クラス) に属する関数・クラスを再定義しないこと。必要なら import して利用する。
 {global_context}"""
 
 CODE_UNIT_USER = """\
 # 実装計画
 ファイル: {file_path}
 全ユニット: {unit_names}
+
+# 他ユニットの公開定義 (これらは別途生成される。再定義せず、必要なら import して使う)
+{sibling_interfaces}
 
 # 生成済みコード構造
 {skeleton}
@@ -212,6 +216,40 @@ def fallback_plan(
 
 # ── プロンプト構築 ──
 
+# 兄弟インタフェースブロックの最大文字数 (プロンプト肥大防止)。
+_SIBLING_INTERFACES_MAX_CHARS = 1500
+
+
+def _render_sibling_interfaces(plan: GenerationPlan, current: CodeUnit) -> str:
+    """現在のユニットを除く全 :class:`CodeUnit` の公開定義を file 別に整形する。
+
+    各ユニットの ``name`` / ``kind`` / 仕様冒頭 1 行を file_path でグルーピングして
+    列挙し、「これらは別途生成されるので再定義せず import せよ」という契約を与える。
+    肥大防止のため上限文字数で打ち切る。兄弟が無ければ ``(なし)`` を返す。
+    """
+    others = [
+        u for u in plan.units
+        if isinstance(u, CodeUnit) and u is not current
+    ]
+    if not others:
+        return "(なし)"
+    by_file: dict[str, list[str]] = {}
+    for u in others:
+        head = ""
+        if u.spec:
+            first = u.spec.strip().splitlines()
+            head = (": " + first[0][:80]) if first else ""
+        by_file.setdefault(u.file_path or "(同一ファイル)", []).append(
+            f"  - {u.name} ({u.kind}){head}"
+        )
+    block = "\n".join(
+        f"{fp}:\n" + "\n".join(lines) for fp, lines in by_file.items()
+    )
+    if len(block) > _SIBLING_INTERFACES_MAX_CHARS:
+        block = block[:_SIBLING_INTERFACES_MAX_CHARS] + "\n…"
+    return block
+
+
 def build_code_unit_messages(
     unit: CodeUnit,
     rolling: RollingContext,
@@ -226,6 +264,10 @@ def build_code_unit_messages(
     unit_names = ", ".join(
         u.name for u in plan.units if isinstance(u, CodeUnit)
     )
+
+    # 兄弟ユニットの公開シグネチャを明示注入し、API 不整合・同名再定義を抑制する
+    # (spec 契約に加えた defense-in-depth)。現在のユニット自身は除く。
+    sibling_interfaces = _render_sibling_interfaces(plan, unit)
 
     skeleton_text = ""
     if rolling.skeleton:
@@ -252,6 +294,7 @@ def build_code_unit_messages(
     user = CODE_UNIT_USER.format(
         file_path=unit.file_path,
         unit_names=unit_names,
+        sibling_interfaces=sibling_interfaces,
         skeleton=skeleton_text or "(なし)",
         short_term=short_term or "(なし)",
         kind=unit.kind,
@@ -429,16 +472,35 @@ def finalize_plan_units(
 
 # ── 計画 JSON 生成 ──
 
+# プラン JSON の出力トークン上限。1024 では多モジュール計画が頻繁に切断され
+# (実測: 1 日 9 回 plan_truncated) 末尾ユニットが黙って欠落していた。1536 は
+# code_spec で実績のある値で long_form_planning の timeout 内に収まる。切断時のみ
+# 下記で再プランする。
+_PLAN_MAX_TOKENS = 1536
+# 切断時の 1 回限り再プラン。出力を増やし、iGPU の decode 長増を見越して timeout も
+# 明示的に延長する (purpose 既定 90s のままだと ReadTimeout を誘発するため)。
+_PLAN_RETRY_MAX_TOKENS = 3072
+_PLAN_RETRY_TIMEOUT_SEC = 150.0
+
+
 async def generate_plan_json(
     assist_client: AssistModelClient | None,
     prompt: str,
     content_type: ContentType,
+    *,
+    telemetry: dict | None = None,
 ) -> dict:
     """アシストモデルで計画 JSON を生成する。
 
     ``content_type`` に応じた schema (CodePlan / TextPlan) を明示選択し、
     ``assist_client is None`` (degraded) / 例外時は空 dict を返して呼出側の
     単一ユニットフォールバックに委ねる。
+
+    出力が ``max_tokens`` で切断された場合 (``telemetry['truncated']``)、ユニット
+    欠落を防ぐため **より大きい出力 + 延長 timeout で 1 回だけ再プラン**する。再プラン
+    が非切断、または取得ユニットが増えた場合のみ採用する。
+
+    ``telemetry`` を渡すと最終結果の ``truncated`` / ``replanned`` 等が書き戻される。
     """
     if assist_client is None:
         logger.warning(
@@ -446,18 +508,49 @@ async def generate_plan_json(
         )
         return {}
     plan_schema = CodePlan if content_type == ContentType.CODE else TextPlan
-    try:
+
+    async def _gen(max_tokens: int, timeout: float | None, tel: dict) -> dict:
         return await assist_client.generate_json(
             prompt,
-            max_tokens=1024,
+            max_tokens=max_tokens,
             temperature=0.3,
             purpose="long_form_planning",
             list_key="units",
             response_schema=plan_schema,
+            timeout=timeout,
+            telemetry=tel,
         )
+
+    try:
+        tel1: dict = {}
+        data = await _gen(_PLAN_MAX_TOKENS, None, tel1)
     except Exception as e:  # noqa: BLE001 — assist 例外で fallback
         logger.warning("Plan generation failed: %s", e)
         return {}
+
+    result, result_tel = data, tel1
+    if tel1.get("truncated"):
+        logger.warning(
+            "Plan JSON truncated at max_tokens=%d; replanning at %d (timeout=%.0fs)",
+            _PLAN_MAX_TOKENS, _PLAN_RETRY_MAX_TOKENS, _PLAN_RETRY_TIMEOUT_SEC,
+        )
+        try:
+            tel2: dict = {}
+            data2 = await _gen(
+                _PLAN_RETRY_MAX_TOKENS, _PLAN_RETRY_TIMEOUT_SEC, tel2,
+            )
+            n1 = len((data or {}).get("units", []) or [])
+            n2 = len((data2 or {}).get("units", []) or [])
+            if data2 and (not tel2.get("truncated") or n2 > n1):
+                tel2["replanned"] = True
+                result, result_tel = data2, tel2
+        except Exception as e:  # noqa: BLE001 — 再プラン失敗は元の結果を維持
+            logger.warning("Plan replan failed: %s", e)
+
+    if telemetry is not None:
+        telemetry.clear()
+        telemetry.update(result_tel)
+    return result
 
 
 # ── テキストユニットメッセージ構築 ──

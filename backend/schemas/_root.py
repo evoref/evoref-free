@@ -27,6 +27,7 @@ from backend.schemas._common import (
     WidgetProxyConfig,
 )
 from backend.schemas.assist_model import AssistModelConfig
+from backend.schemas.coding import CodingConfig
 from backend.schemas.learning import LearningConfig, ScheduleConfig
 from backend.schemas.llm import LlamaConfig
 from backend.schemas.loop import LoopConfig
@@ -92,6 +93,7 @@ class EvorefConfig(BaseModel):
     process_manager: ProcessManagerConfig = Field(default_factory=ProcessManagerConfig)
     long_form: LongFormConfig = Field(default_factory=LongFormConfig)
     loop: LoopConfig = Field(default_factory=LoopConfig)
+    coding: CodingConfig = Field(default_factory=CodingConfig)
     pro: ProConfig = Field(default_factory=ProConfig)
 
     @model_validator(mode="before")
@@ -162,6 +164,7 @@ class EvorefConfig(BaseModel):
         - ``widget_proxy.enabled = True``  (Pro Widget Proxy / 汎用 Web API プロキシ)
         - ``pro.terminal.enabled = True``  (Pro Web ターミナル)
         - ``learning.optimizer == "full-cma-es"`` (Pro CMA-ES オプティマイザ)
+        - ``coding.pipeline == "staged"`` (Pro staged コーディングパイプライン)
         - 未定義トップレベルキー ``mode_models`` (Pro ローカルモデル切替)
 
         過去存在した ``external_api.enabled`` / ``assist_model.backend in
@@ -194,6 +197,11 @@ class EvorefConfig(BaseModel):
                 "pro.url_recall.team_profile_ids",
                 bool(self.pro.url_recall.team_profile_ids),
             ),
+            # staged コーディングパイプラインは Pro 限定 (_staged_coding_enabled が
+            # is_pro() でゲート)。Free で pipeline=staged を設定しても longform の
+            # まま無効なので警告する。staged_enabled は intra-staged のキルスイッチ
+            # (既定 True) で Pro signal ではないため対象にしない。
+            ("coding.pipeline", self.coding.pipeline == "staged"),
         ]
 
         # extra="allow" で透過する未定義トップレベルキー (Pro 拡張)。

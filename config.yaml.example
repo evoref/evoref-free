@@ -306,6 +306,7 @@ local_paths:
   cartridges_dir: local/cartridges/          # カートリッジ（パッケージ + 埋め込み）
   history_dir: local/history/                # 会話履歴アーカイブ
   triggers_dir: local/triggers/              # EvorefMem トリガ辞書の user override 先 (任意、空ディレクトリで可)
+  coding_workspace_dir: local/coding/        # staged コーディングの一時ワークスペース (spec/code/test 中間成果物 + manifest)
   # 学習・経験・状態
   experience_file: local/experience.json             # ベースモデル経験バッファ
   experience_assist_file: local/experience_assist.json   # アシストモデル経験バッファ
@@ -1058,6 +1059,27 @@ long_form:
   code_flowchart_enabled: false     # 設計仕様から mermaid フローチャートを合成し SPEC.md に埋込(既定OFF)
   code_smoke_test_enabled: true     # 生成物の import スモークテスト(ModuleNotFoundError/dataclass引数違い等の実行時エラー捕捉)
   code_smoke_timeout_sec: 10        # import スモークテストのサブプロセスタイムアウト(秒)
+
+# ===== コーディングモード パイプライン設定 =====
+# pipeline=staged で「仕様書→コード→テスト」の多段・各工程多パス生成 (専用 LoopDriver を
+# インライン駆動)。staged は Pro 限定 (evoref code は Pro ゲート済) かつ assist 健全時のみ起動。
+# 既定 longform は従来の LongFormOrchestrator 1 リクエスト生成 (無改変)。
+coding:
+  pipeline: longform                  # staged | longform (既定 longform)
+  staged_enabled: true                # staged のキルスイッチ (pipeline と独立。false で即無効化)
+  staged:
+    test_stage_enabled: true          # test 工程 (生成+pytest 実行+リペア)。false で生成のみ
+    flowchart_enabled: true          # spec 工程で mermaid 設計フローチャートを合成し生成へ注入
+    max_repair_rounds: 2              # test 失敗時のリペア最大回数 (0-5)
+    max_test_regen_rounds: 2         # test が src の実 API に不整合な時 test のみ再生成 (src 不変・準ゲート, 0-5)
+    entry_smoke_exec_enabled: true   # エントリ有界実行スモーク (advisory)。false で静的検査のみ
+    entry_smoke_timeout_sec: 10.0    # エントリ有界実行スモークのタイムアウト
+    spec_max_tokens: 1536            # spec.md 生成の最大トークン
+    spec_timeout_sec: 120.0          # spec 工程タイムアウト
+    test_timeout_sec: 120.0          # 生成テストの pytest サブプロセスタイムアウト
+    total_timeout_sec: 900.0         # staged 1 リクエスト全体のウォールクロック上限
+    max_iterations: 60               # 専用 LoopDriver の最大イテレーション (≈ 1 + 2*モジュール数)
+    cleanup_workspace: false         # 完了時に temp ワークスペースを削除 (false=継続/デバッグ用に保持)
 
 # ──────────────────────────────────────────────────────────────────────
 # Pro 専用機能

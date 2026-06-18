@@ -26,7 +26,7 @@ import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
@@ -76,6 +76,18 @@ TERMINAL_TASK_STATUSES: frozenset[str] = frozenset({"done", "failed"})
 """ライフサイクル終端ステータス"""
 
 
+TaskStage = Literal["spec", "code", "test"]
+"""staged コーディングパイプラインの工程種別 (spec→code→test)。
+
+通常の PRD / ralph タスクは ``stage`` を持たず ``None`` になる。``StagedCodingExecutor``
+のみが ``stage`` 別に分岐し、それ以外の executor / driver ロジックは ``stage`` を無視
+する (後方互換)。
+"""
+
+VALID_TASK_STAGES: frozenset[str] = frozenset({"spec", "code", "test"})
+"""許可される task stage (TaskStage Literal と同期)"""
+
+
 LoopViewProvider = Callable[[str], LoopFactView]
 """``project_id`` を受け取り対応する :class:`LoopFactView` を返す callable。"""
 
@@ -118,6 +130,7 @@ class TaskFactView:
     project_id: str
     created_at: float
     accessed_at: float
+    stage: TaskStage | None = None
 
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_TASK_STATUSES
@@ -137,11 +150,13 @@ def encode_task_object(
     salience: float = 0.5,
     status: TaskStatus = "open",
     source_path: str | None = None,
+    stage: TaskStage | None = None,
 ) -> str:
     """task ファクトの ``object`` フィールド (JSON 文字列) を生成する。
 
     Raises:
-        ValueError: ``task_id`` が空、``status`` が不正、``salience`` が範囲外
+        ValueError: ``task_id`` が空、``status`` が不正、``salience`` が範囲外、
+            ``stage`` が不正
     """
     if not task_id:
         raise ValueError("task_id must be non-empty")
@@ -151,6 +166,8 @@ def encode_task_object(
         raise ValueError(
             f"salience must be in [0.0, 1.0]: got {salience!r}",
         )
+    if stage is not None and stage not in VALID_TASK_STAGES:
+        raise ValueError(f"invalid task stage: {stage!r}")
     payload: dict[str, Any] = {
         "task_id": task_id,
         "title": title,
@@ -161,6 +178,8 @@ def encode_task_object(
     }
     if source_path is not None:
         payload["source_path"] = source_path
+    if stage is not None:
+        payload["stage"] = stage
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
@@ -213,6 +232,11 @@ def decode_task_fact(fact: SemanticFact) -> TaskFactView:
         raise TaskFactDecodeError(
             f"task fact {fact.id} salience invalid: {salience_raw!r}",
         ) from exc
+    stage_raw = body.get("stage")
+    if stage_raw is not None and stage_raw not in VALID_TASK_STAGES:
+        raise TaskFactDecodeError(
+            f"task fact {fact.id} has invalid stage {stage_raw!r}",
+        )
     return TaskFactView(
         fact_id=fact.id,
         task_id=task_id,
@@ -225,6 +249,7 @@ def decode_task_fact(fact: SemanticFact) -> TaskFactView:
         project_id=project_id,
         created_at=fact.created_at,
         accessed_at=fact.accessed_at,
+        stage=stage_raw,
     )
 
 
@@ -237,6 +262,7 @@ def make_task_fact(
     depends_on: list[str] | None = None,
     salience: float = 0.5,
     source_path: str | None = None,
+    stage: TaskStage | None = None,
     now: float | None = None,
 ) -> SemanticFact:
     """``task`` 型 SemanticFact を生成する (ストアには追加しない)。
@@ -254,6 +280,7 @@ def make_task_fact(
         salience=salience,
         status="open",
         source_path=source_path,
+        stage=stage,
     )
     return make_fact(
         subject=f"{TASK_SUBJECT_PREFIX}{tid}",

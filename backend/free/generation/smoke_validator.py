@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import json
 import logging
 import os
@@ -25,10 +26,22 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from backend.free.generation.api_contract import (
+    bind_local_instances,
+    build_src_api,
+    collect_attr_uses,
+)
+
 if TYPE_CHECKING:
     from backend.free.llm.json_schemas import CodeSpec
 
 logger = logging.getLogger("backend.free.generation.smoke_validator")
+
+# Python 標準ライブラリのモジュール名集合 (py3.10+)。``_curses`` 等の私的名を
+# ``lstrip("_")`` で正規化して照合するため、欠落モジュールが「ターゲット OS で
+# 提供されない標準ライブラリ (起動不能)」か「未インストールの 3rd-party 依存
+# (環境要因)」かを区別する (import_wirer._STDLIB_MODULES と同型)。
+_STDLIB_MODULES: frozenset[str] = frozenset(getattr(sys, "stdlib_module_names", ()))
 
 
 def _stems(paths) -> set[str]:
@@ -129,6 +142,417 @@ def check_integrity(
     return errors
 
 
+def _is_main_guard(node: ast.stmt) -> bool:
+    """``if __name__ == "__main__":`` ガードか判定する。"""
+    if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+        return False
+    cmp = node.test
+    left = cmp.left
+    return (
+        isinstance(left, ast.Name)
+        and left.id == "__name__"
+        and len(cmp.ops) == 1
+        and isinstance(cmp.ops[0], ast.Eq)
+        and len(cmp.comparators) == 1
+        and isinstance(cmp.comparators[0], ast.Constant)
+        and cmp.comparators[0].value == "__main__"
+    )
+
+
+def check_entrypoint(
+    files: dict[str, str],
+    spec: CodeSpec | None = None,
+) -> list[str]:
+    """エントリ起動経路が「存在しないメソッド/属性」を参照していないか静的検出する。
+
+    ``run_import_smoke`` は import が通るかまでしか見ないため、``main()`` が
+    ``curses.wrapper(game.run)`` のように **未定義メソッド ``game.run``** を呼ぶ
+    起動不能コードを見逃す (今回のテトリス失敗の主因)。これを実行せず AST で捕捉
+    する。誤検知 (破壊的リペア誘発) を避け、保守的に「生成物内クラスのインスタンス
+    と確証できる変数」への参照のみ照合する。``__getattr__`` / 生成物外基底継承 /
+    型不明変数は :mod:`api_contract` 側でスキップされる。
+    """
+    api = build_src_api(files)
+    if not api.classes:
+        return []
+    known = set(api.classes)
+
+    # エントリ候補コード。spec があればその module、無ければ ``main`` 定義 /
+    # ``__main__`` ガードを持つ生成ファイルを候補にする (staged は CodeSpec を持たない)。
+    candidates: list[tuple[str, str]] = []  # (label, code)
+    ep = getattr(getattr(spec, "entry_point", None), "module", "") if spec else ""
+    if ep:
+        entry_code = _resolve_entry_code(files, ep)
+        if entry_code is None:
+            return []  # エントリ欠落は check_integrity が報告する
+        candidates.append((ep, entry_code))
+    else:
+        candidates = [
+            (path, code)
+            for path, code in files.items()
+            if path.endswith(".py") and _looks_like_entry(code)
+        ]
+    if not candidates:
+        return []
+
+    errors: list[str] = []
+    seen: set[tuple[str, str, str]] = set()
+    for label, entry_code in candidates:
+        try:
+            tree = ast.parse(entry_code)
+        except SyntaxError:
+            continue  # validate_python 側が扱う
+        funcs = {
+            n.name: n for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        # 起動経路ルート = __main__ ガード body + そこから呼ばれる top-level 関数
+        # + ``main`` (ガード無しでも main が起点になる今回ケースを拾う)。1 段のみ。
+        roots: list[list[ast.stmt]] = []
+        called: set[str] = {"main"}
+        for n in tree.body:
+            if _is_main_guard(n):
+                roots.append(n.body)
+                for stmt in n.body:
+                    for c in ast.walk(stmt):
+                        if isinstance(c, ast.Call) and isinstance(c.func, ast.Name):
+                            called.add(c.func.id)
+        for fname in called:
+            if fname in funcs:
+                roots.append(funcs[fname].body)
+
+        for body in roots:
+            bindings = bind_local_instances(body, known)
+            bindings = {v: c for v, c in bindings.items() if c in api.classes}
+            for use in collect_attr_uses(body, bindings):
+                capi = api.classes[use.cls]
+                if capi.dynamic:
+                    continue
+                if use.attr in capi.methods or use.attr in capi.attrs:
+                    continue
+                key = (label, use.cls, use.attr)
+                if key in seen:
+                    continue
+                seen.add(key)
+                errors.append(
+                    f"{label}: エントリ経路が {use.cls}.{use.attr} を参照するが"
+                    "定義が無い (起動不能)"
+                )
+    return sorted(errors)
+
+
+def _looks_like_entry(code: str) -> bool:
+    """``main`` の top-level 定義か ``__main__`` ガードを持つか (エントリ推論用)。"""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    for n in tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "main":
+            return True
+        if _is_main_guard(n):
+            return True
+    return False
+
+
+# ── 静的整合性チェック (coherence: 重複定義 / 未定義名) ──────────────────
+#
+# import スモーク (:func:`run_import_smoke`) は「import が通るか」までしか見ない。
+# 関数本体内でのみ顕在化する ``NameError`` (どのモジュールにも無いシンボルの使用) や
+# 同一モジュール内の重複定義 (生成パスの二重連結 = 後勝ちで前定義が死ぬ) は import
+# only では検出できない。これらを AST で決定論的に検出する (サブプロセス不要・非循環)。
+# 誤検知は破壊的リペアを招くため、保守的に「確実に未束縛な自由名」「同一ブロック直下の
+# 同名 sibling 定義」だけを報告する。
+
+_PSEUDO_NAMES: frozenset[str] = frozenset({
+    "__name__", "__file__", "__doc__", "__package__", "__builtins__",
+    "__spec__", "__loader__", "__path__", "__dict__", "__class__", "__qualname__",
+})
+
+# @overload / property アクセサ等、同名 sibling 定義が正当になるデコレータ。
+_REDEF_EXEMPT_DECORATORS: frozenset[str] = frozenset({
+    "overload", "property", "setter", "deleter", "getter",
+    "cached_property", "singledispatch", "register", "dispatch",
+})
+
+
+def _decorator_names(node) -> set[str]:
+    """def/class のデコレータ名集合 (``Name.id`` / ``Attribute.attr``) を返す。"""
+    names: set[str] = set()
+    for dec in getattr(node, "decorator_list", None) or []:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(target, ast.Name):
+            names.add(target.id)
+        elif isinstance(target, ast.Attribute):
+            names.add(target.attr)
+    return names
+
+
+def _is_exempt_redef(node) -> bool:
+    """``@overload`` / property アクセサ等で同名 sibling 定義が正当か判定する。"""
+    return bool(_decorator_names(node) & _REDEF_EXEMPT_DECORATORS)
+
+
+def _target_names(target) -> set[str]:
+    """代入ターゲット (Name / Tuple / List / Starred) から束縛名を抽出する。"""
+    out: set[str] = set()
+    if isinstance(target, ast.Name):
+        out.add(target.id)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for el in target.elts:
+            out |= _target_names(el)
+    elif isinstance(target, ast.Starred):
+        out |= _target_names(target.value)
+    return out
+
+
+def _module_defined_names(tree: ast.Module) -> set[str]:
+    """モジュールがトップレベルで公開する名前 (兄弟が import し得る) を返す。"""
+    names: set[str] = set()
+    for n in tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(n.name)
+        elif isinstance(n, ast.Assign):
+            for t in n.targets:
+                names |= _target_names(t)
+        elif isinstance(n, ast.AnnAssign):
+            names |= _target_names(n.target)
+        elif isinstance(n, ast.Import):
+            for a in n.names:
+                names.add((a.asname or a.name).split(".")[0])
+        elif isinstance(n, ast.ImportFrom):
+            for a in n.names:
+                if a.name != "*":
+                    names.add(a.asname or a.name)
+        elif isinstance(n, ast.TypeAlias):  # PEP 695 (py3.12+)
+            if isinstance(n.name, ast.Name):
+                names.add(n.name.id)
+    return names
+
+
+def _duplicate_defs(path: str, tree: ast.Module) -> list[str]:
+    """同一ブロック直下の同名 def/class の重複を検出する (条件分岐下は対象外)。"""
+    errors: list[str] = []
+
+    def _scan(body, label: str) -> None:
+        counts: dict[str, int] = {}
+        for n in body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if _is_exempt_redef(n):
+                    continue
+                counts[n.name] = counts.get(n.name, 0) + 1
+        for name, c in sorted(counts.items()):
+            if c >= 2:
+                errors.append(f"{path}: {label}'{name}' が重複定義 ({c} 回)")
+
+    _scan(tree.body, "")
+    for n in tree.body:
+        if isinstance(n, ast.ClassDef):
+            _scan(
+                [m for m in n.body
+                 if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))],
+                f"クラス '{n.name}' のメソッド ",
+            )
+    return errors
+
+
+def _all_bound_names(tree: ast.Module) -> set[str]:
+    """モジュール内のどこかで束縛される名前を網羅収集する (関数内含む)。
+
+    未定義名検出の「利用可能集合」を作る保守的 (過剰収集) な集合。関数スコープを
+    区別せず全束縛名を集めるため false positive を避ける (false negative は許容)。
+    Store-ctx 名で代入 / for / with-as / 内包表記ターゲット / walrus を一括捕捉し、
+    引数 (posonly/kwonly/vararg/kwarg/lambda)・except-as・match capture・global/
+    nonlocal・全 import alias を補う。
+    """
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            bound.add(node.id)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                bound.add((a.asname or a.name).split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.name != "*":
+                    bound.add(a.asname or a.name)
+        elif isinstance(node, ast.MatchAs) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchStar) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.add(node.rest)
+        elif isinstance(node, ast.TypeAlias) and isinstance(node.name, ast.Name):
+            bound.add(node.name.id)
+    return bound
+
+
+def _has_dynamic_binding(tree: ast.Module) -> bool:
+    """束縛名が静的に確定できない構造 (``import *`` / exec / globals 等) の有無。
+
+    検出時は当該モジュールの未定義名チェックを丸ごとスキップする (= より保守的)。
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+            return True
+        if isinstance(node, ast.Name) and node.id in {
+            "exec", "eval", "globals", "locals", "vars",
+        }:
+            return True
+    return False
+
+
+def _undefined_names(path: str, tree: ast.Module, cross_module: set[str]) -> list[str]:
+    """モジュール内で確実に未束縛な自由 Load 名を検出する (保守的)。
+
+    利用可能 = モジュール内束縛 ∪ builtins ∪ 兄弟モジュール公開名 (cross_module)。
+    兄弟が定義する名前は import 配線 (``wire_imports``) で解決可能なため対象外とし、
+    **どのモジュールにも存在しない名前** (例: 呼ばれているが未定義の関数) のみ報告する。
+    属性アクセス (``obj.attr`` の ``attr``) は対象外。
+    """
+    if _has_dynamic_binding(tree):
+        return []
+    available = (
+        _all_bound_names(tree)
+        | set(dir(builtins))
+        | cross_module
+        | _PSEUDO_NAMES
+    )
+    seen: set[str] = set()
+    errors: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            name = node.id
+            if name not in available and name not in seen:
+                seen.add(name)
+                errors.append(f"{path}: 名前 '{name}' が未定義 (import / 定義が無い)")
+    return errors
+
+
+def check_coherence(files: dict[str, str]) -> list[str]:
+    """生成物の静的整合性 (重複定義 / 未定義名) を決定論的に検出する。
+
+    ``run_import_smoke`` が見られない「import only では通るが実行時 ``NameError`` に
+    なる未定義名」「同一モジュール内の重複定義」を AST で検出する。純粋・サブプロセス
+    不要・非循環。誤検知抑制のため保守的に判定する (確証のある問題のみ報告)。
+    出力は決定論順 (sorted) で返す。
+    """
+    parsed: dict[str, ast.Module] = {}
+    for path, code in files.items():
+        if not path.endswith(".py"):
+            continue
+        try:
+            parsed[path] = ast.parse(code)
+        except SyntaxError:
+            continue  # validate_python / run_import_smoke 側が扱う
+    cross_module: set[str] = set()
+    for tree in parsed.values():
+        cross_module |= _module_defined_names(tree)
+    errors: list[str] = []
+    for path, tree in parsed.items():
+        errors.extend(_duplicate_defs(path, tree))
+        errors.extend(_undefined_names(path, tree, cross_module))
+    return sorted(errors)
+
+
+def check_cross_module_imports(files: dict[str, str]) -> list[str]:
+    """生成物間 ``from <sibling> import <name>`` の <name> 実在を静的検証する。
+
+    :func:`run_import_smoke` は外部依存 (pygame 等) が未インストールだと当該モジュール
+    の import 自体が ``ModuleNotFoundError`` で止まり、内部の名前欠落
+    (``cannot import name 'Game' from 'game'``) を見逃す。これを決定論・サブプロセス
+    不要に補完する。対象は **生成物 stem を指す from-import のみ** (stdlib / 3rd-party
+    への import は対象外)。再エクスポートが静的に確定できないモジュール (``import *`` /
+    exec 等) を import 元とする参照は保留する (誤検知回避)。出力は決定論順 (sorted)。
+    """
+    parsed: dict[str, ast.Module] = {}
+    for path, code in files.items():
+        if not path.endswith(".py"):
+            continue
+        try:
+            parsed[path] = ast.parse(code)
+        except SyntaxError:
+            continue  # validate_python / run_import_smoke 側が扱う
+    exports: dict[str, set[str]] = {}
+    dynamic_stems: set[str] = set()
+    for path, tree in parsed.items():
+        stem = os.path.splitext(os.path.basename(path))[0]
+        exports[stem] = _module_defined_names(tree)
+        if _has_dynamic_binding(tree):
+            dynamic_stems.add(stem)
+    errors: list[str] = []
+    for path, tree in parsed.items():
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.module is None:
+                continue
+            sibling = node.module.rsplit(".", 1)[-1]  # dotted パッケージは leaf stem
+            if sibling not in exports or sibling in dynamic_stems:
+                continue  # 生成物以外 / 再エクスポート不確定は対象外
+            for a in node.names:
+                if a.name != "*" and a.name not in exports[sibling]:
+                    errors.append(
+                        f"{path}: '{a.name}' を '{sibling}' から import できない "
+                        f"({sibling} に定義が無い)"
+                    )
+    return sorted(set(errors))
+
+
+def dedup_top_level_defs(code: str) -> str:
+    """同一ブロック直下の同名 def/class 重複を決定論的に除去する (最長 body を保持)。
+
+    生成パスの二重連結で同じ関数/クラスが複数回定義される現象 (後勝ちで前定義が死ぬ・
+    可読性破壊) を assembly 段階で解消する。除去対象は「同名かつ非アクセサ
+    (= ``@overload`` / property setter 等でない) な top-level sibling」と「同一クラス
+    直下の同名メソッド」のみ。固有名の定義は決して落とさない。複数候補からは最長
+    body を残す (より完全な実装を保持)。構文エラーは無変更で返す (防御的)。
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    drop_lines: set[int] = set()
+
+    def _plan(body) -> None:
+        groups: dict[str, list] = {}
+        for n in body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if _is_exempt_redef(n):
+                    continue
+                groups.setdefault(n.name, []).append(n)
+        for nodes in groups.values():
+            if len(nodes) < 2:
+                continue
+            keep = max(nodes, key=lambda n: ((n.end_lineno or n.lineno) - n.lineno))
+            for n in nodes:
+                if n is keep:
+                    continue
+                start = n.lineno
+                if getattr(n, "decorator_list", None):
+                    start = min(start, min(d.lineno for d in n.decorator_list))
+                drop_lines.update(range(start, (n.end_lineno or n.lineno) + 1))
+
+    _plan(tree.body)
+    for n in tree.body:
+        if isinstance(n, ast.ClassDef):
+            _plan(n.body)
+    if not drop_lines:
+        return code
+    kept = [
+        line
+        for i, line in enumerate(code.splitlines(keepends=True), start=1)
+        if i not in drop_lines
+    ]
+    return "".join(kept)
+
+
 @dataclass
 class SmokeResult:
     """import スモークテストの結果。
@@ -160,8 +584,11 @@ _SMOKE_RUNNER = (
 def _classify_failure(failure: dict, stems: set[str]) -> tuple[str, bool]:
     """import 失敗を (メッセージ, is_error) に分類する。
 
-    外部依存の ``ModuleNotFoundError`` (生成物 stem 以外) は環境要因として
-    warning 扱い、それ以外 (cross-file 欠落 / 相対 import / 実行時例外) は error。
+    - 生成物 stem の ``ModuleNotFoundError`` → error (cross-file 欠落)。
+    - **標準ライブラリ**の欠落 (``curses``/``_curses`` 等。Windows で POSIX 専用
+      stdlib が無い 等) → error。ターゲット OS で起動不能な欠陥であり、warning に
+      倒すと「import only では通るが実機で動かない」コードを合格させてしまう。
+    - それ以外 (numpy 等の未インストール 3rd-party) → warning (環境要因・修正不要)。
     """
     module = failure.get("module", "?")
     etype = failure.get("type", "Error")
@@ -172,6 +599,14 @@ def _classify_failure(failure: dict, stems: set[str]) -> tuple[str, bool]:
         if "'" in msg:
             missing = msg.split("'")[1].split(".")[0]
         if missing and missing not in stems:
+            # ``_curses`` → ``curses`` 等、私的名を正規化して stdlib 判定。
+            norm = missing.lstrip("_")
+            if missing in _STDLIB_MODULES or norm in _STDLIB_MODULES:
+                return (
+                    f"{module}: ターゲット OS で標準ライブラリ '{missing}' が"
+                    "利用不可 (起動不能)",
+                    True,
+                )
             return (f"{module}: 外部依存 '{missing}' が未インストール", False)
     return (f"{module}: {etype}: {msg}", True)
 
@@ -235,4 +670,136 @@ def run_import_smoke(
             continue
         seen.add(message)
         (result.errors if is_error else result.warnings).append(message)
+    return result
+
+
+# サブプロセス内で、欠落モジュール (curses 等) をダミー充足してエントリモジュールを
+# import し、引数不要のクラスを構築して引数不要の公開メソッドを呼ぶ runner。
+# __main__ (ブロッキングなゲームループ等) は実行しない。構築失敗のみ報告し、
+# メソッド単体の例外は無視する (stdscr 不足等のノイズを避けるため)。timeout が
+# 無限ループの防壁。結果は **すべて advisory (warning)**。
+_ENTRY_SMOKE_RUNNER = r'''
+import importlib, importlib.util, inspect, json, sys, types
+
+class _Any:
+    def __getattr__(self, k): return _Any()
+    def __call__(self, *a, **k): return _Any()
+    def __iter__(self): return iter(())
+
+class _Loader:
+    def __init__(self, name): self.name = name
+    def create_module(self, spec):
+        m = types.ModuleType(spec.name)
+        m.__getattr__ = lambda k: _Any()
+        return m
+    def exec_module(self, m): pass
+
+class _Finder:
+    # 実ファイル/実 stdlib の解決に失敗した時だけダミーを合成する (meta_path 末尾)。
+    def find_spec(self, name, path=None, target=None):
+        return importlib.util.spec_from_loader(name, _Loader(name))
+
+sys.meta_path.append(_Finder())
+
+target = sys.argv[1]
+P = inspect.Parameter
+issues = []
+
+def _required(sig):
+    return [p for p in sig.parameters.values()
+            if p.default is p.empty
+            and p.kind in (P.POSITIONAL_ONLY, P.POSITIONAL_OR_KEYWORD, P.KEYWORD_ONLY)]
+
+try:
+    mod = importlib.import_module(target)
+except BaseException as e:
+    print(json.dumps({"import_error": "%s: %s" % (type(e).__name__, e)}))
+    sys.exit(0)
+
+for cname in dir(mod):
+    obj = getattr(mod, cname, None)
+    if not inspect.isclass(obj) or getattr(obj, "__module__", "") != mod.__name__:
+        continue
+    try:
+        if _required(inspect.signature(obj)):
+            continue  # 引数必須クラスは構築しない (誤検知回避)
+        inst = obj()
+    except BaseException as e:
+        issues.append("%s() の構築に失敗: %s: %s" % (cname, type(e).__name__, e))
+        continue
+    for mname in dir(inst):
+        if mname.startswith("_"):
+            continue
+        try:
+            meth = getattr(inst, mname)
+            if not callable(meth) or _required(inspect.signature(meth)):
+                continue
+            meth()  # 戻り値は無視。例外も無視 (stdscr 不足等のノイズ回避)。
+        except BaseException:
+            pass
+
+print(json.dumps({"issues": issues}))
+'''
+
+
+def run_entry_smoke(
+    files: dict[str, str],
+    spec: "CodeSpec | None" = None,
+    timeout_sec: float = 10.0,
+    python_exe: str | None = None,
+) -> SmokeResult:
+    """エントリモジュールを有界実行し、構築失敗 / ハング / クラッシュを **warning** で返す。
+
+    静的な :func:`check_entrypoint` を補完する advisory 層。``__main__`` は実行せず、
+    引数不要のクラス構築＋引数不要の公開メソッド呼び出しのみ行う。欠落モジュール
+    (curses 等) はダミー合成で import を通す。タイムアウト / サブプロセス異常は
+    warning に倒し、合否ゲートには影響させない (呼出側で warnings として扱う)。
+    """
+    result = SmokeResult()
+    py_files = {p: c for p, c in files.items() if p.endswith(".py")}
+    if not py_files:
+        return result
+    # エントリ stem を決定。spec があればその module、無ければ ``main`` 定義 /
+    # ``__main__`` ガードを持つファイルを推論 (staged は CodeSpec を持たない)。
+    ep = getattr(getattr(spec, "entry_point", None), "module", "") if spec else ""
+    if ep:
+        ep_leaf = (ep[:-3] if ep.endswith(".py") else ep).replace("\\", "/").replace(
+            "/", "."
+        ).rsplit(".", 1)[-1]
+    else:
+        entry_path = next(
+            (p for p, c in py_files.items() if _looks_like_entry(c)), None
+        )
+        if entry_path is None:
+            return result
+        ep_leaf = os.path.splitext(os.path.basename(entry_path))[0]
+    exe = python_exe or sys.executable
+    try:
+        with tempfile.TemporaryDirectory(prefix="evoref_entry_") as tmp:
+            for path, code in py_files.items():
+                with open(os.path.join(tmp, os.path.basename(path)), "w",
+                          encoding="utf-8") as fh:
+                    fh.write(code)
+            proc = subprocess.run(
+                [exe, "-c", _ENTRY_SMOKE_RUNNER, ep_leaf],
+                cwd=tmp, capture_output=True, text=True, timeout=timeout_sec,
+            )
+    except subprocess.TimeoutExpired:
+        result.warnings.append(
+            f"エントリ実行スモークが {timeout_sec:.0f}s でタイムアウト (要確認)"
+        )
+        return result
+    except Exception as e:  # noqa: BLE001 — 実行不可は warning に倒す
+        result.warnings.append(f"エントリ実行スモーク実行不可: {e}")
+        return result
+
+    try:
+        data = json.loads(proc.stdout.strip() or "{}")
+    except (ValueError, TypeError):
+        return result  # 解析不能は黙って無視 (advisory)
+    if isinstance(data, dict):
+        if data.get("import_error"):
+            result.warnings.append(f"エントリ実行スモーク: {data['import_error']}")
+        for issue in data.get("issues", []) or []:
+            result.warnings.append(f"エントリ実行スモーク: {issue}")
     return result

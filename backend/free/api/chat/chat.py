@@ -40,9 +40,10 @@ from backend.free.api.chat.chat_streaming import (
     rag_signals_from_chunks,
     read_existing_for_append,
     stream_deliberative, stream_long_form, stream_meta_cognitive, stream_reactive,
-    stream_reactive_light,
+    stream_reactive_light, stream_staged_coding,
     sync_deliberative, sync_long_form, sync_meta_cognitive, sync_reactive_light,
 )
+from backend.edition import is_pro
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
@@ -725,6 +726,135 @@ async def _dispatch_long_form(
         )
 
 
+def make_staged_codegen_delegate(
+    client, state: AppState, cfg: dict, gen_params: dict, session_id: str,
+):
+    """base コーディングモデル経由の codegen 委譲を作る (instruction -> {path: code})。
+
+    ``StagedCodingExecutor`` に注入する。``make_code_artifact_generator`` と同じ
+    base 経路 (LongFormOrchestrator の細粒度 CodeUnit 生成 + 検証/修正) を使うが、
+    EditorArtifact ではなく素の ``{logical_path: code}`` を返す。
+
+    staged の code/test 指示は spec/フローチャートの散文を多く含むため
+    ``detect_content_type`` が TEXT と誤判定する。常に CODE を強制して、コードを
+    確実に生成させる (誤判定で散文を生成し last_code_files が空になる事象を防ぐ)。
+    """
+    gen_cfg = _clamp_long_form_timeout(cfg)
+
+    async def _generate(instruction: str) -> dict[str, str]:
+        orchestrator = _build_long_form_orchestrator(
+            client, state, gen_cfg, gen_params,
+        )
+        try:
+            async for _token in orchestrator.generate(
+                instruction=instruction, session_id=session_id,
+                mode="coding", on_step=None,
+                content_type_override=ContentType.CODE,
+            ):
+                pass
+        except Exception as e:  # noqa: BLE001 — 失敗時は空 dict (executor が failure 化)
+            logger.warning("staged codegen delegate failed: %s", e)
+            return {}
+        files = orchestrator.last_code_files or (
+            {"output.py": orchestrator.last_code_output}
+            if orchestrator.last_code_output else {}
+        )
+        return {p: c for p, c in files.items() if c and c.strip()}
+
+    return _generate
+
+
+def _staged_coding_enabled(req: ChatRequest, cfg: dict, state: AppState) -> bool:
+    """staged コーディングパイプラインを起動すべきか判定する。
+
+    全条件を満たすときのみ True。いずれか欠ければ従来 longform 経路へ倒す。
+    """
+    if req.mode != "coding":
+        return False
+    coding_cfg = cfg.get("coding", {}) or {}
+    if coding_cfg.get("pipeline") != "staged":
+        return False
+    if not coding_cfg.get("staged_enabled", True):
+        return False
+    if getattr(state, "assist_client", None) is None:
+        return False
+    if not is_pro():
+        return False
+    try:
+        if detect_content_type(req.message, "coding") != ContentType.CODE:
+            return False
+    except Exception:  # noqa: BLE001 — 判定不能は longform にフォールバック
+        return False
+    return True
+
+
+async def _dispatch_staged_coding(
+    req: ChatRequest,
+    client,
+    state: AppState,
+    cfg: dict,
+    gen_params: dict,
+    session_id: str,
+    instance_name: str,
+    context_size: int,
+    messages: list,
+    search_error_wrapper: StreamWrapper,
+    timer: StageTimer,
+    output_target: str = "file",
+    prefetched_rag: list[tuple[str, float, str]] | None = None,
+    file_context_block: str | None = None,
+) -> StreamingResponse | ChatResponse:
+    """staged コーディング: 専用 LoopDriver をインライン駆動し spec→code→test を実行。
+
+    非ストリーミング要求 / base 不健全時は従来 longform 経路へフォールバックする。
+    タスクグラフ合成が空 (assist degraded 等) のときも stream 内で longform へ委譲。
+    """
+    base_ok, client = await ensure_base_model_health(client, state, cfg)
+    if not base_ok:
+        if req.stream:
+            return _llm_unavailable_response(req.stream)
+        raise HTTPException(status_code=503, detail="llama-server not connected")
+
+    orchestrator = _build_long_form_orchestrator(client, state, cfg, gen_params)
+    existing_content = await read_existing_for_append(req.message, state)
+
+    # staged はストリーミング前提。非ストリーム要求は従来 longform に委譲する。
+    if not req.stream:
+        async with client.chat_in_flight():
+            return await sync_long_form(
+                orchestrator, req.message, session_id,
+                req.mode, state, instance_name, context_size,
+                messages, existing_content,
+                timer=timer, private=req.private, output_target=output_target,
+                prefetched_rag=prefetched_rag, file_context_block=file_context_block,
+            )
+
+    codegen = make_staged_codegen_delegate(
+        client, state, cfg, gen_params, session_id,
+    )
+
+    def _fallback_factory():
+        # 合成失敗時のフォールバック (外側で search_error_wrapper 済みのため raw)
+        return stream_long_form(
+            orchestrator, req.message, session_id,
+            req.mode, state, instance_name, context_size,
+            messages, existing_content,
+            timer=timer, private=req.private, output_target=output_target,
+            prefetched_rag=prefetched_rag, file_context_block=file_context_block,
+        )
+
+    return StreamingResponse(
+        _with_chat_in_flight(client, search_error_wrapper(stream_staged_coding(
+            query=req.message, session_id=session_id, state=state, cfg=cfg,
+            instance_name=instance_name, context_size=context_size,
+            messages=messages, output_target=output_target,
+            codegen=codegen, fallback_factory=_fallback_factory,
+            timer=timer, private=req.private,
+        ))),
+        media_type="text/event-stream",
+    )
+
+
 async def _dispatch_meta_cognitive(
     req: ChatRequest,
     client,
@@ -1123,6 +1253,18 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             case "meta_cognitive" if classifier.is_long_form:
                 # long_form は precomputed tool 判定を使わない (judge_task は通常 None)。
                 _cancel_pending_task(judge_task)
+                # coding mode + pipeline=staged + Pro + assist 健全 のときは
+                # 仕様書→コード→テストの staged パイプライン (専用 LoopDriver) へ。
+                # それ以外は従来 longform 経路 (無改変フォールバック)。
+                if _staged_coding_enabled(req, cfg, state):
+                    return await _dispatch_staged_coding(
+                        req, client, state, cfg, gen_params, session_id,
+                        instance_name, context_size, messages,
+                        search_error_wrapper, timer,
+                        output_target=output_target,
+                        prefetched_rag=scored_chunks,
+                        file_context_block=file_block,
+                    )
                 return await _dispatch_long_form(
                     req, client, state, cfg, gen_params, session_id,
                     instance_name, context_size, messages, search_error_wrapper, timer,
@@ -1138,6 +1280,18 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 # 渡し、ツールループ / コンテンツ生成 / fallback の system に
                 # [参考例] として注入する (Level 1 進化を coding 生成へ反映)。
                 _cancel_pending_task(judge_task)
+                # coding mode + pipeline=staged + Pro + assist 健全 のときは、
+                # is_long_form でない coding 要求 (「テトリスを作成して」級) も
+                # staged パイプラインへ。is_long_form ブランチと同一ゲート。
+                if _staged_coding_enabled(req, cfg, state):
+                    return await _dispatch_staged_coding(
+                        req, client, state, cfg, gen_params, session_id,
+                        instance_name, context_size, messages,
+                        search_error_wrapper, timer,
+                        output_target=output_target,
+                        prefetched_rag=scored_chunks,
+                        file_context_block=file_block,
+                    )
                 return await _dispatch_meta_cognitive(
                     req, client, state, cfg, gen_params,
                     system_prompt, history,

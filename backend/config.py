@@ -52,6 +52,8 @@ class PathResolver:
         # EvorefMem トリガ辞書 (pin / fact / classify) のユーザー上書き先。
         # 同梱 default は ``backend/free/memory/_defaults/triggers/``。
         "triggers_dir": "local/triggers/",
+        # staged コーディングパイプラインの一時ワークスペース。
+        "coding_workspace_dir": "local/coding/",
     }
 
     def __init__(self, config: dict, project_root: Path):
