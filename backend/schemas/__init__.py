@@ -51,6 +51,7 @@ from backend.schemas.assist_model import (
     AssistModelConfig,
     AssistModelLocalConfig,
 )
+from backend.schemas.coding import CodingConfig, CodingStagedConfig
 from backend.schemas.learning import (
     FeedbackPipeConfig,
     LearningConfig,
@@ -101,7 +102,9 @@ __all__ = [
     "CartridgeGateConfig",
     "ChatModeConfig",
     "ClusterIndexConfig",
+    "CodingConfig",
     "CodingModeConfig",
+    "CodingStagedConfig",
     "ConflictResolverConfig",
     "ContextualPrefixConfig",
     "EditorSettingsConfig",

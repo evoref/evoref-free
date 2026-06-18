@@ -265,7 +265,16 @@ class RecurrentStrategy:
         max_units = resolve_max_units(self._lf_config, long_form_mode)
 
         # content_type に応じた schema 選択・assist None / 例外フォールバックは共通化
-        data = await generate_plan_json(self.assist_client, prompt, content_type)
+        plan_telemetry: dict = {}
+        data = await generate_plan_json(
+            self.assist_client, prompt, content_type, telemetry=plan_telemetry,
+        )
+        if plan_telemetry.get("truncated"):
+            logger.warning(
+                "Plan JSON truncated (content_type=%s): planned units may be "
+                "missing; output can be incomplete",
+                content_type.value,
+            )
 
         if not data or "units" not in data:
             logger.warning(

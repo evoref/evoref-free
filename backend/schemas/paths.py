@@ -83,3 +83,6 @@ class LocalPathsConfig(BaseModel):
     # EvorefMem トリガ辞書 (pin / fact / classify) の user override 配置先。
     # 同梱 default は ``backend/free/memory/_defaults/triggers/``。
     triggers_dir: str = "local/triggers/"
+    # staged コーディングパイプラインの一時ワークスペース
+    # (spec.md / src / tests / manifest.json の工程間ハンドオフ)。
+    coding_workspace_dir: str = "local/coding/"

@@ -37,6 +37,7 @@ LoopEventKind = Literal[
     "loop_paused",
     "loop_resumed",
     "loop_stopped",
+    "stage_progress",
 ]
 """LoopEvent の種別。
 
@@ -48,6 +49,8 @@ LoopEventKind = Literal[
 - ``iteration_started`` / ``iteration_ended`` : 周回単位の区切り
 - ``loop_started`` / ``loop_paused`` / ``loop_resumed`` / ``loop_stopped`` :
   ループ全体のライフサイクル
+- ``stage_progress`` : 1 タスク (工程) 内のサブステップ進捗 (staged コーディング
+  専用。``data={"stage","detail","status","task_id"}``)。自律ループは未使用
 """
 
 

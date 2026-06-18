@@ -124,6 +124,7 @@ def _to_task_info(view: TaskFactView) -> TaskInfo:
         project_id=view.project_id,
         created_at=view.created_at,
         accessed_at=view.accessed_at,
+        stage=view.stage,
     )
 
 

@@ -90,6 +90,10 @@ class ExecutionOutcome:
     def as_dict(self) -> dict[str, object]:
         return {
             "status": self.status,
+            # ``LoopDriver`` の loop_iter outcome ログは ``kind`` フィールドで
+            # success / failure / skipped を判定する。``status`` と同値を別名で
+            # 露出し、``iteration_outcome`` が常に "unknown" になる欠落を防ぐ。
+            "kind": self.status,
             "num_actions": len(self.actions),
             "num_artifacts": len(self.artifacts),
             "gate_ok": (

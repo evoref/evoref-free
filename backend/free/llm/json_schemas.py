@@ -203,6 +203,33 @@ class FlowchartSpec(_StrictModel):
     notes: str = ""
 
 
+# ── staged コーディングのタスクグラフ合成 (coding_task_graph) ──
+
+class CodingModuleUnit(_StrictModel):
+    """staged コーディングが生成する 1 モジュール (= 1 ファイル) の粗計画。
+
+    `backend/free/loop/staged/synthesizer.py` が purpose="coding_task_graph"
+    で取得し、spec/code/test の task ファクト三層へ決定的に展開する。
+    モジュール間の ``depends_on`` は code パス内の import 配線への参考情報で
+    あり、task 依存グラフには落とさない (循環回避のため)。
+    """
+
+    file_path: str = ""
+    purpose: str = ""
+    depends_on: list[str] = Field(default_factory=list)
+
+
+class CodingTaskGraph(_StrictModel):
+    """staged コーディングの粗計画 (全体設計 + モジュール分割)。
+
+    LLM には粗計画のみを返させ、三層展開・依存配線・slug 衝突回避は呼出側
+    (synthesizer) が Python で決定的に行う。
+    """
+
+    summary: str = ""
+    modules: list[CodingModuleUnit] = Field(default_factory=list)
+
+
 # ── 長文生成レビュー (long_form_*_review) ──
 
 class ReviewIssueItem(_StrictModel):
@@ -377,6 +404,7 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "long_form_text_review": ReviewIssues,
     "code_spec_synthesis": CodeSpec,
     "flowchart_synthesis": FlowchartSpec,
+    "coding_task_graph": CodingTaskGraph,
     "tool_judgment": ToolJudgmentResult,
     "executable_command_synth": ExecutableCommandSynth,
     "meta_cognitive_plan": MetaCognitivePlan,
