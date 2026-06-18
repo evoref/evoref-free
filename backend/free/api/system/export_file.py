@@ -37,7 +37,6 @@ _MIME_TYPES: dict[str, str] = {
     ".odt": "application/vnd.oasis.opendocument.text",
     ".ods": "application/vnd.oasis.opendocument.spreadsheet",
     ".odp": "application/vnd.oasis.opendocument.presentation",
-    ".epub": "application/epub+zip",
 }
 
 

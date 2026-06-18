@@ -102,19 +102,19 @@ def verify_syntax(file_path: str) -> str:
 
 
 # リッチ(バイナリ)文書形式: プレーンテキスト書込みでは壊れたファイルになるため、
-# backend.export レジストリ経由で実体 (OOXML / OPF 等) を生成する。Writer 未登録の
-# Free 単体でも「リッチ形式の意図」を検知して明示エラーにするための最小定数
-# (backend.pro は import しない)。
+# backend.export レジストリ経由で実体 (OOXML / OPF 等) を生成する。対応ライブラリ
+# 未導入で Writer が利用不可な場合に「リッチ形式の意図」を検知して明示エラーに
+# するための最小定数。
 _EXPORT_DOC_EXTS = frozenset(
-    {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".epub"},
+    {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp"},
 )
 
 
 def _write_rich_document(p: Path, content: str) -> str:
     """``.docx`` 等のリッチ形式を export フレームワーク経由で実ファイル化する。
 
-    Pro Writer (python-docx 等) がグローバルレジストリに登録・利用可能なら
-    OOXML 等を生成する。未登録 / ライブラリ未導入の場合は壊れたファイルを
+    文書 Writer (python-docx 等) がグローバルレジストリに登録・利用可能なら
+    OOXML 等を生成する。ライブラリ未導入で利用不可の場合は壊れたファイルを
     書かず、必要パッケージを案内する明示エラーを返す (fail clearly)。
     """
     from backend.export import get_writer_registry
@@ -126,7 +126,7 @@ def _write_rich_document(p: Path, content: str) -> str:
     if writer is None or not writer.is_available():
         requires = ", ".join(writer.requires) if writer else "python-docx"
         return (
-            f"Error: '{ext}' output requires {requires} (Pro edition). "
+            f"Error: '{ext}' output requires {requires}. "
             "Install the package, or use a text format such as .txt / .md."
         )
     try:

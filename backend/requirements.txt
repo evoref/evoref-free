@@ -16,3 +16,9 @@ diskcache>=5.6.3
 whatthepatch>=1.0.7
 structlog>=24.4.0
 tzdata>=2024.1
+# ドキュメント抽出 / エクスポート (Office / ODF / メール(eml) / RTF / LaTeX)
+python-docx>=1.1.0
+openpyxl>=3.1.0
+python-pptx>=1.0.0
+striprtf>=0.0.26
+odfpy>=1.4.1
