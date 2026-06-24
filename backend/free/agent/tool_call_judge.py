@@ -1645,6 +1645,10 @@ def _extract_file_path(query: str) -> str:
     ドライブレターとファイル名を組み合わせて解釈する。
     抽出後、連続バックスラッシュ (\\\\) をシングル (\\) に正規化する。
     """
+    # URL はファイル名抽出の対象から除外する。URL ドメイン (例: soccer.yahoo.co.jp)
+    # が「co.jp」のようなファイル名として誤抽出されるのを防ぐ。
+    query = _URL_IN_QUERY_RE.sub(" ", query)
+
     # 1. 明示的なフルパス: C:\Users\file.txt（ASCII 文字のみのパス部分）
     m = re.search(r"[A-Za-z]:\\[A-Za-z0-9_.\\/ -]+\.[A-Za-z0-9]{1,10}", query)
     if m:

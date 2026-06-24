@@ -2155,7 +2155,11 @@ class LearningScheduler:
                     decayed += 1
 
             if signals.get("long_form_false_negative"):
-                keywords = store.extract_intent_keywords(query)
+                # パス片 / URL 片 / 汎用ファイル操作語は文書種別シグナルでないため除外
+                keywords = [
+                    kw for kw in store.extract_intent_keywords(query)
+                    if store.is_long_form_learnable(kw)
+                ]
                 for kw in keywords:
                     store.add_pattern(kw, category="long_form")
                     added += 1

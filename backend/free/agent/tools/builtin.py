@@ -110,6 +110,44 @@ _EXPORT_DOC_EXTS = frozenset(
 )
 
 
+def _block_has_renderable_content(block) -> bool:
+    """ContentBlock が文書に描画される実体を持つか (空行/水平線は False)。"""
+    if block.type == "table":
+        return bool(block.rows)
+    if block.type == "list":
+        return bool(block.items)
+    if block.type == "hr":
+        return False
+    return bool((block.content or "").strip())
+
+
+def _reject_unrenderable_rich_content(ext: str, content: str, export_content) -> str | None:
+    """空 / コード文字列だけのリッチ文書を success と誤報せず明示エラーにする。
+
+    取得テーブルを使う決定論経路が外れて LLM 生成に落ちた時、モデルが空文字列や
+    「文書を作るコード」をそのまま返すと、見た目は valid だが中身の無い .pptx/.docx を
+    "Written N bytes" として成功扱いしてしまう (報告された .txt 不具合の .pptx 版)。
+    描画可能なブロックが皆無、または table が無くコードに見える本文を弾く。
+    問題なければ ``None`` を返す。
+    """
+    blocks = export_content.blocks
+    if not any(_block_has_renderable_content(b) for b in blocks):
+        return (
+            f"Error: '{ext}' output produced no document content. "
+            "Provide the document body as Markdown (headings, paragraphs, tables)."
+        )
+    has_table = any(b.type == "table" and b.rows for b in blocks)
+    if not has_table:
+        from backend.free.agent.meta_cognitive_utils import text_looks_like_code
+        if text_looks_like_code(content):
+            return (
+                f"Error: '{ext}' output looks like program code, not document "
+                "content. Provide the document body as Markdown (a heading and a "
+                "Markdown table), not a script that generates the file."
+            )
+    return None
+
+
 def _write_rich_document(p: Path, content: str) -> str:
     """``.docx`` 等のリッチ形式を export フレームワーク経由で実ファイル化する。
 
@@ -118,7 +156,7 @@ def _write_rich_document(p: Path, content: str) -> str:
     書かず、必要パッケージを案内する明示エラーを返す (fail clearly)。
     """
     from backend.export import get_writer_registry
-    from backend.export.base import ExportContent
+    from backend.export.content_converter import ContentConverter
 
     ext = p.suffix.lower()
     registry = get_writer_registry()
@@ -130,7 +168,15 @@ def _write_rich_document(p: Path, content: str) -> str:
             "Install the package, or use a text format such as .txt / .md."
         )
     try:
-        result = registry.write(ExportContent(raw_markdown=content), p)
+        # raw_markdown のみでは XLSX/CSV writer が表データを抽出できない
+        # (no_table_data になる)。ContentConverter で markdown を構造化ブロック
+        # (table 等) に変換して渡す。from_markdown は raw_markdown も保持するため
+        # docx/odt 等のプローズ系 writer は従来どおり動作する。
+        export_content = ContentConverter.from_markdown(content)
+        guard_error = _reject_unrenderable_rich_content(ext, content, export_content)
+        if guard_error:
+            return guard_error
+        result = registry.write(export_content, p)
         return f"Written {result.size_bytes} bytes to {p}"
     except Exception as e:
         return f"Error: {e}"
@@ -490,6 +536,17 @@ _FETCH_URL_SUMMARIZE_SYSTEM = (
     "important facts, numbers, names, and dates. Output the summary directly "
     "without markdown fences, headings, or meta-commentary."
 )
+# 表を含むページは行データの取りこぼしを避けるため truncate 上限を引き上げる。
+# 表はトークンが短く、メタ認知ループのツール結果として消費されるため、ベース LLM の
+# プリフィル懸念 (8000 制限の理由) は当てはまりにくい。
+_FETCH_URL_MAX_TEXT_CHARS_TABLE = 40_000
+# GFM テーブルの区切り行 (``| --- |``)。fetch 結果に表が含まれるかの検出に使う。
+_MD_TABLE_SEP_LINE_RE = re.compile(r"^\s*\|[\s:\-|]+\|\s*$", re.MULTILINE)
+
+
+def _contains_markdown_table(text: str) -> bool:
+    """テキストに GFM テーブル (区切り行付き) が含まれるか判定する。"""
+    return bool(_MD_TABLE_SEP_LINE_RE.search(text))
 
 
 # ── fetch_url 本文抽出ヒューリスティック ──────────────────────────────
@@ -581,19 +638,35 @@ def _prune_link_dense_blocks(root) -> None:
 
 
 def _flatten_tables(root) -> None:
-    """<table> を行ごとに ' | ' 連結したテキストへ置換し、見出しと値の隣接を保つ。"""
+    """<table> を GitHub-flavored Markdown 表へ置換する。
+
+    ヘッダ行 + 区切り行 (``| --- |``) + 各データ行を前後パイプ付きで出力する。
+    これにより fetch_url 結果中の表を ``ContentConverter.from_markdown`` が table
+    ブロックとして解釈でき、取得 → xlsx 出力の経路が成立する。列数が不揃いな行は
+    最大列数にパディングし、セル内の ``|`` はエスケープする。
+    """
     for table in root.find_all("table"):
         try:
             if table.parent is None:
                 continue
-            lines: list[str] = []
+            rows: list[list[str]] = []
             for tr in table.find_all("tr"):
-                cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
-                cells = [c for c in cells if c]
-                if cells:
-                    lines.append(" | ".join(cells))
-            if lines:
-                table.replace_with("\n" + "\n".join(lines) + "\n")
+                cells = [
+                    c.get_text(strip=True).replace("|", "\\|")
+                    for c in tr.find_all(["th", "td"])
+                ]
+                if any(cells):
+                    rows.append(cells)
+            if not rows:
+                continue
+            ncol = max(len(r) for r in rows)
+            md_lines: list[str] = []
+            for idx, r in enumerate(rows):
+                padded = r + [""] * (ncol - len(r))
+                md_lines.append("| " + " | ".join(padded) + " |")
+                if idx == 0:
+                    md_lines.append("| " + " | ".join(["---"] * ncol) + " |")
+            table.replace_with("\n" + "\n".join(md_lines) + "\n")
         except Exception:  # noqa: BLE001
             continue
 
@@ -728,8 +801,14 @@ async def fetch_url(
     # 本文を分離する。bs4 不在・過剰除去時は naive 抽出へ安全に退避。
     text = _html_to_text(html_text)
 
-    if len(text) > _FETCH_URL_MAX_TEXT_CHARS:
-        text = text[:_FETCH_URL_MAX_TEXT_CHARS] + "\n... (truncated)"
+    # 表を含むページは行の取りこぼしを防ぐため truncate 上限を引き上げる。
+    cap = (
+        _FETCH_URL_MAX_TEXT_CHARS_TABLE
+        if _contains_markdown_table(text)
+        else _FETCH_URL_MAX_TEXT_CHARS
+    )
+    if len(text) > cap:
+        text = text[:cap] + "\n... (truncated)"
     if truncated:
         text += f"\n... (response body truncated at {_FETCH_URL_MAX_BYTES} bytes)"
     return text
@@ -755,6 +834,8 @@ def _make_fetch_url(cfg: dict, assist_client: "AssistModelClient | None" = None)
             assist_client is None
             or text.startswith("Error")
             or len(text) <= _FETCH_URL_SUMMARIZE_THRESHOLD
+            # 表を含む結果は要約するとセル/行が失われるため原文のまま返す。
+            or _contains_markdown_table(text)
         ):
             return text
         try:

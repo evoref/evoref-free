@@ -945,7 +945,9 @@ assist_model:
     long_form_planning: 90.0          # CogWriter Plan 生成 (4-8k tok 入力)
     long_form_code_review: 90.0       # CogWriter コードレビュー
     long_form_text_review: 90.0       # CogWriter テキストレビュー
-    conflict_resolution: 15.0         # 短文マージ判定 (thinking 不要)
+    # conflict_resolution: 明示しない (DEFAULTS 15s + 反応的自己較正に委譲)。明示すると
+    #   較正が無効化され低速 assist で 15s 固定の ReadTimeout を連発し SemMem auto-merge
+    #   が停滞するため、ここでは敢えて省略する。
     critique_synthesis: 45.0          # 失敗クラスタ解析
     policy_evolution: 45.0            # PolicyParamEvolver 候補 JSON 生成
     note_evolution: 20.0              # A-MEM note 進化の軽量要約
@@ -1050,6 +1052,7 @@ long_form:
   rolling_short_term_chars: 1000    # ローリング短期メモリの文字数
   review_enabled: true              # レビューフェーズの有効/無効
   max_revisions: 3                  # 最大修正回数（0=レビューのみ）
+  document_quality_enabled: false   # TEXTのドキュメント出力(docx/pptx/xlsx/md)で構造ゲート(空/表の列ずれ/見出し階層/形式不適合)を重ね改稿。取得データは創作させず構造欠落のみ指摘。既定OFF
   repair_enabled: true              # 生成後の検証ゲート付きコードリペア(文法/未定義名の自動修正)
   max_repair_rounds: 2              # コードリペアの最大ラウンド数(0=無効)。Python は AST 厳密検証、他言語は assist 自己点検
   rag_per_unit: true                # ユニットごとにRAG検索を実行

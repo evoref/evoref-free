@@ -124,6 +124,8 @@ def _note_to_dict(note: MemoryNote) -> dict:
         "cluster_id": note.cluster_id,
         "url_curated_at": note.url_curated_at,
         "command_curated_at": note.command_curated_at,
+        "conflict_fail_count": note.conflict_fail_count,
+        "conflict_cooldown_until": note.conflict_cooldown_until,
     }
 
 
@@ -174,4 +176,6 @@ def _note_from_dict(d: dict) -> MemoryNote:
         cluster_id=d.get("cluster_id"),
         url_curated_at=d.get("url_curated_at"),
         command_curated_at=d.get("command_curated_at"),
+        conflict_fail_count=d.get("conflict_fail_count", 0),
+        conflict_cooldown_until=d.get("conflict_cooldown_until"),
     )

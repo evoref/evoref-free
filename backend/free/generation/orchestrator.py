@@ -17,6 +17,10 @@ from backend.free.generation.code_repair import CodeRepairer, infer_language
 from backend.free.generation.import_wirer import wire_imports
 from backend.free.generation.code_skeleton import CodeSkeleton, update_skeleton
 from backend.free.generation.content_detector import detect_content_type
+from backend.free.generation.document_gate import (
+    evaluate_document,
+    is_document_format,
+)
 from backend.free.generation.smoke_validator import (
     check_integrity,
     dedup_top_level_defs,
@@ -32,7 +36,7 @@ from backend.free.generation.models import (
     extract_target_chars,
 )
 from backend.free.generation.rolling_context import RollingContext
-from backend.free.generation.strategy_cogwriter import CogWriterStrategy
+from backend.free.generation.strategy_cogwriter import CogWriterStrategy, ReviewIssue
 from backend.free.generation.strategy_common import resolve_generation_order
 from backend.free.generation.strategy_recurrent import RecurrentStrategy
 from backend.free.generation.token_budget import TokenBudget, truncate_tail
@@ -108,6 +112,13 @@ class LongFormOrchestrator:
         # 配信側 (make_code_artifact_generator) が「壊れたコードを成功として
         # 渡さない」ためユーザーへ提示する。
         self.last_validation_errors: list[str] = []
+        # 直近 generate() の TEXT 確定本文 (document_quality_enabled 時のみ、改稿済み
+        # generated_units から組む)。chat_streaming の finalize が file/editor 出力に
+        # 使い、生ストリームの revise 二重追記を解消する (CODE の last_code_output と
+        # 対称)。非 document_quality / 非 TEXT では None のまま (従来の生ストリーム使用)。
+        self.last_text_output: str | None = None
+        # 直近 generate() の出力先拡張子 (document_quality ゲートの形式判定に使う)。
+        self._target_format: str = ""
 
         # Recurrent も計画 / 要約再帰をアシストモデルで実行する
         # ため ``assist_client`` を渡す。``None`` の場合は Recurrent 内部で
@@ -216,18 +227,51 @@ class LongFormOrchestrator:
         content_type: ContentType,
         on_step,
     ) -> AsyncIterator[str]:
-        """CogWriter 戦略時のレビュー & 修正リライト。トークンを yield する。"""
-        review_enabled = self.config.get("long_form", {}).get("review_enabled", True)
-        if not (isinstance(self.strategy, CogWriterStrategy) and review_enabled):
+        """CogWriter 戦略時のレビュー & 修正リライト。トークンを yield する。
+
+        ``review_enabled`` (既定 True) の LLM レビューに加え、
+        ``document_quality_enabled`` (既定 OFF) のとき TEXT のドキュメント出力先には
+        決定論的な構造ゲート (空 / 表の列ずれ / 見出し階層 / 形式不適合) を重ねる。
+        ゲート赤は export 破綻に直結するため LLM レビューより優先して有界改稿する。
+        """
+        if not isinstance(self.strategy, CogWriterStrategy):
             return
-        revisions = await self.strategy.review(rolling, content_type)
-        if on_step:
-            _call_step(on_step, {
-                "type": "long_form_review",
-                "detail": f"{len(revisions)} issues",
-                "status": "done",
-            })
-        max_revisions = self.config.get("long_form", {}).get("max_revisions", 3)
+        lf = self.config.get("long_form", {})
+        review_enabled = lf.get("review_enabled", True)
+        max_revisions = lf.get("max_revisions", 3)
+
+        revisions: list[ReviewIssue] = []
+        if review_enabled:
+            revisions = list(await self.strategy.review(rolling, content_type))
+            if on_step:
+                _call_step(on_step, {
+                    "type": "long_form_review",
+                    "detail": f"{len(revisions)} issues",
+                    "status": "done",
+                })
+
+        # 決定論ドキュメント品質ゲート (TEXT のドキュメント出力先のみ、既定 OFF)。
+        # 構造の欠落のみ指摘し取得データを創作させない。ゲート赤を LLM レビューより
+        # 前に置き、max_revisions の予算内で優先的に改稿させる。
+        if (
+            content_type == ContentType.TEXT
+            and lf.get("document_quality_enabled", False)
+            and is_document_format(self._target_format)
+        ):
+            plan_headings = [
+                u.heading for u in rolling.plan.units if isinstance(u, SectionPlan)
+            ]
+            gate_issues = evaluate_document(
+                rolling.generated_units, plan_headings, self._target_format,
+            )
+            if on_step:
+                _call_step(on_step, {
+                    "type": "long_form_document_gate",
+                    "detail": f"{len(gate_issues)} structural issues",
+                    "status": "done",
+                })
+            revisions = gate_issues + revisions
+
         for rev in revisions[:max_revisions]:
             async for token in self.strategy.revise_unit(rev, rolling, content_type):
                 yield token
@@ -505,6 +549,7 @@ class LongFormOrchestrator:
         prefetched_rag: list[tuple[str, float, str]] | None = None,
         file_context_block: str | None = None,
         content_type_override: "ContentType | None" = None,
+        target_format: str | None = None,
     ) -> AsyncIterator[str]:
         """長文生成のエントリポイント。トークンを yield する。
 
@@ -524,6 +569,9 @@ class LongFormOrchestrator:
                 強制する。staged コーディングの code/test 工程は spec/フローチャート
                 の散文を多く含む指示になり TEXT と誤判定されるため、
                 :attr:`ContentType.CODE` を強制する用途で使う。
+            target_format: 出力先拡張子 (``.docx`` / ``.pptx`` / ``.xlsx`` 等)。
+                ``document_quality_enabled`` の決定論ドキュメント品質ゲートが対象
+                形式を判定するために使う。未指定/非ドキュメント形式ではゲート非適用。
 
         Yields:
             生成トークン文字列
@@ -531,6 +579,11 @@ class LongFormOrchestrator:
         t_start = time.monotonic()
         # リクエストモードを保持 (_effective_context_size が実窓解決に参照)
         self._mode = mode
+        # 出力先形式を保持 (document_quality ゲートの形式判定に参照)
+        self._target_format = (target_format or "").lower()
+        # 前回 generate() の確定本文が残ると finalize が古い本文を配信し得るため、
+        # リクエスト冒頭で None に戻す (現状は per-request インスタンスだが防御的に)。
+        self.last_text_output = None
 
         # 1. コンテンツ種別判定 (override 指定時は検出をスキップ)
         content_type = content_type_override or detect_content_type(instruction, mode)
@@ -685,6 +738,19 @@ class LongFormOrchestrator:
                 rolling, content_type, on_step,
             ):
                 yield token
+
+            # 8.1 ドキュメント品質モード時は改稿済みユニットから確定本文を組み直す。
+            # 生ストリーム (full_response) は revise トークンを末尾に二重追記するため
+            # file/editor 出力には使えない。CODE の last_code_output と対称の TEXT 版。
+            if (
+                content_type == ContentType.TEXT
+                and self.config.get("long_form", {}).get(
+                    "document_quality_enabled", False,
+                )
+                and is_document_format(self._target_format)
+                and rolling.generated_units
+            ):
+                self.last_text_output = "\n\n".join(rolling.generated_units)
 
         # 8.5 検証ゲート付きコードリペア (CODE のみ)。review 後の generated_units を
         # assemble → 検証 → assist 修正 → 再検証し、last_code_output に保持する。
