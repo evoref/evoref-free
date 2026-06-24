@@ -62,6 +62,17 @@ _STOPWORDS = frozenset({
     "with", "from", "for", "not", "but", "and", "or",
 })
 
+# long_form カテゴリ専用の学習除外語 (CJK)。出力先指定などで頻出するが、
+# 文書(散文)の種別を示さない汎用ファイル操作語。ASCII トークンは
+# ``_LONG_FORM_ASCII_FILEISH_RE`` 側で一律除外するためここには含めない。
+_LONG_FORM_NONLEARNABLE_EXACT = frozenset({
+    "出力", "出力先", "保存", "保存先", "ファイル",
+    "書き出し", "書き込み", "配下", "エクスポート", "セーブ",
+})
+# ASCII のみのトークン (パス片 / URL 片 / ホスト名 / 形式名 / 識別子) を表す。
+# long_form の文書種別シグナルとしては信頼できないため学習対象から外す。
+_LONG_FORM_ASCII_FILEISH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
+
 
 __all__ = ["LearnedPattern", "LearnedPatternStore"]
 
@@ -287,6 +298,26 @@ class LearnedPatternStore:
                 result.append(kw)
 
         return result[:10]
+
+    @staticmethod
+    def is_long_form_learnable(keyword: str) -> bool:
+        """``keyword`` を ``category="long_form"`` として学習してよいか判定する (pure)。
+
+        long_form は文書(散文)生成の意図シグナルを学習するカテゴリ。ファイルパス片
+        (Users / Desktop / aa)・URL 片 (https / soccer.yahoo.co.jp / wcup)・汎用ファイル
+        操作語 (出力 / ファイル / 保存) は文書種別を示さないため除外する。CJK の
+        文書/意図語 (仕様書 / レポート / ガイドライン 等) は通す。
+
+        割り切り: ASCII のみのトークン (python / Excel / wcup 等) は文書種別シグナルとして
+        信頼できないため一律除外する (英語 long_form 語の学習は犠牲にする)。
+        ``correction`` / ``tool_routing`` 等の他カテゴリには適用しない (ASCII 語が正当)。
+        """
+        kw = keyword.strip()
+        if len(kw) < 2:
+            return False
+        if kw.lower() in _LONG_FORM_NONLEARNABLE_EXACT:
+            return False
+        return not _LONG_FORM_ASCII_FILEISH_RE.match(kw)
 
     def _enforce_limit(self) -> None:
         """パターン数上限を超えた場合、低重みパターンを削除"""

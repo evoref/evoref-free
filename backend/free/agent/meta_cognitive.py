@@ -20,7 +20,9 @@ from backend.free.agent.meta_cognitive_tasks import (
     EditorArtifact,
     MetaCognitiveResponse,
     TaskItem,
+    collapse_document_generation_tasks,
     collapse_editor_write_tasks,
+    collapse_fetch_save_tasks,
     determine_task_status,
     merge_same_file_tasks,
     task_expects_write,
@@ -29,6 +31,12 @@ from backend.free.agent.meta_cognitive_tools import (
     infer_tool_from_task,
     normalize_read_file_args,
     normalize_write_file_args,
+)
+from backend.free.agent.output_format import (
+    is_rich_table_output,
+    is_table_output,
+    resolve_dir_output_path,
+    wants_fetched_table,
 )
 from backend.free.agent.meta_cognitive_utils import (
     contains_code_indicator,
@@ -101,6 +109,13 @@ gave one. If the user did not specify an output location, describe the task WITH
 - Creating or rewriting a SINGLE file is always ONE task, not multiple tasks.
   BAD:  {"tasks": ["Create the core logic", "Add feature A", "Add input handling"]}
   GOOD: {"tasks": ["Generate the full program the user requested in a single file"]}
+- When the user asks for a DOCUMENT or DATA FILE (Excel/spreadsheet/CSV, Word, \
+PowerPoint, a calendar, a table, a report), the deliverable is the FILE CONTENT itself. \
+Plan a SINGLE write task that writes the content to the file. Do NOT plan to "generate a \
+Python/openpyxl/VBA script" and do NOT plan to "run/execute" a script — the system renders \
+the content into the real .xlsx/.docx/.pptx automatically.
+  BAD  (user asked for an Excel calendar): {"tasks": ["Generate a Python script that creates the Excel file", "Execute the generated script"]}
+  GOOD (user asked for an Excel calendar): {"tasks": ["Write this month's calendar to the user's specified path"]}
 - Only split into multiple tasks when genuinely different files or operations are needed.
 - Each task should have a SINGLE action type. Do NOT combine "fetch/read" and "write/create" \
 in one task.
@@ -110,6 +125,11 @@ in one task.
 as the task — do NOT plan to create files.
   BAD:  {"tasks": ["Create script to scrape website"]}
   GOOD: {"tasks": ["Fetch URL and summarize the content"]}
+- Fetching a URL and saving its data to a file is exactly TWO tasks: fetch, then write. \
+Do NOT add separate "extract", "generate the file", or "save" steps — extracting the data \
+and creating the file both happen inside the single write task.
+  BAD:  {"tasks": ["Fetch the URL", "Extract the results", "Generate the Excel file", "Save it to <path>"]}
+  GOOD: {"tasks": ["Fetch the URL content", "Write the results to the user's specified path"]}
 - Each task should be self-contained and produce a concrete result.
 
 Example: {"tasks": ["Read foo.py", "Generate refactored code", "Run tests"]}
@@ -140,6 +160,31 @@ Generate the requested content below. Output ONLY the content itself, \
 no explanations, no markdown fences, no surrounding text. \
 Do NOT include the file path as a comment at the top.
 """
+
+# スプレッドシート/表形式の出力先では本文を GFM マークダウン表として生成させる。
+# write_file → ContentConverter.from_markdown → XlsxWriter で実セルに展開される。
+TABLE_CONTENT_INSTRUCTION = (
+    "The target is a spreadsheet/table file. Output ONLY a GitHub-flavored "
+    "Markdown table built from the data gathered in the previous steps: a header "
+    "row, a `| --- |` separator row, then one row per record. Every row must "
+    "start and end with a pipe `|`. No prose, no code fences, no extra text."
+)
+
+# Word/PowerPoint 等のリッチ文書で、取得済みテーブルが無くモデル生成に落ちる時の
+# 保険。export Writer が変換できる GFM を出させ、python-pptx/VBScript 等の「文書を
+# 作るコード」をテキスト出力する退行を明示的に禁じる。表は強制しない (散文文書も可)。
+RICH_DOC_CONTENT_INSTRUCTION = (
+    "The target is a Word/PowerPoint document. Output ONLY GitHub-flavored Markdown "
+    "(headings with #, paragraphs, bullet lists, and Markdown tables as appropriate). "
+    "Do NOT output python-pptx, python-docx, VBScript, openpyxl, or any program code. "
+    "No code fences around the whole document."
+)
+
+# 実データを取得するツール。これらの生結果をタスク横断で蓄積し、後続の
+# write タスクが取得済みデータを直接参照できるようにする (転記ハルシネーション防止)。
+_DATA_BEARING_TOOLS: frozenset[str] = frozenset({
+    "fetch_url", "read_file", "search_code", "search_history", "rag_search",
+})
 
 # 拡張子 → 言語識別子 (エディタ出力片のシンタックスハイライト用、best-effort)
 _EXT_LANGUAGE_MAP: dict[str, str] = {
@@ -436,6 +481,9 @@ class MetaCognitiveAgent:
         self._mode = mode
         self._editor_artifacts: list[EditorArtifact] = []
         self._chat_code_parts: list[str] = []
+        # データ取得系ツール (fetch_url / read_file 等) の生結果をタスク横断で蓄積。
+        # 表/ファイル生成タスクが取得済み実データを直接参照し、転記ハルシネーションを防ぐ。
+        self._fetched_tool_outputs: list[str] = []
 
         # MDP トレース: エピソード開始
         tracer = self._agent_tracer
@@ -455,6 +503,14 @@ class MetaCognitiveAgent:
 
         # 同一ファイル対象のタスクをマージ
         tasks = merge_same_file_tasks(tasks)
+        # 単一 URL → 単一ファイル保存の過分割 (fetch/extract/generate/save) を
+        # fetch+write へ集約する。抽出/保存タスクでの小型モデル拒否を防ぐ。
+        if self._output_target == "file":
+            tasks = collapse_fetch_save_tasks(tasks, query)
+            # URL 無しの文書/データ出力で「スクリプト生成 → 実行」と誤分解された
+            # プランを単一 write タスクへ正規化する (内容を直接 write_file させ、
+            # 実体の無い生成スクリプトの実行や .xlsx へのコード書込みを防ぐ)。
+            tasks = collapse_document_generation_tasks(tasks, query)
         # editor/chat 経路 (パス未指定) は merge_same_file_tasks がすり抜けるため、
         # 過分割された書き込みタスクを 1 件へ集約する (1 リクエスト=1 タブ)。
         if self._output_target in ("editor", "chat"):
@@ -1386,10 +1442,39 @@ class MetaCognitiveAgent:
     ) -> dict:
         """`write_file` / `read_file` の args を正規化する。それ以外は素通し。"""
         if tool_name == "write_file":
-            return normalize_write_file_args(tool_args)
+            args = normalize_write_file_args(tool_args)
+            fp = args.get("file_path", "")
+            if fp:
+                args["file_path"] = MetaCognitiveAgent._resolve_write_path(
+                    fp, original_query,
+                )
+            return args
         if tool_name == "read_file":
             return normalize_read_file_args(tool_args, original_query)
         return tool_args
+
+    @staticmethod
+    def _resolve_write_path(file_path: str, query: str) -> str:
+        """write_file の出力先を確定する。
+
+        - 既存ディレクトリ指定 (例: C:\\...\\aa) → ``output_<UTC><ext>``
+          (write_file はディレクトリをエラーにするため、書込み前にファイル名へ)
+        - ディレクトリ成分の無い bare ファイル名で、クエリが出力ディレクトリを
+          指定している場合 → そのディレクトリ配下へ寄せる (planner が CWD 相対の
+          名前を発明したとき、ユーザー指定の場所へ揃える)
+        """
+        resolved = resolve_dir_output_path(file_path, query)
+        if resolved != file_path:
+            return resolved
+        p = Path(file_path)
+        if str(p.parent) in ("", "."):  # ディレクトリ成分の無い bare ファイル名
+            from backend.free.agent.tool_call_judge import _extract_file_path
+            qpath = _extract_file_path(query)
+            if qpath and ("\\" in qpath or "/" in qpath):
+                qp = Path(qpath)
+                if qp.is_dir() or not qp.suffix:
+                    return str(qp / p.name)
+        return file_path
 
     async def _emit_loop_tool_running(
         self,
@@ -1454,6 +1539,24 @@ class MetaCognitiveAgent:
             tool_name, tool_call.get("args", {}), original_query,
         )
 
+        # 取得専任タスク (collapse 済み) では write_file を実行しない。出力は後続の
+        # write タスクが取得データを決定論的に書く。小型モデルが取得タスクの途中で
+        # 余計な write_file を出してプレースホルダ/重複ファイルを生む退行を防ぐ。
+        if getattr(task, "fetch_only", False) and tool_name == "write_file":
+            logger.info(
+                "fetch-only task: suppressing write_file to %s (delegated to "
+                "write task)", tool_args.get("file_path", ""),
+            )
+            step_results.append(StepResult(
+                tool_name="write_file",
+                output=(
+                    "Skipped: this step only fetches data; the fetched data is "
+                    "written to the file by a later step. Do not write files here."
+                ),
+                iteration=loop,
+            ))
+            return None
+
         tool_call_entry = {"tool": tool_name, "args": tool_args, "success": False}
         tool_calls.append(tool_call_entry)
 
@@ -1500,6 +1603,17 @@ class MetaCognitiveAgent:
             output=tool_result_text,
             iteration=loop,
         ))
+        # データ取得結果をタスク横断アキュムレータへ (write タスクの素材に再利用)。
+        if tool_name in _DATA_BEARING_TOOLS and not is_tool_error(tool_result_text):
+            self._fetched_tool_outputs.append(tool_result_text)
+            # 取得専任タスクは取得成功時点で完了 (後続 write タスクへ委譲)。
+            # ここで止めないと小型モデルが次ループで余計な write_file を出す。
+            if getattr(task, "fetch_only", False):
+                logger.info(
+                    "fetch-only task: fetch succeeded, ending step "
+                    "(write delegated): %s", tool_name,
+                )
+                return tool_result_text, tool_calls
 
         # write_file 成功 → タスク完了
         if not is_tool_error(tool_result_text) and tool_name == "write_file":
@@ -1540,6 +1654,18 @@ class MetaCognitiveAgent:
         成功時は tool_args["content"] を更新して None を返す（ループ続行）。
         """
         file_path = tool_args.get("file_path", "")
+        # 表計算/リッチ文書 (xlsx/csv/docx/pptx) 出力で、タスク横断で取得済みの実
+        # テーブルがあれば、モデルに転記させず取得データを直接書き込む
+        # (ハルシネーション/行脱落の防止、pptx でコード文字列を吐く退行の防止)。
+        if wants_fetched_table(file_path):
+            fetched_table = self._extract_fetched_table_markdown()
+            if fetched_table:
+                tool_args["content"] = fetched_table
+                logger.info(
+                    "write_file content from fetched table (deterministic): "
+                    "%d chars -> %s", len(fetched_table), file_path,
+                )
+                return None
         if on_step:
             await call_callback(on_step, {
                 "type": "tool_call",
@@ -1572,6 +1698,41 @@ class MetaCognitiveAgent:
             len(content), file_path,
         )
         return None
+
+    def _extract_fetched_table_markdown(self) -> str:
+        """タスク横断で取得したツール結果から GFM テーブルを抽出・結合する。
+
+        ``fetch_url`` 等が返した本文中の table ブロックを集め、複数テーブル
+        (日付ごと等で繰り返されるヘッダ) を 1 ヘッダ + 全データ行へ正規化した
+        GFM 文字列を返す。テーブルが無ければ空文字列。
+        """
+        from backend.export.content_converter import ContentConverter
+
+        outputs = getattr(self, "_fetched_tool_outputs", [])
+        header: list[str] | None = None
+        data_rows: list[list[str]] = []
+        for out in outputs:
+            for block in ContentConverter().convert(out):
+                if block.type != "table" or not block.rows:
+                    continue
+                if header is None:
+                    header = block.rows[0]
+                    data_rows.extend(block.rows[1:])
+                else:
+                    # 繰り返しヘッダ行はスキップして本文行のみ連結
+                    start = 1 if block.rows[0] == header else 0
+                    data_rows.extend(block.rows[start:])
+        if header is None or not data_rows:
+            return ""
+        ncol = len(header)
+        lines = [
+            "| " + " | ".join(header) + " |",
+            "| " + " | ".join(["---"] * ncol) + " |",
+        ]
+        for r in data_rows:
+            cells = (list(r) + [""] * ncol)[:ncol]
+            lines.append("| " + " | ".join(cells) + " |")
+        return "\n".join(lines)
 
     @staticmethod
     async def _execute_tool(
@@ -1717,6 +1878,11 @@ class MetaCognitiveAgent:
             is_success = False
             logger.error("Tool fast path failed: %s - %s", tool_name, e)
 
+        # データ取得結果をタスク横断アキュムレータへ (後続 write タスクの素材に再利用)。
+        # ファストパス経由の fetch_url 等もここで蓄積する (ツールループ経路と対称)。
+        if tool_name in _DATA_BEARING_TOOLS and is_success:
+            self._fetched_tool_outputs.append(result_text)
+
         tool_entry = {
             "tool": tool_name,
             "args": tool_args,
@@ -1744,7 +1910,25 @@ class MetaCognitiveAgent:
         prefix: str = "",
     ) -> tuple[str, list[dict]]:
         """書き込みタスクのファストパス実行"""
+        # 出力先を確定 (ディレクトリ→output ファイル / bare 名→クエリ指定ディレクトリ配下)。
+        # planner/judge が発明した CWD 相対の bare 名をユーザー指定の場所へ寄せる。
+        file_path = self._resolve_write_path(file_path, original_query)
         logger.info("Write fast path: %s → %s", task.description[:60], file_path)
+
+        # 表計算/リッチ文書 (xlsx/csv/docx/pptx) 出力で取得済みの実テーブルがあれば、
+        # モデルに転記させず取得データを直接書き込む (小型モデルのハルシネーション/
+        # 行脱落/拒否、pptx でコード文字列を吐く退行を回避)。
+        if wants_fetched_table(file_path):
+            fetched_table = self._extract_fetched_table_markdown()
+            if fetched_table:
+                logger.info(
+                    "Write fast path content from fetched table "
+                    "(deterministic): %d chars -> %s",
+                    len(fetched_table), file_path,
+                )
+                return await self._write_file(
+                    file_path, fetched_table, tools_registry, on_step, prefix,
+                )
 
         if on_step:
             await call_callback(on_step, {
@@ -1853,34 +2037,49 @@ class MetaCognitiveAgent:
             )
             return None
 
+        # 出力先を確定 (ディレクトリ→output / bare→クエリ dir) し、表/CSV 出力で
+        # 取得済みの実テーブルがあれば、モデルではなく取得データを直接使う (決定論)。
+        file_path = self._resolve_write_path(file_path, original_query)
+        fetched_table = (
+            self._extract_fetched_table_markdown()
+            if wants_fetched_table(file_path) else ""
+        )
+
         logger.info(
             "Auto-recovery: LLM returned plain text for write task, "
             "extracting content for %s",
             file_path,
         )
 
-        content = strip_markdown_wrapper(text)
-        if not text_looks_like_code(content):
-            if on_step:
-                await call_callback(on_step, {
-                    "type": "tool_call",
-                    "detail": f"{prefix} コンテンツ生成中（自動リカバリー） → {file_path}",
-                    "status": "running",
-                })
-            content = await self._generate_content(
-                original_query, task.description, llm_client,
-                file_path=file_path,
+        if fetched_table:
+            content = fetched_table
+            logger.info(
+                "Auto-recovery content from fetched table (deterministic): "
+                "%d chars -> %s", len(content), file_path,
             )
-            if content.startswith("(Content generation failed:"):
-                logger.warning("Auto-recovery content generation failed: %s", file_path)
-                return None
+        else:
+            content = strip_markdown_wrapper(text)
+            if not text_looks_like_code(content):
+                if on_step:
+                    await call_callback(on_step, {
+                        "type": "tool_call",
+                        "detail": f"{prefix} コンテンツ生成中（自動リカバリー） → {file_path}",
+                        "status": "running",
+                    })
+                content = await self._generate_content(
+                    original_query, task.description, llm_client,
+                    file_path=file_path,
+                )
+                if content.startswith("(Content generation failed:"):
+                    logger.warning("Auto-recovery content generation failed: %s", file_path)
+                    return None
 
-        if looks_like_path_not_content(content, file_path):
-            logger.warning(
-                "Auto-recovery: content looks like a file path, aborting: %r",
-                content,
-            )
-            return None
+            if looks_like_path_not_content(content, file_path):
+                logger.warning(
+                    "Auto-recovery: content looks like a file path, aborting: %r",
+                    content,
+                )
+                return None
 
         if on_step:
             await call_callback(on_step, {
@@ -1929,12 +2128,24 @@ class MetaCognitiveAgent:
 
         existing_content = self._read_existing_file(file_path)
         user_prompt = f"{original_query}\n\nタスク: {task_description}"
+        # 「今月」「今日」等の相対表現を取り違えないよう現在日付を前置する
+        # (カレンダー/予定表など日付依存の成果物で年月・曜日がズレるのを防ぐ)。
+        user_prompt = self._inject_current_date(user_prompt)
+        # 前ステップで取得した実データ (fetch_url 等) を「使うべき素材」として注入し、
+        # データに無い内容の創作 (ハルシネーション) を抑止する。
+        user_prompt = self._inject_fetched_data(user_prompt, ctx_size)
         user_prompt = self._inject_existing_content(
             user_prompt, existing_content, file_path, ctx_size,
         )
 
         # Level 1 で進化した few-shot を参考例として system に注入する
         system_content = CONTENT_GENERATION_PROMPT
+        # 出力先がスプレッドシート系なら GFM 表生成を強制する (xlsx 実セル化のため)。
+        # リッチ文書系 (docx/pptx) は表を強制せず、コード文字列の出力のみ禁じる。
+        if is_table_output(file_path):
+            system_content = f"{system_content}\n{TABLE_CONTENT_INSTRUCTION}"
+        elif is_rich_table_output(file_path):
+            system_content = f"{system_content}\n{RICH_DOC_CONTENT_INSTRUCTION}"
         if self._fewshot_block:
             system_content = f"{system_content}\n\n[参考例]\n{self._fewshot_block}"
 
@@ -1950,6 +2161,24 @@ class MetaCognitiveAgent:
         return await self._stream_and_clean(
             llm_client, messages, gen_max_tokens,
         )
+
+    @staticmethod
+    def _inject_current_date(user_prompt: str) -> str:
+        """現在日付 (UTC 基準) を user_prompt 先頭に前置する。
+
+        ``_generate_content`` は履歴を持たないため、モデルは現在日付を知らない。
+        「今月のカレンダー」のような相対日付依存の生成で年月・曜日を取り違え
+        ないよう、現在日付と曜日を明示する。内部時刻不変則 (naive 禁止) に従い
+        ``utc_now_dt()`` を使う。
+        """
+        from backend.utils import utc_now_dt
+        now = utc_now_dt()
+        weekday = "月火水木金土日"[now.weekday()]
+        date_ctx = (
+            f"[現在日時 (UTC基準)] {now:%Y-%m-%d} ({weekday}曜)。"
+            "「今月」「今日」等の相対表現はこの日付を基準に解釈すること。"
+        )
+        return f"{date_ctx}\n\n{user_prompt}"
 
     @staticmethod
     def _read_existing_file(file_path: str) -> str:
@@ -1991,6 +2220,28 @@ class MetaCognitiveAgent:
                 base_tokens, existing_tokens, ctx_size // 2,
             )
         return user_prompt
+
+    def _inject_fetched_data(self, user_prompt: str, ctx_size: int) -> str:
+        """タスク横断で取得したツール結果を「使うべき実データ」として注入する。
+
+        コンテキスト予算 (おおよそ ctx_size/2) に収まる範囲で取得データを付与し、
+        モデルにデータ由来の出力を促す。予算不足なら付与しない (安全縮退)。
+        """
+        outputs = getattr(self, "_fetched_tool_outputs", [])
+        if not outputs:
+            return user_prompt
+        combined = "\n\n".join(outputs)
+        base_tokens = _estimate_tokens(CONTENT_GENERATION_PROMPT + user_prompt)
+        budget_tokens = ctx_size // 2 - base_tokens
+        if budget_tokens < 100:
+            return user_prompt
+        # token 予算をおおまかに char 予算へ換算 (日本語混在で ~2 char/token 見込み)
+        snippet = combined[: budget_tokens * 2]
+        return user_prompt + (
+            "\n\n## 取得済みデータ (前ステップで取得した実データ)\n"
+            "以下のデータのみを根拠に出力を生成し、データに無い情報は創作しないこと。\n"
+            f"{snippet}"
+        )
 
     def _calc_gen_max_tokens(
         self, prompt_text: str, ctx_size: int,

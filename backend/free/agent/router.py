@@ -40,6 +40,47 @@ LONG_FORM_PATTERNS = [
     re.compile(r"(完全|網羅的|包括的).*(実装|ガイド|解説)"),
 ]
 
+# URL を含み、かつファイル書込み/出力意図のあるクエリは「取得 → 書込み」の連鎖を
+# 要するため meta_cognitive 層へ振る。deliberative は 1 ターン 1 ツールで連鎖できず、
+# long_form は URL を取得せず散文を生成する (内容を捏造する) ため、いずれも不適。
+_URL_HINT_RE = re.compile(r"https?://", re.IGNORECASE)
+_FILE_WRITE_INTENT_RE = re.compile(
+    r"(?:ファイル|file|csv|excel|エクセル|xlsx|スプレッドシート|ドキュメント|word|ワード"
+    r"|powerpoint|パワーポイント|パワポ|pptx|プレゼンテーション)"
+    r"|(?:出力|保存|書き出|書き込|エクスポート|export|セーブ"
+    r"|(?<![A-Za-z])save(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+
+# URL を伴わずローカルパスへ書き出す意図のクエリ (例: 「C:\\...\\aa 配下に Excel で
+# カレンダーを作成して出力」) も「生成 → 書込み」の連鎖を要するため meta_cognitive 層へ
+# 振る。long_form (文書系名詞) にも _is_url_write_intent にも当たらないデータ成果物
+# (カレンダー/一覧表等) を拾い、deliberative のディレクトリ書込み除外による拒否を防ぐ。
+# ローカルファイルパス (Windows ドライブ / Unix) の存在検出。
+_LOCAL_PATH_RE = re.compile(
+    r"[A-Za-z]:[\\/]"                  # Windows ドライブパス (C:\ / C:/)
+    r"|(?:^|[\s　])(?:/[\w._-]+){2,}",  # Unix パス (/home/user/...)
+)
+# 書込み「動詞」のみ。名詞 (excel / docx 等) 単独では発火させない (「report.xlsx を
+# 読んで」のような read 文脈で誤検出しないため)。
+_WRITE_VERB_RE = re.compile(
+    r"(?:作成|作って|生成|出力|保存|書[きい]|書込|エクスポート|export"
+    r"|(?<![A-Za-z])save(?![A-Za-z])"
+    r"|(?<![A-Za-z])write(?![A-Za-z])"
+    r"|(?<![A-Za-z])create(?![A-Za-z])"
+    r"|(?<![A-Za-z])output(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+# how-to / 質問形マーカー。「作成する方法を教えて」のような書込み動詞を含む
+# 知識質問を local_write_intent から除外する。``_is_knowledge_query`` は
+# 「一覧を…」等のデータ語を広く拾い正当な書込みコマンドまで除外してしまうため、
+# ここでは教示・疑問マーカーに限定する。
+_HOWTO_QUERY_RE = re.compile(
+    r"(?:教えて|おしえて|どうやって|どうすれば|どうやったら"
+    r"|とは|って何|何ですか|ですか|ますか|でしょうか|ありますか|[?？])",
+    re.IGNORECASE,
+)
+
 # 複雑度を示すキーワードパターン（同義語・表記揺れ対応済み）
 COMPLEX_KEYWORDS = [
     "比較", "なぜ", "どのように", "違い", "分析", "解析",
@@ -170,11 +211,33 @@ class ComplexityClassifier:
         if self._is_greeting(query):
             return self._record_classification("reactive", "greeting", query)
 
+        # 1.4. URL + ファイル書込み意図 → meta_cognitive
+        #   「URL を取得してファイルに出力」は取得 → 書込みの連鎖を要し、これを実行
+        #   できるのは meta_cognitive 層のみ。学習語による long_form 誤振り分け
+        #   (step 1.5) より優先して評価する。
+        if self._is_url_write_intent(query, mode):
+            self.is_long_form = False
+            return self._record_classification(
+                self._guard_meta_cognitive(), "url_write_intent", query,
+            )
+
         # 1.5. 長文生成判定 → meta_cognitive（Orchestrator に委任）
         if self._detect_long_form(query):
             self.is_long_form = True
             return self._record_classification(
                 self._guard_meta_cognitive(), "long_form", query,
+            )
+
+        # 1.6. ローカルパス + ファイル書込み意図 (URL 無し) → meta_cognitive
+        #   long_form (文書系名詞) にも url_write_intent にも当たらないデータ成果物
+        #   (Excel カレンダー/一覧表等) のローカル出力を拾う。is_long_form=False の
+        #   まま planner + write-fast 経路 (_dispatch_meta_cognitive) で dir→file
+        #   解決 + 生成 → write_file を成立させる。long_form 判定後に評価することで
+        #   「仕様書/ドキュメント + パス」は従来どおり long_form を維持する。
+        if self._is_local_write_intent(query, mode):
+            self.is_long_form = False
+            return self._record_classification(
+                self._guard_meta_cognitive(), "local_write_intent", query,
             )
 
         # 2. 知識質問の検出 → ツール/Meta-Cognitive エスカレーションをスキップ
@@ -230,6 +293,19 @@ class ComplexityClassifier:
         rag_threshold = self._get_policy("router", "rag_score_threshold", mode, 0.8)
         if is_short and rag_results and rag_results[0][1] > rag_threshold:
             return self._record_classification("reactive", "short_high_rag", query)
+
+        # 8.5. 知識質問 → deliberative（検索を走らせる）
+        #   「Xについて教えて」等の知識質問は LTM / カートリッジ参照が要る。reactive /
+        #   reactive_light は検索パイプラインを一切走らせない (chat 側 search_task は
+        #   agent_layer != reactive のときのみ起動) ため、短い知識質問が step 9 の
+        #   short_query で reactive に落ちると、カートリッジを参照せずベースモデルの
+        #   事前知識だけで回答してしまう。知識質問は短くても検索経路 (deliberative)
+        #   へ送る。step 8 (short_high_rag) の後に置くことで、RAG ヒット済みの短文
+        #   即応答 (本番では rag_results 未注入のため発火しない) は従来挙動を保つ。
+        if is_knowledge:
+            return self._record_classification(
+                "deliberative", "knowledge_query", query,
+            )
 
         # 9. 短いクエリ（単純な質問）→ reactive
         if is_short:
@@ -319,6 +395,38 @@ class ComplexityClassifier:
         q_lower = query.lower()
         return any(kw in q_lower for kw in META_KEYWORDS)
 
+    def _is_url_write_intent(self, query: str, mode: str = "chat") -> bool:
+        """URL からデータを取得してファイルに書き出す意図を検出する。
+
+        chat モードのみ対象 (coding モードは step 3 の ``_needs_tools`` が同等の
+        meta_cognitive 振り分けを行う)。URL とファイル書込み/出力意図の双方が
+        揃った場合のみ True を返す。
+        """
+        if mode != "chat":
+            return False
+        if not _URL_HINT_RE.search(query):
+            return False
+        return bool(_FILE_WRITE_INTENT_RE.search(query))
+
+    def _is_local_write_intent(self, query: str, mode: str = "chat") -> bool:
+        """ローカルパス + ファイル書込み意図 (URL 無し) を検出する。
+
+        chat モードのみ対象 (coding モードは step 3/4 の ``_needs_tools`` /
+        ``_has_meta_keywords`` が同等の振り分けを行う)。URL を含む場合は
+        ``_is_url_write_intent`` / fetch 経路に委ね、知識質問 (「作成方法を
+        教えて」等の how-to) は除外する。ローカルパスと書込み動詞の双方が
+        揃った場合のみ True を返す。
+        """
+        if mode != "chat":
+            return False
+        if _URL_HINT_RE.search(query):
+            return False
+        if _HOWTO_QUERY_RE.search(query):
+            return False
+        if not _LOCAL_PATH_RE.search(query):
+            return False
+        return bool(_WRITE_VERB_RE.search(query))
+
     def _detect_long_form(self, query: str) -> bool:
         """長文生成リクエストかどうかを判定
 
@@ -326,6 +434,10 @@ class ComplexityClassifier:
         ``LearnedPatternStore`` の ``category="long_form"`` を OR 判定する。
         後者は FeedbackCollector / LearningScheduler により自己進化する。
         """
+        # URL を含むクエリは取得 (fetch) を要するためツール経路で扱う。散文生成
+        # (long_form) は URL 内容を取得できず捏造するため、学習語が一致しても除外する。
+        if _URL_HINT_RE.search(query):
+            return False
         if any(p.search(query) for p in LONG_FORM_PATTERNS):
             return True
         return self._contains_learned_long_form_patterns(query)

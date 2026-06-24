@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -26,6 +27,13 @@ class ConflictResolver:
     _CB_MAX_CONSECUTIVE = 2
     _CB_MAX_FAILURE_RATE = 0.5
     _CB_MIN_ATTEMPTS = 3
+
+    # 失敗ペアの quarantine: LLM マージに繰り返し失敗するノートを一定時間
+    # conflict 検出から除外し、同一ペアを毎サイクル再試行して circuit breaker を
+    # 起こし続ける livelock を断つ。低速 assist が一過性に遅いだけのケースに
+    # 備え cooldown 経過後は再試行する (恒久 ban にはしない)。
+    _FAIL_QUARANTINE_THRESHOLD = 3
+    _COOLDOWN_SECONDS = 6 * 3600.0
 
     def __init__(
         self,
@@ -67,33 +75,57 @@ class ConflictResolver:
         # memory.jsonl へ LLM 呼び出し/スキップ件数を記録する任意ロガー
         self._debug_logger: DebugLogger | None = debug_logger
 
+        # 直近の detect_conflicts で cooldown により除外したペア数 (stats 用)
+        self._last_cooldown_skipped: int = 0
+
+    @staticmethod
+    def _in_cooldown(note: MemoryNote, now: float) -> bool:
+        """ノートが conflict quarantine cooldown 中か (float epoch 比較)。"""
+        until = note.conflict_cooldown_until
+        return until is not None and until > now
+
     def detect_conflicts(self, short_term: ShortTermMemory) -> list[tuple[str, str]]:
         """コサイン類似度で類似ノートペアを検出
+
+        quarantine cooldown 中のノートを含むペアは除外する (livelock 防止)。
 
         Returns:
             list of (note_id_a, note_id_b) pairs
         """
+        now = time.time()
         notes = [n for n in short_term.notes.values() if n.embedding is not None]
         if len(notes) < 2:
+            self._last_cooldown_skipped = 0
             return []
 
         pairs: list[tuple[str, str]] = []
         seen: set[frozenset[str]] = set()
+        cooldown_skipped = 0
 
         for i, a in enumerate(notes):
             for b in notes[i + 1:]:
                 sim = float(np.dot(a.embedding, b.embedding))
-                if sim >= self.similarity_threshold:
-                    key = frozenset((a.id, b.id))
-                    if key not in seen:
-                        seen.add(key)
-                        pairs.append((a.id, b.id))
-                        a.conflict_candidate = True
-                        a.conflict_partner_id = b.id
-                        b.conflict_candidate = True
-                        b.conflict_partner_id = a.id
+                if sim < self.similarity_threshold:
+                    continue
+                key = frozenset((a.id, b.id))
+                if key in seen:
+                    continue
+                seen.add(key)
+                # 失敗が続いて quarantine 中のペアはスキップ
+                if self._in_cooldown(a, now) or self._in_cooldown(b, now):
+                    cooldown_skipped += 1
+                    continue
+                pairs.append((a.id, b.id))
+                a.conflict_candidate = True
+                a.conflict_partner_id = b.id
+                b.conflict_candidate = True
+                b.conflict_partner_id = a.id
 
-        logger.info("Detected %d conflict pairs (threshold=%.2f)", len(pairs), self.similarity_threshold)
+        self._last_cooldown_skipped = cooldown_skipped
+        logger.info(
+            "Detected %d conflict pairs (threshold=%.2f, cooldown_skipped=%d)",
+            len(pairs), self.similarity_threshold, cooldown_skipped,
+        )
         return pairs
 
     async def resolve_conflicts(
@@ -116,6 +148,7 @@ class ConflictResolver:
                 "detected_pairs": 0,
                 "low_sim_skipped": 0,
                 "over_cap_skipped": 0,
+                "cooldown_skipped": self._last_cooldown_skipped,
                 "llm_calls": 0,
                 "llm_merged": 0,
                 "llm_failures": 0,
@@ -134,6 +167,7 @@ class ConflictResolver:
         stats: dict = {
             "detected_pairs": len(pairs),
             "over_cap_skipped": over_cap_skipped,
+            "cooldown_skipped": self._last_cooldown_skipped,
             "min_merge_similarity": self.min_merge_similarity,
             "max_per_cycle": self.max_per_cycle,
             "batch_size": self.batch_size,
@@ -230,6 +264,9 @@ class ConflictResolver:
                 note_a.conflict_partner_id = None
                 note_a.evolution_pending = True  # 再進化が必要
                 note_a.embedding = None  # 再埋め込みが必要
+                # 統合成功したので生存ノートの失敗マーカーをリセット
+                note_a.conflict_fail_count = 0
+                note_a.conflict_cooldown_until = None
 
                 del short_term.notes[id_b]
                 short_term._cache_dirty = True
@@ -239,6 +276,7 @@ class ConflictResolver:
             else:
                 consecutive_failures += 1
                 total_failures += 1
+                self._mark_merge_failure(note_a, note_b)
 
             # llama-server の負荷軽減のためインターバルを挿入
             if self.llm_call_interval > 0:
@@ -261,6 +299,20 @@ class ConflictResolver:
             dl.log_memory_op("conflict_resolve", stats)
         except Exception as exc:  # noqa: BLE001 - ロギング失敗は本処理を止めない
             logger.warning("log_memory_op(conflict_resolve) failed: %s", exc)
+
+    def _mark_merge_failure(self, note_a: MemoryNote, note_b: MemoryNote) -> None:
+        """マージ失敗を両ノートに記録し、閾値到達で cooldown を設定する。
+
+        同一ペアを毎サイクル再試行して circuit breaker を起こし続ける livelock を
+        防ぐため、繰り返し失敗するノートを一定時間 conflict 検出から除外する。
+        cooldown 経過後は再び検出対象に戻り、再失敗すれば即座に再 cooldown する
+        (恒久 ban ではなくバックオフ)。
+        """
+        now = time.time()
+        for note in (note_a, note_b):
+            note.conflict_fail_count += 1
+            if note.conflict_fail_count >= self._FAIL_QUARANTINE_THRESHOLD:
+                note.conflict_cooldown_until = now + self._COOLDOWN_SECONDS
 
     async def _merge_with_llm(
         self,

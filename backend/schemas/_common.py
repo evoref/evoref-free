@@ -341,6 +341,12 @@ class LongFormConfig(BaseModel):
     # 低速ローカル GPU では正当な生成が 10-20 分かかるため既定は余裕を持たせる。
     # 超過時は生成済みユニットで打ち切り、部分結果を返す (無限ハング防止)。
     total_timeout_sec: float = Field(default=1800.0, ge=0.0)
+    # ドキュメント品質ゲート: TEXT のドキュメント出力先 (docx/pptx/xlsx/md 等) で、
+    # 既存の review/revise ループに決定論的な構造検査 (空セクション / 表の列ずれ /
+    # 見出し階層の飛び / 形式不適合) を重ね、ゲート赤を優先して有界改稿する。
+    # 取得済みデータを創作させず構造の欠落のみ指摘する。改稿済みユニットから確定
+    # 本文を組み直し file 出力へ反映する。既定 OFF (全エディションで opt-in 可)。
+    document_quality_enabled: bool = False
 
 
 class ChatModeConfig(BaseModel):

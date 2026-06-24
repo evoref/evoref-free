@@ -345,7 +345,12 @@ class FeedbackCollector:
         if self._learned_patterns is None:
             return
 
-        keywords = self._learned_patterns.extract_intent_keywords(query)
+        # パス片 / URL 片 / 汎用ファイル操作語は long_form の文書種別シグナルでは
+        # ないため学習から除外する (出力先指定の自己学習による誤ルーティング防止)。
+        keywords = [
+            kw for kw in self._learned_patterns.extract_intent_keywords(query)
+            if self._learned_patterns.is_long_form_learnable(kw)
+        ]
         for kw in keywords:
             self._learned_patterns.add_pattern(kw, category="long_form")
 

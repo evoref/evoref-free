@@ -25,6 +25,11 @@ class TaskItem:
     description: str
     status: str = "pending"  # "pending" | "done" | "failed"
     result: str = ""
+    # collapse_fetch_save_tasks が付与する「取得専任」マーカー。True のタスクは
+    # 取得 (fetch_url 等) のみ行い、書込みは行わない (出力は後続の write タスクが
+    # 取得データを決定論的に書く)。小型モデルが取得タスクの tool-loop 内で余計な
+    # write_file を出し、プレースホルダ/重複ファイルを生む退行を防ぐ。
+    fetch_only: bool = False
 
 
 @dataclass
@@ -170,5 +175,138 @@ def collapse_editor_write_tasks(tasks: list[TaskItem]) -> list[TaskItem]:
     logger.info(
         "Editor task collapsing: %d tasks → %d tasks (%d write tasks → 1)",
         len(tasks), len(collapsed), len(write_idx),
+    )
+    return collapsed
+
+
+# 取得 (fetch) タスクの識別。動詞または URL の存在で判定する。
+_FETCH_TASK_RE = re.compile(
+    r"(?:fetch|retrieve|download|scrape|取得|読み込|読み取)|https?://",
+    re.IGNORECASE,
+)
+
+
+def collapse_fetch_save_tasks(
+    tasks: list[TaskItem], query: str,
+) -> list[TaskItem]:
+    """単一 URL 取得 → 単一ファイル保存の過分割を [fetch, write] へ集約する。
+
+    planner が「fetch / extract / generate / save」と過分割すると、抽出・保存
+    タスクで小型モデルが拒否/誤反応 (例: 「2026 は未来だから結果は無い」) し、
+    出力が破綻する。取得データの書き込みは決定論経路 (取得テーブルを直接書込) が
+    担うため、fetch を 1 つ残して残りを 1 つの write タスクへ集約し、モデルに
+    「抽出」「保存」を別タスクで実行させる余地を断つ。
+
+    安全側ガード: 出力が表計算/リッチ文書 (xlsx/csv/ods/docx/pptx) で、クエリに URL が
+    ちょうど 1 つ、fetch 以外のタスクが 2 つ以上の場合のみ集約する。非対象形式
+    (要約 → .md 等) はモデル駆動フローを保持し、複数 URL / 複数ファイル要求も対象外。
+    """
+    from backend.free.agent.output_format import (
+        FETCHED_TABLE_EXTS,
+        infer_output_extension,
+    )
+    if infer_output_extension(query, default="") not in FETCHED_TABLE_EXTS:
+        return tasks
+    if len(re.findall(r"https?://", query)) != 1:
+        return tasks
+    fetch_tasks = [t for t in tasks if _FETCH_TASK_RE.search(t.description)]
+    other_tasks = [t for t in tasks if not _FETCH_TASK_RE.search(t.description)]
+    if not fetch_tasks or len(other_tasks) <= 1:
+        return tasks
+
+    from backend.free.agent.tool_call_judge import _extract_file_path
+    out_path = _extract_file_path(query)
+    desc = "Write the fetched data to the file the user requested"
+    if out_path:
+        desc = f"Write the fetched data to {out_path}"
+    # 取得タスクは fetch_only=True とし、書込みは後続の write タスクへ委ねる
+    # (入力 TaskItem を変異させず新規生成する)。
+    collapsed = [
+        TaskItem(description=fetch_tasks[0].description, fetch_only=True),
+        TaskItem(description=desc),
+    ]
+    logger.info(
+        "Fetch/save task collapsing: %d tasks → 2 (fetch + write)",
+        len(tasks),
+    )
+    return collapsed
+
+
+# 「スクリプトを実行/run」系タスク。文書/データ出力では成果物を write_file →
+# export Writer が描画するため、生成スクリプトの実行は常に誤り (実体の無い
+# スクリプトを run_command で叩いて失敗する)。
+_EXECUTE_TASK_RE = re.compile(
+    r"(?<![A-Za-z])(?:execute|run)(?![A-Za-z])|実行",
+    re.IGNORECASE,
+)
+# 「プログラム/スクリプトを生成」系タスク。文書/データ出力でこれらの語を含む
+# プランは、内容ではなく「文書を作るコード」を生成しようとする退行シグナル。
+_SCRIPT_TASK_RE = re.compile(
+    r"(?<![A-Za-z])(?:python|script|program|openpyxl|vba|macro)(?![A-Za-z])"
+    r"|python-pptx|python-docx|スクリプト|プログラム|マクロ",
+    re.IGNORECASE,
+)
+# 入力取得 (read/fetch) タスク。集約時もデータ源として保持する。
+_INPUT_TASK_RE = re.compile(
+    r"(?<![A-Za-z])(?:fetch|retrieve|download|scrape|read|load)(?![A-Za-z])"
+    r"|取得|読み込|読み取|読んで",
+    re.IGNORECASE,
+)
+
+
+def collapse_document_generation_tasks(
+    tasks: list[TaskItem], query: str,
+) -> list[TaskItem]:
+    """URL 無しの文書/データファイル出力で「スクリプト生成 → 実行」プランを単一 write へ集約する。
+
+    planner が「Excel カレンダーを作成」を「Excel を作る Python スクリプトを生成 →
+    そのスクリプトを実行」と誤分解すると、(1) スクリプトコードを .xlsx へ書こうとして
+    "No table data found" エラー、(2) 実体の無い生成スクリプトを ``run_command`` で実行
+    して失敗、となる。成果物 (表/文書) は write_file → export Writer が描画するため、
+    内容を直接生成する単一 write タスクへ正規化し、スクリプト生成 / 実行タスクを排除する。
+
+    安全側ガード: 出力が FETCHED_TABLE_EXTS (xlsx/csv/ods/docx/pptx)、クエリに URL 無し
+    (URL は ``collapse_fetch_save_tasks`` 管轄)、かつ実行 / スクリプト生成タスクを実際に
+    含む (退行シグナルがある) 場合のみ集約する。正常な単一 write タスクや、入力ファイルを
+    読んで変換する正当なプランには手を入れない。入力 (read/fetch) タスクは保持する。
+    """
+    from backend.free.agent.output_format import (
+        FETCHED_TABLE_EXTS,
+        infer_output_extension,
+    )
+    if infer_output_extension(query, default="") not in FETCHED_TABLE_EXTS:
+        return tasks
+    if re.search(r"https?://", query):
+        return tasks
+    has_antipattern = any(
+        _EXECUTE_TASK_RE.search(t.description)
+        or _SCRIPT_TASK_RE.search(t.description)
+        for t in tasks
+    )
+    if not has_antipattern:
+        return tasks
+
+    # データ源 (read/fetch) は保持。スクリプト生成 / 実行タスクは破棄する。
+    input_tasks = [
+        t for t in tasks
+        if _INPUT_TASK_RE.search(t.description)
+        and not _SCRIPT_TASK_RE.search(t.description)
+        and not _EXECUTE_TASK_RE.search(t.description)
+    ]
+
+    from backend.free.agent.tool_call_judge import _extract_file_path
+    out_path = _extract_file_path(query)
+    desc = "Write the requested document to the file the user requested"
+    if out_path:
+        desc = f"Write the requested document to {out_path}"
+
+    collapsed = [
+        TaskItem(description=t.description, fetch_only=True) for t in input_tasks
+    ]
+    collapsed.append(TaskItem(description=desc))
+    logger.info(
+        "Document generation task collapsing: %d tasks → %d "
+        "(script/execute steps removed)",
+        len(tasks), len(collapsed),
     )
     return collapsed

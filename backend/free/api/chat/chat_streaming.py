@@ -32,6 +32,7 @@ from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
 from backend.free.agent.meta_cognitive_utils import is_tool_error
 from backend.free.agent.tool_call_judge import _extract_file_path
+from backend.free.agent.output_format import infer_output_extension
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.core.stream_filter import (
     HeadBufferFilter, StreamThinkingFilter,
@@ -39,6 +40,7 @@ from backend.free.core.stream_filter import (
 from backend.free.core.stream_pipeline import StreamPipeline
 from backend.free.llm.local_client import LocalClient
 from backend.free.llm.editor_filename import derive_editor_filename_stem
+from backend.free.generation.document_gate import is_document_format
 from backend.free.generation.orchestrator import LongFormOrchestrator
 from backend.free.generation.validators import remove_code_fences
 from backend.utils import estimate_tokens as _estimate_tokens, utc_compact_stamp
@@ -261,23 +263,13 @@ _MD_EXT_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 def _infer_output_extension(query: str, default: str = ".txt") -> str:
-    """ユーザー指示文から出力ファイルの拡張子を推論する。
+    """ユーザー指示文から出力ファイルの拡張子を推論する (agent 層に委譲)。
 
-    現状は ``.md`` / ``.txt`` の 2 値のみ扱い、判定できなければ ``default`` を返す。
-    SPLIT モードの個別 unit と CONTINUE モードの自動命名で共通利用する。
-
-    Args:
-        query: ユーザー指示文
-        default: 推論できなかった場合に返す既定拡張子 (先頭ドット必須)
-
-    Returns:
-        ``.md`` / ``.txt`` 等の拡張子文字列 (先頭ドット付き)。
+    long_form / SPLIT / CONTINUE 自動命名と meta_cognitive のディレクトリ解決で
+    同一ロジックを共有するため ``backend.free.agent.output_format`` に集約している。
     """
-    if _MD_EXT_HINT_RE.search(query):
-        return ".md"
-    return default
+    return infer_output_extension(query, default)
 
 
 # エディタ出力時の言語識別子マップ (フロント側 Monaco の syntax highlight 用)。
@@ -524,11 +516,19 @@ async def long_form_write_file(
 
     # コード拡張子 (.py / .js 等) の場合は LLM が付ける markdown コードフェンスを除去。
     # markdown / txt ではフェンスは本文の一部なので除去しない。
-    if _editor_language_for_extension(Path(file_path).suffix) != "markdown":
+    suffix = Path(file_path).suffix
+    if _editor_language_for_extension(suffix) != "markdown":
         content = remove_code_fences(content)
 
-    # 生成テキストのクリーニング（見出し行除去・空行圧縮）
-    content = clean_generated_text(content)
+    # 生成テキストのクリーニング。ドキュメント形式 (docx/pptx/xlsx/odf/md) は
+    # markdown 構造 (見出し / 表 / リスト) が export Writer の組版入力になるため、
+    # 見出しを温存し空行圧縮のみ行う。clean_generated_text は見出し行を全削除する
+    # ため、ここで適用すると pptx のスライド分割 (見出し level<=2 区切り) や docx の
+    # 章節構造が壊れる。それ以外 (.txt 等) は従来どおり余計な見出し行を除去する。
+    if is_document_format(suffix):
+        content = re.sub(r"\n{3,}", "\n\n", content).strip()
+    else:
+        content = clean_generated_text(content)
 
     try:
         # 追記モード: 既存ファイルの内容に連結
@@ -1030,11 +1030,15 @@ async def _finalize_long_form_stream(
     # revise トークンが二重追記されるため、コード出力の確定本文には使わない。
     is_code = getattr(orchestrator, "last_content_type", None) == "code"
     code_output = getattr(orchestrator, "last_code_output", None)
-    delivered = (
-        code_output
-        if (is_code and isinstance(code_output, str) and code_output)
-        else state.full_response
-    )
+    text_output = getattr(orchestrator, "last_text_output", None)
+    if is_code and isinstance(code_output, str) and code_output:
+        delivered = code_output
+    elif (not is_code) and isinstance(text_output, str) and text_output:
+        # document_quality モード: 改稿済みユニットから組んだ確定本文。生ストリーム
+        # は revise トークンを二重追記するため file 出力には使わない (CODE と対称)。
+        delivered = text_output
+    else:
+        delivered = state.full_response
     record_long_form_response(
         sess_state, delivered, messages, session_id,
         query, mode, state.tokens_generated, metrics,
@@ -1238,6 +1242,12 @@ async def stream_long_form(
                 long_form_mode=long_form_mode,
                 prefetched_rag=prefetched_rag,
                 file_context_block=file_context_block,
+                # ドキュメント品質ゲートは実ファイル出力時のみ意味を持つ。no-file の
+                # チャット表示応答にゲート/本文差し替えを及ぼさないよう file 出力確定
+                # 時だけ形式を渡す (非 file は "" → is_document_format=False で非適用)。
+                target_format=(
+                    _infer_output_extension(query) if file_output_mode else ""
+                ),
             )
             aiter = token_gen.__aiter__()
             pending: asyncio.Task[str] | None = None
@@ -1378,6 +1388,10 @@ async def sync_long_form(
             long_form_mode=long_form_mode,
             prefetched_rag=prefetched_rag,
             file_context_block=file_context_block,
+            # ドキュメント品質ゲートは実ファイル出力時のみ適用 (非 file は "")。
+            target_format=(
+                _infer_output_extension(query) if file_output_mode else ""
+            ),
         ):
             if not first_token_recorded and timer:
                 timer.stop("llm_first_token_ms")
@@ -1393,8 +1407,12 @@ async def sync_long_form(
         # を配信する (生ストリームの revise 二重追記を解消)。
         is_code = getattr(orchestrator, "last_content_type", None) == "code"
         code_output = getattr(orchestrator, "last_code_output", None)
+        text_output = getattr(orchestrator, "last_text_output", None)
         if is_code and isinstance(code_output, str) and code_output:
             full_response = code_output
+        elif (not is_code) and isinstance(text_output, str) and text_output:
+            # document_quality モード: 改稿済み確定本文 (revise 二重追記の解消)。
+            full_response = text_output
         _lf_rag_used, _lf_rag_top1 = rag_signals_from_chunks(prefetched_rag)
         record_long_form_response(
             state, full_response, messages, session_id,

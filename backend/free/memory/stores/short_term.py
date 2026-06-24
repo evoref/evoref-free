@@ -118,6 +118,17 @@ class MemoryNote:
     """executable_command_curator (Step 8.6) がこの assistant note を処理済みに
     した時刻。None は未処理。次サイクルで同一コマンドを再記録しないためのマーカー。"""
 
+    # ── conflict 解決の失敗 quarantine マーカー ─────────
+    conflict_fail_count: int = 0
+    """このノートを含むペアが LLM マージに連続失敗した回数。閾値到達で
+    ``conflict_cooldown_until`` を設定し、次サイクル以降の conflict 検出から
+    一定時間除外する (同一ペアを毎サイクル再試行して circuit breaker を起こし
+    続ける livelock の防止)。マージ成功で 0 にリセットされる。"""
+
+    conflict_cooldown_until: float | None = None
+    """conflict 検出を再開してよい時刻 (float epoch)。``None`` または現在時刻
+    超過で検出対象に戻る。``url_curated_at`` 等と同じ float epoch マーカー。"""
+
 
 class ShortTermMemory:
     """Layer 2: A-MEM ノート + LightMem スコア"""
