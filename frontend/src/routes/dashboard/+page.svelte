@@ -82,6 +82,8 @@
 				conditionsMet={learningData.conditions_met}
 				lastLevel1Run={learningData.last_level1_run}
 				lastLevel2Run={learningData.last_level2_run}
+				runningTarget={learningData.running_target}
+				level2={learningData.level2}
 				lastLevel0Record={learningData.last_level0_record}
 				experienceByMode={learningData.experience_by_mode}
 				correctionRate={learningData.correction_rate}

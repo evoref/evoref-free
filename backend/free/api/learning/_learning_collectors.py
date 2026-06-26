@@ -26,6 +26,9 @@ from backend.free.api.learning._learning_schemas import (
     ExperienceByModeModel,
     FitnessPoint,
     Level1ResultEntry,
+    Level2GatesModel,
+    Level2StatusModel,
+    Level2TargetStatus,
     PolicyEvolverDomainStatus,
     PriorityRequestEntry,
 )
@@ -114,6 +117,54 @@ def map_policy_evolver_status(
             phase=val.get("phase", ""),
         )
     return result
+
+
+# ── Pro: Level 2 (base/assist) 状態マッピング ────────────────
+
+
+def _map_level2_target(raw: object) -> Level2TargetStatus:
+    """raw target dict を `Level2TargetStatus` に変換する純粋関数。"""
+    if not isinstance(raw, dict):
+        return Level2TargetStatus()
+    return Level2TargetStatus(
+        method=str(raw.get("method", "")),
+        bootstrap_enabled=bool(raw.get("bootstrap_enabled", False)),
+        adapter_exists=bool(raw.get("adapter_exists", False)),
+        version=int(raw.get("version", 0) or 0),
+        experiences_current=int(raw.get("experiences_current", 0) or 0),
+        bootstrap_min=int(raw.get("bootstrap_min", 0) or 0),
+        spsa_min=int(raw.get("spsa_min", 0) or 0),
+        cvector_min=int(raw.get("cvector_min", 0) or 0),
+        block_reason=str(raw.get("block_reason", "") or ""),
+    )
+
+
+def map_level2_status(raw: object | None) -> Level2StatusModel | None:
+    """raw `level2` dict を `Level2StatusModel` に変換する純粋関数。
+
+    `raw` が dict でない場合 (Free / Level2Runner 未注入) は `None`。
+    Pro/Free 判定は呼び出し側ではなく raw の有無で吸収する。
+    """
+    if not isinstance(raw, dict):
+        return None
+    raw_gates = raw.get("gates", {})
+    if isinstance(raw_gates, dict):
+        gates = Level2GatesModel(
+            active_minutes=float(raw_gates.get("active_minutes", 5.0) or 5.0),
+            overdue_hours=float(raw_gates.get("overdue_hours", 24.0) or 24.0),
+            recheck_interval_sec=float(
+                raw_gates.get("recheck_interval_sec", 300.0) or 300.0,
+            ),
+        )
+    else:
+        gates = Level2GatesModel()
+    return Level2StatusModel(
+        running_target=raw.get("running_target"),
+        next_target=str(raw.get("next_target", "base")),
+        base=_map_level2_target(raw.get("base")),
+        assist=_map_level2_target(raw.get("assist")),
+        gates=gates,
+    )
 
 
 # ── Fitness 履歴マッピング ──────────────────────────────────────────────

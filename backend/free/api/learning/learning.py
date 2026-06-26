@@ -14,6 +14,7 @@ from backend.free.api.learning._learning_collectors import (
     map_experience_by_mode,
     map_fitness_history,
     map_level1_results,
+    map_level2_status,
     map_policy_evolver_status,
     map_priority_queue,
     ts_to_iso,
@@ -258,6 +259,8 @@ def _build_scheduler_status(scheduler: object | None) -> SchedulerStatusModel:
         conditions_met=raw.get("conditions_met", False),
         last_level1_run=ts_to_iso(raw.get("last_level1_run", 0.0)),
         last_level2_run=ts_to_iso(raw.get("last_level2_run", 0.0)),
+        running_target=raw.get("running_target"),
+        level2=map_level2_status(raw.get("level2")),
         # Level 0 詳細
         last_level0_record=raw.get("last_level0_record"),
         experience_by_mode=map_experience_by_mode(raw.get("experience_by_mode")),

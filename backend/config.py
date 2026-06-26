@@ -62,8 +62,16 @@ class PathResolver:
         self.local = config.get("local_paths", {})
 
     def resolve_model(self, key: str) -> Path:
-        """モデルパス解決"""
-        raw = self.models.get(key, self.MODEL_DEFAULTS[key])
+        """モデルパス解決
+
+        config の ``model_paths[key]`` を優先し、無ければ ``MODEL_DEFAULTS[key]``
+        を使う。``dict.get(key, MODEL_DEFAULTS[key])`` は default 引数を先に評価
+        するため、``MODEL_DEFAULTS`` に無いキー (assist_model / embed_model /
+        coding_model 等) を config 側に持っていても KeyError で落ちていた。
+        """
+        raw = self.models.get(key) or self.MODEL_DEFAULTS.get(key)
+        if raw is None:
+            raise KeyError(f"unknown model_paths key: {key!r}")
         return self._to_absolute(raw)
 
     def resolve_local(self, key: str) -> Path:
