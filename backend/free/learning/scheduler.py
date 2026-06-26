@@ -142,6 +142,14 @@ class LearningScheduler:
         self.spsa_iterations: int = learning.get("level2_spsa_iterations", 500)
         self.sparse_params: int = learning.get("level2_sparse_params", 200)
         self.active_minutes: float = learning.get("active_minutes", 5)
+        # Level 2 自動発火のタイミングゲート (SleepTimeWorker と同一 config 由来)。
+        # ダッシュボードの発火条件表示で参照する (get_level2_status 経由)。
+        self.level2_overdue_hours: float = float(
+            learning.get("level2_overdue_hours", 24.0),
+        )
+        self.level2_recheck_interval_sec: float = float(
+            learning.get("level2_recheck_interval_sec", 300),
+        )
         self.assist_min_experiences: int = learning.get(
             "assist_level2_min_experiences", 30,
         )
@@ -262,6 +270,9 @@ class LearningScheduler:
         """ランタイム mutable state + パス + Level1Session 関連の初期化。"""
         self._cancelled = False
         self._running = False
+        # Level 2 学習タスク実行中の対象 ("base" | "assist" | None)。
+        # base/assist 個別の「学習中」表示用に Level2Runner が set/clear する。
+        self._running_target: str | None = None
         self._last_run: float = 0.0
         self._last_level2_run: float = 0.0
         self._level1_run_count: int = 0
@@ -1206,6 +1217,14 @@ class LearningScheduler:
             "conditions_met": new_count >= self.min_experiences,
             "last_level1_run": self._last_run,
             "last_level2_run": self._last_level2_run,
+            # 実行中の Level 2 対象 ("base"/"assist"/None) と base/assist 個別状態。
+            # level2 は Pro (Level2Runner 注入時) のみ非 None。
+            "running_target": self._running_target,
+            "level2": (
+                self._level2_runner.get_level2_status()
+                if self._level2_runner is not None
+                else None
+            ),
             # Level 0 詳細
             "last_level0_record": last_level0_record,
             "experience_by_mode": {"chat": chat_count, "coding": coding_count},

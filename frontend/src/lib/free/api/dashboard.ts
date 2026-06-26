@@ -52,6 +52,37 @@ export interface ActiveSessionInfo {
 	experience_count: number;
 }
 
+/** Level 2 の base / assist 個別状態 + 発火条件（Pro） */
+export interface Level2TargetStatus {
+	method: string;
+	bootstrap_enabled: boolean;
+	adapter_exists: boolean;
+	version: number;
+	/** 蓄積中の発火データ数（base=失敗数 / assist=経験数） */
+	experiences_current: number;
+	bootstrap_min: number;
+	spsa_min: number;
+	cvector_min: number;
+	/** 発火しない理由コード（"" = 発火可能）。表示は i18n でラベル化する */
+	block_reason: string;
+}
+
+/** Level 2 自動発火の共通タイミングゲート（Pro） */
+export interface Level2Gates {
+	active_minutes: number;
+	overdue_hours: number;
+	recheck_interval_sec: number;
+}
+
+/** Level 2 (LoRA) の base/assist 個別状態（Pro のみ非 null） */
+export interface Level2Status {
+	running_target: string | null;
+	next_target: string;
+	base: Level2TargetStatus;
+	assist: Level2TargetStatus;
+	gates: Level2Gates;
+}
+
 /** スケジューラ状態（バックエンド SchedulerStatusModel 準拠） */
 export interface SchedulerStatus {
 	running: boolean;
@@ -61,6 +92,10 @@ export interface SchedulerStatus {
 	conditions_met: boolean;
 	last_level1_run: string | null;
 	last_level2_run: string | null;
+	/** 実行中の Level 2 対象（"base"/"assist"/null） */
+	running_target: string | null;
+	/** Level 2 (LoRA) base/assist 個別状態（Pro のみ非 null） */
+	level2: Level2Status | null;
 	last_level0_record: string | null;
 	experience_by_mode: ExperienceByMode;
 	correction_rate: number;
@@ -87,6 +122,10 @@ export interface DashboardLearningData {
 	conditions_met: boolean;
 	last_level1_run: string | null;
 	last_level2_run: string | null;
+	/** 実行中の Level 2 対象（"base"/"assist"/null） */
+	running_target: string | null;
+	/** Level 2 (LoRA) base/assist 個別状態（Pro のみ非 null） */
+	level2: Level2Status | null;
 	lora_version: number;
 	lora_adapter_exists: boolean;
 	eval_cases_count: number;
