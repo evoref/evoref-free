@@ -209,7 +209,8 @@ async def reload_prompt_manager(state: AppState) -> None:
 
     cfg = get_config()
     resolver = get_path_resolver()
-    prompt_dir = resolver.resolve_local("prompts_dir")
+    # base システムプロンプトは (model×mode) パーティション配下 (resolve_learning)。
+    prompt_dir = resolver.resolve_learning("prompts_dir")
     instance_name = cfg.get("instance", {}).get("name", "evoref")
     state.prompt_manager = SystemPromptManager(prompt_dir, instance_name=instance_name)
     logger.info("PromptManager reloaded: instance_name=%s", instance_name)

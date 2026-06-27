@@ -118,9 +118,16 @@ async def run_reindex(
             except Exception as exc:
                 logger.error("Reindex failed for cartridge %s: %s", cart_id, exc)
 
-    # 状態更新: 次元不一致フラグをクリア
+    # 状態更新: embed 切替 reindex マーカーを消してから次元不一致フラグを再評価。
+    # (フル reindex 時のみ。特定カートリッジのみの reindex では全体の stale 状態は
+    # 解消しないためマーカーは残す。)
     try:
-        from backend.free.rag.dimension_check import check_embedding_dim_consistency
+        from backend.free.rag.dimension_check import (
+            check_embedding_dim_consistency,
+            clear_embed_reindex_required,
+        )
+        if cartridge_id is None:
+            clear_embed_reindex_required()
         check_embedding_dim_consistency(state)
     except Exception as exc:
         logger.warning("Post-reindex dimension check failed: %s", exc)

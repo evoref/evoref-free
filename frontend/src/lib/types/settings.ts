@@ -116,6 +116,7 @@ export interface RAGConfig {
 	support_threshold: number;
 	confidence_threshold: number;
 	hysteresis_band: number;
+	score_normalization: string;
 	self_rag: {
 		assist_judge: {
 			enabled: boolean;

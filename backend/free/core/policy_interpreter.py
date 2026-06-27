@@ -266,6 +266,7 @@ class PolicyInterpreter:
         semmem_stores: list[SemanticFactStore] | None = None,
         policy_activation_min_confidence: float = 0.7,
         debug_logger: "DebugLogger | None" = None,
+        base_model_id: str = "",
     ):
         """
         Args:
@@ -303,10 +304,38 @@ class PolicyInterpreter:
         )
 
         self._debug_logger = debug_logger
+        # base 学習パーティションの active モデルスラグ。空 = partition 無効
+        # (``learn.policy.<mode>.*`` レガシー subject を適用)。set_base_model_id で
+        # 切替時に更新し、当該モデルの policy ファクトのみを適用する。
+        self._base_model_id: str = base_model_id
 
         self._load_all()
         if self._policy_source != "yaml":
             self._apply_semmem_overrides()
+
+    def set_base_model_id(self, base_model_id: str) -> None:
+        """base 学習パーティションの active モデルスラグを差し替えて再適用する。
+
+        モデル切替時に :func:`backend.factory._learning_rebind.rebind_base_learning`
+        から呼ばれる。``set_semmem_stores`` と同様、変更後に即
+        :meth:`_apply_semmem_overrides` を再走させ、前モデルの override を
+        当該モデルのもので置き換える (YAML 再ロード後の呼び出しが前提)。
+        """
+        with self._lock:
+            self._base_model_id = base_model_id or ""
+            if self._policy_source != "yaml":
+                self._apply_semmem_overrides()
+
+    def _active_policy_prefix(self) -> str:
+        """active モデルを織り込んだ policy ファクト検索 prefix を返す。
+
+        partition 有効 (``_base_model_id`` 非空) 時は
+        ``learn.policy.<model>.`` を返し、当該モデルの policy のみを対象にする。
+        無効時はレガシー ``learn.policy.`` (全モデル) を返す。
+        """
+        if self._base_model_id:
+            return f"{LEARN_POLICY_SUBJECT_PREFIX}{self._base_model_id}."
+        return LEARN_POLICY_SUBJECT_PREFIX
 
     def get(self, domain: str, key: str, mode: str = "chat") -> Any:
         """パラメータ値を O(1) で取得する
@@ -441,11 +470,16 @@ class PolicyInterpreter:
         skipped_below_confidence = 0
         skipped_unknown_target = 0
 
+        # partition 有効時は active モデルの policy のみを対象にする
+        # (``learn.policy.<model>.``)。他モデルの override が混入すると分割が
+        # 形骸化するため、検索 prefix 自体でモデルをゲートする。
+        search_prefix = self._active_policy_prefix()
+
         # スコア順ではなく、ストアの順番 → ファクトの created_at 順で適用する
         # ことで、後勝ちの規則を保ちつつ各ストア内の進化履歴も時系列で反映する
         for store in self._semmem_stores:
             facts = store.search_by_pillar_prefix(
-                LEARN_POLICY_SUBJECT_PREFIX, include_superseded=False,
+                search_prefix, include_superseded=False,
             )
             facts.sort(key=lambda f: f.created_at)
             for fact in facts:
@@ -454,7 +488,9 @@ class PolicyInterpreter:
                 if fact.confidence < self._policy_activation_min_confidence:
                     skipped_below_confidence += 1
                     continue
-                parsed = self._parse_learn_policy_subject(fact.subject)
+                parsed = self._parse_learn_policy_subject(
+                    fact.subject, self._base_model_id,
+                )
                 if parsed is None:
                     skipped_unknown_subject += 1
                     continue
@@ -500,16 +536,26 @@ class PolicyInterpreter:
     @staticmethod
     def _parse_learn_policy_subject(
         subject: str,
+        base_model_id: str = "",
     ) -> tuple[str, str, str] | None:
-        """``learn.policy.<mode>.<domain>.<param_path>`` を分解する
+        """policy subject を ``(mode, domain, key)`` に分解する。
 
-        ``param_path`` はドット区切り (将来のネスト対応のため) を許容するが、
-        現状 ``params[mode][key]`` は単一 key のみのため、ドットが含まれて
-        いる場合は丸ごと key として渡す。
+        partition 有効 (``base_model_id`` 非空) 時は新形式
+        ``learn.policy.<model>.<mode>.<domain>.<param_path>`` を期待し、モデル
+        セグメントを剥がしてから ``<mode>.<domain>.<key>`` を読む (モデル不一致は
+        ``None``)。無効時はレガシー ``learn.policy.<mode>.<domain>.<param_path>``。
+
+        ``param_path`` はドット区切り (将来のネスト対応) を許容するが、現状
+        ``params[mode][key]`` は単一 key のみのため、ドット含む場合は丸ごと key。
         """
-        if not subject.startswith(LEARN_POLICY_SUBJECT_PREFIX):
+        prefix = (
+            f"{LEARN_POLICY_SUBJECT_PREFIX}{base_model_id}."
+            if base_model_id
+            else LEARN_POLICY_SUBJECT_PREFIX
+        )
+        if not subject.startswith(prefix):
             return None
-        rest = subject[len(LEARN_POLICY_SUBJECT_PREFIX):]
+        rest = subject[len(prefix):]
         parts = rest.split(".")
         if len(parts) < 3:
             return None

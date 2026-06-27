@@ -161,6 +161,7 @@ class FewShotPool(JsonStateStore):
         learn_view: LearnFactView | None = None,
         semmem_writeback_scope: str = "global",
         evolve_writeback: EvolveWriteback = "yaml",
+        base_model_id: str = "",
     ) -> None:
         """
         Args:
@@ -189,6 +190,9 @@ class FewShotPool(JsonStateStore):
         self._learn_view: LearnFactView | None = learn_view
         self._semmem_writeback_scope: str = semmem_writeback_scope
         self._evolve_writeback: EvolveWriteback = evolve_writeback
+        # base 学習パーティションの active モデルスラグ。空 = partition 無効
+        # (subject はレガシー ``learn.fewshot.<mode>.<id>`` 形式に縮退)。
+        self._base_model_id: str = base_model_id
 
         # モード別のプール: mode → list[FewShotExample]
         self._pools: dict[str, list[FewShotExample]] = {}
@@ -227,9 +231,24 @@ class FewShotPool(JsonStateStore):
         if evolve_writeback is not None:
             self._evolve_writeback = evolve_writeback
 
+    def set_base_model_id(self, base_model_id: str) -> None:
+        """base 学習パーティションの active モデルスラグを差し替える。
+
+        モデル切替時に :func:`backend.factory._learning_rebind.rebind_base_learning`
+        から呼ばれ、以後の writeback / bootstrap が当該モデルの fewshot ファクト
+        (``learn.fewshot.<model>.*``) のみを対象にする。空文字でレガシー縮退。
+        """
+        self._base_model_id = base_model_id or ""
+
     @staticmethod
-    def _build_subject(mode: str, example_id: str) -> str:
-        """``learn.fewshot.<mode>.<example_id>`` 形式の subject を構築する"""
+    def _build_subject(base_model_id: str, mode: str, example_id: str) -> str:
+        """``learn.fewshot.<model>.<mode>.<example_id>`` 形式の subject を構築する。
+
+        ``base_model_id`` が空のときは partition 無効としてレガシー
+        ``learn.fewshot.<mode>.<example_id>`` (2 段) へ縮退する。
+        """
+        if base_model_id:
+            return f"{LEARN_FEWSHOT_SUBJECT_PREFIX}{base_model_id}.{mode}.{example_id}"
         return f"{LEARN_FEWSHOT_SUBJECT_PREFIX}{mode}.{example_id}"
 
     @staticmethod
@@ -265,10 +284,17 @@ class FewShotPool(JsonStateStore):
         if not subject.startswith(LEARN_FEWSHOT_SUBJECT_PREFIX):
             return None
         rest = subject[len(LEARN_FEWSHOT_SUBJECT_PREFIX):]
-        # rest = "<mode>.<id>"
-        if "." not in rest:
+        # rest は新形式 "<model>.<mode>.<id>" または レガシー "<mode>.<id>"。
+        # mode は {chat, coding} に限られるため先頭/2 番目セグメントで判別する。
+        segs = rest.split(".")
+        if len(segs) >= 2 and segs[0] in ("chat", "coding"):
+            mode_part, id_part = segs[0], ".".join(segs[1:])
+        elif len(segs) >= 3 and segs[1] in ("chat", "coding"):
+            mode_part, id_part = segs[1], ".".join(segs[2:])
+        else:
             return None
-        mode_part, _, id_part = rest.partition(".")
+        if not id_part:
+            return None
         return FewShotExample(
             id=id_part,
             query=str(payload.get("query", "")),
@@ -293,7 +319,7 @@ class FewShotPool(JsonStateStore):
         view = self._learn_view
         assert view is not None  # is_semmem_writeback_active で保証
 
-        subject = self._build_subject(example.mode, example.id)
+        subject = self._build_subject(self._base_model_id, example.mode, example.id)
         fact_mode: str = example.mode if example.mode in ("chat", "coding") else "chat"
         new_fact = make_fact(
             subject=subject,
@@ -336,8 +362,16 @@ class FewShotPool(JsonStateStore):
             return 0
         seen_ids: set[str] = set()
         loaded = 0
+        # partition 有効時は active モデルの fewshot ファクトのみを hydrate する
+        # (``learn.fewshot.<model>.``)。未知モデルは 0 件 = 空プール = ゼロから学習。
+        # partition 無効時は従来どおり全 fewshot を対象 (レガシー縮退)。
+        prefix = (
+            f"{LEARN_FEWSHOT_SUBJECT_PREFIX}{self._base_model_id}."
+            if self._base_model_id
+            else LEARN_FEWSHOT_SUBJECT_PREFIX
+        )
         try:
-            facts = view.search_fewshot_by_prefix(LEARN_FEWSHOT_SUBJECT_PREFIX)
+            facts = view.search_fewshot_by_prefix(prefix)
         except ValueError:
             return 0
         for fact in facts:

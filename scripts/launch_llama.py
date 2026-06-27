@@ -737,6 +737,17 @@ def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | 
     cache_ram_mib = _resolve_cache_ram_mib(emb_cfg, default=0)
     cmd += ["--cache-ram", str(cache_ram_mib)]
 
+    # スレッド数。0 (既定) は省略して llama.cpp 自動検出 (全物理コア)。CPU 埋め込み時に
+    # base/assist と CPU を分け合うため、明示値でヘッドルームを残せる。
+    threads = emb_cfg.get("threads", 0)
+    if threads and threads > 0:
+        cmd += ["-t", str(threads)]
+
+    # 並列スロットは常に -np で明示する (未指定だと n_parallel=auto=4 になり
+    # slots × context_size の KV を無駄に確保する)。埋め込みは概ね逐次のため既定 2。
+    slots = max(1, int(emb_cfg.get("slots", 2) or 2))
+    cmd += ["-np", str(slots)]
+
     return cmd
 
 

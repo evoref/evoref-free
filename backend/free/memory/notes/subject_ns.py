@@ -249,6 +249,43 @@ def is_pillar_subject(subject: str) -> bool:
         return False
 
 
+def model_slug(model_id: str) -> str:
+    """モデル識別子 (GGUF ファイル名等) を subject part 安全なスラグへ正規化する。
+
+    GGUF 名はドットを含み :data:`_SAFE_PART_RE` (subject part の許容文字) で弾かれる
+    ため、SemMem の ``learn.*`` subject にモデル次元 (``learn.<kind>.<model>.<mode>...``)
+    を埋め込む際の ``<model>`` セグメント生成に用いる。write 側 (FewShotPool /
+    PolicyParamEvolver) と read 側 (PolicyInterpreter / bootstrap) で同一スラグを
+    得るための SSOT。
+
+    正規化: 末尾 ``.gguf`` 除去 → 小文字化 → ``[a-z0-9_-]`` 以外を ``-`` 置換 →
+    連続 ``-`` 圧縮 → 先頭の非英数字を除去 (part は英数字始まり必須) → 末尾 ``-_`` 除去。
+
+    例:
+        >>> model_slug("Qwen3.5-9B-Q4_K_M.gguf")
+        'qwen3-5-9b-q4_k_m'
+
+    Raises:
+        SubjectNamespaceError: ``model_id`` が str でない、または正規化後に空。
+    """
+    if not isinstance(model_id, str):
+        raise SubjectNamespaceError(
+            f"model_id must be str, got {type(model_id).__name__}",
+        )
+    raw = model_id.strip()
+    if raw.lower().endswith(".gguf"):
+        raw = raw[: -len(".gguf")]
+    raw = raw.lower()
+    slug = re.sub(r"[^a-z0-9_-]+", "-", raw)
+    slug = re.sub(r"-{2,}", "-", slug)
+    slug = slug.lstrip("-_").rstrip("-_")
+    if not slug:
+        raise SubjectNamespaceError(
+            f"model_id {model_id!r} normalized to an empty slug",
+        )
+    return slug
+
+
 __all__ = [
     "ALL_SUBJECT_PILLARS",
     "LEARN_KINDS",
@@ -260,5 +297,6 @@ __all__ = [
     "make_learn_subject",
     "make_loop_subject",
     "make_mem_subject",
+    "model_slug",
     "validate_subject_namespace",
 ]

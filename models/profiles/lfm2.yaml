@@ -22,3 +22,24 @@ sampling: {}
 # enable_thinking / reasoning_budget を送らない (HTTP 400 回避)。
 reasoning:
   mode: none
+# LFM2.5-Embedding-350M (arch "lfm2") の埋め込みプロファイル。embed モデルを本 arch へ
+# 切替えたとき ModelMigrator がここを config.yaml の embedding.* へ転写する
+# (query_template/doc_template/instructions/max_length/context_size)。dim は GGUF の
+# embedding_length、model_name は GGUF stem から取るためここには置かない。生成パス
+# (sampling/reasoning/上の context_size) とは独立・無干渉 (別コードパスが読む)。
+# LFM2.5-Embedding は固定 prefix・非対称・非 instruction-aware: query 側 "query: "、
+# document 側 "document: " (末尾スペース込)。出力は L2 正規化・推奨入力長 512 トークン。
+# instructions はテンプレに {task} が無く挿入されないが、resolve_instruction が eager
+# に呼ばれ空 dict だと毎 embed で WARNING を吐くためダミー文で埋める (出力には無影響)。
+# max_length は「1 入力シーケンスの推奨上限」= 512 (client が各テキストを clamp)。
+# context_size / batch_size / ubatch_size はサーバ側リソース (KV/バッチ) でモデル固有では
+# なく、embed サーバは並列スロットで動くため context は max_length × スロット数を要する。
+# ここで 512 に絞るとスロット分割で per-slot が不足し KV 確保に失敗してサーバが crash する
+# (GGML_ASSERT)。よって profile では設定せず config/schema 既定 (8192) に委ねる。
+embedding:
+  query_template: "query: {query}"
+  doc_template: "document: {query}"
+  instructions:
+    chat: "Retrieve relevant passages for the query."
+    coding: "Retrieve relevant code for the query."
+  max_length: 512

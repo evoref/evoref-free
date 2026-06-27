@@ -2218,9 +2218,15 @@ class LearningScheduler:
             save_ratios,
         )
 
-        prompts_dir = Path(
-            self._config.get("local_paths", {}).get("prompts_dir", "local/prompts")
-        )
+        # ratios は base プロンプトと同じ partition dir に置く。prompt_manager の
+        # prompt_dir (resolve_learning 済 = partition) を SSOT とし、config 直読みの
+        # flat prompts_dir とのデシンクを避ける。
+        if self.prompt_manager is not None:
+            prompts_dir = Path(self.prompt_manager.prompt_dir)
+        else:
+            prompts_dir = Path(
+                self._config.get("local_paths", {}).get("prompts_dir", "local/prompts")
+            )
         current_ratios = load_ratios(prompts_dir)
         best_ratios = current_ratios
         best_fitness = self._calc_budget_fitness(current_ratios, experiences)

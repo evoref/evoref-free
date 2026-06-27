@@ -54,12 +54,34 @@ class PathResolver:
         "triggers_dir": "local/triggers/",
         # staged コーディングパイプラインの一時ワークスペース。
         "coding_workspace_dir": "local/coding/",
+        # base 学習データの (model × mode) パーティションルート。
+        "learning_dir": "local/learning/",
+    }
+
+    # resolve_learning で active モデルパーティション配下へ rebase する base 学習キーと、
+    # ``learning_dir/<stem>/`` からの相対サブパス。ここに無いキー (assist / 共有 / embed)
+    # は resolve_local へ素通しする (assist_* や memory_dir を巻き込まないため allow-list)。
+    _LEARNING_SUBPATH = {
+        "experience_file": "experience.json",
+        "prompts_dir": "prompts",
+        "lora_adapter": "models/adapter.gguf",
+        "lora_versions_dir": "models/lora_versions",
+        "control_vector_adapter": "models/control_vector.gguf",
+        "control_vector_versions_dir": "models/control_vector_versions",
+        "cvector_work_dir": "cvector",
     }
 
     def __init__(self, config: dict, project_root: Path):
         self.root = project_root
         self.models = config.get("model_paths", {})
         self.local = config.get("local_paths", {})
+        # base 学習データの (model × mode) パーティション state。
+        # active stem 未設定 or flag false なら resolve_learning は resolve_local 同等
+        # (レガシー flat レイアウト)。set_active_model_stem で起動時に確定する。
+        self._active_stem: str | None = None
+        self._partition_enabled: bool = bool(
+            (config.get("learning", {}) or {}).get("partition_by_base_model", True)
+        )
 
     def resolve_model(self, key: str) -> Path:
         """モデルパス解決
@@ -78,6 +100,59 @@ class PathResolver:
         """ローカルパス解決（読み書きリソース）"""
         raw = self.local.get(key, self.LOCAL_DEFAULTS[key])
         return self._to_absolute(raw)
+
+    @property
+    def active_model_stem(self) -> str | None:
+        """base 学習パーティションの active モデル stem (未設定なら ``None``)。
+
+        downstream の構築側が SemMem ``learn.*`` subject 用スラグ
+        (``model_slug``) を導出するために参照する。
+        """
+        return self._active_stem
+
+    @property
+    def partition_enabled(self) -> bool:
+        """base 学習パーティションが有効か (``partition_by_base_model``)。"""
+        return self._partition_enabled
+
+    def set_active_model_stem(self, stem: str | None) -> None:
+        """base 学習パーティションの active モデル stem を設定する。
+
+        ``None`` / 空 のときは partition を無効化し、``resolve_learning`` が
+        ``resolve_local`` へ素通しする (レガシー flat レイアウト)。起動時に
+        ``ModelState.current_filename`` の stem で確定し、モデル切替時に更新する。
+        """
+        self._active_stem = stem or None
+
+    def resolve_learning(self, key: str) -> Path:
+        """base 学習データのパスを **active** モデルパーティション配下で解決する。
+
+        ``_LEARNING_SUBPATH`` の base 学習キーのみ ``learning_dir/<active_stem>/...``
+        配下へ rebase する。partition 無効 (``partition_by_base_model=false`` /
+        active stem 未設定) または非対象キーは ``resolve_local`` へ素通しする
+        (assist・共有・レガシー)。``learning_dir`` は ``resolve_local`` 経由で解決
+        するため ``--isolate-data`` の prefix 書換えを自動継承する。
+        """
+        if (
+            not self._partition_enabled
+            or not self._active_stem
+            or key not in self._LEARNING_SUBPATH
+        ):
+            return self.resolve_local(key)
+        return self.learning_path_for(key, self._active_stem)
+
+    def learning_path_for(self, key: str, stem: str) -> Path:
+        """**指定** モデル stem のパーティション配下で base 学習パスを解決する。
+
+        active stem に依存せず任意モデルのパーティションパスを得る。flat→partition
+        移行 (producer 別 / experience の base_model タグ別バケツ) で、active モデル
+        とは異なるモデルのパーティションへ振り分けるために使う。``_LEARNING_SUBPATH``
+        非対象キーは ``resolve_local`` へ素通しする。
+        """
+        if key not in self._LEARNING_SUBPATH:
+            return self.resolve_local(key)
+        root = self.resolve_local("learning_dir") / stem
+        return root / self._LEARNING_SUBPATH[key]
 
     def _to_absolute(self, raw: str) -> Path:
         path = Path(raw)

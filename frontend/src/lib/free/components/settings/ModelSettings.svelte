@@ -6,6 +6,7 @@
 	import ProSection from './ProSection.svelte';
 	import ComponentMigrateButton from './ComponentMigrateButton.svelte';
 	import BaseModelMigrateButton from './BaseModelMigrateButton.svelte';
+	import ReindexButton from './ReindexButton.svelte';
 	import FieldGroup from './fields/FieldGroup.svelte';
 	import TextField from './fields/TextField.svelte';
 	import NumberField from './fields/NumberField.svelte';
@@ -60,6 +61,8 @@
 	<!-- 埋め込みモデル -->
 	<FieldGroup label="settings.group_model_embedding">
 		<ComponentMigrateButton component="embedding" currentModel={String(models.embed_model ?? '')} onMigrated={loadConfig} />
+		<!-- 埋め込みモデル切替後の全ベクトル再構築。切替直後に実行する -->
+		<ReindexButton onReindexed={loadConfig} />
 		<TextField label="settings.embedding.llama_host" value={String(embedding.llama_host ?? 'localhost')} onchange={fieldUpdater('embedding', 'llama_host')} />
 		<NumberField label="settings.embedding.llama_port" value={Number(embedding.llama_port ?? 8082)} min={1024} max={65535} onchange={fieldUpdater('embedding', 'llama_port')} />
 		<NumberField label="settings.embedding.dim" value={Number(embedding.dim ?? 1024)} min={1} onchange={fieldUpdater('embedding', 'dim')} />

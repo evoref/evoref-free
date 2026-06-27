@@ -29,3 +29,17 @@ reasoning:
   server_control: true        # Qwen3 系は llama.cpp 認識 (thinking != 0) → サーバ側 reasoning 制御可
   reasoning_format: auto      # 認識モデルは auto で <think> を reasoning_content に分離
   budget_default: -1
+# Qwen3-Embedding-0.6B (arch "qwen3") の埋め込みプロファイル。embed モデルを本 arch へ
+# 切替え (LFM2.5 からの戻し等) たとき ModelMigrator がここを config.yaml embedding.* へ
+# 転写する。dim は GGUF、model_name は GGUF stem。生成パスとは独立・無干渉。
+# Qwen3-Embedding は instruction-aware・query 側のみ prefix (doc は raw)。Free schema
+# 既定 (backend/schemas/rag.py の EmbeddingConfig) と対称な値。
+embedding:
+  query_template: "Instruct: {task}\nQuery: {query}"
+  doc_template: ""
+  instructions:
+    chat: "Given a user question, retrieve relevant passages that answer the query"
+    coding: "Given a code search query, retrieve relevant code snippets"
+  # max_length は 1 入力シーケンスの推奨上限。context/batch/ubatch (サーバリソース) は
+  # profile では設定せず config/schema 既定に委ねる (並列スロット分の KV が必要なため)。
+  max_length: 8192

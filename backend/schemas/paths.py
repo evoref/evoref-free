@@ -86,3 +86,8 @@ class LocalPathsConfig(BaseModel):
     # staged コーディングパイプラインの一時ワークスペース
     # (spec.md / src / tests / manifest.json の工程間ハンドオフ)。
     coding_workspace_dir: str = "local/coding/"
+    # base モデルの自己学習データを (base モデル識別子 × モード) でパーティション化
+    # する際のルート。``learning_dir/<base_model_stem>/`` 配下に experience /
+    # base prompts / base LoRA・cvector を配置する。PathResolver.resolve_learning が
+    # 参照する (assist・共有データは従来どおり flat の local_paths を使う)。
+    learning_dir: str = "local/learning/"

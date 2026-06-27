@@ -6,6 +6,7 @@
 	import NumberField from './fields/NumberField.svelte';
 	import ToggleField from './fields/ToggleField.svelte';
 	import SelectField from './fields/SelectField.svelte';
+	import ThresholdCalibrate from './ThresholdCalibrate.svelte';
 
 	let rag = $derived(configSection($configData, 'rag'));
 </script>
@@ -34,5 +35,9 @@
 		<NumberField label="settings.rag.support_threshold" value={Number(rag.support_threshold ?? 0.5)} min={0} max={1} step={0.05} onchange={fieldUpdater('rag', 'support_threshold')} />
 		<NumberField label="settings.rag.confidence_threshold" value={Number(rag.confidence_threshold ?? 0.8)} min={0} max={1} step={0.05} onchange={fieldUpdater('rag', 'confidence_threshold')} />
 		<NumberField label="settings.rag.hysteresis_band" value={Number(rag.hysteresis_band ?? 0.02)} min={0} max={0.5} step={0.01} onchange={fieldUpdater('rag', 'hysteresis_band')} />
+		<SelectField label="settings.rag.score_normalization" value={String(rag.score_normalization ?? 'none')} options={[{value:'none',label:'None',i18nLabel:'settings.option.none'},{value:'minmax',label:'Min-Max'},{value:'rank',label:'Rank'}]} onchange={fieldUpdater('rag', 'score_normalization')} />
 	</FieldGroup>
+
+	<!-- 埋め込みモデル切替後の閾値調整ツール (安全正規化 + インデックスからの推定) -->
+	<ThresholdCalibrate scoreNormalization={String(rag.score_normalization ?? 'none')} />
 </SettingsSection>

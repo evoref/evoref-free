@@ -402,7 +402,9 @@ def _load_experience_buffer(resolver: Any) -> tuple["ExperienceBuffer", Path]:
     from backend.free.learning.level0_instant import ExperienceBuffer
 
     exp_buf = ExperienceBuffer()
-    exp_file = resolver.resolve_local("experience_file")
+    # base 経験は (model×mode) partition 配下 (resolve_learning)。partition 無効時は
+    # resolve_local 同等 (flat)。assist 経験 (experience_assist_file) は共有のまま。
+    exp_file = resolver.resolve_learning("experience_file")
     if exp_file.exists():
         try:
             exp_buf.load(exp_file)
@@ -504,15 +506,19 @@ def _init_learning_core(
     state.assist_experience_recorder = _record_assist_experience
 
     # 7b. プロンプトマネージャ（§6.6.4: モード別システムプロンプト）
-    prompt_dir = resolver.resolve_local("prompts_dir")
+    # base システムプロンプト (chat.md / coding.md + meta + history + learning_state)
+    # は (model×mode) partition 配下 (resolve_learning)。assist プロンプトは共有のため
+    # resolve_local 据え置き — 両者が同一 prompts_dir を共有しないよう分離する。
+    base_prompt_dir = resolver.resolve_learning("prompts_dir")
+    assist_prompt_dir = resolver.resolve_local("prompts_dir")
     instance_name = cfg.get("instance", {}).get("name", "evoref")
-    prompt_mgr = SystemPromptManager(prompt_dir, instance_name=instance_name)
+    prompt_mgr = SystemPromptManager(base_prompt_dir, instance_name=instance_name)
     state.prompt_manager = prompt_mgr
 
     # 7b-2. アシストプロンプトマネージャ（§7.1.2: タスク別プロンプト）
     from backend.free.agent.assist_prompt_manager import AssistPromptManager
 
-    assist_prompt_mgr = AssistPromptManager(prompt_dir)
+    assist_prompt_mgr = AssistPromptManager(assist_prompt_dir)
     state.assist_prompt_manager = assist_prompt_mgr
     logger.info(
         "AssistPromptManager initialized: %d tasks loaded",
@@ -969,6 +975,9 @@ def _init_learning_scheduler(
         activation_min_confidence=float(
             learning_policy_cfg.get("activation_min_confidence", 0.7),
         ),
+        # base 学習パーティションの active モデル: policy 書き戻し subject へ
+        # ``learn.policy.<model>.*`` としてモデル次元を埋め込む (partition 無効時は空)。
+        base_model_id=state.active_base_model_slug,
     )
     # 旧 JSON ステートが残っていれば読み込みのみ行う (semmem モードでも
     # fitness 履歴の継続性を保つため)。書き出しは scheduler 側で
@@ -1008,6 +1017,9 @@ def _init_learning_scheduler(
         learn_view=learn_view,
         semmem_writeback_scope=semmem_writeback_scope,
         evolve_writeback=evolve_writeback,
+        # active モデル: fewshot 書き戻し / bootstrap を ``learn.fewshot.<model>.*``
+        # にスコープする (partition 無効時は空でレガシー全件)。
+        base_model_id=state.active_base_model_slug,
     )
     if fewshot_pool.is_semmem_writeback_active():
         # SemMem を source of truth として in-memory プールを再構築。
@@ -2187,6 +2199,70 @@ async def _init_evolve_pipeline(
     )
 
 
+def _activate_learning_partition(base: "_BaseContext", state: AppState) -> None:
+    """base 学習パーティションを有効化する (active stem 確定 + flat→partition 移行)。
+
+    resolver の active モデル stem を ``ModelState.current_filename`` から確定し、
+    SemMem ``learn.*`` 用スラグを ``state.active_base_model_slug`` に保持、構築済
+    PolicyInterpreter を当該モデルへ再スコープし、一度きりの flat→partition 非破壊
+    移行を実行する。``partition_by_base_model=false`` 時は no-op (レガシー flat)。
+
+    **必ず Learn pillar 構築 (_build_learn_pillar) の前に呼ぶこと** —
+    experience / SystemPromptManager / FewShotPool / PolicyParamEvolver が
+    resolve_learning / active slug をこの時点の値で確定するため。
+    """
+    cfg = base.cfg
+    resolver = base.resolver
+    if not resolver.partition_enabled:
+        logger.info("Learning partition disabled (legacy flat layout)")
+        return
+
+    from backend.free.core.learning_partition_migrator import LearningPartitionMigrator
+    from backend.free.core.model_migration import ModelState
+    from backend.free.memory.notes.subject_ns import model_slug
+
+    # active モデル = config の base_model (= 実際に起動する llama-server のモデル)。
+    # 学習コンポーネントはこのモデルのパーティションを指す。
+    active_filename = Path(cfg.get("model_paths", {}).get("base_model", "")).name
+    if not active_filename:
+        logger.warning("Learning partition: no base model identity; staying flat")
+        return
+
+    stem = Path(active_filename).stem
+    resolver.set_active_model_stem(stem)
+    try:
+        state.active_base_model_slug = model_slug(active_filename)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Learning partition: model_slug failed (%s); staying flat", exc)
+        resolver.set_active_model_stem(None)
+        state.active_base_model_slug = ""
+        return
+
+    # PolicyInterpreter (base 構築済) を active モデルへ再スコープ。
+    if base.policy_interpreter is not None:
+        base.policy_interpreter.set_base_model_id(state.active_base_model_slug)
+
+    # 一度きり flat→partition 非破壊移行。producer = flat データの生成元
+    # (model_state.current_filename、前回起動モデル)。active(config) と異なる場合、
+    # flat データは producer のパーティションへ移り active(新) は空 = ゼロから学習。
+    producer_filename = active_filename
+    try:
+        ms = ModelState(resolver.resolve_local("model_state_file"))
+        if ms.current_filename:
+            producer_filename = ms.current_filename
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("partition activation: ModelState read failed: %s", exc)
+
+    migrator = LearningPartitionMigrator(
+        resolver, cfg, develop_level=state.develop_level,
+    )
+    migrator.migrate_if_needed(producer_filename)
+    logger.info(
+        "Learning partition active: stem=%s slug=%s (migration producer=%s)",
+        stem, state.active_base_model_slug, Path(producer_filename).stem,
+    )
+
+
 def _finalize_base(
     state: AppState, base: _BaseContext, timings: dict[str, float],
 ) -> None:
@@ -2227,6 +2303,12 @@ async def wire_pillars(
     # Base (横断基盤)
     with _timed(timings, "pillar_base"):
         base = await _build_base_context(state, project_root, timings)
+
+    # base 学習パーティション有効化 (active stem 確定 + flat→partition 一度きり移行)。
+    # Learn pillar 構築より前に行い、experience / base prompts / fewshot / policy が
+    # 当該 (model×mode) パーティションを指すようにする。
+    with _timed(timings, "learning_partition"):
+        _activate_learning_partition(base, state)
 
     # Gen pillar (core): LLM / 埋め込み / リランカー + Pro Gen 拡張 + Develop Gen 拡張
     with _timed(timings, "pillar_gen"):
