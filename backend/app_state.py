@@ -94,6 +94,11 @@ class AppState:
     # ── モード状態 ──
     current_mode: str = "chat"
 
+    # base 学習パーティションの active モデルスラグ (model_slug 済)。
+    # partition 無効 / 未確定時は空文字。SemMem ``learn.*`` subject へのモデル次元
+    # 注入元として学習コンポーネント構築・モデル切替 rebind から参照する。
+    active_base_model_slug: str = ""
+
     # ── LLM クライアント ──
     local_client: LocalClient | None = None
     llm_client: LLMClient | None = None

@@ -337,6 +337,14 @@ class EmbeddingConfig(BaseModel):
     # リクエストが 500 エラーになり EvorefMem sleep-time update が連鎖失敗する
     batch_size: int | None = Field(default=None, ge=1)
     ubatch_size: int | None = Field(default=None, ge=1)
+    # スレッド数 (llama-server ``-t``)。0 = 省略し llama.cpp 自動検出 (全物理コア)。
+    # CPU 埋め込み (gpu_layers=null/0) 時に base/assist と CPU を分け合うため、
+    # 物理コア数より小さい値を明示してヘッドルームを残せる。
+    threads: int = Field(default=0, ge=0)
+    # 並列スロット数 (llama-server ``-np``)。明示しないと n_parallel=auto (=4) が
+    # 選ばれ slots × context_size 分の KV を無駄に確保する。埋め込みは概ね逐次
+    # アクセスのため既定 2 (前景クエリ + 背景ノート埋め込みの最小並列) で十分。
+    slots: int = Field(default=2, ge=1, le=16)
     # idle slot offload。埋め込みは chat slots を使わないため
     # 上流既定 8192 MiB の RAM 予約は無意味。0 で明示 disable する。
     cache_ram_mib: int = Field(default=0, ge=-1)

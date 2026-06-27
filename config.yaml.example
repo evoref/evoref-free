@@ -308,6 +308,7 @@ local_paths:
   triggers_dir: local/triggers/              # EvorefMem トリガ辞書の user override 先 (任意、空ディレクトリで可)
   coding_workspace_dir: local/coding/        # staged コーディングの一時ワークスペース (spec/code/test 中間成果物 + manifest)
   # 学習・経験・状態
+  learning_dir: local/learning/                      # base 学習データの (モデル×モード) パーティションルート (learning.partition_by_base_model=true 時に使用)
   experience_file: local/experience.json             # ベースモデル経験バッファ
   experience_assist_file: local/experience_assist.json   # アシストモデル経験バッファ
   eval_core_file: local/eval_core.json               # ベースモデル コア評価セット
@@ -497,6 +498,14 @@ embedding:
   # を下げても警告は消えない。CPU buffer フォールバックで動作上は問題なし。
   batch_size: 4096                # -b: 論理バッチサイズ
   ubatch_size: 4096               # -ub: 物理バッチサイズ
+  # 並列スロット数 (-np)。未指定だと llama.cpp が n_parallel=auto(=4) を選び
+  # slots × context_size 分の KV を無駄に確保する。埋め込みは概ね逐次アクセスの
+  # ため 2 (前景クエリ + 背景ノート埋め込みの最小並列) で十分。
+  slots: 2
+  # スレッド数 (-t)。0=自動検出 (全物理コア)。CPU 埋め込み (gpu_layers: null/0) 時は
+  # base/assist と CPU を分け合うため、物理コア数より小さい値を指定して
+  # ヘッドルームを残すとチャット応答との競合を抑えられる。
+  threads: 0
   # --- 永続埋め込みキャッシュ ---
   # チャンクテキストのハッシュをキーに埋め込みベクトルをディスクにキャッシュ。
   # 再登録・rebuild 時に同一チャンクの埋め込み計算をスキップする。
@@ -687,6 +696,9 @@ schedule:
 
 # ===== 学習サイクル設定 =====
 learning:
+  # base モデルの自己学習データを (base モデル識別子 × モード) で分離する。
+  partition_by_base_model: true   # true: local/learning/<base_model_stem>/ 配下へ分離しモデル切替で差し替え（未知モデルはゼロから学習）。false: レガシー flat（即ロールバック用）
+  level2_adapter_partition: model # model（既定=base LoRA/cvector はモデル単位・mode 切替で再起動なし）/ model_mode（mode 単位・切替時に必要なら base サーバ再起動）
   level1_min_experiences: 20      # Level 1 トリガーに必要な最小経験数
   level1_generations: 10          # Level 1 の世代数
   level1_population_size: 5       # Level 1 の集団サイズ

@@ -10,6 +10,7 @@
 		loadCartridge,
 		unloadCartridge,
 		deleteCartridge,
+		rebuildCartridge,
 		getCartridgeDetail
 	} from '$lib/free/api';
 	import { handleApiCall } from '$lib/free/utils/error';
@@ -177,6 +178,22 @@
 		await refreshCartridges();
 	}
 
+	// 埋め込みモデル切替後にカートリッジ単位で再構築 (再埋め込み)。
+	let rebuildingId = $state<string | null>(null);
+	async function handleRebuild(id: string) {
+		if (rebuildingId) return;
+		errorMessage = '';
+		rebuildingId = id;
+		try {
+			await handleApiCall(() => rebuildCartridge(id), {
+				fallbackKey: 'cartridge.rebuild_failed'
+			});
+			await refreshCartridges();
+		} finally {
+			rebuildingId = null;
+		}
+	}
+
 	async function handleShowDetail(id: string) {
 		const detail = await handleApiCall(() => getCartridgeDetail(id), {
 			fallbackKey: 'cartridge.detail_failed'
@@ -249,6 +266,15 @@
 								{$t('cartridge.load')}
 							</button>
 						{/if}
+						<button
+							class="action-btn"
+							disabled={rebuildingId !== null}
+							onclick={() => handleRebuild(cart.id)}
+						>
+							{rebuildingId === cart.id
+								? $t('cartridge.rebuilding')
+								: $t('cartridge.rebuild')}
+						</button>
 						<button class="action-btn danger" onclick={() => handleDelete(cart.id)}>
 							{$t('cartridge.uninstall')}
 						</button>

@@ -88,6 +88,22 @@ class LearningConfig(BaseModel):
 
     model_config = ConfigDict(extra="allow")  # Pro 拡張フィールドを許可
 
+    # base モデルの自己学習データを (base モデル識別子 × モード) でパーティション化する。
+    # True: experience / base prompts / base LoRA・cvector / learning_state を
+    #   ``local/learning/<base_model_stem>/`` 配下へ分離し、モデル切替でそのモデルの
+    #   保存済みセットへ差し替える (未知モデルは空=ゼロから学習)。
+    # False: レガシー flat レイアウト (resolve_learning が resolve_local へ素通し)。
+    #   既存環境の即時ロールバック用キルスイッチ。
+    partition_by_base_model: bool = True
+    # Level 2 base アダプタ (LoRA / 制御ベクトル) のパーティション粒度。
+    # "model" (既定): アダプタはモデル単位 (両モードの経験を 1 アダプタにプール)。
+    #   chat↔coding 切替で base サーバを再起動しない (cvector はランタイム hot-swap 不可、
+    #   GGUF 再ロードは高コストのため)。プロンプト/fewshot/policy/experience は (model×mode)
+    #   で分離されるため軽量側のモード差は保たれる。
+    # "model_mode": アダプタも (model×mode) で分け、モード切替時に必要なら base サーバを
+    #   再起動して該当アダプタをロードする (切替レイテンシ増を許容する strict モード)。
+    level2_adapter_partition: Literal["model", "model_mode"] = "model"
+
     level1_min_experiences: int = Field(default=20, ge=1)
     level1_generations: int = Field(default=10, ge=1)
     level1_population_size: int = Field(default=5, ge=1)

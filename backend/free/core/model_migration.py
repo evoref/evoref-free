@@ -431,18 +431,36 @@ class ModelMigrator:
             result.recommendations = self._build_recommendations(dry_run=True)
             return result
 
-        # Step 3: LoRA アーカイブ
-        lora_action = self._archive_lora(old_model_filename, try_lora)
-        result.lora_action = lora_action
+        # base 学習パーティション有効時は、Step 3-5 の flat 無効化 (LoRA アーカイブ /
+        # 経験 perplexity リセット / プロンプト候補クリア) を行わない。学習データは
+        # モデル別パーティションで保全されており、これらは旧モデルの保全データを
+        # 破壊する (戻したとき復元できなくなる)。新モデルのパーティションは別途
+        # 起動時 _activate_learning_partition で activate され、空なら一から学習する。
+        partitioned = bool(
+            self.config.get("learning", {}).get("partition_by_base_model", True),
+        )
 
-        # Step 4: 経験バッファ更新
-        self._update_experience_buffer(old_model_filename)
+        if partitioned:
+            logger.info(
+                "Migration under partition_by_base_model: skipping flat "
+                "LoRA-archive / experience-reset / prompt-meta-clear "
+                "(per-model partitions preserve old-model learning)",
+            )
+            lora_action = "kept"
+            result.lora_action = lora_action
+        else:
+            # Step 3: LoRA アーカイブ
+            lora_action = self._archive_lora(old_model_filename, try_lora)
+            result.lora_action = lora_action
 
-        # Step 5: プロンプトメタ情報更新
-        self._update_prompt_meta(old_model_filename)
+            # Step 4: 経験バッファ更新
+            self._update_experience_buffer(old_model_filename)
 
-        # Step 6: コア評価セット準備
-        self._reset_eval_core()
+            # Step 5: プロンプトメタ情報更新
+            self._update_prompt_meta(old_model_filename)
+
+            # Step 6: コア評価セット準備
+            self._reset_eval_core()
 
         # Step 7 (部分): config.yaml 更新
         self._update_config(new_model_path)
@@ -638,6 +656,73 @@ class ModelMigrator:
         raw = self.config.get("model_paths", {}).get(cfg_key, "")
         return Path(raw).name if raw else "unknown"
 
+    def _resolve_embedding_profile_params(self, resolved_path: Path) -> dict:
+        """新 embed モデルの ``embedding.*`` パラメータを解決する。
+
+        ``dim`` は GGUF の ``embedding_length`` (権威・必ず GGUF 由来)、
+        ``model_name`` は GGUF ファイル名 stem、
+        ``query_template`` / ``doc_template`` / ``instructions`` /
+        ``max_length`` / ``context_size`` は arch プロファイルの ``embedding:``
+        ブロック (``models/profiles/<arch>.yaml``) から取る。プロファイルに
+        embedding ブロックが無い arch はテンプレート系を据え置き (WARNING)。
+        embed component-migrate / rollback の config 同期に使う。
+
+        返すのは「設定すべきキーだけ」。GGUF 読取失敗時は dim を省く
+        (既存 embedding.dim を温存) — 幅を誤って書くと VectorStore /
+        dimension_check を壊すため。
+        """
+        params: dict = {}
+        try:
+            from scripts.launch_llama import load_model_profile, read_gguf_metadata
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("embed config sync: launch_llama import failed: %s", exc)
+            return params
+
+        try:
+            meta = read_gguf_metadata(resolved_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "embed config sync: GGUF read failed for %s: %s", resolved_path, exc,
+            )
+            meta = {}
+
+        dim = meta.get("embedding_length")
+        if dim:
+            params["dim"] = int(dim)
+        else:
+            logger.warning(
+                "embed config sync: GGUF embedding_length unreadable for %s; "
+                "keeping existing embedding.dim", resolved_path,
+            )
+
+        params["model_name"] = resolved_path.stem
+
+        arch = meta.get("architecture")
+        try:
+            profile = load_model_profile(arch, self.project_root) if arch else {}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "embed config sync: profile load failed for arch %r: %s", arch, exc,
+            )
+            profile = {}
+        emb_prof = (profile or {}).get("embedding")
+        if isinstance(emb_prof, dict) and emb_prof:
+            # query/doc テンプレ・instructions・max_length (1 入力の推奨上限) のみ同期。
+            # context_size/batch_size/ubatch_size はサーバ側 KV/バッチ資源で、並列スロット
+            # 分を要し model 固有でないため同期しない (config/schema 既定に委ねる)。
+            for key in (
+                "query_template", "doc_template", "instructions", "max_length",
+            ):
+                if key in emb_prof:
+                    params[key] = emb_prof[key]
+        else:
+            logger.warning(
+                "embed config sync: arch %r has no embedding profile; query/doc "
+                "templates + instructions left unchanged — review embedding.* manually",
+                arch,
+            )
+        return params
+
     def _update_component_config(
         self, component: str, new_model_path: str,
     ) -> None:
@@ -650,6 +735,17 @@ class ModelMigrator:
         cfg.setdefault("model_paths", {})[COMPONENT_CONFIG_KEY[component]] = (
             new_model_path
         )
+        # embedding 切替時は新モデルの embedding.* (dim/model_name/テンプレ/instruction)
+        # を同期する。これをやらないと旧モデルの prefix スキームで新モデルが駆動され
+        # RAG が静かに劣化する (同 dim swap では dimension_check も検知しない)。
+        emb_params: dict = {}
+        if component == "embedding":
+            resolved = Path(new_model_path)
+            if not resolved.is_absolute():
+                resolved = self.project_root / resolved
+            emb_params = self._resolve_embedding_profile_params(resolved)
+            if emb_params:
+                cfg.setdefault("embedding", {}).update(emb_params)
         with open(config_path, "w", encoding="utf-8") as f:
             yaml.dump(
                 cfg, f,
@@ -657,10 +753,15 @@ class ModelMigrator:
                 allow_unicode=True,
                 sort_keys=False,
             )
-        # in-memory config も同期
+        # in-memory config も同期 (restart+rebind が同じ singleton を再読する)
         self.config.setdefault("model_paths", {})[
             COMPONENT_CONFIG_KEY[component]
         ] = new_model_path
+        if emb_params:
+            self.config.setdefault("embedding", {}).update(emb_params)
+            logger.info(
+                "embed config synced: embedding.%s", sorted(emb_params.keys()),
+            )
         logger.info(
             "config.yaml updated: model_paths.%s = %s",
             COMPONENT_CONFIG_KEY[component], new_model_path,

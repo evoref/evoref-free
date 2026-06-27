@@ -100,6 +100,7 @@ class PolicyParamEvolver(JsonStateStore):
         evolve_writeback: EvolveWriteback = "yaml",
         policy_confidence_init: float = DEFAULT_AUTO_EVOLVED_CONFIDENCE,
         activation_min_confidence: float = DEFAULT_ACTIVATION_MIN_CONFIDENCE,
+        base_model_id: str = "",
     ) -> None:
         """
         Args:
@@ -130,6 +131,9 @@ class PolicyParamEvolver(JsonStateStore):
         self._evolve_writeback: EvolveWriteback = evolve_writeback
         self._policy_confidence_init: float = float(policy_confidence_init)
         self._activation_min_confidence: float = float(activation_min_confidence)
+        # base 学習パーティションの active モデルスラグ。空 = partition 無効
+        # (subject はレガシー ``learn.policy.<mode>.<domain>.<key>`` に縮退)。
+        self._base_model_id: str = base_model_id
 
         # 経路 3: 実環境成功率プロバイダ
         # callable(domain: str, mode: str) -> float | None
@@ -182,9 +186,24 @@ class PolicyParamEvolver(JsonStateStore):
         if evolve_writeback is not None:
             self._evolve_writeback = evolve_writeback
 
+    def set_base_model_id(self, base_model_id: str) -> None:
+        """base 学習パーティションの active モデルスラグを差し替える。
+
+        モデル切替時に :func:`backend.factory._learning_rebind.rebind_base_learning`
+        から呼ばれ、以後の policy 書き戻し subject に当該モデルを埋め込む。空文字で
+        レガシー縮退。
+        """
+        self._base_model_id = base_model_id or ""
+
     @staticmethod
-    def _build_subject(mode: str, domain: str, key: str) -> str:
-        """``learn.policy.<mode>.<domain>.<key>`` 形式の subject を構築する"""
+    def _build_subject(base_model_id: str, mode: str, domain: str, key: str) -> str:
+        """``learn.policy.<model>.<mode>.<domain>.<key>`` 形式の subject を構築する。
+
+        ``base_model_id`` が空のときは partition 無効としてレガシー
+        ``learn.policy.<mode>.<domain>.<key>`` (model セグメント無し) へ縮退する。
+        """
+        if base_model_id:
+            return f"{LEARN_POLICY_SUBJECT_PREFIX}{base_model_id}.{mode}.{domain}.{key}"
         return f"{LEARN_POLICY_SUBJECT_PREFIX}{mode}.{domain}.{key}"
 
     def _find_active_fact_in_writeback_store(
@@ -225,7 +244,7 @@ class PolicyParamEvolver(JsonStateStore):
         view = self._learn_view
         assert view is not None  # is_semmem_writeback_active で保証
 
-        subject = self._build_subject(mode, domain, key)
+        subject = self._build_subject(self._base_model_id, mode, domain, key)
         fact_mode: str = mode if mode in ("chat", "coding") else "chat"
         eval_metric = {
             "fitness": float(fitness),
@@ -363,7 +382,7 @@ class PolicyParamEvolver(JsonStateStore):
             return 0
         count = 0
         for key, value in params.items():
-            subject = self._build_subject(mode, domain, key)
+            subject = self._build_subject(self._base_model_id, mode, domain, key)
             prior = self._find_active_fact_in_writeback_store(subject)
             if prior is None:
                 continue
@@ -453,7 +472,7 @@ class PolicyParamEvolver(JsonStateStore):
             return
         target = self._activation_min_confidence
         for key in keys:
-            subject = self._build_subject(mode, domain, key)
+            subject = self._build_subject(self._base_model_id, mode, domain, key)
             fact = self._find_active_fact_in_writeback_store(subject)
             if fact is not None and fact.confidence < target:
                 view.promote_policy_confidence(fact_id=fact.id, confidence=target)

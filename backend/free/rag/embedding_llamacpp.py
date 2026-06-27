@@ -29,6 +29,12 @@ from backend.log_config import get_logger
 
 logger = get_logger("rag.embedding_llamacpp")
 
+# 1 HTTP リクエストあたりの最大テキスト数。フル reindex 等の大バッチ
+# (例 492 チャンクを 1 回で送る) を分割し、単一リクエストが embedding.timeout を
+# 超過する (低速 iGPU で顕著、httpx.ReadTimeout) のを防ぐ。各サブバッチは
+# embed() の単一リクエスト経路 (clamp / prefix / 5xx per-text フォールバック) を通る。
+_MAX_HTTP_BATCH = 64
+
 
 class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
     """llama-server /v1/embeddings 経由の埋め込み生成"""
@@ -106,6 +112,18 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
         """
         if not texts:
             return np.array([]).reshape(0, self._dim)
+
+        # 大バッチは HTTP リクエストを分割する (timeout / メモリ過大防止)。各サブバッチは
+        # 下の単一リクエスト経路を再帰で通る。フル reindex (全チャンクを 1 embed() で送る)
+        # が低速 iGPU で 30s timeout を超えて落ちるのを防ぐ。
+        if len(texts) > _MAX_HTTP_BATCH:
+            parts: list[np.ndarray] = []
+            for i in range(0, len(texts), _MAX_HTTP_BATCH):
+                sub = await self.embed(
+                    texts[i:i + _MAX_HTTP_BATCH], is_query=is_query, mode=mode,
+                )
+                parts.append(sub)
+            return np.vstack(parts)
 
         client = self._get_http_client()
 

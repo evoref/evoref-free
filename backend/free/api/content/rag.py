@@ -204,3 +204,19 @@ async def reindex_vectors(
         "elapsed_sec": result.elapsed_sec,
         "embedding_dim_mismatch": state.embedding_dim_mismatch,
     }
+
+
+@router.post("/calibrate-thresholds")
+async def calibrate_thresholds_endpoint(
+    state: AppState = Depends(get_app_state),
+):
+    """再構築済み RAG ベクトルのスコア分布から rag.* 閾値の推奨値を返す。
+
+    埋め込みモデル切替後にスコアスケールへ閾値を合わせるための分布ヒューリスティック。
+    正解ラベル不在のため **自動適用はせず提案のみ** を返す (UI でレビュー → 適用)。
+    """
+    from backend.free.rag.threshold_calibration import calibrate_thresholds
+
+    if state.embedder is None:
+        raise embedder_not_initialized_error()
+    return calibrate_thresholds(state)

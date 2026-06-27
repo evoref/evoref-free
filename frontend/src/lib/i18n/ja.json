@@ -399,7 +399,34 @@
 			"relevance_threshold": "関連性閾値",
 			"support_threshold": "支持度閾値",
 			"confidence_threshold": "信頼度閾値",
-			"hysteresis_band": "ヒステリシスバンド"
+			"hysteresis_band": "ヒステリシスバンド",
+			"score_normalization": "スコア正規化"
+		},
+		"reindex": {
+			"preview": "再構築（プレビュー）",
+			"checking": "確認中…",
+			"targets": "対象: RAG {rag} チャンク / カートリッジ {cart} チャンク / メモリ {mem} ノート",
+			"run": "再構築を実行",
+			"running": "再構築中…",
+			"cancel": "キャンセル",
+			"done": "再構築完了: RAG {rag} / カートリッジ {cart} / メモリ {mem} ノート（{sec}秒）",
+			"still_mismatch": "次元不一致が残っています"
+		},
+		"threshold": {
+			"hint": "埋め込みモデル切替後の検索閾値を調整します（先に reindex を実行）。",
+			"enable_normalization": "正規化を有効化（min-max）",
+			"normalization_state": "現在: {value}",
+			"normalization_enabled": "スコア正規化を min-max に設定しました。",
+			"calibrate": "インデックスから閾値を推定",
+			"calibrating": "推定中…",
+			"calibrate_note": "再構築済みベクトルからの分布ヒューリスティック（助言値・自動適用しません）。",
+			"advisory": "推奨値（スコア分布からのヒューリスティック・適用前に確認してください）:",
+			"distribution": "{n} 件のベクトルに基づく。マッチ top1 p50={matchp50}、無関係 p95={bgp95}。",
+			"apply": "適用",
+			"applied": "閾値を適用しました。",
+			"dismiss": "閉じる",
+			"insufficient": "較正に必要なベクトル数が不足しています（{n}）。先に reindex してください。",
+			"no_vectors": "ベクトルがありません。先に reindex してください。"
 		},
 		"embedding": {
 			"llama_host": "ホスト",

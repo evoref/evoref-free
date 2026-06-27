@@ -399,7 +399,34 @@
 			"relevance_threshold": "Relevance Threshold",
 			"support_threshold": "Support Threshold",
 			"confidence_threshold": "Confidence Threshold",
-			"hysteresis_band": "Hysteresis Band"
+			"hysteresis_band": "Hysteresis Band",
+			"score_normalization": "Score Normalization"
+		},
+		"reindex": {
+			"preview": "Reindex (preview)",
+			"checking": "Checking…",
+			"targets": "Targets: RAG {rag} chunks / cartridges {cart} chunks / memory {mem} notes",
+			"run": "Run reindex",
+			"running": "Reindexing…",
+			"cancel": "Cancel",
+			"done": "Reindex complete: RAG {rag} / cartridges {cart} / memory {mem} notes ({sec}s)",
+			"still_mismatch": "dimension mismatch remains"
+		},
+		"threshold": {
+			"hint": "Adjust retrieval thresholds after switching the embedding model (run reindex first).",
+			"enable_normalization": "Enable normalization (min-max)",
+			"normalization_state": "current: {value}",
+			"normalization_enabled": "Score normalization set to min-max.",
+			"calibrate": "Estimate thresholds from index",
+			"calibrating": "Estimating…",
+			"calibrate_note": "Heuristic suggestions from the rebuilt vectors (advisory, not auto-applied).",
+			"advisory": "Suggested values (heuristic from score distribution — review before applying):",
+			"distribution": "Based on {n} vectors. match top1 p50={matchp50}, unrelated p95={bgp95}.",
+			"apply": "Apply",
+			"applied": "Thresholds applied.",
+			"dismiss": "Dismiss",
+			"insufficient": "Not enough vectors to calibrate ({n}). Reindex first.",
+			"no_vectors": "No vectors found. Reindex first."
 		},
 		"embedding": {
 			"llama_host": "Host",

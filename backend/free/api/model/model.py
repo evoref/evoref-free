@@ -272,6 +272,18 @@ async def migrate_component(
     except MigrationError as e:
         raise migration_error(str(e))
 
+    # embedding モデルを実際に切り替えた場合、既存ベクトルは (dim 一致でも) stale。
+    # reindex 要求マーカーを立て、dimension_check がモデル同一性ベースで mismatch を
+    # 検知できるようにする (同 dim swap の「検知不発の罠」対策)。
+    if (
+        component == "embedding"
+        and not req.dry_run
+        and result.old_model != result.new_model
+    ):
+        from backend.free.rag.dimension_check import set_embed_reindex_required
+
+        set_embed_reindex_required(result.new_model)
+
     restarted = False
     if (
         not req.dry_run
