@@ -1,11 +1,11 @@
 <script lang="ts">
-	import { configData, updateField, loadConfig } from '$lib/free/stores/settings';
+	import { configData, loadConfig, saveModelPathsField } from '$lib/free/stores/settings';
 	import { configSection, fieldUpdater, nestedFieldUpdater, deepNestedFieldUpdater } from '$lib/free/stores/settingsHelpers';
 	import type { AssistModelLocalConfig } from '$lib/types/settings';
 	import SettingsSection from './SettingsSection.svelte';
 	import ProSection from './ProSection.svelte';
 	import ComponentMigrateButton from './ComponentMigrateButton.svelte';
-	import BaseModelMigrateButton from './BaseModelMigrateButton.svelte';
+	import ModelServerControl from './ModelServerControl.svelte';
 	import ReindexButton from './ReindexButton.svelte';
 	import FieldGroup from './fields/FieldGroup.svelte';
 	import TextField from './fields/TextField.svelte';
@@ -22,17 +22,21 @@
 </script>
 
 <SettingsSection tabId="model">
-	<!-- ベースモデル (migrate 専用。config 直保存は不可) -->
+	<!-- ベースモデル (migrate 専用。config 直保存は不可。再起動は別途手動) -->
 	<FieldGroup label="settings.group_model_base">
-		<BaseModelMigrateButton currentModel={String(models.base_model ?? '')} onMigrated={loadConfig} />
-		<!-- Pro: コーディングモードは Pro ワークモード専用。model_state 非追跡のため通常編集可 -->
+		<!-- base llama-server の起動/停止/再起動。base 切替は手動再起動が必要 (coding も同 slot) -->
+		<ModelServerControl server="base" />
+		<ComponentMigrateButton component="base" currentModel={String(models.base_model ?? '')} onMigrated={loadConfig} />
+		<!-- Pro: コーディングモードは Pro ワークモード専用。model_state 非追跡のため切替で即 config 保存 -->
 		<ProSection columns={1}>
-			<TextField label="settings.model_paths.coding_model" value={String(models.coding_model ?? '')} description="settings.model_paths.coding_model_desc" onchange={(v) => updateField('model_paths', 'coding_model', v || null)} />
+			<ComponentMigrateButton component="coding" currentModel={String(models.coding_model ?? '')} onMigrated={loadConfig} onApply={(p) => saveModelPathsField('coding_model', p || null)} />
 		</ProSection>
 	</FieldGroup>
 
 	<!-- アシストモデル -->
 	<FieldGroup label="settings.group_model_assist">
+		<!-- assist llama-server の起動/停止/再起動 (migrate は auto_restart 済だが手動操作も可) -->
+		<ModelServerControl server="assist" />
 		<ToggleField label="settings.assist_model.enabled" value={Boolean(assistModel.enabled ?? true)} onchange={fieldUpdater('assist_model', 'enabled')} />
 		<ComponentMigrateButton component="assist" currentModel={String(models.assist_model ?? '')} onMigrated={loadConfig} />
 		<TextField label="settings.assist_model.local.host" value={String(local.host ?? '127.0.0.1')} onchange={nestedFieldUpdater('assist_model', 'local', 'host')} />
@@ -60,9 +64,14 @@
 
 	<!-- 埋め込みモデル -->
 	<FieldGroup label="settings.group_model_embedding">
-		<ComponentMigrateButton component="embedding" currentModel={String(models.embed_model ?? '')} onMigrated={loadConfig} />
-		<!-- 埋め込みモデル切替後の全ベクトル再構築。切替直後に実行する -->
-		<ReindexButton onReindexed={loadConfig} />
+		<!-- embed llama-server の起動/停止/再起動 (ServerName は "embed") -->
+		<ModelServerControl server="embed" />
+		<ComponentMigrateButton component="embedding" currentModel={String(models.embed_model ?? '')} onMigrated={loadConfig}>
+			{#snippet actionsTrailing()}
+				<!-- 埋め込みモデル切替後の全ベクトル再構築。切替ボタンの右隣に同サイズで配置 -->
+				<ReindexButton onReindexed={loadConfig} />
+			{/snippet}
+		</ComponentMigrateButton>
 		<TextField label="settings.embedding.llama_host" value={String(embedding.llama_host ?? 'localhost')} onchange={fieldUpdater('embedding', 'llama_host')} />
 		<NumberField label="settings.embedding.llama_port" value={Number(embedding.llama_port ?? 8082)} min={1024} max={65535} onchange={fieldUpdater('embedding', 'llama_port')} />
 		<NumberField label="settings.embedding.dim" value={Number(embedding.dim ?? 1024)} min={1} onchange={fieldUpdater('embedding', 'dim')} />

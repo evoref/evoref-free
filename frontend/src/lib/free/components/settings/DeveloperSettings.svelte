@@ -11,7 +11,6 @@
 	import { t } from '$lib/i18n';
 	import { isDevelop } from '$lib/edition';
 	import DialogShell from '$lib/free/components/DialogShell.svelte';
-	import ServerStatus from '$lib/free/components/ServerStatus.svelte';
 	import { resetLocalData, ApiError } from '$lib/free/api';
 
 	type Phase = 'idle' | 'confirming' | 'resetting' | 'stopped' | 'error';
@@ -56,12 +55,6 @@
 	</div>
 {:else}
 	<div class="develop-settings">
-		<section class="server-section">
-			<h2 class="section-title">{$t('settings.develop.server_title')}</h2>
-			<p class="section-hint">{$t('settings.develop.server_hint')}</p>
-			<ServerStatus />
-		</section>
-
 		<section class="danger-zone">
 			<h2 class="zone-title">{$t('settings.develop.title')}</h2>
 			<p class="zone-desc">{$t('settings.develop.description')}</p>
@@ -124,24 +117,6 @@
 	.develop-settings {
 		padding: 24px;
 		max-width: 720px;
-	}
-	.server-section {
-		border: 1px solid var(--border);
-		border-radius: 8px;
-		padding: 20px;
-		margin-bottom: 24px;
-	}
-	.section-title {
-		margin: 0 0 6px;
-		font-size: 1.05rem;
-		color: var(--text-primary);
-		font-weight: 600;
-	}
-	.section-hint {
-		margin: 0 0 18px;
-		font-size: 13px;
-		color: var(--text-secondary);
-		line-height: 1.6;
 	}
 	.danger-zone {
 		border: 1px solid var(--color-error);

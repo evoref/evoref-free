@@ -177,6 +177,19 @@ export async function loadConfig(): Promise<void> {
 	}
 }
 
+/**
+ * model_paths の単一フィールドを即時保存する (migrate 非対象キー用。coding_model 等)
+ *
+ * base/assist/embed のような model_state 追跡キーは migrate API 経由でしか変更できないが、
+ * coding_model は非追跡なので config 直保存でよい。追跡キーは現在値のまま同梱して送ると
+ * バックエンドの immutable ガードを通過する (値が変化したキーのみ 403)。
+ * 保存後の dirty クリア / 再スナップショットは呼び出し側の loadConfig 再取得に委ねる。
+ */
+export async function saveModelPathsField(key: string, value: string | null): Promise<void> {
+	const current = { ...(get(configData).model_paths ?? {}), [key]: value };
+	await saveSection('model_paths', current);
+}
+
 /** フィールド値を更新 */
 export function updateField(section: string, key: string, value: unknown): void {
 	configData.update((config) => {

@@ -26,11 +26,11 @@ const initial: ServerState = {
 export const serverState = writable<ServerState>(initial);
 
 /**
- * 現在 start/stop 操作中のサーバー名 (ServerStatus コンポーネントのスピナー表示用)
+ * 現在 start/stop 操作中のサーバー名 (ModelServerControl のスピナー表示用)
  *
- * コンポーネントローカルの $state にすると、Sidebar の collapse / ルート遷移で
- * ServerStatus が再マウントされた瞬間にスピナーが消えてしまうため、グローバル
- * ストアに保持して再マウントを跨いでも維持する。
+ * コンポーネントローカルの $state にすると、設定タブ切替やルート遷移で
+ * ModelServerControl が再マウントされた瞬間にスピナーが消えてしまうため、
+ * グローバルストアに保持して再マウントを跨いでも維持する。
  */
 export const busyServer = writable<ServerName | null>(null);
 
