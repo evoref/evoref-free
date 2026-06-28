@@ -118,10 +118,6 @@
 		display: flex;
 		flex-direction: column;
 		gap: 0.5rem;
-		margin-top: 0.5rem;
-	}
-	.reindex.compact {
-		margin-top: 0;
 	}
 	.actions {
 		display: flex;

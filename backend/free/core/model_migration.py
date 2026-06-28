@@ -427,7 +427,12 @@ class ModelMigrator:
         result.data_summary = self._gather_data_summary()
 
         if dry_run:
-            result.lora_action = "archived" if not try_lora else "kept"
+            # partition 有効時 (既定) は実 migrate が LoRA アーカイブを skip する
+            # ため dry_run も "kept" を返す (過大表示防止)。data_summary も
+            # _gather_data_summary 側で partition-aware に集計済み。
+            result.lora_action = (
+                "kept" if (self._is_partitioned() or try_lora) else "archived"
+            )
             result.recommendations = self._build_recommendations(dry_run=True)
             return result
 
@@ -436,9 +441,7 @@ class ModelMigrator:
         # モデル別パーティションで保全されており、これらは旧モデルの保全データを
         # 破壊する (戻したとき復元できなくなる)。新モデルのパーティションは別途
         # 起動時 _activate_learning_partition で activate され、空なら一から学習する。
-        partitioned = bool(
-            self.config.get("learning", {}).get("partition_by_base_model", True),
-        )
+        partitioned = self._is_partitioned()
 
         if partitioned:
             logger.info(
@@ -802,8 +805,27 @@ class ModelMigrator:
         if self.learning_scheduler and self.learning_scheduler.running:
             raise MigrationBusyError("Learning cycle is currently running")
 
+    def _is_partitioned(self) -> bool:
+        """base 学習パーティション有効か (既定 True)。
+
+        有効時は migrate() が flat 無効化 (LoRA アーカイブ / 経験 perplexity
+        リセット / プロンプト候補クリア) を skip する。dry_run の lora_action と
+        data_summary もこれに合わせて非破壊側へ倒し、過大表示を防ぐ。
+        """
+        return bool(
+            self.config.get("learning", {}).get("partition_by_base_model", True),
+        )
+
     def _gather_data_summary(self) -> dict:
-        """移行対象データの集計"""
+        """移行対象データの集計
+
+        partition_by_base_model 有効時 (既定) は flat 無効化を skip するため、
+        破壊対象カウント (perplexity_reset / prompts_modes) は 0 / 空で返す。
+        migrate() の partitioned 分岐と一致させ dry_run の過大表示を防ぐ。
+        experience_entries / memory_notes / rag_chunks / cartridges は保持
+        データ件数の情報表示なので partition に依らず集計する。
+        """
+        partitioned = self._is_partitioned()
         summary: dict = {
             "memory_notes": 0,
             "experience_entries": 0,
@@ -815,12 +837,13 @@ class ModelMigrator:
 
         if self.experience_buf:
             summary["experience_entries"] = self.experience_buf.count
-            summary["perplexity_reset"] = sum(
-                1 for e in self.experience_buf.entries
-                if e.signals.perplexity is not None
-            )
+            if not partitioned:
+                summary["perplexity_reset"] = sum(
+                    1 for e in self.experience_buf.entries
+                    if e.signals.perplexity is not None
+                )
 
-        if self.prompt_manager:
+        if self.prompt_manager and not partitioned:
             summary["prompts_modes"] = list(self.prompt_manager.MODES)
 
         if self.short_term_memory:

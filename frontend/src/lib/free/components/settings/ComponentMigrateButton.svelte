@@ -1,39 +1,67 @@
 <script lang="ts">
 	/**
-	 * コンポーネントモデル切替ボタン
+	 * モデル切替ボタン (全モデル種別共通 I/F)
 	 *
-	 * assist / embedding のいずれかについて、入力済みの新モデルパスで
-	 * `POST /api/model/{component}/migrate` を実行する。LlamaProcessManager 管理下なら
-	 * 自動再起動 + クライアント差し替えが行われる (バックエンドで rebind 失敗時は
-	 * 旧モデルへ自動ロールバック)。
+	 * base / assist / embedding / coding のいずれかについて、入力済みの新モデルパスで
+	 * 切替を実行する。見た目・操作系は共通だが、種別ごとに正しいバックエンドへ振り分ける:
+	 *   - assist / embedding: `POST /api/model/{component}/migrate` (auto_restart で自動再起動。
+	 *     rebind 失敗時はバックエンドが旧モデルへ自動ロールバック)。
+	 *   - base: `POST /api/model/migrate` (LoRA アーカイブ等の付帯処理あり)。auto_restart 相当は
+	 *     無く、再起動は別途手動で行うため結果に「手動で再起動してください」バッジを出す。
+	 *   - coding: migrate API 無し (model_state 非追跡)。`onApply` 経由で config を即保存する。
 	 *
-	 * ボタンは disabled / loading / 結果表示 / ロールバックボタンの 4 状態を持つ。
+	 * UI は apply ボタン (disabled / loading) → 結果表示 (成功 / エラー) の一発適用で、
+	 * ロールバックボタン・再起動ボタンは持たない (#198 で UI から廃止)。再起動状態バッジは
+	 * 非 coding のみ表示 (assist/embedding=自動再起動済 / base=手動再起動が必要)。
 	 */
+	import type { Snippet } from 'svelte';
 	import { t } from '$lib/i18n';
 	import {
 		migrateComponent,
-		rollbackComponent,
+		migrateBaseModel,
 		ApiError,
-		type ModelComponent,
-		type ComponentMigrateResponse
+		type ModelComponent
 	} from '$lib/free/api';
 
+	/** UI レベルの種別。API の ModelComponent (assist/embedding) を base/coding へ拡張 */
+	type ModelKind = ModelComponent | 'base' | 'coding';
+
+	/** base/assist/embedding/coding のレスポンス差を吸収した共通結果形 */
+	type MigrateResult = {
+		old_model: string;
+		new_model: string;
+		restarted: boolean;
+		recommendations: string[];
+	};
+
 	type Props = {
-		component: ModelComponent;
+		component: ModelKind;
 		currentModel?: string;
 		/** migrate/rollback 成功後に config を再取得させるコールバック */
 		onMigrated?: () => void;
+		/** coding 切替時の即時保存処理 (migrate API を持たない種別用に親が注入) */
+		onApply?: (newPath: string) => Promise<void>;
+		/** apply ボタンと同じ行の右隣に並べる追加アクション (例: reindex ボタン) */
+		actionsTrailing?: Snippet;
 	};
 
-	let { component, currentModel = '', onMigrated }: Props = $props();
+	let { component, currentModel = '', onMigrated, onApply, actionsTrailing }: Props = $props();
 
 	// 新モデルパスは migrate ボタン専用の入力 (config の TextField とは独立)。
 	// これにより model_paths の追跡キーは config 直保存経路に乗らず desync しない。
 	let newPath = $state('');
 	let busy = $state(false);
-	let result = $state<ComponentMigrateResponse | null>(null);
+	let result = $state<MigrateResult | null>(null);
 	let error = $state<string | null>(null);
-	let canRollback = $derived(result !== null && !result.dry_run);
+
+	// coding は config 保存のため、再起動バッジを持たない。
+	let showRestartBadge = $derived(component !== 'coding');
+
+	function toError(e: unknown): string {
+		if (e instanceof ApiError) return e.message;
+		if (e instanceof Error) return e.message;
+		return String(e);
+	}
 
 	async function apply() {
 		if (!newPath || busy) return;
@@ -41,47 +69,37 @@
 		error = null;
 		result = null;
 		try {
-			result = await migrateComponent(component, {
-				new_model_path: newPath,
-				auto_restart: true
-			});
+			if (component === 'base') {
+				const r = await migrateBaseModel({ new_model_path: newPath, dry_run: false });
+				result = {
+					old_model: r.old_model,
+					new_model: r.new_model,
+					restarted: false,
+					recommendations: r.recommendations
+				};
+			} else if (component === 'coding') {
+				await onApply?.(newPath);
+				result = {
+					old_model: currentModel || '—',
+					new_model: newPath,
+					restarted: false,
+					recommendations: []
+				};
+			} else {
+				const r = await migrateComponent(component, {
+					new_model_path: newPath,
+					auto_restart: true
+				});
+				result = {
+					old_model: r.old_model,
+					new_model: r.new_model,
+					restarted: r.restarted,
+					recommendations: r.recommendations
+				};
+			}
 			onMigrated?.();
 		} catch (e) {
-			if (e instanceof ApiError) {
-				error = e.message;
-			} else if (e instanceof Error) {
-				error = e.message;
-			} else {
-				error = String(e);
-			}
-		} finally {
-			busy = false;
-		}
-	}
-
-	async function doRollback() {
-		if (busy) return;
-		busy = true;
-		error = null;
-		try {
-			const r = await rollbackComponent(component);
-			result = {
-				component,
-				dry_run: false,
-				old_model: result?.new_model ?? '',
-				new_model: r.rolled_back_to,
-				restarted: false,
-				recommendations: [$t('settings.model_migrate.rollback_done')]
-			};
-			onMigrated?.();
-		} catch (e) {
-			if (e instanceof ApiError) {
-				error = e.message;
-			} else if (e instanceof Error) {
-				error = e.message;
-			} else {
-				error = String(e);
-			}
+			error = toError(e);
 		} finally {
 			busy = false;
 		}
@@ -108,26 +126,19 @@
 		>
 			{busy ? $t('settings.model_migrate.applying') : $t('settings.model_migrate.apply')}
 		</button>
-		{#if canRollback}
-			<button
-				type="button"
-				class="rollback-btn"
-				disabled={busy}
-				onclick={doRollback}
-			>
-				{$t('settings.model_migrate.rollback')}
-			</button>
-		{/if}
+		{@render actionsTrailing?.()}
 	</div>
 
 	{#if result}
 		<div class="result success">
 			<div>
 				<strong>{result.old_model}</strong> → <strong>{result.new_model}</strong>
-				{#if result.restarted}
-					<span class="badge restarted">{$t('settings.model_migrate.restarted')}</span>
-				{:else}
-					<span class="badge manual">{$t('settings.model_migrate.manual_restart_needed')}</span>
+				{#if showRestartBadge}
+					{#if result.restarted}
+						<span class="badge restarted">{$t('settings.model_migrate.restarted')}</span>
+					{:else}
+						<span class="badge manual">{$t('settings.model_migrate.manual_restart_needed')}</span>
+					{/if}
 				{/if}
 			</div>
 			{#if result.recommendations.length > 0}
@@ -168,6 +179,8 @@
 	.actions {
 		display: flex;
 		gap: 0.5rem;
+		flex-wrap: wrap;
+		align-items: flex-start;
 	}
 	button {
 		padding: 0.4rem 0.8rem;
