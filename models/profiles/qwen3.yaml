@@ -43,3 +43,9 @@ embedding:
   # max_length は 1 入力シーケンスの推奨上限。context/batch/ubatch (サーバリソース) は
   # profile では設定せず config/schema 既定に委ねる (並列スロット分の KV が必要なため)。
   max_length: 8192
+  # URL/コマンドリコールの sim 閾値 (embed 切替時 config.yaml tools.* へ転写)。Qwen3-Embedding
+  # は instruction-aware で正例 sim が高め (0.6-0.8) のため既定の 0.7。LFM2.5 からの戻し時に
+  # tools.* を 0.7 へ復元する。
+  recall:
+    url_recall_min_score: 0.7
+    executable_command_recall_min_score: 0.7

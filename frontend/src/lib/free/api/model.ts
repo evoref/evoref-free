@@ -126,3 +126,33 @@ export async function rollbackComponent(
 		target_model ? { target_model } : {}
 	);
 }
+
+// ── SemMem fact 再 embed ──
+
+/** SemMem fact (URL/コマンドリコール) 埋め込み再構築レスポンス */
+export interface ReembedFactsResponse {
+	dry_run: boolean;
+	/** 対象 fact 数 (dry_run / 実行 共通) */
+	fact_count: number;
+	/** 実行時のみ: 再 embed した fact 数 */
+	reembedded?: number;
+	/** 実行時のみ: 所要秒 */
+	elapsed_sec?: number;
+}
+
+/** SemMem fact 埋め込みを現在の Embedder で in-place 再構築する (再起動不要)。
+ *
+ * RAG reindex は SemMem fact (URL/コマンドリコール) を対象外のため、embed モデル
+ * 切替後に併せて実行する。次元が変わる切替はサーバが 409 を返す (CLI へ誘導)。
+ * - dry_run: 対象 fact 数だけ返す (プレビュー)。
+ */
+export async function reembedFacts(
+	opts: { dry_run?: boolean } = {}
+): Promise<ReembedFactsResponse> {
+	const params = new URLSearchParams();
+	params.set('dry_run', String(opts.dry_run ?? false));
+	return request<ReembedFactsResponse>(
+		'POST',
+		`/model/reembed-facts?${params.toString()}`
+	);
+}

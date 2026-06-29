@@ -670,6 +670,11 @@ class ModelMigrator:
         embedding ブロックが無い arch はテンプレート系を据え置き (WARNING)。
         embed component-migrate / rollback の config 同期に使う。
 
+        ``embedding.recall`` サブブロック (URL/コマンドリコールの sim 閾値) が
+        あれば予約キー ``"recall"`` に入れて返す。これは ``embedding.*`` では
+        なく ``tools.*`` 設定なので、:meth:`_update_component_config` 側で
+        pop して ``tools`` へルーティングする。
+
         返すのは「設定すべきキーだけ」。GGUF 読取失敗時は dim を省く
         (既存 embedding.dim を温存) — 幅を誤って書くと VectorStore /
         dimension_check を壊すため。
@@ -718,6 +723,20 @@ class ModelMigrator:
             ):
                 if key in emb_prof:
                     params[key] = emb_prof[key]
+            # リコール閾値は埋め込みモデルの sim 分布に依存する model 固有値。
+            # embedding.* ではなく tools.* へ送るため予約キー "recall" に退避する。
+            recall_prof = emb_prof.get("recall")
+            if isinstance(recall_prof, dict):
+                recall = {
+                    k: recall_prof[k]
+                    for k in (
+                        "url_recall_min_score",
+                        "executable_command_recall_min_score",
+                    )
+                    if k in recall_prof
+                }
+                if recall:
+                    params["recall"] = recall
         else:
             logger.warning(
                 "embed config sync: arch %r has no embedding profile; query/doc "
@@ -742,13 +761,18 @@ class ModelMigrator:
         # を同期する。これをやらないと旧モデルの prefix スキームで新モデルが駆動され
         # RAG が静かに劣化する (同 dim swap では dimension_check も検知しない)。
         emb_params: dict = {}
+        recall_params: dict = {}
         if component == "embedding":
             resolved = Path(new_model_path)
             if not resolved.is_absolute():
                 resolved = self.project_root / resolved
             emb_params = self._resolve_embedding_profile_params(resolved)
+            # リコール閾値は embedding.* ではなく tools.* へルーティングする。
+            recall_params = emb_params.pop("recall", {})
             if emb_params:
                 cfg.setdefault("embedding", {}).update(emb_params)
+            if recall_params:
+                cfg.setdefault("tools", {}).update(recall_params)
         with open(config_path, "w", encoding="utf-8") as f:
             yaml.dump(
                 cfg, f,
@@ -764,6 +788,11 @@ class ModelMigrator:
             self.config.setdefault("embedding", {}).update(emb_params)
             logger.info(
                 "embed config synced: embedding.%s", sorted(emb_params.keys()),
+            )
+        if recall_params:
+            self.config.setdefault("tools", {}).update(recall_params)
+            logger.info(
+                "recall thresholds synced: tools.%s", sorted(recall_params.keys()),
             )
         logger.info(
             "config.yaml updated: model_paths.%s = %s",

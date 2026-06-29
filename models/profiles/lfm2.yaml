@@ -43,3 +43,10 @@ embedding:
     chat: "Retrieve relevant passages for the query."
     coding: "Retrieve relevant code for the query."
   max_length: 512
+  # URL/コマンドリコールの sim 閾値。embed 切替時 ModelMigrator が config.yaml の
+  # tools.* (url_recall_min_score / executable_command_recall_min_score) へ転写する。
+  # LFM2.5-Embedding は同空間でも JA 類似度が低め (実測: 正例 0.46-0.54 / ノイズ <=0.14)
+  # なので 0.3 に較正 (Qwen3 用の既定 0.7 では正例も空振りする)。
+  recall:
+    url_recall_min_score: 0.3
+    executable_command_recall_min_score: 0.3

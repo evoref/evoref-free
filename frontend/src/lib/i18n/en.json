@@ -391,6 +391,15 @@
 			"done": "Reindex complete: RAG {rag} / cartridges {cart} / memory {mem} notes ({sec}s)",
 			"still_mismatch": "dimension mismatch remains"
 		},
+		"reembed": {
+			"preview": "Reembed facts (preview)",
+			"checking": "Checking…",
+			"targets": "Targets: {n} SemMem facts (URL/command recall)",
+			"run": "Run reembed",
+			"running": "Reembedding…",
+			"cancel": "Cancel",
+			"done": "Reembed complete: {n} facts ({sec}s)"
+		},
 		"threshold": {
 			"hint": "Adjust retrieval thresholds after switching the embedding model (run reindex first).",
 			"enable_normalization": "Enable normalization (min-max)",

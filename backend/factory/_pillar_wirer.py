@@ -577,6 +577,17 @@ async def _check_embedding_dim(state: AppState, cfg: dict[str, Any]) -> None:
         logger.warning("Embedding dimension check failed: %s", e)
         return
 
+    # SemMem fact 埋め込みの stale 検知 (RAG とは別ストア)。embed swap 後の
+    # 取り残しを reembed-facts へ誘導する。recall miss のみで誤結果は出ないため
+    # ブロックはせず WARNING のみ。
+    try:
+        from backend.free.memory.semantic.stale_guard import (
+            warn_if_semmem_reembed_required,
+        )
+        warn_if_semmem_reembed_required()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("SemMem stale guard check skipped: %s", e)
+
     if not mismatch:
         return
 
