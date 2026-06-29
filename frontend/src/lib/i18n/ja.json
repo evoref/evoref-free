@@ -391,6 +391,15 @@
 			"done": "再構築完了: RAG {rag} / カートリッジ {cart} / メモリ {mem} ノート（{sec}秒）",
 			"still_mismatch": "次元不一致が残っています"
 		},
+		"reembed": {
+			"preview": "fact 再embed（プレビュー）",
+			"checking": "確認中…",
+			"targets": "対象: SemMem fact {n} 件（URL/コマンドリコール）",
+			"run": "再embed を実行",
+			"running": "再embed 中…",
+			"cancel": "キャンセル",
+			"done": "fact 再embed 完了: {n} 件（{sec}秒）"
+		},
 		"threshold": {
 			"hint": "埋め込みモデル切替後の検索閾値を調整します（先に reindex を実行）。",
 			"enable_normalization": "正規化を有効化（min-max）",

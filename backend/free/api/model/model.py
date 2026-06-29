@@ -280,9 +280,15 @@ async def migrate_component(
         and not req.dry_run
         and result.old_model != result.new_model
     ):
+        from backend.free.memory.semantic.stale_guard import (
+            set_semmem_reembed_required,
+        )
         from backend.free.rag.dimension_check import set_embed_reindex_required
 
         set_embed_reindex_required(result.new_model)
+        # SemMem fact 埋め込み (URL/コマンドリコール) も同 dim swap で stale になる。
+        # 起動時 WARN で reembed-facts を案内するためのマーカーを立てる。
+        set_semmem_reembed_required(result.new_model)
 
     restarted = False
     if (
@@ -531,6 +537,120 @@ async def process_restart(
         "host": entry.host,
         "port": entry.port,
         "pid": entry.proc.pid,
+    }
+
+
+@router.post("/reembed-facts")
+async def reembed_facts(
+    state: AppState = Depends(get_app_state),
+    dry_run: bool = False,
+):
+    """SemMem fact (URL/コマンドリコール) の埋め込みを現在の Embedder で再構築する。
+
+    埋め込みモデル切替後、SemMem fact ベクトルは旧モデル空間に取り残され
+    ``search_by_embedding`` (URL/コマンドリコール) が空振りする。RAG reindex
+    (``/api/rag/reindex``) は SemMem fact を対象外とするため本エンドポイントが
+    補完する。稼働中の **live global store を in-place で更新** するので mem_view も
+    同一オブジェクトを参照しており **再起動不要**。
+
+    次元が変わる切替 (dim mismatch) は in-place 上書き不可のため CLI
+    ``evorefmem_cli reembed-facts --apply`` (新 model_id dir を作る) へ誘導する。
+
+    Query params:
+        dry_run: True なら対象 fact 数だけ返して実行しない。
+    """
+    import shutil
+    import time
+
+    import numpy as np
+
+    from backend.free.memory.semantic.cli._paths import cli_backup_root
+    from backend.free.memory.semantic.manifest import update_manifest
+    from backend.free.memory.semantic.stale_guard import (
+        clear_semmem_reembed_required,
+    )
+    from backend.utils import utc_now
+
+    if state.embedder is None:
+        raise HTTPException(status_code=503, detail="Embedder not initialized")
+
+    store = state.get_semantic_store("global")
+    live_facts = store.all_facts(include_superseded=False)
+    targets = [
+        (f.id, (f.object or "").strip())
+        for f in live_facts
+        if f.embedding is not None and (f.object or "").strip()
+    ]
+    if dry_run:
+        return {"dry_run": True, "fact_count": len(targets)}
+
+    if not targets:
+        return {"dry_run": False, "reembedded": 0, "fact_count": 0}
+
+    embedder_dim = int(state.embedder.dim())
+    current_dim = next(
+        (int(f.embedding.shape[0]) for f in live_facts if f.embedding is not None),
+        None,
+    )
+    if current_dim is not None and current_dim != embedder_dim:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"embedding dim changed (stored={current_dim}, "
+                f"current={embedder_dim}); in-place reembed not possible. Run "
+                "'python scripts/evorefmem_cli.py reembed-facts --apply' "
+                "(creates a new model_id dir)."
+            ),
+        )
+
+    # 上書き前に現在の埋め込みベクトルを backup する (rollback 用)。
+    resolver = get_path_resolver()
+    memory_dir = resolver.resolve_local("memory_dir")
+    try:
+        backup_root = cli_backup_root(
+            resolver.resolve_local("migration_archive_dir"), "reembed_facts_api",
+        )
+        emb_dir = store.root_dir / "embeddings"
+        if emb_dir.exists():
+            shutil.copytree(
+                emb_dir, backup_root / "embeddings", dirs_exist_ok=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("reembed-facts: backup skipped: %s", exc)
+
+    objs = [t[1] for t in targets]
+    t0 = time.monotonic()
+    vectors = await state.embedder.embed(objs, is_query=False)
+    if len(vectors) != len(objs):
+        raise HTTPException(
+            status_code=500,
+            detail=f"embedder returned {len(vectors)} vectors for {len(objs)} texts",
+        )
+    for (fid, _), vec in zip(targets, vectors):
+        arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+        if arr.shape[0] != embedder_dim:
+            raise HTTPException(
+                status_code=500,
+                detail=f"embedder vector dim {arr.shape[0]} != {embedder_dim}",
+            )
+        store.update_fact(fid, embedding=arr)
+    elapsed = time.monotonic() - t0
+
+    try:
+        update_manifest(memory_dir, last_migrated_at=utc_now())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("reembed-facts: manifest stamp skipped: %s", exc)
+    clear_semmem_reembed_required(memory_dir=memory_dir)
+
+    logger.info(
+        "reembed-facts: reembedded %d SemMem facts in %.2fs",
+        len(targets), elapsed,
+    )
+    return {
+        "dry_run": False,
+        "reembedded": len(targets),
+        "fact_count": len(targets),
+        "elapsed_sec": round(elapsed, 2),
     }
 
 

@@ -68,6 +68,10 @@ from backend.free.memory.semantic.cli.migrate_embedding_cmd import (  # noqa: E4
     format_report_text as _migrate_emb_fmt,
     run_migrate_embedding,
 )
+from backend.free.memory.semantic.cli.reembed_facts_cmd import (  # noqa: E402
+    format_report_text as _reembed_fmt,
+    run_reembed_facts,
+)
 from backend.free.memory.semantic.cli.rebuild_indices_cmd import (  # noqa: E402
     format_report_text as _rebuild_fmt,
     run_rebuild_indices,
@@ -211,6 +215,78 @@ def _cmd_migrate_embedding(args: argparse.Namespace) -> int:
         print(report.to_json())
     else:
         print(_migrate_emb_fmt(report))
+    return 1 if report.error else 0
+
+
+def _build_http_embed_fn(
+    host: str,
+    port: int,
+    doc_template: str,
+    *,
+    batch: int = 32,
+    timeout: int = 60,
+):
+    """live llama-embed サーバ (OAI ``/v1/embeddings``) へ問い合わせる embed_fn.
+
+    生の object テキストに ``doc_template`` (``document: {query}`` 等) を適用し、
+    L2 正規化したベクトル列を返す (保存ベクトルは単位長のため正規化を合わせる)。
+    """
+    import json as _json
+    import math
+    import urllib.request
+
+    url = f"http://{host}:{port}/v1/embeddings"
+
+    def _embed(texts: list[str]) -> list[list[float]]:
+        out: list[list[float]] = []
+        for start in range(0, len(texts), batch):
+            chunk = texts[start:start + batch]
+            inputs = [doc_template.format(query=t) for t in chunk]
+            body = _json.dumps({"input": inputs}).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = _json.loads(resp.read().decode("utf-8"))
+            data = sorted(payload["data"], key=lambda e: e.get("index", 0))
+            for entry in data:
+                vec = entry["embedding"]
+                norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+                out.append([x / norm for x in vec])
+        return out
+
+    return _embed
+
+
+def _cmd_reembed_facts(args: argparse.Namespace) -> int:
+    from backend.config import load_config
+
+    paths = resolve_cli_paths()
+    cfg = load_config()
+    emb = cfg.get("embedding", {}) or {}
+    host = args.embed_host or emb.get("llama_host", "localhost")
+    port = args.embed_port or int(emb.get("llama_port", 8082))
+    doc_template = args.doc_template or emb.get("doc_template", "document: {query}")
+    dim = args.dim if args.dim is not None else int(emb.get("dim", 1024))
+    model_name = emb.get("model_name") or "embedding"
+    model_id = args.model_id or str(model_name).lower()
+
+    embed_fn = None
+    if args.apply:
+        embed_fn = _build_http_embed_fn(host, int(port), doc_template)
+    report = run_reembed_facts(
+        paths.memory_dir,
+        paths.migration_archive_dir,
+        new_model_id=model_id,
+        new_dim=dim,
+        embed_fn=embed_fn,
+        normalized=not args.not_normalized,
+        apply=args.apply,
+    )
+    if args.json:
+        print(report.to_json())
+    else:
+        print(_reembed_fmt(report))
     return 1 if report.error else 0
 
 
@@ -366,6 +442,42 @@ def _build_parser() -> argparse.ArgumentParser:
         help="実際に manifest を書き換える",
     )
     sp.set_defaults(func=_cmd_migrate_embedding)
+
+    # reembed-facts
+    sp = sub.add_parser(
+        "reembed-facts",
+        help="semantic fact の embedding を新モデルで再生成 + manifest swap "
+        "(デフォルト dry-run)",
+    )
+    sp.add_argument(
+        "--model-id", default=None,
+        help="新 model_id (省略時は config embedding.model_name を小文字化)",
+    )
+    sp.add_argument(
+        "--dim", type=int, default=None,
+        help="新モデルの次元数 (省略時は config embedding.dim)",
+    )
+    sp.add_argument(
+        "--not-normalized", action="store_true",
+        help="埋め込みが L2 正規化されていない場合に付与",
+    )
+    sp.add_argument(
+        "--embed-host", default=None,
+        help="llama-embed ホスト (省略時 config embedding.llama_host)",
+    )
+    sp.add_argument(
+        "--embed-port", type=int, default=None,
+        help="llama-embed ポート (省略時 config embedding.llama_port)",
+    )
+    sp.add_argument(
+        "--doc-template", default=None,
+        help="doc 側テンプレ (省略時 config embedding.doc_template)",
+    )
+    sp.add_argument(
+        "--apply", action="store_true",
+        help="実際に再 embed + manifest swap する (未指定時は dry-run)",
+    )
+    sp.set_defaults(func=_cmd_reembed_facts)
 
     # export
     sp = sub.add_parser(
