@@ -170,6 +170,7 @@
     "reindex_canceled": "Reindex canceled.",
     "reindex_running": "Reindexing...",
     "reindex_complete": "Reindex complete: RAG {rag_chunks} chunks / cartridges {cart_chunks} chunks ({cart_count}) / memory {mem_notes} notes reset ({elapsed}s)",
+    "reindex_cart_failed": "Cartridge rebuild failed: {ids}. The stale marker remains; re-run reindex.",
     "reindex_failed": "Reindex failed: {detail}",
     "startup_model_state_ok": "model_state.json — OK",
     "startup_model_state_init": "model_state.json not created yet; will be generated from config.yaml on first launch.",
@@ -426,7 +427,8 @@
       "timeout": "Inference timed out ({seconds}s). Try shorter input or adjust timeout settings.",
       "invalid_response": "Received invalid response from inference server.",
       "model_not_found": "Model file not found: {path}",
-      "process_crashed": "Inference server crashed. Attempting restart."
+      "process_crashed": "Inference server crashed. Attempting restart.",
+      "request_rejected": "Embedding server rejected the request: {detail}. You may need to raise embedding.context_size."
     },
     "fs": {
       "index_corrupted": "Vector index corrupted. Attempting recovery.",
@@ -437,7 +439,8 @@
     },
     "rag": {
       "chunk_failed": "Failed to chunk file: {filename}",
-      "vector_dim_mismatch": "Vector dimension mismatch. Embedding model was changed. Run 'evoref reindex'."
+      "vector_dim_mismatch": "Vector dimension mismatch. Embedding model was changed. Run 'evoref reindex'.",
+      "stale_embedder": "The embedding server is still running the previous model ({current}). Restart the embed server and retry (configured model: {expected})."
     },
     "cartridge": {
       "invalid_zip": "Invalid cartridge file: {filename}",

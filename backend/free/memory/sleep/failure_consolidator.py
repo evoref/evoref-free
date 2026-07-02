@@ -67,7 +67,7 @@ def consolidate_failure_patterns_for_project(
 
     try:
         project_store = store_provider(f"project:{current_project_id}")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning(
             "Step 13: failed to obtain project store: %s", exc,
         )

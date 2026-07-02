@@ -374,7 +374,7 @@ class SleepTimeScheduler:
         self._level1_loop_task.cancel()
         try:
             await self._level1_loop_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        except (asyncio.CancelledError, Exception):
             pass
         self._level1_loop_task = None
         logger.info("Level 1 loop stopped")
@@ -510,7 +510,7 @@ class SleepTimeScheduler:
         self._level2_loop_task.cancel()
         try:
             await self._level2_loop_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        except (asyncio.CancelledError, Exception):
             pass
         self._level2_loop_task = None
         logger.info("Level 2 loop stopped")

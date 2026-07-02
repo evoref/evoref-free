@@ -67,7 +67,7 @@ def ensure_mdp_ingester(
         resolver = get_path_resolver()
         mem_dir = resolver.resolve_local("memory_dir")
         state_path = Path(mem_dir) / "mdp_ingest_state.json"
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("MDP ingester: failed to resolve memory_dir: %s", exc)
         state_path = log_dir / "mdp_ingest_state.json"
     from backend.free.memory.notes.mdp_ingester import MDPIngester
@@ -136,7 +136,7 @@ async def ingest_mdp_traces(
         embeddings = await embedder.embed(
             [n.content for n in notes], is_query=False,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Step 7.5: MDP ingest embedding failed: %s", exc)
         return 0, ingester
 
@@ -151,7 +151,7 @@ async def ingest_mdp_traces(
             chunk_id = long_term.absorb_from_short_term(note)
             if chunk_id is not None:
                 ingested += 1
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "Step 7.5: failed to absorb mdp note %s: %s", note.id, exc,
             )

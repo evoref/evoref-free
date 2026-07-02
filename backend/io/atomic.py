@@ -154,7 +154,7 @@ class AtomicWriter:
                         "mode": self._mode,
                     },
                 )
-            except Exception as log_err:  # noqa: BLE001 — observability must not break writes
+            except Exception as log_err:
                 logger.warning("DebugLogger.log_memory_op failed: %s", log_err)
 
 

@@ -16,8 +16,14 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import httpx
 import numpy as np
 
+from backend.exceptions import (
+    LLMConnectionError,
+    LLMRequestRejectedError,
+    LLMTimeoutError,
+)
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -43,6 +49,7 @@ class ReindexResult:
     rag_chunks: int = 0
     cartridge_chunks: int = 0
     cartridges_rebuilt: list[str] = field(default_factory=list)
+    cartridges_failed: list[str] = field(default_factory=list)
     memory_notes_reset: int = 0
     elapsed_sec: float = 0.0
 
@@ -103,6 +110,21 @@ async def run_reindex(
                     reset += 1
             state.short_term_memory._cache_dirty = True
             result.memory_notes_reset = reset
+            # in-memory のみだと sleep-time worker の保存前に再起動した場合に
+            # ディスク上の旧 (stale) 埋め込みが復活する (マーカーは消えている
+            # ため保護なし)。リセットを即時永続化する。
+            if reset:
+                try:
+                    from backend.config import get_path_resolver
+
+                    memory_dir = get_path_resolver().resolve_local("memory_dir")
+                    state.short_term_memory.save(
+                        memory_dir / "short_term_notes.json",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to persist STM embedding reset: %s", exc,
+                    )
 
     # カートリッジ
     if state.cartridge_manager is not None:
@@ -116,17 +138,19 @@ async def run_reindex(
                 result.cartridges_rebuilt.append(cart_id)
                 result.cartridge_chunks += info.chunks
             except Exception as exc:
+                result.cartridges_failed.append(cart_id)
                 logger.error("Reindex failed for cartridge %s: %s", cart_id, exc)
 
     # 状態更新: embed 切替 reindex マーカーを消してから次元不一致フラグを再評価。
-    # (フル reindex 時のみ。特定カートリッジのみの reindex では全体の stale 状態は
-    # 解消しないためマーカーは残す。)
+    # (フル reindex かつカートリッジ全成功時のみ。特定カートリッジのみの
+    # reindex や、失敗カートリッジが残る場合は stale 状態が解消していないため
+    # マーカーを残す。)
     try:
         from backend.free.rag.dimension_check import (
             check_embedding_dim_consistency,
             clear_embed_reindex_required,
         )
-        if cartridge_id is None:
+        if cartridge_id is None and not result.cartridges_failed:
             clear_embed_reindex_required()
         check_embedding_dim_consistency(state)
     except Exception as exc:
@@ -134,10 +158,11 @@ async def run_reindex(
 
     result.elapsed_sec = round(time.monotonic() - t0, 3)
     logger.info(
-        "Reindex complete: rag=%d, cartridge=%d (%d carts), memory_reset=%d, %.2fs",
+        "Reindex complete: rag=%d, cartridge=%d (%d carts, %d failed), "
+        "memory_reset=%d, %.2fs",
         result.rag_chunks, result.cartridge_chunks,
-        len(result.cartridges_rebuilt), result.memory_notes_reset,
-        result.elapsed_sec,
+        len(result.cartridges_rebuilt), len(result.cartridges_failed),
+        result.memory_notes_reset, result.elapsed_sec,
     )
     return result
 
@@ -173,7 +198,36 @@ async def _reindex_rag_store(
         return 0
 
     texts = [t for _, t in items]
-    new_vecs = await embedder.embed(texts, is_query=False)
+    try:
+        new_vecs = await embedder.embed(texts, is_query=False)
+    except httpx.TimeoutException as exc:
+        raise LLMTimeoutError(
+            f"Embedding request timed out during reindex ({len(texts)} chunks)",
+        ) from exc
+    except httpx.HTTPStatusError as exc:
+        # サーバーは応答したが個別リクエストを拒否した (例: context 長超過)。
+        # httpx.HTTPError のサブクラスなので下の一括 except より先に捕捉する。
+        # llama-server の応答 body に理由が入っているので抽出してユーザーに見せる
+        # (「接続できません」に丸めると実態と異なり、案内された再起動も効かない)。
+        try:
+            detail = (
+                exc.response.json().get("error", {}).get("message")
+                or exc.response.text[:300]
+            )
+        except Exception:
+            detail = exc.response.text[:300] if exc.response.text else str(exc)
+        raise LLMRequestRejectedError(
+            f"Embedding server rejected request during reindex: {detail}",
+            detail=detail,
+        ) from exc
+    except httpx.HTTPError as exc:
+        # httpx.HTTPError は httpx.ReadError 等、TimeoutException ではない
+        # transient I/O 失敗も含む（ReadError は _RETRYABLE_EXCEPTIONS に
+        # 含まれずリトライなしで即座に送出されるため、ConnectError 限定では
+        # 取りこぼす）。
+        raise LLMConnectionError(
+            f"Embedding server connection failed during reindex ({len(texts)} chunks)",
+        ) from exc
 
     # 既存ベクトルをクリアして新規追加
     from backend.free.rag.vector_store import quantize_int8

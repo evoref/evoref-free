@@ -374,7 +374,7 @@ class PolicyAdjuster:
             existing = self.learn_view.find_active_learned_failure_pattern_by_subject(
                 subject,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "find_active_learned_failure_pattern failed for %s: %s",
                 subject, exc,
@@ -390,7 +390,7 @@ class PolicyAdjuster:
                 mode_origin=bucket.last_mode if bucket.last_mode in ("chat", "coding") else "chat",  # type: ignore[arg-type]
                 trace_id=bucket.last_trace_id or None,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "write_learned_failure_pattern failed for %s: %s", subject, exc,
             )
@@ -400,7 +400,7 @@ class PolicyAdjuster:
                 self.learn_view.supersede_learned_failure_pattern(
                     old_id=existing.id, new_id=new_fact.id,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     "supersede_learned_failure_pattern failed: %s", exc,
                 )
@@ -411,7 +411,7 @@ class PolicyAdjuster:
         payload = self._build_payload(bucket, kind="success")
         try:
             existing = self.learn_view.find_active_policy_by_subject(subject)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "find_active_policy_by_subject failed for %s: %s", subject, exc,
             )
@@ -427,7 +427,7 @@ class PolicyAdjuster:
                 auto_evolved=True,
                 trace_id=bucket.last_trace_id or None,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("write_policy failed for %s: %s", subject, exc)
             return
         if existing is not None:
@@ -435,7 +435,7 @@ class PolicyAdjuster:
                 self.learn_view.supersede_policy(
                     old_id=existing.id, new_id=new_fact.id,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("supersede_policy failed: %s", exc)
         self._stats["policy_emitted"] += 1
 

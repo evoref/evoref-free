@@ -237,7 +237,7 @@ async def curate_executable_command_facts(
                     emb = await embedder.embed([topic], is_query=False)
                     if emb is not None and len(emb) > 0:
                         embedding = np.asarray(emb[0], dtype=np.float32)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning(
                         "executable_command_curator: embed failed: %s", exc,
                     )
@@ -271,7 +271,7 @@ async def curate_executable_command_facts(
                     "executable_command_curator: skip failed command with no "
                     "existing fact (mode=%s)", mode,
                 )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "executable_command_curator: persist failed: %s", exc,
             )
@@ -286,7 +286,7 @@ async def curate_executable_command_facts(
                 op="executable_command_curator",
                 stats={"facts_curated": written},
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     if written:
         logger.info(

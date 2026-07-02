@@ -145,7 +145,7 @@ class FadeMemScorer:
         return importance
 
 
-def can_fade(memory_id: str, experience_buf: dict | None, config: dict) -> bool:
+def can_fade(memory_id: str, experience_buf: dict | None, config: dict) -> bool:  # noqa: ARG001
     """FadeMem 削除実行前の安全チェック。
     experience.json と紐づくメモリは score に関わらず保持する。
     """

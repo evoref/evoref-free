@@ -77,7 +77,7 @@ async def digest_tool_result(
             purpose="tool_result_digest",
         )
         digest = _content_of(result).strip()
-    except Exception as e:  # noqa: BLE001 — degraded 安全 (raw 退避)
+    except Exception as e:
         logger.warning("tool_result_digest failed (%r); using raw result", e)
         return None
     if not digest or digest.strip(" .'\"`\n").upper() == _NO_INFO:

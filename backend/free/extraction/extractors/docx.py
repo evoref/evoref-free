@@ -38,7 +38,7 @@ class DocxExtractor(BinarySourceExtractorBase):
     def _extract_from_source(
         self,
         source: Path | BinaryIO,
-        source_name: str,
+        source_name: str,  # noqa: ARG002
     ) -> tuple[str, dict[str, Any]]:
         Document = self._import_docx()
         # python-docx は Path / str / file-like を受け付けるが、

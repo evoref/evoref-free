@@ -80,6 +80,9 @@ from backend.free.memory.semantic.cli.verify_cmd import (  # noqa: E402
     format_report_text as _verify_fmt,
     run_verify,
 )
+from backend.free.memory.semantic.manifest import (  # noqa: E402
+    normalize_embedding_model_id,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -230,6 +233,10 @@ def _build_http_embed_fn(
 
     生の object テキストに ``doc_template`` (``document: {query}`` 等) を適用し、
     L2 正規化したベクトル列を返す (保存ベクトルは単位長のため正規化を合わせる)。
+    ``doc_template`` が空文字列 (Qwen3-Embedding 等の doc 側 prefix なしモデル)
+    なら素のテキストをそのまま埋め込む — ``LlamaCppEmbedder`` の fast-path と
+    同じ扱い。空テンプレに ``.format()`` を適用すると全文書が空文字列に潰れ、
+    embed サーバはエラーを返さないため silent corruption になる。
     """
     import json as _json
     import math
@@ -241,7 +248,10 @@ def _build_http_embed_fn(
         out: list[list[float]] = []
         for start in range(0, len(texts), batch):
             chunk = texts[start:start + batch]
-            inputs = [doc_template.format(query=t) for t in chunk]
+            inputs = [
+                doc_template.format(query=t) if doc_template else t
+                for t in chunk
+            ]
             body = _json.dumps({"input": inputs}).encode("utf-8")
             req = urllib.request.Request(
                 url, data=body, headers={"Content-Type": "application/json"},
@@ -266,10 +276,13 @@ def _cmd_reembed_facts(args: argparse.Namespace) -> int:
     emb = cfg.get("embedding", {}) or {}
     host = args.embed_host or emb.get("llama_host", "localhost")
     port = args.embed_port or int(emb.get("llama_port", 8082))
-    doc_template = args.doc_template or emb.get("doc_template", "document: {query}")
+    doc_template = args.doc_template or emb.get("doc_template", "")
     dim = args.dim if args.dim is not None else int(emb.get("dim", 1024))
     model_name = emb.get("model_name") or "embedding"
-    model_id = args.model_id or str(model_name).lower()
+    # model_id は API 側 (/api/model/reembed-facts の 409 ガード) と同じ
+    # normalize_embedding_model_id で導出する。単純な lower() だと拡張子付き
+    # model_name で manifest とガードの期待値が乖離し 409 が解消しない。
+    model_id = args.model_id or normalize_embedding_model_id(str(model_name))
 
     embed_fn = None
     if args.apply:

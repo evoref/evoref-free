@@ -264,7 +264,7 @@ class NoteEvolver:
             return
         try:
             dl.log_memory_op("note_evolve", stats)
-        except Exception as exc:  # noqa: BLE001 - ロギング失敗は本処理を止めない
+        except Exception as exc:
             logger.warning("log_memory_op(note_evolve) failed: %s", exc)
 
     def _gather_context(

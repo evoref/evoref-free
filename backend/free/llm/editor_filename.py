@@ -117,7 +117,7 @@ async def derive_editor_filename_stem(
             temperature=0.2,
             purpose="editor_filename",
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning(
             "editor_filename derivation failed (%s); using fallback '%s'",
             type(e).__name__, fallback,

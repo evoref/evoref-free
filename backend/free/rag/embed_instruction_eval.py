@@ -67,7 +67,7 @@ class EmbedInstructionEval:
                 hits = vs.search(vecs[0], top_k=self._top_k)
                 if hits:
                     scores.append(float(hits[0][1]))
-        except (VectorDimensionMismatchError, Exception) as exc:  # noqa: BLE001
+        except (VectorDimensionMismatchError, Exception) as exc:
             logger.warning("embed instruction eval failed, degrading: %s", exc)
             return None
 

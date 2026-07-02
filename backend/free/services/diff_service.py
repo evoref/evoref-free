@@ -174,7 +174,7 @@ def _parse_hunks(diff_text: str) -> list[Hunk]:
 
     try:
         patches = whatthepatch.parse_patch(diff_text)
-    except Exception as e:  # noqa: BLE001 — whatthepatch の例外型は private
+    except Exception as e:
         logger.debug("whatthepatch.parse_patch failed: %s", e)
         return []
 

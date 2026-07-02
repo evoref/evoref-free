@@ -389,7 +389,8 @@
 			"running": "Reindexing…",
 			"cancel": "Cancel",
 			"done": "Reindex complete: RAG {rag} / cartridges {cart} / memory {mem} notes ({sec}s)",
-			"still_mismatch": "dimension mismatch remains"
+			"still_mismatch": "dimension mismatch remains",
+			"cart_failed": "Cartridge rebuild failed: {ids}. Re-run required"
 		},
 		"reembed": {
 			"preview": "Reembed facts (preview)",
@@ -398,7 +399,8 @@
 			"run": "Run reembed",
 			"running": "Reembedding…",
 			"cancel": "Cancel",
-			"done": "Reembed complete: {n} facts ({sec}s)"
+			"done": "Reembed complete: {n} facts ({sec}s)",
+			"restart_note": "Embedding model changed: the manifest was swapped and facts reembedded. Restart the backend so live recall uses the new vectors."
 		},
 		"threshold": {
 			"hint": "Adjust retrieval thresholds after switching the embedding model (run reindex first).",

@@ -254,7 +254,7 @@ class StagedCodingExecutor:
                 data={"stage": stage, "detail": detail,
                       "status": status, "task_id": task_id},
             )
-        except Exception as exc:  # noqa: BLE001 — 進捗発行失敗で生成を止めない
+        except Exception as exc:
             logger.debug("stage_progress emit failed: %s", exc)
 
     def _fail_task(self, task: "TaskFactView", error: str) -> None:
@@ -265,7 +265,7 @@ class StagedCodingExecutor:
                 stage=task.stage or "code", status="failed",
                 depends_on=task.depends_on, last_error=error,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.debug("manifest fail upsert failed: %s", exc)
 
     async def execute(self, task: "TaskFactView") -> ExecutionOutcome:
@@ -344,7 +344,7 @@ class StagedCodingExecutor:
                 msgs, purpose="coding_spec_doc", max_tokens=self.spec_max_tokens,
                 temperature=0.3, timeout=self.spec_timeout_sec,
             )
-        except Exception as exc:  # noqa: BLE001 — degraded: 呼出側が description に倒す
+        except Exception as exc:
             logger.warning("spec doc generation failed: %s", exc)
             return ""
         spec_text = _content(resp).strip()
@@ -362,7 +362,7 @@ class StagedCodingExecutor:
                 msgs, purpose="coding_spec_doc", max_tokens=retry_tokens,
                 temperature=0.3, timeout=self.spec_timeout_sec * 1.5,
             )
-        except Exception as exc:  # noqa: BLE001 — 再生成失敗時は初回結果を使う
+        except Exception as exc:
             logger.warning("spec doc regeneration failed: %s", exc)
             return spec_text
         retry_text = _content(resp2).strip()
@@ -388,7 +388,7 @@ class StagedCodingExecutor:
             )
             if isinstance(data, dict):
                 return str(data.get("mermaid", "") or "").strip()
-        except Exception as exc:  # noqa: BLE001 — 失敗は無効化扱い
+        except Exception as exc:
             logger.warning("flowchart synthesis failed: %s", exc)
         return ""
 
@@ -433,7 +433,7 @@ class StagedCodingExecutor:
         )
         try:
             files = await self.codegen(instruction)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("code generation failed for %s: %s", source_path, exc)
             self._fail_task(task, f"codegen error: {exc}")
             return ExecutionOutcome(
@@ -562,7 +562,7 @@ class StagedCodingExecutor:
         }
         try:
             result = await asyncio.to_thread(self.smoke_runner, src_files)  # type: ignore[misc]
-        except Exception as exc:  # noqa: BLE001 — スモーク失敗は検証不能=エラー無し扱い
+        except Exception as exc:
             logger.warning("smoke runner failed: %s", exc)
             return [], []
         errors = [str(e) for e in (getattr(result, "errors", None) or [])]
@@ -670,7 +670,7 @@ class StagedCodingExecutor:
                 f"pytest 参考結果: {'合格' if gate.ok else (gate.error or '失敗')}",
                 "done" if gate.ok else "failed", task.task_id,
             )
-        except Exception as exc:  # noqa: BLE001 — advisory なので失敗は無視
+        except Exception as exc:
             logger.warning("advisory pytest run failed: %s", exc)
         return wf.sha256
 
@@ -684,7 +684,7 @@ class StagedCodingExecutor:
         }
         try:
             return list(self.contract_checker(src_files, {Path(source_path).name: test_code}))
-        except Exception as exc:  # noqa: BLE001 — 照合失敗は検証不能=違反なし扱い
+        except Exception as exc:
             logger.warning("contract check failed: %s", exc)
             return []
 
@@ -700,7 +700,7 @@ class StagedCodingExecutor:
     async def _safe_codegen(self, instruction: str) -> dict[str, str]:
         try:
             return await self.codegen(instruction) or {}
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("staged codegen failed: %s", exc)
             return {}
 

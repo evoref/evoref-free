@@ -237,7 +237,7 @@ class JSONLAppendStore(Generic[T]):
                         "dead_removed": before_dead,
                     },
                 )
-            except Exception as log_err:  # noqa: BLE001 — observability must not break compaction
+            except Exception as log_err:
                 logger.warning("DebugLogger.log_memory_op failed: %s", log_err)
 
     # ── 読み込み API ──────────────────────────────────────────────────

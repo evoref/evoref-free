@@ -348,6 +348,26 @@ def list_stored_models(scope_dir: Path) -> list[str]:
     return sorted(p.name for p in root.iterdir() if p.is_dir())
 
 
+def reset_model_store(scope_dir: Path, model_id: str) -> None:
+    """指定 model_id の埋め込みストア (vectors.npy + row_to_id.json) を削除して空にする.
+
+    full re-embed (:func:`apply_reembed_swap`) で新 model_id dir が既存の stale
+    データを持つ場合に、書き込み前にリセットして「そのモデルのベクトルは今回の
+    対象 fact のみ」を保証する (authoritative swap)。これにより:
+
+    - 既存 dir の dim が新 dim と異なる場合の書込み時 dim-mismatch (manifest swap
+      後に発生すると half-swap で復旧不能になる) を防ぐ、
+    - 削除済み fact の orphan 行が残って誤ヒットするのを防ぐ。
+
+    ``register_new_model`` は idempotent で既存 dir をそのまま返すため、それだけ
+    では上記を保証できない。呼出側は本関数の後に ``register_new_model`` を呼ぶ。
+    ディレクトリ自体は残す (ファイルのみ削除)。
+    """
+    scope_dir = Path(scope_dir)
+    vectors_path(scope_dir, model_id).unlink(missing_ok=True)
+    row_to_id_path(scope_dir, model_id).unlink(missing_ok=True)
+
+
 def register_new_model(
     scope_dir: Path,
     model_id: str,
@@ -421,6 +441,7 @@ __all__ = [
     "list_stored_models",
     "model_dir",
     "register_new_model",
+    "reset_model_store",
     "row_to_id_path",
     "swap_active_model_id",
     "vectors_path",

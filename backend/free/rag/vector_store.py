@@ -715,6 +715,19 @@ class VectorStore:
         """コンテキストプレフィックス未生成のチャンク metadata リストを返す"""
         return [m for m in self.metadata if not m.get("has_context")]
 
+    def mark_has_context(self, chunk_id: str) -> None:
+        """source text が存在せずプレフィックス生成不能なチャンクを
+        ``get_chunks_without_context`` の対象から恒久的に除外する
+
+        ``update_context_prefix`` と異なり prefix もベクトルも更新しない
+        （生成すべきプレフィックスが無いチャンク向け）。
+        """
+        self._ensure_writable()
+        for meta in self.metadata:
+            if meta["id"] == chunk_id:
+                meta["has_context"] = True
+                return
+
     def increment_access_count(self, chunk_id: str) -> int:
         """retrieval ヒット回数をメモリ上でインクリメントする
 

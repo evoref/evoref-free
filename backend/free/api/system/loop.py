@@ -178,7 +178,7 @@ async def start_loop(
             except asyncio.CancelledError:
                 logger.info("loop run task cancelled")
                 raise
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("loop run task failed: %s", exc)
                 driver.stop()
 
@@ -250,7 +250,7 @@ async def get_current_task(state: AppState = Depends(get_app_state)):
                 from backend.free.loop.driver import decode_task_fact
                 view = decode_task_fact(fact)
                 current_task = _to_task_info(view)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     "GET /api/loop/current: failed to decode task fact: %s", exc,
                 )

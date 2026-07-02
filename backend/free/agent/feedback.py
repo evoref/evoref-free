@@ -360,7 +360,7 @@ class FeedbackCollector:
                 json.dumps(keywords[:5], ensure_ascii=False),
             )
 
-    def _learn_from_rephrase(self, current_query: str) -> None:
+    def _learn_from_rephrase(self, current_query: str) -> None:  # noqa: ARG002
         """言い直し検出時: クエリからキーワードを抽出してパターンとして学習
 
         ユーザーが同じ質問を言い直した場合、元の意図キーワードを

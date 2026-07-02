@@ -28,7 +28,7 @@ class RtfExtractor(TextSourceExtractorBase):
         except ImportError:
             return False
 
-    def _process(self, text: str, source_name: str) -> str:
+    def _process(self, text: str, source_name: str) -> str:  # noqa: ARG002
         """RTF を striprtf でプレーンテキストに変換"""
         rtf_to_text = self._import_striprtf()
         return rtf_to_text(text)

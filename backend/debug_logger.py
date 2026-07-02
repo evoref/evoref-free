@@ -367,7 +367,7 @@ class DebugLogger:
         n: int,
         query: str,
         chunks: list[tuple[str, float, str]],
-        scores: list[float] | None = None,
+        scores: list[float] | None = None,  # noqa: ARG002
     ) -> None:
         """RAG 検索結果を記録"""
         if not self.enabled or not self.log_rag:

@@ -94,7 +94,7 @@ class DefaultHarness:
     def parse(self, response: str) -> list[Action]:
         return parse_actions(response)
 
-    def observe(self, action: Action, result: ActionResult) -> None:
+    def observe(self, action: Action, result: ActionResult) -> None:  # noqa: ARG002
         if self._observation_window == 0:
             return
         self._observations.append(result)

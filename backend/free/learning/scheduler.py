@@ -867,7 +867,7 @@ class LearningScheduler:
                     "Level 1 %s: adopted evolved prompt (fitness %.4f → %.4f)",
                     mode, result.initial_fitness, result.final_fitness,
                 )
-            except Exception as e:  # noqa: BLE001 — 個別 mode 失敗は警告して継続
+            except Exception as e:
                 logger.warning("Failed to save prompt for %s: %s", mode, e)
 
         stats: dict[str, dict] = {
@@ -1033,7 +1033,7 @@ class LearningScheduler:
                         session.experience_snapshot, llm_client,
                         extra_results, phase_durations,
                     )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning(
                         "Level 1 extra optimizations failed: %s: %s",
                         type(exc).__name__, exc,
@@ -1097,7 +1097,7 @@ class LearningScheduler:
         try:
             summary = await pipe.run(cycle_num=self._level1_run_count)
             self._last_feedback_summary = summary
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("feedback_pipe.run failed: %s", exc)
 
     def _filter_experiences(self, experiences: list[dict]) -> list[dict]:
@@ -1552,7 +1552,7 @@ class LearningScheduler:
 
     async def _level1_phase2_assist_prompt(
         self,
-        experiences: list[dict],
+        experiences: list[dict],  # noqa: ARG002
         llm_client,
         results: dict[str, dict],
         phase_durations: dict[str, float],
@@ -1798,7 +1798,7 @@ class LearningScheduler:
         tp = time.monotonic()
         try:
             critique_result = await self._critique_synthesizer.critique(experiences)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "Step 11 critique-synthesis failed: %s: %s",
                 type(exc).__name__, exc,
@@ -2265,7 +2265,7 @@ class LearningScheduler:
         }
 
     def _calc_budget_fitness(
-        self, ratios: dict, experiences: list[dict],
+        self, ratios: dict, experiences: list[dict],  # noqa: ARG002
     ) -> float:
         """品質 × 効率のフィットネス（f_09 §12.5）"""
         if not experiences:

@@ -223,7 +223,7 @@ def _theme_info(backend_url: str, console, theme_id: str) -> int:
 
 
 async def _theme_color_mode(
-    backend_url: str, console, state, mode: str,
+    backend_url: str, console, state, mode: str,  # noqa: ARG001
 ) -> int:
     """カラーモード切替"""
     if not mode:

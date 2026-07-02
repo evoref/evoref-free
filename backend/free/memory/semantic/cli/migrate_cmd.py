@@ -170,7 +170,7 @@ def run_migrate(
                     rep.plans.append(_plan_to_dict(p))
     except MigrationChainNotFoundError as exc:
         rep.error = f"chain not found: {exc}"
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         rep.error = f"{type(exc).__name__}: {exc}"
     return rep
 

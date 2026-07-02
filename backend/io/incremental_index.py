@@ -160,7 +160,7 @@ class IncrementalIndexUpdater(Generic[V]):
                         "live_keys": len(self._state),
                     },
                 )
-            except Exception as log_err:  # noqa: BLE001 — observability must not break flush
+            except Exception as log_err:
                 logger.warning("DebugLogger.log_memory_op failed: %s", log_err)
 
     def compact(self) -> None:

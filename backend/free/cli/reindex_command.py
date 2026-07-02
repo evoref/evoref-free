@@ -26,6 +26,26 @@ _DEFAULT_BACKEND = "http://localhost:8000"
 _TIMEOUT = 600.0
 
 
+def _error_detail(resp: httpx.Response) -> str:
+    """非 200 応答から人間可読なエラー理由を取り出す。
+
+    backend の構造化エラー (``{"detail": {"message": ...}}``) を優先し、
+    素の文字列 detail にも対応する。取り出せない場合のみ HTTP コードへ
+    フォールバック (E1007 等のローカライズ済み拒否理由を捨てない)。
+    """
+    try:
+        detail = resp.json().get("detail")
+        if isinstance(detail, dict):
+            message = str(detail.get("message") or "").strip()
+            if message:
+                return message
+        elif isinstance(detail, str) and detail.strip():
+            return detail.strip()
+    except Exception:
+        pass
+    return f"HTTP {resp.status_code}"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="evoref reindex",
@@ -88,7 +108,7 @@ async def _run_reindex_async(args: argparse.Namespace) -> int:
         if resp.status_code != 200:
             render_error(
                 console,
-                msg("cli.reindex_failed", detail=f"HTTP {resp.status_code}"),
+                msg("cli.reindex_failed", detail=_error_detail(resp)),
             )
             return 1
 
@@ -138,7 +158,7 @@ async def _run_reindex_async(args: argparse.Namespace) -> int:
         if resp.status_code != 200:
             render_error(
                 console,
-                msg("cli.reindex_failed", detail=f"HTTP {resp.status_code}"),
+                msg("cli.reindex_failed", detail=_error_detail(resp)),
             )
             return 1
 
@@ -151,4 +171,11 @@ async def _run_reindex_async(args: argparse.Namespace) -> int:
             mem_notes=int(result.get("memory_notes_reset", 0)),
             elapsed=f"{float(result.get('elapsed_sec', 0.0)):.2f}",
         ))
+        failed = list(result.get("cartridges_failed", []) or [])
+        if failed:
+            render_error(
+                console,
+                msg("cli.reindex_cart_failed", ids=", ".join(failed)),
+            )
+            return 1
         return 0

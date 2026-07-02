@@ -88,16 +88,32 @@ async def generate_prefixes_for_store(
         by_source.setdefault(src, []).append(meta)
 
     generated = 0
+    backfilled = 0
     for source, metas in by_source.items():
         if is_cancelled is not None and is_cancelled():
             break
 
         source_text = store.load_source_text(source)
         if not source_text:
-            logger.warning(
-                "Step 5.8 [%s]: source text not found for %s, skipping",
-                label, source,
-            )
+            # memory:<session_id> ソースは設計上 source text を保存しない
+            # (long_term.py の absorb_from_short_term 参照) ため恒久的に
+            # 見つからない。無限リトライを避けるため has_context=True で
+            # 確定させ、以後の Step 5.8 スキャン対象から外す。
+            if source.startswith("memory:"):
+                for meta in metas:
+                    store.mark_has_context(meta["id"])
+                backfilled += len(metas)
+                logger.info(
+                    "Step 5.8 [%s]: %s has no source text by design "
+                    "(memory-sourced chunk); marked %d chunk(s) "
+                    "has_context=True to exclude from future scans",
+                    label, source, len(metas),
+                )
+            else:
+                logger.warning(
+                    "Step 5.8 [%s]: source text not found for %s, skipping",
+                    label, source,
+                )
             continue
 
         for meta in metas:
@@ -122,7 +138,7 @@ async def generate_prefixes_for_store(
             )
             generated += 1
 
-    if generated > 0:
+    if generated > 0 or backfilled > 0:
         store.save()
 
         if store is main_store and bm25_retriever is not None:

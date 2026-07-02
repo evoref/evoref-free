@@ -6,8 +6,7 @@
 	import ProSection from './ProSection.svelte';
 	import ComponentMigrateButton from './ComponentMigrateButton.svelte';
 	import ModelServerControl from './ModelServerControl.svelte';
-	import ReindexButton from './ReindexButton.svelte';
-	import ReembedFactsButton from './ReembedFactsButton.svelte';
+	import EmbeddingRebuildButton from './EmbeddingRebuildButton.svelte';
 	import FieldGroup from './fields/FieldGroup.svelte';
 	import TextField from './fields/TextField.svelte';
 	import NumberField from './fields/NumberField.svelte';
@@ -69,10 +68,9 @@
 		<ModelServerControl server="embed" />
 		<ComponentMigrateButton component="embedding" currentModel={String(models.embed_model ?? '')} onMigrated={loadConfig}>
 			{#snippet actionsTrailing()}
-				<!-- 埋め込みモデル切替後の再構築。RAG ベクトル (ReindexButton) と、URL/コマンド
-				     リコール用の SemMem fact 埋め込み (ReembedFactsButton) は別ストアなので両方押す。 -->
-				<ReindexButton onReindexed={loadConfig} />
-				<ReembedFactsButton onReembedded={loadConfig} />
+				<!-- 埋め込みモデル切替後の再構築。RAG ベクトルと、URL/コマンドリコール用の
+				     SemMem fact 埋め込みは別ストアだが、このボタン1つで両方まとめて再構築する。 -->
+				<EmbeddingRebuildButton onRebuilt={loadConfig} />
 			{/snippet}
 		</ComponentMigrateButton>
 		<TextField label="settings.embedding.llama_host" value={String(embedding.llama_host ?? 'localhost')} onchange={fieldUpdater('embedding', 'llama_host')} />

@@ -97,7 +97,7 @@ class LazyContextualPrefixService:
 
         targets: list[dict] = []
         for cid in chunk_ids:
-            meta = store._find_meta(cid)  # noqa: SLF001 (internal helper)
+            meta = store._find_meta(cid)
             if meta is None:
                 continue
             if meta.get("has_context"):

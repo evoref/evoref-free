@@ -603,7 +603,7 @@ class AssistModelClient(BaseHTTPClient):
             self._calibration_path = get_path_resolver().resolve_local(
                 "assist_calibration_file",
             )
-        except Exception:  # noqa: BLE001 — config 未ロード (単体テスト等) では
+        except Exception:
             # 永続化を無効化し、in-memory 較正のみ動作させる。
             self._calibration_path = None
         if self._calibration_path is not None and self._assist_model_filename:
@@ -774,10 +774,10 @@ class AssistModelClient(BaseHTTPClient):
         self,
         messages: list[dict],
         *,
-        stream: bool = False,
+        stream: bool = False,  # noqa: ARG002
         temperature: float = 0.7,
         max_tokens: int | None = 256,
-        id_slot: int | None = None,
+        id_slot: int | None = None,  # noqa: ARG002
         timeout: float | None = None,
         purpose: str = "",
         cache_prompt: bool = False,
@@ -1237,7 +1237,7 @@ class AssistModelClient(BaseHTTPClient):
             else:
                 stat.consecutive_timeouts = 0
                 stat.observe_success(elapsed)
-        except Exception:  # noqa: BLE001 — 観測は応答パスを壊さない
+        except Exception:
             logger.debug("assist latency recording failed", exc_info=True)
 
     def _bump_calibrated_timeout(self, purpose: str, budget: float) -> None:

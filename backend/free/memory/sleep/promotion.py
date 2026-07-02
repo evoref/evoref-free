@@ -249,7 +249,7 @@ def promote_history_to_semmem(
 
         try:
             store = store_provider(scope_str)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "Step 9 promotion: failed to obtain store %s: %s",
                 scope_str, exc,
@@ -279,7 +279,7 @@ def promote_history_to_semmem(
         ]
         try:
             store.add_fact(fact)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "Step 9 promotion: failed to add fact for session %s: %s",
                 entry.session_id, exc,

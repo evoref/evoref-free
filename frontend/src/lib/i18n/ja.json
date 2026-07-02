@@ -389,7 +389,8 @@
 			"running": "再構築中…",
 			"cancel": "キャンセル",
 			"done": "再構築完了: RAG {rag} / カートリッジ {cart} / メモリ {mem} ノート（{sec}秒）",
-			"still_mismatch": "次元不一致が残っています"
+			"still_mismatch": "次元不一致が残っています",
+			"cart_failed": "カートリッジの再構築に失敗しました: {ids}。再実行が必要です"
 		},
 		"reembed": {
 			"preview": "fact 再embed（プレビュー）",
@@ -398,7 +399,8 @@
 			"run": "再embed を実行",
 			"running": "再embed 中…",
 			"cancel": "キャンセル",
-			"done": "fact 再embed 完了: {n} 件（{sec}秒）"
+			"done": "fact 再embed 完了: {n} 件（{sec}秒）",
+			"restart_note": "埋め込みモデルが変わったため manifest を切替え fact を再embedしました。live リコールに新ベクトルを反映するには backend を再起動してください。"
 		},
 		"threshold": {
 			"hint": "埋め込みモデル切替後の検索閾値を調整します（先に reindex を実行）。",

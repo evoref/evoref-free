@@ -43,7 +43,7 @@ _logger = get_logger("structlog_config")
 
 
 def _trace_id_processor(
-    logger: WrappedLogger, method_name: str, event_dict: EventDict
+    logger: WrappedLogger, method_name: str, event_dict: EventDict  # noqa: ARG001
 ) -> EventDict:
     """``contextvars.ContextVar`` ベースの trace_id を event_dict 先頭に挿入する。
 
@@ -147,7 +147,7 @@ def _redact_value(key: str, value: Any) -> Any:
 
 
 def _redaction_processor(
-    logger: WrappedLogger, method_name: str, event_dict: EventDict
+    logger: WrappedLogger, method_name: str, event_dict: EventDict  # noqa: ARG001
 ) -> EventDict:
     """event_dict 全体に redaction を適用する。"""
     return {k: _redact_value(k, v) for k, v in event_dict.items()}
@@ -159,7 +159,7 @@ def _redaction_processor(
 
 
 def _jsonl_renderer(
-    logger: WrappedLogger, method_name: str, event_dict: EventDict
+    logger: WrappedLogger, method_name: str, event_dict: EventDict  # noqa: ARG001
 ) -> str:
     """structlog の event_dict を JSONL 1 行 (``str``) に変換する。
 
@@ -317,7 +317,7 @@ _CURRENT_SCHEMA_VERSION = 1
 
 
 def _schema_version_processor(
-    logger: WrappedLogger, method_name: str, event_dict: EventDict
+    logger: WrappedLogger, method_name: str, event_dict: EventDict  # noqa: ARG001
 ) -> EventDict:
     """全 JSONL エントリに ``schema_version`` を付与する
 

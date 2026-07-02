@@ -212,7 +212,7 @@ async def probe_model_capabilities(
         reasoning_separated, emits_think, closes_think = interpret_reasoning_probe(
             _message_of(resp),
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("capability probe P1/P2 failed (prior fallback): %s", exc)
 
     # P3: json_schema grammar 強制 (json purpose を持つ assist モデルのみ)
@@ -229,7 +229,7 @@ async def probe_model_capabilities(
             )
             content = _message_of(resp).get("content") or ""
             json_enforced = interpret_json_probe(content)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("capability probe P3 failed (prior fallback): %s", exc)
 
     effective_mode, divergence = resolve_effective_reasoning_mode(

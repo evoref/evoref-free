@@ -393,7 +393,7 @@ async def _run_command_async_impl(cmd: str, timeout: int = 30) -> str:
     """
     global _last_full_output, _last_full_output_lines
     try:
-        proc = subprocess.Popen(  # noqa: S602  # shell=True は設計上必要
+        proc = subprocess.Popen(  # shell=True は設計上必要
             cmd,
             shell=True,
             stdout=subprocess.PIPE,
@@ -482,7 +482,7 @@ def _strip_html_fallback(html: str) -> str:
             self._result: list[str] = []
             self._skip_depth = 0  # スキップ中のタグのネスト深度
 
-        def handle_starttag(self, tag: str, attrs):
+        def handle_starttag(self, tag: str, attrs):  # noqa: ARG002
             if tag.lower() in _STRIP_TAGS:
                 self._skip_depth += 1
 
@@ -611,7 +611,7 @@ def _select_main_root(soup):
     for sel in _MAIN_CONTENT_SELECTORS:
         try:
             el = soup.select_one(sel)
-        except Exception:  # noqa: BLE001 — 不正セレクタ等は無視
+        except Exception:
             el = None
         if el is not None and len(el.get_text(strip=True)) >= 200:
             return el
@@ -633,7 +633,7 @@ def _prune_link_dense_blocks(root) -> None:
             link_len = sum(len(a.get_text(strip=True)) for a in links)
             if link_len / max(len(text), 1) >= _LINK_DENSITY_THRESHOLD:
                 el.decompose()
-        except Exception:  # noqa: BLE001 — 個別要素の失敗は無視して継続
+        except Exception:
             continue
 
 
@@ -667,7 +667,7 @@ def _flatten_tables(root) -> None:
                 if idx == 0:
                     md_lines.append("| " + " | ".join(["---"] * ncol) + " |")
             table.replace_with("\n" + "\n".join(md_lines) + "\n")
-        except Exception:  # noqa: BLE001
+        except Exception:
             continue
 
 
@@ -685,7 +685,7 @@ def _extract_main_content(html: str) -> str:
     for el in soup.find_all(_has_boilerplate_attr):
         try:
             el.decompose()
-        except Exception:  # noqa: BLE001
+        except Exception:
             continue
     root = _select_main_root(soup)
     _prune_link_dense_blocks(root)
@@ -708,7 +708,7 @@ def _html_to_text(html: str) -> str:
         return naive
     try:
         improved = _extract_main_content(html)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("fetch_url heuristic extraction failed (%r); using naive", e)
         return naive
     if not improved.strip():

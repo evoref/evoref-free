@@ -215,7 +215,7 @@ def make_loop_artifact_hook(
             return
         try:
             view = view_provider(project_id)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "artifact_hook: view lookup failed project=%s: %s",
                 project_id, exc,

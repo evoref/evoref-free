@@ -161,7 +161,7 @@ class WorkspaceManager:
         try:
             shutil.rmtree(self.root, ignore_errors=True)
             logger.info("staged workspace cleaned up: %s", self.root)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("staged workspace cleanup failed: %s", exc)
 
     # ── spec ──────────────────────────────────────────────────────────

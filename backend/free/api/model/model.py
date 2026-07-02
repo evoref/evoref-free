@@ -33,6 +33,7 @@ from backend.free.api.schemas import (
 from backend.app_state import AppState, get_app_state
 from backend.config import get_config, get_path_resolver, resolve_context_size
 from backend.edition import get_pro_handler
+from backend.i18n_helper import msg
 from backend.log_config import get_logger
 
 logger = get_logger("api.model")
@@ -303,8 +304,13 @@ async def migrate_component(
 
     recommendations = result.recommendations
     if restarted:
+        # llama-server の再起動+rebind は完了。ただし embedding 切替では RAG
+        # reindex / SemMem reembed 手順が残るため、元リスト先頭の「再起動が必要」
+        # だけ「完了」に置換し後続手順は残す (auto_restart 成功時に reindex/reembed
+        # の案内が丸ごと消えていた不具合の修正)。
         recommendations = [
             f"{component} モデルの再起動とクライアント差し替えが完了しました",
+            *result.recommendations[1:],
         ]
 
     return ComponentMigrateResponse(
@@ -337,7 +343,7 @@ async def _restart_and_rebind(
             "Component restart + rebind succeeded: %s", component,
         )
         return True
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.error(
             "Component restart/rebind failed for %s: %s — rolling back",
             component, e,
@@ -349,12 +355,12 @@ async def _restart_and_rebind(
                 manager.restart(component, cfg_after)
                 from backend.free.core.component_rebind import rebind_component
                 await rebind_component(component, state, cfg_after)
-            except Exception as recover_err:  # noqa: BLE001
+            except Exception as recover_err:
                 logger.error(
                     "Rollback restart also failed for %s: %s",
                     component, recover_err,
                 )
-        except Exception as rb_err:  # noqa: BLE001
+        except Exception as rb_err:
             logger.error(
                 "rollback_component failed for %s: %s", component, rb_err,
             )
@@ -550,11 +556,25 @@ async def reembed_facts(
     埋め込みモデル切替後、SemMem fact ベクトルは旧モデル空間に取り残され
     ``search_by_embedding`` (URL/コマンドリコール) が空振りする。RAG reindex
     (``/api/rag/reindex``) は SemMem fact を対象外とするため本エンドポイントが
-    補完する。稼働中の **live global store を in-place で更新** するので mem_view も
-    同一オブジェクトを参照しており **再起動不要**。
+    補完する。2 経路:
 
-    次元が変わる切替 (dim mismatch) は in-place 上書き不可のため CLI
-    ``evorefmem_cli reembed-facts --apply`` (新 model_id dir を作る) へ誘導する。
+    - **同一モデルでの再埋め込み**: 稼働中の live global store を in-place 更新
+      するので mem_view も同一オブジェクトを参照しており **再起動不要**。
+    - **モデル変更を伴う切替** (model_id 変化 or dim 変化): CLI ``reembed-facts
+      --apply`` と同一の cross-model swap (``apply_reembed_swap``) を実行する。
+      全 scope に新 model_id ディレクトリを作成 → manifest を atomic swap → 全
+      scope の fact を新モデルで再埋め込み → stale マーカー解除。RAG Reindex
+      ボタンがモデル変更込みで自己回復するのと対称。ただし稼働中バックエンドの
+      Fact View は旧 store 参照を保持するため、**live リコールの反映には backend
+      再起動が必須** で ``restart_required: True`` を返す (キャッシュ層は
+      ``invalidate_semantic_stores`` で破棄するが View 再バインドは行わない)。
+      なお再起動までの間に SemMem 書込み (SleepTimeWorker auto-merge / artifact
+      fact / conflict resolution) が発生すると旧 model_id dir へ書かれ再起動後に
+      孤立し得るため、cross-model 切替後は速やかに再起動すること (live View 再
+      バインドによる完全な再起動レス化は今後の課題)。
+
+    いずれの経路でも、embed サーバが新モデルへ未切替 (config と不一致) の場合は
+    409 で拒否する (旧モデル空間で再embedしてマーカーまで消す順序依存の罠を防ぐ)。
 
     Query params:
         dry_run: True なら対象 fact 数だけ返して実行しない。
@@ -565,47 +585,142 @@ async def reembed_facts(
     import numpy as np
 
     from backend.free.memory.semantic.cli._paths import cli_backup_root
-    from backend.free.memory.semantic.manifest import update_manifest
+    from backend.free.memory.semantic.cli.reembed_facts_cmd import (
+        apply_reembed_swap,
+        collect_reembed_targets,
+    )
+    from backend.free.memory.semantic.manifest import (
+        load_manifest,
+        normalize_embedding_model_id,
+        update_manifest,
+    )
     from backend.free.memory.semantic.stale_guard import (
         clear_semmem_reembed_required,
     )
+    from backend.free.rag.dimension_check import embedder_config_mismatch
     from backend.utils import utc_now
 
     if state.embedder is None:
         raise HTTPException(status_code=503, detail="Embedder not initialized")
 
+    resolver = get_path_resolver()
+    memory_dir = resolver.resolve_local("memory_dir")
+    manifest = load_manifest(memory_dir)
+    manifest_model_id = manifest.embedding.model_id if manifest else ""
+    manifest_dim = manifest.embedding.dim if manifest else None
+
+    try:
+        expected_model_id = normalize_embedding_model_id(
+            str(state.embedder.model_name() or ""),
+        )
+    except Exception:
+        expected_model_id = ""
+    try:
+        embedder_dim = int(state.embedder.dim())
+    except Exception:
+        embedder_dim = manifest_dim or 0
+
+    # モデル変更 (model_id 変化 or dim 変化) を検知。どちらかが変われば
+    # cross-model swap (新 model_id dir + manifest swap) が必要。
+    model_id_changed = bool(
+        manifest_model_id
+        and expected_model_id
+        and manifest_model_id != expected_model_id
+    )
+    dim_changed = (
+        manifest_dim is not None
+        and embedder_dim > 0
+        and manifest_dim != embedder_dim
+    )
+
+    if model_id_changed or dim_changed:
+        # ── cross-model: 全 scope を新モデルで再embed + manifest swap ──
+        targets = collect_reembed_targets(memory_dir, manifest)
+        if dry_run:
+            return {
+                "dry_run": True,
+                "fact_count": len(targets),
+                "model_changed": True,
+                "new_model_id": expected_model_id or None,
+            }
+        # embed サーバが新モデルへ未切替なら拒否 (順序依存の罠)。
+        stale = embedder_config_mismatch(state)
+        if stale is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=msg(
+                    "error.rag.stale_embedder",
+                    current=stale[0], expected=stale[1],
+                ),
+            )
+        if not expected_model_id:
+            raise HTTPException(
+                status_code=500,
+                detail="cannot resolve new embedding model_id from embedder",
+            )
+        objs = [t[3] for t in targets]
+        t0 = time.monotonic()
+        vectors = (
+            await state.embedder.embed(objs, is_query=False) if objs else []
+        )
+        elapsed = time.monotonic() - t0
+        # LlamaCppEmbedder.embed は常に L2 正規化して返すため normalized=True。
+        # (旧 manifest の normalized を引き継ぐと、新モデルの実挙動とラベルが
+        # 乖離しうる。CLI 側も normalized=True 既定。)
+        try:
+            reembedded, _backup = apply_reembed_swap(
+                memory_dir,
+                resolver.resolve_local("migration_archive_dir"),
+                targets, vectors,
+                new_model_id=expected_model_id, new_dim=embedder_dim,
+                normalized=True,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        # 稼働中バックエンドのキャッシュ store を破棄 (次回 get で新 manifest 再ロード)。
+        state.invalidate_semantic_stores()
+        logger.info(
+            "reembed-facts (cross-model): manifest %s -> %s, reembedded %d "
+            "in %.2fs (backend restart REQUIRED for live recall)",
+            manifest_model_id or "?", expected_model_id, reembedded, elapsed,
+        )
+        return {
+            "dry_run": False,
+            "reembedded": reembedded,
+            "fact_count": reembedded,
+            "elapsed_sec": round(elapsed, 2),
+            "model_changed": True,
+            "new_model_id": expected_model_id,
+            "restart_required": True,
+        }
+
+    # ── same-model: live global store を in-place 更新 (再起動不要) ──
     store = state.get_semantic_store("global")
     live_facts = store.all_facts(include_superseded=False)
-    targets = [
+    targets_g = [
         (f.id, (f.object or "").strip())
         for f in live_facts
         if f.embedding is not None and (f.object or "").strip()
     ]
     if dry_run:
-        return {"dry_run": True, "fact_count": len(targets)}
+        return {"dry_run": True, "fact_count": len(targets_g)}
 
-    if not targets:
+    if not targets_g:
         return {"dry_run": False, "reembedded": 0, "fact_count": 0}
 
-    embedder_dim = int(state.embedder.dim())
-    current_dim = next(
-        (int(f.embedding.shape[0]) for f in live_facts if f.embedding is not None),
-        None,
-    )
-    if current_dim is not None and current_dim != embedder_dim:
+    # migrate 直後で embedder が旧モデルのまま実行すると、旧モデル空間で
+    # 再埋め込みしてマーカーまでクリアしてしまう (順序依存の罠)。embed
+    # サーバ再起動 + embedder reload が済むまで実行を拒否する。
+    stale = embedder_config_mismatch(state)
+    if stale is not None:
         raise HTTPException(
             status_code=409,
-            detail=(
-                f"embedding dim changed (stored={current_dim}, "
-                f"current={embedder_dim}); in-place reembed not possible. Run "
-                "'python scripts/evorefmem_cli.py reembed-facts --apply' "
-                "(creates a new model_id dir)."
+            detail=msg(
+                "error.rag.stale_embedder", current=stale[0], expected=stale[1],
             ),
         )
 
     # 上書き前に現在の埋め込みベクトルを backup する (rollback 用)。
-    resolver = get_path_resolver()
-    memory_dir = resolver.resolve_local("memory_dir")
     try:
         backup_root = cli_backup_root(
             resolver.resolve_local("migration_archive_dir"), "reembed_facts_api",
@@ -615,10 +730,10 @@ async def reembed_facts(
             shutil.copytree(
                 emb_dir, backup_root / "embeddings", dirs_exist_ok=True,
             )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("reembed-facts: backup skipped: %s", exc)
 
-    objs = [t[1] for t in targets]
+    objs = [t[1] for t in targets_g]
     t0 = time.monotonic()
     vectors = await state.embedder.embed(objs, is_query=False)
     if len(vectors) != len(objs):
@@ -626,7 +741,7 @@ async def reembed_facts(
             status_code=500,
             detail=f"embedder returned {len(vectors)} vectors for {len(objs)} texts",
         )
-    for (fid, _), vec in zip(targets, vectors):
+    for (fid, _), vec in zip(targets_g, vectors):
         arr = np.asarray(vec, dtype=np.float32).reshape(-1)
         if arr.shape[0] != embedder_dim:
             raise HTTPException(
@@ -638,18 +753,18 @@ async def reembed_facts(
 
     try:
         update_manifest(memory_dir, last_migrated_at=utc_now())
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("reembed-facts: manifest stamp skipped: %s", exc)
     clear_semmem_reembed_required(memory_dir=memory_dir)
 
     logger.info(
         "reembed-facts: reembedded %d SemMem facts in %.2fs",
-        len(targets), elapsed,
+        len(targets_g), elapsed,
     )
     return {
         "dry_run": False,
-        "reembedded": len(targets),
-        "fact_count": len(targets),
+        "reembedded": len(targets_g),
+        "fact_count": len(targets_g),
         "elapsed_sec": round(elapsed, 2),
     }
 

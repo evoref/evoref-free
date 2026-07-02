@@ -47,6 +47,7 @@ E1003 = "E1003"  # 不正レスポンス
 E1004 = "E1004"  # モデルファイル不在
 E1005 = "E1005"  # LoRA アダプタ不在
 E1006 = "E1006"  # プロセス異常終了
+E1007 = "E1007"  # リクエスト拒否（コンテンツ起因）
 
 # ファイルシステム (E3xxx)
 E3001 = "E3001"  # ベクトルインデックス破損 (index_q8.npy / scales.npy)
@@ -116,6 +117,7 @@ def handle_llama_error(code: str, **context) -> JSONResponse:
         E1003: (502, "error.llama.invalid_response", "llama.cpp returned invalid response: {detail}"),
         E1004: (503, "error.llama.model_not_found", "GGUF model file not found: {path}"),
         E1006: (503, "error.llama.process_crashed", "llama.cpp process exited unexpectedly"),
+        E1007: (400, "error.llama.request_rejected", "llama.cpp rejected request: {detail}"),
     }
     return _lookup_mapping(mapping, code, "llama", **context)
 
@@ -194,7 +196,7 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(EvorefError)
     async def evoref_error_handler(
-        request: Request, exc: EvorefError,
+        request: Request, exc: EvorefError,  # noqa: ARG001
     ) -> JSONResponse:
         """EvorefError 派生例外を構造化形式で返す"""
         user_message = msg(exc.i18n_key, **exc.context) if exc.i18n_key else str(exc)

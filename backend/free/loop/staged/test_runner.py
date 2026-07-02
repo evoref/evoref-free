@@ -29,7 +29,6 @@ from __future__ import annotations
 import re
 import sys
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from backend.free.harness.action import RunCommandAction
 from backend.free.loop.action_runner import ActionRunner, ActionRunnerConfig

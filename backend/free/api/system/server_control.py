@@ -310,7 +310,7 @@ def stop_server_process(
             if mgr.get_entry(component) is not None:
                 mgr.stop(component)
                 return (True, "stopped (process manager)")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning(
                 "server_control: process_manager stop failed for %s: %s", name, e,
             )
@@ -350,7 +350,7 @@ async def start_server_process(name: ServerName, cfg: dict) -> tuple[bool, str]:
     result = _build_cmd(name, cfg, _find_project_root())
     if result is None:
         return (False, "not configured")
-    _, host, port = result
+    cmd, host, port = result
 
     # 既に起動済み (外部起動 / 別経路) なら spawn しない
     if await _check_health(host, port):
@@ -359,14 +359,21 @@ async def start_server_process(name: ServerName, cfg: dict) -> tuple[bool, str]:
     if existing and existing.proc.poll() is None:
         return (True, "already running")
 
+    import asyncio
+
+    # 旧プロセスの graceful shutdown 残響で wait_for_health が旧プロセスの
+    # 200 を拾う窓を潰す (mode.py の base 切替と同じパターン)。
+    await asyncio.to_thread(wait_port_released, name, cfg, 10.0)
+
     managed = _spawn_server(name, cfg)
     if managed is None:
         return (False, "not configured")
 
-    import asyncio
-    from scripts.launch_llama import wait_for_health
+    from scripts.launch_llama import wait_for_health, _extract_model_basename
+    health_timeout = int((cfg.get("process_manager") or {}).get("health_timeout", 120))
     healthy = await asyncio.to_thread(
-        wait_for_health, managed.host, managed.port, 30,
+        wait_for_health, managed.host, managed.port, health_timeout,
+        _extract_model_basename(cmd),
     )
     if healthy:
         return (True, "started")
@@ -418,9 +425,12 @@ async def start_server(
             )
 
     # 既にポートで起動中かチェック
+    import asyncio
+
     result = _build_cmd(name, cfg, _find_project_root())
+    cmd = None
     if result is not None:
-        _, host, port = result
+        cmd, host, port = result
         if await _check_health(host, port):
             if force:
                 # --force: ポート占有プロセスを kill して再起動
@@ -429,8 +439,7 @@ async def start_server(
                 occ = find_port_occupant(port)
                 if occ:
                     kill_port_occupants([occ])
-                    import asyncio
-                    await asyncio.sleep(1)
+                    # port 解放待ちは下の wait_port_released に一本化
             else:
                 # 外部起動済み — 遅延接続を試みる
                 await _try_reconnect(name, state, cfg)
@@ -439,6 +448,11 @@ async def start_server(
                     message="already healthy, reconnected",
                 )
 
+    # 旧プロセスの graceful shutdown 残響で wait_for_health が旧プロセスの
+    # 200 を拾う窓を潰す (mode.py の base 切替と同じパターン)。force=False
+    # で外部起動済みプロセスが無い場合も no-op で安全。
+    await asyncio.to_thread(wait_port_released, name, cfg, 10.0)
+
     managed = _spawn_server(name, cfg)
     if managed is None:
         return ServerActionResponse(
@@ -446,11 +460,13 @@ async def start_server(
             message="not configured",
         )
 
-    # ヘルスチェック待機（最大30秒、ブロッキング関数をスレッドで実行）
-    import asyncio
-    from scripts.launch_llama import wait_for_health
+    # ヘルスチェック待機。expected_model_id で /props の load 済みモデルまで
+    # 検証し、旧プロセス残響の誤 ready 判定を防ぐ。
+    from scripts.launch_llama import wait_for_health, _extract_model_basename
+    health_timeout = int((cfg.get("process_manager") or {}).get("health_timeout", 120))
     healthy = await asyncio.to_thread(
-        wait_for_health, managed.host, managed.port, 30,
+        wait_for_health, managed.host, managed.port, health_timeout,
+        _extract_model_basename(cmd) if cmd else None,
     )
 
     if healthy:

@@ -599,7 +599,7 @@ def render_diff_result(console: Console, success: bool, message: str) -> None:
             console.print(f"[bold red]Error:[/bold red] {message}")
 
 
-def render_diff_prompt_path(console: Console) -> str:
+def render_diff_prompt_path(console: Console) -> str:  # noqa: ARG001
     """diff のファイルパスが不明な場合にユーザーに尋ねる"""
     from backend.i18n_helper import msg
     try:
@@ -609,6 +609,6 @@ def render_diff_prompt_path(console: Console) -> str:
         return ""
 
 
-def format_prompt(*, no_color: bool = False) -> str:
+def format_prompt(*, no_color: bool = False) -> str:  # noqa: ARG001
     """プロンプト文字列を生成"""
     return _cli_theme.prompt_marker

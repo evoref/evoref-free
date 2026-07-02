@@ -162,7 +162,7 @@ class ChunkContentGate:
             result = await self._run(
                 query, merged, mode, assist_client, tracker, session_id,
             )
-        except Exception as e:  # noqa: BLE001 — ゲートは応答パスを止めない
+        except Exception as e:
             logger.warning(
                 "chunk content gate failed, returning merged unchanged: %s", e,
             )
@@ -312,7 +312,7 @@ class ChunkContentGate:
         except (TimeoutError, asyncio.TimeoutError):
             result.assist_skipped_reason = "timeout"
             return set(prose_idx)
-        except Exception as e:  # noqa: BLE001 — ゲートは応答パスを止めない
+        except Exception as e:
             logger.debug("content gate assist failed: %s", e)
             result.assist_skipped_reason = "error"
             return set(prose_idx)

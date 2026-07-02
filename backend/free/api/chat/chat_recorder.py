@@ -69,7 +69,7 @@ def _loaded_cartridge_ids(state: AppState) -> list[str]:
 
 
 def _save_session_to_history(
-    state: AppState, session_id: str, mode: str,
+    state: AppState, session_id: str, mode: str,  # noqa: ARG001
 ) -> None:
     """蓄積した全ターンを HistoryManager で保存する
 

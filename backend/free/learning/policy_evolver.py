@@ -228,7 +228,7 @@ class PolicyParamEvolver(JsonStateStore):
         new_value,
         fitness: float,
         sigma: float,
-        phase: str,
+        phase: str,  # noqa: ARG002
         *,
         rollback: bool = False,
     ) -> SemanticFact | None:
@@ -517,7 +517,7 @@ class PolicyParamEvolver(JsonStateStore):
             return base
         try:
             rate = self._semmem_success_provider(domain, mode)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "semmem_success_provider failed (domain=%s mode=%s): %s",
                 domain, mode, exc,

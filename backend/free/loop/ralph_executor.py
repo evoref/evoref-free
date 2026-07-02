@@ -125,7 +125,7 @@ class RalphExecutor:
                 max_tokens=max_tokens,
                 purpose=self.purpose,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "RalphExecutor: assist generate failed for task=%s: %s",
                 task.task_id, exc,
@@ -208,7 +208,7 @@ class RalphExecutor:
                 gate_outcome = await asyncio.to_thread(
                     run_quality_gates, list(self.quality_gates),
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     "RalphExecutor: quality_gates failed to run: %s", exc,
                 )
@@ -251,7 +251,7 @@ class RalphExecutor:
             return None
         try:
             result = self.policy_provider(self.mode)  # type: ignore[operator]
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.debug("policy_provider lookup failed: %s", exc)
             return None
         if isinstance(result, dict):

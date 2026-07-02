@@ -603,7 +603,7 @@ def _build_meta_cognitive_agent_runner(
                 output_target=output_target,
             )
             result_holder["resp"] = resp
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             result_holder["error"] = e
         finally:
             await step_queue.put(None)
@@ -1806,7 +1806,7 @@ async def sync_deliberative(
     rag_used: bool = False,
     rag_top1_score: float | None = None,
     tool_judge_task: "asyncio.Task | None" = None,
-    escalated_from: str | None = None,
+    escalated_from: str | None = None,  # noqa: ARG001
 ) -> ChatResponse:
     """Deliberative 層の非ストリーミング応答 (escalated_from は API 一貫性用、未使用)"""
     logger.debug("Sync deliberative: session=%s, messages=%d", session_id, len(messages))
@@ -2151,7 +2151,7 @@ async def _staged_write_file(
         return str(await registry.execute(
             "write_file", file_path=logical_path, content=body,
         ))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("staged write_file failed for %s: %s", logical_path, exc)
         return None
 
@@ -2189,7 +2189,7 @@ def _staged_postprocess(
                 if c and c != out.get(p):
                     out[p] = c
                     wired_paths.append(p)
-        except Exception as exc:  # noqa: BLE001 — 配線失敗は無視 (advisory check は実施)
+        except Exception as exc:
             logger.warning("staged finalize wire_imports failed: %s", exc)
     final_py = {p: c for p, c in out.items() if p.endswith(".py")}
     issues: list[str] = []
@@ -2199,7 +2199,7 @@ def _staged_postprocess(
     for fn in (check_coherence, check_entrypoint, check_cross_module_imports):
         try:
             issues += list(fn(final_py))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("staged finalize %s failed: %s", fn.__name__, exc)
     return out, issues, sorted(wired_paths)
 
@@ -2218,7 +2218,7 @@ async def _staged_import_smoke(code_map: dict[str, str], timeout_sec: float) -> 
     from backend.free.generation.smoke_validator import run_import_smoke
     try:
         res = await asyncio.to_thread(run_import_smoke, py_map, timeout_sec)
-    except Exception as exc:  # noqa: BLE001 — スモーク失敗は検証不能=error 無し扱い
+    except Exception as exc:
         logger.warning("staged finalize import smoke failed: %s", exc)
         return []
     return [str(e) for e in (getattr(res, "errors", None) or [])]
@@ -2312,7 +2312,7 @@ async def stream_staged_coding(
                 task_id=tv.task_id, title=tv.title, stage=tv.stage or "code",
                 status="open", depends_on=tv.depends_on,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("staged coding: failed to register task: %s", exc)
     yield sse.step({
         "type": "long_form_plan",
@@ -2345,7 +2345,7 @@ async def stream_staged_coding(
         for fn in (check_coherence, check_entrypoint, check_cross_module_imports):
             try:
                 extra_errors += list(fn(files))
-            except Exception as exc:  # noqa: BLE001 — 静的検査失敗は無視 (import ゲートは実施済)
+            except Exception as exc:
                 logger.debug("staged static gate %s failed: %s", fn.__name__, exc)
         if extra_errors:
             result.errors = list(result.errors) + extra_errors
@@ -2354,7 +2354,7 @@ async def stream_staged_coding(
                 ent = run_entry_smoke(files, timeout_sec=entry_exec_timeout)
                 if getattr(ent, "warnings", None):
                     result.warnings = list(result.warnings) + list(ent.warnings)
-            except Exception as exc:  # noqa: BLE001 — advisory なので失敗は無視
+            except Exception as exc:
                 logger.debug("staged entry exec smoke failed: %s", exc)
         return result
 
@@ -2415,7 +2415,7 @@ async def stream_staged_coding(
             await run_task
         except asyncio.CancelledError:
             pass
-        except Exception as exc:  # noqa: BLE001 — driver-level fault は可観測にする
+        except Exception as exc:
             logger.warning("staged coding run task failed: %s", exc)
 
     async for frame in _finalize_staged_stream(
@@ -2443,7 +2443,7 @@ async def _finalize_staged_stream(
     context_size: int,
     output_target: str,
     timer: StageTimer | None,
-    t_start: float,
+    t_start: float,  # noqa: ARG001
     private: bool,
     smoke_timeout: float = 120.0,
 ) -> AsyncIterator[str]:
@@ -2485,7 +2485,7 @@ async def _finalize_staged_stream(
                 "coherence_issues": runnability_issues[:20],
                 "tasks_failed": tasks_failed,
             })
-        except Exception as exc:  # noqa: BLE001 — 可測化ログ失敗で配信を止めない
+        except Exception as exc:
             logger.debug("staged coherence long_form log failed: %s", exc)
     if tasks_failed:
         yield sse.step({
@@ -2526,7 +2526,7 @@ async def _finalize_staged_stream(
             state, assembled, messages, session_id, query, "coding",
             _estimate_tokens(assembled), staged_metrics, private=private,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("staged: record_long_form_response failed: %s", exc)
 
     if not code_map:

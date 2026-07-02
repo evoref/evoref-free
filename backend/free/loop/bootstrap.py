@@ -164,17 +164,17 @@ def reset_episodic_context(
     wm_evicted_dropped = 0
     if wm is not None:
         wm_turns_dropped = len(wm.turns)
-        wm_evicted_dropped = len(wm._evicted)  # noqa: SLF001
+        wm_evicted_dropped = len(wm._evicted)
         wm.turns.clear()
-        wm._evicted.clear()  # noqa: SLF001
+        wm._evicted.clear()
         wm.active_notes.clear()
 
     stm_notes_dropped = 0
     if stm is not None:
         stm_notes_dropped = len(stm.notes)
         stm.notes.clear()
-        stm._cache.clear()  # noqa: SLF001
-        stm._cache_dirty = True  # noqa: SLF001
+        stm._cache.clear()
+        stm._cache_dirty = True
 
     report = ResetReport(
         triggered_by=triggered_by,

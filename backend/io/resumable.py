@@ -296,7 +296,7 @@ class ResumableProcessor(Generic[T, R]):
                     r = await self._process(item)
                 except asyncio.CancelledError:
                     raise
-                except BaseException as e:  # noqa: BLE001 — record any failure
+                except BaseException as e:
                     result.failed.append((key, e))
                     self._record(
                         CheckpointEntry(
@@ -371,7 +371,7 @@ class ResumableProcessor(Generic[T, R]):
             return
         try:
             self._checkpoint.record(entry)
-        except Exception as cp_err:  # noqa: BLE001 — checkpoint failure must not break batch
+        except Exception as cp_err:
             logger.warning(
                 "ResumableProcessor[%s]: checkpoint record(%s) failed: %s",
                 self._job_id, entry.status, cp_err,
@@ -384,7 +384,7 @@ class ResumableProcessor(Generic[T, R]):
             await self._on_progress(emitted, total)
         except asyncio.CancelledError:
             raise
-        except Exception as prog_err:  # noqa: BLE001
+        except Exception as prog_err:
             logger.warning(
                 "ResumableProcessor[%s]: on_progress failed: %s",
                 self._job_id, prog_err,
@@ -395,5 +395,5 @@ class ResumableProcessor(Generic[T, R]):
             return
         try:
             self._debug_logger.log_memory_op(op, stats)
-        except Exception as log_err:  # noqa: BLE001
+        except Exception as log_err:
             logger.warning("DebugLogger.log_memory_op failed: %s", log_err)

@@ -344,7 +344,7 @@ class LogIngestor:
         while not self._stop_event.is_set():
             try:
                 await self._poll_once()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 # disk full / permission error 等。ログだけ出して continue。
                 logger.warning(
                     "LogIngestor poll failed (will backoff %ss): %s",
@@ -382,11 +382,6 @@ class LogIngestor:
             await self._read_new_lines(path, "decision")
         for path in outcome_files:
             await self._read_new_lines(path, "outcome")
-
-        # ローテーション検出: ``.1`` 世代ファイルが offset 残存ならその末尾も読む
-        # (rotate が走った直後に未読領域が残っているケース)
-        await self._drain_rotated_generations(decision_files, "decision")
-        await self._drain_rotated_generations(outcome_files, "outcome")
 
         # orphan 判定 + flush
         await self._flush_orphans()
@@ -498,13 +493,6 @@ class LogIngestor:
                 self._stats["malformed_lines"] += 1
                 continue
             await self._handle_entry(category, entry, source_name)
-
-    async def _drain_rotated_generations(
-        self, current_files: list[Path], category: str,
-    ) -> None:
-        """旧 API 互換のため残置 (no-op)。inode ベースの rotation 検出に
-        統合済のため、補助走査は不要。"""
-        return
 
     async def _handle_entry(
         self, category: str, entry: dict[str, Any], source_file: str,

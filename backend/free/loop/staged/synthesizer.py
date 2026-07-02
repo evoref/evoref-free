@@ -157,7 +157,7 @@ async def synthesize_coding_task_graph(
     project_id: str,
     assist_client: "AssistModelClient | None",
     include_tests: bool = True,
-    debug_logger: "DebugLogger | None" = None,
+    debug_logger: "DebugLogger | None" = None,  # noqa: ARG001
 ) -> list[SemanticFact]:
     """コーディング要求を spec/code/test の task ファクト群へ分解する。
 
@@ -190,7 +190,7 @@ async def synthesize_coding_task_graph(
             temperature=0.3,
             telemetry=graph_telemetry,
         )
-    except Exception as exc:  # noqa: BLE001 — 失敗時は longform へフォールバック
+    except Exception as exc:
         logger.warning("coding_task_graph synthesis failed: %s", exc)
         return []
     # coarse plan は通常 1024 に収まるが、切断時はモジュール欠落の可能性を可視化。

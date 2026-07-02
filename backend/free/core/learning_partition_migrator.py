@@ -133,7 +133,7 @@ class LearningPartitionMigrator:
             counts["experience"] = self._migrate_experience(stem)
             counts["prompts"] = self._migrate_base_prompts(stem)
             counts["adapters"] = self._migrate_mode_blind_artifacts(stem)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # 移行失敗で起動を止めない。マーカーを書かず次回再試行する。
             logger.warning("Learning partition migration failed (will retry): %s", exc)
             return False

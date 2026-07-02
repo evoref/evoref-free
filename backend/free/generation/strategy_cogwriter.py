@@ -474,7 +474,7 @@ class CogWriterStrategy:
         instruction: str,
         context: dict,
         content_type: ContentType,
-        budget: TokenBudget,
+        budget: TokenBudget,  # noqa: ARG002
     ) -> GenerationPlan:
         """アシストモデルで計画を生成"""
         t0 = time.monotonic()
@@ -657,7 +657,7 @@ class CogWriterStrategy:
                     )
                     if isinstance(data_retry, dict) and data_retry:
                         data, spec_telemetry = data_retry, retry_tel
-                except Exception as e:  # noqa: BLE001 — 再合成失敗は元結果を維持
+                except Exception as e:
                     logger.warning("Code spec retry failed: %s", e)
                 # 再合成してもなお切断なら可視化する (欠落の可能性を残す)。
                 if spec_telemetry.get("truncated") and self._debug_logger:
@@ -669,7 +669,7 @@ class CogWriterStrategy:
                 logger.warning("Code spec synthesis returned non-dict; skipping")
                 return None
             spec = CodeSpec.model_validate(data)
-        except Exception as e:  # noqa: BLE001 — 合成失敗は従来挙動に倒す
+        except Exception as e:
             logger.warning("Code spec synthesis failed: %s", e)
             return None
 
@@ -715,7 +715,7 @@ class CogWriterStrategy:
             )
             if isinstance(data, dict):
                 return str(data.get("mermaid", "") or "")
-        except Exception as e:  # noqa: BLE001 — 合成失敗は無効化と同じ扱い
+        except Exception as e:
             logger.warning("Flowchart synthesis failed: %s", e)
         return ""
 
@@ -792,7 +792,7 @@ class CogWriterStrategy:
         self,
         issue: ReviewIssue,
         rolling: RollingContext,
-        content_type: ContentType,
+        content_type: ContentType,  # noqa: ARG002
     ) -> AsyncIterator[str]:
         """修正指示に基づくリライト（最大1回）"""
         if issue.unit_idx >= len(rolling.generated_units):

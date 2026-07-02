@@ -64,7 +64,7 @@ def _load_launch_llama(project_root: Path):
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("Failed to load launch_llama.py: %s", e)
         return None
 
@@ -134,7 +134,7 @@ def nvidia_smi_snapshot(timeout_sec: float = 3.0) -> dict[int, int] | None:
         "--format=csv,noheader,nounits",
     ]
     try:
-        proc = subprocess.run(  # noqa: S603
+        proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
@@ -168,7 +168,7 @@ def _get_managed_pids(
         component = _MODEL_TO_COMPONENT[model_name]
         try:
             entry = process_manager.get_entry(component)
-        except Exception:  # noqa: BLE001
+        except Exception:
             entry = None
         if entry is None or entry.proc is None:
             continue
@@ -243,7 +243,7 @@ def collect_vram_status(
             estimates = mod.estimate_vram_usage_mb(
                 cfg, project_root, prefer_fit_params=False,
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("estimate_vram_usage_mb failed: %s", e)
             estimates = {
                 name: {

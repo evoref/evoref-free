@@ -606,7 +606,7 @@ class ModelMigrator:
         self.model_state.save()
 
         result.recommendations = self._build_component_recommendations(
-            component, dry_run=False,
+            component, dry_run=False, model_changed=old_filename != new_filename,
         )
         logger.info(
             "Component migration completed: %s: %s -> %s",
@@ -682,13 +682,13 @@ class ModelMigrator:
         params: dict = {}
         try:
             from scripts.launch_llama import load_model_profile, read_gguf_metadata
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("embed config sync: launch_llama import failed: %s", exc)
             return params
 
         try:
             meta = read_gguf_metadata(resolved_path)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "embed config sync: GGUF read failed for %s: %s", resolved_path, exc,
             )
@@ -708,7 +708,7 @@ class ModelMigrator:
         arch = meta.get("architecture")
         try:
             profile = load_model_profile(arch, self.project_root) if arch else {}
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "embed config sync: profile load failed for arch %r: %s", arch, exc,
             )
@@ -800,17 +800,29 @@ class ModelMigrator:
         )
 
     def _build_component_recommendations(
-        self, component: str, *, dry_run: bool,
+        self, component: str, *, dry_run: bool, model_changed: bool = True,
     ) -> list[str]:
         if dry_run:
             return [
                 "ドライラン完了。--dry-run を外して実行すると切替が反映されます",
             ]
-        return [
+        recs = [
             f"{component} モデルの llama-server 再起動が必要です。"
             "process_manager.enabled=true で自動再起動されます "
-            "(無効時は手動再起動、または POST /api/model/process/{component}/restart)",
+            f"(無効時は手動再起動、または POST /api/model/process/{component}/restart)",
         ]
+        if component == "embedding" and model_changed:
+            recs.append(
+                "RAG ベクトルストアの再構築も必要です。'evoref reindex' "
+                "(または POST /api/rag/reindex) を実行してください。"
+                "実行するまで検索結果は信頼できません。",
+            )
+            recs.append(
+                "SemMem ファクトの埋め込みも再構築が必要です。"
+                "'python scripts/evorefmem_cli.py reembed-facts --apply' "
+                "を実行してください。",
+            )
+        return recs
 
     # ── 内部メソッド ──
 

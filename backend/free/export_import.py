@@ -261,7 +261,7 @@ class ImportManager:
         zf: zipfile.ZipFile,
         category: str,
         mode: str,
-        manifest: ExportManifest,
+        manifest: ExportManifest,  # noqa: ARG002
     ) -> dict:
         """カテゴリ単位のインポート"""
         result = {

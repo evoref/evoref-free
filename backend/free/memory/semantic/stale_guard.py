@@ -41,7 +41,7 @@ def _resolve_memory_dir() -> Path | None:
         from backend.config import get_path_resolver
 
         return get_path_resolver().resolve_local("memory_dir")
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -70,11 +70,12 @@ def set_semmem_reembed_required(
         )
         logger.info(
             "SemMem reembed marker set (embed model -> %s); fact vectors are "
-            "stale. Run 'python scripts/evorefmem_cli.py reembed-facts --apply' "
-            "to rebuild URL/command recall vectors.",
+            "stale. Click the Reembed button in the admin UI (POST "
+            "/api/model/reembed-facts) or run 'python scripts/evorefmem_cli.py "
+            "reembed-facts --apply' to rebuild URL/command recall vectors.",
             new_model,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Failed to write SemMem reembed marker: %s", exc)
 
 
@@ -85,7 +86,7 @@ def clear_semmem_reembed_required(*, memory_dir: Path | None = None) -> None:
         return
     try:
         p.unlink(missing_ok=True)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Failed to clear SemMem reembed marker: %s", exc)
 
 
@@ -103,7 +104,7 @@ def is_semmem_reembed_required(
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
-    except Exception:  # noqa: BLE001
+    except Exception:
         return {}
 
 
@@ -118,7 +119,8 @@ def warn_if_semmem_reembed_required(
     logger.warning(
         "SemMem fact embeddings are STALE (embed model changed to %s). "
         "URL/command recall (search_by_embedding) will MISS until rebuilt. "
-        "Run 'python scripts/evorefmem_cli.py reembed-facts --apply'.",
+        "Click the Reembed button in the admin UI (POST /api/model/reembed-facts) "
+        "or run 'python scripts/evorefmem_cli.py reembed-facts --apply'.",
         model,
     )
     return True

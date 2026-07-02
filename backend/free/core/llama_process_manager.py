@@ -215,5 +215,5 @@ class LlamaProcessManager:
         for component in list(self._procs.keys()):
             try:
                 self.stop(component)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.error("Failed to stop %s: %s", component, e)

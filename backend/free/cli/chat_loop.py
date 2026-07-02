@@ -285,7 +285,7 @@ async def _finalize_chat_stream(
     if step_spinner:
         try:
             await step_spinner.stop()
-        except Exception:  # noqa: BLE001 — クリーンアップ中の例外は握る
+        except Exception:
             pass
     if non_interactive:
         sys.stdout.write("\n")
@@ -695,7 +695,7 @@ async def _handle_split_chat_input(
         response, shell_out_requests, ttft = await chat_stream(
             text, state, split_console, split_layout=layout,
         )
-    except Exception as e:  # noqa: BLE001 — 例外を握って UI を継続
+    except Exception as e:
         error_detail = str(e) or type(e).__name__
         logger.error("Unexpected error in chat_stream: %s", error_detail)
         state.record_error()
@@ -828,7 +828,7 @@ async def _terminal_interactions_async(
     console,
     response: str,
     shell_out_requests: list[str],
-    state: SessionState,
+    state: SessionState,  # noqa: ARG001
     has_diffs: bool,
 ) -> None:
     """ターミナル対話処理（diff 確認・シェルアウト）

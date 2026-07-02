@@ -590,7 +590,7 @@ class MetaCognitiveAgent:
         self,
         query: str,
         conversation: list[dict],
-        llm_client,
+        llm_client,  # noqa: ARG002
         on_step=None,
     ) -> list[TaskItem]:
         """アシストモデルにタスク計画を生成させる
@@ -661,7 +661,7 @@ class MetaCognitiveAgent:
                 "Plan generation timed out after %ds", self._llm_call_timeout,
             )
             return []
-        except Exception as e:  # noqa: BLE001 — assist 側の任意例外で fallback
+        except Exception as e:
             logger.warning("Plan generation failed: %s", e)
             return []
 
@@ -821,7 +821,7 @@ class MetaCognitiveAgent:
             return []
         try:
             return await self._code_generator(original_query, on_step)
-        except Exception as e:  # noqa: BLE001 — 委譲失敗は単一生成へフォールバック
+        except Exception as e:
             logger.warning("Code generation delegation failed: %s", e)
             return []
 
@@ -1325,7 +1325,7 @@ class MetaCognitiveAgent:
         self,
         task: TaskItem,
         original_query: str,
-        system_prompt: str,
+        system_prompt: str,  # noqa: ARG002
         conversation: list[dict],
         llm_client,
         tools_registry,
@@ -1527,7 +1527,7 @@ class MetaCognitiveAgent:
         consecutive_errors: int,
         max_consecutive_errors: int,
         loop: int,
-        generation_params: dict | None,
+        generation_params: dict | None,  # noqa: ARG002
     ) -> tuple[str, list[dict]] | None:
         """ツールループ内の1回のツール実行
 
@@ -1643,7 +1643,7 @@ class MetaCognitiveAgent:
         prefix: str,
         tool_calls: list[dict],
         step_results: list[StepResult],
-        messages: list[dict],
+        messages: list[dict],  # noqa: ARG002
         consecutive_errors: int,
         max_consecutive_errors: int,
         loop: int,
@@ -1853,7 +1853,7 @@ class MetaCognitiveAgent:
         self,
         tool_name: str,
         tool_args: dict,
-        task: TaskItem,
+        task: TaskItem,  # noqa: ARG002
         tools_registry,
         on_step=None,
         prefix: str = "",

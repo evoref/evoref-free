@@ -541,7 +541,7 @@ class LongFormOrchestrator:
     async def generate(
         self,
         instruction: str,
-        session_id: str,
+        session_id: str,  # noqa: ARG002
         mode: str = "coding",
         on_step: Callable[[dict], Any] | None = None,
         existing_content: str = "",
@@ -1009,7 +1009,7 @@ class LongFormOrchestrator:
                 async for token in self._stream_extend_round(remaining, tail):
                     ext_text += token
                     yield token
-            except Exception as e:  # noqa: BLE001 — LLM 呼出失敗は警告して停止
+            except Exception as e:
                 logger.warning("Extend generation failed: %s", e)
                 break
 
