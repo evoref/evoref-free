@@ -256,7 +256,7 @@ def edit_diff_with_editor(
                 logger.warning("Failed to remove temp file %s: %s", tmp_path, e)
 
 
-def _prompt_apply(console) -> str:
+def _prompt_apply(console) -> str:  # noqa: ARG001
     """適用確認プロンプトを表示し、ユーザー入力を返す
 
     Returns:

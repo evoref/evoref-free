@@ -195,7 +195,7 @@ class ComplexityClassifier:
         query: str,
         mode: str = "chat",
         rag_results: list | None = None,
-        context_turns: int = 0,
+        context_turns: int = 0,  # noqa: ARG002
     ) -> str:
         """クエリの複雑度を分類する
 

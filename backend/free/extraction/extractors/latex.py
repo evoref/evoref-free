@@ -49,7 +49,7 @@ class LatexExtractor(TextSourceExtractorBase):
     def extensions(self) -> frozenset[str]:
         return frozenset({".tex"})
 
-    def _process(self, text: str, source_name: str) -> str:
+    def _process(self, text: str, source_name: str) -> str:  # noqa: ARG002
         """LaTeX コマンドを除去してプレーンテキストを返す"""
         return self._strip_latex(text)
 

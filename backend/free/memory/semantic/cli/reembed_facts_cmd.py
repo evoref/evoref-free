@@ -47,6 +47,7 @@ from backend.free.memory.semantic.cli._paths import (
 )
 from backend.free.memory.semantic.embedding_store import (
     register_new_model,
+    reset_model_store,
     swap_active_model_id,
 )
 from backend.free.memory.semantic.manifest import (
@@ -86,7 +87,7 @@ class ReembedFactsReport:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
 
 
-def _collect_targets(
+def collect_reembed_targets(
     memory_dir: Path, manifest,
 ) -> list[tuple[str, Path, str, str]]:
     """全 scope の「embedding を持つ live fact」を列挙する.
@@ -106,6 +107,101 @@ def _collect_targets(
                 continue
             targets.append((scope.name, scope.root_dir, fact.id, text))
     return targets
+
+
+def apply_reembed_swap(
+    memory_dir: Path,
+    migration_archive_dir: Path,
+    targets: Sequence[tuple[str, Path, str, str]],
+    vectors: Sequence[Sequence[float]],
+    *,
+    new_model_id: str,
+    new_dim: int,
+    normalized: bool = True,
+    now: float | None = None,
+) -> tuple[int, str | None]:
+    """embed 済みベクトル列で新 model_id ストアへ swap + 書き戻し + manifest 更新.
+
+    ``run_reembed_facts`` (CLI, sync embed) と ``POST /api/model/reembed-facts``
+    (endpoint, async embed) が共有する cross-model swap のコア。呼出側は
+    ``collect_reembed_targets`` で得た ``targets`` の object テキストを embed 済みの
+    ``vectors`` (``targets`` と同順・同数) を渡す。実行内容:
+
+    1. ``semantic/`` 全体を ``migration_archive`` へ退避、
+    2. 全 scope に新 model_id 用の空ストアを作成し active model を atomic swap、
+    3. ``targets`` の各 fact を ``update_fact(embedding=...)`` で新ストアへ書戻し、
+    4. manifest の ``last_migrated_at`` 更新 + SemMem stale マーカー解除。
+
+    ``targets`` が空でも manifest swap + マーカー解除は行う (fact ゼロの環境でも
+    モデルラベルを揃えて stale 検知の 409 を解消するため)。
+
+    Returns:
+        ``(書き戻した fact 数, backup_path)``。
+
+    Raises:
+        ValueError: ``new_model_id`` 空 / ``new_dim < 1`` / ベクトル数・次元の不整合。
+    """
+    if not new_model_id:
+        raise ValueError("new_model_id must be non-empty")
+    if new_dim < 1:
+        raise ValueError("new_dim must be >= 1")
+    if len(vectors) != len(targets):
+        raise ValueError(
+            f"vectors count {len(vectors)} != targets count {len(targets)}",
+        )
+
+    # ベクトルを swap 前に全件検証する (不整合時に manifest を壊さないため)。
+    vecs: list[np.ndarray] = []
+    for i, v in enumerate(vectors):
+        arr = np.asarray(v, dtype=np.float32).reshape(-1)
+        if arr.shape[0] != new_dim:
+            raise ValueError(
+                f"vector #{i} has dim {arr.shape[0]}, expected {new_dim}",
+            )
+        vecs.append(arr)
+
+    # 1. semantic/ 全体をバックアップ。
+    backup_root = cli_backup_root(
+        migration_archive_dir, "reembed_facts", now=now,
+    )
+    semantic_dir = memory_dir / "semantic"
+    backup_dst = backup_root / "semantic"
+    backup_path: str | None = None
+    if semantic_dir.exists():
+        shutil.copytree(semantic_dir, backup_dst, dirs_exist_ok=True)
+        backup_path = str(backup_dst)
+
+    # 2. 新 model_id 用のストアを全 scope で **空にリセット** してから作成し、
+    #    active model を swap。reset により、既存 dir の残存ベクトル (異なる dim /
+    #    削除済み fact の orphan 行) が原因で swap 後に書込み dim-mismatch → half-swap
+    #    で復旧不能になる事故を防ぐ (authoritative swap)。backup は step 1 で取得済み。
+    for scope in enumerate_scopes(memory_dir):
+        reset_model_store(scope.root_dir, new_model_id)
+        register_new_model(scope.root_dir, new_model_id)
+    swap_active_model_id(
+        memory_dir, new_model_id, new_dim=new_dim, normalized=normalized,
+    )
+
+    # 3. 新 manifest で各 scope の store を開き直し、update_fact で書き戻す。
+    new_manifest = load_manifest(memory_dir)
+    stores: dict[Path, SemanticFactStore] = {}
+    reembedded = 0
+    for (_scope_name, scope_root, fact_id, _text), vec in zip(targets, vecs):
+        store = stores.get(scope_root)
+        if store is None:
+            store = SemanticFactStore(scope_root, manifest=new_manifest)
+            stores[scope_root] = store
+        store.update_fact(fact_id, embedding=vec)
+        reembedded += 1
+
+    # 4. manifest の last_migrated_at を更新 + stale マーカー解除。
+    stamp = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ",
+        time.gmtime(time.time() if now is None else now),
+    )
+    update_manifest(memory_dir, last_migrated_at=stamp)
+    clear_semmem_reembed_required(memory_dir=memory_dir)
+    return reembedded, backup_path
 
 
 def run_reembed_facts(
@@ -141,7 +237,7 @@ def run_reembed_facts(
         )
         return rep
 
-    targets = _collect_targets(memory_dir, manifest)
+    targets = collect_reembed_targets(memory_dir, manifest)
     for scope_name, _root, _fid, _text in targets:
         rep.per_scope_counts[scope_name] = (
             rep.per_scope_counts.get(scope_name, 0) + 1
@@ -158,63 +254,20 @@ def run_reembed_facts(
         rep.error = "no embedded facts to reembed (nothing to do)"
         return rep
 
-    # 1. ベクトルを **swap 前に** 全件計算する (embed 失敗時に manifest を
-    #    壊さないため)。
+    # ベクトルを swap 前に全件計算する (embed 失敗時に manifest を壊さないため)。
     texts = [t[3] for t in targets]
     vectors = embed_fn(texts)
-    if len(vectors) != len(texts):
-        rep.error = (
-            f"embed_fn returned {len(vectors)} vectors for {len(texts)} texts"
+    try:
+        reembedded, backup_path = apply_reembed_swap(
+            memory_dir, migration_archive_dir, targets, vectors,
+            new_model_id=new_model_id, new_dim=new_dim,
+            normalized=normalized, now=now,
         )
+    except ValueError as exc:
+        rep.error = str(exc)
         return rep
-    vecs: list[np.ndarray] = []
-    for i, v in enumerate(vectors):
-        arr = np.asarray(v, dtype=np.float32)
-        if arr.ndim != 1 or arr.shape[0] != new_dim:
-            rep.error = (
-                f"embed_fn vector #{i} has shape {arr.shape}, "
-                f"expected ({new_dim},)"
-            )
-            return rep
-        vecs.append(arr)
-
-    # 2. semantic/ 全体をバックアップ。
-    backup_root = cli_backup_root(
-        migration_archive_dir, "reembed_facts", now=now,
-    )
-    semantic_dir = memory_dir / "semantic"
-    backup_dst = backup_root / "semantic"
-    if semantic_dir.exists():
-        shutil.copytree(semantic_dir, backup_dst, dirs_exist_ok=True)
-        rep.backup_path = str(backup_dst)
-
-    # 3. 新 model_id 用の空ストアを全 scope に作り、active model を swap。
-    for scope in enumerate_scopes(memory_dir):
-        register_new_model(scope.root_dir, new_model_id)
-    swap_active_model_id(
-        memory_dir, new_model_id, new_dim=new_dim, normalized=normalized,
-    )
-
-    # 4. 新 manifest で各 scope の store を開き直し、update_fact で書き戻す。
-    new_manifest = load_manifest(memory_dir)
-    stores: dict[Path, SemanticFactStore] = {}
-    for (_scope_name, scope_root, fact_id, _text), vec in zip(targets, vecs):
-        store = stores.get(scope_root)
-        if store is None:
-            store = SemanticFactStore(scope_root, manifest=new_manifest)
-            stores[scope_root] = store
-        store.update_fact(fact_id, embedding=vec)
-        rep.reembedded += 1
-
-    # 5. manifest の last_migrated_at を更新。
-    stamp = time.strftime(
-        "%Y-%m-%dT%H:%M:%SZ",
-        time.gmtime(time.time() if now is None else now),
-    )
-    update_manifest(memory_dir, last_migrated_at=stamp)
-
-    # 6. stale マーカーがあれば消す (embed-migrate が立てた reembed 要求の解消)。
-    clear_semmem_reembed_required(memory_dir=memory_dir)
+    rep.reembedded = reembedded
+    rep.backup_path = backup_path
     return rep
 
 
@@ -261,6 +314,8 @@ def format_report_text(report: ReembedFactsReport) -> str:
 __all__ = [
     "EmbedFn",
     "ReembedFactsReport",
+    "apply_reembed_swap",
+    "collect_reembed_targets",
     "format_report_text",
     "run_reembed_facts",
 ]

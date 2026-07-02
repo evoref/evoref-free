@@ -69,7 +69,7 @@ def run_semmem_gc(
     for scope in _target_scopes(current_project_id):
         try:
             store = store_provider(scope)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("Step 9 GC: failed to obtain store %s: %s", scope, exc)
             continue
         if store is None:
@@ -88,7 +88,7 @@ def run_semmem_gc(
                 try:
                     if store.delete_fact(fid):
                         deleted_for_type += 1
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning(
                         "Step 9 GC: failed to delete %s in %s: %s",
                         fid, scope, exc,

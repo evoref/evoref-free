@@ -62,7 +62,7 @@ def persist_facts(
         try:
             store.add_fact(fact)
             written += 1
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "Step 8 [%s]: failed to add fact %s: %s",
                 label, fact.id, exc,
@@ -158,7 +158,7 @@ def _persist_failure_patterns_via_view(
                 trace_id=f.trace_id,
             )
             written += 1
-        except Exception as exc:  # noqa: BLE001 — 1 件失敗で sleep を止めない
+        except Exception as exc:
             logger.warning(
                 "Step 8 [mdp_trace]: failure_pattern write_via_view failed "
                 "(sig=%s): %s", signature, exc,
@@ -241,7 +241,7 @@ def extract_semantic_facts(
     total_extracted = 0
     try:
         global_store = store_provider("global")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Step 8: failed to obtain global store: %s", exc)
         global_store = None
 
@@ -255,7 +255,7 @@ def extract_semantic_facts(
     if current_project_id:
         try:
             project_store = store_provider(f"project:{current_project_id}")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("Step 8: failed to obtain project store: %s", exc)
 
     if project_store is not None:

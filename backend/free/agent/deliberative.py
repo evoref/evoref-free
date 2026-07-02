@@ -257,7 +257,7 @@ class DeliberativeAgent:
                 judgement = await tool_judge_task
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     "Precomputed tool judge task failed, re-judging: %r", exc,
                 )
@@ -439,7 +439,7 @@ class DeliberativeAgent:
             ))
             tracer.end_episode(episode_id, "success" if tool_success else "partial")
             tracer.cleanup_episode(episode_id)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("deliberative MDP trace failed (continuing): %s", exc)
 
     async def _sync_response(
@@ -480,8 +480,8 @@ class DeliberativeAgent:
         llm_client,
         max_tokens: int | None = None,
         *,
-        tool_result: str | None = None,
-        tool_name: str | None = None,
+        tool_result: str | None = None,  # noqa: ARG002
+        tool_name: str | None = None,  # noqa: ARG002
         generation_params: GenerationParams | None = None,
     ) -> AsyncIterator[str]:
         """ストリーミング応答（生トークンのイテレータを返す）"""

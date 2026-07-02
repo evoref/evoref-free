@@ -112,7 +112,7 @@ def _resolve_loop_view_for_agent(state: AppState):
             )
     try:
         return LoopFactView(stores=stores, writeback_store=writeback)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("@self: LoopFactView construction failed: %s", exc)
         return None
 
@@ -154,7 +154,7 @@ def _validate_chat_request(req: ChatRequest) -> None:
         )
 
 
-def _llm_unavailable_response(stream: bool) -> StreamingResponse:
+def _llm_unavailable_response(stream: bool) -> StreamingResponse:  # noqa: ARG001
     """LLM クライアント未接続時のレスポンス（stream=True 専用）"""
     sse = SSEFrameBuilder()
 
@@ -279,7 +279,7 @@ async def _gate_reactive_light(
             judgement = await state.tool_call_judge.judge(  # 直列構成で直接実行
                 req.message, state.tools_registry, req.mode, history,
             )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("reactive-light judge failed, escalating: %s", exc)
         return "deliberative", judge_task, "judge_error"
 
@@ -401,7 +401,7 @@ async def _build_messages_with_search(
             search_result = await search_task
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("Search task failed, continuing without RAG: %s", exc)
             search_result = SearchPipelineResult(error=str(exc))
     else:
@@ -629,7 +629,7 @@ def make_code_artifact_generator(
     """
     gen_cfg = _clamp_long_form_timeout(cfg)
 
-    async def _generate(instruction: str, on_step=None) -> list[EditorArtifact]:
+    async def _generate(instruction: str, on_step=None) -> list[EditorArtifact]:  # noqa: ARG001
         if detect_content_type(instruction, "coding") != ContentType.CODE:
             return []
         orchestrator = _build_long_form_orchestrator(
@@ -645,7 +645,7 @@ def make_code_artifact_generator(
                 mode="coding", on_step=None,
             ):
                 pass
-        except Exception as e:  # noqa: BLE001 — 失敗時は agent 側でフォールバック
+        except Exception as e:
             logger.warning("Delegated code generation failed: %s", e)
             return []
         files = orchestrator.last_code_files or (
@@ -752,7 +752,7 @@ def make_staged_codegen_delegate(
                 content_type_override=ContentType.CODE,
             ):
                 pass
-        except Exception as e:  # noqa: BLE001 — 失敗時は空 dict (executor が failure 化)
+        except Exception as e:
             logger.warning("staged codegen delegate failed: %s", e)
             return {}
         files = orchestrator.last_code_files or (
@@ -783,7 +783,7 @@ def _staged_coding_enabled(req: ChatRequest, cfg: dict, state: AppState) -> bool
     try:
         if detect_content_type(req.message, "coding") != ContentType.CODE:
             return False
-    except Exception:  # noqa: BLE001 — 判定不能は longform にフォールバック
+    except Exception:
         return False
     return True
 
@@ -1119,7 +1119,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 )
             try:
                 conflict_ctx = await conflict_task
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("Conflict review task failed (degrading): %s", exc)
                 conflict_ctx = ConflictTurnContext()
         else:
@@ -1158,7 +1158,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                     recall_judgement = await state.tool_call_judge.recall_url_judgement(
                         req.message, state.tools_registry, mode=req.mode,
                     )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning(
                         "URL recall pre-check failed (continuing as reactive): %s", exc,
                     )

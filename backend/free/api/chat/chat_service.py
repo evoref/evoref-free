@@ -313,7 +313,7 @@ def _iter_scopes(state: AppState):
             continue
         try:
             yield scope, state.get_semantic_store(scope)
-        except Exception:  # noqa: BLE001 — store 解決失敗はスキップ
+        except Exception:
             continue
 
 
@@ -325,7 +325,7 @@ def _collect_all_pending_groups(state: AppState) -> list:
     for scope, store in _iter_scopes(state):
         try:
             groups.extend(collect_pending_groups(store, scope))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("collect pending conflicts failed (%s): %s", scope, exc)
     return groups
 
@@ -472,11 +472,11 @@ async def maybe_resolve_pending_conflicts(
                         "new_fact_id": result.new_fact_id or "",
                     },
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("conflict resolve audit log failed: %s", exc)
         # 解決を同ターンの注入へ反映するため pending を再収集
         ctx.pending_groups = _collect_all_pending_groups(state)
-    except Exception as exc:  # noqa: BLE001 — 競合確認の失敗でチャットを止めない
+    except Exception as exc:
         logger.warning("pending conflict chat review failed: %s", exc)
     return ctx
 
@@ -568,7 +568,7 @@ def _render_conflict_section(
                 ),
             )
         return "\n".join(parts) or None
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("conflict section render failed: %s", exc)
         return None
 

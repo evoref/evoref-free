@@ -183,7 +183,7 @@ def create_semantic_dirs(memory_dir: Path) -> list[Path]:
     created: list[Path] = []
     root = _semantic_root(memory_dir)
     root.mkdir(parents=True, exist_ok=True)
-    if not any(True for _ in [root]):  # noqa: PIE810 (placeholder)
+    if not any(True for _ in [root]):
         created.append(root)
     for sub in SEMANTIC_SUBDIRS:
         d = root / sub

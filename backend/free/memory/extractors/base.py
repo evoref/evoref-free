@@ -119,8 +119,8 @@ class BaseExtractor:
 
     def extract(
         self,
-        notes: Iterable[MemoryNote],
-        ctx: ExtractionContext,
+        notes: Iterable[MemoryNote],  # noqa: ARG002
+        ctx: ExtractionContext,  # noqa: ARG002
     ) -> ExtractionResult:
         """ノート列から SemanticFact 候補を抽出する。
 

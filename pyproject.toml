@@ -61,7 +61,10 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-select = ["DTZ001", "DTZ003", "DTZ005"]
+select = ["ARG001", "ARG002", "DTZ001", "DTZ003", "DTZ005"]
 
 [tool.ruff.lint.per-file-ignores]
 # 例外なし。naive datetime が必要な場合は `backend.utils.utc_now_dt()` を使うこと。
+# ARG001/ARG002: pytest fixture / mock は意図的に未使用引数を取るため一括除外 (C49)。
+"**/tests/**" = ["ARG001", "ARG002"]
+"**/conftest.py" = ["ARG001", "ARG002"]

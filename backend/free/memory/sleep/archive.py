@@ -58,7 +58,7 @@ def archive_inactive_projects(
             archive_project,
             propose_archives,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Step 10: failed to import dependencies: %s", exc)
         return []
 
@@ -76,7 +76,7 @@ def archive_inactive_projects(
         resolver = get_path_resolver()
         state_path = Path(resolver.resolve_local("local_state_file"))
         memory_dir = Path(resolver.resolve_local("memory_dir"))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Step 10: failed to resolve paths: %s", exc)
         return []
 
@@ -98,13 +98,13 @@ def archive_inactive_projects(
                 semantic_root=semantic_root,
                 archive_dir=archive_dir,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("Step 10: failed to archive %s: %s", pid, exc)
             continue
         if store_invalidator is not None:
             try:
                 store_invalidator(f"project:{pid}")
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     "Step 10: failed to invalidate cached store for %s: %s",
                     pid, exc,
@@ -114,7 +114,7 @@ def archive_inactive_projects(
     if archived:
         try:
             LocalStateStore.save(state_path, state)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("Step 10: failed to save state.json: %s", exc)
         logger.info(
             "Step 10: archived %d inactive projects: %s",

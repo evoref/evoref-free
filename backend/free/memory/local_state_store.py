@@ -273,7 +273,7 @@ def archive_project(
     *,
     semantic_root: Path,
     archive_dir: Path,
-    now: float | None = None,
+    now: float | None = None,  # noqa: ARG001
 ) -> Path | None:
     """指定プロジェクトを物理アーカイブする
 

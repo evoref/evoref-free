@@ -622,7 +622,7 @@ class ToolCallJudge:
                     fallback_result = await task
                 except asyncio.CancelledError:
                     raise
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     logger.warning(
                         "Speculative executable_command_synth failed: %r", e,
                     )
@@ -828,7 +828,7 @@ class ToolCallJudge:
             return None
         try:
             embeddings = await self._embedder.embed([query], is_query=True, mode=mode)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("URL recall: embed failed: %s", exc)
             return None
         if embeddings is None or len(embeddings) == 0:
@@ -843,7 +843,7 @@ class ToolCallJudge:
         ttl_seconds = float(ttl_days) * 86400.0 if ttl_days > 0 else 0.0
         try:
             candidates = self._mem_view.search_by_embedding(q_vec, top_k=top_k)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("URL recall: search_by_embedding failed: %s", exc)
             return None
 
@@ -860,7 +860,7 @@ class ToolCallJudge:
                     for pid in resolver.allowed_profile_ids():
                         if pid:
                             allowed_profiles.add(pid)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("URL recall: pro resolver init failed: %s", exc)
 
         import time as _time
@@ -999,7 +999,7 @@ class ToolCallJudge:
             return None
         try:
             embeddings = await self._embedder.embed([query], is_query=True, mode=mode)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("Executable command recall: embed failed: %s", exc)
             return None
         if embeddings is None or len(embeddings) == 0:
@@ -1016,7 +1016,7 @@ class ToolCallJudge:
         ttl_seconds = float(ttl_days) * 86400.0 if ttl_days > 0 else 0.0
         try:
             candidates = self._mem_view.search_by_embedding(q_vec, top_k=top_k)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "Executable command recall: search_by_embedding failed: %s", exc,
             )
@@ -1199,7 +1199,7 @@ class ToolCallJudge:
                 temperature=0.1,
                 purpose="executable_command_synth",
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning(
                 "executable_command_synth assist call failed: %r", e,
             )

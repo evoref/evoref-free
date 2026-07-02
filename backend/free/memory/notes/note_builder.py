@@ -386,7 +386,7 @@ class NoteBuilder:
         return bool(cls._CODE_FENCE_RE.search(content))
 
     # サブクラスでオーバーライドする
-    def candidate_fact_tags(self, content: str) -> list[str]:
+    def candidate_fact_tags(self, content: str) -> list[str]:  # noqa: ARG002
         """モード別の候補ファクトタイプを返す。
 
         基底クラスは何も返さない。``ChatNoteBuilder`` /

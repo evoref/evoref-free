@@ -30,7 +30,7 @@ from backend.utils import utc_now_dt
 logger = get_logger("cli.command_handlers")
 
 
-def _cmd_help(args: str, state: SessionState, console) -> CommandResult:
+def _cmd_help(args: str, state: SessionState, console) -> CommandResult:  # noqa: ARG001
     render_help(console)
     return CommandResult()
 
@@ -109,7 +109,7 @@ def _cmd_file(args: str, state: SessionState, console) -> CommandResult:
     return CommandResult()
 
 
-def _cmd_clear(args: str, state: SessionState, console) -> CommandResult:
+def _cmd_clear(args: str, state: SessionState, console) -> CommandResult:  # noqa: ARG001
     logger.debug(
         "/clear: clearing %d context files, %d turns, resetting tokens",
         len(state.context_files), len(state.turns),
@@ -273,7 +273,7 @@ async def _cmd_history(args: str, state: SessionState, console) -> CommandResult
     return CommandResult()
 
 
-async def _cmd_page(args: str, state: SessionState, console) -> CommandResult:
+async def _cmd_page(args: str, state: SessionState, console) -> CommandResult:  # noqa: ARG001
     """最後の run_command 全文出力をページャーで表示"""
     logger.debug("/page: fetching last command output from backend")
     try:
@@ -319,7 +319,7 @@ async def _build_model_info_async(
     return models, result[1]
 
 
-async def _cmd_status(args: str, state: SessionState, console) -> CommandResult:
+async def _cmd_status(args: str, state: SessionState, console) -> CommandResult:  # noqa: ARG001
     """サーバー状態を表示"""
     from backend.free.cli.config_loader import _find_project_root
     from backend.free.cli.renderer import render_model_info
@@ -501,7 +501,7 @@ async def _cmd_private(args: str, state: SessionState, console) -> CommandResult
     return CommandResult()
 
 
-async def _cmd_pinned(args: str, state: SessionState, console) -> CommandResult:
+async def _cmd_pinned(args: str, state: SessionState, console) -> CommandResult:  # noqa: ARG001
     """/pinned — pin 済みファクト一覧を表示する"""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -529,7 +529,7 @@ async def _cmd_pinned(args: str, state: SessionState, console) -> CommandResult:
     return CommandResult()
 
 
-def _cmd_exit(args: str, state: SessionState, console) -> CommandResult:
+def _cmd_exit(args: str, state: SessionState, console) -> CommandResult:  # noqa: ARG001
     # 終了前にサマリログ出力＋自動保存
     finalize_session(state)
     state.should_exit = True

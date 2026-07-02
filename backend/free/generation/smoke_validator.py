@@ -649,7 +649,7 @@ def run_import_smoke(
             "(top-level 副作用の可能性)"
         )
         return result
-    except Exception as e:  # noqa: BLE001 — 実行不可は warning に倒す
+    except Exception as e:
         result.warnings.append(f"import スモークテスト実行不可: {e}")
         return result
 
@@ -789,7 +789,7 @@ def run_entry_smoke(
             f"エントリ実行スモークが {timeout_sec:.0f}s でタイムアウト (要確認)"
         )
         return result
-    except Exception as e:  # noqa: BLE001 — 実行不可は warning に倒す
+    except Exception as e:
         result.warnings.append(f"エントリ実行スモーク実行不可: {e}")
         return result
 

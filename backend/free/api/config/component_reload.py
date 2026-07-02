@@ -140,7 +140,7 @@ def _stop_assist_server_process(state: AppState, cfg: dict) -> None:
     try:
         stopped, msg = stop_server_process("assist", cfg, state)
         logger.info("Assist server process stop on disable: %s (%s)", stopped, msg)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("Failed to stop assist server process on disable: %s", e)
 
 
@@ -155,7 +155,7 @@ async def _start_assist_server_process(cfg: dict) -> None:
     try:
         started, msg = await start_server_process("assist", cfg)
         logger.info("Assist server process start on enable: %s (%s)", started, msg)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("Failed to start assist server process on enable: %s", e)
 
 

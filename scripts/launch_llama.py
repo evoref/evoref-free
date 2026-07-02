@@ -713,6 +713,15 @@ def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | 
     context_size = emb_cfg.get("context_size", 8192)
     cmd += ["-c", str(context_size)]
 
+    max_length = emb_cfg.get("max_length", 8192)
+    if int(context_size) < int(max_length):
+        print(
+            f"[launch] WARNING: embedding.context_size={context_size} is below "
+            f"max_length={max_length}; long embedding inputs will be rejected. "
+            f"Consider raising embedding.context_size to at least {max_length}.",
+            file=sys.stderr,
+        )
+
     # エンベッド LoRA アダプタ（存在する場合のみ）
     embed_lora = lp.get("embed_lora_adapter", "local/models/embed_adapter.gguf")
     embed_lora_path = Path(embed_lora)
@@ -747,6 +756,10 @@ def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | 
     # slots × context_size の KV を無駄に確保する)。埋め込みは概ね逐次のため既定 2。
     slots = max(1, int(emb_cfg.get("slots", 2) or 2))
     cmd += ["-np", str(slots)]
+
+    # slots > 1 では --kv-unified 無しだと per-seq context が n_ctx/slots に
+    # 黙って分割される (base/assist と同じ footgun、_resolve_kv_unified 参照)。
+    _append_kv_unified_args(cmd, emb_cfg, slots=slots)
 
     return cmd
 
@@ -2410,20 +2423,51 @@ def wait_for_health(
     return False
 
 
+def _extract_model_basename(cmd: list[str]) -> str | None:
+    """``cmd`` 中の ``-m`` 引数の basename を返す
+
+    ``build_llama_cmd`` / ``build_assist_cmd`` / ``build_embed_cmd`` はいずれも
+    ``"-m", str(model_path)`` の並びでモデルパスを積むため、実際に spawn される
+    値から抽出する (cfg の再読込による二重管理を避ける)。
+    """
+    if "-m" not in cmd:
+        return None
+    return Path(cmd[cmd.index("-m") + 1]).name
+
+
 def _start_and_wait(
     cmd: list[str], name: str, host: str, port: int,
     *, env: dict | None = None, cwd: str | Path | None = None,
+    expected_model_id: str | None = None, timeout: int = 30,
 ) -> subprocess.Popen:
     """llama-server プロセスを起動しヘルスチェック
 
     ``cwd`` を渡すと相対パス引数 (例: --control-vector-scaled の相対 FNAME) が
     project_root 基準で解決される。canonical 起動 (service_manager) は cwd 設定済で、
     本 standalone 経路でも揃える。``None`` は親プロセスの CWD を継承 (従来挙動)。
+
+    ``expected_model_id`` を渡すと ``wait_for_health`` が ``/props`` の load 済み
+    モデルとの同一性まで検証する。port 占有中の旧プロセスが応答して誤って
+    ready 判定されるのを防ぐ。
     """
     print(f"[launch] {name}: {' '.join(cmd)}")
     proc = subprocess.Popen(cmd, env=env, cwd=cwd)
+
+    # Popen 直後の即死検知 (port bind 失敗等)。wait_for_health のフルタイムアウト
+    # 待ちを避け、旧プロセスが port を握ったまま新プロセスが起動失敗したケースを
+    # 早期に切り分ける。
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        print(
+            f"[launch] ERROR: {name} exited immediately "
+            f"(exit code={proc.returncode}). Likely port bind conflict or "
+            "invalid model path.",
+            file=sys.stderr,
+        )
+        return proc
+
     print(f"[launch] Waiting for {name} at {host}:{port}...")
-    if wait_for_health(host, port):
+    if wait_for_health(host, port, timeout, expected_model_id):
         print(f"[launch] {name} is ready")
     else:
         print(f"[launch] WARNING: {name} health check timed out")
@@ -2484,13 +2528,20 @@ if __name__ == "__main__":
         if not ok:
             sys.exit(2)
 
+    # モデルロードに時間がかかる大型 GGUF を考慮し、health タイムアウトは
+    # process_manager.health_timeout (mode.py の base 切替と同じ既定値) を使う。
+    health_timeout = int((cfg.get("process_manager") or {}).get("health_timeout", 120))
+
     try:
         # ベースモデル
         if launch_base:
             cmd = build_llama_cmd(cfg, project_root)
             host = cfg["llama"].get("host", "localhost")
             port = cfg["llama"].get("port", 8080)
-            procs.append(_start_and_wait(cmd, "base-model", host, port, cwd=project_root))
+            procs.append(_start_and_wait(
+                cmd, "base-model", host, port, cwd=project_root,
+                expected_model_id=_extract_model_basename(cmd), timeout=health_timeout,
+            ))
 
         # アシストモデル
         if launch_assist:
@@ -2499,7 +2550,10 @@ if __name__ == "__main__":
                 assist_cfg = cfg.get("assist_model", {}).get("local", {})
                 host = assist_cfg.get("host", "127.0.0.1")
                 port = assist_cfg.get("port", 8081)
-                procs.append(_start_and_wait(assist_cmd, "assist-model", host, port, cwd=project_root))
+                procs.append(_start_and_wait(
+                    assist_cmd, "assist-model", host, port, cwd=project_root,
+                    expected_model_id=_extract_model_basename(assist_cmd), timeout=health_timeout,
+                ))
             else:
                 print("[launch] Assist model not configured, skipping")
 
@@ -2515,7 +2569,10 @@ if __name__ == "__main__":
                 # buffer size が Vulkan device->max_buffer_size を超えると warning
                 # (ggml_vulkan: Failed to allocate pinned memory) が出るが CPU buffer に
                 # 自動フォールバックするため機能影響は無い (ggml-vulkan.cpp:14079 / :2671)。
-                procs.append(_start_and_wait(embed_cmd, "embedding", host, port, cwd=project_root))
+                procs.append(_start_and_wait(
+                    embed_cmd, "embedding", host, port, cwd=project_root,
+                    expected_model_id=_extract_model_basename(embed_cmd), timeout=health_timeout,
+                ))
             else:
                 print("[launch] Embedding backend is not llama-cpp, skipping")
 

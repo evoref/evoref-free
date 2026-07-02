@@ -890,7 +890,7 @@ class PromptEvolver:
             return
         try:
             save_session(session)
-        except Exception as e:  # noqa: BLE001 — コールバック由来は何でも握る
+        except Exception as e:
             logger.warning("save_session raised: %s", e)
 
     def _handle_mode_yield(
@@ -934,7 +934,7 @@ class PromptEvolver:
             if yield_check():
                 logger.info("Cooperative yield requested between modes")
                 return True
-        except Exception as e:  # noqa: BLE001 — コールバック由来は何でも握る
+        except Exception as e:
             logger.warning("yield_check raised between modes: %s", e)
         return False
 

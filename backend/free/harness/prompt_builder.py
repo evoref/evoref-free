@@ -103,7 +103,7 @@ def build_messages(
 
 
 def _collect_failures(
-    harness_view: HarnessFactView, mode: str, limit: int,
+    harness_view: HarnessFactView, mode: str, limit: int,  # noqa: ARG001
 ) -> list[SemanticFact]:
     """HarnessFactView から最近の failure_pattern を recency 順に返す。"""
     if limit <= 0:

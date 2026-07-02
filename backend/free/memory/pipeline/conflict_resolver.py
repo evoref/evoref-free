@@ -297,7 +297,7 @@ class ConflictResolver:
             return
         try:
             dl.log_memory_op("conflict_resolve", stats)
-        except Exception as exc:  # noqa: BLE001 - ロギング失敗は本処理を止めない
+        except Exception as exc:
             logger.warning("log_memory_op(conflict_resolve) failed: %s", exc)
 
     def _mark_merge_failure(self, note_a: MemoryNote, note_b: MemoryNote) -> None:

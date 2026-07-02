@@ -80,7 +80,7 @@ def bootstrap_loop_context_at_startup(
             reopened = reopen_orphan_in_progress_tasks(
                 view, current_project_id,
             )
-        except Exception as exc:  # noqa: BLE001 — 回収失敗で起動を止めない
+        except Exception as exc:
             logger.warning(
                 "Loop startup orphan recovery failed for project=%s: %s",
                 current_project_id, exc,
@@ -123,7 +123,7 @@ def bootstrap_loop_context_at_startup(
                     memory_dump={},
                     semmem_stats=result.as_dict(),
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.debug(
                     "log_memory_state(startup_bootstrap) failed: %s", exc,
                 )
@@ -136,7 +136,7 @@ def bootstrap_loop_context_at_startup(
 
 def apply_semmem_policy_overrides(
     state: AppState,
-    cfg: dict[str, Any],
+    cfg: dict[str, Any],  # noqa: ARG001
     current_project_id: str | None,
 ) -> None:
     """SemMem 上の active policy ファクトを PolicyInterpreter に反映する
@@ -315,7 +315,7 @@ def _init_memory(
         stm.load(resolver.resolve_local("memory_dir") / "short_term_notes.json")
         if stm.notes:
             logger.info("STM loaded on startup: %d notes", len(stm.notes))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("STM load on startup skipped: %s", e)
 
     # ベクトルストア初期化（LTM 用）

@@ -35,7 +35,7 @@ class SessionState:
     auto_save_enabled: bool = True
     checkpoint_interval: int = 10
     manually_saved: bool = False
-    cli_theme: "CLITheme | None" = None  # noqa: F821
+    cli_theme: "CLITheme | None" = None
     ttft_history: list[float] = field(default_factory=list)
     response_times: list[float] = field(default_factory=list)
     error_count: int = 0

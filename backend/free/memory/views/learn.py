@@ -371,7 +371,7 @@ class LearnFactView(FactViewBase):
     # 書込系 — failure_pattern
     # ──────────────────────────────────────────────────────────────────
 
-    def merge_failure_patterns(self, *, old_id: str, new_id: str) -> None:
+    def merge_failure_patterns(self, *, old_id: str, new_id: str) -> None:  # noqa: ARG002
         """Learn 分析結果に基づく failure_pattern の merge
 
         ``failure_pattern`` の owner は EvorefLoop のため、Learn pillar が直接

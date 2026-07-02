@@ -160,7 +160,7 @@ class CodeRepairer:
                     assembled, max_rounds, intra_file_only,
                 )
             return await self._selfcheck_generic(assembled, language)
-        except Exception as e:  # noqa: BLE001 — リペアは出力経路を止めない
+        except Exception as e:
             logger.warning("code repair failed, returning original: %s", e)
             return assembled
 

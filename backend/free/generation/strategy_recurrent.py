@@ -211,7 +211,7 @@ class RecurrentStrategy:
         instruction: str,
         context: dict,
         content_type: ContentType,
-        budget: TokenBudget,
+        budget: TokenBudget,  # noqa: ARG002
     ) -> GenerationPlan:
         """アシストモデルで計画を JSON 生成
 

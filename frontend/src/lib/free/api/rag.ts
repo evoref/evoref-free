@@ -17,6 +17,8 @@ export interface ReindexResponse {
 	memory_notes?: number;
 	/** 実行時のみ: 再構築したカートリッジ ID */
 	cartridges_rebuilt?: string[];
+	/** 実行時のみ: 再構築に失敗したカートリッジ ID (失敗があると stale マーカーは残る) */
+	cartridges_failed?: string[];
 	/** 実行時のみ: リセットしたメモリノート数 */
 	memory_notes_reset?: number;
 	/** 実行時のみ: 所要秒 */

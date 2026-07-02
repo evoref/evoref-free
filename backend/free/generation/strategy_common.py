@@ -524,7 +524,7 @@ async def generate_plan_json(
     try:
         tel1: dict = {}
         data = await _gen(_PLAN_MAX_TOKENS, None, tel1)
-    except Exception as e:  # noqa: BLE001 — assist 例外で fallback
+    except Exception as e:
         logger.warning("Plan generation failed: %s", e)
         return {}
 
@@ -544,7 +544,7 @@ async def generate_plan_json(
             if data2 and (not tel2.get("truncated") or n2 > n1):
                 tel2["replanned"] = True
                 result, result_tel = data2, tel2
-        except Exception as e:  # noqa: BLE001 — 再プラン失敗は元の結果を維持
+        except Exception as e:
             logger.warning("Plan replan failed: %s", e)
 
     if telemetry is not None:

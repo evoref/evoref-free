@@ -170,6 +170,7 @@
     "reindex_canceled": "再構築をキャンセルしました。",
     "reindex_running": "再構築中...",
     "reindex_complete": "再構築完了: RAG {rag_chunks} チャンク / カートリッジ {cart_chunks} チャンク ({cart_count} 件) / メモリ {mem_notes} ノートをリセット ({elapsed} 秒)",
+    "reindex_cart_failed": "カートリッジの再構築に失敗しました: {ids}。stale マーカーは残っています。再実行してください。",
     "reindex_failed": "再構築に失敗しました: {detail}",
     "startup_model_state_ok": "model_state.json — OK",
     "startup_model_state_init": "model_state.json 未作成です。初回起動時に config.yaml から生成されます。",
@@ -426,7 +427,8 @@
       "timeout": "推論がタイムアウトしました（{seconds}秒）。入力を短くするか、タイムアウト設定を調整してください。",
       "invalid_response": "推論サーバーから不正なレスポンスを受信しました。",
       "model_not_found": "モデルファイルが見つかりません: {path}",
-      "process_crashed": "推論サーバーが異常終了しました。再起動を試みています。"
+      "process_crashed": "推論サーバーが異常終了しました。再起動を試みています。",
+      "request_rejected": "埋め込みサーバーがリクエストを拒否しました: {detail}。embedding.context_size の見直しが必要な場合があります。"
     },
     "fs": {
       "index_corrupted": "ベクトルインデックスが破損しています。復旧を試みます。",
@@ -437,7 +439,8 @@
     },
     "rag": {
       "chunk_failed": "ファイルの分割に失敗しました: {filename}",
-      "vector_dim_mismatch": "ベクトル次元が一致しません。埋め込みモデルが変更されました。evoref reindex を実行してください。"
+      "vector_dim_mismatch": "ベクトル次元が一致しません。埋め込みモデルが変更されました。evoref reindex を実行してください。",
+      "stale_embedder": "埋め込みサーバーが旧モデル ({current}) のまま稼働しています。embed サーバーを再起動してから再実行してください (設定上の新モデル: {expected})。"
     },
     "cartridge": {
       "invalid_zip": "不正なカートリッジファイルです: {filename}",

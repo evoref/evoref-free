@@ -362,7 +362,7 @@ def run_migrations(
 # 登録済 Migration の集約点。
 # v1 → v2 は M5-d で導入: SemMem 索引を旧 4 ファイル形式から fact_id 正規化形の
 # 統合 ``index.jsonl`` に変換する。
-from backend.free.memory.migrations.index_v1_to_v2 import (  # noqa: E402
+from backend.free.memory.migrations.index_v1_to_v2 import (
     IndexV1ToV2Migration,
 )
 

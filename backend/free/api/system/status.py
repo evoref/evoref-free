@@ -138,7 +138,7 @@ def _collect_capabilities(state: AppState) -> list[CapabilityInfo]:
     return out
 
 
-def _collect_debug_info(cfg: dict, state: AppState) -> DebugStatusInfo:
+def _collect_debug_info(cfg: dict, state: AppState) -> DebugStatusInfo:  # noqa: ARG001
     """デバッグセクションの詳細情報を収集する。
 
     ``cfg["debug"]`` セクションは廃止されたため、有効/無効と

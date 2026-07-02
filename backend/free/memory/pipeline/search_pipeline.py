@@ -660,7 +660,7 @@ def _ensure_cartridge_fairness(
 
 def _find_replaceable_index(
     final: list[tuple[str, float, str]],
-    output_carts: set[str],
+    output_carts: set[str],  # noqa: ARG001
 ) -> int | None:
     """差し替え可能な要素のインデックスを返す
 
@@ -752,7 +752,7 @@ def _merge_results(
 
 
 async def _expand_and_research(
-    query: str,
+    query: str,  # noqa: ARG001
     query_vec: np.ndarray,
     working_mem,
     long_term,

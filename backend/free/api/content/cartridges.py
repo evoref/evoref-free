@@ -290,7 +290,7 @@ async def install_cartridge_stream(
             await queue.put({"__cancelled__": True})
         except (ValueError, FileNotFoundError) as e:
             await queue.put({"__error__": {"code": "E0510", "message": str(e)}})
-        except Exception as e:  # noqa: BLE001 — 想定外を SSE で通知
+        except Exception as e:
             logger.exception("install/stream failed: %s", e)
             await queue.put({"__error__": {"code": "E0599", "message": str(e)}})
         finally:
@@ -328,7 +328,7 @@ async def install_cartridge_stream(
                     task.cancel()
                     try:
                         await task
-                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    except (asyncio.CancelledError, Exception):
                         pass
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

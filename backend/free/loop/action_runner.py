@@ -110,7 +110,7 @@ class ActionRunner:
                     return self._run_search(action, t0)
                 case NoopAction():
                     return self._run_noop(action, t0)
-        except Exception as exc:  # noqa: BLE001 — 呼び出し側は success=False で判断
+        except Exception as exc:
             logger.warning(
                 "ActionRunner: unexpected error running %s: %s",
                 action.kind, exc,

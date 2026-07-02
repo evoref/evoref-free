@@ -383,7 +383,7 @@ def update_task_status(
                 title=current.title,
                 status="done",
             )
-        except Exception as exc:  # noqa: BLE001 — マーカー書き込み失敗で本体更新を止めない
+        except Exception as exc:
             logger.warning(
                 "update_task_status: progress_marker write failed for "
                 "task_id=%s project=%s: %s",
@@ -592,7 +592,7 @@ class LoopDriver:
                 project_id=self._state.project_id,
                 data=data or {},
             )
-        except Exception as exc:  # noqa: BLE001 — イベント発行失敗で周回を止めない
+        except Exception as exc:
             logger.warning("LoopDriver._emit(%s) failed: %s", event, exc)
 
     @property
@@ -631,7 +631,7 @@ class LoopDriver:
         if self._bootstrap_on_start:
             try:
                 view = self._resolve_view(project_id)
-            except Exception as exc:  # noqa: BLE001 — view 取得失敗で start を止めない
+            except Exception as exc:
                 logger.warning(
                     "LoopDriver.start: view_provider failed for project=%s: %s",
                     project_id, exc,
@@ -652,7 +652,7 @@ class LoopDriver:
                             len(reopened), project_id,
                             self._state.orphan_tasks_reopened,
                         )
-                except Exception as exc:  # noqa: BLE001 — 回収失敗で start を止めない
+                except Exception as exc:
                     logger.warning(
                         "LoopDriver.start: orphan recovery failed for "
                         "project=%s: %s", project_id, exc,
@@ -666,7 +666,7 @@ class LoopDriver:
                             ),
                         ),
                     )
-                except Exception as exc:  # noqa: BLE001 — bootstrap 失敗で start を止めない
+                except Exception as exc:
                     logger.warning(
                         "LoopDriver.start: bootstrap failed for project=%s: %s",
                         project_id, exc,
@@ -981,7 +981,7 @@ class LoopDriver:
 
         try:
             outcome = await self._executor.execute(task)  # type: ignore[union-attr]
-        except Exception as exc:  # noqa: BLE001 — executor の任意例外を封じ込める
+        except Exception as exc:
             logger.warning(
                 "LoopDriver.run: executor raised for task=%s: %s",
                 task.task_id, exc,
@@ -1038,7 +1038,7 @@ class LoopDriver:
                     self._artifact_hook(  # type: ignore[misc]
                         project_id, task, list(outcome.artifacts),
                     )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning(
                         "LoopDriver.run: artifact_hook failed: %s", exc,
                     )
@@ -1152,7 +1152,7 @@ class LoopDriver:
         self,
         view: LoopFactView,
         project_id: str,
-        task: TaskFactView,
+        task: TaskFactView,  # noqa: ARG002
         outcome: ExecutionOutcome,
     ) -> None:
         """failure_pattern ファクトを書き込む。"""
@@ -1168,7 +1168,7 @@ class LoopDriver:
                             project_id=project_id,
                             gate_result=gr,
                         )
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         logger.warning(
                             "LoopDriver.run: write_failure_note failed: %s",
                             exc,
@@ -1205,7 +1205,7 @@ class LoopDriver:
                 project_id=project_id,
                 gate_result=synthetic,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "LoopDriver.run: write_failure_note (synthetic) failed: %s",
                 exc,

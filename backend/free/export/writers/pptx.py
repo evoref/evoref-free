@@ -116,7 +116,7 @@ class PptxWriter(BytesWriterBase):
     def requires(self) -> list[str]:
         return ["python-pptx"]
 
-    def _render_bytes(self, content: ExportContent, ext: str) -> bytes:
+    def _render_bytes(self, content: ExportContent, ext: str) -> bytes:  # noqa: ARG002
         return _build_pptx(content)
 
     def is_available(self) -> bool:

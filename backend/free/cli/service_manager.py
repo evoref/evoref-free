@@ -237,7 +237,7 @@ def _make_serve_cleanup(
 ):
     """serve 用 cleanup クロージャを生成（signal ハンドラから呼ばれる）。"""
 
-    def cleanup(signum=None, frame=None):
+    def cleanup(signum=None, frame=None):  # noqa: ARG001
         render_info(console, "Shutting down...")
         for p in procs:
             _kill_process_tree(p.pid)

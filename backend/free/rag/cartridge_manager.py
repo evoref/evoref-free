@@ -445,15 +445,34 @@ class CartridgeManager:
 
         self._clean_old_index(cart_dir, chunks_dir)
 
-        # 新しい VectorStore を作成
-        store = VectorStore(cart_dir, memmap_threshold=self._memmap_threshold)
-        store.load()
+        try:
+            # 新しい VectorStore を作成
+            store = VectorStore(cart_dir, memmap_threshold=self._memmap_threshold)
+            store.load()
 
-        total_chunks, doc_count = await self._chunk_and_embed_docs(docs_dir, store, embedder)
+            total_chunks, doc_count = await self._chunk_and_embed_docs(
+                docs_dir, store, embedder,
+            )
 
-        store.save()
+            store.save()
 
-        self._maybe_build_cluster_index(store)
+            self._maybe_build_cluster_index(store)
+        except Exception:
+            # _clean_old_index で旧索引は削除済みのため、ここで失敗すると
+            # カートリッジは索引なしの空状態で残る。黙殺されないよう
+            # needs_rebuild を立てて永続化し、unload 済みの in-memory 状態と
+            # レジストリ (status) を一致させる。
+            failed_info = self._registry[cartridge_id]
+            failed_info.needs_rebuild = True
+            failed_info.status = "installed"
+            try:
+                self._save_registry()
+            except Exception as save_exc:
+                logger.warning(
+                    "Failed to persist needs_rebuild for %s: %s",
+                    cartridge_id, save_exc,
+                )
+            raise
 
         # レジストリ更新
         info = self._registry[cartridge_id]
@@ -907,6 +926,9 @@ class CartridgeManager:
                 cart_id,
             )
             info.status = "installed"
+            # 索引欠損 = rebuild 中断等で空になったカートリッジ。needs_rebuild を
+            # 立てないと UI/API から復旧要否が見えないまま放置される。
+            info.needs_rebuild = True
             return True
 
         try:

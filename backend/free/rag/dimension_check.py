@@ -8,9 +8,10 @@ AppState.embedding_dim_mismatch をセットする共通ヘルパー。
 dim だけでは検知できず、既存ベクトルが stale のまま新クエリで検索されて
 RAG が静かに壊れる。これを補うため、embed モデル切替時に
 :func:`set_embed_reindex_required` で reindex 要求マーカーを立て、本チェックが
-モデル同一性ベースの mismatch として扱う (search ブロック + reindex 案内、
+モデル同一性ベースの mismatch として扱う (WARNING + stats 表示 + reindex 案内、
 ``auto_reindex_on_mismatch`` 有効時は自動 reindex)。マーカーは reindex 成功で
-:func:`clear_embed_reindex_required` により消える。
+:func:`clear_embed_reindex_required` により消える。さらに二重防御として、
+store_info の embedding_model と現行 embedder のモデル名も突合する。
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ def _embed_reindex_marker_path() -> Path | None:
         from backend.config import get_path_resolver
 
         return get_path_resolver().resolve_local("vectors_dir") / _EMBED_REINDEX_MARKER
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -60,11 +61,12 @@ def set_embed_reindex_required(new_model: str) -> None:
             encoding="utf-8",
         )
         logger.info(
-            "Embed reindex marker set (model changed to %s); search blocked until "
-            "reindex (run 'evoref reindex' or set embedding.auto_reindex_on_mismatch)",
+            "Embed reindex marker set (model changed to %s); search results are "
+            "unreliable until reindex (run 'evoref reindex' or set "
+            "embedding.auto_reindex_on_mismatch)",
             new_model,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Failed to write embed reindex marker: %s", exc)
 
 
@@ -75,8 +77,38 @@ def clear_embed_reindex_required() -> None:
         return
     try:
         p.unlink(missing_ok=True)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Failed to clear embed reindex marker: %s", exc)
+
+
+def embedder_config_mismatch(state: "AppState") -> tuple[str, str] | None:
+    """embedder の model_name と config の embedding.model_name の不一致を検出する。
+
+    migrate 成功直後は config は新モデルに切り替わっているが、embed サーバと
+    ``state.embedder`` は再起動 / reload まで旧モデルのまま残る。この状態で
+    reindex / reembed を実行すると旧モデルのベクトルでストアを再構築し、
+    stale マーカーまでクリアしてしまう (順序依存の罠)。実行前の前提チェック
+    として双方非空の場合のみ突合し、不一致なら ``(current, expected)`` を返す。
+    判定不能 (embedder 未初期化 / config 未ロード / 片方空) は ``None``。
+    """
+    embedder = state.embedder
+    if embedder is None:
+        return None
+    try:
+        current = str(embedder.model_name() or "")
+    except Exception:
+        return None
+    try:
+        from backend.config import get_config
+
+        expected = str((get_config().get("embedding") or {}).get("model_name") or "")
+    except Exception:
+        return None
+    if not current or not expected:
+        return None
+    if current != expected:
+        return (current, expected)
+    return None
 
 
 def check_embedding_dim_consistency(state: "AppState") -> bool:
@@ -111,7 +143,7 @@ def check_embedding_dim_consistency(state: "AppState") -> bool:
     if marker is not None and marker.exists():
         logger.warning(
             "EMBED MODEL CHANGED since last index (reindex marker present). "
-            "Existing vectors are stale; search will be blocked. "
+            "Existing vectors are stale; search results are unreliable. "
             "Run 'evoref reindex' to rebuild.",
         )
         mismatch = True
@@ -137,10 +169,27 @@ def check_embedding_dim_consistency(state: "AppState") -> bool:
         elif stored_dim != embedder_dim:
             logger.warning(
                 "DIMENSION MISMATCH: stored vector dim=%d, current embedder dim=%d. "
-                "Search will be blocked. Run 'evoref reindex' to rebuild.",
+                "Search results are unreliable. Run 'evoref reindex' to rebuild.",
                 stored_dim, embedder_dim,
             )
             mismatch = True
+        else:
+            # 同 dim の別モデル切替はマーカーが唯一のガードだったが、マーカーが
+            # 誤ってクリアされた後の二重防御としてモデル名も突合する
+            # (双方非空時のみ。旧フォーマットの store_info 無しはスキップ)。
+            stored_model = str((vs.store_info or {}).get("embedding_model") or "")
+            try:
+                current_model = str(embedder.model_name() or "")
+            except Exception:
+                current_model = ""
+            if stored_model and current_model and stored_model != current_model:
+                logger.warning(
+                    "EMBED MODEL MISMATCH: stored vectors were built with '%s' but "
+                    "current embedder is '%s'. Search results are unreliable. "
+                    "Run 'evoref reindex' to rebuild.",
+                    stored_model, current_model,
+                )
+                mismatch = True
 
     state.embedding_dim_stored = stored_dim
 

@@ -84,7 +84,7 @@ def _normalize_url(url: str) -> tuple[str, str]:
     """
     try:
         parsed = urlparse(url)
-    except Exception:  # noqa: BLE001 - 不正 URL は no-op
+    except Exception:
         return "", ""
     if parsed.scheme not in ("http", "https"):
         return "", ""
@@ -234,7 +234,7 @@ async def _score_url(
             purpose="url_relevance_score",
             response_schema=UrlRelevanceJudgement,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("url_curator: assist scoring failed: %s", exc)
         return None
     from backend.free.llm.json_extract import extract_json_object
@@ -357,7 +357,7 @@ async def curate_url_facts(
                         confidence=new_avg,
                     )
                     written += 1
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning(
                         "url_curator: penalize-update failed for %s: %s",
                         host, exc,
@@ -402,7 +402,7 @@ async def curate_url_facts(
                         emb = await embedder.embed([topic], is_query=False)
                         if emb is not None and len(emb) > 0:
                             embedding = np.asarray(emb[0], dtype=np.float32)
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         logger.warning("url_curator: embed failed: %s", exc)
 
                     extra = {
@@ -430,7 +430,7 @@ async def curate_url_facts(
                     )
                     store.add_fact(fact)
                     written += 1
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("url_curator: persist failed for %s: %s", host, exc)
 
         # ペア処理完了 — score < min_record / fetch 失敗を含む全分岐で必ず
@@ -443,7 +443,7 @@ async def curate_url_facts(
                 op="url_curator",
                 stats={"facts_curated": written},
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     if written:
         logger.info("url_curator: curated %d URL fact(s)", written)

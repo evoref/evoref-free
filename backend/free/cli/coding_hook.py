@@ -48,7 +48,7 @@ class _NoOpCodingHook:
     def is_available(self) -> bool:
         return False
 
-    def on_mode_resolved(self, mode: str) -> None:
+    def on_mode_resolved(self, mode: str) -> None:  # noqa: ARG002
         return None
 
 

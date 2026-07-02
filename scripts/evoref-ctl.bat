@@ -61,11 +61,17 @@ if exist ".venv\Scripts\python.exe" (
     set "VENV_UVICORN=uvicorn"
 )
 
+rem 旧 llama-server が port を握ったまま新プロセスが bind 失敗すると、
+rem 新プロセスは即死するが旧プロセスの /health 応答を拾って誤って ready 判定
+rem されてしまう (モデル切替が反映されない不具合の原因)。spawn 前に一掃する。
+echo [start] Ensuring no stale llama-server.exe is running...
+taskkill /im "llama-server.exe" /f >nul 2>&1
+
 echo [start] Starting llama-server (base + assist + embedding)...
 start "llama-server" /min cmd /c ""%VENV_PYTHON%" scripts\launch_llama.py config.yaml --all"
 
 echo [start] Waiting for llama-server to be ready (up to 60s)...
-powershell -NoProfile -Command "$elapsed=0; do { Start-Sleep 2; $elapsed+=2; try { $r=(Invoke-WebRequest http://localhost:8080/health -TimeoutSec 1 -UseBasicParsing).StatusCode } catch { $r=0 } } while ($r -ne 200 -and $elapsed -lt 60); if ($r -ne 200) { Write-Host '[start] WARNING: llama-server health check timed out, proceeding anyway' }"
+powershell -NoProfile -Command "$targets=[ordered]@{'base'=8080;'assist'=8081;'embed'=8082}; foreach ($t in $targets.GetEnumerator()) { $elapsed=0; do { Start-Sleep 2; $elapsed+=2; try { $r=(Invoke-WebRequest \"http://localhost:$($t.Value)/health\" -TimeoutSec 1 -UseBasicParsing).StatusCode } catch { $r=0 } } while ($r -ne 200 -and $elapsed -lt 60); if ($r -ne 200) { Write-Host \"[start] WARNING: $($t.Key) (port $($t.Value)) health check timed out, proceeding anyway\" } }"
 
 echo [start] Starting FastAPI backend on :8000...
 start "evoref-backend" /min cmd /c ""%VENV_UVICORN%" backend.main:app --host 0.0.0.0 --port 8000"

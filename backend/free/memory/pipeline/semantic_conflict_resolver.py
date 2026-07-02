@@ -197,7 +197,7 @@ class SemanticConflictResolver:
                     group.subject, group.predicate,
                 )
                 continue
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 # sleep-time は best-effort。apply_resolution の I/O 失敗
                 # (OSError 等) や想定外で 1 グループが落ちても、残りの解消と
                 # sleep サイクル全体を止めない。

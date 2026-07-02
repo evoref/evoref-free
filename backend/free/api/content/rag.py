@@ -3,9 +3,10 @@
 import os
 import time
 
-from fastapi import APIRouter, Depends, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 
 from backend.app_state import AppState, get_app_state
+from backend.i18n_helper import msg
 from backend.free.api.content._rag_helpers import (
     aggregate_sources,
     compute_index_size_mb,
@@ -179,6 +180,7 @@ async def reindex_vectors(
         dry_run: True なら対象件数だけ返して実行しない
         cartridge: カートリッジ ID を指定すると当該カートリッジのみ
     """
+    from backend.free.rag.dimension_check import embedder_config_mismatch
     from backend.free.rag.reindex import plan_reindex, run_reindex
 
     if state.embedder is None:
@@ -194,12 +196,25 @@ async def reindex_vectors(
             "memory_notes": plan.memory_notes,
         }
 
+    # migrate 直後で embedder が旧モデルのまま実行すると、旧モデルのベクトルで
+    # 再構築して stale マーカーまでクリアしてしまう (順序依存の罠)。embed
+    # サーバ再起動 + embedder reload が済むまで実行を拒否する。
+    stale = embedder_config_mismatch(state)
+    if stale is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=msg(
+                "error.rag.stale_embedder", current=stale[0], expected=stale[1],
+            ),
+        )
+
     result = await run_reindex(state, cartridge_id=cartridge)
     return {
         "dry_run": False,
         "rag_chunks": result.rag_chunks,
         "cartridge_chunks": result.cartridge_chunks,
         "cartridges_rebuilt": result.cartridges_rebuilt,
+        "cartridges_failed": result.cartridges_failed,
         "memory_notes_reset": result.memory_notes_reset,
         "elapsed_sec": result.elapsed_sec,
         "embedding_dim_mismatch": state.embedding_dim_mismatch,

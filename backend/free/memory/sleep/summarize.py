@@ -60,7 +60,7 @@ async def summarize_unsummarized_sessions(
 
     try:
         mgr = get_history_manager()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Failed to init HistoryManager for step 8-9: %s", exc)
         return 0
 
@@ -103,7 +103,7 @@ async def summarize_unsummarized_sessions(
 
             entry.summary = session.summary
             summarized += 1
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "Failed to summarize session %s: %s", entry.session_id, exc,
             )

@@ -69,6 +69,14 @@ class LLMProcessCrashedError(LLMError):
     i18n_key = "error.llama.process_crashed"
 
 
+class LLMRequestRejectedError(LLMError):
+    """E1007: サーバーは健全だがリクエストを内容起因で拒否 (例: context 長超過)"""
+
+    code = "E1007"
+    status_code = 400
+    i18n_key = "error.llama.request_rejected"
+
+
 # ── E3xxx: ファイルシステム関連 ──
 
 

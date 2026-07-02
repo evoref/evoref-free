@@ -393,7 +393,7 @@ def _resolve_profile_sampling_for_mode(cfg: dict, mode: str) -> dict:
                 for k, v in raw.items()
                 if k in _PROFILE_SAMPLING_KEYS and v is not None
             }
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug("Profile sampling resolution failed for mode %s: %s", mode, e)
         sampling = {}
 
@@ -441,13 +441,13 @@ def _resolve_profile_reasoning(cfg: dict, slot: str) -> dict:
 
             try:
                 reasoning = ProfileReasoningConfig(**raw).model_dump()
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning(
                     "Invalid reasoning profile for slot %s (using defaults): %s",
                     slot, e,
                 )
                 reasoning = {}
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug("Profile reasoning resolution failed for slot %s: %s", slot, e)
         reasoning = {}
 
@@ -487,7 +487,7 @@ def resolve_reasoning_mode(
             return _TEMPLATE_FAMILY_REASONING_MODE.get(
                 detect_template_family(chat_template),
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             return None
     return None
 
@@ -591,7 +591,7 @@ def _resolve_profile_context_size(cfg: dict, slot: str) -> int | None:
             ivalue = int(raw)
             if ivalue >= 512:
                 value = ivalue
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug("Profile context_size resolution failed for slot %s: %s", slot, e)
         value = None
 
@@ -640,7 +640,7 @@ def _resolve_profile_context_size_for_mode(cfg: dict, mode: str) -> int | None:
             ivalue = int(raw)
             if ivalue >= 512:
                 value = ivalue
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug("Profile context_size resolution failed for mode %s: %s", mode, e)
         value = None
 

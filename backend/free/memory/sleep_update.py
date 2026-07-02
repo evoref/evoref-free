@@ -237,14 +237,14 @@ class SleepTimeWorker:
         stores = []
         try:
             stores.append(provider("global"))
-        except Exception as exc:  # noqa: BLE001 - 外側で警告のみ
+        except Exception as exc:
             logger.warning("Failed to open global semantic store: %s", exc)
         if self._current_project_id:
             try:
                 stores.append(
                     provider(f"project:{self._current_project_id}"),
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     "Failed to open project semantic store %s: %s",
                     self._current_project_id, exc,

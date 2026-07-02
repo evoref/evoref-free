@@ -271,6 +271,17 @@ class AppState:
         self._semantic_stores[scope] = store
         return store
 
+    def invalidate_semantic_stores(self) -> None:
+        """キャッシュ済み SemanticFactStore を全て破棄する.
+
+        embed モデルの cross-model 切替 (manifest の active model_id swap) 後に
+        呼び、次回 :meth:`get_semantic_store` で新 manifest からロードし直させる。
+        なお既に配線済みの Fact View (MemFactView / LearnFactView) は wire 時に
+        掴んだ旧 store 参照を保持するため、chat リコール等の live 反映には別途
+        backend 再起動が必要 (本メソッドはキャッシュ層のみ無効化する)。
+        """
+        self._semantic_stores.clear()
+
     # ── LLM クライアント設定 ──
 
     def set_local_client(self, client: LocalClient | None) -> None:

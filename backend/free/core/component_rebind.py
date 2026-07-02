@@ -39,14 +39,14 @@ async def rebind_component(
         if not await new.health_check():
             try:
                 await new.aclose()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
             raise RuntimeError("assist health_check failed after restart")
         state.set_assist_client(new)
         if old is not None:
             try:
                 await old.aclose()
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("old assist_client close failed: %s", e)
         logger.info("assist client rebound")
         return
@@ -61,14 +61,14 @@ async def rebind_component(
         if not await new.health_check():
             try:
                 await new.aclose()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
             raise RuntimeError("embedding health_check failed after restart")
         state.embedder = new
         if old is not None:
             try:
                 await old.aclose()
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("old embedder close failed: %s", e)
         logger.info("embedding backend rebound")
         return

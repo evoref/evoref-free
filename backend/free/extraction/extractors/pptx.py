@@ -38,7 +38,7 @@ class PptxExtractor(BinarySourceExtractorBase):
     def _extract_from_source(
         self,
         source: Path | BinaryIO,
-        source_name: str,
+        source_name: str,  # noqa: ARG002
     ) -> tuple[str, dict[str, Any]]:
         Presentation = self._import_pptx()
         # python-pptx は str / file-like を受け付ける。

@@ -134,7 +134,7 @@ def _shutdown_semmem_index_flush(state: AppState) -> None:
     for scope, store in list(stores.items()):
         try:
             store.flush_index()
-        except Exception as e:  # noqa: BLE001 — flush 失敗で shutdown を止めない
+        except Exception as e:
             logger.warning(
                 "SemMem index flush on shutdown failed (%s): %s", scope, e,
             )
@@ -236,7 +236,7 @@ async def _shutdown_develop(
         return
     try:
         await develop_shutdown(state)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("Develop lifecycle shutdown failed: %s", e)
 
 
@@ -256,17 +256,17 @@ async def _shutdown_evolve_pipeline(
             bridge_task.cancel()
         try:
             await bridge_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        except (asyncio.CancelledError, Exception):
             pass
     if log_ingestor is not None:
         try:
             await log_ingestor.stop()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("LogIngestor.stop failed: %s", e)
     if policy_adjuster is not None:
         try:
             await policy_adjuster.flush_all()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("PolicyAdjuster.flush_all failed: %s", e)
 
 
@@ -315,7 +315,7 @@ async def _run_lifespan_shutdown(
             task.cancel()
             try:
                 await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):
                 pass
     # develop=evolve 時に起動した LogIngestor + PolicyAdjuster
     # bridge を安全停止する (loop_run_cancel の直後で、LLM client close より
@@ -339,7 +339,7 @@ async def _run_lifespan_shutdown(
         if state.llama_manager is not None:
             try:
                 state.llama_manager.shutdown_all()
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("llama_manager shutdown_all failed: %s", e)
     return shutdown_timings
 

@@ -472,7 +472,7 @@ async def judge_user_reply(
             max_tokens=192,
             temperature=0.0,
         )
-    except Exception as exc:  # noqa: BLE001 — 判定失敗は no-op で吸収
+    except Exception as exc:
         logger.warning("conflict_chat_judge failed: %s", exc)
         return None
 

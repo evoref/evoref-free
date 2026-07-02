@@ -156,7 +156,7 @@ def apply_rebuild_scope(
     # から再構築する。M5-d 以降は新形式 index.jsonl への書き出しが永続索引なので、
     # 既存 in-memory state を _index_updater 経由で全件 upsert + compact する。
     store = SemanticFactStore(scope.root_dir)
-    for fact in store._facts.values():  # noqa: SLF001 (rebuild の本責務)
+    for fact in store._facts.values():
         store._index_updater.upsert(fact.id, _fact_to_index_attrs(fact))
     store._index_updater.compact()
     res.applied = True

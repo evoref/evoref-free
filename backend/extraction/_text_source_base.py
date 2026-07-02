@@ -69,7 +69,7 @@ class TextSourceExtractorBase(ABC):
         """
 
     def _build_metadata(
-        self, encoding: str, processed_text: str,
+        self, encoding: str, processed_text: str,  # noqa: ARG002
     ) -> dict[str, Any]:
         """ExtractionResult.metadata を構築する
 

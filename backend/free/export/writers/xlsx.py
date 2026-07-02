@@ -114,7 +114,7 @@ class XlsxWriter(BytesWriterBase):
     def requires(self) -> list[str]:
         return ["openpyxl"]
 
-    def _render_bytes(self, content: ExportContent, ext: str) -> bytes:
+    def _render_bytes(self, content: ExportContent, ext: str) -> bytes:  # noqa: ARG002
         return _build_xlsx(content)
 
     def is_available(self) -> bool:

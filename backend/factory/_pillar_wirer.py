@@ -192,7 +192,7 @@ def _start_capability_probe(
                     snapshot.effective_reasoning_mode,
                 )
                 client._enable_thinking = new_enable
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("Capability probe task failed (prior retained): %s", e)
 
     client._capability_probe_task = asyncio.create_task(_run())
@@ -254,7 +254,7 @@ async def _init_develop_gen_pillar(
             else:
                 state.develop.gen = develop_gen_pillar
             logger.info("Develop Gen pillar setup completed")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("Develop Gen pillar setup failed: %s", e)
     else:
         logger.debug("Develop Gen pillar not registered (skeleton stage)")
@@ -374,7 +374,7 @@ def _start_assist_capability_probe(
                 probe_json=True,  # assist は json purpose (url_relevance_score 等) を持つ
             )
             assist_client.capabilities = snapshot
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("Assist capability probe failed (prior retained): %s", e)
 
     assist_client._capability_probe_task = asyncio.create_task(_run())
@@ -500,7 +500,7 @@ def _init_learning_core(
                 if state.cartridge_manager is not None else []
             )
             buf.record(action_type, input_context[:2000], output, outcome, cart_ids)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug("assist experience record skipped: %s", e)
 
     state.assist_experience_recorder = _record_assist_experience
@@ -585,7 +585,7 @@ async def _check_embedding_dim(state: AppState, cfg: dict[str, Any]) -> None:
             warn_if_semmem_reembed_required,
         )
         warn_if_semmem_reembed_required()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug("SemMem stale guard check skipped: %s", e)
 
     if not mismatch:
@@ -1111,7 +1111,7 @@ def _wire_sleep_scheduler_models(
         try:
             versions_dir = resolver.resolve_local("lora_versions_dir")
             learning_scheduler.set_version_manager(vm_cls(versions_dir, lora_path))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug("Base LoRA version_manager injection skipped: %s", e)
 
     ecm_cls = get_pro_handler("eval_core_manager")
@@ -1119,7 +1119,7 @@ def _wire_sleep_scheduler_models(
         try:
             eval_core_path = resolver.resolve_local("eval_core_file")
             learning_scheduler.set_eval_core_manager(ecm_cls(eval_core_path))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug("eval_core_manager injection skipped: %s", e)
 
 
@@ -1166,7 +1166,7 @@ async def _inject_assist_components(
             cfg, resolver, state, learn_pillar, pro_gen,
             project_root=project_root,
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("Pro Learn pillar setup failed: %s", e)
         return None
 
@@ -1226,7 +1226,7 @@ def _init_tools(
     if callable(pro_register_tools):
         try:
             pro_register_tools(tools_reg, state, cfg)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("Pro tools registration failed: %s", e)
 
     state.tools_registry = tools_reg
@@ -1241,7 +1241,7 @@ def _init_tools(
         if global_store is not None:
             from backend.free.memory.views.mem import MemFactView
             mem_view = MemFactView(global_store)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("URL recall mem_view init skipped: %s", exc)
 
     tool_judge = ToolCallJudge(
@@ -1326,7 +1326,7 @@ def _init_loop_driver(
         gates_raw = loop_cfg.get("quality_gates") or {}
         try:
             gates_cfg = LoopQualityGatesConfig(**gates_raw)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "LoopDriver: quality_gates config invalid: %s (using defaults)",
                 exc,
@@ -1342,7 +1342,7 @@ def _init_loop_driver(
                 return None
             try:
                 return pi.get_all(mode)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 return None
 
         # Harness は HarnessFactView (read-only) で SemMem を参照する
@@ -1734,7 +1734,7 @@ def _log_gpu_cpu_placement(cfg: dict[str, Any], project_root: Path) -> None:
                     "  total estimated VRAM: %d MB / budget %d MB (OK)",
                     total_vram_mb, int(budget_mb),
                 )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.debug("GPU/CPU placement log failed: %s", exc)
 
 
@@ -1861,7 +1861,7 @@ async def _build_gen_pillar(
 async def _build_mem_pillar(
     state: AppState,
     base: _BaseContext,
-    gen: "GenPillar",
+    gen: "GenPillar",  # noqa: ARG001
     timings: dict[str, float],
 ) -> "MemPillar":
     """EvorefMem pillar を構築する (memory + cartridge + sleep-time + bootstrap)。
@@ -2058,7 +2058,7 @@ def _build_loop_pillar(
     base: _BaseContext,
     project_root: Path,
     gen: "GenPillar",
-    mem: "MemPillar",
+    mem: "MemPillar",  # noqa: ARG001
     learn: "LearnPillar",
     timings: dict[str, float],
 ) -> "LoopPillar":
@@ -2110,7 +2110,7 @@ async def _bridge_log_ingestor_to_policy_adjuster(
         async for pair in ingestor.stream_pairs():
             try:
                 await adjuster.consume(pair)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 # 個別 pair の処理失敗で bridge 全体を停止させない
                 logger.warning("PolicyAdjuster.consume failed: %s", exc)
                 continue
@@ -2120,7 +2120,7 @@ async def _bridge_log_ingestor_to_policy_adjuster(
         # 最終 flush: 蓄積中で閾値到達済の bucket を確実に書き出す
         try:
             await adjuster.flush_all()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("PolicyAdjuster.flush_all on cancel failed: %s", exc)
 
 
@@ -2172,7 +2172,7 @@ async def _init_evolve_pipeline(
     try:
         from backend.free.memory.project_resolver import resolve_project_id
         project_id = resolve_project_id(Path.cwd()).project_id
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning(
             "evolve pipeline: project_id resolution failed (using global only): %s",
             exc,
@@ -2243,7 +2243,7 @@ def _activate_learning_partition(base: "_BaseContext", state: AppState) -> None:
     resolver.set_active_model_stem(stem)
     try:
         state.active_base_model_slug = model_slug(active_filename)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Learning partition: model_slug failed (%s); staying flat", exc)
         resolver.set_active_model_stem(None)
         state.active_base_model_slug = ""
@@ -2261,7 +2261,7 @@ def _activate_learning_partition(base: "_BaseContext", state: AppState) -> None:
         ms = ModelState(resolver.resolve_local("model_state_file"))
         if ms.current_filename:
             producer_filename = ms.current_filename
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.debug("partition activation: ModelState read failed: %s", exc)
 
     migrator = LearningPartitionMigrator(
@@ -2361,7 +2361,7 @@ async def wire_pillars(
     with _timed(timings, "evolve_pipeline"):
         try:
             await _init_evolve_pipeline(state, project_root, learn, loop_pillar)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # evolve pipeline は補助機能のため、起動失敗してもアプリ全体を
             # 落とさない (WARN ログのみ)。loop / learn 自体には影響しない。
             logger.warning("evolve pipeline initialization failed: %s", exc)

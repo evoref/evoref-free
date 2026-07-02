@@ -138,12 +138,22 @@ export interface ReembedFactsResponse {
 	reembedded?: number;
 	/** 実行時のみ: 所要秒 */
 	elapsed_sec?: number;
+	/** モデル変更を伴う cross-model swap だったか (manifest を新モデルへ切替) */
+	model_changed?: boolean;
+	/** cross-model 時: 切替先 model_id */
+	new_model_id?: string | null;
+	/** cross-model 時: live リコール反映に backend 再起動が必須 */
+	restart_required?: boolean;
 }
 
-/** SemMem fact 埋め込みを現在の Embedder で in-place 再構築する (再起動不要)。
+/** SemMem fact 埋め込みを現在の Embedder で再構築する。
  *
  * RAG reindex は SemMem fact (URL/コマンドリコール) を対象外のため、embed モデル
- * 切替後に併せて実行する。次元が変わる切替はサーバが 409 を返す (CLI へ誘導)。
+ * 切替後に併せて実行する。
+ * - 同一モデル: live store を in-place 更新 (再起動不要)。
+ * - モデル変更 (model_id / dim): CLI reembed-facts と同一の cross-model swap を
+ *   サーバが実行 (全 scope 再embed + manifest swap)。live リコールの反映には
+ *   backend 再起動が必須で ``restart_required: true`` を返す。
  * - dry_run: 対象 fact 数だけ返す (プレビュー)。
  */
 export async function reembedFacts(
