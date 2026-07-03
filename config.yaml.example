@@ -532,6 +532,12 @@ embedding:
   # ドキュメント整形テンプレート。Qwen3 仕様では空 (prefix なし)。
   # 対称型埋め込み (例: e5) で文書側にも prefix が要る場合のみ設定。
   doc_template: ""
+  # Pooling 方式 (llama-server --pooling: none/mean/cls/last/rank)。既定 null は
+  # フラグを付与せず llama-server のモデル既定 pooling に委ねる (Qwen3-Embedding
+  # 等の既存挙動を変えない)。BGE-M3 (arch "bert") 等 CLS pooling が正しいモデルへ
+  # 切替える場合、embed 切替時に models/profiles/bert.yaml から "cls" が自動
+  # 転写されるため通常は手動設定不要。
+  pooling: null
 
 # ===== メモリシステム設定 =====
 memory:
@@ -1083,13 +1089,15 @@ coding:
   pipeline: longform                  # staged | longform (既定 longform)
   staged_enabled: true                # staged のキルスイッチ (pipeline と独立。false で即無効化)
   staged:
-    test_stage_enabled: true          # test 工程 (生成+pytest 実行+リペア)。false で生成のみ
+    test_stage_enabled: true          # test 工程のうち advisory ユニットテスト生成+pytest 実行。false で生成のみ
+    smoke_gate_enabled: true          # test 工程のうち決定論的 import スモーク+spec/flowchart 注入リペア。test_stage_enabled とは独立
     flowchart_enabled: true          # spec 工程で mermaid 設計フローチャートを合成し生成へ注入
     max_repair_rounds: 2              # test 失敗時のリペア最大回数 (0-5)
     max_test_regen_rounds: 2         # test が src の実 API に不整合な時 test のみ再生成 (src 不変・準ゲート, 0-5)
     entry_smoke_exec_enabled: true   # エントリ有界実行スモーク (advisory)。false で静的検査のみ
     entry_smoke_timeout_sec: 10.0    # エントリ有界実行スモークのタイムアウト
     spec_max_tokens: 1536            # spec.md 生成の最大トークン
+    code_max_tokens: 4096            # code 工程 (単一ファイル直接生成) の最大トークン。切断時のみ倍に広げ再生成
     spec_timeout_sec: 120.0          # spec 工程タイムアウト
     test_timeout_sec: 120.0          # 生成テストの pytest サブプロセスタイムアウト
     total_timeout_sec: 900.0         # staged 1 リクエスト全体のウォールクロック上限

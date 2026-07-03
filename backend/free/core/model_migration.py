@@ -665,8 +665,8 @@ class ModelMigrator:
         ``dim`` は GGUF の ``embedding_length`` (権威・必ず GGUF 由来)、
         ``model_name`` は GGUF ファイル名 stem、
         ``query_template`` / ``doc_template`` / ``instructions`` /
-        ``max_length`` / ``context_size`` は arch プロファイルの ``embedding:``
-        ブロック (``models/profiles/<arch>.yaml``) から取る。プロファイルに
+        ``max_length`` / ``pooling`` / ``context_size`` は arch プロファイルの
+        ``embedding:`` ブロック (``models/profiles/<arch>.yaml``) から取る。プロファイルに
         embedding ブロックが無い arch はテンプレート系を据え置き (WARNING)。
         embed component-migrate / rollback の config 同期に使う。
 
@@ -715,11 +715,14 @@ class ModelMigrator:
             profile = {}
         emb_prof = (profile or {}).get("embedding")
         if isinstance(emb_prof, dict) and emb_prof:
-            # query/doc テンプレ・instructions・max_length (1 入力の推奨上限) のみ同期。
-            # context_size/batch_size/ubatch_size はサーバ側 KV/バッチ資源で、並列スロット
-            # 分を要し model 固有でないため同期しない (config/schema 既定に委ねる)。
+            # query/doc テンプレ・instructions・max_length (1 入力の推奨上限)・
+            # pooling (llama-server --pooling へ転写、CLS pooling 系モデル向け)
+            # のみ同期。context_size/batch_size/ubatch_size はサーバ側 KV/バッチ
+            # 資源で、並列スロット分を要し model 固有でないため同期しない
+            # (config/schema 既定に委ねる)。
             for key in (
                 "query_template", "doc_template", "instructions", "max_length",
+                "pooling",
             ):
                 if key in emb_prof:
                     params[key] = emb_prof[key]

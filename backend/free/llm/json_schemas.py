@@ -200,7 +200,6 @@ class FlowchartSpec(_StrictModel):
     """CodeSpec から導く mermaid フローチャート (config で任意 ON)。"""
 
     mermaid: str = ""
-    notes: str = ""
 
 
 # ── staged コーディングのタスクグラフ合成 (coding_task_graph) ──

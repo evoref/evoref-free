@@ -33,7 +33,7 @@ from backend.free.generation.api_contract import (
 )
 
 if TYPE_CHECKING:
-    from backend.free.llm.json_schemas import CodeSpec
+    from backend.free.llm.json_schemas import CodeSpec, CodeSpecModule
 
 logger = logging.getLogger("backend.free.generation.smoke_validator")
 
@@ -139,7 +139,42 @@ def check_integrity(
                 f"エントリポイント {ep} に if __name__ == '__main__' ガードが無い"
             )
 
+    if spec is not None and spec.modules:
+        missing = _missing_spec_modules(files, spec.modules)
+        if missing:
+            # spec.modules[].path (契約合成 LLM) と CodeUnit.file_path (計画合成
+            # LLM) は独立した別呼び出しの産物で、両者の対応を強制するコードは
+            # 無い。統合/リネーム等の正当な理由もありうるため実失敗にはせず、
+            # ドリフトの可視化のみ行う (非ブロッキング)。
+            logger.warning(
+                "spec で宣言されたモジュールが生成物に見当たらない "
+                "(LLM がリネーム/統合した可能性、非致命): %s", ", ".join(missing),
+            )
+
     return errors
+
+
+def _missing_spec_modules(
+    files: dict[str, str], modules: list[CodeSpecModule],
+) -> list[str]:
+    """``spec.modules[].path`` のうち生成物に対応ファイルが無いものを返す。
+
+    完全一致 → basename 一致 (大小文字無視) の順でフォールバックし、パス表記
+    ゆれ (先頭 ``./`` の有無等) による誤検出を避ける。
+    """
+    declared = [m.path for m in modules if getattr(m, "path", "")]
+    generated_base = {
+        os.path.splitext(os.path.basename(p))[0].lower() for p in files
+    }
+    missing = []
+    for path in declared:
+        if path in files:
+            continue
+        stem = os.path.splitext(os.path.basename(path))[0].lower()
+        if stem in generated_base:
+            continue
+        missing.append(path)
+    return missing
 
 
 def _is_main_guard(node: ast.stmt) -> bool:

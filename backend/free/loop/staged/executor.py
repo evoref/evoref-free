@@ -4,12 +4,15 @@
 
 - ``spec`` : アシストモデルで設計仕様 (spec.md) を生成し workspace に永続化。
 - ``code`` : **base コーディングモデル** (注入された codegen 委譲) で当該モジュール
-  を生成。spec.md と既生成ファイル一覧を読み込んで整合を担保する (multi-pass は
-  委譲先 ``LongFormOrchestrator`` 内部)。
+  を単発生成。spec.md と既生成ファイル一覧を読み込んで instruction に埋め込み、
+  1 ファイル = 1 回の base 呼び出しで完結させる (``LongFormOrchestrator`` 経由の
+  plan/CodeSpec 再合成は経由しない。再合成は instruction の大半を lossy に圧縮し
+  spec/flowchart が実コードへ反映されない原因になるため)。
 - ``test`` : テストを生成 → ワークスペース限定 pytest 実行 → 失敗時リペアパス。
 
-base コードゲンは ``CodegenDelegate`` (callable) として DI 注入し、loop pillar が
-EvorefGen の具象 (LongFormOrchestrator) を import しないようにする。
+base コードゲンは ``CodegenDelegate`` (callable, ``(instruction, file_path) ->
+{path: code}``) として DI 注入し、loop pillar が EvorefGen の具象を import
+しないようにする。
 
 SemMem への task.status / progress_marker / failure_pattern 書込は ``LoopDriver``
 が ``ExecutionOutcome`` を見て一元管理する (本 executor は outcome を返すだけ)。
@@ -28,6 +31,7 @@ from typing import TYPE_CHECKING
 
 from backend.free.loop.executor import ArtifactEntry, ExecutionOutcome
 from backend.free.loop.quality_gate import GateResult, QualityGateOutcome
+from backend.free.loop.staged.synthesizer import MODULE_LIST_MARKER
 from backend.free.loop.staged.test_runner import StagedTestRunner
 from backend.free.loop.staged.workspace import WorkspaceManager, StageTestResult
 from backend.log_config import get_logger
@@ -40,14 +44,27 @@ if TYPE_CHECKING:
 
 logger = get_logger("loop.staged.executor")
 
-# instruction -> {logical_path: code}。base コーディングモデル経由のコード生成委譲。
-CodegenDelegate = Callable[[str], Awaitable[dict[str, str]]]
+# (instruction, file_path) -> {logical_path: code}。base コーディングモデル経由の
+# コード生成委譲。file_path は生成対象の論理パス (戻り値の主キー) を明示する。
+CodegenDelegate = Callable[[str, str], Awaitable[dict[str, str]]]
 
 _SPEC_PROMPT = """\
 Write a detailed software design specification in Markdown for the program below.
 Cover: purpose, module/file breakdown, key data structures, public interfaces \
 (function/class signatures), and the entry point. Be concrete enough that each \
-module can be implemented independently against this spec. Output ONLY the Markdown.
+module can be implemented independently against this spec. If the program design \
+below lists specific file paths, use those EXACT paths verbatim in the module/file \
+breakdown — do not rename, merge, split, or add files.
+
+Be decisive and unambiguous. For every concrete value, parameter, or behavior, \
+commit to ONE exact value/parameter name/type/default — never present it as an \
+example or an open alternative left to the implementer's discretion (do not \
+hedge with "e.g.", "such as", "or similar" for anything the implementation must \
+actually produce). When you describe a data structure's element values, state \
+the precise Python type they must hold at runtime, and call out any type that \
+could easily be substituted for a similar-looking one (for instance, a field \
+described as holding integers must say so explicitly enough that it is not \
+implemented with booleans instead). Output ONLY the Markdown.
 
 Program design:
 {description}
@@ -56,12 +73,14 @@ Program design:
 _FLOWCHART_PROMPT = """\
 You are a software architect. From the design specification below, produce a Mermaid \
 flowchart (start with "flowchart TD") showing the modules, their dependencies, and the \
-control/data flow. Return JSON with a "mermaid" key (the flowchart code, NO ``` fences) \
-and an optional "notes" key.
+control/data flow. Return JSON with a "mermaid" key (the flowchart code, NO ``` fences).
 
 Design specification:
 {spec}
 """
+
+# フローチャート合成入力の合計予算 (module_list を優先し、残りを narrative に充てる)。
+_FLOWCHART_CONTEXT_CHARS = 4000
 
 
 def _os_constraint() -> str:
@@ -93,6 +112,23 @@ def _finish_reason(resp: dict) -> str:
 
 # spec 本文再生成時の max_tokens 上限 (backend/schemas/coding.py の le=8192 と整合)。
 _SPEC_MAX_TOKENS_CEILING = 8192
+
+
+def _extract_module_list(description: str) -> str:
+    """spec タスクの description から正準モジュール一覧ブロックを取り出す。
+
+    ``synthesizer.synthesize_coding_task_graph`` が ``MODULE_LIST_MARKER`` 以降に
+    埋め込む ``file_path`` 群は、決定論的に展開された各 code タスクの
+    ``source_path`` と 1:1 で一致する (= 正準)。spec 本文はここから **別の** LLM
+    呼び出しで自由記述生成されるため、その出力がこの一覧を忠実に再現する保証は
+    ない。呼出側はこの戻り値を spec.md に決定的に追記し、コード生成が参照する
+    ファイル一覧を必ず正しいものにする。マーカーが無ければ空文字 (アシスト未接続
+    等で modules が無かった場合)。
+    """
+    idx = description.find(MODULE_LIST_MARKER)
+    if idx == -1:
+        return ""
+    return description[idx + len(MODULE_LIST_MARKER):].strip()
 
 
 def _pick_primary(files: dict[str, str], source_path: str) -> str:
@@ -215,7 +251,8 @@ class StagedCodingExecutor:
         workspace: 工程間ハンドオフ用 :class:`WorkspaceManager`。
         assist_client: spec 工程で使うアシスト。``None`` なら spec は description
             をそのまま spec.md に書く degraded 動作。
-        codegen: base コーディングモデル経由の生成委譲 (instruction -> {path: code})。
+        codegen: base コーディングモデル経由の生成委譲
+            (instruction, file_path -> {path: code})。
         smoke_runner: 生成 src 群を import スモーク検証する callable
             (``run_import_smoke`` をラップ注入)。``.errors`` / ``.warnings`` を
             duck-typed で参照。``None`` (degraded) ならスモークゲートはスキップ
@@ -293,20 +330,29 @@ class StagedCodingExecutor:
         spec_text = await self._generate_spec_doc(task.description)
         if not spec_text:
             spec_text = task.description
+        module_list = _extract_module_list(task.description)
 
-        # 設計フローチャート (mermaid) を合成し、spec.md に埋め込み + flowchart.md へ保存。
-        # code/test 工程はこれを読んで整合的に生成する (= 検討)。
+        # 設計フローチャート (mermaid) を合成し flowchart.md へ保存。code/test 工程は
+        # flowchart.md を読んで整合的に生成する。spec.md には埋め込まない
+        # (flowchart.md を単一の真実とし、code/test 工程側の flow_block 注入との
+        # 二重埋め込みを避ける)。
         flowchart = ""
         if self.flowchart_enabled and self.assist_client is not None:
             self._emit("spec", "フローチャートを生成中", "running", task.task_id)
-            flowchart = await self._synthesize_flowchart(spec_text)
+            flowchart = await self._synthesize_flowchart(module_list, spec_text)
             if flowchart.strip():
                 self.workspace.write_flowchart(flowchart, task_id=task.task_id)
 
         final_spec = spec_text
-        if flowchart.strip():
+        if module_list:
+            # spec_text は task.description とは別の LLM 呼び出しの自由記述であり、
+            # 与えたファイル一覧を忠実に再現する保証が無い。code タスクの
+            # source_path と必ず一致する正準一覧を決定的に追記し、コード生成が
+            # 常に正しいファイル一覧を参照できるようにする。
             final_spec = (
-                f"{spec_text}\n\n## フローチャート\n\n```mermaid\n{flowchart}\n```\n"
+                f"{spec_text}\n\n"
+                f"## Canonical file list (authoritative — generated files MUST "
+                f"match these exact paths)\n{module_list}\n"
             )
         wf = self.workspace.write_spec(final_spec, task_id=task.task_id)
         self.workspace.upsert_task(
@@ -373,16 +419,27 @@ class StagedCodingExecutor:
             return retry_text
         return spec_text
 
-    async def _synthesize_flowchart(self, spec_text: str) -> str:
+    async def _synthesize_flowchart(self, module_list: str, spec_text: str) -> str:
         """設計仕様から mermaid フローチャートを合成する (失敗時は空文字)。
+
+        入力は正準モジュール一覧 (``module_list``、常に完全) を先頭に置き、残り予算を
+        spec 本文の narrative に充てる。旧実装は spec_text の先頭 4000 文字のみを
+        渡していたため、長い spec では narrative の途中で切れ、末尾のモジュールが
+        フローチャートから欠落しうった。module_list は 1 モジュール 1 行の短い
+        列挙のため、全モジュールがほぼ確実に予算内に収まる。
 
         既存の ``flowchart_synthesis`` purpose / ``FlowchartSpec`` を再利用する。
         """
         if self.assist_client is None:
             return ""
+        if module_list:
+            remaining = max(_FLOWCHART_CONTEXT_CHARS - len(module_list), 0)
+            context = f"{module_list}\n\n{spec_text[:remaining]}"
+        else:
+            context = spec_text[:_FLOWCHART_CONTEXT_CHARS]
         try:
             data = await self.assist_client.generate_json(
-                _FLOWCHART_PROMPT.format(spec=spec_text[:4000]),
+                _FLOWCHART_PROMPT.format(spec=context),
                 max_tokens=1024, temperature=0.3,
                 purpose="flowchart_synthesis",
             )
@@ -396,8 +453,7 @@ class StagedCodingExecutor:
     async def _run_code(self, task: "TaskFactView") -> ExecutionOutcome:
         source_path = task.source_path or f"{task.task_id}.py"
         self._emit("code", f"コード生成中: {source_path}", "running", task.task_id)
-        spec = self.workspace.read_spec() or ""
-        flowchart = self.workspace.read_flowchart() or ""
+        spec, flowchart = self._read_spec_and_flowchart(f"code stage {source_path}")
         api_block = build_sibling_api_block(self._sibling_src(source_path))
         if api_block:
             contract_block = (
@@ -428,11 +484,15 @@ class StagedCodingExecutor:
             f"Produce the COMPLETE, fully working contents of the single file "
             f"`{source_path}` implementing the above with real logic — do NOT leave "
             f"function/method bodies as stubs (no bare `pass`, `# TODO`/`...` "
-            f"placeholders, or NotImplementedError). Output only this file's code."
+            f"placeholders, or NotImplementedError). Use the EXACT Python types "
+            f"stated in the shared design specification's data structures — do "
+            f"NOT substitute a different type that merely behaves similarly "
+            f"(e.g. if a field is specified as holding `int` values, it must "
+            f"hold real `int`s, not `bool`). Output only this file's code."
             + _os_constraint()
         )
         try:
-            files = await self.codegen(instruction)
+            files = await self.codegen(instruction, source_path)
         except Exception as exc:
             logger.warning("code generation failed for %s: %s", source_path, exc)
             self._fail_task(task, f"codegen error: {exc}")
@@ -523,6 +583,17 @@ class StagedCodingExecutor:
         self._record(task.task_id, gate, attempt)
         self._emit_smoke(task, errors, warnings, attempt)
 
+        # spec/flowchart はループ外で 1 度だけ読む (毎試行同一、I/O 削減)。修正指示に
+        # 含めないと base モデルは「エラーを消すこと」だけを目標にでき、spec の
+        # ロジック (境界条件・データ構造・エントリポイント仕様等) を無視した修正
+        # (機能削除・別ロジックへの置換) を許してしまう。
+        spec, flowchart = self._read_spec_and_flowchart(f"smoke repair {source_path}")
+        spec_block = f"## Shared design specification\n{spec}\n\n" if spec.strip() else ""
+        repair_flow_block = (
+            f"## Module architecture diagram\n```mermaid\n{flowchart}\n```\n\n"
+            if flowchart.strip() else ""
+        )
+
         while errors and attempt <= self.max_repair_rounds:
             self.workspace.bump_task_attempt(task.task_id)
             self._emit("test", f"コード修正 (試行 {attempt + 1})", "running", task.task_id)
@@ -537,14 +608,17 @@ class StagedCodingExecutor:
             repair_instr = (
                 f"The generated module(s) failed an import smoke test.\n\n"
                 f"## Smoke errors\n" + "\n".join(f"- {e}" for e in errors) + "\n\n"
+                f"{spec_block}"
+                f"{repair_flow_block}"
                 f"{sibling_block}"
                 f"## Current source `{source_path}`\n```python\n{cur_src}\n```\n\n"
-                f"Fix `{source_path}` so it imports and runs without these errors. "
+                f"Fix `{source_path}` so it imports and runs without these errors, "
+                f"while remaining faithful to the design specification above. "
                 f"KEEP ALL existing functionality — do NOT remove features, classes, or "
                 f"functions, and do NOT shrink the program to a stub. "
                 f"Output only the corrected `{source_path}` code."
             )
-            fixed = await self._safe_codegen(repair_instr)
+            fixed = await self._safe_codegen(repair_instr, source_path)
             self._apply_source_fixes(fixed, source_path, task.task_id)
             attempt += 1
             errors, warnings = await self._smoke_once()
@@ -591,8 +665,7 @@ class StagedCodingExecutor:
         """参考用ユニットテストを 1 回生成・実行する (ソースは書き換えない)。"""
         if self.test_runner is None:
             return None
-        spec = self.workspace.read_spec() or ""
-        flowchart = self.workspace.read_flowchart() or ""
+        spec, flowchart = self._read_spec_and_flowchart(f"advisory test {source_path}")
         src_code = self.workspace.read_file(source_path, kind="src") or ""
         test_logical = _test_logical_for(source_path)
         stem = Path(source_path).stem
@@ -615,7 +688,9 @@ class StagedCodingExecutor:
             f"- Use only runnable Python; never subscript typing.TypedDict.\n"
             f"Output only the test file's code."
         )
-        test_code = _pick_primary(await self._safe_codegen(gen_instr), test_logical)
+        test_code = _pick_primary(
+            await self._safe_codegen(gen_instr, test_logical), test_logical,
+        )
         if not test_code.strip():
             self._emit("test", "ユニットテスト生成なし (参考)", "done", task.task_id)
             return None
@@ -641,11 +716,27 @@ class StagedCodingExecutor:
                 f"import them from `{stem}`). At least one `def test_...` with asserts. "
                 f"Output only the test file's code."
             )
-            regen_code = _pick_primary(await self._safe_codegen(fix_instr), test_logical)
+            regen_code = _pick_primary(
+                await self._safe_codegen(fix_instr, test_logical), test_logical,
+            )
             if not regen_code.strip():
                 break
             test_code = regen_code
             violations = self._contract_violations(source_path, test_code)
+
+        # 構文的に無効な test (中間切断等) は書き込む前に弾く。契約チェッカは構文
+        # エラーを例外握り潰しで違反ゼロ扱いにする (_contract_violations) ため、この
+        # ゲートが無いと壊れたテストファイルがそのまま永続化・pytest 実行されうる。
+        if not _is_valid_python(test_code):
+            logger.warning(
+                "advisory unit test for %s is not valid Python; treating as "
+                "no test generated", source_path,
+            )
+            self._emit(
+                "test", f"ユニットテスト生成失敗 (構文エラー、参考): {test_logical}",
+                "failed", task.task_id,
+            )
+            return None
 
         wf = self.workspace.write_file(
             test_logical, test_code, kind="test", stage="test",
@@ -689,6 +780,27 @@ class StagedCodingExecutor:
             return []
 
     # ── ヘルパ ────────────────────────────────────────────────────────
+    def _read_spec_and_flowchart(self, context: str) -> tuple[str, str]:
+        """spec.md / flowchart.md を読み込む (診断ログ付き)。
+
+        依存ゲーティング (code/test タスクは spec タスク done 後にのみ実行される)
+        により、通常運用では spec.md は必ず存在する。読めない場合はワークスペース
+        破損等の異常サインなので、黙ってフォールバックせず warning を残す。
+        """
+        raw_spec = self.workspace.read_spec()
+        if raw_spec is None:
+            logger.warning(
+                "spec.md not found for %s (dependency gating should guarantee "
+                "spec is done first) — proceeding with empty spec", context,
+            )
+        raw_flowchart = self.workspace.read_flowchart()
+        if raw_flowchart is None and self.flowchart_enabled:
+            logger.warning(
+                "flowchart.md not found for %s despite flowchart_enabled=True "
+                "— proceeding without it", context,
+            )
+        return raw_spec or "", raw_flowchart or ""
+
     def _sibling_src(self, source_path: str) -> dict[str, str]:
         """``source_path`` 以外の既コミット src ファイル {logical_path: code} を返す。"""
         return {
@@ -697,9 +809,9 @@ class StagedCodingExecutor:
             if f.logical_path != source_path
         }
 
-    async def _safe_codegen(self, instruction: str) -> dict[str, str]:
+    async def _safe_codegen(self, instruction: str, file_path: str) -> dict[str, str]:
         try:
-            return await self.codegen(instruction) or {}
+            return await self.codegen(instruction, file_path) or {}
         except Exception as exc:
             logger.warning("staged codegen failed: %s", exc)
             return {}

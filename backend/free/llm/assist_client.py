@@ -457,10 +457,28 @@ class _EmptyResponseError(RuntimeError):
         self.data = data
 
 
+# "Context size has been exceeded" はプロンプトサイズに起因する決定論的
+# エラーで、ペイロードを変えない限り再試行しても必ず同じ結果になるため
+# retryable status (500) から除外する。
+_NON_RETRYABLE_ERROR_SUBSTRINGS: tuple[str, ...] = (
+    "context size has been exceeded",
+)
+
+
 def _is_retryable_status(exc: BaseException) -> bool:
     """``HTTPStatusError`` のうち retryable status のみ True を返す述語"""
     if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in RETRYABLE_STATUS_CODES
+        if exc.response.status_code not in RETRYABLE_STATUS_CODES:
+            return False
+        if exc.response.status_code == 500:
+            try:
+                body = exc.response.json()
+            except ValueError:
+                return True
+            message = str((body.get("error") or {}).get("message", "")).lower()
+            if any(s in message for s in _NON_RETRYABLE_ERROR_SUBSTRINGS):
+                return False
+        return True
     return False
 
 
@@ -641,7 +659,16 @@ class AssistModelClient(BaseHTTPClient):
         #   always = enable_thinking は送らない (OFF 不可) が reasoning_budget は送る
         #            (budget=0 等で常時思考を抑制できるため)
         #   toggle = 従来どおり enable_thinking + reasoning_budget
-        from backend.config import resolve_enable_thinking, resolve_reasoning_mode
+        from backend.config import (
+            resolve_context_size,
+            resolve_enable_thinking,
+            resolve_reasoning_mode,
+        )
+
+        # サイズガード (code_repair / prompt_evolution 等) が参照する assist
+        # の有効 context_size。scripts/launch_llama.py の -c 解決と同じ
+        # 優先順位 (config 明示 > arch プロファイル > 既定) で揃える。
+        self.context_size: int = resolve_context_size(config, "assist")
 
         self._reasoning_mode = resolve_reasoning_mode(config, "assist")
         # reasoning_budget は mode="none" のときだけ送らない (always/toggle は honor しうる)

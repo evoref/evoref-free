@@ -1,5 +1,7 @@
 """RAG / 埋め込み / リランカー関連スキーマ"""
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -326,6 +328,13 @@ class EmbeddingConfig(BaseModel):
     # 対称型埋め込み (例: e5) で文書側にも prefix が要る場合のみ設定する。
     # プレースホルダ ``{task}`` ``{query}`` (= 文書本文) をサポート。
     doc_template: str = ""
+    # Pooling 方式 (llama-server --pooling)。既定 None はフラグを付与せず
+    # llama-server 側のモデル既定 pooling (GGUF pooling_type メタデータ or
+    # ビルトイン既定) に委ねる — 既存モデル (Qwen3-Embedding 等) の挙動を
+    # 変えない。BGE-M3 (arch "bert") は CLS pooling が正しく、embed 切替時に
+    # models/profiles/bert.yaml から "cls" が自動転写される (手動設定は
+    # 通常不要)。値は llama-server --pooling が受理する 5 値のみ許容する。
+    pooling: Literal["none", "mean", "cls", "last", "rank"] | None = None
     # GPU オフロード層数
     # None の場合は CPU フォールバック (``-ngl 0``) が既定となる。
     # GPU に乗せたい場合は明示的に 999 等を指定する。ベースモデルの

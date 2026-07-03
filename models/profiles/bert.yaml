@@ -1,0 +1,43 @@
+# BAAI/bge-m3 (arch "bert")。
+# llama.cpp の convert_hf_to_gguf.py は XLMRobertaModel を MODEL_ARCH.BERT として
+# 変換するため、bge-m3 の GGUF (例: ggml-org/bge-m3-Q8_0-GGUF) は
+# general.architecture="bert" を報告する想定。
+#
+# bert arch は embed 専用プロファイル。BERT/XLM-RoBERTa は encoder-only で
+# 自己回帰生成ができず、base/assist モデルとして使われることは無い。よって
+# 他プロファイル (qwen3.yaml 等) と異なり launch_flags / moe / sampling /
+# reasoning は定義しない (これらを読む resolve_auto_model_flags 等は base
+# モデルパス経由でのみ呼ばれ、embed モデル切替では参照されないため)。
+#
+# BGE-M3 (arch "bert") の埋め込みプロファイル。embed モデルを本 arch へ
+# 切替えたとき ModelMigrator がここを config.yaml の embedding.* へ転写する。
+# dim (1024) は GGUF の embedding_length、model_name は GGUF stem から取る
+# ためここには置かない。
+embedding:
+  # BGE-M3 は非 instruction-aware: 公式モデルカードは query/doc とも raw text
+  # をそのまま投入する設計を明記しており prefix 不要。instructions キーは
+  # 置かない (query_template/doc_template が両方空文字列のため
+  # instruction_resolver::format_with_instruction の空文字列 fast-path が効き
+  # resolve_instruction は一度も呼ばれない)。
+  query_template: ""
+  doc_template: ""
+  # 1 入力シーケンスの推奨上限 (公式モデルカード記載の最大コンテキスト長)。
+  max_length: 8192
+  # Pooling 方式。BERT/XLM-RoBERTa 系の慣例である CLS pooling が正しい
+  # (Qwen3-Embedding の last-token pooling とは異なる)。GGUF の
+  # pooling_type メタデータに実行時判定を委ねず、build_embed_cmd が
+  # --pooling cls を明示付与する (誤 pooling による embedding 品質劣化を防ぐ)。
+  pooling: cls
+  # recall (URL/コマンドリコールの sim 閾値)。実機の稼働中 bge-m3 サーバ +
+  # 実際の SemMem fact (URL 11件・executable_command 7件) で実測較正した値。
+  # BGE-M3 は instruction prefix 無しの生埋め込みのため、短い日本語疑問文
+  # 同士は話題が無関係でも文の型が似ているだけで sim 0.5-0.6 台が出やすく、
+  # 正例 (言い換えレベル: 0.51-0.67) と雑音 (0.40-0.59) の分布が重なる
+  # (Qwen3/LFM2.5 のようにきれいに分離しない)。明確に分離できるのは
+  # ほぼ同一文の再質問 (0.90 台) のみ。雑音側の最大観測値 (0.59) に安全
+  # マージンを載せた 0.65 を採用: 誤引き当てを防ぐ代わりに、言い換え
+  # レベルの正例 (例: fifa.com 0.65-0.67, liquid.ai 0.52) は拾えなくなる
+  # トレードオフを許容する。
+  recall:
+    url_recall_min_score: 0.65
+    executable_command_recall_min_score: 0.65

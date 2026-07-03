@@ -290,6 +290,13 @@ def build_code_unit_messages(
             "エントリポイント・プロトコルを変更しない。存在しないモジュールから"
             "import しない。"
         )
+    # モジュール構成図 (Phase 2、config code_flowchart_enabled=True 時のみ合成)。
+    # 従来は SPEC.md への添付のみでコード生成には一切渡っていなかった。
+    if plan.code_flowchart:
+        system_text = (
+            f"{system_text}\n\n# モジュール構成図 (Mermaid)\n"
+            f"```mermaid\n{plan.code_flowchart}\n```"
+        )
     system = budget.fit_content("system_prompt", system_text)
     user = CODE_UNIT_USER.format(
         file_path=unit.file_path,

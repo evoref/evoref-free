@@ -21,6 +21,7 @@ from backend.free.agent.prompt_utils import (
     validate_protected_sections,
 )
 from backend.log_config import get_logger
+from backend.utils import estimate_tokens
 
 if TYPE_CHECKING:
     from backend.free.learning.critique_synthesizer import CritiqueSynthesizer
@@ -34,6 +35,9 @@ MAX_MUTATION_RETRIES = 3
 # プロンプト変異の生成トークン上限。システムプロンプト全文 (coding.md ~1350字) の
 # 再生成 + reasoning モデルの思考漏れ分の途中切断を避けるため広めに取る。
 _MUTATION_MAX_TOKENS = 2048
+
+# assist context_size に対する安全マージン (chat template / 特殊トークン分)。
+_CONTEXT_SAFETY_MARGIN = 256
 
 # _is_text_similar の判定閾値。SequenceMatcher.ratio がこれ以上、かつ長さ差が
 # _TEXT_LEN_DELTA 以内なら「実質同一」とみなす。長さ差は空白・句読点程度の自明な
@@ -328,6 +332,15 @@ class PromptEvolver:
             # mutation は assist へ寄せる (learning スロット)。purpose は purpose
             # 監査 (test_assist_purpose_audit) が静的検出できるようリテラルで分岐する。
             if getattr(llm_client, "is_assist_client", False):
+                context_size = getattr(llm_client, "context_size", 8192)
+                input_tokens = estimate_tokens(mutation_query)
+                if input_tokens + _MUTATION_MAX_TOKENS > context_size - _CONTEXT_SAFETY_MARGIN:
+                    logger.warning(
+                        "Prompt mutation skipped: prompt=%d tok + output budget=%d tok "
+                        "exceeds assist context_size=%d",
+                        input_tokens, _MUTATION_MAX_TOKENS, context_size,
+                    )
+                    return None
                 result = await llm_client.generate(
                     messages=messages,
                     stream=False,

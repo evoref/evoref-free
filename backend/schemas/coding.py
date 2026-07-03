@@ -21,7 +21,15 @@ class CodingStagedConfig(BaseModel):
 
     test_stage_enabled: bool = Field(
         default=True,
-        description="test 工程 (生成+pytest 実行+リペア) を有効化する。false で生成のみ",
+        description="test 工程のうち advisory なユニットテスト生成+pytest 実行を"
+                    "有効化する。false で生成のみ (smoke gate は smoke_gate_enabled で"
+                    "別途制御)",
+    )
+    smoke_gate_enabled: bool = Field(
+        default=True,
+        description="test 工程のうち決定論的 import スモーク + spec/flowchart 注入"
+                    "リペアループを有効化する。test_stage_enabled (advisory ユニット"
+                    "テスト) とは独立。false でスキップ (終端の import スモークのみ残る)",
     )
     flowchart_enabled: bool = Field(
         default=True,
@@ -49,6 +57,11 @@ class CodingStagedConfig(BaseModel):
     spec_max_tokens: int = Field(
         default=1536, ge=256, le=8192,
         description="spec.md 生成の最大トークン",
+    )
+    code_max_tokens: int = Field(
+        default=4096, ge=512, le=16384,
+        description="code 工程 (単一ファイルの直接生成) の最大トークン。"
+                    "切断時のみ倍に広げて 1 回再生成する",
     )
     spec_timeout_sec: float = Field(
         default=120.0, gt=0.0, le=1800.0,

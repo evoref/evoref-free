@@ -33,6 +33,15 @@ logger = get_logger("loop.staged.synthesizer")
 SPEC_TASK_ID = "spec_root"
 """spec タスクの固定 task_id。全 code タスクの依存先になる。"""
 
+MODULE_LIST_MARKER = "\n\nModules to implement:\n"
+"""spec タスク description 内でモジュール一覧ブロックの直前に置くマーカー。
+
+``executor._extract_module_list`` がこのマーカーを検索して正準ファイル一覧
+(= 各 code タスクの ``source_path`` と一致する ``file_path`` 群) を取り出し、
+spec.md へ決定的に付記する (LLM が自由記述で spec 本文を再生成する際に
+ファイル名がドリフトしても、正準一覧は必ず spec.md に残る)。
+"""
+
 # salience: spec(0.9) > code(0.7..) > test(0.5)。逼迫時 (max_iterations 到達) でも
 # spec→code を優先し、test を後回しにする (pick_next_task_with_deps は salience 降順)。
 _SPEC_SALIENCE = 0.9
@@ -213,7 +222,7 @@ async def synthesize_coding_task_graph(
     spec_desc = summary or f"Design specification for: {request.strip()}"
     module_block = _render_module_list(modules)
     if module_block:
-        spec_desc = f"{spec_desc}\n\nModules to implement:\n{module_block}"
+        spec_desc = f"{spec_desc}{MODULE_LIST_MARKER}{module_block}"
     facts.append(make_task_fact(
         project_id=project_id,
         task_id=SPEC_TASK_ID,

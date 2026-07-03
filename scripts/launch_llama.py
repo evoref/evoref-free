@@ -707,6 +707,15 @@ def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | 
         "-ngl", str(_resolve_embed_gpu_layers(cfg)),
     ]
 
+    # Pooling 方式。embedding.pooling が明示されている場合のみ --pooling を
+    # 付与し、未設定なら llama-server のモデル既定 pooling に委ねる (既存
+    # モデルの挙動を変えない)。BGE-M3 (arch "bert") は CLS pooling が正しく、
+    # embed 切替時に models/profiles/bert.yaml から config.yaml へ自動転写
+    # される (値は EmbeddingConfig 側で検証済みのためここでは素通しする)。
+    pooling = emb_cfg.get("pooling")
+    if pooling:
+        cmd += ["--pooling", str(pooling)]
+
     # 文脈長。モデル既定 n_ctx (Qwen3-Embedding=32768) は過剰なので
     # embedding.context_size (既定 8192 = max_length) に縮小して KV を節約する。
     # max_length を下回ると長い入力で 500 になるため context_size >= max_length を維持する。
