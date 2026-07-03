@@ -70,14 +70,23 @@ Pro 拡張 (`backend/pro/` / `frontend/src/lib/pro/`) はプロプライエタ�
 
 ---
 
-## 過去に使用していたモデル (現在は不使用)
+## BGE-M3 (埋め込みモデル — 代替選択肢)
 
-### BGE-M3
-
-- **提供元**: BAAI
+- **提供元**: BAAI (Beijing Academy of Artificial Intelligence)
 - **リポジトリ**: https://huggingface.co/BAAI/bge-m3
+  (GGUF 配布例: https://huggingface.co/ggml-org/bge-m3-Q8_0-GGUF)
 - **ライセンス**: MIT License
-- **備考**: 以前の埋め込みモデル候補として評価。Qwen3-Embedding-0.6B を既定に切り替え済 (`config.yaml` で引き続き選択可能)。
+- **用途**: テキストの埋め込み (embedding) 生成 (1024 次元)。Qwen3-Embedding-0.6B の
+  代替として `model_paths.embed_model` を差し替えることで選択可能 (既定は変更していない)。
+
+### Attribution / 帰属表示
+
+> BGE-M3 is developed and provided by [BAAI](https://huggingface.co/BAAI).
+> Licensed under the [MIT License](https://opensource.org/licenses/MIT).
+
+---
+
+## 過去に使用していたモデル (現在は不使用)
 
 ### ruri-v3-130m
 

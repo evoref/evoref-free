@@ -52,6 +52,7 @@ from backend.free.agent.router import ComplexityClassifier
 from backend.free.core.stage_timer import StageTimer
 from backend.free.generation.orchestrator import LongFormOrchestrator
 from backend.free.generation.content_detector import detect_content_type
+from backend.free.generation.direct_codegen import generate_single_file
 from backend.free.generation.models import ContentType
 from backend.free.agent.meta_cognitive_tasks import EditorArtifact
 from backend.log_config import get_logger
@@ -726,40 +727,28 @@ async def _dispatch_long_form(
         )
 
 
-def make_staged_codegen_delegate(
-    client, state: AppState, cfg: dict, gen_params: dict, session_id: str,
-):
-    """base コーディングモデル経由の codegen 委譲を作る (instruction -> {path: code})。
+def make_staged_codegen_delegate(client, cfg: dict):
+    """base コーディングモデル経由の codegen 委譲を作る
+    ((instruction, file_path) -> {path: code})。
 
-    ``StagedCodingExecutor`` に注入する。``make_code_artifact_generator`` と同じ
-    base 経路 (LongFormOrchestrator の細粒度 CodeUnit 生成 + 検証/修正) を使うが、
-    EditorArtifact ではなく素の ``{logical_path: code}`` を返す。
-
-    staged の code/test 指示は spec/フローチャートの散文を多く含むため
-    ``detect_content_type`` が TEXT と誤判定する。常に CODE を強制して、コードを
-    確実に生成させる (誤判定で散文を生成し last_code_files が空になる事象を防ぐ)。
+    ``StagedCodingExecutor`` に注入する。以前は ``make_code_artifact_generator`` と
+    同じ LongFormOrchestrator 経路 (plan/CodeSpec 再合成 + CodeUnit 細粒度分割生成)
+    を経由していたが、これは instruction (spec.md 全文 + flowchart + 契約ブロック)
+    の大半をアシストの再合成・トークン予算切り詰めで失い、生成コードが仕様と乖離
+    する原因になっていた (副作用として ``detect_content_type`` の TEXT 誤判定対策
+    も必要だった)。staged は ``synthesize_coding_task_graph`` が既にプログラムを
+    ファイル単位へ決定的に分解済みのため、1 code タスク = 1 ファイルの単発生成で
+    足りる。``direct_codegen.generate_single_file`` で base モデルへの単発呼び出し
+    のみに委譲し、instruction を無劣化のまま渡す (再計画・content_type 判定は
+    どちらも不要になる)。
     """
-    gen_cfg = _clamp_long_form_timeout(cfg)
+    staged_cfg = (cfg.get("coding", {}) or {}).get("staged", {}) or {}
+    max_tokens = int(staged_cfg.get("code_max_tokens", 4096))
 
-    async def _generate(instruction: str) -> dict[str, str]:
-        orchestrator = _build_long_form_orchestrator(
-            client, state, gen_cfg, gen_params,
+    async def _generate(instruction: str, file_path: str) -> dict[str, str]:
+        return await generate_single_file(
+            client, instruction, file_path, max_tokens=max_tokens,
         )
-        try:
-            async for _token in orchestrator.generate(
-                instruction=instruction, session_id=session_id,
-                mode="coding", on_step=None,
-                content_type_override=ContentType.CODE,
-            ):
-                pass
-        except Exception as e:
-            logger.warning("staged codegen delegate failed: %s", e)
-            return {}
-        files = orchestrator.last_code_files or (
-            {"output.py": orchestrator.last_code_output}
-            if orchestrator.last_code_output else {}
-        )
-        return {p: c for p, c in files.items() if c and c.strip()}
 
     return _generate
 
@@ -829,9 +818,7 @@ async def _dispatch_staged_coding(
                 prefetched_rag=prefetched_rag, file_context_block=file_context_block,
             )
 
-    codegen = make_staged_codegen_delegate(
-        client, state, cfg, gen_params, session_id,
-    )
+    codegen = make_staged_codegen_delegate(client, cfg)
 
     def _fallback_factory():
         # 合成失敗時のフォールバック (外側で search_error_wrapper 済みのため raw)

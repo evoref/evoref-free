@@ -27,7 +27,10 @@ from backend.free.generation.smoke_validator import (
     normalize_relative_imports,
     run_import_smoke,
 )
-from backend.free.generation.spec_renderer import render_spec_markdown
+from backend.free.generation.spec_renderer import (
+    render_spec_for_prompt,
+    render_spec_markdown,
+)
 from backend.free.generation.models import (
     CodeUnit,
     ContentType,
@@ -293,6 +296,11 @@ class LongFormOrchestrator:
         repairer = CodeRepairer(
             self.assist_client, self.config, debug_logger=self._debug_logger,
         )
+        # 共有設計仕様 (契約) をリペアプロンプトへ同梱する。無いと修正が「検出
+        # エラーを消すこと」だけを目標にでき、契約 (モジュール名 / データモデルの
+        # フィールド名・型 / 公開シグネチャ) から逸脱した修正 (機能削除含む) を
+        # エラー数減として採用しうる。
+        repair_spec = render_spec_for_prompt(getattr(rolling.plan, "code_spec", None))
         # plan.units と generated_units は位置対応 (CODE は _extend_to_target で
         # append せず、revise は in-place 更新)。timeout 部分生成でも安全なよう
         # zip で生成済み分だけ走査する。
@@ -308,7 +316,9 @@ class LongFormOrchestrator:
                 remove_code_fences(u) for u in rolling.generated_units
             ))
             self._code_language = "python"
-            repaired = await repairer.repair(assembled, language="python")
+            repaired = await repairer.repair(
+                assembled, language="python", spec=repair_spec,
+            )
             self.last_code_output = repaired
             self.last_code_files = {_DEFAULT_CODE_FILE: repaired}
             if on_step and repaired != assembled:
@@ -334,7 +344,7 @@ class LongFormOrchestrator:
             group_code = dedup_top_level_defs("\n\n".join(texts))
             repaired_group = await repairer.repair(
                 group_code, language=infer_language([path]),
-                intra_file_only=multi_file,
+                intra_file_only=multi_file, spec=repair_spec,
             )
             if repaired_group != group_code:
                 changed = True
@@ -566,9 +576,11 @@ class LongFormOrchestrator:
                 :attr:`LongFormMode.EXPAND` / :attr:`LongFormMode.SPLIT` は
                 planning プロンプトと unit イベントを切り替える (P2/P3 で実装)。
             content_type_override: 指定時は ``detect_content_type`` をスキップして
-                強制する。staged コーディングの code/test 工程は spec/フローチャート
-                の散文を多く含む指示になり TEXT と誤判定されるため、
-                :attr:`ContentType.CODE` を強制する用途で使う。
+                強制する。用途例: ドキュメント品質ゲートのテスト
+                (test_document_gate.py) で TEXT 判定を強制する場合。staged
+                コーディング (backend/free/loop/staged/) は eb2fca3 以降
+                direct_codegen 経由の単発呼出しに移行しており、本 override は
+                使用しない。
             target_format: 出力先拡張子 (``.docx`` / ``.pptx`` / ``.xlsx`` 等)。
                 ``document_quality_enabled`` の決定論ドキュメント品質ゲートが対象
                 形式を判定するために使う。未指定/非ドキュメント形式ではゲート非適用。

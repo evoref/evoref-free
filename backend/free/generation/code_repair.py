@@ -35,6 +35,9 @@ logger = get_logger("generation.code_repair")
 # 修正後コード出力に許す最大トークン (元コード規模 + 余裕、上限でガード)。
 _MAX_OUTPUT_TOKENS = 6144
 
+# assist context_size に対する安全マージン (chat template / 特殊トークン分)。
+_CONTEXT_SAFETY_MARGIN = 256
+
 # 拡張子 → 言語ラベル (assist 自己点検プロンプト + Python 判定)。
 _EXT_LANG: dict[str, str] = {
     "py": "python", "pyi": "python",
@@ -56,8 +59,10 @@ _PYTHON_REPAIR_PROMPT = """\
 - 出力はコードのみ。説明・マークダウン・コードフェンスは付けないでください。
 - ロジックと構造は元のコードを尊重し、エラー修正に必要な最小限の変更に留めること。
 - 未定義名のエラーは、必要な import の追加か、呼び出し箇所の修正で解消すること。
+- 元のコードが実装している機能を削除しないこと。エラーを消すために該当箇所を丸ごと
+  削除する・スタブ化するのは不可。
 
-# 検出されたエラー
+{spec_block}# 検出されたエラー
 {errors}
 
 # コード
@@ -138,7 +143,7 @@ class CodeRepairer:
 
     async def repair(
         self, assembled: str, *, language: str = "python",
-        intra_file_only: bool = False,
+        intra_file_only: bool = False, spec: str = "",
     ) -> str:
         """assembled を検証→修正→再検証し、エラー最小版を返す。例外時は原文。
 
@@ -146,6 +151,11 @@ class CodeRepairer:
         含む undefined を修正対象から外し、同一ファイル内で完結するエラー
         (構文 / dataclass 引数不整合) のみ修正する。undefined の解決は後段の
         ``wire_imports`` に委ねる (他ファイル定義シンボルへの placeholder 乱造を防ぐ)。
+        ``spec`` (呼出側の共有設計仕様レンダリング、任意) を渡すと Python リペア
+        プロンプトに同梱し、エラー消去だけを目標にした契約逸脱の修正を抑止する。
+        本メソッドはローカルな構文/未定義名エラーの機械的修正が対象で、モジュール間
+        制御フローの逸脱検出は対象外のため flowchart は受け取らない
+        (``revise_unit`` との非対称は意図的、2ec746b 参照)。
         """
         if not self._lf.get("repair_enabled", True):
             return assembled
@@ -157,7 +167,7 @@ class CodeRepairer:
         try:
             if language == "python":
                 return await self._repair_python(
-                    assembled, max_rounds, intra_file_only,
+                    assembled, max_rounds, intra_file_only, spec,
                 )
             return await self._selfcheck_generic(assembled, language)
         except Exception as e:
@@ -166,11 +176,13 @@ class CodeRepairer:
 
     async def _repair_python(
         self, code: str, max_rounds: int, intra_file_only: bool = False,
+        spec: str = "",
     ) -> str:
         best = code
         best_n, errors = _py_error_count(best, intra_file_only=intra_file_only)
         if best_n == 0:
             return best  # 対象エラー無し → 何もしない
+        spec_block = f"# 設計仕様 (契約 — 遵守すること)\n{spec}\n\n" if spec else ""
         attempts = 0
         for _ in range(max_rounds):
             # intra_file_only 時はプロンプトにも対象種別のエラーのみ提示し、cross-file
@@ -182,13 +194,23 @@ class CodeRepairer:
             ][:10]
             candidate = await self._ask(
                 _PYTHON_REPAIR_PROMPT.format(
-                    errors="\n".join(err_lines), code=best,
+                    spec_block=spec_block, errors="\n".join(err_lines), code=best,
                 ),
                 code,
             )
             attempts += 1
             if not candidate:
                 break
+            # エラー数が減っても、元コードの半分未満に縮んだ候補は機能削除による
+            # 見せかけの改善の疑いが強いため採用しない (_selfcheck_generic の
+            # 0.5〜1.8 倍ガードと同じ考え方)。
+            if len(candidate) < 0.5 * len(best):
+                logger.warning(
+                    "code repair candidate shrank drastically (%d -> %d chars); "
+                    "rejecting despite error count change",
+                    len(best), len(candidate),
+                )
+                continue
             n, errs = _py_error_count(candidate, intra_file_only=intra_file_only)
             if n < best_n:
                 best, best_n, errors = candidate, n, errs
@@ -214,6 +236,15 @@ class CodeRepairer:
 
     async def _ask(self, prompt: str, code: str) -> str:
         max_tokens = min(_MAX_OUTPUT_TOKENS, max(512, int(estimate_tokens(code) * 1.4)))
+        context_size = getattr(self._assist_client, "context_size", 8192)
+        prompt_tokens = estimate_tokens(prompt)
+        if prompt_tokens + max_tokens > context_size - _CONTEXT_SAFETY_MARGIN:
+            logger.warning(
+                "code repair skipped: prompt=%d tok + output budget=%d tok "
+                "exceeds assist context_size=%d; returning original",
+                prompt_tokens, max_tokens, context_size,
+            )
+            return ""
         resp = await self._assist_client.generate(
             [{"role": "user", "content": prompt}],
             purpose="code_repair",

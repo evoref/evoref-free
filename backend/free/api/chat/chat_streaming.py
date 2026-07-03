@@ -2295,7 +2295,10 @@ async def stream_staged_coding(
     facts = await synthesize_coding_task_graph(
         request=query, project_id=_STAGED_PROJECT_ID,
         assist_client=state.assist_client,
-        include_tests=bool(staged_cfg.get("test_stage_enabled", True)),
+        include_tests=(
+            bool(staged_cfg.get("test_stage_enabled", True))
+            or bool(staged_cfg.get("smoke_gate_enabled", True))
+        ),
         debug_logger=state.debug_logger,
     )
     if not facts:
@@ -2360,7 +2363,7 @@ async def stream_staged_coding(
 
     executor = StagedCodingExecutor(
         workspace=ws, assist_client=state.assist_client, codegen=codegen,
-        smoke_runner=_smoke,
+        smoke_runner=(_smoke if staged_cfg.get("smoke_gate_enabled", True) else None),
         test_runner=test_runner,
         contract_checker=check_api_contract,
         max_test_regen_rounds=int(staged_cfg.get("max_test_regen_rounds", 2)),
@@ -2563,14 +2566,15 @@ async def _finalize_staged_stream(
         # 設計フローチャートは UI 表示せず、ファイル成果物としてのみ出力する
         # (ユーザー要望)。チャットへの mermaid 描画フレームは送らない。
         flowchart = ws.read_flowchart()
-        # SPEC.md (フローチャート埋込済) を output_target 別に成果物として届ける。
+        # SPEC.md (flowchart は含まない。flowchart.md は下で別ファイルとして届ける)
+        # を output_target 別に成果物として届ける。
         if output_target == "editor":
             yield sse.editor_code(spec_md, language="markdown", filename="SPEC.md")
         elif output_target == "file":
             await _staged_write_file(state, "SPEC.md", spec_md)
         yield sse.step({
             "type": "task_result",
-            "detail": f"設計仕様 (フローチャート含む): {ws.path('spec.md')}",
+            "detail": f"設計仕様: {ws.path('spec.md')}",
             "status": "done",
         })
 

@@ -291,7 +291,7 @@ class DeliberativeAgent:
             self._assist_client,
             query=query,
             tool_name=judgement.tool_name,
-            tool_result=tool_result_text,
+            tool_result=_truncate_tool_result(tool_result_text, TOOL_RESULT_MAX_CHARS),
         )
         self._append_tool_result_to_last_user(
             messages, judgement.tool_name, digest or tool_result_text, query=query,

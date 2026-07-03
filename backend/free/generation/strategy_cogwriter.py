@@ -1,6 +1,6 @@
 """CogWriter 戦略（アシストモデルあり）
 
-設計書 f_09_long_form_generation.md §5 準拠。
+設計書 f_08_long_form_generation.md §3 (§3.0 コード仕様/フローチャート合成) 準拠。
 認知的ライティング理論に基づき、計画・レビューをアシストモデルが担当し、
 メインモデルは生成に専念する。
 """
@@ -73,7 +73,10 @@ _CODE_SPEC_PROMPT = """\
 - modules: 正準なファイル構成 (各 path と purpose)。後続コードはこの path 以外を import しない。\
 存在しないモジュール (例: 集約用の架空 models.py) を作らない。
 - data_models: ファイル横断で共有する型 (name / module / kind / fields[name,type])。\
-**全ファイルがこのフィールド名・型に厳密に従う**。同じ型を別フィールドで再定義しない。
+**全ファイルがこのフィールド名・型に厳密に従う**。同じ型を別フィールドで再定義しない。\
+type は "int" / "bool" / "str" / "list[int]" のように具体的な Python 型名を書き、\
+「数値」「フラグ」等の曖昧な表現や類似だが別の型 (例: int の代わりに bool) で\
+実装されうる余地を残さないこと。
 - interfaces: 公開する関数/メソッドのシグネチャ (module / signature)。送受信する側が一致させる。
 - entry_point: 実行起点。CLI/アプリなら必ず設定する \
 (例: module="main.py", invocation="if __name__ == '__main__': asyncio.run(main())")。\
@@ -93,9 +96,8 @@ mermaid フローチャート (flowchart TD) を生成してください。
 【設計仕様】
 {spec}
 
-"mermaid" キーに mermaid 記法の文字列のみ (先頭は flowchart TD)、
-補足があれば "notes" キーに入れた JSON を返してください。
-mermaid 値にコードフェンス (```) は含めないでください。"""
+"mermaid" キーに mermaid 記法の文字列のみ (先頭は flowchart TD) を入れた JSON を
+返してください。mermaid 値にコードフェンス (```) は含めないでください。"""
 
 _CODE_PLAN_PROMPT = """\
 あなたはソフトウェアアーキテクトです。
@@ -423,7 +425,7 @@ JSON のみ出力してください。"""
 _REVISE_PROMPT = """\
 以下のコードを修正指示に従って修正してください。
 
-【元のコード】
+{spec_block}【元のコード】
 {original}
 
 【修正指示】
@@ -804,7 +806,25 @@ class CogWriterStrategy:
         from backend.utils import estimate_tokens as _est
         unit_max_tokens = max(config_max, int(_est(original) * 1.5))
 
+        # 設計仕様 (契約) / フローチャートを同梱しないと、リライトが
+        # 「issue.fix の指示に従うこと」だけを目標にでき、契約 (モジュール名 /
+        # データモデルのフィールド名・型 / 公開シグネチャ) やモジュール構成から
+        # 逸脱した修正を許してしまう (build_code_unit_messages の初回生成には
+        # 既に注入済みだが、revise はそれとは独立した別プロンプトのため個別に
+        # 注入する必要がある)。
+        spec_text = render_spec_for_prompt(rolling.plan.code_spec)
+        spec_parts = []
+        if spec_text:
+            spec_parts.append(f"【設計仕様 (契約 — 遵守すること)】\n{spec_text}\n\n")
+        if rolling.plan.code_flowchart:
+            spec_parts.append(
+                f"【モジュール構成図 (Mermaid)】\n```mermaid\n"
+                f"{rolling.plan.code_flowchart}\n```\n\n",
+            )
+        spec_block = "".join(spec_parts)
+
         prompt = _REVISE_PROMPT.format(
+            spec_block=spec_block,
             original=original,
             fix_instruction=issue.fix,
         )
