@@ -19,6 +19,10 @@ class ModelPathsConfig(BaseModel):
         default=None,
         description="コーディングモード用 GGUF パス。未指定 (None / 空文字列) の場合は base_model にフォールバック",
     )
+    assist_coding_model: str | None = Field(
+        default=None,
+        description="コーディングモード用アシスト GGUF パス。未指定 (None / 空文字列) の場合は assist_model にフォールバック",
+    )
 
     @model_validator(mode="before")
     @classmethod

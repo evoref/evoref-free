@@ -42,8 +42,10 @@ if TYPE_CHECKING:
     from backend.free.memory.stores.long_term import LongTermMemory
     from backend.free.memory.scheduler import SleepTimeScheduler
     from backend.free.memory.semantic.store import SemanticFactStore
+    from backend.free.memory.pipeline.rag_judge_assist_log import RagJudgeAssistLog
     from backend.free.memory.stores.short_term import ShortTermMemory
     from backend.free.memory.stores.working import WorkingMemory
+    from backend.free.memory.views.mem import MemFactView
     from backend.free.rag.assist_judge_tracker import AssistJudgeUsageTracker
     from backend.free.rag.embedding_backend import EmbeddingBackend
     from backend.free.rag.lazy_contextual import LazyContextualPrefixService
@@ -135,6 +137,14 @@ class AppState:
     # ``check()`` は使わず ``record`` / ``get_session_count`` / ``reset_session``
     # のみ利用する。
     conflict_judge_tracker: "AssistJudgeUsageTracker | None" = None
+    # RAG necessity/quality の embedding 決定論的リコール用リングバッファ。
+    # SemMem ではない (チャット応答パスで直接 record するだけ)。sleep-time
+    # Step 8.7 (rag_judge_curator) が drain して world_fact 化する。
+    rag_judge_assist_log: "RagJudgeAssistLog | None" = None
+    # URL/executable_command/RAG necessity・quality の embedding リコールで
+    # 共有する global scope の MemFactView。``_init_tools`` のローカル変数を
+    # 他の呼出元 (search_pipeline.py) でも再利用するため state に昇格。
+    mem_view: "MemFactView | None" = None
     # 埋め込みモデルとストアの次元不一致フラグ
     embedding_dim_mismatch: bool = False
     # 不一致時の参考情報（fronend のバナー表示用）

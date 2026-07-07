@@ -92,6 +92,7 @@ class LLMClient:
         presence_penalty: float | None = None,
         repetition_penalty: float | None = None,
         id_slot: int | None = None,
+        request_timeout: float | None = None,
     ) -> dict | AsyncIterator[str]:
         """推論リクエスト
 
@@ -104,6 +105,8 @@ class LLMClient:
             top_k: Top-K サンプリング (None または 0 で送信しない)
             presence_penalty: 存在ペナルティ (None で送信しない)
             id_slot: KV キャッシュスロット
+            request_timeout: 非ストリーミング呼び出し専用の per-request
+                タイムアウト上書き (秒)。``LocalClient.generate`` に透過する
 
         Returns:
             dict (非ストリーミング) or AsyncIterator[str] (ストリーミング)
@@ -118,6 +121,7 @@ class LLMClient:
             presence_penalty=presence_penalty,
             repetition_penalty=repetition_penalty,
             id_slot=id_slot,
+            request_timeout=request_timeout,
         )
 
     async def generate_with_logprobs(

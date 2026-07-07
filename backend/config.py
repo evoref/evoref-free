@@ -756,3 +756,26 @@ def get_mode_generation_params(mode: str) -> dict:
         logger.warning("Failed to apply generation deltas: %s", e)
 
     return params
+
+
+def get_mode_assist_model_path(mode: str) -> str:
+    """指定モードで使用すべきアシストモデルの GGUF パスを解決する
+
+    coding モードで ``model_paths.assist_coding_model`` が指定されていれば
+    それを、未指定/空文字列なら ``model_paths.assist_model`` にフォールバック
+    する (``get_mode_generation_params`` の ``coding_model`` 解決と対称)。
+
+    Args:
+        mode: "chat" または "coding"
+
+    Returns:
+        GGUF パス文字列 (config.yaml からの相対 or 絶対)
+    """
+    cfg = get_config()
+    model_paths = cfg.get("model_paths", {})
+    assist_model = model_paths.get(
+        "assist_model", "models/gemma-4-E4B_q4_0-it.gguf",
+    )
+    if mode == "coding":
+        return model_paths.get("assist_coding_model") or assist_model
+    return assist_model

@@ -116,7 +116,7 @@ def _build_cmd(
         return (cmd, host, port)
 
     if name == "assist":
-        cmd = build_assist_cmd(cfg, project_root)
+        cmd = build_assist_cmd(cfg, project_root, model_override=model_override)
         if cmd is None:
             return None
         local_cfg = cfg.get("assist_model", {}).get("local", {})

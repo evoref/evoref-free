@@ -45,12 +45,35 @@ _STDLIB_MODULES: frozenset[str] = frozenset(getattr(sys, "stdlib_module_names", 
 
 
 def _stems(paths) -> set[str]:
-    """ファイルパス集合からモジュール stem (拡張子・ディレクトリ除去) を返す。"""
-    return {os.path.splitext(os.path.basename(p))[0] for p in paths}
+    """ファイルパス集合から「自分の生成物」判定に使うトップレベル名の集合を返す。
+
+    ネストしたパス (``core/game.py``) はトップレベルのパッケージ名 (``core``) を
+    返す (``from core.game import ...`` が temp dir でパッケージとして解決される
+    場合、失敗時の ``ModuleNotFoundError`` は先頭セグメント ``core`` を指すため)。
+    """
+    stems: set[str] = set()
+    for p in paths:
+        head = p.replace("\\", "/").split("/", 1)[0]
+        stems.add(head if "/" in p.replace("\\", "/") else os.path.splitext(head)[0])
+    return stems
 
 
-def _resolve_entry_code(files: dict[str, str], entry_module: str) -> str | None:
-    """エントリポイントに対応する生成ファイルの内容を返す (無ければ None)。
+def _module_paths(paths) -> set[str]:
+    """各ファイルパスを完全修飾ドット区切りモジュール名に変換する (import smoke 対象)。"""
+    return {os.path.splitext(p.replace("\\", "/"))[0].replace("/", ".") for p in paths}
+
+
+def _write_py_files(tmp: str, py_files: dict[str, str]) -> None:
+    """生成ファイルをネスト構造を保ったまま temp dir に書き出す (namespace package化)。"""
+    for path, code in py_files.items():
+        dest = os.path.join(tmp, *path.replace("\\", "/").split("/"))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as fh:
+            fh.write(code)
+
+
+def _resolve_entry_path(files: dict[str, str], entry_module: str) -> str | None:
+    """エントリポイント表記に対応する生成ファイルのパスを返す (無ければ None)。
 
     ``entry_module`` は 3 形態を取り得る: ファイル名 (``main.py``)、素のモジュール名
     (``tetris``)、dotted パッケージ修飾 (``game_of_life.main``)。dotted 修飾は Python
@@ -60,15 +83,21 @@ def _resolve_entry_code(files: dict[str, str], entry_module: str) -> str | None:
     モジュール表記 (``/`` → ``.``) に正規化して full / leaf の両方で一致を見る。
     """
     if entry_module in files:
-        return files[entry_module]
+        return entry_module
     ep = entry_module[:-3] if entry_module.endswith(".py") else entry_module
     ep_full = ep.replace("\\", "/").replace("/", ".")
     ep_leaf = ep_full.rsplit(".", 1)[-1]
-    for path, code in files.items():
+    for path in files:
         mod_full = os.path.splitext(path)[0].replace("\\", "/").replace("/", ".")
         if mod_full == ep_full or mod_full.rsplit(".", 1)[-1] == ep_leaf:
-            return code
+            return path
     return None
+
+
+def _resolve_entry_code(files: dict[str, str], entry_module: str) -> str | None:
+    """エントリポイントに対応する生成ファイルの内容を返す (無ければ None)。"""
+    path = _resolve_entry_path(files, entry_module)
+    return files.get(path) if path is not None else None
 
 
 def normalize_relative_imports(files: dict[str, str]) -> dict[str, str]:
@@ -525,10 +554,22 @@ def check_cross_module_imports(files: dict[str, str]) -> list[str]:
             dynamic_stems.add(stem)
     errors: list[str] = []
     for path, tree in parsed.items():
+        own_stem = os.path.splitext(os.path.basename(path))[0]
         for node in ast.walk(tree):
             if not isinstance(node, ast.ImportFrom) or node.module is None:
                 continue
             sibling = node.module.rsplit(".", 1)[-1]  # dotted パッケージは leaf stem
+            if sibling == own_stem:
+                # 自己 import (`from breakout import Ball` を breakout.py 自身が
+                # 書く)。部分ごと生成で他 part の component を import 参照する
+                # 誤解から生じ、実行時に partially-initialized ImportError で
+                # 起動不能になる。外部依存欠落が先に発生する環境では runtime
+                # smoke がマスクされるため、静的に error とする (2026-07-06 live)。
+                errors.append(
+                    f"{path}: 自分自身 ('{sibling}') からの import は起動不能 "
+                    f"(定義は同一ファイル内にあるため import 文を削除する)"
+                )
+                continue
             if sibling not in exports or sibling in dynamic_stems:
                 continue  # 生成物以外 / 再エクスポート不確定は対象外
             for a in node.names:
@@ -616,13 +657,28 @@ _SMOKE_RUNNER = (
 )
 
 
-def _classify_failure(failure: dict, stems: set[str]) -> tuple[str, bool]:
+def _classify_failure(
+    failure: dict, stems: set[str], component_names: frozenset[str] = frozenset(),
+    imported_names: frozenset[str] = frozenset(),
+    internal_names: frozenset[str] = frozenset(),
+) -> tuple[str, bool]:
     """import 失敗を (メッセージ, is_error) に分類する。
 
     - 生成物 stem の ``ModuleNotFoundError`` → error (cross-file 欠落)。
+    - **生成物内のコンポーネント定義名** (top-level def/class) と一致する欠落
+      → error (幻覚 import)。部分ごと生成で LLM が同一ファイル内のコンポーネント
+      をモジュールと誤認して ``from initialize_grid import initialize_grid`` の
+      ような import を書く実例があり、3rd-party warning に倒すと起動不能コードを
+      合格させてしまう (2026-07-06 live)。
     - **標準ライブラリ**の欠落 (``curses``/``_curses`` 等。Windows で POSIX 専用
       stdlib が無い 等) → error。ターゲット OS で起動不能な欠陥であり、warning に
       倒すと「import only では通るが実機で動かない」コードを合格させてしまう。
+    - **内部契約名との一致** (case-insensitive の ``component_names`` 一致、
+      または欠落モジュールから import している名前 ``imported_names`` が
+      内部契約名に含まれる) → error (幻覚内部 import)。planner/spec が宣言する
+      プログラム内部の要素を「存在しないモジュール」から import するケース
+      (2026-07-07 live: `from game import Game` — Game は spec の Component だが
+      game.py は正準に無く、外部依存 warning に降格されて偽 success で配信)。
     - それ以外 (numpy 等の未インストール 3rd-party) → warning (環境要因・修正不要)。
     """
     module = failure.get("module", "?")
@@ -634,7 +690,16 @@ def _classify_failure(failure: dict, stems: set[str]) -> tuple[str, bool]:
         if "'" in msg:
             missing = msg.split("'")[1].split(".")[0]
         if missing and missing not in stems:
+            if missing in component_names:
+                return (
+                    f"{module}: 幻覚 import '{missing}' — モジュールではなく"
+                    "生成物内のコンポーネント定義名 (同名の def/class が存在する。"
+                    "この import を削除し、定義を直接使うこと)",
+                    True,
+                )
             # ``_curses`` → ``curses`` 等、私的名を正規化して stdlib 判定。
+            # stdlib 判定は内部契約名照合より先 (component 名と大文字小文字違いの
+            # stdlib を幻覚扱いしないため)。
             norm = missing.lstrip("_")
             if missing in _STDLIB_MODULES or norm in _STDLIB_MODULES:
                 return (
@@ -642,37 +707,93 @@ def _classify_failure(failure: dict, stems: set[str]) -> tuple[str, bool]:
                     "利用不可 (起動不能)",
                     True,
                 )
+            contract = component_names | internal_names
+            lowered = {n.lower() for n in contract}
+            if missing.lower() in lowered or (
+                imported_names and imported_names & contract
+            ):
+                return (
+                    f"{module}: 幻覚 import '{missing}' — このプログラム内部の"
+                    "契約名 (spec の Component / 正準モジュール) であり外部"
+                    "パッケージではない (この import を削除し、当該定義を"
+                    "プログラム内で実装・参照すること)",
+                    True,
+                )
             return (f"{module}: 外部依存 '{missing}' が未インストール", False)
     return (f"{module}: {etype}: {msg}", True)
+
+
+def _top_level_component_names(py_files: dict[str, str]) -> frozenset[str]:
+    """生成物全ファイルの top-level def/class 名を集める (幻覚 import 判定用)。
+
+    構文エラーのファイルは無視する (防御的)。
+    """
+    names: set[str] = set()
+    for code in py_files.values():
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+    return frozenset(names)
+
+
+def _names_imported_from(py_files: dict[str, str], missing: str) -> frozenset[str]:
+    """生成物全ファイル中で ``from <missing> import ...`` されている名前を集める。
+
+    欠落モジュールが「内部契約名を輸出する幻覚モジュール」かの判定材料
+    (`from game import Game` → {"Game"})。構文エラーのファイルは無視する。
+    """
+    names: set[str] = set()
+    for code in py_files.values():
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.level == 0
+                and (node.module or "").split(".")[0] == missing
+            ):
+                names.update(a.name for a in node.names if a.name != "*")
+    return frozenset(names)
 
 
 def run_import_smoke(
     files: dict[str, str],
     timeout_sec: float = 10.0,
     python_exe: str | None = None,
+    *,
+    internal_names: frozenset[str] = frozenset(),
 ) -> SmokeResult:
     """生成ファイルを temp dir に書き出し、各モジュールを import してエラーを収集する。
 
     ``__main__`` は実行せず import のみ行う。top-level 副作用 (サーバ起動等) は
     ``timeout_sec`` で有界化する。書込/実行不可・タイムアウト時は warning に倒し、
     静的ゲートのみで継続する (生成失敗にはしない)。
+
+    ``internal_names`` は呼出側が持つ「プログラム内部の契約名」(staged の場合は
+    spec の Component 名 + 正準モジュール stem)。生成コードの top-level 定義名と
+    合流させ、幻覚内部 import (契約名を存在しないモジュールから import) を
+    外部依存 warning に降格させないための追加判定材料。
     """
     result = SmokeResult()
     py_files = {p: c for p, c in files.items() if p.endswith(".py")}
     if not py_files:
         return result
     stems = _stems(py_files)
+    module_paths = _module_paths(py_files)
+    component_names = _top_level_component_names(py_files)
     exe = python_exe or sys.executable
 
     try:
         with tempfile.TemporaryDirectory(prefix="evoref_smoke_") as tmp:
-            for path, code in py_files.items():
-                # ネストパスは basename へ潰す (flat 配信前提)
-                with open(os.path.join(tmp, os.path.basename(path)), "w",
-                          encoding="utf-8") as fh:
-                    fh.write(code)
+            _write_py_files(tmp, py_files)
             proc = subprocess.run(
-                [exe, "-c", _SMOKE_RUNNER, json.dumps(sorted(stems))],
+                [exe, "-c", _SMOKE_RUNNER, json.dumps(sorted(module_paths))],
                 cwd=tmp,
                 capture_output=True,
                 text=True,
@@ -700,7 +821,14 @@ def run_import_smoke(
     for failure in failures:
         if not isinstance(failure, dict):
             continue
-        message, is_error = _classify_failure(failure, stems)
+        msg = str(failure.get("msg", ""))
+        missing = msg.split("'")[1].split(".")[0] if "'" in msg else ""
+        imported = (
+            _names_imported_from(py_files, missing) if missing else frozenset()
+        )
+        message, is_error = _classify_failure(
+            failure, stems, component_names, imported, internal_names,
+        )
         if message in seen:
             continue
         seen.add(message)
@@ -794,29 +922,26 @@ def run_entry_smoke(
     py_files = {p: c for p, c in files.items() if p.endswith(".py")}
     if not py_files:
         return result
-    # エントリ stem を決定。spec があればその module、無ければ ``main`` 定義 /
+    # エントリモジュールを決定。spec があればその module、無ければ ``main`` 定義 /
     # ``__main__`` ガードを持つファイルを推論 (staged は CodeSpec を持たない)。
     ep = getattr(getattr(spec, "entry_point", None), "module", "") if spec else ""
     if ep:
-        ep_leaf = (ep[:-3] if ep.endswith(".py") else ep).replace("\\", "/").replace(
-            "/", "."
-        ).rsplit(".", 1)[-1]
+        entry_path = _resolve_entry_path(py_files, ep)
+        if entry_path is None:
+            return result
     else:
         entry_path = next(
             (p for p, c in py_files.items() if _looks_like_entry(c)), None
         )
         if entry_path is None:
             return result
-        ep_leaf = os.path.splitext(os.path.basename(entry_path))[0]
+    ep_module = os.path.splitext(entry_path.replace("\\", "/"))[0].replace("/", ".")
     exe = python_exe or sys.executable
     try:
         with tempfile.TemporaryDirectory(prefix="evoref_entry_") as tmp:
-            for path, code in py_files.items():
-                with open(os.path.join(tmp, os.path.basename(path)), "w",
-                          encoding="utf-8") as fh:
-                    fh.write(code)
+            _write_py_files(tmp, py_files)
             proc = subprocess.run(
-                [exe, "-c", _ENTRY_SMOKE_RUNNER, ep_leaf],
+                [exe, "-c", _ENTRY_SMOKE_RUNNER, ep_module],
                 cwd=tmp, capture_output=True, text=True, timeout=timeout_sec,
             )
     except subprocess.TimeoutExpired:

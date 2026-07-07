@@ -7,6 +7,8 @@ export interface ModeSwitchResponse {
 	mode: string;
 	model_changed: boolean;
 	restart_initiated: boolean;
+	assist_model_changed: boolean;
+	assist_restart_initiated: boolean;
 	message: string;
 }
 

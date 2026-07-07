@@ -727,7 +727,7 @@ async def _dispatch_long_form(
         )
 
 
-def make_staged_codegen_delegate(client, cfg: dict):
+def make_staged_codegen_delegate(client, cfg: dict, *, max_tokens: int | None = None):
     """base コーディングモデル経由の codegen 委譲を作る
     ((instruction, file_path) -> {path: code})。
 
@@ -741,13 +741,19 @@ def make_staged_codegen_delegate(client, cfg: dict):
     足りる。``direct_codegen.generate_single_file`` で base モデルへの単発呼び出し
     のみに委譲し、instruction を無劣化のまま渡す (再計画・content_type 判定は
     どちらも不要になる)。
+
+    ``max_tokens`` 指定時は config (``code_max_tokens``) より優先する
+    (部分ごと生成向けの ``part_max_tokens`` 予算で別 delegate を作る用途)。
     """
     staged_cfg = (cfg.get("coding", {}) or {}).get("staged", {}) or {}
-    max_tokens = int(staged_cfg.get("code_max_tokens", 4096))
+    resolved_max_tokens = (
+        int(max_tokens) if max_tokens is not None
+        else int(staged_cfg.get("code_max_tokens", 4096))
+    )
 
     async def _generate(instruction: str, file_path: str) -> dict[str, str]:
         return await generate_single_file(
-            client, instruction, file_path, max_tokens=max_tokens,
+            client, instruction, file_path, max_tokens=resolved_max_tokens,
         )
 
     return _generate
@@ -819,6 +825,13 @@ async def _dispatch_staged_coding(
             )
 
     codegen = make_staged_codegen_delegate(client, cfg)
+    staged_cfg = (cfg.get("coding", {}) or {}).get("staged", {}) or {}
+    part_codegen = (
+        make_staged_codegen_delegate(
+            client, cfg, max_tokens=int(staged_cfg.get("part_max_tokens", 1536)),
+        )
+        if staged_cfg.get("part_generation_enabled", False) else None
+    )
 
     def _fallback_factory():
         # 合成失敗時のフォールバック (外側で search_error_wrapper 済みのため raw)
@@ -835,7 +848,8 @@ async def _dispatch_staged_coding(
             query=req.message, session_id=session_id, state=state, cfg=cfg,
             instance_name=instance_name, context_size=context_size,
             messages=messages, output_target=output_target,
-            codegen=codegen, fallback_factory=_fallback_factory,
+            codegen=codegen, part_codegen=part_codegen,
+            fallback_factory=_fallback_factory,
             timer=timer, private=req.private,
         ))),
         media_type="text/event-stream",

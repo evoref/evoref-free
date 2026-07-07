@@ -38,6 +38,7 @@ from backend.free.generation.strategy_common import (
 )
 from backend.free.generation.token_budget import TokenBudget
 from backend.free.llm.json_schemas import CodeSpec
+from backend.i18n_helper import get_locale
 
 if TYPE_CHECKING:
     from backend.free.llm.assist_client import AssistModelClient
@@ -55,6 +56,16 @@ _CODE_SPEC_RETRY_TIMEOUT_SEC = 180.0
 
 
 # ── プロンプトテンプレート ──
+
+# SPEC.md に載る記述テキスト (title/summary/purpose/constraints/protocol) の
+# 出力言語 (GUI の言語設定 = i18n locale に追従)。識別子・型名・パスは原語のまま。
+_SPEC_OUTPUT_LANGUAGE_NAMES = {"ja": "日本語", "en": "英語"}
+
+
+def _spec_output_language() -> str:
+    """SPEC.md 向け記述テキストの出力言語名 (合成時点の locale を反映)。"""
+    return _SPEC_OUTPUT_LANGUAGE_NAMES.get(get_locale(), "英語")
+
 
 # 事前準備: コード生成の前に固める共有設計仕様 (contract)。後続の plan 生成と
 # 全ユニット生成に注入され、ファイル横断のモジュール名 / データモデル /
@@ -628,6 +639,10 @@ class CogWriterStrategy:
             instruction=instruction,
             rag_context=rag_context,
             memory_context=memory_context,
+        ) + (
+            f"\ntitle / summary / purpose / protocol / constraints などの説明"
+            f"テキストは{_spec_output_language()}で記述してください "
+            f"(識別子・型名・シグネチャ・ファイルパスは原語のまま)。"
         )
         t0 = time.monotonic()
         try:
@@ -709,6 +724,10 @@ class CogWriterStrategy:
         prompt = _FLOWCHART_PROMPT.format(
             instruction=instruction,
             spec=render_spec_for_prompt(spec),
+        ) + (
+            f"\nノード/エッジのラベルの説明テキストは{_spec_output_language()}で"
+            f"記述してください (ファイルパス・識別子は原語のまま。非 ASCII 文字を"
+            f"含むラベルはダブルクォートで囲む)。"
         )
         try:
             data = await self.assist_client.generate_json(

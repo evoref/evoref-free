@@ -217,9 +217,15 @@ export async function switchMode(newMode: string): Promise<void> {
 		messages.set(modeMessages[newMode] ?? []);
 		sessionId.set(modeSessions[newMode] ?? crypto.randomUUID());
 
-		if (result.model_changed && !result.restart_initiated) {
+		// base / assist いずれかの再起動が必要だったが完了しなかった場合は failed。
+		// 両方とも変更なし、または変更があった分は全て再起動完了していれば ready。
+		const baseOk = !result.model_changed || result.restart_initiated;
+		const assistOk = !result.assist_model_changed || result.assist_restart_initiated;
+		const anyChanged = result.model_changed || result.assist_model_changed;
+
+		if (anyChanged && (!baseOk || !assistOk)) {
 			modeRestartStatus.set('failed');
-		} else if (result.model_changed && result.restart_initiated) {
+		} else if (anyChanged) {
 			modeRestartStatus.set('ready');
 			setTimeout(() => modeRestartStatus.set('idle'), MODE_RESTART_STATUS_TIMEOUT_MS);
 		} else {

@@ -489,6 +489,13 @@ def _init_learning_core(
     ) -> None:
         if state.learning_disabled:
             return
+        # Free/Pro 共通: RAG necessity/quality の embedding recall 用リングバッファ。
+        # SemMem 書込みではない (プロセス内リングバッファ、sleep-time Step 8.7 が
+        # drain して world_fact 化する)。Pro 限定の assist 経験バッファ記録とは独立。
+        if state.rag_judge_assist_log is not None and action_type in (
+            "rag_necessity", "rag_quality",
+        ):
+            state.rag_judge_assist_log.record(action_type, input_context, output)
         pro = state.pro
         learn = pro.learn if pro is not None else None
         buf = getattr(learn, "assist_experience_buffer", None) if learn else None
@@ -747,6 +754,10 @@ def _init_assist_judge_tracker(state: AppState) -> None:
     # conflict_chat_judge のセッション内発火上限用に別インスタンスを生成
     # (RAG 判定とカウントを混在させない)。
     state.conflict_judge_tracker = AssistJudgeUsageTracker()
+
+    from backend.free.memory.pipeline.rag_judge_assist_log import RagJudgeAssistLog
+    state.rag_judge_assist_log = RagJudgeAssistLog()
+
     logger.info(
         "AssistJudgeUsageTracker initialized (self_rag + conflict_chat_judge)",
     )
@@ -848,6 +859,7 @@ def _init_sleep_time_worker(
             subject_canonicalizer=subject_canonicalizer,
             semantic_store_invalidator=_semantic_invalidator,
             assist_client=assist_client,
+            rag_judge_assist_log=state.rag_judge_assist_log,
         )
         # contextual prefix 生成後にメイン BM25 索引を再構築できるよう、
         # HybridRetriever が保持する生きた BM25 インスタンスを worker に渡す。
@@ -1243,6 +1255,9 @@ def _init_tools(
             mem_view = MemFactView(global_store)
     except Exception as exc:
         logger.warning("URL recall mem_view init skipped: %s", exc)
+    # RAG necessity/quality の embedding recall (search_pipeline.py) でも
+    # 同じ global scope MemFactView を再利用するため state に昇格。
+    state.mem_view = mem_view
 
     tool_judge = ToolCallJudge(
         assist_client=assist_client,

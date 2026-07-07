@@ -170,6 +170,24 @@ class SelfRagContentGateConfig(BaseModel):
     max_per_query: int = Field(default=1, ge=0)
 
 
+class SelfRagRecallConfig(BaseModel):
+    """RAG necessity/quality の embedding 決定論的リコール設定
+
+    ``ToolCallJudge._try_recall_url`` / ``_try_recall_executable_command``
+    と同型の閾値構成。necessity_recall / quality_recall で共用する
+    (両者ともフィールド構成が同一のため)。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    topk: int = Field(default=5, ge=1, le=50)
+    min_score: float = Field(default=0.75, ge=0.0, le=1.0)
+    min_record_score: float = Field(default=0.65, ge=0.0, le=1.0)
+    record_history_size: int = Field(default=10, ge=1, le=100)
+    ttl_days: int = Field(default=14, ge=0)
+
+
 class SelfRagConfig(BaseModel):
     """Self-RAG 設定ルート
 
@@ -187,6 +205,12 @@ class SelfRagConfig(BaseModel):
     )
     content_gate: SelfRagContentGateConfig = Field(
         default_factory=SelfRagContentGateConfig,
+    )
+    necessity_recall: SelfRagRecallConfig = Field(
+        default_factory=SelfRagRecallConfig,
+    )
+    quality_recall: SelfRagRecallConfig = Field(
+        default_factory=SelfRagRecallConfig,
     )
 
 

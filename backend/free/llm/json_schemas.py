@@ -211,10 +211,13 @@ class CodingModuleUnit(_StrictModel):
     で取得し、spec/code/test の task ファクト三層へ決定的に展開する。
     モジュール間の ``depends_on`` は code パス内の import 配線への参考情報で
     あり、task 依存グラフには落とさない (循環回避のため)。
+    ``key_components`` は spec 工程の ``### Component:`` アンカー候補として
+    プロンプトへ供給される (default 付きで旧応答とも後方互換)。
     """
 
     file_path: str = ""
     purpose: str = ""
+    key_components: list[str] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list)
 
 
@@ -227,6 +230,54 @@ class CodingTaskGraph(_StrictModel):
 
     summary: str = ""
     modules: list[CodingModuleUnit] = Field(default_factory=list)
+
+
+# ── staged フロー構造合成 (flow_spec_synthesis) ──
+
+class FlowSpecEdge(_StrictModel):
+    """フローの 1 遷移。``condition`` は分岐ラベル (無条件遷移は空文字)。"""
+
+    to: str = ""
+    condition: str = ""
+
+
+class FlowSpecStep(_StrictModel):
+    """フローの 1 ステップ。``module`` は正準ファイル一覧のパス (start/end のみ空可)。"""
+
+    id: str = ""
+    module: str = ""
+    label: str = ""
+    kind: Literal["start", "process", "decision", "error", "end"] = "process"
+    next: list[FlowSpecEdge] = Field(default_factory=list)
+
+
+class FlowSpec(_StrictModel):
+    """staged spec 工程のフロー構造 (`executor._synthesize_flow_steps`)。
+
+    spec.md の ``## Processing flow`` 節と flowchart.md の mermaid を
+    同一データから決定論レンダリングするための単一情報源。検証・描画は
+    `backend/free/loop/staged/flow_render.py` (LLM 不使用) が担う。
+    """
+
+    steps: list[FlowSpecStep] = Field(default_factory=list)
+
+
+# ── staged test 工程の spec 見直し判定 (spec_revision_judge) ──
+
+class SpecRevisionJudgement(_StrictModel):
+    """test 不合格時の spec 該当節見直し判定 (executor._spec_revision_cycle)。
+
+    「spec 節自体の欠陥 (矛盾する型/シグネチャ・欠落した振る舞い・曖昧さ) か、
+    コード/テスト側のミスか」を判定させ、欠陥なら ``## Module:`` 見出しから
+    始まる改訂節全文を ``revised_section`` に返させる。改訂が全体の
+    ``## Entry point`` 節と矛盾する場合のみ、その修正版全文を
+    ``revised_entry_point`` に返させる (通常は空)。
+    """
+
+    spec_ok: bool = True
+    reason: str = ""
+    revised_section: str = ""
+    revised_entry_point: str = ""
 
 
 # ── 長文生成レビュー (long_form_*_review) ──
@@ -404,11 +455,15 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "code_spec_synthesis": CodeSpec,
     "flowchart_synthesis": FlowchartSpec,
     "coding_task_graph": CodingTaskGraph,
+    "flow_spec_synthesis": FlowSpec,
+    "flow_spec_part_synthesis": FlowSpec,
+    "spec_revision_judge": SpecRevisionJudgement,
     "tool_judgment": ToolJudgmentResult,
     "executable_command_synth": ExecutableCommandSynth,
     "meta_cognitive_plan": MetaCognitivePlan,
     "cartridge_eval_generation": CartridgeEvalQAList,
     "url_relevance_score": UrlRelevanceJudgement,
+    "rag_judge_relevance_score": UrlRelevanceJudgement,
     "editor_filename": EditorFilenameResult,
     "conflict_chat_judge": ChatConflictJudgement,
 }
@@ -561,6 +616,7 @@ __all__ = [
     "UrlRelevanceJudgement",
     "EditorFilenameResult",
     "ChatConflictJudgement",
+    "SpecRevisionJudgement",
     "PURPOSE_SCHEMAS",
     "make_response_format",
     "resolve_response_format_for_purpose",

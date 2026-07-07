@@ -289,7 +289,8 @@ class ChunkContentGate:
                 "only_when_quality": ["content_gate"],
             }
             decision = tracker.check(
-                session_id=session_id, quality="content_gate",
+                session_id=session_id, namespace="content_gate",
+                quality="content_gate",
                 query_count=0, config=quota,
             )
             if not decision.allowed:
@@ -302,11 +303,12 @@ class ChunkContentGate:
         )
         prompt = f"{_GATE_INSTRUCTIONS}\n\nクエリ: {query}\n\n候補:\n{formatted}"
         try:
-            res = await asyncio.wait_for(
-                assist_client.generate_json(
-                    prompt, max_tokens=64, temperature=0.1,
-                    purpose="retrieval_chunk_gate", list_key="relevant_indices",
-                ),
+            # timeout は generate_json 側の purpose 別 (realtime) 総予算強制に
+            # 一本化する (外側 wait_for との二重ラップは反応的タイムアウト較正を
+            # 機能不全にする。self_rag_judge.py と同じ不具合パターン)。
+            res = await assist_client.generate_json(
+                prompt, max_tokens=64, temperature=0.1,
+                purpose="retrieval_chunk_gate", list_key="relevant_indices",
                 timeout=_ASSIST_TIMEOUT_S,
             )
         except (TimeoutError, asyncio.TimeoutError):
@@ -322,7 +324,7 @@ class ChunkContentGate:
             result.assist_skipped_reason = "invalid_response"
             return set(prose_idx)
         if tracker is not None:
-            tracker.record(session_id)
+            tracker.record(session_id, namespace="content_gate")
         result.assist_used = True
         kept = {prose_idx[n] for n in relevant_local}
         result.assist_dropped = len(prose_idx) - len(kept)

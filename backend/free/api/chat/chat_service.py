@@ -272,6 +272,7 @@ async def run_search_pipeline(
             necessity_prompt=necessity_prompt,
             quality_prompt=quality_prompt,
             assist_experience_recorder=state.assist_experience_recorder,
+            mem_view=state.mem_view,
         )
         if not search_result.skipped and search_result.sources:
             rag_chunks = [content for _, _, content in search_result.sources]
@@ -372,7 +373,7 @@ async def maybe_resolve_pending_conflicts(
         if (
             cap > 0
             and tracker is not None
-            and tracker.get_session_count(session_id) >= cap
+            and tracker.get_session_count(session_id, namespace="conflict_chat_judge") >= cap
         ):
             logger.debug(
                 "conflict_chat_judge session cap reached (%d), "
@@ -408,7 +409,7 @@ async def maybe_resolve_pending_conflicts(
         # 消費されるため、呼出前に数える)。pending 無し / private / assist 未接続 /
         # assistant 履歴なしの早期 return はここに到達せずカウントしない。
         if tracker is not None:
-            count = tracker.record(session_id)
+            count = tracker.record(session_id, namespace="conflict_chat_judge")
             # 並行リクエストが上の cap チェックと record の間に割り込んで cap を
             # 超えた場合、record の atomic な戻り値で判定し、このターンは judge を
             # 打たず注入も止める (発火数が cap を超えないようにする)。

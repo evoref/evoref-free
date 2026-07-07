@@ -461,6 +461,7 @@ class LocalClient(BaseHTTPClient):
         presence_penalty: float | None = None,
         repetition_penalty: float | None = None,
         id_slot: int | None = None,
+        request_timeout: float | None = None,
     ) -> dict | AsyncIterator[str]:
         """llama-server に推論リクエストを送信
 
@@ -471,6 +472,12 @@ class LocalClient(BaseHTTPClient):
             id_slot: KVキャッシュスロット指定。
                      chat_slot / background_slot プロパティを使用推奨。
                      None または -1 で自動割当。
+            request_timeout: 非ストリーミング呼び出し (``stream=False``) 専用の
+                     per-request タイムアウト上書き (秒)。既定 (None) は
+                     ``self._http_timeout`` (120s)。大きな max_tokens を同期
+                     生成する呼出側 (例: staged コーディングの単発ファイル生成)
+                     が、iGPU 等の低速環境で総生成時間が既定を超える場合に使う。
+                     ストリーミング (``stream=True``) には影響しない。
         """
         payload = self._build_payload(
             messages,
@@ -487,7 +494,7 @@ class LocalClient(BaseHTTPClient):
         if stream:
             return self._generate_stream(payload)
         else:
-            return await self._generate_sync(payload)
+            return await self._generate_sync(payload, request_timeout=request_timeout)
 
     async def count_tokens(self, text: str) -> int | None:
         """llama-server /tokenize でテキストの実トークン数を取得。
@@ -528,15 +535,26 @@ class LocalClient(BaseHTTPClient):
             return len(tokens)
         return None
 
-    async def _generate_sync(self, payload: dict) -> dict:
-        """非ストリーミング推論（リトライ付き）"""
+    async def _generate_sync(
+        self, payload: dict, *, request_timeout: float | None = None,
+    ) -> dict:
+        """非ストリーミング推論（リトライ付き）
+
+        ``request_timeout`` 指定時はこの呼び出しに限り per-request タイムアウトを
+        上書きする (``async_retry_http_call`` は ``MAX_ATTEMPTS`` 回まで per-attempt
+        でこのタイムアウトを適用するため、大きい値を渡すと worst case は
+        ``request_timeout × MAX_ATTEMPTS`` の壁時計時間になり得る点に注意)。
+        """
         client = self._get_http_client()
         logger.debug("Sync generate: POST %s/v1/chat/completions", self.url)
 
         async def _do_post() -> dict:
+            post_kwargs: dict = {"json": payload}
+            if request_timeout is not None:
+                post_kwargs["timeout"] = request_timeout
             resp = await client.post(
                 f"{self.url}/v1/chat/completions",
-                json=payload,
+                **post_kwargs,
             )
             if resp.status_code >= 400:
                 # raise_for_status は本文を載せないため、先に本文を抽出してログ + 例外に添付する
