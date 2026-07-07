@@ -53,6 +53,7 @@ export interface ThemeConfig {
 export interface ModelPathsConfig {
 	base_model: string;
 	coding_model?: string | null;
+	assist_coding_model?: string | null;
 	[key: string]: unknown;
 }
 

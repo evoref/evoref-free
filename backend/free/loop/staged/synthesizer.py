@@ -17,6 +17,7 @@ spec → code → test の task ファクト三層へ展開する。
 
 from __future__ import annotations
 
+import platform
 import re
 from typing import TYPE_CHECKING
 
@@ -54,6 +55,13 @@ _TEST_SALIENCE = 0.5
 # 必ず上回るよう _TEST_SALIENCE より上に置く。
 _CODE_DEPTH_STEP = 0.02
 _CODE_SALIENCE_FLOOR = 0.55
+# LLM が depends_on を申告しない場合、深さヒントが効かずエントリモジュールが
+# 先に生成され、未実装の兄弟 API を発明する (2026-07-06 live: main.py が
+# game_state.py より先に生成され Game.setup_event_loop を幻覚)。エントリらしい
+# stem は depends_on の有無に関わらず全 code タスクの最後 (ただし test より上)
+# へ決定論的に落とす。
+_ENTRY_STEMS = frozenset({"main", "app", "__main__", "cli", "run"})
+_ENTRY_SALIENCE = 0.52
 
 _SYNTHESIS_PROMPT = """\
 You are a software design planner. Given a coding request, produce a coarse \
@@ -61,7 +69,10 @@ plan as a JSON object with two fields:
 - "summary": a concise design overview of the whole program (what it does, the \
 overall structure, key data shapes / interfaces). This becomes the shared design spec.
 - "modules": an array of the source files to implement. Each entry is an object \
-{{"file_path": <relative path>, "purpose": <one line>, "depends_on": [<other file_path>...]}}.
+{{"file_path": <relative path>, "purpose": <2-4 sentences: the module's \
+responsibilities, its key public classes/functions, and its inputs/outputs>, \
+"key_components": [<names of the public classes / top-level functions this \
+module will expose>], "depends_on": [<other file_path>...]}}.
 
 IMPORTANT rules:
 - Implement EXACTLY the program the user requested, using the user's own terms. \
@@ -72,6 +83,8 @@ Do NOT use absolute paths and do NOT invent an unrelated output directory.
 - One source file = ONE module entry. A simple single-file program is ONE module.
 - Keep the module list minimal — only split into multiple files when the program \
 genuinely needs separate concerns. Prefer fewer, cohesive modules.
+- "key_components" lists 2-4 names per module (one class = one component; a small \
+group of related helper functions may count as one component).
 - "depends_on" lists OTHER file_path values this module imports from (for code-stage \
 import wiring). Leave it empty when there is no intra-program dependency. Do NOT \
 create circular dependencies.
@@ -82,10 +95,156 @@ Request:
 Output the JSON object and nothing else."""
 
 
+def os_constraint() -> str:
+    """planner/spec/code 生成に注入する実行 OS 制約 (OS 非対応 stdlib の生成を抑止)。
+
+    UI 技術の選定はタスクグラフ合成 (planner) の時点で確定し、下流の spec/code
+    への制約注入では覆らないため、本 synthesizer のプロンプトにも必ず注入する
+    (2026-07-06 live: planner が curses を採用し Windows で起動不能になった)。
+    executor (spec/code/部分生成) も同一の制約文言を共有する。
+    """
+    return (
+        f"\n\nTarget runtime OS: {platform.system() or 'unknown'}. Use only "
+        f"cross-platform standard-library and APIs available on that OS. Avoid "
+        f"OS-specific modules unavailable there (e.g. `curses`/`fcntl`/`termios` "
+        f"on Windows); prefer portable approaches so the program actually runs."
+    )
+
+
+# OS 別の「ターゲット OS で import 不可な stdlib」既知リスト (SSOT)。
+# planner 出力 (summary / module purpose) への決定論スクリーンに使う。
+_OS_UNAVAILABLE_STDLIB: dict[str, tuple[str, ...]] = {
+    "Windows": ("curses", "fcntl", "termios", "pty", "grp", "pwd",
+                "posix", "resource", "syslog"),
+    "Linux": ("msvcrt", "winreg", "winsound"),
+    "Darwin": ("msvcrt", "winreg", "winsound"),
+}
+
+
+def _denied_stdlib_mentions(text: str, os_name: str) -> list[str]:
+    """text 中で言及されている「対象 OS で利用不可な stdlib」名を返す (既知リスト順)。"""
+    return [
+        mod for mod in _OS_UNAVAILABLE_STDLIB.get(os_name, ())
+        if re.search(rf"\b{re.escape(mod)}\b", text)
+    ]
+
+
+def annotate_os_unavailable_modules(
+    summary: str, modules: list[dict], *, os_name: str | None = None,
+) -> tuple[str, list[dict]]:
+    """planner 出力に OS 非対応 stdlib の採用が焼き込まれていたら対抗ノートを追記する。
+
+    ``os_constraint()`` のプロンプト注入だけでは小型モデルに無視されうる
+    (2026-07-07 live: PR#240 の注入後も planner が purpose に「standard curses
+    library」を採用し、正準ファイル一覧経由で spec/code 全プロンプトへ伝播して
+    Windows 起動不能に至った)。採用文言そのものに決定論の否定注記を併記し、
+    下流の合理化 (「curses に対応した環境」等) を汚染源で断つ。テキストの
+    削除・書き換えは行わない (prose 手術は誤爆リスクがあるため追記のみ)。
+    """
+    resolved_os = os_name or platform.system() or "unknown"
+
+    def _note(mods: list[str]) -> str:
+        quoted = ", ".join(f"`{m}`" for m in mods)
+        return (
+            f" [OS NOTE: {quoted} is NOT importable on {resolved_os} — "
+            f"do NOT use it; design a portable alternative instead]"
+        )
+
+    hits_total: set[str] = set()
+    out_modules: list[dict] = []
+    for m in modules:
+        hits = _denied_stdlib_mentions(str(m.get("purpose", "")), resolved_os)
+        if hits:
+            m = {**m, "purpose": f"{m['purpose']}{_note(hits)}"}
+            hits_total.update(hits)
+        out_modules.append(m)
+    summary_hits = _denied_stdlib_mentions(summary, resolved_os)
+    if summary_hits:
+        summary = f"{summary}{_note(summary_hits)}"
+        hits_total.update(summary_hits)
+    if hits_total:
+        logger.warning(
+            "planner adopted OS-unavailable stdlib %s; appended deterministic "
+            "counter-note (os=%s)", sorted(hits_total), resolved_os,
+        )
+    return summary, out_modules
+
+
+def _file_name(path: str) -> str:
+    """OS 非依存のファイル名 (basename)。depends_on の一意解決用。"""
+    return path.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def resolve_unknown_dependencies(modules: list[dict]) -> list[dict]:
+    """module list に無いパスを指す ``depends_on`` を決定論解決する。
+
+    planner は「単一モジュール構成」と申告しながら実在しないモジュールへの
+    依存を書く自己矛盾を出すことがある (2026-07-07 live: modules=[main.py] で
+    depends_on=[game.py] + purpose「imports the Game class」→ 生成コードが
+    `from game import Game` して起動不能。`game` は生成物 stem でも stdlib
+    でもないため smoke/pytest 双方で外部依存に降格され偽 success で配信された)。
+
+    exact 一致 → basename 一意一致の順で正準パスへ解決し、解決不能な依存は
+    除去して purpose に PLAN NOTE を追記する (依存エントリの除去以外は
+    追記のみ — prose の書き換えはしない)。ノートは正準ファイル一覧経由で
+    spec/code 全プロンプトへ伝播し、幻覚モジュールからの import を抑止する。
+    """
+    known = {m["file_path"] for m in modules}
+    by_name: dict[str, list[str]] = {}
+    for path in known:
+        by_name.setdefault(_file_name(path), []).append(path)
+
+    def _note(removed: list[str]) -> str:
+        quoted = ", ".join(f"`{d}`" for d in removed)
+        return (
+            f" [PLAN NOTE: {quoted} is NOT part of this program — do not "
+            f"import from it; implement the needed behavior inside this "
+            f"module or its listed dependencies]"
+        )
+
+    out: list[dict] = []
+    dropped_total: set[str] = set()
+    for m in modules:
+        resolved: list[str] = []
+        dropped: list[str] = []
+        for dep in m["depends_on"]:
+            if dep in known:
+                target = dep
+            else:
+                candidates = by_name.get(_file_name(dep), [])
+                if len(candidates) == 1:
+                    target = candidates[0]
+                else:
+                    dropped.append(dep)
+                    continue
+            if target not in resolved:
+                resolved.append(target)
+        if dropped:
+            m = {**m, "depends_on": resolved,
+                 "purpose": f"{m['purpose']}{_note(dropped)}"}
+            dropped_total.update(dropped)
+        elif resolved != m["depends_on"]:
+            m = {**m, "depends_on": resolved}
+        out.append(m)
+    if dropped_total:
+        logger.warning(
+            "planner declared dependencies on unplanned modules %s; removed "
+            "them and appended a deterministic counter-note",
+            sorted(dropped_total),
+        )
+    return out
+
+
 def _slug(file_path: str) -> str:
     """file_path を task_id に使える ASCII slug に正規化する。"""
     s = re.sub(r"[^0-9a-zA-Z]+", "_", file_path.strip().lower()).strip("_")
     return s or "mod"
+
+
+def _module_stem(file_path: str) -> str:
+    """file_path の stem (小文字) を返す (エントリモジュール判定用)。"""
+    name = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+    return name.rsplit(".", 1)[0].lower()
 
 
 def _unique(base: str, seen: set[str]) -> str:
@@ -127,14 +286,26 @@ def _dependency_depths(modules: list[dict]) -> dict[str, int]:
 
 
 def _render_module_list(modules: list[dict]) -> str:
-    """spec タスク description 用にモジュール一覧を整形する。"""
+    """spec タスク description 用にモジュール一覧を整形する。
+
+    行頭 ``- <path>: `` の 1 行目形式は :func:`spec_parts.module_paths_from_list`
+    の正規表現と契約している。複数行 purpose は 2 スペースインデントの継続行に
+    折り返し、行ベースの形状を保つ。
+    """
     lines: list[str] = []
     for m in modules:
         fp = str(m.get("file_path", "")).strip()
         purpose = str(m.get("purpose", "")).strip()
+        components = [
+            str(c).strip() for c in (m.get("key_components") or []) if str(c).strip()
+        ]
+        comp_note = f" [components: {', '.join(components)}]" if components else ""
         deps = [str(d).strip() for d in (m.get("depends_on") or []) if str(d).strip()]
         dep_note = f" (depends on: {', '.join(deps)})" if deps else ""
-        lines.append(f"- {fp}: {purpose}{dep_note}")
+        purpose_lines = [ln.strip() for ln in purpose.splitlines() if ln.strip()]
+        head = purpose_lines[0] if purpose_lines else ""
+        lines.append(f"- {fp}: {head}{comp_note}{dep_note}")
+        lines.extend(f"  {ln}" for ln in purpose_lines[1:])
     return "\n".join(lines)
 
 
@@ -152,9 +323,13 @@ def _normalize_modules(raw_modules: object) -> list[dict]:
             continue
         seen_paths.add(fp)
         deps = item.get("depends_on") or []
+        components = item.get("key_components")
+        if not isinstance(components, list):
+            components = []
         out.append({
             "file_path": fp,
             "purpose": str(item.get("purpose", "")).strip(),
+            "key_components": [str(c).strip() for c in components if str(c).strip()],
             "depends_on": [str(d).strip() for d in deps if str(d).strip()],
         })
     return out
@@ -189,13 +364,13 @@ async def synthesize_coding_task_graph(
     if not project_id:
         raise ValueError("project_id must be non-empty")
 
-    prompt = _SYNTHESIS_PROMPT.format(request=request.strip())
+    prompt = _SYNTHESIS_PROMPT.format(request=request.strip()) + os_constraint()
     graph_telemetry: dict = {}
     try:
         result = await assist_client.generate_json(
             prompt,
             purpose="coding_task_graph",
-            max_tokens=1024,
+            max_tokens=1536,
             temperature=0.3,
             telemetry=graph_telemetry,
         )
@@ -214,6 +389,10 @@ async def synthesize_coding_task_graph(
     if not modules:
         logger.info("coding_task_graph returned no modules — fallback to longform")
         return []
+    # OS 制約のプロンプト注入を planner が無視した場合の決定論バックストップ。
+    summary, modules = annotate_os_unavailable_modules(summary, modules)
+    # 実在しないモジュールへの依存 (planner の自己矛盾) を決定論解決する。
+    modules = resolve_unknown_dependencies(modules)
 
     facts: list[SemanticFact] = []
     seen_ids: set[str] = {SPEC_TASK_ID}
@@ -246,6 +425,10 @@ async def synthesize_coding_task_graph(
             _CODE_SALIENCE - depths.get(fp, 0) * _CODE_DEPTH_STEP,
             _CODE_SALIENCE_FLOOR,
         )
+        # エントリらしいモジュールは depends_on 未申告でも最後に生成する
+        # (兄弟 API が全て実在する状態でエントリを書かせ、API 幻覚を抑える)。
+        if len(modules) > 1 and _module_stem(fp) in _ENTRY_STEMS:
+            code_salience = _ENTRY_SALIENCE
         facts.append(make_task_fact(
             project_id=project_id,
             task_id=slug,

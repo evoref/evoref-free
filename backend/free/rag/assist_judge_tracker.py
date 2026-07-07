@@ -46,16 +46,24 @@ class AssistJudgeUsageTracker:
     対する許可判定が衝突しても確定した数値で判定する。セッション
     切替時は ``reset_session`` で明示クリアする (chat_service が
     WorkingMemory.clear と同じタイミングで呼ぶ)。
+
+    カウンタは ``(session_id, namespace)`` の組でキー化する。namespace は
+    呼出元 purpose を表す文字列 (``"necessity"`` / ``"quality"`` /
+    ``"content_gate"`` 等) で、purpose 間の発火予算が独立するようにする。
+    以前は session_id のみをキーにしており、よく発火する purpose (例:
+    necessity) が他の purpose (quality/content_gate) の予算を意図せず
+    食い潰すバグがあった。
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._session_counts: dict[str, int] = {}
+        self._session_counts: dict[tuple[str, str], int] = {}
 
     def check(
         self,
         *,
         session_id: str,
+        namespace: str,
         quality: str,
         query_count: int,
         config: dict | None,
@@ -65,6 +73,9 @@ class AssistJudgeUsageTracker:
         Args:
             session_id: チャットセッション識別子。``WorkingMemory.session_id``
                 相当。空文字列でもキー化する (``"default"`` セッションなど)。
+            namespace: 呼出元 purpose を識別する文字列 (``"necessity"`` /
+                ``"quality"`` / ``"content_gate"`` 等)。予算はこの単位で
+                独立に管理される。
             quality: ルールベース Self-RAG の判定結果 ("high"/"medium"/"low")。
                 ``only_when_quality`` に含まれない場合は ``disabled``
                 相当の skip にする。
@@ -79,7 +90,7 @@ class AssistJudgeUsageTracker:
             return AssistJudgeDecision(
                 allowed=False,
                 reason="disabled",
-                session_count=self._peek(session_id),
+                session_count=self._peek(session_id, namespace),
                 query_count=query_count,
             )
 
@@ -88,7 +99,7 @@ class AssistJudgeUsageTracker:
             return AssistJudgeDecision(
                 allowed=False,
                 reason="quality_not_applicable",
-                session_count=self._peek(session_id),
+                session_count=self._peek(session_id, namespace),
                 query_count=query_count,
             )
 
@@ -97,12 +108,12 @@ class AssistJudgeUsageTracker:
             return AssistJudgeDecision(
                 allowed=False,
                 reason="query_cap",
-                session_count=self._peek(session_id),
+                session_count=self._peek(session_id, namespace),
                 query_count=query_count,
             )
 
         max_per_session = int(cfg.get("max_per_session", 5))
-        session_count = self._peek(session_id)
+        session_count = self._peek(session_id, namespace)
         if 0 < max_per_session <= session_count:
             return AssistJudgeDecision(
                 allowed=False,
@@ -118,22 +129,24 @@ class AssistJudgeUsageTracker:
             query_count=query_count,
         )
 
-    def record(self, session_id: str) -> int:
+    def record(self, session_id: str, namespace: str) -> int:
         """発火を記録する。戻り値は記録後の累計。"""
         with self._lock:
-            new_count = self._session_counts.get(session_id, 0) + 1
-            self._session_counts[session_id] = new_count
+            key = (session_id, namespace)
+            new_count = self._session_counts.get(key, 0) + 1
+            self._session_counts[key] = new_count
             return new_count
 
     def reset_session(self, session_id: str) -> None:
-        """セッション切替時にカウンタをクリアする。"""
+        """セッション切替時に全 namespace のカウンタをクリアする。"""
         with self._lock:
-            self._session_counts.pop(session_id, None)
+            for key in [k for k in self._session_counts if k[0] == session_id]:
+                del self._session_counts[key]
 
-    def get_session_count(self, session_id: str) -> int:
+    def get_session_count(self, session_id: str, namespace: str) -> int:
         """デバッグ / テスト用: セッション累計を取得する。"""
-        return self._peek(session_id)
+        return self._peek(session_id, namespace)
 
-    def _peek(self, session_id: str) -> int:
+    def _peek(self, session_id: str, namespace: str) -> int:
         with self._lock:
-            return self._session_counts.get(session_id, 0)
+            return self._session_counts.get((session_id, namespace), 0)

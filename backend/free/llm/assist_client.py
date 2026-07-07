@@ -105,6 +105,18 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     # staged コーディングの spec 工程: 設計仕様 (spec.md) のテキスト生成。
     # 自律ループ内 (inline 駆動) で発火する重いテキスト生成のため background。
     "coding_spec_doc": "background",
+    # staged spec 工程のモジュール節深化 (1 節 1 呼出でメソッド毎挙動・属性・
+    # 定数まで書き下す)。自律ループ内の重いテキスト生成のため background。
+    "coding_spec_deepen": "background",
+    # staged test 工程の spec 見直し判定 (executor._spec_revision_cycle)。
+    # 自律ループ内で発火する JSON 判定 + 改訂節生成のため background。
+    "spec_revision_judge": "background",
+    # staged spec 工程のフロー構造合成 (executor._synthesize_flow_steps)。
+    # 自律ループ内 (spec 確定直後) で発火する JSON 合成のため background。
+    "flow_spec_synthesis": "background",
+    # flow_spec_synthesis が両attemptとも不成立の場合のエスカレーション
+    # (executor._synthesize_flow_parts、Component/モジュール単位の部分合成)。
+    "flow_spec_part_synthesis": "background",
     # コードリペア (長文生成末尾の検証ゲート付き修正)。生成完了後に発火する
     # 重い修正パスで long_form_* と同列。background スロット。
     "code_repair": "background",
@@ -120,6 +132,9 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     # URL リコール (Phase 1) の自己採点。sleep-time 内で発火する
     # ため background スロットを使う。
     "url_relevance_score": "background",
+    # RAG necessity/quality リコール (Step 8.7) の自己採点。url_relevance_score
+    # と同根拠で sleep-time 内発火のため background。
+    "rag_judge_relevance_score": "background",
     # learning — 学習サイクル
     "critique_synthesis": "learning",
     "policy_evolution": "learning",
@@ -162,7 +177,9 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # 1 attempt で完了させるマージンとして 120s を採る。フローチャートは mermaid
     # 文字列 1 本のため 45s。
     "code_spec_synthesis": 120.0,
-    "flowchart_synthesis": 45.0,
+    # フローチャートは mermaid 文字列 1 本だが、詳細化 spec (入力 6000 chars) の
+    # prefill 増を見込み 60s。
+    "flowchart_synthesis": 60.0,
     # コードリペアは assembled 全体を再出力するため long_form_* と同等に確保。
     "code_repair": 90.0,
     "conflict_resolution": 15.0,
@@ -200,8 +217,24 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # staged コーディングのタスクグラフ合成 (summary + modules[] の JSON)。
     # meta_cognitive_plan より構造が大きいため 45s。失敗時は longform へ fallback。
     "coding_task_graph": 45.0,
-    # staged コーディングの spec.md テキスト生成。long_form_* と同等に確保。
-    "coding_spec_doc": 90.0,
+    # staged コーディングの spec.md テキスト生成。構造化 spec (## Module: /
+    # ### Component:) の詳細化で 3072 tok 級になり、iGPU + 4B assist の実測
+    # (3072 tok ≈ 95-130s) を賄うため 300s。実効値は executor が config の
+    # spec_timeout_sec を明示指定するためそちらが優先される (本値は整合目的)。
+    "coding_spec_doc": 300.0,
+    # staged test 工程の spec 見直し判定 (spec_ok + 改訂節 ≈ 500-800 tok の JSON)。
+    "spec_revision_judge": 90.0,
+    # staged spec 工程のフロー構造合成 (FlowSpec の steps JSON ≈ 800-1500 tok)。
+    # 入力は確定後 spec (≦12000 chars) の prefill を含むため 120s。実効値は
+    # executor が明示 timeout を渡すためそちらが優先 (本値は整合目的)。
+    "flow_spec_synthesis": 120.0,
+    # flow_spec_part_synthesis: Component/モジュール単位の小規模サブグラフ
+    # (steps ≈ 100-300 tok) のみを合成するため flow_spec_synthesis より短い。
+    "flow_spec_part_synthesis": 60.0,
+    # staged spec 工程のモジュール節深化 (節 1 個 ≈ 1000-2500 tok のテキスト)。
+    # 実効値は executor が config の spec_timeout_sec を明示指定するため
+    # そちらが優先 (coding_spec_doc と同じ整合目的)。
+    "coding_spec_deepen": 300.0,
     # エディタタブ名導出 ({"file_name": "..."} の極短 JSON)。応答パスで
     # 同期発火するため短く打ち切る。失敗時は言語別 fallback stem に倒す。
     "editor_filename": 8.0,
@@ -219,6 +252,9 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # URL リコール 自己採点。質問文 + 応答 + URL 本文プレビュー (1500 chars)
     # を入力に二値判定 + 短文 reason を返すだけのため、長くは要らない。
     "url_relevance_score": 15.0,
+    # RAG necessity/quality リコール自己採点。url_relevance_score と同根拠
+    # (質問文 + 応答 + 判定ラベルの短文入力)。
+    "rag_judge_relevance_score": 15.0,
     # ラルフループの action 列生成。バックグラウンド周回 (priority=background、
     # LoopDriver 側に max_wall=1800s の外枠がある) のためユーザ体感を阻害せず、
     # task → <actions> JSON 配列の生成にローカルモデルで時間がかかることがある。
@@ -267,6 +303,9 @@ PURPOSE_REASONING_BUDGET_DEFAULTS: dict[str, int] = {
     "prompt_evolution": 0,
     # 検索必要性判定は機械的な 1 bit 分類で thinking 不要
     "retrieval_necessity_judge": 0,
+    # 検索結果品質の再判定 (marginal band 救済) も機械的な 3 値分類で thinking 不要。
+    # retrieval_necessity_judge 等の兄弟 purpose と同じく即終了。
+    "retrieval_quality_judge": 0,
     # content gate の関連性判定も機械的な index 選別で thinking 不要
     "retrieval_chunk_gate": 0,
     # executable query 判定 + コマンド合成は機械的な抜き出し + 短文生成で
@@ -281,6 +320,20 @@ PURPOSE_REASONING_BUDGET_DEFAULTS: dict[str, int] = {
     "coding_task_graph": 0,
     # spec.md 生成は設計の言語化で中程度の推論余地が有効。
     "coding_spec_doc": 1024,
+    # モジュール節深化も設計の言語化 (coding_spec_doc と同根拠)。
+    "coding_spec_deepen": 1024,
+    # spec 見直し判定は欠陥指摘 + 節改訂の中程度タスク。response_format
+    # (SpecRevisionJudgement) で構造を固定するため thinking は絞る。
+    "spec_revision_judge": 512,
+    # フロー構造合成は steps の到達可能性・decision 分岐の整合という spec 全体を
+    # 通した多段推論を要する (2026-07-07 live: reasoning_budget=0 のまま観測
+    # 5 セッション・10 回全てで検証不合格 = 決定論フォールバックへ 100% 縮退。
+    # response_format=FlowSpec は JSON の形状のみ保証し、到達可能性等の意味論は
+    # 保証しないため、旧来の「機械的抽出で thinking 不要」という前提は誤りだった)。
+    # spec_revision_judge と同程度の中庸値。
+    "flow_spec_synthesis": 512,
+    # 部分合成も同根拠 (小規模サブグラフでも到達可能性の整合は要る)。
+    "flow_spec_part_synthesis": 512,
     # エディタタブ名導出は機械的な命名で thinking 不要。
     # response_format (EditorFilenameResult) で構造を固定する。
     "editor_filename": 0,
@@ -293,6 +346,8 @@ PURPOSE_REASONING_BUDGET_DEFAULTS: dict[str, int] = {
     "cartridge_eval_generation": 0,
     # URL リコール 自己採点は二値判定 + 短文 reason のため thinking 不要。
     "url_relevance_score": 0,
+    # RAG necessity/quality リコール自己採点も同様に機械的採点で thinking 不要。
+    "rag_judge_relevance_score": 0,
 }
 
 

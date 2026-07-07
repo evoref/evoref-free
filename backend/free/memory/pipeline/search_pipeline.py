@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
     from backend.free.core.policy_interpreter import PolicyInterpreter
     from backend.free.core.stage_timer import StageTimer
+    from backend.free.memory.views.mem import MemFactView
     from backend.free.rag.assist_judge_tracker import AssistJudgeUsageTracker
     from backend.free.rag.lazy_contextual import LazyContextualPrefixService
 
@@ -203,6 +204,34 @@ def _resolve_assist_necessity_cfg(rag_cfg: dict) -> dict:
     }
 
 
+def _resolve_necessity_recall_cfg(rag_cfg: dict) -> dict:
+    """``rag.self_rag.necessity_recall`` セクションを安全に取り出す
+
+    embedding 決定論的リコール (``rag_judge_recall.try_recall_necessity``) の
+    閾値設定。url/executable_command recall と同型。
+    """
+    cfg = ((rag_cfg.get("self_rag") or {}).get("necessity_recall")) or {}
+    return {
+        "enabled": bool(cfg.get("enabled", True)),
+        "topk": int(cfg.get("topk", 5)),
+        "min_score": float(cfg.get("min_score", 0.75)),
+        "min_record_score": float(cfg.get("min_record_score", 0.65)),
+        "ttl_days": int(cfg.get("ttl_days", 14)),
+    }
+
+
+def _resolve_quality_recall_cfg(rag_cfg: dict) -> dict:
+    """``rag.self_rag.quality_recall`` セクションを安全に取り出す (necessity_recall と対称)。"""
+    cfg = ((rag_cfg.get("self_rag") or {}).get("quality_recall")) or {}
+    return {
+        "enabled": bool(cfg.get("enabled", True)),
+        "topk": int(cfg.get("topk", 5)),
+        "min_score": float(cfg.get("min_score", 0.75)),
+        "min_record_score": float(cfg.get("min_record_score", 0.65)),
+        "ttl_days": int(cfg.get("ttl_days", 14)),
+    }
+
+
 async def _maybe_assist_judge_quality(
     quality_judge: RetrievalQualityJudge,
     quality: str,
@@ -215,6 +244,8 @@ async def _maybe_assist_judge_quality(
     tracker: "AssistJudgeUsageTracker | None" = None,
     debug_logger: "DebugLogger | None" = None,
     assist_experience_recorder: "Callable[[str, str, str, float], None] | None" = None,
+    mem_view: "MemFactView | None" = None,
+    query_vec: np.ndarray | None = None,
 ) -> str:
     """marginal 境界 + アシスト有効時のみ LLM 品質再判定を行う
 
@@ -223,8 +254,39 @@ async def _maybe_assist_judge_quality(
     制御する。上限超過・無効・quality 非該当の場合は ``debug_logger``
     へ ``op="assist_judge"`` + ``assist_judge_skipped_reason`` を記録し、
     ルールベース判定をそのまま返す。
+
+    assist 呼出の前に、まず embedding 決定論的リコール
+    (``rag_judge_recall.try_recall_quality``) を試す。ヒットすれば
+    tracker 予算を消費せず、assist_client が None (degraded) でも
+    LLM 呼出をスキップして即決定する。対象は assist と同じ
+    ``only_when_quality`` (既定 ``medium``) のみ。
     """
     aj_cfg = _resolve_assist_judge_cfg(rag_cfg)
+
+    if quality in aj_cfg["only_when_quality"]:
+        quality_recall_cfg = _resolve_quality_recall_cfg(rag_cfg)
+        if quality_recall_cfg["enabled"] and mem_view is not None and query_vec is not None:
+            from backend.free.memory.pipeline.rag_judge_recall import try_recall_quality
+            recalled = await try_recall_quality(query_vec, mem_view, quality_recall_cfg)
+            if recalled is not None:
+                label, recall_sim = recalled
+                logger.debug(
+                    "Step 5b quality recall: %s (sim=%.3f)", label, recall_sim,
+                )
+                if debug_logger is not None:
+                    debug_logger.log_decision(
+                        decision_point="self_rag_judge_path",
+                        chosen="embedding_recall",
+                        candidates=["rule_based", "assist_judge", "embedding_recall"],
+                        reason="embedding_recall_matched",
+                        context={
+                            "rule_based_quality": quality,
+                            "recalled_quality": label,
+                            "similarity": recall_sim,
+                        },
+                        scope="request",
+                    )
+                return label
 
     # 前提条件: assist_client が無ければ判定不能 (skip ログは出さない)
     if assist_client is None:
@@ -246,6 +308,7 @@ async def _maybe_assist_judge_quality(
 
     decision = tracker.check(
         session_id=session_id,
+        namespace="quality",
         quality=quality,
         query_count=0,
         config=aj_cfg,
@@ -274,7 +337,7 @@ async def _maybe_assist_judge_quality(
         record_assist=assist_experience_recorder,
     )
     elapsed = _time.perf_counter() - started
-    session_count_after = tracker.record(session_id)
+    session_count_after = tracker.record(session_id, namespace="quality")
     logger.debug(
         "Step 5b assist judge: rule=%s -> final=%s (session_count=%d)",
         quality, new_quality, session_count_after,
@@ -367,6 +430,7 @@ async def unified_search(
     necessity_prompt: str | None = None,
     quality_prompt: str | None = None,
     assist_experience_recorder: "Callable[[str, str, str, float], None] | None" = None,
+    mem_view: "MemFactView | None" = None,
 ) -> SearchResult:
     """統合検索パイプライン: Self-RAG + 3層メモリ
 
@@ -413,20 +477,45 @@ async def unified_search(
     else:
         recent_context = full_context
     necessity_cfg = _resolve_assist_necessity_cfg(rag_cfg)
-    if necessity_cfg["enabled"] and assist_client is not None:
-        necessity = await necessity_judge.judge_with_assist(
-            query,
-            context_count,
-            assist_client,
-            recent_context=recent_context,
-            session_id=session_id,
-            tracker=assist_judge_tracker,
-            debug_logger=debug_logger,
-            config=necessity_cfg,
-            record_assist=assist_experience_recorder,
-        )
-    else:
-        necessity = necessity_judge.judge(query, context_count=context_count)
+    necessity_recall_cfg = _resolve_necessity_recall_cfg(rag_cfg)
+
+    rule_necessity = necessity_judge.judge_rule_only(query, context_count)
+    necessity: str | None = None
+    if rule_necessity != "uncertain":
+        necessity = rule_necessity
+    elif necessity_recall_cfg["enabled"] and mem_view is not None:
+        from backend.free.memory.pipeline.rag_judge_recall import try_recall_necessity
+        recalled = await try_recall_necessity(query_vec, mem_view, necessity_recall_cfg)
+        if recalled is not None:
+            necessity, recall_sim = recalled
+            logger.info(
+                "Necessity recall: %s (sim=%.3f, query=%r)",
+                necessity, recall_sim, query[:50],
+            )
+            if debug_logger is not None:
+                debug_logger.log_decision(
+                    decision_point="self_rag_necessity_path",
+                    chosen=necessity,
+                    candidates=["retrieve", "fetch", "skip"],
+                    reason="embedding_recall_matched",
+                    context={"similarity": recall_sim},
+                    scope="request",
+                )
+    if necessity is None:
+        if necessity_cfg["enabled"] and assist_client is not None:
+            necessity = await necessity_judge.judge_with_assist(
+                query,
+                context_count,
+                assist_client,
+                recent_context=recent_context,
+                session_id=session_id,
+                tracker=assist_judge_tracker,
+                debug_logger=debug_logger,
+                config=necessity_cfg,
+                record_assist=assist_experience_recorder,
+            )
+        else:
+            necessity = necessity_judge.judge(query, context_count=context_count)
     logger.debug("Step 1 necessity: %s (context_count=%d)", necessity, context_count)
     # `fetch` は外部 fetch_url 委譲シグナル — RAG パイプラインは `skip` と同等に
     # 即終了し、ToolCallJudge / fetch_url ツールに委ねる。
@@ -517,6 +606,8 @@ async def unified_search(
             tracker=assist_judge_tracker,
             debug_logger=debug_logger,
             assist_experience_recorder=assist_experience_recorder,
+            mem_view=mem_view,
+            query_vec=query_vec,
         )
     finally:
         if timer is not None:

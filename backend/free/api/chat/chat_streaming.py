@@ -2069,7 +2069,9 @@ def _stage_label_for_task(task_id: str) -> str:
     return "タスク"
 
 
-def _translate_loop_event(evt, total_tasks: int = 0) -> str | None:
+def _translate_loop_event(
+    evt, total_tasks: int = 0, task_indices: dict[str, int] | None = None,
+) -> str | None:
     """LoopEvent を staged 進捗の SSE step フレームへ翻訳する (該当なしは None)。
 
     2 段階表示:
@@ -2078,24 +2080,43 @@ def _translate_loop_event(evt, total_tasks: int = 0) -> str | None:
       が進捗バー化する。``iteration_ended`` → ``long_form_unit_done``。
     - 下位 (工程内サブステップ): ``stage_progress`` → ``task_progress`` step
       (フロントは折りたたみリスト、CLI は逐次表示)。
+
+    ``task_indices`` (呼出側所有の可変 dict) を渡すと、ユニット番号を driver の
+    iteration ではなく task_id の初出順で採番する。driver リトライで同一タスクが
+    再 pick された場合は同じ番号を再利用し「(再試行)」を付ける (旧実装は
+    iteration をそのまま使い ``[4/3]`` のように総数を超えて表示されていた)。
     """
     data = getattr(evt, "data", None) or {}
     tid = str(data.get("task_id", ""))
     label = _stage_label_for_task(tid)
+
+    def _unit_index() -> tuple[int, bool]:
+        """(表示番号, 再試行か)。task_indices 未指定時は従来の iteration。"""
+        if task_indices is None or not tid:
+            return getattr(evt, "iteration", 0) or 0, False
+        if tid in task_indices:
+            return task_indices[tid], True
+        task_indices[tid] = len(task_indices) + 1
+        return task_indices[tid], False
+
     if evt.event == "task_picked":
         title = str(data.get("title", ""))
-        idx = getattr(evt, "iteration", 0) or 0
+        idx, is_retry = _unit_index()
         prefix = f"[{idx}/{total_tasks}] " if total_tasks else ""
+        suffix = " (再試行)" if is_retry else ""
         return sse.step({
             "type": "long_form_unit_start",
-            "detail": f"{prefix}{label}: {title}".strip(),
+            "detail": f"{prefix}{label}: {title}{suffix}".strip(),
             "status": "running",
         })
     if evt.event == "iteration_ended":
         outcome = data.get("last_outcome") or {}
         status = str(outcome.get("status", ""))
         ok = status == "success"
-        idx = getattr(evt, "iteration", 0) or 0
+        if task_indices is not None and tid in task_indices:
+            idx = task_indices[tid]
+        else:
+            idx = getattr(evt, "iteration", 0) or 0
         prefix = f"[{idx}/{total_tasks}] " if total_tasks else ""
         return sse.step({
             "type": "long_form_unit_done",
@@ -2204,20 +2225,42 @@ def _staged_postprocess(
     return out, issues, sorted(wired_paths)
 
 
-async def _staged_import_smoke(code_map: dict[str, str], timeout_sec: float) -> list[str]:
+def _staged_internal_names(ws) -> frozenset[str]:
+    """spec が宣言する内部契約名 (幻覚内部 import 判定用、読めなければ空)。
+
+    smoke の「外部依存」分類に渡し、spec の Component / 正準モジュールに由来する
+    import 失敗を環境要因 warning へ降格させない (2026-07-07 live: `from game
+    import Game` が外部依存扱いになり起動不能コードが偽 success で配信された)。
+    """
+    try:
+        from backend.free.loop.staged.spec_parts import internal_contract_names
+        return internal_contract_names(ws.read_spec() or "")
+    except Exception as exc:
+        logger.debug("staged internal names unavailable: %s", exc)
+        return frozenset()
+
+
+async def _staged_import_smoke(
+    code_map: dict[str, str], timeout_sec: float,
+    internal_names: frozenset[str] = frozenset(),
+) -> list[str]:
     """配信前の code_map を import スモークし error 文字列列を返す (失敗時は空)。
 
     静的検査 (check_coherence / check_entrypoint) では拾えない cross-file ImportError
     (``from game import GameConfig`` で GameConfig が実在しない等) を終端でも捕捉する。
     ``__main__`` は実行せず、外部依存 (pygame 等) の未インストールは warning に倒れる
-    ため error には含まれない。
+    ため error には含まれない (内部契約名 ``internal_names`` に由来する幻覚 import
+    は error 側に分類される)。
     """
     py_map = {p: c for p, c in code_map.items() if p.endswith(".py")}
     if not py_map:
         return []
     from backend.free.generation.smoke_validator import run_import_smoke
     try:
-        res = await asyncio.to_thread(run_import_smoke, py_map, timeout_sec)
+        res = await asyncio.to_thread(
+            run_import_smoke, py_map, timeout_sec,
+            internal_names=internal_names,
+        )
     except Exception as exc:
         logger.warning("staged finalize import smoke failed: %s", exc)
         return []
@@ -2236,6 +2279,7 @@ async def stream_staged_coding(
     output_target: str,
     codegen,
     fallback_factory,
+    part_codegen=None,
     timer: StageTimer | None = None,
     private: bool = False,
     keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL_SEC,
@@ -2243,7 +2287,8 @@ async def stream_staged_coding(
     """専用 LoopDriver をインライン駆動し spec→code→test を実行してストリームする。
 
     タスクグラフ合成が空 (assist degraded 等) のときは ``fallback_factory`` が返す
-    従来 longform ストリームへ委譲する。
+    従来 longform ストリームへ委譲する。``part_codegen`` (部分ごと生成向けの別予算
+    delegate) が渡されたときのみ部分生成→決定論結合経路を有効化する。
     """
     from uuid import uuid4
 
@@ -2343,7 +2388,10 @@ async def stream_staged_coding(
         # 未定義メソッドを呼ぶ) を check_entrypoint、生成物間 from-import の名前欠落
         # (外部依存欠落で import スモークが盲目化しても拾える) を
         # check_cross_module_imports で error に上乗せ。エントリ有界実行は advisory。
-        result = run_import_smoke(files, timeout_sec=smoke_timeout)
+        result = run_import_smoke(
+            files, timeout_sec=smoke_timeout,
+            internal_names=_staged_internal_names(ws),
+        )
         extra_errors: list[str] = []
         for fn in (check_coherence, check_entrypoint, check_cross_module_imports):
             try:
@@ -2361,16 +2409,35 @@ async def stream_staged_coding(
                 logger.debug("staged entry exec smoke failed: %s", exc)
         return result
 
+    part_assembler = None
+    if part_codegen is not None:
+        # 部分結合 (EvorefGen 具象) は有効時のみ lazy import で注入する
+        # (smoke_runner / contract_checker と同じ loop→gen 越境回避パターン)。
+        from backend.free.generation.part_assembler import assemble_file_parts
+        part_assembler = assemble_file_parts
+
+    # spec 宣言契約と生成コードの照合 (EvorefGen 具象) も同パターンで注入。
+    from backend.free.generation.spec_conformance import check_spec_conformance
+
     executor = StagedCodingExecutor(
         workspace=ws, assist_client=state.assist_client, codegen=codegen,
         smoke_runner=(_smoke if staged_cfg.get("smoke_gate_enabled", True) else None),
         test_runner=test_runner,
         contract_checker=check_api_contract,
+        conformance_checker=check_spec_conformance,
         max_test_regen_rounds=int(staged_cfg.get("max_test_regen_rounds", 2)),
         max_repair_rounds=int(staged_cfg.get("max_repair_rounds", 2)),
-        spec_max_tokens=int(staged_cfg.get("spec_max_tokens", 1536)),
-        spec_timeout_sec=float(staged_cfg.get("spec_timeout_sec", 120.0)),
+        spec_max_tokens=int(staged_cfg.get("spec_max_tokens", 6144)),
+        spec_timeout_sec=float(staged_cfg.get("spec_timeout_sec", 600.0)),
         flowchart_enabled=bool(staged_cfg.get("flowchart_enabled", True)),
+        spec_deepen_enabled=bool(staged_cfg.get("spec_deepen_enabled", True)),
+        spec_conformance_enabled=bool(
+            staged_cfg.get("spec_conformance_enabled", True),
+        ),
+        max_spec_revision_rounds=int(staged_cfg.get("max_spec_revision_rounds", 1)),
+        part_codegen=part_codegen,
+        part_assembler=part_assembler,
+        part_max_parts=int(staged_cfg.get("part_max_parts", 4)),
         event_bus=event_bus,
         debug_logger=state.debug_logger,
     )
@@ -2380,7 +2447,7 @@ async def stream_staged_coding(
         view_provider=_staged_view,
         executor=executor,
         max_iterations=max_iter,
-        max_wall_time_sec=float(staged_cfg.get("total_timeout_sec", 900.0)),
+        max_wall_time_sec=float(staged_cfg.get("total_timeout_sec", 2400.0)),
         # モジュールは互いに独立。1 モジュールの失敗で全体を打ち切らないよう
         # 連続失敗での abort を実質無効化する (max_iterations / 総時間で有界)。
         max_consecutive_failures=max_iter,
@@ -2390,6 +2457,7 @@ async def stream_staged_coding(
     )
     driver.start(_STAGED_PROJECT_ID)
     total_tasks = len(facts)
+    task_indices: dict[str, int] = {}  # task_id 初出順の表示番号 (リトライで再利用)
     queue = event_bus.subscribe()
     run_task = asyncio.create_task(
         driver.run(_STAGED_PROJECT_ID), name="staged_coding.run",
@@ -2406,7 +2474,9 @@ async def stream_staged_coding(
                     yield sse.keepalive()
                     last_ka = time.monotonic()
                 continue
-            frame = _translate_loop_event(evt, total_tasks=total_tasks)
+            frame = _translate_loop_event(
+                evt, total_tasks=total_tasks, task_indices=task_indices,
+            )
             if frame:
                 yield frame
                 last_ka = time.monotonic()
@@ -2467,13 +2537,22 @@ async def _finalize_staged_stream(
     # code_map へ import スモークを上乗せして cross-file ImportError も拾う。test 工程が
     # wall-time で starve された / test_stage_enabled=false でも、非起動コードを success
     # として学習記録しない (= ゲートをブロッキングにする) ための統合シグナル。
-    import_errors = await _staged_import_smoke(code_map, smoke_timeout)
+    import_errors = await _staged_import_smoke(
+        code_map, smoke_timeout, _staged_internal_names(ws),
+    )
     runnability_issues = coherence_issues + [
         e for e in import_errors if e not in coherence_issues
     ]
 
-    progress = (ws.read_manifest() or {}).get("progress", {}) or {}
+    manifest = ws.read_manifest() or {}
+    progress = manifest.get("progress", {}) or {}
     tasks_failed = int(progress.get("tasks_failed", 0) or 0)
+    # 生成テストが決定論的に赤のまま終わったモジュール数 (警告付き配信の明示用)。
+    # `<task_id>.pytest` エントリは executor._run_advisory_pytest が永続化する。
+    pytest_unpassed = sum(
+        1 for key, rec in (manifest.get("test_results") or {}).items()
+        if key.endswith(".pytest") and not (rec or {}).get("passed")
+    )
     # 終端ゲート結果を long_form JSONL に記録し可測化する (develop=investigate/evolve
     # 時のみ出力)。SSE は表示専用で残らないため、配線件数/整合 issue を後から数値で追える。
     if state.debug_logger is not None:
@@ -2487,6 +2566,7 @@ async def _finalize_staged_stream(
                 "coherence_issue_count": len(runnability_issues),
                 "coherence_issues": runnability_issues[:20],
                 "tasks_failed": tasks_failed,
+                "pytest_unpassed_count": pytest_unpassed,
             })
         except Exception as exc:
             logger.debug("staged coherence long_form log failed: %s", exc)
@@ -2494,6 +2574,13 @@ async def _finalize_staged_stream(
         yield sse.step({
             "type": "task_result",
             "detail": f"⚠ {tasks_failed} 件のタスクが失敗しました (workspace: {ws.root})",
+            "status": "failed",
+        })
+    if pytest_unpassed:
+        yield sse.step({
+            "type": "task_result",
+            "detail": f"⚠ テスト未合格: {pytest_unpassed} モジュール — 生成テストが"
+                      f"失敗しています (成果物は配信します)",
             "status": "failed",
         })
     if runnability_issues:

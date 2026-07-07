@@ -29,6 +29,7 @@ from __future__ import annotations
 import re
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from backend.free.harness.action import RunCommandAction
 from backend.free.loop.action_runner import ActionRunner, ActionRunnerConfig
@@ -38,6 +39,11 @@ from backend.io.atomic import AtomicWriter
 from backend.log_config import get_logger
 
 logger = get_logger("loop.staged.test_runner")
+
+# collection error 中の欠落モジュール抽出 (環境要因判定用)。
+_MISSING_MODULE_RE = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
+# stdlib 名 (py3.10+)。`_curses` → `curses` の私的名正規化は判定側で行う。
+_STDLIB_MODULES: frozenset[str] = frozenset(getattr(sys, "stdlib_module_names", ()))
 
 # 生成テストが src/ のモジュールを ``import`` できるようにする bootstrap。
 # ワークスペース直下の conftest.py として書き出す (sys.path に src/ を足すだけ)。
@@ -97,6 +103,9 @@ class StagedTestRunner:
         return (
             self.python_exe, "-m", "pytest",
             "-p", "no:cacheprovider", "-q",
+            # 失敗トレースを圧縮し、spec 見直しループの evidence 窓 (末尾 3000
+            # chars) に複数の失敗が収まるようにする。
+            "--tb=short",
             "--rootdir", str(self.workspace.root),
             str(target),
         )
@@ -126,6 +135,29 @@ class StagedTestRunner:
         no_tests = returncode == 5
         ok = bool(result.success) and not no_tests
         summary = _summarize(failed, passed, errors, no_tests, returncode)
+
+        # collection error の原因が「非生成物・非 stdlib モジュールの
+        # ModuleNotFoundError」なら環境要因 (外部依存未インストール) であり、
+        # コードの欠陥ではない。import スモークが同ケースを warning に分類する
+        # のと整合させ、skipped=True で返して呼出側 (executor) が spec 見直し
+        # トリガ・failure 集計・テスト未合格警告に乗せないようにする
+        # (2026-07-06 live: pygame 未インストールで見直しループが誤発火)。
+        if not ok:
+            env_dep = _detect_env_missing_dependency(
+                out, self._src_stems(), self._internal_names(),
+            )
+            if env_dep:
+                return GateResult(
+                    name="staged_pytest",
+                    ok=False,
+                    skipped=True,
+                    returncode=returncode,
+                    duration_ms=int(result.duration_ms),
+                    stdout_tail=result.output or "",
+                    stderr_tail=result.error or "",
+                    error=summary,
+                    skip_reason=f"外部依存 '{env_dep}' が未インストール (環境要因)",
+                )
         return GateResult(
             name="staged_pytest",
             ok=ok,
@@ -136,6 +168,65 @@ class StagedTestRunner:
             stderr_tail=result.error or "",
             error=None if ok else summary,
         )
+
+    def _src_stems(self) -> set[str]:
+        """生成 src のモジュール stem 集合 (欠落依存の環境要因判定用)。
+
+        ネストしたパス (``core/game.py``) はトップレベルのパッケージ名 (``core``)
+        も含める (import スモークの ``_stems`` と判定基準を揃える)。
+        """
+        try:
+            stems: set[str] = set()
+            for f in self.workspace.list_files(kind="src"):
+                path = Path(f.logical_path)
+                stems.add(path.stem)
+                if len(path.parts) > 1:
+                    stems.add(path.parts[0])
+            return stems
+        except Exception:  # noqa: BLE001 - 判定不能時は空集合 (env-skip しない側へ)
+            return set()
+
+    def _internal_names(self) -> frozenset[str]:
+        """spec が宣言する内部契約名 (幻覚内部 import を env-skip させない判定用)。"""
+        try:
+            from backend.free.loop.staged.spec_parts import internal_contract_names
+            return internal_contract_names(self.workspace.read_spec() or "")
+        except Exception:  # noqa: BLE001 - 判定不能時は空 (env-skip 側へ)
+            return frozenset()
+
+
+def _detect_env_missing_dependency(
+    out: str, src_stems: set[str],
+    internal_names: frozenset[str] = frozenset(),
+) -> str | None:
+    """collection error の原因が環境要因の外部依存欠落なら、そのモジュール名を返す。
+
+    条件: 「ERROR collecting」を含み、欠落モジュールがすべて
+    (a) 生成物の stem でない (cross-file 欠落や幻覚 import はコード欠陥) かつ
+    (b) stdlib でない (ターゲット OS で起動不能な欠陥) かつ
+    (c) spec の内部契約名 (Component 名 / 正準モジュール stem、case-insensitive)
+    でない (幻覚内部 import はコード欠陥。2026-07-07 live: `from game import
+    Game` が env-skip され偽 success で配信された) こと。
+    1 つでもコード欠陥側の欠落が混ざる場合は None (通常の失敗扱い)。
+    """
+    if "ERROR collecting" not in out:
+        return None
+    missing_names = {
+        m.group(1).split(".")[0] for m in _MISSING_MODULE_RE.finditer(out)
+    }
+    if not missing_names:
+        return None
+    lowered_internal = {n.lower() for n in internal_names}
+    env_only: list[str] = []
+    for name in sorted(missing_names):
+        if name in src_stems:
+            return None
+        if name in _STDLIB_MODULES or name.lstrip("_") in _STDLIB_MODULES:
+            return None
+        if name.lower() in lowered_internal:
+            return None
+        env_only.append(name)
+    return env_only[0] if env_only else None
 
 
 def _parse_pytest_summary(text: str) -> tuple[int, int, int]:

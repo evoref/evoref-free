@@ -779,6 +779,7 @@ def build_assist_cmd(
     *,
     lora_override: str | Path | None = None,
     port_override: int | None = None,
+    model_override: str | None = None,
 ) -> list[str] | None:
     """config.yaml の assist_model セクションからアシストモデル用 llama-server コマンドを生成
 
@@ -786,7 +787,9 @@ def build_assist_cmd(
 
     Level 2 assist=B の候補評価では ``lora_override`` (候補 GGUF LoRA パス) と
     ``port_override`` (スクラッチポート) を指定して ephemeral サーバを起動する。
-    どちらも未指定 (通常運用) のときは従来挙動と完全に等価。
+    ``model_override`` は chat/coding モード切替時 (``model_paths.assist_coding_model``)
+    に一時的に別 GGUF を読み込ませる用途 (build_llama_cmd と同じパターン)。
+    いずれも未指定 (通常運用) のときは従来挙動と完全に等価。
     """
     assist_cfg = cfg.get("assist_model", {})
     local_cfg = assist_cfg.get("local", {})
@@ -798,8 +801,8 @@ def build_assist_cmd(
 
     sp = cfg.get("model_paths", {})
 
-    # アシストモデルパス
-    assist_model = sp.get("assist_model", "")
+    # アシストモデルパス（model_override 指定時はそちらを優先）
+    assist_model = model_override or sp.get("assist_model", "")
     if not assist_model:
         return None
     assist_model_path = Path(assist_model)
@@ -818,17 +821,22 @@ def build_assist_cmd(
         "llama-server",
         "-m", str(assist_model_path),
         "--port", str(port),
-        "-c", str(resolve_context_size_for(cfg, "assist", project_root)),
+        "-c", str(resolve_context_size_for(
+            cfg, "assist", project_root, model_override=model_override,
+        )),
         "-ngl", str(gpu_layers),
     ]
 
     # LoRA アダプタ。lora_override (Level 2 assist=B 候補評価) は無条件で付与する
     # (候補 GGUF は harness が起動直前に書き出すため exists チェックしない)。
     # 通常運用は local_paths.assist_lora_adapter が存在するときのみ付与し、採用済み
-    # assist LoRA を次回起動で反映する。
+    # assist LoRA を次回起動で反映する。model_override (chat/coding モード切替) 時は
+    # lora_override が明示されない限り LoRA を付けない — assist_lora_adapter は
+    # chat 用アシストの重みに対して学習されたものであり、arch が異なりうる
+    # coding 用モデルに無条件添付すると shape mismatch で起動失敗しうるため。
     if lora_override is not None:
         cmd += ["--lora", str(Path(lora_override))]
-    else:
+    elif model_override is None:
         lp = cfg.get("local_paths", {})
         assist_lora = lp.get("assist_lora_adapter", "local/models/assist_adapter.gguf")
         assist_lora_full = Path(assist_lora)

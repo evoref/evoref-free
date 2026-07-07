@@ -256,6 +256,9 @@ model_paths:
   assist_model: models/gemma-4-E4B_q4_0-it.gguf      # アシスト GGUF モデル（メモリ・RAG処理用）
   embed_model: models/Qwen3-Embedding-0.6B-Q8_0.gguf # 埋め込み用 GGUF モデル（llama-cpp バックエンド用）
   coding_model: null                                 # コーディングモード用 GGUF（null/空欄 = base_model にフォールバック）
+  assist_coding_model: null                          # コーディングモード用アシスト GGUF（null/空欄 = assist_model にフォールバック）
+                                                      # 設定すると /api/mode/switch が chat⇄coding 切替時に
+                                                      # アシストサーバも非破壊的 (config.yaml 非変更) に差し替える
 
 # ===== ベースモデル移行 / 起動時整合性チェック =====
 model_migration:
@@ -468,6 +471,27 @@ rag:
       assist_enabled: true        # marginal band の assist 救済 (false で純ルール)
       max_per_session: 5          # 1 セッション内の assist 発火上限 (0 以下で無制限)
       max_per_query: 1            # 1 クエリ内の assist 発火上限 (0 以下で無制限)
+    necessity_recall:
+      # embedding 決定論的リコール (ToolCallJudge._try_recall_url と同型)。
+      # ルール判定が uncertain になったクエリについて、過去の類似クエリ +
+      # assist 自己採点 (sleep-time Step 8.7) から action を直接引き当て、
+      # assist 呼出をスキップする。tracker (assist_necessity の発火上限) を
+      # 消費せず、assist_client=None (degraded) でも動作する。
+      enabled: true
+      topk: 5
+      min_score: 0.75             # 質問 embedding 類似度閾値 (url/command recall の 0.7 よりやや高め)
+      min_record_score: 0.65      # 過去自己採点平均の閾値
+      record_history_size: 10
+      ttl_days: 14                 # KB変化の影響を受けやすいため url recall (30日) より短め
+    quality_recall:
+      # necessity_recall と同型。ルールベース品質判定が marginal
+      # (既定 "medium") のクエリについて assist_judge の呼出をスキップする。
+      enabled: true
+      topk: 5
+      min_score: 0.75
+      min_record_score: 0.65
+      record_history_size: 10
+      ttl_days: 14
 
 # ===== 埋め込みモデル設定 =====
 embedding:
@@ -899,6 +923,20 @@ assist_model:
                                    # null にすると assist モデルの arch プロファイル
                                    # (models/profiles/<arch>.yaml の context_size) を使用
                                    # (解決順: ここの明示値 > profile > 8192)
+    # reasoning OS-fence。per-request の chat_template_kwargs.enable_thinking=false
+    # (assist_client.py) だけに頼らない二重防御として、サーバ起動時点で thinking を
+    # 抑止する。mode:none (qwen2/lfm2 等、非thinking) では no-op、mode:always
+    # (lfm2moe 等、強制thinking) ではサーバ側制御が効かないケースもあるが、その場合も
+    # クライアント側 `_ReasoningFilter` の strip が最終防御として機能するため無害。
+    reasoning: "off"
+    reasoning_budget_default: 0    # --reasoning-budget 0 (即終了)。reasoning: off とセットの二重防御
+    # KV キャッシュ量子化 (VRAM 半減、短文の構造化判定用途では品質劣化ほぼゼロ)。
+    cache_type_k: q8_0
+    cache_type_v: q8_0
+    # 共通 prefix (system prompt 等) の自動再利用。同一 purpose の繰り返し呼出で
+    # prefill コストを削減する保険 (SWA 構成モデルでは llama.cpp 側が自動無効化し
+    # no-op になりうる)。
+    cache_reuse: 256
     # slots: 既定 1 (本セクションに slots キー無し = -np 1)。チャット応答パスの
     # assist 判定を並列化する場合は slots: 2 を追加し、``concurrency.realtime: 2``
     # とセットで設定する。slots>1 では ``--kv-unified`` が自動付与され (下記
@@ -1091,18 +1129,25 @@ coding:
   staged:
     test_stage_enabled: true          # test 工程のうち advisory ユニットテスト生成+pytest 実行。false で生成のみ
     smoke_gate_enabled: true          # test 工程のうち決定論的 import スモーク+spec/flowchart 注入リペア。test_stage_enabled とは独立
-    flowchart_enabled: true          # spec 工程で mermaid 設計フローチャートを合成し生成へ注入
+    flowchart_enabled: true          # spec 工程でフロー構造を合成し flowchart.md (mermaid) と spec.md の Processing flow 節を同一データから描画
+    flow_part_synthesis_enabled: false # flow_spec_synthesis が2回とも検証不合格の場合、Component/モジュール単位で部分合成→決定論結合するエスカレーション (既定OFF、fallback_flow へ直接縮退)
     max_repair_rounds: 2              # test 失敗時のリペア最大回数 (0-5)
     max_test_regen_rounds: 2         # test が src の実 API に不整合な時 test のみ再生成 (src 不変・準ゲート, 0-5)
     entry_smoke_exec_enabled: true   # エントリ有界実行スモーク (advisory)。false で静的検査のみ
     entry_smoke_timeout_sec: 10.0    # エントリ有界実行スモークのタイムアウト
-    spec_max_tokens: 1536            # spec.md 生成の最大トークン
+    spec_max_tokens: 6144            # spec.md 生成の最大トークン上限 (Signature/Attributes/Behavior/Constants の詳細度を賄う。切断リトライ抑制)
+    spec_deepen_enabled: true        # モジュール節を 1 節 1 呼出で実装水準 (メソッド毎挙動・属性・定数) まで深化 (棄却時は原節維持)
+    spec_conformance_enabled: true   # spec 宣言契約と生成コードの決定論照合を smoke gate に合流 (false で観測のみ)
     code_max_tokens: 4096            # code 工程 (単一ファイル直接生成) の最大トークン。切断時のみ倍に広げ再生成
-    spec_timeout_sec: 120.0          # spec 工程タイムアウト
+    spec_timeout_sec: 600.0          # spec 工程タイムアウト (spec 生成/節深化 共用。明示指定のため反応的較正より優先)
     test_timeout_sec: 120.0          # 生成テストの pytest サブプロセスタイムアウト
-    total_timeout_sec: 900.0         # staged 1 リクエスト全体のウォールクロック上限
+    total_timeout_sec: 2400.0        # staged 1 リクエスト全体のウォールクロック上限 (spec 深化 + フロー詳細化の増分込み)
     max_iterations: 60               # 専用 LoopDriver の最大イテレーション (≈ 1 + 2*モジュール数)
     cleanup_workspace: false         # 完了時に temp ワークスペースを削除 (false=継続/デバッグ用に保持)
+    part_generation_enabled: false   # code 工程をコンポーネント部分生成→決定論結合で行う (spec 構造がある時のみ発動、無ければ単発へ自動フォールバック)
+    part_max_tokens: 1536            # 部分 1 個の生成 max_tokens。切断時のみ倍に広げ再生成
+    part_max_parts: 4                # 1 ファイルの最大部分数 (超過 component は spec 順に決定論併合)
+    max_spec_revision_rounds: 1      # test 不合格時の spec 見直しサイクル上限 (ワークスペース全体, 0 で無効)
 
 # ──────────────────────────────────────────────────────────────────────
 # Pro 専用機能

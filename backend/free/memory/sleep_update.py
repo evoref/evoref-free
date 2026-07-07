@@ -23,6 +23,7 @@ from backend.free.rag.bm25_retriever import BM25Retriever
 if TYPE_CHECKING:
     from backend.free.agent.assist_prompt_manager import AssistPromptManager
     from backend.free.llm.assist_client import AssistModelClient
+    from backend.free.memory.pipeline.rag_judge_assist_log import RagJudgeAssistLog
     from backend.free.memory.semantic.store import SemanticFactStore
     from backend.free.memory.notes.subject_canonicalizer import SubjectCanonicalizer
     from backend.free.rag.embedding_backend import EmbeddingBackend
@@ -65,6 +66,7 @@ class SleepTimeWorker:
         semantic_store_invalidator: SemanticStoreInvalidator | None = None,
         assist_client: AssistModelClient | None = None,
         profile_id: str = "default",
+        rag_judge_assist_log: "RagJudgeAssistLog | None" = None,
     ):
         self.short_term = short_term
         self.long_term = long_term
@@ -92,6 +94,8 @@ class SleepTimeWorker:
         # ── Step 8.5 (URL curator) 用 ──
         self._assist_client = assist_client
         self._profile_id = profile_id
+        # ── Step 8.7 (RAG judge curator) 用 ──
+        self._rag_judge_assist_log = rag_judge_assist_log
         # MDPTraceExtractor はプロセス内で episode の二重抽出を防ぐため
         # ワーカー側で 1 インスタンスを保持する。
         self._mdp_trace_extractor = None
@@ -416,6 +420,18 @@ class SleepTimeWorker:
         if self._check_cancelled():
             return result
 
+        # Step 8.7: RAG necessity/quality リコール用 world_fact のキュレーション
+        # チャット応答パスで RagJudgeAssistLog に蓄積された判定を自己採点して
+        # world_fact 化する。CLAUDE.md §6 #2 に従い、SemMem 書込はここに閉じる。
+        # アシスト未接続 (degraded) の場合は no-op で通過する。
+        ts = time.monotonic()
+        result["rag_judge_facts_curated"] = await self._step8_7_curate_rag_judge_facts(
+            llm_client,
+        )
+        step_durations["step8_7_rag_judge_curator"] = round(time.monotonic() - ts, 3)
+        if self._check_cancelled():
+            return result
+
         # Step 13: failure_pattern 統合
         # Step 8 の直後に呼ぶことで、当該イテレーションで新たに抽出された
         # failure_pattern と、既に loop.write_failure_note で即時書き込みされた
@@ -712,6 +728,39 @@ class SleepTimeWorker:
             debug_logger=self._debug_logger,
         )
 
+    async def _step8_7_curate_rag_judge_facts(self, llm_client=None) -> int:
+        """Step 8.7: RAG necessity/quality リコール用の ``world_fact`` を書く。
+
+        実ロジックは :mod:`backend.free.memory.sleep.rag_judge_curator`
+        に分離されている。本メソッドは state を詰め替える薄いラッパ
+        (``_step8_5_curate_urls`` と同型)。
+        """
+        from backend.free.llm.assist_client import AssistModelClient
+        from backend.free.memory.sleep.rag_judge_curator import curate_rag_judge_facts
+
+        assist_client = self._assist_client
+        if assist_client is None and isinstance(llm_client, AssistModelClient):
+            assist_client = llm_client
+            self._assist_client = assist_client
+
+        if self._rag_judge_assist_log is None:
+            return 0
+        events = self._rag_judge_assist_log.drain()
+        if not events:
+            return 0
+
+        notes = list(self.short_term.notes.values())
+        return await curate_rag_judge_facts(
+            events,
+            notes,
+            config=self.config,
+            store_provider=self._semantic_store_provider,
+            assist_client=assist_client,
+            embedder=self.embedder,
+            profile_id=self._profile_id,
+            debug_logger=self._debug_logger,
+        )
+
     # ── Step 13 (failure_pattern 統合) ─────────────────
 
     def _step13_consolidate_failure_patterns(self) -> dict[str, int]:
@@ -830,11 +879,11 @@ class SleepTimeWorker:
         except Exception as e:
             logger.warning("Failed to save state: %s", e)
 
-        # 経験バッファを永続化
+        # 経験バッファを永続化 (起動時ロードと同じ resolve_learning でパーティション先に揃える)
         if self.experience_buf is not None:
             try:
                 resolver = get_path_resolver()
-                exp_file = resolver.resolve_local("experience_file")
+                exp_file = resolver.resolve_learning("experience_file")
                 self.experience_buf.save(exp_file)
             except Exception as e:
                 logger.warning("Failed to save experience buffer: %s", e)

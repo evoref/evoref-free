@@ -914,6 +914,11 @@ class ToolCallJudge:
                         url,
                     )
                     continue
+                logger.info(
+                    "URL recall: match sim=%.3f (min_sim=%.2f) score_avg=%.3f "
+                    "(min_record=%.2f) url=%s",
+                    sim, min_sim, effective_score, min_avg, url,
+                )
                 return str(url)
             # sim は満たしたが score_avg/TTL で落ちたケースを記録 (最初の 1 件のみ)
             if best_subject == fact.subject and best_reason == "sim_below_min":

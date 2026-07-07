@@ -45,7 +45,10 @@ SKIP_PATTERNS = re.compile(
 # 外部 fetch 意図パターン (確実シグナルのみ)
 # URL を含む / 明示的 fetch 動詞は 100% fetch 意図とみなし RAG をスキップ。
 # リアルタイムキーワード (ニュース / 株価 / 天気 等) はアシスト判定に委譲し、
-# 固定キーワードリストの陳腐化を避ける (Phase 2 で learned_pattern 化予定)。
+# 固定キーワードリストの陳腐化を避ける。旧 Phase 2 (learned_pattern 化) の
+# 代替として embedding 決定論的リコール (backend.free.memory.pipeline.
+# rag_judge_recall) を導入済み — 意味的類似性が支配的な判定には正規表現
+# キーワードより embedding の方が適合するため。
 FETCH_INTENT_PATTERNS = re.compile(
     r"(https?://"
     r"|フェッチ|fetch"
@@ -335,6 +338,15 @@ class RetrievalNecessityJudge:
             return "skip"
         return rule
 
+    def judge_rule_only(self, query: str, context_count: int = 0) -> str:
+        """ルール判定の 3 値 (``uncertain`` 含む) をそのまま返す。
+
+        embedding 決定論的リコール (``rag_judge_recall``) が assist 呼出前に
+        「ルールで確定できるか」を判定するための公開 API。``uncertain`` の
+        場合のみ呼出側がリコール → assist の順にフォールバックする。
+        """
+        return self._judge_rule(query, context_count)
+
     async def judge_with_assist(
         self,
         query: str,
@@ -382,6 +394,7 @@ class RetrievalNecessityJudge:
         if tracker is not None:
             decision = tracker.check(
                 session_id=session_id,
+                namespace="necessity",
                 quality="uncertain",
                 query_count=0,
                 config=cfg,
@@ -421,13 +434,17 @@ class RetrievalNecessityJudge:
         else:
             logger.debug("Necessity assist: no context_block (empty/disabled)")
         try:
-            result = await asyncio.wait_for(
-                assist_client.generate_json(
-                    prompt,
-                    max_tokens=32,
-                    temperature=0.0,
-                    purpose="retrieval_necessity_judge",
-                ),
+            # timeout は generate_json 側の purpose 別 (realtime) 総予算強制に
+            # 一本化する。外側に別途 wait_for を掛けると、外側の締切が内側の
+            # asyncio.timeout より先に (または同時に) 発火した場合、内側が
+            # 自分の締切超過と認識できず CancelledError のまま抜けてしまい、
+            # generate() の except (TimeoutError) に到達せず反応的タイムアウト
+            # 較正 (_bump_calibrated_timeout) が発火しない不具合があった。
+            result = await assist_client.generate_json(
+                prompt,
+                max_tokens=32,
+                temperature=0.0,
+                purpose="retrieval_necessity_judge",
                 timeout=timeout_s,
             )
         except asyncio.TimeoutError:
@@ -476,7 +493,7 @@ class RetrievalNecessityJudge:
                 return "retrieve"
 
         if tracker is not None:
-            tracker.record(session_id)
+            tracker.record(session_id, namespace="necessity")
         logger.info(
             "Necessity assist: %s (query=%r)", action, query[:50],
         )

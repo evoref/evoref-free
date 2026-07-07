@@ -130,7 +130,13 @@ def _raw_class_api(classdef: ast.ClassDef) -> ClassApi:
             if decos & _ACCESSOR_DECORATORS:
                 api.attrs.add(m.name)  # property 等は属性としてアクセスされる
             else:
-                api.methods[m.name] = _func_sig(m, is_method=True)
+                # staticmethod は self/cls を受け取らないため第 1 引数を
+                # 剥がさない (剥がすと実引数 1 個の staticmethod が arity 0 に
+                # 化け、契約照合が「宣言通りの呼出は必ず失敗」と誤検知する)。
+                # classmethod は cls が暗黙束縛されるので is_method=True が正。
+                api.methods[m.name] = _func_sig(
+                    m, is_method="staticmethod" not in decos,
+                )
         elif isinstance(m, ast.Assign):
             for t in m.targets:
                 api.attrs |= _assign_target_names(t)
