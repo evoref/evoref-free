@@ -51,10 +51,24 @@ class LocalPathsConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    lora_adapter: str = "local/models/adapter.gguf"
-    lora_versions_dir: str = "local/lora_versions/"
-    assist_lora_adapter: str = "local/models/assist_adapter.gguf"
-    assist_lora_versions_dir: str = "local/models/assist_lora_versions/"
+    lora_adapter: str = Field(
+        default="local/models/adapter.gguf",
+        description="base モデル用 LoRA アダプタ (Level 2 base=lora)。存在時のみ起動時に"
+        "付与 (arch 不一致なら scripts/launch_llama.py が fail-closed でスキップする)。",
+    )
+    lora_versions_dir: str = Field(
+        default="local/lora_versions/",
+        description="base LoRA のバージョン履歴保存先。",
+    )
+    assist_lora_adapter: str = Field(
+        default="local/models/assist_adapter.gguf",
+        description="assist モデル用 LoRA アダプタ (Level 2 assist=B)。"
+        "migrate_component() は新モデルと arch が不一致のときのみ自動アーカイブする。",
+    )
+    assist_lora_versions_dir: str = Field(
+        default="local/models/assist_lora_versions/",
+        description="assist LoRA のバージョン履歴保存先。",
+    )
     # Level 2 base=C: control vector (llama-cvector-generator 生成) の本体 / 版管理 /
     # positive.txt・negative.txt 作業用ディレクトリ。Pro 限定だが PathResolver が
     # 参照するため Free でもフィールドは存在する (extra="forbid" のため明示必須)。
@@ -67,8 +81,15 @@ class LocalPathsConfig(BaseModel):
     # AssistModelClient が ReadTimeout 観測から引き上げた天井を永続化する。
     assist_calibration_file: str = "local/assist_calibration.json"
     lora_archive_dir: str = "local/lora_archive/"
-    embed_lora_adapter: str = "local/models/embed_adapter.gguf"
-    embed_lora_versions_dir: str = "local/models/embed_lora_versions/"
+    embed_lora_adapter: str = Field(
+        default="local/models/embed_adapter.gguf",
+        description="embed モデル用 LoRA アダプタ。"
+        "migrate_component() は新モデルと arch が不一致のときのみ自動アーカイブする。",
+    )
+    embed_lora_versions_dir: str = Field(
+        default="local/models/embed_lora_versions/",
+        description="embed LoRA のバージョン履歴保存先。",
+    )
     vectors_dir: str = "local/vectors/"
     knowledge_dir: str = "local/knowledge/"
     experience_file: str = "local/experience.json"
