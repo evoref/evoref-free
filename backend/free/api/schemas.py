@@ -415,6 +415,9 @@ class ComponentMigrateResponse(BaseModel):
     dry_run: bool
     old_model: str
     new_model: str
+    # 新モデルと既存 LoRA の arch 整合性判定結果 ("kept" / "archived" / "n/a")。
+    # base の MigrateResponse.lora_action に相当。
+    lora_action: str = "n/a"
     # L2: 自動再起動 + クライアント差し替えが成功したか
     restarted: bool = False
     recommendations: list[str] = Field(default_factory=list)
@@ -427,6 +430,9 @@ class ComponentRollbackRequest(BaseModel):
 class ComponentRollbackResponse(BaseModel):
     component: str
     rolled_back_to: str
+    # base の RollbackResponse.lora_restored に相当。アーカイブされていた
+    # LoRA を実際に復元できたか。
+    lora_restored: bool = False
 
 
 class ComponentMigrationHistoryItem(BaseModel):

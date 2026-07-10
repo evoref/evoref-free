@@ -22,8 +22,10 @@ class PathResolver:
     LOCAL_DEFAULTS = {
         "lora_adapter": "local/models/adapter.gguf",
         "lora_versions_dir": "local/lora_versions/",
+        "lora_spsa_checkpoint": "local/models/lora_spsa_checkpoint.json",
         "assist_lora_adapter": "local/models/assist_adapter.gguf",
         "assist_lora_versions_dir": "local/models/assist_lora_versions/",
+        "assist_lora_spsa_checkpoint": "local/models/assist_lora_spsa_checkpoint.json",
         # Level 2 base=C: control vector 本体 / 版管理 / 作業用ディレクトリ
         "control_vector_adapter": "local/models/control_vector.gguf",
         "control_vector_versions_dir": "local/models/control_vector_versions/",
@@ -66,6 +68,7 @@ class PathResolver:
         "prompts_dir": "prompts",
         "lora_adapter": "models/adapter.gguf",
         "lora_versions_dir": "models/lora_versions",
+        "lora_spsa_checkpoint": "models/lora_spsa_checkpoint.json",
         "control_vector_adapter": "models/control_vector.gguf",
         "control_vector_versions_dir": "models/control_vector_versions",
         "cvector_work_dir": "cvector",

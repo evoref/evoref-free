@@ -11,6 +11,7 @@ rebind の順で呼び出され、いずれかが失敗すれば旧モデルへ�
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from backend.log_config import get_logger
@@ -48,6 +49,25 @@ async def rebind_component(
                 await old.aclose()
             except Exception as e:
                 logger.warning("old assist_client close failed: %s", e)
+
+        # Pro Level2 の sleep_scheduler が保持する assist モデル GGUF パスを
+        # 追従させる。起動時 (backend/pro/__init__.py::_wire_assist_sleep_paths)
+        # は 1 回しか配線されないため、これを怠ると migrate 後も Level2 が旧
+        # モデルのパスから LoRA ターゲット層を解決し続ける (GGUF パスは
+        # ターゲット解決に実ファイルが要るため存在時のみ配線する、起動時と
+        # 同じ方針)。
+        if state.sleep_scheduler is not None:
+            assist_model_gguf = (cfg.get("model_paths", {}) or {}).get(
+                "assist_model", "",
+            )
+            if assist_model_gguf:
+                p = Path(assist_model_gguf)
+                if not p.is_absolute() and project_root is not None:
+                    p = project_root / p
+                if p.exists():
+                    state.sleep_scheduler.set_assist_model_path(p)
+                    logger.info("sleep_scheduler assist_model_path refreshed: %s", p)
+
         logger.info("assist client rebound")
         return
 

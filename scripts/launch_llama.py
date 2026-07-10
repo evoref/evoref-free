@@ -496,6 +496,43 @@ def build_mtp_args(
     return ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(draft_n_max)]
 
 
+def _lora_arch_compatible(
+    model_path: Path,
+    lora_path: Path,
+    *,
+    warn: Callable[[str], None] | None = None,
+) -> bool:
+    """LoRA アダプタとモデルの ``general.architecture`` が一致するか判定する。
+
+    モデル切替 (``POST /api/model/{component}/migrate`` 等) 後に旧 arch 向け
+    LoRA が残存すると、llama-server が "model arch and LoRA arch mismatch"
+    でコンテキスト生成に失敗しプロセスごと落ちる。付与直前にこの関数で
+    検証し、不一致・メタ欠如 (判定不能) はいずれも fail-closed で ``False``
+    を返す (``build_mtp_args`` と同じ「非対応なら機能を諦める」方針)。
+    誤ってスキップする実害は警告ログのみだが、誤って付与する実害は
+    プロセスクラッシュそのものであるため、この非対称性を正当化する。
+    """
+    model_arch = read_gguf_metadata(model_path).get("architecture")
+    lora_arch = read_gguf_metadata(lora_path).get("architecture")
+    if not model_arch or not lora_arch:
+        if warn is not None:
+            warn(
+                "[launch] WARNING: cannot verify LoRA/model architecture "
+                f"compatibility (model={model_arch or '?'}, lora={lora_arch or '?'}): "
+                f"{lora_path.name}. Skipping --lora to avoid a possible "
+                '"model arch and LoRA arch mismatch" crash.'
+            )
+        return False
+    if model_arch != lora_arch:
+        if warn is not None:
+            warn(
+                f"[launch] WARNING: LoRA arch mismatch (model={model_arch}, "
+                f"lora={lora_arch}): {lora_path.name}. Skipping --lora."
+            )
+        return False
+    return True
+
+
 def build_llama_cmd(
     cfg: dict,
     project_root: Path | None = None,
@@ -529,12 +566,14 @@ def build_llama_cmd(
         "-b", str(lc.get("batch_size", 512)),
     ]
 
-    # LoRA アダプタ（存在する場合のみ）
+    # LoRA アダプタ（存在し、かつモデルと arch が一致する場合のみ）
     lora_path = lp.get("lora_adapter", "local/models/adapter.gguf")
     lora_full = Path(lora_path)
     if not lora_full.is_absolute():
         lora_full = project_root / lora_full
-    if lora_full.exists():
+    if lora_full.exists() and _lora_arch_compatible(
+        base_model_path, lora_full, warn=lambda m: print(m, file=sys.stderr),
+    ):
         cmd += ["--lora", str(lora_full)]
 
     # Level 2 base=C: control vector (残差ストリーム操舵)。
@@ -731,12 +770,14 @@ def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | 
             file=sys.stderr,
         )
 
-    # エンベッド LoRA アダプタ（存在する場合のみ）
+    # エンベッド LoRA アダプタ（存在し、かつモデルと arch が一致する場合のみ）
     embed_lora = lp.get("embed_lora_adapter", "local/models/embed_adapter.gguf")
     embed_lora_path = Path(embed_lora)
     if not embed_lora_path.is_absolute():
         embed_lora_path = project_root / embed_lora_path
-    if embed_lora_path.exists():
+    if embed_lora_path.exists() and _lora_arch_compatible(
+        embed_model_path, embed_lora_path, warn=lambda m: print(m, file=sys.stderr),
+    ):
         cmd += ["--lora", str(embed_lora_path)]
 
     # 物理バッチサイズ。長い STM ノート (>512 tok) の埋め込みリクエストが
@@ -842,7 +883,9 @@ def build_assist_cmd(
         assist_lora_full = Path(assist_lora)
         if not assist_lora_full.is_absolute():
             assist_lora_full = project_root / assist_lora_full
-        if assist_lora_full.exists():
+        if assist_lora_full.exists() and _lora_arch_compatible(
+            assist_model_path, assist_lora_full, warn=lambda m: print(m, file=sys.stderr),
+        ):
             cmd += ["--lora", str(assist_lora_full)]
 
     # 物理バッチサイズ（指定があれば）

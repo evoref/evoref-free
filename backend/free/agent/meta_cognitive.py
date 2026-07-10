@@ -1796,7 +1796,27 @@ class MetaCognitiveAgent:
         task_description: str,
         tools_registry,
     ):
-        """タスク記述に対してツール判定を行う"""
+        """タスク記述に対してツール判定を行う
+
+        write 期待タスク (``task_expects_write``) は決定論的な
+        ``infer_tool_from_task`` を先に試す。``ToolCallJudge.judge()`` の
+        Step 0 (URL recall) は mode に依らず無条件・最優先で発火し、ヒットすると
+        以降の全判定層を丸ごとスキップして即確定するため、write 期待タスクの
+        クエリが過去の無関係な URL 記憶と埋め込み類似度だけで一致すると
+        fetch_url 等へハイジャックされてしまう (例: 「docx を出力して」が
+        過去の全く無関係な URL fetch 記憶と誤マッチする)。
+        """
+        if task_expects_write(task_description):
+            inferred = infer_tool_from_task(task_description)
+            if inferred is not None and inferred[0] == "write_file":
+                from backend.free.agent.tool_call_judge import ToolJudgement
+                return ToolJudgement(
+                    tool_needed=True,
+                    tool_name=inferred[0],
+                    tool_args=inferred[1],
+                    source="rule",
+                )
+
         if self._tool_judge is not None:
             try:
                 judgement = await self._tool_judge.judge(
@@ -2435,7 +2455,12 @@ class MetaCognitiveAgent:
         parts: list[str] = []
         for task in tasks:
             parts.append(f"- [{task.status}] {task.description}")
-            if task.result:
+            if task.status == "failed" and task_expects_write(task.description):
+                # write 期待タスクの失敗時、無関係なツール結果 (誤ってハイジャック
+                # された fetch_url の webpage 抽出テキスト等) をそのままユーザーへ
+                # 露出させない。
+                parts.append("    (書き込みが実行されませんでした)")
+            elif task.result:
                 parts.append(f"    {task.result[:500]}")
 
         return "\n".join(parts)

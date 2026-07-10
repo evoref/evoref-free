@@ -32,6 +32,23 @@ COMPONENT_CONFIG_KEY: dict[str, str] = {
     "embedding": "embed_model",
 }
 
+# コンポーネント別 LoRA 設定キー: (adapter_key, versions_key, archive_root, default_adapter_path)。
+# base 用 (local_paths.lora_adapter / lora_versions_dir / local/lora_archive/)
+# とは別キー・別アーカイブ先を使う (base の flat な lora_archive/<stem>/ との
+# ファイル名衝突を避けるため component 別サブディレクトリに分離する)。
+# default_adapter_path は backend/schemas/paths.py::LocalPathsConfig の
+# デフォルト値と一致させる。
+_COMPONENT_LORA_KEYS: dict[str, tuple[str, str, str, str]] = {
+    "assist": (
+        "assist_lora_adapter", "assist_lora_versions_dir", "lora_archive/assist",
+        "local/models/assist_adapter.gguf",
+    ),
+    "embedding": (
+        "embed_lora_adapter", "embed_lora_versions_dir", "lora_archive/embedding",
+        "local/models/embed_adapter.gguf",
+    ),
+}
+
 # config.yaml の model_paths 配下で model_state.json と同期されるキー。
 # これらは migrate API (POST /api/model/migrate, /api/model/{component}/migrate)
 # 経由でしか変更できない。config を直書きすると model_state.json と desync し、
@@ -123,13 +140,14 @@ class ModelState:
 
     def add_component_migration(
         self, name: str, from_model: str, to_model: str,
+        lora_archived_to: str = "",
     ) -> None:
         comp = self.get_component(name)
         comp.history.append(MigrationHistoryEntry(
             from_model=from_model,
             to_model=to_model,
             migrated_at=_now(),
-            lora_archived_to="",
+            lora_archived_to=lora_archived_to,
         ))
 
     def get_component_last_migration(
@@ -177,7 +195,7 @@ class ModelState:
                             from_model=h.get("from", ""),
                             to_model=h.get("to", ""),
                             migrated_at=h.get("migrated_at", ""),
-                            lora_archived_to="",
+                            lora_archived_to=h.get("lora_archived_to", ""),
                         )
                         for h in (raw.get("history", []) or [])
                     ],
@@ -219,6 +237,7 @@ class ModelState:
                             "from": h.from_model,
                             "to": h.to_model,
                             "migrated_at": h.migrated_at,
+                            "lora_archived_to": h.lora_archived_to,
                         }
                         for h in comp.history
                     ],
@@ -554,9 +573,13 @@ class ModelMigrator:
     ) -> MigrationResult:
         """assist / embedding モデルを切り替える
 
-        base モデルと違い、LoRA・経験バッファ・プロンプトメタなどの
-        付帯処理は不要。config.yaml 更新と model_state 記録のみを行う。
-        実際の llama-server 再起動とクライアント差し替えは L2 で対応する。
+        base モデルと違い、経験バッファ・プロンプトメタなどのパーティション系
+        付帯処理は不要 (assist/embed の学習データは f_04_self_learning.md
+        §1.2 のとおり元々 flat 共有でモデル別パーティション化されない)。
+        LoRA のみ :meth:`_archive_component_lora_if_incompatible` で新モデルとの
+        arch 整合性を確認し、不一致時のみアーカイブする。config.yaml 更新と
+        model_state 記録も行う。実際の llama-server 再起動とクライアント
+        差し替えは L2 で対応する。
         """
         if component not in ALL_COMPONENTS:
             raise MigrationError(
@@ -598,9 +621,21 @@ class ModelMigrator:
         # config.yaml 更新
         self._update_component_config(component, new_model_path)
 
+        # LoRA: 新モデルと arch が不一致 (または判定不能) の場合のみアーカイブ。
+        # 一致時は f_04_self_learning.md §1.2 の flat 共有方針どおり persist する。
+        lora_action = self._archive_component_lora_if_incompatible(
+            component, old_filename, resolved,
+        )
+        result.lora_action = lora_action
+
         # model_state 更新
         self.model_state.add_component_migration(
             component, old_filename, new_filename,
+            lora_archived_to=(
+                f"local/{_COMPONENT_LORA_KEYS[component][2]}/"
+                f"{Path(old_filename).stem}/"
+                if lora_action == "archived" else ""
+            ),
         )
         self.model_state.update_component_current(component, new_filename)
         self.model_state.save()
@@ -639,16 +674,26 @@ class ModelMigrator:
         rollback_path = str(model_dir / rollback_target)
 
         self._update_component_config(component, rollback_path)
+
+        adapter_key, versions_key, archive_root, _default_adapter = (
+            _COMPONENT_LORA_KEYS[component]
+        )
+        lora_restored = self._restore_lora(
+            rollback_target,
+            adapter_key=adapter_key, versions_key=versions_key,
+            archive_root=archive_root,
+        )
+
         self.model_state.update_component_current(component, rollback_target)
         self.model_state.save()
 
         logger.info(
-            "Component rollback completed: %s -> %s",
-            component, rollback_target,
+            "Component rollback completed: %s -> %s (lora_restored=%s)",
+            component, rollback_target, lora_restored,
         )
         return {
             "rolled_back_to": rollback_target,
-            "lora_restored": False,
+            "lora_restored": lora_restored,
         }
 
     def _get_component_current(self, component: str) -> str:
@@ -658,6 +703,59 @@ class ModelMigrator:
         cfg_key = COMPONENT_CONFIG_KEY[component]
         raw = self.config.get("model_paths", {}).get(cfg_key, "")
         return Path(raw).name if raw else "unknown"
+
+    def _archive_component_lora_if_incompatible(
+        self, component: str, old_model_name: str, new_model_path: Path,
+    ) -> str:
+        """新モデルと既存 LoRA の ``general.architecture`` を比較し、不一致
+        (または判定不能) のときのみ退避する。
+
+        一致時は f_04_self_learning.md §1.2 の「assist/embed の学習は
+        モデル別パーティション化されず flat に共有される」方針どおり LoRA を
+        persist させる (無条件アーカイブだと同一 arch 内でのモデル切替
+        (量子化違い等) でも毎回学習を破棄してしまい、この設計意図を壊す)。
+        判定不能を安全側でアーカイブするのは launch_llama.py の
+        ``_lora_arch_compatible`` の fail-closed 方針と対称。
+        """
+        adapter_key, versions_key, archive_root, default_adapter = (
+            _COMPONENT_LORA_KEYS[component]
+        )
+        lp = self.config.get("local_paths", {})
+        lora_path = self._resolve_path(lp.get(adapter_key, default_adapter))
+        if not lora_path.exists():
+            return "n/a"
+
+        try:
+            from scripts.launch_llama import read_gguf_metadata
+        except Exception as exc:
+            logger.warning(
+                "component LoRA arch check: launch_llama import failed: %s", exc,
+            )
+            return self._archive_lora(
+                old_model_name, False,
+                adapter_key=adapter_key, versions_key=versions_key,
+                archive_root=archive_root,
+            )
+
+        lora_arch = read_gguf_metadata(lora_path).get("architecture")
+        new_arch = read_gguf_metadata(new_model_path).get("architecture")
+        if lora_arch and new_arch and lora_arch == new_arch:
+            logger.info(
+                "Component LoRA arch matches (%s), keeping: %s",
+                lora_arch, lora_path,
+            )
+            return "kept"
+
+        logger.info(
+            "Component LoRA arch mismatch or unreadable (lora=%s, new=%s), "
+            "archiving: %s",
+            lora_arch, new_arch, lora_path,
+        )
+        return self._archive_lora(
+            old_model_name, False,
+            adapter_key=adapter_key, versions_key=versions_key,
+            archive_root=archive_root,
+        )
 
     def _resolve_embedding_profile_params(self, resolved_path: Path) -> dict:
         """新 embed モデルの ``embedding.*`` パラメータを解決する。
@@ -903,14 +1001,26 @@ class ModelMigrator:
 
         return summary
 
-    def _archive_lora(self, old_model_name: str, try_lora: bool) -> str:
-        """Step 3: LoRA アーカイブ"""
+    def _archive_lora(
+        self,
+        old_model_name: str,
+        try_lora: bool,
+        *,
+        adapter_key: str = "lora_adapter",
+        versions_key: str = "lora_versions_dir",
+        archive_root: str = "lora_archive",
+    ) -> str:
+        """Step 3: LoRA アーカイブ
+
+        base 用の既定キーワード引数はそのまま (完全後方互換)。assist/embed
+        用は :data:`_COMPONENT_LORA_KEYS` のキーを渡して呼ぶ。
+        """
         lp = self.config.get("local_paths", {})
         lora_path = self._resolve_path(
-            lp.get("lora_adapter", "local/models/adapter.gguf")
+            lp.get(adapter_key, "local/models/adapter.gguf")
         )
         lora_versions_dir = self._resolve_path(
-            lp.get("lora_versions_dir", "local/lora_versions/")
+            lp.get(versions_key, "local/lora_versions/")
         )
 
         if not lora_path.exists():
@@ -922,7 +1032,7 @@ class ModelMigrator:
             return "kept"
 
         archive_dir = (
-            self.project_root / "local" / "lora_archive"
+            self.project_root / "local" / archive_root
             / Path(old_model_name).stem
         )
         archive_dir.mkdir(parents=True, exist_ok=True)
@@ -1061,18 +1171,29 @@ class ModelMigrator:
                 "Marked %d notes for context regeneration", count,
             )
 
-    def _restore_lora(self, target_model: str) -> bool:
-        """ロールバック時の LoRA 復元"""
+    def _restore_lora(
+        self,
+        target_model: str,
+        *,
+        adapter_key: str = "lora_adapter",
+        versions_key: str = "lora_versions_dir",
+        archive_root: str = "lora_archive",
+    ) -> bool:
+        """ロールバック時の LoRA 復元
+
+        base 用の既定キーワード引数はそのまま (完全後方互換)。assist/embed
+        用は :data:`_COMPONENT_LORA_KEYS` のキーを渡して呼ぶ。
+        """
         lp = self.config.get("local_paths", {})
         lora_path = self._resolve_path(
-            lp.get("lora_adapter", "local/models/adapter.gguf")
+            lp.get(adapter_key, "local/models/adapter.gguf")
         )
         lora_versions_dir = self._resolve_path(
-            lp.get("lora_versions_dir", "local/lora_versions/")
+            lp.get(versions_key, "local/lora_versions/")
         )
 
         archive_dir = (
-            self.project_root / "local" / "lora_archive"
+            self.project_root / "local" / archive_root
             / Path(target_model).stem
         )
 

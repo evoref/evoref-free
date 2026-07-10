@@ -318,6 +318,7 @@ async def migrate_component(
         dry_run=result.dry_run,
         old_model=result.old_model,
         new_model=result.new_model,
+        lora_action=result.lora_action,
         restarted=restarted,
         recommendations=recommendations,
     )
@@ -402,6 +403,7 @@ async def rollback_component(
     return ComponentRollbackResponse(
         component=component,
         rolled_back_to=result["rolled_back_to"],
+        lora_restored=result["lora_restored"],
     )
 
 
