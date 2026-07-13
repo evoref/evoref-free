@@ -583,6 +583,7 @@ def build_chat_messages(
     salience_ranker=None,
     semmem_block: str | None = None,
     fewshot_block: str | None = None,
+    history_min_tokens: int = 0,
 ) -> list[dict]:
     """messages 組み立て（build_messages で few-shot・file・メモリ・RAG・履歴を統合）。
 
@@ -599,6 +600,7 @@ def build_chat_messages(
         salience_ranker=salience_ranker,
         semmem_block=semmem_block,
         fewshot_block=fewshot_block,
+        history_min_tokens=history_min_tokens,
     )
     logger.debug("Messages assembled: %d messages for LLM", len(messages))
     return messages

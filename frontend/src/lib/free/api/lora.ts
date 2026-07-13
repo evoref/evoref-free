@@ -9,7 +9,9 @@
  */
 
 import { request } from './_client';
-import type { ImprovementScore } from './dashboard';
+
+/** LoRA 系列 (base / assist) */
+export type LoraTarget = 'base' | 'assist';
 
 /** LoRA バージョン情報 (バックエンド VersionInfoResponse 準拠) */
 export interface LoraVersionInfo {
@@ -19,31 +21,31 @@ export interface LoraVersionInfo {
 	metadata: Record<string, unknown>;
 }
 
-/** バージョン一覧 API のレスポンス */
-export interface LoraVersionsResponse {
+/** base / assist 1 系列分のバージョン一覧 (バックエンド TargetVersionsResponse 準拠) */
+export interface LoraTargetVersions {
 	versions: LoraVersionInfo[];
 	active_adapter_exists: boolean;
 	latest_version: number;
+	model: string | null;
+}
+
+/** バージョン一覧 API のレスポンス (base / assist 2 系列) */
+export interface LoraVersionsResponse {
+	base: LoraTargetVersions;
+	assist: LoraTargetVersions;
 }
 
 /** ロールバックリクエスト */
 export interface LoraRollbackRequest {
 	version: number;
+	target?: LoraTarget;
 }
 
 /** ロールバック API のレスポンス */
 export interface LoraRollbackResponse {
 	rolled_back_to: number;
 	adapter_path: string;
-}
-
-/**
- * dashboard ストアが扱う緩い型 (一部のフィールドのみ参照)。
- * 旧 `safeFetch<Record<string, unknown>>('/api/lora/versions')` 互換。
- */
-export interface LoraVersionsLooseResponse {
-	versions?: ImprovementScore[];
-	latest_version?: number;
+	target: LoraTarget;
 }
 
 /** LoRA バージョン一覧を取得 */
@@ -51,7 +53,10 @@ export async function getLoraVersions(): Promise<LoraVersionsResponse> {
 	return request<LoraVersionsResponse>('GET', '/lora/versions');
 }
 
-/** 指定バージョンへロールバック */
-export async function rollbackLora(version: number): Promise<LoraRollbackResponse> {
-	return request<LoraRollbackResponse>('POST', '/lora/rollback', { version });
+/** 指定系列の指定バージョンへロールバック */
+export async function rollbackLora(
+	version: number,
+	target: LoraTarget = 'base'
+): Promise<LoraRollbackResponse> {
+	return request<LoraRollbackResponse>('POST', '/lora/rollback', { version, target });
 }

@@ -11,6 +11,6 @@ Free と Pro のバージョンは独立して管理する。
 
 from __future__ import annotations
 
-__version__ = "0.0.32"
+__version__ = "0.0.33"
 __schema_version__ = 1
 __build__ = "dev"

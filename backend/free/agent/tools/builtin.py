@@ -206,7 +206,9 @@ def write_file(file_path: str, content: str) -> str:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-        return f"Written {len(content)} bytes to {file_path}"
+        # len(content) は文字数であり、UTF-8 のマルチバイト文字 (日本語等) を
+        # 含むと実バイト数と乖離する。"bytes" と明記するため実測する。
+        return f"Written {len(content.encode('utf-8'))} bytes to {file_path}"
     except Exception as e:
         return f"Error: {e}"
 

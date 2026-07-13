@@ -101,7 +101,7 @@
 		"not_met": "未充足",
 		"last_level1": "Level 1 最終実行",
 		"last_level2": "Level 2 最終実行",
-		"lora_version_label": "バージョン",
+		"rollback_confirm": "{target} をバージョン {version} にロールバックしますか？",
 		"no_adapter": "アダプターなし",
 		"eval_cases": "評価ケース",
 		"no_data": "データがありません",

@@ -363,6 +363,12 @@ class MemoryConfig(BaseModel):
     project: SemMemProjectConfig = Field(default_factory=SemMemProjectConfig)
     working_max_turns: int = Field(default=10, ge=1)
     working_max_tokens: int = Field(default=2048, ge=256)
+    # 過去履歴の最低確保トークン数 (床)。動的ブロック (few-shot/file/semmem/RAG) の
+    # 配分前に予約し、予算圧迫時でも直近の会話文脈が丸ごと締め出されるのを防ぐ。
+    # 実履歴量・残予算・working_max_tokens でキャップされ、履歴が現在の質問のみの
+    # 新規セッションでは 0 に縮退する。0 で無効。
+    # フォールバック定数は chat_constants.DEFAULT_HISTORY_MIN_TOKENS と同期させること。
+    history_min_tokens: int = Field(default=1024, ge=0)
     short_term_max_notes: int = Field(default=100, ge=1)
     lightmem_decay_days: int = Field(default=7, ge=1)
     # FadeMem タグ別半減期 (日)

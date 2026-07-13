@@ -134,30 +134,35 @@ async def trigger_learning(req: TriggerRequest, state: AppState = Depends(get_ap
 async def improvement_curve():
     """改善カーブ用データを返す（LoRA バージョン別 eval_score 推移）
 
-    Pro 機能: Free 版では空配列を返す。
+    base (`lora_scores`) / assist (`assist_scores`) の 2 系列。
+    Pro 機能: Free 版では両方空配列を返す。
     """
     logger.debug("GET /api/learning/improvement-curve")
 
     LoRAVersionManager = get_pro_handler("lora_version_manager")
     if not is_pro() or LoRAVersionManager is None:
-        return ImprovementCurveResponse(lora_scores=[])
+        return ImprovementCurveResponse()
 
     resolver = get_path_resolver()
-    versions_dir = resolver.resolve_local("lora_versions_dir")
-    adapter_path = resolver.resolve_local("lora_adapter")
-    vmgr = LoRAVersionManager(versions_dir, adapter_path)
 
-    versions = vmgr.list_versions()
-    lora_scores = [
-        ImprovementPoint(
-            version=v.version,
-            eval_score=v.eval_score,
-            created_at=v.created_at,
+    def _scores(versions_key: str, adapter_key: str) -> list[ImprovementPoint]:
+        vmgr = LoRAVersionManager(
+            resolver.resolve_local(versions_key),
+            resolver.resolve_local(adapter_key),
         )
-        for v in versions
-    ]
+        return [
+            ImprovementPoint(
+                version=v.version,
+                eval_score=v.eval_score,
+                created_at=v.created_at,
+            )
+            for v in vmgr.list_versions()
+        ]
 
-    return ImprovementCurveResponse(lora_scores=lora_scores)
+    return ImprovementCurveResponse(
+        lora_scores=_scores("lora_versions_dir", "lora_adapter"),
+        assist_scores=_scores("assist_lora_versions_dir", "assist_lora_adapter"),
+    )
 
 
 @router.get("/status", response_model=LearningStatusResponse)
