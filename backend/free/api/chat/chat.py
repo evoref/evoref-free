@@ -14,6 +14,7 @@ from backend.config import (
     resolve_context_size_for_mode,
 )
 from backend.free.api.chat.chat_constants import (
+    DEFAULT_HISTORY_MIN_TOKENS,
     DEFAULT_KEEPALIVE_INTERVAL_SEC, DEFAULT_MAX_TOKENS,
     MAX_FILE_CONTEXT_TOTAL_CHARS, MAX_FILE_CONTEXT_TOTAL_CHUNKS,
     MAX_MESSAGE_LENGTH,
@@ -431,6 +432,11 @@ async def _build_messages_with_search(
         salience_ranker=salience_ranker,
         semmem_block=semmem_block,
         fewshot_block=fewshot_block,
+        history_min_tokens=int(
+            (cfg.get("memory") or {}).get(
+                "history_min_tokens", DEFAULT_HISTORY_MIN_TOKENS,
+            ),
+        ),
     )
 
     sse_notify = SSEFrameBuilder()

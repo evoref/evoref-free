@@ -101,7 +101,7 @@
 		"not_met": "Not met",
 		"last_level1": "Level 1 last run",
 		"last_level2": "Level 2 last run",
-		"lora_version_label": "Version",
+		"rollback_confirm": "Roll back {target} to version {version}?",
 		"no_adapter": "No adapter",
 		"eval_cases": "Eval cases",
 		"no_data": "No data available",

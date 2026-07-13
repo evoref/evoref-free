@@ -45,6 +45,7 @@ from backend.free.agent.meta_cognitive_utils import (
     parse_template_tool_call,
     try_parse_tool_dict,
     call_callback,
+    fewshot_seems_relevant,
     fix_json_backslashes,
     looks_like_path_not_content,
     strip_markdown_wrapper,
@@ -2166,7 +2167,13 @@ class MetaCognitiveAgent:
             system_content = f"{system_content}\n{TABLE_CONTENT_INSTRUCTION}"
         elif is_rich_table_output(file_path):
             system_content = f"{system_content}\n{RICH_DOC_CONTENT_INSTRUCTION}"
-        if self._fewshot_block:
+        # Level 1 few-shot は query 類似度だけでなく fitness も加味して選ばれる
+        # ため、現在のタスクと無関係でも再利用されうる。無関係な例文をその
+        # まま注入すると、モデルがその例文自体を繰り返す退化を誘発しうる
+        # (#incident) ため、タスク文との粗い関連度チェックを通してから注入する。
+        if self._fewshot_block and fewshot_seems_relevant(
+            f"{original_query}\n{task_description}", self._fewshot_block,
+        ):
             system_content = f"{system_content}\n\n[参考例]\n{self._fewshot_block}"
 
         messages = [

@@ -250,6 +250,7 @@ def build_messages(
     salience_ranker: SalienceRanker | None = None,
     semmem_block: str | None = None,
     fewshot_block: str | None = None,
+    history_min_tokens: int = 0,
 ) -> list[dict]:
     """
     messages リストを組み立て、トークン予算内に収める。
@@ -258,7 +259,10 @@ def build_messages(
     ここではロール・内容の組み立てのみを担う。
 
     予算 = context_size - generation_reserve から
-    system → fewshot → file_contexts → semmem → rag_chunks → history の優先順で配分。
+    system → 最新 user ターン予約 → fewshot → file_contexts → semmem → rag_chunks
+    → history (残余) の優先順で配分。最新 user ターン (現在の質問) は動的ブロックに
+    先立って ``min(質問トークン, working_max_tokens, 残予算)`` を予約し、履歴トリムで
+    消失しないことを保証する (組み立て結果は history が user を含む限り user ロール ≥ 1)。
 
     サリエンスランカーが指定されている場合、RAG チャンクを5因子スコアで
     再評価し、トークン予算内で情報量を最大化するチャンク集合を選別する。
@@ -280,6 +284,10 @@ def build_messages(
         salience_ranker: BudgetMem 式サリエンスランカー。
         fewshot_block: ``format_fewshot_section`` 整形済みの few-shot ブロック
             (query 依存)。動的ブロックの先頭に置く。``None`` / 空なら付与しない。
+        history_min_tokens: 過去履歴の最低確保トークン数 (床)。動的ブロック配分前に
+            予約し、予算圧迫時でも直近の会話文脈が丸ごと締め出されるのを防ぐ。
+            実履歴量・残予算・working_max_tokens でキャップされ、履歴が現在の質問
+            のみの場合は 0 に縮退する。0 (既定) で無効。
     """
     generation_reserve = max_tokens if max_tokens is not None else DEFAULT_GENERATION_RESERVE
     budget = context_size - generation_reserve
@@ -289,12 +297,39 @@ def build_messages(
     sys_tokens = _estimate_tokens(system_prompt)
     remaining = budget - sys_tokens
 
+    # 最新 user ターン (現在の質問) のトークンを動的ブロック配分に先立って予約する。
+    # 予約は残予算を上限とし、収まらない分は _trim_history の最新ターン圧縮保持が吸収する。
+    reserved_latest = 0
+    if history and history[-1].get("role") == "user":
+        reserved_latest = min(
+            _estimate_tokens(history[-1].get("content", "")),
+            working_max_tokens,
+            max(0, remaining),
+        )
+        remaining -= reserved_latest
+
+    # 過去履歴の最低確保 (床)。実履歴量・残予算・working_max でキャップし、
+    # 履歴が現在の質問のみ (新規セッション) の場合は 0 に縮退する —
+    # 空回りの予約で動的ブロックを痩せさせない。
+    hist_floor = 0
+    if history_min_tokens > 0 and len(history) > 1:
+        past_tokens = sum(
+            _estimate_tokens(t.get("content", "")) for t in history[:-1]
+        )
+        hist_floor = min(
+            history_min_tokens,
+            past_tokens,
+            max(0, remaining),
+            max(0, working_max_tokens - reserved_latest),
+        )
+        remaining -= hist_floor
+
     logger.debug(
         "build_messages: budget=%d (context_size=%d - %d), "
-        "system=%d tokens, remaining=%d, "
+        "system=%d tokens, reserved_latest=%d, remaining=%d, "
         "rag_chunks=%d, file_contexts=%d",
-        budget, context_size, generation_reserve, sys_tokens, remaining,
-        total_rag, total_fc,
+        budget, context_size, generation_reserve, sys_tokens, reserved_latest,
+        remaining, total_rag, total_fc,
     )
 
     # 動的ブロック (query 依存) を優先順に積む。system には含めない。
@@ -327,8 +362,21 @@ def build_messages(
     # 静的 system メッセージ (動的部は含めない)
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
 
-    # 4. 会話履歴（残余予算と working_max_tokens の小さい方で管理）
-    history_budget = max(0, min(remaining, working_max_tokens))
+    # 4. 会話履歴（予約分 + 床 + 残余予算。上限は working_max_tokens）
+    history_budget = min(
+        working_max_tokens, reserved_latest + hist_floor + max(0, remaining),
+    )
+    if len(history) > 1 and history_budget <= reserved_latest:
+        logger.warning(
+            "build_messages: context budget squeeze — past history got 0 tokens "
+            "(budget=%d, system=%d, reserved_latest=%d, fewshot=%d, files=%d, "
+            "semmem=%d, rag=%d)",
+            budget, sys_tokens, reserved_latest,
+            _estimate_tokens(fewshot_part) if fewshot_part else 0,
+            _estimate_tokens(fc_block) if fc_block else 0,
+            _estimate_tokens(semmem_part) if semmem_part else 0,
+            _estimate_tokens(rag_block) if rag_block else 0,
+        )
     trimmed = _trim_history(history, history_budget)
 
     # 5. 動的ブロックを最後の user メッセージ先頭へ前置 (KV キャッシュ対応)。
@@ -342,6 +390,23 @@ def build_messages(
             }
 
     messages.extend(trimmed)
+
+    # 不変則ガード: history に user ターンがあるのに組み立て結果に user が無い場合、
+    # 圧縮した最新 user ターンを末尾へ再掲する (予約 + 最新ターン保持により通常経路では
+    # 到達しない最終防衛線。発火は契約違反のシグナル。末尾が assistant の履歴では
+    # 時系列順が崩れるが、user 不在によるテンプレート 400 の回避を優先する)。
+    if not any(m.get("role") == "user" for m in messages):
+        last_user = next(
+            (t for t in reversed(history) if t.get("role") == "user"), None,
+        )
+        if last_user is not None:
+            recovered = compress_turn(last_user)
+            messages.append(recovered)
+            logger.warning(
+                "build_messages: no user turn survived assembly; re-appended "
+                "compressed latest user turn (%d tokens)",
+                _estimate_tokens(recovered.get("content", "")),
+            )
 
     logger.debug(
         "build_messages complete: %d messages "
@@ -407,6 +472,10 @@ def _trim_history(
 ) -> list[dict]:
     """トークン予算に収まるよう、古い履歴を圧縮・削除する。
 
+    **最新ターン (通常は現在の user 質問) は予算超過でも drop しない**: 予算に
+    収まる長さへ圧縮して保持する (下限は compress_turn 既定の 200 字 ≈ 203 トークン
+    で、超過分は呼び出し側の generation_reserve が吸収する)。
+
     トークン推定は estimate_tokens() を使用
     （CJK: 1文字≒1トークン、ASCII: 4文字≒1トークン）。
     """
@@ -423,22 +492,36 @@ def _trim_history(
         estimated_tokens = _estimate_tokens(content)
 
         if total_tokens + estimated_tokens > max_tokens:
-            # 予算超過: 残りの古いターンを圧縮
-            compressed = compress_turn(turn)
-            compressed_tokens = _estimate_tokens(compressed["content"])
-            if total_tokens + compressed_tokens <= max_tokens:
+            if not result:
+                # 最新ターンは drop せず、予算連動で圧縮して保持する
+                # (この分岐では total_tokens == 0 のため残予算 = max_tokens)。
+                compressed = compress_turn(turn, max_chars=max(max_tokens, 200))
+                compressed_tokens = _estimate_tokens(compressed.get("content", ""))
                 result.insert(0, compressed)
                 total_tokens += compressed_tokens
-                logger.debug(
-                    "_trim_history: compressed turn (role=%s, %d->%d tokens)",
+                logger.warning(
+                    "_trim_history: latest turn exceeds budget, kept compressed "
+                    "(role=%s, %d->%d tokens, max=%d)",
                     turn.get("role"), estimated_tokens, compressed_tokens,
+                    max_tokens,
                 )
             else:
-                logger.debug(
-                    "_trim_history: dropped turn (role=%s, %d tokens) — "
-                    "budget exhausted (%d/%d)",
-                    turn.get("role"), estimated_tokens, total_tokens, max_tokens,
-                )
+                # 予算超過: 残りの古いターンを圧縮
+                compressed = compress_turn(turn)
+                compressed_tokens = _estimate_tokens(compressed["content"])
+                if total_tokens + compressed_tokens <= max_tokens:
+                    result.insert(0, compressed)
+                    total_tokens += compressed_tokens
+                    logger.debug(
+                        "_trim_history: compressed turn (role=%s, %d->%d tokens)",
+                        turn.get("role"), estimated_tokens, compressed_tokens,
+                    )
+                else:
+                    logger.debug(
+                        "_trim_history: dropped turn (role=%s, %d tokens) — "
+                        "budget exhausted (%d/%d)",
+                        turn.get("role"), estimated_tokens, total_tokens, max_tokens,
+                    )
             break
         else:
             result.insert(0, turn)

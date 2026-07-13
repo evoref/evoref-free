@@ -157,6 +157,65 @@ def truncate_repetition(content: str, min_repeat: int = 4) -> str:
             len(lines), len(result),
         )
 
+    return _truncate_block_repetition("\n".join(result))
+
+
+def _truncate_block_repetition(
+    content: str, min_cycle_repeats: int = 3, max_period: int = 32,
+) -> str:
+    """複数行が一塊で周期的に反復する退化出力を検出し切除する
+
+    ``truncate_repetition`` の連続同一行検出は period=1 (直前と全く同じ1行の
+    連続) しか捕捉できない。few-shot 例の丸ごと反復生成のように、数行〜
+    数十行のブロックがそのまま周期的に繰り返されるケース (period>=2) は
+    すり抜けるため、別途ブロック単位で検出する
+    (#incident: 無関係な few-shot 例をローカル LLM がそのまま繰り返し、
+    要求内容と無関係な生成物がそのまま write_file されていた)。
+
+    周期 (行数) を 2〜``max_period`` の範囲で探索し、同一ブロックが
+    ``min_cycle_repeats`` 回以上連続していれば最初の1周期分だけ残す。
+    period=1 は ``truncate_repetition`` の担当のためここでは対象外。
+    """
+    lines = content.split("\n")
+    n = len(lines)
+    if n < min_cycle_repeats * 2:
+        return content
+
+    stripped = [ln.strip() for ln in lines]
+    result: list[str] = []
+    truncated = False
+    i = 0
+    while i < n:
+        matched: tuple[int, int] | None = None  # (period, resume_index)
+        limit = min(max_period, (n - i) // min_cycle_repeats)
+        for period in range(2, limit + 1):
+            block = stripped[i:i + period]
+            if not any(block):
+                continue  # 空行だけのブロックは対象外
+            j = i + period
+            repeats = 1
+            while j + period <= n and stripped[j:j + period] == block:
+                repeats += 1
+                j += period
+            if repeats >= min_cycle_repeats:
+                matched = (period, j)
+                break
+        if matched:
+            period, resume_index = matched
+            result.extend(lines[i:i + period])
+            i = resume_index
+            truncated = True
+        else:
+            result.append(lines[i])
+            i += 1
+
+    if truncated:
+        logger.warning(
+            "Block-level repetition detected and truncated in generated "
+            "content (original: %d lines → %d lines)",
+            n, len(result),
+        )
+
     return "\n".join(result)
 
 
@@ -194,6 +253,48 @@ def fix_json_backslashes(text: str) -> str:
 # ---------------------------------------------------------------------------
 # コンテンツ判定
 # ---------------------------------------------------------------------------
+
+_FEWSHOT_USER_LINE_RE = re.compile(r"^User:\s*(.+)$", re.MULTILINE)
+
+
+def _char_bigrams(text: str) -> set[str]:
+    """文字 bi-gram 集合を返す (テキスト間の粗い関連度判定用)。
+
+    fewshot_pool.py の select_top_k と同じ手法だが、pillar 境界
+    (EvorefLoop → EvorefLearn は import 不可) のためここで独立実装する。
+    """
+    t = text.strip()
+    if len(t) < 2:
+        return {t} if t else set()
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+def fewshot_seems_relevant(
+    task_text: str, fewshot_block: str, min_overlap: float = 0.03,
+) -> bool:
+    """few-shot ブロックが現在のタスクとどの程度関連しているかを粗く判定する。
+
+    Level 1 が進化させた few-shot は query 類似度だけでなく fitness (過去の
+    成功実績) も加味して選ばれるため、現在のタスクと無関係でも再利用され
+    うる。無関係な few-shot 例をファイル内容生成タスクへそのまま注入すると、
+    ローカル LLM がその例文をそのまま繰り返す退化を誘発しうる
+    (#incident: 「テスト.docx」生成タスクに無関係な「映画ですか？」の
+    few-shot が注入され、その例文の反復が延々と write_file されていた)。
+
+    fewshot_block 中の ``User: ...`` 行 (例の質問文) だけを取り出して
+    task_text と文字 bi-gram の Jaccard 重なりを見る。Assistant 側の応答文
+    (定型の丁寧語などで一般的な bi-gram が多く、関連度判定のノイズになる)
+    は比較対象から除く。``User:`` 行が見つからない/どちらかが極端に短い
+    等で判定不能な場合は安全側 (注入する) に倒す。
+    """
+    queries = " ".join(_FEWSHOT_USER_LINE_RE.findall(fewshot_block))
+    a = _char_bigrams(task_text)
+    b = _char_bigrams(queries)
+    if not a or not b:
+        return True
+    overlap = len(a & b) / len(a | b)
+    return overlap >= min_overlap
+
 
 def looks_like_path_not_content(content: str, file_path: str) -> bool:
     """content がファイルパスの誤出力かどうかを判定する"""

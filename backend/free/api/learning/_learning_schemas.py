@@ -170,3 +170,4 @@ class ImprovementPoint(BaseModel):
 
 class ImprovementCurveResponse(BaseModel):
     lora_scores: list[ImprovementPoint] = Field(default_factory=list)
+    assist_scores: list[ImprovementPoint] = Field(default_factory=list)

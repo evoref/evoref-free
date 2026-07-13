@@ -6,15 +6,18 @@
 	import PageLayout from '$lib/free/components/PageLayout.svelte';
 	import { onMount } from 'svelte';
 	import type { Component } from 'svelte';
-	import type { LoRAVersion, DashboardLearningData, DashboardRagStats, ImprovementScore } from '$lib/free/api';
+	import type { LoraTarget, DashboardLearningData, DashboardRagStats } from '$lib/free/api';
 	import { getLoraVersions, rollbackLora } from '$lib/free/api';
 	import {
 		type ProComponentMap,
+		type DashboardLoraTargets,
+		type ImprovementSeries,
 		DEFAULT_LEARNING_DATA,
 		DEFAULT_RAG_STATS,
 		loadProComponents,
 		fetchDashboardData,
-		mapLoraVersions
+		mapLoraTarget,
+		emptyLoraSeries
 	} from '$lib/pro/stores/dashboard';
 
 	// Pro ガード: Free 版ではトップにリダイレクト
@@ -28,8 +31,11 @@
 
 	let components: ProComponentMap | null = $state(null);
 	let learningData: DashboardLearningData = $state({ ...DEFAULT_LEARNING_DATA });
-	let loraVersions = $state<LoRAVersion[]>([]);
-	let improvementScores = $state<ImprovementScore[]>([]);
+	let loraTargets = $state<DashboardLoraTargets>({
+		base: emptyLoraSeries(),
+		assist: emptyLoraSeries()
+	});
+	let improvement = $state<ImprovementSeries>({ base: [], assist: [] });
 	let ragStats: DashboardRagStats = $state({ ...DEFAULT_RAG_STATS });
 	let fetchError = $state(false);
 
@@ -46,22 +52,29 @@
 
 		const data = await fetchDashboardData();
 		learningData = data.learningData;
-		loraVersions = data.loraVersions;
-		improvementScores = data.improvementScores;
+		loraTargets = data.loraTargets;
+		improvement = data.improvement;
 		ragStats = data.ragStats;
 		fetchError = data.hasError;
 	});
 
-	async function handleRollback(version: number) {
+	async function handleRollback(target: LoraTarget, version: number) {
+		const label =
+			target === 'base' ? $t('dashboard.level2_base') : $t('dashboard.level2_assist');
+		if (!confirm($t('dashboard.rollback_confirm', { target: label, version }))) return;
+
 		try {
-			await rollbackLora(version);
+			await rollbackLora(version, target);
 		} catch {
 			return;
 		}
 
 		try {
 			const updated = await getLoraVersions();
-			loraVersions = mapLoraVersions(updated.versions, updated.latest_version ?? 0);
+			loraTargets = {
+				base: mapLoraTarget(updated.base),
+				assist: mapLoraTarget(updated.assist)
+			};
 		} catch {
 			// silent — 既存挙動踏襲
 		}
@@ -97,14 +110,18 @@
 				policyEvolverStatus={learningData.policy_evolver_status}
 			/>
 			<components.LoRAVersions
-				versions={loraVersions}
-				loraVersion={learningData.lora_version}
-				loraAdapterExists={learningData.lora_adapter_exists}
+				base={loraTargets.base}
+				assist={loraTargets.assist}
 				evalCasesCount={learningData.eval_cases_count}
 				evalPassThreshold={learningData.eval_pass_threshold}
 				onrollback={handleRollback}
 			/>
-			<components.PerformanceChart scores={improvementScores} />
+			<components.PerformanceChart
+				baseScores={improvement.base}
+				assistScores={improvement.assist}
+				baseLabel={loraTargets.base.label}
+				assistLabel={loraTargets.assist.label}
+			/>
 			<components.RAGStats stats={ragStats} />
 		</div>
 	{:else if isPro}

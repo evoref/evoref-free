@@ -1642,6 +1642,48 @@ def _extract_search_pattern(query: str) -> str:
     return ""
 
 
+# ディレクトリパス抽出用: ドライブレター配下のパスセグメントを解析する。
+# 各セグメントは「\」直後が非空白文字で始まる前提とする
+# (``[A-Za-z0-9_.]`` から開始し、内部は空白を含んでよい)。
+# 「...\aa\ with the content」のように、ディレクトリ指定の直後に自然文
+# (英語の説明文) が「\」+ 空白で続くケースを誤ってパスセグメントとして
+# 飲み込まないための境界条件 (#incident: 日本語ファイル名クエリで
+# planner が生成した英語タスク記述の一部がパスに混入した)。
+# 実在の Windows パスでバックスラッシュ直後が空白になることはない
+# ("Program Files" のようにセグメント内部に空白を含むのは許容する)。
+_DIR_PATH_RE = re.compile(
+    r"([A-Za-z]:(?:\\[A-Za-z0-9_.][A-Za-z0-9_. -]*)*)",
+)
+
+# クォート文字の対応表（開き, 閉じ）。ファイル名の語幹 (拡張子直前) が
+# 日本語等の非ASCIIの場合に、明示的にクォートされたファイル名を抽出する
+# 際に使う。
+_QUOTE_PAIRS: tuple[tuple[str, str], ...] = (
+    ('"', '"'), ("'", "'"), ("「", "」"), ("『", "』"),
+)
+
+
+def _extract_quoted_filename(query: str) -> str | None:
+    """クォートで明示的に囲まれたファイル名を抽出する（非ASCII語幹対応）。
+
+    ``[A-Za-z0-9_-]+\\.ext`` 前提の ASCII 限定パターンでは、「テスト.docx」の
+    ように拡張子直前が日本語等の非ASCIIだと一切マッチしない。クォートで
+    明示されていれば語幹の文字種を問わず抽出する（クォート無しの非ASCII
+    語幹は文中の地の文と区別できず誤検出リスクが高いため対象外）。
+    """
+    for open_q, close_q in _QUOTE_PAIRS:
+        m = re.search(
+            re.escape(open_q)
+            + r"([^\n" + re.escape(open_q) + re.escape(close_q) + r"]{1,200}"
+            r"\.[A-Za-z0-9]{1,10})"
+            + re.escape(close_q),
+            query,
+        )
+        if m:
+            return m.group(1).strip()
+    return None
+
+
 def _extract_file_path(query: str) -> str:
     """クエリからファイルパスを抽出する
 
@@ -1668,30 +1710,29 @@ def _extract_file_path(query: str) -> str:
     #    \w は日本語にもマッチするため ASCII 限定で検索
     drive_match = re.search(r"([A-Za-z]):\\", query)
     file_match = re.search(r"([A-Za-z0-9_-]+\.[A-Za-z0-9]{1,10})(?=[^A-Za-z0-9_.]|$)", query)
-    if drive_match and file_match:
-        filename = file_match.group(1)
-        dir_match = re.search(
-            r"([A-Za-z]:\\[A-Za-z0-9_.\\/ -]*[A-Za-z0-9_])(?=[\\/\s]|$)",
-            query,
-        )
+    # ファイル名の語幹が非ASCII (日本語等) だと file_match はマッチしない
+    # ("テスト.docx" 等)。その場合はクォートで明示されたファイル名を拾う。
+    filename = file_match.group(1) if file_match else _extract_quoted_filename(query)
+    if drive_match and filename:
+        dir_match = _DIR_PATH_RE.search(query)
         if dir_match:
-            directory = _normalize_path_separators(dir_match.group(1)).rstrip("\\/")
+            # セグメント内部は空白を許容するため ("Program Files" 等)、末尾に
+            # 地の文へ続く空白が巻き込まれることがある (例: "aa に保存して" の
+            # "aa " )。rstrip() で末尾空白 (全角含む) を落としてから区切りも除去。
+            directory = _normalize_path_separators(
+                dir_match.group(1).rstrip(),
+            ).rstrip("\\/")
             return f"{directory}\\{filename}"
         return f"{drive_match.group(1)}:\\{filename}"
 
     # 3. ディレクトリパスのみ（ファイル名なし）: E:\xxx\ や E:\xxx 等
     #    配下のファイルを参照する文脈では、ディレクトリパスを返す。
-    #    終端は ASCII 空白 / バックスラッシュ / スラッシュに加え、全角スペース
-    #    (U+3000) 等の Unicode 空白 (\s) と文末アンカー ($) も許容する。
-    #    これにより「Desktop\test　この配下に...」のように全角スペースが続く
-    #    日本語クエリでも path 末尾を正しく検出できる。
+    #    全角スペース (U+3000) 等の Unicode 空白や文末で終端しても、
+    #    セグメント単位で解析する _DIR_PATH_RE が自然に正しい境界で止まる。
     if drive_match:
-        dir_match = re.search(
-            r"([A-Za-z]:\\[A-Za-z0-9_.\\/ -]*[A-Za-z0-9_])(?=[\\/\s]|$)",
-            query,
-        )
+        dir_match = _DIR_PATH_RE.search(query)
         if dir_match:
-            return _normalize_path_separators(dir_match.group(1))
+            return _normalize_path_separators(dir_match.group(1).rstrip())
 
     # 4. Unix パス: /home/user/file.txt
     m = re.search(r"(?:^|[\s　])((?:/[\w._-]+){2,})", query)
