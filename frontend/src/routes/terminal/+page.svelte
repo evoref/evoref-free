@@ -1,13 +1,15 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import type { Component } from 'svelte';
+	import { browser } from '$app/environment';
 	import { goto } from '$app/navigation';
 	import { isPro } from '$lib/edition';
 	import { t } from '$lib/i18n';
 	import PageLayout from '$lib/free/components/PageLayout.svelte';
 
-	// Pro ガード: Free 版ではトップにリダイレクト (Pro 専用機能)
-	if (!isPro) {
+	// Pro ガード: Free 版ではトップにリダイレクト (Pro 専用機能)。
+	// goto は SSR 中に呼ぶと 500 になるため browser ガード必須。
+	if (browser && !isPro) {
 		goto('/');
 	}
 

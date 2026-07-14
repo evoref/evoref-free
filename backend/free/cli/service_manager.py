@@ -54,6 +54,9 @@ logger = get_logger("cli.service_manager")
 class AutoServeState:
     """auto-serve で管理するプロセス群の状態"""
     procs: list[subprocess.Popen] = field(default_factory=list)
+    # procs と並走するコンポーネント名 (stderr ログの stem: llama-base /
+    # llama-assist / llama-embed / backend)。死亡検知時の特定用
+    proc_names: list[str] = field(default_factory=list)
     llama_port: int = 0  # llama-server のポート（停止時にポートから kill 用）
     managed_ports: list[int] = field(default_factory=list)  # 全管理対象ポート
     stderr_files: list = field(default_factory=list)  # stderr ログファイルハンドル
@@ -718,6 +721,7 @@ async def ensure_extra_servers(
                 stderr=stderr_f,
             )
             auto_serve_state.procs.append(proc)
+            auto_serve_state.proc_names.append(f"llama-{name}")
             auto_serve_state.managed_ports.append(port)
             logger.info("ensure_extra_servers: spawned %s on :%d (pid=%d)", name, port, proc.pid)
         except (FileNotFoundError, ValueError, OSError) as e:
@@ -766,6 +770,7 @@ def _spawn_all_servers(
                 stderr=stderr_f,
             )
             state.procs.append(proc)
+            state.proc_names.append("llama-base")
             servers["base"] = (llama_host, llama_port)
             logger.debug("auto-serve: spawned base llama-server on :%d (pid=%d)", llama_port, proc.pid)
         except (FileNotFoundError, ValueError, OSError) as e:
@@ -790,6 +795,7 @@ def _spawn_all_servers(
                 stderr=stderr_f,
             )
             state.procs.append(proc)
+            state.proc_names.append(f"llama-{name}")
             state.managed_ports.append(port)
             servers[name] = (host, port)
             logger.debug("auto-serve: spawned %s server on :%d (pid=%d)", name, port, proc.pid)
@@ -949,11 +955,22 @@ class _HealthCheckSpinner:
 
 
 def _check_procs_alive(state: AutoServeState) -> bool:
-    """子プロセスのいずれかが死亡していたら ``False``。"""
-    for p in state.procs:
+    """子プロセスのいずれかが死亡していたら ``False``。
+
+    どのコンポーネント (llama-base / llama-assist / llama-embed / backend)
+    が死んだかを stderr ログ名とともに ERROR に出す — pid だけでは事後に
+    プロセスを特定できない。
+    """
+    for i, p in enumerate(state.procs):
         if p.poll() is not None:
+            name = (
+                state.proc_names[i]
+                if i < len(state.proc_names) else "unknown"
+            )
             logger.error(
-                "auto-serve: process died during startup (pid=%d)", p.pid,
+                "auto-serve: %s process died during startup (pid=%d); "
+                "check local/logs/%s.stderr.log",
+                name, p.pid, name,
             )
             return False
     return True
@@ -1217,6 +1234,7 @@ def _spawn_auto_serve_backend(
             stderr=stderr_f,
         )
         state.procs.append(backend_proc)
+        state.proc_names.append("backend")
         return True
     except FileNotFoundError as e:
         logger.error("auto-serve: backend start failed: %s", e)

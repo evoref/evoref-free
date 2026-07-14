@@ -56,9 +56,11 @@
 				<a href="/history" class="nav-item" class:active={isActive('/history')}>{$t('sidebar.history')}</a>
 				<a href="/cartridge" class="nav-item" class:active={isActive('/cartridge')}>{$t('sidebar.cartridges')}</a>
 				<a href="/themes" class="nav-item" class:active={isActive('/themes')}>{$t('sidebar.themes')}</a>
-				<a href="/loop" class="nav-item" class:active={isActive('/loop')}>{$t('sidebar.loop')}</a>
 				{#if isPro}
-					<a href="/dashboard" class="nav-item" class:active={isActive('/dashboard')}>{$t('sidebar.dashboard')}</a>
+					<a href="/loop" class="nav-item" class:active={isActive('/loop')}>{$t('sidebar.loop')}</a>
+				{/if}
+				<a href="/dashboard" class="nav-item" class:active={isActive('/dashboard')}>{$t('sidebar.dashboard')}</a>
+				{#if isPro}
 					<a href="/terminal" class="nav-item" class:active={isActive('/terminal')}>{$t('sidebar.terminal')}</a>
 				{/if}
 				<a href="/settings" class="nav-item" class:active={isActive('/settings')}>{$t('sidebar.settings')}</a>

@@ -621,8 +621,9 @@ class ModelMigrator:
         # config.yaml 更新
         self._update_component_config(component, new_model_path)
 
-        # LoRA: 新モデルと arch が不一致 (または判定不能) の場合のみアーカイブ。
-        # 一致時は f_04_self_learning.md §1.2 の flat 共有方針どおり persist する。
+        # LoRA: 新モデルと不適合 (arch / hidden size 不一致、または判定不能) の
+        # 場合のみアーカイブ。適合時は f_04_self_learning.md §1.2 の flat 共有
+        # 方針どおり persist する。
         lora_action = self._archive_component_lora_if_incompatible(
             component, old_filename, resolved,
         )
@@ -707,15 +708,22 @@ class ModelMigrator:
     def _archive_component_lora_if_incompatible(
         self, component: str, old_model_name: str, new_model_path: Path,
     ) -> str:
-        """新モデルと既存 LoRA の ``general.architecture`` を比較し、不一致
-        (または判定不能) のときのみ退避する。
+        """新モデルと既存 LoRA の互換性を判定し、不適合 (または判定不能) の
+        ときのみ退避する。
 
-        一致時は f_04_self_learning.md §1.2 の「assist/embed の学習は
+        適合時は f_04_self_learning.md §1.2 の「assist/embed の学習は
         モデル別パーティション化されず flat に共有される」方針どおり LoRA を
         persist させる (無条件アーカイブだと同一 arch 内でのモデル切替
         (量子化違い等) でも毎回学習を破棄してしまい、この設計意図を壊す)。
-        判定不能を安全側でアーカイブするのは launch_llama.py の
-        ``_lora_arch_compatible`` の fail-closed 方針と対称。
+
+        判定は launch_llama.py の :func:`lora_compatible_with_model` を起動側
+        ガード (``_lora_compatible``) と共有する。``general.architecture`` の
+        一致に加え、adapter の全 ``*.lora_a`` / ``*.lora_b`` テンソルをモデル
+        側の対応 weight 実形状と突合する — 同一 arch でもサイズ違い
+        (例: gemma-4-E2B 1536 vs E4B 2560) や head 構成違いの LoRA を残すと
+        llama-server が tensor 形状不一致でプロセスごと落ちるため、arch
+        文字列の一致だけでは適合と言えない。arch 判定不能を安全側で
+        アーカイブするのは起動側の fail-closed 方針と対称。
         """
         adapter_key, versions_key, archive_root, default_adapter = (
             _COMPONENT_LORA_KEYS[component]
@@ -726,10 +734,14 @@ class ModelMigrator:
             return "n/a"
 
         try:
-            from scripts.launch_llama import read_gguf_metadata
+            from scripts.launch_llama import (
+                lora_compatible_with_model,
+                read_gguf_metadata,
+            )
         except Exception as exc:
             logger.warning(
-                "component LoRA arch check: launch_llama import failed: %s", exc,
+                "component LoRA compatibility check: launch_llama import "
+                "failed: %s", exc,
             )
             return self._archive_lora(
                 old_model_name, False,
@@ -737,19 +749,30 @@ class ModelMigrator:
                 archive_root=archive_root,
             )
 
-        lora_arch = read_gguf_metadata(lora_path).get("architecture")
-        new_arch = read_gguf_metadata(new_model_path).get("architecture")
-        if lora_arch and new_arch and lora_arch == new_arch:
+        compatible, reason = lora_compatible_with_model(
+            new_model_path, lora_path,
+        )
+        if compatible:
             logger.info(
-                "Component LoRA arch matches (%s), keeping: %s",
-                lora_arch, lora_path,
+                "Component LoRA compatible (%s), keeping: %s",
+                reason, lora_path,
             )
+            # 系統 stamp の無いレガシーアダプタは arch/形状しか検証できて
+            # いない。モデルが実際に変わる切替では「学習元不明のまま持ち
+            # 越す」ことを観測可能にする (挙動は従来どおり keep)。
+            if (
+                old_model_name != new_model_path.name
+                and not read_gguf_metadata(lora_path).get("trained_on_model")
+            ):
+                logger.warning(
+                    "Component LoRA lineage unverifiable (no trained-on "
+                    "stamp); kept by arch/shape check only: %s", lora_path,
+                )
             return "kept"
 
         logger.info(
-            "Component LoRA arch mismatch or unreadable (lora=%s, new=%s), "
-            "archiving: %s",
-            lora_arch, new_arch, lora_path,
+            "Component LoRA incompatible (%s), archiving: %s",
+            reason, lora_path,
         )
         return self._archive_lora(
             old_model_name, False,
