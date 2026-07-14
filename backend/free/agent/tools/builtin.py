@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ast
+import calendar
 import locale
 import os
 import re
@@ -148,6 +149,64 @@ def _reject_unrenderable_rich_content(ext: str, content: str, export_content) ->
     return None
 
 
+# 月ごとの実日数上限 (年に依存しない固定値)。2 月は閏年誤検知を避けるため
+# 寛容側に 29 まで許容する (2026 年は平年で 28 日までだが、他年での誤検知を防ぐ)。
+_MONTH_MAX_DAYS = {m: calendar.mdays[m] for m in range(1, 13)}
+_MONTH_MAX_DAYS[2] = 29
+
+
+def _check_calendar_table(export_content) -> str | None:
+    """月別カレンダー表に実在しない日付が含まれていないか検証する。
+
+    「1月から12月」等の月単位カレンダーは各行の先頭セルが月番号 (1-12)、
+    後続セルが日番号という構造で生成されがちだが、ローカル小型モデルは
+    「何月は何日まで」という長距離の正確な記憶・計算が不得手で、31日までしか
+    無い月に32以上、2月に30日以上の値が混入することがある (実運用で発生:
+    2026年2月の行に31日まで埋まっていた)。値の新規作成はせず、実在しない
+    日付が見つかった場合のみ再生成を促すエラーを返す。
+    """
+    for block in export_content.blocks:
+        if block.type != "table" or len(block.rows) < 3:
+            continue
+        month_rows: list[tuple[int, list[str]]] = []
+        for row in block.rows[1:]:
+            if not row:
+                continue
+            try:
+                month = int(str(row[0]).strip())
+            except (ValueError, AttributeError):
+                continue
+            if 1 <= month <= 12:
+                month_rows.append((month, row))
+        # 月番号が重複なく昇順に 2 行以上並ぶ表のみ「月別カレンダー」とみなす
+        # (無関係な数値表の誤検知を避けるための構造的シグナル)。
+        months = [m for m, _ in month_rows]
+        if len(months) < 2 or months != sorted(set(months)):
+            continue
+        bad_months: list[str] = []
+        for month, row in month_rows:
+            max_day = _MONTH_MAX_DAYS[month]
+            for cell in row[1:]:
+                try:
+                    day = int(str(cell).strip())
+                except (ValueError, AttributeError):
+                    continue
+                # 1-31 の範囲内の値のみ「日番号」候補として扱う (無関係な数値
+                # 表 (売上高等) の誤検知を避けるため)。
+                if 1 <= day <= 31 and day > max_day:
+                    bad_months.append(f"{month}月 ({day}日 > {max_day}日まで)")
+                    break
+        if bad_months:
+            return (
+                "Error: calendar table contains dates that do not exist: "
+                f"{', '.join(bad_months)}. Each month's day column must stop at "
+                "its actual last day (February has at most 29 days; April, June, "
+                "September, November have at most 30). Rewrite the table with "
+                "the correct number of days for each month."
+            )
+    return None
+
+
 def _write_rich_document(p: Path, content: str) -> str:
     """``.docx`` 等のリッチ形式を export フレームワーク経由で実ファイル化する。
 
@@ -176,6 +235,9 @@ def _write_rich_document(p: Path, content: str) -> str:
         guard_error = _reject_unrenderable_rich_content(ext, content, export_content)
         if guard_error:
             return guard_error
+        calendar_error = _check_calendar_table(export_content)
+        if calendar_error:
+            return calendar_error
         result = registry.write(export_content, p)
         return f"Written {result.size_bytes} bytes to {p}"
     except Exception as e:

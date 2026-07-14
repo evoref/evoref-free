@@ -1063,6 +1063,14 @@ def _call_step(on_step: Callable[[dict], Any], data: dict) -> None:
     on_step(data)
 
 
+# 1 ユニットあたりの分割数上限。estimated_tokens は LLM 由来 (parse 時に
+# strategy_common._ESTIMATED_TOKENS_MAX で切り詰め済みだが、念のため分割
+# ループ自体にも上限を設ける)。これを超える指定は現実的な単一セクション
+# 規模を逸脱しており、同期ループでイベントループを長時間ブロックする
+# (実運用で発生したハングの直接原因)。
+_MAX_SPLITS_PER_UNIT = 50
+
+
 def _split_oversized_text_units(
     plan: "GenerationPlan",
     unit_target_tokens: int,
@@ -1087,8 +1095,11 @@ def _split_oversized_text_units(
             new_units.append(unit)
             continue
 
-        # 分割数を算出
-        n_splits = math.ceil(unit.estimated_tokens / unit_target_tokens)
+        # 分割数を算出 (異常値によるイベントループ長時間ブロックを防ぐため上限を設ける)
+        n_splits = min(
+            math.ceil(unit.estimated_tokens / unit_target_tokens),
+            _MAX_SPLITS_PER_UNIT,
+        )
         tokens_per_split = unit.estimated_tokens // n_splits
 
         for i in range(n_splits):

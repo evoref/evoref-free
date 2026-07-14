@@ -496,40 +496,130 @@ def build_mtp_args(
     return ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(draft_n_max)]
 
 
-def _lora_arch_compatible(
+def lora_compatible_with_model(
+    model_path: Path,
+    lora_path: Path,
+) -> tuple[bool, str]:
+    """LoRA アダプタがモデルに適用可能かを GGUF メタデータから判定する。
+
+    判定は 3 段階:
+
+    1. ``general.architecture`` の一致。どちらか読めない場合も不適合扱い
+       (fail-closed) — arch すら読めないファイルはアダプタとして信用
+       できないため。
+    2. 全テンソル形状突合 (:func:`_lora_shape_mismatch`): アダプタの全
+       ``*.lora_a`` / ``*.lora_b`` をモデル側の対応 weight テンソルの
+       実形状と照合する。同一 arch でもサイズ違い (例: gemma-4-E2B 1536
+       vs E4B 2560) や head 構成違い、block 数を超えるターゲットは
+       llama-server が "tensor has incorrect shape" でコンテキスト生成に
+       失敗しプロセスごと落ちるため、arch 一致だけでは適合と言えない。
+    3. 系統 (lineage) チェック: アダプタに ``evoref.trained_on_model``
+       (学習元モデルの filename stem、Level 2 トレーナーが刻む) がある
+       場合、現モデルの stem と完全一致 (大文字小文字無視) を要求する。
+       LoRA は特定の重みへの差分なので、同一 arch・同一形状でも別モデル
+       (例: Qwen3.5-9B と同 arch の別 finetune) に当てると silent な品質
+       摂動になる。GGUF の identity メタデータ (``general.name`` 等) は
+       量子化違いの同一モデルすら識別できない品質のため (qat 変換由来の
+       ゴミ名等)、再量子化も「系統不明」として不適合側に倒す (誤って
+       捨てる実害は次の Level 2 サイクルで再学習される軽微なもの、誤って
+       適用する実害は診断困難な品質摂動であるため)。
+
+    形状が判定不能 (LoRA テンソル無し / どちらかのテンソル情報節が
+    読めない) の場合、および stamp が無いレガシーアダプタの系統は
+    fail-open (arch + 形状のみで判定)。arch 側の fail-closed との非対称は
+    意図的 — テンソル命名の異なる正当なアダプタを誤って捨てないため。
+    Free エディションはトレーナーを持たず stamp 付きアダプタを生成しない
+    ので、系統チェックは Free では実質 inert。
+
+    起動側 (:func:`_lora_compatible`) と model migration 側
+    (``backend.free.core.model_migration``) の両層で共有する単一の述語。
+
+    Returns:
+        ``(compatible, reason)``。reason はログ向けの英語短文。
+    """
+    model_meta = read_gguf_metadata(model_path)
+    model_arch = model_meta.get("architecture")
+    lora_meta = read_gguf_metadata(lora_path)
+    lora_arch = lora_meta.get("architecture")
+    if not model_arch or not lora_arch:
+        return False, (
+            f"architecture unreadable (model={model_arch or '?'}, "
+            f"lora={lora_arch or '?'})"
+        )
+    if model_arch != lora_arch:
+        return False, (
+            f"architecture mismatch (model={model_arch}, lora={lora_arch})"
+        )
+
+    mismatch = _lora_shape_mismatch(model_path, lora_path)
+    if mismatch is not None:
+        return False, mismatch
+
+    stamp = lora_meta.get("trained_on_model")
+    if stamp and stamp.casefold() != model_path.stem.casefold():
+        return False, (
+            f"lineage mismatch (adapter trained on {stamp}, "
+            f"model is {model_path.stem})"
+        )
+    return True, f"architecture={model_arch}"
+
+
+def _lora_compatible(
     model_path: Path,
     lora_path: Path,
     *,
     warn: Callable[[str], None] | None = None,
 ) -> bool:
-    """LoRA アダプタとモデルの ``general.architecture`` が一致するか判定する。
+    """LoRA アダプタとモデルの互換性 (arch + 形状) を判定する。
 
-    モデル切替 (``POST /api/model/{component}/migrate`` 等) 後に旧 arch 向け
-    LoRA が残存すると、llama-server が "model arch and LoRA arch mismatch"
-    でコンテキスト生成に失敗しプロセスごと落ちる。付与直前にこの関数で
-    検証し、不一致・メタ欠如 (判定不能) はいずれも fail-closed で ``False``
-    を返す (``build_mtp_args`` と同じ「非対応なら機能を諦める」方針)。
-    誤ってスキップする実害は警告ログのみだが、誤って付与する実害は
+    モデル切替 (``POST /api/model/{component}/migrate`` 等) 後に旧モデル向け
+    LoRA が残存すると、llama-server が arch 不一致または tensor 形状不一致で
+    コンテキスト生成に失敗しプロセスごと落ちる。付与直前に
+    :func:`lora_compatible_with_model` で検証し、不適合は warning を出して
+    ``--lora`` を諦める (``build_mtp_args`` と同じ「非対応なら機能を諦める」
+    方針)。誤ってスキップする実害は警告ログのみだが、誤って付与する実害は
     プロセスクラッシュそのものであるため、この非対称性を正当化する。
     """
-    model_arch = read_gguf_metadata(model_path).get("architecture")
-    lora_arch = read_gguf_metadata(lora_path).get("architecture")
-    if not model_arch or not lora_arch:
-        if warn is not None:
-            warn(
-                "[launch] WARNING: cannot verify LoRA/model architecture "
-                f"compatibility (model={model_arch or '?'}, lora={lora_arch or '?'}): "
-                f"{lora_path.name}. Skipping --lora to avoid a possible "
-                '"model arch and LoRA arch mismatch" crash.'
-            )
-        return False
-    if model_arch != lora_arch:
-        if warn is not None:
-            warn(
-                f"[launch] WARNING: LoRA arch mismatch (model={model_arch}, "
-                f"lora={lora_arch}): {lora_path.name}. Skipping --lora."
-            )
-        return False
+    ok, reason = lora_compatible_with_model(model_path, lora_path)
+    if not ok and warn is not None:
+        warn(
+            f"[launch] WARNING: incompatible LoRA ({reason}): "
+            f"{lora_path.name}. Skipping --lora."
+        )
+    return ok
+
+
+def _cvector_compatible(
+    model_path: Path,
+    cvec_path: Path,
+    *,
+    warn: Callable[[str], None] | None = None,
+) -> bool:
+    """control vector の direction 次元とモデルの ``embedding_length`` を照合する。
+
+    次元不一致の control vector を ``--control-vector`` で渡すと llama-server
+    がロード失敗でプロセスごと落ちる (LoRA の形状不一致と同型)。cvector GGUF
+    は ``general.architecture`` を持たないことがあるため arch 照合はせず、
+    ``direction.<n>`` テンソルの ne0 とモデル ``embedding_length`` の比較のみ
+    行う。判定不能 (テンソル情報不読 / direction テンソル無し /
+    embedding_length 不明) は従来どおり適用する (fail-open)。
+    """
+    cvec_shapes = read_gguf_tensor_shapes(cvec_path)
+    if not cvec_shapes:
+        return True
+    model_emb = read_gguf_metadata(model_path).get("embedding_length")
+    if model_emb is None:
+        return True
+    for name, dims in sorted(cvec_shapes.items()):
+        if name.startswith("direction.") and dims and dims[0] != model_emb:
+            if warn is not None:
+                warn(
+                    "[launch] WARNING: incompatible control vector "
+                    f"(direction dim={dims[0]}, model embedding_length="
+                    f"{model_emb}): {cvec_path.name}. "
+                    "Skipping --control-vector."
+                )
+            return False
     return True
 
 
@@ -571,7 +661,7 @@ def build_llama_cmd(
     lora_full = Path(lora_path)
     if not lora_full.is_absolute():
         lora_full = project_root / lora_full
-    if lora_full.exists() and _lora_arch_compatible(
+    if lora_full.exists() and _lora_compatible(
         base_model_path, lora_full, warn=lambda m: print(m, file=sys.stderr),
     ):
         cmd += ["--lora", str(lora_full)]
@@ -586,7 +676,9 @@ def build_llama_cmd(
         cvec_full = Path(cvec_path)
         if not cvec_full.is_absolute():
             cvec_full = project_root / cvec_full
-        if cvec_full.exists():
+        if cvec_full.exists() and _cvector_compatible(
+            base_model_path, cvec_full, warn=lambda m: print(m, file=sys.stderr),
+        ):
             # 既定 1.0。``or`` フォールバックは使わない (0.0 は診断用の正当な値で、
             # falsy 畳み込みすると 1.0=full strength に化けるため)。dict 既定が欠損を
             # 補い、schema が非 Optional float なので None は来ない。
@@ -775,7 +867,7 @@ def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | 
     embed_lora_path = Path(embed_lora)
     if not embed_lora_path.is_absolute():
         embed_lora_path = project_root / embed_lora_path
-    if embed_lora_path.exists() and _lora_arch_compatible(
+    if embed_lora_path.exists() and _lora_compatible(
         embed_model_path, embed_lora_path, warn=lambda m: print(m, file=sys.stderr),
     ):
         cmd += ["--lora", str(embed_lora_path)]
@@ -883,7 +975,7 @@ def build_assist_cmd(
         assist_lora_full = Path(assist_lora)
         if not assist_lora_full.is_absolute():
             assist_lora_full = project_root / assist_lora_full
-        if assist_lora_full.exists() and _lora_arch_compatible(
+        if assist_lora_full.exists() and _lora_compatible(
             assist_model_path, assist_lora_full, warn=lambda m: print(m, file=sys.stderr),
         ):
             cmd += ["--lora", str(assist_lora_full)]
@@ -1147,8 +1239,12 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
            "expert_count": int, "nextn_predict_layers": int,
            "has_chat_template": bool,
            "block_count" / "head_count_kv" / "head_count" / "key_length" /
-           "value_length" / "embedding_length": int | None}``
+           "value_length" / "embedding_length": int | None,
+           "trained_on_model": str | None}``
 
+    ``trained_on_model`` は evoref 独自 KV ``evoref.trained_on_model``
+    (Level 2 トレーナーが LoRA アダプタに刻む学習元モデルの filename stem)。
+    :func:`lora_compatible_with_model` の系統チェックに使う。
     後半 6 キーは KV キャッシュ VRAM 推定 (``estimate_kv_cache_mb``) 用。
     ``expert_count`` は対応キーが無い dense モデルで 0。パース失敗・I/O
     エラーは安全な既定値を返し、呼び出し側 (default プロファイル /
@@ -1171,6 +1267,8 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
         "key_length": None,
         "value_length": None,
         "embedding_length": None,
+        # LoRA アダプタ専用の evoref 独自 KV (学習元モデルの filename stem)
+        "trained_on_model": None,
     }
     try:
         with gguf_path.open("rb") as f:
@@ -1239,6 +1337,11 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
                 elif key == "tokenizer.chat_template":
                     result["has_chat_template"] = True
                     _gguf_skip_value(f, vtype)
+                elif key == "evoref.trained_on_model":
+                    val = _gguf_read_scalar_or_skip(f, vtype)
+                    result["trained_on_model"] = (
+                        str(val) if val is not None else None
+                    )
                 else:
                     _gguf_skip_value(f, vtype)
     except (OSError, struct.error, UnicodeDecodeError, ValueError, MemoryError):
@@ -1246,6 +1349,98 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
         # docstring の「パース失敗は安全な既定値を返す」契約に合わせる。
         return result
     return result
+
+
+def read_gguf_tensor_shapes(gguf_path: Path) -> dict[str, tuple[int, ...]] | None:
+    """GGUF のテンソル情報節から ``{name: dims}`` を読む。
+
+    テンソル情報 (name / n_dims / dims / type / offset) はヘッダ内
+    (KV 節の直後) にあるため、数 GB のモデルでも読むのは先頭の数十 KB のみ。
+    dims は ggml の ne 順 (ne0=in_features, ne1=out_features)。
+
+    LoRA アダプタの GGUF は KV メタデータに次元情報を持たない
+    (``general.architecture`` / ``general.type`` / ``adapter.*`` のみ) ため、
+    モデルとの形状互換はここから判定するしかない。パース失敗・I/O エラーは
+    ``None`` を返し、呼び出し側は「判定不能」として扱う。
+    """
+    try:
+        with gguf_path.open("rb") as f:
+            magic = f.read(4)
+            if magic != _GGUF_MAGIC:
+                return None
+            (version,) = struct.unpack("<I", f.read(4))
+            if version < 2:
+                return None
+            n_tensors, n_kv = struct.unpack("<QQ", f.read(16))
+            # KV 節を正確に消費してテンソル情報節の先頭に位置合わせする
+            for _ in range(n_kv):
+                (key_len,) = struct.unpack("<Q", f.read(8))
+                f.seek(key_len, 1)
+                (vtype,) = struct.unpack("<I", f.read(4))
+                _gguf_skip_value(f, vtype)
+            shapes: dict[str, tuple[int, ...]] = {}
+            for _ in range(n_tensors):
+                (name_len,) = struct.unpack("<Q", f.read(8))
+                name = f.read(name_len).decode("utf-8", errors="replace")
+                (n_dims,) = struct.unpack("<I", f.read(4))
+                dims = struct.unpack(f"<{n_dims}Q", f.read(8 * n_dims))
+                f.seek(12, 1)  # type (uint32) + offset (uint64)
+                shapes[name] = tuple(int(d) for d in dims)
+            return shapes
+    except (OSError, struct.error, UnicodeDecodeError, ValueError, MemoryError):
+        return None
+
+
+_LORA_SUFFIX_A = ".lora_a"
+_LORA_SUFFIX_B = ".lora_b"
+
+
+def _lora_shape_mismatch(model_path: Path, lora_path: Path) -> str | None:
+    """LoRA の全ターゲットテンソルをモデル実形状と突合し、不一致理由を返す。
+
+    ggml の行列は ne0=in_features, ne1=out_features で格納される。対象
+    weight W (in, out) に対し lora_a は (in, r)、lora_b は (r, out) なので、
+    全ターゲットについて ``lora_a.ne0 == W.ne0`` かつ ``lora_b.ne1 == W.ne1``
+    を要求する。ターゲットがモデルに存在しない (block 数の少ないモデルへ
+    深い層の adapter を当てる等) 場合も不一致。hidden size 違いだけでなく
+    head 構成違い (out_features) も検出できる。
+
+    ``None`` は「不一致の証拠なし」— 全ターゲット照合済みで一致したか、
+    判定不能 (どちらかのテンソル情報が読めない / LoRA テンソルが無い) かの
+    いずれか。判定不能を fail-open にする理由は
+    :func:`lora_compatible_with_model` の docstring 参照。
+    """
+    lora_shapes = read_gguf_tensor_shapes(lora_path)
+    if not lora_shapes:
+        return None
+    targets: dict[str, dict[str, tuple[int, ...]]] = {}
+    for name, dims in lora_shapes.items():
+        if name.endswith(_LORA_SUFFIX_A):
+            targets.setdefault(name[: -len(_LORA_SUFFIX_A)], {})["a"] = dims
+        elif name.endswith(_LORA_SUFFIX_B):
+            targets.setdefault(name[: -len(_LORA_SUFFIX_B)], {})["b"] = dims
+    if not targets:
+        return None
+    model_shapes = read_gguf_tensor_shapes(model_path)
+    if model_shapes is None:
+        return None
+    for target, ab in sorted(targets.items()):
+        model_dims = model_shapes.get(target)
+        if model_dims is None:
+            return f"lora target tensor not in model: {target}"
+        a = ab.get("a")
+        b = ab.get("b")
+        if a and model_dims and a[0] != model_dims[0]:
+            return (
+                f"in_features mismatch at {target} "
+                f"(lora_a={a[0]}, model={model_dims[0]})"
+            )
+        if b and len(b) >= 2 and len(model_dims) >= 2 and b[-1] != model_dims[-1]:
+            return (
+                f"out_features mismatch at {target} "
+                f"(lora_b={b[-1]}, model={model_dims[-1]})"
+            )
+    return None
 
 
 # モデルプロファイル: arch 単位の起動フラグ / sampling 既定。

@@ -130,6 +130,7 @@
 		"level2_accumulating": "蓄積中",
 		"level2_noop": "改良なし",
 		"level2_adapter_none": "adapter なし",
+		"level2_sufficient_data": "十分なデータが蓄積済み ({count}件)",
 		"level2_reason_noop_base_lora": "no-op (base=lora)・cvector で実学習",
 		"level2_reason_noop_assist_method": "no-op・spsa-real-eval を設定",
 		"level2_reason_bootstrap_disabled": "bootstrap 無効",

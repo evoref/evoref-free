@@ -97,6 +97,15 @@ TEXT_UNIT_CONTINUATION_SYSTEM = """\
 
 # ── 計画パース ──
 
+# 1 ユニットあたりの estimated_tokens 上限。LLM (json_schema grammar を強制
+# しないアシストモデルもある) が桁違いの値を返すと、orchestrator の
+# _split_oversized_text_units が n_splits = ceil(estimated_tokens /
+# unit_target_tokens) だけ同期ループしてイベントループを長時間ブロックする
+# (実運用で発生: /api/status ポーリングまで停止する完全ハング)。実際の
+# 妥当な最大単一セクション規模を大きく超えた値なので安全に切り詰める。
+_ESTIMATED_TOKENS_MAX = 20_000
+
+
 def _to_int(value: object, default: int) -> int:
     """JSON 由来の数値フィールドを安全に int 化する。
 
@@ -111,6 +120,11 @@ def _to_int(value: object, default: int) -> int:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
+
+
+def _to_estimated_tokens(value: object) -> int:
+    """``estimated_tokens`` を安全な int に変換し、異常な巨大値を切り詰める。"""
+    return min(_to_int(value, 500), _ESTIMATED_TOKENS_MAX)
 
 
 def parse_plan(
@@ -144,13 +158,13 @@ def parse_plan(
                 file_path=u.get("file_path", ""),
                 spec=u.get("spec", ""),
                 depends_on=u.get("depends_on", []),
-                estimated_tokens=_to_int(u.get("estimated_tokens"), 500),
+                estimated_tokens=_to_estimated_tokens(u.get("estimated_tokens")),
             ))
         else:
             units.append(SectionPlan(
                 heading=u.get("heading", ""),
                 key_points=u.get("key_points", []),
-                estimated_tokens=_to_int(u.get("estimated_tokens"), 500),
+                estimated_tokens=_to_estimated_tokens(u.get("estimated_tokens")),
                 file_name=u.get("file_name") or None,  # SPLIT モード時のみ非 None
             ))
 
@@ -159,14 +173,17 @@ def parse_plan(
     plan_target = _to_int(data.get("target_length"), 0)
     target_length = user_target if user_target > 0 else plan_target
 
-    # target_length に基づき estimated_tokens を補正
+    # target_length に基づき estimated_tokens を補正 (不足分の引き上げだけでなく
+    # 超過分の引き下げも行う)。LLM が estimated_tokens を target_length と無関係に
+    # 桁違いの値で返すことがあり (実運用で発生: 各ユニット 20000 超、目標
+    # 2000文字=1200トークン超過に対し補正なしで 10000 文字超を出力していた)、
+    # 上げ方向のみの補正だと超過ケースを一切是正できなかった。
     if target_length > 0 and units:
         target_tokens = chars_to_tokens(target_length)
         total_estimated = sum(u.estimated_tokens for u in units) or 1
-        if total_estimated < target_tokens:
-            scale = target_tokens / total_estimated
-            for u in units:
-                u.estimated_tokens = max(int(u.estimated_tokens * scale), 200)
+        scale = target_tokens / total_estimated
+        for u in units:
+            u.estimated_tokens = max(int(u.estimated_tokens * scale), 200)
 
     return GenerationPlan(
         content_type=content_type,

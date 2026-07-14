@@ -2,31 +2,33 @@
 	import { t } from '$lib/i18n';
 	import { layout } from '$lib/free/stores/theme';
 	import { isPro } from '$lib/edition';
-	import { goto } from '$app/navigation';
 	import PageLayout from '$lib/free/components/PageLayout.svelte';
-	import { onMount } from 'svelte';
+	import LearningStatus from '$lib/free/components/LearningStatus.svelte';
+	import RAGStats from '$lib/free/components/RAGStats.svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import type { Component } from 'svelte';
 	import type { LoraTarget, DashboardLearningData, DashboardRagStats } from '$lib/free/api';
 	import { getLoraVersions, rollbackLora } from '$lib/free/api';
 	import {
+		DEFAULT_LEARNING_DATA,
+		DEFAULT_RAG_STATS,
+		fetchFreeDashboardData
+	} from '$lib/free/stores/dashboard';
+	import {
 		type ProComponentMap,
 		type DashboardLoraTargets,
 		type ImprovementSeries,
-		DEFAULT_LEARNING_DATA,
-		DEFAULT_RAG_STATS,
 		loadProComponents,
-		fetchDashboardData,
+		fetchProDashboardData,
 		mapLoraTarget,
 		emptyLoraSeries
 	} from '$lib/pro/stores/dashboard';
 
-	// Pro ガード: Free 版ではトップにリダイレクト
-	if (!isPro) {
-		goto('/');
-	}
+	const REFRESH_INTERVAL_MS = 30_000;
 
+	// Pro のみ動的ロード対象 (LoRA バージョン / 改善カーブは Pro 専用データのため)
 	const proLoaders = import.meta.glob<{ default: Component }>(
-		'/src/lib/pro/components/{LearningStatus,LoRAVersions,PerformanceChart,RAGStats}.svelte'
+		'/src/lib/pro/components/{LoRAVersions,PerformanceChart}.svelte'
 	);
 
 	let components: ProComponentMap | null = $state(null);
@@ -38,24 +40,47 @@
 	let improvement = $state<ImprovementSeries>({ base: [], assist: [] });
 	let ragStats: DashboardRagStats = $state({ ...DEFAULT_RAG_STATS });
 	let fetchError = $state(false);
+	let loaded = $state(false);
 
 	let gridCols = $derived($layout.dashboard.grid_columns);
 
-	onMount(async () => {
-		if (!isPro) return;
-
-		components = await loadProComponents(proLoaders);
-		if (!components) {
-			goto('/');
-			return;
+	async function refreshDashboardData() {
+		if (isPro) {
+			const [freeData, proData] = await Promise.all([
+				fetchFreeDashboardData(),
+				fetchProDashboardData()
+			]);
+			learningData = freeData.learningData;
+			ragStats = freeData.ragStats;
+			loraTargets = proData.loraTargets;
+			improvement = proData.improvement;
+			fetchError = freeData.hasError || proData.hasError;
+		} else {
+			const freeData = await fetchFreeDashboardData();
+			learningData = freeData.learningData;
+			ragStats = freeData.ragStats;
+			fetchError = freeData.hasError;
 		}
+	}
 
-		const data = await fetchDashboardData();
-		learningData = data.learningData;
-		loraTargets = data.loraTargets;
-		improvement = data.improvement;
-		ragStats = data.ragStats;
-		fetchError = data.hasError;
+	let refreshTimer: ReturnType<typeof setInterval> | undefined;
+
+	onMount(async () => {
+		if (isPro) {
+			const [loadedComponents] = await Promise.all([
+				loadProComponents(proLoaders),
+				refreshDashboardData()
+			]);
+			components = loadedComponents;
+		} else {
+			await refreshDashboardData();
+		}
+		loaded = true;
+		refreshTimer = setInterval(refreshDashboardData, REFRESH_INTERVAL_MS);
+	});
+
+	onDestroy(() => {
+		if (refreshTimer) clearInterval(refreshTimer);
 	});
 
 	async function handleRollback(target: LoraTarget, version: number) {
@@ -82,12 +107,12 @@
 </script>
 
 <PageLayout title={$t('sidebar.dashboard')}>
-	{#if components?.LearningStatus && components?.LoRAVersions && components?.PerformanceChart && components?.RAGStats}
+	{#if loaded}
 		{#if fetchError}
 			<p class="fetch-error">{$t('dashboard.fetch_error')}</p>
 		{/if}
 		<div class="dashboard-grid" style="grid-template-columns: repeat({gridCols}, 1fr)">
-			<components.LearningStatus
+			<LearningStatus
 				running={learningData.running}
 				experienceCount={learningData.experience_count}
 				newExperienceCount={learningData.new_experience_count}
@@ -109,22 +134,26 @@
 				fitnessHistory={learningData.fitness_history}
 				policyEvolverStatus={learningData.policy_evolver_status}
 			/>
-			<components.LoRAVersions
-				base={loraTargets.base}
-				assist={loraTargets.assist}
-				evalCasesCount={learningData.eval_cases_count}
-				evalPassThreshold={learningData.eval_pass_threshold}
-				onrollback={handleRollback}
-			/>
-			<components.PerformanceChart
-				baseScores={improvement.base}
-				assistScores={improvement.assist}
-				baseLabel={loraTargets.base.label}
-				assistLabel={loraTargets.assist.label}
-			/>
-			<components.RAGStats stats={ragStats} />
+			{#if isPro && components?.LoRAVersions}
+				<components.LoRAVersions
+					base={loraTargets.base}
+					assist={loraTargets.assist}
+					evalCasesCount={learningData.eval_cases_count}
+					evalPassThreshold={learningData.eval_pass_threshold}
+					onrollback={handleRollback}
+				/>
+			{/if}
+			{#if isPro && components?.PerformanceChart}
+				<components.PerformanceChart
+					baseScores={improvement.base}
+					assistScores={improvement.assist}
+					baseLabel={loraTargets.base.label}
+					assistLabel={loraTargets.assist.label}
+				/>
+			{/if}
+			<RAGStats stats={ragStats} />
 		</div>
-	{:else if isPro}
+	{:else}
 		<div class="loading">{$t('common.loading')}</div>
 	{/if}
 </PageLayout>

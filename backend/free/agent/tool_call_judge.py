@@ -755,6 +755,25 @@ class ToolCallJudge:
             return None
         if self._mem_view is None or self._embedder is None:
             return None
+        # クエリが実在するローカルファイルを明示参照している場合、URL recall の
+        # 無条件短絡はスキップし後段の判定層へ落とす。操作対象が具体的な
+        # ローカルファイルであるタスク (実インシデント: "Read <path>.xlsx /
+        # Apply monthly borders...") が、過去の無関係な URL 記憶と埋め込み
+        # 類似度だけで fetch_url へハイジャックされるのを決定論的に防ぐ。
+        # 書込み先ディレクトリ指定 (url_write 正規フロー) は is_file()=False の
+        # ため影響せず、後段の rule/learned 層が fetch_url を選べば
+        # ``_maybe_recall_url`` の URL 補完も引き続き機能する。
+        referenced = _extract_file_path(query)
+        if referenced:
+            try:
+                if Path(referenced).is_file():
+                    logger.info(
+                        "URL recall: skipped (query references existing "
+                        "local file %s)", referenced,
+                    )
+                    return None
+            except (OSError, ValueError):
+                pass
         recalled = await self._try_recall_url(query, mode=mode)
         if not recalled:
             return None
@@ -1719,9 +1738,13 @@ def _extract_file_path(query: str) -> str:
             # セグメント内部は空白を許容するため ("Program Files" 等)、末尾に
             # 地の文へ続く空白が巻き込まれることがある (例: "aa に保存して" の
             # "aa " )。rstrip() で末尾空白 (全角含む) を落としてから区切りも除去。
-            directory = _normalize_path_separators(
-                dir_match.group(1).rstrip(),
-            ).rstrip("\\/")
+            # さらに英語の地の文が空白のみで続くケース ("aa in Excel format") は
+            # 実在チェックで切り落とす。
+            directory = _trim_nonexistent_path_tail(
+                _normalize_path_separators(
+                    dir_match.group(1).rstrip(),
+                ).rstrip("\\/"),
+            )
             return f"{directory}\\{filename}"
         return f"{drive_match.group(1)}:\\{filename}"
 
@@ -1732,7 +1755,9 @@ def _extract_file_path(query: str) -> str:
     if drive_match:
         dir_match = _DIR_PATH_RE.search(query)
         if dir_match:
-            return _normalize_path_separators(dir_match.group(1).rstrip())
+            return _trim_nonexistent_path_tail(
+                _normalize_path_separators(dir_match.group(1).rstrip()),
+            )
 
     # 4. Unix パス: /home/user/file.txt
     m = re.search(r"(?:^|[\s　])((?:/[\w._-]+){2,})", query)
@@ -1778,6 +1803,39 @@ def _normalize_path_separators(path: str) -> str:
     """
     # 連続する2つ以上の \ を1つに置換
     return re.sub(r"\\{2,}", r"\\", path)
+
+
+def _trim_nonexistent_path_tail(path: str) -> str:
+    """実在チェックに基づき、パス末尾へ混入した自然文トークンを切り落とす。
+
+    ``_DIR_PATH_RE`` はセグメント内部の空白を許容する ("Program Files") ため、
+    LLM 生成のタスク記述がパス直後に空白 + 英語の修飾語を続けると
+    (実インシデント: ``...to C:\\...\\Desktop\\aa in Excel format``) 地の文が
+    末尾セグメントへ飲み込まれ、実在しない拡張子なしパスへの平文書込みに
+    化ける (リッチ文書経路・検証ゲートをすべてバイパス)。
+
+    捕捉パスが実在しない場合のみ、空白区切りトークンを右から 1 つずつ外し
+    ながら「実在する最長の空白境界プレフィックス」を探して返す。地の文の
+    混入は必ず空白境界で起きるため、バックスラッシュ境界では分割しない。
+    どのプレフィックスも実在しなければ原文のまま返す (新規パスの指定を
+    壊さない)。
+    """
+    try:
+        if not path or Path(path).exists():
+            return path
+    except (OSError, ValueError):
+        return path
+    candidate = path
+    while " " in candidate:
+        candidate = candidate.rsplit(" ", 1)[0].rstrip()
+        if not candidate or candidate.endswith(":"):
+            break
+        try:
+            if Path(candidate).exists():
+                return candidate
+        except (OSError, ValueError):
+            break
+    return path
 
 
 def _json_to_judgement(data: dict) -> ToolJudgement:

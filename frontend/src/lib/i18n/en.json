@@ -130,6 +130,7 @@
 		"level2_accumulating": "collecting",
 		"level2_noop": "no-op",
 		"level2_adapter_none": "no adapter",
+		"level2_sufficient_data": "sufficient data accumulated ({count})",
 		"level2_reason_noop_base_lora": "no-op (base=lora); set cvector",
 		"level2_reason_noop_assist_method": "no-op; set spsa-real-eval",
 		"level2_reason_bootstrap_disabled": "bootstrap disabled",
