@@ -214,3 +214,19 @@ async def reload_prompt_manager(state: AppState) -> None:
     instance_name = cfg.get("instance", {}).get("name", "evoref")
     state.prompt_manager = SystemPromptManager(prompt_dir, instance_name=instance_name)
     logger.info("PromptManager reloaded: instance_name=%s", instance_name)
+
+
+async def reload_i18n(state: AppState) -> None:  # noqa: ARG001
+    """i18n セクション変更時に locale / fallback をランタイム再適用する
+
+    UI メッセージと LLM 生成物 prose の出力言語 (``get_locale()`` 依存) を
+    再起動なしで追従させる。``prompt_locale`` はプロンプト再学習を伴う専用
+    エンドポイント (``POST /api/prompts/locale``) の管轄なのでここでは触れない。
+    """
+    from backend.i18n_helper import init_i18n
+
+    i18n_cfg = get_config().get("i18n", {})
+    locale = i18n_cfg.get("locale", "ja")
+    fallback = i18n_cfg.get("fallback", "ja")
+    init_i18n(locale=locale, fallback=fallback)
+    logger.info("i18n reloaded: locale=%s, fallback=%s", locale, fallback)

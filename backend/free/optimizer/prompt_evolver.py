@@ -197,6 +197,7 @@ class PromptEvolver:
         - conversation_ended=True → 成功（ユーザーが満足して離脱）
         - rephrased_query=True → 失敗（ユーザーが言い直した）
         - user_correction is not None → 失敗（ユーザーが訂正した）
+        - long_form_used かつ long_form_success=False → 失敗（生成物が検証エラー）
 
         候補テキストの特徴（長さ、キーワード含有）も考慮し、
         同一経験でも異なるプロンプトが異なるスコアを持つようにする。
@@ -229,6 +230,13 @@ class PromptEvolver:
             if signals.get("user_correction") is not None:
                 score -= weight * 0.8
 
+            # 長文生成 (coding モードの成果物) の検証失敗も失敗シグナル。
+            # coding モードは会話が単発で完結しがちで rephrase/user_correction が
+            # 皆無になりやすく (2026-07-17 実データで 21 件中 0 件)、この信号が
+            # ないと coding モードの経験が base_score に一切反映されない。
+            if signals.get("long_form_used") and signals.get("long_form_success") is False:
+                score -= weight * 0.5
+
             # RAG 使用はニュートラル
             total_weight += weight
 
@@ -248,10 +256,23 @@ class PromptEvolver:
 
         # 失敗した経験のクエリ主要語を、その候補がどれだけカバーしているか
         # (カバー率)。候補ごとに値が変わるため候補間識別の主因。最大 +0.1。
+        # rephrased_query/user_correction に加え、長文生成の検証失敗
+        # (long_form_used かつ long_form_success=False) も失敗経験として含める
+        # (coding モードは前者 2 シグナルがほぼ発生しないため、これが無いと
+        # failure_keywords が常に空集合になり全候補の fitness が完全に一致する
+        # = 進化が no-op 化する 2026-07-17 の実障害と同じ状態になる)。
         failure_keywords: set[str] = set()
         for exp in experiences:
             signals = exp.get("signals", {})
-            if signals.get("rephrased_query") or signals.get("user_correction"):
+            is_long_form_failure = (
+                signals.get("long_form_used")
+                and signals.get("long_form_success") is False
+            )
+            if (
+                signals.get("rephrased_query")
+                or signals.get("user_correction")
+                or is_long_form_failure
+            ):
                 failure_keywords.update(
                     _extract_query_terms(str(exp.get("query", ""))),
                 )

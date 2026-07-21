@@ -10,6 +10,7 @@ from backend.edition import get_pro_handler, is_pro
 from backend.free.api._error_responses import api_error
 from backend.free.api.learning._learning_collectors import (
     extract_executed_phases,
+    latest_level2_run,
     map_active_session,
     map_experience_by_mode,
     map_fitness_history,
@@ -263,7 +264,7 @@ def _build_scheduler_status(scheduler: object | None) -> SchedulerStatusModel:
         min_experiences=raw.get("min_experiences", 0),
         conditions_met=raw.get("conditions_met", False),
         last_level1_run=ts_to_iso(raw.get("last_level1_run", 0.0)),
-        last_level2_run=ts_to_iso(raw.get("last_level2_run", 0.0)),
+        last_level2_run=ts_to_iso(latest_level2_run(raw.get("last_level2_run", 0.0))),
         running_target=raw.get("running_target"),
         level2=map_level2_status(raw.get("level2")),
         # Level 0 詳細
@@ -273,6 +274,9 @@ def _build_scheduler_status(scheduler: object | None) -> SchedulerStatusModel:
         rag_usage_rate=raw.get("rag_usage_rate", 0.0),
         prev_correction_rate=raw.get("prev_correction_rate"),
         prev_rag_usage_rate=raw.get("prev_rag_usage_rate"),
+        rag_score_experience_count=raw.get("rag_score_experience_count", 0),
+        long_form_experience_count=raw.get("long_form_experience_count", 0),
+        phase_subset_min_experiences=raw.get("phase_subset_min_experiences", 0),
         # Level 1 詳細
         level1_run_count=raw.get("level1_run_count", 0),
         last_level1_results=level1_results,

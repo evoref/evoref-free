@@ -90,7 +90,7 @@ def _iter_command_pairs(
         for idx, note in enumerate(ordered):
             if not note.tool_command:
                 continue
-            if note.tool_command_name != "run_command":
+            if note.tool_command_name not in ("run_command", "run_command_readonly"):
                 continue
             # 直前で最も近い user note を探す
             user_note: "MemoryNote | None" = None

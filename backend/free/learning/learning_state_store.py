@@ -36,7 +36,10 @@ class LearningState:
     """
 
     last_level1_run: float = 0.0
-    last_level2_run: float = 0.0
+    #: target ("base"/"assist") ごとの最終 Level 2 実行時刻。base の失敗が
+    #: assist の overdue 判定まで巻き込んで 24h ブロックしていた回帰
+    #: (2026-07-18) の修正で、単一 float から target 別 dict へ分離した。
+    last_level2_run: dict[str, float] = field(default_factory=dict)
     level1_run_count: int = 0
     last_level1_results: dict[str, Any] = field(default_factory=dict)
     fitness_history: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
@@ -70,6 +73,31 @@ class LearningStateStore:
         }
 
     @staticmethod
+    def _deserialize_last_level2_run(raw: Any) -> dict[str, float]:
+        """``last_level2_run`` を target 別 dict へ正規化する。
+
+        旧フォーマット (単一 float、base/assist 共有) との後方互換: float の
+        場合は base/assist 両方に同じ値を適用する (旧仕様では両ターゲットの
+        実行がこの単一値を共有更新していたため、片方だけ「未実行」扱いに
+        してしまうと移行直後に不要な overdue 発火を招く)。
+        """
+        if isinstance(raw, dict):
+            result: dict[str, float] = {}
+            for k, v in raw.items():
+                if not isinstance(k, str):
+                    continue
+                try:
+                    result[k] = float(v or 0.0)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Skipping malformed last_level2_run entry: %r=%r", k, v,
+                    )
+            return result
+        if isinstance(raw, (int, float)) and raw:
+            return {"base": float(raw), "assist": float(raw)}
+        return {}
+
+    @staticmethod
     def deserialize(data: dict[str, Any]) -> LearningState:
         """raw JSON dict から `LearningState` を再構築する純粋関数。
 
@@ -95,7 +123,9 @@ class LearningStateStore:
 
         return LearningState(
             last_level1_run=float(data.get("last_level1_run", 0.0) or 0.0),
-            last_level2_run=float(data.get("last_level2_run", 0.0) or 0.0),
+            last_level2_run=LearningStateStore._deserialize_last_level2_run(
+                data.get("last_level2_run"),
+            ),
             level1_run_count=int(data.get("level1_run_count", 0) or 0),
             last_level1_results=dict(data.get("last_level1_results", {}) or {}),
             fitness_history=dict(data.get("fitness_history", {}) or {}),

@@ -180,6 +180,20 @@ class LearningScheduler:
         )
         # Level 2 base=C: control vector (既定 'lora' = 既存 SPSA/LoRA 経路、挙動変更なし)
         self.level2_base_method: str = learning.get("level2_base_method", "lora")
+        # base=spsa-real-eval: assist=B と対称の実推論 eval (既定は assist と同じ値)
+        self.base_realeval_spsa_iterations: int = int(
+            learning.get("base_realeval_spsa_iterations", 30)
+        )
+        self.base_eval_scratch_port: int = int(
+            learning.get("base_eval_scratch_port", 8091)
+        )
+        self.base_eval_loss_w1: float = float(learning.get("base_eval_loss_w1", 0.7))
+        self.base_eval_loss_w2: float = float(learning.get("base_eval_loss_w2", 0.3))
+        self.base_eval_max_tokens: int = int(learning.get("base_eval_max_tokens", 64))
+        self.base_eval_max_cases: int = int(learning.get("base_eval_max_cases", 20))
+        self.base_eval_health_timeout: int = int(
+            learning.get("base_eval_health_timeout", 120)
+        )
         self.cvector_method: str = learning.get("cvector_method", "pca")
         self.cvector_pca_batch: int = int(learning.get("cvector_pca_batch", 100))
         self.cvector_pca_iter: int = int(learning.get("cvector_pca_iter", 1000))
@@ -274,7 +288,11 @@ class LearningScheduler:
         # base/assist 個別の「学習中」表示用に Level2Runner が set/clear する。
         self._running_target: str | None = None
         self._last_run: float = 0.0
-        self._last_level2_run: float = 0.0
+        # target ("base"/"assist") 別の最終 Level 2 実行時刻。単一 float 共有
+        # だった旧仕様では、base (cvector) の失敗が assist (SPSA) の overdue
+        # 判定まで巻き込み、経験が閾値を超えていても 24h ブロックしていた
+        # 回帰 (2026-07-18) の修正で target 別 dict に分離した。
+        self._last_level2_run: dict[str, float] = {}
         self._level1_run_count: int = 0
         self._last_level1_results: dict = {}
         self._fitness_history: dict[str, list[dict]] = {}
@@ -302,8 +320,13 @@ class LearningScheduler:
         debug_logger=None,
         policy: PolicyInterpreter | None = None,
         disabled: bool = False,
+        resolver=None,
     ):
         self._policy = policy
+        # embed_instruction の保存先解決用 (embedding モデル単位パーティション)。
+        # 未注入 (レガシー構築 / 一部テスト) 時は prompt_manager.prompt_dir
+        # (base パーティション) にフォールバックする。
+        self._resolver = resolver
         learning = config.get("learning", {})
 
         # 設定値ロード (4 グループ)
@@ -356,7 +379,7 @@ class LearningScheduler:
             logger.info("Learning state file not found: %s", self._state_file)
             return
         self._last_run = state.last_level1_run
-        self._last_level2_run = state.last_level2_run
+        self._last_level2_run = dict(state.last_level2_run)
         self._level1_run_count = state.level1_run_count
         self._last_level1_results = state.last_level1_results
         self._fitness_history = state.fitness_history
@@ -365,7 +388,7 @@ class LearningScheduler:
         # 優先キューを復元
         self._priority_queue = state.priority_queue
         logger.info(
-            "Learning state loaded: L1=%.0f, L2=%.0f, runs=%d, path=%s",
+            "Learning state loaded: L1=%.0f, L2=%s, runs=%d, path=%s",
             self._last_run, self._last_level2_run,
             self._level1_run_count, self._state_file,
         )
@@ -411,20 +434,36 @@ class LearningScheduler:
         except Exception as e:
             logger.warning("Failed to save policy evolver state: %s", e)
 
-    def record_level2_run(self) -> None:
-        """Level 2 の実行時刻を記録して永続化する"""
-        self._last_level2_run = time.time()
+    def record_level2_run(self, target: str = "base") -> None:
+        """target ("base"/"assist") の Level 2 実行時刻を記録して永続化する"""
+        self._last_level2_run[target] = time.time()
         self._save_state()
 
-    def seconds_since_level2_run(self) -> float:
-        """前回 Level 2 実行からの経過秒。未実行 (_last_level2_run<=0) は inf。
+    def seconds_since_level2_run(self, target: str = "base") -> float:
+        """target の前回 Level 2 実行からの経過秒。未実行は inf。
 
         `_last_level2_run` は learning_state に永続化されるため、再起動を跨いで
         overdue 判定が継続する (SleepTimeScheduler の Level 2 常駐ループが参照)。
+        target 別に分離しているため、一方の失敗がもう一方の overdue 判定を
+        巻き込まない (2026-07-18 修正: 以前は単一値を共有していた)。
         """
-        if self._last_level2_run <= 0:
+        last = self._last_level2_run.get(target, 0.0)
+        if last <= 0:
             return float("inf")
-        return max(0.0, time.time() - self._last_level2_run)
+        return max(0.0, time.time() - last)
+
+    def next_level2_target(self) -> str:
+        """次に試行される Level 2 ターゲット ("base"/"assist") を返す。
+
+        Pro の ``Level2Runner`` が注入されていればその交互スケジュール状態
+        (公開プロパティ ``next_target``) を、Free 版 (runner 未注入) は
+        常に "base" を返す。overdue ゲート (SleepTimeScheduler の常駐ループ)
+        が「次に試す方の target」を対象に判定できるようにするための問い合わせ用。
+        """
+        runner = self._level2_runner
+        if runner is not None:
+            return str(getattr(runner, "next_target", "base"))
+        return "base"
 
     def set_user_active_checker(self, checker) -> None:
         """ユーザーアクティブ判定関数を設定（Level 2 中断用）"""
@@ -464,7 +503,11 @@ class LearningScheduler:
             # runtime embedder へ適用する (再起動後も進化結果を runtime に乗せる)。
             # ファイル不在時は何もしない (config 既定 instruction を尊重し、
             # _load_embed_instruction がデフォルトを書き出す副作用も避ける)。
-            ei_path = self.prompt_manager.prompt_dir / "embed_instruction.md"
+            # 保存先は _embed_instruction_dir() (embedding モデル単位パーティション)
+            # と一致させる必要がある — prompt_manager.prompt_dir 直読みだと
+            # _save_embed_instruction が書いた新パーティションを見落として
+            # 旧 (base パーティション) の古い内容で runtime を上書きしてしまう。
+            ei_path = self._embed_instruction_dir() / "embed_instruction.md"
             if ei_path.exists():
                 try:
                     txt = ei_path.read_text(encoding="utf-8").strip()
@@ -909,9 +952,6 @@ class LearningScheduler:
         await self._level1_phase4_token_budget(
             experiences, results, phase_durations,
         )
-        self._level1_phase5_pattern_weights(
-            experiences, results, phase_durations,
-        )
         self._level1_phase6_generation_params(
             experiences, results, phase_durations,
         )
@@ -1185,6 +1225,17 @@ class LearningScheduler:
         )
         rag_usage_rate = rag_used / total if total > 0 else 0.0
 
+        # phase3 (embed_instruction) / phase4 (token_budget) が実際に判定する
+        # 部分集合の経験数 (発火条件の可視化用。閾値は min_experiences // 2)。
+        rag_score_experience_count = sum(
+            1 for e in safe_exp
+            if e.get("signals", {}).get("rag_top1_score") is not None
+        )
+        long_form_experience_count = sum(
+            1 for e in safe_exp
+            if e.get("signals", {}).get("long_form_used")
+        )
+
         # 優先キューと active session のスナップショット
         priority_queue_view = [
             {
@@ -1230,6 +1281,10 @@ class LearningScheduler:
             "experience_by_mode": {"chat": chat_count, "coding": coding_count},
             "correction_rate": round(correction_rate, 3),
             "rag_usage_rate": round(rag_usage_rate, 3),
+            # phase3/phase4 部分集合条件の可視化 (閾値は min_experiences // 2)
+            "rag_score_experience_count": rag_score_experience_count,
+            "long_form_experience_count": long_form_experience_count,
+            "phase_subset_min_experiences": max(1, self.min_experiences // 2),
             # 前回 Level 1 時点からのトレンド
             "prev_correction_rate": self._prev_correction_rate,
             "prev_rag_usage_rate": self._prev_rag_usage_rate,
@@ -1607,10 +1662,16 @@ class LearningScheduler:
             e for e in experiences
             if e.get("signals", {}).get("rag_top1_score") is not None
         ]
-        if len(rag_exp) < self.min_experiences:
+        # 部分集合 (RAG 使用ターンのみ) への閾値は全体 min_experiences ではなく
+        # phase6 (generation_params) と同じ min_experiences // 2 を使う。全体閾値
+        # をそのまま課すと、Level 1 発火自体は total >= min_experiences で足りる
+        # のに部分集合はそれより小さくなりがちで、この phase だけ実質発火不能に
+        # なっていた (2026-07-17 の自己学習ログ監査で判明)。
+        threshold = max(1, self.min_experiences // 2)
+        if len(rag_exp) < threshold:
             logger.debug(
                 "Level 1 embed instruction skipped: %d RAG experiences < %d",
-                len(rag_exp), self.min_experiences,
+                len(rag_exp), threshold,
             )
             return
 
@@ -1670,10 +1731,12 @@ class LearningScheduler:
             e for e in experiences
             if e.get("signals", {}).get("long_form_used")
         ]
-        if len(lf_exp) < self.min_experiences:
+        # phase3 と同じ理由で部分集合閾値を min_experiences // 2 に緩和。
+        threshold = max(1, self.min_experiences // 2)
+        if len(lf_exp) < threshold:
             logger.debug(
                 "Level 1 token budget skipped: %d long-form experiences < %d",
-                len(lf_exp), self.min_experiences,
+                len(lf_exp), threshold,
             )
             return
 
@@ -1687,20 +1750,9 @@ class LearningScheduler:
         if budget_result:
             results["token_budget"] = budget_result
 
-    def _level1_phase5_pattern_weights(
-        self,
-        experiences: list[dict],
-        results: dict[str, dict],
-        phase_durations: dict[str, float],
-    ) -> None:
-        """パターン重み進化"""
-        if self._cancelled or self._learned_patterns is None:
-            return
-        tp = time.monotonic()
-        pattern_result = self._evolve_pattern_weights(experiences)
-        phase_durations["phase5_pattern_weights"] = round(time.monotonic() - tp, 3)
-        if pattern_result:
-            results["learned_patterns"] = pattern_result
+    # 旧 phase5 (correction パターン重み進化) は 2026-07-21 に learned
+    # correction 機構ごと廃止した (feedback._detect_correction docstring 参照)。
+    # phase 番号は欠番のまま維持する (phase6/7 のリネームは行わない)。
 
     def _level1_phase6_generation_params(
         self,
@@ -1958,25 +2010,80 @@ class LearningScheduler:
         emb.set_instruction(text, mode=None)
         logger.info("Applied evolved embed instruction to live embedder")
 
+    def _embed_instruction_dir(self) -> Path:
+        """embed_instruction.md 系データの保存先ディレクトリ (embedding モデル単位)。
+
+        resolver 未注入 (レガシー構築 / 一部テスト) の場合は従来通り
+        ``prompt_manager.prompt_dir`` (base パーティション) にフォールバックする。
+        """
+        if self._resolver is not None:
+            return self._resolver.resolve_embed_instruction_dir()
+        return self.prompt_manager.prompt_dir
+
     def _load_embed_instruction(self) -> str:
-        """embed_instruction.md を読み込む（なければデフォルト生成）"""
+        """embed_instruction.md を読み込む（なければデフォルト生成）
+
+        2026-07-18: 保存先を base モデルパーティションから embedding モデル
+        パーティションへ変更 (embed_instruction は埋め込みモデル向けのクエリ
+        指示であり base モデル切替と無関係に保持されるべきだったため)。旧
+        base パーティションに残る従来データがあれば一度だけ新パスへコピーして
+        引き継ぐ (非破壊: 旧ファイルは残置)。
+        """
         from backend.free.optimizer.embed_instruction_evolver import (
             DEFAULT_EMBED_INSTRUCTION,
         )
-        prompt_dir = self.prompt_manager.prompt_dir
-        path = prompt_dir / "embed_instruction.md"
+        embed_dir = self._embed_instruction_dir()
+        path = embed_dir / "embed_instruction.md"
         if path.exists():
             return path.read_text(encoding="utf-8")
+
+        embed_dir.mkdir(parents=True, exist_ok=True)
+        legacy_path = self._find_legacy_embed_instruction_source()
+        if embed_dir != self.prompt_manager.prompt_dir and legacy_path is not None:
+            content = legacy_path.read_text(encoding="utf-8")
+            path.write_text(content, encoding="utf-8")
+            logger.info(
+                "Migrated embed_instruction.md from legacy base partition "
+                "(%s) to %s", legacy_path, path,
+            )
+            return content
+
         # デフォルトを書き込んで返す
-        prompt_dir.mkdir(parents=True, exist_ok=True)
         path.write_text(DEFAULT_EMBED_INSTRUCTION, encoding="utf-8")
         logger.info("Created default embed_instruction.md")
         return DEFAULT_EMBED_INSTRUCTION
 
+    def _find_legacy_embed_instruction_source(self) -> Path | None:
+        """旧 base パーティション群から embed_instruction.md の移行元を探す。
+
+        embed_instruction は本来 base モデルと独立のはずが、旧実装では base
+        パーティション (prompt_manager.prompt_dir) に同居していた。base モデルを
+        複数回切り替えた履歴がある場合、active なモデルのものだけを見ると、
+        過去に切り替えた別モデル配下でより進化した instruction を見落とし
+        永久に不可視化する (2026-07-18 のレビューで判明)。resolver が使える
+        場合は全 base パーティションを走査し、更新日時が最も新しいものを選ぶ
+        (どのモデルが「最も進化しているか」を厳密には判定できないため、直近の
+        Level 1 サイクルで更新されたものを優先する近似)。
+        """
+        legacy_path = self.prompt_manager.prompt_dir / "embed_instruction.md"
+        candidates: set[Path] = set()
+        if legacy_path.exists():
+            candidates.add(legacy_path.resolve())
+        if self._resolver is not None:
+            learning_dir = self._resolver.resolve_local("learning_dir")
+            if learning_dir.is_dir():
+                candidates.update(
+                    p.resolve()
+                    for p in learning_dir.glob("*/prompts/embed_instruction.md")
+                )
+        if not candidates:
+            return None
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
     def _save_embed_instruction(self, content: str) -> None:
         """embed_instruction.md を保存（保護セクション検証付き）"""
-        prompt_dir = self.prompt_manager.prompt_dir
-        path = prompt_dir / "embed_instruction.md"
+        embed_dir = self._embed_instruction_dir()
+        path = embed_dir / "embed_instruction.md"
 
         # 保護セクション最終ゲート
         current = self._load_embed_instruction()
@@ -1987,7 +2094,7 @@ class LearningScheduler:
             content = restore_protected_sections(current, content)
 
         # 履歴に退避
-        history_dir = prompt_dir / "history"
+        history_dir = embed_dir / "history"
         history_dir.mkdir(parents=True, exist_ok=True)
         if path.exists():
             # 簡易バージョン番号: 既存履歴の数 + 1
@@ -1999,68 +2106,6 @@ class LearningScheduler:
         path.write_text(content, encoding="utf-8")
         logger.info("Embed instruction updated: %s", path)
 
-    # ── パターン重み進化 ──
-
-    def _evolve_pattern_weights(self, experiences: list[dict]) -> dict | None:
-        """correction パターンの重みを経験バッファに基づいて進化させる
-
-        学習パターンが訂正を正しく検出できた経験ではマッチした correction
-        パターンをブーストし、訂正でない正常終了の経験で correction パターンが
-        ヒットした場合は誤検知とみなして減衰させる (誤検知し続ける弱パターンは
-        ``decay_one`` の min_weight 割れ削除で自然淘汰される)。対象は
-        ``category="correction"`` に限定する (category 未指定だと tool_routing /
-        long_form / rephrase で学習した語まで横断ヒットし無関係なパターンを
-        汚染する)。boost / decay 量は store の ``pattern_boost_amount`` /
-        ``pattern_decay_rate`` 設定に委ねる。LLM 不要。
-
-        Returns:
-            {"boosted": int, "decayed": int, "total": int} or None
-        """
-        if self._learned_patterns is None:
-            return None
-
-        store = self._learned_patterns
-        if store.count == 0:
-            return None
-
-        boosted = 0
-        decayed = 0
-
-        for exp in experiences:
-            signals = exp.get("signals", {})
-            query = exp.get("query", "")
-
-            if signals.get("correction_detected_by") == "learned":
-                # 学習パターンが訂正を正しく検出 → correction 検出器を強化
-                for kw, _ in store.match(query, category="correction"):
-                    store.boost(kw)
-                    boosted += 1
-
-            elif signals.get("conversation_ended") and not signals.get("user_correction"):
-                # 訂正でない正常終了で correction パターンがヒット = 誤検知
-                # → 減衰させ、誤検知し続ける弱パターンは min_weight 割れで自然削除
-                for kw, _ in store.match(query, category="correction"):
-                    store.decay_one(kw)
-                    decayed += 1
-
-        # 永続化
-        try:
-            from backend.config import get_path_resolver
-            resolver = get_path_resolver()
-            patterns_file = resolver.resolve_local("learned_patterns_file")
-            store.save(patterns_file)
-        except Exception as e:
-            logger.warning("Failed to save learned patterns after evolution: %s", e)
-
-        logger.info(
-            "pattern evolution: boosted=%d, decayed=%d, total=%d patterns",
-            boosted, decayed, store.count,
-        )
-        return {
-            "boosted": boosted,
-            "decayed": decayed,
-            "total": store.count,
-        }
 
     # ── ツール誘導パターン重み進化──
 
@@ -2106,8 +2151,15 @@ class LearningScheduler:
                     decayed += 1
 
             if signals.get("tool_routing_false_negative"):
-                # 未検出: クエリからキーワードを抽出して追加
-                keywords = store.extract_intent_keywords(query)
+                # 未検出: クエリからキーワードを抽出して追加。
+                # extract_tool_routing_keywords がツールシグナル無しクエリ /
+                # 話題名詞 / 言語タスク語 (「説明」等) を除外する
+                # (FeedbackCollector._learn_tool_routing_from_false_negative
+                # と同一ゲート。従来ここは無ゲートの extract_intent_keywords
+                # で、feedback 側 2026-07-18 ガードで弾いた経験からも Level 1
+                # バッチで再学習される穴があり、「コーヒー」「天気」等の
+                # 話題名詞 62 件が tool_routing に蓄積していた)
+                keywords = store.extract_tool_routing_keywords(query)
                 for kw in keywords:
                     store.add_pattern(kw, category="tool_routing")
                     added += 1

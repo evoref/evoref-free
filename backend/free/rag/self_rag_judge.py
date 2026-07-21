@@ -71,9 +71,37 @@ QUESTION_PATTERNS = re.compile(
 )
 
 # 自明な質問パターン (RAG 不要の即 skip 確定)
-# 時刻 / 日付 / 曜日 / 自己同一性 / 簡単な雑談を捕捉する。`FORCE_PATTERNS`
-# (教えて / 調べて等) より優先順位が低いため、「教えて、今は何時？」のような
-# 知識要求を伴うクエリは retrieve に倒れる。
+# 時刻 / 日付 / 曜日 / 自己同一性 / 簡単な雑談 / セッション自己参照を捕捉する。
+# `FORCE_PATTERNS` (教えて / 調べて等) より優先順位が低いため、「教えて、
+# 今は何時？」のような知識要求を伴うクエリは retrieve に倒れる。
+#
+# 「この会話で」等のセッション自己参照は、会話履歴が既にコンテキストに
+# 含まれておりカートリッジ/LTM 横断検索の対象ではないため skip する
+# (pillar境界のため backend/free/agent/tool_call_judge.py の
+# _SELF_SESSION_REFERENCE_PATTERNS と同義の定義を重複させている。両ファイルを
+# 変更する際は同期させること)。
+# 実インシデント: 「この会話で一番面白かったやり取りは？」が31文字で
+# QUESTION_PATTERNS の長文分岐(>=30char)にマッチし retrieve に倒れ、
+# 無関係な過去セッションのチャンクがヒットして混同された。
+# ただし「この会話」等の言及だけで無条件 skip にすると、「この会話の続き
+# ですが、量子もつれについて詳しく教えて」のように自己参照を前置きにしつつ
+# 外部知識を要する質問まで retrieve をスキップしてしまう (レビューで発見)。
+# そのため、会話自体を振り返る反省的な語 (面白い/振り返る/まとめ/感想等) との
+# 近接共起を要求し、外部知識質問への誤爆を防ぐ。
+# 近接窓は「同一文内 (句点・疑問符・感嘆符を跨がない) の 40 文字以内」。
+# 旧実装の任意文字 {0,20} は「この会話で一番最初に私が計算させた問題は
+# 何だったか覚えてますか？」(間 21 文字) を 1 文字超過で取りこぼし retrieve
+# に倒れていた (2026-07-20 ライブ再検証で確認)。一方、窓を任意文字のまま
+# {0,50} へ広げるだけでは「この会話とは別に、相対性理論について詳しく
+# 教えてください。とても面白いですよね？」のような外部知識質問まで誤って
+# マッチする (過去レビューで判明) ため、(a) 文境界を跨がない文字クラスで
+# 窓を絞り、(b) 「とは別/とは関係」等の明示的な話題切断の前置きを negative
+# lookahead で弾く、の二重ガード付きで窓を 40 に広げる
+# (tool_call_judge.py 側と同期)。
+# 反省的な語には時系列順序語 (最初/最後/何番目/何回目) も含める
+# (2026-07-21: 「この会話で一番最初に計算させた問題は?」が反省語を欠き
+# 非マッチ → retrieve に倒れ cross-session チャンク混同のリスク)。順序語で
+# マッチ面が広がる分「じゃなく/ではなく」の話題切断も lookahead へ追加。
 TRIVIAL_QUESTION_PATTERNS = re.compile(
     r"(今.{0,3}(何時|何分|時刻|時間)"
     r"|今日.{0,3}(何月|何日|何曜)"
@@ -90,7 +118,13 @@ TRIVIAL_QUESTION_PATTERNS = re.compile(
     r"|お元気"
     r"|調子はどう"
     r"|元気\?"
-    r"|元気？)",
+    r"|元気？"
+    r"|(?:この会話|このやり取り|今までの(?:会話|やり取り)"
+    r"|今日の(?:追加分の)?会話|今回の(?:追加分の)?会話)"
+    r"(?!とは別|とは関係|は関係な|じゃなく|ではなく)"
+    r"[^。．!！?？\n]{0,40}?"
+    r"(?:面白|印象|振り返|まとめ|要約|感想|どう思|覚えて|何でした|どうでした"
+    r"|最初|最後|何番目|何回目))",
 )
 
 # ファイルパス検出 (Windows ドライブレター / Unix 拡張子付きパス)。
@@ -104,11 +138,20 @@ FILE_PATH_PATTERN = re.compile(
 
 # コード / ドキュメント生成意図。router の LONG_FORM_PATTERNS と
 # 一貫させた語彙 (docs/f_03_agent_engine.md §1.2 参照)。
+# 保存/書き出し/テンプレート系の語彙も自己完結の生成タスクとして扱う
+# (2026-07-15: 「〜を作って <path> に保存して」が skip されず 13 件の
+# 無関連チャンク + 7〜10 秒の判定コストが乗った)。
 CODE_DOC_GEN_INTENT_PATTERNS = re.compile(
-    r"(?:作成|実装|生成|書いて|書く|出力|"
-    r"仕様書|設計書|要件定義|計画書|手順書|README|"
-    r"create|implement|generate|write)",
+    r"(?:作成|作って|実装|生成|書いて|書く|出力|保存|書き出|エクスポート|"
+    r"仕様書|設計書|要件定義|計画書|手順書|テンプレート|ひな形|雛形|README|"
+    r"create|implement|generate|write|save|export)",
     re.IGNORECASE,
+)
+
+# how-to / 教示質問マーカー。ファイルパスを含んでいても「方法を教えて」系の
+# 知識質問は生成タスクではないため、write-intent 早期 skip から除外する。
+_HOWTO_QUESTION_RE = re.compile(
+    r"(?:教えて|おしえて|方法|どうやって|どうすれば|とは|って何|ですか|ますか)",
 )
 
 # uncertain 化の最大クエリ長。これより長い質問は QUESTION_PATTERNS
@@ -273,6 +316,27 @@ class RetrievalNecessityJudge:
             )
             return "skip"
 
+        # 3.5. ファイル参照 + コード/ドキュメント生成意図 → skip
+        # 例: "C:\path\spec.txt を参照してテトリスを Python で作成"
+        #     "議事録テンプレートを作って C:\path\minutes.md に保存して"
+        # ユーザが提示したファイルを文脈とする新規生成/書出しタスクで、
+        # local KB (SemMem / 履歴) には引き当てるべき情報がない。
+        # この時点で RAG 全工程 (assist 判定 + embedding + LTM) を
+        # 早期 skip して 10 秒以上のレイテンシを排除する。
+        # QUESTION より先に評価する: 生成依頼の付帯表現 (「〜が欲しいです」等)
+        # が質問マーカーに食われて uncertain → assist 判定 (5 秒) に流れるのを
+        # 防ぐ。ただし how-to 質問 (「作成する方法を教えて」) は除外する。
+        if (
+            FILE_PATH_PATTERN.search(query_stripped)
+            and CODE_DOC_GEN_INTENT_PATTERNS.search(query_stripped)
+            and not _HOWTO_QUESTION_RE.search(query_stripped)
+        ):
+            logger.debug(
+                "Necessity: skip (file path + code/doc-gen intent: %r)",
+                query_stripped[:60],
+            )
+            return "skip"
+
         # 4. 質問マーカー (SKIP より優先)
         # 「発売日はいつ」が SKIP の "はい" substring にヒットして誤って
         # skip されないよう、QUESTION を SKIP より先に評価する。
@@ -288,20 +352,6 @@ class RetrievalNecessityJudge:
                 query_stripped[:50],
             )
             return "retrieve"
-
-        # 4.5. ファイル参照 + コード/ドキュメント生成意図 → skip
-        # 例: "C:\path\spec.txt を参照してテトリスを Python で作成"
-        # ユーザが提示したファイルを文脈とする新規生成タスクで、
-        # local KB (SemMem / 履歴) には引き当てるべき情報がない。
-        # この時点で RAG 全工程 (assist 判定 + embedding + LTM) を
-        # 早期 skip して 10 秒以上のレイテンシを排除する。
-        if FILE_PATH_PATTERN.search(query_stripped) and \
-                CODE_DOC_GEN_INTENT_PATTERNS.search(query_stripped):
-            logger.debug(
-                "Necessity: skip (file path + code/doc-gen intent: %r)",
-                query_stripped[:60],
-            )
-            return "skip"
 
         # 5. スキップパターン (挨拶/相槌) — 短文のみ
         if SKIP_PATTERNS.search(query_stripped) and len(query_stripped) < 20:
@@ -448,16 +498,24 @@ class RetrievalNecessityJudge:
                 timeout=timeout_s,
             )
         except asyncio.TimeoutError:
-            logger.warning("Necessity assist: timeout after %.1fs", timeout_s)
+            # fail-closed: タイムアウト時は skip に倒す。fail-open (retrieve)
+            # だとタイムアウト税 (timeout_s) + 無関連チャンク添付の二重コストに
+            # なる (2026-07-15: timeout 2/3 が retrieve に倒れて 13 件の過去
+            # 雑談ノートがコンテキストに注入された)。ここに来るのは rule が
+            # uncertain と判定した短い質問のみで、検索スキップの損失は小さい。
+            logger.warning(
+                "Necessity assist: timeout after %.1fs (fail-closed to skip)",
+                timeout_s,
+            )
             if debug_logger is not None:
                 debug_logger.log_decision(
                     decision_point="self_rag_necessity_path",
-                    chosen="retrieve",
+                    chosen="skip",
                     candidates=["retrieve", "fetch", "skip"],
                     reason="assist_timeout",
                     scope="request",
                 )
-            return "retrieve"
+            return "skip"
         except Exception as e:
             logger.warning("Necessity assist: failed (%s)", type(e).__name__)
             if debug_logger is not None:

@@ -17,6 +17,7 @@ from backend.free.llm._base_client import (
 from backend.free.llm.model_metadata import ModelMetadata
 from backend.free.llm.utils import extract_content
 from backend.log_config import get_logger
+from backend.utils import estimate_tokens
 
 logger = get_logger("llm.local_client")
 
@@ -324,6 +325,7 @@ class LocalClient(BaseHTTPClient):
         debug_logger=None,
         client_think_budget: int = 0,
         on_runaway: str = "fallback",
+        context_size: int | None = None,
     ):
         super().__init__(timeout=120.0)
         self.url = llama_url
@@ -333,6 +335,9 @@ class LocalClient(BaseHTTPClient):
         self._enable_thinking = enable_thinking
         self._stream_first_token_timeout = stream_first_token_timeout
         self._debug_logger = debug_logger
+        # 送信前コンテキスト超過ガード用の n_ctx (config llama.context_size)。
+        # None なら無効 (テスト経路 / 旧呼出互換)。
+        self._context_size = context_size
         # 暴走 reasoning watchdog (docs/c_15 B3)。profile.reasoning から解決。
         # client_think_budget>0 のとき、未閉じ <think> がこの chunk 数を超えたら
         # ストリームを中断する (thinking=0 モデルの runaway 上限化)。サーバ側で
@@ -390,6 +395,89 @@ class LocalClient(BaseHTTPClient):
 
         return rest
 
+    # 送信前ガードの安全マージン (チャットテンプレート展開 / 推定誤差の吸収分)
+    _CTX_GUARD_MARGIN = 192
+    # 1 メッセージあたりのテンプレートオーバーヘッド見積り (role トークン等)
+    _CTX_GUARD_PER_MSG = 4
+    # 単一メッセージ切り詰めの下限文字数 (これ以下には削らない)
+    _CTX_GUARD_MIN_CONTENT_CHARS = 2000
+
+    def _estimate_prompt_tokens(self, messages: list[dict]) -> int:
+        """messages 全体のプロンプトトークン数を高速見積りする。"""
+        return sum(
+            estimate_tokens(str(m.get("content") or "")) + self._CTX_GUARD_PER_MSG
+            for m in messages
+        )
+
+    def _enforce_context_budget(self, messages: list[dict]) -> list[dict]:
+        """送信前にプロンプトが n_ctx を超えないよう再トリムする。
+
+        build_messages は静的予約でトリムするが、deliberative / meta_cognitive
+        経路はその後にツール結果・既存ファイル内容等を追加注入するため、
+        送信時点で n_ctx を超過して llama-server が HTTP 400 を返すことがある
+        (2026-07-15: 5584 > 4096 でストリーム破壊、4204 > 4096 でフォールバック)。
+        最終防衛として (1) 古い非 system メッセージの除去 → (2) 最大メッセージ
+        の中間切除、の順で予算内へ収める。``context_size`` 未設定なら no-op。
+        """
+        if not self._context_size or not messages:
+            return messages
+        budget = self._context_size - self._CTX_GUARD_MARGIN
+        estimate = self._estimate_prompt_tokens(messages)
+        if estimate <= budget:
+            return messages
+
+        logger.warning(
+            "Prompt exceeds context budget (est=%d > budget=%d, n_ctx=%d); "
+            "re-trimming before send", estimate, budget, self._context_size,
+        )
+        # (1) 先頭の system 群と末尾メッセージ (現在ターン) を保持し、
+        #     間の古いメッセージから順に落とす
+        trimmed = list(messages)
+        while len(trimmed) > 2 and self._estimate_prompt_tokens(trimmed) > budget:
+            for i, m in enumerate(trimmed[:-1]):
+                if m.get("role") != "system":
+                    dropped = trimmed.pop(i)
+                    logger.info(
+                        "Context guard dropped %s message (%d chars)",
+                        dropped.get("role"), len(str(dropped.get("content") or "")),
+                    )
+                    break
+            else:
+                break
+
+        # (2) それでも超過する場合は最大メッセージの中間を切除する
+        #     (system プロンプト先頭 / クエリ末尾のような重要部を残す)
+        for _ in range(20):
+            if self._estimate_prompt_tokens(trimmed) <= budget:
+                break
+            idx = max(
+                range(len(trimmed)),
+                key=lambda i: len(str(trimmed[i].get("content") or "")),
+            )
+            content = str(trimmed[idx].get("content") or "")
+            if len(content) <= self._CTX_GUARD_MIN_CONTENT_CHARS:
+                break
+            keep_head = int(len(content) * 0.5)
+            keep_tail = int(len(content) * 0.25)
+            new_content = (
+                content[:keep_head]
+                + "\n…(コンテキスト予算超過のため中略)…\n"
+                + content[-keep_tail:]
+            )
+            trimmed[idx] = {**trimmed[idx], "content": new_content}
+            logger.info(
+                "Context guard truncated %s message: %d -> %d chars",
+                trimmed[idx].get("role"), len(content), len(new_content),
+            )
+
+        final = self._estimate_prompt_tokens(trimmed)
+        if final > budget:
+            logger.warning(
+                "Context guard could not fully fit prompt (est=%d > budget=%d); "
+                "sending as-is", final, budget,
+            )
+        return trimmed
+
     def _build_payload(
         self,
         messages: list[dict],
@@ -406,6 +494,7 @@ class LocalClient(BaseHTTPClient):
     ) -> dict:
         """共通ペイロード構築"""
         msgs = self._apply_system_fallback(messages)
+        msgs = self._enforce_context_budget(msgs)
 
         payload: dict = {
             "messages": msgs,

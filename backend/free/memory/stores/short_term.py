@@ -18,6 +18,13 @@ from backend.free.memory.types import MemoryMode, NoteSource, TaskStatus
 
 logger = get_logger("memory.short_term")
 
+# pin 済みノート (pin_flag=True) への検索スコア加点。sim(0-1) と
+# lightmem_score(0-1) の合成値 (最大1.0) に対する加点のため、1.0 を超えても
+# 他ノートとの相対順位にのみ影響し実害はない。pin は従来 eviction 保護にのみ
+# 使われ retrieve_top_k のランキングには反映されていなかったギャップの是正
+# (docs/f_02_memory_system.md 参照)。
+_PIN_RETRIEVAL_BOOST: float = 0.15
+
 
 @dataclass
 class MemoryNote:
@@ -295,6 +302,8 @@ class ShortTermMemory:
                 continue
             sim = float(np.dot(note.embedding, query_vec))
             combined = sim * 0.6 + note.lightmem_score * 0.4
+            if note.pin_flag:
+                combined += _PIN_RETRIEVAL_BOOST
             scored.append((note, combined))
 
         if skipped_dim > 0:

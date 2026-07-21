@@ -28,6 +28,24 @@ def get_locale() -> str:
     return _locale
 
 
+# LLM 生成物 prose の出力言語指示に使う言語名 (ja 表記, en 表記)。
+_PROSE_LANGUAGE_NAMES: dict[str, tuple[str, str]] = {
+    "ja": ("日本語", "Japanese"),
+    "en": ("英語", "English"),
+}
+
+
+def prose_language_name(*, english: bool = False) -> str:
+    """成果物 prose の出力言語名 (生成時点の locale を反映)。
+
+    日本語テンプレートへは既定 (日本語表記)、英語テンプレートへは
+    ``english=True`` (英語表記) で埋め込む。未知 locale は英語へフォールバック。
+    import 時に焼き込まず、必ず生成時点で呼ぶこと。
+    """
+    names = _PROSE_LANGUAGE_NAMES.get(get_locale(), _PROSE_LANGUAGE_NAMES["en"])
+    return names[1] if english else names[0]
+
+
 def msg(key: str, **kwargs) -> str:
     """
     メッセージ取得。ドット区切りのキーでネストをたどる。

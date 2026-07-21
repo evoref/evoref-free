@@ -31,7 +31,16 @@ LONG_FORM_PATTERNS = [
         r"仕様書|設計書|要件定義|計画書|手順書|README|読本)"
         r".*(書|作成|生成|まとめ|出力)",
     ),
-    re.compile(r"長(い|文|編)"),
+    # 「長文」「長編」の言及、または「長い」+ 創作文書系名詞 (物語/小説等、
+    # pattern[1] の文書名詞リストには含まれない) の言及が、生成依頼のて形
+    # 動詞と共起する場合に長文生成として拾う。
+    # 「一番長い川」のような一般形容詞や、「長文が重複生成されている」といった
+    # (受身形の) バグ報告文自体の誤爆を防ぐため、pattern[1] と異なりて形の
+    # 完全一致を要求する (「生成」の bare stem だと「生成され」にも誤って一致する)。
+    re.compile(
+        r"(?:長(?:文|編)|長い(?:物語|小説|エッセイ|詩|お話))"
+        r".*(?:書いて|作成して|生成して|まとめて|出力して)",
+    ),
     re.compile(
         r"(ファイル|モジュール|クラス|プロジェクト)"
         r".*(一式|全体|まるごと|フル).*(作成|生成|実装)",
@@ -71,6 +80,17 @@ _WRITE_VERB_RE = re.compile(
     r"|(?<![A-Za-z])output(?![A-Za-z]))",
     re.IGNORECASE,
 )
+# 表形式データの出力先拡張子。long_form (散文ユニット分割) では表構造を
+# 生成できないため、これらへの書出し意図は long_form 判定より優先して
+# local_write_intent (write-fast 経路) に振る。
+_TABULAR_TARGET_RE = re.compile(
+    r"\.(?:csv|tsv|xlsx|ods)(?![A-Za-z])", re.IGNORECASE,
+)
+
+# 学習済み long_form パターン単独発火の抑止床。閾値以上の一致が 1 語のみの
+# 場合、その重み合計がこの値以上でなければ long_form に分類しない。
+_LEARNED_LONG_FORM_MIN_WEIGHT_SUM = 0.8
+
 # how-to / 質問形マーカー。「作成する方法を教えて」のような書込み動詞を含む
 # 知識質問を local_write_intent から除外する。``_is_knowledge_query`` は
 # 「一覧を…」等のデータ語を広く拾い正当な書込みコマンドまで除外してしまうため、
@@ -92,10 +112,19 @@ COMPLEX_KEYWORDS = [
 ]
 
 # 履歴検索が必要なキーワード → Deliberative 層
+# 「覚えて」「最初に」は当初リストに含まれておらず、20+ ターンの長い会話で
+# 「この会話の最初に〜覚えてますか」型の recall 質問が reactive の既定分岐
+# (step 12) まで素通りし、reactive_light 経路 (直近 REACTIVE_LIGHT_HISTORY_TURNS
+# 件のみ・SemMem/STM 注入なし) に落ちて古いターンの内容を想起できない実インシデントが
+# あった (2026-07-19)。deliberative に昇格させれば build_semmem_injection 経由で
+# STM ノート (pin ブースト込み) が注入されるため、search_history ツール発火の有無に
+# 関わらず recall 精度が回復する。
 HISTORY_KEYWORDS = [
     "前に", "以前", "先週", "先月", "この間", "前回", "前の会話",
-    "さっき", "昨日", "今朝", "先ほど",
+    "さっき", "昨日", "今朝", "先ほど", "最初に", "覚えて", "覚えてる",
+    "覚えている",
     "earlier", "previously", "last time", "yesterday", "before",
+    "remember", "recall",
 ]
 
 # Meta-Cognitive 層へのエスカレーションキーワード（同義語拡張済み）
@@ -222,7 +251,15 @@ class ComplexityClassifier:
             )
 
         # 1.5. 長文生成判定 → meta_cognitive（Orchestrator に委任）
+        #   ただし表形式データ出力先 (.csv/.tsv/.xlsx/.ods) はユニット分割の
+        #   散文生成が構造を壊すため (2026-07-15: annual_events.csv が 26 unit
+        #   の散文 CSV 化)、long_form を抑止して write-fast 経路へ落とす。
         if self._detect_long_form(query):
+            if self._is_tabular_write_intent(query, mode):
+                self.is_long_form = False
+                return self._record_classification(
+                    self._guard_meta_cognitive(), "local_write_intent", query,
+                )
             self.is_long_form = True
             return self._record_classification(
                 self._guard_meta_cognitive(), "long_form", query,
@@ -427,6 +464,17 @@ class ComplexityClassifier:
             return False
         return bool(_WRITE_VERB_RE.search(query))
 
+    def _is_tabular_write_intent(self, query: str, mode: str = "chat") -> bool:
+        """表形式データ (.csv/.tsv/.xlsx/.ods) のローカル書出し意図を検出する。
+
+        long_form (散文ユニット分割) では表構造の成果物を生成できないため、
+        long_form 判定に勝つ優先ゲートとして使う。ローカル書込み意図と
+        表形式拡張子の双方が揃った場合のみ True。
+        """
+        if not self._is_local_write_intent(query, mode):
+            return False
+        return bool(_TABULAR_TARGET_RE.search(query))
+
     def _detect_long_form(self, query: str) -> bool:
         """長文生成リクエストかどうかを判定
 
@@ -443,13 +491,22 @@ class ComplexityClassifier:
         return self._contains_learned_long_form_patterns(query)
 
     def _contains_learned_long_form_patterns(self, query: str) -> bool:
-        """学習済み long_form パターンにマッチするか判定"""
+        """学習済み long_form パターンにマッチするか判定
+
+        単一キーワード hit での発火は一般語の自己強化ループを招く
+        (2026-07-15: 「文書」「明日」等の学習語 1 hit で朝礼メモや CSV 依頼が
+        ユニット分割パイプラインへ流出)。閾値以上の一致が 2 語以上、または
+        重み合計が ``_LEARNED_LONG_FORM_MIN_WEIGHT_SUM`` 以上の場合のみ発火する。
+        """
         if self._learned_patterns is None:
             return False
         matches = self._learned_patterns.match(query, category="long_form")
         if not matches:
             return False
-        return matches[0][1] >= self._long_form_threshold
+        eligible = [w for _, w in matches if w >= self._long_form_threshold]
+        if len(eligible) >= 2:
+            return True
+        return sum(eligible) >= _LEARNED_LONG_FORM_MIN_WEIGHT_SUM
 
     def _is_knowledge_query(self, query: str) -> bool:
         """知識質問パターンを検出（RAG で処理すべきクエリ）"""

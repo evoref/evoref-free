@@ -31,6 +31,7 @@ from backend.free.generation.models import (
 )
 from backend.free.generation.spec_renderer import render_spec_for_prompt
 from backend.free.llm.json_schemas import CodePlan, TextPlan
+from backend.i18n_helper import prose_language_name
 
 logger = logging.getLogger("backend.free.generation.strategy_common")
 
@@ -78,6 +79,8 @@ TEXT_UNIT_SYSTEM = """\
 - 文章は自然な段落で区切り、1文ごとに改行を入れないでください。
 - 本文の内容そのものだけを出力してください。\
 執筆意図・方針・プロセスの説明などメタ的な記述は一切含めないでください。
+- 特に指定が無い限り、本文は{output_language}で書いてください\
+（見出し・要点が別言語ならその言語に合わせる）。
 - このセクションの目標文字数は約{unit_target_chars}文字です。必ずこの文字数に近い量を生成してください。\
 短すぎる出力は不可です。
 {global_context}"""
@@ -613,9 +616,12 @@ def build_text_unit_messages(
     )
     system = budget.fit_content(
         "system_prompt",
+        # output_language は新規生成テンプレートのみが持つ (継続テンプレートは
+        # 既存テキストの言語追従が正のため指示しない。余剰 kwarg は無害)
         system_template.format(
             global_context=plan.global_context,
             unit_target_chars=unit_target_chars,
+            output_language=prose_language_name(),
         ),
     )
 

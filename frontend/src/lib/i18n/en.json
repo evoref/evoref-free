@@ -199,31 +199,6 @@
 		"applied": "Settings applied",
 		"apply_failed": "Failed to apply settings",
 		"reset": "Reset",
-		"presets": {
-			"title": "Performance preset",
-			"description": "Switch inference / RAG settings in one click to match your hardware.",
-			"light": {
-				"label": "Lightweight",
-				"description": "Minimal VRAM/RAM. Smaller KV cache. For weak GPU / iGPU."
-			},
-			"balanced": {
-				"label": "Balanced",
-				"description": "Standard settings. 8K context. Default for most setups."
-			},
-			"performance": {
-				"label": "High performance",
-				"description": "2 parallel slots. Prioritizes RAG quality and response concurrency. For GPUs with headroom."
-			},
-			"confirm": "Apply the \"{name}\" preset? Inference / RAG settings will be overwritten.",
-			"applied": "Preset applied",
-			"apply_failed": "Failed to apply preset",
-			"restart_required": "A server restart is required to take effect",
-			"restart_button": "Restart servers",
-			"restarting": "Restarting...",
-			"restart_done": "Servers restarted",
-			"restart_failed": "Failed to restart servers",
-			"current_badge": "Active"
-		},
 		"unsaved_changes": "Unsaved changes",
 		"show": "Show",
 		"hide": "Hide",

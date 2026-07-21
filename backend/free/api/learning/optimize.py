@@ -65,7 +65,7 @@ def _level2_methods(scheduler) -> dict:
     assist_method = getattr(scheduler, "level2_assist_method", "none") if scheduler else "none"
     if base_method == "cvector":
         active = "cvector"
-    elif assist_method == "spsa-real-eval":
+    elif base_method == "spsa-real-eval" or assist_method == "spsa-real-eval":
         active = "spsa-real-eval"
     else:
         active = "none"

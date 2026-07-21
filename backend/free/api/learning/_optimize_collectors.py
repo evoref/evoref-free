@@ -21,6 +21,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
+from backend.free.api.learning._learning_collectors import latest_level2_run
 from backend.free.api.learning._optimize_schemas import (
     AssistTaskStatus,
     PromptHistoryEntry,
@@ -142,7 +143,7 @@ def format_run_timestamps(
     if not scheduler_status:
         return None, None
     last_l1 = _format_iso_or_none(float(scheduler_status.get("last_level1_run", 0.0) or 0.0))
-    last_l2 = _format_iso_or_none(float(scheduler_status.get("last_level2_run", 0.0) or 0.0))
+    last_l2 = _format_iso_or_none(latest_level2_run(scheduler_status.get("last_level2_run")))
     return last_l1, last_l2
 
 

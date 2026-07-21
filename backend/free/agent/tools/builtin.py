@@ -33,11 +33,33 @@ _last_full_output_lines: int = 0
 # 出力切り詰めマーカー / exit code マーカー（共通定数モジュールから import）
 from backend.free.constants import COMMAND_EXIT_CODE_PREFIX, TRUNCATION_MARKER
 
+# read_file / search_code が読み込むファイルの上限サイズ。models/ (GGUF, 数十GB) 等の
+# 巨大バイナリを誤って text として全文読み込みすると、CPython の GIL が長時間手放されず
+# 別スレッド実行下でもイベントループを事実上ブロックする (実インシデントで確認済み)。
+# 通常のソースファイルはこれより十分小さい。
+_TOOL_MAX_FILE_READ_BYTES = 2_000_000
+
 # 安全な計算用に許可するノード
 _SAFE_NODES = {
     ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
     ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow, ast.FloorDiv,
     ast.USub, ast.UAdd,
+}
+
+# 非許可ノードごとの自己修正ヒント。LLM が同一ターン内でエラーを見て
+# 書き直せるよう、そのノードが生じがちな典型的な誤記法を指す (実インシデント:
+# 「πr²」を "π*5^2" と書いて BitXor に、「GCD」を "gcd(360,504)" と書いて
+# Call になり、いずれもエラー後は手計算にフォールバックしていた)。
+_DISALLOWED_NODE_HINTS: dict[str, str] = {
+    "BitXor": "use ** for exponentiation, not ^ (^ is bitwise XOR here)",
+    "Call": (
+        "function calls (e.g. gcd(), sqrt()) are not supported; "
+        "compute the result manually step-by-step instead"
+    ),
+    "Name": (
+        "symbolic constants (e.g. pi, e) are not supported; "
+        "inline the numeric value instead (e.g. 3.14159)"
+    ),
 }
 
 
@@ -46,8 +68,13 @@ def calculate(expression: str) -> str:
     try:
         tree = ast.parse(expression, mode="eval")
         for node in ast.walk(tree):
+            node_name = type(node).__name__
             if type(node) not in _SAFE_NODES:
-                return f"Error: Unsafe expression (disallowed node: {type(node).__name__})"
+                msg = f"Error: Unsafe expression (disallowed node: {node_name})"
+                hint = _DISALLOWED_NODE_HINTS.get(node_name)
+                if hint:
+                    msg += f" -- {hint}"
+                return msg
         result = eval(compile(tree, "<calc>", "eval"), {"__builtins__": {}})
         return str(result)
     except Exception as e:
@@ -62,6 +89,12 @@ def read_file(file_path: str) -> str:
     if not p.is_file():
         return f"Error: Not a file: {file_path}"
     try:
+        size = p.stat().st_size
+        if size > _TOOL_MAX_FILE_READ_BYTES:
+            return (
+                f"Error: file too large to read ({size} bytes, "
+                f"limit {_TOOL_MAX_FILE_READ_BYTES}): {file_path}"
+            )
         content = p.read_text(encoding="utf-8")
         # 大きすぎるファイルは切り詰め
         if len(content) > 50000:
@@ -288,11 +321,18 @@ def search_code(pattern: str, directory: str = ".", max_results: int = 20) -> st
         return f"Error: Directory not found: {directory}"
 
     for root, dirs, files in os.walk(base):
-        # 隠しディレクトリ・一般的な除外をスキップ
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"node_modules", "__pycache__", ".git"}]
+        # 隠しディレクトリ・一般的な除外 + モデル/ローカルデータ (数十GB級バイナリ/
+        # 大量の実行時データを含み、ソースコードではない) をスキップ
+        dirs[:] = [
+            d for d in dirs
+            if not d.startswith(".")
+            and d not in {"node_modules", "__pycache__", ".git", "models", "local"}
+        ]
         for fname in files:
             fpath = Path(root) / fname
             try:
+                if fpath.stat().st_size > _TOOL_MAX_FILE_READ_BYTES:
+                    continue
                 text = fpath.read_text(encoding="utf-8", errors="ignore")
                 for i, line in enumerate(text.splitlines(), 1):
                     if regex.search(line):
@@ -1013,22 +1053,54 @@ def _make_run_command(config: dict):
     return wrapped
 
 
+def _make_run_command_readonly(config: dict):
+    """run_command_readonly ハンドラを生成（config をクロージャでバインド）
+
+    chat モードの executable query (時刻 / OS / スペック等) 専用。実行前に
+    ``reject_readonly_violation`` で読み取り専用 (書込 / 削除 / 導入 /
+    ネットワーク送信なし) を検証し、通過したコマンドのみ ``run_command``
+    本体へ委譲する (危険コマンドガード / 対話コマンドガードは本体側で適用)。
+    判定層のバグや将来コードの誤用があっても、chat から破壊コマンドを実行
+    できない構造的保証をこのラッパが担う。
+    """
+
+    async def wrapped(command: str, timeout: int = 30) -> str:
+        from backend.free.agent.safety_patterns import reject_readonly_violation
+
+        reject = reject_readonly_violation(command)
+        if reject is not None:
+            logger.warning(
+                "Readonly command rejected (%s): %s", reject, command[:100],
+            )
+            return f"Error: readonly violation: {reject}"
+        return await run_command(command, timeout, config)
+
+    return wrapped
+
+
 def _make_search_history(manager: HistoryManager):
     """search_history ツールハンドラを生成（HistoryManager をクロージャでバインド）"""
 
     def search_history(query: str, mode: str | None = None, limit: int = 10,
-                       date_from: str | None = None, date_to: str | None = None) -> str:
-        """過去の会話履歴を検索する"""
+                       date_from: str | None = None, date_to: str | None = None,
+                       session_id: str | None = None) -> str:
+        """過去の会話履歴を検索する
+
+        ``session_id`` は LLM 向けツールスキーマには公開しない
+        (ToolCallJudge がセッション自己参照質問に対してのみ code 側で
+        強制注入する。LLM が任意の session_id を指定できると他セッションの
+        意図的な絞り込み回避に使われかねないため)。
+        """
         try:
             results = manager.search_sessions(
                 query=query, mode=mode, limit=limit, search_turns=False,
-                date_from=date_from, date_to=date_to,
+                date_from=date_from, date_to=date_to, session_id=session_id,
             )
             # 結果が少ない場合のみターン検索で再検索
             if len(results) < limit:
                 results = manager.search_sessions(
                     query=query, mode=mode, limit=limit, search_turns=True,
-                    date_from=date_from, date_to=date_to,
+                    date_from=date_from, date_to=date_to, session_id=session_id,
                 )
             if not results:
                 return f"No results found for: {query}"
@@ -1068,9 +1140,22 @@ def register_builtin_tools(
     registry.register(
         name="calculate",
         func=calculate,
-        description="Evaluate a mathematical expression safely",
+        description=(
+            "Evaluate a Python-syntax arithmetic expression safely (numeric "
+            "literals + - * / % ** // and parentheses only)"
+        ),
         parameters={
-            "expression": {"type": "string", "description": "Math expression to evaluate"},
+            "expression": {
+                "type": "string",
+                "description": (
+                    "Use ** for exponentiation, NOT ^ (which is bitwise XOR in "
+                    "this sandbox and will error). Function calls (e.g. gcd(), "
+                    "sqrt()) and symbolic constants (e.g. pi, e) are NOT "
+                    "supported -- inline the numeric value instead (e.g. 3.14159 "
+                    "instead of pi), and compute functions like gcd manually "
+                    "step-by-step rather than calling them."
+                ),
+            },
         },
     )
 
@@ -1133,6 +1218,25 @@ def register_builtin_tools(
             "command": {"type": "string", "description": "Shell command to execute"},
         },
         modes=["coding"],
+    )
+
+    # chat モードの executable query (時刻 / OS / スペック等) 専用。
+    # hidden=True で LLM プロンプトのツール一覧には出さず、tool_call_judge の
+    # executable 経路 (_executable_tool_for_mode) がコード側から注入する。
+    # mode ゲート (2026-07-18) を変えずに chat のシステム情報クエリを復活
+    # させるための登録 (2026-07-21 回帰対策、docs/f_03_agent_engine.md §3.1)。
+    registry.register(
+        name="run_command_readonly",
+        func=_make_run_command_readonly(cfg),
+        description=(
+            "Execute a read-only shell command for environment facts "
+            "(injected by the tool judge; not directly selectable)"
+        ),
+        parameters={
+            "command": {"type": "string", "description": "Read-only shell command to execute"},
+        },
+        modes=["chat"],
+        hidden=True,
     )
 
     registry.register(
@@ -1199,7 +1303,15 @@ def register_builtin_tools(
             func=_make_search_history(history_manager),
             description="Search past conversation history by keyword and/or date range",
             parameters={
-                "query": {"type": "string", "description": "Search query"},
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Keywords to search for, NOT the user's question verbatim "
+                        "(e.g. use 'Rust' rather than 'what is the user's favorite "
+                        "programming language?'). Extract the key noun(s)/proper "
+                        "noun(s) from the request."
+                    ),
+                },
                 "mode": {"type": "string", "description": "Filter by mode (chat/coding)"},
                 "limit": {"type": "integer", "description": "Maximum number of results (default: 10)"},
                 "date_from": {"type": "string", "description": "Start date in ISO 8601 format (e.g. '2026-03-01')"},

@@ -126,6 +126,11 @@ class SchedulerStatusModel(BaseModel):
     rag_usage_rate: float = 0.0
     prev_correction_rate: float | None = None
     prev_rag_usage_rate: float | None = None
+    # phase3 (embed_instruction) / phase4 (token_budget) 部分集合条件の可視化
+    # (閾値は phase_subset_min_experiences)
+    rag_score_experience_count: int = 0
+    long_form_experience_count: int = 0
+    phase_subset_min_experiences: int = 0
     # Level 1 詳細
     level1_run_count: int = 0
     last_level1_results: dict[str, Level1ResultEntry] = Field(default_factory=dict)

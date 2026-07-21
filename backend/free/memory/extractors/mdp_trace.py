@@ -63,11 +63,22 @@ MEM_DECISION_PREFIX = "mem.decision."
 _FAILURE_KEYWORDS = ("fail", "error", "exception", "abort")
 
 
-def _is_failure_outcome(outcome: str) -> bool:
+def _is_failure_outcome(outcome: str, steps: list[dict[str, Any]] | None = None) -> bool:
+    """エピソード outcome が失敗かを判定する。
+
+    outcome 文字列のキーワードに加え、``partial`` で全ステップ reward 0 の
+    エピソードも失敗として扱う (2026-07-15: write 不発の誤ルーティング 2 件が
+    outcome=partial / reward=0.0 で decision ファクト化され、failure_pattern が
+    1 件も生成されなかった)。
+    """
     if not outcome:
         return False
     s = outcome.lower()
-    return any(k in s for k in _FAILURE_KEYWORDS)
+    if any(k in s for k in _FAILURE_KEYWORDS):
+        return True
+    if s == "partial" and steps:
+        return all(not (st.get("reward") or 0) for st in steps)
+    return False
 
 
 def episode_task_and_result(steps: list[dict[str, Any]]) -> tuple[str, str]:
@@ -220,7 +231,15 @@ class MDPTraceExtractor(BaseExtractor):
             steps = ep["steps"]
             last_actions = [str(s.get("action") or "") for s in steps[-3:]]
             task_desc, last_observation = episode_task_and_result(steps)
-            if _is_failure_outcome(outcome):
+            # begin イベントの実行モード (chat/coding) を fact の mode_origin へ
+            # 反映する。クラス既定 "coding" のままだとチャットセッション由来の
+            # decision ファクトが coding パーティションを汚染する (2026-07-15:
+            # 21 件全件が mode_origin="coding" で取り込まれた)。
+            begin = ep.get("begin") or {}
+            episode_mode = str(begin.get("mode") or "") or self.mode
+            if episode_mode not in ("chat", "coding"):
+                episode_mode = self.mode
+            if _is_failure_outcome(outcome, steps):
                 fact = self._build_failure_fact(
                     episode_id=episode_id,
                     outcome=outcome,
@@ -239,6 +258,7 @@ class MDPTraceExtractor(BaseExtractor):
                     scope=scope,
                     ctx=ctx,
                 )
+            fact.mode_origin = episode_mode  # type: ignore[assignment]
             result.facts.append(fact)
             self._processed_episode_ids.add(episode_id)
 

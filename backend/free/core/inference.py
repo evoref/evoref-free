@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from backend.free.api.chat.chat_constants import (
@@ -195,26 +196,68 @@ def _select_semmem_block(
     return labeled, remaining - cost
 
 
+#: few-shot ブロックの token 上限。無上限だとセッション中に数千 token へ膨張し
+#: (2026-07-15: 2739 tokens → 3 回全ドロップ = 学習効果ゼロ、通常時も履歴予算を
+#: 圧迫)、all-or-nothing ドロップで無意味化する。上限内へ例単位で切り詰める。
+_FEWSHOT_TOKEN_CAP = 600
+
+#: format_fewshot_section の例区切り (### Example N)
+_FEWSHOT_EXAMPLE_SPLIT_RE = re.compile(r"(?=^### Example \d+$)", re.MULTILINE)
+
+
+def _truncate_fewshot_to_budget(block: str, budget: int) -> str | None:
+    """few-shot ブロックを例単位で budget token 内に切り詰める。
+
+    ヘッダ (## Few-shot Examples) + 先頭から入る分の例だけを残す。
+    1 例も入らない場合は None。
+    """
+    parts = _FEWSHOT_EXAMPLE_SPLIT_RE.split(block)
+    if len(parts) <= 1:
+        return block if _estimate_tokens(block) <= budget else None
+    header, examples = parts[0], parts[1:]
+    kept = header
+    for ex in examples:
+        candidate = kept + ex
+        if _estimate_tokens(candidate) > budget:
+            break
+        kept = candidate
+    if kept.strip() == header.strip():
+        return None
+    return kept.rstrip() + "\n"
+
+
 def _select_fewshot_block(
     fewshot_block: str | None,
     remaining: int,
 ) -> tuple[str | None, int]:
-    """few-shot ブロックを予算内なら採用する (全采否、部分切り出しなし)。
+    """few-shot ブロックを予算内へ切り詰めて採用する。
 
     ``format_fewshot_section`` の出力は先頭に改行を含むため lstrip して返す
-    (動的ブロックの先頭要素になるため)。
+    (動的ブロックの先頭要素になるため)。予算は ``remaining`` と
+    ``_FEWSHOT_TOKEN_CAP`` の小さい方。超過分は例単位で部分注入する
+    (all-or-nothing ドロップだと膨張時に学習効果がゼロになる)。
     """
     if not fewshot_block or remaining <= 0:
         return None, remaining
     block = fewshot_block.lstrip("\n")
     if not block:
         return None, remaining
+    budget = min(remaining, _FEWSHOT_TOKEN_CAP)
     cost = _estimate_tokens(block)
-    if cost > remaining:
+    if cost > budget:
+        truncated = _truncate_fewshot_to_budget(block, budget)
+        if truncated is None:
+            logger.debug(
+                "fewshot block dropped (%d tokens > budget %d, no example fits)",
+                cost, budget,
+            )
+            return None, remaining
+        new_cost = _estimate_tokens(truncated)
         logger.debug(
-            "fewshot block dropped (%d tokens > remaining %d)", cost, remaining,
+            "fewshot block truncated: %d -> %d tokens (budget %d)",
+            cost, new_cost, budget,
         )
-        return None, remaining
+        return truncated, remaining - new_cost
     logger.debug("fewshot block injected: %d tokens", cost)
     return block, remaining - cost
 

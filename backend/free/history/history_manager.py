@@ -6,17 +6,75 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field, asdict
 from datetime import timedelta
+from functools import lru_cache
 from pathlib import Path
 
 from backend.free.history.utils import parse_iso, snippet_around
+from backend.free.rag.bm25_retriever import tokenize_ja
 from backend.io import atomic_write_text
 from backend.log_config import get_logger
 from backend.utils import utc_now_dt
 
 logger = get_logger("history.manager")
+
+# トークン重なり判定で「一致」とみなす、クエリの unique トークンに対する
+# 最小重なり割合 (端数切上げ)。完全部分文字列一致に失敗した自然文クエリの
+# 救済用フォールバックだが、日本語 bi-gram は「の天」「日の」のような助詞
+# 絡みの連結詞的トークンが無関係なテキスト間でも偶然重なりやすいため、
+# 過剰マッチを避ける程度には厳しめに取る (レビューで実際に false positive
+# の可能性を指摘された)。
+_TOKEN_OVERLAP_RATIO = 0.7
+# クエリの unique トークン数がこれ未満ならトークン重なりフォールバックを
+# 適用しない (= マッチ扱いにしない)。トークン数が少なすぎると、たまたま
+# 1〜2 個の助詞絡み bi-gram が重なっただけで誤マッチしうるため。単語程度の
+# 短いクエリは完全部分文字列一致 (高速パス) で既に救済されている前提。
+_TOKEN_OVERLAP_MIN_QUERY_TOKENS = 5
+
+
+@lru_cache(maxsize=64)
+def _tokenize_cached(text: str) -> frozenset[str]:
+    """``tokenize_ja`` の結果をキャッシュする。
+
+    1 回の検索 (search_sessions/list_sessions) で同一のクエリ文字列に対して
+    最大で「対象エントリ数 × 3 (summary/topics/search_text)」回呼ばれうる
+    ため、同一入力の再トークン化を避ける。
+    """
+    return frozenset(tokenize_ja(text))
+
+
+def _text_matches_query(text: str, query_lower: str) -> bool:
+    """テキストがクエリにマッチするか (完全部分文字列一致 → トークン重なりの順で判定)。
+
+    まず従来通りの完全部分文字列一致を試す (高速・単語クエリでの後方互換)。
+    失敗した場合は ``tokenize_ja`` (ASCII 語 + 日本語文字 bi-gram) で
+    クエリ・対象テキスト双方をトークン化し、クエリの unique トークンの
+    ``_TOKEN_OVERLAP_RATIO`` 以上が対象テキストに含まれるかで判定する
+    (クエリのトークン数が ``_TOKEN_OVERLAP_MIN_QUERY_TOKENS`` 未満なら
+    フォールバック自体を適用しない)。
+
+    自然文クエリ (助詞・句読点を含む) は過去ログ原文と一字一句連続一致
+    することがほぼ無く、完全部分文字列一致のみだと長期記憶検索のヒット率が
+    著しく低くなる (実インシデント: 「私の好きなプログラミング言語は？」が
+    ヒットせず、「Rust」という単語だけならヒットする現象を確認済み)。
+    """
+    if not text:
+        return False
+    text_lower = text.lower()
+    if query_lower in text_lower:
+        return True
+    query_tokens = _tokenize_cached(query_lower)
+    if len(query_tokens) < _TOKEN_OVERLAP_MIN_QUERY_TOKENS:
+        return False
+    target_tokens = _tokenize_cached(text_lower)
+    if not target_tokens:
+        return False
+    overlap = len(query_tokens & target_tokens)
+    required = math.ceil(len(query_tokens) * _TOKEN_OVERLAP_RATIO)
+    return overlap >= required
 
 
 @dataclass
@@ -168,11 +226,11 @@ def _complete_session_metadata(session: SessionData) -> None:
 def _score_entry(entry: IndexEntry, query_lower: str) -> float:
     """エントリの検索スコア計算（純粋関数）"""
     score = 0.0
-    if entry.summary and query_lower in entry.summary.lower():
+    if _text_matches_query(entry.summary, query_lower):
         score += 1.0
-    if any(query_lower in t.lower() for t in entry.topics):
+    if any(_text_matches_query(t, query_lower) for t in entry.topics):
         score += 0.5
-    if entry.search_text and query_lower in entry.search_text.lower():
+    if _text_matches_query(entry.search_text, query_lower):
         score += 0.5
     return score
 
@@ -182,9 +240,16 @@ def _find_matched_turns(session: SessionData, query_lower: str) -> list[dict]:
     matched: list[dict] = []
     for i, turn in enumerate(session.turns):
         content = turn.get("content", "")
-        if query_lower not in content.lower():
+        if not _text_matches_query(content, query_lower):
             continue
-        preview = snippet_around(content, query_lower, context=50)
+        # snippet_around はクエリの完全部分文字列一致を前提とするため、
+        # トークン重なりのみで一致したケース (完全一致しない) は先頭からの
+        # プレビューにフォールバックする。
+        preview = (
+            snippet_around(content, query_lower, context=50)
+            if query_lower in content.lower()
+            else (content[:100] + "…" if len(content) > 100 else content)
+        )
         matched.append({
             "index": i,
             "role": turn.get("role", ""),
@@ -410,7 +475,7 @@ class HistoryManager:
             matched: list[IndexEntry] = []
             for e in entries:
                 if e.search_text:
-                    if q_lower in e.search_text.lower():
+                    if _text_matches_query(e.search_text, q_lower):
                         matched.append(e)
                 else:
                     # search_text 未設定エントリは検索対象外（起動時に補完済みのはず）
@@ -449,16 +514,23 @@ class HistoryManager:
         date_to: str | None = None,
         limit: int = 10,
         search_turns: bool = False,
+        session_id: str | None = None,
     ) -> list[dict]:
         """セッション検索（全文検索）
 
         list_sessions でフィルタ済みのエントリをスコアリングし、
         search_turns=True 時はスコア上位 limit 件のみにターンマッチを適用する。
+
+        ``session_id`` 指定時は該当セッションのみに絞り込む。「この会話で」
+        等のセッション自己参照質問を他セッションの内容と混同しないための
+        スコープ限定 (呼出元は ``ToolCallJudge._maybe_scope_session_search``)。
         """
         entries, _ = self.list_sessions(
             limit=1000, mode=mode, date_from=date_from, date_to=date_to,
             query=query,
         )
+        if session_id:
+            entries = [e for e in entries if e.session_id == session_id]
 
         q_lower = query.lower()
 

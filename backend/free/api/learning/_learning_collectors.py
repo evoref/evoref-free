@@ -49,6 +49,22 @@ def ts_to_iso(ts: float | None) -> str | None:
     return _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(ts))
 
 
+def latest_level2_run(raw_last_level2_run: object) -> float:
+    """target 別 dict (``{"base": ts, "assist": ts}``) から最新の実行時刻を取る。
+
+    ``LearningScheduler.get_status()`` の ``last_level2_run`` は 2026-07-18 の
+    修正で単一 float から target 別 dict へ変わった。API 層はまだ単一の
+    「最終 Level 2 実行時刻」表示のままなので、target 別の最大値に潰して返す
+    (旧フォーマットの単一 float / 未設定値との後方互換も保つ)。
+    """
+    if isinstance(raw_last_level2_run, dict):
+        values = [v for v in raw_last_level2_run.values() if isinstance(v, (int, float))]
+        return max(values) if values else 0.0
+    if isinstance(raw_last_level2_run, (int, float)):
+        return float(raw_last_level2_run)
+    return 0.0
+
+
 # ── Level 1 結果マッピング ────────────────────────────────────
 
 

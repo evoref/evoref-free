@@ -15,12 +15,19 @@ logger = get_logger("agent.tools_registry")
 
 @dataclass
 class ToolDefinition:
-    """ツール定義"""
+    """ツール定義
+
+    ``hidden=True`` のツールは ``get_descriptions_text()`` (LLM プロンプトの
+    ツール一覧) に出さない。judge 等のコード側注入専用ツール
+    (例: run_command_readonly) 向けで、search_history の session_id パラメータ
+    非公開 (parameters から省く) のツール版に相当する。
+    """
     name: str
     func: Callable
     description: str
     parameters: dict[str, Any] = field(default_factory=dict)
     modes: list[str] = field(default_factory=lambda: ["chat", "coding"])
+    hidden: bool = False
 
 
 class ToolsRegistry:
@@ -36,6 +43,7 @@ class ToolsRegistry:
         description: str,
         parameters: dict[str, Any] | None = None,
         modes: list[str] | None = None,
+        hidden: bool = False,
     ) -> None:
         """ツールを登録"""
         self._tools[name] = ToolDefinition(
@@ -44,6 +52,7 @@ class ToolsRegistry:
             description=description,
             parameters=parameters or {},
             modes=modes or ["chat", "coding"],
+            hidden=hidden,
         )
         logger.info("Registered tool: %s", name)
 
@@ -55,6 +64,18 @@ class ToolsRegistry:
         """ツール定義を取得"""
         return self._tools.get(name)
 
+    def is_available(self, name: str, mode: str) -> bool:
+        """ツールが登録済みかつ現在の ``mode`` で利用可能か。
+
+        ``has(name)`` (存在チェックのみ) と異なり ``ToolDefinition.modes`` も
+        考慮する。tool_call_judge.py の各判定層 (rule/learned/executable
+        fallback/recall) と deliberative.py の実行前ゲートが、同じ「存在 +
+        mode 適合」判定をそれぞれ個別に書いていた重複を解消するための共通口
+        (2026-07-18 レビューで指摘)。
+        """
+        tool_def = self._tools.get(name)
+        return tool_def is not None and mode in tool_def.modes
+
     def get_descriptions_text(self, mode: str | None = None) -> str:
         """ツール説明をテキスト形式で返す（プロンプト注入用）
 
@@ -64,6 +85,8 @@ class ToolsRegistry:
         """
         lines = []
         for tool in self._tools.values():
+            if tool.hidden:
+                continue
             if mode and mode not in tool.modes:
                 continue
             required = self._required_param_names(tool)

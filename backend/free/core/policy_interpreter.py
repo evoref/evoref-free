@@ -154,7 +154,10 @@ def _default_policies() -> dict[str, dict]:
                 "bm25_weight": {"min": 0.0, "max": 1.0, "type": "float"},
                 "vector_weight": {"min": 0.0, "max": 1.0, "type": "float"},
                 "rrf_k": {"min": 1, "max": 200, "type": "int"},
-                "top_k": {"min": 1, "max": 50, "type": "int"},
+                # max=50 だと L1 進化が品質向上なしに取得件数だけ膨張させる
+                # (2026-07-15: top_k=13 まで学習しコンテキストを圧迫)。
+                # iGPU の prefill 速度とコンテキスト予算に対し 10 を上限とする。
+                "top_k": {"min": 1, "max": 10, "type": "int"},
                 "candidates_multiplier": {"min": 1, "max": 10, "type": "int"},
                 "rescore_candidates": {"min": 0, "max": 200, "type": "int"},
                 "hybrid_search": {"type": "bool"},
@@ -208,7 +211,10 @@ def _default_policies() -> dict[str, dict]:
             },
             "constraints": {
                 "unit_max_tokens": {"min": 256, "max": 8192, "type": "int"},
-                "unit_target_tokens": {"min": 128, "max": 4096, "type": "int"},
+                # min=128 だと L1 進化が下限に張り付き、parse_plan の 200 トークン
+                # クランプと組み合わさって全ユニットが機械的に倍分割される
+                # (2026-07-15: 13→26 units / 464 秒)。512 を床にする。
+                "unit_target_tokens": {"min": 512, "max": 4096, "type": "int"},
                 "extend_threshold_ratio": {"min": 0.1, "max": 1.0, "type": "float"},
                 "max_extend_rounds": {"min": 1, "max": 50, "type": "int"},
             },

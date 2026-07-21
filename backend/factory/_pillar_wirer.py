@@ -122,6 +122,9 @@ async def _init_llama_server(
             debug_logger=debug_logger,
             client_think_budget=think_budget,
             on_runaway=on_runaway,
+            # 送信前コンテキスト超過ガード用 (slots>1 でも launch_llama が
+            # --kv-unified を自動付与するため per-slot でも full n_ctx)
+            context_size=llama_cfg.get("context_size", 4096),
         )
         if await client.health_check():
             state.local_client = client
@@ -882,6 +885,7 @@ def _init_learning_scheduler(
     debug_logger: "DebugLogger",
     policy_interpreter: "PolicyInterpreter",
     learned_patterns_store: "LearnedPatternStore",
+    resolver: Any,
 ) -> "LearningScheduler":
     """7f. LearningScheduler (Level 1/2) + Evolver / Critique / FewShot 接続"""
     from backend.free.learning.scheduler import LearningScheduler
@@ -893,6 +897,7 @@ def _init_learning_scheduler(
         debug_logger=debug_logger,
         policy=policy_interpreter,
         disabled=state.learning_disabled,
+        resolver=resolver,
     )
     learning_scheduler.set_learned_patterns(learned_patterns_store)
 
@@ -2027,7 +2032,7 @@ async def _build_learn_pillar(
     with _timed(timings, "learning_scheduler"):
         learning_scheduler = _init_learning_scheduler(
             state, cfg, exp_buf, prompt_mgr, debug_logger,
-            policy_interpreter, learned_patterns_store,
+            policy_interpreter, learned_patterns_store, resolver,
         )
 
     with _timed(timings, "component_wiring"):
@@ -2242,6 +2247,14 @@ def _activate_learning_partition(base: "_BaseContext", state: AppState) -> None:
     if not resolver.partition_enabled:
         logger.info("Learning partition disabled (legacy flat layout)")
         return
+
+    # embed_instruction は embedding モデル単位のパーティション (base モデルとは
+    # 独立軸)。以降の base モデル identity 依存の早期 return に影響されないよう
+    # ここで確定する。
+    embed_filename = Path(cfg.get("model_paths", {}).get("embed_model", "")).name
+    resolver.set_active_embedding_model_stem(
+        Path(embed_filename).stem if embed_filename else None,
+    )
 
     from backend.free.core.learning_partition_migrator import LearningPartitionMigrator
     from backend.free.core.model_migration import ModelState

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -16,6 +17,10 @@ if TYPE_CHECKING:
     from backend.free.memory.stores.short_term import ShortTermMemory
 
 logger = get_logger("api.chat.recorder")
+
+# 文書系の出力先拡張子。これらへの出力依頼で content_type=code が返るのは
+# ルーティング誤り (long_form_success の判定材料)。
+_DOC_TARGET_EXT_RE = re.compile(r"\.(?:md|txt|csv)\b", re.IGNORECASE)
 
 # セッション別の開始時刻（初回リクエスト時に記録）
 _session_started: dict[str, str] = {}
@@ -329,11 +334,22 @@ def record_long_form_response(
             # 長文生成が成功したと判定できる条件:
             #   - units_completed > 0 (1 ユニット以上生成)
             #   - validation_errors == 0 (検証エラーなし)
+            #   - 要求成果物と content_type が矛盾しない (文書拡張子への出力
+            #     依頼なのに code 生成 = ルーティング誤り。2026-07-15 に
+            #     Python コードを .md へ書いた訂正ターンが「成功」として
+            #     正例学習され誤ルーティングを増幅した)
             # 失敗時は long_form_success=False のままで、learned_patterns への
             # boost は走らない (新規追加もなし)。
             units_completed = int(metrics.get("units_completed", 0) or 0)
             validation_errors = int(metrics.get("validation_errors", 0) or 0)
-            long_form_success = units_completed > 0 and validation_errors == 0
+            content_type = str(metrics.get("content_type") or "")
+            doc_target = bool(_DOC_TARGET_EXT_RE.search(user_query))
+            content_type_mismatch = doc_target and content_type == "code"
+            long_form_success = (
+                units_completed > 0
+                and validation_errors == 0
+                and not content_type_mismatch
+            )
 
             fc.record(
                 query=user_query,
@@ -347,10 +363,13 @@ def record_long_form_response(
                 long_form_validation_errors=validation_errors,
                 long_form_budget_used_pct=metrics.get("budget_used_pct"),
                 long_form_success=long_form_success,
-                # 長文経路に入ったが 1 ユニットも生成できなかった = 長文分類の明確な
-                # 誤検出 → false_positive (パターン重み decay の対象)。units>0 で
+                # 長文経路に入ったが 1 ユニットも生成できなかった、または要求
+                # 成果物と content_type が矛盾 = 長文分類の明確な誤検出
+                # → false_positive (パターン重み decay の対象)。units>0 で
                 # validation_errors のみのケースは長文ルーティング自体は妥当なので除外。
-                long_form_false_positive=units_completed == 0,
+                long_form_false_positive=(
+                    units_completed == 0 or content_type_mismatch
+                ),
                 cartridge_ids=_loaded_cartridge_ids(state),
                 rag_used=rag_used,
                 rag_top1_score=rag_top1_score,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from pathlib import Path
 
@@ -40,15 +41,19 @@ from backend.free.agent.output_format import (
 )
 from backend.free.agent.meta_cognitive_utils import (
     contains_code_indicator,
+    content_language_directive,
     iter_balanced_brace_substrings,
     is_tool_error,
     parse_template_tool_call,
     try_parse_tool_dict,
     call_callback,
+    fewshot_contains_task_log,
     fewshot_seems_relevant,
     fix_json_backslashes,
+    generated_content_rejection,
     looks_like_path_not_content,
     strip_markdown_wrapper,
+    strip_task_log_scaffold,
     summarize_file_content,
     summarize_tool_args,
     text_looks_like_code,
@@ -96,20 +101,24 @@ IMPORTANT rules:
 NEVER substitute a different or merely "similar" program. IGNORE any unrelated program \
 names that appear in the examples below or in prior conversation context — they are \
 illustrations of FORMAT only, not of WHAT to build.
-- When the user asks to BUILD, CREATE, MAKE, or WRITE a program, script, app, or game, \
-the task MUST be an action that PRODUCES that program (e.g. "Generate the full program the \
-user requested"). Do NOT reduce a build request to only a "Design/Analyze/Plan the structure" \
-task — that yields just an explanation and no usable program.
+- When the user asks to BUILD, CREATE, MAKE, or WRITE a program, script, app, a document, \
+or a data file, the task MUST be an action that PRODUCES that deliverable. Do NOT reduce a \
+build request to only a "Design/Analyze/Plan the structure" task — that yields just an \
+explanation and no usable deliverable. In the examples below, <...> is a placeholder: \
+replace it with the user's actual words. NEVER copy a <...> placeholder or an example \
+sentence verbatim into your output.
   BAD  (user asked to build): {"tasks": ["Design the game structure and core logic"]}
-  GOOD (user asked to build): {"tasks": ["Generate the full program the user requested"]}
+  GOOD (user asked to build): {"tasks": ["Generate the full <deliverable the user asked for>"]}
 - NEVER invent a file path. Only include a file path in a task when the USER explicitly \
 gave one. If the user did not specify an output location, describe the task WITHOUT any path.
   BAD  (user gave no path): {"tasks": ["Create e:\\\\app\\\\solution.py with the full implementation"]}
-  GOOD (user gave no path): {"tasks": ["Generate the full program the user requested"]}
+  GOOD (user gave no path): {"tasks": ["Generate the full <deliverable the user asked for>"]}
   GOOD (user said save to e:\\\\app\\\\solution.py): {"tasks": ["Create e:\\\\app\\\\solution.py with the full implementation"]}
+- When the user DID give an explicit output path, EVERY create/write task MUST repeat that \
+exact path verbatim. Dropping the user's path from the task loses the write destination.
 - Creating or rewriting a SINGLE file is always ONE task, not multiple tasks.
   BAD:  {"tasks": ["Create the core logic", "Add feature A", "Add input handling"]}
-  GOOD: {"tasks": ["Generate the full program the user requested in a single file"]}
+  GOOD: {"tasks": ["Generate the full <deliverable the user asked for> in a single file"]}
 - When the user asks for a DOCUMENT or DATA FILE (Excel/spreadsheet/CSV, Word, \
 PowerPoint, a calendar, a table, a report), the deliverable is the FILE CONTENT itself. \
 Plan a SINGLE write task that writes the content to the file. Do NOT plan to "generate a \
@@ -171,6 +180,14 @@ TABLE_CONTENT_INSTRUCTION = (
     "start and end with a pipe `|`. No prose, no code fences, no extra text."
 )
 
+# .csv は export 変換を通らず raw テキストとして書き込まれるため、GFM 表ではなく
+# CSV 行そのものを出力させる (散文/説明文の混入は書込み前検証で棄却される)。
+CSV_CONTENT_INSTRUCTION = (
+    "The target is a raw CSV file. Output ONLY comma-separated values: one "
+    "header row, then one line per record. Use the exact columns the user "
+    "asked for. No prose, no Markdown, no code fences, no extra text."
+)
+
 # Word/PowerPoint 等のリッチ文書で、取得済みテーブルが無くモデル生成に落ちる時の
 # 保険。export Writer が変換できる GFM を出させ、python-pptx/VBScript 等の「文書を
 # 作るコード」をテキスト出力する退行を明示的に禁じる。表は強制しない (散文文書も可)。
@@ -180,6 +197,10 @@ RICH_DOC_CONTENT_INSTRUCTION = (
     "Do NOT output python-pptx, python-docx, VBScript, openpyxl, or any program code. "
     "No code fences around the whole document."
 )
+
+# ユーザークエリ/タスク記述中の明示的な絶対パス (Windows ドライブレター形式)。
+# plan 後のパス脱落補完 (_normalize_planned_paths) で使用する。
+_EXPLICIT_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'「」()（）]+")
 
 # 実データを取得するツール。これらの生結果をタスク横断で蓄積し、後続の
 # write タスクが取得済みデータを直接参照できるようにする (転記ハルシネーション防止)。
@@ -669,7 +690,8 @@ class MetaCognitiveAgent:
         tasks_raw = data.get("tasks") if isinstance(data, dict) else None
         if isinstance(tasks_raw, list):
             tasks = [TaskItem(description=str(t)) for t in tasks_raw if t]
-            return self._ensure_build_task(query, tasks)
+            tasks = self._ensure_build_task(query, tasks)
+            return self._normalize_planned_paths(query, tasks)
 
         logger.warning(
             "Plan response did not contain a 'tasks' list: %r", data,
@@ -698,6 +720,37 @@ class MetaCognitiveAgent:
             "single generate task (query=%r)", query[:80],
         )
         return [TaskItem(description="Generate the full program the user requested")]
+
+    @staticmethod
+    def _normalize_planned_paths(
+        query: str, tasks: list[TaskItem],
+    ) -> list[TaskItem]:
+        """ユーザー明示パスが plan タスクから脱落した場合に決定論で補完する。
+
+        小型 assist は PLAN_SYSTEM_PROMPT の例文をエコーしてユーザー指定の
+        出力パスを落とすことがある (2026-07-15: パス無し "Generate the full
+        program..." が 2 ターンで write 不発 → 失敗)。クエリに明示的な
+        絶対パスがあるのに、どのタスクにもパスが含まれない場合、最初の
+        書込み期待タスクへユーザーのパスを付記して write 経路に載せる。
+        """
+        if not tasks:
+            return tasks
+        m = _EXPLICIT_PATH_RE.search(query)
+        if not m:
+            return tasks
+        user_path = m.group(0).rstrip("。、.,;:")
+        if any(_EXPLICIT_PATH_RE.search(t.description) for t in tasks):
+            return tasks
+        for t in tasks:
+            if task_expects_write(t.description):
+                logger.warning(
+                    "Plan dropped the user's explicit output path; "
+                    "re-attaching %s to task: %s",
+                    user_path, t.description[:80],
+                )
+                t.description = f"{t.description} and save it to {user_path}"
+                break
+        return tasks
 
     @staticmethod
     def _build_plan_user_content(
@@ -1138,7 +1191,7 @@ class MetaCognitiveAgent:
         """
         tool_descriptions = ""
         if tools_registry is not None:
-            tool_descriptions = tools_registry.get_descriptions_text()
+            tool_descriptions = tools_registry.get_descriptions_text(mode=self._mode)
         context_text = "\n".join(context_parts) if context_parts else "(none)"
         if len(context_text) > 3000:
             context_text = context_text[:3000] + "\n... (truncated)"
@@ -1735,14 +1788,27 @@ class MetaCognitiveAgent:
             lines.append("| " + " | ".join(cells) + " |")
         return "\n".join(lines)
 
-    @staticmethod
     async def _execute_tool(
+        self,
         tool_name: str,
         tool_args: dict,
         tools_registry,
         state: AgentState,
     ) -> str:
         """ツールを実行して結果テキストを返す"""
+        # search_code は coding 専用ツールだが (modes=["coding"])、ここは LLM
+        # プランナーが自由選択するループ経路であり ToolDefinition.modes は元々
+        # 参照されていない。chat モードの CWD 全域 os.walk が実インシデントの
+        # 直接原因になったため、search_code に限り mode ゲートを追加する
+        # (write_file は meta_cognitive の長文書き出し機能で chat モードからも
+        # 正規に使われるため対象外)。
+        if tool_name == "search_code" and self._mode != "coding":
+            result_text = f"Error: search_code is not available in mode '{self._mode}'"
+            state.on_tool_failure(tool_name, result_text)
+            logger.warning(
+                "Tool not allowed in mode %s: %s", self._mode, tool_name,
+            )
+            return result_text
         if tools_registry is not None and tools_registry.has(tool_name):
             try:
                 tool_result = await tools_registry.execute(tool_name, **tool_args)
@@ -1882,6 +1948,21 @@ class MetaCognitiveAgent:
         """read_file / run_command / search_code のファストパス実行"""
         logger.info("Tool fast path: %s(%s)", tool_name, tool_args)
 
+        # search_code は coding 専用 (modes=["coding"]) だが、この判定は
+        # ToolCallJudge の rule/assist 判定結果をそのまま実行するため
+        # ToolDefinition.modes を経由しない。_execute_tool と同じ理由で
+        # search_code のみ mode ゲートを追加する (write_file は対象外)。
+        if tool_name == "search_code" and self._mode != "coding":
+            result_text = f"Error: search_code is not available in mode '{self._mode}'"
+            logger.warning(
+                "Tool fast path not allowed in mode %s: %s", self._mode, tool_name,
+            )
+            return result_text, [{
+                "tool": tool_name,
+                "args": tool_args,
+                "success": False,
+            }]
+
         if on_step:
             args_summary = summarize_tool_args(tool_name, tool_args)
             await call_callback(on_step, {
@@ -1962,17 +2043,19 @@ class MetaCognitiveAgent:
             original_query, task.description, llm_client,
             file_path=file_path,
         )
+        content, rejection = self._validate_generated_content(content, file_path)
 
-        if looks_like_path_not_content(content, file_path):
+        if rejection and not content.startswith("(Content generation failed:"):
             logger.warning(
-                "Write fast path: content looks like a file path, "
+                "Write fast path: generated content rejected (%s), "
                 "retrying content generation: %r",
-                content,
+                rejection, content[:120],
             )
             content = await self._generate_content(
                 original_query, task.description, llm_client,
                 file_path=file_path,
             )
+            content, rejection = self._validate_generated_content(content, file_path)
 
         if content.startswith("(Content generation failed:"):
             logger.warning("Write fast path: content generation failed for %s", file_path)
@@ -1984,23 +2067,48 @@ class MetaCognitiveAgent:
                 })
             return f"Error: {content}", []
 
-        if looks_like_path_not_content(content, file_path):
+        if rejection:
             logger.warning(
-                "Write fast path: content still looks like a file path "
+                "Write fast path: generated content still rejected (%s) "
                 "after retry, aborting: %r",
-                content,
+                rejection, content[:120],
             )
             if on_step:
                 await call_callback(on_step, {
                     "type": "tool_call",
-                    "detail": f"{prefix} write_file: コンテンツ生成失敗（パス誤出力）",
+                    "detail": f"{prefix} write_file: コンテンツ生成失敗（{rejection}）",
                     "status": "failed",
                 })
-            return "Error: Content generation produced only a file path, not actual content", []
+            return (
+                f"Error: Content generation produced invalid output ({rejection}), "
+                "not actual content",
+                [],
+            )
 
         return await self._write_file(
             file_path, content, tools_registry, on_step, prefix,
         )
+
+    @staticmethod
+    def _validate_generated_content(
+        content: str, file_path: str,
+    ) -> tuple[str, str | None]:
+        """生成コンテンツを scaffold 除去してから書込み適性を検証する。
+
+        「タスクログ + 本文」の連結は本文だけに救済し、本文が残らない
+        エコー (task_log_echo / prompt_echo / path_only / csv_without_rows)
+        は棄却理由を返して呼出側で再生成・中断させる。
+        """
+        if content.startswith("(Content generation failed:"):
+            return content, "generation_failed"
+        stripped = strip_task_log_scaffold(content)
+        if stripped and stripped != content:
+            logger.info(
+                "Write fast path: stripped task-log scaffold from generated "
+                "content (%d -> %d chars)", len(content), len(stripped),
+            )
+            content = stripped
+        return content, generated_content_rejection(content, file_path)
 
     async def _write_file(
         self,
@@ -2016,6 +2124,15 @@ class MetaCognitiveAgent:
             result = await tools_registry.execute("write_file", **tool_args)
             result_text = str(result)
             is_success = not is_tool_error(result_text)
+            if is_success:
+                verify_error = self._verify_written_file(file_path, content)
+                if verify_error:
+                    result_text = f"Error: {verify_error}"
+                    is_success = False
+                    logger.error(
+                        "write_file post-verification failed: %s (%s)",
+                        file_path, verify_error,
+                    )
         except Exception as e:
             result_text = f"Error: {e}"
             is_success = False
@@ -2036,6 +2153,36 @@ class MetaCognitiveAgent:
 
         logger.info("write_file completed: %s → %s", file_path, result_text[:80])
         return result_text, [tool_entry]
+
+    @staticmethod
+    def _verify_written_file(file_path: str, content: str) -> str | None:
+        """書込み後にディスク上の実ファイルを読み戻して内容を突合する。
+
+        「Written N bytes」という成功申告と実ファイルの乖離 (書込み経路の
+        取り違え・変換事故) を success にしないための最終ガード。リッチ文書
+        (xlsx/docx 等) は export 変換で内容が変わるため対象外。改行は
+        ``write_text`` のプラットフォーム変換 (LF→CRLF) を正規化して比較する。
+        検証自体の失敗 (読み戻し不可等) は書込み失敗と区別できないため
+        エラーにせず None (成功維持) を返す。
+        """
+        from backend.free.agent.tools.builtin import _EXPORT_DOC_EXTS
+
+        try:
+            p = Path(file_path)
+            if p.suffix.lower() in _EXPORT_DOC_EXTS:
+                return None
+            if len(content) > 2_000_000:
+                return None
+            on_disk = p.read_text(encoding="utf-8")
+        except Exception:
+            return None
+        if on_disk.replace("\r\n", "\n") != content.replace("\r\n", "\n"):
+            return (
+                f"post-write verification failed: on-disk content of "
+                f"'{file_path}' does not match the generated content "
+                f"({len(on_disk)} vs {len(content)} chars)"
+            )
+        return None
 
     async def _recover_write_from_text(
         self,
@@ -2095,10 +2242,11 @@ class MetaCognitiveAgent:
                     logger.warning("Auto-recovery content generation failed: %s", file_path)
                     return None
 
-            if looks_like_path_not_content(content, file_path):
+            content, rejection = self._validate_generated_content(content, file_path)
+            if rejection:
                 logger.warning(
-                    "Auto-recovery: content looks like a file path, aborting: %r",
-                    content,
+                    "Auto-recovery: generated content rejected (%s), aborting: %r",
+                    rejection, content[:120],
                 )
                 return None
 
@@ -2162,17 +2310,31 @@ class MetaCognitiveAgent:
         # Level 1 で進化した few-shot を参考例として system に注入する
         system_content = CONTENT_GENERATION_PROMPT
         # 出力先がスプレッドシート系なら GFM 表生成を強制する (xlsx 実セル化のため)。
+        # .csv は raw 書込みのため CSV 行そのものを出力させる。
         # リッチ文書系 (docx/pptx) は表を強制せず、コード文字列の出力のみ禁じる。
-        if is_table_output(file_path):
+        if file_path.lower().endswith(".csv"):
+            system_content = f"{system_content}\n{CSV_CONTENT_INSTRUCTION}"
+        elif is_table_output(file_path):
             system_content = f"{system_content}\n{TABLE_CONTENT_INSTRUCTION}"
         elif is_rich_table_output(file_path):
             system_content = f"{system_content}\n{RICH_DOC_CONTENT_INSTRUCTION}"
+        # 出力言語指示 (locale 追従)。ここは write 全経路 (ツールループ /
+        # ファストパス / auto-recovery / editor タスク) の合流点なので、
+        # この 1 箇所で全ファイル出力に効く。
+        system_content = f"{system_content}\n{content_language_directive()}"
         # Level 1 few-shot は query 類似度だけでなく fitness も加味して選ばれる
         # ため、現在のタスクと無関係でも再利用されうる。無関係な例文をその
         # まま注入すると、モデルがその例文自体を繰り返す退化を誘発しうる
         # (#incident) ため、タスク文との粗い関連度チェックを通してから注入する。
-        if self._fewshot_block and fewshot_seems_relevant(
-            f"{original_query}\n{task_description}", self._fewshot_block,
+        # さらに応答例がタスク進捗ノート形式 (- [done] ... Written N bytes) の
+        # 場合は「報告だけ出せば正解」バイアスを与えるため注入しない
+        # (#incident 2026-07-15: 本文なし極小ファイル 10 件)。
+        if (
+            self._fewshot_block
+            and fewshot_seems_relevant(
+                f"{original_query}\n{task_description}", self._fewshot_block,
+            )
+            and not fewshot_contains_task_log(self._fewshot_block)
         ):
             system_content = f"{system_content}\n\n[参考例]\n{self._fewshot_block}"
 

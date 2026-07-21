@@ -1,7 +1,10 @@
 """学習済みパターンストア: 会話から学習したパターン検出キーワードの管理
 
-訂正・言い直し検出時に会話コンテキストからキーワードを抽出し、
-次回以降のパターン検出に活用する。LLM 呼び出しなし。
+ツールルーティング (``tool_routing``) / 長文ルーティング (``long_form``) の
+シグナルからキーワードを学習し、次回以降のルーティング判定に活用する。
+LLM 呼び出しなし。旧 ``correction`` / ``rephrase`` カテゴリは 2026-07-21 に
+廃止 (書き手・読み手とも存在せず、話題語学習による訂正誤検出の温床だった —
+``_DISCONTINUED_CATEGORIES`` 参照)。
 """
 
 from __future__ import annotations
@@ -65,13 +68,41 @@ _STOPWORDS = frozenset({
 # long_form カテゴリ専用の学習除外語 (CJK)。出力先指定などで頻出するが、
 # 文書(散文)の種別を示さない汎用ファイル操作語。ASCII トークンは
 # ``_LONG_FORM_ASCII_FILEISH_RE`` 側で一律除外するためここには含めない。
+# 2026-07-15 に「文書 0.90 / 明日 0.66 / 共有 0.66 / 形式 0.54 / 部署 0.54」等の
+# 汎用語が自己強化され、朝礼メモ・12 行 CSV 依頼までユニット分割パイプラインへ
+# 誘導した実績があるため、時間表現・組織語・汎用文書語も除外する。
 _LONG_FORM_NONLEARNABLE_EXACT = frozenset({
     "出力", "出力先", "保存", "保存先", "ファイル",
     "書き出し", "書き込み", "配下", "エクスポート", "セーブ",
+    # 文書「種別」を示さない汎用文書語
+    "文書", "書類", "形式", "内容", "作成", "一覧", "雛形", "ひな形",
+    # 時間表現 (依頼の期日であって文書種別ではない)
+    "今日", "明日", "昨日", "今週", "来週", "今月", "来月", "本日",
+    # 組織・共有語 (社内文書の話題語であって種別ではない)
+    "共有", "連絡", "連絡事項", "部署", "担当", "社内", "全社",
 })
 # ASCII のみのトークン (パス片 / URL 片 / ホスト名 / 形式名 / 識別子) を表す。
 # long_form の文書種別シグナルとしては信頼できないため学習対象から外す。
 _LONG_FORM_ASCII_FILEISH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
+
+# 廃止カテゴリ (2026-07-21)。correction は「訂正が起きたときの話題語」を
+# 「訂正の言い回し」として照合する意味論の破綻により偽陽性率 ~85% (経験 65 件
+# の実測) に達し、learned correction 検出 (feedback 旧・層2) ごと廃止した。
+# rephrase は書き込み専用で match() の参照箇所が存在しない dead カテゴリ
+# だった。load 時に落とし、廃止前に学習された残存データ (「会話」w=0.95 等)
+# を再起動時に自動浄化する。
+_DISCONTINUED_CATEGORIES = frozenset({"correction", "rephrase"})
+
+# tool_routing カテゴリ専用の学習除外語。ツールシグナル付きクエリに随伴して
+# 抽出される (「main.py を実行して結果を説明して」→「実行」「説明」) が、
+# それ自体は知識質問にも頻出する LLM ネイティブな言語タスク語であり、ツール
+# 意図のシグナルにならない。実インシデント (2026-07-20 ライブ検証): 過去に
+# 学習された「説明」(w=0.630) が知識質問「〜を説明して」にマッチし、coding
+# モードで引数なし run_command 誘導を誘発し得た。add 時 (extract_tool_routing_
+# keywords) と load 時の両方で弾き、既学習の残存データも再起動時に自動浄化する。
+_TOOL_ROUTING_NONLEARNABLE_EXACT = frozenset({
+    "説明", "解説", "要約", "紹介", "定義", "比較", "翻訳",
+})
 
 
 __all__ = ["LearnedPattern", "LearnedPatternStore"]
@@ -118,7 +149,10 @@ class LearnedPatternStore:
 
         Args:
             keyword: 学習するキーワード
-            category: カテゴリ ("correction" | "intent" | "rephrase")
+            category: カテゴリ ("tool_routing" | "long_form")。既定値の
+                "correction" は廃止カテゴリ (後方互換のため温存。プロダクション
+                呼出は全て明示指定で、省略で add しても save → load 時に
+                ``_DISCONTINUED_CATEGORIES`` フィルタで自動浄化される)
             weight: 初期重み（None でデフォルト値）
 
         Returns:
@@ -299,6 +333,47 @@ class LearnedPatternStore:
 
         return result[:10]
 
+    def extract_tool_routing_keywords(self, text: str) -> list[str]:
+        """``category="tool_routing"`` として学習してよいキーワードを抽出する。
+
+        ``extract_intent_keywords`` と異なり 3 条件で絞る:
+
+        1. クエリ全体にツールシグナル (``tool_call_judge._query_has_tool_signal``)
+           があること。雑談・知識質問からの誤学習を防ぐ (2026-07-18 に
+           feedback 側へ入れたガードの一元化。従来 Level 1 バッチ側
+           ``LearningScheduler._evolve_tool_routing_patterns`` にはこのガードが
+           無く、feedback 側で弾いた経験からも再学習される穴があった)。
+        2. 動作指示語 (``_INTENT_PATTERNS``) のみ。汎用キーワード
+           (``_KEYWORD_PATTERNS``: 漢字連続・カタカナ・ASCII トークン) は
+           クエリの話題名詞 (「天気」「歴史」「コーヒー」等) を拾ってしまい、
+           ツール意図のシグナルにならないため使わない (実データ 2026-07-21:
+           tool_routing 62 件中ほぼ全てが話題名詞の汚染だった)。
+        3. LLM ネイティブな言語タスク語
+           (``_TOOL_ROUTING_NONLEARNABLE_EXACT``) を除外する。
+
+        Returns:
+            学習に適したキーワードリスト (最大 10 件)。ツールシグナルの無い
+            クエリでは空リスト。
+        """
+        # 同一パッケージ内の遅延 import (module ロード順の循環回避)
+        from backend.free.agent.tool_call_judge import _query_has_tool_signal
+        if not _query_has_tool_signal(text):
+            return []
+        seen: set[str] = set()
+        result: list[str] = []
+        for pattern in _INTENT_PATTERNS:
+            for m in pattern.finditer(text):
+                kw = m.group(1) if m.lastindex else m.group(0)
+                lower = kw.lower()
+                if lower in _STOPWORDS or len(kw) < 2:
+                    continue
+                if kw in _TOOL_ROUTING_NONLEARNABLE_EXACT:
+                    continue
+                if lower not in seen:
+                    seen.add(lower)
+                    result.append(kw)
+        return result[:10]
+
     @staticmethod
     def is_long_form_learnable(keyword: str) -> bool:
         """``keyword`` を ``category="long_form"`` として学習してよいか判定する (pure)。
@@ -360,8 +435,11 @@ class LearnedPatternStore:
     def load(self, path: str | Path) -> None:
         """JSON ファイルからロードする (infra 層に委譲)
 
-        ドメインルール: ストップワード / 空 keyword のエントリは
-        ロード時に除外する。
+        ドメインルール: ストップワード / 空 keyword / 廃止カテゴリ
+        (``_DISCONTINUED_CATEGORIES``) のエントリはロード時に除外する。
+        tool_routing カテゴリの言語タスク語
+        (``_TOOL_ROUTING_NONLEARNABLE_EXACT``) も除外し、除外セット導入前に
+        学習された残存データ (「説明」w=0.630 等) を再起動時に自動浄化する。
         """
         loaded = LearnedPatternRepository.load(path)
         if loaded is None:
@@ -369,6 +447,22 @@ class LearnedPatternStore:
 
         self._patterns.clear()
         for key, pattern in loaded.items():
-            if key and key not in _STOPWORDS:
-                self._patterns[key] = pattern
+            if not key or key in _STOPWORDS:
+                continue
+            if pattern.category in _DISCONTINUED_CATEGORIES:
+                logger.info(
+                    "Dropped discontinued-category pattern on load: "
+                    "'%s' (category=%s)", key, pattern.category,
+                )
+                continue
+            if (
+                pattern.category == "tool_routing"
+                and key in _TOOL_ROUTING_NONLEARNABLE_EXACT
+            ):
+                logger.info(
+                    "Dropped non-learnable tool_routing pattern on load: '%s'",
+                    key,
+                )
+                continue
+            self._patterns[key] = pattern
         logger.info("Loaded %d learned patterns from %s", len(self._patterns), path)

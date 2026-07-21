@@ -127,10 +127,12 @@ def setup_logging(
 # - backend.learning.*       : Free 版の学習サイクル
 # - backend.pro.learning.*   : Pro 版の Level 2 トレーナー等
 # - backend.memory.sleep_update : Sleep-time update（Level 0.5）
+# - backend.optimizer.*      : Level 1 進化アルゴリズム (prompt/embed_instruction/spsa)
 _LEARNING_LOGGER_NAMES: tuple[str, ...] = (
     "backend.learning",
     "backend.pro.learning",
     "backend.memory.sleep_update",
+    "backend.optimizer",
 )
 
 

@@ -105,7 +105,10 @@ async def _score_decision(
                 {"role": "system", "content": _PROMPT_SYSTEM[kind]},
                 {"role": "user", "content": _build_user_prompt(query, answer, decision)},
             ],
-            max_tokens=256,
+            # 768: tool_judgment と同根拠 (2026-07-18 実インシデント)。gemma4 系
+            # アシストで reasoning_budget=0 が稀に実効せず、256 では reasoning
+            # 出力だけで max_tokens を使い切り空応答になる事例が確認された。
+            max_tokens=768,
             temperature=0.1,
             purpose="rag_judge_relevance_score",
             response_schema=UrlRelevanceJudgement,

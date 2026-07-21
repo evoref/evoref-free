@@ -36,6 +36,7 @@ from backend.free.generation.strategy_common import (
 )
 from backend.free.generation.token_budget import TokenBudget
 from backend.free.llm.utils import extract_content
+from backend.i18n_helper import prose_language_name
 
 if TYPE_CHECKING:
     from backend.free.llm.assist_client import AssistModelClient
@@ -225,6 +226,16 @@ class RecurrentStrategy:
         format_instruction = (
             _CODE_FORMAT if content_type == ContentType.CODE else _TEXT_FORMAT
         )
+        # テキスト計画の記述言語 (locale 追従)。テンプレートは CODE/継続と共有の
+        # ため呼出側で注入する。継続モードは既存テキストの言語追従が正なので
+        # 付加しない (新規/EXPAND のみ)。
+        lang_line = ""
+        if content_type == ContentType.TEXT:
+            lang_line = (
+                f"\nユーザー指示に言語の明示指定が無い限り、"
+                f"title・global_context・heading・key_points は"
+                f"{prose_language_name()}で書いてください。"
+            )
 
         long_form_mode: LongFormMode = context.get(
             "long_form_mode", LongFormMode.CONTINUE,
@@ -244,7 +255,7 @@ class RecurrentStrategy:
                 context=ctx_text[:500],
                 target_length=target_length,
                 per_unit_tokens=per_unit_tokens,
-                format_instruction=format_instruction,
+                format_instruction=format_instruction + lang_line,
             )
         elif existing_content and content_type == ContentType.TEXT:
             # 追記モード: 既存テキストを含む専用プロンプト
@@ -259,7 +270,7 @@ class RecurrentStrategy:
             prompt = _PLAN_PROMPT.format(
                 instruction=instruction,
                 context=ctx_text[:500],  # コンテキスト予算を節約
-                format_instruction=format_instruction,
+                format_instruction=format_instruction + lang_line,
             )
 
         max_units = resolve_max_units(self._lf_config, long_form_mode)
