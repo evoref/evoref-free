@@ -628,8 +628,16 @@ def build_llama_cmd(
     project_root: Path | None = None,
     *,
     model_override: str | None = None,
+    lora_override: str | Path | None = None,
+    port_override: int | None = None,
 ) -> list[str]:
-    """config.yaml の llama セクションから起動コマンドを生成"""
+    """config.yaml の llama セクションから起動コマンドを生成
+
+    Level 2 base=spsa-real-eval の候補評価では ``lora_override`` (候補 GGUF LoRA
+    パス) と ``port_override`` (スクラッチポート) を指定して ephemeral サーバを
+    起動する (build_assist_cmd と同じパターン)。いずれも未指定 (通常運用) の
+    ときは従来挙動と完全に等価。
+    """
     if "llama" not in cfg:
         raise ValueError("config.yaml に 'llama' セクションがありません")
     lc = cfg["llama"]
@@ -645,10 +653,12 @@ def build_llama_cmd(
     if not base_model_path.is_absolute():
         base_model_path = project_root / base_model_path
 
+    port = port_override if port_override is not None else lc.get("port", 8080)
+
     cmd = [
         "llama-server",
         "-m", str(base_model_path),
-        "--port", str(lc.get("port", 8080)),
+        "--port", str(port),
         "-c", str(resolve_context_size_for(
             cfg, "base", project_root, model_override=model_override,
         )),
@@ -656,15 +666,20 @@ def build_llama_cmd(
         "-b", str(lc.get("batch_size", 512)),
     ]
 
-    # LoRA アダプタ（存在し、かつモデルと arch が一致する場合のみ）
-    lora_path = lp.get("lora_adapter", "local/models/adapter.gguf")
-    lora_full = Path(lora_path)
-    if not lora_full.is_absolute():
-        lora_full = project_root / lora_full
-    if lora_full.exists() and _lora_compatible(
-        base_model_path, lora_full, warn=lambda m: print(m, file=sys.stderr),
-    ):
-        cmd += ["--lora", str(lora_full)]
+    # LoRA アダプタ。lora_override (Level 2 base=spsa-real-eval 候補評価) は無条件で
+    # 付与する (候補 GGUF は harness が起動直前に書き出すため exists チェックしない)。
+    # 通常運用は既存アダプタが存在し、かつモデルと arch が一致する場合のみ付与する。
+    if lora_override is not None:
+        cmd += ["--lora", str(Path(lora_override))]
+    else:
+        lora_path = lp.get("lora_adapter", "local/models/adapter.gguf")
+        lora_full = Path(lora_path)
+        if not lora_full.is_absolute():
+            lora_full = project_root / lora_full
+        if lora_full.exists() and _lora_compatible(
+            base_model_path, lora_full, warn=lambda m: print(m, file=sys.stderr),
+        ):
+            cmd += ["--lora", str(lora_full)]
 
     # Level 2 base=C: control vector (残差ストリーム操舵)。
     # learning.level2_base_method=='cvector' かつファイルが存在するときのみ適用する。

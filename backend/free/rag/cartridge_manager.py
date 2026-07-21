@@ -676,6 +676,11 @@ class CartridgeManager:
             sim = float(np.dot(q, data.centroid))
             if sim >= self._gate_threshold:
                 scored.append((cid, sim))
+            else:
+                logger.debug(
+                    "Cartridge gate reject: cartridge=%s sim=%.3f (threshold=%.2f)",
+                    cid, sim, self._gate_threshold,
+                )
 
         # スコア上位 max_cartridges 件 (<=0 で無制限) + 未構築を常に含める
         if self._gate_max_cartridges > 0:

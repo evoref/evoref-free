@@ -168,23 +168,47 @@ def _llm_unavailable_response(stream: bool) -> StreamingResponse:  # noqa: ARG00
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
+# 応答言語のランタイム指示 (i18n.prompt_locale 追従)。プロンプト本文 (.md) は
+# 初回生成 / ロケール切替時にしか再導出されないため、既存インストールの本文が
+# 古い locale のまま・coding 本文に言語制約が無い場合でも設定に追従させる保険。
+# PromptManager の外で付加することで、Level 1 進化が本文へ焼き込む汚染を防ぐ
+# (名前プレフィックスの前例: prompt_manager._strip_name_prefix)。
+_RESPONSE_LANGUAGE_DIRECTIVES: dict[str, str] = {
+    "ja": "（ユーザーが使用言語を明示的に指定した場合を除き、応答は日本語で行うこと）",
+    "en": "(Respond in English unless the user explicitly requests another language.)",
+}
+
+
+def _response_language_directive() -> str:
+    """prompt_locale に応じた応答言語指示行を返す (未知 locale / 取得失敗は ja)。"""
+    try:
+        locale = get_config().get("i18n", {}).get("prompt_locale", "ja")
+    except Exception:
+        locale = "ja"
+    return _RESPONSE_LANGUAGE_DIRECTIVES.get(
+        locale, _RESPONSE_LANGUAGE_DIRECTIVES["ja"],
+    )
+
+
 def _resolve_system_prompt(
     state: AppState, mode: str, instance_name: str,
 ) -> str:
     """静的システムプロンプトを取得（PromptManager 未設定時はフォールバック）。
 
     query 非依存 (few-shot を含まない) なので連続リクエスト間で安定し、
-    llama-server の prefix KV キャッシュが効く。few-shot は
-    ``_resolve_fewshot_block`` で別途取得し最後の user メッセージへ前置する。
+    llama-server の prefix KV キャッシュが効く (応答言語指示も config 固定文字列
+    のため安定)。few-shot は ``_resolve_fewshot_block`` で別途取得し最後の
+    user メッセージへ前置する。
     """
+    directive = _response_language_directive()
     prompt_mgr = state.prompt_manager
     if prompt_mgr:
         get_static = getattr(prompt_mgr, "get_prompt_static", None)
         if get_static is not None:
-            return get_static(mode)
+            return f"{get_static(mode)}\n\n{directive}"
         # 後方互換: get_prompt_static 未実装の Mock 等は query なし get_prompt へ縮退
-        return prompt_mgr.get_prompt(mode)
-    return f"You are {instance_name}, a helpful AI assistant."
+        return f"{prompt_mgr.get_prompt(mode)}\n\n{directive}"
+    return f"You are {instance_name}, a helpful AI assistant.\n\n{directive}"
 
 
 def _resolve_fewshot_block(state: AppState, mode: str, query: str | None) -> str:
@@ -258,6 +282,7 @@ async def _gate_reactive_light(
     cfg: dict,
     history: list,
     judge_task: "asyncio.Task | None",
+    session_id: str = "",
 ) -> tuple[str, "asyncio.Task | None", str]:
     """reactive ルール miss 後、軽量パス採否を判定する。
 
@@ -280,6 +305,7 @@ async def _gate_reactive_light(
         else:
             judgement = await state.tool_call_judge.judge(  # 直列構成で直接実行
                 req.message, state.tools_registry, req.mode, history,
+                session_id=session_id,
             )
     except Exception as exc:
         logger.warning("reactive-light judge failed, escalating: %s", exc)
@@ -1118,6 +1144,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 judge_task = asyncio.create_task(
                     state.tool_call_judge.judge(
                         req.message, state.tools_registry, req.mode, history,
+                        session_id=session_id,
                     )
                 )
             if agent_layer != "reactive":
@@ -1198,7 +1225,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             # ルールベース miss → 軽量パス gating。tool 判定 (judge) で tool 不要
             # なら base 1 ターンの軽量パス、tool 必要なら deliberative へエスカレート。
             decision, judge_task, gate_reason = await _gate_reactive_light(
-                req, state, cfg, history, judge_task,
+                req, state, cfg, history, judge_task, session_id=session_id,
             )
             if decision == "light":
                 # 軽量パスは検索を使わない。judge_task も tool 不要なので破棄。

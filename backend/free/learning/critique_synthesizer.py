@@ -11,6 +11,7 @@ Darwinian Evolver の変異生成前に経験バッファの失敗パターン�
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -28,6 +29,23 @@ _CORRECTION_RATE_THRESHOLD = 0.3   # 訂正率がこれ以上なら「明確性�
 _REPHRASE_RATE_THRESHOLD = 0.3     # 言い直し率がこれ以上なら「理解の問題」
 _CONSECUTIVE_DECLINE_N = 3         # fitness 連続低下の検出閾値
 _HIGH_AGENT_LOOPS = 3              # エージェントループ数の警告閾値
+
+# システム能力と矛盾する改善ヒントの検出。「ローカルにアクセスできない前提で
+# 振る舞え」系のヒントはファイル出力依頼の拒否/迂回を助長する
+# (2026-07-15: この種のヒント経由で chat プロンプト v6 が配備された)。
+_CAPABILITY_CONTRADICTION_RE = re.compile(
+    r"cannot\s+(?:access|write|read)"
+    r"|can'?t\s+(?:access|write|read)"
+    r"|unable\s+to\s+(?:access|write|read)"
+    r"|no\s+access\s+to\s+(?:the\s+)?(?:local|file)"
+    r"|アクセスできない|書き込めない前提",
+    re.IGNORECASE,
+)
+
+
+def _hint_contradicts_capabilities(hint: str) -> bool:
+    """改善ヒントがシステム能力 (ローカル書込可) と矛盾するかを判定する。"""
+    return bool(_CAPABILITY_CONTRADICTION_RE.search(hint))
 
 
 @dataclass
@@ -230,7 +248,9 @@ class CritiqueSynthesizer:
         failures = [
             e for e in experiences
             if (e.get("signals", {}).get("rephrased_query")
-                or e.get("signals", {}).get("user_correction") is not None)
+                or e.get("signals", {}).get("user_correction") is not None
+                # turn_outcome SSOT ([failed] マーカー等から導出) も失敗として扱う
+                or e.get("signals", {}).get("turn_outcome") == "failed")
         ]
 
         if not failures:
@@ -292,6 +312,8 @@ class CritiqueSynthesizer:
                 entry += ", user rephrased the query"
             if signals.get("agent_loops", 0) > 1:
                 entry += f", agent_loops: {signals['agent_loops']}"
+            if signals.get("turn_outcome") == "failed":
+                entry += ", turn failed (deliverable not produced)"
             failure_summaries.append(entry)
 
         total = len(all_experiences)
@@ -308,6 +330,10 @@ class CritiqueSynthesizer:
         prompt = (
             "You are analyzing failure patterns in an AI assistant's interactions "
             "to improve its system prompt.\n\n"
+            "System capabilities (facts — do NOT suggest changes that contradict "
+            "them): the assistant runs locally and CAN write files to local paths "
+            "(write_file tool), read files, and run commands. Do NOT suggest that "
+            "the assistant acknowledge inability to access the local system.\n\n"
             f"Statistics: {failure_count} failures out of {total} total interactions. "
             f"{correction_count} user corrections, {rephrase_count} rephrases.\n\n"
             f"Failure examples:\n"
@@ -337,9 +363,13 @@ class CritiqueSynthesizer:
         if not data:
             raise ValueError("Assist model returned empty JSON")
 
+        hints = [
+            h for h in data.get("improvement_hints", [])
+            if not _hint_contradicts_capabilities(str(h))
+        ]
         return CritiqueResult(
             failure_patterns=data.get("failure_patterns", [])[:4],
-            improvement_hints=data.get("improvement_hints", [])[:4],
+            improvement_hints=hints[:4],
             summary=data.get("summary", ""),
             source="assist",
         )

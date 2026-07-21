@@ -208,9 +208,13 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # ツール呼出判定 ({"tool": ..., "args": {...}} の小さな JSON)。チャット
     # 応答パスで Deliberative / MetaCognitive から同期発火し、アシスト接続は
     # 常時有効。base モデルとの GPU 競合 + realtime 並列化時の assist 相互競合で
-    # 8s では空振りしやすいため 15s に緩める。失敗時はルールベース判定に
-    # フォールバックする。
-    "tool_judgment": 15.0,
+    # 8s では空振りしやすいため緩める。失敗時はルールベース判定にフォールバック
+    # する。2026-07-18: max_tokens を 256→768 に引き上げた (reasoning_budget=0
+    # が gemma4 系アシストで稀に実効せず reasoning がトークンを消費し尽くす
+    # anomaly 対策)。実測 (~30 tok/s) で 768 tok 到達に約 25s かかるため、
+    # 15s のままでは新しい max_tokens の余裕を使い切る前にタイムアウトして
+    # しまう。30s に引き上げて max_tokens の余裕と整合させる。
+    "tool_judgment": 30.0,
     # meta-cognitive 計画 (タスク分解) は coding mode の
     # 応答パスで発火するため、長すぎるとユーザ体感を阻害する。30s で打ち切り。
     "meta_cognitive_plan": 30.0,
@@ -242,8 +246,10 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # 短文要約するだけのため 30s で十分。
     "summarize": 30.0,
     # ツール結果 (最大 4096 chars) からの query 連動抽出。チャット応答パスで
-    # 同期発火するが、コスト無視・品質優先方針で余裕を持たせ 20s。
-    "tool_result_digest": 20.0,
+    # 同期発火するが、コスト無視・品質優先方針で余裕を持たせる。reasoning 型
+    # assist は思考が先行して 20s では出力 16 文字で 97% 消費のニアタイムアウト
+    # が常態化した (2026-07-15 実測) ため 30s へ。
+    "tool_result_digest": 30.0,
     # cartridge eval.json 生成。最大 4000 chars の document を
     # 連結したプロンプトから最大 10 QA を生成する。アシストモデルが
     # thinking 抑制下で QA を逐次出力するのに 60s 程度を想定。長文プラン

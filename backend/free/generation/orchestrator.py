@@ -49,6 +49,7 @@ from backend.free.generation.validators import (
     remove_code_fences,
     validate_python,
 )
+from backend.i18n_helper import get_locale
 from backend.policy_helpers import get_policy_value
 from backend.utils import estimate_tokens
 
@@ -185,7 +186,10 @@ class LongFormOrchestrator:
                 "unit_target_tokens", mode,
                 self.config.get("long_form", {}).get("unit_target_tokens", 800),
             )
-            plan = _split_oversized_text_units(plan, unit_target)
+            max_units = self.config.get("long_form", {}).get("max_units", 20)
+            plan = _split_oversized_text_units(
+                plan, unit_target, max_units=max_units,
+            )
 
         # 依存順ソート (コードのみ; create_plan で既にソート済みだが念のため)
         if content_type == ContentType.CODE:
@@ -929,17 +933,34 @@ class LongFormOrchestrator:
 
     @staticmethod
     def _build_extend_messages(remaining: int, tail: str) -> list[dict]:
-        """追加生成用のシンプルな messages を構築する。"""
-        return [
-            {"role": "system", "content": (
-                "あなたは物語の続きを書く作家です。"
-                "以下の文章の続きを自然に書いてください。"
+        """追加生成用のシンプルな messages を構築する (指示文は locale 追従)。
+
+        続き生成なので出力言語は元テキストへ追従させる (locale で上書きしない)。
+        """
+        if get_locale() == "en":
+            system = (
+                "You are a writer continuing a piece of text. "
+                "Continue the text below naturally, in the same language and "
+                "style as the original. Output only the body text - no "
+                "headings, no meta commentary."
+            )
+            user = (
+                f"Continue the following text with about {remaining} "
+                f"characters.\n\n{tail}\n\nContinuation:"
+            )
+        else:
+            system = (
+                "あなたは文章の続きを書く作家です。"
+                "以下の文章の続きを、元の文章と同じ言語・文体で自然に書いてください。"
                 "見出し行やメタ的な記述は不要です。本文のみを出力してください。"
-            )},
-            {"role": "user", "content": (
+            )
+            user = (
                 f"以下の文章の続きを{remaining}文字程度書いてください。\n\n"
                 f"{tail}\n\n続き:"
-            )},
+            )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ]
 
     def _build_extend_gen_kwargs(self, remaining: int) -> dict:
@@ -1071,19 +1092,62 @@ def _call_step(on_step: Callable[[dict], Any], data: dict) -> None:
 _MAX_SPLITS_PER_UNIT = 50
 
 
+#: 続きユニットに必ず添える継続指示。内容仕様ゼロの定型文単独だと直前段落の
+#: 逐語再掲が起きるため、再掲禁止を明示する (2026-07-15: 7 ファイルで冒頭
+#: 段落の末尾再掲が発生)。
+_CONTINUATION_NOTE = "前の文章の続きだけを書く。既に書いた文や冒頭の宣言文を再掲しない。"
+
+
+def _chunk_evenly(items: list[str], n: int) -> list[list[str]]:
+    """リストを n 個の連続チャンクにほぼ等分する (先頭側が大きい)。"""
+    if n <= 1:
+        return [list(items)]
+    base, extra = divmod(len(items), n)
+    chunks: list[list[str]] = []
+    idx = 0
+    for i in range(n):
+        size = base + (1 if i < extra else 0)
+        chunks.append(list(items[idx:idx + size]))
+        idx += size
+    return chunks
+
+
 def _split_oversized_text_units(
     plan: "GenerationPlan",
     unit_target_tokens: int,
+    max_units: int | None = None,
 ) -> "GenerationPlan":
     """大きすぎるテキストユニットを複数ユニットに分割する
 
     ローカルLLMは1回の生成で安定して出力できるトークン数に限界がある。
-    estimated_tokens が unit_target_tokens を超えるユニットを分割し、
+    estimated_tokens が分割閾値を超えるユニットを分割し、
     各ユニットがLLMの安定出力範囲内に収まるようにする。
 
-    分割後の各サブユニットはローリングコンテキスト（short_term）で
-    自然に繋がるため、テキストの一貫性は維持される。
+    - 分割閾値にはヒステリシス (target の 1.5 倍かつ最低 600) を設ける。
+      parse_plan は estimated_tokens を最低 200 にクランプするため、
+      L1 進化で unit_target_tokens が下限に張り付くと全ユニットが機械的に
+      倍分割される (2026-07-15: 13→26 units / 464 秒)。閾値の床がこれを防ぐ。
+    - ``max_units`` 指定時は分割後の総ユニット数が上限を超えないよう
+      実効ターゲットを底上げする (plan 時の truncate は分割前にしか
+      効かないため)。
+    - 親ユニットの key_points をサブユニットへ連続分配し、続きユニットが
+      内容仕様ゼロにならないようにする (逐語再掲の抑止)。
     """
+    split_threshold = max(int(unit_target_tokens * 1.5), 600)
+
+    if max_units and max_units > 0:
+        text_total = sum(
+            u.estimated_tokens for u in plan.units if isinstance(u, SectionPlan)
+        )
+        floor_target = math.ceil(text_total / max_units)
+        if floor_target > unit_target_tokens:
+            logger.info(
+                "Raising effective unit target %d -> %d to keep total units "
+                "within max_units=%d",
+                unit_target_tokens, floor_target, max_units,
+            )
+            unit_target_tokens = floor_target
+            split_threshold = max(int(unit_target_tokens * 1.5), 600)
 
     new_units: list[CodeUnit | SectionPlan] = []
     for unit in plan.units:
@@ -1091,7 +1155,7 @@ def _split_oversized_text_units(
             new_units.append(unit)
             continue
 
-        if unit.estimated_tokens <= unit_target_tokens:
+        if unit.estimated_tokens <= split_threshold:
             new_units.append(unit)
             continue
 
@@ -1101,20 +1165,22 @@ def _split_oversized_text_units(
             _MAX_SPLITS_PER_UNIT,
         )
         tokens_per_split = unit.estimated_tokens // n_splits
+        point_chunks = _chunk_evenly(unit.key_points, n_splits)
 
         for i in range(n_splits):
+            chunk = point_chunks[i] if i < len(point_chunks) else []
             if i == 0:
-                # 最初のサブユニット: 元の key_points を引き継ぐ
+                # 最初のサブユニット: 分配された key_points (空なら全量) を引き継ぐ
                 sub = SectionPlan(
                     heading=unit.heading,
-                    key_points=unit.key_points,
+                    key_points=chunk or unit.key_points,
                     estimated_tokens=tokens_per_split,
                 )
             else:
-                # 後続サブユニット: 前の内容の続きとして生成
+                # 後続サブユニット: 担当分の key_points + 再掲禁止の継続指示
                 sub = SectionPlan(
                     heading=f"{unit.heading}（続き{i + 1}）",
-                    key_points=["前の文章から自然に続く内容を書いてください。"],
+                    key_points=[*chunk, _CONTINUATION_NOTE],
                     estimated_tokens=tokens_per_split,
                 )
             new_units.append(sub)

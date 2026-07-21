@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from backend.free.loop.driver import make_task_fact
 from backend.free.memory.types import SemanticFact
+from backend.i18n_helper import prose_language_name
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -111,6 +112,22 @@ def os_constraint() -> str:
     )
 
 
+def _graph_language_constraint() -> str:
+    """タスクグラフ合成に注入する出力言語制約 (locale 追従)。
+
+    summary はステージ横断の共有設計 prose、purpose は各 task fact の記述
+    として成果物・ログに露出するため locale に追従させる。機械消費される
+    file_path / key_components / depends_on / 識別子は原語 (ASCII) のまま。
+    """
+    lang = prose_language_name(english=True)
+    return (
+        f'\n\nWrite the "summary" text and each module\'s "purpose" prose in '
+        f"{lang}, unless the user's request explicitly specifies another "
+        f'language. Keep "file_path", "key_components", "depends_on" values, '
+        f"code identifiers, and module/library names as-is (ASCII)."
+    )
+
+
 # OS 別の「ターゲット OS で import 不可な stdlib」既知リスト (SSOT)。
 # planner 出力 (summary / module purpose) への決定論スクリーンに使う。
 _OS_UNAVAILABLE_STDLIB: dict[str, tuple[str, ...]] = {
@@ -122,10 +139,18 @@ _OS_UNAVAILABLE_STDLIB: dict[str, tuple[str, ...]] = {
 
 
 def _denied_stdlib_mentions(text: str, os_name: str) -> list[str]:
-    """text 中で言及されている「対象 OS で利用不可な stdlib」名を返す (既知リスト順)。"""
+    """text 中で言及されている「対象 OS で利用不可な stdlib」名を返す (既知リスト順)。
+
+    ``\\b`` は CJK 文字を語境界としないため、日本語 prose に隣接するモジュール名
+    (例: 「cursesを使う」) を取りこぼす。ASCII 英数字とアンダースコアのみを
+    語構成文字とみなす lookaround で境界判定する (``ncurses`` / ``concursesion``
+    等の部分一致は従来どおり除外)。
+    """
     return [
         mod for mod in _OS_UNAVAILABLE_STDLIB.get(os_name, ())
-        if re.search(rf"\b{re.escape(mod)}\b", text)
+        if re.search(
+            rf"(?<![0-9A-Za-z_]){re.escape(mod)}(?![0-9A-Za-z_])", text,
+        )
     ]
 
 
@@ -364,7 +389,11 @@ async def synthesize_coding_task_graph(
     if not project_id:
         raise ValueError("project_id must be non-empty")
 
-    prompt = _SYNTHESIS_PROMPT.format(request=request.strip()) + os_constraint()
+    prompt = (
+        _SYNTHESIS_PROMPT.format(request=request.strip())
+        + os_constraint()
+        + _graph_language_constraint()
+    )
     graph_telemetry: dict = {}
     try:
         result = await assist_client.generate_json(

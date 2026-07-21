@@ -8,6 +8,7 @@ import re
 from typing import Iterator
 
 from backend.free.constants import COMMAND_EXIT_CODE_PREFIX
+from backend.i18n_helper import prose_language_name
 from backend.log_config import get_logger
 
 logger = get_logger("agent.meta_cognitive.utils")
@@ -313,6 +314,131 @@ def looks_like_path_not_content(content: str, file_path: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# 生成コンテンツのエコー検出 (タスクログ / プロンプト scaffold)
+# ---------------------------------------------------------------------------
+
+#: エージェントの進捗ノート行 (最終応答フォーマット由来)。few-shot に混入した
+#: 「- [done] ... / Written N bytes to ...」形式を小型モデルが成果物として
+#: 復唱する退化 (#incident 2026-07-15: 29 ファイル中 10 件が本文なしのログ 1 行)
+#: を書込み前に検出するためのパターン。
+_TASK_LOG_LINE_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?\[(?:done|failed|skipped)\]\s"
+    r"|^\s*Written\s+\d+\s+bytes\s+to\s+\S"
+    r"|^\s*Content of `[^`]+`\s*:?\s*$",
+)
+
+#: 生成プロンプトの内部 scaffold マーカー。成果物に現れたら「プロンプトの
+#: エコー」であり本文生成に失敗している (例: relocation_notice.txt に
+#: 「[現在日時 (UTC基準)] ...」とタスク英文がそのまま書き込まれた事例)。
+_PROMPT_SCAFFOLD_MARKERS: tuple[str, ...] = (
+    "[現在日時 (UTC基準)]",
+    "## 既存ファイル内容 (",
+    "【元のコード】",
+    "【修正指示】",
+)
+
+#: user_prompt の内部構造「タスク: <英語タスク文>」のエコー検出。planner の
+#: タスク文は英語動詞で始まるため、日本語文書中の一般語「タスク:」とは
+#: 区別できる。
+_TASK_SCAFFOLD_LINE_RE = re.compile(
+    r"^タスク\s*[:：]\s*(?:Write|Generate|Create|List|Read|Fetch|Revise|Update)\b",
+    re.MULTILINE,
+)
+
+
+def strip_task_log_scaffold(content: str) -> str:
+    """先頭に混入したタスク進捗ノート行を取り除いた残りを返す。
+
+    「タスクログ + 本文」の連結出力 (部分症状) から本文だけを救済する。
+    ログ行が無ければ原文をそのまま返し、全行がログなら空文字列を返す
+    (呼出側でエコーとして棄却する)。
+    """
+    lines = content.split("\n")
+    idx = 0
+    for i, line in enumerate(lines):
+        if not line.strip():
+            idx = i + 1
+            continue
+        if _TASK_LOG_LINE_RE.match(line):
+            idx = i + 1
+            continue
+        break
+    if idx == 0:
+        return content
+    return "\n".join(lines[idx:]).strip("\n")
+
+
+def fewshot_contains_task_log(fewshot_block: str) -> bool:
+    """few-shot 例にタスク進捗ノート形式の応答が含まれるかを判定する。
+
+    「- [done] ... Written N bytes」だけの応答例を参考例として注入すると
+    「書いた事実の報告だけ出せば正解」というバイアスを与え、本文なしの
+    極小ファイル生成を誘発する (#incident 2026-07-15)。該当例を含む
+    few-shot ブロックは注入しない。
+    """
+    return any(
+        _TASK_LOG_LINE_RE.match(ln) for ln in fewshot_block.split("\n")
+    )
+
+
+def looks_like_task_log_echo(content: str) -> bool:
+    """content がタスク進捗ノートのエコー (本文なし) かを判定する。"""
+    if not any(_TASK_LOG_LINE_RE.match(ln) for ln in content.split("\n")):
+        return False
+    remainder = strip_task_log_scaffold(content)
+    if remainder == content:
+        return False
+    return len(remainder.strip()) < 40
+
+
+def looks_like_prompt_echo(content: str) -> bool:
+    """content が生成プロンプトの scaffold を含む (= プロンプトエコー) かを判定する。"""
+    if any(marker in content for marker in _PROMPT_SCAFFOLD_MARKERS):
+        return True
+    return bool(_TASK_SCAFFOLD_LINE_RE.search(content))
+
+
+def csv_content_lacks_rows(content: str, file_path: str) -> bool:
+    """.csv 出力先なのに区切り行が実質存在しないかを判定する。
+
+    厳密な CSV 検証ではなく「散文/エコーを CSV として書く」事故の検出が目的。
+    カンマ区切り行または GFM パイプ表行が 2 行以上 (ヘッダ+データ) あれば
+    合格とする。``.csv`` 以外の出力先では常に False。
+    """
+    if not file_path.lower().endswith(".csv"):
+        return False
+    delimited = 0
+    for line in content.split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        if s.count(",") >= 1 or (s.startswith("|") and s.endswith("|")):
+            delimited += 1
+        if delimited >= 2:
+            return False
+    return True
+
+
+def generated_content_rejection(
+    content: str, file_path: str,
+) -> str | None:
+    """write_file 直前の生成コンテンツ検証。棄却理由を返す (適正なら None)。
+
+    書込みパス (fast path / 自動リカバリー) から共通で呼び、タスクログエコー・
+    プロンプトエコー・パス誤出力・CSV 構造欠落を書込み前に弾く。
+    """
+    if looks_like_path_not_content(content, file_path):
+        return "path_only"
+    if looks_like_task_log_echo(content):
+        return "task_log_echo"
+    if looks_like_prompt_echo(content):
+        return "prompt_echo"
+    if csv_content_lacks_rows(content, file_path):
+        return "csv_without_rows"
+    return None
+
+
 _CODE_INDICATORS: tuple[str, ...] = (
     "import ", "from ", "def ", "class ", "function ",
     "const ", "let ", "var ", "return ", "if __name__",
@@ -495,3 +621,25 @@ def iter_balanced_brace_substrings(text: str) -> Iterator[str]:
         end = _find_matching_close_brace(text, start)
         if end is not None:
             yield text[start:end + 1]
+
+
+# ---------------------------------------------------------------------------
+# コンテンツ生成の出力言語指示
+# ---------------------------------------------------------------------------
+
+def content_language_directive() -> str:
+    """write_file コンテンツ生成へ注入する出力言語指示 (locale 追従)。
+
+    英語スキャフォールドプロンプト (CONTENT_GENERATION_PROMPT /
+    _CONTENT_GEN_PROMPT) に付加するため英語文面。ユーザーの明示指定と
+    既存ファイルの言語を優先し、コード識別子等は原語のまま維持させる。
+    生成時点の locale を反映するため呼出毎に組み立てる。
+    """
+    lang = prose_language_name(english=True)
+    return (
+        f"Write all natural-language text (prose, headings, descriptions, "
+        f"comments) in {lang} unless the user's request explicitly specifies "
+        f"another language. Keep code identifiers, commands, file paths, and "
+        f"data values as-is. When updating an existing file, follow the "
+        f"existing content's language."
+    )

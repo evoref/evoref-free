@@ -237,6 +237,40 @@ def clean_generated_text(text: str) -> str:
     return cleaned.strip()
 
 
+#: 逐語重複トリムの対象とする段落の最小文字数。短い定型句 (「敬具」「以上」
+#: や結びの挨拶等) の正当な繰り返しを誤って落とさないための下限。日本語の
+#: 1 段落は 40〜60 文字程度から成立するため 40 とする。
+_DEDUP_MIN_PARAGRAPH_CHARS = 40
+
+
+def dedup_verbatim_paragraphs(text: str) -> str:
+    """既出段落の逐語再掲を除去する (長文ユニット結合の重複対策)。
+
+    続きユニットが直前ユニットの段落を丸ごと再掲する退行 (2026-07-15:
+    7 ファイルで冒頭段落の末尾再掲・セクション丸ごと重複) への決定論
+    ガード。空白正規化後に完全一致する ``_DEDUP_MIN_PARAGRAPH_CHARS``
+    文字以上の段落について、2 回目以降の出現を破棄する。
+    """
+    paragraphs = text.split("\n\n")
+    seen: set[str] = set()
+    kept: list[str] = []
+    removed = 0
+    for para in paragraphs:
+        norm = re.sub(r"\s+", " ", para).strip()
+        if len(norm) >= _DEDUP_MIN_PARAGRAPH_CHARS:
+            if norm in seen:
+                removed += 1
+                continue
+            seen.add(norm)
+        kept.append(para)
+    if removed:
+        logger.info(
+            "Removed %d verbatim duplicated paragraph(s) from long-form output",
+            removed,
+        )
+    return "\n\n".join(kept)
+
+
 # エディタ出力用: 連続改行 (途中に whitespace のみの空行を含む) を単一 \n に圧縮する。
 # file 経路の clean_generated_text とは異なり markdown 見出しは保持する。
 _EDITOR_BLANK_LINE_RE = re.compile(r"\n\s*\n+")
@@ -530,6 +564,11 @@ async def long_form_write_file(
     else:
         content = clean_generated_text(content)
 
+    # ユニット結合で生じた既出段落の逐語再掲を除去する (コード拡張子は
+    # 正当な重複がありうるため文書系のみ)。
+    if _editor_language_for_extension(suffix) == "markdown" or is_document_format(suffix):
+        content = dedup_verbatim_paragraphs(content)
+
     try:
         # 追記モード: 既存ファイルの内容に連結
         if _APPEND_HINT_RE.search(query) and registry.has("read_file"):
@@ -802,12 +841,33 @@ async def stream_meta_cognitive(
                     int(getattr(resp_obj, "tokens", 0) or 0)
                     if resp_obj is not None else 0
                 )
+                # SSE 完走 = success ではなくタスク成否を反映する。ファイル未作成の
+                # 失敗ターンが success=True で記録され、負例が学習に伝播しない
+                # 問題 (2026-07-15) への対策。
+                quality_signals: dict = {"agent_layer": "meta_cognitive"}
+                task_list = list(getattr(resp_obj, "tasks", None) or [])
+                if task_list:
+                    failed_tasks = sum(
+                        1 for t in task_list
+                        if getattr(t, "status", "") == "failed"
+                    )
+                    writes = sum(
+                        1 for tc in (getattr(resp_obj, "tool_calls", None) or [])
+                        if tc.get("tool") == "write_file" and tc.get("success")
+                    )
+                    quality_signals.update({
+                        "tasks": len(task_list),
+                        "failed_tasks": failed_tasks,
+                        "writes": writes,
+                    })
+                    if failed_tasks:
+                        outcome_success = False
                 dl.log_outcome(
                     kind="chat_response",
                     success=outcome_success,
                     duration_ms=elapsed_ms,
                     tokens_out=tokens_out,
-                    quality_signals={"agent_layer": "meta_cognitive"},
+                    quality_signals=quality_signals,
                 )
 
 
@@ -986,6 +1046,52 @@ async def _flush_step_queue_split_aware(
         yield sse.step(step_data)
 
 
+def _emit_long_form_episode(
+    sess_state: AppState,
+    *,
+    session_id: str,
+    mode: str,
+    query: str,
+    delivered: str,
+    metrics: dict,
+    private: bool,
+) -> None:
+    """長文生成ターンを MDP episode として agent_trace へ記録する。
+
+    cogwriter/recurrent 経路は AgentTracer を経由しないため、MDP ingest の
+    decision/failure ファクトから長文ターンが欠落していた。単一ステップの
+    episode として task / 成果メトリクス / 成否を残す。
+    """
+    tracer = getattr(sess_state, "agent_tracer", None)
+    if tracer is None or private:
+        return
+    try:
+        from backend.free.agent.agent_tracer import MDPStep
+
+        units_completed = int(metrics.get("units_completed", 0) or 0)
+        validation_errors = int(metrics.get("validation_errors", 0) or 0)
+        success = units_completed > 0 and validation_errors == 0
+        episode_id = tracer.begin_episode(session_id, mode)
+        tracer.record_step(episode_id, MDPStep(
+            step_index=0,
+            state={
+                "task": query[:200],
+                "layer": "long_form",
+                "strategy": str(metrics.get("strategy") or ""),
+                "content_type": str(metrics.get("content_type") or ""),
+                "units_total": int(metrics.get("units_total", 0) or 0),
+                "units_completed": units_completed,
+                "validation_errors": validation_errors,
+            },
+            action="long_form_generate",
+            observation=(delivered or "")[:200],
+            reward=1.0 if success else 0.0,
+        ))
+        tracer.end_episode(episode_id, "success" if success else "failure")
+    except Exception as e:
+        logger.debug("long_form episode emit skipped: %s", e)
+
+
 async def _finalize_long_form_stream(
     state: _LongFormStreamState,
     sess_state: AppState,
@@ -1045,6 +1151,14 @@ async def _finalize_long_form_stream(
         private=private,
         rag_used=rag_used,
         rag_top1_score=rag_top1_score,
+    )
+
+    # 長文経路も MDP episode を残す (agent_trace 互換)。従来は agent_trace を
+    # 経由しないため MDP ingest (decision/failure ファクト) から長文ターンが
+    # 全欠落していた (2026-07-15: 最重要の問題経路 10 ターンが学習素材にならず)。
+    _emit_long_form_episode(
+        sess_state, session_id=session_id, mode=mode, query=query,
+        delivered=delivered, metrics=metrics, private=private,
     )
 
     # 構文エラーを含むコードがエディタ/ディスクへそのまま出力されると、

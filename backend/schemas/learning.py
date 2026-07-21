@@ -131,8 +131,22 @@ class LearningConfig(BaseModel):
     # llama-cvector-generator (forward-only) で生成し、llama-server --control-vector-scaled
     # で次回起動時に適用する。'cvector' 指定が enable (Pro 限定)。既定 'lora' の SPSA 改良は
     # no-op (対称摂動で勾配 0) のためトリガ段階で skip され Level 2 base は何も起動しない
-    # (#3a)。base の実学習は 'cvector' で有効化する (実 llama-server ロード検証後)。
-    level2_base_method: Literal["lora", "cvector"] = "lora"
+    # (#3a)。base の実学習は 'cvector' または 'spsa-real-eval' で有効化する
+    # (実 llama-server ロード検証後)。
+    # 'spsa-real-eval': assist=B (level2_assist_method) と対称の CandidateEvalHarness を
+    # base 用に配線し、候補 LoRA を ephemeral llama-server (base モデル + scratch port) に
+    # 実ロードして eval_core.json ケースで実推論評価する。CPU 推論 (-ngl 0 相当) のため
+    # base モデルサイズ次第で assist より 1 サイクルが長時間化しうる。
+    level2_base_method: Literal["lora", "cvector", "spsa-real-eval"] = "lora"
+    # base=spsa-real-eval 実推論 eval 有効時の SPSA 反復数 (assist_realeval_spsa_iterations
+    # と同じ理由でコスト天井として低く設定)。
+    base_realeval_spsa_iterations: int = Field(default=30, ge=1)
+    base_eval_scratch_port: int = Field(default=8091, ge=1024, le=65535)
+    base_eval_loss_w1: float = Field(default=0.7, ge=0.0, le=1.0)  # keyword/pattern 一致項
+    base_eval_loss_w2: float = Field(default=0.3, ge=0.0, le=1.0)  # mean neg-logprob 項
+    base_eval_max_tokens: int = Field(default=64, ge=1)
+    base_eval_max_cases: int = Field(default=20, ge=1)
+    base_eval_health_timeout: int = Field(default=120, ge=10)
     cvector_method: Literal["pca", "mean"] = "pca"
     cvector_pca_batch: int = Field(default=100, ge=1)
     cvector_pca_iter: int = Field(default=1000, ge=1)

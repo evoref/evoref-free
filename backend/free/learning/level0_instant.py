@@ -42,13 +42,21 @@ def truncate_at_boundary(text: str, cap: int) -> str:
 class FeedbackSignals:
     """暗黙的フィードバックシグナル"""
     conversation_ended: bool = False
+    # ターン成否の SSOT: "success" | "partial" | "failed"。
+    # response の [failed] マーカー / step_credits 全 0 / ルーティング
+    # false_positive から FeedbackCollector が決定論導出する。
+    # tool_routing_success / long_form_success と矛盾する場合は failed 側に
+    # 倒し、偽成功が Level 1 の正例学習へ伝播しないようにする。
+    turn_outcome: str = "success"
     rephrased_query: bool = False
     rag_used: bool = False
     rag_source: str | None = None
     rag_top1_score: float | None = None
     agent_loops: int = 0
     user_correction: str | None = None
-    correction_detected_by: str | None = None  # "hardcoded" | "learned" | None
+    # "hardcoded" | "prev_failed" | "same_target" | None。旧 "learned"
+    # (学習パターン照合) は 2026-07-21 廃止 — 過去データには残存しうる
+    correction_detected_by: str | None = None
     perplexity: float | None = None
     # 長文生成シグナル
     long_form_used: bool = False

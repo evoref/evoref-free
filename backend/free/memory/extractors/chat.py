@@ -21,6 +21,7 @@ subject の pillar namespace (``mem.*``) を全面適用した
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 
 from backend.free.memory.extractors.base import (
@@ -62,6 +63,64 @@ _PREDICATE_BY_TAG: dict[str, str] = {
 
 _SAFE_KEYWORD_FALLBACK = "unknown"
 
+#: world_fact の subject kind として無意味な英語機能語 / フォーマット例トークン。
+#: 生成物断片の抽出で ``mem.world.from`` / ``mem.world.YYYYMMDD`` 等のゴミ
+#: subject が量産された (2026-07-15) ため、これらは keyword 候補から除外する。
+_WORLD_KEYWORD_STOPWORDS: frozenset[str] = frozenset({
+    "from", "import", "the", "and", "for", "with", "this", "that",
+    "class", "def", "return", "none", "true", "false",
+    "yyyymmdd", "yyyy-mm-dd", "hhmmss", _SAFE_KEYWORD_FALLBACK,
+})
+
+#: 明示的なローカルパス (ファイル出力依頼の指示文検出用)
+_LOCAL_PATH_HINT_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"']+")
+
+#: 文末が疑問形 (質問文) かどうかの判定。personal_fact/preference/emotion/opinion
+#: は「ユーザーが表明した事実」であるべきで、質問文 (例: 「私の好きなプログラミング
+#: 言語は？」) はユーザー自身の嗜好の表明ではない。トリガ語の単純部分一致だけでは
+#: 質問文と平叙文を区別できず、ノート全文がそのまま object_text になる (2026-07-18:
+#: pending コンフリクトに質問文がそのまま preference ファクトとして混入していた実
+#: インシデント)。
+_QUESTION_ENDING_RE = re.compile(r"[?？]\s*$")
+
+#: 文区切り (。！？!?) の直後で分割する。
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?])\s*")
+
+
+def _tag_evidence_is_question_only(content: str, trigger_words: tuple[str, ...]) -> bool:
+    """トリガ語を含む文が、すべて疑問形かどうかを判定する。
+
+    ノート全体の文末だけで判定すると、平叙文の嗜好表明に無関係な質問が
+    続く複合発話 (例:「Pythonが好きです。あなたは何が好きですか?」) まで
+    丸ごと除外してしまう (レビューで判明)。トリガ語を含む文だけを見て、
+    それが全て疑問形の場合のみ「質問文のみの根拠」とみなす。該当文が
+    無ければ (呼出側の判定に委ねるため) False を返す。
+    """
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(content) if s.strip()]
+    text_lower_sentences = [(s, s.lower()) for s in sentences]
+    relevant = [
+        s for s, s_lower in text_lower_sentences
+        if any(t in s_lower for t in trigger_words)
+    ]
+    if not relevant:
+        return False
+    return all(_QUESTION_ENDING_RE.search(s.strip()) for s in relevant)
+
+#: コード断片らしさの指標 (EvorefMem は EvorefLoop の utils を import できない
+#: ため、meta_cognitive_utils.contains_code_indicator と同旨の最小実装を持つ)
+_CODE_FRAGMENT_MARKERS: tuple[str, ...] = (
+    "import ", "from __future__", "def ", "class ", "return ",
+    "#!/", "```python", "@dataclass",
+)
+
+
+def _looks_like_code_fragment(content: str) -> bool:
+    """ノート内容がプログラムコードの断片らしいかを判定する。"""
+    if not content:
+        return False
+    hits = sum(1 for m in _CODE_FRAGMENT_MARKERS if m in content)
+    return hits >= 2
+
 
 def _sanitize_keyword(raw: str) -> str:
     """``mem.<kind>.<parts>`` に使える安全な文字列に変換する。
@@ -87,13 +146,21 @@ def _sanitize_keyword(raw: str) -> str:
 def _world_fact_keyword(note: MemoryNote) -> str:
     """world_fact の subject kind キーワードをノートから導く。
 
-    最初の `keywords` を採用し、無ければ内容先頭 24 文字を使う。
-    ``make_mem_subject`` 互換のサニタイズを掛けて返す。
+    `keywords` からストップワード (英語機能語 / フォーマット例トークン) を
+    除いた最初の候補を採用し、無ければ内容先頭 24 文字を使う。全候補が
+    無効な場合は :data:`_SAFE_KEYWORD_FALLBACK` を返す (呼出側で抽出を
+    スキップする)。
     """
-    if note.keywords:
-        return _sanitize_keyword(note.keywords[0])
+    for kw in note.keywords or []:
+        sanitized = _sanitize_keyword(kw)
+        if sanitized.lower() not in _WORLD_KEYWORD_STOPWORDS:
+            return sanitized
     text = " ".join((note.content or "").split())
-    return _sanitize_keyword(text[:24]) if text else _SAFE_KEYWORD_FALLBACK
+    if text:
+        sanitized = _sanitize_keyword(text[:24])
+        if sanitized.lower() not in _WORLD_KEYWORD_STOPWORDS:
+            return sanitized
+    return _SAFE_KEYWORD_FALLBACK
 
 
 class ChatExtractor(BaseExtractor):
@@ -128,17 +195,47 @@ class ChatExtractor(BaseExtractor):
                 result.already_extracted += 1
                 continue
             result.notes_processed += 1
-            tags = self._builder.candidate_fact_tags(note.content or "")
+            content = note.content or ""
+            is_assistant_note = getattr(note, "source", "user") != "user"
+            # 生成物 (コード等) の断片は user/world ファクトの素材にならない
+            # (2026-07-15: 誤ルート生成の Python コードが mem.world.from として
+            # 保存された)。コードらしいノートは抽出対象から外す。
+            if _looks_like_code_fragment(content):
+                result.notes_skipped += 1
+                continue
+            tags = self._builder.candidate_fact_tags(content)
             for tag in tags:
                 if tag not in self.SUPPORTED_TAGS:
                     continue
                 fact_type: FactType = tag  # type: ignore[assignment]
                 kind = _KIND_BY_TAG[tag]
                 if tag in _USER_SUBJECT_TAGS:
+                    # ロールガード: assistant 発話をユーザーの personal/
+                    # preference/emotion/opinion ファクトにしない (2026-07-15:
+                    # 「私は AI ですので…」が mem.personal.user に保存された)。
+                    if is_assistant_note:
+                        continue
+                    # ファイル出力の指示文 (明示パス付き) は嗜好/感情ではなく
+                    # 作業依頼なので preference/emotion/opinion にしない。
+                    if tag != "personal_fact" and _LOCAL_PATH_HINT_RE.search(content):
+                        continue
+                    # 質問文はユーザー自身の事実の表明ではないので候補にしない
+                    # (例: 「私の好きなプログラミング言語は？」は preference ではない)。
+                    # トリガ語を含む文だけを見て判定し、無関係な質問が後続する
+                    # 平叙文の嗜好表明 (例:「Pythonが好きです。何が好きですか?」)
+                    # までは除外しない。
+                    trigger_words = self._builder.fact_triggers.get(tag, ())
+                    if _tag_evidence_is_question_only(content, trigger_words):
+                        continue
                     subject = make_mem_subject(kind, "user")
                 else:
                     # world_fact のみ: keyword (sanitized) を parts に使用
-                    subject = make_mem_subject(kind, _world_fact_keyword(note))
+                    keyword = _world_fact_keyword(note)
+                    if keyword == _SAFE_KEYWORD_FALLBACK:
+                        # 有効な keyword を導けないノートは world_fact 化しない
+                        # (mem.world.unknown の量産防止)
+                        continue
+                    subject = make_mem_subject(kind, keyword)
                 fact = self.make_fact(
                     subject=subject,
                     predicate=_PREDICATE_BY_TAG.get(tag, "states"),

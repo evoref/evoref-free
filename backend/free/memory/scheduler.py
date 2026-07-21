@@ -287,6 +287,16 @@ class SleepTimeScheduler:
 
         以降: Level 1 のキックは行わない。Level 1 は
         独立常駐ループ `_schedule_level1_loop` で判定される（f_04 §5.3）。
+
+        キャンセルの意味論:
+        - **アイドル待機中** (実行前) のキャンセルは会話継続によるデバウンス
+          (毎応答で発生する正常動作)。outcome は success=True /
+          skipped_reason="debounced" で記録し、失敗として集計しない
+          (2026-07-15: 連続ターンセッションでデバウンス 20 件が
+          success=False で記録され「full が 20 連続失敗」に見えた)。
+        - **実行中** のキャンセル (ユーザー入力割込) のみ success=False。
+          run_full の各ステップは増分設計 (extracted_fact_ids マーク /
+          ingest オフセット / dedup) のため、中断分は次回 full で自然再開する。
         """
         # bg_task wrapper として trace_id を発行し、終了時に
         # outcome.jsonl へ結末記録 (evolve 限定)。
@@ -327,8 +337,17 @@ class SleepTimeScheduler:
             success = True
 
         except asyncio.CancelledError:
-            logger.debug("Full schedule cancelled")
             cancelled = True
+            if not executed:
+                # アイドル待機中のデバウンス (次の応答でタイマーが張り直される)
+                logger.debug("Full schedule debounced (cancelled while idle-waiting)")
+                success = True
+                skipped_reason = "debounced"
+            else:
+                logger.info(
+                    "Full sleep-time update cancelled mid-run "
+                    "(incremental steps resume on next full)",
+                )
             raise
         except Exception as e:
             logger.error("Full sleep-time update failed: %s", e, exc_info=True)
@@ -534,8 +553,13 @@ class SleepTimeScheduler:
                     continue
                 if self.is_user_active():
                     continue
-                # 前回実行から overdue_hours 未満なら待機 (未実行は inf=即 overdue)
-                if ls.seconds_since_level2_run() < overdue_sec:
+                # 次に試行される target (base/assist 交互スケジュール) を対象に
+                # overdue 判定する。単一値共有だった旧仕様では、一方の失敗が
+                # もう一方の overdue 判定まで巻き込んで 24h ブロックしていた
+                # 回帰 (2026-07-18) の修正。前回実行から overdue_hours 未満なら
+                # 待機 (未実行は inf=即 overdue)。
+                next_target = ls.next_level2_target()
+                if ls.seconds_since_level2_run(next_target) < overdue_sec:
                     continue
 
                 triggered = False

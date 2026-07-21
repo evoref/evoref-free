@@ -5,7 +5,6 @@
 	import { performPromptLocaleSwitch } from '$lib/free/services/configService';
 	import { addToast } from '$lib/free/stores/toast';
 	import SettingsSection from './SettingsSection.svelte';
-	import PresetSelector from './PresetSelector.svelte';
 	import FieldGroup from './fields/FieldGroup.svelte';
 	import TextField from './fields/TextField.svelte';
 	import NumberField from './fields/NumberField.svelte';
@@ -40,10 +39,7 @@
 	}
 </script>
 
-<div class="general-tab">
-	<PresetSelector />
-	<div class="general-body">
-		<SettingsSection tabId="general">
+<SettingsSection tabId="general">
 	<FieldGroup label="settings.group_instance">
 		<TextField
 			label="settings.instance.name"
@@ -132,19 +128,4 @@
 			onchange={handlePromptLocaleChange}
 		/>
 	</FieldGroup>
-		</SettingsSection>
-	</div>
-</div>
-
-<style>
-	.general-tab {
-		display: flex;
-		flex-direction: column;
-		height: 100%;
-	}
-
-	.general-body {
-		flex: 1;
-		min-height: 0;
-	}
-</style>
+</SettingsSection>

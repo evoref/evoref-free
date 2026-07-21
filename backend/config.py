@@ -85,6 +85,9 @@ class PathResolver:
         self._partition_enabled: bool = bool(
             (config.get("learning", {}) or {}).get("partition_by_base_model", True)
         )
+        # embed_instruction 系データの (embedding モデル) パーティション state。
+        # base 学習パーティション (_active_stem) とは独立した軸。
+        self._active_embed_stem: str | None = None
 
     def resolve_model(self, key: str) -> Path:
         """モデルパス解決
@@ -126,6 +129,34 @@ class PathResolver:
         ``ModelState.current_filename`` の stem で確定し、モデル切替時に更新する。
         """
         self._active_stem = stem or None
+
+    @property
+    def active_embedding_model_stem(self) -> str | None:
+        """embed_instruction パーティションの active 埋め込みモデル stem。"""
+        return self._active_embed_stem
+
+    def set_active_embedding_model_stem(self, stem: str | None) -> None:
+        """embed_instruction パーティションの active 埋め込みモデル stem を設定する。
+
+        base 学習パーティション (``set_active_model_stem``) とは独立した軸。
+        ``None`` / 空のときは ``resolve_embed_instruction_dir`` が flat レイアウト
+        (``resolve_local("prompts_dir")``) へ素通しする。
+        """
+        self._active_embed_stem = stem or None
+
+    def resolve_embed_instruction_dir(self) -> Path:
+        """embed_instruction 系データの保存先を **embedding モデル単位**で解決する。
+
+        embed_instruction は埋め込みモデル向けのクエリ指示文であり、base モデル
+        切替とは無関係に保持されるべきだが、従来 ``SystemPromptManager.prompt_dir``
+        (base 学習パーティション) に同居しており base モデル切替で誤って
+        切り替わっていた (2026-07-18)。partition 無効 / active embed stem 未確定
+        時は ``resolve_local("prompts_dir")`` (従来の flat 配置) へ素通しし、
+        後方互換を保つ。
+        """
+        if not self._partition_enabled or not self._active_embed_stem:
+            return self.resolve_local("prompts_dir")
+        return self.resolve_local("learning_dir") / "embed" / self._active_embed_stem
 
     def resolve_learning(self, key: str) -> Path:
         """base 学習データのパスを **active** モデルパーティション配下で解決する。

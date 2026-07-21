@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import Counter
 from dataclasses import asdict, fields
 from math import sqrt
@@ -55,6 +56,26 @@ _FITNESS_HI = 1.7
 _TOPK_SIM_WEIGHT = 0.7
 # select_top_k で類似計算する候補数の上限 (fitness 上位で足切りし hot path 遅延を抑制)。
 _TOPK_SELECT_CAP = 64
+# select_top_k の合成スコア下限。これ未満の候補はタスク無関連とみなして
+# 返さない (2026-07-15: 第 3 スロットに 0.28-0.33 帯の無関連例 (W杯話題等) が
+# 毎ターン混入していた)。
+_TOPK_MIN_SCORE = 0.40
+
+# タスク進捗ノート行 (エージェントの最終応答フォーマット)。
+# meta_cognitive_utils._TASK_LOG_LINE_RE と同旨だが、pillar 境界
+# (EvorefLearn → EvorefLoop の utils は import 対象外) のため最小実装を持つ。
+_TASK_LOG_LINE_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?\[(?:done|failed|skipped)\]\s"
+    r"|^\s*Written\s+\d+\s+bytes\s+to\s+\S",
+)
+
+
+def _response_is_task_log_only(response: str) -> bool:
+    """応答がタスク進捗ノート行だけで構成されるかを判定する。"""
+    lines = [ln for ln in response.split("\n") if ln.strip()]
+    if not lines:
+        return False
+    return all(_TASK_LOG_LINE_RE.match(ln) for ln in lines)
 
 # SemMem 書き戻し時の subject prefix
 # ``harness.fewshot.*`` から ``learn.fewshot.*`` に移行済。owner は EvorefLearn。
@@ -483,10 +504,12 @@ class FewShotPool(JsonStateStore):
             if fitness < self.min_fitness:
                 continue
 
-            # 成功例のみ（訂正・言い直しがない）
+            # 成功例のみ（訂正・言い直し・失敗ターンがない）
             if signals.get("user_correction") is not None:
                 continue
             if signals.get("rephrased_query", False):
+                continue
+            if signals.get("turn_outcome") == "failed":
                 continue
 
             query = exp.get("query", "").strip()
@@ -497,6 +520,13 @@ class FewShotPool(JsonStateStore):
 
             # クエリと応答が存在するか
             if not query or not response:
+                continue
+
+            # 応答がタスク進捗ノート形式 (- [done] ... Written N bytes) のみの
+            # 例は「報告だけ出せば正解」バイアスを注入するため採用しない
+            # (2026-07-15: この形式の例が毎ターン選択され本文なしの極小
+            # ファイル生成を誘発した)。
+            if _response_is_task_log_only(response):
                 continue
 
             example = FewShotExample(
@@ -661,7 +691,8 @@ class FewShotPool(JsonStateStore):
             for ex in pool
         ]
         scored.sort(key=lambda t: -t[0])
-        selected = [ex for _, ex in scored[:k]]
+        # 合成スコアが下限未満の候補は返さない (無関連例の混入防止)
+        selected = [ex for s, ex in scored[:k] if s >= _TOPK_MIN_SCORE]
 
         dl = self._debug_logger
         if dl:

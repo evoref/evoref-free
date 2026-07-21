@@ -128,10 +128,29 @@ class WorkingMemory:
                 self._evict_oldest()
 
     def _evict_oldest(self) -> None:
-        """最古ターンを押し出し"""
+        """最古ターンを押し出し
+
+        押し出し後に先頭へ露出した assistant ターンは、対になる user ターン
+        (直前に押し出された) を失った孤立発言であり、次回 LLM 呼出時に
+        messages 配列の先頭 (system 直後) へ verbatim で渡ってしまう。
+        文脈を失ったまま目立つ位置に居座ると、後続ターンで LLM がこの
+        孤立発言をそのまま複製する逐語的自己反復を招くため (2026-07-18
+        の会話ログで実際に発生・確認済み)、連鎖的に押し出す。
+
+        ただし連鎖は ``len(self.turns) > 1`` の間のみ行う。1 件を残して
+        止めないと、token 予算ループの ``while ... and len(self.turns) > 1``
+        ガード (押し出しは常に高々 1 ターンという前提で書かれている) が
+        破れ、1 回の呼出で残り 2 ターンが両方消え、直前に追加したばかりの
+        ターンごと会話履歴が空になる回帰を招く (レビューで判明)。孤立
+        ターンが最後の 1 件になった場合はそのまま残し、次の add_turn で
+        新しい user ターンが追加された後の押し出しで改めて連鎖させる。
+        """
         if self.turns:
             evicted = self.turns.pop(0)
             self._evicted.append(evicted)
+        while len(self.turns) > 1 and self.turns[0].get("role") == "assistant":
+            orphan = self.turns.pop(0)
+            self._evicted.append(orphan)
 
     def _total_tokens(self) -> int:
         """全ターンの推定トークン数"""

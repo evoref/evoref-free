@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import shlex
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -18,6 +17,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from backend.free.agent.reactive import GREETING_RESPONSES
+from backend.free.agent.router import HISTORY_KEYWORDS
+from backend.free.agent.safety_patterns import (
+    extract_python_c_payload,
+    reject_readonly_violation,
+)
 from backend.free.agent.tools_registry import ToolsRegistry
 from backend.free.llm.json_extract import extract_json_object
 from backend.log_config import get_logger
@@ -45,21 +49,9 @@ _NETWORK_EGRESS_MARKERS = (
 )
 
 
-def _extract_python_c_payload(command: str) -> str | None:
-    """``python -c <code>`` 形式ならその ``<code>`` を返す。それ以外は ``None``。"""
-    try:
-        tokens = shlex.split(command, posix=True)
-    except ValueError:
-        return None
-    if not tokens:
-        return None
-    base = Path(tokens[0]).name.lower()
-    if not (base.startswith("python") or base in {"py", "py.exe"}):
-        return None
-    for i, tok in enumerate(tokens[:-1]):
-        if tok == "-c":
-            return tokens[i + 1]
-    return None
+# 実装本体は safety_patterns へ移動 (readonly ガードと共有)。既存テスト /
+# 呼出側の互換のためエイリアスを残す。
+_extract_python_c_payload = extract_python_c_payload
 
 
 def _reject_synthesized_command(command: str) -> str | None:
@@ -84,15 +76,73 @@ def _reject_synthesized_command(command: str) -> str | None:
     return None
 
 
+def _executable_tool_for_mode(tools_registry: ToolsRegistry, mode: str) -> str:
+    """現在の ``mode`` で使える executable コマンドツール名を解決する。
+
+    coding では従来の ``run_command``、chat では読み取り専用の
+    ``run_command_readonly`` (modes=["chat"], hidden) を返す。どちらも使えない
+    場合は ``""``。
+
+    2026-07-18 の mode ゲート導入で chat の executable query (時刻 / OS /
+    スペック等) が合成成功後に必ず no_tool へ格下げされる回帰が起きたため、
+    executable 経路 (early-return / _infer_tool 実行可能クエリ分岐 / 層5
+    fallback / SemMem recall) はこのヘルパでツール名を解決する。mode ゲート
+    (_validate_tool_availability / deliberative 実行前ゲート) には例外を作らず、
+    「chat で使える実行ツールは readonly 検証付き func しか登録されていない」
+    を登録構造で保証する (docs/f_03_agent_engine.md §3.1)。
+    """
+    if tools_registry.is_available("run_command", mode):
+        return "run_command"
+    if tools_registry.is_available("run_command_readonly", mode):
+        return "run_command_readonly"
+    return ""
+
+
+def _readonly_command_rejected(exec_tool: str, command: str) -> bool:
+    """readonly ツールに載せる ``command`` が readonly 検証に違反するか。
+
+    ``exec_tool`` が ``run_command_readonly`` のときだけ
+    ``reject_readonly_violation`` を適用する (coding の run_command は対象外)。
+    judge 段でこれを弾くと、synth が返した非 readonly コマンド (PowerShell
+    スニペット等) が実行段の "Error: readonly violation" ではなく no_tool に
+    倒れ、LLM 知識回答へクリーンに落ちる。実行段のラッパ検証は最終防衛として
+    別途残る (二重ガード)。
+    """
+    if exec_tool != "run_command_readonly":
+        return False
+    reject = reject_readonly_violation(command)
+    if reject is not None:
+        logger.info(
+            "Readonly executable command rejected at judge stage (%s): %s",
+            reject, command[:80],
+        )
+        return True
+    return False
+
+
 # ルールベースフォールバック用パターン
 # 注意: 「検索」等の汎用語は知識質問にもマッチするため、
 # コード/ファイル文脈を要求するパターンのみ含める。
 _TOOL_PATTERNS = [
     re.compile(r"(?:ファイル|file).*(?:読|書|開|作成|削除)", re.IGNORECASE),
     re.compile(r"(?:コマンド|command).*(?:実行|run)", re.IGNORECASE),
-    # コード/ファイル検索: 汎用「検索」は知識質問にマッチするため除外
-    re.compile(r"(?:コード|ファイル|ソース|関数|クラス|code|file|source).*(?:検索|search|grep|find)", re.IGNORECASE),
-    re.compile(r"(?:検索|search|grep|find).*(?:コード|ファイル|ソース|code|file|source)", re.IGNORECASE),
+    # コード/ファイル検索: 汎用「検索」は知識質問にマッチするため除外。
+    # ASCII トークンは単語境界必須 ("crossencoder" の 'code' 等への部分一致誤爆対策、
+    # CPU/RAM 境界ガードと同じ理由)。日本語側 (コード/ファイル/ソース/検索) は対象外。
+    re.compile(
+        r"(?:コード|ファイル|ソース|関数|クラス|(?<![A-Za-z])code(?![A-Za-z])"
+        r"|(?<![A-Za-z])file(?![A-Za-z])|(?<![A-Za-z])source(?![A-Za-z]))"
+        r".*(?:検索|(?<![A-Za-z])search(?![A-Za-z])|(?<![A-Za-z])grep(?![A-Za-z])"
+        r"|(?<![A-Za-z])find(?![A-Za-z]))",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:検索|(?<![A-Za-z])search(?![A-Za-z])|(?<![A-Za-z])grep(?![A-Za-z])"
+        r"|(?<![A-Za-z])find(?![A-Za-z]))"
+        r".*(?:コード|ファイル|ソース|(?<![A-Za-z])code(?![A-Za-z])"
+        r"|(?<![A-Za-z])file(?![A-Za-z])|(?<![A-Za-z])source(?![A-Za-z]))",
+        re.IGNORECASE,
+    ),
     re.compile(r"(?:URL|url|https?://|ウェブ|web|サイト|site|ページ|page|ニュース|news|フェッチ|fetch|ブラウズ|browse)", re.IGNORECASE),
     re.compile(r"(?:計算|calculate)\s", re.IGNORECASE),
     # ファイルパスを含むクエリ（C:\, E:\, /home/ 等）+ 出力/保存/生成系動詞
@@ -106,7 +156,9 @@ _TOOL_PATTERNS = [
     # --- Python 実行可能クエリ: システム情報 ---
     # 注意: \b は日本語文字を \w とみなすため英語-日本語境界で機能しない。
     # 英語の短いキーワードは (?<![A-Za-z])...(?![A-Za-z]) で ASCII 境界を使用。
-    re.compile(r"(?:スペック|CPU|メモリ|RAM|GPU|VRAM|ディスク|容量|ストレージ|ドライブ|(?<![A-Za-z])spec(?![A-Za-z])|(?<![A-Za-z])drive(?![A-Za-z]))", re.IGNORECASE),
+    # CPU/RAM/GPU/VRAM も境界必須 (IGNORECASE で "program" の 'ram' 等に
+    # 部分マッチし、文書タスクへ OS スペックコマンドを誤発火した実績あり)。
+    re.compile(r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])|メモリ|(?<![A-Za-z])RAM(?![A-Za-z])|(?<![A-Za-z])GPU(?![A-Za-z])|(?<![A-Za-z])VRAM(?![A-Za-z])|ディスク|容量|ストレージ|ドライブ|(?<![A-Za-z])spec(?![A-Za-z])|(?<![A-Za-z])drive(?![A-Za-z]))", re.IGNORECASE),
     # 「何月|何日|何曜日」追加 (router.py:101 と同期)
     re.compile(r"(?:何時|何月|何日|何曜日|日時|日付|現在時刻|(?<![A-Za-z])today(?![A-Za-z])|(?<![A-Za-z])now(?![A-Za-z])|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z]))", re.IGNORECASE),
     re.compile(r"(?:IP\s*アドレス|ホスト名|(?<![A-Za-z])hostname(?![A-Za-z])|(?<![A-Za-z])ip\s*address)", re.IGNORECASE),
@@ -179,14 +231,19 @@ _EXECUTABLE_QUERY_COMMANDS: list[tuple[re.Pattern, "str | Callable[[str], str]"]
     ), 'python -c "import datetime; print(datetime.datetime.now())"'),
     # システムスペック（CPU / メモリ / ディスク）
     # ドライブレター指定があれば指定ドライブの容量を返す
+    # CPU/RAM 等の英字略語は ASCII 境界必須 ("program" の 'ram' 誤マッチ対策)
     (re.compile(
-        r"(?:スペック|CPU|メモリ|RAM|ディスク|容量|ストレージ|ドライブ"
+        r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])|メモリ"
+        r"|(?<![A-Za-z])RAM(?![A-Za-z])|ディスク|容量|ストレージ|ドライブ"
         r"|(?<![A-Za-z])spec(?![A-Za-z])"
         r"|(?<![A-Za-z])drive(?![A-Za-z]))",
         re.IGNORECASE,
     ), _build_spec_command),
     # GPU / VRAM
-    (re.compile(r"(?:GPU|VRAM)", re.IGNORECASE),
+    (re.compile(
+        r"(?:(?<![A-Za-z])GPU(?![A-Za-z])|(?<![A-Za-z])VRAM(?![A-Za-z]))",
+        re.IGNORECASE,
+    ),
      "python -c \""
      "import platform;"
      " print('Platform:',platform.platform());"
@@ -212,9 +269,9 @@ _EXECUTABLE_QUERY_COMMANDS: list[tuple[re.Pattern, "str | Callable[[str], str]"]
         r"|(?<![A-Za-z])Mac(?![A-Za-z]))",
         re.IGNORECASE,
     ), "python -c \""
-       "import platform;"
+       "import platform,sys;"
        " print(platform.platform());"
-       " print(platform.system(),platform.release())"
+       " print(sys.platform,platform.release())"
        "\""),
     # Python バージョン
     (re.compile(
@@ -275,12 +332,171 @@ grammar 非強制モデルでも余計な空白で token を浪費して切り�
 
 
 # 知識質問パターン — ツール判定をスキップすべきクエリ
+# 「簡単に説明してください」「〜の使い分けは？」は疑問形の末尾 (教えて/ですか等)
+# を伴わない体言止め・依頼形のため、上のパターンにマッチせず層4 (assist
+# tool_judgment) まで素通りしていた。実インシデント (2026-07-20):
+# 「カーディネーリティという言葉を初めて知りました。簡単に説明してください。」
+# で無関係な過去セッションが誤ヒット (score=0.5)、「インターフェースと抽象
+# クラスの使い分けは？」で search_history が "No results found" を返す —
+# どちらも履歴参照の意図が皆無な純粋な知識質問で、小型 assist モデルが
+# tool_needed=True と誤判定した。
 _KNOWLEDGE_PATTERNS = [
     re.compile(r"(?:教えて|おしえて|とは|って何|ですか|でしょうか|ありますか)", re.IGNORECASE),
     re.compile(r"(?:について|に関して|に関する)", re.IGNORECASE),
     re.compile(r"(?:知りたい|確認したい|調べたい)", re.IGNORECASE),
+    re.compile(r"(?:説明して|使い分け)", re.IGNORECASE),
     re.compile(r"(?:what is|tell me|explain|describe)\b", re.IGNORECASE),
 ]
+
+# アシスタント自身の意見・嗜好・感想を尋ねる質問パターン — 「好きな〜は
+# ありますか」「好きな〜とかあったりしますか」等。search_history は
+# ユーザー自身の過去発言を検索するツールであり、アシスタント自身の意見を
+# 尋ねる質問には無関係だが、明確なツールシグナルが無いため層4 (assist
+# tool_judgment) まで素通りし、小型 assist モデルが誤って search_history を
+# 選ぶ実インシデントが多発した (2026-07-17/18 の2日分ログで
+# tool_call_decision=assist の 48% が該当)。「あったりしますか」等の口語的な
+# 疑問文末尾も拾う (上の _KNOWLEDGE_PATTERNS の「ありますか」は完全一致部分
+# 文字列のみを拾うため「あったりします(か)」を取りこぼす)。
+# あえて _KNOWLEDGE_PATTERNS 側に「あったり」単体を追加しない: _KNOWLEDGE_PATTERNS
+# は _judge_with_rules (層1) でも無条件に (一人称マーカーを考慮せず) 参照される
+# ため、汎用パターンとして追加すると「私は好きな〜あったりしますか」のような
+# 一人称クエリまで層1で誤って即 no_tool になり、下記の一人称除外が層4に届く
+# 前に握り潰されてしまう (レビューで判明)。
+# ただし「私の/私は/僕の/僕は/自分の/自分は」等の一人称マーカーを含む場合は
+# ユーザー自身の過去発言 (例:「私の好きなプログラミング言語は？」) を指す
+# 可能性があるため除外せず、層4 (assist) 判定に委ねる (実際に "Rust" 等の
+# 固有名詞を正しく抽出できた実績がある)。
+_ASSISTANT_PREFERENCE_PATTERNS = [
+    re.compile(
+        r"(?:好きな|嫌いな|得意な|苦手な|おすすめの).{0,20}?"
+        r"(?:ますか|ありますか|でしょうか|ですか"
+        # 「あったり」は文中でも出現しやすい語のため (例:「あったりして
+        # 困った」)、疑問文末尾の用法に限定して文末アンカーを課す。
+        r"|あったり(?:します)?(?:か)?[？?]?\s*$)",
+    ),
+]
+_FIRST_PERSON_REFERENCE_RE = re.compile(
+    r"私の|私が|私は|僕の|僕が|僕は|俺の|俺が|俺は"
+    r"|自分の|自分が|自分は|わたしの|わたしが|わたしは",
+)
+
+# セッション自己参照パターン — 「この会話で」等、現在のセッション自体を参照
+# する発話。会話履歴は working memory の予算を超えると古いターンからコンテキ
+# ストに含まれなくなるため、層4 (tool_judgment) を無条件スキップすると
+# 「会話の最初に〜」のような長距離 recall が失敗する (2026-07-19 実インシデ
+# ント: 20+ ターンの会話で最初の発話内容を正しく想起できなかった)。
+# そのため層4 のスキップ判定には使わず、``ToolCallJudge._maybe_scope_session_
+# search`` が search_history 選択後に ``tool_args["session_id"]`` を強制注入し、
+# 現在セッションのみへスコープ限定する形で対応する。
+# 実インシデント (2026-07-17/18): 「この会話で一番面白かったやり取りは？」が
+# スコープ限定前の search_history に振られ、無関係な過去セッション (別日の
+# 雑談) の内容を誤って参照・混同した。session_id スコープ限定によりこの事故
+# 再発を防ぎつつ、同一セッション内の recall は許可する。
+#
+# 「この会話」等の言及だけで無条件マッチにすると、「この会話の続きですが、
+# 量子もつれについて詳しく教えて」のように自己参照を前置きにしつつ外部知識を
+# 要する質問まで誤ってスキップしてしまうため、会話自体を振り返る反省的な語
+# (面白い/振り返る/まとめ/感想等) との近接共起を要求する。
+# 近接窓は「同一文内 (句点・疑問符・感嘆符を跨がない) の 40 文字以内」。
+# 旧実装の任意文字 {0,20} は「この会話で一番最初に私が計算させた問題は
+# 何だったか覚えてますか？」(間 21 文字) を 1 文字超過で取りこぼし、
+# session_id 非注入 → 全セッション横断検索で前回会話の類似ターンがヒット
+# する near-miss を起こした (2026-07-20 ライブ再検証で確認)。一方、窓を
+# 任意文字のまま {0,50} へ広げるだけでは「この会話とは別に、相対性理論に
+# ついて詳しく教えてください。とても面白いですよね？」のような外部知識
+# 質問まで誤ってマッチする (過去レビューで判明) ため、(a) 文境界を跨がない
+# 文字クラスで窓を絞り、(b) 「とは別/とは関係」等の明示的な話題切断の
+# 前置きを negative lookahead で弾く、の二重ガード付きで窓を 40 に広げる。
+# (pillar境界のため backend/free/rag/self_rag_judge.py の
+# TRIVIAL_QUESTION_PATTERNS と同義の定義を重複させている。両ファイルを
+# 変更する際は同期させること)。
+# 反省的な語には時系列順序語 (最初/最後/何番目/何回目) も含める。
+# 「この会話で一番最初に計算させた問題は?」(2026-07-21 ライブ検証 ターン18)
+# は反省語 (覚えて等) を欠きスコープ注入が漏れ、cross-session 検索が前回
+# 会話の類似ターンを引き当て誤答した。順序語の追加でマッチ面が広がる分、
+# 「この会話じゃなくて/ではなく」の明示的な話題切断も lookahead へ追加する。
+_SELF_SESSION_REFERENCE_PATTERNS = [
+    re.compile(
+        r"(?:この会話|このやり取り|今までの(?:会話|やり取り)"
+        r"|今日の(?:追加分の)?会話|今回の(?:追加分の)?会話)"
+        r"(?!とは別|とは関係|は関係な|じゃなく|ではなく)"
+        r"[^。．!！?？\n]{0,40}?"
+        r"(?:面白|印象|振り返|まとめ|要約|感想|どう思|覚えて|何でした|どうでした"
+        r"|最初|最後|何番目|何回目)",
+    ),
+]
+
+def _coerce_positive_int(value: object) -> int | None:
+    """assist の型崩れ JSON 由来の値を正の int へ正規化する (int / 数値文字列 /
+    整数値 float を受理)。bool や非数値、0 以下は ``None`` を返す。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        return int(value) if value.is_integer() and value > 0 else None
+    if isinstance(value, str):
+        s = value.strip()
+        if s.isdigit():
+            n = int(s)
+            return n if n > 0 else None
+    return None
+
+
+# 時系列順序指定を含む履歴クエリの検出 (「一番最初に」「最後に」等)。
+# assist が合成する小さい limit (例: limit=1) は字句スコア最上位への
+# 切り詰めであり時系列意味論を持たないため、順序指定クエリでは limit を
+# ハンドラ既定値まで引き上げ、turn# 付きの全マッチターンを digest に渡す。
+_ORDERED_HISTORY_QUERY_RE = re.compile(
+    r"最初|最後|何番目|何回目|直近|first|last|earliest|latest",
+    re.IGNORECASE,
+)
+
+# builtin._make_search_history の limit 既定と同期
+_HISTORY_SEARCH_DEFAULT_LIMIT = 10
+
+# 順序リコール質問から search_history 用の内容キーワードを抽出するための定義。
+# 「この会話で一番最初に計算させた問題は何？」→「計算」。
+# 除去対象の scaffolding フレーズ (self-reference / 複合順序語)。単純な文字
+# クラス抽出では「一番最初」等が 1 つの漢字ランに連結するため、先にフレーズ
+# 単位で除去してから内容ランを取り出す。
+_ORDER_QUERY_SCAFFOLD_RE = re.compile(
+    r"今までの(?:会話|やり取り)|今日の(?:追加分の)?会話|今回の(?:追加分の)?会話"
+    r"|前回の会話|この会話|このやり取り|その会話"
+    r"|一番最初|一番最後|何番目|何回目",
+)
+# 内容ラン (漢字 / カタカナ / ラテン / 数字。ひらがなの助詞・活用語尾は自然に
+# 脱落する)。
+_ORDER_QUERY_CONTENT_RE = re.compile(
+    r"[一-鿿゠-ヿ々〆a-zA-Z0-9]+",
+)
+# 内容ランのうち scaffolding とみなして落とす語 (質問・順序・自己参照の骨組み)。
+_ORDER_QUERY_STOPWORD_RUNS = frozenset({
+    "会話", "一番", "最初", "最後", "直近", "以前", "前回", "今日", "今回", "今",
+    "問題", "質問", "内容", "話題", "話", "何", "誰", "私", "貴方", "君", "僕",
+    "俺", "覚", "番目", "回目", "先",
+})
+
+
+def _reduce_ordered_history_query(query: str) -> str:
+    """順序リコール質問から search_history 用の内容キーワードを抽出する。
+
+    レイヤー5.5 の強制フォールバックは search_history に生クエリ全文を渡すが、
+    HistoryManager の字句照合は長い疑問文を短い会話ターンにマッチできない
+    (2026-07-21 ライブ検証: 「この会話で一番最初に計算させた問題は何？」が
+    索引の search_text に「計算」を含むのに No results found)。self-reference /
+    順序語 / 疑問 scaffolding を除去して内容キーワード (例: 計算) を残す。
+    抽出できなければ生クエリを返す (悪化させない安全側)。digest には別途 raw
+    query が渡るため、順序解釈 (「一番最初」) はこの縮約で失われない。
+    """
+    stripped = _ORDER_QUERY_SCAFFOLD_RE.sub(" ", query)
+    terms = [
+        run
+        for run in _ORDER_QUERY_CONTENT_RE.findall(stripped)
+        if run not in _ORDER_QUERY_STOPWORD_RUNS
+    ]
+    reduced = " ".join(terms).strip()
+    return reduced if len(reduced) >= 2 else query
 
 # ユーザー自身の行動宣言パターン — アシスタントへの依頼ではない雑談発話。
 # 「探してみるね」のような一人称の意思表明をツール起動と誤解しないための除外。
@@ -290,8 +506,25 @@ _SELF_ACTION_PATTERNS = [
     re.compile(r"(?:て|で)みる(?:ね|よ|わ|な|かな|から)?[\s　!！。.…]*$"),
     # 「〜しておく/やっておく/調べておく(ね/よ)」自己完結の行動宣言 (文末)
     re.compile(r"(?:してお|やってお|探してお|調べてお|見てお|やっと)く(?:ね|よ|わ|から)?[\s　!！。.…]*$"),
-    # 一人称主語で自分が行う宣言
-    re.compile(r"(?:自分で|自分が|私が|僕が|俺が|わたしが|こっちで|こちらで)"),
+    # 一人称主語で自分が行う宣言 (文末の意思・断定形に限定)。
+    # 旧実装は主語マーカー単独の無アンカー部分一致で、「この会話で一番最初に
+    # 私が計算させた問題は何だったか覚えてますか？」のような関係節中の一人称
+    # 主語まで自己行動宣言と誤検出し skip_judgment=True を招いていた
+    # (2026-07-20 ライブ検証で確認、層5.5 フォールバックが実害を吸収)。
+    # 主語マーカーの後、同一文内 (文境界・疑問符を跨がない) で動詞終止形
+    # (u 段かな) または ます形の文末で終わる発話のみ宣言とみなす。
+    # 丁寧断定「です」は情報提供であって行動宣言ではないため lookbehind で
+    # 除外し (「ます」の「す」は前が「ま」なので通る)、疑問形終端
+    # (「〜ますか？」等) は末尾許容クラスに「？」を含めないことで弾く。
+    # 取りこぼし (「私がやるから大丈夫」等の複文) は層4 assist 判定に
+    # 落ちるだけで安全側。
+    re.compile(
+        r"(?:自分で|自分が|私が|僕が|俺が|わたしが|こっちで|こちらで)"
+        r"[^。．!！?？\n]*"
+        r"(?:[うくぐつぬぶむる]|(?<!で)す)"
+        r"(?:ね|よ|わ|から|かな)?"
+        r"[\s　!！。.…]*$",
+    ),
 ]
 
 
@@ -311,6 +544,13 @@ def _is_conversational_query_without_tool_signal(query: str) -> bool:
 
     - 知識質問 (「とは」「教えて」等) — RAG / LLM 知識で答える
     - ユーザー自身の行動宣言 (「探してみるね」「自分で調べる」等) — 依頼ではない
+    - アシスタント自身の意見・嗜好を尋ねる質問 (「好きな〜はありますか」等、
+      一人称マーカーを含まないもの) — search_history 等の過去発言検索は無関係
+
+    セッション自己参照 (「この会話で」等、``_SELF_SESSION_REFERENCE_PATTERNS``)
+    はここでは判定しない。長距離 recall のため層4 判定は通常どおり実行させ、
+    search_history が選ばれた場合は ``_maybe_scope_session_search`` が事後的に
+    現在セッションへスコープ限定する (詳細は同定数の定義コメント参照)。
 
     時刻・スペック等の実行可能事実クエリやファイルパス・URL を含むクエリは
     ``_TOOL_PATTERNS`` / パスシグナルで弾かれるため、誤って no-tool に倒さない。
@@ -319,10 +559,25 @@ def _is_conversational_query_without_tool_signal(query: str) -> bool:
     """
     if _query_has_tool_signal(query):
         return False
+    if (
+        any(p.search(query) for p in _ASSISTANT_PREFERENCE_PATTERNS)
+        and not _FIRST_PERSON_REFERENCE_RE.search(query)
+    ):
+        return True
     return (
         any(p.search(query) for p in _KNOWLEDGE_PATTERNS)
         or any(p.search(query) for p in _SELF_ACTION_PATTERNS)
     )
+
+
+def _has_history_recall_keywords(query: str) -> bool:
+    """明示的な履歴参照キーワード (router.HISTORY_KEYWORDS) を含むか。
+
+    router.ComplexityClassifier._has_history_keywords と同じ判定 (小文字化
+    後の部分文字列一致) を、layer 分類とは独立に tool 強制発火の判定に使う。
+    """
+    q_lower = query.lower()
+    return any(kw in q_lower for kw in HISTORY_KEYWORDS)
 
 
 @dataclass
@@ -444,6 +699,7 @@ class ToolCallJudge:
         tools_registry: ToolsRegistry,
         mode: str = "coding",
         conversation: list[dict] | None = None,
+        session_id: str = "",
     ) -> ToolJudgement:
         """ツール呼び出しの要否を判定
 
@@ -460,6 +716,11 @@ class ToolCallJudge:
             tools_registry: 利用可能なツールレジストリ
             mode: 動作モード ('chat' | 'coding')
             conversation: 直近の会話履歴（判定精度向上のため）
+            session_id: 現在のチャットセッション ID。search_history が選ばれ、
+                かつクエリが「この会話で」等のセッション自己参照パターンに
+                一致する場合に ``_maybe_scope_session_search`` が
+                ``tool_args["session_id"]`` へ注入し、検索を現在セッションに
+                限定する (未指定時は従来どおり cross-session 検索のまま)。
 
         Returns:
             ToolJudgement
@@ -474,6 +735,9 @@ class ToolCallJudge:
             query, tools_registry, mode=mode,
         )
         if url_recall_result is not None:
+            url_recall_result = self._validate_tool_availability(
+                url_recall_result, tools_registry, mode,
+            )
             self._log_tool_decision(url_recall_result, "url_recall_matched")
             return url_recall_result
 
@@ -486,6 +750,9 @@ class ToolCallJudge:
             query, tools_registry, mode=mode,
         )
         if cmd_recall_result is not None:
+            cmd_recall_result = self._validate_tool_availability(
+                cmd_recall_result, tools_registry, mode,
+            )
             self._log_tool_decision(
                 cmd_recall_result, "executable_command_recall_matched",
             )
@@ -510,26 +777,36 @@ class ToolCallJudge:
                     tool_args={"url": url_match.group(1)},
                     source="rule",
                 )
+                result = self._validate_tool_availability(
+                    result, tools_registry, mode,
+                )
                 self._log_tool_decision(result, "chat_mode_explicit_url")
                 return result
 
             # assist 優先で実行可能コマンドを解決する。assist 未接続 / 失敗
             # 時はモジュールレベル sync 関数 (regex テーブル) にフォールバック。
-            command = await self._resolve_executable_command(query)
-            if command and tools_registry.has("run_command"):
-                logger.debug(
-                    "Chat mode executable query detected: %s", query[:50],
-                )
-                # assist が解決したか regex フォールバックかは
-                # _command_cache_lookup の有無で判別可能だが、source は
-                # ログ用途のため簡略化して "rule" のまま返す
-                # (キャッシュヒット = assist 由来でも "rule" でログされる)。
-                return ToolJudgement(
-                    tool_needed=True,
-                    tool_name="run_command",
-                    tool_args={"command": command},
-                    source="rule",
-                )
+            # ツール名は mode から解決する (chat は run_command_readonly)。
+            # 解決不能な構成では assist 往復を省略して即 no_tool。
+            exec_tool = _executable_tool_for_mode(tools_registry, mode)
+            if exec_tool:
+                command = await self._resolve_executable_command(query)
+                if command and not _readonly_command_rejected(exec_tool, command):
+                    logger.debug(
+                        "Chat mode executable query detected: %s", query[:50],
+                    )
+                    # assist が解決したか regex フォールバックかは
+                    # _command_cache_lookup の有無で判別可能だが、source は
+                    # ログ用途のため簡略化して "rule" のまま返す
+                    # (キャッシュヒット = assist 由来でも "rule" でログされる)。
+                    result = ToolJudgement(
+                        tool_needed=True,
+                        tool_name=exec_tool,
+                        tool_args={"command": command},
+                        source="rule",
+                    )
+                    return self._validate_tool_availability(
+                        result, tools_registry, mode,
+                    )
             return ToolJudgement(tool_needed=False, source="rule")
 
         # 1. 組み込みパターン照合（ルールベース）
@@ -539,14 +816,20 @@ class ToolCallJudge:
             # / 失敗時は regex 由来の既存コマンドを維持)
             result = await self._maybe_upgrade_command_via_assist(result, query)
             await self._maybe_recall_url(result, query, mode=mode)
+            self._maybe_scope_session_search(result, query, session_id)
             result = self._suppress_unfetchable_fetch_url(result)
+            result = self._suppress_commandless_run_command(result)
+            result = self._suppress_expressionless_calculate(result)
+            result = self._validate_tool_availability(result, tools_registry, mode)
             self._log_tool_decision(result, "rule_pattern_matched")
             return result
 
         # 2. カートリッジ tool_hints 照合
         result = self._judge_with_cartridge_hints(query, tools_registry)
         if result.tool_needed:
+            self._maybe_scope_session_search(result, query, session_id)
             result = self._suppress_unfetchable_fetch_url(result)
+            result = self._validate_tool_availability(result, tools_registry, mode)
             self._log_tool_decision(result, "cartridge_hint_matched")
             return result
 
@@ -555,7 +838,11 @@ class ToolCallJudge:
         if result.tool_needed:
             result = await self._maybe_upgrade_command_via_assist(result, query)
             await self._maybe_recall_url(result, query, mode=mode)
+            self._maybe_scope_session_search(result, query, session_id)
             result = self._suppress_unfetchable_fetch_url(result)
+            result = self._suppress_commandless_run_command(result)
+            result = self._suppress_expressionless_calculate(result)
+            result = self._validate_tool_availability(result, tools_registry, mode)
             self._log_tool_decision(result, "learned_pattern_matched")
             return result
 
@@ -580,7 +867,7 @@ class ToolCallJudge:
         spec_task: asyncio.Task | None = None
         if run_layer4 and self._speculation_enabled():
             spec_task = asyncio.create_task(
-                self._judge_with_executable_fallback(query, tools_registry),
+                self._judge_with_executable_fallback(query, tools_registry, mode),
             )
         try:
             # 4. アシストモデル判定（有効時のみ）
@@ -599,8 +886,22 @@ class ToolCallJudge:
                     assist_result = await self._judge_with_assist(
                         query, tools_registry, mode, conversation,
                     )
+                    self._maybe_scope_session_search(assist_result, query, session_id)
+                    self._maybe_expand_ordered_history_search(assist_result, query)
                     assist_result = self._suppress_unfetchable_fetch_url(
                         assist_result,
+                    )
+                    assist_result = self._suppress_commandless_run_command(
+                        assist_result,
+                    )
+                    assist_result = self._suppress_expressionless_calculate(
+                        assist_result,
+                    )
+                    assist_result = self._suppress_hidden_tool_from_assist(
+                        assist_result, tools_registry,
+                    )
+                    assist_result = self._validate_tool_availability(
+                        assist_result, tools_registry, mode,
                     )
                     if assist_result.tool_needed:
                         self._log_tool_decision(assist_result, "assist_judgement")
@@ -629,13 +930,62 @@ class ToolCallJudge:
                     fallback_result = None
             else:
                 fallback_result = await self._judge_with_executable_fallback(
-                    query, tools_registry,
+                    query, tools_registry, mode,
                 )
             if fallback_result is not None:
                 self._log_tool_decision(
                     fallback_result, "executable_command_fallback",
                 )
                 return fallback_result
+
+            # 5.5. 履歴参照キーワードのフォールバック強制発火 (安全網)
+            # router.HISTORY_KEYWORDS 相当の明示的な recall 語 (「覚えて」
+            # 「最初に」等) を含むクエリで、層4 (assist) が no_tool と判定した
+            # 場合の最終防衛線。小型 assist モデルの確率的な見落としで
+            # search_history が一度も呼ばれず、長距離 recall がベースモデルの
+            # 幻覚に倒れる実インシデントがあった (2026-07-20:「この会話で一番
+            # 最初に私が計算させた問題は何だったか覚えてますか？」で
+            # search_history 未発火 → 受動 RAG (quality=medium) のみで
+            # 「そんな計算はなかった」と誤って断言)。
+            # query は原則ユーザーの生クエリをそのまま渡す (search_history の
+            # 照合は字句重なりベースのため、既に会話内で言及済みの語彙を含む
+            # 再質問では十分ヒットしうる)。ただし順序リコール質問
+            # (「一番最初に〜した〜は？」等) は生クエリ全文が長すぎて短い
+            # 会話ターンに字句マッチせず空振りする (2026-07-21 ライブ検証で
+            # 確認) ため、_reduce_ordered_history_query で内容キーワードへ
+            # 縮約する (「この会話で一番最初に計算させた問題は何？」→「計算」)。
+            # 順序解釈は digest 側が受け取る raw query が担うため縮約で失われ
+            # ない。ヒットしなくても "No results found" 経由で「見つからな
+            # かった」という正直な応答に倒れるため、無言のまま確信を持って
+            # 幻覚するより悪化はしない。
+            # skip_judgment (雑談プレフィルタ) の判定結果に関わらず適用する:
+            # 元インシデントのクエリ自体が `_SELF_ACTION_PATTERNS` の
+            # 「私が」(無アンカーの部分一致) に「私が計算させた」の関係節部分で
+            # 誤って一致し skip_judgment=True になっていた (2026-07-20 テストで
+            # 判明)。履歴参照キーワードという強いシグナルがある以上、雑談判定
+            # 側の誤検出よりこちらを優先する。
+            if (
+                tools_registry.has("search_history")
+                and _has_history_recall_keywords(query)
+            ):
+                search_query = query
+                if _ORDERED_HISTORY_QUERY_RE.search(query):
+                    search_query = _reduce_ordered_history_query(query)
+                forced_result = ToolJudgement(
+                    tool_needed=True,
+                    tool_name="search_history",
+                    tool_args={"query": search_query, "mode": mode},
+                    source="rule",
+                )
+                self._maybe_scope_session_search(forced_result, query, session_id)
+                forced_result = self._validate_tool_availability(
+                    forced_result, tools_registry, mode,
+                )
+                if forced_result.tool_needed:
+                    self._log_tool_decision(
+                        forced_result, "history_keyword_forced_fallback",
+                    )
+                    return forced_result
 
             # 6. 全フォールバック失敗時の no_tool 結末を記録
             no_tool_result = ToolJudgement(tool_needed=False, source="rule")
@@ -655,7 +1005,7 @@ class ToolCallJudge:
                 spec_task.cancel()
 
     async def _judge_with_executable_fallback(
-        self, query: str, tools_registry: ToolsRegistry,
+        self, query: str, tools_registry: ToolsRegistry, mode: str = "coding",
     ) -> "ToolJudgement | None":
         """4 層判定後の executable command フォールバック (5 層目).
 
@@ -668,14 +1018,22 @@ class ToolCallJudge:
         再利用するため、Free chat mode の early-return と LRU キャッシュを
         共有する (同一 query は重複呼出ゼロ)。
 
+        ツール名は ``_executable_tool_for_mode`` で mode から解決する
+        (coding → run_command / chat → run_command_readonly)。どちらも使えない
+        構成では assist 呼出自体を省略する (判定確定前にここで弾かないと環境
+        依存事実クエリのたびに無駄な assist 往復 (約2秒) が発生し、かつ判定
+        結果が tool_needed=True のまま返って turn_outcome=failed → 誤学習
+        カスケードを招く。2026-07-18 の会話ログで実際に発生・確認済み)。
+
         Returns:
-            実行可能と判定された場合 ``ToolJudgement(run_command, ...)``。
-            機能 OFF / pre-filter 弾き / assist が否定 / assist 失敗の場合は
-            ``None`` (呼出側は no-tool として処理する)。
+            実行可能と判定された場合 ``ToolJudgement(<exec_tool>, ...)``。
+            機能 OFF / pre-filter 弾き / assist が否定 / assist 失敗 / 現在
+            mode で利用不可の場合は ``None`` (呼出側は no-tool として処理する)。
         """
         if not self._executable_fallback_enabled:
             return None
-        if not tools_registry.has("run_command"):
+        exec_tool = _executable_tool_for_mode(tools_registry, mode)
+        if not exec_tool:
             return None
         if self._assist_client is None:
             return None
@@ -692,16 +1050,60 @@ class ToolCallJudge:
         is_exec, command = synth
         if not is_exec or not command:
             return None
+        if _readonly_command_rejected(exec_tool, command):
+            return None
         logger.info(
             "Executable command synthesized via 5th layer fallback: query=%s",
             query[:50],
         )
         return ToolJudgement(
             tool_needed=True,
-            tool_name="run_command",
+            tool_name=exec_tool,
             tool_args={"command": command},
             source="assist",
         )
+
+    def _validate_tool_availability(
+        self, result: "ToolJudgement", tools_registry: ToolsRegistry, mode: str,
+    ) -> "ToolJudgement":
+        """tool_name が実在し、かつ現在の mode で利用可能かを最終チェックする。
+
+        ``_judge_with_rules`` / ``_judge_with_learned_patterns`` 等の各判定層は
+        ``tools_registry.has()`` (存在チェックのみ、mode 非考慮) で判定するため、
+        chat モードで ``modes=["coding"]`` のツール (例: run_command) が
+        ``tool_needed=True`` のまま返り得る。実行自体は
+        ``deliberative._execute_tool`` のモードゲートで阻止されるが、判定結果が
+        True のまま turn_outcome=failed → 次ターンの訂正誤検出 → 無関係語の
+        correction 誤学習、というカスケードを引き起こす (2026-07-18 の会話
+        ログで実際に発生・確認済み)。
+
+        また ``_json_to_judgement`` は ``tool == "no_tool"`` の完全一致でのみ
+        no-tool と判定するため、tool_judgment 応答が max_tokens 到達で
+        ``{"tool": "no_`` のように途中切断され ``json_repair`` が
+        ``tool_name="no_"`` へ復元した場合、存在しないツール名のまま
+        ``tool_needed=True`` で返ってしまう (2026-07-18 実インシデントで確認)。
+        レジストリに存在しないツール名も判定確定の最終防衛としてここで
+        no_tool に倒す。
+        """
+        if not result.tool_needed or not result.tool_name:
+            return result
+        tool_def = tools_registry.get(result.tool_name)
+        if tool_def is None:
+            logger.info(
+                "Tool %s not found in registry (truncated JSON or "
+                "hallucinated name?); downgrading to no_tool before "
+                "returning judgement",
+                result.tool_name,
+            )
+            return ToolJudgement(tool_needed=False, source=result.source)
+        if mode not in tool_def.modes:
+            logger.info(
+                "Tool %s not available in mode=%s (allowed: %s); "
+                "downgrading to no_tool before returning judgement",
+                result.tool_name, mode, tool_def.modes,
+            )
+            return ToolJudgement(tool_needed=False, source=result.source)
+        return result
 
     def _suppress_unfetchable_fetch_url(
         self, result: "ToolJudgement",
@@ -726,6 +1128,96 @@ class ToolCallJudge:
         logger.info(
             "Suppressing fetch_url with no URL argument (no recall hit, "
             "no in-query URL); LLM will respond from prior knowledge",
+        )
+        return ToolJudgement(
+            tool_needed=False,
+            tool_name="",
+            tool_args={},
+            source=result.source,
+        )
+
+    def _suppress_commandless_run_command(
+        self, result: "ToolJudgement",
+    ) -> "ToolJudgement":
+        """command 引数を補完できない ``run_command`` を ``tool_needed=False`` に格下げ.
+
+        ``_suppress_unfetchable_fetch_url`` と対称。rule / learned 層は字句
+        マッチだけで ``run_command`` を選ぶことがあり (learned 層は
+        ``_infer_tool`` が推定できない場合の run_command フォールバックを持つ)、
+        ``_maybe_upgrade_command_via_assist`` の assist 合成でも command が
+        埋まらなかった場合、実行段階で "requires args but none provided" と
+        空振りするだけの判定が残る。実インシデント (2026-07-20 ライブ検証):
+        学習済み tool_routing パターン「説明」(w=0.630) が知識質問
+        「〜を説明して」にマッチし、coding モードで引数なし run_command が
+        返り得た (chat モードは run_command の mode ゲートで偶然無害化されて
+        いた)。ここで no_tool に倒し、クエリを通常の LLM 応答パスに落とす。
+        """
+        if not result.tool_needed or result.tool_name not in (
+            "run_command", "run_command_readonly",
+        ):
+            return result
+        if (result.tool_args or {}).get("command"):
+            return result
+        logger.info(
+            "Suppressing %s with no command argument (no rule "
+            "inference, no assist synthesis); downgrading to no_tool",
+            result.tool_name,
+        )
+        return ToolJudgement(
+            tool_needed=False,
+            tool_name="",
+            tool_args={},
+            source=result.source,
+        )
+
+    def _suppress_hidden_tool_from_assist(
+        self, result: "ToolJudgement", tools_registry: ToolsRegistry,
+    ) -> "ToolJudgement":
+        """assist (tool_judgment) が hidden ツール名を返した場合 no_tool に格下げ.
+
+        hidden ツール (run_command_readonly 等) はプロンプトのツール一覧
+        (``get_descriptions_text``) に出ないため、assist がその名前を返すのは
+        定義上 hallucination。``_validate_tool_availability`` は登録済み +
+        mode 適合なら通してしまう (chat で modes=["chat"] の hidden ツールは
+        素通り) ため、assist 層専用の防衛としてここで弾く。judge のコード側
+        注入経路 (early-return / recall / fallback / _infer_tool) は本メソッド
+        を通らないため影響しない。
+        """
+        if not result.tool_needed or not result.tool_name:
+            return result
+        tool_def = tools_registry.get(result.tool_name)
+        if tool_def is None or not tool_def.hidden:
+            return result
+        logger.warning(
+            "Suppressing hidden tool %s returned by assist judgement "
+            "(not in prompt tool list); downgrading to no_tool",
+            result.tool_name,
+        )
+        return ToolJudgement(tool_needed=False, source=result.source)
+
+    def _suppress_expressionless_calculate(
+        self, result: "ToolJudgement",
+    ) -> "ToolJudgement":
+        """expression 引数を補完できない ``calculate`` を ``tool_needed=False`` に格下げ.
+
+        ``_suppress_commandless_run_command`` と対称。rule / learned 層の
+        ``_infer_tool`` は「計算」の字句マッチだけで calculate を選ぶが式抽出
+        ロジックを持たず常に空 args を返し、assist 層も free-form args のため
+        ``{"tool": "calculate", "args": {}}`` があり得る。実行段の必須引数
+        チェックで "requires args but none provided" と空振りするだけの判定が
+        残る。実インシデント (2026-07-21 ライブ検証 ターン35):
+        「フィボナッチ数列の10番目を計算して」が rule 層で ``calculate, {}``
+        になり WARN + UI 空ステップ (running フレームのみで完了フレーム無し)。
+        ここで no_tool に倒し、クエリを通常の LLM 応答パスに落とす
+        (格下げ後の応答は LLM 知識で正解した実測あり)。
+        """
+        if not result.tool_needed or result.tool_name != "calculate":
+            return result
+        if (result.tool_args or {}).get("expression"):
+            return result
+        logger.info(
+            "Suppressing calculate with no expression argument; "
+            "downgrading to no_tool",
         )
         return ToolJudgement(
             tool_needed=False,
@@ -822,6 +1314,73 @@ class ToolCallJudge:
             result.tool_args = {}
         result.tool_args["url"] = recalled
         logger.debug("URL recall: matched url=%s for query=%s", recalled, query[:50])
+
+    def _maybe_scope_session_search(
+        self, result: "ToolJudgement", query: str, session_id: str,
+    ) -> None:
+        """``search_history`` が選ばれ、クエリが「この会話で」等のセッション
+        自己参照パターンに一致する場合、``tool_args["session_id"]`` を強制注入
+        して検索対象を現在セッションのみに限定する。
+
+        session_id を渡さずに search_history を無条件許可すると、2026-07-17/18
+        の実インシデント (「この会話で一番面白かった？」が無関係な過去セッション
+        の内容を誤って混同した) が再発するため、自己参照パターンに一致する場合
+        のみ強制的にスコープを絞る。in-place で更新する。``session_id`` が空
+        (未提供) の場合は何もしない (呼出元が未対応でも安全に no-op)。
+        """
+        if result.tool_name != "search_history":
+            return
+        if not session_id:
+            return
+        if not any(p.search(query) for p in _SELF_SESSION_REFERENCE_PATTERNS):
+            return
+        if result.tool_args is None:
+            result.tool_args = {}
+        result.tool_args["session_id"] = session_id
+        logger.debug(
+            "search_history scoped to current session (self-session reference): %s",
+            query[:50],
+        )
+
+    def _maybe_expand_ordered_history_search(
+        self, result: "ToolJudgement", query: str,
+    ) -> None:
+        """時系列順序指定クエリの ``search_history`` で小さい limit を既定値へ引き上げる.
+
+        実インシデント (2026-07-21 ライブ検証 ターン18): 「この会話で一番最初に
+        計算させた問題は?」で assist が ``query='計算', limit=1`` を合成 →
+        ``HistoryManager.search_sessions`` は字句スコア降順で limit 件に切る
+        ため、時系列先頭ではなく直近の計算を返し誤答した。limit が十分なら
+        turn# 付きの全マッチターンが digest に渡り、元クエリ (digest の user
+        prompt に含まれる) と合わせて時系列選択が機能する (同検証 ターン42
+        「すべて挙げて」が limit 既定 10 で 6 件完全列挙に成功した実績)。
+
+        判定は assist 合成後の ``args["query"]`` ではなく**ユーザー生クエリ**
+        に対して行う (合成 query では「一番最初」等の順序語が消えている)。
+        引き上げのみで引き下げはしない (「直近20件」等の明示的な大 limit を
+        壊さない)。挿入点は assist 層のみ — limit を合成し得るのは free-form
+        args の assist 層だけで、rule/learned 層の ``_infer_tool`` に
+        search_history 分岐は無く、cartridge 層は空 args、層5.5 の強制発火は
+        limit を設定しない (ハンドラ既定 10 が効く)。in-place で更新する。
+
+        assist (LFM2) は json_schema grammar を強制せず型崩れ JSON を返し得る
+        (limit が "1" (文字列) や 2.0 (float) 等) ため、数値相当は int へ
+        正規化してから判定する。引き上げ時は int で書き戻すため、後続の
+        search_history ハンドラ (limit で slice する) への型汚染も防ぐ。
+        """
+        if result.tool_name != "search_history":
+            return
+        if not _ORDERED_HISTORY_QUERY_RE.search(query):
+            return
+        args = result.tool_args or {}
+        limit = _coerce_positive_int(args.get("limit"))
+        if limit is not None and 0 < limit < _HISTORY_SEARCH_DEFAULT_LIMIT:
+            args["limit"] = _HISTORY_SEARCH_DEFAULT_LIMIT
+            result.tool_args = args
+            logger.debug(
+                "search_history limit expanded %d -> %d for ordered query: %s",
+                limit, _HISTORY_SEARCH_DEFAULT_LIMIT, query[:50],
+            )
 
     async def _try_recall_url(self, query: str, mode: str = "coding") -> str | None:
         """過去質問の URL fact から類似質問の URL を返す。
@@ -964,26 +1523,37 @@ class ToolCallJudge:
         tools_registry: ToolsRegistry,
         mode: str = "coding",
     ) -> "ToolJudgement | None":
-        """SemMem の過去成功コマンド引き当てで run_command 判定を返す.
+        """SemMem の過去成功コマンド引き当てで executable 判定を返す.
 
         ``_judge_with_url_recall`` と対称。条件:
-          - ``run_command`` ツールが登録済み
+          - 現在の mode で executable ツールが解決できる
+            (coding → run_command / chat → run_command_readonly)
           - ``mem_view`` / ``embedder`` が wired されている
           - ``_try_recall_executable_command`` が閾値判定でコマンドを返す
 
         引き当てが成立すれば assist 呼出 (5 層目 / chat early-return) より
         先に確定するため、学習済みクエリでは LLM コストがゼロになる。
 
+        recall は subject の mode (`mem.world.executable_command.<mode>.*`) を
+        フィルタしないため、chat では coding 学習由来の任意コマンド (書込系
+        等) が引き当たり得る。chat (readonly) のときは
+        ``reject_readonly_violation`` で再検証し、違反コマンドは引き当てを
+        捨てて通常フローへ落とす (実行段の readonly ラッパでも二重に弾かれる
+        が、ここで捨てれば synth 等の後続層が正当なコマンドを合成し直せる)。
+
         Returns:
-            引き当て成立時は ``ToolJudgement(run_command, {"command": ...})``、
+            引き当て成立時は ``ToolJudgement(<exec_tool>, {"command": ...})``、
             それ以外は ``None`` (通常の判定フローに falling-through する)。
         """
-        if not tools_registry.has("run_command"):
+        exec_tool = _executable_tool_for_mode(tools_registry, mode)
+        if not exec_tool:
             return None
         if self._mem_view is None or self._embedder is None:
             return None
         recalled = await self._try_recall_executable_command(query, mode=mode)
         if not recalled:
+            return None
+        if _readonly_command_rejected(exec_tool, recalled):
             return None
         logger.info(
             "Executable command recall: matched command for query=%s",
@@ -991,7 +1561,7 @@ class ToolCallJudge:
         )
         return ToolJudgement(
             tool_needed=True,
-            tool_name="run_command",
+            tool_name=exec_tool,
             tool_args={"command": recalled},
             source="rule",
         )
@@ -1125,10 +1695,15 @@ class ToolCallJudge:
 
         result = await self._assist_client.generate(
             messages,
-            # 256: E4B 等 json_schema grammar 非強制モデルが空白パディング JSON
-            # を返すと 128 token では閉じ括弧前に finish_reason=length で切れる。
-            # executable_command_synth (256) / conflict_chat_judge (192) と整合。
-            max_tokens=256,
+            # 768: reasoning_budget=0 (tool_judgment既定) は gemma4 系アシストで
+            # 稀に (~6日で15件) 実効せず、reasoning_content が本文出力前に
+            # max_tokens を消費し尽くして空応答 → リトライ → タイムアウトに至る
+            # 実インシデントが確認された (2026-07-18)。256 では観測された
+            # reasoning 長 (700-1245 token) を到底吸収できないため、この
+            # anomaly が起きても本文 JSON まで到達できる余裕を持たせる。
+            # 通常時 (thinking 抑制が効くケース) は数十 token で完結するため
+            # 上限を上げても実害はない。
+            max_tokens=768,
             temperature=0.1,
             purpose="tool_judgment",
         )
@@ -1204,6 +1779,20 @@ class ToolCallJudge:
         if cached is not None:
             return cached
 
+        # 書込み成果物タスク (write 動詞 + 明示ファイルパス) に環境コマンド合成は
+        # 不要かつ自明に not-executable。assist 呼出 (15〜20 秒/回) を省き、
+        # 決定論で (False, "") を返す (2026-07-15: 5 回全て is_executable=false の
+        # 純オーバーヘッド 74.5 秒)。
+        from backend.free.agent.meta_cognitive_tasks import task_expects_write
+        if task_expects_write(query) and _extract_file_path(query):
+            logger.debug(
+                "executable_command_synth skipped (write deliverable task): %s",
+                query[:60],
+            )
+            value = (False, "")
+            self._command_cache_store(query, value)
+            return value
+
         import platform
         platform_info = f"{platform.system()} {platform.release()}"
         user_prompt = (
@@ -1219,7 +1808,9 @@ class ToolCallJudge:
                     },
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=256,
+                # reasoning 型 assist は thinking が completion を食い潰し
+                # 256 では 2/5 が finish=length 切断になる (2026-07-15 実測)
+                max_tokens=384,
                 temperature=0.1,
                 purpose="executable_command_synth",
             )
@@ -1291,25 +1882,46 @@ class ToolCallJudge:
             - ``run_command`` 以外のツール → 何もしない
             - assist が ``(True, cmd)`` を返す → コマンドを置換し
               ``source="assist"`` に更新
-            - assist が ``(False, "")`` を返す → 既存 regex 結果を維持
-              (regex が specific パターンにマッチした confidence を尊重)
+            - assist が ``(False, "")`` を返し、かつクエリが書込み期待
+              (``task_expects_write``) → ``no_tool`` に降格
+              (書込みタスクへの環境コマンド発火は regex 部分マッチ由来の
+              誤判定と断定できる。2026-07-15 の "program" 内 'ram' マッチで
+              OS スペック収集を実行し write 不発で失敗した実績への防衛)
+            - assist が ``(False, "")`` で書込み期待なし → 既存 regex 結果を
+              維持 (specific パターンにマッチした confidence を尊重)
             - assist 失敗 / 未接続 → 既存結果をそのまま返す
         """
-        if not result.tool_needed or result.tool_name != "run_command":
+        from backend.free.agent.meta_cognitive_tasks import task_expects_write
+
+        if not result.tool_needed or result.tool_name not in (
+            "run_command", "run_command_readonly",
+        ):
             return result
         synth = await self._synthesize_command_via_assist(query)
         if synth is None:
             return result
         is_exec, command = synth
         if is_exec and command:
+            # readonly ツールに synth コマンドを載せる場合、readonly 検証に
+            # 通らないコマンド (PowerShell スニペット等) では既存の安全な
+            # コマンド (regex テーブル由来) を維持し、アップグレードしない。
+            if _readonly_command_rejected(result.tool_name, command):
+                return result
             new_args = dict(result.tool_args or {})
             new_args["command"] = command
             return ToolJudgement(
                 tool_needed=True,
-                tool_name="run_command",
+                tool_name=result.tool_name,
                 tool_args=new_args,
                 source="assist",
             )
+        if task_expects_write(query):
+            logger.info(
+                "Demoting %s to no_tool: assist judged not executable "
+                "and the task expects a write deliverable: %s",
+                result.tool_name, query[:80],
+            )
+            return ToolJudgement(tool_needed=False, source="assist")
         return result
 
     def _judge_with_rules(
@@ -1418,6 +2030,14 @@ class ToolCallJudge:
         # ツール名と引数を推定（静的パターンと同じロジック）
         tool_name, tool_args = self._infer_tool(query, tools_registry, mode)
         if not tool_name:
+            # _infer_tool が推定できない場合の run_command フォールバックは
+            # 「引数なしの仮判定」であり、judge() 側で
+            # _maybe_upgrade_command_via_assist が command を合成できた場合
+            # のみ生き残る。合成不成立 (assist が not executable と判定 /
+            # assist 未接続) なら _suppress_commandless_run_command が
+            # no_tool に倒す — 学習パターンの字句マッチだけを根拠に実行不能な
+            # run_command を返さない (2026-07-20: 学習済み「説明」が知識質問
+            # にマッチし coding モードで誤発火し得た件の防衛線)。
             tool_name = "run_command" if tools_registry.has("run_command") else ""
         if not tool_name:
             return ToolJudgement(tool_needed=False, source="rule")
@@ -1514,12 +2134,10 @@ class ToolCallJudge:
                 return "search_code", {"pattern": pattern}
             return "search_code", {}
 
-        # 計算パターン
-        if re.search(r"(?:計算|calculate)", q) and tools_registry.has("calculate"):
-            return "calculate", {}
-
         # Python 実行可能クエリ（システム情報・数値処理・データ処理・変換）
-        # これらのクエリは Python コード生成 → run_command で正確に回答できる
+        # これらのクエリは Python コード生成 → run_command で正確に回答できる。
+        # ツール名は mode から解決する (chat は run_command_readonly)。
+        exec_tool = _executable_tool_for_mode(tools_registry, mode)
         if re.search(
             r"(?:スペック|CPU|メモリ|RAM|GPU|VRAM|ディスク|容量|ストレージ"
             r"|(?<![A-Za-z])spec(?![A-Za-z])"
@@ -1536,12 +2154,19 @@ class ToolCallJudge:
             r"|変換|エンコード|デコード|Base64|ハッシュ|タイムスタンプ)",
             q,
             re.IGNORECASE,
-        ) and tools_registry.has("run_command"):
+        ) and exec_tool:
             # システム情報クエリは具体的なコマンドを生成
             command = _infer_executable_command(query)
             if command:
-                return "run_command", {"command": command}
-            return "run_command", {}
+                return exec_tool, {"command": command}
+            return exec_tool, {}
+
+        # 計算パターン (実行可能クエリ分岐より後ろに置く。「フィボナッチ数列の
+        # 10番目を計算して」のように両方にマッチするクエリは、式抽出を持たない
+        # calculate {} で潰さず run_command 合成経路 (assist synth) に乗せる。
+        # 2026-07-21 ライブ検証 ターン35 のインシデント対策)
+        if re.search(r"(?:計算|calculate)", q) and tools_registry.has("calculate"):
+            return "calculate", {}
 
         return "", {}
 

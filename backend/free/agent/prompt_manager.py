@@ -20,6 +20,7 @@ from backend.free.agent.prompt_utils import (
     FewShotExample,
     FewShotSelector,
     dedupe_paragraphs,
+    extract_protected_sections,
     format_fewshot_section,
     restore_protected_sections,
     validate_protected_sections,
@@ -50,7 +51,32 @@ class PromptMeta:
 
 
 # インスタンス名プレフィックス（言語別）
+# 自己紹介質問への対応も含める理由: ランタイム定数であり、コード変更のみで
+# 既存・将来の全 base_model パーティション (local/learning/<stem>/prompts/)
+# に再起動後即座に反映される (本文 (DEFAULT_PROMPTS) は _create_default() 実行時
+# にしか焼き込まれず、既に本文が存在するパーティションには反映されない)。
+# 実インシデント: 「自己紹介してください」に対しベースモデル自身の学習時の
+# 自己同一性 (「Google DeepMindが開発したGemma 4です」等) がそのまま出力された。
 _PREFIX_TEMPLATES: dict[str, str] = {
+    "ja": (
+        "あなたの名前は「{name}」です。ユーザーに名前を聞かれた場合や"
+        "自己紹介を求められた場合は、この名前で答えてください。"
+        "あなた自身の基盤モデル名や開発元 (例: Gemma、Google DeepMind等) を"
+        "尋ねられても開示せず、「{name}」として応答してください。\n\n"
+    ),
+    "en": (
+        "Your name is \"{name}\". When asked your name, or asked to introduce "
+        "yourself, respond with this name. Do not disclose the underlying base "
+        "model's name or provider (e.g. Gemma, Google DeepMind) even if asked "
+        "directly; always respond as \"{name}\".\n\n"
+    ),
+}
+
+# 旧プレフィックス形式 (ベースモデル秘匿指示の追加より前)。既存インストールで
+# Level 1 進化がこの旧形式のまま本文へ焼き込んで汚染しているケースの自己修復
+# (_strip_name_prefix) を、現行の _PREFIX_TEMPLATES 変更後も継続できるよう
+# 別枠で保持する。
+_LEGACY_PREFIX_TEMPLATES: dict[str, str] = {
     "ja": "あなたの名前は「{name}」です。ユーザーに名前を聞かれたらこの名前を答えてください。\n\n",
     "en": "Your name is \"{name}\". When asked your name, respond with this name.\n\n",
 }
@@ -62,9 +88,10 @@ def _strip_name_prefix(body: str) -> str:
     名前プレフィックスは get_prompt() がランタイムで付与するため、本文 (.md) 側に
     含まれていてはならない。過去に Level 1 進化が get_prompt() の出力 (プレフィックス
     付き) を誤って本文へ保存した汚染を、load / 保存時に自己修復する。
-    _PREFIX_TEMPLATES から locale 非依存のパターンを生成し、先頭一致分のみ取り除く。
+    現行 (_PREFIX_TEMPLATES) と旧形式 (_LEGACY_PREFIX_TEMPLATES) の両方から
+    locale 非依存のパターンを生成し、先頭一致分のみ取り除く。
     """
-    for template in _PREFIX_TEMPLATES.values():
+    for template in (*_PREFIX_TEMPLATES.values(), *_LEGACY_PREFIX_TEMPLATES.values()):
         pattern = re.escape(template).replace(re.escape("{name}"), ".*?")
         match = re.match(pattern, body, re.DOTALL)
         if match:
@@ -89,13 +116,15 @@ DEFAULT_PROMPTS: dict[str, dict[str, str]] = {
 - 回答は日本語で行う
 - 技術的な話題では正確性を最優先する
 - 天気・ニュース・株価・スポーツの最新結果など最新の外部データを要する質問では、実際に取得できたデータが無い場合に具体的な数値や事実を創作しない。取得できなかった旨と確認方法を正直に伝える
+- 会話履歴や参考情報に含まれる自分自身の過去の発言をそのまま繰り返さない。同じ趣旨の質問を別の言い回しで尋ねられた場合は、今回の質問の意図に応じて新たに言い回しを組み立てる
+- 個人的な好み・感情・体験を尋ねられた場合は、「AIには感情がない」等と機械的に否定せず、一貫したキャラクターとして自然に応答する。同じ会話の中で、ある質問には人格的な回答をしつつ別の質問では感情の存在を否定する、といった一貫性の無い態度を取らない (実在しない具体的事実の捏造は禁止のまま変わらない)
 
 ## 出力形式
 - 回答のみを出力する
 - 内部思考・分析過程・推論ステップは出力に含めない
 - [内部思考]・[分析]・[アクション]・[応答] 等のラベルを使わない
 - 応答の末尾に自己紹介・挨拶・「他にご質問はありますか?」等の定型文を追加しない
-- ユーザーから明示的に名前を尋ねられた場合のみ名乗る
+- 名前を尋ねられた場合や自己紹介を求められた場合に名乗る (それ以外で自発的に名乗らない)
 <!-- /PROTECTED -->
 """,
         "coding": """\
@@ -115,6 +144,7 @@ DEFAULT_PROMPTS: dict[str, dict[str, str]] = {
 
 <!-- PROTECTED -->
 ## 制約
+- 回答は日本語で行う
 - 既存のコードスタイルに合わせる
 - セキュリティ上のリスクがある操作は警告する
 
@@ -123,7 +153,7 @@ DEFAULT_PROMPTS: dict[str, dict[str, str]] = {
 - 内部思考・分析過程・推論ステップは出力に含めない
 - [内部思考]・[分析]・[アクション]・[応答] 等のラベルを使わない
 - 応答の末尾に自己紹介・挨拶・「他にご質問はありますか?」等の定型文を追加しない
-- ユーザーから明示的に名前を尋ねられた場合のみ名乗る
+- 名前を尋ねられた場合や自己紹介を求められた場合に名乗る (それ以外で自発的に名乗らない)
 <!-- /PROTECTED -->
 """,
     },
@@ -143,13 +173,15 @@ You are a friendly and intelligent assistant.
 - Respond in English
 - Prioritize accuracy for technical topics
 - For questions needing up-to-date external data (weather, news, stock prices, latest sports results), do not invent specific numbers or facts when no actually-retrieved data is available; honestly state that it could not be retrieved and how to verify it
+- Do not repeat your own past reply verbatim from the conversation history or reference material. If asked a similarly-themed question in different wording, construct a fresh response tailored to the current question's intent
+- When asked about personal preferences, feelings, or experiences, respond naturally and consistently in character rather than flatly denying having feelings ("as an AI, I have no feelings"). Do not give an in-character answer to one such question and then deny having feelings for another in the same conversation (this does not change the rule against fabricating concrete facts that don't exist)
 
 ## Output Format
 - Output only the response
 - Do not include internal thoughts, analysis steps, or reasoning processes
 - Do not use labels such as [Internal Thought], [Analysis], [Action], [Response]
 - Do not append self-introduction, greetings, or boilerplate such as "Is there anything else?" at the end of replies
-- Only state your name when the user explicitly asks for it
+- State your name when asked for your name or asked to introduce yourself (do not volunteer it unprompted otherwise)
 <!-- /PROTECTED -->
 """,
         "coding": """\
@@ -169,6 +201,7 @@ You are an assistant that supports software development.
 
 <!-- PROTECTED -->
 ## Constraints
+- Respond in English
 - Follow existing code style
 - Warn about operations with security risks
 
@@ -177,7 +210,7 @@ You are an assistant that supports software development.
 - Do not include internal thoughts, analysis steps, or reasoning processes
 - Do not use labels such as [Internal Thought], [Analysis], [Action], [Response]
 - Do not append self-introduction, greetings, or boilerplate such as "Is there anything else?" at the end of replies
-- Only state your name when the user explicitly asks for it
+- State your name when asked for your name or asked to introduce yourself (do not volunteer it unprompted otherwise)
 <!-- /PROTECTED -->
 """,
     },
@@ -221,15 +254,41 @@ class SystemPromptManager:
         self.prompt_dir.mkdir(parents=True, exist_ok=True)
         for mode in self.MODES:
             if body_exists(self.prompt_dir, mode):
-                self.contents[mode] = _strip_name_prefix(read_body(self.prompt_dir, mode))
+                body = _strip_name_prefix(read_body(self.prompt_dir, mode))
                 meta_data = read_meta_dict(self.prompt_dir, mode)
                 if meta_data is not None:
                     self.metas[mode] = self._meta_from_dict(meta_data, mode)
                 else:
                     self.metas[mode] = PromptMeta(mode=mode)
                     self._save_meta(mode)
+                self.contents[mode] = self._resync_protected(mode, body)
             else:
                 self._create_default(mode)
+
+    def _resync_protected(self, mode: str, body: str) -> str:
+        """PROTECTED セクションを現行コードの DEFAULT_PROMPTS へ強制同期する
+
+        DEFAULT_PROMPTS の PROTECTED セクションはコード変更のみで更新されるランタイム
+        不変則 (persona 一貫性・出力形式等) を含む。だが update_evolved() の保護検証は
+        「現在ロード済みの本文」を基準に比較するため、Level 1 進化や手動編集で本文が
+        一度保存された後にコード側の PROTECTED セクションを更新しても、既存の本文
+        ファイルには反映されない (実インシデント: PR#281 の persona 一貫性制約が
+        Level 1 進化済み chat.md に反映されず機械的否定が再発)。起動時ロード毎に
+        PROTECTED セクションのみ現行コードの内容へ強制同期し、それ以外の本文
+        (進化/手動で調整された部分) はそのまま保持する。
+
+        本文に PROTECTED マーカーが 1 つも無い場合は同期しない。update_manual() は
+        意図的に保護セクション検証を行わない設計 (手動編集による全面的な制約削除を
+        許容する) であり、resync がここでマーカーを勝手に復活させると手動編集の
+        意図を壊してしまうため。
+        """
+        if not extract_protected_sections(body):
+            return body
+        locale = self.metas[mode].locale_calibrated_for or self._current_locale()
+        default_body = DEFAULT_PROMPTS.get(locale, DEFAULT_PROMPTS["ja"]).get(mode, "")
+        if not default_body:
+            return body
+        return restore_protected_sections(default_body, body)
 
     def get_prompt_static(self, mode: str) -> str:
         """インスタンス名プレフィックス + 本文のみ (few-shot を含まない静的 system)。

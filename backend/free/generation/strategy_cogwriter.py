@@ -38,7 +38,7 @@ from backend.free.generation.strategy_common import (
 )
 from backend.free.generation.token_budget import TokenBudget
 from backend.free.llm.json_schemas import CodeSpec
-from backend.i18n_helper import get_locale
+from backend.i18n_helper import get_locale, prose_language_name
 
 if TYPE_CHECKING:
     from backend.free.llm.assist_client import AssistModelClient
@@ -182,6 +182,13 @@ title・global_context・units は **生成する文書そのもの**（例:「�
 文書内容として計画・生成してはいけません。求められているのは成果物の実体です。
 - global_context は成果物の種類と文体（例:「短編小説（物語）」）を記述し、\
 「システム操作」「ファイル生成タスク」等の手続き的な分類にしないでください。
+- **【関連メモリ】は直前までの会話の参考情報であり、今回生成すべき文書の主題では\
+ありません**。【ユーザー指示】が具体的な文書内容を示していない、または文書生成の\
+依頼そのものでない場合（例: 直前の回答への指摘・質問）でも、【関連メモリ】に\
+登場した別の話題（例: 直前に尋ねられた別件の質問）を主題として流用しないでください。\
+主題は必ず【ユーザー指示】から決定してください。
+- ユーザー指示に言語の明示指定が無い限り、title・global_context・heading・\
+key_points は{output_language}で書いてください。
 
 出力形式:
 {{
@@ -274,6 +281,8 @@ file_name は英数字 + アンダースコア (`_`) のみ、32 文字以内、
 - estimated_tokens は各 unit で {per_unit_tokens} 程度を目安に設定してください。
 - 各 unit は **完全に独立して読める** 内容にしてください\
 (他 unit への参照は最小限、ファイル単体で意味が通る)。
+- ユーザー指示に言語の明示指定が無い限り、title・global_context・heading・\
+key_points は{output_language}で書いてください（file_name は英数字スネークケースのまま）。
 
 出力形式:
 {{
@@ -338,6 +347,8 @@ _TEXT_PLAN_EXPAND_PROMPT = """\
 - estimated_tokens は各セクションで {per_unit_tokens} 程度を目安に設定してください。
 - target_length は全 unit 合計の目標文字数として {target_length} を指定してください。
 - 既存テキストの語り口・文体は維持しますが、構造は機能ごとセクション化に再編成してください。
+- ユーザー指示に言語の明示指定が無い限り、title・global_context・heading・\
+key_points は{output_language}で書いてください。
 
 出力形式:
 {{
@@ -533,6 +544,7 @@ class CogWriterStrategy:
                     memory_context=memory_context,
                     target_length=target_length,
                     per_unit_tokens=per_unit_tokens,
+                    output_language=prose_language_name(),
                 )
             else:
                 prompt = _TEXT_PLAN_EXPAND_PROMPT.format(
@@ -543,6 +555,7 @@ class CogWriterStrategy:
                     target_length=target_length,
                     per_unit_tokens=per_unit_tokens,
                     title_hint="詳細仕様書",
+                    output_language=prose_language_name(),
                 )
         elif existing_content:
             # 追記モード: 既存テキストを含む専用プロンプトを使用 (冒頭+末尾を抜粋)
@@ -561,6 +574,7 @@ class CogWriterStrategy:
                 instruction=instruction,
                 rag_context=rag_context,
                 memory_context=memory_context,
+                output_language=prose_language_name(),
             )
 
         # EXPAND/SPLIT モードでは下限 8 を保証 (機能ごとセクション化のため)
@@ -967,8 +981,11 @@ class CogWriterStrategy:
 
         try:
             data = await self.assist_client.generate_json(
-                # code_review と同様、複数 issue 配列で 512 切断が起きるため 1024。
-                prompt, max_tokens=1024, temperature=0.3,
+                # issues 配列サイズは unit 数に比例し、日本語 issue/fix で 1024
+                # でも 2/8 が finish=length 切断 → json_repair は先頭要素しか
+                # 救済できず後半 unit のレビューが黙って落ちる (2026-07-15
+                # 実測)。2048 へ拡張 (timeout 90s 内に収まる)。
+                prompt, max_tokens=2048, temperature=0.3,
                 purpose="long_form_text_review",
                 list_key="issues",
             )

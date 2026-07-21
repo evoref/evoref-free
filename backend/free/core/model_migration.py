@@ -1082,10 +1082,12 @@ class ModelMigrator:
         lora_path.unlink()
         logger.info("Original LoRA adapter removed: %s", lora_path)
 
-        # lora_versions を空にする
+        # lora_versions を空にする (.gitkeep は tracked な構造保持ファイルのため残す)
         if lora_versions_dir.exists():
             for f in lora_versions_dir.iterdir():
                 if f.is_file():
+                    if f.name == ".gitkeep":
+                        continue
                     f.unlink()
                 elif f.is_dir():
                     shutil.rmtree(str(f))

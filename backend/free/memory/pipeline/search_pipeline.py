@@ -624,6 +624,25 @@ async def unified_search(
         merged_raw = expanded
         merged = expanded
 
+    # Step 6.5: 品質 low の結果は添付しない。クエリ拡張 (Step 6) を経ても
+    # low のままなら、無関連チャンクをコンテキストへ注入する害の方が大きい
+    # (2026-07-15: final_quality=low の 13 件がそのまま添付され、内容は全て
+    # 無関連の過去雑談ノートだった)。「low と判定したのに全件添付」を塞ぐ。
+    if quality == "low":
+        logger.info(
+            "Search results discarded (final quality=low): %d candidates "
+            "for query: %s", len(merged), query[:50],
+        )
+        _log_memory_search_state(
+            debug_logger, context_count, stm_results, ltm_results,
+            semmem_stats=semmem_stats,
+        )
+        return SearchResult(
+            sources=[],
+            quality=quality,
+            from_memory=bool(stm_results),
+        )
+
     # Step 7: 最終順位付け (merged はスコア降順) から top_k 件を採用
     final_sources = merged[:top_k]
 

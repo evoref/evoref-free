@@ -10,6 +10,7 @@ from backend.free.agent.agent_state import AgentState
 from backend.free.agent.event_reminder import EventReminderSystem
 from backend.free.agent.meta_cognitive_utils import (
     command_run_failed,
+    content_language_directive,
     is_tool_error,
     strip_markdown_wrapper,
 )
@@ -32,6 +33,11 @@ _CONTENT_GEN_PROMPT = """\
 Generate the requested content below. Output ONLY the content itself, \
 no explanations, no markdown fences, no JSON, no surrounding text.
 """
+
+# digest_tool_result が NO_RELEVANT_INFO と確定した場合に raw の代わりに
+# ツール実行結果として渡すプレースホルダ。無関係な内容を「唯一の事実根拠」
+# として base に読ませないための安全な代替文言。
+_NO_RELEVANT_INFO_MESSAGE = "（ツールを実行しましたが、今回の質問に関連する情報は見つかりませんでした）"
 
 
 def _check_path_traversal(file_path: str, tool_name: str) -> str | None:
@@ -137,6 +143,10 @@ class DeliberativeAgent:
         self.reminder_system = EventReminderSystem(self.config)
         self._tool_judge = tool_judge
         self._tools_registry = tools_registry
+        # _execute_tool の mode ゲートの既定値。process() 呼び出し毎の実際の mode は
+        # _judge_and_execute_tool から明示的に渡される (こちらは直接 _execute_tool を
+        # 呼ぶ既存テスト等のフォールバック用)。
+        self._mode = mode
         # ツール結果の query 連動抽出 (base の接地負荷軽減) に使う。None なら raw を渡す。
         self._assist_client = assist_client
         # assist 由来ツール判定の実行成否を assist 経験へ記録する closure。
@@ -232,12 +242,15 @@ class DeliberativeAgent:
         state: AgentState,
         on_step: StepCallback,
         tool_judge_task: "asyncio.Task | None" = None,
+        session_id: str = "",
     ) -> tuple[str | None, str | None, str | None, bool | None]:
         """ツール判定 → 実行 → messages へのツール結果注入を一括で行う。
 
         ``tool_judge_task`` が渡された場合は chat() が先行起動した tool 判定
         タスクを await して再利用する (直列待ちの短縮)。タスクが例外で終わった
         場合は直接 judge を再実行してフォールバックする (挙動同等性優先)。
+        ``session_id`` は search_history のセッション自己参照スコープ限定用
+        (``ToolCallJudge._maybe_scope_session_search`` 参照)。
 
         Returns:
             ``(tool_result_text, tool_name, command, success)``。
@@ -263,10 +276,12 @@ class DeliberativeAgent:
                 )
                 judgement = await self._tool_judge.judge(
                     query, self._tools_registry, mode, conversation or [],
+                    session_id=session_id,
                 )
         else:
             judgement = await self._tool_judge.judge(
                 query, self._tools_registry, mode, conversation or [],
+                session_id=session_id,
             )
         if not (judgement.tool_needed and judgement.tool_name):
             return None, None, None, None
@@ -277,7 +292,7 @@ class DeliberativeAgent:
             command = cmd if isinstance(cmd, str) and cmd else None
 
         tool_result_text = await self._execute_tool(
-            judgement, state, query, llm_client, on_step,
+            judgement, state, query, llm_client, on_step, mode=mode,
         )
         if tool_result_text is None:
             # 実行されたが結果 None (失敗)。command は penalize 用に返す。
@@ -293,14 +308,31 @@ class DeliberativeAgent:
             tool_name=judgement.tool_name,
             tool_result=_truncate_tool_result(tool_result_text, TOOL_RESULT_MAX_CHARS),
         )
+        if digest is None:
+            prompt_result_text = tool_result_text
+        elif digest == "" and judgement.tool_name == "search_history":
+            # assist が抽出に成功した上で「関連情報なし」と確定したケース。
+            # search_history に限り、raw 結果 (無関係な過去セッションの内容等)
+            # をそのまま「唯一の事実根拠」として base に渡すと誤って参照・混同
+            # されるため (実インシデント: search_history が別セッションの雑談を
+            # ヒットし、base がそれを今回の会話の内容として回答した)、raw へは
+            # 退避しない。他のツール (calculate 等) は raw が「今回の呼出し
+            # そのものの結果」であり無関係な混同のリスクが無いため、assist の
+            # digest 誤判定 (false negative) を安全側に倒せるよう raw へ退避する
+            # (元の挙動を維持)。
+            prompt_result_text = _NO_RELEVANT_INFO_MESSAGE
+        elif digest == "":
+            prompt_result_text = tool_result_text
+        else:
+            prompt_result_text = digest
         self._append_tool_result_to_last_user(
-            messages, judgement.tool_name, digest or tool_result_text, query=query,
+            messages, judgement.tool_name, prompt_result_text, query=query,
         )
         success = not is_tool_error(tool_result_text)
         # run_command は走ったが非ゼロ終了したケース (SyntaxError 等) を
         # is_tool_error が拾えない。exit code マーカーで失敗を反映し、
         # 誤った success が executable_command の SemMem 学習を汚染するのを防ぐ。
-        if success and judgement.tool_name == "run_command":
+        if success and judgement.tool_name in ("run_command", "run_command_readonly"):
             success = not command_run_failed(tool_result_text)
         logger.info(
             "Tool executed: %s, result_length=%d, source=%s, success=%s",
@@ -355,7 +387,7 @@ class DeliberativeAgent:
             tool_result_text, tool_name_used, tool_command, tool_success,
         ) = await self._judge_and_execute_tool(
             query, mode, conversation, messages, llm_client, state, on_step,
-            tool_judge_task=tool_judge_task,
+            tool_judge_task=tool_judge_task, session_id=session_id,
         )
 
         # MDP トレース: tool 判定/実行を 1 step エピソードとして記録する。
@@ -598,6 +630,7 @@ class DeliberativeAgent:
         query: str,
         llm_client,
         on_step: StepCallback = None,
+        mode: str | None = None,
     ) -> str | None:
         """ToolJudgement に基づいてツールを実行
 
@@ -620,6 +653,20 @@ class DeliberativeAgent:
             logger.warning("Tool not found: %s", tool_name)
             return None
 
+        # ToolDefinition.modes は元々 get_descriptions_text() (LLM 向け説明文) の
+        # フィルタ用にしか参照されておらず、実行時には無視されていた。ルールベース
+        # 判定 (tool_call_judge) が誤トリガーで coding 専用ツールを選んでも、ここで
+        # 弾かなければ chat モードでも実行されてしまう (search_code の CWD 全域
+        # os.walk がイベントループを長時間ブロックした実インシデントの直接原因)。
+        tool_def = self._tools_registry.get(tool_name)
+        effective_mode = mode if mode is not None else self._mode
+        if tool_def is not None and effective_mode not in tool_def.modes:
+            logger.warning(
+                "Tool not allowed in mode=%s: %s (allowed modes: %s)",
+                effective_mode, tool_name, tool_def.modes,
+            )
+            return None
+
         path_error = _check_path_traversal(
             tool_args.get("file_path", ""), tool_name,
         )
@@ -637,15 +684,17 @@ class DeliberativeAgent:
             state.on_tool_failure(tool_name, error_text)
             return error_text
 
-        _emit_tool_running_step(on_step, tool_name, tool_args)
-
-        # 必須引数チェック（必須パラメータが空の場合を防止）
-        tool_def = self._tools_registry.get(tool_name)
+        # 必須引数チェック（必須パラメータが空の場合を防止）。running フレーム
+        # の emit より前に行う — emit 後に skip すると完了フレームが出ず
+        # UI に空ステップ (running のまま) が残る (2026-07-21 ライブ検証
+        # ターン35 の引数なし calculate で実発生)。
         if tool_def and tool_def.parameters and not tool_args:
             logger.warning(
                 "Tool %s requires args but none provided, skipping", tool_name,
             )
             return None
+
+        _emit_tool_running_step(on_step, tool_name, tool_args)
 
         return await self._run_tool_with_handling(
             tool_name, tool_args, state, on_step,
@@ -658,7 +707,11 @@ class DeliberativeAgent:
     ) -> str:
         """write_file 用のコンテンツを LLM にプレーンテキストで生成させる"""
         messages = [
-            {"role": "system", "content": _CONTENT_GEN_PROMPT},
+            # 出力言語指示 (locale 追従) を毎回組み立てて付加する
+            {
+                "role": "system",
+                "content": f"{_CONTENT_GEN_PROMPT}{content_language_directive()}",
+            },
             {"role": "user", "content": query},
         ]
         try:
