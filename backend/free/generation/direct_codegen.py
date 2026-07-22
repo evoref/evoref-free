@@ -85,7 +85,9 @@ async def generate_single_file(
         temperature: 生成温度。
 
     Returns:
-        ``{file_path: code}``。生成失敗 / 空応答時は空 dict。
+        ``{file_path: code}``。生成失敗 / 空応答時は空 dict。再生成 (retry) 後も
+        ``finish_reason == "length"`` (再切断) の場合も空 dict を返す (不完全
+        コードは成果物として返さない)。
 
     応答が ``finish_reason == "length"`` (max_tokens 切断) の場合のみ、予算を倍に
     広げて 1 回だけ再生成する (``staged.executor._generate_spec_doc`` と同じ方針)。
@@ -118,6 +120,19 @@ async def generate_single_file(
                     temperature=temperature, id_slot=client.chat_slot,
                     request_timeout=_estimate_timeout(retry_tokens),
                 )
+                if _finish_reason(resp2) == "length":
+                    # 再生成も切断された = 完成コードではなく壊れた断片。長さで
+                    # 「マシ」に見えても SyntaxError を伴う不完全ファイルを完了
+                    # 扱いで返さない (2026-07-22: test_email_validator.py が
+                    # f-string 途中で切れたまま「成果物は配信します」扱いで出荷
+                    # された実害の再発防止)。空扱いにして呼出側 (staged executor
+                    # の empty-code フォールバック) に委ねる。
+                    logger.warning(
+                        "direct codegen still truncated after retry at "
+                        "max_tokens=%d for %s; discarding incomplete code",
+                        retry_tokens, file_path,
+                    )
+                    return {}
                 retry_code = remove_code_fences(extract_content(resp2).strip())
                 if retry_code and len(retry_code) > len(code):
                     code = retry_code

@@ -401,6 +401,9 @@ class LocalClient(BaseHTTPClient):
     _CTX_GUARD_PER_MSG = 4
     # 単一メッセージ切り詰めの下限文字数 (これ以下には削らない)
     _CTX_GUARD_MIN_CONTENT_CHARS = 2000
+    # max_tokens 込みで budget が負/ゼロになっても、プロンプトを丸ごと消し去る
+    # ような病的なトリムに倒れないための下限。
+    _CTX_GUARD_MIN_BUDGET_TOKENS = 256
 
     def _estimate_prompt_tokens(self, messages: list[dict]) -> int:
         """messages 全体のプロンプトトークン数を高速見積りする。"""
@@ -409,7 +412,9 @@ class LocalClient(BaseHTTPClient):
             for m in messages
         )
 
-    def _enforce_context_budget(self, messages: list[dict]) -> list[dict]:
+    def _enforce_context_budget(
+        self, messages: list[dict], max_tokens: int | None = None,
+    ) -> list[dict]:
         """送信前にプロンプトが n_ctx を超えないよう再トリムする。
 
         build_messages は静的予約でトリムするが、deliberative / meta_cognitive
@@ -418,17 +423,27 @@ class LocalClient(BaseHTTPClient):
         (2026-07-15: 5584 > 4096 でストリーム破壊、4204 > 4096 でフォールバック)。
         最終防衛として (1) 古い非 system メッセージの除去 → (2) 最大メッセージ
         の中間切除、の順で予算内へ収める。``context_size`` 未設定なら no-op。
+
+        ``max_tokens`` (同一リクエストで要求する completion 上限) が渡された場合は
+        あらかじめ budget から差し引く。プロンプト単体は budget 内でも、直後に
+        max_tokens 分の completion を同一リクエストで要求すれば合計で n_ctx を
+        超え、llama-server が ``exceed_context_size_error`` (HTTP 400) を返して
+        生成そのものが失敗する (2026-07-22: singly_linked_list.py / bank_account.py
+        で確認)。max_tokens が budget を独力で食い潰す場合は
+        ``_CTX_GUARD_MIN_BUDGET_TOKENS`` を下限にクランプする。
         """
         if not self._context_size or not messages:
             return messages
-        budget = self._context_size - self._CTX_GUARD_MARGIN
+        budget = self._context_size - self._CTX_GUARD_MARGIN - (max_tokens or 0)
+        budget = max(budget, self._CTX_GUARD_MIN_BUDGET_TOKENS)
         estimate = self._estimate_prompt_tokens(messages)
         if estimate <= budget:
             return messages
 
         logger.warning(
-            "Prompt exceeds context budget (est=%d > budget=%d, n_ctx=%d); "
-            "re-trimming before send", estimate, budget, self._context_size,
+            "Prompt exceeds context budget (est=%d > budget=%d, n_ctx=%d, "
+            "reserved max_tokens=%s); re-trimming before send",
+            estimate, budget, self._context_size, max_tokens,
         )
         # (1) 先頭の system 群と末尾メッセージ (現在ターン) を保持し、
         #     間の古いメッセージから順に落とす
@@ -494,7 +509,7 @@ class LocalClient(BaseHTTPClient):
     ) -> dict:
         """共通ペイロード構築"""
         msgs = self._apply_system_fallback(messages)
-        msgs = self._enforce_context_budget(msgs)
+        msgs = self._enforce_context_budget(msgs, max_tokens=max_tokens)
 
         payload: dict = {
             "messages": msgs,

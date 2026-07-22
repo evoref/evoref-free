@@ -244,6 +244,16 @@ KNOWLEDGE_QUERY_PATTERNS = [
     re.compile(r"(?:what is|tell me|explain|describe|how does)\b", re.IGNORECASE),
 ]
 
+# KNOWLEDGE_QUERY_PATTERNS[1] (資料|情報|データ|... + は/を/が/に) は名詞+助詞のみ
+# で判定するため緩く、コーディングモードの正規な生成依頼 ("サンプルCSVデータを
+# 作成し" 等) の一部にも誤マッチする (2026-07-22 ライブ検証で発覚)。それ以外
+# (教えて/について/知りたい 等) は明示的な疑問形式のみを対象とするため誤爆が
+# 少ない。coding_meta_keywords の is_knowledge 上書き判定では、この緩い
+# パターンを除いた「明示的な疑問形式」のみを知識質問シグナルとして扱う。
+_KNOWLEDGE_QUERY_STRICT_PATTERNS = [
+    p for i, p in enumerate(KNOWLEDGE_QUERY_PATTERNS) if i != 1
+]
+
 # KNOWLEDGE_QUERY_PATTERNS の英語版。「about」は汎用前置詞のため直訳せず、
 # 限定的な表現で構成する (誤爆抑制)。
 KNOWLEDGE_QUERY_PATTERNS_EN = [
@@ -455,7 +465,42 @@ class ComplexityClassifier:
         # 後続の通常分類（reactive/deliberative）に委ねる。
         is_knowledge = self._is_knowledge_query(query)
 
-        # 2.5. Python 実行で正確に答えられるクエリは例外的に deliberative に
+        # 2.5. コーディングモードでツール操作が必要 → meta_cognitive
+        #   (2026-07-22 まではこの判定より旧 2.5 の executable_query 判定が
+        #   先に評価されており、「CSV を集計する“プログラムを作成して”」の
+        #   ようなコーディングモードの正規の生成依頼が、集計/フィボナッチ/
+        #   ソート等の汎用実行可能キーワードにマッチしただけで deliberative の
+        #   単発ツール実行に短絡し、staged 生成パイプラインへ一切到達しない
+        #   実害があった。is_coding_mode ゲートを保ったまま先に評価すること
+        #   で、非コーディングモードの挙動 (即 no-op) は変えずに解消する。
+        if is_coding_mode(mode) and not is_knowledge and self._needs_tools(query):
+            return self._record_classification(
+                self._guard_meta_cognitive(), "coding_tools", query,
+            )
+
+        # 2.6. Meta-Cognitive キーワード検出（コーディングモード）
+        #   (2026-07-23: is_knowledge ガードを _is_strict_knowledge_query に
+        #   差し替え。KNOWLEDGE_QUERY_PATTERNS の緩い名詞+助詞パターン
+        #   (資料|情報|データ|... + は/を/が/に) は、「サンプルCSVデータを
+        #   作成し」のような正規の生成依頼の一部 (「データを」) にも誤マッチ
+        #   して is_knowledge=True にしてしまう (2026-07-22 ライブ検証で発覚。
+        #   CSV 集計依頼が meta_cognitive に到達せず deliberative の
+        #   executable_query に短絡していた)。一方「ファイルを作って整理する
+        #   方法について教えて」のような真正の howto 知識質問は「教えて」
+        #   「について」等の明示的疑問形式で is_knowledge=True になっており、
+        #   これは META_KEYWORDS ("作って") が同時に立っていても知識質問の
+        #   まま扱うべき (Meta-Cognitive へ昇格させない)。_is_strict_knowledge_
+        #   query は緩いパターンだけを除外するため、両ケースを正しく判別できる。
+        if (
+            is_coding_mode(mode)
+            and self._has_meta_keywords(query)
+            and not self._is_strict_knowledge_query(query)
+        ):
+            return self._record_classification(
+                self._guard_meta_cognitive(), "coding_meta_keywords", query,
+            )
+
+        # 2.7. Python 実行で正確に答えられるクエリは例外的に deliberative に
         # 昇格してツール実行を誘導する。
         # 知識質問パターン (KNOWLEDGE_QUERY_PATTERNS) は「ですか」「教えて」等の
         # 末尾形式を要求するため、「明日は何月何日?」のような ? 終わりの疑問文
@@ -466,23 +511,11 @@ class ComplexityClassifier:
                 "deliberative", "executable_query", query,
             )
 
-        # 2.6. 知識質問でも学習済み tool_routing パターンにマッチする場合は
+        # 2.8. 知識質問でも学習済み tool_routing パターンにマッチする場合は
         # deliberative に昇格してツール実行を誘導する
         if is_knowledge and self._contains_learned_tool_patterns(query):
             return self._record_classification(
                 "deliberative", "learned_tool_pattern", query,
-            )
-
-        # 3. コーディングモードでツール操作が必要 → meta_cognitive
-        if is_coding_mode(mode) and not is_knowledge and self._needs_tools(query):
-            return self._record_classification(
-                self._guard_meta_cognitive(), "coding_tools", query,
-            )
-
-        # 4. Meta-Cognitive キーワード検出（コーディングモード）
-        if is_coding_mode(mode) and not is_knowledge and self._has_meta_keywords(query):
-            return self._record_classification(
-                self._guard_meta_cognitive(), "coding_meta_keywords", query,
             )
 
         # 5. 履歴参照キーワード → deliberative（短いクエリより優先）
@@ -699,6 +732,15 @@ class ComplexityClassifier:
     def _is_knowledge_query(self, query: str) -> bool:
         """知識質問パターンを検出（RAG で処理すべきクエリ）"""
         return _matches_any(KNOWLEDGE_QUERY_PATTERNS, query) or _matches_any(
+            KNOWLEDGE_QUERY_PATTERNS_EN, query,
+        )
+
+    def _is_strict_knowledge_query(self, query: str) -> bool:
+        """緩い名詞+助詞パターン (KNOWLEDGE_QUERY_PATTERNS[1]) を除いた、
+        明示的な疑問形式のみによる知識質問判定。coding_meta_keywords の
+        is_knowledge 上書き判定用 (詳細は _KNOWLEDGE_QUERY_STRICT_PATTERNS 参照)。
+        """
+        return _matches_any(_KNOWLEDGE_QUERY_STRICT_PATTERNS, query) or _matches_any(
             KNOWLEDGE_QUERY_PATTERNS_EN, query,
         )
 
