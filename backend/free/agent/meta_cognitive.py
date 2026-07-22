@@ -9,6 +9,11 @@ from pathlib import Path
 
 from backend.config import resolve_context_size_for_mode
 from backend.free.agent.agent_state import AgentState
+from backend.free.agent.context_budget import (
+    OUTPUT_RESERVE_TOKENS,
+    resolve_meta_cognitive_loop_budget,
+)
+from backend.free.core.session_mode import is_coding_mode
 from backend.free.agent.code_artifact_generator import CodeArtifactGenerator
 from backend.free.agent.event_reminder import EventReminderSystem
 from backend.free.agent.self_cartridge import (
@@ -313,10 +318,9 @@ class MetaCognitiveAgent:
         self.max_tool_iterations = agent_cfg.get("max_tool_iterations", 5)
 
         ctx_size = resolve_context_size_for_mode(cfg, mode)
-        history_budget = cfg.get("memory", {}).get("working_max_tokens", 2048)
-        self.loop_budget = ctx_size - 512 - 400 - history_budget
+        self.loop_budget = resolve_meta_cognitive_loop_budget(cfg, mode)
 
-        self._execute_max_tokens = max(ctx_size - 512, 1024)
+        self._execute_max_tokens = max(ctx_size - OUTPUT_RESERVE_TOKENS, 1024)
         self._reminder_budget = 100
 
         # content gen の総上限 (低速 GPU でも完走できるよう緩和)。トークン間
@@ -904,7 +908,7 @@ class MetaCognitiveAgent:
             })
         # coding モード: LongForm 細粒度生成へ委譲 (複数ファイル可)。空リスト
         # (テキスト判定 / degraded / 失敗) なら従来の単一ショット生成へフォールバック。
-        if self._mode == "coding":
+        if is_coding_mode(self._mode):
             artifacts = await self._delegate_code_generation(original_query, on_step)
             if artifacts:
                 if self._output_target == "chat":
@@ -929,7 +933,7 @@ class MetaCognitiveAgent:
         # contains_code_indicator は長さ・改行に依存しないため、1 行の短い
         # 正当コード (print(...) 等) を誤って弾かず、指標皆無の散文だけを拒否する。
         if (
-            self._mode == "coding"
+            is_coding_mode(self._mode)
             and language in _CODE_LANGUAGES
             and not contains_code_indicator(content)
         ):
@@ -1730,6 +1734,18 @@ class MetaCognitiveAgent:
             original_query, task.description, llm_client,
             file_path=file_path,
         )
+        content, rejection = self._validate_generated_content(content, file_path)
+        if rejection and not content.startswith("(Content generation failed:"):
+            logger.warning(
+                "Tool-loop write: generated content rejected (%s), "
+                "retrying content generation: %r",
+                rejection, content[:120],
+            )
+            content = await self._generate_content(
+                original_query, task.description, llm_client,
+                file_path=file_path,
+            )
+            content, rejection = self._validate_generated_content(content, file_path)
         if content.startswith("(Content generation failed:"):
             logger.warning(
                 "Skipping write_file due to content generation failure: %s",
@@ -1745,6 +1761,25 @@ class MetaCognitiveAgent:
             if consecutive_errors >= max_consecutive_errors:
                 return tool_result_text, tool_calls
             # ループ続行のためメッセージを追加（呼び出し元の text は使えない）
+            return None
+        if rejection:
+            logger.warning(
+                "Tool-loop write: generated content still rejected (%s) "
+                "after retry, aborting: %r",
+                rejection, content[:120],
+            )
+            tool_result_text = (
+                f"Error: Content generation produced invalid output ({rejection}), "
+                "not actual content"
+            )
+            consecutive_errors += 1
+            step_results.append(StepResult(
+                tool_name=tool_name,
+                output=tool_result_text,
+                iteration=loop,
+            ))
+            if consecutive_errors >= max_consecutive_errors:
+                return tool_result_text, tool_calls
             return None
         tool_args["content"] = content
         logger.info(
@@ -1802,7 +1837,7 @@ class MetaCognitiveAgent:
         # 直接原因になったため、search_code に限り mode ゲートを追加する
         # (write_file は meta_cognitive の長文書き出し機能で chat モードからも
         # 正規に使われるため対象外)。
-        if tool_name == "search_code" and self._mode != "coding":
+        if tool_name == "search_code" and not is_coding_mode(self._mode):
             result_text = f"Error: search_code is not available in mode '{self._mode}'"
             state.on_tool_failure(tool_name, result_text)
             logger.warning(
@@ -1952,7 +1987,7 @@ class MetaCognitiveAgent:
         # ToolCallJudge の rule/assist 判定結果をそのまま実行するため
         # ToolDefinition.modes を経由しない。_execute_tool と同じ理由で
         # search_code のみ mode ゲートを追加する (write_file は対象外)。
-        if tool_name == "search_code" and self._mode != "coding":
+        if tool_name == "search_code" and not is_coding_mode(self._mode):
             result_text = f"Error: search_code is not available in mode '{self._mode}'"
             logger.warning(
                 "Tool fast path not allowed in mode %s: %s", self._mode, tool_name,

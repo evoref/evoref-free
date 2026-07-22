@@ -10,6 +10,7 @@ from backend.app_state import AppState
 from backend.free.api.chat.chat_recorder import clear_session_data, drain_evicted_to_stm
 from backend.free.api.chat.chat_types import ChatMessage, FileContextDict
 from backend.free.api.schemas import ChatRequest
+from backend.free.core.session_mode import normalize_session_mode
 from backend.free.core.inference import build_messages
 from backend.free.llm.llm_client import LLMClient
 from backend.free.memory.pipeline.search_pipeline import unified_search
@@ -75,7 +76,7 @@ async def ensure_llm_client(state: AppState, cfg: dict) -> LLMClient | None:
 
 async def prepare_memory_context(
     req: ChatRequest, state: AppState,
-) -> tuple[list[dict], str]:
+) -> tuple[list[ChatMessage], str]:
     """メモリからコンテキストを取得し、セッション切替を処理する
 
     セッション切替ブロックは asyncio.Lock で排他制御し、
@@ -338,7 +339,7 @@ def _chat_review_cfg(cfg: dict) -> dict:
 
 
 async def maybe_resolve_pending_conflicts(
-    state: AppState, cfg: dict, history: list[dict], user_message: str,
+    state: AppState, cfg: dict, history: list[ChatMessage], user_message: str,
     *, allow_write: bool = True, session_id: str = "default",
 ) -> ConflictTurnContext:
     """pending 競合のユーザー回答を assist で判定し、有効なら即時反映する。
@@ -500,7 +501,7 @@ def build_semmem_injection(
     mem_sys = state.get_memory_system()
     if not mem_sys:
         return None
-    inj_mode = mode if mode in ("chat", "coding") else "chat"
+    inj_mode = normalize_session_mode(mode)
     rendered: str | None = None
     try:
         from backend.free.memory.pipeline.injector import MemoryInjector
@@ -575,7 +576,7 @@ def _render_conflict_section(
 
 
 def build_chat_messages(
-    system_prompt: str, history: list[dict],
+    system_prompt: str, history: list[ChatMessage],
     rag_chunks: list[str] | None,
     file_contexts: list[dict] | None,
     context_size: int, max_tokens: int | None,
@@ -584,7 +585,7 @@ def build_chat_messages(
     semmem_block: str | None = None,
     fewshot_block: str | None = None,
     history_min_tokens: int = 0,
-) -> list[dict]:
+) -> list[ChatMessage]:
     """messages 組み立て（build_messages で few-shot・file・メモリ・RAG・履歴を統合）。
 
     ``system_prompt`` は静的 (query 非依存)、``fewshot_block`` 等の query 依存部は

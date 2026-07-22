@@ -196,6 +196,8 @@ def parse_plan(
         constraints=data.get("constraints", []),
         units=units,
         code_spec=code_spec,
+        needs_clarification=bool(data.get("needs_clarification", False)),
+        clarification_question=data.get("clarification_question", ""),
     )
 
 

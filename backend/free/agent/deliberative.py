@@ -11,11 +11,13 @@ from backend.free.agent.event_reminder import EventReminderSystem
 from backend.free.agent.meta_cognitive_utils import (
     command_run_failed,
     content_language_directive,
+    generated_content_rejection,
     is_tool_error,
     strip_markdown_wrapper,
 )
 from backend.free.agent.tool_call_judge import ToolCallJudge, ToolJudgement
 from backend.free.agent.tool_result_digest import digest_tool_result
+from backend.free.core.session_mode import is_coding_mode
 from backend.config import resolve_context_size_for_mode
 from backend.free.api.chat.chat_constants import (
     CONTENT_MAX_TOKENS_MIN, CONTENT_SYSTEM_RESERVE,
@@ -167,7 +169,7 @@ class DeliberativeAgent:
         """`process` 用 AgentState を生成。`coding` モードは unified_diff を期待。"""
         return AgentState(
             agent_layer="deliberative",
-            expected_format="unified_diff" if mode == "coding" else None,
+            expected_format="unified_diff" if is_coding_mode(mode) else None,
         )
 
     @staticmethod
@@ -569,6 +571,20 @@ class DeliberativeAgent:
                 on_step({
                     "type": "tool_call",
                     "detail": f"write_file: コンテンツ生成失敗 → {file_path}",
+                    "status": "failed",
+                })
+            return
+        rejection = generated_content_rejection(content, file_path)
+        if rejection:
+            logger.warning(
+                "Deliberative: generated content rejected (%s); skipping "
+                "write_file injection: %r",
+                rejection, content[:120],
+            )
+            if on_step:
+                on_step({
+                    "type": "tool_call",
+                    "detail": f"write_file: コンテンツ生成失敗（{rejection}） → {file_path}",
                     "status": "failed",
                 })
             return

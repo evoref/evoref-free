@@ -31,6 +31,7 @@ from uuid import uuid4
 
 import yaml
 
+from backend.free.core.session_mode import is_coding_mode
 from backend.free.memory.types import MemoryMode, NoteSource
 from backend.log_config import get_logger
 
@@ -500,6 +501,6 @@ def get_note_builder(mode: MemoryMode) -> NoteBuilder:
     ``ChatNoteBuilder(triggers_dir=...)`` / ``CodingNoteBuilder(triggers_dir=...)``
     を直接構築すること (通常は extractor / STM 側から注入される)。
     """
-    if mode == "coding":
+    if is_coding_mode(mode):
         return _CODING_BUILDER
     return _CHAT_BUILDER

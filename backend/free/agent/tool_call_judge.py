@@ -16,8 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from backend.free.agent.reactive import GREETING_RESPONSES
-from backend.free.agent.router import HISTORY_KEYWORDS
+from backend.free.agent.reactive import GREETING_RESPONSES, GREETING_RESPONSES_EN
+from backend.free.agent.router import HISTORY_KEYWORDS, HISTORY_KEYWORDS_EN
+from backend.free.core.locale_patterns import is_en_locale, select_locale_variant
+from backend.free.core.session_mode import is_coding_mode
 from backend.free.agent.safety_patterns import (
     extract_python_c_payload,
     reject_readonly_violation,
@@ -173,6 +175,123 @@ _TOOL_PATTERNS = [
     re.compile(r"(?:変換|エンコード|デコード|Base64|ハッシュ|タイムスタンプ)", re.IGNORECASE),
 ]
 
+# _TOOL_PATTERNS の英語版。GUI 左下の言語設定が 'en' の場合のみ使う
+# (_TOOL_PATTERNS とは locale で完全に排他利用される)。既に ASCII/日英混在で
+# 機能するエントリ (コード検索/URL/計算/日時/OS/env 等) は locale='en' でも
+# 引き続き評価できるようそのまま複製する。
+_TOOL_PATTERNS_EN = [
+    re.compile(r"\bfile\b.*\b(?:read|open)\b.*\b(?:write|modify|change|update|delete|remove|edit)\b", re.IGNORECASE),
+    re.compile(r"(?:コマンド|command).*(?:実行|run)", re.IGNORECASE),
+    re.compile(
+        r"(?:コード|ファイル|ソース|関数|クラス|(?<![A-Za-z])code(?![A-Za-z])"
+        r"|(?<![A-Za-z])file(?![A-Za-z])|(?<![A-Za-z])source(?![A-Za-z]))"
+        r".*(?:検索|(?<![A-Za-z])search(?![A-Za-z])|(?<![A-Za-z])grep(?![A-Za-z])"
+        r"|(?<![A-Za-z])find(?![A-Za-z]))",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:検索|(?<![A-Za-z])search(?![A-Za-z])|(?<![A-Za-z])grep(?![A-Za-z])"
+        r"|(?<![A-Za-z])find(?![A-Za-z]))"
+        r".*(?:コード|ファイル|ソース|(?<![A-Za-z])code(?![A-Za-z])"
+        r"|(?<![A-Za-z])file(?![A-Za-z])|(?<![A-Za-z])source(?![A-Za-z]))",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?:URL|url|https?://|web|site|page|news|fetch|browse)", re.IGNORECASE),
+    re.compile(r"(?:計算|calculate)\s", re.IGNORECASE),
+    re.compile(r"[A-Za-z]:\\", re.IGNORECASE),
+    re.compile(r"\b(?:save|export|output)\b.{0,20}\b(?:it|this|that|to|as|file)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:program|code|script|function|class)\b.*"
+        r"\b(?:write|create|generate|build|implement)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:run|execute|exec)\b.{0,20}\b(?:this|that|it|the\s+\w+)\b", re.IGNORECASE),
+    re.compile(r"`[^`]+`", re.IGNORECASE),
+    re.compile(r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])|memory|(?<![A-Za-z])RAM(?![A-Za-z])|(?<![A-Za-z])GPU(?![A-Za-z])|(?<![A-Za-z])VRAM(?![A-Za-z])|disk|capacity|storage|drive|(?<![A-Za-z])specs?(?![A-Za-z]))", re.IGNORECASE),
+    re.compile(r"(?:何時|何月|何日|何曜日|日時|日付|現在時刻|(?<![A-Za-z])today(?![A-Za-z])|(?<![A-Za-z])now(?![A-Za-z])|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z]))", re.IGNORECASE),
+    re.compile(r"(?:IP\s*address|hostname|(?<![A-Za-z])hostname(?![A-Za-z])|(?<![A-Za-z])ip\s*address)", re.IGNORECASE),
+    re.compile(r"(?:(?<![A-Za-z])OS(?![A-Za-z])|operating\s*system|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])|(?<![A-Za-z])Mac(?![A-Za-z]))", re.IGNORECASE),
+    re.compile(r"(?:Python|python)\s*version", re.IGNORECASE),
+    re.compile(r"(?:environment\s*variable|(?<![A-Za-z])env(?![A-Za-z])|(?<![A-Za-z])PATH(?![A-Za-z]))", re.IGNORECASE),
+    # --- Python 実行可能クエリ: 数値処理 (171行目相当の英語版) ---
+    re.compile(r"\b(?:factorial|prime(?:\s*numbers?)?|fibonacci|prime\s*factorization|base\s*conversion|number\s*of\s*digits?|digits?)\b", re.IGNORECASE),
+    # --- Python 実行可能クエリ: データ処理 (173行目相当の英語版) ---
+    # sum/average/mean/sort は日常会話で極めて頻出する多義語 ("What do you
+    # mean?"/"I sort of agree"/"on average, this works fine") のため、
+    # 単独では発火させず数値/データ文脈語との近接共起を要求する (2026-07-22
+    # 監査で判明、router.py の _EXECUTABLE_QUERY_PATTERNS_EN と同期)。
+    # total/median/standard deviation/std dev/statistics/aggregate は
+    # 既存テスト (test_data_processing_queries_en の bare "What's the
+    # total?") が単独発火を前提としており、日常会話での多義性も相対的に
+    # 低いため単独発火のまま維持する。
+    re.compile(r"\b(?:total|median|standard\s*deviation|std\s*dev|statistics|aggregate)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:sum|average|mean|sort(?:ed|ing)?)\b.{0,20}"
+        r"\b(?:numbers?|data|list|array|values?|dataset|figures?)\b"
+        r"|\b(?:numbers?|data|list|array|values?|dataset|figures?)\b.{0,20}"
+        r"\b(?:sum|average|mean|sort(?:ed|ing)?)\b",
+        re.IGNORECASE,
+    ),
+    # --- Python 実行可能クエリ: 変換 (175行目相当の英語版) ---
+    re.compile(r"\b(?:convert|encode|decode|encoding|decoding|Base64|hash(?:ing)?|timestamp)\b", re.IGNORECASE),
+]
+
+# _infer_tool() の実行可能クエリ判定ゲート (システム情報・数値処理・
+# データ処理・変換)。_TOOL_PATTERNS/_TOOL_PATTERNS_EN の該当エントリと
+# 語彙が重複するが、_infer_tool は「どのツールを選ぶか」を決める別の判定
+# フェーズであり、単一の結合正規表現として設計されているため独立して保持する。
+# CPU/RAM/GPU/VRAM 等の短い ASCII トークンは境界必須 (IGNORECASE で
+# "program" の 'ram' 等に部分マッチした実績が _TOOL_PATTERNS 側にあり
+# 159-162行目で対策済み。本パターンは同期しておらず 2026-07-22 監査で
+# 判明するまで同じ穴が残っていた)。
+_INFER_TOOL_EXEC_QUERY_RE = re.compile(
+    r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])|メモリ|(?<![A-Za-z])RAM(?![A-Za-z])"
+    r"|(?<![A-Za-z])GPU(?![A-Za-z])|(?<![A-Za-z])VRAM(?![A-Za-z])|ディスク|容量|ストレージ"
+    r"|(?<![A-Za-z])spec(?![A-Za-z])"
+    r"|何時|何月|何日|何曜日|日時|日付|現在時刻"
+    r"|(?<![A-Za-z])today(?![A-Za-z])|(?<![A-Za-z])now(?![A-Za-z])"
+    r"|IP\s*アドレス|ホスト名|(?<![A-Za-z])hostname(?![A-Za-z])"
+    r"|(?<![A-Za-z])OS(?![A-Za-z])|オペレーティングシステム"
+    r"|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])"
+    r"|(?<![A-Za-z])Mac(?![A-Za-z])"
+    r"|Python\s*(?:バージョン|version)"
+    r"|環境変数|(?<![A-Za-z])env(?![A-Za-z])"
+    r"|階乗|素数|フィボナッチ|素因数|進数変換|桁"
+    r"|集計|合計|平均|中央値|標準偏差|ソート|統計"
+    r"|変換|エンコード|デコード|Base64|ハッシュ|タイムスタンプ)",
+    re.IGNORECASE,
+)
+
+# _INFER_TOOL_EXEC_QUERY_RE の英語版。JA 側と同じ理由で ASCII トークンは
+# 全て境界必須 (境界無しだと program/framework/diagram/anagram が
+# memory/RAM 等に、summary/resume/assume が sum/mean 等に部分マッチする。
+# 2026-07-22 監査で判明)。
+_INFER_TOOL_EXEC_QUERY_RE_EN = re.compile(
+    r"(?:(?<![A-Za-z])specs?(?![A-Za-z])|(?<![A-Za-z])CPU(?![A-Za-z])"
+    r"|(?<![A-Za-z])memory(?![A-Za-z])|(?<![A-Za-z])RAM(?![A-Za-z])"
+    r"|(?<![A-Za-z])GPU(?![A-Za-z])|(?<![A-Za-z])VRAM(?![A-Za-z])"
+    r"|(?<![A-Za-z])disk(?![A-Za-z])|(?<![A-Za-z])capacity(?![A-Za-z])|(?<![A-Za-z])storage(?![A-Za-z])"
+    r"|what'?s?\s*(?:the\s*)?(?:time|date)|current\s*(?:time|date)"
+    r"|today'?s?\s*date|what\s*day\s*(?:is\s*it|of\s*the\s*week)"
+    r"|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z])"
+    r"|IP\s*address|(?<![A-Za-z])hostname(?![A-Za-z])"
+    r"|(?<![A-Za-z])OS(?![A-Za-z])|operating\s*system"
+    r"|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])|(?<![A-Za-z])Mac(?![A-Za-z])"
+    r"|Python\s*version"
+    r"|environment\s*variable|(?<![A-Za-z])env(?![A-Za-z])|(?<![A-Za-z])PATH(?![A-Za-z])"
+    r"|(?<![A-Za-z])factorial(?![A-Za-z])|(?<![A-Za-z])prime(?![A-Za-z])(?:\s*numbers?)?"
+    r"|(?<![A-Za-z])fibonacci(?![A-Za-z])|prime\s*factorization|base\s*conversion"
+    r"|number\s*of\s*digits?|(?<![A-Za-z])digits?(?![A-Za-z])"
+    r"|(?<![A-Za-z])sum(?![A-Za-z])|(?<![A-Za-z])total(?![A-Za-z])|(?<![A-Za-z])average(?![A-Za-z])"
+    r"|(?<![A-Za-z])mean(?![A-Za-z])|(?<![A-Za-z])median(?![A-Za-z])"
+    r"|standard\s*deviation|std\s*dev|(?<![A-Za-z])sort(?:ed|ing)?(?![A-Za-z])"
+    r"|(?<![A-Za-z])statistics(?![A-Za-z])|(?<![A-Za-z])aggregate(?![A-Za-z])"
+    r"|(?<![A-Za-z])convert(?![A-Za-z])|(?<![A-Za-z])encod(?:e|ing)(?![A-Za-z])"
+    r"|(?<![A-Za-z])decod(?:e|ing)(?![A-Za-z])|(?<![A-Za-z])Base64(?![A-Za-z])"
+    r"|(?<![A-Za-z])hash(?:ing)?(?![A-Za-z])|(?<![A-Za-z])timestamp(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+
 # ユーザークエリからドライブレターを抽出するパターン
 # 「Eドライブ」「C:」「D drive」等のパターンにマッチし、
 # 単一の英字（ドライブレター）をキャプチャする。
@@ -232,10 +351,12 @@ _EXECUTABLE_QUERY_COMMANDS: list[tuple[re.Pattern, "str | Callable[[str], str]"]
     # システムスペック（CPU / メモリ / ディスク）
     # ドライブレター指定があれば指定ドライブの容量を返す
     # CPU/RAM 等の英字略語は ASCII 境界必須 ("program" の 'ram' 誤マッチ対策)
+    # spec(s)? で複数形 ("PC specs") も許容する。
     (re.compile(
-        r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])|メモリ"
+        r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])|メモリ|memory"
         r"|(?<![A-Za-z])RAM(?![A-Za-z])|ディスク|容量|ストレージ|ドライブ"
-        r"|(?<![A-Za-z])spec(?![A-Za-z])"
+        r"|disk|capacity|storage"
+        r"|(?<![A-Za-z])specs?(?![A-Za-z])"
         r"|(?<![A-Za-z])drive(?![A-Za-z]))",
         re.IGNORECASE,
     ), _build_spec_command),
@@ -348,6 +469,15 @@ _KNOWLEDGE_PATTERNS = [
     re.compile(r"(?:what is|tell me|explain|describe)\b", re.IGNORECASE),
 ]
 
+# _KNOWLEDGE_PATTERNS の英語版。「about」は汎用前置詞のため直訳せず、
+# 限定的な表現で構成する (誤爆抑制)。
+_KNOWLEDGE_PATTERNS_EN = [
+    re.compile(r"\bwhat(?:'s|\s+is|\s+are)\b", re.IGNORECASE),
+    re.compile(r"\b(?:tell\s+me|explain|describe|walk\s+me\s+through)\b", re.IGNORECASE),
+    re.compile(r"\b(?:i\s+want\s+to\s+know|curious\s+about|wondering\s+about)\b", re.IGNORECASE),
+    re.compile(r"\bdifference\s+between\b|\bwhen\s+(?:should|do)\s+i\s+use\b", re.IGNORECASE),
+]
+
 # アシスタント自身の意見・嗜好・感想を尋ねる質問パターン — 「好きな〜は
 # ありますか」「好きな〜とかあったりしますか」等。search_history は
 # ユーザー自身の過去発言を検索するツールであり、アシスタント自身の意見を
@@ -378,6 +508,24 @@ _ASSISTANT_PREFERENCE_PATTERNS = [
 _FIRST_PERSON_REFERENCE_RE = re.compile(
     r"私の|私が|私は|僕の|僕が|僕は|俺の|俺が|俺は"
     r"|自分の|自分が|自分は|わたしの|わたしが|わたしは",
+)
+
+# _ASSISTANT_PREFERENCE_PATTERNS / _FIRST_PERSON_REFERENCE_RE の英語版。
+# 英語の疑問文は助動詞前置 (do/does/what's) で疑問文を示すため、日本語版の
+# ような文末助詞アンカーではなく、助動詞前置構造をアンカーにする。
+_ASSISTANT_PREFERENCE_PATTERNS_EN = [
+    re.compile(
+        r"\b(?:do|does)\s+you\s+(?:have\s+(?:a|any)\s+favou?rite|like|enjoy)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bwhat(?:'s|\s+is)\s+your\s+favou?rite\b", re.IGNORECASE),
+    re.compile(r"\bare\s+you\s+(?:good|great|bad)\s+at\b", re.IGNORECASE),
+    re.compile(r"\b(?:got|have)\s+a\s+favou?rite\b[^.!\n]{0,20}[?]?\s*$", re.IGNORECASE),
+]
+_FIRST_PERSON_REFERENCE_RE_EN = re.compile(
+    r"\bmy\b|\bi(?:'m| am| was| like| liked| love| loved| prefer"
+    r"| preferred| said| told you| mentioned| have)\b",
+    re.IGNORECASE,
 )
 
 # セッション自己参照パターン — 「この会話で」等、現在のセッション自体を参照
@@ -425,6 +573,40 @@ _SELF_SESSION_REFERENCE_PATTERNS = [
         r"|最初|最後|何番目|何回目)",
     ),
 ]
+
+# _SELF_SESSION_REFERENCE_PATTERNS の英語版。英語の話題切断表現
+# ("aside from"/"apart from") は名詞句の前に来る (日本語の後置とは語順が
+# 逆) ため、_SESSION_TOPIC_BREAK_LEAD_RE_EN の前置きガードと併用する
+# (_maybe_scope_session_search 側で参照)。
+# (pillar境界のため backend/free/rag/self_rag_judge.py の
+# TRIVIAL_QUESTION_PATTERNS_EN と同義の定義を重複させている。両ファイルを
+# 変更する際は同期させること)。
+_SELF_SESSION_REFERENCE_PATTERNS_EN = [
+    re.compile(
+        r"(?:this\s+conversation|this\s+chat|our\s+conversation"
+        r"|what\s+we\s+(?:talked|discussed|were\s+talking)\s+about"
+        r"|earlier\s+in\s+this\s+(?:conversation|chat)"
+        r"|so\s+far\s+in\s+this\s+conversation)"
+        r"(?!\s*(?:is|was|has)?\s*(?:not\s+related|unrelated|nothing\s+to\s+do))"
+        r"[^.!?\n]{0,40}?"
+        r"(?:interesting|memorable|impressive|funn(?:y|iest)"
+        r"|summar\w*|recap\w*|think|thought|feel|felt|remember"
+        r"|first|last|earliest|latest)"
+        # 英語は修飾語 (interesting 等) が「this conversation」より前に
+        # 来る語順も自然なため (日本語の後置とは逆)、逆順の共起も許容する。
+        # 前置きガードは _SESSION_TOPIC_BREAK_LEAD_RE_EN 側で別途行う。
+        r"|(?:interesting|memorable|impressive|funn(?:y|iest)"
+        r"|summar\w*|recap\w*|first|last|earliest|latest)"
+        r"[^.!?\n]{0,40}?"
+        r"(?:this\s+conversation|this\s+chat|our\s+conversation)",
+        re.IGNORECASE,
+    ),
+]
+# 話題切断が前置される英語特有の言い回し (「この会話とは別に」の語順違い対策)。
+_SESSION_TOPIC_BREAK_LEAD_RE_EN = re.compile(
+    r"\b(?:aside|apart|other than|separate)\s+from\s+(?:this|our)\s+conversation\b",
+    re.IGNORECASE,
+)
 
 def _coerce_positive_int(value: object) -> int | None:
     """assist の型崩れ JSON 由来の値を正の int へ正規化する (int / 数値文字列 /
@@ -477,6 +659,28 @@ _ORDER_QUERY_STOPWORD_RUNS = frozenset({
     "俺", "覚", "番目", "回目", "先",
 })
 
+# _ORDER_QUERY_SCAFFOLD_RE/_ORDER_QUERY_CONTENT_RE/_ORDER_QUERY_STOPWORD_RUNS
+# の英語版。日本語版の「文字クラスで内容語/機能語を分離」は英語 (全て
+# Latin script) には構造上適用できないため、単語トークン化 + ストップ
+# ワードセット方式に設計変更する (_reduce_ordered_history_query 側で分岐)。
+_ORDER_QUERY_SCAFFOLD_RE_EN = re.compile(
+    r"\bin\s+(?:this|our)\s+conversation\b"
+    r"|\bthis\s+(?:chat|conversation|thread)\b"
+    r"|\bwhat\s+we\s+(?:talked|discussed)\s+about\b"
+    r"|\b(?:very\s+)?first\s+(?:thing|time|question|message)\b"
+    r"|\b(?:very\s+)?last\s+(?:thing|time|question|message)\b",
+    re.IGNORECASE,
+)
+_ORDER_QUERY_CONTENT_RE_EN = re.compile(r"[A-Za-z0-9']+")
+_ORDER_QUERY_STOPWORD_RUNS_EN = frozenset({
+    "the", "a", "an", "in", "on", "at", "of", "to", "is", "was", "were",
+    "what", "when", "where", "who", "which", "did", "do", "does",
+    "i", "you", "we", "me", "my", "our", "your",
+    "conversation", "chat", "thread", "talk", "talked", "discussed",
+    "first", "last", "earliest", "latest", "very", "thing", "things",
+    "time", "question", "message", "asked", "ask", "about",
+})
+
 
 def _reduce_ordered_history_query(query: str) -> str:
     """順序リコール質問から search_history 用の内容キーワードを抽出する。
@@ -489,11 +693,21 @@ def _reduce_ordered_history_query(query: str) -> str:
     抽出できなければ生クエリを返す (悪化させない安全側)。digest には別途 raw
     query が渡るため、順序解釈 (「一番最初」) はこの縮約で失われない。
     """
-    stripped = _ORDER_QUERY_SCAFFOLD_RE.sub(" ", query)
+    if is_en_locale():
+        scaffold_re, content_re, stopwords = (
+            _ORDER_QUERY_SCAFFOLD_RE_EN, _ORDER_QUERY_CONTENT_RE_EN,
+            _ORDER_QUERY_STOPWORD_RUNS_EN,
+        )
+    else:
+        scaffold_re, content_re, stopwords = (
+            _ORDER_QUERY_SCAFFOLD_RE, _ORDER_QUERY_CONTENT_RE,
+            _ORDER_QUERY_STOPWORD_RUNS,
+        )
+    stripped = scaffold_re.sub(" ", query)
     terms = [
         run
-        for run in _ORDER_QUERY_CONTENT_RE.findall(stripped)
-        if run not in _ORDER_QUERY_STOPWORD_RUNS
+        for run in content_re.findall(stripped)
+        if run.lower() not in stopwords
     ]
     reduced = " ".join(terms).strip()
     return reduced if len(reduced) >= 2 else query
@@ -527,11 +741,28 @@ _SELF_ACTION_PATTERNS = [
     ),
 ]
 
+# _SELF_ACTION_PATTERNS の英語版。「I'll try it myself」等、文末アンカー方式
+# は英語でも概ね踏襲できる (I'll/let me + 動詞 が文末付近に来る自己完結宣言)。
+_SELF_ACTION_PATTERNS_EN = [
+    re.compile(
+        r"\b(?:i'?ll|i\s+will|let\s+me)\s+(?:try|give\s+it\s+a\s+(?:go|try|shot))"
+        r"(?:\s+(?:it|this|that|myself))?\s*[.!]*\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bi'?ll\s+(?:handle|take\s+care\s+of|figure\s+out|sort\s+out"
+        r"|deal\s+with|work\s+(?:it|this)\s+out)\b[^.!\n]*[.!]*\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bi'?ll\s+.{0,25}\bmyself\b[.!]*\s*$", re.IGNORECASE),
+]
+
 
 def _query_has_tool_signal(query: str) -> bool:
     """クエリにツール操作シグナル (ツールパターン / Windows・Unix パス / URL) を含むか。"""
+    patterns = select_locale_variant(_TOOL_PATTERNS, _TOOL_PATTERNS_EN)
     return (
-        any(p.search(query) for p in _TOOL_PATTERNS)
+        any(p.search(query) for p in patterns)
         or bool(re.search(r"[A-Za-z]:\\|(?:^|[\s　])(?:/[\w._-]+){2,}|https?://", query))
     )
 
@@ -559,14 +790,22 @@ def _is_conversational_query_without_tool_signal(query: str) -> bool:
     """
     if _query_has_tool_signal(query):
         return False
+    preference_patterns = select_locale_variant(
+        _ASSISTANT_PREFERENCE_PATTERNS, _ASSISTANT_PREFERENCE_PATTERNS_EN,
+    )
+    first_person_re = select_locale_variant(
+        _FIRST_PERSON_REFERENCE_RE, _FIRST_PERSON_REFERENCE_RE_EN,
+    )
     if (
-        any(p.search(query) for p in _ASSISTANT_PREFERENCE_PATTERNS)
-        and not _FIRST_PERSON_REFERENCE_RE.search(query)
+        any(p.search(query) for p in preference_patterns)
+        and not first_person_re.search(query)
     ):
         return True
+    knowledge_patterns = select_locale_variant(_KNOWLEDGE_PATTERNS, _KNOWLEDGE_PATTERNS_EN)
+    self_action_patterns = select_locale_variant(_SELF_ACTION_PATTERNS, _SELF_ACTION_PATTERNS_EN)
     return (
-        any(p.search(query) for p in _KNOWLEDGE_PATTERNS)
-        or any(p.search(query) for p in _SELF_ACTION_PATTERNS)
+        any(p.search(query) for p in knowledge_patterns)
+        or any(p.search(query) for p in self_action_patterns)
     )
 
 
@@ -577,7 +816,8 @@ def _has_history_recall_keywords(query: str) -> bool:
     後の部分文字列一致) を、layer 分類とは独立に tool 強制発火の判定に使う。
     """
     q_lower = query.lower()
-    return any(kw in q_lower for kw in HISTORY_KEYWORDS)
+    keywords = select_locale_variant(HISTORY_KEYWORDS, HISTORY_KEYWORDS_EN)
+    return any(kw in q_lower for kw in keywords)
 
 
 @dataclass
@@ -762,7 +1002,7 @@ class ToolCallJudge:
         # coding モードではルールベース + カ���トリッジ hints にフ��ールバック
         # ただし chat モードでも executable query（時刻・スペック等）は
         # 安全なコマンド生成のみ行うためルールベース判定を許可する
-        if not self.enabled and mode != "coding":
+        if not self.enabled and not is_coding_mode(mode):
             # クエリに URL が明示的に含まれる場合は tool_judge_enabled に
             # 関係なく fetch_url を返す。ユーザが URL を書く = 「これを読んで」
             # の強い意図表明であり、LLM 判断を仰がず決定論的に拾う
@@ -1041,7 +1281,8 @@ class ToolCallJudge:
         if len(stripped) < self._executable_fallback_min_chars:
             return None
         # 挨拶は assist を呼ばずにスキップ (reactive 層の定型応答対象)
-        if any(p.match(stripped) for p, _ in GREETING_RESPONSES):
+        greetings = select_locale_variant(GREETING_RESPONSES, GREETING_RESPONSES_EN)
+        if any(p.match(stripped) for p, _ in greetings):
             return None
 
         synth = await self._synthesize_command_via_assist(query)
@@ -1332,7 +1573,13 @@ class ToolCallJudge:
             return
         if not session_id:
             return
-        if not any(p.search(query) for p in _SELF_SESSION_REFERENCE_PATTERNS):
+        if is_en_locale():
+            patterns = _SELF_SESSION_REFERENCE_PATTERNS_EN
+            if _SESSION_TOPIC_BREAK_LEAD_RE_EN.search(query):
+                return
+        else:
+            patterns = _SELF_SESSION_REFERENCE_PATTERNS
+        if not any(p.search(query) for p in patterns):
             return
         if result.tool_args is None:
             result.tool_args = {}
@@ -1939,11 +2186,13 @@ class ToolCallJudge:
         # ただしツールパターン・ファイルパス・URL にもマッチするクエリは
         # ツール操作の可能性が高いため知識質問判定を適用しない
         has_tool_signal = _query_has_tool_signal(query)
-        if not has_tool_signal and any(p.search(query) for p in _KNOWLEDGE_PATTERNS):
+        knowledge_patterns = select_locale_variant(_KNOWLEDGE_PATTERNS, _KNOWLEDGE_PATTERNS_EN)
+        if not has_tool_signal and any(p.search(query) for p in knowledge_patterns):
             logger.debug("Rule-based: knowledge query detected, skipping tool: %s", query[:50])
             return ToolJudgement(tool_needed=False, source="rule")
 
-        if not any(p.search(query) for p in _TOOL_PATTERNS):
+        tool_patterns = select_locale_variant(_TOOL_PATTERNS, _TOOL_PATTERNS_EN)
+        if not any(p.search(query) for p in tool_patterns):
             return ToolJudgement(tool_needed=False, source="rule")
 
         logger.debug("Rule-based: tool pattern matched for query: %s", query[:50])
@@ -2115,7 +2364,16 @@ class ToolCallJudge:
                 return "write_file", {"file_path": path}
 
         # コマンド実行パターン
-        if re.search(r"(?:実行|run|exec)", q) and tools_registry.has("run_command"):
+        # "run" は ASCII 境界必須 ("running" 等の語幹への部分一致誤爆対策。
+        # "What OS am I running?" が意図せずここで確定していた実績あり)。
+        # "exec" は execute/executing/executed の活用形も拾う必要があるため、
+        # 境界を活用語尾まで含めた明示形にする (単純な境界だと "execute" を
+        # 取りこぼす)。
+        if re.search(
+            r"(?:実行|(?<![A-Za-z])run(?![A-Za-z])"
+            r"|(?<![A-Za-z])exec(?:ute[sd]?|uting)?(?![A-Za-z]))",
+            q,
+        ) and tools_registry.has("run_command"):
             # ファイルパスがあれば python で実行
             path = _extract_file_path(query)
             if path and path.endswith(".py"):
@@ -2138,23 +2396,8 @@ class ToolCallJudge:
         # これらのクエリは Python コード生成 → run_command で正確に回答できる。
         # ツール名は mode から解決する (chat は run_command_readonly)。
         exec_tool = _executable_tool_for_mode(tools_registry, mode)
-        if re.search(
-            r"(?:スペック|CPU|メモリ|RAM|GPU|VRAM|ディスク|容量|ストレージ"
-            r"|(?<![A-Za-z])spec(?![A-Za-z])"
-            r"|何時|何月|何日|何曜日|日時|日付|現在時刻"
-            r"|(?<![A-Za-z])today(?![A-Za-z])|(?<![A-Za-z])now(?![A-Za-z])"
-            r"|IP\s*アドレス|ホスト名|(?<![A-Za-z])hostname(?![A-Za-z])"
-            r"|(?<![A-Za-z])OS(?![A-Za-z])|オペレーティングシステム"
-            r"|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])"
-            r"|(?<![A-Za-z])Mac(?![A-Za-z])"
-            r"|Python\s*(?:バージョン|version)"
-            r"|環境変数|(?<![A-Za-z])env(?![A-Za-z])"
-            r"|階乗|素数|フィボナッチ|素因数|進数変換|桁"
-            r"|集計|合計|平均|中央値|標準偏差|ソート|統計"
-            r"|変換|エンコード|デコード|Base64|ハッシュ|タイムスタンプ)",
-            q,
-            re.IGNORECASE,
-        ) and exec_tool:
+        exec_query_re = select_locale_variant(_INFER_TOOL_EXEC_QUERY_RE, _INFER_TOOL_EXEC_QUERY_RE_EN)
+        if exec_query_re.search(q) and exec_tool:
             # システム情報クエリは具体的なコマンドを生成
             command = _infer_executable_command(query)
             if command:

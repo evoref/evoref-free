@@ -1,6 +1,9 @@
-import { writable, derived } from 'svelte/store';
+import { writable, derived, get } from 'svelte/store';
 import ja from './ja.json';
 import en from './en.json';
+import { getLocales } from '$lib/free/api';
+import { performPromptLocaleSwitch } from '$lib/free/services/configService';
+import { addToast } from '$lib/free/stores/toast';
 
 const messages: Record<string, Record<string, unknown>> = { ja, en };
 
@@ -47,3 +50,60 @@ export async function setLocale(newLocale: string): Promise<void> {
 
 /** 利用可能なロケール一覧 */
 export const availableLocales = Object.keys(messages);
+
+/**
+ * チャット応答言語 (i18n.prompt_locale) の永続化済み値のキャッシュ。
+ * switchLocale() の冪等性判定 (無駄な再学習トリガー回避) に使う。
+ */
+export const promptLocale = writable<string>('ja');
+
+/** prompt_locale 切替の進行中フラグ (Sidebar の select disable / スピナー用) */
+export const promptLocaleSwitching = writable<boolean>(false);
+
+/**
+ * 起動時にバックエンドの実際のロケール値でストアを初期化する。
+ * 失敗しても既定値 (ja) のまま動作を継続する (initTheme() と同型パターン)。
+ */
+export async function initLocale(): Promise<void> {
+	try {
+		const data = await getLocales();
+		locale.set(data.current);
+		promptLocale.set(data.prompt_locale);
+	} catch (e) {
+		console.warn('[i18n] Failed to initialize locale from backend, using defaults', e);
+	}
+}
+
+/**
+ * サイドバー専用のロケール切替。UI表示言語 (setLocale) に加え、
+ * チャット応答言語 (prompt_locale) が変わる場合のみ POST /api/prompts/locale
+ * を呼んで連動させる (既に同じ prompt_locale なら無駄な再学習トリガーを避ける)。
+ *
+ * prompt_locale の切替はプロンプトのアーカイブ + 再学習スケジュールを伴う
+ * 破壊的操作のため、GeneralSettings.svelte の handlePromptLocaleChange と
+ * 同じ確認ダイアログを挟む (2026-07-22 監査で判明: サイドバー経由だと
+ * UI表示言語を変えるだけのつもりでも無警告でこの破壊的操作が実行されていた)。
+ * UI表示言語自体 (setLocale) は非破壊的なので確認無しで即時反映する。
+ */
+export async function switchLocale(newLocale: string): Promise<void> {
+	await setLocale(newLocale);
+	if (get(promptLocale) === newLocale) return;
+	if (!confirm(get(t)('settings.i18n.prompt_locale_confirm'))) return;
+
+	promptLocaleSwitching.set(true);
+	try {
+		const { relearning } = await performPromptLocaleSwitch(newLocale);
+		promptLocale.set(newLocale);
+		addToast({
+			type: 'success',
+			i18nKey: relearning
+				? 'settings.i18n.prompt_locale_switched_with_relearn'
+				: 'settings.i18n.prompt_locale_switched'
+		});
+	} catch (e) {
+		addToast({ type: 'error', i18nKey: 'settings.i18n.prompt_locale_failed' });
+		console.error('[i18n] prompt locale switch failed', e);
+	} finally {
+		promptLocaleSwitching.set(false);
+	}
+}

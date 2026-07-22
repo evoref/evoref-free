@@ -23,6 +23,7 @@ from backend.free.api.schemas import (
     WorkingMemoryStats,
 )
 from backend.config import get_config
+from backend.free.core.session_mode import is_valid_session_mode
 from backend.free.memory.semantic.pin_manager import (
     PinLockedError,
     list_pinned,
@@ -267,7 +268,7 @@ async def pin_memory(
 
     if req.type not in _ALLOWED_FACT_TYPES:
         raise HTTPException(status_code=400, detail=f"unknown type: {req.type}")
-    if req.mode_origin not in ("chat", "coding"):
+    if not is_valid_session_mode(req.mode_origin):
         raise HTTPException(
             status_code=400, detail=f"unknown mode_origin: {req.mode_origin}",
         )

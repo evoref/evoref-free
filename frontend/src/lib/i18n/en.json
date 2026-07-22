@@ -287,7 +287,8 @@
 			"prompt_locale_confirm": "Switching the prompt language will archive current prompts and replace them with defaults in the new language. Auto re-learning will be scheduled. Continue?",
 			"prompt_locale_switched": "Prompt language switched",
 			"prompt_locale_switched_with_relearn": "Prompt language switched. Re-learning has been scheduled",
-			"prompt_locale_failed": "Failed to switch prompt language"
+			"prompt_locale_failed": "Failed to switch prompt language",
+			"locale_failed": "Failed to switch display language"
 		},
 		"option": {
 			"dark": "Dark",

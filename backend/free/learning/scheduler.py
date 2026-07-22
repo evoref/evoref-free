@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from backend.log_config import get_logger
 from backend.policy_helpers import get_policy_value
 from backend.utils import utc_now
+from backend.free.core.session_mode import is_chat_mode, is_coding_mode
 from backend.free.learning.learning_state_store import (
     LearningState,
     LearningStateStore,
@@ -1203,8 +1204,8 @@ class LearningScheduler:
         new_count = self._get_new_experience_count()
 
         # モード別経験数
-        chat_count = sum(1 for e in safe_exp if e.get("mode") == "chat")
-        coding_count = sum(1 for e in safe_exp if e.get("mode") == "coding")
+        chat_count = sum(1 for e in safe_exp if is_chat_mode(e.get("mode")))
+        coding_count = sum(1 for e in safe_exp if is_coding_mode(e.get("mode")))
 
         # 最終 Level 0 記録日時
         last_level0_record: str | None = None

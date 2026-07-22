@@ -107,6 +107,7 @@ async def get_locales():
     return LocalesResponse(
         locales=available_locales(),
         current=get_locale(),
+        prompt_locale=get_config().get("i18n", {}).get("prompt_locale", "ja"),
     )
 
 

@@ -38,6 +38,10 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from backend.free.core.session_mode import (
+    is_valid_session_mode,
+    normalize_session_mode,
+)
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -305,7 +309,7 @@ class PolicyAdjuster:
         # mode_origin は decision の context に含まれていれば反映
         ctx = decision.get("context") if isinstance(decision.get("context"), dict) else {}
         mode = ctx.get("mode") if isinstance(ctx, dict) else None
-        if mode in ("chat", "coding"):
+        if is_valid_session_mode(mode):
             bucket.last_mode = mode
 
         if pair.is_orphan:
@@ -387,7 +391,7 @@ class PolicyAdjuster:
                 object_=payload,
                 scope=self.scope,
                 confidence=bucket.failure_rate,
-                mode_origin=bucket.last_mode if bucket.last_mode in ("chat", "coding") else "chat",  # type: ignore[arg-type]
+                mode_origin=normalize_session_mode(bucket.last_mode),  # type: ignore[arg-type]
                 trace_id=bucket.last_trace_id or None,
             )
         except Exception as exc:
@@ -423,7 +427,7 @@ class PolicyAdjuster:
                 object_=payload,
                 scope=self.scope,
                 confidence=bucket.success_rate,
-                mode_origin=bucket.last_mode if bucket.last_mode in ("chat", "coding") else "chat",  # type: ignore[arg-type]
+                mode_origin=normalize_session_mode(bucket.last_mode),  # type: ignore[arg-type]
                 auto_evolved=True,
                 trace_id=bucket.last_trace_id or None,
             )

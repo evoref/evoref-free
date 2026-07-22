@@ -13,6 +13,8 @@ import json
 import re
 from typing import TYPE_CHECKING
 
+from backend.free.core.locale_patterns import select_locale_variant
+from backend.free.core.session_mode import is_coding_mode
 from backend.free.learning.level0_instant import (
     RESPONSE_FULL_CAP,
     RESPONSE_SUMMARY_CAP,
@@ -57,6 +59,13 @@ CORRECTION_PATTERNS = [
     re.compile(r"not correct", re.IGNORECASE),
     re.compile(r"that'?s wrong", re.IGNORECASE),
     re.compile(r"^\s*actually\b", re.IGNORECASE),
+    # 英語語彙拡充 (日本語(漢字/かな)と英語(ASCII)は文字体系が異なり相互誤爆
+    # リスクが実質ゼロなため、locale 分岐せず常時併用する)。
+    re.compile(r"that'?s\s+not\s+(?:right|correct)", re.IGNORECASE),
+    re.compile(r"^\s*(?:no,?\s+)?that'?s\s+wrong\b", re.IGNORECASE),
+    re.compile(r"you\s+got\s+it\s+(?:backwards?|wrong|mixed\s+up)", re.IGNORECASE),
+    re.compile(r"(?:please\s+)?(?:redo|retry|try\s+again|fix\s+that)", re.IGNORECASE),
+    re.compile(r"that'?s\s+incorrect", re.IGNORECASE),
 ]
 
 # coding モードの実行結果報告 (2026-07-18: coding 経験に訂正シグナルがほぼ発生
@@ -80,11 +89,39 @@ _CODING_FAILURE_REPORT_EXCLUDE_RE = re.compile(
     r"(?:ください|にして|教えて|作って|実装して)[。.！!？?]*\s*$",
 )
 
+# CODING_FAILURE_REPORT_PATTERNS / _CODING_FAILURE_REPORT_EXCLUDE_RE の
+# 英語版。日本語版の文末アンカー方式 (ください/にして等) は、英語の新規
+# 依頼マーカー (please/命令形/モーダル動詞) が文頭に来る構造とは合わないため、
+# exclude 側は文頭アンカー方式に作り直す。
+CODING_FAILURE_REPORT_PATTERNS_EN = [
+    re.compile(r"\b(?:doesn'?t|does\s+not|isn'?t|is\s+not)\s+work(?:ing)?\b", re.IGNORECASE),
+    re.compile(r"\bnot\s+working\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:i'?m\s+)?getting\s+an?\s+error\b"
+        r"|\berrors?\s+(?:occur(?:s|red)?|showing|appearing|popping\s+up)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\btests?\s+(?:are|is|keep(?:s)?)\s+fail(?:ing)?\b|\btests?\s+fail(?:ed|s)?\b", re.IGNORECASE),
+    re.compile(r"\b(?:it|this|that)\s+(?:broke|is\s+broken|crashed?)\b", re.IGNORECASE),
+]
+_CODING_FAILURE_REPORT_EXCLUDE_RE_EN = re.compile(
+    r"^\s*(?:please\s+)?(?:make|build|create|add|write|implement|set\s+up|change|fix)\b"
+    r"|^\s*(?:can|could|would)\s+you\b"
+    r"|^\s*please\b",
+    re.IGNORECASE,
+)
+
 # 弱い訂正パターン: 単独では新規依頼との区別がつかないため、直前ターンの
 # 失敗または同一成果物 (同じ出力先パス) の再指定を伴う場合のみ訂正とみなす。
 WEAK_CORRECTION_PATTERNS = [
     re.compile(r"(?:では|じゃ)な[くい]"),
     re.compile(r"また.{0,15}(?:になって|なって)"),
+]
+
+# WEAK_CORRECTION_PATTERNS の英語版。
+WEAK_CORRECTION_PATTERNS_EN = [
+    re.compile(r"\bnot\s+\w+\s+but\b|\binstead\s+of\b", re.IGNORECASE),
+    re.compile(r"\bit'?s\s+.{0,15}\bagain\b", re.IGNORECASE),
 ]
 
 # 応答の失敗マーカー (meta_cognitive の最終応答フォーマット "- [failed] ...")
@@ -412,12 +449,18 @@ class FeedbackCollector:
         # 1b. coding モードの実行結果報告。訂正対象 (直前ターン) が無い最初の
         # ターンでは新規の質問/依頼である可能性が高く、文末が新規依頼の完結形
         # なら報告ではなく仕様/質問の可能性が高いため、いずれも除外する。
+        exclude_re = select_locale_variant(
+            _CODING_FAILURE_REPORT_EXCLUDE_RE, _CODING_FAILURE_REPORT_EXCLUDE_RE_EN,
+        )
+        failure_patterns = select_locale_variant(
+            CODING_FAILURE_REPORT_PATTERNS, CODING_FAILURE_REPORT_PATTERNS_EN,
+        )
         if (
-            mode == "coding"
+            is_coding_mode(mode)
             and self._prev_query is not None
-            and not _CODING_FAILURE_REPORT_EXCLUDE_RE.search(query.strip())
+            and not exclude_re.search(query.strip())
         ):
-            for pattern in CODING_FAILURE_REPORT_PATTERNS:
+            for pattern in failure_patterns:
                 if pattern.search(query):
                     return query, "hardcoded"
 
@@ -426,8 +469,9 @@ class FeedbackCollector:
             return query, "prev_failed"
 
         # 3. 同一出力先パスの再指定 + 弱い訂正語 (「〜ではなく」等)
+        weak_patterns = select_locale_variant(WEAK_CORRECTION_PATTERNS, WEAK_CORRECTION_PATTERNS_EN)
         if self._same_target_path(query) and any(
-            p.search(query) for p in WEAK_CORRECTION_PATTERNS
+            p.search(query) for p in weak_patterns
         ):
             return query, "same_target"
 

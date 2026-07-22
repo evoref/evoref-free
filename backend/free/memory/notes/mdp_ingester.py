@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from backend.free.core.session_mode import normalize_session_mode
 from backend.free.memory.extractors.mdp_trace import episode_task_and_result
 from backend.free.memory.stores.short_term import MemoryNote
 from backend.log_config import get_logger
@@ -327,7 +328,7 @@ class MDPIngester:
             session_id=episode.episode_id,
             source="system",
             confidence=0.6,
-            mode=episode.mode() if episode.mode() in ("chat", "coding") else "coding",  # type: ignore[arg-type]
+            mode=normalize_session_mode(episode.mode(), default="coding"),  # type: ignore[arg-type]
             project_id=project_id,
             trace_id=episode.trace_id,
         )

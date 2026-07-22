@@ -28,6 +28,7 @@ from backend.free.agent.prompt_utils import (
     FewShotExample,
     format_fewshot_section,  # noqa: F401  (re-export for tests)
 )
+from backend.free.core.session_mode import is_valid_session_mode, normalize_session_mode
 from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
 from backend.free.memory.types import make_fact
 from backend.log_config import get_logger
@@ -308,9 +309,9 @@ class FewShotPool(JsonStateStore):
         # rest は新形式 "<model>.<mode>.<id>" または レガシー "<mode>.<id>"。
         # mode は {chat, coding} に限られるため先頭/2 番目セグメントで判別する。
         segs = rest.split(".")
-        if len(segs) >= 2 and segs[0] in ("chat", "coding"):
+        if len(segs) >= 2 and is_valid_session_mode(segs[0]):
             mode_part, id_part = segs[0], ".".join(segs[1:])
-        elif len(segs) >= 3 and segs[1] in ("chat", "coding"):
+        elif len(segs) >= 3 and is_valid_session_mode(segs[1]):
             mode_part, id_part = segs[1], ".".join(segs[2:])
         else:
             return None
@@ -341,7 +342,7 @@ class FewShotPool(JsonStateStore):
         assert view is not None  # is_semmem_writeback_active で保証
 
         subject = self._build_subject(self._base_model_id, example.mode, example.id)
-        fact_mode: str = example.mode if example.mode in ("chat", "coding") else "chat"
+        fact_mode: str = normalize_session_mode(example.mode)
         new_fact = make_fact(
             subject=subject,
             predicate=DEFAULT_FEWSHOT_PREDICATE,

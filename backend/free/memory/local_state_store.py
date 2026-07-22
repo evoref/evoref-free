@@ -40,6 +40,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from backend.free.core.session_mode import normalize_session_mode
 from backend.io import AtomicWriter
 from backend.log_config import get_logger
 
@@ -111,7 +112,7 @@ def deserialize(data: dict[str, Any] | None) -> LocalState:
         )
 
     mode_raw = data.get("mode")
-    mode: MemoryMode = mode_raw if mode_raw in ("chat", "coding") else DEFAULT_MODE
+    mode: MemoryMode = normalize_session_mode(mode_raw, default=DEFAULT_MODE)
 
     current = data.get("current_project_id")
     current_pid = current if isinstance(current, str) and current else None

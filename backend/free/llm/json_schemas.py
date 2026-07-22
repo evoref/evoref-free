@@ -127,7 +127,13 @@ class TextPlan(_StrictModel):
     target_length: int = 0
     global_context: str = ""
     constraints: list[str] = Field(default_factory=list)
-    units: list[SectionUnitPlan]
+    units: list[SectionUnitPlan] = Field(default_factory=list)
+    # ユーザー指示に具体的な主題が無く、関連メモリの話題を主題に流用しないと
+    # 計画できない場合に True。True のとき units は空でよく、
+    # clarification_question にユーザーへの確認文を書く
+    # (2026-07-22 ライブ検証で判明した長文トピック混入バグの対策)。
+    needs_clarification: bool = False
+    clarification_question: str = ""
 
 
 # ── コード設計仕様 (code_spec_synthesis) ──

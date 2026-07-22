@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { t } from '$lib/i18n';
 	import { colorMode, toggleColorMode, sidebarCollapsed, layout, themeSlots } from '$lib/free/stores/theme';
-	import { locale, availableLocales, setLocale } from '$lib/i18n';
+	import { locale, availableLocales, switchLocale, promptLocaleSwitching } from '$lib/i18n';
 	import { isPro, isDevelop, edition } from '$lib/edition';
 	import { appVersion } from '$lib/free/stores/app';
 	import { currentMode, clearMessages, switchMode, modeRestartStatus } from '$lib/free/stores/chat';
@@ -95,7 +95,20 @@
 					<select
 						class="footer-select"
 						value={$locale}
-						onchange={(e) => setLocale(e.currentTarget.value)}
+						disabled={$promptLocaleSwitching}
+						onchange={(e) => {
+							// switchLocale() は performPromptLocaleSwitch() 失敗を内部の
+							// try/catch で自前捕捉しトーストも出す (例外は再送出しない)。
+							// このため以下の .catch() が実際に発火するのは setLocale()
+							// (UI 表示言語の PUT /api/config/locale、prompt_locale とは
+							// 無関係) が失敗した場合のみ。誤って prompt_locale_failed
+							// (チャット応答言語の切替失敗) を出さないよう、UI 表示言語
+							// 専用の文言を使う (2026-07-22 監査で判明)。
+							switchLocale(e.currentTarget.value).catch((err: unknown) => {
+								addToast({ type: 'error', i18nKey: 'settings.i18n.locale_failed' });
+								console.error('[Locale Switch]', err);
+							});
+						}}
 					>
 						{#each availableLocales as loc}
 							<option value={loc}>{loc.toUpperCase()}</option>

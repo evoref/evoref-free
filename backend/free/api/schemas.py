@@ -484,6 +484,7 @@ class LocaleResponse(BaseModel):
 class LocalesResponse(BaseModel):
     locales: list[str]
     current: str
+    prompt_locale: str
 
 
 class ConfigFullResponse(BaseModel):

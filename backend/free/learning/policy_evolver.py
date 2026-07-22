@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
+from backend.free.core.session_mode import normalize_session_mode
 from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
 from backend.free.memory.types import make_fact
 from backend.log_config import get_logger
@@ -245,7 +246,7 @@ class PolicyParamEvolver(JsonStateStore):
         assert view is not None  # is_semmem_writeback_active で保証
 
         subject = self._build_subject(self._base_model_id, mode, domain, key)
-        fact_mode: str = mode if mode in ("chat", "coding") else "chat"
+        fact_mode: str = normalize_session_mode(mode)
         eval_metric = {
             "fitness": float(fitness),
             "sigma": float(sigma),

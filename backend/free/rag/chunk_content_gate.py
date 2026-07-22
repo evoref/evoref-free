@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from backend.free.core.session_mode import is_coding_mode
 from backend.free.rag.bm25_retriever import tokenize_ja
 from backend.log_config import get_logger
 
@@ -185,7 +186,7 @@ class ChunkContentGate:
         self, query, merged, mode, assist_client, tracker, session_id,
     ) -> GateResult:
         cfg = self._cfg
-        if mode != "coding":
+        if not is_coding_mode(mode):
             # chat mode: 近似重複除去のみ (recall を退行させない)
             kept, dropped = self._dedup(merged)
             return GateResult(kept=kept, dropped_dedup=dropped)

@@ -8,6 +8,14 @@ from __future__ import annotations
 
 import re
 
+from backend.free.core.locale_patterns import select_locale_variant
+from backend.free.core.session_mode import is_coding_mode
+from backend.free.document_nouns import (
+    DOCUMENT_NOUNS_NEEDS_SUFFIX,
+    DOCUMENT_NOUNS_NEEDS_SUFFIX_EN,
+    DOCUMENT_NOUNS_STANDALONE,
+    DOCUMENT_NOUNS_STANDALONE_EN,
+)
 from backend.free.generation.models import ContentType
 
 CODE_PATTERNS: list[str] = [
@@ -23,24 +31,36 @@ CODE_PATTERNS: list[str] = [
 ]
 
 TEXT_PATTERNS: list[str] = [
-    r"(記事|レポート|文書|論文|ブログ|説明文|マニュアル).*(書|作成|生成)",
+    # 動作動詞 (書/作成/生成) との共起が必要な文書名詞。router.py の
+    # LONG_FORM_PATTERNS と backend/free/document_nouns.py で語彙を共有する。
+    rf"({'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX)}).*(書|作成|生成)",
     r"(write|draft|compose).*(article|report|document|essay)",
     r"(\d{3,})\s*[字文]",
-    # 仕様書・設計書・要件定義書: 名詞単体でも TEXT として扱う。
-    # 「プログラムを作成するための仕様書を出力」のように、動作動詞が
+    # 仕様書・設計書・要件定義書・手順書・議事録・送付状 等: 名詞単体でも TEXT
+    # として扱う。「プログラムを作成するための仕様書を出力」のように、動作動詞が
     # 「出力」「保存」など多様で、かつコード関連語と共起しても文書要件のため。
-    r"(仕様書|要件定義書?|設計書|設計仕様書?|基本設計書|詳細設計書|要求仕様書|デザインドキュメント)",
+    # 2026-07-15 に「受付フロー手順書」等が CODE 判定され .md へ Python コードが
+    # 書き込まれた退行への対策で社内文書語彙 (手順書/議事録/送付状 等) を追加した
+    # 経緯を含む。語彙は backend/free/document_nouns.py で共有する。
+    rf"({'|'.join(DOCUMENT_NOUNS_STANDALONE)})",
     r"(specification|design[\s-]?doc(?:ument)?|requirements?[\s-]?doc(?:ument)?)",
-    # 社内文書系の名詞: 手順書/議事録/テンプレート/案内/通知/メール等は名詞単体で
-    # TEXT シグナル。2026-07-15 に「受付フロー手順書」等が CODE 判定され .md へ
-    # Python コードが書き込まれた退行への対策 (旧リストは 記事/論文/ブログ 等の
-    # 執筆物のみで社内文書語彙が不在だった)。
-    r"(手順書|議事録|テンプレート|ひな形|雛形|案内文?|通知文?|お知らせ|報告書"
-    r"|提案書|企画書|送付状|依頼文|挨拶文|文面|チェックリスト|アジェンダ"
-    r"|ガイドライン|規約|規定|スクリプト台本|台本)",
     # 出力先が文書/データ拡張子ならテキスト成果物 (CODE_PATTERNS の
     # コード拡張子パターンと対称)。
     r"\.(md|txt|csv|docx|pptx|xlsx)\b",
+]
+
+# TEXT_PATTERNS の英語版。GUI 左下の言語設定が 'en' の場合のみ使う
+# (TEXT_PATTERNS とは locale で完全に排他利用される。select_locale_variant 経由)。
+# detect_content_type() は re.search() を flags 無しで呼ぶため、大文字小文字を
+# 無視するには各パターン先頭に (?i) インライン修飾子を明示する必要がある
+# (文頭大文字化が頻出する英語の実用性のため)。
+TEXT_PATTERNS_EN: list[str] = [
+    rf"(?i)\b(?:write|draft|create|compose|prepare|put\s+together)\b"
+    rf".*\b(?:{'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX_EN)})\b"
+    rf"|\b(?:{'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX_EN)})\b.*\b(?:write|draft|create|compose|prepare)\b",
+    r"(?i)\b(\d{3,})[\s-]?words?\b",
+    rf"(?i)\b(?:{'|'.join(DOCUMENT_NOUNS_STANDALONE_EN)})\b",
+    r"(?i)\.(md|txt|csv|docx|pptx|xlsx)\b",
 ]
 
 # コード否定の文脈 (「プログラムではなくて文書が欲しい」等の訂正表現)。
@@ -49,6 +69,16 @@ TEXT_PATTERNS: list[str] = [
 # Python ジェネレータを生成した (2026-07-15)。
 _NEGATED_CODE_RE = re.compile(
     r"(?:コード|プログラム|スクリプト)\s*(?:じゃ|では|で\s*は)\s*な(?:く|い)",
+)
+
+# _NEGATED_CODE_RE の英語版。GUI 左下の言語設定が 'en' の場合のみ使う
+# (TEXT_PATTERNS_EN 追加時に見落とされていた: 2026-07-22 監査で判明。
+# 英語ユーザーが同種の訂正 ("Not code, just the document itself") を
+# 行っても最優先ガードが働かず、2026-07-15 インシデントが英語ロケールで
+# 再発しうる状態だった)。
+_NEGATED_CODE_RE_EN = re.compile(
+    r"\b(?:not|isn'?t)\s+(?:a\s+)?(?:code|program|script)\b",
+    re.IGNORECASE,
 )
 
 
@@ -60,14 +90,23 @@ def detect_content_type(instruction: str, mode: str) -> ContentType:
         mode: 動作モード ("coding" / "chat")
     """
     # 「コード/プログラムではなく」の明示否定は最優先で TEXT に確定
-    if _NEGATED_CODE_RE.search(instruction):
+    negated_code_re = select_locale_variant(_NEGATED_CODE_RE, _NEGATED_CODE_RE_EN)
+    if negated_code_re.search(instruction):
         return ContentType.TEXT
 
-    if mode == "coding":
-        if any(re.search(p, instruction) for p in TEXT_PATTERNS):
+    text_patterns = select_locale_variant(TEXT_PATTERNS, TEXT_PATTERNS_EN)
+
+    if is_coding_mode(mode):
+        if any(re.search(p, instruction) for p in text_patterns):
             return ContentType.TEXT
         return ContentType.CODE
 
-    code_score = sum(1 for p in CODE_PATTERNS if re.search(p, instruction))
-    text_score = sum(1 for p in TEXT_PATTERNS if re.search(p, instruction))
+    # CODE_PATTERNS は implement/create/generate/write 等の英語動詞を含むが
+    # (?i) インライン修飾子が無い。TEXT_PATTERNS_EN 側は各パターン先頭に (?i)
+    # を明示しているため (文頭大文字化が頻出する英語の実用性のため)、この
+    # IGNORECASE 無しのままだと英語ロケールで文頭大文字化した指示
+    # ("Implement a class Foo" 等) が CODE_PATTERNS 側だけ取りこぼし、
+    # code_score/text_score が非対称に取りこぼす (2026-07-22 監査で判明)。
+    code_score = sum(1 for p in CODE_PATTERNS if re.search(p, instruction, re.IGNORECASE))
+    text_score = sum(1 for p in text_patterns if re.search(p, instruction))
     return ContentType.CODE if code_score > text_score else ContentType.TEXT

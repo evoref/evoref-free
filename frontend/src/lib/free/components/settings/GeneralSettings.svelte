@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { configData, updateField } from '$lib/free/stores/settings';
 	import { configSection, fieldUpdater } from '$lib/free/stores/settingsHelpers';
-	import { t } from '$lib/i18n';
+	import { t, promptLocale as promptLocaleCache, promptLocaleSwitching } from '$lib/i18n';
 	import { performPromptLocaleSwitch } from '$lib/free/services/configService';
 	import { addToast } from '$lib/free/stores/toast';
 	import SettingsSection from './SettingsSection.svelte';
@@ -15,18 +15,21 @@
 	let theme = $derived(configSection($configData, 'theme'));
 	let i18n = $derived(configSection($configData, 'i18n'));
 
-	let switchingLocale = $state(false);
-
 	async function handlePromptLocaleChange(newLocale: string | boolean | null) {
 		if (typeof newLocale !== 'string') return;
 		const currentLocale = String(i18n.prompt_locale ?? 'ja');
 		if (newLocale === currentLocale) return;
 		if (!confirm($t('settings.i18n.prompt_locale_confirm'))) return;
 
-		switchingLocale = true;
+		// サイドバーの switchLocale() と同じ promptLocaleSwitching ストアを
+		// 共有する。どちらの画面から開始した切替でも両方の select を
+		// disable し、同一の排他操作 (prompt_locale 切替) への二重発火を
+		// 防ぐ (2026-07-22 監査で判明)。
+		promptLocaleSwitching.set(true);
 		try {
 			const { relearning } = await performPromptLocaleSwitch(newLocale);
 			updateField('i18n', 'prompt_locale', newLocale);
+			promptLocaleCache.set(newLocale);
 			const key = relearning
 				? 'settings.i18n.prompt_locale_switched_with_relearn'
 				: 'settings.i18n.prompt_locale_switched';
@@ -34,7 +37,7 @@
 		} catch {
 			addToast({ type: 'error', i18nKey: 'settings.i18n.prompt_locale_failed' });
 		} finally {
-			switchingLocale = false;
+			promptLocaleSwitching.set(false);
 		}
 	}
 </script>
@@ -124,7 +127,7 @@
 				{ value: 'ja', label: '日本語' },
 				{ value: 'en', label: 'English' }
 			]}
-			disabled={switchingLocale}
+			disabled={$promptLocaleSwitching}
 			onchange={handlePromptLocaleChange}
 		/>
 	</FieldGroup>

@@ -26,7 +26,7 @@ from backend.free.api.chat.chat_recorder import (
     record_long_form_response,
 )
 from backend.free.api.chat.chat_service import make_token_info
-from backend.free.api.chat.chat_types import GenerationParams, StepCallback
+from backend.free.api.chat.chat_types import ChatMessage, GenerationParams, StepCallback
 from backend.free.api.schemas import ChatResponse, TokenInfo
 from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
@@ -609,7 +609,7 @@ def _build_meta_cognitive_agent_runner(
     *,
     query: str,
     system_prompt: str,
-    conversation: list[dict],
+    conversation: list[ChatMessage],
     client: LocalClient,
     state: AppState,
     session_id: str,
@@ -711,7 +711,7 @@ def _finalize_meta_cognitive_stream(
     resp,
     *,
     state: AppState,
-    messages: list[dict],
+    messages: list[ChatMessage],
     session_id: str,
     query: str,
     mode: str,
@@ -755,9 +755,9 @@ def _finalize_meta_cognitive_stream(
 
 async def stream_meta_cognitive(
     agent: MetaCognitiveAgent, query: str, system_prompt: str,
-    conversation: list[dict], client: LocalClient, state: AppState,
+    conversation: list[ChatMessage], client: LocalClient, state: AppState,
     session_id: str, instance_name: str, context_size: int,
-    messages: list[dict], mode: str,
+    messages: list[ChatMessage], mode: str,
     *, generation_params: GenerationParams | None = None,
     keepalive_interval: float = 15.0,
     timer: StageTimer | None = None,
@@ -873,9 +873,9 @@ async def stream_meta_cognitive(
 
 async def sync_meta_cognitive(
     agent: MetaCognitiveAgent, query: str, system_prompt: str,
-    conversation: list[dict], client: LocalClient, state: AppState,
+    conversation: list[ChatMessage], client: LocalClient, state: AppState,
     session_id: str, instance_name: str, context_size: int,
-    messages: list[dict], mode: str,
+    messages: list[ChatMessage], mode: str,
     *, generation_params: GenerationParams | None = None,
     timer: StageTimer | None = None,
     private: bool = False,
@@ -1097,7 +1097,7 @@ async def _finalize_long_form_stream(
     sess_state: AppState,
     orchestrator: LongFormOrchestrator,
     query: str,
-    messages: list[dict],
+    messages: list[ChatMessage],
     session_id: str,
     mode: str,
     instance_name: str,
@@ -1180,7 +1180,12 @@ async def _finalize_long_form_stream(
             "status": "failed",
         })
 
-    if output_target == "editor":
+    if getattr(orchestrator, "last_needed_clarification", False) is True:
+        # 主題不明で確認質問を返しただけの応答。delivered は確認質問文なので、
+        # そのまま file 書込み/editor 送出してしまうと確認質問がドキュメントに
+        # なってしまう (2026-07-22 発見のトピック混入バグの対策で追加)。
+        write_result = None
+    elif output_target == "editor":
         # エディタ経路: ディスクには書込みせず生成本文を editor_code フレームで送出。
         # SPLIT モードでもエディタ送出を優先 (per-unit ファイルは on_step 側で完了済み)。
         ext, language = _resolve_editor_output_format(query, is_code)
@@ -1244,7 +1249,7 @@ async def stream_long_form(
     orchestrator: LongFormOrchestrator, query: str, session_id: str,
     mode: str, state: AppState,
     instance_name: str, context_size: int,
-    messages: list[dict],
+    messages: list[ChatMessage],
     existing_content: str = "",
     *,
     timer: StageTimer | None = None,
@@ -1405,7 +1410,14 @@ async def stream_long_form(
                 stream_state.full_response += token
                 stream_state.tokens_generated += 1
 
-                if not suppress_chat_token_stream:
+                # needs_clarification 時は file_output_mode/editor_output_mode に
+                # 関わらず必ずチャットへ送出する。抑制したままだと、write-hint 付き
+                # query (例: 元バグの再現クエリ) で確認質問がユーザーに一切届かず
+                # 無応答に見えてしまう (2026-07-22 発見のトピック混入バグ対策)。
+                needs_clarification = (
+                    getattr(orchestrator, "last_needed_clarification", False) is True
+                )
+                if not suppress_chat_token_stream or needs_clarification:
                     yield sse.token(token)
                     last_frame_at = time.monotonic()
                 elif time.monotonic() - last_frame_at >= DEFAULT_KEEPALIVE_INTERVAL_SEC:
@@ -1460,7 +1472,7 @@ async def sync_long_form(
     orchestrator: LongFormOrchestrator, query: str, session_id: str,
     mode: str, state: AppState,
     instance_name: str, context_size: int,
-    messages: list[dict],
+    messages: list[ChatMessage],
     existing_content: str = "",
     *,
     timer: StageTimer | None = None,
@@ -1536,7 +1548,12 @@ async def sync_long_form(
             rag_top1_score=_lf_rag_top1,
         )
 
-        if output_target == "editor":
+        if getattr(orchestrator, "last_needed_clarification", False) is True:
+            # 主題不明で確認質問を返しただけの応答。full_response は確認質問文
+            # なので、そのまま file 書込みしてしまうと確認質問がドキュメントに
+            # なってしまう (2026-07-22 発見のトピック混入バグの対策で追加)。
+            write_result = None
+        elif output_target == "editor":
             write_result = None
             # コード生成時は editor 表示前に markdown コードフェンスを除去。
             if is_code:
@@ -1672,7 +1689,7 @@ async def _stream_filtered_token_pipeline(
 
 async def _retry_zero_tokens_deliberative(
     state: _DeliberativeStreamState,
-    messages: list[dict],
+    messages: list[ChatMessage],
     client: LocalClient,
     max_tokens: int | None,
     session_id: str,
@@ -1740,7 +1757,7 @@ async def _finalize_deliberative_stream(
     state: _DeliberativeStreamState,
     sess_state: AppState,
     query: str,
-    messages: list[dict],
+    messages: list[ChatMessage],
     session_id: str,
     mode: str,
     instance_name: str,
@@ -1784,11 +1801,11 @@ async def _finalize_deliberative_stream(
 
 
 async def stream_deliberative(
-    agent: DeliberativeAgent, query: str, messages: list[dict],
+    agent: DeliberativeAgent, query: str, messages: list[ChatMessage],
     client: LocalClient, state: AppState,
     session_id: str, instance_name: str, context_size: int,
     *, mode: str = "chat", max_tokens: int | None = None,
-    conversation: list[dict] | None = None,
+    conversation: list[ChatMessage] | None = None,
     generation_params: GenerationParams | None = None,
     timer: StageTimer | None = None,
     private: bool = False,
@@ -1909,11 +1926,11 @@ async def stream_deliberative(
 
 
 async def sync_deliberative(
-    agent: DeliberativeAgent, query: str, messages: list[dict],
+    agent: DeliberativeAgent, query: str, messages: list[ChatMessage],
     client: LocalClient, state: AppState,
     session_id: str, instance_name: str, context_size: int,
     *, mode: str = "chat", max_tokens: int | None = None,
-    conversation: list[dict] | None = None,
+    conversation: list[ChatMessage] | None = None,
     generation_params: GenerationParams | None = None,
     timer: StageTimer | None = None,
     private: bool = False,
@@ -1998,7 +2015,7 @@ def _apply_generation_params(gen_kwargs: dict, generation_params: "GenerationPar
 
 async def stream_reactive_light(
     query: str,
-    messages: list[dict],
+    messages: list[ChatMessage],
     client: LocalClient,
     state: AppState,
     session_id: str,
@@ -2096,7 +2113,7 @@ async def stream_reactive_light(
 
 async def sync_reactive_light(
     query: str,
-    messages: list[dict],
+    messages: list[ChatMessage],
     client: LocalClient,
     state: AppState,
     session_id: str,
@@ -2389,7 +2406,7 @@ async def stream_staged_coding(
     cfg: dict,
     instance_name: str,
     context_size: int,
-    messages: list[dict],
+    messages: list[ChatMessage],
     output_target: str,
     codegen,
     fallback_factory,
@@ -2624,7 +2641,7 @@ async def _finalize_staged_stream(
     ws,
     state: AppState,
     query: str,
-    messages: list[dict],
+    messages: list[ChatMessage],
     session_id: str,
     instance_name: str,
     context_size: int,

@@ -9,6 +9,7 @@ from backend.free.api.chat.chat_constants import (
     DEFAULT_CONTEXT_SIZE, DEFAULT_GENERATION_RESERVE,
     DEFAULT_MAX_TOKENS, DEFAULT_WORKING_MAX_TOKENS,
 )
+from backend.free.api.chat.chat_types import ChatMessage
 from backend.config import resolve_context_size
 from backend.log_config import get_logger
 from backend.utils import compress_turn, estimate_tokens as _estimate_tokens
@@ -262,7 +263,7 @@ def _select_fewshot_block(
     return block, remaining - cost
 
 
-def _prepend_dynamic_block(trimmed: list[dict], dyn_text: str) -> bool:
+def _prepend_dynamic_block(trimmed: list[ChatMessage], dyn_text: str) -> bool:
     """trimmed の最後の user メッセージ content 先頭に動的ブロックを前置する。
 
     最後の user メッセージを **新しい dict で置換** する (入力要素は mutate しない。
@@ -283,7 +284,7 @@ def _prepend_dynamic_block(trimmed: list[dict], dyn_text: str) -> bool:
 
 def build_messages(
     system_prompt: str,
-    history: list[dict],
+    history: list[ChatMessage],
     rag_chunks: list[str] | None = None,
     file_contexts: list[dict] | None = None,
     working_max_tokens: int = DEFAULT_WORKING_MAX_TOKENS,
@@ -294,7 +295,7 @@ def build_messages(
     semmem_block: str | None = None,
     fewshot_block: str | None = None,
     history_min_tokens: int = 0,
-) -> list[dict]:
+) -> list[ChatMessage]:
     """
     messages リストを組み立て、トークン予算内に収める。
 
@@ -403,7 +404,7 @@ def build_messages(
         dyn_parts.append(rag_block)
 
     # 静的 system メッセージ (動的部は含めない)
-    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    messages: list[ChatMessage] = [{"role": "system", "content": system_prompt}]
 
     # 4. 会話履歴（予約分 + 床 + 残余予算。上限は working_max_tokens）
     history_budget = min(
@@ -463,10 +464,10 @@ def build_messages(
 
 def build_messages_for_loop(
     system: str,
-    history: list[dict],
+    history: list[ChatMessage],
     compacted_steps: list,
     cfg: dict,
-) -> list[dict]:
+) -> list[ChatMessage]:
     """Meta-Cognitive ループ用の messages 組み立て。
 
     build_messages と同じ予算管理だが、RAG チャンクの代わりに
@@ -510,9 +511,9 @@ def build_messages_for_loop(
 
 
 def _trim_history(
-    history: list[dict],
+    history: list[ChatMessage],
     max_tokens: int,
-) -> list[dict]:
+) -> list[ChatMessage]:
     """トークン予算に収まるよう、古い履歴を圧縮・削除する。
 
     **最新ターン (通常は現在の user 質問) は予算超過でも drop しない**: 予算に
@@ -526,7 +527,7 @@ def _trim_history(
         logger.debug("_trim_history: empty history, nothing to trim")
         return []
 
-    result: list[dict] = []
+    result: list[ChatMessage] = []
     total_tokens = 0
 
     # 新しいターンから逆順に追加
