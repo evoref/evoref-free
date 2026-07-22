@@ -122,15 +122,13 @@ def _readonly_command_rejected(exec_tool: str, command: str) -> bool:
     return False
 
 
-# ルールベースフォールバック用パターン
-# 注意: 「検索」等の汎用語は知識質問にもマッチするため、
-# コード/ファイル文脈を要求するパターンのみ含める。
-_TOOL_PATTERNS = [
-    re.compile(r"(?:ファイル|file).*(?:読|書|開|作成|削除)", re.IGNORECASE),
-    re.compile(r"(?:コマンド|command).*(?:実行|run)", re.IGNORECASE),
-    # コード/ファイル検索: 汎用「検索」は知識質問にマッチするため除外。
-    # ASCII トークンは単語境界必須 ("crossencoder" の 'code' 等への部分一致誤爆対策、
-    # CPU/RAM 境界ガードと同じ理由)。日本語側 (コード/ファイル/ソース/検索) は対象外。
+# コード/ファイル検索の共起ガード。汎用「検索」単独は知識質問にもマッチする
+# ため、コード/ファイル文脈語との共起を要求する (下記 _TOOL_PATTERNS の設計
+# 原則と同じ)。_TOOL_PATTERNS / _TOOL_PATTERNS_EN のこのエントリと
+# ToolCallJudge._infer_tool 内の search_code 判定の単一の情報源。JA/EN で
+# 同一の複合パターンを使う (両トークンを同一正規表現に含めているため locale
+# で分岐不要)。
+_CODE_SEARCH_PATTERNS = (
     re.compile(
         r"(?:コード|ファイル|ソース|関数|クラス|(?<![A-Za-z])code(?![A-Za-z])"
         r"|(?<![A-Za-z])file(?![A-Za-z])|(?<![A-Za-z])source(?![A-Za-z]))"
@@ -145,6 +143,18 @@ _TOOL_PATTERNS = [
         r"|(?<![A-Za-z])file(?![A-Za-z])|(?<![A-Za-z])source(?![A-Za-z]))",
         re.IGNORECASE,
     ),
+)
+
+# ルールベースフォールバック用パターン
+# 注意: 「検索」等の汎用語は知識質問にもマッチするため、
+# コード/ファイル文脈を要求するパターンのみ含める。
+_TOOL_PATTERNS = [
+    re.compile(r"(?:ファイル|file).*(?:読|書|開|作成|削除)", re.IGNORECASE),
+    re.compile(r"(?:コマンド|command).*(?:実行|run)", re.IGNORECASE),
+    # コード/ファイル検索: 汎用「検索」は知識質問にマッチするため除外。
+    # ASCII トークンは単語境界必須 ("crossencoder" の 'code' 等への部分一致誤爆対策、
+    # CPU/RAM 境界ガードと同じ理由)。日本語側 (コード/ファイル/ソース/検索) は対象外。
+    *_CODE_SEARCH_PATTERNS,
     re.compile(r"(?:URL|url|https?://|ウェブ|web|サイト|site|ページ|page|ニュース|news|フェッチ|fetch|ブラウズ|browse)", re.IGNORECASE),
     re.compile(r"(?:計算|calculate)\s", re.IGNORECASE),
     # ファイルパスを含むクエリ（C:\, E:\, /home/ 等）+ 出力/保存/生成系動詞
@@ -182,20 +192,7 @@ _TOOL_PATTERNS = [
 _TOOL_PATTERNS_EN = [
     re.compile(r"\bfile\b.*\b(?:read|open)\b.*\b(?:write|modify|change|update|delete|remove|edit)\b", re.IGNORECASE),
     re.compile(r"(?:コマンド|command).*(?:実行|run)", re.IGNORECASE),
-    re.compile(
-        r"(?:コード|ファイル|ソース|関数|クラス|(?<![A-Za-z])code(?![A-Za-z])"
-        r"|(?<![A-Za-z])file(?![A-Za-z])|(?<![A-Za-z])source(?![A-Za-z]))"
-        r".*(?:検索|(?<![A-Za-z])search(?![A-Za-z])|(?<![A-Za-z])grep(?![A-Za-z])"
-        r"|(?<![A-Za-z])find(?![A-Za-z]))",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?:検索|(?<![A-Za-z])search(?![A-Za-z])|(?<![A-Za-z])grep(?![A-Za-z])"
-        r"|(?<![A-Za-z])find(?![A-Za-z]))"
-        r".*(?:コード|ファイル|ソース|(?<![A-Za-z])code(?![A-Za-z])"
-        r"|(?<![A-Za-z])file(?![A-Za-z])|(?<![A-Za-z])source(?![A-Za-z]))",
-        re.IGNORECASE,
-    ),
+    *_CODE_SEARCH_PATTERNS,
     re.compile(r"(?:URL|url|https?://|web|site|page|news|fetch|browse)", re.IGNORECASE),
     re.compile(r"(?:計算|calculate)\s", re.IGNORECASE),
     re.compile(r"[A-Za-z]:\\", re.IGNORECASE),
@@ -2384,8 +2381,13 @@ class ToolCallJudge:
                 return "run_command", {"command": cmd_match.group(1)}
             return "run_command", {}
 
-        # コード検索パターン
-        if re.search(r"(?:検索|search|grep|find)", q) and tools_registry.has("search_code"):
+        # コード検索パターン (_TOOL_PATTERNS と同一の共起ガード _CODE_SEARCH_PATTERNS
+        # を再利用。汎用「検索」単独は "Binary Search Tree" のような英語クラス名
+        # の部分一致にも誤爆するため、コード/ファイル文脈語との共起を要求する
+        # — 2026-07-22 監査で判明。裸の検索語だけで抽出パターンが確定し、
+        # 無関係ファイルへの search_code 誤発火を招いていた)
+        if (any(p.search(query) for p in _CODE_SEARCH_PATTERNS)
+                and tools_registry.has("search_code")):
             # クエリからキーワードを抽出して pattern 引数に設定
             pattern = _extract_search_pattern(query)
             if pattern:
