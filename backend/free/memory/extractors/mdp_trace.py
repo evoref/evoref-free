@@ -42,6 +42,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from backend.free.core.session_mode import is_valid_session_mode
 from backend.free.memory.extractors.base import (
     BaseExtractor,
     ExtractionContext,
@@ -237,7 +238,7 @@ class MDPTraceExtractor(BaseExtractor):
             # 21 件全件が mode_origin="coding" で取り込まれた)。
             begin = ep.get("begin") or {}
             episode_mode = str(begin.get("mode") or "") or self.mode
-            if episode_mode not in ("chat", "coding"):
+            if not is_valid_session_mode(episode_mode):
                 episode_mode = self.mode
             if _is_failure_outcome(outcome, steps):
                 fact = self._build_failure_fact(

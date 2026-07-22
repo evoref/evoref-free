@@ -287,7 +287,8 @@
 			"prompt_locale_confirm": "プロンプト言語を切り替えると、現在のプロンプトはアーカイブされ新しい言語のデフォルトに置き換わります。自動再学習がスケジュールされます。続行しますか？",
 			"prompt_locale_switched": "プロンプト言語を切り替えました",
 			"prompt_locale_switched_with_relearn": "プロンプト言語を切り替えました。再学習がスケジュールされています",
-			"prompt_locale_failed": "プロンプト言語の切り替えに失敗しました"
+			"prompt_locale_failed": "プロンプト言語の切り替えに失敗しました",
+			"locale_failed": "表示言語の切り替えに失敗しました"
 		},
 		"option": {
 			"dark": "ダーク",

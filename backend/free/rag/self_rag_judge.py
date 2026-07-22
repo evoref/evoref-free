@@ -24,6 +24,13 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from backend.free.core.locale_patterns import is_en_locale
+from backend.free.document_nouns import (
+    DOCUMENT_NOUNS_NEEDS_SUFFIX,
+    DOCUMENT_NOUNS_NEEDS_SUFFIX_EN,
+    DOCUMENT_NOUNS_STANDALONE,
+    DOCUMENT_NOUNS_STANDALONE_EN,
+)
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -39,6 +46,16 @@ VALID_QUALITIES = {"high", "medium", "low"}
 # 検索スキップパターン
 SKIP_PATTERNS = re.compile(
     r"(こんにちは|こんばんは|おはよう|ありがとう|了解|OK|はい|いいえ|さようなら)",
+    re.IGNORECASE,
+)
+
+# SKIP_PATTERNS の英語版。短い英単語 ("no"/"yes") の部分一致誤爆
+# ("know"/"yesterday" 等) を防ぐため \b で単語境界を必須にする。
+SKIP_PATTERNS_EN = re.compile(
+    r"\b(?:hello|hi|hey|good\s+(?:morning|afternoon|evening)"
+    r"|thanks?(?:\s+you)?|thank\s+you"
+    r"|ok(?:ay)?|yes|yeah|yep|no|nope"
+    r"|bye|goodbye|see\s+you)\b",
     re.IGNORECASE,
 )
 
@@ -58,6 +75,17 @@ FETCH_INTENT_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# FETCH_INTENT_PATTERNS の英語版。
+FETCH_INTENT_PATTERNS_EN = re.compile(
+    r"(https?://"
+    r"|\bfetch\b"
+    r"|\baccess\s+(?:it|that|the\s+(?:page|site|url|link))\b"
+    r"|\bretrieve\b"
+    r"|\bget\s+it\s+again\b|\bre-?fetch\b|\bre-?download\b"
+    r"|\bbrowse\b|\bdownload\b)",
+    re.IGNORECASE,
+)
+
 # 質問マーカーパターン
 # これらを含むクエリは多ターン会話でも常に retrieve とする。
 # 多ターン会話の途中で新しい知識質問が来た場合に、コンテキスト
@@ -68,6 +96,18 @@ QUESTION_PATTERNS = re.compile(
     r"|を教え|を説明|を知|を教|の意味|の理由|の特徴|の違い|の使い方|の歴史"
     # 旧 FORCE_PATTERNS から移管: 知識質問の意図を表す動詞 / 願望表現
     r"|教えて|教えてくだ|教えて欲|知りたい|調べて|確認したい|について教)",
+)
+
+# QUESTION_PATTERNS の英語版。日本語版は「?」記号への依存が大きいため、
+# 「?」を付けない英語依頼文 ("Tell me the difference between A and B") も
+# 拾えるよう疑問語・依頼動詞を明示的に含める。
+QUESTION_PATTERNS_EN = re.compile(
+    r"(\?"
+    r"|\bwhat(?:'s|\s+is|\s+are)\b|\bwho(?:'s|\s+is)\b|\bwhen(?:'s|\s+is)\b"
+    r"|\bwhere(?:'s|\s+is)\b|\bwhy\s+(?:is|does|do)\b|\bhow\s+(?:is|does|do)\b"
+    r"|\btell\s+me\b|\bexplain\b|\bdo\s+you\s+know\b"
+    r"|\bi\s+want\s+to\s+know\b|\bcurious\s+about\b|\bcould\s+you\s+check\b)",
+    re.IGNORECASE,
 )
 
 # 自明な質問パターン (RAG 不要の即 skip 確定)
@@ -127,6 +167,43 @@ TRIVIAL_QUESTION_PATTERNS = re.compile(
     r"|最初|最後|何番目|何回目))",
 )
 
+# TRIVIAL_QUESTION_PATTERNS の英語版。
+# (pillar境界のため backend/free/agent/tool_call_judge.py の
+# _SELF_SESSION_REFERENCE_PATTERNS_EN と同義の定義を重複させている。
+# 両ファイルを変更する際は同期させること)。
+# 時刻/自己同一性/雑談の短いフレーズ群 (1 行目の alternation) は ^...$ で
+# クエリ全体との一致を要求する。アンカー無しの re.search だと "How are you
+# handling auth in this API?" のような RAG が必要な技術的質問が部分文字列
+# 一致で誤って skip される (2026-07-22 監査で判明)。セッション自己参照の
+# 複合パターン (2/3 行目) は元々 40 文字の近接窓 + 否定先読みで十分に
+# 絞り込まれているため対象外。
+TRIVIAL_QUESTION_PATTERNS_EN = re.compile(
+    r"(^\s*(?:what\s+time\s+is\s+it"
+    r"|what'?s?\s+(?:today'?s?\s+date|the\s+date)"
+    r"|what\s+day\s+is\s+it"
+    r"|current\s+time"
+    r"|what'?s\s+your\s+name"
+    r"|who\s+are\s+you"
+    r"|what\s+are\s+you"
+    r"|how\s+are\s+you"
+    r"|how'?re\s+you\s+doing"
+    r"|how'?s\s+it\s+going)\s*[?.!]*\s*$"
+    r"|(?:this\s+conversation|this\s+chat|our\s+conversation"
+    r"|what\s+we\s+(?:talked|discussed|were\s+talking)\s+about"
+    r"|earlier\s+in\s+this\s+(?:conversation|chat)"
+    r"|so\s+far\s+in\s+this\s+conversation)"
+    r"(?!\s*(?:is|was|has)?\s*(?:not\s+related|unrelated|nothing\s+to\s+do))"
+    r"[^.!?\n]{0,40}?"
+    r"(?:interesting|memorable|impressive|funn(?:y|iest)"
+    r"|summar\w*|recap\w*|think|thought|feel|felt|remember"
+    r"|first|last|earliest|latest)"
+    r"|(?:interesting|memorable|impressive|funn(?:y|iest)"
+    r"|summar\w*|recap\w*|first|last|earliest|latest)"
+    r"[^.!?\n]{0,40}?"
+    r"(?:this\s+conversation|this\s+chat|our\s+conversation))",
+    re.IGNORECASE,
+)
+
 # ファイルパス検出 (Windows ドライブレター / Unix 拡張子付きパス)。
 # `tool_call_judge._extract_file_path` をミラーした最小実装。
 # pillar 境界 (EvorefGen `rag/` ⇄ EvorefLoop `agent/`) を越境しないよう
@@ -137,14 +214,24 @@ FILE_PATH_PATTERN = re.compile(
 )
 
 # コード / ドキュメント生成意図。router の LONG_FORM_PATTERNS と
-# 一貫させた語彙 (docs/f_03_agent_engine.md §1.2 参照)。
+# 一貫させた語彙 (docs/f_03_agent_engine.md §1.2 参照)。名詞側は
+# backend/free/document_nouns.py の共有語彙を参照する (以前は独立ハード
+# コードで router.py/content_detector.py と語彙が乖離していた3つ目の重複
+# 箇所だった)。
 # 保存/書き出し/テンプレート系の語彙も自己完結の生成タスクとして扱う
 # (2026-07-15: 「〜を作って <path> に保存して」が skip されず 13 件の
 # 無関連チャンク + 7〜10 秒の判定コストが乗った)。
 CODE_DOC_GEN_INTENT_PATTERNS = re.compile(
-    r"(?:作成|作って|実装|生成|書いて|書く|出力|保存|書き出|エクスポート|"
-    r"仕様書|設計書|要件定義|計画書|手順書|テンプレート|ひな形|雛形|README|"
+    rf"(?:作成|作って|実装|生成|書いて|書く|出力|保存|書き出|エクスポート|"
+    rf"{'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX + DOCUMENT_NOUNS_STANDALONE)}|"
     r"create|implement|generate|write|save|export)",
+    re.IGNORECASE,
+)
+
+# CODE_DOC_GEN_INTENT_PATTERNS の英語版。
+CODE_DOC_GEN_INTENT_PATTERNS_EN = re.compile(
+    rf"(?:create|write|implement|generate|save|export|build|draft|prepare|"
+    rf"{'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX_EN + DOCUMENT_NOUNS_STANDALONE_EN)})",
     re.IGNORECASE,
 )
 
@@ -152,6 +239,13 @@ CODE_DOC_GEN_INTENT_PATTERNS = re.compile(
 # 知識質問は生成タスクではないため、write-intent 早期 skip から除外する。
 _HOWTO_QUESTION_RE = re.compile(
     r"(?:教えて|おしえて|方法|どうやって|どうすれば|とは|って何|ですか|ますか)",
+)
+
+# _HOWTO_QUESTION_RE の英語版。
+_HOWTO_QUESTION_RE_EN = re.compile(
+    r"\b(?:how\s+(?:do|can|could|would)\s+i|how\s+to|what\s+is|what'?s"
+    r"|tell\s+me\s+(?:how|about)|explain|describe)\b",
+    re.IGNORECASE,
 )
 
 # uncertain 化の最大クエリ長。これより長い質問は QUESTION_PATTERNS
@@ -294,6 +388,13 @@ class RetrievalNecessityJudge:
         (retrieve 意図) を区別できないため、アシスト 3 値判定に委ねる。
         """
         query_stripped = query.strip()
+        en = is_en_locale()
+        skip_pat = SKIP_PATTERNS_EN if en else SKIP_PATTERNS
+        fetch_pat = FETCH_INTENT_PATTERNS_EN if en else FETCH_INTENT_PATTERNS
+        trivial_pat = TRIVIAL_QUESTION_PATTERNS_EN if en else TRIVIAL_QUESTION_PATTERNS
+        codegen_pat = CODE_DOC_GEN_INTENT_PATTERNS_EN if en else CODE_DOC_GEN_INTENT_PATTERNS
+        howto_pat = _HOWTO_QUESTION_RE_EN if en else _HOWTO_QUESTION_RE
+        question_pat = QUESTION_PATTERNS_EN if en else QUESTION_PATTERNS
 
         # 1. 短すぎるクエリはスキップ
         if len(query_stripped) < 3:
@@ -301,7 +402,7 @@ class RetrievalNecessityJudge:
             return "skip"
 
         # 2. 外部 fetch 意図 (確定): URL を含む or 明示的 fetch 動詞
-        if FETCH_INTENT_PATTERNS.search(query_stripped):
+        if fetch_pat.search(query_stripped):
             logger.debug(
                 "Necessity: fetch (fetch intent pattern matched: %r)",
                 query_stripped[:50],
@@ -309,7 +410,7 @@ class RetrievalNecessityJudge:
             return "fetch"
 
         # 3. 自明な質問 (時刻 / 日付 / 自己同一性 / 雑談): 即 skip 確定
-        if TRIVIAL_QUESTION_PATTERNS.search(query_stripped):
+        if trivial_pat.search(query_stripped):
             logger.debug(
                 "Necessity: skip (trivial question pattern matched: %r)",
                 query_stripped[:50],
@@ -328,8 +429,8 @@ class RetrievalNecessityJudge:
         # 防ぐ。ただし how-to 質問 (「作成する方法を教えて」) は除外する。
         if (
             FILE_PATH_PATTERN.search(query_stripped)
-            and CODE_DOC_GEN_INTENT_PATTERNS.search(query_stripped)
-            and not _HOWTO_QUESTION_RE.search(query_stripped)
+            and codegen_pat.search(query_stripped)
+            and not howto_pat.search(query_stripped)
         ):
             logger.debug(
                 "Necessity: skip (file path + code/doc-gen intent: %r)",
@@ -340,7 +441,7 @@ class RetrievalNecessityJudge:
         # 4. 質問マーカー (SKIP より優先)
         # 「発売日はいつ」が SKIP の "はい" substring にヒットして誤って
         # skip されないよう、QUESTION を SKIP より先に評価する。
-        if QUESTION_PATTERNS.search(query_stripped):
+        if question_pat.search(query_stripped):
             if len(query_stripped) < _UNCERTAIN_QUERY_MAX_CHARS:
                 logger.debug(
                     "Necessity: uncertain (short question marker: %r)",
@@ -354,7 +455,7 @@ class RetrievalNecessityJudge:
             return "retrieve"
 
         # 5. スキップパターン (挨拶/相槌) — 短文のみ
-        if SKIP_PATTERNS.search(query_stripped) and len(query_stripped) < 20:
+        if skip_pat.search(query_stripped) and len(query_stripped) < 20:
             logger.debug("Necessity: skip (greeting/simple pattern matched: %r)", query_stripped[:30])
             return "skip"
 

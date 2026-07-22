@@ -5,7 +5,14 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
-from backend.config import resolve_context_size_for_mode
+from backend.free.agent.context_budget import resolve_meta_cognitive_loop_budget
+from backend.free.core.session_mode import is_chat_mode, is_coding_mode
+from backend.free.document_nouns import (
+    DOCUMENT_NOUNS_NEEDS_SUFFIX,
+    DOCUMENT_NOUNS_NEEDS_SUFFIX_EN,
+    DOCUMENT_NOUNS_STANDALONE,
+    DOCUMENT_NOUNS_STANDALONE_EN,
+)
 from backend.log_config import get_logger
 from backend.policy_helpers import get_policy_value
 
@@ -24,11 +31,12 @@ LONG_FORM_PATTERNS = [
     re.compile(r"(\d{3,})\s*[字文行]"),                        # 「3000字の記事」「500行」
     # 文書系名詞 → 動作動詞 の組合せ。
     # 「仕様書を作成して」「ドキュメントを出力して」「計画書をまとめて」等
-    # を長文生成として拾うため、設計系文書 (仕様書/設計書/要件定義/計画書/
-    # 手順書/README/読本) と出力動詞 (出力) を追加。
+    # を長文生成として拾う。名詞語彙は backend/free/document_nouns.py で
+    # content_detector.py (EvorefGen) の TEXT_PATTERNS と共有する。router は
+    # 常にサフィックス必須で運用するため、名詞単体マッチ許容語彙
+    # (DOCUMENT_NOUNS_STANDALONE) もここではサフィックス必須の安全側で使う。
     re.compile(
-        r"(記事|レポート|報告書|文書|論文|マニュアル|ドキュメント|論説|手引き|"
-        r"仕様書|設計書|要件定義|計画書|手順書|README|読本)"
+        rf"({'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX + DOCUMENT_NOUNS_STANDALONE)})"
         r".*(書|作成|生成|まとめ|出力)",
     ),
     # 「長文」「長編」の言及、または「長い」+ 創作文書系名詞 (物語/小説等、
@@ -47,6 +55,44 @@ LONG_FORM_PATTERNS = [
     ),
     re.compile(r"(実装|作成).*全体"),
     re.compile(r"(完全|網羅的|包括的).*(実装|ガイド|解説)"),
+]
+
+# LONG_FORM_PATTERNS の英語版。GUI locale に関わらず LONG_FORM_PATTERNS と
+# 常に両方評価する (2026-07-22 発見: GUI locale が既定 'ja' のまま英語で
+# チャットすると、以前は locale 排他選択のため英語の文書作成依頼が一切
+# 検出されなかった。詳細は _detect_long_form 参照)。
+LONG_FORM_PATTERNS_EN = [
+    re.compile(r"\b(\d{3,})[\s-]?(?:words?|lines?)\b", re.IGNORECASE),  # "3000-word article" "500 lines"
+    re.compile(
+        rf"\b(?:write|draft|create|compose|generate|produce|prepare|put\s+together)\b"
+        rf".*\b(?:{'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX_EN + DOCUMENT_NOUNS_STANDALONE_EN)})\b"
+        r"|"
+        rf"\b(?:{'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX_EN + DOCUMENT_NOUNS_STANDALONE_EN)})\b"
+        rf".*\b(?:write|draft|create|compose|generate|produce|prepare|put\s+together)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:write|draft|create|compose)\b.*\b(?:long|lengthy|in-depth|comprehensive)\b"
+        r".*\b(?:article|essay|story|novel|report|poem)\b"
+        r"|"
+        r"\b(?:long|lengthy|in-depth|comprehensive)\b.*\b(?:article|essay|story|novel|report|poem)\b"
+        r".*\b(?:write|draft|create|compose)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:files?|modules?|classes?|the\s+(?:whole|entire)\s+project)\b"
+        r".*\b(?:entire|whole|full|complete)\b.*\b(?:create|generate|implement|build)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:implement|create|build)\b.*\b(?:everything|the\s+whole\s+thing|the\s+entire\s+project)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:complete|comprehensive|exhaustive|full)\b"
+        r".*\b(?:implementation|guide|explanation|walkthrough|write-?up)\b",
+        re.IGNORECASE,
+    ),
 ]
 
 # URL を含み、かつファイル書込み/出力意図のあるクエリは「取得 → 書込み」の連鎖を
@@ -94,10 +140,17 @@ _LEARNED_LONG_FORM_MIN_WEIGHT_SUM = 0.8
 # how-to / 質問形マーカー。「作成する方法を教えて」のような書込み動詞を含む
 # 知識質問を local_write_intent から除外する。``_is_knowledge_query`` は
 # 「一覧を…」等のデータ語を広く拾い正当な書込みコマンドまで除外してしまうため、
-# ここでは教示・疑問マーカーに限定する。
+# ここでは教示・疑問マーカーに限定する。locale で切替えず単一の正規表現に
+# JA/EN 両方の教示・疑問フレーズを併記する (末尾の [?？] は locale 非依存の
+# フォールバック)。英語側は疑問符依存のみだと "How do I create this report
+# at C:\reports\" のように疑問符無しで how-to 意図を書くクエリを取りこぼす
+# ため、明示的な how-to フレーズを追加した (2026-07-22 監査で判明)。
 _HOWTO_QUERY_RE = re.compile(
     r"(?:教えて|おしえて|どうやって|どうすれば|どうやったら"
-    r"|とは|って何|何ですか|ですか|ますか|でしょうか|ありますか|[?？])",
+    r"|とは|って何|何ですか|ですか|ますか|でしょうか|ありますか|[?？]"
+    r"|how\s+(?:do|can|should|would)\s+i\b|how\s+to\b"
+    r"|(?:could|can|would)\s+you\s+(?:tell|show)\s+me\s+how\b"
+    r"|tell\s+me\s+how\b|what'?s?\s+the\s+way\s+to\b)",
     re.IGNORECASE,
 )
 
@@ -107,8 +160,23 @@ COMPLEX_KEYWORDS = [
     "メリット", "デメリット", "利点", "欠点", "長所", "短所",
     "原因", "理由", "要因", "根本原因",
     "仕組み", "構造", "アーキテクチャ",
-    "explain", "compare", "analyze", "analyse", "why", "how",
-    "difference", "pros", "cons", "trade-off", "tradeoff",
+]
+
+# COMPLEX_KEYWORDS の英語版。"how"/"cons"/"pros" 等の短い英単語は
+# "however"/"prospect"/"considering" 等への substring 誤爆を防ぐため、
+# 単純な文字列一致ではなく ASCII 境界ガード付き正規表現で構成する
+# (META_KEYWORDS_EN_PATTERNS の慣用句を踏襲)。
+COMPLEX_KEYWORDS_EN_PATTERNS = [
+    re.compile(r"(?<![A-Za-z])explain(?:ed|ing|s)?(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])compar(?:e[ds]?|ing|ison)(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])analy[sz]e[ds]?(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])analy[sz]ing(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])why(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])how(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])difference[s]?(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])pros(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])cons(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])trade[\s-]?offs?(?![A-Za-z])", re.IGNORECASE),
 ]
 
 # 履歴検索が必要なキーワード → Deliberative 層
@@ -127,6 +195,13 @@ HISTORY_KEYWORDS = [
     "remember", "recall",
 ]
 
+# HISTORY_KEYWORDS の英語版。
+HISTORY_KEYWORDS_EN = [
+    "earlier", "previously", "last time", "yesterday", "before",
+    "remember", "recall", "this morning", "just now", "a moment ago",
+    "a while back", "at first", "in the beginning",
+]
+
 # Meta-Cognitive 層へのエスカレーションキーワード（同義語拡張済み）
 # 注意: 命令形（〜して）のみ対象。「計画を教えて」等の知識質問は
 # ここに含めない（RAG パイプラインで処理する）。
@@ -136,6 +211,27 @@ META_KEYWORDS = [
     "構築", "ビルド", "テストして", "動かして",
     "implement", "refactor", "fix", "debug",
     "build", "design",
+]
+
+# META_KEYWORDS の英語版。短い英単語の substring 誤爆 ("prefix"/"contest"/
+# "rebuild" 等) を防ぐため、単純な文字列一致ではなく ASCII 境界ガード付き
+# 正規表現で構成する (_EXECUTABLE_QUERY_PATTERNS の慣用句を踏襲)。
+META_KEYWORDS_EN_PATTERNS = [
+    re.compile(r"(?<![A-Za-z])steps?(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"step[\s-]by[\s-]step", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])implement(?:ed|ing|ation)?(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])write(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])create(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])build(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])refactor(?:ing)?(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])fix(?:ed|ing)?(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])debug(?:ging)?(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])design(?:ed|ing)?(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"set\s*up", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])construct(?:ed|ing)?(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])test(?:ed|ing)?(?![A-Za-z])", re.IGNORECASE),
+    re.compile(r"run\s+(?:it|this|that)\b", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z])make(?![A-Za-z])", re.IGNORECASE),
 ]
 
 # 知識質問パターン — ツール呼び出しではなく RAG で処理すべきクエリ
@@ -148,6 +244,26 @@ KNOWLEDGE_QUERY_PATTERNS = [
     re.compile(r"(?:what is|tell me|explain|describe|how does)\b", re.IGNORECASE),
 ]
 
+# KNOWLEDGE_QUERY_PATTERNS の英語版。「about」は汎用前置詞のため直訳せず、
+# 限定的な表現で構成する (誤爆抑制)。
+KNOWLEDGE_QUERY_PATTERNS_EN = [
+    re.compile(
+        r"\b(?:what\s+is|what's|what\s+are|tell\s+me\s+(?:about|more)|explain"
+        r"|describe|how\s+does|how\s+do|could\s+you\s+explain)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:tell\s+me\s+about|what\s+about|information\s+(?:about|on)"
+        r"|details?\s+(?:about|on)|overview\s+of|regarding)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:want\s+to\s+know|would\s+like\s+to\s+know|i'?d\s+like\s+to\s+know"
+        r"|curious\s+about|want\s+to\s+understand|want\s+to\s+check)\b",
+        re.IGNORECASE,
+    ),
+]
+
 # ツール呼び出しを示すパターン（Meta-Cognitive 層へのエスカレーション対象）
 # 注意: 単純なファイル読み書きは Deliberative 層の ToolCallJudge が処理する。
 # ここには複数ツールの連携が必要なパターンのみ含める。
@@ -157,6 +273,20 @@ TOOL_PATTERNS = [
     re.compile(r"(?:ファイル|file).*(?:読|開).*(?:書|修正|変更|削除|追加)", re.IGNORECASE),
     re.compile(r"(?:コマンド|command).*(?:実行|run)", re.IGNORECASE),
     # コード/ファイル検索: 汎用「検索」ではなく、コード・ファイル文脈を要求
+    re.compile(r"(?:コード|ファイル|ソース|関数|クラス|code|file|source|function|class).*(?:検索|search|grep|find)", re.IGNORECASE),
+    re.compile(r"(?:検索|search|grep|find).*(?:コード|ファイル|ソース|code|file|source)", re.IGNORECASE),
+    re.compile(r"(?:URL|url|https?://)", re.IGNORECASE),
+    re.compile(r"(?:計算|calculate)\s", re.IGNORECASE),
+]
+
+# TOOL_PATTERNS の英語版。末尾4パターン (コード検索/URL/計算) は元々
+# ASCII 語彙のみで日英両対応済みのためそのまま複製する。1つ目 (ファイル
+# 読み書き複合操作) のみ、日本語版が活用語尾ゲート限定のため英語文で
+# 発火しない (128行目相当) ので、英語動詞で作り直す。2つ目 (コマンド実行)
+# も日本語活用語尾 (して/する) を要求せずに発火するよう緩和する。
+TOOL_PATTERNS_EN = [
+    re.compile(r"\bfile\b.*\b(?:read|open)\b.*\b(?:write|modify|change|update|delete|remove|edit|append)\b", re.IGNORECASE),
+    re.compile(r"\b(?:run|execute|exec)\b.*\bcommand\b|\bcommand\b.*\b(?:run|execute|exec)\b", re.IGNORECASE),
     re.compile(r"(?:コード|ファイル|ソース|関数|クラス|code|file|source|function|class).*(?:検索|search|grep|find)", re.IGNORECASE),
     re.compile(r"(?:検索|search|grep|find).*(?:コード|ファイル|ソース|code|file|source)", re.IGNORECASE),
     re.compile(r"(?:URL|url|https?://)", re.IGNORECASE),
@@ -182,12 +312,54 @@ _EXECUTABLE_QUERY_PATTERNS = [
     re.compile(r"(?:変換|エンコード|デコード|Base64|ハッシュ|タイムスタンプ)", re.IGNORECASE),
 ]
 
+# _EXECUTABLE_QUERY_PATTERNS の英語版。
+_EXECUTABLE_QUERY_PATTERNS_EN = [
+    re.compile(r"(?<![A-Za-z])(?:specs?|CPU|memory|RAM|GPU|VRAM|disk|capacity|storage)(?![A-Za-z])", re.IGNORECASE),
+    re.compile(
+        r"\b(?:what'?s?\s*(?:the\s*)?(?:time|date)|current\s*(?:time|date)"
+        r"|today'?s?\s*date|what\s*day\s*(?:is\s*it|of\s*the\s*week))\b"
+        r"|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z])",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?:IP\s*address|hostname|(?<![A-Za-z])hostname(?![A-Za-z]))", re.IGNORECASE),
+    re.compile(r"(?:(?<![A-Za-z])OS(?![A-Za-z])|operating\s*system|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])|(?<![A-Za-z])Mac(?![A-Za-z]))", re.IGNORECASE),
+    re.compile(r"(?:Python|python)\s*version", re.IGNORECASE),
+    re.compile(r"(?:environment\s*variable|(?<![A-Za-z])env(?![A-Za-z])|(?<![A-Za-z])PATH(?![A-Za-z]))", re.IGNORECASE),
+    re.compile(r"\b(?:factorial|prime(?:\s*numbers?)?|fibonacci|prime\s*factorization|base\s*conversion|number\s*of\s*digits?|digits?)\b", re.IGNORECASE),
+    # sum/average/mean/sort は日常会話で極めて頻出する多義語 ("What do you
+    # mean?"/"I sort of agree"/"on average, this works fine") のため、
+    # 単独では発火させず数値/データ文脈語との近接共起を要求する (2026-07-22
+    # 監査で判明)。total/median/standard deviation/std dev/statistics/
+    # aggregate は既存テスト (test_tool_call_judge.py の bare "What's the
+    # total?") が単独発火を前提としており、日常会話での多義性も相対的に
+    # 低いため単独発火のまま維持する。
+    re.compile(r"\b(?:total|median|standard\s*deviation|std\s*dev|statistics|aggregate)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:sum|average|mean|sort(?:ed|ing)?)\b.{0,20}"
+        r"\b(?:numbers?|data|list|array|values?|dataset|figures?)\b"
+        r"|\b(?:numbers?|data|list|array|values?|dataset|figures?)\b.{0,20}"
+        r"\b(?:sum|average|mean|sort(?:ed|ing)?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:convert|encode|decode|encoding|decoding|Base64|hash(?:ing)?|timestamp)\b", re.IGNORECASE),
+]
+
 # 挨拶・簡単な定型パターン → Reactive 層で即応答
 GREETING_PATTERNS = [
     re.compile(r"^(?:こんにち[はわ]|おはよう|こんばんは|やあ|ども|hello|hi|hey)\s*[!！。.]?\s*$", re.IGNORECASE),
     re.compile(r"^(?:ありがと[うございます]*|thanks|thank you)\s*[!！。.]?\s*$", re.IGNORECASE),
     re.compile(r"^(?:おやすみ|さようなら|bye|goodbye)\s*[!！。.]?\s*$", re.IGNORECASE),
 ]
+
+
+def _matches_any(patterns: list[re.Pattern], query: str) -> bool:
+    """パターンリストのいずれかが query にマッチするか判定する。
+
+    JA/EN 両方のパターンリストを GUI locale に関わらず両方評価する用途で使う
+    (2026-07-22 発見: 以前は locale で片方の言語のみ評価しており、GUI locale
+    と実際の入力言語が食い違うと該当言語側の判定が一切効かなかった)。
+    """
+    return any(p.search(query) for p in patterns)
 
 
 class ComplexityClassifier:
@@ -302,13 +474,13 @@ class ComplexityClassifier:
             )
 
         # 3. コーディングモードでツール操作が必要 → meta_cognitive
-        if mode == "coding" and not is_knowledge and self._needs_tools(query):
+        if is_coding_mode(mode) and not is_knowledge and self._needs_tools(query):
             return self._record_classification(
                 self._guard_meta_cognitive(), "coding_tools", query,
             )
 
         # 4. Meta-Cognitive キーワード検出（コーディングモード）
-        if mode == "coding" and not is_knowledge and self._has_meta_keywords(query):
+        if is_coding_mode(mode) and not is_knowledge and self._has_meta_keywords(query):
             return self._record_classification(
                 self._guard_meta_cognitive(), "coding_meta_keywords", query,
             )
@@ -420,17 +592,23 @@ class ComplexityClassifier:
     def _has_complex_keywords(self, query: str) -> bool:
         """複雑度を示すキーワードを検出"""
         q_lower = query.lower()
-        return any(kw in q_lower for kw in COMPLEX_KEYWORDS)
+        if any(kw in q_lower for kw in COMPLEX_KEYWORDS):
+            return True
+        return _matches_any(COMPLEX_KEYWORDS_EN_PATTERNS, query)
 
     def _has_history_keywords(self, query: str) -> bool:
         """履歴参照キーワードを検出"""
         q_lower = query.lower()
-        return any(kw in q_lower for kw in HISTORY_KEYWORDS)
+        return any(kw in q_lower for kw in HISTORY_KEYWORDS) or any(
+            kw in q_lower for kw in HISTORY_KEYWORDS_EN
+        )
 
     def _has_meta_keywords(self, query: str) -> bool:
         """Meta-Cognitive 層へのエスカレーションキーワードを検出"""
         q_lower = query.lower()
-        return any(kw in q_lower for kw in META_KEYWORDS)
+        if any(kw in q_lower for kw in META_KEYWORDS):
+            return True
+        return _matches_any(META_KEYWORDS_EN_PATTERNS, query)
 
     def _is_url_write_intent(self, query: str, mode: str = "chat") -> bool:
         """URL からデータを取得してファイルに書き出す意図を検出する。
@@ -439,7 +617,7 @@ class ComplexityClassifier:
         meta_cognitive 振り分けを行う)。URL とファイル書込み/出力意図の双方が
         揃った場合のみ True を返す。
         """
-        if mode != "chat":
+        if not is_chat_mode(mode):
             return False
         if not _URL_HINT_RE.search(query):
             return False
@@ -454,7 +632,7 @@ class ComplexityClassifier:
         教えて」等の how-to) は除外する。ローカルパスと書込み動詞の双方が
         揃った場合のみ True を返す。
         """
-        if mode != "chat":
+        if not is_chat_mode(mode):
             return False
         if _URL_HINT_RE.search(query):
             return False
@@ -486,7 +664,17 @@ class ComplexityClassifier:
         # (long_form) は URL 内容を取得できず捏造するため、学習語が一致しても除外する。
         if _URL_HINT_RE.search(query):
             return False
-        if any(p.search(query) for p in LONG_FORM_PATTERNS):
+        # how-to / 質問形は「作成方法の説明」を求めているのであり、実際の生成を
+        # 依頼しているわけではない。_is_local_write_intent と同じ _HOWTO_QUERY_RE
+        # で除外しないと、「手順書を作成する方法を教えて」/ "How do I create a
+        # status report at <path>" のような howto 質問が実際に長文ドキュメントを
+        # 生成・書込みしてしまう (2026-07-22 ライブ検証で判明。JA/EN 両方で
+        # 再現し、PR#298-300 の対象範囲より前から存在した既存バグ)。
+        if _HOWTO_QUERY_RE.search(query):
+            return False
+        if _matches_any(LONG_FORM_PATTERNS, query) or _matches_any(
+            LONG_FORM_PATTERNS_EN, query,
+        ):
             return True
         return self._contains_learned_long_form_patterns(query)
 
@@ -510,11 +698,15 @@ class ComplexityClassifier:
 
     def _is_knowledge_query(self, query: str) -> bool:
         """知識質問パターンを検出（RAG で処理すべきクエリ）"""
-        return any(p.search(query) for p in KNOWLEDGE_QUERY_PATTERNS)
+        return _matches_any(KNOWLEDGE_QUERY_PATTERNS, query) or _matches_any(
+            KNOWLEDGE_QUERY_PATTERNS_EN, query,
+        )
 
     def _contains_executable_query_keywords(self, query: str) -> bool:
         """Python 実行で正確に答えられるクエリのキーワードを検出"""
-        return any(p.search(query) for p in _EXECUTABLE_QUERY_PATTERNS)
+        return _matches_any(_EXECUTABLE_QUERY_PATTERNS, query) or _matches_any(
+            _EXECUTABLE_QUERY_PATTERNS_EN, query,
+        )
 
     def _contains_learned_tool_patterns(self, query: str) -> bool:
         """学習済み tool_routing パターンにマッチするか判定"""
@@ -527,7 +719,9 @@ class ComplexityClassifier:
 
     def _needs_tools(self, query: str) -> bool:
         """ツール呼び出しが必要なパターンを検出"""
-        return any(p.search(query) for p in TOOL_PATTERNS)
+        return _matches_any(TOOL_PATTERNS, query) or _matches_any(
+            TOOL_PATTERNS_EN, query,
+        )
 
     def _get_policy(
         self, domain: str, key: str, mode: str, default: int | float,
@@ -542,9 +736,7 @@ def _can_use_meta_cognitive(
     mode: str = "chat",
 ) -> bool:
     """コンテキスト予算が Meta-Cognitive ループに十分か判定"""
-    ctx_size = resolve_context_size_for_mode(config, mode)
-    history_budget = config.get("memory", {}).get("working_max_tokens", 2048)
-    loop_budget = ctx_size - 512 - 400 - history_budget
+    loop_budget = resolve_meta_cognitive_loop_budget(config, mode)
 
     cfg_default = config.get("agent", {}).get("meta_cognitive_min_budget", 512)
     min_budget = get_policy_value(

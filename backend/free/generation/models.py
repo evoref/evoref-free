@@ -114,3 +114,9 @@ class GenerationPlan:
     # 任意の mermaid フローチャート (config code_flowchart_enabled=True 時のみ)。
     # SPEC.md に埋め込む。既定 OFF のため通常は空文字列。
     code_flowchart: str = ""
+    # ユーザー指示に具体的な主題が無く、生成を進められない場合に True。
+    # orchestrator.generate() はこの場合ユニット生成をスキップし、
+    # clarification_question をそのまま応答として返す
+    # (2026-07-22 ライブ検証で判明した長文トピック混入バグの対策)。
+    needs_clarification: bool = False
+    clarification_question: str = ""

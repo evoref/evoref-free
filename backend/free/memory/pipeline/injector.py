@@ -44,6 +44,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterable, Literal
 
+from backend.free.core.session_mode import (
+    is_chat_mode,
+    is_coding_mode,
+    is_valid_session_mode,
+)
 from backend.free.memory.stores.short_term import MemoryNote
 from backend.free.memory.types import MemoryMode, SemanticFact
 from backend.log_config import get_logger
@@ -197,12 +202,12 @@ class MemoryInjector:
         Returns:
             :class:`InjectionPlan` — 採用候補 / 削除候補 / 使用トークン。
         """
-        if mode not in ("chat", "coding"):
+        if not is_valid_session_mode(mode):
             raise ValueError(f"unsupported mode: {mode}")
 
         sigs: set[str] = set(failure_signatures or ())
-        budget = self.chat_budget if mode == "chat" else self.coding_budget
-        ratios = self.chat_ratios if mode == "chat" else self.coding_ratios
+        budget = self.chat_budget if is_chat_mode(mode) else self.coding_budget
+        ratios = self.chat_ratios if is_chat_mode(mode) else self.coding_ratios
         tier_budgets = self._tier_budgets(budget, ratios)
 
         # Tier ごとに分類
@@ -298,7 +303,7 @@ class MemoryInjector:
         is_other_project = fact.is_project_scoped() and not is_current_project
         t = fact.type
 
-        if mode == "chat":
+        if is_chat_mode(mode):
             if t in ("personal_fact", "preference", "emotion"):
                 return 1
             if t in ("decision", "commitment"):
@@ -364,7 +369,7 @@ class MemoryInjector:
         # モード不一致は対象外
         if note.mode != mode:
             return None
-        if mode == "coding" and current_project_id is not None:
+        if is_coding_mode(mode) and current_project_id is not None:
             if note.project_id != current_project_id:
                 return None
         return 2

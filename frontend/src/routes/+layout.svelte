@@ -4,7 +4,7 @@
 	import Sidebar from '$lib/free/components/Sidebar.svelte';
 	import Toast from '$lib/free/components/Toast.svelte';
 	import { colorMode, sidebarCollapsed, initTheme } from '$lib/free/stores/theme';
-	import { t } from '$lib/i18n';
+	import { t, initLocale } from '$lib/i18n';
 	import { onMount, onDestroy } from 'svelte';
 	import { startPolling, stopPolling } from '$lib/free/stores/server';
 	import { startVramPolling, stopVramPolling } from '$lib/free/stores/vram';
@@ -27,6 +27,9 @@
 
 		// テーマ初期化（バックエンドからアクティブテーマを取得して適用）
 		initTheme();
+
+		// ロケール初期化（バックエンドの実際の locale / prompt_locale で同期）
+		initLocale();
 	});
 
 	onDestroy(() => {

@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from backend.free.core.session_mode import normalize_session_mode
 from backend.free.memory.types import SemanticFact, make_fact
 from backend.log_config import get_logger
 
@@ -62,7 +63,7 @@ def _normalize_command(command: str) -> str:
 def _make_subject(mode: str, command_normalized: str) -> str:
     """executable command リコール用 subject を構築する。"""
     digest = hashlib.sha1(command_normalized.encode("utf-8")).hexdigest()[:12]
-    safe_mode = mode if mode in ("chat", "coding") else "chat"
+    safe_mode = normalize_session_mode(mode)
     return f"{_SUBJECT_PREFIX}{safe_mode}.{digest}"
 
 

@@ -187,10 +187,16 @@ title・global_context・units は **生成する文書そのもの**（例:「�
 依頼そのものでない場合（例: 直前の回答への指摘・質問）でも、【関連メモリ】に\
 登場した別の話題（例: 直前に尋ねられた別件の質問）を主題として流用しないでください。\
 主題は必ず【ユーザー指示】から決定してください。
+- **上記を守った結果、【ユーザー指示】単独では文書の主題が決定できない場合**\
+（例:「文書が欲しい」「手順書を作成して」等、何についての文書かが一切示されて\
+いない）は、**推測で計画を立てず** `needs_clarification` を `true` にし、\
+`clarification_question` に「どのような内容・主題の文書をご希望ですか？」\
+に相当する確認質問を{output_language}で1文だけ書いてください。この場合\
+`title`・`units` は空でよく、【関連メモリ】の話題を主題として補ってはいけません。
 - ユーザー指示に言語の明示指定が無い限り、title・global_context・heading・\
 key_points は{output_language}で書いてください。
 
-出力形式:
+出力形式（通常）:
 {{
   "content_type": "text",
   "title": "...",
@@ -203,7 +209,21 @@ key_points は{output_language}で書いてください。
       "key_points": ["背景", "目的"],
       "estimated_tokens": 500
     }}
-  ]
+  ],
+  "needs_clarification": false,
+  "clarification_question": ""
+}}
+
+出力形式（主題が決定できない場合）:
+{{
+  "content_type": "text",
+  "title": "",
+  "target_length": 0,
+  "global_context": "",
+  "constraints": [],
+  "units": [],
+  "needs_clarification": true,
+  "clarification_question": "どのような内容の文書をご希望ですか？"
 }}
 
 global_context には文書の種類と文体を具体的に記述してください。

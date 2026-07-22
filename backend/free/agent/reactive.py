@@ -7,6 +7,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from backend.free.core.locale_patterns import select_locale_variant
 from backend.log_config import get_logger
 
 logger = get_logger("agent.reactive")
@@ -16,7 +17,7 @@ logger = get_logger("agent.reactive")
 class ReactiveResponse:
     """Reactive 層の応答"""
     content: str
-    source: str  # "pattern" | "datetime" | "cache"
+    source: str  # "pattern" | "cache"
     elapsed_ms: float = 0.0
 
 
@@ -52,18 +53,6 @@ class ResponseCache:
         self._cache.clear()
 
 
-# 日付・時刻クエリ判定パターン (reactive 即応答用)。
-# Router の executable_query regex (router.py:101) より絞り込んだ集合: ここに
-# マッチしたら datetime tool 経由を経ずに reactive layer が rule-based で
-# 即応答する (二重防護の第 1 段)。「今日|明日|昨日」単独追加は誤検出するため
-# 「明日.*何月|明日.*日付」のように疑問語と組み合わせた場合のみマッチ。
-_DATETIME_QUERY_RE: re.Pattern = re.compile(
-    r"(?:何月|何日|何曜日|何時|現在時刻|現在の時刻|現在の時間|"
-    r"今日.*日付|明日.*日付|date|time)",
-    re.IGNORECASE,
-)
-
-
 # 定型応答パターン: (regex, response)
 GREETING_RESPONSES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^(?:こんにち[はわ])\s*[!！。.]?\s*$", re.IGNORECASE), "こんにちは！何かお手伝いできることはありますか？"),
@@ -73,6 +62,20 @@ GREETING_RESPONSES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^(?:ありがと[うございます]*|thanks|thank you)\s*[!！。.]?\s*$", re.IGNORECASE), "どういたしまして！他に何かあればお気軽にどうぞ。"),
     (re.compile(r"^(?:おやすみ(?:なさい)?)\s*[!！。.]?\s*$", re.IGNORECASE), "おやすみなさい。良い夜を！"),
     (re.compile(r"^(?:さようなら|bye|goodbye)\s*[!！。.]?\s*$", re.IGNORECASE), "さようなら！またいつでもどうぞ。"),
+]
+
+# GREETING_RESPONSES の英語版。GUI 左下の言語設定が 'en' の場合のみ使う
+# (パターンだけでなく返信テキストも英語化する必要があるため独立したリストにする)。
+# "good morning"/"good night" は日本語版の「おはよう」「おやすみ」相当だが、
+# 元の JA パターンには hi/hello/hey (72行目) が既に含まれているため、
+# ここでも同様の口語挨拶を独立エントリとして残す。
+GREETING_RESPONSES_EN: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"^(?:hi|hello|hey)\s*[!.]?\s*$", re.IGNORECASE), "Hello! What can I help you with?"),
+    (re.compile(r"^good\s*morning\s*[!.]?\s*$", re.IGNORECASE), "Good morning! What shall we work on today?"),
+    (re.compile(r"^good\s*(?:evening|afternoon)\s*[!.]?\s*$", re.IGNORECASE), "Good evening! How can I help?"),
+    (re.compile(r"^good\s*night\s*[!.]?\s*$", re.IGNORECASE), "Good night! Sleep well."),
+    (re.compile(r"^(?:thanks|thank\s*you)\s*[!.]?\s*$", re.IGNORECASE), "You're welcome! Feel free to ask anything else."),
+    (re.compile(r"^(?:bye|goodbye)\s*[!.]?\s*$", re.IGNORECASE), "Goodbye! Talk to you again soon."),
 ]
 
 
@@ -90,7 +93,7 @@ class ReactiveAgent:
         """Reactive 層で応答を試みる (ルールベース + キャッシュのみ、LLM ゼロ)。
 
         Returns:
-            ReactiveResponse: 応答できた場合 (挨拶パターン / 日時クエリ / キャッシュ命中)
+            ReactiveResponse: 応答できた場合 (挨拶パターン / キャッシュ命中)
             None: 応答できない場合（上位層にエスカレーション）
         """
         start = time.perf_counter()
@@ -101,17 +104,6 @@ class ReactiveAgent:
             elapsed = (time.perf_counter() - start) * 1000
             logger.info("Pattern match hit: %.1fms", elapsed)
             return ReactiveResponse(content=response, source="pattern", elapsed_ms=elapsed)
-
-        # 1.5. 日付・時刻クエリ → Python 側で datetime を取得して即応答
-        # (LLM 呼び出し / tool 呼び出し無し。router.py の executable 経路と
-        # 二重防護)
-        dt_response = self._handle_datetime_query(query)
-        if dt_response is not None:
-            elapsed = (time.perf_counter() - start) * 1000
-            logger.info("Datetime query hit: %.1fms", elapsed)
-            return ReactiveResponse(
-                content=dt_response, source="datetime", elapsed_ms=elapsed,
-            )
 
         # 2. キャッシュ検索 (上位層の応答を cache_response() で蓄積したもの)
         cached = self.cache.get(self._cache_key(query))
@@ -130,28 +122,11 @@ class ReactiveAgent:
     def _pattern_match(self, query: str) -> str | None:
         """定型応答パターンで照合"""
         stripped = query.strip()
-        for pattern, response in GREETING_RESPONSES:
+        responses = select_locale_variant(GREETING_RESPONSES, GREETING_RESPONSES_EN)
+        for pattern, response in responses:
             if pattern.match(stripped):
                 return response
         return None
-
-    def _handle_datetime_query(self, query: str) -> str | None:
-        """日付・時刻クエリに対する rule-based 即応答。
-
-        :data:`_DATETIME_QUERY_RE` にマッチすれば
-        :func:`backend.utils.utc_now_dt` で UTC tz-aware datetime を取得して
-        ローカル時刻に変換し、``「今日は YYYY 年 M 月 D 日 (曜日)、現在時刻は HH:MM です。」``
-        形式で返す。LLM 呼び出し無しで数 ms 応答。マッチしない場合は ``None``。
-        """
-        if not _DATETIME_QUERY_RE.search(query):
-            return None
-        from backend.utils import utc_now_dt
-        now = utc_now_dt().astimezone()  # ローカル tz に変換
-        weekday_jp = "月火水木金土日"[now.weekday()]
-        return (
-            f"今日は {now.year} 年 {now.month} 月 {now.day} 日 "
-            f"({weekday_jp}曜日)、現在時刻は {now.hour:02d}:{now.minute:02d} です。"
-        )
 
     def _cache_key(self, query: str) -> str:
         """クエリからキャッシュキーを生成（正規化）"""

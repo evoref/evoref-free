@@ -420,13 +420,49 @@ def csv_content_lacks_rows(content: str, file_path: str) -> bool:
     return True
 
 
+#: モデルが成果物の代わりに「アクセス権が無い」「内容を教えてほしい」等、
+#: 自身の制約や情報不足を説明する断り書きを返す退化パターン (2026-07-22
+#: 発見: 主題不明のまま write_file の内容生成をさせると、英語入力の
+#: agentic write_file 経路でこの断り書き自体が本文として書き込まれた)。
+_REFUSAL_MARKERS: tuple[str, ...] = (
+    "i do not have direct file system access",
+    "i don't have direct file system access",
+    "i do not have access to the file system",
+    "i don't have access to the file system",
+    "as an ai model",
+    "as an ai language model",
+    "please provide the content",
+    "please provide more details",
+    "please specify what",
+    "could you clarify",
+    "could you please specify",
+    "ファイルシステムに直接アクセス",
+    "具体的な内容をご指定ください",
+    "内容を教えてください",
+    "どのような内容にすれば",
+)
+
+
+def looks_like_refusal_or_missing_info(content: str) -> bool:
+    """content が本文ではなく、モデル自身の断り書き/情報不足の説明かを判定する。
+
+    正当な長文コンテンツ中に類似語が偶然出現しても誤検出しないよう、短文
+    (500 文字以下) の場合のみマーカーを見る。
+    """
+    if len(content) > 500:
+        return False
+    lowered = content.lower()
+    return any(marker in lowered for marker in _REFUSAL_MARKERS)
+
+
 def generated_content_rejection(
     content: str, file_path: str,
 ) -> str | None:
     """write_file 直前の生成コンテンツ検証。棄却理由を返す (適正なら None)。
 
-    書込みパス (fast path / 自動リカバリー) から共通で呼び、タスクログエコー・
-    プロンプトエコー・パス誤出力・CSV 構造欠落を書込み前に弾く。
+    書込みパス (fast path / tool-loop / deliberative) から共通で呼び、
+    タスクログエコー・プロンプトエコー・パス誤出力・CSV 構造欠落・断り書きを
+    書込み前に弾く。
     """
     if looks_like_path_not_content(content, file_path):
         return "path_only"
@@ -436,6 +472,8 @@ def generated_content_rejection(
         return "prompt_echo"
     if csv_content_lacks_rows(content, file_path):
         return "csv_without_rows"
+    if looks_like_refusal_or_missing_info(content):
+        return "refusal_or_missing_info"
     return None
 
 

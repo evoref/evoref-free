@@ -19,9 +19,20 @@ export interface ConfigValidateResponse {
 	errors: string[];
 }
 
+export interface LocalesResponse {
+	locales: string[];
+	current: string;
+	prompt_locale: string;
+}
+
 /** 全設定取得 */
 export async function getConfig(): Promise<ConfigFullResponse> {
 	return request<ConfigFullResponse>('GET', '/config');
+}
+
+/** 利用可能ロケール一覧 + 現在値 (UI locale / チャット応答言語 prompt_locale) */
+export async function getLocales(): Promise<LocalesResponse> {
+	return request<LocalesResponse>('GET', '/config/locales');
 }
 
 /** 設定セクション更新 */

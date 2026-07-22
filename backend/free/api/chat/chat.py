@@ -27,6 +27,7 @@ from backend.free.api.schemas import (
 from backend.free.api.chat._editor_routing import detect_editor_route
 from backend.free.agent.tool_call_judge import _extract_file_path
 from backend.free.api.chat.chat_recorder import record_response
+from backend.free.api.chat.chat_types import ChatMessage
 from backend.free.api.chat.chat_service import (
     ConflictTurnContext,
     SearchPipelineResult,
@@ -45,6 +46,7 @@ from backend.free.api.chat.chat_streaming import (
     sync_deliberative, sync_long_form, sync_meta_cognitive, sync_reactive_light,
 )
 from backend.edition import is_pro
+from backend.free.core.session_mode import is_coding_mode, is_valid_session_mode
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
@@ -130,7 +132,7 @@ def _validate_chat_request(req: ChatRequest) -> None:
             detail=f"Message too long: {len(req.message)} chars (max {MAX_MESSAGE_LENGTH})",
         )
 
-    if req.mode not in ("chat", "coding"):
+    if not is_valid_session_mode(req.mode):
         raise HTTPException(status_code=400, detail=f"Invalid mode: {req.mode}")
 
     if req.session_id is not None and not _SESSION_ID_RE.match(req.session_id):
@@ -342,7 +344,7 @@ async def _dispatch_reactive_light(
     system_prompt = _resolve_system_prompt(state, req.mode, instance_name)
     if conflict_notice:
         system_prompt = f"{system_prompt}\n\n{conflict_notice}"
-    light_messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    light_messages: list[ChatMessage] = [{"role": "system", "content": system_prompt}]
     light_messages.extend(history[-REACTIVE_LIGHT_HISTORY_TURNS:])
     light_max = min(max_tokens or REACTIVE_LIGHT_MAX_TOKENS, REACTIVE_LIGHT_MAX_TOKENS)
     if req.stream:
@@ -796,7 +798,7 @@ def _staged_coding_enabled(req: ChatRequest, cfg: dict, state: AppState) -> bool
 
     全条件を満たすときのみ True。いずれか欠ければ従来 longform 経路へ倒す。
     """
-    if req.mode != "coding":
+    if not is_coding_mode(req.mode):
         return False
     coding_cfg = cfg.get("coding", {}) or {}
     if coding_cfg.get("pipeline") != "staged":
@@ -917,7 +919,7 @@ async def _dispatch_meta_cognitive(
     # generator を注入する (複数ファイル可)。非 coding / 無効時は None。
     code_generator = None
     if (
-        req.mode == "coding"
+        is_coding_mode(req.mode)
         and cfg.get("agent", {}).get("delegate_codegen_to_longform", True)
     ):
         code_generator = make_code_artifact_generator(
@@ -1252,7 +1254,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         # - 否定指示 ("エディタに出さず…") → "chat" (チャット本文にコードブロック)
         # - 既定 → "editor" (ディスク書込せず editor_code チャネルでエディタペインへ)
         # editor_route SSE フレームはフロント表示制御 (suppressCode) 用に併せて通知する。
-        if req.mode == "coding":
+        if is_coding_mode(req.mode):
             if _extract_file_path(req.message):
                 output_target = "file"
             elif detect_editor_route(req.message) == "chat":

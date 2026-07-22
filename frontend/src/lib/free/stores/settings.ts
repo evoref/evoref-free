@@ -7,7 +7,7 @@ import { refreshVramStatus } from './vram';
 import { addToast } from './toast';
 import { instanceName } from './app';
 import { colorMode } from './theme';
-import { setLocale } from '$lib/i18n';
+import { setLocale, promptLocale } from '$lib/i18n';
 import { layout } from './theme';
 
 // ── TAB_SECTIONS（イミュータブル） ──
@@ -178,6 +178,19 @@ export async function loadConfig(): Promise<void> {
 }
 
 /**
+ * promptLocale ストア (サイドバー/GeneralSettings 双方の switchLocale 系
+ * 関数が成功後に更新する) を購読し、configData.i18n.prompt_locale を
+ * 追随させる。config 未ロード時 (configData.i18n が無い) は loadConfig()
+ * が後で正しい値を取得するため何もしない。
+ */
+promptLocale.subscribe((newLocale) => {
+	const config = get(configData);
+	if (config.i18n && config.i18n.prompt_locale !== newLocale) {
+		syncPersistedField('i18n', 'prompt_locale', newLocale);
+	}
+});
+
+/**
  * model_paths の単一フィールドを即時保存する (migrate 非対象キー用。coding_model 等)
  *
  * base/assist/embed のような model_state 追跡キーは migrate API 経由でしか変更できないが、
@@ -198,6 +211,33 @@ export function updateField(section: string, key: string, value: unknown): void 
 		config = { ...config, [section]: sectionData };
 		return config;
 	});
+
+	checkDirty(section);
+}
+
+/**
+ * Settings 画面を経由せず別経路 (サイドバーの言語切替等) で既にバックエンドへ
+ * 直接永続化済みの値を configData に反映する。dirty 判定の基準となる
+ * snapshot 側もキー単位で同時更新するため、Apply ボタンを押さなくても
+ * 「未保存の変更あり」表示が誤って出ない (かつ同一セクション内の他の
+ * 未保存編集を誤って "保存済み" 扱いにもしない)。
+ *
+ * 2026-07-22 監査で判明: サイドバーの switchLocale() は promptLocale
+ * ストアのみ更新し configData には触れないため、Settings 画面を開いたまま
+ * サイドバーで言語を切替えると、その後の Apply (無関係なフィールドへの
+ * 変更でも) が configData に残った古い prompt_locale を送信し、
+ * 直前に切替えたばかりの値を config.yaml 上で静かに巻き戻していた。
+ */
+function syncPersistedField(section: string, key: string, value: unknown): void {
+	configData.update((config) => {
+		const sectionData = { ...(config[section] || {}), [key]: value };
+		return { ...config, [section]: sectionData };
+	});
+
+	const existing = originalSnapshot[section];
+	const snapshotObj: Record<string, unknown> = existing ? JSON.parse(existing) : {};
+	snapshotObj[key] = value;
+	originalSnapshot[section] = JSON.stringify(snapshotObj);
 
 	checkDirty(section);
 }

@@ -123,6 +123,10 @@ class LongFormOrchestrator:
         self.last_text_output: str | None = None
         # 直近 generate() の出力先拡張子 (document_quality ゲートの形式判定に使う)。
         self._target_format: str = ""
+        # 直近 generate() が主題不明で確認質問を返した (ユニット生成を行わなかった)
+        # かどうか。chat_streaming の finalize はこの場合 write_file を呼ばない
+        # (確認質問をファイルへ書き込んでしまうことを防ぐ)。
+        self.last_needed_clarification: bool = False
 
         # Recurrent も計画 / 要約再帰をアシストモデルで実行する
         # ため ``assist_client`` を渡す。``None`` の場合は Recurrent 内部で
@@ -227,6 +231,13 @@ class LongFormOrchestrator:
             "detail": f"{len(plan.units)} units planned ({content_type.value})",
             "status": "done",
         })
+
+    @staticmethod
+    def _default_clarification_question() -> str:
+        """計画側が確認質問を空文字で返した場合のフォールバック文言。"""
+        if get_locale() == "en":
+            return "What would you like this document to be about?"
+        return "どのような内容・主題の文書をご希望ですか？"
 
     async def _apply_review_revisions(
         self,
@@ -626,6 +637,23 @@ class LongFormOrchestrator:
         plan, budget = await self._build_plan_for_generation(
             instruction, context, content_type, mode,
         )
+
+        # 指示単独では主題が決定できず、計画側が確認を求めた場合はユニット生成
+        # を一切行わずそのまま確認質問を返す。【関連メモリ】の話題を主題として
+        # 誤って流用したまま生成・書込みしてしまう事故を防ぐ
+        # (2026-07-22 ライブ検証で判明: 「文書が欲しい」等の主題無し依頼が、
+        # 直前の無関係な会話の話題で長文ドキュメントを生成・書込みしていた)。
+        if plan.needs_clarification:
+            self.last_needed_clarification = True
+            question = plan.clarification_question or self._default_clarification_question()
+            logger.info(
+                "long_form: instruction has no discernible topic, asking for "
+                "clarification instead of generating (instruction=%.80s)",
+                instruction,
+            )
+            yield question
+            return
+
         self._emit_plan_step(on_step, plan, content_type)
 
         # 6. ローリングコンテキスト初期化

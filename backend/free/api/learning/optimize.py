@@ -6,6 +6,7 @@ from backend.app_state import AppState, get_app_state
 from backend.config import get_path_resolver
 from backend.edition import get_pro_handler, is_pro
 from backend.free.api._error_responses import api_error
+from backend.free.core.session_mode import is_valid_session_mode
 from backend.free.api.learning._optimize_collectors import (
     collect_assist_prompt_history,
     collect_assist_task_statuses,
@@ -149,7 +150,7 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
             "api.optimize_invalid_level",
         )
 
-    if req.mode is not None and req.mode not in ("coding", "chat"):
+    if req.mode is not None and not is_valid_session_mode(req.mode):
         raise api_error(
             400, "E0400", "mode must be 'coding' or 'chat'",
             "api.optimize_invalid_mode",

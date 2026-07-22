@@ -25,6 +25,11 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
+from backend.free.core.session_mode import (
+    is_coding_mode,
+    is_valid_session_mode,
+    normalize_session_mode,
+)
 from backend.free.memory.notes.subject_ns import make_mem_subject
 from backend.free.memory.types import (
     Provenance,
@@ -186,16 +191,16 @@ def _resolve_scope(
 ) -> tuple[str, str | None]:
     """セッション情報から ``(scope, project_id)`` を解決する。
 
-    - ``mode == 'coding'`` かつ project_id 既知 → ``project:<id>``
+    - ``is_coding_mode(mode)`` かつ project_id 既知 → ``project:<id>``
     - それ以外 → ``global``
 
     Returns:
         ``(scope_str, project_id)`` ペア。project 未確定時は ``project_id=None``。
     """
     project_id = entry_project_id or (
-        fallback_project_id if entry_mode == "coding" else None
+        fallback_project_id if is_coding_mode(entry_mode) else None
     )
-    if entry_mode == "coding" and project_id:
+    if is_coding_mode(entry_mode) and project_id:
         return SemanticFact.make_project_scope(project_id), project_id
     return "global", project_id
 
@@ -265,13 +270,13 @@ def promote_history_to_semmem(
             object_=entry.summary,
             type=fact_type,
             scope=scope_str,
-            mode_origin=entry.mode if entry.mode in ("chat", "coding") else "chat",
+            mode_origin=normalize_session_mode(entry.mode),
             confidence=0.5,
         )
         fact.provenances = [
             Provenance(
                 session_id=entry.session_id,
-                mode=entry.mode if entry.mode in ("chat", "coding") else None,
+                mode=entry.mode if is_valid_session_mode(entry.mode) else None,
                 project_id=project_id,
                 source="assistant",
                 captured_at=time.time(),

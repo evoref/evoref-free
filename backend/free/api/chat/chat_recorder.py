@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from backend.app_state import AppState
+from backend.free.api.chat.chat_types import ChatMessage
 from backend.free.history.history_manager import SessionData, get_history_manager
 from backend.log_config import get_logger
 from backend.utils import utc_now_dt
@@ -160,7 +161,7 @@ def drain_evicted_to_stm(
 
 
 def record_response(
-    state: AppState, full_response: str, messages: list[dict],
+    state: AppState, full_response: str, messages: list[ChatMessage],
     session_id: str, user_query: str, mode: str,
     tokens_generated: int,
     *,
@@ -231,7 +232,7 @@ def record_response(
 
 
 def record_meta_cognitive_response(
-    state: AppState, full_response: str, messages: list[dict],
+    state: AppState, full_response: str, messages: list[ChatMessage],
     session_id: str, user_query: str, mode: str,
     tokens_generated: int, step_credits: list,
     *,
@@ -300,7 +301,7 @@ def record_meta_cognitive_response(
 
 
 def record_long_form_response(
-    state: AppState, full_response: str, messages: list[dict],
+    state: AppState, full_response: str, messages: list[ChatMessage],
     session_id: str, user_query: str, mode: str,
     tokens_generated: int, metrics: dict,
     *,
