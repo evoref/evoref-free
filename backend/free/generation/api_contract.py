@@ -63,6 +63,9 @@ class SrcApi:
 
     functions: dict[str, FuncSig] = field(default_factory=dict)
     classes: dict[str, ClassApi] = field(default_factory=dict)
+    # 関数/クラス以外のトップレベル名 (代入・注釈代入・import 先の名前)。
+    # 「未定義シンボル」誤検知回避専用 — arity/属性チェックの対象にはしない。
+    other_names: set[str] = field(default_factory=set)
 
 
 # ── シグネチャ / クラス抽出 ───────────────────────────────────────────────
@@ -193,6 +196,15 @@ def build_src_api(src_files: dict[str, str]) -> SrcApi:
                     api.functions[n.name] = _func_sig(n, is_method=False)
             elif isinstance(n, ast.ClassDef):
                 raw_classes[n.name] = _raw_class_api(n)
+            elif isinstance(n, ast.Assign):
+                for t in n.targets:
+                    api.other_names |= _assign_target_names(t)
+            elif isinstance(n, ast.AnnAssign):
+                api.other_names |= _assign_target_names(n.target)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                for a in n.names:
+                    if a.name != "*":
+                        api.other_names.add((a.asname or a.name).split(".")[0])
 
     # 基底クラスを再帰マージ (生成物外の基底は dynamic 化)。
     def _merged(name: str, seen: frozenset[str]) -> ClassApi:
@@ -389,6 +401,15 @@ def check_api_contract(
                 msg = check_call_arity(api.functions[fname], n, f"{fname}()")
                 if msg:
                     errors.append(f"{path}: {msg}")
+            elif fname and fname not in api.classes and fname not in api.other_names:
+                # src 由来と確証済みの名前 (import 元 or モジュール別名) なのに
+                # 関数・クラス・その他トップレベル名のいずれにも存在しない =
+                # テストが実装に無い API を幻覚している (palindrome_checker の
+                # `reverse_string` 幻覚、2026-07-23 live、で確認済み)。
+                errors.append(
+                    f"{path}: '{fname}' は定義が無い "
+                    "(関数/クラスとして存在しない、テストの幻覚参照の可能性)"
+                )
 
         # クラス属性 / メソッド: ``g = TetrisGame(); g.board / g.update(...)``。
         known_class_names = set(api.classes)

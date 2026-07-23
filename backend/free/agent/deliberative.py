@@ -41,6 +41,22 @@ no explanations, no markdown fences, no JSON, no surrounding text.
 # として base に読ませないための安全な代替文言。
 _NO_RELEVANT_INFO_MESSAGE = "（ツールを実行しましたが、今回の質問に関連する情報は見つかりませんでした）"
 
+# search_history が空振りした場合専用のグラウンディング文言。通常ツールの
+# 「唯一の事実根拠として扱う」枠をそのまま付けると、直前ターンで述べられた
+# 情報 (SemMem 未反映のまだ生の会話履歴) まで無視して「見つかりません」と
+# 誤答する (実インシデント 2026-07-23: 直前ターンで伝えた氏名・出身地を
+# 聞き直され、search_history 空振りを理由に誤って「記録が無い」と回答した)。
+# search_history は過去セッションのみを検索するツールであることを明示し、
+# 今回進行中の会話履歴の参照を妨げないようにする。
+_SEARCH_HISTORY_NO_INFO_GUIDANCE = (
+    "search_history は過去の別セッションの会話記録を検索するツールである。"
+    "上記の「関連する情報は見つかりませんでした」は、過去の別セッションには"
+    "見つからなかったという意味に過ぎず、今回進行中のこの会話で既に述べられた"
+    "情報 (直前のユーザー発言を含む会話履歴) を否定するものではない。"
+    "会話履歴に該当情報があれば、検索結果とは関係なくそれを使って具体的に"
+    "回答すること。会話履歴にも本当に無い場合のみ「わからない」と答えてよい。"
+)
+
 
 def _check_path_traversal(file_path: str, tool_name: str) -> str | None:
     """write_file / read_file のパス検証。違反時はエラーメッセージを返す。
@@ -195,22 +211,31 @@ class DeliberativeAgent:
                 f"今回ユーザーが答えてほしい質問は『{q}』である。"
                 f"会話履歴の前の話題は無関係なので無視し、この質問にのみ答えること。\n"
             )
+        if tool_name == "search_history" and tool_result_text == _NO_RELEVANT_INFO_MESSAGE:
+            # 空振りに「唯一の事実根拠」枠を付けると直前ターンの内容まで
+            # 無視されるため、search_history 空振り専用の文言に差し替える
+            # (通常ツールの capability assertion は付けない)。
+            grounding = _SEARCH_HISTORY_NO_INFO_GUIDANCE
+        else:
+            # capability assertion: 弱いモデルは「自分はブラウズ/取得できない」という
+            # 思い込みでツール結果を無視し拒否することがある (実機確認)。結果が
+            # 実際に取得された本物データであると明示して上書きする。
+            grounding = (
+                f"上記の ## ツール実行結果 は、システムが {tool_name} ツールで実際にアクセスして"
+                f"取得した本物のデータである。あなたにはこのツールがあり、取得は既に成功している。"
+                f"この結果を唯一の事実根拠として、内容 (数値・名称・日付・条件など) を読み取り、"
+                f"それに基づいて具体的に回答すること。"
+                f"「ブラウズできない」「取得できない」「アクセスできない」とは言わないこと。"
+                f"「取得できない」「データがない」と答えてよいのは、結果が空かエラーの場合のみ。"
+                f"結果に該当が無い場合のみ、システムプロンプトの参考コンテキスト (カートリッジ・記憶等) も併用してよい。"
+                f"結果に無い数値・事実は創作しないこと。"
+            )
         tool_msg = (
             f"\n\n## ツール実行結果\n"
             f"ツール: {tool_name}\n"
             f"結果:\n{truncated}\n\n"
             f"{refocus}"
-            # capability assertion: 弱いモデルは「自分はブラウズ/取得できない」という
-            # 思い込みでツール結果を無視し拒否することがある (実機確認)。結果が
-            # 実際に取得された本物データであると明示して上書きする。
-            f"上記の ## ツール実行結果 は、システムが {tool_name} ツールで実際にアクセスして"
-            f"取得した本物のデータである。あなたにはこのツールがあり、取得は既に成功している。"
-            f"この結果を唯一の事実根拠として、内容 (数値・名称・日付・条件など) を読み取り、"
-            f"それに基づいて具体的に回答すること。"
-            f"「ブラウズできない」「取得できない」「アクセスできない」とは言わないこと。"
-            f"「取得できない」「データがない」と答えてよいのは、結果が空かエラーの場合のみ。"
-            f"結果に該当が無い場合のみ、システムプロンプトの参考コンテキスト (カートリッジ・記憶等) も併用してよい。"
-            f"結果に無い数値・事実は創作しないこと。"
+            f"{grounding}"
         )
         for i in range(len(messages) - 1, -1, -1):
             if messages[i]["role"] == "user":
@@ -221,18 +246,20 @@ class DeliberativeAgent:
                 break
 
     def _record_tool_call_outcome(
-        self, query: str, judgement: ToolJudgement, success: bool,
+        self, query: str, judgement: ToolJudgement, success: bool, mode: str = "chat",
     ) -> None:
         """assist 由来ツール判定の実行成否を assist 経験へ記録する (best-effort)。
 
         rule / learned / cartridge 由来は assist モデル出力ではないため記録しない
         (assist=B が学ぶのは assist のツール判定のみ)。recorder 未注入
         (Free / --no-learning) なら no-op。例外は recorder 側で握り潰される。
+        ``mode`` は呼び出し元 (``_judge_and_execute_tool`` の明示引数、
+        ``self._mode`` ではなく実際の処理対象モード) をそのまま渡す。
         """
         rec = self._assist_experience_recorder
         if rec is None or judgement.source != "assist":
             return
-        rec("tool_call", query, judgement.tool_name or "", 1.0 if success else 0.0)
+        rec("tool_call", query, judgement.tool_name or "", 1.0 if success else 0.0, mode)
 
     async def _judge_and_execute_tool(
         self,
@@ -298,7 +325,7 @@ class DeliberativeAgent:
         )
         if tool_result_text is None:
             # 実行されたが結果 None (失敗)。command は penalize 用に返す。
-            self._record_tool_call_outcome(query, judgement, False)
+            self._record_tool_call_outcome(query, judgement, False, mode=mode)
             return None, judgement.tool_name, command, False
 
         # ツール結果を assist で query 連動抽出し、base 文脈には digest を注入して
@@ -341,7 +368,7 @@ class DeliberativeAgent:
             judgement.tool_name, len(tool_result_text), judgement.source,
             success,
         )
-        self._record_tool_call_outcome(query, judgement, success)
+        self._record_tool_call_outcome(query, judgement, success, mode=mode)
         return tool_result_text, judgement.tool_name, command, success
 
     async def process(

@@ -129,12 +129,20 @@ class ExperienceBuffer(JsonStateStore):
         """直近 n 件取得"""
         return self.entries[-n:]
 
-    def get_failures(self) -> list[ExperienceEntry]:
-        """失敗エントリ抽出（rephrased_query=True or user_correction 非 None）"""
-        return [
+    def get_failures(self, mode: str | None = None) -> list[ExperienceEntry]:
+        """失敗エントリ抽出（rephrased_query=True or user_correction 非 None）
+
+        Args:
+            mode: 指定時はそのモード ("chat"/"coding") のエントリのみに絞る。
+                None (省略、既定) の場合は全モード横断 (後方互換)。
+        """
+        result = [
             e for e in self.entries
             if e.signals.rephrased_query or e.signals.user_correction is not None
         ]
+        if mode is not None:
+            result = [e for e in result if e.mode == mode]
+        return result
 
     @property
     def count(self) -> int:

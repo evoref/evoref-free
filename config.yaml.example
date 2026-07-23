@@ -729,7 +729,7 @@ schedule:
 learning:
   # base モデルの自己学習データを (base モデル識別子 × モード) で分離する。
   partition_by_base_model: true   # true: local/learning/<base_model_stem>/ 配下へ分離しモデル切替で差し替え（未知モデルはゼロから学習）。false: レガシー flat（即ロールバック用）
-  level2_adapter_partition: model # model（既定=base LoRA/cvector はモデル単位・mode 切替で再起動なし）/ model_mode（mode 単位・切替時に必要なら base サーバ再起動）
+  level2_adapter_partition: model # LoRA限定(cvectorは常にモデル単位・対象外)。model（既定=base/assistともモデル単位・mode切替で再起動なし）/ model_mode（base/assistともmode単位・切替時にLoRAパスが変わればサーバ再起動、partition_by_base_model=true必須）
   level1_min_experiences: 20      # Level 1 トリガーに必要な最小経験数
   level1_generations: 10          # Level 1 の世代数
   level1_population_size: 5       # Level 1 の集団サイズ

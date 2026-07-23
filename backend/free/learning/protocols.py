@@ -75,8 +75,10 @@ class AssistExperienceBufferProtocol(Protocol):
         """経験エントリを追加する (同期)。"""
         ...
 
-    def get_filtered(self, cartridge_ids: list[str]) -> list[Any]:
-        """カートリッジ ID でフィルタ済のエントリリストを返す。"""
+    def get_filtered(
+        self, cartridge_ids: list[str] | None = None, mode: str | None = None,
+    ) -> list[Any]:
+        """カートリッジ ID / モードでフィルタ済のエントリリストを返す。"""
         ...
 
 

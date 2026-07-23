@@ -220,6 +220,25 @@ def _resolve_necessity_recall_cfg(rag_cfg: dict) -> dict:
     }
 
 
+def _bind_recorder_mode(
+    recorder: "Callable[[str, str, str, float, str], None] | None",
+    mode: str,
+) -> "Callable[[str, str, str, float], None] | None":
+    """assist_experience_recorder (5引数版) を mode 束縛した 4引数版へラップする。
+
+    ``RetrievalNecessityJudge.judge_with_assist`` / ``RetrievalQualityJudge.judge_with_assist``
+    は ``record_assist`` を 4 引数 (action_type, input_context, output, outcome) で
+    呼ぶため、この呼び出しの ``mode`` を先に束縛しておく (下流を変更せずに済む)。
+    """
+    if recorder is None:
+        return None
+
+    def _record(action_type: str, input_context: str, output: str, outcome: float) -> None:
+        recorder(action_type, input_context, output, outcome, mode)
+
+    return _record
+
+
 def _resolve_quality_recall_cfg(rag_cfg: dict) -> dict:
     """``rag.self_rag.quality_recall`` セクションを安全に取り出す (necessity_recall と対称)。"""
     cfg = ((rag_cfg.get("self_rag") or {}).get("quality_recall")) or {}
@@ -429,7 +448,7 @@ async def unified_search(
     assist_judge_tracker: "AssistJudgeUsageTracker | None" = None,
     necessity_prompt: str | None = None,
     quality_prompt: str | None = None,
-    assist_experience_recorder: "Callable[[str, str, str, float], None] | None" = None,
+    assist_experience_recorder: "Callable[[str, str, str, float, str], None] | None" = None,
     mem_view: "MemFactView | None" = None,
 ) -> SearchResult:
     """統合検索パイプライン: Self-RAG + 3層メモリ
@@ -454,6 +473,12 @@ async def unified_search(
     """
     cfg = config or {}
     rag_cfg = cfg.get("rag", {})
+    # assist_experience_recorder (state.assist_experience_recorder、5引数版
+    # (..., mode)) を、この呼び出しの mode に束縛した 4 引数版へラップしてから
+    # 下流 (necessity_judge / _maybe_assist_judge_quality) へ渡す。ラップしない
+    # まま渡すと下流は 4 引数で呼ぶため recorder 側の mode 既定値 "chat" に
+    # 落ち、coding セッションの assist 経験が誤って chat タグで記録されてしまう。
+    assist_experience_recorder = _bind_recorder_mode(assist_experience_recorder, mode)
     top_k, stm_top_k, noise_sigma = _resolve_search_params(policy, rag_cfg, mode)
     multiplier = _resolve_fetch_multiplier(cfg)
     fetch_k = top_k * multiplier

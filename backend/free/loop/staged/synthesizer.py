@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import platform
 import re
+import sys
 from typing import TYPE_CHECKING
 
 from backend.free.loop.driver import make_task_fact
@@ -360,6 +361,47 @@ def _normalize_modules(raw_modules: object) -> list[dict]:
     return out
 
 
+# stdlib と同名の生成ファイルはリネーム時にこの接尾辞を付ける。
+_STDLIB_COLLISION_SUFFIX = "_module"
+
+
+def _avoid_stdlib_collisions(modules: list[dict]) -> list[dict]:
+    """file_path の stem が Python 標準ライブラリ名と衝突する場合にリネームする。
+
+    stdlib モジュール (``queue`` 等) は pytest 起動までに ``sys.modules`` へ
+    既にキャッシュされ得るため、test_runner の bootstrap conftest が行う
+    ``sys.path.insert(0, src)`` では奪還できない (2026-07-23 live: 生成された
+    ``queue.py`` のテストが ``import queue`` で stdlib を掴み、
+    ``Queue.enqueue`` 等が不在の ``AttributeError`` で全滅した)。テスト実行
+    段階での回避は不可能に近く、合成時点でファイル名衝突そのものを断つのが
+    唯一の確実な対策。depends_on の参照も同時にリネームへ追随させる。
+    """
+    stdlib_names = frozenset(getattr(sys, "stdlib_module_names", ()))
+    rename_map: dict[str, str] = {}
+    for m in modules:
+        fp = m["file_path"]
+        if _module_stem(fp) in stdlib_names:
+            new_fp = re.sub(r"\.py$", f"{_STDLIB_COLLISION_SUFFIX}.py", fp)
+            if new_fp != fp:
+                rename_map[fp] = new_fp
+    if not rename_map:
+        return modules
+    logger.warning(
+        "planner file names collide with Python stdlib modules; renamed to "
+        "avoid unresolvable import shadowing: %s",
+        {k: v for k, v in rename_map.items()},
+    )
+    out: list[dict] = []
+    for m in modules:
+        fp = m["file_path"]
+        new_fp = rename_map.get(fp, fp)
+        deps = [rename_map.get(d, d) for d in m["depends_on"]]
+        out.append({**m, "file_path": new_fp, "depends_on": deps} if (
+            new_fp != fp or deps != m["depends_on"]
+        ) else m)
+    return out
+
+
 async def synthesize_coding_task_graph(
     *,
     request: str,
@@ -418,6 +460,8 @@ async def synthesize_coding_task_graph(
     if not modules:
         logger.info("coding_task_graph returned no modules — fallback to longform")
         return []
+    # stdlib と同名のファイルは import 解決不能な衝突を起こすため合成時に断つ。
+    modules = _avoid_stdlib_collisions(modules)
     # OS 制約のプロンプト注入を planner が無視した場合の決定論バックストップ。
     summary, modules = annotate_os_unavailable_modules(summary, modules)
     # 実在しないモジュールへの依存 (planner の自己矛盾) を決定論解決する。

@@ -102,6 +102,8 @@
 		"last_level1": "Level 1 最終実行",
 		"last_level2": "Level 2 最終実行",
 		"rollback_confirm": "{target} をバージョン {version} にロールバックしますか？",
+		"rollback_restart_required": "この変更を反映するには、対象モードへの切替またはサーバ再起動が必要です。",
+		"lora_mode_label": "表示モード",
 		"no_adapter": "アダプターなし",
 		"eval_cases": "評価ケース",
 		"no_data": "データがありません",

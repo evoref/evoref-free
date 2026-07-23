@@ -161,10 +161,11 @@ class AppState:
     prompt_manager: SystemPromptManager | None = None
     assist_prompt_manager: AssistPromptManager | None = None
     feedback_collector: FeedbackCollector | None = None
-    # assist 経験記録 closure (Pro/Develop 起動時のみ非 None)。primitive 4 引数
-    # (action_type, input_context, output, outcome) を受け、Pro の assist 経験バッファへ
-    # 記録する。factory 層で構築し、Free 側 (chat_service / judge) は Pro 型非依存で呼ぶ。
-    assist_experience_recorder: "Callable[[str, str, str, float], None] | None" = None
+    # assist 経験記録 closure (Pro/Develop 起動時のみ非 None)。primitive 5 引数
+    # (action_type, input_context, output, outcome, mode) を受け、Pro の assist 経験
+    # バッファへ記録する。mode は既定 "chat" (省略可)。factory 層で構築し、Free 側
+    # (chat_service / judge) は Pro 型非依存で呼ぶ。
+    assist_experience_recorder: "Callable[[str, str, str, float, str], None] | None" = None
     file_manager: SessionFileManager | None = None
     learned_patterns_store: LearnedPatternStore | None = None
     tools_registry: ToolsRegistry | None = None

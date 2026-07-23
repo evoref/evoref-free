@@ -17,7 +17,9 @@ staged は ``synthesize_coding_task_graph`` が既にプログラムをファイ
 
 from __future__ import annotations
 
+import ast
 import logging
+import re
 
 from backend.free.generation.validators import remove_code_fences
 from backend.free.llm.utils import extract_content
@@ -63,6 +65,64 @@ def _finish_reason(resp: dict) -> str:
         return ""
 
 
+def _reasoning_content(resp: dict) -> str:
+    """base client generate() 応答の reasoning_content ('<think>' 分離出力)。"""
+    try:
+        rc = resp["choices"][0]["message"].get("reasoning_content")
+        return rc if isinstance(rc, str) else ""
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return ""
+
+
+_CODE_FENCE_BLOCK_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
+
+
+def _parses_to_nonempty_module(code: str) -> bool:
+    try:
+        return bool(ast.parse(code).body)
+    except (SyntaxError, ValueError):
+        return False
+
+
+def _salvage_code_from_reasoning(reasoning_content: str) -> str:
+    """打ち切られた reasoning から、最後に書かれた完成コードブロックを救出する。
+
+    coder モデル (Qwopus3.5 等) は推論モデルであり、``<think>`` 内で一度コード
+    を書き下してから自己ツッコミ・再検討を続けることがある (2026-07-23 live:
+    gcd_calculator/fibonacci_generator の生成で確認 — max_tokens が reasoning
+    だけで尽き、可視の ``content`` が空のまま finish_reason='length' で切断
+    された。reasoning_content 側には既に完成した正しい関数が書かれていた)。
+    reasoning 内の fenced code block を末尾から走査し、構文的に完成している
+    (``ast.parse`` が通り body が空でない) 最初の候補を採用する (best-effort、
+    無ければ空文字)。
+    """
+    for block in reversed(_CODE_FENCE_BLOCK_RE.findall(reasoning_content)):
+        candidate = block.strip()
+        if candidate and _parses_to_nonempty_module(candidate):
+            return candidate
+    return ""
+
+
+def _extract_code(resp: dict, file_path: str) -> tuple[str, bool]:
+    """応答からコードを取り出す。戻り値は ``(code, from_salvage)``。
+
+    可視 ``content`` が空なら reasoning から救出する。``from_salvage=True`` は
+    ``ast.parse`` で完成を検証済みという意味で、``finish_reason == "length"``
+    でも不完全な断片ではないと信頼してよい (直接 content から取った切断済み
+    テキストとは区別する — 後者は語尾が切れた不完全コードの可能性がある)。
+    """
+    code = remove_code_fences(extract_content(resp).strip())
+    if code:
+        return code, False
+    salvaged = _salvage_code_from_reasoning(_reasoning_content(resp))
+    if salvaged:
+        logger.info(
+            "direct codegen recovered code from truncated reasoning_content "
+            "for %s (visible content was empty)", file_path,
+        )
+    return salvaged, bool(salvaged)
+
+
 async def generate_single_file(
     client,
     instruction: str,
@@ -105,9 +165,15 @@ async def generate_single_file(
         logger.warning("direct codegen failed for %s: %s", file_path, exc)
         return {}
 
-    code = remove_code_fences(extract_content(resp).strip())
+    code, code_from_salvage = _extract_code(resp, file_path)
 
-    if _finish_reason(resp) == "length":
+    # reasoning から検証済みで救出できた場合は、切断されていても完成コードと
+    # して信頼できるため、費用のかかる倍額再生成をスキップする (2026-07-23
+    # live: gcd_calculator/fibonacci_generator が reasoning だけで max_tokens
+    # を使い切り、直接 content は空だが reasoning 内には既に完成した正しい
+    # 関数が書かれていた。再生成を重ねても同じパターンで再度失敗し、
+    # 最終的に「コードが生成されませんでした」まで至っていた)。
+    if _finish_reason(resp) == "length" and not code_from_salvage:
         retry_tokens = min(max_tokens * 2, _MAX_TOKENS_CEILING)
         if retry_tokens > max_tokens:
             logger.warning(
@@ -120,8 +186,11 @@ async def generate_single_file(
                     temperature=temperature, id_slot=client.chat_slot,
                     request_timeout=_estimate_timeout(retry_tokens),
                 )
-                if _finish_reason(resp2) == "length":
-                    # 再生成も切断された = 完成コードではなく壊れた断片。長さで
+                retry_code, retry_from_salvage = _extract_code(resp2, file_path)
+                if _finish_reason(resp2) == "length" and not retry_from_salvage:
+                    # 再生成も切断され、reasoning からの検証済み救出も得られな
+                    # かった = 完成コードではなく壊れた断片 (直接 content が
+                    # 非空でも未検証の切断済みテキストに過ぎない)。長さで
                     # 「マシ」に見えても SyntaxError を伴う不完全ファイルを完了
                     # 扱いで返さない (2026-07-22: test_email_validator.py が
                     # f-string 途中で切れたまま「成果物は配信します」扱いで出荷
@@ -133,7 +202,6 @@ async def generate_single_file(
                         retry_tokens, file_path,
                     )
                     return {}
-                retry_code = remove_code_fences(extract_content(resp2).strip())
                 if retry_code and len(retry_code) > len(code):
                     code = retry_code
             except Exception as exc:

@@ -102,6 +102,8 @@
 		"last_level1": "Level 1 last run",
 		"last_level2": "Level 2 last run",
 		"rollback_confirm": "Roll back {target} to version {version}?",
+		"rollback_restart_required": "Switching to that mode or restarting the server is required for this change to take effect.",
+		"lora_mode_label": "Display mode",
 		"no_adapter": "No adapter",
 		"eval_cases": "Eval cases",
 		"no_data": "No data available",
