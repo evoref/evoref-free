@@ -96,8 +96,15 @@ def _build_cmd(
     project_root: Path,
     *,
     model_override: str | None = None,
+    lora_override: str | Path | None = None,
+    lora_fallback: bool = True,
 ) -> tuple[list[str], str, int] | None:
     """サーバー名から起動コマンドと (host, port) を構築
+
+    ``lora_override``/``lora_fallback`` は base/assist のみ有効
+    (``build_llama_cmd``/``build_assist_cmd`` にそのまま透過する)。呼出元
+    (``mode.py``) が exists/arch 互換チェック済みの絶対パスを解決して渡す
+    責務を持ち、本関数はただの配管に徹する。
 
     Returns:
         (cmd, host, port) or None（設定なし / モデル未指定）
@@ -112,11 +119,17 @@ def _build_cmd(
         llama_cfg = cfg.get("llama", {})
         host = llama_cfg.get("host", "127.0.0.1")
         port = llama_cfg.get("port", 8080)
-        cmd = build_llama_cmd(cfg, project_root, model_override=model_override)
+        cmd = build_llama_cmd(
+            cfg, project_root, model_override=model_override,
+            lora_override=lora_override, lora_fallback=lora_fallback,
+        )
         return (cmd, host, port)
 
     if name == "assist":
-        cmd = build_assist_cmd(cfg, project_root, model_override=model_override)
+        cmd = build_assist_cmd(
+            cfg, project_root, model_override=model_override,
+            lora_override=lora_override, lora_fallback=lora_fallback,
+        )
         if cmd is None:
             return None
         local_cfg = cfg.get("assist_model", {}).get("local", {})
@@ -184,10 +197,15 @@ def _spawn_server_with_override(
     cfg: dict,
     *,
     model_override: str | None = None,
+    lora_override: str | Path | None = None,
+    lora_fallback: bool = True,
 ) -> ManagedProcess | None:
-    """model_override 対応版の llama-server プロセス起動"""
+    """model_override / lora_override 対応版の llama-server プロセス起動"""
     project_root = _find_project_root()
-    result = _build_cmd(name, cfg, project_root, model_override=model_override)
+    result = _build_cmd(
+        name, cfg, project_root, model_override=model_override,
+        lora_override=lora_override, lora_fallback=lora_fallback,
+    )
     if result is None:
         logger.warning("server_control: no config for %s", name)
         return None

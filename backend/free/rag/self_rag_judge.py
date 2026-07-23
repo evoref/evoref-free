@@ -569,7 +569,12 @@ class RetrievalNecessityJudge:
                     )
                 return "retrieve"
 
-        timeout_s = float(cfg.get("timeout_s", 5.0))
+        # cfg["timeout_s"] (rag.self_rag.assist_necessity.timeout_s) は使わない:
+        # schema既定値(5.0)が常に埋まるため「ユーザー明示設定」と「未設定」を
+        # 区別できず、反応的タイムアウト較正 (_calibrated_timeouts) を永久に
+        # 無効化してしまう。purpose別上書きは assist_model.timeouts.<purpose>
+        # (全 purpose 共通の正規チャネル) に委ね、ここでは較正込みの実効値を使う。
+        timeout_s = assist_client.resolve_effective_timeout("retrieval_necessity_judge")
         context_turns = int(cfg.get("context_turns", _DEFAULT_CONTEXT_TURNS))
         context_block = _format_context_for_assist(
             recent_context, max_turns=context_turns,

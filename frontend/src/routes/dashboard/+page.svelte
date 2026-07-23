@@ -7,7 +7,7 @@
 	import RAGStats from '$lib/free/components/RAGStats.svelte';
 	import { onMount, onDestroy } from 'svelte';
 	import type { Component } from 'svelte';
-	import type { LoraTarget, DashboardLearningData, DashboardRagStats } from '$lib/free/api';
+	import type { LoraTarget, LoraMode, DashboardLearningData, DashboardRagStats } from '$lib/free/api';
 	import { getLoraVersions, rollbackLora } from '$lib/free/api';
 	import {
 		DEFAULT_LEARNING_DATA,
@@ -41,6 +41,9 @@
 	let ragStats: DashboardRagStats = $state({ ...DEFAULT_RAG_STATS });
 	let fetchError = $state(false);
 	let loaded = $state(false);
+	// learning.level2_adapter_partition=="model_mode" のときのみ意味を持つ表示対象
+	// モード ("model" スキームでは chat/coding どちらを選んでも同じ内容が返る)。
+	let loraMode = $state<LoraMode>('chat');
 
 	let gridCols = $derived($layout.dashboard.grid_columns);
 
@@ -48,7 +51,7 @@
 		if (isPro) {
 			const [freeData, proData] = await Promise.all([
 				fetchFreeDashboardData(),
-				fetchProDashboardData()
+				fetchProDashboardData(loraMode)
 			]);
 			learningData = freeData.learningData;
 			ragStats = freeData.ragStats;
@@ -83,19 +86,35 @@
 		if (refreshTimer) clearInterval(refreshTimer);
 	});
 
+	async function handleModeChange(newMode: LoraMode) {
+		loraMode = newMode;
+		try {
+			const updated = await getLoraVersions(loraMode);
+			loraTargets = {
+				base: mapLoraTarget(updated.base),
+				assist: mapLoraTarget(updated.assist)
+			};
+		} catch {
+			// silent — 次回の定期リフレッシュで再試行される
+		}
+	}
+
 	async function handleRollback(target: LoraTarget, version: number) {
 		const label =
 			target === 'base' ? $t('dashboard.level2_base') : $t('dashboard.level2_assist');
 		if (!confirm($t('dashboard.rollback_confirm', { target: label, version }))) return;
 
 		try {
-			await rollbackLora(version, target);
+			const result = await rollbackLora(version, target, loraMode);
+			if (result.restart_required) {
+				alert($t('dashboard.rollback_restart_required'));
+			}
 		} catch {
 			return;
 		}
 
 		try {
-			const updated = await getLoraVersions();
+			const updated = await getLoraVersions(loraMode);
 			loraTargets = {
 				base: mapLoraTarget(updated.base),
 				assist: mapLoraTarget(updated.assist)
@@ -141,6 +160,8 @@
 					evalCasesCount={learningData.eval_cases_count}
 					evalPassThreshold={learningData.eval_pass_threshold}
 					onrollback={handleRollback}
+					mode={loraMode}
+					onmodechange={handleModeChange}
 				/>
 			{/if}
 			{#if isPro && components?.PerformanceChart}

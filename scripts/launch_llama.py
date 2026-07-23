@@ -629,6 +629,7 @@ def build_llama_cmd(
     *,
     model_override: str | None = None,
     lora_override: str | Path | None = None,
+    lora_fallback: bool = True,
     port_override: int | None = None,
 ) -> list[str]:
     """config.yaml の llama セクションから起動コマンドを生成
@@ -637,6 +638,12 @@ def build_llama_cmd(
     パス) と ``port_override`` (スクラッチポート) を指定して ephemeral サーバを
     起動する (build_assist_cmd と同じパターン)。いずれも未指定 (通常運用) の
     ときは従来挙動と完全に等価。
+
+    ``lora_fallback`` は ``lora_override is None`` のときのみ意味を持つ。既定
+    ``True`` は従来どおり ``local_paths.lora_adapter`` (flat) を exists+compat
+    チェック付きで読む。``False`` を渡すと (level2_adapter_partition=="model_mode"
+    でのモード切替のように) そのモードにはまだ学習済み LoRA が存在しないことを
+    明示するために、flat フォールバックを踏まず ``--lora`` を一切付与しない。
     """
     if "llama" not in cfg:
         raise ValueError("config.yaml に 'llama' セクションがありません")
@@ -671,7 +678,7 @@ def build_llama_cmd(
     # 通常運用は既存アダプタが存在し、かつモデルと arch が一致する場合のみ付与する。
     if lora_override is not None:
         cmd += ["--lora", str(Path(lora_override))]
-    else:
+    elif lora_fallback:
         lora_path = lp.get("lora_adapter", "local/models/adapter.gguf")
         lora_full = Path(lora_path)
         if not lora_full.is_absolute():
@@ -680,6 +687,7 @@ def build_llama_cmd(
             base_model_path, lora_full, warn=lambda m: print(m, file=sys.stderr),
         ):
             cmd += ["--lora", str(lora_full)]
+    # else: lora_fallback=False → 明示的に LoRA なし (flat フォールバック抑制)
 
     # Level 2 base=C: control vector (残差ストリーム操舵)。
     # learning.level2_base_method=='cvector' かつファイルが存在するときのみ適用する。
@@ -926,6 +934,7 @@ def build_assist_cmd(
     project_root: Path | None = None,
     *,
     lora_override: str | Path | None = None,
+    lora_fallback: bool = True,
     port_override: int | None = None,
     model_override: str | None = None,
 ) -> list[str] | None:
@@ -938,6 +947,9 @@ def build_assist_cmd(
     ``model_override`` は chat/coding モード切替時 (``model_paths.assist_coding_model``)
     に一時的に別 GGUF を読み込ませる用途 (build_llama_cmd と同じパターン)。
     いずれも未指定 (通常運用) のときは従来挙動と完全に等価。
+
+    ``lora_fallback`` は build_llama_cmd と同じ意味論 (既定 True = flat
+    ``assist_lora_adapter`` フォールバックを許可、False = 明示的に LoRA なし)。
     """
     assist_cfg = cfg.get("assist_model", {})
     local_cfg = assist_cfg.get("local", {})
@@ -984,7 +996,7 @@ def build_assist_cmd(
     # coding 用モデルに無条件添付すると shape mismatch で起動失敗しうるため。
     if lora_override is not None:
         cmd += ["--lora", str(Path(lora_override))]
-    elif model_override is None:
+    elif model_override is None and lora_fallback:
         lp = cfg.get("local_paths", {})
         assist_lora = lp.get("assist_lora_adapter", "local/models/assist_adapter.gguf")
         assist_lora_full = Path(assist_lora)

@@ -489,6 +489,7 @@ def _init_learning_core(
     # チャット応答パスを壊さないようにする。
     def _record_assist_experience(
         action_type: str, input_context: str, output: str, outcome: float,
+        mode: str = "chat",
     ) -> None:
         if state.learning_disabled:
             return
@@ -509,7 +510,7 @@ def _init_learning_core(
                 list(state.cartridge_manager.loaded)
                 if state.cartridge_manager is not None else []
             )
-            buf.record(action_type, input_context[:2000], output, outcome, cart_ids)
+            buf.record(action_type, input_context[:2000], output, outcome, cart_ids, mode=mode)
         except Exception as e:
             logger.debug("assist experience record skipped: %s", e)
 
@@ -1112,7 +1113,14 @@ def _wire_sleep_scheduler_models(
 
     # LoRA パスは不在でも常に設定する: Level 2 初回 full-train (bootstrap) が
     # この位置に初期アダプタを書き込むため、存在判定は trainer 側で行う。
-    lora_path = resolver.resolve_local("lora_adapter")
+    # resolve_learning 経由に統一 (Issue #251 修正): 従来 resolve_local (flat)
+    # で構築していたため、partition_by_base_model=true 環境でもここだけモデル
+    # パーティションから孤立していた。mode は明示せず resolver.active_mode
+    # (起動時既定 "chat") に委ねる — "model" (既定) スキームでは mode を無視して
+    # 従来と同じ flat 相当のパスを返すため、この変更で挙動が変わるのは
+    # partition_by_base_model=true のユーザーのみ (元々 partition される "べき"
+    # だった箇所の是正)。
+    lora_path = resolver.resolve_learning("lora_adapter")
     sleep_scheduler.set_lora_path(lora_path)
 
     base_model_path = resolver.resolve_model("base_model")
@@ -1126,7 +1134,7 @@ def _wire_sleep_scheduler_models(
     vm_cls = get_pro_handler("lora_version_manager")
     if vm_cls is not None:
         try:
-            versions_dir = resolver.resolve_local("lora_versions_dir")
+            versions_dir = resolver.resolve_learning("lora_versions_dir")
             learning_scheduler.set_version_manager(vm_cls(versions_dir, lora_path))
         except Exception as e:
             logger.debug("Base LoRA version_manager injection skipped: %s", e)
@@ -2296,6 +2304,10 @@ def _activate_learning_partition(base: "_BaseContext", state: AppState) -> None:
         resolver, cfg, develop_level=state.develop_level,
     )
     migrator.migrate_if_needed(producer_filename)
+    # level2_adapter_partition=="model_mode" 初回有効化時、既存の (model のみ)
+    # パーティション済みアダプタを "chat" バケットへ移す (独立マーカー、
+    # partition_by_base_model の移行タイミングとは非同期に発火しうる)。
+    migrator.migrate_adapter_partition_mode_if_needed(stem)
     logger.info(
         "Learning partition active: stem=%s slug=%s (migration producer=%s)",
         stem, state.active_base_model_slug, Path(producer_filename).stem,

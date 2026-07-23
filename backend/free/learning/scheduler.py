@@ -181,6 +181,10 @@ class LearningScheduler:
         )
         # Level 2 base=C: control vector (既定 'lora' = 既存 SPSA/LoRA 経路、挙動変更なし)
         self.level2_base_method: str = learning.get("level2_base_method", "lora")
+        # Level 2 base/assist アダプタの (mode) パーティション粒度。既定 "model"
+        # (chat/coding で 1 アダプタ共有、挙動変更なし)。"model_mode" で
+        # Level2Runner が chat/coding を交互に別サイクルとして訓練する。
+        self.level2_adapter_partition: str = learning.get("level2_adapter_partition", "model")
         # base=spsa-real-eval: assist=B と対称の実推論 eval (既定は assist と同じ値)
         self.base_realeval_spsa_iterations: int = int(
             learning.get("base_realeval_spsa_iterations", 30)
@@ -1158,17 +1162,23 @@ class LearningScheduler:
         self,
         experiences: list[dict],
         current_model: str,
+        mode: str | None = None,
     ) -> list[dict]:
         """Level 2 用: カートリッジフィルタ + ベースモデルフィルタ（§22.5.4）
 
         旧モデルで収集された経験は新モデルの LoRA 微調整に適さないため、
-        現在のベースモデルで収集された経験のみを使用する。
+        現在のベースモデルで収集された経験のみを使用する。``mode`` 指定時は
+        さらにそのモード ("chat"/"coding") の経験のみに絞る (省略時は全モード
+        横断、後方互換)。
         """
         filtered = self._filter_experiences(experiences)
-        return [
+        filtered = [
             e for e in filtered
             if e.get("base_model", current_model) == current_model
         ]
+        if mode is not None:
+            filtered = [e for e in filtered if e.get("mode") == mode]
+        return filtered
 
     def _get_filtered_experiences(self) -> list[dict]:
         """経験バッファを dict リストに変換しカートリッジフィルタを適用"""

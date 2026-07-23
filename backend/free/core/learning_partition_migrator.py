@@ -34,6 +34,12 @@ if TYPE_CHECKING:
 logger = get_logger("core.learning_partition_migrator")
 
 MARKER_NAME = ".partition_migrated_v1"
+# level2_adapter_partition=="model_mode" を初めて有効化した際の
+# 「既存 (model のみ) パーティション済みアダプタ → "chat" バケット」移行マーカー。
+# MARKER_NAME (flat→partition) とは独立したライフサイクル: partition_by_base_model
+# は起動時から有効な可能性が高いが、level2_adapter_partition はユーザーが後から
+# "model" → "model_mode" に切り替えるケースがあり、発火タイミングが異なるため。
+ADAPTER_MODE_MARKER_NAME = ".adapter_mode_migrated_v1"
 
 # flat prompts_dir から base パーティションへ移すファイル名 (assist_* は移さない)。
 _BASE_PROMPT_FILES = (
@@ -258,3 +264,81 @@ class LearningPartitionMigrator:
                 shutil.copytree(src, dst)
                 copied += 1
         return copied
+
+    # ── adapter mode-partition (chat/coding 分離) 初回移行 ──
+
+    def _adapter_mode_marker_path(self) -> Path:
+        return self._resolver.resolve_local("learning_dir") / ADAPTER_MODE_MARKER_NAME
+
+    def adapter_mode_already_migrated(self) -> bool:
+        return self._adapter_mode_marker_path().exists()
+
+    def migrate_adapter_partition_mode_if_needed(self, stem: str) -> bool:
+        """``level2_adapter_partition=="model_mode"`` 初回有効化時の非破壊移行。
+
+        既存の (model のみ) パーティション済み base/assist LoRA を "chat" バケットへ
+        コピーする(原本は残置)。既定モードが "chat" (``AppState.current_mode`` /
+        Free CLI 既定と一致) なので、既存の共有アダプタは主に chat セッションの
+        経験を反映していると見なすのが最も実態に近い、という前提。
+
+        ``level2_adapter_partition=="model_mode"`` はスキーマ側で
+        ``partition_by_base_model=true`` を要求しているため、コピー元は常に
+        "model" スキームのパーティション済みパス
+        (``learning_path_for(key, stem)``、mode 無し) になる — flat レイアウトからの
+        直接移行は考慮不要 (既存の :meth:`migrate_if_needed` が別途担う領域)。
+        """
+        if self._resolver.adapter_partition_mode != "model_mode":
+            return False
+        if self.adapter_mode_already_migrated():
+            return False
+
+        copied = 0
+        for key in ("lora_adapter", "lora_versions_dir", "lora_spsa_checkpoint"):
+            src = self._resolver.learning_path_for(key, stem)
+            dst = self._resolver.learning_path_for(key, stem, mode="chat")
+            copied += self._copy_if_missing(src, dst)
+
+        for key in (
+            "assist_lora_adapter",
+            "assist_lora_versions_dir",
+            "assist_lora_spsa_checkpoint",
+        ):
+            src = self._resolver.resolve_local(key)
+            dst = self._resolver.resolve_assist_learning(key, mode="chat")
+            copied += self._copy_if_missing(src, dst)
+
+        self._write_adapter_mode_marker(stem, copied)
+        logger.info(
+            "Adapter mode-partition migration complete: stem=%s copied=%d "
+            "(model-partitioned/flat originals retained for rollback)",
+            stem, copied,
+        )
+        return True
+
+    @staticmethod
+    def _copy_if_missing(src: Path, dst: Path) -> int:
+        if src.resolve() == dst.resolve():
+            return 0
+        if src.is_file() and not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            return 1
+        if src.is_dir() and not dst.exists():
+            shutil.copytree(src, dst)
+            return 1
+        return 0
+
+    def _write_adapter_mode_marker(self, stem: str, copied: int) -> None:
+        marker = self._adapter_mode_marker_path()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "migrated_at": utc_now(),
+            "model_stem": stem,
+            "target_mode": "chat",
+            "copied": copied,
+        }
+        marker.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )

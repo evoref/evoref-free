@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import re
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable
@@ -743,6 +744,25 @@ def _is_valid_python(code: str) -> bool:
         return False
 
 
+_PYTEST_USAGE_RE = re.compile(r"\bpytest\.\w+")
+_PYTEST_IMPORT_RE = re.compile(
+    r"^\s*(import\s+pytest\b|from\s+pytest\s+import\b)", re.MULTILINE,
+)
+
+
+def _ensure_pytest_import(test_code: str) -> str:
+    """``pytest.xxx`` を使うのに import 忘れの生成テストへ決定論的に import を補う。
+
+    2026-07-23 live: bubble_sort のテストが `pytest.raises`/マーカーを使い
+    ながら `import pytest` を欠落させ、収集時の `NameError` で 11 件全滅した。
+    LLM 再生成に頼らず、構文的に確証できる欠落は機械的に修復する
+    (誤検知余地が無い — 既に import 済みなら何もしない)。
+    """
+    if not _PYTEST_USAGE_RE.search(test_code) or _PYTEST_IMPORT_RE.search(test_code):
+        return test_code
+    return f"import pytest\n{test_code}"
+
+
 # repair/test 系 instruction の末尾に付与する出力制約。"Output only ... code." だけの
 # 弱い指示だと前置き/後書きの自然文が混入し ast.parse に失敗する (2026-07-06 live:
 # 非 Python 応答で repair round が空転)。code_repair.py の _PYTHON_REPAIR_PROMPT と
@@ -818,6 +838,11 @@ class StagedCodingExecutor:
     # test↔src API 契約チェッカ (src_files, test_files) -> 違反メッセージ列。
     # EvorefGen の check_api_contract を api 層で注入 (loop→gen の越境回避)。
     contract_checker: "Callable[[dict[str, str], dict[str, str]], list[str]] | None" = None
+    # 生成テストの決め打ち期待値を pytest 失敗出力の実測値で補正する
+    # (test_code, pytest_output) -> (repaired_code, fixed_count)。EvorefGen の
+    # repair_literal_assertions を api 層で注入 (loop→gen の越境回避)。
+    # ``None`` (未注入) なら補正はスキップされる (従来動作)。
+    value_repair: "Callable[[str, str], tuple[str, int]] | None" = None
     max_repair_rounds: int = 2
     max_test_regen_rounds: int = 2
     spec_max_tokens: int = 1536
@@ -2116,6 +2141,8 @@ class StagedCodingExecutor:
             test_code = regen_code
             violations = self._contract_violations(source_path, test_code)
 
+        test_code = _ensure_pytest_import(test_code)
+
         # 構文的に無効な test (中間切断等) は書き込む前に弾く。契約チェッカは構文
         # エラーを例外握り潰しで違反ゼロ扱いにする (_contract_violations) ため、この
         # ゲートが無いと壊れたテストファイルがそのまま永続化・pytest 実行されうる。
@@ -2152,7 +2179,61 @@ class StagedCodingExecutor:
             return wf.sha256, "contract_violations_remaining", None
 
         pytest_status, pytest_gate = await self._run_advisory_pytest(task, test_logical)
+        if pytest_status == "generated_pytest_failed" and pytest_gate is not None:
+            repaired = await self._maybe_repair_literal_assertions(
+                task, source_path, test_logical, test_code, pytest_gate,
+            )
+            if repaired is not None:
+                return repaired
         return wf.sha256, pytest_status, pytest_gate
+
+    async def _maybe_repair_literal_assertions(
+        self, task: "TaskFactView", source_path: str, test_logical: str,
+        test_code: str, gate: "GateResult",
+    ) -> tuple[str, str, "GateResult | None"] | None:
+        """pytest 失敗の決め打ちリテラルを実測値へ補正できるか試す (golden-testing)。
+
+        2026-07-23 live: 二分探索の重複値ケース (仕様上どのインデックスも正当
+        だがテストが未検証の値を決め打ち) と、スタックの多型 push テストの
+        期待値取り違えは、いずれも「実装は正しいがテストの決め打ち期待値だけ
+        が誤り」という同型の失敗だった。src は成果物 (権威) というこの
+        パイプラインの既存方針に沿い、pytest 自身が報告した実測値でテスト側
+        を補正し、1 回だけ再実行する。1 回だけ (spec 見直しループとは独立、
+        無限ループ化しない)。
+
+        Returns:
+            補正して再実行した場合のみ ``(sha, status, gate)``。補正対象が
+            無い (=単純な決め打ちリテラル不一致ではない) 場合は ``None``
+            (呼出側は従来の pytest_status/gate をそのまま使う)。
+        """
+        if self.value_repair is None:
+            return None
+        output = (gate.stdout_tail or "") + "\n" + (gate.stderr_tail or "")
+        repaired_code, fixed_count = self.value_repair(test_code, output)
+        if fixed_count == 0:
+            return None
+        self._emit(
+            "test",
+            f"テストの決め打ち期待値を実測値へ補正中 ({fixed_count} 件): {test_logical}",
+            "running", task.task_id,
+        )
+        wf = self.workspace.write_file(
+            test_logical, repaired_code, kind="test", stage="test",
+            task_id=task.task_id, covers=(source_path,),
+        )
+        status, new_gate = await self._run_advisory_pytest(
+            task, test_logical, attempt=2,
+        )
+        self._emit(
+            "test",
+            (
+                f"テストの期待値を実測値へ補正し合格 ({fixed_count} 件)"
+                if status == "generated_pytest_ok"
+                else f"期待値補正 ({fixed_count} 件) 後もテスト未合格"
+            ),
+            "done" if status == "generated_pytest_ok" else "failed", task.task_id,
+        )
+        return wf.sha256, status, new_gate
 
     async def _run_advisory_pytest(
         self, task: "TaskFactView", test_logical: str, *, attempt: int = 1,
@@ -2488,6 +2569,8 @@ class StagedCodingExecutor:
             regen_code = _pick_primary(
                 await self._safe_codegen(fix_instr, test_logical), test_logical,
             )
+            if regen_code.strip():
+                regen_code = _ensure_pytest_import(regen_code)
             if regen_code.strip() and not _is_valid_python(regen_code):
                 regen_code = _salvage_python_code(regen_code) or ""
             if regen_code.strip() and _is_valid_python(regen_code):
@@ -2504,6 +2587,13 @@ class StagedCodingExecutor:
         if f is not None:
             sha = f.sha256
         status, gate = await self._run_advisory_pytest(task, test_logical, attempt=2)
+        if status == "generated_pytest_failed" and gate is not None:
+            repaired = await self._maybe_repair_literal_assertions(
+                task, source_path, test_logical, test_code, gate,
+            )
+            if repaired is not None:
+                sha_out, status, gate = repaired
+                return sha_out, status, gate
         return (sha or None), status, gate
 
     def _contract_violations(self, source_path: str, test_code: str) -> list[str]:

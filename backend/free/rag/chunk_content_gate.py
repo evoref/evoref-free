@@ -35,8 +35,6 @@ logger = get_logger("rag.chunk_content_gate")
 _TRUNCATE = 150
 # dedup の token-set Jaccard を計算する候補数の上限。超過時は O(n^2) を避け skip。
 _DEDUP_MAX = 50
-# marginal band assist の wall-clock 上限 (秒)。超過時は全 keep にフォールバック。
-_ASSIST_TIMEOUT_S = 5.0
 
 # コード片を含むかの安価判定パターン (coding mode)。
 _CODE_FENCE = re.compile(r"```")
@@ -306,11 +304,12 @@ class ChunkContentGate:
         try:
             # timeout は generate_json 側の purpose 別 (realtime) 総予算強制に
             # 一本化する (外側 wait_for との二重ラップは反応的タイムアウト較正を
-            # 機能不全にする。self_rag_judge.py と同じ不具合パターン)。
+            # 機能不全にする)。静的な既定値ではなく較正込みの実効タイムアウトを
+            # 明示的に渡す (self_rag_judge.py と同じ不具合パターンの修正)。
             res = await assist_client.generate_json(
                 prompt, max_tokens=64, temperature=0.1,
                 purpose="retrieval_chunk_gate", list_key="relevant_indices",
-                timeout=_ASSIST_TIMEOUT_S,
+                timeout=assist_client.resolve_effective_timeout("retrieval_chunk_gate"),
             )
         except (TimeoutError, asyncio.TimeoutError):
             result.assist_skipped_reason = "timeout"

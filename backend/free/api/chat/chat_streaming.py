@@ -2549,6 +2549,7 @@ async def stream_staged_coding(
 
     # spec 宣言契約と生成コードの照合 (EvorefGen 具象) も同パターンで注入。
     from backend.free.generation.spec_conformance import check_spec_conformance
+    from backend.free.generation.test_value_repair import repair_literal_assertions
 
     executor = StagedCodingExecutor(
         workspace=ws, assist_client=state.assist_client, codegen=codegen,
@@ -2556,6 +2557,7 @@ async def stream_staged_coding(
         test_runner=test_runner,
         contract_checker=check_api_contract,
         conformance_checker=check_spec_conformance,
+        value_repair=repair_literal_assertions,
         max_test_regen_rounds=int(staged_cfg.get("max_test_regen_rounds", 2)),
         max_repair_rounds=int(staged_cfg.get("max_repair_rounds", 2)),
         spec_max_tokens=int(staged_cfg.get("spec_max_tokens", 6144)),

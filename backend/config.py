@@ -74,6 +74,25 @@ class PathResolver:
         "cvector_work_dir": "cvector",
     }
 
+    # ``_LEARNING_SUBPATH`` のうち、``learning.level2_adapter_partition=="model_mode"``
+    # の時に ``<stem>/<mode>/...`` と mode サブディレクトリを追加で挟む対象キー。
+    # experience_file / prompts_dir は既に別の方法 (mode.md ファイル名 / mode タグ) で
+    # モード分離済みのため対象外。control_vector 系 / cvector_work_dir は本機能の
+    # スコープ外 (Level 2 base=cvector 手法は今回のモード分離の対象としない)。
+    _MODE_PARTITIONED_KEYS = frozenset(
+        {"lora_adapter", "lora_versions_dir", "lora_spsa_checkpoint"},
+    )
+
+    # resolve_assist_learning で使う assist LoRA 用の (mode のみ) パーティション先。
+    # base の ``_LEARNING_SUBPATH`` と異なり model stem 軸を持たない
+    # (``learning_dir/assist/<mode>/...``) — assist は経験/プロンプトがモデル
+    # 非依存という既存設計 (docs/f_04_self_learning.md) を維持するため。
+    _ASSIST_MODE_SUBPATH = {
+        "assist_lora_adapter": "adapter.gguf",
+        "assist_lora_versions_dir": "lora_versions",
+        "assist_lora_spsa_checkpoint": "lora_spsa_checkpoint.json",
+    }
+
     def __init__(self, config: dict, project_root: Path):
         self.root = project_root
         self.models = config.get("model_paths", {})
@@ -88,6 +107,15 @@ class PathResolver:
         # embed_instruction 系データの (embedding モデル) パーティション state。
         # base 学習パーティション (_active_stem) とは独立した軸。
         self._active_embed_stem: str | None = None
+        # Level 2 base/assist LoRA アダプタの (mode) パーティション state。
+        # "model" (既定) では resolve_learning/resolve_assist_learning は mode 引数を
+        # 無視し、従来どおりモデル単位で 1 アダプタを共有する。"model_mode" のときのみ
+        # chat/coding で別ファイルへ分離する。AppState.current_mode の初期値と揃え、
+        # active_mode の既定は "chat"。
+        self._active_mode: str = "chat"
+        self._adapter_partition_mode: str = str(
+            (config.get("learning", {}) or {}).get("level2_adapter_partition", "model"),
+        )
 
     def resolve_model(self, key: str) -> Path:
         """モデルパス解決
@@ -158,7 +186,21 @@ class PathResolver:
             return self.resolve_local("prompts_dir")
         return self.resolve_local("learning_dir") / "embed" / self._active_embed_stem
 
-    def resolve_learning(self, key: str) -> Path:
+    @property
+    def active_mode(self) -> str:
+        """Level 2 アダプタパーティションの active モード (``"chat"``/``"coding"``)。"""
+        return self._active_mode
+
+    def set_active_mode(self, mode: str | None) -> None:
+        """モード切替時に呼ぶ。未指定/不明値は安全側で ``"chat"`` に丸める。"""
+        self._active_mode = mode if mode in ("chat", "coding") else "chat"
+
+    @property
+    def adapter_partition_mode(self) -> str:
+        """``learning.level2_adapter_partition`` の値 (``"model"``/``"model_mode"``)。"""
+        return self._adapter_partition_mode
+
+    def resolve_learning(self, key: str, mode: str | None = None) -> Path:
         """base 学習データのパスを **active** モデルパーティション配下で解決する。
 
         ``_LEARNING_SUBPATH`` の base 学習キーのみ ``learning_dir/<active_stem>/...``
@@ -166,6 +208,11 @@ class PathResolver:
         active stem 未設定) または非対象キーは ``resolve_local`` へ素通しする
         (assist・共有・レガシー)。``learning_dir`` は ``resolve_local`` 経由で解決
         するため ``--isolate-data`` の prefix 書換えを自動継承する。
+
+        ``mode`` は ``key`` が ``_MODE_PARTITIONED_KEYS`` に属し、かつ
+        ``adapter_partition_mode=="model_mode"`` のときだけ効く (``learning_path_for``
+        参照)。省略時は ``active_mode`` を使う。"model" (既定) スキームでは mode に
+        関わらず常に同一パスを返す (後方互換)。
         """
         if (
             not self._partition_enabled
@@ -173,20 +220,51 @@ class PathResolver:
             or key not in self._LEARNING_SUBPATH
         ):
             return self.resolve_local(key)
-        return self.learning_path_for(key, self._active_stem)
+        effective_mode = mode if mode is not None else self._active_mode
+        return self.learning_path_for(key, self._active_stem, mode=effective_mode)
 
-    def learning_path_for(self, key: str, stem: str) -> Path:
+    def learning_path_for(self, key: str, stem: str, mode: str | None = None) -> Path:
         """**指定** モデル stem のパーティション配下で base 学習パスを解決する。
 
         active stem に依存せず任意モデルのパーティションパスを得る。flat→partition
         移行 (producer 別 / experience の base_model タグ別バケツ) で、active モデル
         とは異なるモデルのパーティションへ振り分けるために使う。``_LEARNING_SUBPATH``
         非対象キーは ``resolve_local`` へ素通しする。
+
+        ``mode`` は ``key in _MODE_PARTITIONED_KEYS`` かつ
+        ``adapter_partition_mode=="model_mode"`` のときのみ ``<stem>/<mode>/...`` と
+        サブディレクトリを追加する。それ以外 (既定 "model" スキーム、または
+        mode 分割対象外キー) は従来どおり ``<stem>/...`` のまま (mode を無視する)。
         """
         if key not in self._LEARNING_SUBPATH:
             return self.resolve_local(key)
         root = self.resolve_local("learning_dir") / stem
+        if (
+            mode is not None
+            and key in self._MODE_PARTITIONED_KEYS
+            and self._adapter_partition_mode == "model_mode"
+        ):
+            root = root / mode
         return root / self._LEARNING_SUBPATH[key]
+
+    def resolve_assist_learning(self, key: str, mode: str | None = None) -> Path:
+        """assist LoRA アダプタ/バージョン履歴/チェックポイントを **mode 単位**で解決する。
+
+        base の ``resolve_learning`` と異なり model stem 軸を持たない — assist の
+        経験・プロンプトはモデル識別子で分離しない既存方針 (docs/f_04_self_learning.md)
+        を踏襲し、``adapter_partition_mode=="model_mode"`` のときのみ
+        ``learning_dir/assist/<mode>/...`` という mode のみの軸を新設する。
+        非対象キー / "model" (既定) スキームは ``resolve_local`` へ素通しする
+        (従来の flat 配置、後方互換)。``mode`` 省略時は ``resolve_learning`` と同様
+        ``active_mode`` を使う。
+        """
+        if key not in self._ASSIST_MODE_SUBPATH or self._adapter_partition_mode != "model_mode":
+            return self.resolve_local(key)
+        effective_mode = mode if mode is not None else self._active_mode
+        return (
+            self.resolve_local("learning_dir")
+            / "assist" / effective_mode / self._ASSIST_MODE_SUBPATH[key]
+        )
 
     def _to_absolute(self, raw: str) -> Path:
         path = Path(raw)
@@ -813,3 +891,40 @@ def get_mode_assist_model_path(mode: str) -> str:
     if mode == "coding":
         return model_paths.get("assist_coding_model") or assist_model
     return assist_model
+
+
+def get_mode_lora_path(mode: str) -> Path:
+    """指定モードで使用すべき base LoRA アダプタの絶対パスを解決する (存在確認はしない)。
+
+    ``learning.level2_adapter_partition=="model"`` (既定) のときは mode に依らず
+    常に同一パスを返す — ``/api/mode/switch`` の再起動判定がこの関数の戻り値を
+    比較するだけで LoRA 差分による再起動要否を導けるようにするため
+    (既定運用では常に等しい = 再起動トリガーなし、後方互換)。
+    "model_mode" のときのみ mode 別の実際のパスを返す。
+
+    Args:
+        mode: "chat" または "coding"
+
+    Returns:
+        解決された絶対パス (ファイルの存在は保証しない)
+    """
+    resolver = get_path_resolver()
+    effective_mode = mode if resolver.adapter_partition_mode == "model_mode" else None
+    return resolver.resolve_learning("lora_adapter", mode=effective_mode)
+
+
+def get_mode_assist_lora_path(mode: str) -> Path:
+    """指定モードで使用すべき assist LoRA アダプタの絶対パスを解決する (存在確認はしない)。
+
+    ``get_mode_lora_path`` と対称。"model" (既定) では常に flat 共有パスを返す。
+
+    Args:
+        mode: "chat" または "coding"
+
+    Returns:
+        解決された絶対パス (ファイルの存在は保証しない)
+    """
+    resolver = get_path_resolver()
+    if resolver.adapter_partition_mode != "model_mode":
+        return resolver.resolve_local("assist_lora_adapter")
+    return resolver.resolve_assist_learning("assist_lora_adapter", mode=mode)

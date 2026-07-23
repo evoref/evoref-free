@@ -1395,3 +1395,13 @@ class AssistModelClient(BaseHTTPClient):
             if purpose in PURPOSE_TIMEOUT_DEFAULTS:
                 return PURPOSE_TIMEOUT_DEFAULTS[purpose]
         return self.timeout
+
+    def resolve_effective_timeout(self, purpose: str) -> float:
+        """purpose の実効タイムアウトを解決する (config上書き→較正値→既定、副作用なし)。
+
+        呼び出し元が `generate()`/`generate_json()` に `timeout=` を明示指定する
+        必要がある場合 (外側 wait_for との二重ラップが反応的タイムアウト較正を
+        機能不全にするケース、``self_rag_judge.py`` 参照) に、その明示値として
+        較正済みの値を渡せるようにする。
+        """
+        return self._resolve_timeout(None, purpose)

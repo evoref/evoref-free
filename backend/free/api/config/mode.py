@@ -5,8 +5,17 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
+from pathlib import Path
+
 from backend.app_state import AppState, get_app_state
-from backend.config import get_mode_assist_model_path, get_mode_generation_params
+from backend.config import (
+    get_mode_assist_lora_path,
+    get_mode_assist_model_path,
+    get_mode_generation_params,
+    get_mode_lora_path,
+    get_path_resolver,
+    get_project_root,
+)
 from backend.log_config import get_logger
 
 logger = get_logger("api.mode")
@@ -24,7 +33,45 @@ class ModeSwitchResponse(BaseModel):
     restart_initiated: bool
     assist_model_changed: bool = False
     assist_restart_initiated: bool = False
+    lora_changed: bool = False
+    assist_lora_changed: bool = False
     message: str = ""
+
+
+def _resolve_lora_override(
+    model_path: str, lora_path: Path | None,
+) -> tuple[Path | None, bool]:
+    """``get_mode_lora_path``/``get_mode_assist_lora_path`` の解決結果を、
+    実際に ``--lora`` へ渡してよいか (存在確認 + arch 互換) 検証する。
+
+    ``level2_adapter_partition!="model_mode"`` (既定) または ``lora_path`` が
+    None のときは ``(None, True)`` を返し、``build_*_cmd`` 側の従来どおりの
+    flat フォールバック分岐に委譲する (既存挙動を完全維持)。
+
+    "model_mode" のときは、対象モードのアダプタが (a) 存在しない、または
+    (b) 起動対象モデルと arch 不一致であれば ``(None, False)`` を返し、
+    flat フォールバックも踏ませずに明示的に「LoRA なし」で起動させる —
+    そのモードがまだ学習されていない状態を安全に表す。
+    """
+    resolver = get_path_resolver()
+    if resolver.adapter_partition_mode != "model_mode" or lora_path is None:
+        return None, True
+    if not lora_path.exists():
+        return None, False
+
+    from scripts.launch_llama import lora_compatible_with_model
+
+    model_abs = Path(model_path)
+    if not model_abs.is_absolute():
+        model_abs = get_project_root() / model_abs
+    ok, reason = lora_compatible_with_model(model_abs, lora_path)
+    if not ok:
+        logger.warning(
+            "Mode switch: LoRA %s incompatible with model %s (%s); starting without LoRA",
+            lora_path, model_abs, reason,
+        )
+        return None, False
+    return lora_path, False
 
 
 @router.post("/switch", response_model=ModeSwitchResponse)
@@ -61,8 +108,19 @@ async def switch_mode(
     new_assist_path = get_mode_assist_model_path(new_mode)
     assist_model_changed = old_assist_path != new_assist_path
 
-    # モード状態を更新
+    # base/assist LoRA パスの比較 (level2_adapter_partition=="model_mode" の
+    # ときのみ差が出る。既定 "model" では get_mode_lora_path は常に同一パスを
+    # 返すため lora_changed は常に False = 再起動トリガーへの影響なし)。
+    new_lora_path = get_mode_lora_path(new_mode)
+    lora_changed = get_mode_lora_path(old_mode) != new_lora_path
+    new_assist_lora_path = get_mode_assist_lora_path(new_mode)
+    assist_lora_changed = get_mode_assist_lora_path(old_mode) != new_assist_lora_path
+
+    # モード状態を更新。resolver 側の active_mode も同期する (ダッシュボード等の
+    # 「現在モードのアダプタ」既定表示に使われる、Level2Runner は mode を明示
+    # 引数で受け取るためこれには依存しない)。
     state.current_mode = new_mode
+    get_path_resolver().set_active_mode(new_mode)
 
     restart_initiated = False
     assist_restart_initiated = False
@@ -72,13 +130,15 @@ async def switch_mode(
     # 最悪 (health_timeout × 2) になり CLI 側 read timeout を超過しうるため、
     # 別ポート・別プロセスで資源競合しない両者を asyncio.gather で並走させる。
     restart_tasks: dict[str, asyncio.Task[bool]] = {}
-    if model_changed:
+    if model_changed or lora_changed:
         restart_tasks["base"] = asyncio.create_task(
-            _restart_base_server(state, new_params["model"]),
+            _restart_base_server(state, new_params["model"], lora_path=new_lora_path),
         )
-    if assist_model_changed:
+    if assist_model_changed or assist_lora_changed:
         restart_tasks["assist"] = asyncio.create_task(
-            _restart_assist_server(state, new_assist_path),
+            _restart_assist_server(
+                state, new_assist_path, lora_path=new_assist_lora_path,
+            ),
         )
     if restart_tasks:
         results = await asyncio.gather(*restart_tasks.values())
@@ -86,19 +146,19 @@ async def switch_mode(
         restart_initiated = outcome.get("base", False)
         assist_restart_initiated = outcome.get("assist", False)
 
-    if model_changed:
+    if model_changed or lora_changed:
         message += ", server restart initiated" if restart_initiated else ", server restart failed"
-    if assist_model_changed:
+    if assist_model_changed or assist_lora_changed:
         message += (
             ", assist restart initiated" if assist_restart_initiated
             else ", assist restart failed"
         )
 
     logger.info(
-        "Mode switched: %s -> %s (model_changed=%s, restart=%s, "
-        "assist_model_changed=%s, assist_restart=%s)",
-        old_mode, new_mode, model_changed, restart_initiated,
-        assist_model_changed, assist_restart_initiated,
+        "Mode switched: %s -> %s (model_changed=%s, lora_changed=%s, restart=%s, "
+        "assist_model_changed=%s, assist_lora_changed=%s, assist_restart=%s)",
+        old_mode, new_mode, model_changed, lora_changed, restart_initiated,
+        assist_model_changed, assist_lora_changed, assist_restart_initiated,
     )
 
     return ModeSwitchResponse(
@@ -107,20 +167,26 @@ async def switch_mode(
         restart_initiated=restart_initiated,
         assist_model_changed=assist_model_changed,
         assist_restart_initiated=assist_restart_initiated,
+        lora_changed=lora_changed,
+        assist_lora_changed=assist_lora_changed,
         message=message,
     )
 
 
 async def _restart_base_server(
-    state: AppState, model_path: str,
+    state: AppState, model_path: str, lora_path: Path | None = None,
 ) -> bool:
     """ベースサーバーを新モデルで再起動する
+
+    ``lora_path`` は ``get_mode_lora_path(new_mode)`` の解決結果 (存在確認前)。
+    "model" (既定) スキームでは常に ``None`` 相当 (呼出元の ``_resolve_lora_override``
+    が ``adapter_partition_mode!="model_mode"`` を見て ``(None, True)`` に丸める
+    ため、legacy flat フォールバックへ委譲され挙動は完全に従来通り)。
 
     Returns:
         再起動が成功したかどうか
     """
     import asyncio
-    from pathlib import Path
 
     from backend.config import get_config
     from backend.free.api.system.server_control import (
@@ -132,6 +198,7 @@ async def _restart_base_server(
     from scripts.launch_llama import wait_for_health
 
     cfg = get_config()
+    lora_override, lora_fallback = _resolve_lora_override(model_path, lora_path)
 
     # 1. 既存プロセスを確実に停止。``_stop_server`` は本バックエンドが spawn して
     #    ``_managed`` に登録したプロセスしか kill しないが、base は通常 CLI /
@@ -154,8 +221,11 @@ async def _restart_base_server(
     #    旧サーバの 200 を拾う窓を潰す)。
     await asyncio.to_thread(wait_port_released, "base", cfg, 10.0)
 
-    # 3. model_override 付きで新プロセス起動
-    managed = _spawn_server_with_override("base", cfg, model_override=model_path)
+    # 3. model_override / lora_override 付きで新プロセス起動
+    managed = _spawn_server_with_override(
+        "base", cfg, model_override=model_path,
+        lora_override=lora_override, lora_fallback=lora_fallback,
+    )
     if managed is None:
         logger.error("Failed to spawn base server with model override")
         return False
@@ -185,7 +255,7 @@ async def _restart_base_server(
 
 
 async def _restart_assist_server(
-    state: AppState, model_path: str,
+    state: AppState, model_path: str, lora_path: Path | None = None,
 ) -> bool:
     """アシストサーバーを新モデルで再起動する (``_restart_base_server`` と対称)
 
@@ -200,12 +270,18 @@ async def _restart_assist_server(
     ため巻き戻す対象が無く、``assist_client=None`` の degraded mode へ
     素直に着地させる方が既存不変則 (呼出元は None 安全) と整合する)。
 
+    ``lora_path`` は ``get_mode_assist_lora_path(new_mode)`` の解決結果。
+    明示的な ``lora_override`` を渡すことで、既存の
+    「``model_override`` 指定時は arch 不明な LoRA を付けない」安全策
+    (``launch_llama.build_assist_cmd`` の ``elif model_override is None`` 分岐)
+    を安全にバイパスする — 対象モードの LoRA は起動対象モデルとの arch 互換を
+    ``_resolve_lora_override`` が事前検証済みのため。
+
     Returns:
         再起動が成功したかどうか
     """
     import asyncio
     import copy
-    from pathlib import Path
 
     from backend.config import get_config
     from backend.free.api.system.server_control import (
@@ -217,6 +293,7 @@ async def _restart_assist_server(
     from scripts.launch_llama import wait_for_health
 
     cfg = get_config()
+    lora_override, lora_fallback = _resolve_lora_override(model_path, lora_path)
 
     # 1. 既存プロセスを確実に停止 (base と同じ 3 経路フォールバック)。
     await asyncio.to_thread(stop_server_process, "assist", cfg, state)
@@ -231,8 +308,11 @@ async def _restart_assist_server(
     # 2. 旧サーバが port を解放するまで待ってから再 spawn。
     await asyncio.to_thread(wait_port_released, "assist", cfg, 10.0)
 
-    # 3. model_override 付きで新プロセス起動 (config.yaml は不変)。
-    managed = _spawn_server_with_override("assist", cfg, model_override=model_path)
+    # 3. model_override / lora_override 付きで新プロセス起動 (config.yaml は不変)。
+    managed = _spawn_server_with_override(
+        "assist", cfg, model_override=model_path,
+        lora_override=lora_override, lora_fallback=lora_fallback,
+    )
     if managed is None:
         logger.error("Failed to spawn assist server with model override")
         return False

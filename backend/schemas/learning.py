@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ScheduleConfig(BaseModel):
@@ -95,13 +95,17 @@ class LearningConfig(BaseModel):
     # False: レガシー flat レイアウト (resolve_learning が resolve_local へ素通し)。
     #   既存環境の即時ロールバック用キルスイッチ。
     partition_by_base_model: bool = True
-    # Level 2 base アダプタ (LoRA / 制御ベクトル) のパーティション粒度。
-    # "model" (既定): アダプタはモデル単位 (両モードの経験を 1 アダプタにプール)。
-    #   chat↔coding 切替で base サーバを再起動しない (cvector はランタイム hot-swap 不可、
-    #   GGUF 再ロードは高コストのため)。プロンプト/fewshot/policy/experience は (model×mode)
-    #   で分離されるため軽量側のモード差は保たれる。
-    # "model_mode": アダプタも (model×mode) で分け、モード切替時に必要なら base サーバを
-    #   再起動して該当アダプタをロードする (切替レイテンシ増を許容する strict モード)。
+    # Level 2 base/assist LoRA アダプタ (Pro) のパーティション粒度。
+    # 対象は LoRA のみ (control vector / cvector は本設定の対象外、常にモデル単位で
+    # 不変 — ランタイム hot-swap 不可 + GGUF 再ロードが高コストなため)。
+    # "model" (既定): LoRA はモデル単位 (base/assist とも両モードの経験を1アダプタに
+    #   プール)。chat↔coding 切替で base/assist サーバを再起動しない。
+    #   プロンプト/fewshot/policy/experience は (model×mode) で分離されるため
+    #   軽量側のモード差は保たれる。
+    # "model_mode": base・assist とも LoRA を (model×mode) で分け、モード切替時に
+    #   LoRA パスが変わっていれば該当サーバを再起動して切り替える
+    #   (プロセス再起動方式、切替レイテンシ増を許容する strict モード)。
+    #   partition_by_base_model=true を前提とする (model_validator で強制)。
     level2_adapter_partition: Literal["model", "model_mode"] = "model"
 
     level1_min_experiences: int = Field(default=20, ge=1)
@@ -220,3 +224,19 @@ class LearningConfig(BaseModel):
     feedback_pipe: FeedbackPipeConfig = Field(default_factory=FeedbackPipeConfig)
     # ポリシー / 進化結果書き戻し設定
     policy: LearningPolicyConfig = Field(default_factory=LearningPolicyConfig)
+
+    @model_validator(mode="after")
+    def _require_partition_for_adapter_mode_split(self) -> "LearningConfig":
+        """``level2_adapter_partition="model_mode"`` は base 学習パーティション必須
+
+        chat/coding 別アダプタは ``local/learning/<base_model_stem>/<mode>/...``
+        という base パーティション配下のサブディレクトリとして実装されるため、
+        ``partition_by_base_model=false`` (flat レイアウト) との組合せは意味を
+        持たない。単純化のため起動時に明示的に拒否する。
+        """
+        if self.level2_adapter_partition == "model_mode" and not self.partition_by_base_model:
+            raise ValueError(
+                "learning.level2_adapter_partition='model_mode' requires "
+                "learning.partition_by_base_model=true",
+            )
+        return self
