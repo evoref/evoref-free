@@ -6,6 +6,8 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import httpx
+
 from backend.app_state import AppState
 from backend.free.api.chat.chat_recorder import clear_session_data, drain_evicted_to_stm
 from backend.free.api.chat.chat_types import ChatMessage, FileContextDict
@@ -357,6 +359,11 @@ async def maybe_resolve_pending_conflicts(
       (回答されないまま毎ターン assist スロットを専有するのを避ける。pending は
       次セッション or sleep-time TTL で解消する)
 
+    タイムアウト (インフラ的失敗) は「ユーザーが回答しなかった」判定とは
+    区別し、セッション cap を消費しない (呼出前に予約したカウントを
+    ``tracker.refund`` で払い戻す)。予約自体は並行リクエストでの cap
+    超過防止のため呼出前に行う。
+
     全例外は warning + 素通しでチャットを止めない。
     """
     ctx = ConflictTurnContext()
@@ -429,12 +436,21 @@ async def maybe_resolve_pending_conflicts(
                     count, cap, session_id,
                 )
 
-        judgement = await judge_user_reply(
-            state.assist_client,
-            groups=ctx.pending_groups,
-            user_message=user_message,
-            last_assistant_message=last_assistant,
-        )
+        try:
+            judgement = await judge_user_reply(
+                state.assist_client,
+                groups=ctx.pending_groups,
+                user_message=user_message,
+                last_assistant_message=last_assistant,
+            )
+        except (httpx.TimeoutException, TimeoutError):
+            if tracker is not None:
+                tracker.refund(session_id, namespace="conflict_chat_judge")
+            logger.warning(
+                "conflict_chat_judge timed out; not counted against "
+                "session cap (session=%s)", session_id,
+            )
+            return ctx
         if judgement is None:
             return ctx
 

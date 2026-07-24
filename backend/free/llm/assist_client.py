@@ -185,8 +185,11 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "conflict_resolution": 15.0,
     # pending 競合のチャット回答判定。チャット応答パスで同期発火し、
     # base との GPU 競合 + realtime 並列化時の assist 相互競合があるため
-    # tool_judgment と同根拠で 15s (失敗時は no-op で pending 維持)。
-    "conflict_chat_judge": 15.0,
+    # tool_judgment と同根拠 (reasoning_budget=0 が gemma4 系アシストで
+    # 稀に実効せず reasoning がトークンを消費し尽くす anomaly) で
+    # tool_judgment と同じ 30s に引き上げ (旧 15s は 2026-07-24 実機検証で
+    # 頻発するタイムアウトの一因と判明。失敗時は no-op で pending 維持)。
+    "conflict_chat_judge": 30.0,
     "critique_synthesis": 45.0,
     "policy_evolution": 45.0,
     # プロンプト変異 (~1024 tok のテキスト生成)。assist は base の約5倍速で
@@ -625,6 +628,14 @@ class AssistModelClient(BaseHTTPClient):
         self.capabilities = None
         self._capability_probe_task = None
 
+        # 進行中のアシストモデル呼出数 (f_04 §8.1、LLMClient.chat_in_flight() と対称)。
+        # purpose を問わず generate() 呼出中はインクリメントされ、Level1 プロンプト
+        # 進化 / SleepTimeWorker バックグラウンド抽出 / チャット応答中の RAG・
+        # necessity 判定など全呼出元を横断してカウントする。属性名は
+        # SleepTimeScheduler.is_user_active() が getattr で参照する
+        # "in_flight_chat_count" に揃える (base 用と同名でないと拾われない)。
+        self._in_flight_count: int = 0
+
         self.timeout: float = float(assist_cfg.get("timeout", 30))
         super().__init__(timeout=self.timeout)
 
@@ -858,6 +869,18 @@ class AssistModelClient(BaseHTTPClient):
         """バックグラウンドスロット（自動割当）"""
         return -1
 
+    @property
+    def in_flight_chat_count(self) -> int:
+        """現在進行中のアシストモデル呼出数
+
+        Level1 プロンプト進化 / SleepTimeWorker バックグラウンド抽出 / チャット応答
+        中の RAG・necessity 判定など、purpose を問わず generate()/generate_json() の
+        呼出中は 1 以上になる。LLMClient.chat_in_flight() と対称に
+        SleepTimeScheduler.is_user_active() が本属性を読み、Level 2 候補評価の
+        一時 llama-server 起動と本番アシストサーバのリソース競合を回避する。
+        """
+        return self._in_flight_count
+
     async def generate(
         self,
         messages: list[dict],
@@ -965,6 +988,7 @@ class AssistModelClient(BaseHTTPClient):
         priority = resolve_priority(purpose)
 
         t0 = time.monotonic()
+        self._in_flight_count += 1
         try:
             result = await self._request_with_retry(
                 payload, timeout=effective_timeout, priority=priority,
@@ -978,6 +1002,8 @@ class AssistModelClient(BaseHTTPClient):
                 timed_out=True, budget=effective_timeout,
             )
             raise
+        finally:
+            self._in_flight_count -= 1
         elapsed = time.monotonic() - t0
         self._record_assist_latency(
             purpose, elapsed, timed_out=False, budget=effective_timeout,

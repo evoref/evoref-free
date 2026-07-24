@@ -75,7 +75,7 @@ from backend.free.loop.staged.spec_parts import (
 from backend.free.loop.staged.synthesizer import MODULE_LIST_MARKER, os_constraint
 from backend.free.loop.staged.test_runner import StagedTestRunner
 from backend.free.loop.staged.workspace import WorkspaceManager, StageTestResult
-from backend.i18n_helper import get_locale
+from backend.i18n_helper import prose_language_name
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -364,6 +364,40 @@ def _condensed_flow_context(spec: str, module_paths: list[str]) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
+def _condensed_code_spec(spec: str, source_path: str) -> str:
+    """予算超過 spec の単発コード生成 instruction 入力を圧縮する。
+
+    生成対象 (``source_path``) 自身の ``## Module:`` 節は BINDING CONTRACT
+    そのものであり、絶対に切り詰めない。他モジュールの節は cross-reference
+    用の参考情報として per-module cap で圧縮する
+    (:func:`_condensed_flow_context` と同じ全モジュール公平圧縮の思想)。
+    ``## Canonical file list`` 以降 (Canonical file list + Processing flow、
+    末尾に決定論追記される軽量な節) は常に全文保持する。
+    """
+    first_idx = spec.find("## Module:")
+    if first_idx < 0:
+        return spec[:_CODE_SPEC_MAX_CHARS]
+    head = spec[:first_idx].strip()[:_CODE_SPEC_HEAD_MAX_CHARS]
+
+    tail_idx = spec.find("## Canonical file list")
+    modules_region = spec[first_idx:tail_idx if tail_idx >= 0 else len(spec)]
+    tail = spec[tail_idx:].strip() if tail_idx >= 0 else ""
+
+    target_heading = f"## Module: {source_path}"
+    parts = [head]
+    for chunk in re.split(r"\n(?=## Module: )", modules_region):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts.append(
+            chunk if chunk.startswith(target_heading)
+            else chunk[:_CODE_SPEC_OTHER_MODULE_MAX_CHARS]
+        )
+    if tail:
+        parts.append(tail)
+    return "\n\n".join(p for p in parts if p)
+
+
 def _missing_declared_names(group_spec: str, part_code: str) -> list[str]:
     """部分 spec が宣言する def/class 名のうち part コードに無いものを返す。
 
@@ -384,6 +418,40 @@ def _missing_declared_names(group_spec: str, part_code: str) -> list[str]:
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     }
     return [d for d in declared if d not in present]
+
+
+def _undeclared_part_names(
+    coherence_checker: "Callable[[dict[str, str]], list[str]] | None",
+    assembler: "Callable[..., str | None] | None",
+    parts: list[str],
+    code: str,
+    source_path: str,
+) -> list[str]:
+    """宣言済みチェックを通過した part に spec 未宣言の幻覚識別子が無いか確認する。
+
+    ``_missing_declared_names`` は spec に宣言された component の実装漏れしか
+    検知できず、LLM が自発的に持ち込んだ未宣言の幻覚名 (import も定義も無い
+    bare identifier) は原理的に対象外になる。同一ファイル内のみを対象にした
+    ``check_coherence`` プレビューで補完し、安価な part 単位リトライに前倒しする
+    (finalize 直前の advisory チェックはタイムアウトで飛ばされ得るため)。
+
+    クロスファイル参照との誤検知を避けるため、対象は生成中ファイル単体の
+    結合プレビューに限定する (import 文がある名前は check_coherence 側の
+    束縛名収集で解決済み扱いになるため、他ファイルの実在有無は見ない)。
+    assembler/checker 未注入 or 結合失敗時は判定不能として空を返す。
+    """
+    if coherence_checker is None or assembler is None:
+        return []
+    try:
+        preview = assembler([*parts, code], module_stem=Path(source_path).stem)
+    except Exception:
+        return []
+    if not preview or not preview.strip():
+        return []
+    try:
+        return coherence_checker({source_path: preview})
+    except Exception:
+        return []
 
 
 def _deepen_context(spec: str) -> str:
@@ -516,19 +584,27 @@ _REVISION_ENTRY_MAX_CHARS = 3000
 # シグネチャ要約へ決定論的に縮退する (LLM 要約は使わない)。
 _PART_CONTEXT_MAX_CHARS = 16000
 
+# 単発 (非分割) コード生成 instruction に spec 全文をそのまま埋め込む上限。
+# 深化後 spec (module 1 節あたり最大 _DEEPEN_SECTION_MAX_CHARS) は複数モジュール
+# 構成で容易にこれを超えうる。超過時は _condensed_code_spec で圧縮する
+# (生成対象モジュール自身の節は全文保持、他モジュールは per-module cap)。
+_CODE_SPEC_MAX_CHARS = 20000
+_CODE_SPEC_HEAD_MAX_CHARS = 3000
+_CODE_SPEC_OTHER_MODULE_MAX_CHARS = 2500
+
 
 # 実行 OS 制約は synthesizer.os_constraint を共有する (planner/spec/code で
 # 同一文言を注入し、上流の設計決定と下流の制約が食い違わないようにする)。
 
 # spec.md / flowchart.md の prose 出力言語 (GUI の言語設定 = i18n locale に追従)。
 # 見出し (`## Module:` 等) は spec_parts の決定論パーサのアンカーなので英語構文の
-# まま固定し、prose のみ対象言語で書かせる。
-_PROSE_LANGUAGE_NAMES = {"ja": "Japanese", "en": "English"}
+# まま固定し、prose のみ対象言語で書かせる。マッピングの実体は共有ヘルパー
+# (synthesizer.py と同じ import パターン) に委譲し、独自再実装を避ける。
 
 
 def _prose_language() -> str:
     """成果物 prose の出力言語名 (生成時点の locale を反映)。"""
-    return _PROSE_LANGUAGE_NAMES.get(get_locale(), "English")
+    return prose_language_name(english=True)
 
 
 def _spec_language_constraint() -> str:
@@ -574,6 +650,25 @@ def _flow_language_constraint() -> str:
     return (
         f'\nWrite "label" and "condition" text in {_prose_language()}; keep '
         f"file paths, exception class names, and code identifiers as-is."
+    )
+
+
+def _code_language_constraint() -> str:
+    """実コード/テスト生成に注入する出力言語制約 (locale 追従)。
+
+    chat モードの write_file 全経路に注入される
+    ``meta_cognitive_utils.content_language_directive()`` と同じ原則
+    (コメント/docstring は locale、識別子・シグネチャ・契約名は英語のまま)
+    を staged pipeline のコード生成 (_build_code_instruction /
+    _build_part_instruction) とテスト生成 (advisory unit test の生成/修正)
+    にも適用する。
+    """
+    return (
+        f"\n\nWrite comments and docstrings in {_prose_language()} unless the "
+        f"user's request explicitly specifies another language. Keep class "
+        f"names, method/function names, signatures, types, imports, string "
+        f"literals that are data (e.g. keys, URLs, log format strings), and "
+        f"file paths unchanged (as declared in the design specification)."
     )
 
 
@@ -875,6 +970,14 @@ class StagedCodingExecutor:
     part_codegen: "CodegenDelegate | None" = None
     # (parts, *, module_stem) -> merged | None。module_stem は自己 import 除去用。
     part_assembler: "Callable[..., str | None] | None" = None
+    # 宣言済みコンポーネントチェック (_missing_declared_names) を通過した part
+    # に、spec 未宣言の幻覚識別子 (import も定義も無い bare name) が紛れ込んで
+    # いないかを補完検知する。EvorefGen の check_coherence を api 層で注入
+    # (loop→gen の越境回避、conformance_checker と同パターン)。未注入時は
+    # このチェックをスキップする (2026-07-24 実機で GameData/Contact_manager
+    # のような自発的な幻覚名が finalize 直前の advisory チェックまで
+    # すり抜けタイムアウトで未修正のまま出荷された問題への対策)。
+    coherence_checker: "Callable[[dict[str, str]], list[str]] | None" = None
     part_max_parts: int = 4
     event_bus: "LoopEventBus | None" = None
     debug_logger: "DebugLogger | None" = None
@@ -1030,6 +1133,21 @@ class StagedCodingExecutor:
                     final_spec = replaced
                     deepen_applied += 1
 
+                if self.debug_logger is not None:
+                    self.debug_logger.log_decision(
+                        decision_point="spec_deepen_outcome",
+                        chosen=("applied" if deepen_applied > 0 else "rejected_or_skipped"),
+                        candidates=["applied", "rejected_or_skipped"],
+                        reason=f"applied={deepen_applied} rejected={deepen_rejected}",
+                        context={
+                            "task_id": task.task_id,
+                            "module_count": len(module_paths),
+                            "deepen_applied": deepen_applied,
+                            "deepen_rejected": deepen_rejected,
+                        },
+                        scope="loop_iter",
+                    )
+
             # spec_text は task.description とは別の LLM 呼び出しの自由記述であり、
             # 与えたファイル一覧を忠実に再現する保証が無い。code タスクの
             # source_path と必ず一致する正準一覧を決定的に追記し、コード生成が
@@ -1071,6 +1189,17 @@ class StagedCodingExecutor:
             "llm", "llm_retry", "llm_repaired", "llm_retry_repaired", "parts",
             "fallback",
         )
+        if self.flowchart_enabled and self.debug_logger is not None:
+            self.debug_logger.log_decision(
+                decision_point="flow_spec_synthesis_path",
+                chosen=flow_source,
+                candidates=[
+                    "llm", "llm_retry", "llm_repaired", "llm_retry_repaired",
+                    "parts", "fallback", "none", "error",
+                ],
+                context={"task_id": task.task_id, "module_count": len(module_paths)},
+                scope="loop_iter",
+            )
 
         wf = self.workspace.write_spec(final_spec, task_id=task.task_id)
         self.workspace.upsert_task(
@@ -1393,7 +1522,16 @@ class StagedCodingExecutor:
         self, description: str, source_path: str, spec: str, flowchart: str,
     ) -> str:
         """単一ファイル生成の instruction を組み立てる (code 工程と spec 見直し後の
-        再生成で共有。spec 全文・flowchart・兄弟 API を無改変で運ぶ)。"""
+        再生成で共有。spec 全文・flowchart・兄弟 API を無改変で運ぶ)。
+
+        spec が ``_CODE_SPEC_MAX_CHARS`` を超える場合 (深化後の複数モジュール
+        構成で起こりうる) は :func:`_condensed_code_spec` で圧縮する。単一
+        メッセージ (system+user) の instruction は
+        ``local_client._enforce_context_budget`` の位置ベース中略に落ちる前に
+        ここで生成対象モジュール自身の節を優先温存する。
+        """
+        if len(spec) > _CODE_SPEC_MAX_CHARS:
+            spec = _condensed_code_spec(spec, source_path)
         flow_block = (
             f"## Module architecture diagram\n```mermaid\n{flowchart}\n```\n\n"
             if flowchart.strip() else ""
@@ -1419,6 +1557,7 @@ class StagedCodingExecutor:
             f"(e.g. if a field is specified as holding `int` values, it must "
             f"hold real `int`s, not `bool`). Output only this file's code."
             + os_constraint()
+            + _code_language_constraint()
         )
 
     async def _run_code(self, task: "TaskFactView") -> ExecutionOutcome:
@@ -1560,6 +1699,7 @@ class StagedCodingExecutor:
             f"mechanically checked against the declared signatures and "
             f"non-conforming code is rejected."
             + os_constraint()
+            + _code_language_constraint()
         )
 
     async def _generate_in_parts(
@@ -1607,7 +1747,22 @@ class StagedCodingExecutor:
                     # バック (欠落 component は結合後 smoke で検出できない)。
                     missing = _missing_declared_names(group.spec_text, code)
                     if not missing:
-                        break
+                        undeclared = _undeclared_part_names(
+                            self.coherence_checker, self.part_assembler,
+                            parts, code, source_path,
+                        )
+                        if not undeclared:
+                            break
+                        last_err = (
+                            "part introduces undeclared name(s): "
+                            + ", ".join(undeclared)
+                        )
+                        logger.warning(
+                            "part %d/%d for %s %s; retrying",
+                            i, n, source_path, last_err,
+                        )
+                        code = ""
+                        continue
                     last_err = (
                         "part lacks declared component(s): "
                         + ", ".join(missing)
@@ -1943,6 +2098,7 @@ class StagedCodingExecutor:
                 f"functions, and do NOT shrink the program to a stub. "
                 f"Output only the corrected `{source_path}` code."
                 + _NO_PROSE_OUTPUT_CONSTRAINT
+                + _code_language_constraint()
             )
             fixed = await self._safe_codegen(repair_instr, source_path)
             wrote = self._apply_source_fixes(fixed, source_path, task.task_id)
@@ -2097,6 +2253,7 @@ class StagedCodingExecutor:
             f"not merely that attributes exist.\n"
             f"Output only the test file's code."
             + _NO_PROSE_OUTPUT_CONSTRAINT
+            + _code_language_constraint()
         )
         test_files, codegen_error = await self._codegen_or_error(gen_instr, test_logical)
         test_code = _pick_primary(test_files, test_logical)
@@ -2132,6 +2289,7 @@ class StagedCodingExecutor:
                 f"import them from `{stem}`). At least one `def test_...` with asserts. "
                 f"Output only the test file's code."
                 + _NO_PROSE_OUTPUT_CONSTRAINT
+                + _code_language_constraint()
             )
             regen_code = _pick_primary(
                 await self._safe_codegen(fix_instr, test_logical), test_logical,
@@ -2565,6 +2723,7 @@ class StagedCodingExecutor:
                 f"src symbols; import them from `{stem}`). At least one "
                 f"`def test_...` with asserts. Output only the test file's code."
                 + _NO_PROSE_OUTPUT_CONSTRAINT
+                + _code_language_constraint()
             )
             regen_code = _pick_primary(
                 await self._safe_codegen(fix_instr, test_logical), test_logical,

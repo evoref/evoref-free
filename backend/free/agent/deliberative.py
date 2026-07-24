@@ -17,6 +17,9 @@ from backend.free.agent.meta_cognitive_utils import (
 )
 from backend.free.agent.tool_call_judge import ToolCallJudge, ToolJudgement
 from backend.free.agent.tool_result_digest import digest_tool_result
+from backend.free.agent.tools.builtin import (
+    _check_path_traversal as check_builtin_path_traversal,
+)
 from backend.free.core.session_mode import is_coding_mode
 from backend.config import resolve_context_size_for_mode
 from backend.free.api.chat.chat_constants import (
@@ -59,23 +62,16 @@ _SEARCH_HISTORY_NO_INFO_GUIDANCE = (
 
 
 def _check_path_traversal(file_path: str, tool_name: str) -> str | None:
-    """write_file / read_file のパス検証。違反時はエラーメッセージを返す。
+    """write_file / read_file のパス検証 (LLM 生成コンテンツ生成前の fail-fast)。
 
-    `..` セグメントを含むパスを拒否することでワークスペース外への
-    アクセスを防止する。検査対象外なら ``None``。
+    実体は ``backend.free.agent.tools.builtin._check_path_traversal`` に集約
+    済み (builtin.write_file/read_file 自体もこれを呼ぶため二重防御になる)。
+    ここでは無駄な ``_ensure_write_file_content`` (LLM 呼出し) を避けるため
+    早期に同じ検証を行う。
     """
-    if not file_path or tool_name not in ("write_file", "read_file"):
+    if tool_name not in ("write_file", "read_file"):
         return None
-    try:
-        normalized = file_path.replace("\\", "/")
-        if ".." in normalized.split("/"):
-            logger.warning(
-                "Path traversal detected in tool args: %s", file_path,
-            )
-            return f"Error: path traversal not allowed: {file_path}"
-    except (AttributeError, TypeError):
-        pass
-    return None
+    return check_builtin_path_traversal(file_path)
 
 
 def _emit_tool_running_step(

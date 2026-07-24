@@ -2414,12 +2414,19 @@ async def stream_staged_coding(
     timer: StageTimer | None = None,
     private: bool = False,
     keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL_SEC,
+    prefetched_rag: list[tuple[str, float, str]] | None = None,
+    file_context_block: str | None = None,
 ) -> AsyncIterator[str]:
     """専用 LoopDriver をインライン駆動し spec→code→test を実行してストリームする。
 
     タスクグラフ合成が空 (assist degraded 等) のときは ``fallback_factory`` が返す
     従来 longform ストリームへ委譲する。``part_codegen`` (部分ごと生成向けの別予算
     delegate) が渡されたときのみ部分生成→決定論結合経路を有効化する。
+
+    ``prefetched_rag``/``file_context_block`` は spec/code 生成プロンプトへは
+    注入しない (f_10 §9 の非可逆な再合成 LLM パスを避ける方針)。Level 0 経験
+    記録の rag_used/rag_top1_score シグナルと staged_coherence ログの可観測性
+    のみに使う (longform 経路と record 粒度を揃える)。
     """
     from uuid import uuid4
 
@@ -2503,6 +2510,7 @@ async def stream_staged_coding(
         StagedTestRunner(
             workspace=ws,
             test_timeout_sec=float(staged_cfg.get("test_timeout_sec", 120.0)),
+            debug_logger=state.debug_logger,
         )
         if staged_cfg.get("test_stage_enabled", True) else None
     )
@@ -2570,17 +2578,19 @@ async def stream_staged_coding(
         max_spec_revision_rounds=int(staged_cfg.get("max_spec_revision_rounds", 1)),
         part_codegen=part_codegen,
         part_assembler=part_assembler,
+        coherence_checker=check_coherence,
         part_max_parts=int(staged_cfg.get("part_max_parts", 4)),
         event_bus=event_bus,
         debug_logger=state.debug_logger,
     )
     artifact_hook = make_loop_artifact_hook(_staged_view)
     max_iter = int(staged_cfg.get("max_iterations", 60))
+    staged_total_timeout_sec = float(staged_cfg.get("total_timeout_sec", 2400.0))
     driver = LoopDriver(
         view_provider=_staged_view,
         executor=executor,
         max_iterations=max_iter,
-        max_wall_time_sec=float(staged_cfg.get("total_timeout_sec", 2400.0)),
+        max_wall_time_sec=staged_total_timeout_sec,
         # モジュールは互いに独立。1 モジュールの失敗で全体を打ち切らないよう
         # 連続失敗での abort を実質無効化する (max_iterations / 総時間で有界)。
         max_consecutive_failures=max_iter,
@@ -2596,8 +2606,22 @@ async def stream_staged_coding(
         driver.run(_STAGED_PROJECT_ID), name="staged_coding.run",
     )
     last_ka = time.monotonic()
+    timed_out = False
     try:
         while True:
+            # LoopDriver.run() 自身の wall-time チェックはイテレーション間の協調的
+            # チェックのみで、実行中の単一タスク (await executor.execute(task)) を
+            # 打ち切れない。ここで run_task 自体をハード打ち切りすることで、
+            # meta_cognitive.py の asyncio.wait_for(total_timeout) 相当の強制締切を
+            # staged 側にも持たせる。
+            if time.monotonic() - t_start >= staged_total_timeout_sec:
+                logger.warning(
+                    "staged coding: hard wall-time cutoff reached (%.0fs); "
+                    "cancelling run_task",
+                    staged_total_timeout_sec,
+                )
+                timed_out = True
+                break
             try:
                 evt = await asyncio.wait_for(queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
@@ -2624,12 +2648,23 @@ async def stream_staged_coding(
         except Exception as exc:
             logger.warning("staged coding run task failed: %s", exc)
 
+    if timed_out:
+        yield sse.step({
+            "type": "task_result",
+            "detail": (
+                f"⏱ タイムアウト ({staged_total_timeout_sec:.0f}秒) のため打ち切りました。"
+                f"生成済みの成果物のみ配信します。"
+            ),
+            "status": "failed",
+        })
+
     async for frame in _finalize_staged_stream(
         ws=ws, state=state, query=query, messages=messages,
         session_id=session_id, instance_name=instance_name,
         context_size=context_size, output_target=output_target,
         timer=timer, t_start=t_start, private=private,
         smoke_timeout=smoke_timeout,
+        prefetched_rag=prefetched_rag, file_context_block=file_context_block,
     ):
         yield frame
 
@@ -2652,6 +2687,8 @@ async def _finalize_staged_stream(
     t_start: float,  # noqa: ARG001
     private: bool,
     smoke_timeout: float = 120.0,
+    prefetched_rag: list[tuple[str, float, str]] | None = None,
+    file_context_block: str | None = None,
 ) -> AsyncIterator[str]:
     """staged 終端: 生成物を集約し output_target 別に配信 + token_info/done。"""
     if timer:
@@ -2700,6 +2737,8 @@ async def _finalize_staged_stream(
                 "coherence_issues": runnability_issues[:20],
                 "tasks_failed": tasks_failed,
                 "pytest_unpassed_count": pytest_unpassed,
+                "had_prefetched_rag": bool(prefetched_rag),
+                "had_file_context": bool(file_context_block),
             })
         except Exception as exc:
             logger.debug("staged coherence long_form log failed: %s", exc)
@@ -2745,9 +2784,11 @@ async def _finalize_staged_stream(
         "strategy": "staged",
     }
     try:
+        _staged_rag_used, _staged_rag_top1 = rag_signals_from_chunks(prefetched_rag)
         record_long_form_response(
             state, assembled, messages, session_id, query, "coding",
             _estimate_tokens(assembled), staged_metrics, private=private,
+            rag_used=_staged_rag_used, rag_top1_score=_staged_rag_top1,
         )
     except Exception as exc:
         logger.warning("staged: record_long_form_response failed: %s", exc)

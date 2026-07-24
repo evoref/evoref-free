@@ -83,6 +83,9 @@ def calculate(expression: str) -> str:
 
 def read_file(file_path: str) -> str:
     """ファイルの内容を読み込む"""
+    traversal_error = _check_path_traversal(file_path)
+    if traversal_error:
+        return traversal_error
     p = Path(file_path)
     if not p.exists():
         return f"Error: File not found: {file_path}"
@@ -277,6 +280,28 @@ def _write_rich_document(p: Path, content: str) -> str:
         return f"Error: {e}"
 
 
+def _check_path_traversal(file_path: str) -> str | None:
+    """``..`` セグメントを含む相対パス指定を拒否する。
+
+    write_file / read_file 共通のガード。LLM が意図しない (幻覚・プロンプト
+    インジェクション由来の) ``..`` を含むパスを発行し、呼び出し元が想定した
+    範囲外のファイルを書き換え/読み出ししてしまう事故を防ぐ。本ツールには
+    固定のワークスペースルート概念が無い (ユーザーが任意の絶対パスを指定して
+    書き込む用途を意図的にサポートしている) ため、絶対パス自体は許可し
+    ``..`` 相対脱出のみを検査対象とする。
+    """
+    if not file_path:
+        return None
+    try:
+        normalized = file_path.replace("\\", "/")
+        if ".." in normalized.split("/"):
+            logger.warning("Path traversal detected in tool args: %s", file_path)
+            return f"Error: path traversal not allowed: {file_path}"
+    except (AttributeError, TypeError):
+        pass
+    return None
+
+
 def write_file(file_path: str, content: str) -> str:
     """ファイルに書き込む
 
@@ -290,6 +315,9 @@ def write_file(file_path: str, content: str) -> str:
     ``.docx`` 等のリッチ文書形式 (``_EXPORT_DOC_EXTS``) は export フレームワーク
     経由で実体を生成する。それ以外は UTF-8 テキストとして書き込む。
     """
+    traversal_error = _check_path_traversal(file_path)
+    if traversal_error:
+        return traversal_error
     p = Path(file_path)
     if p.is_dir():
         return (
