@@ -885,6 +885,7 @@ async def _dispatch_staged_coding(
             codegen=codegen, part_codegen=part_codegen,
             fallback_factory=_fallback_factory,
             timer=timer, private=req.private,
+            prefetched_rag=prefetched_rag, file_context_block=file_context_block,
         ))),
         media_type="text/event-stream",
     )

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.free.learning.level1_session import PriorityRequest
+from backend.io import atomic_write_text
 from backend.log_config import get_logger
 
 logger = get_logger("learning.learning_state_store")
@@ -136,11 +137,17 @@ class LearningStateStore:
 
     @staticmethod
     def save(state: LearningState, path: str | Path) -> None:
-        """`state` を JSON ファイルに書き出す。親ディレクトリは自動作成。"""
+        """`state` を JSON ファイルに書き出す。親ディレクトリは自動作成。
+
+        Level 1 (`_save_state`) と Level 2 (`record_level2_run`) がそれぞれ独立に
+        同一ファイルへ書き戻すため、書込み途中のクラッシュや同時読み出しで壊れた
+        (truncate された) ファイルを見せないよう原子的に書き込む。
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         data = LearningStateStore.serialize(state)
-        path.write_text(
+        atomic_write_text(
+            path,
             json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )

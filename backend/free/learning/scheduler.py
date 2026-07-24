@@ -1398,6 +1398,10 @@ class LearningScheduler:
                 f"Not enough experiences: {len(safe_exp)} < {self.min_experiences}"
             )
 
+        # create_task 直後ではなくタスク実行開始 (_run_level1 内) まで _running が
+        # False のままになる TOCTOU レースを防ぐため、起動確定と同時に同期的に
+        # セットする (_run_level1 内の再設定は冪等で、直接呼出経路の安全のため残す)。
+        self._running = True
         self._task = asyncio.create_task(
             self._run_level1(safe_exp, llm_client)
         )

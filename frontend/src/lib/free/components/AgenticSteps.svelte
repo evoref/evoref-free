@@ -18,6 +18,9 @@
 		!$isStreaming && steps.length > 0 && steps.every((s) => s.status === 'done')
 	);
 
+	/** 長文生成のいずれかのユニットが失敗/打ち切りだったか (完了ラベルの出し分け用) */
+	let hasFailedResult = $derived(results.some((r) => r.status === 'failed'));
+
 	function formatElapsed(ms?: number): string {
 		if (ms == null) return '';
 		return (ms / 1000).toFixed(1);
@@ -31,10 +34,18 @@
 {#if progress || (showMode !== 'hidden' && (steps.length > 0 || results.length > 0 || showSpinner))}
 	<div class="agentic-steps">
 		{#if progress}
-			<div class="lf-progress" class:done={progress.done && !$isStreaming}>
-				<span class="lf-icon">{progress.done && !$isStreaming ? '✓' : '⚙'}</span>
+			<div
+				class="lf-progress"
+				class:done={progress.done && !$isStreaming && !hasFailedResult}
+				class:failed={!$isStreaming && hasFailedResult}
+			>
+				<span class="lf-icon">
+					{#if $isStreaming}⚙{:else if hasFailedResult}⚠{:else}✓{/if}
+				</span>
 				{#if $isStreaming}
 					{$t('chat.long_form_progress', { current: progress.current, total: progress.total, label: progress.label })}
+				{:else if hasFailedResult}
+					{$t('chat.long_form_incomplete', { total: progress.total })}
 				{:else}
 					{$t('chat.long_form_done', { total: progress.total })}
 				{/if}
@@ -112,6 +123,10 @@
 	}
 	.lf-progress.done {
 		color: var(--text-secondary);
+		font-weight: normal;
+	}
+	.lf-progress.failed {
+		color: #ef4444;
 		font-weight: normal;
 	}
 	.lf-icon {

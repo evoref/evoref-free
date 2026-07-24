@@ -137,6 +137,18 @@ class AssistJudgeUsageTracker:
             self._session_counts[key] = new_count
             return new_count
 
+    def refund(self, session_id: str, namespace: str) -> int:
+        """``record`` を取り消す (0 未満にはしない)。戻り値は取消後の累計。
+
+        タイムアウト等のインフラ的失敗で判定が完了しなかった場合、事前に
+        ``record`` した予約分を呼出元が払い戻すために使う。
+        """
+        with self._lock:
+            key = (session_id, namespace)
+            new_count = max(0, self._session_counts.get(key, 0) - 1)
+            self._session_counts[key] = new_count
+            return new_count
+
     def reset_session(self, session_id: str) -> None:
         """セッション切替時に全 namespace のカウンタをクリアする。"""
         with self._lock:

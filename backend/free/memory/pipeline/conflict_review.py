@@ -26,6 +26,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import httpx
+
 from backend.free.memory.pipeline.semantic_conflict_resolver import (
     CONFLICTS_PENDING_FILENAME,
     CONFLICTS_RESOLVED_FILENAME,
@@ -453,6 +455,11 @@ async def judge_user_reply(
     回答でない / 応答が壊れている / 例外時はすべて ``None`` (= no-op)。
     アシストが json_schema grammar を強制しないモデル (LFM2 系) でも
     安全なよう、消費側で多段バリデーションする。
+
+    タイムアウト (``httpx.TimeoutException`` / ``TimeoutError``) はインフラ的
+    失敗であり「ユーザーが競合に回答しなかった」とは意味が異なるため、
+    呼出元 (``chat_service.maybe_resolve_pending_conflicts``) がセッション cap
+    を消費しない判断ができるよう再送出する。
     """
     if assist_client is None or not groups:
         return None
@@ -472,6 +479,8 @@ async def judge_user_reply(
             max_tokens=192,
             temperature=0.0,
         )
+    except (httpx.TimeoutException, TimeoutError):
+        raise
     except Exception as exc:
         logger.warning("conflict_chat_judge failed: %s", exc)
         return None

@@ -30,6 +30,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from backend.free.harness.action import RunCommandAction
 from backend.free.loop.action_runner import ActionRunner, ActionRunnerConfig
@@ -37,6 +38,9 @@ from backend.free.loop.quality_gate import GateResult
 from backend.free.loop.staged.workspace import WorkspaceManager, _safe_rel
 from backend.io.atomic import AtomicWriter
 from backend.log_config import get_logger
+
+if TYPE_CHECKING:
+    from backend.debug_logger import DebugLogger
 
 logger = get_logger("loop.staged.test_runner")
 
@@ -72,11 +76,14 @@ class StagedTestRunner:
         workspace: 対象 :class:`WorkspaceManager`。
         test_timeout_sec: pytest サブプロセスのタイムアウト。
         python_exe: 使用する python 実行ファイル (既定: 現行インタプリタ)。
+        debug_logger: pytest 不合格時の詳細 (stdout/stderr tail) を
+            ``long_form.jsonl`` へ構造化記録する (任意)。
     """
 
     workspace: WorkspaceManager
     test_timeout_sec: float = 120.0
     python_exe: str = field(default_factory=lambda: sys.executable or "python")
+    debug_logger: "DebugLogger | None" = None
 
     def _ensure_bootstrap(self) -> None:
         conftest = self.workspace.path("conftest.py")
@@ -147,7 +154,7 @@ class StagedTestRunner:
                 out, self._src_stems(), self._internal_names(),
             )
             if env_dep:
-                return GateResult(
+                gate = GateResult(
                     name="staged_pytest",
                     ok=False,
                     skipped=True,
@@ -158,7 +165,9 @@ class StagedTestRunner:
                     error=summary,
                     skip_reason=f"外部依存 '{env_dep}' が未インストール (環境要因)",
                 )
-        return GateResult(
+                self._log_gate_result(gate, test_logical_path)
+                return gate
+        gate = GateResult(
             name="staged_pytest",
             ok=ok,
             skipped=False,
@@ -168,6 +177,31 @@ class StagedTestRunner:
             stderr_tail=result.error or "",
             error=None if ok else summary,
         )
+        self._log_gate_result(gate, test_logical_path)
+        return gate
+
+    def _log_gate_result(self, gate: GateResult, test_logical_path: str) -> None:
+        """pytest 不合格時のみ詳細 (stdout/stderr tail) を JSONL へ記録する。
+
+        合格時は manifest 側 (record_test_result) に残るため、ここでは
+        develop=investigate/evolve での障害解析に要る不合格ケースに絞る。
+        """
+        if gate.ok or self.debug_logger is None:
+            return
+        try:
+            self.debug_logger.log_long_form_event({
+                "phase": "staged_test",
+                "test_logical_path": test_logical_path,
+                "ok": gate.ok,
+                "skipped": gate.skipped,
+                "returncode": gate.returncode,
+                "error": gate.error,
+                "skip_reason": gate.skip_reason,
+                "stdout_tail": (gate.stdout_tail or "")[-2000:],
+                "stderr_tail": (gate.stderr_tail or "")[-2000:],
+            })
+        except Exception as exc:
+            logger.debug("staged test gate result log failed: %s", exc)
 
     def _src_stems(self) -> set[str]:
         """生成 src のモジュール stem 集合 (欠落依存の環境要因判定用)。

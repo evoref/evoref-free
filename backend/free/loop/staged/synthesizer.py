@@ -408,7 +408,7 @@ async def synthesize_coding_task_graph(
     project_id: str,
     assist_client: "AssistModelClient | None",
     include_tests: bool = True,
-    debug_logger: "DebugLogger | None" = None,  # noqa: ARG001
+    debug_logger: "DebugLogger | None" = None,
 ) -> list[SemanticFact]:
     """コーディング要求を spec/code/test の task ファクト群へ分解する。
 
@@ -418,16 +418,35 @@ async def synthesize_coding_task_graph(
         assist_client: アシストモデル。``None`` (degraded) なら ``[]`` を返す。
         include_tests: ``False`` なら test 工程を生成しない (config の
             ``coding.staged.test_stage_enabled=false`` 用)。
-        debug_logger: 任意。
+        debug_logger: chat モードの meta_cognitive_llm_route と同種の
+            assist 利用可否判定を ``coding_task_graph_synthesis_path`` として
+            構造化記録する (任意)。
 
     Returns:
         spec → code* → test* の順に並んだ ``task`` 型 SemanticFact リスト
         (まだストアには追加されていない)。アシスト未接続 / 解析失敗 /
         モジュール 0 件 の場合は ``[]`` (= 呼出側で longform へフォールバック)。
     """
+    _candidates = ["assist_synthesis", "assist_unavailable_fallback"]
     if assist_client is None:
         logger.info("synthesize_coding_task_graph: assist_client is None — fallback")
+        if debug_logger is not None:
+            debug_logger.log_decision(
+                decision_point="coding_task_graph_synthesis_path",
+                chosen="assist_unavailable_fallback",
+                candidates=_candidates,
+                reason="assist_client_unavailable",
+                scope="loop_iter",
+            )
         return []
+    if debug_logger is not None:
+        debug_logger.log_decision(
+            decision_point="coding_task_graph_synthesis_path",
+            chosen="assist_synthesis",
+            candidates=_candidates,
+            reason="assist_client_available",
+            scope="loop_iter",
+        )
     if not project_id:
         raise ValueError("project_id must be non-empty")
 

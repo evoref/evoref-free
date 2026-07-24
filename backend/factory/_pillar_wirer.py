@@ -1101,8 +1101,14 @@ def _wire_sleep_scheduler_models(
 ) -> None:
     """7g (前半). SleepTimeScheduler に LLM クライアント / モデルパスを設定"""
     # SleepTimeScheduler にベースモデル（フォールバック用）とアシストモデル（優先）を設定
-    if state.local_client:
-        sleep_scheduler.set_llm_client(state.local_client)
+    # is_user_active() の協調 yield 判定は chat_in_flight()/in_flight_chat_count を
+    # 持つ LLMClient ファサード (state.llm_client) 前提。生の LocalClient
+    # (state.local_client) にはこの属性が無くgetattrデフォルト(0)に落ちるため、
+    # フォアグラウンド生成中でも Level1/Level2 の yield ゲートが機能しなかった
+    # (2026-07-24 実機検証で判明、staged coding 実行中も Level2 real-eval が
+    # 抑止されず本番 llama-server とリソース競合していた)。
+    if state.llm_client:
+        sleep_scheduler.set_llm_client(state.llm_client)
 
     # アシストモデルクライアントを設定（§5.5.2: sleep-time はアシストモデル優先）
     if state.assist_client:
