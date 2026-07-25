@@ -14,7 +14,7 @@ class WorkingMemory:
 
     def __init__(self, config: dict):
         mem = config.get("memory", {})
-        self.max_turns: int = mem.get("working_max_turns", 10)
+        self.max_turns: int = mem.get("working_max_turns", 30)
         self.max_tokens: int = mem.get("working_max_tokens", 2048)
         self.turns: list[dict] = []
         self.active_notes: list[str] = []
@@ -33,6 +33,7 @@ class WorkingMemory:
         tool_command: str | None = None,
         tool_command_name: str | None = None,
         tool_command_success: bool | None = None,
+        tool_command_source: str | None = None,
     ) -> None:
         """ターンを追加し、トークン上限を超えたら圧縮・押し出し
 
@@ -70,6 +71,8 @@ class WorkingMemory:
             turn["tool_command_name"] = tool_command_name
         if tool_command_success is not None:
             turn["tool_command_success"] = tool_command_success
+        if tool_command_source is not None:
+            turn["tool_command_source"] = tool_command_source
         self.turns.append(turn)
         self._enforce_limits()
 

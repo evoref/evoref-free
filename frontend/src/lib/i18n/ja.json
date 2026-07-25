@@ -20,6 +20,7 @@
 		"long_form_done": "生成 完了 ({total} ユニット)",
 		"long_form_incomplete": "生成 打ち切り ({total} ユニット中一部未完了)",
 		"agentic_step_elapsed": "{elapsed}s",
+		"search_history_no_match": "search_history: 過去の会話に該当なし",
 		"step_complete": "✓ {detail}",
 		"rag_hits": "RAG検索: {count}件ヒット",
 		"sufficiency_ok": "十分性判定: OK",
@@ -37,7 +38,8 @@
 		"cancel": "キャンセル",
 		"cancelled": "生成を中断しました",
 		"code_in_editor": "→ エディタに出力しました（{lang}）",
-		"code_output_done": "完了しました"
+		"code_output_done": "完了しました",
+		"long_form_quality_issue": "生成 完了 ({total} ユニット) — 品質チェックで要確認"
 	},
 	"sidebar": {
 		"chat": "チャット",

@@ -219,12 +219,14 @@ modes:
     temperature: 0.7                # 生成温度（0.0〜2.0）— 高いほど多様な応答
     top_p: 0.9                      # Top-P サンプリング（0.0〜1.0）
     top_k: 40                       # Top-K サンプリング（0=無効、1〜1000）
-    presence_penalty: 0.0           # 存在ペナルティ（-2.0〜2.0）— 正で話題の多様性を促進
+    presence_penalty: 0.0           # 存在ペナルティ（-2.0〜2.0）— 一度出た語を一律に抑制するため日本語では 0.0 推奨
+    frequency_penalty: 0.3          # 頻度ペナルティ（-2.0〜2.0）— 出現回数に比例して抑制。0.0 だと同一句の暴走反復が止まらない
   coding:
     temperature: 0.3                # コーディングは低温度で正確性重視
     top_p: 0.95                     # やや高めで十分な候補を確保
     top_k: 20                       # 低めで的確なトークン選択
     presence_penalty: 0.0           # コーディングではペナルティなし
+    frequency_penalty: 0.0          # コードは同一トークンの反復が正当なため抑制しない
 
 # ===== CLI 設定 =====
 # CLI が FastAPI バックエンドに HTTP リクエストを送る際のタイムアウト (秒)。
@@ -611,7 +613,8 @@ memory:
     # 回答を assist (conflict_chat_judge) で判定して即時解決する。
     chat_review:
       enabled: true                                            # false で注入・判定とも停止
-      max_groups: 0                                            # 注入グループ上限 (0=無制限、超過分は件数のみ要約)
+      max_groups: 3                                            # 注入グループ上限 (0=無制限、超過分は件数のみ要約)
+      max_tokens: 400                                          # ブロック全体のトークン上限 (0=無制限、最低1グループは必ず注入)
       # conflict_chat_judge (assist) のセッション内発火上限。上限到達後は同一
       # セッションでの判定と pending 注入を停止する (滞留 pending が毎ターン
       # realtime スロットを専有するのを防ぐ)。0 = 無制限。
@@ -623,10 +626,12 @@ memory:
   injection:
     chat_budget_tokens: 800                                    # チャットモードの注入予算 (tokens)
     coding_budget_tokens: 2000                                 # コーディングモードの注入予算 (tokens)
+    relevance_enabled: true                                    # クエリ埋め込みとの関連度で注入候補を足切りする
+    relevance_min_score: 0.35                                  # 関連度ゲートのコサイン類似度閾値 (pinned は常に通過)
     tier_ratios:
       chat: [0.40, 0.35, 0.15, 0.10]                           # Tier 1〜4 比率 (合計 1.0)
       coding: [0.40, 0.35, 0.15, 0.10]                         # Tier 1〜4 比率 (合計 1.0)
-  working_max_turns: 10           # ワーキングメモリの最大ターン数
+  working_max_turns: 30           # ワーキングメモリの最大ターン数 (ハード上限。通常は下の token 側で縮退させる)
   working_max_tokens: 2048        # ワーキングメモリの最大トークン数
   # 推奨: 512〜(context_size * 0.6) の範囲で設定
   # | context_size | 上限目安 | 推奨値 |

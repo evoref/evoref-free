@@ -18,6 +18,7 @@ from backend.free.agent.meta_cognitive_utils import (
 from backend.free.agent.tool_call_judge import ToolCallJudge, ToolJudgement
 from backend.free.agent.tool_result_digest import digest_tool_result
 from backend.free.agent.tools.builtin import (
+    SEARCH_HISTORY_NO_RESULTS_PREFIX,
     _check_path_traversal as check_builtin_path_traversal,
 )
 from backend.free.core.session_mode import is_coding_mode
@@ -61,6 +62,14 @@ _SEARCH_HISTORY_NO_INFO_GUIDANCE = (
 )
 
 
+def _is_search_history_empty(tool_name: str, result_text: str) -> bool:
+    """search_history が 1 件もヒットしなかった結果か判定する (純粋関数)。"""
+    return (
+        tool_name == "search_history"
+        and result_text.startswith(SEARCH_HISTORY_NO_RESULTS_PREFIX)
+    )
+
+
 def _check_path_traversal(file_path: str, tool_name: str) -> str | None:
     """write_file / read_file のパス検証 (LLM 生成コンテンツ生成前の fail-fast)。
 
@@ -91,17 +100,29 @@ def _emit_tool_running_step(
 def _emit_tool_result_step(
     on_step: StepCallback, tool_name: str, result_text: str,
 ) -> None:
-    """ツール正常完了 (`task_result`) の step フレームを emit する。"""
+    """ツール実行完了 (`task_result`) の step フレームを emit する。
+
+    ツールラッパが例外を投げなくても、走ったコマンド自身が失敗していることが
+    ある (``run_command`` は非ゼロ終了時に ``[exit code: N]`` を付けて stderr を
+    戻り値として返す)。この経路を無条件に ``status="done"`` にしていたため、
+    UI が Traceback を ✓ で表示していた (実測 2026-07-25: 存在しない
+    ``platform.cpu_count`` を呼んだ合成コマンドが ✓ 表示)。
+    学習シグナル (``tool_command_success``) と同じ判定を使って揃える。
+    """
     if on_step is None:
         return
+    failed = is_tool_error(result_text) or (
+        tool_name in ("run_command", "run_command_readonly")
+        and command_run_failed(result_text)
+    )
     logger.debug(
-        "Tool result step: tool=%s, result=%s",
-        tool_name, result_text[:120],
+        "Tool result step: tool=%s, failed=%s, result=%s",
+        tool_name, failed, result_text[:120],
     )
     on_step({
         "type": "task_result",
         "detail": f"{tool_name}: {result_text[:100]}",
-        "status": "done",
+        "status": "failed" if failed else "done",
     })
 
 
@@ -130,6 +151,9 @@ class DeliberativeResponse:
     # executable command 学習用 (run_command 実行ターンのみ非 None)
     tool_command: str | None = None
     tool_command_success: bool | None = None
+    # 判定層 ("rule" / "assist" / "recall" ...)。sleep 側の
+    # executable_command_curator が "recall" 由来の実行を学習対象から外すために使う。
+    tool_command_source: str | None = None
 
 
 class DeliberativeAgent:
@@ -268,7 +292,7 @@ class DeliberativeAgent:
         on_step: StepCallback,
         tool_judge_task: "asyncio.Task | None" = None,
         session_id: str = "",
-    ) -> tuple[str | None, str | None, str | None, bool | None]:
+    ) -> tuple[str | None, str | None, str | None, bool | None, str | None]:
         """ツール判定 → 実行 → messages へのツール結果注入を一括で行う。
 
         ``tool_judge_task`` が渡された場合は chat() が先行起動した tool 判定
@@ -288,7 +312,7 @@ class DeliberativeAgent:
             # 判定経路が無いなら precomputed タスクも使えない。残っていれば破棄。
             if tool_judge_task is not None and not tool_judge_task.done():
                 tool_judge_task.cancel()
-            return None, None, None, None
+            return None, None, None, None, None
 
         if tool_judge_task is not None:
             try:
@@ -309,7 +333,7 @@ class DeliberativeAgent:
                 session_id=session_id,
             )
         if not (judgement.tool_needed and judgement.tool_name):
-            return None, None, None, None
+            return None, None, None, None, None
 
         command = None
         if isinstance(judgement.tool_args, dict):
@@ -322,11 +346,32 @@ class DeliberativeAgent:
         if tool_result_text is None:
             # 実行されたが結果 None (失敗)。command は penalize 用に返す。
             self._record_tool_call_outcome(query, judgement, False, mode=mode)
-            return None, judgement.tool_name, command, False
+            return None, judgement.tool_name, command, False, judgement.source
 
         # ツール結果を assist で query 連動抽出し、base 文脈には digest を注入して
         # 弱い base の接地負荷を下げる。抽出不能/assist 不在時は raw へ退避 (現挙動)。
         # 戻り値の tool_result_text(raw) は UI 表示用にそのまま保つ。
+        if _is_search_history_empty(judgement.tool_name, tool_result_text):
+            # 空振りと分かっている結果を assist に要約させても得られるのは
+            # 「関連情報なし」の確定だけで、アシスト 1 往復 (実測 1〜2 秒) が
+            # 丸ごと無駄になる。実測 2026-07-25 のライブ検証では search_history
+            # 11 回中 7 回が空振りだった。判定を code 側で先に済ませ、
+            # _SEARCH_HISTORY_NO_INFO_GUIDANCE へ直結する
+            # (assist 不在・タイムアウトで digest が None に落ちると raw が
+            # 「唯一の事実根拠」枠で base に渡り、進行中の会話履歴まで否定
+            # させてしまう経路を塞ぐ効果も兼ねる)。
+            prompt_result_text = _NO_RELEVANT_INFO_MESSAGE
+            self._append_tool_result_to_last_user(
+                messages, judgement.tool_name, prompt_result_text, query=query,
+            )
+            logger.info(
+                "Tool executed: %s, result_length=%d, source=%s, success=True "
+                "(empty result: digest skipped)",
+                judgement.tool_name, len(tool_result_text), judgement.source,
+            )
+            self._record_tool_call_outcome(query, judgement, True, mode=mode)
+            return tool_result_text, judgement.tool_name, command, True, judgement.source
+
         digest = await digest_tool_result(
             self._assist_client,
             query=query,
@@ -365,7 +410,7 @@ class DeliberativeAgent:
             success,
         )
         self._record_tool_call_outcome(query, judgement, success, mode=mode)
-        return tool_result_text, judgement.tool_name, command, success
+        return tool_result_text, judgement.tool_name, command, success, judgement.source
 
     async def process(
         self,
@@ -410,6 +455,7 @@ class DeliberativeAgent:
         state = self._init_deliberative_state(mode)
         (
             tool_result_text, tool_name_used, tool_command, tool_success,
+            tool_command_source,
         ) = await self._judge_and_execute_tool(
             query, mode, conversation, messages, llm_client, state, on_step,
             tool_judge_task=tool_judge_task, session_id=session_id,
@@ -430,6 +476,7 @@ class DeliberativeAgent:
             tool_capture["command"] = tool_command
             tool_capture["command_name"] = tool_name_used if tool_command else None
             tool_capture["success"] = tool_success
+            tool_capture["command_source"] = tool_command_source
 
         # ツール結果に基づく接地回答は創作不要。chat 既定 0.7 のままだと weak base が
         # 非決定的に拒否/話題混同しやすい (実機: ニュースで 0.7→~25%拒否、0.2→安定)。
@@ -460,6 +507,7 @@ class DeliberativeAgent:
             messages, llm_client, max_tokens,
             tool_result=tool_result_text, tool_name=tool_name_used,
             tool_command=tool_command, tool_command_success=tool_success,
+            tool_command_source=tool_command_source,
             generation_params=generation_params,
         )
 
@@ -509,6 +557,7 @@ class DeliberativeAgent:
         tool_name: str | None = None,
         tool_command: str | None = None,
         tool_command_success: bool | None = None,
+        tool_command_source: str | None = None,
         generation_params: GenerationParams | None = None,
     ) -> DeliberativeResponse:
         """非ストリーミング応答"""
@@ -517,7 +566,7 @@ class DeliberativeAgent:
             kwargs["max_tokens"] = max_tokens
         # モード別生成パラメータを適用
         if generation_params:
-            for k in ("temperature", "top_p", "top_k", "presence_penalty", "repetition_penalty"):
+            for k in ("temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "repetition_penalty"):
                 if k in generation_params:
                     kwargs[k] = generation_params[k]
         result = await llm_client.generate(messages, **kwargs)
@@ -529,6 +578,7 @@ class DeliberativeAgent:
             tool_name=tool_name,
             tool_command=tool_command,
             tool_command_success=tool_command_success,
+            tool_command_source=tool_command_source,
         )
 
     async def _stream_response(
@@ -547,7 +597,7 @@ class DeliberativeAgent:
             kwargs["max_tokens"] = max_tokens
         # モード別生成パラメータを適用
         if generation_params:
-            for k in ("temperature", "top_p", "top_k", "presence_penalty", "repetition_penalty"):
+            for k in ("temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "repetition_penalty"):
                 if k in generation_params:
                     kwargs[k] = generation_params[k]
         token_gen = await llm_client.generate(messages, **kwargs)
@@ -632,9 +682,12 @@ class DeliberativeAgent:
         state.pending_tool = tool_name
         state.pending_args = tool_args
         try:
+            timeout_sec = self._tools_registry.timeout_for(
+                tool_name, TOOL_EXECUTION_TIMEOUT_SEC,
+            )
             result = await asyncio.wait_for(
                 self._tools_registry.execute(tool_name, **tool_args),
-                timeout=TOOL_EXECUTION_TIMEOUT_SEC,
+                timeout=timeout_sec,
             )
             result_text = str(result)
             state.on_tool_success(tool_name)
@@ -642,13 +695,10 @@ class DeliberativeAgent:
             _emit_tool_result_step(on_step, tool_name, result_text)
             return result_text
         except asyncio.TimeoutError:
-            error_text = (
-                f"Error: tool execution timed out after {TOOL_EXECUTION_TIMEOUT_SEC}s"
-            )
+            error_text = f"Error: tool execution timed out after {timeout_sec}s"
             state.on_tool_failure(tool_name, error_text)
             logger.warning(
-                "Tool execution timed out: %s (%.0fs)",
-                tool_name, TOOL_EXECUTION_TIMEOUT_SEC,
+                "Tool execution timed out: %s (%.0fs)", tool_name, timeout_sec,
             )
             _emit_tool_failure_step(on_step, tool_name, error_text)
             return error_text

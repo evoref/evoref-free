@@ -21,6 +21,7 @@ from backend.free.api.chat._long_form_intent import (
     detect_long_form_mode,
 )
 from backend.free.api.chat.chat_recorder import (
+    judge_long_form_success,
     record_meta_cognitive_response,
     record_response,
     record_long_form_response,
@@ -35,7 +36,7 @@ from backend.free.agent.tool_call_judge import _extract_file_path
 from backend.free.agent.output_format import infer_output_extension
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.core.stream_filter import (
-    HeadBufferFilter, StreamThinkingFilter,
+    HeadBufferFilter, RepetitionGuardFilter, StreamThinkingFilter,
 )
 from backend.free.core.stream_pipeline import StreamPipeline
 from backend.free.llm.local_client import LocalClient
@@ -1070,7 +1071,9 @@ def _emit_long_form_episode(
 
         units_completed = int(metrics.get("units_completed", 0) or 0)
         validation_errors = int(metrics.get("validation_errors", 0) or 0)
-        success = units_completed > 0 and validation_errors == 0
+        # Level 0 記録側 (chat_recorder) と同一式を共有する。式が食い違うと
+        # 同じターンが reward=1.0 と long_form_success=False で二重学習される。
+        success = judge_long_form_success(metrics, query)
         episode_id = tracer.begin_episode(session_id, mode)
         tracer.record_step(episode_id, MDPStep(
             step_index=0,
@@ -1161,22 +1164,31 @@ async def _finalize_long_form_stream(
         delivered=delivered, metrics=metrics, private=private,
     )
 
-    # 構文エラーを含むコードがエディタ/ディスクへそのまま出力されると、
-    # ユーザは破損に気づけない (validate は事後計測でブロックしない)。
+    # 検証エラーを含む生成物がエディタ/ディスクへそのまま出力されると、ユーザは
+    # 破損に気づけない (validate は事後計測でブロックしない)。
     # validation_errors > 0 のときは警告ステップを surface して認識させる。
+    # 文面は content_type で分ける (TEXT にも品質ゲートが入ったため、散文に対して
+    # 「構文エラー」と表示していた 2026-07-25 の誤表示を解消)。
     validation_errors = int(metrics.get("validation_errors", 0) or 0)
     if validation_errors > 0:
         logger.warning(
-            "Long-form output has %d validation error(s) (session=%s); "
-            "surfacing warning to user",
-            validation_errors, session_id,
+            "Long-form output has %d validation error(s) (content_type=%s, "
+            "session=%s); surfacing warning to user",
+            validation_errors, metrics.get("content_type"), session_id,
         )
-        yield sse.step({
-            "type": "task_result",
-            "detail": (
+        if str(metrics.get("content_type") or "") == "code":
+            detail = (
                 f"⚠ 生成コードに構文エラーが {validation_errors} 件検出されました。"
                 "そのまま実行する前に内容を確認してください。"
-            ),
+            )
+        else:
+            detail = (
+                f"⚠ 生成文の品質チェックで {validation_errors} 件の問題を検出しました"
+                "(反復・目標文字数からの乖離・未対応のレビュー指摘)。内容を確認してください。"
+            )
+        yield sse.step({
+            "type": "task_result",
+            "detail": detail,
             "status": "failed",
         })
 
@@ -1597,6 +1609,7 @@ class _DeliberativeStreamState:
     tool_command: str | None = None
     tool_command_name: str | None = None
     tool_command_success: bool | None = None
+    tool_command_source: str | None = None
 
 
 def _make_step_queue_callback(
@@ -1646,6 +1659,9 @@ async def _stream_filtered_token_pipeline(
     pipeline = StreamPipeline([
         StreamThinkingFilter(),
         HeadBufferFilter(),
+        # 思考ブロック除去・先頭ラベル除去を通したあとの「実際にユーザーへ出る
+        # テキスト」に対して反復を判定する (前段が落とす行を数えないため)。
+        RepetitionGuardFilter(),
     ])
     aiter = token_stream.__aiter__()
     pending: asyncio.Task[str] | None = None
@@ -1784,6 +1800,7 @@ async def _finalize_deliberative_stream(
         tool_command=state.tool_command,
         tool_command_name=state.tool_command_name,
         tool_command_success=state.tool_command_success,
+        tool_command_source=state.tool_command_source,
         tool_routing_success=state.tool_command_success is True,
         rag_used=rag_used,
         rag_top1_score=rag_top1_score,
@@ -1866,6 +1883,7 @@ async def stream_deliberative(
             stream_state.tool_command = tool_capture.get("command")
             stream_state.tool_command_name = tool_capture.get("command_name")
             stream_state.tool_command_success = tool_capture.get("success")
+            stream_state.tool_command_source = tool_capture.get("command_source")
 
             async for frame in _drain_deliberative_step_queue(step_queue):
                 yield frame
@@ -1973,6 +1991,7 @@ async def sync_deliberative(
             tool_command=resp.tool_command,
             tool_command_name=resp.tool_name if resp.tool_command else None,
             tool_command_success=resp.tool_command_success,
+            tool_command_source=resp.tool_command_source,
             tool_routing_success=resp.tool_command_success is True,
             rag_used=rag_used,
             rag_top1_score=rag_top1_score,
@@ -2008,7 +2027,7 @@ def _apply_generation_params(gen_kwargs: dict, generation_params: "GenerationPar
     """モード別生成パラメータを client.generate の kwargs へ転写する。"""
     if not generation_params:
         return
-    for k in ("temperature", "top_p", "top_k", "presence_penalty", "repetition_penalty"):
+    for k in ("temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "repetition_penalty"):
         if k in generation_params:
             gen_kwargs[k] = generation_params[k]
 

@@ -204,6 +204,15 @@ async def curate_executable_command_facts(
         command = assistant_note.tool_command or ""
         if not command:
             continue
+        # recall 由来 (層0.5 が過去 fact を引き当てて発火した実行) は学習しない。
+        # 学習すると「誤発火 → exit 0 で成功記録 → success_avg と
+        # last_executed_at が更新され TTL による唯一の排除経路がリセット →
+        # また誤発火」で自己強化する (実測 2026-07-25: 好みの表明・記憶想起の
+        # ターンで発火した datetime コマンドが 2 世代にわたり延命されていた)。
+        # rule / assist が能動的に選んだ実行のみを学習対象にする。
+        if assistant_note.tool_command_source == "recall":
+            assistant_note.command_curated_at = now_fn()
+            continue
         mode = assistant_note.mode or "chat"
         normalized = _normalize_command(command)
         if not normalized:
@@ -235,7 +244,12 @@ async def curate_executable_command_facts(
                 # 新規作成は成功時のみ (失敗コマンドを学習対象にしない)
                 embedding = None
                 try:
-                    emb = await embedder.embed([topic], is_query=False)
+                    # 読み出し側 (tool_call_judge._try_recall_executable_command)
+                    # は is_query=True で埋め込むため、保存側も揃える。
+                    # instruction-aware な embed では query/document で prefix が
+                    # 変わり、同一テキストの自己類似度が 0.78 程度まで落ちる。
+                    # 非対称のままだと閾値が本来の尺度で意味を持たない。
+                    emb = await embedder.embed([topic], is_query=True)
                     if emb is not None and len(emb) > 0:
                         embedding = np.asarray(emb[0], dtype=np.float32)
                 except Exception as exc:

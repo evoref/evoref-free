@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from backend.free.agent.learned_pattern_store import LearnedPatternRepository
 from backend.free.agent.learned_patterns_types import LearnedPattern
+from backend.free.document_nouns import DOCUMENT_NOUN_LEARNABLE_JA
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -209,17 +210,30 @@ class LearnedPatternStore:
 
         text_lower = text.lower()
         matches: list[tuple[str, float]] = []
+        # 既にヒットした文字区間。同一スパンから重複カウントしない
+        # (「技術的な議論」に対し「技術」と「技術的」が 2 語成立し、
+        #  learned 語 2 件で long_form が発火していた。2026-07-25)。
+        # 長いキーワードを優先するため長さ降順に評価する。
+        claimed: list[tuple[int, int]] = []
 
-        for key, pattern in self._patterns.items():
+        for key, pattern in sorted(
+            self._patterns.items(), key=lambda kv: -len(kv[0]),
+        ):
             if pattern.weight < self.match_threshold:
                 continue
             if category is not None and pattern.category != category:
                 continue
-            if key in text_lower:
-                matches.append((pattern.keyword, pattern.weight))
-                # ヒットカウントを更新
-                pattern.hit_count += 1
-                pattern.last_hit = time.time()
+            start = text_lower.find(key)
+            if start < 0:
+                continue
+            end = start + len(key)
+            if any(s <= start and end <= e for s, e in claimed):
+                continue
+            claimed.append((start, end))
+            matches.append((pattern.keyword, pattern.weight))
+            # ヒットカウントを更新
+            pattern.hit_count += 1
+            pattern.last_hit = time.time()
 
         return sorted(matches, key=lambda x: -x[1])
 
@@ -378,21 +392,28 @@ class LearnedPatternStore:
     def is_long_form_learnable(keyword: str) -> bool:
         """``keyword`` を ``category="long_form"`` として学習してよいか判定する (pure)。
 
-        long_form は文書(散文)生成の意図シグナルを学習するカテゴリ。ファイルパス片
-        (Users / Desktop / aa)・URL 片 (https / soccer.yahoo.co.jp / wcup)・汎用ファイル
-        操作語 (出力 / ファイル / 保存) は文書種別を示さないため除外する。CJK の
-        文書/意図語 (仕様書 / レポート / ガイドライン 等) は通す。
+        long_form は文書(散文)生成の意図シグナルを学習するカテゴリ。
+        **許容リスト方式** で、``DOCUMENT_NOUN_LEARNABLE_JA`` の文書種別名詞を
+        含む語だけを学習可とする (仕様書 / レポート / 議事録 / ガイドライン 等)。
 
-        割り切り: ASCII のみのトークン (python / Excel / wcup 等) は文書種別シグナルとして
-        信頼できないため一律除外する (英語 long_form 語の学習は犠牲にする)。
-        ``correction`` / ``tool_routing`` 等の他カテゴリには適用しない (ASCII 語が正当)。
+        2026-07-25 に除外リスト方式から反転した。除外リストは「新種の一般語が
+        来るたび追記する」運用になり、2026-07-15 の対処後も「技術 / 方針 / 会話 /
+        検索 / 議論 / 有益 / 簡潔 / 字以内 / 捏造 / 内線番号」等 52 語が学習され、
+        謝辞 1 行が 7 ユニット 6,436 字の長文生成に化けた。未知語を既定で
+        学習しない構造にしないと同型の再発が止まらない。
+
+        割り切り: ASCII のみのトークン (python / Excel / wcup 等) は文書種別
+        シグナルとして信頼できないため一律除外する (英語 long_form 語の学習は
+        犠牲にする)。``tool_routing`` 等の他カテゴリには適用しない (ASCII 語が正当)。
         """
         kw = keyword.strip()
         if len(kw) < 2:
             return False
         if kw.lower() in _LONG_FORM_NONLEARNABLE_EXACT:
             return False
-        return not _LONG_FORM_ASCII_FILEISH_RE.match(kw)
+        if _LONG_FORM_ASCII_FILEISH_RE.match(kw):
+            return False
+        return any(noun in kw for noun in DOCUMENT_NOUN_LEARNABLE_JA)
 
     def _enforce_limit(self) -> None:
         """パターン数上限を超えた場合、低重みパターンを削除"""

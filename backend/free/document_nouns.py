@@ -55,6 +55,37 @@ DOCUMENT_NOUNS_STANDALONE: tuple[str, ...] = (
     "ガイドライン", "規約", "規定", "スクリプト台本", "台本",
 )
 
+def _plain_variants(pattern: str) -> set[str]:
+    """正規表現片から素の語彙候補を起こす (``案内文?`` → ``{案内文, 案内}``)。
+
+    JA の名詞タプルは ``?`` による任意末尾しか正規表現要素を持たないため、
+    それだけを展開する。ASCII を含む語は学習許可判定で一律除外されるので対象外。
+    """
+    if "?" not in pattern:
+        return {pattern}
+    out = {pattern.replace("?", "")}
+    idx = pattern.find("?")
+    while idx != -1:
+        # ``?`` の直前 1 文字を落とした形も許容語として登録する。
+        out.add((pattern[: idx - 1] + pattern[idx + 1 :]).replace("?", ""))
+        idx = pattern.find("?", idx + 1)
+    return {v for v in out if len(v) >= 2}
+
+
+#: ``category="long_form"`` として **学習を許可する** 文書種別名詞の許容リスト。
+#: 2026-07-25 に除外リスト方式から反転した。除外リスト (``_LONG_FORM_NONLEARNABLE_EXACT``)
+#: は「新種の一般語が来るたびに追記する」運用になり、2026-07-15 に一度対処した後も
+#: 2026-07-25 に「技術 / 方針 / 会話 / 検索 / 議論 / 有益 / 簡潔 / 字以内 / 捏造 /
+#: 内線番号」等 52 語が学習され、謝辞 1 行が 6,436 字の長文生成に化けた。
+#: 許容リストなら未知の一般語は既定で学習されない。
+DOCUMENT_NOUN_LEARNABLE_JA: frozenset[str] = frozenset(
+    v
+    for noun in (*DOCUMENT_NOUNS_NEEDS_SUFFIX, *DOCUMENT_NOUNS_STANDALONE)
+    for v in _plain_variants(noun)
+    if not noun.isascii()
+)
+
+
 # DOCUMENT_NOUNS_NEEDS_SUFFIX の英語版。
 DOCUMENT_NOUNS_NEEDS_SUFFIX_EN: tuple[str, ...] = (
     "article", "report", "document", "paper", "manual", "documentation",

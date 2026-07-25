@@ -16,11 +16,13 @@ from typing import TYPE_CHECKING
 from backend.exceptions import UnitGenerationError
 from backend.free.generation.code_skeleton import CodeSkeleton
 from backend.free.generation.models import (
+    BREVITY_CHARS_PER_UNIT,
     CodeUnit,
     ContentType,
     GenerationPlan,
     LongFormMode,
     SectionPlan,
+    detect_brevity_cap,
     extract_target_chars,
 )
 from backend.free.generation.rolling_context import RollingContext
@@ -596,6 +598,17 @@ class CogWriterStrategy:
                 memory_context=memory_context,
                 output_language=prose_language_name(),
             )
+            # 新規生成の既定プロンプトは target_length を渡さず LLM の裁量に
+            # 任せるため、「簡潔に」「冗長にならない」等が計画に一切反映されない。
+            # parse_plan 側の上限は事後の安全網なので、計画時点でも明示する。
+            brevity_cap = detect_brevity_cap(instruction)
+            if brevity_cap > 0:
+                unit_cap = max(1, brevity_cap // BREVITY_CHARS_PER_UNIT)
+                prompt += (
+                    "\n\n# 追加制約 (ユーザーが簡潔さを要求しています)\n"
+                    f"- target_length は {brevity_cap} 以下にしてください。\n"
+                    f"- units は最大 {unit_cap} 個にしてください。\n"
+                )
 
         # EXPAND/SPLIT モードでは下限 8 を保証 (機能ごとセクション化のため)
         max_units = resolve_max_units(self._lf_config, long_form_mode)

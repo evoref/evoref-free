@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
@@ -69,6 +70,39 @@ RAG_TOTAL_TOKEN_BUDGET = 256
 # CodeUnit に file_path が無い (degraded fallback 等) 場合の既定ファイル名。
 _DEFAULT_CODE_FILE = "output.py"
 
+# 散文出力の品質ゲート (_validate_generated_text)。
+# 目標文字数比の許容レンジ。plan.target_length が 0 (未指定) のときは判定しない。
+_TARGET_LENGTH_MIN_RATIO = 0.5
+_TARGET_LENGTH_MAX_RATIO = 1.5
+# 文重複率の判定は短文で不安定なので、一定数の文が無いと評価しない。
+_DUP_CHECK_MIN_SENTENCES = 12
+# ユニーク文の比率がこれ未満なら degeneration とみなし error。
+_MIN_UNIQUE_SENTENCE_RATIO = 0.6
+# error には満たないが健全とも言えない領域は warning に落とす。
+_WARN_UNIQUE_SENTENCE_RATIO = 0.8
+# 重複判定で無視する短文 (定型の相槌・見出し断片を拾わないため)。
+_DUP_MIN_SENTENCE_CHARS = 15
+
+# 文分割 (日本語の句点・感嘆・疑問 + 改行 + 英文のピリオド)。
+_SENTENCE_SPLIT_RE = re.compile(r"[。．!！?？\n]+")
+
+
+def _sentence_dup_stats(text: str) -> tuple[int, int]:
+    """``(総文数, ユニーク文数)`` を返す。空白を正規化して比較する。
+
+    ``_DUP_MIN_SENTENCE_CHARS`` 未満の短文は除外する (箇条書きの記号や
+    「はい」のような相槌が重複としてカウントされるのを避けるため)。
+    """
+    seen: set[str] = set()
+    total = 0
+    for raw in _SENTENCE_SPLIT_RE.split(text):
+        s = " ".join(raw.split())
+        if len(s) < _DUP_MIN_SENTENCE_CHARS:
+            continue
+        total += 1
+        seen.add(s)
+    return total, len(seen)
+
 
 class LongFormOrchestrator:
     """長文生成のオーケストレーター
@@ -112,9 +146,11 @@ class LongFormOrchestrator:
         # 直近コードのファイル別 (file_path → 検証・修正済みコード)。複数ファイル
         # 計画時に Agentic 経路が複数 EditorArtifact として配信するために使う。
         self.last_code_files: dict[str, str] = {}
-        # 直近生成の post-repair 検証で残った error 行 (severity=error のみ)。
-        # 配信側 (make_code_artifact_generator) が「壊れたコードを成功として
-        # 渡さない」ためユーザーへ提示する。
+        # 直近生成の検証で残った error 行。CODE は post-repair の AST 検証
+        # (severity=error のみ)、TEXT は品質ゲート (_validate_generated_text)。
+        # CODE では配信側 (make_code_artifact_generator) が「壊れたコードを成功
+        # として渡さない」ためユーザーへ提示する (TEXT は artifact を持たないので
+        # 当該経路には乗らず、chat_streaming の警告ステップ側で surface される)。
         self.last_validation_errors: list[str] = []
         # 直近 generate() の TEXT 確定本文 (document_quality_enabled 時のみ、改稿済み
         # generated_units から組む)。chat_streaming の finalize が file/editor 出力に
@@ -127,6 +163,10 @@ class LongFormOrchestrator:
         # かどうか。chat_streaming の finalize はこの場合 write_file を呼ばない
         # (確認質問をファイルへ書き込んでしまうことを防ぐ)。
         self.last_needed_clarification: bool = False
+        # 直近 review が検出した issue 数と、max_revisions 予算内で改稿できなかった
+        # 残数。TEXT の品質判定 (_validate_generated_text) が参照する。
+        self._last_review_issue_count: int = 0
+        self._last_unaddressed_issue_count: int = 0
 
         # Recurrent も計画 / 要約再帰をアシストモデルで実行する
         # ため ``assist_client`` を渡す。``None`` の場合は Recurrent 内部で
@@ -252,6 +292,8 @@ class LongFormOrchestrator:
         決定論的な構造ゲート (空 / 表の列ずれ / 見出し階層 / 形式不適合) を重ねる。
         ゲート赤は export 破綻に直結するため LLM レビューより優先して有界改稿する。
         """
+        self._last_review_issue_count = 0
+        self._last_unaddressed_issue_count = 0
         if not isinstance(self.strategy, CogWriterStrategy):
             return
         lf = self.config.get("long_form", {})
@@ -289,6 +331,12 @@ class LongFormOrchestrator:
                     "status": "done",
                 })
             revisions = gate_issues + revisions
+
+        # 検出数と「予算内で改稿しきれなかった残数」を記録する。残issueは出力に
+        # 残ったままなので、TEXT の成否判定 (_validate_generated_text) が error として
+        # 数える。これが無いと review が issue を出しても success 判定に反映されない。
+        self._last_review_issue_count = len(revisions)
+        self._last_unaddressed_issue_count = max(0, len(revisions) - max_revisions)
 
         for rev in revisions[:max_revisions]:
             async for token in self.strategy.revise_unit(rev, rolling, content_type):
@@ -451,6 +499,76 @@ class LongFormOrchestrator:
                 "warning_count": warning_count,
             })
         return validation_errors, warning_count
+
+    def _validate_generated_text(
+        self,
+        rolling: RollingContext,
+        content_type: ContentType,
+        on_step,
+    ) -> tuple[int, int]:
+        """散文出力の品質検証。``(error_count, warning_count)`` を返す。
+
+        ``_validate_generated_code`` は CODE 専用のため、TEXT では従来
+        ``validation_errors`` が常に 0 になり、``long_form_success`` が実質恒真だった
+        (壊れた出力が Level 0 の正例として学習される)。決定論で判定できる 3 点のみ見る:
+
+        1. review が検出し ``max_revisions`` 予算内で改稿しきれなかった残 issue
+        2. 目標文字数比が ``[0.5, 1.5]`` の外 (``target_length`` 未指定時はスキップ)
+        3. 文単位の重複率 (ユニーク文 / 総文 が ``_MIN_UNIQUE_SENTENCE_RATIO`` 未満)
+
+        3 は degeneration ループの検出用。実測 (2026-07-25) では同一文が 34 回反復した
+        7,192 字のメールが 43/156 = 0.28 で、正常な生成は 0.9 以上だった。
+        """
+        if content_type != ContentType.TEXT or not rolling.generated_units:
+            return 0, 0
+
+        text = "\n\n".join(rolling.generated_units)
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        unaddressed = self._last_unaddressed_issue_count
+        if unaddressed > 0:
+            errors.append(
+                f"review issues left unaddressed: {unaddressed}"
+                f" (detected={self._last_review_issue_count})",
+            )
+
+        target = getattr(rolling.plan, "target_length", 0) or 0
+        if target > 0:
+            ratio = len(text) / target
+            if ratio < _TARGET_LENGTH_MIN_RATIO or ratio > _TARGET_LENGTH_MAX_RATIO:
+                errors.append(
+                    f"length {len(text)} chars is {ratio:.2f}x target {target}",
+                )
+
+        total, unique = _sentence_dup_stats(text)
+        if total >= _DUP_CHECK_MIN_SENTENCES:
+            uniq_ratio = unique / total
+            if uniq_ratio < _MIN_UNIQUE_SENTENCE_RATIO:
+                errors.append(
+                    f"repetitive output: {unique}/{total} unique sentences"
+                    f" ({uniq_ratio:.2f})",
+                )
+            elif uniq_ratio < _WARN_UNIQUE_SENTENCE_RATIO:
+                warnings.append(f"unique sentence ratio {uniq_ratio:.2f}")
+
+        self.last_validation_errors = list(errors)
+        if on_step:
+            _call_step(on_step, {
+                "type": "long_form_validate",
+                "detail": "; ".join(errors) if errors else "OK",
+                "status": "failed" if errors else "done",
+            })
+        if self._debug_logger:
+            self._debug_logger.log_long_form_event({
+                "phase": "validate",
+                "errors": errors,
+                "error_count": len(errors),
+                "warning_count": len(warnings),
+                "unique_sentence_ratio": round(unique / total, 3) if total else None,
+                "review_issues": self._last_review_issue_count,
+            })
+        return len(errors), len(warnings)
 
     def _run_integrity_and_smoke(
         self,
@@ -801,10 +919,17 @@ class LongFormOrchestrator:
         # 総時間超過時も最終出力品質のため実行する (max_repair_rounds で有界)。
         await self._repair_generated_code(rolling, content_type, on_step)
 
-        # 9. コード検証 (リペア後を対象、Python のみ AST 検証)
-        validation_errors, _warning_count = self._validate_generated_code(
-            rolling, content_type, on_step,
-        )
+        # 9. 出力検証。CODE は AST 検証 (リペア後 / Python のみ)、TEXT は決定論の
+        # 品質ゲート (残 review issue / 目標文字数比 / 文重複率)。TEXT 側が無いと
+        # validation_errors が常に 0 になり、壊れた散文が success として学習される。
+        if content_type == ContentType.TEXT:
+            validation_errors, _warning_count = self._validate_generated_text(
+                rolling, content_type, on_step,
+            )
+        else:
+            validation_errors, _warning_count = self._validate_generated_code(
+                rolling, content_type, on_step,
+            )
 
         # 9.5 整合ゲート (相対 import 残存 / エントリポイント) + import スモーク
         # テスト (config 任意)。AST 検証が見逃す実行時 import エラー等を捕捉する。
@@ -1205,11 +1330,17 @@ def _split_oversized_text_units(
                     estimated_tokens=tokens_per_split,
                 )
             else:
-                # 後続サブユニット: 担当分の key_points + 再掲禁止の継続指示
+                # 後続サブユニット: 担当分の key_points のみ。
+                # heading に「（続き N）」を埋めると、その文字列が
+                # strategy_common のセクション一覧経由で全ユニットのプロンプトに
+                # 注入され、本文へそのまま出力される (2026-07-25 実測)。
+                # 継続指示も key_points (=「本文に含めるべき要点」) ではなく
+                # system プロンプト側で与える。
                 sub = SectionPlan(
-                    heading=f"{unit.heading}（続き{i + 1}）",
-                    key_points=[*chunk, _CONTINUATION_NOTE],
+                    heading=unit.heading,
+                    key_points=list(chunk),
                     estimated_tokens=tokens_per_split,
+                    sub_index=i + 1,
                 )
             new_units.append(sub)
 

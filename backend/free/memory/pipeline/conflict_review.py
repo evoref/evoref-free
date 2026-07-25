@@ -33,6 +33,7 @@ from backend.free.memory.pipeline.semantic_conflict_resolver import (
     CONFLICTS_RESOLVED_FILENAME,
 )
 from backend.free.memory.semantic.store import SemanticFactStore
+from backend.utils import estimate_tokens
 from backend.free.memory.types import SemanticFact, make_fact
 from backend.log_config import get_logger
 
@@ -365,12 +366,57 @@ def _render_group_line(
     )
 
 
+def _render_block_lines(
+    groups: list[PendingConflictGroup],
+    *,
+    instruct: bool,
+    max_object_chars: int,
+) -> list[str]:
+    """ブロック本文 (ヘッダ + 指示 + グループ行) を組み立てる。"""
+    lines = ["[記憶の競合 — 未解決]"]
+    if instruct:
+        lines.append(
+            "以下の記憶は内容が矛盾しています。会話の流れを壊さない範囲で、"
+            "どちらが正しいか自然にユーザーへ確認してください (1 ターンに 1 件まで)。"
+        )
+    else:
+        lines.append("以下の記憶は内容が矛盾しています (確認待ち)。")
+    for i, g in enumerate(groups, start=1):
+        lines.append(_render_group_line(i, g, max_object_chars=max_object_chars))
+    return lines
+
+
+def _fit_groups_to_tokens(
+    groups: list[PendingConflictGroup],
+    max_tokens: int,
+    *,
+    instruct: bool,
+    max_object_chars: int,
+) -> list[PendingConflictGroup]:
+    """トークン上限に収まる先頭 N グループを返す (最低 1 件は残す)。"""
+    if not groups:
+        return groups
+    fitted: list[PendingConflictGroup] = []
+    for g in groups:
+        candidate = [*fitted, g]
+        text = "\n".join(
+            _render_block_lines(
+                candidate, instruct=instruct, max_object_chars=max_object_chars,
+            ),
+        )
+        if fitted and estimate_tokens(text) > max_tokens:
+            break
+        fitted.append(g)
+    return fitted
+
+
 def render_pending_conflicts_block(
     groups: list[PendingConflictGroup],
     *,
     instruct: bool = True,
     max_groups: int = 0,
     max_object_chars: int = 80,
+    max_tokens: int = 0,
 ) -> str | None:
     """pending 競合グループをプロンプト注入用テキストへ整形する。
 
@@ -383,20 +429,22 @@ def render_pending_conflicts_block(
             (回答を判定できない) のときは False で情報提示のみにする。
         max_groups: 注入するグループ数の上限 (0 = 無制限)。超過分は
             件数のみ要約する。
+        max_tokens: ブロック全体のトークン上限 (0 = 無制限)。グループ数上限
+            だけでは member 数の多いグループを抑えられないため、トークンでも
+            打ち切る。設計書 §203 の「drop されない」保証を守るため、
+            **最低 1 グループは必ず残す** (上限を超えても先頭 1 件は出す)。
     """
     if not groups:
         return None
     shown = groups if max_groups <= 0 else groups[:max_groups]
-    lines = ["[記憶の競合 — 未解決]"]
-    if instruct:
-        lines.append(
-            "以下の記憶は内容が矛盾しています。会話の流れを壊さない範囲で、"
-            "どちらが正しいか自然にユーザーへ確認してください (1 ターンに 1 件まで)。"
+    if max_tokens > 0:
+        shown = _fit_groups_to_tokens(
+            shown, max_tokens, instruct=instruct,
+            max_object_chars=max_object_chars,
         )
-    else:
-        lines.append("以下の記憶は内容が矛盾しています (確認待ち)。")
-    for i, g in enumerate(shown, start=1):
-        lines.append(_render_group_line(i, g, max_object_chars=max_object_chars))
+    lines = _render_block_lines(
+        shown, instruct=instruct, max_object_chars=max_object_chars,
+    )
     if len(groups) > len(shown):
         lines.append(f"(他 {len(groups) - len(shown)} 件)")
     return "\n".join(lines)

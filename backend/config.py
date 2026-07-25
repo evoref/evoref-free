@@ -824,12 +824,14 @@ def get_mode_generation_params(mode: str) -> dict:
             "top_p": 0.9,
             "top_k": 40,
             "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
         },
         "coding": {
             "temperature": 0.3,
             "top_p": 0.95,
             "top_k": 20,
             "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
         },
     }
 

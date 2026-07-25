@@ -9,10 +9,11 @@ from typing import TYPE_CHECKING
 import httpx
 
 from backend.app_state import AppState
+from backend.free.api.chat.chat_constants import DEFAULT_WORKING_MAX_TOKENS
 from backend.free.api.chat.chat_recorder import clear_session_data, drain_evicted_to_stm
 from backend.free.api.chat.chat_types import ChatMessage, FileContextDict
 from backend.free.api.schemas import ChatRequest
-from backend.free.core.session_mode import normalize_session_mode
+from backend.free.core.session_mode import is_chat_mode, normalize_session_mode
 from backend.free.core.inference import build_messages
 from backend.free.llm.llm_client import LLMClient
 from backend.free.memory.pipeline.search_pipeline import unified_search
@@ -152,17 +153,22 @@ def convert_file_contexts(req: ChatRequest) -> list[FileContextDict] | None:
 class SearchPipelineResult:
     """検索パイプラインの結果（BUG-9: 成功/失敗/スキップの区別を明確化）"""
 
-    __slots__ = ("chunks", "scored_chunks", "error")
+    __slots__ = ("chunks", "scored_chunks", "error", "query_vec")
 
     def __init__(
         self,
         chunks: list[str] | None = None,
         scored_chunks: list[tuple[str, float, str]] | None = None,
         error: str | None = None,
+        query_vec=None,
     ):
         self.chunks = chunks
         self.scored_chunks = scored_chunks
         self.error = error
+        # クエリ埋め込み。MemoryInjector の関連度ゲートが再利用する
+        # (検索が necessity judge で skip されても埋め込み自体は計算済みなので、
+        #  ゲートを効かせるために持ち回る)。
+        self.query_vec = query_vec
 
     @property
     def failed(self) -> bool:
@@ -286,12 +292,15 @@ async def run_search_pipeline(
             return SearchPipelineResult(
                 chunks=rag_chunks,
                 scored_chunks=search_result.sources,
+                query_vec=query_vec,
             )
     except Exception as e:
         logger.warning("Search pipeline failed, continuing without RAG: %s", e)
         return SearchPipelineResult(error=str(e))
 
-    return SearchPipelineResult()
+    # necessity judge が retrieve を skip した経路。チャンクは無いが
+    # query_vec は算出済みなので、関連度ゲート用に返す。
+    return SearchPipelineResult(query_vec=locals().get("query_vec"))
 
 
 @dataclass
@@ -321,8 +330,23 @@ def _iter_scopes(state: AppState):
             continue
 
 
-def _collect_all_pending_groups(state: AppState) -> list:
-    """global + project ストアの pending 競合グループを集約する (読取のみ)。"""
+#: chat モードで注入しない競合グループの FactType。
+#:
+#: project スコープには coding_task / coding (ソースコード本文を含む) の
+#: pending が溜まる。これを chat の競合セクションへ載せると、ユーザーに
+#: 「todo_item.py の 2 版のどちらが正しいか」を毎ターン尋ねることになり、
+#: Tier 予算の外で数百トークンを消費する (実測 2026-07-25: 16 件 ≒ 840 tokens。
+#: 弱い base モデルがこれを回答対象と誤解し、本題と無関係な応答を返していた)。
+_CODING_ONLY_CONFLICT_TYPES = frozenset({"coding", "coding_task"})
+
+
+def _collect_all_pending_groups(state: AppState, mode: str = "chat") -> list:
+    """global + project ストアの pending 競合グループを集約する (読取のみ)。
+
+    chat モードではコーディング専用型 (``coding`` / ``coding_task``) の
+    グループを除外する。type は混在時 ``"a/b"`` 形式なので、構成型がすべて
+    コーディング専用のときだけ落とす (混在は残す)。
+    """
     from backend.free.memory.pipeline.conflict_review import collect_pending_groups
 
     groups: list = []
@@ -331,6 +355,19 @@ def _collect_all_pending_groups(state: AppState) -> list:
             groups.extend(collect_pending_groups(store, scope))
         except Exception as exc:
             logger.warning("collect pending conflicts failed (%s): %s", scope, exc)
+    if is_chat_mode(mode):
+        before = len(groups)
+        groups = [
+            g for g in groups
+            if not set((g.type or "").split("/")).issubset(
+                _CODING_ONLY_CONFLICT_TYPES,
+            )
+        ]
+        if before != len(groups):
+            logger.debug(
+                "conflict groups: dropped %d coding-only group(s) in chat mode",
+                before - len(groups),
+            )
     return groups
 
 
@@ -343,6 +380,7 @@ def _chat_review_cfg(cfg: dict) -> dict:
 async def maybe_resolve_pending_conflicts(
     state: AppState, cfg: dict, history: list[ChatMessage], user_message: str,
     *, allow_write: bool = True, session_id: str = "default",
+    mode: str = "chat",
 ) -> ConflictTurnContext:
     """pending 競合のユーザー回答を assist で判定し、有効なら即時反映する。
 
@@ -371,7 +409,7 @@ async def maybe_resolve_pending_conflicts(
     if not review_cfg.get("enabled", True):
         return ctx
     try:
-        ctx.pending_groups = _collect_all_pending_groups(state)
+        ctx.pending_groups = _collect_all_pending_groups(state, mode)
         if not ctx.pending_groups:
             return ctx
         # セッション内発火上限: 到達済みなら判定も注入も止める。allow_write
@@ -493,7 +531,7 @@ async def maybe_resolve_pending_conflicts(
             except Exception as exc:
                 logger.warning("conflict resolve audit log failed: %s", exc)
         # 解決を同ターンの注入へ反映するため pending を再収集
-        ctx.pending_groups = _collect_all_pending_groups(state)
+        ctx.pending_groups = _collect_all_pending_groups(state, mode)
     except Exception as exc:
         logger.warning("pending conflict chat review failed: %s", exc)
     return ctx
@@ -502,6 +540,7 @@ async def maybe_resolve_pending_conflicts(
 def build_semmem_injection(
     state: AppState, cfg: dict, mode: str = "chat",
     conflict_ctx: ConflictTurnContext | None = None,
+    query_vec=None,
 ) -> str | None:
     """SemMem facts + STM notes を MemoryInjector で tier 整形し、
     プロンプト注入用テキストを返す。
@@ -544,6 +583,7 @@ def build_semmem_injection(
                 stm_notes=stm_notes,
                 current_project_id=pid,
                 failure_signatures=(),
+                query_embedding=query_vec,
             )
             rendered = plan.render() or None
     except Exception as e:
@@ -575,7 +615,8 @@ def _render_conflict_section(
         block = render_pending_conflicts_block(
             conflict_ctx.pending_groups,
             instruct=state.assist_client is not None,
-            max_groups=int(review_cfg.get("max_groups", 0) or 0),
+            max_groups=int(review_cfg.get("max_groups", 3) or 0),
+            max_tokens=int(review_cfg.get("max_tokens", 400) or 0),
         )
         if block:
             parts.append(block)
@@ -601,6 +642,7 @@ def build_chat_messages(
     semmem_block: str | None = None,
     fewshot_block: str | None = None,
     history_min_tokens: int = 0,
+    working_max_tokens: int = DEFAULT_WORKING_MAX_TOKENS,
 ) -> list[ChatMessage]:
     """messages 組み立て（build_messages で few-shot・file・メモリ・RAG・履歴を統合）。
 
@@ -618,6 +660,7 @@ def build_chat_messages(
         semmem_block=semmem_block,
         fewshot_block=fewshot_block,
         history_min_tokens=history_min_tokens,
+        working_max_tokens=working_max_tokens,
     )
     logger.debug("Messages assembled: %d messages for LLM", len(messages))
     return messages

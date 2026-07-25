@@ -34,6 +34,10 @@ class MemoryNote:
     keywords: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     embedding: np.ndarray | None = None
+    #: 埋め込み生成の連続失敗回数。上限に達したノートは Step 1 の対象外にする
+    #: (1 件の失敗ノートが毎サイクル Step 1 を落とし、sleep-time 全体が
+    #: 前進しなくなるのを防ぐ。詳細は sleep_update._step1_embed_notes)。
+    embed_failures: int = 0
     lightmem_score: float = 0.5
     created_at: float = 0.0
     accessed_at: float = 0.0
@@ -89,6 +93,10 @@ class MemoryNote:
     """コマンドを実行したツール名 (通常 "run_command"、それ以外は None)"""
 
     tool_command_success: bool | None = None
+    #: 判定層 ("rule" / "assist" / "recall" ...)。executable_command_curator が
+    #: "recall" 由来 (= 過去 fact の引き当てで発火) を学習対象から外すために使う。
+    #: これが無いと「誤発火 → 成功記録 → fact 延命 → また誤発火」で自己強化する。
+    tool_command_source: str | None = None
     """コマンド実行が成功したか (出力が "Error:" prefix でない)。command 無しは None"""
 
     # ── 統合追加フィールド ────────────────────────────────────────
@@ -268,6 +276,7 @@ class ShortTermMemory:
             tool_command=turn.get("tool_command"),
             tool_command_name=turn.get("tool_command_name"),
             tool_command_success=turn.get("tool_command_success"),
+            tool_command_source=turn.get("tool_command_source"),
         )
         self.notes[note.id] = note
         self._cache_dirty = True

@@ -17,6 +17,7 @@ import numpy as np
 
 from backend.free.llm._base_client import (
     BaseHTTPClient,
+    HealthLogGate,
     async_retry_http_call,
     make_retry_logger,
 )
@@ -53,6 +54,8 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
         debug_logger=None,
     ):
         super().__init__(timeout=timeout)
+        # health check の DEBUG を状態変化時のみに絞る (ポーリングでログが埋まるのを防ぐ)
+        self._health_log_gate = HealthLogGate()
         self._url = f"http://{host}:{port}/v1/embeddings"
         self._model_name = model_name_str
         self._dim = dim_size
@@ -328,10 +331,13 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
             base_url = self._url.rsplit("/v1/embeddings", 1)[0]
             resp = await client.get(f"{base_url}/health", timeout=5.0)
             healthy = resp.status_code == 200
-            logger.debug(
-                "Embedding health check: status=%d, healthy=%s",
-                resp.status_code, healthy,
-            )
+            if self._health_log_gate.should_log(resp.status_code, healthy):
+                logger.debug(
+                    "Embedding health check: status=%d, healthy=%s"
+                    " (suppressed %d identical)",
+                    resp.status_code, healthy,
+                    self._health_log_gate.take_suppressed(),
+                )
             return healthy
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPError) as e:
             logger.debug("Embedding health check failed: %s", e)

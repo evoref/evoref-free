@@ -286,8 +286,18 @@ class FeedbackCollector:
         # 前 entry へ遡及マーク (Level 1 バッチ消費側が前クエリから学習: 正しい帰属) し、
         # 即時にも前クエリから学習する。前ターンが既に capability を使っていたケースは
         # 同一ターン false_positive (chat_recorder で検出) の領分なので扱わない。
+        # ``prev_failed`` は「直前ターンが失敗した」だけで、当ターンが訂正だとは
+        # 限らない (話題を変えただけでも立つ)。これを訂正として遡及学習すると、
+        # 無関係な前クエリの語彙が long_form / tool_routing として学習される
+        # (実測 2026-07-25: platform.cpu_count のツールエラーの次ターンで、
+        # 前クエリ「CPU のコア数と Python のバージョン」から
+        # [マシン, コア, バージョン] が long_form として学習された)。
+        # 遡及学習は明示訂正 (hardcoded / same_target) に限定する。
+        explicit_correction = (
+            correction_text is not None and detected_by != "prev_failed"
+        )
         current_routed_tool = tool_routing_success or tool_routing_false_positive
-        if correction_text is not None and self._prev_entry is not None:
+        if explicit_correction and self._prev_entry is not None:
             if current_routed_tool and not self._prev_routed_tool:
                 self._prev_entry.signals.tool_routing_false_negative = True
                 self._learn_tool_routing_from_false_negative(self._prev_entry.query)

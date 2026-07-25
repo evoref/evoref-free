@@ -24,6 +24,7 @@ from tenacity import (
 
 from backend.free.llm._base_client import (
     BaseHTTPClient,
+    HealthLogGate,
     MAX_ATTEMPTS,
     RETRY_WAIT_INITIAL,
     RETRY_WAIT_MAX,
@@ -615,6 +616,8 @@ class AssistModelClient(BaseHTTPClient):
             config: config.yaml 全体の dict。assist_model セクションを参照する。
             debug_logger: DebugLogger インスタンス（任意）
         """
+        # health check の DEBUG を状態変化時のみに絞る (ポーリングでログが埋まるのを防ぐ)
+        self._health_log_gate = HealthLogGate()
         self._debug_logger = debug_logger
         assist_cfg = config.get("assist_model", {})
         local_cfg = assist_cfg.get("local", {})
@@ -1136,7 +1139,12 @@ class AssistModelClient(BaseHTTPClient):
             client = self._get_http_client()
             resp = await client.get(f"{self.url}/health", timeout=5.0)
             healthy = resp.status_code == 200
-            logger.debug("Health check: status=%d, healthy=%s", resp.status_code, healthy)
+            if self._health_log_gate.should_log(resp.status_code, healthy):
+                logger.debug(
+                    "Health check: status=%d, healthy=%s (suppressed %d identical)",
+                    resp.status_code, healthy,
+                    self._health_log_gate.take_suppressed(),
+                )
             return healthy
         except (httpx.ConnectError, httpx.TimeoutException):
             logger.debug("Health check: connection failed")

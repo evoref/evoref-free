@@ -17,16 +17,19 @@
 from __future__ import annotations
 
 import logging
+import math
 from graphlib import TopologicalSorter
 from typing import TYPE_CHECKING
 
 from backend.free.generation.models import (
+    BREVITY_CHARS_PER_UNIT,
     CodeUnit,
     ContentType,
     GenerationPlan,
     LongFormMode,
     SectionPlan,
     chars_to_tokens,
+    detect_brevity_cap,
     extract_target_chars,
 )
 from backend.free.generation.spec_renderer import render_spec_for_prompt
@@ -108,6 +111,15 @@ TEXT_UNIT_CONTINUATION_SYSTEM = """\
 # 妥当な最大単一セクション規模を大きく超えた値なので安全に切り詰める。
 _ESTIMATED_TOKENS_MAX = 20_000
 
+#: 分割された続きユニット (``SectionPlan.sub_index > 0``) の system プロンプトへ
+#: 追記する継続指示。以前は key_points 側に入れていたため「本文に含めるべき要点」
+#: として扱われ、冒頭宣言文の再掲を促していた (2026-07-25)。
+_CONTINUATION_SYSTEM_NOTE = (
+    "これは直前セクションの続きです。見出し・件名・宛名・挨拶などの"
+    "冒頭部分は既に書かれているので繰り返さず、直前の文章の続きだけを書いてください。"
+    "既に書いた文の再掲も禁止です。"
+)
+
 
 def _to_int(value: object, default: int) -> int:
     """JSON 由来の数値フィールドを安全に int 化する。
@@ -175,6 +187,34 @@ def parse_plan(
     user_target = extract_target_chars(instruction, default=0)
     plan_target = _to_int(data.get("target_length"), 0)
     target_length = user_target if user_target > 0 else plan_target
+
+    # 数値指定が無く「簡潔に」「冗長にならない」「箇条書きで」等を要求された場合、
+    # planner の target_length を上限で抑える。これが無いと LLM が要求と無関係に
+    # 大きな target を選び、ユニット分割まで含めて冗長化する
+    # (実測 2026-07-25: 「丁寧だが冗長にならない書き方で」→ 6 ユニット 7,192 字)。
+    if user_target <= 0:
+        brevity_cap = detect_brevity_cap(instruction)
+        if brevity_cap > 0 and (target_length <= 0 or target_length > brevity_cap):
+            logger.info(
+                "Brevity signal detected: capping target_length %d -> %d",
+                target_length, brevity_cap,
+            )
+            target_length = brevity_cap
+            # ユニットは最低 200 トークン (≒330 字) 生成されるため、目標に対して
+            # ユニット数が多いとそれ自体が冗長化の原因になる。SPLIT モード
+            # (file_name 付き = 1 ユニット 1 ファイル) は件数が意図的なので対象外。
+            if units and not any(
+                getattr(u, "file_name", None) for u in units
+            ):
+                unit_cap = max(
+                    1, math.ceil(brevity_cap / BREVITY_CHARS_PER_UNIT),
+                )
+                if len(units) > unit_cap:
+                    logger.info(
+                        "Brevity signal: truncating %d units -> %d",
+                        len(units), unit_cap,
+                    )
+                    units = units[:unit_cap]
 
     # target_length に基づき estimated_tokens を補正 (不足分の引き上げだけでなく
     # 超過分の引き下げも行う)。LLM が estimated_tokens を target_length と無関係に
@@ -600,8 +640,14 @@ def build_text_unit_messages(
     budget = rolling.budget
     plan = rolling.plan
 
+    # 分割で生まれた続きユニット (sub_index > 0) は親と同じ heading を持つため
+    # 重複除去する。順序は保つ。
     section_headings = ", ".join(
-        u.heading for u in plan.units if isinstance(u, SectionPlan)
+        dict.fromkeys(
+            u.heading
+            for u in plan.units
+            if isinstance(u, SectionPlan) and not u.sub_index
+        )
     )
     short_term = budget.fit_content("short_term", rolling.short_term)
 
@@ -616,15 +662,21 @@ def build_text_unit_messages(
         if rolling.has_existing_context
         else TEXT_UNIT_SYSTEM
     )
+    system_text = system_template.format(
+        global_context=plan.global_context,
+        unit_target_chars=unit_target_chars,
+        output_language=prose_language_name(),
+    )
+    # 分割で生まれた続きユニットには再掲禁止を **system 側** で与える。
+    # key_points (=「本文に含めるべき要点」) に混ぜると制約が本文の一部として
+    # 提示され、見出し・冒頭の宣言文ごと再生成される (2026-07-25 実測: 同一文が
+    # 34 回反復し「件名：」が 4 回出るメールになった)。
+    if getattr(unit, "sub_index", 0):
+        system_text += "\n" + _CONTINUATION_SYSTEM_NOTE
     system = budget.fit_content(
-        "system_prompt",
         # output_language は新規生成テンプレートのみが持つ (継続テンプレートは
         # 既存テキストの言語追従が正のため指示しない。余剰 kwarg は無害)
-        system_template.format(
-            global_context=plan.global_context,
-            unit_target_chars=unit_target_chars,
-            output_language=prose_language_name(),
-        ),
+        "system_prompt", system_text,
     )
 
     fmt_kwargs = {

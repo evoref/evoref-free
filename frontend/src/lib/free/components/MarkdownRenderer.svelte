@@ -15,10 +15,46 @@
 	import CodeViewer from './CodeViewer.svelte';
 	import MermaidDiagram from './MermaidDiagram.svelte';
 	import { normalizeLanguage } from '$lib/free/utils/code_blocks';
+	import { installKatexExtension, KATEX_SANITIZE_OPTIONS } from '$lib/free/utils/katex_marked';
 	import { t } from '$lib/i18n';
+	import 'katex/dist/katex.min.css';
+
+	// marked シングルトンへの登録はモジュール初期化時に一度だけ行う。
+	installKatexExtension();
 
 	function isMermaid(lang: string | undefined): boolean {
 		return (lang ?? '').toLowerCase().trim() === 'mermaid';
+	}
+
+	/**
+	 * ブロック単位の描画結果キャッシュ (token.raw -> sanitize 済み HTML)。
+	 *
+	 * ストリーミング中は SSE 1 トークンごとに content が伸びて再描画が走るが、
+	 * 末尾ブロック以外は内容が変わらない。キャッシュが無いと毎フレーム全ブロックを
+	 * marked.parser + DOMPurify.sanitize し直すため O(n^2) になる。
+	 *
+	 * 実測 (2026-07-25, 7,702 字 / 54 ブロックの応答):
+	 *   lexer のみ                      0.50 ms/回
+	 *   lexer + parser + sanitize       100.17 ms/回  ← 99.5% がここ
+	 * 4,073 トークンのストリームでは累計で 1 コアの約 44% を再描画のみに消費し、
+	 * ページが応答不能になっていた (CDP evaluate が 45 秒でタイムアウト)。
+	 *
+	 * token.raw が同一なら marked.parser も DOMPurify も決定論的に同じ出力を返すため、
+	 * キーとして安全。コンポーネントインスタンス単位で保持し、メッセージが破棄されれば
+	 * 一緒に GC される (メッセージ間で共有すると長文が他メッセージの分を evict する)。
+	 *
+	 * 実測の改善 (400 トークンのストリーム再現): 504.0 秒 -> 36.2 秒 = 92.8% 削減。
+	 */
+	const renderCache = new Map<string, string>();
+	const RENDER_CACHE_MAX = 512;
+
+	function cachePut(key: string, html: string): void {
+		// FIFO で上限を保つ (Map は挿入順を保持する)。
+		if (renderCache.size >= RENDER_CACHE_MAX) {
+			const oldest = renderCache.keys().next().value;
+			if (oldest !== undefined) renderCache.delete(oldest);
+		}
+		renderCache.set(key, html);
 	}
 
 	// suppressCode: コーディングモードでコードをエディタへ流す場合、チャット側の
@@ -29,8 +65,13 @@
 
 	function renderNonCode(token: Token): string {
 		// 1 トークンずつ HTML 化。リンク参照定義 ([id]: url) は通常チャット応答では稀。
+		const key = token.raw ?? '';
+		const hit = key ? renderCache.get(key) : undefined;
+		if (hit !== undefined) return hit;
 		const html = marked.parser([token]) as string;
-		return DOMPurify.sanitize(html);
+		const safe = DOMPurify.sanitize(html, KATEX_SANITIZE_OPTIONS);
+		if (key) cachePut(key, safe);
+		return safe;
 	}
 </script>
 
@@ -55,6 +96,16 @@
 	.markdown-renderer {
 		line-height: 1.5;
 		word-break: break-word;
+	}
+	/* 長い数式は折り返さず横スクロールさせる (本文側は折り返したまま) */
+	.markdown-renderer :global(.math-block) {
+		overflow-x: auto;
+		overflow-y: hidden;
+		margin: 8px 0;
+		padding-bottom: 2px;
+	}
+	.markdown-renderer :global(.katex) {
+		word-break: normal;
 	}
 	.code-in-editor {
 		display: inline-flex;
@@ -123,10 +174,29 @@
 		border-top: 1px solid var(--md-heading-border);
 		margin: 12px 0;
 	}
+	/*
+	 * Tailwind の preflight が ul/ol を list-style: none にリセットするため、
+	 * markdown 本文のリストだけマーカーを復元する。padding-left しか戻して
+	 * いなかったので、箇条書きの記号と番号付きリストの番号が両方消えていた
+	 * (実測 2026-07-25: 「手順を短く番号付きでまとめて」に対し ol は正しく
+	 *  生成されているのに 1. 2. 3. が表示されず、手順の順序が読み取れなかった)。
+	 */
 	.markdown-renderer :global(ul),
 	.markdown-renderer :global(ol) {
 		padding-left: 24px;
 		margin: 4px 0 8px;
+	}
+	.markdown-renderer :global(ul) {
+		list-style: disc outside;
+	}
+	.markdown-renderer :global(ol) {
+		list-style: decimal outside;
+	}
+	.markdown-renderer :global(ul ul) {
+		list-style-type: circle;
+	}
+	.markdown-renderer :global(ul ul ul) {
+		list-style-type: square;
 	}
 	.markdown-renderer :global(li) {
 		margin-bottom: 2px;

@@ -190,6 +190,118 @@ def reset_fact_triggers_cache() -> None:
         _TRIGGERS_CACHE.clear()
 
 
+#: ``{mode: {fact_type: ((attribute_slug, (trigger, ...)), ...)}}``。
+#: attribute は YAML 記載順を保持する (先勝ちの優先順位になるため)。
+FactAttributeMap = dict[str, dict[str, tuple[tuple[str, tuple[str, ...]], ...]]]
+
+_ATTRS_LOCK = threading.Lock()
+_ATTRS_CACHE: dict[str, FactAttributeMap] = {}
+
+
+def load_fact_attributes(path: str | Path) -> FactAttributeMap:
+    """``fact_attributes.yaml`` をロードする。
+
+    欠落 / パース失敗時は空辞書を返す (属性分割が無効になるだけで、呼出側は
+    従来どおり ``"user"`` へフォールバックする)。例外は投げない。
+    """
+    p = Path(path)
+    result: FactAttributeMap = {"chat": {}, "coding": {}}
+    if not p.exists():
+        logger.warning(
+            "fact_attributes file not found: %s — attribute subjects disabled", p,
+        )
+        return result
+    try:
+        raw: Any = yaml.safe_load(p.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning("fact_attributes load failed (%s): %s", p, exc)
+        return result
+    if not isinstance(raw, dict):
+        logger.warning("fact_attributes root is not mapping: %s", p)
+        return result
+
+    for mode_key in ("chat", "coding"):
+        section = raw.get(mode_key) or {}
+        if not isinstance(section, dict):
+            continue
+        per_type: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {}
+        for tag, attrs in section.items():
+            if not isinstance(tag, str) or not isinstance(attrs, dict):
+                continue
+            ordered: list[tuple[str, tuple[str, ...]]] = []
+            for slug, triggers in attrs.items():
+                if not isinstance(slug, str):
+                    continue
+                words = _coerce_triggers(triggers)
+                if words:
+                    ordered.append((slug, words))
+            if ordered:
+                per_type[tag] = tuple(ordered)
+        result[mode_key] = per_type
+
+    logger.info(
+        "fact_attributes loaded: chat=%d types / coding=%d types (from %s)",
+        len(result["chat"]), len(result["coding"]), p,
+    )
+    return result
+
+
+def get_fact_attributes(path: str | Path) -> FactAttributeMap:
+    """パスをキーとした ``FactAttributeMap`` のキャッシュ取得。"""
+    key = str(Path(path).resolve())
+    with _ATTRS_LOCK:
+        cached = _ATTRS_CACHE.get(key)
+        if cached is not None:
+            return cached
+        attrs = load_fact_attributes(path)
+        _ATTRS_CACHE[key] = attrs
+        return attrs
+
+
+def reset_fact_attributes_cache() -> None:
+    """テスト用: キャッシュ全消去。"""
+    with _ATTRS_LOCK:
+        _ATTRS_CACHE.clear()
+
+
+def resolve_fact_attributes_path(triggers_dir: str | Path | None = None) -> Path:
+    """``fact_attributes.yaml`` の解決パスを返す (user override → default)。"""
+    from backend.free.memory._defaults import resolve_trigger_file
+
+    return resolve_trigger_file("fact_attributes.yaml", triggers_dir=triggers_dir)
+
+
+def resolve_fact_attribute(
+    text: str,
+    fact_type: str,
+    *,
+    mode: str = "chat",
+    triggers_dir: str | Path | None = None,
+) -> str | None:
+    """``text`` から ``fact_type`` の属性スラグを決定する。
+
+    YAML 記載順に走査し、最初に部分一致した attribute を返す。どれにも
+    一致しなければ ``None`` (呼出側は ``"user"`` 等へフォールバックする)。
+
+    subject の粒度を属性単位にすることで、競合検出 (``(subject, predicate)``
+    キー) が無関係な事実を同一事実の競合版と誤判定するのを防ぐ。
+    """
+    if not text:
+        return None
+    if triggers_dir is None:
+        triggers_dir = _DEFAULT_TRIGGERS_DIR
+    attrs = get_fact_attributes(resolve_fact_attributes_path(triggers_dir))
+    per_type = attrs.get(mode) or {}
+    ordered = per_type.get(fact_type) or ()
+    if not ordered:
+        return None
+    haystack = _normalize_trigger(text)
+    for slug, words in ordered:
+        if any(w in haystack for w in words):
+            return slug
+    return None
+
+
 def resolve_fact_triggers_path(triggers_dir: str | Path | None = None) -> Path:
     """``fact_triggers.yaml`` の解決パスを返す (user override → default)。"""
     from backend.free.memory._defaults import resolve_trigger_file
@@ -425,6 +537,15 @@ class _ModeAwareNoteBuilder(NoteBuilder):
         if self._explicit_triggers_dir is not None:
             return self._explicit_triggers_dir
         return _DEFAULT_TRIGGERS_DIR
+
+    @property
+    def triggers_dir(self) -> str | Path | None:
+        """解決に使う triggers_dir (明示指定 → モジュール default)。
+
+        Extractor 側が ``resolve_fact_attribute`` へ同じ override を渡すための
+        公開アクセサ。
+        """
+        return self._effective_triggers_dir
 
     @property
     def fact_triggers(self) -> dict[str, tuple[str, ...]]:

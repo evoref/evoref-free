@@ -29,7 +29,10 @@ from backend.free.memory.extractors.base import (
     ExtractionContext,
     ExtractionResult,
 )
-from backend.free.memory.notes.note_builder import ChatNoteBuilder
+from backend.free.memory.notes.note_builder import (
+    ChatNoteBuilder,
+    resolve_fact_attribute,
+)
 from backend.free.memory.stores.short_term import MemoryNote
 from backend.free.memory.notes.subject_ns import make_mem_subject
 from backend.free.memory.types import FactType, SemanticFact
@@ -227,7 +230,17 @@ class ChatExtractor(BaseExtractor):
                     trigger_words = self._builder.fact_triggers.get(tag, ())
                     if _tag_evidence_is_question_only(content, trigger_words):
                         continue
-                    subject = make_mem_subject(kind, "user")
+                    # subject を属性単位に分割する (mem.personal.machine_spec 等)。
+                    # 一律 "user" だと、競合検出が (subject, predicate) キーで
+                    # 類似度を見ずにグルーピングするため、無関係な事実
+                    # (コメント方針 vs GPU 仕様) まで同一事実の競合版と誤判定され
+                    # 恒久 pending 化する (2026-07-25)。辞書に無ければ従来どおり
+                    # "user" へフォールバックするので退行しない。
+                    attr = resolve_fact_attribute(
+                        content, tag, mode="chat",
+                        triggers_dir=self._builder.triggers_dir,
+                    )
+                    subject = make_mem_subject(kind, attr or "user")
                 else:
                     # world_fact のみ: keyword (sanitized) を parts に使用
                     keyword = _world_fact_keyword(note)

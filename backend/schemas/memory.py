@@ -156,7 +156,13 @@ class ConflictChatReviewConfig(BaseModel):
     # チャットでの pending 確認・解決フロー全体の有効/無効
     enabled: bool = True
     # 注入するグループ数の上限 (0 = 無制限)。超過分は件数のみ要約する。
-    max_groups: int = Field(default=0, ge=0)
+    # 2026-07-25: 既定 0 (無制限) では pending が溜まるほどブロックが膨張し、
+    # Tier 予算の外で数百トークンを消費していた (実測 16 件 = 840 tokens)。
+    max_groups: int = Field(default=3, ge=0)
+    # ブロック全体のトークン上限 (0 = 無制限)。グループ数だけでは member 数の
+    # 多いグループを抑えられないため併用する。設計書 §203 の「drop されない」
+    # 保証のため、上限を超えても最低 1 グループは必ず注入する。
+    max_tokens: int = Field(default=400, ge=0)
     # conflict_chat_judge (assist) のセッション内発火上限。上限到達後は
     # 同一セッションでの判定と pending 注入を停止し、滞留 pending が
     # 毎ターン realtime スロットを専有するのを防ぐ。0 = 無制限 (従来動作)。
@@ -236,6 +242,20 @@ class InjectionConfig(BaseModel):
     chat_budget_tokens: int = Field(default=800, ge=0)
     coding_budget_tokens: int = Field(default=2000, ge=0)
     tier_ratios: InjectionTierRatios = Field(default_factory=InjectionTierRatios)
+    relevance_enabled: bool = Field(
+        default=True,
+        description=(
+            "クエリ埋め込みとの関連度で注入候補を足切りするか。False で"
+            "従来の静的スコアのみ (recency / type / tier) に戻る"
+        ),
+    )
+    relevance_min_score: float = Field(
+        default=0.35, ge=0.0, le=1.0,
+        description=(
+            "関連度ゲートのコサイン類似度閾値。実測 (LFM2.5-Embedding-350M) で"
+            "真陽性 0.38〜0.44 / ノイズ中央値 0.12〜0.17"
+        ),
+    )
 
 
 class PinConfig(BaseModel):
@@ -361,7 +381,14 @@ class MemoryConfig(BaseModel):
     semmem_limits: SemMemLimitsConfig = Field(default_factory=SemMemLimitsConfig)
     # プロジェクトアーカイブ
     project: SemMemProjectConfig = Field(default_factory=SemMemProjectConfig)
-    working_max_turns: int = Field(default=10, ge=1)
+    # ターン数はトークン上限より先に効かせない。ターン数超過は無圧縮の
+    # ハード eviction (古い発言が丸ごと消える) だが、トークン超過は
+    # compress_turn による段階的縮退なので、後者を主たる制約にする。
+    # 10 だと実測 ~59 tok/turn で 590 tok しか使わず working_max_tokens=2048 の
+    # 3 割未満で足切りされ、5 往復前の自己紹介が文脈から消えていた
+    # (2026-07-25 実測: 20 ターン会話で名前・職業・趣味を想起できず
+    #  search_history へ不要フォールバック)。
+    working_max_turns: int = Field(default=30, ge=1)
     working_max_tokens: int = Field(default=2048, ge=256)
     # 過去履歴の最低確保トークン数 (床)。動的ブロック (few-shot/file/semmem/RAG) の
     # 配分前に予約し、予算圧迫時でも直近の会話文脈が丸ごと締め出されるのを防ぐ。

@@ -36,6 +36,41 @@ def extract_target_chars(instruction: str, default: int = 1000) -> int:
     return default
 
 
+# 数値を伴わない「簡潔に」要求のシグナル。``_TARGET_CHARS_RE`` は「300 字以内」の
+# ような数値指定しか拾えないため、これらは従来まったく計画へ伝わらなかった
+# (実測 2026-07-25: 「丁寧だが冗長にならない書き方で」→ 6 ユニット 7,192 字、
+#  「3 つ挙げて。箇条書きで簡潔に」→ 6 ユニット 3,264 字)。
+_BREVITY_PATTERNS = (
+    re.compile(r"簡潔|冗長に(?:なら|し)ない|手短|端的|要点だけ|要点のみ"),
+    re.compile(r"箇条書き|箇条書|リスト形式で"),
+    re.compile(r"(?:一言|ひとこと|短く|短め|コンパクト)(?:で|に)"),
+    re.compile(
+        r"\b(?:concise(?:ly)?|briefly|brief|succinct|terse|in\s+bullet"
+        r"|bullet\s*points?|keep\s+it\s+short|tl;?dr)\b",
+        re.IGNORECASE,
+    ),
+)
+
+#: ブレビティ要求時に被せる目標文字数の上限。
+BREVITY_TARGET_CHARS = 600
+
+#: ブレビティ要求時、ユニット 1 個あたりに割り当てる最小文字数。ユニットは
+#: 最低 200 トークン (≒330 字) 生成されるため、目標に対してユニット数が多いと
+#: それ自体が冗長化の原因になる。
+BREVITY_CHARS_PER_UNIT = 400
+
+
+def detect_brevity_cap(instruction: str) -> int:
+    """指示に数値を伴わない簡潔さ要求があれば目標文字数の上限を返す。
+
+    無ければ ``0``。明示の文字数指定 (``extract_target_chars``) がある場合は
+    そちらが優先されるため、呼出側は数値指定が無いときだけ本関数を使う。
+    """
+    if any(p.search(instruction) for p in _BREVITY_PATTERNS):
+        return BREVITY_TARGET_CHARS
+    return 0
+
+
 def chars_to_tokens(chars: int) -> int:
     """日本語文字数からトークン数を概算する
 
@@ -95,6 +130,11 @@ class SectionPlan:
     # SPLIT モード時に LLM が指定する出力ファイル名候補。``None`` の場合は
     # オーケストレータが連番フォールバック (例: ``unit_03``) を採用する。
     file_name: str | None = None
+    # 過大ユニットの分割で生まれた続きユニットの通し番号 (0 = 親 / 分割なし)。
+    # 以前は heading に「（続き2）」を埋め込んでいたため、見出し文字列が
+    # プロンプトのセクション一覧経由で本文へ漏出していた (2026-07-25)。
+    # 分割は構造データで持ち、heading は親と同一に保つ。
+    sub_index: int = 0
 
 
 @dataclass

@@ -41,6 +41,8 @@ from __future__ import annotations
 
 import math
 import time
+
+import numpy as np
 from dataclasses import dataclass, field
 from typing import Iterable, Literal
 
@@ -72,6 +74,21 @@ DEFAULT_POLICY_ACTIVATION_MIN_CONFIDENCE = 0.7
 
 #: スコア計算で用いる recency 半減期 (日)
 _RECENCY_HALF_LIFE_DAYS = 14.0
+
+#: 関連度ゲートの既定閾値 (クエリ埋め込みとのコサイン類似度)。
+#:
+#: 従来 inject() は query を受け取らず、recency / type / tier 比率の静的スコア
+#: だけで候補を選んでいた。そのため話題に関係なく毎ターン同じ「ユーザーの
+#: プロフィール」や「過去の質問文」が注入され、弱い base モデルがそれを
+#: 「いま答えるべき対象」と誤解して復唱する事象が起きていた
+#: (実測 2026-07-25: 「応答は日本語で書いてほしい」に対し、注入された
+#:  過去の質問「私の名前と出身地、覚えていますか？」へ回答した)。
+#:
+#: 閾値は稼働 embed (LFM2.5-Embedding-350M) での実測から決めた:
+#:   真陽性  GPU 想起→GPU ノート 0.3787 / コメント方針→方針ノート 0.4441
+#:   ノイズ  中央値 0.12〜0.17
+#: 0.40 では GPU ノート (0.3787) を落とすため 0.35 を採用する。
+DEFAULT_RELEVANCE_MIN_SCORE = 0.35
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -174,6 +191,12 @@ class MemoryInjector:
                 DEFAULT_POLICY_ACTIVATION_MIN_CONFIDENCE,
             ),
         )
+        self.relevance_enabled: bool = bool(
+            cfg.get("relevance_enabled", True),
+        )
+        self.relevance_min_score: float = float(
+            cfg.get("relevance_min_score", DEFAULT_RELEVANCE_MIN_SCORE),
+        )
         self._now_provider = now_provider or time.time
 
     # ── public API ────────────────────────────────────────────────────
@@ -186,6 +209,7 @@ class MemoryInjector:
         stm_notes: Iterable[MemoryNote] = (),
         current_project_id: str | None = None,
         failure_signatures: Iterable[str] | None = None,
+        query_embedding: "np.ndarray | None" = None,
     ) -> InjectionPlan:
         """注入計画を構築する。
 
@@ -198,6 +222,10 @@ class MemoryInjector:
                 すべて他プロジェクト扱いになる。
             failure_signatures: Tier 1 注入を許可する failure_pattern の
                 ``failure_signature`` 集合 (signature 一致時のみ Tier 1)。
+            query_embedding: 現在のユーザー発話の埋め込み。与えられた場合、
+                埋め込みを持つ候補は類似度 ``relevance_min_score`` 未満なら
+                注入しない (``pinned`` は明示指定なので常に通す)。``None``
+                なら関連度ゲートは無効 (従来どおり静的スコアのみで選ぶ)。
 
         Returns:
             :class:`InjectionPlan` — 採用候補 / 削除候補 / 使用トークン。
@@ -209,12 +237,20 @@ class MemoryInjector:
         budget = self.chat_budget if is_chat_mode(mode) else self.coding_budget
         ratios = self.chat_ratios if is_chat_mode(mode) else self.coding_ratios
         tier_budgets = self._tier_budgets(budget, ratios)
+        query_vec = self._prepare_query_vec(query_embedding)
+        filtered_out = 0
 
         # Tier ごとに分類
         buckets: dict[int, list[InjectedItem]] = {1: [], 2: [], 3: [], 4: []}
 
         for fact in facts:
             if fact.superseded_by:
+                continue
+            if not self._is_relevant(
+                query_vec, getattr(fact, "embedding", None),
+                pinned=bool(fact.pinned),
+            ):
+                filtered_out += 1
                 continue
             tier = self._classify_fact(
                 fact, mode, current_project_id, sigs,
@@ -236,6 +272,13 @@ class MemoryInjector:
             )
 
         for note in stm_notes:
+            if not self._is_relevant(
+                query_vec, getattr(note, "embedding", None),
+                # MemoryNote 側の pin 属性は ``pin_flag`` (SemanticFact は ``pinned``)。
+                pinned=bool(getattr(note, "pin_flag", False)),
+            ):
+                filtered_out += 1
+                continue
             tier = self._classify_note(note, mode, current_project_id)
             if tier is None:
                 continue
@@ -273,11 +316,52 @@ class MemoryInjector:
 
         logger.debug(
             "MemoryInjector.inject: mode=%s budget=%d used=%d items=%d "
-            "dropped=%d project=%s sigs=%d",
+            "dropped=%d project=%s sigs=%d relevance=%s filtered=%d",
             mode, budget, plan.used_tokens, len(plan.items),
             len(plan.dropped), current_project_id, len(sigs),
+            "on" if query_vec is not None else "off", filtered_out,
         )
         return plan
+
+    # ── 関連度ゲート ──────────────────────────────────────────────────
+
+    def _prepare_query_vec(
+        self, query_embedding: "np.ndarray | None",
+    ) -> "np.ndarray | None":
+        """関連度ゲート用に正規化済みクエリベクトルを返す。無効なら ``None``。"""
+        if query_embedding is None or not self.relevance_enabled:
+            return None
+        v = np.asarray(query_embedding, dtype=np.float32).ravel()
+        norm = float(np.linalg.norm(v))
+        if not norm or not np.isfinite(norm):
+            return None
+        return v / norm
+
+    def _is_relevant(
+        self,
+        query_vec: "np.ndarray | None",
+        embedding: "np.ndarray | None",
+        *,
+        pinned: bool,
+    ) -> bool:
+        """関連度ゲートを通すか判定する。
+
+        - ゲート無効 (``query_vec is None``) → 常に通す (従来挙動)
+        - ``pinned`` → ユーザーの明示指定なので常に通す
+        - 埋め込みを持たない候補 → 判定不能なので通す (安全側)
+        - それ以外 → コサイン類似度 >= ``relevance_min_score`` のみ通す
+        """
+        if query_vec is None or pinned:
+            return True
+        if embedding is None:
+            return True
+        w = np.asarray(embedding, dtype=np.float32).ravel()
+        if w.shape != query_vec.shape:
+            return True
+        norm = float(np.linalg.norm(w))
+        if not norm or not np.isfinite(norm):
+            return True
+        return float(query_vec @ (w / norm)) >= self.relevance_min_score
 
     # ── tier 分類 ────────────────────────────────────────────────────
 

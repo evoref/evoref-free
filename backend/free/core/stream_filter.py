@@ -161,6 +161,83 @@ class StreamThinkingFilter:
         )
 
 
+class RepetitionGuardFilter:
+    """同一行の暴走反復を検知して以降の出力を打ち切る。
+
+    サンプリング側のペナルティ (``frequency_penalty``) は反復の確率を下げるだけで
+    ゼロにはできず、実測 2026-07-25 のライブ検証では ``frequency_penalty=0.3``
+    を適用した状態でも、ユーザーの質問文をそのまま 20 回複製し続ける応答が
+    発生した (回答全体がユーザー自身の質問の羅列に置き換わり、実行済みの
+    ツール結果も反映されない)。確率的な緩和とは独立した決定論的な安全網として、
+    同一行が連続で規定回数現れた時点で以降を捨てる。
+
+    誤爆を避けるため、判定は以下を満たす行に限る:
+
+    - 空白除去後 ``_MIN_LINE_CHARS`` 文字以上 (箇条書きの短い項目や
+      区切り線、表の罫線を巻き込まない)
+    - 直前に出力した行と完全一致 (間に別の行が挟まればカウントはリセット)
+
+    StreamFilter プロトコルに準拠: process() / flush()
+    """
+
+    _MIN_LINE_CHARS = 12
+    _MAX_CONSECUTIVE = 3
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._last_line = ""
+        self._repeat_count = 1
+        self._tripped = False
+
+    @property
+    def tripped(self) -> bool:
+        """反復を検知して打ち切ったかどうか"""
+        return self._tripped
+
+    def _line_is_repeat(self, line: str) -> bool:
+        """行を消費し、打ち切るべきなら True を返す。"""
+        stripped = line.strip()
+        if len(stripped) < self._MIN_LINE_CHARS:
+            # 短い行は正当な繰り返し (箇条書き記号・空行) がありうるため
+            # カウント対象にせず、連鎖も切らない
+            return False
+        if stripped == self._last_line:
+            self._repeat_count += 1
+        else:
+            self._last_line = stripped
+            self._repeat_count = 1
+        return self._repeat_count >= self._MAX_CONSECUTIVE
+
+    def process(self, text: str) -> str:
+        """テキストを供給し、打ち切り後は空文字列を返す。"""
+        if self._tripped:
+            return ""
+        if not text:
+            return ""
+        self._buffer += text
+        out: list[str] = []
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if self._line_is_repeat(line):
+                self._tripped = True
+                self._buffer = ""
+                logger.warning(
+                    "RepetitionGuardFilter: truncated output after %d identical "
+                    "lines (line=%.40s)",
+                    self._repeat_count, self._last_line,
+                )
+                return "".join(out)
+            out.append(line + "\n")
+        return "".join(out)
+
+    def flush(self) -> str:
+        """残りバッファを排出する (打ち切り済みなら空)。"""
+        if self._tripped:
+            return ""
+        remaining, self._buffer = self._buffer, ""
+        return remaining
+
+
 class HeadBufferFilter:
     """先頭バッファ: 最初の改行までバッファリングし、装飾ラベルを除去
 
