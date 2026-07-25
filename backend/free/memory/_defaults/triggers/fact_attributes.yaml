@@ -1,0 +1,269 @@
+# EvorefMem — ユーザーファクトの属性 subject 辞書
+#
+# 目的:
+#   ``personal_fact`` / ``preference`` / ``emotion`` / ``opinion`` の subject を
+#   属性単位 (``mem.personal.name`` / ``mem.preference.coding_style`` 等) に
+#   分割する。設計書 f_02_memory_system.md §4.2 の subject 規約に対応。
+#
+# なぜ必要か (2026-07-25):
+#   従来これらは一律 ``mem.personal.user`` 等の 1 subject にまとめられていた。
+#   競合検出 (``semantic_conflict_resolver._detect_groups``) は
+#   ``(subject, predicate)`` が同じで object が異なれば **類似度を見ずに**
+#   競合と判定するため、「コメント方針」と「GPU 仕様」のように無関係な事実まで
+#   同一事実の競合版と誤判定され、恒久 pending 化してチャットの競合セクションを
+#   毎ターン汚染していた。
+#
+# 構成:
+#   mode (chat)
+#     └ fact_type (personal_fact / preference / emotion / opinion)
+#         └ attribute_slug: [trigger, ...]
+#
+# マッチング規則 (note_builder.resolve_fact_attribute):
+#   1. 入力テキストを NFKC + lowercase
+#   2. 当該 fact_type の attribute を **YAML 記載順** に走査し、
+#      trigger が 1 語でも部分一致した最初の attribute を採用する
+#   3. どれにも一致しなければ ``None`` (呼出側が従来どおり "user" にフォールバック)
+#
+#   → 記載順が優先順位。具体的な属性 (machine_spec 等) を先に、
+#     汎用的な属性 (other 寄り) を後ろに置くこと。
+#
+# attribute_slug の制約:
+#   ``subject_ns._SAFE_PART_RE`` により **ASCII 英数字 / _ / -** のみ。
+#   日本語スラグは ``SubjectNamespaceError`` になる。
+#
+# 粒度の指針:
+#   細かすぎると「同じ属性の言い直し」が別 subject に分裂して真の競合を
+#   取り逃す。逆に粗すぎると無関係な事実が競合扱いになる。
+#   「ユーザーが後から言い直しうる単位」を 1 attribute とする。
+#
+# ユーザー上書き: ``local/triggers/fact_attributes.yaml`` に同名ファイルを置くと
+# package 同梱 default に代えて読み込まれる (fact_triggers.yaml と同じ方針)。
+
+chat:
+  personal_fact:
+    # 具体的・固有性の高いものを先に置く
+    machine_spec:
+      - gpu
+      - cpu
+      - vram
+      - ram
+      - メモリは
+      - メモリが
+      - 開発マシン
+      - 開発環境
+      - マシンは
+      - スペック
+      - ryzen
+      - radeon
+      - geforce
+      - intel
+      - core i
+      - ssd
+      - ストレージ
+    birthday:
+      - 誕生日
+      - 生年月日
+      - 何歳
+      - 歳です
+      - 才です
+      - birthday
+      - years old
+    contact:
+      - メールアドレス
+      - 連絡先
+      - 電話番号
+      - 内線
+      - email address
+      - phone number
+    family:
+      - 家族
+      - 妻
+      - 夫
+      - 息子
+      - 娘
+      - 子ども
+      - 子供
+      - 両親
+      - my wife
+      - my husband
+      - my kids
+    health:
+      - 体調
+      - 睡眠
+      - 健康
+      - 持病
+      - アレルギー
+      - 疲れやすい
+    location:
+      - 在住
+      - 住んで
+      - 住まい
+      - 出身
+      - 引っ越
+      - 地元
+      - 勤務地
+      - i live in
+      - i'm from
+      - i am from
+    occupation:
+      - 仕事は
+      - 職業
+      - 勤務
+      - 勤めて
+      - 働いて
+      - 会社は
+      - 所属は
+      - 部署
+      - エンジニアです
+      - i work as
+      - my job
+      - my company
+    schedule:
+      - 予定
+      - 締切
+      - 期限
+      - 会議
+      - ミーティング
+      - スケジュール
+      - 来週
+      - 来月
+      - 明日まで
+      - deadline
+      - meeting
+    policy:
+      # 「私の方針は…」形式。personal_fact タグで拾われるが内容は作業方針。
+      # preference.coding_style と重複しうるが、タグが片方しか立たないため両方に置く。
+      - 方針
+      - ルールは
+      - 規約
+      - コメントは
+      - コメントを
+      - 命名は
+      - スタイルは
+      - 進め方は
+    name:
+      - 名前は
+      - 名前が
+      - 名前を
+      - と申します
+      - と呼んで
+      - my name
+      - call me
+
+  preference:
+    language:
+      - 日本語で
+      - 英語で
+      - 応答は
+      - 回答は
+      - 返答は
+      - 出力は
+      - in japanese
+      - in english
+      - respond in
+    coding_style:
+      - コメント
+      - 命名
+      - インデント
+      - 型ヒント
+      - docstring
+      - フォーマッタ
+      - コーディング規約
+      - コードスタイル
+      - naming
+      - code style
+    communication_style:
+      - 簡潔
+      - 冗長
+      - 詳しく
+      - 端的
+      - ざっくり
+      - 丁寧に
+      - 箇条書き
+      - concise
+      - verbose
+      - in detail
+    tooling:
+      - エディタ
+      - vscode
+      - vim
+      - emacs
+      - ターミナル
+      - シェル
+      - powershell
+      - windows
+      - linux
+      - macos
+      - フレームワーク
+      - ライブラリは
+    workflow:
+      - テストは
+      - レビュー
+      - ブランチ
+      - コミット
+      - プルリク
+      - ci
+      - 進め方
+      - 作業時間
+    food:
+      - 食べ物
+      - 料理
+      - 飲み物
+      - 好きな味
+    hobby:
+      - 趣味
+      - 休日は
+      - 余暇
+      - hobby
+    media:
+      - 音楽
+      - 映画
+      - 本は
+      - 読書
+      - ゲームは
+
+  emotion:
+    workload:
+      - 忙し
+      - 疲れ
+      - ストレス
+      - 手一杯
+      - 余裕がな
+    frustration:
+      - 困って
+      - 苛立
+      - もどかし
+      - うまくいかな
+      - 厄介
+    anxiety:
+      - 不安
+      - 心配
+      - 迷って
+      - 悩んで
+    satisfaction:
+      - 嬉し
+      - 楽し
+      - 満足
+      - 助かった
+      - ありがた
+
+  opinion:
+    tech_stack:
+      - 技術選定
+      - 言語は
+      - フレームワーク
+      - ライブラリ
+      - アーキテクチャ
+      - 設計は
+    process:
+      - 進め方
+      - 方針
+      - 運用
+      - 体制
+      - ルール
+    product:
+      - 製品
+      - サービス
+      - 機能は
+      - ui
+      - ux

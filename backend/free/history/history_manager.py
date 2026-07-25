@@ -525,12 +525,24 @@ class HistoryManager:
         等のセッション自己参照質問を他セッションの内容と混同しないための
         スコープ限定 (呼出元は ``ToolCallJudge._maybe_scope_session_search``)。
         """
-        entries, _ = self.list_sessions(
-            limit=1000, mode=mode, date_from=date_from, date_to=date_to,
-            query=query,
-        )
         if session_id:
+            # session_id 指定時はクエリ絞り込みを **かけずに** 対象セッションを
+            # 取り、本体の turns を直接走査する。list_sessions(query=...) は
+            # index の search_text (先頭 _SEARCH_TEXT_MAX 文字) しか見ないため、
+            # 長いセッションでは後半の発言が索引に載らず、当のセッション自身が
+            # session_id 判定に到達する前に脱落していた
+            # (2026-07-25 実測: 100 ターン / 48,368 字のうち索引は 5,014 字 =
+            #  先頭 14 ターンのみ。「訂正」の初出は 10,602 字目で拾えず、
+            #  前日の別セッションが score 1.4 で 1 位になった)。
+            entries, _ = self.list_sessions(
+                limit=1000, mode=mode, date_from=date_from, date_to=date_to,
+            )
             entries = [e for e in entries if e.session_id == session_id]
+        else:
+            entries, _ = self.list_sessions(
+                limit=1000, mode=mode, date_from=date_from, date_to=date_to,
+                query=query,
+            )
 
         q_lower = query.lower()
 
@@ -548,7 +560,9 @@ class HistoryManager:
         results: list[dict] = []
         for entry, score in top_entries:
             matched_turns: list[dict] = []
-            if search_turns:
+            # session_id 指定時は索引を迂回してセッション本体を走査するため、
+            # ターンマッチは必須 (これが唯一のヒット源になる)。
+            if search_turns or session_id:
                 session = self.get_session(entry.session_id)
                 if session:
                     matched_turns = _find_matched_turns(session, q_lower)

@@ -1489,7 +1489,7 @@ class MetaCognitiveAgent:
             "id_slot": -1,
         }
         if generation_params:
-            for k in ("temperature", "top_p", "top_k", "presence_penalty", "repetition_penalty"):
+            for k in ("temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "repetition_penalty"):
                 if k in generation_params:
                     gen_kwargs[k] = generation_params[k]
         return gen_kwargs

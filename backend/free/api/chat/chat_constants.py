@@ -49,6 +49,14 @@ REACTIVE_LIGHT_MAX_TOKENS: int = 512
 #: ツール実行タイムアウト（秒）
 TOOL_EXECUTION_TIMEOUT_SEC: float = 30.0
 
+#: 内部で LLM 生成を行うツール (summarize / translate / draft_document) の
+#: 実行タイムアウト（秒）。既定 30 秒は生成系には短く、低速な環境では
+#: 常に失敗する (実測 2026-07-26: draft_document が会議テンプレート生成で
+#: 30 秒に達し、「ツール実行がタイムアウトしたため完了していません」だけが
+#: 回答として返った)。iGPU の decode 実測 7〜13 tok/s で数百トークンの
+#: 生成に 30〜60 秒かかるため、その 3 倍程度を確保する。
+LLM_TOOL_EXECUTION_TIMEOUT_SEC: float = 180.0
+
 #: ツール結果の最大文字数（超過分は先頭/末尾のみ残す）
 TOOL_RESULT_MAX_CHARS: int = 4096
 

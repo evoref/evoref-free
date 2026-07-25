@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from backend.free.agent.context_budget import resolve_meta_cognitive_loop_budget
 from backend.free.core.session_mode import is_chat_mode, is_coding_mode
 from backend.free.document_nouns import (
+    DOCUMENT_NOUN_LEARNABLE_JA,
     DOCUMENT_NOUNS_NEEDS_SUFFIX,
     DOCUMENT_NOUNS_NEEDS_SUFFIX_EN,
     DOCUMENT_NOUNS_STANDALONE,
@@ -718,11 +719,20 @@ class ComplexityClassifier:
         (2026-07-15: 「文書」「明日」等の学習語 1 hit で朝礼メモや CSV 依頼が
         ユニット分割パイプラインへ流出)。閾値以上の一致が 2 語以上、または
         重み合計が ``_LEARNED_LONG_FORM_MIN_WEIGHT_SUM`` 以上の場合のみ発火する。
+
+        さらに 2026-07-25 から、学習語だけで発火させるには文書種別名詞
+        (``DOCUMENT_NOUN_LEARNABLE_JA``) を 1 語以上含むことを必須にした。
+        学習側の許容リスト (``is_long_form_learnable``) と二重防御の関係で、
+        ストアに既存の汚染語が残っていても誤発火しない
+        (実測: 「ありがとう。技術的な議論の部分はとても有益だった」が
+        技術的 0.65 + 技術 0.5 の 2 語成立で 6,436 字の長文生成に化けた)。
         """
         if self._learned_patterns is None:
             return False
         matches = self._learned_patterns.match(query, category="long_form")
         if not matches:
+            return False
+        if not any(noun in query for noun in DOCUMENT_NOUN_LEARNABLE_JA):
             return False
         eligible = [w for _, w in matches if w >= self._long_form_threshold]
         if len(eligible) >= 2:

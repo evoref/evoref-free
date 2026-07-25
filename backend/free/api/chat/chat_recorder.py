@@ -23,6 +23,41 @@ logger = get_logger("api.chat.recorder")
 # ルーティング誤り (long_form_success の判定材料)。
 _DOC_TARGET_EXT_RE = re.compile(r"\.(?:md|txt|csv)\b", re.IGNORECASE)
 
+def is_content_type_mismatch(metrics: dict, user_query: str) -> bool:
+    """文書拡張子への出力依頼なのに ``content_type=code`` を返したか。
+
+    長文ルーティング自体の誤検出 (= ``long_form_false_positive``) の判定材料。
+    """
+    return (
+        bool(_DOC_TARGET_EXT_RE.search(user_query))
+        and str(metrics.get("content_type") or "") == "code"
+    )
+
+
+def judge_long_form_success(metrics: dict, user_query: str) -> bool:
+    """長文生成ターンの成否を判定する (Level 0 記録 / MDP episode 共通)。
+
+    条件:
+      - ``units_completed > 0`` (1 ユニット以上生成)
+      - ``validation_errors == 0`` (CODE は AST 検証、TEXT は残 review issue /
+        目標文字数比 / 文重複率のゲート。``orchestrator._validate_generated_text``)
+      - 要求成果物と ``content_type`` が矛盾しない (文書拡張子への出力依頼なのに
+        code 生成 = ルーティング誤り。2026-07-15 に Python コードを .md へ書いた
+        訂正ターンが「成功」として正例学習され誤ルーティングを増幅した)
+
+    失敗時は ``long_form_success=False`` となり、learned_patterns への boost も
+    新規追加も走らない。record 側と agent_trace 側で式が食い違うと同じターンが
+    別々の成否で二重学習されるため、両者はこの関数を共有する。
+    """
+    units_completed = int(metrics.get("units_completed", 0) or 0)
+    validation_errors = int(metrics.get("validation_errors", 0) or 0)
+    return (
+        units_completed > 0
+        and validation_errors == 0
+        and not is_content_type_mismatch(metrics, user_query)
+    )
+
+
 # セッション別の開始時刻（初回リクエスト時に記録）
 _session_started: dict[str, str] = {}
 
@@ -169,6 +204,7 @@ def record_response(
     tool_command: str | None = None,
     tool_command_name: str | None = None,
     tool_command_success: bool | None = None,
+    tool_command_source: str | None = None,
     tool_routing_success: bool = False,
     rag_used: bool = False,
     rag_top1_score: float | None = None,
@@ -192,6 +228,7 @@ def record_response(
             tool_command=tool_command,
             tool_command_name=tool_command_name,
             tool_command_success=tool_command_success,
+            tool_command_source=tool_command_source,
         )
         drain_evicted_to_stm(wm, stm, session_id)
 
@@ -332,25 +369,9 @@ def record_long_form_response(
     fc = state.feedback_collector
     if fc and full_response and not private:
         try:
-            # 長文生成が成功したと判定できる条件:
-            #   - units_completed > 0 (1 ユニット以上生成)
-            #   - validation_errors == 0 (検証エラーなし)
-            #   - 要求成果物と content_type が矛盾しない (文書拡張子への出力
-            #     依頼なのに code 生成 = ルーティング誤り。2026-07-15 に
-            #     Python コードを .md へ書いた訂正ターンが「成功」として
-            #     正例学習され誤ルーティングを増幅した)
-            # 失敗時は long_form_success=False のままで、learned_patterns への
-            # boost は走らない (新規追加もなし)。
             units_completed = int(metrics.get("units_completed", 0) or 0)
             validation_errors = int(metrics.get("validation_errors", 0) or 0)
-            content_type = str(metrics.get("content_type") or "")
-            doc_target = bool(_DOC_TARGET_EXT_RE.search(user_query))
-            content_type_mismatch = doc_target and content_type == "code"
-            long_form_success = (
-                units_completed > 0
-                and validation_errors == 0
-                and not content_type_mismatch
-            )
+            long_form_success = judge_long_form_success(metrics, user_query)
 
             fc.record(
                 query=user_query,
@@ -369,7 +390,8 @@ def record_long_form_response(
                 # → false_positive (パターン重み decay の対象)。units>0 で
                 # validation_errors のみのケースは長文ルーティング自体は妥当なので除外。
                 long_form_false_positive=(
-                    units_completed == 0 or content_type_mismatch
+                    units_completed == 0
+                    or is_content_type_mismatch(metrics, user_query)
                 ),
                 cartridge_ids=_loaded_cartridge_ids(state),
                 rag_used=rag_used,

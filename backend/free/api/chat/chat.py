@@ -20,6 +20,7 @@ from backend.free.api.chat.chat_constants import (
     MAX_MESSAGE_LENGTH,
     REACTIVE_LIGHT_HISTORY_TURNS, REACTIVE_LIGHT_MAX_TOKENS,
     SESSION_ID_MAX_LENGTH, SESSION_ID_MIN_LENGTH,
+    DEFAULT_WORKING_MAX_TOKENS,
 )
 from backend.free.api.schemas import (
     CancelRequest, CancelResponse, ChatRequest, ChatResponse, TokenInfo,
@@ -451,6 +452,8 @@ async def _build_messages_with_search(
     # (RAG とは独立、読み取りのみ)。pending 競合セクションも併せて連結する。
     semmem_block = build_semmem_injection(
         state, cfg, mode=req.mode, conflict_ctx=conflict_ctx,
+        # 検索で算出済みのクエリ埋め込みを再利用し、無関係な記憶の注入を防ぐ
+        query_vec=search_result.query_vec,
     )
 
     messages = build_chat_messages(
@@ -463,6 +466,11 @@ async def _build_messages_with_search(
         history_min_tokens=int(
             (cfg.get("memory") or {}).get(
                 "history_min_tokens", DEFAULT_HISTORY_MIN_TOKENS,
+            ),
+        ),
+        working_max_tokens=int(
+            (cfg.get("memory") or {}).get(
+                "working_max_tokens", DEFAULT_WORKING_MAX_TOKENS,
             ),
         ),
     )
@@ -1137,6 +1145,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 maybe_resolve_pending_conflicts(
                     state, cfg, history, req.message,
                     allow_write=not req.private, session_id=session_id,
+                    mode=req.mode,
                 )
             )
             if (
@@ -1163,6 +1172,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             conflict_ctx = await maybe_resolve_pending_conflicts(
                 state, cfg, history, req.message,
                 allow_write=not req.private, session_id=session_id,
+                mode=req.mode,
             )
 
         # reactive→deliberative エスカレート時に Level 0 経験記録の出自を残す。

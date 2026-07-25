@@ -23,6 +23,8 @@ subject の pillar namespace (``mem.*``) を全面適用した
 
 from __future__ import annotations
 
+import hashlib
+
 from collections.abc import Iterable
 
 from backend.free.memory.extractors.base import (
@@ -90,6 +92,22 @@ def _coding_keyword(note: MemoryNote) -> str:
     return _sanitize_keyword(text[:24]) if text else "coding"
 
 
+def _task_signature(note: MemoryNote) -> str:
+    """``coding_task`` subject 用のタスク識別子 (内容ハッシュ、12 hex)。
+
+    従来 ``coding_task`` の subject は project_id だけだったため、1 プロジェクト
+    内の全タスクが 1 subject に集まり、競合検出 (``(subject, predicate)`` キー)
+    が別々のタスク依頼を「同一タスクの競合版」と誤判定して恒久 pending 化して
+    いた (2026-07-25 実測: 9 タスクが 1 subject、project scope の pending 16 件)。
+
+    ``subject_ns.make_mem_subject`` の docstring が示す
+    ``mem.coding_task.<project>.<id>`` 形式に合わせる。同一依頼の再アサートでは
+    同じ signature になり、正しく更新/競合判定される。
+    """
+    text = " ".join((note.content or "").split()).lower()
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+
+
 def _build_subject(tag: str, *, project_id: str, note: MemoryNote) -> str:
     """Coding extractor の subject を mem.* namespace で構築する"""
     if tag == "commitment":
@@ -99,7 +117,9 @@ def _build_subject(tag: str, *, project_id: str, note: MemoryNote) -> str:
     if tag == "decision":
         return make_mem_subject("decision", _sanitize_keyword(project_id))
     if tag == "task":
-        return make_mem_subject("coding_task", _sanitize_keyword(project_id))
+        return make_mem_subject(
+            "coding_task", _sanitize_keyword(project_id), _task_signature(note),
+        )
     if tag == "coding":
         return make_mem_subject("coding", _coding_keyword(note))
     # フォールバック (理論上到達しない)

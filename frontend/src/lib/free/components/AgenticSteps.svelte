@@ -5,6 +5,9 @@
 	import type { AgenticStep, StepResult, LongFormProgress } from '$lib/free/stores/chat';
 
 	let { steps = [], results = [], showSpinner = false, progress = undefined }: { steps?: AgenticStep[]; results?: StepResult[]; showSpinner?: boolean; progress?: LongFormProgress } = $props();
+	/** backend の search_history 空振り (builtin.SEARCH_HISTORY_NO_RESULTS_PREFIX) 検出用 */
+	const SEARCH_HISTORY_NO_MATCH_RE = /^search_history:\s*No results found for:/;
+
 	let showMode = $derived($layout.chat.show_agentic_steps);
 	let expanded = $state(false);
 
@@ -21,9 +24,34 @@
 	/** 長文生成のいずれかのユニットが失敗/打ち切りだったか (完了ラベルの出し分け用) */
 	let hasFailedResult = $derived(results.some((r) => r.status === 'failed'));
 
+	/**
+	 * ユニットは全て完了したが品質チェックで問題が出たケース。
+	 * 2026-07-25 に散文へ品質ゲートが入り、警告ステップが status='failed' で届くように
+	 * なったため、全ユニット完了でも「打ち切り」と表示されていた。件数ベースで区別する。
+	 */
+	let unitsAllCompleted = $derived(
+		progress != null && progress.total > 0 && progress.current >= progress.total
+	);
+	let qualityIssueOnly = $derived(hasFailedResult && unitsAllCompleted);
+
 	function formatElapsed(ms?: number): string {
 		if (ms == null) return '';
 		return (ms / 1000).toFixed(1);
+	}
+
+	/**
+	 * ステップ詳細の表示整形。
+	 *
+	 * search_history の空振りはバックエンドが英語の生文字列
+	 * `search_history: No results found for: <query>` で流してくる。失敗では
+	 * ないのにエラー文のように読め、かつ内部クエリ語がそのまま露出するため
+	 * (実測 2026-07-25: 11 回中 7 回が空振り)、中立なローカライズ表記に置き換える。
+	 */
+	function displayDetail(detail: string): string {
+		if (SEARCH_HISTORY_NO_MATCH_RE.test(detail)) {
+			return $t('chat.search_history_no_match');
+		}
+		return detail;
 	}
 
 	$effect(() => {
@@ -44,6 +72,8 @@
 				</span>
 				{#if $isStreaming}
 					{$t('chat.long_form_progress', { current: progress.current, total: progress.total, label: progress.label })}
+				{:else if qualityIssueOnly}
+					{$t('chat.long_form_quality_issue', { total: progress.total })}
 				{:else if hasFailedResult}
 					{$t('chat.long_form_incomplete', { total: progress.total })}
 				{:else}
@@ -73,7 +103,7 @@
 						<li class="step-item">
 							<span class="step-marker">{step.status === 'done' ? $t('chat.step_marker_done') : $t('chat.step_marker_active')}</span>
 							<span class="step-type">{step.type}</span>
-							<span class="step-detail">{step.detail}</span>
+							<span class="step-detail">{displayDetail(step.detail)}</span>
 							{#if step.elapsed_ms != null}
 								<span class="step-elapsed">{$t('chat.agentic_step_elapsed', { elapsed: formatElapsed(step.elapsed_ms) })}</span>
 							{/if}
@@ -94,7 +124,7 @@
 				{#each results as result}
 					<div class="result-item">
 						<span class="result-status" class:failed={result.status === 'failed'}>{result.status === 'failed' ? $t('chat.step_marker_failed') : $t('chat.step_marker_done')}</span>
-						<span class="result-text">{result.detail}</span>
+						<span class="result-text">{displayDetail(result.detail)}</span>
 					</div>
 				{/each}
 			</div>

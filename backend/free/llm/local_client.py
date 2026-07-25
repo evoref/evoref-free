@@ -9,6 +9,7 @@ import httpx
 from backend.exceptions import LLMConnectionError, LLMTimeoutError
 from backend.free.llm._base_client import (
     BaseHTTPClient,
+    HealthLogGate,
     MAX_ATTEMPTS,
     RETRYABLE_STATUS_CODES,
     async_retry_http_call,
@@ -328,6 +329,9 @@ class LocalClient(BaseHTTPClient):
         context_size: int | None = None,
     ):
         super().__init__(timeout=120.0)
+        # health check の DEBUG を状態変化時のみに絞る (ポーリングでログが埋まるのを防ぐ)
+        self._health_log_gate = HealthLogGate()
+
         self.url = llama_url
         self.metadata = metadata
         self._cache_prompt = cache_prompt
@@ -503,6 +507,7 @@ class LocalClient(BaseHTTPClient):
         top_p: float | None = None,
         top_k: int | None = None,
         presence_penalty: float | None = None,
+        frequency_penalty: float | None = None,
         repetition_penalty: float | None = None,
         id_slot: int | None = None,
         **extra,
@@ -524,6 +529,8 @@ class LocalClient(BaseHTTPClient):
             payload["top_k"] = top_k
         if presence_penalty is not None:
             payload["presence_penalty"] = presence_penalty
+        if frequency_penalty is not None:
+            payload["frequency_penalty"] = frequency_penalty
         if repetition_penalty is not None:
             payload["repetition_penalty"] = repetition_penalty
 
@@ -545,10 +552,11 @@ class LocalClient(BaseHTTPClient):
 
         logger.debug(
             "Payload built: stream=%s, temperature=%.2f, max_tokens=%s, "
-            "top_p=%s, top_k=%s, presence_penalty=%s, "
+            "top_p=%s, top_k=%s, presence_penalty=%s, frequency_penalty=%s, "
+            "repetition_penalty=%s, "
             "id_slot=%s, cache_prompt=%s, messages=%d, extra_keys=%s",
             stream, temperature, max_tokens,
-            top_p, top_k, presence_penalty,
+            top_p, top_k, presence_penalty, frequency_penalty, repetition_penalty,
             id_slot, self._cache_prompt, len(msgs),
             list(extra.keys()) or "none",
         )
@@ -563,6 +571,7 @@ class LocalClient(BaseHTTPClient):
         top_p: float | None = None,
         top_k: int | None = None,
         presence_penalty: float | None = None,
+        frequency_penalty: float | None = None,
         repetition_penalty: float | None = None,
         id_slot: int | None = None,
         request_timeout: float | None = None,
@@ -591,6 +600,7 @@ class LocalClient(BaseHTTPClient):
             top_p=top_p,
             top_k=top_k,
             presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
             id_slot=id_slot,
         )
@@ -941,7 +951,12 @@ class LocalClient(BaseHTTPClient):
             client = self._get_http_client()
             resp = await client.get(f"{self.url}/health", timeout=5.0)
             healthy = resp.status_code == 200
-            logger.debug("Health check: status=%d, healthy=%s", resp.status_code, healthy)
+            if self._health_log_gate.should_log(resp.status_code, healthy):
+                logger.debug(
+                    "Health check: status=%d, healthy=%s (suppressed %d identical)",
+                    resp.status_code, healthy,
+                    self._health_log_gate.take_suppressed(),
+                )
             return healthy
         except (httpx.ConnectError, httpx.TimeoutException):
             logger.debug("Health check: connection failed")

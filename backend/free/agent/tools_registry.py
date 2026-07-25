@@ -28,6 +28,12 @@ class ToolDefinition:
     parameters: dict[str, Any] = field(default_factory=dict)
     modes: list[str] = field(default_factory=lambda: ["chat", "coding"])
     hidden: bool = False
+    #: 実行タイムアウト (秒)。None なら呼出側の既定
+    #: (chat_constants.TOOL_EXECUTION_TIMEOUT_SEC) を使う。内部で LLM 生成を
+    #: 行うツールは既定 30 秒では足りない (実測 2026-07-26: draft_document が
+    #: 会議テンプレート生成で 30 秒に達し、タイムアウト文言がそのまま回答に
+    #: なった)。低速な環境ほど顕著なため、ツール側で宣言できるようにする。
+    timeout_sec: float | None = None
 
 
 class ToolsRegistry:
@@ -44,6 +50,7 @@ class ToolsRegistry:
         parameters: dict[str, Any] | None = None,
         modes: list[str] | None = None,
         hidden: bool = False,
+        timeout_sec: float | None = None,
     ) -> None:
         """ツールを登録"""
         self._tools[name] = ToolDefinition(
@@ -53,8 +60,16 @@ class ToolsRegistry:
             parameters=parameters or {},
             modes=modes or ["chat", "coding"],
             hidden=hidden,
+            timeout_sec=timeout_sec,
         )
         logger.info("Registered tool: %s", name)
+
+    def timeout_for(self, name: str, default: float) -> float:
+        """ツールの実行タイムアウトを返す (未宣言なら ``default``)。"""
+        tool = self._tools.get(name)
+        if tool is None or tool.timeout_sec is None:
+            return default
+        return tool.timeout_sec
 
     def has(self, name: str) -> bool:
         """ツールが登録済みかどうか"""

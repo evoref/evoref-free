@@ -44,6 +44,8 @@ EvorefMem 統合仕様 の自動 Pin 検出を実装する
 
 from __future__ import annotations
 
+import re
+
 import threading
 import unicodedata
 from dataclasses import dataclass, field
@@ -201,6 +203,36 @@ def _dedup(items: list[str]) -> list[str]:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+#: 疑問形の文末 (「覚えていますか？」等)。
+_PIN_QUESTION_ENDING_RE = re.compile(r"[?？]\s*$")
+
+#: 文区切り (。！？!?) の直後で分割する。
+_PIN_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?])\s*")
+
+
+def _trigger_evidence_is_question_only(content: str, word: str) -> bool:
+    """トリガ語を含む文がすべて疑問形かを判定する。
+
+    「覚えておいて」は保存指示だが「覚えていますか？」は **想起の依頼** であり、
+    保存すべき事実ではない。両方とも「覚えて」を含むため、トリガ語の部分一致
+    だけでは区別できない。
+
+    これを pin してしまうと、その質問文が Tier 1 の pinned ノートとして
+    毎ターン注入され続け、MemoryInjector の関連度ゲート (pinned は
+    ユーザーの明示指定として常に通す) も素通りする。実測 2026-07-25:
+    「ちょっと確認ですが、私の名前と出身地、覚えていますか？」が pin され、
+    無関係なターンで base モデルがこれを「いま答えるべき質問」と解釈していた。
+
+    ChatExtractor の ``_tag_evidence_is_question_only`` と同旨 (EvorefMem 内の
+    別モジュールなので最小実装を持つ)。
+    """
+    sentences = [s for s in _PIN_SENTENCE_SPLIT_RE.split(content) if s.strip()]
+    relevant = [s for s in sentences if word in s.lower()]
+    if not relevant:
+        return False
+    return all(_PIN_QUESTION_ENDING_RE.search(s.strip()) for s in relevant)
+
+
 def detect_pin(
     content: str,
     mode: MemoryMode,
@@ -247,6 +279,15 @@ def detect_pin(
     positives = triggers.mode_positive.get(mode, [])
     for word in positives:
         if word and word in norm:
+            # 「覚えていますか？」= 想起の依頼であって保存指示ではない。
+            # pin すると Tier 1 で毎ターン注入され、関連度ゲートも素通りする。
+            if _trigger_evidence_is_question_only(norm, word):
+                return PinDetection(
+                    should_pin=False,
+                    matched=word,
+                    reason=f"auto_detect_question:{word}",
+                    negated=False,
+                )
             return PinDetection(
                 should_pin=True,
                 matched=word,

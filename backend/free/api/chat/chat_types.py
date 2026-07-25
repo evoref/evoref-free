@@ -28,6 +28,7 @@ class GenerationParams(TypedDict, total=False):
     top_p: float
     top_k: int
     presence_penalty: float
+    frequency_penalty: float
     model: str | None
 
 

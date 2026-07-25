@@ -45,8 +45,14 @@ embedding:
   max_length: 512
   # URL/コマンドリコールの sim 閾値。embed 切替時 ModelMigrator が config.yaml の
   # tools.* (url_recall_min_score / executable_command_recall_min_score) へ転写する。
-  # LFM2.5-Embedding は同空間でも JA 類似度が低め (実測: 正例 0.46-0.54 / ノイズ <=0.14)
-  # なので 0.3 に較正 (Qwen3 用の既定 0.7 では正例も空振りする)。
+  # LFM2.5-Embedding は同空間でも JA 類似度が低め (Qwen3 用の既定 0.7 では正例も
+  # 空振りするため引き下げが必要)。
+  # 2026-07-25 再較正 (executable のみ): 当初のノイズ推定 (<=0.14) は実測と
+  # 乖離していた。稼働 embed へ当日クエリを再投入した実測では、executable でない
+  # クエリ (好みの表明 / 記憶想起 / 履歴検索依頼) が 0.31-0.36 に載り、閾値 0.3 が
+  # ノイズ帯の下にあった。正例 (日付質問) は 0.4323 なので、その間を取る。
+  # url 側は「ユーザーが URL を書いた」という決定論的根拠を伴い、当セッションで
+  # 誤発火の実測が無いため 0.3 のまま据え置く。
   recall:
     url_recall_min_score: 0.3
-    executable_command_recall_min_score: 0.3
+    executable_command_recall_min_score: 0.45

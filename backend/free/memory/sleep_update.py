@@ -41,6 +41,26 @@ SemanticStoreInvalidator = Callable[[str], None]
 
 logger = get_logger("memory.sleep_update")
 
+# STM ノートを埋め込む際の本文上限 (文字数)。llama-server の embed インスタンスは
+# n_ctx_slot が 2048〜4096 程度で運用されるため、超過すると
+# `input (N tokens) is larger than the max context size` で **400** が返り、
+# バッチ全体が失敗する (2026-07-25 の恒久デッドロックの起点)。
+# 日本語は 1 文字 ≒ 1 トークン強なので、最小構成 (2048) でも収まる値に取る。
+# ノートの先頭側に主題が来るため単純な前方切り出しで足りる。
+_EMBED_MAX_CHARS = 1500
+# 1 リクエストあたりのノート数。失敗時の巻き添えを小さくする。
+_EMBED_BATCH_SIZE = 16
+# 同一ノートの埋め込み連続失敗をこの回数まで許容し、超えたら以降スキップする
+# (毎サイクル同じノートで失敗し続けて Step 1 が前進しなくなるのを防ぐ)。
+_EMBED_MAX_FAILURES = 3
+
+
+def _truncate_for_embedding(text: str) -> str:
+    """埋め込み入力を ``_EMBED_MAX_CHARS`` で切り詰める。"""
+    if len(text) <= _EMBED_MAX_CHARS:
+        return text
+    return text[:_EMBED_MAX_CHARS]
+
 
 class SleepTimeWorker:
     """Sleep-time update の実行ワーカー"""
@@ -139,41 +159,49 @@ class SleepTimeWorker:
 
         logger.info("Sleep-time Light started (%d notes)", len(self.short_term.notes))
 
-        # Step 1: 未埋め込みノートの埋め込み生成
-        ts = time.monotonic()
-        result["embedded"] = await self._step1_embed_notes()
-        step_durations["step1_embedding"] = round(time.monotonic() - ts, 3)
-        if self._check_cancelled():
-            return result
+        # Step 1 が例外で抜けると Step 2-5.5 と _save_state() がまるごと飛び、
+        # 経験バッファ / STM / LTM / learned_patterns が一切永続化されないまま
+        # 次サイクルも同じ理由で落ち続ける (2026-07-25: 過大ノート 1 件の
+        # embed 400 で 26 分間・17 回連続失敗し、未埋め込みノートが 2→84 件へ
+        # 単調増加した。除去できるのは Step 4 eviction だが Step 1 で落ちるため
+        # 永久に到達しないデッドロック)。
+        # 各 step を独立させ、`_save_state()` は finally で必ず走らせる。
+        try:
+            # Step 1: 未埋め込みノートの埋め込み生成
+            ts = time.monotonic()
+            result["embedded"] = await self._step1_embed_notes()
+            step_durations["step1_embedding"] = round(time.monotonic() - ts, 3)
+            if self._check_cancelled():
+                return result
 
-        # Step 2: タグ補完（ルールベース）
-        ts = time.monotonic()
-        result["tags_refined"] = self._step2_refine_tags()
-        step_durations["step2_tagging"] = round(time.monotonic() - ts, 3)
-        if self._check_cancelled():
-            return result
+            # Step 2: タグ補完（ルールベース）
+            ts = time.monotonic()
+            result["tags_refined"] = self._step2_refine_tags()
+            step_durations["step2_tagging"] = round(time.monotonic() - ts, 3)
+            if self._check_cancelled():
+                return result
 
-        # Step 3: LightMem スコア再計算
-        ts = time.monotonic()
-        result["scores_updated"] = self._step3_recalc_scores()
-        step_durations["step3_scoring"] = round(time.monotonic() - ts, 3)
-        if self._check_cancelled():
-            return result
+            # Step 3: LightMem スコア再計算
+            ts = time.monotonic()
+            result["scores_updated"] = self._step3_recalc_scores()
+            step_durations["step3_scoring"] = round(time.monotonic() - ts, 3)
+            if self._check_cancelled():
+                return result
 
-        # Step 4: FadeMem eviction 判定
-        ts = time.monotonic()
-        result["evicted"] = self._step4_eviction()
-        step_durations["step4_eviction"] = round(time.monotonic() - ts, 3)
-        if self._check_cancelled():
-            return result
+            # Step 4: FadeMem eviction 判定
+            ts = time.monotonic()
+            result["evicted"] = self._step4_eviction()
+            step_durations["step4_eviction"] = round(time.monotonic() - ts, 3)
+            if self._check_cancelled():
+                return result
 
-        # Step 5.5: 学習済みパターンの減衰と永続化
-        ts = time.monotonic()
-        result["patterns_decayed"] = self._step5_5_decay_patterns()
-        step_durations["step5_5_patterns"] = round(time.monotonic() - ts, 3)
-
-        # 永続化
-        self._save_state()
+            # Step 5.5: 学習済みパターンの減衰と永続化
+            ts = time.monotonic()
+            result["patterns_decayed"] = self._step5_5_decay_patterns()
+            step_durations["step5_5_patterns"] = round(time.monotonic() - ts, 3)
+        finally:
+            # 永続化 (途中で落ちても、それまでの進捗は必ず書き出す)
+            self._save_state()
 
         elapsed = round(time.monotonic() - t0, 3)
         logger.info("Sleep-time Light completed in %.3fs: %s", elapsed, result)
@@ -486,25 +514,72 @@ class SleepTimeWorker:
         return result
 
     async def _step1_embed_notes(self) -> int:
-        """Step 1: 未埋め込みノートの埋め込み生成"""
+        """Step 1: 未埋め込みノートの埋め込み生成
+
+        1 件でも embed サーバの context を超えるノートがあるとバッチ全体が
+        400 で落ち、Step 2 以降と永続化がすべて飛ぶ (2026-07-25 のデッドロック)。
+        対策は 3 段:
+
+        1. ``_EMBED_MAX_CHARS`` でノート本文を切り詰めてから投げる (根本対策)
+        2. バッチ失敗時はノート単位へフォールバックし、健全なノートを救う
+        3. 連続失敗したノートは ``embed_failures`` を加算し、上限に達したら
+           以降スキップする (同じノートで永久に再試行しない)
+        """
         unembedded = [
             note for note in self.short_term.notes.values()
             if note.embedding is None
+            and note.embed_failures < _EMBED_MAX_FAILURES
         ]
         if not unembedded:
             logger.debug("Step 1: no unembedded notes, skipping")
             return 0
 
         logger.info("Step 1: embedding %d notes...", len(unembedded))
-        texts = [note.content for note in unembedded]
-        embeddings = await self.embedder.embed(texts, is_query=False)
-
-        for note, emb in zip(unembedded, embeddings):
-            note.embedding = emb.astype(np.float32)
+        embedded = 0
+        for start in range(0, len(unembedded), _EMBED_BATCH_SIZE):
+            batch = unembedded[start:start + _EMBED_BATCH_SIZE]
+            texts = [_truncate_for_embedding(n.content) for n in batch]
+            try:
+                embeddings = await self.embedder.embed(texts, is_query=False)
+            except Exception as exc:
+                logger.warning(
+                    "Step 1: batch embed failed (%d notes), "
+                    "falling back to per-note: %s", len(batch), exc,
+                )
+                embedded += await self._embed_notes_individually(batch)
+                continue
+            for note, emb in zip(batch, embeddings):
+                note.embedding = emb.astype(np.float32)
+                note.embed_failures = 0
+                embedded += 1
 
         self.short_term._cache_dirty = True
-        logger.info("Step 1: embedded %d notes", len(unembedded))
-        return len(unembedded)
+        logger.info("Step 1: embedded %d notes", embedded)
+        return embedded
+
+    async def _embed_notes_individually(self, notes: list) -> int:
+        """バッチ失敗時のフォールバック。健全なノートだけ個別に埋め込む。"""
+        embedded = 0
+        for note in notes:
+            try:
+                emb = await self.embedder.embed(
+                    [_truncate_for_embedding(note.content)], is_query=False,
+                )
+            except Exception as exc:
+                note.embed_failures += 1
+                logger.warning(
+                    "Step 1: note embed failed (%d/%d, len=%d): %s",
+                    note.embed_failures, _EMBED_MAX_FAILURES,
+                    len(note.content), exc,
+                )
+                continue
+            if emb is None or len(emb) == 0:
+                note.embed_failures += 1
+                continue
+            note.embedding = emb[0].astype(np.float32)
+            note.embed_failures = 0
+            embedded += 1
+        return embedded
 
     def _step2_refine_tags(self) -> int:
         """Step 2: タグ補完（ルールベース）

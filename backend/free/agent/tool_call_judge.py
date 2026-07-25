@@ -37,6 +37,18 @@ if TYPE_CHECKING:
 
 logger = get_logger("agent.tool_call_judge")
 
+# executable command リコールの候補プールがこの件数未満のとき、類似度閾値を
+# ``_RECALL_SMALL_POOL_MARGIN`` だけ嵩上げする。学習初期は top-K も success_avg も
+# 選別として機能せず、類似度ゲート 1 本で決まってしまうため。
+_RECALL_SMALL_POOL_SIZE = 3
+_RECALL_SMALL_POOL_MARGIN = 0.1
+
+# Windows / Unix の明示パス、または URL。ユーザーが対象を書いた決定論的シグナルで、
+# assist の否定票より優先してよい (``_upgrade_command_via_assist`` の降格例外)。
+_PATH_OR_URL_SIGNAL_RE = re.compile(
+    r"[A-Za-z]:\\|(?:^|[\s　])(?:/[\w._-]+){2,}|https?://",
+)
+
 # executable_command_synth が合成したコマンドの事後検証用。
 # synth プロンプトは「環境依存事実のみ・副作用/ネットワーク送信なし」を要求するが、
 # アシストがこれを破ってネットワークコマンドや構文エラーの python -c を返すため、
@@ -331,6 +343,23 @@ def _build_spec_command(query: str) -> str:
     )
 
 
+# 現在時刻 / 日付クエリ。executable 判定の中で最も曖昧さが小さく、assist が
+# 否定票を返しても regex 結果を維持してよい唯一の高特異度パターン
+# (``_upgrade_command_via_assist`` の降格例外)。
+# 「何時間」「何日間」は所要時間・期間を尋ねる表現であり現在時刻とは無関係。
+# 「何時」「何日」の部分一致で拾うと、ユーザーが提示した数値の集計を頼んでいる
+# 場面で datetime.now() が実行される (実測 2026-07-26: 「週合計の習い事時間は
+# 何時間ですか。計算してください」に対し現在時刻を取得し、無関係な結果を
+# 根拠として合計を 5 時間と正しく内訳しながら見出しには 12 時間と書いた)。
+# 本パターンは assist の否定票を上書きする高特異度扱いのため、誤検出すると
+# 必ずツールが発火する。「間」が続く場合は除外する。
+_DATETIME_QUERY_RE = re.compile(
+    r"(?:何時(?!間)|何月|何日(?!間)|何曜日|日時|日付|現在時刻"
+    r"|(?<![A-Za-z])today(?![A-Za-z])|(?<![A-Za-z])now(?![A-Za-z])"
+    r"|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+
 # Python 実行で正確に答えられるシステム情報クエリのコマンドマッピング
 # パターンにマッチしたクエリに対して、具体的な Python コマンドを生成する。
 # コマンドは Windows cmd.exe / Unix sh の両方で動作するよう、
@@ -339,12 +368,8 @@ def _build_spec_command(query: str) -> str:
 _EXECUTABLE_QUERY_COMMANDS: list[tuple[re.Pattern, "str | Callable[[str], str]"]] = [
     # 現在時刻 / 日付 (「何月|何日|何曜日」は明確な疑問語のみ追加、
     # 「今日|明日|昨日」単独は誤検出するため見送り)
-    (re.compile(
-        r"(?:何時|何月|何日|何曜日|日時|日付|現在時刻"
-        r"|(?<![A-Za-z])today(?![A-Za-z])|(?<![A-Za-z])now(?![A-Za-z])"
-        r"|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z]))",
-        re.IGNORECASE,
-    ), 'python -c "import datetime; print(datetime.datetime.now())"'),
+    (_DATETIME_QUERY_RE,
+     'python -c "import datetime; print(datetime.datetime.now())"'),
     # システムスペック（CPU / メモリ / ディスク）
     # ドライブレター指定があれば指定ドライブの容量を返す
     # CPU/RAM 等の英字略語は ASCII 境界必須 ("program" の 'ram' 誤マッチ対策)
@@ -357,16 +382,16 @@ _EXECUTABLE_QUERY_COMMANDS: list[tuple[re.Pattern, "str | Callable[[str], str]"]
         r"|(?<![A-Za-z])drive(?![A-Za-z]))",
         re.IGNORECASE,
     ), _build_spec_command),
-    # GPU / VRAM
-    (re.compile(
-        r"(?:(?<![A-Za-z])GPU(?![A-Za-z])|(?<![A-Za-z])VRAM(?![A-Za-z]))",
-        re.IGNORECASE,
-    ),
-     "python -c \""
-     "import platform;"
-     " print('Platform:',platform.platform());"
-     " print('Machine:',platform.machine())"
-     "\""),
+    # GPU / VRAM のエントリは 2026-07-25 に削除した。
+    # コマンドが platform.platform() / platform.machine() しか実行しておらず
+    # GPU 型番も VRAM 容量も一切返さないのに、実行が成功扱いになっていた
+    # (実測: 「さっき伝えた GPU は？」→ "Platform: Windows-11 / Machine: AMD64" →
+    #  「ツール結果に GPU 型番は含まれていません」と誤答)。
+    # safety_patterns._READONLY_SAFE_MODULES が wmic / Get-CimInstance /
+    # nvidia-smi / 外部ライブラリをすべて拒否するため、正しい情報を返すコマンドへ
+    # 差し替える経路は存在しない。エントリを消すと _infer_tool が引数なしを返し
+    # _suppress_commandless_run_command が no_tool へ落とすので、GPU/VRAM は
+    # 会話履歴と LLM 知識に委ねる (そちらの方が誤答が少ない)。
     # IP アドレス / ホスト名
     (re.compile(
         r"(?:IP\s*アドレス|ホスト名"
@@ -567,6 +592,11 @@ _SELF_SESSION_REFERENCE_PATTERNS = [
         r"(?!とは別|とは関係|は関係な|じゃなく|ではなく)"
         r"[^。．!！?？\n]{0,40}?"
         r"(?:面白|印象|振り返|まとめ|要約|感想|どう思|覚えて|何でした|どうでした"
+        # 2026-07-25 追加。これらが無いため「今日の会話の中で、私があなたの回答を
+        # 訂正した箇所が 3 回ある」がセッション限定されず、前日の別セッションを
+        # 引用して「居住地：東京→大阪 / 名前：太郎→ヒロユキ」という他人の
+        # ペルソナ設定をユーザー本人の訂正として提示した。
+        r"|訂正|指摘|直した|思い出|言った|話した|聞いた"
         r"|最初|最後|何番目|何回目)",
     ),
 ]
@@ -760,7 +790,7 @@ def _query_has_tool_signal(query: str) -> bool:
     patterns = select_locale_variant(_TOOL_PATTERNS, _TOOL_PATTERNS_EN)
     return (
         any(p.search(query) for p in patterns)
-        or bool(re.search(r"[A-Za-z]:\\|(?:^|[\s　])(?:/[\w._-]+){2,}|https?://", query))
+        or bool(_PATH_OR_URL_SIGNAL_RE.search(query))
     )
 
 
@@ -906,6 +936,9 @@ class ToolCallJudge:
         self._executable_fallback_min_chars: int = int(
             agent_cfg.get("executable_command_fallback_min_chars", 5),
         )
+        # 直近の層0.5 リコールの診断値 (sim / min_sim / success_avg / 候補数)。
+        # _log_tool_decision が decision.jsonl の context に載せる。
+        self._last_recall_diag: dict[str, Any] = {}
 
     @property
     def enabled(self) -> bool:
@@ -983,9 +1016,30 @@ class ToolCallJudge:
         # リコールと同様、chat early-return / coding 4 層のどちらに入る前にも
         # 短絡させることで、学習済みクエリでは assist (合成 / 5 層目) を一切
         # 呼ばずにコマンドを確定できる。
-        cmd_recall_result = await self._judge_with_executable_command_recall(
-            query, tools_registry, mode=mode,
+        #
+        # ただし URL リコールが「ユーザーが URL を書いた」という決定論的根拠を
+        # 持つのに対し、command recall の根拠は類似度のみ。ツール意図のシグナルが
+        # 無いクエリ (好みの表明 / 記憶想起 / 感謝) まで先回りで奪うと、会話履歴で
+        # 答えられる質問が「ツール結果に含まれていません」に化ける
+        # (実測 2026-07-25: 誤発火 6 件中 4 件がこの型)。層0.5 の適用は
+        # ツールシグナルを持つクエリに限定し、かつ記憶想起クエリは除外する。
+        # 「さっき伝えた GPU は何だった？」は 'GPU' が _TOOL_PATTERNS に載るため
+        # ツールシグナル判定を通ってしまうが、答えは会話履歴にある。ここで
+        # コマンドを撃つと、ツール結果が文脈を上書きして
+        # 「ツール結果に GPU 型番は含まれていません」と誤答する (実測 2026-07-25。
+        # 同じ会話の 1 ターン前では Radeon 890M を正しく想起できていた)。
+        # coding では run_command が一級のツールで、「依存を入れて」→ 学習済み
+        # `pip install ...` の引き当てが本機能の主目的なのでゲートしない。
+        recall_allowed = is_coding_mode(mode) or (
+            _query_has_tool_signal(query)
+            and not _has_history_recall_keywords(query)
         )
+        if recall_allowed:
+            cmd_recall_result = await self._judge_with_executable_command_recall(
+                query, tools_registry, mode=mode,
+            )
+        else:
+            cmd_recall_result = None
         if cmd_recall_result is not None:
             cmd_recall_result = self._validate_tool_availability(
                 cmd_recall_result, tools_registry, mode,
@@ -1807,7 +1861,10 @@ class ToolCallJudge:
             tool_needed=True,
             tool_name=exec_tool,
             tool_args={"command": recalled},
-            source="rule",
+            # "rule" と区別する。recall 由来の実行を curator が再学習すると
+            # 「誤発火 → 成功記録 → fact 延命 → また誤発火」で自己強化するため、
+            # sleep 側 (executable_command_curator) がこの source を見て除外する。
+            source="recall",
         )
 
     async def _try_recall_executable_command(
@@ -1860,8 +1917,22 @@ class ToolCallJudge:
             )
             return None
 
+        # 候補プールが小さいうちは top-K も success_avg も選別として機能しないため
+        # (実測 2026-07-25: executable_command fact は global に 1 件のみで、
+        # 類似度ゲートだけが唯一のフィルタだった)、閾値を嵩上げして保守的に倒す。
+        if len(candidates) < _RECALL_SMALL_POOL_SIZE:
+            min_sim += _RECALL_SMALL_POOL_MARGIN
+
         import time as _time
         now = _time.time()
+
+        best_sim = candidates[0][1] if candidates else 0.0
+        self._last_recall_diag = {
+            "candidates": len(candidates),
+            "best_sim": round(float(best_sim), 4),
+            "min_sim": round(min_sim, 4),
+            "min_avg": min_avg,
+        }
 
         for fact, sim in candidates:
             if fact.type != "world_fact":
@@ -1893,7 +1964,27 @@ class ToolCallJudge:
                         )
 
             if command and effective_score >= min_avg:
+                # URL リコール側と同粒度の観測。embed モデルを差し替えるたびに
+                # sim 分布が動くため、これが無いと閾値較正が事後検証できない。
+                logger.info(
+                    "Executable command recall matched: sim=%.4f min_sim=%.4f "
+                    "success_avg=%.3f effective=%.3f min_record=%.3f "
+                    "candidates=%d subject=%s",
+                    sim, min_sim, success_avg, effective_score, min_avg,
+                    len(candidates), fact.subject,
+                )
+                self._last_recall_diag.update({
+                    "sim": round(float(sim), 4),
+                    "success_avg": round(success_avg, 3),
+                    "effective_score": round(effective_score, 3),
+                    "subject": fact.subject,
+                })
                 return str(command)
+        logger.debug(
+            "Executable command recall miss: candidates=%d best_sim=%.4f "
+            "min_sim=%.4f query=%s",
+            len(candidates), float(best_sim), min_sim, query[:50],
+        )
         return None
 
     def _log_tool_decision(
@@ -1908,15 +1999,23 @@ class ToolCallJudge:
         if self._debug_logger is None:
             return
         chosen = "no_tool" if not result.tool_needed else (result.source or "rule")
+        context: dict[str, Any] = {
+            "tool_needed": bool(result.tool_needed),
+            "tool_name": getattr(result, "tool_name", None) or "",
+        }
+        command = (getattr(result, "tool_args", None) or {}).get("command")
+        if command:
+            context["command"] = str(command)[:120]
+        # 層0.5 の採否は類似度が唯一の根拠なので、decision.jsonl だけで
+        # 閾値較正を検証できるよう診断値を載せる。
+        if reason.startswith("executable_command_recall") and self._last_recall_diag:
+            context.update(self._last_recall_diag)
         self._debug_logger.log_decision(
             decision_point="tool_call_decision",
             chosen=chosen,
-            candidates=["rule", "cartridge", "learned", "assist", "no_tool"],
+            candidates=["rule", "cartridge", "learned", "assist", "recall", "no_tool"],
             reason=reason,
-            context={
-                "tool_needed": bool(result.tool_needed),
-                "tool_name": getattr(result, "tool_name", None) or "",
-            },
+            context=context,
             scope="request",
         )
 
@@ -2126,17 +2225,18 @@ class ToolCallJudge:
             - ``run_command`` 以外のツール → 何もしない
             - assist が ``(True, cmd)`` を返す → コマンドを置換し
               ``source="assist"`` に更新
-            - assist が ``(False, "")`` を返し、かつクエリが書込み期待
-              (``task_expects_write``) → ``no_tool`` に降格
-              (書込みタスクへの環境コマンド発火は regex 部分マッチ由来の
-              誤判定と断定できる。2026-07-15 の "program" 内 'ram' マッチで
-              OS スペック収集を実行し write 不発で失敗した実績への防衛)
-            - assist が ``(False, "")`` で書込み期待なし → 既存 regex 結果を
-              維持 (specific パターンにマッチした confidence を尊重)
+            - assist が ``(False, "")`` を返す → 原則 ``no_tool`` に降格
+              (2026-07-25 に降格条件を反転。旧実装は ``task_expects_write``
+              のときだけ降格し、それ以外は regex 結果を維持していたため、
+              「メモリは 64GB」という自己紹介文の 'メモリ' 部分マッチや
+              「さっき伝えた GPU 覚えている？」という記憶想起で環境コマンドが
+              発火した。実測では assist の判定は 28 件中 27 件が正しく、
+              regex の部分マッチより信頼できる)
+            - 例外: 日付 / 時刻クエリ (``_DATETIME_QUERY_RE``) は曖昧さが
+              小さいため regex 結果を維持する (assist が JSON 崩れ等で
+              誤って否定票を返したときの安全弁)
             - assist 失敗 / 未接続 → 既存結果をそのまま返す
         """
-        from backend.free.agent.meta_cognitive_tasks import task_expects_write
-
         if not result.tool_needed or result.tool_name not in (
             "run_command", "run_command_readonly",
         ):
@@ -2159,14 +2259,16 @@ class ToolCallJudge:
                 tool_args=new_args,
                 source="assist",
             )
-        if task_expects_write(query):
-            logger.info(
-                "Demoting %s to no_tool: assist judged not executable "
-                "and the task expects a write deliverable: %s",
-                result.tool_name, query[:80],
-            )
-            return ToolJudgement(tool_needed=False, source="assist")
-        return result
+        # 高特異度シグナルがある場合のみ assist の否定票を覆す:
+        #  - 日付 / 時刻クエリ (曖昧さが小さい)
+        #  - 明示的なファイルパス / URL (ユーザーが対象を書いた決定論的根拠)
+        if _DATETIME_QUERY_RE.search(query) or _PATH_OR_URL_SIGNAL_RE.search(query):
+            return result
+        logger.info(
+            "Demoting %s to no_tool: assist judged the query not executable: %s",
+            result.tool_name, query[:80],
+        )
+        return ToolJudgement(tool_needed=False, source="assist")
 
     def _judge_with_rules(
         self,

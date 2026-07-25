@@ -83,6 +83,41 @@ _RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
 )
 
 
+class HealthLogGate:
+    """health check の結果を **状態が変わったときだけ** ログするためのゲート。
+
+    UI は ``/api/status`` と ``/api/system/vram_status`` を数秒間隔でポーリングし、
+    1 回のポーリングが base / assist / embed の 3 系統の health check を起こす。
+    毎回 DEBUG を出すと ``--develop`` 時の backend.log が同一文言で埋まり、実信号が
+    埋没する (実測 2026-07-25: 1 日の DEBUG 約 16,600 行 = 全体の大半が
+    ``Health check: status=200, healthy=True`` と ``GET /api/status`` の反復。
+    調査のたびに grep -v で除外する必要があった)。
+
+    同じ ``(status, healthy)`` が続く間は抑制し、抑制した回数を次の変化時に添える。
+    """
+
+    __slots__ = ("_last", "_suppressed")
+
+    def __init__(self) -> None:
+        self._last: tuple[int, bool] | None = None
+        self._suppressed = 0
+
+    def should_log(self, status: int, healthy: bool) -> bool:
+        """前回と異なる結果なら ``True``。同一なら抑制して ``False``。"""
+        key = (status, healthy)
+        if self._last == key:
+            self._suppressed += 1
+            return False
+        self._last = key
+        return True
+
+    def take_suppressed(self) -> int:
+        """直前の変化までに抑制した件数を返し、カウンタを 0 に戻す。"""
+        n = self._suppressed
+        self._suppressed = 0
+        return n
+
+
 class BaseHTTPClient:
     """`httpx.AsyncClient` の遅延初期化とクローズを共通化する基底クラス
 

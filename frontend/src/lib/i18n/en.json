@@ -20,6 +20,7 @@
 		"long_form_done": "Generation complete ({total} units)",
 		"long_form_incomplete": "Generation stopped ({total} units, some incomplete)",
 		"agentic_step_elapsed": "{elapsed}s",
+		"search_history_no_match": "search_history: no match in past conversations",
 		"step_complete": "✓ {detail}",
 		"rag_hits": "RAG search: {count} hit(s)",
 		"sufficiency_ok": "Sufficiency: OK",
@@ -37,7 +38,8 @@
 		"cancel": "Cancel",
 		"cancelled": "Generation cancelled",
 		"code_in_editor": "→ Sent to editor ({lang})",
-		"code_output_done": "Completed"
+		"code_output_done": "Completed",
+		"long_form_quality_issue": "Generated ({total} units) — quality check flagged issues"
 	},
 	"sidebar": {
 		"chat": "Chat",
