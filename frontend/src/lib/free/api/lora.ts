@@ -30,12 +30,23 @@ export interface LoraTargetVersions {
 	active_adapter_exists: boolean;
 	latest_version: number;
 	model: string | null;
+	/** アダプタが当該モードのモデルへ実際に適用されるか (null = アダプタ不在 / 判定不能)。
+	 *  active_adapter_exists はファイル存在しか見ないため、存在しても起動時に
+	 *  arch/形状/系統の不一致で --lora が付かないことがある。 */
+	adapter_applicable?: boolean | null;
+	/** adapter_applicable が false のときの理由 (英語短文) */
+	adapter_incompatible_reason?: string | null;
 }
+
+/** LoRA アダプタのパーティションスキーム (learning.level2_adapter_partition) */
+export type LoraAdapterPartition = 'model' | 'model_mode';
 
 /** バージョン一覧 API のレスポンス (base / assist 2 系列) */
 export interface LoraVersionsResponse {
 	base: LoraTargetVersions;
 	assist: LoraTargetVersions;
+	/** 'model' のときアダプタはモード非依存で chat/coding が同一実体を共有する */
+	adapter_partition?: LoraAdapterPartition;
 }
 
 /** ロールバックリクエスト */

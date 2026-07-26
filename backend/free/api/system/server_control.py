@@ -142,7 +142,7 @@ def _build_cmd(
         if cmd is None:
             return None
         embed_cfg = cfg.get("embedding", {})
-        host = embed_cfg.get("llama_host", "127.0.0.1")
+        host = embed_cfg.get("llama_host", "localhost")
         port = embed_cfg.get("llama_port", 8082)
         return (cmd, host, port)
 
@@ -264,7 +264,7 @@ def _resolve_endpoint(name: ServerName, cfg: dict) -> tuple[str, int] | None:
         return local_cfg.get("host", "127.0.0.1"), int(local_cfg.get("port", 8081))
     if name == "embed":
         emb = cfg.get("embedding", {}) or {}
-        return emb.get("llama_host", "127.0.0.1"), int(emb.get("llama_port", 8082))
+        return emb.get("llama_host", "localhost"), int(emb.get("llama_port", 8082))
     return None
 
 

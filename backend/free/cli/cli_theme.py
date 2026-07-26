@@ -56,6 +56,10 @@ class CLITheme:
     # === Welcome ===
     show_welcome: bool = True
 
+    # === Layout ===
+    # config `theme.cli_layout_mode: auto` のときに参照されるテーマ側の希望値。
+    layout_mode: str = "sequential"
+
     @classmethod
     def from_dict(cls, data: dict) -> CLITheme:
         """cli-theme.json の辞書からパースする。
@@ -119,6 +123,15 @@ class CLITheme:
         if isinstance(welcome, dict):
             if "show" in welcome and isinstance(welcome["show"], bool):
                 kwargs["show_welcome"] = welcome["show"]
+
+        # layout セクション
+        layout = data.get("layout", {})
+        if isinstance(layout, dict):
+            mode = layout.get("mode")
+            if mode in ("split", "sequential"):
+                kwargs["layout_mode"] = mode
+            elif mode is not None:
+                logger.warning("Ignoring unknown layout.mode: %r", mode)
 
         return cls(**kwargs)
 

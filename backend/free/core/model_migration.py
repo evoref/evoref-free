@@ -289,7 +289,7 @@ class ModelState:
     def initialize_from_config(self, config: dict) -> None:
         """model_state.json が存在しない場合に config.yaml から初期化"""
         model_paths = config.get("model_paths", {}) or {}
-        base_model = model_paths.get("base_model", "")
+        base_model = model_paths.get("base_model") or ""
         filename = Path(base_model).name if base_model else ""
         changed = False
         if not self._current.filename:
@@ -341,7 +341,7 @@ def detect_mismatches(
     result: dict[str, dict[str, str]] = {}
 
     ms_base = model_state.current_filename
-    cfg_base = Path(model_paths.get("base_model", "") or "").name
+    cfg_base = Path(model_paths.get("base_model") or "" or "").name
     if ms_base and cfg_base and ms_base != cfg_base:
         result["base_model"] = {"model_state": ms_base, "config": cfg_base}
 
@@ -533,7 +533,7 @@ class ModelMigrator:
         lora_restored = self._restore_lora(rollback_target)
 
         # config.yaml 更新
-        old_base_model = self.config.get("model_paths", {}).get("base_model", "")
+        old_base_model = self.config.get("model_paths", {}).get("base_model") or ""
         model_dir = Path(old_base_model).parent if old_base_model else Path("models")
         rollback_path = str(model_dir / rollback_target)
         self._update_config(rollback_path)
@@ -954,7 +954,7 @@ class ModelMigrator:
         """現在のモデルファイル名を取得"""
         if self.model_state.current_filename:
             return self.model_state.current_filename
-        base_model = self.config.get("model_paths", {}).get("base_model", "")
+        base_model = self.config.get("model_paths", {}).get("base_model") or ""
         return Path(base_model).name if base_model else "unknown"
 
     def _validate(self, new_model_path: Path) -> None:

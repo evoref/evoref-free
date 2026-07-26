@@ -61,7 +61,7 @@ def _resolve_endpoint(component: str, cfg: dict) -> tuple[str, int]:
     if component == "embedding":
         emb = cfg.get("embedding", {}) or {}
         return (
-            emb.get("llama_host", "127.0.0.1"),
+            emb.get("llama_host", "localhost"),
             int(emb.get("llama_port", 8082)),
         )
     raise ProcessManagerError(f"Unknown component: {component}")

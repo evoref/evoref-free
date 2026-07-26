@@ -43,6 +43,12 @@ export interface ChatMessage {
 	editor_route?: 'editor' | 'chat';
 	/** long_form 生成の進捗 (ユニット i/total)。生成中のみセットされ常時表示される */
 	long_form_progress?: LongFormProgress;
+	/**
+	 * この user 発言が長さ制限で切り詰められて送られた場合の内訳。
+	 * backend の system 注記だけではベースモデルが従わず、ユーザーには何も
+	 * 見えなかったため (2026-07-26 実測)、発言バブル自体に表示する。
+	 */
+	input_truncated?: { original_chars: number; sent_chars: number };
 }
 
 /** モード別メッセージバッファ */
@@ -189,6 +195,28 @@ export function addStepResultToLastAssistant(detail: string, status: string = 'd
 		if (last?.role === 'assistant') {
 			const results = [...(last.step_results ?? []), { detail, status }];
 			return [...msgs.slice(0, -1), { ...last, step_results: results }];
+		}
+		return msgs;
+	});
+}
+
+/**
+ * 直近の user メッセージに「長さ制限で切り詰められた」内訳を付ける。
+ *
+ * 切り詰めの通知はアシスタント応答のストリーム冒頭で届くため、その時点で
+ * 末尾は空のアシスタントメッセージ。対象は 1 つ前の user メッセージになる。
+ */
+export function markLastUserTruncated(info: {
+	original_chars: number;
+	sent_chars: number;
+}): void {
+	messages.update((msgs) => {
+		for (let i = msgs.length - 1; i >= 0; i--) {
+			if (msgs[i].role === 'user') {
+				const updated = [...msgs];
+				updated[i] = { ...msgs[i], input_truncated: info };
+				return updated;
+			}
 		}
 		return msgs;
 	});

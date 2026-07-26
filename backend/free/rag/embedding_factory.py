@@ -93,7 +93,7 @@ def create_embedding_backend(
 
             host = emb_cfg.get("llama_host", "localhost")
             port = emb_cfg.get("llama_port", 8082)
-            model_name = emb_cfg.get("model_name", "qwen3-embedding")
+            model_name = emb_cfg.get("model_name", "Qwen/Qwen3-Embedding-0.6B")
             dim = emb_cfg.get("dim", 1024)
             timeout = emb_cfg.get("timeout", 30.0)
             max_length = emb_cfg.get("max_length", 8192)

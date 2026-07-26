@@ -532,6 +532,8 @@ class LoopDriver:
         max_wall_time_sec: float = 1800.0,
         max_consecutive_failures: int = 3,
         tick_interval_sec: float = 0.0,
+        sleep_time_every_n: int = 5,
+        sleep_time_hook: Any = None,  # Callable[[], Awaitable[None]]
         on_gate_fail: str = "retry",
         retry_limit_per_task: int = 2,
         artifact_hook: Any = None,  # Callable[[str, TaskFactView, list[ArtifactEntry]], None]
@@ -550,6 +552,11 @@ class LoopDriver:
                 と整合させる)
             bootstrap_on_start: ``True`` の場合は ``start(project_id)`` 時に自動的に
                 ``bootstrap_context`` を呼び出して結果を ``state.last_bootstrap`` に保存する。
+            sleep_time_every_n: ``sleep_time_hook`` を呼ぶ反復間隔
+                (``config.loop.sleep_time_every_n``)。
+            sleep_time_hook: ``sleep_time_every_n`` 反復ごとに await される
+                コルーチン関数。sleep-time (Light) へバトンを渡し、STM 圧縮後の
+                メモリで次の反復に入るために使う。``None`` で無効。
         """
         self._view_provider = view_provider
         self._policy_activation_min_confidence = float(
@@ -561,6 +568,8 @@ class LoopDriver:
         self._max_wall_time_sec = float(max_wall_time_sec)
         self._max_consecutive_failures = int(max_consecutive_failures)
         self._tick_interval_sec = float(tick_interval_sec)
+        self._sleep_time_every_n = int(sleep_time_every_n)
+        self._sleep_time_hook = sleep_time_hook
         self._on_gate_fail = str(on_gate_fail)
         self._retry_limit_per_task = int(retry_limit_per_task)
         self._artifact_hook = artifact_hook
@@ -576,6 +585,26 @@ class LoopDriver:
     @property
     def event_bus(self) -> LoopEventBus | None:
         return self._event_bus
+
+    async def _maybe_run_sleep_time(self) -> None:
+        """``sleep_time_every_n`` 反復ごとに sleep-time (Light) へバトンを渡す。
+
+        フックの失敗はループを止めない (warning のみ)。
+        """
+        if self._sleep_time_hook is None or self._sleep_time_every_n <= 0:
+            return
+        if self._state.iteration % self._sleep_time_every_n != 0:
+            return
+        logger.info(
+            "LoopDriver: handing off to sleep-time at iteration=%d (every_n=%d)",
+            self._state.iteration, self._sleep_time_every_n,
+        )
+        try:
+            await self._sleep_time_hook()
+        except Exception as exc:
+            logger.warning("LoopDriver sleep-time hook failed: %s", exc)
+        else:
+            self._emit("sleep_time_ran", {"iteration": self._state.iteration})
 
     def _emit(
         self,
@@ -912,6 +941,7 @@ class LoopDriver:
                     "last_outcome": self._state.last_outcome,
                 },
             )
+            await self._maybe_run_sleep_time()
             # (evolve 限定)。``last_outcome`` の kind フィールドで
             # success / failure / skipped を判定する。
             if self._debug_logger is not None:

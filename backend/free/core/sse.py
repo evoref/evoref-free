@@ -104,6 +104,29 @@ class SSEFrameBuilder:
         return f"data: {json.dumps({'token_info': info}, ensure_ascii=False)}\n\n"
 
     @staticmethod
+    def input_truncated(original_chars: int, sent_chars: int) -> str:
+        """入力切り詰めフレーム: ユーザー発言が長さ制限で切られた旨の通知。
+
+        build_messages は予算超過の最新ターンを drop せず切り詰めて送るが、
+        その事実はモデルにしか (system 注記として) 伝わらず、ユーザーには
+        何も見えなかった。注記を入れてもベースモデルが従わず全体を見た前提で
+        断定する実測があるため (2026-07-26: 11,359 文字のメモを 3,962 文字に
+        切られた状態で件数を断定)、モデルの遵守に依存せずユーザー自身が
+        気づけるよう UI へ流す。
+
+        Args:
+            original_chars: ユーザーが送った元の文字数
+            sent_chars: 実際にモデルへ渡された文字数
+        """
+        payload = {
+            "input_truncated": {
+                "original_chars": original_chars,
+                "sent_chars": sent_chars,
+            },
+        }
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    @staticmethod
     def rag_debug(chunks: list[dict], search_time_ms: float) -> str:
         """RAG デバッグフレーム: 検索結果チャンクの可視化（debug.enabled 時のみ送信）
 

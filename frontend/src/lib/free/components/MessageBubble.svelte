@@ -46,6 +46,15 @@
 		</div>
 	{/if}
 
+	{#if isUser && message.input_truncated}
+		<p class="truncation-notice">
+			{$t('chat.input_truncated', {
+				original: message.input_truncated.original_chars,
+				sent: message.input_truncated.sent_chars
+			})}
+		</p>
+	{/if}
+
 	{#if !isUser && message.rag_debug}
 		<RagDebugPanel ragDebug={message.rag_debug} />
 	{/if}
@@ -58,6 +67,14 @@
 		padding: 10px 14px;
 		border-radius: var(--border-radius);
 		margin-bottom: 12px;
+	}
+	/* 長さ制限で先頭のみ送られた旨の注記 (該当 user 発言に付く) */
+	.truncation-notice {
+		margin-top: 6px;
+		padding-top: 6px;
+		border-top: 1px dashed color-mix(in srgb, var(--text-primary) 25%, transparent);
+		font-size: 12px;
+		opacity: 0.85;
 	}
 	/* --- チャットモード --- */
 	.message-bubble.user:not(.coding) {

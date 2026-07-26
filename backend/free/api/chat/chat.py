@@ -47,6 +47,7 @@ from backend.free.api.chat.chat_streaming import (
     sync_deliberative, sync_long_form, sync_meta_cognitive, sync_reactive_light,
 )
 from backend.edition import is_pro
+from backend.free.core.inference import latest_turn_truncation
 from backend.free.core.session_mode import is_coding_mode, is_valid_session_mode
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.agent.deliberative import DeliberativeAgent
@@ -477,11 +478,17 @@ async def _build_messages_with_search(
 
     sse_notify = SSEFrameBuilder()
     rag_debug_frame = _build_rag_debug_frame(state, scored_chunks, sse_notify, timer)
+    # ユーザー発言が長さ制限で切られた場合は UI へも伝える。system 注記だけでは
+    # ベースモデルが従わず全体を見た前提で断定する実測があるため、モデルの遵守に
+    # 依存せずユーザー自身が気づけるようにする (2026-07-26)。
+    truncation = latest_turn_truncation(history, messages)
 
     async def _wrapper(inner_gen: AsyncIterator[str]) -> AsyncIterator[str]:
         """エディタ振り分け / 検索エラー通知 + RAG デバッグ情報をストリームの冒頭に挿入"""
         if editor_route is not None:
             yield sse_notify.editor_route(editor_route)
+        if truncation is not None:
+            yield sse_notify.input_truncated(*truncation)
         if search_error:
             yield sse_notify.step({
                 "type": "search_error",
@@ -653,7 +660,7 @@ def _clamp_long_form_timeout(cfg: dict) -> dict:
     agent (`_total_timeout` 既定 900s、超過時に artifacts 破棄) より短く打ち切り、
     orchestrator 側でユニット境界の部分結果 + repair を確定させる (artifacts 喪失回避)。
     """
-    agent_total = float((cfg.get("agent") or {}).get("total_timeout", 900) or 900)
+    agent_total = float((cfg.get("agent") or {}).get("total_timeout", 1800) or 1800)
     clamped = max(300.0, agent_total - 90.0)
     lf_cfg = dict(cfg.get("long_form") or {})
     existing = float(lf_cfg.get("total_timeout_sec", 1800.0) or 0.0)

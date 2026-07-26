@@ -30,5 +30,9 @@ class RollingContext:
     # 共通: 直前ユニットの末尾テキスト
     short_term: str = ""
 
+    # 現ユニット向けに選抜した RAG コンテキスト (config ``long_form.rag_per_unit``)。
+    # 空文字なら unit プロンプトの参考情報スロットは「(なし)」になる。
+    unit_rag: str = ""
+
     # 既存テキスト参照モード: 追記・修正・加筆など既存ファイルを踏まえた生成
     has_existing_context: bool = False

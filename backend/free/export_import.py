@@ -106,7 +106,7 @@ class ExportManager:
     def _build_manifest(self, categories: list[str]) -> ExportManifest:
         """export-manifest.json を生成"""
         emb_cfg = self.config.get("embedding", {})
-        base_model = self.config.get("model_paths", {}).get("base_model", "")
+        base_model = self.config.get("model_paths", {}).get("base_model") or ""
         instance_name = self.config.get("instance", {}).get("name", "evoref")
 
         return ExportManifest(
@@ -115,8 +115,8 @@ class ExportManager:
             source_platform=sys.platform,
             categories=categories,
             embedding_model={
-                "name": emb_cfg.get("model_name", ""),
-                "dim": emb_cfg.get("dim", 512),
+                "name": emb_cfg.get("model_name") or "",
+                "dim": emb_cfg.get("dim", 1024),
             },
             base_model={"filename": Path(base_model).name if base_model else ""},
         )
@@ -240,10 +240,10 @@ class ImportManager:
     def _check_compatibility(self, manifest: ExportManifest) -> dict:
         """埋め込みモデル互換性チェック"""
         emb_cfg = self.config.get("embedding", {})
-        base_model = self.config.get("model_paths", {}).get("base_model", "")
+        base_model = self.config.get("model_paths", {}).get("base_model") or ""
 
         exp_emb_name = manifest.embedding_model.get("name", "")
-        local_emb_name = emb_cfg.get("model_name", "")
+        local_emb_name = emb_cfg.get("model_name") or ""
         emb_match = exp_emb_name == local_emb_name
 
         exp_base = manifest.base_model.get("filename", "")

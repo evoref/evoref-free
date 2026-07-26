@@ -37,13 +37,25 @@ _TOKEN_OVERLAP_MIN_QUERY_TOKENS = 5
 
 @lru_cache(maxsize=64)
 def _tokenize_cached(text: str) -> frozenset[str]:
-    """``tokenize_ja`` の結果をキャッシュする。
+    """``tokenize_ja`` の結果をキャッシュする (空白区切りは区間ごとにトークン化)。
 
     1 回の検索 (search_sessions/list_sessions) で同一のクエリ文字列に対して
     最大で「対象エントリ数 × 3 (summary/topics/search_text)」回呼ばれうる
     ため、同一入力の再トークン化を避ける。
+
+    ``tokenize_ja`` は空白を除去してから日本語 bi-gram を切るため、語を空白で
+    並べたキーワードクエリ (``search_history`` に渡る実引数はこの形が既定) では
+    境界をまたぐ bi-gram が混入する。これは実在テキストに出現しえないトークン
+    なので ``_TOKEN_OVERLAP_RATIO`` の分母だけを押し上げ、重なり率を構造的に
+    達成不能にする (2026-07-26 実測: 「伝 ツール 名前 用途 正確 教」は 10
+    トークン中 5 個が境界またぎの「伝ツ」「ル名」「前用」「途正」「確教」で、
+    到達しうる重なりの上限 0.5 < 必要値 0.7 = どんな履歴にもマッチしない)。
+    空白区間ごとにトークン化して境界またぎを作らない。
     """
-    return frozenset(tokenize_ja(text))
+    tokens: set[str] = set()
+    for segment in text.split():
+        tokens.update(tokenize_ja(segment))
+    return frozenset(tokens)
 
 
 def _text_matches_query(text: str, query_lower: str) -> bool:
@@ -96,6 +108,10 @@ class SessionData:
     token_info: dict = field(default_factory=dict)
     summary: str | None = None
     summary_embedding: list[float] | None = None
+    #: ``summary`` を生成した時点の ``turn_count``。会話が進んで turn_count が
+    #: これを上回ったら sleep-time が要約を作り直す (会話途中で要約が固定され、
+    #: 後半の訂正が要約に反映されないのを防ぐ)。
+    summary_turn_count: int = 0
     topics: list[str] = field(default_factory=list)
     archived_at: str = ""
     # SemMem への昇格済フラグ
@@ -113,7 +129,7 @@ class SessionData:
             mode=data.get("mode", "chat"),
             modes_used=data.get("modes_used", []),
             instance_name=data.get("instance_name", "evoref"),
-            base_model=data.get("base_model", ""),
+            base_model=data.get("base_model") or "",
             source=data.get("source", "auto"),
             turns=data.get("turns", []),
             turn_count=data.get("turn_count", 0),
@@ -122,6 +138,7 @@ class SessionData:
             token_info=data.get("token_info", {}),
             summary=data.get("summary"),
             summary_embedding=data.get("summary_embedding"),
+            summary_turn_count=int(data.get("summary_turn_count", 0) or 0),
             topics=data.get("topics", []),
             archived_at=data.get("archived_at", ""),
             promoted_to_semmem=bool(data.get("promoted_to_semmem", False)),
@@ -139,6 +156,8 @@ class IndexEntry:
     mode: str
     turn_count: int
     summary: str | None = None
+    #: ``summary`` を生成した時点の ``turn_count`` (0 = 未要約)。
+    summary_turn_count: int = 0
     topics: list[str] = field(default_factory=list)
     size_bytes: int = 0
     search_text: str = ""
@@ -363,6 +382,7 @@ class HistoryManager:
             mode=session.mode,
             turn_count=session.turn_count,
             summary=session.summary,
+            summary_turn_count=session.summary_turn_count,
             topics=session.topics,
             size_bytes=size_bytes,
             search_text=_build_search_text(session),
@@ -710,6 +730,7 @@ class HistoryManager:
                 mode=s.get("mode", "chat"),
                 turn_count=s.get("turn_count", 0),
                 summary=s.get("summary"),
+                summary_turn_count=int(s.get("summary_turn_count", 0) or 0),
                 topics=s.get("topics", []),
                 size_bytes=s.get("size_bytes", 0),
                 search_text=s.get("search_text", ""),
@@ -814,6 +835,7 @@ class HistoryManager:
                         mode=sd.mode,
                         turn_count=sd.turn_count,
                         summary=sd.summary,
+                        summary_turn_count=sd.summary_turn_count,
                         topics=sd.topics,
                         size_bytes=session_file.stat().st_size,
                         search_text=_build_search_text(sd),

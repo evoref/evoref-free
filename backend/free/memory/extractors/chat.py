@@ -21,6 +21,7 @@ subject の pillar namespace (``mem.*``) を全面適用した
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Iterable
 
@@ -69,11 +70,30 @@ _SAFE_KEYWORD_FALLBACK = "unknown"
 #: world_fact の subject kind として無意味な英語機能語 / フォーマット例トークン。
 #: 生成物断片の抽出で ``mem.world.from`` / ``mem.world.YYYYMMDD`` 等のゴミ
 #: subject が量産された (2026-07-15) ため、これらは keyword 候補から除外する。
+#: 2026-07-26 追加: 依頼文・質問文の先頭語が subject になった実例
+#: (``mem.world.Please`` ← "Please answer in English. What is a race condition")。
 _WORLD_KEYWORD_STOPWORDS: frozenset[str] = frozenset({
     "from", "import", "the", "and", "for", "with", "this", "that",
     "class", "def", "return", "none", "true", "false",
     "yyyymmdd", "yyyy-mm-dd", "hhmmss", _SAFE_KEYWORD_FALLBACK,
+    # 依頼・質問・接続の機能語 (話題を指さないので subject に使えない)
+    "please", "what", "when", "where", "which", "who", "why", "how",
+    "is", "are", "was", "were", "be", "been", "do", "does", "did",
+    "can", "could", "will", "would", "should", "may", "might", "must",
+    "tell", "give", "show", "explain", "answer", "about", "into",
+    "you", "your", "yours", "me", "my", "mine", "we", "our", "it", "its",
+    "a", "an", "of", "in", "on", "at", "to", "by", "as", "or", "but",
+    "not", "no", "yes", "if", "then", "than", "so", "there", "here",
 })
+
+#: 英字を 1 文字も含まない sanitized keyword を弾く判定。``_sanitize_keyword`` は
+#: 非 ASCII を ``-`` に潰すため、数字と記号だけの語は無意味な subject になる
+#: (2026-07-26 実測: 「0.8% と 2.3%」→ ``mem.world.0-8----2-3``)。
+_HAS_ASCII_LETTER_RE = re.compile(r"[A-Za-z]")
+
+#: subject に付ける内容ハッシュの長さ。curator 系 (``mem.world.url.<host>.<sha1_12>``
+#: / ``mem.world.executable_command.<mode>.<sha1_12>``) と同じ規約に合わせる。
+_WORLD_SUBJECT_HASH_LEN = 8
 
 #: 明示的なローカルパス (ファイル出力依頼の指示文検出用)
 _LOCAL_PATH_HINT_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"']+")
@@ -146,24 +166,53 @@ def _sanitize_keyword(raw: str) -> str:
     return out or _SAFE_KEYWORD_FALLBACK
 
 
+def _is_usable_world_keyword(sanitized: str) -> bool:
+    """sanitized keyword が world_fact の subject に使えるかを判定する。
+
+    ストップワードでないこと、かつ英字を 1 文字以上含むことを要求する。
+    数字と記号だけの語 (「0.8% と 2.3%」→ ``0-8----2-3``) は話題を指さない。
+    """
+    if sanitized.lower() in _WORLD_KEYWORD_STOPWORDS:
+        return False
+    return bool(_HAS_ASCII_LETTER_RE.search(sanitized))
+
+
 def _world_fact_keyword(note: MemoryNote) -> str:
     """world_fact の subject kind キーワードをノートから導く。
 
-    `keywords` からストップワード (英語機能語 / フォーマット例トークン) を
-    除いた最初の候補を採用し、無ければ内容先頭 24 文字を使う。全候補が
-    無効な場合は :data:`_SAFE_KEYWORD_FALLBACK` を返す (呼出側で抽出を
-    スキップする)。
+    `keywords` からストップワード (英語機能語 / 依頼・質問の機能語 / フォーマット
+    例トークン) と英字を含まない語を除いた最初の候補を採用し、無ければ内容先頭
+    24 文字を使う。全候補が無効な場合は :data:`_SAFE_KEYWORD_FALLBACK` を返す
+    (呼出側で抽出をスキップする)。
     """
     for kw in note.keywords or []:
         sanitized = _sanitize_keyword(kw)
-        if sanitized.lower() not in _WORLD_KEYWORD_STOPWORDS:
+        if _is_usable_world_keyword(sanitized):
             return sanitized
     text = " ".join((note.content or "").split())
     if text:
         sanitized = _sanitize_keyword(text[:24])
-        if sanitized.lower() not in _WORLD_KEYWORD_STOPWORDS:
+        if _is_usable_world_keyword(sanitized):
             return sanitized
     return _SAFE_KEYWORD_FALLBACK
+
+
+def _world_fact_subject_parts(keyword: str, content: str) -> tuple[str, str]:
+    """world_fact の subject を ``<keyword>`` + ``<内容ハッシュ>`` に分ける。
+
+    keyword だけでは subject が衝突する。keyword は本文から拾った任意の語なので、
+    無関係な事実が同一 subject に相乗りし、競合検出が ``(subject, predicate)``
+    でグルーピングするため「同一事実の別版」と誤判定される
+    (2026-07-26 実測: 自転車通勤の走行距離がスペイン語の ``mem.world.ser`` に
+    同居していた)。curator 系が既に採っている
+    ``mem.world.url.<host>.<sha1_12>`` / ``mem.world.executable_command.<mode>.
+    <sha1_12>`` と同じ規約で、内容ハッシュを 1 セグメント足して一意にする。
+    """
+    normalized = " ".join((content or "").split())
+    digest = hashlib.sha1(
+        normalized.encode("utf-8"), usedforsecurity=False,
+    ).hexdigest()[:_WORLD_SUBJECT_HASH_LEN]
+    return keyword, digest
 
 
 class ChatExtractor(BaseExtractor):
@@ -206,6 +255,24 @@ class ChatExtractor(BaseExtractor):
             if _looks_like_code_fragment(content):
                 result.notes_skipped += 1
                 continue
+            # ロールガード: assistant 発話は SemanticFact の素材にしない。
+            # personal/preference/emotion/opinion は 2026-07-15 に対策済み
+            # (「私は AI ですので…」が mem.personal.user に保存された) だが、
+            # world_fact だけガードの外にあり、アシスタント自身の生成文が
+            # 「世界の事実」として蓄積されていた。未検証の生成物を権威ある
+            # 事実として後日想起する構造になる。
+            # 2026-07-26 の実データ (global scope) では world_fact 11 件が
+            # すべてこの経路の産物で、内容も subject も事実として機能して
+            # いなかった: アシスタントの長文回答がそのまま object になり、
+            # subject は本文から拾った任意の ASCII 語 (mem.world.ser /
+            # mem.world.Cpk / mem.world.LDK)、数字混じりのゴミ
+            # (mem.world.0-8----2-3)、ユーザーの質問文の先頭語
+            # (mem.world.Please) だった。自転車通勤の走行距離がスペイン語の
+            # 「ser」に相乗りする subject 衝突も起きていた。
+            # world_fact はユーザーが断定した知識 (「水は H2O である」) に限る。
+            if is_assistant_note:
+                result.notes_skipped += 1
+                continue
             tags = self._builder.candidate_fact_tags(content)
             for tag in tags:
                 if tag not in self.SUPPORTED_TAGS:
@@ -213,11 +280,6 @@ class ChatExtractor(BaseExtractor):
                 fact_type: FactType = tag  # type: ignore[assignment]
                 kind = _KIND_BY_TAG[tag]
                 if tag in _USER_SUBJECT_TAGS:
-                    # ロールガード: assistant 発話をユーザーの personal/
-                    # preference/emotion/opinion ファクトにしない (2026-07-15:
-                    # 「私は AI ですので…」が mem.personal.user に保存された)。
-                    if is_assistant_note:
-                        continue
                     # ファイル出力の指示文 (明示パス付き) は嗜好/感情ではなく
                     # 作業依頼なので preference/emotion/opinion にしない。
                     if tag != "personal_fact" and _LOCAL_PATH_HINT_RE.search(content):
@@ -242,13 +304,16 @@ class ChatExtractor(BaseExtractor):
                     )
                     subject = make_mem_subject(kind, attr or "user")
                 else:
-                    # world_fact のみ: keyword (sanitized) を parts に使用
+                    # world_fact のみ: keyword (sanitized) + 内容ハッシュを
+                    # parts に使用 (keyword 単独では subject が衝突する)
                     keyword = _world_fact_keyword(note)
                     if keyword == _SAFE_KEYWORD_FALLBACK:
                         # 有効な keyword を導けないノートは world_fact 化しない
                         # (mem.world.unknown の量産防止)
                         continue
-                    subject = make_mem_subject(kind, keyword)
+                    subject = make_mem_subject(
+                        kind, *_world_fact_subject_parts(keyword, content),
+                    )
                 fact = self.make_fact(
                     subject=subject,
                     predicate=_PREDICATE_BY_TAG.get(tag, "states"),

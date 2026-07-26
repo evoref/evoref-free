@@ -27,6 +27,12 @@ export interface EditorConfig {
 	line_height: number;
 	show_toolbar: boolean;
 	show_active_line: boolean;
+	/** 新規タブ / ファイル読込時の既定文字コード (config.editor 由来、テーマは持たない) */
+	default_encoding: string;
+	/** 新規タブの既定改行コード (config.editor 由来、テーマは持たない) */
+	default_line_ending: 'lf' | 'crlf' | 'cr';
+	/** シンタックスハイライトを有効にする言語 (config.editor 由来、テーマは持たない) */
+	highlight_languages: string[];
 }
 
 export interface LayoutConfig {
@@ -59,7 +65,7 @@ export interface LayoutConfig {
 	};
 }
 
-const defaultEditorConfig: EditorConfig = {
+export const defaultEditorConfig: EditorConfig = {
 	show_line_numbers: true,
 	word_wrap: false,
 	tab_size: 4,
@@ -67,7 +73,13 @@ const defaultEditorConfig: EditorConfig = {
 	font_size: 14,
 	line_height: 1.5,
 	show_toolbar: true,
-	show_active_line: true
+	show_active_line: true,
+	default_encoding: 'utf-8',
+	default_line_ending: 'lf',
+	highlight_languages: [
+		'markdown', 'python', 'javascript', 'typescript',
+		'json', 'html', 'css', 'yaml', 'xml', 'sql', 'php'
+	]
 };
 
 const defaultLayout: LayoutConfig = {
@@ -260,7 +272,9 @@ export async function activateTheme(
 			...layoutFields,
 			coding: {
 				...layoutFields.coding,
-				editor: layoutFields.coding.editor ?? { ...defaultEditorConfig },
+				// テーマは config.editor 由来のフィールド (encoding / line ending /
+				// highlight_languages) を持たないため、既定値を土台に重ねる。
+				editor: { ...defaultEditorConfig, ...layoutFields.coding.editor },
 			},
 		});
 	}

@@ -95,7 +95,27 @@ def _kmeans_numpy(
 class VectorStore:
     """numpy ベースのベクトル検索（int8 量子化 + memmap 対応）"""
 
-    def __init__(self, vectors_dir: str | Path, memmap_threshold: int = DEFAULT_MEMMAP_THRESHOLD):
+    def __init__(
+        self,
+        vectors_dir: str | Path,
+        memmap_threshold: int = DEFAULT_MEMMAP_THRESHOLD,
+        quantization: str = "int8",
+    ):
+        """
+        Args:
+            vectors_dir: インデックスの配置ディレクトリ
+            memmap_threshold: memmap に切り替えるベクトル件数の閾値
+            quantization: 検索時の量子化利用方針 (config ``rag.quantization``)。
+
+                - ``int8`` (既定): int8 粗検索で候補を絞り、候補のみ float32 に
+                  復元して rescore する 2 段階検索
+                - ``none``: 粗検索で候補を絞らず全ベクトルを float32 に復元して
+                  正確なスコアを計算する (低速だが粗検索の取りこぼしが無い)
+
+                ディスク上の保持形式は常に int8 で、本設定は検索時の挙動のみを
+                変える。
+        """
+        self.quantization = quantization
         self.vectors_dir = Path(vectors_dir)
         self.chunks_dir = self.vectors_dir / "chunks"
         self.source_texts_dir = self.vectors_dir / "source_texts"
@@ -562,7 +582,10 @@ class VectorStore:
             )
 
         n_vectors = len(self.vectors_q8)
-        if rescore_candidates <= 0:
+        if self.quantization == "none":
+            # 粗検索で絞らず全件を float32 rescore に回す
+            rescore_candidates = n_vectors
+        elif rescore_candidates <= 0:
             rescore_candidates = max(_DEFAULT_RESCORE_MIN, top_k * 3)
 
         # ── 第1段階: int8 粗検索 ──

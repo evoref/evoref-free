@@ -62,7 +62,7 @@ async def get_assist_model_status(
     host = local_cfg.get("host", "127.0.0.1")
     port = int(local_cfg.get("port", 8081))
     url = f"http://{host}:{port}"
-    timeout = float(assist_cfg.get("timeout", 10))
+    timeout = float(assist_cfg.get("timeout", 30.0))
     # 用途別セマフォ。未指定は 1 スロットを既定
     concurrency_cfg = assist_cfg.get("concurrency") or {}
     concurrency = AssistModelConcurrency(

@@ -257,7 +257,7 @@ class RAGConfig(BaseModel):
         default_factory=ContextualPrefixConfig,
     )
     # --- ベクトル量子化 ---
-    quantization: str = Field(default="none", pattern=r"^(none|int8)$")
+    quantization: str = Field(default="int8", pattern=r"^(none|int8)$")
     rescore_candidates: int = Field(default=50, ge=0)
     # --- memmap ---
     memmap_threshold: int = Field(default=10000, ge=100)
@@ -335,7 +335,7 @@ class EmbeddingConfig(BaseModel):
     # 速度・次元は同等)。
     context_size: int = Field(default=8192, ge=1)
     # 共通
-    model_name: str = "qwen3-embedding"
+    model_name: str = "Qwen/Qwen3-Embedding-0.6B"
     # Qwen3-Embedding 系の instruction-aware プレフィックス
     # ``is_query=True`` のときに ``query_template`` で整形する。``mode`` は
     # ``chat`` / ``coding`` のいずれか。ドキュメント側 (``is_query=False``)

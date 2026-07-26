@@ -290,8 +290,13 @@ class PrivateSessionConfig(BaseModel):
     """セッション開始時のデフォルト private モード"""
 
     history_storage: str = Field(default="memory_only", pattern=r"^(memory_only|skip)$")
-    """history 保存方針。``memory_only``: ディスク永続化をスキップし WM/STM のみで保持。
-    ``skip``: 同上 (将来拡張用エイリアス)。"""
+    """history 保存方針。
+
+    - ``memory_only`` (既定): private ターンだけをディスク永続化から除外し、
+      WM/STM のみで保持する。同じセッションの通常ターンは履歴に残る。
+    - ``skip``: private ターンを 1 度でも含んだセッションは、通常ターンも含めて
+      セッションファイルごと永続化しない。
+    """
 
 
 class SemMemLimitsConfig(BaseModel):

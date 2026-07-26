@@ -204,6 +204,18 @@ class SleepTimeScheduler:
             self._run_light()
         )
 
+    async def run_light_now(self) -> None:
+        """Light 版を即時実行して完了まで待つ。
+
+        自律ループ (``LoopDriver``) が ``loop.sleep_time_every_n`` 反復ごとに
+        バトンを渡すための同期エントリ。``on_llm_start`` と違い fire-and-forget
+        にせず完了を待つため、呼出側は「圧縮済みメモリで次の反復に入る」ことを
+        保証できる。既に Light が走っている場合は二重起動せず何もしない。
+        """
+        if self._worker is None or self._running:
+            return
+        await self._run_light()
+
     def on_response_sent(self) -> None:
         """応答完了通知: Trigger B (Full) タイマーをリセット（§8.1）"""
         self._last_response = time.time()

@@ -53,7 +53,7 @@ def build_model_info_sync(
         llama_connected = ls.get("connected", False)
 
     # ベースモデル
-    base = sp.get("base_model", "")
+    base = sp.get("base_model") or ""
     if base:
         models.append(ModelInfoItem(
             label="base",
@@ -78,7 +78,7 @@ def build_model_info_sync(
         ))
 
     # 埋め込みモデル
-    embed = sp.get("embed_model", "")
+    embed = sp.get("embed_model") or ""
     embed_cfg = cfg.get("embedding", {})
     if embed or embed_cfg.get("backend"):
         if embed:
@@ -122,7 +122,7 @@ async def build_model_info_async(
         llama_connected = ls.get("connected", False)
 
     # ベースモデル
-    base = sp.get("base_model", "")
+    base = sp.get("base_model") or ""
     if base:
         models.append(ModelInfoItem(
             label="base",
@@ -146,7 +146,7 @@ async def build_model_info_async(
         ))
 
     # 埋め込みモデル
-    embed = sp.get("embed_model", "")
+    embed = sp.get("embed_model") or ""
     embed_cfg = cfg.get("embedding", {})
     if embed or embed_cfg.get("backend"):
         if embed:

@@ -126,7 +126,7 @@ class LearningPartitionMigrator:
 
         stem = Path(producer_filename).stem if producer_filename else ""
         if not stem:
-            base_model = self._cfg.get("model_paths", {}).get("base_model", "")
+            base_model = self._cfg.get("model_paths", {}).get("base_model") or ""
             stem = Path(base_model).stem
         if not stem:
             logger.warning(
@@ -176,7 +176,7 @@ class LearningPartitionMigrator:
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
-            tag = str(entry.get("base_model", "") or "")
+            tag = str(entry.get("base_model") or "" or "")
             stem = Path(tag).stem if tag else current_stem
             buckets.setdefault(stem or current_stem, []).append(entry)
 

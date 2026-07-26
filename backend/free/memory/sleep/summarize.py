@@ -29,6 +29,7 @@ async def summarize_unsummarized_sessions(
     llm_client: Any,
     embedder: "EmbeddingBackend",
     *,
+    batch_size: int = 5,
     is_cancelled: Callable[[], bool] | None = None,
 ) -> int:
     """未要約セッションに LLM 要約 + 埋め込みベクトルを生成する。
@@ -37,7 +38,8 @@ async def summarize_unsummarized_sessions(
 
     1. :func:`~backend.free.history.history_manager.get_history_manager` で
        シングルトンを取得 (失敗時は warning ログ + ``0`` 返却)。
-    2. インデックスから ``summary is None`` のセッションを順次取得。
+    2. インデックスから ``summary is None`` のセッションを順次取得
+       (1 サイクルあたり ``batch_size`` 件まで)。
     3. LLM に「以下の会話を 1-2 文で要約してください」プロンプトを投げ、
        先頭 20 ターン (各 200 文字まで) を入力とする。
     4. 生成された要約をセッションオブジェクトに保存し、続けて embedder で
@@ -51,6 +53,8 @@ async def summarize_unsummarized_sessions(
             id_slot=<background_slot>`` を受け付けること)。
         embedder: 要約の埋め込みベクトルを生成する
             :class:`~backend.free.rag.embedding_backend.EmbeddingBackend`。
+        batch_size: 1 サイクルで要約する最大セッション数
+            (config ``history.summary_batch_size``)。``0`` 以下は無制限。
         is_cancelled: キャンセル判定コールバック (``True`` で途中中断)。
 
     Returns:
@@ -70,7 +74,14 @@ async def summarize_unsummarized_sessions(
     for entry in index.sessions:
         if is_cancelled is not None and is_cancelled():
             break
-        if entry.summary is not None:
+        if batch_size > 0 and summarized >= batch_size:
+            break
+        # 未要約、または要約後に会話が伸びたセッションを対象にする。
+        # 自動保存は毎ターン走るため、会話途中で要約が付くことがある。その要約を
+        # 恒久化すると後半の訂正が要約に載らず、search_history 経由で訂正前の値が
+        # 「独立した根拠」として再注入される (2026-07-26 ライブ検証: 火曜→水曜と
+        # 訂正済みの予約が過去セッションの要約から火曜へ巻き戻った)。
+        if entry.summary is not None and entry.turn_count <= entry.summary_turn_count:
             continue
 
         session = mgr.get_session(entry.session_id)
@@ -95,6 +106,8 @@ async def summarize_unsummarized_sessions(
             session.summary = (
                 result["choices"][0]["message"]["content"].strip()
             )
+            # 要約の基にしたターン数を刻む。会話がここから伸びたら次回作り直す。
+            session.summary_turn_count = len(session.turns)
 
             emb = await embedder.embed([session.summary], is_query=False)
             session.summary_embedding = emb[0].tolist()
@@ -102,6 +115,7 @@ async def summarize_unsummarized_sessions(
             mgr.save_session(session)
 
             entry.summary = session.summary
+            entry.summary_turn_count = session.summary_turn_count
             summarized += 1
         except Exception as exc:
             logger.warning(

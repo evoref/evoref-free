@@ -202,7 +202,7 @@ async def generate_contextual_prefixes(
     from backend.free.rag.contextual_prefix import ContextualPrefixGenerator
     generator = ContextualPrefixGenerator(llm_client, config)
     batch_size = int(cp_cfg.get("batch_size", 10))
-    min_chunk_tokens = int(cp_cfg.get("min_chunk_tokens", 0))
+    min_chunk_tokens = int(cp_cfg.get("min_chunk_tokens", 200))
 
     total_generated = 0
 

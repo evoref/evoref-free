@@ -67,6 +67,24 @@ RAG_MAX_CHUNKS = 3
 RAG_CHUNK_CHAR_CAP = 300
 RAG_TOTAL_TOKEN_BUDGET = 256
 
+
+def _lexical_overlap(query: str, text: str) -> float:
+    """クエリとチャンクの語句重なり率 (0.0-1.0)。
+
+    埋め込み器が無い経路 (チャットの long_form) でユニット別に RAG チャンクを
+    選抜するための決定論スコア。日本語も拾えるよう文字 bi-gram を併用する。
+    """
+    def _grams(s: str) -> set[str]:
+        s = s.lower()
+        words = {w for w in re.findall(r"[a-z0-9_]{2,}", s)}
+        bigrams = {s[i:i + 2] for i in range(len(s) - 1) if not s[i].isspace()}
+        return words | bigrams
+
+    q = _grams(query)
+    if not q:
+        return 0.0
+    return len(q & _grams(text)) / len(q)
+
 # CodeUnit に file_path が無い (degraded fallback 等) 場合の既定ファイル名。
 _DEFAULT_CODE_FILE = "output.py"
 
@@ -255,8 +273,8 @@ class LongFormOrchestrator:
         if content_type == ContentType.CODE:
             rolling.skeleton = CodeSkeleton([], [], [], [], [])
         if existing_content and content_type == ContentType.TEXT:
-            rolling.short_term = truncate_tail(
-                existing_content, rolling.budget.short_term,
+            rolling.short_term = self._fit_short_term(
+                truncate_tail(existing_content, rolling.budget.short_term),
             )
             rolling.has_existing_context = True
         return rolling
@@ -596,7 +614,7 @@ class LongFormOrchestrator:
 
         lf = self.config.get("long_form", {})
         warnings: list[str] = []
-        if lf.get("code_smoke_test_enabled", False):
+        if lf.get("code_smoke_test_enabled", True):
             timeout = float(lf.get("code_smoke_timeout_sec", 10.0) or 10.0)
             smoke = run_import_smoke(files, timeout_sec=timeout)
             issues.extend(smoke.errors)
@@ -828,6 +846,10 @@ class LongFormOrchestrator:
             ):
                 yield "\n\n"
 
+            # ユニット別 RAG (long_form.rag_per_unit)。plan 用の一括ブロックでは
+            # なく、このユニットに効く参考情報だけを絞って渡す。
+            rolling.unit_rag = await self._build_unit_rag(label, prefetched_rag, mode)
+
             text = ""
             async for token in self.strategy.generate_unit(unit, rolling, content_type):
                 text += token
@@ -1038,12 +1060,69 @@ class LongFormOrchestrator:
             used_tokens += part_tokens
         return "\n---\n".join(parts)
 
+    def _fit_short_term(self, text: str) -> str:
+        """ローリング短期コンテキストを ``long_form.rolling_short_term_chars``
+        文字以内に収める (トークン予算とは独立した文字数上限)。
+        """
+        limit = int(
+            self.config.get("long_form", {}).get("rolling_short_term_chars", 1000),
+        )
+        if limit <= 0 or len(text) <= limit:
+            return text
+        return text[-limit:]
+
+    async def _build_unit_rag(
+        self,
+        unit_label: str,
+        prefetched_rag: list[tuple[str, float, str]] | None,
+        mode: str,
+    ) -> str:
+        """ユニット単位の参考情報ブロックを組み立てる。
+
+        ``long_form.rag_per_unit`` が有効なときだけ働き、無効なら空文字を返す
+        (ユニットプロンプトの参考情報は「(なし)」のまま)。
+
+        - retriever + embedder が注入されていれば、ユニット名で実検索する
+        - 未注入 (チャット経路の既定) なら、plan 用に取得済みの
+          ``prefetched_rag`` からユニット名との語句重なりで再選抜する
+
+        いずれも ``long_form.rag_top_k_per_unit`` 件までに絞る。
+        """
+        lf = self.config.get("long_form", {})
+        if not lf.get("rag_per_unit", True):
+            return ""
+        top_k = int(lf.get("rag_top_k_per_unit", 3))
+        if top_k <= 0 or not unit_label:
+            return ""
+
+        if self.retriever is not None and self.embedder is not None:
+            try:
+                hits = await self.retriever.search(unit_label, top_k=top_k, mode=mode)
+            except Exception as e:
+                logger.warning("per-unit RAG search failed: %s", e)
+                return ""
+            return "\n---\n".join(
+                f"[{source}] (score={score:.2f})\n{text[:RAG_CHUNK_CHAR_CAP]}"
+                for text, score, source in hits[:top_k]
+            )
+
+        if not prefetched_rag:
+            return ""
+        ranked = sorted(
+            prefetched_rag,
+            key=lambda c: (_lexical_overlap(unit_label, c[2]), c[1]),
+            reverse=True,
+        )
+        return self._format_prefetched_rag(ranked[:top_k])
+
     async def _update_rolling_context(
         self, rolling: RollingContext, text: str, content_type: ContentType,
     ) -> None:
         """ローリングコンテキストを更新"""
         # 共通: 直前ユニットの末尾を保持
-        rolling.short_term = truncate_tail(text, rolling.budget.short_term)
+        rolling.short_term = self._fit_short_term(
+            truncate_tail(text, rolling.budget.short_term),
+        )
 
         if content_type == ContentType.CODE:
             # コード: スケルトン更新（ルールベース、LLM不要）
@@ -1206,7 +1285,7 @@ class LongFormOrchestrator:
                 break
 
             rolling.generated_units.append(ext_text)
-            rolling.short_term = ext_text[-500:]
+            rolling.short_term = self._fit_short_term(ext_text)
             total_chars += len(ext_text)
 
             if on_step:

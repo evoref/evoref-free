@@ -140,6 +140,13 @@ class LearningScheduler:
     def _init_level2_params(self, learning: dict) -> None:
         """Level 2 (ベースモデル + アシストモデル §7.5.1) パラメータを設定する。"""
         self.min_failures: int = learning.get("level2_min_failures", 50)
+        # モード別の発火閾値 (未指定モードは min_failures にフォールバック)。
+        # coding は経験が溜まりにくく、chat と同じ閾値だと永久に発火しないか、
+        # chat が回るたび無駄に評価されるかのどちらかになる。
+        self.min_failures_by_mode: dict[str, int] = {
+            str(k): int(v)
+            for k, v in (learning.get("level2_min_failures_by_mode") or {}).items()
+        }
         self.spsa_iterations: int = learning.get("level2_spsa_iterations", 500)
         self.sparse_params: int = learning.get("level2_sparse_params", 200)
         self.active_minutes: float = learning.get("active_minutes", 5)
@@ -245,7 +252,7 @@ class LearningScheduler:
         self.budget_max_total_ratio: float = learning.get(
             "budget_max_total_ratio", 0.7,
         )
-        self._prompt_mutator_base: str = learning.get("prompt_mutator_base", "main")
+        self._prompt_mutator_base: str = learning.get("prompt_mutator_base", "assist")
         self._prompt_mutator_assist: str = learning.get("prompt_mutator_assist", "main")
 
     def _init_lazy_injected_slots(self) -> None:
@@ -2292,7 +2299,7 @@ class LearningScheduler:
             prompts_dir = Path(self.prompt_manager.prompt_dir)
         else:
             prompts_dir = Path(
-                self._config.get("local_paths", {}).get("prompts_dir", "local/prompts")
+                self._config.get("local_paths", {}).get("prompts_dir", "local/prompts/")
             )
         current_ratios = load_ratios(prompts_dir)
         best_ratios = current_ratios

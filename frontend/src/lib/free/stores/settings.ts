@@ -8,7 +8,10 @@ import { addToast } from './toast';
 import { instanceName } from './app';
 import { colorMode } from './theme';
 import { setLocale, promptLocale } from '$lib/i18n';
-import { layout } from './theme';
+import { layout, setLayoutCssVariables } from './theme';
+import type { EditorConfig } from './theme';
+
+type LineEndingSetting = EditorConfig['default_line_ending'];
 
 // ── TAB_SECTIONS（イミュータブル） ──
 
@@ -135,22 +138,33 @@ const syncHandlers = new Map<string, SyncHandler>([
 		(config) => {
 			const ed = config.editor;
 			if (ed && typeof ed === 'object') {
-				layout.update((l) => ({
-					...l,
-					coding: {
-						...l.coding,
-						editor: {
-							show_line_numbers: ed.show_line_numbers as boolean ?? l.coding.editor.show_line_numbers,
-							word_wrap: ed.word_wrap as boolean ?? l.coding.editor.word_wrap,
-							tab_size: ed.tab_size as number ?? l.coding.editor.tab_size,
-							font_family: ed.font_family as string ?? l.coding.editor.font_family,
-							font_size: ed.font_size as number ?? l.coding.editor.font_size,
-							line_height: ed.line_height as number ?? l.coding.editor.line_height,
-							show_toolbar: ed.show_toolbar as boolean ?? l.coding.editor.show_toolbar,
-							show_active_line: ed.show_active_line as boolean ?? l.coding.editor.show_active_line,
+				layout.update((l) => {
+					const next = {
+						...l,
+						coding: {
+							...l.coding,
+							editor: {
+								show_line_numbers: ed.show_line_numbers as boolean ?? l.coding.editor.show_line_numbers,
+								word_wrap: ed.word_wrap as boolean ?? l.coding.editor.word_wrap,
+								tab_size: ed.tab_size as number ?? l.coding.editor.tab_size,
+								font_family: ed.font_family as string ?? l.coding.editor.font_family,
+								font_size: ed.font_size as number ?? l.coding.editor.font_size,
+								line_height: ed.line_height as number ?? l.coding.editor.line_height,
+								show_toolbar: ed.show_toolbar as boolean ?? l.coding.editor.show_toolbar,
+								show_active_line: ed.show_active_line as boolean ?? l.coding.editor.show_active_line,
+								default_encoding: ed.default_encoding as string ?? l.coding.editor.default_encoding,
+								default_line_ending: ed.default_line_ending as LineEndingSetting
+									?? l.coding.editor.default_line_ending,
+								highlight_languages: ed.highlight_languages as string[]
+									?? l.coding.editor.highlight_languages,
+							}
 						}
-					}
-				}));
+					};
+					// font_size / line_height / tab_size は CSS 変数経由で効くため、
+					// ストア更新だけでは反映されない。ここで変数も張り替える。
+					setLayoutCssVariables(next);
+					return next;
+				});
 			}
 		}
 	]

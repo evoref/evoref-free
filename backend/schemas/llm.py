@@ -117,7 +117,7 @@ class LlamaConfig(BaseModel):
     flash_attn: bool = True
     mlock: bool = False
     cache_prompt: bool = True
-    slots: int = Field(default=2, ge=1, le=16)
+    slots: int = Field(default=1, ge=1, le=16)
     cache_type_k: str = Field(
         default="q8_0", pattern=r"^(f16|bf16|q8_0|q5_1|q5_0|q4_1|q4_0)$"
     )
@@ -131,7 +131,7 @@ class LlamaConfig(BaseModel):
     # ``cache_reuse is not supported by this context`` で自動無効化し、毎ターン
     # full re-prefill するため **no-op** (フラグは無害に無視される)。非 SWA base
     # に差し替えた場合のみ有効。AssistModelLocalConfig.cache_reuse と同型。
-    cache_reuse: int = Field(default=0, ge=0)
+    cache_reuse: int = Field(default=256, ge=0)
     max_tokens: int = Field(default=1024, ge=0)  # 0=無制限
     lora_target: str = "auto"
     # None = 未指定 (arch プロファイルの reasoning.enable_thinking / 能力判定で決定。
@@ -144,7 +144,7 @@ class LlamaConfig(BaseModel):
     # idle slot offload
     # cache_ram_mib: -1=無制限 / 0=disable / >0=MiB 上限。上流既定 8192 を
     # 黙従しないよう launch_llama.py から常に明示付与する。
-    cache_ram_mib: int = Field(default=4096, ge=-1)
+    cache_ram_mib: int = Field(default=0, ge=-1)
     # 上流既定 true (idle slot を退避対象にする)。false で機構自体を OFF。
     cache_idle_slots: bool = True
     # null=auto (slots>1 で ``--kv-unified`` 自動付与) / true|false で明示上書き。

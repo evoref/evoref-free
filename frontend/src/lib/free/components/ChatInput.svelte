@@ -13,6 +13,7 @@
 		clearGeneratedEditorCode,
 		setStreamingEditorCode,
 		clearStreamingEditorCode,
+		markLastUserTruncated,
 		nextMessageId,
 		tokenInfo,
 		sessionId,
@@ -105,6 +106,10 @@
 							elapsed_ms: event.step.elapsed_ms
 						});
 					}
+				} else if (event.type === 'input_truncated' && event.input_truncated) {
+					// 発言バブルに内訳を残し、見落とし防止にトーストも出す
+					markLastUserTruncated(event.input_truncated);
+					addToast({ type: 'error', i18nKey: 'chat.input_truncated_toast' });
 				} else if (event.type === 'rag_debug' && event.rag_debug) {
 					setRagDebugToLastAssistant(event.rag_debug);
 				} else if (event.type === 'editor_route' && event.editor_route) {

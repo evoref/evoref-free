@@ -655,7 +655,7 @@ def build_llama_cmd(
         project_root = Path.cwd()
 
     # ベースモデルパス解決（model_override 指定時はそちらを優先）
-    base_model = model_override or sp.get("base_model", "models/base_model.gguf")
+    base_model = model_override or sp.get("base_model", "models/gemma-4-12b-it-qat-q4_0.gguf")
     base_model_path = Path(base_model)
     if not base_model_path.is_absolute():
         base_model_path = project_root / base_model_path
@@ -846,7 +846,7 @@ def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | 
     lp = cfg.get("local_paths", {})
 
     # エンベッドモデルパス（model_paths.embed_model or デフォルト）
-    embed_model = sp.get("embed_model", "models/qwen3-embedding.gguf")
+    embed_model = sp.get("embed_model", "models/Qwen3-Embedding-0.6B-Q8_0.gguf")
     embed_model_path = Path(embed_model)
     if not embed_model_path.is_absolute():
         embed_model_path = project_root / embed_model_path

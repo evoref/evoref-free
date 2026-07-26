@@ -258,7 +258,13 @@ _INFER_TOOL_EXEC_QUERY_RE = re.compile(
     r"|(?<![A-Za-z])GPU(?![A-Za-z])|(?<![A-Za-z])VRAM(?![A-Za-z])|ディスク|容量|ストレージ"
     r"|(?<![A-Za-z])spec(?![A-Za-z])"
     r"|何時|何月|何日|何曜日|日時|日付|現在時刻"
-    r"|(?<![A-Za-z])today(?![A-Za-z])|(?<![A-Za-z])now(?![A-Za-z])"
+    # 裸の now は時刻クエリのシグナルにならない ("from now on" / "right now" /
+    # "know now" 等の非時制表現に誤爆する。2026-07-26 ライブ検証で
+    # "From now on, always reply in English. Tell me what a deadlock is" が
+    # run_command_readonly の時刻取得を発火させた)。EN 版 (_..._RE_EN) は
+    # 2026-07-22 監査で既に句単位に絞ってあるので、同じ形へ揃える。
+    r"|(?<![A-Za-z])today(?![A-Za-z])"
+    r"|what'?s?\s*(?:the\s*)?(?:time|date)|current\s*(?:time|date)"
     r"|IP\s*アドレス|ホスト名|(?<![A-Za-z])hostname(?![A-Za-z])"
     r"|(?<![A-Za-z])OS(?![A-Za-z])|オペレーティングシステム"
     r"|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])"
@@ -1101,8 +1107,20 @@ class ToolCallJudge:
             return ToolJudgement(tool_needed=False, source="rule")
 
         # 1. 組み込みパターン照合（ルールベース）
+        # ツール名まで確定したときだけ層1で打ち切る。``tool_needed=True`` かつ
+        # ``tool_name=""`` (汎用ツール指示) で即 return すると、実行できる
+        # ツールが 1 つも無いまま deliberative に落ちる。LLM は「ツールを使った
+        # 建前」で文脈だけから答えるため、ツールで確かめるべき事実を捏造する
+        # (2026-07-26 ライブ検証: 「保存したファイルを読み込んで、中身をそのまま
+        # 見せてください。」— パスは直前ターンにあり本文には無い — が
+        # tool_name="" で確定し read_file が発火せず、実ファイルと全く異なる
+        # 内容を「ファイルの中身」として提示した。同じ依頼をパス明示で出すと
+        # read_file が正しく発火し実内容を返す)。
+        # ツール名が空のときは後続層 (カートリッジ / 学習済み / assist) に
+        # 具体化を委ねる。assist 層は会話履歴を見るため、本文に無いパスを
+        # 直前ターンから補える。
         result = self._judge_with_rules(query, tools_registry, mode)
-        if result.tool_needed:
+        if result.tool_needed and result.tool_name:
             # run_command の場合は assist でコマンド合成を試行 (assist=None
             # / 失敗時は regex 由来の既存コマンドを維持)
             result = await self._maybe_upgrade_command_via_assist(result, query)
@@ -1610,15 +1628,23 @@ class ToolCallJudge:
     def _maybe_scope_session_search(
         self, result: "ToolJudgement", query: str, session_id: str,
     ) -> None:
-        """``search_history`` が選ばれ、クエリが「この会話で」等のセッション
-        自己参照パターンに一致する場合、``tool_args["session_id"]`` を強制注入
-        して検索対象を現在セッションのみに限定する。
+        """``search_history`` の現在セッションの扱いを code 側で強制する。
 
-        session_id を渡さずに search_history を無条件許可すると、2026-07-17/18
-        の実インシデント (「この会話で一番面白かった？」が無関係な過去セッション
-        の内容を誤って混同した) が再発するため、自己参照パターンに一致する場合
-        のみ強制的にスコープを絞る。in-place で更新する。``session_id`` が空
-        (未提供) の場合は何もしない (呼出元が未対応でも安全に no-op)。
+        クエリが「この会話で」等のセッション自己参照パターンに一致する場合は
+        ``tool_args["session_id"]`` を強制注入して検索対象を現在セッションのみに
+        限定する。session_id を渡さずに search_history を無条件許可すると、
+        2026-07-17/18 の実インシデント (「この会話で一番面白かった？」が無関係な
+        過去セッションの内容を誤って混同した) が再発するため。
+
+        自己参照でない場合は逆に ``tool_args["exclude_session_id"]`` を注入して
+        現在セッションを結果から外す。現在セッションの発言は既に会話コンテキスト
+        へ全文が載っており再注入しても情報は増えないのに、セッション要約
+        (= 会話冒頭の発言) が「独立した根拠」の顔で入り、後から訂正された内容を
+        訂正前の値へ巻き戻す (2026-07-26 ライブ検証: 火曜→水曜と訂正した歯科の
+        予約が、2 ターン後に検索結果のセッション要約経由で火曜へ戻った)。
+
+        in-place で更新する。``session_id`` が空 (未提供) の場合は何もしない
+        (呼出元が未対応でも安全に no-op)。
         """
         if result.tool_name != "search_history":
             return
@@ -1626,17 +1652,25 @@ class ToolCallJudge:
             return
         if is_en_locale():
             patterns = _SELF_SESSION_REFERENCE_PATTERNS_EN
-            if _SESSION_TOPIC_BREAK_LEAD_RE_EN.search(query):
-                return
+            self_reference = (
+                not _SESSION_TOPIC_BREAK_LEAD_RE_EN.search(query)
+                and any(p.search(query) for p in patterns)
+            )
         else:
             patterns = _SELF_SESSION_REFERENCE_PATTERNS
-        if not any(p.search(query) for p in patterns):
-            return
+            self_reference = any(p.search(query) for p in patterns)
         if result.tool_args is None:
             result.tool_args = {}
-        result.tool_args["session_id"] = session_id
+        if self_reference:
+            result.tool_args["session_id"] = session_id
+            logger.debug(
+                "search_history scoped to current session "
+                "(self-session reference): %s", query[:50],
+            )
+            return
+        result.tool_args["exclude_session_id"] = session_id
         logger.debug(
-            "search_history scoped to current session (self-session reference): %s",
+            "search_history excludes current session (already in context): %s",
             query[:50],
         )
 

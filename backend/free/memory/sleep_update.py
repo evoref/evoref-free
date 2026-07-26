@@ -697,9 +697,11 @@ class SleepTimeWorker:
             summarize_unsummarized_sessions,
         )
 
+        history_cfg = self.config.get("history") or {}
         return await summarize_unsummarized_sessions(
             llm_client,
             self.embedder,
+            batch_size=int(history_cfg.get("summary_batch_size", 5)),
             is_cancelled=self._check_cancelled,
         )
 
