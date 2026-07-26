@@ -60,6 +60,10 @@ class LocalPathsConfig(BaseModel):
         default="local/lora_versions/",
         description="base LoRA のバージョン履歴保存先。",
     )
+    lora_spsa_checkpoint: str = Field(
+        default="local/models/lora_spsa_checkpoint.json",
+        description="base LoRA SPSA 学習の中断/再開チェックポイント。",
+    )
     assist_lora_adapter: str = Field(
         default="local/models/assist_adapter.gguf",
         description="assist モデル用 LoRA アダプタ (Level 2 assist=B)。"
@@ -68,6 +72,10 @@ class LocalPathsConfig(BaseModel):
     assist_lora_versions_dir: str = Field(
         default="local/models/assist_lora_versions/",
         description="assist LoRA のバージョン履歴保存先。",
+    )
+    assist_lora_spsa_checkpoint: str = Field(
+        default="local/models/assist_lora_spsa_checkpoint.json",
+        description="assist LoRA SPSA 学習の中断/再開チェックポイント。",
     )
     # Level 2 base=C: control vector (llama-cvector-generator 生成) の本体 / 版管理 /
     # positive.txt・negative.txt 作業用ディレクトリ。Pro 限定だが PathResolver が

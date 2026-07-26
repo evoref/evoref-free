@@ -322,8 +322,13 @@ def _init_memory(
     vs = None
     try:
         vectors_dir = resolver.resolve_local("vectors_dir")
-        memmap_threshold = cfg.get("rag", {}).get("memmap_threshold", 10000)
-        vs = VectorStore(vectors_dir, memmap_threshold=memmap_threshold)
+        rag_cfg = cfg.get("rag", {})
+        memmap_threshold = rag_cfg.get("memmap_threshold", 10000)
+        vs = VectorStore(
+            vectors_dir,
+            memmap_threshold=memmap_threshold,
+            quantization=str(rag_cfg.get("quantization", "int8")),
+        )
         if vs.index_path.exists():
             vs.load()
             logger.info("Vector store loaded: %d vectors", vs.count)

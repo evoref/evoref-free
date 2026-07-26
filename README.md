@@ -95,9 +95,9 @@ evoref は **完全ローカル動作** の自己進化型 LLM アシスタン�
 | Python | 3.12 以上 |
 | Node.js | npm 同梱の LTS |
 | Git | 最新版 |
-| llama-server | [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) の build **b8946 以上**を推奨 |
-| GPU / VRAM | GPU 推奨だが **CPU only でも動作** (`llama.gpu_layers: 0`)。Qwen3.5-9B Q4_K_M + KV キャッシュで VRAM **3〜5GB** が目安。埋め込み・リランカーは既定で CPU 配置 |
-| ディスク | GGUF モデル計 **約 9GB** (base ~5.5GB / assist ~2.4GB / embedding ~0.6GB / reranker ~0.3GB)。`local/` データは運用に応じ別途数百 MB〜数 GB |
+| llama-server | [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) の build **b8946 以上**を推奨 (CVE-2026-21869 修正以降) |
+| GPU / VRAM | GPU 推奨だが **CPU only でも動作** (`llama.gpu_layers: 0`)。必要 VRAM はモデルサイズと `context_size` に依存 (既定 base = gemma-4-12b-it-qat-q4_0 で概ね 8GB 前後)。埋め込みは既定で CPU 配置 |
+| ディスク | GGUF モデル計 十数 GB (既定構成: base gemma-4-12b-it-qat-q4_0 / assist gemma-4-E4B / embed Qwen3-Embedding-0.6B)。`local/` データは運用に応じ別途数百 MB〜数 GB |
 
 llama-server は setup では導入されません。**別途インストールして PATH を通す**必要があります。
 
@@ -123,14 +123,16 @@ setup は以下を一括実行します:
 2. Python 依存インストール (`backend/requirements.txt` + `pip install -e .`)
 3. フロントエンド依存 (`npm install`)
 4. `config.yaml.example` → `config.yaml` コピー
-5. モデルダウンロード (対話式 Y/n): base (Qwen3.5-9B) / assist (Qwen3.5-4B) / embedding (Qwen3-Embedding-0.6B) / reranker (Qwen3-Reranker-0.6B)
+5. モデル配置チェック: `models/` に GGUF が配置されているか確認 (自動ダウンロードは行いません)
 6. `local/` データディレクトリ生成
+
+> **モデルは手動配置**: GGUF を `models/` に置き、`config.yaml` の `model_paths` と整合させてください。既定は base (gemma-4-12b-it-qat-q4_0) / assist (gemma-4-E4B) / embed (Qwen3-Embedding-0.6B)。配置状況は `python scripts/download_model.py` で確認できます。
 
 #### オプション
 
 ```powershell
-.\scripts\setup.bat --shared-path <NAS_PATH>   # 複数 PC で models/ を共有 (DL スキップ)
-.\scripts\setup.bat --force                    # .venv / config.yaml / models を強制再構築
+.\scripts\setup.bat --shared-path <NAS_PATH>   # 複数 PC で models/ を共有 (モデル配置チェックをスキップ)
+.\scripts\setup.bat --force                    # .venv / config.yaml を強制再構築
 ```
 
 複数 PC で使う場合、大きな GGUF モデルは NAS 上に共有しつつ、個人データ (履歴・記憶・学習) は各 PC の `local/` に独立して保持できます。
@@ -162,9 +164,12 @@ evoref gui     # 既定ブラウザで Web UI を開く
 | Web UI | 5173 |
 | backend (API) | 8000 |
 | llama-server (base / assist / embed) | 8080 / 8081 / 8082 |
-| llama-server (rerank, 任意) | 8083 |
 
-リランカー (8083) は既定で無効 (`reranker.enabled: false`)。RAG はリランカー無しでも動作し、検索精度を上げたい場合に有効化します。
+---
+
+## 変更履歴
+
+[docs/0.0.x_CHANGELOG.md](docs/0.0.x_CHANGELOG.md) を参照してください。
 
 ---
 

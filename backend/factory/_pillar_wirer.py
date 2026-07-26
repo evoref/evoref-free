@@ -469,8 +469,8 @@ def _init_learning_core(
     # build_contrastive_pairs は current_model でこの base_model を一致フィルタする
     # ため、空のままだと母集団が seed のみに縮退する (cvector が学習信号を失う)。
     _model_paths = cfg.get("model_paths", {})
-    _base_model_name = Path(_model_paths.get("base_model", "")).name
-    _embed_model_name = Path(_model_paths.get("embed_model", "")).name
+    _base_model_name = Path(_model_paths.get("base_model") or "").name
+    _embed_model_name = Path(_model_paths.get("embed_model") or "").name
     fc = FeedbackCollector(
         exp_buf, debug_logger=debug_logger,
         learned_patterns=learned_patterns_store,
@@ -1422,6 +1422,21 @@ def _init_loop_driver(
         max_queue_size=int(loop_cfg.get("event_bus_max_queue", 128)),
     )
 
+    def _build_sleep_time_hook(app_state: AppState):
+        """`loop.sleep_time_every_n` 反復ごとに sleep-time Light を回すフック。
+
+        ``sleep_scheduler`` が未構築 (degraded / ``--no-learning``) の場合は
+        ``None`` を返し、LoopDriver 側でフック無効として扱われる。
+        """
+        scheduler = getattr(app_state, "sleep_scheduler", None)
+        if scheduler is None:
+            return None
+
+        async def _hook() -> None:
+            await scheduler.run_light_now()
+
+        return _hook
+
     driver = LoopDriver(
         view_provider=_view_provider,
         executor=executor,  # type: ignore[arg-type]
@@ -1431,6 +1446,8 @@ def _init_loop_driver(
             loop_cfg.get("max_consecutive_failures", 3),
         ),
         tick_interval_sec=float(loop_cfg.get("tick_interval_sec", 0.0)),
+        sleep_time_every_n=int(loop_cfg.get("sleep_time_every_n", 5)),
+        sleep_time_hook=_build_sleep_time_hook(state),
         on_gate_fail=str(loop_cfg.get("on_gate_fail", "retry")),
         retry_limit_per_task=int(loop_cfg.get("retry_limit_per_task", 2)),
         artifact_hook=artifact_hook,
@@ -1474,7 +1491,7 @@ def _validate_model_state(
         if not ms.current_filename:
             ms.initialize_from_config(cfg)
 
-        config_base_model = cfg.get("model_paths", {}).get("base_model", "")
+        config_base_model = cfg.get("model_paths", {}).get("base_model") or ""
         config_filename = Path(config_base_model).name if config_base_model else ""
 
         mismatch = (
@@ -1808,7 +1825,7 @@ async def _build_base_context(
         pm_cfg = (cfg.get("process_manager") or {})
         state.llama_manager = LlamaProcessManager(
             project_root,
-            health_timeout=int(pm_cfg.get("health_timeout", 60)),
+            health_timeout=int(pm_cfg.get("health_timeout", 120)),
             stop_timeout=int(pm_cfg.get("stop_timeout", 10)),
         )
 
@@ -2265,7 +2282,7 @@ def _activate_learning_partition(base: "_BaseContext", state: AppState) -> None:
     # embed_instruction は embedding モデル単位のパーティション (base モデルとは
     # 独立軸)。以降の base モデル identity 依存の早期 return に影響されないよう
     # ここで確定する。
-    embed_filename = Path(cfg.get("model_paths", {}).get("embed_model", "")).name
+    embed_filename = Path(cfg.get("model_paths", {}).get("embed_model") or "").name
     resolver.set_active_embedding_model_stem(
         Path(embed_filename).stem if embed_filename else None,
     )
@@ -2276,7 +2293,7 @@ def _activate_learning_partition(base: "_BaseContext", state: AppState) -> None:
 
     # active モデル = config の base_model (= 実際に起動する llama-server のモデル)。
     # 学習コンポーネントはこのモデルのパーティションを指す。
-    active_filename = Path(cfg.get("model_paths", {}).get("base_model", "")).name
+    active_filename = Path(cfg.get("model_paths", {}).get("base_model") or "").name
     if not active_filename:
         logger.warning("Learning partition: no base model identity; staying flat")
         return

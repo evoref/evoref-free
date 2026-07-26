@@ -712,6 +712,18 @@ def _load_context_files(state: SessionState, console) -> None:
         )
 
 
+def _resolve_layout_mode(project_root: Path) -> str:
+    """config から CLI レイアウトを解決する（読込失敗時は sequential）。"""
+    from backend.free.cli.chat_loop import resolve_layout_mode
+    from backend.free.cli.service_manager import _load_config
+
+    try:
+        return resolve_layout_mode(_load_config(project_root), project_root)
+    except (OSError, ValueError, ImportError) as e:
+        logger.warning("Failed to resolve CLI layout mode, using sequential: %s", e)
+        return "sequential"
+
+
 async def _run_interactive_loop(
     state: SessionState,
     console,
@@ -731,7 +743,7 @@ async def _run_interactive_loop(
     render_model_info(console, *_build_model_info(project_root, status_data))
     render_welcome_hint(console)
     try:
-        await _main_loop(state, console)
+        await _main_loop(state, console, layout_mode=_resolve_layout_mode(project_root))
     finally:
         await _unregister_session(state.backend_url, state.session_id)
         _auto_serve_cleanup(auto_serve_state, console)

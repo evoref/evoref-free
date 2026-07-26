@@ -34,7 +34,8 @@ from backend.free.cli.renderer import (
     render_step,
     render_user_message,
 )
-from backend.free.cli.split_layout import SplitLayout
+from backend.free.cli.cli_theme import CLITheme
+from backend.free.cli.split_layout import SplitLayout, is_split_available
 from backend.error_handlers import E6001, E6004
 from backend.i18n_helper import msg
 from backend.log_config import get_logger
@@ -487,12 +488,49 @@ def _save_checkpoint_if_needed(state: SessionState) -> None:
         save_checkpoint(state)
 
 
-async def _main_loop(state: SessionState, console) -> None:
+def resolve_layout_mode(cfg: dict, project_root: Path) -> str:
+    """config `theme.cli_layout_mode` を実際のレイアウトへ解決する。
+
+    - ``sequential``: Claude Code 風の全スクロール出力（既定）
+    - ``split``: textual による画面分割。textual 未導入なら sequential へ縮退
+    - ``auto``: アクティブテーマの ``cli-theme.json`` の ``layout.mode`` に従う
+      （テーマ未適用・指定なしなら sequential）
+
+    Returns:
+        ``"split"`` または ``"sequential"``。
+    """
+    theme_cfg = cfg.get("theme") or {}
+    mode = theme_cfg.get("cli_layout_mode", "auto")
+
+    if mode == "auto":
+        active = theme_cfg.get("active") or ""
+        mode = "sequential"
+        if active:
+            from backend.config import PathResolver
+            themes_dir = PathResolver(cfg, project_root).resolve_local("themes_dir")
+            mode = CLITheme.from_file(themes_dir / active / "cli-theme.json").layout_mode
+
+    if mode == "split" and not is_split_available():
+        logger.warning(
+            "cli_layout_mode=split requested but textual is not installed; "
+            "falling back to sequential layout",
+        )
+        return "sequential"
+    return mode
+
+
+async def _main_loop(
+    state: SessionState, console, layout_mode: str = "sequential",
+) -> None:
     """メインインタラクションループ
 
-    Claude Code 風の全スクロールレイアウト（sequential モード）を使用。
-    固定ウィジェットを持たず、入力も出力も自然にスクロールする。
+    ``layout_mode`` は :func:`resolve_layout_mode` で解決済みの値を受け取る。
+    ``sequential`` は Claude Code 風の全スクロールレイアウトで、固定ウィジェット
+    を持たず入力も出力も自然にスクロールする。``split`` は textual による画面分割。
     """
+    if layout_mode == "split":
+        await _main_loop_split(state, console)
+        return
     await _main_loop_sequential(state, console)
 
 

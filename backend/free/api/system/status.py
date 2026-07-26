@@ -42,7 +42,7 @@ async def _collect_component_statuses(
     components: list[ComponentStatus] = []
 
     # base model
-    base_model_path = cfg.get("model_paths", {}).get("base_model", "")
+    base_model_path = cfg.get("model_paths", {}).get("base_model") or ""
     base_name = Path(base_model_path).stem if base_model_path else ""
     if client and hasattr(client, "metadata") and client.metadata.model_id:
         base_name = client.metadata.model_id
@@ -61,7 +61,7 @@ async def _collect_component_statuses(
 
     # embed model
     embed_cfg = cfg.get("embedding", {})
-    embed_name = embed_cfg.get("model_name", "")
+    embed_name = embed_cfg.get("model_name") or ""
     embed_connected = False
     if state.embedder is not None and hasattr(state.embedder, "health_check"):
         try:

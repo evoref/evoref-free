@@ -36,6 +36,7 @@ class StepCompactor:
     def __init__(self, config: dict, policy: PolicyInterpreter | None = None):
         self._policy = policy
         ac = config.get("agent", {})
+        self.enabled: bool = bool(ac.get("step_compaction_enabled", True))
         self.rag_lines: int = self._p(
             "step_compaction_rag_lines",
             ac.get("step_compaction_rag_lines", 2),
@@ -58,8 +59,10 @@ class StepCompactor:
         """ステップ結果リストを予算内に収める。
 
         最新反復は全文保持、古い反復から段階的に圧縮。
+        config ``agent.step_compaction_enabled`` が ``False`` の場合は
+        圧縮せず入力をそのまま返す。
         """
-        if not steps:
+        if not steps or not self.enabled:
             return steps
 
         before_tokens = self._total_tokens(steps)

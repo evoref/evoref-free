@@ -38,8 +38,23 @@ export interface EditorCodeArtifact {
 	partial?: boolean;
 }
 
+/** ユーザー発言が長さ制限で切り詰められた旨の通知 */
+export interface InputTruncatedInfo {
+	original_chars: number;
+	sent_chars: number;
+}
+
 export interface ChatStreamEvent {
-	type: 'token' | 'token_info' | 'done' | 'error' | 'step' | 'rag_debug' | 'editor_route' | 'editor_code';
+	type:
+		| 'token'
+		| 'token_info'
+		| 'done'
+		| 'error'
+		| 'step'
+		| 'rag_debug'
+		| 'editor_route'
+		| 'editor_code'
+		| 'input_truncated';
 	token?: string;
 	token_info?: TokenInfo;
 	error?: string;
@@ -47,6 +62,7 @@ export interface ChatStreamEvent {
 	rag_debug?: RagDebugInfo;
 	editor_route?: { target: 'editor' | 'chat' };
 	editor_code?: EditorCodeArtifact;
+	input_truncated?: InputTruncatedInfo;
 }
 
 /** SSE ストリーミングチャット */
@@ -161,6 +177,9 @@ export async function* chatStream(
 					if (parsed.rag_debug) {
 						if (IS_DEV) eventCounts.rag_debug++;
 						yield { type: 'rag_debug', rag_debug: parsed.rag_debug };
+					}
+					if (parsed.input_truncated) {
+						yield { type: 'input_truncated', input_truncated: parsed.input_truncated };
 					}
 					if (parsed.editor_route) {
 						yield { type: 'editor_route', editor_route: parsed.editor_route };

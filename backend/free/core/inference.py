@@ -427,7 +427,16 @@ def build_messages(
             _estimate_tokens(semmem_part) if semmem_part else 0,
             _estimate_tokens(rag_block) if rag_block else 0,
         )
+    # 最新ターンが予算を超えている = 切り詰め確定なら、後で system へ足す注記の
+    # 分を先に履歴予算から引く (後付けすると予約予算を超える)。
+    latest_tokens = (
+        _estimate_tokens(str(history[-1].get("content") or "")) if history else 0
+    )
+    if latest_tokens > history_budget:
+        history_budget = max(0, history_budget - _TRUNCATION_NOTE_RESERVE)
     trimmed = _trim_history(history, history_budget)
+    # 最新ターンが切られたかは dyn_parts 前置 (下) で内容が変わる前に判定する。
+    truncation_note = _latest_turn_truncation_note(history, trimmed)
 
     # 5. 動的ブロックを最後の user メッセージ先頭へ前置 (KV キャッシュ対応)。
     #    user ターンが無い場合のみ従来どおり system へ結合して情報を落とさない。
@@ -438,6 +447,14 @@ def build_messages(
                 "role": "system",
                 "content": system_prompt + "\n\n" + dyn_text,
             }
+
+    # 最新ターン切り詰めの注記は system へ足す (messages[0] の差し替え後に行う)。
+    if truncation_note:
+        messages[0] = {
+            "role": "system",
+            "content": f"{messages[0]['content']}\n\n{truncation_note}",
+        }
+        logger.warning("build_messages: %s", truncation_note)
 
     messages.extend(trimmed)
 
@@ -516,6 +533,95 @@ def build_messages_for_loop(
     return [{"role": "system", "content": sys_content}, *trimmed_history]
 
 
+#: ``_latest_turn_truncation_note`` の注記に確保するトークン数。注記は最新ターンを
+#: 切り詰めたときだけ system へ足すため、切り詰めが確定している場合のみ履歴予算から
+#: 引く (常時予約すると通常経路の履歴予算を無駄に削る)。予約せずに後付けすると
+#: プロンプトが予約予算を超え、context 溢れの 400 を招く。
+_TRUNCATION_NOTE_RESERVE = 120
+
+
+def _chars_within_token_budget(text: str, max_tokens: int) -> int:
+    """``text`` の先頭から ``max_tokens`` に収まる最大の文字数を返す。
+
+    ``estimate_tokens`` は CJK 1 文字 ≒ 1 トークン / ASCII 4 文字 ≒ 1 トークン
+    で見積もるため、文字数とトークン数の比は本文の構成で変わる。超過率から
+    候補長を縮めながら数回試す (二分探索までの精度は不要)。
+    """
+    if _estimate_tokens(text) <= max_tokens:
+        return len(text)
+    cut = len(text)
+    for _ in range(8):
+        est = _estimate_tokens(text[:cut])
+        if est <= max_tokens:
+            return cut
+        cut = min(int(cut * max_tokens / est), int(cut * 0.9)) or 1
+    return cut
+
+
+def latest_turn_truncation(
+    history: list[ChatMessage],
+    messages: list[ChatMessage],
+) -> tuple[int, int] | None:
+    """最新ターンが切り詰められた場合 ``(元文字数, 渡した文字数)`` を返す。
+
+    ``build_messages`` の戻り値と入力 history から判定する。UI へ「あなたの発言は
+    先頭のみ送られた」と提示するために API 層が使う (system 注記だけでは
+    ベースモデルが従わず、ユーザーには何も見えないため)。
+
+    ``messages`` は動的ブロック (few-shot / RAG / 記憶) が最後の user へ前置され
+    ている場合があるので、長さ比較ではなく「元テキストが末尾に丸ごと残っているか」
+    で判定する。前置は末尾に生クエリを残す契約 (``_prepend_dynamic_block``)。
+    """
+    if not history or not messages:
+        return None
+    original = history[-1]
+    sent = next(
+        (m for m in reversed(messages) if m.get("role") == original.get("role")),
+        None,
+    )
+    if sent is None:
+        return None
+    original_text = str(original.get("content") or "")
+    sent_text = str(sent.get("content") or "")
+    if not original_text or sent_text.endswith(original_text):
+        return None
+    kept = sent_text.removesuffix("...")
+    return len(original_text), len(kept)
+
+
+def _latest_turn_truncation_note(
+    history: list[ChatMessage],
+    trimmed: list[ChatMessage],
+) -> str | None:
+    """最新ターンが予算超過で切られた場合、その旨を伝える system 注記を返す。
+
+    ``_trim_history`` は最新ターンを drop せず ``compress_turn`` で切り詰めて
+    保持するが、モデルに届くのは末尾の ``"..."`` だけで「どれだけ落ちたか」は
+    伝わらない。そのためモデルは見ていない部分についても断定してしまう
+    (2026-07-26 ライブ検証: 11,359 文字のメモを 4,096 文字に切られた状態で
+    「検査装置のキャリブレーション周期は何回出てくるか」に対し、実際の 120 回
+    ではなく渡された範囲の 43 回を全体の件数として断定した)。
+
+    注記は system メッセージへ足す。ユーザー発言の中に注意書きを混ぜると
+    ユーザーが言っていないことを言ったことにしてしまうため採らない。
+    """
+    if not history or not trimmed:
+        return None
+    original, kept = history[-1], trimmed[-1]
+    if original.get("role") != kept.get("role"):
+        return None
+    original_text = str(original.get("content") or "")
+    kept_text = str(kept.get("content") or "")
+    if len(kept_text) >= len(original_text):
+        return None
+    return (
+        f"注: 直近の{original.get('role', 'user')}発言は長さ制限で先頭のみ"
+        f"渡されている (元 {len(original_text)} 文字 / 渡した {len(kept_text)} 文字)。"
+        "未渡し部分を見たものとして扱わず、全体の件数・集計・網羅列挙は"
+        "断定せず途中までしか読めていない旨を明示すること。"
+    )
+
+
 def _trim_history(
     history: list[ChatMessage],
     max_tokens: int,
@@ -545,7 +651,15 @@ def _trim_history(
             if not result:
                 # 最新ターンは drop せず、予算連動で圧縮して保持する
                 # (この分岐では total_tokens == 0 のため残予算 = max_tokens)。
-                compressed = compress_turn(turn, max_chars=max(max_tokens, 200))
+                # max_chars はトークンではなく文字数の上限なので、トークン予算を
+                # そのまま渡すと単位が合わない: ASCII (4 文字 ≒ 1 トークン) では
+                # 予算の 1/4 しか使わず、CJK (1 文字 ≒ 1 トークン) では予算ぎりぎり
+                # まで載る。推定トークン数で残予算まで詰める形に揃える。
+                compressed = compress_turn(
+                    turn, max_chars=_chars_within_token_budget(
+                        content, max(max_tokens, 200),
+                    ),
+                )
                 compressed_tokens = _estimate_tokens(compressed.get("content", ""))
                 result.insert(0, compressed)
                 total_tokens += compressed_tokens

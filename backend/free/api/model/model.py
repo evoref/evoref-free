@@ -159,7 +159,7 @@ async def get_model_state(state: AppState = Depends(get_app_state)):
     cfg = get_config()
     model_state = _get_model_state()
 
-    config_base_model = cfg.get("model_paths", {}).get("base_model", "")
+    config_base_model = cfg.get("model_paths", {}).get("base_model") or ""
     config_filename = Path(config_base_model).name if config_base_model else ""
     mismatch_info = state.model_state_mismatch or {}
     is_mismatch = bool(
@@ -811,7 +811,7 @@ async def reload_model(state: AppState = Depends(get_app_state)):
         model_state = _get_model_state()
         model_state.update_current(
             filename=Path(
-                cfg.get("model_paths", {}).get("base_model", "")
+                cfg.get("model_paths", {}).get("base_model") or ""
             ).name,
             chat_template_name=metadata.chat_template[:50] if metadata.chat_template else "",
             has_system_role=metadata.has_system_role,

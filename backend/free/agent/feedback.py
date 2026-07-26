@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from backend.free.core.locale_patterns import select_locale_variant
@@ -134,6 +135,28 @@ _QUERY_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'「」()（）]+")
 # 言い換えパターン（同じ質問の言い直し検出用）
 REPHRASE_THRESHOLD = 0.5  # 類似度閾値
 
+# オウム返し (応答がユーザー発話と同一) 判定の最小文字数。これ未満は
+# 「こんにちは」→「こんにちは」のような正当な同語応答があり得るため
+# 対象外にする。
+_ECHO_MIN_CHARS = 16
+
+
+def _is_user_echo(query: str, response: str) -> bool:
+    """応答がユーザー発話のオウム返しかを判定する。
+
+    ベースモデルが短い訂正ターン等でユーザー発話をそのまま復唱することが
+    ある (2026-07-26 ライブ検証: 「すみません、火曜ではなく水曜の間違い
+    でした。時間はそのままです。」に対し全く同一の応答)。これは応答として
+    失敗だが、``[failed]`` マーカーも step_credits も無いため従来は
+    ``success`` として経験記録され、Level 1 fitness / learned_patterns の
+    正例に混ざっていた。空白差だけを無視した完全一致を失敗として扱う。
+    """
+    q = "".join((query or "").split())
+    r = "".join((response or "").split())
+    if len(q) < _ECHO_MIN_CHARS or len(r) < _ECHO_MIN_CHARS:
+        return False
+    return q == r
+
 
 class FeedbackCollector:
     """暗黙的フィードバックシグナルを収集し経験バッファに記録
@@ -167,6 +190,12 @@ class FeedbackCollector:
         self._prev_turn_failed: bool = False
         # 現在ロード中のモデル名 (GGUF ファイル名)。record() の base_model /
         # embedding_model が明示指定されないとき既定値として埋める。
+        #
+        # base_model は **モードで変わる**: coding は model_paths.coding_model を
+        # ロードするため、chat と同じ名前を刻むとモデル隔離フィルタ (Level 2 が
+        # current_model で経験を絞る) の意味が壊れる。実際 2026-07-26 時点の
+        # 経験 182 件は coding 分 2 件も chat のモデル名で記録されていた。
+        # _base_model_name は chat 既定として保持し、record() 時に mode から解決する。
         self._base_model_name = base_model_name
         self._embedding_model_name = embedding_model_name
         # 現会話セッションで record した entry の参照。会話終了時に
@@ -180,6 +209,26 @@ class FeedbackCollector:
                 "FeedbackCollector initialized in disabled mode "
                 "(Level 0 experience record is no-op)",
             )
+
+    def _resolve_base_model_name(self, mode: str) -> str:
+        """記録時のモードで実際にロードされている base モデルの GGUF 名を返す。
+
+        coding は ``model_paths.coding_model`` を読み込むため、chat と同じ名前を
+        刻むと Level 2 のモデル隔離フィルタ (``current_model`` で経験を絞る) が
+        別モデルの経験を混ぜてしまう。解決経路はモード切替が使う
+        ``get_mode_generation_params`` に揃える (実際にロードされるモデルと
+        刻む名前を同じ関数から採る)。
+
+        config 未初期化などで解決できない場合は起動時に決めた既定
+        (``_base_model_name``) へフォールバックし、記録自体は止めない。
+        """
+        try:
+            from backend.config import get_mode_generation_params
+
+            raw = get_mode_generation_params(mode)["model"]
+        except Exception:
+            return self._base_model_name
+        return Path(raw).name if raw else self._base_model_name
 
     def record(
         self,
@@ -219,13 +268,14 @@ class FeedbackCollector:
                 query=query,
                 response_summary=response[:RESPONSE_SUMMARY_CAP],
                 response_full=truncate_at_boundary(response, RESPONSE_FULL_CAP),
-                base_model=base_model or self._base_model_name,
+                base_model=base_model or self._resolve_base_model_name(mode),
                 embedding_model=embedding_model or self._embedding_model_name,
                 cartridge_ids=cartridge_ids or [],
                 signals=FeedbackSignals(),
             )
         turn_outcome = self._derive_turn_outcome(
             response, step_credits,
+            query=query,
             tool_routing_false_positive=tool_routing_false_positive,
             long_form_false_positive=long_form_false_positive,
         )
@@ -274,7 +324,7 @@ class FeedbackCollector:
             query=query,
             response_summary=response[:RESPONSE_SUMMARY_CAP],
             response_full=truncate_at_boundary(response, RESPONSE_FULL_CAP),
-            base_model=base_model or self._base_model_name,
+            base_model=base_model or self._resolve_base_model_name(mode),
             embedding_model=embedding_model or self._embedding_model_name,
             cartridge_ids=cartridge_ids or [],
             signals=signals,
@@ -374,13 +424,15 @@ class FeedbackCollector:
         response: str,
         step_credits: list[dict] | None,
         *,
+        query: str = "",
         tool_routing_false_positive: bool = False,
         long_form_false_positive: bool = False,
     ) -> str:
         """ターン成否 ("success" | "partial" | "failed") を決定論導出する。
 
         SSE 完走 = 成功ではなく、応答本文の [failed] マーカー・step_credits
-        全 0・ルーティング false_positive を失敗シグナルとして扱う。
+        全 0・ルーティング false_positive・ユーザー発話のオウム返しを失敗
+        シグナルとして扱う。
         """
         text = response or ""
         if _FAILED_MARKER_RE.search(text):
@@ -390,6 +442,8 @@ class FeedbackCollector:
         ):
             return "failed"
         if tool_routing_false_positive or long_form_false_positive:
+            return "failed"
+        if _is_user_echo(query, text):
             return "failed"
         return "success"
 

@@ -38,6 +38,7 @@ LoopEventKind = Literal[
     "loop_resumed",
     "loop_stopped",
     "stage_progress",
+    "sleep_time_ran",
 ]
 """LoopEvent の種別。
 
@@ -51,6 +52,8 @@ LoopEventKind = Literal[
   ループ全体のライフサイクル
 - ``stage_progress`` : 1 タスク (工程) 内のサブステップ進捗 (staged コーディング
   専用。``data={"stage","detail","status","task_id"}``)。自律ループは未使用
+- ``sleep_time_ran`` : ``loop.sleep_time_every_n`` 反復ごとの sleep-time バトン
+  タッチが完了した
 """
 
 

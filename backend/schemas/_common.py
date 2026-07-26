@@ -212,7 +212,7 @@ class AgentConfig(BaseModel):
     content_gen_idle_timeout: int = Field(default=30, ge=5, le=300)
     content_gen_timeout: int = Field(default=600, ge=30)
     llm_call_timeout: int = Field(default=90, ge=10)
-    total_timeout: int = Field(default=900, ge=60)
+    total_timeout: int = Field(default=1800, ge=60)
     # coding モードで editor/chat 出力のコード生成を LongForm 細粒度生成
     # (CodeUnit 計画 → ファイル別生成・検証・修正) へ委譲する。大規模実装は
     # 複数ファイルへ分割出力可能。False で従来の単一ショット生成に戻す。
@@ -247,7 +247,7 @@ class ToolsConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    fetch_url_enabled: bool = False
+    fetch_url_enabled: bool = True
     fetch_url_timeout: int = Field(default=10, ge=1)
     fetch_url_allow_private_ip: bool = False
     # ── URL リコール (Phase 1) ──
@@ -362,7 +362,8 @@ class ChatModeConfig(BaseModel):
     top_p: float = Field(default=0.9, ge=0.0, le=1.0)
     top_k: int = Field(default=40, ge=0, le=1000)
     presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
-    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
+    # 0.0 だと同一句の暴走反復が止まらないため chat は既定で抑制を掛ける
+    frequency_penalty: float = Field(default=0.3, ge=-2.0, le=2.0)
 
 
 class CodingModeConfig(BaseModel):
@@ -434,7 +435,7 @@ class ProcessManagerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
-    health_timeout: int = 60
+    health_timeout: int = 120
     stop_timeout: int = 10
 
 

@@ -112,6 +112,13 @@ class LearningConfig(BaseModel):
     level1_generations: int = Field(default=10, ge=1)
     level1_population_size: int = Field(default=5, ge=1)
     level2_min_failures: int = Field(default=50, ge=1)
+    # モード別の Level 2 発火閾値。未指定のモードは level2_min_failures に
+    # フォールバックする。coding は経験が溜まりにくく (2026-07-26 実測: chat 180 件に対し
+    # coding 2 件)、chat と同じ閾値では「chat が回るたびに coding も無駄に評価される」か
+    # 「coding が永久に発火しない」のどちらかになるため、モード別に持てるようにする。
+    level2_min_failures_by_mode: dict[Literal["chat", "coding"], int] = Field(
+        default_factory=dict,
+    )
     # アイドル判定タイマー
     full_idle_minutes: int = Field(default=10, ge=1)        # Trigger B: Full sleep-time
     level1_idle_minutes: int = Field(default=30, ge=1)      # Trigger C: Level 1

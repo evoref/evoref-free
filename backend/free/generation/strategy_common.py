@@ -370,7 +370,7 @@ def build_code_unit_messages(
         name=unit.name,
         spec=budget.fit_content("unit_spec", unit.spec),
         depends_on=", ".join(unit.depends_on) or "(なし)",
-        rag_context="(なし)",  # RAG は Orchestrator 側で注入
+        rag_context=budget.fit_content("rag_chunks", rolling.unit_rag) or "(なし)",
     )
 
     return [
@@ -685,7 +685,7 @@ def build_text_unit_messages(
         "short_term": short_term or "(なし)",
         "heading": unit.heading,
         "key_points": ", ".join(unit.key_points),
-        "rag_context": "(なし)",  # RAG は Orchestrator 側で注入
+        "rag_context": budget.fit_content("rag_chunks", rolling.unit_rag) or "(なし)",
     }
     if include_long_term_summary:
         fmt_kwargs["long_term_summary"] = budget.fit_content(

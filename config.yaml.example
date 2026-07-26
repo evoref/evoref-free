@@ -283,7 +283,7 @@ model_migration:
 # 従来通り `scripts/launch_llama.py` を別途実行するワークフロー互換。
 process_manager:
   enabled: false           # 自動 spawn / 自動再起動を有効化
-  health_timeout: 60       # 起動後ヘルスチェック待機時間 (秒)
+  health_timeout: 120      # 起動後ヘルスチェック待機時間 (秒)。大きい coding GGUF の load を待てる値
   stop_timeout: 10         # SIGTERM 後のグレースフル終了待機時間 (秒)
 
 # ===== ローカルパス（読み書き）=====
@@ -295,9 +295,11 @@ local_paths:
   # LoRA / アシスト LoRA / 埋め込み LoRA (Pro 限定機能 — Free では未使用だが PathResolver が参照する)
   lora_adapter: local/models/adapter.gguf                          # ベース LoRA アダプタ
   lora_versions_dir: local/lora_versions/                          # ベース LoRA スナップショット
+  lora_spsa_checkpoint: local/models/lora_spsa_checkpoint.json     # ベース LoRA SPSA の再開チェックポイント
   lora_archive_dir: local/lora_archive/                            # ベース LoRA アーカイブ (古い世代)
   assist_lora_adapter: local/models/assist_adapter.gguf            # アシスト LoRA アダプタ
   assist_lora_versions_dir: local/models/assist_lora_versions/     # アシスト LoRA スナップショット
+  assist_lora_spsa_checkpoint: local/models/assist_lora_spsa_checkpoint.json  # アシスト LoRA SPSA の再開チェックポイント
   control_vector_adapter: local/models/control_vector.gguf            # base=C control vector 本体 (Pro)
   control_vector_versions_dir: local/models/control_vector_versions/  # control vector スナップショット (Pro)
   cvector_work_dir: local/cvector/                                 # control vector 生成の positive/negative 作業用 (Pro)
@@ -575,7 +577,7 @@ memory:
     auto_expand: false                                         # 自動拡張は仕様で禁止
   # --- ファクト抽出 ---
   facts:
-    extraction_skip_subject_canonicalize_regex: '^harness\.'   # ハーネス系 subject は辞書スキップ
+    extraction_skip_subject_canonicalize_regex: '^(loop|learn|mem)\.'   # pillar が機械的に命名した subject は辞書スキップ
     enable_extraction: true                                    # Step 8 Extractor 全体オンオフ
     trigger: idle_full_only                                    # 抽出トリガ (Trigger B = run_full のみ)
     extract_from_mdp_trace: true                               # agent_trace.jsonl から MDP 抽出
@@ -597,7 +599,8 @@ memory:
   # 会話履歴のディスク永続化をスキップする。セッション終了時に揮発する。
   private:
     default: false                                             # セッション開始時のデフォルト private モード
-    history_storage: memory_only                               # memory_only | skip — WM/STM のみ保持し永続化スキップ
+    history_storage: memory_only                               # memory_only: private ターンのみ永続化しない (通常ターンは残る)
+                                                               # skip: private ターンを含むセッションは丸ごと永続化しない
   # --- SemMem コンフリクト解消 ---
   conflict:
     default_mode: auto                                         # auto: 例外を除き自動マージ / manual: 全件 pending
@@ -683,7 +686,10 @@ memory:
     policy: 5000
     fewshot: 2000                 # policy subtype から独立
     failure_pattern: 2000
+    learned_failure_pattern: 2000 # PolicyAdjuster 由来 (EvorefLearn owned)
     progress_marker: 5000
+    artifact: 10000               # ラルフループの成果物ファクト
+    model: 1000                   # モデル能力プローブ由来のファクト
     enforcement: hard             # hard | soft (soft は削除しない計測専用)
     gc_strategy: lowest_score     # 削除戦略 (現在は lowest_score のみ)
   # --- プロジェクトアーカイブ ---
@@ -739,6 +745,11 @@ learning:
   level1_generations: 10          # Level 1 の世代数
   level1_population_size: 5       # Level 1 の集団サイズ
   level2_min_failures: 50         # Level 2 トリガーに必要な最小失敗数
+  # モード別の Level 2 発火閾値。未指定のモードは level2_min_failures を使う。
+  # coding は経験が溜まりにくいため個別に下げる用途を想定。
+  level2_min_failures_by_mode:
+    chat: 50
+    coding: 20
   # アイドル判定タイマー
   full_idle_minutes: 10           # Trigger B: sleep-time Full の起動アイドル時間（分）
   level1_idle_minutes: 30         # Trigger C: Level 1 の起動アイドル時間（分）
@@ -820,6 +831,16 @@ learning:
     source: yaml                      # yaml | hybrid | semmem
     activation_min_confidence: 0.7
     evolve_writeback: yaml            # yaml | semmem (D-2 で semmem 化予定)
+  # 品質ゲート結果 → 学習サイクル 還流パイプ。ラルフループが SemMem に書く
+  # progress_marker / failure_pattern / artifact を Level 1/2 tick 時に走査し、
+  # FewShotPool / CritiqueSynthesizer / PolicyParamEvolver の fitness へ還流する。
+  feedback_pipe:
+    enabled: false                    # 全経路の ON/OFF (false で走査自体をスキップ)
+    max_scan_per_tick: 50             # 1 tick で走査する SemMem ファクト数上限 (暴走防止)
+    progress_marker_lookback: 20      # 経路 1 で走査する直近 progress_marker 件数
+    failure_pattern_lookback: 30      # 経路 2 で走査する直近 failure_pattern 件数
+    failure_cluster_min_size: 3       # 経路 2 でクラスタとして扱う最小件数
+    weight_semmem_success: 0.3        # 経路 3 の fitness 重み w (0.0-1.0)
 
 # ===== ストリーミング設定 =====
 streaming:
@@ -964,10 +985,9 @@ assist_model:
     # MTP (Multi-Token Prediction) self-speculative。Free/Pro 共通。アシストモデル
     # 内蔵の MTP ヘッド (NextN 層) を draft に使う自己投機 (外部 draft モデル不要)。
     # MTP ヘッド内蔵モデルでのみ有効、非対応モデルでは warning + 素通り。
-    # 既定 null (フラグ未付与)。有効化する場合のみ下記ブロックを設定する。
-    # mtp:
-    #   enabled: false               # 対応モデルで true にすると MTP を有効化
-    #   draft_n_max: 3               # ``--spec-draft-n-max`` (上流既定 3)
+    mtp:
+      enabled: false               # 対応モデルで true にすると MTP を有効化
+      draft_n_max: 3               # ``--spec-draft-n-max`` (上流既定 3)
   model_path: ""                   # アシストモデルパス（通常は model_paths.assist_model を参照）
   timeout: 30.0                    # タイムアウト（秒）. CogWriter Plan 生成 (max_tokens=1024) 等の長め応答を許容するため 30 秒を推奨
   # 用途別セマフォ。realtime / background / learning を独立

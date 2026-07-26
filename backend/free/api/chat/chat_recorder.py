@@ -64,6 +64,10 @@ _session_started: dict[str, str] = {}
 # セッション別の全ターン蓄積（WM のエビクションに依存しない完全な履歴）
 _session_turns: dict[str, list[dict]] = {}
 
+# private ターンを 1 度でも含んだセッション ID
+# (``memory.private.history_storage: skip`` でセッションごと永続化を落とす判定に使う)
+_session_had_private: set[str] = set()
+
 
 def _accumulate_turn(
     session_id: str, role: str, content: str, *, private: bool = False,
@@ -77,6 +81,7 @@ def _accumulate_turn(
     除外する (memory_only)。蓄積バッファ自体に追加しない。
     """
     if private:
+        _session_had_private.add(session_id)
         logger.debug(
             "accumulate skipped (private turn): role=%s, session=%s, len=%d",
             role, session_id, len(content),
@@ -95,6 +100,7 @@ def clear_session_data(session_id: str) -> None:
     """セッション切替時にセッション固有データをクリーンアップ"""
     _session_started.pop(session_id, None)
     _session_turns.pop(session_id, None)
+    _session_had_private.discard(session_id)
 
 
 def _loaded_cartridge_ids(state: AppState) -> list[str]:
@@ -107,6 +113,22 @@ def _loaded_cartridge_ids(state: AppState) -> list[str]:
     if mgr is None:
         return []
     return list(mgr.loaded)
+
+
+def _existing_summary(mgr, session_id: str) -> str | None:
+    """既に生成済みのセッション要約を引き継ぐ (未生成なら ``None``)。
+
+    自動保存は毎ターン走るため、sleep-time の LLM 要約器が書いた要約を
+    次ターンの保存で消さないよう索引から読み直す。
+    """
+    try:
+        index = mgr._load_index()
+    except Exception:
+        return None
+    entry = next(
+        (e for e in index.sessions if e.session_id == session_id), None,
+    )
+    return entry.summary if entry is not None else None
 
 
 def _save_session_to_history(
@@ -126,6 +148,22 @@ def _save_session_to_history(
     try:
         from backend.config import get_config
         cfg = get_config()
+
+        # memory.private.history_storage:
+        #   memory_only (既定) — private ターンのみディスクから除外し、
+        #                        同席した通常ターンはセッションファイルに残す
+        #   skip            — private ターンを含んだセッションは丸ごと永続化しない
+        private_cfg = ((cfg.get("memory") or {}).get("private") or {})
+        if (
+            private_cfg.get("history_storage", "memory_only") == "skip"
+            and session_id in _session_had_private
+        ):
+            logger.info(
+                "history save skipped (history_storage=skip, session had private turns): %s",
+                session_id,
+            )
+            return
+
         mgr = get_history_manager()
 
         # 開始時刻を記録（初回のみ）
@@ -153,11 +191,21 @@ def _save_session_to_history(
             history_turns.append(entry)
 
         instance_name = cfg.get("instance", {}).get("name", "evoref")
-        # ユーザーの最初のメッセージを summary に使用（検索用）
-        first_user = next(
-            (t["content"] for t in history_turns if t.get("role") == "user"), None,
-        )
-        summary = first_user[:200] if first_user else None
+        # summary は書かない (None のまま残す)。
+        #
+        # 以前はユーザーの最初のメッセージを検索用 summary として毎ターン
+        # 書き込んでいたが、sleep-time の LLM 要約器
+        # (memory.sleep.summarize.summarize_unsummarized_sessions) は
+        # ``summary is None`` のセッションだけを対象にするため、summary が
+        # 一度も None にならず要約器が永久に発火しない状態になっていた
+        # (2026-07-26 実測: 31 セッション全件が「最初のユーザ発話そのまま」で、
+        # LLM 要約は 0 件)。さらに要約器が書いた要約も次ターンの自動保存で
+        # 最初の発話へ上書きされる構造だった。
+        #
+        # 検索は index の ``search_text`` (summary + topics + 全ターン結合) が
+        # 担うので、summary を空にしても search_history のヒット率は落ちない。
+        # 既に要約が付いているセッションは上書きせず引き継ぐ。
+        summary = _existing_summary(mgr, session_id)
 
         session = SessionData(
             session_id=session_id,

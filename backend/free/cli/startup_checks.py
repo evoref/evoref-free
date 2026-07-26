@@ -455,7 +455,7 @@ def _check_model_state_consistency(
     # base mismatch を優先表示 (ユーザが起動時に見る主エラー)
     base_mm = mismatches.get("base_model")
     if base_mm:
-        config_base_model = config.get("model_paths", {}).get("base_model", "")
+        config_base_model = config.get("model_paths", {}).get("base_model") or ""
         logger.error(
             "Model mismatch: model_state.json=%s vs config.yaml=%s",
             base_mm["model_state"], base_mm["config"],

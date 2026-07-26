@@ -27,6 +27,7 @@ from backend.free.rag.embedding_backend import (
 )
 from backend.free.rag.instruction_resolver import format_with_instruction
 from backend.log_config import get_logger
+from backend.utils import estimate_tokens
 
 logger = get_logger("rag.embedding_llamacpp")
 
@@ -99,6 +100,24 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
             text, template, self._instructions, mode, backend_label="embed_query",
         )
 
+    def _clamp_to_token_budget(self, text: str) -> str:
+        """推定トークン数が ``max_length`` を超えないよう末尾を切る。
+
+        ``estimate_tokens`` は CJK 1 文字 ≒ 1 トークン / ASCII 4 文字 ≒ 1
+        トークンで見積もる。超過分の比率から切り詰め位置を決め、なお超える
+        場合のみ縮めながら再試行する (二分探索は不要な精度)。
+        """
+        if estimate_tokens(text) <= self._max_length:
+            return text
+        cut = len(text)
+        for _ in range(8):
+            est = estimate_tokens(text[:cut])
+            if est <= self._max_length:
+                return text[:cut]
+            # 超過率から次の候補長を出す (最低でも 10% は縮める)
+            cut = min(int(cut * self._max_length / est), int(cut * 0.9)) or 1
+        return text[:cut]
+
     async def embed(
         self,
         texts: list[str],
@@ -137,19 +156,24 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
 
         # 入力長クランプ (instruction 付与前に実行)
         # llama-server の ubatch_size を単一入力が超えた場合、per-text
-        # フォールバックでも救えないため、事前に文字数で安全側にトリミングする。
+        # フォールバックでも救えないため、事前に安全側にトリミングする。
+        # 文字数上限 (max_length * 2) だけでは日本語で足りない: CJK は
+        # 概ね 1 文字 ≈ 1 トークンなので、8192 文字の日本語は 4096 トークンの
+        # context を大きく超えて 400 Bad Request になる (2026-07-26 ライブ検証:
+        # 11,359 文字の日本語入力が clamp 後も 400 で弾かれ、そのターンの RAG が
+        # 丸ごと無効化された)。文字数と推定トークン数の両方で切る。
         char_limit = self._char_limit
         clamped_texts: list[str] = []
         clamp_count = 0
         for t in texts:
-            if len(t) > char_limit:
+            clamped = t[:char_limit] if len(t) > char_limit else t
+            clamped = self._clamp_to_token_budget(clamped)
+            if clamped != t:
                 clamp_count += 1
-                clamped_texts.append(t[:char_limit])
-            else:
-                clamped_texts.append(t)
+            clamped_texts.append(clamped)
         if clamp_count:
             logger.debug(
-                "embed: clamped %d/%d texts to %d chars (max_length=%d)",
+                "embed: clamped %d/%d texts to %d chars / %d est. tokens",
                 clamp_count, len(texts), char_limit, self._max_length,
             )
 

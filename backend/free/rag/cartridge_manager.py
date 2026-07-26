@@ -135,6 +135,9 @@ class CartridgeManager:
         self._memmap_threshold = self.rag_config.get(
             "memmap_threshold", DEFAULT_MEMMAP_THRESHOLD,
         )
+        # config ``rag.quantization`` (int8 | none) をカートリッジ側の
+        # VectorStore にも同じ方針で適用する。
+        self._quantization = str(self.rag_config.get("quantization", "int8"))
         self._max_loaded = int(self.rag_config.get("max_loaded_cartridges", 20))
         self._large_warn_chunks = int(
             self.rag_config.get("large_cartridge_warn_chunks", 50000),
@@ -218,7 +221,11 @@ class CartridgeManager:
 
         # ドキュメントをチャンク分割 + 埋め込み
         docs_dir = cart_dir / "docs"
-        store = VectorStore(cart_dir, memmap_threshold=self._memmap_threshold)
+        store = VectorStore(
+            cart_dir,
+            memmap_threshold=self._memmap_threshold,
+            quantization=self._quantization,
+        )
         store.load()
 
         total_chunks, _ = await self._chunk_and_embed_docs(
@@ -350,7 +357,11 @@ class CartridgeManager:
             return self._loaded[cartridge_id].info
 
         cart_dir = self.cartridges_dir / cartridge_id
-        store = VectorStore(cart_dir, memmap_threshold=self._memmap_threshold)
+        store = VectorStore(
+            cart_dir,
+            memmap_threshold=self._memmap_threshold,
+            quantization=self._quantization,
+        )
         store.load()
 
         info = self._registry[cartridge_id]
@@ -447,7 +458,11 @@ class CartridgeManager:
 
         try:
             # 新しい VectorStore を作成
-            store = VectorStore(cart_dir, memmap_threshold=self._memmap_threshold)
+            store = VectorStore(
+                cart_dir,
+                memmap_threshold=self._memmap_threshold,
+                quantization=self._quantization,
+            )
             store.load()
 
             total_chunks, doc_count = await self._chunk_and_embed_docs(
@@ -937,7 +952,11 @@ class CartridgeManager:
             return True
 
         try:
-            store = VectorStore(cart_dir, memmap_threshold=self._memmap_threshold)
+            store = VectorStore(
+                cart_dir,
+                memmap_threshold=self._memmap_threshold,
+                quantization=self._quantization,
+            )
             store.load()
             self._enforce_max_loaded_before_insert(cart_id)
             centroid = _load_centroid(cart_dir)

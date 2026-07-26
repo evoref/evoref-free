@@ -12,6 +12,32 @@ logger = get_logger("config")
 _config: dict | None = None
 _path_resolver: "PathResolver | None" = None
 
+#: base_model 未指定時のフォールバック (歴史的既定)。
+_DEFAULT_BASE_MODEL = "models/gemma-4-12b-it-qat-q4_0.gguf"
+
+
+def mode_base_model_raw(
+    model_paths: dict, mode: str, *, default: str = _DEFAULT_BASE_MODEL,
+) -> str:
+    """指定モードで実際にロードされる base モデルの生パス文字列を返す。
+
+    chat は常に ``model_paths.base_model``。coding は ``coding_model`` 指定が
+    あればそれ、無い/空なら ``base_model`` へフォールバックする。
+
+    ``get_mode_generation_params`` (起動 / モード切替が使う解決) と
+    ``PathResolver`` (LoRA パーティション根の決定) の**単一情報源**。両者が
+    別々に同じ規則を書くと、片方だけ変えたときに「表示・保存先と実際に
+    ロードされるモデル」がズレる (2026-07-26 に同種のズレを 2 件修正済み)。
+
+    ``default`` は ``base_model`` 未宣言時の戻り値。起動側は歴史的既定へ倒すが、
+    パーティション根の決定では ``""`` を渡して「未宣言」を区別する
+    (宣言されていないモデル名でディレクトリを作らないため)。
+    """
+    base_model = model_paths.get("base_model") or default
+    if mode == "coding":
+        return model_paths.get("coding_model") or base_model
+    return base_model
+
 
 class PathResolver:
     """モデルパスとローカルパスを統一的に解決"""
@@ -221,7 +247,39 @@ class PathResolver:
         ):
             return self.resolve_local(key)
         effective_mode = mode if mode is not None else self._active_mode
-        return self.learning_path_for(key, self._active_stem, mode=effective_mode)
+        return self.learning_path_for(
+            key, self._stem_for(key, effective_mode), mode=effective_mode,
+        )
+
+    def _stem_for(self, key: str, mode: str | None) -> str:
+        """``key`` / ``mode`` に対するパーティション根のモデル stem を返す。
+
+        LoRA アダプタ系 (``_MODE_PARTITIONED_KEYS``) は **そのモードが実際に
+        ロードするモデル** を根にする。アダプタは特定モデルの重みへの差分なので、
+        「どのモデル向けか」が保存先の第一キーであるべき。
+
+        従来は常に ``_active_stem`` (= ``model_paths.base_model`` = chat のモデル)
+        を根にしていたため、coding が別モデル (``coding_model``) を使う構成では
+        coding のアダプタが chat モデルのパーティション配下に置かれていた。この
+        状態で chat の ``base_model`` を差し替えると、``coding_model`` は変わって
+        いないのに coding のアダプタが参照されなくなる (根が別 stem に移るため)。
+
+        アダプタ以外 (experience / prompts / cvector 系) は従来どおり
+        ``_active_stem``。経験とプロンプトは base 学習パーティション単位で
+        まとまっている既存設計 (docs/f_04_self_learning.md) を変えない。
+
+        ``model_paths`` に該当モデルの宣言が無い場合も ``_active_stem`` に倒す
+        (宣言されていないモデル名でパーティションを作らない)。
+        """
+        assert self._active_stem is not None  # 呼出元でガード済み
+        if (
+            mode is None
+            or key not in self._MODE_PARTITIONED_KEYS
+            or self._adapter_partition_mode != "model_mode"
+        ):
+            return self._active_stem
+        raw = mode_base_model_raw(self.models, mode, default="")
+        return Path(raw).stem if raw else self._active_stem
 
     def learning_path_for(self, key: str, stem: str, mode: str | None = None) -> Path:
         """**指定** モデル stem のパーティション配下で base 学習パスを解決する。
@@ -470,7 +528,7 @@ def _resolve_profile_sampling_for_mode(cfg: dict, mode: str) -> dict:
         return {}
 
     model_paths = cfg.get("model_paths", {})
-    base_model = model_paths.get("base_model", "")
+    base_model = model_paths.get("base_model") or ""
     if mode == "coding":
         model_rel = model_paths.get("coding_model") or base_model
     else:
@@ -722,7 +780,7 @@ def _resolve_profile_context_size_for_mode(cfg: dict, mode: str) -> int | None:
     if not (cfg.get("llama", {}) or {}).get("auto_model_flags", True):
         return None
     model_paths = cfg.get("model_paths", {}) or {}
-    base_model = model_paths.get("base_model", "")
+    base_model = model_paths.get("base_model") or ""
     if mode == "coding":
         model_rel = model_paths.get("coding_model") or base_model
     else:
@@ -850,12 +908,7 @@ def get_mode_generation_params(mode: str) -> dict:
 
     # ベースモデル。chat は常にここを採用。
     # coding は model_paths.coding_model 指定が無い/空の場合のみフォールバック。
-    model_paths = cfg.get("model_paths", {})
-    base_model = model_paths.get("base_model", "models/gemma-4-12b-it-qat-q4_0.gguf")
-    if mode == "coding":
-        params["model"] = model_paths.get("coding_model") or base_model
-    else:
-        params["model"] = base_model
+    params["model"] = mode_base_model_raw(cfg.get("model_paths", {}), mode)
 
     # 学習デルタの適用（Level 1 生成パラメータ進化の結果）
     try:

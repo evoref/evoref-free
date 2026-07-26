@@ -190,7 +190,7 @@ class ExperienceBuffer(JsonStateStore):
                 query=d.get("query", ""),
                 response_summary=d.get("response_summary", ""),
                 response_full=d.get("response_full", ""),
-                base_model=d.get("base_model", ""),
+                base_model=d.get("base_model") or "",
                 embedding_model=d.get("embedding_model", ""),
                 cartridge_ids=d.get("cartridge_ids", []),
                 # JSON に存在するキーのみ採用 (欠損キーは FeedbackSignals の

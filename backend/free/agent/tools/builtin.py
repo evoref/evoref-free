@@ -394,9 +394,12 @@ def write_file(file_path: str, content: str) -> str:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-        # len(content) は文字数であり、UTF-8 のマルチバイト文字 (日本語等) を
-        # 含むと実バイト数と乖離する。"bytes" と明記するため実測する。
-        return f"Written {len(content.encode('utf-8'))} bytes to {file_path}"
+        # 書込み後のファイルサイズを stat で読む。len(content) は文字数なので
+        # UTF-8 マルチバイト (日本語等) で乖離し、encode しても Windows の
+        # 改行変換 (write_text は newline=None = LF -> CRLF) の分だけ足りない
+        # (2026-07-26 実測: 報告 274 bytes に対し実ファイル 284 bytes、差は
+        # 改行 10 個分)。"bytes" と明記する以上、実体と一致させる。
+        return f"Written {p.stat().st_size} bytes to {file_path}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -1182,25 +1185,43 @@ def _make_search_history(manager: HistoryManager):
 
     def search_history(query: str, mode: str | None = None, limit: int = 10,
                        date_from: str | None = None, date_to: str | None = None,
-                       session_id: str | None = None) -> str:
+                       session_id: str | None = None,
+                       exclude_session_id: str | None = None) -> str:
         """過去の会話履歴を検索する
 
-        ``session_id`` は LLM 向けツールスキーマには公開しない
-        (ToolCallJudge がセッション自己参照質問に対してのみ code 側で
-        強制注入する。LLM が任意の session_id を指定できると他セッションの
-        意図的な絞り込み回避に使われかねないため)。
+        ``session_id`` / ``exclude_session_id`` は LLM 向けツールスキーマには
+        公開しない (ToolCallJudge が code 側で強制注入する。LLM が任意の
+        session_id を指定できると他セッションの意図的な絞り込み回避に
+        使われかねないため)。
+
+        ``exclude_session_id`` は現在進行中のセッションを結果から外す。
+        現在セッションの発言は既に会話コンテキストへ全文が載っており、
+        検索結果として再注入しても情報は増えない一方、要約 (= 会話冒頭の
+        発言) や断片が「独立した根拠」の顔で入り、後から訂正された内容を
+        訂正前の値へ巻き戻す (2026-07-26 ライブ検証: 火曜→水曜と訂正した
+        歯科の予約が、2 ターン後に検索結果のセッション要約経由で火曜へ
+        戻った)。自己参照質問で ``session_id`` を明示スコープした場合は
+        現在セッションこそが検索対象なので除外しない。
         """
-        try:
-            results = manager.search_sessions(
-                query=query, mode=mode, limit=limit, search_turns=False,
+        if session_id:
+            exclude_session_id = None
+
+        def _search(*, search_turns: bool) -> list[dict]:
+            found = manager.search_sessions(
+                query=query, mode=mode, limit=limit, search_turns=search_turns,
                 date_from=date_from, date_to=date_to, session_id=session_id,
             )
+            if exclude_session_id:
+                found = [
+                    r for r in found if r.get("session_id") != exclude_session_id
+                ]
+            return found
+
+        try:
+            results = _search(search_turns=False)
             # 結果が少ない場合のみターン検索で再検索
             if len(results) < limit:
-                results = manager.search_sessions(
-                    query=query, mode=mode, limit=limit, search_turns=True,
-                    date_from=date_from, date_to=date_to, session_id=session_id,
-                )
+                results = _search(search_turns=True)
             if not results:
                 return f"{SEARCH_HISTORY_NO_RESULTS_PREFIX}{query}"
 
@@ -1208,7 +1229,14 @@ def _make_search_history(manager: HistoryManager):
             for r in results:
                 header = f"[{r['started_at']}] mode={r['mode']} score={r['relevance_score']:.1f}"
                 if r.get("summary"):
-                    header += f" | {r['summary']}"
+                    # summary はそのセッションの「最初のユーザ発話」そのもの。
+                    # 同じ会話の後半で訂正されていてもここには反映されないため、
+                    # 裸で出すと現在も有効な事実として読まれ、訂正済みの値へ
+                    # 巻き戻す (2026-07-26 ライブ検証: 火曜→水曜と訂正済みの
+                    # 予約が、過去セッションの要約「来週の火曜日に歯科の予約を
+                    # 入れました。」経由で火曜へ戻った)。由来を明示して、
+                    # 会話冒頭の発言にすぎないことが読み取れるようにする。
+                    header += f" | first_message: {r['summary']}"
                 lines.append(header)
                 for turn in r.get("matched_turns", []):
                     lines.append(f"  turn#{turn['index']} ({turn['role']}): {turn['content_preview']}")
