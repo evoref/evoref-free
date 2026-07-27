@@ -213,7 +213,6 @@
     "history_search_found": "「{query}」で {count} 件見つかりました",
     "history_not_found": "セッションが見つかりません: {session_id}",
     "history_detail_duration": "所要時間",
-    "history_detail_topics": "トピック",
     "history_detail_files": "ファイル",
     "history_detail_turns": "ターン一覧",
     "history_detail_compressed": "圧縮済み",

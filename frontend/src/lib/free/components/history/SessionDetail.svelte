@@ -35,13 +35,6 @@
 				{/if}
 			</div>
 			<div class="detail-actions">
-				{#if detail.topics.length > 0}
-					<div class="detail-topics">
-						{#each detail.topics as topic}
-							<span class="topic-tag">{topic}</span>
-						{/each}
-					</div>
-				{/if}
 				<button class="resume-btn" onclick={onresume}>{$t('history_page.resume')}</button>
 			</div>
 		</div>
@@ -118,18 +111,6 @@
 		display: flex;
 		align-items: center;
 		gap: 10px;
-	}
-	.detail-topics {
-		display: flex;
-		gap: 4px;
-		flex-wrap: wrap;
-	}
-	.topic-tag {
-		font-size: 11px;
-		padding: 1px 6px;
-		border-radius: 3px;
-		background: color-mix(in srgb, var(--accent) 10%, transparent);
-		color: var(--text-secondary);
 	}
 	.resume-btn {
 		padding: 5px 14px;

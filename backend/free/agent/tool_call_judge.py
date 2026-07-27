@@ -1227,6 +1227,19 @@ class ToolCallJudge:
                     )
             return ToolJudgement(tool_needed=False, source="rule")
 
+        # 0.9. 「同じファイルに保存し直して」型: パスは直前ターンにしか無い。
+        # ルール層はパス必須、assist 層は read_file を選びがちで、書込みが
+        # 一度も走らないまま「直した内容」だけを返してしまう (実測 2026-07-27:
+        # 「体重を4.5kgに直して、同じファイルに保存し直して」→ read_file のみ
+        # 実行され、ファイルは旧内容のまま「保存し直した」体で回答された)。
+        # 会話から直近のパスを引いて write_file に確定させる。
+        rewrite = _referential_rewrite_judgement(query, conversation, tools_registry)
+        if rewrite is not None:
+            rewrite = self._validate_tool_availability(rewrite, tools_registry, mode)
+            if rewrite.tool_needed:
+                self._log_tool_decision(rewrite, "referential_rewrite")
+                return rewrite
+
         # 1. 組み込みパターン照合（ルールベース）
         # ツール名まで確定したときだけ層1で打ち切る。``tool_needed=True`` かつ
         # ``tool_name=""`` (汎用ツール指示) で即 return すると、実行できる
@@ -2959,6 +2972,58 @@ def _extract_quoted_filename(query: str) -> str | None:
         )
         if m:
             return m.group(1).strip()
+    return None
+
+
+#: 「同じファイルに」「そのファイルを」等、保存先を直前の文脈に委ねる表現。
+_REFERENTIAL_TARGET_RE = re.compile(
+    r"(?:同じ|その|この|先ほどの?|さっきの?)\s*(?:ファイル|ところ|場所)"
+    r"|保存し直|上書き|書き直して保存|同じ場所に"
+    r"|\b(?:same|that)\s+file\b|\boverwrite\b",
+    re.IGNORECASE,
+)
+#: 保存/書き出しを求める動詞 (パス無しの参照依頼を拾うための最小集合)。
+_REWRITE_VERB_RE = re.compile(
+    r"保存|書き込|書き出|上書き|セーブ|\bsave\b|\bwrite\b|\boverwrite\b",
+    re.IGNORECASE,
+)
+
+
+def _referential_rewrite_judgement(
+    query: str, conversation: list[dict] | None, tools_registry: ToolsRegistry,
+) -> "ToolJudgement | None":
+    """「同じファイルに保存し直して」型の依頼を write_file に確定させる。
+
+    クエリ自身にパスが無く、参照表現 + 保存動詞が揃っている場合のみ、直近の
+    会話から最後に出たファイルパスを引いて ``write_file`` を返す。該当しない
+    (パスが本文にある / 参照表現が無い / 会話にパスが無い) 場合は ``None`` で、
+    後続層の判定に委ねる。純粋関数 (レジストリ参照のみ)。
+    """
+    if not tools_registry.has("write_file"):
+        return None
+    if not _REWRITE_VERB_RE.search(query):
+        return None
+    if not _REFERENTIAL_TARGET_RE.search(query):
+        return None
+    if _extract_file_path(query):
+        return None  # 本文にパスがあるなら通常のルール層で足りる
+    for msg in reversed(list(conversation or [])):
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        path = _extract_file_path(content)
+        if path:
+            logger.info(
+                "Referential rewrite: resolved target from conversation: %s", path,
+            )
+            return ToolJudgement(
+                tool_needed=True,
+                tool_name="write_file",
+                tool_args={"file_path": path},
+                source="rule",
+            )
     return None
 
 

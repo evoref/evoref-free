@@ -202,8 +202,9 @@ def _save_session_to_history(
         # LLM 要約は 0 件)。さらに要約器が書いた要約も次ターンの自動保存で
         # 最初の発話へ上書きされる構造だった。
         #
-        # 検索は index の ``search_text`` (summary + topics + 全ターン結合) が
-        # 担うので、summary を空にしても search_history のヒット率は落ちない。
+        # 検索は index の ``search_text`` (summary + 全ターン結合) が担うので、
+        # summary を空にしても search_history のヒット率は落ちない。一覧見出しは
+        # index の ``first_user_preview`` (最初のユーザ発話) で代替される。
         # 既に要約が付いているセッションは上書きせず引き継ぐ。
         summary = _existing_summary(mgr, session_id)
 

@@ -38,9 +38,9 @@ export function formatDuration(sec: number): string {
 	return String(Math.max(1, Math.round(sec / 60)));
 }
 
-/** セッションの表示テキストを返す（サマリ → トピック → フォールバック） */
+/** セッションの表示テキストを返す（サマリ → 最初のユーザ発話 → フォールバック） */
 export function sessionDisplayText(s: SessionSummary, fallback: string): string {
-	return s.summary || s.topics.join(', ') || fallback;
+	return s.summary || s.first_user_preview || fallback;
 }
 
 /**

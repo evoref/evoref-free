@@ -1882,6 +1882,8 @@ async def stream_deliberative(
         # genuine error (except Exception) と client cancel
         # (CancelledError/GeneratorExit; except を素通り) を区別する。
         errored = False
+        # keepalive ループで使う process() タスク (finally の衛生処理が参照)。
+        process_task: asyncio.Task | None = None
 
         try:
             yield sse.agent_layer("deliberative")
@@ -1899,7 +1901,7 @@ async def stream_deliberative(
             # process() は iterator 返却前に _judge_and_execute_tool を完了
             # するため、await 完了時点で値が確定している。
             tool_capture: dict = {}
-            token_stream = await agent.process(
+            process_task = asyncio.create_task(agent.process(
                 query=query,
                 messages=list(messages),
                 llm_client=client,
@@ -1912,7 +1914,25 @@ async def stream_deliberative(
                 tool_capture=tool_capture,
                 tool_judge_task=tool_judge_task,
                 session_id=session_id,
-            )
+            ))
+            # process() はトークンを返す前にツール判定と実行を完了させる。
+            # ここを素の await にすると、その間 SSE フレームが 1 つも流れず、
+            # フロントの chunk timeout (60 秒) に掛かって "stream_timeout" で
+            # 落ちる (実測 2026-07-27: draft_document がベースモデルの
+            # 非ストリーミング生成に入り、iGPU で 60 秒を超えて失敗した)。
+            # 待機中も keepalive と step フレームを流し続ける。
+            while True:
+                done, _ = await asyncio.wait(
+                    {process_task}, timeout=DEFAULT_KEEPALIVE_INTERVAL_SEC,
+                )
+                # ツール開始の step フレームを実行完了まで溜めない
+                # (UI に「実行中」が即座に出る副次効果もある)。
+                async for frame in _drain_deliberative_step_queue(step_queue):
+                    yield frame
+                if process_task in done:
+                    break
+                yield sse.keepalive()
+            token_stream = process_task.result()
             stream_state.tool_command = tool_capture.get("command")
             stream_state.tool_command_name = tool_capture.get("command_name")
             stream_state.tool_command_success = tool_capture.get("success")
@@ -1955,6 +1975,10 @@ async def stream_deliberative(
             # 正常経路では process() 内で既に await 済み (done) のため no-op。
             if tool_judge_task is not None and not tool_judge_task.done():
                 tool_judge_task.cancel()
+            # 同様に、keepalive ループ中にジェネレータが閉じられた場合は
+            # process() タスクを孤児にしない。
+            if process_task is not None and not process_task.done():
+                process_task.cancel()
             # CancelledError 経路でも finally に入るため client cancel
             # 検知 (success=False) が確実に行える。
             dl = getattr(state, "debug_logger", None)

@@ -82,6 +82,42 @@ _SEARCH_HISTORY_RESULT_GUIDANCE = (
     "結果にも会話履歴にも無い数値・事実は創作しないこと。"
 )
 
+# calculate 専用のグラウンディング文言。calculate の結果は裸の数値であり、
+# 何をどの単位で計算したかの情報を持たない。汎用の「唯一の事実根拠」枠だけを
+# 付けると base が (a) 質問文の単位をそのまま数値に貼り付ける
+# (b) 式に無い係数を後付けで説明する、という 2 つの捏造を起こす
+# (実インシデント 2026-07-27: 「直径30cm・深さ25cm の鉢の土は何リットル？」に
+# 対し assist が cm 単位の式 3.14159*(30/2)**2*(25-2) を組み、結果 16257.7 cm³ が
+# 「約 16,258 リットル」と回答され、さらに「土の比重 1.3 を掛けた結果」という
+# 式に存在しない根拠が創作された)。式を併記したうえで、単位は入力に従うこと・
+# 式に無い係数を語らないことを明示する。
+_CALCULATE_RESULT_GUIDANCE = (
+    "上記の ## ツール実行結果 は、システムが calculate ツールで実際に評価した式と"
+    "その厳密な計算結果である。数値はこの結果をそのまま使うこと。"
+    "結果の単位は式に入力した数値の単位に従う"
+    "(例: cm で測った長さだけを掛けた体積は cm³ であってリットルではない)。"
+    "ユーザーが別の単位で尋ねている場合、式に換算が含まれていなければ換算は"
+    "行われていないので、必要な換算を自分で行って示すか、単位が異なる旨を明示すること。"
+    "式に現れていない係数・比重・補正 (例:「比重 1.3 を掛けた」) を"
+    "計算の根拠として述べないこと。実際に評価されたのは上記の式だけである。"
+)
+
+# 生成系ツール (draft_document / summarize / translate) 専用のグラウンディング。
+# これらの結果は外部から取得した事実データではなく LLM が書いた下書きなので、
+# 「唯一の事実根拠」枠を付けると、下書きが混入させた誤りが会話で既に確定した
+# 事実を上書きしてしまう (実インシデント 2026-07-27: 8 月 22 日を「(土)」と
+# 正しく答えた次のターンで、draft_document の下書きが「(日)」と書いたため
+# 回答も (日) に化けた)。下書きであることを明示し、会話側の事実を優先させる。
+_GENERATED_DRAFT_TOOLS = frozenset({"draft_document", "summarize", "translate"})
+_GENERATED_DRAFT_GUIDANCE = (
+    "上記の ## ツール実行結果 は、あなた自身が下書きとして生成した文章であり、"
+    "外部から取得した事実データではない。文体・構成の土台としては使ってよいが、"
+    "日付・曜日・場所・数量など会話で既に確定している事実と食い違う箇所は"
+    "会話側を正として書き直すこと。下書きに現れる事実を新たな根拠として扱わないこと。"
+    "回答本文では「ツール実行結果」「ご提示いただいた結果」等の内部的な言い回しを使わず、"
+    "自分が書いた文章として自然に提示すること。"
+)
+
 
 def _is_search_history_empty(tool_name: str, result_text: str) -> bool:
     """search_history が 1 件もヒットしなかった結果か判定する (純粋関数)。"""
@@ -235,6 +271,7 @@ class DeliberativeAgent:
         tool_name: str,
         tool_result_text: str,
         query: str | None = None,
+        tool_args: dict | None = None,
     ) -> None:
         """最後の user メッセージにツール実行結果を追記する。
 
@@ -242,6 +279,13 @@ class DeliberativeAgent:
         テンプレートで 400 エラーになるため、必ず user に統合する。
         """
         truncated = _truncate_tool_result(tool_result_text, TOOL_RESULT_MAX_CHARS)
+        expression = ""
+        if tool_name == "calculate" and isinstance(tool_args, dict):
+            expression = str(tool_args.get("expression") or "").strip()
+        if expression:
+            # 裸の数値だけでは何を計算したかが base に伝わらず、単位と根拠の
+            # 捏造を招く (_CALCULATE_RESULT_GUIDANCE 参照)。式を併記する。
+            truncated = f"{expression} = {truncated}"
         # 話題再フォーカス: 弱いモデルは前ターンの話題に引きずられ、今回の質問
         # (例: ニュース) を取り違える (実機確認: 前ターンが天気だとニュース質問に
         # 天気で誤答)。今回の質問を明示して前話題を無視させる。
@@ -261,6 +305,10 @@ class DeliberativeAgent:
             # ヒットした場合も「唯一の事実根拠」枠は付けない。過去の別セッション
             # の内容を今回の事実として断定させないため専用文言を使う。
             grounding = _SEARCH_HISTORY_RESULT_GUIDANCE
+        elif tool_name == "calculate":
+            grounding = _CALCULATE_RESULT_GUIDANCE
+        elif tool_name in _GENERATED_DRAFT_TOOLS:
+            grounding = _GENERATED_DRAFT_GUIDANCE
         else:
             # capability assertion: 弱いモデルは「自分はブラウズ/取得できない」という
             # 思い込みでツール結果を無視し拒否することがある (実機確認)。結果が
@@ -274,6 +322,12 @@ class DeliberativeAgent:
                 f"「取得できない」「データがない」と答えてよいのは、結果が空かエラーの場合のみ。"
                 f"結果に該当が無い場合のみ、システムプロンプトの参考コンテキスト (カートリッジ・記憶等) も併用してよい。"
                 f"結果に無い数値・事実は創作しないこと。"
+                # 内部足場の語彙がそのまま本文に出る (実測 2026-07-27:
+                # 「ご提示いただいたツール実行結果に基づき、作成した買い物リストは
+                # 以下の通りです。」)。ユーザーにはツール実行は見えているが、
+                # 「提示された」という受け身の言い回しは主体を取り違えさせる。
+                f"ただし回答本文では「ツール実行結果」「ご提示いただいた結果」等の内部的な言い回しを使わず、"
+                f"自分で調べて分かったこととして自然に述べること。"
             )
         tool_msg = (
             f"\n\n## ツール実行結果\n"
@@ -367,6 +421,7 @@ class DeliberativeAgent:
 
         tool_result_text = await self._execute_tool(
             judgement, state, query, llm_client, on_step, mode=mode,
+            conversation=conversation,
         )
         if tool_result_text is None:
             # 実行されたが結果 None (失敗)。command は penalize 用に返す。
@@ -397,12 +452,22 @@ class DeliberativeAgent:
             self._record_tool_call_outcome(query, judgement, True, mode=mode)
             return tool_result_text, judgement.tool_name, command, True, judgement.source
 
-        digest = await digest_tool_result(
-            self._assist_client,
-            query=query,
-            tool_name=judgement.tool_name,
-            tool_result=_truncate_tool_result(tool_result_text, TOOL_RESULT_MAX_CHARS),
-        )
+        if judgement.tool_name == "calculate":
+            # calculate の結果は裸の数値 1 個で、抽出すべき要点は存在しない。
+            # digest に通すと assist が質問文の単位を勝手に貼り付ける
+            # (実インシデント 2026-07-27: raw "16257.72825" が digest
+            # "16257.72825 リットル" になり、cm³ の値がリットルとして回答された)。
+            # 抽出の利得ゼロ・捏造リスクありなので assist 1 往復ごと省く。
+            digest = None
+        else:
+            digest = await digest_tool_result(
+                self._assist_client,
+                query=query,
+                tool_name=judgement.tool_name,
+                tool_result=_truncate_tool_result(
+                    tool_result_text, TOOL_RESULT_MAX_CHARS,
+                ),
+            )
         if digest is None:
             prompt_result_text = tool_result_text
         elif digest == "" and judgement.tool_name == "search_history":
@@ -422,6 +487,7 @@ class DeliberativeAgent:
             prompt_result_text = digest
         self._append_tool_result_to_last_user(
             messages, judgement.tool_name, prompt_result_text, query=query,
+            tool_args=judgement.tool_args,
         )
         success = not is_tool_error(tool_result_text)
         # run_command は走ったが非ゼロ終了したケース (SyntaxError 等) を
@@ -642,6 +708,7 @@ class DeliberativeAgent:
         query: str,
         llm_client,
         on_step: StepCallback,
+        conversation: list[dict] | None = None,
     ) -> None:
         """`write_file` の `content` が空なら LLM で生成して `tool_args` に注入する。
 
@@ -658,7 +725,9 @@ class DeliberativeAgent:
                 "detail": f"コンテンツ生成中 → {file_path}",
                 "status": "running",
             })
-        content = await self._generate_content(query, llm_client)
+        content = await self._generate_content(
+            query, llm_client, conversation=conversation,
+        )
         if content.startswith("(Content generation failed:"):
             logger.warning(
                 "Deliberative: content generation failed for %s; "
@@ -745,6 +814,7 @@ class DeliberativeAgent:
         llm_client,
         on_step: StepCallback = None,
         mode: str | None = None,
+        conversation: list[dict] | None = None,
     ) -> str | None:
         """ToolJudgement に基づいてツールを実行
 
@@ -789,6 +859,7 @@ class DeliberativeAgent:
 
         await self._ensure_write_file_content(
             tool_name, tool_args, query, llm_client, on_step,
+            conversation=conversation,
         )
 
         # write_file で content が依然空 → LLM 生成失敗。誤実行を防ぐため
@@ -818,16 +889,26 @@ class DeliberativeAgent:
         self,
         query: str,
         llm_client,
+        conversation: list[dict] | None = None,
     ) -> str:
-        """write_file 用のコンテンツを LLM にプレーンテキストで生成させる"""
-        messages = [
+        """write_file 用のコンテンツを LLM にプレーンテキストで生成させる
+
+        依頼が会話中の成果物を指す場合 (「この案内文を保存して」「さっきの文章を
+        ファイルに」) は、クエリ単体では何を書くべきかが決まらない。直近の会話を
+        添えないと、モデルは書くものが無いまま出力を埋めようとして無関係な
+        テキストを捏造する (実インシデント 2026-07-27: 直前に作った夏祭りの
+        案内文を保存させたら、ファイルに ``## Example 1 / User: ... /
+        Assistant: ...`` という架空の Q&A が書き込まれた)。
+        """
+        messages: list[dict] = [
             # 出力言語指示 (locale 追従) を毎回組み立てて付加する
             {
                 "role": "system",
                 "content": f"{_CONTENT_GEN_PROMPT}{content_language_directive()}",
             },
-            {"role": "user", "content": query},
         ]
+        messages.extend(_recent_context_messages(conversation))
+        messages.append({"role": "user", "content": query})
         try:
             result = await llm_client.generate(
                 messages, stream=False,
@@ -841,6 +922,29 @@ class DeliberativeAgent:
         except Exception as e:
             logger.error("Content generation failed: %s", e)
             return f"(Content generation failed: {e})"
+
+
+#: `_generate_content` に添える直近会話の上限 (メッセージ数 / 1 件あたり文字数)。
+#: 保存対象は直前に作った成果物であることが大半なので、深い履歴は要らない。
+_CONTENT_CONTEXT_MESSAGES = 4
+_CONTENT_CONTEXT_CHARS = 2000
+
+
+def _recent_context_messages(conversation: list[dict] | None) -> list[dict]:
+    """直近会話を content 生成用メッセージ列に整形する (純粋関数)。"""
+    if not conversation:
+        return []
+    recent = [
+        m for m in conversation[-_CONTENT_CONTEXT_MESSAGES:]
+        if isinstance(m, dict)
+        and m.get("role") in ("user", "assistant")
+        and isinstance(m.get("content"), str)
+        and m["content"].strip()
+    ]
+    return [
+        {"role": m["role"], "content": m["content"][:_CONTENT_CONTEXT_CHARS]}
+        for m in recent
+    ]
 
 
 def _truncate_tool_result(text: str, max_chars: int) -> str:

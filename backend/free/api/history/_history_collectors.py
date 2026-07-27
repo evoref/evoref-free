@@ -47,7 +47,7 @@ def to_session_summary(
         mode=entry.mode,
         turn_count=entry.turn_count,
         summary=entry.summary,
-        topics=entry.topics,
+        first_user_preview=entry.first_user_preview,
         matched_preview=preview,
     )
 
@@ -67,7 +67,7 @@ def to_session_summaries(
 def to_session_detail_response(session: SessionData) -> SessionDetailResponse:
     """`SessionData` を `SessionDetailResponse` に変換する純粋関数。
 
-    元 handler の field-by-field マッピングを保持する (15 フィールド)。
+    元 handler の field-by-field マッピングを保持する。
     """
     return SessionDetailResponse(
         session_id=session.session_id,
@@ -83,5 +83,4 @@ def to_session_detail_response(session: SessionData) -> SessionDetailResponse:
         context_files=session.context_files,
         cartridge_ids=session.cartridge_ids,
         summary=session.summary,
-        topics=session.topics,
     )

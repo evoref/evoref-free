@@ -20,7 +20,8 @@ class SessionSummary(BaseModel):
     mode: str
     turn_count: int
     summary: str | None = None
-    topics: list[str] = Field(default_factory=list)
+    #: 未要約セッションの見出しフォールバック (最初のユーザ発話の先頭)
+    first_user_preview: str = ""
     matched_preview: str | None = None
 
 
@@ -43,7 +44,6 @@ class SessionDetailResponse(BaseModel):
     context_files: list[str] = Field(default_factory=list)
     cartridge_ids: list[str] = Field(default_factory=list)
     summary: str | None = None
-    topics: list[str] = Field(default_factory=list)
 
 
 class SearchRequest(BaseModel):

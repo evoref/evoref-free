@@ -127,6 +127,16 @@ _WRITE_VERB_RE = re.compile(
     r"|(?<![A-Za-z])output(?![A-Za-z]))",
     re.IGNORECASE,
 )
+# 保存先を直前の文脈に委ねる参照表現。「同じファイルに保存し直して」のような
+# 追記・修正依頼はパスを本文に持たないため _LOCAL_PATH_RE に掛からず、
+# deliberative に落ちて read_file だけが走り、書込みが一度も起きないまま
+# 「保存し直した」体の回答になっていた (実測 2026-07-27)。
+_REFERENTIAL_WRITE_TARGET_RE = re.compile(
+    r"(?:同じ|その|この|先ほどの?|さっきの?)\s*(?:ファイル|ところ|場所)"
+    r"|保存し直|上書き|同じ場所に"
+    r"|\b(?:same|that)\s+file\b|\boverwrite\b",
+    re.IGNORECASE,
+)
 # 表形式データの出力先拡張子。long_form (散文ユニット分割) では表構造を
 # 生成できないため、これらへの書出し意図は long_form 判定より優先して
 # local_write_intent (write-fast 経路) に振る。
@@ -683,9 +693,13 @@ class ComplexityClassifier:
             return False
         if _HOWTO_QUERY_RE.search(query):
             return False
-        if not _LOCAL_PATH_RE.search(query):
+        if not _WRITE_VERB_RE.search(query):
             return False
-        return bool(_WRITE_VERB_RE.search(query))
+        if _LOCAL_PATH_RE.search(query):
+            return True
+        # パスは直前ターンにしか無い参照依頼 (「同じファイルに保存し直して」)。
+        # 保存先は write-fast 経路が会話から解決する。
+        return bool(_REFERENTIAL_WRITE_TARGET_RE.search(query))
 
     def _is_tabular_write_intent(self, query: str, mode: str = "chat") -> bool:
         """表形式データ (.csv/.tsv/.xlsx/.ods) のローカル書出し意図を検出する。

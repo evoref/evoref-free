@@ -31,6 +31,7 @@ from backend.free.generation.models import (
     SectionPlan,
     chars_to_tokens,
     detect_brevity_cap,
+    detect_line_limit_chars,
     extract_target_chars,
 )
 from backend.free.generation.spec_renderer import render_spec_for_prompt
@@ -233,6 +234,14 @@ def parse_plan(
     # (実測 2026-07-25: 「丁寧だが冗長にならない書き方で」→ 6 ユニット 7,192 字)。
     if user_target <= 0:
         brevity_cap = detect_brevity_cap(instruction)
+        # 「3 行で」等の行数指定は文字数換算して同じ上限機構に載せる
+        # (コードの「50 行くらい」は行数=規模の指定なので TEXT のみ)。
+        if content_type != ContentType.CODE:
+            line_cap = detect_line_limit_chars(instruction)
+            if line_cap > 0:
+                brevity_cap = (
+                    line_cap if brevity_cap <= 0 else min(brevity_cap, line_cap)
+                )
         if brevity_cap > 0 and (target_length <= 0 or target_length > brevity_cap):
             logger.info(
                 "Brevity signal detected: capping target_length %d -> %d",

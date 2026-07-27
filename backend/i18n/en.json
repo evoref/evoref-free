@@ -213,7 +213,6 @@
     "history_search_found": "Found {count} results for \"{query}\"",
     "history_not_found": "Session not found: {session_id}",
     "history_detail_duration": "Duration",
-    "history_detail_topics": "Topics",
     "history_detail_files": "Files",
     "history_detail_turns": "Turns",
     "history_detail_compressed": "compressed",

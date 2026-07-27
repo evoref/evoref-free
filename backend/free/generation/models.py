@@ -71,6 +71,71 @@ def detect_brevity_cap(instruction: str) -> int:
     return 0
 
 
+#: ユーザーが明示した「書式」の要求。plan / unit プロンプトには本文の要点しか
+#: 渡らないため、これらは従来まったく生成側へ伝わらず、散文で返っていた
+#: (実測 2026-07-27: 「議事録の形式に整えて。見出しと箇条書きで」→ 見出しも
+#:  箇条書きも無い 4 段落の散文)。
+_BULLET_FORMAT_RE = re.compile(
+    r"箇条書き|箇条書|リスト形式|リストで"
+    r"|\b(?:in\s+bullet|bullet\s*points?|as\s+a\s+list)\b",
+    re.IGNORECASE,
+)
+_TABLE_FORMAT_RE = re.compile(
+    r"表形式|表にして|テーブル形式|\b(?:as\s+a\s+table|in\s+a\s+table)\b",
+    re.IGNORECASE,
+)
+
+_BULLET_DIRECTIVE = (
+    "ユーザーは箇条書きを指定している。本文は「- 」で始まる箇条書きを主体に構成し、"
+    "説明的な段落で埋めないこと。1 項目 1 行で簡潔に書くこと。"
+)
+_TABLE_DIRECTIVE = (
+    "ユーザーは表形式を指定している。本文は Markdown のパイプ表 "
+    "(| 列 | 列 |) で構成すること。"
+)
+
+
+#: 「3 行で」「3 行以内」「in 3 lines」等の行数指定。文字数指定 (_TARGET_CHARS_RE)
+#: にも簡潔さシグナル (_BREVITY_PATTERNS) にも掛からず、そのまま長文計画へ流れて
+#: いた (実測 2026-07-27: 「案内を 3 行で書いて」→ 3 ユニットの丁寧文書)。
+_LINE_LIMIT_RE = re.compile(
+    r"(\d{1,2})\s*行(?:程度|以内|くらい|ぐらい)?(?:で|に|の)"
+    r"|\bin\s+(\d{1,2})\s+lines?\b",
+    re.IGNORECASE,
+)
+
+#: 行数指定を目標文字数へ換算する係数 (日本語 1 行 ≒ 60 字)。
+LINE_LIMIT_CHARS_PER_LINE = 60
+
+
+def detect_line_limit_chars(instruction: str) -> int:
+    """行数指定があれば目標文字数の上限へ換算して返す。無ければ ``0``。"""
+    m = _LINE_LIMIT_RE.search(instruction)
+    if not m:
+        return 0
+    raw = m.group(1) or m.group(2)
+    try:
+        lines = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    if lines <= 0:
+        return 0
+    return lines * LINE_LIMIT_CHARS_PER_LINE
+
+
+def detect_structure_directive(instruction: str) -> str:
+    """指示に明示された書式要求 (箇条書き / 表) を生成側への指示文に変換する。
+
+    要求が無ければ空文字列。表と箇条書きの両方が指定された場合は表を優先する
+    (表の方が構造が強く、箇条書きは表のセル内に収まるため)。
+    """
+    if _TABLE_FORMAT_RE.search(instruction):
+        return _TABLE_DIRECTIVE
+    if _BULLET_FORMAT_RE.search(instruction):
+        return _BULLET_DIRECTIVE
+    return ""
+
+
 def chars_to_tokens(chars: int) -> int:
     """日本語文字数からトークン数を概算する
 
