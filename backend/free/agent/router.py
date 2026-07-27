@@ -188,10 +188,19 @@ COMPLEX_KEYWORDS_EN_PATTERNS = [
 # あった (2026-07-19)。deliberative に昇格させれば build_semmem_injection 経由で
 # STM ノート (pin ブースト込み) が注入されるため、search_history ツール発火の有無に
 # 関わらず recall 精度が回復する。
+#
+# 「過去の会話」「会話履歴」等の明示的な履歴検索語も対象。これらが無いと、
+# ユーザーが明示的に検索を依頼しても知識質問プレフィルタで落ち、
+# search_history が一度も発火しないまま「確認したが見当たらない」と
+# 未確認のまま断言する (実インシデント 2026-07-27 ライブ検証:
+# 「過去の会話で、登山の話題をしたことはありますか？探してください。」が
+# tool_call_decision=no_tool / reason=no_match_in_any_layer で素通りし、
+# 実際には 1 時間前に登山の会話があったのに「見当たりません」と回答)。
 HISTORY_KEYWORDS = [
     "前に", "以前", "先週", "先月", "この間", "前回", "前の会話",
     "さっき", "昨日", "今朝", "先ほど", "最初に", "覚えて", "覚えてる",
     "覚えている",
+    "過去の会話", "過去のやり取り", "過去に話", "以前の会話", "会話履歴",
     "earlier", "previously", "last time", "yesterday", "before",
     "remember", "recall",
 ]
@@ -201,6 +210,8 @@ HISTORY_KEYWORDS_EN = [
     "earlier", "previously", "last time", "yesterday", "before",
     "remember", "recall", "this morning", "just now", "a moment ago",
     "a while back", "at first", "in the beginning",
+    "past conversation", "previous conversation", "conversation history",
+    "chat history",
 ]
 
 # Meta-Cognitive 層へのエスカレーションキーワード（同義語拡張済み）

@@ -410,7 +410,11 @@
     "interactive_command_blocked": "対話的コマンドのためバックエンド側では実行できません（TTY パススルーが必要）: {command}",
     "terminal_exec_dangerous": "危険コマンドのため terminal_exec を拒否しました: {command}",
     "terminal_exec_not_in_allowlist": "コマンドが許可リストに含まれていません: {command}",
-    "terminal_exec_empty_command": "terminal_exec: command が空です"
+    "terminal_exec_empty_command": "terminal_exec: command が空です",
+    "tasks_all_done": "{count} 件のタスクをすべて完了しました。",
+    "task_done": "タスクを完了しました。",
+    "tasks_partially_done": "{done} 件のタスクを完了し、{failed} 件が失敗しました。",
+    "tasks_all_failed": "タスクの実行に失敗しました。"
   },
   "terminal": {
     "errors": {

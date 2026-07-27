@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+from pathlib import Path
 from typing import Iterator
 
 from backend.free.constants import COMMAND_EXIT_CODE_PREFIX
@@ -85,7 +86,106 @@ def strip_markdown_wrapper(content: str) -> str:
         content = max(matches, key=len).strip()
 
     content = strip_leading_path_comment(content)
+    content = strip_leading_narration_headings(content)
     return content
+
+
+#: 「これから何を書くか」を述べているだけの見出しテキスト (成果物ではない)。
+#: 見出し全体との完全一致のみを対象にし、実文書の見出し (「# 議事録」等) を
+#: 誤って削らないようにする。
+_NARRATION_HEADING_TEXT_RE = re.compile(
+    r"^(?:writing(?:\s+to)?(?:\s+(?:the\s+)?file)?"
+    r"|write(?:\s+to)?(?:\s+(?:the\s+)?file)?"
+    r"|file(?:\s+content)?|output|generated\s+content|content"
+    r"|ファイル(?:へ)?の?書き(?:込み|出し)|書き(?:込み|出し)"
+    r"|ファイル(?:出力|内容|名)?|出力(?:内容)?|生成(?:内容|結果)?)$",
+    re.IGNORECASE,
+)
+#: 見出しがファイルパス/ファイル名そのものを繰り返しているケース
+_HEADING_PATH_RE = re.compile(
+    r"^(?:[A-Za-z]:[/\\]\S*"           # ドライブレター付きフルパス
+    r"|(?:/\S+){2,}"                    # Unix フルパス
+    r"|\S+\.[A-Za-z][A-Za-z0-9]{0,9})$" # 拡張子付きファイル名
+)
+
+
+#: 「<literal>」と保存して / 「<literal>」という内容で書き込んで の literal 部分。
+#: 閉じ括弧の直後は助詞と定型句だけを許し、書き込み動詞まで到達した場合のみ
+#: 「ユーザーが本文そのものを書いた」とみなす。
+_LITERAL_WRITE_CONTENT_RE = re.compile(
+    r"[「『]([^「」『』]{1,2000})[」』]"
+    r"\s*(?:と\s*(?:いう)?\s*(?:内容|文言|テキスト|文字列)?\s*(?:で|を)?|を)?\s*"
+    r"(?:そのまま\s*)?"
+    r"(?:保存|書き込|書き出|書いて|出力)",
+)
+#: 引用が本文ではなくタイトル/ファイル名を指しているケースの除外
+_LITERAL_WRITE_REJECT_RE = re.compile(
+    r"[」』]\s*と?\s*いう?\s*(?:タイトル|題名|件名|ファイル名|名前|名称)",
+)
+#: literal 書き込みを許可する拡張子 (リッチ文書は構造化生成が必要なので対象外)
+_LITERAL_WRITE_EXTENSIONS = frozenset({"", ".txt", ".md", ".log"})
+
+
+def extract_literal_write_content(query: str, file_path: str) -> str:
+    """ユーザーが本文そのものを引用符で指定している場合、その literal を返す。
+
+    「E:\\tmp\\memo.txt に『会議メモ: 2026年7月27日』と保存してください」のように
+    書く内容が確定しているなら、小型モデルに再生成させる理由が無い。再生成
+    させると実況やタスクの言い換えを本文として書き込む退行が起きる
+    (実インシデント 2026-07-27 ライブ検証: 見出し形式
+    「## Writing to File / ### <path>」および箇条書き形式
+    「- ファイル: <path> / - 内容: ...」が本文として書き込まれた)。
+
+    タイトル/ファイル名を指す引用 (「『山の話』というタイトルで作文を書いて」)
+    と、構造化生成が必要なリッチ文書 (xlsx/docx/pptx/csv) は対象外。
+
+    Returns:
+        literal 本文。抽出できなければ空文字列 (純粋関数)。
+    """
+    if Path(file_path).suffix.lower() not in _LITERAL_WRITE_EXTENSIONS:
+        return ""
+    if _LITERAL_WRITE_REJECT_RE.search(query):
+        return ""
+    match = _LITERAL_WRITE_CONTENT_RE.search(query)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def strip_leading_narration_headings(content: str) -> str:
+    """先頭の「何を書くか」を述べただけの見出しブロックを除去する。
+
+    meta_cognitive の生成プロンプトはタスク文とファイルパスを含むため、
+    小型モデルがエージェントの実況をそのまま成果物として出力することがある
+    (実インシデント 2026-07-27 ライブ検証: memo.txt に
+    「## Writing to File / ### E:\\tmp\\...\\memo.txt / 会議メモ: ...」が
+    書き込まれた)。既存の scaffold 検出は literal なエコー用で、見出しに
+    言い換えられた形を拾えなかった。
+
+    除去対象は「実況見出し」か「パス/ファイル名の見出し」のみ。実文書の
+    見出しを削らないよう、それ以外の見出しに当たった時点で打ち切り、
+    全部消える場合は原文を返す (純粋関数)。
+    """
+    lines = content.split("\n")
+    idx = 0
+    stripped_any = False
+    for i, line in enumerate(lines):
+        text = line.strip()
+        if not text:
+            idx = i + 1
+            continue
+        if not text.startswith("#"):
+            break
+        heading = text.lstrip("#").strip().rstrip(":：")
+        if _NARRATION_HEADING_TEXT_RE.match(heading) or _HEADING_PATH_RE.match(heading):
+            idx = i + 1
+            stripped_any = True
+            continue
+        break
+    if not stripped_any:
+        return content
+    remainder = "\n".join(lines[idx:]).strip("\n")
+    return remainder or content
 
 
 # ファイルパスコメント除去用パターン

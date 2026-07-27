@@ -52,6 +52,7 @@ from backend.free.agent.meta_cognitive_utils import (
     parse_template_tool_call,
     try_parse_tool_dict,
     call_callback,
+    extract_literal_write_content,
     fewshot_contains_task_log,
     fewshot_seems_relevant,
     fix_json_backslashes,
@@ -2066,6 +2067,20 @@ class MetaCognitiveAgent:
                 return await self._write_file(
                     file_path, fetched_table, tools_registry, on_step, prefix,
                 )
+
+        # ユーザーが本文そのものを引用符で指定しているなら再生成しない。
+        # 小型モデルはタスクの実況・言い換えを本文として書き込むことがある
+        # (実インシデント 2026-07-27 ライブ検証: 「『会議メモ: 2026年7月27日』と
+        # 保存して」に対し「- ファイル: <path> / - 内容: ...」が書き込まれた)。
+        literal = extract_literal_write_content(original_query, file_path)
+        if literal:
+            logger.info(
+                "Write fast path content from user literal (deterministic): "
+                "%d chars -> %s", len(literal), file_path,
+            )
+            return await self._write_file(
+                file_path, literal, tools_registry, on_step, prefix,
+            )
 
         if on_step:
             await call_callback(on_step, {

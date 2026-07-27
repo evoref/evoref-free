@@ -24,6 +24,47 @@ logger = get_logger("agent.tool_result_digest")
 _NO_INFO = "NO_RELEVANT_INFO"
 _DIGIT_RUN_RE = re.compile(r"\d+")
 
+# 小型 assist モデルは「関連情報なし」を _NO_INFO トークンではなく自然文
+# パラフレーズで返すことがある (実インシデント 2026-07-26: search_history が
+# 別セッション (別人物「佐藤健一」の会話) をヒットし、digest が
+# 「- 会話履歴には、佐藤健一の趣味についての情報が見つかりませんでした。」を
+# 返した。空文字列でないため呼出側の no-info 分岐に落ちず、「唯一の事実根拠」
+# 枠で base に渡り、base が現在のユーザーを佐藤健一と誤認して回答した)。
+# 「情報が無かった」ことしか述べていない digest は抽出結果ゼロと同義なので
+# _NO_INFO と同じ扱い (空文字列) に正規化する。
+_NEGATIVE_FINDING_MARKERS = (
+    "見つかりませんでした", "見つかりません", "見つからなかった", "見つからない",
+    "情報はありません", "情報がありません", "情報はない", "情報がない",
+    "記載はありません", "記載がありません", "記載されていません",
+    "記録はありません", "記録がありません", "記録されていません",
+    "言及はありません", "言及されていません", "含まれていません",
+    "該当なし", "該当する情報", "該当する記録", "該当するもの",
+    "no relevant information", "no relevant info", "not found",
+    "no information", "no results", "nothing relevant", "no matching",
+)
+_SEGMENT_SPLIT_RE = re.compile(r"[\n。]+")
+_BULLET_STRIP = " \t-*・>#0123456789.)、"
+
+
+def _is_negative_finding(digest: str) -> bool:
+    """digest が「関連情報が無かった」ことだけを述べているか判定する (純粋関数)。
+
+    箇条書き・複数文を許容するため、空でない全セグメントが不在マーカーを
+    含む場合のみ True。1 つでも実質的な抽出内容を含むセグメントがあれば
+    False (実際に見つかった情報を握り潰さないため)。
+    """
+    segments = [
+        s.strip().strip(_BULLET_STRIP)
+        for s in _SEGMENT_SPLIT_RE.split(digest)
+    ]
+    segments = [s for s in segments if s]
+    if not segments:
+        return False
+    return all(
+        any(m in s.lower() for m in _NEGATIVE_FINDING_MARKERS)
+        for s in segments
+    )
+
 _DIGEST_SYSTEM = (
     "You extract, from a tool execution result, ONLY the information needed to "
     "answer the user's question. If the result contains information relevant to "
@@ -122,6 +163,13 @@ async def digest_tool_result(
         return ""
     if not digest:
         return None
+    if _is_negative_finding(digest):
+        logger.info(
+            "tool_result_digest: digest states no relevant info in prose "
+            "(tool=%s) - normalizing to NO_RELEVANT_INFO",
+            tool_name,
+        )
+        return ""
     if not _numeric_claims_grounded(digest, tool_result):
         logger.warning(
             "tool_result_digest: digested number(s) not found in raw tool_result "

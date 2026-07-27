@@ -180,6 +180,20 @@ def _select_rag_block(
     return None, remaining, 0
 
 
+#: メモリブロックのラベル。「過去の会話の記録である」ことを明示しないと、
+#: 小型モデルが注入された note を今回の発言として復唱する (実インシデント
+#: 2026-07-27 ライブ検証: 新規セッションの 1 ターン目「明日の予定を整理して
+#: おいてください」に対し、過去セッションの note を根拠に「10 日（金）に歯科の
+#: 予約」「先ほど訂正された通り健康診断が 20 日（水）」と、この会話には存在
+#: しない予定と訂正を捏造した)。注入ブロックは全体 context に収まらないと
+#: 丸ごと破棄されるため、guidance は 1 行に収めてトークン増を最小にする。
+_SEMMEM_BLOCK_LABEL = (
+    "[関連する記憶] "
+    "(過去の会話や記録から想起したもの。今回の会話で述べられた内容ではない。"
+    "今回の質問に関係しなければ無視し、ここに無い予定・日付・数値を創作しないこと)"
+)
+
+
 def _select_semmem_block(
     semmem_block: str | None,
     remaining: int,
@@ -192,7 +206,7 @@ def _select_semmem_block(
     """
     if not semmem_block or remaining <= 0:
         return None, remaining
-    labeled = f"[関連する記憶]\n{semmem_block}"
+    labeled = f"{_SEMMEM_BLOCK_LABEL}\n{semmem_block}"
     cost = _estimate_tokens(labeled)
     if cost > remaining:
         logger.debug(

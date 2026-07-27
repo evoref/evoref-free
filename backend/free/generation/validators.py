@@ -327,3 +327,42 @@ def validate_python(assembled_code: str) -> list[ValidationError]:
     errors.extend(_check_dataclass_calls(tree))
 
     return errors
+
+
+#: 先頭段落が計画の要点をそのまま書き写しているか判定するときの一致基準。
+#: 要点が 1 つしか無い計画で誤爆しないよう、最低 2 項目の一致を要求する。
+_OUTLINE_ECHO_MIN_MATCHES = 2
+
+
+def strip_echoed_outline(text: str, key_points: list[str]) -> str:
+    """先頭段落が計画の key_points の丸写しなら取り除く (純粋関数)。
+
+    弱い base モデルは unit プロンプトの「含めるべき要点」を本文冒頭へ
+    そのまま書き写すことがある (実インシデント 2026-07-27 ライブ検証:
+    「春について 200 字で」の応答が要点の羅列で始まり、その後に本文が続いた)。
+    要点は執筆の内部計画であって成果物ではないため、後続に実本文が残る場合に
+    限って先頭段落を落とす。
+
+    誤って本文を削らないための条件:
+
+    * 先頭段落に ``_OUTLINE_ECHO_MIN_MATCHES`` 件以上の要点が部分文字列として
+      含まれる (要点が 1 件だけの計画では発火しない)
+    * 先頭段落を除いても本文が残る
+    """
+    points = [p.strip() for p in key_points if isinstance(p, str) and p.strip()]
+    if len(points) < _OUTLINE_ECHO_MIN_MATCHES or not text.strip():
+        return text
+    parts = text.split("\n\n", 1)
+    if len(parts) < 2:
+        return text
+    head, rest = parts[0], parts[1]
+    if not rest.strip():
+        return text
+    matches = sum(1 for p in points if p in head)
+    if matches < _OUTLINE_ECHO_MIN_MATCHES:
+        return text
+    logger.info(
+        "Stripped echoed outline from unit head (%d/%d key points matched, %d chars)",
+        matches, len(points), len(head),
+    )
+    return rest.lstrip("\n")

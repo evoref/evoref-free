@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -666,16 +667,64 @@ def build_chat_messages(
     return messages
 
 
+# モデル入替中 (mode 切替が llama-server を再起動する) の待機上限とポーリング間隔。
+# 9B Q4_K_M の実測ロード時間は iGPU で 5-15 秒、寒いページキャッシュだと数十秒。
+BASE_MODEL_LOADING_WAIT_SEC = 90.0
+BASE_MODEL_LOADING_POLL_SEC = 2.0
+
+
+async def _wait_base_model_loading(client: LLMClient, cfg: dict) -> bool:
+    """ベースモデルのロード完了を上限付きで待つ。
+
+    mode 切替 (chat ↔ coding) は llama-server を停止 → 再起動するため、
+    その最中に届いたチャット要求は ``/health`` 503 に当たる。従来は 1 回の
+    health_check 失敗で「LLM サーバーに接続できません。llama-server が起動
+    しているか確認してください。」を返しており、実際にはロード中なだけなのに
+    ユーザーへ誤った対処を促していた (実インシデント 2026-07-27 ライブ検証:
+    モードを coding へ切替えた直後の 1 通目が失敗)。
+
+    ポートが LISTEN されていなければ本当に起動していないので待たない
+    (llama-server 未起動という本来のケースを遅延させない)。
+    """
+    from backend.free.cli.pid_manager import find_port_occupant
+
+    port = (cfg.get("llama") or {}).get("port", 8080)
+    if await asyncio.to_thread(find_port_occupant, port) is None:
+        return False
+
+    logger.info(
+        "Base model not ready but port %d is occupied; "
+        "waiting up to %.0fs for model load to finish",
+        port, BASE_MODEL_LOADING_WAIT_SEC,
+    )
+    deadline = time.monotonic() + BASE_MODEL_LOADING_WAIT_SEC
+    while time.monotonic() < deadline:
+        await asyncio.sleep(BASE_MODEL_LOADING_POLL_SEC)
+        if await client.health_check():
+            logger.info("Base model became healthy after model load")
+            return True
+        if await asyncio.to_thread(find_port_occupant, port) is None:
+            logger.warning("llama-server disappeared while waiting for model load")
+            return False
+    logger.warning(
+        "Base model still not healthy after %.0fs wait", BASE_MODEL_LOADING_WAIT_SEC,
+    )
+    return False
+
+
 async def ensure_base_model_health(
     client: LLMClient, state: AppState, cfg: dict,
 ) -> tuple[bool, LLMClient | None]:
-    """ベースモデルの接続確認 — 未接続なら遅延接続を試行
+    """ベースモデルの接続確認 — ロード中は待機し、なお駄目なら遅延接続を試行
 
     Returns:
         (ok, client) のタプル。ok=False の場合は接続失敗。
     """
     base_ok = await client.health_check()
     if base_ok:
+        return True, client
+
+    if await _wait_base_model_loading(client, cfg):
         return True, client
 
     from backend.free.api.system.status import _try_lazy_connect

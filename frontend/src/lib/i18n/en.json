@@ -11,6 +11,7 @@
 	},
 	"chat": {
 		"input_placeholder": "Type a message...",
+		"mode_restarting": "Switching models. Please wait until it finishes...",
 		"send": "Send",
 		"message_list": "Message list",
 		"clear_history": "Clear conversation history",

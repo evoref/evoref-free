@@ -18,6 +18,7 @@
 		tokenInfo,
 		sessionId,
 		currentMode,
+		modeRestartStatus,
 		attachedFiles,
 		clearFiles
 	} from '$lib/free/stores/chat';
@@ -48,6 +49,9 @@
 	async function handleSend() {
 		const text = inputText.trim();
 		if (!text || $isStreaming) return;
+		// モード切替 (llama-server のモデル入替を伴い数十秒かかる) の最中に
+		// 送ると、切替完了時の messages 差し替えでターンごと破棄される。
+		if ($modeRestartStatus === 'restarting') return;
 
 		const files = get(attachedFiles).map((f) => f.name);
 
@@ -204,21 +208,28 @@
 		<textarea
 			bind:this={textarea}
 			bind:value={inputText}
-			placeholder={$t('chat.input_placeholder')}
+			placeholder={$modeRestartStatus === 'restarting'
+				? $t('chat.mode_restarting')
+				: $t('chat.input_placeholder')}
 			aria-label={$t('chat.input_placeholder')}
 			rows="1"
 			onkeydown={handleKeydown}
 			oninput={autoResize}
 			ondragover={handleInputDragOver}
 			ondrop={handleInputDrop}
-			disabled={$isStreaming}
+			disabled={$isStreaming || $modeRestartStatus === 'restarting'}
 		></textarea>
 		{#if $isStreaming}
 			<button class="cancel-btn" onclick={handleCancel} aria-label={$t('chat.cancel')}>
 				{$t('chat.cancel')}
 			</button>
 		{:else}
-			<button class="send-btn" onclick={handleSend} disabled={!inputText.trim()} aria-label={$t('chat.send')}>
+			<button
+				class="send-btn"
+				onclick={handleSend}
+				disabled={!inputText.trim() || $modeRestartStatus === 'restarting'}
+				aria-label={$t('chat.send')}
+			>
 				{$t('chat.send')}
 			</button>
 		{/if}

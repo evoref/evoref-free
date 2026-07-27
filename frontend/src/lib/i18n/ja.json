@@ -11,6 +11,7 @@
 	},
 	"chat": {
 		"input_placeholder": "メッセージを入力...",
+		"mode_restarting": "モデル切替中です。完了までお待ちください...",
 		"send": "送信",
 		"message_list": "メッセージ一覧",
 		"clear_history": "チャット履歴をリセット",

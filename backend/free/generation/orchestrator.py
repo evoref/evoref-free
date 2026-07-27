@@ -47,6 +47,7 @@ from backend.free.generation.token_budget import TokenBudget, truncate_tail
 from backend.free.generation.validators import (
     ValidationError,
     collapse_runaway_repetition,
+    strip_echoed_outline,
     remove_code_fences,
     validate_python,
 )
@@ -860,6 +861,11 @@ class LongFormOrchestrator:
             # 汚染を防ぐため保存前にクリーンにする。
             raw_len = len(text)
             text = collapse_runaway_repetition(text)
+            # 計画の要点をそのまま書き写した冒頭段落を落とす (2026-07-27)。
+            # ライブストリームには既に流れているが、保存・assemble・後続ユニットの
+            # コンテキストに内部計画が残るのを防ぐ (上の反復切除と同じ方針)。
+            if content_type == ContentType.TEXT:
+                text = strip_echoed_outline(text, getattr(unit, "key_points", []))
             if len(text) < raw_len and self._debug_logger:
                 self._debug_logger.log_long_form_event({
                     "phase": "repetition_collapsed",

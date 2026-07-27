@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from graphlib import TopologicalSorter
 from typing import TYPE_CHECKING
 
@@ -121,6 +122,44 @@ _CONTINUATION_SYSTEM_NOTE = (
 )
 
 
+#: 「〜を描写する」のような執筆指示形の語尾。planner プロンプトはメタ的な
+#: key_points を禁じているが (strategy_cogwriter の計画プロンプト参照)、
+#: 強制はしておらず parse は受け取った文字列をそのまま保持していた。指示形の
+#: まま unit プロンプトの「含めるべき要点」に載ると、弱い base モデルがそれを
+#: 本文冒頭にそのまま書き写す (実インシデント 2026-07-27 ライブ検証:
+#: 「春について 200 字で」の応答が「桜の花が満開になり…様子を描写する。
+#: …情景を記述する。…特徴を伝える。」という指示文の羅列で始まった)。
+#: parse 時に語尾を落として体言止めへ寄せ、写されても本文として読める形にする。
+_KEY_POINT_INSTRUCTION_TAIL_RE = re.compile(
+    r"(?:[をにへ](?:ついて|関して)?)?\s*"
+    r"(?:描写|記述|説明|紹介|言及|提示|強調|表現|詳述|概説|解説|叙述)"
+    r"(?:する|します|していく|していきます)?[。．.]?\s*$"
+    r"|(?:[をにへ](?:ついて|関して)?)?\s*"
+    r"(?:書く|書きます|述べる|述べます|伝える|伝えます"
+    r"|まとめる|まとめます|触れる|触れます)[。．.]?\s*$",
+)
+
+
+def _declarative_key_points(raw: object) -> list[str]:
+    """key_points から執筆指示の語尾を落として体言止めに揃える (純粋関数)。
+
+    文字列以外の要素・空要素は捨てる。語尾を落として空になる項目
+    (「説明する」だけ等) は情報が無いので元の文字列を残す。
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if not text:
+            continue
+        stripped = _KEY_POINT_INSTRUCTION_TAIL_RE.sub("", text).strip(" 、,。．.")
+        out.append(stripped if stripped else text)
+    return out
+
+
 def _to_int(value: object, default: int) -> int:
     """JSON 由来の数値フィールドを安全に int 化する。
 
@@ -178,7 +217,7 @@ def parse_plan(
         else:
             units.append(SectionPlan(
                 heading=u.get("heading", ""),
-                key_points=u.get("key_points", []),
+                key_points=_declarative_key_points(u.get("key_points", [])),
                 estimated_tokens=_to_estimated_tokens(u.get("estimated_tokens")),
                 file_name=u.get("file_name") or None,  # SPLIT モード時のみ非 None
             ))
