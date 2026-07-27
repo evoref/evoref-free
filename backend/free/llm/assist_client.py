@@ -69,6 +69,7 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     # executable query (環境依存事実) のコマンド合成。チャット応答パスで
     # tool_call_judge から同期発火するため realtime。
     "executable_command_synth": "realtime",
+    "calculate_expression_synth": "realtime",
     # meta-cognitive 計画は coding mode のチャット応答パスで
     # 同期発火する (タスク分解後に他のエージェントが実行される) ため
     # realtime に分類する。
@@ -209,6 +210,7 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # 投機実行 (tool_judgment との並走) で 8s では空振りしやすいため 15s に
     # 緩める。失敗時は regex フォールバックが正しさを担保。
     "executable_command_synth": 15.0,
+    "calculate_expression_synth": 15.0,
     # ツール呼出判定 ({"tool": ..., "args": {...}} の小さな JSON)。チャット
     # 応答パスで Deliberative / MetaCognitive から同期発火し、アシスト接続は
     # 常時有効。base モデルとの GPU 競合 + realtime 並列化時の assist 相互競合で
@@ -321,6 +323,7 @@ PURPOSE_REASONING_BUDGET_DEFAULTS: dict[str, int] = {
     # executable query 判定 + コマンド合成は機械的な抜き出し + 短文生成で
     # thinking 不要。response_format (ExecutableCommandSynth) で構造を固定する。
     "executable_command_synth": 0,
+    "calculate_expression_synth": 0,
     # ツール呼出判定は機械的な分類 + 引数抽出で thinking 不要。
     # response_format (ToolJudgmentResult) で構造を固定する。
     "tool_judgment": 0,

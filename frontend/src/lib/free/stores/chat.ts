@@ -232,13 +232,19 @@ export async function switchMode(newMode: string): Promise<void> {
 	if (current === newMode) return;
 	if (get(modeRestartStatus) === 'restarting') return;
 
-	// 現在のモードのメッセージを保存（API 呼び出し前にバックアップ）
-	modeMessages[current] = get(messages);
-
 	// バックエンド API 呼び出し（UI更新前）
 	modeRestartStatus.set('restarting');
 	try {
 		const result = await switchModeApi(newMode);
+
+		// 現在のモードのメッセージを保存。await の「後」に取ること。
+		// llama-server のモデル入替を伴う切替は数十秒かかり、その間に
+		// ユーザーがメッセージを送れてしまう。await 前にスナップショットを
+		// 取ると、待機中に追加されたターンが下の messages.set で消えたまま
+		// バックアップにも残らず永久に失われる
+		// (実インシデント 2026-07-27 ライブ検証: コーディングへ切替直後に
+		//  送信したメッセージが自分の吹き出しごと消え、応答も破棄された)。
+		modeMessages[current] = get(messages);
 
 		// API 成功: UI 状態を更新
 		currentMode.set(newMode);

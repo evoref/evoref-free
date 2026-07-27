@@ -31,7 +31,10 @@ from backend.free.api.chat.chat_types import ChatMessage, GenerationParams, Step
 from backend.free.api.schemas import ChatResponse, TokenInfo
 from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
-from backend.free.agent.meta_cognitive_utils import is_tool_error
+from backend.free.agent.meta_cognitive_utils import (
+    is_tool_error,
+    strip_task_log_scaffold,
+)
 from backend.free.agent.tool_call_judge import _extract_file_path
 from backend.free.agent.output_format import infer_output_extension
 from backend.free.core.sse import SSEFrameBuilder
@@ -44,6 +47,7 @@ from backend.free.llm.editor_filename import derive_editor_filename_stem
 from backend.free.generation.document_gate import is_document_format
 from backend.free.generation.orchestrator import LongFormOrchestrator
 from backend.free.generation.validators import remove_code_fences
+from backend.i18n_helper import msg
 from backend.utils import estimate_tokens as _estimate_tokens, utc_compact_stamp
 from backend.log_config import get_logger
 
@@ -675,8 +679,35 @@ async def _drain_meta_cognitive_steps(
         yield sse.step(step_data)
 
 
+def _meta_cognitive_body_text(resp) -> str:
+    """MetaCognitive 応答のうち、チャット本文として出すべきテキストを返す。
+
+    ``resp.content`` は ``_build_final_response`` が組み立てたタスク進捗ノート
+    (「- [done] ... / Written N bytes to ...」) であることが多く、これは
+    task_result step として別途送出済みなので本文には出さない。ノート行を
+    取り除いて残る実質的な本文 (チャット出力向けの生成コード等) があれば
+    それを、無ければタスクの成否をまとめた 1 文を返す。
+
+    これが無いと、ファイル書き込みのようにタスクだけで完結するターンで
+    assistant バブルが空になる (実インシデント 2026-07-27 ライブ検証:
+    「note.txt に保存してください」への応答が step 行のみで本文なし)。
+    """
+    body = strip_task_log_scaffold(resp.content or "").strip()
+    if body:
+        return body
+    done = sum(1 for t in resp.tasks if t.status == "done")
+    failed = sum(1 for t in resp.tasks if t.status == "failed")
+    if failed and not done:
+        return msg("agent.tasks_all_failed")
+    if failed:
+        return msg("agent.tasks_partially_done", done=done, failed=failed)
+    if done == 1:
+        return msg("agent.task_done")
+    return msg("agent.tasks_all_done", count=done)
+
+
 async def _emit_meta_cognitive_result_frames(resp) -> AsyncIterator[str]:
-    """MetaCognitive 応答から最終フレーム（task_result または token）を yield する。"""
+    """MetaCognitive 応答から最終フレーム（task_result と本文 token）を yield する。"""
     if resp is None:
         return
 
@@ -700,6 +731,8 @@ async def _emit_meta_cognitive_result_frames(resp) -> AsyncIterator[str]:
                 task.status, detail[:120],
             )
             yield sse.step({"type": "task_result", "detail": detail, "status": task.status})
+        # step だけでは本文が空のままになるため、本文テキストも必ず送る。
+        yield sse.token(_meta_cognitive_body_text(resp))
     else:
         logger.debug(
             "MetaCognitive final: no tasks, sending content as token (%d chars)",
@@ -2308,6 +2341,33 @@ def _translate_loop_event(
 _STAGED_PROJECT_ID = "staged"
 
 
+def _staged_output_dir(query: str) -> str:
+    """staged 成果物の書き出し先ディレクトリをユーザークエリから解決する。
+
+    従来は logical path (``stats.py`` / ``SPEC.md``) をそのまま write_file に
+    渡していたため、バックエンドの CWD (= リポジトリルート) に書き出され、
+    ユーザーが指定したディレクトリが無視されていた (実インシデント
+    2026-07-27 ライブ検証: 「E:\\tmp\\evoref_test\\stats.py を作って」に対し
+    リポジトリ直下へ stats.py / SPEC.md / flowchart.md が生成された)。
+
+    Returns:
+        解決したディレクトリ。クエリにパス指定が無ければ空文字列
+        (従来どおり logical path をそのまま使う)。純粋関数。
+    """
+    referenced = _extract_file_path(query)
+    if not referenced:
+        return ""
+    path = Path(referenced)
+    parent = path.parent if path.suffix else path
+    resolved = str(parent)
+    return "" if resolved in ("", ".") else resolved
+
+
+def _staged_deliverable_path(out_dir: str, logical_path: str) -> str:
+    """logical path を出力先ディレクトリ配下へ寄せる (純粋関数)。"""
+    return str(Path(out_dir) / logical_path) if out_dir else logical_path
+
+
 async def _staged_write_file(
     state: AppState, logical_path: str, content: str,
 ) -> str | None:
@@ -2692,6 +2752,23 @@ async def stream_staged_coding(
         ws.cleanup()
 
 
+def _staged_pytest_counts(manifest: dict) -> tuple[int, int]:
+    """staged manifest から生成ユニットテストの (合格数, 未合格数) を返す。
+
+    ``<task_id>.pytest`` エントリは ``executor._run_advisory_pytest`` が
+    永続化する。キー無しの ``<task_id>`` エントリは import スモークゲートの
+    結果であり pytest 実行ではないため数えない (両者を混ぜると、テストが
+    1 つも生成されなかったケースが「合格」に見える)。純粋関数。
+    """
+    records = [
+        rec or {}
+        for key, rec in (manifest.get("test_results") or {}).items()
+        if key.endswith(".pytest")
+    ]
+    unpassed = sum(1 for rec in records if not rec.get("passed"))
+    return len(records) - unpassed, unpassed
+
+
 async def _finalize_staged_stream(
     *,
     ws,
@@ -2736,12 +2813,7 @@ async def _finalize_staged_stream(
     manifest = ws.read_manifest() or {}
     progress = manifest.get("progress", {}) or {}
     tasks_failed = int(progress.get("tasks_failed", 0) or 0)
-    # 生成テストが決定論的に赤のまま終わったモジュール数 (警告付き配信の明示用)。
-    # `<task_id>.pytest` エントリは executor._run_advisory_pytest が永続化する。
-    pytest_unpassed = sum(
-        1 for key, rec in (manifest.get("test_results") or {}).items()
-        if key.endswith(".pytest") and not (rec or {}).get("passed")
-    )
+    pytest_passed, pytest_unpassed = _staged_pytest_counts(manifest)
     # 終端ゲート結果を long_form JSONL に記録し可測化する (develop=investigate/evolve
     # 時のみ出力)。SSE は表示専用で残らないため、配線件数/整合 issue を後から数値で追える。
     if state.debug_logger is not None:
@@ -2773,6 +2845,22 @@ async def _finalize_staged_stream(
             "detail": f"⚠ テスト未合格: {pytest_unpassed} モジュール — 生成テストが"
                       f"失敗しています (成果物は配信します)",
             "status": "failed",
+        })
+    # 合格・未実行も明示する。従来は失敗時しか出さなかったため、実際には生成
+    # テストが走って合格していても UI 上は起動可能性チェックの「未実行」表記
+    # だけが残り、テスト未実行と区別が付かなかった (実インシデント 2026-07-27
+    # ライブ検証: pytest が 8 passed で完了したのに合格表示が無かった)。
+    if pytest_passed:
+        yield sse.step({
+            "type": "task_result",
+            "detail": f"生成ユニットテスト合格: {pytest_passed} モジュール (実行済み)",
+            "status": "done",
+        })
+    elif not pytest_unpassed:
+        yield sse.step({
+            "type": "task_result",
+            "detail": "生成ユニットテストは未実行です (テスト未生成またはスキップ)",
+            "status": "done",
         })
     if runnability_issues:
         head = "; ".join(runnability_issues[:5])
@@ -2829,12 +2917,16 @@ async def _finalize_staged_stream(
             lang = _editor_language_for_extension(Path(p).suffix) or ""
             yield sse.token(f"\n\n**{p}**\n```{lang}\n{c}\n```\n")
     else:  # file
+        out_dir = _staged_output_dir(query)
         written = [
             res for p, c in code_map.items()
-            if (res := await _staged_write_file(state, p, c))
+            if (res := await _staged_write_file(
+                state, _staged_deliverable_path(out_dir, p), c,
+            ))
         ]
         detail = (
             f"{len(written)} ファイルを書き込みました"
+            + (f" ({out_dir})" if out_dir and written else "")
             if written else f"生成物は workspace にあります: {ws.root}"
         )
         yield sse.step({
@@ -2851,7 +2943,10 @@ async def _finalize_staged_stream(
         if output_target == "editor":
             yield sse.editor_code(spec_md, language="markdown", filename="SPEC.md")
         elif output_target == "file":
-            await _staged_write_file(state, "SPEC.md", spec_md)
+            await _staged_write_file(
+                state, _staged_deliverable_path(_staged_output_dir(query), "SPEC.md"),
+                spec_md,
+            )
         yield sse.step({
             "type": "task_result",
             "detail": f"設計仕様: {ws.path('spec.md')}",
@@ -2864,7 +2959,13 @@ async def _finalize_staged_stream(
             if output_target == "editor":
                 yield sse.editor_code(fc_doc, language="markdown", filename="flowchart.md")
             elif output_target == "file":
-                await _staged_write_file(state, "flowchart.md", fc_doc)
+                await _staged_write_file(
+                    state,
+                    _staged_deliverable_path(
+                        _staged_output_dir(query), "flowchart.md",
+                    ),
+                    fc_doc,
+                )
             yield sse.step({
                 "type": "task_result",
                 "detail": f"フローチャート: {ws.path('flowchart.md')}",

@@ -383,6 +383,32 @@ class ExecutableCommandSynth(_StrictModel):
     rationale: str = ""
 
 
+# ── 数値文章題の式合成 (calculate_expression_synth) ──
+
+class CalculateExpressionSynth(_StrictModel):
+    """`backend/free/agent/tool_call_judge.py` の数値文章題 → 式 合成.
+
+    「1マイルは約1.609キロメートルです。42.195キロメートルは何マイルですか？」
+    のように計算を求めているが式が書かれていないクエリから、``calculate``
+    ツールへ渡す Python 構文の算術式を合成する。式が書かれているクエリは
+    ルール層 (`_extract_arithmetic_expression`) が決定論的に処理するため、
+    ここへは到達しない。
+
+    出力フィールド:
+
+    - ``is_calculation``: クエリが数値計算の答えを求めているか。知識質問 /
+      一般会話 / 計算不要の場合は ``False``。
+    - ``expression``: ``is_calculation=True`` 時の算術式。数値リテラルと
+      ``+ - * / % ** // ( )`` のみで構成し、**クエリに現れる数値だけ**を使う
+      (関数呼び出し・変数・単位記号は不可)。``is_calculation=False`` のときは ``""``。
+    - ``rationale``: 1 行説明 (ログ用、UI 非表示)。
+    """
+
+    is_calculation: bool
+    expression: str = ""
+    rationale: str = ""
+
+
 # ── ツール呼出判定 (tool_judgment) ──
 
 class ToolJudgmentResult(_StrictModel):
@@ -466,6 +492,7 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "spec_revision_judge": SpecRevisionJudgement,
     "tool_judgment": ToolJudgmentResult,
     "executable_command_synth": ExecutableCommandSynth,
+    "calculate_expression_synth": CalculateExpressionSynth,
     "meta_cognitive_plan": MetaCognitivePlan,
     "cartridge_eval_generation": CartridgeEvalQAList,
     "url_relevance_score": UrlRelevanceJudgement,

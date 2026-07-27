@@ -276,6 +276,7 @@ class MemoryInjector:
                 query_vec, getattr(note, "embedding", None),
                 # MemoryNote 側の pin 属性は ``pin_flag`` (SemanticFact は ``pinned``)。
                 pinned=bool(getattr(note, "pin_flag", False)),
+                require_embedding=True,
             ):
                 filtered_out += 1
                 continue
@@ -343,18 +344,30 @@ class MemoryInjector:
         embedding: "np.ndarray | None",
         *,
         pinned: bool,
+        require_embedding: bool = False,
     ) -> bool:
         """関連度ゲートを通すか判定する。
 
         - ゲート無効 (``query_vec is None``) → 常に通す (従来挙動)
         - ``pinned`` → ユーザーの明示指定なので常に通す
-        - 埋め込みを持たない候補 → 判定不能なので通す (安全側)
+        - 埋め込みを持たない候補 → ``require_embedding`` なら落とす、
+          さもなくば判定不能として通す
         - それ以外 → コサイン類似度 >= ``relevance_min_score`` のみ通す
+
+        ``require_embedding`` は STM ノート用。ノートは生成時点では
+        ``embedding=None`` で、sleep-time の embed 工程を通るまで値が入らない
+        (note_builder / sleep_update 参照)。埋め込み無しを「判定不能なので通す」
+        にすると、直近の別セッションのノートが**クエリと無関係でも新しい順に
+        必ず注入される** (実インシデント 2026-07-27 ライブ検証: 新規セッション
+        1 ターン目の「明日の予定を整理しておいてください」に対し、別セッション
+        の歯科予約・会議進行の話が注入され、この会話に存在しない予定を捏造した)。
+        ノート本文は素の会話テキストで一人称・時制をそのまま含むため誤読の害が
+        大きい。関連性を確認できないノートは注入しない方が安全側になる。
         """
         if query_vec is None or pinned:
             return True
         if embedding is None:
-            return True
+            return not require_embedding
         w = np.asarray(embedding, dtype=np.float32).ravel()
         if w.shape != query_vec.shape:
             return True
@@ -494,7 +507,16 @@ class MemoryInjector:
         return f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.object}"
 
     def _render_note(self, note: MemoryNote) -> str:
-        return f"- (note) {note.content}"
+        """STM ノートを 1 行にレンダリングする。
+
+        ノート本文は過去セッションの生の会話テキストで、「先ほど〜と言いました
+        が訂正します」のような一人称・時制表現をそのまま含む。``(note)`` という
+        中立ラベルだと、ブロック先頭の注意書きから数百トークン離れた位置では
+        効かず、モデルが「先ほど話した〜」と今回の会話の発言として誤って帰属
+        する (実インシデント 2026-07-27 ライブ検証)。行ごとに過去の記録である
+        ことを示す。
+        """
+        return f"- (過去の記録) {note.content}"
 
     # ── パッキング ───────────────────────────────────────────────────
 

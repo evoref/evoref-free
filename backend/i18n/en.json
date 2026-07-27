@@ -410,7 +410,11 @@
     "interactive_command_blocked": "Cannot execute interactive command on backend (TTY passthrough required): {command}",
     "terminal_exec_dangerous": "terminal_exec rejected: dangerous command: {command}",
     "terminal_exec_not_in_allowlist": "Command is not in the allowlist: {command}",
-    "terminal_exec_empty_command": "terminal_exec: command is empty"
+    "terminal_exec_empty_command": "terminal_exec: command is empty",
+    "tasks_all_done": "Completed all {count} tasks.",
+    "task_done": "Task completed.",
+    "tasks_partially_done": "Completed {done} task(s); {failed} failed.",
+    "tasks_all_failed": "Task execution failed."
   },
   "terminal": {
     "errors": {

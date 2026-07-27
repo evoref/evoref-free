@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import re
 import time
@@ -480,6 +481,91 @@ grammar 非強制モデルでも余計な空白で token を浪費して切り�
 """
 
 
+_CALCULATE_EXPRESSION_SYNTH_SYSTEM_PROMPT = """\
+# 数値計算クエリ判定 + 式合成
+
+ユーザのクエリが「数値計算の答えを求めている」かを判定し、計算式を生成してください。
+
+## is_calculation=true の例
+- 「1マイルは約1.609キロメートルです。42.195キロメートルは何マイルですか?」
+  → expression: "42.195 / 1.609"
+- 「時速12キロで42.195キロ走ると何時間かかりますか?」 → "42.195 / 12"
+- 「1個180円のリンゴを7個買うといくら?」 → "180 * 7"
+- 「税抜2400円に10%の消費税を足すといくら?」 → "2400 * 1.1"
+
+## is_calculation=false の例
+- 「素数とは何ですか?」 (知識質問)
+- 「今日は何月何日?」 (環境依存の事実 — 計算ではない)
+- 「売上を集計して」 (データが無い / 計算対象が不明)
+- 数値が 1 つしか無く、演算の対象が定まらないもの
+
+## 式の生成ルール (is_calculation=true のとき)
+- **クエリに実際に書かれている数値だけ**を使う。知識から補った定数は使わない
+  (使うと検証で棄却される)
+- 数値リテラルと `+ - * / % ** // ( )` のみ。関数呼び出し・変数・単位記号・
+  カンマ区切りは不可 (例: `sqrt(2)` `1,000` `42.195km` はすべて不可)
+- Python 構文。冪乗は `**` (`^` は不可)
+- 答えではなく **式** を返す (計算はツールが行う)
+- is_calculation=false のとき expression は ""
+
+## rationale
+1 行で判定理由を述べる (UI 非表示、ログ用)。
+
+## 出力形式
+JSON は **1 行のコンパクト形式** (改行・余分な空白なし) で出力する。
+"""
+
+#: 数値計算クエリの事前フィルタ。式が書かれていれば層1 (_extract_arithmetic_expression)
+#: が決定論的に処理するため、ここは「数値は複数あるが式は書かれていない」ものだけを
+#: 対象にする。assist 往復 (realtime) を増やさないよう条件は厳しめにする。
+_NUMBER_LITERAL_RE = re.compile(r"\d+(?:\.\d+)?")
+_CALCULATION_CUE_RE = re.compile(
+    r"(?:いくつ|いくら|何[個円分秒時間日年枚人倍%％]|何キロ|何マイル|何時間"
+    r"|合計|総額|平均|割合|求め|計算"
+    r"|(?<![A-Za-z])how\s+(?:much|many)(?![A-Za-z])"
+    r"|(?<![A-Za-z])what\s+is(?![A-Za-z])|(?<![A-Za-z])total(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+#: 環境依存事実クエリ (層5 が扱う) を巻き込まないための除外語。
+_CALCULATION_EXCLUDE_RE = re.compile(
+    r"(?:何月|何日|何曜日|現在時刻|日付|バージョン|version"
+    r"|ディスク|メモリ|使用量|(?<![A-Za-z])CPU(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_numeric_question(query: str) -> bool:
+    """式は書かれていないが数値計算の答えを求めているクエリか (純粋関数)。
+
+    2026-07-27 ライブ検証: 「1マイルは約1.609キロメートルです。42.195キロ
+    メートルは何マイルですか？」が全層 no_tool となり、base の暗算で 26.195
+    と誤答した (正解 26.224)。同じ計算を式で書くと層1 が calculate へ流して
+    正答するため、差は「式が書かれているか」だけだった。
+
+    数値が 2 つ以上あり、値を尋ねる手掛かり語があり、環境依存事実クエリの
+    語を含まない場合のみ True。
+    """
+    if len(_NUMBER_LITERAL_RE.findall(query)) < 2:
+        return False
+    if _CALCULATION_EXCLUDE_RE.search(query):
+        return False
+    return bool(_CALCULATION_CUE_RE.search(query))
+
+
+def _synthesized_expression_grounded(expression: str, query: str) -> bool:
+    """合成式の数値がすべてクエリに現れるか (純粋関数)。
+
+    assist が知識から定数を補う (例: クエリに無い換算率を持ち出す) と、
+    ツールは「正しく計算された嘘」を返してしまう。式に現れる数値リテラルが
+    クエリ中に文字列として存在することを要求し、捏造を決定論的に弾く。
+    """
+    numbers = _NUMBER_LITERAL_RE.findall(expression)
+    if not numbers:
+        return False
+    query_numbers = set(_NUMBER_LITERAL_RE.findall(query))
+    return all(n in query_numbers for n in numbers)
+
+
 # 知識質問パターン — ツール判定をスキップすべきクエリ
 # 「簡単に説明してください」「〜の使い分けは？」は疑問形の末尾 (教えて/ですか等)
 # を伴わない体言止め・依頼形のため、上のパターンにマッチせず層4 (assist
@@ -678,6 +764,7 @@ _HISTORY_SEARCH_DEFAULT_LIMIT = 10
 _ORDER_QUERY_SCAFFOLD_RE = re.compile(
     r"今までの(?:会話|やり取り)|今日の(?:追加分の)?会話|今回の(?:追加分の)?会話"
     r"|前回の会話|この会話|このやり取り|その会話"
+    r"|過去の(?:会話|やり取り)|以前の会話|会話履歴"
     r"|一番最初|一番最後|何番目|何回目",
 )
 # 内容ラン (漢字 / カタカナ / ラテン / 数字。ひらがなの助詞・活用語尾は自然に
@@ -690,6 +777,8 @@ _ORDER_QUERY_STOPWORD_RUNS = frozenset({
     "会話", "一番", "最初", "最後", "直近", "以前", "前回", "今日", "今回", "今",
     "問題", "質問", "内容", "話題", "話", "何", "誰", "私", "貴方", "君", "僕",
     "俺", "覚", "番目", "回目", "先",
+    # 明示的な履歴検索依頼の骨組み (「過去の会話で〜を探して/調べて」)
+    "過去", "履歴", "探", "検索", "調", "教", "知",
 })
 
 # _ORDER_QUERY_SCAFFOLD_RE/_ORDER_QUERY_CONTENT_RE/_ORDER_QUERY_STOPWORD_RUNS
@@ -712,17 +801,22 @@ _ORDER_QUERY_STOPWORD_RUNS_EN = frozenset({
     "conversation", "chat", "thread", "talk", "talked", "discussed",
     "first", "last", "earliest", "latest", "very", "thing", "things",
     "time", "question", "message", "asked", "ask", "about",
+    # 明示的な履歴検索依頼の骨組み
+    "past", "previous", "history", "search", "find", "look", "tell",
+    "ever", "any", "topic", "topics",
 })
 
 
 def _reduce_ordered_history_query(query: str) -> str:
-    """順序リコール質問から search_history 用の内容キーワードを抽出する。
+    """履歴リコール質問から search_history 用の内容キーワードを抽出する。
 
-    レイヤー5.5 の強制フォールバックは search_history に生クエリ全文を渡すが、
+    レイヤー5.5 の強制フォールバックが search_history に生クエリ全文を渡すと、
     HistoryManager の字句照合は長い疑問文を短い会話ターンにマッチできない
     (2026-07-21 ライブ検証: 「この会話で一番最初に計算させた問題は何？」が
-    索引の search_text に「計算」を含むのに No results found)。self-reference /
-    順序語 / 疑問 scaffolding を除去して内容キーワード (例: 計算) を残す。
+    索引の search_text に「計算」を含むのに No results found。2026-07-27
+    ライブ検証: 「過去の会話で、登山の話題をしたことはありますか？探して
+    ください。」→「登山」)。self-reference / 順序語 / 検索依頼 /
+    疑問 scaffolding を除去して内容キーワードを残す。
     抽出できなければ生クエリを返す (悪化させない安全側)。digest には別途 raw
     query が渡るため、順序解釈 (「一番最初」) はこの縮約で失われない。
     """
@@ -789,6 +883,33 @@ _SELF_ACTION_PATTERNS_EN = [
     ),
     re.compile(r"\bi'?ll\s+.{0,25}\bmyself\b[.!]*\s*$", re.IGNORECASE),
 ]
+
+
+#: ローカルファイル/ディレクトリを対象にしていることが明確な語。パス自体は
+#: 含まれていなくてよい (「そのファイル」のような anaphoric 参照を拾うため)。
+_LOCAL_FILE_REFERENCE_RE = re.compile(
+    r"(?:ファイル|フォルダ|ディレクトリ|保存した"
+    r"|(?<![A-Za-z])file(?![A-Za-z])|(?<![A-Za-z])folder(?![A-Za-z])"
+    r"|(?<![A-Za-z])directory(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+#: web リソースを対象にしていることを示す語。1 つでもあればローカル限定と
+#: みなさない (「そのURLをファイルに保存して」等の url_write 正規フロー保護)。
+_WEB_REFERENCE_RE = re.compile(
+    r"(?:URL|https?://|ウェブ|サイト|ページ|ニュース|記事|ブログ|ドメイン|リンク"
+    r"|(?<![A-Za-z])web(?![A-Za-z])|(?<![A-Za-z])site(?![A-Za-z])"
+    r"|(?<![A-Za-z])page(?![A-Za-z])|(?<![A-Za-z])news(?![A-Za-z])"
+    r"|(?<![A-Za-z])fetch(?![A-Za-z])|(?<![A-Za-z])browse(?![A-Za-z])"
+    r"|(?<![A-Za-z])link(?![A-Za-z])|(?<![A-Za-z])domain(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+
+
+def _query_targets_local_file_only(query: str) -> bool:
+    """ローカルファイル参照が明確で、web 参照シグナルが無いか (純粋関数)。"""
+    return bool(_LOCAL_FILE_REFERENCE_RE.search(query)) and not _WEB_REFERENCE_RE.search(
+        query,
+    )
 
 
 def _query_has_tool_signal(query: str) -> bool:
@@ -1247,6 +1368,27 @@ class ToolCallJudge:
                 )
                 return fallback_result
 
+            # 5.2. 数値文章題の calculate フォールバック
+            # 式が書かれていれば層1 が決定論的に calculate へ流すが、
+            # 「1マイルは約1.609km。42.195km は何マイル?」のように式が書かれて
+            # いないと全層 no_tool になり base の暗算 (誤答) に倒れていた
+            # (2026-07-27 ライブ検証: 26.195 と回答。正解 26.224)。
+            # 事前フィルタで数値 2 つ以上 + 手掛かり語を要求するため、非数値
+            # クエリで assist 往復は増えない。合成式は AST 検証 + クエリ由来
+            # 数値チェックを通ったものだけ採用する。
+            calc_result = await self._judge_with_calculate_fallback(
+                query, tools_registry,
+            )
+            if calc_result is not None:
+                calc_result = self._validate_tool_availability(
+                    calc_result, tools_registry, mode,
+                )
+                if calc_result.tool_needed:
+                    self._log_tool_decision(
+                        calc_result, "calculate_expression_fallback",
+                    )
+                    return calc_result
+
             # 5.5. 履歴参照キーワードのフォールバック強制発火 (安全網)
             # router.HISTORY_KEYWORDS 相当の明示的な recall 語 (「覚えて」
             # 「最初に」等) を含むクエリで、層4 (assist) が no_tool と判定した
@@ -1256,17 +1398,20 @@ class ToolCallJudge:
             # 最初に私が計算させた問題は何だったか覚えてますか？」で
             # search_history 未発火 → 受動 RAG (quality=medium) のみで
             # 「そんな計算はなかった」と誤って断言)。
-            # query は原則ユーザーの生クエリをそのまま渡す (search_history の
-            # 照合は字句重なりベースのため、既に会話内で言及済みの語彙を含む
-            # 再質問では十分ヒットしうる)。ただし順序リコール質問
-            # (「一番最初に〜した〜は？」等) は生クエリ全文が長すぎて短い
-            # 会話ターンに字句マッチせず空振りする (2026-07-21 ライブ検証で
-            # 確認) ため、_reduce_ordered_history_query で内容キーワードへ
-            # 縮約する (「この会話で一番最初に計算させた問題は何？」→「計算」)。
-            # 順序解釈は digest 側が受け取る raw query が担うため縮約で失われ
-            # ない。ヒットしなくても "No results found" 経由で「見つからな
-            # かった」という正直な応答に倒れるため、無言のまま確信を持って
-            # 幻覚するより悪化はしない。
+            # search_history へ渡すクエリは常に内容キーワードへ縮約する。
+            # HistoryManager の照合は字句重なりベースで、疑問文全文は短い
+            # 会話ターンにマッチせず空振りする (2026-07-21 ライブ検証:
+            # 「この会話で一番最初に計算させた問題は何？」/ 2026-07-27 ライブ
+            # 検証:「過去の会話で、登山の話題をしたことはありますか？探して
+            # ください。」が、実際には該当する会話があるのに自分の質問文を
+            # 含む直近セッションだけを拾って「見当たりません」と誤答)。
+            # 当初は順序リコール質問のみ縮約していたが、明示的な検索依頼でも
+            # 同じ空振りが起きるため全ケースで縮約する。内容語が取れない
+            # クエリでは _reduce_ordered_history_query が生クエリを返すため
+            # 従来挙動のまま。順序解釈は digest 側が受け取る raw query が
+            # 担うため縮約で失われない。ヒットしなくても "No results found"
+            # 経由で「見つからなかった」という正直な応答に倒れるため、無言の
+            # まま確信を持って幻覚するより悪化はしない。
             # skip_judgment (雑談プレフィルタ) の判定結果に関わらず適用する:
             # 元インシデントのクエリ自体が `_SELF_ACTION_PATTERNS` の
             # 「私が」(無アンカーの部分一致) に「私が計算させた」の関係節部分で
@@ -1277,9 +1422,7 @@ class ToolCallJudge:
                 tools_registry.has("search_history")
                 and _has_history_recall_keywords(query)
             ):
-                search_query = query
-                if _ORDERED_HISTORY_QUERY_RE.search(query):
-                    search_query = _reduce_ordered_history_query(query)
+                search_query = _reduce_ordered_history_query(query)
                 forced_result = ToolJudgement(
                     tool_needed=True,
                     tool_name="search_history",
@@ -1370,6 +1513,90 @@ class ToolCallJudge:
             tool_needed=True,
             tool_name=exec_tool,
             tool_args={"command": command},
+            source="assist",
+        )
+
+    async def _synthesize_calculate_via_assist(self, query: str) -> str:
+        """数値文章題から calculate 用の算術式を assist で合成する。
+
+        Returns:
+            検証を通った式。合成不能 / 非計算クエリ / 検証失敗時は空文字列。
+        """
+        if self._assist_client is None:
+            return ""
+        try:
+            result = await self._assist_client.generate(
+                [
+                    {"role": "system",
+                     "content": _CALCULATE_EXPRESSION_SYNTH_SYSTEM_PROMPT},
+                    {"role": "user", "content": query},
+                ],
+                max_tokens=256,
+                temperature=0.1,
+                purpose="calculate_expression_synth",
+            )
+        except Exception as exc:
+            logger.warning("calculate_expression_synth failed: %r", exc)
+            return ""
+        content = (
+            result.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+        data = extract_json_object(content)
+        if not isinstance(data, dict) or not data.get("is_calculation"):
+            return ""
+        expression = str(data.get("expression") or "").strip()
+        if not expression:
+            return ""
+        # 検証は 2 段。式として安全か (ルール層と同じ述語) と、使われている
+        # 数値がクエリ由来か (assist が知識から定数を補う捏造を弾く)。
+        if not _is_numeric_expression(expression):
+            logger.info(
+                "calculate_expression_synth: rejected non-numeric expression %r",
+                expression[:80],
+            )
+            return ""
+        if not _synthesized_expression_grounded(expression, query):
+            logger.info(
+                "calculate_expression_synth: rejected ungrounded expression %r "
+                "(numbers not present in query)", expression[:80],
+            )
+            return ""
+        return expression
+
+    async def _judge_with_calculate_fallback(
+        self, query: str, tools_registry: ToolsRegistry,
+    ) -> "ToolJudgement | None":
+        """数値文章題の calculate フォールバック (5.2 層目).
+
+        式が書かれたクエリは層1 が決定論的に処理するため、ここへ来るのは
+        「計算を求めているが式が書かれていない」ものだけ。事前フィルタ
+        (``_looks_like_numeric_question``) で数値 2 つ以上 + 手掛かり語を
+        要求し、非数値クエリで assist 往復を増やさない。
+
+        Returns:
+            式合成に成功した場合 ``ToolJudgement(calculate, ...)``。
+            それ以外は ``None`` (呼出側は後続層 / no-tool として処理する)。
+        """
+        if not tools_registry.has("calculate"):
+            return None
+        if self._assist_client is None:
+            return None
+        if not _looks_like_numeric_question(query):
+            return None
+        expression = await self._synthesize_calculate_via_assist(query)
+        if not expression:
+            return None
+        logger.info(
+            "Calculate expression synthesized via 5.2 layer fallback: %r "
+            "(query=%s)", expression[:80], query[:50],
+        )
+        return ToolJudgement(
+            tool_needed=True,
+            tool_name="calculate",
+            tool_args={"expression": expression},
             source="assist",
         )
 
@@ -1576,6 +1803,18 @@ class ToolCallJudge:
                     return None
             except (OSError, ValueError):
                 pass
+        # パスを明示しないローカルファイル参照 (「そのファイルの中身を読み込んで
+        # 見せて」等) は _extract_file_path で拾えないため、上の実在チェックを
+        # すり抜けて埋め込み類似度だけで fetch_url へ短絡していた (実インシデント
+        # 2026-07-27 ライブ検証: 直前ターンで保存した note2.txt の読み出し依頼が
+        # 過去セッションの example.com への fetch_url になった)。web 参照シグナル
+        # が無いローカルファイル依頼は URL recall の対象外にする。
+        if _query_targets_local_file_only(query):
+            logger.info(
+                "URL recall: skipped (local file reference without web signal): %s",
+                query[:50],
+            )
+            return None
         recalled = await self._try_recall_url(query, mode=mode)
         if not recalled:
             return None
@@ -2315,6 +2554,20 @@ class ToolCallJudge:
         パターンマッチした場合、クエリの内容からツール名と引数を推定する。
         知識質問（RAG で処理すべき）はツール不要と判定する。
         """
+        # 明示的に書かれた算術式は calculate で決定論的に評価する。
+        # 知識質問判定より前に置く: 「1234 × 5678 はいくつですか？」は
+        # 「〜ですか」で知識質問にマッチし、ツール無しで base の暗算に落ちて
+        # 誤答するため (実インシデント 2026-07-27 ライブ検証)。
+        expression = _extract_arithmetic_expression(query)
+        if expression and tools_registry.has("calculate"):
+            logger.debug("Rule-based: arithmetic expression detected: %s", expression)
+            return ToolJudgement(
+                tool_needed=True,
+                tool_name="calculate",
+                tool_args={"expression": expression},
+                source="rule",
+            )
+
         # 知識質問はツール不要（RAG パイプラインで処理）
         # ただしツールパターン・ファイルパス・URL にもマッチするクエリは
         # ツール操作の可能性が高いため知識質問判定を適用しない
@@ -2783,6 +3036,97 @@ def _extract_file_path(query: str) -> str:
     if m:
         return m.group(1)
 
+    return ""
+
+
+# --- 算術式抽出 (calculate ツールの決定論的ルーティング) ---------------------
+# 全角の数字・演算子を ASCII へ寄せる。カタカナ長音符 (ー) や罫線 (―) は
+# 日本語語中に頻出するため意図的に含めない (マイナスへ誤変換すると
+# 「コーヒー」等が式断片に見えてしまう)。
+_ARITH_NORMALIZE = str.maketrans({
+    "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+    "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+    "＋": "+", "－": "-", "−": "-",
+    "×": "*", "✕": "*", "＊": "*",
+    "÷": "/", "／": "/", "％": "%", "＾": "^",
+    "（": "(", "）": ")", "．": ".",
+})
+# 算術式になりうる文字だけからなる連続領域
+_ARITH_RUN_RE = re.compile(r"[0-9.+\-*/%^()\s]+")
+# 日付・バージョン番号の誤検出除け (2026-07-27 は BinOp として parse できてしまう)
+_ARITH_DATE_LIKE_RE = re.compile(
+    r"^(?:\d{4}\s*-\s*\d{1,2}\s*-\s*\d{1,2}"
+    r"|\d{1,2}\s*/\s*\d{1,2}(?:\s*/\s*\d{2,4})?)$",
+)
+# 「式の値を求めている」ことの手掛かり。式だけが裸で書かれた場合は不要。
+_ARITH_REQUEST_CUE_RE = re.compile(
+    r"(?:いくつ|いくら|答え|計算|求め|何になる|=|＝"
+    r"|(?<![A-Za-z])calculate(?![A-Za-z])|(?<![A-Za-z])compute(?![A-Za-z])"
+    r"|what\s+is|how\s+much|(?<![A-Za-z])equals?(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+# 式の直後に助詞と疑問符しか残らない形 (「1+1は？」「12*34」) も計算依頼とみなす
+_ARITH_BARE_TAIL_RE = re.compile(r"^[\s　]*(?:とは|って|は|の)?[\s　]*[?？。!！]*$")
+_ARITH_SAFE_NODES = (
+    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
+    ast.USub, ast.UAdd,
+)
+
+
+def _is_numeric_expression(expression: str) -> bool:
+    """``expression`` が数値リテラルと算術演算子だけで構成されるか (純粋関数)。"""
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return False
+    has_operator = False
+    for node in ast.walk(tree):
+        if not isinstance(node, _ARITH_SAFE_NODES):
+            return False
+        if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
+            return False
+        if isinstance(node, ast.BinOp):
+            has_operator = True
+    return has_operator
+
+
+def _extract_arithmetic_expression(query: str) -> str:
+    """クエリに書かれた算術式を Python 構文へ正規化して返す (純粋関数)。
+
+    「1234 × 5678 はいくつですか？」のような明示的な計算依頼で ``calculate``
+    を決定論的に発火させるための抽出器。ルール層は従来「計算」の字句しか
+    見ておらず、式そのものを書かれるとツール無しで base の暗算に落ちて
+    誤答していた (実インシデント 2026-07-27 ライブ検証: 1234 × 5678 に
+    7060672 と回答。正解は 7006652)。
+
+    誤検出を避けるため、以下をすべて満たす場合のみ式を返す:
+
+    * 数値リテラルと算術演算子のみで構成され、二項演算を 1 つ以上含む
+    * 日付 (2026-07-27) / 日付表記 (7/27) ではない
+    * 値を尋ねる手掛かり語があるか、式の前に文が無く後ろも助詞・疑問符だけ
+      (「12*34」「1+1は？」のような裸の式)
+
+    Returns:
+        正規化済みの式。抽出できなければ空文字列。
+    """
+    normalized = query.translate(_ARITH_NORMALIZE)
+    for match in _ARITH_RUN_RE.finditer(normalized):
+        candidate = match.group(0).strip()
+        if not candidate or _ARITH_DATE_LIKE_RE.match(candidate):
+            continue
+        # ^ は Python では XOR。書かれた意図は冪乗なので ** へ寄せる。
+        candidate = candidate.replace("^", "**")
+        if not _is_numeric_expression(candidate):
+            continue
+        head = normalized[: match.start()]
+        tail = normalized[match.end():]
+        bare = (
+            not any(c.isalnum() for c in head)
+            and _ARITH_BARE_TAIL_RE.match(tail) is not None
+        )
+        if bare or _ARITH_REQUEST_CUE_RE.search(normalized):
+            return candidate
     return ""
 
 
