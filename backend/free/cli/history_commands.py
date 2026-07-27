@@ -75,7 +75,10 @@ def _history_list(
             "ID": s["session_id"][:8],
             msg("cli.history_col_date"): format_datetime(s.get("started_at", "")),
             msg("cli.history_col_turns"): str(s.get("turn_count", 0)),
-            msg("cli.history_col_summary"): _truncate(s.get("summary") or "-", 40),
+            # 要約は sleep-time でしか付かないので、未要約は最初のユーザ発話で代替
+            msg("cli.history_col_summary"): _truncate(
+                s.get("summary") or s.get("first_user_preview") or "-", 40,
+            ),
         })
 
     headers = [
@@ -180,8 +183,6 @@ def _history_show(backend_url: str, console, session_id: str) -> int:
     render_info(console, f"  {msg('cli.history_detail_duration')}: {format_duration(duration)}")
     if s.get("summary"):
         render_info(console, f"  {msg('cli.history_col_summary')}: {s['summary']}")
-    if s.get("topics"):
-        render_info(console, f"  {msg('cli.history_detail_topics')}: {', '.join(s['topics'])}")
     if s.get("context_files"):
         render_info(console, f"  {msg('cli.history_detail_files')}: {', '.join(s['context_files'])}")
 

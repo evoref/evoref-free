@@ -845,6 +845,30 @@ _PYTEST_IMPORT_RE = re.compile(
 )
 
 
+def _ensure_module_import(test_code: str, source_path: str) -> str:
+    """``<module>.<attr>`` を使うのに import 忘れの生成テストへ import を補う。
+
+    2026-07-27 live: brackets.py のテストが ``brackets.is_balanced("([)]")`` を
+    ``import brackets`` 無しで呼び、収集時の ``NameError`` で失敗した (同型の
+    失敗は wordcount.py でも記録済み)。``_ensure_pytest_import`` と同じ方針で、
+    構文的に確証できる欠落だけを機械的に補う (既に import 済みなら何もしない)。
+    """
+    stem = Path(source_path).stem
+    if not stem or not stem.isidentifier():
+        return test_code
+    if not re.search(rf"\b{re.escape(stem)}\.\w", test_code):
+        return test_code
+    already = re.search(
+        rf"^\s*(?:import\s+{re.escape(stem)}\b"
+        rf"|from\s+{re.escape(stem)}\s+import\b"
+        rf"|import\s+.*\bas\s+{re.escape(stem)}\b)",
+        test_code, re.MULTILINE,
+    )
+    if already:
+        return test_code
+    return f"import {stem}\n{test_code}"
+
+
 def _ensure_pytest_import(test_code: str) -> str:
     """``pytest.xxx`` を使うのに import 忘れの生成テストへ決定論的に import を補う。
 
@@ -2300,6 +2324,7 @@ class StagedCodingExecutor:
             violations = self._contract_violations(source_path, test_code)
 
         test_code = _ensure_pytest_import(test_code)
+        test_code = _ensure_module_import(test_code, source_path)
 
         # 構文的に無効な test (中間切断等) は書き込む前に弾く。契約チェッカは構文
         # エラーを例外握り潰しで違反ゼロ扱いにする (_contract_violations) ため、この
@@ -2730,6 +2755,7 @@ class StagedCodingExecutor:
             )
             if regen_code.strip():
                 regen_code = _ensure_pytest_import(regen_code)
+                regen_code = _ensure_module_import(regen_code, source_path)
             if regen_code.strip() and not _is_valid_python(regen_code):
                 regen_code = _salvage_python_code(regen_code) or ""
             if regen_code.strip() and _is_valid_python(regen_code):

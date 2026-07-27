@@ -879,6 +879,80 @@ except BaseException as e:
     print(json.dumps({"import_error": "%s: %s" % (type(e).__name__, e)}))
     sys.exit(0)
 
+# --- 引数付き純関数の軽量呼出し (型注釈からサンプル値を合成) ---------------
+# 引数不要のものしか呼べないと、ライブラリの中心的な関数 (例:
+# is_balanced(text: str)) が一度も実行されないまま「起動可能性チェック合格」
+# として配信される (実インシデント 2026-07-27: 閉じ括弧のたびに KeyError で
+# 落ちる is_balanced が静的検証を通過し、全ての正常入力で例外になった)。
+# 型注釈からサンプル値を作れる関数だけを、副作用が疑われる名前を除いて呼ぶ。
+_SAMPLES = {
+    str: ["", "test", "()[]{}", "a (b) [c] {d}"],
+    int: [0, 1, 2],
+    float: [0.0, 1.5],
+    bool: [True, False],
+    list: [[], ["a", "b"]],
+    dict: [{}, {"a": 1}],
+    tuple: [(), ("a",)],
+    set: [set(), {"a"}],
+}
+# 論理エラーを示す例外だけを issue にする。ValueError / OSError 等は
+# 「サンプル値がその関数の入力仕様に合わなかった」だけの可能性が高い。
+_LOGIC_ERRORS = (
+    KeyError, IndexError, TypeError, AttributeError, NameError,
+    ZeroDivisionError, UnboundLocalError, RecursionError,
+)
+_SIDE_EFFECT_NAME = (
+    "write", "save", "delete", "remove", "send", "post", "upload", "download",
+    "run", "exec", "main", "install", "drop", "clear", "reset", "update",
+    "create", "open", "connect", "commit", "push", "kill", "shutdown",
+)
+
+
+def _sample_args(sig):
+    """全必須引数に安全なサンプル値を割り当てた候補リストを返す (作れなければ None)。"""
+    required = _required(sig)
+    if not required or len(required) > 3:
+        return None
+    per_param = []
+    for p in required:
+        ann = p.annotation
+        if ann is p.empty or ann not in _SAMPLES:
+            return None
+        per_param.append(_SAMPLES[ann])
+    rounds = max(len(v) for v in per_param)
+    calls = []
+    for i in range(rounds):
+        calls.append([vals[i % len(vals)] for vals in per_param])
+    return calls
+
+
+for fname in dir(mod):
+    fn = getattr(mod, fname, None)
+    if fname.startswith("_") or not inspect.isfunction(fn):
+        continue
+    if getattr(fn, "__module__", "") != mod.__name__:
+        continue
+    if any(w in fname.lower() for w in _SIDE_EFFECT_NAME):
+        continue
+    try:
+        calls = _sample_args(inspect.signature(fn))
+    except (TypeError, ValueError):
+        continue
+    if not calls:
+        continue
+    for args in calls:
+        try:
+            fn(*args)
+        except _LOGIC_ERRORS as e:
+            issues.append(
+                "%s(%s) が %s: %s" % (
+                    fname, ", ".join(repr(a) for a in args), type(e).__name__, e,
+                )
+            )
+            break
+        except BaseException:
+            break  # 入力仕様の不一致等は判定不能として次の関数へ
+
 for cname in dir(mod):
     obj = getattr(mod, cname, None)
     if not inspect.isclass(obj) or getattr(obj, "__module__", "") != mod.__name__:

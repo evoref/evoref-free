@@ -23,6 +23,7 @@ from backend.free.generation.models import (
     LongFormMode,
     SectionPlan,
     detect_brevity_cap,
+    detect_line_limit_chars,
     extract_target_chars,
 )
 from backend.free.generation.rolling_context import RollingContext
@@ -602,6 +603,11 @@ class CogWriterStrategy:
             # 任せるため、「簡潔に」「冗長にならない」等が計画に一切反映されない。
             # parse_plan 側の上限は事後の安全網なので、計画時点でも明示する。
             brevity_cap = detect_brevity_cap(instruction)
+            line_cap = detect_line_limit_chars(instruction)
+            if line_cap > 0:
+                brevity_cap = (
+                    line_cap if brevity_cap <= 0 else min(brevity_cap, line_cap)
+                )
             if brevity_cap > 0:
                 unit_cap = max(1, brevity_cap // BREVITY_CHARS_PER_UNIT)
                 prompt += (

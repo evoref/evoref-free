@@ -7,7 +7,8 @@ export interface SessionSummary {
 	mode: string;
 	turn_count: number;
 	summary: string | null;
-	topics: string[];
+	/** 未要約セッションの見出しフォールバック（最初のユーザ発話の先頭） */
+	first_user_preview: string;
 	matched_preview: string | null;
 }
 
@@ -25,7 +26,6 @@ export interface SessionDetailData {
 	context_files: string[];
 	cartridge_ids: string[];
 	summary: string | null;
-	topics: string[];
 }
 
 export interface TurnData {

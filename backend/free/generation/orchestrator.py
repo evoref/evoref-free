@@ -37,6 +37,7 @@ from backend.free.generation.models import (
     ContentType,
     LongFormMode,
     SectionPlan,
+    detect_structure_directive,
     extract_target_chars,
 )
 from backend.free.generation.rolling_context import RollingContext
@@ -242,6 +243,17 @@ class LongFormOrchestrator:
             instruction, context, content_type, budget,
         )
 
+        # ユーザーが明示した書式 (箇条書き / 表) は plan の key_points にも
+        # unit プロンプトにも載らないため、そのままでは散文で返る。global_context
+        # は unit 生成の system に必ず入る唯一の共通スロットなのでここへ載せる。
+        if content_type == ContentType.TEXT:
+            directive = detect_structure_directive(instruction)
+            if directive and directive not in (plan.global_context or ""):
+                plan.global_context = (
+                    f"{plan.global_context}\n{directive}"
+                    if plan.global_context else directive
+                )
+
         # ローカルLLMは1回の生成で安定して出力できるトークン数に限界があるため、
         # 大きすぎるテキストユニットは分割しローリングコンテキストで繋ぐ。
         if content_type == ContentType.TEXT:
@@ -314,6 +326,14 @@ class LongFormOrchestrator:
         self._last_review_issue_count = 0
         self._last_unaddressed_issue_count = 0
         if not isinstance(self.strategy, CogWriterStrategy):
+            return
+        # チャット表示応答 (ファイル/エディタ出力でない TEXT) は、ストリームした
+        # トークンそのものがユーザーの見る本文であり履歴にも保存される。revise は
+        # 修正版を「追記」で流すため、同じ文書が 2 回並ぶ (実測 2026-07-27:
+        # 議事録が箇条書き版と【】版で二重出力され、履歴にも 615 字で残った)。
+        # 確定本文を差し替えられる出力先 (file / editor = target_format あり) に
+        # 限って改稿する。
+        if content_type == ContentType.TEXT and not self._target_format:
             return
         lf = self.config.get("long_form", {})
         review_enabled = lf.get("review_enabled", True)
@@ -874,6 +894,27 @@ class LongFormOrchestrator:
                     "chars_before": raw_len,
                     "chars_after": len(text),
                 })
+            # ユニットまるごとの重複 (前ユニットと同一本文の再生成) を検出する。
+            # collapse_runaway_repetition はユニット内の行反復しか見ないため、
+            # 「同じ段落を持つユニットが並ぶ」退化を素通ししていた (実測
+            # 2026-07-27: 「案内を 3 行で」→ 同一段落が 5 回並ぶ 3,889 字の応答)。
+            # 重複が出た時点で以降のユニットも同じ内容を繰り返すため打ち切る。
+            if content_type == ContentType.TEXT and _is_duplicate_unit(
+                text, rolling.generated_units,
+            ):
+                logger.warning(
+                    "Duplicate unit detected (idx=%d, %d chars); stopping generation",
+                    i, len(text),
+                )
+                if self._debug_logger:
+                    self._debug_logger.log_long_form_event({
+                        "phase": "duplicate_unit_stopped",
+                        "unit_name": label,
+                        "unit_idx": i,
+                        "chars": len(text),
+                    })
+                break
+
             rolling.generated_units.append(text)
             await self._update_rolling_context(rolling, text, content_type)
             unit_tokens = estimate_tokens(text)
@@ -929,17 +970,13 @@ class LongFormOrchestrator:
             ):
                 yield token
 
-            # 8.1 ドキュメント品質モード時は改稿済みユニットから確定本文を組み直す。
-            # 生ストリーム (full_response) は revise トークンを末尾に二重追記するため
-            # file/editor 出力には使えない。CODE の last_code_output と対称の TEXT 版。
-            if (
-                content_type == ContentType.TEXT
-                and self.config.get("long_form", {}).get(
-                    "document_quality_enabled", False,
-                )
-                and is_document_format(self._target_format)
-                and rolling.generated_units
-            ):
+            # 8.1 改稿済みユニットから確定本文を組み直す。生ストリーム
+            # (full_response) は revise トークンを末尾に二重追記するため
+            # file/editor 出力には使えない。CODE の last_code_output と対称の
+            # TEXT 版で、document_quality の有無に関わらず必要 (LLM レビュー由来の
+            # revise は既定 ON。ゲート限定にしていたため、既定構成のファイル出力に
+            # 二重本文が書かれていた)。
+            if content_type == ContentType.TEXT and rolling.generated_units:
                 self.last_text_output = "\n\n".join(rolling.generated_units)
 
         # 8.5 検証ゲート付きコードリペア (CODE のみ)。review 後の generated_units を
@@ -1334,6 +1371,36 @@ _MAX_SPLITS_PER_UNIT = 50
 #: 逐語再掲が起きるため、再掲禁止を明示する (2026-07-15: 7 ファイルで冒頭
 #: 段落の末尾再掲が発生)。
 _CONTINUATION_NOTE = "前の文章の続きだけを書く。既に書いた文や冒頭の宣言文を再掲しない。"
+
+
+#: 重複ユニット判定の対象にする最小文字数 (短い断片は偶然一致しうる)。
+_DUPLICATE_UNIT_MIN_CHARS = 60
+
+
+def _normalize_unit_text(text: str) -> str:
+    """ユニット本文を重複比較用に正規化する (純粋関数)。"""
+    return "".join(text.split())
+
+
+def _is_duplicate_unit(text: str, previous: list[str]) -> bool:
+    """生成済みユニットのいずれかと実質同一かを判定する (純粋関数).
+
+    完全一致に加え、片方がもう片方を丸ごと含む場合 (途中で切れた再生成) も
+    重複とみなす。
+    """
+    normalized = _normalize_unit_text(text)
+    if len(normalized) < _DUPLICATE_UNIT_MIN_CHARS:
+        return False
+    for prev in previous:
+        prev_norm = _normalize_unit_text(prev)
+        if len(prev_norm) < _DUPLICATE_UNIT_MIN_CHARS:
+            continue
+        if normalized == prev_norm:
+            return True
+        shorter, longer = sorted((normalized, prev_norm), key=len)
+        if len(shorter) >= _DUPLICATE_UNIT_MIN_CHARS and shorter in longer:
+            return True
+    return False
 
 
 def _chunk_evenly(items: list[str], n: int) -> list[list[str]]:

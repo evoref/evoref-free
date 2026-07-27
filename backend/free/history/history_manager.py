@@ -40,7 +40,7 @@ def _tokenize_cached(text: str) -> frozenset[str]:
     """``tokenize_ja`` の結果をキャッシュする (空白区切りは区間ごとにトークン化)。
 
     1 回の検索 (search_sessions/list_sessions) で同一のクエリ文字列に対して
-    最大で「対象エントリ数 × 3 (summary/topics/search_text)」回呼ばれうる
+    最大で「対象エントリ数 × 2 (summary/search_text)」回呼ばれうる
     ため、同一入力の再トークン化を避ける。
 
     ``tokenize_ja`` は空白を除去してから日本語 bi-gram を切るため、語を空白で
@@ -112,7 +112,6 @@ class SessionData:
     #: これを上回ったら sleep-time が要約を作り直す (会話途中で要約が固定され、
     #: 後半の訂正が要約に反映されないのを防ぐ)。
     summary_turn_count: int = 0
-    topics: list[str] = field(default_factory=list)
     archived_at: str = ""
     # SemMem への昇格済フラグ
     promoted_to_semmem: bool = False
@@ -139,7 +138,6 @@ class SessionData:
             summary=data.get("summary"),
             summary_embedding=data.get("summary_embedding"),
             summary_turn_count=int(data.get("summary_turn_count", 0) or 0),
-            topics=data.get("topics", []),
             archived_at=data.get("archived_at", ""),
             promoted_to_semmem=bool(data.get("promoted_to_semmem", False)),
             project_id=data.get("project_id"),
@@ -158,7 +156,9 @@ class IndexEntry:
     summary: str | None = None
     #: ``summary`` を生成した時点の ``turn_count`` (0 = 未要約)。
     summary_turn_count: int = 0
-    topics: list[str] = field(default_factory=list)
+    #: 最初のユーザ発話の先頭 (一覧表示のフォールバック見出し)。要約は
+    #: sleep-time でしか付かないため、未要約セッションの見出しをこれで賄う。
+    first_user_preview: str = ""
     size_bytes: int = 0
     search_text: str = ""
     # SemMem への昇格済フラグ
@@ -177,6 +177,7 @@ class HistoryIndex:
 
 
 _SEARCH_TEXT_MAX = 5000  # インデックスに保存する検索テキストの最大文字数
+_FIRST_USER_PREVIEW_MAX = 100  # 一覧見出しフォールバックに使う先頭文字数
 
 
 def _atomic_write_json(filepath: Path, data: dict) -> None:
@@ -188,21 +189,40 @@ def _atomic_write_json(filepath: Path, data: dict) -> None:
     atomic_write_text(filepath, json.dumps(data, ensure_ascii=False, indent=2))
 
 
+def _build_first_user_preview(
+    session: SessionData,
+    max_len: int = _FIRST_USER_PREVIEW_MAX,
+) -> str:
+    """最初のユーザ発話から一覧見出し用のプレビューを作る (決定論)。
+
+    要約 (``summary``) は sleep-time の Full サイクルでしか付かず、アイドルが
+    取れない日は 1 件も生成されない。未要約セッションの見出しが全部同じ
+    「要約なし」になるのを避けるためのフォールバック。保存のたびに作り直す
+    ので、要約器のゲート (``summary is None``) には影響しない。
+    """
+    for t in session.turns:
+        if t.get("role") != "user":
+            continue
+        content = " ".join((t.get("content") or "").split())
+        if not content:
+            continue
+        if len(content) > max_len:
+            return content[:max_len] + "…"
+        return content
+    return ""
+
+
 def _build_search_text(
     session: SessionData,
     max_len: int = _SEARCH_TEXT_MAX,
 ) -> str:
-    """summary・topics・全ターンの content を結合して検索用テキストを生成"""
+    """summary・全ターンの content を結合して検索用テキストを生成"""
     parts: list[str] = []
     total = 0
 
     if session.summary:
         parts.append(session.summary)
         total += len(session.summary)
-    if session.topics:
-        topic_str = " ".join(session.topics)
-        parts.append(topic_str)
-        total += len(topic_str)
 
     for t in session.turns:
         content = t.get("content", "")
@@ -247,8 +267,6 @@ def _score_entry(entry: IndexEntry, query_lower: str) -> float:
     score = 0.0
     if _text_matches_query(entry.summary, query_lower):
         score += 1.0
-    if any(_text_matches_query(t, query_lower) for t in entry.topics):
-        score += 0.5
     if _text_matches_query(entry.search_text, query_lower):
         score += 0.5
     return score
@@ -383,7 +401,7 @@ class HistoryManager:
             turn_count=session.turn_count,
             summary=session.summary,
             summary_turn_count=session.summary_turn_count,
-            topics=session.topics,
+            first_user_preview=_build_first_user_preview(session),
             size_bytes=size_bytes,
             search_text=_build_search_text(session),
             promoted_to_semmem=session.promoted_to_semmem,
@@ -731,7 +749,7 @@ class HistoryManager:
                 turn_count=s.get("turn_count", 0),
                 summary=s.get("summary"),
                 summary_turn_count=int(s.get("summary_turn_count", 0) or 0),
-                topics=s.get("topics", []),
+                first_user_preview=s.get("first_user_preview", ""),
                 size_bytes=s.get("size_bytes", 0),
                 search_text=s.get("search_text", ""),
                 promoted_to_semmem=bool(s.get("promoted_to_semmem", False)),
@@ -814,6 +832,39 @@ class HistoryManager:
             logger.info("Backfilled search_text for %d sessions", updated)
         return updated
 
+    def ensure_first_user_preview(self) -> int:
+        """``first_user_preview`` が未設定のエントリをセッション本体から補完
+
+        既存インデックス (フィールド追加前に書かれたもの) の見出しを一覧で
+        表示できるようにする。``ensure_search_text`` と同じく起動時に 1 回。
+
+        Returns:
+            補完したエントリ数
+        """
+        index = self._load_index()
+        updated = 0
+        for entry in index.sessions:
+            if entry.first_user_preview:
+                continue
+            filepath = self.history_dir / entry.file
+            if not filepath.exists():
+                continue
+            try:
+                with open(filepath, encoding="utf-8") as f:
+                    data = json.load(f)
+                preview = _build_first_user_preview(SessionData.from_dict(data))
+                if preview:
+                    entry.first_user_preview = preview
+                    updated += 1
+            except Exception as e:
+                logger.warning("Failed to build first_user_preview for %s: %s",
+                               entry.session_id, e)
+
+        if updated:
+            self._save_index(index)
+            logger.info("Backfilled first_user_preview for %d sessions", updated)
+        return updated
+
     def rebuild_index(self) -> HistoryIndex:
         """ファイルスキャンでインデックスを再構築"""
         index = HistoryIndex()
@@ -836,7 +887,7 @@ class HistoryManager:
                         turn_count=sd.turn_count,
                         summary=sd.summary,
                         summary_turn_count=sd.summary_turn_count,
-                        topics=sd.topics,
+                        first_user_preview=_build_first_user_preview(sd),
                         size_bytes=session_file.stat().st_size,
                         search_text=_build_search_text(sd),
                         promoted_to_semmem=sd.promoted_to_semmem,
@@ -937,6 +988,7 @@ def get_history_manager() -> HistoryManager:
     mgr = HistoryManager(history_dir, cfg)
     mgr.promote_checkpoints()
     mgr.ensure_search_text()
+    mgr.ensure_first_user_preview()
     _manager_cache = mgr
     return mgr
 

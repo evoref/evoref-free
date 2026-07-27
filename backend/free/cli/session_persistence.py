@@ -66,7 +66,6 @@ def _build_history_data(state: SessionState) -> dict:
         "ttft_history": list(state.ttft_history),
         "summary": None,
         "summary_embedding": None,
-        "topics": [],
         "archived_at": now.isoformat(),
     }
 
@@ -117,7 +116,6 @@ def auto_save_session(state: SessionState) -> bool:
             cartridge_ids=data["cartridge_ids"],
             token_info=data["token_info"],
             summary=data.get("summary"),
-            topics=data.get("topics", []),
             archived_at=data["archived_at"],
         )
         path = mgr.save_session(session)

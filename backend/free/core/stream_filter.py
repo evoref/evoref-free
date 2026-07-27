@@ -177,17 +177,36 @@ class RepetitionGuardFilter:
       区切り線、表の罫線を巻き込まない)
     - 直前に出力した行と完全一致 (間に別の行が挟まればカウントはリセット)
 
+    加えて「ブロック単位の巡回反復」も検知する。連続一致だけでは、番号や
+    見出しが挟まって完全連続にならない反復を取りこぼす (実測 2026-07-27:
+    引っ越し手続きの箇条書きで項目 5〜8 がそのまま 9〜12 として再出力された。
+    見出し行は採番だけが違い、説明行は完全一致していた)。行頭の採番・箇条書き
+    記号を正規化したうえで、既出行の再出現が ``_MAX_DUPLICATE_LINES`` 回
+    たまった時点で打ち切る。コードフェンス内は正当な重複行 (``return None``
+    等) が普通に現れるためカウントしない。
+
     StreamFilter プロトコルに準拠: process() / flush()
     """
 
     _MIN_LINE_CHARS = 12
     _MAX_CONSECUTIVE = 3
+    _MAX_DUPLICATE_LINES = 4
+    _LIST_MARKER_RE = re.compile(r"^(?:\d{1,3}[.)]|[-*+・>#]+)\s*")
 
     def __init__(self) -> None:
         self._buffer = ""
         self._last_line = ""
         self._repeat_count = 1
         self._tripped = False
+        self._seen_lines: set[str] = set()
+        self._duplicate_count = 0
+        self._in_code_fence = False
+
+    @classmethod
+    def _normalize(cls, line: str) -> str:
+        """行頭の採番・箇条書き記号と強調記号を落として比較用に正規化する。"""
+        stripped = cls._LIST_MARKER_RE.sub("", line.strip())
+        return stripped.replace("*", "").replace("　", " ").strip()
 
     @property
     def tripped(self) -> bool:
@@ -197,6 +216,9 @@ class RepetitionGuardFilter:
     def _line_is_repeat(self, line: str) -> bool:
         """行を消費し、打ち切るべきなら True を返す。"""
         stripped = line.strip()
+        if stripped.startswith("```"):
+            self._in_code_fence = not self._in_code_fence
+            return False
         if len(stripped) < self._MIN_LINE_CHARS:
             # 短い行は正当な繰り返し (箇条書き記号・空行) がありうるため
             # カウント対象にせず、連鎖も切らない
@@ -206,7 +228,25 @@ class RepetitionGuardFilter:
         else:
             self._last_line = stripped
             self._repeat_count = 1
-        return self._repeat_count >= self._MAX_CONSECUTIVE
+        if self._repeat_count >= self._MAX_CONSECUTIVE:
+            return True
+        if self._in_code_fence:
+            return False
+        normalized = self._normalize(stripped)
+        if len(normalized) < self._MIN_LINE_CHARS:
+            return False
+        if normalized in self._seen_lines:
+            self._duplicate_count += 1
+            if self._duplicate_count >= self._MAX_DUPLICATE_LINES:
+                logger.warning(
+                    "RepetitionGuardFilter: truncated output after %d duplicated "
+                    "lines (line=%.40s)",
+                    self._duplicate_count, normalized,
+                )
+                return True
+        else:
+            self._seen_lines.add(normalized)
+        return False
 
     def process(self, text: str) -> str:
         """テキストを供給し、打ち切り後は空文字列を返す。"""

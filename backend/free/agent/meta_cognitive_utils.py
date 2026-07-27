@@ -397,6 +397,23 @@ def fewshot_seems_relevant(
     return overlap >= min_overlap
 
 
+#: 本文がパスそのものかを判定するパターン。区切り文字と拡張子を含む「パスの
+#: 形」を要求する。以前は「/ か \\ を含み、最後のセグメントに . がある 1 行」
+#: という緩い条件で、日付と小数を含む正当な本文まで棄却していた
+#: (実インシデント 2026-07-27: 「チェーン注油 7/20、タイヤ空気圧 7.0気圧、
+#: ブレーキパッドは残り半分」が path_only 判定で 4 回連続棄却され、
+#: 上書き保存そのものが失敗した)。
+_PATH_ONLY_RE = re.compile(
+    r"^[\"'`]?"
+    r"(?:[A-Za-z]:[\\/]|\.{0,2}[\\/]|~[\\/])"   # ドライブ / 相対 / ホーム起点
+    r"[^\r\n\"'`]*"
+    r"\.[A-Za-z0-9]{1,10}"                       # 拡張子で終わる
+    r"[\"'`]?$",
+)
+#: パス判定から除外する文字 (日本語が含まれていれば散文と見なす)。
+_CJK_RE = re.compile(r"[぀-ヿ一-鿿]")
+
+
 def looks_like_path_not_content(content: str, file_path: str) -> bool:
     """content がファイルパスの誤出力かどうかを判定する"""
     if content == file_path:
@@ -404,14 +421,11 @@ def looks_like_path_not_content(content: str, file_path: str) -> bool:
     stripped = content.strip()
     if stripped.startswith("{") or stripped.startswith("["):
         return False
-    if (
-        len(content) < 260
-        and "\n" not in content
-        and ("/" in content or "\\" in content)
-        and "." in content.split("/")[-1].split("\\")[-1]
-    ):
-        return True
-    return False
+    if len(stripped) >= 260 or "\n" in stripped:
+        return False
+    if _CJK_RE.search(stripped):
+        return False
+    return bool(_PATH_ONLY_RE.match(stripped))
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +459,43 @@ _TASK_SCAFFOLD_LINE_RE = re.compile(
     r"^タスク\s*[:：]\s*(?:Write|Generate|Create|List|Read|Fetch|Revise|Update)\b",
     re.MULTILINE,
 )
+
+
+#: 生成プロンプト冒頭の角括弧ラベル (日付コンテキスト / 直近会話ブロック等)。
+#: 小型モデルはこれを言い換えて本文冒頭に書き写すため、リテラル一致の
+#: ``_PROMPT_SCAFFOLD_MARKERS`` では拾えない (実インシデント 2026-07-27:
+#: 「[現在日時 (UTC基準)]」が「[現在の日付 (UTC基準)]」に化けて書き込まれた)。
+_SCAFFOLD_LABEL_LINE_RE = re.compile(
+    r"^\s*[\[【](?:現在[のな]?日[時付]|直近の会話|参考資料|参考情報"
+    r"|既存ファイル|取得データ|Current\s+date|Recent\s+conversation)"
+)
+
+
+def strip_prompt_scaffold_lines(content: str) -> str:
+    """先頭に混入した生成プロンプトのラベル行 (と続く注意書き) を除去する。
+
+    角括弧ラベル行と、その直後に続く空行までを 1 ブロックとして落とす。
+    ラベル行以外に当たった時点で打ち切るので、本文中の角括弧は残る (純粋関数)。
+    """
+    lines = content.split("\n")
+    idx = 0
+    stripped_any = False
+    while idx < len(lines):
+        line = lines[idx]
+        if not line.strip():
+            idx += 1
+            continue
+        if not _SCAFFOLD_LABEL_LINE_RE.match(line):
+            break
+        # ラベル行から次の空行までを 1 ブロックとして捨てる
+        idx += 1
+        while idx < len(lines) and lines[idx].strip():
+            idx += 1
+        stripped_any = True
+    if not stripped_any:
+        return content
+    remainder = "\n".join(lines[idx:]).strip("\n")
+    return remainder or content
 
 
 def strip_task_log_scaffold(content: str) -> str:
@@ -492,11 +543,159 @@ def looks_like_task_log_echo(content: str) -> bool:
     return len(remainder.strip()) < 40
 
 
+#: 「書き込み完了の報告」を成果物として出力してしまう退化の検出用。
+#: 本文の代わりに「議事録を保存しました。**ファイル**: `path` **保存内容**: ...」
+#: が書き込まれた (実インシデント 2026-07-27)。既存の task_log_echo は
+#: ``[done]`` / ``Written N bytes`` 形式しか見ておらず、日本語の完了報告は
+#: すり抜けていた。
+_WRITE_REPORT_RE = re.compile(
+    # 「保存しました」「書き込みました」「作成いたしました」
+    r"(?:保存|書き込み|書込み|作成|出力|記録)(?:を)?(?:し|いたし)(?:ました|ます)"
+    # 「保存が完了しました」「書き込みは完了です」(助詞が挟まる形)
+    r"|(?:保存|書き込み|書込み|作成|出力|記録)(?:[がはも])?\s*完了"
+    r"(?:し(?:ました|ます)|です|しています)?"
+    r"|^\s*(?:Saved|Written|Created)\s+(?:to|the\s+file)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+#: 「保存内容:」「ファイル:」のようなメタラベル (本文ではなく報告の構造)。
+_WRITE_REPORT_LABEL_RE = re.compile(
+    r"^\s*[*_`#\s]*(?:ファイル|パス|保存先|保存内容|出力先|File|Path|Content)"
+    r"[*_`\s]*[:：]",
+    re.MULTILINE,
+)
+
+
+def looks_like_write_report(content: str, file_path: str) -> bool:
+    """content が「書き込みました」という完了報告かを判定する。
+
+    冒頭で完了を宣言し、かつ保存先パス (またはそのファイル名) を含む場合のみ
+    真とする。文書がたまたま「作成しました」を含むだけでは弾かない。
+    """
+    if not file_path:
+        return False
+    head = "\n".join(
+        [ln for ln in content.split("\n") if ln.strip()][:3],
+    )
+    if not head:
+        return False
+    if not _WRITE_REPORT_RE.search(head):
+        return False
+    basename = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+    mentions_target = (
+        file_path in content
+        or (bool(basename) and basename in content)
+    )
+    if not mentions_target:
+        return False
+    # 報告のメタラベルがあるか、全体が短い (本文が無い) 場合に限る
+    return bool(_WRITE_REPORT_LABEL_RE.search(content)) or len(content) < 400
+
+
+#: 「この案内文を保存して」のように直前の成果物を指す参照表現。
+_PREVIOUS_ANSWER_REF_RE = re.compile(
+    r"(?:この|その|上記の?|先ほどの?|さっきの?|いまの|今の)\s*"
+    r"(?:案内文?|文章|文面|本文|内容|議事録|メモ|原稿|下書き|回答|答え|結果|一覧|リスト|表)"
+)
+#: 直前の成果物に手を加える依頼 (そのまま書き写してはいけない)。
+_TRANSFORM_VERB_RE = re.compile(
+    r"翻訳|英訳|和訳|要約|短く|長く|整えて|直して|修正|変えて|変更|書き換え"
+    r"|追記|付け加え|足して|加えて|敬語|丁寧に|箇条書きに|表にして|まとめ直"
+)
+#: 保存/書き出しの依頼であることのシグナル。
+_WRITE_REQUEST_RE = re.compile(r"保存|書き出|書き込|出力|ファイルに|セーブ|save|write", re.IGNORECASE)
+
+#: そのまま書き写す対象として採用する直前応答の最小文字数。
+_PREVIOUS_ANSWER_MIN_CHARS = 40
+
+#: 応答冒頭の前置き 1 文 (「〜を作成しました。」「以下の通りです。」)。
+#: 会話では自然だがファイル本文としては不要なので、書き写す際に落とす。
+_LEAD_IN_LINE_RE = re.compile(
+    r"^.{0,60}?(?:作成しました|作りました|まとめました|用意しました"
+    r"|以下の通りです|以下のとおりです|次のとおりです)[。．.]?$",
+)
+
+
+def _strip_lead_in(text: str) -> str:
+    """先頭の前置き 1 文を落とす (残りが空なら原文を返す。純粋関数)。"""
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not _LEAD_IN_LINE_RE.match(stripped):
+            return text
+        remainder = "\n".join(lines[i + 1:]).strip("\n")
+        return remainder or text
+    return text
+
+
+def previous_answer_write_content(
+    query: str, conversation: list[dict] | None,
+) -> str:
+    """「この文章を保存して」型の依頼に対し、直前の応答本文を決定論的に返す。
+
+    書くべき本文が会話の中に既にあるのに毎回 LLM へ生成させ直すと、素材を
+    見失って完了報告や架空の例文を本文として書き出す退化が起きる
+    (実インシデント 2026-07-27: few-shot 書式の複写 / 「内容の保存が
+    完了しました。」という報告文がファイルに書かれた)。参照表現があり、
+    かつ加工指示 (翻訳・要約・修正等) が無い場合に限り、直前の assistant
+    応答をそのまま採用する。該当しなければ空文字列。
+    """
+    if not conversation:
+        return ""
+    if not _WRITE_REQUEST_RE.search(query):
+        return ""
+    if not _PREVIOUS_ANSWER_REF_RE.search(query):
+        return ""
+    if _TRANSFORM_VERB_RE.search(query):
+        return ""
+    for msg in reversed(conversation):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        text = _strip_lead_in(content.strip())
+        if len(text) >= _PREVIOUS_ANSWER_MIN_CHARS:
+            return text
+        # 直前が短い定型応答 (「タスクを完了しました。」等) ならさらに遡る
+    return ""
+
+
 def looks_like_prompt_echo(content: str) -> bool:
     """content が生成プロンプトの scaffold を含む (= プロンプトエコー) かを判定する。"""
     if any(marker in content for marker in _PROMPT_SCAFFOLD_MARKERS):
         return True
+    if looks_like_fewshot_echo(content):
+        return True
     return bool(_TASK_SCAFFOLD_LINE_RE.search(content))
+
+
+#: few-shot 例ブロック (``### Example N`` + ``User:`` / ``Assistant:``) の
+#: 書式を成果物として複写した退化の検出用。
+_FEWSHOT_EXAMPLE_HEADING_RE = re.compile(
+    r"^#{1,4}\s*Example\s+\d+\s*$", re.MULTILINE | re.IGNORECASE,
+)
+_FEWSHOT_TURN_LINE_RE = re.compile(
+    r"^(?:User|Assistant)\s*[:：]", re.MULTILINE,
+)
+
+
+def looks_like_fewshot_echo(content: str) -> bool:
+    """content が few-shot 例ブロックの複写かを判定する。
+
+    ``_generate_content`` の system には Level 1 が進化させた few-shot が
+    ``### Example N / User: ... / Assistant: ...`` の書式で入る。書くべき本文が
+    決まらないとき、小型モデルはこの書式ごと真似た架空の Q&A を「成果物」として
+    出力する (実インシデント 2026-07-27: 直前に作った夏祭りの案内文を保存させたら、
+    ファイルに ``## Example 1 / User: <保存先パス>を読んでください。 /
+    Assistant: ...`` という架空の対話 3 件が書き込まれた)。
+    見出しと発話行の両方が揃った場合のみ棄却する (Q&A 形式の正当な文書や、
+    ``Example`` の語を含むだけの文書を巻き込まないため)。
+    """
+    if not _FEWSHOT_EXAMPLE_HEADING_RE.search(content):
+        return False
+    return len(_FEWSHOT_TURN_LINE_RE.findall(content)) >= 2
 
 
 def csv_content_lacks_rows(content: str, file_path: str) -> bool:
@@ -568,6 +767,8 @@ def generated_content_rejection(
         return "path_only"
     if looks_like_task_log_echo(content):
         return "task_log_echo"
+    if looks_like_write_report(content, file_path):
+        return "write_report_echo"
     if looks_like_prompt_echo(content):
         return "prompt_echo"
     if csv_content_lacks_rows(content, file_path):

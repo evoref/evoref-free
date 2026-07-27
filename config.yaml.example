@@ -335,7 +335,7 @@ history:
   retention_compressed_days: 365  # 圧縮保持期間（日）
   max_storage_mb: 200             # 履歴全体の上限サイズ（MB）
   compress_preview_chars: 100     # 圧縮時に保持するアシスタントターンの先頭文字数
-  summary_batch_size: 5           # sleep-time での要約生成バッチサイズ
+  summary_batch_size: 20          # sleep-time での要約生成バッチサイズ (実測 2.8 秒/件)
 
 # ===== RAG 設定 =====
 rag:

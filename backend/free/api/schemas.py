@@ -580,7 +580,6 @@ class SessionData(BaseModel):
     token_info: SessionTokenInfo = Field(default_factory=SessionTokenInfo)
     summary: str | None = None
     summary_embedding: list[float] | None = None
-    topics: list[str] = Field(default_factory=list)
     archived_at: str | None = None
 
 

@@ -53,12 +53,14 @@ from backend.free.agent.meta_cognitive_utils import (
     try_parse_tool_dict,
     call_callback,
     extract_literal_write_content,
+    previous_answer_write_content,
     fewshot_contains_task_log,
     fewshot_seems_relevant,
     fix_json_backslashes,
     generated_content_rejection,
     looks_like_path_not_content,
     strip_markdown_wrapper,
+    strip_prompt_scaffold_lines,
     strip_task_log_scaffold,
     summarize_file_content,
     summarize_tool_args,
@@ -511,6 +513,10 @@ class MetaCognitiveAgent:
         # データ取得系ツール (fetch_url / read_file 等) の生結果をタスク横断で蓄積。
         # 表/ファイル生成タスクが取得済み実データを直接参照し、転記ハルシネーションを防ぐ。
         self._fetched_tool_outputs: list[str] = []
+        # 直近会話。write 全経路 (fast path / tool-loop / auto-recovery) が
+        # 合流する _generate_content から参照する。個別に引数を通すと経路ごとの
+        # 漏れが出るため、リクエストごとの状態としてここで一括保持する。
+        self._conversation: list[dict] = list(conversation or [])
 
         # MDP トレース: エピソード開始
         tracer = self._agent_tracer
@@ -1082,6 +1088,24 @@ class MetaCognitiveAgent:
 
         return steps
 
+    def _referential_write_path(self) -> str:
+        """直近会話に現れた最後のファイルパスを返す (無ければ空文字列)。"""
+        from backend.free.agent.tool_call_judge import _extract_file_path
+
+        for msg in reversed(list(getattr(self, "_conversation", None) or [])):
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str):
+                continue
+            path = _extract_file_path(content)
+            if path:
+                logger.info(
+                    "Referential write target resolved from conversation: %s", path,
+                )
+                return path
+        return ""
+
     @staticmethod
     def _enrich_context_for_retry(
         task: TaskItem, context_parts: list[str],
@@ -1161,6 +1185,11 @@ class MetaCognitiveAgent:
             and tools_registry.has("write_file")
         ):
             file_path = judgement.tool_args.get("file_path", "")
+            if not file_path:
+                # 「同じファイルに保存し直して」型はプランにもパスが載らない。
+                # 直近会話に出た保存先を引く (実測 2026-07-27: パス不明のまま
+                # 生成だけ走り、ファイルは旧内容のままだった)。
+                file_path = self._referential_write_path()
             if file_path:
                 return await self._execute_write_fast(
                     task, original_query, file_path,
@@ -2082,6 +2111,21 @@ class MetaCognitiveAgent:
                 file_path, literal, tools_registry, on_step, prefix,
             )
 
+        # 「この案内文を保存して」型: 書くべき本文は直前の応答そのもの。
+        # 生成し直させると素材を見失って完了報告や架空の例文が書き込まれる
+        # (実インシデント 2026-07-27)。加工指示が無い参照依頼に限り直接採用する。
+        previous = previous_answer_write_content(
+            original_query, getattr(self, "_conversation", None),
+        )
+        if previous:
+            logger.info(
+                "Write fast path content from previous answer (deterministic): "
+                "%d chars -> %s", len(previous), file_path,
+            )
+            return await self._write_file(
+                file_path, previous, tools_registry, on_step, prefix,
+            )
+
         if on_step:
             await call_callback(on_step, {
                 "type": "tool_call",
@@ -2151,6 +2195,13 @@ class MetaCognitiveAgent:
         """
         if content.startswith("(Content generation failed:"):
             return content, "generation_failed"
+        descaffolded = strip_prompt_scaffold_lines(content)
+        if descaffolded != content:
+            logger.info(
+                "Write: stripped prompt scaffold labels from generated content "
+                "(%d -> %d chars)", len(content), len(descaffolded),
+            )
+            content = descaffolded
         stripped = strip_task_log_scaffold(content)
         if stripped and stripped != content:
             logger.info(
@@ -2347,6 +2398,18 @@ class MetaCognitiveAgent:
 
         existing_content = self._read_existing_file(file_path)
         user_prompt = f"{original_query}\n\nタスク: {task_description}"
+        # 「この案内文を保存して」のように直前の成果物を指す依頼は、クエリと
+        # タスク文だけでは書くべき本文が決まらない。素材が無いままだと小型
+        # モデルは system の few-shot 書式を真似た架空の Q&A を本文として
+        # 書き出す (実インシデント 2026-07-27 → looks_like_fewshot_echo)。
+        # ただし既存ファイルがある場合は _inject_existing_content が同じ役割の
+        # 素材を渡すので重ねない。ラベル付きブロックを増やすほど小型モデルは
+        # ラベルごと本文へ書き写す (実測 2026-07-27: 上書き依頼で
+        # 「[現在の日付 (UTC基準)] …」「[直近の会話] …」がファイルに出た)。
+        if not existing_content:
+            user_prompt = self._inject_recent_conversation(
+                user_prompt, getattr(self, "_conversation", None),
+            )
         # 「今月」「今日」等の相対表現を取り違えないよう現在日付を前置する
         # (カレンダー/予定表など日付依存の成果物で年月・曜日がズレるのを防ぐ)。
         user_prompt = self._inject_current_date(user_prompt)
@@ -2399,6 +2462,40 @@ class MetaCognitiveAgent:
 
         return await self._stream_and_clean(
             llm_client, messages, gen_max_tokens,
+        )
+
+    #: 生成プロンプトに添える直近会話 (メッセージ数 / 1 件あたり文字数)。
+    #: 保存対象は直前に作った成果物であることが大半なので深い履歴は不要。
+    _CONTENT_CONTEXT_MESSAGES = 4
+    _CONTENT_CONTEXT_CHARS = 1500
+
+    @classmethod
+    def _inject_recent_conversation(
+        cls, user_prompt: str, conversation: list[dict] | None,
+    ) -> str:
+        """直近会話を「素材」として user_prompt に前置する (純粋関数)。"""
+        if not conversation:
+            return user_prompt
+        lines: list[str] = []
+        for msg in conversation[-cls._CONTENT_CONTEXT_MESSAGES:]:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            content = msg.get("content")
+            if role not in ("user", "assistant") or not isinstance(content, str):
+                continue
+            text = content.strip()
+            if not text:
+                continue
+            speaker = "ユーザー" if role == "user" else "あなた"
+            lines.append(f"{speaker}: {text[:cls._CONTENT_CONTEXT_CHARS]}")
+        if not lines:
+            return user_prompt
+        block = "\n".join(lines)
+        return (
+            "[直近の会話] 依頼が「この文章」「さっきの案」等を指す場合、"
+            "書くべき本文はこの会話の中にある。会話に無い内容を新たに創作しないこと。\n"
+            f"{block}\n\n{user_prompt}"
         )
 
     @staticmethod

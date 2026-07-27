@@ -167,7 +167,9 @@ class HistoryConfig(BaseModel):
     retention_compressed_days: int = Field(default=365, ge=1)
     max_storage_mb: float = Field(default=200, ge=1)
     compress_preview_chars: int = Field(default=100, ge=1)
-    summary_batch_size: int = Field(default=5, ge=1)
+    #: 1 Full サイクルで要約するセッション数。実測 2.8 秒/件 (アシスト要約 +
+    #: 埋め込み) で、5 件では日次の会話流入に追いつかず未要約が積み上がる。
+    summary_batch_size: int = Field(default=20, ge=1)
 
 
 class StreamingConfig(BaseModel):
