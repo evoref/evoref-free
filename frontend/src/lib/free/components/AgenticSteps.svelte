@@ -34,6 +34,18 @@
 	);
 	let qualityIssueOnly = $derived(hasFailedResult && unitsAllCompleted);
 
+	/**
+	 * この長文メッセージ自身がまだ生成中か。
+	 *
+	 * `isStreaming` はチャット全体で共有される store なので、これだけで出し分けると
+	 * 別ターンの生成が始まった瞬間に、完了済みの過去メッセージまで「生成中 3/3」
+	 * 表示へ巻き戻る (実測 2026-07-27: 完了済みの 2 メッセージが後続ターンの生成中
+	 * だけ ⚙ 表示に戻り、完了後に ✓ へ戻った)。`progress.done` はメッセージ単位の
+	 * フラグなので、こちらを主判定にして store は「今まさに流れているか」の補助に
+	 * とどめる。
+	 */
+	let lfInProgress = $derived(progress != null && !progress.done && $isStreaming);
+
 	function formatElapsed(ms?: number): string {
 		if (ms == null) return '';
 		return (ms / 1000).toFixed(1);
@@ -64,13 +76,13 @@
 		{#if progress}
 			<div
 				class="lf-progress"
-				class:done={progress.done && !$isStreaming && !hasFailedResult}
-				class:failed={!$isStreaming && hasFailedResult}
+				class:done={progress.done && !lfInProgress && !hasFailedResult}
+				class:failed={!lfInProgress && hasFailedResult}
 			>
 				<span class="lf-icon">
-					{#if $isStreaming}⚙{:else if hasFailedResult}⚠{:else}✓{/if}
+					{#if lfInProgress}⚙{:else if hasFailedResult}⚠{:else}✓{/if}
 				</span>
-				{#if $isStreaming}
+				{#if lfInProgress}
 					{$t('chat.long_form_progress', { current: progress.current, total: progress.total, label: progress.label })}
 				{:else if qualityIssueOnly}
 					{$t('chat.long_form_quality_issue', { total: progress.total })}

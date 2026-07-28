@@ -24,6 +24,22 @@ logger = get_logger("agent.tool_result_digest")
 _NO_INFO = "NO_RELEVANT_INFO"
 _DIGIT_RUN_RE = re.compile(r"\d+")
 
+#: これ以下の長さのツール結果は digest に通さず raw のまま base へ渡す。
+#: digest の目的は「長く雑多な結果から弱い base が答えを拾えない」問題の緩和
+#: なので、短い結果では抽出の利得が無く、assist 1 往復ぶんのレイテンシと
+#: 取り違えリスクだけが残る。
+#:
+#: 実インシデント (2026-07-27 ライブ監査): read_file が 55 文字のファイル内容を
+#: 正しく返したのに、「中身をそのまま見せて」という依頼に対し digest が 40 文字へ
+#: 要約し、base がファイル内容ではなく要約を「中身」として回答した。
+#:
+#: 閾値根拠 (同日 backend.log の digest 22 件の入力長):
+#:   calculate 4-13 / read_file 6-95 / run_command_readonly 28-131 /
+#:   summarize 90 / draft_document 106-537 (median 214)
+#:   → 22 件中 18 件が 200 文字以下。200 で切ると、本来 digest が効く長文
+#:     (draft_document の長い側) だけを残して無駄な往復を落とせる。
+_DIGEST_MIN_RESULT_CHARS = 200
+
 # 小型 assist モデルは「関連情報なし」を _NO_INFO トークンではなく自然文
 # パラフレーズで返すことがある (実インシデント 2026-07-26: search_history が
 # 別セッション (別人物「佐藤健一」の会話) をヒットし、digest が
@@ -122,6 +138,13 @@ async def digest_tool_result(
     if assist_client is None:
         return None
     if not tool_result or is_tool_error(tool_result):
+        return None
+    if len(tool_result) <= _DIGEST_MIN_RESULT_CHARS:
+        logger.debug(
+            "tool_result_digest: skipped (tool=%s, %d chars <= %d) - "
+            "using raw result",
+            tool_name, len(tool_result), _DIGEST_MIN_RESULT_CHARS,
+        )
         return None
     try:
         messages = [

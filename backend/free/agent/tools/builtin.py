@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 from backend.free.api.chat.chat_constants import LLM_TOOL_EXECUTION_TIMEOUT_SEC
 from backend.free.llm.utils import extract_content
+from backend.i18n_helper import prose_language_name
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -1076,7 +1077,10 @@ def _make_summarize(client: LocalClient):
     async def summarize(text: str) -> str:
         """テキストを要約する"""
         messages = [
-            {"role": "system", "content": "You are a summarization assistant. Summarize the given text concisely."},
+            {"role": "system", "content": (
+                "You are a summarization assistant. Summarize the given text "
+                f"concisely. Write the summary in {prose_language_name(english=True)}."
+            )},
             {"role": "user", "content": f"Summarize the following text:\n\n{text}"},
         ]
         try:
@@ -1118,9 +1122,20 @@ def _make_draft_document(client: LocalClient):
     """draft_document ツールハンドラを生成（LocalClient をクロージャでバインド）"""
 
     async def draft_document(instruction: str, format: str = "markdown") -> str:
-        """指示に基づいてドキュメントを生成する"""
+        """指示に基づいてドキュメントを生成する
+
+        本文の言語は生成時点の locale に従う。指示文はツール判定層の assist が
+        書くため常に英語で届き (実測)、言語指示が無いと日本語ユーザーに英語の
+        成果物が返る (2026-07-28 ライブ検証:「ここまでの数値を表にまとめて
+        ください。」→ ``| Speed (km/h) | Time |`` の英語表を生成)。
+        """
         messages = [
-            {"role": "system", "content": f"You are a document drafting assistant. Generate documents in {format} format."},
+            {"role": "system", "content": (
+                "You are a document drafting assistant. Generate documents in "
+                f"{format} format. Write the document in "
+                f"{prose_language_name(english=True)} unless the instruction "
+                "explicitly asks for a different language."
+            )},
             {"role": "user", "content": instruction},
         ]
         try:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterator
 
@@ -87,7 +88,42 @@ def strip_markdown_wrapper(content: str) -> str:
 
     content = strip_leading_path_comment(content)
     content = strip_leading_narration_headings(content)
+    content = strip_answer_framing(content)
     return content
+
+
+#: 「<成果物> の内容は「<本文>」です。」型のチャット回答枠。前置きの末尾が
+#: 成果物を指す語 + 助詞で終わるものだけを対象にし、実文書に現れる普通の
+#: 引用文 (「〜」です。) を誤って剥がさないようにする。
+_ANSWER_FRAMING_LEAD_RE = re.compile(
+    r"(?:内容|中身|リスト|一覧|結果|ファイル)\s*(?:は|:|：)\s*$",
+)
+_ANSWER_FRAMING_RE = re.compile(
+    r"\A(?P<lead>[^\n]{1,120}?)[「『]\s*(?P<body>.+?)\s*[」』]"
+    r"(?:です|でした|になります|となります)?[。．.]?\s*\Z",
+    re.DOTALL,
+)
+
+
+def strip_answer_framing(content: str) -> str:
+    """チャット回答の言い回しごと成果物にした出力から本文だけを取り出す。
+
+    生成プロンプトは「本文だけを出せ」と指示しているが、小型モデルは会話の
+    癖でファイル本文を回答文に包む (実インシデント 2026-07-28 ライブ検証:
+    「E:\\tmp\\audit_round6.txt に登山の持ち物リストを5項目、箇条書きで書いて
+    ください。」に対し、ファイルへ ``E:\\tmp\\audit_round6.txt の内容は「登山の
+    持ち物リスト：\\n- 登山靴\\n…」です。`` が書き込まれた)。
+
+    前置きが成果物を指す語 (内容 / 中身 / リスト …) + 助詞で終わり、全体が
+    鉤括弧 1 組で閉じている場合だけ剥がす (純粋関数)。
+    """
+    m = _ANSWER_FRAMING_RE.match(content.strip())
+    if m is None:
+        return content
+    if not _ANSWER_FRAMING_LEAD_RE.search(m.group("lead")):
+        return content
+    body = m.group("body").strip()
+    return body or content
 
 
 #: 「これから何を書くか」を述べているだけの見出しテキスト (成果物ではない)。
@@ -754,14 +790,53 @@ def looks_like_refusal_or_missing_info(content: str) -> bool:
     return any(marker in lowered for marker in _REFUSAL_MARKERS)
 
 
+def looks_like_instruction_echo(content: str, instruction: str) -> bool:
+    """content がユーザーの依頼文そのものの複写かを判定する。
+
+    ``looks_like_prompt_echo`` は生成プロンプトの scaffold 語 (「タスク:」等) を
+    見るため、依頼文を**そのまま**返した場合は素通りしていた
+    (実インシデント 2026-07-27: 「E:\\tmp\\audit_r3.md というファイルを作って、
+    中身は「監査テスト 1行目」だけにしてください。」→ 1 回目の生成は
+    prompt_echo で棄却されたが、再生成が依頼文の逐語コピーを返し、それが
+    そのままファイルに書き込まれた)。
+
+    誤検出を避けるため判定は「ほぼ同一」に限る。依頼文に含まれる文言を
+    書くよう頼まれる場面 (「『こんにちは』と書いて」→ 本文「こんにちは」) は
+    長さが大きく異なるため、長さ比のガードで確実に除外される。
+    """
+    if not instruction:
+        return False
+    c = " ".join(content.split())
+    q = " ".join(instruction.split())
+    if len(c) < _INSTRUCTION_ECHO_MIN_CHARS or not q:
+        return False
+    ratio = len(c) / len(q)
+    if not (_INSTRUCTION_ECHO_MIN_LEN_RATIO <= ratio <= _INSTRUCTION_ECHO_MAX_LEN_RATIO):
+        return False
+    return SequenceMatcher(None, c, q).ratio() >= _INSTRUCTION_ECHO_MIN_SIMILARITY
+
+
+#: 依頼文エコー判定のガード。短文・長さ乖離・低類似は判定対象外にして
+#: 正当な本文を巻き込まない。
+_INSTRUCTION_ECHO_MIN_CHARS = 10
+_INSTRUCTION_ECHO_MIN_LEN_RATIO = 0.8
+_INSTRUCTION_ECHO_MAX_LEN_RATIO = 1.2
+_INSTRUCTION_ECHO_MIN_SIMILARITY = 0.9
+
+
 def generated_content_rejection(
-    content: str, file_path: str,
+    content: str, file_path: str, instruction: str = "",
 ) -> str | None:
     """write_file 直前の生成コンテンツ検証。棄却理由を返す (適正なら None)。
 
     書込みパス (fast path / tool-loop / deliberative) から共通で呼び、
-    タスクログエコー・プロンプトエコー・パス誤出力・CSV 構造欠落・断り書きを
-    書込み前に弾く。
+    タスクログエコー・プロンプトエコー・依頼文エコー・パス誤出力・
+    CSV 構造欠落・断り書きを書込み前に弾く。
+
+    Args:
+        content: 書込み予定の生成コンテンツ。
+        file_path: 書込み先パス (拡張子別の検証に使う)。
+        instruction: 元のユーザー依頼文。空なら依頼文エコー検証を行わない。
     """
     if looks_like_path_not_content(content, file_path):
         return "path_only"
@@ -771,6 +846,8 @@ def generated_content_rejection(
         return "write_report_echo"
     if looks_like_prompt_echo(content):
         return "prompt_echo"
+    if looks_like_instruction_echo(content, instruction):
+        return "instruction_echo"
     if csv_content_lacks_rows(content, file_path):
         return "csv_without_rows"
     if looks_like_refusal_or_missing_info(content):

@@ -62,6 +62,19 @@ _TOPK_SELECT_CAP = 64
 # 毎ターン混入していた)。
 _TOPK_MIN_SCORE = 0.40
 
+# select_top_k の query 類似度そのものの下限。合成スコアは fitness を 0.3 の重みで
+# 含むため、プール入りの最低 fitness (DEFAULT_MIN_FITNESS=0.7) でも下駄 0.21 が
+# 無条件に乗り、_TOPK_MIN_SCORE だけでは「高 fitness な無関連例」を弾けない
+# (2026-07-27 実測: fitness 0.917 の無関連例が sim 0.220 で合成 0.429 を取り
+# 自己紹介ターンに混入)。fitness は品質シグナルであって関連性シグナルではない
+# ため、関連性は fitness と独立な必要条件として課す。
+# 閾値根拠 (同実測、chat プール 50 件):
+#   無関連 250 組 … p95=0.151 / p99=0.172 / max=0.220
+#   関連する言い換え 6 組 … 0.354 / 0.463 / 0.473 / 0.601 (弱い 2 例は 0.213/0.238)
+# 無関連例の混入は害 (トークン浪費 + 文体バイアス)、取りこぼしは無害 (few-shot 節
+# を出さないだけ) の非対称性から、観測ノイズ上限を上回る 0.25 を採る。
+_TOPK_MIN_SIM = 0.25
+
 # タスク進捗ノート行 (エージェントの最終応答フォーマット)。
 # meta_cognitive_utils._TASK_LOG_LINE_RE と同旨だが、pillar 境界
 # (EvorefLearn → EvorefLoop の utils は import 対象外) のため最小実装を持つ。
@@ -683,22 +696,28 @@ class FewShotPool(JsonStateStore):
         if len(pool) > _TOPK_SELECT_CAP:
             pool = sorted(pool, key=lambda e: -e.fitness)[:_TOPK_SELECT_CAP]
         q_bg = _char_bigrams(q)  # query bi-gram は 1 回だけ計算
-        scored: list[tuple[float, FewShotExample]] = [
-            (
-                _TOPK_SIM_WEIGHT * _cosine_similarity(q_bg, self._get_bigrams(ex))
-                + (1.0 - _TOPK_SIM_WEIGHT) * ex.fitness,
-                ex,
+        scored: list[tuple[float, float, FewShotExample]] = []
+        for ex in pool:
+            sim = _cosine_similarity(q_bg, self._get_bigrams(ex))
+            combined = (
+                _TOPK_SIM_WEIGHT * sim + (1.0 - _TOPK_SIM_WEIGHT) * ex.fitness
             )
-            for ex in pool
-        ]
+            scored.append((combined, sim, ex))
         scored.sort(key=lambda t: -t[0])
-        # 合成スコアが下限未満の候補は返さない (無関連例の混入防止)
-        selected = [ex for s, ex in scored[:k] if s >= _TOPK_MIN_SCORE]
+        # 無関連例の混入防止は 2 条件の AND。合成スコア下限 (品質込みの総合判定) に
+        # 加え、query 類似度そのものの下限を課す。後者が無いと高 fitness の下駄だけで
+        # 無関連例が通る (_TOPK_MIN_SIM のコメント参照)。
+        selected = [
+            ex
+            for s, sim, ex in scored[:k]
+            if s >= _TOPK_MIN_SCORE and sim >= _TOPK_MIN_SIM
+        ]
 
         dl = self._debug_logger
         if dl:
             selected_ids = [ex.id for ex in selected]
-            scores = [round(s, 4) for s, _ in scored[:k]]
+            scores = [round(s, 4) for s, _, _ in scored[:k]]
+            sims = [round(sim, 4) for _, sim, _ in scored[:k]]
             # evolve 専用 learning カテゴリ (従来通り)
             dl.log_learning_cycle(cycle_num=0, data={
                 "component": "fewshot_pool",
@@ -708,6 +727,9 @@ class FewShotPool(JsonStateStore):
                 "query_len": len(q),
                 "selected_ids": selected_ids,
                 "scores": scores,
+                # sim 単体も残す。合成スコアだけでは「fitness の下駄で通ったのか
+                # 本当に関連したのか」が事後に判別できない。
+                "sims": sims,
             })
             # debug / investigate でも見える rag カテゴリへ並行出力
             dl.log_fewshot_select(

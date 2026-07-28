@@ -57,28 +57,57 @@ class PromptMeta:
 # にしか焼き込まれず、既に本文が存在するパーティションには反映されない)。
 # 実インシデント: 「自己紹介してください」に対しベースモデル自身の学習時の
 # 自己同一性 (「Google DeepMindが開発したGemma 4です」等) がそのまま出力された。
+# 人称の指示を含める理由: 小型 base はユーザー発言の一人称をそのまま引き継ぎ、
+# ユーザーの属性を自分のものとして述べる (実インシデント 2026-07-28 ライブ検証:
+# 「私の誕生日は3月14日です。…あと何日ですか。」→「私の誕生日は 3 月 14 日で…」/
+# 「この会話で私がお願いした3つのうち…」→「この会話で私がお願いした 3 つのうち」)。
+# ツール実行結果側の帰属注記はツールを使うターンにしか効かないため、
+# 全レイヤ (reactive / deliberative / meta_cognitive) が通るここにも置く。
+# 文言は「二人称に置き換えて述べる」という肯定形で書くこと。当初「自分のこと
+# として言い換えないでください」という否定形だったところ、9B base が
+# 「言い換えない」だけを拾い、平叙文の入力を逐語エコーする退行を起こした
+# (2026-07-28 実測 3/3: 「今週の定例会議は火曜日の15時です。」→ 同一文を返答)。
 _PREFIX_TEMPLATES: dict[str, str] = {
     "ja": (
         "あなたの名前は「{name}」です。ユーザーに名前を聞かれた場合や"
         "自己紹介を求められた場合は、この名前で答えてください。"
         "あなた自身の基盤モデル名や開発元 (例: Gemma、Google DeepMind等) を"
-        "尋ねられても開示せず、「{name}」として応答してください。\n\n"
+        "尋ねられても開示せず、「{name}」として応答してください。"
+        "ユーザーの発言に現れる一人称 (私 / 僕 / 自分) はユーザー自身を指します。"
+        "ユーザーのことを述べるときは、一人称ではなく二人称 (「あなた」または"
+        "ユーザーの名前) に置き換えて述べてください。\n\n"
     ),
     "en": (
         "Your name is \"{name}\". When asked your name, or asked to introduce "
         "yourself, respond with this name. Do not disclose the underlying base "
         "model's name or provider (e.g. Gemma, Google DeepMind) even if asked "
-        "directly; always respond as \"{name}\".\n\n"
+        "directly; always respond as \"{name}\". First-person pronouns in the "
+        "user's messages (I, me, my) refer to the user; when referring to the "
+        "user use second person (\"you\", \"your\"), never first person.\n\n"
     ),
 }
 
-# 旧プレフィックス形式 (ベースモデル秘匿指示の追加より前)。既存インストールで
-# Level 1 進化がこの旧形式のまま本文へ焼き込んで汚染しているケースの自己修復
-# (_strip_name_prefix) を、現行の _PREFIX_TEMPLATES 変更後も継続できるよう
-# 別枠で保持する。
+# 旧プレフィックス形式。既存インストールで Level 1 進化がこの旧形式のまま本文へ
+# 焼き込んで汚染しているケースの自己修復 (_strip_name_prefix) を、現行の
+# _PREFIX_TEMPLATES 変更後も継続できるよう別枠で保持する。
+# キーは locale ではなく世代識別子 (_strip_name_prefix は values() のみ使う)。
 _LEGACY_PREFIX_TEMPLATES: dict[str, str] = {
-    "ja": "あなたの名前は「{name}」です。ユーザーに名前を聞かれたらこの名前を答えてください。\n\n",
-    "en": "Your name is \"{name}\". When asked your name, respond with this name.\n\n",
+    # v1: ベースモデル秘匿指示より前
+    "ja_v1": "あなたの名前は「{name}」です。ユーザーに名前を聞かれたらこの名前を答えてください。\n\n",
+    "en_v1": "Your name is \"{name}\". When asked your name, respond with this name.\n\n",
+    # v2: 人称指示より前
+    "ja_v2": (
+        "あなたの名前は「{name}」です。ユーザーに名前を聞かれた場合や"
+        "自己紹介を求められた場合は、この名前で答えてください。"
+        "あなた自身の基盤モデル名や開発元 (例: Gemma、Google DeepMind等) を"
+        "尋ねられても開示せず、「{name}」として応答してください。\n\n"
+    ),
+    "en_v2": (
+        "Your name is \"{name}\". When asked your name, or asked to introduce "
+        "yourself, respond with this name. Do not disclose the underlying base "
+        "model's name or provider (e.g. Gemma, Google DeepMind) even if asked "
+        "directly; always respond as \"{name}\".\n\n"
+    ),
 }
 
 

@@ -50,6 +50,22 @@ _PATH_OR_URL_SIGNAL_RE = re.compile(
     r"[A-Za-z]:\\|(?:^|[\s　])(?:/[\w._-]+){2,}|https?://",
 )
 
+# `python -c "..."` の 1 行中で `;` の後に複合文を書いた形。Python の構文上
+# 必ず SyntaxError になる合成ミスで、4B assist は "SyntaxError: invalid syntax"
+# という素の理由だけを返しても同じ書き方を繰り返す (2026-07-28 実測: 再合成 2 回
+# とも `; if target<d:`)。検出できたときだけ具体的な書き換え方を添える。
+_INLINE_COMPOUND_STMT_RE = re.compile(
+    r";\s*(?:if|for|while|def|class|with|try)\b",
+)
+_INLINE_COMPOUND_STMT_HINT = (
+    "\n原因: `python -c` の 1 行の中で `;` の後に `if` / `for` などの複合文を"
+    "書いている。Python の構文上これは必ず SyntaxError になる。"
+    "条件分岐は三項演算子へ書き換えること。\n"
+    "誤: `t=datetime.date(d.year,3,14); if t<d: t=datetime.date(d.year+1,3,14)`\n"
+    "正: `y=d.year if (d.month,d.day)<=(3,14) else d.year+1;"
+    " t=datetime.date(y,3,14)`"
+)
+
 # executable_command_synth が合成したコマンドの事後検証用。
 # synth プロンプトは「環境依存事実のみ・副作用/ネットワーク送信なし」を要求するが、
 # アシストがこれを破ってネットワークコマンドや構文エラーの python -c を返すため、
@@ -328,16 +344,29 @@ def _build_spec_command(query: str) -> str:
     """システムスペックコマンドを生成する
 
     クエリにドライブレター指定（「Eドライブ」「C:」等）が含まれる場合は、
-    そのドライブの容量を取得する。指定がなければカレントディレクトリ('.')。
+    そのドライブの容量を取得する。指定がなければシステムドライブ
+    (Windows は %SystemDrive%、Unix は '/')。
     Windows / Unix の両方で動作するよう、パスはフォワードスラッシュで構築する
     （shutil.disk_usage は Windows でも 'E:/' を受理する）。
+
+    フォールバックはかつてカレントディレクトリ ('.') だったが、これは backend
+    プロセスの起動位置という**ユーザーから見えない値**に測定対象が依存する。
+    実測 (2026-07-27 ライブ監査): 「C ドライブの空き容量は?」→ C: の 138 GB を
+    回答した直後、「さっき調べた空き容量はディスク全体の何%?」でドライブ名が
+    落ちて '.' にフォールバックし、cwd のある E: (553 GB free) を測って
+    「さっき調べた空き容量 553 GB」と自己矛盾した回答を返した。
+    「この PC の空き容量」はシステムドライブを指すのが自然で、かつ起動位置に
+    依存せず決定論的になる。
     """
     m = _DRIVE_LETTER_RE.search(query)
     if m:
         letter = m.group(1).upper()
         py_path = f"'{letter}:/'"
     else:
-        py_path = "'.'"
+        # サブプロセス側で評価する (実行ホストのシステムドライブを見る)。
+        # os は既に import 済みで、os.environ / .get とも readonly guard の
+        # 禁止属性ではない。
+        py_path = "(os.environ.get('SystemDrive','C:')+'/' if os.name=='nt' else '/')"
     return (
         "python -c \""
         "import platform,os,shutil;"
@@ -377,13 +406,20 @@ _EXECUTABLE_QUERY_COMMANDS: list[tuple[re.Pattern, "str | Callable[[str], str]"]
     # 「今日|明日|昨日」単独は誤検出するため見送り)
     (_DATETIME_QUERY_RE,
      'python -c "import datetime; print(datetime.datetime.now())"'),
-    # システムスペック（CPU / メモリ / ディスク）
+    # システムスペック（OS / CPU / コア数 / ディスク）
     # ドライブレター指定があれば指定ドライブの容量を返す
-    # CPU/RAM 等の英字略語は ASCII 境界必須 ("program" の 'ram' 誤マッチ対策)
+    # CPU 等の英字略語は ASCII 境界必須 ("program" の 'ram' 誤マッチ対策)
     # spec(s)? で複数形 ("PC specs") も許容する。
+    # メモリ / memory / RAM は 2026-07-27 に外した。GPU/VRAM (下記) と同じ理由で、
+    # コマンドが搭載メモリ量を一切出力しないのにパターンだけ一致して発火し、
+    # サブプロセスと 1 ターンを消費した末に「ツール結果にメモリ容量の数値は
+    # 記載されていません」としか返せなかった (実測: 「この PC のメモリは何 GB
+    # 積んでいますか？」)。Windows で搭載 RAM を取る手段 (ctypes / wmic /
+    # Get-CimInstance) は _READONLY_SAFE_MODULES / 危険コマンド判定が全て拒否
+    # するため、正しい情報を返すコマンドへ差し替える経路は存在しない。
     (re.compile(
-        r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])|メモリ|memory"
-        r"|(?<![A-Za-z])RAM(?![A-Za-z])|ディスク|容量|ストレージ|ドライブ"
+        r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])"
+        r"|ディスク|容量|ストレージ|ドライブ"
         r"|disk|capacity|storage"
         r"|(?<![A-Za-z])specs?(?![A-Za-z])"
         r"|(?<![A-Za-z])drive(?![A-Za-z]))",
@@ -453,6 +489,7 @@ _EXECUTABLE_COMMAND_SYNTH_SYSTEM_PROMPT = """\
 
 ## is_executable=true の例
 - 「今日は何月何日?」「現在時刻は?」 → 日時取得
+- 「今日から100日後は?」「今年はあと何日?」 → 日時からの派生値 (下記参照)
 - 「Python のバージョン」「Chrome のバージョン」 → ソフトウェアバージョン取得
 - 「ディスク使用量」「CPU 情報」「メモリ使用量」 → システムリソース取得
 - 「IP アドレス」「ホスト名」「OS の情報」 → ネットワーク / OS 情報
@@ -467,10 +504,32 @@ _EXECUTABLE_COMMAND_SYNTH_SYSTEM_PROMPT = """\
 - 単一行、副作用なし (書き込み・削除・ネットワーク送信・対話プロンプトなし)
 - 30 秒以内に終了する
 - 可搬性を優先して `python -c "..."` 形式を基本とする
+- `python -c "..."` の中身は **1 行**。`;` の後ろに `if` / `for` / `def` などの
+  複合文は書けない (SyntaxError で実行前に棄却される)。条件分岐は三項演算子
+  (`y = a if cond else b`)、繰り返しは内包表記で書く
 - Windows 固有情報は PowerShell スニペットでも可
   (例: `powershell -Command "(Get-Item 'C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe').VersionInfo.ProductVersion"`)
 - shell の文法に従い、クオートを適切に処理する
 - is_executable=false のとき command は ""
+
+## 派生値は「取得」で止めず「計算まで」コマンドに含める
+基準時刻からの派生値 (N 日後 / N 日前 / 曜日 / 残り日数 / 経過日数) を
+尋ねられたとき、現在時刻だけを print するコマンドを返してはいけない。
+差分の計算が LLM の暗算に倒れて誤答する (2026-07-28 実測: 2026-07-28 の
+100 日後を 2026-10-27 と誤答。正解は 2026-11-05)。**求められた値そのもの**を
+計算して print する。
+
+- 「今日から100日後は何月何日?」
+  → `python -c "import datetime; print(datetime.date.today() + datetime.timedelta(days=100))"`
+- 「今年はあと何日?」
+  → `python -c "import datetime; d=datetime.date.today(); print((datetime.date(d.year,12,31)-d).days)"`
+- 「今日は何曜日?」
+  → `python -c "import datetime; print(datetime.date.today().strftime('%A'))"`
+- 「3月14日まであと何日?」
+  → `python -c "import datetime; d=datetime.date.today(); y=d.year if (d.month,d.day)<=(3,14) else d.year+1; print((datetime.date(y,3,14)-d).days)"`
+
+なお readonly 実行では属性 `replace` / `write` 等が拒否されるため、
+`date.replace(year=...)` は使わず上記のように年を式で選ぶこと。
 
 ## rationale
 1 行で判定理由を述べる (UI 非表示、ログ用)。
@@ -500,8 +559,8 @@ _CALCULATE_EXPRESSION_SYNTH_SYSTEM_PROMPT = """\
 - 数値が 1 つしか無く、演算の対象が定まらないもの
 
 ## 式の生成ルール (is_calculation=true のとき)
-- **クエリに実際に書かれている数値だけ**を使う。知識から補った定数は使わない
-  (使うと検証で棄却される)
+- **クエリ、または直前の会話 (### 直近の会話 節) に実際に書かれている数値だけ**を
+  使う。知識から補った定数は使わない (使うと検証で棄却される)
 - 数値リテラルと `+ - * / % ** // ( )` のみ。関数呼び出し・変数・単位記号・
   カンマ区切りは不可 (例: `sqrt(2)` `1,000` `42.195km` はすべて不可)
 - Python 構文。冪乗は `**` (`^` は不可)
@@ -534,7 +593,7 @@ _CALCULATION_EXCLUDE_RE = re.compile(
 )
 
 
-def _looks_like_numeric_question(query: str) -> bool:
+def _looks_like_numeric_question(query: str, context: str = "") -> bool:
     """式は書かれていないが数値計算の答えを求めているクエリか (純粋関数)。
 
     2026-07-27 ライブ検証: 「1マイルは約1.609キロメートルです。42.195キロ
@@ -542,28 +601,67 @@ def _looks_like_numeric_question(query: str) -> bool:
     と誤答した (正解 26.224)。同じ計算を式で書くと層1 が calculate へ流して
     正答するため、差は「式が書かれているか」だけだった。
 
-    数値が 2 つ以上あり、値を尋ねる手掛かり語があり、環境依存事実クエリの
-    語を含まない場合のみ True。
+    値を尋ねる手掛かり語があり、環境依存事実クエリの語を含まず、クエリ自身に
+    数値が 1 つ以上あり、かつクエリ + ``context`` (直近の会話) を合わせて数値が
+    2 つ以上ある場合のみ True。
+
+    ``context`` を数える理由 (2026-07-28 ライブ検証): 「1マイルは何キロ?」の
+    直後に「では 26.2 マイルのフルマラソンは何キロですか。」と尋ねると、被演算子
+    の片方 (換算率 1.61) は直前ターンにしか無いためクエリ単独では 1 数値となり、
+    本フィルタで弾かれて base の暗算に倒れていた (42.19 と誤答。正解 42.16)。
+    手掛かり語と「クエリ自身に数値が要る」制約は残すので、数値を含まない雑談で
+    assist 往復は増えない。
     """
-    if len(_NUMBER_LITERAL_RE.findall(query)) < 2:
-        return False
     if _CALCULATION_EXCLUDE_RE.search(query):
         return False
-    return bool(_CALCULATION_CUE_RE.search(query))
+    if not _CALCULATION_CUE_RE.search(query):
+        return False
+    query_numbers = _NUMBER_LITERAL_RE.findall(query)
+    if not query_numbers:
+        return False
+    if len(query_numbers) >= 2:
+        return True
+    return bool(_NUMBER_LITERAL_RE.search(context))
 
 
-def _synthesized_expression_grounded(expression: str, query: str) -> bool:
-    """合成式の数値がすべてクエリに現れるか (純粋関数)。
+def _synthesized_expression_grounded(
+    expression: str, query: str, context: str = "",
+) -> bool:
+    """合成式の数値がすべてクエリ / 直近の会話に現れるか (純粋関数)。
 
-    assist が知識から定数を補う (例: クエリに無い換算率を持ち出す) と、
+    assist が知識から定数を補う (例: クエリにも会話にも無い換算率を持ち出す) と、
     ツールは「正しく計算された嘘」を返してしまう。式に現れる数値リテラルが
-    クエリ中に文字列として存在することを要求し、捏造を決定論的に弾く。
+    クエリまたは ``context`` 中に文字列として存在することを要求し、捏造を
+    決定論的に弾く。``context`` を許すのは、会話で一度提示された数値は
+    「対話に書かれた事実」であってモデルの想像ではないため。
     """
     numbers = _NUMBER_LITERAL_RE.findall(expression)
     if not numbers:
         return False
-    query_numbers = set(_NUMBER_LITERAL_RE.findall(query))
-    return all(n in query_numbers for n in numbers)
+    known = set(_NUMBER_LITERAL_RE.findall(query))
+    known.update(_NUMBER_LITERAL_RE.findall(context))
+    return all(n in known for n in numbers)
+
+
+#: 層5.2 の数値グラウンディングに使う直近ターン数。長く取るほど無関係な数値を
+#: 拾いやすくなるため短く保つ。
+_CALCULATE_CONTEXT_TURNS = 4
+
+
+def _recent_dialogue_text(conversation: list[dict] | None) -> str:
+    """直近ターンの本文を連結して返す (純粋関数)。
+
+    層5.2 の事前フィルタとグラウンディング検証で「対話に現れた数値」を数える
+    ためだけに使う。role は問わない (換算率はアシスタント発話側に出る)。
+    """
+    if not conversation:
+        return ""
+    parts = [
+        str(turn.get("content") or "")
+        for turn in conversation[-_CALCULATE_CONTEXT_TURNS:]
+        if isinstance(turn, dict)
+    ]
+    return "\n".join(p for p in parts if p)
 
 
 # 知識質問パターン — ツール判定をスキップすべきクエリ
@@ -670,8 +768,12 @@ _FIRST_PERSON_REFERENCE_RE_EN = re.compile(
 # 文字クラスで窓を絞り、(b) 「とは別/とは関係」等の明示的な話題切断の
 # 前置きを negative lookahead で弾く、の二重ガード付きで窓を 40 に広げる。
 # (pillar境界のため backend/free/rag/self_rag_judge.py の
-# TRIVIAL_QUESTION_PATTERNS と同義の定義を重複させている。両ファイルを
-# 変更する際は同期させること)。
+# TRIVIAL_QUESTION_PATTERNS と同趣旨の定義を重複させている。片方だけ直すと
+# 挙動がずれるので変更時は必ず両方を確認すること。ただし **語彙を同一にしては
+# いけない** — self_rag 側はマッチすると RAG 検索を丸ごと skip するため誤検出
+# コストが桁違いに高く、話題ポインタにもなる語 (質問/指摘/言った/話した/聞いた
+# /順番) は self_rag 側では意図的に採っていない。詳細な実測は
+# self_rag_judge.py の「語彙が同一でない理由」コメント参照)。
 # 反省的な語には時系列順序語 (最初/最後/何番目/何回目) も含める。
 # 「この会話で一番最初に計算させた問題は?」(2026-07-21 ライブ検証 ターン18)
 # は反省語 (覚えて等) を欠きスコープ注入が漏れ、cross-session 検索が前回
@@ -689,7 +791,13 @@ _SELF_SESSION_REFERENCE_PATTERNS = [
         # 引用して「居住地：東京→大阪 / 名前：太郎→ヒロユキ」という他人の
         # ペルソナ設定をユーザー本人の訂正として提示した。
         r"|訂正|指摘|直した|思い出|言った|話した|聞いた"
-        r"|最初|最後|何番目|何回目)",
+        r"|最初|最後|何番目|何回目"
+        # 2026-07-27 追加。順序・列挙を尋ねる語が無いため
+        # 「この会話で私が質問した順番を、古いものから順に番号付きで列挙して
+        # ください。」が自己参照と判定されず、逆に exclude_session_id が注入され、
+        # 「この会話」について尋ねているのに現在セッションだけを除外して
+        # 検索していた (実測 2026-07-27 ライブ監査)。
+        r"|順番|順序|列挙|並べ|質問)",
     ),
 ]
 
@@ -698,8 +806,9 @@ _SELF_SESSION_REFERENCE_PATTERNS = [
 # 逆) ため、_SESSION_TOPIC_BREAK_LEAD_RE_EN の前置きガードと併用する
 # (_maybe_scope_session_search 側で参照)。
 # (pillar境界のため backend/free/rag/self_rag_judge.py の
-# TRIVIAL_QUESTION_PATTERNS_EN と同義の定義を重複させている。両ファイルを
-# 変更する際は同期させること)。
+# TRIVIAL_QUESTION_PATTERNS_EN と同趣旨の定義を重複させている。JA 側と同様に
+# 語彙は意図的に完全一致させていない — ``asked`` は self_rag 側では採らない。
+# 理由と実測は self_rag_judge.py の「語彙が同一でない理由」コメント参照)。
 _SELF_SESSION_REFERENCE_PATTERNS_EN = [
     re.compile(
         r"(?:this\s+conversation|this\s+chat|our\s+conversation"
@@ -710,6 +819,8 @@ _SELF_SESSION_REFERENCE_PATTERNS_EN = [
         r"[^.!?\n]{0,40}?"
         r"(?:interesting|memorable|impressive|funn(?:y|iest)"
         r"|summar\w*|recap\w*|think|thought|feel|felt|remember"
+        # 2026-07-27 追加 (JA 側の 順番/順序/列挙/質問 と対応)。
+        r"|order|sequence|enumerate|asked"
         r"|first|last|earliest|latest)"
         # 英語は修飾語 (interesting 等) が「this conversation」より前に
         # 来る語順も自然なため (日本語の後置とは逆)、逆順の共起も許容する。
@@ -961,6 +1072,27 @@ def _is_conversational_query_without_tool_signal(query: str) -> bool:
         any(p.search(query) for p in knowledge_patterns)
         or any(p.search(query) for p in self_action_patterns)
     )
+
+
+#: 進行中の会話を指す近接リコール語。これらは「今のセッションの中」を指すので、
+#: 現在セッションを除外した search_history では構造的に当たらない。
+_PROXIMAL_RECALL_KEYWORDS = (
+    "さっき", "先ほど", "さきほど", "今朝",
+    "just now", "a moment ago", "this morning",
+)
+
+
+def _only_proximal_recall_keywords(query: str) -> bool:
+    """履歴参照語が近接リコール語だけか (純粋関数)。
+
+    長距離リコール語 (「以前」「最初に」「覚えて」等) が 1 つでもあれば False。
+    """
+    q_lower = query.lower()
+    keywords = select_locale_variant(HISTORY_KEYWORDS, HISTORY_KEYWORDS_EN)
+    matched = [kw for kw in keywords if kw in q_lower]
+    if not matched:
+        return False
+    return all(kw in _PROXIMAL_RECALL_KEYWORDS for kw in matched)
 
 
 def _has_history_recall_keywords(query: str) -> bool:
@@ -1264,8 +1396,22 @@ class ToolCallJudge:
             result = self._suppress_commandless_run_command(result)
             result = self._suppress_expressionless_calculate(result)
             result = self._validate_tool_availability(result, tools_registry, mode)
-            self._log_tool_decision(result, "rule_pattern_matched")
-            return result
+            if result.tool_needed:
+                self._log_tool_decision(result, "rule_pattern_matched")
+                return result
+            # 降格 (assist の not-executable 判定 / 引数欠落 / mode 不可) は
+            # 「このツールは使えない」であって「ツールは不要」ではない。ここで
+            # return すると層2〜5.2 が丸ごと死に、最も救済が要るクエリだけが
+            # 素の base 暗算に落ちる (2026-07-28 ライブ検証: 「その距離を時速
+            # 12キロで走ると何時間何分かかりますか。」が run_command_readonly
+            # として rule 一致 → assist が not-executable と判定 → 即 no_tool
+            # となり、層4 assist なら calculate を選べたのに base の暗算で
+            # 「約3時間30分」と答えたうえ本文末尾で「正確には3時間31分」と
+            # 自己矛盾した)。後続層へ落とす。
+            logger.debug(
+                "Rule layer match downgraded to no_tool; falling through to "
+                "later layers: %s", query[:50],
+            )
 
         # 2. カートリッジ tool_hints 照合
         result = self._judge_with_cartridge_hints(query, tools_registry)
@@ -1286,8 +1432,14 @@ class ToolCallJudge:
             result = self._suppress_commandless_run_command(result)
             result = self._suppress_expressionless_calculate(result)
             result = self._validate_tool_availability(result, tools_registry, mode)
-            self._log_tool_decision(result, "learned_pattern_matched")
-            return result
+            if result.tool_needed:
+                self._log_tool_decision(result, "learned_pattern_matched")
+                return result
+            # 層1 と同じ理由で降格時は後続層へ落とす。
+            logger.debug(
+                "Learned layer match downgraded to no_tool; falling through to "
+                "later layers: %s", query[:50],
+            )
 
         # 雑談プレフィルタ: ツールシグナルが無く、知識質問 or ユーザー自身の
         # 行動宣言 (「探してみるね」等) のクエリは層4 (tool_judgment) をスキップ
@@ -1390,7 +1542,7 @@ class ToolCallJudge:
             # クエリで assist 往復は増えない。合成式は AST 検証 + クエリ由来
             # 数値チェックを通ったものだけ採用する。
             calc_result = await self._judge_with_calculate_fallback(
-                query, tools_registry,
+                query, tools_registry, conversation,
             )
             if calc_result is not None:
                 calc_result = self._validate_tool_availability(
@@ -1446,7 +1598,26 @@ class ToolCallJudge:
                 forced_result = self._validate_tool_availability(
                     forced_result, tools_registry, mode,
                 )
-                if forced_result.tool_needed:
+                # 近接リコール語 (「さっき」「先ほど」) だけが根拠で、かつ
+                # 現在セッションを検索対象から外した組合せは構造的に必ず空振り
+                # する — 指しているのは進行中の会話であり、それを除外した先に
+                # 答えは無い (2026-07-28 ライブ検証: 「さっきの3ステップを、
+                # 番号付きリストで…」で exclude_session_id 付きの
+                # search_history が走り 10 秒かけて「該当なし」を返した)。
+                # 会話履歴は既にコンテキストに載っているので撃たない。
+                # 長距離リコール語 (「以前」「最初に」「覚えて」等) が併存する
+                # 場合は従来どおり撃つ。
+                if (
+                    forced_result.tool_needed
+                    and forced_result.tool_args.get("exclude_session_id")
+                    and _only_proximal_recall_keywords(query)
+                ):
+                    logger.debug(
+                        "Skipping history_keyword_forced_fallback: proximal "
+                        "recall word refers to the ongoing session, which is "
+                        "excluded from the search: %s", query[:50],
+                    )
+                elif forced_result.tool_needed:
                     self._log_tool_decision(
                         forced_result, "history_keyword_forced_fallback",
                     )
@@ -1529,20 +1700,32 @@ class ToolCallJudge:
             source="assist",
         )
 
-    async def _synthesize_calculate_via_assist(self, query: str) -> str:
+    async def _synthesize_calculate_via_assist(
+        self, query: str, context: str = "",
+    ) -> str:
         """数値文章題から calculate 用の算術式を assist で合成する。
+
+        Args:
+            query: ユーザーのクエリ。
+            context: 直近の会話本文。被演算子の片方が直前ターンにしか無い
+                多ターン計算 (「では 26.2 マイルは何キロ?」) を扱うために
+                渡す。グラウンディング検証もこの範囲を許容する。
 
         Returns:
             検証を通った式。合成不能 / 非計算クエリ / 検証失敗時は空文字列。
         """
         if self._assist_client is None:
             return ""
+        user_content = (
+            f"### 直近の会話\n{context}\n\n### クエリ\n{query}"
+            if context else query
+        )
         try:
             result = await self._assist_client.generate(
                 [
                     {"role": "system",
                      "content": _CALCULATE_EXPRESSION_SYNTH_SYSTEM_PROMPT},
-                    {"role": "user", "content": query},
+                    {"role": "user", "content": user_content},
                 ],
                 max_tokens=256,
                 temperature=0.1,
@@ -1564,23 +1747,28 @@ class ToolCallJudge:
         if not expression:
             return ""
         # 検証は 2 段。式として安全か (ルール層と同じ述語) と、使われている
-        # 数値がクエリ由来か (assist が知識から定数を補う捏造を弾く)。
+        # 数値が対話 (クエリ + 直近の会話) 由来か (assist が知識から定数を補う
+        # 捏造を弾く)。
         if not _is_numeric_expression(expression):
             logger.info(
                 "calculate_expression_synth: rejected non-numeric expression %r",
                 expression[:80],
             )
             return ""
-        if not _synthesized_expression_grounded(expression, query):
+        if not _synthesized_expression_grounded(expression, query, context):
             logger.info(
                 "calculate_expression_synth: rejected ungrounded expression %r "
-                "(numbers not present in query)", expression[:80],
+                "(numbers not present in query or recent dialogue)",
+                expression[:80],
             )
             return ""
         return expression
 
     async def _judge_with_calculate_fallback(
-        self, query: str, tools_registry: ToolsRegistry,
+        self,
+        query: str,
+        tools_registry: ToolsRegistry,
+        conversation: list[dict] | None = None,
     ) -> "ToolJudgement | None":
         """数値文章題の calculate フォールバック (5.2 層目).
 
@@ -1597,9 +1785,10 @@ class ToolCallJudge:
             return None
         if self._assist_client is None:
             return None
-        if not _looks_like_numeric_question(query):
+        context = _recent_dialogue_text(conversation)
+        if not _looks_like_numeric_question(query, context):
             return None
-        expression = await self._synthesize_calculate_via_assist(query)
+        expression = await self._synthesize_calculate_via_assist(query, context)
         if not expression:
             return None
         logger.info(
@@ -1988,15 +2177,20 @@ class ToolCallJudge:
             return None
         if not query:
             return None
+        # embed_query は LRU キャッシュ付きの単一クエリ経路。同一ターンでは
+        # 検索パイプライン (run_search_pipeline) が同じ (query, mode) で既に
+        # 埋め込み済みなので、ここはキャッシュヒットになり埋め込みサーバへの
+        # 往復が消える。embed() を直接呼ぶとキャッシュを迂回して毎ターン
+        # 二重に埋め込んでいた (2026-07-27 実測: 1 ターンあたり +0.35s)。
         try:
-            embeddings = await self._embedder.embed([query], is_query=True, mode=mode)
+            embedding = await self._embedder.embed_query(query, mode=mode)
         except Exception as exc:
             logger.warning("URL recall: embed failed: %s", exc)
             return None
-        if embeddings is None or len(embeddings) == 0:
+        if embedding is None or len(embedding) == 0:
             return None
         import numpy as _np
-        q_vec = _np.asarray(embeddings[0], dtype=_np.float32)
+        q_vec = _np.asarray(embedding, dtype=_np.float32)
 
         top_k = int(tools_cfg.get("url_recall_topk", 5))
         min_sim = float(tools_cfg.get("url_recall_min_score", 0.7))
@@ -2178,15 +2372,16 @@ class ToolCallJudge:
             return None
         if not query:
             return None
+        # ``_try_recall_url`` と同じ理由で embed_query (LRU キャッシュ経路) を使う。
         try:
-            embeddings = await self._embedder.embed([query], is_query=True, mode=mode)
+            embedding = await self._embedder.embed_query(query, mode=mode)
         except Exception as exc:
             logger.warning("Executable command recall: embed failed: %s", exc)
             return None
-        if embeddings is None or len(embeddings) == 0:
+        if embedding is None or len(embedding) == 0:
             return None
         import numpy as _np
-        q_vec = _np.asarray(embeddings[0], dtype=_np.float32)
+        q_vec = _np.asarray(embedding, dtype=_np.float32)
 
         top_k = int(tools_cfg.get("executable_command_recall_topk", 5))
         min_sim = float(tools_cfg.get("executable_command_recall_min_score", 0.7))
@@ -2424,10 +2619,63 @@ class ToolCallJudge:
 
         import platform
         platform_info = f"{platform.system()} {platform.release()}"
-        user_prompt = (
+        base_prompt = (
             f"## プラットフォーム\n{platform_info}\n\n"
             f"## クエリ\n{query}"
         )
+        outcome = await self._ask_command_synth(base_prompt)
+        if outcome is None:
+            return None
+        is_executable, command, reject = outcome
+        if reject:
+            # 棄却は「意図は合っているが書き方が悪い」ケースが大半で
+            # (実測: `python -c` に 1 行では書けない `if` 文、全角句点の混入)、
+            # ここで諦めると呼出側は regex テーブルの汎用コマンド
+            # (日時なら現在時刻の print) にフォールバックする。そのコマンドは
+            # 質問とは別の値を返すため、base が差分を暗算して誤答する
+            # (2026-07-28 ライブ検証:「今日から誕生日まであと何日ですか。」で
+            # 合成が SyntaxError 棄却 → 現在時刻だけ取得 → 「約 -139 日」と回答)。
+            # 棄却理由を添えて 1 回だけ書き直させる。棄却は稀 (ログ 2 ファイルで
+            # 計 3 件) なので assist 往復の増加は無視できる。
+            logger.warning(
+                "executable_command_synth rejected command (%s): %s",
+                reject, command[:120],
+            )
+            hint = (
+                _INLINE_COMPOUND_STMT_HINT
+                if _INLINE_COMPOUND_STMT_RE.search(command) else ""
+            )
+            retried = await self._ask_command_synth(
+                f"{base_prompt}\n\n## 直前の試行が棄却された\n"
+                f"生成したコマンド: {command}\n"
+                f"棄却理由: {reject}{hint}\n"
+                f"この理由を解消したコマンドを 1 つだけ生成し直してください。"
+                f"解消できない場合は is_executable=false を返してください。",
+            )
+            if retried is not None:
+                is_executable, command, reject = retried
+                if reject:
+                    logger.warning(
+                        "executable_command_synth retry also rejected (%s): %s",
+                        reject, command[:120],
+                    )
+            else:
+                is_executable, command = False, ""
+        value = (True, command) if is_executable and command else (False, "")
+        self._command_cache_store(query, value)
+        return value
+
+    async def _ask_command_synth(
+        self, user_prompt: str,
+    ) -> tuple[bool, str, str] | None:
+        """executable_command_synth を 1 回呼び、結果を検証して返す.
+
+        Returns:
+            ``(is_executable, command, reject_reason)``。``reject_reason`` が
+            空でなければ ``_reject_synthesized_command`` がコマンドを棄却した
+            ことを示す (``is_executable`` は False)。
+            通信失敗 / JSON パース失敗時は ``None``。
+        """
         try:
             result = await self._assist_client.generate(
                 [
@@ -2466,21 +2714,13 @@ class ToolCallJudge:
         # is_executable=True と主張するが command が空のケースは
         # 「コマンド合成失敗」とみなして False に降格する。
         if not is_executable or not command:
-            value = (False, "")
-        else:
-            # synth プロンプトのスコープ (ネットワーク送信なし・構文妥当) を
-            # コード側で enforce。逸脱コマンドは実行させず False に降格する。
-            reject = _reject_synthesized_command(command)
-            if reject is not None:
-                logger.warning(
-                    "executable_command_synth rejected command (%s): %s",
-                    reject, command[:120],
-                )
-                value = (False, "")
-            else:
-                value = (True, command)
-        self._command_cache_store(query, value)
-        return value
+            return (False, "", "")
+        # synth プロンプトのスコープ (ネットワーク送信なし・構文妥当) を
+        # コード側で enforce。逸脱コマンドは実行させず False に降格する。
+        reject = _reject_synthesized_command(command)
+        if reject is not None:
+            return (False, command, reject)
+        return (True, command, "")
 
     async def _resolve_executable_command(self, query: str) -> str:
         """assist を優先して executable command を解決する.
