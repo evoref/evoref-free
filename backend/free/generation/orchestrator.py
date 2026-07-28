@@ -102,6 +102,15 @@ _MIN_UNIQUE_SENTENCE_RATIO = 0.6
 _WARN_UNIQUE_SENTENCE_RATIO = 0.8
 # 重複判定で無視する短文 (定型の相槌・見出し断片を拾わないため)。
 _DUP_MIN_SENTENCE_CHARS = 15
+# 総文数に依存しない退化検出の下限文字数。比率ゲートは _DUP_CHECK_MIN_SENTENCES
+# (12 文) 未満だと一切評価しないため、短い退化出力を丸ごと素通ししていた
+# (実測 2026-07-27: 「箇条書きを使わず地の文で 400 字に縮めて」の応答が
+# 要点を並べた 6 断片で、うち 44 文字の 1 文が逐語で 2 回出現。総文数 6 < 12 の
+# ため比率 0.833 は算出・記録されたのにゲートは動かず、error 0 件で
+# long_form_success として学習された)。
+# これだけ長い文が逐語で複数回現れるのは生成ループの兆候で、自然な散文では
+# まず起きない。定型の挨拶・見出し・箇条書きラベルはこの長さに届かない。
+_VERBATIM_DUP_MIN_CHARS = 30
 
 # 文分割 (日本語の句点・感嘆・疑問 + 改行 + 英文のピリオド)。
 _SENTENCE_SPLIT_RE = re.compile(r"[。．!！?？\n]+")
@@ -122,6 +131,51 @@ def _sentence_dup_stats(text: str) -> tuple[int, int]:
         total += 1
         seen.add(s)
     return total, len(seen)
+
+
+def _verbatim_duplicate_count(text: str) -> int:
+    """``_VERBATIM_DUP_MIN_CHARS`` 以上の文が逐語重複している件数を返す (純粋関数)。
+
+    総文数に依存しないので、比率ゲート (``_DUP_CHECK_MIN_SENTENCES``) が
+    評価しない短い出力の退化も検出できる。返すのは「2 回以上出現した文」の
+    種類数 (同じ文が何回出たかではない)。
+    """
+    counts: dict[str, int] = {}
+    for raw in _SENTENCE_SPLIT_RE.split(text):
+        s = " ".join(raw.split())
+        if len(s) < _VERBATIM_DUP_MIN_CHARS:
+            continue
+        counts[s] = counts.get(s, 0) + 1
+    return sum(1 for c in counts.values() if c > 1)
+
+
+#: 文とその直後の区切り文字を一組で取り出す (再構成用)。
+_SENTENCE_WITH_DELIM_RE = re.compile(r"[^。．!！?？\n]+[。．!！?？\n]*")
+
+
+def drop_repeated_sentences(text: str) -> str:
+    """``_VERBATIM_DUP_MIN_CHARS`` 以上の文の 2 回目以降の出現を落とす (純粋関数)。
+
+    ``_validate_generated_text`` は逐語重複を error として**記録する**が、
+    本文には手を入れないため、重複したままの本文が保存・assemble され、
+    後続ユニットのコンテキストにも残っていた (2026-07-28 ライブ検証:
+    「在宅勤務の利点と課題」800 字で 34 文字と 44 文字の 2 文が同一ユニット内で
+    逐語再掲。validate は `1 sentence(s) ... repeated verbatim` を記録済み)。
+
+    これだけ長い文の完全一致は生成ループの兆候で、落としても情報は失われない。
+    ``collapse_runaway_repetition`` は連続反復しか見ないため本ケースを
+    素通しする (間に別の文が挟まる)。
+    """
+    seen: set[str] = set()
+    kept: list[str] = []
+    for chunk in _SENTENCE_WITH_DELIM_RE.findall(text):
+        norm = " ".join(chunk.strip(" 。．!！?？\n\t").split())
+        if len(norm) >= _VERBATIM_DUP_MIN_CHARS:
+            if norm in seen:
+                continue
+            seen.add(norm)
+        kept.append(chunk)
+    return "".join(kept)
 
 
 class LongFormOrchestrator:
@@ -591,6 +645,16 @@ class LongFormOrchestrator:
             elif uniq_ratio < _WARN_UNIQUE_SENTENCE_RATIO:
                 warnings.append(f"unique sentence ratio {uniq_ratio:.2f}")
 
+        # 比率ゲートは総文数が閾値未満だと一切評価しないため、短い退化出力
+        # (要点の羅列を数断片だけ返す等) を素通ししていた。長い文の逐語重複は
+        # 総文数に関係なく生成ループの兆候なので独立に見る。
+        verbatim_dups = _verbatim_duplicate_count(text)
+        if verbatim_dups > 0:
+            errors.append(
+                f"repetitive output: {verbatim_dups} sentence(s) of "
+                f">={_VERBATIM_DUP_MIN_CHARS} chars repeated verbatim",
+            )
+
         self.last_validation_errors = list(errors)
         if on_step:
             _call_step(on_step, {
@@ -605,6 +669,8 @@ class LongFormOrchestrator:
                 "error_count": len(errors),
                 "warning_count": len(warnings),
                 "unique_sentence_ratio": round(unique / total, 3) if total else None,
+                "sentence_count": total,
+                "verbatim_duplicates": verbatim_dups,
                 "review_issues": self._last_review_issue_count,
             })
         return len(errors), len(warnings)
@@ -867,6 +933,18 @@ class LongFormOrchestrator:
             ):
                 yield "\n\n"
 
+            # 計画上の見出しを決定論的に前置きする。本文プロンプト
+            # (TEXT_UNIT_SYSTEM) はモデルに見出し行の出力を禁じているため、
+            # 前置きしないと計画に見出しがあっても TEXT 出力のどこにも現れない
+            # (実測 2026-07-27: 「見出しをちょうど 3 つ立てて 800 字」→ 計画は
+            # 3 見出しを持ち JSONL にも記録されていたが、応答は見出し 0 個の
+            # 平文 3 段落だった)。
+            heading_md = _unit_heading_markdown(
+                unit, plan, content_type, long_form_mode,
+            )
+            if heading_md:
+                yield heading_md
+
             # ユニット別 RAG (long_form.rag_per_unit)。plan 用の一括ブロックでは
             # なく、このユニットに効く参考情報だけを絞って渡す。
             rolling.unit_rag = await self._build_unit_rag(label, prefetched_rag, mode)
@@ -881,6 +959,10 @@ class LongFormOrchestrator:
             # 汚染を防ぐため保存前にクリーンにする。
             raw_len = len(text)
             text = collapse_runaway_repetition(text)
+            # 間に別の文が挟まる逐語再掲は collapse_runaway_repetition が
+            # 見ないため独立に落とす (2026-07-28)。
+            if content_type == ContentType.TEXT:
+                text = drop_repeated_sentences(text)
             # 計画の要点をそのまま書き写した冒頭段落を落とす (2026-07-27)。
             # ライブストリームには既に流れているが、保存・assemble・後続ユニットの
             # コンテキストに内部計画が残るのを防ぐ (上の反復切除と同じ方針)。
@@ -915,7 +997,10 @@ class LongFormOrchestrator:
                     })
                 break
 
-            rolling.generated_units.append(text)
+            # 重複判定 (直上) は本文どうしで行い、保存はその後に見出しを付ける。
+            # 見出し込みで比較すると、見出しだけ違う同一本文が重複と見なされず
+            # 退化ガードをすり抜ける。
+            rolling.generated_units.append(heading_md + text if heading_md else text)
             await self._update_rolling_context(rolling, text, content_type)
             unit_tokens = estimate_tokens(text)
             total_tokens += unit_tokens
@@ -1401,6 +1486,43 @@ def _is_duplicate_unit(text: str, previous: list[str]) -> bool:
         if len(shorter) >= _DUPLICATE_UNIT_MIN_CHARS and shorter in longer:
             return True
     return False
+
+
+def _unit_heading_markdown(
+    unit: Any,
+    plan: Any,
+    content_type: ContentType,
+    long_form_mode: LongFormMode,
+) -> str:
+    """TEXT 出力でユニット冒頭に置く見出し行を返す (不要なら空文字列、純粋関数)。
+
+    本文プロンプト (``TEXT_UNIT_SYSTEM``) はモデルに見出し行の出力を禁じている
+    ため、計画側の見出しをここで前置きしないと TEXT 出力に見出しが一切現れない。
+
+    付けない条件:
+      - CODE 生成 (見出しはコードに無関係)
+      - SPLIT モード (ユニットごとに別ファイルへ書くため呼出側が構成する)
+      - 単一セクションの計画 — 「春について 200 字で」のような短い依頼にまで
+        表題が付いて冗長になる。章立てとして意味を持つのは複数セクション時のみ
+      - 分割された続きユニット (``sub_index > 0``) — 同一セクションの継続なので
+        見出しを繰り返さない (``_CONTINUATION_SYSTEM_NOTE`` と整合)
+    """
+    if content_type != ContentType.TEXT:
+        return ""
+    if long_form_mode == LongFormMode.SPLIT:
+        return ""
+    if not isinstance(unit, SectionPlan):
+        return ""
+    if getattr(unit, "sub_index", 0) > 0:
+        return ""
+    sections = [u for u in getattr(plan, "units", []) if isinstance(u, SectionPlan)]
+    if len(sections) < 2:
+        return ""
+    # planner が "## 見出し" 形式で返すこともあるため先頭の # と空白を落とす。
+    heading = (unit.heading or "").lstrip("#").strip()
+    if not heading:
+        return ""
+    return f"## {heading}\n\n"
 
 
 def _chunk_evenly(items: list[str], n: int) -> list[list[str]]:

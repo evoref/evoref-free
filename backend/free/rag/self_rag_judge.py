@@ -118,8 +118,24 @@ QUESTION_PATTERNS_EN = re.compile(
 # 「この会話で」等のセッション自己参照は、会話履歴が既にコンテキストに
 # 含まれておりカートリッジ/LTM 横断検索の対象ではないため skip する
 # (pillar境界のため backend/free/agent/tool_call_judge.py の
-# _SELF_SESSION_REFERENCE_PATTERNS と同義の定義を重複させている。両ファイルを
-# 変更する際は同期させること)。
+# _SELF_SESSION_REFERENCE_PATTERNS と同趣旨の定義を重複させている。片方だけ
+# 直すと挙動がずれるので、変更時は必ず両方を確認すること。ただし **語彙を
+# 同一にしてはいけない** — 理由は直下参照)。
+#
+# ── 語彙が同一でない理由 (2026-07-27 実測) ─────────────────────
+# 2 つの消費側はマッチ時の効果も誤検出コストも異なる:
+#   tool_call_judge: search_history を現在セッションへ限定するだけ → 誤検出は軽微
+#   self_rag_judge : RAG 検索を丸ごと skip する → 誤検出で外部知識が引けなくなる
+# そのため「会話への言及 + 語」で拾える語のうち、**話題ポインタとしても使われる
+# 語** は self_rag 側では採らない。この会話で〈話した/聞いた/質問した/指摘された〉X
+# について詳しく教えて、のように「会話は X の指し示しに使い、欲しいのは外部知識」
+# という形が自然に成立するため。
+#   採用: 順序 / 列挙 / 並べ / 訂正 / 直した / 思い出   (誤爆 0)
+#   不採用: 順番 / 質問 / 指摘 / 言った / 話した / 聞いた (EXT 質問を誤って skip)
+# 実測 (自己参照 8 件 + 外部知識 9 件のプローブ):
+#   全語同期    → SELF 捕捉 8/8 だが EXT 誤爆 4/9
+#   上記の採用のみ → SELF 捕捉 8/8 / EXT 誤爆 0/9
+# 英語側も同じ理由で ``asked`` を採らない (採ると EXT 誤爆 1/4 → 3/4)。
 # 実インシデント: 「この会話で一番面白かったやり取りは？」が31文字で
 # QUESTION_PATTERNS の長文分岐(>=30char)にマッチし retrieve に倒れ、
 # 無関係な過去セッションのチャンクがヒットして混同された。
@@ -142,6 +158,13 @@ QUESTION_PATTERNS_EN = re.compile(
 # (2026-07-21: 「この会話で一番最初に計算させた問題は?」が反省語を欠き
 # 非マッチ → retrieve に倒れ cross-session チャンク混同のリスク)。順序語で
 # マッチ面が広がる分「じゃなく/ではなく」の話題切断も lookahead へ追加。
+#: 順序語 (最初/最後) が「会話の発話単位」を指していると判断するための共起語。
+#: 『議論された物』(引数・リリース等) を修飾しているだけのケースと区別する。
+_JA_SPEECH_UNIT = (
+    r"言っ|聞い|話し|尋ね|質問|発言|やり取り|回答|答え|返答"
+    r"|計算させ|書かせ|作らせ|指示|依頼|お願い"
+)
+
 TRIVIAL_QUESTION_PATTERNS = re.compile(
     r"(今.{0,3}(何時|何分|時刻|時間)"
     r"|今日.{0,3}(何月|何日|何曜)"
@@ -164,7 +187,19 @@ TRIVIAL_QUESTION_PATTERNS = re.compile(
     r"(?!とは別|とは関係|は関係な|じゃなく|ではなく)"
     r"[^。．!！?？\n]{0,40}?"
     r"(?:面白|印象|振り返|まとめ|要約|感想|どう思|覚えて|何でした|どうでした"
-    r"|最初|最後|何番目|何回目))",
+    # 2026-07-27 追加。順序・列挙・自己訂正を尋ねる自己参照を拾う。
+    # tool_call_judge 側にある 順番 / 質問 / 指摘 / 言った / 話した / 聞いた は
+    # **意図的に採らない** (下のコメント「語彙が同一でない理由」参照)。
+    r"|順序|列挙|並べ|訂正|直した|思い出"
+    # 順序語 (最初/最後) は発話単位を指す語との近接共起を要求する。単独で
+    # 採ると「この会話で触れた関数の**最初の引数**の意味を詳しく教えて」
+    # 「この会話で扱ったフレームワークの**最後のメジャーリリース**はいつ」の
+    # ように、順序語が『議論された物』を修飾しているだけの外部知識質問まで
+    # RAG を skip する (2026-07-27 実測: 誤爆 2/5)。共起要求で 0/5 になり、
+    # 自己参照の捕捉は落ちない。何番目/何回目 は物を修飾しないので単独可。
+    rf"|(?:最初|最後)[^。．!！?？\n]{{0,20}}?(?:{_JA_SPEECH_UNIT})"
+    rf"|(?:{_JA_SPEECH_UNIT})[^。．!！?？\n]{{0,20}}?(?:最初|最後)"
+    r"|何番目|何回目))",
 )
 
 # TRIVIAL_QUESTION_PATTERNS の英語版。
@@ -177,6 +212,20 @@ TRIVIAL_QUESTION_PATTERNS = re.compile(
 # 一致で誤って skip される (2026-07-22 監査で判明)。セッション自己参照の
 # 複合パターン (2/3 行目) は元々 40 文字の近接窓 + 否定先読みで十分に
 # 絞り込まれているため対象外。
+#: ``_JA_SPEECH_UNIT`` の英語版と、それを使った順序語サブパターン。
+#: 活用形の取りこぼしを避けるため動詞は語幹 + ``\w*`` で書く。過去形だけを
+#: 並べると "what did we discuss first?" (原形) を落とす (テストで検出)。
+_EN_SPEECH_UNIT = (
+    r"thing|things|message|messages|question|questions|topic|topics"
+    r"|point|points|say|said|says|ask\w*|tell|told|telling"
+    r"|mention\w*|discuss\w*|talk\w*|repl(?:y|ies|ied|ying)"
+    r"|answer\w*|correct\w*"
+)
+_EN_ORDINAL_WITH_SPEECH = (
+    rf"(?:first|last|earliest|latest)[^.!?\n]{{0,24}}?(?:{_EN_SPEECH_UNIT})"
+    rf"|(?:{_EN_SPEECH_UNIT})[^.!?\n]{{0,24}}?(?:first|last|earliest|latest)"
+)
+
 TRIVIAL_QUESTION_PATTERNS_EN = re.compile(
     r"(^\s*(?:what\s+time\s+is\s+it"
     r"|what'?s?\s+(?:today'?s?\s+date|the\s+date)"
@@ -196,9 +245,18 @@ TRIVIAL_QUESTION_PATTERNS_EN = re.compile(
     r"[^.!?\n]{0,40}?"
     r"(?:interesting|memorable|impressive|funn(?:y|iest)"
     r"|summar\w*|recap\w*|think|thought|feel|felt|remember"
-    r"|first|last|earliest|latest)"
+    # 2026-07-27 追加。tool_call_judge 側にある asked は **意図的に採らない**
+    # (下のコメント「語彙が同一でない理由」参照)。
+    r"|order|sequence|enumerate"
+    # 順序語は発話単位を指す語との近接共起を要求する (JA 側と同じ理由)。
+    # 単独で採ると "what is the **latest version**?" / "the **last stable
+    # release**" / "what does the **first argument** do?" のように、順序語が
+    # 『議論された物』を修飾しているだけの外部知識質問まで RAG を skip する
+    # (2026-07-27 実測: 誤爆 4/6 → 共起要求で 0/6、自己参照の捕捉は不変)。
+    rf"|{_EN_ORDINAL_WITH_SPEECH})"
     r"|(?:interesting|memorable|impressive|funn(?:y|iest)"
-    r"|summar\w*|recap\w*|first|last|earliest|latest)"
+    r"|summar\w*|recap\w*|order|sequence|enumerate"
+    rf"|{_EN_ORDINAL_WITH_SPEECH})"
     r"[^.!?\n]{0,40}?"
     r"(?:this\s+conversation|this\s+chat|our\s+conversation))",
     re.IGNORECASE,

@@ -210,6 +210,20 @@ RICH_DOC_CONTENT_INSTRUCTION = (
 # plan 後のパス脱落補完 (_normalize_planned_paths) で使用する。
 _EXPLICIT_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'「」()（）]+")
 
+# assist がパラメータ名をそのまま値として返したときに現れる「パスもどき」。
+# ディレクトリ成分も拡張子も持たず、意味のあるファイル名ではない。
+_PLACEHOLDER_WRITE_PATH_NAMES: frozenset[str] = frozenset({
+    "file_path", "filepath", "file", "filename", "file_name", "fname",
+    "path", "output", "output_file", "output_path", "outfile",
+    "target", "target_file", "dest", "destination",
+})
+
+
+def _is_placeholder_write_path(file_path: str) -> bool:
+    """``file_path`` が引数名プレースホルダそのものか判定する (純粋関数)。"""
+    token = file_path.strip().strip("<>{}[]\"'`　 ").lower()
+    return token in _PLACEHOLDER_WRITE_PATH_NAMES
+
 # 実データを取得するツール。これらの生結果をタスク横断で蓄積し、後続の
 # write タスクが取得済みデータを直接参照できるようにする (転記ハルシネーション防止)。
 _DATA_BEARING_TOOLS: frozenset[str] = frozenset({
@@ -1545,18 +1559,39 @@ class MetaCognitiveAgent:
     def _resolve_write_path(file_path: str, query: str) -> str:
         """write_file の出力先を確定する。
 
+        - 引数名プレースホルダ (``file_path`` / ``<path>`` 等) → クエリ中の
+          明示パスへ差し替える
         - 既存ディレクトリ指定 (例: C:\\...\\aa) → ``output_<UTC><ext>``
           (write_file はディレクトリをエラーにするため、書込み前にファイル名へ)
         - ディレクトリ成分の無い bare ファイル名で、クエリが出力ディレクトリを
           指定している場合 → そのディレクトリ配下へ寄せる (planner が CWD 相対の
           名前を発明したとき、ユーザー指定の場所へ揃える)
         """
+        from backend.free.agent.tool_call_judge import _extract_file_path
+
+        if _is_placeholder_write_path(file_path):
+            # 小型 assist はパラメータ名をそのまま値として返すことがある
+            # (実インシデント 2026-07-28 ライブ検証:
+            # `{"tool": "write_file", "args": {"file_path": "file_path", ...}}`
+            # がそのまま実行され、リポジトリ直下に `file_path` という名前の
+            # ファイルが作られた)。クエリに明示パスがあればそこへ寄せる。
+            qpath = _extract_file_path(query)
+            if qpath:
+                logger.warning(
+                    "Write path placeholder %r replaced with query path %s",
+                    file_path, qpath,
+                )
+                return qpath
+            logger.warning(
+                "Write path is a parameter-name placeholder (%r) and the query "
+                "has no explicit path; falling through to normal resolution",
+                file_path,
+            )
         resolved = resolve_dir_output_path(file_path, query)
         if resolved != file_path:
             return resolved
         p = Path(file_path)
         if str(p.parent) in ("", "."):  # ディレクトリ成分の無い bare ファイル名
-            from backend.free.agent.tool_call_judge import _extract_file_path
             qpath = _extract_file_path(query)
             if qpath and ("\\" in qpath or "/" in qpath):
                 qp = Path(qpath)
@@ -1764,7 +1799,7 @@ class MetaCognitiveAgent:
             original_query, task.description, llm_client,
             file_path=file_path,
         )
-        content, rejection = self._validate_generated_content(content, file_path)
+        content, rejection = self._validate_generated_content(content, file_path, original_query)
         if rejection and not content.startswith("(Content generation failed:"):
             logger.warning(
                 "Tool-loop write: generated content rejected (%s), "
@@ -1775,7 +1810,7 @@ class MetaCognitiveAgent:
                 original_query, task.description, llm_client,
                 file_path=file_path,
             )
-            content, rejection = self._validate_generated_content(content, file_path)
+            content, rejection = self._validate_generated_content(content, file_path, original_query)
         if content.startswith("(Content generation failed:"):
             logger.warning(
                 "Skipping write_file due to content generation failure: %s",
@@ -2137,7 +2172,7 @@ class MetaCognitiveAgent:
             original_query, task.description, llm_client,
             file_path=file_path,
         )
-        content, rejection = self._validate_generated_content(content, file_path)
+        content, rejection = self._validate_generated_content(content, file_path, original_query)
 
         if rejection and not content.startswith("(Content generation failed:"):
             logger.warning(
@@ -2149,7 +2184,7 @@ class MetaCognitiveAgent:
                 original_query, task.description, llm_client,
                 file_path=file_path,
             )
-            content, rejection = self._validate_generated_content(content, file_path)
+            content, rejection = self._validate_generated_content(content, file_path, original_query)
 
         if content.startswith("(Content generation failed:"):
             logger.warning("Write fast path: content generation failed for %s", file_path)
@@ -2185,13 +2220,16 @@ class MetaCognitiveAgent:
 
     @staticmethod
     def _validate_generated_content(
-        content: str, file_path: str,
+        content: str, file_path: str, instruction: str = "",
     ) -> tuple[str, str | None]:
         """生成コンテンツを scaffold 除去してから書込み適性を検証する。
 
         「タスクログ + 本文」の連結は本文だけに救済し、本文が残らない
-        エコー (task_log_echo / prompt_echo / path_only / csv_without_rows)
-        は棄却理由を返して呼出側で再生成・中断させる。
+        エコー (task_log_echo / prompt_echo / instruction_echo / path_only /
+        csv_without_rows) は棄却理由を返して呼出側で再生成・中断させる。
+
+        ``instruction`` (元のユーザー依頼文) を渡すと、依頼文の逐語コピーを
+        本文として書き込む退化も棄却できる。
         """
         if content.startswith("(Content generation failed:"):
             return content, "generation_failed"
@@ -2209,7 +2247,7 @@ class MetaCognitiveAgent:
                 "content (%d -> %d chars)", len(content), len(stripped),
             )
             content = stripped
-        return content, generated_content_rejection(content, file_path)
+        return content, generated_content_rejection(content, file_path, instruction)
 
     async def _write_file(
         self,
@@ -2343,7 +2381,7 @@ class MetaCognitiveAgent:
                     logger.warning("Auto-recovery content generation failed: %s", file_path)
                     return None
 
-            content, rejection = self._validate_generated_content(content, file_path)
+            content, rejection = self._validate_generated_content(content, file_path, original_query)
             if rejection:
                 logger.warning(
                     "Auto-recovery: generated content rejected (%s), aborting: %r",
@@ -2544,10 +2582,19 @@ class MetaCognitiveAgent:
         )
         existing_tokens = _estimate_tokens(existing_content)
         if base_tokens + existing_tokens < ctx_size // 2:
+            # 差し替え規則は既存内容ブロックの「後」に置く。前に置くと 9B base が
+            # 従わず、古い項目の括弧書きだけが残った (2026-07-28 実測)。
             user_prompt += (
                 f"\n\n## 既存ファイル内容 ({file_path})\n"
-                f"以下の既存コードを含め、タスクの内容を統合した完全なファイルを出力してください。\n"
-                f"```\n{existing_content}\n```"
+                f"以下の既存内容を含め、タスクの内容を統合した完全なファイルを出力してください。\n"
+                f"```\n{existing_content}\n```\n"
+                f"差し替え規則: ある項目を別の項目に置き換えるときは、行を丸ごと"
+                f"書き直すこと。古い項目に付いていた補足 (括弧書き・単位・説明) を"
+                f"新しい項目に流用してはいけない。新しい項目に合う補足を書くか、"
+                f"補足なしにする。\n"
+                f"例: 「水筒（500ml〜1L）」を「ヘッドランプ」に差し替える → "
+                f"「ヘッドランプ（予備電池も）」または「ヘッドランプ」。"
+                f"「ヘッドランプ（500ml〜1L）」は誤り。"
             )
         else:
             logger.info(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
@@ -102,6 +103,29 @@ _CALCULATE_RESULT_GUIDANCE = (
     "計算の根拠として述べないこと。実際に評価されたのは上記の式だけである。"
 )
 
+# 引用したユーザー発言に一人称が含まれるかの判定 (帰属注記の出し分け用)。
+_FIRST_PERSON_RE = re.compile(r"(?:私|僕|俺|自分|わたし|ぼく)")
+
+# run_command / run_command_readonly 専用のグラウンディング。calculate と同じく
+# 出力は裸の値で、「何を求めたコマンドか」の情報を持たない。汎用枠だけを付けると
+# base は出力を「基準値 (= 現在時刻)」と読み、質問された演算をもう一度適用する
+# (実インシデント 2026-07-28:「今日から100日後は何月何日ですか。」で
+# `date.today() + timedelta(days=100)` が 2026-11-05 を正しく返したのに、
+# 回答は「2026 年 11 月 5 日から 100 日後は、2027 年 2 月 13 日です」となった)。
+# コマンドを併記したうえで、出力は既に求められた値であることを明示する。
+_COMMAND_TOOLS = frozenset({"run_command", "run_command_readonly"})
+_COMMAND_RESULT_GUIDANCE = (
+    "上記の ## ツール実行結果 は、システムが実際に実行したコマンドとその標準出力である。"
+    "出力はコマンドが計算し終えた**結果そのもの**であり、途中経過や基準値ではない。"
+    "コマンドに日数の加算・差分・書式変換が含まれている場合、その計算は既に済んでいるので、"
+    "同じ演算を出力に対してもう一度適用しないこと。"
+    "数値・日付はこの出力をそのまま使い、暗算で作り直さないこと。"
+    "「実行できない」「取得できない」とは言わないこと。"
+    "出力に無い数値・事実は創作しないこと。"
+    "回答本文では「ツール実行結果」「コマンド」等の内部的な言い回しを使わず、"
+    "自分で調べて分かったこととして自然に述べること。"
+)
+
 # 生成系ツール (draft_document / summarize / translate) 専用のグラウンディング。
 # これらの結果は外部から取得した事実データではなく LLM が書いた下書きなので、
 # 「唯一の事実根拠」枠を付けると、下書きが混入させた誤りが会話で既に確定した
@@ -154,6 +178,17 @@ def _emit_tool_running_step(
     })
 
 
+# step frame の detail に載せるツール結果の最大長。
+_STEP_DETAIL_MAX_CHARS = 100
+
+
+def _truncate_for_step(text: str) -> str:
+    """step frame 表示用に切り詰める。切った場合は省略記号と全長を付ける。"""
+    if len(text) <= _STEP_DETAIL_MAX_CHARS:
+        return text
+    return f"{text[:_STEP_DETAIL_MAX_CHARS]}... ({len(text)} chars)"
+
+
 def _emit_tool_result_step(
     on_step: StepCallback, tool_name: str, result_text: str,
 ) -> None:
@@ -165,6 +200,12 @@ def _emit_tool_result_step(
     UI が Traceback を ✓ で表示していた (実測 2026-07-25: 存在しない
     ``platform.cpu_count`` を呼んだ合成コマンドが ✓ 表示)。
     学習シグナル (``tool_command_success``) と同じ判定を使って揃える。
+
+    detail は 100 文字で切るが、切ったことを明示する。無告知で切ると UI 上は
+    語の途中でぶつ切りになり、応答の数値がツール出力に含まれていたのか
+    捏造なのかを人間が判別できない (実測 2026-07-27: "Cores: 24 Di" で切れて
+    直後の "Disk: 443 GB total, 138 GB free" が隠れ、正しくグラウンドされた
+    回答が捏造に見えた)。step_compactor._compress_generic と同じ体裁に揃える。
     """
     if on_step is None:
         return
@@ -178,7 +219,7 @@ def _emit_tool_result_step(
     )
     on_step({
         "type": "task_result",
-        "detail": f"{tool_name}: {result_text[:100]}",
+        "detail": f"{tool_name}: {_truncate_for_step(result_text)}",
         "status": "failed" if failed else "done",
     })
 
@@ -279,21 +320,40 @@ class DeliberativeAgent:
         テンプレートで 400 エラーになるため、必ず user に統合する。
         """
         truncated = _truncate_tool_result(tool_result_text, TOOL_RESULT_MAX_CHARS)
-        expression = ""
-        if tool_name == "calculate" and isinstance(tool_args, dict):
-            expression = str(tool_args.get("expression") or "").strip()
-        if expression:
-            # 裸の数値だけでは何を計算したかが base に伝わらず、単位と根拠の
-            # 捏造を招く (_CALCULATE_RESULT_GUIDANCE 参照)。式を併記する。
-            truncated = f"{expression} = {truncated}"
+        args = tool_args if isinstance(tool_args, dict) else {}
+        if tool_name == "calculate":
+            expression = str(args.get("expression") or "").strip()
+            if expression:
+                # 裸の数値だけでは何を計算したかが base に伝わらず、単位と根拠の
+                # 捏造を招く (_CALCULATE_RESULT_GUIDANCE 参照)。式を併記する。
+                truncated = f"{expression} = {truncated}"
+        elif tool_name in _COMMAND_TOOLS:
+            executed = str(args.get("command") or "").strip()
+            if executed:
+                # 裸の出力だけでは何を求めたコマンドか base に伝わらず、
+                # 出力を基準値と読んで演算を二重適用する
+                # (_COMMAND_RESULT_GUIDANCE 参照)。コマンドを併記する。
+                truncated = f"$ {executed}\n{truncated}"
         # 話題再フォーカス: 弱いモデルは前ターンの話題に引きずられ、今回の質問
         # (例: ニュース) を取り違える (実機確認: 前ターンが天気だとニュース質問に
         # 天気で誤答)。今回の質問を明示して前話題を無視させる。
         refocus = ""
         if query:
             q = query if len(query) <= 200 else query[:200] + "…"
+            # 引用文の一人称をそのまま自分のものとして繰り返す事故がある
+            # (実インシデント 2026-07-28:「私の誕生日は3月14日です。今日から
+            # 誕生日まであと何日ですか。」に対し「私の誕生日は 3 月 14 日で、
+            # 今日からあと 229 日です。」と、アシスタント自身の誕生日として
+            # 回答した)。一人称を含むときだけ帰属を明示する。
+            person_note = (
+                "引用文中の一人称 (私 / 僕 / 自分) はユーザーを指す。"
+                "回答では一人称を使わず、必ず二人称で述べること "
+                "(誤:「私の誕生日は3月14日です」/ "
+                "正:「小川さんの誕生日は3月14日ですね」「あなたの誕生日は…」)。"
+                if _FIRST_PERSON_RE.search(q) else ""
+            )
             refocus = (
-                f"今回ユーザーが答えてほしい質問は『{q}』である。"
+                f"今回ユーザーが答えてほしい質問は『{q}』である。{person_note}"
                 f"会話履歴の前の話題は無関係なので無視し、この質問にのみ答えること。\n"
             )
         if tool_name == "search_history" and tool_result_text == _NO_RELEVANT_INFO_MESSAGE:
@@ -307,6 +367,8 @@ class DeliberativeAgent:
             grounding = _SEARCH_HISTORY_RESULT_GUIDANCE
         elif tool_name == "calculate":
             grounding = _CALCULATE_RESULT_GUIDANCE
+        elif tool_name in _COMMAND_TOOLS:
+            grounding = _COMMAND_RESULT_GUIDANCE
         elif tool_name in _GENERATED_DRAFT_TOOLS:
             grounding = _GENERATED_DRAFT_GUIDANCE
         else:
@@ -741,7 +803,7 @@ class DeliberativeAgent:
                     "status": "failed",
                 })
             return
-        rejection = generated_content_rejection(content, file_path)
+        rejection = generated_content_rejection(content, file_path, query)
         if rejection:
             logger.warning(
                 "Deliberative: generated content rejected (%s); skipping "
