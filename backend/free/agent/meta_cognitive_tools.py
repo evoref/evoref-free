@@ -5,7 +5,9 @@ from __future__ import annotations
 import re
 
 from backend.free.agent.meta_cognitive_utils import looks_like_path_not_content
+from backend.free.agent.safety_patterns import strip_command_literals
 from backend.log_config import get_logger
+from backend.free.core.intent_vocab import WRITE_VERB_RE
 
 logger = get_logger("agent.meta_cognitive.tools")
 
@@ -15,12 +17,9 @@ logger = get_logger("agent.meta_cognitive.tools")
 # ---------------------------------------------------------------------------
 
 _TOOL_PATTERNS: list[tuple[re.Pattern, str]] = [
-    # write_file: 作成・修正系
-    (re.compile(
-        r"作成|追加|実装|修正|変更|書き込|生成|更新|書く|書いて"
-        r"|create|write|add|implement|modify|update|generate|fix|refactor",
-        re.IGNORECASE,
-    ), "write_file"),
+    # write_file: 作成・修正系 (語彙は core.intent_vocab が SSOT。
+    # meta_cognitive_tasks の書込み期待判定と同一定義を持っていた)
+    (WRITE_VERB_RE, "write_file"),
     # read_file: 読み取り系
     (re.compile(
         r"読み|読んで|確認|正し[いく]|合って|内容|表示|中身|見せて|見て"
@@ -55,17 +54,21 @@ def infer_tool_from_task(
     """
     from backend.free.agent.tool_call_judge import _extract_file_path
 
+    # バッククォート内コマンドの引数パスは読み書きの対象ではない。パス抽出は
+    # コマンドを除いた本文に対して行う (コマンド抽出は生の description を見る)。
+    path_source = strip_command_literals(description)
+
     for pattern, tool_name in _TOOL_PATTERNS:
         if not pattern.search(description):
             continue
 
         if tool_name == "write_file":
-            file_path = _extract_file_path(description)
+            file_path = _extract_file_path(path_source)
             if file_path:
                 return ("write_file", {"file_path": file_path})
 
         elif tool_name == "read_file":
-            file_path = _extract_file_path(description)
+            file_path = _extract_file_path(path_source)
             if file_path:
                 return ("read_file", {"file_path": file_path})
 

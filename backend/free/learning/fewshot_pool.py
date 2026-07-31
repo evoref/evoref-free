@@ -30,6 +30,8 @@ from backend.free.agent.prompt_utils import (
 )
 from backend.free.core.session_mode import is_valid_session_mode, normalize_session_mode
 from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
+from backend.free.learning.response_arithmetic import find_arithmetic_contradictions
+from backend.free.llm.json_schemas import FewShotQualityJudgement
 from backend.free.memory.types import make_fact
 from backend.log_config import get_logger
 
@@ -52,6 +54,28 @@ DEFAULT_DIVERSITY_THRESHOLD = 0.8  # コサイン類似度の上限（これ以�
 # 係数を変えたらこの 2 定数も更新する。
 _FITNESS_LO = -1.9
 _FITNESS_HI = 1.7
+
+#: quality_score が付いている例で、fitness と品質採点を混ぜる比率。
+#:
+#: fitness は「会話が正常終了したセッションに属するか」がほぼ唯一の判別項で、
+#: 実データ 447 件では 89% が 2 値 (0.5278 / 0.8056) に潰れる。採用閾値 0.7 を
+#: 超える 150 件のうち 145 件が同点で、順位付けの情報が事実上ない。品質採点は
+#: この同点を割るために入れるので、fitness と同等の重みを与える。
+_QUALITY_WEIGHT = 0.5
+
+
+def _effective_fitness(example: FewShotExample) -> float:
+    """順位付けに使う実効スコア (純粋関数)。
+
+    ``quality_score`` 未採点 (assist 未接続 / 採点前) では従来どおり
+    ``fitness`` そのものを返すため、degraded mode でも挙動は変わらない。
+    """
+    if example.quality_score is None:
+        return example.fitness
+    return (
+        (1.0 - _QUALITY_WEIGHT) * example.fitness
+        + _QUALITY_WEIGHT * example.quality_score
+    )
 
 # select_top_k のスコア合成: query 適合を主項に fitness を従に。
 _TOPK_SIM_WEIGHT = 0.7
@@ -90,6 +114,46 @@ def _response_is_task_log_only(response: str) -> bool:
     if not lines:
         return False
     return all(_TASK_LOG_LINE_RE.match(ln) for ln in lines)
+
+
+# 内部足場の語彙。システムプロンプトの PROTECTED は
+# 「[関連する記憶]・[参考情報]・ツール実行結果が『有ったか / 無かったか』自体を
+# 話題にしない」「ご提示いただいた結果 等の内部的な言い回しを使わない」と定めて
+# いるが、これを破った応答が few-shot の正例として保存されると、以後その言い回しを
+# 手本として再生産してしまう (2026-07-28 実測: chat プール 50 件中 3 件が
+# 「ご提示いただいたツール実行結果には…」「メモが参考情報として提供されています」
+# 型で、いずれも fitness 0.806 の正例だった)。採用時点で弾く。
+_INTERNAL_SCAFFOLD_RE = re.compile(
+    r"ご提示いただいた"
+    r"|参考情報として提供"
+    r"|参考情報には(?:記載|情報)"
+    r"|ツール実行結果に(?:は|も)"
+    r"|会話履歴を確認したところ",
+)
+
+
+def _response_leaks_internal_scaffold(response: str) -> bool:
+    """応答が内部足場の語彙をそのまま含むかを判定する (純粋関数)。"""
+    return bool(_INTERNAL_SCAFFOLD_RE.search(response))
+
+
+#: few-shot 品質採点のシステムプロンプト。
+#:
+#: 問いは「正しいか」ではなく **「手本として提示したとき挙動が良くなるか」**。
+#: few-shot の目的に直結させることで、正しいが一般化できない例 (その場限りの
+#: 固有値回答等) も相対的に下がる。算術の正誤は決定論側が担当するため、ここでは
+#: 検算を求めない (求めても小型モデルは実行できず、誤答に満点を付ける)。
+#: JSON が壊れた応答から採点値を拾う救済用 (先頭の数値)。
+_BARE_SCORE_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+_QUALITY_SYSTEM_PROMPT = (
+    "あなたは few-shot 手本の品質評価者です。"
+    "提示された Q/A ペアを、他の質問に答えるときの手本としてモデルに見せた場合、"
+    "モデルの振る舞いが良くなるかを 0.0〜1.0 で評価してください。"
+    "評価軸: (1) 質問に正面から答えているか (2) 手本として一般化できるか "
+    "(3) 内部的な言い回しや進捗ノートが混ざっていないか。"
+    "その場限りの固有値だけを述べた回答や、質問と噛み合っていない回答は低く評価してください。"
+)
 
 # SemMem 書き戻し時の subject prefix
 # ``harness.fewshot.*`` から ``learn.fewshot.*`` に移行済。owner は EvorefLearn。
@@ -439,6 +503,119 @@ class FewShotPool(JsonStateStore):
         """指定モードの候補数"""
         return len(self._pools.get(mode, []))
 
+    async def score_pending_quality(
+        self,
+        assist_client,
+        *,
+        limit: int = 20,
+    ) -> int:
+        """未採点の例にアシストで品質スコアを付ける (増分)。
+
+        **拒否権は持たない**。付いたスコアは ``_effective_fitness`` の重みとして
+        順位付け (select_top_k / eviction) にのみ効く。内容の正誤判定を
+        アシストに委ねてはいけないため (実測 2026-07-31: 稼働 assist は
+        「42.195 ÷ 1.609 ≈ 26.195」に満点を付けた)、算術の検証は採用時点の
+        ``response_arithmetic`` が決定論で行う。
+
+        ``assist_client`` が ``None`` (degraded mode) なら何もしない。採点済みの
+        例は再採点しないので、呼び出しごとのコストは新規分だけに比例する。
+
+        Args:
+            limit: 1 回の呼び出しで採点する最大件数 (sleep-time の予算制御)。
+
+        Returns:
+            採点した件数。
+        """
+        if assist_client is None:
+            logger.debug("fewshot quality scoring skipped: assist_client is None")
+            return 0
+
+        pending = [
+            (mode, ex)
+            for mode, pool in self._pools.items()
+            for ex in pool
+            if ex.quality_score is None
+        ][:limit]
+        if not pending:
+            return 0
+
+        scored = 0
+        for mode, ex in pending:
+            score = await self._score_one_quality(assist_client, ex)
+            if score is None:
+                continue
+            ex.quality_score = score
+            scored += 1
+
+        if scored:
+            logger.info(
+                "Fewshot quality scoring: %d examples scored (%d pending left)",
+                scored, sum(
+                    1 for pool in self._pools.values()
+                    for e in pool if e.quality_score is None
+                ),
+            )
+            dl = self._debug_logger
+            if dl:
+                dl.log_learning_cycle(cycle_num=0, data={
+                    "component": "fewshot_pool",
+                    "op": "score_pending_quality",
+                    "scored": scored,
+                })
+        return scored
+
+    async def _score_one_quality(
+        self, assist_client, example: FewShotExample,
+    ) -> float | None:
+        """1 例をアシストで採点する。失敗時は ``None`` (未採点のまま残す)。"""
+        try:
+            result = await assist_client.generate(
+                messages=[
+                    {"role": "system", "content": _QUALITY_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Q: {example.query[:600]}\n"
+                            f"A: {example.response[:900]}"
+                        ),
+                    },
+                ],
+                max_tokens=768,
+                temperature=0.1,
+                purpose="fewshot_quality_score",
+                response_schema=FewShotQualityJudgement,
+            )
+        except Exception as exc:  # noqa: BLE001 - 採点失敗は未採点で継続する
+            logger.warning("fewshot quality scoring failed: %r", exc)
+            return None
+
+        from backend.free.llm.json_extract import extract_json_object
+        from backend.free.llm.utils import extract_content
+
+        content = extract_content(result)
+        parsed = extract_json_object(content)
+        if isinstance(parsed, dict):
+            raw = parsed.get("score")
+        else:
+            # response_format を強制しきれないモデルは「評価: 0.4 評価理由: …」の
+            # ような散文を返す。裸の数値から拾う (sleep-time キュレーターの
+            # coerce_bare_score と同じ救済。pillar 境界 (learn → mem 配下の
+            # _curator_common) を越えられないため最小実装を持つ)。
+            m = _BARE_SCORE_RE.search(content or "")
+            raw = m.group(0) if m else None
+        if raw is None:
+            logger.debug(
+                "fewshot quality scoring: unparseable response: %s", content[:120],
+            )
+            return None
+        try:
+            score = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not 0.0 <= score <= 1.0:
+            return None
+        return score
+
     def get_pool(self, mode: str) -> list[FewShotExample]:
         """指定モードのプール全体を返す"""
         return list(self._pools.get(mode, []))
@@ -494,7 +671,7 @@ class FewShotPool(JsonStateStore):
         # プールサイズ制限: SemMem 書き戻しモードでは GC を SemMem 側
         # (semmem_limits.policy + gc_strategy=lowest_score) に委譲し局所 GC を停止。
         if len(pool) > self.pool_size and not self.is_semmem_writeback_active():
-            pool.sort(key=lambda e: e.fitness)
+            pool.sort(key=_effective_fitness)
             removed = pool.pop(0)
             self._bigram_cache.pop(removed.id, None)
             seen.discard(self._content_hash(removed.query, removed.response))
@@ -541,6 +718,23 @@ class FewShotPool(JsonStateStore):
             # (2026-07-15: この形式の例が毎ターン選択され本文なしの極小
             # ファイル生成を誘発した)。
             if _response_is_task_log_only(response):
+                continue
+
+            # 内部足場の語彙を含む応答は PROTECTED 違反の実例なので手本にしない
+            if _response_leaks_internal_scaffold(response):
+                continue
+
+            # 計算が合わない応答は手本にしない。fitness は「会話が正常終了した
+            # セッションに属するか」しか見ておらず内容の正しさを測らないため、
+            # 誤答が最高位の正例として常駐していた (実データで 4 件確認)。
+            # アシスト採点では捕まらない (小型モデルは自分が検算できない算術を
+            # 「正確」と評価する) ので、ここは決定論で拒否する。
+            contradictions = find_arithmetic_contradictions(response)
+            if contradictions:
+                logger.info(
+                    "Rejecting fewshot candidate with arithmetic contradiction: "
+                    "%s | query=%s", contradictions[0], query[:50],
+                )
                 continue
 
             example = FewShotExample(
@@ -692,15 +886,16 @@ class FewShotPool(JsonStateStore):
         q = (query or "").strip()
         if not pool or not q:
             return []
-        # fitness 上位 cap 件に足切り (全件 cosine を避ける)
+        # 実効スコア上位 cap 件に足切り (全件 cosine を避ける)
         if len(pool) > _TOPK_SELECT_CAP:
-            pool = sorted(pool, key=lambda e: -e.fitness)[:_TOPK_SELECT_CAP]
+            pool = sorted(pool, key=lambda e: -_effective_fitness(e))[:_TOPK_SELECT_CAP]
         q_bg = _char_bigrams(q)  # query bi-gram は 1 回だけ計算
         scored: list[tuple[float, float, FewShotExample]] = []
         for ex in pool:
             sim = _cosine_similarity(q_bg, self._get_bigrams(ex))
             combined = (
-                _TOPK_SIM_WEIGHT * sim + (1.0 - _TOPK_SIM_WEIGHT) * ex.fitness
+                _TOPK_SIM_WEIGHT * sim
+                + (1.0 - _TOPK_SIM_WEIGHT) * _effective_fitness(ex)
             )
             scored.append((combined, sim, ex))
         scored.sort(key=lambda t: -t[0])
@@ -846,7 +1041,7 @@ class FewShotPool(JsonStateStore):
         for mode, pool in self._pools.items():
             if len(pool) <= self.pool_size:
                 continue
-            pool.sort(key=lambda e: e.fitness)
+            pool.sort(key=_effective_fitness)
             excess = len(pool) - self.pool_size
             seen = self._seen_hashes.setdefault(mode, set())
             for _ in range(excess):

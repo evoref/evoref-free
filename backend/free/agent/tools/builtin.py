@@ -34,7 +34,13 @@ _last_full_output: str = ""
 _last_full_output_lines: int = 0
 
 # 出力切り詰めマーカー / exit code マーカー（共通定数モジュールから import）
-from backend.free.constants import COMMAND_EXIT_CODE_PREFIX, TRUNCATION_MARKER
+from backend.free.constants import (
+    COMMAND_EXIT_CODE_PREFIX,
+    TRUNCATION_MARKER,
+)
+from backend.free.constants import (
+    SEARCH_HISTORY_NO_RESULTS_PREFIX as _SEARCH_HISTORY_NO_RESULTS_PREFIX,
+)
 
 # read_file / search_code が読み込むファイルの上限サイズ。models/ (GGUF, 数十GB) 等の
 # 巨大バイナリを誤って text として全文読み込みすると、CPython の GIL が長時間手放されず
@@ -1190,9 +1196,9 @@ def _make_run_command_readonly(config: dict):
 
 
 # search_history が 1 件もヒットしなかったときの戻り値プレフィックス。
-# 呼出側 (deliberative の digest スキップ / frontend の表示整形) が空振りを
-# 判定するために参照するため、文字列を直書きせず本定数を経由する。
-SEARCH_HISTORY_NO_RESULTS_PREFIX = "No results found for: "
+# 実体は共通定数モジュール (成否判定側と emit 側で同じ文字列を共有するため)。
+# 既存の import 経路を保つためここから再エクスポートする。
+SEARCH_HISTORY_NO_RESULTS_PREFIX = _SEARCH_HISTORY_NO_RESULTS_PREFIX
 
 
 def _make_search_history(manager: HistoryManager):

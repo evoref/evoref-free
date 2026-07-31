@@ -14,6 +14,10 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from backend.free.core.intent_vocab import (
+    EXPLICIT_WINDOWS_PATH_RE,
+    REFERENTIAL_WRITE_TARGET_RE,
+)
 from backend.free.core.locale_patterns import select_locale_variant
 from backend.free.core.session_mode import is_coding_mode
 from backend.free.learning.level0_instant import (
@@ -112,6 +116,84 @@ _CODING_FAILURE_REPORT_EXCLUDE_RE_EN = re.compile(
     re.IGNORECASE,
 )
 
+# ── 訂正の帰属判定 ────────────────────────────────────────────────
+#
+# CORRECTION_PATTERNS が拾う「訂正」は 3 種類あり、**アシスタントが誤った**
+# ことを意味するのは一部だけ。にもかかわらず ``user_correction`` は fitness で
+# 最大の減点 (-0.8) を受け、cvector の negative を駆動していた。
+#
+# 実データ 447 件中の訂正 24 件を目視分類した内訳:
+#   assistant     5 件 (21%) — 「その計算は違います」「単位を取り違えていませんか」
+#   self         11 件 (46%) — 「すみません、火曜ではなく水曜の間違いでした」
+#                              (アシスタントの応答は正しい)
+#   not_correction 8 件 (33%) — 「3 番目を差し替えて、同じファイルに保存し直して」
+#                              (単なる編集依頼)、「訂正後の距離を挙げて」(質問)
+#
+# つまり **79% が誤ったペナルティ** だった。下記の判別で assistant のみを
+# ``user_correction`` として扱う。判別不能は従来どおり assistant に倒す
+# (保守的側。ルールが効かなければ現行挙動のまま)。
+
+#: 「訂正」を目的語として問う質問。訂正そのものではない。
+_ASKS_ABOUT_CORRECTION_RE = re.compile(
+    r"訂正(?:した|後の|前の)[^。！？\n]{0,20}?(?:答え|挙げ|教え|列挙|示し)",
+)
+
+#: 出力形式・言語の変更依頼。内容の誤りを指していない。
+_REFORMAT_REQUEST_RE = re.compile(
+    r"同じ内容を.{0,10}(?:日本語|英語|中国語)で"
+    r"|(?:日本語|英語)で(?:説明し直|書き直|言い直)",
+)
+
+#: ユーザー自身の申告訂正。謝罪 / 自己の過去発言への言及 + 事実の言い換え。
+_SELF_CORRECTION_RE = re.compile(
+    r"(?:すみません|すいません|ごめん|失礼しました)[、,。\s]*"
+    r".{0,30}?(?:ではなく|じゃなく|の間違い|間違えました)"
+    r"|(?:先ほど|さっき|前に)\s*[「『]?.{0,20}?[」』]?\s*と(?:言|申)"
+    r"|^訂正です"
+    r"|あ[、,]?\s*間違えました"
+    r"|実はこれは",
+)
+
+#: アシスタントの出力を指す参照。これがあれば自己訂正ではない。
+_ASSISTANT_OUTPUT_REF_RE = re.compile(
+    r"その(?:計算|答え|回答|結果|数字|値)"
+    r"|(?:最後|最初)の.{0,6}(?:行|文|項目).{0,10}(?:なって|です)"
+    r"|取り違え|間違っていませんか|違います|誤りです"
+    r"|のはずです|ではありませんか|ませんでしたか"
+    r"|(?:計算|回答|答え)しましたよね",
+)
+
+
+def classify_correction_target(query: str) -> str:
+    """訂正候補の帰属を返す: ``assistant`` / ``self`` / ``not_correction``。
+
+    純粋関数。``assistant`` のみが「直前のアシスタント応答が誤っていた」を
+    意味する。判別できないものは ``assistant`` に倒す (現行挙動を維持)。
+    """
+    # アシスタント出力への言及が最優先。「すみません、その計算は違います」の
+    # ように謝罪語と併存しうるため、自己訂正判定より先に見る。
+    if _ASSISTANT_OUTPUT_REF_RE.search(query):
+        return "assistant"
+    if _SELF_CORRECTION_RE.search(query):
+        return "self"
+    if _ASKS_ABOUT_CORRECTION_RE.search(query):
+        return "not_correction"
+    if _REFORMAT_REQUEST_RE.search(query):
+        return "not_correction"
+    # 既存ファイルへの再保存を伴う依頼は編集であって訂正ではない。
+    # 「3 番目を『ヘッドランプ』に直して、同じファイルに保存し直して」の
+    # 「直して」が CORRECTION_PATTERNS に掛かるのを打ち消す。
+    #
+    # ただし内容への異議 (「プログラムではなくて文書が欲しいです」) を伴う場合は
+    # 除外しない。編集依頼の体裁でも中身は訂正であり、除外すると本物の訂正を
+    # 取りこぼす (既存テスト test_same_target_weak_pattern_detected の実例)。
+    if REFERENTIAL_WRITE_TARGET_RE.search(query) and not any(
+        p.search(query) for p in WEAK_CORRECTION_PATTERNS
+    ):
+        return "not_correction"
+    return "assistant"
+
+
 # 弱い訂正パターン: 単独では新規依頼との区別がつかないため、直前ターンの
 # 失敗または同一成果物 (同じ出力先パス) の再指定を伴う場合のみ訂正とみなす。
 WEAK_CORRECTION_PATTERNS = [
@@ -129,8 +211,9 @@ WEAK_CORRECTION_PATTERNS_EN = [
 _FAILED_MARKER_RE = re.compile(r"(?:^|\n)\s*-\s*\[failed\]", re.IGNORECASE)
 _DONE_MARKER_RE = re.compile(r"(?:^|\n)\s*-\s*\[done\]", re.IGNORECASE)
 
-# クエリ中の明示的な出力先パス (同一成果物の再指定検出用)
-_QUERY_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'「」()（）]+")
+# クエリ中の明示的な出力先パス (同一成果物の再指定検出用)。
+# 定義は core.intent_vocab が SSOT (agent.meta_cognitive が同一定義を持っていた)。
+_QUERY_PATH_RE = EXPLICIT_WINDOWS_PATH_RE
 
 # 言い換えパターン（同じ質問の言い直し検出用）
 REPHRASE_THRESHOLD = 0.5  # 類似度閾値
@@ -491,7 +574,34 @@ class FeedbackCollector:
     def _detect_correction(
         self, query: str, *, mode: str = "chat",
     ) -> tuple[str | None, str | None]:
-        """ユーザーの訂正パターンを検出（多段: ハードコード / 直前失敗 /
+        """ユーザーの訂正のうち **アシスタントの誤りに対するもの** を検出する。
+
+        字句一致で拾った候補 (``hardcoded`` / ``same_target``) は
+        ``classify_correction_target`` で帰属を判定し、ユーザー自身の申告訂正
+        (「すみません、火曜ではなく水曜でした」) と編集依頼・質問を除外する。
+        除外しないと、正しく応答したターンが失敗として学習される (実データでは
+        訂正 24 件のうち 19 件が該当した)。
+
+        直前ターンが実際に失敗している場合 (``_prev_turn_failed``) は、字句に
+        依らない独立した証拠があるため帰属判定を通さない。書込みが失敗した直後の
+        「同じファイルに保存し直して」は編集依頼の体裁でも本物の訂正である。
+        """
+        raw, detected_by = self._detect_correction_lexical(query, mode=mode)
+        if raw is None or self._prev_turn_failed:
+            return raw, detected_by
+        target = classify_correction_target(query)
+        if target != "assistant":
+            logger.debug(
+                "Correction candidate reclassified as %s (not an assistant "
+                "error); dropping: %s", target, query[:60],
+            )
+            return None, None
+        return raw, detected_by
+
+    def _detect_correction_lexical(
+        self, query: str, *, mode: str = "chat",
+    ) -> tuple[str | None, str | None]:
+        """訂正候補の字句検出（多段: ハードコード / 直前失敗 /
         同一成果物 + 弱パターン）
 
         旧・層2 (学習済み correction パターン照合) は 2026-07-21 に廃止した。

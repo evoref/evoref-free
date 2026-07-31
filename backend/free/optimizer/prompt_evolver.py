@@ -13,6 +13,8 @@ import numpy as np
 # 保護セクション検証・重複排除は agent.prompt_utils (EvorefLoop
 # pillar の純粋 util) に集約済。Learn pillar 側はここから top-level import する。
 from backend.free.agent.prompt_utils import (
+    PROTECTED_CLOSE,
+    PROTECTED_OPEN,
     dedupe_paragraphs,
     extract_protected_sections,
     restore_protected_sections,
@@ -195,6 +197,7 @@ class PromptEvolver:
 
         成功率ベースのスコアリング:
         - conversation_ended=True → 成功（ユーザーが満足して離脱）
+        - turn_outcome="failed" → 失敗（出力が壊れていたターンの SSOT）
         - rephrased_query=True → 失敗（ユーザーが言い直した）
         - user_correction is not None → 失敗（ユーザーが訂正した）
         - long_form_used かつ long_form_success=False → 失敗（生成物が検証エラー）
@@ -224,6 +227,18 @@ class PromptEvolver:
                 score += weight * 1.0
 
             # 失敗シグナル
+            # turn_outcome は「このターンの出力が壊れていたか」の SSOT
+            # ([failed] マーカー / step_credits / オウム返し検出等から導出) だが、
+            # fitness はこれを一切見ておらず、壊れた応答を生むプロンプトが
+            # 無罰点のまま採用され続けていた (2026-07-28 調査: 経験 334 件のうち
+            # turn_outcome=failed が 4 件あるのに fitness の入力は 0 件)。
+            # critique_synthesizer / fewshot_pool は既に turn_outcome を見て
+            # いるので、Level 1 の選択圧だけが取り残されていた形。
+            # user_correction とは独立に導出されるため二重計上ではない
+            # (両方立つターンは実際に二重に悪い)。
+            if signals.get("turn_outcome") == "failed":
+                score -= weight * 0.8
+
             if signals.get("rephrased_query", False):
                 score -= weight * 0.5
 
@@ -327,8 +342,10 @@ class PromptEvolver:
 
         # 保護セクションがある場合は LLM にも指示
         has_protected = bool(extract_protected_sections(current))
+        # マーカー文字列は prompt_utils を唯一の出所とする (ここへ literal で
+        # 書き写すと、マーカー記法を変えたとき LLM への指示だけが古いまま残る)。
         protected_instruction = (
-            "\n\nIMPORTANT: Sections enclosed in <!-- PROTECTED --> ... <!-- /PROTECTED --> "
+            f"\n\nIMPORTANT: Sections enclosed in {PROTECTED_OPEN} ... {PROTECTED_CLOSE} "
             "markers MUST be preserved exactly as-is. Do not modify, remove, or rewrite "
             "their content or the markers themselves."
         ) if has_protected else ""

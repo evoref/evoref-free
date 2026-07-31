@@ -148,7 +148,7 @@
     "startup_config_ok": "config.yaml — OK",
     "startup_config_missing": "config.yaml が見つかりません: {path}",
     "startup_config_invalid": "config.yaml の構文エラー: {detail}",
-"startup_local_paths_ok": "ローカルディレクトリ — OK",
+    "startup_local_paths_ok": "ローカルディレクトリ — OK",
     "startup_dir_created": "ディレクトリを自動作成しました: {path}",
     "startup_dir_create_failed": "ディレクトリの作成に失敗しました: {path}",
     "startup_model_paths_ok": "モデルパス — OK",
@@ -476,6 +476,9 @@
       "invalid_response": "外部APIから不正なレスポンスを受信しました。",
       "api_key_missing": "APIキーが設定されていません。環境変数 {env_var} を設定してください。",
       "disabled": "ウィジェットプロキシが無効になっています。config.yaml で widget_proxy.enabled を true に設定してください。"
+    },
+    "chat": {
+      "stream_failed": "応答の生成に失敗しました。推論サーバーが停止しているか、応答が途中で切断された可能性があります。しばらく待って再試行してください。"
     }
   },
   "warning": {

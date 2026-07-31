@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from backend.free.agent.meta_cognitive_utils import is_tool_error
 from backend.log_config import get_logger
+from backend.free.core.intent_vocab import WRITE_VERB_RE
 
 if TYPE_CHECKING:
     from backend.free.agent.credit_assigner import StepCredit
@@ -57,12 +58,10 @@ class MetaCognitiveResponse:
 # タスク状態判定
 # ---------------------------------------------------------------------------
 
-# 書き込み期待パターン（日本語・英語）
-_WRITE_PATTERN = re.compile(
-    r"作成|追加|実装|修正|変更|書き込|生成|更新|書く|書いて"
-    r"|create|write|add|implement|modify|update|generate|fix|refactor",
-    re.IGNORECASE,
-)
+# 書き込み期待パターン（日本語・英語）。
+# 定義は core.intent_vocab が SSOT (meta_cognitive_tools の write_file
+# ルーティングが同一定義を持っていた)。
+_WRITE_PATTERN = WRITE_VERB_RE
 
 
 def task_expects_write(description: str) -> bool:

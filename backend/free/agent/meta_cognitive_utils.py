@@ -9,7 +9,11 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterator
 
-from backend.free.constants import COMMAND_EXIT_CODE_PREFIX
+from backend.free.constants import (
+    COMMAND_EXIT_CODE_PREFIX,
+    SEARCH_HISTORY_NO_RESULTS_PREFIX,
+)
+from backend.free.core.prompt_blocks import CURRENT_DATETIME_LABEL
 from backend.i18n_helper import prose_language_name
 from backend.log_config import get_logger
 
@@ -60,6 +64,53 @@ def command_run_failed(text: str) -> bool:
     されないため、呼出側は ``run_command`` のときだけ参照すること。
     """
     return COMMAND_EXIT_CODE_PREFIX in text
+
+
+#: 「ツールは正常終了したが結果が 0 件」を示すツール別の先頭マーカー。
+#: 新しいツールで空振り表現を足すときはここへ登録する (判定側は触らない)。
+_TOOL_EMPTY_RESULT_PREFIXES: dict[str, tuple[str, ...]] = {
+    "search_history": (SEARCH_HISTORY_NO_RESULTS_PREFIX,),
+}
+
+#: 結果本文のマーカーで「走ったプログラム自身の失敗」を判定するツール。
+_EXIT_CODE_TOOLS = frozenset({"run_command", "run_command_readonly"})
+
+
+def tool_result_lacks_information(tool_name: str | None, text: str) -> bool:
+    """ツールは正常終了したが結果が情報ゼロ (空振り) かを判定する。"""
+    prefixes = _TOOL_EMPTY_RESULT_PREFIXES.get(tool_name or "")
+    if not prefixes:
+        return False
+    return text.startswith(prefixes)
+
+
+def tool_result_succeeded(tool_name: str | None, text: str) -> bool:
+    """ツール実行が「役に立つ結果を返した」かを判定する (学習シグナルの SSOT)。
+
+    ``is_tool_error`` (``Error:`` プレフィックス) は **ツールラッパ自身が例外を
+    出したか** しか見ない。「実行できた」と「役に立った」は別物で、後者でない
+    ものを成功として扱うと Level 0/1 の選択圧が反転する:
+
+    - ``run_command`` が非ゼロ終了 → 実行はできたがコマンドは失敗
+      (``command_run_failed``)
+    - ``search_history`` が 0 件 → 実行はできたが情報は得られていない
+      (実インシデント 2026-07-29 ライブ監査: 直近の会話で答えられる質問に
+      ``search_history`` が発火し 0 件で終わったターンが ``reward=1.0`` /
+      ``outcome=success`` で記録され、「空振りするルーティング」が正例として
+      強化されていた)
+
+    ``run_command`` の exit code 判定だけが deliberative 側にローカル実装され、
+    meta_cognitive 側には無いという非対称もここへ集約して解消する。
+
+    Args:
+        tool_name: 実行したツール名 (不明なら None)。
+        text: ツールの戻り値文字列。
+    """
+    if is_tool_error(text):
+        return False
+    if tool_name in _EXIT_CODE_TOOLS and command_run_failed(text):
+        return False
+    return not tool_result_lacks_information(tool_name, text)
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +202,12 @@ _HEADING_PATH_RE = re.compile(
 _LITERAL_WRITE_CONTENT_RE = re.compile(
     r"[「『]([^「」『』]{1,2000})[」』]"
     r"\s*(?:と\s*(?:いう)?\s*(?:内容|文言|テキスト|文字列)?\s*(?:で|を)?|を)?\s*"
+    # 限定の副助詞。「『…』とだけ書いて」「『…』のみを保存して」は本文が
+    # 確定している最も典型的な言い方なのに、これが無いと literal 抽出が
+    # 外れて小型モデルの再生成に倒れる (実インシデント 2026-07-29 ライブ監査:
+    # 「…に「監査テスト 1行目」とだけ書いて保存してください。」でファイルに
+    # 「タスクの内容: ファイル `…` に「監査テスト 1行目」と…」が書かれた)。
+    r"(?:(?:だけ|のみ)\s*(?:を|で)?\s*)?"
     r"(?:そのまま\s*)?"
     r"(?:保存|書き込|書き出|書いて|出力)",
 )
@@ -160,6 +217,21 @@ _LITERAL_WRITE_REJECT_RE = re.compile(
 )
 #: literal 書き込みを許可する拡張子 (リッチ文書は構造化生成が必要なので対象外)
 _LITERAL_WRITE_EXTENSIONS = frozenset({"", ".txt", ".md", ".log"})
+#: 「1行目は alpha、2行目は beta、3行目は gamma です」型の行指定。引用符を
+#: 使わずに本文を確定させる言い方で、引用符ベースの literal 抽出では拾えない
+#: (実インシデント 2026-07-29 ライブ監査: この依頼が生成経路に落ち、生成物が
+#: task_restatement として 2 回とも棄却されて書き込み自体が起きなかった)。
+_ENUMERATED_LINE_RE = re.compile(
+    r"(?:(\d{1,3})\s*行目|line\s*(\d{1,3}))\s*(?:は|が|:|：)\s*"
+    r"(.+?)"
+    r"\s*(?:です|だ|である)?"
+    # 末尾に続く書込み指示 (「… と書き込んで」) は本文ではないので食わせる。
+    r"\s*(?:[とを]\s*(?:書き込|書いて|書き出|保存|出力)\S*)?"
+    r"\s*(?=[、,。\n]|$)",
+    re.IGNORECASE,
+)
+#: 行本文を包む引用符 (抽出後に剥がす)
+_ENUMERATED_LINE_QUOTES = ("「」", "『』", '""', "''", "``")
 
 
 def extract_literal_write_content(query: str, file_path: str) -> str:
@@ -183,9 +255,48 @@ def extract_literal_write_content(query: str, file_path: str) -> str:
     if _LITERAL_WRITE_REJECT_RE.search(query):
         return ""
     match = _LITERAL_WRITE_CONTENT_RE.search(query)
-    if not match:
+    if match:
+        return match.group(1).strip()
+    return extract_enumerated_line_content(query)
+
+
+def extract_enumerated_line_content(query: str) -> str:
+    """「1行目は alpha、2行目は beta、3行目は gamma です」型の本文を組み立てる。
+
+    引用符を使わずに行ごとの本文を確定させる言い方。引用符ベースの literal
+    抽出では拾えず、生成経路に落ちて棄却される (実インシデント 2026-07-29
+    ライブ監査: 「1行目は alpha、2行目は beta、3行目は gamma です」の依頼で
+    生成物が 2 回とも ``task_restatement`` 判定になり、書き込みが一度も
+    実行されないまま「(書き込みが実行されませんでした)」で終わった)。
+
+    行番号が 1 から連番で欠けなく揃っている場合のみ採用する。部分的な言及
+    (「3行目を直して」等) を本文全体と誤認しないための決定論ガード。
+
+    Returns:
+        改行連結した本文。組み立てられなければ空文字列 (純粋関数)。
+    """
+    found: dict[int, str] = {}
+    for m in _ENUMERATED_LINE_RE.finditer(query):
+        index = int(m.group(1) or m.group(2))
+        value = _strip_enclosing_quotes(m.group(3).strip())
+        if not value or len(value) > 500:
+            return ""
+        if index in found:
+            return ""
+        found[index] = value
+    if len(found) < 2:
         return ""
-    return match.group(1).strip()
+    if sorted(found) != list(range(1, len(found) + 1)):
+        return ""
+    return "\n".join(found[i] for i in range(1, len(found) + 1))
+
+
+def _strip_enclosing_quotes(text: str) -> str:
+    """本文を包む引用符を 1 組だけ剥がす (純粋関数)。"""
+    for pair in _ENUMERATED_LINE_QUOTES:
+        if len(text) >= 2 and text[0] == pair[0] and text[-1] == pair[-1]:
+            return text[1:-1].strip()
+    return text
 
 
 def strip_leading_narration_headings(content: str) -> str:
@@ -481,9 +592,25 @@ _TASK_LOG_LINE_RE = re.compile(
 #: 生成プロンプトの内部 scaffold マーカー。成果物に現れたら「プロンプトの
 #: エコー」であり本文生成に失敗している (例: relocation_notice.txt に
 #: 「[現在日時 (UTC基準)] ...」とタスク英文がそのまま書き込まれた事例)。
+#: 生成プロンプトが本文へ差し込むブロック見出し。**emit 側と検出側で同じ
+#: 定数を使う**こと。片方だけに文字列を直書きすると、新しいブロックを足した
+#: ときに検出漏れが生まれる (実インシデント 2026-07-29 ライブ監査: 翻訳結果の
+#: 保存で ``## 取得済みデータ (前ステップで取得した実データ) / 以下のデータ
+#: のみを根拠に…`` がそのままファイルへ書き込まれた。既存ファイル内容ブロック
+#: だけがマーカー登録されており、取得済みデータブロックは素通りだった)。
+EXISTING_CONTENT_BLOCK_HEADING = "## 既存ファイル内容"
+FETCHED_DATA_BLOCK_HEADING = "## 取得済みデータ (前ステップで取得した実データ)"
+FETCHED_DATA_BLOCK_NOTE = (
+    "以下のデータのみを根拠に出力を生成し、データに無い情報は創作しないこと。"
+)
+
 _PROMPT_SCAFFOLD_MARKERS: tuple[str, ...] = (
-    "[現在日時 (UTC基準)]",
-    "## 既存ファイル内容 (",
+    # ラベルは emit 側 (core.prompt_blocks) を唯一の出所とする。ここへ literal で
+    # 書き写すと、出す側の文言を変えた瞬間に検出が黙って空振りする。
+    CURRENT_DATETIME_LABEL,
+    f"{EXISTING_CONTENT_BLOCK_HEADING} (",
+    FETCHED_DATA_BLOCK_HEADING,
+    FETCHED_DATA_BLOCK_NOTE,
     "【元のコード】",
     "【修正指示】",
 )
@@ -491,8 +618,15 @@ _PROMPT_SCAFFOLD_MARKERS: tuple[str, ...] = (
 #: user_prompt の内部構造「タスク: <英語タスク文>」のエコー検出。planner の
 #: タスク文は英語動詞で始まるため、日本語文書中の一般語「タスク:」とは
 #: 区別できる。
+#: ラベルは日本語 (``タスク:``) だけでなく planner がそのまま出す英語
+#: (``Task:``) の形もある (実インシデント 2026-07-29 ライブ監査: 発明された
+#: ``document.txt`` に ``Task: Delete the 5th item from the document`` が
+#: 本文として書き込まれた)。動詞を要求する制約は残し、実文書中の一般語
+#: 「タスク:」との区別を保つ。
 _TASK_SCAFFOLD_LINE_RE = re.compile(
-    r"^タスク\s*[:：]\s*(?:Write|Generate|Create|List|Read|Fetch|Revise|Update)\b",
+    r"^(?:タスク|Task)\s*[:：]\s*"
+    r"(?:Write|Generate|Create|List|Read|Fetch|Revise|Update|Delete|Remove"
+    r"|Add|Append|Modify|Replace|Edit|Save|Output)\b",
     re.MULTILINE,
 )
 
@@ -534,6 +668,97 @@ def strip_prompt_scaffold_lines(content: str) -> str:
     return remainder or content
 
 
+#: 生成器に向けた指示文 (読者に向けた文書本文には現れない言い回し)。
+#: リテラルの scaffold マーカーは小型モデルが **言い換えて** 再生成すると
+#: 効かない (実インシデント 2026-07-29 ライブ監査: マーカー登録した
+#: ``## 取得済みデータ (…) / 以下のデータのみを根拠に…`` を塞いだ直後、
+#: 同じ書式を真似た ``## 保存済み翻訳データ (E:\\tmp\\audit_r6_ja.md) /
+#: 以下の翻訳済み内容のみを根拠に…`` が書き込まれた)。語ではなく
+#: 「生成器への指示である」という構造で拾う。
+_GENERATOR_DIRECTIVE_RE = re.compile(
+    r"(?:のみ|だけ)を根拠に.{0,24}(?:出力|生成)"
+    r"|(?:データ|情報|内容)に(?:無|な)い.{0,12}(?:創作|捏造)"
+    r"|(?:創作|捏造)しないこと",
+)
+
+
+def _heading_titles_output_path(line: str, file_path: str) -> bool:
+    """見出し行が出力先パス自身を名乗っているか (純粋関数)。
+
+    実文書が自分の保存先パスを見出しに書くことはまず無いので、これを
+    scaffold の signal として使える。
+    """
+    stripped = line.strip()
+    if not stripped.startswith("#"):
+        return False
+    basename = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+    return file_path in stripped or (bool(basename) and basename in stripped)
+
+
+def strip_generator_scaffold_block(content: str, file_path: str) -> str:
+    """先頭の「生成器向けブロック」(自己言及見出し + 指示文) を除去する。
+
+    出力先パスを名乗る見出しと、生成器に向けた指示文が続く限り読み飛ばす。
+    どちらでもない行に当たった時点で打ち切るので、実文書の見出しは残る。
+    全部消える場合は原文を返す (純粋関数)。
+    """
+    if not file_path:
+        return content
+    lines = content.split("\n")
+    idx = 0
+    stripped_any = False
+    while idx < len(lines):
+        line = lines[idx]
+        if not line.strip():
+            idx += 1
+            continue
+        if (
+            _heading_titles_output_path(line, file_path)
+            or _GENERATOR_DIRECTIVE_RE.search(line)
+        ):
+            idx += 1
+            stripped_any = True
+            continue
+        break
+    if not stripped_any:
+        return content
+    remainder = "\n".join(lines[idx:]).strip("\n")
+    return remainder or content
+
+
+def strip_output_lead_in(content: str, file_path: str) -> str:
+    """先頭の「<パス> の内容は以下の通りです。」型の前置き 1 行を除去する。
+
+    小型モデルは会話の癖でファイル本文に回答の前置きを付ける。既存の
+    ``strip_answer_framing`` は全体が鉤括弧 1 組で閉じている形しか剥がせず、
+    「前置き 1 行 + 空行 + 本文」の形は素通りしていた (実インシデント
+    2026-07-29 ライブ監査: audit_r5.md の 1 行目に
+    ``E:\\tmp\\audit_r5.md の内容は以下の通りです。`` が書き込まれた)。
+
+    前置き行が出力先パス (またはそのファイル名) を含むことを共起条件にする
+    ので、たまたま「以下の通りです。」で始まる正当な文書は巻き込まない。
+    残りが空になる場合は原文を返す (純粋関数)。
+    """
+    if not file_path:
+        return content
+    lines = content.split("\n")
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not _LEAD_IN_LINE_RE.match(stripped):
+            return content
+        basename = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+        mentions = file_path in stripped or (
+            bool(basename) and basename in stripped
+        )
+        if not mentions:
+            return content
+        remainder = "\n".join(lines[i + 1:]).strip("\n")
+        return remainder or content
+    return content
+
+
 def strip_task_log_scaffold(content: str) -> str:
     """先頭に混入したタスク進捗ノート行を取り除いた残りを返す。
 
@@ -554,6 +779,27 @@ def strip_task_log_scaffold(content: str) -> str:
     if idx == 0:
         return content
     return "\n".join(lines[idx:]).strip("\n")
+
+
+#: 進捗ノートの断片が行頭以外に現れる形。``_TASK_LOG_LINE_RE`` は行頭
+#: アンカーなので、ノート行と別のテキストが 1 行に連結されると素通りする
+#: (実インシデント 2026-07-29 ライブ監査: 改行を含む本文の書込み依頼で、
+#: 応答本文が ``行2 行3' to the file E:\\tmp\\audit_r9.txt / Read and display
+#: the contents of the file … Written 16 bytes to E:\\tmp\\audit_r9.txt``
+#: という内部タスク文の断片になった)。
+_TASK_LOG_FRAGMENT_RE = re.compile(
+    r"Written\s+\d+\s+bytes\s+to\s+\S"
+    r"|\[(?:done|failed|skipped)\]\s",
+)
+
+
+def looks_like_task_log_residue(text: str) -> bool:
+    """テキストが進捗ノートの残骸 (ユーザー向け本文ではない) かを判定する。
+
+    ``strip_task_log_scaffold`` で行単位に落とし切れなかった断片を拾う
+    (純粋関数)。
+    """
+    return bool(_TASK_LOG_FRAGMENT_RE.search(text))
 
 
 def fewshot_contains_task_log(fewshot_block: str) -> bool:
@@ -824,8 +1070,79 @@ _INSTRUCTION_ECHO_MAX_LEN_RATIO = 1.2
 _INSTRUCTION_ECHO_MIN_SIMILARITY = 0.9
 
 
+#: 「これから何をするか」を述べたメタラベルで始まる行 (成果物ではない)。
+#: 既存の ``_TASK_SCAFFOLD_LINE_RE`` は英語動詞 (``タスク: Write ...``) の形しか
+#: 見ておらず、日本語で依頼文を言い換えた形 (``タスクの内容: ファイル … に…``)
+#: は素通りしていた (実インシデント 2026-07-29 ライブ監査)。
+_TASK_RESTATEMENT_LABEL_RE = re.compile(
+    r"^\s*[*_`#\s]*(?:タスク|指示|依頼|命令|要求|Task|Instruction|Request)"
+    r"(?:の(?:内容|詳細))?\s*[:：]",
+)
+
+
+def looks_like_task_restatement(content: str, file_path: str) -> bool:
+    """content が依頼文の言い換え (成果物ではない) かを判定する。
+
+    冒頭がメタラベル (``タスク:`` / ``指示:``) で始まり、かつ本文が **出力先
+    パスそのもの** を含む場合だけ真とする。自分の保存先を本文に書く文書は
+    まず無いので、これを共起条件にすることで「タスク一覧」のような正当な
+    文書 (先頭行が「タスク:」で始まりうる) を巻き込まない (純粋関数)。
+    """
+    if not file_path:
+        return False
+    head = next(
+        (ln for ln in content.split("\n") if ln.strip()), "",
+    )
+    if not _TASK_RESTATEMENT_LABEL_RE.match(head):
+        return False
+    basename = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+    return file_path in content or (bool(basename) and basename in content)
+
+
+#: 既存内容の変更を求める依頼の動詞。
+_EDIT_REQUEST_RE = re.compile(
+    r"差し替え|差替え|置き換え|置換|入れ替え|変更|修正|直して|直す|更新"
+    r"|書き換え|書き直|追加|足して|加えて|削除|消して|除いて|外して"
+    r"|replace|update|change|modif|edit|rewrite|append|remove|delete",
+    re.IGNORECASE,
+)
+
+
+def _normalize_for_content_compare(text: str) -> str:
+    """行末空白と改行コードの差を無視した比較用の正規形 (純粋関数)。"""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return "\n".join(line.rstrip() for line in normalized.split("\n"))
+
+
+def edit_produced_no_change(
+    content: str, existing_content: str, instruction: str,
+) -> bool:
+    """既存内容の変更を頼まれたのに生成結果が既存と同一かを判定する。
+
+    小型モデルは既存内容ブロックを丸ごと写して編集指示を落とすことがある。
+    書込み自体は成功するのでバイト数も返り、ユーザーには「完了しました」と
+    表示されるが、ファイルは 1 文字も変わっていない (実インシデント
+    2026-07-29 ライブ監査: 「そのリストの3番目を「ヘッドランプ」に差し替えて、
+    同じファイルに保存し直してください。」で元のリストがそのまま書き戻され、
+    "Written 126 bytes" と「タスクを完了しました。」が返った)。
+
+    依頼文に変更を求める動詞があり、既存ファイルがあり、生成結果が既存と
+    同一のときだけ真 (純粋関数)。新規作成や「同じ内容で別名保存」型の依頼は
+    動詞が一致しないため巻き込まない。
+    """
+    if not existing_content or not instruction:
+        return False
+    if not _EDIT_REQUEST_RE.search(instruction):
+        return False
+    return (
+        _normalize_for_content_compare(content)
+        == _normalize_for_content_compare(existing_content)
+    )
+
+
 def generated_content_rejection(
     content: str, file_path: str, instruction: str = "",
+    existing_content: str = "",
 ) -> str | None:
     """write_file 直前の生成コンテンツ検証。棄却理由を返す (適正なら None)。
 
@@ -837,13 +1154,19 @@ def generated_content_rejection(
         content: 書込み予定の生成コンテンツ。
         file_path: 書込み先パス (拡張子別の検証に使う)。
         instruction: 元のユーザー依頼文。空なら依頼文エコー検証を行わない。
+        existing_content: 上書き対象の既存ファイル内容。空なら無変更検証を
+            行わない (新規作成)。
     """
+    if edit_produced_no_change(content, existing_content, instruction):
+        return "edit_without_change"
     if looks_like_path_not_content(content, file_path):
         return "path_only"
     if looks_like_task_log_echo(content):
         return "task_log_echo"
     if looks_like_write_report(content, file_path):
         return "write_report_echo"
+    if looks_like_task_restatement(content, file_path):
+        return "task_restatement"
     if looks_like_prompt_echo(content):
         return "prompt_echo"
     if looks_like_instruction_echo(content, instruction):

@@ -357,6 +357,25 @@ class UrlRelevanceJudgement(_StrictModel):
     reason: str = Field(max_length=200)
 
 
+# ── few-shot 手本の品質採点 (fewshot_quality_score) ──
+
+
+class FewShotQualityJudgement(_StrictModel):
+    """`backend/free/learning/fewshot_pool.py` の few-shot 手本 自己採点。
+
+    「この Q/A を手本として提示したときモデルの振る舞いが良くなるか」を 0..1 で
+    採点する。**採用可否の拒否権は持たない** (重み付けのみ) ため、
+    ``UrlRelevanceJudgement`` のような bool 判定フィールドは置かない。
+
+    拒否権を与えない理由は実測にある (2026-07-31): 稼働 assist (Qwen3.5-4B) は
+    「42.195 ÷ 1.609 ≈ 26.195」(正しくは 26.2244) に満点を付けた。算術の誤りは
+    ``response_arithmetic`` の決定論検算が担当し、本採点は定性面の順位付けに使う。
+    """
+
+    score: float = Field(ge=0.0, le=1.0)
+    reason: str = Field(max_length=200)
+
+
 # ── 実行可能クエリのコマンド合成 (executable_command_synth) ──
 
 class ExecutableCommandSynth(_StrictModel):
@@ -497,6 +516,7 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "cartridge_eval_generation": CartridgeEvalQAList,
     "url_relevance_score": UrlRelevanceJudgement,
     "rag_judge_relevance_score": UrlRelevanceJudgement,
+    "fewshot_quality_score": FewShotQualityJudgement,
     "editor_filename": EditorFilenameResult,
     "conflict_chat_judge": ChatConflictJudgement,
 }

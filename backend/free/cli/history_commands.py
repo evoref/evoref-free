@@ -24,6 +24,24 @@ _DEFAULT_BACKEND = "http://localhost:8000"
 _TIMEOUT = 30.0
 
 
+def http_error_detail(e: httpx.HTTPStatusError) -> str:
+    """エラー応答の ``detail`` を best-effort で取り出す (純粋関数)。
+
+    バックエンドは 4xx/5xx を ``{"detail": "..."}`` で返すが、プロキシ由来の
+    HTML やボディ無し応答もあり得るため、JSON として読めない場合は空文字列を
+    返す。全 API 呼出で同じ形の try/except を書き写していたのを 1 箇所に集約する。
+    """
+    try:
+        return str(e.response.json().get("detail", ""))
+    except Exception:  # noqa: BLE001 - 非 JSON 応答は想定内。詳細は捨ててよい
+        return ""
+
+
+def format_http_error(e: httpx.HTTPStatusError) -> str:
+    """``API error: <status> <detail>`` の 1 行を組み立てる。"""
+    return f"API error: {e.response.status_code} {http_error_detail(e)}".rstrip()
+
+
 # ── 内部実装関数 ──
 
 
@@ -51,12 +69,7 @@ def _history_list(
         render_error(console, msg("cli.backend_not_running"))
         return 1
     except httpx.HTTPStatusError as e:
-        detail = ""
-        try:
-            detail = e.response.json().get("detail", "")
-        except Exception:
-            pass
-        render_error(console, f"API error: {e.response.status_code} {detail}".rstrip())
+        render_error(console, format_http_error(e))
         return 1
 
     data = resp.json()
@@ -116,12 +129,7 @@ def _history_search(
         render_error(console, msg("cli.backend_not_running"))
         return 1
     except httpx.HTTPStatusError as e:
-        detail = ""
-        try:
-            detail = e.response.json().get("detail", "")
-        except Exception:
-            pass
-        render_error(console, f"API error: {e.response.status_code} {detail}".rstrip())
+        render_error(console, format_http_error(e))
         return 1
 
     results = resp.json().get("results", [])
@@ -165,12 +173,7 @@ def _history_show(backend_url: str, console, session_id: str) -> int:
         render_error(console, msg("cli.backend_not_running"))
         return 1
     except httpx.HTTPStatusError as e:
-        detail = ""
-        try:
-            detail = e.response.json().get("detail", "")
-        except Exception:
-            pass
-        render_error(console, f"API error: {e.response.status_code} {detail}".rstrip())
+        render_error(console, format_http_error(e))
         return 1
 
     s = resp.json()
@@ -214,12 +217,7 @@ def _history_stats(backend_url: str, console) -> int:
         render_error(console, msg("cli.backend_not_running"))
         return 1
     except httpx.HTTPStatusError as e:
-        detail = ""
-        try:
-            detail = e.response.json().get("detail", "")
-        except Exception:
-            pass
-        render_error(console, f"API error: {e.response.status_code} {detail}".rstrip())
+        render_error(console, format_http_error(e))
         return 1
 
     stats = resp.json()
@@ -250,12 +248,7 @@ def _history_compact(backend_url: str, console) -> int:
         render_error(console, msg("cli.backend_not_running"))
         return 1
     except httpx.HTTPStatusError as e:
-        detail = ""
-        try:
-            detail = e.response.json().get("detail", "")
-        except Exception:
-            pass
-        render_error(console, f"API error: {e.response.status_code} {detail}".rstrip())
+        render_error(console, format_http_error(e))
         return 1
 
     result = resp.json()
@@ -284,12 +277,7 @@ def _history_delete(backend_url: str, console, session_id: str) -> int:
         render_error(console, msg("cli.backend_not_running"))
         return 1
     except httpx.HTTPStatusError as e:
-        detail = ""
-        try:
-            detail = e.response.json().get("detail", "")
-        except Exception:
-            pass
-        render_error(console, f"API error: {e.response.status_code} {detail}".rstrip())
+        render_error(console, format_http_error(e))
         return 1
 
     render_info(console, msg("cli.history_deleted", session_id=session_id))
@@ -317,12 +305,7 @@ def _history_prune(backend_url: str, console, before: str) -> int:
         render_error(console, msg("cli.backend_not_running"))
         return 1
     except httpx.HTTPStatusError as e:
-        detail = ""
-        try:
-            detail = e.response.json().get("detail", "")
-        except Exception:
-            pass
-        render_error(console, f"API error: {e.response.status_code} {detail}".rstrip())
+        render_error(console, format_http_error(e))
         return 1
 
     sessions = resp.json().get("sessions", [])
@@ -346,7 +329,10 @@ def _history_prune(backend_url: str, console, before: str) -> int:
     except httpx.ConnectError:
         render_error(console, msg("cli.backend_not_running"))
         return 1
-    except Exception:
+    except Exception as e:
+        # ユーザーには件数 (failed=N) しか出ないため、原因はログに残す。
+        # 残さないと「消せなかった」だけが見えて事後に切り分けできない。
+        logger.warning("History prune request failed: %r", e)
         deleted = 0
         failed = len(session_ids)
 

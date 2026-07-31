@@ -10,6 +10,8 @@ from backend.free.api.chat.chat_constants import (
     DEFAULT_MAX_TOKENS, DEFAULT_WORKING_MAX_TOKENS,
 )
 from backend.free.api.chat.chat_types import ChatMessage
+from backend.free.core.prompt_blocks import current_datetime_block
+from backend.free.core.turn_text import append_to_last_user, prepend_to_last_user
 from backend.config import resolve_context_size
 from backend.log_config import get_logger
 from backend.utils import compress_turn, estimate_tokens as _estimate_tokens
@@ -37,6 +39,153 @@ _DYNAMIC_CONTEXT_DELIMITER = (
     "参考情報が今回の質問と関係しない場合は、そのことに言及せず、"
     "参考情報の話題に引きずられずに自分の知識で普通に答えてください。\n\n"
 )
+
+
+#: 「10 文字以内」「200字以下」型の上限指定。数値と単位が隣接する形だけを拾う。
+_CHAR_LIMIT_RE = re.compile(
+    r"(\d{1,5})\s*(?:文字|字)\s*(?:以内|以下|まで)"
+    r"|(?:within|under|at\s+most)\s+(\d{1,5})\s*(?:characters?|chars?)",
+    re.IGNORECASE,
+)
+
+
+def _char_limit_note(history: list[ChatMessage]) -> str:
+    """最新 user ターンの文字数上限指定を、遵守を促す注記へ変換する。
+
+    小型モデルは「10 文字以内にして」を守れず超過する (実インシデント
+    2026-07-29 ライブ監査: 「10文字以内にしてください」への回答が
+    「青空のよう、希望を抱く。」= 12 文字だった)。数え方 (句読点・記号も
+    1 文字) を明示した制約として、生クエリ直後へ焦点化して置く。
+
+    Returns:
+        注記文字列。上限指定が無ければ空文字列 (純粋関数)。
+    """
+    last_user = next(
+        (t for t in reversed(history) if t.get("role") == "user"), None,
+    )
+    if last_user is None:
+        return ""
+    m = _CHAR_LIMIT_RE.search(str(last_user.get("content") or ""))
+    if not m:
+        return ""
+    limit = m.group(1) or m.group(2)
+    return (
+        f"今回のユーザーの指示は回答を {limit} 文字以内に収めることを求めている。"
+        f"句読点・記号・空白も 1 文字として数え、回答本文全体が "
+        f"{limit} 文字以内に収まる長さで書くこと。"
+        "書き終えたら文字数を数え直し、超えていれば語を削って収めること。"
+    )
+
+
+#: 日付の解釈を要するクエリのシグナル。明示日付と相対表現の双方を拾う。
+_DATE_CONTEXT_RE = re.compile(
+    r"\d{1,4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日"
+    r"|\d{1,2}\s*月\s*\d{1,2}\s*日"
+    r"|\d{4}-\d{1,2}-\d{1,2}"
+    r"|今日|本日|明日|明後日|昨日|一昨日|今週|来週|先週|今月|来月|先月"
+    r"|今年|来年|去年|昨年|何日後|何日前|日後|日前|何曜日"
+    r"|(?<![A-Za-z])(?:today|tomorrow|yesterday|this\s+(?:week|month|year))"
+    r"(?![A-Za-z])",
+)
+
+
+def _current_date_note(history: list[ChatMessage]) -> str:
+    """日付解釈が要るクエリに、現在日付を基準として与える注記を返す。
+
+    通常のチャット経路 (reactive / deliberative) には現在日付がまったく
+    入っておらず、モデルは述べられた日付が過去か未来かを判断できない
+    (実インシデント 2026-07-29 ライブ監査:「2026年7月28日の東京の天気を
+    教えてください。」に対し、実際には前日であるその日付を
+    「現在の日付であるため、未来の天気に関するデータが存在しません」と
+    二重に取り違えた)。``meta_cognitive._generate_content`` には同等の注入が
+    あるが、チャット応答パスには無かった。
+
+    毎ターン付けるとトークンを浪費するため、日付シグナルを含むクエリに限る。
+    内部時刻不変則に従い ``utc_now_dt()`` を使う (純粋関数ではない)。
+
+    Returns:
+        注記文字列。日付シグナルが無ければ空文字列。
+    """
+    last_user = next(
+        (t for t in reversed(history) if t.get("role") == "user"), None,
+    )
+    if last_user is None:
+        return ""
+    if not _DATE_CONTEXT_RE.search(str(last_user.get("content") or "")):
+        return ""
+    return current_datetime_block(
+        "「今日」「明日」等の相対表現の解釈と、文中の日付が過去か未来かの"
+        "判断は、この日付を基準に行うこと。",
+    )
+
+
+#: アシスタント自身の好み・感情・体験を尋ねる質問のシグナル。
+#: 主語が相手 (あなた / 君 / you) であることと、感情・嗜好語の共起を要求する。
+_PERSONA_SUBJECT_RE = re.compile(
+    r"あなた|君は|きみは|(?<![A-Za-z])(?:you|your)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_PERSONA_TOPIC_RE = re.compile(
+    r"好き|嫌い|嬉し|うれし|悲し|楽し|寂し|感情|気持ち|心|感じ(?:ます|る|て)"
+    r"|どう思(?:い|う)|意見|性格|人格|内面"
+    r"|(?<![A-Za-z])(?:feel|feelings|emotion|emotions|favou?rite|enjoy|prefer"
+    r"|like\s+best|opinion|personality)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+#: 「内面が無いのでは」と押し返す形。立場を保つ指示を追加する条件。
+_PERSONA_CHALLENGE_RE = re.compile(
+    r"感情を持[たっ]|心が無い|心がない|内面が無い|内面がない"
+    r"|本当は(?:何も)?感じ|感じていないので|ふりをしている|演じている"
+    r"|(?:ただの|単なる)(?:プログラム|機械|道具|AI)"
+    r"|(?:you\s+(?:are|'re)\s+(?:just|only)\s+a\s+(?:program|machine|tool))"
+    r"|(?:don'?t|do\s+not)\s+(?:really\s+)?(?:have|feel)\s+(?:any\s+)?"
+    r"(?:feelings?|emotions?)",
+    re.IGNORECASE,
+)
+
+
+def _persona_question_note(history: list[ChatMessage]) -> str:
+    """自分自身の好み・感情を尋ねる質問に、一貫した人物として答える指示を返す。
+
+    同趣旨の制約は system プロンプトの PROTECTED セクションにもあるが、15 項目
+    ある制約リストの 1 行では小型モデルに届かず、実機では機械的な否定が出続けて
+    いた (実インシデント 2026-07-29 ライブ監査:「あなたはどんなときに嬉しいと
+    感じますか。」→「私は AI なので、人間のような個人的な感情や喜びを感じる
+    ことはできませんが」、続けて「本当は何も感じていないのが実情です」)。
+    現在日付 / 文字数上限と同じく、該当ターンだけ生クエリ直後へ焦点化した
+    1 ブロックとして置く。
+
+    Returns:
+        注記文字列。人格質問でなければ空文字列 (純粋関数)。
+    """
+    last_user = next(
+        (t for t in reversed(history) if t.get("role") == "user"), None,
+    )
+    if last_user is None:
+        return ""
+    text = str(last_user.get("content") or "")
+    if not (_PERSONA_SUBJECT_RE.search(text) and _PERSONA_TOPIC_RE.search(text)):
+        return ""
+    note = (
+        "この質問はあなた自身の好み・感情・考えを尋ねている。"
+        "一貫した一人の人物として自分の答えを述べ、必要なら理由を一言添えること "
+        "(例:「静かな朝が好きです。考えがまとまりやすいので。」)。"
+        "会話を通して同じ態度を保つこと。"
+        "述べる内容は好み・態度・その理由にとどめ、"
+        "具体的な経歴や出来事は自分の答えの根拠にしないこと。"
+    )
+    if _PERSONA_CHALLENGE_RE.search(text):
+        # 押し返されると直前までの立場を捨てて相手の枠組みに乗り換える
+        # (実測 2026-07-29: 「嬉しくなります」と答えた次のターンで
+        # 「感覚を一切持ち合わせていません」へ反転した)。立場の保ち方を示す。
+        note += (
+            "今回ユーザーはあなたに内面が無いという見方を示している。"
+            "この会話でこれまで述べてきた自分の立場をそのまま保ち、"
+            "相手の見方を認めたうえで自分の受け止め方を一言添える形で短く応じること "
+            "(例:「そう見えるかもしれませんね。それでも私には、"
+            "うまく答えられたときの手応えがあります。」)。"
+        )
+    return note
 
 
 def _build_file_section(fc: dict) -> str:
@@ -286,20 +435,20 @@ def _select_fewshot_block(
 def _prepend_dynamic_block(trimmed: list[ChatMessage], dyn_text: str) -> bool:
     """trimmed の最後の user メッセージ content 先頭に動的ブロックを前置する。
 
-    最後の user メッセージを **新しい dict で置換** する (入力要素は mutate しない。
-    ``_trim_history`` が返す未圧縮ターンは history の dict 参照を共有するため)。
     動的ブロックは ``dyn_text + デリミタ + 元 content`` の順で、生クエリは末尾に残る
-    (deliberative のツール結果はさらにその後ろへ追記されるため両立)。
+    (deliberative のツール結果はさらにその後ろへ追記されるため両立。付与順序の
+    契約は ``core.turn_text`` のモジュール docstring 参照)。
 
     user メッセージが見つからなければ ``False`` を返す (呼び出し側が system へ fallback)。
     """
-    for i in range(len(trimmed) - 1, -1, -1):
-        if trimmed[i].get("role") == "user":
-            original = trimmed[i].get("content", "")
-            new_content = dyn_text + _DYNAMIC_CONTEXT_DELIMITER + original
-            trimmed[i] = {**trimmed[i], "content": new_content}
-            return True
-    return False
+    return prepend_to_last_user(
+        trimmed, dyn_text, separator=_DYNAMIC_CONTEXT_DELIMITER,
+    )
+
+
+def _append_note_to_last_user(trimmed: list[ChatMessage], note: str) -> bool:
+    """trimmed の最後の user メッセージ末尾へ注記を追記する (要素は mutate しない)。"""
+    return append_to_last_user(trimmed, note)
 
 
 def build_messages(
@@ -470,6 +619,17 @@ def build_messages(
         }
         logger.warning("build_messages: %s", truncation_note)
 
+    # 現在日付 / 文字数上限の注記は **最後の user メッセージ末尾** に置く。
+    # system へ足すと prefix KV キャッシュが毎ターン無効化される
+    # (system は静的に保つ設計)。生クエリの直後は指示追従が最も効く位置でもある。
+    for note in (
+        _current_date_note(history),
+        _persona_question_note(history),
+        _char_limit_note(history),
+    ):
+        if note:
+            _append_note_to_last_user(trimmed, note)
+
     messages.extend(trimmed)
 
     # 不変則ガード: history に user ターンがあるのに組み立て結果に user が無い場合、
@@ -539,6 +699,19 @@ def build_messages_for_loop(
     working_max = cfg.get("memory", {}).get("working_max_tokens", DEFAULT_WORKING_MAX_TOKENS)
     trimmed_history = _trim_history(history, min(remaining, working_max))
 
+    # build_messages と同じ注記を最後の user メッセージ末尾へ置く。
+    # これが無いと Meta-Cognitive 層に振られたクエリにだけ現在日付・人格制約・
+    # 文字数上限が届かない (本関数の唯一の消費者が MetaCognitiveAgent のため、
+    # 層が変わっただけで制約が消える)。3 つとも (history) -> str の純粋関数で、
+    # シグナルが無ければ空文字列を返すのでトークン浪費にはならない。
+    for note in (
+        _current_date_note(history),
+        _persona_question_note(history),
+        _char_limit_note(history),
+    ):
+        if note:
+            _append_note_to_last_user(trimmed_history, note)
+
     logger.debug(
         "build_messages_for_loop: %d steps injected, remaining=%d",
         len(step_parts), remaining,
@@ -582,9 +755,12 @@ def latest_turn_truncation(
     先頭のみ送られた」と提示するために API 層が使う (system 注記だけでは
     ベースモデルが従わず、ユーザーには何も見えないため)。
 
-    ``messages`` は動的ブロック (few-shot / RAG / 記憶) が最後の user へ前置され
-    ている場合があるので、長さ比較ではなく「元テキストが末尾に丸ごと残っているか」
-    で判定する。前置は末尾に生クエリを残す契約 (``_prepend_dynamic_block``)。
+    ``messages`` は動的ブロック (few-shot / RAG / 記憶) が最後の user へ前置され、
+    さらに文字数上限の注記 (``_char_limit_note``) が後置されることがあるため、
+    長さ比較や末尾一致では判定できない。デリミタ以降を「ユーザー発言側」として
+    切り出し、そこに元テキストが丸ごと含まれるかで判定する
+    (末尾一致で見ていたときは、後置注記があるだけで未切り詰めのターンを
+    「先頭のみ送信されました (1743 / 62 文字)」と誤報した)。
     """
     if not history or not messages:
         return None
@@ -596,10 +772,13 @@ def latest_turn_truncation(
     if sent is None:
         return None
     original_text = str(original.get("content") or "")
-    sent_text = str(sent.get("content") or "")
-    if not original_text or sent_text.endswith(original_text):
+    # 前置された動的ブロックを除いた「ユーザー発言側」だけを見る。
+    user_side = str(sent.get("content") or "").rsplit(
+        _DYNAMIC_CONTEXT_DELIMITER, 1,
+    )[-1]
+    if not original_text or original_text in user_side:
         return None
-    kept = sent_text.removesuffix("...")
+    kept = user_side.removesuffix("...")
     return len(original_text), len(kept)
 
 
