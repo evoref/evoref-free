@@ -151,10 +151,18 @@ class DebugLogger:
         messages: list[dict],
         response: str,
     ) -> None:
-        """LLM リクエスト/レスポンスを記録"""
+        """LLM リクエスト/レスポンスを記録
+
+        ``develop_level="evolve"`` では全メッセージを丸ごと (``messages_full``)
+        記録する。100 文字プレビュー + 先頭 3 件では、system に組み立てられた
+        記憶ブロック・few-shot ブロックが一切見えず、プロンプト起因の不具合を
+        ログから追えなかった (2026-07-28 の逐語オウム返し調査で、実機は再現
+        するのに system プロンプト単体では再現せず、差分が特定できなかった)。
+        redaction は sink 側の processor で全文に適用される。
+        """
         if not self.enabled or not self.log_requests:
             return
-        self._emit("requests", {
+        payload: dict[str, Any] = {
             "n": n,
             "timestamp": _now(),
             "messages_count": len(messages),
@@ -163,7 +171,13 @@ class DebugLogger:
                 for m in messages[:3]
             ],
             "response_preview": response[:200],
-        })
+        }
+        if self.develop_level == "evolve":
+            payload["messages_full"] = [
+                {"role": m["role"], "content": m["content"]} for m in messages
+            ]
+            payload["response_full"] = response
+        self._emit("requests", payload)
 
     def log_assist_request(
         self,

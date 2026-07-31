@@ -13,6 +13,8 @@ from backend.free.agent.context_budget import (
     OUTPUT_RESERVE_TOKENS,
     resolve_meta_cognitive_loop_budget,
 )
+from backend.free.core.intent_vocab import EXPLICIT_WINDOWS_PATH_RE
+from backend.free.core.prompt_blocks import current_datetime_block
 from backend.free.core.session_mode import is_coding_mode
 from backend.free.agent.code_artifact_generator import CodeArtifactGenerator
 from backend.free.agent.event_reminder import EventReminderSystem
@@ -52,6 +54,9 @@ from backend.free.agent.meta_cognitive_utils import (
     parse_template_tool_call,
     try_parse_tool_dict,
     call_callback,
+    EXISTING_CONTENT_BLOCK_HEADING,
+    FETCHED_DATA_BLOCK_HEADING,
+    FETCHED_DATA_BLOCK_NOTE,
     extract_literal_write_content,
     previous_answer_write_content,
     fewshot_contains_task_log,
@@ -60,11 +65,14 @@ from backend.free.agent.meta_cognitive_utils import (
     generated_content_rejection,
     looks_like_path_not_content,
     strip_markdown_wrapper,
+    strip_generator_scaffold_block,
+    strip_output_lead_in,
     strip_prompt_scaffold_lines,
     strip_task_log_scaffold,
     summarize_file_content,
     summarize_tool_args,
     text_looks_like_code,
+    tool_result_succeeded,
     truncate_repetition,
 )
 from backend.free.agent.step_compactor import StepCompactor, StepResult
@@ -208,7 +216,8 @@ RICH_DOC_CONTENT_INSTRUCTION = (
 
 # ユーザークエリ/タスク記述中の明示的な絶対パス (Windows ドライブレター形式)。
 # plan 後のパス脱落補完 (_normalize_planned_paths) で使用する。
-_EXPLICIT_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'「」()（）]+")
+# 定義は core.intent_vocab が SSOT (agent.feedback が同一定義を持っていた)。
+_EXPLICIT_PATH_RE = EXPLICIT_WINDOWS_PATH_RE
 
 # assist がパラメータ名をそのまま値として返したときに現れる「パスもどき」。
 # ディレクトリ成分も拡張子も持たず、意味のあるファイル名ではない。
@@ -871,7 +880,14 @@ class MetaCognitiveAgent:
                 tool_names = ", ".join(
                     tc.get("tool", "") for tc in tool_calls
                 ) if tool_calls else "none"
-                reward = 1.0 if task.status == "done" else 0.0
+                # タスクが完了扱いでも、使ったツールが軒並み情報ゼロ (0 件検索 /
+                # 非ゼロ終了コマンド) なら reward は 0。「実行できた」を成功として
+                # credit を配ると、空振りするツール選択が正例に化ける。
+                # ツール未使用のタスク (純生成) は従来どおり status のみで判定する。
+                produced_info = not tool_calls or any(
+                    tc.get("success") for tc in tool_calls
+                )
+                reward = 1.0 if task.status == "done" and produced_info else 0.0
                 tracer.record_step(episode_id, MDPStep(
                     step_index=i,
                     state={
@@ -1597,6 +1613,19 @@ class MetaCognitiveAgent:
                 qp = Path(qpath)
                 if qp.is_dir() or not qp.suffix:
                     return str(qp / p.name)
+                if p.name not in query:
+                    # クエリが挙げているのは別のファイルで、この bare 名は
+                    # planner の発明。そのまま書くとプロセスの CWD
+                    # (= リポジトリ直下) にゴミが残る (実インシデント
+                    # 2026-07-29 ライブ監査: 「E:\tmp\audit_r4b.md の5番目の
+                    # 項目を削除して保存し直してください。」が 2 タスクに割れ、
+                    # 2 番目が `document.txt` へタスク文を書き込んだ)。
+                    # 少なくともユーザーが作業しているディレクトリへ寄せる。
+                    logger.warning(
+                        "Invented bare write path %r redirected next to the "
+                        "query path %s", file_path, qpath,
+                    )
+                    return str(qp.parent / p.name)
         return file_path
 
     async def _emit_loop_tool_running(
@@ -1702,7 +1731,9 @@ class MetaCognitiveAgent:
         tool_result_text = await self._execute_tool(
             tool_name, tool_args, tools_registry, state,
         )
-        tool_call_entry["success"] = not is_tool_error(tool_result_text)
+        tool_call_entry["success"] = tool_result_succeeded(
+            tool_name, tool_result_text,
+        )
 
         state.pending_tool = None
         state.pending_args = {}
@@ -2074,7 +2105,7 @@ class MetaCognitiveAgent:
         try:
             result = await tools_registry.execute(tool_name, **tool_args)
             result_text = str(result)
-            is_success = not is_tool_error(result_text)
+            is_success = tool_result_succeeded(tool_name, result_text)
         except Exception as e:
             result_text = f"Error: {e}"
             is_success = False
@@ -2230,6 +2261,10 @@ class MetaCognitiveAgent:
 
         ``instruction`` (元のユーザー依頼文) を渡すと、依頼文の逐語コピーを
         本文として書き込む退化も棄却できる。
+
+        上書き対象が既に存在する場合は既存内容も渡し、編集依頼なのに 1 文字も
+        変わっていない生成 (edit_without_change) を棄却する。書込み自体は
+        成功してしまうため、これを見ないと「完了しました」と誤報告される。
         """
         if content.startswith("(Content generation failed:"):
             return content, "generation_failed"
@@ -2247,7 +2282,24 @@ class MetaCognitiveAgent:
                 "content (%d -> %d chars)", len(content), len(stripped),
             )
             content = stripped
-        return content, generated_content_rejection(content, file_path, instruction)
+        descaffolded_block = strip_generator_scaffold_block(content, file_path)
+        if descaffolded_block != content:
+            logger.info(
+                "Write: stripped generator-directed scaffold block "
+                "(%d -> %d chars)", len(content), len(descaffolded_block),
+            )
+            content = descaffolded_block
+        without_lead_in = strip_output_lead_in(content, file_path)
+        if without_lead_in != content:
+            logger.info(
+                "Write: stripped answer lead-in naming the output path "
+                "(%d -> %d chars)", len(content), len(without_lead_in),
+            )
+            content = without_lead_in
+        return content, generated_content_rejection(
+            content, file_path, instruction,
+            existing_content=MetaCognitiveAgent._read_existing_file(file_path),
+        )
 
     async def _write_file(
         self,
@@ -2545,12 +2597,8 @@ class MetaCognitiveAgent:
         ないよう、現在日付と曜日を明示する。内部時刻不変則 (naive 禁止) に従い
         ``utc_now_dt()`` を使う。
         """
-        from backend.utils import utc_now_dt
-        now = utc_now_dt()
-        weekday = "月火水木金土日"[now.weekday()]
-        date_ctx = (
-            f"[現在日時 (UTC基準)] {now:%Y-%m-%d} ({weekday}曜)。"
-            "「今月」「今日」等の相対表現はこの日付を基準に解釈すること。"
+        date_ctx = current_datetime_block(
+            "「今月」「今日」等の相対表現はこの日付を基準に解釈すること。",
         )
         return f"{date_ctx}\n\n{user_prompt}"
 
@@ -2585,7 +2633,7 @@ class MetaCognitiveAgent:
             # 差し替え規則は既存内容ブロックの「後」に置く。前に置くと 9B base が
             # 従わず、古い項目の括弧書きだけが残った (2026-07-28 実測)。
             user_prompt += (
-                f"\n\n## 既存ファイル内容 ({file_path})\n"
+                f"\n\n{EXISTING_CONTENT_BLOCK_HEADING} ({file_path})\n"
                 f"以下の既存内容を含め、タスクの内容を統合した完全なファイルを出力してください。\n"
                 f"```\n{existing_content}\n```\n"
                 f"差し替え規則: ある項目を別の項目に置き換えるときは、行を丸ごと"
@@ -2621,8 +2669,8 @@ class MetaCognitiveAgent:
         # token 予算をおおまかに char 予算へ換算 (日本語混在で ~2 char/token 見込み)
         snippet = combined[: budget_tokens * 2]
         return user_prompt + (
-            "\n\n## 取得済みデータ (前ステップで取得した実データ)\n"
-            "以下のデータのみを根拠に出力を生成し、データに無い情報は創作しないこと。\n"
+            f"\n\n{FETCHED_DATA_BLOCK_HEADING}\n"
+            f"{FETCHED_DATA_BLOCK_NOTE}\n"
             f"{snippet}"
         )
 

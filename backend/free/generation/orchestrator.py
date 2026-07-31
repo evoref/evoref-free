@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+from difflib import SequenceMatcher
 import time
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
@@ -147,6 +148,42 @@ def _verbatim_duplicate_count(text: str) -> int:
             continue
         counts[s] = counts.get(s, 0) + 1
     return sum(1 for c in counts.values() if c > 1)
+
+
+#: 言い換え重複とみなす文類似度。逐語ではないが実質同じ文が並ぶのも生成
+#: ループの兆候で、読み手には冗長な繰り返しに見える。
+_NEAR_DUP_SIMILARITY = 0.85
+#: 言い換え重複判定の下限文字数。逐語判定 (_VERBATIM_DUP_MIN_CHARS=30) より
+#: 少し低く取る。実インシデントの重複文は 29 字で、逐語側の閾値では届かな
+#: かった。定型の相槌や見出し断片はこの長さに達しない。
+_NEAR_DUP_MIN_CHARS = 20
+
+
+def _near_duplicate_sentence_count(text: str) -> int:
+    """語を数語だけ入れ替えた実質重複の文の件数を返す (純粋関数)。
+
+    逐語一致しか見ない ``_verbatim_duplicate_count`` は、数文字だけ差し替え
+    られた重複を素通りする (実インシデント 2026-07-29 ライブ監査: 「雪国の
+    伝統行事は年越しそばやおせち料理の文化を静かに支える。」と「雪国の冬風物詩
+    は年越しそばやおせち料理の文化を静かに支える。」が並び、ユニーク文比率は
+    1.0、逐語重複 0 件で通過した)。
+
+    返すのは「先行文と高類似だった文」の件数 (逐語重複と同じく件数)。
+    """
+    sentences: list[str] = []
+    duplicates = 0
+    for raw in _SENTENCE_SPLIT_RE.split(text):
+        s = " ".join(raw.split())
+        if len(s) < _NEAR_DUP_MIN_CHARS:
+            continue
+        if any(
+            SequenceMatcher(None, s, prev).ratio() >= _NEAR_DUP_SIMILARITY
+            for prev in sentences
+        ):
+            duplicates += 1
+        else:
+            sentences.append(s)
+    return duplicates
 
 
 #: 文とその直後の区切り文字を一組で取り出す (再構成用)。
@@ -654,6 +691,14 @@ class LongFormOrchestrator:
                 f"repetitive output: {verbatim_dups} sentence(s) of "
                 f">={_VERBATIM_DUP_MIN_CHARS} chars repeated verbatim",
             )
+        # 数語だけ差し替えた実質重複は逐語判定を抜けるので別に見る。誤検出
+        # (定型の言い回しが 2 回出る等) の影響を抑えるため warning 止まりにする。
+        near_dups = _near_duplicate_sentence_count(text)
+        if near_dups > 0 and verbatim_dups == 0:
+            warnings.append(
+                f"{near_dups} near-duplicate sentence(s) "
+                f"(>={_NEAR_DUP_SIMILARITY:.2f} similarity)",
+            )
 
         self.last_validation_errors = list(errors)
         if on_step:
@@ -671,6 +716,7 @@ class LongFormOrchestrator:
                 "unique_sentence_ratio": round(unique / total, 3) if total else None,
                 "sentence_count": total,
                 "verbatim_duplicates": verbatim_dups,
+                "near_duplicates": near_dups,
                 "review_issues": self._last_review_issue_count,
             })
         return len(errors), len(warnings)

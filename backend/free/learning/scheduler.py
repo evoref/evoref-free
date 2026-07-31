@@ -1039,7 +1039,7 @@ class LearningScheduler:
                 # 進化前に経験から few-shot プールを補充する (f_04 §3)。
                 # resume 時は同一スナップショットの再投入になるが
                 # FewShotPool 側の多様性チェックが重複を弾く。
-                self._update_fewshot_pool_from_experiences(
+                await self._update_fewshot_pool_from_experiences(
                     session.experience_snapshot,
                 )
                 # 進化対象は名前プレフィックス無しの raw 本文。get_prompt() の
@@ -1464,7 +1464,7 @@ class LearningScheduler:
                 "Level 1 evolution started (%d experiences, %d generations)",
                 len(experiences), self.generations,
             )
-            self._update_fewshot_pool_from_experiences(experiences)
+            await self._update_fewshot_pool_from_experiences(experiences)
 
             # Step 11 — Critique-Synthesis
             # 失敗パターン批評を base prompt 進化より前に明示的に実行し、結果を
@@ -1533,13 +1533,21 @@ class LearningScheduler:
 
     # ── Level 1 ヘルパー: 各サブステップの実装 ──
 
-    def _update_fewshot_pool_from_experiences(self, experiences: list[dict]) -> None:
-        """Few-shot プール更新"""
+    async def _update_fewshot_pool_from_experiences(
+        self, experiences: list[dict],
+    ) -> None:
+        """Few-shot プール更新 + 未採点例への品質採点。
+
+        採点はプールに入った例の **順位付け** にのみ効き、採用可否は決めない
+        (``FewShotPool.score_pending_quality`` の docstring 参照)。assist 未接続
+        なら採点は no-op で、従来どおり fitness だけで順位付けされる。
+        """
         if self._fewshot_pool is None:
             return
         added = self._fewshot_pool.add_from_experiences(experiences)
         if added:
             logger.info("Fewshot pool updated: %d new examples added", added)
+        await self._fewshot_pool.score_pending_quality(self.assist_llm_client)
 
     def _collect_mode_prompt_texts(self) -> dict[str, str]:
         """モード別の生プロンプトテキストを収集（取得失敗モードはスキップ）"""

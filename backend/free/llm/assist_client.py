@@ -137,6 +137,9 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     # RAG necessity/quality リコール (Step 8.7) の自己採点。url_relevance_score
     # と同根拠で sleep-time 内発火のため background。
     "rag_judge_relevance_score": "background",
+    # few-shot 手本の品質採点。Level 0.5 のプール更新内で発火し、
+    # チャット応答パスを塞がないよう background スロットを使う。
+    "fewshot_quality_score": "background",
     # learning — 学習サイクル
     "critique_synthesis": "learning",
     "policy_evolution": "learning",
@@ -267,6 +270,9 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # RAG necessity/quality リコール自己採点。url_relevance_score と同根拠
     # (質問文 + 応答 + 判定ラベルの短文入力)。
     "rag_judge_relevance_score": 15.0,
+    # few-shot 手本の品質採点。質問 + 応答の短文入力に対し score と
+    # 短文 reason を返すだけなので url_relevance_score と同根拠。
+    "fewshot_quality_score": 15.0,
     # ラルフループの action 列生成。バックグラウンド周回 (priority=background、
     # LoopDriver 側に max_wall=1800s の外枠がある) のためユーザ体感を阻害せず、
     # task → <actions> JSON 配列の生成にローカルモデルで時間がかかることがある。
@@ -361,6 +367,8 @@ PURPOSE_REASONING_BUDGET_DEFAULTS: dict[str, int] = {
     "url_relevance_score": 0,
     # RAG necessity/quality リコール自己採点も同様に機械的採点で thinking 不要。
     "rag_judge_relevance_score": 0,
+    # few-shot 品質採点も機械的採点で thinking 不要。
+    "fewshot_quality_score": 0,
 }
 
 

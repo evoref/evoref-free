@@ -8,6 +8,8 @@ Widget 構成: RichLog (出力) + Input (入力) + Static (ステータス)
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -17,6 +19,25 @@ from textual.widgets import Input, RichLog, Static
 from rich.text import Text
 
 from backend.free.cli.cli_theme import CLITheme
+from backend.log_config import get_logger
+
+logger = get_logger("cli.textual")
+
+
+@contextmanager
+def suppress_widget_error(action: str) -> Iterator[None]:
+    """widget 操作の失敗を握り潰しつつ、原因をログに残す。
+
+    ``query_one`` はマウント前・レイアウト差し替え中に ``NoMatches`` を投げる。
+    キー操作や状態表示の更新はいずれも「失敗しても対話を続けるべき」種類の処理
+    なので送出はしないが、素の ``except Exception: pass`` だとセレクタの打ち間違い
+    のような本物のバグまで完全に不可視になる。意図を 1 箇所で述べ、切り分け用に
+    debug ログだけ残す。
+    """
+    try:
+        yield
+    except Exception as e:  # noqa: BLE001 - UI 操作の失敗で対話を止めない
+        logger.debug("TUI %s skipped: %r", action, e)
 
 
 def build_textual_css(theme: CLITheme) -> str:
@@ -183,20 +204,16 @@ class EvorefApp(App):
             self._should_exit = True
             self._input_ready.set()
             return
-        try:
+        with suppress_widget_error("action_interrupt"):
             richlog = self.query_one("#chat-output", RichLog)
             richlog.write(
                 Text("\n(Ctrl+C: press again to exit)\n", style="dim"),
             )
-        except Exception:
-            pass
 
     def action_clear_output(self) -> None:
         """Ctrl+L: 出力エリアをクリア"""
-        try:
+        with suppress_widget_error("action_clear_output"):
             self.query_one("#chat-output", RichLog).clear()
-        except Exception:
-            pass
 
     def action_request_exit(self) -> None:
         """Ctrl+D: 終了要求"""
@@ -204,34 +221,26 @@ class EvorefApp(App):
         self._input_ready.set()
 
     def action_page_up(self) -> None:
-        try:
+        with suppress_widget_error("action_page_up"):
             self.query_one("#chat-output", RichLog).scroll_page_up(
                 animate=False,
             )
-        except Exception:
-            pass
 
     def action_page_down(self) -> None:
-        try:
+        with suppress_widget_error("action_page_down"):
             self.query_one("#chat-output", RichLog).scroll_page_down(
                 animate=False,
             )
-        except Exception:
-            pass
 
     def action_scroll_up(self) -> None:
-        try:
+        with suppress_widget_error("action_scroll_up"):
             rl = self.query_one("#chat-output", RichLog)
             rl.scroll_relative(y=-3, animate=False)
-        except Exception:
-            pass
 
     def action_scroll_down(self) -> None:
-        try:
+        with suppress_widget_error("action_scroll_down"):
             rl = self.query_one("#chat-output", RichLog)
             rl.scroll_relative(y=3, animate=False)
-        except Exception:
-            pass
 
     # ── Status Bar ──
 
@@ -296,17 +305,13 @@ class EvorefApp(App):
                 status.append("  ", style=t.text_muted)
             status.append(self._code_spinner_text, style=t.text_muted)
 
-        try:
+        with suppress_widget_error("_refresh_status"):
             self.query_one("#status-bar", Static).update(status)
-        except Exception:
-            pass
 
     def apply_theme(self, theme: CLITheme) -> None:
         """テーマを動的に再適用（/theme activate 時に使用）"""
         self._cli_theme = theme
         self.stylesheet.set(build_textual_css(theme))
-        try:
+        with suppress_widget_error("apply_theme"):
             self.query_one("#prompt-label", Static).update(theme.prompt_marker)
-        except Exception:
-            pass
         self.refresh(layout=True)

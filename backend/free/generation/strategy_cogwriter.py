@@ -602,7 +602,22 @@ class CogWriterStrategy:
             # 新規生成の既定プロンプトは target_length を渡さず LLM の裁量に
             # 任せるため、「簡潔に」「冗長にならない」等が計画に一切反映されない。
             # parse_plan 側の上限は事後の安全網なので、計画時点でも明示する。
-            brevity_cap = detect_brevity_cap(instruction)
+            #
+            # 数値での明示指定 (「800字程度」) も同じ穴に落ちていた。計画に
+            # 渡らないので target_length が未指定のままになり、orchestrator の
+            # 目標文字数ゲート (target > 0 のときだけ評価) まで無効化される
+            # (実インシデント 2026-07-29 ライブ監査: 「800字程度の記事を書いて
+            # ください。」で約 460 字しか生成されず、警告も出なかった)。
+            # 数値指定は「簡潔に」より具体的なので優先する。
+            user_target = extract_target_chars(instruction, default=0)
+            if user_target > 0:
+                prompt += (
+                    "\n\n# 追加制約 (ユーザーが文字数を指定しています)\n"
+                    f"- target_length は {user_target} にしてください。\n"
+                    "- 各 unit の目標文字数の合計が target_length に近くなるよう"
+                    "ユニット数と配分を決めてください。\n"
+                )
+            brevity_cap = 0 if user_target > 0 else detect_brevity_cap(instruction)
             line_cap = detect_line_limit_chars(instruction)
             if line_cap > 0:
                 brevity_cap = (

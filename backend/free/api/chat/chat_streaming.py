@@ -32,6 +32,7 @@ from backend.free.api.schemas import ChatResponse, TokenInfo
 from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
 from backend.free.agent.meta_cognitive_utils import (
+    looks_like_task_log_residue,
     is_tool_error,
     strip_task_log_scaffold,
 )
@@ -693,6 +694,15 @@ def _meta_cognitive_body_text(resp) -> str:
     「note.txt に保存してください」への応答が step 行のみで本文なし)。
     """
     body = strip_task_log_scaffold(resp.content or "").strip()
+    # 行頭アンカーの行単位除去では落ちない断片 (ノート行が他のテキストと
+    # 1 行に連結された形) が残ることがある。残骸を本文として出すくらいなら
+    # タスクの成否をまとめた 1 文の方がユーザーには有用。
+    if body and looks_like_task_log_residue(body):
+        logger.warning(
+            "MetaCognitive body looks like task-log residue; falling back to "
+            "the task summary: %r", body[:120],
+        )
+        body = ""
     if body:
         return body
     done = sum(1 for t in resp.tasks if t.status == "done")
@@ -1963,7 +1973,9 @@ async def stream_deliberative(
 
         except Exception as e:
             errored = True
-            logger.error("Deliberative stream error: %s", e)
+            # 例外がメッセージを持たないケース (httpx.ReadError('') 等) では
+            # %s だと原因不明のログ行しか残らないため repr で型を残す。
+            logger.error("Deliberative stream error: %r", e)
             if timer:
                 timer.stop("llm_total_ms")
             _emit_timing(state, timer, "deliberative", 0, mode=mode)

@@ -23,7 +23,6 @@ CLAUDE.md §6 不変則 #2 より、SemMem への書込は sleep-time に限定�
 
 from __future__ import annotations
 
-import hashlib
 import re
 import time
 from collections.abc import Callable
@@ -32,6 +31,12 @@ from urllib.parse import urlparse, urlunparse
 
 import numpy as np
 
+from backend.free.memory.sleep._curator_common import (
+    build_scoring_prompt,
+    coerce_bare_score,
+    subject_digest,
+    truncate_for_prompt,
+)
 from backend.free.llm.json_schemas import UrlRelevanceJudgement
 from backend.free.memory.types import SemanticFact, make_fact
 from backend.log_config import get_logger
@@ -102,7 +107,7 @@ def _normalize_url(url: str) -> tuple[str, str]:
 
 def _make_subject(host: str, normalized_url: str) -> str:
     """URL リコール用 subject を構築する。"""
-    digest = hashlib.sha1(normalized_url.encode("utf-8")).hexdigest()[:12]
+    digest = subject_digest(normalized_url)
     return f"{_SUBJECT_PREFIX}{host}.{digest}"
 
 
@@ -137,18 +142,12 @@ def _iter_qa_pairs(
     return pairs
 
 
-def _truncate(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "...(truncated)"
+#: 体裁は _curator_common が SSOT (3 兄弟で byte 一致の定義を各々持っていた)。
+_truncate = truncate_for_prompt
 
 
 def _build_user_prompt(query: str, answer: str, url: str) -> str:
-    return (
-        f"QUESTION: {_truncate(query, 1000)}\n"
-        f"ASSISTANT_ANSWER: {_truncate(answer, 2000)}\n"
-        f"URL: {url}\n"
-    )
+    return build_scoring_prompt(query, answer, URL=url)
 
 
 def _topic_text(query: str) -> str:
@@ -200,17 +199,7 @@ def _record_score(
     return extra
 
 
-def _coerce_bare_score(content: str | None) -> str | None:
-    """裸の数値応答 ("0.7" 等) から最初の float トークンを取り出す。
-
-    LFM2 系 hybrid/recurrent モデルは response_format(json_schema) を強制できず、
-    スキーマ ({"score": ...}) ではなくスカラ ("0.7") を返すことがある。その場合に
-    後段の ``float()`` へ渡せる文字列を返す (見つからなければ ``None``)。
-    """
-    if not content:
-        return None
-    m = re.search(r"-?\d+(?:\.\d+)?", content)
-    return m.group(0) if m else None
+_coerce_bare_score = coerce_bare_score
 
 
 async def _score_url(

@@ -15,6 +15,7 @@ from backend.free.agent.meta_cognitive_utils import (
     generated_content_rejection,
     is_tool_error,
     strip_markdown_wrapper,
+    tool_result_succeeded,
 )
 from backend.free.agent.tool_call_judge import ToolCallJudge, ToolJudgement
 from backend.free.agent.tool_result_digest import digest_tool_result
@@ -23,6 +24,7 @@ from backend.free.agent.tools.builtin import (
     _check_path_traversal as check_builtin_path_traversal,
 )
 from backend.free.core.session_mode import is_coding_mode
+from backend.free.core.turn_text import append_to_last_user
 from backend.config import resolve_context_size_for_mode
 from backend.free.api.chat.chat_constants import (
     CONTENT_MAX_TOKENS_MIN, CONTENT_SYSTEM_RESERVE,
@@ -45,6 +47,25 @@ no explanations, no markdown fences, no JSON, no surrounding text.
 # ツール実行結果として渡すプレースホルダ。無関係な内容を「唯一の事実根拠」
 # として base に読ませないための安全な代替文言。
 _NO_RELEVANT_INFO_MESSAGE = "（ツールを実行しましたが、今回の質問に関連する情報は見つかりませんでした）"
+
+# 環境依存の事実を尋ねられたのにツールが 1 つも走らなかったときの注記。
+# 「この PC の〜を調べて」型のクエリは router が executable_query と分類する
+# が、chat の readonly 実行は python インタプリタと限られたモジュールしか
+# 許さないため、合成されたコマンドが棄却されて全層 no_tool に落ちうる。
+# その状態で base に丸投げすると、測っていない値を断定して答える
+# (実インシデント 2026-07-29 ライブ監査:「このPCのメモリ搭載量を調べて
+# 教えてください。」で powershell / wmic のコマンドが 2 度棄却され、ツールが
+# 1 つも走らないまま「32 GB です」と回答した)。system プロンプトの捏造禁止
+# 条項は天気・ニュース・株価等の外部データにしか掛かっておらず、実行環境の
+# 事実は素通りしていた。
+_UNMEASURED_FACT_GUIDANCE = (
+    "\n\nこの質問はこの実行環境を実際に調べないと答えられない種類の質問だが、"
+    "今回はツールを実行できず、測定値は取得できていない。"
+    "したがって具体的な数値・型番・バージョン・容量を答えてはならない。"
+    "会話履歴や記憶で既にユーザー自身が述べた値があるならその出典を明示して"
+    "述べてよいが、それが無い場合は「今回は取得できなかった」と正直に伝え、"
+    "ユーザーが自分で確認する方法を 1 つ示すこと。推測値を断定形で述べない。"
+)
 
 # search_history が空振りした場合専用のグラウンディング文言。通常ツールの
 # 「唯一の事実根拠として扱う」枠をそのまま付けると、直前ターンで述べられた
@@ -97,6 +118,10 @@ _CALCULATE_RESULT_GUIDANCE = (
     "その厳密な計算結果である。数値はこの結果をそのまま使うこと。"
     "結果の単位は式に入力した数値の単位に従う"
     "(例: cm で測った長さだけを掛けた体積は cm³ であってリットルではない)。"
+    "割り算では単位も割り算される "
+    "(例: km ÷ (km/時) = 時間、円 ÷ 個 = 円/個)。"
+    "答えの文では、数値に必ずその単位を添えて述べること "
+    "(例:「何時間かかりますか」への答えは『5 時間かかります』と単位まで書く)。"
     "ユーザーが別の単位で尋ねている場合、式に換算が含まれていなければ換算は"
     "行われていないので、必要な換算を自分で行って示すか、単位が異なる旨を明示すること。"
     "式に現れていない係数・比重・補正 (例:「比重 1.3 を掛けた」) を"
@@ -141,6 +166,73 @@ _GENERATED_DRAFT_GUIDANCE = (
     "回答本文では「ツール実行結果」「ご提示いただいた結果」等の内部的な言い回しを使わず、"
     "自分が書いた文章として自然に提示すること。"
 )
+
+
+# read_file 専用のグラウンディング。汎用文言は「結果に無い事実を創作しない」と
+# しか言っておらず、会話中で「こう書いたはず」と分かっている内容とファイルの
+# 実体が食い違うとき、実体ではなく期待値を答えてしまう (実インシデント
+# 2026-07-29 ライブ監査:「さっき保存したファイルの中身をそのまま見せて」に対し、
+# read_file は「タスクの内容: ファイル `…` に…」を返したのに、回答は依頼時の
+# 文言「監査テスト 1行目」だった。書込みが壊れていた事実がユーザーから隠れた)。
+# 食い違いの報告を明示的な仕事として与える (禁止形だけだと退行する)。
+_FILE_CONTENT_TOOLS = frozenset({"read_file"})
+_FILE_CONTENT_RESULT_GUIDANCE = (
+    "上記の ## ツール実行結果 は、そのファイルに実際に保存されている内容そのものである。"
+    "ファイルの中身を示すときは、この結果の文字列をそのまま引用して提示すること。"
+    "会話の中で「こう書いたはず」と話していた内容と食い違う場合は、"
+    "実際のファイル内容の方を示したうえで、期待と食い違っている旨も併せて伝えること。"
+    "期待していた文言に合わせて内容を書き換えたり、要約・整形したりしないこと。"
+    "「読み取れない」「アクセスできない」とは言わないこと。"
+    "回答本文では「ツール実行結果」等の内部的な言い回しを使わず、"
+    "自分で読んで分かったこととして自然に述べること。"
+)
+
+
+#: 「そのまま / 一字一句 / 全文」でファイル内容の提示を求める言い回し。
+_VERBATIM_ECHO_RE = re.compile(
+    r"そのまま|一字一句|原文|全文|加工せず|変えずに"
+    r"|verbatim|as[- ]is|exactly as|raw content",
+    re.IGNORECASE,
+)
+#: 決定論エコーの上限。これを超える内容は会話に貼るより要約が適切なので
+#: 従来どおりモデルへ渡す。
+_VERBATIM_ECHO_MAX_CHARS = 8000
+
+
+def verbatim_file_echo(
+    query: str, tool_name: str | None, tool_result: str | None,
+) -> str | None:
+    """「中身をそのまま見せて」型の依頼へ返す決定論的な応答を組み立てる。
+
+    ``read_file`` の結果は「唯一の事実根拠として使え」と指示しても、小型
+    base はファイルの実体ではなく **会話上そうであるはずの内容** を答えて
+    しまう (実インシデント 2026-07-29 ライブ監査: 内部プロンプトの足場と
+    英文が書き込まれてしまったファイルを「そのまま見せて」と頼んだところ、
+    その英文を日本語訳した文章が提示され、ファイルが壊れている事実が
+    ユーザーから隠れた。read_file 専用のグラウンディング文言を足しても
+    再現した)。
+
+    逐語提示は答えが一意に決まるのでモデルを通す利得が無い。該当する依頼に
+    限り生成を迂回し、ツール結果をそのまま返す。
+
+    Returns:
+        返すべき応答本文。該当しなければ ``None`` (純粋関数)。
+    """
+    if tool_name not in _FILE_CONTENT_TOOLS or not tool_result:
+        return None
+    if is_tool_error(tool_result):
+        return None
+    if not _VERBATIM_ECHO_RE.search(query or ""):
+        return None
+    if len(tool_result) > _VERBATIM_ECHO_MAX_CHARS:
+        return None
+    fence = "````" if "```" in tool_result else "```"
+    return f"{fence}\n{tool_result.rstrip()}\n{fence}"
+
+
+async def _iterate_once(text: str) -> AsyncIterator[str]:
+    """1 チャンクだけ返すストリーム (決定論応答をストリーム経路へ載せる)。"""
+    yield text
 
 
 def _is_search_history_empty(tool_name: str, result_text: str) -> bool:
@@ -369,6 +461,8 @@ class DeliberativeAgent:
             grounding = _CALCULATE_RESULT_GUIDANCE
         elif tool_name in _COMMAND_TOOLS:
             grounding = _COMMAND_RESULT_GUIDANCE
+        elif tool_name in _FILE_CONTENT_TOOLS:
+            grounding = _FILE_CONTENT_RESULT_GUIDANCE
         elif tool_name in _GENERATED_DRAFT_TOOLS:
             grounding = _GENERATED_DRAFT_GUIDANCE
         else:
@@ -398,13 +492,12 @@ class DeliberativeAgent:
             f"{refocus}"
             f"{grounding}"
         )
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i]["role"] == "user":
-                messages[i] = {
-                    "role": "user",
-                    "content": messages[i]["content"] + tool_msg,
-                }
-                break
+        append_to_last_user(messages, tool_msg, separator="")
+
+    @staticmethod
+    def _append_unmeasured_fact_note(messages: list[dict]) -> None:
+        """最後の user メッセージへ「実測できなかった」注記を追記する。"""
+        append_to_last_user(messages, _UNMEASURED_FACT_GUIDANCE, separator="")
 
     def _record_tool_call_outcome(
         self, query: str, judgement: ToolJudgement, success: bool, mode: str = "chat",
@@ -474,6 +567,10 @@ class DeliberativeAgent:
                 session_id=session_id,
             )
         if not (judgement.tool_needed and judgement.tool_name):
+            if getattr(self._tool_judge, "measurement_blocked", False):
+                # 実測を試みたが撃てなかった。この状態で base に丸投げすると
+                # 測っていない値を断定する (_UNMEASURED_FACT_GUIDANCE 参照)。
+                self._append_unmeasured_fact_note(messages)
             return None, None, None, None, None
 
         command = None
@@ -551,12 +648,10 @@ class DeliberativeAgent:
             messages, judgement.tool_name, prompt_result_text, query=query,
             tool_args=judgement.tool_args,
         )
-        success = not is_tool_error(tool_result_text)
-        # run_command は走ったが非ゼロ終了したケース (SyntaxError 等) を
-        # is_tool_error が拾えない。exit code マーカーで失敗を反映し、
-        # 誤った success が executable_command の SemMem 学習を汚染するのを防ぐ。
-        if success and judgement.tool_name in ("run_command", "run_command_readonly"):
-            success = not command_run_failed(tool_result_text)
+        # 「実行できた」ではなく「役に立つ結果が出た」を成否とする (SSOT)。
+        # 非ゼロ終了の run_command / 0 件の search_history を成功にすると、
+        # executable_command の SemMem 学習と tool_routing の選択圧が汚染される。
+        success = tool_result_succeeded(judgement.tool_name, tool_result_text)
         logger.info(
             "Tool executed: %s, result_length=%d, source=%s, success=%s",
             judgement.tool_name, len(tool_result_text), judgement.source,
@@ -650,6 +745,26 @@ class DeliberativeAgent:
             sum(len(m.get("content", "")) for m in messages),
         )
 
+        # 「中身をそのまま見せて」型はモデルに通さず決定論的に返す。
+        verbatim = verbatim_file_echo(
+            query, tool_name_used, tool_result_text,
+        )
+        if verbatim is not None:
+            logger.info(
+                "Verbatim file echo (bypassing generation): %d chars",
+                len(verbatim),
+            )
+            if stream:
+                return _iterate_once(verbatim)
+            return DeliberativeResponse(
+                content=verbatim,
+                tool_name=tool_name_used,
+                tool_result=tool_result_text,
+                tool_command=tool_command,
+                tool_command_success=tool_success,
+                tool_command_source=tool_command_source,
+            )
+
         if stream:
             return self._stream_response(
                 messages, llm_client, max_tokens,
@@ -678,7 +793,16 @@ class DeliberativeAgent:
         tracer 未注入 (通常起動) / session_id 空 / tool 未実行なら no-op。
         tool を実行したターンのみを記録対象とし、no_tool ルーティング signal は
         record_response の tool_routing_success (経験記録) 側に委ねて episodic LTM
-        の膨張を避ける。reward は tool 実行成否。
+        の膨張を避ける。
+
+        reward と outcome は別軸で付ける:
+
+        - ``reward``: 「役に立つ結果が出たか」(``tool_success``)。空振り検索も 0 に
+          倒し、無駄なツール選択が正例として強化されるのを防ぐ。
+        - ``outcome``: 「ツールが壊れたか」。0 件ヒットは正常動作なので
+          ``success`` のままにする。``partial`` にすると SemMem の
+          ``mdp_trace`` 抽出が空振りのたびに failure_pattern ファクトを作り、
+          ストアが膨張してしまう。
         """
         tracer = self._agent_tracer
         if tracer is None or not session_id or tool_result is None:
@@ -686,6 +810,7 @@ class DeliberativeAgent:
         from backend.free.agent.agent_tracer import MDPStep
 
         reward = 1.0 if tool_success else 0.0
+        errored = is_tool_error(tool_result)
         try:
             episode_id = tracer.begin_episode(session_id, mode)
             tracer.record_step(episode_id, MDPStep(
@@ -695,7 +820,7 @@ class DeliberativeAgent:
                 observation=tool_result[:200],
                 reward=reward,
             ))
-            tracer.end_episode(episode_id, "success" if tool_success else "partial")
+            tracer.end_episode(episode_id, "partial" if errored else "success")
             tracer.cleanup_episode(episode_id)
         except Exception as exc:
             logger.warning("deliberative MDP trace failed (continuing): %s", exc)

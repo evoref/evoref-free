@@ -28,7 +28,6 @@ CLAUDE.md §6 不変則 #2 より、SemMem への書込は sleep-time に限定�
 
 from __future__ import annotations
 
-import hashlib
 import re
 import time
 from collections.abc import Callable
@@ -36,6 +35,12 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from backend.free.memory.sleep._curator_common import (
+    build_scoring_prompt,
+    coerce_bare_score,
+    subject_digest,
+    truncate_for_prompt,
+)
 from backend.free.core.session_mode import normalize_session_mode
 from backend.free.memory.types import SemanticFact, make_fact
 from backend.log_config import get_logger
@@ -62,15 +67,13 @@ def _normalize_command(command: str) -> str:
 
 def _make_subject(mode: str, command_normalized: str) -> str:
     """executable command リコール用 subject を構築する。"""
-    digest = hashlib.sha1(command_normalized.encode("utf-8")).hexdigest()[:12]
+    digest = subject_digest(command_normalized)
     safe_mode = normalize_session_mode(mode)
     return f"{_SUBJECT_PREFIX}{safe_mode}.{digest}"
 
 
-def _truncate(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "...(truncated)"
+#: 体裁は _curator_common が SSOT (3 兄弟で byte 一致の定義を各々持っていた)。
+_truncate = truncate_for_prompt
 
 
 def _iter_command_pairs(

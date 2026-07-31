@@ -148,7 +148,7 @@
     "startup_config_ok": "config.yaml — OK",
     "startup_config_missing": "config.yaml not found: {path}",
     "startup_config_invalid": "config.yaml syntax error: {detail}",
-"startup_local_paths_ok": "Local directories — OK",
+    "startup_local_paths_ok": "Local directories — OK",
     "startup_dir_created": "Auto-created directory: {path}",
     "startup_dir_create_failed": "Failed to create directory: {path}",
     "startup_model_paths_ok": "Model paths — OK",
@@ -476,6 +476,9 @@
       "invalid_response": "Received invalid response from external API.",
       "api_key_missing": "API key not set. Set environment variable {env_var}.",
       "disabled": "Widget proxy is disabled. Set widget_proxy.enabled to true in config.yaml."
+    },
+    "chat": {
+      "stream_failed": "Failed to generate a response. The inference server may have stopped or the stream was cut off. Please wait a moment and try again."
     }
   },
   "warning": {

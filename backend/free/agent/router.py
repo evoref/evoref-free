@@ -3,9 +3,20 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from backend.free.agent.context_budget import resolve_meta_cognitive_loop_budget
+from backend.free.agent.safety_patterns import strip_command_literals
+from backend.free.core.intent_vocab import (
+    GREETING_PUNCTUATION_JA,
+    HISTORY_KEYWORDS as _HISTORY_KEYWORDS,
+    HISTORY_KEYWORDS_EN as _HISTORY_KEYWORDS_EN,
+    REFERENTIAL_WRITE_TARGET_RE,
+    ascii_boundary_alternation,
+    exact_greeting_pattern,
+)
 from backend.free.core.session_mode import is_chat_mode, is_coding_mode
 from backend.free.document_nouns import (
     DOCUMENT_NOUN_LEARNABLE_JA,
@@ -112,6 +123,8 @@ _FILE_WRITE_INTENT_RE = re.compile(
 # カレンダーを作成して出力」) も「生成 → 書込み」の連鎖を要するため meta_cognitive 層へ
 # 振る。long_form (文書系名詞) にも _is_url_write_intent にも当たらないデータ成果物
 # (カレンダー/一覧表等) を拾い、deliberative のディレクトリ書込み除外による拒否を防ぐ。
+# CJK (ひらがな / カタカナ / 漢字) の検出。クエリ長判定の分岐に使う。
+_CJK_CHAR_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿]")
 # ローカルファイルパス (Windows ドライブ / Unix) の存在検出。
 _LOCAL_PATH_RE = re.compile(
     r"[A-Za-z]:[\\/]"                  # Windows ドライブパス (C:\ / C:/)
@@ -127,16 +140,29 @@ _WRITE_VERB_RE = re.compile(
     r"|(?<![A-Za-z])output(?![A-Za-z]))",
     re.IGNORECASE,
 )
+# 既に書かれた成果物を **指し示す** 連体修飾節。「いま書いたそのファイルを読み込んで」
+# の「書いた」は依頼された動作ではなく対象の説明であり、書込み意図ではない。
+# これを書込み動詞として拾うと、純粋な読み取り依頼が meta_cognitive (書込み志向の
+# プランナ) へ振られ、read → 「合計を計算」→「中身を表示」のような非ファイル
+# サブタスクまでファイルツールで実行しようとして破綻する (実インシデント
+# 2026-07-29 ライブ監査: 「いま書いたそのファイルを読み込んで、金額の合計を
+# 計算してください」が 3 タスクに分解され、うち 2 つが実在しないパス
+# (prices.txt / unknown) の read_file になって失敗し、質問は無回答のまま
+# 「1 件のタスクを完了し、2 件が失敗しました。」だけが返った)。
+_DESCRIPTIVE_WRITE_CLAUSE_RE = re.compile(
+    r"(?:書[きい]た|作成した|作った|生成した|保存した|出力した|書き込んだ)"
+    r"\s*(?:ばかりの?|ところの?)?"
+    r"\s*(?:その|この|あの|先ほどの?|さっきの?)?"
+    r"\s*(?:ファイル|もの|やつ|データ|内容|中身)"
+    r"|(?:you\s+(?:just\s+)?(?:wrote|created|saved|generated))",
+    re.IGNORECASE,
+)
 # 保存先を直前の文脈に委ねる参照表現。「同じファイルに保存し直して」のような
 # 追記・修正依頼はパスを本文に持たないため _LOCAL_PATH_RE に掛からず、
 # deliberative に落ちて read_file だけが走り、書込みが一度も起きないまま
 # 「保存し直した」体の回答になっていた (実測 2026-07-27)。
-_REFERENTIAL_WRITE_TARGET_RE = re.compile(
-    r"(?:同じ|その|この|先ほどの?|さっきの?)\s*(?:ファイル|ところ|場所)"
-    r"|保存し直|上書き|同じ場所に"
-    r"|\b(?:same|that)\s+file\b|\boverwrite\b",
-    re.IGNORECASE,
-)
+# 定義は core.intent_vocab が SSOT (agent.feedback の訂正判定でも同じ意味で使う)。
+_REFERENTIAL_WRITE_TARGET_RE = REFERENTIAL_WRITE_TARGET_RE
 # 表形式データの出力先拡張子。long_form (散文ユニット分割) では表構造を
 # 生成できないため、これらへの書出し意図は long_form 判定より優先して
 # local_write_intent (write-fast 経路) に振る。
@@ -162,6 +188,20 @@ _HOWTO_QUERY_RE = re.compile(
     r"|how\s+(?:do|can|should|would)\s+i\b|how\s+to\b"
     r"|(?:could|can|would)\s+you\s+(?:tell|show)\s+me\s+how\b"
     r"|tell\s+me\s+how\b|what'?s?\s+the\s+way\s+to\b)",
+    re.IGNORECASE,
+)
+
+# 既出の成果物から一部だけを抜き出す / 並べ直す依頼。生成量を **減らす**
+# 依頼なので、ユニット分割の長文生成は categorically 不適
+# (実インシデント 2026-07-29 ライブ監査: 800 字の記事を書かせた直後に
+# 「その記事の見出しだけを箇条書きで並べてください。」と頼んだところ、
+# 見出しの一覧ではなく春の話題の散文生成が始まった)。
+_EXTRACTION_REQUEST_RE = re.compile(
+    r"(?:見出し|表題|タイトル|項目|要点|ポイント|キーワード|一覧|リスト)"
+    r"\s*(?:だけ|のみ)"
+    r"|(?:だけ|のみ)\s*を?\s*(?:並べ|挙げ|列挙|抜き出|抜粋|取り出)"
+    r"|(?:headings?|titles?|key\s*points?|items?)\s+only"
+    r"|(?:list|extract)\s+(?:just|only)\s+the",
     re.IGNORECASE,
 )
 
@@ -206,23 +246,10 @@ COMPLEX_KEYWORDS_EN_PATTERNS = [
 # 「過去の会話で、登山の話題をしたことはありますか？探してください。」が
 # tool_call_decision=no_tool / reason=no_match_in_any_layer で素通りし、
 # 実際には 1 時間前に登山の会話があったのに「見当たりません」と回答)。
-HISTORY_KEYWORDS = [
-    "前に", "以前", "先週", "先月", "この間", "前回", "前の会話",
-    "さっき", "昨日", "今朝", "先ほど", "最初に", "覚えて", "覚えてる",
-    "覚えている",
-    "過去の会話", "過去のやり取り", "過去に話", "以前の会話", "会話履歴",
-    "earlier", "previously", "last time", "yesterday", "before",
-    "remember", "recall",
-]
-
-# HISTORY_KEYWORDS の英語版。
-HISTORY_KEYWORDS_EN = [
-    "earlier", "previously", "last time", "yesterday", "before",
-    "remember", "recall", "this morning", "just now", "a moment ago",
-    "a while back", "at first", "in the beginning",
-    "past conversation", "previous conversation", "conversation history",
-    "chat history",
-]
+# 履歴参照キーワードは core.intent_vocab が SSOT (キーワードと「近接 / 長距離」の
+# 距離分類を 1 つの表で持つ)。従来ここに定義されていたため、後方互換で再輸出する。
+HISTORY_KEYWORDS = _HISTORY_KEYWORDS
+HISTORY_KEYWORDS_EN = _HISTORY_KEYWORDS_EN
 
 # Meta-Cognitive 層へのエスカレーションキーワード（同義語拡張済み）
 # 注意: 命令形（〜して）のみ対象。「計画を教えて」等の知識質問は
@@ -258,22 +285,30 @@ META_KEYWORDS_EN_PATTERNS = [
 
 # 知識質問パターン — ツール呼び出しではなく RAG で処理すべきクエリ
 # これらにマッチするクエリはツール/Meta-Cognitive エスカレーションをスキップする
-KNOWLEDGE_QUERY_PATTERNS = [
+#
+# 「明示的な疑問形式」(strict) と「名詞+助詞だけの緩いパターン」(loose) を
+# 分けて定義し、全体はその合成として組み立てる。両者を 1 つのリストに混ぜて
+# index で除外すると (旧実装は ``if i != 1``)、リストに要素を 1 つ挿入した
+# 瞬間に除外対象が黙って別のパターンへすり替わる。
+_KNOWLEDGE_QUERY_STRICT_PATTERNS = [
     re.compile(r"(?:教えて|おしえて|とは|って何|ですか|でしょうか|ありますか)", re.IGNORECASE),
-    re.compile(r"(?:資料|情報|データ|内容|概要|詳細|特徴|一覧).*(?:は|を|が|に)", re.IGNORECASE),
     re.compile(r"(?:について|に関して|に関する)", re.IGNORECASE),
     re.compile(r"(?:知りたい|確認したい|調べたい|わかる|分かる)", re.IGNORECASE),
     re.compile(r"(?:what is|tell me|explain|describe|how does)\b", re.IGNORECASE),
 ]
 
-# KNOWLEDGE_QUERY_PATTERNS[1] (資料|情報|データ|... + は/を/が/に) は名詞+助詞のみ
-# で判定するため緩く、コーディングモードの正規な生成依頼 ("サンプルCSVデータを
-# 作成し" 等) の一部にも誤マッチする (2026-07-22 ライブ検証で発覚)。それ以外
-# (教えて/について/知りたい 等) は明示的な疑問形式のみを対象とするため誤爆が
-# 少ない。coding_meta_keywords の is_knowledge 上書き判定では、この緩い
-# パターンを除いた「明示的な疑問形式」のみを知識質問シグナルとして扱う。
-_KNOWLEDGE_QUERY_STRICT_PATTERNS = [
-    p for i, p in enumerate(KNOWLEDGE_QUERY_PATTERNS) if i != 1
+# 名詞 + 助詞のみで判定するため緩く、コーディングモードの正規な生成依頼
+# ("サンプルCSVデータを作成し" 等) の一部にも誤マッチする (2026-07-22 ライブ
+# 検証で発覚)。strict 側 (教えて/について/知りたい 等) は明示的な疑問形式のみを
+# 対象とするため誤爆が少ない。coding_meta_keywords の is_knowledge 上書き判定
+# では、この緩いパターンを除いた strict のみを知識質問シグナルとして扱う。
+_KNOWLEDGE_QUERY_LOOSE_PATTERN = re.compile(
+    r"(?:資料|情報|データ|内容|概要|詳細|特徴|一覧).*(?:は|を|が|に)", re.IGNORECASE,
+)
+
+KNOWLEDGE_QUERY_PATTERNS = [
+    *_KNOWLEDGE_QUERY_STRICT_PATTERNS,
+    _KNOWLEDGE_QUERY_LOOSE_PATTERN,
 ]
 
 # KNOWLEDGE_QUERY_PATTERNS の英語版。「about」は汎用前置詞のため直訳せず、
@@ -331,7 +366,16 @@ TOOL_PATTERNS_EN = [
 _EXECUTABLE_QUERY_PATTERNS = [
     # 注意: \b は日本語文字を \w とみなすため英語-日本語境界で機能しない。
     # 英語の短いキーワードは (?<![A-Za-z])...(?![A-Za-z]) で ASCII 境界を使用。
-    re.compile(r"(?:スペック|CPU|メモリ|RAM|GPU|VRAM|ディスク|容量|ストレージ|(?<![A-Za-z])spec(?![A-Za-z]))", re.IGNORECASE),
+    # CPU/RAM/GPU/VRAM/spec は ASCII 境界必須。境界を付けないと IGNORECASE で
+    # "program" / "diagram" / "telegram" の 'ram' に部分マッチし、無関係な
+    # クエリが executable_query として deliberative へ強制昇格していた。
+    # tool_call_judge 側は 2026-07-22 監査で塞がれたが、こちらは残っていた。
+    re.compile(
+        r"(?:スペック|メモリ|ディスク|容量|ストレージ|"
+        + ascii_boundary_alternation("CPU", "RAM", "GPU", "VRAM", "spec")
+        + r")",
+        re.IGNORECASE,
+    ),
     # 「何月|何日|何曜日」は明確な疑問語のみ追加 (「今日|明日|昨日」単独は
     # 「今日の予定」等の文脈で誤検出するため見送り)。
     re.compile(r"(?:何時|何月|何日|何曜日|日時|日付|現在時刻|(?<![A-Za-z])today(?![A-Za-z])|(?<![A-Za-z])now(?![A-Za-z])|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z]))", re.IGNORECASE),
@@ -377,10 +421,31 @@ _EXECUTABLE_QUERY_PATTERNS_EN = [
 ]
 
 # 挨拶・簡単な定型パターン → Reactive 層で即応答
+# 体裁 (クエリ全体が挨拶だけであることの要求) は core.intent_vocab から派生させる。
+# 語彙は reactive.GREETING_RESPONSES とは **意図的に別** (あちらは応答文と 1 対 1 で
+# 対応させるため分割が細かく、「おはようございます」等も個別に拾う)。
 GREETING_PATTERNS = [
-    re.compile(r"^(?:こんにち[はわ]|おはよう|こんばんは|やあ|ども|hello|hi|hey)\s*[!！。.]?\s*$", re.IGNORECASE),
-    re.compile(r"^(?:ありがと[うございます]*|thanks|thank you)\s*[!！。.]?\s*$", re.IGNORECASE),
-    re.compile(r"^(?:おやすみ|さようなら|bye|goodbye)\s*[!！。.]?\s*$", re.IGNORECASE),
+    re.compile(
+        exact_greeting_pattern(
+            r"こんにち[はわ]|おはよう|こんばんは|やあ|ども|hello|hi|hey",
+            punctuation=GREETING_PUNCTUATION_JA,
+        ),
+        re.IGNORECASE,
+    ),
+    re.compile(
+        exact_greeting_pattern(
+            r"ありがと[うございます]*|thanks|thank you",
+            punctuation=GREETING_PUNCTUATION_JA,
+        ),
+        re.IGNORECASE,
+    ),
+    re.compile(
+        exact_greeting_pattern(
+            r"おやすみ|さようなら|bye|goodbye",
+            punctuation=GREETING_PUNCTUATION_JA,
+        ),
+        re.IGNORECASE,
+    ),
 ]
 
 
@@ -392,6 +457,180 @@ def _matches_any(patterns: list[re.Pattern], query: str) -> bool:
     と実際の入力言語が食い違うと該当言語側の判定が一切効かなかった)。
     """
     return any(p.search(query) for p in patterns)
+
+
+#: ルール表で meta_cognitive を表すセンチネル。実際の層はマッチ時に
+#: ``_guard_meta_cognitive()`` で解決する (コンテキスト予算が足りなければ
+#: deliberative へ降格するため、表に静的な層名は書けない)。
+_META = "__meta_cognitive__"
+
+
+class _ClassifyContext:
+    """1 回の ``classify()`` 呼出で共有する導出値。
+
+    ``is_knowledge`` / ``is_short`` 等は複数のルールが参照するため、都度
+    計算せずここでキャッシュする。すべて純粋関数の結果なので、評価タイミングが
+    変わっても判定は変わらない (早期マッチ時に評価されないよう遅延させている)。
+    """
+
+    __slots__ = ("_c", "_cache", "mode", "query", "rag_results")
+
+    def __init__(
+        self,
+        classifier: "ComplexityClassifier",
+        query: str,
+        mode: str,
+        rag_results: list,
+    ) -> None:
+        self._c = classifier
+        self.query = query
+        self.mode = mode
+        self.rag_results = rag_results
+        self._cache: dict[str, object] = {}
+
+    def _memo(self, key: str, compute):
+        if key not in self._cache:
+            self._cache[key] = compute()
+        return self._cache[key]
+
+    @property
+    def is_knowledge(self) -> bool:
+        return self._memo("k", lambda: self._c._is_knowledge_query(self.query))
+
+    @property
+    def is_short(self) -> bool:
+        return self._memo(
+            "s", lambda: self._c._is_short_query(self.query, self.mode),
+        )
+
+    @property
+    def is_long_form_candidate(self) -> bool:
+        return self._memo("lf", lambda: self._c._detect_long_form(self.query))
+
+    @property
+    def rag_threshold(self) -> float:
+        return self._memo(
+            "rt",
+            lambda: self._c._get_policy(
+                "router", "rag_score_threshold", self.mode, 0.8,
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class _ClassifyRule:
+    """``classify()`` の 1 判定。表中の並び順がそのまま優先度。"""
+
+    #: decision.jsonl / policy_adjuster へ渡る matched-rule 識別子。
+    reason: str
+    #: 遷移先。``_META`` はマッチ時にガード経由で解決する。
+    layer: str
+    predicate: Callable[["ComplexityClassifier", _ClassifyContext], bool]
+    #: マッチ時に ``is_long_form`` へ設定する値。
+    long_form: bool = False
+
+
+#: 判定順序の SSOT。**並び順が優先度**であり、番号は振らない
+#: (かつて 1.4 / 2.5 / 8.5 のような小数が後付け層の痕跡として残り、
+#: 欠番 3 / 4 を docstring が参照する事故も起きていた)。
+_CLASSIFY_RULES: tuple[_ClassifyRule, ...] = (
+    _ClassifyRule(
+        "greeting", "reactive",
+        lambda c, x: c._is_greeting(x.query),
+    ),
+    # URL 取得 → ファイル書込みの連鎖は meta_cognitive でしか実行できない。
+    # 学習語による long_form 誤振り分けより先に評価する。
+    _ClassifyRule(
+        "url_write_intent", _META,
+        lambda c, x: c._is_url_write_intent(x.query, x.mode),
+    ),
+    # 表形式データ出力先 (.csv/.tsv/.xlsx/.ods) はユニット分割の散文生成が
+    # 構造を壊すため long_form を抑止して write-fast 経路へ落とす
+    # (2026-07-15: annual_events.csv が 26 unit の散文 CSV 化)。
+    # long_form 候補の部分集合なので long_form ルールより前に置く。
+    _ClassifyRule(
+        "local_write_intent", _META,
+        lambda c, x: (
+            x.is_long_form_candidate and c._is_tabular_write_intent(x.query, x.mode)
+        ),
+    ),
+    _ClassifyRule(
+        "long_form", _META,
+        lambda c, x: x.is_long_form_candidate,
+        long_form=True,
+    ),
+    # long_form (文書系名詞) にも url_write_intent にも当たらないデータ成果物
+    # (Excel カレンダー/一覧表等) のローカル出力を拾う。long_form 判定の後に
+    # 置くことで「仕様書/ドキュメント + パス」は従来どおり long_form を維持する。
+    _ClassifyRule(
+        "local_write_intent", _META,
+        lambda c, x: c._is_local_write_intent(x.query, x.mode),
+    ),
+    # coding の正規な生成依頼が executable_query へ短絡するのを防ぐため、
+    # executable_query より先に評価する (2026-07-22: 「CSV を集計する
+    # プログラムを作成して」が staged 生成へ一切到達しなかった)。
+    _ClassifyRule(
+        "coding_tools", _META,
+        lambda c, x: (
+            is_coding_mode(x.mode) and not x.is_knowledge and c._needs_tools(x.query)
+        ),
+    ),
+    # 緩い名詞+助詞パターンは正規の生成依頼にも誤マッチするため、ここでは
+    # strict 側 (明示的な疑問形式) だけを知識質問として扱う。
+    _ClassifyRule(
+        "coding_meta_keywords", _META,
+        lambda c, x: (
+            is_coding_mode(x.mode)
+            and c._has_meta_keywords(x.query)
+            and not c._is_strict_knowledge_query(x.query)
+        ),
+    ),
+    # 「明日は何月何日?」のような ? 終わりの疑問文は知識質問パターンが要求する
+    # 末尾形式を満たさないため、is_knowledge を見ずに常時評価する。
+    _ClassifyRule(
+        "executable_query", "deliberative",
+        lambda c, x: c._contains_executable_query_keywords(x.query),
+    ),
+    _ClassifyRule(
+        "learned_tool_pattern", "deliberative",
+        lambda c, x: x.is_knowledge and c._contains_learned_tool_patterns(x.query),
+    ),
+    _ClassifyRule(
+        "history_ref", "deliberative",
+        lambda c, x: c._has_history_keywords(x.query),
+    ),
+    _ClassifyRule(
+        "complex_keywords", "deliberative",
+        lambda c, x: c._has_complex_keywords(x.query),
+    ),
+    _ClassifyRule(
+        "short_high_rag", "reactive",
+        lambda c, x: bool(
+            x.is_short and x.rag_results and x.rag_results[0][1] > x.rag_threshold
+        ),
+    ),
+    # reactive / reactive_light は検索パイプラインを一切走らせないため、短い
+    # 知識質問を short_query で reactive に落とすとカートリッジを参照せず
+    # 事前知識だけで答えてしまう。short_high_rag の後に置くことで、RAG ヒット
+    # 済みの短文即応答は従来挙動を保つ。
+    _ClassifyRule(
+        "knowledge_query", "deliberative",
+        lambda c, x: x.is_knowledge,
+    ),
+    _ClassifyRule(
+        "short_query", "reactive",
+        lambda c, x: x.is_short,
+    ),
+    _ClassifyRule(
+        "no_rag_results", "deliberative",
+        lambda c, x: not x.rag_results,
+    ),
+    _ClassifyRule(
+        "tool_patterns", _META,
+        lambda c, x: c._needs_tools(x.query),
+    ),
+    _ClassifyRule("default", "reactive", lambda c, x: True),
+)
 
 
 class ComplexityClassifier:
@@ -432,6 +671,12 @@ class ComplexityClassifier:
     ) -> str:
         """クエリの複雑度を分類する
 
+        判定は ``_CLASSIFY_RULES`` の **並び順がそのまま優先度** で、最初に
+        マッチしたルールの層を返す。順序と条件はすべて表側にあるので、本体は
+        表を上から評価するだけ。ルールを足すときは表の適切な位置へ 1 エントリ
+        加える (以前は 18 個の if が本体に並び、後付け層が 1.4 / 2.5 / 8.5 の
+        ような小数コメントで表現されていた)。
+
         Returns:
             "reactive" | "deliberative" | "meta_cognitive"
         """
@@ -440,154 +685,19 @@ class ComplexityClassifier:
         self._classify_mode = mode
         self._last_classify_reason = "default"
 
-        # 1. 挨拶・定型パターン → reactive
-        if self._is_greeting(query):
-            return self._record_classification("reactive", "greeting", query)
-
-        # 1.4. URL + ファイル書込み意図 → meta_cognitive
-        #   「URL を取得してファイルに出力」は取得 → 書込みの連鎖を要し、これを実行
-        #   できるのは meta_cognitive 層のみ。学習語による long_form 誤振り分け
-        #   (step 1.5) より優先して評価する。
-        if self._is_url_write_intent(query, mode):
-            self.is_long_form = False
-            return self._record_classification(
-                self._guard_meta_cognitive(), "url_write_intent", query,
+        ctx = _ClassifyContext(self, query, mode, rag_results)
+        for rule in _CLASSIFY_RULES:
+            if not rule.predicate(self, ctx):
+                continue
+            self.is_long_form = rule.long_form
+            layer = (
+                self._guard_meta_cognitive()
+                if rule.layer == _META
+                else rule.layer
             )
+            return self._record_classification(layer, rule.reason, query)
 
-        # 1.5. 長文生成判定 → meta_cognitive（Orchestrator に委任）
-        #   ただし表形式データ出力先 (.csv/.tsv/.xlsx/.ods) はユニット分割の
-        #   散文生成が構造を壊すため (2026-07-15: annual_events.csv が 26 unit
-        #   の散文 CSV 化)、long_form を抑止して write-fast 経路へ落とす。
-        if self._detect_long_form(query):
-            if self._is_tabular_write_intent(query, mode):
-                self.is_long_form = False
-                return self._record_classification(
-                    self._guard_meta_cognitive(), "local_write_intent", query,
-                )
-            self.is_long_form = True
-            return self._record_classification(
-                self._guard_meta_cognitive(), "long_form", query,
-            )
-
-        # 1.6. ローカルパス + ファイル書込み意図 (URL 無し) → meta_cognitive
-        #   long_form (文書系名詞) にも url_write_intent にも当たらないデータ成果物
-        #   (Excel カレンダー/一覧表等) のローカル出力を拾う。is_long_form=False の
-        #   まま planner + write-fast 経路 (_dispatch_meta_cognitive) で dir→file
-        #   解決 + 生成 → write_file を成立させる。long_form 判定後に評価することで
-        #   「仕様書/ドキュメント + パス」は従来どおり long_form を維持する。
-        if self._is_local_write_intent(query, mode):
-            self.is_long_form = False
-            return self._record_classification(
-                self._guard_meta_cognitive(), "local_write_intent", query,
-            )
-
-        # 2. 知識質問の検出 → ツール/Meta-Cognitive エスカレーションをスキップ
-        # コーディングモードでもカートリッジ検索による知識質問は有効。
-        # 知識質問はツール操作ではないため、ここでツール判定をバイパスし
-        # 後続の通常分類（reactive/deliberative）に委ねる。
-        is_knowledge = self._is_knowledge_query(query)
-
-        # 2.5. コーディングモードでツール操作が必要 → meta_cognitive
-        #   (2026-07-22 まではこの判定より旧 2.5 の executable_query 判定が
-        #   先に評価されており、「CSV を集計する“プログラムを作成して”」の
-        #   ようなコーディングモードの正規の生成依頼が、集計/フィボナッチ/
-        #   ソート等の汎用実行可能キーワードにマッチしただけで deliberative の
-        #   単発ツール実行に短絡し、staged 生成パイプラインへ一切到達しない
-        #   実害があった。is_coding_mode ゲートを保ったまま先に評価すること
-        #   で、非コーディングモードの挙動 (即 no-op) は変えずに解消する。
-        if is_coding_mode(mode) and not is_knowledge and self._needs_tools(query):
-            return self._record_classification(
-                self._guard_meta_cognitive(), "coding_tools", query,
-            )
-
-        # 2.6. Meta-Cognitive キーワード検出（コーディングモード）
-        #   (2026-07-23: is_knowledge ガードを _is_strict_knowledge_query に
-        #   差し替え。KNOWLEDGE_QUERY_PATTERNS の緩い名詞+助詞パターン
-        #   (資料|情報|データ|... + は/を/が/に) は、「サンプルCSVデータを
-        #   作成し」のような正規の生成依頼の一部 (「データを」) にも誤マッチ
-        #   して is_knowledge=True にしてしまう (2026-07-22 ライブ検証で発覚。
-        #   CSV 集計依頼が meta_cognitive に到達せず deliberative の
-        #   executable_query に短絡していた)。一方「ファイルを作って整理する
-        #   方法について教えて」のような真正の howto 知識質問は「教えて」
-        #   「について」等の明示的疑問形式で is_knowledge=True になっており、
-        #   これは META_KEYWORDS ("作って") が同時に立っていても知識質問の
-        #   まま扱うべき (Meta-Cognitive へ昇格させない)。_is_strict_knowledge_
-        #   query は緩いパターンだけを除外するため、両ケースを正しく判別できる。
-        if (
-            is_coding_mode(mode)
-            and self._has_meta_keywords(query)
-            and not self._is_strict_knowledge_query(query)
-        ):
-            return self._record_classification(
-                self._guard_meta_cognitive(), "coding_meta_keywords", query,
-            )
-
-        # 2.7. Python 実行で正確に答えられるクエリは例外的に deliberative に
-        # 昇格してツール実行を誘導する。
-        # 知識質問パターン (KNOWLEDGE_QUERY_PATTERNS) は「ですか」「教えて」等の
-        # 末尾形式を要求するため、「明日は何月何日?」のような ? 終わりの疑問文
-        # を取りこぼす。executable_query_keywords は明確なツール経路シグナル
-        # なので is_knowledge 判定を外して常時評価する。
-        if self._contains_executable_query_keywords(query):
-            return self._record_classification(
-                "deliberative", "executable_query", query,
-            )
-
-        # 2.8. 知識質問でも学習済み tool_routing パターンにマッチする場合は
-        # deliberative に昇格してツール実行を誘導する
-        if is_knowledge and self._contains_learned_tool_patterns(query):
-            return self._record_classification(
-                "deliberative", "learned_tool_pattern", query,
-            )
-
-        # 5. 履歴参照キーワード → deliberative（短いクエリより優先）
-        if self._has_history_keywords(query):
-            return self._record_classification("deliberative", "history_ref", query)
-
-        # 6. 複雑キーワード → deliberative
-        if self._has_complex_keywords(query):
-            return self._record_classification(
-                "deliberative", "complex_keywords", query,
-            )
-
-        # 7. クエリ長の判定（日本語はスペース分割できないため文字数も考慮）
-        is_short = self._is_short_query(query, mode)
-
-        # 8. 短いクエリ + 高スコア RAG ヒット → reactive
-        rag_threshold = self._get_policy("router", "rag_score_threshold", mode, 0.8)
-        if is_short and rag_results and rag_results[0][1] > rag_threshold:
-            return self._record_classification("reactive", "short_high_rag", query)
-
-        # 8.5. 知識質問 → deliberative（検索を走らせる）
-        #   「Xについて教えて」等の知識質問は LTM / カートリッジ参照が要る。reactive /
-        #   reactive_light は検索パイプラインを一切走らせない (chat 側 search_task は
-        #   agent_layer != reactive のときのみ起動) ため、短い知識質問が step 9 の
-        #   short_query で reactive に落ちると、カートリッジを参照せずベースモデルの
-        #   事前知識だけで回答してしまう。知識質問は短くても検索経路 (deliberative)
-        #   へ送る。step 8 (short_high_rag) の後に置くことで、RAG ヒット済みの短文
-        #   即応答 (本番では rag_results 未注入のため発火しない) は従来挙動を保つ。
-        if is_knowledge:
-            return self._record_classification(
-                "deliberative", "knowledge_query", query,
-            )
-
-        # 9. 短いクエリ（単純な質問）→ reactive
-        if is_short:
-            return self._record_classification("reactive", "short_query", query)
-
-        # 10. RAG 結果がない → deliberative（検索が必要）
-        if not rag_results:
-            return self._record_classification(
-                "deliberative", "no_rag_results", query,
-            )
-
-        # 11. ツール操作が必要 → meta_cognitive
-        if self._needs_tools(query):
-            return self._record_classification(
-                self._guard_meta_cognitive(), "tool_patterns", query,
-            )
-
-        # 12. デフォルト: reactive
+        # 表は必ず default ルールで終わるため到達しない。
         return self._record_classification("reactive", "default", query)
 
     def _record_classification(self, layer: str, reason: str, query: str) -> str:
@@ -627,16 +737,24 @@ class ComplexityClassifier:
     def _is_short_query(self, query: str, mode: str = "chat") -> bool:
         """クエリが短い（単純）かどうかを判定
 
-        日本語テキストはスペースで分割されないため、文字数も考慮する。
+        日本語テキストはスペースで分割されないため、文字数で判定する。
+        分岐は **表記体系** で決める。空白トークン数で分岐すると、日本語文に
+        ASCII 断片 (パス / コマンド / 識別子) が混ざっただけで英語扱いになり、
+        長い日本語クエリが「短文」と誤判定される (実インシデント 2026-07-29
+        ライブ監査: 55 文字の「コマンド `dir E:\\tmp\\x` を実行して、返ってきた
+        出力をそのまま報告してください。」が空白 4 トークンなので short_query
+        と判定され、検索もツール判定も走らない reactive に落ちて、ベースモデルが
+        実行していないコマンドの出力を捏造した)。
         """
         min_tokens = self._get_policy("router", "short_query_min_tokens", mode, 3)
         max_tokens = self._get_policy("router", "short_query_max_tokens", mode, 10)
         max_chars = self._get_policy("router", "short_query_max_chars", mode, 20)
 
-        tokens = len(query.split())
-        # 英語テキスト: 単語数で判定
-        if tokens >= min_tokens:
-            return tokens < max_tokens
+        # 英語テキスト: 単語数で判定 (CJK を含まない場合のみ)
+        if not _CJK_CHAR_RE.search(query):
+            tokens = len(query.split())
+            if tokens >= min_tokens:
+                return tokens < max_tokens
         # 日本語テキスト: 文字数で判定
         return len(query.strip()) < max_chars
 
@@ -668,7 +786,7 @@ class ComplexityClassifier:
     def _is_url_write_intent(self, query: str, mode: str = "chat") -> bool:
         """URL からデータを取得してファイルに書き出す意図を検出する。
 
-        chat モードのみ対象 (coding モードは step 3 の ``_needs_tools`` が同等の
+        chat モードのみ対象 (coding モードは step 2.5 の ``_needs_tools`` が同等の
         meta_cognitive 振り分けを行う)。URL とファイル書込み/出力意図の双方が
         揃った場合のみ True を返す。
         """
@@ -681,7 +799,7 @@ class ComplexityClassifier:
     def _is_local_write_intent(self, query: str, mode: str = "chat") -> bool:
         """ローカルパス + ファイル書込み意図 (URL 無し) を検出する。
 
-        chat モードのみ対象 (coding モードは step 3/4 の ``_needs_tools`` /
+        chat モードのみ対象 (coding モードは step 2.5 / 2.6 の ``_needs_tools`` /
         ``_has_meta_keywords`` が同等の振り分けを行う)。URL を含む場合は
         ``_is_url_write_intent`` / fetch 経路に委ね、知識質問 (「作成方法を
         教えて」等の how-to) は除外する。ローカルパスと書込み動詞の双方が
@@ -693,13 +811,19 @@ class ComplexityClassifier:
             return False
         if _HOWTO_QUERY_RE.search(query):
             return False
-        if not _WRITE_VERB_RE.search(query):
+        # コマンドリテラル (`dir E:\tmp\x`) 内のパスは実行対象の引数であって
+        # 書込み先ではない。書込み動詞・パスの双方をこれを除いた本文で判定する。
+        probe = strip_command_literals(query)
+        # 「いま書いたそのファイル」のような既出成果物への言及は、依頼された
+        # 動作ではなく対象の説明。書込み動詞判定から除外する。
+        probe = _DESCRIPTIVE_WRITE_CLAUSE_RE.sub(" ", probe)
+        if not _WRITE_VERB_RE.search(probe):
             return False
-        if _LOCAL_PATH_RE.search(query):
+        if _LOCAL_PATH_RE.search(probe):
             return True
         # パスは直前ターンにしか無い参照依頼 (「同じファイルに保存し直して」)。
         # 保存先は write-fast 経路が会話から解決する。
-        return bool(_REFERENTIAL_WRITE_TARGET_RE.search(query))
+        return bool(_REFERENTIAL_WRITE_TARGET_RE.search(probe))
 
     def _is_tabular_write_intent(self, query: str, mode: str = "chat") -> bool:
         """表形式データ (.csv/.tsv/.xlsx/.ods) のローカル書出し意図を検出する。
@@ -730,6 +854,9 @@ class ComplexityClassifier:
         # 生成・書込みしてしまう (2026-07-22 ライブ検証で判明。JA/EN 両方で
         # 再現し、PR#298-300 の対象範囲より前から存在した既存バグ)。
         if _HOWTO_QUERY_RE.search(query):
+            return False
+        # 「見出しだけ並べて」型は既出成果物の抽出であって生成ではない。
+        if _EXTRACTION_REQUEST_RE.search(query):
             return False
         if _matches_any(LONG_FORM_PATTERNS, query) or _matches_any(
             LONG_FORM_PATTERNS_EN, query,
@@ -771,7 +898,7 @@ class ComplexityClassifier:
         )
 
     def _is_strict_knowledge_query(self, query: str) -> bool:
-        """緩い名詞+助詞パターン (KNOWLEDGE_QUERY_PATTERNS[1]) を除いた、
+        """緩い名詞+助詞パターン (_KNOWLEDGE_QUERY_LOOSE_PATTERN) を除いた、
         明示的な疑問形式のみによる知識質問判定。coding_meta_keywords の
         is_knowledge 上書き判定用 (詳細は _KNOWLEDGE_QUERY_STRICT_PATTERNS 参照)。
         """

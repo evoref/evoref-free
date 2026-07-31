@@ -42,6 +42,12 @@ class FewShotExample:
     mode: str = "chat"
     fitness: float = 0.0
     added_at: str = ""
+    #: アシストによる手本品質の採点 (0..1)。未採点 / degraded mode では ``None``。
+    #: **採用可否の拒否権は持たない** — 順位付けの重みとしてのみ使う
+    #: (``FewShotPool._effective_fitness``)。小型 assist は自分が検算できない
+    #: 算術を「正確」と評価するため (実測 2026-07-31)、内容の正誤は
+    #: ``response_arithmetic`` の決定論検算が担当する。
+    quality_score: float | None = None
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -81,14 +87,14 @@ def format_fewshot_section(examples: list[FewShotExample]) -> str:
 # PROTECTED セクション (マーカー定数 + 検出・除去 util)
 # ─────────────────────────────────────────────────────────────────────
 
-_PROTECTED_OPEN = "<!-- PROTECTED -->"
-_PROTECTED_CLOSE = "<!-- /PROTECTED -->"
+PROTECTED_OPEN = "<!-- PROTECTED -->"
+PROTECTED_CLOSE = "<!-- /PROTECTED -->"
 _PROTECTED_RE = re.compile(
-    re.escape(_PROTECTED_OPEN) + r"\n?(.*?)\n?" + re.escape(_PROTECTED_CLOSE),
+    re.escape(PROTECTED_OPEN) + r"\n?(.*?)\n?" + re.escape(PROTECTED_CLOSE),
     re.DOTALL,
 )
 _ANY_PROTECTED_MARKER_RE = re.compile(
-    re.escape(_PROTECTED_OPEN) + r"|" + re.escape(_PROTECTED_CLOSE),
+    re.escape(PROTECTED_OPEN) + r"|" + re.escape(PROTECTED_CLOSE),
 )
 
 
@@ -219,7 +225,7 @@ def restore_protected_sections(original: str, candidate: str) -> str:
     if not cand_matches:
         # マーカーが全て消失 → 末尾に全保護セクションを追記
         blocks = "\n\n".join(
-            f"{_PROTECTED_OPEN}\n{s}\n{_PROTECTED_CLOSE}" for s in orig_sections
+            f"{PROTECTED_OPEN}\n{s}\n{PROTECTED_CLOSE}" for s in orig_sections
         )
         return candidate.rstrip() + "\n\n" + blocks
 
@@ -227,14 +233,14 @@ def restore_protected_sections(original: str, candidate: str) -> str:
     result = candidate
     for i, match in reversed(list(enumerate(cand_matches))):
         if i < len(orig_sections):
-            replacement = f"{_PROTECTED_OPEN}\n{orig_sections[i]}\n{_PROTECTED_CLOSE}"
+            replacement = f"{PROTECTED_OPEN}\n{orig_sections[i]}\n{PROTECTED_CLOSE}"
             result = result[:match.start()] + replacement + result[match.end():]
 
     # candidate のマーカー数が不足している場合: 残りを末尾に追記
     if len(cand_matches) < len(orig_sections):
         extra = orig_sections[len(cand_matches):]
         blocks = "\n\n".join(
-            f"{_PROTECTED_OPEN}\n{s}\n{_PROTECTED_CLOSE}" for s in extra
+            f"{PROTECTED_OPEN}\n{s}\n{PROTECTED_CLOSE}" for s in extra
         )
         result = result.rstrip() + "\n\n" + blocks
 
@@ -242,6 +248,8 @@ def restore_protected_sections(original: str, candidate: str) -> str:
 
 
 __all__ = [
+    "PROTECTED_CLOSE",
+    "PROTECTED_OPEN",
     "FewShotExample",
     "FewShotSelector",
     "dedupe_paragraphs",

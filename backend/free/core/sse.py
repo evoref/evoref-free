@@ -8,6 +8,8 @@
 
 import json
 
+from backend.i18n_helper import msg as i18n_msg
+
 
 class SSEFrameBuilder:
     """SSE フレーム生成の統一ビルダー
@@ -146,10 +148,18 @@ class SSEFrameBuilder:
     def error(msg: str) -> str:
         """エラーフレーム
 
+        本文が空のときは汎用メッセージへ差し替える。呼出側の多くは
+        ``sse.error(str(e))`` だが、例外は必ずしもメッセージを持たない
+        (``httpx.ReadError('')`` 等)。空のまま流すとフロントは中身の無い
+        エラーフレームを受け取り、ユーザーには「何も起きなかった」ように
+        見える (実インシデント 2026-07-29 ライブ監査: GPU デバイスロストで
+        llama-server が落ちた際、応答が空欄のまま完了扱いになった)。
+
         Args:
             msg: エラーメッセージ
         """
-        return f"data: {json.dumps({'error': msg})}\n\n"
+        text = (msg or "").strip() or i18n_msg("error.chat.stream_failed")
+        return f"data: {json.dumps({'error': text}, ensure_ascii=False)}\n\n"
 
     @staticmethod
     def error_with_code(code: str, message: str, **context) -> str:

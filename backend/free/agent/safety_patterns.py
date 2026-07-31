@@ -1,10 +1,67 @@
-"""危険コマンドパターン定義（Free / Pro 共有）"""
+"""危険コマンドパターン定義 + コマンドリテラル判定（Free / Pro 共有）"""
 
 from __future__ import annotations
 
 import ast
+import re
 import shlex
 from pathlib import Path
+
+# バッククォートで囲まれた区間。ユーザーは「コマンド `dir E:\tmp\x` を実行して」の
+# ようにコマンドを、`foo.txt` のように語の強調を、どちらもこの記法で書く。
+_BACKTICK_SPAN_RE = re.compile(r"`([^`\n]+)`")
+
+
+def _span_looks_like_command(span: str) -> bool:
+    """バッククォート区間がコマンド呼び出しに見えるか判定する。
+
+    保守的に「空白区切りで 2 トークン以上あり、第 1 トークンがパス・ファイル名
+    でない」場合のみコマンドと見なす。``foo.txt`` / ``E:\\tmp\\x`` のような
+    強調用途の単独パスは対象外に落とす。
+    """
+    tokens = span.split()
+    if len(tokens) < 2:
+        return False
+    head = tokens[0]
+    return not any(c in head for c in ("\\", "/", "."))
+
+
+def strip_command_literals(text: str) -> str:
+    """バッククォートで囲まれた **コマンド** を取り除いたテキストを返す。
+
+    コマンドの引数として現れるパスは、読み書きの対象ではなくコマンドの一部
+    である。ファイルパス抽出や書込み意図判定をこの位置のパスに反応させると、
+    実行依頼がファイル操作に化ける (実インシデント 2026-07-29 ライブ監査:
+    「コマンド `dir E:\\tmp\\no_such_dir_zzz` を実行して、返ってきた出力を
+    そのまま報告してください」が、「出力」を書込み動詞と解釈したうえで
+    コマンド引数のパスを書込み先に取り、幻覚した dir 出力 61 バイトを
+    ``E:\\tmp\\no_such_dir_zzz`` へ書き込んで「完了しました」と報告した)。
+
+    コマンド実行系の判定は生のクエリを見るため、本関数の戻り値は「パス抽出 /
+    書込み意図判定」の入力としてのみ使うこと。
+    """
+    if "`" not in text:
+        return text
+    return _BACKTICK_SPAN_RE.sub(
+        lambda m: " " if _span_looks_like_command(m.group(1)) else m.group(0),
+        text,
+    )
+
+
+def extract_command_literal(text: str) -> str:
+    """テキスト中の最初の「コマンドに見えるバッククォート区間」を返す。
+
+    ``strip_command_literals`` と同じ判定基準を使う。見つからなければ空文字列
+    (純粋関数)。
+    """
+    if "`" not in text:
+        return ""
+    for m in _BACKTICK_SPAN_RE.finditer(text):
+        span = m.group(1).strip()
+        if _span_looks_like_command(span):
+            return span
+    return ""
+
 
 # 危険コマンドパターン（run_command_safe + EventReminderSystem で共有）
 DANGEROUS_PATTERNS: list[str] = [

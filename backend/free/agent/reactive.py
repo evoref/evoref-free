@@ -7,6 +7,16 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from backend.free.core.intent_vocab import (
+    GREETING_PUNCTUATION_EN,
+    GREETING_PUNCTUATION_JA,
+    exact_greeting_pattern,
+)
+from backend.free.core.intent_vocab import (
+    GREETING_PUNCTUATION_EN,
+    GREETING_PUNCTUATION_JA,
+    exact_greeting_pattern,
+)
 from backend.free.core.locale_patterns import select_locale_variant
 from backend.log_config import get_logger
 
@@ -55,13 +65,13 @@ class ResponseCache:
 
 # 定型応答パターン: (regex, response)
 GREETING_RESPONSES: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"^(?:こんにち[はわ])\s*[!！。.]?\s*$", re.IGNORECASE), "こんにちは！何かお手伝いできることはありますか？"),
-    (re.compile(r"^(?:おはよう(?:ございます)?)\s*[!！。.]?\s*$", re.IGNORECASE), "おはようございます！今日は何をしましょうか？"),
-    (re.compile(r"^(?:こんばんは)\s*[!！。.]?\s*$", re.IGNORECASE), "こんばんは！何かお手伝いしましょうか？"),
-    (re.compile(r"^(?:やあ|ども|hi|hello|hey)\s*[!！。.]?\s*$", re.IGNORECASE), "こんにちは！お気軽にどうぞ。"),
-    (re.compile(r"^(?:ありがと[うございます]*|thanks|thank you)\s*[!！。.]?\s*$", re.IGNORECASE), "どういたしまして！他に何かあればお気軽にどうぞ。"),
-    (re.compile(r"^(?:おやすみ(?:なさい)?)\s*[!！。.]?\s*$", re.IGNORECASE), "おやすみなさい。良い夜を！"),
-    (re.compile(r"^(?:さようなら|bye|goodbye)\s*[!！。.]?\s*$", re.IGNORECASE), "さようなら！またいつでもどうぞ。"),
+    (re.compile(exact_greeting_pattern(r"こんにち[はわ]", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), "こんにちは！何かお手伝いできることはありますか？"),
+    (re.compile(exact_greeting_pattern(r"おはよう(?:ございます)?", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), "おはようございます！今日は何をしましょうか？"),
+    (re.compile(exact_greeting_pattern(r"こんばんは", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), "こんばんは！何かお手伝いしましょうか？"),
+    (re.compile(exact_greeting_pattern(r"やあ|ども|hi|hello|hey", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), "こんにちは！お気軽にどうぞ。"),
+    (re.compile(exact_greeting_pattern(r"ありがと[うございます]*|thanks|thank you", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), "どういたしまして！他に何かあればお気軽にどうぞ。"),
+    (re.compile(exact_greeting_pattern(r"おやすみ(?:なさい)?", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), "おやすみなさい。良い夜を！"),
+    (re.compile(exact_greeting_pattern(r"さようなら|bye|goodbye", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), "さようなら！またいつでもどうぞ。"),
 ]
 
 # GREETING_RESPONSES の英語版。GUI 左下の言語設定が 'en' の場合のみ使う
@@ -70,12 +80,12 @@ GREETING_RESPONSES: list[tuple[re.Pattern, str]] = [
 # 元の JA パターンには hi/hello/hey (72行目) が既に含まれているため、
 # ここでも同様の口語挨拶を独立エントリとして残す。
 GREETING_RESPONSES_EN: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"^(?:hi|hello|hey)\s*[!.]?\s*$", re.IGNORECASE), "Hello! What can I help you with?"),
-    (re.compile(r"^good\s*morning\s*[!.]?\s*$", re.IGNORECASE), "Good morning! What shall we work on today?"),
-    (re.compile(r"^good\s*(?:evening|afternoon)\s*[!.]?\s*$", re.IGNORECASE), "Good evening! How can I help?"),
-    (re.compile(r"^good\s*night\s*[!.]?\s*$", re.IGNORECASE), "Good night! Sleep well."),
-    (re.compile(r"^(?:thanks|thank\s*you)\s*[!.]?\s*$", re.IGNORECASE), "You're welcome! Feel free to ask anything else."),
-    (re.compile(r"^(?:bye|goodbye)\s*[!.]?\s*$", re.IGNORECASE), "Goodbye! Talk to you again soon."),
+    (re.compile(exact_greeting_pattern(r"hi|hello|hey", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), "Hello! What can I help you with?"),
+    (re.compile(exact_greeting_pattern(r"good\s*morning", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), "Good morning! What shall we work on today?"),
+    (re.compile(exact_greeting_pattern(r"good\s*(?:evening|afternoon)", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), "Good evening! How can I help?"),
+    (re.compile(exact_greeting_pattern(r"good\s*night", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), "Good night! Sleep well."),
+    (re.compile(exact_greeting_pattern(r"thanks|thank\s*you", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), "You're welcome! Feel free to ask anything else."),
+    (re.compile(exact_greeting_pattern(r"bye|goodbye", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), "Goodbye! Talk to you again soon."),
 ]
 
 
