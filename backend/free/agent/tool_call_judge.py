@@ -18,7 +18,11 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from backend.free.agent.reactive import GREETING_RESPONSES, GREETING_RESPONSES_EN
-from backend.free.agent.router import HISTORY_KEYWORDS, HISTORY_KEYWORDS_EN
+from backend.free.agent.router import (
+    HISTORY_KEYWORDS,
+    HISTORY_KEYWORDS_EN,
+    is_environment_fact_query,
+)
 from backend.free.core.intent_vocab import (
     PROXIMAL_RECALL_KEYWORDS,
     SESSION_ANCHOR_EN,
@@ -34,7 +38,7 @@ from backend.free.agent.safety_patterns import (
     reject_readonly_violation,
     strip_command_literals,
 )
-from backend.free.agent.tools_registry import ToolsRegistry
+from backend.free.agent.tools_registry import ToolDefinition, ToolsRegistry
 from backend.free.llm.json_extract import extract_json_object
 from backend.log_config import get_logger
 
@@ -52,6 +56,33 @@ logger = get_logger("agent.tool_call_judge")
 # 選別として機能せず、類似度ゲート 1 本で決まってしまうため。
 #: 実行可能コマンドを載せるツール名 (mode により片方のみ利用可能)。
 _COMMAND_TOOL_NAMES = frozenset({"run_command", "run_command_readonly"})
+
+#: 「直下だけ」を指す表現。再帰的な列挙を明示する語 (再帰 / 全部 / 配下すべて)
+#: が同居する依頼は対象外にして、意図が割れる文には手を入れない。
+_IMMEDIATE_CHILDREN_RE = re.compile(
+    r"直下|直下の|トップレベル|第一階層|一階層目"
+    r"|immediate\s+children|top[-\s]?level|first\s+level",
+    re.IGNORECASE,
+)
+_RECURSIVE_LISTING_RE = re.compile(
+    r"再帰|階層すべて|配下すべて|すべての階層|全階層|recursive(?:ly)?",
+    re.IGNORECASE,
+)
+
+#: 処理対象の本文そのものを引数に取るツール。判定プロンプトの会話は切り詰めて
+#: あるため、assist の転記をそのまま使うと断片だけが処理される。
+_TEXT_OPERAND_TOOLS = frozenset({"summarize", "translate"})
+
+#: 判定プロンプトへ載せる会話 1 メッセージあたりの文字数上限。切り詰め側と
+#: 復元側で同じ定数を共有する (別々に持つと片方の変更で復元が効かなくなる)。
+_JUDGE_CONTEXT_CHARS = 100
+
+#: 同じ能力を持ち権限だけが違うツールの対応表 (優先順)。assist が mode 外の
+#: 兄弟名を返したとき、撃てる方へ載せ替えて判定の意図を保つ。緩い側から厳しい
+#: 側への一方向にだけ張る (逆向きに張ると chat が特権ツールへ昇格してしまう)。
+_MODE_CAPABILITY_SIBLINGS: dict[str, tuple[str, ...]] = {
+    "run_command": ("run_command_readonly",),
+}
 
 _RECALL_SMALL_POOL_SIZE = 3
 _RECALL_SMALL_POOL_MARGIN = 0.1
@@ -1376,6 +1407,8 @@ class ToolCallJudge:
         # readonly 検証違反 (PowerShell 等) / mode 非対応での降格で立つ。
         # deliberative がこれを見て、測っていない値の捏造を禁じる注記を付ける。
         self._measurement_blocked: bool = False
+        # 直近の judge() のユーザークエリ。measurement_blocked の適用可否判定用。
+        self._last_query: str = ""
 
     @property
     def measurement_blocked(self) -> bool:
@@ -1387,10 +1420,35 @@ class ToolCallJudge:
         """
         return self._measurement_blocked
 
+    def _user_requested_measurement(self) -> bool:
+        """直近クエリが実測 (環境事実の取得 / コマンド実行) を求めているか。
+
+        層5 のコマンド合成は環境事実を尋ねていないクエリにも投機的に走るため、
+        合成の棄却だけで「実測できなかった」と記録すると、測定を求めていない
+        質問にまで断り書きが混入する (実インシデント 2026-08-01 ライブ監査:
+        「あなたは何ができますか？」への回答に「PC の空き容量や具体的なスペックは
+        測定ツールが利用できないため取得できていません」が混ざった)。
+
+        ユーザー意図を確立していない投機的な経路だけがこれを見る。意図が
+        呼出時点で確定している経路 (明示コマンド + 実行動詞 / 判定層が
+        コマンドツールを選択済み) は無条件に記録してよい。
+
+        判定材料が無い場合 (クエリ未設定の直接呼出) は従来どおり True。
+        """
+        if not self._last_query:
+            return True
+        return is_environment_fact_query(self._last_query) or bool(
+            extract_command_literal(self._last_query),
+        )
+
     def _reject_readonly(self, exec_tool: str, command: str) -> bool:
-        """``_readonly_command_rejected`` に「実測が阻まれた」記録を足したもの。"""
+        """``_readonly_command_rejected`` に「実測が阻まれた」記録を足したもの。
+
+        コマンドは層5 が投機的に合成したものでもあり得るため、ユーザーが実測を
+        求めていないクエリでは記録しない (``_user_requested_measurement`` 参照)。
+        """
         rejected = _readonly_command_rejected(exec_tool, command)
-        if rejected:
+        if rejected and self._user_requested_measurement():
             self._measurement_blocked = True
         return rejected
 
@@ -1480,6 +1538,7 @@ class ToolCallJudge:
             ToolJudgement
         """
         self._measurement_blocked = False
+        self._last_query = query
 
         # 0. URL リコール先回り判定 (mode / enabled に関係なく実行)
         # ``_try_recall_url`` は決定論的 (embedding 類似度 + 過去採点平均閾値)
@@ -2069,6 +2128,16 @@ class ToolCallJudge:
         if assist_guards:
             guards += [
                 (
+                    "truncated_text_operand",
+                    lambda r: self._restore_truncated_text_operand(
+                        r, conversation,
+                    ),
+                ),
+                (
+                    "immediate_children_depth",
+                    lambda r: self._scope_list_directory_depth(r, query),
+                ),
+                (
                     "ungrounded_calculate",
                     lambda r: self._suppress_ungrounded_calculate(
                         r, query, conversation,
@@ -2145,6 +2214,11 @@ class ToolCallJudge:
             )
             return ToolJudgement(tool_needed=False, source=result.source)
         if mode not in tool_def.modes:
+            remapped = self._remap_to_mode_sibling(
+                result, tools_registry, mode, tool_def,
+            )
+            if remapped is not None:
+                return remapped
             logger.info(
                 "Tool %s not available in mode=%s (allowed: %s); "
                 "downgrading to no_tool before returning judgement",
@@ -2156,6 +2230,125 @@ class ToolCallJudge:
                 self._measurement_blocked = True
             return ToolJudgement(tool_needed=False, source=result.source)
         return result
+
+    def _scope_list_directory_depth(
+        self, result: "ToolJudgement", query: str,
+    ) -> "ToolJudgement":
+        """「直下だけ」の一覧依頼で ``list_directory`` を 1 階層に絞る。
+
+        既定の 3 階層ツリーを返すと、受け取ったモデルがインデントを読み違えて
+        入れ子の項目を直下の項目として並べる (実インシデント 2026-08-01 再検証:
+        「直下にあるファイルとフォルダを一覧して」に対し backend/ の下の
+        develop/ api/ tests/ を直下として列挙した)。深さは依頼文から決まる
+        決定論的な値なので、モデルの転記に委ねず code 側で確定させる。
+        """
+        if result.tool_name != "list_directory" or not query:
+            return result
+        if not _IMMEDIATE_CHILDREN_RE.search(query):
+            return result
+        if _RECURSIVE_LISTING_RE.search(query):
+            return result
+        args = dict(result.tool_args or {})
+        if _coerce_positive_int(args.get("max_depth")) == 1:
+            return result
+        args["max_depth"] = 1
+        logger.info(
+            "list_directory scoped to immediate children for query: %s",
+            query[:60],
+        )
+        return ToolJudgement(
+            tool_needed=True,
+            tool_name=result.tool_name,
+            tool_args=args,
+            source=result.source,
+        )
+
+    def _restore_truncated_text_operand(
+        self, result: "ToolJudgement", conversation: list[dict] | None,
+    ) -> "ToolJudgement":
+        """text 引数へ転記された「切り詰め済み会話」の断片を全文へ復元する。
+
+        判定用プロンプトは会話を 1 メッセージ ``_JUDGE_CONTEXT_CHARS`` 文字で
+        切って assist に見せる。summarize / translate のように**処理対象の本文
+        そのものを引数に取る**ツールでは、assist はその切り詰められた断片しか
+        転記できず、後段は断片だけを処理してしまう (実インシデント 2026-08-01
+        ライブ監査: 4 ユニット 530 文字の四季の文章を「1 行に要約して」と頼んだ
+        ところ、先頭 100 文字 = 春の節だけが要約された)。
+
+        引数が会話中メッセージの真の接頭辞になっている場合、それは切り詰めの
+        産物であって「その部分だけを対象にする」という意図ではない。元メッセージ
+        全文へ差し替える。引数が全文と一致していれば何もしない。
+
+        文字数上限を引き上げる対処では、上限を超える長さで同じ欠落が再発する。
+        転記させず code 側で解決するのが構造的な解。
+        """
+        if not result.tool_needed or result.tool_name not in _TEXT_OPERAND_TOOLS:
+            return result
+        excerpt = (result.tool_args or {}).get("text")
+        if not isinstance(excerpt, str) or not excerpt.strip():
+            return result
+        excerpt = excerpt.strip()
+        for msg in reversed(conversation or []):
+            content = msg.get("content")
+            if not isinstance(content, str):
+                continue
+            full = content.strip()
+            if len(full) > len(excerpt) and full.startswith(excerpt):
+                logger.info(
+                    "Restored truncated text operand for %s: %d -> %d chars",
+                    result.tool_name, len(excerpt), len(full),
+                )
+                args = dict(result.tool_args or {})
+                args["text"] = full
+                return ToolJudgement(
+                    tool_needed=True,
+                    tool_name=result.tool_name,
+                    tool_args=args,
+                    source=result.source,
+                )
+        return result
+
+    def _remap_to_mode_sibling(
+        self,
+        result: "ToolJudgement",
+        tools_registry: ToolsRegistry,
+        mode: str,
+        tool_def: ToolDefinition,
+    ) -> "ToolJudgement | None":
+        """mode 外のツール名を、同じ能力を持つ mode 内の兄弟ツールへ載せ替える。
+
+        assist へ渡すカタログは mode で絞ってあるが、モデルは学習事前分布から
+        カタログ外の兄弟名を返すことがある (実インシデント 2026-08-01 ライブ監査:
+        chat モードで ``run_command`` を返し、ガードが no_tool へ落として
+        「ツールを実行できなかった」という曖昧な断りだけが残った。実際には
+        ``run_command_readonly`` が同じ ``command`` 引数で撃てた)。
+
+        判定そのものは正しいのに名前だけが外れている場合に意図を捨てないための
+        載せ替え。引数スキーマが被覆関係にある (兄弟の必須引数をすべて満たせる)
+        ときだけ行い、満たせなければ従来どおり no_tool へ落とす。権限は兄弟側の
+        ツールが自前で検証するため、ここで緩むことはない。
+
+        Returns:
+            載せ替えた判定。該当が無ければ None (純粋な判定、副作用なし)。
+        """
+        for sibling in _MODE_CAPABILITY_SIBLINGS.get(result.tool_name, ()):
+            if not tools_registry.is_available(sibling, mode):
+                continue
+            supplied = set(result.tool_args or {})
+            if not tools_registry.required_params(sibling) <= supplied:
+                continue
+            logger.info(
+                "Tool %s not available in mode=%s (allowed: %s); remapping to "
+                "same-capability sibling %s",
+                result.tool_name, mode, tool_def.modes, sibling,
+            )
+            return ToolJudgement(
+                tool_needed=True,
+                tool_name=sibling,
+                tool_args=dict(result.tool_args or {}),
+                source=result.source,
+            )
+        return None
 
     def _suppress_unfetchable_fetch_url(
         self, result: "ToolJudgement",
@@ -3530,7 +3723,7 @@ class ToolCallJudge:
             context_lines = []
             for msg in recent:
                 role = msg.get("role", "")
-                content = msg.get("content", "")[:100]
+                content = msg.get("content", "")[:_JUDGE_CONTEXT_CHARS]
                 if role in ("user", "assistant"):
                     context_lines.append(f"{role}: {content}")
             if context_lines:

@@ -281,6 +281,29 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
 }
 
 
+# 反応的タイムアウト較正 (``_bump_calibrated_timeout``) の対象外 purpose。
+#
+# 判定基準は **タイムアウト時にアシストの答えを必要としない安全側の既定へ
+# フォールバックするか**。そうした purpose では、予算を上げても得られるのは
+# 「より高い失敗コスト」だけで、成功率の改善が結果に反映されない。
+#
+# 実測 (2026-08-01 プロファイリング): ``retrieval_necessity_judge`` は
+# タイムアウトのたびに較正が 5.0→7.5→11.2→15.0s (cap) と上がり、失敗 1 回の
+# コストが 3 倍になっていた。この判定は「~1.2 秒の検索をやるべきか」を決める
+# ゲートで、タイムアウト時は skip に倒れて答えは捨てられる。**ゲートがゲート
+# 対象より高くつく**状態を較正が自ら悪化させていた。
+#
+# 較正が有効なのは「予算を増やせば使える答えが返る」purpose (長文生成・要約・
+# 変異など、結果を実際に使うもの)。新しい purpose を足すときは、タイムアウト時に
+# その答えを使うかどうかで振り分ける。全 purpose の分類は
+# ``test_assist_timeout_calibration.py`` が網羅を強制する。
+PURPOSE_TIMEOUT_CALIBRATION_EXEMPT: frozenset[str] = frozenset({
+    "retrieval_necessity_judge",   # timeout → skip (答えを捨てる)
+    "retrieval_quality_judge",     # timeout → ルール判定の品質をそのまま採用
+    "retrieval_chunk_gate",        # timeout → prune せず全件通す
+})
+
+
 # purpose 文字列 → reasoning_budget の既定マップ
 # override 値。``-1`` 無制限 / ``0`` 即終了 / ``N>0`` token 上限。
 # config.yaml の ``assist_model.reasoning_budgets`` 未指定時に適用される。
@@ -718,10 +741,22 @@ class AssistModelClient(BaseHTTPClient):
                 self._calibration_path, self._assist_model_filename,
             )
             # config 明示 purpose は権威として上書きしない。
+            # 較正対象外 purpose の永続値も捨てる: 対象外化する前に膨らんだ値が
+            # 残っていると、既存インストールでは修正が効かないまま失敗コストの
+            # 高い予算 (実測 15.0s) を読み戻し続ける。
             self._calibrated_timeouts = {
                 p: v for p, v in loaded.items()
                 if p not in self._purpose_timeouts
+                and p not in PURPOSE_TIMEOUT_CALIBRATION_EXEMPT
             }
+            dropped = sorted(
+                set(loaded) & PURPOSE_TIMEOUT_CALIBRATION_EXEMPT,
+            )
+            if dropped:
+                logger.info(
+                    "Dropped persisted calibration for gate purposes: %s",
+                    ", ".join(dropped),
+                )
             if self._calibrated_timeouts:
                 logger.info(
                     "Loaded assist timeout calibration for model=%s "
@@ -1380,6 +1415,15 @@ class AssistModelClient(BaseHTTPClient):
         を基準に ``_CALIB_BUMP_FACTOR`` 倍ずつ、``base * _CALIB_MAX_SCALE`` を
         上限に上げる。値が変化した場合のみ WARNING ログ + 永続化する。
         """
+        if purpose in PURPOSE_TIMEOUT_CALIBRATION_EXEMPT:
+            # ゲート用途。予算を上げても失敗コストが上がるだけで結果は変わらない
+            # (PURPOSE_TIMEOUT_CALIBRATION_EXEMPT の説明を参照)。
+            logger.info(
+                "Assist purpose '%s' timed out (budget=%.1fs); calibration is "
+                "exempt for gate purposes, keeping the budget",
+                purpose, budget,
+            )
+            return
         base = PURPOSE_TIMEOUT_DEFAULTS.get(purpose, self.timeout)
         ceiling = base * _CALIB_MAX_SCALE
         current = self._calibrated_timeouts.get(purpose, base)

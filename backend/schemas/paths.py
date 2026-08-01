@@ -88,6 +88,7 @@ class LocalPathsConfig(BaseModel):
     # アシスト purpose 別 timeout の反応的自己較正値 (model-keyed)。
     # AssistModelClient が ReadTimeout 観測から引き上げた天井を永続化する。
     assist_calibration_file: str = "local/assist_calibration.json"
+    rag_judge_events_file: str = "local/rag_judge_events.jsonl"
     lora_archive_dir: str = "local/lora_archive/"
     embed_lora_adapter: str = Field(
         default="local/models/embed_adapter.gguf",

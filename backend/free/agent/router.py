@@ -40,7 +40,6 @@ logger = get_logger("agent.router")
 # の学習済みキーワード (FeedbackCollector で蓄積、LearningScheduler で進化)
 # も判定対象 (`_detect_long_form_learned()` で OR 統合)。
 LONG_FORM_PATTERNS = [
-    re.compile(r"(\d{3,})\s*[字文行]"),                        # 「3000字の記事」「500行」
     # 文書系名詞 → 動作動詞 の組合せ。
     # 「仕様書を作成して」「ドキュメントを出力して」「計画書をまとめて」等
     # を長文生成として拾う。名詞語彙は backend/free/document_nouns.py で
@@ -74,7 +73,6 @@ LONG_FORM_PATTERNS = [
 # チャットすると、以前は locale 排他選択のため英語の文書作成依頼が一切
 # 検出されなかった。詳細は _detect_long_form 参照)。
 LONG_FORM_PATTERNS_EN = [
-    re.compile(r"\b(\d{3,})[\s-]?(?:words?|lines?)\b", re.IGNORECASE),  # "3000-word article" "500 lines"
     re.compile(
         rf"\b(?:write|draft|create|compose|generate|produce|prepare|put\s+together)\b"
         rf".*\b(?:{'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX_EN + DOCUMENT_NOUNS_STANDALONE_EN)})\b"
@@ -447,6 +445,53 @@ GREETING_PATTERNS = [
         re.IGNORECASE,
     ),
 ]
+
+
+#: 「N 文字 / N 行」型の分量指定。**桁数ではなく実際の大きさ** で判定する。
+#: 旧実装は ``\d{3,}`` (3 桁以上) を「大きい」の代用にしており、300 文字程度の
+#: 普通のチャット回答までユニット分割パイプラインへ流していた (実インシデント
+#: 2026-08-01 ライブ監査: 「300 文字程度で説明して」が 4 ユニット 530 字になり、
+#: 品質ゲートが「目標の 1.77 倍」と警告した)。桁数は大きさの代用でしかなく、
+#: 100〜999 の帯で必ず外れる。捕捉した数値をそのまま閾値と比べる。
+_LENGTH_REQUEST_RE = re.compile(r"(\d{2,})\s*(文字|字|行|文)")
+_LENGTH_REQUEST_RE_EN = re.compile(
+    r"\b(\d{2,})[\s-]?(words?|lines?|characters?|chars?)\b", re.IGNORECASE,
+)
+#: 単位ごとの長文しきい値。1 単位あたりの分量が違うので単位別に持つ。
+#: 字/文字 1000 は「1 パス生成で収まる上限」の目安。これ未満でユニット分割
+#: すると、構造化の利得より各ユニットの尺の膨らみ (実測 1.77 倍) が上回る。
+_LONG_FORM_MIN_BY_UNIT: dict[str, int] = {
+    "文字": 1000, "字": 1000, "文": 50, "行": 100,
+    "word": 300, "words": 300, "character": 1000, "characters": 1000,
+    "char": 1000, "chars": 1000, "line": 100, "lines": 100,
+}
+
+
+def is_environment_fact_query(query: str) -> bool:
+    """クエリがこの実行環境の事実 (時刻 / OS / スペック等) を尋ねているか。
+
+    router の executable_query 分類と、``ToolCallJudge.measurement_blocked`` の
+    公開可否判定が **同じ語彙を共有** するための公開口。別々に持つと、片方だけ
+    更新されて「測定要求なのに注記が付かない / 測定要求でないのに付く」の
+    どちらかがずれる (純粋関数)。
+    """
+    return _matches_any(_EXECUTABLE_QUERY_PATTERNS, query) or _matches_any(
+        _EXECUTABLE_QUERY_PATTERNS_EN, query,
+    )
+
+
+def requests_long_output(query: str) -> bool:
+    """クエリが「長文と呼べる分量」を明示的に指定しているか (純粋関数)。
+
+    単位ごとの閾値以上を 1 つでも指定していれば True。分量指定が無い、
+    または閾値未満なら False (他の long_form シグナルの判定へ委ねる)。
+    """
+    for regex in (_LENGTH_REQUEST_RE, _LENGTH_REQUEST_RE_EN):
+        for amount, unit in regex.findall(query):
+            threshold = _LONG_FORM_MIN_BY_UNIT.get(unit.lower())
+            if threshold is not None and int(amount) >= threshold:
+                return True
+    return False
 
 
 def _matches_any(patterns: list[re.Pattern], query: str) -> bool:
@@ -858,6 +903,8 @@ class ComplexityClassifier:
         # 「見出しだけ並べて」型は既出成果物の抽出であって生成ではない。
         if _EXTRACTION_REQUEST_RE.search(query):
             return False
+        if requests_long_output(query):
+            return True
         if _matches_any(LONG_FORM_PATTERNS, query) or _matches_any(
             LONG_FORM_PATTERNS_EN, query,
         ):
@@ -908,9 +955,7 @@ class ComplexityClassifier:
 
     def _contains_executable_query_keywords(self, query: str) -> bool:
         """Python 実行で正確に答えられるクエリのキーワードを検出"""
-        return _matches_any(_EXECUTABLE_QUERY_PATTERNS, query) or _matches_any(
-            _EXECUTABLE_QUERY_PATTERNS_EN, query,
-        )
+        return is_environment_fact_query(query)
 
     def _contains_learned_tool_patterns(self, query: str) -> bool:
         """学習済み tool_routing パターンにマッチするか判定"""

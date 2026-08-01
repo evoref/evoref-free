@@ -450,8 +450,18 @@ def search_code(pattern: str, directory: str = ".", max_results: int = 20) -> st
     return "\n".join(results)
 
 
+#: ツリー出力の行数上限。超過分は黙って捨てず、省略行数を明示する。
+#: 黙って切ると、受け取ったモデルは手元の部分木を全体として提示する
+#: (実インシデント 2026-08-01 ライブ監査 再検証: 6070 文字のツリーが途中で
+#: 切れ、入れ子の項目が直下の項目として並べられた)。
+_LIST_DIRECTORY_MAX_LINES = 200
+
+
 def list_directory(directory: str = ".", max_depth: int = 3) -> str:
-    """ディレクトリ構造を表示する"""
+    """ディレクトリ構造を表示する
+
+    ``max_depth=1`` で直下のみ。「直下を一覧して」型の依頼はこれで満たせる。
+    """
     base = Path(directory)
     if not base.exists():
         return f"Error: Directory not found: {directory}"
@@ -461,12 +471,25 @@ def list_directory(directory: str = ".", max_depth: int = 3) -> str:
 
     if not lines:
         return "(empty directory)"
-    return "\n".join(lines[:200])
+    if len(lines) > _LIST_DIRECTORY_MAX_LINES:
+        omitted = len(lines) - _LIST_DIRECTORY_MAX_LINES
+        lines = [
+            *lines[:_LIST_DIRECTORY_MAX_LINES],
+            f"... ({omitted} more entries omitted) ...",
+        ]
+    return "\n".join(lines)
 
 
 def _walk_tree(path: Path, lines: list[str], prefix: str, depth: int, max_depth: int) -> None:
-    """ディレクトリツリーを再帰的に構築"""
-    if depth > max_depth:
+    """ディレクトリツリーを再帰的に構築
+
+    ``max_depth`` は **表示する階層数**。``depth`` は 0 起点なので打ち切りは
+    ``>=`` で行う。``>`` だと 1 階層余分に降り、``max_depth=1`` (直下だけ) が
+    2 階層返る (実インシデント 2026-08-01 再検証: 直下一覧の依頼に
+    ``max_depth=1`` が正しく渡ったのに孫階層まで出力され、受け取ったモデルが
+    入れ子の項目を直下として並べた)。
+    """
+    if depth >= max_depth:
         return
     entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name))
     skip_dirs = {".git", "node_modules", "__pycache__", ".svelte-kit", "dist"}
@@ -1341,9 +1364,20 @@ def register_builtin_tools(
     registry.register(
         name="list_directory",
         func=list_directory,
-        description="List the directory structure",
+        description="List the directory structure as an indented tree",
         parameters={
             "directory": {"type": "string", "description": "Directory to list"},
+            # 関数は元から max_depth を持っていたがスキーマに出しておらず、
+            # 「直下だけ一覧して」という依頼を表現する手段が無かった。常に 3 階層
+            # の木が返り、受け取ったモデルがインデントを読み違えて入れ子の項目を
+            # 直下の項目として並べた (実インシデント 2026-08-01 再検証)。
+            "max_depth": {
+                "type": "integer",
+                "description": (
+                    "How many levels to descend. Use 1 for the immediate "
+                    "children of the directory only. Default 3."
+                ),
+            },
         },
     )
 

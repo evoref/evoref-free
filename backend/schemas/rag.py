@@ -82,6 +82,21 @@ class SelfRagAssistJudgeConfig(BaseModel):
 
     # 機能の有効/無効。無効時はルールベース判定のみで確定する。
     enabled: bool = True
+    # 発火する top_score の上限。この値以上のスコアでは発火しない。
+    #
+    # 実効果は「medium → low への格下げ (= チャンク破棄)」のみで、
+    # medium と high は Step 6.5 で同じ扱い (どちらも添付) になる。つまり
+    # medium → high の再判定は 6 秒かけて何も変えない。
+    #
+    # 実測 (2026-08-01、11 発火の top_score → 判定):
+    #   0.653 low / 0.659 low / 0.712 high / 0.721 high / 0.723 high /
+    #   0.727 low / 0.758 high / 0.768 high / 0.776 high / 0.784 high / 0.814 high
+    # 格下げは 0.727 以下に集中し、0.75 で切ると観測された格下げ 3/3 を保ったまま
+    # 発火を 11 → 6 (45% 減) にできる。**きれいな分離ではない** (0.727 が
+    # upgrade 帯 0.712〜0.814 に食い込む) ため、これ以上絞ると格下げを取りこぼす。
+    # 標本 11 件なので、値を動かすときは上の表を取り直すこと。
+    # 0 以下で無効化 (= 従来どおり only_when_quality 帯全域で発火)。
+    max_top_score: float = Field(default=0.75, ge=0.0, le=1.0)
     # 1 セッション (session_id 単位) で発火可能な最大回数。0 以下で無制限。
     # 上限超過時は raw hybrid 結果で返し、DebugLogger に
     # ``assist_judge_skipped_reason="session_cap"`` を記録する。
@@ -114,12 +129,31 @@ class SelfRagAssistNecessityConfig(BaseModel):
     アシストモデルに 1 bit JSON (`{"need_rag": bool}`) を問い、`true` なら
     retrieve、`false` なら skip。失敗 / タイムアウト / 上限到達時は安全側
     (`retrieve`) にフォールバック。
+
+    **既定は無効** (2026-08-01 プロファイリングの結果)。この判定は「検索を
+    実行すべきか」を決めるゲートだが、実測で **ゲートがゲート対象の 165 倍**
+    高くついていた:
+
+        necessity assist  median 3,407ms  (2,552〜4,165ms)
+        retrieval (実作業) median    21ms  (7〜24ms)
+
+    21ms の作業を回避するかどうかを決めるのに 3.4 秒かける構図で、`skip` と
+    判定されたターンでも判定料金だけは必ず発生する (実測: 3,827ms かけて
+    21ms の作業を回避)。無効時は `judge()` が `uncertain → retrieve` の
+    安全側に倒すため、取りこぼしではなく「常に引く」方向へ縮退する。
+    無関係チャンクの混入は下流の品質判定 (Step 5) と
+    「品質 low は添付しない」(Step 6.5) が既に防いでいる。
+
+    有効化すると assist 1 往復ぶんのレイテンシと引き換えに、検索を省く判断が
+    得られる。コーパスが十分大きく retrieval が実測で秒オーダーになる環境では
+    再検討する価値がある (その場合は上の実測値を取り直すこと)。
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    # 機能の有効/無効。無効時は純ルール判定のみで確定する。
-    enabled: bool = True
+    # 機能の有効/無効。無効時は純ルール判定のみで確定する
+    # (uncertain は安全側の retrieve に倒れる)。
+    enabled: bool = False
     # 1 セッション (session_id 単位) で発火可能な最大回数。0 以下で無制限。
     max_per_session: int = Field(default=10, ge=0)
     # 1 クエリ内の最大発火回数。0 以下で無制限。

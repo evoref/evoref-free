@@ -179,6 +179,7 @@ def _resolve_assist_judge_cfg(rag_cfg: dict) -> dict:
     aj_cfg = self_rag_cfg.get("assist_judge") or {}
     return {
         "enabled": bool(aj_cfg.get("enabled", True)),
+        "max_top_score": float(aj_cfg.get("max_top_score", 0.75)),
         "max_per_session": int(aj_cfg.get("max_per_session", 5)),
         "max_per_query": int(aj_cfg.get("max_per_query", 1)),
         "only_when_quality": list(aj_cfg.get("only_when_quality", ["medium"])),
@@ -191,11 +192,14 @@ def _resolve_assist_necessity_cfg(rag_cfg: dict) -> dict:
     検索必要性のハイブリッド判定 (ルール → uncertain 時のみアシスト) を
     制御する。``only_when_quality`` は ``AssistJudgeUsageTracker`` 互換の
     キーで、本機能の quality ラベルは ``"uncertain"`` のみを使う。
+
+    既定は無効 (``SelfRagAssistNecessityConfig`` の説明を参照)。実測で
+    ゲート (3,407ms) がゲート対象の retrieval (21ms) の 165 倍高くついていた。
     """
     self_rag_cfg = rag_cfg.get("self_rag") or {}
     an_cfg = self_rag_cfg.get("assist_necessity") or {}
     return {
-        "enabled": bool(an_cfg.get("enabled", True)),
+        "enabled": bool(an_cfg.get("enabled", False)),
         "max_per_session": int(an_cfg.get("max_per_session", 10)),
         "max_per_query": int(an_cfg.get("max_per_query", 1)),
         "only_when_quality": list(an_cfg.get("only_when_quality", ["uncertain"])),
@@ -281,6 +285,30 @@ async def _maybe_assist_judge_quality(
     ``only_when_quality`` (既定 ``medium``) のみ。
     """
     aj_cfg = _resolve_assist_judge_cfg(rag_cfg)
+
+    # 高スコア側では発火しない。この判定の実効果は medium → low の格下げだけで、
+    # medium → high は Step 6.5 で medium と同じ扱い (添付) になるため何も変えない。
+    # 実測 (2026-08-01) では 11 発火中 8 件が medium → high、つまり 6 秒かけて
+    # 挙動が変わらない呼出だった。格下げが起きる帯だけに絞る
+    # (``max_top_score`` の説明に実測表)。
+    max_top = aj_cfg["max_top_score"]
+    top_score = merged[0][1] if merged else 0.0
+    if max_top > 0 and top_score >= max_top:
+        if debug_logger is not None:
+            debug_logger.log_assist_judge(
+                query_preview=query[:80],
+                rule_based_quality=quality,
+                used=False,
+                final_quality=quality,
+                session_count=0,
+                query_count=0,
+                skipped_reason="top_score_above_band",
+            )
+        logger.debug(
+            "Step 5b assist judge skipped: top_score=%.3f >= %.2f",
+            top_score, max_top,
+        )
+        return quality
 
     if quality in aj_cfg["only_when_quality"]:
         quality_recall_cfg = _resolve_quality_recall_cfg(rag_cfg)
@@ -504,11 +532,27 @@ async def unified_search(
     necessity_cfg = _resolve_assist_necessity_cfg(rag_cfg)
     necessity_recall_cfg = _resolve_necessity_recall_cfg(rag_cfg)
 
+    # Step 1 全体を計測する。ここが未計測だったため「遅い検索の 89.7% が
+    # 内訳不明」という状態が続き、実際の支配要因 (necessity assist の往復) が
+    # 見えていなかった (2026-08-01 プロファイリング)。
+    if timer is not None:
+        timer.start("necessity_ms")
     rule_necessity = necessity_judge.judge_rule_only(query, context_count)
     necessity: str | None = None
     if rule_necessity != "uncertain":
         necessity = rule_necessity
-    elif necessity_recall_cfg["enabled"] and mem_view is not None:
+    elif (
+        # リコールは necessity 判定そのもののキャッシュなので、判定を無効に
+        # したらキャッシュも効かせない。切り離すと「判定は止めたのに過去の
+        # 判定結果が skip を出し続ける」状態になり、無効化の意図が骨抜きになる。
+        # しかもキュレータは閾値 (min_record_score) を超えたものだけ残すため、
+        # 「retrieve は不要だった」と採点されやすい現行ルーブリックの下では
+        # skip 判定が選択的に蓄積される (2026-08-01 実測: retrieve 判定の
+        # 採点は 0.0 で捨てられた)。無効時に生かすと退行方向にしか働かない。
+        necessity_cfg["enabled"]
+        and necessity_recall_cfg["enabled"]
+        and mem_view is not None
+    ):
         from backend.free.memory.pipeline.rag_judge_recall import try_recall_necessity
         recalled = await try_recall_necessity(query_vec, mem_view, necessity_recall_cfg)
         if recalled is not None:
@@ -541,6 +585,8 @@ async def unified_search(
             )
         else:
             necessity = necessity_judge.judge(query, context_count=context_count)
+    if timer is not None:
+        timer.stop("necessity_ms")
     logger.debug("Step 1 necessity: %s (context_count=%d)", necessity, context_count)
     # `fetch` は外部 fetch_url 委譲シグナル — RAG パイプラインは `skip` と同等に
     # 即終了し、ToolCallJudge / fetch_url ツールに委ねる。
@@ -553,6 +599,10 @@ async def unified_search(
     # Step 2-3: STM / LTM / カートリッジを asyncio.gather で並列実行（設計書 4.10.1）
     # fetch_multiplier >= 2 のときは fetch_k 件を取得し、後段で top_k に絞る
     cart_timeout_ms = int(rag_cfg.get("cartridge_search_timeout_ms", 3000))
+    # 取得そのものの所要。necessity ゲートの費用対効果を測るために分けて計る
+    # (ゲートが取得より高くつく状態を検出できるようにする)。
+    if timer is not None:
+        timer.start("retrieval_ms")
     stm_results, ltm_results, cart_results = await asyncio.gather(
         _search_stm_layer(short_term, query_vec, stm_top_k),
         _search_ltm_layer(long_term, query_vec, fetch_k),
@@ -560,6 +610,8 @@ async def unified_search(
             cartridge_mgr, query_vec, fetch_k, timeout_ms=cart_timeout_ms,
         ),
     )
+    if timer is not None:
+        timer.stop("retrieval_ms")
 
     # Lazy Contextual Retrieval — LTM hit について on-demand で
     # プレフィックス生成を非同期タスクとして起動する。fire-and-forget なので

@@ -64,6 +64,7 @@ from backend.free.agent.meta_cognitive_utils import (
     fix_json_backslashes,
     generated_content_rejection,
     looks_like_path_not_content,
+    rescue_quoted_write_literal,
     strip_markdown_wrapper,
     strip_generator_scaffold_block,
     strip_output_lead_in,
@@ -1808,40 +1809,22 @@ class MetaCognitiveAgent:
         成功時は tool_args["content"] を更新して None を返す（ループ続行）。
         """
         file_path = tool_args.get("file_path", "")
-        # 表計算/リッチ文書 (xlsx/csv/docx/pptx) 出力で、タスク横断で取得済みの実
-        # テーブルがあれば、モデルに転記させず取得データを直接書き込む
-        # (ハルシネーション/行脱落の防止、pptx でコード文字列を吐く退行の防止)。
-        if wants_fetched_table(file_path):
-            fetched_table = self._extract_fetched_table_markdown()
-            if fetched_table:
-                tool_args["content"] = fetched_table
-                logger.info(
-                    "write_file content from fetched table (deterministic): "
-                    "%d chars -> %s", len(fetched_table), file_path,
-                )
-                return None
-        if on_step:
-            await call_callback(on_step, {
-                "type": "tool_call",
-                "detail": f"{prefix} コンテンツ生成中 → {file_path}",
-                "status": "running",
-            })
-        content = await self._generate_content(
-            original_query, task.description, llm_client,
+
+        async def _notify_generating() -> None:
+            if on_step:
+                await call_callback(on_step, {
+                    "type": "tool_call",
+                    "detail": f"{prefix} コンテンツ生成中 → {file_path}",
+                    "status": "running",
+                })
+
+        content, rejection = await self._resolve_write_content(
             file_path=file_path,
+            original_query=original_query,
+            task_description=task.description,
+            llm_client=llm_client,
+            notify_generating=_notify_generating,
         )
-        content, rejection = self._validate_generated_content(content, file_path, original_query)
-        if rejection and not content.startswith("(Content generation failed:"):
-            logger.warning(
-                "Tool-loop write: generated content rejected (%s), "
-                "retrying content generation: %r",
-                rejection, content[:120],
-            )
-            content = await self._generate_content(
-                original_query, task.description, llm_client,
-                file_path=file_path,
-            )
-            content, rejection = self._validate_generated_content(content, file_path, original_query)
         if content.startswith("(Content generation failed:"):
             logger.warning(
                 "Skipping write_file due to content generation failure: %s",
@@ -2148,74 +2131,21 @@ class MetaCognitiveAgent:
         file_path = self._resolve_write_path(file_path, original_query)
         logger.info("Write fast path: %s → %s", task.description[:60], file_path)
 
-        # 表計算/リッチ文書 (xlsx/csv/docx/pptx) 出力で取得済みの実テーブルがあれば、
-        # モデルに転記させず取得データを直接書き込む (小型モデルのハルシネーション/
-        # 行脱落/拒否、pptx でコード文字列を吐く退行を回避)。
-        if wants_fetched_table(file_path):
-            fetched_table = self._extract_fetched_table_markdown()
-            if fetched_table:
-                logger.info(
-                    "Write fast path content from fetched table "
-                    "(deterministic): %d chars -> %s",
-                    len(fetched_table), file_path,
-                )
-                return await self._write_file(
-                    file_path, fetched_table, tools_registry, on_step, prefix,
-                )
+        async def _notify_generating() -> None:
+            if on_step:
+                await call_callback(on_step, {
+                    "type": "tool_call",
+                    "detail": f"{prefix} write_file: コンテンツ生成中 → {file_path}",
+                    "status": "running",
+                })
 
-        # ユーザーが本文そのものを引用符で指定しているなら再生成しない。
-        # 小型モデルはタスクの実況・言い換えを本文として書き込むことがある
-        # (実インシデント 2026-07-27 ライブ検証: 「『会議メモ: 2026年7月27日』と
-        # 保存して」に対し「- ファイル: <path> / - 内容: ...」が書き込まれた)。
-        literal = extract_literal_write_content(original_query, file_path)
-        if literal:
-            logger.info(
-                "Write fast path content from user literal (deterministic): "
-                "%d chars -> %s", len(literal), file_path,
-            )
-            return await self._write_file(
-                file_path, literal, tools_registry, on_step, prefix,
-            )
-
-        # 「この案内文を保存して」型: 書くべき本文は直前の応答そのもの。
-        # 生成し直させると素材を見失って完了報告や架空の例文が書き込まれる
-        # (実インシデント 2026-07-27)。加工指示が無い参照依頼に限り直接採用する。
-        previous = previous_answer_write_content(
-            original_query, getattr(self, "_conversation", None),
-        )
-        if previous:
-            logger.info(
-                "Write fast path content from previous answer (deterministic): "
-                "%d chars -> %s", len(previous), file_path,
-            )
-            return await self._write_file(
-                file_path, previous, tools_registry, on_step, prefix,
-            )
-
-        if on_step:
-            await call_callback(on_step, {
-                "type": "tool_call",
-                "detail": f"{prefix} write_file: コンテンツ生成中 → {file_path}",
-                "status": "running",
-            })
-
-        content = await self._generate_content(
-            original_query, task.description, llm_client,
+        content, rejection = await self._resolve_write_content(
             file_path=file_path,
+            original_query=original_query,
+            task_description=task.description,
+            llm_client=llm_client,
+            notify_generating=_notify_generating,
         )
-        content, rejection = self._validate_generated_content(content, file_path, original_query)
-
-        if rejection and not content.startswith("(Content generation failed:"):
-            logger.warning(
-                "Write fast path: generated content rejected (%s), "
-                "retrying content generation: %r",
-                rejection, content[:120],
-            )
-            content = await self._generate_content(
-                original_query, task.description, llm_client,
-                file_path=file_path,
-            )
-            content, rejection = self._validate_generated_content(content, file_path, original_query)
 
         if content.startswith("(Content generation failed:"):
             logger.warning("Write fast path: content generation failed for %s", file_path)
@@ -2248,6 +2178,91 @@ class MetaCognitiveAgent:
         return await self._write_file(
             file_path, content, tools_registry, on_step, prefix,
         )
+
+    async def _resolve_write_content(
+        self,
+        *,
+        file_path: str,
+        original_query: str,
+        task_description: str,
+        llm_client,
+        notify_generating=None,
+    ) -> tuple[str, str | None]:
+        """書込み本文を「決定論 → 生成 → 救済」の順で解決する単一の合流点。
+
+        fast path と tool-loop が本文解決を各々持っており、決定論経路
+        (ユーザー literal / 直前応答) が fast path にしか無かったため、
+        同じ依頼でも経路が変わると実況文が書き込まれた。両経路をここへ
+        集約し、解決順序を 1 箇所で決める。
+
+        Returns:
+            ``(content, rejection)``。``rejection`` が None なら書込み可。
+        """
+        # 1. 取得済みの実テーブル (転記させるとハルシネーション/行脱落が出る)
+        if wants_fetched_table(file_path):
+            fetched_table = self._extract_fetched_table_markdown()
+            if fetched_table:
+                logger.info(
+                    "Write content from fetched table (deterministic): "
+                    "%d chars -> %s", len(fetched_table), file_path,
+                )
+                return fetched_table, None
+
+        # 2. ユーザーが引用符で本文そのものを指定している (高精度マッチ)
+        literal = extract_literal_write_content(original_query, file_path)
+        if literal:
+            logger.info(
+                "Write content from user literal (deterministic): "
+                "%d chars -> %s", len(literal), file_path,
+            )
+            return literal, None
+
+        # 3. 「この案内文を保存して」型: 書くべき本文は直前の応答そのもの
+        previous = previous_answer_write_content(
+            original_query, getattr(self, "_conversation", None),
+        )
+        if previous:
+            logger.info(
+                "Write content from previous answer (deterministic): "
+                "%d chars -> %s", len(previous), file_path,
+            )
+            return previous, None
+
+        if notify_generating:
+            await notify_generating()
+
+        # 4. 生成 (棄却されたら 1 度だけ再生成)
+        content = await self._generate_content(
+            original_query, task_description, llm_client, file_path=file_path,
+        )
+        content, rejection = self._validate_generated_content(
+            content, file_path, original_query,
+        )
+        if rejection and not content.startswith("(Content generation failed:"):
+            logger.warning(
+                "Write: generated content rejected (%s), retrying content "
+                "generation: %r", rejection, content[:120],
+            )
+            content = await self._generate_content(
+                original_query, task_description, llm_client,
+                file_path=file_path,
+            )
+            content, rejection = self._validate_generated_content(
+                content, file_path, original_query,
+            )
+
+        # 5. 救済: 生成が失敗と確定した後に限り、緩い引用抽出で本文を拾う。
+        #    誤爆リスクは「既に生成が棄却されている」状態に閉じ込めてある。
+        if rejection:
+            rescued = rescue_quoted_write_literal(original_query, file_path)
+            if rescued:
+                logger.info(
+                    "Write content rescued from user quote after %s: "
+                    "%d chars -> %s", rejection, len(rescued), file_path,
+                )
+                return rescued, None
+
+        return content, rejection
 
     @staticmethod
     def _validate_generated_content(
@@ -2396,13 +2411,8 @@ class MetaCognitiveAgent:
             )
             return None
 
-        # 出力先を確定 (ディレクトリ→output / bare→クエリ dir) し、表/CSV 出力で
-        # 取得済みの実テーブルがあれば、モデルではなく取得データを直接使う (決定論)。
+        # 出力先を確定 (ディレクトリ→output / bare→クエリ dir)。
         file_path = self._resolve_write_path(file_path, original_query)
-        fetched_table = (
-            self._extract_fetched_table_markdown()
-            if wants_fetched_table(file_path) else ""
-        )
 
         logger.info(
             "Auto-recovery: LLM returned plain text for write task, "
@@ -2410,30 +2420,40 @@ class MetaCognitiveAgent:
             file_path,
         )
 
-        if fetched_table:
-            content = fetched_table
-            logger.info(
-                "Auto-recovery content from fetched table (deterministic): "
-                "%d chars -> %s", len(content), file_path,
-            )
-        else:
-            content = strip_markdown_wrapper(text)
-            if not text_looks_like_code(content):
+        # この経路だけの特殊性: モデルが既に成果物 (コード) を平文で吐いている
+        # なら、それが書くべき本文そのもの。合流点より前に採用する。
+        content = ""
+        if not wants_fetched_table(file_path):
+            candidate = strip_markdown_wrapper(text)
+            if text_looks_like_code(candidate):
+                validated, rejection = self._validate_generated_content(
+                    candidate, file_path, original_query,
+                )
+                if not rejection:
+                    content = validated
+
+        # それ以外は共通の合流点へ (取得テーブル / ユーザー literal / 直前応答 /
+        # 生成 + 再生成 + 救済)。この経路だけ決定論解決を持たず、実況文が本文
+        # として書き込まれる穴になっていた。
+        if not content:
+            async def _notify_generating() -> None:
                 if on_step:
                     await call_callback(on_step, {
                         "type": "tool_call",
                         "detail": f"{prefix} コンテンツ生成中（自動リカバリー） → {file_path}",
                         "status": "running",
                     })
-                content = await self._generate_content(
-                    original_query, task.description, llm_client,
-                    file_path=file_path,
-                )
-                if content.startswith("(Content generation failed:"):
-                    logger.warning("Auto-recovery content generation failed: %s", file_path)
-                    return None
 
-            content, rejection = self._validate_generated_content(content, file_path, original_query)
+            content, rejection = await self._resolve_write_content(
+                file_path=file_path,
+                original_query=original_query,
+                task_description=task.description,
+                llm_client=llm_client,
+                notify_generating=_notify_generating,
+            )
+            if content.startswith("(Content generation failed:"):
+                logger.warning("Auto-recovery content generation failed: %s", file_path)
+                return None
             if rejection:
                 logger.warning(
                     "Auto-recovery: generated content rejected (%s), aborting: %r",

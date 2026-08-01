@@ -203,6 +203,86 @@ SESSION_PROXIMITY_WINDOW_EN = r"[^.!?\n]{0,40}?"
 
 
 # ─────────────────────────────────────────────────────────────────────
+# 進行中セッションの位置指定 (「この会話で最初に言ったこと」)
+# ─────────────────────────────────────────────────────────────────────
+#
+# 位置で決まる事実は検索でもモデルの読解でもなく、並び順から機械的に確定する。
+# 進行中の会話は全文がコンテキストに載っている一方、``search_history`` の索引に
+# はまだ入っておらず、現在セッションを検索しても中身の無いヘッダしか返らない。
+
+#: 「最初 / 最後」のどちらを指しているか。両方現れる曖昧な文は採らない。
+_SESSION_POSITION_FIRST_RE = re.compile(
+    r"(?:一番)?最初|最初に|first|earliest", re.IGNORECASE,
+)
+_SESSION_POSITION_LAST_RE = re.compile(
+    r"(?:一番)?最後|最後に|直前|last|latest|most\s+recent", re.IGNORECASE,
+)
+#: 位置指定の対象がユーザー自身の発言であること。「最初に説明した内容」等の
+#: 話題ポインタを巻き込まないよう、発言そのものを指す語を要求する。
+_SESSION_POSITION_TARGET_RE = re.compile(
+    r"(?:送|言|聞|尋|書|投げ|打)\S{0,4}?"
+    r"(?:メッセージ|発言|質問|こと|内容|の)"
+    r"|メッセージ|発言"
+    r"|(?:message|question|thing)\s+(?:i|you)\s+(?:sent|said|asked)"
+    r"|(?:sent|said|asked)",
+    re.IGNORECASE,
+)
+#: アンカー + 話題切断の否定先読み。「この会話とは別に、最初に送るメッセージの
+#: 例を教えて」のような外部依頼を自己参照と誤判定しないため、他の自己参照判定と
+#: 同じ先読みを掛ける。
+_SESSION_ANCHOR_ANY_RE = re.compile(
+    f"(?:{SESSION_ANCHOR_JA}{SESSION_TOPIC_BREAK_LOOKAHEAD_JA})"
+    f"|(?:{SESSION_ANCHOR_EN}{SESSION_TOPIC_BREAK_LOOKAHEAD_EN})",
+    re.IGNORECASE,
+)
+
+
+def session_position_kind(query: str) -> str | None:
+    """クエリが進行中セッションの「最初 / 最後の発言」を尋ねているか判定する。
+
+    3 条件すべてを満たす場合だけ確定する: 会話そのものへのアンカーがある /
+    位置語が片方だけ現れる / 対象が発言そのものである。曖昧な文は None を
+    返して従来経路へ委ねる (純粋関数)。
+
+    Returns:
+        ``"first"`` / ``"last"`` / ``None``。
+    """
+    if not query or not _SESSION_ANCHOR_ANY_RE.search(query):
+        return None
+    if not _SESSION_POSITION_TARGET_RE.search(query):
+        return None
+    is_first = bool(_SESSION_POSITION_FIRST_RE.search(query))
+    is_last = bool(_SESSION_POSITION_LAST_RE.search(query))
+    if is_first == is_last:
+        return None
+    return "first" if is_first else "last"
+
+
+def resolve_session_position_message(
+    conversation: list[dict] | None, query: str, position: str,
+) -> str:
+    """会話履歴から最初 / 直近のユーザー発言を取り出す (純粋関数)。
+
+    今まさに尋ねている質問自体は対象から外す。``conversation`` に現在ターンが
+    既に積まれているかは呼出経路によって違うため、内容一致で除外する。
+
+    Returns:
+        発言本文。確定できなければ空文字列。
+    """
+    texts = [
+        content.strip()
+        for msg in conversation or []
+        if msg.get("role") == "user"
+        and isinstance(content := msg.get("content"), str)
+        and content.strip()
+        and content.strip() != query.strip()
+    ]
+    if not texts:
+        return ""
+    return texts[0] if position == "first" else texts[-1]
+
+
+# ─────────────────────────────────────────────────────────────────────
 # 挨拶
 # ─────────────────────────────────────────────────────────────────────
 #

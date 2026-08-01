@@ -321,6 +321,7 @@ local_paths:
   eval_core_file: local/eval_core.json               # ベースモデル コア評価セット
   eval_assist_file: local/eval_assist.json           # アシストモデル コア評価セット
   assist_calibration_file: local/assist_calibration.json # アシスト purpose 別 timeout の反応的自己較正値 (モデル切替後に自動調整)
+  rag_judge_events_file: local/rag_judge_events.jsonl # RAG necessity/quality 判定イベント (sleep-time が world_fact 化するまでの保持先)
   learned_patterns_file: local/learned_patterns.json # 学習済みパターン検出キーワード
   model_state_file: local/model_state.json           # モデル切替・LoRA 装着状態の永続化
   local_state_file: local/state.json                 # EvorefMem ローカル状態
@@ -443,6 +444,12 @@ rag:
   self_rag:
     assist_judge:
       enabled: true               # アシストモデルによる品質再判定（marginal 結果の救済）
+      # 発火する top_score の上限。実効果は medium → low の格下げ (チャンク破棄) だけで、
+      # medium → high は Step 6.5 で medium と同じ扱い (添付) なので何も変わらない。
+      # 実測 2026-08-01: 11 発火中 8 件が medium → high = 6 秒かけて挙動不変だった。
+      # 格下げは top_score 0.727 以下に集中しており、0.75 で切ると観測された格下げ
+      # 3/3 を保ったまま発火を 45% 減らせる。標本 11 件なので変更時は取り直すこと。
+      max_top_score: 0.75         # これ以上のスコアでは発火しない (0 以下で無効)
       max_per_session: 5          # 1 セッション内の発火上限 (0 以下で無制限)
       max_per_query: 1            # 1 クエリ内の発火上限 (0 以下で無制限)
       only_when_quality: ["medium"]  # 発火条件の quality ラベル (high/medium/low から指定)
@@ -455,7 +462,16 @@ rag:
       # `fetch` は外部 fetch_url ツールに委ねるシグナルで、search_pipeline は
       # `skip` 同等にローカル RAG をスキップする。
       # 失敗 / タイムアウト / 上限到達時は安全側 (`retrieve`) にフォールバック。
-      enabled: true               # uncertain 時のアシスト発火 (false で完全ルール運用)
+      #
+      # 既定は false。2026-08-01 の実測でゲートがゲート対象の 165 倍高くついた:
+      #   necessity assist  median 3,407ms / retrieval (実作業) median 21ms
+      # 21ms の作業を省くか決めるのに 3.4 秒かかる構図で、skip と判定した
+      # ターンでも判定料金は必ず発生する。false のときは uncertain が安全側の
+      # retrieve に倒れる (取りこぼしではなく「常に引く」方向へ縮退)。
+      # 無関係チャンクは下流の品質判定と「品質 low は添付しない」が防ぐ。
+      # コーパスが大きく retrieval が秒オーダーになる環境では true を検討する
+      # (その際は necessity_ms / retrieval_ms を実測し直すこと)。
+      enabled: false              # uncertain 時のアシスト発火 (true で有効化)
       max_per_session: 10         # 1 セッション内の発火上限 (0 以下で無制限)
       max_per_query: 1            # 1 クエリ内の発火上限 (0 以下で無制限)
       only_when_quality: ["uncertain"]  # tracker キー (互換、変更非推奨)

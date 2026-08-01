@@ -246,8 +246,11 @@ async def curate_rag_judge_facts(
         min_record = float(recall_cfg.get("min_record_score", 0.65))
         history_size = int(recall_cfg.get("record_history_size", 10))
 
-        answer = _find_answer_for_query(notes, ev.query)
-        if answer is None:
+        # ターン確定時に紐付けた本文を優先する。STM 引き直しは、紐付け導入前の
+        # 残存イベントと、紐付けに失敗したケースのフォールバック
+        # (light サイクルの eviction で見つからないことが多い)。
+        answer = ev.answer or _find_answer_for_query(notes, ev.query)
+        if not answer:
             continue
 
         score = await _score_decision(
