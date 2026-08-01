@@ -24,6 +24,10 @@ from backend.free.agent.tools.builtin import (
     _check_path_traversal as check_builtin_path_traversal,
 )
 from backend.free.core.session_mode import is_coding_mode
+from backend.free.core.intent_vocab import (
+    resolve_session_position_message,
+    session_position_kind,
+)
 from backend.free.core.turn_text import append_to_last_user
 from backend.config import resolve_context_size_for_mode
 from backend.free.api.chat.chat_constants import (
@@ -58,13 +62,21 @@ _NO_RELEVANT_INFO_MESSAGE = "（ツールを実行しましたが、今回の質
 # 1 つも走らないまま「32 GB です」と回答した)。system プロンプトの捏造禁止
 # 条項は天気・ニュース・株価等の外部データにしか掛かっておらず、実行環境の
 # 事実は素通りしていた。
+# 文言は「実行を試みて失敗した」と読めない形にする。旧版の「ツールを実行
+# できず」は base に「ツール実行により取得できませんでした」と言い換えられ、
+# 実際には 1 度も実行していないのに実行して失敗したかのように読める応答に
+# なった (実インシデント 2026-08-01 ライブ監査)。システムの実状態
+# (= このターンでツールを 1 つも実行していない) をそのまま述べさせる。
 _UNMEASURED_FACT_GUIDANCE = (
     "\n\nこの質問はこの実行環境を実際に調べないと答えられない種類の質問だが、"
-    "今回はツールを実行できず、測定値は取得できていない。"
+    "今回のターンではこの環境を調べるツールを 1 つも実行していないため、"
+    "測定値は存在しない。"
     "したがって具体的な数値・型番・バージョン・容量を答えてはならない。"
     "会話履歴や記憶で既にユーザー自身が述べた値があるならその出典を明示して"
-    "述べてよいが、それが無い場合は「今回は取得できなかった」と正直に伝え、"
-    "ユーザーが自分で確認する方法を 1 つ示すこと。推測値を断定形で述べない。"
+    "述べてよいが、それが無い場合は「今回は調べていないので分からない」と"
+    "正直に伝え、ユーザーが自分で確認する方法を 1 つ示すこと。"
+    "実行していないツールについて、実行した / 実行を試みたと述べない。"
+    "推測値を断定形で述べない。"
 )
 
 # search_history が空振りした場合専用のグラウンディング文言。通常ツールの
@@ -175,6 +187,25 @@ _GENERATED_DRAFT_GUIDANCE = (
 # read_file は「タスクの内容: ファイル `…` に…」を返したのに、回答は依頼時の
 # 文言「監査テスト 1行目」だった。書込みが壊れていた事実がユーザーから隠れた)。
 # 食い違いの報告を明示的な仕事として与える (禁止形だけだと退行する)。
+# 列挙が価値のツール。結果の意味は「その集合が全部である」ことなので、散文
+# 要約に通すと項目が落ち、base が落ちた分をもっともらしい名前で埋める
+# (実インシデント 2026-08-01 ライブ監査: list_directory の 6070 文字が digest
+# で 225 文字に圧縮され、回答は実在しない requirements.txt / .env.example を
+# 挙げ、実在する scripts/ local/ models/ CLAUDE.md 等を落とした)。
+# ``_ENUMERATIVE_TOOLS`` は digest 抑止とグラウンディング文言の両方が見る。
+_ENUMERATIVE_TOOLS = frozenset({"list_directory", "search_code"})
+_ENUMERATION_RESULT_GUIDANCE = (
+    "上記の ## ツール実行結果 は、システムが実際に列挙した項目そのものである。"
+    "項目名はこの結果に現れる綴りのまま引用すること。"
+    "一般的な構成から類推した項目名を補わないこと。"
+)
+#: 列挙結果が切り詰められていたときに追加する文言。省略があることを明示しないと
+#: base は手元の部分集合を全体として提示する。
+_TRUNCATED_ENUMERATION_NOTE = (
+    "この結果は途中が省略された部分的な一覧である。"
+    "「これで全部」とは述べず、一覧が部分的であることを明示して答えること。"
+)
+
 _FILE_CONTENT_TOOLS = frozenset({"read_file"})
 _FILE_CONTENT_RESULT_GUIDANCE = (
     "上記の ## ツール実行結果 は、そのファイルに実際に保存されている内容そのものである。"
@@ -461,6 +492,10 @@ class DeliberativeAgent:
             grounding = _CALCULATE_RESULT_GUIDANCE
         elif tool_name in _COMMAND_TOOLS:
             grounding = _COMMAND_RESULT_GUIDANCE
+        elif tool_name in _ENUMERATIVE_TOOLS:
+            grounding = _ENUMERATION_RESULT_GUIDANCE
+            if len(truncated) < len(tool_result_text):
+                grounding += _TRUNCATED_ENUMERATION_NOTE
         elif tool_name in _FILE_CONTENT_TOOLS:
             grounding = _FILE_CONTENT_RESULT_GUIDANCE
         elif tool_name in _GENERATED_DRAFT_TOOLS:
@@ -493,6 +528,42 @@ class DeliberativeAgent:
             f"{grounding}"
         )
         append_to_last_user(messages, tool_msg, separator="")
+
+    @staticmethod
+    def _append_session_position_fact(
+        messages: list[dict], conversation: list[dict] | None, query: str,
+    ) -> str | None:
+        """「この会話で最初/最後に言ったこと」を決定論的に確定して注記する。
+
+        位置で決まる事実を検索やモデルの読解に委ねる理由が無い。進行中の会話は
+        全文がコンテキストに載っている一方、``search_history`` の索引には
+        **まだ入っていない** ため、現在セッションを検索しても中身の無い
+        セッションヘッダしか返らない。それを根拠枠で渡すと base は文脈から
+        適当な発言を選ぶ (実インシデント 2026-08-01 ライブ監査:「この会話で私が
+        最初に送ったメッセージは何でしたか？」に対し、12 番目の発言
+        「円周率の小数点以下 10 桁を教えてください。」と誤答した)。
+
+        Returns:
+            注記した位置種別 ("first" / "last")。対象外なら None。
+        """
+        position = session_position_kind(query)
+        if position is None:
+            return None
+        target = resolve_session_position_message(conversation, query, position)
+        if not target:
+            return None
+        label = "最初" if position == "first" else "直近"
+        append_to_last_user(
+            messages,
+            f"\n\n確定事実: この会話でユーザーが{label}に送ったメッセージは"
+            f"「{target}」である。これは会話の並び順から機械的に確定した値なので、"
+            f"この値をそのまま答えること。",
+            separator="",
+        )
+        logger.info(
+            "Session position fact pinned (%s): %s", position, target[:60],
+        )
+        return position
 
     @staticmethod
     def _append_unmeasured_fact_note(messages: list[dict]) -> None:
@@ -542,6 +613,11 @@ class DeliberativeAgent:
             ``success`` は実行成功か (出力が "Error:" prefix でない)。
             executable_command 学習 (sleep-time curator) のデータ源になる。
         """
+        # 位置で決まる事実は判定経路の有無に関わらず先に確定させる。検索索引に
+        # 載っていない進行中セッションを search_history に問い合わせても答えは
+        # 出ないため、並び順から機械的に決めた値を根拠として渡す。
+        self._append_session_position_fact(messages, conversation, query)
+
         if self._tool_judge is None or self._tools_registry is None:
             # 判定経路が無いなら precomputed タスクも使えない。残っていれば破棄。
             if tool_judge_task is not None and not tool_judge_task.done():
@@ -617,6 +693,12 @@ class DeliberativeAgent:
             # (実インシデント 2026-07-27: raw "16257.72825" が digest
             # "16257.72825 リットル" になり、cm³ の値がリットルとして回答された)。
             # 抽出の利得ゼロ・捏造リスクありなので assist 1 往復ごと省く。
+            digest = None
+        elif judgement.tool_name in _ENUMERATIVE_TOOLS:
+            # 列挙結果の価値は「その集合が全部である」ことにあり、散文要約は
+            # 必ず項目を落とす。落ちた項目を base がもっともらしい名前で埋める
+            # ため、決定論的な切り詰め (省略量を明示する) の方が安全
+            # (_ENUMERATIVE_TOOLS 参照)。
             digest = None
         else:
             digest = await digest_tool_result(

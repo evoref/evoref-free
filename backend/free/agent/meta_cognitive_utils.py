@@ -830,11 +830,29 @@ def looks_like_task_log_echo(content: str) -> bool:
 #: が書き込まれた (実インシデント 2026-07-27)。既存の task_log_echo は
 #: ``[done]`` / ``Written N bytes`` 形式しか見ておらず、日本語の完了報告は
 #: すり抜けていた。
+_WRITE_REPORT_STEM = r"(?:保存|書き込み?|書込み?|作成|生成|出力|記録|更新)"
+#: サ変動詞に付く助動詞。**活用形の全列挙ではなく助動詞の閉じた集合** として
+#: 定義する。旧実装は能動の ``し|いたし`` だけを見ており、受身
+#: 「作成されました」がすり抜けて実況文がファイル本文として書き込まれた
+#: (実インシデント 2026-08-01 ライブ監査)。能動 / 受身 / 謙譲 / 可能 / 継続を
+#: 網羅しておけば、以後は語形を足し続けなくてよい。
+_SAHEN_AUX = (
+    r"(?:し|され|なされ|いたし|致し|でき|出来"
+    r"|しており|しておき|してあり|し終え|し終わり)"
+)
+#: 「書き込む」「書き出す」は五段動詞でサ変助動詞が付かないため別枝で持つ。
+_GODAN_WRITE_REPORT = (
+    r"(?:書き込み|書込み|書き出し|書出し)(?:ました|ます)"
+    r"|(?:書き込|書込)まれ(?:ました|ます)"
+    r"|(?:書き出|書出)され(?:ました|ます)"
+)
 _WRITE_REPORT_RE = re.compile(
-    # 「保存しました」「書き込みました」「作成いたしました」
-    r"(?:保存|書き込み|書込み|作成|出力|記録)(?:を)?(?:し|いたし)(?:ました|ます)"
-    # 「保存が完了しました」「書き込みは完了です」(助詞が挟まる形)
-    r"|(?:保存|書き込み|書込み|作成|出力|記録)(?:[がはも])?\s*完了"
+    # 「保存しました」「作成されました」「作成いたしました」「出力できました」
+    rf"{_WRITE_REPORT_STEM}(?:を)?{_SAHEN_AUX}(?:ました|ます|ています)"
+    # 「書き込みました」「書き込まれました」(五段)
+    rf"|{_GODAN_WRITE_REPORT}"
+    # 「保存が完了しました」「書き込みは完了です」「作成済みです」(助詞挟み形)
+    rf"|{_WRITE_REPORT_STEM}(?:[がはも])?\s*(?:完了|済み)"
     r"(?:し(?:ました|ます)|です|しています)?"
     r"|^\s*(?:Saved|Written|Created)\s+(?:to|the\s+file)\b",
     re.IGNORECASE | re.MULTILINE,
@@ -871,6 +889,90 @@ def looks_like_write_report(content: str, file_path: str) -> bool:
         return False
     # 報告のメタラベルがあるか、全体が短い (本文が無い) 場合に限る
     return bool(_WRITE_REPORT_LABEL_RE.search(content)) or len(content) < 400
+
+
+#: 依頼文中の引用スパン (本文候補)。
+_QUOTED_SPAN_RE = re.compile(r"[「『]([^「」『』]{1,2000})[」』]")
+#: 引用がパス / ファイル名を指しているケース (本文候補から外す)。
+_QUOTE_IS_PATH_RE = re.compile(r"[/\\]|^\S+\.[A-Za-z][A-Za-z0-9]{0,9}$")
+#: 実況文が引用本文を包んでいると判定する最小の余剰文字数。引用に句読点や
+#: 改行が付いただけの整形は本文として通す。
+_LITERAL_WRAPPER_MIN_EXTRA = 8
+#: 「引用 + 前後の枠付け」に留まると見なす上限。引用を含みつつ本文を書き足した
+#: 長い文書 (依頼文を冒頭で引用する議事録など) を巻き込まないための天井。
+#: 引用長に比例させ、短い引用ほど枠付けの余地を許す。
+_LITERAL_WRAPPER_MAX_RATIO = 3
+_LITERAL_WRAPPER_MAX_FRAMING = 80
+
+
+def quoted_write_literals(instruction: str) -> list[str]:
+    """依頼文から本文候補となる引用スパンを取り出す (純粋関数)。
+
+    パス / ファイル名を指す引用と、タイトル参照は候補から外す。
+    """
+    if not instruction or _LITERAL_WRITE_REJECT_RE.search(instruction):
+        return []
+    out: list[str] = []
+    for m in _QUOTED_SPAN_RE.finditer(instruction):
+        span = m.group(1).strip()
+        if not span or _QUOTE_IS_PATH_RE.search(span):
+            continue
+        out.append(span)
+    return out
+
+
+def looks_like_literal_wrapper(
+    content: str, instruction: str, file_path: str,
+) -> bool:
+    """ユーザーが引用符で確定させた本文を、実況文で包んだだけかを判定する。
+
+    「…に『動作確認テスト』とだけ書いたファイルを作って」に対し、ファイルへ
+    「ファイル `<path>` は「動作確認テスト」という内容で作成されました。」が
+    書き込まれた (実インシデント 2026-08-01 ライブ監査)。
+
+    依頼文の言い回し (書いて / 書いた / 書き直して …) に一切依存せず、**出力側の
+    形** だけで判定するのが要点。完了報告の語形を追い続ける必要が無くなる。
+    条件は「本文が確定している」「生成物がそれを枠付けしただけ」
+    「生成物が自分の書込み先を名指している」の 3 つが揃うこと。依頼文を冒頭で
+    引用しつつ本文を書き足した長い文書は、枠付けの天井を超えるので通る。
+    """
+    if not file_path or not content:
+        return False
+    literals = quoted_write_literals(instruction)
+    if not literals:
+        return False
+    basename = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+    if file_path not in content and not (basename and basename in content):
+        return False
+    body = content.strip()
+    return any(
+        literal in body
+        and len(literal) + _LITERAL_WRAPPER_MIN_EXTRA <= len(body)
+        <= len(literal) * _LITERAL_WRAPPER_MAX_RATIO + _LITERAL_WRAPPER_MAX_FRAMING
+        for literal in literals
+    )
+
+
+def rescue_quoted_write_literal(instruction: str, file_path: str) -> str:
+    """生成が棄却された後に限り使う、緩い本文引用の特定 (救済経路)。
+
+    ``extract_literal_write_content`` は「引用の直後に書込み動詞」を要求する
+    高精度マッチで、「『…』とだけ書いたファイルを作って」のような語形は
+    取り逃がす。語形を足し続けるのは破綻するため、**生成が棄却された後** に
+    限って動く低精度側を分離した。既に「生成は失敗」と分かっている状態で
+    しか呼ばれないので、多少緩くても誤爆しない。
+
+    候補が 1 つに定まる場合のみ返す (複数候補は本文が特定できないので空)。
+
+    Returns:
+        本文。特定できなければ空文字列 (純粋関数)。
+    """
+    if Path(file_path).suffix.lower() not in _LITERAL_WRITE_EXTENSIONS:
+        return ""
+    literals = quoted_write_literals(instruction)
+    if len(literals) != 1:
+        return ""
+    return literals[0]
 
 
 #: 「この案内文を保存して」のように直前の成果物を指す参照表現。
@@ -1171,6 +1273,10 @@ def generated_content_rejection(
         return "prompt_echo"
     if looks_like_instruction_echo(content, instruction):
         return "instruction_echo"
+    # instruction_echo (依頼文の逐語コピー) より後に置く。両方成立する場合は
+    # より具体的な逐語コピー診断を優先し、報告される理由を安定させる。
+    if looks_like_literal_wrapper(content, instruction, file_path):
+        return "literal_wrapped"
     if csv_content_lacks_rows(content, file_path):
         return "csv_without_rows"
     if looks_like_refusal_or_missing_info(content):

@@ -91,6 +91,15 @@ class ToolsRegistry:
         tool_def = self._tools.get(name)
         return tool_def is not None and mode in tool_def.modes
 
+    def required_params(self, name: str) -> set[str]:
+        """ツールの必須引数名。未登録なら空集合。
+
+        呼出側が「この引数一式でこのツールを撃てるか」を判断するための公開口
+        (ToolCallJudge の兄弟ツール載せ替えが使う)。
+        """
+        tool = self._tools.get(name)
+        return self._required_param_names(tool) if tool is not None else set()
+
     def get_descriptions_text(self, mode: str | None = None) -> str:
         """ツール説明をテキスト形式で返す（プロンプト注入用）
 

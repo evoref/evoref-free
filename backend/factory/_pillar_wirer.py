@@ -760,7 +760,17 @@ def _init_assist_judge_tracker(state: AppState) -> None:
     state.conflict_judge_tracker = AssistJudgeUsageTracker()
 
     from backend.free.memory.pipeline.rag_judge_assist_log import RagJudgeAssistLog
-    state.rag_judge_assist_log = RagJudgeAssistLog()
+    # 永続化する: 消費側は Full サイクル (実測 22 回 / light 557 回) にしか
+    # 無く、間に再起動が入ると in-memory バッファが丸ごと消えていた
+    # (キュレータ実行 22 回中 16 回が空の入力)。
+    try:
+        from backend.config import get_path_resolver
+        rag_judge_events_path = get_path_resolver().resolve_local(
+            "rag_judge_events_file",
+        )
+    except Exception:
+        rag_judge_events_path = None
+    state.rag_judge_assist_log = RagJudgeAssistLog(path=rag_judge_events_path)
 
     logger.info(
         "AssistJudgeUsageTracker initialized (self_rag + conflict_chat_judge)",

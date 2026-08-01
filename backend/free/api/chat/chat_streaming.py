@@ -995,6 +995,9 @@ class _LongFormStreamState:
     tokens_generated: int = 0
     full_response: str = ""
     first_token_recorded: bool = False
+    #: 品質ゲートが検出した問題数。ユーザーには警告ステップとして見せている
+    #: ため、成否シグナルにも同じ判断を反映させる (下の log_outcome 参照)。
+    validation_errors: int = 0
 
 
 async def _emit_long_form_init_steps(
@@ -1213,6 +1216,7 @@ async def _finalize_long_form_stream(
     # 文面は content_type で分ける (TEXT にも品質ゲートが入ったため、散文に対して
     # 「構文エラー」と表示していた 2026-07-25 の誤表示を解消)。
     validation_errors = int(metrics.get("validation_errors", 0) or 0)
+    state.validation_errors = validation_errors
     if validation_errors > 0:
         logger.warning(
             "Long-form output has %d validation error(s) (content_type=%s, "
@@ -1510,15 +1514,21 @@ async def stream_long_form(
             dl = getattr(state, "debug_logger", None)
             if dl is not None:
                 elapsed_ms = (time.monotonic() - t_start) * 1000
+                # 品質ゲートが問題を出した応答をユーザーには「要確認」と見せて
+                # おきながら成功として記録すると、選択圧に失敗が一件も入らない
+                # (実インシデント 2026-08-01 ライブ監査: 目標 300 字に対し 530 字
+                # で警告を出したターンが success=True で記録された)。
+                # meta_cognitive 経路が failed_tasks を畳み込むのと同じ扱いに揃える。
                 dl.log_outcome(
                     kind="chat_response",
-                    success=outcome_success,
+                    success=outcome_success and not stream_state.validation_errors,
                     duration_ms=elapsed_ms,
                     tokens_out=stream_state.tokens_generated,
                     quality_signals={
                         "agent_layer": "long_form",
                         "file_output_mode": file_output_mode,
                         "output_target": output_target,
+                        "validation_errors": stream_state.validation_errors,
                     },
                 )
 
