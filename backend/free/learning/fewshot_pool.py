@@ -29,6 +29,7 @@ from backend.free.agent.prompt_utils import (
     format_fewshot_section,  # noqa: F401  (re-export for tests)
 )
 from backend.free.core.session_mode import is_valid_session_mode, normalize_session_mode
+from backend.free.core.text_quality import has_broken_ja_spacing
 from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
 from backend.free.learning.response_arithmetic import find_arithmetic_contradictions
 from backend.free.llm.json_schemas import FewShotQualityJudgement
@@ -135,6 +136,25 @@ _INTERNAL_SCAFFOLD_RE = re.compile(
 def _response_leaks_internal_scaffold(response: str) -> bool:
     """応答が内部足場の語彙をそのまま含むかを判定する (純粋関数)。"""
     return bool(_INTERNAL_SCAFFOLD_RE.search(response))
+
+
+#: 日本語の語間に紛れ込んだ半角空白。正常な日本語では発生しない
+#: (実測 2026-08-02: 学習データ削除前の応答 96 件中 0 件)。
+#:
+#: 学習データを全削除するとベースモデルが素の状態に戻り、
+#: 「日本の三景 は、富士山、天橋立、伊勢神宮 です。」のような崩れた応答を出す。
+#: この応答が経験として記録され、Level 1 が手本に採用すると **崩れが手本として
+#: 固定される自己増幅ループ**になる (実測: プール 25 件中 17 件 = 68% が混入し、
+#: いずれも fitness 0.806 で全ゲートを素通りしていた)。
+#:
+#: アシスト品質採点では分離できない。空白混入例の quality 平均 0.80 に対し
+#: 正常例 0.89 と差が 0.09 しかなく、混入例に 0.95 が 4 件付いていた
+#: (小型モデルは自分と同種の崩れを問題と認識できない)。算術矛盾と同じく
+#: **決定論で拒否する**。
+#: 判定器の実体は :mod:`backend.free.core.text_quality`。モデル切替時の品質
+#: プローブ (:mod:`backend.free.llm.quality_probe`) と同じ判定を共有する
+#: — 別々に定義すると片方だけ直る。
+_response_has_broken_ja_spacing = has_broken_ja_spacing
 
 
 #: few-shot 品質採点のシステムプロンプト。
@@ -724,6 +744,16 @@ class FewShotPool(JsonStateStore):
             if _response_leaks_internal_scaffold(response):
                 continue
 
+            # 日本語の語間に半角空白が紛れた応答は手本にしない。放置すると
+            # 崩れた出力が手本として再生産される自己増幅ループになる
+            # (_JA_INTERWORD_SPACE_RE 参照)。
+            if _response_has_broken_ja_spacing(response):
+                logger.info(
+                    "Rejecting fewshot candidate with broken JA spacing: "
+                    "query=%s", query[:50],
+                )
+                continue
+
             # 計算が合わない応答は手本にしない。fitness は「会話が正常終了した
             # セッションに属するか」しか見ておらず内容の正しさを測らないため、
             # 誤答が最高位の正例として常駐していた (実データで 4 件確認)。
@@ -1096,6 +1126,7 @@ class FewShotPool(JsonStateStore):
         self._pools.clear()
         self._bigram_cache.clear()
         self._seen_hashes.clear()
+        dropped = 0
         for mode, entries in payload.items():
             pool: list[FewShotExample] = []
             seen = self._seen_hashes.setdefault(mode, set())
@@ -1104,9 +1135,21 @@ class FewShotPool(JsonStateStore):
                 ex = FewShotExample(**{
                     k: v for k, v in entry.items() if k in _EXAMPLE_FIELD_NAMES
                 })
+                # 採用ゲート追加前に混入した崩れた手本を読み込み時に落とす。
+                # 採用時のゲートだけでは既存プールが永久に汚染されたままになる
+                # (実測 2026-08-02: 25 件中 17 件が混入し、全ゲートを素通り
+                # していた)。件数を必ずログへ出す (黙って削らない)。
+                if _response_has_broken_ja_spacing(ex.response):
+                    dropped += 1
+                    continue
                 pool.append(ex)
                 seen.add(self._content_hash(ex.query, ex.response))
             self._pools[mode] = pool
+        if dropped:
+            logger.warning(
+                "Dropped %d fewshot example(s) with broken JA spacing on load",
+                dropped,
+            )
 
     def _on_save_success(self, path: Path) -> None:
         logger.info("Fewshot pool saved: %s (%d total)", path, self.total_count)

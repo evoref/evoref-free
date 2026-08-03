@@ -38,6 +38,21 @@ def _should_auto_save(state: SessionState) -> bool:
     return True
 
 
+def _resolve_base_model_name() -> str:
+    """アーカイブに刻むベースモデル名。config 未初期化なら空文字列。
+
+    CLI は config を読まずに単独起動されうる (テスト・オフライン検査)。その場合は
+    従来どおり空のままにし、保存自体は止めない。
+    """
+    try:
+        from backend.config import get_config
+        from backend.free.history.history_manager import active_base_model_name
+
+        return active_base_model_name(get_config())
+    except Exception:
+        return ""
+
+
 def _build_history_data(state: SessionState) -> dict:
     """自動保存用のセッションデータを構築"""
     now = utc_now_dt()
@@ -52,7 +67,7 @@ def _build_history_data(state: SessionState) -> dict:
         "duration_sec": duration,
         "mode": state.mode,
         "instance_name": state.instance_name,
-        "base_model": "",
+        "base_model": _resolve_base_model_name(),
         "source": "auto",
         "turns": list(state.turns),
         "turn_count": len(state.turns),
@@ -94,7 +109,8 @@ def auto_save_session(state: SessionState) -> bool:
 
     try:
         from backend.free.history.history_manager import (
-            HistoryManager, SessionData, get_history_manager,
+            HistoryManager, SessionData, active_base_model_name,
+            get_history_manager,
         )
         try:
             mgr = get_history_manager()

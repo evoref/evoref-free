@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING
 
 from backend.app_state import AppState
 from backend.free.api.chat.chat_types import ChatMessage
-from backend.free.history.history_manager import SessionData, get_history_manager
+from backend.free.history.history_manager import (
+    SessionData,
+    active_base_model_name,
+    get_history_manager,
+)
 from backend.log_config import get_logger
 from backend.utils import utc_now_dt
 
@@ -239,6 +243,7 @@ def _save_session_to_history(
             mode=mode,
             modes_used=[mode],
             instance_name=instance_name,
+            base_model=active_base_model_name(cfg),
             source="auto",
             turns=history_turns,
             turn_count=len(history_turns),

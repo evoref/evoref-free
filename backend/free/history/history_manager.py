@@ -995,3 +995,26 @@ def get_history_manager() -> HistoryManager:
 
 
 
+
+
+def active_base_model_name(config: dict | None) -> str:
+    """アーカイブに刻むベースモデル名 (GGUF ファイル名) を解決する (純粋関数)。
+
+    値の形式は ``ModelState.current_filename`` および
+    ``ExperienceEntry.base_model`` と揃える (どちらも GGUF ファイル名)。同じ会話を
+    経験バッファ側と突き合わせるとき、片方がフルパスだと照合できない。
+
+    ``SessionData.base_model`` は API レスポンス (``SessionDetailResponse``) と UI
+    (``SessionDetail.svelte`` の「モデル」表示) まで配線済みだったが、**書き込み側が
+    どの経路にも無く**、Web 経路は未指定で既定の空文字列、CLI 経路は空文字列を
+    ハードコードしていた。結果、UI の `{#if detail.base_model}` が常に偽で、
+    「どのモデルが生成した会話か」を後から追えなかった (2026-08-03 に判明。
+    ベースモデル差し替えによる日本語品質の劣化を調査した際、アーカイブからは
+    モデルを特定できず backend.log を grep する必要があった)。
+
+    セッション途中でのモデル差し替えは llama-server の再起動を伴うため実質的に
+    起こらない。保存のたびに現行 config から解決すれば十分で、セッション開始時刻を
+    別途保持する必要はない。
+    """
+    raw = ((config or {}).get("model_paths", {}) or {}).get("base_model") or ""
+    return Path(raw).name

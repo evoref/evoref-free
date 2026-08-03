@@ -68,6 +68,7 @@ class PathResolver:
         "experience_file": "local/experience.json",
         "eval_core_file": "local/eval_core.json",
         "model_state_file": "local/model_state.json",
+        "model_quality_file": "local/model_quality.json",
         # EvorefMem ローカル状態
         "local_state_file": "local/state.json",
         "memory_dir": "local/memory/",
@@ -134,6 +135,7 @@ class PathResolver:
         # embed_instruction 系データの (embedding モデル) パーティション state。
         # base 学習パーティション (_active_stem) とは独立した軸。
         self._active_embed_stem: str | None = None
+        self._active_assist_stem: str | None = None
         # Level 2 base/assist LoRA アダプタの (mode) パーティション state。
         # "model" (既定) では resolve_learning/resolve_assist_learning は mode 引数を
         # 無視し、従来どおりモデル単位で 1 アダプタを共有する。"model_mode" のときのみ
@@ -212,6 +214,37 @@ class PathResolver:
         if not self._partition_enabled or not self._active_embed_stem:
             return self.resolve_local("prompts_dir")
         return self.resolve_local("learning_dir") / "embed" / self._active_embed_stem
+
+    @property
+    def active_assist_model_stem(self) -> str | None:
+        """assist プロンプトパーティションの active アシストモデル stem。"""
+        return self._active_assist_stem
+
+    def set_active_assist_model_stem(self, stem: str | None) -> None:
+        """assist プロンプトパーティションの active モデル stem を設定する。
+
+        base 学習 (``set_active_model_stem``) / embed_instruction
+        (``set_active_embedding_model_stem``) とは独立した第 3 の軸。
+        """
+        self._active_assist_stem = stem or None
+
+    def resolve_assist_prompt_dir(self) -> Path:
+        """アシストプロンプトの保存先を **アシストモデル単位**で解決する。
+
+        アシストプロンプト (rag_necessity / rag_quality / tool_call / note_evolve)
+        は進化の対象で、進化した文面は **そのモデルの癖に合わせて最適化される**。
+        従来 ``local/prompts/`` に flat 配置されており、アシストモデルを差し替えても
+        前モデル向けに進化した文面がそのまま使われていた。base 学習
+        (``resolve_learning``) と embed_instruction
+        (``resolve_embed_instruction_dir``) は既にモデル別に分かれており、
+        assist だけが取り残されていた。
+
+        partition 無効 / active assist stem 未確定時は ``resolve_local("prompts_dir")``
+        (従来の flat 配置) へ素通しし、後方互換を保つ。
+        """
+        if not self._partition_enabled or not self._active_assist_stem:
+            return self.resolve_local("prompts_dir")
+        return self.resolve_local("learning_dir") / "assist" / self._active_assist_stem
 
     @property
     def active_mode(self) -> str:

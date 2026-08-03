@@ -104,6 +104,13 @@ class LocalPathsConfig(BaseModel):
     experience_file: str = "local/experience.json"
     eval_core_file: str = "local/eval_core.json"
     model_state_file: str = "local/model_state.json"
+    model_quality_file: str = Field(
+        default="local/model_quality.json",
+        description=(
+            "モデル切替時の出力品質プローブ結果。役割 (base/assist/embedding) ごとに"
+            "「どのモデルを最後に検査したか」を記録し、変わったときだけ再検査する。"
+        ),
+    )
     # EvorefMem ローカル状態
     local_state_file: str = "local/state.json"
     memory_dir: str = "local/memory/"

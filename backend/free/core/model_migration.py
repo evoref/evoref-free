@@ -452,7 +452,10 @@ class ModelMigrator:
             result.lora_action = (
                 "kept" if (self._is_partitioned() or try_lora) else "archived"
             )
-            result.recommendations = self._build_recommendations(dry_run=True)
+            result.recommendations = (
+                self._known_issue_recommendations(resolved_path)
+                + self._build_recommendations(dry_run=True)
+            )
             return result
 
         # base 学習パーティション有効時は、Step 3-5 の flat 無効化 (LoRA アーカイブ /
@@ -502,7 +505,15 @@ class ModelMigrator:
         self.model_state.lora_compatible = (try_lora and lora_action == "kept")
         self.model_state.save()
 
-        result.recommendations = self._build_recommendations(dry_run=False)
+        known_issues = self._known_issue_recommendations(resolved_path)
+        result.recommendations = known_issues + self._build_recommendations(
+            dry_run=False,
+        )
+        for issue in self._target_known_issues(resolved_path):
+            logger.warning(
+                "Target model %s has a known issue: %s",
+                new_model_filename, issue,
+            )
         logger.info(
             "Migration completed: %s -> %s (lora: %s)",
             old_model_filename, new_model_filename, lora_action,
@@ -613,8 +624,9 @@ class ModelMigrator:
             raise MigrationBusyError("Learning cycle is currently running")
 
         if dry_run:
-            result.recommendations = self._build_component_recommendations(
-                component, dry_run=True,
+            result.recommendations = (
+                self._known_issue_recommendations(resolved)
+                + self._build_component_recommendations(component, dry_run=True)
             )
             return result
 
@@ -641,9 +653,18 @@ class ModelMigrator:
         self.model_state.update_component_current(component, new_filename)
         self.model_state.save()
 
-        result.recommendations = self._build_component_recommendations(
-            component, dry_run=False, model_changed=old_filename != new_filename,
+        result.recommendations = (
+            self._known_issue_recommendations(resolved)
+            + self._build_component_recommendations(
+                component, dry_run=False,
+                model_changed=old_filename != new_filename,
+            )
         )
+        for issue in self._target_known_issues(resolved):
+            logger.warning(
+                "Target %s model %s has a known issue: %s",
+                component, new_filename, issue,
+            )
         logger.info(
             "Component migration completed: %s: %s -> %s",
             component, old_filename, new_filename,
@@ -779,6 +800,46 @@ class ModelMigrator:
             adapter_key=adapter_key, versions_key=versions_key,
             archive_root=archive_root,
         )
+
+    def _target_known_issues(self, resolved_path: Path) -> list[str]:
+        """切替先モデルの arch プロファイルに宣言された既知の弱点を返す。
+
+        切替**前**に伝えるのが目的。起動時の品質プローブ
+        (:mod:`backend.free.llm.quality_probe`) は事後の観測で、切替を戻すには
+        もう一度 migrate + 再起動が要る。プロファイルに実測済みの弱点があるなら
+        ``--dry-run`` の時点で出すのが最も安い。
+
+        arch が読めない / プロファイルに ``quality_baseline`` が無い場合は空。
+        判断材料が無いことを警告にはしない (未知 ≠ 悪い)。
+        """
+        try:
+            from scripts.launch_llama import load_model_profile, read_gguf_metadata
+
+            arch = read_gguf_metadata(resolved_path).get("architecture")
+            profile = load_model_profile(arch, self.project_root) if arch else {}
+        except Exception as exc:
+            logger.debug(
+                "known-issue lookup failed for %s: %s", resolved_path, exc,
+            )
+            return []
+        raw = (profile or {}).get("quality_baseline")
+        if not isinstance(raw, dict):
+            return []
+        issues = raw.get("known_issues")
+        return [str(i) for i in issues] if isinstance(issues, list) else []
+
+    def _known_issue_recommendations(self, resolved_path: Path) -> list[str]:
+        """既知の弱点を推奨アクション文へ整形する (無ければ空リスト)。"""
+        issues = self._target_known_issues(resolved_path)
+        if not issues:
+            return []
+        return [
+            f"切替先モデルには既知の弱点が報告されています: {issue}"
+            for issue in issues
+        ] + [
+            "切替後の起動時に出力品質プローブが走ります "
+            "(結果は GET /api/model/quality)",
+        ]
 
     def _resolve_embedding_profile_params(self, resolved_path: Path) -> dict:
         """新 embed モデルの ``embedding.*`` パラメータを解決する。

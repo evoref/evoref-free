@@ -116,6 +116,7 @@ async def reload_assist_model(state: AppState) -> None:
         await client.update_params_from_server()
         state.assist_client = client
         _sync_assist_client_downstream(state)
+        _rebind_assist_prompts(state, cfg)
         cc = client.concurrency
         logger.info(
             "Assist model reloaded: %s "
@@ -127,6 +128,42 @@ async def reload_assist_model(state: AppState) -> None:
         logger.error("Failed to reload assist model: %s", e)
         state.assist_client = None
         _sync_assist_client_downstream(state)
+
+
+def _rebind_assist_prompts(state: AppState, cfg: dict) -> None:
+    """アシストモデル切替に合わせて AssistPromptManager を貼り替える。
+
+    アシストプロンプトは進化の対象で、進化した文面は **そのモデルの癖に合わせて
+    最適化される**。モデルだけ差し替えて文面を据え置くと、前モデル向けの誘導が
+    新モデルに掛かり続ける。パーティションは
+    ``PathResolver.resolve_assist_prompt_dir`` (アシストモデル単位) が持つので、
+    ここでは active stem を更新して manager を作り直すだけでよい。
+
+    新モデルのディレクトリが空なら :class:`AssistPromptManager` が既定を書き出す
+    (= 引き継がず作り直す)。失敗しても既存 manager を残して継続する。
+    """
+    from pathlib import Path
+
+    from backend.config import get_path_resolver
+    from backend.free.agent.assist_prompt_manager import AssistPromptManager
+
+    try:
+        resolver = get_path_resolver()
+        filename = Path(cfg.get("model_paths", {}).get("assist_model") or "").name
+        new_stem = Path(filename).stem if filename else None
+        if new_stem == resolver.active_assist_model_stem:
+            return
+        resolver.set_active_assist_model_stem(new_stem)
+        state.assist_prompt_manager = AssistPromptManager(
+            resolver.resolve_assist_prompt_dir(),
+        )
+        logger.info(
+            "Assist prompts rebound to model partition: %s", new_stem or "(flat)",
+        )
+    except Exception as e:
+        logger.warning(
+            "Assist prompt rebind failed (keeping previous prompts): %s", e,
+        )
 
 
 def _stop_assist_server_process(state: AppState, cfg: dict) -> None:
