@@ -383,6 +383,167 @@ def _start_assist_capability_probe(
     assist_client._capability_probe_task = asyncio.create_task(_run())
 
 
+def _start_quality_probes(
+    state: AppState,
+    cfg: dict[str, Any],
+    resolver: Any,
+    debug_logger: "DebugLogger",
+    *,
+    local_client: Any,
+    assist_client: Any,
+    embedder: Any,
+) -> None:
+    """モデル切替を検知した役割だけ出力品質プローブを走らせる。
+
+    ``capability_probe`` が観測するのは形式 (reasoning 分離 / json 強制) だけで
+    **出力の質は見ない**。base を Qwen3.5-9B → gemma-4-12b へ切り替えた際、
+    日本語の語間空白が 1% → 76〜83% に悪化したのに起動も capability probe も
+    正常で、27 ターン会話するまで気付けなかった (2026-08-02)。その穴を塞ぐ。
+
+    毎起動は走らせない。``local/model_quality.json`` に「役割ごとに最後に検査した
+    モデル名」を記録し、**変わったときだけ**カナリアを投げる (iGPU では 3 役割で
+    分単位かかるため)。起動はブロックせず、失敗しても prior のまま継続する。
+    """
+    if not (cfg.get("runtime", {}) or {}).get("capability_probe", True):
+        return
+
+    from backend.free.llm.quality_probe import (
+        QualityProbeStore,
+        log_probe_result,
+        probe_embed_quality,
+        probe_text_quality,
+    )
+
+    model_paths = cfg.get("model_paths", {}) or {}
+    targets: list[tuple[str, str, Any]] = [
+        ("base", model_paths.get("base_model") or "", local_client),
+        ("assist", model_paths.get("assist_model") or "", assist_client),
+        ("embedding", model_paths.get("embed_model") or "", embedder),
+    ]
+    raw_paths = {role: raw for role, raw, _ in targets}
+
+    try:
+        store = QualityProbeStore(resolver.resolve_local("model_quality_file"))
+    except Exception as exc:
+        logger.warning("Quality probe store unavailable: %s", exc)
+        return
+    state.model_quality = store
+
+    pending = [
+        (role, Path(raw).name, client)
+        for role, raw, client in targets
+        if client is not None
+        and store.needs_probe(role, Path(raw).name if raw else "")
+    ]
+    if not pending:
+        return
+    logger.info(
+        "Quality probe scheduled for changed models: %s",
+        ", ".join(f"{role}={name}" for role, name, _ in pending),
+    )
+
+    async def _run() -> None:
+        for role, model_name, client in pending:
+            try:
+                baseline = _resolve_role_quality_baseline(raw_paths[role])
+                if role == "embedding":
+                    result = await probe_embed_quality(
+                        model=model_name,
+                        embed_fn=_make_probe_embed_fn(client),
+                        baseline=baseline,
+                        expected_dim=(cfg.get("embedding", {}) or {}).get("dim"),
+                    )
+                else:
+                    from backend.free.llm.capability import make_llama_chat_fn
+                    url = getattr(client, "url", "")
+                    if not url:
+                        continue
+                    result = await probe_text_quality(
+                        role=role,
+                        model=model_name,
+                        chat_fn=make_llama_chat_fn(
+                            url, debug_logger=debug_logger, timeout=90.0,
+                        ),
+                        baseline=baseline,
+                        # 本番のチャットパスと同じ thinking 設定で測る。既定のまま
+                        # 投げると reasoning モデルでは思考が生成上限を食い潰し、
+                        # content が空のまま「観測不能」になる (実機で確認)。
+                        enable_thinking=_probe_enable_thinking(client),
+                    )
+                log_probe_result(result)
+                store.record(result)
+            except Exception as exc:
+                logger.warning(
+                    "Quality probe failed for role=%s (skipped): %s", role, exc,
+                )
+
+    state._quality_probe_task = asyncio.create_task(_run())
+
+
+def _probe_enable_thinking(client: Any) -> bool | None:
+    """クライアントが本番で使っている ``enable_thinking`` を取り出す。
+
+    品質プローブは**ユーザーが実際に受け取る本文**を測るので、本番と同じ設定で
+    投げる必要がある。設定が違えば別のものを測ってしまう (既定のまま投げたところ、
+    reasoning モデルで思考が生成上限を食い潰し content が空になった)。
+
+    保持場所がクライアント種別で異なる — ``LocalClient`` は ``_enable_thinking``、
+    ``AssistModelClient`` は ``_chat_template_kwargs["enable_thinking"]``。どちらも
+    起動時に ``resolve_enable_thinking`` で解決済みの値なので、ここでは読むだけで
+    再導出しない (二重解決は乖離のもと)。``None`` は「送らない」を意味する。
+    """
+    value = getattr(client, "_enable_thinking", None)
+    if value is not None:
+        return bool(value)
+    kwargs = getattr(client, "_chat_template_kwargs", None)
+    if isinstance(kwargs, dict) and "enable_thinking" in kwargs:
+        return bool(kwargs["enable_thinking"])
+    return None
+
+
+def _resolve_role_quality_baseline(model_path: str) -> Any:
+    """GGUF の arch から ``quality_baseline`` を解決する。
+
+    arch は ``ModelMetadata`` に無い (llama-server の ``/props`` は返さない) ため、
+    ``_resolve_embedding_profile_params`` と同じく GGUF ヘッダから読む。読めない /
+    プロファイルに ``quality_baseline:`` が無い場合は既定閾値 — プロファイルは
+    あくまで既定の**調整**で、無くても検査自体は成立させる。
+    """
+    from backend.free.llm.quality_probe import resolve_quality_baseline
+
+    if not model_path:
+        return resolve_quality_baseline(None)
+    try:
+        from backend.config import get_project_root
+        from scripts.launch_llama import load_model_profile, read_gguf_metadata
+
+        root = get_project_root()
+        resolved = Path(model_path)
+        if not resolved.is_absolute():
+            resolved = root / resolved
+        arch = read_gguf_metadata(resolved).get("architecture")
+        profile = load_model_profile(arch, root) if arch else {}
+    except Exception as exc:
+        logger.debug(
+            "quality baseline profile load failed (%s): %s", model_path, exc,
+        )
+        return resolve_quality_baseline(None)
+    return resolve_quality_baseline(profile)
+
+
+def _make_probe_embed_fn(embedder: Any) -> Any:
+    """``EmbeddingBackend`` を品質プローブ用の ``EmbedFn`` へ薄く包む。
+
+    プローブ文はクエリでもドキュメントでもない中立のカナリアなので
+    ``is_query=False`` (prefix なし) で埋め込む — instruction prefix が乗ると
+    測っているのがモデルではなく prefix になってしまう。
+    """
+    async def _embed(texts: Any) -> Any:
+        return await embedder.embed(list(texts), is_query=False)
+
+    return _embed
+
+
 def _init_cartridge_manager(state: AppState, cfg: dict[str, Any], resolver: Any) -> None:
     """6b. カートリッジマネージャ初期化"""
     from backend.free.rag.cartridge_manager import CartridgeManager
@@ -518,10 +679,13 @@ def _init_learning_core(
 
     # 7b. プロンプトマネージャ（§6.6.4: モード別システムプロンプト）
     # base システムプロンプト (chat.md / coding.md + meta + history + learning_state)
-    # は (model×mode) partition 配下 (resolve_learning)。assist プロンプトは共有のため
-    # resolve_local 据え置き — 両者が同一 prompts_dir を共有しないよう分離する。
+    # は (model×mode) partition 配下 (resolve_learning)。assist プロンプトは
+    # **アシストモデル単位** の別軸パーティション (resolve_assist_prompt_dir) —
+    # 進化した文面はそのモデルの癖に合わせて最適化されるため、アシストモデルを
+    # 差し替えたら引き継がず既定から作り直す。両者が同一 prompts_dir を共有しない
+    # よう分離する。
     base_prompt_dir = resolver.resolve_learning("prompts_dir")
-    assist_prompt_dir = resolver.resolve_local("prompts_dir")
+    assist_prompt_dir = resolver.resolve_assist_prompt_dir()
     instance_name = cfg.get("instance", {}).get("name", "evoref")
     prompt_mgr = SystemPromptManager(base_prompt_dir, instance_name=instance_name)
     state.prompt_manager = prompt_mgr
@@ -1909,6 +2073,11 @@ async def _build_gen_pillar(
     with _timed(timings, "llm_client"):
         _init_llm_client(state, client)
 
+    _start_quality_probes(
+        state, cfg, resolver, debug_logger,
+        local_client=client, assist_client=assist_client, embedder=embedder,
+    )
+
     from backend.pillars import GenPillar
     gen = GenPillar(
         local_client=client,
@@ -2295,6 +2464,14 @@ def _activate_learning_partition(base: "_BaseContext", state: AppState) -> None:
     embed_filename = Path(cfg.get("model_paths", {}).get("embed_model") or "").name
     resolver.set_active_embedding_model_stem(
         Path(embed_filename).stem if embed_filename else None,
+    )
+
+    # assist プロンプトも同様に base モデルとは独立軸 (アシストモデル単位)。
+    # 進化した文面はそのモデルの癖に合わせて最適化されるため、アシストモデルを
+    # 差し替えたら前モデル向けの文面を引き継がず、既定から作り直す。
+    assist_filename = Path(cfg.get("model_paths", {}).get("assist_model") or "").name
+    resolver.set_active_assist_model_stem(
+        Path(assist_filename).stem if assist_filename else None,
     )
 
     from backend.free.core.learning_partition_migrator import LearningPartitionMigrator

@@ -202,6 +202,37 @@ class ExperienceBuffer(JsonStateStore):
                 }),
             )
             self.entries.append(entry)
+        self._mark_loaded_conversations_ended()
+
+    def _mark_loaded_conversations_ended(self) -> int:
+        """読み込んだエントリの ``conversation_ended`` を確定させる。
+
+        ``FeedbackCollector.mark_conversation_ended`` は ``_session_entries``
+        (**メモリ上のオブジェクト参照リスト**) を辿って印を付けるため、印を付ける前に
+        プロセスが落ちると紐付けごと消え、そのエントリは**二度と** ended にならない
+        (実測: 69 件中 42 件が未マークのまま死蔵。fitness が 0.528 と 0.806 で
+        二分され、学習の選択圧から丸ごと外れていた)。
+
+        永続ファイルにあるエントリは定義上すべて**このプロセスの起動より前**に
+        書かれたもので、それを書いたプロセスはもう存在しない。したがって当該会話は
+        既に終了している。読み込み時点で確定させるのが正しく、ここが唯一の
+        再起動耐性のある地点になる。
+
+        Returns:
+            新たに ended を立てた件数。
+        """
+        marked = 0
+        for entry in self.entries:
+            if not entry.signals.conversation_ended:
+                entry.signals.conversation_ended = True
+                marked += 1
+        if marked:
+            logger.info(
+                "Marked %d loaded entries as conversation_ended "
+                "(their writing process is gone, so those conversations are over)",
+                marked,
+            )
+        return marked
 
     def _on_save_success(self, path: Path) -> None:
         logger.info("Saved %d experience entries to %s", len(self.entries), path)

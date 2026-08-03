@@ -480,6 +480,66 @@ def is_environment_fact_query(query: str) -> bool:
     )
 
 
+#: 環境事実を「問うている」ことを示す疑問・依頼マーカー。
+#:
+#: ``is_environment_fact_query`` 単体は語彙マッチなので、ユーザーの自己申告
+#: (「私のマシンはメモリは 64GB です」) にも当たる。実行判断にそのまま使うと
+#: 2026-07-25 に潰した「自己紹介文の 'メモリ' 部分マッチで環境コマンドが発火し、
+#: ツール結果が会話履歴を上書きする」不具合が戻る (実際に踏んだ)。
+_ENV_FACT_ASK_RE = re.compile(
+    r"[?？]\s*$"
+    r"|(?:教えて|おしえて|ですか|でしょうか|ありますか|知りたい|調べて|確認して)"
+    r"|\b(?:what(?:'s| is| are)|tell\s+me|show\s+me|which)\b",
+    re.IGNORECASE,
+)
+
+
+def asks_environment_fact(query: str) -> bool:
+    """この実行環境の事実を **問うている** か (純粋関数)。
+
+    ``is_environment_fact_query`` (語彙一致) との違いは疑問・依頼形であること。
+    言及や自己申告を実行要求と取り違えないための連言で、実行するか否かの判断は
+    必ずこちらを使う。語彙側と同居させるのは、片方だけ更新されて食い違うのを
+    防ぐため (``is_environment_fact_query`` の docstring と同じ理由)。
+    """
+    return is_environment_fact_query(query) and bool(_ENV_FACT_ASK_RE.search(query))
+
+
+#: ディレクトリを指す名詞。
+_DIRECTORY_NOUN_RE = re.compile(
+    r"(?:ディレクトリ|フォルダ"
+    r"|(?<![A-Za-z])director(?:y|ies)(?![A-Za-z])"
+    r"|(?<![A-Za-z])folders?(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+
+#: 「そこに何があるか」を問う列挙表現。
+_LISTING_QUESTION_RE = re.compile(
+    r"(?:直下|配下|の中に|の下に|一覧|リスト|中身|入って(?:いま|ま)す|何があり)"
+    r"|(?<![A-Za-z])list(?![A-Za-z])"
+    r"|what(?:'s| is| are)\s+in",
+    re.IGNORECASE,
+)
+
+
+def asks_directory_listing(query: str) -> bool:
+    """ディレクトリの中身の列挙を求めているか (純粋関数)。
+
+    ディレクトリ名詞と列挙表現の **連言** で判定する。片方だけでは必ず誤爆する —
+    「ディレクトリとは何ですか」は名詞のみ、「利点を一覧で教えて」は列挙のみで、
+    どちらも実行要求ではない。同じ連言方式を ``asks_environment_fact`` でも使う。
+
+    実インシデント (2026-08-03 ライブ監査): 「backend ディレクトリの直下には何が
+    ありますか」がツールシグナル無しと判定されて knowledge query に落ち、
+    ``list_directory`` が一度も走らないまま Node.js の構成
+    (``config/ db/ controllers/ routes/ app.js``) を丸ごと捏造した。続く
+    「そのうち Python ファイルはいくつありますか」も捏造の上に「5 個」と答えた。
+    """
+    return bool(
+        _DIRECTORY_NOUN_RE.search(query) and _LISTING_QUESTION_RE.search(query),
+    )
+
+
 def requests_long_output(query: str) -> bool:
     """クエリが「長文と呼べる分量」を明示的に指定しているか (純粋関数)。
 

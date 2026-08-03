@@ -324,6 +324,7 @@ local_paths:
   rag_judge_events_file: local/rag_judge_events.jsonl # RAG necessity/quality 判定イベント (sleep-time が world_fact 化するまでの保持先)
   learned_patterns_file: local/learned_patterns.json # 学習済みパターン検出キーワード
   model_state_file: local/model_state.json           # モデル切替・LoRA 装着状態の永続化
+  model_quality_file: local/model_quality.json       # モデル切替時の出力品質プローブ結果
   local_state_file: local/state.json                 # EvorefMem ローカル状態
   # マイグレーション
   migration_archive_dir: local/migration_archive/    # SchemaMigrator バックアップ / 旧 prompts 退避先 (EvorefMem 移行で 30 日保持)

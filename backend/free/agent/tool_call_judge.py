@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import re
 import time
 from collections import OrderedDict
@@ -18,9 +19,12 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from backend.free.agent.reactive import GREETING_RESPONSES, GREETING_RESPONSES_EN
+from backend.config import get_project_root
 from backend.free.agent.router import (
     HISTORY_KEYWORDS,
     HISTORY_KEYWORDS_EN,
+    asks_directory_listing,
+    asks_environment_fact,
     is_environment_fact_query,
 )
 from backend.free.core.intent_vocab import (
@@ -720,15 +724,69 @@ def _synthesized_expression_grounded(
     numbers = _NUMBER_LITERAL_RE.findall(expression)
     if not numbers:
         return False
-    known = set(_NUMBER_LITERAL_RE.findall(query))
-    known.update(_NUMBER_LITERAL_RE.findall(context))
+    known = _known_numbers(query) | _known_numbers(context)
     known.update(_UNIT_SYSTEM_CONSTANTS)
     return all(n in known for n in numbers)
+
+
+#: 桁区切り入りの数字 (``2,660`` / ``1,234,567``)。アシスタント自身が金額を
+#: この書式で提示するため、次のターンでその数値を使う式が「対話に無い数値」と
+#: 誤判定されていた (実インシデント 2026-08-03 ライブ監査: 直前の回答
+#: 「2,660円です」を受けた ``2926 + 500`` が ungrounded で no_tool に落ち、
+#: 決定論の calculate 経路を失って base の暗算に回っていた)。
+_GROUPED_NUMBER_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?")
+
+#: 明示されたパーセント (``10%`` / ``10 パーセント``)。
+_PERCENT_LITERAL_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:%|％|パーセント)")
+
+
+def _known_numbers(text: str) -> set[str]:
+    """``text`` に「書かれている」とみなせる数値リテラルを集める (純粋関数)。
+
+    素の数字に加えて 2 種類を同一視する。どちらも **対話に現れた表記から決定論で
+    導ける**もので、モデルが知識から持ち出した定数ではない:
+
+    - 桁区切り: ``2,660`` → ``2660``。数える側 (式) は区切りを打たないため、
+      正規化しないと自分が直前に提示した金額を「知らない数値」と判定してしまう
+    - パーセント: ``10%`` → ``0.1`` / ``1.1`` / ``1.10``。税率・割引率の計算で
+      式に現れる倍率は、クエリ中の百分率から一意に決まる
+    """
+    known = set(_NUMBER_LITERAL_RE.findall(text))
+    for grouped in _GROUPED_NUMBER_RE.findall(text):
+        known.add(grouped.replace(",", ""))
+    for pct in _PERCENT_LITERAL_RE.findall(text):
+        try:
+            rate = float(pct) / 100.0
+        except ValueError:
+            continue
+        # 「10%」からは 0.1 (率) と 1.1 (加算後の倍率) が導ける。式側の表記ゆれ
+        # (1.1 / 1.10) を吸収するため両方を登録する。
+        for value in (rate, 1.0 + rate):
+            known.add(f"{value:g}")
+            known.add(f"{value:.2f}")
+    return known
 
 
 #: 層5.2 の数値グラウンディングに使う直近ターン数。長く取るほど無関係な数値を
 #: 拾いやすくなるため短く保つ。
 _CALCULATE_CONTEXT_TURNS = 4
+
+#: 指示語 (照応) を含むクエリ。単体では対象が決まらず、直前ターンを見ないと
+#: 解決できない。コマンド合成は ``query`` だけでプロンプトを組んでいたため、
+#: 「その数を 1000 で割った余りは？」で「その数」を解決できず、クエリ内の唯一の
+#: 数値を代入した ``print(1000 % 1000)`` を生成して 0 と誤答した
+#: (実インシデント 2026-08-02 ライブ監査。直前ターンの正解は 65536 → 536)。
+#: 同じ照応解決は calculate 側 (``_judge_with_calculate_fallback``) では
+#: conversation を受け取って既に解けており、経路間の非対称だった。
+#:
+#: 全クエリに文脈を足すと合成プロンプトが常に膨らむため、照応を含む場合だけ
+#: 付与する。
+_ANAPHORIC_QUERY_RE = re.compile(
+    r"(?:その|それ|これ|この|あの|先ほどの?|さっきの?|今の|上記の?)"
+    r"|(?<![A-Za-z])(?:that|it|this|the\s+(?:result|answer|number|value))"
+    r"(?![A-Za-z])",
+    re.IGNORECASE,
+)
 
 
 # 明示的な実行動詞。バッククォートのコマンドと共起したとき「実測要求」とみなす。
@@ -1155,7 +1213,49 @@ def _query_has_tool_signal(query: str) -> bool:
     return (
         any(p.search(query) for p in patterns)
         or bool(_PATH_OR_URL_SIGNAL_RE.search(query))
+        # ディレクトリ列挙は _TOOL_PATTERNS のどれにも当たらず、knowledge query
+        # として落ちて捏造回答になっていた (2026-08-03 ライブ監査)。
+        or asks_directory_listing(query)
     )
+
+
+#: 「プロジェクトのルート」を指す表現。列挙対象をカレントディレクトリに解決する。
+_PROJECT_ROOT_REFERENCE_RE = re.compile(
+    r"(?:プロジェクト|リポジトリ|ルート|トップ(?:レベル)?|一番上)"
+    r"|(?<![A-Za-z])(?:project|repo(?:sitory)?|root|top[-\s]?level)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+#: ``<名前> ディレクトリ`` / ``<名前> フォルダ`` の ``<名前>`` を取る。パス片として
+#: ありうる文字だけを許し、和文は取らない (「このディレクトリ」の「この」等を
+#: 対象名と誤認しないため)。
+_NAMED_DIRECTORY_RE = re.compile(
+    r"([A-Za-z0-9._/\\-]+)\s*(?:ディレクトリ|フォルダ)"
+    r"|(?:director(?:y|ies)|folders?)\s+([A-Za-z0-9._/\\-]+)",
+    re.IGNORECASE,
+)
+
+
+def resolve_listing_directory(query: str, root: Path) -> str | None:
+    """列挙対象のディレクトリを解決する。**実在するものだけ**返す (純粋関数)。
+
+    存在しないパスを返さないのは、捏造パスを実行しても失敗するだけで価値が無い
+    ためで、``_READ_PATH_TOOLS`` の方針と同じ。解決できなければ ``None`` を返し、
+    呼び出し側は後段の層 (assist 判定) へ委ねる — 当てずっぽうの引数でツールを
+    撃つより、シグナルだけ立てて判断を渡すほうが安全。
+    """
+    for match in _NAMED_DIRECTORY_RE.finditer(query):
+        name = match.group(1) or match.group(2)
+        if not name:
+            continue
+        candidate = Path(name)
+        if not candidate.is_absolute():
+            candidate = root / name
+        if candidate.is_dir():
+            return name
+    if _PROJECT_ROOT_REFERENCE_RE.search(query):
+        return "."
+    return None
 
 
 def _is_conversational_query_without_tool_signal(query: str) -> bool:
@@ -1409,6 +1509,10 @@ class ToolCallJudge:
         self._measurement_blocked: bool = False
         # 直近の judge() のユーザークエリ。measurement_blocked の適用可否判定用。
         self._last_query: str = ""
+        # 直近の judge() の会話履歴。コマンド合成の指示語解決に使う
+        # (``_synthesize_command_via_assist`` の呼出元が 3 箇所あり、いずれも
+        # conversation を持たないため、単一の入口である judge() で保持する)。
+        self._last_conversation: list[dict] = []
 
     @property
     def measurement_blocked(self) -> bool:
@@ -1539,6 +1643,7 @@ class ToolCallJudge:
         """
         self._measurement_blocked = False
         self._last_query = query
+        self._last_conversation = list(conversation or [])
 
         # 0. URL リコール先回り判定 (mode / enabled に関係なく実行)
         # ``_try_recall_url`` は決定論的 (embedding 類似度 + 過去採点平均閾値)
@@ -3173,6 +3278,21 @@ class ToolCallJudge:
                 }
         return judgement
 
+    def _command_cache_key(self, query: str, readonly: bool) -> str:
+        """合成キャッシュのキー。指示語クエリでは文脈もキーに含める。
+
+        指示語を含むクエリは、同じ文面でも直前ターンが違えば正しいコマンドが
+        変わる (「その数を 1000 で割った余りは？」は直前の値次第)。文脈を
+        プロンプトへ入れる以上、キーにも入れないと別の会話の結果を配ってしまう。
+        """
+        key = f"{int(readonly)}:{query.strip().lower()}"
+        if _ANAPHORIC_QUERY_RE.search(query):
+            recent = _recent_dialogue_text(self._last_conversation)
+            if recent:
+                digest = hashlib.sha256(recent.encode("utf-8")).hexdigest()[:12]
+                key = f"{key}:{digest}"
+        return key
+
     def _command_cache_lookup(
         self, query: str, readonly: bool = False,
     ) -> tuple[bool, str] | None:
@@ -3182,7 +3302,7 @@ class ToolCallJudge:
         ``readonly`` は合成プロンプトの制約を変えるためキーに含める
         (chat の readonly 結果を coding へ、またはその逆へ流さない)。
         """
-        key = f"{int(readonly)}:{query.strip().lower()}"
+        key = self._command_cache_key(query, readonly)
         if key not in self._command_cache:
             return None
         ts, value = self._command_cache[key]
@@ -3196,7 +3316,7 @@ class ToolCallJudge:
         self, query: str, value: tuple[bool, str], readonly: bool = False,
     ) -> None:
         """executable_command_synth キャッシュに格納する (LRU)."""
-        key = f"{int(readonly)}:{query.strip().lower()}"
+        key = self._command_cache_key(query, readonly)
         self._command_cache[key] = (time.time(), value)
         self._command_cache.move_to_end(key)
         while len(self._command_cache) > self._command_cache_max:
@@ -3237,9 +3357,23 @@ class ToolCallJudge:
 
         import platform
         platform_info = f"{platform.system()} {platform.release()}"
+        # 指示語を含むクエリだけ直前ターンを添える (``_ANAPHORIC_QUERY_RE`` 参照)。
+        # 単体では「その数」が解決できず、クエリ内の別の数値を代入した式を
+        # 合成してしまう。
+        context_block = ""
+        if _ANAPHORIC_QUERY_RE.search(query):
+            recent = _recent_dialogue_text(self._last_conversation)
+            if recent:
+                context_block = (
+                    f"## 直前のやり取り\n{recent}\n\n"
+                    "クエリ中の指示語 (その数 / それ / 先ほどの結果 等) は"
+                    "上記から特定し、特定した値そのものをコマンドに埋め込むこと。"
+                    "指示語を解決できない場合は is_executable=false を返すこと。\n\n"
+                )
         base_prompt = (
             f"## プラットフォーム\n{platform_info}\n\n"
             f"{_READONLY_SYNTH_CONSTRAINT if readonly else ''}"
+            f"{context_block}"
             f"## クエリ\n{query}"
         )
         outcome = await self._ask_command_synth(base_prompt)
@@ -3411,7 +3545,19 @@ class ToolCallJudge:
         # 高特異度シグナルがある場合のみ assist の否定票を覆す:
         #  - 日付 / 時刻クエリ (曖昧さが小さい)
         #  - 明示的なファイルパス / URL (ユーザーが対象を書いた決定論的根拠)
-        if _DATETIME_QUERY_RE.search(query) or _PATH_OR_URL_SIGNAL_RE.search(query):
+        #  - この実行環境の事実 (OS / スペック等) — 原理的に実測でしか答えられない
+        #
+        # 環境事実を足すのは、降格した先が「base の想像」しかないため。実インシデント
+        # (2026-08-03 ライブ監査): 「今動いている OS とそのバージョンを教えてください」
+        # で規則層が run_command_readonly を選んだのに assist が not executable と
+        # 判定して降格し、Windows 11 の実機に対して「Windows 10 Pro 22H2」と確信を
+        # 持って誤答した。規則層は router と同じ ``is_environment_fact_query`` の語彙で
+        # 実行可能と分類しており、そこへ 4B の assist に拒否権を与える理由がない。
+        if (
+            _DATETIME_QUERY_RE.search(query)
+            or _PATH_OR_URL_SIGNAL_RE.search(query)
+            or asks_environment_fact(query)
+        ):
             return result
         logger.info(
             "Demoting %s to no_tool: assist judged the query not executable: %s",
@@ -3443,6 +3589,23 @@ class ToolCallJudge:
                 tool_args={"expression": expression},
                 source="rule",
             )
+
+        # ディレクトリ列挙は決定論で解決する。対象が実在するときだけ発火し、
+        # 解決できなければシグナルだけ立てて後段へ委ねる (当てずっぽうの引数で
+        # 撃たない)。知識質問判定より前に置くのは算術式と同じ理由で、
+        # 「〜には何がありますか」が知識質問にマッチして base の想像に落ちるため。
+        if asks_directory_listing(query) and tools_registry.has("list_directory"):
+            directory = resolve_listing_directory(query, get_project_root())
+            if directory is not None:
+                logger.debug(
+                    "Rule-based: directory listing detected: %s", directory,
+                )
+                return ToolJudgement(
+                    tool_needed=True,
+                    tool_name="list_directory",
+                    tool_args={"directory": directory},
+                    source="rule",
+                )
 
         # 知識質問はツール不要（RAG パイプラインで処理）
         # ただしツールパターン・ファイルパス・URL にもマッチするクエリは

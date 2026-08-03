@@ -25,6 +25,8 @@ from backend.free.api.schemas import (
     MigrateResponse,
     MigrationHistoryResponse,
     ModelDetailResponse,
+    ModelQualityResponse,
+    ModelQualityRole,
     ModelStateResponse,
     ReloadResponse,
     RollbackRequest,
@@ -178,6 +180,24 @@ async def get_model_state(state: AppState = Depends(get_app_state)):
             cfg.get("model_migration", {}).get("strict_startup_check", False),
         ),
         recommendation=mismatch_info.get("recommendation", "") if is_mismatch else "",
+    )
+
+
+@router.get("/quality", response_model=ModelQualityResponse)
+async def get_model_quality(state: AppState = Depends(get_app_state)):
+    """モデル切替時の出力品質プローブ結果を取得
+
+    プローブはモデルが変わったときだけ走るため、まだ一度も切替が起きていない
+    役割は含まれない (空リスト = 未検査であって合格ではない)。
+    """
+    logger.debug("GET /api/model/quality")
+    store = state.model_quality
+    if store is None:
+        return ModelQualityResponse()
+    roles = [ModelQualityRole(**r) for r in store.summary()]
+    return ModelQualityResponse(
+        roles=roles,
+        degraded=any(not r.passed and not r.skipped_reason for r in roles),
     )
 
 

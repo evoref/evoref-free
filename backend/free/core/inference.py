@@ -10,6 +10,7 @@ from backend.free.api.chat.chat_constants import (
     DEFAULT_MAX_TOKENS, DEFAULT_WORKING_MAX_TOKENS,
 )
 from backend.free.api.chat.chat_types import ChatMessage
+from backend.free.core.intent_vocab import refers_to_previous_output
 from backend.free.core.prompt_blocks import current_datetime_block
 from backend.free.core.turn_text import append_to_last_user, prepend_to_last_user
 from backend.config import resolve_context_size
@@ -446,6 +447,25 @@ def _prepend_dynamic_block(trimmed: list[ChatMessage], dyn_text: str) -> bool:
     )
 
 
+def _latest_user_refers_to_previous_output(trimmed: list[ChatMessage]) -> bool:
+    """最後の user メッセージが直前の出力を指す照応を含むか。
+
+    動的ブロック (記憶注入 / RAG / few-shot) は生クエリの **上** に前置されるため、
+    「上の内容を〜」「それを〜」のような後方参照はブロックの側に束縛されうる。
+    ブロック冒頭のラベルは既に「今回の会話で述べられた内容ではない」と否定して
+    いるが、実機ではその指示より **位置的な隣接が勝った** (2026-08-03 ライブ監査:
+    「上の内容を箇条書き 5 行にまとめ直してください」で直前ターンではなく注入
+    ブロックを要約し、次ターンの英訳依頼にも汚染が伝播した)。
+
+    指示文で直すのは既に一度失敗しているので、位置そのものを決定論で変える。
+    """
+    for msg in reversed(trimmed):
+        if msg.get("role") != "user":
+            continue
+        return refers_to_previous_output(str(msg.get("content") or ""))
+    return False
+
+
 def _append_note_to_last_user(trimmed: list[ChatMessage], note: str) -> bool:
     """trimmed の最後の user メッセージ末尾へ注記を追記する (要素は mutate しない)。"""
     return append_to_last_user(trimmed, note)
@@ -602,10 +622,18 @@ def build_messages(
     truncation_note = _latest_turn_truncation_note(history, trimmed)
 
     # 5. 動的ブロックを最後の user メッセージ先頭へ前置 (KV キャッシュ対応)。
-    #    user ターンが無い場合のみ従来どおり system へ結合して情報を落とさない。
+    #    ただし生クエリが直前の出力を指す照応を含む場合は system へ回す。前置すると
+    #    注入ブロックが「上の内容」のすぐ上に並び、参照先を奪う (下記参照)。
+    #    user ターンが無い場合も従来どおり system へ結合して情報を落とさない。
     if dyn_parts:
         dyn_text = "\n\n".join(dyn_parts)
-        if not _prepend_dynamic_block(trimmed, dyn_text):
+        divert_to_system = _latest_user_refers_to_previous_output(trimmed)
+        if divert_to_system:
+            logger.debug(
+                "dynamic block diverted to system: latest user turn refers to "
+                "previous output (avoiding anaphora capture)",
+            )
+        if divert_to_system or not _prepend_dynamic_block(trimmed, dyn_text):
             messages[0] = {
                 "role": "system",
                 "content": system_prompt + "\n\n" + dyn_text,

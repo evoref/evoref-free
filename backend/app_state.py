@@ -156,6 +156,11 @@ class AppState:
     model_state_mismatch: dict | None = None
     # component (assist/embed) の不一致。{config_key: {model_state, config}}
     component_state_mismatches: dict = field(default_factory=dict)
+    # 出力品質プローブの記録 (QualityProbeStore)。モデル切替を検知した役割だけ
+    # 検査され、結果は /api/status で参照される。型注釈を文字列にせず Any 相当で
+    # 持つのは、AppState を EvorefGen 非依存に保つため (lazy import で構築)。
+    model_quality: object | None = None
+    _quality_probe_task: object | None = None
 
     # ── エージェント / プロンプト ──
     prompt_manager: SystemPromptManager | None = None

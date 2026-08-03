@@ -471,6 +471,40 @@ class ModelStateResponse(BaseModel):
     recommendation: str = ""
 
 
+class ModelQualityCheck(BaseModel):
+    """品質プローブの個別チェック結果"""
+
+    name: str
+    passed: bool
+    observed: float | None = None
+    threshold: float | None = None
+    detail: str = ""
+
+
+class ModelQualityRole(BaseModel):
+    """役割 (base/assist/embedding) 1 つ分の品質プローブ結果"""
+
+    role: str
+    model: str
+    passed: bool = True
+    checks: list[ModelQualityCheck] = Field(default_factory=list)
+    known_issues: list[str] = Field(default_factory=list)
+    probed_at: str = ""
+    skipped_reason: str = ""
+
+
+class ModelQualityResponse(BaseModel):
+    """`GET /api/model/quality` レスポンス
+
+    モデル切替を検知した役割だけが検査されるため、`roles` は「これまでに一度でも
+    検査した役割」のみを含む。`degraded=True` は 1 つ以上の役割が閾値を割った
+    ことを示す (起動は止めない — 判断材料としての提示)。
+    """
+
+    roles: list[ModelQualityRole] = Field(default_factory=list)
+    degraded: bool = False
+
+
 # ===== Config =====
 
 class LocaleRequest(BaseModel):
