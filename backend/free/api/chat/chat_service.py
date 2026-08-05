@@ -14,8 +14,13 @@ from backend.free.api.chat.chat_constants import DEFAULT_WORKING_MAX_TOKENS
 from backend.free.api.chat.chat_recorder import clear_session_data, drain_evicted_to_stm
 from backend.free.api.chat.chat_types import ChatMessage, FileContextDict
 from backend.free.api.schemas import ChatRequest
+from backend.free.core.intent_vocab import (
+    is_whole_session_scope_query,
+    self_output_measure_kinds,
+)
 from backend.free.core.session_mode import is_chat_mode, normalize_session_mode
 from backend.free.core.inference import build_messages
+from backend.free.core.turn_text import append_to_last_user
 from backend.free.llm.llm_client import LLMClient
 from backend.free.memory.pipeline.search_pipeline import unified_search
 from backend.utils import estimate_tokens as _estimate_tokens
@@ -133,7 +138,12 @@ async def prepare_memory_context(
         )
         history = wm.get_messages()
 
-    logger.debug("Memory context: %d history turns from WorkingMemory", len(history))
+    # 単位はメッセージ数 (user/assistant を各 1 と数える)。往復数ではない —
+    # 「N history turns」と書いていたため、上限 30 を 30 往復と読み違えやすく
+    # なっていた (実際は 15 往復)。
+    logger.debug(
+        "Memory context: %d history messages from WorkingMemory", len(history),
+    )
 
     session_id = req.session_id or wm.session_id
     return history, session_id
@@ -633,6 +643,15 @@ def _render_conflict_section(
         return None
 
 
+def session_evicted_turns(state: AppState) -> int:
+    """現在セッションでワーキングメモリから押し出したターン数を安全に取る。
+
+    pillar 未構築 (degraded / テストの部分モック) では 0 を返す。
+    """
+    working = getattr(getattr(state, "mem", None), "working_memory", None)
+    return int(getattr(working, "session_evicted_turns", 0) or 0)
+
+
 def build_chat_messages(
     system_prompt: str, history: list[ChatMessage],
     rag_chunks: list[str] | None,
@@ -644,11 +663,17 @@ def build_chat_messages(
     fewshot_block: str | None = None,
     history_min_tokens: int = 0,
     working_max_tokens: int = DEFAULT_WORKING_MAX_TOKENS,
+    evicted_turns: int = 0,
 ) -> list[ChatMessage]:
     """messages 組み立て（build_messages で few-shot・file・メモリ・RAG・履歴を統合）。
 
     ``system_prompt`` は静的 (query 非依存)、``fewshot_block`` 等の query 依存部は
     build_messages 内で最後の user メッセージへ前置される (KV キャッシュ対応)。
+
+    Args:
+        evicted_turns: 現在セッションでワーキングメモリから押し出したターン数
+            (``WorkingMemory.session_evicted_turns``)。0 より大きい場合、会話
+            全体を走査しないと答えられない質問には切り詰め注記を付ける。
     """
     messages = build_messages(
         system_prompt, history,
@@ -663,8 +688,147 @@ def build_chat_messages(
         history_min_tokens=history_min_tokens,
         working_max_tokens=working_max_tokens,
     )
+    apply_grounding_notes(messages, history, evicted_turns)
     logger.debug("Messages assembled: %d messages for LLM", len(messages))
     return messages
+
+
+def apply_grounding_notes(
+    messages: list[ChatMessage],
+    history: list[ChatMessage],
+    evicted_turns: int,
+) -> None:
+    """視界の欠落と自己出力の計量に関する注記をまとめて付ける (in-place)。
+
+    **messages を組み立てる全経路がここを通ること**。reactive 軽量パス
+    (``chat._dispatch_reactive_light``) は ``build_chat_messages`` を通らず
+    独自に messages を組むため、片方にだけ入れると軽量パスが素通しになる。
+    実際、2026-08-05 ライブ監査で捏造が起きた 2 ターンはどちらも軽量パス
+    だった (「今の回答は実際に何字ありましたか？」が short_query →
+    reactive_light に落ち、直前の出力を数えずに「488 文字」と答えた)。
+
+    ``history`` は**切り詰め前の全履歴**を渡すこと。計量対象の直前 assistant
+    発言は軽量パスの窓から外れていることがある。
+    """
+    _append_truncated_history_note(messages, history, evicted_turns)
+    _append_self_output_measurement(messages, history)
+
+
+# 会話の前半がワーキングメモリから押し出された状態で、会話全体を走査しないと
+# 答えられない質問が来たときの注記。
+#
+# モデルには「見えている履歴」と「会話の全体」の区別が付かないため、切り詰めを
+# 伝えないと部分的な視界を全体だと思い込んで断定する (2026-08-05 ライブ監査:
+# ターン19 のファイル書き込みが 30 メッセージ窓から落ちた状態で「この会話で
+# 依頼したファイル操作を全部リストアップして」→「ファイル操作はありません」、
+# ターン7 で読んだ README が窓外の状態で「最初に読ませたファイルは」→ 窓内で
+# 最後に読んだ別ファイルを回答)。
+#
+# 「答えるな」ではなく「見えている範囲を答え、見えていない範囲を断定するな」
+# と書く。否定形の禁止だけを書くと退行する実測がある (2026-07-28)。
+_TRUNCATED_HISTORY_GUIDANCE = (
+    "\n\nこの質問は会話全体を見ないと正確に答えられないが、"
+    "この会話の前半 {n} 件のやり取りは文脈の上限を超えたため、"
+    "今のあなたには見えていない。"
+    "見えている範囲について答えたうえで、"
+    "「会話の前半は参照できないため、これより前にもあった可能性がある」"
+    "と明示すること。"
+    "見えていない範囲について「無い」「一度も〜していない」と断定しないこと。"
+)
+
+
+def _append_truncated_history_note(
+    messages: list[ChatMessage],
+    history: list[ChatMessage],
+    evicted_turns: int,
+) -> None:
+    """履歴が切り詰められている状態の全体走査質問へ注記を付ける (in-place)。
+
+    切り詰めが起きていない (``evicted_turns == 0``) 場合は何もしない。全体走査
+    質問の判定が多少広くても、切り詰めが無ければ注記は出ないためコストは無い。
+    """
+    if evicted_turns <= 0:
+        return
+    query = ""
+    for msg in reversed(history):
+        if msg.get("role") == "user":
+            query = str(msg.get("content") or "")
+            break
+    if not is_whole_session_scope_query(query):
+        return
+    if append_to_last_user(
+        messages, _TRUNCATED_HISTORY_GUIDANCE.format(n=evicted_turns),
+        separator="",
+    ):
+        logger.debug(
+            "Truncated-history note appended (%d turns evicted): %s",
+            evicted_turns, query[:60],
+        )
+
+
+# 直前の自分の出力の計量結果を「実測値」として渡す注記。
+#
+# 自分が出した文章の文字数はモデルには数えられない (2026-08-05 ライブ監査
+# ターン33: 実測 633 文字の回答を「488 文字」と回答)。しかもクエリが短いため
+# router が reactive に落とし、ツール判定すら走らない経路だった。ファイルの
+# 文字数を read_file のメタ行で決定論化したのと同じ扱いにする。
+_SELF_OUTPUT_MEASURE_LABELS: dict[str, str] = {
+    "chars": "文字数",
+    "lines": "行数",
+    "words": "単語数",
+}
+_SELF_OUTPUT_MEASUREMENT_GUIDANCE = (
+    "\n\n[システム計測] 直前のあなたの回答を機械的に数えた結果: {values}。"
+    "この数値をそのまま使って答えること。自分で数え直したり概算したりしないこと。"
+)
+
+
+def _measure_text(text: str, kinds: tuple[str, ...]) -> list[str]:
+    """直前出力の計量結果を人間可読な文字列リストにする (純粋関数)。"""
+    parts: list[str] = []
+    for kind in kinds:
+        label = _SELF_OUTPUT_MEASURE_LABELS[kind]
+        if kind == "chars":
+            stripped = "".join(text.split())
+            parts.append(
+                f"{label} {len(text)} 文字"
+                f" (空白・改行を除くと {len(stripped)} 文字)",
+            )
+        elif kind == "lines":
+            parts.append(f"{label} {len(text.splitlines())} 行")
+        else:
+            parts.append(f"{label} {len(text.split())} 語")
+    return parts
+
+
+def _append_self_output_measurement(
+    messages: list[ChatMessage], history: list[ChatMessage],
+) -> None:
+    """「今の回答は何文字?」に実測値を添える (in-place)。
+
+    直前の assistant 発言が無い / 計量質問でない場合は何もしない。
+    """
+    query = ""
+    for msg in reversed(history):
+        if msg.get("role") == "user":
+            query = str(msg.get("content") or "")
+            break
+    kinds = self_output_measure_kinds(query)
+    if not kinds:
+        return
+    previous = ""
+    for msg in reversed(history):
+        if msg.get("role") == "assistant":
+            previous = str(msg.get("content") or "")
+            break
+    if not previous.strip():
+        return
+    values = "、".join(_measure_text(previous, kinds))
+    if append_to_last_user(
+        messages, _SELF_OUTPUT_MEASUREMENT_GUIDANCE.format(values=values),
+        separator="",
+    ):
+        logger.debug("Self-output measurement injected: %s", values)
 
 
 # モデル入替中 (mode 切替が llama-server を再起動する) の待機上限とポーリング間隔。

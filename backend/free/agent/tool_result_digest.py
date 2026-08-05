@@ -40,6 +40,19 @@ _DIGIT_RUN_RE = re.compile(r"\d+")
 #:     (draft_document の長い側) だけを残して無駄な往復を落とせる。
 _DIGEST_MIN_RESULT_CHARS = 200
 
+#: digest として成立する最小文字数。これ未満は「要約」ではなく抽出の崩壊なので
+#: raw へ退避する。digest に掛かるのは 200 文字以上の結果だけ (上の定数) なので、
+#: 数文字の戻りは常に異常。
+#:
+#: 実インシデント (2026-08-05 ライブ監査): search_history の 1320 文字の結果が
+#: **2 文字**に潰れたが、`1320 -> 2 chars` という INFO ログが 1 行出るだけで
+#: そのまま base の「唯一の事実根拠」枠へ渡っていた。
+#:
+#: 閾値根拠: 同監査の正常な digest は 22 / 216 / 231 / 370 / 374 文字。
+#: 最小の 22 文字は read_file の行数・文字数抽出で、正当な短い digest。
+#: 8 文字はその下限より十分小さく、正当な短抽出を巻き込まない。
+_DIGEST_MIN_USEFUL_CHARS = 8
+
 # 小型 assist モデルは「関連情報なし」を _NO_INFO トークンではなく自然文
 # パラフレーズで返すことがある (実インシデント 2026-07-26: search_history が
 # 別セッション (別人物「佐藤健一」の会話) をヒットし、digest が
@@ -198,6 +211,18 @@ async def digest_tool_result(
             "tool_result_digest: digested number(s) not found in raw tool_result "
             "(tool=%s) - discarding possibly hallucinated digest, falling back to raw",
             tool_name,
+        )
+        return None
+    if len(digest) < _DIGEST_MIN_USEFUL_CHARS:
+        # 200 文字以上の入力から数文字しか返らないのは要約ではなく抽出の崩壊。
+        # そのまま「唯一の事実根拠」枠に載せると base は中身ゼロの文字列を
+        # 根拠に答えることになる (2026-08-05 ライブ監査: search_history の
+        # 1320 文字の結果が 2 文字に潰れたが INFO ログ 1 行だけで素通りした)。
+        # raw へ退避する方が安全。
+        logger.warning(
+            "tool_result_digest: digest collapsed to %d chars from %d "
+            "(tool=%s) - falling back to raw result",
+            len(digest), len(tool_result), tool_name,
         )
         return None
     logger.info(

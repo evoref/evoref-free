@@ -1904,6 +1904,12 @@ async def stream_deliberative(
         errored = False
         # keepalive ループで使う process() タスク (finally の衛生処理が参照)。
         process_task: asyncio.Task | None = None
+        # executable command 学習用に command/success を受け取る dict。
+        # process() は iterator 返却前に _judge_and_execute_tool を完了
+        # するため、await 完了時点で値が確定している。
+        # try の外で束縛する — finally の outcome ログが参照するため、
+        # try 内の早期例外で未定義になると NameError で握り潰される。
+        tool_capture: dict = {}
 
         try:
             yield sse.agent_layer("deliberative")
@@ -1917,10 +1923,6 @@ async def stream_deliberative(
                 timer.start("llm_total_ms")
                 timer.start("llm_first_token_ms")
 
-            # executable command 学習用に command/success を受け取る dict。
-            # process() は iterator 返却前に _judge_and_execute_tool を完了
-            # するため、await 完了時点で値が確定している。
-            tool_capture: dict = {}
             process_task = asyncio.create_task(agent.process(
                 query=query,
                 messages=list(messages),
@@ -2009,6 +2011,14 @@ async def stream_deliberative(
                 signals: dict = {"agent_layer": "deliberative"}
                 if escalated_from:
                     signals["escalated_from"] = escalated_from
+                # 「どのツールを撃って、役に立つ結果が出たか」を残す。
+                # これが無いと outcome JSONL には agent_layer しか載らず、
+                # 空振りツールに頼ったターンと接地できたターンが事後に
+                # 区別できない (2026-08-05 ライブ監査: chat_response 40/40 が
+                # success=true で、捏造したターンを含めて全て同じ見え方だった)。
+                if tool_capture.get("tool_name"):
+                    signals["tool_name"] = tool_capture["tool_name"]
+                    signals["tool_success"] = bool(tool_capture.get("tool_success"))
                 # success=False かつ genuine error でない = client cancel。
                 # evolve fitness がユーザーキャンセルを失敗計上しないよう区別する。
                 if not outcome_success and not errored:

@@ -39,7 +39,10 @@ from backend.free.constants import (
     TRUNCATION_MARKER,
 )
 from backend.free.constants import (
+    READ_FILE_META_PREFIX,
+    SEARCH_HISTORY_CURRENT_SESSION_HEADER,
     SEARCH_HISTORY_NO_RESULTS_PREFIX as _SEARCH_HISTORY_NO_RESULTS_PREFIX,
+    SEARCH_HISTORY_OTHER_SESSIONS_HEADER,
 )
 
 # read_file / search_code が読み込むファイルの上限サイズ。models/ (GGUF, 数十GB) 等の
@@ -153,8 +156,21 @@ def calculate(expression: str) -> str:
         return f"Error: {e}"
 
 
-def read_file(file_path: str) -> str:
-    """ファイルの内容を読み込む"""
+def read_file(
+    file_path: str,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> str:
+    """ファイルの内容を読み込む
+
+    先頭に ``[file: ... | lines: N | chars: M]`` のメタ行を付ける。行数・文字数は
+    LLM が本文から数えても正確にならない (実測 2026-08-05: 文字数を問われて
+    「確認できません」と回答放棄した) ため、決定論的に算出して渡す。
+
+    ``start_line`` / ``end_line`` (1 始まり・両端含む) を指定すると該当行だけを
+    返す。「最初の 3 行」のような範囲指定は本文全体を渡すとモデルが守らず
+    ほぼ全文を出力してしまうため、ツール側で切り出す。
+    """
     traversal_error = _check_path_traversal(file_path)
     if traversal_error:
         return traversal_error
@@ -171,10 +187,24 @@ def read_file(file_path: str) -> str:
                 f"limit {_TOOL_MAX_FILE_READ_BYTES}): {file_path}"
             )
         content = p.read_text(encoding="utf-8")
-        # 大きすぎるファイルは切り詰め
+        lines = content.splitlines()
+        header = (
+            f"{READ_FILE_META_PREFIX}{file_path}"
+            f" | lines: {len(lines)} | chars: {len(content)}"
+        )
+
+        if start_line is not None or end_line is not None:
+            start = max(1, int(start_line or 1))
+            end = int(end_line) if end_line is not None else len(lines)
+            end = min(len(lines), max(start, end))
+            content = "\n".join(lines[start - 1:end])
+            header += f" | showing lines {start}-{end}"
+
+        header += "]"
+        # 大きすぎるファイルは切り詰め (メタ行は残す)
         if len(content) > 50000:
-            return content[:50000] + "\n\n... (truncated, file too large)"
-        return content
+            content = content[:50000] + "\n\n... (truncated, file too large)"
+        return f"{header}\n{content}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -1129,9 +1159,22 @@ def _make_translate(client: LocalClient):
     """translate ツールハンドラを生成（LocalClient をクロージャでバインド）"""
 
     async def translate(text: str, target_lang: str) -> str:
-        """テキストを指定言語に翻訳する"""
+        """テキストを指定言語に翻訳する
+
+        システムプロンプトは「訳文だけを 1 案出す」ことを肯定形で指示する。
+        指定が緩いとモデルは丁寧さの異なる複数案とその解説を返し、それが
+        ツール結果として下流へ渡る (2026-08-05 ライブ監査: 「今の英文を日本語に
+        訳して」に対し ``Here are a few ways to translate this, depending on the
+        desired level of politeness: **Option 1: Po...`` という 1088 文字の
+        英語の解説文が返った。最終応答は base 側が持ち直したが、ツールの
+        戻り値としては不正)。
+        """
         messages = [
-            {"role": "system", "content": "You are a translation assistant. Translate the given text accurately."},
+            {"role": "system", "content": (
+                "You are a translation assistant. Translate the given text "
+                "accurately. Reply with the translated text only, as a single "
+                "version, keeping the original formatting and line breaks."
+            )},
             {"role": "user", "content": f"Translate the following text to {target_lang}:\n\n{text}"},
         ]
         try:
@@ -1270,6 +1313,15 @@ def _make_search_history(manager: HistoryManager):
                 return f"{SEARCH_HISTORY_NO_RESULTS_PREFIX}{query}"
 
             lines: list[str] = []
+            # 由来 (今回の会話 / 別の会話) を本文先頭で必ず宣言する。
+            # exclude_session_id が入っている = 現在セッションを除外した検索
+            # なので、ヒットは構造的に全て別セッション。session_id 明示時は
+            # 逆に全て現在セッション。どちらでもない (スコープ未注入) 場合は
+            # 混在し得るので宣言しない。
+            if exclude_session_id:
+                lines.append(SEARCH_HISTORY_OTHER_SESSIONS_HEADER)
+            elif session_id:
+                lines.append(SEARCH_HISTORY_CURRENT_SESSION_HEADER)
             for r in results:
                 header = f"[{r['started_at']}] mode={r['mode']} score={r['relevance_score']:.1f}"
                 if r.get("summary"):
@@ -1333,9 +1385,21 @@ def register_builtin_tools(
     registry.register(
         name="read_file",
         func=read_file,
-        description="Read the contents of a file",
+        description=(
+            "Read the contents of a file. Line 1 is metadata in brackets "
+            "(total lines / total chars) — read counts from there and keep it "
+            "out of your answer. The file content itself starts on line 2"
+        ),
         parameters={
             "file_path": {"type": "string", "description": "Path to the file to read"},
+            "start_line": {
+                "type": "integer",
+                "description": "First line to read (1-based, inclusive). Optional",
+            },
+            "end_line": {
+                "type": "integer",
+                "description": "Last line to read (1-based, inclusive). Optional",
+            },
         },
     )
 

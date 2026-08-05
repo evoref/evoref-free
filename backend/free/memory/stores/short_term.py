@@ -99,6 +99,18 @@ class MemoryNote:
     tool_command_source: str | None = None
     """コマンド実行が成功したか (出力が "Error:" prefix でない)。command 無しは None"""
 
+    tool_command_query: str | None = None
+    """このコマンドを発火させたユーザークエリ (executable_command_curator の対応付け用)。
+
+    STM は**選択的に吸収された部分集合**であり会話の完全な転写ではない。
+    curator が「直前で最も近い user note」を走査して対応付けると、当該ターンの
+    user note が吸収されていない場合に **別ターンのクエリ**と結び付く
+    (2026-08-05 実測: 日付コマンドが「富士山の標高は何メートルですか。」の
+    答えとして success_avg=1.0 で保存され、類似クエリで日付コマンドが発火する
+    状態になっていた)。発火時点で確定しているクエリをそのまま持たせて、
+    走査による推測をなくす。
+    """
+
     # ── 統合追加フィールド ────────────────────────────────────────
     task_status: TaskStatus | None = None
     """task ファクト lifecycle 用ステータス (open/in_progress/done/failed)"""
@@ -277,6 +289,7 @@ class ShortTermMemory:
             tool_command_name=turn.get("tool_command_name"),
             tool_command_success=turn.get("tool_command_success"),
             tool_command_source=turn.get("tool_command_source"),
+            tool_command_query=turn.get("tool_command_query"),
         )
         self.notes[note.id] = note
         self._cache_dirty = True

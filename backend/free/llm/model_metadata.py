@@ -102,6 +102,7 @@ async def fetch_model_metadata(
     llama_url: str,
     *,
     debug_logger=None,
+    purpose: str = "startup/props",
 ) -> ModelMetadata:
     """llama-server GET /props からチャットテンプレートを取得。
 
@@ -117,9 +118,17 @@ async def fetch_model_metadata(
     ``wait_exponential_jitter(0.5, 4.0)``) に集約。``debug_logger`` を渡すと
     リトライ発火が ``requests.jsonl`` に ``op="retry"`` (``backend="base"``)
     として記録される。
+
+    Args:
+        purpose: リトライログに載せる呼出元ラベル。既定は起動時プローブ。
+            **起動以外の経路は必ず自分のラベルを渡すこと** — 既定のまま使うと、
+            稼働中に発生したリトライが「起動時のプローブ」に見える
+            (2026-08-05 ライブ監査: 会話の最中に ``startup/props`` の
+            ``RemoteProtocolError`` リトライが 3 回記録され、実体は
+            ``/api/status`` ポーリング由来の遅延再接続だった)。
     """
     logger.debug("Fetching model metadata from %s/props", llama_url)
-    retry_logger = make_retry_logger(debug_logger, backend="base", purpose="startup/props")
+    retry_logger = make_retry_logger(debug_logger, backend="base", purpose=purpose)
 
     async def _fetch_props() -> dict:
         async with httpx.AsyncClient() as client:

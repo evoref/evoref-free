@@ -554,8 +554,14 @@ class DebugLogger:
 
         Args:
             session_id: 呼び出しコンテキスト識別子 (例: ``"unified_search"``、
-                ``"startup_bootstrap"``)。
-            memory_dump: WM/STM/LTM スナップショット。
+                ``"startup_bootstrap"``)。**チャットのセッション ID ではない**
+                ため、JSONL には ``context`` として書き出す (引数名は既存呼出を
+                壊さないよう据え置く)。全レコードが ``session_id:
+                "unified_search"`` に見える状態は、セッション単位の切り分けが
+                できるという誤解を生んでいた (2026-08-05 ライブ監査)。
+            memory_dump: WM/STM/LTM スナップショット。``working_turns`` は
+                ワーキングメモリの**メッセージ数** (user+assistant を各 1 と
+                数える) であって往復数ではない。
             semmem_stats: SemMem ストアの統計。指定された場合
                 ``semmem`` フィールドにそのまま埋め込まれる。Tier 別件数や
                 bootstrap 結果など可変な指標を扱うため辞書を素通しする。
@@ -564,8 +570,8 @@ class DebugLogger:
             return
         entry: dict = {
             "timestamp": _now(),
-            "session_id": session_id,
-            "working_turns": memory_dump.get("working_turns", 0),
+            "context": session_id,
+            "working_messages": memory_dump.get("working_turns", 0),
             "stm_notes": memory_dump.get("stm_notes", 0),
             "ltm_vectors": memory_dump.get("ltm_vectors", 0),
         }

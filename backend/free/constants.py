@@ -15,3 +15,24 @@ COMMAND_EXIT_CODE_PREFIX = "[exit code:"
 # 成否判定 (meta_cognitive_utils.tool_result_lacks_information) と
 # フロントの表示置換 (AgenticSteps.svelte) が参照する。
 SEARCH_HISTORY_NO_RESULTS_PREFIX = "No results found for: "
+
+# search_history の結果が「今のセッション」か「別のセッション」かを本文先頭で
+# 明示する見出し。スコープ注入 (ToolCallJudge._maybe_scope_session_search) は
+# 正規表現で自己参照を推定しており、外れると別セッションの内容が「さっきの話」
+# として提示される (2026-08-05 ライブ監査: 「さっき ...txt に書き込んで
+# もらったはず」に対し、別セッションの `監査メモ.txt に「検証コードは
+# アオサギ42」` を今回の会話で依頼された操作として列挙した)。
+# 推定精度に依存せず、由来をデータ側に必ず載せることで混同を構造的に防ぐ。
+SEARCH_HISTORY_OTHER_SESSIONS_HEADER = (
+    "[以下は**別の（過去の）会話**の記録です。"
+    "今回の会話で起きたことではありません]"
+)
+SEARCH_HISTORY_CURRENT_SESSION_HEADER = "[以下は**今回の会話**の記録です]"
+
+# read_file が結果の先頭へ付けるメタ行の開始マーカー。行数・文字数をモデルに
+# 数えさせないための**モデル向け**の補助情報であり、ユーザーに見せる本文では
+# ない。emit 側 (tools/builtin.read_file) と除去側 (deliberative の逐語エコー)
+# で同じ定数を共有する。
+# 逐語エコー (「そのまま見せて」) は生成を迂回してツール結果をそのまま返すため、
+# 除去しないとこのメタ行がそのまま回答に出る (2026-08-05 ライブ監査で 2 件)。
+READ_FILE_META_PREFIX = "[file: "

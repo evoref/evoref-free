@@ -57,6 +57,17 @@ class FeedbackSignals:
     # "hardcoded" | "prev_failed" | "same_target" | None。旧 "learned"
     # (学習パターン照合) は 2026-07-21 廃止 — 過去データには残存しうる
     correction_detected_by: str | None = None
+    # アシスタント自身が応答冒頭で前ターンの誤りを撤回したか
+    # (「失礼いたしました」「訂正します」等)。ユーザーの字句に依らない
+    # 高確度シグナルで、**誤っていたのは 1 つ前のターン**。検出時は
+    # FeedbackCollector が直前エントリの turn_outcome を failed へ落とす。
+    #
+    # user_correction とは別枠にする — あちらは「ユーザーの訂正発話そのもの」
+    # を保持し critique_synthesizer が本文を引用するため、ユーザーが訂正して
+    # いないターンのクエリを入れると引用が破綻する (2026-08-05 ライブ監査で
+    # 訂正検出 0/40。アシスタントが「失礼いたしました」と撤回したターンすら
+    # 検出されていなかった)。
+    assistant_self_retraction: bool = False
     perplexity: float | None = None
     # 長文生成シグナル
     long_form_used: bool = False

@@ -195,11 +195,17 @@ llama:
   mtp:
     enabled: false                # 対応モデルで true にすると MTP を有効化
     draft_n_max: 3                # ``--spec-draft-n-max`` (1 サイクルの draft トークン数、上流既定 3)
-  # モデル arch 別の起動フラグ / sampling 自動決定 (base / assist 共通)。
-  # true: GGUF の general.architecture を読み、models/profiles/<arch>.yaml (同梱)
-  #       ＋ local/profiles/<arch>.yaml (任意 override) から
-  #       --jinja / --reasoning-format / MoE / sampling 既定を解決する。
-  #       プロファイルの無い arch には何も付与しない。モデル切替時も自動再評価。
+  # モデル別の起動フラグ / sampling 自動決定 (base / assist 共通)。
+  # true: GGUF の general.architecture を読み、以下 4 層から --jinja /
+  #       --reasoning-format / MoE / context_size / sampling 既定を解決する。
+  #         (1) models/profiles/<arch>.yaml            同梱・arch 既定
+  #         (2) local/profiles/<arch>.yaml             (1) を全文置換
+  #         (3) models/profiles/by-model/<GGUF ファイル名>.yaml  同梱・モデル固有
+  #         (4) local/profiles/by-model/<GGUF ファイル名>.yaml   (3) を全文置換
+  #       arch 層 (1)(2) にモデル別層 (3)(4) を差分上書き (dict は再帰マージ、
+  #       list とスカラーは置換)。モデル別層には変えたいキーだけ書けばよい。
+  #       プロファイルの無いモデルには何も付与しない。モデル切替時も自動再評価。
+  #       プロファイル YAML の編集はプロセス再起動で反映される。
   # false: 本機構を完全 OFF にし、従来どおり extra_args 手動指定のみで運用する。
   auto_model_flags: true
   extra_args: []                  # 上記以外の任意オプションを文字列リストで追加 (auto_model_flags より優先)

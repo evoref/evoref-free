@@ -334,9 +334,13 @@ async def _restart_assist_server(
 
     # 5. クライアント再接続。``model_paths.assist_model`` を実際にロードした
     #    パスへ差し替えた deep copy を渡す — ``AssistModelClient`` のコンストラクタ
-    #    は ``resolve_context_size``/``resolve_reasoning_mode`` をこのキーから
-    #    解決するため、実体 (assist_coding_model) と設定 (assist_model) の
-    #    不一致で誤った reasoning_budget/enable_thinking を送信しないようにする。
+    #    は ``resolve_context_size``/``resolve_reasoning_mode``/
+    #    ``resolve_sampling_params`` をこのキーから解決するため、実体
+    #    (assist_coding_model) と設定 (assist_model) の不一致で誤った
+    #    reasoning_budget/enable_thinking/sampling を送信しないようにする。
+    #    モデル別プロファイル (models/profiles/by-model/) もこのキー経由で
+    #    解決されるので、chat/coding で別のアシストモデルを使う構成でも
+    #    それぞれの宣言が正しく効く。
     #    ``config.yaml`` 自体 (get_config() のグローバル state) は変更しない。
     cfg_for_reconnect = copy.deepcopy(cfg)
     cfg_for_reconnect.setdefault("model_paths", {})["assist_model"] = model_path

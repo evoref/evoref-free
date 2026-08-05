@@ -393,6 +393,13 @@ class MemoryConfig(BaseModel):
     # 3 割未満で足切りされ、5 往復前の自己紹介が文脈から消えていた
     # (2026-07-25 実測: 20 ターン会話で名前・職業・趣味を想起できず
     #  search_history へ不要フォールバック)。
+    #
+    # **単位はメッセージ数** (WorkingMemory.add_turn は user / assistant を
+    # それぞれ 1 件として積む)。名前は "turns" だが 30 = 15 往復であり、
+    # 30 往復ではない (2026-08-05 ライブ監査: 40 ターンの会話でターン 22 以降
+    # しか見えず、会話全体を走査する質問が前半を「無い」と断定した)。
+    # 上限を超えた分は WorkingMemory.session_evicted_turns に計上され、
+    # 全体走査質問には切り詰め注記が付く (chat_service._append_truncated_history_note)。
     working_max_turns: int = Field(default=30, ge=1)
     working_max_tokens: int = Field(default=2048, ge=256)
     # 過去履歴の最低確保トークン数 (床)。動的ブロック (few-shot/file/semmem/RAG) の

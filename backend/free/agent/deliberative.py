@@ -23,6 +23,7 @@ from backend.free.agent.tools.builtin import (
     SEARCH_HISTORY_NO_RESULTS_PREFIX,
     _check_path_traversal as check_builtin_path_traversal,
 )
+from backend.free.constants import READ_FILE_META_PREFIX
 from backend.free.core.session_mode import is_coding_mode
 from backend.free.core.intent_vocab import (
     resolve_session_position_message,
@@ -257,8 +258,31 @@ def verbatim_file_echo(
         return None
     if len(tool_result) > _VERBATIM_ECHO_MAX_CHARS:
         return None
-    fence = "````" if "```" in tool_result else "```"
-    return f"{fence}\n{tool_result.rstrip()}\n{fence}"
+    body = strip_read_file_meta_line(tool_result)
+    if not body.strip():
+        return None
+    fence = "````" if "```" in body else "```"
+    return f"{fence}\n{body.rstrip()}\n{fence}"
+
+
+def strip_read_file_meta_line(tool_result: str) -> str:
+    """``read_file`` 結果の先頭メタ行を落として本文だけを返す (純粋関数)。
+
+    メタ行 (``[file: ... | lines: N | chars: M]``) は行数・文字数をモデルに
+    数えさせないための**モデル向け**補助情報であり、ユーザーに見せる本文では
+    ない。逐語エコーは生成を迂回してツール結果をそのまま返すため、ここで
+    落とさないとメタ行が回答へそのまま出る (2026-08-05 ライブ監査: 「その
+    README の最初の 5 行をそのまま見せて」「今書き込んだファイルを読み返して
+    内容をそのまま見せて」の 2 ターンで露出)。
+
+    メタ行が無い結果はそのまま返す。
+    """
+    if not tool_result.startswith(READ_FILE_META_PREFIX):
+        return tool_result
+    head, sep, rest = tool_result.partition("\n")
+    if not sep or not head.rstrip().endswith("]"):
+        return tool_result
+    return rest
 
 
 async def _iterate_once(text: str) -> AsyncIterator[str]:
@@ -679,13 +703,24 @@ class DeliberativeAgent:
             self._append_tool_result_to_last_user(
                 messages, judgement.tool_name, prompt_result_text, query=query,
             )
+            # 成否は下の通常経路と同じ SSOT (tool_result_succeeded) で決める。
+            # ここは「空振りと分かっている結果を digest に通さない」ための
+            # 早期 return であって、成否判定を変える意図は無い。以前は success を
+            # True 固定で書いており、0 件検索が reward=1.0 で正例として記録される
+            # という、まさに tool_result_succeeded が塞いだはずの穴が
+            # この early return 経由で復活していた (2026-08-05 ライブ監査で確認)。
+            success = tool_result_succeeded(judgement.tool_name, tool_result_text)
             logger.info(
-                "Tool executed: %s, result_length=%d, source=%s, success=True "
+                "Tool executed: %s, result_length=%d, source=%s, success=%s "
                 "(empty result: digest skipped)",
                 judgement.tool_name, len(tool_result_text), judgement.source,
+                success,
             )
-            self._record_tool_call_outcome(query, judgement, True, mode=mode)
-            return tool_result_text, judgement.tool_name, command, True, judgement.source
+            self._record_tool_call_outcome(query, judgement, success, mode=mode)
+            return (
+                tool_result_text, judgement.tool_name, command, success,
+                judgement.source,
+            )
 
         if judgement.tool_name == "calculate":
             # calculate の結果は裸の数値 1 個で、抽出すべき要点は存在しない。
@@ -807,6 +842,12 @@ class DeliberativeAgent:
             tool_capture["command_name"] = tool_name_used if tool_command else None
             tool_capture["success"] = tool_success
             tool_capture["command_source"] = tool_command_source
+            # command_name は run_command 系でしか埋まらない。ツール種別と
+            # 「役に立つ結果が出たか」は全ツール共通の品質シグナルなので別枠で
+            # 渡す (outcome JSONL の quality_signals に載せて、空振りツールに
+            # 頼ったターンを事後に切り分けられるようにする)。
+            tool_capture["tool_name"] = tool_name_used
+            tool_capture["tool_success"] = tool_success
 
         # ツール結果に基づく接地回答は創作不要。chat 既定 0.7 のままだと weak base が
         # 非決定的に拒否/話題混同しやすい (実機: ニュースで 0.7→~25%拒否、0.2→安定)。

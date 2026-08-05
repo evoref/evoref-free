@@ -502,12 +502,12 @@ def _probe_enable_thinking(client: Any) -> bool | None:
 
 
 def _resolve_role_quality_baseline(model_path: str) -> Any:
-    """GGUF の arch から ``quality_baseline`` を解決する。
+    """モデルプロファイルから ``quality_baseline`` を解決する。
 
-    arch は ``ModelMetadata`` に無い (llama-server の ``/props`` は返さない) ため、
-    ``_resolve_embedding_profile_params`` と同じく GGUF ヘッダから読む。読めない /
-    プロファイルに ``quality_baseline:`` が無い場合は既定閾値 — プロファイルは
-    あくまで既定の**調整**で、無くても検査自体は成立させる。
+    プロファイルに ``quality_baseline:`` が無い / 読めない場合は既定閾値 —
+    プロファイルはあくまで既定の**調整**で、無くても検査自体は成立させる。
+    モデル別層 (by-model) が効くので、同 arch でもサイズ・量子化ごとに
+    実測済みの弱点を宣言できる。
     """
     from backend.free.llm.quality_probe import resolve_quality_baseline
 
@@ -515,14 +515,13 @@ def _resolve_role_quality_baseline(model_path: str) -> Any:
         return resolve_quality_baseline(None)
     try:
         from backend.config import get_project_root
-        from scripts.launch_llama import load_model_profile, read_gguf_metadata
+        from scripts.launch_llama import load_model_profile_for
 
         root = get_project_root()
         resolved = Path(model_path)
         if not resolved.is_absolute():
             resolved = root / resolved
-        arch = read_gguf_metadata(resolved).get("architecture")
-        profile = load_model_profile(arch, root) if arch else {}
+        profile = load_model_profile_for(resolved, root)
     except Exception as exc:
         logger.debug(
             "quality baseline profile load failed (%s): %s", model_path, exc,

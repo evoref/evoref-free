@@ -164,6 +164,25 @@ class LlamaConfig(BaseModel):
     extra_args: list[str] = Field(default_factory=list)
 
 
+class ProfileSamplingConfig(BaseModel):
+    """モデルプロファイルの ``sampling`` セクション。
+
+    モデルカードが推奨する生成パラメータの宣言先。宣言したキーだけが
+    ``model_dump(exclude_none=True)`` で返り、未宣言キーは ``modes.*`` (base) /
+    呼出側既定 (assist) に委ねられる。プロファイル由来の値は llama-server の
+    リクエストへ直接載るため、``extra="forbid"`` + 範囲制約で早期に弾く
+    (検証に失敗したセクションは WARNING を出して丸ごと無視する)。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=0)
+    presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    repetition_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
+
+
 class ProfileReasoningConfig(BaseModel):
     """``models/profiles/<arch>.yaml`` の ``reasoning`` セクション (docs/c_15)。
 
