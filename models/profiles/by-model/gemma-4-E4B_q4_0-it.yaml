@@ -1,0 +1,24 @@
+# gemma-4-E4B (q4_0, it) 固有のプロファイル。
+# arch は "gemma4" を報告するため models/profiles/gemma4.yaml が土台になり、
+# 本ファイルの宣言だけが差分上書きされる。ファイル名は GGUF ファイル名の
+# 拡張子なし部分と一致させること。反映には llama-server / backend の再起動が要る。
+
+# Google 公式が全ユースケース共通で推奨する標準サンプリング設定。
+#
+# arch 層 (gemma4.yaml) に置かない理由: プロファイルの sampling は base ロールで
+# modes.* を上書きするため、arch 層に書くと chat (temp 0.7) と coding (temp 0.3) の
+# モード別チューニングを一律に潰してしまう。モデル別層なら「この GGUF を使う
+# ロール」に閉じて宣言できる。本モデルは assist ロール (model_paths.assist_model)
+# で使っており、assist には modes.* の概念が無いので衝突しない。
+#
+# ⚠ 本 GGUF を base ロールへ切り替える場合は上記の上書きが起きる点に注意
+# (chat/coding の温度差が消え、両モードとも temperature 1.0 になる)。
+#
+# assist での temperature の効き方: 呼出側が明示した温度が優先されるため、
+# ここの 1.0 が効くのは温度を指定していない generate() 呼出だけ (JSON 抽出等の
+# 低温度指定は不変)。top_p / top_k は assist では他に供給元が無く、本宣言が
+# 唯一の供給元になる。
+sampling:
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 64

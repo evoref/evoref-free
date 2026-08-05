@@ -309,6 +309,10 @@ def record_response(
             tool_command_name=tool_command_name,
             tool_command_success=tool_command_success,
             tool_command_source=tool_command_source,
+            # 発火元のクエリを note に確定させる。curator が STM を走査して
+            # 「直前で最も近い user note」から推測すると、当該ターンの user note が
+            # 吸収されていない場合に別ターンのクエリと結び付く。
+            tool_command_query=user_query if tool_command else None,
         )
         drain_evicted_to_stm(wm, stm, session_id)
 

@@ -20,6 +20,16 @@ class WorkingMemory:
         self.active_notes: list[str] = []
         self.session_id: str = uuid4().hex[:8]
         self._evicted: list[dict] = []  # Layer 2 転送用バッファ
+        #: 現在のセッションで押し出したターン数 (``clear()`` でリセット)。
+        #: ``_evicted`` は ``drain_evicted()`` で吸い出されるため残高を見ても
+        #: 「このセッションで会話の前半が視界から落ちたか」は分からない。
+        #: 会話全体を走査しないと答えられない質問 (「この会話で依頼した
+        #: ファイル操作を全部」等) で、見えていない範囲を「無い」と断定させない
+        #: ための注記を出すかどうかの判定に使う (2026-08-05 ライブ監査:
+        #: ターン19 で行ったファイル書き込みが 30 メッセージ窓から外れた状態で
+        #: 「この会話で依頼したファイル操作を全部」と聞かれ、
+        #: 「ファイル操作はありません」と断言した)。
+        self.session_evicted_turns: int = 0
 
     def add_turn(
         self,
@@ -34,6 +44,7 @@ class WorkingMemory:
         tool_command_name: str | None = None,
         tool_command_success: bool | None = None,
         tool_command_source: str | None = None,
+        tool_command_query: str | None = None,
     ) -> None:
         """ターンを追加し、トークン上限を超えたら圧縮・押し出し
 
@@ -44,6 +55,8 @@ class WorkingMemory:
         が読み取る。``tool_command`` / ``tool_command_name`` /
         ``tool_command_success`` は run_command 実行ターンの learning 用メタで、
         sleep-time の executable_command_curator が参照する (それ以外は None)。
+        ``tool_command_query`` は当該コマンドを発火させたユーザークエリで、
+        curator が STM 走査で対応付けを推測しないために持たせる。
         """
         est_tokens = _estimate_tokens(content)
         logger.debug(
@@ -73,6 +86,8 @@ class WorkingMemory:
             turn["tool_command_success"] = tool_command_success
         if tool_command_source is not None:
             turn["tool_command_source"] = tool_command_source
+        if tool_command_query is not None:
+            turn["tool_command_query"] = tool_command_query
         self.turns.append(turn)
         self._enforce_limits()
 
@@ -89,6 +104,9 @@ class WorkingMemory:
         logger.debug("clear: evicting all %d turns to transfer buffer", len(self.turns))
         self._evicted.extend(self.turns)
         self.turns.clear()
+        # clear() はセッション切替時に呼ばれる。新しいセッションでは「前半が
+        # 落ちている」状態ではないのでカウンタも畳む。
+        self.session_evicted_turns = 0
 
     def drain_evicted(self) -> list[dict]:
         """Layer 2 への転送用: 押し出されたターンを取得してバッファをクリア"""
@@ -151,9 +169,11 @@ class WorkingMemory:
         if self.turns:
             evicted = self.turns.pop(0)
             self._evicted.append(evicted)
+            self.session_evicted_turns += 1
         while len(self.turns) > 1 and self.turns[0].get("role") == "assistant":
             orphan = self.turns.pop(0)
             self._evicted.append(orphan)
+            self.session_evicted_turns += 1
 
     def _total_tokens(self) -> int:
         """全ターンの推定トークン数"""

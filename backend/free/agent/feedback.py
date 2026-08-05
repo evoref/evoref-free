@@ -116,6 +116,43 @@ _CODING_FAILURE_REPORT_EXCLUDE_RE_EN = re.compile(
     re.IGNORECASE,
 )
 
+# アシスタント自身による前ターンの撤回。ユーザーの字句ではなく**自分の出力**を
+# 見るため、CORRECTION_PATTERNS が抱えていた偽陽性 (話題語の学習・一般語法との
+# 識別不能) の問題が構造的に起きない。
+#
+# 実インシデント (2026-08-05 ライブ監査): 40 ターン中、訂正シグナルは 0 件。
+# ユーザーが「本当ですか？さっき ... に書き込んでもらったはずです」と矛盾を
+# 指摘し、アシスタントが「失礼いたしました。過去の記録を確認したところ…」と
+# 撤回したターンすら correction=false のまま記録されていた。字句パターンの
+# 拡充 (「本当ですか」等) は一般語法と識別できず過去に偽陽性 85% を出している
+# ため、拡充ではなく**自分の撤回**という別軸の証拠を採る。
+#
+# 撤回は応答の冒頭に来る。本文中の「訂正」への言及 (例: 「訂正機能について
+# 説明します」) を拾わないよう先頭 80 文字に限定する。
+_SELF_RETRACTION_HEAD_CHARS = 80
+_ASSISTANT_SELF_RETRACTION_RE = re.compile(
+    r"失礼(?:しました|いたしました|致しました)"
+    r"|申し訳(?:ありません|ございません|あり?ませんでした)"
+    r"|訂正(?:します|いたします|させてください)"
+    r"|(?:先ほど|さきほど|前)の(?:回答|説明|発言)(?:は|が)(?:誤り|間違)"
+    r"|誤(?:り|情報)でした|間違(?:い|え)でした"
+    r"|(?:i\s+)?apolog(?:ise|ize)|my\s+mistake|i\s+was\s+(?:wrong|incorrect)"
+    r"|correction:",
+    re.IGNORECASE,
+)
+
+
+def detect_assistant_self_retraction(response: str) -> bool:
+    """応答冒頭がアシスタント自身による前ターンの撤回かを判定する (純粋関数)。"""
+    if not response:
+        return False
+    return bool(
+        _ASSISTANT_SELF_RETRACTION_RE.search(
+            response[:_SELF_RETRACTION_HEAD_CHARS],
+        ),
+    )
+
+
 # ── 訂正の帰属判定 ────────────────────────────────────────────────
 #
 # CORRECTION_PATTERNS が拾う「訂正」は 3 種類あり、**アシスタントが誤った**
@@ -453,6 +490,8 @@ class FeedbackCollector:
         if long_form_success or long_form_false_negative:
             self._learn_long_form_from_signal(query)
 
+        self._apply_self_retraction(signals, response)
+
         self.buffer.record(entry)
         self._session_entries.append(entry)
         self._prev_query = query
@@ -570,6 +609,29 @@ class FeedbackCollector:
         similarity = overlap / union if union > 0 else 0
 
         return similarity > REPHRASE_THRESHOLD
+
+    def _apply_self_retraction(self, signals, response: str) -> None:
+        """アシスタント自身の撤回を検出し、**直前ターン**を failed へ落とす。
+
+        撤回した本ターンは誤りを直した側なので失敗ではない。誤っていたのは
+        1 つ前のターンであり、``_prev_entry`` はまだバッファ内にあるので
+        その ``turn_outcome`` を書き換えれば正しい側に選択圧が掛かる
+        (``ExperienceBuffer`` は entry オブジェクトを保持しており、保存時に
+        書き換え後の値が直列化される)。
+
+        既に failed / partial のエントリは触らない (格上げも格下げもしない)。
+        """
+        if not detect_assistant_self_retraction(response):
+            return
+        signals.assistant_self_retraction = True
+        prev = self._prev_entry
+        if prev is None or prev.signals.turn_outcome != "success":
+            return
+        prev.signals.turn_outcome = "failed"
+        logger.info(
+            "Assistant retracted its previous answer; marking the previous "
+            "turn as failed (prev_query=%s)", (self._prev_query or "")[:60],
+        )
 
     def _detect_correction(
         self, query: str, *, mode: str = "chat",

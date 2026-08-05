@@ -78,33 +78,46 @@ _truncate = truncate_for_prompt
 
 def _iter_command_pairs(
     notes: list["MemoryNote"],
-) -> list[tuple["MemoryNote", "MemoryNote"]]:
-    """``run_command`` を実行した assistant note と直前 user note の組を返す。
+) -> list[tuple[str, "MemoryNote"]]:
+    """``run_command`` を実行した assistant note と、それを発火させたクエリの組を返す。
 
-    同一 session 内で ``created_at`` 昇順にソートし、``tool_command`` を持つ
-    assistant note について、その直前で最も近い ``source=="user"`` note を
-    query として対にする。直前 user note が無い assistant note は除外する。
+    クエリの出所は ``note.tool_command_query`` (発火時に確定した値) のみ。
+    無い note は対応付けを推測せずに **捨てる**。
+
+    以前は STM を ``created_at`` 昇順に並べ「直前で最も近い ``source=="user"``
+    note」を走査してクエリとしていた。しかし **STM は選択的に吸収された部分集合**
+    であって会話の完全な転写ではなく、当該ターンの user note が吸収されていないと
+    走査が前のターンまで遡って **別の質問**を掴む。
+
+    実測 (2026-08-05): 日付コマンド
+    ``python -c "import datetime; print(datetime.date.today().strftime(...))"``
+    が「富士山の標高は何メートルですか。」の答えとして ``success_avg=1.0`` /
+    ``confidence=1.0`` で保存されていた。この fact は読み出し側の閾値
+    (``min_sim=0.45``) を余裕で超えるため、「富士山の高さを調べて」(sim=0.96)
+    「エベレストの標高は何メートルか調べて」(sim=0.51) といったクエリで
+    **日付コマンドが発火し、その出力が高さの質問の唯一の根拠として** base へ
+    渡る状態だった。
+
+    読み出し側は「クエリ間の類似度」と「過去成功率」しか見ておらず、コマンドが
+    クエリと無関係であることを検出できない。したがって誤った対応付けは
+    **書込み側で作らない**のが唯一の防衛線になる。
     """
-    by_session: dict[str, list["MemoryNote"]] = {}
+    pairs: list[tuple[str, "MemoryNote"]] = []
     for note in notes:
-        by_session.setdefault(note.session_id or "_", []).append(note)
-    pairs: list[tuple["MemoryNote", "MemoryNote"]] = []
-    for sess_notes in by_session.values():
-        ordered = sorted(sess_notes, key=lambda n: n.created_at)
-        for idx, note in enumerate(ordered):
-            if not note.tool_command:
-                continue
-            if note.tool_command_name not in ("run_command", "run_command_readonly"):
-                continue
-            # 直前で最も近い user note を探す
-            user_note: "MemoryNote | None" = None
-            for before in reversed(ordered[:idx]):
-                if before.source == "user":
-                    user_note = before
-                    break
-            if user_note is None:
-                continue
-            pairs.append((user_note, note))
+        if not note.tool_command:
+            continue
+        if note.tool_command_name not in ("run_command", "run_command_readonly"):
+            continue
+        query = (note.tool_command_query or "").strip()
+        if not query:
+            # 発火元が確定していない note (旧形式) は学習対象にしない。
+            # 推測して誤った fact を作るより、学習しないほうが安全。
+            logger.debug(
+                "executable_command_curator: skipping note without "
+                "tool_command_query (cannot pair reliably)",
+            )
+            continue
+        pairs.append((query, note))
     return pairs
 
 
@@ -199,7 +212,7 @@ async def curate_executable_command_facts(
     now_fn = now_provider or time.time
     written = 0
     seen_subjects: set[str] = set()
-    for user_note, assistant_note in pairs:
+    for user_query, assistant_note in pairs:
         # 処理済みアンカー (assistant note) はスキップ。STM に残り続ける同一
         # コマンドを Full サイクルごとに再記録 (exec_count 水増し) するのを防ぐ。
         if assistant_note.command_curated_at is not None:
@@ -228,14 +241,14 @@ async def curate_executable_command_facts(
             continue
         seen_subjects.add(subject)
         success = bool(assistant_note.tool_command_success)
-        topic = _truncate((user_note.content or "").strip(), 200)
+        topic = _truncate(user_query, 200)
         now = now_fn()
 
         existing = _existing_command_fact(store, subject)
         try:
             if existing is not None:
                 new_extra = _record_success(
-                    existing, success, user_note.content,
+                    existing, success, user_query,
                     history_size=history_size, now=now,
                 )
                 new_avg = float(new_extra.get("success_avg") or 0.0)

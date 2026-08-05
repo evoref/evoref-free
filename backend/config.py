@@ -511,21 +511,12 @@ def save_config_section(section: str, data: dict) -> dict:
     return validated
 
 
-# モデル arch プロファイルの sampling 既定キャッシュ。((絶対パス, mtime_ns) -> dict)
-# GGUF ヘッダ読取を毎回走らせないため。モデル差し替えで mtime が変わり自動 miss する。
-_profile_sampling_cache: dict[tuple[str, int], dict] = {}
+# モデルプロファイルのキャッシュ。((絶対パス, mtime_ns) -> 正規化済み profile dict)
+# チャット応答パスから毎リクエスト呼ばれるため GGUF ヘッダと YAML の読取を
+# キャッシュする。モデル差し替えで mtime が変わり自動 miss する
+# (プロファイル YAML 自体の編集は再起動で反映)。
+_profile_cache: dict[tuple[str, int], dict] = {}
 
-# プロファイル sampling として採用する既知キー
-_PROFILE_SAMPLING_KEYS = (
-    "temperature", "top_p", "top_k", "presence_penalty", "repetition_penalty",
-)
-
-# モデル arch プロファイルの reasoning 既定キャッシュ。((絶対パス, mtime_ns) -> dict)
-_profile_reasoning_cache: dict[tuple[str, int], dict] = {}
-
-# モデル arch プロファイルの context_size キャッシュ。((絶対パス, mtime_ns) -> int | None)
-# チャット応答パスから毎リクエスト呼ばれるため GGUF ヘッダ読取をキャッシュする。
-_profile_context_cache: dict[tuple[str, int], int | None] = {}
 
 # config 明示も arch プロファイル宣言も無い場合の context_size 既定。
 # scripts/launch_llama.py::_CONTEXT_SIZE_DEFAULTS と一致させること
@@ -550,113 +541,126 @@ _TEMPLATE_FAMILY_REASONING_MODE: dict[str, str] = {
 _REASONING_MODES = frozenset({"toggle", "always", "none"})
 
 
-def _resolve_profile_sampling_for_mode(cfg: dict, mode: str) -> dict:
-    """アクティブモデルの arch プロファイルから sampling 既定を解決する。
+def _model_path_for(cfg: dict, target: str) -> Path | None:
+    """target のモデル GGUF 絶対パスを解決する。
 
-    ``llama.auto_model_flags`` が false / GGUF 読取失敗 / arch 不明 / プロファイル
-    不在のときは ``{}`` を返す。結果は (絶対パス, mtime) でキャッシュする。
-    起動フラグ側 (scripts/launch_llama.py) と同じ GGUF reader / プロファイル
-    ローダを流用し、SSOT を一本化する。
+    target は slot (``"base"`` / ``"assist"``) と mode (``"chat"`` / ``"coding"``)
+    の 4 値。``"coding"`` のみ ``model_paths.coding_model`` を見て、未設定なら
+    base へフォールバックする。モデル未設定時は ``None``。
     """
-    if not (cfg.get("llama", {}) or {}).get("auto_model_flags", True):
-        return {}
-
-    model_paths = cfg.get("model_paths", {})
+    model_paths = cfg.get("model_paths", {}) or {}
     base_model = model_paths.get("base_model") or ""
-    if mode == "coding":
+    if target == "assist":
+        model_rel = model_paths.get("assist_model") or ""
+    elif target == "coding":
         model_rel = model_paths.get("coding_model") or base_model
     else:
         model_rel = base_model
     if not model_rel:
-        return {}
-
-    project_root = get_project_root()
+        return None
     model_path = Path(model_rel)
     if not model_path.is_absolute():
-        model_path = project_root / model_path
-
-    try:
-        mtime = model_path.stat().st_mtime_ns
-    except OSError:
-        return {}
-
-    cache_key = (str(model_path), mtime)
-    if cache_key in _profile_sampling_cache:
-        return _profile_sampling_cache[cache_key]
-
-    sampling: dict = {}
-    try:
-        from scripts.launch_llama import load_model_profile, read_gguf_metadata
-
-        meta = read_gguf_metadata(model_path)
-        profile = load_model_profile(meta.get("architecture"), project_root)
-        raw = profile.get("sampling") or {}
-        if isinstance(raw, dict):
-            sampling = {
-                k: v
-                for k, v in raw.items()
-                if k in _PROFILE_SAMPLING_KEYS and v is not None
-            }
-    except Exception as e:
-        logger.debug("Profile sampling resolution failed for mode %s: %s", mode, e)
-        sampling = {}
-
-    _profile_sampling_cache[cache_key] = sampling
-    return sampling
+        model_path = get_project_root() / model_path
+    return model_path
 
 
-def _resolve_profile_reasoning(cfg: dict, slot: str) -> dict:
-    """slot ("base"|"assist") のモデル arch プロファイルから ``reasoning`` を返す。
+def _normalize_profile(raw: dict) -> dict:
+    """検証付きセクションを正規化する (キャッシュ格納前に 1 回だけ走る)。
 
-    ``auto_model_flags=false`` / モデル未設定 / GGUF 読取失敗 / プロファイル不在 /
-    ``reasoning`` 不在のときは ``{}``。((絶対パス, mtime) でキャッシュ)。
+    ``reasoning`` は ``ProfileReasoningConfig``、``sampling`` は
+    ``ProfileSamplingConfig`` で検証する。宣言が無い / 検証に失敗したセクションは
+    キーごと落とす (プロファイル全体は落とさない)。他のキーは素通しで、
+    プロファイル YAML への寛容さ (綴り違いで起動を落とさない) を維持する。
+    """
+    profile = dict(raw)
+
+    # reasoning は宣言されている場合のみ検証する (docs/c_15、profile=SSOT)。
+    # 未宣言時はキーを落とし、template family fallback に委ねる。
+    reasoning = profile.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning:
+        from backend.schemas.llm import ProfileReasoningConfig
+
+        try:
+            profile["reasoning"] = ProfileReasoningConfig(**reasoning).model_dump()
+        except Exception as e:
+            logger.warning("Invalid reasoning profile (ignored): %s", e)
+            profile.pop("reasoning", None)
+    else:
+        profile.pop("reasoning", None)
+
+    sampling = profile.get("sampling")
+    if isinstance(sampling, dict) and sampling:
+        from backend.schemas.llm import ProfileSamplingConfig
+
+        try:
+            profile["sampling"] = ProfileSamplingConfig(
+                **sampling,
+            ).model_dump(exclude_none=True)
+        except Exception as e:
+            logger.warning("Invalid sampling profile (ignored): %s", e)
+            profile.pop("sampling", None)
+    else:
+        profile.pop("sampling", None)
+
+    return profile
+
+
+def _profile_for(cfg: dict, target: str) -> dict:
+    """target のモデルの有効プロファイルを返す (プロファイル解決の単一入口)。
+
+    ``llama.auto_model_flags`` が false / モデル未設定 / GGUF 読取失敗 /
+    プロファイル不在のときは ``{}``。((絶対パス, mtime_ns) でキャッシュ)。
+    起動フラグ側 (scripts/launch_llama.py) と同じローダ (arch 層 + モデル別層)
+    を流用し、SSOT を一本化する。
     """
     if not (cfg.get("llama", {}) or {}).get("auto_model_flags", True):
         return {}
-    model_paths = cfg.get("model_paths", {}) or {}
-    key = "base_model" if slot == "base" else "assist_model"
-    model_rel = model_paths.get(key, "")
-    if not model_rel:
+    model_path = _model_path_for(cfg, target)
+    if model_path is None:
         return {}
-    project_root = get_project_root()
-    model_path = Path(model_rel)
-    if not model_path.is_absolute():
-        model_path = project_root / model_path
     try:
         mtime = model_path.stat().st_mtime_ns
     except OSError:
         return {}
     cache_key = (str(model_path), mtime)
-    if cache_key in _profile_reasoning_cache:
-        return _profile_reasoning_cache[cache_key]
+    cached = _profile_cache.get(cache_key)
+    if cached is not None:
+        return cached
 
-    reasoning: dict = {}
+    profile: dict = {}
     try:
-        from scripts.launch_llama import load_model_profile, read_gguf_metadata
+        from scripts.launch_llama import load_model_profile_for
 
-        meta = read_gguf_metadata(model_path)
-        profile = load_model_profile(meta.get("architecture"), project_root)
-        raw = profile.get("reasoning")
-        # reasoning セクションが宣言されている場合のみ ProfileReasoningConfig で
-        # 検証し、既定を埋めた dict を返す (docs/c_15、profile=SSOT)。未宣言時は
-        # ``{}`` を保ち template family fallback (resolve_reasoning_mode) に委ねる。
-        if isinstance(raw, dict) and raw:
-            from backend.schemas.llm import ProfileReasoningConfig
-
-            try:
-                reasoning = ProfileReasoningConfig(**raw).model_dump()
-            except Exception as e:
-                logger.warning(
-                    "Invalid reasoning profile for slot %s (using defaults): %s",
-                    slot, e,
-                )
-                reasoning = {}
+        raw = load_model_profile_for(model_path, get_project_root())
+        if raw:
+            profile = _normalize_profile(raw)
     except Exception as e:
-        logger.debug("Profile reasoning resolution failed for slot %s: %s", slot, e)
-        reasoning = {}
+        logger.debug("Profile resolution failed for %s: %s", target, e)
+        profile = {}
 
-    _profile_reasoning_cache[cache_key] = reasoning
-    return reasoning
+    _profile_cache[cache_key] = profile
+    return profile
+
+
+def _resolve_profile_sampling_for_mode(cfg: dict, mode: str) -> dict:
+    """アクティブモデル ("chat"|"coding") のプロファイルから sampling 既定を返す。"""
+    return _profile_for(cfg, mode).get("sampling") or {}
+
+
+def _resolve_profile_reasoning(cfg: dict, slot: str) -> dict:
+    """slot ("base"|"assist") のモデルプロファイルから ``reasoning`` を返す。"""
+    return _profile_for(cfg, slot).get("reasoning") or {}
+
+
+def resolve_sampling_params(cfg: dict, target: str) -> dict:
+    """target のモデルプロファイルが宣言する sampling パラメータを返す。
+
+    target は slot (``"base"`` / ``"assist"``) と mode (``"chat"`` / ``"coding"``)。
+    宣言の無いキーは含まれないので、呼び出し側の既定を潰さない。base 側は
+    :func:`get_mode_generation_params` が ``modes.*`` より優先で適用し、assist 側は
+    ``AssistModelClient`` がリクエスト payload の既定として使う。
+    """
+    return _profile_for(cfg, target).get("sampling") or {}
 
 
 def resolve_reasoning_mode(
@@ -757,99 +761,31 @@ def resolve_client_reasoning(cfg: dict, slot: str) -> tuple[int, str]:
     return max(0, budget), str(on_runaway)
 
 
-def _resolve_profile_context_size(cfg: dict, slot: str) -> int | None:
-    """slot ("base"|"assist") の arch プロファイルから ``context_size`` を返す。
+def _profile_context_size(cfg: dict, target: str) -> int | None:
+    """target のモデルプロファイルから ``context_size`` を返す。
 
-    ``auto_model_flags=false`` / モデル未設定 / GGUF 読取失敗 / プロファイル不在 /
-    ``context_size`` 未宣言・512 未満のときは ``None``。((絶対パス, mtime) でキャッシュ)。
-    起動フラグ側 (scripts/launch_llama.py) と同じ GGUF reader / プロファイルローダを
-    流用し、サーバ ``-c`` とランタイム値を揃える。
+    未宣言 / 512 未満 / 数値でない場合は ``None`` (呼び出し側が既定へ倒す)。
+    起動フラグ側 (scripts/launch_llama.py) と同じプロファイルを読み、サーバ
+    ``-c`` とランタイム値を揃える。
     """
-    if not (cfg.get("llama", {}) or {}).get("auto_model_flags", True):
+    raw = _profile_for(cfg, target).get("context_size")
+    if raw is None:
         return None
-    model_paths = cfg.get("model_paths", {}) or {}
-    key = "base_model" if slot == "base" else "assist_model"
-    model_rel = model_paths.get(key, "")
-    if not model_rel:
-        return None
-    project_root = get_project_root()
-    model_path = Path(model_rel)
-    if not model_path.is_absolute():
-        model_path = project_root / model_path
     try:
-        mtime = model_path.stat().st_mtime_ns
-    except OSError:
+        value = int(raw)
+    except (TypeError, ValueError):
         return None
-    cache_key = (str(model_path), mtime)
-    if cache_key in _profile_context_cache:
-        return _profile_context_cache[cache_key]
+    return value if value >= 512 else None
 
-    value: int | None = None
-    try:
-        from scripts.launch_llama import load_model_profile, read_gguf_metadata
 
-        meta = read_gguf_metadata(model_path)
-        profile = load_model_profile(meta.get("architecture"), project_root)
-        raw = profile.get("context_size")
-        if raw is not None:
-            ivalue = int(raw)
-            if ivalue >= 512:
-                value = ivalue
-    except Exception as e:
-        logger.debug("Profile context_size resolution failed for slot %s: %s", slot, e)
-        value = None
-
-    _profile_context_cache[cache_key] = value
-    return value
+def _resolve_profile_context_size(cfg: dict, slot: str) -> int | None:
+    """slot ("base"|"assist") のプロファイルから ``context_size`` を返す。"""
+    return _profile_context_size(cfg, slot)
 
 
 def _resolve_profile_context_size_for_mode(cfg: dict, mode: str) -> int | None:
-    """アクティブモードのモデル arch プロファイルから ``context_size`` を返す。
-
-    ``_resolve_profile_sampling_for_mode`` と対称で、``mode=="coding"`` のときは
-    ``model_paths.coding_model`` (未設定なら base_model) を、それ以外は base_model
-    を参照する。``auto_model_flags=false`` / モデル未設定 / 読取失敗 / プロファイル
-    不在・512 未満は ``None``。((絶対パス, mtime) でキャッシュ、slot 版と共有)。
-    """
-    if not (cfg.get("llama", {}) or {}).get("auto_model_flags", True):
-        return None
-    model_paths = cfg.get("model_paths", {}) or {}
-    base_model = model_paths.get("base_model") or ""
-    if mode == "coding":
-        model_rel = model_paths.get("coding_model") or base_model
-    else:
-        model_rel = base_model
-    if not model_rel:
-        return None
-    project_root = get_project_root()
-    model_path = Path(model_rel)
-    if not model_path.is_absolute():
-        model_path = project_root / model_path
-    try:
-        mtime = model_path.stat().st_mtime_ns
-    except OSError:
-        return None
-    cache_key = (str(model_path), mtime)
-    if cache_key in _profile_context_cache:
-        return _profile_context_cache[cache_key]
-
-    value: int | None = None
-    try:
-        from scripts.launch_llama import load_model_profile, read_gguf_metadata
-
-        meta = read_gguf_metadata(model_path)
-        profile = load_model_profile(meta.get("architecture"), project_root)
-        raw = profile.get("context_size")
-        if raw is not None:
-            ivalue = int(raw)
-            if ivalue >= 512:
-                value = ivalue
-    except Exception as e:
-        logger.debug("Profile context_size resolution failed for mode %s: %s", mode, e)
-        value = None
-
-    _profile_context_cache[cache_key] = value
-    return value
+    """アクティブモード ("chat"|"coding") のプロファイルから ``context_size`` を返す。"""
+    return _profile_context_size(cfg, mode)
 
 
 def resolve_context_size_for_mode(cfg: dict, mode: str) -> int:

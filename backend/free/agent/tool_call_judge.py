@@ -451,8 +451,15 @@ _DATETIME_QUERY_RE = re.compile(
 _EXECUTABLE_QUERY_COMMANDS: list[tuple[re.Pattern, "str | Callable[[str], str]"]] = [
     # 現在時刻 / 日付 (「何月|何日|何曜日」は明確な疑問語のみ追加、
     # 「今日|明日|昨日」単独は誤検出するため見送り)
+    # ``astimezone()`` を付けて **UTC オフセット付き**で出力する。プロンプトには
+    # 別途 ``[現在日時 (UTC基準)]`` が注入されており、コマンド出力が naive
+    # ローカル時刻だと 2 つの時計が無印で並ぶ。JST では 00:00-09:00 の間、
+    # ローカル日付と UTC 日付が 1 日ずれるため、モデルはどちらを「今日」と
+    # 呼ぶべきか判断できない (2026-08-05 ライブ監査で構造として確認。当日は
+    # 22:43 JST = 13:43 UTC で偶然一致しており表面化しなかった)。
+    # オフセットを添えれば両者の関係が出力から読み取れる。
     (_DATETIME_QUERY_RE,
-     'python -c "import datetime; print(datetime.datetime.now())"'),
+     'python -c "import datetime; print(datetime.datetime.now().astimezone())"'),
     # システムスペック（OS / CPU / コア数 / ディスク）
     # ドライブレター指定があれば指定ドライブの容量を返す
     # CPU 等の英字略語は ASCII 境界必須 ("program" の 'ram' 誤マッチ対策)
@@ -1074,7 +1081,49 @@ _ORDER_QUERY_STOPWORD_RUNS = frozenset({
     "俺", "覚", "番目", "回目", "先",
     # 明示的な履歴検索依頼の骨組み (「過去の会話で〜を探して/調べて」)
     "過去", "履歴", "探", "検索", "調", "教", "知",
+    # 「もう一度」「〜させた」等の依頼骨組み (2026-08-05 追加)。
+    "一度", "度", "全部", "全て", "読",
 })
+#: 日本語ストップワードを長い順に固定した並び (最長一致 + 決定論のため)。
+#: frozenset をそのまま走査すると反復順が実行ごとに変わり、剥がれ方が
+#: 非決定になる。
+_ORDER_QUERY_STOPWORDS_BY_LEN: tuple[str, ...] = tuple(
+    sorted(_ORDER_QUERY_STOPWORD_RUNS, key=len, reverse=True),
+)
+
+
+def _strip_stopword_affixes(run: str) -> str:
+    """内容ランの前後に貼り付いたストップワードを剥がす (純粋関数)。
+
+    日本語側は「漢字・カタカナ・ラテンの連続」を 1 ランとして切り出すため、
+    隣接したストップワード同士が 1 つのランに融合してしまう。ラン単位の
+    ストップワード照合はこの融合語を素通しし、語中で切れた無意味なキーワードが
+    検索クエリに載る (2026-08-05 ライブ監査: 「今日私が最初に読ませたファイルの
+    フルパスをもう一度教えてください」→ ``今日私 読 ファイル フルパス 一度教``
+    で 0 件。``今日``+``私``、``一度``+``教`` がそれぞれ融合していた)。
+
+    剥がすのは **残りが 2 文字以上、または残り自体がストップワード** の場合
+    だけにする。無条件に剥がすと「教育」→「育」のように内容語を壊す
+    (``教`` がストップワード)。
+    """
+    changed = True
+    while changed and run:
+        changed = False
+        for stopword in _ORDER_QUERY_STOPWORDS_BY_LEN:
+            if len(stopword) >= len(run):
+                continue
+            for rest in (
+                run[len(stopword):] if run.startswith(stopword) else None,
+                run[: -len(stopword)] if run.endswith(stopword) else None,
+            ):
+                if rest is None:
+                    continue
+                if len(rest) >= 2 or rest in _ORDER_QUERY_STOPWORD_RUNS:
+                    run, changed = rest, True
+                    break
+            if changed:
+                break
+    return run
 
 # _ORDER_QUERY_SCAFFOLD_RE/_ORDER_QUERY_CONTENT_RE/_ORDER_QUERY_STOPWORD_RUNS
 # の英語版。日本語版の「文字クラスで内容語/機能語を分離」は英語 (全て
@@ -1115,7 +1164,8 @@ def _reduce_ordered_history_query(query: str) -> str:
     抽出できなければ生クエリを返す (悪化させない安全側)。digest には別途 raw
     query が渡るため、順序解釈 (「一番最初」) はこの縮約で失われない。
     """
-    if is_en_locale():
+    en = is_en_locale()
+    if en:
         scaffold_re, content_re, stopwords = (
             _ORDER_QUERY_SCAFFOLD_RE_EN, _ORDER_QUERY_CONTENT_RE_EN,
             _ORDER_QUERY_STOPWORD_RUNS_EN,
@@ -1126,11 +1176,12 @@ def _reduce_ordered_history_query(query: str) -> str:
             _ORDER_QUERY_STOPWORD_RUNS,
         )
     stripped = scaffold_re.sub(" ", query)
-    terms = [
-        run
-        for run in content_re.findall(stripped)
-        if run.lower() not in stopwords
-    ]
+    terms: list[str] = []
+    for run in content_re.findall(stripped):
+        # 日本語はランの融合を解いてから照合する (英語は空白で切れており不要)。
+        term = run if en else _strip_stopword_affixes(run)
+        if term and term.lower() not in stopwords:
+            terms.append(term)
     reduced = " ".join(terms).strip()
     return reduced if len(reduced) >= 2 else query
 
@@ -1680,6 +1731,16 @@ class ToolCallJudge:
         # 同じ会話の 1 ターン前では Radeon 890M を正しく想起できていた)。
         # coding では run_command が一級のツールで、「依存を入れて」→ 学習済み
         # `pip install ...` の引き当てが本機能の主目的なのでゲートしない。
+        # 注意: リコールはルール表 (_EXECUTABLE_QUERY_COMMANDS) より **先** に
+        # 短絡する。したがって一度保存されたコマンドはルール表を恒久的に隠し、
+        # コード側でコマンドを直しても学習済みクエリには反映されない
+        # (2026-08-06 実測: 日時コマンドを astimezone() 付きへ直した後も、
+        # SemMem の naive 版が sim=0.9478 で引き当たり旧形式が実行された。
+        # ルール表が非該当の「一年は何日ありますか？」はリコールが外れて
+        # 新コマンドが走っており、差は経路だけだった)。
+        # これは assist 呼出を省くための意図的な順序 (テストで固定) なので
+        # 変えていない。コマンド表を直したときは、対応する
+        # ``mem.world.executable_command.*`` ファクトの purge が要る。
         recall_allowed = is_coding_mode(mode) or (
             _query_has_tool_signal(query)
             and not _has_history_recall_keywords(query)
@@ -1981,26 +2042,11 @@ class ToolCallJudge:
                 forced_result = self._finalize(
                     forced_result, tools_registry, mode, query=query,
                 )
-                # 近接リコール語 (「さっき」「先ほど」) だけが根拠で、かつ
-                # 現在セッションを検索対象から外した組合せは構造的に必ず空振り
-                # する — 指しているのは進行中の会話であり、それを除外した先に
-                # 答えは無い (2026-07-28 ライブ検証: 「さっきの3ステップを、
-                # 番号付きリストで…」で exclude_session_id 付きの
-                # search_history が走り 10 秒かけて「該当なし」を返した)。
-                # 会話履歴は既にコンテキストに載っているので撃たない。
-                # 長距離リコール語 (「以前」「最初に」「覚えて」等) が併存する
-                # 場合は従来どおり撃つ。
-                if (
-                    forced_result.tool_needed
-                    and forced_result.tool_args.get("exclude_session_id")
-                    and _only_proximal_recall_keywords(query)
-                ):
-                    logger.debug(
-                        "Skipping history_keyword_forced_fallback: proximal "
-                        "recall word refers to the ongoing session, which is "
-                        "excluded from the search: %s", query[:50],
-                    )
-                elif forced_result.tool_needed:
+                # 「近接リコール語だけ + 現在セッション除外」の組合せは
+                # _finalize の proximal_recall_excluded_session ガードが
+                # no_tool へ降格させる (以前はここにインライン実装されており、
+                # assist 経路には掛かっていなかった)。
+                if forced_result.tool_needed:
                     self._log_tool_decision(
                         forced_result, "history_keyword_forced_fallback",
                     )
@@ -2229,6 +2275,10 @@ class ToolCallJudge:
             ("unfetchable_fetch_url", self._suppress_unfetchable_fetch_url),
             ("commandless_run_command", self._suppress_commandless_run_command),
             ("expressionless_calculate", self._suppress_expressionless_calculate),
+            (
+                "proximal_recall_excluded_session",
+                lambda r: self._suppress_proximal_recall_cross_session(r, query),
+            ),
         ]
         if assist_guards:
             guards += [
@@ -2284,6 +2334,44 @@ class ToolCallJudge:
                 )
                 break
         return result
+
+    def _suppress_proximal_recall_cross_session(
+        self, result: "ToolJudgement", query: str,
+    ) -> "ToolJudgement":
+        """近接リコール語だけを根拠に現在セッションを除外した検索を撃たせない。
+
+        「さっき」「先ほど」等が指しているのは**進行中の会話**であり、それを
+        ``exclude_session_id`` で除外した検索先に答えは無い。結果は 2 通りしか
+        なく、どちらも有害:
+
+        - 0 件 → 10 秒前後を捨てたうえ「該当なし」が根拠として base に渡り、
+          進行中の会話の内容まで否定させる (2026-07-28 ライブ検証)
+        - 別セッションがヒット → その内容が「さっきの話」として提示される
+          (2026-08-05 ライブ監査: 「さっき E:\\tmp\\...txt に書き込んで
+          もらったはず」に対し、**別セッション**の
+          ``E:\\tmp\\監査メモ.txt に「検証コードはアオサギ42」`` を今回の
+          会話で依頼されたファイル操作として列挙した)
+
+        このガードは元々 ``judge()`` の層5.5 (history_keyword_forced_fallback)
+        にインラインで書かれており、**assist 経路 (層4) には掛かっていなかった**。
+        上記 2026-08-05 の実インシデントはまさに ``source=assist`` の判定で
+        起きている。同責務の抑止は層ごとに書き写さず ``_finalize`` の funnel
+        へ集約する (funnel の docstring 参照)。
+
+        ``query`` 未指定 (既定 "") の呼出では ``_only_proximal_recall_keywords``
+        が False を返すため安全に no-op。
+        """
+        if result.tool_name != "search_history" or not result.tool_needed:
+            return result
+        if not (result.tool_args or {}).get("exclude_session_id"):
+            return result
+        if not _only_proximal_recall_keywords(query):
+            return result
+        logger.debug(
+            "Suppressing search_history: proximal recall word refers to the "
+            "ongoing session, which is excluded from the search: %s", query[:50],
+        )
+        return ToolJudgement(tool_needed=False, source=result.source)
 
     def _validate_tool_availability(
         self, result: "ToolJudgement", tools_registry: ToolsRegistry, mode: str,
@@ -3770,10 +3858,15 @@ class ToolCallJudge:
         # 「確認」「チェック」「見せて」「内容」等は実質的にファイル読み取りを必要とする。
         # カタカナ「チェック」は日本語で頻出するため明示的に含める (ASCII "check" だけ
         # ではカタカナ表記を取りこぼし、後続の write パターンへ誤って落ちる)。
+        # ファイルの行数・文字数を問う質問も読み取りが要る。モデルは本文から
+        # 数えても正確にならないため read_file のメタ行 (lines / chars) を
+        # 使わせる (実測 2026-08-05: ツール未発火のまま「確認できません」と
+        # 回答放棄した)。パス抽出済みの分岐なので誤爆はファイル参照時に限る。
         if re.search(
             r"(?:読[みむ]込|読んで|開いて|見せて|見て|確認|チェック|確かめ"
-            r"|正し[いく]|合って|内容|中身"
-            r"|read|show|check|verify|correct|content|view)",
+            r"|正し[いく]|合って|内容|中身|何文字|文字数|何行|行数"
+            r"|read|show|check|verify|correct|content|view"
+            r"|how many (?:characters|chars|lines))",
             q,
         ):
             path = _extract_file_path(path_query)
@@ -3783,7 +3876,12 @@ class ToolCallJudge:
                 if Path(path).is_dir() and tools_registry.has("list_directory"):
                     return "list_directory", {"directory": path}
                 if tools_registry.has("read_file"):
-                    return "read_file", {"file_path": path}
+                    args: dict = {"file_path": path}
+                    head_lines = _extract_head_line_count(query)
+                    if head_lines is not None:
+                        args["start_line"] = 1
+                        args["end_line"] = head_lines
+                    return "read_file", args
 
         # ファイル書き込み/出力パターン
         # ディレクトリを書込み先に取ると write_file が配下に output_<UTC>.txt を
@@ -4063,6 +4161,34 @@ def _referential_rewrite_judgement(
     return None
 
 
+#: 「最初の 3 行」「先頭 10 行」「first 5 lines」等、ファイル先頭からの行数指定。
+#: 全角数字も拾う (日本語入力では「３行」になりやすい)。
+_HEAD_LINES_RE = re.compile(
+    r"(?:最初|先頭|冒頭|頭|first|head|top)\D{0,6}?([0-9０-９]{1,4})\s*(?:行|lines?)",
+)
+
+
+def _extract_head_line_count(query: str) -> int | None:
+    """「最初の N 行」の N を返す (指定が無ければ ``None``)。
+
+    本文全体を渡すとモデルが行数指定を守らずほぼ全文を出力するため
+    (実測 2026-08-05: NOTICE.md の「最初の 3 行」で約 1,264 文字を出力)、
+    read_file 側で切り出せるようにツール引数へ渡す。
+    """
+    m = _HEAD_LINES_RE.search(query)
+    if not m:
+        return None
+    try:
+        count = int(m.group(1).translate(_ZENKAKU_DIGITS))
+    except ValueError:
+        return None
+    return count if count > 0 else None
+
+
+#: 全角数字 → ASCII。
+_ZENKAKU_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
+
+
 def _extract_file_path(query: str) -> str:
     """クエリからファイルパスを抽出する
 
@@ -4075,7 +4201,25 @@ def _extract_file_path(query: str) -> str:
     # が「co.jp」のようなファイル名として誤抽出されるのを防ぐ。
     query = _URL_IN_QUERY_RE.sub(" ", query)
 
-    # 1. 明示的なフルパス: C:\Users\file.txt（ASCII 文字のみのパス部分）
+    # 1a. 非 ASCII を含みうるフルパス: E:\tmp\日本語テスト.txt
+    #     ASCII 限定にすると日本語ファイル名が拡張子の手前で切れ、切り詰めた
+    #     パスがたまたま実在ディレクトリだと read_file ではなく list_directory が
+    #     選ばれ、実在するファイルを「見つからない」と答える (実測 2026-08-05)。
+    #     地の文を飲み込まないための境界条件は 2 つ:
+    #       - 空白 (半角/全角) とクォートを含まない (「E:\tmp に置いた report.txt」)
+    #       - ドライブ直下ではなく 1 階層以上下 (「e:\直下にa.txtのファイル名で」)。
+    #         ドライブ直下 + 非 ASCII は地の文と構造的に区別できないため、
+    #         従来どおり Pattern 2 (ドライブ + ファイル名) に委ねる。
+    m = re.search(
+        r"[A-Za-z]:\\[^\s　\"'「」『』\\]+\\[^\s　\"'「」『』]*\.[A-Za-z0-9]{1,10}",
+        query,
+    )
+    if m:
+        return _normalize_path_separators(m.group(0))
+
+    # 1b. 空白を含む ASCII パス: C:\Program Files\app.exe
+    #     空白を許容する代償として本体は ASCII 限定にし、地の文 (日本語) で
+    #     停止させる。
     m = re.search(r"[A-Za-z]:\\[A-Za-z0-9_.\\/ -]+\.[A-Za-z0-9]{1,10}", query)
     if m:
         return _normalize_path_separators(m.group(0).rstrip(" "))

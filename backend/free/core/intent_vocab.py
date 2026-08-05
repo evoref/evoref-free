@@ -258,6 +258,76 @@ def session_position_kind(query: str) -> str | None:
     return "first" if is_first else "last"
 
 
+#: 会話全体を走査しないと答えられない質問の 3 系統。
+#:
+#: (a) 会話そのものへのアンカー (「この会話で」)
+#: (b) 位置指定 (「最初に / 最後に 〜した」) — 位置は見えている範囲の端では
+#:     なく会話全体の端で決まる
+#: (c) 網羅指定 (「全部 / すべて 〜列挙して」)
+#:
+#: (b)/(c) の対象語は「ユーザー自身が会話の中で行ったこと」に限定する。
+#: 「最初に何をすべき？」「全部教えて」のような一般依頼を巻き込むと、
+#: 会話と無関係な質問にまで注記が付く。
+_WHOLE_SESSION_ACTION_TARGET_RE = re.compile(
+    r"(?:送|言|聞|尋|書|投げ|打|頼|依頼|指示|命じ|質問|訊|読ま|作ら|やらせ|させ)"
+    r"|(?:メッセージ|発言|質問|依頼|指示|お願い|やり取り|ファイル操作|操作)"
+    r"|(?:asked|said|sent|requested|told\s+you|instructed)",
+    re.IGNORECASE,
+)
+_WHOLE_SESSION_EXHAUSTIVE_RE = re.compile(
+    r"(?:全部|すべて|全て|漏れなく|残らず)"
+    r"|(?:\ball\b|\bevery\b|\beverything\b)",
+    re.IGNORECASE,
+)
+_WHOLE_SESSION_ENUMERATE_RE = re.compile(
+    r"(?:リストアップ|列挙|挙げ|並べ|洗い出|書き出|まとめ)"
+    r"|(?:list|enumerate)",
+    re.IGNORECASE,
+)
+#: 文頭の談話標識。「最後に、〜」の「最後に」は位置指定ではなく「ついでに最後の
+#: 質問だが」の意で、位置語として数えると「最初」と衝突して曖昧扱いになり、
+#: 本来の位置指定 (「最初に読ませたファイル」) を取りこぼす (2026-08-05 ライブ
+#: 監査 ターン40)。読点で区切られた文頭のものだけを落とす — 「この会話の最後に
+#: 言ったこと」のような文中の位置指定は残す。
+_LEADING_DISCOURSE_MARKER_RE = re.compile(
+    r"^\s*(?:最後に|さいごに|ついでに|ちなみに|それでは|では|あと)\s*[、,]\s*"
+    r"|^\s*(?:lastly|finally|by\s+the\s+way|also)\s*,\s*",
+    re.IGNORECASE,
+)
+
+
+def is_whole_session_scope_query(query: str) -> bool:
+    """会話全体を見ないと正しく答えられない質問か判定する (純粋関数)。
+
+    「この会話で依頼したファイル操作を全部」「最初に読ませたファイルは」の
+    ように、**答えが会話の全範囲に依存する**質問を拾う。会話履歴がワーキング
+    メモリの上限で切り詰められていると、見えている範囲だけを根拠に「ありません」
+    「〜です」と断定してしまう (2026-08-05 ライブ監査で 2 件発生。ターン19 の
+    書き込みが窓外に落ちた状態で「この会話で依頼したファイル操作を全部」→
+    「ありません」、ターン7 で読んだ README が窓外の状態で「最初に読ませた
+    ファイルは」→ 窓内で最後に読んだ別ファイルを回答)。
+
+    消費側は「実際に切り詰めが起きているか」と AND を取って使うこと。切り詰めが
+    無ければ会話全体が見えているので注記は不要であり、そのぶん誤検出のコストは
+    ほぼゼロになる。
+    """
+    if not query:
+        return False
+    if _SESSION_ANCHOR_ANY_RE.search(query):
+        return True
+    if not _WHOLE_SESSION_ACTION_TARGET_RE.search(query):
+        return False
+    body = _LEADING_DISCOURSE_MARKER_RE.sub("", query, count=1)
+    is_first = bool(_SESSION_POSITION_FIRST_RE.search(body))
+    is_last = bool(_SESSION_POSITION_LAST_RE.search(body))
+    if is_first != is_last:
+        return True
+    return bool(
+        _WHOLE_SESSION_EXHAUSTIVE_RE.search(query)
+        and _WHOLE_SESSION_ENUMERATE_RE.search(query),
+    )
+
+
 def resolve_session_position_message(
     conversation: list[dict] | None, query: str, position: str,
 ) -> str:
@@ -393,3 +463,70 @@ BACKREFERENCE_TO_OUTPUT_RE = re.compile(
 def refers_to_previous_output(text: str) -> bool:
     """``text`` が直前に出力された内容を指し示しているか (純粋関数)。"""
     return bool(BACKREFERENCE_TO_OUTPUT_RE.search(text))
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 直前の出力そのものの計量 (「今の回答は何文字?」)
+# ─────────────────────────────────────────────────────────────────────
+#
+# 自分が今出力した文章の文字数・行数は、モデルに数えさせても当たらない。
+# 実インシデント (2026-08-05 ライブ監査 ターン33):「今の回答は実際に何字あり
+# ましたか？」に対し「488 文字」と回答したが実測は 633 文字。しかもクエリが
+# 17 文字と短いため router が short_query → reactive に落とし、ツール判定も
+# 検索も走らない経路だった (層をどう直しても「数える道具」が無い)。
+#
+# ファイルの文字数は read_file のメタ行 (lines / chars) で決定論化済み。
+# 直前の出力も同じ扱いにする — 数えるのはコード、モデルは読み上げるだけ。
+
+#: 直前の**自分の出力**を指す照応。BACKREFERENCE_TO_OUTPUT_RE は「上の」等の
+#: 指示語だけで成立するが、ここでは計量対象を確定させる必要があるため
+#: 「〜の回答 / 文章」まで含む形に限定する (「今の」は上記正規表現に無い)。
+_SELF_OUTPUT_REFERENCE_RE = re.compile(
+    r"(?:今|いま|先(?:ほど|程)|さっき|直前|上|上記|その|この)の?\s*"
+    r"(?:回答|返答|答え|文章|文面|出力|説明|要約|本文|テキスト|メッセージ|文)"
+    r"|(?:your\s+)?(?:previous|last|above)\s+"
+    r"(?:answer|reply|response|text|message|summary|paragraph)",
+    re.IGNORECASE,
+)
+#: ファイル・URL を指しているクエリは対象外 (計量対象が直前の出力ではない)。
+_MEASURE_EXTERNAL_TARGET_RE = re.compile(
+    r"https?://|[A-Za-z]:\\|/\w+/|\.\w{1,5}(?:\s|$|は|を|の|が)",
+)
+_MEASURE_KIND_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    (
+        "chars",
+        re.compile(
+            r"何文字|何字|文字数|字数|character\s*count|how\s+many\s+characters?",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "lines",
+        re.compile(
+            r"何行|行数|line\s*count|how\s+many\s+lines?", re.IGNORECASE,
+        ),
+    ),
+    (
+        "words",
+        re.compile(
+            r"何語|何単語|単語数|語数|word\s*count|how\s+many\s+words?",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def self_output_measure_kinds(query: str) -> tuple[str, ...]:
+    """直前の自分の出力の計量を尋ねているか判定する (純粋関数)。
+
+    Returns:
+        ``("chars",)`` / ``("lines",)`` / ``("chars", "lines")`` 等。該当
+        しなければ空タプル。
+    """
+    if not query or not _SELF_OUTPUT_REFERENCE_RE.search(query):
+        return ()
+    if _MEASURE_EXTERNAL_TARGET_RE.search(query):
+        return ()
+    return tuple(
+        kind for kind, pattern in _MEASURE_KIND_PATTERNS if pattern.search(query)
+    )

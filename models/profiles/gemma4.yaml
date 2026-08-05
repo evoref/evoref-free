@@ -43,20 +43,8 @@ reasoning:
   server_control: true
   reasoning_format: auto
   budget_default: -1
-# 切替時の出力品質プローブ (backend/free/llm/quality_probe.py)。閾値は既定のままで、
-# known_issues だけを宣言する — 実測済みの弱点をユーザーへ先に伝えるのが目的で、
-# 閾値を緩めて隠すのは本末転倒。
-#
-# 実測 (2026-08-02〜03): gemma-4-12b-it-Q4_K_M で日本語の語間空白の混入率 76〜83%。
-# 同じ計測で Qwen3.5-9B-Q4_K_M は 1% だった。temperature=0.0 の貪欲法でも再現する
-# ためサンプリング設定では回避できず、事実誤認 (日本三景を富士山と答える等) や
-# トークンレベルの崩れも同時に現れる。
-#
-# **サイズ依存**: プロファイルは arch 単位で 12B と E2B/E4B を区別できないが、
-# 同じ 3 モデル横断プローブで gemma-4-E2B_q4_0-it は 0/6 件 (0%) と正常だった。
-# したがって known_issues には計測対象のモデル名を明記し、arch 全体の性質と
-# 誤読させない。実際の可否は起動時プローブの実測値で判断すること。
-quality_baseline:
-  known_issues:
-    - "gemma-4-12b-it-Q4_K_M で日本語の語間に半角空白が混入する (実測 76〜83%、temperature=0.0 でも再現)。同 arch でも gemma-4-E2B は 0% で正常"
-    - "gemma-4-12b-it-Q4_K_M は日本語での事実性も低下する傾向 (語間空白と同時に観測)"
+# 切替時の出力品質プローブ (backend/free/llm/quality_probe.py) の閾値は既定のまま
+# 宣言しない。実測済みの弱点 (12B の日本語語間空白等) は arch 全体の性質ではなく
+# 特定モデル・特定量子化のものなので、``by-model/<GGUF stem>.yaml`` 側で宣言する
+# (例: models/profiles/by-model/gemma-4-12b-it-Q4_K_M.yaml)。同じ計測で
+# gemma-4-E2B_q4_0-it は 0/6 件 (0%)、gemma-4-26B-A4B は 0.0 と正常だった。

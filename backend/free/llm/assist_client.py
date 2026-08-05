@@ -165,7 +165,7 @@ _DEFAULT_PRIORITY: Priority = "background"
 #   - policy_evolution (45s)  : PolicyParamEvolver の候補 JSON 生成
 #   - note_evolution (20s)    : A-MEM note 進化の軽量要約
 #   - conflict_resolution (15s): 短文マージ判定
-#   - retrieval_quality_judge: 既定 ``timeout`` をそのまま使う (短時間で済む)
+#   - retrieval_quality_judge (5s): necessity / chunk_gate と同じ検索ゲート族
 #   - tool_judgment (15s): チャット応答パスで同期発火。アシスト接続時は
 #     モード非依存で常時有効化されるため呼出頻度が上がる。base との GPU 競合に
 #     加え、realtime 並列化 (concurrency.realtime>=2) 時は assist 同士の
@@ -207,6 +207,14 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # 取得直後 content gate の marginal band 関連性判定 (1 回の batched JSON)。
     # チャット応答パスで同期発火するため短く打ち切る。
     "retrieval_chunk_gate": 5.0,
+    # 取得結果の品質ラベル判定 (high/medium/low の 1 語)。他の 2 つのゲートと
+    # 同じ「ゲートがゲート対象より高くつく」族なので予算も揃える。
+    # 以前は本マップに無く汎用 ``self.timeout`` (実機 30s) に落ちており、
+    # 「短時間で済む」という前提が実測で崩れていた (2026-08-05 ライブ監査:
+    # retrieval 10.7ms に対し本判定が 28,443ms = 2,658 倍。返ってきたのは
+    # 21 文字。search_ms がそのまま 28.8 秒になった)。タイムアウト時は
+    # ルールベースの品質ラベルをそのまま採用するので、打ち切りは安全側。
+    "retrieval_quality_judge": 5.0,
     # executable query 判定 + コマンド合成。チャット応答パスで
     # tool_call_judge から発火する。is_executable: bool + command: str の
     # 短い JSON を返すだけだが、base モデルとの GPU 競合 + realtime 並列化時の
@@ -422,20 +430,43 @@ _CALIB_BUMP_FACTOR = 1.5
 _CALIB_MAX_SCALE = 3.0
 
 
+# ── realtime purpose のサーキットブレーカ ────────────────────────────────
+# タイムアウトした realtime 呼出は、**待った分がまるごと無駄**になる。呼出側は
+# どれも安全側の既定 (no_tool / ルール判定 / skip) へ倒れるので、待たずに同じ
+# 既定へ倒すのと結果は変わらず、ユーザーの待ち時間だけが消える。
+#
+# 実測 (2026-08-05 ライブ監査、40 ターン): assist が低速な構成で
+# ``executable_command_synth`` が 31 回中 21 回 (68%) タイムアウトし、
+# ``tool_judgment`` も 22 回中 10 回タイムアウトした。合計 762.5 秒 (12.7 分)
+# を「必ず失敗すると分かっている呼出」の待機に費やしていた。1 ターンあたり
+# 中央値 70 秒のうち 20〜30 秒がこれ。
+#
+# 連続 N 回タイムアウトしたら当該 purpose を一定時間スキップし、冷却後は
+# 1 回だけ試す (half-open)。成功したら即座に閉じる。スキップ時に送出する例外は
+# 実際のタイムアウトと同じ ``TimeoutError`` にする — 呼出側の degraded 経路が
+# そのまま効き、分岐を増やさずに済む。
+#
+# background / learning priority は対象外 (信頼性優先。待たせる相手が居ない)。
+_BREAKER_CONSECUTIVE_TIMEOUTS = 3
+_BREAKER_COOLDOWN_SEC = 180.0
+
+
 class _PurposeStat:
-    """purpose 単位のレイテンシ観測 (反応的較正用)。
+    """purpose 単位のレイテンシ観測 (反応的較正 / サーキットブレーカ用)。
 
     成功レイテンシの EWMA と連続 timeout 回数を保持する。EWMA は較正の引き金
     には使わず観測値 (WARNING ログ / 将来の /api/status 露出) として用いる。
     較正のトリガは timeout イベントそのもの。
     """
 
-    __slots__ = ("ewma", "consecutive_timeouts", "samples")
+    __slots__ = ("ewma", "consecutive_timeouts", "samples", "breaker_open_until")
 
     def __init__(self) -> None:
         self.ewma: float | None = None
         self.consecutive_timeouts: int = 0
         self.samples: int = 0
+        #: ブレーカを開いている間の monotonic 期限 (0.0 = 閉じている)。
+        self.breaker_open_until: float = 0.0
 
     def observe_success(self, elapsed: float, *, alpha: float = 0.3) -> None:
         """成功レイテンシを EWMA に取り込む。"""
@@ -784,6 +815,7 @@ class AssistModelClient(BaseHTTPClient):
             resolve_context_size,
             resolve_enable_thinking,
             resolve_reasoning_mode,
+            resolve_sampling_params,
         )
 
         # サイズガード (code_repair / prompt_evolution 等) が参照する assist
@@ -802,6 +834,12 @@ class AssistModelClient(BaseHTTPClient):
             self._chat_template_kwargs.pop("enable_thinking", None)
         else:
             self._chat_template_kwargs["enable_thinking"] = resolved_enable_thinking
+
+        # アシストモデルのプロファイルが宣言する sampling 既定。temperature 以外は
+        # 呼出側に渡す口が無いため、モデルカード推奨値の唯一の供給元になる。
+        # temperature は purpose ごとに呼出側が決める (JSON 抽出の 0.0 等) ため
+        # 明示値を上書きしない (generate() 側で未指定時のみ採用)。
+        self._profile_sampling: dict = resolve_sampling_params(config, "assist")
 
         # モデルサイズ推定 (LLM 呼び出しインターバル計算用)
         # 優先順位:
@@ -935,7 +973,7 @@ class AssistModelClient(BaseHTTPClient):
         messages: list[dict],
         *,
         stream: bool = False,  # noqa: ARG002
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = 256,
         id_slot: int | None = None,  # noqa: ARG002
         timeout: float | None = None,
@@ -952,7 +990,9 @@ class AssistModelClient(BaseHTTPClient):
         Args:
             messages: OpenAI 互換の messages 配列
             stream: 無視（常に非ストリーミング）
-            temperature: 生成温度
+            temperature: 生成温度。省略時はモデルプロファイルの
+                ``sampling.temperature`` → ``0.7`` の順で解決する
+                (purpose ごとに温度を決めている呼出は明示値がそのまま勝つ)。
             max_tokens: 最大トークン数
             id_slot: 無視（アシストモデルは単一スロット）
             timeout: リクエストタイムアウト秒数。省略時は self.timeout を使用。
@@ -974,6 +1014,8 @@ class AssistModelClient(BaseHTTPClient):
             OpenAI 互換のレスポンス dict
             {"choices": [{"message": {"content": "..."}}]}
         """
+        if temperature is None:
+            temperature = self._profile_sampling.get("temperature", 0.7)
         payload: dict = {
             "messages": messages,
             "stream": False,
@@ -983,6 +1025,21 @@ class AssistModelClient(BaseHTTPClient):
             payload["max_tokens"] = max_tokens
         if cache_prompt:
             payload["cache_prompt"] = True
+
+        # プロファイル由来の sampling (LocalClient._build_payload と同じ付与条件)。
+        # 宣言されたキーだけを載せ、未宣言なら llama-server 既定に委ねる。
+        top_p = self._profile_sampling.get("top_p")
+        if top_p is not None:
+            payload["top_p"] = top_p
+        top_k = self._profile_sampling.get("top_k")
+        if top_k is not None and top_k > 0:
+            payload["top_k"] = top_k
+        presence_penalty = self._profile_sampling.get("presence_penalty")
+        if presence_penalty is not None:
+            payload["presence_penalty"] = presence_penalty
+        repetition_penalty = self._profile_sampling.get("repetition_penalty")
+        if repetition_penalty is not None:
+            payload["repetition_penalty"] = repetition_penalty
 
         # response_format の解決。優先順位:
         #   1. 引数 ``response_format`` (明示 dict)
@@ -1036,6 +1093,23 @@ class AssistModelClient(BaseHTTPClient):
         effective_timeout = self._resolve_timeout(timeout, purpose)
         priority = resolve_priority(purpose)
 
+        if self._breaker_is_open(purpose, priority):
+            # 直近が連続タイムアウトなので、待たずに同じ結末へ倒す。例外型を
+            # 実タイムアウトと揃えているため呼出側の degraded 経路は不変。
+            logger.info(
+                "Assist request short-circuited by circuit breaker "
+                "(purpose=%s, budget=%.1fs)", purpose, effective_timeout,
+            )
+            self._log_assist_failure(
+                messages_count=len(messages), purpose=purpose,
+                priority=priority, budget=effective_timeout,
+                elapsed=0.0, finish_reason="breaker_open",
+            )
+            raise TimeoutError(
+                f"Assist purpose '{purpose}' is short-circuited by the "
+                f"circuit breaker (recent consecutive timeouts)"
+            )
+
         t0 = time.monotonic()
         self._in_flight_count += 1
         try:
@@ -1046,9 +1120,19 @@ class AssistModelClient(BaseHTTPClient):
         except (httpx.TimeoutException, TimeoutError):
             # timeout を purpose 別較正シグナルとして記録し、天井を反応的に
             # 引き上げてから例外を再送出する (caller の degraded fallback は不変)。
+            elapsed = time.monotonic() - t0
             self._record_assist_latency(
-                purpose, time.monotonic() - t0,
-                timed_out=True, budget=effective_timeout,
+                purpose, elapsed, timed_out=True, budget=effective_timeout,
+            )
+            # 失敗した呼出も JSONL に残す。以前は成功時だけ記録しており、
+            # requests JSONL からは assist のコストも失敗率も見えなかった
+            # (2026-08-05 ライブ監査: JSONL 上は 37 件すべて finish_reason=stop
+            # に見えるが、実際には backend.log にしか出ない 33 件のタイムアウトが
+            # 別にあり、assist の実コストを 42% 過小評価していた)。
+            self._log_assist_failure(
+                messages_count=len(messages), purpose=purpose,
+                priority=priority, budget=effective_timeout,
+                elapsed=elapsed, finish_reason="timeout",
             )
             raise
         finally:
@@ -1392,7 +1476,7 @@ class AssistModelClient(BaseHTTPClient):
         observability が応答パスを壊さないよう、本メソッドは例外を外へ伝播しない。
         config で timeout を明示している purpose (ユーザー権威) は較正対象外。
         """
-        if not purpose or purpose in self._purpose_timeouts:
+        if not purpose:
             return
         try:
             stat = self._latency_stats.get(purpose)
@@ -1401,12 +1485,80 @@ class AssistModelClient(BaseHTTPClient):
                 self._latency_stats[purpose] = stat
             if timed_out:
                 stat.consecutive_timeouts += 1
-                self._bump_calibrated_timeout(purpose, budget)
+                if stat.consecutive_timeouts >= _BREAKER_CONSECUTIVE_TIMEOUTS:
+                    stat.breaker_open_until = (
+                        time.monotonic() + _BREAKER_COOLDOWN_SEC
+                    )
+                    logger.warning(
+                        "Assist purpose '%s' circuit breaker opened after %d "
+                        "consecutive timeouts (budget=%.1fs); realtime calls "
+                        "will short-circuit for %.0fs",
+                        purpose, stat.consecutive_timeouts, budget,
+                        _BREAKER_COOLDOWN_SEC,
+                    )
             else:
+                if stat.breaker_open_until:
+                    logger.info(
+                        "Assist purpose '%s' circuit breaker closed "
+                        "(probe succeeded in %.1fs)", purpose, elapsed,
+                    )
                 stat.consecutive_timeouts = 0
+                stat.breaker_open_until = 0.0
                 stat.observe_success(elapsed)
+            # config で timeout を明示している purpose はユーザー権威なので
+            # 較正 (天井の自動引き上げ) の対象外。ブレーカは待ち時間の削減で
+            # あって予算の書き換えではないため、こちらは対象に含める。
+            if timed_out and purpose not in self._purpose_timeouts:
+                self._bump_calibrated_timeout(purpose, budget)
         except Exception:
             logger.debug("assist latency recording failed", exc_info=True)
+
+    def _log_assist_failure(
+        self, *, messages_count: int, purpose: str, priority: str,
+        budget: float, elapsed: float, finish_reason: str,
+    ) -> None:
+        """失敗した assist 呼出を requests JSONL へ記録する。
+
+        成功時と同じ ``log_assist_request`` を使い、``finish_reason`` で
+        ``timeout`` / ``breaker_open`` を区別する。これを書かないと JSONL 上は
+        成功呼出しか存在しないことになり、assist の実コスト・失敗率が
+        観測できない (observability が応答パスを壊さないよう例外は握り潰す)。
+        """
+        dl = self._debug_logger
+        if dl is None:
+            return
+        try:
+            dl.log_assist_request(
+                messages_count=messages_count,
+                response_preview="",
+                elapsed_sec=elapsed,
+                purpose=purpose,
+                priority=priority,
+                resolved_timeout=budget,
+                finish_reason=finish_reason,
+            )
+        except Exception:
+            logger.debug("assist failure logging failed", exc_info=True)
+
+    def _breaker_is_open(self, purpose: str, priority: str) -> bool:
+        """当該 purpose の realtime 呼出を短絡すべきか (副作用なしの判定)。
+
+        冷却期限を過ぎていれば half-open として 1 回だけ通す (期限をクリアし、
+        次の結果で開閉が決まる)。
+        """
+        if priority != "realtime" or not purpose:
+            return False
+        stat = self._latency_stats.get(purpose)
+        if stat is None or not stat.breaker_open_until:
+            return False
+        if time.monotonic() >= stat.breaker_open_until:
+            stat.breaker_open_until = 0.0
+            logger.info(
+                "Assist purpose '%s' circuit breaker half-open; probing once",
+                purpose,
+            )
+            return False
+        return True
 
     def _bump_calibrated_timeout(self, purpose: str, budget: float) -> None:
         """timeout を観測した purpose の較正天井を反応的に引き上げる。

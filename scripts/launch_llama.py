@@ -240,15 +240,14 @@ def _append_reasoning_args(cmd: list[str], section_cfg: dict) -> None:
 
 
 def _profile_reasoning_for_model(model_path: Path, project_root: Path) -> dict:
-    """モデルパスから arch プロファイルの ``reasoning`` セクション (raw dict) を返す。
+    """モデルパスからプロファイルの ``reasoning`` セクション (raw dict) を返す。
 
-    GGUF arch 検出 → ``load_model_profile`` で解決。失敗 / 不在時は ``{}``。
-    検証は backend 側 ``_resolve_profile_reasoning`` (ProfileReasoningConfig) で行うため
+    ``load_model_profile_for`` で解決 (arch 層 + モデル別層)。失敗 / 不在時は ``{}``。
+    検証は backend 側 ``_normalize_profile`` (ProfileReasoningConfig) で行うため
     ここでは raw を返す (docs/c_15)。
     """
     try:
-        meta = read_gguf_metadata(model_path)
-        profile = load_model_profile(meta.get("architecture"), project_root)
+        profile = load_model_profile_for(model_path, project_root)
         r = profile.get("reasoning")
         return r if isinstance(r, dict) else {}
     except Exception:  # noqa: BLE001
@@ -866,7 +865,18 @@ def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | 
     # モデルの挙動を変えない)。BGE-M3 (arch "bert") は CLS pooling が正しく、
     # embed 切替時に models/profiles/bert.yaml から config.yaml へ自動転写
     # される (値は EmbeddingConfig 側で検証済みのためここでは素通しする)。
+    #
+    # config 未設定時のみプロファイルの embedding.pooling へフォールバックする。
+    # migrate 経由の切替では転写済みなので発火せず、config.yaml の
+    # model_paths.embed_model を手編集して差し替えた場合の安全網として効く
+    # (転写と同じプロファイルを読むので値は分岐しない)。
     pooling = emb_cfg.get("pooling")
+    if not pooling and (cfg.get("llama", {}) or {}).get("auto_model_flags", True):
+        emb_profile = load_model_profile_for(embed_model_path, project_root).get(
+            "embedding",
+        )
+        if isinstance(emb_profile, dict):
+            pooling = emb_profile.get("pooling")
     if pooling:
         cmd += ["--pooling", str(pooling)]
 
@@ -1470,12 +1480,55 @@ def _lora_shape_mismatch(model_path: Path, lora_path: Path) -> str | None:
     return None
 
 
-# モデルプロファイル: arch 単位の起動フラグ / sampling 既定。
-# 同梱ベース (tracked, models/profiles/) + local override の 2 段階解決。
-# default フォールバックは持たない (プロファイルの無い arch はフラグ無付与)。
-# ``models/`` 自体は .gitignore 対象だが models/profiles/ は再包含例外で tracked。
+# モデルプロファイル: arch 単位 + GGUF ファイル名単位の起動フラグ / sampling 既定。
+# 同梱ベース (tracked, models/profiles/) + local override の 2 段階 × arch 層 /
+# モデル別層 (by-model/) の 2 スコープ。default フォールバックは持たない
+# (プロファイルの無い arch はフラグ無付与)。
+# ``models/`` 自体は .gitignore 対象だが models/profiles/ は再包含例外で tracked
+# (``by-model/`` サブディレクトリにも同じ再包含が効く)。
 _MODEL_PROFILE_BASE_DIR = "models/profiles"
 _MODEL_PROFILE_OVERRIDE_DIR = "local/profiles"
+_MODEL_PROFILE_BY_MODEL_SUBDIR = "by-model"
+
+
+def _load_profile_layer(project_root: Path, *parts: str) -> tuple[dict, Path | None]:
+    """1 スコープ分のプロファイルを解決する (local override → 同梱 base)。
+
+    最初に読めた YAML を wholesale で採用し ``(data, path)`` を返す。読取失敗 /
+    dict でない場合は次の候補へ進み、どこにも無ければ ``({}, None)``。
+    """
+    for base in (
+        project_root / _MODEL_PROFILE_OVERRIDE_DIR,
+        project_root / _MODEL_PROFILE_BASE_DIR,
+    ):
+        path = base.joinpath(*parts)
+        if not path.exists():
+            continue
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            continue
+        if isinstance(data, dict):
+            return data, path
+    return {}, None
+
+
+def _deep_merge(base: dict, over: dict) -> dict:
+    """``over`` を ``base`` に重ねた新しい dict を返す (dict のみ再帰マージ)。
+
+    list・スカラー・明示 ``None`` は置換する。``launch_flags`` は順序と排他性
+    (``--reasoning-format auto`` 等) を持つため連結してはならず、明示 ``null`` は
+    下位層の宣言を消す唯一の手段になる。
+    """
+    merged = dict(base)
+    for key, value in over.items():
+        current = merged.get(key)
+        merged[key] = (
+            _deep_merge(current, value)
+            if isinstance(current, dict) and isinstance(value, dict)
+            else value
+        )
+    return merged
 
 
 def load_model_profile(arch: str | None, project_root: Path) -> dict:
@@ -1488,19 +1541,42 @@ def load_model_profile(arch: str | None, project_root: Path) -> dict:
     """
     if not arch:
         return {}
+    return _load_profile_layer(project_root, f"{arch}.yaml")[0]
 
-    override_dir = project_root / _MODEL_PROFILE_OVERRIDE_DIR
-    base_dir = project_root / _MODEL_PROFILE_BASE_DIR
-    for base in (override_dir, base_dir):
-        path = base / f"{arch}.yaml"
-        if path.exists():
-            try:
-                data = yaml.safe_load(path.read_text(encoding="utf-8"))
-            except (OSError, yaml.YAMLError):
-                continue
-            if isinstance(data, dict):
-                return data
-    return {}
+
+def load_model_profile_for(
+    model_path: Path, project_root: Path, *,
+    warn: Callable[[str], None] | None = None,
+) -> dict:
+    """GGUF パスから有効なモデルプロファイルを解決する (プロファイル解決の入口)。
+
+    解決順:
+      ① ``models/profiles/<arch>.yaml``          同梱・arch 既定
+      ② ``local/profiles/<arch>.yaml``           ①を wholesale 置換
+      ③ ``models/profiles/by-model/<stem>.yaml`` 同梱・モデル固有
+      ④ ``local/profiles/by-model/<stem>.yaml``  ③を wholesale 置換
+
+    有効プロファイル = ``deep_merge(arch 層, モデル別層)``。同一スコープ内は
+    wholesale 置換 (arch override の既存挙動を変えない)、スコープ跨ぎのみ
+    deep merge なのでモデル別層には差分だけ書けばよい。``<stem>`` は GGUF
+    ファイル名の拡張子なし部分をそのままファイル名として引く (正規化や
+    あいまい照合はしない。大文字小文字の区別はファイルシステム依存)。
+    GGUF 読取に失敗しても (arch 不明でも) モデル別層は適用される。
+    """
+    try:
+        arch = read_gguf_metadata(model_path).get("architecture")
+    except Exception:  # noqa: BLE001
+        arch = None
+    profile = load_model_profile(arch, project_root)
+
+    by_model, path = _load_profile_layer(
+        project_root, _MODEL_PROFILE_BY_MODEL_SUBDIR, f"{model_path.stem}.yaml",
+    )
+    if not by_model:
+        return profile
+    if warn:
+        warn(f"[launch] per-model profile applied: {path}")
+    return _deep_merge(profile, by_model)
 
 
 def _dedupe_flags(candidate: list[str], fixed_flags: set[str]) -> list[str]:
@@ -1539,20 +1615,20 @@ def resolve_auto_model_flags(
     project_root: Path,
     warn: Callable[[str], None] | None = None,
 ) -> list[str]:
-    """GGUF メタデータ + arch プロファイルから llama-server 起動フラグを決定する。
+    """GGUF メタデータ + モデルプロファイルから llama-server 起動フラグを決定する。
 
     - ``llama.auto_model_flags`` が false なら何も付与しない (現行挙動)。
     - profile.launch_flags をベースに、MoE (GGUF が expert を報告 +
       profile.moe.enabled + n_cpu_moe が明示 int) なら ``--n-cpu-moe N`` を付与。
     - ``fixed_flags`` に既出のフラグは除外して二重付与を避ける。
-    - GGUF 読取失敗 / arch 不明時は default プロファイルにフォールバック。
+    - GGUF 読取失敗 / arch 不明時はモデル別層のみが適用される。
     """
     lc = cfg.get("llama", {}) or {}
     if not lc.get("auto_model_flags", True):
         return []
 
     meta = read_gguf_metadata(model_path)
-    profile = load_model_profile(meta.get("architecture"), project_root)
+    profile = load_model_profile_for(model_path, project_root, warn=warn)
     if not profile:
         return []
 
@@ -1909,14 +1985,13 @@ _CONTEXT_SIZE_DEFAULTS: dict[str, int] = {
 def _profile_context_size_for_model(
     model_path: Path, project_root: Path,
 ) -> int | None:
-    """モデルパスから arch プロファイルの ``context_size`` を返す。
+    """モデルパスからプロファイルの ``context_size`` を返す。
 
-    GGUF arch 検出 → ``load_model_profile`` で解決。未宣言 / 512 未満 / 不正値 /
-    読取失敗はすべて ``None`` (呼び出し側で slot 別既定にフォールバック)。
+    ``load_model_profile_for`` で解決 (arch 層 + モデル別層)。未宣言 / 512 未満 /
+    不正値 / 読取失敗はすべて ``None`` (呼び出し側で slot 別既定にフォールバック)。
     """
     try:
-        meta = read_gguf_metadata(model_path)
-        profile = load_model_profile(meta.get("architecture"), project_root)
+        profile = load_model_profile_for(model_path, project_root)
         raw = profile.get("context_size")
         if raw is None:
             return None

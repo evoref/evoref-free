@@ -1,0 +1,47 @@
+# LiquidAI LFM2.5-2.6B (Q5_K_M) 固有のプロファイル。
+# arch は "lfm2" を報告するため models/profiles/lfm2.yaml が土台になり、本ファイルの
+# 宣言だけが差分上書きされる (dict は再帰マージ、list とスカラーは置換)。
+# ファイル名は GGUF ファイル名の拡張子なし部分と一致させること。変更の反映には
+# llama-server / backend の再起動が要る。
+#
+# context_size は宣言しない。モデルカードの `-c 4096` は CLI 例の設定値であって
+# モデルの制約ではなく (GGUF の n_ctx_train は 128000)、実際の -c は
+# assist_model.local.context_size / llama.context_size の config 明示が優先される。
+
+# モデルカードの推奨サンプリング (llama-cli -hf LiquidAI/LFM2.5-2.6B-GGUF の例と同値)。
+# base スロットでは modes.* より優先、assist スロットではリクエスト payload の
+# 既定として使われる。temperature は purpose 別に明示している呼出 (JSON 抽出の
+# 0.0 等) が勝つため、未指定の呼出にだけ効く。
+sampling:
+  temperature: 0.1
+  top_k: 50
+  repetition_penalty: 1.1
+
+# reasoning。**arch 層 (lfm2.yaml) の mode: none を上書きする** — lfm2.yaml は非
+# reasoning の LFM2 dense 系を前提に書かれているが、本モデルの chat_template は
+# 生成プロンプト末尾で必ず `<|im_start|>assistant\n<think>` を開き、思考を切る
+# 変数 (enable_thinking 等) を持たない = OFF 不可の強制 reasoning。
+#
+# server_control: true — 起動時 capability probe の実測 (2026-08-05) で
+# reasoning_separated=true / emits_think_tags=false、つまり llama.cpp が
+# --reasoning-format auto で思考を reasoning_content へ分離できている
+# (同系でも MoE の LFM2.5-8B-A1B は thinking=0 で分離不可だった)。
+# budget_default: -1 なので起動時に --reasoning-budget は付与されない。
+#
+# client_handling 以下はサーバ分離が効かない環境向けのフォールバック。
+# client_think_budget: 4096 — 8B-A1B は難問で思考が 1000+ トークンに達してから
+# </think> を閉じ、512 では回答到達前にストリームが中断した実測がある。
+#
+# ⚠ 実運用上の注意: 思考を切れないため、アシスト用途では短い呼び出しでも
+# 思考が生成上限を食い尽くし本文が空になる。実測 (2026-08-05) で品質プローブが
+# 6/6 件空応答、チャット 5 ターン中 4 ターンで executable_command_synth が
+# 空応答 → リトライ → タイムアウトした。アシストに使うなら max_tokens の
+# 引き上げが要る。
+reasoning:
+  mode: always
+  server_control: true
+  client_handling: strip
+  marker_style: think_tags
+  client_think_budget: 4096
+  on_runaway: fallback
+  exclude_from_history: true

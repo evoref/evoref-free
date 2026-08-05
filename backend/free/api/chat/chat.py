@@ -33,10 +33,11 @@ from backend.free.api.chat.chat_service import (
     ConflictTurnContext,
     SearchPipelineResult,
     _render_conflict_section,
+    apply_grounding_notes,
     build_chat_messages, build_semmem_injection, convert_file_contexts,
     ensure_base_model_health,
     ensure_llm_client, maybe_resolve_pending_conflicts, prepare_memory_context,
-    run_search_pipeline,
+    run_search_pipeline, session_evicted_turns,
 )
 from backend.free.api.chat.chat_streaming import (
     _cancel_flags,
@@ -348,6 +349,15 @@ async def _dispatch_reactive_light(
         system_prompt = f"{system_prompt}\n\n{conflict_notice}"
     light_messages: list[ChatMessage] = [{"role": "system", "content": system_prompt}]
     light_messages.extend(history[-REACTIVE_LIGHT_HISTORY_TURNS:])
+    # 軽量パスは全経路の中で視界が最も狭い (直近 6 メッセージ)。切り詰め注記と
+    # 自己出力の計量は build_chat_messages を通らないここにも掛ける
+    # (2026-08-05 ライブ監査で捏造が起きた 2 ターンはどちらもこの経路だった)。
+    # 押し出し数は WM 側の押し出しに軽量パス自身の切り詰めを足した実効値。
+    apply_grounding_notes(
+        light_messages, history,
+        session_evicted_turns(state)
+        + max(0, len(history) - REACTIVE_LIGHT_HISTORY_TURNS),
+    )
     light_max = min(max_tokens or REACTIVE_LIGHT_MAX_TOKENS, REACTIVE_LIGHT_MAX_TOKENS)
     if req.stream:
         return StreamingResponse(
@@ -474,6 +484,8 @@ async def _build_messages_with_search(
                 "working_max_tokens", DEFAULT_WORKING_MAX_TOKENS,
             ),
         ),
+        # 会話の前半が窓外へ落ちている状態を「全体を走査する質問」にだけ伝える。
+        evicted_turns=session_evicted_turns(state),
     )
 
     sse_notify = SSEFrameBuilder()

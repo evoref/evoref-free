@@ -802,21 +802,21 @@ class ModelMigrator:
         )
 
     def _target_known_issues(self, resolved_path: Path) -> list[str]:
-        """切替先モデルの arch プロファイルに宣言された既知の弱点を返す。
+        """切替先モデルのプロファイルに宣言された既知の弱点を返す。
 
         切替**前**に伝えるのが目的。起動時の品質プローブ
         (:mod:`backend.free.llm.quality_probe`) は事後の観測で、切替を戻すには
         もう一度 migrate + 再起動が要る。プロファイルに実測済みの弱点があるなら
         ``--dry-run`` の時点で出すのが最も安い。
 
-        arch が読めない / プロファイルに ``quality_baseline`` が無い場合は空。
-        判断材料が無いことを警告にはしない (未知 ≠ 悪い)。
+        モデル別層 (by-model) が効くので、同 arch でもサイズ・量子化ごとに
+        別の弱点を宣言できる。プロファイルに ``quality_baseline`` が無い / 読めない
+        場合は空。判断材料が無いことを警告にはしない (未知 ≠ 悪い)。
         """
         try:
-            from scripts.launch_llama import load_model_profile, read_gguf_metadata
+            from scripts.launch_llama import load_model_profile_for
 
-            arch = read_gguf_metadata(resolved_path).get("architecture")
-            profile = load_model_profile(arch, self.project_root) if arch else {}
+            profile = load_model_profile_for(resolved_path, self.project_root)
         except Exception as exc:
             logger.debug(
                 "known-issue lookup failed for %s: %s", resolved_path, exc,
@@ -847,9 +847,10 @@ class ModelMigrator:
         ``dim`` は GGUF の ``embedding_length`` (権威・必ず GGUF 由来)、
         ``model_name`` は GGUF ファイル名 stem、
         ``query_template`` / ``doc_template`` / ``instructions`` /
-        ``max_length`` / ``pooling`` / ``context_size`` は arch プロファイルの
-        ``embedding:`` ブロック (``models/profiles/<arch>.yaml``) から取る。プロファイルに
-        embedding ブロックが無い arch はテンプレート系を据え置き (WARNING)。
+        ``max_length`` / ``pooling`` / ``context_size`` はプロファイルの
+        ``embedding:`` ブロック (``models/profiles/<arch>.yaml`` + モデル別層
+        ``by-model/<GGUF stem>.yaml``) から取る。プロファイルに embedding
+        ブロックが無い場合はテンプレート系を据え置き (WARNING)。
         embed component-migrate / rollback の config 同期に使う。
 
         ``embedding.recall`` サブブロック (URL/コマンドリコールの sim 閾値) が
@@ -863,7 +864,7 @@ class ModelMigrator:
         """
         params: dict = {}
         try:
-            from scripts.launch_llama import load_model_profile, read_gguf_metadata
+            from scripts.launch_llama import load_model_profile_for, read_gguf_metadata
         except Exception as exc:
             logger.warning("embed config sync: launch_llama import failed: %s", exc)
             return params
@@ -887,12 +888,11 @@ class ModelMigrator:
 
         params["model_name"] = resolved_path.stem
 
-        arch = meta.get("architecture")
         try:
-            profile = load_model_profile(arch, self.project_root) if arch else {}
+            profile = load_model_profile_for(resolved_path, self.project_root)
         except Exception as exc:
             logger.warning(
-                "embed config sync: profile load failed for arch %r: %s", arch, exc,
+                "embed config sync: profile load failed for %s: %s", resolved_path, exc,
             )
             profile = {}
         emb_prof = (profile or {}).get("embedding")
@@ -924,9 +924,9 @@ class ModelMigrator:
                     params["recall"] = recall
         else:
             logger.warning(
-                "embed config sync: arch %r has no embedding profile; query/doc "
+                "embed config sync: %s has no embedding profile; query/doc "
                 "templates + instructions left unchanged — review embedding.* manually",
-                arch,
+                resolved_path.name,
             )
         return params
 

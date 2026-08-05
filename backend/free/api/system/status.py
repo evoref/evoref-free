@@ -74,13 +74,28 @@ async def _collect_component_statuses(
 
 
 async def _try_lazy_connect(state: AppState, llama_url: str, llama_cfg: dict) -> bool:
-    """local_client が未接続の場合、llama-server への遅延接続を試みる"""
+    """local_client が未接続の場合、llama-server への遅延接続を試みる
+
+    チャット生成中は試行しない。生成でビジーな llama-server への ``/props`` は
+    ``RemoteProtocolError`` になりやすく、リトライ 3 回ぶんを空費したうえ
+    「未接続」という誤った結論にも至りうる (2026-08-05 ライブ監査: 会話中に
+    ``/props`` リトライが 3 回発生。実体はモデルが応答生成中だっただけ)。
+    生成中であることは接続済みの証拠でもある。
+    """
     from backend.free.llm.local_client import LocalClient
     from backend.free.llm.model_metadata import fetch_model_metadata
 
+    llm_client = getattr(state, "llm_client", None)
+    if llm_client is not None and getattr(llm_client, "is_serving_user", False):
+        logger.debug("Skipping lazy-connect: base model is serving a chat turn")
+        return False
+
     debug_logger = getattr(state, "debug_logger", None)
     try:
-        metadata = await fetch_model_metadata(llama_url, debug_logger=debug_logger)
+        metadata = await fetch_model_metadata(
+            llama_url, debug_logger=debug_logger,
+            purpose="lazy_reconnect/props",
+        )
         from backend.config import resolve_client_reasoning, resolve_enable_thinking
         base_enable_thinking = resolve_enable_thinking(
             get_config(), "base",
