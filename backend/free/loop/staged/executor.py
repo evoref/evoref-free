@@ -2085,7 +2085,7 @@ class StagedCodingExecutor:
         errors += self._gate_conformance_errors(source_path, spec)
         attempt = start_attempt
         gate = _smoke_gate_result(errors, warnings)
-        self._record(task.task_id, gate, attempt)
+        self._record(task.task_id, gate, attempt, kind="smoke")
         self._emit_smoke(task, errors, warnings, attempt)
         spec_block = f"## Shared design specification\n{spec}\n\n" if spec.strip() else ""
         repair_flow_block = (
@@ -2145,7 +2145,7 @@ class StagedCodingExecutor:
             errors, warnings = await self._smoke_once()
             errors += self._gate_conformance_errors(source_path, spec)
             gate = _smoke_gate_result(errors, warnings)
-            self._record(task.task_id, gate, attempt)
+            self._record(task.task_id, gate, attempt, kind="smoke")
             self._emit_smoke(task, errors, warnings, attempt)
 
         return (not errors), gate, errors
@@ -2452,7 +2452,7 @@ class StagedCodingExecutor:
             f"pytest 参考結果: {'合格' if gate.ok else (gate.error or '失敗')}",
             "done" if gate.ok else "failed", task.task_id,
         )
-        self._record(f"{task.task_id}.pytest", gate, attempt)
+        self._record(f"{task.task_id}.pytest", gate, attempt, kind="pytest")
         status = "generated_pytest_ok" if gate.ok else "generated_pytest_failed"
         return status, gate
 
@@ -2894,13 +2894,20 @@ class StagedCodingExecutor:
         )
         return True
 
-    def _record(self, task_id: str, gate: GateResult, attempt: int) -> None:
+    def _record(
+        self, task_id: str, gate: GateResult, attempt: int, *, kind: str,
+    ) -> None:
+        """ゲート結果を manifest / tests/_runs へ記録する。
+
+        ``kind`` は出所 (``"pytest"`` = 生成テストを実行した / ``"smoke"`` =
+        静的ゲートのみ)。``tests_passing`` の集計が両者を区別するために必須。
+        """
         tail = (gate.stdout_tail or gate.stderr_tail or "")[-2000:]
         self.workspace.record_test_result(StageTestResult(
             task_id=task_id, passed=gate.ok,
             failed_count=0 if gate.ok else 1,
             attempt=attempt, summary=(gate.error or "passed"),
-            output_tail=tail, ran_at=time.time(),
+            output_tail=tail, ran_at=time.time(), kind=kind,
         ))
 
 

@@ -18,21 +18,34 @@ from __future__ import annotations
 #: (``core.inference._current_date_note``) と生成パス
 #: (``agent.meta_cognitive._inject_current_date``) の両方が出し、
 #: ``agent.meta_cognitive_utils._PROMPT_SCAFFOLD_MARKERS`` が剥がす。
-CURRENT_DATETIME_LABEL = "[現在日時 (UTC基準)]"
+CURRENT_DATETIME_LABEL = "[現在日時]"
 
 
 def current_datetime_block(guidance: str) -> str:
-    """``[現在日時 (UTC基準)] YYYY-MM-DD (X曜)。<guidance>`` を返す。
+    """``[現在日時] YYYY-MM-DD (X曜)。<guidance>`` を返す。
 
     日付スタンプの体裁 (ラベル / 書式 / 曜日の和名) を 1 箇所に集約する。
     後続の指示文は用途ごとに異なる (チャット応答は「過去か未来かの判断」まで
     求め、成果物生成は「相対表現の解釈」のみ) ため引数で受け取る。
 
-    内部時刻不変則 (naive datetime 禁止) に従い ``utc_now_dt()`` を使う
-    (純粋関数ではない)。
+    暦日は **ローカル基準**。以前は UTC 基準で出していたが、``run_command``
+    系ツールはローカル時刻を返すため、両方が同じプロンプトに並ぶと base が
+    「ローカルの日付 + UTC の曜日」を接合して曜日を取り違えた (実インシデント
+    2026-08-04 ライブ監査: ローカル 08-04(火) と UTC 08-03(月) から
+    「2026年8月4日（月曜）」と回答)。ユーザーが「今日」と言うのはローカルの
+    今日なので、暦日をローカルに揃えて接合の余地を無くす。**ズレるのは
+    UTC と暦日が食い違う時間帯だけ** (JST なら 00:00-09:00) なので、検証は
+    その時間帯か単体テストで行うこと。
+
+    時刻 (HH:MM) やオフセットは載せない。日付の基準を与えるのが役目で、
+    時刻が要る質問はツールが答えるため。旧 UTC 版からの差分をラベルと
+    暦日の基準だけに留める意図もある。
+
+    内部時刻不変則 (naive datetime 禁止) は ``utc_now_dt()`` を
+    ``astimezone()`` で変換することで保つ (tz-aware のまま。純粋関数ではない)。
     """
     from backend.utils import utc_now_dt
 
-    now = utc_now_dt()
+    now = utc_now_dt().astimezone()
     weekday = "月火水木金土日"[now.weekday()]
     return f"{CURRENT_DATETIME_LABEL} {now:%Y-%m-%d} ({weekday}曜)。{guidance}"

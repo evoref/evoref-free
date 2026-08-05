@@ -193,7 +193,7 @@ class RepetitionGuardFilter:
     _MAX_DUPLICATE_LINES = 4
     _LIST_MARKER_RE = re.compile(r"^(?:\d{1,3}[.)]|[-*+・>#]+)\s*")
 
-    def __init__(self) -> None:
+    def __init__(self, query: str | None = None) -> None:
         self._buffer = ""
         self._last_line = ""
         self._repeat_count = 1
@@ -201,6 +201,12 @@ class RepetitionGuardFilter:
         self._seen_lines: set[str] = set()
         self._duplicate_count = 0
         self._in_code_fence = False
+        # ユーザーの質問文そのものの反復は、長さに関わらず正当な繰り返しでは
+        # ない。下限 (_MIN_LINE_CHARS) は箇条書きや区切り線を巻き込まないため
+        # のものだが、短い質問文が素通りする穴になっていた (実インシデント
+        # 2026-08-04 ライブ監査: 10 文字の「今日は何曜日ですか。」が 5 回
+        # 繰り返され、答えが 1 文字も出なかった)。
+        self._query_line = (query or "").strip()
 
     @classmethod
     def _normalize(cls, line: str) -> str:
@@ -219,7 +225,8 @@ class RepetitionGuardFilter:
         if stripped.startswith("```"):
             self._in_code_fence = not self._in_code_fence
             return False
-        if len(stripped) < self._MIN_LINE_CHARS:
+        is_query_line = bool(self._query_line) and stripped == self._query_line
+        if len(stripped) < self._MIN_LINE_CHARS and not is_query_line:
             # 短い行は正当な繰り返し (箇条書き記号・空行) がありうるため
             # カウント対象にせず、連鎖も切らない
             return False
@@ -233,7 +240,7 @@ class RepetitionGuardFilter:
         if self._in_code_fence:
             return False
         normalized = self._normalize(stripped)
-        if len(normalized) < self._MIN_LINE_CHARS:
+        if len(normalized) < self._MIN_LINE_CHARS and not is_query_line:
             return False
         if normalized in self._seen_lines:
             self._duplicate_count += 1
@@ -276,6 +283,101 @@ class RepetitionGuardFilter:
             return ""
         remaining, self._buffer = self._buffer, ""
         return remaining
+
+
+class QueryEchoFilter:
+    """先頭に現れたユーザー質問の逐語コピーを落とす。
+
+    質問をそのまま復唱してから答える崩れが実在する。``RepetitionGuardFilter``
+    は同一行の反復を打ち切るが、1 回だけの復唱は反復にならず素通りする。また
+    反復の判定には ``_MIN_LINE_CHARS`` の下限があり、短い質問文
+    (「今日は何曜日ですか。」= 10 文字) は複数回繰り返されても数えられない
+    (実インシデント 2026-08-04 ライブ監査)。
+
+    本文の冒頭に限って落とす。途中に現れる引用 (「『〜』というご質問ですね」)
+    は正当なので触らない。``query`` が空か短すぎる場合は素通しする。
+
+    StreamFilter プロトコルに準拠: process() / flush()
+    """
+
+    #: 復唱の判定に載せる質問の下限。これ未満は「はい」等の相槌で、応答が
+    #: 偶然同じ語で始まっただけの誤爆になりうる。
+    _MIN_QUERY_CHARS = 8
+
+    #: 復唱の前に許す前置きの長さ。呼びかけ (「小川さん、」) を挟んでから復唱
+    #: する形が実在する (実測 2026-08-04:「私の名前を覚えていますか。」に対し
+    #: 「小川さん、私の名前を覚えていますか。」)。短い前置きに限るのは、問いを
+    #: 引用してから答える正常な応答を巻き込まないため。
+    _MAX_LEAD_CHARS = 16
+
+    def __init__(self, query: str | None = None) -> None:
+        self._query = (query or "").strip()
+        self._active = len(self._query) >= self._MIN_QUERY_CHARS
+        self._buffer = ""
+        self._flushed = not self._active
+        self._lead_resolved = not self._active
+
+    def _strip_leading_echoes(self, text: str) -> str:
+        out = text.lstrip()
+        while out.startswith(self._query):
+            out = out[len(self._query):].lstrip()
+        return out
+
+    def _resolve_lead(self) -> bool:
+        """前置きの有無を確定する。まだ判断材料が足りなければ False。
+
+        呼びかけを挟んだ復唱 (「小川さん、<質問>」) と、引用してから答える形
+        (「はい。『<質問>』というご質問ですね」) は括弧の有無で分かれる。
+        引用符に囲まれていれば言及なので触らない。
+        """
+        head = self._buffer.lstrip()
+        if head.startswith(self._query):
+            self._lead_resolved = True
+            return True
+        idx = head.find(self._query)
+        if 0 < idx <= self._MAX_LEAD_CHARS:
+            if head[idx - 1] in "「『\"'“‘":
+                # 引用符付き = 質問への言及。復唱ではない。
+                self._lead_resolved = True
+                return True
+            self._buffer = head[idx:]
+            self._lead_resolved = True
+            return True
+        # 前置き + 質問文が全部届くまでは判断できない。
+        if len(head) < len(self._query) + self._MAX_LEAD_CHARS:
+            return False
+        self._lead_resolved = True
+        return True
+
+    def process(self, text: str) -> str:
+        if not text or self._flushed:
+            return text
+        self._buffer += text
+        if not self._lead_resolved and not self._resolve_lead():
+            return ""
+        stripped = self._strip_leading_echoes(self._buffer)
+        if not stripped:
+            # 復唱を消費し切った状態。続きが更なる復唱か本文かはまだ
+            # 分からないので、判定を続ける。
+            self._buffer = ""
+            return ""
+        if self._query.startswith(stripped):
+            # 質問文の前方一致 = 復唱の途中かもしれない。全部届くまで待つ。
+            self._buffer = stripped
+            return ""
+        self._flushed = True
+        self._buffer = ""
+        return stripped
+
+    def flush(self) -> str:
+        if self._flushed:
+            return ""
+        self._flushed = True
+        if not self._lead_resolved:
+            self._resolve_lead()
+        head = self._buffer.lstrip()
+        self._buffer = ""
+        return self._strip_leading_echoes(head)
 
 
 class HeadBufferFilter:

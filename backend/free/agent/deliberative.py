@@ -205,6 +205,14 @@ _ENUMERATION_RESULT_GUIDANCE = (
 _TRUNCATED_ENUMERATION_NOTE = (
     "この結果は途中が省略された部分的な一覧である。"
     "「これで全部」とは述べず、一覧が部分的であることを明示して答えること。"
+    # 省略の明示だけでは不在の断定を防げない。部分集合に無いことを
+    # 「存在しない」と結論した (実インシデント 2026-08-04 ライブ監査:
+    # 切り詰めを自ら明示したうえで、実在する frontend/ を
+    # 「見当たりません」と答えた)。不在の断定は部分一覧からは導けない。
+    "特定の項目があるかを問われた場合、この部分一覧に現れないことを"
+    "「存在しない」と結論しないこと。見つかった場合のみ「ある」と答え、"
+    "見つからない場合は省略部分に含まれる可能性があるため"
+    "「この範囲では確認できない」と答えること。"
 )
 
 _FILE_CONTENT_TOOLS = frozenset({"read_file"})
@@ -214,6 +222,8 @@ _FILE_CONTENT_RESULT_GUIDANCE = (
     "会話の中で「こう書いたはず」と話していた内容と食い違う場合は、"
     "実際のファイル内容の方を示したうえで、期待と食い違っている旨も併せて伝えること。"
     "期待していた文言に合わせて内容を書き換えたり、要約・整形したりしないこと。"
+    "文字数・行数を問われた場合は、結果に併記された [この結果の実測値] の数値を"
+    "そのまま使うこと (自分で数え直した値を述べない)。"
     "「読み取れない」「アクセスできない」とは言わないこと。"
     "回答本文では「ツール実行結果」等の内部的な言い回しを使わず、"
     "自分で読んで分かったこととして自然に述べること。"
@@ -481,6 +491,18 @@ class DeliberativeAgent:
                 # 出力を基準値と読んで演算を二重適用する
                 # (_COMMAND_RESULT_GUIDANCE 参照)。コマンドを併記する。
                 truncated = f"$ {executed}\n{truncated}"
+        elif tool_name in _FILE_CONTENT_TOOLS:
+            # 文字数・行数は「結果を読めば分かる」値ではなく数え上げが要る派生値
+            # で、base は必ず外す (実インシデント 2026-08-04 ライブ監査: 137 文字
+            # のファイルを read_file した直後に「196 文字」と回答)。決定論で
+            # 数えた実測値を併記し、guidance 側でこの値を使わせる。長さは
+            # 切り詰め前の全文で数える (ユーザーが訊いているのは抜粋ではなく
+            # ファイルそのもの)。
+            truncated = (
+                f"{truncated}\n\n"
+                f"[この結果の実測値: {len(tool_result_text)} 文字 / "
+                f"{tool_result_text.count(chr(10)) + 1} 行]"
+            )
         # 話題再フォーカス: 弱いモデルは前ターンの話題に引きずられ、今回の質問
         # (例: ニュース) を取り違える (実機確認: 前ターンが天気だとニュース質問に
         # 天気で誤答)。今回の質問を明示して前話題を無視させる。
@@ -640,7 +662,16 @@ class DeliberativeAgent:
         # 位置で決まる事実は判定経路の有無に関わらず先に確定させる。検索索引に
         # 載っていない進行中セッションを search_history に問い合わせても答えは
         # 出ないため、並び順から機械的に決めた値を根拠として渡す。
-        self._append_session_position_fact(messages, conversation, query)
+        #
+        # 確定できた場合はツールを撃たない。注記を足すだけでは search_history が
+        # 併走し、別セッションのヒットを根拠枠で受け取った base がそちらを採用
+        # した (実インシデント 2026-08-04 ライブ監査: 注記があるのに 04:55 の
+        # 旧セッションのヒットを引いて誤答)。答えが決定論で出ている以上、
+        # ツール結果は誤答の材料にしかならない。
+        if self._append_session_position_fact(messages, conversation, query):
+            if tool_judge_task is not None and not tool_judge_task.done():
+                tool_judge_task.cancel()
+            return None, None, None, None, None
 
         if self._tool_judge is None or self._tools_registry is None:
             # 判定経路が無いなら precomputed タスクも使えない。残っていれば破棄。

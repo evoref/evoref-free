@@ -65,7 +65,13 @@ _COMMAND_TOOL_NAMES = frozenset({"run_command", "run_command_readonly"})
 #: が同居する依頼は対象外にして、意図が割れる文には手を入れない。
 _IMMEDIATE_CHILDREN_RE = re.compile(
     r"直下|直下の|トップレベル|第一階層|一階層目"
-    r"|immediate\s+children|top[-\s]?level|first\s+level",
+    # 「ルートディレクトリにあるファイルとフォルダ」も直下要求だが、語彙が
+    # 「直下」に限られていたため素通りし、既定 3 階層のツリー (5,523 字) が
+    # TOOL_RESULT_MAX_CHARS で切り詰められた (実インシデント 2026-08-04
+    # ライブ監査: 実在する frontend/ を「見当たりません」と誤答)。
+    r"|ルート(?:ディレクトリ|フォルダ)?直下|ルート(?:ディレクトリ|フォルダ)にある"
+    r"|最上位|一番上"
+    r"|immediate\s+children|top[-\s]?level|first\s+level|root\s+(?:directory|folder)",
     re.IGNORECASE,
 )
 _RECURSIVE_LISTING_RE = re.compile(
@@ -93,8 +99,12 @@ _RECALL_SMALL_POOL_MARGIN = 0.1
 
 # Windows / Unix の明示パス、または URL。ユーザーが対象を書いた決定論的シグナルで、
 # assist の否定票より優先してよい (``_upgrade_command_via_assist`` の降格例外)。
+#: ドライブレターの区切りは ``\`` と ``/`` の双方を受ける。バックスラッシュ限定
+#: だったため ``E:/tmp/a.txt`` がツールシグナルとして検出されず、明示パス付きの
+#: 依頼が knowledge query に落ちて「存在しない」と誤答していた (実インシデント
+#: 2026-08-04 ライブ監査)。
 _PATH_OR_URL_SIGNAL_RE = re.compile(
-    r"[A-Za-z]:\\|(?:^|[\s　])(?:/[\w._-]+){2,}|https?://",
+    r"[A-Za-z]:[\\/]|(?:^|[\s　])(?:/[\w._-]+){2,}|https?://",
 )
 
 # `python -c "..."` の 1 行中で `;` の後に複合文を書いた形。Python の構文上
@@ -1785,6 +1795,34 @@ class ToolCallJudge:
                 self._log_tool_decision(result, "chat_mode_explicit_url")
                 return result
 
+            # 明示パスも URL と同じ扱いにする。ユーザーがパスを書く =
+            # 「これを見て」の強い意図表明で、LLM 判断を仰ぐ理由が無い。
+            # ここが無いと chat では file 系が決定論で解決されず、同じ依頼が
+            # ツール未発火に落ちて「存在しない」と誤答していた (実インシデント
+            # 2026-08-04 ライブ監査: 「E:/tmp/a.txt の中身を見せて、あわせて
+            # 文字数も教えてください。」でツールが 1 つも走らなかった)。
+            # ``_infer_tool`` は読み書きの動詞が無ければ空を返すので、パスに
+            # 言及しただけの文は従来どおり後続へ落ちる。
+            if _PATH_OR_URL_SIGNAL_RE.search(query):
+                path_tool, path_args = self._infer_tool(query, tools_registry, mode)
+                if path_tool:
+                    logger.debug(
+                        "Chat mode explicit path resolved to %s: %s",
+                        path_tool, query[:50],
+                    )
+                    result = self._finalize(
+                        ToolJudgement(
+                            tool_needed=True,
+                            tool_name=path_tool,
+                            tool_args=path_args,
+                            source="rule",
+                        ),
+                        tools_registry, mode, query=query,
+                    )
+                    if result.tool_needed:
+                        self._log_tool_decision(result, "chat_mode_explicit_path")
+                        return result
+
             # assist 優先で実行可能コマンドを解決する。assist 未接続 / 失敗
             # 時はモジュールレベル sync 関数 (regex テーブル) にフォールバック。
             # ツール名は mode から解決する (chat は run_command_readonly)。
@@ -2275,6 +2313,15 @@ class ToolCallJudge:
             ("unfetchable_fetch_url", self._suppress_unfetchable_fetch_url),
             ("commandless_run_command", self._suppress_commandless_run_command),
             ("expressionless_calculate", self._suppress_expressionless_calculate),
+            # 深さ絞りは抑止ではなく、依頼文から決まる引数の確定なので層を
+            # 問わず安全 (対象ツール名が違えば no-op)。assist 限定にしていた
+            # ため rule 層の list_directory が素通りし、同じ依頼でも層が変わる
+            # と再発した (実インシデント 2026-08-04: source=assist では効き、
+            # source=rule では既定 3 階層のまま 5,523 字が切り詰められた)。
+            (
+                "immediate_children_depth",
+                lambda r: self._scope_list_directory_depth(r, query),
+            ),
             (
                 "proximal_recall_excluded_session",
                 lambda r: self._suppress_proximal_recall_cross_session(r, query),
@@ -2287,10 +2334,6 @@ class ToolCallJudge:
                     lambda r: self._restore_truncated_text_operand(
                         r, conversation,
                     ),
-                ),
-                (
-                    "immediate_children_depth",
-                    lambda r: self._scope_list_directory_depth(r, query),
                 ),
                 (
                     "ungrounded_calculate",
@@ -3704,6 +3747,27 @@ class ToolCallJudge:
             logger.debug("Rule-based: knowledge query detected, skipping tool: %s", query[:50])
             return ToolJudgement(tool_needed=False, source="rule")
 
+        # 明示パス / URL があり、かつ具体的なツールまで決定論で解決できるなら
+        # ``_TOOL_PATTERNS`` に無い言い回しでもここで確定させる。パス付きの依頼が
+        # assist 層任せになっており、同じ依頼が read_file / search_history /
+        # ツール未発火に割れていた (実インシデント 2026-08-04 ライブ監査:
+        # 「E:/tmp/a.txt の中身を見せて、あわせて文字数も教えてください。」で
+        # ツールが 1 つも走らず「存在しない」と誤答)。``_infer_tool`` は読み書きの
+        # 動詞が無ければ空を返すので、パスに言及しただけの文は従来経路へ落ちる。
+        if has_tool_signal:
+            signal_name, signal_args = self._infer_tool(query, tools_registry, mode)
+            if signal_name:
+                logger.debug(
+                    "Rule-based: path/URL signal resolved to %s: %s",
+                    signal_name, query[:50],
+                )
+                return ToolJudgement(
+                    tool_needed=True,
+                    tool_name=signal_name,
+                    tool_args=signal_args,
+                    source="rule",
+                )
+
         tool_patterns = select_locale_variant(_TOOL_PATTERNS, _TOOL_PATTERNS_EN)
         if not any(p.search(query) for p in tool_patterns):
             return ToolJudgement(tool_needed=False, source="rule")
@@ -4076,8 +4140,13 @@ def _extract_search_pattern(query: str) -> str:
 # planner が生成した英語タスク記述の一部がパスに混入した)。
 # 実在の Windows パスでバックスラッシュ直後が空白になることはない
 # ("Program Files" のようにセグメント内部に空白を含むのは許容する)。
+#: ドライブレター付きパスの区切り。Windows はスラッシュ区切りも等価に受け付け、
+#: ユーザーもツール出力もそちらを書く。バックスラッシュ限定にしていたため
+#: ``E:/tmp/a.txt`` が 1 つも抽出できず、ルール層が read_file を選べないまま
+#: assist 層へ落ちていた (実インシデント 2026-08-04 ライブ監査: 同じ依頼が
+#: read_file / search_history / ツール未発火に割れる原因)。
 _DIR_PATH_RE = re.compile(
-    r"([A-Za-z]:(?:\\[A-Za-z0-9_.][A-Za-z0-9_. -]*)*)",
+    r"([A-Za-z]:(?:[\\/][A-Za-z0-9_.][A-Za-z0-9_. -]*)*)",
 )
 
 # クォート文字の対応表（開き, 閉じ）。ファイル名の語幹 (拡張子直前) が
@@ -4201,17 +4270,20 @@ def _extract_file_path(query: str) -> str:
     # が「co.jp」のようなファイル名として誤抽出されるのを防ぐ。
     query = _URL_IN_QUERY_RE.sub(" ", query)
 
-    # 1a. 非 ASCII を含みうるフルパス: E:\tmp\日本語テスト.txt
+    # 1a. 非 ASCII を含みうるフルパス: E:\tmp\日本語テスト.txt / E:/tmp/日本語.txt
     #     ASCII 限定にすると日本語ファイル名が拡張子の手前で切れ、切り詰めた
     #     パスがたまたま実在ディレクトリだと read_file ではなく list_directory が
     #     選ばれ、実在するファイルを「見つからない」と答える (実測 2026-08-05)。
+    #     区切りは \ と / の双方を受ける。バックスラッシュ限定だと ``E:/tmp/a.txt``
+    #     が 1 つも抽出できず、同じ依頼が read_file / search_history / ツール
+    #     未発火に割れていた (実測 2026-08-04)。
     #     地の文を飲み込まないための境界条件は 2 つ:
     #       - 空白 (半角/全角) とクォートを含まない (「E:\tmp に置いた report.txt」)
     #       - ドライブ直下ではなく 1 階層以上下 (「e:\直下にa.txtのファイル名で」)。
     #         ドライブ直下 + 非 ASCII は地の文と構造的に区別できないため、
     #         従来どおり Pattern 2 (ドライブ + ファイル名) に委ねる。
     m = re.search(
-        r"[A-Za-z]:\\[^\s　\"'「」『』\\]+\\[^\s　\"'「」『』]*\.[A-Za-z0-9]{1,10}",
+        r"[A-Za-z]:[\\/][^\s　\"'「」『』\\/]+[\\/][^\s　\"'「」『』]*\.[A-Za-z0-9]{1,10}",
         query,
     )
     if m:
@@ -4219,8 +4291,8 @@ def _extract_file_path(query: str) -> str:
 
     # 1b. 空白を含む ASCII パス: C:\Program Files\app.exe
     #     空白を許容する代償として本体は ASCII 限定にし、地の文 (日本語) で
-    #     停止させる。
-    m = re.search(r"[A-Za-z]:\\[A-Za-z0-9_.\\/ -]+\.[A-Za-z0-9]{1,10}", query)
+    #     停止させる。区切りは 1a と同様に \ と / の双方を受ける。
+    m = re.search(r"[A-Za-z]:[\\/][A-Za-z0-9_.\\/ -]+\.[A-Za-z0-9]{1,10}", query)
     if m:
         return _normalize_path_separators(m.group(0).rstrip(" "))
 
@@ -4231,7 +4303,7 @@ def _extract_file_path(query: str) -> str:
     #    サブ階層を保持する。深い階層が無い (ドライブ直下指定) 場合のみ
     #    従来どおりドライブ直下へフォールバックする。
     #    \w は日本語にもマッチするため ASCII 限定で検索
-    drive_match = re.search(r"([A-Za-z]):\\", query)
+    drive_match = re.search(r"([A-Za-z]):[\\/]", query)
     file_match = re.search(r"([A-Za-z0-9_-]+\.[A-Za-z0-9]{1,10})(?=[^A-Za-z0-9_.]|$)", query)
     # ファイル名の語幹が非ASCII (日本語等) だと file_match はマッチしない
     # ("テスト.docx" 等)。その場合はクォートで明示されたファイル名を拾う。

@@ -222,7 +222,12 @@ _SESSION_POSITION_LAST_RE = re.compile(
 _SESSION_POSITION_TARGET_RE = re.compile(
     r"(?:送|言|聞|尋|書|投げ|打)\S{0,4}?"
     r"(?:メッセージ|発言|質問|こと|内容|の)"
-    r"|メッセージ|発言"
+    # 「質問」は動詞を伴わない形でも発言そのものを指す。動詞集合に無い
+    # 「した質問」や、動詞を持たない「一番最初の質問」が素通りして
+    # search_history 経由の誤答になった (実インシデント 2026-08-04 ライブ監査:
+    # 「この会話で私が一番最初にした質問は何でしたか。」に対し 6 番目の発言
+    # 「今日の日付と現在時刻を教えてください。」と誤答)。
+    r"|メッセージ|発言|質問"
     r"|(?:message|question|thing)\s+(?:i|you)\s+(?:sent|said|asked)"
     r"|(?:sent|said|asked)",
     re.IGNORECASE,

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from backend.app_state import AppState
 from backend.free.api.chat.chat_types import ChatMessage
+from backend.free.core.text_quality import is_query_echo, strip_echoed_query
 from backend.free.history.history_manager import (
     SessionData,
     active_base_model_name,
@@ -260,10 +261,35 @@ def _save_session_to_history(
 def drain_evicted_to_stm(
     wm: WorkingMemory, stm: ShortTermMemory, session_id: str,
 ) -> None:
-    """WorkingMemory から押し出されたターンを ShortTermMemory に吸収"""
+    """WorkingMemory から押し出されたターンを ShortTermMemory に吸収
+
+    直前のユーザー発言を逐語コピーしただけの assistant 応答は、記憶として
+    保存しない。保存すると同じ問いで想起されて再生産され、繰り返し回数が
+    増えていく自己増幅ループになる (実インシデント 2026-08-04 ライブ監査:
+    「今日は何曜日ですか。」が 5 回繰り返され答えが出ない状態まで悪化。
+    汚染ノートを除去したら 5/5 で解消した)。エコー部分を落として中身が
+    残ればその中身だけを吸収し、何も残らなければ丸ごと捨てる。
+    """
     evicted = wm.drain_evicted()
+    last_user = ""
+    dropped = 0
     for turn in evicted:
+        content = turn.get("content") or ""
+        if turn.get("role") == "user" or turn.get("source") == "user":
+            last_user = content
+        elif last_user and content:
+            if is_query_echo(content, last_user):
+                dropped += 1
+                continue
+            cleaned = strip_echoed_query(content, last_user)
+            if cleaned != content:
+                turn = {**turn, "content": cleaned}
         stm.absorb(turn, session_id)
+    if dropped:
+        logger.info(
+            "Dropped %d echo-only assistant turn(s) before STM absorb (session=%s)",
+            dropped, session_id,
+        )
     if evicted:
         total_chars = sum(len(t.get("content", "")) for t in evicted)
         logger.debug(
