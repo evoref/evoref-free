@@ -29,7 +29,11 @@ from backend.free.agent.prompt_utils import (
     format_fewshot_section,  # noqa: F401  (re-export for tests)
 )
 from backend.free.core.session_mode import is_valid_session_mode, normalize_session_mode
-from backend.free.core.text_quality import has_broken_ja_spacing
+from backend.free.core.text_quality import (
+    has_boilerplate_closing,
+    has_broken_ja_spacing,
+    is_query_echo,
+)
 from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
 from backend.free.learning.response_arithmetic import find_arithmetic_contradictions
 from backend.free.llm.json_schemas import FewShotQualityJudgement
@@ -750,6 +754,27 @@ class FewShotPool(JsonStateStore):
             if _response_has_broken_ja_spacing(response):
                 logger.info(
                     "Rejecting fewshot candidate with broken JA spacing: "
+                    "query=%s", query[:50],
+                )
+                continue
+
+            # 質問を逐語で繰り返しただけの応答は手本にしない。手本に入ると
+            # 「問いをそのまま返すのが正解」というバイアスを注入し、記憶側の
+            # 再生産と合わさって繰り返し回数が増えていく (実インシデント
+            # 2026-08-04 ライブ監査: 同文 5 回で答えが出ない状態まで悪化)。
+            if is_query_echo(response, query):
+                logger.info(
+                    "Rejecting fewshot candidate that only echoes the query: "
+                    "query=%s", query[:50],
+                )
+                continue
+
+            # PROTECTED の出力形式が禁止している締め文を含む応答は手本にしない。
+            # 禁止条項だけでは消えず、違反応答が fitness 最上位帯で手本に載って
+            # 再生産されていた (実インシデント 2026-08-04 ライブ監査)。
+            if has_boilerplate_closing(response):
+                logger.info(
+                    "Rejecting fewshot candidate with boilerplate closing: "
                     "query=%s", query[:50],
                 )
                 continue

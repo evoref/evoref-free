@@ -60,7 +60,16 @@ class WorkspaceFile:
 
 @dataclass(frozen=True)
 class StageTestResult:
-    """テスト工程 1 実行分の結果。"""
+    """テスト工程 1 実行分の結果。
+
+    ``kind`` は記録の出所。``"pytest"`` は生成テストを実際に実行した結果、
+    ``"smoke"`` は import/準拠の静的ゲート (テストは 1 つも走っていない)。
+    両方を同じ ``test_results`` に入れているため、区別が無いと「スモーク合格」
+    が「テスト合格」として集計される (実インシデント 2026-08-04 ライブ監査:
+    テストファイル 0 件・UI は「生成ユニットテストは未実行です」と表示して
+    いるのに manifest は ``tests_passing: true``)。空文字は出所不明として
+    ``tests_passing`` の集計から外す (旧 manifest 互換、安全側)。
+    """
 
     task_id: str
     passed: bool
@@ -70,6 +79,7 @@ class StageTestResult:
     output_tail: str
     ran_at: float
     run_ref: str = ""
+    kind: str = ""
 
 
 def _sha256(text: str) -> str:
@@ -139,7 +149,7 @@ class WorkspaceManager:
                 "test_results": {},
                 "progress": {
                     "tasks_total": 0, "tasks_done": 0, "tasks_failed": 0,
-                    "files_written": 0, "tests_passing": False,
+                    "files_written": 0, "tests_passing": None,
                 },
             })
             logger.info("staged workspace created: %s", root)
@@ -343,7 +353,7 @@ class WorkspaceManager:
                 "task_id": result.task_id, "passed": result.passed,
                 "failed_count": result.failed_count, "attempt": result.attempt,
                 "summary": result.summary, "output_tail": result.output_tail,
-                "ran_at": result.ran_at,
+                "ran_at": result.ran_at, "kind": result.kind,
             }, ensure_ascii=False, indent=2))
 
         def _mut(m: dict) -> None:
@@ -351,7 +361,7 @@ class WorkspaceManager:
                 "passed": result.passed, "failed_count": result.failed_count,
                 "attempt": result.attempt, "summary": result.summary,
                 "output_tail": result.output_tail, "run_ref": run_ref,
-                "ran_at": result.ran_at,
+                "ran_at": result.ran_at, "kind": result.kind,
             }
 
         self._update_manifest(_mut)
@@ -369,6 +379,7 @@ class WorkspaceManager:
             output_tail=str(rec.get("output_tail", "")),
             ran_at=float(rec.get("ran_at", 0.0)),
             run_ref=str(rec.get("run_ref", "")),
+            kind=str(rec.get("kind", "")),
         )
 
     # ── manifest I/O ──────────────────────────────────────────────────
@@ -405,12 +416,14 @@ class WorkspaceManager:
         tasks = m.get("tasks") or []
         files = m.get("files") or {}
         results = m.get("test_results") or {}
+        # 実際にテストを走らせた記録だけを数える。静的スモークゲートも同じ
+        # ``test_results`` に入るため、全件を見ると「テスト 0 件でも合格」に
+        # なる。1 件も走っていなければ True/False ではなく None (未実行)。
+        runs = [r for r in results.values() if r.get("kind") == "pytest"]
         return {
             "tasks_total": len(tasks),
             "tasks_done": sum(1 for t in tasks if t.get("status") == "done"),
             "tasks_failed": sum(1 for t in tasks if t.get("status") == "failed"),
             "files_written": sum(1 for r in files.values() if r.get("kind") == "src"),
-            "tests_passing": bool(results) and all(
-                r.get("passed") for r in results.values()
-            ),
+            "tests_passing": all(r.get("passed") for r in runs) if runs else None,
         }

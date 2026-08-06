@@ -40,7 +40,8 @@ from backend.free.agent.tool_call_judge import _extract_file_path
 from backend.free.agent.output_format import infer_output_extension
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.core.stream_filter import (
-    HeadBufferFilter, RepetitionGuardFilter, StreamThinkingFilter,
+    HeadBufferFilter, QueryEchoFilter, RepetitionGuardFilter,
+    StreamThinkingFilter,
 )
 from backend.free.core.stream_pipeline import StreamPipeline
 from backend.free.llm.local_client import LocalClient
@@ -1656,6 +1657,11 @@ class _DeliberativeStreamState:
     """`stream_deliberative` のループ mutable 状態を集約。"""
 
     tokens_generated: int = 0
+    #: フィルタ通過後に実際にユーザーへ出た文字数。``tokens_generated`` は
+    #: tok/s 指標用に raw トークンを数えるため、フィルタが全部落としても 0 に
+    #: ならず、ゼロトークン再試行が発火しない。復唱だけの応答を落とすと画面が
+    #: 空になるため、再試行判定はこちらを見る。
+    emitted_chars: int = 0
     full_response: str = ""
     first_token_recorded: bool = False
     # executable command 学習用 (run_command 実行ターンのみ非 None)
@@ -1703,18 +1709,24 @@ async def _stream_filtered_token_pipeline(
     state: _DeliberativeStreamState,
     session_id: str,
     timer: StageTimer | None,
+    query: str = "",
 ) -> AsyncIterator[str]:
     """フィルタパイプライン (思考ブロック除去 + 先頭ラベル除去) でトークンを yield する。
 
     LLM の prefill が長引いて keepalive_interval を超える間トークンが届かない場合は、
     SSE keepalive コメントを送出してフロントエンドの chunk timeout を防ぐ。
+
+    ``query`` は復唱除去用。渡さない場合は復唱フィルタが素通しになる。
     """
     pipeline = StreamPipeline([
         StreamThinkingFilter(),
         HeadBufferFilter(),
+        # 先頭ラベル除去のあとに復唱を判定する (「**回答:** 今日は何曜日ですか。」
+        # のようにラベルが前置されている形でも冒頭一致で拾えるようにする)。
+        QueryEchoFilter(query),
         # 思考ブロック除去・先頭ラベル除去を通したあとの「実際にユーザーへ出る
         # テキスト」に対して反復を判定する (前段が落とす行を数えないため)。
-        RepetitionGuardFilter(),
+        RepetitionGuardFilter(query),
     ])
     aiter = token_stream.__aiter__()
     pending: asyncio.Task[str] | None = None
@@ -1749,10 +1761,12 @@ async def _stream_filtered_token_pipeline(
             if not state.first_token_recorded and timer:
                 timer.stop("llm_first_token_ms")
                 state.first_token_recorded = True
+            state.emitted_chars += len(filtered)
             yield sse.token(filtered)
 
     remaining = pipeline.flush()
     if remaining:
+        state.emitted_chars += len(remaining)
         yield sse.token(remaining)
 
 
@@ -1762,13 +1776,24 @@ async def _retry_zero_tokens_deliberative(
     client: LocalClient,
     max_tokens: int | None,
     session_id: str,
+    query: str = "",
 ) -> AsyncIterator[str]:
-    """tokens_generated==0 時に reasoning ループを回避するため再試行する。
+    """ユーザーへ 1 文字も出なかった場合に再試行する。
 
-    既にキャンセル済みか tokens_generated > 0 なら何も yield しない。
+    判定は raw トークン数ではなく **フィルタ通過後に出た文字数**。復唱だけの
+    応答はフィルタが全部落とすため、raw では 0 にならないのに画面は空になる
+    (実インシデント 2026-08-04 ライブ監査: 質問文の復唱しか生成せず、
+    QueryEchoFilter がそれを落とした結果 5 回中 2 回が無応答)。
+
+    再試行トークンも **本流と同じフィルタへ通す**。素通しにすると、初回を
+    フィルタが落としたケースで再試行だけが無防備になり、結果として最悪の
+    出力がそのまま画面へ出る (実インシデント 2026-08-04: 初回の復唱を落とした
+    直後の再試行が同じ復唱を 170 回出力して max_tokens まで走った)。
+
+    既にキャンセル済みか出力済みなら何も yield しない。
     リトライ後もゼロなら error フレームを yield。
     """
-    if state.tokens_generated > 0 or _cancel_flags.get(session_id):
+    if state.emitted_chars > 0 or _cancel_flags.get(session_id):
         return
     logger.warning(
         "No content tokens from llama-server, "
@@ -1778,14 +1803,27 @@ async def _retry_zero_tokens_deliberative(
         messages, stream=True, id_slot=client.chat_slot,
         max_tokens=max_tokens,
     )
+    pipeline = StreamPipeline([
+        StreamThinkingFilter(),
+        HeadBufferFilter(),
+        QueryEchoFilter(query),
+        RepetitionGuardFilter(query),
+    ])
     async for token in retry_stream:
         if _cancel_flags.get(session_id):
             break
         state.full_response += token
         state.tokens_generated += 1
-        yield sse.token(token)
+        filtered = pipeline.process(token)
+        if filtered:
+            state.emitted_chars += len(filtered)
+            yield sse.token(filtered)
+    remaining = pipeline.flush()
+    if remaining:
+        state.emitted_chars += len(remaining)
+        yield sse.token(remaining)
 
-    if state.tokens_generated > 0:
+    if state.emitted_chars > 0:
         logger.info("Retry succeeded: tokens=%d", state.tokens_generated)
         return
     logger.error("Retry also returned 0 content tokens")
@@ -1964,12 +2002,12 @@ async def stream_deliberative(
                 yield frame
 
             async for frame in _stream_filtered_token_pipeline(
-                token_stream, stream_state, session_id, timer,
+                token_stream, stream_state, session_id, timer, query,
             ):
                 yield frame
 
             async for frame in _retry_zero_tokens_deliberative(
-                stream_state, messages, client, max_tokens, session_id,
+                stream_state, messages, client, max_tokens, session_id, query,
             ):
                 yield frame
 
@@ -2165,12 +2203,12 @@ async def stream_reactive_light(
             token_stream = await client.generate(list(messages), **gen_kwargs)
 
             async for frame in _stream_filtered_token_pipeline(
-                token_stream, stream_state, session_id, timer,
+                token_stream, stream_state, session_id, timer, query,
             ):
                 yield frame
 
             async for frame in _retry_zero_tokens_deliberative(
-                stream_state, messages, client, max_tokens, session_id,
+                stream_state, messages, client, max_tokens, session_id, query,
             ):
                 yield frame
 

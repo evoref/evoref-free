@@ -46,6 +46,7 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Iterable, Literal
 
+from backend.free.core.text_quality import carries_no_assertion
 from backend.free.core.session_mode import (
     is_chat_mode,
     is_coding_mode,
@@ -272,10 +273,18 @@ class MemoryInjector:
             )
 
         for note in stm_notes:
+            pinned = bool(getattr(note, "pin_flag", False))
+            # 問いだけのノートは答えを含まないのに (過去の記録) として注入され、
+            # モデルがそれを回答として復唱する (実インシデント 2026-08-04
+            # ライブ監査:「今日は何曜日ですか。」が過去の記録として想起され、
+            # 同文がそのまま出力された)。明示的に pin されたものは尊重する。
+            if not pinned and carries_no_assertion(getattr(note, "content", "")):
+                filtered_out += 1
+                continue
             if not self._is_relevant(
                 query_vec, getattr(note, "embedding", None),
                 # MemoryNote 側の pin 属性は ``pin_flag`` (SemanticFact は ``pinned``)。
-                pinned=bool(getattr(note, "pin_flag", False)),
+                pinned=pinned,
                 require_embedding=True,
             ):
                 filtered_out += 1
