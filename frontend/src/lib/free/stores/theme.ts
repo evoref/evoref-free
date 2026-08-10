@@ -48,7 +48,7 @@ export interface LayoutConfig {
 		show_timestamps: boolean;
 		show_agentic_steps: 'expanded' | 'collapsed' | 'hidden';
 	};
-	coding: {
+	create: {
 		pane_ratio: [number, number];
 		pane_direction: 'horizontal' | 'vertical';
 		editor: EditorConfig;
@@ -95,7 +95,7 @@ const defaultLayout: LayoutConfig = {
 		show_timestamps: true,
 		show_agentic_steps: 'collapsed'
 	},
-	coding: {
+	create: {
 		pane_ratio: [50, 50],
 		pane_direction: 'horizontal',
 		editor: { ...defaultEditorConfig }
@@ -156,7 +156,7 @@ export function setLayoutCssVariables(config: LayoutConfig): void {
 	root.style.setProperty('--border-radius', config.global.border_radius + 'px');
 	root.style.setProperty('--spacing-unit', config.global.spacing_unit + 'px');
 
-	const ed = config.coding.editor;
+	const ed = config.create.editor;
 	root.style.setProperty('--editor-font-family', ed.font_family);
 	root.style.setProperty('--editor-font-size', ed.font_size + 'px');
 	root.style.setProperty('--editor-line-height', String(ed.line_height));
@@ -166,8 +166,8 @@ export function setLayoutCssVariables(config: LayoutConfig): void {
 /** レイアウト設定をDOMに反映しストアを更新する */
 export function applyLayout(config: LayoutConfig): void {
 	// editor が省略されている場合はデフォルト値で補完
-	if (!config.coding.editor) {
-		config.coding.editor = { ...defaultEditorConfig };
+	if (!config.create.editor) {
+		config.create.editor = { ...defaultEditorConfig };
 	}
 	setLayoutCssVariables(config);
 	layout.set(config);
@@ -270,11 +270,11 @@ export async function activateTheme(
 		const { slots: _slots, ...layoutFields } = result.gui_layout;
 		applyLayout({
 			...layoutFields,
-			coding: {
-				...layoutFields.coding,
+			create: {
+				...layoutFields.create,
 				// テーマは config.editor 由来のフィールド (encoding / line ending /
 				// highlight_languages) を持たないため、既定値を土台に重ねる。
-				editor: { ...defaultEditorConfig, ...layoutFields.coding.editor },
+				editor: { ...defaultEditorConfig, ...layoutFields.create.editor },
 			},
 		});
 	}

@@ -15,13 +15,13 @@ class ModelPathsConfig(BaseModel):
     base_model: str = "models/gemma-4-12b-it-qat-q4_0.gguf"
     assist_model: str = "models/gemma-4-E4B_q4_0-it.gguf"
     embed_model: str = "models/Qwen3-Embedding-0.6B-Q8_0.gguf"
-    coding_model: str | None = Field(
+    create_model: str | None = Field(
         default=None,
-        description="コーディングモード用 GGUF パス。未指定 (None / 空文字列) の場合は base_model にフォールバック",
+        description="クリエイトモード用 GGUF パス。未指定 (None / 空文字列) の場合は base_model にフォールバック",
     )
-    assist_coding_model: str | None = Field(
+    assist_create_model: str | None = Field(
         default=None,
-        description="コーディングモード用アシスト GGUF パス。未指定 (None / 空文字列) の場合は assist_model にフォールバック",
+        description="クリエイトモード用アシスト GGUF パス。未指定 (None / 空文字列) の場合は assist_model にフォールバック",
     )
 
     @model_validator(mode="before")
@@ -124,9 +124,9 @@ class LocalPathsConfig(BaseModel):
     # EvorefMem トリガ辞書 (pin / fact / classify) の user override 配置先。
     # 同梱 default は ``backend/free/memory/_defaults/triggers/``。
     triggers_dir: str = "local/triggers/"
-    # staged コーディングパイプラインの一時ワークスペース
+    # staged クリエイトパイプラインの一時ワークスペース
     # (spec.md / src / tests / manifest.json の工程間ハンドオフ)。
-    coding_workspace_dir: str = "local/coding/"
+    create_workspace_dir: str = "local/create/"
     # base モデルの自己学習データを (base モデル識別子 × モード) でパーティション化
     # する際のルート。``learning_dir/<base_model_stem>/`` 配下に experience /
     # base prompts / base LoRA・cvector を配置する。PathResolver.resolve_learning が

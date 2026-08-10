@@ -44,7 +44,7 @@ ADAPTER_MODE_MARKER_NAME = ".adapter_mode_migrated_v1"
 # flat prompts_dir から base パーティションへ移すファイル名 (assist_* は移さない)。
 _BASE_PROMPT_FILES = (
     "chat.md", "chat.meta.json",
-    "coding.md", "coding.meta.json",
+    "create.md", "create.meta.json",
     "learning_state.json",
     "level1_session_active.json",
     "exploration_state.json",
@@ -55,7 +55,7 @@ _BASE_PROMPT_FILES = (
 # 同じく移すサブディレクトリ。
 _BASE_PROMPT_SUBDIRS = ("level1_history",)
 # history/ 配下で移す base プロンプト版 (assist_*_v*.md は残置)。
-_BASE_HISTORY_GLOBS = ("chat_v*.md", "coding_v*.md")
+_BASE_HISTORY_GLOBS = ("chat_v*.md", "create_v*.md")
 
 
 class LearningPartitionMigrator:
@@ -265,7 +265,7 @@ class LearningPartitionMigrator:
                 copied += 1
         return copied
 
-    # ── adapter mode-partition (chat/coding 分離) 初回移行 ──
+    # ── adapter mode-partition (chat/create 分離) 初回移行 ──
 
     def _adapter_mode_marker_path(self) -> Path:
         return self._resolver.resolve_local("learning_dir") / ADAPTER_MODE_MARKER_NAME

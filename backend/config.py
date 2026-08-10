@@ -21,7 +21,7 @@ def mode_base_model_raw(
 ) -> str:
     """指定モードで実際にロードされる base モデルの生パス文字列を返す。
 
-    chat は常に ``model_paths.base_model``。coding は ``coding_model`` 指定が
+    chat は常に ``model_paths.base_model``。create は ``create_model`` 指定が
     あればそれ、無い/空なら ``base_model`` へフォールバックする。
 
     ``get_mode_generation_params`` (起動 / モード切替が使う解決) と
@@ -34,8 +34,8 @@ def mode_base_model_raw(
     (宣言されていないモデル名でディレクトリを作らないため)。
     """
     base_model = model_paths.get("base_model") or default
-    if mode == "coding":
-        return model_paths.get("coding_model") or base_model
+    if mode == "create":
+        return model_paths.get("create_model") or base_model
     return base_model
 
 
@@ -82,8 +82,8 @@ class PathResolver:
         # EvorefMem トリガ辞書 (pin / fact / classify) のユーザー上書き先。
         # 同梱 default は ``backend/free/memory/_defaults/triggers/``。
         "triggers_dir": "local/triggers/",
-        # staged コーディングパイプラインの一時ワークスペース。
-        "coding_workspace_dir": "local/coding/",
+        # staged クリエイトパイプラインの一時ワークスペース。
+        "create_workspace_dir": "local/create/",
         # base 学習データの (model × mode) パーティションルート。
         "learning_dir": "local/learning/",
     }
@@ -139,7 +139,7 @@ class PathResolver:
         # Level 2 base/assist LoRA アダプタの (mode) パーティション state。
         # "model" (既定) では resolve_learning/resolve_assist_learning は mode 引数を
         # 無視し、従来どおりモデル単位で 1 アダプタを共有する。"model_mode" のときのみ
-        # chat/coding で別ファイルへ分離する。AppState.current_mode の初期値と揃え、
+        # chat/create で別ファイルへ分離する。AppState.current_mode の初期値と揃え、
         # active_mode の既定は "chat"。
         self._active_mode: str = "chat"
         self._adapter_partition_mode: str = str(
@@ -152,7 +152,7 @@ class PathResolver:
         config の ``model_paths[key]`` を優先し、無ければ ``MODEL_DEFAULTS[key]``
         を使う。``dict.get(key, MODEL_DEFAULTS[key])`` は default 引数を先に評価
         するため、``MODEL_DEFAULTS`` に無いキー (assist_model / embed_model /
-        coding_model 等) を config 側に持っていても KeyError で落ちていた。
+        create_model 等) を config 側に持っていても KeyError で落ちていた。
         """
         raw = self.models.get(key) or self.MODEL_DEFAULTS.get(key)
         if raw is None:
@@ -248,12 +248,12 @@ class PathResolver:
 
     @property
     def active_mode(self) -> str:
-        """Level 2 アダプタパーティションの active モード (``"chat"``/``"coding"``)。"""
+        """Level 2 アダプタパーティションの active モード (``"chat"``/``"create"``)。"""
         return self._active_mode
 
     def set_active_mode(self, mode: str | None) -> None:
         """モード切替時に呼ぶ。未指定/不明値は安全側で ``"chat"`` に丸める。"""
-        self._active_mode = mode if mode in ("chat", "coding") else "chat"
+        self._active_mode = mode if mode in ("chat", "create") else "chat"
 
     @property
     def adapter_partition_mode(self) -> str:
@@ -293,10 +293,10 @@ class PathResolver:
         「どのモデル向けか」が保存先の第一キーであるべき。
 
         従来は常に ``_active_stem`` (= ``model_paths.base_model`` = chat のモデル)
-        を根にしていたため、coding が別モデル (``coding_model``) を使う構成では
-        coding のアダプタが chat モデルのパーティション配下に置かれていた。この
-        状態で chat の ``base_model`` を差し替えると、``coding_model`` は変わって
-        いないのに coding のアダプタが参照されなくなる (根が別 stem に移るため)。
+        を根にしていたため、create が別モデル (``create_model``) を使う構成では
+        create のアダプタが chat モデルのパーティション配下に置かれていた。この
+        状態で chat の ``base_model`` を差し替えると、``create_model`` は変わって
+        いないのに create のアダプタが参照されなくなる (根が別 stem に移るため)。
 
         アダプタ以外 (experience / prompts / cvector 系) は従来どおり
         ``_active_stem``。経験とプロンプトは base 学習パーティション単位で
@@ -544,16 +544,16 @@ _REASONING_MODES = frozenset({"toggle", "always", "none"})
 def _model_path_for(cfg: dict, target: str) -> Path | None:
     """target のモデル GGUF 絶対パスを解決する。
 
-    target は slot (``"base"`` / ``"assist"``) と mode (``"chat"`` / ``"coding"``)
-    の 4 値。``"coding"`` のみ ``model_paths.coding_model`` を見て、未設定なら
+    target は slot (``"base"`` / ``"assist"``) と mode (``"chat"`` / ``"create"``)
+    の 4 値。``"create"`` のみ ``model_paths.create_model`` を見て、未設定なら
     base へフォールバックする。モデル未設定時は ``None``。
     """
     model_paths = cfg.get("model_paths", {}) or {}
     base_model = model_paths.get("base_model") or ""
     if target == "assist":
         model_rel = model_paths.get("assist_model") or ""
-    elif target == "coding":
-        model_rel = model_paths.get("coding_model") or base_model
+    elif target == "create":
+        model_rel = model_paths.get("create_model") or base_model
     else:
         model_rel = base_model
     if not model_rel:
@@ -643,7 +643,7 @@ def _profile_for(cfg: dict, target: str) -> dict:
 
 
 def _resolve_profile_sampling_for_mode(cfg: dict, mode: str) -> dict:
-    """アクティブモデル ("chat"|"coding") のプロファイルから sampling 既定を返す。"""
+    """アクティブモデル ("chat"|"create") のプロファイルから sampling 既定を返す。"""
     return _profile_for(cfg, mode).get("sampling") or {}
 
 
@@ -655,7 +655,7 @@ def _resolve_profile_reasoning(cfg: dict, slot: str) -> dict:
 def resolve_sampling_params(cfg: dict, target: str) -> dict:
     """target のモデルプロファイルが宣言する sampling パラメータを返す。
 
-    target は slot (``"base"`` / ``"assist"``) と mode (``"chat"`` / ``"coding"``)。
+    target は slot (``"base"`` / ``"assist"``) と mode (``"chat"`` / ``"create"``)。
     宣言の無いキーは含まれないので、呼び出し側の既定を潰さない。base 側は
     :func:`get_mode_generation_params` が ``modes.*`` より優先で適用し、assist 側は
     ``AssistModelClient`` がリクエスト payload の既定として使う。
@@ -784,14 +784,14 @@ def _resolve_profile_context_size(cfg: dict, slot: str) -> int | None:
 
 
 def _resolve_profile_context_size_for_mode(cfg: dict, mode: str) -> int | None:
-    """アクティブモード ("chat"|"coding") のプロファイルから ``context_size`` を返す。"""
+    """アクティブモード ("chat"|"create") のプロファイルから ``context_size`` を返す。"""
     return _profile_context_size(cfg, mode)
 
 
 def resolve_context_size_for_mode(cfg: dict, mode: str) -> int:
-    """アクティブモード ("chat"|"coding") の有効 context_size を解決する。
+    """アクティブモード ("chat"|"create") の有効 context_size を解決する。
 
-    coding モードで ``model_paths.coding_model`` が base と別 arch (別 context
+    create モードで ``model_paths.create_model`` が base と別 arch (別 context
     window) の場合に、その実窓を反映する。優先順位は :func:`resolve_context_size`
     と同じ: config 明示 (``llama.context_size``) > arch プロファイル > 既定。
     ``llama.context_size`` の明示はモードに依らず手動 pin として優先する。
@@ -831,7 +831,7 @@ def get_mode_generation_params(mode: str) -> dict:
     """指定モードの生成パラメータを取得
 
     Args:
-        mode: モード名（"chat" または "coding"）
+        mode: モード名（"chat" または "create"）
 
     Returns:
         {"model": str, "temperature": float, "top_p": float,
@@ -845,7 +845,7 @@ def get_mode_generation_params(mode: str) -> dict:
     modes_cfg = cfg.get("modes", {})
 
     # デフォルト値
-    # モデルパスは生成パラメータと分離し、coding は model_paths.coding_model から引く。
+    # モデルパスは生成パラメータと分離し、create は model_paths.create_model から引く。
     defaults = {
         "chat": {
             "temperature": 0.7,
@@ -854,7 +854,7 @@ def get_mode_generation_params(mode: str) -> dict:
             "presence_penalty": 0.0,
             "frequency_penalty": 0.0,
         },
-        "coding": {
+        "create": {
             "temperature": 0.3,
             "top_p": 0.95,
             "top_k": 20,
@@ -864,7 +864,7 @@ def get_mode_generation_params(mode: str) -> dict:
     }
 
     if mode not in defaults:
-        raise ValueError(f"Unknown mode: {mode!r} (available: chat, coding)")
+        raise ValueError(f"Unknown mode: {mode!r} (available: chat, create)")
 
     mode_cfg = dict(modes_cfg.get(mode, {}))
     # 生成パラメータのみを採用 (model はここには存在しない)
@@ -877,7 +877,7 @@ def get_mode_generation_params(mode: str) -> dict:
     params = {**defaults[mode], **mode_cfg, **profile_sampling}
 
     # ベースモデル。chat は常にここを採用。
-    # coding は model_paths.coding_model 指定が無い/空の場合のみフォールバック。
+    # create は model_paths.create_model 指定が無い/空の場合のみフォールバック。
     params["model"] = mode_base_model_raw(cfg.get("model_paths", {}), mode)
 
     # 学習デルタの適用（Level 1 生成パラメータ進化の結果）
@@ -898,12 +898,12 @@ def get_mode_generation_params(mode: str) -> dict:
 def get_mode_assist_model_path(mode: str) -> str:
     """指定モードで使用すべきアシストモデルの GGUF パスを解決する
 
-    coding モードで ``model_paths.assist_coding_model`` が指定されていれば
+    create モードで ``model_paths.assist_create_model`` が指定されていれば
     それを、未指定/空文字列なら ``model_paths.assist_model`` にフォールバック
-    する (``get_mode_generation_params`` の ``coding_model`` 解決と対称)。
+    する (``get_mode_generation_params`` の ``create_model`` 解決と対称)。
 
     Args:
-        mode: "chat" または "coding"
+        mode: "chat" または "create"
 
     Returns:
         GGUF パス文字列 (config.yaml からの相対 or 絶対)
@@ -913,8 +913,8 @@ def get_mode_assist_model_path(mode: str) -> str:
     assist_model = model_paths.get(
         "assist_model", "models/gemma-4-E4B_q4_0-it.gguf",
     )
-    if mode == "coding":
-        return model_paths.get("assist_coding_model") or assist_model
+    if mode == "create":
+        return model_paths.get("assist_create_model") or assist_model
     return assist_model
 
 
@@ -928,7 +928,7 @@ def get_mode_lora_path(mode: str) -> Path:
     "model_mode" のときのみ mode 別の実際のパスを返す。
 
     Args:
-        mode: "chat" または "coding"
+        mode: "chat" または "create"
 
     Returns:
         解決された絶対パス (ファイルの存在は保証しない)
@@ -944,7 +944,7 @@ def get_mode_assist_lora_path(mode: str) -> Path:
     ``get_mode_lora_path`` と対称。"model" (既定) では常に flat 共有パスを返す。
 
     Args:
-        mode: "chat" または "coding"
+        mode: "chat" または "create"
 
     Returns:
         解決された絶対パス (ファイルの存在は保証しない)

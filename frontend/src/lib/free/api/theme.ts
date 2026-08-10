@@ -41,7 +41,7 @@ export interface GuiLayoutResponse {
 		show_timestamps: boolean;
 		show_agentic_steps: 'expanded' | 'collapsed' | 'hidden';
 	};
-	coding: {
+	create: {
 		pane_ratio: [number, number];
 		pane_direction: 'horizontal' | 'vertical';
 		editor?: {

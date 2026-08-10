@@ -193,8 +193,33 @@ class RepetitionGuardFilter:
     _MAX_DUPLICATE_LINES = 4
     _LIST_MARKER_RE = re.compile(r"^(?:\d{1,3}[.)]|[-*+・>#]+)\s*")
 
+    #: 1 行の中で同一トークンが連続してよい回数の上限。判定が行単位なので
+    #: 「ador ador ador ador …」のように **1 行に収まる暴走** は素通りしていた
+    #: (実インシデント 2026-08-10 ライブ監査: 日本三景の 2 項目目が "ador" の
+    #: 連呼になり、そのまま画面に出た)。長文生成側には同種のガード
+    #: (generation.validators.collapse_runaway_repetition) があるが、チャットの
+    #: ストリームには繋がっていない。正当な散文で同じ短語が 6 回続くことはない。
+    _MAX_TOKEN_RUN = 6
+
+    #: 改行を待たずに先出しを始める、未確定行の文字数。
+    #:
+    #: 判定は行単位なので素朴には改行が来るまで何も出せないが、それだと
+    #: **改行を含まない長い段落は最後まで 1 文字も表示されない**。実測
+    #: (2026-08-08 ライブ監査、gemma-4-12b/iGPU): 300 字の説明と会議メモの要約で、
+    #: llama-server が最初のトークンを出してからクライアントに最初の SSE が届く
+    #: までが 23.8 秒 / 22.2 秒だった (他 31 ターンの中央値は 3.3 秒)。
+    #: バックエンドは生成できているのに画面が空のままになる。
+    #:
+    #: 一方この閾値より短い未確定行は従来どおり改行まで待つ。反復ガードが守る
+    #: 対象 (箇条書き・見出し・質問文の複製) はいずれも短い行で、そこでの挙動を
+    #: 変えないため。閾値を超えた行は既に「反復ではない散文」とみなせる長さで、
+    #: 先出ししても打ち切り判定そのものは行完成時に従来どおり効く。
+    _EAGER_FLUSH_CHARS = 120
+
     def __init__(self, query: str | None = None) -> None:
         self._buffer = ""
+        #: ``_buffer`` の先頭から何文字を既に先出ししたか (行完成時にリセット)。
+        self._emitted_in_line = 0
         self._last_line = ""
         self._repeat_count = 1
         self._tripped = False
@@ -214,6 +239,20 @@ class RepetitionGuardFilter:
         stripped = cls._LIST_MARKER_RE.sub("", line.strip())
         return stripped.replace("*", "").replace("　", " ").strip()
 
+    @classmethod
+    def _has_token_runaway(cls, line: str) -> bool:
+        """1 行の中で同一トークンが連続しすぎているか (純粋関数)。"""
+        prev = ""
+        run = 1
+        for token in line.split():
+            if token == prev:
+                run += 1
+                if run >= cls._MAX_TOKEN_RUN:
+                    return True
+            else:
+                prev, run = token, 1
+        return False
+
     @property
     def tripped(self) -> bool:
         """反復を検知して打ち切ったかどうか"""
@@ -226,6 +265,13 @@ class RepetitionGuardFilter:
             self._in_code_fence = not self._in_code_fence
             return False
         is_query_line = bool(self._query_line) and stripped == self._query_line
+        # 行内の暴走は長さに関わらず打ち切る (コード中は 0 や | の連続が正当)。
+        if not self._in_code_fence and self._has_token_runaway(stripped):
+            logger.warning(
+                "RepetitionGuardFilter: truncated output after an in-line token "
+                "runaway (line=%.40s)", stripped,
+            )
+            return True
         if len(stripped) < self._MIN_LINE_CHARS and not is_query_line:
             # 短い行は正当な繰り返し (箇条書き記号・空行) がありうるため
             # カウント対象にせず、連鎖も切らない
@@ -268,20 +314,29 @@ class RepetitionGuardFilter:
             if self._line_is_repeat(line):
                 self._tripped = True
                 self._buffer = ""
+                self._emitted_in_line = 0
                 logger.warning(
                     "RepetitionGuardFilter: truncated output after %d identical "
                     "lines (line=%.40s)",
                     self._repeat_count, self._last_line,
                 )
                 return "".join(out)
-            out.append(line + "\n")
+            # 先出し済みの分は二重に出さない。
+            out.append(line[self._emitted_in_line:] + "\n")
+            self._emitted_in_line = 0
+        # 長い未確定行は改行を待たずに先出しする (_EAGER_FLUSH_CHARS 参照)。
+        if len(self._buffer) >= self._EAGER_FLUSH_CHARS:
+            out.append(self._buffer[self._emitted_in_line:])
+            self._emitted_in_line = len(self._buffer)
         return "".join(out)
 
     def flush(self) -> str:
         """残りバッファを排出する (打ち切り済みなら空)。"""
         if self._tripped:
             return ""
-        remaining, self._buffer = self._buffer, ""
+        remaining = self._buffer[self._emitted_in_line:]
+        self._buffer = ""
+        self._emitted_in_line = 0
         return remaining
 
 

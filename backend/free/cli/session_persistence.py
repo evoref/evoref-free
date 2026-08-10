@@ -364,10 +364,10 @@ def _restore_session(
     state.token_used = token_info.get("used", 0)
     state.token_limit = token_info.get("limit", 4096)
     # 保存時のモードを復元 (save は mode を書き込むが load 側が捨てていた)。
-    # 不正値は現行モードを維持。Free で coding を読んだ場合の降格は
+    # 不正値は現行モードを維持。Free で create を読んだ場合の降格は
     # 起動時 coerce_cli_mode に委ねる (ここでは生値を尊重)。
     saved_mode = data.get("mode")
-    if saved_mode in ("chat", "coding"):
+    if saved_mode in ("chat", "create"):
         state.mode = saved_mode
 
     # 保存されていたファイルパスを再読込み

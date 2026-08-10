@@ -29,7 +29,7 @@ extractor は no-op となる。
 
 ファイル形式 (``debug_logger.log_agent_trace_event`` 由来)::
 
-    {"event": "begin", "episode_id": "ep_xxx", "conversation_id": "...", "mode": "coding", ...}
+    {"event": "begin", "episode_id": "ep_xxx", "conversation_id": "...", "mode": "create", ...}
     {"event": "step", "episode_id": "ep_xxx", "step_index": 0, "action": "...", ...}
     {"event": "end", "episode_id": "ep_xxx", "outcome": "success" | "failure: ...", ...}
 """
@@ -128,7 +128,7 @@ AGENT_TRACE_GLOB = "agent_trace*.jsonl"
 class MDPTraceExtractor(BaseExtractor):
     """``agent_trace*.jsonl`` から failure_pattern / decision を抽出する。"""
 
-    mode = "coding"
+    mode = "create"
 
     def __init__(self) -> None:
         # プロセス内の二重抽出防止用エピソード集合 (再起動でリセット可)
@@ -232,10 +232,10 @@ class MDPTraceExtractor(BaseExtractor):
             steps = ep["steps"]
             last_actions = [str(s.get("action") or "") for s in steps[-3:]]
             task_desc, last_observation = episode_task_and_result(steps)
-            # begin イベントの実行モード (chat/coding) を fact の mode_origin へ
-            # 反映する。クラス既定 "coding" のままだとチャットセッション由来の
-            # decision ファクトが coding パーティションを汚染する (2026-07-15:
-            # 21 件全件が mode_origin="coding" で取り込まれた)。
+            # begin イベントの実行モード (chat/create) を fact の mode_origin へ
+            # 反映する。クラス既定 "create" のままだとチャットセッション由来の
+            # decision ファクトが create パーティションを汚染する (2026-07-15:
+            # 21 件全件が mode_origin="create" で取り込まれた)。
             begin = ep.get("begin") or {}
             episode_mode = str(begin.get("mode") or "") or self.mode
             if not is_valid_session_mode(episode_mode):

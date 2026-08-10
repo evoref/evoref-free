@@ -9,11 +9,14 @@ import asyncio
 import contextlib
 import json
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
 import httpx
 from pydantic import BaseModel
+
+from backend.exceptions import AssistUnavailableError
 from tenacity import (
     AsyncRetrying,
     retry_if_exception,
@@ -63,21 +66,21 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     "retrieval_quality_judge": "realtime",
     "retrieval_necessity_judge": "realtime",
     # 取得直後 content gate の marginal band 関連性判定。チャット応答パス
-    # (coding mode) で同期発火するため realtime。
+    # (create mode) で同期発火するため realtime。
     "retrieval_chunk_gate": "realtime",
     "tool_judgment": "realtime",
     # executable query (環境依存事実) のコマンド合成。チャット応答パスで
     # tool_call_judge から同期発火するため realtime。
     "executable_command_synth": "realtime",
     "calculate_expression_synth": "realtime",
-    # meta-cognitive 計画は coding mode のチャット応答パスで
+    # meta-cognitive 計画は create mode のチャット応答パスで
     # 同期発火する (タスク分解後に他のエージェントが実行される) ため
     # realtime に分類する。
     "meta_cognitive_plan": "realtime",
-    # staged コーディングのタスクグラフ合成。coding mode のチャット応答パス
+    # staged クリエイトのタスクグラフ合成。create mode のチャット応答パス
     # 冒頭で同期発火し、ユーザは plan 確定を待つ (meta_cognitive_plan と同根拠)。
-    "coding_task_graph": "realtime",
-    # エディタタブ名導出。coding mode のチャット応答パス (long_form /
+    "create_task_graph": "realtime",
+    # エディタタブ名導出。create mode のチャット応答パス (long_form /
     # meta_cognitive のエディタ出力終端) で同期発火し、ユーザはタブ名表示を
     # 待つ。max_tokens 数十・budget 0 の極短呼出なので realtime に乗せる。
     "editor_filename": "realtime",
@@ -104,12 +107,12 @@ _PURPOSE_PRIORITY_MAP: dict[str, Priority] = {
     # と同列の background スロット。
     "code_spec_synthesis": "background",
     "flowchart_synthesis": "background",
-    # staged コーディングの spec 工程: 設計仕様 (spec.md) のテキスト生成。
+    # staged クリエイトの spec 工程: 設計仕様 (spec.md) のテキスト生成。
     # 自律ループ内 (inline 駆動) で発火する重いテキスト生成のため background。
-    "coding_spec_doc": "background",
+    "create_spec_doc": "background",
     # staged spec 工程のモジュール節深化 (1 節 1 呼出でメソッド毎挙動・属性・
     # 定数まで書き下す)。自律ループ内の重いテキスト生成のため background。
-    "coding_spec_deepen": "background",
+    "create_spec_deepen": "background",
     # staged test 工程の spec 見直し判定 (executor._spec_revision_cycle)。
     # 自律ループ内で発火する JSON 判定 + 改訂節生成のため background。
     "spec_revision_judge": "background",
@@ -232,17 +235,17 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # 15s のままでは新しい max_tokens の余裕を使い切る前にタイムアウトして
     # しまう。30s に引き上げて max_tokens の余裕と整合させる。
     "tool_judgment": 30.0,
-    # meta-cognitive 計画 (タスク分解) は coding mode の
+    # meta-cognitive 計画 (タスク分解) は create mode の
     # 応答パスで発火するため、長すぎるとユーザ体感を阻害する。30s で打ち切り。
     "meta_cognitive_plan": 30.0,
-    # staged コーディングのタスクグラフ合成 (summary + modules[] の JSON)。
+    # staged クリエイトのタスクグラフ合成 (summary + modules[] の JSON)。
     # meta_cognitive_plan より構造が大きいため 45s。失敗時は longform へ fallback。
-    "coding_task_graph": 45.0,
-    # staged コーディングの spec.md テキスト生成。構造化 spec (## Module: /
+    "create_task_graph": 45.0,
+    # staged クリエイトの spec.md テキスト生成。構造化 spec (## Module: /
     # ### Component:) の詳細化で 3072 tok 級になり、iGPU + 4B assist の実測
     # (3072 tok ≈ 95-130s) を賄うため 300s。実効値は executor が config の
     # spec_timeout_sec を明示指定するためそちらが優先される (本値は整合目的)。
-    "coding_spec_doc": 300.0,
+    "create_spec_doc": 300.0,
     # staged test 工程の spec 見直し判定 (spec_ok + 改訂節 ≈ 500-800 tok の JSON)。
     "spec_revision_judge": 90.0,
     # staged spec 工程のフロー構造合成 (FlowSpec の steps JSON ≈ 800-1500 tok)。
@@ -254,8 +257,8 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "flow_spec_part_synthesis": 60.0,
     # staged spec 工程のモジュール節深化 (節 1 個 ≈ 1000-2500 tok のテキスト)。
     # 実効値は executor が config の spec_timeout_sec を明示指定するため
-    # そちらが優先 (coding_spec_doc と同じ整合目的)。
-    "coding_spec_deepen": 300.0,
+    # そちらが優先 (create_spec_doc と同じ整合目的)。
+    "create_spec_deepen": 300.0,
     # エディタタブ名導出 ({"file_name": "..."} の極短 JSON)。応答パスで
     # 同期発火するため短く打ち切る。失敗時は言語別 fallback stem に倒す。
     "editor_filename": 8.0,
@@ -367,11 +370,11 @@ PURPOSE_REASONING_BUDGET_DEFAULTS: dict[str, int] = {
     # meta-cognitive 計画は機械的なタスク分解で thinking 不要
     "meta_cognitive_plan": 0,
     # タスクグラフ合成も機械的な分割で thinking 不要 (response_format で構造固定)。
-    "coding_task_graph": 0,
+    "create_task_graph": 0,
     # spec.md 生成は設計の言語化で中程度の推論余地が有効。
-    "coding_spec_doc": 1024,
-    # モジュール節深化も設計の言語化 (coding_spec_doc と同根拠)。
-    "coding_spec_deepen": 1024,
+    "create_spec_doc": 1024,
+    # モジュール節深化も設計の言語化 (create_spec_doc と同根拠)。
+    "create_spec_deepen": 1024,
     # spec 見直し判定は欠陥指摘 + 節改訂の中程度タスク。response_format
     # (SpecRevisionJudgement) で構造を固定するため thinking は絞る。
     "spec_revision_judge": 512,
@@ -451,6 +454,23 @@ _BREAKER_CONSECUTIVE_TIMEOUTS = 3
 _BREAKER_COOLDOWN_SEC = 180.0
 
 
+# ── config 明示 purpose の timeout 警告 ──────────────────────────────────
+# ``assist_model.timeouts[purpose]`` を config に書くとユーザー権威として較正
+# 対象外になる (上記)。正しい優先順位だが、**低すぎる値を書いた場合に自動修復も
+# 通知も無い**のが問題。当該 purpose は毎ターン予算いっぱい待って失敗し、
+# 呼出側は degraded (no_tool 等) へ静かに倒れ続ける。
+#
+# 実測 (2026-08-07 ライブ監査、チャット 50 ターン): config で
+# ``executable_command_synth: 20`` / ``tool_judgment: 30`` と固定していた結果、
+# 前者は 46 回中 17 回 (37%)、後者は 21 回中 7 回 (33%) がタイムアウト。成功時の
+# p90 が予算とほぼ同値 (21.6s / 31.4s) で、予算が実レイテンシ分布の裾に
+# 食い込んでいた。ブレーカは待ち時間を削るが予算は直さないので、状態は永続する。
+#
+# 予算は書き換えず (ユーザー権威を尊重)、実測に基づく推奨値を WARNING で示す。
+_PINNED_TIMEOUT_WARN_AFTER = 3
+_PINNED_TIMEOUT_WARN_EVERY = 10
+
+
 class _PurposeStat:
     """purpose 単位のレイテンシ観測 (反応的較正 / サーキットブレーカ用)。
 
@@ -459,7 +479,10 @@ class _PurposeStat:
     較正のトリガは timeout イベントそのもの。
     """
 
-    __slots__ = ("ewma", "consecutive_timeouts", "samples", "breaker_open_until")
+    __slots__ = (
+        "ewma", "consecutive_timeouts", "samples", "breaker_open_until",
+        "pinned_timeouts",
+    )
 
     def __init__(self) -> None:
         self.ewma: float | None = None
@@ -467,6 +490,8 @@ class _PurposeStat:
         self.samples: int = 0
         #: ブレーカを開いている間の monotonic 期限 (0.0 = 閉じている)。
         self.breaker_open_until: float = 0.0
+        #: config 明示 (較正対象外) の purpose が timeout した累計回数。
+        self.pinned_timeouts: int = 0
 
     def observe_success(self, elapsed: float, *, alpha: float = 0.3) -> None:
         """成功レイテンシを EWMA に取り込む。"""
@@ -662,6 +687,36 @@ def _assist_before_sleep_callback(
     return _callback
 
 
+def assist_ready(client: "AssistModelClient | None", purpose: str = "") -> bool:
+    """アシストへ実際に呼出を投げてよいかを 1 行で判定する。
+
+    ``client is None`` (degraded mode) と residency 非常駐
+    (``assist_model.residency: on_demand`` のチャット中) を等価に扱う。
+    呼出元は従来の ``if assist_client is None: return <fallback>`` を
+    ``if not assist_ready(assist_client): return <fallback>`` に置き換えるだけで
+    両方に対応できる (docs/c_14 §6.1)。
+
+    ``is_available`` を持たないクライアント (``AssistModelClientProtocol`` を
+    独自実装する Pro 拡張、テストのスタブ) は **利用可** とみなす — 本ヘルパの
+    導入前と同じ挙動にし、Protocol の実装者へメソッド追加を強制しない。
+    """
+    if client is None:
+        return False
+    is_available = getattr(client, "is_available", None)
+    if is_available is None:
+        return True
+    result = is_available(purpose)
+    if isinstance(result, bool):
+        return result
+    # bool を返さない実装 (AsyncMock 等のテストダブル) は「利用可」に倒す。
+    # coroutine を作ってしまった場合は閉じて "never awaited" 警告を出さない。
+    close = getattr(result, "close", None)
+    if callable(close):
+        with contextlib.suppress(Exception):
+            close()
+    return True
+
+
 class AssistModelClient(BaseHTTPClient):
     """アシストモデル（ローカル llama-server :8081）クライアント
 
@@ -681,6 +736,10 @@ class AssistModelClient(BaseHTTPClient):
             config: config.yaml 全体の dict。assist_model セクションを参照する。
             debug_logger: DebugLogger インスタンス（任意）
         """
+        # residency ゲート (docs/c_14 §1.2)。``AssistResidencyManager.allows`` を
+        # ``set_residency_gate`` で注入する。None (未注入 = テスト / always 運用)
+        # では常に通す。
+        self._residency_gate: Callable[[str], bool] | None = None
         # health check の DEBUG を状態変化時のみに絞る (ポーリングでログが埋まるのを防ぐ)
         self._health_log_gate = HealthLogGate()
         self._debug_logger = debug_logger
@@ -745,6 +804,50 @@ class AssistModelClient(BaseHTTPClient):
             str(k): int(v) for k, v in raw_budgets.items()
         }
 
+        self._apply_model_config(config, assist_cfg, local_cfg)
+
+        logger.info(
+            "AssistModelClient initialized: url=%s, timeout=%.1fs, "
+            "concurrency(realtime=%d, background=%d, learning=%d), "
+            "estimated_params=%.1fB, response_format_enabled=%s",
+            self.url, self.timeout,
+            self._concurrency["realtime"],
+            self._concurrency["background"],
+            self._concurrency["learning"],
+            self._params_b,
+            self._response_format_enabled,
+        )
+
+    def rebind_model_config(self, config: dict) -> None:
+        """ロード済みモデルが変わったとき、モデル由来の設定だけ引き直す。
+
+        chat⇄create のモード切替で ``model_paths.assist_create_model`` へ
+        差し替えると、context_size / reasoning mode / sampling / params_b /
+        timeout 較正キーがすべて別モデルのものになる。**クライアントを作り直すと
+        注入済み参照が stale になる** (docs/c_14 §1.2) ため、同一オブジェクトの
+        上で引き直す。
+
+        セマフォ・HTTP クライアント・residency ゲートは触らない (接続と並列度は
+        モデルに依存しない)。
+        """
+        assist_cfg = config.get("assist_model", {})
+        local_cfg = assist_cfg.get("local", {})
+        self._apply_model_config(config, assist_cfg, local_cfg)
+        logger.info(
+            "AssistModelClient rebound to model=%s "
+            "(context_size=%d, estimated_params=%.1fB)",
+            self._assist_model_filename or "<unknown>",
+            self.context_size, self._params_b,
+        )
+
+    def _apply_model_config(
+        self, config: dict, assist_cfg: dict, local_cfg: dict,
+    ) -> None:
+        """ロード済みモデルに依存する設定を解決して属性へ書き込む。
+
+        ``__init__`` と ``rebind_model_config`` の共有実装。二重管理にすると
+        モデル切替時だけ片方が古いままになる (実際に mode 切替で踏んだ経路)。
+        """
         # purpose 別 timeout の反応的自己較正 (model-keyed)。アシストモデル名で
         # キー化した較正値を起動時にロードし、``generate()`` で timeout を観測する
         # 度に天井を引き上げて ``local/assist_calibration.json`` に永続化する。
@@ -858,18 +961,6 @@ class AssistModelClient(BaseHTTPClient):
             self._params_b = estimate_params_b(str(model_path))
             self._params_b_explicit = False
 
-        logger.info(
-            "AssistModelClient initialized: url=%s, timeout=%.1fs, "
-            "concurrency(realtime=%d, background=%d, learning=%d), "
-            "estimated_params=%.1fB, response_format_enabled=%s",
-            self.url, self.timeout,
-            self._concurrency["realtime"],
-            self._concurrency["background"],
-            self._concurrency["learning"],
-            self._params_b,
-            self._response_format_enabled,
-        )
-
     @property
     def params_b(self) -> float:
         """アシストモデルのパラメータ数推定値（B 単位）"""
@@ -956,6 +1047,25 @@ class AssistModelClient(BaseHTTPClient):
         """バックグラウンドスロット（自動割当）"""
         return -1
 
+    def set_residency_gate(self, gate: Callable[[str], bool] | None) -> None:
+        """residency ゲートを注入する (docs/c_14 §1.2)。
+
+        ``AssistResidencyManager.allows`` を渡す。``assist_model.residency:
+        on_demand`` ではアイドル窓と create モードの外で False を返し、
+        本クライアントは HTTP を一切投げずに ``AssistUnavailableError`` へ倒す。
+        """
+        self._residency_gate = gate
+
+    def is_available(self, purpose: str = "") -> bool:
+        """今このアシストへ呼出を投げてよいか。
+
+        呼出元はホットパス (チャット応答パス) でこれを事前チェックし、例外を
+        起こさずに既存の degraded フォールバックへ分岐してよい。未チェックの
+        呼出も ``generate()`` 側のゲートで安全に弾かれる (二重防御)。
+        """
+        gate = self._residency_gate
+        return True if gate is None else bool(gate(purpose))
+
     @property
     def in_flight_chat_count(self) -> int:
         """現在進行中のアシストモデル呼出数
@@ -1014,6 +1124,20 @@ class AssistModelClient(BaseHTTPClient):
             OpenAI 互換のレスポンス dict
             {"choices": [{"message": {"content": "..."}}]}
         """
+        # residency ゲート (docs/c_14 §1.2)。ペイロード構築より前に弾き、
+        # HTTP / リトライ / サーキットブレーカー / timeout 較正をすべて素通り
+        # させる。死んだポートへの 3 リトライでチャット応答が数秒待たされる
+        # 事故を防ぐのが主目的。
+        if not self.is_available(purpose):
+            logger.debug(
+                "Assist call refused: residency not ready (purpose=%s)",
+                purpose or "<unspecified>",
+            )
+            raise AssistUnavailableError(
+                f"Assist model is not resident (purpose={purpose or '<unspecified>'})",
+                purpose=purpose,
+            )
+
         if temperature is None:
             temperature = self._profile_sampling.get("temperature", 0.7)
         payload: dict = {
@@ -1508,10 +1632,44 @@ class AssistModelClient(BaseHTTPClient):
             # config で timeout を明示している purpose はユーザー権威なので
             # 較正 (天井の自動引き上げ) の対象外。ブレーカは待ち時間の削減で
             # あって予算の書き換えではないため、こちらは対象に含める。
-            if timed_out and purpose not in self._purpose_timeouts:
-                self._bump_calibrated_timeout(purpose, budget)
+            if timed_out:
+                if purpose not in self._purpose_timeouts:
+                    self._bump_calibrated_timeout(purpose, budget)
+                else:
+                    self._warn_pinned_timeout_too_low(purpose, stat, budget)
         except Exception:
             logger.debug("assist latency recording failed", exc_info=True)
+
+    def _warn_pinned_timeout_too_low(
+        self, purpose: str, stat: "_PurposeStat", budget: float,
+    ) -> None:
+        """config 明示の予算が実レイテンシに対して低すぎることを警告する。
+
+        config 値は書き換えない (ユーザー権威)。較正が効かない purpose では
+        黙って degraded に倒れ続けるので、推奨値を添えて気付けるようにする
+        (:data:`_PINNED_TIMEOUT_WARN_AFTER` 参照)。
+        """
+        stat.pinned_timeouts += 1
+        n = stat.pinned_timeouts
+        if n < _PINNED_TIMEOUT_WARN_AFTER:
+            return
+        if n > _PINNED_TIMEOUT_WARN_AFTER and (
+            (n - _PINNED_TIMEOUT_WARN_AFTER) % _PINNED_TIMEOUT_WARN_EVERY
+        ):
+            return
+        suggested = round(budget * _CALIB_BUMP_FACTOR, 1)
+        observed = (
+            f"{stat.ewma:.1f}s (EWMA of {stat.samples} successes)"
+            if stat.ewma is not None else "no successful call yet"
+        )
+        logger.warning(
+            "Assist purpose '%s' timed out %d time(s) at the budget pinned in "
+            "config (assist_model.timeouts.%s=%.1fs); auto-calibration is "
+            "disabled for config-pinned purposes, so this will not self-correct. "
+            "Successful latency: %s. Consider raising it to ~%.1fs or removing "
+            "the key to let calibration manage it.",
+            purpose, n, purpose, budget, observed, suggested,
+        )
 
     def _log_assist_failure(
         self, *, messages_count: int, purpose: str, priority: str,

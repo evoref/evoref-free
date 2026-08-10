@@ -161,6 +161,149 @@ def _response_leaks_internal_scaffold(response: str) -> bool:
 _response_has_broken_ja_spacing = has_broken_ja_spacing
 
 
+#: 発話時点の「いま」を指す語。これを含む問いへの答えは、その日にしか成立しない。
+_PRESENT_TIME_RE = re.compile(
+    r"今日|本日|昨日|明日|明後日|一昨日|今週|来週|先週|今月|来月|先月"
+    r"|今年|来年|去年|昨年|現在|只今|ただいま"
+    r"|(?<![A-Za-z])(?:today|tomorrow|yesterday|now|current)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+#: 具体的な日付・時刻・曜日のリテラル。年 4 桁を必須にして「5 月 3 日」のような
+#: 毎年成立する記述 (祝日等) を巻き込まない。
+_ABSOLUTE_DATETIME_RE = re.compile(
+    r"\d{4}\s*[-/年]\s*\d{1,2}\s*[-/月]\s*\d{1,2}"
+    r"|\d{1,2}\s*[:：]\s*\d{2}"
+    r"|[月火水木金土日]曜日",
+)
+
+#: ローカル環境の絶対パス。この機械の、その時点の状態を述べた応答の目印。
+_LOCAL_ABS_PATH_RE = re.compile(r"[A-Za-z]:\\|/(?:home|Users|mnt|opt|var)/")
+
+#: ユーザーの個人属性を **値まで断定している** 応答。
+#:
+#: 日付・ローカルパスと同じ「その時点でしか成立しない」類型だが、こちらは
+#: ユーザーが言い直した瞬間に古くなる。few-shot は数週間常駐するため、
+#: 個人属性を含む例は必ずいつか嘘の手本になる。
+#:
+#: 実インシデント (2026-08-09): プールに
+#: ``Q: 私の趣味は何でしたか？ / A: 小川博之さんの趣味は自転車と写真です。``
+#: (quality_score 0.9) が常駐しており、**同一の質問に対する手本として**古い値を
+#: 直接教えていた。SemMem 側で世代を畳んでも、手本が答えそのものを提示するので
+#: 勝てない (実機で 3 回連続して古い値を回答)。
+#:
+#: 属性名 + 助詞/コロン + 値、の形だけを採る。「趣味について説明します」の
+#: ような一般論は拾わない。
+_PERSONAL_ATTRIBUTE_ASSERTION_RE = re.compile(
+    r"(?:名前|氏名|趣味|誕生日|生年月日|好きな[^\s、。:：]{0,6}|ペット|飼っている)"
+    r"\s*(?:は|：|:)\s*[^\s、。:：]",
+)
+
+#: 個人属性の主張が「ユーザーのもの」であることを示す帰属語。一般的な説明文
+#: (「趣味は人によって違います」) を巻き込まないための第 2 条件。
+#:
+#: **一人称は入れない**。応答中の「私」はアシスタント自身を指すため、
+#: 「私の名前はAliceです。」のような自己紹介まで棄却してしまう (実データ 50 件で
+#: 検証した際に 3 件が誤検出になった)。アシスタントの名前は変わらないので
+#: 揮発性ではなく、手本として正当。
+_PERSONAL_ATTRIBUTION_RE = re.compile(
+    r"(?:あなた|ユーザー)(?:の|は|が)"
+    r"|さん(?:の|は|で)"
+    r"|個人情報",
+)
+
+#: 応答の途中で自分の結論を撤回する言い回し。1 つの応答に結論が 2 つ入る。
+#:
+#: 実インシデント (2026-08-07 ライブ監査):「2の10乗と10の3乗ではどちらが
+#: 大きいですか？」に対し「10の3乗の方が大きいです。… 失礼しました、正しくは
+#: 2の10乗（1,024）の方が大きいです。」と、誤った結論と訂正が同居した応答を
+#: 返した。算術自体は正しいので ``find_arithmetic_contradictions`` では捕まらない。
+#: 手本に載ると「まず外して後から直す」形が正解として再生産される。
+_SELF_RETRACTION_RE = re.compile(
+    r"(?:失礼しました|すみません|申し訳|訂正(?:します|いたします)|"
+    r"間違えました|誤りでした)[、。,\s]*(?:正しくは|訂正)"
+    r"|正しくは.{0,12}でした[。\s]*$",
+)
+
+
+def _find_volatile_reason(query: str, response: str) -> str | None:
+    """例が「その時点でしか成立しない」ものかを判定する (純粋関数)。
+
+    few-shot は数週間〜数か月プールに常駐するため、発話時点の日付やこの機械の
+    ファイル状態を述べた例は、翌日には **古い答えを手本として提示する** ものに
+    変わる。品質採点では分離できない — 採点時点では正しいので、実測で
+    quality_score 0.9 が付いていた (``_QUALITY_SYSTEM_PROMPT`` は「その場限りの
+    固有値だけを述べた回答」を低く評価するよう指示しているが、小型モデルは
+    従わない)。算術矛盾・語間空白と同じく決定論で拒否する。
+
+    実インシデント (2026-08-07 ライブ監査): 2 日前に採用された
+    ``Q: 今日は何月何日の何曜日ですか？ / A: 今日は2026年8月5日、水曜日です。``
+    が「3 年前の今日は何曜日でしたか？」の手本として提示され、
+    ``Q: README.md は何行で、何文字ありますか？ / A: 121 行あり、3353 文字です。``
+    が同ファイルの行数質問の手本として提示された。
+
+    Returns:
+        棄却理由。揮発性でなければ ``None``。
+    """
+    if _PRESENT_TIME_RE.search(query) and _ABSOLUTE_DATETIME_RE.search(response):
+        return "time-dependent answer (asserts a date/weekday valid only that day)"
+    if _LOCAL_ABS_PATH_RE.search(query) or _LOCAL_ABS_PATH_RE.search(response):
+        return "environment-dependent answer (describes local filesystem state)"
+    if (
+        _PERSONAL_ATTRIBUTE_ASSERTION_RE.search(response)
+        and _PERSONAL_ATTRIBUTION_RE.search(response)
+    ):
+        return "user-dependent answer (asserts the user's personal attributes)"
+    return None
+
+
+def find_content_rejection(query: str, response: str) -> str | None:
+    """few-shot 手本として不適な内容を決定論で判定する (純粋関数)。
+
+    採用経路は 2 つ (``add_from_experiences`` / ``accept_from_artifact``) あり、
+    さらに読込時の浄化 (``_from_payload``) も同じ判定を要る。片方にだけ置くと
+    もう一方が抜け道になる (2026-08-07 監査時点で ``accept_from_artifact`` は
+    全内容ゲートを迂回していた) ため、判定はここに集約して 3 箇所から呼ぶ。
+    ``TestArtifactPathSharesContentGates`` /
+    ``TestBrokenJaSpacingGate::test_load_applies_every_content_gate``
+    (:mod:`backend.free.learning.tests.test_fewshot_pool`) が経路ごとに固定する。
+
+    Returns:
+        棄却理由 (ログ用の英語 1 行)。採用可なら ``None``。
+    """
+    # 応答がタスク進捗ノート形式 (- [done] ... Written N bytes) のみの例は
+    # 「報告だけ出せば正解」バイアスを注入する (2026-07-15: この形式の例が
+    # 毎ターン選択され本文なしの極小ファイル生成を誘発した)。
+    if _response_is_task_log_only(response):
+        return "task-log-only response"
+    # 内部足場の語彙を含む応答は PROTECTED 違反の実例なので手本にしない
+    if _response_leaks_internal_scaffold(response):
+        return "leaks internal scaffold vocabulary"
+    # 日本語の語間に半角空白が紛れた応答は手本にしない。放置すると崩れた出力が
+    # 手本として再生産される自己増幅ループになる (_JA_INTERWORD_SPACE_RE 参照)。
+    if _response_has_broken_ja_spacing(response):
+        return "broken JA spacing"
+    # 質問を逐語で繰り返しただけの応答は「問いをそのまま返すのが正解」という
+    # バイアスを注入する (2026-08-04 ライブ監査: 同文 5 回で答えが出なくなった)。
+    if is_query_echo(response, query):
+        return "response only echoes the query"
+    # PROTECTED の出力形式が禁止している締め文。禁止条項だけでは消えず、違反
+    # 応答が fitness 最上位帯で手本に載って再生産されていた (2026-08-04)。
+    if has_boilerplate_closing(response):
+        return "boilerplate closing"
+    # 計算が合わない応答。fitness は「会話が正常終了したセッションに属するか」
+    # しか見ておらず内容の正しさを測らないため、誤答が最高位の正例として常駐
+    # していた (実データで 4 件確認)。小型モデルの採点では捕まらない。
+    contradictions = find_arithmetic_contradictions(response)
+    if contradictions:
+        return f"arithmetic contradiction: {contradictions[0]}"
+    # 途中で結論を撤回した応答は、正しい結論に辿り着いていても手本にしない
+    # (_SELF_RETRACTION_RE 参照)。
+    if _SELF_RETRACTION_RE.search(response):
+        return "response retracts its own conclusion mid-answer"
+    return _find_volatile_reason(query, response)
+
+
 #: few-shot 品質採点のシステムプロンプト。
 #:
 #: 問いは「正しいか」ではなく **「手本として提示したとき挙動が良くなるか」**。
@@ -408,7 +551,7 @@ class FewShotPool(JsonStateStore):
             return None
         rest = subject[len(LEARN_FEWSHOT_SUBJECT_PREFIX):]
         # rest は新形式 "<model>.<mode>.<id>" または レガシー "<mode>.<id>"。
-        # mode は {chat, coding} に限られるため先頭/2 番目セグメントで判別する。
+        # mode は {chat, create} に限られるため先頭/2 番目セグメントで判別する。
         segs = rest.split(".")
         if len(segs) >= 2 and is_valid_session_mode(segs[0]):
             mode_part, id_part = segs[0], ".".join(segs[1:])
@@ -737,58 +880,11 @@ class FewShotPool(JsonStateStore):
             if not query or not response:
                 continue
 
-            # 応答がタスク進捗ノート形式 (- [done] ... Written N bytes) のみの
-            # 例は「報告だけ出せば正解」バイアスを注入するため採用しない
-            # (2026-07-15: この形式の例が毎ターン選択され本文なしの極小
-            # ファイル生成を誘発した)。
-            if _response_is_task_log_only(response):
-                continue
-
-            # 内部足場の語彙を含む応答は PROTECTED 違反の実例なので手本にしない
-            if _response_leaks_internal_scaffold(response):
-                continue
-
-            # 日本語の語間に半角空白が紛れた応答は手本にしない。放置すると
-            # 崩れた出力が手本として再生産される自己増幅ループになる
-            # (_JA_INTERWORD_SPACE_RE 参照)。
-            if _response_has_broken_ja_spacing(response):
+            reject = find_content_rejection(query, response)
+            if reject is not None:
                 logger.info(
-                    "Rejecting fewshot candidate with broken JA spacing: "
-                    "query=%s", query[:50],
-                )
-                continue
-
-            # 質問を逐語で繰り返しただけの応答は手本にしない。手本に入ると
-            # 「問いをそのまま返すのが正解」というバイアスを注入し、記憶側の
-            # 再生産と合わさって繰り返し回数が増えていく (実インシデント
-            # 2026-08-04 ライブ監査: 同文 5 回で答えが出ない状態まで悪化)。
-            if is_query_echo(response, query):
-                logger.info(
-                    "Rejecting fewshot candidate that only echoes the query: "
-                    "query=%s", query[:50],
-                )
-                continue
-
-            # PROTECTED の出力形式が禁止している締め文を含む応答は手本にしない。
-            # 禁止条項だけでは消えず、違反応答が fitness 最上位帯で手本に載って
-            # 再生産されていた (実インシデント 2026-08-04 ライブ監査)。
-            if has_boilerplate_closing(response):
-                logger.info(
-                    "Rejecting fewshot candidate with boilerplate closing: "
-                    "query=%s", query[:50],
-                )
-                continue
-
-            # 計算が合わない応答は手本にしない。fitness は「会話が正常終了した
-            # セッションに属するか」しか見ておらず内容の正しさを測らないため、
-            # 誤答が最高位の正例として常駐していた (実データで 4 件確認)。
-            # アシスト採点では捕まらない (小型モデルは自分が検算できない算術を
-            # 「正確」と評価する) ので、ここは決定論で拒否する。
-            contradictions = find_arithmetic_contradictions(response)
-            if contradictions:
-                logger.info(
-                    "Rejecting fewshot candidate with arithmetic contradiction: "
-                    "%s | query=%s", contradictions[0], query[:50],
+                    "Rejecting fewshot candidate (%s): query=%s",
+                    reject, query[:50],
                 )
                 continue
 
@@ -825,7 +921,7 @@ class FewShotPool(JsonStateStore):
         *,
         query: str,
         response: str,
-        mode: str = "coding",
+        mode: str = "create",
         fitness: float,
         added_at: str = "",
     ) -> FewShotExample | None:
@@ -844,6 +940,15 @@ class FewShotPool(JsonStateStore):
         if not query or not response:
             return None
         if fitness < self.min_fitness:
+            return None
+        # 内容ゲートは経験経路と共有する。こちらだけ素通りにすると、同じ崩れが
+        # ラルフループ経由でプールに入る抜け道になる (2026-08-07 監査で発見)。
+        reject = find_content_rejection(query, response)
+        if reject is not None:
+            logger.info(
+                "Rejecting fewshot artifact candidate (%s): query=%s",
+                reject, query[:50],
+            )
             return None
 
         example = FewShotExample(
@@ -1151,7 +1256,7 @@ class FewShotPool(JsonStateStore):
         self._pools.clear()
         self._bigram_cache.clear()
         self._seen_hashes.clear()
-        dropped = 0
+        dropped: Counter[str] = Counter()
         for mode, entries in payload.items():
             pool: list[FewShotExample] = []
             seen = self._seen_hashes.setdefault(mode, set())
@@ -1160,20 +1265,24 @@ class FewShotPool(JsonStateStore):
                 ex = FewShotExample(**{
                     k: v for k, v in entry.items() if k in _EXAMPLE_FIELD_NAMES
                 })
-                # 採用ゲート追加前に混入した崩れた手本を読み込み時に落とす。
-                # 採用時のゲートだけでは既存プールが永久に汚染されたままになる
-                # (実測 2026-08-02: 25 件中 17 件が混入し、全ゲートを素通り
-                # していた)。件数を必ずログへ出す (黙って削らない)。
-                if _response_has_broken_ja_spacing(ex.response):
-                    dropped += 1
+                # 採用ゲート追加前に混入した手本を読み込み時に落とす。採用時の
+                # ゲートだけでは既存プールが永久に汚染されたままになる
+                # (実測 2026-08-02: 25 件中 17 件が語間空白の混入で、全ゲートを
+                # 素通りしていた。2026-08-07: 揮発性の日付・ファイル状態の例が
+                # quality_score 0.9 で常駐していた)。ゲートを増やしたら過去分も
+                # 自然に消えるよう、採用時と同じ判定を通す。件数と理由を必ず
+                # ログへ出す (黙って削らない)。
+                reject = find_content_rejection(ex.query, ex.response)
+                if reject is not None:
+                    dropped[reject.split(":")[0]] += 1
                     continue
                 pool.append(ex)
                 seen.add(self._content_hash(ex.query, ex.response))
             self._pools[mode] = pool
         if dropped:
             logger.warning(
-                "Dropped %d fewshot example(s) with broken JA spacing on load",
-                dropped,
+                "Dropped %d stale fewshot example(s) on load: %s",
+                sum(dropped.values()), dict(dropped),
             )
 
     def _on_save_success(self, path: Path) -> None:

@@ -8,7 +8,7 @@ subject prefix を ``harness.progress.`` → ``loop.progress.`` に移行済
 - predicate: ``reached``
 - type: ``progress_marker``
 - scope: ``project:<project_id>``
-- mode_origin: ``coding``
+- mode_origin: ``create``
 
 冪等性: 同一 ``task_id`` の progress_marker が既に存在する場合は
 ``occurrences`` を +1 して ``update_fact`` する。

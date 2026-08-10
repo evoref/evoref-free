@@ -1,6 +1,6 @@
 """エディタタブ名 (ファイル名) のアシスト導出ヘルパ
 
-コーディングモードで生成したコード/仕様書を Pro エディタへタブ表示する際、
+クリエイトモードで生成したコード/仕様書を Pro エディタへタブ表示する際、
 タブ名 (= ファイル名) が日本語にならないよう、生成内容から **ASCII snake_case
 の stem (拡張子なし)** をアシストモデルで導出する。long_form 経路
 (`api/chat/chat_streaming.py`) と meta_cognitive 経路
@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from backend.free.llm.assist_client import assist_ready
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -103,7 +104,7 @@ async def derive_editor_filename_stem(
         ASCII snake_case の stem。常に非空。拡張子は含まない。
     """
     fallback = _fallback_stem(language)
-    if assist_client is None:
+    if not assist_ready(assist_client, "editor_filename"):
         return fallback
     prompt = _PROMPT_TEMPLATE.format(
         language=language or "text",

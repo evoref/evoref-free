@@ -29,9 +29,9 @@ DEFAULT_HALF_LIFE_DAYS_BY_TAG: dict[str, float] = {
     "decision": 60,
     "commitment": 30,
     "project": 9999,
-    "coding": 60,
+    "create": 60,
     "task": 14,
-    "coding_task": 14,  # / D4: CodingExtractor 由来の task
+    "create_task": 14,  # / D4: CreateExtractor 由来の task
     "policy": 9999,
     "fewshot": 9999,    # policy subtype から独立
     "failure_pattern": 60,

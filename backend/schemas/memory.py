@@ -25,9 +25,9 @@ VALID_FACT_TYPES: frozenset[str] = frozenset(
         "learned_failure_pattern",  # PolicyAdjuster 由来 (Learn owned)
         "progress_marker",
         "task",
-        "coding_task",
+        "create_task",
         "artifact",
-        "coding",
+        "create",
         "model",
     }
 )
@@ -54,14 +54,14 @@ class FactsExtractionMaxPerSession(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     chat: int = Field(default=10, ge=0)
-    coding: int = Field(default=5, ge=0)
+    create: int = Field(default=5, ge=0)
 
 
 class FactsConfig(BaseModel):
     """ファクト抽出関連設定
 
     バイパス正規表現のみだったが、sleep-time
-    Step 8 (Chat/Coding/MDP Extractor) のスイッチと上限値を追加する。
+    Step 8 (Chat/Create/MDP Extractor) のスイッチと上限値を追加する。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -78,7 +78,7 @@ class FactsConfig(BaseModel):
     extraction_max_per_session: FactsExtractionMaxPerSession = Field(
         default_factory=FactsExtractionMaxPerSession,
     )
-    """セッションあたりの抽出上限 (chat=10 / coding=5)"""
+    """セッションあたりの抽出上限 (chat=10 / create=5)"""
 
     extraction_max_pinned_per_session: int = -1
     """pinned ノート由来の抽出上限。``-1`` で無制限"""
@@ -212,11 +212,11 @@ class InjectionTierRatios(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     chat: list[float] = Field(default_factory=lambda: [0.40, 0.35, 0.15, 0.10])
-    coding: list[float] = Field(default_factory=lambda: [0.40, 0.35, 0.15, 0.10])
+    create: list[float] = Field(default_factory=lambda: [0.40, 0.35, 0.15, 0.10])
 
     @model_validator(mode="after")
     def validate_lengths(self) -> "InjectionTierRatios":
-        for name, vec in (("chat", self.chat), ("coding", self.coding)):
+        for name, vec in (("chat", self.chat), ("create", self.create)):
             if len(vec) != 4:
                 raise ValueError(
                     f"injection.tier_ratios.{name} は 4 要素 (Tier 1〜4) "
@@ -229,7 +229,7 @@ class InjectionConfig(BaseModel):
     """MemoryInjector 設定
 
     EvorefMem 統合仕様 におけるモード別 Tier 注入器の設定
-    チャット 800 / コーディング 2000 トークンを既定予算とする。
+    チャット 800 / クリエイト 2000 トークンを既定予算とする。
 
     ``policy_activation_min_confidence`` は
     ``learning.policy.activation_min_confidence`` (LearningPolicyConfig) に
@@ -240,7 +240,7 @@ class InjectionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     chat_budget_tokens: int = Field(default=800, ge=0)
-    coding_budget_tokens: int = Field(default=2000, ge=0)
+    create_budget_tokens: int = Field(default=2000, ge=0)
     tier_ratios: InjectionTierRatios = Field(default_factory=InjectionTierRatios)
     relevance_enabled: bool = Field(
         default=True,
@@ -254,6 +254,17 @@ class InjectionConfig(BaseModel):
         description=(
             "関連度ゲートのコサイン類似度閾値。実測 (LFM2.5-Embedding-350M) で"
             "真陽性 0.38〜0.44 / ノイズ中央値 0.12〜0.17"
+        ),
+    )
+    pinned_relevance_min_score: float = Field(
+        default=0.10, ge=0.0, le=1.0,
+        description=(
+            "pinned ファクトに課す関連度の下限。pin は優先度の指定であって"
+            "「常に関連する」の宣言ではなく、しかも「覚えておいてください」等の"
+            "語で自動 pin されるため、0 (完全迂回) だと無関係なターンにも毎回"
+            "載り続ける。実測 2026-08-09: 0 → 0.10 で記憶不要ターンの注入が"
+            "297→81 token (約 2.2→0.6 秒) に減り、想起ターンは注入量・正答とも"
+            "無変化。0.35 で想起が壊れ始める"
         ),
     )
 
@@ -325,9 +336,9 @@ class SemMemLimitsConfig(BaseModel):
     decision: int = Field(default=5000, ge=0)
     commitment: int = Field(default=2000, ge=0)
     project: int = Field(default=10000, ge=0)
-    coding: int = Field(default=10000, ge=0)
+    create: int = Field(default=10000, ge=0)
     task: int = Field(default=5000, ge=0)
-    coding_task: int = Field(default=5000, ge=0)
+    create_task: int = Field(default=5000, ge=0)
     policy: int = Field(default=5000, ge=0)
     fewshot: int = Field(default=2000, ge=0)  # policy subtype から独立
     failure_pattern: int = Field(default=2000, ge=0)
@@ -402,6 +413,17 @@ class MemoryConfig(BaseModel):
     # 全体走査質問には切り詰め注記が付く (chat_service._append_truncated_history_note)。
     working_max_turns: int = Field(default=30, ge=1)
     working_max_tokens: int = Field(default=2048, ge=256)
+    # 上限に達したときに **まとめて** 押し出すターン数 (ヒステリシス)。
+    # 1 ターンずつ削ると窓の先頭が毎ターン動き、llama-server の接頭辞 KV
+    # キャッシュが system プロンプト以降まるごと無効化される。実測
+    # (2026-08-09 ライブ監査、base=gemma-4-12b / 8192 ctx): prompt eval が
+    # 2,898 トークンで 27.7 秒かかる一方 decode は 54 トークンで 7.1 秒
+    # (7.6 tok/s = iGPU の正常値)。LCP 類似度 f_sim_best は毎ターン 0.35 前後で、
+    # 連続プロンプトの共通接頭辞は常に system プロンプト長ちょうどだった。
+    # 8〜14 トークンの短い応答でも 28〜40 秒かかる原因。
+    # 1 で従来どおり (1 件ずつ)。既定 6 で押し出し回数が約 1/3 になり、
+    # 保持ターン数の平均は max_turns の約 90% を維持する。
+    working_evict_block: int = Field(default=6, ge=1)
     # 過去履歴の最低確保トークン数 (床)。動的ブロック (few-shot/file/semmem/RAG) の
     # 配分前に予約し、予算圧迫時でも直近の会話文脈が丸ごと締め出されるのを防ぐ。
     # 実履歴量・残予算・working_max_tokens でキャップされ、履歴が現在の質問のみの

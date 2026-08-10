@@ -39,7 +39,7 @@ export interface ChatMessage {
 	agentic_steps?: AgenticStep[];
 	step_results?: StepResult[];
 	rag_debug?: RagDebugInfo;
-	/** コーディングモードでの生成コード出力先 ('editor' 既定 / 'chat' 明示指示時) */
+	/** クリエイトモードでの生成コード出力先 ('editor' 既定 / 'chat' 明示指示時) */
 	editor_route?: 'editor' | 'chat';
 	/** long_form 生成の進捗 (ユニット i/total)。生成中のみセットされ常時表示される */
 	long_form_progress?: LongFormProgress;
@@ -54,13 +54,13 @@ export interface ChatMessage {
 /** モード別メッセージバッファ */
 const modeMessages: Record<string, ChatMessage[]> = {
 	chat: [],
-	coding: []
+	create: []
 };
 
 /** モード別セッションID */
 const modeSessions: Record<string, string> = {
 	chat: crypto.randomUUID(),
-	coding: crypto.randomUUID()
+	create: crypto.randomUUID()
 };
 
 /** メッセージ配列 */
@@ -242,7 +242,7 @@ export async function switchMode(newMode: string): Promise<void> {
 		// ユーザーがメッセージを送れてしまう。await 前にスナップショットを
 		// 取ると、待機中に追加されたターンが下の messages.set で消えたまま
 		// バックアップにも残らず永久に失われる
-		// (実インシデント 2026-07-27 ライブ検証: コーディングへ切替直後に
+		// (実インシデント 2026-07-27 ライブ検証: クリエイトへ切替直後に
 		//  送信したメッセージが自分の吹き出しごと消え、応答も破棄された)。
 		modeMessages[current] = get(messages);
 

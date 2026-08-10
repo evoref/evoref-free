@@ -47,7 +47,7 @@ class MemFactView(FactViewBase):
 
     Mem 所有 FactType (``personal_fact`` / ``world_fact`` / ``preference`` /
     ``emotion`` / ``opinion`` / ``belief`` / ``decision`` / ``commitment`` /
-    ``project`` / ``coding`` / ``coding_task`` / ``model``) に対しフルアクセスを
+    ``project`` / ``create`` / ``create_task`` / ``model``) に対しフルアクセスを
     提供する。
 
     Attributes:

@@ -135,8 +135,8 @@
 					appendToLastAssistant(`\n\n**Error:** ${event.error}`);
 				}
 			}
-			// コーディングモードでエディタへコードを出力したターンの完了通知
-			if (!cancelled && get(currentMode) === 'coding' && sawEditorCode) {
+			// クリエイトモードでエディタへコードを出力したターンの完了通知
+			if (!cancelled && get(currentMode) === 'create' && sawEditorCode) {
 				addStepResultToLastAssistant($t('chat.code_output_done'), 'done');
 			}
 		} catch (e) {

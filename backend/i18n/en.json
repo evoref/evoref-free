@@ -16,7 +16,7 @@
     "learning_cycle_running": "Learning cycle already running",
     "learning_llm_unavailable": "LLM client not available",
     "optimize_invalid_level": "level must be 'level1' or 'level2'",
-    "optimize_invalid_mode": "mode must be 'coding' or 'chat'",
+    "optimize_invalid_mode": "mode must be 'create' or 'chat'",
     "optimize_scheduler_not_initialized": "Learning scheduler not initialized",
     "optimize_already_running": "Optimization already running",
     "optimize_llm_unavailable": "LLM client not available",
@@ -197,7 +197,7 @@
     "edition_develop_unavailable": "--edition develop was specified, but Develop module is not found. Develop cannot be selected from Free/Pro source.",
     "edition_requires_develop": "--edition option is only available in --develop mode.",
     "isolate_data_requires_develop": "--isolate-data option requires --develop.",
-    "mode_coding_pro_only_warning": "--mode coding is Pro-only. Falling back to chat mode in Free.",
+    "mode_create_pro_only_warning": "--mode create is Pro-only. Falling back to chat mode in Free.",
     "mode_default_resolved": "Mode: {mode} (edition default)",
     "develop_banner": "DEVELOP MODE ON [{level}] — develop logging enabled",
     "learning_disabled_banner": "Self-learning disabled (--no-learning) — Level 0/1/2 and Pro assist injection are no-op; SemMem reads continue.",
@@ -412,6 +412,7 @@
     "terminal_exec_empty_command": "terminal_exec: command is empty",
     "tasks_all_done": "Completed all {count} tasks.",
     "task_done": "Task completed.",
+    "files_written": "Wrote {paths}.",
     "tasks_partially_done": "Completed {done} task(s); {failed} failed.",
     "tasks_all_failed": "Task execution failed."
   },
@@ -431,7 +432,8 @@
       "invalid_response": "Received invalid response from inference server.",
       "model_not_found": "Model file not found: {path}",
       "process_crashed": "Inference server crashed. Attempting restart.",
-      "request_rejected": "Embedding server rejected the request: {detail}. You may need to raise embedding.context_size."
+      "request_rejected": "Embedding server rejected the request: {detail}. You may need to raise embedding.context_size.",
+      "assist_unavailable": "The assist model is currently stopped (it does not run during chat). This work runs in the next idle window."
     },
     "fs": {
       "index_corrupted": "Vector index corrupted. Attempting recovery.",

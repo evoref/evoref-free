@@ -8,7 +8,7 @@ subject prefix を ``harness.artifact.`` → ``loop.artifact.`` に移行済
 - predicate: ``produced``
 - type: ``artifact``
 - scope: ``project:<project_id>``
-- mode_origin: ``coding``
+- mode_origin: ``create``
 
 冪等性: 同一 ``diff_sha1`` + 同一 subject の artifact が既に存在する場合は
 スキップする。

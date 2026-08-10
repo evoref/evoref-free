@@ -9,7 +9,7 @@ EvorefMem 統合仕様 で追加される `local/state.json` を扱う
     {
       "schema_version": 1,
       "current_project_id": "git_abc123def456",
-      "mode": "coding",
+      "mode": "create",
       "project_aliases": {
         "https://github.com/owner/repo": "git_abc123def456"
       },
@@ -51,7 +51,7 @@ SCHEMA_VERSION = 1
 DEFAULT_MODE: "MemoryMode" = "chat"
 DEFAULT_INACTIVE_DAYS = 180
 
-MemoryMode = Literal["chat", "coding"]
+MemoryMode = Literal["chat", "create"]
 
 
 @dataclass

@@ -356,7 +356,7 @@ def strip_leading_path_comment(content: str) -> str:
     → ``import pygame\\n...`` に修正する。
 
     ドライブレター付きパス（C:\\, E:\\ 等）のみを対象とし、
-    通常のコメント行（# -*- coding: utf-8 -*- 等）は除去しない。
+    通常のコメント行（# -*- create: utf-8 -*- 等）は除去しない。
     """
     lines = content.split("\n", 1)
     if len(lines) < 2:
@@ -865,6 +865,46 @@ _WRITE_REPORT_LABEL_RE = re.compile(
 )
 
 
+#: 成果物そのものではなく「そのファイルを書くスクリプト」を返したときに現れる
+#: 書込み命令 (実インシデント 2026-08-10 ライブ監査: member_schema.json に
+#: ``$schema = @'…'@`` と ``$schema | Out-File -FilePath "E:\\tmp\\member_schema.json"``
+#: が丸ごと書き込まれた。looks_like_tool_call_syntax と同じ
+#: 「モデルが本文を作らず実行しようとした」退化だが、シェル構文で現れる)。
+_WRITE_SCRIPT_RE = re.compile(
+    r"Out-File|Set-Content|Add-Content|Export-Csv"
+    r"|writeFileSync|WriteAllText|FileWriter"
+    r"|open\s*\([^)]*['\"][wa]b?['\"]",
+    re.IGNORECASE,
+)
+
+#: PowerShell の here-string 代入。成果物が .ps1 等のスクリプトなら正当なので、
+#: 対象がスクリプトファイルのときは見ない。
+_HERE_STRING_ASSIGN_RE = re.compile(r"^\s*\$\w+\s*=\s*@['\"]", re.MULTILINE)
+
+#: 中身がスクリプトであることが期待される拡張子。
+_SCRIPT_SUFFIXES: tuple[str, ...] = (
+    ".ps1", ".psm1", ".sh", ".bash", ".bat", ".cmd", ".py", ".js", ".ts",
+)
+
+
+def looks_like_write_script(content: str, file_path: str) -> bool:
+    """content が成果物ではなく「そのファイルを書くスクリプト」かを判定する。
+
+    対象がスクリプトファイル自体の場合は、書込み命令もヒアストリングも正当な
+    中身になりうるので判定しない。
+    """
+    if not content or not file_path:
+        return False
+    lowered_path = file_path.lower()
+    if lowered_path.endswith(_SCRIPT_SUFFIXES):
+        return False
+    if _HERE_STRING_ASSIGN_RE.search(content):
+        return True
+    basename = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+    mentions_target = file_path in content or (bool(basename) and basename in content)
+    return bool(mentions_target and _WRITE_SCRIPT_RE.search(content))
+
+
 def looks_like_write_report(content: str, file_path: str) -> bool:
     """content が「書き込みました」という完了報告かを判定する。
 
@@ -976,9 +1016,19 @@ def rescue_quoted_write_literal(instruction: str, file_path: str) -> str:
 
 
 #: 「この案内文を保存して」のように直前の成果物を指す参照表現。
+#:
+#: 成果物の名詞は **散文以外も** 並べる。コード・スクリプト・定義・計算過程が
+#: 抜けていたため「そのテストコードを保存して」で決定論経路が発火せず、LLM の
+#: 再生成に回って `E:\tmp\test_mttr.py にテストコードを保存しました。` という
+#: 完了報告を本文として出し、2 回とも棄却されて書込み自体が失敗した
+#: (実インシデント 2026-08-10 ライブ監査)。直前の応答をそのまま書けばよい
+#: ケースを生成に回さないのが最も確実。
 _PREVIOUS_ANSWER_REF_RE = re.compile(
-    r"(?:この|その|上記の?|先ほどの?|さっきの?|いまの|今の)\s*"
-    r"(?:案内文?|文章|文面|本文|内容|議事録|メモ|原稿|下書き|回答|答え|結果|一覧|リスト|表)"
+    r"(?:この|その|上記の?|先(?:ほど|程)の?|さっきの?|いまの|今の|先の|提示した)\s*"
+    r"(?:案内文?|文章|文面|本文|内容|議事録|メモ|原稿|下書き|回答|答え|結果"
+    r"|一覧|リスト|表"
+    r"|コード|スクリプト|プログラム|関数|クラス|テスト|クエリ|設定|定義"
+    r"|設計|手順|計算過程|計算|説明|要点)"
 )
 #: 直前の成果物に手を加える依頼 (そのまま書き写してはいけない)。
 _TRANSFORM_VERB_RE = re.compile(
@@ -1013,6 +1063,51 @@ def _strip_lead_in(text: str) -> str:
     return text
 
 
+#: 応答全体がひとつのコードフェンスで囲まれている形。
+#:
+#: ``strip_markdown_wrapper`` は「最長のフェンス内」を取り出すため、散文と
+#: コードが混在する成果物 (.md 等) では地の文を落としてしまう。決定論経路は
+#: 直前の応答を **そのまま** 使うのが原則なので、外してよいのは「応答が
+#: コードブロックそのもの」のときだけに限る (実インシデント 2026-08-10
+#: ライブ監査: 「そのコードを .py に保存して」で ```python 行ごと書き込まれた)。
+_SOLE_CODE_FENCE_RE = re.compile(r"\A```[\w+-]*\s*\n(.*?)\n?```\s*\Z", re.DOTALL)
+
+
+def unwrap_sole_code_fence(text: str) -> str:
+    """全体が 1 つのコードフェンスなら中身だけ返す (純粋関数)。"""
+    m = _SOLE_CODE_FENCE_RE.match(text.strip())
+    return m.group(1).strip() if m else text
+
+
+#: 参照名詞が指す成果物の「見た目」。参照が種別を名指ししているのに直近の応答が
+#: 別種別なら、1 つ飛ばして探す。
+#:
+#: 実インシデント 2026-08-10 ライブ監査: 表を出した次のターンで「その表は
+#: どんな情報を持っていますか」と聞き、その次に「その表を保存して」と頼んだら、
+#: **直前の 1 文 (41 文字の説明)** が保存された。参照は「表」と種別を明示して
+#: いるのに、候補の中身と突き合わせていなかった。
+_ARTIFACT_SHAPES: tuple[tuple[re.Pattern, re.Pattern], ...] = (
+    # 表・リスト: GFM の行かタブ区切りの多列行
+    (
+        re.compile(r"表|テーブル|リスト|一覧"),
+        re.compile(r"^\s*\|.*\|\s*$|^[^\t\n]+\t[^\t\n]+", re.MULTILINE),
+    ),
+    # コード類
+    (
+        re.compile(r"コード|スクリプト|プログラム|関数|クラス|テスト|クエリ"),
+        re.compile(r"^\s*(?:def |class |import |from |SELECT |CREATE )", re.MULTILINE),
+    ),
+)
+
+
+def _artifact_shape_for(query: str) -> "re.Pattern | None":
+    """参照名詞から、候補が満たすべき見た目を返す (純粋関数)。"""
+    for noun_re, shape_re in _ARTIFACT_SHAPES:
+        if noun_re.search(query):
+            return shape_re
+    return None
+
+
 def previous_answer_write_content(
     query: str, conversation: list[dict] | None,
 ) -> str:
@@ -1033,17 +1128,49 @@ def previous_answer_write_content(
         return ""
     if _TRANSFORM_VERB_RE.search(query):
         return ""
+    candidates: list[str] = []
     for msg in reversed(conversation):
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
         content = msg.get("content")
         if not isinstance(content, str):
             continue
-        text = _strip_lead_in(content.strip())
+        text = unwrap_sole_code_fence(_strip_lead_in(content.strip()))
         if len(text) >= _PREVIOUS_ANSWER_MIN_CHARS:
-            return text
+            candidates.append(text)
         # 直前が短い定型応答 (「タスクを完了しました。」等) ならさらに遡る
-    return ""
+    if not candidates:
+        return ""
+    # 参照が種別を名指ししている (「その**表**を保存して」) なら、その見た目を
+    # 持つ最も新しい応答を選ぶ。名指しが無い / 該当が無ければ従来どおり直近。
+    shape = _artifact_shape_for(query)
+    if shape is not None:
+        for text in candidates:
+            if shape.search(text):
+                return text
+    return candidates[0]
+
+
+#: ベースモデルが本文の代わりに吐くツールコール構文。チャットテンプレートや
+#: 学習データ由来の特殊トークンで、本文として書き込む価値は無い。
+#:
+#: 実インシデント 2026-08-09 (2 回目のライブ監査): 上書き依頼に対し base が
+#: ``<|tool_call>call:write_file{file_path: "E:\tmp\club_plan.txt"}<tool_call|>``
+#: を生成し、それが **チャット本文としてユーザーに露出** した。write_file は
+#: 一度も走らずファイルは無変更だったが、UI には ✓ が付いた。
+#: 形式はモデルごとに違うので、代表的な囲みと ``call:<tool>{`` 形を広めに拾う。
+_TOOL_CALL_SYNTAX_RE = re.compile(
+    r"<\|?\s*tool_call|tool_call\s*\|?>"
+    r"|<\|?\s*(?:function|tool)_?(?:call|response)\s*\|?>"
+    r"|\bcall\s*:\s*\w+\s*\{"
+    r"|<\|(?:im_start|im_end|assistant|channel)\|>",
+    re.IGNORECASE,
+)
+
+
+def looks_like_tool_call_syntax(content: str) -> bool:
+    """content がツールコール構文/特殊トークンの吐き出しかを判定する (純粋関数)。"""
+    return bool(_TOOL_CALL_SYNTAX_RE.search(content))
 
 
 def looks_like_prompt_echo(content: str) -> bool:
@@ -1126,6 +1253,22 @@ _REFUSAL_MARKERS: tuple[str, ...] = (
 )
 
 
+#: 日本語の断り書きは言い回しの幅が広く、逐語マーカーでは取りこぼす。謝辞と
+#: 不能表現の **共起** で見る (実インシデント 2026-08-10 ライブ監査:
+#: 「申し訳ありませんが、私はお客様のローカル環境にあるファイルシステム
+#: （E:\\tmp\\ など）に直接ファイルを書き込む権限を持っていません。」が
+#: _REFUSAL_MARKERS の「ファイルシステムに直接アクセス」に一致せず、
+#: この断り書き自体が JSON Schema の代わりにファイルへ書き込まれ、UI は
+#: ✓「書き込みました」と成功表示した)。
+_JA_APOLOGY_RE = re.compile(r"申し訳(?:あり|ござい)ませ|恐れ入りますが|残念ながら")
+_JA_INABILITY_RE = re.compile(
+    r"権限[^。]{0,12}ませ"
+    r"|(?:こと|の)は?できませ"
+    r"|できかねま|いたしかねま"
+    r"|アクセス(?:でき|は?できま)せ",
+)
+
+
 def looks_like_refusal_or_missing_info(content: str) -> bool:
     """content が本文ではなく、モデル自身の断り書き/情報不足の説明かを判定する。
 
@@ -1135,7 +1278,9 @@ def looks_like_refusal_or_missing_info(content: str) -> bool:
     if len(content) > 500:
         return False
     lowered = content.lower()
-    return any(marker in lowered for marker in _REFUSAL_MARKERS)
+    if any(marker in lowered for marker in _REFUSAL_MARKERS):
+        return True
+    return bool(_JA_APOLOGY_RE.search(content) and _JA_INABILITY_RE.search(content))
 
 
 def looks_like_instruction_echo(content: str, instruction: str) -> bool:
@@ -1269,6 +1414,13 @@ def generated_content_rejection(
         return "write_report_echo"
     if looks_like_task_restatement(content, file_path):
         return "task_restatement"
+    # ツールコール構文はプロンプトエコーより先に見る。両方成立しうるが、
+    # 「モデルがツールを呼ぼうとして本文を作らなかった」の方が具体的で、
+    # 再生成の判断材料として正確 (2026-08-09 ライブ監査)。
+    if looks_like_tool_call_syntax(content):
+        return "tool_call_syntax"
+    if looks_like_write_script(content, file_path):
+        return "write_script"
     if looks_like_prompt_echo(content):
         return "prompt_echo"
     if looks_like_instruction_echo(content, instruction):
@@ -1288,7 +1440,7 @@ _CODE_INDICATORS: tuple[str, ...] = (
     "import ", "from ", "def ", "class ", "function ",
     "const ", "let ", "var ", "return ", "if __name__",
     "#include", "package ", "public class",
-    "#!/", "# -*- coding",
+    "#!/", "# -*- create",
     "pygame", "print(", "console.log",
 )
 

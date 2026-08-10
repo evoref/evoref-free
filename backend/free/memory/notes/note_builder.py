@@ -11,8 +11,8 @@
   is_code_block / extraction_skipped) を含む dict を返す。
 - :class:`ChatNoteBuilder` — チャットモード用レンズ。``personal_fact`` /
   ``world_fact`` / ``preference`` / ``emotion`` / ``opinion`` の候補抽出を行う。
-- :class:`CodingNoteBuilder` — コーディングモード用レンズ。``project`` /
-  ``decision`` / ``commitment`` / ``task`` / ``coding`` の候補抽出を行う。
+- :class:`CreateNoteBuilder` — クリエイトモード用レンズ。``project`` /
+  ``decision`` / ``commitment`` / ``task`` / ``create`` の候補抽出を行う。
   コードブロックは完全スキップ、ツール出力は extraction_skipped を立てる。
 
 候補ファクトタグは sleep-time Step 8 の Extractor がこのノートを
@@ -31,7 +31,7 @@ from uuid import uuid4
 
 import yaml
 
-from backend.free.core.session_mode import is_coding_mode
+from backend.free.core.session_mode import is_create_mode
 from backend.free.memory.types import MemoryMode, NoteSource
 from backend.log_config import get_logger
 
@@ -72,7 +72,7 @@ FactTriggerMap = dict[str, dict[str, tuple[str, ...]]]
 #: 同梱 default で期待される fact_type 集合 (mode 別)
 _EXPECTED_TAGS: dict[MemoryMode, tuple[str, ...]] = {
     "chat": ("personal_fact", "world_fact", "preference", "emotion", "opinion"),
-    "coding": ("project", "decision", "commitment", "task", "coding"),
+    "create": ("project", "decision", "commitment", "task", "create"),
 }
 
 _TRIGGERS_LOCK = threading.Lock()
@@ -93,11 +93,11 @@ def set_default_triggers_dir(triggers_dir: str | Path | None) -> None:
     app_factory 起動時に ``PathResolver.resolve_local("triggers_dir")`` の
     値を渡す想定。テスト / 再設定のため何度呼んでも安全。
     """
-    global _DEFAULT_TRIGGERS_DIR, _CHAT_BUILDER, _CODING_BUILDER
+    global _DEFAULT_TRIGGERS_DIR, _CHAT_BUILDER, _CREATE_BUILDER
     _DEFAULT_TRIGGERS_DIR = triggers_dir
     # Singleton を再構築してキャッシュを無効化 (新しい default を読ませる)。
     _CHAT_BUILDER = ChatNoteBuilder()
-    _CODING_BUILDER = CodingNoteBuilder()
+    _CREATE_BUILDER = CreateNoteBuilder()
 
 
 def get_default_triggers_dir() -> str | Path | None:
@@ -137,7 +137,7 @@ def load_fact_triggers(path: str | Path) -> FactTriggerMap:
     「候補判定無効」相当として扱える (例外を投げない)。
     """
     p = Path(path)
-    result: FactTriggerMap = {"chat": {}, "coding": {}}
+    result: FactTriggerMap = {"chat": {}, "create": {}}
     if not p.exists():
         logger.warning("fact_triggers file not found: %s — candidates disabled", p)
         return result
@@ -150,7 +150,7 @@ def load_fact_triggers(path: str | Path) -> FactTriggerMap:
         logger.warning("fact_triggers root is not mapping: %s", p)
         return result
 
-    for mode_key in ("chat", "coding"):
+    for mode_key in ("chat", "create"):
         section = raw.get(mode_key) or {}
         if not isinstance(section, dict):
             continue
@@ -164,9 +164,9 @@ def load_fact_triggers(path: str | Path) -> FactTriggerMap:
         result[mode_key] = mapping
 
     logger.info(
-        "fact_triggers loaded: chat=%d tags / coding=%d tags (from %s)",
+        "fact_triggers loaded: chat=%d tags / create=%d tags (from %s)",
         len(result["chat"]),
-        len(result["coding"]),
+        len(result["create"]),
         p,
     )
     return result
@@ -205,7 +205,7 @@ def load_fact_attributes(path: str | Path) -> FactAttributeMap:
     従来どおり ``"user"`` へフォールバックする)。例外は投げない。
     """
     p = Path(path)
-    result: FactAttributeMap = {"chat": {}, "coding": {}}
+    result: FactAttributeMap = {"chat": {}, "create": {}}
     if not p.exists():
         logger.warning(
             "fact_attributes file not found: %s — attribute subjects disabled", p,
@@ -220,7 +220,7 @@ def load_fact_attributes(path: str | Path) -> FactAttributeMap:
         logger.warning("fact_attributes root is not mapping: %s", p)
         return result
 
-    for mode_key in ("chat", "coding"):
+    for mode_key in ("chat", "create"):
         section = raw.get(mode_key) or {}
         if not isinstance(section, dict):
             continue
@@ -240,8 +240,8 @@ def load_fact_attributes(path: str | Path) -> FactAttributeMap:
         result[mode_key] = per_type
 
     logger.info(
-        "fact_attributes loaded: chat=%d types / coding=%d types (from %s)",
-        len(result["chat"]), len(result["coding"]), p,
+        "fact_attributes loaded: chat=%d types / create=%d types (from %s)",
+        len(result["chat"]), len(result["create"]), p,
     )
     return result
 
@@ -334,7 +334,7 @@ class NoteBuilder:
 
     # 自動タグ: キーワードからルールベースで付与（汎用）
     TAG_RULES: dict[str, list[str]] = {
-        "coding": ["python", "code", "バグ", "実装", "関数", "class", "def", "import"],
+        "create": ["python", "code", "バグ", "実装", "関数", "class", "def", "import"],
         "model": ["gguf", "llama", "qwen", "lora", "モデル", "推論"],
         "preference": ["好き", "嫌い", "いつも", "よく使う", "お気に入り"],
         "fact": ["です", "である", "とは", "定義"],
@@ -365,7 +365,7 @@ class NoteBuilder:
             role: 発言者ロール (``user`` / ``assistant``)
             source: 発生源 (``NoteSource``)。``None`` の場合は ``role`` から推測
             mode: モード。``None`` の場合はビルダの ``self.mode`` を使う
-            project_id: コーディングモード時のプロジェクト ID
+            project_id: クリエイトモード時のプロジェクト ID
             is_tool_output: ツール出力か。``True`` の場合 STM 以降は除外される
 
         Returns:
@@ -490,7 +490,7 @@ class NoteBuilder:
     def _detect_code_block(cls, content: str) -> bool:
         """markdown フェンス (``` ... ```) を含むかを判定。
 
-        コーディングモードで生成された markdown 応答にフェンスが含まれると、
+        クリエイトモードで生成された markdown 応答にフェンスが含まれると、
         コード片はファクト抽出対象から外したいので、ここで早期検出する。
         部分一致でも True を返す (フェンス開閉が片方のみでも保守的に skip)。
         """
@@ -503,7 +503,7 @@ class NoteBuilder:
         """モード別の候補ファクトタイプを返す。
 
         基底クラスは何も返さない。``ChatNoteBuilder`` /
-        ``CodingNoteBuilder`` でオーバーライドする。
+        ``CreateNoteBuilder`` でオーバーライドする。
         """
         return []
 
@@ -586,23 +586,23 @@ class ChatNoteBuilder(_ModeAwareNoteBuilder):
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# CodingNoteBuilder
+# CreateNoteBuilder
 # ──────────────────────────────────────────────────────────────────────────
 
 
-class CodingNoteBuilder(_ModeAwareNoteBuilder):
-    """コーディングモード用 NoteBuilder。
+class CreateNoteBuilder(_ModeAwareNoteBuilder):
+    """クリエイトモード用 NoteBuilder。
 
     目的達成重視のレンズ — プロジェクトルール・判断・約束・タスク・コード関連
     知識を捕捉する。コードブロック (``` フェンス) は完全スキップ、ツール出力は
     extraction_skipped を立てる (基底クラスの ``build()`` 内で処理)。
 
     候補ファクトタイプ: ``project`` / ``decision`` / ``commitment`` /
-    ``task`` / ``coding``。実際のトリガ語は
+    ``task`` / ``create``。実際のトリガ語は
     ``backend/free/memory/_defaults/triggers/fact_triggers.yaml`` を参照。
     """
 
-    mode: MemoryMode = "coding"
+    mode: MemoryMode = "create"
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -611,7 +611,7 @@ class CodingNoteBuilder(_ModeAwareNoteBuilder):
 
 
 _CHAT_BUILDER = ChatNoteBuilder()
-_CODING_BUILDER = CodingNoteBuilder()
+_CREATE_BUILDER = CreateNoteBuilder()
 
 
 def get_note_builder(mode: MemoryMode) -> NoteBuilder:
@@ -619,9 +619,9 @@ def get_note_builder(mode: MemoryMode) -> NoteBuilder:
 
     builder インスタンスはステートレスなので使い回して問題ない。
     ``fact_triggers.yaml`` の user override を使いたい場合は、
-    ``ChatNoteBuilder(triggers_dir=...)`` / ``CodingNoteBuilder(triggers_dir=...)``
+    ``ChatNoteBuilder(triggers_dir=...)`` / ``CreateNoteBuilder(triggers_dir=...)``
     を直接構築すること (通常は extractor / STM 側から注入される)。
     """
-    if is_coding_mode(mode):
-        return _CODING_BUILDER
+    if is_create_mode(mode):
+        return _CREATE_BUILDER
     return _CHAT_BUILDER

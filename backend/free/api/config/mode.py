@@ -16,6 +16,7 @@ from backend.config import (
     get_path_resolver,
     get_project_root,
 )
+from backend.free.core.session_mode import is_create_mode
 from backend.log_config import get_logger
 
 logger = get_logger("api.mode")
@@ -24,7 +25,7 @@ router = APIRouter(prefix="/api/mode", tags=["mode"])
 
 
 class ModeSwitchRequest(BaseModel):
-    mode: str = Field(..., pattern=r"^(chat|coding)$")
+    mode: str = Field(..., pattern=r"^(chat|create)$")
 
 
 class ModeSwitchResponse(BaseModel):
@@ -83,7 +84,7 @@ async def switch_mode(
 
     旧モードと新モードのモデルパスを比較し、
     異なる場合は model_changed=True を返す。アシストモデルも
-    ``model_paths.assist_coding_model`` が設定されていれば同様に比較し、
+    ``model_paths.assist_create_model`` が設定されていれば同様に比較し、
     base と同一リクエスト内で並列に再起動する。
     """
     import asyncio
@@ -126,6 +127,31 @@ async def switch_mode(
     assist_restart_initiated = False
     message = f"switched from {old_mode} to {new_mode}"
 
+    # アシストの常駐 (docs/c_14 §1.2)。``residency: on_demand`` では chat の間
+    # アシストは停止しているので、create へ入る時点で起動して create の間ずっと
+    # 常駐させる (1 ターン目からモデルロード待ちを出さない)。chat へ戻る時に解放。
+    # ``assist_create_model`` が設定されていれば下の ``_restart_assist_server`` が
+    # model_override 付きで起こすので、ここでは二重に spawn しない。
+    residency = getattr(state, "assist_residency", None)
+    # アシストを再起動すべきか。``assist_model_changed`` / ``assist_lora_changed``
+    # は応答フィールドとして事実をそのまま返すため書き換えず、再起動可否だけを
+    # 別変数で持つ。
+    restart_assist = assist_model_changed or assist_lora_changed
+    if residency is not None and residency.on_demand:
+        if is_create_mode(new_mode):
+            if restart_assist:
+                # 起動は _restart_assist_server が行う。状態だけ引き継ぐ。
+                residency.note_external_start("create_mode")
+            elif not await residency.acquire("create_mode"):
+                message += ", assist start failed (create runs in degraded mode)"
+        elif is_create_mode(old_mode):
+            # chat へ戻るときは **停止するだけ**。ここで chat 用アシストを
+            # 起こし直すと on_demand なのに常駐したままになる (2026-08-08 実機で
+            # 観測: residency=stopped なのに :8081 が LISTEN のまま残った)。
+            # 次のアイドル窓が chat 用モデルで起こすので、ここで温めておく必要は無い。
+            restart_assist = False
+            await residency.release("create_mode")
+
     # base / assist の再起動は同一リクエスト内で並列実行する。逐次だと
     # 最悪 (health_timeout × 2) になり CLI 側 read timeout を超過しうるため、
     # 別ポート・別プロセスで資源競合しない両者を asyncio.gather で並走させる。
@@ -134,7 +160,7 @@ async def switch_mode(
         restart_tasks["base"] = asyncio.create_task(
             _restart_base_server(state, new_params["model"], lora_path=new_lora_path),
         )
-    if assist_model_changed or assist_lora_changed:
+    if restart_assist:
         restart_tasks["assist"] = asyncio.create_task(
             _restart_assist_server(
                 state, new_assist_path, lora_path=new_assist_lora_path,
@@ -148,11 +174,13 @@ async def switch_mode(
 
     if model_changed or lora_changed:
         message += ", server restart initiated" if restart_initiated else ", server restart failed"
-    if assist_model_changed or assist_lora_changed:
+    if restart_assist:
         message += (
             ", assist restart initiated" if assist_restart_initiated
             else ", assist restart failed"
         )
+    elif assist_model_changed and residency is not None and residency.on_demand:
+        message += ", assist stopped (starts again on the next idle window)"
 
     logger.info(
         "Mode switched: %s -> %s (model_changed=%s, lora_changed=%s, restart=%s, "
@@ -232,7 +260,7 @@ async def _restart_base_server(
 
     # 4. ヘルスチェック。``/health`` 200 だけでなく ``/props`` の load 済みモデルが
     #    要求モデルと一致するまで待つ (旧サーバの 200 やロード途中を成功と誤判定
-    #    しない)。大きい coding GGUF は load に時間がかかるためタイムアウトは
+    #    しない)。大きい create GGUF は load に時間がかかるためタイムアウトは
     #    process_manager.health_timeout (既定 120s) を採用。
     expected_model_id = Path(model_path).name
     health_timeout = int((cfg.get("process_manager") or {}).get("health_timeout", 120))
@@ -260,7 +288,7 @@ async def _restart_assist_server(
     """アシストサーバーを新モデルで再起動する (``_restart_base_server`` と対称)
 
     ``config.yaml`` / ``local/model_state.json`` は一切変更しない
-    (``model_paths.coding_model`` と同じ、モード切替限定のエフェメラル
+    (``model_paths.create_model`` と同じ、モード切替限定のエフェメラル
     override 方式)。既存の ``POST /api/model/assist/migrate``
     (``ModelMigrator.migrate_component``) は使わない —
     ``process_manager.enabled`` (既定 false) に依存し、false だと config
@@ -298,12 +326,22 @@ async def _restart_assist_server(
     # 1. 既存プロセスを確実に停止 (base と同じ 3 経路フォールバック)。
     await asyncio.to_thread(stop_server_process, "assist", cfg, state)
 
-    # クライアント参照を即座に None にする。旧クライアントで接続失敗を
-    # 待たせるより、各呼出元の既存 degraded mode フォールバックへ
-    # 速やかに乗せた方が切替中のチャット応答パスの待機時間が短い。
+    # 切替中は呼出を即拒否させ、各呼出元の既存 degraded フォールバックへ
+    # 速やかに乗せる (旧クライアントで接続失敗を待たせるより待機時間が短い)。
+    #
+    # **クライアントオブジェクトは差し替えない**。``AssistModelClient`` は
+    # _pillar_wirer が 20 箇所以上へコンストラクタ注入しており、
+    # ``set_assist_client`` が同期するのは 4 つだけなので、None を挟むと残りが
+    # 閉じた旧オブジェクトを掴んだままになる (docs/c_14 §1.2)。接続プールだけ
+    # 捨て、可用性は residency のゲートで表現する。
+    residency = getattr(state, "assist_residency", None)
+    if residency is not None:
+        residency.suspend("assist_model_swap")
     if state.assist_client:
         await state.assist_client.aclose()
-    state.set_assist_client(None)
+    if residency is None:
+        # residency 未配線 (テスト等) では従来どおり None 縮退に倒す。
+        state.set_assist_client(None)
 
     # 2. 旧サーバが port を解放するまで待ってから再 spawn。
     await asyncio.to_thread(wait_port_released, "assist", cfg, 10.0)
@@ -330,20 +368,28 @@ async def _restart_assist_server(
             "(expected model=%s)", expected_model_id,
         )
         await asyncio.to_thread(stop_server_process, "assist", cfg, state)
+        # suspend は解除する — 「差し替え中」ではなく「起動失敗」として
+        # residency の状態 (stopped/failed) にそのまま表現させる。
+        if residency is not None:
+            residency.resume("assist_model_swap_failed")
         return False
 
     # 5. クライアント再接続。``model_paths.assist_model`` を実際にロードした
     #    パスへ差し替えた deep copy を渡す — ``AssistModelClient`` のコンストラクタ
     #    は ``resolve_context_size``/``resolve_reasoning_mode``/
     #    ``resolve_sampling_params`` をこのキーから解決するため、実体
-    #    (assist_coding_model) と設定 (assist_model) の不一致で誤った
+    #    (assist_create_model) と設定 (assist_model) の不一致で誤った
     #    reasoning_budget/enable_thinking/sampling を送信しないようにする。
     #    モデル別プロファイル (models/profiles/by-model/) もこのキー経由で
-    #    解決されるので、chat/coding で別のアシストモデルを使う構成でも
+    #    解決されるので、chat/create で別のアシストモデルを使う構成でも
     #    それぞれの宣言が正しく効く。
     #    ``config.yaml`` 自体 (get_config() のグローバル state) は変更しない。
+    #    既存クライアントがある場合は ``rebind_model_config`` で同一オブジェクトの
+    #    上に引き直す (注入済み参照を stale にしない、docs/c_14 §1.2)。
     cfg_for_reconnect = copy.deepcopy(cfg)
     cfg_for_reconnect.setdefault("model_paths", {})["assist_model"] = model_path
     await _try_reconnect("assist", state, cfg_for_reconnect)
+    if residency is not None:
+        residency.resume("assist_model_swap")
 
     return True

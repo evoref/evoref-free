@@ -26,7 +26,7 @@ from backend.schemas._common import (
     ChatModeConfig,
     CLIConfig,
     CLITimeoutsConfig,
-    CodingModeConfig,
+    CreateModeConfig,
     EditorSettingsConfig,
     HistoryConfig,
     I18nConfig,
@@ -51,7 +51,7 @@ from backend.schemas.assist_model import (
     AssistModelConfig,
     AssistModelLocalConfig,
 )
-from backend.schemas.coding import CodingConfig, CodingStagedConfig
+from backend.schemas.create import CreateConfig, CreateStagedConfig
 from backend.schemas.learning import (
     FeedbackPipeConfig,
     LearningConfig,
@@ -102,9 +102,9 @@ __all__ = [
     "CartridgeGateConfig",
     "ChatModeConfig",
     "ClusterIndexConfig",
-    "CodingConfig",
-    "CodingModeConfig",
-    "CodingStagedConfig",
+    "CreateConfig",
+    "CreateModeConfig",
+    "CreateStagedConfig",
     "ConflictResolverConfig",
     "ContextualPrefixConfig",
     "EditorSettingsConfig",

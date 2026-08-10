@@ -71,7 +71,7 @@ class MemoryNote:
     """このノートが生成されたモード"""
 
     project_id: str | None = None
-    """coding モード時のプロジェクト ID"""
+    """create モード時のプロジェクト ID"""
 
     is_tool_output: bool = False
     """ツール出力か (WM までのみ保持、STM 以降は除外)"""
@@ -196,8 +196,8 @@ class ShortTermMemory:
         ``NoteBuilder`` を選択して ``MemoryNote`` を構築する:
 
         - ``role`` (``user`` / ``assistant``)
-        - ``mode`` (``chat`` / ``coding``) — 省略時は ``chat``
-        - ``project_id`` — coding モード時のプロジェクト ID
+        - ``mode`` (``chat`` / ``create``) — 省略時は ``chat``
+        - ``project_id`` — create モード時のプロジェクト ID
         - ``source`` (``user`` / ``assistant`` / ``system`` / ``rag``)
         - ``is_tool_output`` — ``True`` の場合 STM 以降は除外 (絶対に保存しない)
 

@@ -8,7 +8,7 @@
 /** モード別経験数 */
 export interface ExperienceByMode {
 	chat: number;
-	coding: number;
+	create: number;
 }
 
 /** Level 1 各フェーズの結果 */

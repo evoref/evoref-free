@@ -93,7 +93,7 @@
 		background: color-mix(in srgb, var(--accent) 15%, transparent);
 		color: var(--accent);
 	}
-	.session-mode.mode-coding {
+	.session-mode.mode-create {
 		background: color-mix(in srgb, var(--color-success) 15%, transparent);
 		color: var(--color-success);
 	}

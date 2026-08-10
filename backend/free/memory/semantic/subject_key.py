@@ -63,24 +63,24 @@ class SubjectKey:
 
     Attributes:
         pillar: ``"loop"`` / ``"learn"`` / ``"mem"`` のいずれか
-        category: 2 番目のセグメント (``coding_task`` / ``policy`` /
+        category: 2 番目のセグメント (``create_task`` / ``policy`` /
             ``failure`` / ``user`` 等)。``subject_ns.{LOOP,LEARN,MEM}_KINDS``
             と概ね対応するが、parse 時は allowlist チェックを行わない
         segments: 3 番目以降の可変長セグメント。空 tuple (segments なし) は
             ``mem.user`` のような 2 セグメント subject を表す
 
     Examples:
-        >>> SubjectKey.parse("mem.coding_task.proj42.abc123")
-        SubjectKey(pillar='mem', category='coding_task', segments=('proj42', 'abc123'))
+        >>> SubjectKey.parse("mem.create_task.proj42.abc123")
+        SubjectKey(pillar='mem', category='create_task', segments=('proj42', 'abc123'))
 
         >>> SubjectKey.parse("mem.user").canonical()
         'mem.user'
 
-        >>> SubjectKey("learn", "policy", ("coding", "search", "top_k")).canonical()
-        'learn.policy.coding.search.top_k'
+        >>> SubjectKey("learn", "policy", ("create", "search", "top_k")).canonical()
+        'learn.policy.create.search.top_k'
 
-        >>> SubjectKey.parse("mem.coding_task.p1.x").with_category("coding_history").canonical()
-        'mem.coding_history.p1.x'
+        >>> SubjectKey.parse("mem.create_task.p1.x").with_category("create_history").canonical()
+        'mem.create_history.p1.x'
     """
 
     pillar: SubjectPillar

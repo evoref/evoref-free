@@ -26,6 +26,7 @@ import numpy as np
 
 from backend.free.core.intent_vocab import session_self_reference_pattern_ja
 from backend.free.core.locale_patterns import is_en_locale
+from backend.free.llm.assist_client import assist_ready
 from backend.free.document_nouns import (
     DOCUMENT_NOUNS_NEEDS_SUFFIX,
     DOCUMENT_NOUNS_NEEDS_SUFFIX_EN,
@@ -598,9 +599,10 @@ class RetrievalNecessityJudge:
 
         cfg = config or {}
 
-        # assist_client が無ければ degraded mode → 安全側 retrieve
-        if assist_client is None:
-            logger.debug("Necessity assist: skipped (assist_client is None)")
+        # assist が無い / 非常駐 (residency=on_demand のチャット中) なら
+        # degraded mode → 安全側 retrieve
+        if not assist_ready(assist_client, "retrieval_necessity_judge"):
+            logger.debug("Necessity assist: skipped (assist not available)")
             return "retrieve"
 
         # tracker による発火上限チェック (本機能の quality キーは "uncertain")

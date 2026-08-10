@@ -1,9 +1,9 @@
-"""staged コーディングの stage 対応 TaskExecutor。
+"""staged クリエイトの stage 対応 TaskExecutor。
 
 ``LoopDriver`` から 1 タスクずつ呼ばれ、``task.stage`` で分岐する:
 
 - ``spec`` : アシストモデルで設計仕様 (spec.md) を生成し workspace に永続化。
-- ``code`` : **base コーディングモデル** (注入された codegen 委譲) で当該モジュール
+- ``code`` : **base クリエイトモデル** (注入された codegen 委譲) で当該モジュール
   を単発生成。spec.md と既生成ファイル一覧を読み込んで instruction に埋め込み、
   1 ファイル = 1 回の base 呼び出しで完結させる (``LongFormOrchestrator`` 経由の
   plan/CodeSpec 再合成は経由しない。再合成は instruction の大半を lossy に圧縮し
@@ -30,6 +30,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from backend.free.core.dependency_constraint import (
+    find_third_party_imports,
+    requires_stdlib_only,
+)
 from backend.free.loop.executor import ArtifactEntry, ExecutionOutcome
 from backend.free.loop.quality_gate import GateResult, QualityGateOutcome
 from backend.free.loop.staged.flow_render import (
@@ -86,7 +90,7 @@ if TYPE_CHECKING:
 
 logger = get_logger("loop.staged.executor")
 
-# (instruction, file_path) -> {logical_path: code}。base コーディングモデル経由の
+# (instruction, file_path) -> {logical_path: code}。base クリエイトモデル経由の
 # コード生成委譲。file_path は生成対象の論理パス (戻り値の主キー) を明示する。
 CodegenDelegate = Callable[[str, str], Awaitable[dict[str, str]]]
 
@@ -689,14 +693,14 @@ def _finish_reason(resp: dict) -> str:
         return ""
 
 
-# spec 本文再生成時の max_tokens 上限 (backend/schemas/coding.py の le=8192 と整合)。
+# spec 本文再生成時の max_tokens 上限 (backend/schemas/create.py の le=8192 と整合)。
 _SPEC_MAX_TOKENS_CEILING = 8192
 
 
 def _extract_module_list(description: str) -> str:
     """spec タスクの description から正準モジュール一覧ブロックを取り出す。
 
-    ``synthesizer.synthesize_coding_task_graph`` が ``MODULE_LIST_MARKER`` 以降に
+    ``synthesizer.synthesize_create_task_graph`` が ``MODULE_LIST_MARKER`` 以降に
     埋め込む ``file_path`` 群は、決定論的に展開された各 code タスクの
     ``source_path`` と 1:1 で一致する (= 正準)。spec 本文はここから **別の** LLM
     呼び出しで自由記述生成されるため、その出力がこの一覧を忠実に再現する保証は
@@ -839,6 +843,31 @@ def _is_valid_python(code: str) -> bool:
         return False
 
 
+#: code 工程で ``_salvage_python_code`` の結果を採用する下限 (原文に対する文字比)。
+#: 前置き/後書きの自然文はコード本体に比べて短いので高い比率が残る。逆に本物の
+#: 構文エラーは、壊れた文そのものを削らないとパースが通らないため大きく縮む。
+_SALVAGE_MIN_KEEP_RATIO = 0.9
+
+
+def _compile_error_detail(code: str) -> str | None:
+    """``compile`` が通らないときの位置と理由を 1 行で返す (通れば ``None``)。
+
+    :func:`_is_valid_python` の ``ast.parse`` は構文木を作るだけで、
+    ``continue`` / ``break`` の位置のような **コンパイル時にしか検出されない
+    誤り**を見逃す (実測 2026-08-07: ループ外の ``continue`` を ``ast.parse`` は
+    受理し、import スモークだけが落とした)。成果物として書き出す前の最終判定は
+    import スモークと同じ ``compile`` で行う。
+    """
+    try:
+        compile(code, "<generated>", "exec")
+    except SyntaxError as exc:
+        where = f"line {exc.lineno}" if exc.lineno else "unknown line"
+        return f"{where}: {exc.msg}"
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
 _PYTEST_USAGE_RE = re.compile(r"\bpytest\.\w+")
 _PYTEST_IMPORT_RE = re.compile(
     r"^\s*(import\s+pytest\b|from\s+pytest\s+import\b)", re.MULTILINE,
@@ -930,14 +959,14 @@ def _salvage_python_code(code: str) -> str | None:
 
 
 @dataclass
-class StagedCodingExecutor:
+class StagedCreateExecutor:
     """stage 別 TaskExecutor。``LoopDriver(executor=...)`` に差し込む。
 
     Args:
         workspace: 工程間ハンドオフ用 :class:`WorkspaceManager`。
         assist_client: spec 工程で使うアシスト。``None`` なら spec は description
             をそのまま spec.md に書く degraded 動作。
-        codegen: base コーディングモデル経由の生成委譲
+        codegen: base クリエイトモデル経由の生成委譲
             (instruction, file_path -> {path: code})。
         smoke_runner: 生成 src 群を import スモーク検証する callable
             (``run_import_smoke`` をラップ注入)。``.errors`` / ``.warnings`` を
@@ -1005,7 +1034,7 @@ class StagedCodingExecutor:
     part_max_parts: int = 4
     event_bus: "LoopEventBus | None" = None
     debug_logger: "DebugLogger | None" = None
-    name: str = "staged_coding"
+    name: str = "staged_create"
 
     def _emit(self, stage: str, detail: str, status: str, task_id: str) -> None:
         """工程内サブステップ進捗を event_bus へ発行する (null-safe)。"""
@@ -1280,7 +1309,7 @@ class StagedCodingExecutor:
                  + _spec_language_constraint() + extra_constraint}]
         try:
             resp = await self.assist_client.generate(
-                msgs, purpose="coding_spec_doc", max_tokens=self.spec_max_tokens,
+                msgs, purpose="create_spec_doc", max_tokens=self.spec_max_tokens,
                 temperature=0.3, timeout=self.spec_timeout_sec,
             )
         except Exception as exc:
@@ -1298,7 +1327,7 @@ class StagedCodingExecutor:
         )
         try:
             resp2 = await self.assist_client.generate(
-                msgs, purpose="coding_spec_doc", max_tokens=retry_tokens,
+                msgs, purpose="create_spec_doc", max_tokens=retry_tokens,
                 temperature=0.3, timeout=self.spec_timeout_sec * 1.5,
             )
         except Exception as exc:
@@ -1334,7 +1363,7 @@ class StagedCodingExecutor:
                  ) + os_constraint() + _deepen_language_constraint()}]
         try:
             resp = await self.assist_client.generate(
-                msgs, purpose="coding_spec_deepen",
+                msgs, purpose="create_spec_deepen",
                 max_tokens=_SPEC_DEEPEN_MAX_TOKENS,
                 temperature=0.3, timeout=self.spec_timeout_sec,
             )
@@ -1581,8 +1610,42 @@ class StagedCodingExecutor:
             f"(e.g. if a field is specified as holding `int` values, it must "
             f"hold real `int`s, not `bool`). Output only this file's code."
             + os_constraint()
+            + self._dependency_constraint()
             + _code_language_constraint()
         )
+
+    def _request_text(self) -> str:
+        """依存制約の検出に使う「ユーザーの元の要求文」 (manifest の goal)。"""
+        try:
+            return str(self.workspace.read_manifest().get("goal") or "")
+        except Exception:
+            return ""
+
+    def _dependency_constraint(self) -> str:
+        """要求文が「標準ライブラリのみ」ならその制約を生成指示へ運ぶ。
+
+        ゲート (:meth:`_run_code`) だけでは retry のたびに同じ違反を作り直す
+        ので、制約は生成時点で伝える。
+        """
+        if not requires_stdlib_only(self._request_text()):
+            return ""
+        return (
+            "\n\nThe user requires the STANDARD LIBRARY ONLY: do not import any "
+            "third-party package (no pandas, numpy, requests, fastapi, ...). "
+            "Use only modules from the Python standard library and the sibling "
+            "modules of this project. Code importing a third-party package is "
+            "rejected."
+        )
+
+    def _local_module_names(self, source_path: str) -> set[str]:
+        """生成物の兄弟モジュール名 (import 検証で自作扱いにする集合)。"""
+        names = {Path(source_path).stem}
+        try:
+            files = self.workspace.read_manifest().get("files") or {}
+            names |= {Path(p).stem for p in files}
+        except Exception:
+            pass
+        return names
 
     async def _run_code(self, task: "TaskFactView") -> ExecutionOutcome:
         source_path = task.source_path or f"{task.task_id}.py"
@@ -1622,6 +1685,79 @@ class StagedCodingExecutor:
                 status="failure", error="empty code generation",
                 notes={"executor": self.name, "stage": "code", **part_notes},
             )
+        # 構文チェックは code 工程で行う。ここを素通りさせると、壊れたファイルは
+        # test 工程の smoke ゲートで初めて検出されるが、そのときの repair は
+        # **当該 test タスクの source_path に固定** されているため、別ユニットの
+        # 構文エラーは誰も直せないまま retry を消費して警告付きで配信される
+        # (実インシデント 2026-08-07 ライブ監査: file_scanner.py の
+        # ``'continue' not properly in loop`` が test: main.py の失敗として現れ、
+        # 2 回の retry がどちらも main.py を書き直して同じエラーで終わった)。
+        # 生成したタスク自身を失敗させれば、driver の retry が同じ code タスクを
+        # 再実行し、修復対象と原因ファイルが一致する。
+        # 同じ判定は生成テスト (_run_test) と repair 書き戻し
+        # (_write_source_if_valid) では既に効いており、ここだけ非対称だった。
+        # ``_salvage_python_code`` は前後の行を削って再パースするので、前置きの
+        # 自然文は救えるが、**本物の構文エラーに当てると壊れた行を削った縮小版**
+        # が出来てしまう (実測: 9 行の関数から except 節ごと 3 行消えて「有効な
+        # Python」になった)。repair 経路 (_write_source_if_valid) は旧ファイルとの
+        # 縮小率ガードが後段にあるが、code 工程には比較対象が無い。ここでは
+        # 「ほぼ全量が残った場合だけ前置き除去とみなす」で同じ役割を果たす。
+        detail = _compile_error_detail(code)
+        if detail is not None:
+            salvaged = _salvage_python_code(code)
+            if (
+                salvaged is not None
+                and len(salvaged) >= _SALVAGE_MIN_KEEP_RATIO * len(code)
+                and _compile_error_detail(salvaged) is None
+            ):
+                logger.warning(
+                    "staged code stage returned prose around the code for %s; "
+                    "salvaged the embedded Python (%d -> %d chars)",
+                    source_path, len(code), len(salvaged),
+                )
+                code = salvaged
+                detail = None
+        if detail is not None:
+            logger.warning(
+                "staged code stage produced invalid Python for %s: %s",
+                source_path, detail,
+            )
+            self._fail_task(task, f"syntax error: {detail}")
+            self._emit(
+                "code", f"コード生成失敗 (構文エラー): {source_path} — {detail}",
+                "failed", task.task_id,
+            )
+            return ExecutionOutcome(
+                status="failure", error=f"syntax error: {detail}",
+                notes={"executor": self.name, "stage": "code", **part_notes},
+            )
+        # ユーザーが明示した依存制約の検証。import スモークは「その環境で import
+        # できるか」しか見ないため、pandas が入っている開発機では
+        # 「標準ライブラリのみ」違反が合格として通ってしまう (実インシデント
+        # 2026-08-07 ライブ監査)。制約も違反も決定論で確定できるので LLM に
+        # 判定させない。
+        if requires_stdlib_only(self._request_text()):
+            offenders = find_third_party_imports(
+                code, self._local_module_names(source_path),
+            )
+            if offenders:
+                detail = ", ".join(offenders)
+                logger.warning(
+                    "staged code stage violated the stdlib-only constraint for "
+                    "%s: imports %s", source_path, detail,
+                )
+                self._fail_task(task, f"third-party import: {detail}")
+                self._emit(
+                    "code",
+                    f"コード生成失敗 (標準ライブラリのみの指定に違反): "
+                    f"{source_path} — {detail}",
+                    "failed", task.task_id,
+                )
+                return ExecutionOutcome(
+                    status="failure",
+                    error=f"third-party import despite stdlib-only request: {detail}",
+                    notes={"executor": self.name, "stage": "code", **part_notes},
+                )
         wf = self.workspace.write_file(
             source_path, code, kind="src", stage="code", task_id=task.task_id,
         )
@@ -1723,6 +1859,7 @@ class StagedCodingExecutor:
             f"mechanically checked against the declared signatures and "
             f"non-conforming code is rejected."
             + os_constraint()
+            + self._dependency_constraint()
             + _code_language_constraint()
         )
 

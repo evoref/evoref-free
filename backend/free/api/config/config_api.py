@@ -61,7 +61,7 @@ def _guard_model_paths_immutable(data: dict) -> None:
 
     base/assist/embed のモデルは migrate API 経由でしか変更できない。
     config を直書きすると model_state.json と desync し起動時 mismatch を招くため、
-    現在値と異なる追跡キーが含まれていれば 403 を返す。coding_model 等の非追跡
+    現在値と異なる追跡キーが含まれていれば 403 を返す。create_model 等の非追跡
     キーは通常通り編集可能 (現在値と一致する追跡キーが同梱されていても許可)。
     """
     from backend.free.core.model_migration import MODEL_STATE_TRACKED_KEYS

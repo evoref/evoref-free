@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 
 import httpx
 
+from backend.free.core.text_quality import carries_no_assertion
+from backend.free.llm.assist_client import assist_ready
 from backend.free.memory.pipeline.semantic_conflict_resolver import (
     CONFLICTS_PENDING_FILENAME,
     CONFLICTS_RESOLVED_FILENAME,
@@ -131,6 +133,68 @@ def collect_pending_groups(
             facts=tuple(facts),
         ))
     groups.sort(key=lambda g: (g.scope, g.subject, g.predicate, g.type))
+    return groups
+
+
+def collect_review_groups(
+    store: SemanticFactStore, scope: str,
+) -> list[PendingConflictGroup]:
+    """**表示用**の競合グループ。スロットの現在値まで含めて返す。
+
+    :func:`collect_pending_groups` との違いは 2 つで、どちらも「ユーザーに何を
+    見せるか」の問題。**解決 (supersede) の対象は変えない** — TTL 自動解決は
+    引き続き pending だけを見る (非 pending を巻き込むと、ユーザーがレビューに
+    同意していないファクトを消してしまう)。
+
+    1. **スロットの非 pending ファクトも表示に含める。**
+       競合検出より後に作られたファクトには pending が付かないため、
+       pending だけを並べるとそのスロットの **最新値が欠落**する。旧/新 の
+       ラベルは残ったメンバの中で付くので、古い値が「新」として提示される。
+
+       実インシデント (2026-08-09): ``mem.personal.name`` の表示が
+       ``旧「好きな季節は秋」(08-05) / 新「趣味は自転車と写真」(08-08 06:38)``
+       となり、実際の最新値「趣味は登山と写真」(08-08 12:58、
+       ``review_status=none``) が含まれていなかった。競合は 08-08 07:48 に
+       検出され ``pinned_present`` で pending のまま滞留していたため、5 時間後に
+       現れた正しい値は永久に合流できない。**この「新」ラベルはプロンプト中で
+       最も強い現在値の信号**で、記憶注入 / few-shot / RAG をすべて正しくしても
+       これだけで古い値が採用され続けた。
+
+    2. **問いだけのファクトを除く。**
+       「私の猫の名前と誕生日を覚えていますか。」が競合の当事者として並び、
+       最新であるがゆえに winner 扱いされていた。問いは主張ではないので
+       競合し得ない。注入層は同じ判定をファクトへ既に掛けている。
+
+    3. **同一 object は 1 件に畳む。**
+       ストアは append-only で同じ文が複数 id で残る。畳まないと
+       ``旧「私の趣味をもう一度確認させてください。」/ 新「私の趣味をもう一度
+       確認させてください。」`` のように **同じ文が旧と新の両方**に並び、
+       ブロック自体が自己矛盾する (実測 2026-08-09)。
+    """
+    by_slot: dict[tuple[str, str], list[SemanticFact]] = {}
+    for f in store.all_facts(include_superseded=False):
+        if carries_no_assertion(f.object or ""):
+            continue
+        by_slot.setdefault((f.subject, f.predicate), []).append(f)
+
+    groups: list[PendingConflictGroup] = []
+    for base in collect_pending_groups(store, scope):
+        newest_by_object: dict[str, SemanticFact] = {}
+        for f in by_slot.get((base.subject, base.predicate), []):
+            cur = newest_by_object.get(f.object)
+            if cur is None or f.created_at > cur.created_at:
+                newest_by_object[f.object] = f
+        members = list(newest_by_object.values())
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda f: f.created_at)
+        groups.append(PendingConflictGroup(
+            scope=base.scope,
+            subject=base.subject,
+            predicate=base.predicate,
+            type="/".join(sorted({f.type for f in members})),
+            facts=tuple(members),
+        ))
     return groups
 
 
@@ -353,12 +417,19 @@ def _truncate(text: str, limit: int) -> str:
 def _render_group_line(
     index: int, group: PendingConflictGroup, *, max_object_chars: int,
 ) -> str:
-    """1 グループを ``[C1] (type) subject predicate: 旧「…」 / 新「…」`` 形式に。"""
+    """1 グループを ``[C1] (type) subject predicate: 旧「…」 / 新「…」`` 形式に。
+
+    ``新`` は **最新の 1 件だけ**。3 件以上のグループで先頭以外を全部 ``新`` に
+    すると「新」が複数現れ、どれが現在値か分からなくなる (実インシデント
+    2026-08-09: 3 件のグループで古い値と質問の両方に「新」が付いていた)。
+    """
+    facts = group.facts
+    last = len(facts) - 1
     parts = [
-        f"旧「{_truncate(f.object, max_object_chars)}」({_short_date(f.created_at)})"
-        if i == 0
-        else f"新「{_truncate(f.object, max_object_chars)}」({_short_date(f.created_at)})"
-        for i, f in enumerate(group.facts)
+        f"新「{_truncate(f.object, max_object_chars)}」({_short_date(f.created_at)})"
+        if i == last
+        else f"旧「{_truncate(f.object, max_object_chars)}」({_short_date(f.created_at)})"
+        for i, f in enumerate(facts)
     ]
     return (
         f"[C{index}] ({group.type}) {group.subject} {group.predicate}: "
@@ -509,7 +580,7 @@ async def judge_user_reply(
     呼出元 (``chat_service.maybe_resolve_pending_conflicts``) がセッション cap
     を消費しない判断ができるよう再送出する。
     """
-    if assist_client is None or not groups:
+    if not groups or not assist_ready(assist_client, "conflict_chat_judge"):
         return None
     conflicts_text = "\n".join(
         _render_group_line(i, g, max_object_chars=max_object_chars)

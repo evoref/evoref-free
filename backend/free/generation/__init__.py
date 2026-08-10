@@ -1,6 +1,6 @@
 """長文生成エンジン基盤モジュール
 
-設計書 f_09_long_form_generation.md 準拠。
+設計書 f_08_long_form_generation.md 準拠。
 CogWriter / Recurrent 両戦略で共有するデータモデル・ユーティリティ。
 """
 

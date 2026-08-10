@@ -3,7 +3,7 @@
 EvorefLoop pillar が書き込む ``task`` / ``progress_marker`` /
 ``failure_pattern`` / ``artifact`` の管理、および Loop が reader として
 読む ``policy`` / ``fewshot`` / ``personal_fact`` / ``preference`` / ``decision`` /
-``commitment`` / ``project`` / ``coding`` / ``coding_task`` の読取 API を提供する。
+``commitment`` / ``project`` / ``create`` / ``create_task`` の読取 API を提供する。
 
 追加した骨格に加えて、既存 ``LoopDriver`` /
 ``DefaultHarness`` / ``bootstrap_project_context`` / ``make_loop_artifact_hook``
@@ -667,7 +667,7 @@ class LoopFactView(FactViewBase):
             object_=json.dumps(payload, ensure_ascii=False, sort_keys=True),
             type="progress_marker",
             scope=project_scope,
-            mode_origin="coding",
+            mode_origin="create",
             confidence=confidence,
             now=t,
             trace_id=trace_id,
@@ -747,7 +747,7 @@ class LoopFactView(FactViewBase):
             object_=json.dumps(payload, ensure_ascii=False, sort_keys=True),
             type="failure_pattern",
             scope=project_scope,
-            mode_origin="coding",
+            mode_origin="create",
             confidence=confidence,
             now=t,
             trace_id=trace_id,
@@ -827,7 +827,7 @@ class LoopFactView(FactViewBase):
             object_=json.dumps(payload, ensure_ascii=False, sort_keys=True),
             type="artifact",
             scope=project_scope,
-            mode_origin="coding",
+            mode_origin="create",
             confidence=confidence,
             now=t,
             trace_id=trace_id,

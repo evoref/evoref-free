@@ -20,11 +20,35 @@ router = APIRouter(prefix="/api/assist-model", tags=["assist-model"])
 
 
 async def _try_lazy_connect_assist(state: AppState, cfg: dict) -> bool:
-    """assist_client が未接続の場合、アシストモデルへの遅延接続を試みる"""
+    """assist_client が未接続の場合、アシストモデルへの遅延接続を試みる
+
+    **既に ``state.assist_client`` がある場合はオブジェクトを作り直さない**。
+    ``AssistModelClient`` は ``_pillar_wirer`` が 20 箇所以上へコンストラクタ
+    注入しており、``AppState.set_assist_client`` が同期するのは 4 つだけなので、
+    差し替えると残りが古いオブジェクトを掴んだままになる。``BaseHTTPClient.
+    _get_http_client`` は閉じた接続プールを遅延再生成するため、同一オブジェクトを
+    ``aclose()`` してから使い直せば死んだ keep-alive も残らない (docs/c_14 §1.2)。
+    """
     from backend.free.llm.assist_client import AssistModelClient
 
     assist_model_cfg = cfg.get("assist_model", {})
     if not assist_model_cfg.get("local"):
+        return False
+
+    existing = state.assist_client
+    if existing is not None:
+        try:
+            # 前世代サーバの socket を掴んだままの keep-alive を捨てる。
+            await existing.aclose()
+            # ロードされたモデルが変わっている可能性がある (create モードの
+            # assist_create_model 差し替え)。context_size / reasoning /
+            # sampling / timeout 較正キーを引き直す。
+            existing.rebind_model_config(cfg)
+            if await existing.health_check():
+                logger.info("Assist model reconnected (same client): %s", existing.url)
+                return True
+        except Exception as e:
+            logger.debug("Assist model reconnect failed: %s", e)
         return False
 
     try:
@@ -75,12 +99,24 @@ async def get_assist_model_status(
     connected = False
     model_params_b: float | None = None
 
+    residency = getattr(state, "assist_residency", None)
     if state.assist_client is not None:
-        try:
-            connected = await state.assist_client.health_check()
-            model_params_b = state.assist_client.params_b
-        except Exception:
-            logger.debug("Assist model health check failed during status request")
+        model_params_b = state.assist_client.params_b
+        # 設計どおり停止している間 (residency=on_demand のチャット中) は
+        # health check を投げない — 死んだポートへの ConnectError を数秒ごとに
+        # 積むだけで何も分からない (docs/c_14 §1.2)。
+        if residency is None or residency.is_ready():
+            try:
+                connected = await state.assist_client.health_check()
+            except Exception:
+                logger.debug("Assist model health check failed during status request")
+    elif residency is not None and residency.on_demand:
+        # クライアント未配線 + on_demand。lazy-connect はサーバが動いていない
+        # 前提なので試さない (毎回 1 秒待たされるだけ)。
+        model_path = local_cfg.get("model", local_cfg.get("model_path", ""))
+        if model_path:
+            from backend.free.llm.model_metadata import estimate_params_b
+            model_params_b = estimate_params_b(str(model_path))
     else:
         # assist_client が未初期化 → 遅延接続を試行
         # （起動時にモデルロードが間に合わなかったケース）

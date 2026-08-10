@@ -99,7 +99,7 @@ class LearningConfig(BaseModel):
     # 対象は LoRA のみ (control vector / cvector は本設定の対象外、常にモデル単位で
     # 不変 — ランタイム hot-swap 不可 + GGUF 再ロードが高コストなため)。
     # "model" (既定): LoRA はモデル単位 (base/assist とも両モードの経験を1アダプタに
-    #   プール)。chat↔coding 切替で base/assist サーバを再起動しない。
+    #   プール)。chat↔create 切替で base/assist サーバを再起動しない。
     #   プロンプト/fewshot/policy/experience は (model×mode) で分離されるため
     #   軽量側のモード差は保たれる。
     # "model_mode": base・assist とも LoRA を (model×mode) で分け、モード切替時に
@@ -113,10 +113,10 @@ class LearningConfig(BaseModel):
     level1_population_size: int = Field(default=5, ge=1)
     level2_min_failures: int = Field(default=50, ge=1)
     # モード別の Level 2 発火閾値。未指定のモードは level2_min_failures に
-    # フォールバックする。coding は経験が溜まりにくく (2026-07-26 実測: chat 180 件に対し
-    # coding 2 件)、chat と同じ閾値では「chat が回るたびに coding も無駄に評価される」か
-    # 「coding が永久に発火しない」のどちらかになるため、モード別に持てるようにする。
-    level2_min_failures_by_mode: dict[Literal["chat", "coding"], int] = Field(
+    # フォールバックする。create は経験が溜まりにくく (2026-07-26 実測: chat 180 件に対し
+    # create 2 件)、chat と同じ閾値では「chat が回るたびに create も無駄に評価される」か
+    # 「create が永久に発火しない」のどちらかになるため、モード別に持てるようにする。
+    level2_min_failures_by_mode: dict[Literal["chat", "create"], int] = Field(
         default_factory=dict,
     )
     # アイドル判定タイマー
@@ -236,7 +236,7 @@ class LearningConfig(BaseModel):
     def _require_partition_for_adapter_mode_split(self) -> "LearningConfig":
         """``level2_adapter_partition="model_mode"`` は base 学習パーティション必須
 
-        chat/coding 別アダプタは ``local/learning/<base_model_stem>/<mode>/...``
+        chat/create 別アダプタは ``local/learning/<base_model_stem>/<mode>/...``
         という base パーティション配下のサブディレクトリとして実装されるため、
         ``partition_by_base_model=false`` (flat レイアウト) との組合せは意味を
         持たない。単純化のため起動時に明示的に拒否する。

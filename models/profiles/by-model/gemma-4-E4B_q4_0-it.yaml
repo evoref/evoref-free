@@ -6,13 +6,13 @@
 # Google 公式が全ユースケース共通で推奨する標準サンプリング設定。
 #
 # arch 層 (gemma4.yaml) に置かない理由: プロファイルの sampling は base ロールで
-# modes.* を上書きするため、arch 層に書くと chat (temp 0.7) と coding (temp 0.3) の
+# modes.* を上書きするため、arch 層に書くと chat (temp 0.7) と create (temp 0.3) の
 # モード別チューニングを一律に潰してしまう。モデル別層なら「この GGUF を使う
 # ロール」に閉じて宣言できる。本モデルは assist ロール (model_paths.assist_model)
 # で使っており、assist には modes.* の概念が無いので衝突しない。
 #
 # ⚠ 本 GGUF を base ロールへ切り替える場合は上記の上書きが起きる点に注意
-# (chat/coding の温度差が消え、両モードとも temperature 1.0 になる)。
+# (chat/create の温度差が消え、両モードとも temperature 1.0 になる)。
 #
 # assist での temperature の効き方: 呼出側が明示した温度が優先されるため、
 # ここの 1.0 が効くのは温度を指定していない generate() 呼出だけ (JSON 抽出等の

@@ -75,6 +75,14 @@ class ComponentStatus(BaseModel):
     """個別コンポーネント（モデル）のステータス"""
     name: str = ""
     connected: bool = False
+    # アシストのオンデマンド常駐状態 (docs/c_14 §1.2)。assist 以外は None。
+    #   "stopped" — 設計どおり停止中 (チャット中は起動しない)
+    #   "starting" / "stopping" — 遷移中
+    #   "ready"   — アイドルバッチ or create モードで常駐中
+    #   "failed"  — 起動に失敗した (これだけが異常)
+    # ``assist_model.residency: always`` では常に None を返し、従来どおり
+    # ``connected`` だけで判断させる。
+    residency: str | None = None
 
 
 class LearningBriefStatus(BaseModel):
@@ -550,7 +558,7 @@ class ConfigValidateResponse(BaseModel):
 
 class SessionRegisterRequest(BaseModel):
     session_id: str
-    mode: str = "coding"
+    mode: str = "create"
     client_type: str = "cli"
 
 
@@ -603,7 +611,7 @@ class SessionData(BaseModel):
     started_at: str
     ended_at: str
     duration_sec: int = 0
-    mode: str = "coding"
+    mode: str = "create"
     instance_name: str = "evoref"
     base_model: str = ""
     source: str = "auto"  # "auto" | "manual" | "gui"
@@ -656,7 +664,7 @@ class TaskInfo(BaseModel):
     project_id: str
     created_at: float = 0.0
     accessed_at: float = 0.0
-    stage: str | None = None  # staged コーディング工程 (spec/code/test)。通常タスクは None
+    stage: str | None = None  # staged クリエイト工程 (spec/code/test)。通常タスクは None
 
 
 class TaskListResponse(BaseModel):

@@ -274,10 +274,51 @@ def _init_llm_client(
         logger.info("LLMClient initialized (local llama-server)")
 
 
+def _init_assist_residency(
+    state: AppState, cfg: dict[str, Any], debug_logger: "DebugLogger",
+) -> None:
+    """アシストの常駐管理 (docs/c_14 §1.2) を構築し ``AppState`` に載せる。
+
+    ``_init_assist_model`` より前に呼ぶ必要がある — ``on_demand`` かどうかで
+    起動時に health check を待つかが変わるため。
+    """
+    from backend.free.llm.assist_residency import AssistResidencyManager
+
+    async def _on_first_ready(client: "AssistModelClient") -> None:
+        """初回 ready 時に 1 度だけ: サーバ実パラメータ同期 + 各種プローブ。
+
+        毎回のアイドル窓で再実行すると数秒を無駄にするため 1 プロセス 1 回。
+        品質プローブ (``_start_quality_probes``) は assist URL を直接叩くため、
+        起動時ではなくここで走らせる — 非常駐のまま起動時に投げると必ず
+        ConnectError になり、モデル変更が永久に検査されなくなる。
+        """
+        await client.update_params_from_server()
+        _start_assist_capability_probe(client, cfg, debug_logger)
+        try:
+            from backend.config import get_path_resolver
+            _start_quality_probes(
+                state, cfg, get_path_resolver(), debug_logger,
+                local_client=None, assist_client=client, embedder=None,
+            )
+        except Exception as e:
+            logger.warning("Assist quality probe scheduling failed: %s", e)
+
+    state.assist_residency = AssistResidencyManager(
+        state, cfg, on_first_ready=_on_first_ready,
+    )
+
+
 async def _init_assist_model(
     state: AppState, cfg: dict[str, Any], debug_logger: "DebugLogger",
 ) -> "AssistModelClient | None":
-    """5d. アシストモデルクライアント初期化（全エディション必須、§2.3.2）"""
+    """5d. アシストモデルクライアント初期化（全エディション必須、§2.3.2）
+
+    ``assist_model.residency: on_demand`` (既定) ではクライアントだけ構築して
+    返し、llama-server の起動・health check は行わない (docs/c_14 §1.2)。
+    実際の起動は ``AssistResidencyManager.acquire`` がアイドル窓 / create モード
+    で行う。呼出は ``AssistModelClient`` 内の residency ゲートで塞がれるため、
+    非常駐のまま呼ばれても HTTP は発生しない。
+    """
     try:
         from backend.free.llm.assist_client import AssistModelClient
 
@@ -299,6 +340,24 @@ async def _init_assist_model(
             return None
 
         assist_client = AssistModelClient(cfg, debug_logger=debug_logger)
+        residency = state.assist_residency
+        if residency is not None:
+            assist_client.set_residency_gate(residency.allows)
+
+        if residency is not None and residency.on_demand:
+            # on_demand: 起動を待たずに配線だけ済ませる。外部起動 (evoref-ctl の
+            # 旧手順や launch_llama --assist) で :8081 が生きていると、
+            # チャット中もベースと帯域を奪い合うため確実に落としておく。
+            state.assist_client = assist_client
+            await _stop_stray_assist_server(state, cfg)
+            logger.info(
+                "Assist model wired in on-demand residency mode (%s): "
+                "the assist server stays stopped during chat and is started only "
+                "for idle batches (sleep-time / Level 1-2) and create mode",
+                assist_client.url,
+            )
+            return assist_client
+
         # 起動レース対策: assist-model llama-server プロセスが listen するまで
         # /health をポーリング (base と同じパターン)
         from backend.free.llm._base_client import wait_for_server_ready
@@ -335,6 +394,39 @@ async def _init_assist_model(
             e,
         )
         return None
+
+
+async def _stop_stray_assist_server(state: AppState, cfg: dict[str, Any]) -> None:
+    """``on_demand`` 起動時に居残っているアシスト llama-server を停止する。
+
+    ``evoref-ctl start`` の旧手順や ``launch_llama.py --assist`` を手で叩いた
+    後に backend を上げると :8081 が生きたままになり、「チャット中は常駐しない」
+    という設計目的が崩れる (VRAM も帯域も取られる)。/health が通ったときだけ
+    停止する (通常は no-op で追加コストゼロ)。
+    """
+    import asyncio
+
+    from backend.free.api.system.server_control import (
+        _check_health,
+        _resolve_endpoint,
+        stop_server_process,
+    )
+
+    endpoint = _resolve_endpoint("assist", cfg)
+    if endpoint is None:
+        return
+    host, port = endpoint
+    try:
+        if not await _check_health(host, port):
+            return
+        logger.info(
+            "Assist server found running at %s:%s while residency=on_demand — "
+            "stopping it so chat keeps the GPU to itself",
+            host, port,
+        )
+        await asyncio.to_thread(stop_server_process, "assist", cfg, state)
+    except Exception as e:
+        logger.warning("Failed to stop stray assist server: %s", e)
 
 
 def _start_assist_capability_probe(
@@ -677,7 +769,7 @@ def _init_learning_core(
     state.assist_experience_recorder = _record_assist_experience
 
     # 7b. プロンプトマネージャ（§6.6.4: モード別システムプロンプト）
-    # base システムプロンプト (chat.md / coding.md + meta + history + learning_state)
+    # base システムプロンプト (chat.md / create.md + meta + history + learning_state)
     # は (model×mode) partition 配下 (resolve_learning)。assist プロンプトは
     # **アシストモデル単位** の別軸パーティション (resolve_assist_prompt_dir) —
     # 進化した文面はそのモデルの癖に合わせて最適化されるため、アシストモデルを
@@ -1278,7 +1370,7 @@ def _wire_sleep_scheduler_models(
     # 持つ LLMClient ファサード (state.llm_client) 前提。生の LocalClient
     # (state.local_client) にはこの属性が無くgetattrデフォルト(0)に落ちるため、
     # フォアグラウンド生成中でも Level1/Level2 の yield ゲートが機能しなかった
-    # (2026-07-24 実機検証で判明、staged coding 実行中も Level2 real-eval が
+    # (2026-07-24 実機検証で判明、staged create 実行中も Level2 real-eval が
     # 抑止されず本番 llama-server とリソース競合していた)。
     if state.llm_client:
         sleep_scheduler.set_llm_client(state.llm_client)
@@ -1287,6 +1379,10 @@ def _wire_sleep_scheduler_models(
     if state.assist_client:
         sleep_scheduler.set_assist_llm_client(state.assist_client)
         logger.info("SleepTimeScheduler: assist model set as preferred LLM")
+
+    # アイドル窓 (Trigger B / Level 1 / Level 2) の間だけアシストを起動させる
+    # (docs/c_14 §1.2)。未設定なら従来どおり「常に常駐」とみなして動く。
+    sleep_scheduler.set_assist_residency(state.assist_residency)
 
     sleep_scheduler.set_learning_scheduler(learning_scheduler)
 
@@ -1461,6 +1557,10 @@ def _init_tools(
         debug_logger=state.debug_logger,
         mem_view=mem_view,
         embedder=embedder,
+        # アシスト非常駐時のネイティブ tool calling 用 (docs/c_14 §1.3)。
+        # ``generate_tool_call`` を持つ LocalClient を直接渡す
+        # (LLMClient ファサードは tools を透過しない)。
+        llm_client=state.local_client,
     )
     state.tool_call_judge = tool_judge
     logger.info("ToolCallJudge initialized: enabled=%s", tool_judge.enabled)
@@ -1561,7 +1661,7 @@ def _init_loop_driver(
 
         harness = DefaultHarness(
             harness_view=harness_view,
-            mode="coding",
+            mode="create",
             policy_provider=_policy_provider,
         )
         executor = RalphExecutor(
@@ -2033,6 +2133,11 @@ async def _build_gen_pillar(
     debug_logger = base.debug_logger
     resolver = base.resolver
 
+    # residency は _init_assist_model より前に用意する (on_demand かどうかで
+    # 起動時に health check を待つかが変わるため)。
+    with _timed(timings, "assist_residency"):
+        _init_assist_residency(state, cfg, debug_logger)
+
     async with asyncio.TaskGroup() as tg:
         t_llama = tg.create_task(
             _timed_task(
@@ -2072,9 +2177,15 @@ async def _build_gen_pillar(
     with _timed(timings, "llm_client"):
         _init_llm_client(state, client)
 
+    # assist が非常駐 (residency=on_demand) の間は URL を直接叩けないので
+    # 対象から外す。初回 ready 時に _on_first_ready が同じプローブを走らせる。
+    residency = state.assist_residency
+    probe_assist = assist_client
+    if residency is not None and residency.on_demand and not residency.is_ready():
+        probe_assist = None
     _start_quality_probes(
         state, cfg, resolver, debug_logger,
-        local_client=client, assist_client=assist_client, embedder=embedder,
+        local_client=client, assist_client=probe_assist, embedder=embedder,
     )
 
     from backend.pillars import GenPillar
@@ -2439,6 +2550,20 @@ async def _init_evolve_pipeline(
     )
 
 
+def _migrate_mode_rename(base: "_BaseContext") -> None:
+    """旧モード名 ``"coding"`` のローカルデータを ``"create"`` へ一度きり移行する。
+
+    マーカー (``local/.mode_renamed_create_v1``) 済みなら即 no-op。移行はユーザー
+    データの整形であって起動要件ではないため、失敗しても WARNING で継続する。
+    """
+    from backend.free.core.mode_rename_migrator import ModeRenameMigrator
+
+    try:
+        ModeRenameMigrator(base.resolver).migrate_if_needed()
+    except Exception as exc:
+        logger.warning("Mode rename migration skipped: %s", exc)
+
+
 def _activate_learning_partition(base: "_BaseContext", state: AppState) -> None:
     """base 学習パーティションを有効化する (active stem 確定 + flat→partition 移行)。
 
@@ -2563,6 +2688,13 @@ async def wire_pillars(
     # Base (横断基盤)
     with _timed(timings, "pillar_base"):
         base = await _build_base_context(state, project_root, timings)
+
+    # 旧モード名 "coding" → "create" の一度きり移行。パーティション有効化より前に
+    # 行い、以降のパス解決 (prompts/<mode>.md や <stem>/<mode>/) が現行名で当たる
+    # ようにする。partition_by_base_model の有無や base モデル identity には
+    # 依存しないため _activate_learning_partition の内側には置かない。
+    with _timed(timings, "mode_rename_migration"):
+        _migrate_mode_rename(base)
 
     # base 学習パーティション有効化 (active stem 確定 + flat→partition 一度きり移行)。
     # Learn pillar 構築より前に行い、experience / base prompts / fewshot / policy が

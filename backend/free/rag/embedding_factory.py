@@ -99,7 +99,7 @@ def create_embedding_backend(
             max_length = emb_cfg.get("max_length", 8192)
             # instruction-aware プレフィックス (Qwen3 等)。
             # ``embedding.instructions`` が config.yaml に無い場合は schema 既定値が
-            # 入る (chat / coding 両方の英語 instruction)。空辞書は LlamaCppEmbedder
+            # 入る (chat / create 両方の英語 instruction)。空辞書は LlamaCppEmbedder
             # 側の _FALLBACK_INSTRUCTION で救済。
             instructions = emb_cfg.get("instructions", {})
             # クエリ / ドキュメント整形テンプレート。schema 既定値は Qwen3 仕様

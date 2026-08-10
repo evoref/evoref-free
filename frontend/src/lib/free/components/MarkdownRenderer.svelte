@@ -57,7 +57,7 @@
 		renderCache.set(key, html);
 	}
 
-	// suppressCode: コーディングモードでコードをエディタへ流す場合、チャット側の
+	// suppressCode: クリエイトモードでコードをエディタへ流す場合、チャット側の
 	// コードブロックを「エディタに出力」プレースホルダに置換する。
 	let { content, suppressCode = false }: { content: string; suppressCode?: boolean } = $props();
 

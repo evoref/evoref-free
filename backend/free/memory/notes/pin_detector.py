@@ -14,7 +14,7 @@ EvorefMem 統合仕様 の自動 Pin 検出を実装する
     - i18n: トリガ辞書を YAML に外出し (``pin_triggers.yaml``)。
       ja/en を同一ファイルにフラットに記述するため、文字列マッチで両言語拾える
     - 否定優先 (negative-first): negative に該当した瞬間 pin 発火を抑制する
-    - mode 別: チャット / コーディングで固有トリガを持ち、common は両モード適用
+    - mode 別: チャット / クリエイトで固有トリガを持ち、common は両モード適用
 
 辞書ファイルの解決:
     - **shipped default**: ``backend/free/memory/_defaults/triggers/pin_triggers.yaml``
@@ -87,7 +87,7 @@ class PinDetection:
 class PinTriggers:
     """ロード済みのトリガ語辞書。
 
-    `mode_positive["chat"]` / `mode_positive["coding"]` は mode 固有 +
+    `mode_positive["chat"]` / `mode_positive["create"]` は mode 固有 +
     common をマージ済みのリストを保持する。`negative` は両モード共通。
     全要素は NFKC + lowercase 正規化済み。
     """
@@ -130,7 +130,7 @@ def load_pin_triggers(path: str | Path) -> PinTriggers:
         positive:
           common: [str, ...]
           chat:   [str, ...]
-          coding: [str, ...]
+          create: [str, ...]
         negative:
           common: [str, ...]
     """
@@ -164,20 +164,20 @@ def load_pin_triggers(path: str | Path) -> PinTriggers:
 
     common = _flatten(pos.get("common"))
     chat_only = _flatten(pos.get("chat"))
-    coding_only = _flatten(pos.get("coding"))
+    create_only = _flatten(pos.get("create"))
     negative = _flatten(neg.get("common"))
 
     triggers = PinTriggers(
         mode_positive={
             "chat": _dedup(common + chat_only),
-            "coding": _dedup(common + coding_only),
+            "create": _dedup(common + create_only),
         },
         negative=_dedup(negative),
     )
     logger.info(
-        "pin_triggers loaded: chat=%d, coding=%d, negative=%d",
+        "pin_triggers loaded: chat=%d, create=%d, negative=%d",
         len(triggers.mode_positive["chat"]),
-        len(triggers.mode_positive["coding"]),
+        len(triggers.mode_positive["create"]),
         len(triggers.negative),
     )
     return triggers
@@ -252,7 +252,7 @@ def detect_pin(
 
     Args:
         content: 判定対象テキスト (通常はユーザー発話)
-        mode: ``chat`` / ``coding``
+        mode: ``chat`` / ``create``
         triggers: ``load_pin_triggers`` で得た辞書
 
     Returns:

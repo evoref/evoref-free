@@ -1,8 +1,8 @@
 """
 
 :class:`SubjectCategoryRenameMigration` は、`SubjectKey.category` の
-in-place 書換を行う Migration の具象雛形。``mem.coding_task.*`` を
-``mem.coding_history.*`` に移行するようなケースを将来的に扱えるよう、
+in-place 書換を行う Migration の具象雛形。``mem.create_task.*`` を
+``mem.create_history.*`` に移行するようなケースを将来的に扱えるよう、
 本 Issue では枠組みのみ提供する (登録済 Migration には追加しない)。
 
 ## スコープ
@@ -25,7 +25,7 @@ EvorefMem の semantic スコープ (``global`` / ``projects/<project_id>``) は
   subject/pillar 属性を自己修復するため、本 Migration では index.jsonl に触れない
   (索引を自前で差し替えるよりバグ面積が小さい)
 - **predicate optional**: category 一致に追加して任意の fact 条件を
-  掛けられる (例: ``lambda fact: fact.type == "coding_task"``)
+  掛けられる (例: ``lambda fact: fact.type == "create_task"``)
 - **from_version / to_version 可変**: 本 Migration は「カテゴリ rename」
   という抽象的なパターンを扱うため、実際の版番号ペアは呼び出し側が決める。
   ``Migration`` ABC の ClassVar を instance 属性でシャドーすることで

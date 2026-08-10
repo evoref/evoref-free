@@ -403,13 +403,20 @@ class SemanticFactStore:
         """ID でファクトを取得する。存在しなければ None"""
         return self._facts.get(fact_id)
 
-    def update_fact(self, fact_id: str, **changes: Any) -> SemanticFact:
+    def update_fact(
+        self, fact_id: str, *, touch: bool = True, **changes: Any,
+    ) -> SemanticFact:
         """既存ファクトのフィールドを差分更新する。
 
         指定可能なフィールドは `SemanticFact` の dataclass フィールドのみ。
         `id` の変更は許可しない。インデックスに影響するフィールド
         (`subject` / `type` / `pinned`) を変更した場合は索引を再構築する。
         `embedding` を含めると EmbeddingStore にも反映する。
+
+        Args:
+            touch: ``accessed_at`` を現在時刻へ更新するか。既定 True。
+                埋め込みの遡及生成のような **保守処理はアクセスではない** ため、
+                False を渡して recency スコアと GC 判定を歪めないようにする。
         """
         fact = self._facts.get(fact_id)
         if fact is None:
@@ -423,7 +430,8 @@ class SemanticFactStore:
         self._remove_from_indexes(fact)
         for key, val in changes.items():
             setattr(fact, key, val)
-        fact.accessed_at = time.time()
+        if touch:
+            fact.accessed_at = time.time()
         self._add_to_indexes(fact)
         self._append_fact_line(fact)
         if "embedding" in changes:
@@ -535,7 +543,7 @@ class SemanticFactStore:
         前方一致でファクトを返す
 
         ``prefix`` は ``loop.`` / ``learn.`` / ``mem.`` のいずれかで始まる
-        完全な前方一致パターンを期待する (例: ``learn.policy.coding.``)。
+        完全な前方一致パターンを期待する (例: ``learn.policy.create.``)。
         索引 ``facts_by_pillar.idx`` を参照して高速化する。
         """
         if not _matches_pillar_prefix(prefix):

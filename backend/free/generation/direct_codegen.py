@@ -1,4 +1,4 @@
-"""staged コーディングパイプライン専用の単発ファイル生成。
+"""staged クリエイトパイプライン専用の単発ファイル生成。
 
 ``LongFormOrchestrator`` (CogWriterStrategy) はモジュール内部で instruction から
 独自に plan JSON / CodeSpec を **再合成**し、CodeUnit (関数/クラス粒度) に分割して
@@ -9,7 +9,7 @@ staged executor が組み立てた instruction (spec.md 全文 + flowchart + 契
 unit.spec のみ)。さらに CodeUnit 分割・再連結は import 重複や機能重複などの結合
 不整合を生む。
 
-staged は ``synthesize_coding_task_graph`` が既にプログラムをファイル単位へ決定的に
+staged は ``synthesize_create_task_graph`` が既にプログラムをファイル単位へ決定的に
 分解済みであり、1 code タスク = 1 ファイルの単発生成で足りる。本モジュールは
 その再計画・再合成・分割連結を経由せず、base モデルへの単発呼び出しのみで完結する
 軽量パスを提供する。instruction は無劣化のままプロンプトへ渡る。

@@ -1,4 +1,4 @@
-"""staged コーディングの test 工程: 生成テストをサンドボックスで実行する。
+"""staged クリエイトの test 工程: 生成テストをサンドボックスで実行する。
 
 **安全上の不変則**: evoref 自身のテストスイートを起動しうる ``PytestGate`` /
 ``scripts/safe_pytest.py`` / ``build_default_gates`` は **使わない**。これらは
@@ -14,7 +14,7 @@
   明示指定する**こと。pytest は指定されたファイルだけを収集するため、evoref の
   ``tests/system`` 等は対象にならない。``run()`` は常に 1 ファイルのみを渡す
   (この不変則が崩れると保証も崩れるので、ディレクトリ指定に変えてはいけない)。
-- ワークスペース既定は ``local/coding/`` で **repo 配下**にあるため、pytest は祖先を
+- ワークスペース既定は ``local/create/`` で **repo 配下**にあるため、pytest は祖先を
   遡って evoref のルート ``conftest.py`` / ``pytest.ini`` を **読み込む**
   (``--rootdir`` は rootdir 算出を変えるだけで conftest/ini 探索は止めない)。これは
   害ではなく、ルート ``conftest.py`` の subprocess ガードが生成テスト側の危険な

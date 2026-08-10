@@ -35,6 +35,7 @@ from backend.free.generation.models import (
     extract_target_chars,
 )
 from backend.free.generation.spec_renderer import render_spec_for_prompt
+from backend.free.llm.assist_client import assist_ready
 from backend.free.llm.json_schemas import CodePlan, TextPlan
 from backend.i18n_helper import prose_language_name
 
@@ -619,9 +620,16 @@ async def generate_plan_json(
 
     ``telemetry`` を渡すと最終結果の ``truncated`` / ``replanned`` 等が書き戻される。
     """
-    if assist_client is None:
-        logger.warning(
-            "create_plan: assist_client is None, falling back to single-unit plan",
+    # ``is None`` (未設定) と residency 非常駐を同じ扱いにする
+    # (docs/c_14 §6.1 の移行)。``assist_model.residency: on_demand`` では
+    # チャット中つねに非常駐なので、``is None`` のままだと long_form のたびに
+    # HTTP 手前まで進んで例外を踏み、「Plan generation failed」という
+    # 失敗に見える WARNING が出ていた (2026-08-09 ライブ監査)。
+    if not assist_ready(assist_client, "long_form_planning"):
+        logger.info(
+            "create_plan: assist model is not available "
+            "(not configured, or not resident during chat); "
+            "falling back to single-unit plan",
         )
         return {}
     plan_schema = CodePlan if content_type == ContentType.CODE else TextPlan

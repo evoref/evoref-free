@@ -78,6 +78,18 @@ def _text_matches_query(text: str, query_lower: str) -> bool:
     text_lower = text.lower()
     if query_lower in text_lower:
         return True
+    # 空白区切りのキーワード列は「語の集合」として扱う。判定側の抽出器は
+    # ``設計 言 答`` のような列を渡すので、連続部分文字列一致は構造的に当たらず、
+    # トークン重なりも ``tokenize_ja`` が 1 文字語を落とすため語数不足で無効化され、
+    # **どちらの経路にも乗らない** (実測 2026-08-10: tokens={'設計'} で len<5 →
+    # fallback 無効 → 不一致。``設計`` 単独なら一致する)。結果 score は最低値
+    # 0.1 のまま matched_turns も空になり、「この会話の最初に何を設計すると
+    # 言ったか」に「記述はありません」と答えていた。
+    terms = [t for t in query_lower.split() if len(t) >= 2]
+    if terms and len(query_lower.split()) > 1:
+        hit = sum(1 for t in terms if t in text_lower)
+        if hit >= math.ceil(len(terms) * _TOKEN_OVERLAP_RATIO):
+            return True
     query_tokens = _tokenize_cached(query_lower)
     if len(query_tokens) < _TOKEN_OVERLAP_MIN_QUERY_TOKENS:
         return False

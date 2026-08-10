@@ -222,7 +222,7 @@ class FeedbackPipe:
             ex = self._fewshot_pool.accept_from_artifact(
                 query=query,
                 response=response,
-                mode="coding",
+                mode="create",
                 fitness=float(marker.confidence),
                 added_at=time.strftime(
                     "%Y-%m-%dT%H:%M:%S",
@@ -337,7 +337,7 @@ class FeedbackPipe:
             object_=payload,
             type="policy",
             scope=self._writeback_scope,
-            mode_origin="coding",
+            mode_origin="create",
             confidence=CRITIQUE_POLICY_CONFIDENCE_INIT,
             auto_evolved=True,
         )

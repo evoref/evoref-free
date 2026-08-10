@@ -47,9 +47,33 @@ EXPLICIT_WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'「」()（）]+")
 #:
 #: 名詞 (excel / docx 等) は含めない — 単独で発火させると「report.xlsx を
 #: 読んで」のような read 文脈を誤って書込みと判定する。
+#: 「追記」「書き足」は 2026-08-08 に追加。``追加`` はあるのに ``追記`` が無く、
+#: 「同じファイルに 3 行追記して」が書込み意図として認識されずルータの
+#: local_write_intent を外れていた。その結果 chat では実行できる書込みツールが
+#: 無い経路に落ち、ツールを 1 つも撃たないまま「追記しました」と完了を捏造した
+#: (実ファイルは無変更。ライブ監査 ターン6)。
+#: 「作って」「作る」は 2026-08-09 に追加。``作成`` はあるのに口語の ``作って``
+#: が無く、``meta_cognitive_tools._TOOL_PATTERNS`` は write を先に照合する設計
+#: なのに書込み動詞として当たらず、後段の read パターン (``中身``/``内容``) に
+#: 落ちていた。その結果「E:\tmp に 在庫メモ.txt も **作って** ください。
+#: 中身は…」がファイル作成ではなく ``read_file`` として実行され、
+#: ``File not found`` で失敗した (ファイルは未作成。2026-08-09 ライブ監査)。
+#: 同じ依頼に「書いて」を足すと write 経路に乗って成功しており、差は動詞だけ。
+#:
+#: 「書き直」「書き換え」「上書き」「差し替え」「保存し」は 2026-08-09 の
+#: 2 回目のライブ監査で追加。``書[きい]`` 系は ``書く`` / ``書いて`` /
+#: ``書き足`` / ``書き込`` しか無く、**「書き直してください」が書込み期待と
+#: 判定されなかった**。その結果 ``determine_task_status`` の
+#: 「write を期待したのに write_file が走っていない → failed」ガードが効かず、
+#: ツールを 1 度も撃たないまま ``status=done`` で ✓ 表示され、ベースモデルが
+#: 吐いたツールコール構文 (``<|tool_call>call:write_file{...}``) がそのまま
+#: チャット本文に出た (実ファイルは無変更)。
+#: ``保存`` は「保存場所」「保存されている」のような状態の言及も拾うため、
+#: 連用形の ``保存し`` に限定する。
 WRITE_VERB_RE = re.compile(
-    r"作成|追加|実装|修正|変更|書き込|生成|更新|書く|書いて"
-    r"|create|write|add|implement|modify|update|generate|fix|refactor",
+    r"作成|作って|作る|追加|追記|書き足|書き直|書き換え|上書き|差し替え|保存し"
+    r"|実装|修正|変更|書き込|生成|更新|書く|書いて"
+    r"|create|write|append|add|implement|modify|update|generate|fix|refactor",
     re.IGNORECASE,
 )
 
@@ -70,7 +94,20 @@ WRITE_VERB_RE = re.compile(
 #: 近接語タプルにだけ存在し、キーワード側に無いため一度も効かない死んだ
 #: エントリになっていた)。距離をキーワード表そのものに持たせて派生させる。
 _HISTORY_KEYWORD_DISTANCE: tuple[tuple[str, str], ...] = (
-    ("前に", "long_range"),
+    # 「前に」単独は 2 文字の部分文字列で、履歴参照と無関係な語に必ず埋もれる
+    # (締切直**前に** / 名**前に** / 事**前に** / 手**前に** / 目の**前に**)。
+    # 照合は小文字化後の素の部分一致なので境界が無く、実インシデント
+    # (2026-08-09 2 回目のライブ監査): 「大会エントリーは締切直前にアクセスが
+    # 集中します…」という純粋な技術質問で search_history が強制発火し、
+    # 新規インストールで索引が空のため 1 往復を空費した。
+    # 履歴参照として意味を持つのは発話動詞を伴う形なので、そちらを列挙する。
+    # 単独の「以前」「前回」「過去の会話」は別エントリで拾えている。
+    ("前に言", "long_range"),
+    ("前にも言", "long_range"),
+    ("前に話", "long_range"),
+    ("前に聞", "long_range"),
+    ("前に伝え", "long_range"),
+    ("前に教え", "long_range"),
     ("以前", "long_range"),
     ("先週", "long_range"),
     ("先月", "long_range"),
@@ -159,7 +196,11 @@ PROXIMAL_RECALL_KEYWORDS: frozenset[str] = frozenset(
 
 #: 会話そのものを指す前置き。
 SESSION_ANCHOR_JA = (
-    r"(?:この会話|このやり取り|今までの(?:会話|やり取り)"
+    # 「このセッション」「この対話」は「この会話」と同義のアンカー。同義語を
+    # 落とすと同じ取りこぼしを言い換えのたびに繰り返す (2026-08-08 監査で
+    # 「このセッションで最後に指示した内容は」がアンカー無し扱いになった)。
+    r"(?:この会話|このやり取り|このセッション|この対話"
+    r"|今までの(?:会話|やり取り)"
     r"|今日の(?:追加分の)?会話|今回の(?:追加分の)?会話)"
 )
 
@@ -220,16 +261,31 @@ _SESSION_POSITION_LAST_RE = re.compile(
 #: 位置指定の対象がユーザー自身の発言であること。「最初に説明した内容」等の
 #: 話題ポインタを巻き込まないよう、発言そのものを指す語を要求する。
 _SESSION_POSITION_TARGET_RE = re.compile(
-    r"(?:送|言|聞|尋|書|投げ|打)\S{0,4}?"
-    r"(?:メッセージ|発言|質問|こと|内容|の)"
+    # 動詞に依頼系 (依頼|お願い|頼|指示) を含める。ユーザーは自分の発言を
+    # 「質問」ではなく「依頼」と呼ぶことがあり、語彙が欠けていると同じ
+    # 取りこぼしを繰り返す (実インシデント 2026-08-08 ライブ監査:
+    # 「この会話で私が一番最初に依頼したことは何でしたか。」に対し 9 番目の
+    # 発言「今日から100日後は…」と誤答した。2026-08-04 の「した質問」の
+    # 取りこぼしと同型)。
+    r"(?:送|言|聞|尋|書|投げ|打|依頼|お願い|頼|指示)\S{0,4}?"
+    r"(?:メッセージ|発言|質問|依頼|指示|こと|内容|の)"
+    # 名詞化しない疑問形も同じ対象を指す。「言った**こと**」は拾えるのに
+    # 「言った**か**」が漏れており、search_history 経由へ落ちて答えられな
+    # かった (実インシデント 2026-08-10 ライブ監査: 「この会話の最初に、
+    # 私が何を決めると言ったか答えてください。」→ 抽出後のキーワードが
+    # ``決 言 答`` と 1 文字語だけになり score 0.1 で「記述はありません」)。
+    # このクエリには内容名詞が無く、字句検索では構造的に answered できない。
+    # 位置参照として解くのが正しい経路。
+    r"|(?:言|述べ|話|聞|尋|送|書)\S{0,3}?(?:た|ました)(?:か|っけ|でしょうか)"
     # 「質問」は動詞を伴わない形でも発言そのものを指す。動詞集合に無い
     # 「した質問」や、動詞を持たない「一番最初の質問」が素通りして
     # search_history 経由の誤答になった (実インシデント 2026-08-04 ライブ監査:
     # 「この会話で私が一番最初にした質問は何でしたか。」に対し 6 番目の発言
     # 「今日の日付と現在時刻を教えてください。」と誤答)。
     r"|メッセージ|発言|質問"
-    r"|(?:message|question|thing)\s+(?:i|you)\s+(?:sent|said|asked)"
-    r"|(?:sent|said|asked)",
+    r"|(?:message|question|thing|request)\s+(?:i|you)\s+"
+    r"(?:sent|said|asked|requested)"
+    r"|(?:sent|said|asked|requested)",
     re.IGNORECASE,
 )
 #: アンカー + 話題切断の否定先読み。「この会話とは別に、最初に送るメッセージの
@@ -535,3 +591,164 @@ def self_output_measure_kinds(query: str) -> tuple[str, ...]:
     return tuple(
         kind for kind, pattern in _MEASURE_KIND_PATTERNS if pattern.search(query)
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 数値計算を求めるクエリ
+# ─────────────────────────────────────────────────────────────────────
+
+#: クエリ中の数値リテラル。
+NUMBER_LITERAL_RE = re.compile(r"\d+(?:\.\d+)?")
+
+#: 「値を尋ねている」手掛かり語。
+#:
+#: 単位を列挙すると必ず取りこぼす (実インシデント 2026-07-29 ライブ監査:
+#: 「残りは何リットルですか？」「進む距離は何kmですか？」がどちらも手掛かり語
+#: なしと判定され、base の暗算で誤答した)。「何<単位>+文末表現」という構造で
+#: 受ける。数値を含まないクエリは後段の数値チェックで落ちるため、「これは何
+#: ですか」のような非数量文で判定が緩むことはない。
+CALCULATION_CUE_RE = re.compile(
+    r"(?:いくつ|いくら|何[個円分秒時間日年枚人倍%％]|何キロ|何マイル|何時間"
+    # 文末表現に「ます」を含める。「進みます」「増えます」「減ります」など
+    # 動作動詞の丁寧形が最も普通の言い方なのに、``です|でしょ|になり|かかり|
+    # ありま`` だけでは受からなかった (実インシデント 2026-08-08 ライブ監査:
+    # 「時速240kmで2時間30分走ると何km進みますか。」が手掛かり語なしと判定
+    # され、base の暗算で 540km と誤答。正解は 600km)。
+    r"|何[ぁ-んァ-ヴーA-Za-z一-龥%％]{0,6}?(?:です|でしょ|になり|かかり|ありま|ます)"
+    r"|合計|総額|平均|割合|求め|計算"
+    r"|(?<![A-Za-z])how\s+(?:much|many)(?![A-Za-z])"
+    r"|(?<![A-Za-z])what\s+is(?![A-Za-z])|(?<![A-Za-z])total(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+
+#: 環境依存事実クエリ (実行可能コマンドで答える層が扱う) を巻き込まないための除外語。
+CALCULATION_EXCLUDE_RE = re.compile(
+    r"(?:何月|何日|何曜日|現在時刻|日付|バージョン|version"
+    r"|ディスク|メモリ|使用量|(?<![A-Za-z])CPU(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+
+
+#: 前提への同意を求める確認形。「〜ですよね？」「〜で合っていますか」等。
+#:
+#: 過去形 (でした / だった / ました) と文末の句点を取りこぼしていた。実インシデント
+#: 2026-08-10 ライブ監査:「平均のほうの毎分リクエスト数は 5,787 **でしたよね。**」が
+#: 確認形と判定されず、検証されないまま追認された (自分が 4 ターン前に calculate で
+#: 出した 3,472.2 と矛盾していた)。文末の ``。`` ``．`` も許す。
+#:
+#: router (誤前提を検索せず追認しないための分類) と deliberative (未検証の主張への
+#: 注記) が同じ判定を使うため core に置く。
+PREMISE_CONFIRMATION_RE = re.compile(
+    r"(?:です|ます|でした|ました|だ|だった|でしょう)よね[?？]?[。．]?$"
+    r"|(?:で|て)?(?:合って|あって|正しい|間違いな)(?:い)?(?:ます|です)?"
+    r"(?:か|よね|ね)[?？]?[。．]?$"
+    r"|(?:じゃない|ではない|ないです)(?:か|よね)[?？]?[。．]?$"
+    r"|\b(?:right|correct)\?$"
+    r"|\b(?:isn't|aren't|doesn't|don't)\s+(?:it|they|that)\?$",
+)
+
+#: 桁区切り入りの数字 (``5,787`` / ``1,234,567``)。
+_GROUPED_NUMBER_LITERAL_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?")
+
+#: 「会話に出ていない」と判定する最小桁数。1〜2 桁は「3 倍」「1 日」のように
+#: 文中で普通に現れるため、突き合わせても信号にならない。
+_CLAIM_NUMBER_MIN_DIGITS = 3
+
+
+def _normalized_numbers(text: str) -> set[str]:
+    """桁区切りを外した数値リテラルの集合 (純粋関数)。"""
+    found = set(NUMBER_LITERAL_RE.findall(text))
+    found.update(m.replace(",", "") for m in _GROUPED_NUMBER_LITERAL_RE.findall(text))
+    return found
+
+
+def unverified_claim_numbers(query: str, context: str) -> tuple[str, ...]:
+    """確認形のクエリが持ち込んだ「会話に無い数値」を返す (純粋関数)。
+
+    ユーザーが確認を求める形で数値を挙げたとき、その値が会話に一度も現れて
+    いなければ、同意してよい根拠が無い。実インシデント 2026-08-10 ライブ監査:
+    自分が calculate で出した 3,472.2 があるのに「5,787 でしたよね」に
+    「はい、5,787 です」と追認した。注記を添えると 3/3 で「その値は出ていません。
+    …3,472.2 です」と訂正するようになる (実測)。
+
+    確認形でないクエリ (ユーザーが新しい前提を述べているだけ) は対象外。
+    """
+    if not PREMISE_CONFIRMATION_RE.search(query.strip()):
+        return ()
+    known = _normalized_numbers(context)
+    unverified: list[str] = []
+    for raw in _GROUPED_NUMBER_LITERAL_RE.findall(query):
+        plain = raw.replace(",", "")
+        if plain not in known and raw not in unverified:
+            unverified.append(raw)
+    grouped_plain = {
+        m.replace(",", "") for m in _GROUPED_NUMBER_LITERAL_RE.findall(query)
+    }
+    for raw in NUMBER_LITERAL_RE.findall(query):
+        digits = raw.replace(".", "")
+        if len(digits) < _CLAIM_NUMBER_MIN_DIGITS:
+            continue
+        # 桁区切り表記の一部 (5,787 の 787) は重複計上しない
+        if any(raw in g for g in grouped_plain):
+            continue
+        if raw not in known and raw not in unverified:
+            unverified.append(raw)
+    return tuple(unverified)
+
+
+#: 被演算子が直前ターンにしかないことを示す照応。「その差」「先ほどの合計」等。
+#:
+#: 数量を表す名詞まで含めて限定する。指示語だけ (「それはどう思う?」) を拾うと
+#: 計算でないターンまで deliberative に回るため。なお呼び出し側は
+#: ``CALCULATION_CUE_RE`` (「何分になりますか」等) と **context に数値があること**
+#: も同時に要求するので、この正規表現単体で判定が緩むことはない。
+ANAPHORIC_OPERAND_RE = re.compile(
+    r"(?:その|それ|この|これ|先(?:ほど|程)の|さきほどの|さっきの|上記の|直前の)\s*"
+    r"(?:差|値|数値|数|合計|総額|金額|件数|回数|結果|平均|割合|時間|人数)"
+    r"|(?<![A-Za-z])(?:that|the)\s+"
+    r"(?:difference|total|sum|result|number|amount|average|count)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def looks_like_numeric_question(query: str, context: str = "") -> bool:
+    """式は書かれていないが数値計算の答えを求めているクエリか (純粋関数)。
+
+    2026-07-27 ライブ検証: 「1マイルは約1.609キロメートルです。42.195キロ
+    メートルは何マイルですか？」が全層 no_tool となり、base の暗算で 26.195
+    と誤答した (正解 26.224)。同じ計算を式で書くと層1 が calculate へ流して
+    正答するため、差は「式が書かれているか」だけだった。
+
+    値を尋ねる手掛かり語があり、環境依存事実クエリの語を含まず、クエリ自身に
+    数値が 1 つ以上あり、かつクエリ + ``context`` (直近の会話) を合わせて数値が
+    2 つ以上ある場合のみ True。
+
+    ``context`` を数える理由 (2026-07-28 ライブ検証): 「1マイルは何キロ?」の
+    直後に「では 26.2 マイルのフルマラソンは何キロですか。」と尋ねると、被演算子
+    の片方 (換算率 1.61) は直前ターンにしか無いためクエリ単独では 1 数値となり、
+    本フィルタで弾かれて base の暗算に倒れていた (42.19 と誤答。正解 42.16)。
+    手掛かり語と「クエリ自身に数値が要る」制約は残すので、数値を含まない雑談で
+    判定が緩むことはない。
+
+    ``agent.tool_call_judge`` (calculate フォールバックの事前フィルタ) と
+    ``agent.router`` (計算クエリを reactive へ落とさないための分類) が同じ判定を
+    使うため core に置く。``tool_call_judge`` は ``router`` を import している
+    ので、逆向きの参照は循環になり作れない。
+    """
+    if CALCULATION_EXCLUDE_RE.search(query):
+        return False
+    if not CALCULATION_CUE_RE.search(query):
+        return False
+    query_numbers = NUMBER_LITERAL_RE.findall(query)
+    if not query_numbers:
+        # 被演算子が **すべて** 直前ターンにある形。照応で数量を名指ししている
+        # ときだけ許す (実インシデント 2026-08-10 ライブ監査: 525.6 分と 262.8 分
+        # を出した直後の「その差を月あたりに直すと何分になりますか。」が
+        # 数値ゼロで弾かれ、router で short_query → reactive に落ちてツール判定に
+        # 一度も到達せず、base の暗算で 13.4 分と誤答した。正解 21.9 分)。
+        if not ANAPHORIC_OPERAND_RE.search(query):
+            return False
+        return bool(NUMBER_LITERAL_RE.search(context))
+    if len(query_numbers) >= 2:
+        return True
+    return bool(NUMBER_LITERAL_RE.search(context))

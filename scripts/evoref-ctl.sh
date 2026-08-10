@@ -18,7 +18,7 @@ start_all() {
     activate_venv
     setup_utf8
 
-    echo "[start] Starting llama-server (base + assist + embedding)..."
+    echo "[start] Starting llama-server (base + embedding; assist starts on demand)..."
     python scripts/launch_llama.py config.yaml --all &
     PIDS+=($!)
     sleep 3

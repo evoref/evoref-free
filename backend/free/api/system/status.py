@@ -35,8 +35,19 @@ _start_time = time.time()
 
 async def _collect_component_statuses(
     cfg: dict, state: AppState, client: object | None, base_connected: bool,
+    *, serving_user: bool = False,
 ) -> list[ComponentStatus]:
-    """各コンポーネント (base / assist / embed) のステータスを収集する"""
+    """各コンポーネント (base / assist / embed) のステータスを収集する
+
+    Args:
+        serving_user: ベースモデルがチャット応答を生成中か。True のときは
+            health check を投げない。ビジーな llama-server への probe は
+            タイムアウトしやすく、**動いている最中に「未接続」と表示される**
+            (2026-08-09 ライブ監査: チャット中だけ ``Health check: connection
+            failed`` が 47 件、アイドル時は 0 件。手動 curl では base も embed も
+            200 を返した)。ターンが進行中であること自体が接続済みの証拠で、
+            これは ``_try_lazy_connect`` が既に採っている判断と同じ。
+    """
     from pathlib import Path
 
     components: list[ComponentStatus] = []
@@ -52,22 +63,38 @@ async def _collect_component_statuses(
     assist_model_path = cfg.get("model_paths", {}).get("assist_model", "")
     assist_name = Path(assist_model_path).stem if assist_model_path else ""
     assist_connected = False
+    residency = getattr(state, "assist_residency", None)
+    assist_residency_state: str | None = None
+    if residency is not None and residency.on_demand:
+        assist_residency_state = residency.status
     if state.assist_client is not None:
-        try:
-            assist_connected = await state.assist_client.health_check()
-        except Exception:
-            pass
-    components.append(ComponentStatus(name=assist_name, connected=assist_connected))
+        # 非常駐が設計どおりの状態なら health check を投げない。UI は数秒ごとに
+        # /api/status をポーリングするため、死んだポートへ毎回 ConnectError を
+        # 出しにいくとログが埋まる (docs/c_14 §1.2)。
+        if residency is None or residency.is_ready():
+            try:
+                assist_connected = await state.assist_client.health_check()
+            except Exception:
+                pass
+    components.append(ComponentStatus(
+        name=assist_name,
+        connected=assist_connected,
+        residency=assist_residency_state,
+    ))
 
     # embed model
     embed_cfg = cfg.get("embedding", {})
     embed_name = embed_cfg.get("model_name") or ""
     embed_connected = False
     if state.embedder is not None and hasattr(state.embedder, "health_check"):
-        try:
-            embed_connected = await state.embedder.health_check()
-        except Exception:
-            pass
+        if serving_user:
+            # 進行中のターンは RAG (= 埋め込み) を既に通しているため接続済み。
+            embed_connected = True
+        else:
+            try:
+                embed_connected = await state.embedder.health_check()
+            except Exception:
+                pass
     components.append(ComponentStatus(name=embed_name, connected=embed_connected))
 
     return components
@@ -212,12 +239,21 @@ async def get_status(state: AppState = Depends(get_app_state)):
     llama_url = f"http://{llama_host}:{llama_port}"
     connected = False
 
+    # 生成中は health check を投げない。ビジーな llama-server への probe は
+    # タイムアウトしやすく、応答中なのに「未接続」と表示される
+    # (_collect_component_statuses の serving_user 引数を参照)。
+    serving_user = bool(
+        getattr(getattr(state, "llm_client", None), "is_serving_user", False),
+    )
     client = state.local_client
     if client:
-        try:
-            connected = await client.health_check()
-        except Exception:
-            connected = False
+        if serving_user:
+            connected = True
+        else:
+            try:
+                connected = await client.health_check()
+            except Exception:
+                connected = False
 
     # 未接続なら遅延接続を試行（auto-serve 時に llama-server が後から起動するケース）
     # 失敗後はバックオフし、サーバが死んでいる間も /api/status を高速化する
@@ -250,7 +286,9 @@ async def get_status(state: AppState = Depends(get_app_state)):
         )
 
     # --- 各コンポーネントのステータス ---
-    components = await _collect_component_statuses(cfg, state, client, connected)
+    components = await _collect_component_statuses(
+        cfg, state, client, connected, serving_user=serving_user,
+    )
 
     # メモリ統計
     mem_sys = state.get_memory_system()

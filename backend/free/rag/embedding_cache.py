@@ -189,7 +189,7 @@ class CachedEmbeddingBackend:
         """テキストリストを埋め込みベクトルに変換（キャッシュ対応）
 
         ``is_query=True`` の場合はキャッシュを使用しない（クエリは内部 LRU で対応）。
-        ``mode`` (``chat``/``coding``) は内部バックエンドへ素通り
+        ``mode`` (``chat``/``create``) は内部バックエンドへ素通り
         ドキュメント側 (``is_query=False``) は Qwen3 仕様で prefix を付けないため、
         永続キャッシュキーは ``(model_name, text)`` のままで mode 分離は不要。
         """

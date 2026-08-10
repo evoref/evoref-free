@@ -131,7 +131,7 @@
 							}}
 							>
 								<option value="chat">{$t('sidebar.mode_chat')}</option>
-								<option value="coding">{$t('sidebar.mode_coding')}</option>
+								<option value="create">{$t('sidebar.mode_create')}</option>
 							</select>
 						</div>
 					</div>

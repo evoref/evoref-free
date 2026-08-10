@@ -5,8 +5,8 @@
 # reasoning / thinking 非対応の dense モデル。
 #
 # sampling は意図的に空: プロファイル sampling は modes.* を上書きするため、
-# ここで値を入れると chat (temp 0.7) と coding (temp 0.3) のモード別チューニングを
-# 一律に潰してしまう。Qwen2.5-Coder はコーディング用途で coding モードの低温度が
+# ここで値を入れると chat (temp 0.7) と create (temp 0.3) のモード別チューニングを
+# 一律に潰してしまう。Qwen2.5-Coder はコーディング用途で create モードの低温度が
 # 有効なので modes.* に委ねる。
 #
 # dense なので MoE 無効。内蔵 ChatML テンプレートを使うため --jinja を付与。

@@ -5,7 +5,7 @@
 # 専用プロファイルが必要 (cf. lfm2 と lfm2moe の分離)。
 #
 # sampling は意図的に空: プロファイル sampling は modes.* を上書きするため、
-# ここで値を入れると chat (temp 0.7) と coding (temp 0.3) のモード別チューニングを
+# ここで値を入れると chat (temp 0.7) と create (temp 0.3) のモード別チューニングを
 # 一律に潰してしまう。Qwen3 系はモード別の温度差が有効なので modes.* に委ねる。
 #
 # dense なので MoE 無効。内蔵テンプレートを使うため --jinja を付与。

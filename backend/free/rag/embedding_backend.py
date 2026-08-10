@@ -8,7 +8,7 @@ Qwen3-Embedding は instruction-aware かつ非対称な埋め込みモデルで
 - クエリ側 (``is_query=True``): ``f"Instruct: {task}\\nQuery: {query}"`` 形式で integration
 - ドキュメント側 (``is_query=False``): prefix を一切付与しない
 
-を要求する。``task`` は ``mode`` (``chat`` / ``coding``) によって切替えられ、
+を要求する。``task`` は ``mode`` (``chat`` / ``create``) によって切替えられ、
 ``config.yaml`` の ``embedding.instructions`` で定義される。
 """
 
@@ -66,7 +66,7 @@ class EmbeddingBackend(Protocol):
         Args:
             texts: 埋め込み対象テキストのリスト
             is_query: True でクエリ用 instruction を付与、False で素のテキスト
-            mode: ``chat`` / ``coding`` のいずれか。``is_query=True`` のときに
+            mode: ``chat`` / ``create`` のいずれか。``is_query=True`` のときに
                 ``embedding.instructions[mode]`` を解決して prefix を生成する。
                 ``is_query=False`` 時は無視される (Qwen3 はドキュメント側に
                 prefix を付けない仕様)。
@@ -83,7 +83,7 @@ class EmbeddingBackend(Protocol):
 
         Args:
             query: 検索クエリ文字列
-            mode: ``chat`` / ``coding`` のいずれか。LRU キャッシュキーは mode
+            mode: ``chat`` / ``create`` のいずれか。LRU キャッシュキーは mode
                 ごとに分離される。
 
         Returns:
@@ -119,7 +119,7 @@ class QueryCacheMixin:
     サブクラスは ``_embed_single_query(query, mode)`` のみ実装する。
 
     キャッシュキーは ``(mode, normalized_query)`` で名前空間分離する
-    chat 用埋め込みが coding 検索で誤って再利用されるのを防ぐ。
+    chat 用埋め込みが create 検索で誤って再利用されるのを防ぐ。
     """
 
     _query_cache: OrderedDict[str, np.ndarray]

@@ -52,8 +52,8 @@ export interface ThemeConfig {
 
 export interface ModelPathsConfig {
 	base_model: string;
-	coding_model?: string | null;
-	assist_coding_model?: string | null;
+	create_model?: string | null;
+	assist_create_model?: string | null;
 	[key: string]: unknown;
 }
 
@@ -284,11 +284,11 @@ export interface ChatModeConfig {
 	presence_penalty: number;
 }
 
-export type CodingModeConfig = ChatModeConfig;
+export type CreateModeConfig = ChatModeConfig;
 
 export interface ModesConfig {
 	chat: ChatModeConfig;
-	coding: CodingModeConfig;
+	create: CreateModeConfig;
 }
 
 export interface EditorSettingsConfig {

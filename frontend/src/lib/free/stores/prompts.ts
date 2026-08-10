@@ -18,7 +18,7 @@ import { addToast } from './toast';
 /** 選択中のプロンプト識別子 */
 export interface PromptSelection {
 	category: PromptCategory;
-	id: string; // mode (chat/coding) or task (rag_necessity/...)
+	id: string; // mode (chat/create) or task (rag_necessity/...)
 }
 
 // PromptCategory と PromptDetailWithScore を re-export

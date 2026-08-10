@@ -50,23 +50,67 @@ _CHAR_LIMIT_RE = re.compile(
 )
 
 
+#: 「300字ちょうど」「ちょうど300文字で」型の **厳密指定**。上限指定
+#: (_CHAR_LIMIT_RE) とは守り方が違う (足りない側も直す必要がある) ため分ける。
+_CHAR_EXACT_RE = re.compile(
+    r"(?:ちょうど|丁度|きっかり|正確に)\s*(\d{1,5})\s*(?:文字|字)"
+    r"|(\d{1,5})\s*(?:文字|字)\s*(?:ちょうど|丁度|きっかり|で書|で説明|で答)"
+    r"|exactly\s+(\d{1,5})\s*(?:characters?|chars?)",
+    re.IGNORECASE,
+)
+
+#: 「「あ」を50回」型の反復回数指定。
+_REPEAT_COUNT_RE = re.compile(
+    r"(\d{1,4})\s*回\s*(?:だけ)?\s*(?:続けて|繰り返|repeat)"
+    r"|(?:続けて|繰り返して)\s*(\d{1,4})\s*回"
+    r"|repeat(?:ed)?\s+(\d{1,4})\s+times",
+    re.IGNORECASE,
+)
+
+
 def _char_limit_note(history: list[ChatMessage]) -> str:
-    """最新 user ターンの文字数上限指定を、遵守を促す注記へ変換する。
+    """最新 user ターンの数量指定を、遵守を促す注記へ変換する。
 
     小型モデルは「10 文字以内にして」を守れず超過する (実インシデント
     2026-07-29 ライブ監査: 「10文字以内にしてください」への回答が
     「青空のよう、希望を抱く。」= 12 文字だった)。数え方 (句読点・記号も
     1 文字) を明示した制約として、生クエリ直後へ焦点化して置く。
 
+    上限 (``以内``) だけでなく **厳密指定** (``ちょうど``) と **反復回数**
+    も扱う。守り方が違う: 上限は超えたら削るだけだが、厳密指定は足りない側も
+    直す必要がある。実インシデント (2026-08-08 ライブ監査): 「300字ちょうど」
+    に 267 字、「「あ」を50回」に 45 個で、いずれも **不足側** に外していた。
+
     Returns:
-        注記文字列。上限指定が無ければ空文字列 (純粋関数)。
+        注記文字列。数量指定が無ければ空文字列 (純粋関数)。
     """
     last_user = next(
         (t for t in reversed(history) if t.get("role") == "user"), None,
     )
     if last_user is None:
         return ""
-    m = _CHAR_LIMIT_RE.search(str(last_user.get("content") or ""))
+    text = str(last_user.get("content") or "")
+
+    m = _CHAR_EXACT_RE.search(text)
+    if m:
+        exact = next(g for g in m.groups() if g)
+        return (
+            f"今回のユーザーの指示は回答本文を {exact} 文字ちょうどにすることを"
+            f"求めている。句読点・記号・空白も 1 文字として数えること。"
+            f"書き終えたら数え直し、**多くても少なくても** 語を足し引きして "
+            f"{exact} 文字に合わせること。"
+        )
+
+    m = _REPEAT_COUNT_RE.search(text)
+    if m:
+        times = next(g for g in m.groups() if g)
+        return (
+            f"今回のユーザーの指示は {times} 回ちょうどの繰り返しを求めている。"
+            f"書き終えたら個数を数え直し、多くても少なくても {times} 個に"
+            f"合わせること。"
+        )
+
+    m = _CHAR_LIMIT_RE.search(text)
     if not m:
         return ""
     limit = m.group(1) or m.group(2)

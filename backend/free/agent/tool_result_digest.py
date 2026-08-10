@@ -14,6 +14,7 @@ import re
 from typing import TYPE_CHECKING
 
 from backend.free.agent.meta_cognitive_utils import is_tool_error
+from backend.free.llm.assist_client import assist_ready
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -51,7 +52,16 @@ _DIGEST_MIN_RESULT_CHARS = 200
 #: 閾値根拠: 同監査の正常な digest は 22 / 216 / 231 / 370 / 374 文字。
 #: 最小の 22 文字は read_file の行数・文字数抽出で、正当な短い digest。
 #: 8 文字はその下限より十分小さく、正当な短抽出を巻き込まない。
+#:
+#: ただし数量を問う質問への digest は「数値そのもの」が完全な答えなので、
+#: 長さで崩壊と判定してはならない (:func:`_is_grounded_numeric_answer` 参照)。
 _DIGEST_MIN_USEFUL_CHARS = 8
+
+#: 数値そのものが答えになっている digest。桁区切り・小数・短い単位を許容する
+#: (``121`` / ``3,353`` / ``12.5 秒`` / ``8 KB``)。
+_NUMERIC_ANSWER_RE = re.compile(
+    r"^\d[\d,，]*(?:[.．]\d+)?\s*[^\s\d]{0,6}$",
+)
 
 # 小型 assist モデルは「関連情報なし」を _NO_INFO トークンではなく自然文
 # パラフレーズで返すことがある (実インシデント 2026-07-26: search_history が
@@ -123,6 +133,26 @@ def _numeric_claims_grounded(digest: str, tool_result: str) -> bool:
     return all(n in tool_result for n in digest_numbers)
 
 
+def _is_grounded_numeric_answer(digest: str, tool_result: str) -> bool:
+    """digest が「raw に実在する数値そのもの」かを判定する (純粋関数)。
+
+    「何行ありますか」「何文字ありますか」のような数量質問では、数値 1 つが
+    完全な答えであって要約の崩壊ではない。長さだけで崩壊と判定すると、正解を
+    捨てて raw を base へ丸投げすることになる。
+
+    実インシデント (2026-08-07 ライブ監査): ``README.md は何行ありますか？``
+    に対し digest が正しく ``121`` を返したが、3 文字なので
+    ``_DIGEST_MIN_USEFUL_CHARS`` に弾かれて 3427 文字の raw へ退避し、base が
+    自力で数えて ``123 行`` と誤答した。
+
+    raw への接地 (:func:`_numeric_claims_grounded`) を必須にしているので、
+    捏造された数値がこの例外を通ることはない。
+    """
+    if not _NUMERIC_ANSWER_RE.match(digest.strip()):
+        return False
+    return _numeric_claims_grounded(digest, tool_result)
+
+
 def _content_of(result: dict) -> str:
     """OAI 応答 dict から ``choices[0].message.content`` を安全に取り出す。"""
     try:
@@ -148,7 +178,11 @@ async def digest_tool_result(
     ツール結果 (無関係な過去セッションの内容等) へフォールバックしないようにする。
     assist が落ちていても例外を投げない。
     """
-    if assist_client is None:
+    # residency 非常駐 (``on_demand`` のチャット中) も「使えない」に含める
+    # (docs/c_14 §6.1)。``is None`` だけだとツールを撃つたびに HTTP 手前まで
+    # 進んで例外を踏み、その分だけ応答が遅れる。digest が無ければ raw の
+    # ツール結果を使う既存フォールバックがそのまま働く。
+    if not assist_ready(assist_client, "tool_result_digest"):
         return None
     if not tool_result or is_tool_error(tool_result):
         return None
@@ -213,7 +247,10 @@ async def digest_tool_result(
             tool_name,
         )
         return None
-    if len(digest) < _DIGEST_MIN_USEFUL_CHARS:
+    if (
+        len(digest) < _DIGEST_MIN_USEFUL_CHARS
+        and not _is_grounded_numeric_answer(digest, tool_result)
+    ):
         # 200 文字以上の入力から数文字しか返らないのは要約ではなく抽出の崩壊。
         # そのまま「唯一の事実根拠」枠に載せると base は中身ゼロの文字列を
         # 根拠に答えることになる (2026-08-05 ライブ監査: search_history の

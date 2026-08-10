@@ -588,7 +588,7 @@ class LocalClient(BaseHTTPClient):
             request_timeout: 非ストリーミング呼び出し (``stream=False``) 専用の
                      per-request タイムアウト上書き (秒)。既定 (None) は
                      ``self._http_timeout`` (120s)。大きな max_tokens を同期
-                     生成する呼出側 (例: staged コーディングの単発ファイル生成)
+                     生成する呼出側 (例: staged クリエイトの単発ファイル生成)
                      が、iGPU 等の低速環境で総生成時間が既定を超える場合に使う。
                      ストリーミング (``stream=True``) には影響しない。
         """
@@ -944,6 +944,71 @@ class LocalClient(BaseHTTPClient):
             logprobs = [tok["logprob"] for tok in lp_data["content"]]
 
         return {"content": content, "logprobs": logprobs}
+
+    async def generate_tool_call(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict],
+        temperature: float = 0.2,
+        max_tokens: int = 256,
+        id_slot: int | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        """OAI ``tools`` を渡してツール選択だけをさせる非ストリーミング推論。
+
+        ``assist_model.residency: on_demand`` のチャット中はアシストの
+        ``tool_judgment`` が撃てないため、ベースモデル自身のネイティブ tool
+        calling で代替する (docs/c_14 §1.3)。本文生成はしないので
+        ``max_tokens`` は tool_call を吐ける程度で足りる。
+
+        ``tools`` を受け付けない llama-server build / chat template では 4xx が
+        返る。リトライしても回復しないため呼出側で 1 度だけ判定し、以後は
+        ネイティブ経路を無効化すること。
+
+        Returns:
+            ``choices[0].message`` の dict。``tool_calls`` が無ければツール不要と
+            モデルが判断したことを意味する。
+        """
+        payload = self._build_payload(
+            messages,
+            stream=False,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            id_slot=id_slot,
+            tools=tools,
+        )
+
+        client = self._get_http_client()
+        retry_logger = make_retry_logger(self._debug_logger, backend="base")
+
+        async def _do_post() -> dict:
+            resp = await client.post(
+                f"{self.url}/v1/chat/completions",
+                json=payload,
+                timeout=timeout if timeout is not None else self._http_timeout,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+        data = await async_retry_http_call(
+            _do_post,
+            request_label="LocalClient /v1/chat/completions (tools)",
+            retry_logger=retry_logger,
+        )
+        choices = data.get("choices") or [{}]
+        message = choices[0].get("message") or {}
+
+        # 予算を使い切って tool_call が無い応答は 100% 無駄撃ち (実測 28 秒)。
+        # 判定させたつもりがモデルが本文を書き始めた場合に起きるので、次の監査で
+        # 追えるよう記録する。戻り値の契約 (message dict) は変えない。
+        if choices[0].get("finish_reason") == "length" and not message.get("tool_calls"):
+            logger.warning(
+                "Native tool calling exhausted max_tokens=%d without a tool call "
+                "(model wrote prose instead of judging); falling through to no_tool",
+                max_tokens,
+            )
+        return message
 
     async def health_check(self) -> bool:
         """llama-server のヘルスチェック"""

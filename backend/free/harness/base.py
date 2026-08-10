@@ -52,7 +52,7 @@ class DefaultHarness:
         self,
         *,
         harness_view: HarnessFactView,
-        mode: str = "coding",
+        mode: str = "create",
         max_failures: int = 5,
         max_fewshot: int = 3,
         observation_window: int = 3,
@@ -61,7 +61,7 @@ class DefaultHarness:
         """Args:
             harness_view: SemMem (global + project スコープ) への read-only View。
                 prompt_builder が failure_pattern / fewshot を引く際に使う。
-            mode: ``"chat"`` / ``"coding"`` 等。fewshot subject 前方一致に使用。
+            mode: ``"chat"`` / ``"create"`` 等。fewshot subject 前方一致に使用。
             max_failures: 注入する failure_pattern の最大件数。
             max_fewshot: 注入する fewshot の最大件数。
             observation_window: 直近観測結果のリングバッファサイズ。

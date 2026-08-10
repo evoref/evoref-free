@@ -24,12 +24,12 @@
 <SettingsSection tabId="model">
 	<!-- ベースモデル (migrate 専用。config 直保存は不可。再起動は別途手動) -->
 	<FieldGroup label="settings.group_model_base">
-		<!-- base llama-server の起動/停止/再起動。base 切替は手動再起動が必要 (coding も同 slot) -->
+		<!-- base llama-server の起動/停止/再起動。base 切替は手動再起動が必要 (create も同 slot) -->
 		<ModelServerControl server="base" />
 		<ComponentMigrateButton component="base" currentModel={String(models.base_model ?? '')} onMigrated={loadConfig} />
-		<!-- Pro: コーディングモードは Pro ワークモード専用。model_state 非追跡のため切替で即 config 保存 -->
+		<!-- Pro: クリエイトモードは Pro ワークモード専用。model_state 非追跡のため切替で即 config 保存 -->
 		<ProSection columns={1}>
-			<ComponentMigrateButton component="coding" currentModel={String(models.coding_model ?? '')} onMigrated={loadConfig} onApply={(p) => saveModelPathsField('coding_model', p || null)} />
+			<ComponentMigrateButton component="create" currentModel={String(models.create_model ?? '')} onMigrated={loadConfig} onApply={(p) => saveModelPathsField('create_model', p || null)} />
 		</ProSection>
 	</FieldGroup>
 
@@ -39,10 +39,10 @@
 		<ModelServerControl server="assist" />
 		<ToggleField label="settings.assist_model.enabled" value={Boolean(assistModel.enabled ?? true)} onchange={fieldUpdater('assist_model', 'enabled')} />
 		<ComponentMigrateButton component="assist" currentModel={String(models.assist_model ?? '')} onMigrated={loadConfig} />
-		<!-- Pro: コーディングモード用アシストモデル。model_state 非追跡のため切替で即 config 保存
-		     (base の coding_model と対称。実際の差替えは /api/mode/switch がモード遷移時に行う) -->
+		<!-- Pro: クリエイトモード用アシストモデル。model_state 非追跡のため切替で即 config 保存
+		     (base の create_model と対称。実際の差替えは /api/mode/switch がモード遷移時に行う) -->
 		<ProSection columns={1}>
-			<ComponentMigrateButton component="assist_coding" currentModel={String(models.assist_coding_model ?? '')} onMigrated={loadConfig} onApply={(p) => saveModelPathsField('assist_coding_model', p || null)} />
+			<ComponentMigrateButton component="assist_create" currentModel={String(models.assist_create_model ?? '')} onMigrated={loadConfig} onApply={(p) => saveModelPathsField('assist_create_model', p || null)} />
 		</ProSection>
 		<TextField label="settings.assist_model.local.host" value={String(local.host ?? '127.0.0.1')} onchange={nestedFieldUpdater('assist_model', 'local', 'host')} />
 		<NumberField label="settings.assist_model.local.port" value={Number(local.port ?? 8081)} min={1024} max={65535} onchange={nestedFieldUpdater('assist_model', 'local', 'port')} />

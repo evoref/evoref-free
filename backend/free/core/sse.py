@@ -54,7 +54,7 @@ class SSEFrameBuilder:
 
     @staticmethod
     def editor_route(target: str) -> str:
-        """エディタ振り分けフレーム: 生成コードの出力先通知（coding モードのみ）
+        """エディタ振り分けフレーム: 生成コードの出力先通知（create モードのみ）
 
         ストリーム冒頭でトークンより先に 1 度だけ送信し、フロントエンドが
         コードブロックをエディタへ流すかチャットに表示するかを決める。
@@ -71,7 +71,7 @@ class SSEFrameBuilder:
         filename: str | None = None,
         partial: bool = False,
     ) -> str:
-        """エディタコードフレーム: 生成コード本文をエディタペインへ直接送る（coding モードのみ）
+        """エディタコードフレーム: 生成コード本文をエディタペインへ直接送る（create モードのみ）
 
         出力先パス未指定 (editor 経路) のとき、ディスク書込の代わりに生成コードを
         専用チャネルでフロントへ送出する。チャット本文とは独立に送る。

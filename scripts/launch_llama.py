@@ -43,7 +43,7 @@ config.yaml の llama / embedding セクションから起動コマンドを組�
   従来の per-request ``chat_template_kwargs.enable_thinking=false``
   との二重防御で、サーバ側 fence 失敗時にもフォールバック可能。
   self-speculative decoding (``--spec-default`` / ``--spec-type ngram-*``) を
-  Pro 限定で有効化する。``evoref code`` モード
+  Pro 限定で有効化する。``evoref create`` モード
   の base モデルが対象。``EVOREF_EDITION`` 環境変数 + ``backend.pro`` パッケー
   ジ存在で Pro 判定し、Free 環境では ``llama.speculative.enabled=true`` でも
   warning + 無効化する。assist / embed は対象外 (Issue 文 §スコープ)。
@@ -954,7 +954,7 @@ def build_assist_cmd(
 
     Level 2 assist=B の候補評価では ``lora_override`` (候補 GGUF LoRA パス) と
     ``port_override`` (スクラッチポート) を指定して ephemeral サーバを起動する。
-    ``model_override`` は chat/coding モード切替時 (``model_paths.assist_coding_model``)
+    ``model_override`` は chat/create モード切替時 (``model_paths.assist_create_model``)
     に一時的に別 GGUF を読み込ませる用途 (build_llama_cmd と同じパターン)。
     いずれも未指定 (通常運用) のときは従来挙動と完全に等価。
 
@@ -1000,10 +1000,10 @@ def build_assist_cmd(
     # LoRA アダプタ。lora_override (Level 2 assist=B 候補評価) は無条件で付与する
     # (候補 GGUF は harness が起動直前に書き出すため exists チェックしない)。
     # 通常運用は local_paths.assist_lora_adapter が存在するときのみ付与し、採用済み
-    # assist LoRA を次回起動で反映する。model_override (chat/coding モード切替) 時は
+    # assist LoRA を次回起動で反映する。model_override (chat/create モード切替) 時は
     # lora_override が明示されない限り LoRA を付けない — assist_lora_adapter は
     # chat 用アシストの重みに対して学習されたものであり、arch が異なりうる
-    # coding 用モデルに無条件添付すると shape mismatch で起動失敗しうるため。
+    # create 用モデルに無条件添付すると shape mismatch で起動失敗しうるため。
     if lora_override is not None:
         cmd += ["--lora", str(Path(lora_override))]
     elif model_override is None and lora_fallback:
@@ -2014,7 +2014,7 @@ def resolve_context_size_for(
     み、かつ ``project_root`` 指定時のみ (未指定なら config + 既定で解決)。
     embed は profile 非対象 (従来挙動)。
 
-    ``model_override`` 指定時 (例: /api/mode/switch で coding_model に差し替えて
+    ``model_override`` 指定時 (例: /api/mode/switch で create_model に差し替えて
     base を再起動する経路) は、その実モデルの profile から ``context_size`` を
     引く。これにより ``-m`` で渡すモデルと ``-c`` が一致する (旧実装は常に
     base_model profile から ``-c`` を引いていた)。``llama.context_size`` の明示は
@@ -2512,22 +2512,47 @@ def format_placement_summary(estimates: dict[str, dict]) -> list[str]:
     return lines
 
 
+def assist_residency_is_on_demand(cfg: dict) -> bool:
+    """``assist_model.residency`` が ``on_demand`` (既定) かどうか。
+
+    True のとき、アシスト llama-server は backend の
+    ``AssistResidencyManager`` がアイドル窓 / create モードの間だけ起動する。
+    起動スクリプト側で常駐させてはいけない (docs/c_14 §1.2)。
+    """
+    assist_cfg = cfg.get("assist_model", {}) or {}
+    if not assist_cfg.get("enabled", True) or not assist_cfg.get("local"):
+        return False
+    return str(assist_cfg.get("residency", "on_demand")) == "on_demand"
+
+
 def check_vram_budget(
     cfg: dict, project_root: Path | None = None, *, force: bool = False,
 ) -> tuple[bool, int, int | None, dict[str, dict], str]:
     """VRAM 予算との比較を行う
 
+    ``assist_model.residency: on_demand`` では 2 段で評価する:
+
+    - **チャット常駐** (base + embed): 予算超過なら従来どおり中断する。
+      ユーザーが日常的に使う構成なので、ここは硬く守る。
+    - **アイドル窓ピーク** (base + assist + embed): 超過しても warning に留める。
+      アイドル窓と create モードでしか同時常駐せず、その間はユーザーが
+      チャットしていない。assist 分を差し引いた余裕をベースモデルの
+      大型化に回せるようにするのが目的。
+
     Returns:
         (ok, total_vram_mb, budget_mb, estimates, message)
 
         - ``ok``: True なら起動継続可。False なら超過中 (force=True でも True にはならない)
-        - ``total_vram_mb``: 推定 VRAM 合計
+        - ``total_vram_mb``: 判定に使った VRAM 合計 (on_demand ではチャット常駐分)
         - ``budget_mb``: ``runtime.total_vram_budget_mb`` (未設定なら None)
         - ``estimates``: モデル別内訳 (``estimate_vram_usage_mb`` の返り値)
         - ``message``: 人間可読なログ用メッセージ
     """
     estimates = estimate_vram_usage_mb(cfg, project_root)
-    total_vram_mb = sum(e.get("vram_mb", 0) for e in estimates.values())
+    peak_vram_mb = sum(e.get("vram_mb", 0) for e in estimates.values())
+    on_demand = assist_residency_is_on_demand(cfg)
+    assist_vram_mb = (estimates.get("assist") or {}).get("vram_mb", 0)
+    total_vram_mb = peak_vram_mb - assist_vram_mb if on_demand else peak_vram_mb
     runtime_cfg = cfg.get("runtime", {}) or {}
     budget_mb = runtime_cfg.get("total_vram_budget_mb")
 
@@ -2542,7 +2567,17 @@ def check_vram_budget(
             "[launch] GPU/CPU placement summary (via llama-fit-params, Tier 1):"
         )
     lines.extend(format_placement_summary(estimates))
-    lines.append(f"  total estimated VRAM: {total_vram_mb} MB")
+    if on_demand:
+        lines.append(
+            f"  chat-resident VRAM (assist on demand): {total_vram_mb} MB"
+        )
+        lines.append(
+            f"  idle-window peak (with assist): {peak_vram_mb} MB "
+            f"(assist {assist_vram_mb} MB, loaded only while you are idle "
+            "or in create mode)"
+        )
+    else:
+        lines.append(f"  total estimated VRAM: {total_vram_mb} MB")
     if budget_mb is None:
         lines.append(
             "  runtime.total_vram_budget_mb: (not set — skipping VRAM budget check)"
@@ -2579,6 +2614,13 @@ def check_vram_budget(
         return False, total_vram_mb, int(budget_mb), estimates, "\n".join(lines)
 
     lines.append(f"[launch] VRAM budget OK ({total_vram_mb} MB / {budget_mb} MB)")
+    if on_demand and peak_vram_mb > int(budget_mb):
+        lines.append(
+            f"[launch] NOTE: the idle-window peak ({peak_vram_mb} MB) exceeds the "
+            f"budget ({budget_mb} MB). Chat is unaffected (assist is not resident), "
+            "but sleep-time / Level 1-2 batches and create mode load the assist "
+            "model alongside the base model."
+        )
     return True, total_vram_mb, int(budget_mb), estimates, "\n".join(lines)
 
 
@@ -2846,6 +2888,15 @@ if __name__ == "__main__":
             "VRAM 予算超過時も強制起動する。--all と併用することを想定"
         ),
     )
+    parser.add_argument(
+        "--print-health-ports",
+        action="store_true",
+        help=(
+            "起動せず、--all で実際に立ち上がるサーバの 'name=port' を 1 行ずつ "
+            "出力して終了する。evoref-ctl が health 待ち対象を決めるのに使う "
+            "(assist は residency=on_demand のとき出力されない)"
+        ),
+    )
     args = parser.parse_args()
 
     cfg_path = Path(args.config)
@@ -2855,11 +2906,34 @@ if __name__ == "__main__":
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     project_root = cfg_path.parent
 
+    if args.print_health_ports:
+        print(f"base={cfg.get('llama', {}).get('port', 8080)}")
+        if not assist_residency_is_on_demand(cfg):
+            assist_local = (cfg.get("assist_model", {}) or {}).get("local") or {}
+            if assist_local:
+                print(f"assist={assist_local.get('port', 8081)}")
+        emb = cfg.get("embedding", {}) or {}
+        if emb.get("backend", "llama-cpp") == "llama-cpp":
+            print(f"embed={emb.get('llama_port', 8082)}")
+        sys.exit(0)
+
     procs: list[subprocess.Popen] = []
 
     launch_base = not args.embed and not args.assist
     launch_embed = args.embed or args.all
     launch_assist = args.assist or args.all
+
+    # assist_model.residency: on_demand (既定) では、アシストはアイドル窓と
+    # create モードの間だけ backend (AssistResidencyManager) が起動する。
+    # --all で常駐させるとチャット中もベースと GPU 帯域を奪い合い、設計目的が
+    # 崩れるので外す。--assist の明示指定だけは尊重する (デバッグ用途)。
+    if launch_assist and not args.assist and assist_residency_is_on_demand(cfg):
+        launch_assist = False
+        print(
+            "[launch] Assist model is managed on demand "
+            "(assist_model.residency=on_demand); skipping. "
+            "Use --assist to start it explicitly."
+        )
 
     # llama-server バージョン検査。--all / 個別起動を問わず
     # llama-server バイナリを起動する全パスで一度だけ build 番号を確認する。

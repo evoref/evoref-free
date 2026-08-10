@@ -460,6 +460,18 @@ class SleepTimeWorker:
         if self._check_cancelled():
             return result
 
+        # Step 8.8: 埋め込みが無いファクトの遡及生成
+        # Step 8 (extractor) / Step 9 (history 昇格) は同期関数で embedder を
+        # 持てないため、生成した直後にここで埋める。curator (8.5-8.7) の後に
+        # 置くことで当該サイクルの新規ファクトも同時に対象になる。
+        ts = time.monotonic()
+        result["fact_embeddings_backfilled"] = (
+            await self._step8_8_backfill_fact_embeddings()
+        )
+        step_durations["step8_8_fact_embedding"] = round(time.monotonic() - ts, 3)
+        if self._check_cancelled():
+            return result
+
         # Step 13: failure_pattern 統合
         # Step 8 の直後に呼ぶことで、当該イテレーションで新たに抽出された
         # failure_pattern と、既に loop.write_failure_note で即時書き込みされた
@@ -726,7 +738,7 @@ class SleepTimeWorker:
         )
         return ingested
 
-    # ── Step 8 (Chat/Coding/MDP Extractor) ─────────────
+    # ── Step 8 (Chat/Create/MDP Extractor) ─────────────
 
     def _step8_extract_facts(self) -> int:
         """Step 8: SemanticFact 抽出
@@ -839,6 +851,25 @@ class SleepTimeWorker:
         )
 
     # ── Step 13 (failure_pattern 統合) ─────────────────
+
+    async def _step8_8_backfill_fact_embeddings(self) -> int:
+        """Step 8.8: 埋め込みが無い SemanticFact へ遡及的に埋め込みを生成する。
+
+        実ロジックは :mod:`backend.free.memory.sleep.fact_embedding` に分離。
+        本メソッドは provider / embedder / cancel を詰め替える薄いラッパ。
+        """
+        from backend.free.memory.sleep.fact_embedding import (
+            backfill_fact_embeddings,
+        )
+
+        if self._semantic_store_provider is None:
+            return 0
+        return await backfill_fact_embeddings(
+            self._semantic_store_provider,
+            self.embedder,
+            current_project_id=self._current_project_id,
+            is_cancelled=self._check_cancelled,
+        )
 
     def _step13_consolidate_failure_patterns(self) -> dict[str, int]:
         """Step 13: 同一 ``failure_signature`` の failure_pattern を統合する。

@@ -3,7 +3,7 @@
 ユーザー指示から「機能ごと個別ファイル」(SPLIT) / 「単一ファイル詳細化」
 (EXPAND) / 「現状の継続」(CONTINUE) / 「長文生成なし」(OFF) を分類する。
 
-[docs/f_09_long_form_generation.md] 参照。本モジュールは
+[docs/f_08_long_form_generation.md] 参照。本モジュールは
 :mod:`backend.free.api.chat.chat_streaming` から呼ばれ、判定結果は
 :meth:`backend.free.generation.orchestrator.LongFormOrchestrator.generate`
 に ``long_form_mode`` kwarg として伝播する。

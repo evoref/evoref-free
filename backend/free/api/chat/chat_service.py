@@ -21,6 +21,7 @@ from backend.free.core.intent_vocab import (
 from backend.free.core.session_mode import is_chat_mode, normalize_session_mode
 from backend.free.core.inference import build_messages
 from backend.free.core.turn_text import append_to_last_user
+from backend.free.llm.assist_client import assist_ready
 from backend.free.llm.llm_client import LLMClient
 from backend.free.memory.pipeline.search_pipeline import unified_search
 from backend.utils import estimate_tokens as _estimate_tokens
@@ -343,27 +344,30 @@ def _iter_scopes(state: AppState):
 
 #: chat モードで注入しない競合グループの FactType。
 #:
-#: project スコープには coding_task / coding (ソースコード本文を含む) の
+#: project スコープには create_task / create (ソースコード本文を含む) の
 #: pending が溜まる。これを chat の競合セクションへ載せると、ユーザーに
 #: 「todo_item.py の 2 版のどちらが正しいか」を毎ターン尋ねることになり、
 #: Tier 予算の外で数百トークンを消費する (実測 2026-07-25: 16 件 ≒ 840 tokens。
 #: 弱い base モデルがこれを回答対象と誤解し、本題と無関係な応答を返していた)。
-_CODING_ONLY_CONFLICT_TYPES = frozenset({"coding", "coding_task"})
+_CREATE_ONLY_CONFLICT_TYPES = frozenset({"create", "create_task"})
 
 
 def _collect_all_pending_groups(state: AppState, mode: str = "chat") -> list:
     """global + project ストアの pending 競合グループを集約する (読取のみ)。
 
-    chat モードではコーディング専用型 (``coding`` / ``coding_task``) の
+    chat モードではクリエイト専用型 (``create`` / ``create_task``) の
     グループを除外する。type は混在時 ``"a/b"`` 形式なので、構成型がすべて
-    コーディング専用のときだけ落とす (混在は残す)。
+    クリエイト専用のときだけ落とす (混在は残す)。
     """
-    from backend.free.memory.pipeline.conflict_review import collect_pending_groups
+    # 表示用グループを使う (collect_pending_groups ではない)。pending だけを
+    # 並べるとスロットの最新値が欠け、古い値に「新」ラベルが付く
+    # (``collect_review_groups`` の docstring 参照)。解決対象は変わらない。
+    from backend.free.memory.pipeline.conflict_review import collect_review_groups
 
     groups: list = []
     for scope, store in _iter_scopes(state):
         try:
-            groups.extend(collect_pending_groups(store, scope))
+            groups.extend(collect_review_groups(store, scope))
         except Exception as exc:
             logger.warning("collect pending conflicts failed (%s): %s", scope, exc)
     if is_chat_mode(mode):
@@ -371,12 +375,12 @@ def _collect_all_pending_groups(state: AppState, mode: str = "chat") -> list:
         groups = [
             g for g in groups
             if not set((g.type or "").split("/")).issubset(
-                _CODING_ONLY_CONFLICT_TYPES,
+                _CREATE_ONLY_CONFLICT_TYPES,
             )
         ]
         if before != len(groups):
             logger.debug(
-                "conflict groups: dropped %d coding-only group(s) in chat mode",
+                "conflict groups: dropped %d create-only group(s) in chat mode",
                 before - len(groups),
             )
     return groups
@@ -402,7 +406,9 @@ async def maybe_resolve_pending_conflicts(
     - ``memory.conflict.chat_review.enabled=false`` → 全体スキップ
     - pending 無し → 即 return
     - ``allow_write=False`` (private ターン等) → 判定/書込スキップ (注入は継続)
-    - ``assist_client is None`` → 判定スキップ (注入は情報提示のみで継続)
+    - アシストが無い / 非常駐 (``residency: on_demand`` のチャット中) →
+      判定スキップ (注入は情報提示のみで継続)。pending は sleep-time の
+      ``conflict_resolution`` と TTL 自動解決に委ねる
     - history に assistant 発話なし (= まだ確認を出していない) → 判定スキップ
     - ``chat_review.max_judge_per_session`` 到達 → 判定**と注入**を停止
       (回答されないまま毎ターン assist スロットを専有するのを避ける。pending は
@@ -444,7 +450,7 @@ async def maybe_resolve_pending_conflicts(
             # よる SemMem 書込 (apply_resolution) は行わない。private 契約
             # (LTM/SemMem/履歴へ書かない) を競合解決経路でも守る。
             return ctx
-        if state.assist_client is None:
+        if not assist_ready(state.assist_client, "conflict_chat_judge"):
             return ctx
         last_assistant = next(
             (
@@ -625,7 +631,9 @@ def _render_conflict_section(
         parts: list[str] = []
         block = render_pending_conflicts_block(
             conflict_ctx.pending_groups,
-            instruct=state.assist_client is not None,
+            # 回答を促す文言は「その回答を判定できる」ときだけ出す。
+            # アシスト非常駐では judge が動かないため、指示なしの情報提示に留める。
+            instruct=assist_ready(state.assist_client, "conflict_chat_judge"),
             max_groups=int(review_cfg.get("max_groups", 3) or 0),
             max_tokens=int(review_cfg.get("max_tokens", 400) or 0),
         )
@@ -840,12 +848,12 @@ BASE_MODEL_LOADING_POLL_SEC = 2.0
 async def _wait_base_model_loading(client: LLMClient, cfg: dict) -> bool:
     """ベースモデルのロード完了を上限付きで待つ。
 
-    mode 切替 (chat ↔ coding) は llama-server を停止 → 再起動するため、
+    mode 切替 (chat ↔ create) は llama-server を停止 → 再起動するため、
     その最中に届いたチャット要求は ``/health`` 503 に当たる。従来は 1 回の
     health_check 失敗で「LLM サーバーに接続できません。llama-server が起動
     しているか確認してください。」を返しており、実際にはロード中なだけなのに
     ユーザーへ誤った対処を促していた (実インシデント 2026-07-27 ライブ検証:
-    モードを coding へ切替えた直後の 1 通目が失敗)。
+    モードを create へ切替えた直後の 1 通目が失敗)。
 
     ポートが LISTEN されていなければ本当に起動していないので待たない
     (llama-server 未起動という本来のケースを遅延させない)。

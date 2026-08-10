@@ -32,6 +32,16 @@
 	let connected = $derived(comp?.connected ?? false);
 	let busy = $derived($busyServer === server);
 
+	// アシストのオンデマンド常駐 (docs/c_14 §1.2)。停止は設計どおりの状態なので、
+	// 未接続 (灰ランプ) を「異常」と読み違えないようラベルで理由を添える。
+	// `failed` だけが本当の異常。residency が無い (always / base / embed) なら未表示。
+	let residency = $derived(comp?.residency ?? null);
+	let residencyLabel = $derived(
+		residency === null || residency === 'ready'
+			? ''
+			: $t(`sidebar.assist_residency_${residency}`),
+	);
+
 	/** 直前の起動失敗を記録 (force restart 提案用) */
 	let startFailed = $state(false);
 
@@ -89,8 +99,15 @@
 	{#if !$serverState.backendOnline}
 		<span class="srv-offline">{$t('sidebar.backend_offline')}</span>
 	{:else}
-		<span class="status-dot" class:connected class:failed={startFailed && !connected}></span>
+		<span
+			class="status-dot"
+			class:connected
+			class:failed={(startFailed && !connected) || residency === 'failed'}
+		></span>
 		<span class="vram-cell {vram.cls}">{vram.text}</span>
+		{#if residencyLabel}
+			<span class="residency" class:failed={residency === 'failed'}>{residencyLabel}</span>
+		{/if}
 		<div class="actions">
 			{#if connected}
 				<button
@@ -187,6 +204,16 @@
 	}
 	.vram-cell.absent {
 		opacity: 0.4;
+	}
+	.residency {
+		font-size: 11px;
+		color: var(--text-secondary);
+		white-space: nowrap;
+		opacity: 0.7;
+	}
+	.residency.failed {
+		color: #ef4444;
+		opacity: 1;
 	}
 	.actions {
 		display: flex;

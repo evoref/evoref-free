@@ -59,6 +59,28 @@ def _has_plain_stream_handler(lg: logging.Logger) -> bool:
     )
 
 
+#: 通常起動 (INFO+) の backend.log / learning.log ローテ閾値。
+_LOG_MAX_BYTES_DEFAULT = 5 * 1024 * 1024
+
+#: develop モード (DEBUG+) のローテ閾値。
+#:
+#: DEBUG 出力は INFO の 10 倍以上の行数になるため、5MB × 3 世代では実測で
+#: **30 分ぶんしか残らない** (2026-08-07 ライブ監査: 1 時間のセッションを
+#: 調べようとした時点で開始 40 分ぶんが既にローテで消えており、観測した
+#: ``stream_timeout`` を backend.log と突き合わせられなかった)。
+#: JSONL 側 (:mod:`backend.debug_logger` の ``_LEVEL_CONFIGS``) が develop
+#: レベルに応じて 100〜500MB を確保しているのに対し、標準ログだけが据え置き
+#: だったのが不整合。世代数は据え置き (3) で 1 ファイルの上限だけ上げる。
+_LOG_MAX_BYTES_DEVELOP = 50 * 1024 * 1024
+
+
+def _log_max_bytes(develop_level: DevelopLevel) -> int:
+    """develop レベルに応じたローテ閾値を返す (純粋関数)。"""
+    if develop_level == "off":
+        return _LOG_MAX_BYTES_DEFAULT
+    return _LOG_MAX_BYTES_DEVELOP
+
+
 def setup_logging(
     develop_level: DevelopLevel = "off",
     project_root: Path | None = None,
@@ -89,6 +111,8 @@ def setup_logging(
     log_dir = project_root / "local" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    max_bytes = _log_max_bytes(develop_level)
+
     # ログフォーマット
     fmt = "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
     datefmt = "%Y-%m-%dT%H:%M:%S%z"
@@ -103,7 +127,7 @@ def setup_logging(
     if not _has_rotating_file_handler(root, backend_log_path):
         backend_handler = RotatingFileHandler(
             log_dir / "backend.log",
-            maxBytes=5 * 1024 * 1024,  # 5MB
+            maxBytes=max_bytes,
             backupCount=3,
             encoding="utf-8",
         )
@@ -119,8 +143,8 @@ def setup_logging(
         root.addHandler(console)
 
     # learning.log ハンドラ（学習サイクル Level 0.5〜2 専用）
-    # 設計書 c_07_error_handling.md §6.2 に従い独立ファイルへ出力する
-    _setup_learning_logging(log_dir, formatter, level)
+    # 設計書 c_07_error_handling_and_observability.md §6.2 に従い独立ファイルへ出力する
+    _setup_learning_logging(log_dir, formatter, level, max_bytes)
 
 
 # 学習サイクル系ロガー（学習サイクル Level 0.5〜2 を learning.log に集約する対象）
@@ -140,6 +164,7 @@ def _setup_learning_logging(
     log_dir: Path,
     formatter: logging.Formatter,
     level: int,
+    max_bytes: int = _LOG_MAX_BYTES_DEFAULT,
 ) -> None:
     """learning.log ハンドラを学習サイクル系ロガーに登録する
 
@@ -154,7 +179,7 @@ def _setup_learning_logging(
 
     learning_handler = RotatingFileHandler(
         log_dir / "learning.log",
-        maxBytes=5 * 1024 * 1024,  # 5MB
+        maxBytes=max_bytes,
         backupCount=3,
         encoding="utf-8",
     )

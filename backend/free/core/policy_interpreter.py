@@ -61,7 +61,7 @@ def _default_policies() -> dict[str, dict]:
                     "short_query_max_tokens": 10,
                     "short_query_max_chars": 20,
                 },
-                "coding": {
+                "create": {
                     "rag_score_threshold": 0.8,
                     "short_query_min_tokens": 3,
                     "short_query_max_tokens": 10,
@@ -89,7 +89,7 @@ def _default_policies() -> dict[str, dict]:
                     "conflict_similarity_threshold": 0.85,
                     "conflict_batch_size": 5,
                 },
-                "coding": {
+                "create": {
                     "fade_alpha": 0.4,
                     "fade_beta": 0.3,
                     "fade_gamma": 0.3,
@@ -131,7 +131,7 @@ def _default_policies() -> dict[str, dict]:
                     "salience_w_info_density": 0.20,
                     "salience_w_position_bias": 0.10,
                 },
-                "coding": {
+                "create": {
                     "stm_top_k": 5,
                     "noise_sigma": 0.03,
                     "bm25_weight": 0.4,
@@ -178,7 +178,7 @@ def _default_policies() -> dict[str, dict]:
                     "file_skeleton_threshold": 30,
                     "meta_cognitive_min_budget": 512,
                 },
-                "coding": {
+                "create": {
                     "step_compaction_rag_lines": 2,
                     "step_compaction_command_head_tail": 5,
                     "file_skeleton_threshold": 30,
@@ -202,7 +202,7 @@ def _default_policies() -> dict[str, dict]:
                     "extend_threshold_ratio": 0.7,
                     "max_extend_rounds": 10,
                 },
-                "coding": {
+                "create": {
                     "unit_max_tokens": 2000,
                     "unit_target_tokens": 800,
                     "extend_threshold_ratio": 0.7,
@@ -349,7 +349,7 @@ class PolicyInterpreter:
         Args:
             domain: ポリシードメイン ("router", "memory", "search", ...)
             key: パラメータ名
-            mode: "chat" | "coding"（learning ドメインは無視される）
+            mode: "chat" | "create"（learning ドメインは無視される）
 
         Returns:
             パラメータ値
@@ -657,7 +657,7 @@ class PolicyInterpreter:
         Args:
             domain: ポリシードメイン
             delta: {key: new_value, ...}
-            mode: "chat" | "coding"
+            mode: "chat" | "create"
         """
         with self._lock:
             policy = self._data.get(domain)

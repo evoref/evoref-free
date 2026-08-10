@@ -59,12 +59,16 @@
 		"nav_label": "Main navigation",
 		"mode": "Mode",
 		"mode_chat": "Chat",
-		"mode_coding": "Coding",
+		"mode_create": "Create",
 		"mode_restarting": "Model restarting...",
 		"mode_restart_ready": "Restart complete",
 		"mode_restart_failed": "Restart failed",
 		"server_status": "Server",
 		"backend_offline": "Backend offline",
+		"assist_residency_stopped": "On demand (stopped)",
+		"assist_residency_starting": "Starting…",
+		"assist_residency_stopping": "Stopping…",
+		"assist_residency_failed": "Failed to start",
 		"start": "Start",
 		"stop": "Stop",
 		"start_failed": "Failed to start",
@@ -109,7 +113,7 @@
 		"last_level2": "Level 2 last run",
 		"rollback_confirm": "Roll back {target} to version {version}?",
 		"rollback_restart_required": "Switching to that mode or restarting the server is required for this change to take effect.",
-		"lora_shared_across_modes": "Chat and Coding share the same LoRA adapter (learning.level2_adapter_partition = \"model\"). Both sections point to the same files.",
+		"lora_shared_across_modes": "Chat and Create share the same LoRA adapter (learning.level2_adapter_partition = \"model\"). Both sections point to the same files.",
 		"adapter_not_applied": "not applied",
 		"adapter_not_applied_detail": "The {target} adapter exists but is not applied to this mode’s model ({reason}). --lora is omitted at launch.",
 		"no_adapter": "No adapter",
@@ -119,7 +123,7 @@
 		"level0_last_record": "Last record",
 		"experience_by_mode": "By mode",
 		"mode_chat": "chat",
-		"mode_coding": "coding",
+		"mode_create": "create",
 		"correction_rate": "Correction rate",
 		"rag_usage_rate": "RAG usage",
 		"level1_title": "Level 1",
@@ -280,7 +284,7 @@
 		"group_assist_prompts": "Assist Model",
 		"group_prompt_history": "Version History",
 		"group_mode_chat": "Chat Mode",
-		"group_mode_coding": "Coding Mode",
+		"group_mode_create": "Create Mode",
 		"instance": {
 			"name": "Nickname"
 		},
@@ -468,8 +472,8 @@
 		},
 		"model_paths": {
 			"base_model": "Base Model",
-			"coding_model": "Coding Model",
-			"coding_model_desc": "Uses base model when empty",
+			"create_model": "Create Model",
+			"create_model_desc": "Uses base model when empty",
 			"assist_model": "Assist Model Path",
 			"assist_model_desc": "GGUF file path for the assist model (used for memory/RAG processing)",
 			"embed_model": "Embedding Model (GGUF)",
@@ -568,7 +572,7 @@
 		"prompts": {
 			"select_prompt": "Select Prompt",
 			"mode_chat": "(Base) Chat",
-			"mode_coding": "(Base) Coding",
+			"mode_create": "(Base) Create",
 			"task_rag_necessity": "(Assist) Retrieval Necessity",
 			"task_rag_quality": "(Assist) Retrieval Quality",
 			"task_tool_call": "(Assist) Tool Call",
@@ -806,7 +810,7 @@
 		"learning_cycle_running": "Learning cycle already running",
 		"learning_llm_unavailable": "LLM client not available",
 		"optimize_invalid_level": "level must be 'level1' or 'level2'",
-		"optimize_invalid_mode": "mode must be 'coding' or 'chat'",
+		"optimize_invalid_mode": "mode must be 'create' or 'chat'",
 		"optimize_scheduler_not_initialized": "Learning scheduler not initialized",
 		"optimize_already_running": "Optimization already running",
 		"optimize_llm_unavailable": "LLM client not available",
@@ -876,11 +880,11 @@
 		"no_chunks": "No chunks retrieved"
 	},
 	"cli": {
-		"mode_coding_pro_only_warning": "Coding mode is available only in the Pro edition. Falling back to chat mode."
+		"mode_create_pro_only_warning": "Create mode is available only in the Pro edition. Falling back to chat mode."
 	},
 	"landing": {
 		"free_tagline": "Local personal knowledge assistant powered by Agentic RAG",
-		"pro_tagline": "Self-evolving local LLM assistant with Agentic RAG plus coding mode"
+		"pro_tagline": "Self-evolving local LLM assistant with Agentic RAG plus create mode"
 	},
 	"loop": {
 		"console": {
