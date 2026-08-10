@@ -6,9 +6,9 @@
 # いずれもアーキ名は gemma4 (サイズ非依存・本プロファイルで共通カバー)。
 #
 # sampling は意図的に空: プロファイル sampling は modes.* を上書きするため、
-# ここで値を入れると chat (temp 0.7) と coding (temp 0.3) のモード別チューニングを
+# ここで値を入れると chat (temp 0.7) と create (temp 0.3) のモード別チューニングを
 # 一律に潰してしまう。Gemma 公式推奨 (temp 1.0 / top_k 64 / top_p 0.95) は単一 arch
-# プロファイルでは chat/coding を区別できないため採用せず、modes.* に委ねる。
+# プロファイルでは chat/create を区別できないため採用せず、modes.* に委ねる。
 #
 # dense なので MoE 無効 (expert_count=0)。内蔵テンプレートを使うため --jinja を付与。
 launch_flags:

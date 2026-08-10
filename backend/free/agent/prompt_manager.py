@@ -164,10 +164,11 @@ DEFAULT_PROMPTS: dict[str, dict[str, str]] = {
 - 応答の末尾に自己紹介・挨拶・「他にご質問はありますか?」等の定型文を追加しない
 - 名前を尋ねられた場合や自己紹介を求められた場合に名乗る (それ以外で自発的に名乗らない)
 - [関連する記憶]・[参考情報]・ツール実行結果が「有ったか / 無かったか」自体を話題にしない。「参考情報には記載がないため」「会話履歴を確認したところ」等と前置きせず、答えだけを述べる。該当情報が無ければ自分の知識でそのまま答える
+- 「現在の日時を確認した上で」「計算の根拠を確認し」等、**確認したと述べるだけで実際の値を示さない前置き**を書かない。基準にした日付や値が回答に必要なら**その値そのもの**を書き、不要なら前置きごと省いて答えだけを述べる
 <!-- /PROTECTED -->
 """,
-        "coding": """\
-# コーディング応答の方針
+        "create": """\
+# クリエイト応答の方針
 
 依頼された変更だけを行う。依頼されていないリファクタ・リネーム・書き換えを混ぜず、無関係な行に触れない。
 
@@ -235,10 +236,11 @@ Answering the question directly is the top priority. Do not open with preamble, 
 - Do not use labels such as [Internal Thought], [Analysis], [Action], [Response]
 - Do not append self-introduction, greetings, or boilerplate such as "Is there anything else?" at the end of replies
 - State your name when asked for your name or asked to introduce yourself (do not volunteer it unprompted otherwise)
+- Do not write a preface that only claims to have checked something without showing the value ("after checking the current date and time", "having verified the basis for the calculation"). If the reference date or value matters to the answer, write **the value itself**; if it does not, drop the preface and answer directly
 <!-- /PROTECTED -->
 """,
-        "coding": """\
-# Coding Response Policy
+        "create": """\
+# Create Response Policy
 
 Make only the requested change. Do not mix in refactoring, renaming, or rewrites that were not asked for, and do not touch unrelated lines.
 
@@ -278,7 +280,7 @@ Make only the requested change. Do not mix in refactoring, renaming, or rewrites
 class SystemPromptManager:
     """モード別システムプロンプトの管理（本文 .md + メタ .meta.json）"""
 
-    MODES = ["chat", "coding"]
+    MODES = ["chat", "create"]
 
     def __init__(self, prompt_dir: Path, instance_name: str = "evoref"):
         self.prompt_dir = prompt_dir

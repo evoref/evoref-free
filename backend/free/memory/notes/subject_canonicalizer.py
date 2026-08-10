@@ -11,7 +11,7 @@ SemanticFact の `subject` フィールドは検索・索引・コンフリク�
 
 ## バイパスルール (重要)
 
-`learn.policy.coding.search.top_k` のように pillar 層が機械的に命名
+`learn.policy.create.search.top_k` のように pillar 層が機械的に命名
 した subject (`^(loop|learn|mem)\\.` プレフィックス) は **辞書ルックアップを
 完全にスキップ** する。これは:
 

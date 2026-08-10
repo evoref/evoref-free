@@ -12,7 +12,7 @@ EvorefMem 統合仕様 + 4 pillar 化 における自律実行ループ
 
 task の物理表現 (``make_task_fact`` / ``encode_task_object`` で生成):
 
-- ``type=task`` / ``scope=project:<project_id>`` / ``mode_origin=coding``
+- ``type=task`` / ``scope=project:<project_id>`` / ``mode_origin=create``
 - ``subject=task.<task_id>`` (``task_id`` はユーザ定義 or 自動採番 ``t_<8hex>``)
 - ``predicate=defines``
 - ``object`` は JSON 文字列で本体 (title / description / depends_on / salience /
@@ -77,9 +77,9 @@ TERMINAL_TASK_STATUSES: frozenset[str] = frozenset({"done", "failed"})
 
 
 TaskStage = Literal["spec", "code", "test"]
-"""staged コーディングパイプラインの工程種別 (spec→code→test)。
+"""staged クリエイトパイプラインの工程種別 (spec→code→test)。
 
-通常の PRD / ralph タスクは ``stage`` を持たず ``None`` になる。``StagedCodingExecutor``
+通常の PRD / ralph タスクは ``stage`` を持たず ``None`` になる。``StagedCreateExecutor``
 のみが ``stage`` 別に分岐し、それ以外の executor / driver ロジックは ``stage`` を無視
 する (後方互換)。
 """
@@ -288,7 +288,7 @@ def make_task_fact(
         object_=object_json,
         type="task",
         scope=SemanticFact.make_project_scope(project_id),
-        mode_origin="coding",
+        mode_origin="create",
         confidence=1.0,
         now=now,
     )

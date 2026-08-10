@@ -1,6 +1,6 @@
 """トークン予算の動的配分
 
-設計書 f_09_long_form_generation.md §4 準拠。
+設計書 f_08_long_form_generation.md §4 準拠。
 コンテキストサイズ × 比率で各スロットの予算を算出する。
 比率テーブルは local/prompts/token_budget.json に保存し、
 Level 1 進化させる

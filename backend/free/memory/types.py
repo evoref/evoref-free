@@ -38,8 +38,8 @@ import numpy as np
 NoteSource = Literal["user", "assistant", "system", "rag"]
 """MemoryNote の発生源"""
 
-MemoryMode = Literal["chat", "coding"]
-"""モード (チャット / コーディング)"""
+MemoryMode = Literal["chat", "create"]
+"""モード (チャット / クリエイト)"""
 
 TaskStatus = Literal["open", "in_progress", "done", "failed"]
 """task ファクト / MemoryNote のタスク状態"""
@@ -60,14 +60,14 @@ FactType = Literal[
     "learned_failure_pattern",  # PolicyAdjuster 由来の集約失敗パターン (EvorefLearn owned)
     "progress_marker",
     "task",
-    "coding_task",
+    "create_task",
     "artifact",        # ラルフループの編集成果物トレース
-    "coding",
+    "create",
     "model",
 ]
 """SemanticFact の type タグ。`policy` / `failure_pattern` / `progress_marker`
 は統合済。`artifact` はラルフループの成果物 (ファイルパス / diff SHA1 /
-行数) を追跡する。`coding_task` と `fewshot` は: 前者は Extractor 由来と
+行数) を追跡する。`create_task` と `fewshot` は: 前者は Extractor 由来と
 LoopDriver 由来の構造差を明示、後者は policy subtype から意味的に独立した
 FactType に昇格。`learned_failure_pattern` は LogIngestor + PolicyAdjuster
 で追加: develop=evolve で出力される decision/outcome JSONL を集約した結果、

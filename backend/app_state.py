@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from backend.free.agent.tools_registry import ToolsRegistry
     from backend.free.learning.scheduler import LearningScheduler
     from backend.free.llm.assist_client import AssistModelClient
+    from backend.free.llm.assist_residency import AssistResidencyManager
     from backend.free.llm.llm_client import LLMClient
     from backend.free.llm.local_client import LocalClient
     from backend.free.memory.stores.long_term import LongTermMemory
@@ -105,6 +106,11 @@ class AppState:
     local_client: LocalClient | None = None
     llm_client: LLMClient | None = None
     assist_client: AssistModelClient | None = None
+    # アシスト llama-server のオンデマンド常駐管理 (docs/c_14 §1.2)。
+    # ``assist_model.residency: on_demand`` (既定) では、アイドル窓と create
+    # モードの間だけプロセスを起動する。``None`` は未配線 (テスト等) を意味し、
+    # 呼出側は「常駐している」とみなして従来どおり振る舞う。
+    assist_residency: "AssistResidencyManager | None" = None
 
     # ── メモリシステム ──
     working_memory: WorkingMemory | None = None
@@ -314,6 +320,14 @@ class AppState:
         else:
             from backend.free.llm.llm_client import LLMClient
             self.llm_client = LLMClient(local=client)
+
+        # ToolCallJudge._llm_client を同期 (ネイティブ tool calling 用)。
+        # モード切替の base 再起動でクライアントが差し替わるため、ここで
+        # 追随しないと judge が閉じた旧オブジェクトを掴んだままになる
+        # (set_assist_client と同じ理由、docs/c_14 §1.2.2)。
+        judge = self.tool_call_judge
+        if judge is not None and hasattr(judge, "_llm_client"):
+            judge._llm_client = client
 
     def set_assist_client(self, client: AssistModelClient | None) -> None:
         """アシストモデルクライアントを設定し、下流コンポーネントを同期する.

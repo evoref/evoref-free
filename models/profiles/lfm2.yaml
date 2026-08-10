@@ -41,7 +41,7 @@ embedding:
   doc_template: "document: {query}"
   instructions:
     chat: "Retrieve relevant passages for the query."
-    coding: "Retrieve relevant code for the query."
+    create: "Retrieve relevant code for the query."
   max_length: 512
   # URL/コマンドリコールの sim 閾値。embed 切替時 ModelMigrator が config.yaml の
   # tools.* (url_recall_min_score / executable_command_recall_min_score) へ転写する。

@@ -1,6 +1,6 @@
 """LongFormOrchestrator — 長文生成エントリポイント
 
-設計書 f_09_long_form_generation.md §2, §9, §10 準拠。
+設計書 f_08_long_form_generation.md §2, §9, §10 準拠。
 Router が長文判定した場合に Meta-Cognitive 層から委任される。
 """
 
@@ -243,14 +243,14 @@ class LongFormOrchestrator:
         self._debug_logger = debug_logger
         self._generation_params = generation_params or {}
         self._policy = policy
-        # 直近 generate() のモード。_effective_context_size が coding_model の
+        # 直近 generate() のモード。_effective_context_size が create_model の
         # 実窓を反映するために参照する。generate() 開始時に確定する。
-        self._mode = "coding"
+        self._mode = "create"
         # 直近 generate() の content_type ("code" / "text")。コンシューマが生成途中で
         # コード/テキストを判定するために参照する。generate() 開始時に確定する。
         self.last_content_type: str | None = None
         # 直近 generate() のコード出力 (検証・修正済み assembled)。chat_streaming の
-        # finalize が coding の editor/file 出力に使う (生ストリーム二重追記の解消)。
+        # finalize が create の editor/file 出力に使う (生ストリーム二重追記の解消)。
         self.last_code_output: str | None = None
         # 直近コードの推定言語 (検証を Python のみ AST 検証に限定するため)。
         self._code_language: str = "python"
@@ -481,7 +481,7 @@ class LongFormOrchestrator:
         """生成コードを検証ゲート付きでリペアし ``last_code_output`` に保持する。
 
         review 後の ``generated_units`` を assemble → 検証 → assist 修正 → 再検証。
-        coding の editor/file 出力はこの結果を配信する (生ストリームの revise
+        create の editor/file 出力はこの結果を配信する (生ストリームの revise
         二重追記の解消)。リペア無効 / degraded 時は素の assembled をそのまま保持。
         """
         if content_type != ContentType.CODE or not rolling.generated_units:
@@ -836,7 +836,7 @@ class LongFormOrchestrator:
         self,
         instruction: str,
         session_id: str,  # noqa: ARG002
-        mode: str = "coding",
+        mode: str = "create",
         on_step: Callable[[dict], Any] | None = None,
         existing_content: str = "",
         long_form_mode: LongFormMode = LongFormMode.CONTINUE,
@@ -850,7 +850,7 @@ class LongFormOrchestrator:
         Args:
             instruction: ユーザーの指示
             session_id: セッションID
-            mode: "coding" | "chat"
+            mode: "create" | "chat"
             on_step: SSEステップ通知コールバック
             existing_content: 追記モード時の既存ファイル内容
             file_context_block: ユーザー添付ファイルを整形したブロック。
@@ -862,7 +862,7 @@ class LongFormOrchestrator:
             content_type_override: 指定時は ``detect_content_type`` をスキップして
                 強制する。用途例: ドキュメント品質ゲートのテスト
                 (test_document_gate.py) で TEXT 判定を強制する場合。staged
-                コーディング (backend/free/loop/staged/) は eb2fca3 以降
+                クリエイト (backend/free/loop/staged/) は eb2fca3 以降
                 direct_codegen 経由の単発呼出しに移行しており、本 override は
                 使用しない。
             target_format: 出力先拡張子 (``.docx`` / ``.pptx`` / ``.xlsx`` 等)。
@@ -1146,7 +1146,7 @@ class LongFormOrchestrator:
         instruction: str,
         prefetched_rag: list[tuple[str, float, str]] | None = None,
         file_context_block: str | None = None,
-        mode: str = "coding",
+        mode: str = "create",
     ) -> dict:
         """メモリ3層 + RAG からコンテキストを収集
 

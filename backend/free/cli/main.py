@@ -57,8 +57,29 @@ from backend.log_config import get_logger, setup_cli_logging
 logger = get_logger("cli.main")
 
 # サブコマンドとして認識する名前
-# - "code": 対話モード (Pro はコーディング、Free は警告 + chat フォールバック)
-_SUBCOMMANDS = {"serve", "chat", "code", "gui", "export", "import", "reindex"}
+# - "create": 対話モード (Pro はクリエイト、Free は警告 + chat フォールバック)
+_SUBCOMMANDS = {"serve", "chat", "create", "gui", "export", "import", "reindex"}
+
+#: 旧サブコマンド名 → 現行名。``code`` はクリエイトモードへの改名に追随して
+#: ``create`` になった。既存のスクリプトや手癖を壊さないよう受理し続け、
+#: 読み替えたことを 1 行だけ警告する。
+_LEGACY_SUBCOMMANDS = {"code": "create"}
+
+
+def _canonicalize_subcommands(argv: list[str]) -> list[str]:
+    """旧サブコマンド名 (``code``) を現行名 (``create``) へ読み替える。"""
+    out: list[str] = []
+    for arg in argv:
+        renamed = _LEGACY_SUBCOMMANDS.get(arg)
+        if renamed is None:
+            out.append(arg)
+            continue
+        logger.warning(
+            "Subcommand %r was renamed to %r; accepting the old name for now",
+            arg, renamed,
+        )
+        out.append(renamed)
+    return out
 
 
 # ────────────────────────────────────────────
@@ -423,7 +444,7 @@ def _add_develop_flag(parser: argparse.ArgumentParser) -> None:
 
 
 def _build_interactive_parser() -> argparse.ArgumentParser:
-    """対話/単発モード用パーサー（code サブコマンド、デフォルト）"""
+    """対話/単発モード用パーサー（create サブコマンド、デフォルト）"""
     parser = argparse.ArgumentParser(
         prog="evoref",
         description="evoref - self-evolving local LLM assistant",
@@ -465,9 +486,9 @@ def _build_interactive_parser() -> argparse.ArgumentParser:
         help="Kill stale processes and port occupants before starting",
     )
     parser.add_argument(
-        "--mode", choices=["chat", "coding"], default=None,
-        help="Chat mode (default: chat in Free / coding in Pro). "
-             "'coding' is Pro-only and falls back to 'chat' with a warning in Free.",
+        "--mode", choices=["chat", "create"], default=None,
+        help="Chat mode (default: chat in Free / create in Pro). "
+             "'create' is Pro-only and falls back to 'chat' with a warning in Free.",
     )
     parser.add_argument(
         "--no-learning", action="store_true",
@@ -570,25 +591,25 @@ def _apply_develop_port_offset(
 
 def _resolve_cli_mode(args: argparse.Namespace) -> None:
     """`--mode` を検証し、エディションに応じて補正したモードを `args._resolved_mode`
-    に格納する。Free 環境で `--mode coding` 指定時は warning を stderr に出して
+    に格納する。Free 環境で `--mode create` 指定時は warning を stderr に出して
     `chat` にフォールバック
 
     `--mode` 未指定時は :func:`default_cli_mode` がエディション既定を返す。
-    coding モードで起動する場合は :func:`get_coding_hook` 経由で Pro 拡張に通知。
+    create モードで起動する場合は :func:`get_create_hook` 経由で Pro 拡張に通知。
     """
     from backend.free.cli.cli_mode import coerce_cli_mode
-    from backend.free.cli.coding_hook import get_coding_hook
+    from backend.free.cli.create_hook import get_create_hook
 
     requested = getattr(args, "mode", None)
     resolved, downgraded = coerce_cli_mode(requested)
     if downgraded:
-        print(msg("cli.mode_coding_pro_only_warning"), file=sys.stderr)
+        print(msg("cli.mode_create_pro_only_warning"), file=sys.stderr)
         logger.warning(
-            "CLI mode downgraded to chat (requested=coding, Free edition)",
+            "CLI mode downgraded to chat (requested=create, Free edition)",
         )
     logger.debug("CLI mode resolved: %s (requested=%s)", resolved, requested)
     args._resolved_mode = resolved
-    get_coding_hook().on_mode_resolved(resolved)
+    get_create_hook().on_mode_resolved(resolved)
 
 
 def _validate_edition_arg_async(
@@ -806,8 +827,8 @@ async def async_main(args: argparse.Namespace) -> int:
         _auto_serve_cleanup(auto_serve_state, console)
         return 1
 
-    # 解決モードを base サーバへ反映 (coding_model が別 GGUF の構成で coding
-    # モデルをロードさせる)。同一モード / coding_model 未設定なら no-op。
+    # 解決モードを base サーバへ反映 (create_model が別 GGUF の構成で create
+    # モデルをロードさせる)。同一モード / create_model 未設定なら no-op。
     await _sync_server_mode(state.backend_url, state.mode)
 
     if non_interactive:
@@ -830,7 +851,7 @@ def main() -> None:
         sys.exit(1)
 
     # サブコマンドを位置に依存せず検出（--develop serve 等に対応）
-    argv = sys.argv[1:]
+    argv = _canonicalize_subcommands(sys.argv[1:])
 
     # サブコマンドルーティング
     for subcmd in _SUBCOMMANDS:
@@ -840,12 +861,12 @@ def main() -> None:
                 sub_argv = [a for a in argv if a != subcmd]
                 sys.exit(handler(sub_argv))
 
-    # "chat" / "code" サブコマンド: 対話モードと同等（引数を除去するだけ）。
+    # "chat" / "create" サブコマンド: 対話モードと同等（引数を除去するだけ）。
     # 実モード解決は `--mode` + エディションデフォルト (`cli_mode.coerce_cli_mode`) に委譲する。
     if "chat" in argv:
         argv = [a for a in argv if a != "chat"]
-    if "code" in argv:
-        argv = [a for a in argv if a != "code"]
+    if "create" in argv:
+        argv = [a for a in argv if a != "create"]
 
     parser = _build_interactive_parser()
     args = parser.parse_args(argv)

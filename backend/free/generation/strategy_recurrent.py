@@ -1,6 +1,6 @@
 """Recurrent 戦略（ローリングコンテキスト型 long-form 生成）
 
-設計書 f_09_long_form_generation.md §6 準拠。
+設計書 f_08_long_form_generation.md §6 準拠。
 RecurrentGPT 方式のローリングコンテキストにより、メインモデルは生成 (`generate_unit`)
 に専念し、計画 (`create_plan`) と要約再帰 (`update_summary`) はアシストモデルが
 担当する

@@ -5,7 +5,7 @@ Stage 1 で外部化されたポリシーの数値パラメータを、
 LearningScheduler の Level 1 サイクルとして実行される
 
 LLM 不要。数値摂動 + fitness 評価のみ。
-chat モードと coding モードは独立して進化する。
+chat モードと create モードは独立して進化する。
 
 ACE (arXiv:2510.04618) のデルタ更新パターンを参考に、
 全パラメータ同時変更ではなく部分的な差分更新で進化品質を維持する。
@@ -545,7 +545,7 @@ class PolicyParamEvolver(JsonStateStore):
 
         Args:
             domain: ポリシードメイン ("router", "memory", "search", ...)
-            mode: "chat" | "coding"
+            mode: "chat" | "create"
             experiences: そのモードの経験リスト
 
         Returns:
@@ -611,13 +611,13 @@ class PolicyParamEvolver(JsonStateStore):
 
         Args:
             experiences: 全経験リスト（内部でモード別にフィルタ）
-            modes: 対象モードリスト（デフォルト: ["chat", "coding"]）
+            modes: 対象モードリスト（デフォルト: ["chat", "create"]）
 
         Returns:
             "{domain}_{mode}" → 進化結果 dict
         """
         if modes is None:
-            modes = ["chat", "coding"]
+            modes = ["chat", "create"]
 
         results: dict[str, dict] = {}
 
@@ -736,7 +736,7 @@ class PolicyParamEvolver(JsonStateStore):
 
         Args:
             domain: ポリシードメイン
-            mode: "chat" | "coding"
+            mode: "chat" | "create"
             sigma: 変異スケール（制約の range に対する比率）
 
         Returns:

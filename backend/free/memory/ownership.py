@@ -154,8 +154,8 @@ FACT_OWNERSHIP: dict[FactType, FactOwnership] = {
     "decision":        _ow("mem",   {"mem", "loop"}),
     "commitment":      _ow("mem",   {"mem", "loop"}),
     "project":         _ow("mem",   {"mem", "loop", "learn"}),
-    "coding":          _ow("mem",   {"mem", "loop", "learn"}),
-    "coding_task":     _ow("mem",   {"mem", "loop", "learn"}),  # D4: CodingExtractor 由来
+    "create":          _ow("mem",   {"mem", "loop", "learn"}),
+    "create_task":     _ow("mem",   {"mem", "loop", "learn"}),  # D4: CreateExtractor 由来
     "model":           _ow("mem",   {"mem"}),  # 将来対応
 
     # ── EvorefLoop owned ─────────────────────────────────────────────────

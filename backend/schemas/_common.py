@@ -62,7 +62,7 @@ class RuntimeConfig(BaseModel):
       ``"messages-allowed"`` は将来 ``/v1/messages`` 採用判断を行った
       場合の予約値。挙動制御は行わず宣言的フラグ。実体の検証は
       ``backend/free/tests/test_llama_endpoint_policy.py`` の静的検査で
-      担保する。詳細 ``docs/e_05_llama_server_endpoint_policy.md``。
+      担保する。詳細 ``docs/e_03_llama_server_endpoint_policy.md``。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -90,6 +90,10 @@ class RuntimeConfig(BaseModel):
     fit_params_binary: str = "llama-fit-params"
 
     # llama-server エンドポイント利用ポリシー宣言
+    #: ⚠ 実行時にこの値を読むコードは無い (方針の宣言用フィールド)。実体の
+    #: 検証は ``backend/free/tests/test_llama_endpoint_policy.py`` の静的検査で
+    #: 担保しており、**その検査も config を参照しない**。したがって
+    #: ``"messages-allowed"`` にしても ``/v1/messages`` が使えるようにはならない。
     llama_endpoint_policy: Literal["oai-only", "messages-allowed"] = "oai-only"
 
     # ``llama.gpu_layers`` / ``assist_model.local.gpu_layers`` が ``"auto"``
@@ -200,11 +204,22 @@ class AgentConfig(BaseModel):
     # tool 判定 (assist judge) で tool 不要と判定されたら base 1 ターンの軽量パスで
     # 応答する。tool 必要なら deliberative へエスカレート。False で常に deliberative。
     reactive_light_enabled: bool = True
-    # tool_judge_enabled=True (coding mode 等) で 4 層フォールバックが全て
+    # tool_judge_enabled=True (create mode 等) で 4 層フォールバックが全て
     # no-tool を返した際、assist (executable_command_synth) で環境依存事実
     # クエリを判定し run_command に橋渡しする 5 層目のゲート。
     executable_command_fallback_enabled: bool = True
     executable_command_fallback_min_chars: int = Field(default=5, ge=0, le=80)
+    # ── ネイティブ tool calling (docs/c_14 §1.3) ──
+    # ``assist_model.residency: on_demand`` のチャット中は assist の
+    # tool_judgment が撃てないため、ベースモデル自身の OAI tool calling で
+    # ツールを選ばせる最終層。決定論プリゲート (ツールパターン / パス / URL /
+    # ディレクトリ列挙) を通ったターンだけ ``tools`` を載せるので、雑談ターンの
+    # 推論コストは増えない。``tools`` 非対応の llama-server build /
+    # chat template では初回 4xx で自動的に無効化される。
+    native_tool_calling_enabled: bool = True
+    # ツール選択のみで本文生成はしないため小さくてよい。
+    native_tool_max_tokens: int = Field(default=256, ge=16, le=4096)
+    native_tool_timeout_sec: float = Field(default=60.0, ge=1.0, le=600.0)
     # ── コンテンツ生成タイムアウト (Meta-Cognitive 層) ──
     # ファイル内容生成はトークン間アイドル (無出力) タイムアウトで「停止した
     # ストリーム」を素早く諦めつつ、低速だが進行中の生成は総上限まで継続する。
@@ -215,7 +230,7 @@ class AgentConfig(BaseModel):
     content_gen_timeout: int = Field(default=600, ge=30)
     llm_call_timeout: int = Field(default=90, ge=10)
     total_timeout: int = Field(default=1800, ge=60)
-    # coding モードで editor/chat 出力のコード生成を LongForm 細粒度生成
+    # create モードで editor/chat 出力のコード生成を LongForm 細粒度生成
     # (CodeUnit 計画 → ファイル別生成・検証・修正) へ委譲する。大規模実装は
     # 複数ファイルへ分割出力可能。False で従来の単一ショット生成に戻す。
     delegate_codegen_to_longform: bool = True
@@ -368,10 +383,10 @@ class ChatModeConfig(BaseModel):
     frequency_penalty: float = Field(default=0.3, ge=-2.0, le=2.0)
 
 
-class CodingModeConfig(BaseModel):
-    """コーディングモード生成パラメータ
+class CreateModeConfig(BaseModel):
+    """クリエイトモード生成パラメータ
 
-    コーディング用モデルパスは ``model_paths.coding_model`` に保持する
+    クリエイト用モデルパスは ``model_paths.create_model`` に保持する
     (未指定時はベースモデルにフォールバック)。本モデルは生成パラメータのみ。
     """
 
@@ -388,13 +403,13 @@ class ModesConfig(BaseModel):
     """モード別設定
 
     - ``chat``: ベースモデル (= チャット用モデル) を使用。モデル指定不可。
-    - ``coding``: 生成パラメータのみ。モデルパスは ``model_paths.coding_model``。
+    - ``create``: 生成パラメータのみ。モデルパスは ``model_paths.create_model``。
     """
 
     model_config = ConfigDict(extra="forbid")
 
     chat: ChatModeConfig = Field(default_factory=ChatModeConfig)
-    coding: CodingModeConfig = Field(default_factory=CodingModeConfig)
+    create: CreateModeConfig = Field(default_factory=CreateModeConfig)
 
 
 class EditorSettingsConfig(BaseModel):
@@ -428,17 +443,44 @@ class EditorSettingsConfig(BaseModel):
 class ProcessManagerConfig(BaseModel):
     """llama-server プロセスマネージャ設定
 
-    `enabled=True` で lifespan 起動時に 3 種 (base/assist/embedding)
-    の llama-server を自動 spawn し、`migrate_component` API からの自動
-    再起動を有効化する。`False` (デフォルト) は従来通り
-    `scripts/launch_llama.py` を別途実行するワークフロー互換。
+    ``health_timeout`` / ``stop_timeout`` は ``LlamaProcessManager`` の構築値
+    として使われるほか、``health_timeout`` はモード切替 (``/api/mode/switch``)
+    とサーバ起動 API のヘルスチェック待ちにも共有される。
+
+    プロセスの起動経路は ``scripts/launch_llama.py`` (evoref-ctl / CLI
+    auto-serve) と、アシストのオンデマンド常駐 (``AssistResidencyManager``、
+    docs/c_14 §1.2) の 2 系統。
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    #: ⚠ **未実装**。lifespan 起動時の自動 spawn を意図した予約フラグだが、
+    #: 現状どこからも参照されない (``_pillar_wirer`` は値に関係なく
+    #: ``LlamaProcessManager`` を構築し、``.start()`` は REST API 経由で
+    #: しか呼ばれない)。``true`` にしても挙動は変わらない。
+    #: 起動は launch_llama / evoref-ctl / AssistResidencyManager が担当する。
     enabled: bool = False
+    #: 起動後ヘルスチェックの待機上限 (秒)。``enabled`` と違い実際に効く。
     health_timeout: int = 120
+    #: SIGTERM 後のグレースフル終了待機 (秒)。
     stop_timeout: int = 10
+
+
+class AutoServeConfig(BaseModel):
+    """``evoref chat --auto-serve`` の起動待ちタイムアウト
+
+    ``backend/free/cli/service_manager.py`` が参照する。既定値のみで長らく
+    運用されており schema / config.yaml.example のどちらにも宣言が無かったため
+    「効くのに存在を知られていない」状態だった (2026-08-08 の設定棚卸しで検出)。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: FastAPI バックエンドが ``/api/health`` を返すまでの待機上限 (秒)。
+    timeout_backend: int = Field(default=30, ge=5, le=600)
+    #: llama-server 群が ``/health`` を返すまでの待機上限 (秒)。大きい GGUF の
+    #: ロードを待てる値にする。
+    timeout_llama: int = Field(default=120, ge=10, le=1800)
 
 
 class TerminalConfig(BaseModel):

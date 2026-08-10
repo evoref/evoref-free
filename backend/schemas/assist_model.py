@@ -126,6 +126,20 @@ class AssistModelConfig(BaseModel):
     local: AssistModelLocalConfig | None = None
     model_path: str = ""
     timeout: float = Field(default=30.0, ge=0.1)
+    # アシスト llama-server の常駐方針。
+    #
+    # ``on_demand`` (既定): チャット応答パスではアシストを起動も実行もしない。
+    # アイドル窓 (Full sleep-time / Level 1 / Level 2) と create モードの間だけ
+    # プロセスを起動し、用が済んだら停止する。チャットの帯域と VRAM を
+    # ベースモデルへ明け渡すのが目的。
+    # ``always``: 従来どおり起動時から常駐させる (回帰時の退路)。
+    residency: Literal["on_demand", "always"] = "on_demand"
+    # ``on_demand`` でアシストを起動する際の「spawn + /health + /props 一致」
+    # 待ちの上限秒。超過した窓はスキップして次の窓で再試行する。
+    idle_start_timeout_sec: float = Field(default=120.0, ge=1.0)
+    # アイドルバッチを流し終えた時点で即停止するか。``false`` にすると
+    # 次のユーザー入力まで常駐したままになる (VRAM は解放されない)。
+    stop_after_batch: bool = True
     # 用途別セマフォスロット数
     # 従来の ``max_concurrent`` を廃し realtime / background / learning に分離。
     concurrency: AssistConcurrencyConfig = Field(

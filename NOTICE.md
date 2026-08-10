@@ -33,7 +33,7 @@ Pro 拡張 (`backend/pro/` / `frontend/src/lib/pro/`) はプロプライエタ�
 - **提供元**: Qwen Team (Alibaba Cloud) / GGUF 配布: Unsloth
 - **リポジトリ**: https://huggingface.co/unsloth/Qwen3.5-9B-GGUF
 - **ライセンス**: Apache License 2.0
-- **用途**: チャット / コーディングモードの応答生成 (llama-server で実行)。
+- **用途**: チャット / クリエイトモードの応答生成 (llama-server で実行)。
 
 ### Attribution / 帰属表示
 

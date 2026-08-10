@@ -5,7 +5,7 @@
 
 両マネージャはキー命名規則だけが異なる:
 - システムプロンプト: `{mode}.md` / `{mode}.meta.json` / `history/{mode}_v{NNN}.md`
-  → key_prefix = mode (例: "chat", "coding")
+  → key_prefix = mode (例: "chat", "create")
 - アシストプロンプト: `assist_{task}.md` / `assist_{task}.meta.json` /
   `history/assist_{task}_v{NNN}.md`
   → key_prefix = f"assist_{task}" (例: "assist_rag_necessity")

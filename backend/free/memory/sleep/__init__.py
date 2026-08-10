@@ -7,7 +7,7 @@ sleep-time cycle (Steps 6-13) の各工程を責務別に独立 module へ分離
 
 Module 一覧:
 
-- :mod:`.extraction` — Step 8: SemanticFact Extractor (Chat / Coding / MDP)
+- :mod:`.extraction` — Step 8: SemanticFact Extractor (Chat / Create / MDP)
 - :mod:`.promotion` — Step 9: history summary → ``decision`` / ``commitment`` 昇格
 - :mod:`.gc` — Step 9: ``semmem_limits`` に基づく SemMem GC 実行
 - :mod:`.failure_consolidator` — Step 13: ``failure_pattern`` 統合

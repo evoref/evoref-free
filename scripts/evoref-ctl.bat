@@ -67,11 +67,14 @@ rem されてしまう (モデル切替が反映されない不具合の原因)�
 echo [start] Ensuring no stale llama-server.exe is running...
 taskkill /im "llama-server.exe" /f >nul 2>&1
 
-echo [start] Starting llama-server (base + assist + embedding)...
+echo [start] Starting llama-server (base + embedding; assist starts on demand)...
 start "llama-server" /min cmd /c ""%VENV_PYTHON%" scripts\launch_llama.py config.yaml --all"
 
+rem 待ち受け対象は launch_llama.py に問い合わせる。assist は
+rem assist_model.residency=on_demand (既定) だと --all でも起動しないため、
+rem 固定リストで待つと 60 秒空振りしてから WARNING が出てしまう。
 echo [start] Waiting for llama-server to be ready (up to 60s)...
-powershell -NoProfile -Command "$targets=[ordered]@{'base'=8080;'assist'=8081;'embed'=8082}; foreach ($t in $targets.GetEnumerator()) { $elapsed=0; do { Start-Sleep 2; $elapsed+=2; try { $r=(Invoke-WebRequest \"http://localhost:$($t.Value)/health\" -TimeoutSec 1 -UseBasicParsing).StatusCode } catch { $r=0 } } while ($r -ne 200 -and $elapsed -lt 60); if ($r -ne 200) { Write-Host \"[start] WARNING: $($t.Key) (port $($t.Value)) health check timed out, proceeding anyway\" } }"
+powershell -NoProfile -Command "$pairs=& '%VENV_PYTHON%' scripts\launch_llama.py config.yaml --print-health-ports; foreach ($p in $pairs) { if ($p -notmatch '^(\w+)=(\d+)$') { continue }; $name=$Matches[1]; $port=$Matches[2]; $elapsed=0; do { Start-Sleep 2; $elapsed+=2; try { $r=(Invoke-WebRequest \"http://localhost:$port/health\" -TimeoutSec 1 -UseBasicParsing).StatusCode } catch { $r=0 } } while ($r -ne 200 -and $elapsed -lt 60); if ($r -ne 200) { Write-Host \"[start] WARNING: $name (port $port) health check timed out, proceeding anyway\" } }"
 
 echo [start] Starting FastAPI backend on :8000...
 start "evoref-backend" /min cmd /c ""%VENV_UVICORN%" backend.main:app --host 0.0.0.0 --port 8000"

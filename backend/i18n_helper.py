@@ -49,7 +49,7 @@ def prose_language_name(*, english: bool = False) -> str:
 def msg(key: str, **kwargs) -> str:
     """
     メッセージ取得。ドット区切りのキーでネストをたどる。
-    例: msg("cli.welcome", version="0.1.0", mode="coding")
+    例: msg("cli.welcome", version="0.1.0", mode="create")
     """
     keys = key.split(".")
     value = _resolve(keys, _locale)

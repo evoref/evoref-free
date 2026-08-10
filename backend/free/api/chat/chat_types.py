@@ -20,7 +20,7 @@ class ChatMessage(TypedDict):
 class GenerationParams(TypedDict, total=False):
     """モード別生成パラメータ（temperature, top_p 等）
 
-    config.yaml の modes.chat / modes.coding から取得される値。
+    config.yaml の modes.chat / modes.create から取得される値。
     全フィールドはオプショナル。
     """
 

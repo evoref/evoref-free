@@ -461,7 +461,7 @@ class DebugLogger:
 
         Step 4 マージ後に低価値 chunk を pruning した内訳 (relevance floor /
         近似重複除去 / 境界 assist) を ``op="content_gate"`` で書き出す。
-        coding/chat mode 別の pruning 率と assist 発火状況を後追いし、
+        create/chat mode 別の pruning 率と assist 発火状況を後追いし、
         しきい値チューニングと品質回帰のモニタリングを可能にする。
         """
         if not self.enabled or not self.log_rag:

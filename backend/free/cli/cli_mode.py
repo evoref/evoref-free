@@ -1,15 +1,15 @@
 """CLI モードのエディション別デフォルト解決
 
-`backend/free/cli/` 内で `"mode": "coding"` 等のリテラルをハードコードする代わりに、
+`backend/free/cli/` 内で `"mode": "create"` 等のリテラルをハードコードする代わりに、
 本モジュールの :func:`default_cli_mode` を介してエディションに応じた既定モードを
 解決する。
 
 設計指針:
 
-- **Free**: チャットメイン (デフォルト = ``"chat"``)。`--mode coding` 指定は
+- **Free**: チャットメイン (デフォルト = ``"chat"``)。`--mode create` 指定は
   warning + ``"chat"`` フォールバック (`coerce_cli_mode`)。
-- **Pro / Develop**: コーディング含む (デフォルト = ``"coding"``)。
-  `--mode chat`/`coding` いずれもそのまま受け入れ。Develop は Pro の上位
+- **Pro / Develop**: クリエイト含む (デフォルト = ``"create"``)。
+  `--mode chat`/`create` いずれもそのまま受け入れ。Develop は Pro の上位
   互換 (Develop ⊇ Pro) のため Pro と同じ扱い。
 
 Pro 判定優先順位:
@@ -32,7 +32,7 @@ import os
 
 from backend.edition import develop_available, pro_available
 
-VALID_CLI_MODES: frozenset[str] = frozenset({"chat", "coding"})
+VALID_CLI_MODES: frozenset[str] = frozenset({"chat", "create"})
 
 
 def is_cli_pro_edition() -> bool:
@@ -53,9 +53,9 @@ def default_cli_mode() -> str:
     """エディションに応じた CLI のデフォルトモードを返す。
 
     Returns:
-        ``"coding"`` (Pro) / ``"chat"`` (Free)。
+        ``"create"`` (Pro) / ``"chat"`` (Free)。
     """
-    return "coding" if is_cli_pro_edition() else "chat"
+    return "create" if is_cli_pro_edition() else "chat"
 
 
 def coerce_cli_mode(requested: str | None) -> tuple[str, bool]:
@@ -66,7 +66,7 @@ def coerce_cli_mode(requested: str | None) -> tuple[str, bool]:
 
     Returns:
         ``(resolved_mode, downgraded)`` — ``downgraded=True`` の場合、Free 環境で
-        ``"coding"`` 指定 → ``"chat"`` フォールバックが発生したことを示す。呼び出し
+        ``"create"`` 指定 → ``"chat"`` フォールバックが発生したことを示す。呼び出し
         元 (`main`) で warning を表示する。
     """
     if requested is None:
@@ -74,6 +74,6 @@ def coerce_cli_mode(requested: str | None) -> tuple[str, bool]:
     if requested not in VALID_CLI_MODES:
         # argparse の choices で弾かれる想定だが、防御的に default にフォールバック。
         return default_cli_mode(), False
-    if requested == "coding" and not is_cli_pro_edition():
+    if requested == "create" and not is_cli_pro_edition():
         return "chat", True
     return requested, False

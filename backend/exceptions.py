@@ -77,6 +77,23 @@ class LLMRequestRejectedError(LLMError):
     i18n_key = "error.llama.request_rejected"
 
 
+class AssistUnavailableError(LLMError):
+    """E1008: アシストが非常駐のため呼出を受け付けない (docs/c_14 §1.2)
+
+    ``assist_model.residency: on_demand`` では、アイドル窓と create モード
+    以外でアシスト llama-server は動いていない。死んだポートへ HTTP を投げて
+    リトライ待ちするのを防ぐため、``AssistModelClient`` が呼出直前に本例外へ
+    倒す (HTTP・リトライ・サーキットブレーカー・timeout 較正はすべて素通り)。
+
+    呼出元は既存の degraded フォールバック (c_14 §6.1) にそのまま着地させる
+    こと。チャット応答を壊してはならない。
+    """
+
+    code = "E1008"
+    status_code = 503
+    i18n_key = "error.llama.assist_unavailable"
+
+
 # ── E3xxx: ファイルシステム関連 ──
 
 

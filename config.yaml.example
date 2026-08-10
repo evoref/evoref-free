@@ -57,8 +57,11 @@ runtime:
   # "oai-only" (既定) で OpenAI 互換 (/v1/chat/completions / /v1/embeddings /
   # /tokenize / /health / /props) のみ採用、
   # "messages-allowed" は将来 /v1/messages 採用判断を行った場合の予約値。
-  # 実体の検証は backend/free/tests/test_llama_endpoint_policy.py の静的検査
-  # で担保する。詳細 docs/e_05_llama_server_endpoint_policy.md。
+  # ⚠ 実行時にこの値を読むコードは無い。実体の検証は
+  #   backend/free/tests/test_llama_endpoint_policy.py の静的検査で担保しており、
+  #   その検査も config を参照しない。つまり "messages-allowed" にしても
+  #   /v1/messages が使えるようにはならない (方針の宣言用フィールド)。
+  #   詳細 docs/e_03_llama_server_endpoint_policy.md。
   llama_endpoint_policy: "oai-only"
 
   # モデル接続/切替時に実挙動プローブを実行し、宣言と実機の食い違いを観測して
@@ -163,7 +166,7 @@ llama:
   cache_idle_slots: true
   kv_unified: null
   # --- self-speculative decoding ---
-  # Pro 限定。``evoref code`` モード (Pro デフォルト) の base モデルで
+  # Pro 限定。``evoref create`` モード (Pro デフォルト) の base モデルで
   # コーディング系ワークロードのスループット改善を狙う。Free では
   # ``enabled=true`` でも launch_llama.py 側で warning + 無効化される。
   # mode の意味:
@@ -217,9 +220,9 @@ llama:
   # ※ スケール倍率 = 目標コンテキスト長 ÷ モデルの学習時コンテキスト長
 
 # ===== モード別生成パラメータ =====
-# ベースモデル (= チャット用) + コーディング用モデル の 2 モデル構成。
+# ベースモデル (= チャット用) + クリエイト用モデル の 2 モデル構成。
 # - chat: 常に model_paths.base_model を使用 (独立 model フィールド無し)
-# - coding: 生成パラメータのみ。モデルパスは model_paths.coding_model に指定
+# - create: 生成パラメータのみ。モデルパスは model_paths.create_model に指定
 modes:
   chat:
     temperature: 0.7                # 生成温度（0.0〜2.0）— 高いほど多様な応答
@@ -227,11 +230,11 @@ modes:
     top_k: 40                       # Top-K サンプリング（0=無効、1〜1000）
     presence_penalty: 0.0           # 存在ペナルティ（-2.0〜2.0）— 一度出た語を一律に抑制するため日本語では 0.0 推奨
     frequency_penalty: 0.3          # 頻度ペナルティ（-2.0〜2.0）— 出現回数に比例して抑制。0.0 だと同一句の暴走反復が止まらない
-  coding:
-    temperature: 0.3                # コーディングは低温度で正確性重視
+  create:
+    temperature: 0.3                # クリエイトは低温度で正確性重視
     top_p: 0.95                     # やや高めで十分な候補を確保
     top_k: 20                       # 低めで的確なトークン選択
-    presence_penalty: 0.0           # コーディングではペナルティなし
+    presence_penalty: 0.0           # クリエイトではペナルティなし
     frequency_penalty: 0.0          # コードは同一トークンの反復が正当なため抑制しない
 
 # ===== CLI 設定 =====
@@ -263,9 +266,9 @@ model_paths:
   base_model: models/gemma-4-12b-it-qat-q4_0.gguf    # ベース GGUF モデル（models/ に配置）
   assist_model: models/gemma-4-E4B_q4_0-it.gguf      # アシスト GGUF モデル（メモリ・RAG処理用）
   embed_model: models/Qwen3-Embedding-0.6B-Q8_0.gguf # 埋め込み用 GGUF モデル（llama-cpp バックエンド用）
-  coding_model: null                                 # コーディングモード用 GGUF（null/空欄 = base_model にフォールバック）
-  assist_coding_model: null                          # コーディングモード用アシスト GGUF（null/空欄 = assist_model にフォールバック）
-                                                      # 設定すると /api/mode/switch が chat⇄coding 切替時に
+  create_model: null                                 # クリエイトモード用 GGUF（null/空欄 = base_model にフォールバック）
+  assist_create_model: null                          # クリエイトモード用アシスト GGUF（null/空欄 = assist_model にフォールバック）
+                                                      # 設定すると /api/mode/switch が chat⇄create 切替時に
                                                       # アシストサーバも非破壊的 (config.yaml 非変更) に差し替える
 
 # ===== ベースモデル移行 / 起動時整合性チェック =====
@@ -288,9 +291,18 @@ model_migration:
 # 自動再起動 + クライアント差し替えを行う。false (デフォルト) の場合は
 # 従来通り `scripts/launch_llama.py` を別途実行するワークフロー互換。
 process_manager:
-  enabled: false           # 自動 spawn / 自動再起動を有効化
-  health_timeout: 120      # 起動後ヘルスチェック待機時間 (秒)。大きい coding GGUF の load を待てる値
+  # ⚠ enabled は未実装で、現状どこからも参照されない (true にしても挙動は
+  #   変わらない)。llama-server の起動は launch_llama / evoref-ctl と、
+  #   アシストのオンデマンド常駐 (AssistResidencyManager) が担当する。
+  enabled: false           # 未実装（予約）
+  health_timeout: 120      # 起動後ヘルスチェック待機時間 (秒)。大きい create GGUF の load を待てる値。モード切替・サーバ起動 API と共用
   stop_timeout: 10         # SIGTERM 後のグレースフル終了待機時間 (秒)
+
+# ===== CLI の自動起動 (evoref chat --auto-serve) =====
+# --auto-serve でサーバ群を CLI から起こす際の起動待ち上限。
+auto_serve:
+  timeout_backend: 30      # FastAPI が /api/health を返すまでの待機上限 (秒)
+  timeout_llama: 120       # llama-server 群が /health を返すまでの待機上限 (秒)。大きい GGUF のロードを待てる値
 
 # ===== ローカルパス（読み書き）=====
 # データ・状態ファイルのパス。
@@ -319,7 +331,7 @@ local_paths:
   cartridges_dir: local/cartridges/          # カートリッジ（パッケージ + 埋め込み）
   history_dir: local/history/                # 会話履歴アーカイブ
   triggers_dir: local/triggers/              # EvorefMem トリガ辞書の user override 先 (任意、空ディレクトリで可)
-  coding_workspace_dir: local/coding/        # staged コーディングの一時ワークスペース (spec/code/test 中間成果物 + manifest)
+  create_workspace_dir: local/create/        # staged クリエイトの一時ワークスペース (spec/code/test 中間成果物 + manifest)
   # 学習・経験・状態
   learning_dir: local/learning/                      # base 学習データの (モデル×モード) パーティションルート (learning.partition_by_base_model=true 時に使用)
   experience_file: local/experience.json             # ベースモデル経験バッファ
@@ -487,14 +499,14 @@ rag:
     content_gate:
       # 取得直後 (Step 4 マージ後) の chunk 内容精査ゲート。低価値 chunk を
       # 事前 pruning し、quality judge / query expansion の候補数を
-      # 縮小する。coding mode を主対象 (chat mode は近似重複除去のみ)。判断に
+      # 縮小する。create mode を主対象 (chat mode は近似重複除去のみ)。判断に
       # 迷う marginal band の prose チャンクだけ assist で 1 回関連性を判定する。
-      enabled: true               # coding-mode 事前精査を有効化 (false で無効)
+      enabled: true               # create-mode 事前精査を有効化 (false で無効)
       relevance_floor: 0.45       # cosine スコア下限 (これ未満を pruning)
       marginal_band: 0.10         # [floor, floor+band) を assist 判定対象帯とする
       min_keep: 3                 # 最低保持件数 (生成を枯渇させない)
       dedup_jaccard: 0.85         # token-set Jaccard 近似重複しきい値 (1.0 で無効)
-      coding_code_signal: true    # coding mode: marginal 帯のコードシグナル判定
+      create_code_signal: true    # create mode: marginal 帯のコードシグナル判定
       assist_enabled: true        # marginal band の assist 救済 (false で純ルール)
       max_per_session: 5          # 1 セッション内の assist 発火上限 (0 以下で無制限)
       max_per_query: 1            # 1 クエリ内の assist 発火上限 (0 以下で無制限)
@@ -572,10 +584,10 @@ embedding:
   # 上流既定 8192 MiB の RAM 予約は無意味。0 で明示 disable する。
   cache_ram_mib: 0
   # instruction-aware モデル (Qwen3 等) 用の mode 別 task description。
-  # mode は chat / coding のいずれか。
+  # mode は chat / create のいずれか。
   instructions:
     chat: "Given a user question, retrieve relevant passages that answer the query"
-    coding: "Given a code search query, retrieve relevant code snippets"
+    create: "Given a code search query, retrieve relevant code snippets"
   # クエリ整形テンプレート。{task} (= instructions[mode]) と {query} を埋め込む。
   # 既定は Qwen3-Embedding 公式仕様。BGE-M3 等の非 instruction-aware モデルに
   # 切り替える場合は "" (空文字列) を指定し prefix を一切付与しない。
@@ -608,7 +620,7 @@ memory:
     extraction_max_pinned_per_session: -1                      # pinned 由来の上限 (-1=無制限)
     extraction_max_per_session:                                # セッションあたりの抽出上限
       chat: 10
-      coding: 5
+      create: 5
   # --- Pin 機能 ---
   # トリガ辞書 (pin_triggers.yaml / fact_triggers.yaml / classify_triggers.yaml) は
   # 同梱 default を backend/free/memory/_defaults/triggers/ に配置し、user override
@@ -651,13 +663,19 @@ memory:
   # MemoryInjector / PolicyInterpreter / LoopFactView 等すべて同一閾値で動作する。
   injection:
     chat_budget_tokens: 800                                    # チャットモードの注入予算 (tokens)
-    coding_budget_tokens: 2000                                 # コーディングモードの注入予算 (tokens)
+    create_budget_tokens: 2000                                 # クリエイトモードの注入予算 (tokens)
     relevance_enabled: true                                    # クエリ埋め込みとの関連度で注入候補を足切りする
-    relevance_min_score: 0.35                                  # 関連度ゲートのコサイン類似度閾値 (pinned は常に通過)
+    relevance_min_score: 0.35                                  # 関連度ゲートのコサイン類似度閾値
+    pinned_relevance_min_score: 0.10                           # pinned に課す下限。0 にすると完全迂回し、無関係なターンにも毎回載る
     tier_ratios:
       chat: [0.40, 0.35, 0.15, 0.10]                           # Tier 1〜4 比率 (合計 1.0)
-      coding: [0.40, 0.35, 0.15, 0.10]                         # Tier 1〜4 比率 (合計 1.0)
+      create: [0.40, 0.35, 0.15, 0.10]                         # Tier 1〜4 比率 (合計 1.0)
   working_max_turns: 30           # ワーキングメモリの最大ターン数 (ハード上限。通常は下の token 側で縮退させる)
+  working_evict_block: 6          # 上限到達時にまとめて押し出すターン数 (1=従来の1件ずつ)
+  # 1 件ずつ押し出すと窓の先頭が毎ターンずれ、llama-server の接頭辞 KV キャッシュが
+  # system プロンプト以降まるごと無効化される (実測: prompt eval 2,898 tok で 27.7 秒、
+  # decode は 7.6 tok/s と正常)。まとめて押し出すと次に上限へ達するまで先頭が動かず、
+  # 再 prefill の回数が約 1/3 になる。代償は保持ターン数が平均 max_turns の約 90% になること。
   working_max_tokens: 2048        # ワーキングメモリの最大トークン数
   # 推奨: 512〜(context_size * 0.6) の範囲で設定
   # | context_size | 上限目安 | 推奨値 |
@@ -682,9 +700,9 @@ memory:
     decision: 60
     commitment: 30
     project: 9999
-    coding: 60
+    create: 60
     task: 14
-    coding_task: 14
+    create_task: 14
     policy: 9999
     fewshot: 9999        # policy subtype から独立
     failure_pattern: 60
@@ -703,9 +721,9 @@ memory:
     decision: 5000
     commitment: 2000
     project: 10000
-    coding: 10000
+    create: 10000
     task: 5000
-    coding_task: 5000
+    create_task: 5000
     policy: 5000
     fewshot: 2000                 # policy subtype から独立
     failure_pattern: 2000
@@ -769,10 +787,10 @@ learning:
   level1_population_size: 5       # Level 1 の集団サイズ
   level2_min_failures: 50         # Level 2 トリガーに必要な最小失敗数
   # モード別の Level 2 発火閾値。未指定のモードは level2_min_failures を使う。
-  # coding は経験が溜まりにくいため個別に下げる用途を想定。
+  # create は経験が溜まりにくいため個別に下げる用途を想定。
   level2_min_failures_by_mode:
     chat: 50
-    coding: 20
+    create: 20
   # アイドル判定タイマー
   full_idle_minutes: 10           # Trigger B: sleep-time Full の起動アイドル時間（分）
   level1_idle_minutes: 30         # Trigger C: Level 1 の起動アイドル時間（分）
@@ -883,13 +901,23 @@ agent:
   reactive_light_enabled: true           # reactive 分類かつルール即応に該当しないクエリを、tool 判定で tool 不要なら base 1 ターンの軽量パスで応答（false で常に deliberative）
   executable_command_fallback_enabled: true   # 4 層判定が全て no-tool の時、assist で環境依存事実クエリを run_command に橋渡しする 5 層目（false で無効化）
   executable_command_fallback_min_chars: 5    # 5 層目 assist 呼出をスキップするクエリ長閾値（これ未満は呼ばない）
+  # ── ネイティブ tool calling (アシスト非常駐時の代替、docs/c_14 §1.3) ──
+  # assist_model.residency: on_demand のチャット中は assist の tool_judgment が
+  # 撃てないため、ベースモデル自身の OAI tool calling でツールを選ばせる。
+  # 決定論プリゲート (ツールパターン / パス / URL / ディレクトリ列挙) を通った
+  # ターンだけ tools を載せるので、雑談ターンのコストは増えない。
+  # tools 非対応の llama-server build / chat template では初回 4xx で自動的に
+  # 無効化される (毎ターン 4xx を踏まない)。
+  native_tool_calling_enabled: true      # false でネイティブ経路を使わず決定論層のみに縮退
+  native_tool_max_tokens: 256            # tool_call 生成の上限トークン（本文生成はしないので小さくてよい）
+  native_tool_timeout_sec: 60            # ツール選択 1 往復のタイムアウト（秒）
   # ── コンテンツ生成タイムアウト (Meta-Cognitive 層) ──
   content_gen_first_token_timeout: 120   # 最初のトークン到達までの許容秒数（サーバ混雑時の待機。idle と分離）
   content_gen_idle_timeout: 30           # トークン間の無出力許容秒数（2トークン目以降、超過で「停止」とみなし中断）
   content_gen_timeout: 600               # ファイル内容生成の総上限秒数（低速 GPU でも完走できるよう緩和）
   llm_call_timeout: 90                   # 計画生成など単発 LLM 呼出のタイムアウト（秒）
   total_timeout: 1800                    # Meta-Cognitive 全体のタイムアウト（秒、content_gen_timeout / 長文 codegen を内包）。低速 GPU の長文生成を完走させるため余裕を持たせる
-  delegate_codegen_to_longform: true     # coding: editor/chat のコード生成を LongForm 細粒度生成へ委譲(複数ファイル可)。false で単一ショット生成
+  delegate_codegen_to_longform: true     # create: editor/chat のコード生成を LongForm 細粒度生成へ委譲(複数ファイル可)。false で単一ショット生成
 
 # ===== ツール設定 =====
 tools:
@@ -963,6 +991,15 @@ assist_model:
   enabled: true                    # false でアシストモデル無効化。health_check を経由せず None を注入し、
                                    # ツール判定・メモリ進化・長文プラン・検索品質判定は
                                    # フォールバックモードで動作する
+  # アシスト llama-server の常駐方針。
+  #   on_demand (既定): チャット応答パスではアシストを起動も実行もしない。
+  #     アイドル窓 (Full sleep-time / Level 1 / Level 2) と create モードの間だけ
+  #     プロセスを起動し、用が済んだら停止する。チャット中の GPU 帯域と VRAM を
+  #     ベースモデルへ明け渡すため、より大きなベースモデルを載せられる。
+  #   always: 従来どおり起動時から常駐 (チャット応答パスでも assist 判定が動く)。
+  residency: on_demand
+  idle_start_timeout_sec: 120      # on_demand 起動時の spawn + health 待ち上限 (秒)
+  stop_after_batch: true           # アイドルバッチ完了で即停止 (false で次の入力まで常駐)
   local:
     host: 127.0.0.1               # アシストモデル llama-server のホスト
     port: 8081                     # アシストモデル llama-server のポート
@@ -1056,7 +1093,7 @@ assist_model:
     critique_synthesis: 45.0          # 失敗クラスタ解析
     policy_evolution: 45.0            # PolicyParamEvolver 候補 JSON 生成
     note_evolution: 20.0              # A-MEM note 進化の軽量要約
-    meta_cognitive_plan: 30.0         # coding mode タスク分解
+    meta_cognitive_plan: 30.0         # create mode タスク分解
     summarize: 30.0                   # Recurrent 戦略の summary 再帰更新
   # 用途別 reasoning_budget (thinking token 上限)
   # ``chat_template_kwargs.reasoning_budget`` として送信される。
@@ -1150,7 +1187,7 @@ loop:
     command_timeout_sec: 120.0
 
 # ===== 長文生成設定 =====
-# 長文生成エンジン。詳細は docs/f_09_long_form_engine.md 参照。
+# 長文生成エンジン。詳細は docs/f_08_long_form_generation.md 参照。
 long_form:
   max_units: 20                     # 最大ユニット数
   unit_max_tokens: 2000             # ユニットあたり最大トークン数
@@ -1168,11 +1205,11 @@ long_form:
   code_smoke_test_enabled: true     # 生成物の import スモークテスト(ModuleNotFoundError/dataclass引数違い等の実行時エラー捕捉)
   code_smoke_timeout_sec: 10        # import スモークテストのサブプロセスタイムアウト(秒)
 
-# ===== コーディングモード パイプライン設定 =====
+# ===== クリエイトモード パイプライン設定 =====
 # pipeline=staged で「仕様書→コード→テスト」の多段・各工程多パス生成 (専用 LoopDriver を
-# インライン駆動)。staged は Pro 限定 (evoref code は Pro ゲート済) かつ assist 健全時のみ起動。
+# インライン駆動)。staged は Pro 限定 (evoref create は Pro ゲート済) かつ assist 健全時のみ起動。
 # 既定 longform は従来の LongFormOrchestrator 1 リクエスト生成 (無改変)。
-coding:
+create:
   pipeline: longform                  # staged | longform (既定 longform)
   staged_enabled: true                # staged のキルスイッチ (pipeline と独立。false で即無効化)
   staged:

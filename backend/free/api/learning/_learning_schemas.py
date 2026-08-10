@@ -24,7 +24,7 @@ class EvalCaseInfo(BaseModel):
 class ExperienceByModeModel(BaseModel):
     """モード別経験数"""
     chat: int = 0
-    coding: int = 0
+    create: int = 0
 
 
 class Level1ResultEntry(BaseModel):

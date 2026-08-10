@@ -42,7 +42,7 @@ class SessionState:
     # プライベートセッション (memory_only)
     # ``True`` の間、チャットリクエストに ``private: true`` を付与する。
     private_mode: bool = False
-    # `default_cli_mode()` でエディション既定が解決される。Pro=coding / Free=chat。
+    # `default_cli_mode()` でエディション既定が解決される。Pro=create / Free=chat。
     # `_build_chat_payload` / `_register_session` / `_save_session` 等で参照する。
     mode: str = field(default_factory=lambda: _resolve_default_mode())
 
@@ -69,7 +69,7 @@ class SessionState:
 
 
 def _resolve_default_mode() -> str:
-    """Free=chat / Pro=coding をエディション判定で解決する。
+    """Free=chat / Pro=create をエディション判定で解決する。
 
     `field(default_factory=...)` から呼ぶための関数化。直接 `default_cli_mode` を
     参照すると import 順序の都合で循環するため薄いラッパとして定義。

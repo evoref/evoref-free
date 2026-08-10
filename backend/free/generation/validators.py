@@ -1,6 +1,6 @@
 """コード検証（AST parse, import 整合性）
 
-設計書 f_09_long_form_generation.md §7 準拠。
+設計書 f_08_long_form_generation.md §7 準拠。
 コード生成完了後にルールベースの静的検証を実施する。
 テキスト生成には適用しない。
 """

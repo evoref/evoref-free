@@ -44,7 +44,7 @@ def bootstrap_loop_context_at_startup(
     実際の注入は MemoryInjector / ループ本体接続後に行う。
     ``loop.enabled=False`` の場合や project_id 未解決の場合は no-op。
 
-    起動時 (主導モード問わず — chat / coding) に呼び出される。失敗しても
+    起動時 (主導モード問わず — chat / create) に呼び出される。失敗しても
     アプリ起動を止めず WARN ログのみで握りつぶす (リスク対応:
     bootstrap が起動失敗の単一障害点にならないこと)。
     """
@@ -300,7 +300,7 @@ def _init_memory(
     # 同梱 default は ``backend/free/memory/_defaults/triggers/`` 配下。
     triggers_dir = resolver.resolve_local("triggers_dir")
     # note_builder のモジュールレベル default に設定し、以降に構築される
-    # ChatNoteBuilder / CodingNoteBuilder (NoteBuilder singleton 経由 + sleep
+    # ChatNoteBuilder / CreateNoteBuilder (NoteBuilder singleton 経由 + sleep
     # extractors が fresh 構築するインスタンス) が同じ user override を拾うようにする。
     from backend.free.memory.notes.note_builder import set_default_triggers_dir
     set_default_triggers_dir(triggers_dir)

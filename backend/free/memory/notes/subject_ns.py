@@ -127,14 +127,14 @@ MEM_KINDS: frozenset[str] = frozenset({
     "decision",
     "commitment",
     "project",
-    "coding",
-    "coding_task",
+    "create",
+    "create_task",
     "model",
 })
 """EvorefMem owned subject の ``<kind>`` 集合。
 
 task FactType に対応する subject kind。owner が ``mem`` であるため
-``mem.coding_task.*`` 名前空間に配置する (設計書 §7.2 に準拠)。
+``mem.create_task.*`` 名前空間に配置する (設計書 §7.2 に準拠)。
 """
 
 
@@ -176,10 +176,10 @@ def make_learn_subject(kind: str, *parts: str) -> str:
     許容 ``<kind>``: :data:`LEARN_KINDS` (``policy`` / ``fewshot`` / ``metric``)。
 
     例:
-        >>> make_learn_subject("policy", "coding", "search", "top_k")
-        'learn.policy.coding.search.top_k'
-        >>> make_learn_subject("fewshot", "coding", "abc123")
-        'learn.fewshot.coding.abc123'
+        >>> make_learn_subject("policy", "create", "search", "top_k")
+        'learn.policy.create.search.top_k'
+        >>> make_learn_subject("fewshot", "create", "abc123")
+        'learn.fewshot.create.abc123'
 
     Raises:
         SubjectNamespaceError: kind が allowlist 外、または parts に不正文字。
@@ -193,13 +193,13 @@ def make_mem_subject(kind: str, *parts: str) -> str:
 
     許容 ``<kind>``: :data:`MEM_KINDS` (``personal`` / ``world`` / ``preference`` /
     ``emotion`` / ``opinion`` / ``belief`` / ``decision`` / ``commitment`` /
-    ``project`` / ``coding`` / ``coding_task`` / ``model``)。
+    ``project`` / ``create`` / ``create_task`` / ``model``)。
 
     例:
         >>> make_mem_subject("personal", "favorite-language")
         'mem.personal.favorite-language'
-        >>> make_mem_subject("coding_task", "my-project", "abc123def456")
-        'mem.coding_task.my-project.abc123def456'
+        >>> make_mem_subject("create_task", "my-project", "abc123def456")
+        'mem.create_task.my-project.abc123def456'
 
     Raises:
         SubjectNamespaceError: kind が allowlist 外、または parts に不正文字。

@@ -141,22 +141,22 @@ const syncHandlers = new Map<string, SyncHandler>([
 				layout.update((l) => {
 					const next = {
 						...l,
-						coding: {
-							...l.coding,
+						create: {
+							...l.create,
 							editor: {
-								show_line_numbers: ed.show_line_numbers as boolean ?? l.coding.editor.show_line_numbers,
-								word_wrap: ed.word_wrap as boolean ?? l.coding.editor.word_wrap,
-								tab_size: ed.tab_size as number ?? l.coding.editor.tab_size,
-								font_family: ed.font_family as string ?? l.coding.editor.font_family,
-								font_size: ed.font_size as number ?? l.coding.editor.font_size,
-								line_height: ed.line_height as number ?? l.coding.editor.line_height,
-								show_toolbar: ed.show_toolbar as boolean ?? l.coding.editor.show_toolbar,
-								show_active_line: ed.show_active_line as boolean ?? l.coding.editor.show_active_line,
-								default_encoding: ed.default_encoding as string ?? l.coding.editor.default_encoding,
+								show_line_numbers: ed.show_line_numbers as boolean ?? l.create.editor.show_line_numbers,
+								word_wrap: ed.word_wrap as boolean ?? l.create.editor.word_wrap,
+								tab_size: ed.tab_size as number ?? l.create.editor.tab_size,
+								font_family: ed.font_family as string ?? l.create.editor.font_family,
+								font_size: ed.font_size as number ?? l.create.editor.font_size,
+								line_height: ed.line_height as number ?? l.create.editor.line_height,
+								show_toolbar: ed.show_toolbar as boolean ?? l.create.editor.show_toolbar,
+								show_active_line: ed.show_active_line as boolean ?? l.create.editor.show_active_line,
+								default_encoding: ed.default_encoding as string ?? l.create.editor.default_encoding,
 								default_line_ending: ed.default_line_ending as LineEndingSetting
-									?? l.coding.editor.default_line_ending,
+									?? l.create.editor.default_line_ending,
 								highlight_languages: ed.highlight_languages as string[]
-									?? l.coding.editor.highlight_languages,
+									?? l.create.editor.highlight_languages,
 							}
 						}
 					};
@@ -205,10 +205,10 @@ promptLocale.subscribe((newLocale) => {
 });
 
 /**
- * model_paths の単一フィールドを即時保存する (migrate 非対象キー用。coding_model 等)
+ * model_paths の単一フィールドを即時保存する (migrate 非対象キー用。create_model 等)
  *
  * base/assist/embed のような model_state 追跡キーは migrate API 経由でしか変更できないが、
- * coding_model は非追跡なので config 直保存でよい。追跡キーは現在値のまま同梱して送ると
+ * create_model は非追跡なので config 直保存でよい。追跡キーは現在値のまま同梱して送ると
  * バックエンドの immutable ガードを通過する (値が変化したキーのみ 403)。
  * 保存後の dirty クリア / 再スナップショットは呼び出し側の loadConfig 再取得に委ねる。
  */

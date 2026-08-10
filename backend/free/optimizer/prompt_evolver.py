@@ -34,7 +34,7 @@ logger = get_logger("optimizer.prompt_evolver")
 # 突然変異リトライ上限
 MAX_MUTATION_RETRIES = 3
 
-# プロンプト変異の生成トークン上限。システムプロンプト全文 (coding.md ~1350字) の
+# プロンプト変異の生成トークン上限。システムプロンプト全文 (create.md ~1350字) の
 # 再生成 + reasoning モデルの思考漏れ分の途中切断を避けるため広めに取る。
 _MUTATION_MAX_TOKENS = 2048
 
@@ -245,10 +245,10 @@ class PromptEvolver:
             if signals.get("user_correction") is not None:
                 score -= weight * 0.8
 
-            # 長文生成 (coding モードの成果物) の検証失敗も失敗シグナル。
-            # coding モードは会話が単発で完結しがちで rephrase/user_correction が
+            # 長文生成 (create モードの成果物) の検証失敗も失敗シグナル。
+            # create モードは会話が単発で完結しがちで rephrase/user_correction が
             # 皆無になりやすく (2026-07-17 実データで 21 件中 0 件)、この信号が
-            # ないと coding モードの経験が base_score に一切反映されない。
+            # ないと create モードの経験が base_score に一切反映されない。
             if signals.get("long_form_used") and signals.get("long_form_success") is False:
                 score -= weight * 0.5
 
@@ -273,7 +273,7 @@ class PromptEvolver:
         # (カバー率)。候補ごとに値が変わるため候補間識別の主因。最大 +0.1。
         # rephrased_query/user_correction に加え、長文生成の検証失敗
         # (long_form_used かつ long_form_success=False) も失敗経験として含める
-        # (coding モードは前者 2 シグナルがほぼ発生しないため、これが無いと
+        # (create モードは前者 2 シグナルがほぼ発生しないため、これが無いと
         # failure_keywords が常に空集合になり全候補の fitness が完全に一致する
         # = 進化が no-op 化する 2026-07-17 の実障害と同じ状態になる)。
         failure_keywords: set[str] = set()

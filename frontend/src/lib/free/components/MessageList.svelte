@@ -22,7 +22,7 @@
 
 <div
 	class="message-list"
-	class:constrained={$currentMode !== 'coding'}
+	class:constrained={$currentMode !== 'create'}
 	role="log"
 	aria-live="polite"
 	aria-label={$t('chat.message_list')}

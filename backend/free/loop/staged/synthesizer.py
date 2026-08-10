@@ -1,11 +1,11 @@
-"""staged コーディングのタスクグラフ合成。
+"""staged クリエイトのタスクグラフ合成。
 
-ユーザーのコーディング要求 (例: 「Xを作って」) を、アシストモデルに粗計画
+ユーザーのクリエイト要求 (例: 「Xを作って」) を、アシストモデルに粗計画
 (``summary`` + ``modules[]``) として返させ、Python 側で **決定的に**
 spec → code → test の task ファクト三層へ展開する。
 
 設計方針:
-- LLM には粗計画のみ返させる (purpose=``coding_task_graph``、schema は
+- LLM には粗計画のみ返させる (purpose=``create_task_graph``、schema は
   ``PURPOSE_SCHEMAS`` から自動解決)。三層展開・依存配線・slug 衝突回避は
   本モジュールが Python で行い、非循環な依存グラフを保証する。
 - アシスト未接続 / 解析失敗 / モジュール 0 件 のときは ``[]`` を返し、呼出側
@@ -402,7 +402,7 @@ def _avoid_stdlib_collisions(modules: list[dict]) -> list[dict]:
     return out
 
 
-async def synthesize_coding_task_graph(
+async def synthesize_create_task_graph(
     *,
     request: str,
     project_id: str,
@@ -410,16 +410,16 @@ async def synthesize_coding_task_graph(
     include_tests: bool = True,
     debug_logger: "DebugLogger | None" = None,
 ) -> list[SemanticFact]:
-    """コーディング要求を spec/code/test の task ファクト群へ分解する。
+    """クリエイト要求を spec/code/test の task ファクト群へ分解する。
 
     Args:
-        request: ユーザーのコーディング指示。
+        request: ユーザーのクリエイト指示。
         project_id: タスクを所属させる project_id。
         assist_client: アシストモデル。``None`` (degraded) なら ``[]`` を返す。
         include_tests: ``False`` なら test 工程を生成しない (config の
-            ``coding.staged.test_stage_enabled=false`` 用)。
+            ``create.staged.test_stage_enabled=false`` 用)。
         debug_logger: chat モードの meta_cognitive_llm_route と同種の
-            assist 利用可否判定を ``coding_task_graph_synthesis_path`` として
+            assist 利用可否判定を ``create_task_graph_synthesis_path`` として
             構造化記録する (任意)。
 
     Returns:
@@ -429,10 +429,10 @@ async def synthesize_coding_task_graph(
     """
     _candidates = ["assist_synthesis", "assist_unavailable_fallback"]
     if assist_client is None:
-        logger.info("synthesize_coding_task_graph: assist_client is None — fallback")
+        logger.info("synthesize_create_task_graph: assist_client is None — fallback")
         if debug_logger is not None:
             debug_logger.log_decision(
-                decision_point="coding_task_graph_synthesis_path",
+                decision_point="create_task_graph_synthesis_path",
                 chosen="assist_unavailable_fallback",
                 candidates=_candidates,
                 reason="assist_client_unavailable",
@@ -441,7 +441,7 @@ async def synthesize_coding_task_graph(
         return []
     if debug_logger is not None:
         debug_logger.log_decision(
-            decision_point="coding_task_graph_synthesis_path",
+            decision_point="create_task_graph_synthesis_path",
             chosen="assist_synthesis",
             candidates=_candidates,
             reason="assist_client_available",
@@ -459,25 +459,25 @@ async def synthesize_coding_task_graph(
     try:
         result = await assist_client.generate_json(
             prompt,
-            purpose="coding_task_graph",
+            purpose="create_task_graph",
             max_tokens=1536,
             temperature=0.3,
             telemetry=graph_telemetry,
         )
     except Exception as exc:
-        logger.warning("coding_task_graph synthesis failed: %s", exc)
+        logger.warning("create_task_graph synthesis failed: %s", exc)
         return []
     # coarse plan は通常 1024 に収まるが、切断時はモジュール欠落の可能性を可視化。
     if graph_telemetry.get("truncated"):
         logger.warning(
-            "coding_task_graph truncated: some modules may be missing from the "
+            "create_task_graph truncated: some modules may be missing from the "
             "staged plan (request too large for the planning budget)",
         )
 
     summary = str((result or {}).get("summary", "")).strip()
     modules = _normalize_modules((result or {}).get("modules"))
     if not modules:
-        logger.info("coding_task_graph returned no modules — fallback to longform")
+        logger.info("create_task_graph returned no modules — fallback to longform")
         return []
     # stdlib と同名のファイルは import 解決不能な衝突を起こすため合成時に断つ。
     modules = _avoid_stdlib_collisions(modules)
@@ -545,7 +545,7 @@ async def synthesize_coding_task_graph(
             ))
 
     logger.info(
-        "coding_task_graph synthesized: %d modules -> %d tasks (project=%s)",
+        "create_task_graph synthesized: %d modules -> %d tasks (project=%s)",
         len(modules), len(facts), project_id,
     )
     return facts

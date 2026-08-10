@@ -16,8 +16,10 @@ from backend.free.core.intent_vocab import (
     REFERENTIAL_WRITE_TARGET_RE,
     ascii_boundary_alternation,
     exact_greeting_pattern,
+    looks_like_numeric_question,
+    PREMISE_CONFIRMATION_RE,
 )
-from backend.free.core.session_mode import is_chat_mode, is_coding_mode
+from backend.free.core.session_mode import is_chat_mode, is_create_mode
 from backend.free.document_nouns import (
     DOCUMENT_NOUN_LEARNABLE_JA,
     DOCUMENT_NOUNS_NEEDS_SUFFIX,
@@ -130,10 +132,21 @@ _LOCAL_PATH_RE = re.compile(
 )
 # 書込み「動詞」のみ。名詞 (excel / docx 等) 単独では発火させない (「report.xlsx を
 # 読んで」のような read 文脈で誤検出しないため)。
+#
+# ``core.intent_vocab.WRITE_VERB_RE`` とは **意図的に別物** (統合しない)。
+# あちらは meta_cognitive のタスク種別判定用で語彙が広く (修正 / 変更 / 更新 /
+# 実装 等)、ここでルータの振り分けに使うと純粋な読み取り・編集依頼まで
+# 書込み志向のプランナへ送ってしまう。共有するのは概念であって語彙ではない。
+#
+# 「追記」「書き足」は 2026-08-08 に追加。``書[きい]`` は 書き/書い しか拾わず、
+# 「同じファイルに 3 行追記して」が書込み意図として認識されなかった。その結果
+# chat で実行できる書込みツールが無い経路に落ち、ツールを 1 つも撃たないまま
+# 「追記しました」と完了を捏造した (実ファイルは無変更。ライブ監査 ターン6)。
 _WRITE_VERB_RE = re.compile(
-    r"(?:作成|作って|生成|出力|保存|書[きい]|書込|エクスポート|export"
+    r"(?:作成|作って|生成|出力|保存|書[きい]|書込|追記|書き足|エクスポート|export"
     r"|(?<![A-Za-z])save(?![A-Za-z])"
     r"|(?<![A-Za-z])write(?![A-Za-z])"
+    r"|(?<![A-Za-z])append(?![A-Za-z])"
     r"|(?<![A-Za-z])create(?![A-Za-z])"
     r"|(?<![A-Za-z])output(?![A-Za-z]))",
     re.IGNORECASE,
@@ -147,12 +160,48 @@ _WRITE_VERB_RE = re.compile(
 # 計算してください」が 3 タスクに分解され、うち 2 つが実在しないパス
 # (prices.txt / unknown) の read_file になって失敗し、質問は無回答のまま
 # 「1 件のタスクを完了し、2 件が失敗しました。」だけが返った)。
+#
+# 「〜に書いてある / 書かれている」も同様に **状態の説明** であって依頼された
+# 動作ではない。``書[きい]`` が ``書いてある`` の ``書い`` に一致するため、
+# 裸のファイル名を書込み先として認めるようにすると
+# 「notes.txt に書いてある内容を見せて」が書込み依頼に化ける。
 _DESCRIPTIVE_WRITE_CLAUSE_RE = re.compile(
     r"(?:書[きい]た|作成した|作った|生成した|保存した|出力した|書き込んだ)"
     r"\s*(?:ばかりの?|ところの?)?"
     r"\s*(?:その|この|あの|先ほどの?|さっきの?)?"
     r"\s*(?:ファイル|もの|やつ|データ|内容|中身)"
+    r"|書いてあ|書かれて|書いてる"
     r"|(?:you\s+(?:just\s+)?(?:wrote|created|saved|generated))",
+    re.IGNORECASE,
+)
+# 裸のファイル名 (ディレクトリを伴わない ``notes.txt``)。書込み動詞と揃った
+# ときだけ書込み先として認める。
+#
+# ``_LOCAL_PATH_RE`` はドライブ接頭辞か Unix の 2 階層以上しか認めないため、
+# 直前に自分が作ったファイルを名前だけで指す **最も自然な言い方** が
+# ``local_write_intent`` を外れ deliberative に落ちていた。chat には実行できる
+# 書込みツールが無いので、ツールを 1 つも撃たないまま完了を捏造する
+# (実インシデント 2026-08-09 ライブ監査: 「inventory_notes.txt に 1 行追記して
+# ください」でツール 0 回、**フルパスを補って**「E:\tmp\inventory_notes.txt の
+# 末尾に追記しました」と報告。実ファイルは無変更。フルパスで同じ依頼をすると
+# 正常に書き込まれ、差はパス表記だけだった)。
+#
+# 実際の保存先は meta_cognitive の write-fast 経路が会話から解決する
+# (解決できなければ書かずに失敗する = 捏造しない)。
+# 先頭境界は **否定後読み** で書く。区切り文字を列挙する方式にすると、
+# 日本語の句読点直後 (「その値です。notes.txt を書き直して」) を取りこぼす。
+# 日本語ではファイル名が句点・読点の直後に来るのが普通なので、列挙漏れは
+# そのまま実害になる (2026-08-09 の 2 回目のライブ監査で、`。` 直後の
+# 指定がルータを外れ、ツール 0 回のまま「書き直します」と応答した)。
+# パス区切り・語構成文字だけを除外すれば、``E:\tmp\a.txt`` の末尾要素を
+# 裸名として二重に拾うことも防げる。
+_BARE_FILENAME_TARGET_RE = re.compile(
+    r"(?<![\w./\\-])"
+    r"[\w-]+(?:\.[\w-]+)*\."
+    r"(?:txt|md|markdown|csv|tsv|json|jsonl|ya?ml|log|ini|cfg|conf|toml"
+    r"|xlsx|xls|ods|docx|doc|pptx|ppt|pdf|html?|xml"
+    r"|py|js|ts|tsx|jsx|sh|ps1|bat|sql|rs|go|java|rb|c|cpp|h)"
+    r"(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 # 保存先を直前の文脈に委ねる参照表現。「同じファイルに保存し直して」のような
@@ -202,6 +251,23 @@ _EXTRACTION_REQUEST_RE = re.compile(
     r"|(?:list|extract)\s+(?:just|only)\s+the",
     re.IGNORECASE,
 )
+
+#: 「さきほどの表で上書きして」型: 書くべき本文は会話に既にあり、生成する対象が
+#: 無い。書込み経路の仕事なので長文生成に落とさない。
+#:
+#: 実インシデント 2026-08-10 ライブ監査: 「そのファイルには表ではなく説明文が
+#: 入っています。さきほどの列定義の表で上書きしてください。」が long_form に
+#: 分類され、**やるべきことを説明する約 1,000 字の散文**を出力してファイルは
+#: 無変更のまま「✓ 生成 完了 (1 ユニット)」と表示された。さらにその誤ルー
+#: ティングが `説明文` として long_form パターンに学習・永続化された。
+#:
+#: 動詞はファイルへ向かうもの (上書き/保存/書き込) に限る。「先ほどの内容を
+#: もとにレポートを書いて」のような正当な長文依頼を巻き込まないため。
+_PRIOR_ARTIFACT_REF_RE = re.compile(
+    r"(?:さきほど|さっき|先(?:ほど|程)|上記|直前|いま|今)の?\s*[^。、]{0,10}?"
+    r"(?:表|リスト|一覧|コード|スクリプト|関数|クラス|定義|案|下書き|内容|文面|本文)",
+)
+_WRITE_TO_FILE_VERB_RE = re.compile(r"上書き|書き込|書き直|保存")
 
 # 複雑度を示すキーワードパターン（同義語・表記揺れ対応済み）
 COMPLEX_KEYWORDS = [
@@ -295,10 +361,10 @@ _KNOWLEDGE_QUERY_STRICT_PATTERNS = [
     re.compile(r"(?:what is|tell me|explain|describe|how does)\b", re.IGNORECASE),
 ]
 
-# 名詞 + 助詞のみで判定するため緩く、コーディングモードの正規な生成依頼
+# 名詞 + 助詞のみで判定するため緩く、クリエイトモードの正規な生成依頼
 # ("サンプルCSVデータを作成し" 等) の一部にも誤マッチする (2026-07-22 ライブ
 # 検証で発覚)。strict 側 (教えて/について/知りたい 等) は明示的な疑問形式のみを
-# 対象とするため誤爆が少ない。coding_meta_keywords の is_knowledge 上書き判定
+# 対象とするため誤爆が少ない。create_meta_keywords の is_knowledge 上書き判定
 # では、この緩いパターンを除いた strict のみを知識質問シグナルとして扱う。
 _KNOWLEDGE_QUERY_LOOSE_PATTERN = re.compile(
     r"(?:資料|情報|データ|内容|概要|詳細|特徴|一覧).*(?:は|を|が|に)", re.IGNORECASE,
@@ -308,6 +374,61 @@ KNOWLEDGE_QUERY_PATTERNS = [
     *_KNOWLEDGE_QUERY_STRICT_PATTERNS,
     _KNOWLEDGE_QUERY_LOOSE_PATTERN,
 ]
+
+# ユーザー自身について記憶している内容の想起を求めるクエリ。
+#
+# reactive / reactive_light は SemMem も RAG も一切走らせないため、この種の
+# クエリが short_query で reactive に落ちると、**記憶しているのに「情報が
+# ありません」と答える**。知識質問を deliberative へ逃がす knowledge_query
+# ルール (直上) と同じ理由だが、想起依頼は「〜ですか」で終わらない言い回しが
+# 多く strict パターンに掛からない。
+#
+# 実インシデント (2026-08-07 ライブ監査): 同一セッションで「趣味は自転車と
+# 写真です」と伝え、実際にファクトとして保持していたにもかかわらず、
+# 「私の趣味をもう一度確認させてください。」(19 文字) が short_query →
+# reactive_light に落ち、「あなたの趣味に関する情報は提供されていない」と
+# 回答した。「私の趣味は何でしたか？」も同じ経路に落ちる (strict 側は
+# ``ですか`` を持つが ``でしたか`` を持たない)。
+#
+# 一人称の所有格と想起動詞が近接している場合のみ対象とし、間に挟める文字数を
+# 制限して「私が作ったコードを修正して」等の依頼を巻き込まない。
+#
+# 「私の◯◯は？」型 (想起動詞も ``ですか`` も無い最短形) も対象に含める。
+# 実インシデント (2026-08-09): 「私の猫の名前は？」(9 文字) /
+# 「私の好きな季節は？」が short_query → reactive に落ち、**記憶ブロックが
+# 一切組み立てられないまま** 「文脈が不足しているため猫の名前を教えて
+# ください」と回答した。ファクトは保持しており (類似度 0.490)、注入経路に
+# 到達しさえすれば正答する。所有格 + 短い属性名 + ``は？`` で終わる形だけを
+# 採るので、「私の作ったコードは動きますか」のような依頼文は掛からない。
+_PERSONAL_RECALL_RE = re.compile(
+    r"(?:私|わたし|僕|ぼく|俺|おれ|自分)の[^。、？?\n]{1,12}は[？?]\s*$"
+    r"|(?:私|わたし|僕|ぼく|俺|おれ|自分)(?:の|は|が)[^。？?\n]{0,24}"
+    r"(?:覚えて|おぼえて|記憶して|思い出|確認|言って|"
+    r"何(?:です|でした|だった)|は何|でしたか|だっけ)",
+)
+_PERSONAL_RECALL_EN_RE = re.compile(
+    r"\bmy\b[^.?!\n]{0,24}"
+    r"\b(?:remember|recall|what(?:'s| is| was)|again)\b",
+    re.IGNORECASE,
+)
+
+# 前提の同意を求める確認形。「〜ですよね？」「〜で合っていますか」など。
+#
+# knowledge_query の strict パターンは ``ですか|でしょうか|とは|教えて`` を持つが、
+# 同意要求形はそのどれにも当たらない。短ければ short_query で reactive に落ち、
+# RAG もカートリッジも引かないまま事前知識だけで答えることになる。**この形は
+# 誤りに同意するのが既定の失敗**なので、他の短文より取りこぼしの代償が大きい。
+#
+# 実インシデント (2026-08-08 ライブ監査): 「evoref は RAG に LangChain を使って
+# いますよね？」(29 文字) が short_query → reactive に落ち、検索を一切せずに
+# 「はい、evoref は RAG に LangChain を使用しています」と回答した。リポジトリの
+# 不変則 (LangChain / LlamaIndex / ChromaDB / FAISS を使わない) と真逆で、同じ
+# セッションの「パリはイタリアの首都ですよね？」は事前知識だけで正しく訂正できて
+# いたため、**知識の有無ではなく検索の有無**が分けていた。
+# ``よね`` は述語の断定形に付くものだけを採る。裸の ``よね$`` にすると
+# 「修正してよね」のような依頼 (て形 + よね) まで確認形として拾ってしまう。
+# 定義は core.intent_vocab が SSOT (deliberative も同じ判定を使うため)。
+_PREMISE_CONFIRMATION_RE = PREMISE_CONFIRMATION_RE
 
 # KNOWLEDGE_QUERY_PATTERNS の英語版。「about」は汎用前置詞のため直訳せず、
 # 限定的な表現で構成する (誤爆抑制)。
@@ -368,27 +489,42 @@ _EXECUTABLE_QUERY_PATTERNS = [
     # "program" / "diagram" / "telegram" の 'ram' に部分マッチし、無関係な
     # クエリが executable_query として deliberative へ強制昇格していた。
     # tool_call_judge 側は 2026-07-22 監査で塞がれたが、こちらは残っていた。
+    # 「容量」単独は外す (tool_call_judge._TOOL_PATTERNS の同じエントリと同期。
+    # データ量の話に普通に現れ、機械スペックの要求とは限らない)。judge 側に
+    # あって router に無かった ``ドライブ`` をここで補い、「E ドライブの容量は?」
+    # のような機器名指しの質問が reactive に落ちないようにする。
     re.compile(
-        r"(?:スペック|メモリ|ディスク|容量|ストレージ|"
+        r"(?:スペック|メモリ|ディスク|(?:空き|残り|使用)容量|ストレージ|ドライブ|"
         + ascii_boundary_alternation("CPU", "RAM", "GPU", "VRAM", "spec")
         + r")",
         re.IGNORECASE,
     ),
     # 「何月|何日|何曜日」は明確な疑問語のみ追加 (「今日|明日|昨日」単独は
     # 「今日の予定」等の文脈で誤検出するため見送り)。
-    re.compile(r"(?:何時|何月|何日|何曜日|日時|日付|現在時刻|(?<![A-Za-z])today(?![A-Za-z])|(?<![A-Za-z])now(?![A-Za-z])|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z]))", re.IGNORECASE),
+    # 「日時」「日付」の直後に 型/形式/フォーマット/カラム/列 が続く場合は
+    # **データ型やスキーマの話** であって現在日時の要求ではない
+    # (実インシデント 2026-08-09 2 回目のライブ監査: 「入会日を持たせるとき、
+    # 日付型と文字列型のどちらが良いですか」で現在時刻の取得コマンドが撃たれ、
+    # 1 往復を空費した)。
+    re.compile(r"(?:何時|何月|何日|何曜日|(?:日時|日付)(?!型|形式|フォーマット|カラム|列)|現在時刻|(?<![A-Za-z])today(?![A-Za-z])|(?<![A-Za-z])now(?![A-Za-z])|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z]))", re.IGNORECASE),
     re.compile(r"(?:IP\s*アドレス|ホスト名|(?<![A-Za-z])hostname(?![A-Za-z])|(?<![A-Za-z])ip\s*address)", re.IGNORECASE),
     re.compile(r"(?:(?<![A-Za-z])OS(?![A-Za-z])|オペレーティングシステム|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])|(?<![A-Za-z])Mac(?![A-Za-z]))", re.IGNORECASE),
     re.compile(r"(?:Python|python)\s*(?:バージョン|version)", re.IGNORECASE),
     re.compile(r"(?:環境変数|(?<![A-Za-z])env(?![A-Za-z])|(?<![A-Za-z])PATH(?![A-Za-z]))", re.IGNORECASE),
-    re.compile(r"(?:階乗|素数|フィボナッチ|素因数|進数変換|桁)", re.IGNORECASE),
+    re.compile(r"(?:階乗|素数|フィボナッチ|素因数|進数変換|\d+\s*進(?:数|法)?|桁)", re.IGNORECASE),
     re.compile(r"(?:集計|合計|平均|中央値|標準偏差|ソート|統計)", re.IGNORECASE),
-    re.compile(r"(?:変換|エンコード|デコード|Base64|ハッシュ|タイムスタンプ)", re.IGNORECASE),
+    # 「変換」単独は外す (tool_call_judge._TOOL_PATTERNS の同じエントリと同期。
+    # 理由はそちらのコメント参照)。内容変換の依頼が executable_query になり、
+    # 不要に deliberative へ回っていた。
+    re.compile(r"(?:エンコード|デコード|Base64|ハッシュ|タイムスタンプ|文字コード|エポック秒?|UNIX\s*時間)", re.IGNORECASE),
 ]
 
 # _EXECUTABLE_QUERY_PATTERNS の英語版。
 _EXECUTABLE_QUERY_PATTERNS_EN = [
-    re.compile(r"(?<![A-Za-z])(?:specs?|CPU|memory|RAM|GPU|VRAM|disk|capacity|storage)(?![A-Za-z])", re.IGNORECASE),
+    # ``capacity`` は 2026-08-09 に外した。データ項目名として普通に現れ、
+    # 機械スペックの要求とは限らない (詳細は
+    # ``tool_call_judge._EXECUTABLE_QUERY_COMMANDS`` の同名エントリのコメント)。
+    re.compile(r"(?<![A-Za-z])(?:specs?|CPU|memory|RAM|GPU|VRAM|disk|storage)(?![A-Za-z])", re.IGNORECASE),
     re.compile(
         r"\b(?:what'?s?\s*(?:the\s*)?(?:time|date)|current\s*(?:time|date)"
         r"|today'?s?\s*date|what\s*day\s*(?:is\s*it|of\s*the\s*week))\b"
@@ -399,7 +535,7 @@ _EXECUTABLE_QUERY_PATTERNS_EN = [
     re.compile(r"(?:(?<![A-Za-z])OS(?![A-Za-z])|operating\s*system|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])|(?<![A-Za-z])Mac(?![A-Za-z]))", re.IGNORECASE),
     re.compile(r"(?:Python|python)\s*version", re.IGNORECASE),
     re.compile(r"(?:environment\s*variable|(?<![A-Za-z])env(?![A-Za-z])|(?<![A-Za-z])PATH(?![A-Za-z]))", re.IGNORECASE),
-    re.compile(r"\b(?:factorial|prime(?:\s*numbers?)?|fibonacci|prime\s*factorization|base\s*conversion|number\s*of\s*digits?|digits?)\b", re.IGNORECASE),
+    re.compile(r"\b(?:factorial|prime(?:\s*numbers?)?|fibonacci|prime\s*factorization|base\s*conversion|base\s*\d+|hex(?:adecimal)?|binary|octal|radix|number\s*of\s*digits?|digits?)\b", re.IGNORECASE),
     # sum/average/mean/sort は日常会話で極めて頻出する多義語 ("What do you
     # mean?"/"I sort of agree"/"on average, this works fine") のため、
     # 単独では発火させず数値/データ文脈語との近接共起を要求する (2026-07-22
@@ -415,7 +551,7 @@ _EXECUTABLE_QUERY_PATTERNS_EN = [
         r"\b(?:sum|average|mean|sort(?:ed|ing)?)\b",
         re.IGNORECASE,
     ),
-    re.compile(r"\b(?:convert|encode|decode|encoding|decoding|Base64|hash(?:ing)?|timestamp)\b", re.IGNORECASE),
+    re.compile(r"\b(?:encode|decode|encoding|decoding|Base64|hash(?:ing)?|timestamp|epoch)\b", re.IGNORECASE),
 ]
 
 # 挨拶・簡単な定型パターン → Reactive 層で即応答
@@ -464,6 +600,22 @@ _LONG_FORM_MIN_BY_UNIT: dict[str, int] = {
     "文字": 1000, "字": 1000, "文": 50, "行": 100,
     "word": 300, "words": 300, "character": 1000, "characters": 1000,
     "char": 1000, "chars": 1000, "line": 100, "lines": 100,
+}
+#: 分量指定 (1 桁も拾う)。``_LENGTH_REQUEST_RE`` は長文側の判定専用で
+#: ``\d{2,}`` に限っているため、「3文で」のような **短さの明示** が
+#: そもそも分量指定として認識されなかった (``requests_short_output`` 参照)。
+_ANY_LENGTH_REQUEST_RE = re.compile(r"(\d+)\s*(文字|字|行|文|段落)")
+_ANY_LENGTH_REQUEST_RE_EN = re.compile(
+    r"\b(\d+)[\s-]?(sentences?|paragraphs?|words?|lines?|characters?|chars?)\b",
+    re.IGNORECASE,
+)
+#: この値**以下**なら「短い」と確定し long_form へ振らない。長文しきい値との
+#: 間 (例: 11〜49 文) はどちらでもないので、他の long_form シグナルに委ねる。
+_SHORT_FORM_MAX_BY_UNIT: dict[str, int] = {
+    "文": 10, "行": 20, "段落": 3, "文字": 400, "字": 400,
+    "sentence": 10, "sentences": 10, "paragraph": 3, "paragraphs": 3,
+    "line": 20, "lines": 20, "word": 150, "words": 150,
+    "character": 400, "characters": 400, "char": 400, "chars": 400,
 }
 
 
@@ -554,6 +706,28 @@ def requests_long_output(query: str) -> bool:
     return False
 
 
+def requests_short_output(query: str) -> bool:
+    """クエリが「短い分量」を明示的に指定しているか (純粋関数)。
+
+    ``requests_long_output`` の対称形。明示的に小さい分量を指定した依頼は、
+    文書種別名詞 (案内文 / 手順書 …) を含んでいても長文生成ではない。
+
+    ``_LENGTH_REQUEST_RE`` は ``\\d{2,}`` (2 桁以上) しか拾わないため、
+    **1 桁の指定がそもそも分量指定として認識されていなかった**。
+    実インシデント (2026-08-09 2 回目のライブ監査): 「会員向けの案内文を英語で
+    **3文** 書いてください」が ``案内文`` で long_form に分類され、
+    ユニット分割パイプラインで 543 トークン / 49 秒を生成。3 文どころか
+    数段落になり、会話で確定済みの大会日 (2026-11-07) を無視して
+    「October 25th」を捏造した。
+    """
+    for regex in (_ANY_LENGTH_REQUEST_RE, _ANY_LENGTH_REQUEST_RE_EN):
+        for amount, unit in regex.findall(query):
+            cap = _SHORT_FORM_MAX_BY_UNIT.get(unit.lower())
+            if cap is not None and int(amount) <= cap:
+                return True
+    return False
+
+
 def _matches_any(patterns: list[re.Pattern], query: str) -> bool:
     """パターンリストのいずれかが query にマッチするか判定する。
 
@@ -578,7 +752,7 @@ class _ClassifyContext:
     変わっても判定は変わらない (早期マッチ時に評価されないよう遅延させている)。
     """
 
-    __slots__ = ("_c", "_cache", "mode", "query", "rag_results")
+    __slots__ = ("_c", "_cache", "context", "mode", "query", "rag_results")
 
     def __init__(
         self,
@@ -586,11 +760,15 @@ class _ClassifyContext:
         query: str,
         mode: str,
         rag_results: list,
+        context: str = "",
     ) -> None:
         self._c = classifier
         self.query = query
         self.mode = mode
         self.rag_results = rag_results
+        #: 直近会話の本文。被演算子の片方が前ターンにしか無い計算クエリを
+        #: reactive に落とさないために使う (``looks_like_numeric_question``)。
+        self.context = context
         self._cache: dict[str, object] = {}
 
     def _memo(self, key: str, compute):
@@ -671,21 +849,21 @@ _CLASSIFY_RULES: tuple[_ClassifyRule, ...] = (
         "local_write_intent", _META,
         lambda c, x: c._is_local_write_intent(x.query, x.mode),
     ),
-    # coding の正規な生成依頼が executable_query へ短絡するのを防ぐため、
+    # create の正規な生成依頼が executable_query へ短絡するのを防ぐため、
     # executable_query より先に評価する (2026-07-22: 「CSV を集計する
     # プログラムを作成して」が staged 生成へ一切到達しなかった)。
     _ClassifyRule(
-        "coding_tools", _META,
+        "create_tools", _META,
         lambda c, x: (
-            is_coding_mode(x.mode) and not x.is_knowledge and c._needs_tools(x.query)
+            is_create_mode(x.mode) and not x.is_knowledge and c._needs_tools(x.query)
         ),
     ),
     # 緩い名詞+助詞パターンは正規の生成依頼にも誤マッチするため、ここでは
     # strict 側 (明示的な疑問形式) だけを知識質問として扱う。
     _ClassifyRule(
-        "coding_meta_keywords", _META,
+        "create_meta_keywords", _META,
         lambda c, x: (
-            is_coding_mode(x.mode)
+            is_create_mode(x.mode)
             and c._has_meta_keywords(x.query)
             and not c._is_strict_knowledge_query(x.query)
         ),
@@ -721,6 +899,27 @@ _CLASSIFY_RULES: tuple[_ClassifyRule, ...] = (
     _ClassifyRule(
         "knowledge_query", "deliberative",
         lambda c, x: x.is_knowledge,
+    ),
+    # 記憶の想起依頼も reactive に落とすと SemMem を引かずに「情報がありません」
+    # と答える (_PERSONAL_RECALL_RE 参照)。knowledge_query と同じく short_query
+    # の手前に置く。
+    _ClassifyRule(
+        "personal_recall", "deliberative",
+        lambda c, x: c._is_personal_recall_query(x.query),
+    ),
+    # 計算を求めるクエリを reactive に落とすとツール判定に一度も到達せず、
+    # base の暗算に倒れる (2026-08-08 ライブ監査:「時速240kmで2時間30分走ると
+    # 何km進みますか。」(26 文字) が short_query → reactive で 540km と誤答。
+    # 正解 600km)。knowledge_query / personal_recall と同じく short_query の
+    # 手前に置く。判定は core.intent_vocab が SSOT。
+    _ClassifyRule(
+        "numeric_question", "deliberative",
+        lambda c, x: looks_like_numeric_question(x.query, x.context),
+    ),
+    # 前提の同意を求める確認形も同様 (_PREMISE_CONFIRMATION_RE 参照)。
+    _ClassifyRule(
+        "premise_confirmation", "deliberative",
+        lambda c, x: c._is_premise_confirmation_query(x.query),
     ),
     _ClassifyRule(
         "short_query", "reactive",
@@ -773,6 +972,7 @@ class ComplexityClassifier:
         mode: str = "chat",
         rag_results: list | None = None,
         context_turns: int = 0,  # noqa: ARG002
+        context: str = "",
     ) -> str:
         """クエリの複雑度を分類する
 
@@ -790,7 +990,7 @@ class ComplexityClassifier:
         self._classify_mode = mode
         self._last_classify_reason = "default"
 
-        ctx = _ClassifyContext(self, query, mode, rag_results)
+        ctx = _ClassifyContext(self, query, mode, rag_results, context)
         for rule in _CLASSIFY_RULES:
             if not rule.predicate(self, ctx):
                 continue
@@ -891,7 +1091,7 @@ class ComplexityClassifier:
     def _is_url_write_intent(self, query: str, mode: str = "chat") -> bool:
         """URL からデータを取得してファイルに書き出す意図を検出する。
 
-        chat モードのみ対象 (coding モードは step 2.5 の ``_needs_tools`` が同等の
+        chat モードのみ対象 (create モードは step 2.5 の ``_needs_tools`` が同等の
         meta_cognitive 振り分けを行う)。URL とファイル書込み/出力意図の双方が
         揃った場合のみ True を返す。
         """
@@ -904,7 +1104,7 @@ class ComplexityClassifier:
     def _is_local_write_intent(self, query: str, mode: str = "chat") -> bool:
         """ローカルパス + ファイル書込み意図 (URL 無し) を検出する。
 
-        chat モードのみ対象 (coding モードは step 2.5 / 2.6 の ``_needs_tools`` /
+        chat モードのみ対象 (create モードは step 2.5 / 2.6 の ``_needs_tools`` /
         ``_has_meta_keywords`` が同等の振り分けを行う)。URL を含む場合は
         ``_is_url_write_intent`` / fetch 経路に委ね、知識質問 (「作成方法を
         教えて」等の how-to) は除外する。ローカルパスと書込み動詞の双方が
@@ -925,6 +1125,11 @@ class ComplexityClassifier:
         if not _WRITE_VERB_RE.search(probe):
             return False
         if _LOCAL_PATH_RE.search(probe):
+            return True
+        # ディレクトリを伴わない裸のファイル名 (「notes.txt に追記して」)。
+        # 直前に作ったファイルを名前だけで指す言い方で、書込み先としては
+        # 参照依頼と同じ扱い (保存先は write-fast 経路が会話から解決する)。
+        if _BARE_FILENAME_TARGET_RE.search(probe):
             return True
         # パスは直前ターンにしか無い参照依頼 (「同じファイルに保存し直して」)。
         # 保存先は write-fast 経路が会話から解決する。
@@ -963,8 +1168,19 @@ class ComplexityClassifier:
         # 「見出しだけ並べて」型は既出成果物の抽出であって生成ではない。
         if _EXTRACTION_REQUEST_RE.search(query):
             return False
+        # 「さきほどの表で上書きして」型も同じ。書くべき本文は会話にあり、
+        # 生成する対象が無い (_PRIOR_ARTIFACT_REF_RE のコメント参照)。
+        if (
+            _PRIOR_ARTIFACT_REF_RE.search(query)
+            and _WRITE_TO_FILE_VERB_RE.search(query)
+        ):
+            return False
         if requests_long_output(query):
             return True
+        # 明示的な短さ指定は文書種別名詞より優先する。長文側を先に見ているので、
+        # 「2000字で」のような明示的な長文指定があればそちらが勝つ。
+        if requests_short_output(query):
+            return False
         if _matches_any(LONG_FORM_PATTERNS, query) or _matches_any(
             LONG_FORM_PATTERNS_EN, query,
         ):
@@ -1004,9 +1220,20 @@ class ComplexityClassifier:
             KNOWLEDGE_QUERY_PATTERNS_EN, query,
         )
 
+    def _is_personal_recall_query(self, query: str) -> bool:
+        """ユーザー自身について記憶している内容の想起依頼かを判定する。"""
+        return bool(
+            _PERSONAL_RECALL_RE.search(query)
+            or _PERSONAL_RECALL_EN_RE.search(query),
+        )
+
+    def _is_premise_confirmation_query(self, query: str) -> bool:
+        """前提の同意を求める確認形かを判定する (_PREMISE_CONFIRMATION_RE 参照)。"""
+        return bool(_PREMISE_CONFIRMATION_RE.search(query.strip()))
+
     def _is_strict_knowledge_query(self, query: str) -> bool:
         """緩い名詞+助詞パターン (_KNOWLEDGE_QUERY_LOOSE_PATTERN) を除いた、
-        明示的な疑問形式のみによる知識質問判定。coding_meta_keywords の
+        明示的な疑問形式のみによる知識質問判定。create_meta_keywords の
         is_knowledge 上書き判定用 (詳細は _KNOWLEDGE_QUERY_STRICT_PATTERNS 参照)。
         """
         return _matches_any(_KNOWLEDGE_QUERY_STRICT_PATTERNS, query) or _matches_any(

@@ -2,19 +2,19 @@
 	/**
 	 * モデル切替ボタン (全モデル種別共通 I/F)
 	 *
-	 * base / assist / embedding / coding / assist_coding のいずれかについて、入力済みの
+	 * base / assist / embedding / create / assist_create のいずれかについて、入力済みの
 	 * 新モデルパスで切替を実行する。見た目・操作系は共通だが、種別ごとに正しいバックエンドへ
 	 * 振り分ける:
 	 *   - assist / embedding: `POST /api/model/{component}/migrate` (auto_restart で自動再起動。
 	 *     rebind 失敗時はバックエンドが旧モデルへ自動ロールバック)。
 	 *   - base: `POST /api/model/migrate` (LoRA アーカイブ等の付帯処理あり)。auto_restart 相当は
 	 *     無く、再起動は別途手動で行うため結果に「手動で再起動してください」バッジを出す。
-	 *   - coding / assist_coding: migrate API 無し (model_state 非追跡)。`onApply` 経由で
+	 *   - create / assist_create: migrate API 無し (model_state 非追跡)。`onApply` 経由で
 	 *     config を即保存する (実際の切替は POST /api/mode/switch がモード遷移時に行う)。
 	 *
 	 * UI は apply ボタン (disabled / loading) → 結果表示 (成功 / エラー) の一発適用で、
 	 * ロールバックボタン・再起動ボタンは持たない (#198 で UI から廃止)。再起動状態バッジは
-	 * 非 coding/assist_coding のみ表示 (assist/embedding=自動再起動済 / base=手動再起動が必要)。
+	 * 非 create/assist_create のみ表示 (assist/embedding=自動再起動済 / base=手動再起動が必要)。
 	 */
 	import type { Snippet } from 'svelte';
 	import { t } from '$lib/i18n';
@@ -25,10 +25,10 @@
 		type ModelComponent
 	} from '$lib/free/api';
 
-	/** UI レベルの種別。API の ModelComponent (assist/embedding) を base/coding/assist_coding へ拡張 */
-	type ModelKind = ModelComponent | 'base' | 'coding' | 'assist_coding';
+	/** UI レベルの種別。API の ModelComponent (assist/embedding) を base/create/assist_create へ拡張 */
+	type ModelKind = ModelComponent | 'base' | 'create' | 'assist_create';
 
-	/** base/assist/embedding/coding のレスポンス差を吸収した共通結果形 */
+	/** base/assist/embedding/create のレスポンス差を吸収した共通結果形 */
 	type MigrateResult = {
 		old_model: string;
 		new_model: string;
@@ -41,7 +41,7 @@
 		currentModel?: string;
 		/** migrate/rollback 成功後に config を再取得させるコールバック */
 		onMigrated?: () => void;
-		/** coding 切替時の即時保存処理 (migrate API を持たない種別用に親が注入) */
+		/** create 切替時の即時保存処理 (migrate API を持たない種別用に親が注入) */
 		onApply?: (newPath: string) => Promise<void>;
 		/** apply ボタンと同じ行の右隣に並べる追加アクション (例: reindex ボタン) */
 		actionsTrailing?: Snippet;
@@ -56,8 +56,8 @@
 	let result = $state<MigrateResult | null>(null);
 	let error = $state<string | null>(null);
 
-	// coding / assist_coding は config 保存のため、再起動バッジを持たない。
-	let showRestartBadge = $derived(component !== 'coding' && component !== 'assist_coding');
+	// create / assist_create は config 保存のため、再起動バッジを持たない。
+	let showRestartBadge = $derived(component !== 'create' && component !== 'assist_create');
 
 	function toError(e: unknown): string {
 		if (e instanceof ApiError) return e.message;
@@ -79,7 +79,7 @@
 					restarted: false,
 					recommendations: r.recommendations
 				};
-			} else if (component === 'coding' || component === 'assist_coding') {
+			} else if (component === 'create' || component === 'assist_create') {
 				await onApply?.(newPath);
 				result = {
 					old_model: currentModel || '—',

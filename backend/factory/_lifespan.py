@@ -207,6 +207,22 @@ async def _shutdown_embedder(state: AppState) -> None:
         logger.warning("Embedder close failed: %s", e)
 
 
+async def _shutdown_assist_residency(state: AppState) -> None:
+    """オンデマンド起動したアシスト llama-server を停止する (docs/c_14 §1.2)。
+
+    アイドル窓や create モードの最中に backend が落ちると、こちらが起こした
+    llama-server が孤児として VRAM を掴んだまま残る。クライアントを閉じる前に
+    プロセスを落とす。
+    """
+    residency = getattr(state, "assist_residency", None)
+    if residency is None:
+        return
+    try:
+        await residency.shutdown()
+    except Exception as e:
+        logger.warning("Assist residency shutdown failed: %s", e)
+
+
 async def _shutdown_assist_client(state: AppState) -> None:
     """アシストモデルクライアントを閉じる（lazy-connect で後から設定された場合も含む）"""
     active_assist = state.assist_client
@@ -329,6 +345,8 @@ async def _run_lifespan_shutdown(
         await _shutdown_llm_client(state)
     with _timed(shutdown_timings, "embedder_close"):
         await _shutdown_embedder(state)
+    with _timed(shutdown_timings, "assist_residency_stop"):
+        await _shutdown_assist_residency(state)
     with _timed(shutdown_timings, "assist_client_close"):
         await _shutdown_assist_client(state)
     with _timed(shutdown_timings, "pro_shutdown"):

@@ -8,6 +8,10 @@ from backend.utils import compress_turn, estimate_tokens as _estimate_tokens
 
 logger = get_logger("memory.working")
 
+#: トークン上限を超えたときに落とす下限水位 (``max_tokens`` に対する比)。
+#: 上限ちょうどで止めると次ターンで即また超えて毎ターン先頭が動く。
+_TOKEN_EVICT_KEEP_RATIO = 0.8
+
 
 class WorkingMemory:
     """Layer 1: ゼロレイテンシの会話コンテキスト"""
@@ -16,6 +20,27 @@ class WorkingMemory:
         mem = config.get("memory", {})
         self.max_turns: int = mem.get("working_max_turns", 30)
         self.max_tokens: int = mem.get("working_max_tokens", 2048)
+        #: 上限に達したときに **まとめて** 押し出すターン数 (ヒステリシス)。
+        #:
+        #: 1 ターンずつ押し出すと、窓の先頭が毎ターン 1 つずれる。プロンプトは
+        #: ``system + 履歴`` の順に組み立てられ、llama-server は共通接頭辞の
+        #: KV キャッシュを再利用するため、先頭がずれると **system 以降が毎ターン
+        #: 全部無効化** される。実測 (2026-08-09 ライブ監査、base=gemma-4-12b):
+        #:
+        #:   prompt eval time = 27,712 ms / 2,898 tokens   ← 固定 28 秒
+        #:          eval time =  7,105 ms /    54 tokens   ← decode は正常
+        #:   selected slot by LCP similarity, f_sim_best = 0.366
+        #:
+        #: 連続ターンのプロンプト差分を取ると共通接頭辞は毎回きっちり
+        #: system プロンプト長 (1,834 文字) で、その直後から食い違っていた。
+        #: 8〜14 トークンしか出さない短い応答でも 28〜40 秒かかっていた。
+        #:
+        #: まとめて押し出すと、次に上限へ達するまでの数ターンは先頭が動かず
+        #: 接頭辞が再利用できる。代償は保持ターン数の平均が
+        #: ``max_turns - block/2`` に下がること。
+        self.evict_block: int = max(
+            1, int(mem.get("working_evict_block", 6)),
+        )
         self.turns: list[dict] = []
         self.active_notes: list[str] = []
         self.session_id: str = uuid4().hex[:8]
@@ -117,23 +142,40 @@ class WorkingMemory:
         return evicted
 
     def _enforce_limits(self) -> None:
-        """ターン数・トークン上限を強制"""
+        """ターン数・トークン上限を強制
+
+        どちらの上限も、超えたら **下限水位までまとめて** 落とす
+        (``evict_block`` の説明を参照)。1 件ずつ削ると窓の先頭が毎ターン動き、
+        llama-server の接頭辞 KV キャッシュが毎回無効化されて prefill が
+        応答時間を支配する。
+        """
         # ターン数制限
-        while len(self.turns) > self.max_turns:
+        if len(self.turns) > self.max_turns:
+            # 一度に窓の半分より多くは捨てない。小さい ``max_turns`` (テスト値や
+            # 極小構成) で block が窓を上回ると、1 回のオーバーフローで会話が
+            # ほぼ空になる。
+            block = max(1, min(self.evict_block, max(1, self.max_turns // 2)))
+            target = max(1, self.max_turns - block + 1)
             logger.debug(
-                "_enforce_limits: turn count %d > max %d, evicting oldest",
-                len(self.turns), self.max_turns,
+                "_enforce_limits: turn count %d > max %d, evicting to %d "
+                "(block=%d)",
+                len(self.turns), self.max_turns, target, block,
             )
-            self._evict_oldest()
+            while len(self.turns) > target:
+                self._evict_oldest()
 
         # トークン制限
         total = self._total_tokens()
-        if total > self.max_tokens:
-            logger.debug(
-                "_enforce_limits: tokens %d > max %d, compressing/evicting",
-                total, self.max_tokens,
-            )
-        while self._total_tokens() > self.max_tokens and len(self.turns) > 1:
+        if total <= self.max_tokens:
+            return
+        # 上限ちょうどまでしか削らないと次ターンで即また超える。窓の先頭を
+        # 動かす回数を減らすため下限水位 (既定 80%) まで落とす。
+        token_target = max(1, int(self.max_tokens * _TOKEN_EVICT_KEEP_RATIO))
+        logger.debug(
+            "_enforce_limits: tokens %d > max %d, compressing/evicting to %d",
+            total, self.max_tokens, token_target,
+        )
+        while self._total_tokens() > token_target and len(self.turns) > 1:
             oldest = self.turns[0]
             if not oldest.get("compressed"):
                 # 未圧縮なら圧縮で対処

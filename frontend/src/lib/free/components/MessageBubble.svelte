@@ -14,16 +14,16 @@
 		mode = 'chat'
 	}: { message: ChatMessage; instanceName?: string; streaming?: boolean; mode?: string } = $props();
 	let isUser = $derived(message.role === 'user');
-	let isCoding = $derived(mode === 'coding');
-	// コーディングモードではコードをエディタへ流すため、チャット側は
+	let isCreate = $derived(mode === 'create');
+	// クリエイトモードではコードをエディタへ流すため、チャット側は
 	// プレースホルダに置換する。'chat' 明示指示時のみコードを表示。
-	let suppressCode = $derived(isCoding && message.editor_route !== 'chat');
+	let suppressCode = $derived(isCreate && message.editor_route !== 'chat');
 	let showTimestamp = $derived($layout.chat.show_timestamps);
 	let showSpinner = $derived(!isUser && streaming && message.content === '');
 </script>
 
-<div class="message-bubble" class:user={isUser} class:assistant={!isUser} class:coding={isCoding}>
-	{#if !isCoding}
+<div class="message-bubble" class:user={isUser} class:assistant={!isUser} class:create={isCreate}>
+	{#if !isCreate}
 		<div class="message-header" class:header-right={isUser}>
 			<span class="role-label">{isUser ? $t('chat.you') : instanceName}</span>
 			{#if showTimestamp}
@@ -33,7 +33,7 @@
 	{/if}
 
 	{#if !isUser && (message.agentic_steps?.length || message.step_results?.length || message.long_form_progress || showSpinner)}
-		<AgenticSteps steps={message.agentic_steps} results={message.step_results} progress={message.long_form_progress} {showSpinner} />
+		<AgenticSteps steps={message.agentic_steps} results={message.step_results} progress={message.long_form_progress} {showSpinner} {streaming} />
 	{/if}
 
 	{#if !showSpinner}
@@ -77,33 +77,33 @@
 		opacity: 0.85;
 	}
 	/* --- チャットモード --- */
-	.message-bubble.user:not(.coding) {
+	.message-bubble.user:not(.create) {
 		align-self: flex-end;
 		background-color: color-mix(in srgb, var(--accent) 18%, var(--bg-secondary));
 		color: var(--text-primary);
 		border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
 		border-bottom-right-radius: 2px;
 	}
-	.message-bubble.assistant:not(.coding) {
+	.message-bubble.assistant:not(.create) {
 		align-self: flex-start;
 		background-color: var(--bg-secondary);
 		color: var(--text-primary);
 		border-bottom-left-radius: 2px;
 	}
-	/* --- コーディングモード: 横幅いっぱい --- */
-	.message-bubble.coding {
+	/* --- クリエイトモード: 横幅いっぱい --- */
+	.message-bubble.create {
 		max-width: 100%;
 		width: 100%;
 		margin-bottom: 2px;
 	}
-	.message-bubble.coding.user {
+	.message-bubble.create.user {
 		align-self: flex-start;
 		background-color: var(--bg-secondary);
 		color: var(--text-primary);
 		border: 1px solid var(--border);
 		border-bottom-left-radius: 2px;
 	}
-	.message-bubble.coding.assistant {
+	.message-bubble.create.assistant {
 		background-color: transparent;
 		border: none;
 		padding: 0 0 10px;

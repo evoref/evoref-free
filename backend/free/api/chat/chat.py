@@ -26,7 +26,10 @@ from backend.free.api.schemas import (
     CancelRequest, CancelResponse, ChatRequest, ChatResponse, TokenInfo,
 )
 from backend.free.api.chat._editor_routing import detect_editor_route
-from backend.free.agent.tool_call_judge import _extract_file_path
+from backend.free.agent.tool_call_judge import (
+    _extract_file_path,
+    _recent_dialogue_text,
+)
 from backend.free.api.chat.chat_recorder import record_response
 from backend.free.api.chat.chat_types import ChatMessage
 from backend.free.api.chat.chat_service import (
@@ -44,12 +47,12 @@ from backend.free.api.chat.chat_streaming import (
     rag_signals_from_chunks,
     read_existing_for_append,
     stream_deliberative, stream_long_form, stream_meta_cognitive, stream_reactive,
-    stream_reactive_light, stream_staged_coding,
+    stream_reactive_light, stream_staged_create,
     sync_deliberative, sync_long_form, sync_meta_cognitive, sync_reactive_light,
 )
 from backend.edition import is_pro
 from backend.free.core.inference import latest_turn_truncation
-from backend.free.core.session_mode import is_coding_mode, is_valid_session_mode
+from backend.free.core.session_mode import is_create_mode, is_valid_session_mode
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
@@ -57,6 +60,7 @@ from backend.free.agent.reactive import ReactiveAgent
 from backend.free.agent.router import ComplexityClassifier
 from backend.free.core.stage_timer import StageTimer
 from backend.free.generation.orchestrator import LongFormOrchestrator
+from backend.free.llm.assist_client import assist_ready
 from backend.free.generation.content_detector import detect_content_type
 from backend.free.generation.direct_codegen import generate_single_file
 from backend.free.generation.models import ContentType
@@ -175,7 +179,7 @@ def _llm_unavailable_response(stream: bool) -> StreamingResponse:  # noqa: ARG00
 
 # 応答言語のランタイム指示 (i18n.prompt_locale 追従)。プロンプト本文 (.md) は
 # 初回生成 / ロケール切替時にしか再導出されないため、既存インストールの本文が
-# 古い locale のまま・coding 本文に言語制約が無い場合でも設定に追従させる保険。
+# 古い locale のまま・create 本文に言語制約が無い場合でも設定に追従させる保険。
 # PromptManager の外で付加することで、Level 1 進化が本文へ焼き込む汚染を防ぐ
 # (名前プレフィックスの前例: prompt_manager._strip_name_prefix)。
 _RESPONSE_LANGUAGE_DIRECTIVES: dict[str, str] = {
@@ -667,7 +671,7 @@ def _validation_issues_artifact(errors: list[str]) -> EditorArtifact:
 
 
 def _clamp_long_form_timeout(cfg: dict) -> dict:
-    """coding 委譲時、orchestrator の total_timeout_sec を agent 上限未満にする。
+    """create 委譲時、orchestrator の total_timeout_sec を agent 上限未満にする。
 
     agent (`_total_timeout` 既定 900s、超過時に artifacts 破棄) より短く打ち切り、
     orchestrator 側でユニット境界の部分結果 + repair を確定させる (artifacts 喪失回避)。
@@ -683,7 +687,7 @@ def _clamp_long_form_timeout(cfg: dict) -> dict:
 def make_code_artifact_generator(
     client, state: AppState, cfg: dict, gen_params: dict, session_id: str,
 ):
-    """coding の editor/chat 出力向け code_generator を返す (MetaCognitiveAgent に注入)。
+    """create の editor/chat 出力向け code_generator を返す (MetaCognitiveAgent に注入)。
 
     指示文を LongFormOrchestrator の細粒度 CodeUnit 計画で生成し、ファイル別の
     検証・修正済みコードを EditorArtifact 群 (複数ファイル可) として返す。テキスト
@@ -692,7 +696,7 @@ def make_code_artifact_generator(
     gen_cfg = _clamp_long_form_timeout(cfg)
 
     async def _generate(instruction: str, on_step=None) -> list[EditorArtifact]:  # noqa: ARG001
-        if detect_content_type(instruction, "coding") != ContentType.CODE:
+        if detect_content_type(instruction, "create") != ContentType.CODE:
             return []
         orchestrator = _build_long_form_orchestrator(
             client, state, gen_cfg, gen_params,
@@ -704,7 +708,7 @@ def make_code_artifact_generator(
             # (進捗は agent 側の task_progress が表示する)。
             async for _token in orchestrator.generate(
                 instruction=instruction, session_id=session_id,
-                mode="coding", on_step=None,
+                mode="create", on_step=None,
             ):
                 pass
         except Exception as e:
@@ -748,7 +752,7 @@ async def _dispatch_long_form(
 ) -> StreamingResponse | ChatResponse:
     """Meta-Cognitive (long_form) 経路: 長文生成オーケストレータを起動する。
 
-    ``output_target`` は coding モード時の出力先 (``"file"`` / ``"editor"`` /
+    ``output_target`` は create モード時の出力先 (``"file"`` / ``"editor"`` /
     ``"chat"``) を ``stream_long_form`` / ``sync_long_form`` に伝播する。
     既定 ``"file"`` (チャット応答パス互換)。
     """
@@ -789,15 +793,15 @@ async def _dispatch_long_form(
 
 
 def make_staged_codegen_delegate(client, cfg: dict, *, max_tokens: int | None = None):
-    """base コーディングモデル経由の codegen 委譲を作る
+    """base クリエイトモデル経由の codegen 委譲を作る
     ((instruction, file_path) -> {path: code})。
 
-    ``StagedCodingExecutor`` に注入する。以前は ``make_code_artifact_generator`` と
+    ``StagedCreateExecutor`` に注入する。以前は ``make_code_artifact_generator`` と
     同じ LongFormOrchestrator 経路 (plan/CodeSpec 再合成 + CodeUnit 細粒度分割生成)
     を経由していたが、これは instruction (spec.md 全文 + flowchart + 契約ブロック)
     の大半をアシストの再合成・トークン予算切り詰めで失い、生成コードが仕様と乖離
     する原因になっていた (副作用として ``detect_content_type`` の TEXT 誤判定対策
-    も必要だった)。staged は ``synthesize_coding_task_graph`` が既にプログラムを
+    も必要だった)。staged は ``synthesize_create_task_graph`` が既にプログラムを
     ファイル単位へ決定的に分解済みのため、1 code タスク = 1 ファイルの単発生成で
     足りる。``direct_codegen.generate_single_file`` で base モデルへの単発呼び出し
     のみに委譲し、instruction を無劣化のまま渡す (再計画・content_type 判定は
@@ -806,7 +810,7 @@ def make_staged_codegen_delegate(client, cfg: dict, *, max_tokens: int | None = 
     ``max_tokens`` 指定時は config (``code_max_tokens``) より優先する
     (部分ごと生成向けの ``part_max_tokens`` 予算で別 delegate を作る用途)。
     """
-    staged_cfg = (cfg.get("coding", {}) or {}).get("staged", {}) or {}
+    staged_cfg = (cfg.get("create", {}) or {}).get("staged", {}) or {}
     resolved_max_tokens = (
         int(max_tokens) if max_tokens is not None
         else int(staged_cfg.get("code_max_tokens", 4096))
@@ -820,31 +824,33 @@ def make_staged_codegen_delegate(client, cfg: dict, *, max_tokens: int | None = 
     return _generate
 
 
-def _staged_coding_enabled(req: ChatRequest, cfg: dict, state: AppState) -> bool:
-    """staged コーディングパイプラインを起動すべきか判定する。
+def _staged_create_enabled(req: ChatRequest, cfg: dict, state: AppState) -> bool:
+    """staged クリエイトパイプラインを起動すべきか判定する。
 
     全条件を満たすときのみ True。いずれか欠ければ従来 longform 経路へ倒す。
     """
-    if not is_coding_mode(req.mode):
+    if not is_create_mode(req.mode):
         return False
-    coding_cfg = cfg.get("coding", {}) or {}
-    if coding_cfg.get("pipeline") != "staged":
+    create_cfg = cfg.get("create", {}) or {}
+    if create_cfg.get("pipeline") != "staged":
         return False
-    if not coding_cfg.get("staged_enabled", True):
+    if not create_cfg.get("staged_enabled", True):
         return False
-    if getattr(state, "assist_client", None) is None:
+    # create モードでは residency が常駐を保証する (/api/mode/switch が acquire)。
+    # 起動失敗・未配線なら従来 longform へ倒す。
+    if not assist_ready(getattr(state, "assist_client", None), "create_task_graph"):
         return False
     if not is_pro():
         return False
     try:
-        if detect_content_type(req.message, "coding") != ContentType.CODE:
+        if detect_content_type(req.message, "create") != ContentType.CODE:
             return False
     except Exception:
         return False
     return True
 
 
-async def _dispatch_staged_coding(
+async def _dispatch_staged_create(
     req: ChatRequest,
     client,
     state: AppState,
@@ -860,7 +866,7 @@ async def _dispatch_staged_coding(
     prefetched_rag: list[tuple[str, float, str]] | None = None,
     file_context_block: str | None = None,
 ) -> StreamingResponse | ChatResponse:
-    """staged コーディング: 専用 LoopDriver をインライン駆動し spec→code→test を実行。
+    """staged クリエイト: 専用 LoopDriver をインライン駆動し spec→code→test を実行。
 
     非ストリーミング要求 / base 不健全時は従来 longform 経路へフォールバックする。
     タスクグラフ合成が空 (assist degraded 等) のときも stream 内で longform へ委譲。
@@ -886,7 +892,7 @@ async def _dispatch_staged_coding(
             )
 
     codegen = make_staged_codegen_delegate(client, cfg)
-    staged_cfg = (cfg.get("coding", {}) or {}).get("staged", {}) or {}
+    staged_cfg = (cfg.get("create", {}) or {}).get("staged", {}) or {}
     part_codegen = (
         make_staged_codegen_delegate(
             client, cfg, max_tokens=int(staged_cfg.get("part_max_tokens", 1536)),
@@ -905,7 +911,7 @@ async def _dispatch_staged_coding(
         )
 
     return StreamingResponse(
-        _with_chat_in_flight(client, search_error_wrapper(stream_staged_coding(
+        _with_chat_in_flight(client, search_error_wrapper(stream_staged_create(
             query=req.message, session_id=session_id, state=state, cfg=cfg,
             instance_name=instance_name, context_size=context_size,
             messages=messages, output_target=output_target,
@@ -943,11 +949,11 @@ async def _dispatch_meta_cognitive(
     """Meta-Cognitive (通常) 経路: 計画 + ツールループ。"""
     # @self 仮想カートリッジ用 LoopFactView 配線
     loop_view = _resolve_loop_view_for_agent(state)
-    # coding モード: editor/chat 出力のコード生成を LongForm 細粒度生成へ委譲する
-    # generator を注入する (複数ファイル可)。非 coding / 無効時は None。
+    # create モード: editor/chat 出力のコード生成を LongForm 細粒度生成へ委譲する
+    # generator を注入する (複数ファイル可)。非 create / 無効時は None。
     code_generator = None
     if (
-        is_coding_mode(req.mode)
+        is_create_mode(req.mode)
         and cfg.get("agent", {}).get("delegate_codegen_to_longform", True)
     ):
         code_generator = make_code_artifact_generator(
@@ -976,7 +982,7 @@ async def _dispatch_meta_cognitive(
         # Level 1 進化 few-shot を維持 (固定 scaffold の [参考例] に注入)
         fewshot_block=fewshot_block,
         code_generator=code_generator,
-        # 内部 loop/token 予算を coding_model の実窓に合わせる
+        # 内部 loop/token 予算を create_model の実窓に合わせる
         mode=req.mode,
     )
     keepalive_sec = cfg.get("streaming", {}).get(
@@ -1043,7 +1049,7 @@ async def _dispatch_deliberative(
         assist_client=state.assist_client,
         assist_experience_recorder=state.assist_experience_recorder,
         agent_tracer=state.agent_tracer,
-        # コンテンツ生成 max_tokens を coding_model の実窓に合わせる
+        # コンテンツ生成 max_tokens を create_model の実窓に合わせる
         mode=req.mode,
     )
 
@@ -1061,6 +1067,9 @@ async def _dispatch_deliberative(
                 rag_top1_score=rag_top1_score,
                 tool_judge_task=tool_judge_task,
                 escalated_from=escalated_from,
+                # 窓の先頭が会話の先頭かを deliberative 側で判定するために渡す
+                # (``_append_session_position_fact`` 参照)。
+                evicted_turns=session_evicted_turns(state),
             ))),
             media_type="text/event-stream",
         )
@@ -1077,6 +1086,7 @@ async def _dispatch_deliberative(
             rag_top1_score=rag_top1_score,
             tool_judge_task=tool_judge_task,
             escalated_from=escalated_from,
+            evicted_turns=session_evicted_turns(state),
         )
 
 
@@ -1121,7 +1131,13 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         learned_patterns=getattr(state, "learned_patterns_store", None),
         policy=state.policy_interpreter,
     )
-    agent_layer = classifier.classify(req.message, mode=req.mode)
+    # 直近会話を渡す。被演算子が前ターンにしか無い計算 (「その差を月あたりに
+    # 直すと何分？」) は数値ゼロのクエリになり、context 無しでは short_query →
+    # reactive に落ちてツール判定へ一度も到達しない (2026-08-10 ライブ監査)。
+    agent_layer = classifier.classify(
+        req.message, mode=req.mode,
+        context=_recent_dialogue_text(history),
+    )
     logger.info(
         "Agent layer: %s (mode=%s) for query: %s",
         agent_layer, req.mode, req.message[:80],
@@ -1279,12 +1295,12 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             _log_layer_escalation(state, chosen="deliberative", reason=gate_reason)
             logger.info("Reactive escalated to deliberative (%s)", gate_reason)
 
-        # coding モードのみ生成コードの出力先を決定する。
+        # create モードのみ生成コードの出力先を決定する。
         # - 出力先パス明示 → "file" (従来どおり write_file でディスクへ)
         # - 否定指示 ("エディタに出さず…") → "chat" (チャット本文にコードブロック)
         # - 既定 → "editor" (ディスク書込せず editor_code チャネルでエディタペインへ)
         # editor_route SSE フレームはフロント表示制御 (suppressCode) 用に併せて通知する。
-        if is_coding_mode(req.mode):
+        if is_create_mode(req.mode):
             if _extract_file_path(req.message):
                 output_target = "file"
             elif detect_editor_route(req.message) == "chat":
@@ -1319,11 +1335,11 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             case "meta_cognitive" if classifier.is_long_form:
                 # long_form は precomputed tool 判定を使わない (judge_task は通常 None)。
                 _cancel_pending_task(judge_task)
-                # coding mode + pipeline=staged + Pro + assist 健全 のときは
+                # create mode + pipeline=staged + Pro + assist 健全 のときは
                 # 仕様書→コード→テストの staged パイプライン (専用 LoopDriver) へ。
                 # それ以外は従来 longform 経路 (無改変フォールバック)。
-                if _staged_coding_enabled(req, cfg, state):
-                    return await _dispatch_staged_coding(
+                if _staged_create_enabled(req, cfg, state):
+                    return await _dispatch_staged_create(
                         req, client, state, cfg, gen_params, session_id,
                         instance_name, context_size, messages,
                         search_error_wrapper, timer,
@@ -1344,13 +1360,13 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 # meta 経路は固定の PLAN/EXECUTE/CONTENT scaffold を使うため、
                 # few-shot は system へ結合せず instance block (fewshot_block) として
                 # 渡し、ツールループ / コンテンツ生成 / fallback の system に
-                # [参考例] として注入する (Level 1 進化を coding 生成へ反映)。
+                # [参考例] として注入する (Level 1 進化を create 生成へ反映)。
                 _cancel_pending_task(judge_task)
-                # coding mode + pipeline=staged + Pro + assist 健全 のときは、
-                # is_long_form でない coding 要求 (「テトリスを作成して」級) も
+                # create mode + pipeline=staged + Pro + assist 健全 のときは、
+                # is_long_form でない create 要求 (「テトリスを作成して」級) も
                 # staged パイプラインへ。is_long_form ブランチと同一ゲート。
-                if _staged_coding_enabled(req, cfg, state):
-                    return await _dispatch_staged_coding(
+                if _staged_create_enabled(req, cfg, state):
+                    return await _dispatch_staged_create(
                         req, client, state, cfg, gen_params, session_id,
                         instance_name, context_size, messages,
                         search_error_wrapper, timer,

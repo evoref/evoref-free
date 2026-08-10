@@ -98,7 +98,7 @@ _DISCONTINUED_CATEGORIES = frozenset({"correction", "rephrase"})
 # 抽出される (「main.py を実行して結果を説明して」→「実行」「説明」) が、
 # それ自体は知識質問にも頻出する LLM ネイティブな言語タスク語であり、ツール
 # 意図のシグナルにならない。実インシデント (2026-07-20 ライブ検証): 過去に
-# 学習された「説明」(w=0.630) が知識質問「〜を説明して」にマッチし、coding
+# 学習された「説明」(w=0.630) が知識質問「〜を説明して」にマッチし、create
 # モードで引数なし run_command 誘導を誘発し得た。add 時 (extract_tool_routing_
 # keywords) と load 時の両方で弾き、既学習の残存データも再起動時に自動浄化する。
 _TOOL_ROUTING_NONLEARNABLE_EXACT = frozenset({

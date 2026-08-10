@@ -1,10 +1,9 @@
 <script lang="ts">
 	import { t } from '$lib/i18n';
 	import { layout } from '$lib/free/stores/theme';
-	import { isStreaming } from '$lib/free/stores/chat';
 	import type { AgenticStep, StepResult, LongFormProgress } from '$lib/free/stores/chat';
 
-	let { steps = [], results = [], showSpinner = false, progress = undefined }: { steps?: AgenticStep[]; results?: StepResult[]; showSpinner?: boolean; progress?: LongFormProgress } = $props();
+	let { steps = [], results = [], showSpinner = false, progress = undefined, streaming = false }: { steps?: AgenticStep[]; results?: StepResult[]; showSpinner?: boolean; progress?: LongFormProgress; streaming?: boolean } = $props();
 	/** backend の search_history 空振り (builtin.SEARCH_HISTORY_NO_RESULTS_PREFIX) 検出用 */
 	const SEARCH_HISTORY_NO_MATCH_RE = /^search_history:\s*No results found for:/;
 
@@ -16,9 +15,9 @@
 		steps.reduce((sum, s) => sum + (s.elapsed_ms ?? 0), 0) / 1000
 	);
 
-	/** 全ステップが完了しているか */
+	/** 全ステップが完了しているか (lfInProgress と同じくメッセージ単位で判定する) */
 	let allDone = $derived(
-		!$isStreaming && steps.length > 0 && steps.every((s) => s.status === 'done')
+		!streaming && steps.length > 0 && steps.every((s) => s.status === 'done')
 	);
 
 	/** 長文生成のいずれかのユニットが失敗/打ち切りだったか (完了ラベルの出し分け用) */
@@ -40,11 +39,16 @@
 	 * `isStreaming` はチャット全体で共有される store なので、これだけで出し分けると
 	 * 別ターンの生成が始まった瞬間に、完了済みの過去メッセージまで「生成中 3/3」
 	 * 表示へ巻き戻る (実測 2026-07-27: 完了済みの 2 メッセージが後続ターンの生成中
-	 * だけ ⚙ 表示に戻り、完了後に ✓ へ戻った)。`progress.done` はメッセージ単位の
-	 * フラグなので、こちらを主判定にして store は「今まさに流れているか」の補助に
-	 * とどめる。
+	 * だけ ⚙ 表示に戻り、完了後に ✓ へ戻った)。
+	 *
+	 * 当初は `progress.done` をメッセージ単位のフラグとして併用したが、**タイム
+	 * アウトで打ち切られた実行は最後の `long_form_unit_done` が来ないので done が
+	 * 立たない**。実測 2026-08-07 ライブ監査: 1800 秒で打ち切られた 2 本目の
+	 * メッセージが、後続ターンの生成中ずっと「生成中 7/9: テスト」を出し続けた。
+	 * `streaming` は MessageList が「このメッセージが最後尾かつ生成中」で算出した
+	 * メッセージ単位の値なので、こちらを使えば done の有無に依存しない。
 	 */
-	let lfInProgress = $derived(progress != null && !progress.done && $isStreaming);
+	let lfInProgress = $derived(progress != null && !progress.done && streaming);
 
 	function formatElapsed(ms?: number): string {
 		if (ms == null) return '';

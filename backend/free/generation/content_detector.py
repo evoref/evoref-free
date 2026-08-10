@@ -1,6 +1,6 @@
 """コンテンツ種別判定
 
-設計書 f_09_long_form_generation.md §11 準拠。
+設計書 f_08_long_form_generation.md §11 準拠。
 パターンマッチによるコード/テキストの自動判定。
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 
 from backend.free.core.locale_patterns import select_locale_variant
-from backend.free.core.session_mode import is_coding_mode
+from backend.free.core.session_mode import is_create_mode
 from backend.free.document_nouns import (
     DOCUMENT_NOUNS_NEEDS_SUFFIX,
     DOCUMENT_NOUNS_NEEDS_SUFFIX_EN,
@@ -87,7 +87,7 @@ def detect_content_type(instruction: str, mode: str) -> ContentType:
 
     Args:
         instruction: ユーザー指示テキスト
-        mode: 動作モード ("coding" / "chat")
+        mode: 動作モード ("create" / "chat")
     """
     # 「コード/プログラムではなく」の明示否定は最優先で TEXT に確定
     negated_code_re = select_locale_variant(_NEGATED_CODE_RE, _NEGATED_CODE_RE_EN)
@@ -96,7 +96,7 @@ def detect_content_type(instruction: str, mode: str) -> ContentType:
 
     text_patterns = select_locale_variant(TEXT_PATTERNS, TEXT_PATTERNS_EN)
 
-    if is_coding_mode(mode):
+    if is_create_mode(mode):
         if any(re.search(p, instruction) for p in text_patterns):
             return ContentType.TEXT
         return ContentType.CODE

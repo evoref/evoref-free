@@ -1,10 +1,10 @@
 # Qwen3 / Qwen3.5 dense 系 (arch "qwen3"・非 MoE)。
 #
 # sampling は意図的に空にする: プロファイル sampling は modes.* を上書きするため、
-# ここで値を入れると chat (temp 0.7) と coding (temp 0.3) のモード別チューニングを
+# ここで値を入れると chat (temp 0.7) と create (temp 0.3) のモード別チューニングを
 # 一律に潰してしまう。Qwen3 はモード別の温度差が有効なので modes.* に委ねるのが最適。
 # (Qwen3 公式の非 thinking 推奨は temp 0.7 / top_p 0.8 / top_k 20 だが、単一 arch
-#  プロファイルでは chat/coding を区別できないため採用しない。)
+#  プロファイルでは chat/create を区別できないため採用しない。)
 #
 # dense なので MoE 無効。内蔵テンプレートを使うため --jinja を付与。
 launch_flags:
@@ -39,7 +39,7 @@ embedding:
   doc_template: ""
   instructions:
     chat: "Given a user question, retrieve relevant passages that answer the query"
-    coding: "Given a code search query, retrieve relevant code snippets"
+    create: "Given a code search query, retrieve relevant code snippets"
   # max_length は 1 入力シーケンスの推奨上限。context/batch/ubatch (サーバリソース) は
   # profile では設定せず config/schema 既定に委ねる (並列スロット分の KV が必要なため)。
   max_length: 8192

@@ -1,6 +1,6 @@
-"""コーディングモードのパイプライン設定スキーマ。
+"""クリエイトモードのパイプライン設定スキーマ。
 
-``coding:`` トップレベルセクション。``loop:`` (自律ループ周回の設定) とは別建てに
+``create:`` トップレベルセクション。``loop:`` (自律ループ周回の設定) とは別建てに
 し、staged パイプラインのチューニングが自律ループ設定に干渉しないようにする。
 
 - ``pipeline``: ``"staged"`` で仕様書→コード→テストの多段パイプライン、
@@ -14,8 +14,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class CodingStagedConfig(BaseModel):
-    """staged コーディングパイプラインの動作設定。"""
+class CreateStagedConfig(BaseModel):
+    """staged クリエイトパイプラインの動作設定。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -88,8 +88,8 @@ class CodingStagedConfig(BaseModel):
     )
     spec_timeout_sec: float = Field(
         default=600.0, gt=0.0, le=1800.0,
-        description="spec 工程の assist 生成タイムアウト (coding_spec_doc / "
-                    "coding_spec_deepen)。明示指定のため assist の反応的較正より"
+        description="spec 工程の assist 生成タイムアウト (create_spec_doc / "
+                    "create_spec_deepen)。明示指定のため assist の反応的較正より"
                     "優先される。iGPU 実測 (7-13 t/s) で 6144 tok 級の生成を賄う "
                     "(timeout は description への全損フォールバックで救済が無い)",
     )
@@ -99,7 +99,7 @@ class CodingStagedConfig(BaseModel):
     )
     total_timeout_sec: float = Field(
         default=2400.0, gt=0.0, le=7200.0,
-        description="staged コーディング 1 リクエスト全体のウォールクロック上限。"
+        description="staged クリエイト 1 リクエスト全体のウォールクロック上限。"
                     "spec 詳細化 (深化パス + フロー詳細化) の増分を見込む",
     )
     part_generation_enabled: bool = Field(
@@ -133,17 +133,17 @@ class CodingStagedConfig(BaseModel):
     )
 
 
-class CodingConfig(BaseModel):
-    """``coding:`` トップレベル設定。"""
+class CreateConfig(BaseModel):
+    """``create:`` トップレベル設定。"""
 
     model_config = ConfigDict(extra="forbid")
 
     pipeline: Literal["staged", "longform"] = Field(
         default="longform",
-        description="コーディングモードの生成方式。既定は従来の longform",
+        description="クリエイトモードの生成方式。既定は従来の longform",
     )
     staged_enabled: bool = Field(
         default=True,
         description="staged パイプラインのキルスイッチ (pipeline と独立)",
     )
-    staged: CodingStagedConfig = Field(default_factory=CodingStagedConfig)
+    staged: CreateStagedConfig = Field(default_factory=CreateStagedConfig)

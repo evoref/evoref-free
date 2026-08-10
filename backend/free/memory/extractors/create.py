@@ -1,21 +1,21 @@
 """
 
-コーディングモード由来の ``MemoryNote`` から SemanticFact 候補を抽出する。
+クリエイトモード由来の ``MemoryNote`` から SemanticFact 候補を抽出する。
 
-抽出される type は統合仕様 (``coding_task`` 含む) に従い:
+抽出される type は統合仕様 (``create_task`` 含む) に従い:
 
 - ``project`` — プロジェクトルール (subject = ``mem.project.<project_id>``)
 - ``decision`` — 採用/不採用の判断 (subject = ``mem.decision.<project_id>``)
 - ``commitment`` — 締切・予定 (subject = ``mem.commitment.user``)
-- ``coding_task`` — タスク依頼 (subject = ``mem.coding_task.<project_id>``)
+- ``create_task`` — タスク依頼 (subject = ``mem.create_task.<project_id>``)
   Loop driver の ``task`` FactType と構造差があるため別 FactType に分離
-- ``coding`` — コード関連知識 (subject = ``mem.coding.<keyword>``)
+- ``create`` — コード関連知識 (subject = ``mem.create.<keyword>``)
 
 スコープは可能な限り ``project:<project_id>``
 ``ctx.project_id`` が ``None`` の場合は extractor が no-op となる
 (``project`` タグが ``project`` スコープ必須のため)。
 
-ロジックは ``CodingNoteBuilder.candidate_fact_tags`` のトリガ判定をそのまま再利用
+ロジックは ``CreateNoteBuilder.candidate_fact_tags`` のトリガ判定をそのまま再利用
 してモード一貫性を保つ。LLM 呼び出しは行わない。
 
 subject の pillar namespace (``mem.*``) を全面適用した
@@ -32,26 +32,26 @@ from backend.free.memory.extractors.base import (
     ExtractionContext,
     ExtractionResult,
 )
-from backend.free.memory.notes.note_builder import CodingNoteBuilder
+from backend.free.memory.notes.note_builder import CreateNoteBuilder
 from backend.free.memory.stores.short_term import MemoryNote
 from backend.free.memory.notes.subject_ns import make_mem_subject
 from backend.free.memory.types import FactType, SemanticFact
 from backend.log_config import get_logger
 
-logger = get_logger("memory.extractors.coding")
+logger = get_logger("memory.extractors.create")
 
 
-#: ``CodingNoteBuilder.candidate_fact_tags`` が返すタグ → 実際に書き込む FactType。
+#: ``CreateNoteBuilder.candidate_fact_tags`` が返すタグ → 実際に書き込む FactType。
 #:
-#: ``task`` タグは ``coding_task`` FactType に変換する
-#: (CodingExtractor の task は Loop driver の ``task`` と構造差が
+#: ``task`` タグは ``create_task`` FactType に変換する
+#: (CreateExtractor の task は Loop driver の ``task`` と構造差が
 #: あるため別 FactType に分離)。
 _FACT_TYPE_BY_TAG: dict[str, FactType] = {
     "project": "project",
     "decision": "decision",
     "commitment": "commitment",
-    "task": "coding_task",  # D4: task → coding_task に変換
-    "coding": "coding",
+    "task": "create_task",  # D4: task → create_task に変換
+    "create": "create",
 }
 
 _PREDICATE_BY_TAG: dict[str, str] = {
@@ -59,7 +59,7 @@ _PREDICATE_BY_TAG: dict[str, str] = {
     "decision": "decided",
     "commitment": "promised",
     "task": "requested",
-    "coding": "notes",
+    "create": "notes",
 }
 
 
@@ -84,24 +84,24 @@ def _sanitize_keyword(raw: str) -> str:
     return out or _SAFE_KEYWORD_FALLBACK
 
 
-def _coding_keyword(note: MemoryNote) -> str:
-    """``coding`` subject 用の kind キーワードをノートから導く (サニタイズ済)。"""
+def _create_keyword(note: MemoryNote) -> str:
+    """``create`` subject 用の kind キーワードをノートから導く (サニタイズ済)。"""
     if note.keywords:
         return _sanitize_keyword(note.keywords[0])
     text = " ".join((note.content or "").split())
-    return _sanitize_keyword(text[:24]) if text else "coding"
+    return _sanitize_keyword(text[:24]) if text else "create"
 
 
 def _task_signature(note: MemoryNote) -> str:
-    """``coding_task`` subject 用のタスク識別子 (内容ハッシュ、12 hex)。
+    """``create_task`` subject 用のタスク識別子 (内容ハッシュ、12 hex)。
 
-    従来 ``coding_task`` の subject は project_id だけだったため、1 プロジェクト
+    従来 ``create_task`` の subject は project_id だけだったため、1 プロジェクト
     内の全タスクが 1 subject に集まり、競合検出 (``(subject, predicate)`` キー)
     が別々のタスク依頼を「同一タスクの競合版」と誤判定して恒久 pending 化して
     いた (2026-07-25 実測: 9 タスクが 1 subject、project scope の pending 16 件)。
 
     ``subject_ns.make_mem_subject`` の docstring が示す
-    ``mem.coding_task.<project>.<id>`` 形式に合わせる。同一依頼の再アサートでは
+    ``mem.create_task.<project>.<id>`` 形式に合わせる。同一依頼の再アサートでは
     同じ signature になり、正しく更新/競合判定される。
     """
     text = " ".join((note.content or "").split()).lower()
@@ -109,7 +109,7 @@ def _task_signature(note: MemoryNote) -> str:
 
 
 def _build_subject(tag: str, *, project_id: str, note: MemoryNote) -> str:
-    """Coding extractor の subject を mem.* namespace で構築する"""
+    """Create extractor の subject を mem.* namespace で構築する"""
     if tag == "commitment":
         return make_mem_subject("commitment", "user")
     if tag == "project":
@@ -118,31 +118,31 @@ def _build_subject(tag: str, *, project_id: str, note: MemoryNote) -> str:
         return make_mem_subject("decision", _sanitize_keyword(project_id))
     if tag == "task":
         return make_mem_subject(
-            "coding_task", _sanitize_keyword(project_id), _task_signature(note),
+            "create_task", _sanitize_keyword(project_id), _task_signature(note),
         )
-    if tag == "coding":
-        return make_mem_subject("coding", _coding_keyword(note))
+    if tag == "create":
+        return make_mem_subject("create", _create_keyword(note))
     # フォールバック (理論上到達しない)
-    return make_mem_subject("coding", _SAFE_KEYWORD_FALLBACK)
+    return make_mem_subject("create", _SAFE_KEYWORD_FALLBACK)
 
 
-class CodingExtractor(BaseExtractor):
-    """コーディングモード用 SemanticFact 抽出器。"""
+class CreateExtractor(BaseExtractor):
+    """クリエイトモード用 SemanticFact 抽出器。"""
 
-    mode = "coding"
+    mode = "create"
 
-    #: ``CodingNoteBuilder.candidate_fact_tags`` が返しうるタグ集合。
+    #: ``CreateNoteBuilder.candidate_fact_tags`` が返しうるタグ集合。
     #: 実際に書き込む FactType は :data:`_FACT_TYPE_BY_TAG` を経由する
     SUPPORTED_TAGS: tuple[str, ...] = (
         "project",
         "decision",
         "commitment",
         "task",
-        "coding",
+        "create",
     )
 
-    def __init__(self, builder: CodingNoteBuilder | None = None) -> None:
-        self._builder = builder or CodingNoteBuilder()
+    def __init__(self, builder: CreateNoteBuilder | None = None) -> None:
+        self._builder = builder or CreateNoteBuilder()
 
     def extract(
         self,
@@ -152,7 +152,7 @@ class CodingExtractor(BaseExtractor):
         result = ExtractionResult()
         if not ctx.project_id:
             logger.debug(
-                "CodingExtractor: no project_id in context, skipping (project scope required)"
+                "CreateExtractor: no project_id in context, skipping (project scope required)"
             )
             return result
 
@@ -178,8 +178,8 @@ class CodingExtractor(BaseExtractor):
                 )
                 overrides: dict = {}
                 if tag == "task":
-                    # coding_task ファクトの初期 confidence
-                    # (task → coding_task FactType に分離済)
+                    # create_task ファクトの初期 confidence
+                    # (task → create_task FactType に分離済)
                     overrides["confidence"] = 0.6
                 fact = self.make_fact(
                     subject=subject,
@@ -200,7 +200,7 @@ class CodingExtractor(BaseExtractor):
             if fact.id not in note.extracted_fact_ids:
                 note.extracted_fact_ids.append(fact.id)
         logger.debug(
-            "CodingExtractor: processed=%d skipped=%d already=%d facts=%d dropped=%d project=%s",
+            "CreateExtractor: processed=%d skipped=%d already=%d facts=%d dropped=%d project=%s",
             result.notes_processed,
             result.notes_skipped,
             result.already_extracted,

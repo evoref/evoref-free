@@ -95,7 +95,7 @@
 			content: turn.content,
 			timestamp: turn.timestamp ? new Date(turn.timestamp).getTime() : Date.now(),
 		}));
-		// Free では coding セッションを chat に丸める (Sidebar の露出方針に合わせる)。
+		// Free では create セッションを chat に丸める (Sidebar の露出方針に合わせる)。
 		// switchMode は await 後にモード別バッファで messages/sessionId を上書き
 		// するため、復元値が勝つよう先に await してから set する。
 		await switchMode(isPro ? detail.mode : 'chat');
@@ -161,7 +161,7 @@
 				<option value="">{$t('history_page.mode_all')}</option>
 				<option value="chat">{$t('sidebar.mode_chat')}</option>
 				{#if isPro}
-					<option value="coding">{$t('sidebar.mode_coding')}</option>
+					<option value="create">{$t('sidebar.mode_create')}</option>
 				{/if}
 			</select>
 		</div>

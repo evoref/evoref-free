@@ -8,7 +8,7 @@
 ``promoted_to_semmem=False`` のエントリ。要約テキストを簡易ルールベースで
 ``decision`` / ``commitment`` の 2 型に分類し、
 :class:`~backend.free.memory.semantic.store.SemanticFactStore` に書き込む。
-スコープは coding モードかつ project_id 既知であれば ``project:<id>``、
+スコープは create モードかつ project_id 既知であれば ``project:<id>``、
 それ以外は ``global``。Subject namespace は 定義された
 ``mem.<type>.history.session.<id12>`` を用いる。
 
@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from backend.free.core.session_mode import (
-    is_coding_mode,
+    is_create_mode,
     is_valid_session_mode,
     normalize_session_mode,
 )
@@ -191,16 +191,16 @@ def _resolve_scope(
 ) -> tuple[str, str | None]:
     """セッション情報から ``(scope, project_id)`` を解決する。
 
-    - ``is_coding_mode(mode)`` かつ project_id 既知 → ``project:<id>``
+    - ``is_create_mode(mode)`` かつ project_id 既知 → ``project:<id>``
     - それ以外 → ``global``
 
     Returns:
         ``(scope_str, project_id)`` ペア。project 未確定時は ``project_id=None``。
     """
     project_id = entry_project_id or (
-        fallback_project_id if is_coding_mode(entry_mode) else None
+        fallback_project_id if is_create_mode(entry_mode) else None
     )
-    if is_coding_mode(entry_mode) and project_id:
+    if is_create_mode(entry_mode) and project_id:
         return SemanticFact.make_project_scope(project_id), project_id
     return "global", project_id
 

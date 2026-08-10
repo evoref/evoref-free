@@ -2,7 +2,7 @@
 
 EvorefMem 統合仕様 におけるモード別の意味記憶 / 短期記憶注入器
 ``SemanticFact`` と ``MemoryNote`` の集合を入力として、モード別の Tier 配分
-(チャット 800 トークン / コーディング 2000 トークン) に従って LLM プロンプト
+(チャット 800 トークン / クリエイト 2000 トークン) に従って LLM プロンプト
 へ注入する候補列を生成する。
 
 設計仕様:
@@ -13,19 +13,19 @@ EvorefMem 統合仕様 におけるモード別の意味記憶 / 短期記憶注
    モード        予算 (tokens)  Tier 比率 (T1, T2, T3, T4)
    ============  =============  =================================
    chat            800          (0.40, 0.35, 0.15, 0.10)
-   coding         2000          (0.40, 0.35, 0.15, 0.10)
+   create         2000          (0.40, 0.35, 0.15, 0.10)
    ============  =============  =================================
 
 2. **Tier 1 ボーナス**: ``pinned=True`` の項目はスコアに ``+1.0`` を付与し、
    かつ Tier 1 へ強制配置する (タグ種別を問わない)。
 
-3. **Coding Tier 1 拡張**:
+3. **Create Tier 1 拡張**:
 
    - ``policy`` ファクトは ``confidence >= 0.7`` (active) のみ採用。
    - ``failure_pattern`` ファクトは ``failure_signature`` が呼び出し側
      から提供された signature 集合と一致したものだけ Tier 1 注入。
 
-4. **Coding Tier 2 拡張**: ``current_project_id`` と一致する ``task``
+4. **Create Tier 2 拡張**: ``current_project_id`` と一致する ``task``
    ファクト (current task) を Tier 2 に注入する。
 
 5. **予算オーバー時の挙動**: 各 Tier はその予算を厳密上限とする
@@ -49,7 +49,7 @@ from typing import Iterable, Literal
 from backend.free.core.text_quality import carries_no_assertion
 from backend.free.core.session_mode import (
     is_chat_mode,
-    is_coding_mode,
+    is_create_mode,
     is_valid_session_mode,
 )
 from backend.free.memory.stores.short_term import MemoryNote
@@ -64,7 +64,7 @@ logger = get_logger("memory.injector")
 # ──────────────────────────────────────────────────────────────────────────
 
 DEFAULT_CHAT_BUDGET_TOKENS = 800
-DEFAULT_CODING_BUDGET_TOKENS = 2000
+DEFAULT_CREATE_BUDGET_TOKENS = 2000
 DEFAULT_TIER_RATIOS: tuple[float, float, float, float] = (0.40, 0.35, 0.15, 0.10)
 
 #: pin ボーナス値
@@ -75,6 +75,10 @@ DEFAULT_POLICY_ACTIVATION_MIN_CONFIDENCE = 0.7
 
 #: スコア計算で用いる recency 半減期 (日)
 _RECENCY_HALF_LIFE_DAYS = 14.0
+
+#: この日数以上前に記録されたファクトは、行に「N日前の記録」と書き添える。
+#: 当日のもの (= 今の会話で書かれた可能性がある) には付けない。
+_FACT_STALE_LABEL_DAYS = 1.0
 
 #: 関連度ゲートの既定閾値 (クエリ埋め込みとのコサイン類似度)。
 #:
@@ -90,6 +94,38 @@ _RECENCY_HALF_LIFE_DAYS = 14.0
 #:   ノイズ  中央値 0.12〜0.17
 #: 0.40 では GPU ノート (0.3787) を落とすため 0.35 を採用する。
 DEFAULT_RELEVANCE_MIN_SCORE = 0.35
+
+#: pinned ファクトに課す関連度の **下限**。
+#:
+#: pin は「優先度」の指定であって「常に関連する」の宣言ではない。しかも pin 検出は
+#: 「覚えておいてください」等の語で発火するため、``mem.personal.name`` /
+#: ``birthday`` のようなファクトが**自動的に** pin され、以後すべてのターンで
+#: 無条件に載り続けていた (ゲート完全迂回)。
+#:
+#: 実測 (2026-08-09、実ファクトストア 45 件 / LFM2.5-Embedding-350M):
+#: 「1 キロメートルは何メートルですか。」に対し pin 済み 5 件が類似度
+#: -0.006 / 0.020 / 0.040 / -0.013 / -0.013 で注入されていた
+#: (``relevance_min_score`` を 0.80 まで上げても素通り)。
+#:
+#: 下限別の比較 — 記憶不要ターン / 想起ターンの注入量と想起の正否:
+#:   0.00 (旧)  297 tok (約 2.2 秒) / 297 tok / 全 OK
+#:   0.10 (既定)  81 tok (約 0.6 秒) / 297 tok / 全 OK   ← 想起を一切損なわない
+#:   0.25         70 tok            / 192 tok / 全 OK
+#:   0.35         70 tok            / 179 tok / 1 件 NG
+#:
+#: 0.10 は想起ターンの注入量・正答をそのままに、記憶不要ターンだけ 73% 削る。
+#: 破綻するのは 0.35 なので 3.5 倍の余裕がある。
+DEFAULT_PINNED_RELEVANCE_MIN_SCORE = 0.10
+
+
+#: セッション要約ファクトの subject 接頭辞。会話のメタ記録であって、ユーザーに
+#: ついての事実ではないため [関連する記憶] へ注入しない (``inject`` 内の判定参照)。
+_SESSION_SUMMARY_SUBJECT_PREFIX = "mem.decision.history.session"
+
+
+def _normalize_for_dup(text: str) -> str:
+    """重複判定用の正規化 (空白除去のみ)。曖昧一致はしない。"""
+    return "".join((text or "").split())
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -148,10 +184,10 @@ class MemoryInjector:
         memory:
           injection:
             chat_budget_tokens: 800
-            coding_budget_tokens: 2000
+            create_budget_tokens: 2000
             tier_ratios:
               chat: [0.40, 0.35, 0.15, 0.10]
-              coding: [0.40, 0.35, 0.15, 0.10]
+              create: [0.40, 0.35, 0.15, 0.10]
         learning:
           policy:
             activation_min_confidence: 0.7
@@ -176,15 +212,15 @@ class MemoryInjector:
         self.chat_budget: int = int(
             cfg.get("chat_budget_tokens", DEFAULT_CHAT_BUDGET_TOKENS),
         )
-        self.coding_budget: int = int(
-            cfg.get("coding_budget_tokens", DEFAULT_CODING_BUDGET_TOKENS),
+        self.create_budget: int = int(
+            cfg.get("create_budget_tokens", DEFAULT_CREATE_BUDGET_TOKENS),
         )
         ratios = cfg.get("tier_ratios") or {}
         self.chat_ratios = self._normalize_ratios(
             ratios.get("chat"), DEFAULT_TIER_RATIOS,
         )
-        self.coding_ratios = self._normalize_ratios(
-            ratios.get("coding"), DEFAULT_TIER_RATIOS,
+        self.create_ratios = self._normalize_ratios(
+            ratios.get("create"), DEFAULT_TIER_RATIOS,
         )
         self.policy_min_confidence: float = float(
             learning_policy_cfg.get(
@@ -197,6 +233,12 @@ class MemoryInjector:
         )
         self.relevance_min_score: float = float(
             cfg.get("relevance_min_score", DEFAULT_RELEVANCE_MIN_SCORE),
+        )
+        self.pinned_relevance_min_score: float = float(
+            cfg.get(
+                "pinned_relevance_min_score",
+                DEFAULT_PINNED_RELEVANCE_MIN_SCORE,
+            ),
         )
         self._now_provider = now_provider or time.time
 
@@ -215,10 +257,10 @@ class MemoryInjector:
         """注入計画を構築する。
 
         Args:
-            mode: ``"chat"`` または ``"coding"``。
+            mode: ``"chat"`` または ``"create"``。
             facts: 候補 ``SemanticFact`` の集合 (global / project 混在可)。
             stm_notes: 候補 ``MemoryNote`` の集合 (Tier 2 配置)。
-            current_project_id: コーディングモードで「現在プロジェクト」と
+            current_project_id: クリエイトモードで「現在プロジェクト」と
                 見なすプロジェクト ID。``None`` の場合 project ファクトは
                 すべて他プロジェクト扱いになる。
             failure_signatures: Tier 1 注入を許可する failure_pattern の
@@ -235,8 +277,8 @@ class MemoryInjector:
             raise ValueError(f"unsupported mode: {mode}")
 
         sigs: set[str] = set(failure_signatures or ())
-        budget = self.chat_budget if is_chat_mode(mode) else self.coding_budget
-        ratios = self.chat_ratios if is_chat_mode(mode) else self.coding_ratios
+        budget = self.chat_budget if is_chat_mode(mode) else self.create_budget
+        ratios = self.chat_ratios if is_chat_mode(mode) else self.create_ratios
         tier_budgets = self._tier_budgets(budget, ratios)
         query_vec = self._prepare_query_vec(query_embedding)
         filtered_out = 0
@@ -244,8 +286,49 @@ class MemoryInjector:
         # Tier ごとに分類
         buckets: dict[int, list[InjectedItem]] = {1: [], 2: [], 3: [], 4: []}
 
+        facts, collapsed, stale_texts = self._collapse_to_current_values(facts)
+        filtered_out += collapsed
+
         for fact in facts:
             if fact.superseded_by:
+                continue
+            # 問いだけのファクトは主張を含まないのに「(personal_fact)
+            # mem.personal.birthday states: ...」と **断定形** で注入され、
+            # モデルがそれを既知の事実として扱う。抽出側のゲート
+            # (extractors/chat.py の _tag_evidence_is_question_only) は
+            # 2026-08-06 に入ったが、それ以前に保存された行は残り続けるため、
+            # 読込時にも同じ判定を掛ける。
+            #
+            # ノート側 (下の carries_no_assertion) と違い pin を例外にしない。
+            # pin は**優先度**の指定であって主張の有無とは無関係で、問いだけの
+            # 行を優先注入しても「既知の事実」の誤認を強めるだけだから。しかも
+            # ピン検出は「覚えておいてください」等の語で発火するので、
+            # **問い自体がその語を含むと自動で pin される** (実インシデント
+            # 2026-08-07 ライブ監査: 「私の猫の名前と誕生日を覚えていますか。」
+            # が pinned な personal_fact として全ターンの [関連する記憶] に
+            # 載り続けていた — pin 例外を付けるとこの実例が素通りする)。
+            if carries_no_assertion(fact.object or ""):
+                filtered_out += 1
+                continue
+            # セッション要約は「会話で何が起きたか」のメタ記録であって、
+            # ユーザーについての事実ではない。[関連する記憶] に並べると
+            # **アシスタント自身の過去の回答が事実として提示される**。
+            #
+            # 実インシデント (2026-08-09): 「私の趣味は？」に対し
+            #   (decision) ...: ユーザーが自分の趣味を尋ねたところ、
+            #                   アシスタントは「自転車と写真」であると回答しました。
+            # が 3 件並んでいた。趣味は既に「登山と写真」へ更新済みだったが、
+            # 要約は古い誤答をそのまま事実として記録しており、**注入内で
+            # 自転車 5 回 vs 登山 2 回**と数で上回っていた。しかも誤答するたびに
+            # 新しい要約が生まれ、次のターンでさらに数が増える自己増幅になる
+            # (実測: テスト実行のたびに 1 件ずつ増加。ある要約は誤答を
+            #  「正しく提供しました」と記録していた)。
+            #
+            # 実ストアでは live 50 件中 33 件 (66%) がこの種別で、注入予算も
+            # 大きく食っていた (想起クエリで 582 → 219 文字)。
+            # 「前回何を話したか」は search_history ツールの担当。
+            if fact.subject.startswith(_SESSION_SUMMARY_SUBJECT_PREFIX):
+                filtered_out += 1
                 continue
             if not self._is_relevant(
                 query_vec, getattr(fact, "embedding", None),
@@ -274,6 +357,14 @@ class MemoryInjector:
 
         for note in stm_notes:
             pinned = bool(getattr(note, "pin_flag", False))
+            # ファクト側で却下した世代が、同じ本文のままノート経由で戻るのを塞ぐ
+            # (``_is_stale_duplicate`` 参照)。pin も例外にしない — 判断済みの
+            # 内容の再提示に優先度を与える理由が無い。
+            if self._is_stale_duplicate(
+                getattr(note, "content", "") or "", stale_texts,
+            ):
+                filtered_out += 1
+                continue
             # 問いだけのノートは答えを含まないのに (過去の記録) として注入され、
             # モデルがそれを回答として復唱する (実インシデント 2026-08-04
             # ライブ監査:「今日は何曜日ですか。」が過去の記録として想起され、
@@ -358,10 +449,35 @@ class MemoryInjector:
         """関連度ゲートを通すか判定する。
 
         - ゲート無効 (``query_vec is None``) → 常に通す (従来挙動)
-        - ``pinned`` → ユーザーの明示指定なので常に通す
+        - ``pinned`` → 通常のゲートは免除するが、``pinned_relevance_min_score``
+          の**下限だけは課す** (下記)
         - 埋め込みを持たない候補 → ``require_embedding`` なら落とす、
           さもなくば判定不能として通す
         - それ以外 → コサイン類似度 >= ``relevance_min_score`` のみ通す
+
+        pin に下限を課す理由 (実測 2026-08-09): pin は「優先度」の指定であって
+        「常に関連する」の宣言ではない。しかも pin 検出は「覚えておいてください」
+        等の語で発火するため、``mem.personal.name`` / ``birthday`` のような
+        ファクトが**自動的に** pin され、以後すべてのターンで無条件に載り続ける。
+
+        実測: 「1 キロメートルは何メートルですか。」に対し pin 済み 5 件が
+        類似度 -0.006 / 0.020 / 0.040 / -0.013 / -0.013 で注入されていた
+        (``relevance_min_score`` を 0.80 まで上げても素通り)。記憶が要らない
+        ターンで毎回 297 token = 約 2.2 秒の prefill を払っていた。
+
+        下限 0.10 での実測 (実ファクトストア 45 件):
+
+        =========================== ============== ============== ========
+        floor                       記憶不要ターン 想起ターン     想起
+        =========================== ============== ============== ========
+        0.00 (旧: 完全迂回)         297 tok (2.2s) 297 tok        全 OK
+        **0.10 (既定)**             **81 tok**     **297 tok**    全 OK
+        0.25                         70 tok        192 tok        全 OK
+        0.35                         70 tok        179 tok        1 件 NG
+        =========================== ============== ============== ========
+
+        0.10 は想起ターンの注入量・正答を一切損なわずに、記憶不要ターンだけを
+        73% 削る。破綻するのは 0.35 なので 3.5 倍の余裕がある。
 
         ``require_embedding`` は STM ノート用。ノートは生成時点では
         ``embedding=None`` で、sleep-time の embed 工程を通るまで値が入らない
@@ -373,17 +489,21 @@ class MemoryInjector:
         ノート本文は素の会話テキストで一人称・時制をそのまま含むため誤読の害が
         大きい。関連性を確認できないノートは注入しない方が安全側になる。
         """
-        if query_vec is None or pinned:
+        if query_vec is None:
             return True
         if embedding is None:
-            return not require_embedding
+            # pin されていても判定材料が無いのは従来どおり通す (下限は課せない)。
+            return True if pinned else not require_embedding
         w = np.asarray(embedding, dtype=np.float32).ravel()
         if w.shape != query_vec.shape:
             return True
         norm = float(np.linalg.norm(w))
         if not norm or not np.isfinite(norm):
             return True
-        return float(query_vec @ (w / norm)) >= self.relevance_min_score
+        score = float(query_vec @ (w / norm))
+        if pinned:
+            return score >= self.pinned_relevance_min_score
+        return score >= self.relevance_min_score
 
     # ── tier 分類 ────────────────────────────────────────────────────
 
@@ -420,7 +540,7 @@ class MemoryInjector:
                 return 4
             return None
 
-        # coding mode
+        # create mode
         if t == "policy":
             if fact.confidence >= self.policy_min_confidence:
                 return 1
@@ -445,7 +565,7 @@ class MemoryInjector:
             return 1
         if t == "task":
             return 2 if is_current_project else None
-        if t == "coding":
+        if t == "create":
             return 2 if is_current_project else 4
         if t == "preference":
             return 3
@@ -475,7 +595,7 @@ class MemoryInjector:
         # モード不一致は対象外
         if note.mode != mode:
             return None
-        if is_coding_mode(mode) and current_project_id is not None:
+        if is_create_mode(mode) and current_project_id is not None:
             if note.project_id != current_project_id:
                 return None
         return 2
@@ -513,7 +633,132 @@ class MemoryInjector:
     # ── レンダリング ─────────────────────────────────────────────────
 
     def _render_fact(self, fact: SemanticFact) -> str:
-        return f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.object}"
+        age = self._fact_age_days(fact)
+        if age is None or age < _FACT_STALE_LABEL_DAYS:
+            return f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.object}"
+        # 何日前の記録かを行ごとに書く。ノート側 (_render_note の (過去の記録))
+        # と同じ理由で、ブロック先頭の注意書きは数百トークン離れると効かない。
+        #
+        # 実インシデント (2026-08-08 ライブ監査 ターン34): 同一セッションの
+        # 前半で「趣味は登山と写真」と伝えていたが、その発言は 25 ターンの
+        # WorkingMemory 窓から押し出されており、3 日前の別セッションで記録した
+        # 「趣味は自転車と写真」が検索で 1.000 の最上位に立った。**どちらが今の
+        # 話かを示す情報が行に無かった**ため、古い方がそのまま回答になった。
+        return (
+            f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.object}"
+            f" ({int(age)}日前の記録)"
+        )
+
+    def _fact_age_days(self, fact: SemanticFact) -> float | None:
+        """ファクトが記録されてからの経過日数 (未記録なら ``None``)。"""
+        created_at = float(getattr(fact, "created_at", 0.0) or 0.0)
+        if created_at <= 0:
+            return None
+        return max(0.0, (self._now_provider() - created_at) / 86400.0)
+
+    def _collapse_to_current_values(
+        self, facts: Iterable[SemanticFact],
+    ) -> tuple[list[SemanticFact], int, set[str]]:
+        """1 スロット 1 値へ畳む (純粋関数的。入力は変更しない)。
+
+        2 段階で落とす:
+
+        1. **完全重複** — ``(subject, predicate, object)`` が同一の行。
+        2. **古い世代** — 同じ ``(subject, predicate)`` に異なる値が並ぶ場合、
+           ``created_at`` が最新のものだけ残す。
+
+        ``subject`` は ``mem.personal.name`` / ``mem.world.url.<hash>`` のように
+        名前空間化されており、``(subject, predicate)`` が**そのファクトのスロット
+        識別子**である (競合検出 ``semantic_conflict_resolver._group_conflicts``
+        も同じキーでグループ化する)。したがって同一スロットに live な値が複数
+        並ぶのは「世代が溜まっている」状態であって、並列に主張してよい別々の
+        事実ではない。
+
+        実測 (2026-08-09、実ファクトストア): live 88 件 / 38 スロットに対し、
+        **43 件 (49%) が完全重複**だった。同じ文が 2〜3 件ずつ複製されており、
+
+        - 注入予算の約半分を複製が食う
+        - **多数決が壊れる** — 「趣味は自転車と写真」(3 複製) が
+          「趣味は登山と写真」(2 複製) を回数で上回り、実機で古い方が採用された
+          (ライブ監査 ターン34)。意味ではなく複製数の差で負けていた
+
+        異なる値を持つスロットは 4 件しかなく、その大半は「質問がファクト化
+        されたもの」(``carries_no_assertion`` が読込時に落とす) だった。真に
+        矛盾していたのは ``mem.personal.name`` のみで、最新 (08-08 12:58
+        「登山と写真」) が実際に正しい値だった。
+
+        なぜ注入側でやるか: 競合検出は同じ矛盾を既に検出済みだが、
+        ``_decide`` が ``any(f.pinned)`` で ``pinned_present`` として自動解決を
+        見送るため pending のまま滞留する。そして pin は「覚えておいてください」
+        から**自動的に**付く。解決を待つ間も**矛盾を並べて注入してはいけない**
+        ので、注入の入口で 1 値に畳む。ユーザーへの確認は競合レビュー側の
+        担当で、こちらはそれと独立に成立する。
+
+        Returns:
+            ``(残したファクト, 落とした行数, 却下した世代の本文集合)``。
+            3 つ目は STM ノート側の重複抑止に使う (``_is_stale_duplicate``)。
+        """
+        by_slot: dict[tuple[str, str], SemanticFact] = {}
+        seen_exact: set[tuple[str, str, str]] = set()
+        out: list[SemanticFact] = []
+        stale_texts: set[str] = set()
+        dropped = 0
+        for fact in facts:
+            if fact.superseded_by:
+                out.append(fact)          # 既存ループ側で落とす (カウント二重計上を避ける)
+                continue
+            # **主張を含まない行はスロットの代表になれない。**
+            #
+            # 畳み込みは「最新を残す」ので、質問が最新だとそれがスロットを取り、
+            # 後段の carries_no_assertion で落とされて **スロットごと消える**。
+            # 実インシデント (2026-08-09): mem.personal.birthday に
+            #   「私の誕生日は 3 月 14 日で、飼っている猫の名前はコトラです。」(答え)
+            #   「私の猫の名前と誕生日を覚えていますか。」(質問・同日で後勝ち)
+            # が並び、質問が代表になった結果「猫の名前は？」に対して答えが 1 件も
+            # 注入されず「文脈が不足しています」と回答した (類似度 0.490 で
+            # 関連度ゲートは通っていた)。判定順序だけの問題。
+            if carries_no_assertion(fact.object or ""):
+                out.append(fact)          # 既存ループ側の同じ判定に委ねる
+                continue
+            exact = (fact.subject, fact.predicate, fact.object)
+            if exact in seen_exact:
+                dropped += 1
+                continue
+            seen_exact.add(exact)
+            slot = (fact.subject, fact.predicate)
+            current = by_slot.get(slot)
+            if current is None:
+                by_slot[slot] = fact
+                out.append(fact)
+                continue
+            dropped += 1
+            if float(getattr(fact, "created_at", 0.0) or 0.0) > float(
+                getattr(current, "created_at", 0.0) or 0.0,
+            ):
+                stale_texts.add(_normalize_for_dup(current.object))
+                out[out.index(current)] = fact
+                by_slot[slot] = fact
+            else:
+                stale_texts.add(_normalize_for_dup(fact.object))
+        if dropped:
+            logger.debug(
+                "MemoryInjector: collapsed %d duplicate/stale fact rows", dropped,
+            )
+        return out, dropped, stale_texts
+
+    @staticmethod
+    def _is_stale_duplicate(content: str, stale_texts: set[str]) -> bool:
+        """却下した世代と**同一本文**の STM ノートか。
+
+        ファクトと STM ノートは同じ発話を別々のストアに持つ。世代をファクト側で
+        畳んでも、同じ文がノート経由でそのまま戻ってくる (実測 2026-08-09:
+        「趣味は自転車と写真」のファクトを落とした後もノートが同文を注入していた)。
+        却下済みの本文と一致するノートは、判断済みの内容の再提示でしかない。
+
+        完全一致 (空白正規化のみ) に限る。曖昧一致にすると、言い換えただけの
+        別の発言まで巻き込む。
+        """
+        return bool(stale_texts) and _normalize_for_dup(content) in stale_texts
 
     def _render_note(self, note: MemoryNote) -> str:
         """STM ノートを 1 行にレンダリングする。

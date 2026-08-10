@@ -69,7 +69,7 @@ class GenerationParamEvolver:
         """モードの生成パラメータデルタを進化させる
 
         Args:
-            mode: "chat" または "coding"
+            mode: "chat" または "create"
             experiences: 経験バッファのエントリ（signals 含む）
             population_size: 候補数
 

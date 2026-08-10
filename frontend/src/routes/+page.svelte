@@ -51,14 +51,14 @@
 {/snippet}
 
 <PageLayout fullHeight>
-	{#if $currentMode === 'coding' && isPro && SplitPane && EditorPanel}
+	{#if $currentMode === 'create' && isPro && SplitPane && EditorPanel}
 		{@const SP = SplitPane}
 		{@const EP = EditorPanel}
 		<SP
-			ratio={$layout.coding.pane_ratio}
-			direction={$layout.coding.pane_direction}
+			ratio={$layout.create.pane_ratio}
+			direction={$layout.create.pane_direction}
 			onResize={(newRatio: [number, number]) => {
-				layout.update(l => ({ ...l, coding: { ...l.coding, pane_ratio: newRatio } }));
+				layout.update(l => ({ ...l, create: { ...l.create, pane_ratio: newRatio } }));
 			}}
 		>
 			{#snippet left()}

@@ -1,11 +1,11 @@
-# EvorefMem — ChatNoteBuilder / CodingNoteBuilder 候補ファクト判定辞書
+# EvorefMem — ChatNoteBuilder / CreateNoteBuilder 候補ファクト判定辞書
 #
 # 本ファイル: FACT_TRIGGERS の外部化 (config → YAML)
 #
 # 構成:
-#   mode (chat | coding)
+#   mode (chat | create)
 #     └ fact_type (personal_fact / world_fact / preference / emotion / opinion /
-#                  project / decision / commitment / task / coding)
+#                  project / decision / commitment / task / create)
 #         └ triggers: [str, ...]   # 部分一致、lowercase 化後に比較
 #
 # マッチング規則 (note_builder.candidate_fact_tags):
@@ -14,7 +14,7 @@
 #      1 語でも ``in`` マッチした fact_type を候補タグとして返す
 #   3. 複数 fact_type が当たった場合は全てを返す (重複なし)
 #
-# sleep-time Step 8 の Chat/CodingExtractor は ``candidate_fact_tags`` の
+# sleep-time Step 8 の Chat/CreateExtractor は ``candidate_fact_tags`` の
 # 戻り値をそのまま利用するため、ここを拡張すると Extractor にも追随する。
 #
 # i18n: ja / en をフラットに混在させる。pin_triggers.yaml と同じ方針。
@@ -102,7 +102,7 @@ chat:
     - "in my opinion"
     - "i feel that"
 
-coding:
+create:
   project:
     - このプロジェクト
     - 本プロジェクト
@@ -151,7 +151,7 @@ coding:
     - "fix the"
     - "add the"
     - "refactor"
-  coding:
+  create:
     - "python"
     - "javascript"
     - "typescript"

@@ -74,8 +74,8 @@ positive:
     - "please remember"
     - "pin this"
 
-  coding:
-    # コーディングモード固有: ルール・規約・制約を強調する語
+  create:
+    # クリエイトモード固有: ルール・規約・制約を強調する語
     - ルール
     - 規約
     - 制約

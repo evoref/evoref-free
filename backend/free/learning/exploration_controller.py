@@ -85,7 +85,7 @@ class ExplorationController(JsonStateStore):
 
         Args:
             domain: ポリシードメイン
-            mode: "chat" | "coding"
+            mode: "chat" | "create"
             fitness_history: そのドメイン・モードの fitness 値の時系列
         """
         key = (domain, mode)

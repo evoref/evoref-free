@@ -55,7 +55,7 @@
 	<!-- 左: プロンプト選択リスト -->
 	<div class="prompt-sidebar">
 		{#each $systemPrompts as p}
-			{#if isPro || p.mode !== 'coding'}
+			{#if isPro || p.mode !== 'create'}
 				<button
 					type="button"
 					class="prompt-item"

@@ -16,7 +16,7 @@
   ``DebugLogSink`` が ``_trace_id_processor`` で ``contextvars``
   の ``trace_id`` を自動付与する。本アダプタは行から
   ``trace_id`` を読み出し、``MemoryNote.trace_id`` にそのまま伝播させる。これに
-  より B-1 の ``MDPTraceExtractor`` / Step 8 の Chat/Coding extractor が同じ
+  より B-1 の ``MDPTraceExtractor`` / Step 8 の Chat/Create extractor が同じ
   ``trace_id`` を ``SemanticFact.trace_id`` / ``Provenance.trace_id`` として
   受け継ぎ、ファクトと episodic LTM が連結可能になる。
 - **private 防御**: ``private_trace_ids`` (現 STM の private ノートに紐づく
@@ -94,7 +94,7 @@ class EpisodeRecord:
             m = self.begin.get("mode")
             if isinstance(m, str) and m:
                 return m
-        return "coding"
+        return "create"
 
     def outcome(self) -> str:
         if self.end and isinstance(self.end, dict):
@@ -288,7 +288,7 @@ class MDPIngester:
 
         - ``id`` は ``mdp_<episode_id>`` (重複した場合は LTM 側で chunk_id が
           一意化されるためここでは episode 毎に固定)
-        - ``mode`` は begin event の値 (デフォルト coding)
+        - ``mode`` は begin event の値 (デフォルト create)
         - ``trace_id`` はイベントから引き継ぎ (contextvars 由来)
         - ``content`` は ``outcome`` + task/observation + 直近 3 アクションの
           1 行サマリ (ツール無しの単発生成でも無内容にならないよう enrich)
@@ -328,7 +328,7 @@ class MDPIngester:
             session_id=episode.episode_id,
             source="system",
             confidence=0.6,
-            mode=normalize_session_mode(episode.mode(), default="coding"),  # type: ignore[arg-type]
+            mode=normalize_session_mode(episode.mode(), default="create"),  # type: ignore[arg-type]
             project_id=project_id,
             trace_id=episode.trace_id,
         )

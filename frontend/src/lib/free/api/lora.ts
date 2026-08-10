@@ -13,8 +13,8 @@ import { request } from './_client';
 /** LoRA 系列 (base / assist) */
 export type LoraTarget = 'base' | 'assist';
 
-/** モード (chat / coding)。level2_adapter_partition=="model_mode" のときのみ意味を持つ。 */
-export type LoraMode = 'chat' | 'coding';
+/** モード (chat / create)。level2_adapter_partition=="model_mode" のときのみ意味を持つ。 */
+export type LoraMode = 'chat' | 'create';
 
 /** LoRA バージョン情報 (バックエンド VersionInfoResponse 準拠) */
 export interface LoraVersionInfo {
@@ -45,7 +45,7 @@ export type LoraAdapterPartition = 'model' | 'model_mode';
 export interface LoraVersionsResponse {
 	base: LoraTargetVersions;
 	assist: LoraTargetVersions;
-	/** 'model' のときアダプタはモード非依存で chat/coding が同一実体を共有する */
+	/** 'model' のときアダプタはモード非依存で chat/create が同一実体を共有する */
 	adapter_partition?: LoraAdapterPartition;
 }
 

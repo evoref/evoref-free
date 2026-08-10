@@ -1,11 +1,11 @@
-"""staged コーディングの temp ワークスペース管理。
+"""staged クリエイトの temp ワークスペース管理。
 
 工程間 (spec→code→test) の中間成果物 (spec.md / 生成コード / 生成テスト) と
 進捗 manifest を実ファイルとして保持し、後続工程が読み戻して整合を担保する。
 SemMem (artifact/progress/failure ファクト) は内容を持たない進捗・学習シグナル
 専用とし、**ファイル内容と manifest の真実はこのワークスペースが持つ**。
 
-ディレクトリ構成 (``coding_workspace_dir/{workspace_id}/``)::
+ディレクトリ構成 (``create_workspace_dir/{workspace_id}/``)::
 
     manifest.json            工程間ハンドオフ (atomic, fsync)
     spec.md                  spec 工程の設計仕様
@@ -95,7 +95,7 @@ def _safe_rel(logical_path: str) -> str:
 
 @dataclass
 class WorkspaceManager:
-    """1 コーディングセッション = 1 ワークスペース。
+    """1 クリエイトセッション = 1 ワークスペース。
 
     ``open_or_create`` で生成 / 再アタッチする。manifest 変更は ``_update_manifest``
     に集約し、Lock + AtomicWriter(fsync) で原子化する。
@@ -117,7 +117,7 @@ class WorkspaceManager:
     @classmethod
     def open_or_create(
         cls,
-        coding_workspace_dir: Path | str,
+        create_workspace_dir: Path | str,
         *,
         workspace_id: str,
         session_id: str,
@@ -125,8 +125,8 @@ class WorkspaceManager:
         goal: str = "",
         debug_logger: "DebugLogger | None" = None,
     ) -> "WorkspaceManager":
-        """``{coding_workspace_dir}/{workspace_id}`` を生成 / 再アタッチする。"""
-        root = Path(coding_workspace_dir) / workspace_id
+        """``{create_workspace_dir}/{workspace_id}`` を生成 / 再アタッチする。"""
+        root = Path(create_workspace_dir) / workspace_id
         root.mkdir(parents=True, exist_ok=True)
         (root / "src").mkdir(exist_ok=True)
         (root / "tests" / "_runs").mkdir(parents=True, exist_ok=True)
@@ -163,7 +163,7 @@ class WorkspaceManager:
     def cleanup(self) -> None:
         """ワークスペース (含 .semmem / 生成物 / manifest) を削除する。
 
-        ``coding.staged.cleanup_workspace=true`` のときにリクエスト完了後に呼ぶ。
+        ``create.staged.cleanup_workspace=true`` のときにリクエスト完了後に呼ぶ。
         失敗は握り潰す (一時ファイルのため致命的でない)。
         """
         import shutil

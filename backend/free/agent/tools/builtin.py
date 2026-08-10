@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from backend.free.api.chat.chat_constants import LLM_TOOL_EXECUTION_TIMEOUT_SEC
+from backend.free.llm.assist_client import assist_ready
 from backend.free.llm.utils import extract_content
 from backend.i18n_helper import prose_language_name
 from backend.log_config import get_logger
@@ -1091,7 +1092,10 @@ def _make_fetch_url(cfg: dict, assist_client: "AssistModelClient | None" = None)
             url, timeout=timeout, allow_private_ip=allow_private_ip,
         )
         if (
-            assist_client is None
+            # residency 非常駐 (``on_demand`` のチャット中) も「使えない」扱い
+            # (docs/c_14 §6.1)。要約できなければ原文をそのまま返す既存の
+            # フォールバックが働く。
+            not assist_ready(assist_client, "summarize")
             or text.startswith("Error")
             or len(text) <= _FETCH_URL_SUMMARIZE_THRESHOLD
             # 表を含む結果は要約するとセル/行が失われるため原文のまま返す。
@@ -1411,7 +1415,7 @@ def register_builtin_tools(
             "file_path": {"type": "string", "description": "Path to the file to write"},
             "content": {"type": "string", "description": "Content to write"},
         },
-        modes=["coding"],
+        modes=["create"],
     )
 
     registry.register(
@@ -1422,7 +1426,7 @@ def register_builtin_tools(
             "pattern": {"type": "string", "description": "Regex pattern to search for"},
             "directory": {"type": "string", "description": "Directory to search in"},
         },
-        modes=["coding"],
+        modes=["create"],
     )
 
     registry.register(
@@ -1453,7 +1457,7 @@ def register_builtin_tools(
             "file_path": {"type": "string", "description": "Path to the file to patch"},
             "diff_text": {"type": "string", "description": "Unified diff content"},
         },
-        modes=["coding"],
+        modes=["create"],
     )
 
     registry.register(
@@ -1463,7 +1467,7 @@ def register_builtin_tools(
         parameters={
             "command": {"type": "string", "description": "Shell command to execute"},
         },
-        modes=["coding"],
+        modes=["create"],
     )
 
     # chat モードの executable query (時刻 / OS / スペック等) 専用。
@@ -1492,7 +1496,7 @@ def register_builtin_tools(
         parameters={
             "file_path": {"type": "string", "description": "Path to the Python file to verify"},
         },
-        modes=["coding"],
+        modes=["create"],
     )
 
     # fetch_url（デフォルト有効、config で無効化可能）
@@ -1561,7 +1565,7 @@ def register_builtin_tools(
                         "noun(s) from the request."
                     ),
                 },
-                "mode": {"type": "string", "description": "Filter by mode (chat/coding)"},
+                "mode": {"type": "string", "description": "Filter by mode (chat/create)"},
                 "limit": {"type": "integer", "description": "Maximum number of results (default: 10)"},
                 "date_from": {"type": "string", "description": "Start date in ISO 8601 format (e.g. '2026-03-01')"},
                 "date_to": {"type": "string", "description": "End date in ISO 8601 format (e.g. '2026-03-31')"},

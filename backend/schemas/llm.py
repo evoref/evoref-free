@@ -32,7 +32,7 @@ class MtpConfig(BaseModel):
 class LlamaSpeculativeConfig(BaseModel):
     """self-speculative decoding 設定
 
-    Pro 限定機能。``evoref code`` モード の base
+    Pro 限定機能。``evoref create`` モード の base
     モデルでコーディング系ワークロードのスループット改善を狙う。Free では
     ``enabled=true`` でも ``scripts/launch_llama.py`` 側で warning + 無効化
     される (``EVOREF_EDITION`` / ``backend.pro`` 存在で判定)。

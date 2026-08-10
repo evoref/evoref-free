@@ -25,8 +25,8 @@
 	 * - `model`: assist_model.backend (local/external/hybrid) が Pro 限定
 	 * - `learning`: level1_idle_minutes_pro / 上位オプティマイザが Pro 限定
 	 * - `integration`: external_api / widget_proxy が Pro 限定
-	 * - `generation`: modes.coding (コーディングモードの生成パラメータ) が Pro 限定
-	 * - `prompts`: coding システムプロンプトが Pro 限定
+	 * - `generation`: modes.create (クリエイトモードの生成パラメータ) が Pro 限定
+	 * - `prompts`: create システムプロンプトが Pro 限定
 	 *
 	 * ProSection を含まないタブ (memory 等) は Pro バッジ対象外。
 	 */

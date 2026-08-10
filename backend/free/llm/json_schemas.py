@@ -208,12 +208,12 @@ class FlowchartSpec(_StrictModel):
     mermaid: str = ""
 
 
-# ── staged コーディングのタスクグラフ合成 (coding_task_graph) ──
+# ── staged クリエイトのタスクグラフ合成 (create_task_graph) ──
 
-class CodingModuleUnit(_StrictModel):
-    """staged コーディングが生成する 1 モジュール (= 1 ファイル) の粗計画。
+class CreateModuleUnit(_StrictModel):
+    """staged クリエイトが生成する 1 モジュール (= 1 ファイル) の粗計画。
 
-    `backend/free/loop/staged/synthesizer.py` が purpose="coding_task_graph"
+    `backend/free/loop/staged/synthesizer.py` が purpose="create_task_graph"
     で取得し、spec/code/test の task ファクト三層へ決定的に展開する。
     モジュール間の ``depends_on`` は code パス内の import 配線への参考情報で
     あり、task 依存グラフには落とさない (循環回避のため)。
@@ -227,15 +227,15 @@ class CodingModuleUnit(_StrictModel):
     depends_on: list[str] = Field(default_factory=list)
 
 
-class CodingTaskGraph(_StrictModel):
-    """staged コーディングの粗計画 (全体設計 + モジュール分割)。
+class CreateTaskGraph(_StrictModel):
+    """staged クリエイトの粗計画 (全体設計 + モジュール分割)。
 
     LLM には粗計画のみを返させ、三層展開・依存配線・slug 衝突回避は呼出側
     (synthesizer) が Python で決定的に行う。
     """
 
     summary: str = ""
-    modules: list[CodingModuleUnit] = Field(default_factory=list)
+    modules: list[CreateModuleUnit] = Field(default_factory=list)
 
 
 # ── staged フロー構造合成 (flow_spec_synthesis) ──
@@ -455,7 +455,7 @@ class ToolJudgmentResult(_StrictModel):
 class EditorFilenameResult(_StrictModel):
     """`backend/free/llm/editor_filename.py` のエディタタブ名導出.
 
-    コーディングモードで生成したコード/仕様書を Pro エディタへタブ表示する際、
+    クリエイトモードで生成したコード/仕様書を Pro エディタへタブ表示する際、
     生成内容から **拡張子なしの ASCII snake_case** ファイル名 stem を 1 つ
     導出する。日本語見出しをそのまま流用するとタブ名が日本語化するため、
     アシストモデルに英語の簡潔名を生成させる (SPLIT モードの ``file_name`` と
@@ -505,7 +505,7 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "long_form_text_review": ReviewIssues,
     "code_spec_synthesis": CodeSpec,
     "flowchart_synthesis": FlowchartSpec,
-    "coding_task_graph": CodingTaskGraph,
+    "create_task_graph": CreateTaskGraph,
     "flow_spec_synthesis": FlowSpec,
     "flow_spec_part_synthesis": FlowSpec,
     "spec_revision_judge": SpecRevisionJudgement,

@@ -17,6 +17,7 @@ from backend.schemas._common import (
     LongFormConfig,
     ModelMigrationConfig,
     ModesConfig,
+    AutoServeConfig,
     ProcessManagerConfig,
     ProConfig,
     RuntimeConfig,
@@ -27,7 +28,7 @@ from backend.schemas._common import (
     WidgetProxyConfig,
 )
 from backend.schemas.assist_model import AssistModelConfig
-from backend.schemas.coding import CodingConfig
+from backend.schemas.create import CreateConfig
 from backend.schemas.learning import LearningConfig, ScheduleConfig
 from backend.schemas.llm import LlamaConfig
 from backend.schemas.loop import LoopConfig
@@ -91,9 +92,10 @@ class EvorefConfig(BaseModel):
     editor: EditorSettingsConfig = Field(default_factory=EditorSettingsConfig)
     model_migration: ModelMigrationConfig = Field(default_factory=ModelMigrationConfig)
     process_manager: ProcessManagerConfig = Field(default_factory=ProcessManagerConfig)
+    auto_serve: AutoServeConfig = Field(default_factory=AutoServeConfig)
     long_form: LongFormConfig = Field(default_factory=LongFormConfig)
     loop: LoopConfig = Field(default_factory=LoopConfig)
-    coding: CodingConfig = Field(default_factory=CodingConfig)
+    create: CreateConfig = Field(default_factory=CreateConfig)
     pro: ProConfig = Field(default_factory=ProConfig)
 
     @model_validator(mode="before")
@@ -164,7 +166,7 @@ class EvorefConfig(BaseModel):
         - ``widget_proxy.enabled = True``  (Pro Widget Proxy / 汎用 Web API プロキシ)
         - ``pro.terminal.enabled = True``  (Pro Web ターミナル)
         - ``learning.optimizer == "full-cma-es"`` (Pro CMA-ES オプティマイザ)
-        - ``coding.pipeline == "staged"`` (Pro staged コーディングパイプライン)
+        - ``create.pipeline == "staged"`` (Pro staged クリエイトパイプライン)
         - 未定義トップレベルキー ``mode_models`` (Pro ローカルモデル切替)
 
         過去存在した ``external_api.enabled`` / ``assist_model.backend in
@@ -197,11 +199,11 @@ class EvorefConfig(BaseModel):
                 "pro.url_recall.team_profile_ids",
                 bool(self.pro.url_recall.team_profile_ids),
             ),
-            # staged コーディングパイプラインは Pro 限定 (_staged_coding_enabled が
+            # staged クリエイトパイプラインは Pro 限定 (_staged_create_enabled が
             # is_pro() でゲート)。Free で pipeline=staged を設定しても longform の
             # まま無効なので警告する。staged_enabled は intra-staged のキルスイッチ
             # (既定 True) で Pro signal ではないため対象にしない。
-            ("coding.pipeline", self.coding.pipeline == "staged"),
+            ("create.pipeline", self.create.pipeline == "staged"),
         ]
 
         # extra="allow" で透過する未定義トップレベルキー (Pro 拡張)。
@@ -226,8 +228,41 @@ class EvorefConfig(BaseModel):
         return self
 
 
+#: 旧 "coding" モード名時代のキー → 現行キー。``LocalPathsConfig`` /
+#: ``ModelPathsConfig`` 等が ``extra="forbid"`` のため、旧キーの残る config.yaml は
+#: そのままでは起動時に ValidationError になる。ファイルは書き換えず、読み込んだ
+#: dict の上でだけ読み替えて WARNING を出す (更新はユーザーの任意)。
+_LEGACY_KEY_RENAMES: dict[str, str] = {
+    "coding": "create",
+    "coding_task": "create_task",
+    "coding_model": "create_model",
+    "assist_coding_model": "assist_create_model",
+    "coding_workspace_dir": "create_workspace_dir",
+    "coding_budget_tokens": "create_budget_tokens",
+    "coding_code_signal": "create_code_signal",
+}
+
+
+def _rename_legacy_keys(node: object, path: str, renamed: list[str]) -> object:
+    """設定ツリーを再帰的に走査し、旧モード名のキーを現行キーへ読み替える。"""
+    if isinstance(node, dict):
+        out: dict = {}
+        for key, value in node.items():
+            new_key = _LEGACY_KEY_RENAMES.get(key, key) if isinstance(key, str) else key
+            if new_key != key:
+                renamed.append(f"{path}{key} -> {new_key}")
+            out[new_key] = _rename_legacy_keys(value, f"{path}{new_key}.", renamed)
+        return out
+    if isinstance(node, list):
+        return [_rename_legacy_keys(v, path, renamed) for v in node]
+    return node
+
+
 def validate_config(raw: dict) -> dict:
     """config dict を Pydantic スキーマで検証し、デフォルト値を補完した dict を返す
+
+    旧 "coding" モード名時代のキーは現行キーへ読み替えてから検証する
+    (:data:`_LEGACY_KEY_RENAMES`)。
 
     Args:
         raw: YAML から読み込んだ生の設定辞書
@@ -238,6 +273,14 @@ def validate_config(raw: dict) -> dict:
     Raises:
         pydantic.ValidationError: 設定値が不正な場合
     """
+    renamed: list[str] = []
+    raw = _rename_legacy_keys(raw, "", renamed)  # type: ignore[assignment]
+    if renamed:
+        logger.warning(
+            "config.yaml uses legacy 'coding' mode keys; reading them as the "
+            "current names for this run. Update config.yaml to silence this: %s",
+            ", ".join(renamed),
+        )
     validated = EvorefConfig.model_validate(raw)
     logger.info("Config validation passed")
     return validated.model_dump()

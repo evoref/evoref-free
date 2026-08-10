@@ -1,11 +1,11 @@
 """
 
-``ChatExtractor`` / ``CodingExtractor`` / ``MDPTraceExtractor`` 共通の
+``ChatExtractor`` / ``CreateExtractor`` / ``MDPTraceExtractor`` 共通の
 データクラスとヘルパを提供する。
 
 設計の核となる考え方:
 
-- **入力**: ``ShortTermMemory`` の ``MemoryNote`` 群 (chat/coding 抽出器) または
+- **入力**: ``ShortTermMemory`` の ``MemoryNote`` 群 (chat/create 抽出器) または
   ``agent_trace*.jsonl`` ファイル群 (MDPTraceExtractor、日付付きファイル含む)。
 - **出力**: ``SemanticFact`` のリスト + 統計 (``ExtractionResult``)。
   ``ExtractionResult`` には skip 件数や cap 当たり件数も含め、
@@ -47,8 +47,8 @@ class ExtractionContext:
     """Extractor 共通のコンテキスト。
 
     Attributes:
-        project_id: コーディングモードのプロジェクト ID。``None`` の場合
-            CodingExtractor / MDPTraceExtractor は no-op (project スコープ
+        project_id: クリエイトモードのプロジェクト ID。``None`` の場合
+            CreateExtractor / MDPTraceExtractor は no-op (project スコープ
             必須のため)。
         agent_trace_dir: ``agent_trace*.jsonl`` を格納するディレクトリ
             (通常は ``debug_logger.log_dir``)。``MDPTraceExtractor`` は
@@ -56,7 +56,7 @@ class ExtractionContext:
             (``agent_trace_YYYY-MM-DD.jsonl``) をグロブで横断する。
             ``None`` または存在しない場合は no-op。
         max_per_session: モード別セッション上限
-            ``{"chat": 10, "coding": 5}`` を期待
+            ``{"chat": 10, "create": 5}`` を期待
         max_pinned_per_session: pinned ノート由来の上限。``-1`` で無制限
         canonicalizer: subject 正規化器 (``None`` ならバイパスのみ)
         now: テスト容易性のための時刻注入
@@ -65,7 +65,7 @@ class ExtractionContext:
     project_id: str | None = None
     agent_trace_dir: Path | None = None
     max_per_session: dict[str, int] = field(
-        default_factory=lambda: {"chat": 10, "coding": 5},
+        default_factory=lambda: {"chat": 10, "create": 5},
     )
     max_pinned_per_session: int = -1
     canonicalizer: SubjectCanonicalizer | None = None
@@ -104,7 +104,7 @@ class ExtractionResult:
 class BaseExtractor:
     """Extractor 共通基底。
 
-    サブクラスは ``mode`` (``chat`` / ``coding``) と ``extract`` を実装する。
+    サブクラスは ``mode`` (``chat`` / ``create``) と ``extract`` を実装する。
     ``MDPTraceExtractor`` のように STM を入力に取らない抽出器は ``extract``
     を完全にオーバーライドする。
     """
@@ -141,7 +141,7 @@ class BaseExtractor:
         - ``is_tool_output=True`` (ツール出力は STM 以降に来ない想定だが
           念のため二重ガード)
         - ``extraction_skipped=True``
-        - モード不一致 (chat extractor が coding ノートを取らないなど)
+        - モード不一致 (chat extractor が create ノートを取らないなど)
         - ``content`` が空
         """
         if note.private:

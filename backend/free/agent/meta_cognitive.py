@@ -15,7 +15,7 @@ from backend.free.agent.context_budget import (
 )
 from backend.free.core.intent_vocab import EXPLICIT_WINDOWS_PATH_RE
 from backend.free.core.prompt_blocks import current_datetime_block
-from backend.free.core.session_mode import is_coding_mode
+from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.code_artifact_generator import CodeArtifactGenerator
 from backend.free.agent.event_reminder import EventReminderSystem
 from backend.free.agent.self_cartridge import (
@@ -64,6 +64,7 @@ from backend.free.agent.meta_cognitive_utils import (
     fix_json_backslashes,
     generated_content_rejection,
     looks_like_path_not_content,
+    looks_like_task_log_residue,
     rescue_quoted_write_literal,
     strip_markdown_wrapper,
     strip_generator_scaffold_block,
@@ -78,6 +79,7 @@ from backend.free.agent.meta_cognitive_utils import (
 )
 from backend.free.agent.step_compactor import StepCompactor, StepResult
 from backend.free.core.inference import build_messages_for_loop
+from backend.free.llm.assist_client import assist_ready
 from backend.free.llm.editor_filename import derive_editor_filename_stem
 from backend.utils import estimate_tokens as _estimate_tokens
 from backend.log_config import get_logger
@@ -220,6 +222,39 @@ RICH_DOC_CONTENT_INSTRUCTION = (
 # 定義は core.intent_vocab が SSOT (agent.feedback が同一定義を持っていた)。
 _EXPLICIT_PATH_RE = EXPLICIT_WINDOWS_PATH_RE
 
+# 書込み棄却の理由コード → ユーザー向けの短い説明。
+#
+# 理由を伏せると、次のターンで「なぜ失敗したのか」と聞かれたモデルが **事実と
+# 異なる説明** を作る (実インシデント 2026-08-10 ライブ監査: 同一会話で 2 回
+# 書き込みに成功しているのに「私はファイルを直接作成したり書き込んだりする権限を
+# 持っていないため、保存に失敗しました」と答えた)。理由はこちらが付けたコードなので、
+# 無関係なツール出力を露出させる心配なく添えられる。
+_WRITE_REJECTION_REASON_JA: dict[str, str] = {
+    "write_report_echo": "生成された本文が完了報告になっていたため",
+    "task_log_echo": "生成された本文が進捗ノートになっていたため",
+    "tool_call_syntax": "生成された本文がツールコール構文になっていたため",
+    "write_script": "生成された本文がファイルを書くスクリプトになっていたため",
+    "refusal_or_missing_info": "生成された本文が断り書きになっていたため",
+    "prompt_echo": "生成された本文が内部プロンプトの写しになっていたため",
+    "instruction_echo": "生成された本文が依頼文の写しになっていたため",
+    "literal_wrapped": "生成された本文が依頼文の引用で包まれていたため",
+    "path_only": "生成された本文がパスだけだったため",
+    "csv_without_rows": "生成された CSV に行が無かったため",
+    "edit_without_change": "内容が変わらなかったため",
+    "task_restatement": "生成された本文が依頼の言い換えだったため",
+}
+_WRITE_REJECTION_RE = re.compile(r"invalid output \(([a-z_]+)\)")
+
+# 「書くべき本文は会話にある」ことを示す参照表現。既存ファイルがある上書き
+# 依頼でも、この語があるときは既存内容ではなく会話を素材にする
+# (_generate_content 内の使用箇所のコメント参照)。
+_PRIOR_CONTENT_REFERENCE_RE = re.compile(
+    r"先(?:ほど|程)|さきほど|さっき|上記|直前|先の|前の"
+    r"|提示した|示した|作成した|出力した"
+    r"|\bearlier\b|\babove\b|\bprevious(?:ly)?\b",
+    re.IGNORECASE,
+)
+
 # assist がパラメータ名をそのまま値として返したときに現れる「パスもどき」。
 # ディレクトリ成分も拡張子も持たず、意味のあるファイル名ではない。
 _PLACEHOLDER_WRITE_PATH_NAMES: frozenset[str] = frozenset({
@@ -281,7 +316,7 @@ _CODE_LANGUAGES: frozenset[str] = frozenset({
 class MetaCognitiveAgent:
     """Meta-Cognitive 層: 計画立案 + 多段推論 + ツール実行ループ
 
-    コーディングモードのタスクリスト方式 + diff 駆動を実装。
+    クリエイトモードのタスクリスト方式 + diff 駆動を実装。
     StepCompactor によるステップ結果圧縮と EventReminderSystem による
     Instruction Fade-Out 対策を統合。
     目標応答時間: 10〜30秒
@@ -303,7 +338,7 @@ class MetaCognitiveAgent:
         file_block: str | None = None,
         fewshot_block: str | None = None,
         code_generator: CodeArtifactGenerator | None = None,
-        mode: str = "coding",
+        mode: str = "create",
     ) -> None:
         self.max_steps = max_steps
         cfg = config or {}
@@ -322,9 +357,9 @@ class MetaCognitiveAgent:
         # Level 1 で進化したモード別 few-shot ブロック。meta 経路は固定の
         # PLAN/EXECUTE/CONTENT scaffold を使うため、deliberative のように最後の
         # user メッセージへ前置できない。ツールループ / コンテンツ生成 / fallback
-        # の system に [参考例] として注入し、進化を coding 生成へ効かせる。
+        # の system に [参考例] として注入し、進化を create 生成へ効かせる。
         self._fewshot_block = fewshot_block
-        # coding モードで editor/chat 出力のコード生成を LongForm 細粒度生成へ
+        # create モードで editor/chat 出力のコード生成を LongForm 細粒度生成へ
         # 委譲する (composition が注入)。None なら従来の単一ショット生成。
         self._code_generator = code_generator
         # 構築時モード (内部 loop/token 予算の context_size 解決に使う)。
@@ -384,14 +419,14 @@ class MetaCognitiveAgent:
         on_step=None,
         generation_params: dict | None = None,
         session_id: str = "",
-        mode: str = "coding",
+        mode: str = "create",
         output_target: str = "file",
     ) -> MetaCognitiveResponse:
         """Meta-Cognitive 層で計画立案 → タスク実行ループ
 
         全体をタイムアウトで保護し、失敗時はプレーン LLM にフォールバック。
 
-        ``output_target`` は生成コードの出力先 (coding モードのみ意味を持つ):
+        ``output_target`` は生成コードの出力先 (create モードのみ意味を持つ):
         ``"file"`` (既定、明示パスへ write_file) / ``"editor"`` (ディスク書込せず
         ``editor_artifacts`` へ) / ``"chat"`` (コードフェンスで ``content`` に返す)。
         """
@@ -522,7 +557,7 @@ class MetaCognitiveAgent:
         output_target: str = "file",
         generation_params: dict | None = None,
         session_id: str = "",
-        mode: str = "coding",
+        mode: str = "create",
     ) -> MetaCognitiveResponse:
         """process() の本体実装"""
         from backend.free.agent.credit_assigner import assign_credit, compute_final_outcome
@@ -668,10 +703,18 @@ class MetaCognitiveAgent:
                 "status": "running",
             })
 
-        if self._assist_client is None:
-            logger.warning(
-                "Plan generation skipped: assist_client is not configured "
-                "(degraded mode); falling back to single task",
+        # ``is None`` (未設定) だけでなく residency 非常駐も同じ扱いにする
+        # (docs/c_14 §6.1 の移行)。``assist_model.residency: on_demand`` では
+        # **チャット中つねに非常駐**なので、ここを ``is None`` のままにすると
+        # 毎回 HTTP 手前まで進んで ``AssistUnavailableError`` を踏み、
+        # 「Plan generation failed」という **失敗に見える WARNING** が
+        # ファイル操作のたびに出ていた (2026-08-09 ライブ監査)。設計どおりの
+        # 縮退なので、事前に判定して静かに単一タスクへ倒す。
+        if not assist_ready(self._assist_client, "meta_cognitive_plan"):
+            logger.info(
+                "Plan generation skipped: assist model is not available "
+                "(not configured, or not resident during chat); "
+                "falling back to single task",
             )
             if self._debug_logger is not None:
                 self._debug_logger.log_decision(
@@ -944,9 +987,9 @@ class MetaCognitiveAgent:
                 "detail": f"{prefix} コンテンツ生成中...",
                 "status": "running",
             })
-        # coding モード: LongForm 細粒度生成へ委譲 (複数ファイル可)。空リスト
+        # create モード: LongForm 細粒度生成へ委譲 (複数ファイル可)。空リスト
         # (テキスト判定 / degraded / 失敗) なら従来の単一ショット生成へフォールバック。
-        if is_coding_mode(self._mode):
+        if is_create_mode(self._mode):
             artifacts = await self._delegate_code_generation(original_query, on_step)
             if artifacts:
                 if self._output_target == "chat":
@@ -965,13 +1008,13 @@ class MetaCognitiveAgent:
         filename, language = self._guess_artifact_meta(
             task.description, original_query,
         )
-        # coding モードでコード系言語が期待されるのに散文 ("設計します..." のみ)
+        # create モードでコード系言語が期待されるのに散文 ("設計します..." のみ)
         # が返った場合は成果物として採用せず failed に倒す。これを done のまま
         # 通すと reward=1.0 で記録され Level 0/1 が誤強化される (false-success)。
         # contains_code_indicator は長さ・改行に依存しないため、1 行の短い
         # 正当コード (print(...) 等) を誤って弾かず、指標皆無の散文だけを拒否する。
         if (
-            is_coding_mode(self._mode)
+            is_create_mode(self._mode)
             and language in _CODE_LANGUAGES
             and not contains_code_indicator(content)
         ):
@@ -1119,22 +1162,27 @@ class MetaCognitiveAgent:
 
         return steps
 
-    def _referential_write_path(self) -> str:
-        """直近会話に現れた最後のファイルパスを返す (無ければ空文字列)。"""
-        from backend.free.agent.tool_call_judge import _extract_file_path
+    def _referential_write_path(self, query_path: str | None = None) -> str:
+        """書込み先を直近会話から解決する (解決できなければ空文字列)。
 
-        for msg in reversed(list(getattr(self, "_conversation", None) or [])):
-            if not isinstance(msg, dict):
-                continue
-            content = msg.get("content")
-            if not isinstance(content, str):
-                continue
-            path = _extract_file_path(content)
-            if path:
-                logger.info(
-                    "Referential write target resolved from conversation: %s", path,
-                )
-                return path
+        ``query_path`` に **ディレクトリを伴わない裸のファイル名**
+        (``notes.txt``) を渡すと、会話中の同じ basename を持つフルパスに
+        解決する。裸の名前をそのまま write_file へ渡すとカレント
+        ディレクトリに着地し、ユーザーが指した既存ファイルとは別物を作る
+        (2026-08-09 ライブ監査で判明した実害の対処)。``None`` なら従来どおり
+        「最後に出たパス」を返す (「同じファイルに保存し直して」型)。
+        """
+        from backend.free.agent.tool_call_judge import _resolve_referenced_path
+
+        path = _resolve_referenced_path(
+            query_path, getattr(self, "_conversation", None),
+        )
+        if path:
+            logger.info(
+                "Referential write target resolved from conversation: %s "
+                "(query_path=%r)", path, query_path,
+            )
+            return path
         return ""
 
     @staticmethod
@@ -1215,12 +1263,14 @@ class MetaCognitiveAgent:
             judgement.tool_name == "write_file"
             and tools_registry.has("write_file")
         ):
+            # パスが無い (「同じファイルに保存し直して」型) か、ディレクトリを
+            # 伴わない裸のファイル名 (「notes.txt に追記して」) は保存先が
+            # 確定していないので直近会話から引く。ディレクトリ付きパスはその
+            # まま返るので無条件に通してよい (実測 2026-07-27: パス不明のまま
+            # 生成だけ走りファイルは旧内容のままだった / 2026-08-09: 裸名を
+            # そのまま渡すとカレントディレクトリに別物を作る)。
             file_path = judgement.tool_args.get("file_path", "")
-            if not file_path:
-                # 「同じファイルに保存し直して」型はプランにもパスが載らない。
-                # 直近会話に出た保存先を引く (実測 2026-07-27: パス不明のまま
-                # 生成だけ走り、ファイルは旧内容のままだった)。
-                file_path = self._referential_write_path()
+            file_path = self._referential_write_path(file_path or None) or file_path
             if file_path:
                 return await self._execute_write_fast(
                     task, original_query, file_path,
@@ -1910,13 +1960,13 @@ class MetaCognitiveAgent:
         state: AgentState,
     ) -> str:
         """ツールを実行して結果テキストを返す"""
-        # search_code は coding 専用ツールだが (modes=["coding"])、ここは LLM
+        # search_code は create 専用ツールだが (modes=["create"])、ここは LLM
         # プランナーが自由選択するループ経路であり ToolDefinition.modes は元々
         # 参照されていない。chat モードの CWD 全域 os.walk が実インシデントの
         # 直接原因になったため、search_code に限り mode ゲートを追加する
         # (write_file は meta_cognitive の長文書き出し機能で chat モードからも
         # 正規に使われるため対象外)。
-        if tool_name == "search_code" and not is_coding_mode(self._mode):
+        if tool_name == "search_code" and not is_create_mode(self._mode):
             result_text = f"Error: search_code is not available in mode '{self._mode}'"
             state.on_tool_failure(tool_name, result_text)
             logger.warning(
@@ -2001,7 +2051,7 @@ class MetaCognitiveAgent:
         if self._tool_judge is not None:
             try:
                 judgement = await self._tool_judge.judge(
-                    task_description, tools_registry, mode="coding",
+                    task_description, tools_registry, mode="create",
                 )
                 if judgement.tool_needed and judgement.tool_name:
                     return judgement
@@ -2062,11 +2112,11 @@ class MetaCognitiveAgent:
         """read_file / run_command / search_code のファストパス実行"""
         logger.info("Tool fast path: %s(%s)", tool_name, tool_args)
 
-        # search_code は coding 専用 (modes=["coding"]) だが、この判定は
+        # search_code は create 専用 (modes=["create"]) だが、この判定は
         # ToolCallJudge の rule/assist 判定結果をそのまま実行するため
         # ToolDefinition.modes を経由しない。_execute_tool と同じ理由で
         # search_code のみ mode ゲートを追加する (write_file は対象外)。
-        if tool_name == "search_code" and not is_coding_mode(self._mode):
+        if tool_name == "search_code" and not is_create_mode(self._mode):
             result_text = f"Error: search_code is not available in mode '{self._mode}'"
             logger.warning(
                 "Tool fast path not allowed in mode %s: %s", self._mode, tool_name,
@@ -2403,10 +2453,19 @@ class MetaCognitiveAgent:
         """LLM がツールコール JSON を出力しなかった場合の自動リカバリー"""
         from backend.free.agent.tool_call_judge import _extract_file_path
 
+        # 「同じファイルに追記して」型はタスク文にパスが無く、直前ターンに
+        # しか無い。プラン生成側 (write fast path) は既に
+        # ``_referential_write_path`` で会話から解決しているのに、リカバリー
+        # 側はタスク文しか見ておらず非対称だった。その結果、書込みが 2 回とも
+        # 失敗して「実行されませんでした」で終わる (実インシデント
+        # 2026-08-08 ライブ監査 ターン6: ルータは local_write_intent へ
+        # 正しく振ったが、ここで毎回 no file path になっていた)。
+        # 裸のファイル名も同じく未確定として会話から解決する (2026-08-09)。
         file_path = _extract_file_path(task.description)
+        file_path = self._referential_write_path(file_path or None) or file_path
         if not file_path:
             logger.warning(
-                "Auto-recovery skipped: no file path in task: %s",
+                "Auto-recovery skipped: no file path in task or conversation: %s",
                 task.description[:80],
             )
             return None
@@ -2516,9 +2575,17 @@ class MetaCognitiveAgent:
         # 素材を渡すので重ねない。ラベル付きブロックを増やすほど小型モデルは
         # ラベルごと本文へ書き写す (実測 2026-07-27: 上書き依頼で
         # 「[現在の日付 (UTC基準)] …」「[直近の会話] …」がファイルに出た)。
-        if not existing_content:
+        #
+        # 例外は「先ほどの〜の内容で上書きして」型。書くべき本文は会話にあり、
+        # 既存内容はむしろ捨てたいものなので、既存内容だけを素材にすると
+        # 別物を再生成する (実インシデント 2026-08-10 ライブ監査: 断り書きが
+        # 書き込まれたファイルを「先ほどの JSON Schema の内容で上書きして」と
+        # 直させたら、draft-07 の別スキーマを作って書いた。同じ会話の次の
+        # ターンではコード生成が正しい方のスキーマを使えており、素材が
+        # 渡っていないことが原因だと確定した)。
+        if not existing_content or _PRIOR_CONTENT_REFERENCE_RE.search(user_prompt):
             user_prompt = self._inject_recent_conversation(
-                user_prompt, getattr(self, "_conversation", None),
+                user_prompt, getattr(self, "_conversation", None), ctx_size,
             )
         # 「今月」「今日」等の相対表現を取り違えないよう現在日付を前置する
         # (カレンダー/予定表など日付依存の成果物で年月・曜日がズレるのを防ぐ)。
@@ -2574,34 +2641,89 @@ class MetaCognitiveAgent:
             llm_client, messages, gen_max_tokens,
         )
 
-    #: 生成プロンプトに添える直近会話 (メッセージ数 / 1 件あたり文字数)。
-    #: 保存対象は直前に作った成果物であることが大半なので深い履歴は不要。
-    _CONTENT_CONTEXT_MESSAGES = 4
-    _CONTENT_CONTEXT_CHARS = 1500
+    #: 生成プロンプトに添える直近会話の上限。
+    #:
+    #: 以前は **メッセージ数 4 固定** だった ("保存対象は直前に作った成果物で
+    #: あることが大半なので深い履歴は不要" という前提)。その前提は
+    #: 「ここまでの試算を3行で」のように **会話をさかのぼって集計する依頼** で
+    #: 崩れる。実インシデント (2026-08-09 2 回目のライブ監査): 必要な値
+    #: (480人 / 3200円 / 1536000円) がすべて 4 メッセージ窓の外にあり、視界に
+    #: 残っていた直前のツール結果 ``3,025`` を 3 項目すべてに貼り、さらに
+    #: 3025×3025=9,150,625 まで計算してファイルに書いた。しかもユーザーには
+    #: 「書き込みました」と成功報告される。
+    #:
+    #: ``ctx_size=8192`` に対し実際の入力は ~443 トークンで予算は大量に
+    #: 余っていた。数で切らず予算で切る。
+    _CONTENT_CONTEXT_CHARS = 1500          # 1 メッセージあたりの上限
+    _CONTENT_CONTEXT_MAX_MESSAGES = 30     # 暴走防止 (WorkingMemory の窓と同じ)
+    _CONTENT_CONTEXT_CTX_FRACTION = 3      # ctx_size の 1/3 を会話素材へ
+    _CONTENT_CONTEXT_FALLBACK_CHARS = 6000  # ctx_size 不明時
+
+    @classmethod
+    def _content_context_budget_chars(cls, ctx_size: int) -> int:
+        """会話素材ブロックに使える文字数 (純粋関数)。
+
+        トークン予算を char へ概算換算する (日本語混在で ~2 char/token)。
+        """
+        if ctx_size <= 0:
+            return cls._CONTENT_CONTEXT_FALLBACK_CHARS
+        return max(
+            cls._CONTENT_CONTEXT_CHARS,
+            (ctx_size // cls._CONTENT_CONTEXT_CTX_FRACTION) * 2,
+        )
+
+    @staticmethod
+    def _strip_task_log_lines(text: str) -> str:
+        """会話素材から進捗ノート行を落とす (純粋関数)。
+
+        素材に「- [done] …」「Written N bytes to …」が混ざっていると、小型
+        モデルはその**書式ごと**真似て本文の代わりに進捗ノートを書く。生成物は
+        ``looks_like_task_log_echo`` が弾くので壊れたファイルは残らないが、
+        再生成しても同じ素材を見るので**書込みが 2 回とも失敗する**
+        (実インシデント 2026-08-10 ライブ監査: 「そのテストコードを
+        E:\\tmp\\test_overlap.py に保存して」が 2 回とも
+        ``- [done] …\\n    Written 1385 bytes to …`` を生成して中断)。
+        """
+        if not text or not looks_like_task_log_residue(text):
+            return text
+        return "\n".join(
+            ln for ln in text.split("\n") if not looks_like_task_log_residue(ln)
+        )
 
     @classmethod
     def _inject_recent_conversation(
         cls, user_prompt: str, conversation: list[dict] | None,
+        ctx_size: int = 0,
     ) -> str:
-        """直近会話を「素材」として user_prompt に前置する (純粋関数)。"""
+        """直近会話を「素材」として user_prompt に前置する (純粋関数)。
+
+        新しい発言から予算いっぱいまで遡って採る。予算に関係なく最低 1 件は
+        載せる (極小 ctx_size でも従来同様に直前の成果物は渡す)。
+        """
         if not conversation:
             return user_prompt
-        lines: list[str] = []
-        for msg in conversation[-cls._CONTENT_CONTEXT_MESSAGES:]:
+        budget = cls._content_context_budget_chars(ctx_size)
+        picked: list[str] = []
+        used = 0
+        for msg in reversed(conversation[-cls._CONTENT_CONTEXT_MAX_MESSAGES:]):
             if not isinstance(msg, dict):
                 continue
             role = msg.get("role")
             content = msg.get("content")
             if role not in ("user", "assistant") or not isinstance(content, str):
                 continue
-            text = content.strip()
+            text = cls._strip_task_log_lines(content).strip()
             if not text:
                 continue
             speaker = "ユーザー" if role == "user" else "あなた"
-            lines.append(f"{speaker}: {text[:cls._CONTENT_CONTEXT_CHARS]}")
-        if not lines:
+            line = f"{speaker}: {text[:cls._CONTENT_CONTEXT_CHARS]}"
+            if picked and used + len(line) > budget:
+                break
+            picked.append(line)
+            used += len(line)
+        if not picked:
             return user_prompt
-        block = "\n".join(lines)
+        block = "\n".join(reversed(picked))
         return (
             "[直近の会話] 依頼が「この文章」「さっきの案」等を指す場合、"
             "書くべき本文はこの会話の中にある。会話に無い内容を新たに創作しないこと。\n"
@@ -2875,6 +2997,15 @@ class MetaCognitiveAgent:
             )
 
     @staticmethod
+    def _write_failure_reason(result: str) -> str:
+        """書込み失敗の理由を短い日本語で返す (未知なら空文字列。純粋関数)。"""
+        m = _WRITE_REJECTION_RE.search(result or "")
+        if m is None:
+            return ""
+        reason = _WRITE_REJECTION_REASON_JA.get(m.group(1))
+        return f": {reason}" if reason else ""
+
+    @staticmethod
     def _build_final_response(
         tasks: list[TaskItem],
         context_parts: list[str],
@@ -2889,8 +3020,11 @@ class MetaCognitiveAgent:
             if task.status == "failed" and task_expects_write(task.description):
                 # write 期待タスクの失敗時、無関係なツール結果 (誤ってハイジャック
                 # された fetch_url の webpage 抽出テキスト等) をそのままユーザーへ
-                # 露出させない。
-                parts.append("    (書き込みが実行されませんでした)")
+                # 露出させない。ただし **自前の棄却理由コード** は安全に出せるので
+                # 添える (理由を伏せるとモデルが次のターンで作り話をする。
+                # _WRITE_REJECTION_REASON_JA のコメント参照)。
+                reason = MetaCognitiveAgent._write_failure_reason(task.result or "")
+                parts.append(f"    (書き込みが実行されませんでした{reason})")
             elif task.result:
                 parts.append(f"    {task.result[:500]}")
 

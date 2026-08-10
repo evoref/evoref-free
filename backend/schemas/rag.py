@@ -172,7 +172,7 @@ class SelfRagContentGateConfig(BaseModel):
 
     ``unified_search`` の Step 4 マージ直後に低価値 chunk を pruning し、
     quality judge / query expansion の候補数を縮小
-    する。coding mode を主対象とし (chat mode は近似重複除去のみ)、安価な
+    する。create mode を主対象とし (chat mode は近似重複除去のみ)、安価な
     ヒューリスティック (relevance floor / 近似重複除去 / コードシグナル) で
     大半を裁き、判断に迷う marginal band の prose チャンクだけアシストモデル
     で 1 回判定する。``assist_client=None`` / cap 超過 / error 時はヒューリス
@@ -182,20 +182,20 @@ class SelfRagContentGateConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # 機能の有効/無効。スキーマ既定は保守的に OFF (config.yaml.example 側で
-    # true を記載し、新規セットアップでは coding-mode 精査が有効になる)。
+    # true を記載し、新規セットアップでは create-mode 精査が有効になる)。
     enabled: bool = False
     # relevance スコア下限 (cosine スケール 0-1)。これ未満を pruning する。
     # unified_search は STM/LTM/カートリッジの cosine 類似度が基準。
     relevance_floor: float = Field(default=0.45, ge=0.0, le=1.0)
-    # [floor, floor+marginal_band) を「判断に迷う帯」とし、coding mode では
+    # [floor, floor+marginal_band) を「判断に迷う帯」とし、create mode では
     # この帯の prose チャンクのみ assist 判定に回す。
     marginal_band: float = Field(default=0.10, ge=0.0, le=0.5)
     # 最低保持件数。pruning がこれを下回ったら上位から補填し生成を枯渇させない。
     min_keep: int = Field(default=3, ge=1)
     # 近似重複除去の token-set Jaccard しきい値 (1.0 で重複除去を無効化)。
     dedup_jaccard: float = Field(default=0.85, ge=0.0, le=1.0)
-    # coding mode で marginal 帯のコードシグナル判定を有効化する。
-    coding_code_signal: bool = True
+    # create mode で marginal 帯のコードシグナル判定を有効化する。
+    create_code_signal: bool = True
     # marginal band の assist 救済を有効化する (false で純ヒューリスティック)。
     assist_enabled: bool = True
     # 1 セッションでの assist 発火上限 (0 以下で無制限)。
@@ -342,7 +342,7 @@ class RAGConfig(BaseModel):
 
 _DEFAULT_INSTRUCTIONS: dict[str, str] = {
     "chat": "Given a user question, retrieve relevant passages that answer the query",
-    "coding": "Given a code search query, retrieve relevant code snippets",
+    "create": "Given a code search query, retrieve relevant code snippets",
 }
 
 # 埋め込みクエリ整形テンプレート (Qwen3-Embedding 公式仕様)
@@ -372,7 +372,7 @@ class EmbeddingConfig(BaseModel):
     model_name: str = "Qwen/Qwen3-Embedding-0.6B"
     # Qwen3-Embedding 系の instruction-aware プレフィックス
     # ``is_query=True`` のときに ``query_template`` で整形する。``mode`` は
-    # ``chat`` / ``coding`` のいずれか。ドキュメント側 (``is_query=False``)
+    # ``chat`` / ``create`` のいずれか。ドキュメント側 (``is_query=False``)
     # は ``doc_template`` で整形する (既定では空のため prefix なし)。
     instructions: dict[str, str] = Field(
         default_factory=lambda: dict(_DEFAULT_INSTRUCTIONS),

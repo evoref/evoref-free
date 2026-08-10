@@ -50,7 +50,7 @@ def build_messages(
     task: SemanticFact,
     *,
     harness_view: HarnessFactView,
-    mode: str = "coding",
+    mode: str = "create",
     max_failures: int = 5,
     max_fewshot: int = 3,
     policy_overrides: dict[str, object] | None = None,
@@ -63,7 +63,7 @@ def build_messages(
             を user メッセージ本体として埋め込む。
         harness_view: SemMem への read-only View。failure_pattern / fewshot を
             引くために使う。
-        mode: ``"chat"`` / ``"coding"`` 等。fewshot subject 前方一致に使用。
+        mode: ``"chat"`` / ``"create"`` 等。fewshot subject 前方一致に使用。
         max_failures: 注入する failure_pattern の最大件数。
         max_fewshot: 注入する fewshot の最大件数。
         policy_overrides: policy パラメータの dict。``None`` または空 dict

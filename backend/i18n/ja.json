@@ -16,7 +16,7 @@
     "learning_cycle_running": "学習サイクルが既に実行中です",
     "learning_llm_unavailable": "LLM クライアントが利用できません",
     "optimize_invalid_level": "level は 'level1' または 'level2' のいずれかを指定してください",
-    "optimize_invalid_mode": "mode は 'coding' または 'chat' のいずれかを指定してください",
+    "optimize_invalid_mode": "mode は 'create' または 'chat' のいずれかを指定してください",
     "optimize_scheduler_not_initialized": "学習スケジューラーが初期化されていません",
     "optimize_already_running": "最適化が既に実行中です",
     "optimize_llm_unavailable": "LLM クライアントが利用できません",
@@ -197,7 +197,7 @@
     "edition_develop_unavailable": "--edition develop が指定されましたが、Develop モジュールが見つかりません。Free / Pro ソースでは Develop を選択できません。",
     "edition_requires_develop": "--edition オプションは --develop モードでのみ使用できます。",
     "isolate_data_requires_develop": "--isolate-data オプションは --develop との併用が必要です。",
-    "mode_coding_pro_only_warning": "--mode coding は Pro 専用です。Free 環境では chat モードにフォールバックします。",
+    "mode_create_pro_only_warning": "--mode create は Pro 専用です。Free 環境では chat モードにフォールバックします。",
     "mode_default_resolved": "Mode: {mode} (edition default)",
     "develop_banner": "DEVELOP MODE ON [{level}] — develop ログ有効",
     "learning_disabled_banner": "自己学習は無効化されています (--no-learning) — Level 0/1/2 / Pro アシスト注入は no-op、SemMem 読み込みは継続。",
@@ -412,6 +412,7 @@
     "terminal_exec_empty_command": "terminal_exec: command が空です",
     "tasks_all_done": "{count} 件のタスクをすべて完了しました。",
     "task_done": "タスクを完了しました。",
+    "files_written": "{paths} に書き込みました。",
     "tasks_partially_done": "{done} 件のタスクを完了し、{failed} 件が失敗しました。",
     "tasks_all_failed": "タスクの実行に失敗しました。"
   },
@@ -431,7 +432,8 @@
       "invalid_response": "推論サーバーから不正なレスポンスを受信しました。",
       "model_not_found": "モデルファイルが見つかりません: {path}",
       "process_crashed": "推論サーバーが異常終了しました。再起動を試みています。",
-      "request_rejected": "埋め込みサーバーがリクエストを拒否しました: {detail}。embedding.context_size の見直しが必要な場合があります。"
+      "request_rejected": "埋め込みサーバーがリクエストを拒否しました: {detail}。embedding.context_size の見直しが必要な場合があります。",
+      "assist_unavailable": "アシストモデルは現在停止しています（チャット中は起動しない設定）。この処理はアイドル時にまとめて実行されます。"
     },
     "fs": {
       "index_corrupted": "ベクトルインデックスが破損しています。復旧を試みます。",

@@ -2,7 +2,7 @@
 
 ``unified_search`` の Step 4 マージ直後に走り、低価値 chunk を pruning して
 quality judge / query expansion の候補数を縮小する。
-coding mode を主対象とし、安価なヒューリスティック (relevance floor /
+create mode を主対象とし、安価なヒューリスティック (relevance floor /
 近似重複除去 / コードシグナル) で大半を裁き、判断に迷う marginal band の
 prose チャンクだけアシストモデルで 1 回だけ関連性を判定する
 (``AssistJudgeUsageTracker`` で発火上限を抑制)。
@@ -21,7 +21,8 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from backend.free.core.session_mode import is_coding_mode
+from backend.free.core.session_mode import is_create_mode
+from backend.free.llm.assist_client import assist_ready
 from backend.free.rag.bm25_retriever import tokenize_ja
 from backend.log_config import get_logger
 
@@ -36,7 +37,7 @@ _TRUNCATE = 150
 # dedup の token-set Jaccard を計算する候補数の上限。超過時は O(n^2) を避け skip。
 _DEDUP_MAX = 50
 
-# コード片を含むかの安価判定パターン (coding mode)。
+# コード片を含むかの安価判定パターン (create mode)。
 _CODE_FENCE = re.compile(r"```")
 _INDENT_BLOCK = re.compile(r"(?m)^[ \t]{4,}\S")
 _CODE_KEYWORDS = re.compile(
@@ -97,7 +98,7 @@ class GateConfig:
     marginal_band: float = 0.10
     min_keep: int = 3
     dedup_jaccard: float = 0.85
-    coding_code_signal: bool = True
+    create_code_signal: bool = True
     assist_enabled: bool = True
     max_per_session: int = 5
     max_per_query: int = 1
@@ -112,7 +113,7 @@ class GateConfig:
             marginal_band=float(cfg.get("marginal_band", 0.10)),
             min_keep=int(cfg.get("min_keep", 3)),
             dedup_jaccard=float(cfg.get("dedup_jaccard", 0.85)),
-            coding_code_signal=bool(cfg.get("coding_code_signal", True)),
+            create_code_signal=bool(cfg.get("create_code_signal", True)),
             assist_enabled=bool(cfg.get("assist_enabled", True)),
             max_per_session=int(cfg.get("max_per_session", 5)),
             max_per_query=int(cfg.get("max_per_query", 1)),
@@ -184,12 +185,12 @@ class ChunkContentGate:
         self, query, merged, mode, assist_client, tracker, session_id,
     ) -> GateResult:
         cfg = self._cfg
-        if not is_coding_mode(mode):
+        if not is_create_mode(mode):
             # chat mode: 近似重複除去のみ (recall を退行させない)
             kept, dropped = self._dedup(merged)
             return GateResult(kept=kept, dropped_dedup=dropped)
 
-        # coding mode: フル精査
+        # create mode: フル精査
         floor = cfg.relevance_floor
         band_hi = floor + cfg.marginal_band
 
@@ -211,7 +212,7 @@ class ChunkContentGate:
         for i, (_cid, score, text) in enumerate(deduped):
             if score >= band_hi:
                 clear_idx.add(i)
-            elif cfg.coding_code_signal and _has_code_signal(text):
+            elif cfg.create_code_signal and _has_code_signal(text):
                 code_idx.add(i)
             else:
                 prose_idx.append(i)
@@ -275,9 +276,11 @@ class ChunkContentGate:
         cfg = self._cfg
         if not prose_idx:
             return set()
-        if not cfg.assist_enabled or assist_client is None:
+        if not cfg.assist_enabled or not assist_ready(
+            assist_client, "retrieval_chunk_gate",
+        ):
             result.assist_skipped_reason = (
-                "assist_unavailable" if assist_client is None else "assist_disabled"
+                "assist_disabled" if not cfg.assist_enabled else "assist_unavailable"
             )
             return set(prose_idx)
         if tracker is not None:

@@ -26,7 +26,7 @@ class ToolDefinition:
     func: Callable
     description: str
     parameters: dict[str, Any] = field(default_factory=dict)
-    modes: list[str] = field(default_factory=lambda: ["chat", "coding"])
+    modes: list[str] = field(default_factory=lambda: ["chat", "create"])
     hidden: bool = False
     #: 実行タイムアウト (秒)。None なら呼出側の既定
     #: (chat_constants.TOOL_EXECUTION_TIMEOUT_SEC) を使う。内部で LLM 生成を
@@ -58,7 +58,7 @@ class ToolsRegistry:
             func=func,
             description=description,
             parameters=parameters or {},
-            modes=modes or ["chat", "coding"],
+            modes=modes or ["chat", "create"],
             hidden=hidden,
             timeout_sec=timeout_sec,
         )
@@ -90,6 +90,16 @@ class ToolsRegistry:
         """
         tool_def = self._tools.get(name)
         return tool_def is not None and mode in tool_def.modes
+
+    def list_names(self) -> list[str]:
+        """登録済みツール名を登録順で返す。
+
+        ネイティブ tool calling の ``tools`` 配列構築 (``native_tools.
+        build_oai_tools``) が全ツールを走査するための公開口。``hidden`` は
+        ここでは除外しない — hidden は「プロンプトのツール一覧に出さない」印で
+        あって「使わせない」印ではないため、絞り込みは呼出側の責務。
+        """
+        return list(self._tools)
 
     def required_params(self, name: str) -> set[str]:
         """ツールの必須引数名。未登録なら空集合。

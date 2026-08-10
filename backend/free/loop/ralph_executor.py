@@ -79,7 +79,7 @@ class RalphExecutor:
         max_actions_per_task: 1 サイクルあたり実行する Action 最大数
         policy_provider: ``mode -> dict`` を返す callable。温度 / top_k /
             max_tokens を LLM 呼び出しに反映するために参照する。None 可。
-        mode: 通常 ``"coding"``。policy lookup の key。
+        mode: 通常 ``"create"``。policy lookup の key。
         purpose: ``AssistModelClient.generate(purpose=...)`` に渡すラベル。
     """
 
@@ -89,7 +89,7 @@ class RalphExecutor:
     quality_gates: Sequence[QualityGate] = ()
     max_actions_per_task: int = 10
     policy_provider: object | None = None  # Callable[[str], dict | None]
-    mode: str = "coding"
+    mode: str = "create"
     purpose: str = "ralph_loop"
 
     name: str = "ralph"
@@ -293,7 +293,7 @@ def _view_to_fact(view: "TaskFactView") -> SemanticFact:
         object_=object_json,
         type="task",
         scope=SemanticFact.make_project_scope(view.project_id),
-        mode_origin="coding",
+        mode_origin="create",
         confidence=1.0,
     )
 

@@ -24,10 +24,11 @@ from backend.free.agent.tools.builtin import (
     _check_path_traversal as check_builtin_path_traversal,
 )
 from backend.free.constants import READ_FILE_META_PREFIX
-from backend.free.core.session_mode import is_coding_mode
+from backend.free.core.session_mode import is_create_mode
 from backend.free.core.intent_vocab import (
     resolve_session_position_message,
     session_position_kind,
+    unverified_claim_numbers,
 )
 from backend.free.core.turn_text import append_to_last_user
 from backend.config import resolve_context_size_for_mode
@@ -78,6 +79,26 @@ _UNMEASURED_FACT_GUIDANCE = (
     "正直に伝え、ユーザーが自分で確認する方法を 1 つ示すこと。"
     "実行していないツールについて、実行した / 実行を試みたと述べない。"
     "推測値を断定形で述べない。"
+)
+
+#: 状態を変える依頼だったが、実行できるツールが 1 つも無かった場合の文言。
+#:
+#: ``_UNMEASURED_FACT_GUIDANCE`` (値を測っていない) とは別に要る。あちらは
+#: 「数値を断定するな」であって「やっていないことをやったと言うな」ではない。
+#:
+#: 実インシデント (2026-08-08 ライブ監査 ターン6): 「同じファイルに 3 行追記して、
+#: もう一度読み取って行数を報告して」に対し、ネイティブ層は
+#: ``echo "2 行目" >> ...`` を選んだが chat の読み取り専用ツールは python
+#: インタプリタしか許さないため正しく拒否された。その後 base は「追記しました」
+#: と述べ、**存在しない 4 行のファイル内容まで書き出した**。実ファイルは 1 行の
+#: まま無変更だった。
+_UNPERFORMED_ACTION_GUIDANCE = (
+    "\n\nこの依頼はファイルやシステムの状態を変える操作を含むが、"
+    "今回のターンではその操作を実行できるツールが無く、**何も実行していない**。"
+    "したがって「書き込みました」「追記しました」「作成しました」のように"
+    "完了を報告してはならない。変更後の内容を推測して提示してもならない。"
+    "実行できなかったことを率直に伝え、可能な代替 (クリエイトモードで行う / "
+    "完全なパスを指定して書き込みを依頼する 等) を 1 つ示すこと。"
 )
 
 # search_history が空振りした場合専用のグラウンディング文言。通常ツールの
@@ -140,6 +161,24 @@ _CALCULATE_RESULT_GUIDANCE = (
     "式に現れていない係数・比重・補正 (例:「比重 1.3 を掛けた」) を"
     "計算の根拠として述べないこと。実際に評価されたのは上記の式だけである。"
 )
+
+
+def _unexplained_numbers_note(numbers: tuple[str, ...]) -> str:
+    """式に含まれる「対話に無い数値」の開示を求める注記を作る (純粋関数)。
+
+    以前は式ごと no_tool へ格下げしていたが、格下げの落ち先は base の暗算で、
+    式が見えないぶん誤りに気づけなかった。式を残すかわりに、説明できない値を
+    名指しして出所を述べさせる (``ToolCallJudge._suppress_ungrounded_calculate``
+    のコメント参照)。
+    """
+    listed = "、".join(numbers)
+    return (
+        f"ただし式中の {listed} は、ユーザーの依頼文にもここまでの会話にも"
+        f"現れていない値である。この値が何を指すのか (単位・1件あたりの量・"
+        f"換算率など) を答えの中で明示すること。根拠を示せない場合は、"
+        f"その値を仮定として断ったうえで、正しい値をユーザーに確認すること。"
+    )
+
 
 # 引用したユーザー発言に一人称が含まれるかの判定 (帰属注記の出し分け用)。
 _FIRST_PERSON_RE = re.compile(r"(?:私|僕|俺|自分|わたし|ぼく)")
@@ -231,9 +270,13 @@ _FILE_CONTENT_RESULT_GUIDANCE = (
 
 
 #: 「そのまま / 一字一句 / 全文」でファイル内容の提示を求める言い回し。
+#: 「1 行ずつ / 行ごとに」は 2026-08-09 に追加。逐語提示の依頼なのにエコーへ
+#: 乗らず、モデルが 4 行を 1 行に連結して返した (単一改行は markdown で
+#: 段落結合されるため、UI 上も行構造が消える)。エコーはコードフェンスで
+#: 囲むので行構造が保たれる。
 _VERBATIM_ECHO_RE = re.compile(
-    r"そのまま|一字一句|原文|全文|加工せず|変えずに"
-    r"|verbatim|as[- ]is|exactly as|raw content",
+    r"そのまま|一字一句|原文|全文|加工せず|変えずに|[1１一]行ずつ|行ごと"
+    r"|verbatim|as[- ]is|exactly as|raw content|line by line",
     re.IGNORECASE,
 )
 #: 決定論エコーの上限。これを超える内容は会話に貼るより要約が適切なので
@@ -293,6 +336,33 @@ def strip_read_file_meta_line(tool_result: str) -> str:
     if not sep or not head.rstrip().endswith("]"):
         return tool_result
     return rest
+
+
+#: ``read_file`` メタ行の宣言済み行数・文字数。
+_READ_FILE_META_COUNTS_RE = re.compile(r"\| lines: (\d+) \| chars: (\d+)")
+
+
+def read_file_body_counts(tool_result: str) -> tuple[int, int]:
+    """``read_file`` 結果から「ファイル本文の」文字数・行数を返す (純粋関数)。
+
+    Returns:
+        ``(文字数, 行数)``。
+
+    メタ行 (``[file: ... | lines: N | chars: M]``) は ``read_file`` が本文に
+    対して決定論的に数えた値であり、**メタ行自身は本文ではない**。宣言値が
+    読めればそれを使い、読めないときだけメタ行を除いた本文を数える。
+
+    以前はツール結果の文字列全体 (メタ行込み) を数えて併記していたため、
+    1 行 10 文字のファイルに対して「2 行 / 74 文字」という封筒の寸法を渡して
+    いた。base はその値を忠実に採用するので、捏造ではなく**こちらが渡した
+    数値がそのまま誤答になっていた** (実インシデント 2026-08-08 ライブ監査
+    ターン13: 応答「行数は2行、文字数は74文字」= ツール結果全体の実寸)。
+    """
+    match = _READ_FILE_META_COUNTS_RE.search(tool_result.partition("\n")[0])
+    if match and tool_result.startswith(READ_FILE_META_PREFIX):
+        return int(match.group(2)), int(match.group(1))
+    body = strip_read_file_meta_line(tool_result)
+    return len(body), len(body.splitlines()) or 1
 
 
 async def _iterate_once(text: str) -> AsyncIterator[str]:
@@ -451,16 +521,16 @@ class DeliberativeAgent:
         # 学習信号にする (これが無いと agent ドメインは skipped_no_signal)。
         self._agent_tracer = agent_tracer
 
-        # コンテンツ生成用の max_tokens (coding 時は coding_model の実窓に合わせる)
+        # コンテンツ生成用の max_tokens (create 時は create_model の実窓に合わせる)
         ctx_size = resolve_context_size_for_mode(self.config, mode)
         self._content_max_tokens = max(ctx_size - CONTENT_SYSTEM_RESERVE, CONTENT_MAX_TOKENS_MIN)
 
     @staticmethod
     def _init_deliberative_state(mode: str) -> AgentState:
-        """`process` 用 AgentState を生成。`coding` モードは unified_diff を期待。"""
+        """`process` 用 AgentState を生成。`create` モードは unified_diff を期待。"""
         return AgentState(
             agent_layer="deliberative",
-            expected_format="unified_diff" if is_coding_mode(mode) else None,
+            expected_format="unified_diff" if is_create_mode(mode) else None,
         )
 
     @staticmethod
@@ -470,6 +540,7 @@ class DeliberativeAgent:
         tool_result_text: str,
         query: str | None = None,
         tool_args: dict | None = None,
+        unexplained_numbers: tuple[str, ...] = (),
     ) -> None:
         """最後の user メッセージにツール実行結果を追記する。
 
@@ -497,11 +568,12 @@ class DeliberativeAgent:
             # のファイルを read_file した直後に「196 文字」と回答)。決定論で
             # 数えた実測値を併記し、guidance 側でこの値を使わせる。長さは
             # 切り詰め前の全文で数える (ユーザーが訊いているのは抜粋ではなく
-            # ファイルそのもの)。
+            # ファイルそのもの) が、**メタ行は本文ではない**ので数に入れない
+            # (``read_file_body_counts`` の docstring 参照)。
+            chars, lines = read_file_body_counts(tool_result_text)
             truncated = (
                 f"{truncated}\n\n"
-                f"[この結果の実測値: {len(tool_result_text)} 文字 / "
-                f"{tool_result_text.count(chr(10)) + 1} 行]"
+                f"[この結果の実測値: {chars} 文字 / {lines} 行]"
             )
         # 話題再フォーカス: 弱いモデルは前ターンの話題に引きずられ、今回の質問
         # (例: ニュース) を取り違える (実機確認: 前ターンが天気だとニュース質問に
@@ -536,6 +608,8 @@ class DeliberativeAgent:
             grounding = _SEARCH_HISTORY_RESULT_GUIDANCE
         elif tool_name == "calculate":
             grounding = _CALCULATE_RESULT_GUIDANCE
+            if unexplained_numbers:
+                grounding += _unexplained_numbers_note(unexplained_numbers)
         elif tool_name in _COMMAND_TOOLS:
             grounding = _COMMAND_RESULT_GUIDANCE
         elif tool_name in _ENUMERATIVE_TOOLS:
@@ -578,6 +652,7 @@ class DeliberativeAgent:
     @staticmethod
     def _append_session_position_fact(
         messages: list[dict], conversation: list[dict] | None, query: str,
+        evicted_turns: int = 0,
     ) -> str | None:
         """「この会話で最初/最後に言ったこと」を決定論的に確定して注記する。
 
@@ -589,11 +664,29 @@ class DeliberativeAgent:
         最初に送ったメッセージは何でしたか？」に対し、12 番目の発言
         「円周率の小数点以下 10 桁を教えてください。」と誤答した)。
 
+        Args:
+            evicted_turns: ワーキングメモリから押し出したメッセージ数。
+                0 より大きい = 窓の先頭は **会話の先頭ではない** ため、
+                ``first`` の pin は行わない。ここを見ないと「窓で最初の発言」を
+                「会話で最初の発言」として ``確定事実`` の枠で断定してしまう
+                (実インシデント 2026-08-09 ライブ監査: 33 ターンの会話で
+                「一番最初に依頼したことは？」に窓の先頭 = 24 番目の質問を
+                回答。切り詰め注記は併記されていたのに、``確定事実`` の方が
+                強く効いて矛盾した回答になった)。``last`` は窓の末尾が常に
+                会話の末尾なので影響を受けない。
+
         Returns:
             注記した位置種別 ("first" / "last")。対象外なら None。
         """
         position = session_position_kind(query)
         if position is None:
+            return None
+        if position == "first" and evicted_turns > 0:
+            logger.info(
+                "Session position fact skipped: history truncated "
+                "(%d messages evicted); the window head is not the "
+                "conversation head", evicted_turns,
+            )
             return None
         target = resolve_session_position_message(conversation, query, position)
         if not target:
@@ -615,6 +708,50 @@ class DeliberativeAgent:
     def _append_unmeasured_fact_note(messages: list[dict]) -> None:
         """最後の user メッセージへ「実測できなかった」注記を追記する。"""
         append_to_last_user(messages, _UNMEASURED_FACT_GUIDANCE, separator="")
+
+    @staticmethod
+    def _append_unperformed_action_note(messages: list[dict]) -> None:
+        """最後の user メッセージへ「操作を実行できなかった」注記を追記する。"""
+        append_to_last_user(messages, _UNPERFORMED_ACTION_GUIDANCE, separator="")
+
+    @staticmethod
+    def _append_unverified_claim_note(
+        messages: list[dict], query: str, conversation: list[dict] | None,
+    ) -> bool:
+        """確認形で持ち込まれた「会話に無い数値」への注記を追記する。
+
+        Returns:
+            注記を足したか。
+        """
+        # 今回の発言自身は文脈に含めない。conversation には送信済みの user
+        # メッセージが入っており、そのまま数えるとユーザーが持ち込んだ数値が
+        # 「会話にある」ことになって注記が永久に出ない。
+        normalized_query = " ".join(query.split())
+        context = "\n".join(
+            str(m.get("content") or "")
+            for m in (conversation or [])
+            if isinstance(m, dict)
+            and m.get("role") in ("user", "assistant")
+            and " ".join(str(m.get("content") or "").split()) != normalized_query
+        )
+        numbers = unverified_claim_numbers(query, context)
+        if not numbers:
+            return False
+        listed = "、".join(numbers)
+        append_to_last_user(
+            messages,
+            f"\n\nこの発言に含まれる数値 {listed} は、ここまでの会話に一度も"
+            f"現れていない。会話に実際にある値を確認し、食い違うならその値を"
+            f"示して訂正すること。会話に無い値であれば、そのまま同意せず"
+            f"「その値は出ていない」と伝えて確認を求めること。",
+            separator="",
+        )
+        logger.info(
+            "Unverified claim numbers %s in a confirmation-form query; "
+            "asked the model to check the dialogue instead of agreeing",
+            list(numbers),
+        )
+        return True
 
     def _record_tool_call_outcome(
         self, query: str, judgement: ToolJudgement, success: bool, mode: str = "chat",
@@ -643,6 +780,7 @@ class DeliberativeAgent:
         on_step: StepCallback,
         tool_judge_task: "asyncio.Task | None" = None,
         session_id: str = "",
+        evicted_turns: int = 0,
     ) -> tuple[str | None, str | None, str | None, bool | None, str | None]:
         """ツール判定 → 実行 → messages へのツール結果注入を一括で行う。
 
@@ -668,7 +806,9 @@ class DeliberativeAgent:
         # した (実インシデント 2026-08-04 ライブ監査: 注記があるのに 04:55 の
         # 旧セッションのヒットを引いて誤答)。答えが決定論で出ている以上、
         # ツール結果は誤答の材料にしかならない。
-        if self._append_session_position_fact(messages, conversation, query):
+        if self._append_session_position_fact(
+            messages, conversation, query, evicted_turns,
+        ):
             if tool_judge_task is not None and not tool_judge_task.done():
                 tool_judge_task.cancel()
             return None, None, None, None, None
@@ -698,7 +838,15 @@ class DeliberativeAgent:
                 session_id=session_id,
             )
         if not (judgement.tool_needed and judgement.tool_name):
-            if getattr(self._tool_judge, "measurement_blocked", False):
+            # 確認形で持ち込まれた未検証の数値は、ツールが撃てないターンほど
+            # 危険。丸投げすると自分が計算した値を捨てて追認する
+            # (_append_unverified_claim_note の docstring 参照)。
+            self._append_unverified_claim_note(messages, query, conversation)
+            if getattr(self._tool_judge, "action_blocked", False):
+                # 状態を変えようとして撃てなかった。丸投げすると「追記しました」
+                # と完了を捏造する (_UNPERFORMED_ACTION_GUIDANCE 参照)。
+                self._append_unperformed_action_note(messages)
+            elif getattr(self._tool_judge, "measurement_blocked", False):
                 # 実測を試みたが撃てなかった。この状態で base に丸投げすると
                 # 測っていない値を断定する (_UNMEASURED_FACT_GUIDANCE 参照)。
                 self._append_unmeasured_fact_note(messages)
@@ -795,6 +943,7 @@ class DeliberativeAgent:
         self._append_tool_result_to_last_user(
             messages, judgement.tool_name, prompt_result_text, query=query,
             tool_args=judgement.tool_args,
+            unexplained_numbers=getattr(judgement, "unexplained_numbers", ()),
         )
         # 「実行できた」ではなく「役に立つ結果が出た」を成否とする (SSOT)。
         # 非ゼロ終了の run_command / 0 件の search_history を成功にすると、
@@ -823,6 +972,7 @@ class DeliberativeAgent:
         tool_capture: dict | None = None,
         tool_judge_task: "asyncio.Task | None" = None,
         session_id: str = "",
+        evicted_turns: int = 0,
     ) -> DeliberativeResponse | AsyncIterator[str]:
         """Deliberative 層で LLM 推論を実行
 
@@ -830,7 +980,7 @@ class DeliberativeAgent:
             query: ユーザーのクエリ
             messages: build_messages() で組み立て済みのメッセージ配列
             llm_client: LocalClient インスタンス
-            mode: 動作モード ('chat' | 'coding')
+            mode: 動作モード ('chat' | 'create')
             stream: ストリーミング応答を返すか
             conversation: 直近の会話履歴（ツール判定の精度向上用）
             max_tokens: 最大生成トークン数
@@ -855,6 +1005,7 @@ class DeliberativeAgent:
         ) = await self._judge_and_execute_tool(
             query, mode, conversation, messages, llm_client, state, on_step,
             tool_judge_task=tool_judge_task, session_id=session_id,
+            evicted_turns=evicted_turns,
         )
 
         # MDP トレース: tool 判定/実行を 1 step エピソードとして記録する。
@@ -1180,7 +1331,7 @@ class DeliberativeAgent:
 
         # ToolDefinition.modes は元々 get_descriptions_text() (LLM 向け説明文) の
         # フィルタ用にしか参照されておらず、実行時には無視されていた。ルールベース
-        # 判定 (tool_call_judge) が誤トリガーで coding 専用ツールを選んでも、ここで
+        # 判定 (tool_call_judge) が誤トリガーで create 専用ツールを選んでも、ここで
         # 弾かなければ chat モードでも実行されてしまう (search_code の CWD 全域
         # os.walk がイベントループを長時間ブロックした実インシデントの直接原因)。
         tool_def = self._tools_registry.get(tool_name)
@@ -1265,27 +1416,43 @@ class DeliberativeAgent:
             return f"(Content generation failed: {e})"
 
 
-#: `_generate_content` に添える直近会話の上限 (メッセージ数 / 1 件あたり文字数)。
-#: 保存対象は直前に作った成果物であることが大半なので、深い履歴は要らない。
-_CONTENT_CONTEXT_MESSAGES = 4
+#: `_generate_content` に添える直近会話の上限。
+#:
+#: 以前は **メッセージ数 4 固定** だった。「ここまでの試算を書いて」のように
+#: 会話をさかのぼって集計する依頼では必要な値が窓の外に落ち、視界に残った
+#: 直前のツール結果を全項目に貼る捏造が起きる (実インシデント 2026-08-09
+#: 2 回目のライブ監査。詳細は ``MetaCognitiveAgent._inject_recent_conversation``
+#: のコメント)。同じ固定窓がこちらにもあったので同じ方針で予算連動にする。
 _CONTENT_CONTEXT_CHARS = 2000
+_CONTENT_CONTEXT_MAX_MESSAGES = 30
+_CONTENT_CONTEXT_BUDGET_CHARS = 6000
 
 
-def _recent_context_messages(conversation: list[dict] | None) -> list[dict]:
-    """直近会話を content 生成用メッセージ列に整形する (純粋関数)。"""
+def _recent_context_messages(
+    conversation: list[dict] | None, budget_chars: int = _CONTENT_CONTEXT_BUDGET_CHARS,
+) -> list[dict]:
+    """直近会話を content 生成用メッセージ列に整形する (純粋関数)。
+
+    新しい発言から予算いっぱいまで遡る。予算に関係なく最低 1 件は載せる。
+    """
     if not conversation:
         return []
-    recent = [
-        m for m in conversation[-_CONTENT_CONTEXT_MESSAGES:]
-        if isinstance(m, dict)
-        and m.get("role") in ("user", "assistant")
-        and isinstance(m.get("content"), str)
-        and m["content"].strip()
-    ]
-    return [
-        {"role": m["role"], "content": m["content"][:_CONTENT_CONTEXT_CHARS]}
-        for m in recent
-    ]
+    picked: list[dict] = []
+    used = 0
+    for m in reversed(conversation[-_CONTENT_CONTEXT_MAX_MESSAGES:]):
+        if (
+            not isinstance(m, dict)
+            or m.get("role") not in ("user", "assistant")
+            or not isinstance(m.get("content"), str)
+            or not m["content"].strip()
+        ):
+            continue
+        content = m["content"][:_CONTENT_CONTEXT_CHARS]
+        if picked and used + len(content) > budget_chars:
+            break
+        picked.append({"role": m["role"], "content": content})
+        used += len(content)
+    return list(reversed(picked))
 
 
 def _truncate_tool_result(text: str, max_chars: int) -> str:

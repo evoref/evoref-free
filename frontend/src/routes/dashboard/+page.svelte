@@ -33,7 +33,7 @@
 
 	let components: ProComponentMap | null = $state(null);
 	let learningData: DashboardLearningData = $state({ ...DEFAULT_LEARNING_DATA });
-	// LoRA は chat / coding を上下段で並べて表示する (以前はセレクトで切り替えて
+	// LoRA は chat / create を上下段で並べて表示する (以前はセレクトで切り替えて
 	// いたが、既定の level2_adapter_partition="model" ではアダプタがモード非依存で
 	// 切り替えても内容が変わらず、動作していないように見えていた)。
 	let loraModes = $state<DashboardLoraModes>(emptyLoraModes());
@@ -110,7 +110,7 @@
 		try {
 			// partition="model" ではアダプタがモード非依存なので両段が同じ実体を指す。
 			// 片方だけ更新すると上下段で表示がずれるため、両モードを取り直す。
-			await Promise.all([reloadMode('chat'), reloadMode('coding')]);
+			await Promise.all([reloadMode('chat'), reloadMode('create')]);
 		} catch {
 			// silent — 既存挙動踏襲 (次回の定期リフレッシュで再試行される)
 		}

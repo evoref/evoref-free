@@ -1,7 +1,7 @@
 """CLI split レイアウト: textual ベースの TUI
 
 textual App による画面分割アーキテクチャ。
-対話モード（evoref code / evoref --mode chat）でのみ使用し、
+対話モード（evoref create / evoref --mode chat）でのみ使用し、
 非対話モードでは従来の逐次出力を維持する。
 
 RichLog で出力エリアの表示と Rich ネイティブレンダリング（Syntax, Markdown 等）

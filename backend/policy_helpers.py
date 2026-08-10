@@ -42,7 +42,7 @@ def get_policy_value(
         domain: ポリシードメイン ("search" / "memory" / "learning" / ...)。
         key: パラメータ名。
         default: 取得失敗時のフォールバック (この型が戻り値型を決める)。
-        mode: "chat" / "coding" など。``None`` のとき ``policy.get`` の既定
+        mode: "chat" / "create" など。``None`` のとき ``policy.get`` の既定
             (= "chat") を使う (mode 引数を持たない learning 等のドメイン向け)。
         coerce_type: 取得値に適用する型変換 (例: ``float``)。``None`` なら無変換。
 

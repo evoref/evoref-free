@@ -47,6 +47,7 @@ from backend.free.core.stream_pipeline import StreamPipeline
 from backend.free.llm.local_client import LocalClient
 from backend.free.llm.editor_filename import derive_editor_filename_stem
 from backend.free.generation.document_gate import is_document_format
+from backend.free.generation.key_coherence import find_unmatched_dict_keys
 from backend.free.generation.orchestrator import LongFormOrchestrator
 from backend.free.generation.validators import remove_code_fences
 from backend.i18n_helper import msg
@@ -712,9 +713,43 @@ def _meta_cognitive_body_text(resp) -> str:
         return msg("agent.tasks_all_failed")
     if failed:
         return msg("agent.tasks_partially_done", done=done, failed=failed)
+    # 書込みで完結したターンは「何を書いたか」を出す。「タスクを完了しました。」
+    # だけだと、ユーザーは書き込まれた先を確認する手掛かりが本文に無い
+    # (2026-08-09 ライブ監査で指摘)。
+    written = _written_paths(resp.tasks)
+    if written:
+        return msg("agent.files_written", paths="、".join(written))
     if done == 1:
         return msg("agent.task_done")
     return msg("agent.tasks_all_done", count=done)
+
+
+#: ``write_file`` の戻り値 (``Written 158 bytes to E:\tmp\a.txt``) から書込み先を拾う。
+_WRITTEN_PATH_RE = re.compile(r"Written\s+\d+\s+bytes?\s+to\s+(.+?)\s*$", re.MULTILINE)
+
+#: task_result ステップ見出しに載せるタスク記述の最大長。
+_STEP_DESCRIPTION_MAX_CHARS = 48
+
+
+def _truncate_step_description(description: str) -> str:
+    """ステップ見出し用にタスク記述を短く畳む (純粋関数)。"""
+    text = " ".join(str(description or "").split())
+    if len(text) <= _STEP_DESCRIPTION_MAX_CHARS:
+        return text
+    return text[:_STEP_DESCRIPTION_MAX_CHARS] + "…"
+
+
+def _written_paths(tasks) -> list[str]:
+    """完了タスクの結果から書込み先パスを重複なく取り出す (純粋関数)。"""
+    paths: list[str] = []
+    for task in tasks or []:
+        if getattr(task, "status", None) != "done":
+            continue
+        for match in _WRITTEN_PATH_RE.finditer(str(getattr(task, "result", "") or "")):
+            path = match.group(1).strip()
+            if path and path not in paths:
+                paths.append(path)
+    return paths
 
 
 async def _emit_meta_cognitive_result_frames(resp) -> AsyncIterator[str]:
@@ -734,9 +769,15 @@ async def _emit_meta_cognitive_result_frames(resp) -> AsyncIterator[str]:
             len(resp.tasks),
         )
         for task in resp.tasks:
-            detail = task.description
+            # タスク記述はプラン生成が失敗すると **生のユーザー発言そのもの**
+            # になる。そのまま出すと UI の折りたたみ見出しが依頼文まるごとに
+            # なり、実際の結果が読めない (2026-08-09 ライブ監査:
+            # 「E:\tmp に inventory_notes.txt というファイルを作って、ここまでの
+            # 試算結果を3行で書いてください。 Written 158 bytes to ...」)。
+            # 見出しは短く保ち、結果を主役にする。
+            detail = _truncate_step_description(task.description)
             if task.result:
-                detail += f" {task.result[:500]}"
+                detail += f" — {task.result[:500]}"
             logger.debug(
                 "MetaCognitive task_result: status=%s, detail=%s",
                 task.status, detail[:120],
@@ -835,7 +876,10 @@ async def stream_meta_cognitive(
 
         try:
             yield sse.agent_layer("meta_cognitive")
-            yield sse.step({"type": "plan", "detail": "Generating task plan...", "status": "running"})
+            # ``MetaCognitiveAgent._plan`` が同じ ``type="plan"`` を最初に
+            # emit する。ここでも出すと UI のステップ一覧に英語と日本語の
+            # plan が 2 行並ぶ (2026-08-09 ライブ監査で確認)。エージェント側の
+            # 1 本に任せる。
 
             if timer:
                 timer.start("llm_total_ms")
@@ -1169,7 +1213,7 @@ async def _finalize_long_form_stream(
     受けて書き込んだ各ファイルの ``[{"path", "heading", "idx"}]``。
 
     ``output_target == "editor"`` の場合はディスク書込みをスキップし、
-    `sse.editor_code` で生成本文をエディタペインへ送出する (coding モードの
+    `sse.editor_code` で生成本文をエディタペインへ送出する (create モードの
     ``_dispatch_meta_cognitive`` 経路の挙動に揃える)。
     """
     if timer:
@@ -1181,7 +1225,7 @@ async def _finalize_long_form_stream(
         session_id, file_output_mode, long_form_mode.value, output_target,
     )
     metrics = getattr(orchestrator, "last_metrics", {})
-    # coding の editor/file 出力は orchestrator が検証・修正した assembled
+    # create の editor/file 出力は orchestrator が検証・修正した assembled
     # (last_code_output) を配信する。生ストリーム (full_response) は review の
     # revise トークンが二重追記されるため、コード出力の確定本文には使わない。
     is_code = getattr(orchestrator, "last_content_type", None) == "code"
@@ -1320,7 +1364,7 @@ async def stream_long_form(
 ):
     """長文生成の SSE ストリーミング（long_form_* ステップフレーム付き）
 
-    ``output_target`` は coding モード時の出力先 (``"file"`` / ``"editor"`` /
+    ``output_target`` は create モード時の出力先 (``"file"`` / ``"editor"`` /
     ``"chat"``)。``"editor"`` の場合はトークンの逐次送出を抑止して終端で
     `sse.editor_code` を送る (`_dispatch_meta_cognitive` 経路の挙動に揃える)。
     """
@@ -1595,7 +1639,7 @@ async def sync_long_form(
             timer.stop("llm_total_ms")
 
         metrics = getattr(orchestrator, "last_metrics", {})
-        # coding の editor/file 出力は検証・修正済み assembled (last_code_output)
+        # create の editor/file 出力は検証・修正済み assembled (last_code_output)
         # を配信する (生ストリームの revise 二重追記を解消)。
         is_code = getattr(orchestrator, "last_content_type", None) == "code"
         code_output = getattr(orchestrator, "last_code_output", None)
@@ -1730,6 +1774,15 @@ async def _stream_filtered_token_pipeline(
     ])
     aiter = token_stream.__aiter__()
     pending: asyncio.Task[str] | None = None
+    # keepalive を「LLM からトークンが来ない時間」ではなく「SSE フレームを
+    # 送っていない時間」で測る。フィルタはトークンをバッファするので、LLM が
+    # 途切れなく生成していてもフロントには何も届かない時間が生じる
+    # (実インシデント 2026-08-07 ライブ監査: E:\tmp のファイル一覧が 1 行の長い
+    # 列挙になり、バックエンドは全文を生成し終えていたのにフロントが 60 秒の
+    # chunk timeout で切って `Error: stream_timeout` を出し、応答が失われた)。
+    # 長文経路 (_stream_long_form) は既にこの測り方をしており、こちらだけが
+    # トークン到着ベースだった。
+    last_frame_at = time.monotonic()
     while True:
         if _cancel_flags.get(session_id):
             if pending is not None and not pending.done():
@@ -1744,6 +1797,7 @@ async def _stream_filtered_token_pipeline(
         )
         if pending not in done:
             yield sse.keepalive()
+            last_frame_at = time.monotonic()
             continue
         try:
             token = pending.result()
@@ -1763,6 +1817,12 @@ async def _stream_filtered_token_pipeline(
                 state.first_token_recorded = True
             state.emitted_chars += len(filtered)
             yield sse.token(filtered)
+            last_frame_at = time.monotonic()
+        elif time.monotonic() - last_frame_at >= DEFAULT_KEEPALIVE_INTERVAL_SEC:
+            # フィルタがバッファしている間もフロントの chunk timeout を防ぐ
+            # (上の last_frame_at のコメント参照)。
+            yield sse.keepalive()
+            last_frame_at = time.monotonic()
 
     remaining = pipeline.flush()
     if remaining:
@@ -1921,6 +1981,7 @@ async def stream_deliberative(
     rag_top1_score: float | None = None,
     tool_judge_task: "asyncio.Task | None" = None,
     escalated_from: str | None = None,
+    evicted_turns: int = 0,
 ):
     """Deliberative 層の SSE ストリーミング
 
@@ -1974,6 +2035,7 @@ async def stream_deliberative(
                 tool_capture=tool_capture,
                 tool_judge_task=tool_judge_task,
                 session_id=session_id,
+                evicted_turns=evicted_turns,
             ))
             # process() はトークンを返す前にツール判定と実行を完了させる。
             # ここを素の await にすると、その間 SSE フレームが 1 つも流れず、
@@ -2083,6 +2145,7 @@ async def sync_deliberative(
     rag_top1_score: float | None = None,
     tool_judge_task: "asyncio.Task | None" = None,
     escalated_from: str | None = None,  # noqa: ARG001
+    evicted_turns: int = 0,
 ) -> ChatResponse:
     """Deliberative 層の非ストリーミング応答 (escalated_from は API 一貫性用、未使用)"""
     logger.debug("Sync deliberative: session=%s, messages=%d", session_id, len(messages))
@@ -2105,6 +2168,7 @@ async def sync_deliberative(
             generation_params=generation_params,
             tool_judge_task=tool_judge_task,
             session_id=session_id,
+            evicted_turns=evicted_turns,
         )
 
         if timer:
@@ -2330,7 +2394,7 @@ async def sync_reactive_light(
 
 
 # ---------------------------------------------------------------------------
-# Staged コーディング (仕様書→コード→テスト) ストリーミング
+# Staged クリエイト (仕様書→コード→テスト) ストリーミング
 # ---------------------------------------------------------------------------
 
 _STAGE_LABELS = {"spec": "仕様書", "code": "コーディング", "test": "テスト"}
@@ -2412,12 +2476,23 @@ def _translate_loop_event(
         })
     if evt.event == "gate_result":
         ok = bool(data.get("ok"))
+        # ゲートは工程タスク単位で走るため、同一工程に複数ユニットがあると
+        # label だけでは全く同じ行が並ぶ (実測 2026-08-07 ライブ監査: test 工程が
+        # 2 ユニットで「テスト: 起動可能性チェック合格 ...」が 2 行、どちらが
+        # どのユニットか判別できなかった)。他イベントと同じ [i/N] を付ける。
+        if task_indices is not None and tid in task_indices:
+            idx = task_indices[tid]
+        else:
+            idx = getattr(evt, "iteration", 0) or 0
+        prefix = f"[{idx}/{total_tasks}] " if total_tasks else ""
         # import スモークゲートは「import 成功＋エントリ静的整合＋OS 互換」までを
         # 静的に検証するもので、プログラムを実行したわけではない。「pass」と書くと
         # 実行検証済みと誤解されるため、起動可能性チェック (静的) と明示する。
         detail = (
-            f"{label}: 起動可能性チェック合格 (import/エントリ/整合・静的検証/未実行)"
-            if ok else f"{label}: 起動可能性チェック失敗 (起動不能の可能性)"
+            f"{prefix}{label}: 起動可能性チェック合格 "
+            "(import/エントリ/整合・静的検証/未実行)"
+            if ok else
+            f"{prefix}{label}: 起動可能性チェック失敗 (起動不能の可能性)"
         )
         return sse.step({
             "type": "task_result",
@@ -2433,6 +2508,11 @@ def _translate_loop_event(
 # (state.loop_driver / RalphExecutor) が stage 付きタスクを誤実行する、という不具合に
 # なるため、永続プロジェクトストアからは完全に切り離す。
 _STAGED_PROJECT_ID = "staged"
+
+#: staged クリエイト 1 リクエストの総時間上限の出荷既定
+#: (:class:`backend.schemas.create.StagedCreateConfig` と一致させる)。
+#: 打ち切りメッセージで「設定値が既定より低い」ことを示すために参照する。
+_STAGED_TOTAL_TIMEOUT_DEFAULT_SEC = 2400.0
 
 
 def _staged_output_dir(query: str) -> str:
@@ -2571,7 +2651,7 @@ async def _staged_import_smoke(
     return [str(e) for e in (getattr(res, "errors", None) or [])]
 
 
-async def stream_staged_coding(
+async def stream_staged_create(
     *,
     query: str,
     session_id: str,
@@ -2609,9 +2689,9 @@ async def stream_staged_coding(
     from backend.free.loop.events import LoopEventBus
     from backend.free.loop.staged import (
         WorkspaceManager,
-        synthesize_coding_task_graph,
+        synthesize_create_task_graph,
     )
-    from backend.free.loop.staged.executor import StagedCodingExecutor
+    from backend.free.loop.staged.executor import StagedCreateExecutor
     from backend.free.loop.staged.test_runner import StagedTestRunner
     from backend.free.generation.api_contract import check_api_contract
     from backend.free.generation.smoke_validator import (
@@ -2625,14 +2705,14 @@ async def stream_staged_coding(
     from backend.free.memory.views.loop import LoopFactView
 
     t_start = time.monotonic()
-    staged_cfg = (cfg.get("coding", {}) or {}).get("staged", {}) or {}
+    staged_cfg = (cfg.get("create", {}) or {}).get("staged", {}) or {}
     # editor_route は search_error_wrapper (chat.py) が冒頭で 1 度送出するため、
     # ここでは送らない (二重送出回避)。
 
     # リクエスト毎に隔離されたワークスペース + SemMem ストアを使う (継続ターンの
     # stale ファクト混入・自律ループとの干渉を構造的に排除する)。
     run_id = uuid4().hex[:12]
-    workspace_root = get_path_resolver().resolve_local("coding_workspace_dir")
+    workspace_root = get_path_resolver().resolve_local("create_workspace_dir")
     ws = WorkspaceManager.open_or_create(
         workspace_root, workspace_id=run_id, session_id=session_id,
         project_id=_STAGED_PROJECT_ID, goal=query, debug_logger=state.debug_logger,
@@ -2648,7 +2728,7 @@ async def stream_staged_coding(
         "detail": "タスクグラフ (仕様書/コード/テスト) を合成中…",
         "status": "running",
     })
-    facts = await synthesize_coding_task_graph(
+    facts = await synthesize_create_task_graph(
         request=query, project_id=_STAGED_PROJECT_ID,
         assist_client=state.assist_client,
         include_tests=(
@@ -2658,7 +2738,7 @@ async def stream_staged_coding(
         debug_logger=state.debug_logger,
     )
     if not facts:
-        logger.info("staged coding: empty task graph; falling back to longform")
+        logger.info("staged create: empty task graph; falling back to longform")
         async for frame in fallback_factory():
             yield frame
         return
@@ -2672,7 +2752,7 @@ async def stream_staged_coding(
                 status="open", depends_on=tv.depends_on,
             )
         except Exception as exc:
-            logger.warning("staged coding: failed to register task: %s", exc)
+            logger.warning("staged create: failed to register task: %s", exc)
     yield sse.step({
         "type": "long_form_plan",
         "detail": f"{len(facts)} タスクを生成 (仕様書→コード→テスト)",
@@ -2732,7 +2812,7 @@ async def stream_staged_coding(
     from backend.free.generation.spec_conformance import check_spec_conformance
     from backend.free.generation.test_value_repair import repair_literal_assertions
 
-    executor = StagedCodingExecutor(
+    executor = StagedCreateExecutor(
         workspace=ws, assist_client=state.assist_client, codegen=codegen,
         smoke_runner=(_smoke if staged_cfg.get("smoke_gate_enabled", True) else None),
         test_runner=test_runner,
@@ -2758,7 +2838,9 @@ async def stream_staged_coding(
     )
     artifact_hook = make_loop_artifact_hook(_staged_view)
     max_iter = int(staged_cfg.get("max_iterations", 60))
-    staged_total_timeout_sec = float(staged_cfg.get("total_timeout_sec", 2400.0))
+    staged_total_timeout_sec = float(
+        staged_cfg.get("total_timeout_sec", _STAGED_TOTAL_TIMEOUT_DEFAULT_SEC),
+    )
     driver = LoopDriver(
         view_provider=_staged_view,
         executor=executor,
@@ -2776,7 +2858,7 @@ async def stream_staged_coding(
     task_indices: dict[str, int] = {}  # task_id 初出順の表示番号 (リトライで再利用)
     queue = event_bus.subscribe()
     run_task = asyncio.create_task(
-        driver.run(_STAGED_PROJECT_ID), name="staged_coding.run",
+        driver.run(_STAGED_PROJECT_ID), name="staged_create.run",
     )
     last_ka = time.monotonic()
     timed_out = False
@@ -2789,7 +2871,7 @@ async def stream_staged_coding(
             # staged 側にも持たせる。
             if time.monotonic() - t_start >= staged_total_timeout_sec:
                 logger.warning(
-                    "staged coding: hard wall-time cutoff reached (%.0fs); "
+                    "staged create: hard wall-time cutoff reached (%.0fs); "
                     "cancelling run_task",
                     staged_total_timeout_sec,
                 )
@@ -2819,14 +2901,39 @@ async def stream_staged_coding(
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            logger.warning("staged coding run task failed: %s", exc)
+            logger.warning("staged create run task failed: %s", exc)
 
     if timed_out:
+        # 打ち切りは「設定値が作業量に対して小さい」ことがほとんどなので、
+        # どこを変えればよいかまで書く。値だけ出しても利用者は次に何をすれば
+        # よいか分からない (実インシデント 2026-08-07 ライブ監査: config.yaml が
+        # 出荷既定の 2400 より低い 1800 を明示していたため 5 本中 3 本が打ち切られ、
+        # メッセージからはその関係が読み取れなかった)。
+        progress = ws.read_manifest().get("progress") or {}
+        remaining = max(
+            0,
+            int(progress.get("tasks_total") or 0)
+            - int(progress.get("tasks_done") or 0)
+            - int(progress.get("tasks_failed") or 0),
+        )
+        suggested = max(
+            _STAGED_TOTAL_TIMEOUT_DEFAULT_SEC,
+            round(staged_total_timeout_sec * 1.5 / 300.0) * 300,
+        )
+        hint = (
+            f"未完了 {remaining} ユニット。"
+            if remaining else ""
+        ) + (
+            f"時間が足りない場合は config.yaml の "
+            f"create.staged.total_timeout_sec を {suggested:.0f} 以上へ"
+            f"引き上げてください (出荷既定 "
+            f"{_STAGED_TOTAL_TIMEOUT_DEFAULT_SEC:.0f})。"
+        )
         yield sse.step({
             "type": "task_result",
             "detail": (
                 f"⏱ タイムアウト ({staged_total_timeout_sec:.0f}秒) のため打ち切りました。"
-                f"生成済みの成果物のみ配信します。"
+                f"生成済みの成果物のみ配信します。{hint}"
             ),
             "status": "failed",
         })
@@ -2969,6 +3076,30 @@ async def _finalize_staged_stream(
             "status": "failed",
         })
 
+    # モジュール間の辞書キー不一致 (advisory)。import スモークは「起動できるか」
+    # しか見ないため、片方が作ったキーをもう片方が別名で読む欠陥は素通りし、
+    # 実行して初めて KeyError になる (実インシデント 2026-08-07 ライブ監査:
+    # csv_processor が 'mean' を返すのに main.py が stats['average'] を読み、
+    # 「起動可能性チェック合格」で配信された)。
+    # プロジェクト外由来の辞書 (JSON 入力等) のキーは当然「作られて」いないので
+    # **警告に留め、validation_errors には畳み込まない** (正常な生成を
+    # 学習上の失敗にしないため)。
+    unmatched_keys = find_unmatched_dict_keys(
+        {p: c for p, c in code_map.items() if p.endswith(".py")},
+    )
+    if unmatched_keys:
+        shown = "、".join(f"'{k}'" for k in unmatched_keys[:5])
+        more_k = (
+            f" ほか{len(unmatched_keys) - 5}件"
+            if len(unmatched_keys) > 5 else ""
+        )
+        yield sse.step({
+            "type": "task_result",
+            "detail": f"⚠ 参照のみで生成されていない辞書キー: {shown}{more_k} "
+                      f"— 実行時 KeyError の可能性 (外部入力由来なら無視可)",
+            "status": "failed",
+        })
+
     assembled = "\n\n".join(
         f"# === {p} ===\n{c}" for p, c in code_map.items()
     )
@@ -2987,7 +3118,7 @@ async def _finalize_staged_stream(
     try:
         _staged_rag_used, _staged_rag_top1 = rag_signals_from_chunks(prefetched_rag)
         record_long_form_response(
-            state, assembled, messages, session_id, query, "coding",
+            state, assembled, messages, session_id, query, "create",
             _estimate_tokens(assembled), staged_metrics, private=private,
             rag_used=_staged_rag_used, rag_top1_score=_staged_rag_top1,
         )

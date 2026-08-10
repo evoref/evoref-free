@@ -8,9 +8,9 @@
 1. :class:`~backend.free.memory.extractors.chat.ChatExtractor`
    → ``global`` スコープに ``personal_fact`` / ``world_fact`` / ``preference`` /
    ``emotion`` / ``opinion`` を追記
-2. :class:`~backend.free.memory.extractors.coding.CodingExtractor`
+2. :class:`~backend.free.memory.extractors.create.CreateExtractor`
    → ``project:<id>`` スコープに ``project`` / ``decision`` / ``commitment`` /
-   ``coding_task`` / ``coding`` を追記
+   ``create_task`` / ``create`` を追記
 3. :class:`~backend.free.memory.extractors.mdp_trace.MDPTraceExtractor`
    → ``project:<id>`` スコープに ``failure_pattern`` / ``decision`` を追記
    (config で disable 可)
@@ -52,7 +52,7 @@ def persist_facts(
     Args:
         store: 書き込み先ストア。
         result: ``BaseExtractor.extract`` の戻り値。
-        label: ログ用ラベル (``"chat"`` / ``"coding"`` / ``"mdp_trace"`` 等)。
+        label: ログ用ラベル (``"chat"`` / ``"create"`` / ``"mdp_trace"`` 等)。
 
     Returns:
         実際に書き込まれたファクト数。
@@ -82,7 +82,7 @@ def _drop_facts_with_existing_subject(
     (エピソード毎に一意) で生成する。プロセス再起動で抽出器の in-memory
     ``_processed_episode_ids`` が失われると同一エピソードが再抽出されるが、
     既存 subject を弾くことで新しい ``fact_id`` での重複追記を防ぐ (store が
-    dedup の永続状態を兼ねる)。``chat`` / ``coding`` 抽出器は同一 subject の再
+    dedup の永続状態を兼ねる)。``chat`` / ``create`` 抽出器は同一 subject の再
     アサートで内容を更新する設計のため、この dedup は MDP 経路にのみ適用する。
 
     ``failure_pattern`` (loop 所有) は呼出側で事前に分離され
@@ -182,14 +182,14 @@ def extract_semantic_facts(
     mdp_trace_extractor: "MDPTraceExtractor | None" = None,
     mdp_trace_extractor_factory: Callable[[], "MDPTraceExtractor"] | None = None,
 ) -> tuple[int, "MDPTraceExtractor | None"]:
-    """Step 8: ChatExtractor / CodingExtractor / MDPTraceExtractor を順次実行する。
+    """Step 8: ChatExtractor / CreateExtractor / MDPTraceExtractor を順次実行する。
 
     Guards:
 
     - ``memory.facts.enable_extraction = False`` → no-op (``0``)
     - ``store_provider`` が ``None`` → no-op (``0``)
     - ``global`` store 取得失敗 → Chat skip
-    - ``current_project_id`` 未設定 / project store 取得失敗 → Coding / MDP skip
+    - ``current_project_id`` 未設定 / project store 取得失敗 → Create / MDP skip
 
     Args:
         notes: 対象ノート群 (通常は ``ShortTermMemory.notes.values()`` のリスト)。
@@ -219,7 +219,7 @@ def extract_semantic_facts(
 
     from backend.free.memory.extractors import (
         ChatExtractor,
-        CodingExtractor,
+        CreateExtractor,
         ExtractionContext,
         MDPTraceExtractor,
     )
@@ -230,7 +230,7 @@ def extract_semantic_facts(
         agent_trace_dir=agent_trace_dir,
         max_per_session={
             "chat": int(max_per_session_cfg.get("chat", 10)),
-            "coding": int(max_per_session_cfg.get("coding", 5)),
+            "create": int(max_per_session_cfg.get("create", 5)),
         },
         max_pinned_per_session=int(
             cfg_facts.get("extraction_max_pinned_per_session", -1),
@@ -250,7 +250,7 @@ def extract_semantic_facts(
         chat_result = ChatExtractor().extract(notes, ctx)
         total_extracted += persist_facts(global_store, chat_result, "chat")
 
-    # ── 2. CodingExtractor → project ──
+    # ── 2. CreateExtractor → project ──
     project_store = None
     if current_project_id:
         try:
@@ -259,8 +259,8 @@ def extract_semantic_facts(
             logger.warning("Step 8: failed to obtain project store: %s", exc)
 
     if project_store is not None:
-        coding_result = CodingExtractor().extract(notes, ctx)
-        total_extracted += persist_facts(project_store, coding_result, "coding")
+        create_result = CreateExtractor().extract(notes, ctx)
+        total_extracted += persist_facts(project_store, create_result, "create")
 
     # ── 3. MDPTraceExtractor → project ──
     if (

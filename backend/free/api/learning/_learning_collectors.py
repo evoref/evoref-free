@@ -260,5 +260,5 @@ def map_experience_by_mode(mode_data: dict | None) -> ExperienceByModeModel:
         return ExperienceByModeModel()
     return ExperienceByModeModel(
         chat=int(mode_data.get("chat", 0) or 0),
-        coding=int(mode_data.get("coding", 0) or 0),
+        create=int(mode_data.get("create", 0) or 0),
     )

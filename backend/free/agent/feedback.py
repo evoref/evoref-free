@@ -19,7 +19,7 @@ from backend.free.core.intent_vocab import (
     REFERENTIAL_WRITE_TARGET_RE,
 )
 from backend.free.core.locale_patterns import select_locale_variant
-from backend.free.core.session_mode import is_coding_mode
+from backend.free.core.session_mode import is_create_mode
 from backend.free.learning.level0_instant import (
     RESPONSE_FULL_CAP,
     RESPONSE_SUMMARY_CAP,
@@ -73,14 +73,14 @@ CORRECTION_PATTERNS = [
     re.compile(r"that'?s\s+incorrect", re.IGNORECASE),
 ]
 
-# coding モードの実行結果報告 (2026-07-18: coding 経験に訂正シグナルがほぼ発生
+# create モードの実行結果報告 (2026-07-18: create 経験に訂正シグナルがほぼ発生
 # せず Level 1 fitness が無差別化する一因だった語彙)。「動かない」「エラー」
 # 等は一般語彙で他モードの質問・新規依頼 (例:「ホバーしても動かないボタンに
 # して」「テストが通らないという話について教えて」) と誤検知しやすいため、
-# CORRECTION_PATTERNS には含めず (a) coding モード限定 (b) 直前ターンが存在する
+# CORRECTION_PATTERNS には含めず (a) create モード限定 (b) 直前ターンが存在する
 # 場合のみ (訂正対象が無い最初のターンでは新規の質問/依頼である可能性が高い)、
 # の 2 条件でゲートする (_detect_correction 参照)。
-CODING_FAILURE_REPORT_PATTERNS = [
+CREATE_FAILURE_REPORT_PATTERNS = [
     re.compile(r"動(?:か|き)(?:ない|ません)", re.IGNORECASE),
     re.compile(r"エラー(?:が出|にな|です)", re.IGNORECASE),
     re.compile(r"テストが(?:通ら|落ち)", re.IGNORECASE),
@@ -90,15 +90,15 @@ CODING_FAILURE_REPORT_PATTERNS = [
 # (「ホバーしても動かないボタンにして」「テストが通らないという話について
 # 教えて」の誤検知回避)。「〜(やり/し/作り)直して」で終わる依頼は
 # CORRECTION_PATTERNS 側で既に検出されるため対象外にする必要はない。
-_CODING_FAILURE_REPORT_EXCLUDE_RE = re.compile(
+_CREATE_FAILURE_REPORT_EXCLUDE_RE = re.compile(
     r"(?:ください|にして|教えて|作って|実装して)[。.！!？?]*\s*$",
 )
 
-# CODING_FAILURE_REPORT_PATTERNS / _CODING_FAILURE_REPORT_EXCLUDE_RE の
+# CREATE_FAILURE_REPORT_PATTERNS / _CREATE_FAILURE_REPORT_EXCLUDE_RE の
 # 英語版。日本語版の文末アンカー方式 (ください/にして等) は、英語の新規
 # 依頼マーカー (please/命令形/モーダル動詞) が文頭に来る構造とは合わないため、
 # exclude 側は文頭アンカー方式に作り直す。
-CODING_FAILURE_REPORT_PATTERNS_EN = [
+CREATE_FAILURE_REPORT_PATTERNS_EN = [
     re.compile(r"\b(?:doesn'?t|does\s+not|isn'?t|is\s+not)\s+work(?:ing)?\b", re.IGNORECASE),
     re.compile(r"\bnot\s+working\b", re.IGNORECASE),
     re.compile(
@@ -109,7 +109,7 @@ CODING_FAILURE_REPORT_PATTERNS_EN = [
     re.compile(r"\btests?\s+(?:are|is|keep(?:s)?)\s+fail(?:ing)?\b|\btests?\s+fail(?:ed|s)?\b", re.IGNORECASE),
     re.compile(r"\b(?:it|this|that)\s+(?:broke|is\s+broken|crashed?)\b", re.IGNORECASE),
 ]
-_CODING_FAILURE_REPORT_EXCLUDE_RE_EN = re.compile(
+_CREATE_FAILURE_REPORT_EXCLUDE_RE_EN = re.compile(
     r"^\s*(?:please\s+)?(?:make|build|create|add|write|implement|set\s+up|change|fix)\b"
     r"|^\s*(?:can|could|would)\s+you\b"
     r"|^\s*please\b",
@@ -311,10 +311,10 @@ class FeedbackCollector:
         # 現在ロード中のモデル名 (GGUF ファイル名)。record() の base_model /
         # embedding_model が明示指定されないとき既定値として埋める。
         #
-        # base_model は **モードで変わる**: coding は model_paths.coding_model を
+        # base_model は **モードで変わる**: create は model_paths.create_model を
         # ロードするため、chat と同じ名前を刻むとモデル隔離フィルタ (Level 2 が
         # current_model で経験を絞る) の意味が壊れる。実際 2026-07-26 時点の
-        # 経験 182 件は coding 分 2 件も chat のモデル名で記録されていた。
+        # 経験 182 件は create 分 2 件も chat のモデル名で記録されていた。
         # _base_model_name は chat 既定として保持し、record() 時に mode から解決する。
         self._base_model_name = base_model_name
         self._embedding_model_name = embedding_model_name
@@ -333,7 +333,7 @@ class FeedbackCollector:
     def _resolve_base_model_name(self, mode: str) -> str:
         """記録時のモードで実際にロードされている base モデルの GGUF 名を返す。
 
-        coding は ``model_paths.coding_model`` を読み込むため、chat と同じ名前を
+        create は ``model_paths.create_model`` を読み込むため、chat と同じ名前を
         刻むと Level 2 のモデル隔離フィルタ (``current_model`` で経験を絞る) が
         別モデルの経験を混ぜてしまう。解決経路はモード切替が使う
         ``get_mode_generation_params`` に揃える (実際にロードされるモデルと
@@ -682,17 +682,17 @@ class FeedbackCollector:
             if pattern.search(query):
                 return query, "hardcoded"
 
-        # 1b. coding モードの実行結果報告。訂正対象 (直前ターン) が無い最初の
+        # 1b. create モードの実行結果報告。訂正対象 (直前ターン) が無い最初の
         # ターンでは新規の質問/依頼である可能性が高く、文末が新規依頼の完結形
         # なら報告ではなく仕様/質問の可能性が高いため、いずれも除外する。
         exclude_re = select_locale_variant(
-            _CODING_FAILURE_REPORT_EXCLUDE_RE, _CODING_FAILURE_REPORT_EXCLUDE_RE_EN,
+            _CREATE_FAILURE_REPORT_EXCLUDE_RE, _CREATE_FAILURE_REPORT_EXCLUDE_RE_EN,
         )
         failure_patterns = select_locale_variant(
-            CODING_FAILURE_REPORT_PATTERNS, CODING_FAILURE_REPORT_PATTERNS_EN,
+            CREATE_FAILURE_REPORT_PATTERNS, CREATE_FAILURE_REPORT_PATTERNS_EN,
         )
         if (
-            is_coding_mode(mode)
+            is_create_mode(mode)
             and self._prev_query is not None
             and not exclude_re.search(query.strip())
         ):

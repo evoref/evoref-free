@@ -43,7 +43,7 @@
 		conditionsMet = false,
 		lastLevel1Run = null,
 		lastLevel2Run = null,
-		experienceByMode = { chat: 0, coding: 0 },
+		experienceByMode = { chat: 0, create: 0 },
 		correctionRate = 0,
 		ragUsageRate = 0,
 		prevCorrectionRate = null,
@@ -352,9 +352,9 @@
 		<!-- セクション 3: 経験の質 -->
 		<StatusSection label={$t('dashboard.experience_quality')}>
 			<StatusRow
-				active={experienceByMode.chat > 0 || experienceByMode.coding > 0}
+				active={experienceByMode.chat > 0 || experienceByMode.create > 0}
 				label={$t('dashboard.experience_by_mode')}
-				value="{$t('dashboard.mode_chat')}: {experienceByMode.chat} / {$t('dashboard.mode_coding')}: {experienceByMode.coding}"
+				value="{$t('dashboard.mode_chat')}: {experienceByMode.chat} / {$t('dashboard.mode_create')}: {experienceByMode.create}"
 			/>
 			<StatusRow
 				active={correctionRate > 0}

@@ -11,6 +11,7 @@ import numpy as np
 
 from backend.log_config import get_logger
 from backend.trace_context import run_in_executor_with_context
+from backend.free.llm.assist_client import assist_ready
 from backend.free.rag.chunk_content_gate import ChunkContentGate, GateConfig
 from backend.free.rag.self_rag_judge import (
     QualityThresholds,
@@ -335,8 +336,8 @@ async def _maybe_assist_judge_quality(
                     )
                 return label
 
-    # 前提条件: assist_client が無ければ判定不能 (skip ログは出さない)
-    if assist_client is None:
+    # 前提条件: assist が無い / 非常駐なら判定不能 (skip ログは出さない)
+    if not assist_ready(assist_client, "retrieval_quality_judge"):
         return quality
 
     # tracker が無いとセッション累計を追えないので、記録対象から外す
@@ -505,7 +506,7 @@ async def unified_search(
     # (..., mode)) を、この呼び出しの mode に束縛した 4 引数版へラップしてから
     # 下流 (necessity_judge / _maybe_assist_judge_quality) へ渡す。ラップしない
     # まま渡すと下流は 4 引数で呼ぶため recorder 側の mode 既定値 "chat" に
-    # 落ち、coding セッションの assist 経験が誤って chat タグで記録されてしまう。
+    # 落ち、create セッションの assist 経験が誤って chat タグで記録されてしまう。
     assist_experience_recorder = _bind_recorder_mode(assist_experience_recorder, mode)
     top_k, stm_top_k, noise_sigma = _resolve_search_params(policy, rag_cfg, mode)
     multiplier = _resolve_fetch_multiplier(cfg)
@@ -642,7 +643,7 @@ async def unified_search(
 
     # Step 4.5: 取得直後の内容精査ゲート — 低価値 chunk を pruning し、後続の
     # 品質判定 / クエリ拡張の候補数を縮小する。
-    # coding mode を主対象 (chat mode は近似重複除去のみ)。marginal band の
+    # create mode を主対象 (chat mode は近似重複除去のみ)。marginal band の
     # prose のみ assist で 1 回関連性判定する (assist 無/cap 超過/error は純ルール)。
     # gate は生スコア (relevance_floor は cosine 前提) で判定するため merged_raw に
     # 適用し、残った chunk_id 集合を正規化側 merged にも射影する。

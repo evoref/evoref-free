@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { configData } from '$lib/free/stores/settings';
 	import { configSection, fieldUpdater, nestedFieldUpdater } from '$lib/free/stores/settingsHelpers';
-	import type { ChatModeConfig, CodingModeConfig, LongFormConfig } from '$lib/types/settings';
+	import type { ChatModeConfig, CreateModeConfig, LongFormConfig } from '$lib/types/settings';
 	import SettingsSection from './SettingsSection.svelte';
 	import ProSection from './ProSection.svelte';
 	import FieldGroup from './fields/FieldGroup.svelte';
@@ -11,7 +11,7 @@
 
 	let modes = $derived(configSection($configData, 'modes'));
 	let chat = $derived((modes.chat ?? {}) as ChatModeConfig);
-	let coding = $derived((modes.coding ?? {}) as CodingModeConfig);
+	let create = $derived((modes.create ?? {}) as CreateModeConfig);
 	let longForm = $derived(configSection($configData, 'long_form') as LongFormConfig);
 </script>
 
@@ -23,13 +23,13 @@
 		<SliderField label="settings.modes.presence_penalty" value={Number(chat.presence_penalty ?? 0)} min={-2} max={2} step={0.1} description="settings.modes.presence_penalty_desc" onchange={nestedFieldUpdater('modes', 'chat', 'presence_penalty')} />
 	</FieldGroup>
 
-	<!-- Pro: コーディングモードは Pro ワークモード専用 -->
+	<!-- Pro: クリエイトモードは Pro ワークモード専用 -->
 	<ProSection>
-		<FieldGroup label="settings.group_mode_coding">
-			<SliderField label="settings.modes.temperature" value={Number(coding.temperature ?? 0.3)} min={0} max={2} step={0.05} description="settings.modes.temperature_desc" onchange={nestedFieldUpdater('modes', 'coding', 'temperature')} />
-			<SliderField label="settings.modes.top_p" value={Number(coding.top_p ?? 0.95)} min={0} max={1} step={0.01} description="settings.modes.top_p_desc" onchange={nestedFieldUpdater('modes', 'coding', 'top_p')} />
-			<NumberField label="settings.modes.top_k" value={Number(coding.top_k ?? 20)} min={0} max={1000} description="settings.modes.top_k_desc" onchange={nestedFieldUpdater('modes', 'coding', 'top_k')} />
-			<SliderField label="settings.modes.presence_penalty" value={Number(coding.presence_penalty ?? 0)} min={-2} max={2} step={0.1} description="settings.modes.presence_penalty_desc" onchange={nestedFieldUpdater('modes', 'coding', 'presence_penalty')} />
+		<FieldGroup label="settings.group_mode_create">
+			<SliderField label="settings.modes.temperature" value={Number(create.temperature ?? 0.3)} min={0} max={2} step={0.05} description="settings.modes.temperature_desc" onchange={nestedFieldUpdater('modes', 'create', 'temperature')} />
+			<SliderField label="settings.modes.top_p" value={Number(create.top_p ?? 0.95)} min={0} max={1} step={0.01} description="settings.modes.top_p_desc" onchange={nestedFieldUpdater('modes', 'create', 'top_p')} />
+			<NumberField label="settings.modes.top_k" value={Number(create.top_k ?? 20)} min={0} max={1000} description="settings.modes.top_k_desc" onchange={nestedFieldUpdater('modes', 'create', 'top_k')} />
+			<SliderField label="settings.modes.presence_penalty" value={Number(create.presence_penalty ?? 0)} min={-2} max={2} step={0.1} description="settings.modes.presence_penalty_desc" onchange={nestedFieldUpdater('modes', 'create', 'presence_penalty')} />
 		</FieldGroup>
 	</ProSection>
 

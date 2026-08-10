@@ -52,7 +52,7 @@ _COMPONENT_LORA_KEYS: dict[str, tuple[str, str, str, str]] = {
 # config.yaml の model_paths 配下で model_state.json と同期されるキー。
 # これらは migrate API (POST /api/model/migrate, /api/model/{component}/migrate)
 # 経由でしか変更できない。config を直書きすると model_state.json と desync し、
-# 起動時に mismatch を起こすため API 層で遮断する。coding_model は model_state
+# 起動時に mismatch を起こすため API 層で遮断する。create_model は model_state
 # 非追跡 (未指定時は base_model にフォールバック) のため対象外。
 MODEL_STATE_TRACKED_KEYS: frozenset[str] = frozenset(
     ("base_model", *COMPONENT_CONFIG_KEY.values()),

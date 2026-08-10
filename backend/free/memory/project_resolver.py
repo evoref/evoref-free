@@ -1,7 +1,7 @@
 """プロジェクト ID 解決ロジック
 
 EvorefMem 統合仕様 における **プロジェクトスコープ** の同定を担う
-コーディングモードでの SemMem は project スコープに物理分離されるため
+クリエイトモードでの SemMem は project スコープに物理分離されるため
 (`local/memory/semantic/projects/<project_id>/`)、現在の作業ディレクトリから
 安定した project_id を導出する必要がある。
 

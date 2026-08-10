@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 from backend.log_config import get_logger
 from backend.policy_helpers import get_policy_value
 from backend.utils import utc_now
-from backend.free.core.session_mode import is_chat_mode, is_coding_mode
+from backend.free.core.session_mode import is_chat_mode, is_create_mode
 from backend.free.learning.learning_state_store import (
     LearningState,
     LearningStateStore,
@@ -112,7 +112,7 @@ class _CachedCritiqueProxy:
 class LearningScheduler:
     """Level 1〜2 学習サイクルのスケジューラ"""
 
-    MODES = ["coding", "chat"]
+    MODES = ["create", "chat"]
 
     def _init_level1_params(self, learning: dict) -> None:
         """Level 1 学習サイクル関連パラメータをポリシー優先で設定する。"""
@@ -141,7 +141,7 @@ class LearningScheduler:
         """Level 2 (ベースモデル + アシストモデル §7.5.1) パラメータを設定する。"""
         self.min_failures: int = learning.get("level2_min_failures", 50)
         # モード別の発火閾値 (未指定モードは min_failures にフォールバック)。
-        # coding は経験が溜まりにくく、chat と同じ閾値だと永久に発火しないか、
+        # create は経験が溜まりにくく、chat と同じ閾値だと永久に発火しないか、
         # chat が回るたび無駄に評価されるかのどちらかになる。
         self.min_failures_by_mode: dict[str, int] = {
             str(k): int(v)
@@ -189,8 +189,8 @@ class LearningScheduler:
         # Level 2 base=C: control vector (既定 'lora' = 既存 SPSA/LoRA 経路、挙動変更なし)
         self.level2_base_method: str = learning.get("level2_base_method", "lora")
         # Level 2 base/assist アダプタの (mode) パーティション粒度。既定 "model"
-        # (chat/coding で 1 アダプタ共有、挙動変更なし)。"model_mode" で
-        # Level2Runner が chat/coding を交互に別サイクルとして訓練する。
+        # (chat/create で 1 アダプタ共有、挙動変更なし)。"model_mode" で
+        # Level2Runner が chat/create を交互に別サイクルとして訓練する。
         self.level2_adapter_partition: str = learning.get("level2_adapter_partition", "model")
         # base=spsa-real-eval: assist=B と対称の実推論 eval (既定は assist と同じ値)
         self.base_realeval_spsa_iterations: int = int(
@@ -1175,7 +1175,7 @@ class LearningScheduler:
 
         旧モデルで収集された経験は新モデルの LoRA 微調整に適さないため、
         現在のベースモデルで収集された経験のみを使用する。``mode`` 指定時は
-        さらにそのモード ("chat"/"coding") の経験のみに絞る (省略時は全モード
+        さらにそのモード ("chat"/"create") の経験のみに絞る (省略時は全モード
         横断、後方互換)。
         """
         filtered = self._filter_experiences(experiences)
@@ -1222,7 +1222,7 @@ class LearningScheduler:
 
         # モード別経験数
         chat_count = sum(1 for e in safe_exp if is_chat_mode(e.get("mode")))
-        coding_count = sum(1 for e in safe_exp if is_coding_mode(e.get("mode")))
+        create_count = sum(1 for e in safe_exp if is_create_mode(e.get("mode")))
 
         # 最終 Level 0 記録日時
         last_level0_record: str | None = None
@@ -1296,7 +1296,7 @@ class LearningScheduler:
             ),
             # Level 0 詳細
             "last_level0_record": last_level0_record,
-            "experience_by_mode": {"chat": chat_count, "coding": coding_count},
+            "experience_by_mode": {"chat": chat_count, "create": create_count},
             "correction_rate": round(correction_rate, 3),
             "rag_usage_rate": round(rag_usage_rate, 3),
             # phase3/phase4 部分集合条件の可視化 (閾値は min_experiences // 2)

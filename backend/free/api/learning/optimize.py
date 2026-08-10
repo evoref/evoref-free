@@ -52,7 +52,7 @@ __all__ = [
 ]
 
 # Level 1 で集計対象とするモード / アシストタスクのリスト
-_LEVEL1_MODES = ["coding", "chat"]
+_LEVEL1_MODES = ["create", "chat"]
 _ASSIST_TASKS = ["rag_necessity", "rag_quality", "tool_call", "note_evolve"]
 
 
@@ -152,7 +152,7 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
 
     if req.mode is not None and not is_valid_session_mode(req.mode):
         raise api_error(
-            400, "E0400", "mode must be 'coding' or 'chat'",
+            400, "E0400", "mode must be 'create' or 'chat'",
             "api.optimize_invalid_mode",
         )
 

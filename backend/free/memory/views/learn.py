@@ -3,7 +3,7 @@
 EvorefLearn pillar が書き込む ``policy`` / ``fewshot`` の管理、および
 Learn が reader として読む ``failure_pattern`` / ``task`` /
 ``progress_marker`` / ``decision`` / ``commitment`` / ``project`` /
-``coding`` / ``coding_task`` の読取 API を提供する。
+``create`` / ``create_task`` の読取 API を提供する。
 
 ## 設計方針
 
@@ -310,7 +310,7 @@ class LearnFactView(FactViewBase):
             object_: JSON 文字列の集約ペイロード (failure_count / total /
                 avg_duration_ms / quality_signals 等)。
             confidence: 失敗率 (0.0〜1.0)。
-            mode_origin: ``chat`` / ``coding``。
+            mode_origin: ``chat`` / ``create``。
             trace_id: 観測トレース ID (任意)。
             now: テスト用クロック注入。
 

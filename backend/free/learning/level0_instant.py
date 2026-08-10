@@ -144,7 +144,7 @@ class ExperienceBuffer(JsonStateStore):
         """失敗エントリ抽出（rephrased_query=True or user_correction 非 None）
 
         Args:
-            mode: 指定時はそのモード ("chat"/"coding") のエントリのみに絞る。
+            mode: 指定時はそのモード ("chat"/"create") のエントリのみに絞る。
                 None (省略、既定) の場合は全モード横断 (後方互換)。
         """
         result = [

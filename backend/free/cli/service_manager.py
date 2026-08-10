@@ -532,11 +532,24 @@ def _build_embed_cmd(project_root: Path, cfg: dict | None = None) -> list[str] |
 
 
 def _build_assist_cmd(project_root: Path, cfg: dict | None = None) -> list[str] | None:
-    """config.yaml からアシストモデル用 llama-server コマンドを構築（設定時のみ）"""
-    from scripts.launch_llama import build_assist_cmd
+    """config.yaml からアシストモデル用 llama-server コマンドを構築（設定時のみ）
+
+    ``assist_model.residency: on_demand`` (既定) では ``None`` を返し、CLI からは
+    起動しない。アシストはアイドル窓 (sleep-time / Level 1-2) と create モードの
+    間だけ backend の ``AssistResidencyManager`` が起こす (docs/c_14 §1.2)。
+    ここを唯一の分岐点にすることで ``_spawn_extra_servers`` と
+    ``ensure_extra_servers`` の両経路を一度に塞ぐ。
+    """
+    from scripts.launch_llama import assist_residency_is_on_demand, build_assist_cmd
 
     if cfg is None:
         cfg = _load_config(project_root)
+    if assist_residency_is_on_demand(cfg):
+        logger.info(
+            "Assist server is managed on demand "
+            "(assist_model.residency=on_demand); not starting it from the CLI"
+        )
+        return None
     return build_assist_cmd(cfg, project_root)
 
 
@@ -688,7 +701,7 @@ async def ensure_extra_servers(
     """設定済みだが未起動の補助サーバー（assist/embed）を自動起動
 
     バックエンドが既に起動している状態で、--auto-serve を使わずに
-    evoref code を実行した場合に補助サーバーを補完する。
+    evoref create を実行した場合に補助サーバーを補完する。
     """
     cfg = _load_config(project_root)
     builders = {
@@ -838,7 +851,7 @@ async def _register_session(
 
     Args:
         mode: チャットモード。``None`` の場合は :func:`default_cli_mode` で
-            エディション既定 (Free=chat / Pro=coding) を解決する
+            エディション既定 (Free=chat / Pro=create) を解決する
     """
     if mode is None:
         from backend.free.cli.cli_mode import default_cli_mode
@@ -867,11 +880,11 @@ async def _sync_server_mode(url: str, mode: str) -> None:
     """CLI の解決モードをバックエンドへ反映し base サーバの load モデルを揃える。
 
     CLI は ``/api/chat`` に mode を載せるだけで base サーバの再起動は web UI の
-    ``/api/mode/switch`` 経由でしか起きないため、``coding_model`` が base と別
-    GGUF の構成だと ``evoref code`` でも chat モデル上で生成されてしまう。起動時
+    ``/api/mode/switch`` 経由でしか起きないため、``create_model`` が base と別
+    GGUF の構成だと ``evoref create`` でも chat モデル上で生成されてしまう。起動時
     に1回 ``/api/mode/switch`` を叩いて要求モードのモデルをロードさせる。
 
-    同一モード (chat→chat 等) は endpoint 側ガードで no-op。``coding_model`` が
+    同一モード (chat→chat 等) は endpoint 側ガードで no-op。``create_model`` が
     base と同一なら ``model_changed=False`` で再起動も発生しない。ベストエフォート
     で、失敗しても CLI 起動は継続する (モデル再起動は最大 30s の health 待ちが
     あるため read timeout を長めに取る)。

@@ -59,12 +59,16 @@
 		"nav_label": "メインナビゲーション",
 		"mode": "モード",
 		"mode_chat": "チャット",
-		"mode_coding": "コーディング",
+		"mode_create": "クリエイト",
 		"mode_restarting": "モデル再起動中...",
 		"mode_restart_ready": "再起動完了",
 		"mode_restart_failed": "再起動に失敗しました",
 		"server_status": "サーバー",
 		"backend_offline": "バックエンド未接続",
+		"assist_residency_stopped": "オンデマンド (停止中)",
+		"assist_residency_starting": "起動中…",
+		"assist_residency_stopping": "停止中…",
+		"assist_residency_failed": "起動に失敗",
 		"start": "起動",
 		"stop": "停止",
 		"start_failed": "起動に失敗しました",
@@ -109,7 +113,7 @@
 		"last_level2": "Level 2 最終実行",
 		"rollback_confirm": "{target} をバージョン {version} にロールバックしますか？",
 		"rollback_restart_required": "この変更を反映するには、対象モードへの切替またはサーバ再起動が必要です。",
-		"lora_shared_across_modes": "チャットとコーディングは同一の LoRA アダプタを共有しています (learning.level2_adapter_partition = \"model\")。上下段は同じ実体を指します。",
+		"lora_shared_across_modes": "チャットとクリエイトは同一の LoRA アダプタを共有しています (learning.level2_adapter_partition = \"model\")。上下段は同じ実体を指します。",
 		"adapter_not_applied": "未適用",
 		"adapter_not_applied_detail": "{target} のアダプタは存在しますが、このモードのモデルには適用されません ({reason})。起動時に --lora が付与されません。",
 		"no_adapter": "アダプターなし",
@@ -119,7 +123,7 @@
 		"level0_last_record": "最終記録",
 		"experience_by_mode": "モード別",
 		"mode_chat": "chat",
-		"mode_coding": "coding",
+		"mode_create": "create",
 		"correction_rate": "修正検出率",
 		"rag_usage_rate": "RAG利用率",
 		"level1_title": "Level 1",
@@ -280,7 +284,7 @@
 		"group_assist_prompts": "アシストモデル",
 		"group_prompt_history": "バージョン履歴",
 		"group_mode_chat": "チャットモード",
-		"group_mode_coding": "コーディングモード",
+		"group_mode_create": "クリエイトモード",
 		"instance": {
 			"name": "ニックネーム"
 		},
@@ -468,8 +472,8 @@
 		},
 		"model_paths": {
 			"base_model": "ベースモデル",
-			"coding_model": "コーディング用モデル",
-			"coding_model_desc": "空欄の場合はベースモデルを使用",
+			"create_model": "クリエイト用モデル",
+			"create_model_desc": "空欄の場合はベースモデルを使用",
 			"assist_model": "アシストモデルパス",
 			"assist_model_desc": "アシストモデル用 GGUF ファイルパス (メモリ・RAG 処理に使用)",
 			"embed_model": "埋め込みモデル (GGUF)",
@@ -568,7 +572,7 @@
 		"prompts": {
 			"select_prompt": "プロンプトを選択",
 			"mode_chat": "(Base)チャット",
-			"mode_coding": "(Base)コーディング",
+			"mode_create": "(Base)クリエイト",
 			"task_rag_necessity": "(Assist)検索必要性判定",
 			"task_rag_quality": "(Assist)検索品質判定",
 			"task_tool_call": "(Assist)ツール呼出",
@@ -806,7 +810,7 @@
 		"learning_cycle_running": "学習サイクルが既に実行中です",
 		"learning_llm_unavailable": "LLM クライアントが利用できません",
 		"optimize_invalid_level": "level は 'level1' または 'level2' のいずれかを指定してください",
-		"optimize_invalid_mode": "mode は 'coding' または 'chat' のいずれかを指定してください",
+		"optimize_invalid_mode": "mode は 'create' または 'chat' のいずれかを指定してください",
 		"optimize_scheduler_not_initialized": "学習スケジューラーが初期化されていません",
 		"optimize_already_running": "最適化が既に実行中です",
 		"optimize_llm_unavailable": "LLM クライアントが利用できません",
@@ -876,11 +880,11 @@
 		"no_chunks": "チャンク取得なし"
 	},
 	"cli": {
-		"mode_coding_pro_only_warning": "コーディングモードは Pro エディション専用です。チャットモードで起動します。"
+		"mode_create_pro_only_warning": "クリエイトモードは Pro エディション専用です。チャットモードで起動します。"
 	},
 	"landing": {
 		"free_tagline": "Agentic RAG で動くローカル個人ナレッジアシスタント",
-		"pro_tagline": "Agentic RAG + コーディングモードを備えた進化型ローカル LLM アシスタント"
+		"pro_tagline": "Agentic RAG + クリエイトモードを備えた進化型ローカル LLM アシスタント"
 	},
 	"loop": {
 		"console": {
