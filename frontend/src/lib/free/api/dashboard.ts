@@ -52,13 +52,13 @@ export interface ActiveSessionInfo {
 	experience_count: number;
 }
 
-/** Level 2 の base / assist 個別状態 + 発火条件（Pro） */
+/** Level 2 の状態 + 発火条件（Pro） */
 export interface Level2TargetStatus {
 	method: string;
 	bootstrap_enabled: boolean;
 	adapter_exists: boolean;
 	version: number;
-	/** 蓄積中の発火データ数（base=失敗数 / assist=経験数） */
+	/** 蓄積中の発火データ数（失敗数） */
 	experiences_current: number;
 	bootstrap_min: number;
 	spsa_min: number;
@@ -72,14 +72,29 @@ export interface Level2Gates {
 	active_minutes: number;
 	overdue_hours: number;
 	recheck_interval_sec: number;
+	/**
+	 * target ごとの **実効** クールダウン時間（h）。連続無改善が stale_streak に
+	 * 達した target は延長クールダウンへ落ちるため overdue_hours とは一致しない。
+	 */
+	cooldown_hours?: Record<string, number>;
+	/** target ごとの連続無改善回数（採用成功で 0 に戻る） */
+	no_improve_streak?: Record<string, number>;
+	/** 延長クールダウンへ落ちる連続無改善回数の閾値 */
+	stale_streak?: number;
+	/**
+	 * target ごとの「クールダウンを過ぎているか」。データ充足（block_reason==""）
+	 * と AND を取って初めて実際に発火する。未提供（旧バックエンド）は true 扱い。
+	 */
+	overdue?: Record<string, boolean>;
+	/** target ごとの前回実行からの経過秒。未実行は null */
+	seconds_since_run?: Record<string, number | null>;
 }
 
-/** Level 2 (LoRA) の base/assist 個別状態（Pro のみ非 null） */
+/** Level 2 (LoRA) の状態（Pro のみ非 null） */
 export interface Level2Status {
 	running_target: string | null;
 	next_target: string;
 	base: Level2TargetStatus;
-	assist: Level2TargetStatus;
 	gates: Level2Gates;
 }
 
@@ -89,12 +104,21 @@ export interface SchedulerStatus {
 	experience_count: number;
 	new_experience_count: number;
 	min_experiences: number;
+	/**
+	 * 経験件数だけを見た表示値。Level 1 の実ゲートにはアイドル時間・
+	 * ユーザー活動・LLM クライアント配線も含まれるため、true でも走らない
+	 * ことは正常状態として起こる。実際の詰まりは level1_blocked_reason を見る。
+	 */
 	conditions_met: boolean;
+	/** Level 1 が今走れない理由 (走れる状態なら null) */
+	level1_blocked_reason: string | null;
+	/** waiting_for_idle のとき、アイドル成立までの残り秒数 */
+	level1_seconds_until_idle: number | null;
 	last_level1_run: string | null;
 	last_level2_run: string | null;
-	/** 実行中の Level 2 対象（"base"/"assist"/null） */
+	/** 実行中の Level 2 対象（"base"/null） */
 	running_target: string | null;
-	/** Level 2 (LoRA) base/assist 個別状態（Pro のみ非 null） */
+	/** Level 2 (LoRA) の状態（Pro のみ非 null） */
 	level2: Level2Status | null;
 	last_level0_record: string | null;
 	experience_by_mode: ExperienceByMode;
@@ -119,12 +143,21 @@ export interface DashboardLearningData {
 	experience_count: number;
 	new_experience_count: number;
 	min_experiences: number;
+	/**
+	 * 経験件数だけを見た表示値。Level 1 の実ゲートにはアイドル時間・
+	 * ユーザー活動・LLM クライアント配線も含まれるため、true でも走らない
+	 * ことは正常状態として起こる。実際の詰まりは level1_blocked_reason を見る。
+	 */
 	conditions_met: boolean;
+	/** Level 1 が今走れない理由 (走れる状態なら null) */
+	level1_blocked_reason: string | null;
+	/** waiting_for_idle のとき、アイドル成立までの残り秒数 */
+	level1_seconds_until_idle: number | null;
 	last_level1_run: string | null;
 	last_level2_run: string | null;
-	/** 実行中の Level 2 対象（"base"/"assist"/null） */
+	/** 実行中の Level 2 対象（"base"/null） */
 	running_target: string | null;
-	/** Level 2 (LoRA) base/assist 個別状態（Pro のみ非 null） */
+	/** Level 2 (LoRA) の状態（Pro のみ非 null） */
 	level2: Level2Status | null;
 	lora_version: number;
 	lora_adapter_exists: boolean;

@@ -200,7 +200,7 @@
     "mode_create_pro_only_warning": "--mode create は Pro 専用です。Free 環境では chat モードにフォールバックします。",
     "mode_default_resolved": "Mode: {mode} (edition default)",
     "develop_banner": "DEVELOP MODE ON [{level}] — develop ログ有効",
-    "learning_disabled_banner": "自己学習は無効化されています (--no-learning) — Level 0/1/2 / Pro アシスト注入は no-op、SemMem 読み込みは継続。",
+    "learning_disabled_banner": "自己学習は無効化されています (--no-learning) — Level 0/1/2 / Pro 学習コンポーネント注入は no-op、SemMem 読み込みは継続。",
     "develop_level_develop_only": "--develop={level} は Develop エディションが必要です。--develop=debug または --develop=investigate を使用してください。",
     "develop_mode_active": "developモードがアクティブです",
     "history_empty": "会話履歴はありません",
@@ -432,8 +432,7 @@
       "invalid_response": "推論サーバーから不正なレスポンスを受信しました。",
       "model_not_found": "モデルファイルが見つかりません: {path}",
       "process_crashed": "推論サーバーが異常終了しました。再起動を試みています。",
-      "request_rejected": "埋め込みサーバーがリクエストを拒否しました: {detail}。embedding.context_size の見直しが必要な場合があります。",
-      "assist_unavailable": "アシストモデルは現在停止しています（チャット中は起動しない設定）。この処理はアイドル時にまとめて実行されます。"
+      "request_rejected": "埋め込みサーバーがリクエストを拒否しました: {detail}。embedding.context_size の見直しが必要な場合があります。"
     },
     "fs": {
       "index_corrupted": "ベクトルインデックスが破損しています。復旧を試みます。",

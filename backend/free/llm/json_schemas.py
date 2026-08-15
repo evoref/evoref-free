@@ -1,4 +1,4 @@
-"""アシストモデル JSON 応答 purpose 別スキーマ定義
+"""補助タスク JSON 応答 purpose 別スキーマ定義
 
 llama-server `/v1/chat/completions` の OAI 互換 ``response_format`` を用いた
 制約サンプリング用に、purpose ごとの Pydantic v2 モデルを集約する。
@@ -43,7 +43,7 @@ class RetrievalQualityJudgement(_StrictModel):
 class RetrievalNecessityJudgement(_StrictModel):
     """`backend/free/rag/self_rag_judge.py` の uncertain 救済判定。
 
-    ルールで確定できないクエリに対して、アシストモデルが 3 択で意図を返す:
+    ルールで確定できないクエリに対して、補助タスクが 3 択で意図を返す:
 
     - ``retrieve``: ローカル RAG (ドキュメント / 過去会話 / カートリッジ) を
       参照する必要がある (How-to / 既知ドキュメント質問 / 過去会話参照)。
@@ -321,7 +321,7 @@ class CartridgeEvalQAItem(_StrictModel):
     """カートリッジ eval.json の QA ペア 1 件
 
     `backend/pro/cartridge_creator.py` がドキュメント理解度評価用の QA ペアを
-    アシストモデルに生成させる際に使う。``tags`` は分類用の任意ラベルだが、
+    補助タスクに生成させる際に使う。``tags`` は分類用の任意ラベルだが、
     OpenAI strict structured outputs では全プロパティ required のため、
     LLM 側に必ず空配列以上を返させる。
     """
@@ -348,7 +348,7 @@ class UrlRelevanceJudgement(_StrictModel):
     """`backend/free/memory/sleep/url_curator.py` の URL 自己採点。
 
     sleep-time worker で fetch_url が呼ばれたターンを抽出し、
-    アシストモデルに「この URL は質問に対して正しく答えられたか」を
+    補助タスクに「この URL は質問に対して正しく答えられたか」を
     0..1 の score で採点させる。
     """
 
@@ -367,7 +367,7 @@ class FewShotQualityJudgement(_StrictModel):
     採点する。**採用可否の拒否権は持たない** (重み付けのみ) ため、
     ``UrlRelevanceJudgement`` のような bool 判定フィールドは置かない。
 
-    拒否権を与えない理由は実測にある (2026-07-31): 稼働 assist (Qwen3.5-4B) は
+    拒否権を与えない理由は実測にある (2026-07-31): 稼働 aux (Qwen3.5-4B) は
     「42.195 ÷ 1.609 ≈ 26.195」(正しくは 26.2244) に満点を付けた。算術の誤りは
     ``response_arithmetic`` の決定論検算が担当し、本採点は定性面の順位付けに使う。
     """
@@ -383,7 +383,7 @@ class ExecutableCommandSynth(_StrictModel):
 
     「Chrome のバージョン」「現在のディスク使用量」「インストール済み Python
     パッケージ」のような環境依存事実 (Python / シェルから取得できる事実) を、
-    パターン辞書 (`_EXECUTABLE_QUERY_COMMANDS`) ではなく アシストモデルで
+    パターン辞書 (`_EXECUTABLE_QUERY_COMMANDS`) ではなく 補助タスクで
     判定する。
 
     出力フィールド:
@@ -431,7 +431,7 @@ class CalculateExpressionSynth(_StrictModel):
 # ── ツール呼出判定 (tool_judgment) ──
 
 class ToolJudgmentResult(_StrictModel):
-    """`backend/free/agent/tool_call_judge.py` のアシスト判定。
+    """`backend/free/agent/tool_call_judge.py` のLLM 判定。
 
     既存プロンプト (`_DEFAULT_SYSTEM_PROMPT`) の出力形式
     ``{"tool": "<ツール名>" | "", "args": {...}}`` に合わせる。
@@ -458,7 +458,7 @@ class EditorFilenameResult(_StrictModel):
     クリエイトモードで生成したコード/仕様書を Pro エディタへタブ表示する際、
     生成内容から **拡張子なしの ASCII snake_case** ファイル名 stem を 1 つ
     導出する。日本語見出しをそのまま流用するとタブ名が日本語化するため、
-    アシストモデルに英語の簡潔名を生成させる (SPLIT モードの ``file_name`` と
+    補助タスクに英語の簡潔名を生成させる (SPLIT モードの ``file_name`` と
     同思想)。
 
     - ``file_name``: 英小文字 + 数字 + アンダースコアのみ、拡張子なし。
@@ -493,7 +493,7 @@ class ChatConflictJudgement(_StrictModel):
 
 # ── purpose -> schema 自動解決マップ ──
 #
-# 呼出側が ``response_schema`` を明示しない場合、AssistClient が purpose
+# 呼出側が ``response_schema`` を明示しない場合、AuxClient が purpose
 # 文字列から自動解決する。content_type で schema が分岐する purpose
 # (``long_form_planning``) は本マップに含めず、呼出側が明示する。
 PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {

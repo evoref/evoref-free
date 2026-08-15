@@ -170,6 +170,10 @@ async def get_model_state(state: AppState = Depends(get_app_state)):
         and model_state.current_filename != config_filename
     )
 
+    # 実際に serve 中のモデル。起動時検証 (_validate_served_model) が記録した
+    # スナップショットを返す (再起動しない限り変わらない)。
+    served_info = state.served_model_mismatch or {}
+
     return ModelStateResponse(
         current_filename=model_state.current_filename,
         config_filename=config_filename,
@@ -180,6 +184,9 @@ async def get_model_state(state: AppState = Depends(get_app_state)):
             cfg.get("model_migration", {}).get("strict_startup_check", False),
         ),
         recommendation=mismatch_info.get("recommendation", "") if is_mismatch else "",
+        served_filename=served_info.get("served_filename", ""),
+        served_mismatch=bool(served_info),
+        served_recommendation=served_info.get("recommendation", ""),
     )
 
 
@@ -239,10 +246,10 @@ async def rollback_model(req: RollbackRequest, state: AppState = Depends(get_app
 
 
 # ────────────────────────────────────────────
-# コンポーネント (assist / embedding) 移行 API
+# コンポーネント (embedding) 移行 API
 # ────────────────────────────────────────────
 
-_VALID_COMPONENTS = ("assist", "embedding")
+_VALID_COMPONENTS = ("embedding",)
 
 
 def _validate_component(component: str) -> None:
@@ -262,7 +269,7 @@ async def migrate_component(
     req: ComponentMigrateRequest,
     state: AppState = Depends(get_app_state),
 ):
-    """assist / embedding モデルを切り替える
+    """embedding モデルを切り替える
 
     L2: `auto_restart=True` (既定) かつ LlamaProcessManager が当該
     コンポーネントを管理している場合、config.yaml 反映後に llama-server を
@@ -455,7 +462,7 @@ async def get_component_migration_history(component: str):
 # llama-server プロセス管理 API
 # ────────────────────────────────────────────
 
-_ALL_PROCESS_COMPONENTS = ("base", "assist", "embedding")
+_ALL_PROCESS_COMPONENTS = ("base", "embedding")
 
 
 def _validate_process_component(component: str) -> None:

@@ -57,6 +57,8 @@ class SleepTimeScheduler:
 
     def __init__(self, config: dict, debug_logger: "DebugLogger | None" = None):
         learning = config.get("learning", {})
+        # AuxClient へ渡す (purpose 別タイムアウト較正の永続化キーと JSONL 出力)。
+        self._config: dict = config
         self._debug_logger: "DebugLogger | None" = debug_logger
         schedule_cfg = config.get("schedule", {}) or {}
         self.local_tz_name: str = schedule_cfg.get("local_tz", self.DEFAULT_LOCAL_TZ)
@@ -81,6 +83,13 @@ class SleepTimeScheduler:
         )
 
         self._last_user_input: float = 0.0
+        # プロセス起動時刻。``_last_user_input`` が 0 (再起動後まだ一度も
+        # チャットが無い) のときのアイドル基準に使う。これが無いと
+        # ``is_level1_idle()`` が恒久的に False を返し、**まさに誰も使って
+        # いない時間帯に Level 1 が一度も走らない** (経験データは再起動を
+        # またいで残るので、走るべき仕事はある)。2026-08-14 ライブ監査で
+        # 「再起動 → 無操作」の状態が構造的に永久待機になることを確認。
+        self._started_at: float = time.time()
         self._last_response: float = 0.0
         self._light_task: asyncio.Task | None = None
         self._full_task: asyncio.Task | None = None
@@ -89,19 +98,10 @@ class SleepTimeScheduler:
         self._level2_loop_task: asyncio.Task | None = None
         self._worker = None  # SleepTimeWorker, set via set_worker()
         self._llm_client = None  # LocalClient for Full mode
-        self._assist_llm_client = None  # AssistModelClient for Full mode (preferred)
         self._learning_scheduler = None  # LearningScheduler for Level 1/2
         self._lora_path = None  # Path to LoRA adapter for Level 2
         self._base_model_path = None  # Path to base model GGUF for LoRA target resolution
-        self._assist_lora_path = None  # Path to assist LoRA adapter for Level 2
-        self._assist_model_path = None  # Path to assist model GGUF for LoRA target resolution
         self._running = False
-        # AssistResidencyManager (docs/c_14 §1.2)。None なら「常に常駐」とみなし
-        # 従来どおり振る舞う (テスト / assist_model.residency=always)。
-        self._assist_residency = None
-        # Level 2 は check_level2 が fire-and-forget で起動するため、起動した窓を
-        # そのまま保持し、学習が終わった tick で解放する。
-        self._level2_residency_held = False
 
     def _resolve_local_tz(self, tz_name: str) -> tzinfo:
         """設定 tz 名を tzinfo に解決する（解決不能時は段階的に縮退）
@@ -142,46 +142,27 @@ class SleepTimeScheduler:
         """Full 版で使用する LLM クライアントを設定（ベースモデル、フォールバック用）"""
         self._llm_client = client
 
-    def set_assist_llm_client(self, client) -> None:
-        """Full 版で使用するアシストモデルクライアントを設定（優先）"""
-        self._assist_llm_client = client
+    def resolve_sleep_client(self):
+        """Full sleep-time の LLM ステージに渡すクライアントを解決する。
 
-    def set_assist_residency(self, residency) -> None:
-        """アシストのオンデマンド常駐管理を設定する (docs/c_14 §1.2)。
-
-        ``None`` のままなら「常に常駐」とみなし、acquire/release は素通りする。
+        ベースモデルを補助タスクの面で使う :class:`AuxClient` を返す
+        (専有スロット ``background_slot`` を使うのでチャットとは KV を分けられる)。
+        ベースが未接続なら ``None`` を返し、``run_full`` が Step 5.8-10 を
+        クリーンスキップする。
         """
-        self._assist_residency = residency
-
-    async def _acquire_assist(self, reason: str) -> bool:
-        """アイドル窓のためにアシストを起動する。
-
-        起動には数十秒かかるので、ready になった直後に ``is_user_active()`` を
-        **もう一度**確認する。読み終えてユーザーが戻ってきていたら、窓を開けずに
-        即解放して GPU をチャットへ返す。
-
-        Returns:
-            アシストが使える状態になったか。False なら窓を開けない。
-        """
-        residency = self._assist_residency
-        if residency is None:
-            return True
-        if not await residency.acquire(reason):
-            return False
-        if self.is_user_active():
-            await residency.release(reason)
-            logger.info(
-                "Idle window aborted (%s): user came back while the assist "
-                "model was loading", reason,
+        # LLMClient ファサード / 生の LocalClient のどちらでも受ける
+        local = getattr(self._llm_client, "local", self._llm_client)
+        if local is None or not hasattr(local, "generate_constrained"):
+            logger.warning(
+                "Base client has no constrained transport; "
+                "skipping the LLM stages of the full sleep-time cycle",
             )
-            return False
-        return True
+            return None
+        from backend.free.llm.aux_client import AuxClient
 
-    async def _release_assist(self, reason: str) -> None:
-        """アイドル窓を閉じる (refcount 0 でアシストを停止)。"""
-        residency = self._assist_residency
-        if residency is not None:
-            await residency.release(reason)
+        return AuxClient(
+            local, config=self._config, debug_logger=self._debug_logger,
+        )
 
     def set_learning_scheduler(self, scheduler) -> None:
         """Level 1/2 学習スケジューラを設定"""
@@ -196,14 +177,6 @@ class SleepTimeScheduler:
     def set_base_model_path(self, path) -> None:
         """Level 2 で使用するベースモデル GGUF パスを設定（LoRA ターゲット自動判定用）"""
         self._base_model_path = path
-
-    def set_assist_lora_path(self, path) -> None:
-        """Level 2 で使用するアシストモデル LoRA アダプタパスを設定"""
-        self._assist_lora_path = path
-
-    def set_assist_model_path(self, path) -> None:
-        """Level 2 で使用するアシストモデル GGUF パスを設定"""
-        self._assist_model_path = path
 
     def on_user_input(self) -> None:
         """ユーザー入力通知: 実行中のタスクをキャンセル"""
@@ -231,23 +204,13 @@ class SleepTimeScheduler:
             self._learning_scheduler.cancel(graceful=True)
         # Level 2 常駐ループは停止しない (各 tick で is_user_active を見て自律 skip)。
 
-        # アシストを即座に落として GPU をチャット応答へ明け渡す (docs/c_14 §1.2)。
-        # 起動途中でも start タスクごと打ち切られるため、ユーザーは
-        # モデルロードの完了を待たされない。on_user_input は同期メソッドなので
-        # タスク化して投げっぱなしにする (チャットハンドラの中なのでループは動く)。
-        residency = self._assist_residency
-        if residency is not None and residency.on_demand:
-            self._level2_residency_held = False
-            asyncio.create_task(residency.request_stop("user_input"))
-
     def on_llm_start(self) -> None:
         """LLM 応答生成開始通知: Trigger A (Light) を即座に実行（§8.1）
 
         ベースモデルの推論と並列に sleep-time ステップ 1〜5.5 を実行する。
-        Light は **アシストモデルを一切呼ばない** (ノート埋め込み / タグ精製 /
+        Light は **LLM を一切呼ばない** (ノート埋め込み / タグ精製 /
         LightMem 再スコア / FadeMem 退避 / パターン減衰)。使うのは埋め込み
-        サーバのみなので、``assist_model.residency`` の管理対象外
-        (docs/c_14 §1.2 / f_02 §4.3)。
+        サーバのみ (f_02 §4.3)。
         """
         if self._worker is None:
             return
@@ -293,22 +256,21 @@ class SleepTimeScheduler:
         """ユーザーがフォアグラウンド対応中かどうか
 
         判定順:
-        1. ベース／アシスト LLM の in_flight_chat_count > 0 → アクティブ
+        1. ベース LLM の in_flight_chat_count > 0 → アクティブ
         2. _last_user_input から active_minutes 未満 → アクティブ
         3. それ以外 → 非アクティブ
 
         in_flight_chat_count を主条件とすることで、「メッセージ送信中」と
-        「応答を読んでいる短い無動作期間」を正しく区別できる。
+        「応答を読んでいる短い無動作期間」を正しく区別できる。補助タスクも
+        同じベースモデル上で走るため、観測点はベース 1 つで足りる。
         """
-        for client in (self._llm_client, self._assist_llm_client):
-            if client is None:
-                continue
+        if self._llm_client is not None:
             try:
-                if int(getattr(client, "in_flight_chat_count", 0)) > 0:
+                if int(getattr(self._llm_client, "in_flight_chat_count", 0)) > 0:
                     return True
             except Exception:
                 # Mock やテストダブル等で属性アクセスが失敗しても致命的にはしない
-                continue
+                pass
 
         if self._last_user_input == 0:
             return False
@@ -373,7 +335,6 @@ class SleepTimeScheduler:
         success = False
         cancelled = False
         executed = False
-        window_open = False
         skipped_reason: str | None = None
         try:
             await asyncio.sleep(self.full_idle_minutes * 60)
@@ -390,26 +351,14 @@ class SleepTimeScheduler:
                 skipped_reason = "user_active"
                 return
 
-            # アイドル窓を開く (residency=on_demand ならここでアシストを起動)。
-            if not await self._acquire_assist("sleep_full"):
-                logger.info("Trigger B: skipped, assist model unavailable")
-                success = True
-                skipped_reason = "assist_unavailable"
-                return
-            window_open = True
-
             logger.info("Trigger B: starting Full sleep-time update")
             self._running = True
             executed = True
-            # sleep-time の LLM ステージはアシストモデルでのみ実行する。
-            # アシスト未接続 (degraded) 時はベースモデルへフォールバックせず
-            # None を渡し、run_full が Step 5.8-10 をクリーンスキップする
-            # (c_14 §6.2: degraded はメモリ抽出をスキップし次回起動で再実行)。
-            # ベースモデルにメモリ抽出/要約/判定をさせない不変則
-            # (CLAUDE.md §6.1) とも整合する。run_full の各 LLM 呼出は
-            # purpose= 付きで LocalClient が受けられないため、フォールバックは
-            # 元々 TypeError を握り潰す死に配線だった。
-            llm_for_sleep = self._assist_llm_client
+            # sleep-time の LLM ステージを回すクライアント。ベースを
+            # AuxClient 越しに使う。アイドル窓かつ専有スロットなので
+            # 不変則 (CLAUDE.md §6 #1 / docs/c_14 §1.1) を満たす。未接続なら
+            # None を渡し、run_full が Step 5.8-10 をクリーンスキップする。
+            llm_for_sleep = self.resolve_sleep_client()
             await self._worker.run_full(llm_for_sleep)
             success = True
 
@@ -430,14 +379,6 @@ class SleepTimeScheduler:
             logger.error("Full sleep-time update failed: %s", e, exc_info=True)
         finally:
             self._running = False
-            if window_open:
-                try:
-                    await self._release_assist("sleep_full")
-                except asyncio.CancelledError:
-                    # finally 内の await が再 cancel された。llama-server を
-                    # 起動したまま取り残さないよう、停止だけ独立タスクで完走させる。
-                    asyncio.create_task(self._release_assist("sleep_full"))
-                    raise
             elapsed_ms = (time.monotonic() - t_start) * 1000
             extra: dict = {"cancelled": cancelled, "executed": executed}
             if skipped_reason is not None:
@@ -483,12 +424,43 @@ class SleepTimeScheduler:
         self._level1_loop_task = None
         logger.info("Level 1 loop stopped")
 
+    def _level1_idle_since(self) -> float:
+        """Level 1 のアイドル計測の起点 (最終ユーザー入力 or プロセス起動)。
+
+        再起動直後でまだチャットが無い場合はプロセス起動時刻を使う。
+        ``_last_user_input == 0`` で常に「非アイドル」と答えていた頃は、
+        再起動して放置した状態が永久待機になっていた。
+        """
+        return self._last_user_input or self._started_at
+
     def is_level1_idle(self) -> bool:
         """Level 1 用のアイドル判定（level1_idle_minutes 基準）"""
-        if self._last_user_input == 0:
-            return False
-        elapsed = time.time() - self._last_user_input
+        elapsed = time.time() - self._level1_idle_since()
         return elapsed >= self.level1_idle_minutes * 60
+
+    def level1_gate_status(self) -> dict[str, object]:
+        """Level 1 常駐ループのゲート状態を返す (観測用、副作用なし)。
+
+        ``LearningScheduler.get_status()`` の ``conditions_met`` は **経験件数
+        だけ** を見た表示値で、実際の起動ゲート (アイドル / ユーザー活動 /
+        LLM クライアント配線) を含まない。そのため「conditions_met: true
+        なのに一向に走らない」が正常状態として起こり、原因の切り分けに
+        ログ読解が要った (2026-08-14 ライブ監査で実際に時間を要した)。
+        ダッシュボード / API がゲートの実体を出せるようにする。
+        """
+        remaining = (
+            self.level1_idle_minutes * 60
+            - (time.time() - self._level1_idle_since())
+        )
+        seconds_until_idle = max(0.0, remaining)
+        return {
+            "llm_client_wired": self._llm_client is not None,
+            "loop_running": self._level1_loop_task is not None,
+            "idle": self.is_level1_idle(),
+            "user_active": self.is_user_active(),
+            "idle_minutes_required": self.level1_idle_minutes,
+            "seconds_until_idle": seconds_until_idle,
+        }
 
     async def _schedule_level1_loop(self) -> None:
         """常駐ループ。f_04 §5.3 の判定順序に従って Level 1 を起動する。
@@ -510,7 +482,7 @@ class SleepTimeScheduler:
                 if ls is None:
                     continue
 
-                llm_for_level1 = self._llm_client or self._assist_llm_client
+                llm_for_level1 = self._llm_client
                 if llm_for_level1 is None:
                     # LLM 未接続。次 tick で再評価
                     continue
@@ -519,17 +491,12 @@ class SleepTimeScheduler:
                 if ls.has_active_session():
                     if self.is_user_active():
                         continue
-                    if not await self._acquire_assist("level1"):
-                        continue
-                    try:
-                        logger.info("Level 1 loop: resuming SUSPENDED session")
-                        await ls.run_or_resume_level1(
-                            llm_client=llm_for_level1,
-                            reason="resume",
-                            relax_threshold=False,
-                        )
-                    finally:
-                        await self._release_assist("level1")
+                    logger.info("Level 1 loop: resuming SUSPENDED session")
+                    await ls.run_or_resume_level1(
+                        llm_client=llm_for_level1,
+                        reason="resume",
+                        relax_threshold=False,
+                    )
                     continue
 
                 # (2) 優先キューを処理
@@ -537,20 +504,15 @@ class SleepTimeScheduler:
                 if req is not None:
                     if self.is_user_active():
                         continue
-                    if not await self._acquire_assist("level1"):
-                        continue
-                    try:
-                        logger.info(
-                            "Level 1 loop: processing priority request reason=%s",
-                            req.reason,
-                        )
-                        result = await ls.run_or_resume_level1(
-                            llm_client=llm_for_level1,
-                            reason=req.reason,
-                            relax_threshold=req.relax_ratio < 1.0,
-                        )
-                    finally:
-                        await self._release_assist("level1")
+                    logger.info(
+                        "Level 1 loop: processing priority request reason=%s",
+                        req.reason,
+                    )
+                    result = await ls.run_or_resume_level1(
+                        llm_client=llm_for_level1,
+                        reason=req.reason,
+                        relax_threshold=req.relax_ratio < 1.0,
+                    )
                     # yield されなかった場合のみキューから取り除く
                     if not result.get("yielded", False):
                         ls.pop_priority_request()
@@ -571,17 +533,12 @@ class SleepTimeScheduler:
                         "since last run"
                     )
                     continue
-                if not await self._acquire_assist("level1"):
-                    continue
-                try:
-                    logger.info("Level 1 loop: starting scheduled idle session")
-                    await ls.run_or_resume_level1(
-                        llm_client=llm_for_level1,
-                        reason="idle",
-                        relax_threshold=False,
-                    )
-                finally:
-                    await self._release_assist("level1")
+                logger.info("Level 1 loop: starting scheduled idle session")
+                await ls.run_or_resume_level1(
+                    llm_client=llm_for_level1,
+                    reason="idle",
+                    relax_threshold=False,
+                )
 
             except asyncio.CancelledError:
                 logger.info("Level 1 loop cancelled")
@@ -643,7 +600,6 @@ class SleepTimeScheduler:
         token = trace_id_var.set(generate_trace_id())
         t_start = time.monotonic()
         cancelled_ok = False
-        overdue_sec = self.level2_overdue_hours * 3600.0
         while True:
             try:
                 await asyncio.sleep(self.level2_recheck_interval_sec)
@@ -652,36 +608,19 @@ class SleepTimeScheduler:
                 if ls is None:
                     continue
 
-                # 前 tick で起動した Level 2 学習が終わっていればアシストを解放する。
-                # check_level2 は fire-and-forget なので、窓の終わりは
-                # LearningScheduler.running が False に戻ったところで判定する。
-                if self._level2_residency_held and not getattr(ls, "running", False):
-                    self._level2_residency_held = False
-                    await self._release_assist("level2")
-
                 if self.is_user_active():
                     continue
-                # 次に試行される target (base/assist 交互スケジュール) を対象に
-                # overdue 判定する。単一値共有だった旧仕様では、一方の失敗が
-                # もう一方の overdue 判定まで巻き込んで 24h ブロックしていた
-                # 回帰 (2026-07-18) の修正。前回実行から overdue_hours 未満なら
-                # 待機 (未実行は inf=即 overdue)。
-                next_target = ls.next_level2_target()
-                if ls.seconds_since_level2_run(next_target) < overdue_sec:
+                # ここは「overdue でないなら check をまるごと省く」ための
+                # **安価な事前チェック** に徹する。実際に起動するかは
+                # check_level2 → Level2Runner.check_and_run が決め、クールダウンも
+                # そこで掛かる (単一述語 LearningScheduler.is_level2_overdue)。
+                if not ls.is_level2_overdue("base"):
                     continue
 
-                if self._level2_residency_held:
-                    # 学習継続中。次 tick で終了判定する。
+                if getattr(ls, "running", False):
+                    # 学習継続中。次 tick で再評価する。
                     continue
 
-                # ``check_level2`` は「判定 + 起動」が一体で、失敗数不足 / LoRA
-                # 非互換 / 実行中 などの内部ゲートにより **大半の tick で False**
-                # を返す。overdue のまま内部ゲートで落ち続ける構成では
-                # `_last_level2_run` が更新されないため、acquire を先に置くと
-                # 「起動 (~15s) → 即停止」を recheck 間隔ごとに永久に繰り返す
-                # (2026-08-08 実機観測: 5-6 分おきに 3 回発生)。判定自体は
-                # assist を使わないので先に走らせ、**実際に起動したときだけ**
-                # 窓を取る。学習本体は fire-and-forget なので acquire は間に合う。
                 triggered = False
                 try:
                     triggered = bool(ls.check_level2(
@@ -695,17 +634,10 @@ class SleepTimeScheduler:
                             if self._base_model_path else ""
                         ),
                         base_model_path=self._base_model_path,
-                        assist_lora_path=self._assist_lora_path,
-                        assist_model_path=self._assist_model_path,
                     ))
                 except Exception as e:
                     logger.error("Level 2 check failed: %s", e, exc_info=True)
                 if triggered:
-                    # 学習は fire-and-forget で走り続けるので窓を保持する。
-                    # 次 tick で running が下りたら解放する。取れなければ
-                    # 既存の degraded 経路で走らせる (学習自体は止めない)。
-                    if await self._acquire_assist("level2"):
-                        self._level2_residency_held = True
                     logger.info("Level 2 LoRA tuning triggered (overdue loop)")
                     _emit_bg_task_outcome(
                         self._debug_logger,
@@ -718,9 +650,6 @@ class SleepTimeScheduler:
             except asyncio.CancelledError:
                 logger.info("Level 2 loop cancelled")
                 cancelled_ok = True
-                if self._level2_residency_held:
-                    self._level2_residency_held = False
-                    asyncio.create_task(self._release_assist("level2"))
                 break
             except Exception as e:
                 logger.error("Level 2 loop iteration failed: %s", e, exc_info=True)

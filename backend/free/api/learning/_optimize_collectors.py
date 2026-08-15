@@ -2,7 +2,7 @@
 
 `backend/free/api/optimize.py` の `optimize_status` / `optimize_history`
 ハンドラ内に直書きされていた以下のロジックを抽出した純粋関数群:
-- PromptMeta / AssistPromptMeta → レスポンススキーマへのマッピング
+- PromptMeta / AuxPromptMeta → レスポンススキーマへのマッピング
 - LearningScheduler 設定値の既定値マージ
 - Unix epoch → ISO8601 タイムスタンプ整形
 - 履歴エントリのマッピング
@@ -23,13 +23,13 @@ from typing import TYPE_CHECKING
 
 from backend.free.api.learning._learning_collectors import latest_level2_run
 from backend.free.api.learning._optimize_schemas import (
-    AssistTaskStatus,
+    AuxTaskStatus,
     PromptHistoryEntry,
     PromptModeStatus,
 )
 
 if TYPE_CHECKING:
-    from backend.free.agent.assist_prompt_manager import AssistPromptManager
+    from backend.free.agent.aux_prompt_manager import AuxPromptManager
     from backend.free.agent.prompt_manager import SystemPromptManager
 
 
@@ -46,7 +46,7 @@ SCHEDULER_DEFAULTS: dict[str, int] = {
 }
 
 
-# ── PromptMeta / AssistPromptMeta → スキーマへのマッピング ──────────────
+# ── PromptMeta / AuxPromptMeta → スキーマへのマッピング ──────────────
 
 
 def collect_prompt_mode_statuses(
@@ -76,25 +76,25 @@ def collect_prompt_mode_statuses(
     return result
 
 
-def collect_assist_task_statuses(
-    assist_prompt_mgr: AssistPromptManager | None,
+def collect_aux_task_statuses(
+    aux_prompt_mgr: AuxPromptManager | None,
     tasks: list[str],
-) -> list[AssistTaskStatus]:
-    """指定タスクリストから `AssistTaskStatus` のリストを構築する。
+) -> list[AuxTaskStatus]:
+    """指定タスクリストから `AuxTaskStatus` のリストを構築する。
 
-    `assist_prompt_mgr` が `None` の場合は空リストを返す。`get_meta` が
+    `aux_prompt_mgr` が `None` の場合は空リストを返す。`get_meta` が
     `ValueError` を投げたタスクはスキップする。Pro/Free ガードは呼び出し側の
     責務 (この関数自体は edition-agnostic)。
     """
-    if assist_prompt_mgr is None:
+    if aux_prompt_mgr is None:
         return []
-    result: list[AssistTaskStatus] = []
+    result: list[AuxTaskStatus] = []
     for task in tasks:
         try:
-            meta = assist_prompt_mgr.get_meta(task)
+            meta = aux_prompt_mgr.get_meta(task)
         except ValueError:
             continue
-        result.append(AssistTaskStatus(
+        result.append(AuxTaskStatus(
             task=meta.task,
             version=meta.version,
             source=meta.source,
@@ -173,24 +173,24 @@ def collect_prompt_history(
     return result
 
 
-def collect_assist_prompt_history(
-    assist_prompt_mgr: AssistPromptManager | None,
+def collect_aux_prompt_history(
+    aux_prompt_mgr: AuxPromptManager | None,
     tasks: list[str],
 ) -> dict[str, list[PromptHistoryEntry]]:
-    """アシストプロンプトのタスク別履歴を `{f"assist_{task}": [entries...]}` で返す。
+    """補助タスクのプロンプト別履歴を `{f"aux_{task}": [entries...]}` で返す。
 
-    `assist_prompt_mgr` が `None` の場合は空 dict。`ValueError` はスキップ。
+    `aux_prompt_mgr` が `None` の場合は空 dict。`ValueError` はスキップ。
     Pro/Free ガードは呼び出し側の責務。
     """
-    if assist_prompt_mgr is None:
+    if aux_prompt_mgr is None:
         return {}
     result: dict[str, list[PromptHistoryEntry]] = {}
     for task in tasks:
         try:
-            entries = assist_prompt_mgr.get_history(task)
+            entries = aux_prompt_mgr.get_history(task)
         except ValueError:
             continue
-        key = f"assist_{task}"
+        key = f"aux_{task}"
         result[key] = [
             PromptHistoryEntry(mode=key, version=e["version"], file=e["file"])
             for e in entries

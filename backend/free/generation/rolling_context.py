@@ -24,7 +24,7 @@ class RollingContext:
     # コード用: スケルトン（ルールベース更新）
     skeleton: CodeSkeleton | None = None
 
-    # テキスト用: ローリングサマリ（LLM更新 or アシスト更新）
+    # テキスト用: ローリングサマリ（LLM更新 or 補助タスク更新）
     long_term_summary: str = ""
 
     # 共通: 直前ユニットの末尾テキスト

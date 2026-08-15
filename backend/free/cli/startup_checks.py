@@ -472,7 +472,7 @@ def _check_model_state_consistency(
             ),
         )
 
-    # component (assist/embed) のみの不一致
+    # component (embed) のみの不一致
     keys = ", ".join(sorted(mismatches))
     logger.error("Component model mismatch: %s", keys)
     return CheckResult(

@@ -17,7 +17,7 @@ if /i "%~1"=="restart" goto restart
 if /i "%~1"=="status" goto status
 goto usage
 
-rem ── サービス起動 (全サービス: llama + backend + frontend) ──
+rem --- Start all services (llama + backend + frontend) ---
 :start
 call :check_dep npm "nodejs.org or winget install OpenJS.NodeJS"
 if errorlevel 1 exit /b 1
@@ -39,20 +39,20 @@ echo Close the terminal windows to stop services,
 echo or run: %~nx0 stop
 goto :eof
 
-rem ── コアサービス起動 (llama + backend のみ、frontend は起動しない) ──
-rem `:start` から call され、reset_local_data.py の再起動からは `start-core`
-rem コマンドとして直接呼ばれる。frontend(vite:5173) を生かしたまま llama と
-rem backend だけを再起動する用途。stop が効くようウィンドウタイトルは維持する。
+rem --- Start core services only (llama + backend; frontend is left running) ---
+rem Called from `:start`, and invoked directly as the `start-core` command when
+rem reset_local_data.py restarts services. Restarts llama and backend while
+rem keeping frontend(vite:5173) alive. Window titles are kept so `stop` still works.
 :start_core
 call :check_dep python "python.org or winget install Python.Python.3"
 if errorlevel 1 exit /b 1
 
-rem 仮想環境の有効化
+rem Activate the virtual environment
 if exist ".venv\Scripts\activate.bat" (
     call .venv\Scripts\activate.bat
 )
 
-rem venv の Python / uvicorn を直接参照（start cmd /c では activate が引き継がれない）
+rem Reference the venv python/uvicorn directly (activate is not inherited by start cmd /c)
 if exist ".venv\Scripts\python.exe" (
     set "VENV_PYTHON=%CD%\.venv\Scripts\python.exe"
     set "VENV_UVICORN=%CD%\.venv\Scripts\uvicorn.exe"
@@ -61,18 +61,17 @@ if exist ".venv\Scripts\python.exe" (
     set "VENV_UVICORN=uvicorn"
 )
 
-rem 旧 llama-server が port を握ったまま新プロセスが bind 失敗すると、
-rem 新プロセスは即死するが旧プロセスの /health 応答を拾って誤って ready 判定
-rem されてしまう (モデル切替が反映されない不具合の原因)。spawn 前に一掃する。
+rem If a stale llama-server still holds the port, the new process fails to bind
+rem and dies at once, yet the old process keeps answering /health so we wrongly
+rem judge it ready (this is why a model switch could appear to have no effect).
+rem Sweep them out before spawning.
 echo [start] Ensuring no stale llama-server.exe is running...
 taskkill /im "llama-server.exe" /f >nul 2>&1
 
-echo [start] Starting llama-server (base + embedding; assist starts on demand)...
+echo [start] Starting llama-server (base + embedding)...
 start "llama-server" /min cmd /c ""%VENV_PYTHON%" scripts\launch_llama.py config.yaml --all"
 
-rem 待ち受け対象は launch_llama.py に問い合わせる。assist は
-rem assist_model.residency=on_demand (既定) だと --all でも起動しないため、
-rem 固定リストで待つと 60 秒空振りしてから WARNING が出てしまう。
+rem wait targets come from launch_llama.py --print-health-ports
 echo [start] Waiting for llama-server to be ready (up to 60s)...
 powershell -NoProfile -Command "$pairs=& '%VENV_PYTHON%' scripts\launch_llama.py config.yaml --print-health-ports; foreach ($p in $pairs) { if ($p -notmatch '^(\w+)=(\d+)$') { continue }; $name=$Matches[1]; $port=$Matches[2]; $elapsed=0; do { Start-Sleep 2; $elapsed+=2; try { $r=(Invoke-WebRequest \"http://localhost:$port/health\" -TimeoutSec 1 -UseBasicParsing).StatusCode } catch { $r=0 } } while ($r -ne 200 -and $elapsed -lt 60); if ($r -ne 200) { Write-Host \"[start] WARNING: $name (port $port) health check timed out, proceeding anyway\" } }"
 
@@ -80,7 +79,7 @@ echo [start] Starting FastAPI backend on :8000...
 start "evoref-backend" /min cmd /c ""%VENV_UVICORN%" backend.main:app --host 0.0.0.0 --port 8000"
 goto :eof
 
-rem ── サービス停止 ──
+rem --- Stop services ---
 :stop
 echo [stop] Stopping evoref services...
 
@@ -98,18 +97,18 @@ echo.
 echo === All services stopped ===
 goto :eof
 
-rem ── サービス再起動 ──
+rem --- Restart services ---
 :restart
 call :stop
 timeout /t 2 /nobreak >nul
 call :start
 goto :eof
 
-rem ── サービス状態表示 ──
+rem --- Show service status ---
 :status
 echo === evoref service status ===
 
-rem llama-server: 実行ファイル名で確認
+rem llama-server: check by executable name
 tasklist /fi "IMAGENAME eq llama-server.exe" /nh 2>nul | find /i "llama-server" >nul 2>&1
 if !errorlevel!==0 (
     echo   llama-server:       running
@@ -117,7 +116,7 @@ if !errorlevel!==0 (
     echo   llama-server:       stopped
 )
 
-rem FastAPI backend: ポート 8000 で確認
+rem FastAPI backend: check port 8000
 netstat -an 2>nul | find ":8000 " | find "LISTENING" >nul 2>&1
 if !errorlevel!==0 (
     echo   FastAPI backend:    running
@@ -125,7 +124,7 @@ if !errorlevel!==0 (
     echo   FastAPI backend:    stopped
 )
 
-rem SvelteKit frontend: ポート 5173 で確認
+rem SvelteKit frontend: check port 5173
 netstat -an 2>nul | find ":5173 " | find "LISTENING" >nul 2>&1
 if !errorlevel!==0 (
     echo   SvelteKit frontend: running
@@ -134,7 +133,7 @@ if !errorlevel!==0 (
 )
 goto :eof
 
-rem ── ヘルプ表示 ──
+rem --- Usage ---
 :usage
 echo Usage: %~nx0 {start^|stop^|restart^|status}
 echo.
@@ -145,7 +144,7 @@ echo   restart  Restart all services
 echo   status   Show status of all services
 exit /b 1
 
-rem ── 依存コマンド確認 ──
+rem --- Dependency check ---
 :check_dep
 where %~1 >nul 2>&1
 if errorlevel 1 (

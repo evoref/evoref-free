@@ -49,7 +49,7 @@ class ContextualPrefixConfig(BaseModel):
     enabled: bool = True
     # 生成モード: "eager" (Sleep-time 一括) / "lazy" (retrieval 時 on-demand)
     mode: str = Field(default="eager", pattern=r"^(eager|lazy)$")
-    # アシストモデルに要求する最大トークン数 (プレフィックス 1 件あたり)
+    # 補助タスクに要求する最大トークン数 (プレフィックス 1 件あたり)
     max_tokens: int = Field(default=128, ge=1)
     # プロンプトに埋め込むドキュメント本文の最大文字数 (超過時はトランケート)
     max_doc_chars: int = Field(default=6000, ge=100)
@@ -63,19 +63,19 @@ class ContextualPrefixConfig(BaseModel):
     lazy_hit_threshold: int = Field(default=2, ge=1)
     # プレフィックス生成プロンプトのテンプレート。プレースホルダ
     # ``{document}`` ``{chunk}`` をサポート。多言語対応や、英語専用 / 中国語
-    # 専用アシストモデルに切替えた際にこのテンプレートを差し替えることで、
-    # アシストモデルの学習言語と一致させる。空文字列にすると default
+    # 専用補助タスクに切替えた際にこのテンプレートを差し替えることで、
+    # 補助タスクの学習言語と一致させる。空文字列にすると default
     # (日本語) が利用される。
     prompt_template: str = ""
 
 
-class SelfRagAssistJudgeConfig(BaseModel):
-    """Self-RAG アシスト品質再判定設定
+class SelfRagQualityJudgeConfig(BaseModel):
+    """Self-RAG 補助タスク品質再判定設定
 
     ルールベース Self-RAG の quality 判定が ``only_when_quality`` に
-    該当した場合に、アシストモデル LLM による品質再判定で marginal な
+    該当した場合に、補助タスク LLM による品質再判定で marginal な
     検索結果を救済する。セッション / クエリ単位で発火上限を設けて、
-    ユーザ体感レイテンシとアシストモデル負荷への影響を抑える。
+    ユーザ体感レイテンシと補助タスク負荷への影響を抑える。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -99,7 +99,7 @@ class SelfRagAssistJudgeConfig(BaseModel):
     max_top_score: float = Field(default=0.75, ge=0.0, le=1.0)
     # 1 セッション (session_id 単位) で発火可能な最大回数。0 以下で無制限。
     # 上限超過時は raw hybrid 結果で返し、DebugLogger に
-    # ``assist_judge_skipped_reason="session_cap"`` を記録する。
+    # ``judge_skipped_reason="session_cap"`` を記録する。
     max_per_session: int = Field(default=5, ge=0)
     # 1 クエリ (= 1 unified_search 呼び出し) 内の最大発火回数。
     # 現行実装では LLM 再判定は 1 クエリあたり 1 回しか呼ばれないが、
@@ -111,22 +111,22 @@ class SelfRagAssistJudgeConfig(BaseModel):
     only_when_quality: list[str] = Field(default_factory=lambda: ["medium"])
 
     @model_validator(mode="after")
-    def validate_only_when_quality(self) -> "SelfRagAssistJudgeConfig":
+    def validate_only_when_quality(self) -> "SelfRagQualityJudgeConfig":
         valid = {"high", "medium", "low"}
         invalid = [q for q in self.only_when_quality if q not in valid]
         if invalid:
             raise ValueError(
-                "self_rag.assist_judge.only_when_quality に不正な値があります: "
+                "self_rag.quality_judge.only_when_quality に不正な値があります: "
                 f"{invalid}。許容値は {sorted(valid)}",
             )
         return self
 
 
-class SelfRagAssistNecessityConfig(BaseModel):
-    """Self-RAG アシスト検索必要性判定設定
+class SelfRagNecessityJudgeConfig(BaseModel):
+    """Self-RAG 補助タスク検索必要性判定設定
 
     ルールで `retrieve` / `skip` を確定できない短い質問 (uncertain) のみ
-    アシストモデルに 1 bit JSON (`{"need_rag": bool}`) を問い、`true` なら
+    補助タスクに 1 bit JSON (`{"need_rag": bool}`) を問い、`true` なら
     retrieve、`false` なら skip。失敗 / タイムアウト / 上限到達時は安全側
     (`retrieve`) にフォールバック。
 
@@ -134,7 +134,7 @@ class SelfRagAssistNecessityConfig(BaseModel):
     実行すべきか」を決めるゲートだが、実測で **ゲートがゲート対象の 165 倍**
     高くついていた:
 
-        necessity assist  median 3,407ms  (2,552〜4,165ms)
+        necessity judge   median 3,407ms  (2,552〜4,165ms)
         retrieval (実作業) median    21ms  (7〜24ms)
 
     21ms の作業を回避するかどうかを決めるのに 3.4 秒かける構図で、`skip` と
@@ -144,7 +144,7 @@ class SelfRagAssistNecessityConfig(BaseModel):
     無関係チャンクの混入は下流の品質判定 (Step 5) と
     「品質 low は添付しない」(Step 6.5) が既に防いでいる。
 
-    有効化すると assist 1 往復ぶんのレイテンシと引き換えに、検索を省く判断が
+    有効化すると LLM 1 往復ぶんのレイテンシと引き換えに、検索を省く判断が
     得られる。コーパスが十分大きく retrieval が実測で秒オーダーになる環境では
     再検討する価値がある (その場合は上の実測値を取り直すこと)。
     """
@@ -160,22 +160,22 @@ class SelfRagAssistNecessityConfig(BaseModel):
     max_per_query: int = Field(default=1, ge=0)
     # tracker キー互換 (本機能の quality ラベルは "uncertain" のみ)
     only_when_quality: list[str] = Field(default_factory=lambda: ["uncertain"])
-    # アシスト wall-clock 上限 (秒)。超過時は安全側 retrieve にフォールバック。
+    # 補助タスク wall-clock 上限 (秒)。超過時は安全側 retrieve にフォールバック。
     timeout_s: float = Field(default=5.0, gt=0.0, le=60.0)
-    # アシストプロンプトに埋め込む直前ターン数 (user + assistant 合計)。
+    # 判定プロンプトに埋め込む直前ターン数 (user + assistant 合計)。
     # 0 で会話文脈を含めない (旧挙動)。1〜2 が推奨。
     context_turns: int = Field(default=2, ge=0, le=10)
 
 
 class SelfRagContentGateConfig(BaseModel):
-    """取得直後の chunk 内容精査ゲート設定 (heuristics-first + 境界 assist)
+    """取得直後の chunk 内容精査ゲート設定 (heuristics-first + 境界 LLM 判定)
 
     ``unified_search`` の Step 4 マージ直後に低価値 chunk を pruning し、
     quality judge / query expansion の候補数を縮小
     する。create mode を主対象とし (chat mode は近似重複除去のみ)、安価な
     ヒューリスティック (relevance floor / 近似重複除去 / コードシグナル) で
-    大半を裁き、判断に迷う marginal band の prose チャンクだけアシストモデル
-    で 1 回判定する。``assist_client=None`` / cap 超過 / error 時はヒューリス
+    大半を裁き、判断に迷う marginal band の prose チャンクだけ補助タスク
+    で 1 回判定する。``aux_client=None`` / cap 超過 / error 時はヒューリス
     ティックのみで確定する。
     """
 
@@ -188,7 +188,7 @@ class SelfRagContentGateConfig(BaseModel):
     # unified_search は STM/LTM/カートリッジの cosine 類似度が基準。
     relevance_floor: float = Field(default=0.45, ge=0.0, le=1.0)
     # [floor, floor+marginal_band) を「判断に迷う帯」とし、create mode では
-    # この帯の prose チャンクのみ assist 判定に回す。
+    # この帯の prose チャンクのみ LLM 判定に回す。
     marginal_band: float = Field(default=0.10, ge=0.0, le=0.5)
     # 最低保持件数。pruning がこれを下回ったら上位から補填し生成を枯渇させない。
     min_keep: int = Field(default=3, ge=1)
@@ -196,11 +196,11 @@ class SelfRagContentGateConfig(BaseModel):
     dedup_jaccard: float = Field(default=0.85, ge=0.0, le=1.0)
     # create mode で marginal 帯のコードシグナル判定を有効化する。
     create_code_signal: bool = True
-    # marginal band の assist 救済を有効化する (false で純ヒューリスティック)。
-    assist_enabled: bool = True
-    # 1 セッションでの assist 発火上限 (0 以下で無制限)。
+    # marginal band の LLM 救済を有効化する (false で純ヒューリスティック)。
+    judge_enabled: bool = True
+    # 1 セッションでの LLM 判定発火上限 (0 以下で無制限)。
     max_per_session: int = Field(default=5, ge=0)
-    # 1 クエリでの assist 発火上限 (0 以下で無制限)。
+    # 1 クエリでの LLM 判定発火上限 (0 以下で無制限)。
     max_per_query: int = Field(default=1, ge=0)
 
 
@@ -225,17 +225,32 @@ class SelfRagRecallConfig(BaseModel):
 class SelfRagConfig(BaseModel):
     """Self-RAG 設定ルート
 
-    ルールベース Self-RAG の補助機能 (アシスト LLM 再判定 / 検索必要性
+    ルールベース Self-RAG の補助機能 (補助タスク LLM 再判定 / 検索必要性
     判定) をネスト構造に集約する。
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    assist_judge: SelfRagAssistJudgeConfig = Field(
-        default_factory=SelfRagAssistJudgeConfig,
+    # 品質 low と判定されたときの救済フロア (生スコア = cosine スケール)。
+    # フロア以上のチャンクだけを残して添付する (1 件も残らなければ空)。
+    # 0.0 で無効化 = 従来どおりクエリ単位の全件破棄へ切り戻せる。
+    # 既定 0.40 の根拠と実測は config.yaml.example / search_pipeline Step 6.5 を参照。
+    # Level 1 進化の対象外 (policy_interpreter の search ドメインに登録しない)。
+    low_quality_keep_floor: float = Field(default=0.40, ge=0.0, le=1.0)
+
+    # 品質 3 閾値 (relevance / support / confidence) の決め方。
+    # ``auto``  : 実ストアのスコア分布から較正した値を使う (埋め込みモデル指紋で
+    #             キャッシュ)。較正が無ければ config の静的値へ縮退する。
+    # ``manual``: config の静的値をそのまま使う (較正を無視)。
+    # 静的既定 0.65/0.50/0.80 は Qwen3-Embedding の分布前提の値で、他モデルでは
+    # 到達不能になりゲートが閉じたままになる (実測 LFM2.5-Embedding-350M で
+    # 記憶採用 0 件)。既定を ``auto`` にしてモデル差を吸収する。
+    threshold_mode: Literal["auto", "manual"] = "auto"
+    quality_judge: SelfRagQualityJudgeConfig = Field(
+        default_factory=SelfRagQualityJudgeConfig,
     )
-    assist_necessity: SelfRagAssistNecessityConfig = Field(
-        default_factory=SelfRagAssistNecessityConfig,
+    necessity_judge: SelfRagNecessityJudgeConfig = Field(
+        default_factory=SelfRagNecessityJudgeConfig,
     )
     content_gate: SelfRagContentGateConfig = Field(
         default_factory=SelfRagContentGateConfig,
@@ -313,7 +328,7 @@ class RAGConfig(BaseModel):
     confidence_threshold: float = Field(default=0.80, ge=0.0, le=1.0)
     hysteresis_band: float = Field(default=0.02, ge=0.0, le=0.5)
     # --- Self-RAG 補助機能 ---
-    # 旧 `assist_judge_enabled` は本ネスト構造 (`self_rag.assist_judge.enabled`)
+    # 旧 `aux_judge_enabled` は本ネスト構造 (`self_rag.quality_judge.enabled`)
     # へ移行された。後方互換は維持しない。
     self_rag: SelfRagConfig = Field(default_factory=SelfRagConfig)
 
@@ -405,7 +420,7 @@ class EmbeddingConfig(BaseModel):
     batch_size: int | None = Field(default=None, ge=1)
     ubatch_size: int | None = Field(default=None, ge=1)
     # スレッド数 (llama-server ``-t``)。0 = 省略し llama.cpp 自動検出 (全物理コア)。
-    # CPU 埋め込み (gpu_layers=null/0) 時に base/assist と CPU を分け合うため、
+    # CPU 埋め込み (gpu_layers=null/0) 時に base と CPU を分け合うため、
     # 物理コア数より小さい値を明示してヘッドルームを残せる。
     threads: int = Field(default=0, ge=0)
     # 並列スロット数 (llama-server ``-np``)。明示しないと n_parallel=auto (=4) が

@@ -7,7 +7,6 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-import httpx
 
 from backend.app_state import AppState
 from backend.free.api.chat.chat_constants import DEFAULT_WORKING_MAX_TOKENS
@@ -21,12 +20,10 @@ from backend.free.core.intent_vocab import (
 from backend.free.core.session_mode import is_chat_mode, normalize_session_mode
 from backend.free.core.inference import build_messages
 from backend.free.core.turn_text import append_to_last_user
-from backend.free.llm.assist_client import assist_ready
 from backend.free.llm.llm_client import LLMClient
 from backend.free.memory.pipeline.search_pipeline import unified_search
 from backend.utils import estimate_tokens as _estimate_tokens
 from backend.log_config import get_logger
-from backend.trace_context import get_trace_id
 
 if TYPE_CHECKING:
     from backend.free.core.stage_timer import StageTimer
@@ -117,11 +114,11 @@ async def prepare_memory_context(
             wm.session_id = req.session_id
             # 旧セッションの蓄積データをクリーンアップ（メモリ解放）
             clear_session_data(old_session_id)
-            # assist_judge のセッション単位カウンタもリセット
+            # quality_judge のセッション単位カウンタもリセット
             # 旧セッションの残存カウントで新セッションが session_cap に
             # 張り付くのを防ぐ。
-            if state.assist_judge_tracker is not None:
-                state.assist_judge_tracker.reset_session(old_session_id)
+            if state.judge_tracker is not None:
+                state.judge_tracker.reset_session(old_session_id)
             # conflict_chat_judge のセッション内発火カウンタも同様にリセット。
             if state.conflict_judge_tracker is not None:
                 state.conflict_judge_tracker.reset_session(old_session_id)
@@ -165,7 +162,7 @@ def convert_file_contexts(req: ChatRequest) -> list[FileContextDict] | None:
 class SearchPipelineResult:
     """検索パイプラインの結果（BUG-9: 成功/失敗/スキップの区別を明確化）"""
 
-    __slots__ = ("chunks", "scored_chunks", "error", "query_vec")
+    __slots__ = ("chunks", "scored_chunks", "error", "query_vec", "rag_top_score")
 
     def __init__(
         self,
@@ -173,10 +170,14 @@ class SearchPipelineResult:
         scored_chunks: list[tuple[str, float, str]] | None = None,
         error: str | None = None,
         query_vec=None,
+        rag_top_score: float | None = None,
     ):
         self.chunks = chunks
         self.scored_chunks = scored_chunks
         self.error = error
+        # 採用チャンクの生スコア (cosine) 最大値。``scored_chunks`` 側のスコアは
+        # 正規化後で Level 0 シグナルには使えない (SearchResult.top_raw_score 参照)。
+        self.rag_top_score = rag_top_score
         # クエリ埋め込み。MemoryInjector の関連度ゲートが再利用する
         # (検索が necessity judge で skip されても埋め込み自体は計算済みなので、
         #  ゲートを効かせるために持ち回る)。
@@ -257,22 +258,10 @@ async def run_search_pipeline(
             timer.stop("embedding_ms")
 
         wm, stm, ltm = mem_sys
-        # assist_judge のセッション上限判定に使う session_id は
+        # quality_judge のセッション上限判定に使う session_id は
         # WorkingMemory 側で常に同期されている (セッション切替時に
         # prepare_memory_context が wm.session_id を更新する)。
         session_id = getattr(wm, "session_id", None) or "default"
-        # アシスト判定プロンプト (AssistPromptManager 由来) を plain str で解決し注入する。
-        # search_pipeline (EvorefMem) / self_rag_judge (EvorefGen) から agent ピラーへ
-        # 越境 import しないため、composition 層 (api/chat) で文字列に解決して渡す。
-        # manager 未初期化や task 欠落時は None → judge 側の既定指示にフォールバック。
-        mgr = state.assist_prompt_manager
-        necessity_prompt = quality_prompt = None
-        if mgr is not None:
-            try:
-                necessity_prompt = mgr.get_assist_prompt("rag_necessity")
-                quality_prompt = mgr.get_assist_prompt("rag_quality")
-            except (ValueError, KeyError):
-                necessity_prompt = quality_prompt = None
         search_result = await unified_search(
             query=query,
             query_vec=query_vec,
@@ -281,7 +270,7 @@ async def run_search_pipeline(
             long_term=ltm,
             cartridge_mgr=state.cartridge_manager,
             config=cfg,
-            assist_client=state.assist_client,
+            aux_client=state.aux_client,
             debug_logger=state.debug_logger,
             mode=mode,
             policy=state.policy_interpreter,
@@ -289,10 +278,7 @@ async def run_search_pipeline(
             semmem_stats=_collect_semmem_stats(state),
             lazy_contextual=state.lazy_contextual,
             session_id=session_id,
-            assist_judge_tracker=state.assist_judge_tracker,
-            necessity_prompt=necessity_prompt,
-            quality_prompt=quality_prompt,
-            assist_experience_recorder=state.assist_experience_recorder,
+            judge_tracker=state.judge_tracker,
             mem_view=state.mem_view,
         )
         if not search_result.skipped and search_result.sources:
@@ -305,6 +291,7 @@ async def run_search_pipeline(
                 chunks=rag_chunks,
                 scored_chunks=search_result.sources,
                 query_vec=query_vec,
+                rag_top_score=search_result.top_raw_score,
             )
     except Exception as e:
         logger.warning("Search pipeline failed, continuing without RAG: %s", e)
@@ -392,32 +379,18 @@ def _chat_review_cfg(cfg: dict) -> dict:
     ) or {}
 
 
-async def maybe_resolve_pending_conflicts(
-    state: AppState, cfg: dict, history: list[ChatMessage], user_message: str,
-    *, allow_write: bool = True, session_id: str = "default",
-    mode: str = "chat",
+async def collect_pending_conflicts(
+    state: AppState, cfg: dict, *, mode: str = "chat",
 ) -> ConflictTurnContext:
-    """pending 競合のユーザー回答を assist で判定し、有効なら即時反映する。
+    """このターンで提示する pending 競合を集める。
 
-    SemMem 書込は sleep-time に閉じる不変則の例外 2 例目
-    (``conflict_review.apply_resolution``、CLAUDE.md §6.2)。
+    ユーザー回答の LLM 判定は撤去済み。pending は sleep-time の
+    ``conflict_resolution`` と TTL 自動解決に委ねる (docs/c_14 §1.2.5)。
+    本関数は注入用の pending グループを収集するだけで、SemMem へは書かない。
 
     ゲート:
     - ``memory.conflict.chat_review.enabled=false`` → 全体スキップ
     - pending 無し → 即 return
-    - ``allow_write=False`` (private ターン等) → 判定/書込スキップ (注入は継続)
-    - アシストが無い / 非常駐 (``residency: on_demand`` のチャット中) →
-      判定スキップ (注入は情報提示のみで継続)。pending は sleep-time の
-      ``conflict_resolution`` と TTL 自動解決に委ねる
-    - history に assistant 発話なし (= まだ確認を出していない) → 判定スキップ
-    - ``chat_review.max_judge_per_session`` 到達 → 判定**と注入**を停止
-      (回答されないまま毎ターン assist スロットを専有するのを避ける。pending は
-      次セッション or sleep-time TTL で解消する)
-
-    タイムアウト (インフラ的失敗) は「ユーザーが回答しなかった」判定とは
-    区別し、セッション cap を消費しない (呼出前に予約したカウントを
-    ``tracker.refund`` で払い戻す)。予約自体は並行リクエストでの cap
-    超過防止のため呼出前に行う。
 
     全例外は warning + 素通しでチャットを止めない。
     """
@@ -427,130 +400,8 @@ async def maybe_resolve_pending_conflicts(
         return ctx
     try:
         ctx.pending_groups = _collect_all_pending_groups(state, mode)
-        if not ctx.pending_groups:
-            return ctx
-        # セッション内発火上限: 到達済みなら判定も注入も止める。allow_write
-        # チェックより前に置き、private ターンでも注入を止める。
-        cap = int(review_cfg.get("max_judge_per_session", 3) or 0)
-        tracker = state.conflict_judge_tracker
-        if (
-            cap > 0
-            and tracker is not None
-            and tracker.get_session_count(session_id, namespace="conflict_chat_judge") >= cap
-        ):
-            logger.debug(
-                "conflict_chat_judge session cap reached (%d), "
-                "suppressing pending injection for session=%s",
-                cap, session_id,
-            )
-            ctx.pending_groups = []
-            return ctx
-        if not allow_write:
-            # private ターン: pending の提示 (注入) はするが、ユーザー回答判定に
-            # よる SemMem 書込 (apply_resolution) は行わない。private 契約
-            # (LTM/SemMem/履歴へ書かない) を競合解決経路でも守る。
-            return ctx
-        if not assist_ready(state.assist_client, "conflict_chat_judge"):
-            return ctx
-        last_assistant = next(
-            (
-                m.get("content", "")
-                for m in reversed(history)
-                if m.get("role") == "assistant"
-            ),
-            "",
-        )
-        if not last_assistant:
-            return ctx
-
-        from backend.free.memory.pipeline.conflict_review import (
-            apply_resolution,
-            judge_user_reply,
-        )
-
-        # assist を呼びに行く時点でカウント (タイムアウトでも realtime スロットは
-        # 消費されるため、呼出前に数える)。pending 無し / private / assist 未接続 /
-        # assistant 履歴なしの早期 return はここに到達せずカウントしない。
-        if tracker is not None:
-            count = tracker.record(session_id, namespace="conflict_chat_judge")
-            # 並行リクエストが上の cap チェックと record の間に割り込んで cap を
-            # 超えた場合、record の atomic な戻り値で判定し、このターンは judge を
-            # 打たず注入も止める (発火数が cap を超えないようにする)。
-            if cap > 0 and count > cap:
-                logger.debug(
-                    "conflict_chat_judge over session cap (%d/%d) for "
-                    "session=%s (concurrent); skipping judge this turn",
-                    count, cap, session_id,
-                )
-                ctx.pending_groups = []
-                return ctx
-            if cap > 0 and count >= cap:
-                logger.info(
-                    "conflict_chat_judge reached session cap (%d/%d) for "
-                    "session=%s; further turns skip judging and injection",
-                    count, cap, session_id,
-                )
-
-        try:
-            judgement = await judge_user_reply(
-                state.assist_client,
-                groups=ctx.pending_groups,
-                user_message=user_message,
-                last_assistant_message=last_assistant,
-            )
-        except (httpx.TimeoutException, TimeoutError):
-            if tracker is not None:
-                tracker.refund(session_id, namespace="conflict_chat_judge")
-            logger.warning(
-                "conflict_chat_judge timed out; not counted against "
-                "session cap (session=%s)", session_id,
-            )
-            return ctx
-        if judgement is None:
-            return ctx
-
-        index = judgement["group_index"]
-        group = ctx.pending_groups[index - 1]
-        action = judgement["action"]
-        winner = group.oldest if action == "keep_old" else group.newest
-        losers = [f.id for f in group.facts if f.id != winner.id]
-        store = state.get_semantic_store(group.scope)
-        result = apply_resolution(
-            store,
-            scope=group.scope,
-            action=action,
-            winner_id=winner.id,
-            loser_ids=losers,
-            merged_object=judgement["merged_object"] or None,
-            decision_source="user_chat",
-            trace_id=get_trace_id(),
-        )
-        ctx.resolved = result
-        ctx.resolved_group = group
-        logger.info(
-            "SemMem conflict resolved via chat: scope=%s action=%s winner=%s",
-            group.scope, action, winner.id,
-        )
-        if state.debug_logger is not None:
-            # 監査ログ失敗で後続の pending 再収集 (同ターン注入の整合) を
-            # 落とさないよう、debug ログ単体を握る。
-            try:
-                state.debug_logger.log_memory_op(
-                    "semmem_conflict_user_resolve",
-                    {
-                        "scope": group.scope,
-                        "action": action,
-                        "winner_id": result.winner_id,
-                        "superseded": len(result.superseded_ids),
-                        "new_fact_id": result.new_fact_id or "",
-                    },
-                )
-            except Exception as exc:
-                logger.warning("conflict resolve audit log failed: %s", exc)
-        # 解決を同ターンの注入へ反映するため pending を再収集
-        ctx.pending_groups = _collect_all_pending_groups(state, mode)
     except Exception as exc:
-        logger.warning("pending conflict chat review failed: %s", exc)
+        logger.warning("pending conflict collection failed: %s", exc)
     return ctx
 
 
@@ -607,14 +458,14 @@ def build_semmem_injection(
         logger.warning("semmem injection skipped: %s", e)
         rendered = None
 
-    conflict_block = _render_conflict_section(state, cfg, conflict_ctx)
+    conflict_block = _render_conflict_section(cfg, conflict_ctx)
     if conflict_block:
         rendered = f"{rendered}\n\n{conflict_block}" if rendered else conflict_block
     return rendered
 
 
 def _render_conflict_section(
-    state: AppState, cfg: dict, conflict_ctx: ConflictTurnContext | None,
+    cfg: dict, conflict_ctx: ConflictTurnContext | None,
 ) -> str | None:
     """pending 競合セクション (+ 解決済み通知) を組み立てる。失敗時は None。"""
     if conflict_ctx is None:
@@ -631,9 +482,8 @@ def _render_conflict_section(
         parts: list[str] = []
         block = render_pending_conflicts_block(
             conflict_ctx.pending_groups,
-            # 回答を促す文言は「その回答を判定できる」ときだけ出す。
-            # アシスト非常駐では judge が動かないため、指示なしの情報提示に留める。
-            instruct=assist_ready(state.assist_client, "conflict_chat_judge"),
+            # 回答を判定する経路が無いので、指示なしの情報提示に留める。
+            instruct=False,
             max_groups=int(review_cfg.get("max_groups", 3) or 0),
             max_tokens=int(review_cfg.get("max_tokens", 400) or 0),
         )

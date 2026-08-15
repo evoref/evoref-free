@@ -22,8 +22,8 @@ class PromptModeStatus(BaseModel):
     model_calibrated_for: str = ""
 
 
-class AssistTaskStatus(BaseModel):
-    """アシストタスク別プロンプト最適化状態"""
+class AuxTaskStatus(BaseModel):
+    """補助タスクタスク別プロンプト最適化状態"""
     task: str
     version: int
     source: str  # "default" | "manual" | "evolution"
@@ -34,7 +34,7 @@ class AssistTaskStatus(BaseModel):
 class Level1Status(BaseModel):
     """Level 1 (プロンプト進化) の状態"""
     modes: list[PromptModeStatus] = Field(default_factory=list)
-    assist_tasks: list[AssistTaskStatus] = Field(default_factory=list)
+    aux_tasks: list[AuxTaskStatus] = Field(default_factory=list)
     generations: int
     population_size: int
     min_experiences: int
@@ -46,10 +46,9 @@ class Level2Status(BaseModel):
     sparse_params: int
     min_failures: int
     lora_adapter_exists: bool
-    # #3a: 既定 (base=lora / assist=none) は no-op でトリガ段階 skip される。UI が
+    # #3a: 既定 (base=lora) は no-op でトリガ段階 skip される。UI が
     # 「設定済・待機中」と誤解しないよう、有効メソッドと実行可否を明示する。
     base_method: str = "lora"          # lora | cvector
-    assist_method: str = "none"        # none | spsa-real-eval
     active_method: str = "none"        # cvector | spsa-real-eval | none
     will_run: bool = False             # 実メソッドが有効か (no-op skip でないか)
 

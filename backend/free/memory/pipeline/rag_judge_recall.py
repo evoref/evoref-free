@@ -3,9 +3,9 @@
 ``ToolCallJudge._try_recall_url`` / ``_try_recall_executable_command`` と
 同型のパターン。``mem.world.rag_necessity.*`` / ``mem.world.rag_quality.*``
 を query embedding で検索し、類似度 + 過去自己採点平均 + TTL 減衰の閾値を
-満たせば assist 呼出を完全スキップして即決定する。
+満たせば aux 呼出を完全スキップして即決定する。
 
-LLM 不使用・``AssistJudgeUsageTracker`` 予算を消費しない。書込は
+LLM 不使用・``JudgeUsageTracker`` 予算を消費しない。書込は
 sleep-time (``backend.free.memory.sleep.rag_judge_curator``) に限定される
 (CLAUDE.md §6 #2)。本モジュールは読取のみ。
 """

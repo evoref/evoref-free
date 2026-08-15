@@ -72,7 +72,7 @@ def register_pro_pillar_setup(pillar: str, setup) -> None:
     """Pro pillar 別 setup フックを登録する
 
     ``wire_pillars()`` は該当 pillar の構築フェーズでこのフックを参照し、
-    Pro 拡張オブジェクト (ProAssistComponents / WidgetProxyManager 等) を
+    Pro 拡張オブジェクト (ProLearnComponents / WidgetProxyManager 等) を
     取得する。Free エディションでは登録されないため、
     :func:`get_pro_pillar_setup` が ``None`` を返す。
 

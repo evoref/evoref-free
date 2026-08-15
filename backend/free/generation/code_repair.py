@@ -1,16 +1,16 @@
 """生成コードの検証ゲート付きリペア
 
 長文コード生成の最終段で assembled コードを検証し、エラーが残る場合に
-アシストモデル (低温) で修正 → 再検証を最大 N ラウンド繰り返し、検出エラーが
+補助タスク (低温) で修正 → 再検証を最大 N ラウンド繰り返し、検出エラーが
 最小の版を採用する。
 
 - Python: ``validate_python`` (AST 構文 + 未定義名) で厳密検証し、各ラウンドで
   検出エラーが減った版のみ採用する (悪化させない)。
-- 他言語 (TS/Svelte/Rust 等): AST 検証器が無いため、アシストによる軽い構文
+- 他言語 (TS/Svelte/Rust 等): AST 検証器が無いため、補助タスクによる軽い構文
   自己点検を 1 回だけ行う。長さが極端に変動した応答 (prose 混入 / truncation)
   は破棄して原文を維持する。
 
-アシスト不在 (degraded) / 機能無効 / 例外時はいずれも原文をそのまま返す
+補助タスク不在 (degraded) / 機能無効 / 例外時はいずれも原文をそのまま返す
 (出力経路を止めず、品質を悪化させない)。
 """
 
@@ -35,10 +35,10 @@ logger = get_logger("generation.code_repair")
 # 修正後コード出力に許す最大トークン (元コード規模 + 余裕、上限でガード)。
 _MAX_OUTPUT_TOKENS = 6144
 
-# assist context_size に対する安全マージン (chat template / 特殊トークン分)。
+# aux context_size に対する安全マージン (chat template / 特殊トークン分)。
 _CONTEXT_SAFETY_MARGIN = 256
 
-# 拡張子 → 言語ラベル (assist 自己点検プロンプト + Python 判定)。
+# 拡張子 → 言語ラベル (aux 自己点検プロンプト + Python 判定)。
 _EXT_LANG: dict[str, str] = {
     "py": "python", "pyi": "python",
     "ts": "TypeScript", "tsx": "TypeScript",
@@ -121,7 +121,7 @@ def _py_error_count(
 
 
 def _extract_content(resp: object) -> str:
-    """AssistModelClient.generate の OAI 互換 dict から content を取り出す。"""
+    """AuxClient.generate の OAI 互換 dict から content を取り出す。"""
     if isinstance(resp, dict):
         choices = resp.get("choices") or []
         if choices and isinstance(choices[0], dict):
@@ -133,11 +133,11 @@ class CodeRepairer:
     """検証ゲート付きのコードリペア。"""
 
     def __init__(
-        self, assist_client, config: dict | None = None, *,
+        self, aux_client, config: dict | None = None, *,
         debug_logger: DebugLogger | None = None,
     ):
-        # 監査 (_is_assist_receiver) がレシーバ名で検出できるよう ``_assist_client``。
-        self._assist_client = assist_client
+        # 監査 (_is_aux_receiver) がレシーバ名で検出できるよう ``_aux_client``。
+        self._aux_client = aux_client
         self._lf = (config or {}).get("long_form", {})
         self._debug_logger = debug_logger
 
@@ -159,7 +159,7 @@ class CodeRepairer:
         """
         if not self._lf.get("repair_enabled", True):
             return assembled
-        if self._assist_client is None or not assembled.strip():
+        if self._aux_client is None or not assembled.strip():
             return assembled
         max_rounds = int(self._lf.get("max_repair_rounds", 2))
         if max_rounds <= 0:
@@ -236,16 +236,16 @@ class CodeRepairer:
 
     async def _ask(self, prompt: str, code: str) -> str:
         max_tokens = min(_MAX_OUTPUT_TOKENS, max(512, int(estimate_tokens(code) * 1.4)))
-        context_size = getattr(self._assist_client, "context_size", 8192)
+        context_size = getattr(self._aux_client, "context_size", 8192)
         prompt_tokens = estimate_tokens(prompt)
         if prompt_tokens + max_tokens > context_size - _CONTEXT_SAFETY_MARGIN:
             logger.warning(
                 "code repair skipped: prompt=%d tok + output budget=%d tok "
-                "exceeds assist context_size=%d; returning original",
+                "exceeds aux context_size=%d; returning original",
                 prompt_tokens, max_tokens, context_size,
             )
             return ""
-        resp = await self._assist_client.generate(
+        resp = await self._aux_client.generate(
             [{"role": "user", "content": prompt}],
             purpose="code_repair",
             temperature=0.2,

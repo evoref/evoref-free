@@ -6,7 +6,7 @@ set "SCRIPT_DIR=%~dp0"
 set "PROJECT_ROOT=%SCRIPT_DIR%.."
 cd /d "%PROJECT_ROOT%"
 
-rem ── 引数解析 ──
+rem --- Argument parsing ---
 set "SHARED_PATH="
 set "FORCE="
 :parse_args
@@ -49,7 +49,7 @@ exit /b 0
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 
-rem ── 依存コマンド確認 ──
+rem --- Dependency check ---
 call :check_dep python "python.org or winget install Python.Python.3"
 if errorlevel 1 exit /b 1
 call :check_dep npm "nodejs.org or winget install OpenJS.NodeJS"
@@ -57,7 +57,7 @@ if errorlevel 1 exit /b 1
 call :check_dep git "git-scm.com or winget install Git.Git"
 if errorlevel 1 exit /b 1
 
-rem ── モデルパス検証 ──
+rem --- Model path validation ---
 if defined SHARED_PATH (
     if not exist "!SHARED_PATH!" (
         echo ERROR: Shared path does not exist: !SHARED_PATH!
@@ -70,7 +70,7 @@ if defined SHARED_PATH (
         echo   +-- models\    ^(GGUF model files^)
         exit /b 1
     )
-    rem 絶対パスに変換
+    rem Convert to an absolute path
     pushd "!SHARED_PATH!"
     set "SHARED_PATH=!CD!"
     popd
@@ -82,7 +82,7 @@ if defined SHARED_PATH echo Shared path:  !SHARED_PATH!
 if defined FORCE echo Mode:          FORCE REINSTALL
 echo.
 
-rem ── 1. Python 仮想環境 ──
+rem --- 1. Python virtual environment ---
 echo [1/6] Creating Python virtual environment...
 if defined FORCE if exist ".venv" (
     echo   [force] Removing existing .venv...
@@ -97,7 +97,7 @@ if not exist ".venv" (
 
 call .venv\Scripts\activate.bat
 
-rem ── 2. Python パッケージ ──
+rem --- 2. Python packages ---
 echo [2/6] Installing Python dependencies...
 python -m pip install --upgrade pip -q
 if defined FORCE (
@@ -109,7 +109,7 @@ if defined FORCE (
 )
 echo   Done
 
-rem ── 3. フロントエンド依存 ──
+rem --- 3. Frontend dependencies ---
 echo [3/6] Installing frontend dependencies...
 if defined FORCE if exist "frontend\node_modules" (
     echo   [force] Removing existing node_modules...
@@ -120,7 +120,7 @@ call npm install --silent
 cd /d "%PROJECT_ROOT%"
 echo   Done
 
-rem ── 4. config.yaml ──
+rem --- 4. config.yaml ---
 echo [4/6] Setting up config.yaml...
 if defined FORCE if exist "config.yaml" (
     echo   [force] Overwriting existing config.yaml
@@ -138,7 +138,7 @@ if not exist "config.yaml" (
 )
 
 if defined SHARED_PATH if exist "config.yaml" (
-    rem GGUF モデルファイルを検索
+    rem Look for a GGUF model file
     set "GGUF_PATH="
     for %%f in ("!SHARED_PATH!\models\*.gguf") do (
         if not defined GGUF_PATH (
@@ -151,21 +151,21 @@ if defined SHARED_PATH if exist "config.yaml" (
         echo   WARNING: No .gguf file found in !SHARED_PATH!\models\
         echo            Please update model_paths.base_model in config.yaml manually.
     )
-    rem config.yaml の model_paths を更新
+    rem Update model_paths in config.yaml
     python scripts\configure_shared_path.py "!SHARED_PATH!" "!GGUF_PATH!"
     echo   Updated config.yaml with shared paths
 )
 
-rem ── 5. モデル配置チェック ──
+rem --- 5. Model placement check ---
 echo [5/6] Checking models...
 if defined SHARED_PATH (
     echo   Using shared path. Models expected at: !SHARED_PATH!\models\
 ) else (
-    rem 自動ダウンロードは廃止。GGUF は models\ へ手動配置する。
+    rem Automatic download was dropped; place GGUF files into models\ manually.
     python scripts\download_model.py
 )
 
-rem ── 6. ローカルディレクトリ ──
+rem --- 6. Local directories ---
 echo [6/6] Creating local directories...
 for %%d in (
     "local\models"
@@ -203,7 +203,7 @@ echo.
 endlocal
 goto :eof
 
-rem ── 依存コマンド確認 ──
+rem --- Dependency check ---
 :check_dep
 where %~1 >nul 2>&1
 if errorlevel 1 (

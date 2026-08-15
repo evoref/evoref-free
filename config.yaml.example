@@ -70,7 +70,7 @@ runtime:
   # 詳細 docs/c_15_model_capability_adaptation.md。
   capability_probe: true
 
-  # llama.gpu_layers / assist_model.local.gpu_layers が "auto" の場合に
+  # llama.gpu_layers が "auto" の場合に
   # GPU 物理容量から差し引く Vulkan host buffer 予約量 (MiB)。
   # iGPU 環境で embed (CPU モード) が起動時に確保する pinned buffer 用
   # の余裕。既定 4 GiB は AMD Radeon 890M + 既定の embed モデル構成での
@@ -128,10 +128,12 @@ llama:
   flash_attn: true                # -fa / Flash Attention の有効化
   mlock: false                    # --mlock / モデルを RAM に固定
   cache_prompt: true              # KVキャッシュ再利用（共通プレフィックスの再計算をスキップ）
-  slots: 1                        # -np / 並列スロット数（1=単一, 2=チャット+バックグラウンド分離）
-                                  # 1: VRAM 節約（KV キャッシュ半減）が既定。チャットとバックグラウンド
-                                  #    処理が 1 スロットを共有・直列化する
-                                  # 2: チャットとバックグラウンド処理の KV キャッシュを分離（VRAM 余裕時）
+  slots: 2                        # -np / 並列スロット数（1=単一, 2=チャット+バックグラウンド分離）
+                                  # 2: 既定。学習 (Level 1 変異) と sleep-time がチャットと別スロットを使い、
+                                  #    プレフィクスキャッシュを潰し合わない。kv_unified が自動付与されるので
+                                  #    per-seq context は n_ctx のまま（VRAM 増なし）
+                                  # 1: 単一スロット。チャットとバックグラウンド処理が直列化し、
+                                  #    学習中のチャットが 1 呼出ぶん待たされる
   cache_type_k: q8_0              # --cache-type-k / KV key 量子化
                                   #   f16: 基準（VRAM最大）, bf16: bf16学習モデル向け
                                   #   q8_0: 推奨（VRAM半減、品質劣化ほぼゼロ）
@@ -154,9 +156,8 @@ llama:
   # --- idle slot offload ---
   # cache_ram_mib: -1=無制限 / 0=disable / >0=MiB 上限 (host RAM 退避量。VRAM 非依存)
   #   上流デフォルト 8192 を黙従しないよう launch_llama.py が常に明示付与する。
-  #   既定 slots=1 では退避対象の idle slot が存在しないため 0 で無効化し
-  #   host RAM 予約を省く。slots を 2 以上にしても per-seq context は kv_unified
-  #   (下記) が守るので、cache_ram_mib は RAM 退避が欲しい時のみ >0 にすればよい。
+  #   既定は 0 (無効) で host RAM 予約を省く。slots >= 2 でも per-seq context は
+  #   kv_unified (下記) が守るので、cache_ram_mib は RAM 退避が欲しい時のみ >0 にすればよい。
   # cache_idle_slots: 上流既定 true (idle slot を退避対象にする)。
   #   false で機構自体を OFF（``--no-cache-idle-slots`` 付与）。
   # kv_unified: null=auto (slots>1 で ``--kv-unified`` 自動付与) / true|false で明示上書き。
@@ -180,12 +181,16 @@ llama:
   speculative:
     enabled: false                # Pro でも opt-in
     mode: default                 # default | ngram-mod | ngram-cache | ngram-simple | ngram-map-k | ngram-map-k4v | draft-model
-    draft_max: 64                 # ``--draft-max`` (1 サイクルの最大 draft トークン数)
-    draft_min: 48                 # ``--draft-min``
+    # 実フラグは mode 依存 (上流が 2026-05 に総称名を削除し mode 別へ分割したため)。
+    draft_max: 64                 # ngram-mod 系→``--spec-ngram-mod-n-max`` / 他→``--spec-draft-n-max``
+    draft_min: 48                 # ngram-mod 系→``--spec-ngram-mod-n-min`` / 他→``--spec-draft-n-min``
     draft_p_min: null             # ``--draft-p-min`` (greedy 採択の確率閾値、null=未指定)
-    ctx_size_draft: 0             # ``-cd`` (0 = model から取得、上流既定)
-    ngram_size_n: 24              # ``--spec-ngram-size-n``
-    ngram_size_m: null            # ``--spec-ngram-size-m`` (null=未指定)
+    ctx_size_draft: 0             # ⚠ 現在は無視される (上流が ``-cd`` を削除)。>0 で warning
+    ngram_size_n: 24              # ngram-mod 系→``--spec-ngram-mod-n-match`` /
+                                  # ngram-simple・map-k・map-k4v→``--spec-<mode>-size-n`` /
+                                  # ngram-cache・draft-model→無視 (warning)
+    ngram_size_m: null            # ngram-simple・map-k・map-k4v→``--spec-<mode>-size-m`` /
+                                  # それ以外→無視 (warning)。null=未指定
     # mode="draft-model" 時のみ使用
     draft_model_path: null        # 外部 draft GGUF パス (相対 / 絶対)
     gpu_layers_draft: null        # ``-ngld`` (null=auto, 整数, "all" を許容)
@@ -198,7 +203,7 @@ llama:
   mtp:
     enabled: false                # 対応モデルで true にすると MTP を有効化
     draft_n_max: 3                # ``--spec-draft-n-max`` (1 サイクルの draft トークン数、上流既定 3)
-  # モデル別の起動フラグ / sampling 自動決定 (base / assist 共通)。
+  # モデル別の起動フラグ / sampling 自動決定。
   # true: GGUF の general.architecture を読み、以下 4 層から --jinja /
   #       --reasoning-format / MoE / context_size / sampling 既定を解決する。
   #         (1) models/profiles/<arch>.yaml            同梱・arch 既定
@@ -264,12 +269,10 @@ theme:
 # 相対パスはプロジェクトルートからの相対、絶対パスはそのまま使用。
 model_paths:
   base_model: models/gemma-4-12b-it-qat-q4_0.gguf    # ベース GGUF モデル（models/ に配置）
-  assist_model: models/gemma-4-E4B_q4_0-it.gguf      # アシスト GGUF モデル（メモリ・RAG処理用）
   embed_model: models/Qwen3-Embedding-0.6B-Q8_0.gguf # 埋め込み用 GGUF モデル（llama-cpp バックエンド用）
   create_model: null                                 # クリエイトモード用 GGUF（null/空欄 = base_model にフォールバック）
-  assist_create_model: null                          # クリエイトモード用アシスト GGUF（null/空欄 = assist_model にフォールバック）
                                                       # 設定すると /api/mode/switch が chat⇄create 切替時に
-                                                      # アシストサーバも非破壊的 (config.yaml 非変更) に差し替える
+                                                      # 補助タスクサーバも非破壊的 (config.yaml 非変更) に差し替える
 
 # ===== ベースモデル移行 / 起動時整合性チェック =====
 model_migration:
@@ -286,14 +289,14 @@ model_migration:
   auto_migrate_on_startup: false
 
 # ===== llama-server プロセス管理 =====
-# enabled=true で lifespan 起動時に 3 種 (base/assist/embedding) の
+# enabled=true で lifespan 起動時に 2 種 (base/embedding) の
 # llama-server を自動 spawn し、`POST /api/model/{component}/migrate` 実行時に
 # 自動再起動 + クライアント差し替えを行う。false (デフォルト) の場合は
 # 従来通り `scripts/launch_llama.py` を別途実行するワークフロー互換。
 process_manager:
   # ⚠ enabled は未実装で、現状どこからも参照されない (true にしても挙動は
   #   変わらない)。llama-server の起動は launch_llama / evoref-ctl と、
-  #   アシストのオンデマンド常駐 (AssistResidencyManager) が担当する。
+  #   補助タスクのオンデマンド常駐 (AuxResidencyManager) が担当する。
   enabled: false           # 未実装（予約）
   health_timeout: 120      # 起動後ヘルスチェック待機時間 (秒)。大きい create GGUF の load を待てる値。モード切替・サーバ起動 API と共用
   stop_timeout: 10         # SIGTERM 後のグレースフル終了待機時間 (秒)
@@ -310,14 +313,11 @@ auto_serve:
 # ValidationError で検出される。
 local_paths:
   themes_dir: local/themes/              # テーマパッケージディレクトリ
-  # LoRA / アシスト LoRA / 埋め込み LoRA (Pro 限定機能 — Free では未使用だが PathResolver が参照する)
+  # LoRA / 補助タスク LoRA / 埋め込み LoRA (Pro 限定機能 — Free では未使用だが PathResolver が参照する)
   lora_adapter: local/models/adapter.gguf                          # ベース LoRA アダプタ
   lora_versions_dir: local/lora_versions/                          # ベース LoRA スナップショット
   lora_spsa_checkpoint: local/models/lora_spsa_checkpoint.json     # ベース LoRA SPSA の再開チェックポイント
   lora_archive_dir: local/lora_archive/                            # ベース LoRA アーカイブ (古い世代)
-  assist_lora_adapter: local/models/assist_adapter.gguf            # アシスト LoRA アダプタ
-  assist_lora_versions_dir: local/models/assist_lora_versions/     # アシスト LoRA スナップショット
-  assist_lora_spsa_checkpoint: local/models/assist_lora_spsa_checkpoint.json  # アシスト LoRA SPSA の再開チェックポイント
   control_vector_adapter: local/models/control_vector.gguf            # base=C control vector 本体 (Pro)
   control_vector_versions_dir: local/models/control_vector_versions/  # control vector スナップショット (Pro)
   cvector_work_dir: local/cvector/                                 # control vector 生成の positive/negative 作業用 (Pro)
@@ -335,10 +335,10 @@ local_paths:
   # 学習・経験・状態
   learning_dir: local/learning/                      # base 学習データの (モデル×モード) パーティションルート (learning.partition_by_base_model=true 時に使用)
   experience_file: local/experience.json             # ベースモデル経験バッファ
-  experience_assist_file: local/experience_assist.json   # アシストモデル経験バッファ
   eval_core_file: local/eval_core.json               # ベースモデル コア評価セット
-  eval_assist_file: local/eval_assist.json           # アシストモデル コア評価セット
-  assist_calibration_file: local/assist_calibration.json # アシスト purpose 別 timeout の反応的自己較正値 (モデル切替後に自動調整)
+  aux_experience_file: local/aux_experience.json     # 補助タスク (RAG 必要性/品質・ツール判定) の経験バッファ。Level 1 Phase 2 の進化が読む
+  aux_prompts_dir: local/aux_prompts/                # 補助タスクのタスク別プロンプト (partition 有効時は base モデル配下へ rebase)
+  aux_calibration_file: local/aux_calibration.json   # 補助タスク purpose 別 timeout の反応的自己較正値 (モデル切替後に自動調整)
   rag_judge_events_file: local/rag_judge_events.jsonl # RAG necessity/quality 判定イベント (sleep-time が world_fact 化するまでの保持先)
   learned_patterns_file: local/learned_patterns.json # 学習済みパターン検出キーワード
   model_state_file: local/model_state.json           # モデル切替・LoRA 装着状態の永続化
@@ -398,24 +398,24 @@ rag:
   #   list → 指定リストで上書き
   bm25_stopword_bigrams: null
   # --- Contextual Retrieval ---
-  # チャンク登録時にアシストモデルでドキュメント文脈プレフィックスを生成し、
+  # チャンク登録時に補助タスクでドキュメント文脈プレフィックスを生成し、
   # 埋め込み・BM25 の両方で検索精度を向上させる。
   # 参考: https://www.anthropic.com/news/contextual-retrieval
   contextual_prefix:
-    enabled: true                # Contextual Retrieval の有効/無効（アシストモデル必須）
+    enabled: true                # Contextual Retrieval の有効/無効（補助タスク必須）
     # eager: Sleep-time Step 5.8 で未生成 chunk を一括生成 (従来動作)
     # lazy : retrieval 時に hit した chunk のみ on-demand 生成 (大規模カートリッジ向け)
     mode: eager
     max_tokens: 128              # プレフィックス生成の最大トークン数
-    max_doc_chars: 6000          # プレフィックス生成時のドキュメント全文上限文字数（超過時はトランケート）。assist_model.local.context_size を超えないよう注意
+    max_doc_chars: 6000          # プレフィックス生成時のドキュメント全文上限文字数（超過時はトランケート）。llama.context_size を超えないよう注意
     batch_size: 10               # sleep-time で 1 回に処理するチャンク数上限
     # 生成対象の最小チャンクトークン数。短文は prefix の retrieval 寄与が薄いためスキップ
     min_chunk_tokens: 200
     # lazy モード時: retrieval でこの回数以上 hit した chunk のみ prefix を永続化
     lazy_hit_threshold: 2
     # プレフィックス生成プロンプト。プレースホルダ {document} {chunk} 必須。
-    # 空 (既定) で日本語テンプレートを使用。英語専用 / 中国語専用アシスト
-    # モデルに切替えた場合はここをアシストモデルの学習言語のテンプレートに
+    # 空 (既定) で日本語テンプレートを使用。英語専用 / 中国語専用補助タスク
+    # モデルに切替えた場合はここを補助タスクの学習言語のテンプレートに
     # 差し替えること (品質低下を防ぐため)。
     prompt_template: ""
   # --- ベクトル量子化 ---
@@ -461,8 +461,55 @@ rag:
   hysteresis_band: 0.02          # ヒステリシス幅（閾値近傍の揺れを吸収）
   # --- Self-RAG 補助機能 ---
   self_rag:
-    assist_judge:
-      enabled: true               # アシストモデルによる品質再判定（marginal 結果の救済）
+    # 品質 low のときの救済フロア (生スコア = cosine スケール、0.0 で無効)。
+    #
+    # 上の 3 閾値は merged 全体の top_score という **単一スカラ** なので、
+    # 「この質問に記憶が要るか」を弁別しない。実測 2026-08-12 (LFM2.5-Embedding
+    # -350M / STM 94 / LTM 103 / 監査 24 クエリ): 記憶が要るクエリの top_score
+    # 中央値 0.472 に対し、要らないクエリは 0.541 と逆転していた。閾値をどこに
+    # 動かしても誤注入 >= recall にしかならない。一方で正解ノート自体は 5 プローブ
+    # 中 3 件で merged 1 位 (0.547 / 0.605 / 0.544) に来ており、検索は当たって
+    # いた。実会話 31 ターンで採用 0 件だったのは全件破棄が効いていたため。
+    #
+    # そこで low のときだけ「クエリ単位の全件破棄」からこのフロアによる
+    # 「チャンク単位の絞り込み」へ落とす。フロア別の実測 (正解が残る件数 /
+    # 記憶不要クエリの通過チャンク数): 0.45 -> 3/5・平均 1.3 件、
+    # 0.40 -> 4/5・平均 1.3 件、0.35 -> 5/5・平均 2.8 件。
+    #
+    # NOTE: この値は Level 1 進化の対象外 (policy_interpreter の search ドメインに
+    # 登録していない)。ゲートはモデルが何を見るかを決めるので、モデル自身の出力
+    # 由来の turn_outcome で自動調整すると閉ループになる。一方 **フロアがまたぐ
+    # スコア分布のほうは進化する** (search ポリシーの stm_top_k / top_k / rrf_k /
+    # bm25_weight / vector_weight / salience_w_* / noise_sigma)。embedding family
+    # を替えたときと同様、`Search results below quality floor` の
+    # `N/M chunks passed` をログで見て、通過率が常時 0 / 常時全件へ寄っていないか
+    # 確認すること。
+    #
+    # NOTE: 上の 0.45/0.40/0.35 の実測は **旧スケール** (STM が
+    # `0.6*cos + 0.4*lightmem` を流していた頃) で取ったもの。ゲートが素の cosine を
+    # 受け取るようになった現在、0.40 は実測 need の下限 0.338 / p25 0.367 を上回り、
+    # 救済すべき単発ヒットを捨てる。そのため threshold_mode: auto では本値ではなく
+    # **較正済み relevance と同じ棒**を使う (「関連性の棒を越えたチャンクは集計判定が
+    # low でも残す」)。manual では本値をそのまま使う。0.0 は「従来どおりクエリ単位の
+    # 全件破棄」で、auto でも 0.0 が優先される。
+    low_quality_keep_floor: 0.40
+    # 品質3閾値 (rag.relevance_threshold / support_threshold / confidence_threshold)
+    # の決め方。
+    #   auto   : 実ストアのスコア分布から較正した値を使う (既定)。較正結果は
+    #            埋め込みモデル指紋 (model_id + 次元) をキーに
+    #            local/memory/threshold_calibration.json へキャッシュされ、
+    #            モデルを替えると自動的に無効化されて再較正される。
+    #            較正がまだ無い場合は下の静的値へ縮退する。
+    #   manual : 下の静的値をそのまま使う (較正を無視)。
+    #
+    # 静的既定 0.65/0.50/0.80 は Qwen3-Embedding の cosine 分布を前提にした値。
+    # 別ファミリの埋め込みへ替えると到達不能になりゲートが閉じたままになる
+    # (実測 2026-08-12、LFM2.5-Embedding-350M: 記憶が要るクエリの top cosine が
+    # 0.338〜0.636 に対し relevance=0.65 は一度も超えず、31 ターンの実会話で
+    # 記憶採用 0 件)。auto はこのモデル差を吸収する。
+    threshold_mode: auto
+    quality_judge:
+      enabled: true               # 補助タスクによる品質再判定（marginal 結果の救済）
       # 発火する top_score の上限。実効果は medium → low の格下げ (チャンク破棄) だけで、
       # medium → high は Step 6.5 で medium と同じ扱い (添付) なので何も変わらない。
       # 実測 2026-08-01: 11 発火中 8 件が medium → high = 6 秒かけて挙動不変だった。
@@ -472,50 +519,50 @@ rag:
       max_per_session: 5          # 1 セッション内の発火上限 (0 以下で無制限)
       max_per_query: 1            # 1 クエリ内の発火上限 (0 以下で無制限)
       only_when_quality: ["medium"]  # 発火条件の quality ラベル (high/medium/low から指定)
-    assist_necessity:
+    necessity_judge:
       # 検索必要性のハイブリッド 3 値判定 (Phase 1 で旧 2 値から拡張)。
       # ルール層 (URL含む / 明示fetch動詞 / TRIVIAL / 長文 question) で
-      # `retrieve` / `fetch` / `skip` が確定するケースはアシスト 0 呼び出しで即返す。
-      # それ以外の uncertain ケースだけ アシストモデルに 3 値 JSON
+      # `retrieve` / `fetch` / `skip` が確定するケースは補助タスク 0 呼び出しで即返す。
+      # それ以外の uncertain ケースだけ 補助タスクに 3 値 JSON
       # ({"action": "retrieve" | "fetch" | "skip"}) を問い合わせる。
       # `fetch` は外部 fetch_url ツールに委ねるシグナルで、search_pipeline は
       # `skip` 同等にローカル RAG をスキップする。
       # 失敗 / タイムアウト / 上限到達時は安全側 (`retrieve`) にフォールバック。
       #
       # 既定は false。2026-08-01 の実測でゲートがゲート対象の 165 倍高くついた:
-      #   necessity assist  median 3,407ms / retrieval (実作業) median 21ms
+      #   necessity judge   median 3,407ms / retrieval (実作業) median 21ms
       # 21ms の作業を省くか決めるのに 3.4 秒かかる構図で、skip と判定した
       # ターンでも判定料金は必ず発生する。false のときは uncertain が安全側の
       # retrieve に倒れる (取りこぼしではなく「常に引く」方向へ縮退)。
       # 無関係チャンクは下流の品質判定と「品質 low は添付しない」が防ぐ。
       # コーパスが大きく retrieval が秒オーダーになる環境では true を検討する
       # (その際は necessity_ms / retrieval_ms を実測し直すこと)。
-      enabled: false              # uncertain 時のアシスト発火 (true で有効化)
+      enabled: false              # uncertain 時の補助タスク発火 (true で有効化)
       max_per_session: 10         # 1 セッション内の発火上限 (0 以下で無制限)
       max_per_query: 1            # 1 クエリ内の発火上限 (0 以下で無制限)
       only_when_quality: ["uncertain"]  # tracker キー (互換、変更非推奨)
-      timeout_s: 5.0              # アシスト wall-clock 上限 (秒)
-      context_turns: 2            # アシストプロンプトに含める直前ターン数 (0 で会話文脈なし)
+      timeout_s: 5.0              # 補助タスク wall-clock 上限 (秒)
+      context_turns: 2            # 補助タスクプロンプトに含める直前ターン数 (0 で会話文脈なし)
     content_gate:
       # 取得直後 (Step 4 マージ後) の chunk 内容精査ゲート。低価値 chunk を
       # 事前 pruning し、quality judge / query expansion の候補数を
       # 縮小する。create mode を主対象 (chat mode は近似重複除去のみ)。判断に
-      # 迷う marginal band の prose チャンクだけ assist で 1 回関連性を判定する。
+      # 迷う marginal band の prose チャンクだけ LLM で 1 回関連性を判定する。
       enabled: true               # create-mode 事前精査を有効化 (false で無効)
       relevance_floor: 0.45       # cosine スコア下限 (これ未満を pruning)
-      marginal_band: 0.10         # [floor, floor+band) を assist 判定対象帯とする
+      marginal_band: 0.10         # [floor, floor+band) を LLM 判定対象帯とする
       min_keep: 3                 # 最低保持件数 (生成を枯渇させない)
       dedup_jaccard: 0.85         # token-set Jaccard 近似重複しきい値 (1.0 で無効)
       create_code_signal: true    # create mode: marginal 帯のコードシグナル判定
-      assist_enabled: true        # marginal band の assist 救済 (false で純ルール)
-      max_per_session: 5          # 1 セッション内の assist 発火上限 (0 以下で無制限)
-      max_per_query: 1            # 1 クエリ内の assist 発火上限 (0 以下で無制限)
+      judge_enabled: true         # marginal band の LLM 救済 (false で純ルール)
+      max_per_session: 5          # 1 セッション内の LLM 判定発火上限 (0 以下で無制限)
+      max_per_query: 1            # 1 クエリ内の LLM 判定発火上限 (0 以下で無制限)
     necessity_recall:
       # embedding 決定論的リコール (ToolCallJudge._try_recall_url と同型)。
       # ルール判定が uncertain になったクエリについて、過去の類似クエリ +
-      # assist 自己採点 (sleep-time Step 8.7) から action を直接引き当て、
-      # assist 呼出をスキップする。tracker (assist_necessity の発火上限) を
-      # 消費せず、assist_client=None (degraded) でも動作する。
+      # 自己採点 (sleep-time Step 8.7) から action を直接引き当て、
+      # LLM 呼出をスキップする。tracker (necessity_judge の発火上限) を
+      # 消費せず、LLM 未接続 (degraded) でも動作する。
       enabled: true
       topk: 5
       min_score: 0.75             # 質問 embedding 類似度閾値 (url/command recall の 0.7 よりやや高め)
@@ -524,7 +571,7 @@ rag:
       ttl_days: 14                 # KB変化の影響を受けやすいため url recall (30日) より短め
     quality_recall:
       # necessity_recall と同型。ルールベース品質判定が marginal
-      # (既定 "medium") のクエリについて assist_judge の呼出をスキップする。
+      # (既定 "medium") のクエリについて quality_judge の呼出をスキップする。
       enabled: true
       topk: 5
       min_score: 0.75
@@ -548,7 +595,7 @@ embedding:
   # 埋め込みモデルの GPU オフロード層数
   # null は CPU フォールバック (-ngl 0) が既定。GPU に載せたい場合は
   # 明示的に 999 等を指定する。ベースモデルの llama.gpu_layers には追従しない。
-  # 補足: 埋め込みの GPU オフロードはクエリ時最大の速度ノブ。base/assist との
+  # 補足: 埋め込みの GPU オフロードはクエリ時最大の速度ノブ。base との
   # VRAM 競合に注意し、設定変更時は起動時サマリで VRAM 予算を確認すること。
   gpu_layers: null                # 既定: CPU 配置 (弱い GPU 環境での OOM 回避)
   # 物理バッチサイズ。llama-server デフォルト 512 のままだと長文ノート (>512 tok)
@@ -566,7 +613,7 @@ embedding:
   # ため 2 (前景クエリ + 背景ノート埋め込みの最小並列) で十分。
   slots: 2
   # スレッド数 (-t)。0=自動検出 (全物理コア)。CPU 埋め込み (gpu_layers: null/0) 時は
-  # base/assist と CPU を分け合うため、物理コア数より小さい値を指定して
+  # base と CPU を分け合うため、物理コア数より小さい値を指定して
   # ヘッドルームを残すとチャット応答との競合を抑えられる。
   threads: 0
   # --- 永続埋め込みキャッシュ ---
@@ -648,12 +695,12 @@ memory:
     # default_mode: manual でも有効。0 で無効。
     pending_auto_resolve_days: 3.0
     # pending 競合のチャット確認フロー。チャット注入で AI がユーザーに確認し、
-    # 回答を assist (conflict_chat_judge) で判定して即時解決する。
+    # 回答を LLM (conflict_chat_judge) で判定して即時解決する。
     chat_review:
       enabled: true                                            # false で注入・判定とも停止
       max_groups: 3                                            # 注入グループ上限 (0=無制限、超過分は件数のみ要約)
       max_tokens: 400                                          # ブロック全体のトークン上限 (0=無制限、最低1グループは必ず注入)
-      # conflict_chat_judge (assist) のセッション内発火上限。上限到達後は同一
+      # conflict_chat_judge のセッション内発火上限。上限到達後は同一
       # セッションでの判定と pending 注入を停止する (滞留 pending が毎ターン
       # realtime スロットを専有するのを防ぐ)。0 = 無制限。
       max_judge_per_session: 3
@@ -781,7 +828,7 @@ schedule:
 learning:
   # base モデルの自己学習データを (base モデル識別子 × モード) で分離する。
   partition_by_base_model: true   # true: local/learning/<base_model_stem>/ 配下へ分離しモデル切替で差し替え（未知モデルはゼロから学習）。false: レガシー flat（即ロールバック用）
-  level2_adapter_partition: model # LoRA限定(cvectorは常にモデル単位・対象外)。model（既定=base/assistともモデル単位・mode切替で再起動なし）/ model_mode（base/assistともmode単位・切替時にLoRAパスが変わればサーバ再起動、partition_by_base_model=true必須）
+  level2_adapter_partition: model # LoRA限定(cvectorは常にモデル単位・対象外)。model（既定=モデル単位・mode切替で再起動なし）/ model_mode（mode単位・切替時にLoRAパスが変わればサーバ再起動、partition_by_base_model=true必須）
   level1_min_experiences: 20      # Level 1 トリガーに必要な最小経験数
   level1_generations: 10          # Level 1 の世代数
   level1_population_size: 5       # Level 1 の集団サイズ
@@ -802,6 +849,10 @@ learning:
   level2_schedule_hour: 3         # Level 2 の優先窓ヒント時刻（強制ではない）
   level2_recheck_interval_sec: 300  # Level 2 常駐ループの再評価間隔（秒、再起動耐性）
   level2_overdue_hours: 24.0      # 前回実行からこの時間超で overdue 発火
+  level2_stale_streak: 2          # 連続でこの回数だけ改善を採用できなければ延長クールダウンへ
+  level2_stale_backoff_hours: 72.0  # 延長クールダウン時間（探索が空振りし続ける局面の天井）
+  level2_min_improvement_ratio: 0.001  # 採用に必要な最小改善幅（baseline 比。0.1%未満は過適合として棄却）
+  level2_early_stop_patience: 10  # SPSA の best がこの反復数だけ停滞したら打ち切り（0 で無効、実 eval 経路のみ）
   level2_bootstrap_enabled: false # 初回 full-train（初期 LoRA 生成）。実 llama-server ロード検証後に true 推奨
   level2_bootstrap_rank: 8        # bootstrap LoRA の rank
   level2_bootstrap_init_sigma: 0.0001  # lora_a 初期ガウス標準偏差（lora_b=0）
@@ -831,28 +882,10 @@ learning:
   fewshot_min_fitness: 0.7            # プール追加の最低 fitness
   fewshot_max_examples: 3             # プロンプトに埋め込む最大 Few-shot 数
   fewshot_diversity_threshold: 0.8    # 重複判定のコサイン類似度上限
-  # Level 2 アシストモデル
-  assist_level2_min_experiences: 30   # アシストモデル Level 2 の最小経験数
-  assist_spsa_iterations: 300         # アシストモデル SPSA 反復回数（assist=B 使用時は ~30 推奨: 1 iter=候補サーバ2回起動）
-  assist_sparse_params: 100           # アシストモデルのスパースパラメータ数
-  # Level 2 assist=B: assist LoRA 候補を ephemeral サーバに実ロードして実推論評価 (Pro 限定)。実 --lora ロード検証後に spsa-real-eval へ
-  level2_assist_method: none          # none（既定=assist は #3a で trigger-skip、何も起動しない）/ spsa-real-eval（assist 実学習）
-  assist_eval_scratch_port: 8090      # 候補評価サーバのスクラッチポート
-  assist_eval_loss_w1: 0.7            # keyword/pattern 一致項の重み
-  assist_eval_loss_w2: 0.3            # mean neg-logprob 項の重み
-  assist_eval_max_tokens: 64          # 候補評価生成のトークン上限
-  assist_eval_max_cases: 20           # 候補評価に使う held-out ケース上限
-  assist_eval_health_timeout: 120     # 候補サーバ起動の health 待ち秒数
-  level2_assist_bootstrap_enabled: false  # assist B=0 種生成。実 --lora ロード検証後に true
-  level2_assist_bootstrap_rank: 8     # assist bootstrap LoRA の rank
-  level2_assist_bootstrap_init_sigma: 0.0001  # lora_a 初期ガウス標準偏差（lora_b=0）
   # トークン予算進化
   budget_generations: 5               # トークン予算進化の世代数
   budget_sigma: 0.05                  # トークン予算進化の摂動スケール
   budget_max_total_ratio: 0.7         # 各戦略の比率合計の上限
-  # 変異生成 LLM 設定
-  prompt_mutator_base: assist         # ベースモデル変異生成の LLM（main / assist）。低速 base のタイムアウト回避のため既定 assist
-  prompt_mutator_assist: main         # アシストモデル変異生成の LLM（main / assist）
   # ポリシー / 進化結果書き戻し設定
   # PolicyInterpreter / PolicyParamEvolver / FewShotPool の永続化先と進化挙動。
   #
@@ -895,22 +928,26 @@ agent:
   reminders_enabled: true                # イベント駆動リマインダーの有効/無効
   max_reminders_per_turn: 2              # 1 回の LLM 呼び出しに注入する最大リマインダー数
   dangerous_command_block: true          # 危険コマンドをブロック（false=警告のみ）
-  tool_judge_enabled: true               # ツール判定。アシスト接続時はモード非依存で常時有効。false で明示オプトアウト（アシスト未接続時は本値に関わらず無効）
+  tool_judge_enabled: true               # 最終層のベースモデル文法制約ツール分類。false で決定論層のみに縮退
   meta_cognitive_enabled: true           # Meta-Cognitive 層（計画+多段推論+ツールループ）の有効/無効
   meta_cognitive_min_budget: 512         # Meta-Cognitive 発動に必要な最小ループ予算（トークン数）
   reactive_light_enabled: true           # reactive 分類かつルール即応に該当しないクエリを、tool 判定で tool 不要なら base 1 ターンの軽量パスで応答（false で常に deliberative）
-  executable_command_fallback_enabled: true   # 4 層判定が全て no-tool の時、assist で環境依存事実クエリを run_command に橋渡しする 5 層目（false で無効化）
-  executable_command_fallback_min_chars: 5    # 5 層目 assist 呼出をスキップするクエリ長閾値（これ未満は呼ばない）
-  # ── ネイティブ tool calling (アシスト非常駐時の代替、docs/c_14 §1.3) ──
-  # assist_model.residency: on_demand のチャット中は assist の tool_judgment が
+  # ── ネイティブ tool calling (補助タスク非常駐時の代替、docs/c_14 §1.3) ──
   # 撃てないため、ベースモデル自身の OAI tool calling でツールを選ばせる。
   # 決定論プリゲート (ツールパターン / パス / URL / ディレクトリ列挙) を通った
   # ターンだけ tools を載せるので、雑談ターンのコストは増えない。
   # tools 非対応の llama-server build / chat template では初回 4xx で自動的に
   # 無効化される (毎ターン 4xx を踏まない)。
-  native_tool_calling_enabled: true      # false でネイティブ経路を使わず決定論層のみに縮退
-  native_tool_max_tokens: 256            # tool_call 生成の上限トークン（本文生成はしないので小さくてよい）
-  native_tool_timeout_sec: 60            # ツール選択 1 往復のタイムアウト（秒）
+  # 分類器を撃つかどうかの門。従来の正規表現ゲートは実クエリ137件のベンチで
+  # recall 66.2%（ツールが要るクエリの3分の1を取りこぼし）。埋め込み exemplar
+  # 近傍なら k=5 の leave-one-out で recall 98.5%。precision は 84.9%→81.7% と
+  # 下がるが、137ターンあたり無駄な分類器呼出が 8→15 件増えるだけで、
+  # 22件の取りこぼしを回収できる。embedder 未配線時は正規表現へ自動縮退。
+  tool_gate_knn_enabled: true            # false で従来の正規表現ゲートのみ
+  tool_gate_knn_k: 5                     # 近傍投票数（recall 寄りに 5。1 だと 92.6%）
+  tool_classifier_enabled: true          # false で分類器を使わず決定論層のみに縮退
+  tool_classifier_max_tokens: 96         # 分類 JSON の上限トークン（本文生成はしないので小さくてよい。実測 16〜44）
+  tool_classifier_timeout_sec: 60        # ツール選択 1 往復のタイムアウト（秒）
   # ── コンテンツ生成タイムアウト (Meta-Cognitive 層) ──
   content_gen_first_token_timeout: 120   # 最初のトークン到達までの許容秒数（サーバ混雑時の待機。idle と分離）
   content_gen_idle_timeout: 30           # トークン間の無出力許容秒数（2トークン目以降、超過で「停止」とみなし中断）
@@ -926,7 +963,7 @@ tools:
   fetch_url_allow_private_ip: false  # true で localhost / private IP / link-local への接続を許可（既定 false で SSRF 対策）
   # ── URL リコール (Phase 1) ──
   # 過去質問で正しく fetch_url できた URL を新規の類似質問で再利用する。
-  # 書込は sleep-time の url_curator が担当（アシスト自己採点）、引き当ては
+  # 書込は sleep-time の url_curator が担当（補助タスク自己採点）、引き当ては
   # ToolCallJudge が embedding 類似度 + 過去採点平均で決定論的に行う。
   url_recall_enabled: true            # URL リコール機能の有効/無効
   url_recall_topk: 5                  # 引き当て時に走査する近傍ファクト数
@@ -984,147 +1021,6 @@ i18n:
 #
 # 通常起動 (--develop 未指定) では backend.log が INFO+ で固定されます。
 
-# ===== アシストモデル設定 =====
-# メモリ・RAG 処理用の補助 llama-server インスタンス。
-# 全エディションで必須。ベースモデルとは別インスタンスで起動する。
-assist_model:
-  enabled: true                    # false でアシストモデル無効化。health_check を経由せず None を注入し、
-                                   # ツール判定・メモリ進化・長文プラン・検索品質判定は
-                                   # フォールバックモードで動作する
-  # アシスト llama-server の常駐方針。
-  #   on_demand (既定): チャット応答パスではアシストを起動も実行もしない。
-  #     アイドル窓 (Full sleep-time / Level 1 / Level 2) と create モードの間だけ
-  #     プロセスを起動し、用が済んだら停止する。チャット中の GPU 帯域と VRAM を
-  #     ベースモデルへ明け渡すため、より大きなベースモデルを載せられる。
-  #   always: 従来どおり起動時から常駐 (チャット応答パスでも assist 判定が動く)。
-  residency: on_demand
-  idle_start_timeout_sec: 120      # on_demand 起動時の spawn + health 待ち上限 (秒)
-  stop_after_batch: true           # アイドルバッチ完了で即停止 (false で次の入力まで常駐)
-  local:
-    host: 127.0.0.1               # アシストモデル llama-server のホスト
-    port: 8081                     # アシストモデル llama-server のポート
-    context_size: 8192             # アシストモデルのコンテキストサイズ（デフォルト: 8192）
-                                   # Contextual Retrieval のプレフィックス生成や note_evolve の入力を
-                                   # 収容するため、2048 ではオーバーフローで空応答となるので避ける
-                                   # ベースモデルの context_size とは独立して設定可能
-                                   # null にすると assist モデルの arch プロファイル
-                                   # (models/profiles/<arch>.yaml の context_size) を使用
-                                   # (解決順: ここの明示値 > profile > 8192)
-    # reasoning OS-fence。per-request の chat_template_kwargs.enable_thinking=false
-    # (assist_client.py) だけに頼らない二重防御として、サーバ起動時点で thinking を
-    # 抑止する。mode:none (qwen2/lfm2 等、非thinking) では no-op、mode:always
-    # (lfm2moe 等、強制thinking) ではサーバ側制御が効かないケースもあるが、その場合も
-    # クライアント側 `_ReasoningFilter` の strip が最終防御として機能するため無害。
-    reasoning: "off"
-    reasoning_budget_default: 0    # --reasoning-budget 0 (即終了)。reasoning: off とセットの二重防御
-    # KV キャッシュ量子化 (VRAM 半減、短文の構造化判定用途では品質劣化ほぼゼロ)。
-    cache_type_k: q8_0
-    cache_type_v: q8_0
-    # 共通 prefix (system prompt 等) の自動再利用。同一 purpose の繰り返し呼出で
-    # prefill コストを削減する保険 (SWA 構成モデルでは llama.cpp 側が自動無効化し
-    # no-op になりうる)。
-    cache_reuse: 256
-    # slots: 既定 1 (本セクションに slots キー無し = -np 1)。チャット応答パスの
-    # assist 判定を並列化する場合は slots: 2 を追加し、``concurrency.realtime: 2``
-    # とセットで設定する。slots>1 では ``--kv-unified`` が自動付与され (下記
-    # kv_unified)、per-seq context は full context_size を維持する (分割されない)。
-    # idle slot offload。cache_ram_mib は host RAM 退避量で kv-unified とは独立。
-    # 既定 slots=1 では退避対象の idle slot が無いため 0。slots>1 で idle slot の
-    # RAM 退避も欲しい場合のみ 2048 等にする (per-seq context には影響しない)。
-    cache_ram_mib: 0
-    cache_idle_slots: true
-    # null=auto (slots>1 で ``--kv-unified`` 自動付与) / true|false で明示上書き。
-    kv_unified: null
-    # アシストモデルのパラメータ数 (B 単位) を明示指定する。
-    # null (既定) で model 名の正規表現 (\d+B) → /props の順に推定する。
-    # モデル名に B 表記がない GGUF (例: custom-1.7b-q4.gguf の小文字 b) や、
-    # 量子化版で実効性能が異なる場合に明示指定する。note_evolver /
-    # conflict_resolver の sleep-time インターバル計算で 7B 基準のスケーリ
-    # ングに使われる。
-    params_b: null
-    # MTP (Multi-Token Prediction) self-speculative。Free/Pro 共通。アシストモデル
-    # 内蔵の MTP ヘッド (NextN 層) を draft に使う自己投機 (外部 draft モデル不要)。
-    # MTP ヘッド内蔵モデルでのみ有効、非対応モデルでは warning + 素通り。
-    mtp:
-      enabled: false               # 対応モデルで true にすると MTP を有効化
-      draft_n_max: 3               # ``--spec-draft-n-max`` (上流既定 3)
-  model_path: ""                   # アシストモデルパス（通常は model_paths.assist_model を参照）
-  timeout: 30.0                    # タイムアウト（秒）. CogWriter Plan 生成 (max_tokens=1024) 等の長め応答を許容するため 30 秒を推奨
-  # 用途別セマフォ。realtime / background / learning を独立
-  # スロット化し、Sleep-time (Step 5.8 contextual_prefix 等) / Level 2
-  # (critique_synthesis) が並行稼働してもチャット応答パスの realtime
-  # リクエストがキュー待ちしないようにする。purpose → priority の対応は
-  # AssistModelClient._PURPOSE_PRIORITY_MAP を参照。
-  #
-  # realtime を 2 にすると、チャット 1 ターン内の assist 判定 (conflict 判定 /
-  # 検索必要性判定 / tool 判定 + 層5 投機 synth) が並列化され、短い応答の直列
-  # 待ちが縮む。効果を得るには assist llama-server 側の ``local.slots`` も 2 に
-  # 揃える (片方だけだとクライアントかサーバのどちらかでキュー待ちになり効果
-  # ゼロ)。並列時は assist 同士の GPU バッチ競合で個々の判定が 1.3-1.6 倍に
-  # 延びるが、壁時計時間では短縮する (タイムアウト既定は 15s に調整済み)。
-  concurrency:
-    realtime: 1                    # self_rag_judge / tool_judgment / meta_cognitive_plan (2 で並列化、local.slots:2 とセット)
-    background: 1                  # contextual_prefix / long_form / ralph_loop / note_evolution / conflict_resolution
-    learning: 1                    # critique_synthesis / policy_evolution / spsa
-  # JSON 応答 purpose に GBNF/json_schema 制約サンプリングを適用するか
-  # true: OAI 互換 ``response_format: {"type": "json_schema", ...}`` を /v1/chat/completions
-  #   に送信し、Pydantic schema (backend/free/llm/json_schemas.py) で文法外トークンを抑制。
-  #   小規模 LLM の JSON 応答エラー率を構文レベルで 0 化できる。
-  # false: 旧来の json_extract.py フォールバック (コードフェンス除去 / balanced 抽出) のみ。
-  #   古い llama-server build (response_format: json_schema 未対応) や、パースエラー切り
-  #   分け用に使用する。
-  response_format_enabled: true
-  # 用途別タイムアウト (秒)
-  # 解決優先順:
-  #   1. 明示指定 (`timeout` 引数)
-  #   2. `assist_model.timeouts[purpose]` (このセクション)
-  #   3. `PURPOSE_TIMEOUT_DEFAULTS[purpose]` (コード既定 / `backend/free/llm/assist_client.py`)
-  #   4. `assist_model.timeout` (グローバル既定)
-  # 本セクションを省略しても、DEFAULTS により以下と同等値が自動適用される。
-  # 明示する場合はサイト固有チューニング、または DEFAULTS にない purpose の追加で使う。
-  timeouts:
-    contextual_prefix: 60.0           # Sleep-time Step 5.8 の長文 document prefix 生成
-    long_form_planning: 90.0          # CogWriter Plan 生成 (4-8k tok 入力)
-    long_form_code_review: 90.0       # CogWriter コードレビュー
-    long_form_text_review: 90.0       # CogWriter テキストレビュー
-    # conflict_resolution: 明示しない (DEFAULTS 15s + 反応的自己較正に委譲)。明示すると
-    #   較正が無効化され低速 assist で 15s 固定の ReadTimeout を連発し SemMem auto-merge
-    #   が停滞するため、ここでは敢えて省略する。
-    critique_synthesis: 45.0          # 失敗クラスタ解析
-    policy_evolution: 45.0            # PolicyParamEvolver 候補 JSON 生成
-    note_evolution: 20.0              # A-MEM note 進化の軽量要約
-    meta_cognitive_plan: 30.0         # create mode タスク分解
-    summarize: 30.0                   # Recurrent 戦略の summary 再帰更新
-  # 用途別 reasoning_budget (thinking token 上限)
-  # ``chat_template_kwargs.reasoning_budget`` として送信される。
-  # -1 = 無制限 / 0 = 即終了 / N>0 = N トークン上限。
-  # サーバ側 ``-rea off`` (= `local.reasoning: off`) で起動している場合 (推奨) は
-  # そもそも thinking が disable されるため本値は no-op だが、``-rea auto`` / ``on``
-  # 運用時に purpose 単位で budget を絞る安全側デフォルトとして機能する。
-  # 本セクションを省略しても、PURPOSE_REASONING_BUDGET_DEFAULTS により以下と同等値が
-  # 自動適用される。
-  reasoning_budgets:
-    long_form_planning: 2048
-    long_form_code_review: 2048
-    long_form_text_review: 2048
-    contextual_prefix: 256
-    critique_synthesis: 512
-    conflict_resolution: 0            # マージ判定は thinking 不要
-    policy_evolution: 1024
-    meta_cognitive_plan: 0            # 機械的なタスク分解
-    summarize: 0                      # 機械的な再要約
-  # 全 assist リクエストに per-request で注入する chat_template_kwargs。
-  # 上記 reasoning_budgets は本マップに自動マージされる。
-  # - Qwen3 / Gemma-4 / DeepSeek-R1 等の thinking モデル: {"enable_thinking": false} (既定)
-  #   jinja template が受理した場合に thinking を抑制する保険として機能。
-  # - Llama 3 / Mistral 等の非 thinking モデル: {} を指定し、未知 kwarg
-  #   送信を完全停止する。
-  # ※ assist モデルの arch プロファイル reasoning.mode による能力ゲート:
-  #   none   = enable_thinking / reasoning_budget を一切送らない (HTTP 400 回避)
-  #   always = enable_thinking は送らない (OFF 不可) が reasoning_budget は送る (budget=0 で抑制可)
-  #   toggle = 本設定どおり enable_thinking + reasoning_budget を送る
-  chat_template_kwargs:
-    enable_thinking: false
 
 # ===== エディタ設定（Pro ワークモード）=====
 editor:
@@ -1196,7 +1092,7 @@ long_form:
   max_revisions: 3                  # 最大修正回数（0=レビューのみ）
   document_quality_enabled: false   # TEXTのドキュメント出力(docx/pptx/xlsx/md)で構造ゲート(空/表の列ずれ/見出し階層/形式不適合)を重ね改稿。取得データは創作させず構造欠落のみ指摘。既定OFF
   repair_enabled: true              # 生成後の検証ゲート付きコードリペア(文法/未定義名の自動修正)
-  max_repair_rounds: 2              # コードリペアの最大ラウンド数(0=無効)。Python は AST 厳密検証、他言語は assist 自己点検
+  max_repair_rounds: 2              # コードリペアの最大ラウンド数(0=無効)。Python は AST 厳密検証、他言語は LLM 自己点検
   rag_per_unit: true                # ユニットごとにRAG検索を実行
   rag_top_k_per_unit: 3             # ユニットごとのRAG上位件数
   total_timeout_sec: 1800           # 1リクエストの総時間上限(秒)。0=無効。超過時は生成済みユニットで部分結果打ち切り
@@ -1207,7 +1103,7 @@ long_form:
 
 # ===== クリエイトモード パイプライン設定 =====
 # pipeline=staged で「仕様書→コード→テスト」の多段・各工程多パス生成 (専用 LoopDriver を
-# インライン駆動)。staged は Pro 限定 (evoref create は Pro ゲート済) かつ assist 健全時のみ起動。
+# インライン駆動)。staged は Pro 限定 (evoref create は Pro ゲート済)。
 # 既定 longform は従来の LongFormOrchestrator 1 リクエスト生成 (無改変)。
 create:
   pipeline: longform                  # staged | longform (既定 longform)

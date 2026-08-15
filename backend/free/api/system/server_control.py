@@ -1,6 +1,6 @@
 """サーバー管理 API: llama-server プロセスの起動・停止
 
-フロントエンドからベース/アシスト/埋め込みの
+フロントエンドからベース/補助タスク/埋め込みの
 llama-server プロセスを個別に起動・停止できるようにする。
 """
 
@@ -29,7 +29,7 @@ router = APIRouter(prefix="/api/servers", tags=["server-control"])
 # プロセス管理コンテナ（モジュールレベルシングルトン）
 # ────────────────────────────────────────────
 
-ServerName = Literal["base", "assist", "embed"]
+ServerName = Literal["base", "embed"]
 
 
 @dataclass
@@ -101,19 +101,15 @@ def _build_cmd(
 ) -> tuple[list[str], str, int] | None:
     """サーバー名から起動コマンドと (host, port) を構築
 
-    ``lora_override``/``lora_fallback`` は base/assist のみ有効
-    (``build_llama_cmd``/``build_assist_cmd`` にそのまま透過する)。呼出元
+    ``lora_override``/``lora_fallback`` は base のみ有効
+    (``build_llama_cmd`` にそのまま透過する)。呼出元
     (``mode.py``) が exists/arch 互換チェック済みの絶対パスを解決して渡す
     責務を持ち、本関数はただの配管に徹する。
 
     Returns:
         (cmd, host, port) or None（設定なし / モデル未指定）
     """
-    from scripts.launch_llama import (
-        build_llama_cmd,
-        build_assist_cmd,
-        build_embed_cmd,
-    )
+    from scripts.launch_llama import build_embed_cmd, build_llama_cmd
 
     if name == "base":
         llama_cfg = cfg.get("llama", {})
@@ -123,18 +119,6 @@ def _build_cmd(
             cfg, project_root, model_override=model_override,
             lora_override=lora_override, lora_fallback=lora_fallback,
         )
-        return (cmd, host, port)
-
-    if name == "assist":
-        cmd = build_assist_cmd(
-            cfg, project_root, model_override=model_override,
-            lora_override=lora_override, lora_fallback=lora_fallback,
-        )
-        if cmd is None:
-            return None
-        local_cfg = cfg.get("assist_model", {}).get("local", {})
-        host = local_cfg.get("host", "127.0.0.1")
-        port = local_cfg.get("port", 8081)
         return (cmd, host, port)
 
     if name == "embed":
@@ -259,9 +243,6 @@ def _resolve_endpoint(name: ServerName, cfg: dict) -> tuple[str, int] | None:
     if name == "base":
         lc = cfg.get("llama", {}) or {}
         return lc.get("host", "127.0.0.1"), int(lc.get("port", 8080))
-    if name == "assist":
-        local_cfg = (cfg.get("assist_model", {}) or {}).get("local", {}) or {}
-        return local_cfg.get("host", "127.0.0.1"), int(local_cfg.get("port", 8081))
     if name == "embed":
         emb = cfg.get("embedding", {}) or {}
         return emb.get("llama_host", "localhost"), int(emb.get("llama_port", 8082))
@@ -529,10 +510,6 @@ async def stop_server(
             state.local_client = None
             if state.llm_client:
                 state.llm_client.local = None
-        elif name == "assist":
-            if state.assist_client:
-                await state.assist_client.aclose()
-            state.set_assist_client(None)
         elif name == "embed":
             # embedder オブジェクトは残すが httpx クライアントだけ閉じて
             # 死んだサーバへの kept-alive socket を破棄する。次回 embed 呼び出しで
@@ -558,7 +535,7 @@ async def _try_reconnect(
 ) -> None:
     """サーバー起動後にバックエンドのクライアントを再接続
 
-    base/assist だけでなく embed も再構築する。再構築しないと
+    base だけでなく embed も再構築する。再構築しないと
     httpx.AsyncClient の kept-alive が前世代の死んだサーバの socket を
     保持したままになり、起動直後の health_check / embed 呼び出しが
     フライング失敗する。
@@ -570,10 +547,6 @@ async def _try_reconnect(
         port = llama_cfg.get("port", 8080)
         url = f"http://{host}:{port}"
         await _try_lazy_connect(state, url, llama_cfg)
-
-    elif name == "assist":
-        from backend.free.api.model.assist_model_api import _try_lazy_connect_assist
-        await _try_lazy_connect_assist(state, cfg)
 
     elif name == "embed":
         from backend.free.api.config.component_reload import reload_embedder

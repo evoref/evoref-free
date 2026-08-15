@@ -1,4 +1,4 @@
-"""モデル切替時の出力品質プローブ (base / assist / embedding)
+"""モデル切替時の出力品質プローブ (base / aux / embedding)
 
 ``capability.py`` のプローブが観測するのは **形式** (reasoning 分離 / ``<think>`` /
 json_schema 強制) だけで、**出力そのものの質**は一切見ない。この穴を突いた実例:
@@ -11,7 +11,7 @@ json_schema 強制) だけで、**出力そのものの質**は一切見ない�
 可視化する。**起動は止めない** (degraded 安全 / モデル選択はユーザーの裁量) —
 出すのは WARNING と ``/api/status`` の記録で、判断材料を先に渡すのが役割。
 
-判定にアシストモデルを使わないのは意図的。小型モデルは自分と同種の崩れを問題と
+判定に補助タスクを使わないのは意図的。小型モデルは自分と同種の崩れを問題と
 認識できず、実測で正常例と崩れ例の採点差が 0.09 しか付かなかった
 (:mod:`backend.free.core.text_quality` 参照)。
 
@@ -21,7 +21,7 @@ json_schema 強制) だけで、**出力そのものの質**は一切見ない�
 role         検査
 ===========  =========================================================
 base         日本語の生成品質 (語間空白の混入率 / 日本語で答えているか)
-assist       同上 (要約・digest がユーザーと SemMem に直接届くため)
+aux       同上 (要約・digest がユーザーと SemMem に直接届くため)
 embedding    埋め込み空間の健全性 (類似ペアが非類似ペアより近いか)
 ===========  =========================================================
 """
@@ -40,7 +40,7 @@ from backend.utils import utc_now
 logger = get_logger("llm.quality_probe")
 
 #: プローブ対象の役割。``model_paths`` のキーではなく論理名で扱う。
-QUALITY_ROLES: tuple[str, ...] = ("base", "assist", "embedding")
+QUALITY_ROLES: tuple[str, ...] = ("base", "aux", "embedding")
 
 #: 日本語生成のカナリア。
 #:
@@ -407,7 +407,7 @@ async def probe_text_quality(
     baseline: QualityBaseline,
     enable_thinking: bool | None = None,
 ) -> QualityProbeResult:
-    """base / assist の日本語生成品質を観測する。
+    """base / aux の日本語生成品質を観測する。
 
     ``enable_thinking`` は **本番のチャットパスと同じ値**を渡すこと。ここで測るのは
     ユーザーが実際に受け取る本文の質で、設定が違えば別のものを測ってしまう。

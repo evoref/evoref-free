@@ -1,6 +1,6 @@
 """LLM クライアントの HTTP プラミング共通化
 
-`LocalClient` / `AssistModelClient` / `LlamaCppEmbedder`
+`LocalClient` / `AuxClient` / `LlamaCppEmbedder`
 は llama-server への HTTP 呼び出しという共通の責務を持ち、以下のロジックが
 重複していた:
 
@@ -52,14 +52,14 @@ from backend.trace_context import get_trace_id
 logger = get_logger("llm._base_client")
 
 
-# 共通リトライ定数 (LocalClient / AssistModelClient / Embedder で同一値)。
+# 共通リトライ定数 (LocalClient / AuxClient / Embedder で同一値)。
 # ``stop_after_attempt(MAX_ATTEMPTS)`` で全試行回数 (初回含む) を制御する。
 # 旧実装の ``MAX_RETRIES=3`` (= 4 試行) から ``MAX_ATTEMPTS=3`` (= 3 試行) に変更し、
 # worst case のバックオフ待機 (0.5 + 1.0 + 2.0 = 3.5s + jitter) を抑える。
 # 注意: ここで制御するのは試行回数とバックオフ待機のみで、``timeout`` は
 # **per-attempt** に適用される (3 試行なら最悪 timeout×3 + 待機の壁時計時間)。
 # realtime 用途の purpose timeout を「総予算」として守りたい場合は、呼出側
-# (AssistModelClient._request_with_retry) でリトライループ全体を asyncio.timeout
+# (AuxClient._request_with_retry) でリトライループ全体を asyncio.timeout
 # で囲む必要がある。
 MAX_ATTEMPTS = 3
 RETRY_WAIT_INITIAL = 0.5  # 秒、wait_exponential_jitter の初期値
@@ -87,7 +87,7 @@ class HealthLogGate:
     """health check の結果を **状態が変わったときだけ** ログするためのゲート。
 
     UI は ``/api/status`` と ``/api/system/vram_status`` を数秒間隔でポーリングし、
-    1 回のポーリングが base / assist / embed の 3 系統の health check を起こす。
+    1 回のポーリングが base / aux / embed の 3 系統の health check を起こす。
     毎回 DEBUG を出すと ``--develop`` 時の backend.log が同一文言で埋まり、実信号が
     埋没する (実測 2026-07-25: 1 日の DEBUG 約 16,600 行 = 全体の大半が
     ``Health check: status=200, healthy=True`` と ``GET /api/status`` の反復。

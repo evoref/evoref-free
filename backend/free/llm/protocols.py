@@ -1,8 +1,8 @@
 """
 
-EvorefGen (llm / rag / generation pillar) が他 pillar に公開するアシスト
+EvorefGen (llm / rag / generation pillar) が他 pillar に公開する補助タスク
 モデル呼び出しの契約を型として固定する。全エディションで
-`backend.free.llm.assist_client.AssistModelClient` (ローカル llama-server)
+`backend.free.llm.aux_client.AuxClient` (ローカル llama-server)
 が本 Protocol を満たす
 Pro 実装は存在しない。
 
@@ -18,11 +18,11 @@ from typing import Protocol, runtime_checkable
 
 
 @runtime_checkable
-class AssistModelClientProtocol(Protocol):
-    """アシストモデル呼び出しの抽象。
+class AuxClientProtocol(Protocol):
+    """補助タスク呼び出しの抽象。
 
     メモリ / RAG / 要約 / 判定など「チャット応答パスから切り離された
-    アシスト処理」で使われる LLM クライアントの共通契約。
+    補助タスク処理」で使われる LLM クライアントの共通契約。
     ベースモデル (メイン応答生成) 用クライアントとは別インスタンス。
 
     最小 API:
@@ -36,7 +36,7 @@ class AssistModelClientProtocol(Protocol):
         messages: list[dict],
         **kwargs: object,
     ) -> dict:
-        """アシストモデルで推論を実行し、OpenAI 互換レスポンス dict を返す。
+        """補助タスクで推論を実行し、OpenAI 互換レスポンス dict を返す。
 
         ``kwargs`` には ``temperature`` / ``max_tokens`` / ``timeout`` /
         ``purpose`` など、実装依存のオプションが含まれる。Protocol としては
@@ -45,8 +45,8 @@ class AssistModelClientProtocol(Protocol):
         ...
 
     async def health_check(self) -> bool:
-        """アシストモデルバックエンドが疎通可能かを返す。"""
+        """補助タスクバックエンドが疎通可能かを返す。"""
         ...
 
 
-__all__ = ["AssistModelClientProtocol"]
+__all__ = ["AuxClientProtocol"]

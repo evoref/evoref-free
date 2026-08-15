@@ -48,7 +48,16 @@
 
 	async function handleSend() {
 		const text = inputText.trim();
-		if (!text || $isStreaming) return;
+		if (!text) return;
+		// 生成中は送信できないが、**入力は消さずに残す**。以前は textarea 自体を
+		// disabled にしていたため、生成中に打った文字がどこにも入らず Enter も
+		// 無反応で、ユーザーから見るとメッセージが黙って消えた (プレースホルダも
+		// 変わらないので手掛かりが一切無い)。実インシデント 2026-08-14 ライブ監査:
+		// ターン24 と 25 が 2 回連続で消失した。
+		if ($isStreaming) {
+			addToast({ type: 'error', i18nKey: 'chat.send_blocked_while_streaming' });
+			return;
+		}
 		// モード切替 (llama-server のモデル入替を伴い数十秒かかる) の最中に
 		// 送ると、切替完了時の messages 差し替えでターンごと破棄される。
 		if ($modeRestartStatus === 'restarting') return;
@@ -217,7 +226,7 @@
 			oninput={autoResize}
 			ondragover={handleInputDragOver}
 			ondrop={handleInputDrop}
-			disabled={$isStreaming || $modeRestartStatus === 'restarting'}
+			disabled={$modeRestartStatus === 'restarting'}
 		></textarea>
 		{#if $isStreaming}
 			<button class="cancel-btn" onclick={handleCancel} aria-label={$t('chat.cancel')}>

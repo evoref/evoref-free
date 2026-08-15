@@ -92,14 +92,25 @@ def meta_tool_routing_false_positive(resp) -> bool:
 
 def rag_signals_from_chunks(
     scored: list[tuple[str, float, str]] | None,
+    raw_top_score: float | None = None,
 ) -> tuple[bool, float | None]:
     """``scored_chunks`` から Level 0 経験記録用の ``(rag_used, rag_top1_score)`` を導出。
 
     ``scored_chunks`` は ``(chunk_id, score, content)`` の salience 降順リスト。
     空 / None なら ``(False, None)`` (RAG 未使用)。
+
+    ``raw_top_score`` は ``SearchResult.top_raw_score`` (採用チャンクの **生スコア**
+    最大値、cosine スケール)。``scored`` 側のスコアは ``rag.score_normalization``
+    適用後で、``minmax`` では先頭が定義上 1.0 に固定されるため、記録される
+    ``rag_top1_score`` が観測値として死ぬ (実機 2026-08-13: RAG 使用 7 ターン全てが
+    厳密に 1.0、embed_instruction の初期集団 5 候補も全て fitness 1.0000)。
+    渡された場合はそちらを採用する。``None`` (検索結果を持ち回れない経路 / 旧
+    呼出) は従来どおり正規化スコアへフォールバックする。
     """
     if not scored:
         return False, None
+    if raw_top_score is not None:
+        return True, raw_top_score
     return True, scored[0][1]
 
 
@@ -1298,11 +1309,9 @@ async def _finalize_long_form_stream(
         body = remove_code_fences(delivered) if is_code else delivered
         # 空行を含む連続改行を単一 \n に圧縮 (markdown 見出しは保持)。
         editor_text = _normalize_editor_text(body)
-        # 生成内容からアシストモデルで ASCII snake_case のファイル名を導出する
+        # 指示文と言語から ASCII snake_case のファイル名を導出する
         # (日本語見出しをそのまま流用するとタブ名が日本語化するため)。
-        stem = await derive_editor_filename_stem(
-            sess_state.assist_client, content=body, hint=query, language=language,
-        )
+        stem = derive_editor_filename_stem(hint=query, language=language)
         filename = f"{stem}{ext}"
         yield sse.editor_code(
             editor_text, language=language, filename=filename,
@@ -1360,6 +1369,7 @@ async def stream_long_form(
     private: bool = False,
     output_target: str = "file",
     prefetched_rag: list[tuple[str, float, str]] | None = None,
+    prefetched_rag_top_score: float | None = None,
     file_context_block: str | None = None,
 ):
     """長文生成の SSE ストリーミング（long_form_* ステップフレーム付き）
@@ -1533,7 +1543,9 @@ async def stream_long_form(
             async for frame in _flush():
                 yield frame
 
-            _lf_rag_used, _lf_rag_top1 = rag_signals_from_chunks(prefetched_rag)
+            _lf_rag_used, _lf_rag_top1 = rag_signals_from_chunks(
+                prefetched_rag, prefetched_rag_top_score,
+            )
             async for frame in _finalize_long_form_stream(
                 stream_state, state, orchestrator, query, messages,
                 session_id, mode, instance_name, context_size,
@@ -1589,6 +1601,7 @@ async def sync_long_form(
     private: bool = False,
     output_target: str = "file",
     prefetched_rag: list[tuple[str, float, str]] | None = None,
+    prefetched_rag_top_score: float | None = None,
     file_context_block: str | None = None,
 ) -> ChatResponse:
     """長文生成の同期応答
@@ -1649,7 +1662,9 @@ async def sync_long_form(
         elif (not is_code) and isinstance(text_output, str) and text_output:
             # document_quality モード: 改稿済み確定本文 (revise 二重追記の解消)。
             full_response = text_output
-        _lf_rag_used, _lf_rag_top1 = rag_signals_from_chunks(prefetched_rag)
+        _lf_rag_used, _lf_rag_top1 = rag_signals_from_chunks(
+            prefetched_rag, prefetched_rag_top_score,
+        )
         record_long_form_response(
             state, full_response, messages, session_id,
             query, mode, tokens_generated, metrics,
@@ -2668,11 +2683,12 @@ async def stream_staged_create(
     private: bool = False,
     keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL_SEC,
     prefetched_rag: list[tuple[str, float, str]] | None = None,
+    prefetched_rag_top_score: float | None = None,
     file_context_block: str | None = None,
 ) -> AsyncIterator[str]:
     """専用 LoopDriver をインライン駆動し spec→code→test を実行してストリームする。
 
-    タスクグラフ合成が空 (assist degraded 等) のときは ``fallback_factory`` が返す
+    タスクグラフ合成が空 (aux degraded 等) のときは ``fallback_factory`` が返す
     従来 longform ストリームへ委譲する。``part_codegen`` (部分ごと生成向けの別予算
     delegate) が渡されたときのみ部分生成→決定論結合経路を有効化する。
 
@@ -2730,7 +2746,7 @@ async def stream_staged_create(
     })
     facts = await synthesize_create_task_graph(
         request=query, project_id=_STAGED_PROJECT_ID,
-        assist_client=state.assist_client,
+        aux_client=state.aux_client,
         include_tests=(
             bool(staged_cfg.get("test_stage_enabled", True))
             or bool(staged_cfg.get("smoke_gate_enabled", True))
@@ -2813,7 +2829,7 @@ async def stream_staged_create(
     from backend.free.generation.test_value_repair import repair_literal_assertions
 
     executor = StagedCreateExecutor(
-        workspace=ws, assist_client=state.assist_client, codegen=codegen,
+        workspace=ws, aux_client=state.aux_client, codegen=codegen,
         smoke_runner=(_smoke if staged_cfg.get("smoke_gate_enabled", True) else None),
         test_runner=test_runner,
         contract_checker=check_api_contract,
@@ -2944,7 +2960,9 @@ async def stream_staged_create(
         context_size=context_size, output_target=output_target,
         timer=timer, t_start=t_start, private=private,
         smoke_timeout=smoke_timeout,
-        prefetched_rag=prefetched_rag, file_context_block=file_context_block,
+        prefetched_rag=prefetched_rag,
+        prefetched_rag_top_score=prefetched_rag_top_score,
+        file_context_block=file_context_block,
     ):
         yield frame
 
@@ -2985,6 +3003,7 @@ async def _finalize_staged_stream(
     private: bool,
     smoke_timeout: float = 120.0,
     prefetched_rag: list[tuple[str, float, str]] | None = None,
+    prefetched_rag_top_score: float | None = None,
     file_context_block: str | None = None,
 ) -> AsyncIterator[str]:
     """staged 終端: 生成物を集約し output_target 別に配信 + token_info/done。"""
@@ -3116,7 +3135,9 @@ async def _finalize_staged_stream(
         "strategy": "staged",
     }
     try:
-        _staged_rag_used, _staged_rag_top1 = rag_signals_from_chunks(prefetched_rag)
+        _staged_rag_used, _staged_rag_top1 = rag_signals_from_chunks(
+            prefetched_rag, prefetched_rag_top_score,
+        )
         record_long_form_response(
             state, assembled, messages, session_id, query, "create",
             _estimate_tokens(assembled), staged_metrics, private=private,

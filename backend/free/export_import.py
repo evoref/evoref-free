@@ -25,13 +25,12 @@ CATEGORY_PATHS: dict[str, list[str]] = {
     "memory": ["memory_dir"],
     "experience": [
         "experience_file", "eval_core_file",
-        "experience_assist_file", "eval_assist_file",
+        "aux_experience_file",
     ],
     "rag": ["vectors_dir", "knowledge_dir"],
     "prompts": ["prompts_dir"],
     "lora": [
         "lora_adapter", "lora_versions_dir",
-        "assist_lora_adapter", "assist_lora_versions_dir",
     ],
     "cartridges": ["cartridges_dir"],
     "history": ["history_dir"],

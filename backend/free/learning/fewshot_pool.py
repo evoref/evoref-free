@@ -72,7 +72,7 @@ _QUALITY_WEIGHT = 0.5
 def _effective_fitness(example: FewShotExample) -> float:
     """順位付けに使う実効スコア (純粋関数)。
 
-    ``quality_score`` 未採点 (assist 未接続 / 採点前) では従来どおり
+    ``quality_score`` 未採点 (採点モデル未接続 / 採点前) では従来どおり
     ``fitness`` そのものを返すため、degraded mode でも挙動は変わらない。
     """
     if example.quality_score is None:
@@ -151,7 +151,7 @@ def _response_leaks_internal_scaffold(response: str) -> bool:
 #: 固定される自己増幅ループ**になる (実測: プール 25 件中 17 件 = 68% が混入し、
 #: いずれも fitness 0.806 で全ゲートを素通りしていた)。
 #:
-#: アシスト品質採点では分離できない。空白混入例の quality 平均 0.80 に対し
+#: 補助タスク品質採点では分離できない。空白混入例の quality 平均 0.80 に対し
 #: 正常例 0.89 と差が 0.09 しかなく、混入例に 0.95 が 4 件付いていた
 #: (小型モデルは自分と同種の崩れを問題と認識できない)。算術矛盾と同じく
 #: **決定論で拒否する**。
@@ -672,19 +672,19 @@ class FewShotPool(JsonStateStore):
 
     async def score_pending_quality(
         self,
-        assist_client,
+        scorer_client,
         *,
         limit: int = 20,
     ) -> int:
-        """未採点の例にアシストで品質スコアを付ける (増分)。
+        """未採点の例に LLM で品質スコアを付ける (増分)。
 
         **拒否権は持たない**。付いたスコアは ``_effective_fitness`` の重みとして
         順位付け (select_top_k / eviction) にのみ効く。内容の正誤判定を
-        アシストに委ねてはいけないため (実測 2026-07-31: 稼働 assist は
+        LLM に委ねてはいけないため (実測 2026-07-31: 採点モデルは
         「42.195 ÷ 1.609 ≈ 26.195」に満点を付けた)、算術の検証は採用時点の
         ``response_arithmetic`` が決定論で行う。
 
-        ``assist_client`` が ``None`` (degraded mode) なら何もしない。採点済みの
+        ``scorer_client`` が ``None`` なら何もしない。採点済みの
         例は再採点しないので、呼び出しごとのコストは新規分だけに比例する。
 
         Args:
@@ -693,8 +693,8 @@ class FewShotPool(JsonStateStore):
         Returns:
             採点した件数。
         """
-        if assist_client is None:
-            logger.debug("fewshot quality scoring skipped: assist_client is None")
+        if scorer_client is None:
+            logger.debug("fewshot quality scoring skipped: scorer_client is None")
             return 0
 
         pending = [
@@ -708,7 +708,7 @@ class FewShotPool(JsonStateStore):
 
         scored = 0
         for mode, ex in pending:
-            score = await self._score_one_quality(assist_client, ex)
+            score = await self._score_one_quality(scorer_client, ex)
             if score is None:
                 continue
             ex.quality_score = score
@@ -732,11 +732,11 @@ class FewShotPool(JsonStateStore):
         return scored
 
     async def _score_one_quality(
-        self, assist_client, example: FewShotExample,
+        self, scorer_client, example: FewShotExample,
     ) -> float | None:
-        """1 例をアシストで採点する。失敗時は ``None`` (未採点のまま残す)。"""
+        """1 例を LLM で採点する。失敗時は ``None`` (未採点のまま残す)。"""
         try:
-            result = await assist_client.generate(
+            result = await scorer_client.generate(
                 messages=[
                     {"role": "system", "content": _QUALITY_SYSTEM_PROMPT},
                     {

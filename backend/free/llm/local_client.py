@@ -945,30 +945,31 @@ class LocalClient(BaseHTTPClient):
 
         return {"content": content, "logprobs": logprobs}
 
-    async def generate_tool_call(
+    async def generate_constrained(
         self,
         messages: list[dict],
         *,
-        tools: list[dict],
-        temperature: float = 0.2,
-        max_tokens: int = 256,
+        response_format: dict,
+        temperature: float = 0.1,
+        max_tokens: int = 64,
         id_slot: int | None = None,
         timeout: float | None = None,
-    ) -> dict:
-        """OAI ``tools`` を渡してツール選択だけをさせる非ストリーミング推論。
+    ) -> str | None:
+        """``response_format`` (json_schema) で文法制約した非ストリーミング生成。
 
-        ``assist_model.residency: on_demand`` のチャット中はアシストの
-        ``tool_judgment`` が撃てないため、ベースモデル自身のネイティブ tool
-        calling で代替する (docs/c_14 §1.3)。本文生成はしないので
-        ``max_tokens`` は tool_call を吐ける程度で足りる。
-
-        ``tools`` を受け付けない llama-server build / chat template では 4xx が
-        返る。リトライしても回復しないため呼出側で 1 度だけ判定し、以後は
-        ネイティブ経路を無効化すること。
+        OAI ``tools`` を使わない理由は **強制力**。実測
+        (2026-08-12, Qwen3.5-27B / gemma-4-12b) では ``tools`` は 200 で受理
+        されてもモデルが tool_call を出さずに本文を書き始め、``max_tokens`` を
+        使い切って 15.6〜60.2 秒を捨てることがある (``tool_choice="required"``
+        でも 6 件中 3 件で無視された)。一方 ``response_format`` の json_schema は
+        llama-server 側の GBNF 制約なので、**出力が必ずスキーマに従い、
+        トークン数の上限が読める**。判定系はこちらを使う。
 
         Returns:
-            ``choices[0].message`` の dict。``tool_calls`` が無ければツール不要と
-            モデルが判断したことを意味する。
+            ``choices[0].message.content`` の文字列。取得できなければ ``None``。
+            スキーマを強制しない build / chat template では非 JSON が返り得るので、
+            呼出側は必ずパース失敗を許容すること (capability probe が
+            ``json_schema grammar not enforced`` を警告する構成が実在する)。
         """
         payload = self._build_payload(
             messages,
@@ -976,7 +977,7 @@ class LocalClient(BaseHTTPClient):
             temperature=temperature,
             max_tokens=max_tokens,
             id_slot=id_slot,
-            tools=tools,
+            response_format=response_format,
         )
 
         client = self._get_http_client()
@@ -993,22 +994,18 @@ class LocalClient(BaseHTTPClient):
 
         data = await async_retry_http_call(
             _do_post,
-            request_label="LocalClient /v1/chat/completions (tools)",
+            request_label="LocalClient /v1/chat/completions (json_schema)",
             retry_logger=retry_logger,
         )
         choices = data.get("choices") or [{}]
         message = choices[0].get("message") or {}
-
-        # 予算を使い切って tool_call が無い応答は 100% 無駄撃ち (実測 28 秒)。
-        # 判定させたつもりがモデルが本文を書き始めた場合に起きるので、次の監査で
-        # 追えるよう記録する。戻り値の契約 (message dict) は変えない。
-        if choices[0].get("finish_reason") == "length" and not message.get("tool_calls"):
+        content = message.get("content")
+        if choices[0].get("finish_reason") == "length":
             logger.warning(
-                "Native tool calling exhausted max_tokens=%d without a tool call "
-                "(model wrote prose instead of judging); falling through to no_tool",
-                max_tokens,
+                "Constrained generation hit max_tokens=%d; output is likely "
+                "truncated mid-JSON", max_tokens,
             )
-        return message
+        return content if isinstance(content, str) and content.strip() else None
 
     async def health_check(self) -> bool:
         """llama-server のヘルスチェック"""

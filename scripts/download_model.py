@@ -15,7 +15,6 @@ from pathlib import Path
 
 EXPECTED_MODELS = {
     "base": "models/gemma-4-12b-it-qat-q4_0.gguf",
-    "assist": "models/gemma-4-E4B_q4_0-it.gguf",
     "embed": "models/Qwen3-Embedding-0.6B-Q8_0.gguf",
 }
 

@@ -2,7 +2,7 @@
 
 ``LoopDriver`` から 1 タスクずつ呼ばれ、``task.stage`` で分岐する:
 
-- ``spec`` : アシストモデルで設計仕様 (spec.md) を生成し workspace に永続化。
+- ``spec`` : 補助タスクで設計仕様 (spec.md) を生成し workspace に永続化。
 - ``code`` : **base クリエイトモデル** (注入された codegen 委譲) で当該モジュール
   を単発生成。spec.md と既生成ファイル一覧を読み込んで instruction に埋め込み、
   1 ファイル = 1 回の base 呼び出しで完結させる (``LongFormOrchestrator`` 経由の
@@ -84,7 +84,7 @@ from backend.log_config import get_logger
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
-    from backend.free.llm.assist_client import AssistModelClient
+    from backend.free.llm.aux_client import AuxClient
     from backend.free.loop.driver import TaskFactView
     from backend.free.loop.events import LoopEventBus
 
@@ -677,7 +677,7 @@ def _code_language_constraint() -> str:
 
 
 def _content(resp: dict) -> str:
-    """assist generate() の dict 応答から content を取り出す (pillar 内に閉じる)。"""
+    """aux generate() の dict 応答から content を取り出す (pillar 内に閉じる)。"""
     try:
         return str(resp["choices"][0]["message"]["content"] or "")
     except (KeyError, IndexError, TypeError):
@@ -685,7 +685,7 @@ def _content(resp: dict) -> str:
 
 
 def _finish_reason(resp: dict) -> str:
-    """assist generate() 応答の finish_reason ('length' は max_tokens 切断を示す)。"""
+    """aux generate() 応答の finish_reason ('length' は max_tokens 切断を示す)。"""
     try:
         fr = resp["choices"][0].get("finish_reason")
         return fr if isinstance(fr, str) else ""
@@ -705,7 +705,7 @@ def _extract_module_list(description: str) -> str:
     ``source_path`` と 1:1 で一致する (= 正準)。spec 本文はここから **別の** LLM
     呼び出しで自由記述生成されるため、その出力がこの一覧を忠実に再現する保証は
     ない。呼出側はこの戻り値を spec.md に決定的に追記し、コード生成が参照する
-    ファイル一覧を必ず正しいものにする。マーカーが無ければ空文字 (アシスト未接続
+    ファイル一覧を必ず正しいものにする。マーカーが無ければ空文字 (補助タスク未接続
     等で modules が無かった場合)。
     """
     idx = description.find(MODULE_LIST_MARKER)
@@ -964,7 +964,7 @@ class StagedCreateExecutor:
 
     Args:
         workspace: 工程間ハンドオフ用 :class:`WorkspaceManager`。
-        assist_client: spec 工程で使うアシスト。``None`` なら spec は description
+        aux_client: spec 工程で使う補助タスク。``None`` なら spec は description
             をそのまま spec.md に書く degraded 動作。
         codegen: base クリエイトモデル経由の生成委譲
             (instruction, file_path -> {path: code})。
@@ -979,7 +979,7 @@ class StagedCreateExecutor:
     """
 
     workspace: WorkspaceManager
-    assist_client: "AssistModelClient | None"
+    aux_client: "AuxClient | None"
     codegen: CodegenDelegate
     smoke_runner: "Callable[[dict[str, str]], object] | None" = None
     test_runner: StagedTestRunner | None = None
@@ -1000,7 +1000,7 @@ class StagedCreateExecutor:
     # エスカレーション。Component/モジュール単位で小規模サブグラフを部分合成
     # →決定論結合する (part_generation_enabled と同じ段階導入の作法)。
     flow_part_synthesis_enabled: bool = False
-    # spec 工程のモジュール節深化 (1 節 1 assist 呼出でメソッド毎挙動・属性・
+    # spec 工程のモジュール節深化 (1 節 1 aux 呼出でメソッド毎挙動・属性・
     # 定数まで書き下す)。ガード棄却時は原節維持の best-effort。
     spec_deepen_enabled: bool = True
     # spec 宣言契約と生成コードの決定論照合を test 工程の smoke gate に合流
@@ -1011,7 +1011,7 @@ class StagedCreateExecutor:
     conformance_checker: (
         "Callable[..., list[str]] | None"
     ) = None
-    # test 不合格時に spec 該当節を assist で点検・改訂して再生成するサイクルの
+    # test 不合格時に spec 該当節を aux で点検・改訂して再生成するサイクルの
     # ワークスペース全体での上限 (0 で無効)。per-task では 1 回まで。
     max_spec_revision_rounds: int = 1
     # 部分ごと生成 (spec の ### Component: 単位で生成→決定論結合)。どちらか
@@ -1110,7 +1110,7 @@ class StagedCreateExecutor:
                 spec_text = retry
                 anchor_retry = True
         # 深化パスは LLM 由来の spec に対してのみ意味を持つ (description
-        # フォールバック時は assist 劣化中の可能性が高く、深化 N 呼出は
+        # フォールバック時は aux 劣化中の可能性が高く、深化 N 呼出は
         # ウォールクロックを無成果に消費するだけ)。
         spec_from_llm = bool(spec_text)
         if not spec_text:
@@ -1136,13 +1136,13 @@ class StagedCreateExecutor:
             final_spec, foreign_merged = merge_foreign_module_sections(
                 final_spec, module_paths,
             )
-            # モジュール節の深化 (1 節 1 assist 呼出): メソッド毎の挙動・属性・
+            # モジュール節の深化 (1 節 1 aux 呼出): メソッド毎の挙動・属性・
             # 定数まで実装水準に書き下す。単一呼出の spec は 4B の注意が文書
             # 全体に薄まり密度が出ないため、節単位の集中プロンプトで賄う
             # (部分生成と同じ確立パターン)。ガード棄却時は原節維持。
             if (
                 self.spec_deepen_enabled
-                and self.assist_client is not None
+                and self.aux_client is not None
                 and spec_from_llm
             ):
                 context = _deepen_context(final_spec)
@@ -1153,7 +1153,7 @@ class StagedCreateExecutor:
                     _, _, section = found
                     if len(section) >= _DEEPEN_SECTION_MAX_CHARS:
                         # 上限超の節は数学的に必ず棄却される (成長不能) ため
-                        # assist 呼出自体をスキップする。
+                        # aux 呼出自体をスキップする。
                         logger.info(
                             "spec deepen skipped for %s: section already at "
                             "max size", path,
@@ -1171,7 +1171,7 @@ class StagedCreateExecutor:
                         path, section, context, taken,
                     )
                     if abort:
-                        # assist 劣化 (タイムアウト/接続断)。残りモジュールへ
+                        # aux 劣化 (タイムアウト/接続断)。残りモジュールへ
                         # 直列で挑み続けるとウォールクロック予算を無成果に
                         # 食い潰すため深化を打ち切る。
                         deepen_rejected += 1
@@ -1293,7 +1293,7 @@ class StagedCreateExecutor:
     async def _generate_spec_doc(
         self, description: str, extra_constraint: str = "",
     ) -> str:
-        """spec 本文をアシスト生成する。max_tokens 切断時のみ予算を倍に広げ 1 回再生成。
+        """spec 本文を補助タスク生成する。max_tokens 切断時のみ予算を倍に広げ 1 回再生成。
 
         ``generate()`` は finish_reason='length' を telemetry に露出しないため、
         応答 dict から直接 finish_reason を読み本文の途中切れを検知する (検知しないと
@@ -1302,13 +1302,13 @@ class StagedCreateExecutor:
         ``None`` (degraded) / 失敗時は空文字を返し、呼出側が description に倒す。
         ``extra_constraint`` はアンカー遵守リトライの矯正制約 (末尾追記)。
         """
-        if self.assist_client is None:
+        if self.aux_client is None:
             return ""
         msgs = [{"role": "user", "content":
                  _SPEC_PROMPT.format(description=description) + os_constraint()
                  + _spec_language_constraint() + extra_constraint}]
         try:
-            resp = await self.assist_client.generate(
+            resp = await self.aux_client.generate(
                 msgs, purpose="create_spec_doc", max_tokens=self.spec_max_tokens,
                 temperature=0.3, timeout=self.spec_timeout_sec,
             )
@@ -1326,7 +1326,7 @@ class StagedCreateExecutor:
             self.spec_max_tokens, retry_tokens,
         )
         try:
-            resp2 = await self.assist_client.generate(
+            resp2 = await self.aux_client.generate(
                 msgs, purpose="create_spec_doc", max_tokens=retry_tokens,
                 temperature=0.3, timeout=self.spec_timeout_sec * 1.5,
             )
@@ -1351,18 +1351,18 @@ class StagedCreateExecutor:
         (`finish_reason=='length'`)・空応答・決定論ガード棄却
         (:func:`_deepen_reject_reason`) は ``(None, False)`` に倒し、呼出側は
         原節を維持する。**例外 (タイムアウト/接続断) は ``(None, True)``** —
-        assist 劣化のシグナルであり、残りモジュールへ 600s ずつ直列で挑み
+        aux 劣化のシグナルであり、残りモジュールへ 600s ずつ直列で挑み
         続けるとウォールクロック予算を無成果に食い潰すため、呼出側は深化
         ループ全体を打ち切る (レビュー確定指摘のサーキットブレーカ)。
         """
-        if self.assist_client is None:
+        if self.aux_client is None:
             return None, False
         msgs = [{"role": "user", "content":
                  _SPEC_DEEPEN_PROMPT.format(
                      file_path=module_path, context=context, section=section,
                  ) + os_constraint() + _deepen_language_constraint()}]
         try:
-            resp = await self.assist_client.generate(
+            resp = await self.aux_client.generate(
                 msgs, purpose="create_spec_deepen",
                 max_tokens=_SPEC_DEEPEN_MAX_TOKENS,
                 temperature=0.3, timeout=self.spec_timeout_sec,
@@ -1413,7 +1413,7 @@ class StagedCreateExecutor:
             steps = fallback_flow(entries)
             return (steps, "fallback") if steps else ([], "none")
 
-        if self.assist_client is None:
+        if self.aux_client is None:
             return _fallback()
 
         # 入力から旧 Processing flow 節を除く (改訂後の再合成で自己参照させ
@@ -1443,7 +1443,7 @@ class StagedCreateExecutor:
                 ) + base_prompt
             telemetry: dict = {}
             try:
-                data = await self.assist_client.generate_json(
+                data = await self.aux_client.generate_json(
                     prompt, max_tokens=_FLOW_MAX_TOKENS, temperature=0.2,
                     purpose="flow_spec_synthesis", telemetry=telemetry,
                     # 出力予算 3072 tok は iGPU 実測 (7-13 t/s) で purpose 既定
@@ -1497,7 +1497,7 @@ class StagedCreateExecutor:
         結合後は必ず :func:`validate_flow` で全体を再検証し、合格した場合の
         みステップ列を返す。
         """
-        assert self.assist_client is not None
+        assert self.aux_client is not None
         units_specs: list[tuple[str, str]] = []  # (module_path, unit_spec_text)
         for module_path in module_paths:
             plan = plan_file_parts(spec, module_path, max_parts=self.part_max_parts)
@@ -1521,7 +1521,7 @@ class StagedCreateExecutor:
             steps: list[FlowStep] = []
             for _attempt in range(2):  # 初回 + 再試行 1 回
                 try:
-                    data = await self.assist_client.generate_json(
+                    data = await self.aux_client.generate_json(
                         prompt, max_tokens=768, temperature=0.2,
                         purpose="flow_spec_part_synthesis", timeout=60.0,
                     )
@@ -2652,11 +2652,11 @@ class StagedCreateExecutor:
     async def _spec_revision_cycle(
         self, task: "TaskFactView", source_path: str, *, evidence: str, kind: str,
     ) -> bool:
-        """spec 該当節を assist で点検し、欠陥なら改訂 + コード再生成する。
+        """spec 該当節を aux で点検し、欠陥なら改訂 + コード再生成する。
 
         戻り値 True = 改訂を適用しコードを再生成した (呼出側は再検証する)。
         ガード: per-task 1 回 (stage_notes マーカー) / ワークスペース全体
-        ``max_spec_revision_rounds`` / assist degraded / アンカー不在。
+        ``max_spec_revision_rounds`` / aux degraded / アンカー不在。
         JSON 崩れ・非 dict は spec_ok 扱い (grammar 非強制モデル対策)。
         max_tokens 切断 (telemetry.truncated) は判定全体を不信として不採用
         (json_repair が切断 JSON を閉じて素通りし、途中切れの revised_section
@@ -2676,7 +2676,7 @@ class StagedCreateExecutor:
         if self._revision_budget_used() >= self.max_spec_revision_rounds:
             self._record_revision(task, source_path, "skipped_budget_exhausted")
             return False
-        if self.assist_client is None:
+        if self.aux_client is None:
             self._record_revision(task, source_path, "skipped_degraded")
             return False
         spec = self.workspace.read_spec() or ""
@@ -2705,7 +2705,7 @@ class StagedCreateExecutor:
         )
         judge_telemetry: dict = {}
         try:
-            data = await self.assist_client.generate_json(
+            data = await self.aux_client.generate_json(
                 prompt, purpose="spec_revision_judge",
                 max_tokens=1536, temperature=0.2, telemetry=judge_telemetry,
             )

@@ -1,13 +1,13 @@
 """lazy-init バックオフキャッシュ
 
-`/api/status` および `/api/assist-model/status` は、サーバが落ちている状態でも
+`/api/status` は、サーバが落ちている状態でも
 毎回 lazy-init を試みていたため、httpx の接続失敗で 1 リクエスト 5〜7 秒の
 遅延が発生していた。
 
 本モジュールは直近の lazy-init 失敗時刻をモジュールスコープで記録し、
 バックオフ期間内であれば実行をスキップする小さなガードを提供する。
 
-- `kind`: "local" / "assist" 等の識別子。呼び出し側が任意に決める
+- `kind`: "local" 等の識別子。呼び出し側が任意に決める
 - 失敗した場合のみバックオフが効き、成功時はキャッシュをクリアする
 - バックオフ期間が経過した次回の呼び出しでは再度 lazy-init を試行する
 """
@@ -58,7 +58,7 @@ async def guarded_lazy_connect(
     """`connector` をバックオフガード付きで実行する。
 
     Args:
-        kind: バックオフキー (例: "local" / "assist")
+        kind: バックオフキー (例: "local")
         connector: 実際の lazy-init コルーチン。成功時 True を返すこと
 
     Returns:

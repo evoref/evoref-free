@@ -6,22 +6,17 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 class ModelPathsConfig(BaseModel):
     """モデルファイルパス
 
-    標準 3 モデル (base/assist/embed) を明示フィールドとして定義。
+    標準 2 モデル (base/embed) を明示フィールドとして定義。
     カスタムモデル種を追加できるよう ``extra="allow"`` を維持する。
     """
 
     model_config = ConfigDict(extra="allow")
 
     base_model: str = "models/gemma-4-12b-it-qat-q4_0.gguf"
-    assist_model: str = "models/gemma-4-E4B_q4_0-it.gguf"
     embed_model: str = "models/Qwen3-Embedding-0.6B-Q8_0.gguf"
     create_model: str | None = Field(
         default=None,
         description="クリエイトモード用 GGUF パス。未指定 (None / 空文字列) の場合は base_model にフォールバック",
-    )
-    assist_create_model: str | None = Field(
-        default=None,
-        description="クリエイトモード用アシスト GGUF パス。未指定 (None / 空文字列) の場合は assist_model にフォールバック",
     )
 
     @model_validator(mode="before")
@@ -37,6 +32,33 @@ class ModelPathsConfig(BaseModel):
                 "model_paths must not contain 'reranker_model' anymore. "
                 "The reranker feature has been removed. Remove the "
                 "'model_paths.reranker_model' line from config.yaml.",
+            )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_removed_assist_models(cls, data: dict) -> dict:
+        """撤去済みの専用アシストモデル系キーを明示的に拒否する
+
+        専用アシストモデル (:8081) は撤去され、補助タスクはベースモデルの
+        専有スロットへ集約された (2026-08-14)。``extra="allow"`` なのでこれらの
+        キーは黙って透過し、「設定したのに効かない」状態に気付けないため
+        ``ValueError`` を上げる。``aux_model`` は撤去時の一括置換で
+        ``assist_model`` から機械的に生まれうる綴りなので併せて拒否する
+        (補助タスクは専用モデルを持たないので、この名前のキーは常に誤り)。
+        """
+        if not isinstance(data, dict):
+            return data
+        removed = [
+            k for k in ("assist_model", "assist_create_model", "aux_model")
+            if k in data
+        ]
+        if removed:
+            raise ValueError(
+                f"model_paths must not contain {removed} anymore. The dedicated "
+                "assist model has been removed; auxiliary tasks now run on the "
+                "base model's background slot. Remove these lines from "
+                "config.yaml (see docs/c_14_aux_client_protocol.md).",
             )
         return data
 
@@ -64,30 +86,20 @@ class LocalPathsConfig(BaseModel):
         default="local/models/lora_spsa_checkpoint.json",
         description="base LoRA SPSA 学習の中断/再開チェックポイント。",
     )
-    assist_lora_adapter: str = Field(
-        default="local/models/assist_adapter.gguf",
-        description="assist モデル用 LoRA アダプタ (Level 2 assist=B)。"
-        "migrate_component() は新モデルと arch が不一致のときのみ自動アーカイブする。",
-    )
-    assist_lora_versions_dir: str = Field(
-        default="local/models/assist_lora_versions/",
-        description="assist LoRA のバージョン履歴保存先。",
-    )
-    assist_lora_spsa_checkpoint: str = Field(
-        default="local/models/assist_lora_spsa_checkpoint.json",
-        description="assist LoRA SPSA 学習の中断/再開チェックポイント。",
-    )
     # Level 2 base=C: control vector (llama-cvector-generator 生成) の本体 / 版管理 /
     # positive.txt・negative.txt 作業用ディレクトリ。Pro 限定だが PathResolver が
     # 参照するため Free でもフィールドは存在する (extra="forbid" のため明示必須)。
     control_vector_adapter: str = "local/models/control_vector.gguf"
     control_vector_versions_dir: str = "local/models/control_vector_versions/"
     cvector_work_dir: str = "local/cvector/"
-    experience_assist_file: str = "local/experience_assist.json"
-    eval_assist_file: str = "local/eval_assist.json"
-    # アシスト purpose 別 timeout の反応的自己較正値 (model-keyed)。
-    # AssistModelClient が ReadTimeout 観測から引き上げた天井を永続化する。
-    assist_calibration_file: str = "local/assist_calibration.json"
+    # 補助タスク (rag_necessity / rag_quality / tool_call / note_evolve) の
+    # 経験バッファとプロンプト。Level 1 Phase 2 の進化が読む。partition 有効時は
+    # base モデルパーティション配下へ rebase される (PathResolver._LEARNING_SUBPATH)。
+    aux_experience_file: str = "local/aux_experience.json"
+    aux_prompts_dir: str = "local/aux_prompts/"
+    # 補助タスク purpose 別 timeout の反応的自己較正値 (model-keyed)。
+    # AuxClient がタイムアウト観測から引き上げた天井を永続化する。
+    aux_calibration_file: str = "local/aux_calibration.json"
     rag_judge_events_file: str = "local/rag_judge_events.jsonl"
     lora_archive_dir: str = "local/lora_archive/"
     embed_lora_adapter: str = Field(
@@ -107,7 +119,7 @@ class LocalPathsConfig(BaseModel):
     model_quality_file: str = Field(
         default="local/model_quality.json",
         description=(
-            "モデル切替時の出力品質プローブ結果。役割 (base/assist/embedding) ごとに"
+            "モデル切替時の出力品質プローブ結果。役割 (base/embedding) ごとに"
             "「どのモデルを最後に検査したか」を記録し、変わったときだけ再検査する。"
         ),
     )
@@ -130,5 +142,5 @@ class LocalPathsConfig(BaseModel):
     # base モデルの自己学習データを (base モデル識別子 × モード) でパーティション化
     # する際のルート。``learning_dir/<base_model_stem>/`` 配下に experience /
     # base prompts / base LoRA・cvector を配置する。PathResolver.resolve_learning が
-    # 参照する (assist・共有データは従来どおり flat の local_paths を使う)。
+    # 参照する (共有データは従来どおり flat の local_paths を使う)。
     learning_dir: str = "local/learning/"

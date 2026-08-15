@@ -79,10 +79,10 @@ evoref は **完全ローカル動作** の自己進化型 LLM アシスタン�
 - ファイル読込: `txt` / `md` / `json` / `yaml` / コード / `html` / `pdf` / `csv` / `tsv`。書出: `txt` / `md` / `html` / `csv` / `tsv` / `json` / `yaml` / `tex`。
 - 記憶・経験・RAG・プロンプト・カートリッジの 5 カテゴリを一括エクスポート/インポートでき、別環境への移行やバックアップに使えます (埋め込みモデルが異なる場合は互換性の警告を表示)。
 
-### 高速応答の仕組み（base / assist モデル分離）
+### 高速応答の仕組み（base / aux モデル分離）
 
-- チャット応答用の大型モデル (base) と、記憶抽出・検索判定・要約などの裏方処理用の小型モデル (assist) を**別プロセスで動かし**、応答速度と品質を両立します。
-- 裏方の assist が起動失敗・故障してもチャットは縮退モードで継続し、状態は Web UI のバナーで確認できます。
+- チャット応答用の大型モデル (base) と、記憶抽出・検索判定・要約などの裏方処理用の小型モデル (aux) を**別プロセスで動かし**、応答速度と品質を両立します。
+- 裏方の aux が起動失敗・故障してもチャットは縮退モードで継続し、状態は Web UI のバナーで確認できます。
 - 起動時に必要 VRAM を自動見積もりし、予算を超えそうな場合は安全に起動を止めます (8K / 16K / 32K の長文対応レシピも用意)。
 
 ---
@@ -97,7 +97,7 @@ evoref は **完全ローカル動作** の自己進化型 LLM アシスタン�
 | Git | 最新版 |
 | llama-server | [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) の build **b8946 以上**を推奨 (CVE-2026-21869 修正以降) |
 | GPU / VRAM | GPU 推奨だが **CPU only でも動作** (`llama.gpu_layers: 0`)。必要 VRAM はモデルサイズと `context_size` に依存 (既定 base = gemma-4-12b-it-qat-q4_0 で概ね 8GB 前後)。埋め込みは既定で CPU 配置 |
-| ディスク | GGUF モデル計 十数 GB (既定構成: base gemma-4-12b-it-qat-q4_0 / assist gemma-4-E4B / embed Qwen3-Embedding-0.6B)。`local/` データは運用に応じ別途数百 MB〜数 GB |
+| ディスク | GGUF モデル計 十数 GB (既定構成: base gemma-4-12b-it-qat-q4_0 / aux gemma-4-E4B / embed Qwen3-Embedding-0.6B)。`local/` データは運用に応じ別途数百 MB〜数 GB |
 
 llama-server は setup では導入されません。**別途インストールして PATH を通す**必要があります。
 
@@ -126,7 +126,7 @@ setup は以下を一括実行します:
 5. モデル配置チェック: `models/` に GGUF が配置されているか確認 (自動ダウンロードは行いません)
 6. `local/` データディレクトリ生成
 
-> **モデルは手動配置**: GGUF を `models/` に置き、`config.yaml` の `model_paths` と整合させてください。既定は base (gemma-4-12b-it-qat-q4_0) / assist (gemma-4-E4B) / embed (Qwen3-Embedding-0.6B)。配置状況は `python scripts/download_model.py` で確認できます。
+> **モデルは手動配置**: GGUF を `models/` に置き、`config.yaml` の `model_paths` と整合させてください。既定は base (gemma-4-12b-it-qat-q4_0) / aux (gemma-4-E4B) / embed (Qwen3-Embedding-0.6B)。配置状況は `python scripts/download_model.py` で確認できます。
 
 #### オプション
 
@@ -163,7 +163,7 @@ evoref gui     # 既定ブラウザで Web UI を開く
 |----------|--------|
 | Web UI | 5173 |
 | backend (API) | 8000 |
-| llama-server (base / assist / embed) | 8080 / 8081 / 8082 |
+| llama-server (base / embed) | 8080 / 8082 |
 
 ---
 

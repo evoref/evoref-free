@@ -53,17 +53,12 @@ export interface ThemeConfig {
 export interface ModelPathsConfig {
 	base_model: string;
 	create_model?: string | null;
-	assist_create_model?: string | null;
 	[key: string]: unknown;
 }
 
 export interface LocalPathsConfig {
 	lora_adapter: string;
 	lora_versions_dir: string;
-	assist_lora_adapter: string;
-	assist_lora_versions_dir: string;
-	experience_assist_file: string;
-	eval_assist_file: string;
 	lora_archive_dir: string;
 	embed_lora_adapter: string;
 	embed_lora_versions_dir: string;
@@ -119,7 +114,7 @@ export interface RAGConfig {
 	hysteresis_band: number;
 	score_normalization: string;
 	self_rag: {
-		assist_judge: {
+		quality_judge: {
 			enabled: boolean;
 			max_per_session: number;
 			max_per_query: number;
@@ -244,29 +239,6 @@ export interface DebugConfig {
 	max_log_mb: number;
 }
 
-export interface AssistModelLocalConfig {
-	host: string;
-	port: number;
-	context_size: number;
-	mtp?: MtpConfig;
-	[key: string]: unknown;
-}
-
-export interface AssistModelConcurrencyConfig {
-	realtime: number;
-	background: number;
-	learning: number;
-	[key: string]: number;
-}
-
-export interface AssistModelConfig {
-	local: AssistModelLocalConfig | null;
-	model_path: string;
-	timeout: number;
-	concurrency: AssistModelConcurrencyConfig;
-	[key: string]: unknown;
-}
-
 export interface LongFormConfig {
 	max_units: number;
 	unit_max_tokens: number;
@@ -326,7 +298,6 @@ export interface ConfigData {
 	external_api: ExternalApiConfig;
 	i18n: I18nConfig;
 	debug: DebugConfig;
-	assist_model: AssistModelConfig;
 	modes: ModesConfig;
 	editor: EditorSettingsConfig;
 	long_form: LongFormConfig;

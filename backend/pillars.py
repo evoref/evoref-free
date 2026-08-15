@@ -15,7 +15,7 @@
 
 ## Pro 拡張
 
-:class:`ProState` は Pro 版で追加される補助 pillar (AssistComponents /
+:class:`ProState` は Pro 版で追加される補助 pillar (AuxComponents /
 WidgetProxyManager 等) を集約する。Free 版では ``None``。
 
 本モジュール自身は具象クラス依存を持たず、全属性を ``Any`` または
@@ -28,14 +28,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from backend.free.agent.assist_prompt_manager import AssistPromptManager
+    from backend.free.agent.aux_prompt_manager import AuxPromptManager
     from backend.free.agent.feedback import FeedbackCollector
     from backend.free.agent.learned_patterns import LearnedPatternStore
     from backend.free.agent.prompt_manager import SystemPromptManager
     from backend.free.learning.level0_instant import ExperienceBuffer
     from backend.free.learning.policy_adjuster import PolicyAdjuster
     from backend.free.learning.scheduler import LearningScheduler
-    from backend.free.llm.assist_client import AssistModelClient
+    from backend.free.llm.aux_client import AuxClient
     from backend.free.llm.llm_client import LLMClient
     from backend.free.llm.local_client import LocalClient
     from backend.free.loop.driver import LoopDriver
@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from backend.free.rag.embedding_backend import EmbeddingBackend
     from backend.free.rag.retriever import HybridRetriever
     from backend.free.rag.vector_store import VectorStore
-    from backend.pro.assist_components import ProAssistComponents
+    from backend.pro.learn_components import ProLearnComponents
 
 
 @dataclass
@@ -58,14 +58,14 @@ class GenPillar:
     Attributes:
         local_client: ベースモデル (llama-server) クライアント。未接続時は ``None``。
         llm_client: LocalClient を束ねたファサード (chat_in_flight / is_serving_user を提供)。
-        assist_client: アシストモデル LLM クライアント。未設定時は ``None``。
+        aux_client: 補助タスク LLM クライアント。未設定時は ``None``。
         embedder: 埋め込みバックエンド (llama-cpp server 経由)。未初期化時は ``None``。
         hybrid_retriever: BM25 + Vector ハイブリッド検索器 (ベンチマーク専用)。
     """
 
     local_client: "LocalClient | None" = None
     llm_client: "LLMClient | None" = None
-    assist_client: "AssistModelClient | None" = None
+    aux_client: "AuxClient | None" = None
     embedder: "EmbeddingBackend | None" = None
     hybrid_retriever: "HybridRetriever | None" = None
 
@@ -112,7 +112,7 @@ class LearnPillar:
     experience_buffer: "ExperienceBuffer"
     learned_patterns_store: "LearnedPatternStore"
     prompt_manager: "SystemPromptManager"
-    assist_prompt_manager: "AssistPromptManager"
+    aux_prompt_manager: "AuxPromptManager"
     feedback_collector: "FeedbackCollector"
     # develop=evolve 時のみ初期化される SemMem 書き戻し
     # コンポーネント。LogIngestor (Loop pillar) からの JoinedPair を消費する。
@@ -133,12 +133,14 @@ class ProLearnPillar:
     """Pro 版 EvorefLearn 拡張。
 
     Attributes:
-        assist_experience_buffer: アシストモデル経験バッファ。shutdown 時に保存される。
-        components: :class:`AssistComponentsProtocol` 準拠の集約コンポーネント。
+        components: :class:`LearnComponentsProtocol` 準拠の集約コンポーネント。
+
+    補助タスク経験バッファは Free 側 (``AppState.aux_experience_buffer``) が
+    所有する — アシストモデル撤去で判定自体がベースへ移り、Pro 限定である
+    必要がなくなったため。
     """
 
-    assist_experience_buffer: Any | None = None
-    components: "ProAssistComponents | None" = None
+    components: "ProLearnComponents | None" = None
 
 
 @dataclass

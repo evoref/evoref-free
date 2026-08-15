@@ -1,23 +1,14 @@
-"""Self-RAG 品質判定（ルールベース、ベースモデル呼び出し禁止）
+"""Self-RAG 判定 (ルールベース / LLM 呼び出しなし)
 
-ルールベース判定が既定 (``RetrievalQualityJudge.judge``)。
-``config.yaml`` の ``rag.self_rag.assist_judge`` (default enabled) で
-制御され、セッション / クエリ単位の発火上限は ``AssistJudgeUsageTracker``
-が担う。呼び出しの組立ては ``backend.free.memory.pipeline.search_pipeline``
-``_maybe_assist_judge_quality`` に集約される。
-
-検索必要性 (``RetrievalNecessityJudge``) はハイブリッド 3 値構成:
-ルールで ``retrieve`` / ``fetch`` / ``skip`` が確定するケースはアシスト 0
-呼び出しで即返し、判別不能な ``uncertain`` ケースのみ ``judge_with_assist``
-がアシストモデルに 3 値 JSON
-(``{"action": "retrieve" | "fetch" | "skip"}``) を問う。``fetch`` は外部
-fetch_url ツールに委ねる意図のため、search_pipeline では ``skip`` 同等に
-RAG をスキップする。
+検索結果の品質判定 (:class:`RetrievalQualityJudge`) はベクトル閾値、検索
+必要性判定 (:class:`RetrievalNecessityJudge`) は正規表現ルールで完結する。
+判別不能な ``uncertain`` ケースは呼出側 (``search_pipeline``) が embedding
+決定論的リコール (``rag_judge_recall``) で補い、それでも決まらなければ
+安全側の ``retrieve`` に倒す。
 """
 
 from __future__ import annotations
 
-import asyncio
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -26,7 +17,6 @@ import numpy as np
 
 from backend.free.core.intent_vocab import session_self_reference_pattern_ja
 from backend.free.core.locale_patterns import is_en_locale
-from backend.free.llm.assist_client import assist_ready
 from backend.free.document_nouns import (
     DOCUMENT_NOUNS_NEEDS_SUFFIX,
     DOCUMENT_NOUNS_NEEDS_SUFFIX_EN,
@@ -36,10 +26,8 @@ from backend.free.document_nouns import (
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
 
     from backend.debug_logger import DebugLogger
-    from backend.free.rag.assist_judge_tracker import AssistJudgeUsageTracker
 
 logger = get_logger("rag.self_rag_judge")
 
@@ -63,7 +51,7 @@ SKIP_PATTERNS_EN = re.compile(
 
 # 外部 fetch 意図パターン (確実シグナルのみ)
 # URL を含む / 明示的 fetch 動詞は 100% fetch 意図とみなし RAG をスキップ。
-# リアルタイムキーワード (ニュース / 株価 / 天気 等) はアシスト判定に委譲し、
+# リアルタイムキーワード (ニュース / 株価 / 天気 等) はLLM 判定に委譲し、
 # 固定キーワードリストの陳腐化を避ける。旧 Phase 2 (learned_pattern 化) の
 # 代替として embedding 決定論的リコール (backend.free.memory.pipeline.
 # rag_judge_recall) を導入済み — 意味的類似性が支配的な判定には正規表現
@@ -196,7 +184,16 @@ TRIVIAL_QUESTION_PATTERNS = re.compile(
     r"|あなた(は|の)(名前|誰|何者)"
     r"|お前(は|の)(名前|誰)"
     r"|君の名前"
-    r"|名前は何"
+    # NOTE: 旧 ``名前は何`` は削除した。主語を要求しないため
+    # 「**私の**名前は何でしたっけ？」「僕の名前は何だった？」という
+    # **ユーザー自身についての長期記憶質問**まで skip し、記憶検索が
+    # 到達しなくなっていた (2026-08-12 実測: backend.log の necessity
+    # skip 率 86.1% のうち、個人想起質問がこの枝で落ちていた)。
+    # アシスタントの同一性質問は上の ``あなた(は|の)(名前|誰|何者)`` /
+    # ``お前(は|の)(名前|誰)`` / ``君の名前`` が既に捕捉しており、本枝は
+    # 冗長だった (実測で 3 件すべて他枝が先に一致)。主語の無い
+    # 「名前は何ですか？」は uncertain → retrieve に倒れるが、無駄な検索
+    # 1 回のコストは想起失敗より安い。
     r"|あなたは誰"
     r"|あなたは何者"
     r"|元気ですか"
@@ -315,69 +312,6 @@ _HOWTO_QUESTION_RE_EN = re.compile(
 # にマッチした時点で retrieve に倒す (情報量があるため検索の便益が高い前提)。
 _UNCERTAIN_QUERY_MAX_CHARS = 30
 
-# アシストモデルへの検索必要性判定プロンプトの指示部 (日本語、3 値 action 応答)。
-# AssistPromptManager (task=rag_necessity) 未注入時のフォールバック既定値。
-# 動的データ (直前文脈 / クエリ) は judge_with_assist が末尾に連結するため、
-# ここにフォーマットスロットは含めない (str.format は使わない)。
-_NECESSITY_INSTRUCTIONS = (
-    "ユーザーの最新クエリを、3つの検索アクションのいずれかに分類してください。\n"
-    "\n"
-    "- retrieve: ローカルの知識ベース（アップロード文書・過去の会話・"
-    "導入済みカートリッジ）から答えるのが最適なもの。使い方・定義・"
-    "既知の内容への意見・以前の話題への言及など。\n"
-    "- fetch: 静的な知識ベースでは提供できない最新／ライブの外部情報を"
-    "要するもの。最新ニュース、現在の株価・天気・スポーツのスコア、"
-    "本日の見出し、特定サイトのリアルタイムな状態など。システムは"
-    "ローカル検索ではなく Web 取得ツールを使う。\n"
-    "- skip: 検索も取得も不要な些末なもの。現在時刻・日付・曜日、"
-    "簡単な挨拶、自己同一性、雑談のフィラーなど。\n"
-    "\n"
-    "直前のローカルな話題を指す短いフォローアップ質問は retrieve を"
-    "優先する。外部の最新状態を尋ねるものは fetch を優先する。\n"
-    "\n"
-    'JSON形式で回答: {"action": "retrieve"} / {"action": "fetch"} / {"action": "skip"}'
-)
-
-# アシストプロンプトへ含める直前ターン数の既定値 (user/assistant 合計)
-# 大きくしすぎるとレイテンシ増 + 関係ないトピックを引きずるため、
-# 直前 1 ターン (user + assistant) = 2 メッセージを既定とする。
-_DEFAULT_CONTEXT_TURNS = 2
-
-# 1 ターンあたりに含める content の最大文字数。
-# 長文 assistant 応答が context を埋めないようトリムする。
-_CONTEXT_TURN_MAX_CHARS = 200
-
-
-def _format_context_for_assist(
-    recent_context: list[dict] | None,
-    *,
-    max_turns: int = _DEFAULT_CONTEXT_TURNS,
-    max_chars: int = _CONTEXT_TURN_MAX_CHARS,
-) -> str:
-    """`judge_with_assist` のプロンプトに埋め込む直前ターン文字列を作る。
-
-    `recent_context` から末尾 `max_turns` 件を取り出し、各ターンの
-    content を `max_chars` 文字で切り詰めて role 付き 1 行にする。
-    空 / None / `max_turns <= 0` のときは空文字列を返す。
-    """
-    if not recent_context or max_turns <= 0:
-        return ""
-    tail = recent_context[-max_turns:]
-    if not tail:
-        return ""
-    lines = []
-    for turn in tail:
-        role = str(turn.get("role", "")).strip() or "user"
-        content = str(turn.get("content", "")).strip().replace("\n", " ")
-        if len(content) > max_chars:
-            content = content[: max_chars - 3] + "..."
-        if not content:
-            continue
-        lines.append(f"{role}: {content}")
-    if not lines:
-        return ""
-    return "直近の会話:\n" + "\n".join(lines) + "\n"
-
 # デフォルト閾値
 DEFAULT_RELEVANCE_THRESHOLD = 0.65
 DEFAULT_SUPPORT_THRESHOLD = 0.50
@@ -395,8 +329,46 @@ class QualityThresholds:
     hysteresis_band: float = DEFAULT_HYSTERESIS_BAND
 
     @classmethod
-    def from_config(cls, rag_cfg: dict) -> QualityThresholds:
-        """config.yaml の rag セクションから閾値を読込み"""
+    def from_config(
+        cls, rag_cfg: dict, calibration: dict[str, float] | None = None,
+    ) -> QualityThresholds:
+        """config.yaml の rag セクションから閾値を読込み
+
+        3 閾値は cosine スケールの絶対値だが、到達可能なスコア域は埋め込みモデル
+        ごとに違う。``rag.self_rag.threshold_mode`` が ``auto`` (既定) で較正値が
+        あればそちらを採用し、``manual`` なら config の静的値をそのまま使う。
+        ``hysteresis_band`` は帯幅であってスケール依存の絶対閾値ではないため
+        較正対象外 (常に config 値)。
+
+        Args:
+            rag_cfg: config.yaml の ``rag`` セクション。
+            calibration: 較正済み閾値。``None`` の場合はプロセス共通の
+                アクティブ較正値を参照する (テストからは明示注入できる)。
+        """
+        mode = str((rag_cfg.get("self_rag") or {}).get("threshold_mode", "auto"))
+        if calibration is None and mode == "auto":
+            from backend.free.rag.memory_threshold_calibration import (
+                get_active_calibration,
+            )
+            calibration = get_active_calibration()
+
+        if mode == "auto" and calibration:
+            return cls(
+                relevance=float(
+                    calibration.get("relevance_threshold", DEFAULT_RELEVANCE_THRESHOLD),
+                ),
+                support=float(
+                    calibration.get("support_threshold", DEFAULT_SUPPORT_THRESHOLD),
+                ),
+                confidence=float(
+                    calibration.get(
+                        "confidence_threshold", DEFAULT_CONFIDENCE_THRESHOLD,
+                    ),
+                ),
+                hysteresis_band=rag_cfg.get(
+                    "hysteresis_band", DEFAULT_HYSTERESIS_BAND,
+                ),
+            )
         return cls(
             relevance=rag_cfg.get("relevance_threshold", DEFAULT_RELEVANCE_THRESHOLD),
             support=rag_cfg.get("support_threshold", DEFAULT_SUPPORT_THRESHOLD),
@@ -406,27 +378,12 @@ class QualityThresholds:
 
 
 class RetrievalNecessityJudge:
-    """検索必要性のハイブリッド判定 (ルール → 任意でアシスト併用)
+    """検索必要性のルール判定
 
-    `_judge_rule` がルールで `"retrieve"` / `"skip"` / `"uncertain"` を
-    返し、外向きの後方互換 API `judge` は `uncertain` を `"retrieve"`
-    に正規化する。`judge_with_assist` は `uncertain` のみアシスト
-    モデルへ問い合わせ、失敗時は安全側の `"retrieve"` にフォールバック
-    する (現状挙動と一致させ回帰防止)。
+    `_judge_rule` がルールで `"retrieve"` / `"fetch"` / `"skip"` /
+    `"uncertain"` を返す。外向きの後方互換 API `judge` は `uncertain` を
+    安全側の `"retrieve"` に正規化する。
     """
-
-    def __init__(self, necessity_instructions: str | None = None) -> None:
-        """
-        Args:
-            necessity_instructions: アシスト必要性判定プロンプトの指示部。
-                AssistPromptManager (task=rag_necessity) 由来の編集可能テキストを
-                composition 層 (api/chat) から注入する。``None`` の場合は
-                ``_NECESSITY_INSTRUCTIONS`` 既定値にフォールバックする
-                (degraded-safe)。
-        """
-        self._necessity_instructions = (
-            necessity_instructions or _NECESSITY_INSTRUCTIONS
-        )
 
     def _judge_rule(self, query: str, context_count: int = 0) -> str:
         """純ルール判定 (3 値 + uncertain).
@@ -439,16 +396,12 @@ class RetrievalNecessityJudge:
             3. TRIVIAL (時刻/自己同一性/雑談) → skip
             4. QUESTION_PATTERNS マッチ:
                 - 長文 (>= 30 char) → retrieve (情報量がある知識質問)
-                - 短文 → uncertain (アシスト判定送り)
+                - 短文 → uncertain (呼出側のリコール送り)
             5. SKIP_PATTERNS (挨拶/相槌) + 短文 → skip
                 (QUESTION より後に置くのは「発売日はいつ」など SKIP の "はい"
                 substring に誤マッチする知識質問を retrieve に倒すため)
             6. context_count >= 3 → skip (会話継続フィラー)
-            7. デフォルト → uncertain (アシスト判定送り)
-
-        旧 ``FORCE_PATTERNS`` (教えて/情報/方法/...) は廃止。固定キーワード
-        では「Yahoo の最新ニュース教えて」(fetch 意図) と「RAG の方法を教えて」
-        (retrieve 意図) を区別できないため、アシスト 3 値判定に委ねる。
+            7. デフォルト → uncertain (呼出側のリコール送り)
         """
         query_stripped = query.strip()
         en = is_en_locale()
@@ -485,11 +438,10 @@ class RetrievalNecessityJudge:
         #     "議事録テンプレートを作って C:\path\minutes.md に保存して"
         # ユーザが提示したファイルを文脈とする新規生成/書出しタスクで、
         # local KB (SemMem / 履歴) には引き当てるべき情報がない。
-        # この時点で RAG 全工程 (assist 判定 + embedding + LTM) を
-        # 早期 skip して 10 秒以上のレイテンシを排除する。
+        # この時点で RAG 全工程 (embedding + LTM) を早期 skip する。
         # QUESTION より先に評価する: 生成依頼の付帯表現 (「〜が欲しいです」等)
-        # が質問マーカーに食われて uncertain → assist 判定 (5 秒) に流れるのを
-        # 防ぐ。ただし how-to 質問 (「作成する方法を教えて」) は除外する。
+        # が質問マーカーに食われて uncertain に流れるのを防ぐ。
+        # ただし how-to 質問 (「作成する方法を教えて」) は除外する。
         if (
             FILE_PATH_PATTERN.search(query_stripped)
             and codegen_pat.search(query_stripped)
@@ -528,7 +480,7 @@ class RetrievalNecessityJudge:
             logger.debug("Necessity: skip (sufficient context: %d turns)", context_count)
             return "skip"
 
-        # 7. デフォルトは uncertain (アシスト判定送り)
+        # 7. デフォルトは uncertain (呼出側のリコール送り)
         # 旧 FORCE_PATTERNS が拾っていたケースもここに落ちる。
         logger.debug("Necessity: uncertain (default, query=%r)", query_stripped[:50])
         return "uncertain"
@@ -542,8 +494,7 @@ class RetrievalNecessityJudge:
         - ``"fetch"`` → ``"skip"`` (RAG 不要の意味では同義)
         - ``"uncertain"`` → ``"retrieve"`` (安全側、検索する)
 
-        アシスト併用 + 3 値を使いたい呼出側は ``judge_with_assist`` を
-        await すること。
+        3 値のまま扱いたい呼出側は ``judge_rule_only`` を使うこと。
         """
         rule = self._judge_rule(query, context_count)
         if rule == "uncertain":
@@ -555,203 +506,11 @@ class RetrievalNecessityJudge:
     def judge_rule_only(self, query: str, context_count: int = 0) -> str:
         """ルール判定の 3 値 (``uncertain`` 含む) をそのまま返す。
 
-        embedding 決定論的リコール (``rag_judge_recall``) が assist 呼出前に
-        「ルールで確定できるか」を判定するための公開 API。``uncertain`` の
-        場合のみ呼出側がリコール → assist の順にフォールバックする。
+        embedding 決定論的リコール (``rag_judge_recall``) が「ルールで確定
+        できるか」を判定するための公開 API。``uncertain`` の場合のみ呼出側が
+        リコールへフォールバックする。
         """
         return self._judge_rule(query, context_count)
-
-    async def judge_with_assist(
-        self,
-        query: str,
-        context_count: int,
-        assist_client,
-        *,
-        recent_context: list[dict] | None = None,
-        session_id: str = "default",
-        tracker: "AssistJudgeUsageTracker | None" = None,
-        debug_logger: "DebugLogger | None" = None,
-        config: dict | None = None,
-        record_assist: "Callable[[str, str, str, float], None] | None" = None,
-    ) -> str:
-        """ルール判定 + uncertain 時のアシスト救済 (3 値返却).
-
-        ルールで ``retrieve`` / ``fetch`` / ``skip`` が確定すればアシストを
-        呼ばない。``uncertain`` のみアシストモデルに 3 値 JSON
-        (``{"action": "retrieve" | "fetch" | "skip"}``) を問う。
-        tracker / timeout / 例外でフォールバックする場合は安全側の
-        ``"retrieve"`` を返す。
-
-        Args:
-            recent_context: 会話履歴 (role/content dict のリスト)。末尾の
-                ``config["context_turns"]`` 件 (既定 2) をアシストプロンプトに
-                埋め込み、フォローアップ質問の判定精度を上げる。
-            session_id: 発火回数カウンタのキー (``WorkingMemory.session_id``)。
-            tracker: ``AssistJudgeUsageTracker`` 互換のセッションカウンタ。
-                ``None`` ならカウンタ評価をスキップする (テスト経路互換)。
-            config: ``rag.self_rag.assist_necessity`` セクション。
-
-        Returns: "retrieve" | "fetch" | "skip"
-        """
-        rule = self._judge_rule(query, context_count)
-        if rule != "uncertain":
-            return rule
-
-        cfg = config or {}
-
-        # assist が無い / 非常駐 (residency=on_demand のチャット中) なら
-        # degraded mode → 安全側 retrieve
-        if not assist_ready(assist_client, "retrieval_necessity_judge"):
-            logger.debug("Necessity assist: skipped (assist not available)")
-            return "retrieve"
-
-        # tracker による発火上限チェック (本機能の quality キーは "uncertain")
-        if tracker is not None:
-            decision = tracker.check(
-                session_id=session_id,
-                namespace="necessity",
-                quality="uncertain",
-                query_count=0,
-                config=cfg,
-            )
-            if not decision.allowed:
-                logger.debug(
-                    "Necessity assist: skipped (reason=%s, session=%d)",
-                    decision.reason, decision.session_count,
-                )
-                if debug_logger is not None:
-                    debug_logger.log_decision(
-                        decision_point="self_rag_necessity_path",
-                        chosen="retrieve",
-                        candidates=["retrieve", "fetch", "skip"],
-                        reason=f"tracker_skipped:{decision.reason}",
-                        context={
-                            "session_count": decision.session_count,
-                            "query_count": decision.query_count,
-                        },
-                        scope="request",
-                    )
-                return "retrieve"
-
-        # cfg["timeout_s"] (rag.self_rag.assist_necessity.timeout_s) は使わない:
-        # schema既定値(5.0)が常に埋まるため「ユーザー明示設定」と「未設定」を
-        # 区別できず、反応的タイムアウト較正 (_calibrated_timeouts) を永久に
-        # 無効化してしまう。purpose別上書きは assist_model.timeouts.<purpose>
-        # (全 purpose 共通の正規チャネル) に委ね、ここでは較正込みの実効値を使う。
-        timeout_s = assist_client.resolve_effective_timeout("retrieval_necessity_judge")
-        context_turns = int(cfg.get("context_turns", _DEFAULT_CONTEXT_TURNS))
-        context_block = _format_context_for_assist(
-            recent_context, max_turns=context_turns,
-        )
-        prompt = (
-            f"{self._necessity_instructions}\n{context_block}最新のクエリ: {query}"
-        )
-        if context_block:
-            logger.debug(
-                "Necessity assist: context_block included (chars=%d, turns=%d)",
-                len(context_block), min(context_turns, len(recent_context or [])),
-            )
-        else:
-            logger.debug("Necessity assist: no context_block (empty/disabled)")
-        try:
-            # timeout は generate_json 側の purpose 別 (realtime) 総予算強制に
-            # 一本化する。外側に別途 wait_for を掛けると、外側の締切が内側の
-            # asyncio.timeout より先に (または同時に) 発火した場合、内側が
-            # 自分の締切超過と認識できず CancelledError のまま抜けてしまい、
-            # generate() の except (TimeoutError) に到達せず反応的タイムアウト
-            # 較正 (_bump_calibrated_timeout) が発火しない不具合があった。
-            result = await assist_client.generate_json(
-                prompt,
-                max_tokens=32,
-                temperature=0.0,
-                purpose="retrieval_necessity_judge",
-                timeout=timeout_s,
-            )
-        except asyncio.TimeoutError:
-            # fail-closed: タイムアウト時は skip に倒す。fail-open (retrieve)
-            # だとタイムアウト税 (timeout_s) + 無関連チャンク添付の二重コストに
-            # なる (2026-07-15: timeout 2/3 が retrieve に倒れて 13 件の過去
-            # 雑談ノートがコンテキストに注入された)。ここに来るのは rule が
-            # uncertain と判定した短い質問のみで、検索スキップの損失は小さい。
-            logger.warning(
-                "Necessity assist: timeout after %.1fs (fail-closed to skip)",
-                timeout_s,
-            )
-            if debug_logger is not None:
-                debug_logger.log_decision(
-                    decision_point="self_rag_necessity_path",
-                    chosen="skip",
-                    candidates=["retrieve", "fetch", "skip"],
-                    reason="assist_timeout",
-                    scope="request",
-                )
-            return "skip"
-        except Exception as e:
-            logger.warning("Necessity assist: failed (%s)", type(e).__name__)
-            if debug_logger is not None:
-                debug_logger.log_decision(
-                    decision_point="self_rag_necessity_path",
-                    chosen="retrieve",
-                    candidates=["retrieve", "fetch", "skip"],
-                    reason=f"assist_call_failed:{type(e).__name__}",
-                    scope="request",
-                )
-            return "retrieve"
-
-        # 新 3 値 schema: {"action": "retrieve" | "fetch" | "skip"}
-        # 旧 2 値 schema: {"need_rag": bool}  ← 後方互換のため両方を受理
-        action = result.get("action")
-        if not isinstance(action, str) or action not in {"retrieve", "fetch", "skip"}:
-            need_rag = result.get("need_rag")
-            if isinstance(need_rag, bool):
-                action = "retrieve" if need_rag else "skip"
-            else:
-                logger.warning(
-                    "Necessity assist: invalid response %r, falling back to retrieve",
-                    result,
-                )
-                if debug_logger is not None:
-                    debug_logger.log_decision(
-                        decision_point="self_rag_necessity_path",
-                        chosen="retrieve",
-                        candidates=["retrieve", "fetch", "skip"],
-                        reason="invalid_assist_response",
-                        scope="request",
-                    )
-                return "retrieve"
-
-        if tracker is not None:
-            tracker.record(session_id, namespace="necessity")
-        logger.info(
-            "Necessity assist: %s (query=%r)", action, query[:50],
-        )
-        if debug_logger is not None:
-            debug_logger.log_decision(
-                decision_point="self_rag_necessity_path",
-                chosen=action,
-                candidates=["retrieve", "fetch", "skip"],
-                reason="assist_judge_used",
-                context={"action": action},
-                scope="request",
-            )
-        # assist が有効判定を返したケースのみ assist 経験に記録 (outcome=1.0)。
-        # tracker_skipped / timeout / 例外 / 不正応答の fallback 経路では呼ばない。
-        if record_assist is not None:
-            record_assist("rag_necessity", query, action, 1.0)
-        return action
-
-
-# 検索結果品質判定プロンプトの指示部 (日本語、3 値 quality 応答)。
-# AssistPromptManager (task=rag_quality) 未注入時のフォールバック既定値。
-# クエリ / 検索結果は judge_with_assist が末尾に連結する。
-_QUALITY_INSTRUCTIONS = (
-    "以下のクエリに対する検索結果の関連性を判定してください。\n\n"
-    "判定基準:\n"
-    "- high: 検索結果がクエリに直接的に関連し、十分な情報を含む\n"
-    "- medium: 部分的に関連するが、情報が不十分\n"
-    "- low: 検索結果がクエリにほぼ関連しない\n\n"
-    'JSON形式で回答: {"quality": "high" or "medium" or "low"}'
-)
 
 
 class RetrievalQualityJudge:
@@ -761,25 +520,16 @@ class RetrievalQualityJudge:
         self,
         thresholds: QualityThresholds | None = None,
         debug_logger: "DebugLogger | None" = None,
-        quality_instructions: str | None = None,
     ):
         """
         Args:
             thresholds: 品質判定の閾値設定。
-                marginal 判定時の rule-based vs assist 救済の選択 (decision_point=
+            debug_logger: marginal 判定の選択 (decision_point=
                 ``self_rag_judge_path``) を ``decision.jsonl`` に記録する。
                 ``evolve`` レベル限定で実発火、それ以外は no-op。
-            quality_instructions: アシスト品質判定プロンプトの指示部。
-                AssistPromptManager (task=rag_quality) 由来の編集可能テキストを
-                composition 層 (api/chat) から注入する。``None`` の場合は
-                ``_QUALITY_INSTRUCTIONS`` 既定値にフォールバックする
-                (degraded-safe)。
         """
         self.thresholds = thresholds or QualityThresholds()
         self._debug_logger = debug_logger
-        self._quality_instructions = (
-            quality_instructions or _QUALITY_INSTRUCTIONS
-        )
 
     def judge(
         self,
@@ -834,102 +584,3 @@ class RetrievalQualityJudge:
 
         logger.debug("Quality: low (top_score=%.3f below thresholds)", top_score)
         return "low"
-
-    async def judge_with_assist(
-        self,
-        query: str,
-        results: list[tuple[str, float, str]],
-        assist_client,
-        rule_based_quality: str,
-        record_assist: "Callable[[str, str, str, float], None] | None" = None,
-    ) -> str:
-        """アシストモデルで閾値境界の品質を再判定する。
-
-        ルールベース判定が "medium"（閾値境界）の場合に呼び出し、
-        アシストモデル LLM で関連性をより正確に判定する。
-        エラー時はルールベース結果にフォールバックする。
-
-        Args:
-            query: ユーザークエリ
-            results: [(chunk_id, score, text), ...]
-            assist_client: AssistModelClient インスタンス
-            rule_based_quality: ルールベース判定の結果（フォールバック用）
-
-        Returns: "high" | "medium" | "low"
-        """
-        try:
-            top_results = results[:3]
-            formatted = "\n".join(
-                f"- (スコア: {score:.2f}) {text[:150]}"
-                for _, score, text in top_results
-            )
-            prompt = (
-                f"{self._quality_instructions}\n\n"
-                f"クエリ: {query}\n\n"
-                f"検索結果:\n{formatted}"
-            )
-
-            result = await assist_client.generate_json(
-                prompt, max_tokens=64, temperature=0.1,
-                purpose="retrieval_quality_judge",
-            )
-            quality = result.get("quality", "")
-
-            if quality not in VALID_QUALITIES:
-                logger.warning(
-                    "Assist judge returned invalid quality %r, "
-                    "falling back to rule-based: %s",
-                    quality, rule_based_quality,
-                )
-                if self._debug_logger is not None:
-                    self._debug_logger.log_decision(
-                        decision_point="self_rag_judge_path",
-                        chosen="rule_based",
-                        candidates=["rule_based", "assist_judge"],
-                        reason="invalid_assist_response",
-                        context={
-                            "rule_based_quality": rule_based_quality,
-                            "assist_quality": quality,
-                        },
-                        scope="request",
-                    )
-                return rule_based_quality
-
-            logger.info(
-                "Assist judge: rule_based=%s -> assist=%s",
-                rule_based_quality, quality,
-            )
-            if self._debug_logger is not None:
-                self._debug_logger.log_decision(
-                    decision_point="self_rag_judge_path",
-                    chosen="assist_judge",
-                    candidates=["rule_based", "assist_judge"],
-                    reason="marginal_quality_assist_used",
-                    context={
-                        "rule_based_quality": rule_based_quality,
-                        "assist_quality": quality,
-                    },
-                    scope="request",
-                )
-            # assist が有効 quality を返したケースのみ記録。
-            # outcome は high/medium/low を 1.0/0.5/0.0 にマップ。fallback は記録しない。
-            if record_assist is not None:
-                _q_outcome = {"high": 1.0, "medium": 0.5, "low": 0.0}.get(quality, 0.5)
-                record_assist("rag_quality", query, quality, _q_outcome)
-            return quality
-
-        except Exception as e:
-            logger.warning(
-                "Assist judge failed (%s), falling back to rule-based: %s",
-                e, rule_based_quality,
-            )
-            if self._debug_logger is not None:
-                self._debug_logger.log_decision(
-                    decision_point="self_rag_judge_path",
-                    chosen="rule_based",
-                    candidates=["rule_based", "assist_judge"],
-                    reason=f"assist_call_failed:{type(e).__name__}",
-                    context={"rule_based_quality": rule_based_quality},
-                    scope="request",
-                )
-            return rule_based_quality

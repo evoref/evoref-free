@@ -1,8 +1,8 @@
-"""アシストモデル タスク別プロンプト管理（§7.1.2）
+"""補助タスク タスク別プロンプト管理（§7.1.2）
 
-アシストモデルの4タスク（検索必要性判定・検索品質判定・ツール呼び出し・ノート進化）
+補助タスクの4タスク（検索必要性判定・検索品質判定・ツール呼び出し・ノート進化）
 それぞれに専用プロンプトを持ち、読込み・更新・履歴管理を行う。
-SystemPromptManager のアシスト版。全エディション共通。
+SystemPromptManager の補助タスク版。全エディション共通。
 """
 
 from __future__ import annotations
@@ -28,12 +28,12 @@ from backend.free.agent.prompt_utils import (
 from backend.log_config import get_logger
 from backend.utils import utc_now as _now
 
-logger = get_logger("agent.assist_prompt_manager")
+logger = get_logger("agent.aux_prompt_manager")
 
 
 @dataclass
-class AssistPromptMeta:
-    """アシストプロンプトメタ情報"""
+class AuxPromptMeta:
+    """補助タスクプロンプトメタ情報"""
     task: str
     version: int = 1
     updated_at: str = ""
@@ -42,7 +42,7 @@ class AssistPromptMeta:
 
 
 # デフォルトプロンプト
-DEFAULT_ASSIST_PROMPTS: dict[str, str] = {
+DEFAULT_AUX_PROMPTS: dict[str, str] = {
     "rag_necessity": """\
 ユーザーの最新クエリを、3つの検索アクションのいずれかに分類してください。
 
@@ -131,8 +131,8 @@ JSON で出力してください:
 }
 
 
-class AssistPromptManager:
-    """アシストモデル タスク別プロンプト管理
+class AuxPromptManager:
+    """補助タスク タスク別プロンプト管理
 
     4タスクそれぞれに .md（本文）+ .meta.json（メタ情報）を管理する。
     SystemPromptManager と同じパターンだが、モードではなくタスク単位。
@@ -147,21 +147,21 @@ class AssistPromptManager:
         """
         self.prompt_dir = prompt_dir
         self.contents: dict[str, str] = {}
-        self.metas: dict[str, AssistPromptMeta] = {}
+        self.metas: dict[str, AuxPromptMeta] = {}
         self._load_all()
 
     def _load_all(self) -> None:
         """起動時に全タスクのプロンプトとメタ情報をロード"""
         self.prompt_dir.mkdir(parents=True, exist_ok=True)
         for task in self.TASKS:
-            key = f"assist_{task}"
+            key = f"aux_{task}"
             if body_exists(self.prompt_dir, key):
                 self.contents[task] = read_body(self.prompt_dir, key)
                 meta_data = read_meta_dict(self.prompt_dir, key)
                 if meta_data is not None:
                     self.metas[task] = self._meta_from_dict(meta_data, task)
                 else:
-                    self.metas[task] = AssistPromptMeta(task=task)
+                    self.metas[task] = AuxPromptMeta(task=task)
                     self._save_meta(task)
                 # 自己修復: 未編集 (source=default) のままコード側デフォルトが
                 # 更新された場合、ディスクの旧デフォルトを現行デフォルトに書き直し、
@@ -171,7 +171,7 @@ class AssistPromptManager:
             else:
                 self._create_default(task)
 
-    def get_assist_prompt(self, task: str) -> str:
+    def get_aux_prompt(self, task: str) -> str:
         """タスク別プロンプト本文を取得
 
         Args:
@@ -184,16 +184,16 @@ class AssistPromptManager:
             ValueError: 不明なタスク名
         """
         if task not in self.contents:
-            raise ValueError(f"Unknown assist task: {task}")
+            raise ValueError(f"Unknown aux task: {task}")
         return self.contents[task]
 
-    def get_meta(self, task: str) -> AssistPromptMeta:
+    def get_meta(self, task: str) -> AuxPromptMeta:
         """メタ情報を取得"""
         if task not in self.metas:
-            raise ValueError(f"Unknown assist task: {task}")
+            raise ValueError(f"Unknown aux task: {task}")
         return self.metas[task]
 
-    def update_assist_prompt(
+    def update_aux_prompt(
         self,
         task: str,
         content: str,
@@ -210,7 +210,7 @@ class AssistPromptManager:
             fitness: 適応度スコア
         """
         if task not in self.TASKS:
-            raise ValueError(f"Unknown assist task: {task}")
+            raise ValueError(f"Unknown aux task: {task}")
 
         # 保護セクション最終ゲート
         from backend.free.agent.prompt_manager import _normalized_equal
@@ -221,7 +221,7 @@ class AssistPromptManager:
 
         if not validate_protected_sections(current, content):
             logger.warning(
-                "Evolved assist prompt for %s lost protected sections, force-restoring",
+                "Evolved aux prompt for %s lost protected sections, force-restoring",
                 task,
             )
             content = restore_protected_sections(current, content)
@@ -230,14 +230,14 @@ class AssistPromptManager:
         # 意味的同一性ガード - 正規化後 current と同じなら no-op
         if _normalized_equal(current, content):
             logger.warning(
-                "Evolved assist prompt for %s is semantically identical to current "
+                "Evolved aux prompt for %s is semantically identical to current "
                 "(fitness=%.3f), skipping update",
                 task, fitness,
             )
             return
 
         self._archive_current(task)
-        write_body(self.prompt_dir, f"assist_{task}", content)
+        write_body(self.prompt_dir, f"aux_{task}", content)
         self.contents[task] = content
         meta = self.metas[task]
         meta.version += 1
@@ -246,37 +246,37 @@ class AssistPromptManager:
         meta.fitness_score = fitness
         self._save_meta(task)
         logger.info(
-            "Assist prompt evolved: task=%s, version=%d, fitness=%.3f",
+            "Aux prompt evolved: task=%s, version=%d, fitness=%.3f",
             task, meta.version, fitness,
         )
 
     def update_manual(self, task: str, content: str) -> None:
         """手動編集によるプロンプト更新"""
         if task not in self.TASKS:
-            raise ValueError(f"Unknown assist task: {task}")
+            raise ValueError(f"Unknown aux task: {task}")
         self._archive_current(task)
-        write_body(self.prompt_dir, f"assist_{task}", content)
+        write_body(self.prompt_dir, f"aux_{task}", content)
         self.contents[task] = content
         meta = self.metas[task]
         meta.version += 1
         meta.updated_at = _now()
         meta.source = "manual"
         self._save_meta(task)
-        logger.info("Assist prompt manual update: task=%s, version=%d", task, meta.version)
+        logger.info("Aux prompt manual update: task=%s, version=%d", task, meta.version)
 
     def get_history(self, task: str) -> list[dict]:
         """タスクの履歴一覧を取得"""
         if task not in self.TASKS:
-            raise ValueError(f"Unknown assist task: {task}")
-        return list_history_entries(self.prompt_dir, f"assist_{task}")
+            raise ValueError(f"Unknown aux task: {task}")
+        return list_history_entries(self.prompt_dir, f"aux_{task}")
 
     def rollback(self, task: str, version: int) -> None:
         """特定バージョンにロールバック"""
         if task not in self.TASKS:
-            raise ValueError(f"Unknown assist task: {task}")
-        content = read_history_version(self.prompt_dir, f"assist_{task}", version)
+            raise ValueError(f"Unknown aux task: {task}")
+        content = read_history_version(self.prompt_dir, f"aux_{task}", version)
         self._archive_current(task)
-        write_body(self.prompt_dir, f"assist_{task}", content)
+        write_body(self.prompt_dir, f"aux_{task}", content)
         self.contents[task] = content
         meta = self.metas[task]
         meta.version += 1
@@ -284,7 +284,7 @@ class AssistPromptManager:
         meta.source = "manual"
         self._save_meta(task)
         logger.info(
-            "Assist prompt rollback: task=%s to v%03d, new version=%d",
+            "Aux prompt rollback: task=%s to v%03d, new version=%d",
             task, version, meta.version,
         )
 
@@ -294,7 +294,7 @@ class AssistPromptManager:
             return
         archive_to_history(
             self.prompt_dir,
-            f"assist_{task}",
+            f"aux_{task}",
             self.metas[task].version,
             self.contents[task],
         )
@@ -305,16 +305,16 @@ class AssistPromptManager:
         デフォルト更新を既存インストールへ伝播させるための起動時自己修復。
         ``source`` が ``manual`` (手動編集) / ``evolution`` (進化採用) のものは
         ユーザー資産として保護し、書き換えない。``source=default`` かつディスク
-        内容が現行 ``DEFAULT_ASSIST_PROMPTS[task]`` と異なる場合のみ書き直す。
+        内容が現行 ``DEFAULT_AUX_PROMPTS[task]`` と異なる場合のみ書き直す。
         一致していれば no-op (毎回起動で再書き込みしない / 冪等)。
         """
         meta = self.metas.get(task)
         if meta is None or meta.source != "default":
             return
-        default = DEFAULT_ASSIST_PROMPTS.get(task)
+        default = DEFAULT_AUX_PROMPTS.get(task)
         if default is None or self.contents.get(task) == default:
             return
-        write_body(self.prompt_dir, f"assist_{task}", default)
+        write_body(self.prompt_dir, f"aux_{task}", default)
         self.contents[task] = default
         meta.version = 1
         meta.updated_at = _now()
@@ -322,32 +322,32 @@ class AssistPromptManager:
         meta.fitness_score = 0.0
         self._save_meta(task)
         logger.info(
-            "Refreshed stale default assist prompt: task=%s "
+            "Refreshed stale default aux prompt: task=%s "
             "(on-disk default differed from current code default)",
             task,
         )
 
     def _create_default(self, task: str) -> None:
         """デフォルトプロンプトを生成"""
-        content = DEFAULT_ASSIST_PROMPTS.get(
-            task, f"# assist_{task}\nDefault assist prompt.\n",
+        content = DEFAULT_AUX_PROMPTS.get(
+            task, f"# aux_{task}\nDefault aux prompt.\n",
         )
-        write_body(self.prompt_dir, f"assist_{task}", content)
+        write_body(self.prompt_dir, f"aux_{task}", content)
         self.contents[task] = content
-        self.metas[task] = AssistPromptMeta(
+        self.metas[task] = AuxPromptMeta(
             task=task, version=1, updated_at=_now(), source="default",
         )
         self._save_meta(task)
-        logger.info("Created default assist prompt: task=%s", task)
+        logger.info("Created default aux prompt: task=%s", task)
 
     def _save_meta(self, task: str) -> None:
         """メタ情報を JSON ファイルに保存 (infra 層 `_prompt_store_helpers` に委譲)"""
-        write_meta_dict(self.prompt_dir, f"assist_{task}", asdict(self.metas[task]))
+        write_meta_dict(self.prompt_dir, f"aux_{task}", asdict(self.metas[task]))
 
     @staticmethod
-    def _meta_from_dict(data: dict, task: str) -> AssistPromptMeta:
-        """`read_meta_dict` の結果を `AssistPromptMeta` にハイドレートする (純粋関数)"""
-        return AssistPromptMeta(
+    def _meta_from_dict(data: dict, task: str) -> AuxPromptMeta:
+        """`read_meta_dict` の結果を `AuxPromptMeta` にハイドレートする (純粋関数)"""
+        return AuxPromptMeta(
             task=data.get("task", task),
             version=data.get("version", 1),
             updated_at=data.get("updated_at", ""),

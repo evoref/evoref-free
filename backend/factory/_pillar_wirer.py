@@ -35,13 +35,13 @@ from backend.trace_context import generate_trace_id, set_trace_id
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
-    from backend.free.agent.assist_prompt_manager import AssistPromptManager
+    from backend.free.agent.aux_prompt_manager import AuxPromptManager
     from backend.free.agent.learned_patterns import LearnedPatternStore
     from backend.free.agent.prompt_manager import SystemPromptManager
     from backend.free.core.policy_interpreter import PolicyInterpreter
     from backend.free.learning.level0_instant import ExperienceBuffer
     from backend.free.learning.scheduler import LearningScheduler
-    from backend.free.llm.assist_client import AssistModelClient
+    from backend.free.llm.aux_client import AuxClient
     from backend.free.llm.local_client import LocalClient
     from backend.free.memory.scheduler import SleepTimeScheduler
     from backend.free.memory.stores.short_term import ShortTermMemory
@@ -49,7 +49,6 @@ if TYPE_CHECKING:
     from backend.free.rag.retriever import HybridRetriever
     from backend.free.rag.vector_store import VectorStore
     from backend.pillars import GenPillar, LearnPillar, LoopPillar, MemPillar
-    from backend.pro.assist_experience import AssistExperienceBuffer
 
 logger = get_logger("factory.pillar_wirer")
 
@@ -177,8 +176,13 @@ def _start_capability_probe(
                 model_id=getattr(metadata, "model_id", ""),
                 template_family=getattr(metadata, "template_family", "unknown"),
                 declared_reasoning_mode=declared,
-                chat_fn=make_llama_chat_fn(llama_url, debug_logger=debug_logger),
-                probe_json=False,  # base はチャットのみ。json purpose は assist 側で観測
+                chat_fn=make_llama_chat_fn(
+                    llama_url,
+                    debug_logger=debug_logger,
+                    # プローブは背景処理。チャットの初回応答と KV を分離する
+                    id_slot=client.background_slot,
+                ),
+                probe_json=True,  # 補助タスクの JSON purpose も base が担う
             )
             client.capabilities = snapshot
             new_enable = resolve_enable_thinking(
@@ -274,205 +278,35 @@ def _init_llm_client(
         logger.info("LLMClient initialized (local llama-server)")
 
 
-def _init_assist_residency(
-    state: AppState, cfg: dict[str, Any], debug_logger: "DebugLogger",
-) -> None:
-    """アシストの常駐管理 (docs/c_14 §1.2) を構築し ``AppState`` に載せる。
+def _init_aux_client(
+    state: AppState,
+    cfg: dict[str, Any],
+    debug_logger: "DebugLogger",
+    local_client: Any,
+) -> "AuxClient | None":
+    """5d. 補助タスク用クライアント初期化
 
-    ``_init_assist_model`` より前に呼ぶ必要がある — ``on_demand`` かどうかで
-    起動時に health check を待つかが変わるため。
+    補助タスク (sleep-time / 学習 / 長文プラン / create の計画・仕様合成) は
+    ベースモデルの専有スロットで回す。専用サーバもヘルスチェックも要らず、
+    ベースが接続できていれば必ず使える。ベース未接続時のみ ``None``。
     """
-    from backend.free.llm.assist_residency import AssistResidencyManager
-
-    async def _on_first_ready(client: "AssistModelClient") -> None:
-        """初回 ready 時に 1 度だけ: サーバ実パラメータ同期 + 各種プローブ。
-
-        毎回のアイドル窓で再実行すると数秒を無駄にするため 1 プロセス 1 回。
-        品質プローブ (``_start_quality_probes``) は assist URL を直接叩くため、
-        起動時ではなくここで走らせる — 非常駐のまま起動時に投げると必ず
-        ConnectError になり、モデル変更が永久に検査されなくなる。
-        """
-        await client.update_params_from_server()
-        _start_assist_capability_probe(client, cfg, debug_logger)
-        try:
-            from backend.config import get_path_resolver
-            _start_quality_probes(
-                state, cfg, get_path_resolver(), debug_logger,
-                local_client=None, assist_client=client, embedder=None,
-            )
-        except Exception as e:
-            logger.warning("Assist quality probe scheduling failed: %s", e)
-
-    state.assist_residency = AssistResidencyManager(
-        state, cfg, on_first_ready=_on_first_ready,
-    )
-
-
-async def _init_assist_model(
-    state: AppState, cfg: dict[str, Any], debug_logger: "DebugLogger",
-) -> "AssistModelClient | None":
-    """5d. アシストモデルクライアント初期化（全エディション必須、§2.3.2）
-
-    ``assist_model.residency: on_demand`` (既定) ではクライアントだけ構築して
-    返し、llama-server の起動・health check は行わない (docs/c_14 §1.2)。
-    実際の起動は ``AssistResidencyManager.acquire`` がアイドル窓 / create モード
-    で行う。呼出は ``AssistModelClient`` 内の residency ゲートで塞がれるため、
-    非常駐のまま呼ばれても HTTP は発生しない。
-    """
-    try:
-        from backend.free.llm.assist_client import AssistModelClient
-
-        assist_model_cfg = cfg.get("assist_model", {})
-        if not assist_model_cfg.get("enabled", True):
-            logger.info(
-                "Assist model disabled via config (assist_model.enabled=false) — "
-                "tool judgment, memory evolution, long-form planning, "
-                "and search quality judgment will use fallback modes"
-            )
-            return None
-        if not assist_model_cfg.get("local"):
-            logger.info(
-                "Assist model not configured in config.yaml "
-                "(add assist_model.local section to enable) — "
-                "tool judgment, memory evolution, long-form planning, "
-                "and search quality judgment will use fallback modes"
-            )
-            return None
-
-        assist_client = AssistModelClient(cfg, debug_logger=debug_logger)
-        residency = state.assist_residency
-        if residency is not None:
-            assist_client.set_residency_gate(residency.allows)
-
-        if residency is not None and residency.on_demand:
-            # on_demand: 起動を待たずに配線だけ済ませる。外部起動 (evoref-ctl の
-            # 旧手順や launch_llama --assist) で :8081 が生きていると、
-            # チャット中もベースと帯域を奪い合うため確実に落としておく。
-            state.assist_client = assist_client
-            await _stop_stray_assist_server(state, cfg)
-            logger.info(
-                "Assist model wired in on-demand residency mode (%s): "
-                "the assist server stays stopped during chat and is started only "
-                "for idle batches (sleep-time / Level 1-2) and create mode",
-                assist_client.url,
-            )
-            return assist_client
-
-        # 起動レース対策: assist-model llama-server プロセスが listen するまで
-        # /health をポーリング (base と同じパターン)
-        from backend.free.llm._base_client import wait_for_server_ready
-        await wait_for_server_ready(
-            f"{assist_client.url}/health",
-            label="llama-server (assist)",
-        )
-        if not await assist_client.health_check():
-            logger.warning(
-                "Assist model health check failed: %s — "
-                "impact: tool judgment → rule-based fallback, "
-                "memory steps 6-10 → base model fallback, "
-                "long-form → Recurrent strategy, "
-                "search pipeline → assist judge disabled",
-                assist_client.url,
-            )
-            return None
-
-        await assist_client.update_params_from_server()
-        state.assist_client = assist_client
-        cc = assist_client.concurrency
-        logger.info(
-            "Assist model connected: %s "
-            "(concurrency realtime=%d, background=%d, learning=%d)",
-            assist_client.url,
-            cc["realtime"], cc["background"], cc["learning"],
-        )
-        _start_assist_capability_probe(assist_client, cfg, debug_logger)
-        return assist_client
-    except Exception as e:
+    if local_client is None or not hasattr(local_client, "generate_constrained"):
         logger.warning(
-            "Assist model client init failed: %s — "
-            "all assist-dependent features will use fallback modes",
-            e,
+            "Aux client not wired: base llama-server is unavailable — "
+            "sleep-time LLM stages, learning cycles, long-form planning and "
+            "create-mode synthesis will use their fallback paths",
         )
         return None
 
+    from backend.free.llm.aux_client import AuxClient
 
-async def _stop_stray_assist_server(state: AppState, cfg: dict[str, Any]) -> None:
-    """``on_demand`` 起動時に居残っているアシスト llama-server を停止する。
-
-    ``evoref-ctl start`` の旧手順や ``launch_llama.py --assist`` を手で叩いた
-    後に backend を上げると :8081 が生きたままになり、「チャット中は常駐しない」
-    という設計目的が崩れる (VRAM も帯域も取られる)。/health が通ったときだけ
-    停止する (通常は no-op で追加コストゼロ)。
-    """
-    import asyncio
-
-    from backend.free.api.system.server_control import (
-        _check_health,
-        _resolve_endpoint,
-        stop_server_process,
+    aux_client = AuxClient(local_client, config=cfg, debug_logger=debug_logger)
+    state.aux_client = aux_client
+    logger.info(
+        "Aux client wired on the base model (background slot=%d)",
+        local_client.background_slot,
     )
-
-    endpoint = _resolve_endpoint("assist", cfg)
-    if endpoint is None:
-        return
-    host, port = endpoint
-    try:
-        if not await _check_health(host, port):
-            return
-        logger.info(
-            "Assist server found running at %s:%s while residency=on_demand — "
-            "stopping it so chat keeps the GPU to itself",
-            host, port,
-        )
-        await asyncio.to_thread(stop_server_process, "assist", cfg, state)
-    except Exception as e:
-        logger.warning("Failed to stop stray assist server: %s", e)
-
-
-def _start_assist_capability_probe(
-    assist_client: Any, cfg: dict[str, Any], debug_logger: "DebugLogger",
-) -> None:
-    """アシストモデルの実挙動プローブをバックグラウンドで起動する (docs/c_15)。
-
-    json purpose を持つため ``probe_json=True``。観測結果 (特に json_schema grammar
-    が強制されるか) を ``assist_client.capabilities`` に保持し、divergence をログ化する
-    (``needs_lenient_json`` の可視化)。``runtime.capability_probe`` False で no-op。
-    失敗時は prior を維持 (degraded 安全)。
-    """
-    if not (cfg.get("runtime", {}) or {}).get("capability_probe", True):
-        return
-
-    import asyncio
-
-    from backend.config import resolve_reasoning_mode
-    from backend.free.llm.capability import (
-        make_llama_chat_fn,
-        probe_model_capabilities,
-    )
-    from backend.free.llm.model_metadata import fetch_model_metadata
-
-    url = getattr(assist_client, "url", None)
-    if not url:
-        return
-
-    async def _run() -> None:
-        try:
-            meta = await fetch_model_metadata(url, debug_logger=debug_logger)
-            declared = resolve_reasoning_mode(
-                cfg, "assist", chat_template=getattr(meta, "chat_template", None),
-            )
-            snapshot = await probe_model_capabilities(
-                model_id=getattr(meta, "model_id", ""),
-                template_family=getattr(meta, "template_family", "unknown"),
-                declared_reasoning_mode=declared,
-                chat_fn=make_llama_chat_fn(url, debug_logger=debug_logger),
-                probe_json=True,  # assist は json purpose (url_relevance_score 等) を持つ
-            )
-            assist_client.capabilities = snapshot
-        except Exception as e:
-            logger.warning("Assist capability probe failed (prior retained): %s", e)
-
-    assist_client._capability_probe_task = asyncio.create_task(_run())
+    return aux_client
 
 
 def _start_quality_probes(
@@ -482,7 +316,6 @@ def _start_quality_probes(
     debug_logger: "DebugLogger",
     *,
     local_client: Any,
-    assist_client: Any,
     embedder: Any,
 ) -> None:
     """モデル切替を検知した役割だけ出力品質プローブを走らせる。
@@ -509,7 +342,6 @@ def _start_quality_probes(
     model_paths = cfg.get("model_paths", {}) or {}
     targets: list[tuple[str, str, Any]] = [
         ("base", model_paths.get("base_model") or "", local_client),
-        ("assist", model_paths.get("assist_model") or "", assist_client),
         ("embedding", model_paths.get("embed_model") or "", embedder),
     ]
     raw_paths = {role: raw for role, raw, _ in targets}
@@ -555,6 +387,8 @@ def _start_quality_probes(
                         model=model_name,
                         chat_fn=make_llama_chat_fn(
                             url, debug_logger=debug_logger, timeout=90.0,
+                            # 品質プローブも背景処理。チャットと KV を分離する
+                            id_slot=client.background_slot,
                         ),
                         baseline=baseline,
                         # 本番のチャットパスと同じ thinking 設定で測る。既定のまま
@@ -580,7 +414,7 @@ def _probe_enable_thinking(client: Any) -> bool | None:
     reasoning モデルで思考が生成上限を食い潰し content が空になった)。
 
     保持場所がクライアント種別で異なる — ``LocalClient`` は ``_enable_thinking``、
-    ``AssistModelClient`` は ``_chat_template_kwargs["enable_thinking"]``。どちらも
+    ``AuxClient`` は ``_chat_template_kwargs["enable_thinking"]``。どちらも
     起動時に ``resolve_enable_thinking`` で解決済みの値なので、ここでは読むだけで
     再導出しない (二重解決は乖離のもと)。``None`` は「送らない」を意味する。
     """
@@ -658,7 +492,7 @@ def _load_experience_buffer(resolver: Any) -> tuple["ExperienceBuffer", Path]:
 
     exp_buf = ExperienceBuffer()
     # base 経験は (model×mode) partition 配下 (resolve_learning)。partition 無効時は
-    # resolve_local 同等 (flat)。assist 経験 (experience_assist_file) は共有のまま。
+    # resolve_local 同等 (flat)。
     exp_file = resolver.resolve_learning("experience_file")
     if exp_file.exists():
         try:
@@ -698,7 +532,7 @@ def _init_learning_core(
     "LearnedPatternStore",
     Path,
     "SystemPromptManager",
-    "AssistPromptManager",
+    "AuxPromptManager",
     "SleepTimeScheduler",
 ]:
     """7. 学習サイクル初期化（経験バッファ・パターン・プロンプト・SleepTimeScheduler）"""
@@ -732,29 +566,22 @@ def _init_learning_core(
     )
     state.feedback_collector = fc
 
-    # assist 経験記録 closure: assist 由来の RAG 必要性 / RAG 品質 / ツール判定の
-    # outcome を Pro の assist 経験バッファへ best-effort で記録する (Level 2
-    # assist=B / assist bootstrap の学習信号)。Free / --no-learning / Pro 未配置は
-    # no-op。Pro 型を import せず buffer.record() をポリモーフィックに呼ぶことで
-    # pillar 境界 (Free→Pro 禁止) を侵さない。buffer は call 時に遅延参照する
-    # (Pro learn pillar の構築順に依存しない)。例外は握り潰し、記録失敗が
-    # チャット応答パスを壊さないようにする。
-    def _record_assist_experience(
+    # 判定経験の記録 closure: RAG 必要性 / RAG 品質の判定結果を embedding
+    # リコール用リングバッファへ best-effort で記録する。--no-learning では
+    # no-op。例外は握り潰し、記録失敗がチャット応答パスを壊さないようにする。
+    def _record_judge_experience(
         action_type: str, input_context: str, output: str, outcome: float,
         mode: str = "chat",
     ) -> None:
         if state.learning_disabled:
             return
-        # Free/Pro 共通: RAG necessity/quality の embedding recall 用リングバッファ。
         # SemMem 書込みではない (プロセス内リングバッファ、sleep-time Step 8.7 が
-        # drain して world_fact 化する)。Pro 限定の assist 経験バッファ記録とは独立。
-        if state.rag_judge_assist_log is not None and action_type in (
+        # drain して world_fact 化する)。
+        if state.rag_judge_log is not None and action_type in (
             "rag_necessity", "rag_quality",
         ):
-            state.rag_judge_assist_log.record(action_type, input_context, output)
-        pro = state.pro
-        learn = pro.learn if pro is not None else None
-        buf = getattr(learn, "assist_experience_buffer", None) if learn else None
+            state.rag_judge_log.record(action_type, input_context, output)
+        buf = state.aux_experience_buffer
         if buf is None:
             return
         try:
@@ -762,33 +589,34 @@ def _init_learning_core(
                 list(state.cartridge_manager.loaded)
                 if state.cartridge_manager is not None else []
             )
-            buf.record(action_type, input_context[:2000], output, outcome, cart_ids, mode=mode)
+            buf.record(
+                action_type, input_context[:2000], output, outcome,
+                cart_ids, mode=mode,
+            )
         except Exception as e:
-            logger.debug("assist experience record skipped: %s", e)
+            logger.debug("aux experience record skipped: %s", e)
 
-    state.assist_experience_recorder = _record_assist_experience
+    state.judge_experience_recorder = _record_judge_experience
 
     # 7b. プロンプトマネージャ（§6.6.4: モード別システムプロンプト）
     # base システムプロンプト (chat.md / create.md + meta + history + learning_state)
-    # は (model×mode) partition 配下 (resolve_learning)。assist プロンプトは
-    # **アシストモデル単位** の別軸パーティション (resolve_assist_prompt_dir) —
-    # 進化した文面はそのモデルの癖に合わせて最適化されるため、アシストモデルを
-    # 差し替えたら引き継がず既定から作り直す。両者が同一 prompts_dir を共有しない
-    # よう分離する。
+    # は (model×mode) partition 配下 (resolve_learning)。補助タスクのプロンプトは
+    # モードに依存しない共有軸 (resolve_aux_prompt_dir) に置き、両者が同一
+    # prompts_dir を共有しないよう分離する。
     base_prompt_dir = resolver.resolve_learning("prompts_dir")
-    assist_prompt_dir = resolver.resolve_assist_prompt_dir()
+    aux_prompt_dir = resolver.resolve_aux_prompt_dir()
     instance_name = cfg.get("instance", {}).get("name", "evoref")
     prompt_mgr = SystemPromptManager(base_prompt_dir, instance_name=instance_name)
     state.prompt_manager = prompt_mgr
 
-    # 7b-2. アシストプロンプトマネージャ（§7.1.2: タスク別プロンプト）
-    from backend.free.agent.assist_prompt_manager import AssistPromptManager
+    # 7b-2. 補助タスクプロンプトマネージャ（§7.1.2: タスク別プロンプト）
+    from backend.free.agent.aux_prompt_manager import AuxPromptManager
 
-    assist_prompt_mgr = AssistPromptManager(assist_prompt_dir)
-    state.assist_prompt_manager = assist_prompt_mgr
+    aux_prompt_mgr = AuxPromptManager(aux_prompt_dir)
+    state.aux_prompt_manager = aux_prompt_mgr
     logger.info(
-        "AssistPromptManager initialized: %d tasks loaded",
-        len(assist_prompt_mgr.contents),
+        "AuxPromptManager initialized: %d tasks loaded",
+        len(aux_prompt_mgr.contents),
     )
 
     # 7c. SleepTimeScheduler
@@ -801,7 +629,7 @@ def _init_learning_core(
     return (
         exp_buf, exp_file,
         learned_patterns_store, patterns_file,
-        prompt_mgr, assist_prompt_mgr,
+        prompt_mgr, aux_prompt_mgr,
         sleep_scheduler,
     )
 
@@ -959,7 +787,7 @@ def _init_lazy_contextual(
     ``rag.contextual_prefix.enabled=true`` かつ ``mode=lazy`` のときのみ
     構築する。それ以外はスキップし ``state.lazy_contextual`` は ``None``
     のままで、search_pipeline 側の hook は自動的に no-op 化される。
-    ``assist_client`` / ``embedder`` / ``vector_store`` のいずれかが
+    ``aux_client`` / ``embedder`` / ``vector_store`` のいずれかが
     欠落していても no-op。
     """
     rag_cfg = cfg.get("rag", {}) or {}
@@ -972,11 +800,11 @@ def _init_lazy_contextual(
             "(enabled=%s, mode=%s)", enabled, mode,
         )
         return
-    if not (state.assist_client and embedder and vector_store):
+    if not (state.aux_client and embedder and vector_store):
         logger.info(
             "LazyContextualPrefixService init skipped: "
-            "assist_client=%s, embedder=%s, vector_store=%s",
-            state.assist_client is not None,
+            "aux_client=%s, embedder=%s, vector_store=%s",
+            state.aux_client is not None,
             embedder is not None,
             vector_store is not None,
         )
@@ -985,7 +813,7 @@ def _init_lazy_contextual(
         from backend.free.rag.contextual_prefix import ContextualPrefixGenerator
         from backend.free.rag.lazy_contextual import LazyContextualPrefixService
 
-        generator = ContextualPrefixGenerator(state.assist_client, cfg)
+        generator = ContextualPrefixGenerator(state.aux_client, cfg)
         service = LazyContextualPrefixService(
             generator=generator,
             embedder=embedder,
@@ -1001,20 +829,138 @@ def _init_lazy_contextual(
         logger.warning("LazyContextualPrefixService init skipped: %s", e)
 
 
-def _init_assist_judge_tracker(state: AppState) -> None:
-    """Self-RAG assist_judge のセッション / クエリ単位カウンタを初期化する
+def _init_memory_threshold_calibration(
+    resolver, cfg: dict[str, Any], short_term, embedder,
+) -> None:
+    """記憶検索の品質 3 閾値を、埋め込みモデルに合わせた較正値へ差し替える。
 
-    config の ``rag.self_rag.assist_judge`` 設定読取は ``search_pipeline``
+    ``rag.self_rag.threshold_mode`` が ``manual`` なら何もしない (config の静的値)。
+    ``auto`` のときは指紋一致のキャッシュがあれば同期で適用し、無ければ代理クエリ
+    の再埋め込みが要るためバックグラウンドタスクで較正する。較正が終わるまでは
+    config の静的値へ縮退する (起動を遅らせない)。
+    """
+    from backend.free.rag.memory_threshold_calibration import (
+        embedder_fingerprint,
+        load_calibration,
+        set_active_calibration,
+    )
+
+    rag_cfg = cfg.get("rag", {}) or {}
+    mode = str((rag_cfg.get("self_rag") or {}).get("threshold_mode", "auto"))
+    if mode != "auto":
+        set_active_calibration(None)
+        logger.info("Memory threshold calibration disabled (threshold_mode=manual)")
+        return
+    if embedder is None or short_term is None:
+        logger.info(
+            "Memory threshold calibration skipped: embedder=%s short_term=%s",
+            embedder is not None, short_term is not None,
+        )
+        return
+
+    try:
+        fingerprint = embedder_fingerprint(embedder.model_name(), embedder.dim())
+        memory_dir = resolver.resolve_local("memory_dir")
+    except Exception as e:  # pragma: no cover - 起動は止めない
+        logger.warning("Memory threshold calibration setup failed: %s", e)
+        return
+
+    cached = load_calibration(memory_dir, fingerprint)
+    if cached:
+        set_active_calibration(cached)
+        logger.info(
+            "Memory threshold calibration loaded from cache (%s): %s",
+            fingerprint, cached,
+        )
+        return
+
+    try:
+        asyncio.create_task(
+            _run_memory_threshold_calibration(
+                memory_dir, fingerprint, short_term, embedder,
+            ),
+            name="memory_threshold_calibration",
+        )
+    except RuntimeError:  # イベントループ外 (同期テスト等) では単に見送る
+        logger.info("Memory threshold calibration deferred: no running event loop")
+
+
+async def _run_memory_threshold_calibration(
+    memory_dir, fingerprint: str, short_term, embedder,
+) -> None:
+    """代理クエリを再埋め込みして閾値を較正し、キャッシュへ保存する。
+
+    代理クエリは **保存済みのユーザー発話**。質問文と平叙文では埋め込みが
+    非対称なので、ノート↔ノートで測ると系統的に高く出て閾値が過大になる。
+    """
+    import numpy as np
+
+    from backend.free.rag.memory_threshold_calibration import (
+        MIN_NOTES,
+        MIN_QUERIES,
+        compute_calibration,
+        save_calibration,
+        set_active_calibration,
+    )
+
+    try:
+        notes = [n for n in short_term.notes.values() if n.embedding is not None]
+        if len(notes) < MIN_NOTES:
+            logger.info(
+                "Memory threshold calibration skipped: only %d notes with "
+                "embeddings (need %d); falling back to config thresholds",
+                len(notes), MIN_NOTES,
+            )
+            return
+        row_of = {note.id: i for i, note in enumerate(notes)}
+        proxies = [n for n in notes if getattr(n, "source", "user") == "user"]
+        if len(proxies) < MIN_QUERIES:
+            logger.info(
+                "Memory threshold calibration skipped: only %d user-source notes "
+                "usable as proxy queries (need %d)", len(proxies), MIN_QUERIES,
+            )
+            return
+
+        query_vecs = await embedder.embed(
+            [n.content for n in proxies], is_query=True, mode="chat",
+        )
+        note_vecs = np.stack([n.embedding for n in notes])
+        self_index = [row_of[n.id] for n in proxies]
+
+        result = compute_calibration(
+            note_vecs, np.asarray(query_vecs), self_index=self_index,
+        )
+        if not result.get("ok"):
+            logger.info(
+                "Memory threshold calibration not applied: %s", result.get("reason"),
+            )
+            return
+        set_active_calibration(result["thresholds"])
+        save_calibration(memory_dir, fingerprint, result)
+        logger.info(
+            "Memory threshold calibration applied (%s): %s",
+            fingerprint, result["thresholds"],
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # pragma: no cover - 較正失敗は縮退で吸収する
+        logger.warning("Memory threshold calibration failed: %s", e)
+
+
+def _init_judge_tracker(state: AppState) -> None:
+    """Self-RAG quality_judge のセッション / クエリ単位カウンタを初期化する
+
+    config の ``rag.self_rag.quality_judge`` 設定読取は ``search_pipeline``
     側で都度行うため、ここではトラッカーのみ生成する。enabled=False の
     場合でも tracker 自体は生成して問題ない (判定時に disabled skip)。
     """
-    from backend.free.rag.assist_judge_tracker import AssistJudgeUsageTracker
-    state.assist_judge_tracker = AssistJudgeUsageTracker()
+    from backend.free.rag.judge_usage_tracker import JudgeUsageTracker
+    state.judge_tracker = JudgeUsageTracker()
     # conflict_chat_judge のセッション内発火上限用に別インスタンスを生成
     # (RAG 判定とカウントを混在させない)。
-    state.conflict_judge_tracker = AssistJudgeUsageTracker()
+    state.conflict_judge_tracker = JudgeUsageTracker()
 
-    from backend.free.memory.pipeline.rag_judge_assist_log import RagJudgeAssistLog
+    from backend.free.memory.pipeline.rag_judge_log import RagJudgeLog
     # 永続化する: 消費側は Full サイクル (実測 22 回 / light 557 回) にしか
     # 無く、間に再起動が入ると in-memory バッファが丸ごと消えていた
     # (キュレータ実行 22 回中 16 回が空の入力)。
@@ -1025,10 +971,10 @@ def _init_assist_judge_tracker(state: AppState) -> None:
         )
     except Exception:
         rag_judge_events_path = None
-    state.rag_judge_assist_log = RagJudgeAssistLog(path=rag_judge_events_path)
+    state.rag_judge_log = RagJudgeLog(path=rag_judge_events_path)
 
     logger.info(
-        "AssistJudgeUsageTracker initialized (self_rag + conflict_chat_judge)",
+        "JudgeUsageTracker initialized (self_rag + conflict_chat_judge)",
     )
 
 
@@ -1044,8 +990,7 @@ def _init_sleep_time_worker(
     debug_logger: "DebugLogger",
     learned_patterns_store: "LearnedPatternStore",
     policy_interpreter: "PolicyInterpreter",
-    assist_prompt_mgr: "AssistPromptManager",
-    assist_client: "AssistModelClient | None" = None,
+    aux_prompt_mgr: "AuxPromptManager",
     hybrid_retriever: "HybridRetriever | None" = None,
 ) -> None:
     """7e. SleepTimeWorker（EmbeddingBackend + FadeMemScorer が必要）"""
@@ -1121,14 +1066,13 @@ def _init_sleep_time_worker(
             vector_store=vs,
             cartridge_manager=state.cartridge_manager,
             policy=policy_interpreter,
-            assist_prompt_manager=assist_prompt_mgr,
+            aux_prompt_manager=aux_prompt_mgr,
             semantic_store_provider=semantic_provider,
             current_project_id=current_project_id,
             agent_trace_dir=agent_trace_dir,
             subject_canonicalizer=subject_canonicalizer,
             semantic_store_invalidator=_semantic_invalidator,
-            assist_client=assist_client,
-            rag_judge_assist_log=state.rag_judge_assist_log,
+            rag_judge_log=state.rag_judge_log,
         )
         # contextual prefix 生成後にメイン BM25 索引を再構築できるよう、
         # HybridRetriever が保持する生きた BM25 インスタンスを worker に渡す。
@@ -1156,24 +1100,30 @@ def _init_learning_scheduler(
     """7f. LearningScheduler (Level 1/2) + Evolver / Critique / FewShot 接続"""
     from backend.free.learning.scheduler import LearningScheduler
 
+    # 補助タスク経験バッファ (rag_necessity / rag_quality / tool_call)。
+    # Level 1 Phase 2 の補助プロンプト進化が読む学習信号。
+    from backend.free.learning.aux_experience import AuxExperienceBuffer
+
+    aux_exp_buf = AuxExperienceBuffer()
+    aux_exp_file = resolver.resolve_learning("aux_experience_file")
+    if aux_exp_file.exists():
+        try:
+            aux_exp_buf.load(aux_exp_file)
+        except Exception as e:
+            logger.warning("Aux experience buffer load failed: %s", e)
+    state.aux_experience_buffer = aux_exp_buf
+
     learning_scheduler = LearningScheduler(
         config=cfg,
         experience_buf=exp_buf,
         prompt_manager=prompt_mgr,
+        aux_experience_buf=aux_exp_buf,
         debug_logger=debug_logger,
         policy=policy_interpreter,
         disabled=state.learning_disabled,
         resolver=resolver,
     )
     learning_scheduler.set_learned_patterns(learned_patterns_store)
-
-    # 7f-1a. Level 1 プロンプト変異の assist ルーティング (#5)。既定
-    # prompt_mutator_base="assist" だが、scheduler への assist_llm_client 注入は
-    # 従来 Pro の setup_pro_learn でしか行われず、Free では低速 base に黙って縮退して
-    # いた。アシスト必須アーキテクチャの state.assist_client を Free 配線でも注入する
-    # (Pro の _inject_assist_components は同一オブジェクトで後から上書き = 冪等)。
-    if state.assist_client is not None:
-        learning_scheduler.assist_llm_client = state.assist_client
 
     # 7f-1b. EmbedInstructionEvolver (Level 1 phase3, f_04 §4.2)
     # embedder が instruction-aware の場合のみ embed 検索指示プロンプトの進化が有効。
@@ -1284,14 +1234,21 @@ def _init_learning_scheduler(
     )
 
     # 7f-3. CritiqueSynthesizer
+    # 批評はアイドル窓 (Level 1) の処理なのでベースモデルで回す。
+    # purpose="critique_synthesis" は PURPOSE_SCHEMAS 登録済みなので
+    # AuxClient が文法制約経路へ流す。
     from backend.free.learning.critique_synthesizer import CritiqueSynthesizer
 
+    critique_client = learning_scheduler.resolve_idle_task_client(state.local_client)
     critique_synthesizer = CritiqueSynthesizer(
-        assist_client=state.assist_client,
+        llm_client=critique_client,
         debug_logger=debug_logger,
     )
     learning_scheduler.set_critique_synthesizer(critique_synthesizer)
-    logger.info("CritiqueSynthesizer initialized")
+    logger.info(
+        "CritiqueSynthesizer initialized (client=%s)",
+        type(critique_client).__name__ if critique_client else "none",
+    )
 
     # 7f-4. FewShotPool
     # learning.policy.evolve_writeback=semmem
@@ -1365,7 +1322,7 @@ def _wire_sleep_scheduler_models(
     resolver: Any,
 ) -> None:
     """7g (前半). SleepTimeScheduler に LLM クライアント / モデルパスを設定"""
-    # SleepTimeScheduler にベースモデル（フォールバック用）とアシストモデル（優先）を設定
+    # sleep-time / Level 1 の LLM ステージはベースモデルで回す。
     # is_user_active() の協調 yield 判定は chat_in_flight()/in_flight_chat_count を
     # 持つ LLMClient ファサード (state.llm_client) 前提。生の LocalClient
     # (state.local_client) にはこの属性が無くgetattrデフォルト(0)に落ちるため、
@@ -1374,15 +1331,6 @@ def _wire_sleep_scheduler_models(
     # 抑止されず本番 llama-server とリソース競合していた)。
     if state.llm_client:
         sleep_scheduler.set_llm_client(state.llm_client)
-
-    # アシストモデルクライアントを設定（§5.5.2: sleep-time はアシストモデル優先）
-    if state.assist_client:
-        sleep_scheduler.set_assist_llm_client(state.assist_client)
-        logger.info("SleepTimeScheduler: assist model set as preferred LLM")
-
-    # アイドル窓 (Trigger B / Level 1 / Level 2) の間だけアシストを起動させる
-    # (docs/c_14 §1.2)。未設定なら従来どおり「常に常駐」とみなして動く。
-    sleep_scheduler.set_assist_residency(state.assist_residency)
 
     sleep_scheduler.set_learning_scheduler(learning_scheduler)
 
@@ -1438,17 +1386,17 @@ def _inject_level2_runner(
         logger.warning("Level 2 runner injection failed: %s", e)
 
 
-async def _inject_assist_components(
+async def _inject_learn_components(
     state: AppState,
     cfg: dict[str, Any],
     resolver: Any,
     project_root: Path,
     learn_pillar: "LearnPillar",
-) -> "AssistExperienceBuffer | None":
-    """7i. Pro Learn pillar setup を呼び出し、アシストモデルコンポーネントを注入する。
+) -> None:
+    """7i. Pro Learn pillar setup を呼び出し、Pro 学習コンポーネントを注入する。
 
     (pro_pillar_setup("learn")) に全面委譲し、本関数は pillar 構築の薄い
-    ラッパに縮退した。Free エディションでは ``None`` を返す。
+    ラッパに縮退した。結果は ``state.pro.learn`` へ載せるため戻り値は持たない。
     """
     from backend.edition import get_pro_pillar_setup
     from backend.pillars import ProGenPillar, ProState
@@ -1474,7 +1422,7 @@ async def _inject_assist_components(
         state.pro = ProState(learn=pro_learn_pillar)
     else:
         state.pro.learn = pro_learn_pillar
-    return pro_learn_pillar.assist_experience_buffer
+    return None
 
 
 def _start_level1_loop(
@@ -1499,9 +1447,8 @@ def _init_tools(
     state: AppState,
     cfg: dict[str, Any],
     client: "LocalClient | None",
-    assist_client: "AssistModelClient | None",
     learned_patterns_store: "LearnedPatternStore",
-    assist_prompt_mgr: "AssistPromptManager",
+    aux_prompt_mgr: "AuxPromptManager",
     embedder: "EmbeddingBackend | None" = None,
 ) -> None:
     """7j. ToolsRegistry + ToolCallJudge + ReactiveAgent 初期化（3層エージェントディスパッチ用）"""
@@ -1515,7 +1462,6 @@ def _init_tools(
     register_builtin_tools(
         tools_reg, cfg, client,
         history_manager=get_history_manager(),
-        assist_client=assist_client,
     )
 
     # Pro 拡張ツール: ``register_pro_tools`` ハンドラが
@@ -1548,22 +1494,29 @@ def _init_tools(
     state.mem_view = mem_view
 
     tool_judge = ToolCallJudge(
-        assist_client=assist_client,
-        prompt_manager=assist_prompt_mgr,
+        prompt_manager=aux_prompt_mgr,
         config=cfg,
         cartridge_manager=state.cartridge_manager,
         learned_patterns=learned_patterns_store,
-        # assist/no_tool) を decision.jsonl に記録
         debug_logger=state.debug_logger,
         mem_view=mem_view,
         embedder=embedder,
-        # アシスト非常駐時のネイティブ tool calling 用 (docs/c_14 §1.3)。
-        # ``generate_tool_call`` を持つ LocalClient を直接渡す
-        # (LLMClient ファサードは tools を透過しない)。
+        # ベースモデルの文法制約ツール分類用 (docs/c_14 §1.3)。
+        # ``generate_constrained`` を持つ LocalClient を直接渡す
+        # (LLMClient ファサードは response_format を透過しない)。
         llm_client=state.local_client,
     )
     state.tool_call_judge = tool_judge
     logger.info("ToolCallJudge initialized: enabled=%s", tool_judge.enabled)
+
+    # ツール要否ゲートの exemplar 埋め込み (実測 ~5.6 秒 / 137 件)。起動を
+    # 待たせないので背景タスクにし、完了までは従来の正規表現ゲートへ縮退する。
+    try:
+        asyncio.create_task(
+            tool_judge.warmup_tool_gate(), name="tool_gate_warmup",
+        )
+    except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
+        logger.info("Tool gate warmup deferred: no running event loop")
 
     # Reactive 層を常駐化 (リクエスト毎生成だと LRU キャッシュが温まらない)。
     # 既定 cache (100 件 / TTL 300s) のまま。LLM 非依存なので構築コストはほぼゼロ。
@@ -1584,7 +1537,7 @@ def _init_loop_driver(
     state: AppState,
     cfg: dict[str, Any],
     project_root: Path,
-    assist_client: "AssistModelClient | None",
+    aux_client: "AuxClient | None",
 ) -> None:
     """7m. LoopDriver + TaskExecutor 初期化
 
@@ -1667,7 +1620,7 @@ def _init_loop_driver(
         executor = RalphExecutor(
             harness=harness,
             action_runner=action_runner,
-            assist_client=assist_client,
+            aux_client=aux_client,
             quality_gates=gates,
             max_actions_per_task=int(loop_cfg.get("max_actions_per_task", 10)),
             policy_provider=_policy_provider,
@@ -1745,6 +1698,55 @@ def _init_theme_manager(state: AppState, cfg: dict[str, Any], resolver: Any) -> 
     logger.info("ThemeManager initialized: themes_dir=%s", themes_dir)
 
 
+def _served_model_filename(state: Any) -> str:
+    """llama-server が **実際にロードしているモデル**のファイル名を返す。
+
+    ``/props`` 由来の ``ModelMetadata.model_id`` (model_alias → model_path →
+    default_generation_settings.model の順で解決済み) を basename 化する。
+    取得できない (degraded / 未接続) 場合は空文字。
+    """
+    client = getattr(state, "local_client", None) if state is not None else None
+    model_id = getattr(getattr(client, "metadata", None), "model_id", "") or ""
+    return Path(model_id).name if model_id else ""
+
+
+def _validate_served_model(
+    cfg: dict[str, Any], state: Any, expected_filename: str,
+) -> None:
+    """9a. 実際に serve 中のモデルが config / model_state と一致するか検証する。
+
+    モデル移行 (`/migrate-model`) は ``model_state.json`` と学習パーティションを
+    切り替えるが、**稼働中の llama-server は差し替えない** (再起動が要る)。
+    2026-08-12 の調査では、この乖離に気付かないまま **62.8 時間**別モデルが
+    serve され、学習パーティションが別モデルの出力で汚染されていた。config と
+    ``model_state.json`` が一致していても発生するため、3 者目として ``/props``
+    を照合する。
+
+    起動をブロックはしない (再起動すれば解消する運用上の乖離であり、degraded で
+    ``model_id`` が取れないケースもあるため)。WARNING + ``AppState`` へ記録する。
+    """
+    served = _served_model_filename(state)
+    if not served or not expected_filename or served == expected_filename:
+        return
+
+    recommendation = (
+        "Restart llama-server (scripts/evoref-ctl.bat stop && start) so the "
+        "served model matches the configured one. Until then, chat responses "
+        "and any learning written to the active partition come from "
+        f"'{served}', not '{expected_filename}'."
+    )
+    logger.warning(
+        "Served model mismatch: llama-server /props=%s, expected=%s. %s",
+        served, expected_filename, recommendation,
+    )
+    if state is not None:
+        state.served_model_mismatch = {
+            "served_filename": served,
+            "expected_filename": expected_filename,
+            "recommendation": recommendation,
+        }
+
+
 def _validate_model_state(
     cfg: dict[str, Any], resolver: Any, state: Any = None,
 ) -> None:
@@ -1755,6 +1757,10 @@ def _validate_model_state(
     に詳細を保持し、API (`GET /api/model/state`) 経由で UI / CLI が参照できる
     ようにする。`model_migration.strict_startup_check` が true のときは
     RuntimeError を送出して起動をブロックする。
+
+    加えて **実際に serve 中のモデル** (`/props`) を第 3 の照合先として見る
+    (`_validate_served_model`)。config と model_state が一致していても、
+    llama-server が古いモデルを掴んだままのことがある。
     """
     try:
         from backend.free.core.model_migration import ModelState
@@ -1766,6 +1772,10 @@ def _validate_model_state(
 
         config_base_model = cfg.get("model_paths", {}).get("base_model") or ""
         config_filename = Path(config_base_model).name if config_base_model else ""
+
+        # config が意図するモデルを基準に、実際の serve 状態を照合する
+        # (config 未設定なら model_state を基準にする)。
+        _validate_served_model(cfg, state, config_filename or ms.current_filename)
 
         mismatch = (
             ms.current_filename
@@ -1838,7 +1848,7 @@ def _validate_model_state(
 def _validate_component_model_state(
     cfg: dict[str, Any], resolver: Any, state: Any = None,
 ) -> None:
-    """9b. component (assist/embed) の model_state 検証
+    """9b. component (embed) の model_state 検証
 
     base は `_validate_model_state` が担当。本関数は component の
     config↔model_state 不一致を ERROR ログ + `AppState.component_state_mismatches`
@@ -1981,7 +1991,7 @@ class _LifespanContext:
     exp_file: Any
     learned_patterns_store: Any
     patterns_file: Any
-    assist_exp_buf: Any
+    aux_exp_buf: Any
     pro_shutdown: Any
     instance_name: str
     # Develop エディション起動時のみ非 None
@@ -2008,7 +2018,7 @@ class _BaseContext:
 def _log_gpu_cpu_placement(cfg: dict[str, Any], project_root: Path) -> None:
     """llama-server 4 モデルの GPU/CPU 配置と推定 VRAM 合計を INFO に出力する
 
-    `scripts/launch_llama.py` の推定ロジックを流用し、ベース / アシスト /
+    `scripts/launch_llama.py` の推定ロジックを流用し、ベース / 補助タスク /
     埋め込み / リランカーの ``-ngl`` と GGUF ファイルサイズから使用 VRAM を
     見積もる。``runtime.total_vram_budget_mb`` が設定されている場合は予算と
     合算値を比較し、超過時に WARNING ログを出力する (起動はブロックしない。
@@ -2118,7 +2128,7 @@ async def _build_gen_pillar(
 ) -> tuple["GenPillar", ProShutdownHook, DevelopShutdownHook]:
     """EvorefGen pillar の core 部分 (LLM / 埋め込み) を構築する。
 
-    並列 I/O (llama_server / pro_gen_pillar / develop_gen_pillar / assist_model /
+    並列 I/O (llama_server / pro_gen_pillar / develop_gen_pillar /
     embedding) で TaskGroup 内でまとめて初期化し、LLMClient ファサードを
     組み立てる。Pro エディション起動時は ``setup_pro_gen`` が ``state.pro.gen`` を、
     Develop エディション起動時は ``setup_develop_gen`` が ``state.develop.gen`` を
@@ -2132,11 +2142,6 @@ async def _build_gen_pillar(
     cfg = base.cfg
     debug_logger = base.debug_logger
     resolver = base.resolver
-
-    # residency は _init_assist_model より前に用意する (on_demand かどうかで
-    # 起動時に health check を待つかが変わるため)。
-    with _timed(timings, "assist_residency"):
-        _init_assist_residency(state, cfg, debug_logger)
 
     async with asyncio.TaskGroup() as tg:
         t_llama = tg.create_task(
@@ -2156,12 +2161,6 @@ async def _build_gen_pillar(
                 _init_develop_gen_pillar(state, cfg, resolver),
             ),
         )
-        t_assist = tg.create_task(
-            _timed_task(
-                timings, "assist_model",
-                _init_assist_model(state, cfg, debug_logger),
-            ),
-        )
         t_embed = tg.create_task(
             _timed_task(
                 timings, "embedding",
@@ -2171,28 +2170,24 @@ async def _build_gen_pillar(
     client = t_llama.result()
     pro_shutdown = t_pro_gen.result()
     develop_shutdown = t_develop_gen.result()
-    assist_client = t_assist.result()
     embedder = t_embed.result()
 
     with _timed(timings, "llm_client"):
         _init_llm_client(state, client)
 
-    # assist が非常駐 (residency=on_demand) の間は URL を直接叩けないので
-    # 対象から外す。初回 ready 時に _on_first_ready が同じプローブを走らせる。
-    residency = state.assist_residency
-    probe_assist = assist_client
-    if residency is not None and residency.on_demand and not residency.is_ready():
-        probe_assist = None
+    with _timed(timings, "aux_client"):
+        aux_client = _init_aux_client(state, cfg, debug_logger, client)
+
     _start_quality_probes(
         state, cfg, resolver, debug_logger,
-        local_client=client, assist_client=probe_assist, embedder=embedder,
+        local_client=client, embedder=embedder,
     )
 
     from backend.pillars import GenPillar
     gen = GenPillar(
         local_client=client,
         llm_client=state.llm_client,
-        assist_client=assist_client,
+        aux_client=aux_client,
         embedder=embedder,
     )
     return gen, pro_shutdown, develop_shutdown
@@ -2206,7 +2201,7 @@ async def _build_mem_pillar(
 ) -> "MemPillar":
     """EvorefMem pillar を構築する (memory + cartridge + sleep-time + bootstrap)。
 
-    依存方向: Mem は最下流だが、SleepTimeWorker は Gen の embedder / assist_client
+    依存方向: Mem は最下流だが、SleepTimeWorker は Gen の embedder / aux_client
     に依存するため ``gen`` を受け取る。SemMem への書込は MemFactView 経由、
     他 pillar (Loop/Learn) からは Fact View 経由でのみアクセスされる。
     """
@@ -2293,8 +2288,12 @@ def _build_gen_pillar_retrieval(
         gen.hybrid_retriever = hybrid_retriever
     with _timed(timings, "lazy_contextual"):
         _init_lazy_contextual(state, cfg, mem.vector_store, gen.embedder)
-    with _timed(timings, "assist_judge_tracker"):
-        _init_assist_judge_tracker(state)
+    with _timed(timings, "memory_threshold_calibration"):
+        _init_memory_threshold_calibration(
+            base.resolver, cfg, mem.short_term_memory, gen.embedder,
+        )
+    with _timed(timings, "judge_tracker"):
+        _init_judge_tracker(state)
 
 
 async def _build_learn_pillar(
@@ -2307,9 +2306,9 @@ async def _build_learn_pillar(
 ) -> tuple["LearnPillar", Path, Path]:
     """EvorefLearn pillar を構築する (experience / scheduler / evolver / Pro 拡張)。
 
-    依存: Mem (SleepTimeScheduler / SemMem view) + Gen (assist_client)。
-    Pro エディションでは ``inject_assist_components`` 経由で Level 2 ランナーと
-    ``ProAssistComponents`` が注入され、``state.pro.learn`` に集約される。
+    依存: Mem (SleepTimeScheduler / SemMem view) + Gen (aux_client)。
+    Pro エディションでは ``inject_learn_components`` 経由で Level 2 ランナーと
+    ``ProLearnComponents`` が注入され、``state.pro.learn`` に集約される。
 
     Returns:
         (learn_pillar, experience_file_path, learned_patterns_file_path)
@@ -2319,22 +2318,22 @@ async def _build_learn_pillar(
     resolver = base.resolver
     policy_interpreter = base.policy_interpreter
 
-    # Learn 中核 (experience / patterns / prompt / assist_prompt / sleep_scheduler)
+    # Learn 中核 (experience / patterns / prompt / aux_prompt / sleep_scheduler)
     # SleepTimeScheduler は Mem 所有のため、_init_learning_core が使う
     # state.sleep_scheduler は既に Mem pillar 構築時に設定済み。
     with _timed(timings, "learning_core"):
         (
             exp_buf, exp_file,
             learned_patterns_store, patterns_file,
-            prompt_mgr, assist_prompt_mgr,
+            prompt_mgr, aux_prompt_mgr,
             _sleep_scheduler_ignored,  # Mem が既に set 済み、重複生成を許容
         ) = _init_learning_core(state, cfg, resolver, debug_logger, policy_interpreter)
 
     # SleepTimeWorker を Mem の sleep_scheduler に注入 (Mem + Learn が連携するため
     # Learn フェーズで wire する — SleepTimeWorker 構築には Learn の exp_buf /
-    # learned_patterns_store / assist_prompt_mgr が必要)
+    # learned_patterns_store / aux_prompt_mgr が必要)
     # --no-learning 時は SleepTimeWorker / Level1 loop / Level2 runner /
-    # Pro assist 注入をすべてスキップする (LearningScheduler 本体は構築維持)
+    # Pro 学習コンポーネント注入をスキップする (LearningScheduler 本体は構築維持)
     learning_disabled = state.learning_disabled
     if not learning_disabled:
         with _timed(timings, "sleep_time_worker"):
@@ -2342,8 +2341,7 @@ async def _build_learn_pillar(
                 state, cfg, mem.sleep_scheduler, mem.short_term_memory,
                 mem.long_term_memory, gen.embedder, mem.vector_store,
                 exp_buf, debug_logger, learned_patterns_store,
-                policy_interpreter, assist_prompt_mgr,
-                gen.assist_client,
+                policy_interpreter, aux_prompt_mgr,
                 hybrid_retriever=gen.hybrid_retriever,
             )
     else:
@@ -2370,18 +2368,18 @@ async def _build_learn_pillar(
         experience_buffer=exp_buf,
         learned_patterns_store=learned_patterns_store,
         prompt_manager=prompt_mgr,
-        assist_prompt_manager=assist_prompt_mgr,
+        aux_prompt_manager=aux_prompt_mgr,
         feedback_collector=state.feedback_collector,
     )
 
-    # Pro Learn pillar setup (ProAssistComponents を LearningScheduler に注入する)
+    # Pro Learn pillar setup (ProLearnComponents を LearningScheduler に注入する)
     if not learning_disabled:
         with _timed(timings, "pro_learn_setup"):
-            await _inject_assist_components(
+            await _inject_learn_components(
                 state, cfg, resolver, project_root, learn,
             )
     else:
-        logger.info("Pro assist components injection skipped (learning disabled)")
+        logger.info("Pro learn components injection skipped (learning disabled)")
 
     # Level 1 独立常駐ループ起動
     if not learning_disabled:
@@ -2413,8 +2411,8 @@ def _build_loop_pillar(
 
     with _timed(timings, "tools"):
         _init_tools(
-            state, cfg, gen.local_client, gen.assist_client,
-            learn.learned_patterns_store, learn.assist_prompt_manager,
+            state, cfg, gen.local_client,
+            learn.learned_patterns_store, learn.aux_prompt_manager,
             embedder=gen.embedder,
         )
     with _timed(timings, "agent_tracer"):
@@ -2425,7 +2423,7 @@ def _build_loop_pillar(
 
     with _timed(timings, "loop_driver"):
         if enabled:
-            _init_loop_driver(state, cfg, project_root, gen.assist_client)
+            _init_loop_driver(state, cfg, project_root, gen.aux_client)
 
     from backend.pillars import LoopPillar
     driver = getattr(state, "loop_driver", None) if enabled else None
@@ -2590,14 +2588,6 @@ def _activate_learning_partition(base: "_BaseContext", state: AppState) -> None:
         Path(embed_filename).stem if embed_filename else None,
     )
 
-    # assist プロンプトも同様に base モデルとは独立軸 (アシストモデル単位)。
-    # 進化した文面はそのモデルの癖に合わせて最適化されるため、アシストモデルを
-    # 差し替えたら前モデル向けの文面を引き継がず、既定から作り直す。
-    assist_filename = Path(cfg.get("model_paths", {}).get("assist_model") or "").name
-    resolver.set_active_assist_model_stem(
-        Path(assist_filename).stem if assist_filename else None,
-    )
-
     from backend.free.core.learning_partition_migrator import LearningPartitionMigrator
     from backend.free.core.model_migration import ModelState
     from backend.free.memory.notes.subject_ns import model_slug
@@ -2752,9 +2742,6 @@ async def wire_pillars(
         _finalize_base(state, base, timings)
 
     instance_name = base.cfg.get("instance", {}).get("name", "evoref")
-    assist_exp_buf = None
-    if state.pro is not None and state.pro.learn is not None:
-        assist_exp_buf = state.pro.learn.assist_experience_buffer
     ctx = _LifespanContext(
         sleep_scheduler=mem.sleep_scheduler,
         learning_scheduler=learn.scheduler,
@@ -2765,7 +2752,7 @@ async def wire_pillars(
         exp_file=exp_file,
         learned_patterns_store=learn.learned_patterns_store,
         patterns_file=patterns_file,
-        assist_exp_buf=assist_exp_buf,
+        aux_exp_buf=state.aux_experience_buffer,
         pro_shutdown=pro_shutdown,
         instance_name=instance_name,
         develop_shutdown=develop_shutdown,

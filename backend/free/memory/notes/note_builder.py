@@ -341,6 +341,23 @@ class NoteBuilder:
         "task": ["やって", "して", "作って", "教えて", "確認"],
     }
 
+    #: assistant 発話には付けないタグ。
+    #:
+    #: ``fact`` のトリガは文末表現 (``です`` 等) なので、**assistant の回答は
+    #: ほぼ全てが該当する**。この付与自体が問題なのは、``fact`` ノートが
+    #: ``MemoryInjector`` 経由でプロンプトへ「(過去の記録)」として再注入され、
+    #: システムプロンプトが「[関連する記憶] は自分の記憶より優先して根拠にする」
+    #: と規定しているため — **未検証の生成物が、以後のターンでモデル自身の知識を
+    #: 上書きする**。誤答が一度出ると記録として恒久化し自己増幅する。
+    #:
+    #: 実インシデント (2026-08-15 ライブ監査 ターン3): 「日本の三名園は、
+    #: 大徳寺(京都)、西芳寺(京都)、兼六園(石川)です。」(正しくは兼六園・後楽園・
+    #: 偕楽園) が ``tags:["fact"]`` で STM に残り、別セッションのプロンプトへ
+    #: 「(過去の記録)」として注入されているのを確認した。
+    #:
+    #: user 発話の ``fact`` は「ユーザーがそう述べた」という記録であり残す。
+    ASSISTANT_EXCLUDED_TAGS: frozenset[str] = frozenset({"fact"})
+
     # ─── markdown フェンス検知 ──
     _CODE_FENCE_RE = re.compile(r"```")
 
@@ -398,7 +415,7 @@ class NoteBuilder:
             candidate_tags: list[str] = []
         else:
             keywords = self.extract_keywords(content)
-            generic_tags = self.auto_tag(content)
+            generic_tags = self.auto_tag(content, effective_source)
             # ツール出力は候補抽出も行わない (sleep-time Extractor に流さない)
             candidate_tags = (
                 [] if is_tool_output else self.candidate_fact_tags(content)
@@ -450,11 +467,21 @@ class NoteBuilder:
         return result[:10]
 
     @classmethod
-    def auto_tag(cls, content: str) -> list[str]:
-        """ルールベースの自動タグ付け (汎用)"""
+    def auto_tag(cls, content: str, source: str = "user") -> list[str]:
+        """ルールベースの自動タグ付け (汎用)
+
+        Args:
+            content: ノート内容。
+            source: 発生源 (``NoteSource``)。``"assistant"`` のときは
+                :data:`ASSISTANT_EXCLUDED_TAGS` を付けない (理由は同定数の
+                コメント参照)。既定 ``"user"`` は従来挙動。
+        """
         content_lower = content.lower()
+        excluded = cls.ASSISTANT_EXCLUDED_TAGS if source == "assistant" else frozenset()
         tags: list[str] = []
         for tag, trigger_words in cls.TAG_RULES.items():
+            if tag in excluded:
+                continue
             if any(w in content_lower for w in trigger_words):
                 tags.append(tag)
         return tags

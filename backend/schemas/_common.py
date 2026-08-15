@@ -2,7 +2,7 @@
 
 EvorefConfig 直下の細かいセクションをここに集約する。
 専用ファイル (llm / rag / memory / learning / loop / paths /
-assist_model) に属さない Config を置く。
+llm) に属さない Config を置く。
 """
 
 from typing import Literal
@@ -36,7 +36,7 @@ class RuntimeConfig(BaseModel):
     llama-server バイナリのバージョン要件を表現する。
 
     - ``total_vram_budget_mb``: VRAM 予算検査のソフト上限 (MB)
-      ``scripts/launch_llama.py --all`` が本値を参照し、ベース / アシスト /
+      ``scripts/launch_llama.py --all`` が本値を参照し、ベース / 補助タスク /
       埋め込み / リランカーの GPU レイヤ推定 VRAM 合計がこの値を超える場合に
       警告を出して起動を中断する (``--force`` で強制起動可能)。
       None の場合は検査を行わない (従来挙動と同じ)。
@@ -96,11 +96,11 @@ class RuntimeConfig(BaseModel):
     #: ``"messages-allowed"`` にしても ``/v1/messages`` が使えるようにはならない。
     llama_endpoint_policy: Literal["oai-only", "messages-allowed"] = "oai-only"
 
-    # ``llama.gpu_layers`` / ``assist_model.local.gpu_layers`` が ``"auto"``
+    # ``llama.gpu_layers`` が ``"auto"``
     # の場合の Vulkan host buffer 予約量 (MiB)。
     # iGPU 環境では embed (CPU モード) でも llama.cpp が Vulkan
     # backend を初期化し model loading 時に host (pinned) buffer を要求する。
-    # base/assist が GPU メモリを占有しすぎると後発の embed で
+    # base が GPU メモリを占有しすぎると後発の embed で
     # ``ggml_vulkan: Failed to allocate pinned memory (ErrorOutOfDeviceMemory)``
     # 警告が出るため、自動段階縮小ロジックはこの分を GPU 容量から差し引いて
     # 予算を計算する。既定 4 GiB は AMD Radeon 890M + Qwen3-Embedding-0.6B
@@ -171,7 +171,7 @@ class HistoryConfig(BaseModel):
     retention_compressed_days: int = Field(default=365, ge=1)
     max_storage_mb: float = Field(default=200, ge=1)
     compress_preview_chars: int = Field(default=100, ge=1)
-    #: 1 Full サイクルで要約するセッション数。実測 2.8 秒/件 (アシスト要約 +
+    #: 1 Full サイクルで要約するセッション数。実測 2.8 秒/件 (補助タスク要約 +
     #: 埋め込み) で、5 件では日次の会話流入に追いつかず未要約が積み上がる。
     summary_batch_size: int = Field(default=20, ge=1)
 
@@ -195,31 +195,37 @@ class AgentConfig(BaseModel):
     reminders_enabled: bool = True
     max_reminders_per_turn: int = Field(default=2, ge=0)
     dangerous_command_block: bool = True
-    # アシスト接続時はモード非依存で常時有効 (False で明示オプトアウト)。
-    # アシスト未接続時はこの値に関わらず無効 (決定論ショートカットのみ)。
+    # 最終層のベースモデル文法制約分類を撃つか (False で決定論層のみ)。
     tool_judge_enabled: bool = True
     meta_cognitive_enabled: bool = True
     meta_cognitive_min_budget: int = Field(default=512, ge=0)
     # reactive 分類クエリがルールベース即応 (挨拶/日時/キャッシュ) に該当しない場合、
-    # tool 判定 (assist judge) で tool 不要と判定されたら base 1 ターンの軽量パスで
-    # 応答する。tool 必要なら deliberative へエスカレート。False で常に deliberative。
+    # ツール判定で tool 不要と判定されたら base 1 ターンの軽量パスで応答する。
+    # tool 必要なら deliberative へエスカレート。False で常に deliberative。
     reactive_light_enabled: bool = True
-    # tool_judge_enabled=True (create mode 等) で 4 層フォールバックが全て
-    # no-tool を返した際、assist (executable_command_synth) で環境依存事実
-    # クエリを判定し run_command に橋渡しする 5 層目のゲート。
-    executable_command_fallback_enabled: bool = True
-    executable_command_fallback_min_chars: int = Field(default=5, ge=0, le=80)
-    # ── ネイティブ tool calling (docs/c_14 §1.3) ──
-    # ``assist_model.residency: on_demand`` のチャット中は assist の
-    # tool_judgment が撃てないため、ベースモデル自身の OAI tool calling で
-    # ツールを選ばせる最終層。決定論プリゲート (ツールパターン / パス / URL /
-    # ディレクトリ列挙) を通ったターンだけ ``tools`` を載せるので、雑談ターンの
-    # 推論コストは増えない。``tools`` 非対応の llama-server build /
-    # chat template では初回 4xx で自動的に無効化される。
-    native_tool_calling_enabled: bool = True
-    # ツール選択のみで本文生成はしないため小さくてよい。
-    native_tool_max_tokens: int = Field(default=256, ge=16, le=4096)
-    native_tool_timeout_sec: float = Field(default=60.0, ge=1.0, le=600.0)
+    # ── 文法制約ツール分類器 (docs/c_14 §1.3) ──
+    # 決定論層がすべて外れたとき、ベースモデル自身にツールを選ばせる最終層。
+    # 選ばせ方は OAI ``tools`` ではなく ``response_format`` (json_schema) の
+    # enum 分類。``tools`` は 200 で受理されてもモデルが tool_call を出さずに
+    # 本文を書き始め、max_tokens を使い切って 15.6〜60.2 秒を捨てる実測がある
+    # (``tool_choice: "required"`` でも 6 件中 3 件で無視された)。json_schema は
+    # llama-server 側の GBNF 制約なので必ず従い、出力トークン数の上限が読める。
+    # 決定論プリゲートを通ったターンだけ発火するので雑談ターンのコストは増えない。
+    # ``response_format`` 非対応の build では初回 4xx で自動的に無効化される。
+    tool_classifier_enabled: bool = True
+    # 分類器を撃つかどうかの門。従来の正規表現 (_query_has_tool_signal) は
+    # 実クエリ137件のベンチで recall 66.2% しかなく、ツールが要るクエリの
+    # 3分の1を落としていた (取りこぼしが集中していたのは「保存したファイルの
+    # 中身を見せて」型と「その計算、〜ではないですか」型)。埋め込み exemplar
+    # 近傍なら同ベンチで k=5 の leave-one-out で recall 98.5%。
+    # embedder 未配線 / 埋め込み未完了のときは自動的に正規表現へ縮退する。
+    tool_gate_knn_enabled: bool = True
+    # 近傍投票数。取りこぼしのコスト (誤答) が無駄撃ちのコスト (分類器1回)
+    # より高いので、recall 寄りの 5 を既定にする (k=1 は recall 92.6%)。
+    tool_gate_knn_k: int = Field(default=5, ge=1, le=25)
+    # ツール選択のみで本文生成はしないため小さくてよい (実測 16〜44 トークン)。
+    tool_classifier_max_tokens: int = Field(default=96, ge=16, le=4096)
+    tool_classifier_timeout_sec: float = Field(default=60.0, ge=1.0, le=600.0)
     # ── コンテンツ生成タイムアウト (Meta-Cognitive 層) ──
     # ファイル内容生成はトークン間アイドル (無出力) タイムアウトで「停止した
     # ストリーム」を素早く諦めつつ、低速だが進行中の生成は総上限まで継続する。
@@ -270,7 +276,7 @@ class ToolsConfig(BaseModel):
     # ── URL リコール (Phase 1) ──
     # 過去質問で正しく fetch_url できた URL を新規類似質問で再利用するための設定。
     # 書き込みは sleep-time の url_curator が担当し、引き当ては
-    # ToolCallJudge._try_recall_url が決定論的に行う (アシスト同期発火なし)。
+    # ToolCallJudge._try_recall_url が決定論的に行う (補助タスク同期発火なし)。
     url_recall_enabled: bool = True
     url_recall_topk: int = Field(default=5, ge=1, le=20)
     url_recall_min_score: float = Field(default=0.7, ge=0.0, le=1.0)
@@ -339,8 +345,8 @@ class LongFormConfig(BaseModel):
     review_enabled: bool = True
     max_revisions: int = Field(default=3, ge=0)
     # 検証ゲート付きコードリペア: 生成後に assembled を検証し、文法/未定義
-    # エラーが残ればアシストモデルで修正→再検証を繰り返す。Python は AST で
-    # 厳密検証 (構文 + 未定義名)、他言語は assist による軽い構文自己点検。
+    # エラーが残れば補助タスクで修正→再検証を繰り返す。Python は AST で
+    # 厳密検証 (構文 + 未定義名)、他言語は LLM による軽い構文自己点検。
     repair_enabled: bool = True
     max_repair_rounds: int = Field(default=2, ge=0)
     rag_per_unit: bool = True
@@ -448,7 +454,7 @@ class ProcessManagerConfig(BaseModel):
     とサーバ起動 API のヘルスチェック待ちにも共有される。
 
     プロセスの起動経路は ``scripts/launch_llama.py`` (evoref-ctl / CLI
-    auto-serve) と、アシストのオンデマンド常駐 (``AssistResidencyManager``、
+    auto-serve) と、補助タスクのオンデマンド常駐 (``AuxResidencyManager``、
     docs/c_14 §1.2) の 2 系統。
     """
 
@@ -458,7 +464,7 @@ class ProcessManagerConfig(BaseModel):
     #: 現状どこからも参照されない (``_pillar_wirer`` は値に関係なく
     #: ``LlamaProcessManager`` を構築し、``.start()`` は REST API 経由で
     #: しか呼ばれない)。``true`` にしても挙動は変わらない。
-    #: 起動は launch_llama / evoref-ctl / AssistResidencyManager が担当する。
+    #: 起動は launch_llama / evoref-ctl / AuxResidencyManager が担当する。
     enabled: bool = False
     #: 起動後ヘルスチェックの待機上限 (秒)。``enabled`` と違い実際に効く。
     health_timeout: int = 120

@@ -13,17 +13,16 @@ import numpy as np
 # 保護セクション検証・重複排除は agent.prompt_utils (EvorefLoop
 # pillar の純粋 util) に集約済。Learn pillar 側はここから top-level import する。
 from backend.free.agent.prompt_utils import (
-    PROTECTED_CLOSE,
-    PROTECTED_OPEN,
     dedupe_paragraphs,
     extract_protected_sections,
+    protected_line_indices,
     restore_protected_sections,
     strip_orphan_protected_markers,
     text_contains_sentence,
     validate_protected_sections,
 )
+from backend.free.llm.json_extract import extract_json_object
 from backend.log_config import get_logger
-from backend.utils import estimate_tokens
 
 if TYPE_CHECKING:
     from backend.free.learning.critique_synthesizer import CritiqueSynthesizer
@@ -38,7 +37,7 @@ MAX_MUTATION_RETRIES = 3
 # 再生成 + reasoning モデルの思考漏れ分の途中切断を避けるため広めに取る。
 _MUTATION_MAX_TOKENS = 2048
 
-# assist context_size に対する安全マージン (chat template / 特殊トークン分)。
+# aux context_size に対する安全マージン (chat template / 特殊トークン分)。
 _CONTEXT_SAFETY_MARGIN = 256
 
 # _is_text_similar の判定閾値。SequenceMatcher.ratio がこれ以上、かつ長さ差が
@@ -64,7 +63,7 @@ _THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
 def _strip_think_tags(text: str) -> str:
     """reasoning モデルが content に吐く ``<think>...</think>`` を除去する。
 
-    Qwen3 / LFM2 等の reasoning ベース/アシストでプロンプトを変異させると、思考が
+    Qwen3 / LFM2 等の reasoning ベース/補助タスクでプロンプトを変異させると、思考が
     そのまま変異後プロンプトに焼き込まれ system プロンプト (chat.md) を汚染する。
     閉じたブロックは除去し、未閉鎖 ``<think>`` (暴走/打ち切り) は以降をすべて思考と
     みなして破棄する (残った本文が空なら呼出側で無効判定させる)。
@@ -74,6 +73,153 @@ def _strip_think_tags(text: str) -> str:
     if m:
         text = text[: m.start()]
     return text.strip()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 差分編集変異 (文法制約 JSON)
+# ─────────────────────────────────────────────────────────────────────
+# 全文書き直しは実測 356.3 秒/回 (2026-08-12, Qwen3.5-27B: in 977 tok を
+# prefill 15 t/s + out 1037 tok を decode 3.57 t/s)。50 変異で 4.9 時間となり
+# アイドル窓に入らない = ベースモデルでは自己学習が成立しない。1 行編集に
+# 落とすと出力が 47〜99 トークンに収まり 16〜32 秒/回 (warm) になる。加えて
+# 候補が current の近傍に留まるため llama-server の prefix cache が効く
+# (実測 cached=960/977)。
+_EDIT_MAX_TOKENS = 160
+# 変異どうしを散らすためのサンプリング温度 (全文書き直しの 0.5 より高い)。
+# 実測 5 回で unique anchor 4/5。
+_EDIT_TEMPERATURE = 1.0
+# cold prefill 込みの実測最大 84 秒に余裕を見た値 (既定の HTTP timeout 120 秒
+# では 27B の cold ミスで落ちる)。
+_EDIT_TIMEOUT_SEC = 180.0
+# text にプロンプトを丸ごと詰め込む暴走を弾く上限。現行プロンプトの最長行が
+# 約 230 文字なので、その 2 倍強を許容する。
+_EDIT_MAX_TEXT_CHARS = 600
+# 近似一致でアンカーを認める下限 (SequenceMatcher.ratio)
+_ANCHOR_FUZZY_THRESHOLD = 0.85
+# 前方一致でアンカーを認めるための最小文字数 (短い見出しの誤爆防止)
+_ANCHOR_PREFIX_MIN_CHARS = 8
+# 保護ブロックをモデルに見せないためのプレースホルダ
+_PROTECTED_PLACEHOLDER = "<!-- (locked section, not shown) -->"
+
+_EDIT_SYSTEM_PROMPT = (
+    "You improve a system prompt by proposing ONE small edit.\n"
+    '- "anchor": copy ONE existing line from the prompt verbatim. '
+    "It only locates the edit.\n"
+    '- "op": "insert_after" adds a new line below the anchor, '
+    '"replace" rewrites the anchor line.\n'
+    '- "text": the new line. Max 30 words, in the same language as the prompt.\n'
+    "Never restructure the prompt and never output the whole prompt."
+)
+
+#: ``response_format`` (json_schema)。llama-server 側の GBNF 制約なので必ず従う。
+_EDIT_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "prompt_edit",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["insert_after", "replace"]},
+                "anchor": {"type": "string"},
+                "text": {"type": "string"},
+            },
+            "required": ["op", "anchor", "text"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
+_HEADING_RE = re.compile(r"^\s*#{1,6}\s+")
+_INLINE_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_anchor(line: str) -> str:
+    """アンカー照合用に箇条書き記号・見出し記号・空白・大小文字を落とす"""
+    text = _BULLET_RE.sub("", line.strip())
+    text = _HEADING_RE.sub("", text)
+    return _INLINE_WS_RE.sub(" ", text).strip().lower()
+
+
+def _editable_view(text: str) -> tuple[str, list[tuple[int, str]]]:
+    """``(モデルへ見せるビュー, [(行番号, 行本文), ...])`` を返す。
+
+    保護ブロックは 1 行のプレースホルダへ畳む。**モデルの目に触れない行は
+    アンカーになり得ない**ため、差分編集は構造的に保護セクションを壊せない
+    (全文書き直しでは指示文でしか守れず、実際に破壊されていた)。
+    """
+    lines = text.split("\n")
+    protected = protected_line_indices(text)
+    view: list[str] = []
+    editable: list[tuple[int, str]] = []
+    collapsed = False
+    for index, line in enumerate(lines):
+        if index in protected:
+            if not collapsed:
+                view.append(_PROTECTED_PLACEHOLDER)
+                collapsed = True
+            continue
+        collapsed = False
+        view.append(line)
+        if line.strip():
+            editable.append((index, line))
+    return "\n".join(view), editable
+
+
+def _resolve_anchor(editable: list[tuple[int, str]], anchor: str) -> int | None:
+    """アンカー文字列を行番号へ解決する。解決できなければ ``None``。
+
+    実測 (Qwen3.5-27B / gemma-4-12b) でモデルが返したアンカーは 3 形あった:
+    原文どおり / 箇条書き記号を落とした形 / 長い行を途中で打ち切った形。
+    完全一致 → 前方一致 → 近似一致の順に降りる。同点候補は先頭を採る。
+    """
+    needle = _normalize_anchor(anchor)
+    if len(needle) < 4:
+        return None
+
+    normalized = [(index, _normalize_anchor(line)) for index, line in editable]
+
+    for index, line in normalized:
+        if line == needle:
+            return index
+    for index, line in normalized:
+        if len(line) < _ANCHOR_PREFIX_MIN_CHARS or len(needle) < _ANCHOR_PREFIX_MIN_CHARS:
+            continue
+        if line.startswith(needle) or needle.startswith(line):
+            return index
+
+    best_index: int | None = None
+    best_ratio = 0.0
+    for index, line in normalized:
+        ratio = difflib.SequenceMatcher(None, line, needle).ratio()
+        if ratio > best_ratio:
+            best_index, best_ratio = index, ratio
+    return best_index if best_ratio >= _ANCHOR_FUZZY_THRESHOLD else None
+
+
+def _apply_prompt_edit(current: str, op: str, anchor: str, text: str) -> str | None:
+    """1 行編集を適用する。適用できなければ ``None`` (呼出側で再試行)。"""
+    _, editable = _editable_view(current)
+    index = _resolve_anchor(editable, anchor)
+    if index is None:
+        return None
+
+    new_text = text.strip()
+    if not new_text or len(new_text) > _EDIT_MAX_TEXT_CHARS:
+        return None
+
+    lines = current.split("\n")
+    match op:
+        case "insert_after":
+            lines.insert(index + 1, new_text)
+        case "replace":
+            lines[index] = new_text
+        case _:
+            return None
+
+    mutated = "\n".join(lines)
+    return mutated if mutated.strip() != current.strip() else None
 
 
 # fitness 識別用キーワード抽出: ASCII 語 (3 文字以上) + CJK 文字 bi-gram。
@@ -320,110 +466,111 @@ class PromptEvolver:
         """
         return self._calc_fitness(candidate, experiences)
 
+    async def _mutate_by_edit(
+        self,
+        current: str,
+        failure_hints: list[str],
+        llm_client,
+        *,
+        variant: int,
+    ) -> str | None:
+        """文法制約 JSON の 1 行編集でプロンプトを変異させる。
+
+        `{"op", "anchor", "text"}` を `response_format` (json_schema) で強制し、
+        アンカー行を実テキスト上で解決して適用する。編集が成立しなかった場合は
+        `None` を返し、呼出側の再試行 / ルールベース変異へ委ねる。
+
+        Args:
+            variant: 候補番号。失敗ヒントの選択に使い、候補どうしを散らす。
+        """
+        view, editable = _editable_view(current)
+        if not editable:
+            return None
+
+        if failure_hints:
+            hint = failure_hints[variant % len(failure_hints)]
+            task = f"Failure to fix:\n{hint}"
+        else:
+            task = "No failure was recorded. Propose one small clarity improvement."
+
+        messages = [
+            {"role": "system", "content": _EDIT_SYSTEM_PROMPT},
+            # 変わらない部分を先に、変わる部分を最後に置く (prefix cache のため)
+            {"role": "user", "content": f"System prompt:\n{view}"},
+            {"role": "user", "content": f"{task}\n\nPropose edit variant #{variant + 1}."},
+        ]
+
+        try:
+            raw = await llm_client.generate_constrained(
+                messages,
+                response_format=_EDIT_RESPONSE_FORMAT,
+                temperature=_EDIT_TEMPERATURE,
+                max_tokens=_EDIT_MAX_TOKENS,
+                id_slot=getattr(llm_client, "background_slot", -1),
+                timeout=_EDIT_TIMEOUT_SEC,
+            )
+        except Exception as e:
+            logger.warning("Prompt edit mutation failed: %s: %s", type(e).__name__, e)
+            return None
+
+        if not raw:
+            return None
+        edit = extract_json_object(raw)
+        if not isinstance(edit, dict):
+            logger.warning("Prompt edit returned non-JSON output; rejecting")
+            return None
+
+        op = edit.get("op")
+        anchor = edit.get("anchor")
+        text = edit.get("text")
+        if not (isinstance(op, str) and isinstance(anchor, str) and isinstance(text, str)):
+            logger.warning("Prompt edit missing op/anchor/text; rejecting")
+            return None
+
+        mutated = _apply_prompt_edit(current, op, anchor, text)
+        if mutated is None:
+            logger.info(
+                "Prompt edit rejected (op=%s, anchor=%.40r): anchor unresolved "
+                "or edit was a no-op", op, anchor,
+            )
+            return None
+        logger.info("Prompt edit applied: op=%s anchor=%.40r", op, anchor)
+        return mutated
+
     async def _mutate_prompt(
         self,
         current: str,
         failure_hints: list[str],
         llm_client,
+        *,
+        variant: int = 0,
     ) -> str | None:
         """LLM によるプロンプト変異
 
-        失敗パターンを分析してプロンプトの改善点を生成する。
+        失敗パターンを分析してプロンプトの改善点を生成する。変異は
+        文法制約 JSON の 1 行編集 (`_mutate_by_edit`) で行う。全文書き直しは
+        実測 356 秒/回 で 30 分のアイドル窓に入らないため採らない
+        (docs/c_14 §1.4)。
 
         Args:
             current: 現在のプロンプトテキスト
             failure_hints: 失敗ケースのヒント（ユーザーの訂正・言い直し等）
             llm_client: LLMClient / LocalClient インスタンス
+            variant: 候補番号 (差分編集でヒント選択に使う)
 
         Returns:
-            変異後のプロンプトテキスト。LLM エラー時は None
+            変異後のプロンプトテキスト。文法制約経路が無い / LLM エラー時は None
+            (呼出側がルールベース変異へフォールバックする)
         """
-        hints_text = "\n".join(f"- {h}" for h in failure_hints[:5])
-
-        # 保護セクションがある場合は LLM にも指示
-        has_protected = bool(extract_protected_sections(current))
-        # マーカー文字列は prompt_utils を唯一の出所とする (ここへ literal で
-        # 書き写すと、マーカー記法を変えたとき LLM への指示だけが古いまま残る)。
-        protected_instruction = (
-            f"\n\nIMPORTANT: Sections enclosed in {PROTECTED_OPEN} ... {PROTECTED_CLOSE} "
-            "markers MUST be preserved exactly as-is. Do not modify, remove, or rewrite "
-            "their content or the markers themselves."
-        ) if has_protected else ""
-
-        mutation_query = (
-            "You are a prompt engineer. Improve the following system prompt "
-            "based on the failure patterns. Make meaningful changes - "
-            "add specific instructions, improve clarity, or restructure "
-            "to better handle the failure cases.\n\n"
-            f"Current system prompt:\n```\n{current}\n```\n\n"
-            f"Failure patterns:\n{hints_text}\n\n"
-            "Output ONLY the improved system prompt, nothing else. "
-            "The improved prompt MUST be different from the current one."
-            f"{protected_instruction}"
-        )
-
-        messages = [{"role": "user", "content": mutation_query}]
-        try:
-            # 変異生成器が assist (AssistModelClient) か base (LocalClient) かで
-            # generate のシグネチャが異なる: assist は purpose 必須・id_slot 無視、
-            # base は purpose 非対応・id_slot 使用。低速 base のタイムアウトを避け
-            # mutation は assist へ寄せる (learning スロット)。purpose は purpose
-            # 監査 (test_assist_purpose_audit) が静的検出できるようリテラルで分岐する。
-            if getattr(llm_client, "is_assist_client", False):
-                context_size = getattr(llm_client, "context_size", 8192)
-                input_tokens = estimate_tokens(mutation_query)
-                if input_tokens + _MUTATION_MAX_TOKENS > context_size - _CONTEXT_SAFETY_MARGIN:
-                    logger.warning(
-                        "Prompt mutation skipped: prompt=%d tok + output budget=%d tok "
-                        "exceeds assist context_size=%d",
-                        input_tokens, _MUTATION_MAX_TOKENS, context_size,
-                    )
-                    return None
-                result = await llm_client.generate(
-                    messages=messages,
-                    stream=False,
-                    temperature=0.5,
-                    max_tokens=_MUTATION_MAX_TOKENS,
-                    purpose="prompt_evolution",
-                )
-            else:
-                result = await llm_client.generate(
-                    messages=messages,
-                    stream=False,
-                    temperature=0.5,
-                    max_tokens=_MUTATION_MAX_TOKENS,
-                    id_slot=getattr(llm_client, "background_slot", -1),
-                )
-            mutated = result["choices"][0]["message"]["content"].strip()
-
-            # reasoning モデル (Qwen3 / LFM2 等) が content に吐く <think>...</think> を
-            # 除去する。未除去だと思考が変異後プロンプトに焼き込まれ chat.md を汚染する。
-            mutated = _strip_think_tags(mutated)
-
-            # 応答全体が ``` でラップされている場合のみ外側フェンスを外す。
-            # 全フェンス行を無差別除去すると、プロンプト本文中のコード例フェンス
-            # (```python ... ```) まで剥がれてコード例が壊れるため、先頭フェンスと
-            # 対応する末尾フェンスのペアだけを除去し本文中のフェンスは保護する。
-            if mutated.startswith("```"):
-                lines = mutated.split("\n")
-                lines = lines[1:]  # 先頭フェンス行 (```lang 含む) を除去
-                if lines and lines[-1].strip().startswith("```"):
-                    lines = lines[:-1]  # 対応する末尾フェンスを除去
-                mutated = "\n".join(lines).strip()
-
-            # 思考が残る / 空になった場合は汚染とみなし無効化 (rule-based 変異へフォールバック)
-            if not mutated or "<think>" in mutated.lower():
-                logger.warning(
-                    "Prompt mutation produced contaminated/empty output "
-                    "(<think> residue or empty); rejecting for rule-based fallback",
-                )
-                return None
-
-            return mutated
-
-        except Exception as e:
-            logger.warning("Prompt mutation failed: %s: %s", type(e).__name__, e)
+        if not callable(getattr(llm_client, "generate_constrained", None)):
+            logger.warning(
+                "Prompt mutation skipped: the client has no constrained "
+                "transport; falling back to rule-based variation",
+            )
             return None
+        return await self._mutate_by_edit(
+            current, failure_hints, llm_client, variant=variant,
+        )
 
     def _create_rule_based_variation(self, current: str, failure_hints: list[str]) -> str:
         """LLM なしのルールベース変異（フォールバック）
@@ -610,11 +757,16 @@ class PromptEvolver:
         failure_hints: list[str],
         llm_client,
         cb: _CircuitBreaker,
+        variant: int = 0,
     ) -> tuple[str, bool]:
         """初期集団用に LLM 変異を最大 `MAX_MUTATION_RETRIES` 回試行する。
 
         多様性確保のため `_is_text_similar` を満たす変異が得られるまで再試行し、
         全試行が同一テキストだった場合はルールベース変異にフォールバックする。
+
+        Args:
+            variant: 候補番号。差分編集変異が失敗ヒントの選択に使う
+                (再試行は温度 1.0 のサンプリング差で散らすため同値のまま)。
 
         Returns:
             `(mutated_text, mutation_succeeded)` のタプル。
@@ -624,7 +776,7 @@ class PromptEvolver:
         mutation_succeeded = False
         for _retry in range(MAX_MUTATION_RETRIES):
             result = await self._mutate_prompt(
-                current, failure_hints, llm_client,
+                current, failure_hints, llm_client, variant=variant,
             )
             cb.record_attempt()
             if result is None:
@@ -668,13 +820,13 @@ class PromptEvolver:
         initial_fitness = await self._score_candidate(current, experiences)
         population[0].fitness = initial_fitness
 
-        for _ in range(population_size - 1):
+        for member in range(population_size - 1):
             if cb.should_stop():
                 cb.tripped = True
                 break
 
             mutated_text, mutation_succeeded = await self._try_initial_mutation(
-                current, failure_hints, llm_client, cb,
+                current, failure_hints, llm_client, cb, variant=member,
             )
 
             if cb.tripped or cb.should_stop():
@@ -718,7 +870,7 @@ class PromptEvolver:
         # 変異（指示テキスト）
         if failure_hints:
             result = await self._mutate_prompt(
-                child_text, failure_hints, llm_client,
+                child_text, failure_hints, llm_client, variant=gen,
             )
             cb.record_attempt()
             if result is None:

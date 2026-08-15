@@ -10,8 +10,8 @@
 
 import { request } from './_client';
 
-/** LoRA 系列 (base / assist) */
-export type LoraTarget = 'base' | 'assist';
+/** LoRA 系列 */
+export type LoraTarget = 'base';
 
 /** モード (chat / create)。level2_adapter_partition=="model_mode" のときのみ意味を持つ。 */
 export type LoraMode = 'chat' | 'create';
@@ -24,7 +24,7 @@ export interface LoraVersionInfo {
 	metadata: Record<string, unknown>;
 }
 
-/** base / assist 1 系列分のバージョン一覧 (バックエンド TargetVersionsResponse 準拠) */
+/** 1 系列分のバージョン一覧 (バックエンド TargetVersionsResponse 準拠) */
 export interface LoraTargetVersions {
 	versions: LoraVersionInfo[];
 	active_adapter_exists: boolean;
@@ -41,10 +41,9 @@ export interface LoraTargetVersions {
 /** LoRA アダプタのパーティションスキーム (learning.level2_adapter_partition) */
 export type LoraAdapterPartition = 'model' | 'model_mode';
 
-/** バージョン一覧 API のレスポンス (base / assist 2 系列) */
+/** バージョン一覧 API のレスポンス */
 export interface LoraVersionsResponse {
 	base: LoraTargetVersions;
-	assist: LoraTargetVersions;
 	/** 'model' のときアダプタはモード非依存で chat/create が同一実体を共有する */
 	adapter_partition?: LoraAdapterPartition;
 }

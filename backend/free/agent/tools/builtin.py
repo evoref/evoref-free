@@ -18,14 +18,13 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from backend.free.api.chat.chat_constants import LLM_TOOL_EXECUTION_TIMEOUT_SEC
-from backend.free.llm.assist_client import assist_ready
+from backend.free.core.system_info import format_hardware_facts
 from backend.free.llm.utils import extract_content
 from backend.i18n_helper import prose_language_name
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
     from backend.free.history.history_manager import HistoryManager
-    from backend.free.llm.assist_client import AssistModelClient
     from backend.free.llm.local_client import LocalClient
 
 logger = get_logger("agent.tools.builtin")
@@ -786,17 +785,6 @@ _FETCH_URL_TEXT_CONTENT_TYPE_PREFIXES = (
 # 20_000 ではベース LLM のプリフィルが 30〜50 秒に達して
 # フロント側 SSE chunk timeout を引き起こしていたため 8_000 に抑制。
 _FETCH_URL_MAX_TEXT_CHARS = 8_000
-# fetch_url の戻り値がこの文字数を超えた場合、アシストモデルで
-# 要約してからベース LLM に渡す。assist_client が未注入の場合は
-# 従来通り truncate のみで返す (degraded mode 安全縮退)。
-_FETCH_URL_SUMMARIZE_THRESHOLD = 4_000
-# fetch_url 要約プロンプト (英語固定でアシストモデルへ指示)。
-_FETCH_URL_SUMMARIZE_SYSTEM = (
-    "You are a precise summarizer for retrieved web content. "
-    "Summarize the user-provided text in 500-1000 characters while preserving "
-    "important facts, numbers, names, and dates. Output the summary directly "
-    "without markdown fences, headings, or meta-commentary."
-)
 # 表を含むページは行データの取りこぼしを避けるため truncate 上限を引き上げる。
 # 表はトークンが短く、メタ認知ループのツール結果として消費されるため、ベース LLM の
 # プリフィル懸念 (8000 制限の理由) は当てはまりにくい。
@@ -1075,61 +1063,20 @@ async def fetch_url(
     return text
 
 
-def _make_fetch_url(cfg: dict, assist_client: "AssistModelClient | None" = None):
-    """fetch_url ツールハンドラを生成（config / assist_client をクロージャでバインド）
+def _make_fetch_url(cfg: dict):
+    """fetch_url ツールハンドラを生成（config をクロージャでバインド）
 
-    ``assist_client`` が与えられている場合、戻り値が
-    ``_FETCH_URL_SUMMARIZE_THRESHOLD`` を超えていれば
-    アシストモデル (purpose=``summarize``) で要約してから返す。
-    要約失敗・assist_client=None の場合は truncate 済み原文で安全縮退する。
+    戻り値は ``_FETCH_URL_MAX_TEXT_CHARS`` (表を含む場合は
+    ``_FETCH_URL_MAX_TEXT_CHARS_TABLE``) で切り詰めた本文。
     """
     tools_cfg = cfg.get("tools", {})
     default_timeout = int(tools_cfg.get("fetch_url_timeout", 10))
     allow_private_ip = bool(tools_cfg.get("fetch_url_allow_private_ip", False))
 
     async def _fetch_url(url: str, timeout: int = default_timeout) -> str:
-        text = await fetch_url(
+        return await fetch_url(
             url, timeout=timeout, allow_private_ip=allow_private_ip,
         )
-        if (
-            # residency 非常駐 (``on_demand`` のチャット中) も「使えない」扱い
-            # (docs/c_14 §6.1)。要約できなければ原文をそのまま返す既存の
-            # フォールバックが働く。
-            not assist_ready(assist_client, "summarize")
-            or text.startswith("Error")
-            or len(text) <= _FETCH_URL_SUMMARIZE_THRESHOLD
-            # 表を含む結果は要約するとセル/行が失われるため原文のまま返す。
-            or _contains_markdown_table(text)
-        ):
-            return text
-        try:
-            messages = [
-                {"role": "system", "content": _FETCH_URL_SUMMARIZE_SYSTEM},
-                {
-                    "role": "user",
-                    "content": (
-                        f"URL: {url}\n\nContent:\n{text}\n\n"
-                        "Provide the summary now."
-                    ),
-                },
-            ]
-            result = await assist_client.generate(
-                messages, stream=False, purpose="summarize",
-            )
-            summary = extract_content(result).strip()
-            if summary:
-                logger.info(
-                    "fetch_url summarized: url=%s, %d -> %d chars",
-                    _redact_url_for_log(url), len(text), len(summary),
-                )
-                return f"(Summary of {url})\n{summary}"
-        except Exception as e:
-            logger.warning(
-                "fetch_url summarize failed: url=%s err=%r; "
-                "falling back to truncated raw text",
-                _redact_url_for_log(url), e,
-            )
-        return text
 
     return _fetch_url
 
@@ -1200,7 +1147,7 @@ def _make_draft_document(client: LocalClient):
     async def draft_document(instruction: str, format: str = "markdown") -> str:
         """指示に基づいてドキュメントを生成する
 
-        本文の言語は生成時点の locale に従う。指示文はツール判定層の assist が
+        本文の言語は生成時点の locale に従う。指示文はツール判定層の aux が
         書くため常に英語で届き (実測)、言語指示が無いと日本語ユーザーに英語の
         成果物が返る (2026-07-28 ライブ検証:「ここまでの数値を表にまとめて
         ください。」→ ``| Speed (km/h) | Time |`` の英語表を生成)。
@@ -1313,6 +1260,20 @@ def _make_search_history(manager: HistoryManager):
             # 結果が少ない場合のみターン検索で再検索
             if len(results) < limit:
                 results = _search(search_turns=True)
+            # summary も matched_turns も無いヒットは **会話の中身を 1 文字も
+            # 運んでいない**。``search_sessions`` は ``max(score, 0.1)`` で全件に
+            # 下駄を履かせ、``session_id`` 指定時はクエリ絞り込み自体を行わない
+            # ため、無関係なセッションが必ず score=0.1 のヘッダだけで返る。
+            # これを「根拠」の枠で base に渡すと、中身が無いのに検索が当たった
+            # ことになり、モデルは仕方なく手元の (切り詰め済み) 文脈から適当な
+            # 発言を選んで断定する。実インシデント (2026-08-14 ライブ監査
+            # ターン19): 「この会話で一番最初に送ったメッセージは？」に対し
+            # ``[2026-08-14T04:14:43Z] mode=chat score=0.1`` だけが返り、
+            # 実際の 1 通目ではなく窓の先頭 (7 ターン目の質問) を答えた。
+            results = [
+                r for r in results
+                if r.get("summary") or r.get("matched_turns")
+            ]
             if not results:
                 return f"{SEARCH_HISTORY_NO_RESULTS_PREFIX}{query}"
 
@@ -1353,15 +1314,8 @@ def register_builtin_tools(
     config: dict | None = None,
     local_client: LocalClient | None = None,
     history_manager: HistoryManager | None = None,
-    *,
-    assist_client: "AssistModelClient | None" = None,
 ) -> None:
-    """ビルトインツールをレジストリに一括登録
-
-    ``assist_client`` が与えられた場合、fetch_url の戻り値が長文の場合に
-    アシストモデル (purpose="summarize") で要約してから返す。
-    None の場合は従来通り truncate のみで動作する。
-    """
+    """ビルトインツールをレジストリに一括登録"""
     cfg = config or {}
 
     registry.register(
@@ -1489,6 +1443,23 @@ def register_builtin_tools(
         hidden=True,
     )
 
+    # 搭載 RAM / CPU / OS を **シェルを介さず** に返す chat 専用ツール。
+    # readonly allow-list (_READONLY_SAFE_MODULES) はチャットから渡される
+    # コマンド文字列にしか掛からないため、backend 内の実装で測る
+    # (free/core/vram_monitor が nvidia-smi を直接叩いているのと同じ立て付け)。
+    # hidden=True: LLM のツール一覧には出さず、tool_call_judge の層0.6 が注入する。
+    registry.register(
+        name="system_hardware_info",
+        func=lambda: format_hardware_facts(),
+        description=(
+            "Report host hardware facts (OS / CPU / cores / physical RAM) "
+            "without a shell (injected by the tool judge; not directly selectable)"
+        ),
+        parameters={},
+        modes=["chat"],
+        hidden=True,
+    )
+
     registry.register(
         name="verify_syntax",
         func=verify_syntax,
@@ -1504,7 +1475,7 @@ def register_builtin_tools(
         fetch_timeout = cfg.get("tools", {}).get("fetch_url_timeout", 10)
         registry.register(
             name="fetch_url",
-            func=_make_fetch_url(cfg, assist_client=assist_client),
+            func=_make_fetch_url(cfg),
             description="Fetch a URL and extract text content",
             parameters={
                 "url": {"type": "string", "description": "URL to fetch"},

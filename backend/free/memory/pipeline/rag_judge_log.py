@@ -1,4 +1,4 @@
-"""RAG necessity/quality の assist 判定を保持するバッファ (再起動耐性つき)
+"""RAG necessity/quality の aux 判定を保持するバッファ (再起動耐性つき)
 
 SemMem ではない (``SemanticFactStore`` を一切参照しない)。CLAUDE.md §6 #2 の
 「SemMem は読むだけ (チャット応答パス)」を侵さない。sleep-time Step 8.7
@@ -29,7 +29,7 @@ from pathlib import Path
 
 from backend.log_config import get_logger
 
-logger = get_logger("memory.rag_judge_assist_log")
+logger = get_logger("memory.rag_judge_log")
 
 #: 答えが紐付かないまま滞留したイベントの寿命 (秒)。ターンが中断された等で
 #: 本文が付かないイベントを永久に持ち越さない。
@@ -37,8 +37,8 @@ _PENDING_TTL_SEC = 7 * 24 * 3600
 
 
 @dataclass(frozen=True)
-class RagJudgeAssistEvent:
-    """RAG necessity/quality の 1 回の assist 判定を表すイベント。"""
+class RagJudgeAuxEvent:
+    """RAG necessity/quality の 1 回の aux 判定を表すイベント。"""
 
     kind: str
     """"rag_necessity" | "rag_quality" のいずれか。"""
@@ -50,8 +50,8 @@ class RagJudgeAssistEvent:
     """ターン確定時に紐付けた応答本文。空ならキュレータが STM から引き直す。"""
 
 
-class RagJudgeAssistLog:
-    """chat 応答パスで発火した RAG necessity/quality の assist 判定を蓄積する。
+class RagJudgeLog:
+    """chat 応答パスで発火した RAG necessity/quality の aux 判定を蓄積する。
 
     thread-safe。``path`` を与えると JSONL へ追記して再起動をまたいで保持する
     (``path=None`` は in-memory のみ = 従来挙動、テスト用)。上限 ``max_size``
@@ -60,18 +60,18 @@ class RagJudgeAssistLog:
 
     def __init__(self, max_size: int = 500, path: "Path | None" = None) -> None:
         self._lock = threading.Lock()
-        self._events: list[RagJudgeAssistEvent] = []
+        self._events: list[RagJudgeAuxEvent] = []
         self._max_size = max_size
         self._path = path
         if path is not None:
             self._events = self._load()
 
     # -- 永続化 ---------------------------------------------------------
-    def _load(self) -> list[RagJudgeAssistEvent]:
+    def _load(self) -> list[RagJudgeAuxEvent]:
         """JSONL からイベントを復元する (壊れた行は捨てて続行)。"""
         if self._path is None or not self._path.exists():
             return []
-        events: list[RagJudgeAssistEvent] = []
+        events: list[RagJudgeAuxEvent] = []
         try:
             with self._path.open(encoding="utf-8") as f:
                 for line in f:
@@ -80,7 +80,7 @@ class RagJudgeAssistLog:
                         continue
                     try:
                         d = json.loads(line)
-                        events.append(RagJudgeAssistEvent(
+                        events.append(RagJudgeAuxEvent(
                             kind=d["kind"], query=d["query"],
                             decision=d["decision"], ts=float(d["ts"]),
                             answer=d.get("answer", ""),
@@ -88,11 +88,11 @@ class RagJudgeAssistLog:
                     except (ValueError, KeyError, TypeError):
                         continue
         except OSError as e:
-            logger.warning("rag_judge_assist_log: load failed: %s", e)
+            logger.warning("rag_judge_log: load failed: %s", e)
             return []
         if events:
             logger.info(
-                "rag_judge_assist_log: restored %d pending event(s)", len(events),
+                "rag_judge_log: restored %d pending event(s)", len(events),
             )
         return events
 
@@ -112,7 +112,7 @@ class RagJudgeAssistLog:
                     }, ensure_ascii=False) + "\n")
             tmp.replace(self._path)
         except OSError as e:
-            logger.warning("rag_judge_assist_log: persist failed: %s", e)
+            logger.warning("rag_judge_log: persist failed: %s", e)
 
     def _prune_locked(self, now: float) -> None:
         """TTL 超過の未紐付けイベントと、上限超過分を落とす。"""
@@ -130,7 +130,7 @@ class RagJudgeAssistLog:
         now = time.time()
         with self._lock:
             self._events.append(
-                RagJudgeAssistEvent(
+                RagJudgeAuxEvent(
                     kind=kind, query=query, decision=decision, ts=now,
                 ),
             )
@@ -160,7 +160,7 @@ class RagJudgeAssistLog:
                 self._rewrite_locked()
         return attached
 
-    def drain(self) -> list[RagJudgeAssistEvent]:
+    def drain(self) -> list[RagJudgeAuxEvent]:
         """蓄積イベントを取り出してバッファを空にする (冪等消費)。"""
         with self._lock:
             events = list(self._events)
@@ -173,4 +173,4 @@ class RagJudgeAssistLog:
             return len(self._events)
 
 
-__all__ = ["RagJudgeAssistEvent", "RagJudgeAssistLog"]
+__all__ = ["RagJudgeAuxEvent", "RagJudgeLog"]

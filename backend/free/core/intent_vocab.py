@@ -119,9 +119,22 @@ _HISTORY_KEYWORD_DISTANCE: tuple[tuple[str, str], ...] = (
     ("今朝", "proximal"),
     ("先ほど", "proximal"),
     ("最初に", "long_range"),
-    ("覚えて", "long_range"),
+    # 「覚えて」単独は「前に」と同じ部分文字列の罠。**保存指示**の
+    # 「覚えておいて(ください)」「覚えといて」にも当たってしまう。実インシデント
+    # (2026-08-12 ライブ監査 ターン3): 「私の名前は小川博之です。覚えておいて
+    # ください。」で search_history が強制発火した。しかも
+    # ``_maybe_scope_session_search`` が現セッションを除外するため、たった今
+    # 述べられた事実は **構造的に必ず空振り**する (1 往復を確実に空費する)。
+    # 同じ曖昧性は EvorefMem 側で解決済み (notes/pin_detector.py の
+    # ``_trigger_evidence_is_question_only``: 「覚えておいて」は保存指示、
+    # 「覚えていますか？」は想起依頼) だが、この表へ伝播していなかった。
+    # 想起を問う活用形だけを採る (次の文字が お / と なら保存指示側)。
+    ("覚えてい", "long_range"),
     ("覚えてる", "long_range"),
-    ("覚えている", "long_range"),
+    ("覚えてま", "long_range"),
+    ("おぼえてい", "long_range"),
+    ("おぼえてる", "long_range"),
+    ("おぼえてま", "long_range"),
     ("過去の会話", "long_range"),
     ("過去のやり取り", "long_range"),
     ("過去に話", "long_range"),
@@ -199,8 +212,12 @@ SESSION_ANCHOR_JA = (
     # 「このセッション」「この対話」は「この会話」と同義のアンカー。同義語を
     # 落とすと同じ取りこぼしを言い換えのたびに繰り返す (2026-08-08 監査で
     # 「このセッションで最後に指示した内容は」がアンカー無し扱いになった)。
+    # 「ここまでの」「これまでの」は「今までの」と同義。落としていたため
+    # 「ここまでの会話を要約して」がアンカー無し扱いになり、reactive 軽量パス
+    # (直近 6 メッセージ・STM/SemMem 注入なし) で直近 3 往復だけを要約した
+    # (2026-08-12 ライブ監査 ターン21)。
     r"(?:この会話|このやり取り|このセッション|この対話"
-    r"|今までの(?:会話|やり取り)"
+    r"|(?:今|ここ|これ)までの(?:会話|やり取り|対話|セッション)"
     r"|今日の(?:追加分の)?会話|今回の(?:追加分の)?会話)"
 )
 
@@ -615,6 +632,12 @@ CALCULATION_CUE_RE = re.compile(
     # 「時速240kmで2時間30分走ると何km進みますか。」が手掛かり語なしと判定
     # され、base の暗算で 540km と誤答。正解は 600km)。
     r"|何[ぁ-んァ-ヴーA-Za-z一-龥%％]{0,6}?(?:です|でしょ|になり|かかり|ありま|ます)"
+    # 丁寧形を列挙しても辞書形が漏れる。「何<単位>...？」と疑問符で閉じる形は
+    # 文末表現に依らず受ける (実インシデント 2026-08-12 ライブ監査:
+    # 「時速72km で 45 分走ると何 km 進む？」が手掛かり語なしと判定され、
+    # ツール判定に一度も到達せず base の暗算で 6km と誤答。正解は 54km)。
+    # 数値ゼロのクエリ (「これは何？」) は後段の数値チェックで落ちる。
+    r"|何[ぁ-んァ-ヴーA-Za-z一-龥%％\s]{0,8}?[?？]"
     r"|合計|総額|平均|割合|求め|計算"
     r"|(?<![A-Za-z])how\s+(?:much|many)(?![A-Za-z])"
     r"|(?<![A-Za-z])what\s+is(?![A-Za-z])|(?<![A-Za-z])total(?![A-Za-z]))",
@@ -752,3 +775,78 @@ def looks_like_numeric_question(query: str, context: str = "") -> bool:
     if len(query_numbers) >= 2:
         return True
     return bool(NUMBER_LITERAL_RE.search(context))
+
+
+#: 「あなたは何のツールが使えるか」を尋ねる問い。ツール目録は決定論で答えられる
+#: 事実 (ToolsRegistry が SSOT) なのに、チャット応答パスの system プロンプトには
+#: 一覧が載っていない。ツール選択は別レイヤ (ToolCallJudge / grammar 分類器) が
+#: 担うため、base はツールの存在自体を知らないまま答える。
+#:
+#: 実インシデント (2026-08-14 ライブ監査 ターン33): 「あなたが今使えるツールを
+#: 全部列挙してください。推測せず、実際に利用可能なものだけで。」に対し
+#: 「現在、私が直接利用できるツールはありません」と回答した。同じ会話で
+#: calculate / run_command_readonly / search_history / write_file が実行済み。
+_TOOL_INVENTORY_SUBJECT_RE = re.compile(
+    r"(?:ツール|tool)"
+    r"|(?:機能|できること|出来ること)",
+    re.IGNORECASE,
+)
+#: 「一覧を出せ / 何が使えるか」に相当する問いかけ。
+_TOOL_INVENTORY_ASK_RE = re.compile(
+    r"(?:使え|使用でき|利用でき|呼べ|実行でき)"
+    r"|(?:一覧|列挙|リスト|教えて|何がある|どんな|何ができ|何が出来)"
+    r"|(?:what|which|list)\b",
+    re.IGNORECASE,
+)
+#: ツール「を使って何かをしろ」という依頼を目録質問と取り違えないための除外。
+#: 「このツールでファイルを読んで」等は目録ではなく実行依頼。
+_TOOL_INVENTORY_EXCLUDE_RE = re.compile(
+    r"(?:を使って|で実行|を実行して|して[くだ]さい\s*$)"
+    r"|[A-Za-z]:[\/]",
+)
+
+
+def tool_inventory_question(query: str) -> bool:
+    """クエリが「使えるツール / 機能の一覧」を尋ねているか (純粋関数)。
+
+    主語 (ツール / 機能 / できること) と問いかけ (使える / 一覧 / 何が…) の
+    両方が現れ、実行依頼の語が無い場合だけ True。曖昧な文は False を返して
+    従来経路へ委ねる。
+    """
+    if not query:
+        return False
+    if _TOOL_INVENTORY_EXCLUDE_RE.search(query):
+        return False
+    if not _TOOL_INVENTORY_SUBJECT_RE.search(query):
+        return False
+    return bool(_TOOL_INVENTORY_ASK_RE.search(query))
+
+
+#: 現在日時 / 日付を尋ねるクエリ。``agent.tool_call_judge`` (datetime コマンド
+#: 合成) と ``agent.router`` (executable_query 分類) が同じ判定を使う。
+#:
+#: 以前は両モジュールが個別に正規表現を持っており、``(?!間)`` ガードが
+#: tool_call_judge 側にしか無い等の食い違いがあった。ここを SSOT にする。
+#:
+#: 英語側は以前 ``now`` / ``date`` / ``time`` を **裸で** 拾っていた。これらは
+#: 談話副詞・一般名詞として頻出するため、時刻と無関係な文でツールが発火する。
+#: 本パターンは aux の否定票を上書きする高特異度扱い (``_upgrade_command_via_aux``
+#: の降格例外) なので、誤検出はそのまま無駄なツール実行になる。
+#: 実インシデント (2026-08-14 ライブ監査 ターン28/29):
+#: 「Please answer in English **from now** until I say otherwise. What are the
+#: three main benefits of using type hints in Python?」と
+#: 「**Now** give me a JSON object with keys ...」の 2 回、現在時刻の取得
+#: コマンドが撃たれた。どちらも日時とは無関係。
+#: 疑問構文・明示的な「current/today's」構文に限定して受ける。
+DATETIME_QUERY_RE = re.compile(
+    r"(?:何時(?!間)|何月|何日(?!間)|何曜日"
+    r"|(?:日時|日付)(?!型|形式|フォーマット|カラム|列)|現在時刻"
+    r"|(?<![A-Za-z])what(?:'s|’s|\s+is|\s+are|\s+was)?"
+    r"[^.?!\n]{0,15}?(?<![A-Za-z])(?:date|time|day)(?![A-Za-z])"
+    r"|(?<![A-Za-z])current\s+(?:date|time)(?![A-Za-z])"
+    r"|(?<![A-Za-z])today'?s?\s+date(?![A-Za-z])"
+    r"|(?<![A-Za-z])day\s+of\s+the\s+week(?![A-Za-z])"
+    r"|(?<![A-Za-z])(?:tell|give)\s+me[^.?!\n]{0,20}?"
+    r"(?<![A-Za-z])(?:date|time)(?![A-Za-z]))",
+    re.IGNORECASE,
+)

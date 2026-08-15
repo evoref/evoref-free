@@ -42,9 +42,9 @@ class FewShotExample:
     mode: str = "chat"
     fitness: float = 0.0
     added_at: str = ""
-    #: アシストによる手本品質の採点 (0..1)。未採点 / degraded mode では ``None``。
+    #: 補助タスクによる手本品質の採点 (0..1)。未採点 / degraded mode では ``None``。
     #: **採用可否の拒否権は持たない** — 順位付けの重みとしてのみ使う
-    #: (``FewShotPool._effective_fitness``)。小型 assist は自分が検算できない
+    #: (``FewShotPool._effective_fitness``)。小型 aux は自分が検算できない
     #: 算術を「正確」と評価するため (実測 2026-07-31)、内容の正誤は
     #: ``response_arithmetic`` の決定論検算が担当する。
     quality_score: float | None = None
@@ -101,6 +101,20 @@ _ANY_PROTECTED_MARKER_RE = re.compile(
 def extract_protected_sections(text: str) -> list[str]:
     """プロンプトから保護セクションの内容を順序付きで抽出する"""
     return [m.group(1).strip() for m in _PROTECTED_RE.finditer(text)]
+
+
+def protected_line_indices(text: str) -> set[int]:
+    """保護ブロックが占める 0-origin 行番号の集合 (マーカー行を含む)
+
+    差分編集変異 (`PromptEvolver._mutate_by_edit`) が「編集してよい行」を
+    決めるために使う。マーカー記法を知るのは本モジュールだけに保つ。
+    """
+    indices: set[int] = set()
+    for match in _PROTECTED_RE.finditer(text):
+        first = text.count("\n", 0, match.start())
+        last = text.count("\n", 0, match.end())
+        indices.update(range(first, last + 1))
+    return indices
 
 
 def has_orphan_protected_markers(text: str) -> bool:
@@ -256,6 +270,7 @@ __all__ = [
     "extract_protected_sections",
     "format_fewshot_section",
     "has_orphan_protected_markers",
+    "protected_line_indices",
     "restore_protected_sections",
     "strip_orphan_protected_markers",
     "text_contains_sentence",

@@ -41,6 +41,42 @@ def _make_utf8_stream() -> io.TextIOWrapper:
         return sys.stderr  # type: ignore[return-value]
 
 
+def _make_rotating_handler(
+    path: Path,
+    formatter: logging.Formatter,
+    max_bytes: int,
+    *,
+    level: int | None = None,
+) -> RotatingFileHandler | None:
+    """ローテーションハンドラを作る。開けなければ ``None`` を返す。
+
+    ``RotatingFileHandler`` は ``delay`` 未指定だとコンストラクタで即座に
+    ファイルを開くため、開けないと ``setup_logging()` が例外を上げてアプリが
+    **起動不能** になる。Windows では削除保留 (delete pending) のファイルが
+    同名の再作成をブロックするため、``scripts/reset_local_data.py``
+    (UI の初期化ボタン) が ``local/`` を wipe した直後にこれを踏みうる
+    (2026-08-14 に実機で再現: ``PermissionError`` → ``Application startup failed``)。
+
+    ログが 1 本落ちることとアプリが起動しないことは重大さが桁違いなので、
+    開けない場合は stderr に警告して縮退する。
+    """
+    try:
+        handler = RotatingFileHandler(
+            path, maxBytes=max_bytes, backupCount=3, encoding="utf-8",
+        )
+    except OSError as e:
+        print(
+            f"[log_config] WARNING: cannot open log file {path} ({e}); "
+            f"continuing without this handler",
+            file=sys.stderr,
+        )
+        return None
+    handler.setFormatter(formatter)
+    if level is not None:
+        handler.setLevel(level)
+    return handler
+
+
 def _has_rotating_file_handler(lg: logging.Logger, target_path: Path) -> bool:
     """指定パスを baseFilename とする RotatingFileHandler が既に登録済みかを判定する"""
     return any(
@@ -125,14 +161,11 @@ def setup_logging(
     # backend.log ハンドラ（複数回呼び出しでも重複登録しない）
     backend_log_path = (log_dir / "backend.log").resolve()
     if not _has_rotating_file_handler(root, backend_log_path):
-        backend_handler = RotatingFileHandler(
-            log_dir / "backend.log",
-            maxBytes=max_bytes,
-            backupCount=3,
-            encoding="utf-8",
+        backend_handler = _make_rotating_handler(
+            log_dir / "backend.log", formatter, max_bytes,
         )
-        backend_handler.setFormatter(formatter)
-        root.addHandler(backend_handler)
+        if backend_handler is not None:
+            root.addHandler(backend_handler)
 
     # コンソール出力（debug / investigate のみ）— UTF-8 強制
     # 非 RotatingFileHandler の StreamHandler が既に登録済みなら追加しない
@@ -177,14 +210,11 @@ def _setup_learning_logging(
     if all(_has_rotating_file_handler(lg, target_path) for lg in target_loggers):
         return  # 既に全対象に登録済み（ハンドラ重複回避）
 
-    learning_handler = RotatingFileHandler(
-        log_dir / "learning.log",
-        maxBytes=max_bytes,
-        backupCount=3,
-        encoding="utf-8",
+    learning_handler = _make_rotating_handler(
+        log_dir / "learning.log", formatter, max_bytes, level=level,
     )
-    learning_handler.setFormatter(formatter)
-    learning_handler.setLevel(level)
+    if learning_handler is None:
+        return
 
     for target_logger in target_loggers:
         if _has_rotating_file_handler(target_logger, target_path):
@@ -221,15 +251,12 @@ def setup_cli_logging(
     # cli.log ハンドラ (5MB × 3世代) — 同一パスが既に登録済みなら追加しない
     cli_log_path = (log_dir / "cli.log").resolve()
     if not _has_rotating_file_handler(cli_logger, cli_log_path):
-        cli_handler = RotatingFileHandler(
-            log_dir / "cli.log",
-            maxBytes=5 * 1024 * 1024,
-            backupCount=3,
-            encoding="utf-8",
+        cli_handler = _make_rotating_handler(
+            log_dir / "cli.log", formatter, 5 * 1024 * 1024,
+            level=logging.DEBUG,
         )
-        cli_handler.setFormatter(formatter)
-        cli_handler.setLevel(logging.DEBUG)
-        cli_logger.addHandler(cli_handler)
+        if cli_handler is not None:
+            cli_logger.addHandler(cli_handler)
 
     # デバッグモード時は stderr にも出力 — UTF-8 強制
     if debug and not _has_plain_stream_handler(cli_logger):

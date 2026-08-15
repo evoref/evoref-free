@@ -37,7 +37,7 @@ async def _collect_component_statuses(
     cfg: dict, state: AppState, client: object | None, base_connected: bool,
     *, serving_user: bool = False,
 ) -> list[ComponentStatus]:
-    """各コンポーネント (base / assist / embed) のステータスを収集する
+    """各コンポーネント (base / embed) のステータスを収集する
 
     Args:
         serving_user: ベースモデルがチャット応答を生成中か。True のときは
@@ -58,29 +58,6 @@ async def _collect_component_statuses(
     if client and hasattr(client, "metadata") and client.metadata.model_id:
         base_name = client.metadata.model_id
     components.append(ComponentStatus(name=base_name, connected=base_connected))
-
-    # assist model
-    assist_model_path = cfg.get("model_paths", {}).get("assist_model", "")
-    assist_name = Path(assist_model_path).stem if assist_model_path else ""
-    assist_connected = False
-    residency = getattr(state, "assist_residency", None)
-    assist_residency_state: str | None = None
-    if residency is not None and residency.on_demand:
-        assist_residency_state = residency.status
-    if state.assist_client is not None:
-        # 非常駐が設計どおりの状態なら health check を投げない。UI は数秒ごとに
-        # /api/status をポーリングするため、死んだポートへ毎回 ConnectError を
-        # 出しにいくとログが埋まる (docs/c_14 §1.2)。
-        if residency is None or residency.is_ready():
-            try:
-                assist_connected = await state.assist_client.health_check()
-            except Exception:
-                pass
-    components.append(ComponentStatus(
-        name=assist_name,
-        connected=assist_connected,
-        residency=assist_residency_state,
-    ))
 
     # embed model
     embed_cfg = cfg.get("embedding", {})
@@ -150,14 +127,14 @@ async def _try_lazy_connect(state: AppState, llama_url: str, llama_cfg: dict) ->
 
 
 def _collect_capabilities(state: AppState) -> list[CapabilityInfo]:
-    """base / assist クライアントの能力プローブ結果を Status 用に収集する (docs/c_15)。
+    """base クライアントの能力プローブ結果を Status 用に収集する (docs/c_15)。
 
     プローブ未完了 / 無効 (``capabilities is None``) の slot は含めない。
     """
     from backend.free.llm.capability import CapabilitySnapshot
 
     out: list[CapabilityInfo] = []
-    for slot, client in (("base", state.local_client), ("assist", state.assist_client)):
+    for slot, client in (("base", state.local_client),):
         snap = getattr(client, "capabilities", None) if client is not None else None
         # 実 snapshot のみ採用 (MagicMock の自動属性 / None を弾く)
         if not isinstance(snap, CapabilitySnapshot):
@@ -266,14 +243,6 @@ async def get_status(state: AppState = Depends(get_app_state)):
         )
         if connected:
             client = state.local_client
-
-    # アシストモデルの遅延接続も試行（モデルロードが起動時に間に合わなかったケース）
-    if state.assist_client is None:
-        from backend.free.api.model.assist_model_api import _try_lazy_connect_assist
-        await guarded_lazy_connect(
-            "assist",
-            lambda: _try_lazy_connect_assist(state, cfg),
-        )
 
     # モデル情報
     model = None

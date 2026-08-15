@@ -88,13 +88,14 @@ async def trigger_learning(req: TriggerRequest, state: AppState = Depends(get_ap
         )
 
     # Full モード: まず sleep-time update を実行する。
-    # sleep-time の LLM ステージはアシストモデルでのみ実行する (degraded 時は
-    # ベースへフォールバックせず run_full(None) が Step 5.8-10 をスキップ)。
-    # 通常のスケジュール経路 (scheduler.py の Full) と同じ方針 (c_14 §6.2)。
+    # LLM ステージのクライアントは通常のスケジュール経路 (scheduler.py の
+    # Trigger B) と同じ ``resolve_sleep_client()`` で解決する
+    # (sleep-time はベースモデルで実行する)。
+    # どちらも未接続なら run_full を呼ばず Step 5.8-10 をスキップする (c_14 §6.2)。
     if req.level == "full":
         sleep_sched = state.sleep_scheduler
         if sleep_sched is not None and sleep_sched._worker is not None:
-            sleep_client = state.assist_client
+            sleep_client = sleep_sched.resolve_sleep_client()
             if sleep_client:
                 try:
                     logger.info(
@@ -135,7 +136,7 @@ async def trigger_learning(req: TriggerRequest, state: AppState = Depends(get_ap
 async def improvement_curve():
     """改善カーブ用データを返す（LoRA バージョン別 eval_score 推移）
 
-    base (`lora_scores`) / assist (`assist_scores`) の 2 系列。
+    base (`lora_scores`) の 1 系列。
     Pro 機能: Free 版では両方空配列を返す。
     """
     logger.debug("GET /api/learning/improvement-curve")
@@ -146,11 +147,10 @@ async def improvement_curve():
 
     resolver = get_path_resolver()
 
-    def _scores(versions_key: str, adapter_key: str) -> list[ImprovementPoint]:
-        vmgr = LoRAVersionManager(
-            resolver.resolve_local(versions_key),
-            resolver.resolve_local(adapter_key),
-        )
+    # base は (モデル×モード) パーティション配下。
+    # resolve_local (flat) のままだと Level 2 が積んだ版履歴が 1 件も出ない。
+    def _scores(resolve, versions_key: str, adapter_key: str) -> list[ImprovementPoint]:
+        vmgr = LoRAVersionManager(resolve(versions_key), resolve(adapter_key))
         return [
             ImprovementPoint(
                 version=v.version,
@@ -161,8 +161,9 @@ async def improvement_curve():
         ]
 
     return ImprovementCurveResponse(
-        lora_scores=_scores("lora_versions_dir", "lora_adapter"),
-        assist_scores=_scores("assist_lora_versions_dir", "assist_lora_adapter"),
+        lora_scores=_scores(
+            resolver.resolve_learning, "lora_versions_dir", "lora_adapter",
+        ),
     )
 
 
@@ -176,6 +177,7 @@ async def learning_status(state: AppState = Depends(get_app_state)):
 
     pro_info = _get_pro_learning_info()
     sched_status = _build_scheduler_status(state.learning_scheduler)
+    _annotate_level1_gate(sched_status, state.sleep_scheduler)
 
     return LearningStatusResponse(
         lora_version=pro_info["lora_version"],
@@ -185,6 +187,45 @@ async def learning_status(state: AppState = Depends(get_app_state)):
         eval_cases=pro_info["eval_cases"],
         scheduler_status=sched_status,
     )
+
+
+def _annotate_level1_gate(
+    status: SchedulerStatusModel, sleep_scheduler: object | None,
+) -> None:
+    """Level 1 が今走れない理由を ``status`` へ書き込む (in-place)。
+
+    ``conditions_met`` は経験件数だけの表示値で、実ゲート (アイドル /
+    ユーザー活動 / LLM クライアント配線 / ループ起動) を含まない。両者を
+    突き合わせないと「conditions_met: true なのに level1_run_count が 0 の
+    まま」の理由が API からは分からず、ログを読むしかなかった
+    (2026-08-14 ライブ監査で実際に切り分けに時間を要した)。
+
+    ``LearningScheduler`` 側で分かる理由を先に見て、残りを
+    ``SleepTimeScheduler.level1_gate_status()`` から補う。
+    """
+    if status.is_disabled:
+        status.level1_blocked_reason = "learning_disabled"
+        return
+    if status.running:
+        status.level1_blocked_reason = "already_running"
+        return
+    if not status.conditions_met:
+        status.level1_blocked_reason = "insufficient_experiences"
+        return
+
+    gate_fn = getattr(sleep_scheduler, "level1_gate_status", None)
+    if gate_fn is None:
+        return
+    gate = gate_fn()
+    status.level1_seconds_until_idle = gate.get("seconds_until_idle")
+    if not gate.get("llm_client_wired"):
+        status.level1_blocked_reason = "no_llm_client"
+    elif not gate.get("loop_running"):
+        status.level1_blocked_reason = "loop_not_started"
+    elif gate.get("user_active"):
+        status.level1_blocked_reason = "user_active"
+    elif not gate.get("idle"):
+        status.level1_blocked_reason = "waiting_for_idle"
 
 
 def _ts_to_iso(ts: float) -> str | None:
@@ -212,8 +253,11 @@ def _get_pro_learning_info() -> dict:
         return result
 
     resolver = get_path_resolver()
-    versions_dir = resolver.resolve_local("lora_versions_dir")
-    adapter_path = resolver.resolve_local("lora_adapter")
+    # 学習済みアダプタは (モデル×モード) パーティション配下にある。resolve_local
+    # (flat) のままだと Level 2 が実際に書き出した版が見えず、同じ応答の中の
+    # level2.base.version と食い違う (実機で version=0/exists=false vs v4)。
+    versions_dir = resolver.resolve_learning("lora_versions_dir")
+    adapter_path = resolver.resolve_learning("lora_adapter")
     vmgr = LoRAVersionManager(versions_dir, adapter_path)
     result["lora_version"] = vmgr.get_latest_version()
     result["lora_adapter_exists"] = adapter_path.exists()

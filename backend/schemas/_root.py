@@ -27,7 +27,6 @@ from backend.schemas._common import (
     ToolsConfig,
     WidgetProxyConfig,
 )
-from backend.schemas.assist_model import AssistModelConfig
 from backend.schemas.create import CreateConfig
 from backend.schemas.learning import LearningConfig, ScheduleConfig
 from backend.schemas.llm import LlamaConfig
@@ -87,7 +86,6 @@ class EvorefConfig(BaseModel):
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     widget_proxy: WidgetProxyConfig = Field(default_factory=WidgetProxyConfig)
     i18n: I18nConfig = Field(default_factory=I18nConfig)
-    assist_model: AssistModelConfig = Field(default_factory=AssistModelConfig)
     modes: ModesConfig = Field(default_factory=ModesConfig)
     editor: EditorSettingsConfig = Field(default_factory=EditorSettingsConfig)
     model_migration: ModelMigrationConfig = Field(default_factory=ModelMigrationConfig)
@@ -169,8 +167,8 @@ class EvorefConfig(BaseModel):
         - ``create.pipeline == "staged"`` (Pro staged クリエイトパイプライン)
         - 未定義トップレベルキー ``mode_models`` (Pro ローカルモデル切替)
 
-        過去存在した ``external_api.enabled`` / ``assist_model.backend in
-        {external, hybrid}`` の判定対象は削除済。
+        過去存在した ``external_api.enabled`` / 補助タスク関連の判定対象は
+        削除済。
         """
         # 遅延 import: ``backend.edition`` は ``log_config`` のみ依存するため
         # 循環は発生しないが、トップレベル import で初期化順序の罠を作らない
@@ -190,10 +188,6 @@ class EvorefConfig(BaseModel):
             (
                 "learning.level2_base_method",
                 self.learning.level2_base_method == "cvector",
-            ),
-            (
-                "learning.level2_assist_method",
-                self.learning.level2_assist_method == "spsa-real-eval",
             ),
             (
                 "pro.url_recall.team_profile_ids",
@@ -236,7 +230,6 @@ _LEGACY_KEY_RENAMES: dict[str, str] = {
     "coding": "create",
     "coding_task": "create_task",
     "coding_model": "create_model",
-    "assist_coding_model": "assist_create_model",
     "coding_workspace_dir": "create_workspace_dir",
     "coding_budget_tokens": "create_budget_tokens",
     "coding_code_signal": "create_code_signal",

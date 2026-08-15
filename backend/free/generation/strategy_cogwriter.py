@@ -1,7 +1,7 @@
-"""CogWriter 戦略（アシストモデルあり）
+"""CogWriter 戦略（補助タスクあり）
 
 設計書 f_08_long_form_generation.md §3 (§3.0 コード仕様/フローチャート合成) 準拠。
-認知的ライティング理論に基づき、計画・レビューをアシストモデルが担当し、
+認知的ライティング理論に基づき、計画・レビューを補助タスクが担当し、
 メインモデルは生成に専念する。
 """
 
@@ -44,12 +44,12 @@ from backend.free.llm.json_schemas import CodeSpec
 from backend.i18n_helper import get_locale, prose_language_name
 
 if TYPE_CHECKING:
-    from backend.free.llm.assist_client import AssistModelClient
+    from backend.free.llm.aux_client import AuxClient
     from backend.free.llm.local_client import LocalClient
 
 logger = logging.getLogger("backend.free.generation.strategy_cogwriter")
 
-# code_spec 合成の出力トークン上限。iGPU + 4B assist では 3072 が purpose timeout
+# code_spec 合成の出力トークン上限。iGPU + 4B aux では 3072 が purpose timeout
 # (120s) を超えて ReadTimeout+retry を誘発したため基底は 1536 に抑える。切断時のみ
 # 出力を増やし timeout を明示延長して 1 回だけ再合成する (モジュール/インタフェース
 # 欠落 → 後続ファイルの黙殺欠落を防ぐ)。
@@ -495,22 +495,22 @@ class ReviewIssue:
 # ── CogWriter 戦略本体 ──
 
 class CogWriterStrategy:
-    """CogWriter 戦略（アシストモデルあり）
+    """CogWriter 戦略（補助タスクあり）
 
-    計画・レビューをアシストモデルが担当し、
+    計画・レビューを補助タスクが担当し、
     メインモデルは生成に専念する。
     """
 
     def __init__(
         self,
         main_client: LocalClient,
-        assist_client: AssistModelClient,
+        aux_client: AuxClient,
         config: dict,
         debug_logger=None,
         generation_params: dict | None = None,
     ):
         self.main_client = main_client
-        self.assist_client = assist_client
+        self.aux_client = aux_client
         self.config = config
         self._debug_logger = debug_logger
         self._lf_config = config.get("long_form", {})
@@ -523,7 +523,7 @@ class CogWriterStrategy:
         content_type: ContentType,
         budget: TokenBudget,  # noqa: ARG002
     ) -> GenerationPlan:
-        """アシストモデルで計画を生成"""
+        """補助タスクで計画を生成"""
         t0 = time.monotonic()
         rag_context = context.get("rag", "")
         memory_context = context.get("memory", "")
@@ -636,7 +636,7 @@ class CogWriterStrategy:
         # content_type に応じた schema 選択と例外フォールバックは共通化
         plan_telemetry: dict = {}
         data = await generate_plan_json(
-            self.assist_client, prompt, content_type, telemetry=plan_telemetry,
+            self.aux_client, prompt, content_type, telemetry=plan_telemetry,
         )
         # max_tokens 切断でユニットが黙って欠落する事象を可視化する
         # (例: 多モジュールのコード計画で末尾モジュールが落ちる)。
@@ -695,10 +695,10 @@ class CogWriterStrategy:
     ) -> CodeSpec | None:
         """コード生成の事前準備として共有設計仕様 (契約) を合成する。
 
-        ``assist_client=None`` (degraded) / config 無効化 / 合成失敗時は
+        ``aux_client=None`` (degraded) / config 無効化 / 合成失敗時は
         ``None`` を返し、呼出側は仕様なしの従来挙動にフォールバックする。
         """
-        if self.assist_client is None:
+        if self.aux_client is None:
             return None
         if not self._lf_config.get("code_spec_enabled", True):
             return None
@@ -715,12 +715,12 @@ class CogWriterStrategy:
         t0 = time.monotonic()
         try:
             # max_tokens は CodeSpec (modules/data_models/interfaces) を網羅できる
-            # 範囲で最小化する。iGPU + 4B assist では decode 長が支配項で、3072 は
+            # 範囲で最小化する。iGPU + 4B aux では decode 長が支配項で、3072 は
             # purpose timeout を超えて ReadTimeout+retry を誘発していた (~130s の
             # 無駄待ち)。基底 1536 で単一〜少数モジュールの spec は収まり、超過時は
             # 下で延長 timeout 付き再合成 → なお切断/失敗なら spec=None で安全に縮退。
             spec_telemetry: dict = {}
-            data = await self.assist_client.generate_json(
+            data = await self.aux_client.generate_json(
                 prompt, max_tokens=_CODE_SPEC_MAX_TOKENS, temperature=0.3,
                 purpose="code_spec_synthesis", telemetry=spec_telemetry,
             )
@@ -735,7 +735,7 @@ class CogWriterStrategy:
                 )
                 try:
                     retry_tel: dict = {}
-                    data_retry = await self.assist_client.generate_json(
+                    data_retry = await self.aux_client.generate_json(
                         prompt, max_tokens=_CODE_SPEC_RETRY_MAX_TOKENS,
                         temperature=0.3, purpose="code_spec_synthesis",
                         timeout=_CODE_SPEC_RETRY_TIMEOUT_SEC, telemetry=retry_tel,
@@ -781,10 +781,10 @@ class CogWriterStrategy:
     ) -> str:
         """設計仕様から mermaid フローチャートを合成する (config 任意・既定 OFF)。
 
-        ``code_flowchart_enabled`` が False / ``assist_client=None`` / 合成失敗時は
+        ``code_flowchart_enabled`` が False / ``aux_client=None`` / 合成失敗時は
         空文字列を返し、SPEC.md にフローチャート節を付けない。
         """
-        if self.assist_client is None:
+        if self.aux_client is None:
             return ""
         if not self._lf_config.get("code_flowchart_enabled", False):
             return ""
@@ -798,7 +798,7 @@ class CogWriterStrategy:
             f"含むラベルはダブルクォートで囲む)。"
         )
         try:
-            data = await self.assist_client.generate_json(
+            data = await self.aux_client.generate_json(
                 prompt, max_tokens=1024, temperature=0.3,
                 purpose="flowchart_synthesis",
             )
@@ -850,7 +850,7 @@ class CogWriterStrategy:
         rolling: RollingContext,
         content_type: ContentType,
     ) -> list[ReviewIssue]:
-        """アシストモデルでレビュー"""
+        """補助タスクでレビュー"""
         if not rolling.generated_units:
             return []
 
@@ -954,7 +954,7 @@ class CogWriterStrategy:
     # ── レビュー実装 ──
 
     async def _review_code(self, rolling: RollingContext) -> list[ReviewIssue]:
-        """コード用レビュー: AST検証 + アシストによるシグネチャ整合性チェック"""
+        """コード用レビュー: AST検証 + 補助タスクによるシグネチャ整合性チェック"""
         issues: list[ReviewIssue] = []
         plan = rolling.plan
 
@@ -969,7 +969,7 @@ class CogWriterStrategy:
                     fix=f"構文エラーを修正: {e.msg}",
                 ))
 
-        # 2. アシストモデル: シグネチャ整合性チェック
+        # 2. 補助タスク: シグネチャ整合性チェック
         plan_specs = []
         for u in plan.units:
             if isinstance(u, CodeUnit):
@@ -989,7 +989,7 @@ class CogWriterStrategy:
         )
 
         try:
-            data = await self.assist_client.generate_json(
+            data = await self.aux_client.generate_json(
                 # 複数 ReviewIssue(unit_idx/issue/fix) を配列で返すため 512 では
                 # finish_reason=length で約半数が途中切断され json_repair 依存に
                 # なる。1024 へ拡張して切断を抑える。
@@ -1007,12 +1007,12 @@ class CogWriterStrategy:
                         fix=item.get("fix", ""),
                     ))
         except Exception as e:
-            logger.warning("Assist review failed: %s", e)
+            logger.warning("Aux review failed: %s", e)
 
         return issues
 
     async def _review_text(self, rolling: RollingContext) -> list[ReviewIssue]:
-        """テキスト用レビュー: アシストによる要点カバー率 + 文体一貫性"""
+        """テキスト用レビュー: 補助タスクによる要点カバー率 + 文体一貫性"""
         issues: list[ReviewIssue] = []
         plan = rolling.plan
 
@@ -1034,7 +1034,7 @@ class CogWriterStrategy:
         )
 
         try:
-            data = await self.assist_client.generate_json(
+            data = await self.aux_client.generate_json(
                 # issues 配列サイズは unit 数に比例し、日本語 issue/fix で 1024
                 # でも 2/8 が finish=length 切断 → json_repair は先頭要素しか
                 # 救済できず後半 unit のレビューが黙って落ちる (2026-07-15
@@ -1053,6 +1053,6 @@ class CogWriterStrategy:
                         fix=item.get("fix", ""),
                     ))
         except Exception as e:
-            logger.warning("Assist text review failed: %s", e)
+            logger.warning("Aux text review failed: %s", e)
 
         return issues

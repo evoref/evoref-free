@@ -815,7 +815,7 @@ async def async_main(args: argparse.Namespace) -> int:
     if status_data:
         state.instance_name = status_data.get("instance_name", "evoref")
 
-    # 設定済みだが未起動の補助サーバー（assist/embed）を自動起動
+    # 設定済みだが未起動の補助サーバー（aux/embed）を自動起動
     await ensure_extra_servers(project_root, auto_serve_state)
 
     # セッション登録（設計書 09 §9.4.5）

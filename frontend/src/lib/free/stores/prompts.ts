@@ -3,9 +3,9 @@
 import { writable, get } from 'svelte/store';
 import {
 	getPrompts,
-	getAssistPrompts,
+	getAuxPrompts,
 	type PromptListItem,
-	type AssistPromptListItem,
+	type AuxPromptListItem,
 	type PromptHistoryItem
 } from '$lib/free/api';
 import {
@@ -27,8 +27,8 @@ export type { PromptCategory, PromptDetailWithScore };
 /** システムプロンプト一覧 */
 export const systemPrompts = writable<PromptListItem[]>([]);
 
-/** アシストプロンプト一覧 */
-export const assistPrompts = writable<AssistPromptListItem[]>([]);
+/** 補助タスクプロンプト一覧 */
+export const auxPrompts = writable<AuxPromptListItem[]>([]);
 
 /** 選択中のプロンプト */
 export const selectedPrompt = writable<PromptSelection | null>(null);
@@ -57,12 +57,12 @@ export const historyOpen = writable(false);
 /** 元の内容（dirty 検出用） */
 let originalContent = '';
 
-/** アシストプロンプトのデフォルトタスク一覧 */
-const DEFAULT_ASSIST_TASKS = ['rag_necessity', 'rag_quality', 'tool_call', 'note_evolve'];
+/** 補助タスクプロンプトのデフォルトタスク一覧 */
+const DEFAULT_AUX_TASKS = ['rag_necessity', 'rag_quality', 'tool_call', 'note_evolve'];
 
-/** API未取得時のフォールバック用アシストプロンプト一覧 */
-function defaultAssistPrompts(): AssistPromptListItem[] {
-	return DEFAULT_ASSIST_TASKS.map((task) => ({
+/** API未取得時のフォールバック用補助タスクプロンプト一覧 */
+function defaultAuxPrompts(): AuxPromptListItem[] {
+	return DEFAULT_AUX_TASKS.map((task) => ({
 		task,
 		version: 0,
 		source: 'default',
@@ -76,12 +76,12 @@ function defaultAssistPrompts(): AssistPromptListItem[] {
 export async function loadPromptList(): Promise<void> {
 	promptsLoading.set(true);
 	try {
-		const [sys, assist] = await Promise.all([
+		const [sys, aux] = await Promise.all([
 			getPrompts(),
-			getAssistPrompts().catch(() => defaultAssistPrompts())
+			getAuxPrompts().catch(() => defaultAuxPrompts())
 		]);
 		systemPrompts.set(sys);
-		assistPrompts.set(assist.length > 0 ? assist : defaultAssistPrompts());
+		auxPrompts.set(aux.length > 0 ? aux : defaultAuxPrompts());
 	} catch {
 		addToast({ type: 'error', i18nKey: 'settings.prompts.load_failed' });
 	} finally {

@@ -30,7 +30,7 @@ class ConflictResolver:
 
     # 失敗ペアの quarantine: LLM マージに繰り返し失敗するノートを一定時間
     # conflict 検出から除外し、同一ペアを毎サイクル再試行して circuit breaker を
-    # 起こし続ける livelock を断つ。低速 assist が一過性に遅いだけのケースに
+    # 起こし続ける livelock を断つ。低速 aux が一過性に遅いだけのケースに
     # 備え cooldown 経過後は再試行する (恒久 ban にはしない)。
     _FAIL_QUARANTINE_THRESHOLD = 3
     _COOLDOWN_SECONDS = 6 * 3600.0
@@ -136,7 +136,7 @@ class ConflictResolver:
         """類似ノートを LLM で統合
 
         サーキットブレーカーと事前ヘルスチェックにより、
-        アシストモデルがビジー/停止時の長時間ブロッキングを防止する。
+        補助タスクがビジー/停止時の長時間ブロッキングを防止する。
 
         Returns:
             統合されたペア数
@@ -182,12 +182,12 @@ class ConflictResolver:
             self._log_op_stats(stats)
             return 0
 
-        # 事前ヘルスチェック: アシストモデルが応答不能ならスキップ
+        # 事前ヘルスチェック: 補助タスクが応答不能ならスキップ
         if hasattr(llm_client, "health_check"):
             healthy = await llm_client.health_check()
             if not healthy:
                 logger.warning(
-                    "Assist model unhealthy, skipping conflict resolution "
+                    "Aux task unhealthy, skipping conflict resolution "
                     "(%d pairs detected)",
                     len(pairs),
                 )
@@ -236,7 +236,7 @@ class ConflictResolver:
 
             # 実類似度が min_merge_similarity 未満なら LLM 呼び出しを
             # スキップし低優先度扱い。detect の閾値は広めに (0.85) 候補抽出に用い、
-            # LLM 統合はより厳しい閾値で絞ることで無駄な assist 呼び出しを削減する。
+            # LLM 統合はより厳しい閾値で絞ることで無駄な aux 呼び出しを削減する。
             if note_a.embedding is not None and note_b.embedding is not None:
                 sim = float(np.dot(note_a.embedding, note_b.embedding))
                 if sim < self.min_merge_similarity:
@@ -348,7 +348,7 @@ class ConflictResolver:
         try:
             # timeout は明示せず purpose="conflict_resolution" の解決に委ねる。
             # 明示 timeout は反応的自己較正 (_calibrated_timeouts) より優先されて
-            # しまい、低速 assist (iGPU + 4B) で 15s 固定のまま ReadTimeout を連発し
+            # しまい、低速 aux (iGPU + 4B) で 15s 固定のまま ReadTimeout を連発し
             # SemMem auto-merge と学習を停滞させていた。purpose 既定 15s + 較正で
             # 実レイテンシに追従させる (背景処理なので per-attempt 延長の体感影響なし)。
             gen_kwargs: dict = {

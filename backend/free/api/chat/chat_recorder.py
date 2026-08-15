@@ -125,7 +125,7 @@ def _attach_rag_judge_answer(
 ) -> None:
     """RAG 判定イベントへ、確定した応答本文を紐付ける。
 
-    necessity/quality の assist 判定はターンの先頭で走るため、記録時点では
+    necessity/quality の aux 判定はターンの先頭で走るため、記録時点では
     応答本文が存在しない。ここで結びつけておかないと sleep-time のキュレータが
     STM を引き直すことになり、light サイクルの eviction 済みターンでは答えが
     見つからず学習信号が落ちる (2026-08-01 プロファイリング: 生成 181 件に対し
@@ -134,7 +134,7 @@ def _attach_rag_judge_answer(
     全ての ``record_*_response`` から呼ぶ。網羅は
     ``test_chat_recorder.py::TestRagJudgeAnswerAttachment`` が静的に強制する。
     """
-    log = getattr(state, "rag_judge_assist_log", None)
+    log = getattr(state, "rag_judge_log", None)
     if log is None or not full_response:
         return
     try:

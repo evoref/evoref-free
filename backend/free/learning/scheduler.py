@@ -1,7 +1,7 @@
 """LearningScheduler: Level 1〜2 の学習サイクルを管理
 
 Level 1: アイドル時のモード別システムプロンプト進化（Darwinian Evolver）
-         + アシストモデルのタスク別プロンプト進化（§7.1.2, Pro 以上）
+         + 補助タスクのタスク別プロンプト進化（§7.1.2, Pro 以上）
 Level 2: 夜間 SPSA による LoRA 微調整（Pro 専用、Level2Runner で注入）
 """
 
@@ -57,7 +57,7 @@ def _aggregate_mutation_health(results: dict) -> tuple[int, int]:
 
     ``results`` の値は ``EvolutionResult`` (run_or_resume_level1) か結果 dict
     (_run_level1 の phase 別 dict) のいずれか。変異統計を持たない phase
-    (assist/embed/extra) は 0 として扱う。``(attempts, failures)`` を返す。
+    (aux/embed/extra) は 0 として扱う。``(attempts, failures)`` を返す。
     """
     attempts = 0
     failures = 0
@@ -138,7 +138,7 @@ class LearningScheduler:
         )
 
     def _init_level2_params(self, learning: dict) -> None:
-        """Level 2 (ベースモデル + アシストモデル §7.5.1) パラメータを設定する。"""
+        """Level 2 (ベースモデル §7.5.1) パラメータを設定する。"""
         self.min_failures: int = learning.get("level2_min_failures", 50)
         # モード別の発火閾値 (未指定モードは min_failures にフォールバック)。
         # create は経験が溜まりにくく、chat と同じ閾値だと永久に発火しないか、
@@ -158,20 +158,32 @@ class LearningScheduler:
         self.level2_recheck_interval_sec: float = float(
             learning.get("level2_recheck_interval_sec", 300),
         )
-        self.assist_min_experiences: int = learning.get(
-            "assist_level2_min_experiences", 30,
+        # 連続で改善が採用されなかった target を延長クールダウンへ落とす閾値と、
+        # そのときに使う待機時間。1 サイクル 1 時間規模の実推論最適化が空振りし
+        # 続ける局面 (探索が局所最適に張り付いた状態) で 24h 間隔を回し続けても
+        # 得るものが無いため、間隔を伸ばして次のデータ蓄積を待つ。
+        self.level2_stale_streak: int = max(
+            1, int(learning.get("level2_stale_streak", 2)),
         )
-        self.assist_spsa_iterations: int = learning.get(
-            "assist_spsa_iterations", 300,
+        self.level2_stale_backoff_hours: float = float(
+            learning.get("level2_stale_backoff_hours", 72.0),
         )
-        # assist=B 実推論 eval は 1 反復で候補サーバを複数回起動するため、real-eval
-        # 有効時 (harness 利用可) は専用の低い反復数を使う (既定 30)。no-op eval 時は
-        # 従来の assist_spsa_iterations を使う。
-        self.assist_realeval_spsa_iterations: int = learning.get(
-            "assist_realeval_spsa_iterations", 30,
+        # 採用に必要な最小改善幅 (baseline_loss に対する相対比)。実推論 eval は
+        # 決定論的なので微小差も「実差」ではあるが、少数ケースの held-out に対する
+        # 0.0x% の改善は汎化ではなく当該ケースへの過適合で、版だけが増える。
+        self.level2_min_improvement_ratio: float = max(
+            0.0, float(learning.get("level2_min_improvement_ratio", 0.001)),
         )
-        self.assist_sparse_params: int = learning.get(
-            "assist_sparse_params", 100,
+        # SPSA の best が更新されないまま何反復続いたら打ち切るか (0 で無効)。
+        # 実推論 eval は 1 反復 = 候補サーバ 2 起動と高価なため、空振りが確定
+        # している探索を最後まで回さない。
+        self.level2_early_stop_patience: int = max(
+            0, int(learning.get("level2_early_stop_patience", 10)),
+        )
+        # 候補評価用の使い捨てサーバに --no-warmup を付けるか (旧 llama.cpp で
+        # 非対応の場合のみ false)。
+        self.level2_eval_no_warmup: bool = bool(
+            learning.get("level2_eval_no_warmup", True),
         )
         # Level 2 最適化器切替
         self.optimizer_type: str = learning.get("optimizer", "spsa")
@@ -188,11 +200,11 @@ class LearningScheduler:
         )
         # Level 2 base=C: control vector (既定 'lora' = 既存 SPSA/LoRA 経路、挙動変更なし)
         self.level2_base_method: str = learning.get("level2_base_method", "lora")
-        # Level 2 base/assist アダプタの (mode) パーティション粒度。既定 "model"
+        # Level 2 base アダプタの (mode) パーティション粒度。既定 "model"
         # (chat/create で 1 アダプタ共有、挙動変更なし)。"model_mode" で
         # Level2Runner が chat/create を交互に別サイクルとして訓練する。
         self.level2_adapter_partition: str = learning.get("level2_adapter_partition", "model")
-        # base=spsa-real-eval: assist=B と対称の実推論 eval (既定は assist と同じ値)
+        # base=spsa-real-eval: 候補 LoRA を ephemeral サーバで実推論評価する
         self.base_realeval_spsa_iterations: int = int(
             learning.get("base_realeval_spsa_iterations", 30)
         )
@@ -215,45 +227,14 @@ class LearningScheduler:
         self.cvector_min_experiences: int = int(
             learning.get("cvector_min_experiences", 40)
         )
-        # Level 2 assist=B: 実推論 eval (既定 'none' = 現状の no-op eval_func を維持)
-        self.level2_assist_method: str = learning.get("level2_assist_method", "none")
-        self.assist_eval_scratch_port: int = int(
-            learning.get("assist_eval_scratch_port", 8090)
-        )
-        self.assist_eval_loss_w1: float = float(
-            learning.get("assist_eval_loss_w1", 0.7)
-        )
-        self.assist_eval_loss_w2: float = float(
-            learning.get("assist_eval_loss_w2", 0.3)
-        )
-        self.assist_eval_max_tokens: int = int(
-            learning.get("assist_eval_max_tokens", 64)
-        )
-        self.assist_eval_max_cases: int = int(
-            learning.get("assist_eval_max_cases", 20)
-        )
-        self.assist_eval_health_timeout: int = int(
-            learning.get("assist_eval_health_timeout", 120)
-        )
-        self.assist_bootstrap_enabled: bool = bool(
-            learning.get("level2_assist_bootstrap_enabled", False)
-        )
-        self.assist_bootstrap_rank: int = int(
-            learning.get("level2_assist_bootstrap_rank", 8)
-        )
-        self.assist_bootstrap_init_sigma: float = float(
-            learning.get("level2_assist_bootstrap_init_sigma", 1e-4)
-        )
 
     def _init_phase4_and_mutator_config(self, learning: dict) -> None:
-        """トークン予算進化 + §7.1.3 変異生成 LLM 設定"""
+        """トークン予算進化の設定"""
         self.budget_generations: int = learning.get("budget_generations", 5)
         self.budget_sigma: float = learning.get("budget_sigma", 0.05)
         self.budget_max_total_ratio: float = learning.get(
             "budget_max_total_ratio", 0.7,
         )
-        self._prompt_mutator_base: str = learning.get("prompt_mutator_base", "assist")
-        self._prompt_mutator_assist: str = learning.get("prompt_mutator_assist", "main")
 
     def _init_lazy_injected_slots(self) -> None:
         """`lifespan` / Pro プラグインから後注入されるコンポーネントの初期値を設定。"""
@@ -279,14 +260,9 @@ class LearningScheduler:
         # 品質ゲート 還流パイプ
         self._feedback_pipe = None
         self._last_feedback_summary: dict = {}
-        # アシストモデル用コンポーネント (Pro プラグインから注入)
-        self.assist_experience_buf = None
-        self.assist_version_manager = None
-        self.eval_assist_manager = None
-        self.assist_prompt_mgr = None
-        self.assist_prompt_evolver = None
-        # LLM クライアント参照 (Pro プラグインから注入)
-        self.assist_llm_client = None
+        # 補助タスク用コンポーネント (Pro プラグインから注入)
+        self.aux_prompt_mgr = None
+        self.aux_prompt_evolver = None
         # ランタイム注入用 callable / runner
         self._task: asyncio.Task | None = None
         self._user_active_checker = None  # callable: () -> bool
@@ -296,15 +272,18 @@ class LearningScheduler:
         """ランタイム mutable state + パス + Level1Session 関連の初期化。"""
         self._cancelled = False
         self._running = False
-        # Level 2 学習タスク実行中の対象 ("base" | "assist" | None)。
-        # base/assist 個別の「学習中」表示用に Level2Runner が set/clear する。
+        # Level 2 学習タスク実行中の対象 ("base" | None)。
+        # 「学習中」表示用に Level2Runner が set/clear する。
         self._running_target: str | None = None
         self._last_run: float = 0.0
-        # target ("base"/"assist") 別の最終 Level 2 実行時刻。単一 float 共有
-        # だった旧仕様では、base (cvector) の失敗が assist (SPSA) の overdue
+        # target 別の最終 Level 2 実行時刻 (現在は "base" のみ)。単一 float 共有
+        # だった旧仕様では、base (cvector) の失敗が別 target の overdue
         # 判定まで巻き込み、経験が閾値を超えていても 24h ブロックしていた
         # 回帰 (2026-07-18) の修正で target 別 dict に分離した。
         self._last_level2_run: dict[str, float] = {}
+        # target 別の「連続で改善が採用されなかった回数」。`is_level2_overdue`
+        # が延長クールダウンへ落とす判断に使う (採用成功で 0 へリセット)。
+        self._level2_no_improve_streak: dict[str, int] = {}
         self._level1_run_count: int = 0
         self._last_level1_results: dict = {}
         self._fitness_history: dict[str, list[dict]] = {}
@@ -329,6 +308,7 @@ class LearningScheduler:
         cartridge_mgr=None,
         version_manager=None,
         eval_core_manager=None,
+        aux_experience_buf=None,
         debug_logger=None,
         policy: PolicyInterpreter | None = None,
         disabled: bool = False,
@@ -353,6 +333,9 @@ class LearningScheduler:
         self.cartridge_mgr = cartridge_mgr
         self.version_manager = version_manager
         self.eval_core_manager = eval_core_manager
+        # 補助タスク (rag_necessity / rag_quality / tool_call / note_evolve) の
+        # 経験バッファ。Level 1 Phase 2 の補助プロンプト進化がこれを読む。
+        self.aux_experience_buf = aux_experience_buf
         self._debug_logger = debug_logger
         self._evolver = PromptEvolver()
 
@@ -392,6 +375,7 @@ class LearningScheduler:
             return
         self._last_run = state.last_level1_run
         self._last_level2_run = dict(state.last_level2_run)
+        self._level2_no_improve_streak = dict(state.level2_no_improve_streak)
         self._level1_run_count = state.level1_run_count
         self._last_level1_results = state.last_level1_results
         self._fitness_history = state.fitness_history
@@ -412,6 +396,7 @@ class LearningScheduler:
                 LearningState(
                     last_level1_run=self._last_run,
                     last_level2_run=self._last_level2_run,
+                    level2_no_improve_streak=self._level2_no_improve_streak,
                     level1_run_count=self._level1_run_count,
                     last_level1_results=self._last_level1_results,
                     fitness_history=self._fitness_history,
@@ -446,10 +431,58 @@ class LearningScheduler:
         except Exception as e:
             logger.warning("Failed to save policy evolver state: %s", e)
 
-    def record_level2_run(self, target: str = "base") -> None:
-        """target ("base"/"assist") の Level 2 実行時刻を記録して永続化する"""
+    def record_level2_run(
+        self, target: str = "base", *, improved: bool | None = None,
+    ) -> None:
+        """target ("base") の Level 2 実行時刻を記録して永続化する。
+
+        Args:
+            target: "base"
+            improved: そのサイクルで改善版を採用できたか。``True`` で連続無改善
+                ストリークをリセット、``False`` でインクリメントする。``None``
+                (既定) は判定不能 (early return / 例外 / 手動記録) を意味し、
+                ストリークを触らない — 空振りと区別できない事象でクールダウンを
+                伸ばすと、データが揃った直後の 1 回目まで巻き添えで待たされる。
+        """
         self._last_level2_run[target] = time.time()
+        if improved is True:
+            self._level2_no_improve_streak[target] = 0
+        elif improved is False:
+            self._level2_no_improve_streak[target] = (
+                self._level2_no_improve_streak.get(target, 0) + 1
+            )
         self._save_state()
+
+    def level2_no_improve_streak(self, target: str = "base") -> int:
+        """target の連続無改善回数 (採用に成功すると 0 に戻る)。"""
+        return self._level2_no_improve_streak.get(target, 0)
+
+    def level2_cooldown_hours(self, target: str = "base") -> float:
+        """target に現在適用される Level 2 クールダウン時間 (h)。
+
+        連続無改善が ``level2_stale_streak`` 回に達した target は
+        ``level2_stale_backoff_hours`` へ落ちる。
+        """
+        if self.level2_no_improve_streak(target) >= self.level2_stale_streak:
+            return max(self.level2_overdue_hours, self.level2_stale_backoff_hours)
+        return self.level2_overdue_hours
+
+    def is_level2_overdue(self, target: str = "base") -> bool:
+        """target の Level 2 が overdue (クールダウン経過済み) か。
+
+        Level 2 発火のタイミングゲートの **単一の述語**。常駐ループ
+        (`SleepTimeScheduler._schedule_level2_loop`) の安価な事前チェックと、
+        Level2Runner が実際に起動する target ごとの本ゲートの双方がこれを使う。
+
+        両者が別々の判定を持っていた旧実装では、ループが「次に試す target」
+        (= 実行されない target) で判定する一方で実際に走るのは base だったため、
+        一度も実行されない target の経過時間が恒久的に ``inf`` となりゲートが
+        開きっぱなしになっていた (実機で Level 2 が 10 時間連続稼働)。判定を
+        実行 target と同じ軸へ揃えるのが本メソッドの存在理由。
+        """
+        return self.seconds_since_level2_run(target) >= (
+            self.level2_cooldown_hours(target) * 3600.0
+        )
 
     def seconds_since_level2_run(self, target: str = "base") -> float:
         """target の前回 Level 2 実行からの経過秒。未実行は inf。
@@ -463,19 +496,6 @@ class LearningScheduler:
         if last <= 0:
             return float("inf")
         return max(0.0, time.time() - last)
-
-    def next_level2_target(self) -> str:
-        """次に試行される Level 2 ターゲット ("base"/"assist") を返す。
-
-        Pro の ``Level2Runner`` が注入されていればその交互スケジュール状態
-        (公開プロパティ ``next_target``) を、Free 版 (runner 未注入) は
-        常に "base" を返す。overdue ゲート (SleepTimeScheduler の常駐ループ)
-        が「次に試す方の target」を対象に判定できるようにするための問い合わせ用。
-        """
-        runner = self._level2_runner
-        if runner is not None:
-            return str(getattr(runner, "next_target", "base"))
-        return "base"
 
     def set_user_active_checker(self, checker) -> None:
         """ユーザーアクティブ判定関数を設定（Level 2 中断用）"""
@@ -608,71 +628,55 @@ class LearningScheduler:
         self._level2_runner = runner
         logger.info("Level 2 runner set")
 
-    def set_assist_components(self, components) -> None:
-        """アシストモデル + Level 2 拡張コンポーネントを一括注入する
+    def set_learn_components(self, components) -> None:
+        """補助タスク + Level 2 拡張コンポーネントを一括注入する
 
-        旧 ``inject_assist_components(scheduler, buf, vm, eval_mgr, ...)`` の
-        位置引数 7 本を :class:`~backend.free.learning.protocols.AssistComponentsProtocol`
+        旧 ``inject_learn_components(scheduler, buf, vm, eval_mgr, ...)`` の
+        位置引数 7 本を :class:`~backend.free.learning.protocols.LearnComponentsProtocol`
         インスタンス 1 本に集約する。Protocol の各 Property から
         scheduler の個別フィールドに hydrate する。Protocol の契約どおり、
-        Free 版 (:class:`~backend.free.learning.protocols.NoopAssistComponents`)
+        Free 版 (:class:`~backend.free.learning.protocols.NoopLearnComponents`)
         では全 Property が ``None`` を返すため本メソッドは no-op に近い動作
         となる。
 
         Args:
-            components: :class:`AssistComponentsProtocol` 準拠インスタンス
-                (Pro 版は ``backend.pro.assist_components.ProAssistComponents``,
-                Free 版は ``NoopAssistComponents``)。
+            components: :class:`LearnComponentsProtocol` 準拠インスタンス
+                (Pro 版は ``backend.pro.learn_components.ProLearnComponents``,
+                Free 版は ``NoopLearnComponents``)。
         """
-        self.assist_experience_buf = components.experience_buffer
-        self.assist_version_manager = components.version_manager
-        self.eval_assist_manager = components.eval_manager
-        self.assist_prompt_mgr = components.prompt_manager
-        self.assist_prompt_evolver = components.assist_prompt_evolver
-        self.assist_llm_client = components.assist_client
+        self.aux_prompt_mgr = components.prompt_manager
+        self.aux_prompt_evolver = components.aux_prompt_evolver
+        if components.version_manager is not None:
+            self.version_manager = components.version_manager
         # Level 2 拡張 (Pro 専用): level2_runner は従来の setter 経由でも
         # 注入可能。ここで Protocol 側の値が非 None であれば優先する。
         if components.level2_runner is not None:
             self._level2_runner = components.level2_runner
         logger.info(
-            "Assist components injected: buf=%s, vm=%s, eval=%s, "
-            "prompt_mgr=%s, prompt_evolver=%s, assist_llm=%s, l2_runner=%s",
-            self.assist_experience_buf is not None,
-            self.assist_version_manager is not None,
-            self.eval_assist_manager is not None,
-            self.assist_prompt_mgr is not None,
-            self.assist_prompt_evolver is not None,
-            self.assist_llm_client is not None,
+            "Learn components injected: vm=%s, prompt_mgr=%s, "
+            "prompt_evolver=%s, l2_runner=%s",
+            self.version_manager is not None,
+            self.aux_prompt_mgr is not None,
+            self.aux_prompt_evolver is not None,
             self._level2_runner is not None,
         )
 
-    def _resolve_mutator_client(self, target: str, llm_client):
-        """変異生成に使用する LLM クライアントを設定から解決（§7.1.3）
+    def resolve_idle_task_client(self, llm_client=None):
+        """批評合成 / few-shot 品質採点に使うクライアントを解決する。
 
-        Args:
-            target: "base"（ベースモデル進化）or "assist"（アシストモデル進化）
-            llm_client: デフォルトのベースモデル LLM クライアント
-
-        Returns:
-            変異生成に使用する LLM クライアント
+        ベースモデルを `AuxClient` 越しに使う。両 purpose
+        (`critique_synthesis` / `fewshot_quality_score`) は `PURPOSE_SCHEMAS`
+        登録済みなので文法制約経路を通る。ベースが未接続 / 文法制約非対応なら
+        `None` を返し、呼出側が no-op になる。
         """
-        key = f"prompt_mutator_{target}"
-        mutator = getattr(self, f"_{key}", "main")
+        local = getattr(llm_client, "local", llm_client)
+        if local is None or not hasattr(local, "generate_constrained"):
+            return None
+        from backend.free.llm.aux_client import AuxClient
 
-        match mutator:
-            case "main":
-                return llm_client
-            case "assist":
-                if self.assist_llm_client is not None:
-                    return self.assist_llm_client
-                logger.warning(
-                    "Assist LLM client not available for %s, falling back to main",
-                    key,
-                )
-                return llm_client
-            case _:
-                logger.warning("Unknown %s: %s, using main", key, mutator)
-                return llm_client
+        return AuxClient(
+            local, config=self._config, debug_logger=self._debug_logger,
+        )
 
     def cancel(self, *, graceful: bool = True) -> None:
         """学習を中断する（f_04 §8.3）
@@ -955,7 +959,7 @@ class LearningScheduler:
         両経路から共有される。各 phase は未注入コンポーネント・経験不足・
         cancel を自身でガードして no-op する。
         """
-        await self._level1_phase2_assist_prompt(
+        await self._level1_phase2_aux_prompt(
             experiences, llm_client, results, phase_durations,
         )
         await self._level1_phase3_embed_instruction(
@@ -990,7 +994,7 @@ class LearningScheduler:
 
         `_schedule_level1_loop` から呼ばれるエントリポイント
         本メソッドは prompt evolution 部分を Level1Session で管理し、
-        全モード完了時に追加最適化 (`_run_extra_optimizations`: assist prompt /
+        全モード完了時に追加最適化 (`_run_extra_optimizations`: aux prompt /
         embed instruction / token budget / pattern weights / generation params /
         tool routing / policy evolver / fewshot GC) を続けて実行する。
         yield された場合は prompt evolution の再開を優先し、追加最適化は
@@ -1040,7 +1044,7 @@ class LearningScheduler:
                 # resume 時は同一スナップショットの再投入になるが
                 # FewShotPool 側の多様性チェックが重複を弾く。
                 await self._update_fewshot_pool_from_experiences(
-                    session.experience_snapshot,
+                    session.experience_snapshot, llm_client,
                 )
                 # 進化対象は名前プレフィックス無しの raw 本文。get_prompt() の
                 # 出力 (プレフィックス付き) を渡すと進化後本文へ名前が焼き込まれ、
@@ -1049,11 +1053,10 @@ class LearningScheduler:
                     mode: self.prompt_manager.get_raw_prompt(mode)
                     for mode in self.MODES
                 }
-                mutator_client = self._resolve_mutator_client("base", llm_client)
                 results = await self._evolver.evolve_all_modes(
                     experiences=session.experience_snapshot,
                     prompt_texts=prompt_texts,
-                    llm_client=mutator_client,
+                    llm_client=llm_client,
                     generations=self.generations,
                     population_size=self.population_size,
                     critique_synthesizer=self._critique_synthesizer,
@@ -1286,7 +1289,7 @@ class LearningScheduler:
             "conditions_met": new_count >= self.min_experiences,
             "last_level1_run": self._last_run,
             "last_level2_run": self._last_level2_run,
-            # 実行中の Level 2 対象 ("base"/"assist"/None) と base/assist 個別状態。
+            # 実行中の Level 2 対象 ("base"/None) と base の状態。
             # level2 は Pro (Level2Runner 注入時) のみ非 None。
             "running_target": self._running_target,
             "level2": (
@@ -1415,16 +1418,16 @@ class LearningScheduler:
         logger.info("Level 1 manually triggered (%d experiences)", len(safe_exp))
         return True, f"Level 1 triggered with {len(safe_exp)} experiences"
 
-    def _get_filtered_assist_experiences(self) -> list:
-        """アシスト経験バッファからカートリッジフィルタ適用済みリストを取得"""
-        if self.assist_experience_buf is None:
+    def _get_filtered_aux_experiences(self) -> list:
+        """補助タスク経験バッファからカートリッジフィルタ適用済みリストを取得"""
+        if self.aux_experience_buf is None:
             return []
 
         current_cart_ids = None
         if self.cartridge_mgr is not None:
             current_cart_ids = frozenset(self.cartridge_mgr.loaded.keys())
 
-        return self.assist_experience_buf.get_filtered(current_cart_ids)
+        return self.aux_experience_buf.get_filtered(current_cart_ids)
 
     async def _run_level1(
         self,
@@ -1434,7 +1437,7 @@ class LearningScheduler:
         """Level 1 プロンプト進化を実行
 
         ベースモデルのモード別プロンプト進化
-        アシストモデルのタスク別プロンプト進化（Pro 以上, §7.1.2）
+        補助タスクのタスク別プロンプト進化（Pro 以上, §7.1.2）
         エンベッド検索指示プロンプト進化（f_04 §4.2）
         トークン予算比率進化（f_09 §12）
         パターン重み進化
@@ -1464,7 +1467,7 @@ class LearningScheduler:
                 "Level 1 evolution started (%d experiences, %d generations)",
                 len(experiences), self.generations,
             )
-            await self._update_fewshot_pool_from_experiences(experiences)
+            await self._update_fewshot_pool_from_experiences(experiences, llm_client)
 
             # Step 11 — Critique-Synthesis
             # 失敗パターン批評を base prompt 進化より前に明示的に実行し、結果を
@@ -1534,20 +1537,22 @@ class LearningScheduler:
     # ── Level 1 ヘルパー: 各サブステップの実装 ──
 
     async def _update_fewshot_pool_from_experiences(
-        self, experiences: list[dict],
+        self, experiences: list[dict], llm_client=None,
     ) -> None:
         """Few-shot プール更新 + 未採点例への品質採点。
 
         採点はプールに入った例の **順位付け** にのみ効き、採用可否は決めない
-        (``FewShotPool.score_pending_quality`` の docstring 参照)。assist 未接続
-        なら採点は no-op で、従来どおり fitness だけで順位付けされる。
+        (``FewShotPool.score_pending_quality`` の docstring 参照)。採点クライアント
+        が無ければ no-op で、従来どおり fitness だけで順位付けされる。
         """
         if self._fewshot_pool is None:
             return
         added = self._fewshot_pool.add_from_experiences(experiences)
         if added:
             logger.info("Fewshot pool updated: %d new examples added", added)
-        await self._fewshot_pool.score_pending_quality(self.assist_llm_client)
+        await self._fewshot_pool.score_pending_quality(
+            self.resolve_idle_task_client(llm_client),
+        )
 
     def _collect_mode_prompt_texts(self) -> dict[str, str]:
         """モード別の生プロンプトテキストを収集（取得失敗モードはスキップ）"""
@@ -1576,10 +1581,7 @@ class LearningScheduler:
             logger.warning("No prompts available for evolution")
             return False
 
-        # 変異生成 LLM を解決（§7.1.3）
-        base_mutator = self._resolve_mutator_client("base", llm_client)
-        if base_mutator is not llm_client:
-            logger.info("Resolved separate base mutator client for prompt evolution")
+        base_mutator = llm_client
 
         tp = time.monotonic()
         # Step 11 で先行実行済みなら結果を再利用する
@@ -1635,43 +1637,41 @@ class LearningScheduler:
             mode, evo_result.initial_fitness, evo_result.final_fitness,
         )
 
-    async def _level1_phase2_assist_prompt(
+    async def _level1_phase2_aux_prompt(
         self,
         experiences: list[dict],  # noqa: ARG002
         llm_client,
         results: dict[str, dict],
         phase_durations: dict[str, float],
     ) -> None:
-        """アシストモデルのタスク別プロンプト進化（§7.1.2）"""
+        """補助タスクのタスク別プロンプト進化（§7.1.2）"""
         if self._cancelled:
             return
-        if self.assist_prompt_evolver is None or self.assist_prompt_mgr is None:
+        if self.aux_prompt_evolver is None or self.aux_prompt_mgr is None:
             return
 
-        assist_experiences = self._get_filtered_assist_experiences()
-        if not assist_experiences:
-            logger.info("Level 1 assist prompt evolution skipped: no assist experiences")
+        aux_experiences = self._get_filtered_aux_experiences()
+        if not aux_experiences:
+            logger.info("Level 1 aux prompt evolution skipped: no aux experiences")
             return
 
         logger.info(
-            "Level 1 assist prompt evolution (%d assist experiences)",
-            len(assist_experiences),
+            "Level 1 aux prompt evolution (%d aux experiences)",
+            len(aux_experiences),
         )
-        assist_mutator = self._resolve_mutator_client("assist", llm_client)
-
         tp = time.monotonic()
-        assist_results = await self.assist_prompt_evolver.evolve_all_tasks(
-            assist_experiences=assist_experiences,
-            prompt_mgr=self.assist_prompt_mgr,
-            mutator_client=assist_mutator,
+        aux_results = await self.aux_prompt_evolver.evolve_all_tasks(
+            aux_experiences=aux_experiences,
+            prompt_mgr=self.aux_prompt_mgr,
+            mutator_client=llm_client,
             generations=self.generations,
             population_size=self.population_size,
         )
-        phase_durations["phase2_assist_prompt"] = round(time.monotonic() - tp, 3)
+        phase_durations["phase2_aux_prompt"] = round(time.monotonic() - tp, 3)
 
-        # アシスト進化結果もメインの results に含める
-        for task, evo_result in assist_results.items():
-            results[f"assist_{task}"] = {
+        # 補助プロンプトの進化結果もメインの results に含める
+        for task, evo_result in aux_results.items():
+            results[f"aux_{task}"] = {
                 "improved": evo_result.final_fitness > evo_result.initial_fitness,
                 "fitness_before": evo_result.initial_fitness,
                 "fitness_after": evo_result.final_fitness,
@@ -1709,7 +1709,7 @@ class LearningScheduler:
             "Level 1 embed instruction evolution (%d RAG experiences)",
             len(rag_exp),
         )
-        base_mutator = self._resolve_mutator_client("base", llm_client)
+        base_mutator = llm_client
         current_instruction = self._load_embed_instruction()
         tp = time.monotonic()
         evo_result = await self._embed_instruction_evolver.evolve_instruction(
@@ -2394,10 +2394,9 @@ class LearningScheduler:
         lora_path: Path | None = None,
         current_model: str = "",
         base_model_path: Path | None = None,
-        assist_lora_path: Path | None = None,
-        assist_model_path: Path | None = None,
+        force: bool = False,
     ) -> bool:
-        """Level 2 トリガー判定と実行開始（ベース/アシスト交互スケジュール）
+        """Level 2 トリガー判定と実行開始（ベースモデル）
 
         Pro 版: Level2Runner に委譲。
         Free 版: _level2_runner が None のため常に False。
@@ -2407,8 +2406,8 @@ class LearningScheduler:
             lora_path: ベースモデル LoRA アダプタパス
             current_model: 現在のベースモデルファイル名（base_model フィルタ用）
             base_model_path: ベースモデル GGUF パス（LoRA ターゲット自動判定用）
-            assist_lora_path: アシストモデル LoRA アダプタパス
-            assist_model_path: アシストモデル GGUF パス
+            force: overdue クールダウンを無視して即時試行する（手動トリガ用）。
+                データ量・実行中・アダプタ互換の各ゲートは維持する。
 
         Returns:
             学習を開始したかどうか
@@ -2424,8 +2423,7 @@ class LearningScheduler:
             lora_path=lora_path,
             current_model=current_model,
             base_model_path=base_model_path,
-            assist_lora_path=assist_lora_path,
-            assist_model_path=assist_model_path,
+            force=force,
         )
 
 

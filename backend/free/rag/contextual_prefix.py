@@ -1,7 +1,7 @@
 """Contextual Retrieval プレフィックス生成
 
 Anthropic 方式の Contextual Retrieval を実装する。
-チャンク登録時にアシストモデルでドキュメント全体の文脈を要約した
+チャンク登録時に補助タスクでドキュメント全体の文脈を要約した
 50-100 トークンのプレフィックスを付加し、検索精度を向上させる。
 
 参考: https://www.anthropic.com/news/contextual-retrieval
@@ -16,7 +16,7 @@ import httpx
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
-    from backend.free.llm.assist_client import AssistModelClient
+    from backend.free.llm.aux_client import AuxClient
 
 logger = get_logger("rag.contextual_prefix")
 
@@ -41,17 +41,17 @@ _DEFAULT_PREFIX_PROMPT = """\
 
 
 class ContextualPrefixGenerator:
-    """アシストモデルを使ったコンテキストプレフィックス生成"""
+    """補助タスクを使ったコンテキストプレフィックス生成"""
 
-    def __init__(self, assist_client: AssistModelClient, config: dict):
-        self.assist_client = assist_client
+    def __init__(self, aux_client: AuxClient, config: dict):
+        self.aux_client = aux_client
         rag_cfg = config.get("rag", {})
         # 設定は rag.contextual_prefix 配下のネスト構造
         cp_cfg = rag_cfg.get("contextual_prefix", {}) or {}
         self.max_tokens: int = int(cp_cfg.get("max_tokens", 128))
         self.max_doc_chars: int = int(cp_cfg.get("max_doc_chars", 6000))
         # プロンプトテンプレート。空 (既定) なら _DEFAULT_PREFIX_PROMPT を使用。
-        # 多言語対応 / 英語専用アシストモデル切替時はここを config で上書き。
+        # 多言語対応 / 英語専用補助タスク切替時はここを config で上書き。
         prompt_template = str(cp_cfg.get("prompt_template", "") or "").strip()
         self._prompt_template: str = prompt_template or _DEFAULT_PREFIX_PROMPT
         self._consecutive_failures: int = 0
@@ -80,7 +80,7 @@ class ContextualPrefixGenerator:
             # prefill を llama-server 側の KV キャッシュで再利用するため有効化
             # する。prompt 構造は {document(固定)} ... {chunk(可変)} の順なので、
             # 2 チャンク目以降はドキュメント部分の prefill がほぼゼロになる。
-            result = await self.assist_client.generate(
+            result = await self.aux_client.generate(
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=self.max_tokens,
                 temperature=0.3,

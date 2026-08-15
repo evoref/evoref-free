@@ -1,5 +1,8 @@
 """設定管理とパス解決"""
 
+import importlib.util
+import sys
+
 import yaml
 from pathlib import Path
 
@@ -49,16 +52,13 @@ class PathResolver:
         "lora_adapter": "local/models/adapter.gguf",
         "lora_versions_dir": "local/lora_versions/",
         "lora_spsa_checkpoint": "local/models/lora_spsa_checkpoint.json",
-        "assist_lora_adapter": "local/models/assist_adapter.gguf",
-        "assist_lora_versions_dir": "local/models/assist_lora_versions/",
-        "assist_lora_spsa_checkpoint": "local/models/assist_lora_spsa_checkpoint.json",
         # Level 2 base=C: control vector 本体 / 版管理 / 作業用ディレクトリ
         "control_vector_adapter": "local/models/control_vector.gguf",
         "control_vector_versions_dir": "local/models/control_vector_versions/",
         "cvector_work_dir": "local/cvector/",
-        "experience_assist_file": "local/experience_assist.json",
-        "eval_assist_file": "local/eval_assist.json",
-        "assist_calibration_file": "local/assist_calibration.json",
+        "aux_experience_file": "local/aux_experience.json",
+        "aux_prompts_dir": "local/aux_prompts/",
+        "aux_calibration_file": "local/aux_calibration.json",
         "rag_judge_events_file": "local/rag_judge_events.jsonl",
         "lora_archive_dir": "local/lora_archive/",
         "embed_lora_adapter": "local/models/embed_adapter.gguf",
@@ -89,11 +89,16 @@ class PathResolver:
     }
 
     # resolve_learning で active モデルパーティション配下へ rebase する base 学習キーと、
-    # ``learning_dir/<stem>/`` からの相対サブパス。ここに無いキー (assist / 共有 / embed)
-    # は resolve_local へ素通しする (assist_* や memory_dir を巻き込まないため allow-list)。
+    # ``learning_dir/<stem>/`` からの相対サブパス。ここに無いキー (共有 / embed)
+    # は resolve_local へ素通しする (memory_dir を巻き込まないため allow-list)。
     _LEARNING_SUBPATH = {
         "experience_file": "experience.json",
         "prompts_dir": "prompts",
+        # 補助タスク (rag_necessity / rag_quality / tool_call / note_evolve) の
+        # プロンプトと経験。判定はベースモデルが行うので base 軸で分離する
+        # (モデルを替えたら進化済みの文面を引き継がず既定から作り直す)。
+        "aux_prompts_dir": "aux_prompts",
+        "aux_experience_file": "aux_experience.json",
         "lora_adapter": "models/adapter.gguf",
         "lora_versions_dir": "models/lora_versions",
         "lora_spsa_checkpoint": "models/lora_spsa_checkpoint.json",
@@ -111,16 +116,6 @@ class PathResolver:
         {"lora_adapter", "lora_versions_dir", "lora_spsa_checkpoint"},
     )
 
-    # resolve_assist_learning で使う assist LoRA 用の (mode のみ) パーティション先。
-    # base の ``_LEARNING_SUBPATH`` と異なり model stem 軸を持たない
-    # (``learning_dir/assist/<mode>/...``) — assist は経験/プロンプトがモデル
-    # 非依存という既存設計 (docs/f_04_self_learning.md) を維持するため。
-    _ASSIST_MODE_SUBPATH = {
-        "assist_lora_adapter": "adapter.gguf",
-        "assist_lora_versions_dir": "lora_versions",
-        "assist_lora_spsa_checkpoint": "lora_spsa_checkpoint.json",
-    }
-
     def __init__(self, config: dict, project_root: Path):
         self.root = project_root
         self.models = config.get("model_paths", {})
@@ -135,9 +130,8 @@ class PathResolver:
         # embed_instruction 系データの (embedding モデル) パーティション state。
         # base 学習パーティション (_active_stem) とは独立した軸。
         self._active_embed_stem: str | None = None
-        self._active_assist_stem: str | None = None
-        # Level 2 base/assist LoRA アダプタの (mode) パーティション state。
-        # "model" (既定) では resolve_learning/resolve_assist_learning は mode 引数を
+        # Level 2 base LoRA アダプタの (mode) パーティション state。
+        # "model" (既定) では resolve_learning は mode 引数を
         # 無視し、従来どおりモデル単位で 1 アダプタを共有する。"model_mode" のときのみ
         # chat/create で別ファイルへ分離する。AppState.current_mode の初期値と揃え、
         # active_mode の既定は "chat"。
@@ -151,7 +145,7 @@ class PathResolver:
 
         config の ``model_paths[key]`` を優先し、無ければ ``MODEL_DEFAULTS[key]``
         を使う。``dict.get(key, MODEL_DEFAULTS[key])`` は default 引数を先に評価
-        するため、``MODEL_DEFAULTS`` に無いキー (assist_model / embed_model /
+        するため、``MODEL_DEFAULTS`` に無いキー (embed_model /
         create_model 等) を config 側に持っていても KeyError で落ちていた。
         """
         raw = self.models.get(key) or self.MODEL_DEFAULTS.get(key)
@@ -215,36 +209,16 @@ class PathResolver:
             return self.resolve_local("prompts_dir")
         return self.resolve_local("learning_dir") / "embed" / self._active_embed_stem
 
-    @property
-    def active_assist_model_stem(self) -> str | None:
-        """assist プロンプトパーティションの active アシストモデル stem。"""
-        return self._active_assist_stem
+    def resolve_aux_prompt_dir(self) -> Path:
+        """補助タスクプロンプトの保存先を **ベースモデル単位**で解決する。
 
-    def set_active_assist_model_stem(self, stem: str | None) -> None:
-        """assist プロンプトパーティションの active モデル stem を設定する。
-
-        base 学習 (``set_active_model_stem``) / embed_instruction
-        (``set_active_embedding_model_stem``) とは独立した第 3 の軸。
-        """
-        self._active_assist_stem = stem or None
-
-    def resolve_assist_prompt_dir(self) -> Path:
-        """アシストプロンプトの保存先を **アシストモデル単位**で解決する。
-
-        アシストプロンプト (rag_necessity / rag_quality / tool_call / note_evolve)
+        補助プロンプト (rag_necessity / rag_quality / tool_call / note_evolve)
         は進化の対象で、進化した文面は **そのモデルの癖に合わせて最適化される**。
-        従来 ``local/prompts/`` に flat 配置されており、アシストモデルを差し替えても
-        前モデル向けに進化した文面がそのまま使われていた。base 学習
-        (``resolve_learning``) と embed_instruction
-        (``resolve_embed_instruction_dir``) は既にモデル別に分かれており、
-        assist だけが取り残されていた。
-
-        partition 無効 / active assist stem 未確定時は ``resolve_local("prompts_dir")``
-        (従来の flat 配置) へ素通しし、後方互換を保つ。
+        判定を実行するのはベースモデルなので、base 学習パーティション
+        (``resolve_learning``) と同じ軸に置き、モデルを差し替えたら既定から
+        作り直す。partition 無効時は ``local/aux_prompts/`` (flat) を返す。
         """
-        if not self._partition_enabled or not self._active_assist_stem:
-            return self.resolve_local("prompts_dir")
-        return self.resolve_local("learning_dir") / "assist" / self._active_assist_stem
+        return self.resolve_learning("aux_prompts_dir")
 
     @property
     def active_mode(self) -> str:
@@ -266,7 +240,7 @@ class PathResolver:
         ``_LEARNING_SUBPATH`` の base 学習キーのみ ``learning_dir/<active_stem>/...``
         配下へ rebase する。partition 無効 (``partition_by_base_model=false`` /
         active stem 未設定) または非対象キーは ``resolve_local`` へ素通しする
-        (assist・共有・レガシー)。``learning_dir`` は ``resolve_local`` 経由で解決
+        (共有・レガシー)。``learning_dir`` は ``resolve_local`` 経由で解決
         するため ``--isolate-data`` の prefix 書換えを自動継承する。
 
         ``mode`` は ``key`` が ``_MODE_PARTITIONED_KEYS`` に属し、かつ
@@ -338,25 +312,6 @@ class PathResolver:
         ):
             root = root / mode
         return root / self._LEARNING_SUBPATH[key]
-
-    def resolve_assist_learning(self, key: str, mode: str | None = None) -> Path:
-        """assist LoRA アダプタ/バージョン履歴/チェックポイントを **mode 単位**で解決する。
-
-        base の ``resolve_learning`` と異なり model stem 軸を持たない — assist の
-        経験・プロンプトはモデル識別子で分離しない既存方針 (docs/f_04_self_learning.md)
-        を踏襲し、``adapter_partition_mode=="model_mode"`` のときのみ
-        ``learning_dir/assist/<mode>/...`` という mode のみの軸を新設する。
-        非対象キー / "model" (既定) スキームは ``resolve_local`` へ素通しする
-        (従来の flat 配置、後方互換)。``mode`` 省略時は ``resolve_learning`` と同様
-        ``active_mode`` を使う。
-        """
-        if key not in self._ASSIST_MODE_SUBPATH or self._adapter_partition_mode != "model_mode":
-            return self.resolve_local(key)
-        effective_mode = mode if mode is not None else self._active_mode
-        return (
-            self.resolve_local("learning_dir")
-            / "assist" / effective_mode / self._ASSIST_MODE_SUBPATH[key]
-        )
 
     def _to_absolute(self, raw: str) -> Path:
         path = Path(raw)
@@ -544,15 +499,13 @@ _REASONING_MODES = frozenset({"toggle", "always", "none"})
 def _model_path_for(cfg: dict, target: str) -> Path | None:
     """target のモデル GGUF 絶対パスを解決する。
 
-    target は slot (``"base"`` / ``"assist"``) と mode (``"chat"`` / ``"create"``)
-    の 4 値。``"create"`` のみ ``model_paths.create_model`` を見て、未設定なら
-    base へフォールバックする。モデル未設定時は ``None``。
+    target は slot (``"base"``) と mode (``"chat"`` / ``"create"``) の 3 値。
+    ``"create"`` のみ ``model_paths.create_model`` を見て、未設定なら base へ
+    フォールバックする。モデル未設定時は ``None``。
     """
     model_paths = cfg.get("model_paths", {}) or {}
     base_model = model_paths.get("base_model") or ""
-    if target == "assist":
-        model_rel = model_paths.get("assist_model") or ""
-    elif target == "create":
+    if target == "create":
         model_rel = model_paths.get("create_model") or base_model
     else:
         model_rel = base_model
@@ -648,17 +601,16 @@ def _resolve_profile_sampling_for_mode(cfg: dict, mode: str) -> dict:
 
 
 def _resolve_profile_reasoning(cfg: dict, slot: str) -> dict:
-    """slot ("base"|"assist") のモデルプロファイルから ``reasoning`` を返す。"""
+    """slot ("base") のモデルプロファイルから ``reasoning`` を返す。"""
     return _profile_for(cfg, slot).get("reasoning") or {}
 
 
 def resolve_sampling_params(cfg: dict, target: str) -> dict:
     """target のモデルプロファイルが宣言する sampling パラメータを返す。
 
-    target は slot (``"base"`` / ``"assist"``) と mode (``"chat"`` / ``"create"``)。
-    宣言の無いキーは含まれないので、呼び出し側の既定を潰さない。base 側は
-    :func:`get_mode_generation_params` が ``modes.*`` より優先で適用し、assist 側は
-    ``AssistModelClient`` がリクエスト payload の既定として使う。
+    target は slot (``"base"``) と mode (``"chat"`` / ``"create"``)。
+    宣言の無いキーは含まれないので、呼び出し側の既定を潰さない。
+    :func:`get_mode_generation_params` が ``modes.*`` より優先で適用する。
     """
     return _profile_for(cfg, target).get("sampling") or {}
 
@@ -667,7 +619,7 @@ def resolve_reasoning_mode(
     cfg: dict, slot: str, *, chat_template: str | None = None,
     observed_reasoning_mode: str | None = None,
 ) -> str | None:
-    """slot ("base"|"assist") のモデル arch の reasoning mode を返す。
+    """slot ("base") のモデル arch の reasoning mode を返す。
 
     戻り値: ``"toggle"`` | ``"always"`` | ``"none"`` | ``None`` (不明)。
       - toggle : ``enable_thinking`` で ON/OFF 可 (Qwen3)
@@ -716,9 +668,8 @@ def resolve_enable_thinking(
     > ``None`` で解決する。
 
     Args:
-        slot: ``"base"`` | ``"assist"``。
-        explicit: config 明示値 (base=``llama.enable_thinking`` / assist=
-            ``chat_template_kwargs.enable_thinking``)。未指定は ``None``。
+        slot: ``"base"``。
+        explicit: config 明示値 (``llama.enable_thinking``)。未指定は ``None``。
         chat_template: 取得済みなら渡す (base は ``metadata.chat_template``)。能力 fallback 用。
 
     Returns:
@@ -779,7 +730,7 @@ def _profile_context_size(cfg: dict, target: str) -> int | None:
 
 
 def _resolve_profile_context_size(cfg: dict, slot: str) -> int | None:
-    """slot ("base"|"assist") のプロファイルから ``context_size`` を返す。"""
+    """slot ("base") のプロファイルから ``context_size`` を返す。"""
     return _profile_context_size(cfg, slot)
 
 
@@ -806,19 +757,14 @@ def resolve_context_size_for_mode(cfg: dict, mode: str) -> int:
 
 
 def resolve_context_size(cfg: dict, slot: str) -> int:
-    """slot ("base"|"assist") の有効 context_size を解決する (docs/c_15)。
+    """slot ("base") の有効 context_size を解決する (docs/c_15)。
 
-    優先順位: config 明示 (``llama.context_size`` / ``assist_model.local.context_size``)
-    > arch プロファイル ``context_size`` > 既定 (``_CONTEXT_SIZE_FALLBACK``)。
-    起動フラグ ``-c`` (scripts/launch_llama.py::resolve_context_size_for) と同じ
-    優先順位で解決し、llama-server 起動値とランタイム値 (token budget 表示等) を
-    一致させる。
+    優先順位: config 明示 (``llama.context_size``) > arch プロファイル
+    ``context_size`` > 既定 (``_CONTEXT_SIZE_FALLBACK``)。起動フラグ ``-c``
+    (scripts/launch_llama.py::resolve_context_size_for) と同じ優先順位で解決し、
+    llama-server 起動値とランタイム値 (token budget 表示等) を一致させる。
     """
-    if slot == "assist":
-        local = (cfg.get("assist_model") or {}).get("local") or {}
-        explicit = local.get("context_size")
-    else:
-        explicit = (cfg.get("llama") or {}).get("context_size")
+    explicit = (cfg.get("llama") or {}).get("context_size")
     if explicit is not None:
         return int(explicit)
     profile_ctx = _resolve_profile_context_size(cfg, slot)
@@ -895,29 +841,6 @@ def get_mode_generation_params(mode: str) -> dict:
     return params
 
 
-def get_mode_assist_model_path(mode: str) -> str:
-    """指定モードで使用すべきアシストモデルの GGUF パスを解決する
-
-    create モードで ``model_paths.assist_create_model`` が指定されていれば
-    それを、未指定/空文字列なら ``model_paths.assist_model`` にフォールバック
-    する (``get_mode_generation_params`` の ``create_model`` 解決と対称)。
-
-    Args:
-        mode: "chat" または "create"
-
-    Returns:
-        GGUF パス文字列 (config.yaml からの相対 or 絶対)
-    """
-    cfg = get_config()
-    model_paths = cfg.get("model_paths", {})
-    assist_model = model_paths.get(
-        "assist_model", "models/gemma-4-E4B_q4_0-it.gguf",
-    )
-    if mode == "create":
-        return model_paths.get("assist_create_model") or assist_model
-    return assist_model
-
-
 def get_mode_lora_path(mode: str) -> Path:
     """指定モードで使用すべき base LoRA アダプタの絶対パスを解決する (存在確認はしない)。
 
@@ -938,18 +861,146 @@ def get_mode_lora_path(mode: str) -> Path:
     return resolver.resolve_learning("lora_adapter", mode=effective_mode)
 
 
-def get_mode_assist_lora_path(mode: str) -> Path:
-    """指定モードで使用すべき assist LoRA アダプタの絶対パスを解決する (存在確認はしない)。
+def _lora_compat_check(project_root: Path):
+    """``scripts.launch_llama.lora_compatible_with_model`` を解決する。
 
-    ``get_mode_lora_path`` と対称。"model" (既定) では常に flat 共有パスを返す。
+    ``scripts`` はパッケージとして sys.path 上に無いことがある。特に
+    ``python scripts/launch_llama.py`` (evoref-ctl start が使う本番経路) では
+    ``sys.path[0]`` がスクリプト自身のディレクトリになり project_root が載らない
+    ため、素の ``import scripts.launch_llama`` は ModuleNotFoundError になる。
+    通常 import が通らない場合はファイルパスから解決する。
 
-    Args:
-        mode: "chat" または "create"
+    ロード済みモジュール (launch_llama 自身から呼ばれた場合は ``__main__``) を
+    先に探すのは、2900 行のモジュールを二重実行しないため。
+    """
+    try:
+        from scripts.launch_llama import lora_compatible_with_model
+    except ImportError:
+        pass
+    else:
+        return lora_compatible_with_model
+
+    launch_py = Path(project_root) / "scripts" / "launch_llama.py"
+    for mod in list(sys.modules.values()):
+        fn = getattr(mod, "lora_compatible_with_model", None)
+        mod_file = getattr(mod, "__file__", None)
+        if fn is None or not mod_file:
+            continue
+        try:
+            if Path(mod_file) == launch_py:
+                return fn
+        except (TypeError, ValueError):
+            continue
+
+    spec = importlib.util.spec_from_file_location("_launch_llama_compat", launch_py)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {launch_py}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.lora_compatible_with_model
+
+
+def validate_lora_for_launch(
+    model_path: Path | str,
+    lora_path: Path | None,
+    project_root: Path | None = None,
+) -> tuple[Path | None, bool]:
+    """解決済みの LoRA パスを検証し ``build_*_cmd`` の引数組へ落とす。
+
+    「そのモデル/モードにはまだ学習済みアダプタが無い」ことを
+    ``(None, False)`` = flat フォールバックも踏まない、で表す。flat
+    (``local_paths.lora_adapter``) はパーティション導入前のレガシー配置なので、
+    パーティション運用中に踏むと **別モデル向けの差分を静かに当てる** ことに
+    なりうる (``lora_compatible_with_model`` の系統チェックが守る対象そのもの)。
 
     Returns:
-        解決された絶対パス (ファイルの存在は保証しない)
+        ``(lora_override, lora_fallback)``
     """
-    resolver = get_path_resolver()
-    if resolver.adapter_partition_mode != "model_mode":
-        return resolver.resolve_local("assist_lora_adapter")
-    return resolver.resolve_assist_learning("assist_lora_adapter", mode=mode)
+    if lora_path is None or not Path(lora_path).exists():
+        return None, False
+
+    model_abs = Path(model_path)
+    if not model_abs.is_absolute():
+        model_abs = (project_root or get_project_root()) / model_abs
+
+    # arch / テンソル形状 / 系統 (evoref.trained_on_model) の三層判定。不適合な
+    # アダプタを --lora で渡すと llama-server がプロセスごと落ちるため必須。
+    lora_compatible_with_model = _lora_compat_check(
+        project_root or get_project_root(),
+    )
+    ok, reason = lora_compatible_with_model(model_abs, Path(lora_path))
+    if not ok:
+        logger.warning(
+            "LoRA %s incompatible with model %s (%s); starting without LoRA",
+            lora_path, model_abs, reason,
+        )
+        return None, False
+    return Path(lora_path), False
+
+
+def resolve_base_lora_for_launch(
+    cfg: dict,
+    project_root: Path,
+    mode: str = "chat",
+) -> tuple[Path | None, bool]:
+    """起動時に ``--lora`` へ渡す base LoRA を **cfg だけから** 解決する。
+
+    ``scripts.launch_llama.build_llama_cmd`` の ``lora_override`` /
+    ``lora_fallback`` へそのまま渡せる組を返す、LoRA 適用判断の **単一述語**。
+    base llama-server を起こす経路は 3 つある
+
+    - ``backend.free.cli.service_manager``      (``evoref serve`` の初回起動)
+    - ``backend.free.core.llama_process_manager`` (API からの再起動)
+    - ``backend.free.api.config.mode``          (モード切替に伴う再起動)
+
+    が、従来はモード切替経路だけがパーティション対応の解決を持ち、残る 2 経路は
+    ``build_llama_cmd`` 内の flat フォールバック (``local_paths.lora_adapter``)
+    しか見ていなかった。``partition_by_base_model`` 既定 true では学習済み
+    アダプタは ``local/learning/<model>/[<mode>/]models/adapter.gguf`` に置かれる
+    ため、**通常起動では Level 2 が作ったアダプタが一度もロードされない**
+    (実機で確認: ``GET /lora-adapters`` が空)。全経路をこの関数へ寄せる。
+
+    グローバル ``PathResolver`` (``get_path_resolver``) は **backend プロセスの
+    起動時にしか active stem が確定しない**ため、CLI プロセスからは使えない。
+    ここでは cfg からローカルに ``PathResolver`` を組み、``_pillar_wirer`` と
+    同じ規則 (``model_paths.base_model`` の stem) で active stem を決める。
+
+    Args:
+        cfg: config.yaml をロードした dict
+        project_root: プロジェクトルート絶対パス
+        mode: 起動対象モード ("chat" / "create")。起動時の既定は "chat"
+
+    Returns:
+        ``(lora_override, lora_fallback)``。
+
+        - ``(None, True)``  — パーティション無効。従来どおり flat を探索させる
+        - ``(None, False)`` — パーティション有効だが当該モデル/モードは未学習
+          または非互換。flat も踏ませず「LoRA なし」で起動する
+        - ``(path, False)`` — 学習済みかつ互換。このアダプタを適用する
+    """
+    resolver = PathResolver(cfg, project_root)
+    if not resolver.partition_enabled:
+        return None, True
+
+    model_paths = cfg.get("model_paths", {}) or {}
+    active_stem = Path(Path(model_paths.get("base_model") or "").name).stem
+    if not active_stem:
+        # モデル identity 不明。パーティション根を決められないので従来挙動へ。
+        return None, True
+    resolver.set_active_model_stem(active_stem)
+    resolver.set_active_mode(mode)
+
+    model_raw = mode_base_model_raw(model_paths, mode, default="")
+    if not model_raw:
+        return None, False
+
+    lora_path = resolver.resolve_learning("lora_adapter")
+    override, fallback = validate_lora_for_launch(model_raw, lora_path, project_root)
+    if override is None:
+        logger.info(
+            "No usable base LoRA for mode=%s (%s); starting without --lora",
+            mode, lora_path,
+        )
+    else:
+        logger.info("Applying trained base LoRA for mode=%s: %s", mode, override)
+    return override, fallback
