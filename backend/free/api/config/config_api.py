@@ -59,7 +59,7 @@ def _is_pro() -> bool:
 def _guard_model_paths_immutable(data: dict) -> None:
     """model_paths の model_state 追跡キー変更を 403 で遮断する。
 
-    base/assist/embed のモデルは migrate API 経由でしか変更できない。
+    base/aux/embed のモデルは migrate API 経由でしか変更できない。
     config を直書きすると model_state.json と desync し起動時 mismatch を招くため、
     現在値と異なる追跡キーが含まれていれば 403 を返す。create_model 等の非追跡
     キーは通常通り編集可能 (現在値と一致する追跡キーが同梱されていても許可)。
@@ -223,7 +223,6 @@ async def validate_config_section(section: str, req: ConfigUpdateRequest):
 # 設定変更時にコンポーネント再生成が必要なセクション
 _RELOAD_HANDLERS: dict[str, str] = {
     "embedding": "reload_embedder",
-    "assist_model": "reload_assist_model",
     "instance": "reload_prompt_manager",
     "i18n": "reload_i18n",
 }
@@ -236,7 +235,6 @@ async def _reload_components_if_needed(section: str, state: AppState) -> None:
         return
 
     from backend.free.api.config.component_reload import (
-        reload_assist_model,
         reload_embedder,
         reload_i18n,
         reload_prompt_manager,
@@ -244,7 +242,6 @@ async def _reload_components_if_needed(section: str, state: AppState) -> None:
 
     handlers = {
         "reload_embedder": reload_embedder,
-        "reload_assist_model": reload_assist_model,
         "reload_prompt_manager": reload_prompt_manager,
         "reload_i18n": reload_i18n,
     }

@@ -37,7 +37,7 @@
 	// いたが、既定の level2_adapter_partition="model" ではアダプタがモード非依存で
 	// 切り替えても内容が変わらず、動作していないように見えていた)。
 	let loraModes = $state<DashboardLoraModes>(emptyLoraModes());
-	let improvement = $state<ImprovementSeries>({ base: [], assist: [] });
+	let improvement = $state<ImprovementSeries>({ base: [] });
 	let ragStats: DashboardRagStats = $state({ ...DEFAULT_RAG_STATS });
 	let fetchError = $state(false);
 	let loaded = $state(false);
@@ -87,15 +87,13 @@
 	async function reloadMode(mode: LoraMode) {
 		const updated = await getLoraVersions(mode);
 		const targets = {
-			base: mapLoraTarget(updated.base),
-			assist: mapLoraTarget(updated.assist)
+			base: mapLoraTarget(updated.base)
 		};
 		loraModes = { ...loraModes, [mode]: targets };
 	}
 
 	async function handleRollback(target: LoraTarget, version: number, mode: LoraMode) {
-		const label =
-			target === 'base' ? $t('dashboard.level2_base') : $t('dashboard.level2_assist');
+		const label = $t('dashboard.level2_base');
 		if (!confirm($t('dashboard.rollback_confirm', { target: label, version }))) return;
 
 		try {
@@ -129,6 +127,8 @@
 				newExperienceCount={learningData.new_experience_count}
 				minExperiences={learningData.min_experiences}
 				conditionsMet={learningData.conditions_met}
+				level1BlockedReason={learningData.level1_blocked_reason}
+				level1SecondsUntilIdle={learningData.level1_seconds_until_idle}
 				lastLevel1Run={learningData.last_level1_run}
 				lastLevel2Run={learningData.last_level2_run}
 				runningTarget={learningData.running_target}
@@ -156,9 +156,7 @@
 			{#if isPro && components?.PerformanceChart}
 				<components.PerformanceChart
 					baseScores={improvement.base}
-					assistScores={improvement.assist}
 					baseLabel={loraModes.chat.base.label}
-					assistLabel={loraModes.chat.assist.label}
 				/>
 			{/if}
 			<RAGStats stats={ragStats} />

@@ -65,7 +65,7 @@ class LazyContextualPrefixService:
         self.mode: str = str(cp_cfg.get("mode", "eager"))
         self.min_chunk_tokens: int = int(cp_cfg.get("min_chunk_tokens", 200))
         self.lazy_hit_threshold: int = int(cp_cfg.get("lazy_hit_threshold", 2))
-        # 生成処理の直列化 (同時実行は assist model の負荷増大を招くため)
+        # 生成処理の直列化 (同時実行は aux task の負荷増大を招くため)
         self._lock: asyncio.Lock = asyncio.Lock()
 
     @property

@@ -5,8 +5,8 @@ LocalClient を薄くラップし、フォアグラウンド (チャット応答
 (学習サイクル / sleep-time) との協調はこの進行中数を読む側
 (SleepTimeScheduler.is_user_active → LearningScheduler.should_yield) が行う。
 
-ローカル llama-server 専用となった。アシストモデル (別 llama-server
-インスタンス) は `AssistModelClient` が独立に管理する。
+ローカル llama-server 専用となった。補助タスク (別 llama-server
+インスタンス) は `AuxClient` が独立に管理する。
 """
 
 from __future__ import annotations
@@ -124,6 +124,37 @@ class LLMClient:
             repetition_penalty=repetition_penalty,
             id_slot=id_slot,
             request_timeout=request_timeout,
+        )
+
+    async def generate_constrained(
+        self,
+        messages: list[dict],
+        *,
+        response_format: dict,
+        temperature: float = 0.1,
+        max_tokens: int = 64,
+        id_slot: int | None = None,
+        timeout: float | None = None,
+    ) -> str | None:
+        """``response_format`` (json_schema) で文法制約した非ストリーミング生成
+
+        ``generate`` は ``response_format`` を透過しないため、文法制約が要る
+        呼出はこの専用メソッドを通す。Level 1 の差分編集変異
+        (``PromptEvolver._mutate_by_edit``) はファサード経由で来る
+        (``SleepTimeScheduler`` は ``in_flight_chat_count`` を読むため生の
+        ``LocalClient`` ではなくファサードを保持している) ので、ここが無いと
+        変異が黙って全文書き直し (実測 356 秒/回) へ縮退する。
+
+        Returns:
+            ``choices[0].message.content``。取得できなければ ``None``。
+        """
+        return await self.local.generate_constrained(
+            messages,
+            response_format=response_format,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            id_slot=id_slot,
+            timeout=timeout,
         )
 
     async def generate_with_logprobs(

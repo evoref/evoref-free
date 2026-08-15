@@ -69,7 +69,21 @@ CORRECTION_PATTERNS = [
     re.compile(r"that'?s\s+not\s+(?:right|correct)", re.IGNORECASE),
     re.compile(r"^\s*(?:no,?\s+)?that'?s\s+wrong\b", re.IGNORECASE),
     re.compile(r"you\s+got\s+it\s+(?:backwards?|wrong|mixed\s+up)", re.IGNORECASE),
-    re.compile(r"(?:please\s+)?(?:redo|retry|try\s+again|fix\s+that)", re.IGNORECASE),
+    # ``redo`` / ``retry`` を **裸で** 拾ってはいけない。短い英語動詞は
+    # 技術用語として日本語文中に頻出し、境界も無かったため部分一致していた
+    # (実データ 2026-08-14: 「先ほどの retry デコレータで、max_retries=3 の
+    # とき関数本体は最大何回呼ばれますか？」「retry_decorator.md の中身を
+    # 読んで、先頭 3 行をそのまま引用してください。」の 3 ターンが訂正として
+    # 記録され、Level 2 の失敗コーパス 10 件中 3 件を占めた)。
+    # 「日本語と英語は文字体系が違うので相互誤爆しない」という前提は、
+    # 英語の識別子が日本語文に埋め込まれる場面で成り立たない。
+    # 命令形の文脈 (please / 目的語) を要求し、``_`` や数字との連結も弾く。
+    re.compile(
+        r"(?<![A-Za-z0-9_])(?:try\s+again|fix\s+that)(?![A-Za-z0-9_])"
+        r"|please\s+(?:redo|retry)(?![A-Za-z0-9_])"
+        r"|(?<![A-Za-z0-9_])(?:redo|retry)\s+(?:that|it|this)(?![A-Za-z0-9_])",
+        re.IGNORECASE,
+    ),
     re.compile(r"that'?s\s+incorrect", re.IGNORECASE),
 ]
 
@@ -170,9 +184,18 @@ def detect_assistant_self_retraction(response: str) -> bool:
 # ``user_correction`` として扱う。判別不能は従来どおり assistant に倒す
 # (保守的側。ルールが効かなければ現行挙動のまま)。
 
-#: 「訂正」を目的語として問う質問。訂正そのものではない。
+#: 「訂正」「間違い」を **目的語として問う質問**。訂正そのものではない。
+#:
+#: 監査の振り返り (「どこを間違えた？」「何回訂正させた？」) は、直前の応答が
+#: 誤っていたことを意味しない。にもかかわらず訂正として記録され、Level 2 の
+#: 失敗コーパスに混ざっていた (実データ 2026-08-14: 10 件中 2 件が
+#: 「私があなたの回答を訂正させたのは何回で…」「あなたが間違えた点を…列挙して」)。
+#: 訂正語の後に **列挙・計数を求める語** が続く形を除外する。
+#: 「正しくは X です。訂正してください」のような本物の訂正は、これらの語を
+#: 伴わないので影響を受けない。
 _ASKS_ABOUT_CORRECTION_RE = re.compile(
-    r"訂正(?:した|後の|前の)[^。！？\n]{0,20}?(?:答え|挙げ|教え|列挙|示し)",
+    r"(?:訂正|間違[いえ])[^。！？\n]{0,20}?"
+    r"(?:答え|挙げ|教え|列挙|示し|説明し|何回|何件|いくつ|どこ|点を|箇所)",
 )
 
 #: 出力形式・言語の変更依頼。内容の誤りを指していない。

@@ -8,7 +8,7 @@ import { createPoller } from '$lib/free/stores/_polling';
 export interface ServerState {
 	/** バックエンドに到達可能か */
 	backendOnline: boolean;
-	/** 各コンポーネント (base / assist / embed) */
+	/** 各コンポーネント (base / embed) */
 	components: ComponentStatus[];
 	/** デバッグ情報 */
 	debug: DebugStatusInfo | null;

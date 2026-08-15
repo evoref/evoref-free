@@ -4,7 +4,7 @@ VRAM 使用量スナップショットなど、コンポーネント単位では
 観測するエンドポイント群を集約する。
 
 ``GET /api/system/vram_status``:
-    ベース / アシスト / 埋め込み の 3 モデルについて、推定値
+    ベース / 補助タスク / 埋め込み の 3 モデルについて、推定値
     + (条件が揃えば) 実測値を返す。詳細は
     ``backend/free/core/vram_monitor.py`` と
     ``backend/free/api/schemas.py::VramStatusResponse`` を参照。

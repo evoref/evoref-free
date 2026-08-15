@@ -1,6 +1,6 @@
 """Step 8.5: URL リコール用のキュレーター
 
-ユーザの直近セッションで参照された URL について、アシストモデルが
+ユーザの直近セッションで参照された URL について、補助タスクが
 「その URL が回答に正しく寄与したか」を 0..1 で自己採点し、
 score >= 閾値の URL を ``world_fact`` (subject = ``mem.world.url.*``) として
 SemMem に永続化する。
@@ -18,7 +18,7 @@ CLAUDE.md §6 不変則 #2 より、SemMem への書込は sleep-time に限定�
 - ``_extra`` に URL 専用メタ (url / fetch_count / score_history /
   score_avg / last_query 等) を載せる。SemanticFact の round-trip 機能で
   そのまま JSONL に保持される。
-- ``assist_client is None`` (degraded mode) では何もせず ``0`` を返す。
+- ``scorer_client is None`` (ベース未接続) では何もせず ``0`` を返す。
 """
 
 from __future__ import annotations
@@ -42,7 +42,6 @@ from backend.free.memory.types import SemanticFact, make_fact
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
-    from backend.free.llm.assist_client import AssistModelClient
     from backend.free.memory.semantic.store import SemanticFactStore
     from backend.free.memory.stores.short_term import MemoryNote
     from backend.free.rag.embedding_backend import EmbeddingBackend
@@ -203,15 +202,15 @@ _coerce_bare_score = coerce_bare_score
 
 
 async def _score_url(
-    assist_client: "AssistModelClient",
+    scorer_client,
     *,
     query: str,
     answer: str,
     url: str,
 ) -> float | None:
-    """アシストモデルで URL 関連性を採点する。失敗時は ``None``。"""
+    """sleep-time の LLM で URL 関連性を採点する。失敗時は ``None``。"""
     try:
-        result = await assist_client.generate(
+        result = await scorer_client.generate(
             messages=[
                 {"role": "system", "content": _PROMPT_SYSTEM},
                 {"role": "user", "content": _build_user_prompt(query, answer, url)},
@@ -224,7 +223,7 @@ async def _score_url(
             response_schema=UrlRelevanceJudgement,
         )
     except Exception as exc:
-        logger.warning("url_curator: assist scoring failed: %s", exc)
+        logger.warning("url_curator: relevance scoring failed: %s", exc)
         return None
     from backend.free.llm.json_extract import extract_json_object
     from backend.free.llm.utils import extract_content
@@ -254,7 +253,7 @@ async def curate_url_facts(
     *,
     config: dict | None,
     store_provider: Callable[[str], "SemanticFactStore | None"] | None,
-    assist_client: "AssistModelClient | None",
+    scorer_client,
     embedder: "EmbeddingBackend | None",
     profile_id: str = "default",
     debug_logger=None,
@@ -266,7 +265,8 @@ async def curate_url_facts(
         notes: 直近の MemoryNote 群 (通常 ``ShortTermMemory.notes.values()``)。
         config: 全体 config。``tools.url_recall_*`` を参照する。
         store_provider: ``scope -> SemanticFactStore | None`` のコールバック。
-        assist_client: ``None`` の場合は no-op (degraded mode)。
+        scorer_client: 採点に使う LLM クライアント (sleep-time のベース
+            モデルアダプタ)。``None`` の場合は no-op。
         embedder: topic embedding 生成用。``None`` で no-op。
         profile_id: 書込先 fact の profile_id。
         debug_logger: 任意の DebugLogger。
@@ -275,8 +275,8 @@ async def curate_url_facts(
     Returns:
         新規に書き込まれた / 更新された URL fact 件数。
     """
-    if assist_client is None:
-        logger.debug("url_curator: assist_client is None (degraded mode), skipping")
+    if scorer_client is None:
+        logger.debug("url_curator: scorer_client is None, skipping")
         return 0
     if embedder is None:
         logger.debug("url_curator: embedder is None, skipping")
@@ -303,7 +303,7 @@ async def curate_url_facts(
     written = 0
     for user_note, assistant_note, urls in pairs:
         # 処理済みアンカー (user note) はスキップ。STM に残り続ける同一 QA ペアを
-        # Full サイクルごとに再採点 (assist 浪費) / fetch_count 水増しするのを防ぐ。
+        # Full サイクルごとに再採点 / fetch_count 水増しするのを防ぐ。
         if user_note.url_curated_at is not None:
             continue
         seen_urls: set[str] = set()
@@ -317,7 +317,7 @@ async def curate_url_facts(
             seen_urls.add(normalized)
 
             if fetch_failed:
-                # 失敗シグナル検出 — アシストには採点させず score=0 を強制。
+                # 失敗シグナル検出 — 補助タスクには採点させず score=0 を強制。
                 # 既存 fact のみ更新する (新規 fact の作成はしない)。
                 subject = _make_subject(host, normalized)
                 topic = _topic_text(user_note.content)
@@ -354,7 +354,7 @@ async def curate_url_facts(
                 continue
 
             score = await _score_url(
-                assist_client,
+                scorer_client,
                 query=user_note.content,
                 answer=assistant_note.content,
                 url=raw_url,
@@ -423,7 +423,7 @@ async def curate_url_facts(
                 logger.warning("url_curator: persist failed for %s: %s", host, exc)
 
         # ペア処理完了 — score < min_record / fetch 失敗を含む全分岐で必ず
-        # マークし、次サイクルで同じペアを assist に再採点させない。
+        # マークし、次サイクルで同じペアを再採点させない。
         user_note.url_curated_at = now_fn()
 
     if written and debug_logger is not None:

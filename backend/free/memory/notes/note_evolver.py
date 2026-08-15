@@ -22,7 +22,7 @@ from backend.free.memory.stores.long_term import LongTermMemory
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
-    from backend.free.agent.assist_prompt_manager import AssistPromptManager
+    from backend.free.agent.aux_prompt_manager import AuxPromptManager
 
 logger = get_logger("memory.note_evolver")
 
@@ -31,16 +31,26 @@ MAX_NOTE_CONTENT_LEN = 800
 MAX_CONTEXT_CONTENT_LEN = 150
 
 # 空レスポンス時のリトライ回数
-# assist_client 側でも MAX_RETRIES (=3) 分リトライするため、ここでは
+# aux_client 側でも MAX_RETRIES (=3) 分リトライするため、ここでは
 # 「KV キャッシュ汚染等で連続失敗が発生した場合に slot 回復を待つ」目的で
 # 追加の外側リトライを行う。合計で最大 (1 + _EMPTY_RESPONSE_MAX_RETRIES) 回試行する。
 _EMPTY_RESPONSE_MAX_RETRIES = 2
 
-# assist_prompt_manager が利用不可な場合のフォールバックプロンプト
+# aux_prompt_manager が利用不可な場合のフォールバックプロンプト
 _FALLBACK_SYSTEM_PROMPT = (
     "メモリノートの暗黙的な意味・トピック・重要性を捉えた簡潔な文脈説明（1〜2文）を"
     "生成してください。説明文のみを出力してください。"
 )
+
+
+#: ``base_interval`` に対する自動スケールの上限倍率。
+#: sleep-time をベースモデル (27B) で回すようになり、素の線形スケールでは
+#: 呼出間に 3.86 秒 (= 1.0 × 27/7) の待機が入るようになった。1 サイクル 10〜15 件
+#: なら 40〜58 秒がまるまる待機で消える。インターバルの役割 (チャットへ GPU を
+#: 明け渡す) は、専有スロット (``background_slot``) と協調 yield
+#: (``is_user_active`` → キャンセル) が既に担っており、かつ大きいモデルほど
+#: 1 呼出自体が長くなるので、待機まで比例させる必要はない。
+_MAX_INTERVAL_SCALE = 2.0
 
 
 def compute_llm_call_interval(base_interval: float, params_b: float) -> float:
@@ -51,11 +61,12 @@ def compute_llm_call_interval(base_interval: float, params_b: float) -> float:
         params_b: モデルのパラメータ数（B 単位）
 
     Returns:
-        実効インターバル（秒）。最低 0.1 秒
+        実効インターバル（秒）。最低 0.1 秒、上限 ``base_interval * 2``
     """
     if base_interval <= 0:
         return 0.0
     interval = base_interval * (params_b / DEFAULT_PARAMS_B)
+    interval = min(interval, base_interval * _MAX_INTERVAL_SCALE)
     return max(interval, 0.1)
 
 
@@ -66,7 +77,7 @@ class NoteEvolver:
         self,
         config: dict,
         params_b: float = DEFAULT_PARAMS_B,
-        assist_prompt_manager: AssistPromptManager | None = None,
+        aux_prompt_manager: AuxPromptManager | None = None,
         debug_logger: DebugLogger | None = None,
     ):
         mc = config.get("memory", {})
@@ -94,16 +105,16 @@ class NoteEvolver:
         else:
             self.llm_call_interval = compute_llm_call_interval(base, params_b)
 
-        # システムプロンプト: assist_prompt_manager → フォールバック
+        # システムプロンプト: aux_prompt_manager → フォールバック
         self._system_prompt = _FALLBACK_SYSTEM_PROMPT
-        if assist_prompt_manager is not None:
+        if aux_prompt_manager is not None:
             try:
-                self._system_prompt = assist_prompt_manager.get_assist_prompt(
+                self._system_prompt = aux_prompt_manager.get_aux_prompt(
                     "note_evolve"
                 )
             except (ValueError, KeyError):
                 logger.warning(
-                    "Failed to get note_evolve prompt from assist_prompt_manager, "
+                    "Failed to get note_evolve prompt from aux_prompt_manager, "
                     "using fallback"
                 )
 
@@ -188,12 +199,12 @@ class NoteEvolver:
                 )
             return rule_based_evolved
 
-        # 事前ヘルスチェック: アシストモデルが応答不能ならスキップ
+        # 事前ヘルスチェック: 補助タスクが応答不能ならスキップ
         if hasattr(llm_client, "health_check"):
             healthy = await llm_client.health_check()
             if not healthy:
                 logger.warning(
-                    "Assist model unhealthy, skipping note evolution "
+                    "Aux task unhealthy, skipping note evolution "
                     "(%d llm targets, %d rule-based evolved)",
                     len(targets), rule_based_evolved,
                 )

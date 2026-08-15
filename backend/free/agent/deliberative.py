@@ -18,7 +18,6 @@ from backend.free.agent.meta_cognitive_utils import (
     tool_result_succeeded,
 )
 from backend.free.agent.tool_call_judge import ToolCallJudge, ToolJudgement
-from backend.free.agent.tool_result_digest import digest_tool_result
 from backend.free.agent.tools.builtin import (
     SEARCH_HISTORY_NO_RESULTS_PREFIX,
     _check_path_traversal as check_builtin_path_traversal,
@@ -28,6 +27,7 @@ from backend.free.core.session_mode import is_create_mode
 from backend.free.core.intent_vocab import (
     resolve_session_position_message,
     session_position_kind,
+    tool_inventory_question,
     unverified_claim_numbers,
 )
 from backend.free.core.turn_text import append_to_last_user
@@ -49,9 +49,8 @@ Generate the requested content below. Output ONLY the content itself, \
 no explanations, no markdown fences, no JSON, no surrounding text.
 """
 
-# digest_tool_result が NO_RELEVANT_INFO と確定した場合に raw の代わりに
-# ツール実行結果として渡すプレースホルダ。無関係な内容を「唯一の事実根拠」
-# として base に読ませないための安全な代替文言。
+# 空振りと確定したツール結果の代わりに渡すプレースホルダ。無関係な内容を
+# 「唯一の事実根拠」として base に読ませないための安全な代替文言。
 _NO_RELEVANT_INFO_MESSAGE = "（ツールを実行しましたが、今回の質問に関連する情報は見つかりませんでした）"
 
 # 環境依存の事実を尋ねられたのにツールが 1 つも走らなかったときの注記。
@@ -95,10 +94,17 @@ _UNMEASURED_FACT_GUIDANCE = (
 _UNPERFORMED_ACTION_GUIDANCE = (
     "\n\nこの依頼はファイルやシステムの状態を変える操作を含むが、"
     "今回のターンではその操作を実行できるツールが無く、**何も実行していない**。"
-    "したがって「書き込みました」「追記しました」「作成しました」のように"
-    "完了を報告してはならない。変更後の内容を推測して提示してもならない。"
+    "したがって「書き込みました」「追記しました」「作成しました」"
+    "「削除しました」「存在しません」のように"
+    "完了を報告してはならない。変更後の内容や変更後の状態を推測して"
+    "提示してもならない。"
     "実行できなかったことを率直に伝え、可能な代替 (クリエイトモードで行う / "
-    "完全なパスを指定して書き込みを依頼する 等) を 1 つ示すこと。"
+    "パスが曖昧な場合は完全なパスを指定して依頼し直す 等) を 1 つ示すこと。"
+    "実行できなかった理由は上記のとおり「その操作を実行できるツールが無い」で"
+    "確定している。権限が無い・パス指定が足りないなど、**ここに書かれていない"
+    "理由を推測して述べない** (実インシデント 2026-08-15: 完全なパスを与えた"
+    "削除依頼に「ファイルの削除には権限が必要です。完全なパスを指定して削除を"
+    "依頼してください」と、誤った理由と成立しない代替を提示した)。"
 )
 
 # search_history が空振りした場合専用のグラウンディング文言。通常ツールの
@@ -143,7 +149,7 @@ _SEARCH_HISTORY_RESULT_GUIDANCE = (
 # 付けると base が (a) 質問文の単位をそのまま数値に貼り付ける
 # (b) 式に無い係数を後付けで説明する、という 2 つの捏造を起こす
 # (実インシデント 2026-07-27: 「直径30cm・深さ25cm の鉢の土は何リットル？」に
-# 対し assist が cm 単位の式 3.14159*(30/2)**2*(25-2) を組み、結果 16257.7 cm³ が
+# 対し aux が cm 単位の式 3.14159*(30/2)**2*(25-2) を組み、結果 16257.7 cm³ が
 # 「約 16,258 リットル」と回答され、さらに「土の比重 1.3 を掛けた結果」という
 # 式に存在しない根拠が創作された)。式を併記したうえで、単位は入力に従うこと・
 # 式に無い係数を語らないことを明示する。
@@ -227,12 +233,11 @@ _GENERATED_DRAFT_GUIDANCE = (
 # read_file は「タスクの内容: ファイル `…` に…」を返したのに、回答は依頼時の
 # 文言「監査テスト 1行目」だった。書込みが壊れていた事実がユーザーから隠れた)。
 # 食い違いの報告を明示的な仕事として与える (禁止形だけだと退行する)。
-# 列挙が価値のツール。結果の意味は「その集合が全部である」ことなので、散文
-# 要約に通すと項目が落ち、base が落ちた分をもっともらしい名前で埋める
-# (実インシデント 2026-08-01 ライブ監査: list_directory の 6070 文字が digest
-# で 225 文字に圧縮され、回答は実在しない requirements.txt / .env.example を
-# 挙げ、実在する scripts/ local/ models/ CLAUDE.md 等を落とした)。
-# ``_ENUMERATIVE_TOOLS`` は digest 抑止とグラウンディング文言の両方が見る。
+# 列挙が価値のツール。結果の意味は「その集合が全部である」ことなので、base が
+# 落ちた項目をもっともらしい名前で埋めないようグラウンディング文言を足す
+# (実インシデント 2026-08-01 ライブ監査: list_directory の結果を圧縮した結果、
+# 回答が実在しない requirements.txt / .env.example を挙げ、実在する scripts/
+# local/ models/ CLAUDE.md 等を落とした)。
 _ENUMERATIVE_TOOLS = frozenset({"list_directory", "search_code"})
 _ENUMERATION_RESULT_GUIDANCE = (
     "上記の ## ツール実行結果 は、システムが実際に列挙した項目そのものである。"
@@ -476,13 +481,13 @@ class DeliberativeResponse:
     # executable command 学習用 (run_command 実行ターンのみ非 None)
     tool_command: str | None = None
     tool_command_success: bool | None = None
-    # 判定層 ("rule" / "assist" / "recall" ...)。sleep 側の
+    # 判定層 ("rule" / "llm" / "recall" ...)。sleep 側の
     # executable_command_curator が "recall" 由来の実行を学習対象から外すために使う。
     tool_command_source: str | None = None
 
 
 class DeliberativeAgent:
-    """Deliberative 層: LLM 推論 + アシストモデルによるツール判定
+    """Deliberative 層: LLM 推論 + 補助タスクによるツール判定
 
     ToolCallJudge によるツール呼び出し判定を実行し、
     ツール結果をコンテキストとして注入してから LLM に応答を生成させる。
@@ -497,8 +502,7 @@ class DeliberativeAgent:
         config: dict | None = None,
         tool_judge: ToolCallJudge | None = None,
         tools_registry=None,
-        assist_client=None,
-        assist_experience_recorder=None,
+        judge_experience_recorder=None,
         agent_tracer=None,
         mode: str = "chat",
     ):
@@ -510,11 +514,9 @@ class DeliberativeAgent:
         # _judge_and_execute_tool から明示的に渡される (こちらは直接 _execute_tool を
         # 呼ぶ既存テスト等のフォールバック用)。
         self._mode = mode
-        # ツール結果の query 連動抽出 (base の接地負荷軽減) に使う。None なら raw を渡す。
-        self._assist_client = assist_client
-        # assist 由来ツール判定の実行成否を assist 経験へ記録する closure。
+        # aux 由来ツール判定の実行成否を aux 経験へ記録する closure。
         # Pro/Develop 起動時のみ非 None (factory 層が注入)。None なら記録 no-op。
-        self._assist_experience_recorder = assist_experience_recorder
+        self._judge_experience_recorder = judge_experience_recorder
         # MDP トレース。develop モード時のみ非 None (factory 層が注入)。
         # deliberative の tool 判定/実行を 1 step エピソードとして記録し、
         # sleep-time Step 7.5 が episodic LTM へ取込 → Level 1 agent ドメインの
@@ -687,6 +689,22 @@ class DeliberativeAgent:
                 "(%d messages evicted); the window head is not the "
                 "conversation head", evicted_turns,
             )
+            # 黙って降りると、視界の先頭を「会話の先頭」として断定する。
+            # 実インシデント (2026-08-14 ライブ監査 ターン19): 19 件が窓外に
+            # 出た状態で「一番最初に送ったメッセージは？」に対し、窓の先頭
+            # (7 ターン目の asyncio の質問) を答えた (切り詰めの断りは後置き
+            # だったため、先に出た断定の方が読まれた)。確定できないことを
+            # 先に伝えて、推測での断定を止める。
+            append_to_last_user(
+                messages,
+                f"\n\n注記: この会話の冒頭 {evicted_turns} 件は文脈の上限を超えて"
+                "参照できない。したがって「会話で最初に送ったメッセージ」は"
+                "確定できない。見えている範囲の先頭を会話の先頭として断定せず、"
+                "参照できる範囲が限られていることを述べたうえで、"
+                "見えている中で最も古い発言を『確認できる範囲での最古』として"
+                "示すこと。",
+                separator="",
+            )
             return None
         target = resolve_session_position_message(conversation, query, position)
         if not target:
@@ -704,6 +722,43 @@ class DeliberativeAgent:
         )
         return position
 
+    def _append_tool_inventory_fact(
+        self, messages: list[dict], query: str, mode: str,
+    ) -> bool:
+        """「使えるツールは何か」に ToolsRegistry の実体を根拠として渡す。
+
+        チャット応答パスの system プロンプトにはツール一覧が載っていない
+        (選択は ToolCallJudge / 文法制約分類器が別レイヤで行う設計)。その結果
+        base は自分がツールを持つことを知らないまま答える。実インシデント
+        (2026-08-14 ライブ監査 ターン33): 「あなたが今使えるツールを全部列挙
+        してください」に「現在、私が直接利用できるツールはありません」と回答。
+        同じ会話で calculate / run_command_readonly / search_history /
+        write_file が実行済みだった。
+
+        毎ターン一覧を注入すると余計なトークンとツール話への引きずられが出る
+        ため、目録を尋ねられたターンだけ決定論で足す。
+
+        Returns:
+            注記したか。
+        """
+        if self._tools_registry is None:
+            return False
+        if not tool_inventory_question(query):
+            return False
+        summary = self._tools_registry.get_capability_summary(mode)
+        if not summary:
+            return False
+        append_to_last_user(
+            messages,
+            f"\n\n確定事実: このモード ({mode}) で実際に実行できるツールは"
+            f"以下がすべてである。これは実装の登録内容から機械的に取得した値なので、"
+            f"この一覧をそのまま答えること。ここに無いものを挙げず、"
+            f"「ツールは無い」とも述べないこと。\n{summary}",
+            separator="",
+        )
+        logger.info("Tool inventory fact pinned (mode=%s)", mode)
+        return True
+
     @staticmethod
     def _append_unmeasured_fact_note(messages: list[dict]) -> None:
         """最後の user メッセージへ「実測できなかった」注記を追記する。"""
@@ -713,6 +768,20 @@ class DeliberativeAgent:
     def _append_unperformed_action_note(messages: list[dict]) -> None:
         """最後の user メッセージへ「操作を実行できなかった」注記を追記する。"""
         append_to_last_user(messages, _UNPERFORMED_ACTION_GUIDANCE, separator="")
+
+    def _append_unperformed_action_note_if_blocked(
+        self, messages: list[dict],
+    ) -> None:
+        """ツールが走った場合でも、状態変更が未実行なら注記を足す。
+
+        以前はこの注記が「ツールが 1 つも立たなかった」経路にしか無かった。
+        削除依頼がパスを含むと read 系ツール (list_directory) が代わりに走って
+        しまい、注記が付かないまま一覧だけを根拠に完了が捏造された
+        (実インシデント 2026-08-14 ライブ監査 ターン37)。実行されたツールが
+        状態を変えていない以上、注記の要否はツールの有無と独立に決まる。
+        """
+        if getattr(self._tool_judge, "action_blocked", False):
+            self._append_unperformed_action_note(messages)
 
     @staticmethod
     def _append_unverified_claim_note(
@@ -756,16 +825,16 @@ class DeliberativeAgent:
     def _record_tool_call_outcome(
         self, query: str, judgement: ToolJudgement, success: bool, mode: str = "chat",
     ) -> None:
-        """assist 由来ツール判定の実行成否を assist 経験へ記録する (best-effort)。
+        """LLM 由来ツール判定の実行成否を補助タスク経験へ記録する (best-effort)。
 
-        rule / learned / cartridge 由来は assist モデル出力ではないため記録しない
-        (assist=B が学ぶのは assist のツール判定のみ)。recorder 未注入
-        (Free / --no-learning) なら no-op。例外は recorder 側で握り潰される。
+        rule / learned / cartridge 由来は LLM 出力ではないため記録しない
+        (プロンプト進化が学ぶのは LLM のツール判定のみ)。recorder 未注入
+        (--no-learning) なら no-op。例外は recorder 側で握り潰される。
         ``mode`` は呼び出し元 (``_judge_and_execute_tool`` の明示引数、
         ``self._mode`` ではなく実際の処理対象モード) をそのまま渡す。
         """
-        rec = self._assist_experience_recorder
-        if rec is None or judgement.source != "assist":
+        rec = self._judge_experience_recorder
+        if rec is None or judgement.source != "llm":
             return
         rec("tool_call", query, judgement.tool_name or "", 1.0 if success else 0.0, mode)
 
@@ -809,6 +878,14 @@ class DeliberativeAgent:
         if self._append_session_position_fact(
             messages, conversation, query, evicted_turns,
         ):
+            if tool_judge_task is not None and not tool_judge_task.done():
+                tool_judge_task.cancel()
+            return None, None, None, None, None
+
+        # 「どんなツールが使えるか」も決定論で答えが出る事実 (ToolsRegistry が
+        # SSOT)。ツールを撃つ意味は無いので、位置事実と同様に注記だけ足して
+        # 判定経路を短絡させる。
+        if self._append_tool_inventory_fact(messages, query, mode):
             if tool_judge_task is not None and not tool_judge_task.done():
                 tool_judge_task.cancel()
             return None, None, None, None, None
@@ -866,32 +943,24 @@ class DeliberativeAgent:
             self._record_tool_call_outcome(query, judgement, False, mode=mode)
             return None, judgement.tool_name, command, False, judgement.source
 
-        # ツール結果を assist で query 連動抽出し、base 文脈には digest を注入して
-        # 弱い base の接地負荷を下げる。抽出不能/assist 不在時は raw へ退避 (現挙動)。
-        # 戻り値の tool_result_text(raw) は UI 表示用にそのまま保つ。
+        # 空振りと分かっている search_history の結果は、raw をそのまま
+        # 「唯一の事実根拠」枠で base に渡すと進行中の会話履歴まで否定させて
+        # しまうため、明示的な「関連情報なし」文言へ差し替える。
         if _is_search_history_empty(judgement.tool_name, tool_result_text):
-            # 空振りと分かっている結果を assist に要約させても得られるのは
-            # 「関連情報なし」の確定だけで、アシスト 1 往復 (実測 1〜2 秒) が
-            # 丸ごと無駄になる。実測 2026-07-25 のライブ検証では search_history
-            # 11 回中 7 回が空振りだった。判定を code 側で先に済ませ、
-            # _SEARCH_HISTORY_NO_INFO_GUIDANCE へ直結する
-            # (assist 不在・タイムアウトで digest が None に落ちると raw が
-            # 「唯一の事実根拠」枠で base に渡り、進行中の会話履歴まで否定
-            # させてしまう経路を塞ぐ効果も兼ねる)。
             prompt_result_text = _NO_RELEVANT_INFO_MESSAGE
             self._append_tool_result_to_last_user(
                 messages, judgement.tool_name, prompt_result_text, query=query,
             )
+            self._append_unperformed_action_note_if_blocked(messages)
             # 成否は下の通常経路と同じ SSOT (tool_result_succeeded) で決める。
-            # ここは「空振りと分かっている結果を digest に通さない」ための
-            # 早期 return であって、成否判定を変える意図は無い。以前は success を
-            # True 固定で書いており、0 件検索が reward=1.0 で正例として記録される
-            # という、まさに tool_result_succeeded が塞いだはずの穴が
-            # この early return 経由で復活していた (2026-08-05 ライブ監査で確認)。
+            # 以前は success を True 固定で書いており、0 件検索が reward=1.0 で
+            # 正例として記録されるという、まさに tool_result_succeeded が塞いだ
+            # はずの穴がこの early return 経由で復活していた
+            # (2026-08-05 ライブ監査で確認)。
             success = tool_result_succeeded(judgement.tool_name, tool_result_text)
             logger.info(
                 "Tool executed: %s, result_length=%d, source=%s, success=%s "
-                "(empty result: digest skipped)",
+                "(empty result)",
                 judgement.tool_name, len(tool_result_text), judgement.source,
                 success,
             )
@@ -901,50 +970,30 @@ class DeliberativeAgent:
                 judgement.source,
             )
 
-        if judgement.tool_name == "calculate":
-            # calculate の結果は裸の数値 1 個で、抽出すべき要点は存在しない。
-            # digest に通すと assist が質問文の単位を勝手に貼り付ける
-            # (実インシデント 2026-07-27: raw "16257.72825" が digest
-            # "16257.72825 リットル" になり、cm³ の値がリットルとして回答された)。
-            # 抽出の利得ゼロ・捏造リスクありなので assist 1 往復ごと省く。
-            digest = None
-        elif judgement.tool_name in _ENUMERATIVE_TOOLS:
-            # 列挙結果の価値は「その集合が全部である」ことにあり、散文要約は
-            # 必ず項目を落とす。落ちた項目を base がもっともらしい名前で埋める
-            # ため、決定論的な切り詰め (省略量を明示する) の方が安全
-            # (_ENUMERATIVE_TOOLS 参照)。
-            digest = None
-        else:
-            digest = await digest_tool_result(
-                self._assist_client,
-                query=query,
-                tool_name=judgement.tool_name,
-                tool_result=_truncate_tool_result(
-                    tool_result_text, TOOL_RESULT_MAX_CHARS,
-                ),
-            )
-        if digest is None:
-            prompt_result_text = tool_result_text
-        elif digest == "" and judgement.tool_name == "search_history":
-            # assist が抽出に成功した上で「関連情報なし」と確定したケース。
-            # search_history に限り、raw 結果 (無関係な過去セッションの内容等)
-            # をそのまま「唯一の事実根拠」として base に渡すと誤って参照・混同
-            # されるため (実インシデント: search_history が別セッションの雑談を
-            # ヒットし、base がそれを今回の会話の内容として回答した)、raw へは
-            # 退避しない。他のツール (calculate 等) は raw が「今回の呼出し
-            # そのものの結果」であり無関係な混同のリスクが無いため、assist の
-            # digest 誤判定 (false negative) を安全側に倒せるよう raw へ退避する
-            # (元の挙動を維持)。
-            prompt_result_text = _NO_RELEVANT_INFO_MESSAGE
-        elif digest == "":
-            prompt_result_text = tool_result_text
-        else:
-            prompt_result_text = digest
+        # ツール結果は決定論的に切り詰めたものをそのまま渡す。LLM による
+        # query 連動抽出 (digest) は撤去済み — チャット応答パスで制約なしの
+        # 抽出を走らせられないため (CLAUDE.md §6 #1)。
+        prompt_result_text = tool_result_text
         self._append_tool_result_to_last_user(
             messages, judgement.tool_name, prompt_result_text, query=query,
             tool_args=judgement.tool_args,
             unexplained_numbers=getattr(judgement, "unexplained_numbers", ()),
         )
+        # ツールがエラー文字列を返したなら、それは「測れなかった」という事実で
+        # あって観測結果ではない。``_append_tool_result_to_last_user`` は結果を
+        # 「唯一の事実根拠」として枠付けするため、注記なしだと base がエラー文から
+        # ファクトを導く。``success`` は学習シグナル用にしか使われておらず、
+        # プロンプト側には何も伝わっていなかった。
+        #
+        # 実インシデント (2026-08-15 ライブ監査): バッククォート付き明示コマンドの
+        # 実行依頼が実行段の readonly ラッパに弾かれ
+        # ``Error: readonly violation: ...`` を返したところ、base が対象ファイルを
+        # 「存在しません」と断定した。2 ターン前に read_file で存在を確認済みの
+        # ファイルだった。judge 段の拒否 (action/measurement blocked) と違い、
+        # 実行段の失敗はこれまで何の注記も伴っていなかった。
+        if is_tool_error(tool_result_text):
+            self._append_unmeasured_fact_note(messages)
+        self._append_unperformed_action_note_if_blocked(messages)
         # 「実行できた」ではなく「役に立つ結果が出た」を成否とする (SSOT)。
         # 非ゼロ終了の run_command / 0 件の search_history を成功にすると、
         # executable_command の SemMem 学習と tool_routing の選択圧が汚染される。
@@ -1320,7 +1369,7 @@ class DeliberativeAgent:
             return None
 
         tool_name = judgement.tool_name
-        # tool_args は dict 契約だが、アシスト応答の機械修復経路で非 dict が
+        # tool_args は dict 契約だが、補助タスク応答の機械修復経路で非 dict が
         # 紛れ込むことがあるため防御的にガードする (cf. _judge_and_execute_tool)。
         raw_args = judgement.tool_args
         tool_args = dict(raw_args) if isinstance(raw_args, dict) else {}  # コピー

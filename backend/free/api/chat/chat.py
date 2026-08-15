@@ -39,7 +39,7 @@ from backend.free.api.chat.chat_service import (
     apply_grounding_notes,
     build_chat_messages, build_semmem_injection, convert_file_contexts,
     ensure_base_model_health,
-    ensure_llm_client, maybe_resolve_pending_conflicts, prepare_memory_context,
+    collect_pending_conflicts, ensure_llm_client, prepare_memory_context,
     run_search_pipeline, session_evicted_turns,
 )
 from backend.free.api.chat.chat_streaming import (
@@ -52,6 +52,7 @@ from backend.free.api.chat.chat_streaming import (
 )
 from backend.edition import is_pro
 from backend.free.core.inference import latest_turn_truncation
+from backend.free.core.intent_vocab import is_whole_session_scope_query
 from backend.free.core.session_mode import is_create_mode, is_valid_session_mode
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.agent.deliberative import DeliberativeAgent
@@ -60,7 +61,7 @@ from backend.free.agent.reactive import ReactiveAgent
 from backend.free.agent.router import ComplexityClassifier
 from backend.free.core.stage_timer import StageTimer
 from backend.free.generation.orchestrator import LongFormOrchestrator
-from backend.free.llm.assist_client import assist_ready
+from backend.free.llm.aux_client import AuxClient
 from backend.free.generation.content_detector import detect_content_type
 from backend.free.generation.direct_codegen import generate_single_file
 from backend.free.generation.models import ContentType
@@ -307,6 +308,17 @@ async def _gate_reactive_light(
         return "deliberative", judge_task, "file_context"
     if state.tool_call_judge is None or state.tools_registry is None:
         return "deliberative", judge_task, "judge_unavailable"
+    # 会話全体を見ないと答えられない質問を、直近 REACTIVE_LIGHT_HISTORY_TURNS
+    # メッセージ + STM/SemMem 注入なしの視界で答えさせない。窓に収まっている
+    # 間は軽量パスでも正答できるので、実際に切り詰めが起きる場合だけ上げる
+    # (実インシデント 2026-08-12 ライブ監査 ターン21:「ここまでの会話を 5 行
+    # 以内で要約して。」が 21 文字で short_query → 軽量パスに落ち、直近 3 往復
+    # だけを要約した。31 ターン中の残り 28 ターンは要約に含まれなかった)。
+    if (
+        len(history) > REACTIVE_LIGHT_HISTORY_TURNS
+        and is_whole_session_scope_query(req.message)
+    ):
+        return "deliberative", judge_task, "whole_session_scope"
 
     try:
         if judge_task is not None:
@@ -382,16 +394,14 @@ async def _dispatch_reactive_light(
         )
 
 
-def _realtime_parallel_enabled(state: AppState) -> bool:
-    """チャット応答パスの assist 判定を並列化してよいか。
+def _realtime_parallel_enabled(state: AppState) -> bool:  # noqa: ARG001
+    """チャット応答パスの前処理 (競合収集 / ツール判定 / 検索) を並列化してよいか。
 
-    assist の realtime セマフォが 2 以上 (= サーバ側 slots とセットで並列度が
-    確保された構成) のときだけ True。1 (既定) では現行の直列フローを維持する。
+    以前は補助タスクの realtime セマフォ数で判定していた。チャット応答パスから
+    補助タスク呼出が無くなり、直列化の要因だったセマフォ自体が無くなったので
+    常に並列でよい (3 つとも互いに独立)。
     """
-    client = state.assist_client
-    if client is None:
-        return False
-    return getattr(client, "realtime_concurrency", 1) >= 2
+    return True
 
 
 async def _run_search_timed(
@@ -432,10 +442,17 @@ async def _build_messages_with_search(
     conflict_ctx: ConflictTurnContext | None = None,
     search_task: "asyncio.Task | None" = None,
     fewshot_block: str | None = None,
-) -> tuple[list, StreamWrapper, str | None, list[tuple[str, float, str]] | None]:
+) -> tuple[
+    list, StreamWrapper, str | None,
+    list[tuple[str, float, str]] | None, float | None,
+]:
     """統合検索を実行し ``messages`` / SSE 通知ラッパ / semmem ブロック / 取得済み
-    scored_chunks を構築する。``scored_chunks`` は long_form 経路が orchestrator に
-    再利用注入するために返す (非 long_form 経路は ``messages`` 側で消費するため未使用)。
+    scored_chunks / 採用チャンクの生スコア最大値を構築する。``scored_chunks`` は
+    long_form 経路が orchestrator に再利用注入するために返す (非 long_form 経路は
+    ``messages`` 側で消費するため未使用)。最後の要素は Level 0 の
+    ``rag_top1_score`` 用で、``scored_chunks`` 側のスコアが
+    ``rag.score_normalization`` 適用後 (minmax なら先頭は定義上 1.0) なのに対し、
+    こちらは cosine スケールの生スコア (``SearchResult.top_raw_score``)。
 
     ``search_task`` が渡された場合は chat() が先行起動した検索タスクを await して
     回収する (conflict 判定 / tool 判定との並走)。None の場合はここで直列実行する。
@@ -455,6 +472,7 @@ async def _build_messages_with_search(
     rag_chunks = search_result.chunks
     search_error = search_result.error
     scored_chunks = search_result.scored_chunks
+    rag_top_raw_score = search_result.rag_top_score
 
     salience_ranker = None
     if scored_chunks:
@@ -516,7 +534,7 @@ async def _build_messages_with_search(
         async for frame in inner_gen:
             yield frame
 
-    return messages, _wrapper, semmem_block, scored_chunks
+    return messages, _wrapper, semmem_block, scored_chunks, rag_top_raw_score
 
 
 def _build_rag_debug_frame(
@@ -608,11 +626,23 @@ def _format_file_block(
 def _build_long_form_orchestrator(
     client, state: AppState, cfg: dict, gen_params: dict,
 ) -> LongFormOrchestrator:
-    """LongFormOrchestrator を構築する (long_form ディスパッチ / コード委譲で共用)。"""
+    """LongFormOrchestrator を構築する (long_form ディスパッチ / コード委譲で共用)。
+
+    プラン生成 / レビュー / 設計仕様合成は ``AuxClient`` 越しに
+    **ベースモデルの専有スロット** で実行する。長文生成はユーザーが明示的に
+    起動する一次生成タスクで、本文生成そのものも同じベースモデルが担うため、
+    補助段だけを別モデルへ逃がす理由がない (docs/c_14 §1.1 の例外)。
+    """
     mem_sys = state.get_memory_system()
+    local = state.local_client
+    planner = (
+        AuxClient(local, config=cfg, debug_logger=state.debug_logger)
+        if local is not None and hasattr(local, "generate_constrained")
+        else None
+    )
     return LongFormOrchestrator(
         main_client=client,
-        assist_client=state.assist_client,
+        aux_client=planner,
         memory_wm=mem_sys[0] if mem_sys else None,
         config=cfg,
         debug_logger=state.debug_logger,
@@ -748,6 +778,7 @@ async def _dispatch_long_form(
     timer: StageTimer,
     output_target: str = "file",
     prefetched_rag: list[tuple[str, float, str]] | None = None,
+    prefetched_rag_top_score: float | None = None,
     file_context_block: str | None = None,
 ) -> StreamingResponse | ChatResponse:
     """Meta-Cognitive (long_form) 経路: 長文生成オーケストレータを起動する。
@@ -775,6 +806,7 @@ async def _dispatch_long_form(
                 private=req.private,
                 output_target=output_target,
                 prefetched_rag=prefetched_rag,
+                prefetched_rag_top_score=prefetched_rag_top_score,
                 file_context_block=file_context_block,
             ))),
             media_type="text/event-stream",
@@ -788,6 +820,7 @@ async def _dispatch_long_form(
             private=req.private,
             output_target=output_target,
             prefetched_rag=prefetched_rag,
+            prefetched_rag_top_score=prefetched_rag_top_score,
             file_context_block=file_context_block,
         )
 
@@ -799,7 +832,7 @@ def make_staged_codegen_delegate(client, cfg: dict, *, max_tokens: int | None = 
     ``StagedCreateExecutor`` に注入する。以前は ``make_code_artifact_generator`` と
     同じ LongFormOrchestrator 経路 (plan/CodeSpec 再合成 + CodeUnit 細粒度分割生成)
     を経由していたが、これは instruction (spec.md 全文 + flowchart + 契約ブロック)
-    の大半をアシストの再合成・トークン予算切り詰めで失い、生成コードが仕様と乖離
+    の大半を補助タスクの再合成・トークン予算切り詰めで失い、生成コードが仕様と乖離
     する原因になっていた (副作用として ``detect_content_type`` の TEXT 誤判定対策
     も必要だった)。staged は ``synthesize_create_task_graph`` が既にプログラムを
     ファイル単位へ決定的に分解済みのため、1 code タスク = 1 ファイルの単発生成で
@@ -836,9 +869,8 @@ def _staged_create_enabled(req: ChatRequest, cfg: dict, state: AppState) -> bool
         return False
     if not create_cfg.get("staged_enabled", True):
         return False
-    # create モードでは residency が常駐を保証する (/api/mode/switch が acquire)。
-    # 起動失敗・未配線なら従来 longform へ倒す。
-    if not assist_ready(getattr(state, "assist_client", None), "create_task_graph"):
+    # 補助クライアント未配線 (ベース llama-server 未接続) なら従来 longform へ倒す。
+    if getattr(state, "aux_client", None) is None:
         return False
     if not is_pro():
         return False
@@ -864,12 +896,13 @@ async def _dispatch_staged_create(
     timer: StageTimer,
     output_target: str = "file",
     prefetched_rag: list[tuple[str, float, str]] | None = None,
+    prefetched_rag_top_score: float | None = None,
     file_context_block: str | None = None,
 ) -> StreamingResponse | ChatResponse:
     """staged クリエイト: 専用 LoopDriver をインライン駆動し spec→code→test を実行。
 
     非ストリーミング要求 / base 不健全時は従来 longform 経路へフォールバックする。
-    タスクグラフ合成が空 (assist degraded 等) のときも stream 内で longform へ委譲。
+    タスクグラフ合成が空 (aux degraded 等) のときも stream 内で longform へ委譲。
     """
     base_ok, client = await ensure_base_model_health(client, state, cfg)
     if not base_ok:
@@ -888,7 +921,9 @@ async def _dispatch_staged_create(
                 req.mode, state, instance_name, context_size,
                 messages, existing_content,
                 timer=timer, private=req.private, output_target=output_target,
-                prefetched_rag=prefetched_rag, file_context_block=file_context_block,
+                prefetched_rag=prefetched_rag,
+                prefetched_rag_top_score=prefetched_rag_top_score,
+                file_context_block=file_context_block,
             )
 
     codegen = make_staged_codegen_delegate(client, cfg)
@@ -907,7 +942,9 @@ async def _dispatch_staged_create(
             req.mode, state, instance_name, context_size,
             messages, existing_content,
             timer=timer, private=req.private, output_target=output_target,
-            prefetched_rag=prefetched_rag, file_context_block=file_context_block,
+            prefetched_rag=prefetched_rag,
+            prefetched_rag_top_score=prefetched_rag_top_score,
+            file_context_block=file_context_block,
         )
 
     return StreamingResponse(
@@ -918,7 +955,9 @@ async def _dispatch_staged_create(
             codegen=codegen, part_codegen=part_codegen,
             fallback_factory=_fallback_factory,
             timer=timer, private=req.private,
-            prefetched_rag=prefetched_rag, file_context_block=file_context_block,
+            prefetched_rag=prefetched_rag,
+            prefetched_rag_top_score=prefetched_rag_top_score,
+            file_context_block=file_context_block,
         ))),
         media_type="text/event-stream",
     )
@@ -966,11 +1005,11 @@ async def _dispatch_meta_cognitive(
         agent_tracer=state.agent_tracer,
         loop_view=loop_view,
         project_id=state.current_project_id,
-        # 計画立案 (`_plan`) は CLAUDE.md §1 に従いアシスト
-        # モデルで実行する。``state.assist_client`` は health_check 失敗時
+        # 計画立案 (`_plan`) は CLAUDE.md §1 に従い補助タスク
+        # モデルで実行する。``state.aux_client`` は health_check 失敗時
         # ``None`` (degraded mode) になるが、その場合 ``_plan`` は空リスト
         # を返し単一タスクへフォールバックする。
-        assist_client=state.assist_client,
+        aux_client=state.aux_client,
         # に記録 (decision_point=``meta_cognitive_llm_route``)
         debug_logger=state.debug_logger,
         # ツールループ全反復で SemMem メモリを維持 (初回ターンと同じ block)
@@ -1046,8 +1085,7 @@ async def _dispatch_deliberative(
         config=cfg,
         tool_judge=state.tool_call_judge,
         tools_registry=state.tools_registry,
-        assist_client=state.assist_client,
-        assist_experience_recorder=state.assist_experience_recorder,
+        judge_experience_recorder=state.judge_experience_recorder,
         agent_tracer=state.agent_tracer,
         # コンテンツ生成 max_tokens を create_model の実窓に合わせる
         mode=req.mode,
@@ -1177,11 +1215,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     try:
         if _realtime_parallel_enabled(state):
             conflict_task = asyncio.create_task(
-                maybe_resolve_pending_conflicts(
-                    state, cfg, history, req.message,
-                    allow_write=not req.private, session_id=session_id,
-                    mode=req.mode,
-                )
+                collect_pending_conflicts(state, cfg, mode=req.mode)
             )
             if (
                 agent_layer != "meta_cognitive"
@@ -1204,10 +1238,8 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 logger.warning("Conflict review task failed (degrading): %s", exc)
                 conflict_ctx = ConflictTurnContext()
         else:
-            conflict_ctx = await maybe_resolve_pending_conflicts(
-                state, cfg, history, req.message,
-                allow_write=not req.private, session_id=session_id,
-                mode=req.mode,
+            conflict_ctx = await collect_pending_conflicts(
+                state, cfg, mode=req.mode,
             )
 
         # reactive→deliberative エスカレート時に Level 0 経験記録の出自を残す。
@@ -1224,7 +1256,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         if agent_layer == "reactive" and (
             conflict_ctx.pending_groups or conflict_ctx.resolved is not None
         ):
-            conflict_notice = _render_conflict_section(state, cfg, conflict_ctx)
+            conflict_notice = _render_conflict_section(cfg, conflict_ctx)
 
         if agent_layer == "reactive":
             # URL recall プリチェック: 過去会話で fetch 済みの URL fact が
@@ -1312,7 +1344,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             output_target = "file"
             editor_route = None
 
-        messages, search_error_wrapper, semmem_block, scored_chunks = (
+        messages, search_error_wrapper, semmem_block, scored_chunks, rag_top_raw = (
             await _build_messages_with_search(
                 req, state, cfg, system_prompt, history, file_contexts,
                 context_size, max_tokens, timer,
@@ -1329,13 +1361,15 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
 
         # Level 0 経験記録用 RAG シグナル。long_form 経路は prefetched_rag から
         # 自前で導出するため、ここでは meta_cognitive / deliberative へ伝播する。
-        rag_used, rag_top1_score = rag_signals_from_chunks(scored_chunks)
+        # スコアは正規化前の生スコア (rag_top_raw) を渡す — scored_chunks 側は
+        # score_normalization 適用後で minmax なら先頭が定義上 1.0 になる。
+        rag_used, rag_top1_score = rag_signals_from_chunks(scored_chunks, rag_top_raw)
 
         match agent_layer:
             case "meta_cognitive" if classifier.is_long_form:
                 # long_form は precomputed tool 判定を使わない (judge_task は通常 None)。
                 _cancel_pending_task(judge_task)
-                # create mode + pipeline=staged + Pro + assist 健全 のときは
+                # create mode + pipeline=staged + Pro + aux 健全 のときは
                 # 仕様書→コード→テストの staged パイプライン (専用 LoopDriver) へ。
                 # それ以外は従来 longform 経路 (無改変フォールバック)。
                 if _staged_create_enabled(req, cfg, state):
@@ -1345,6 +1379,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                         search_error_wrapper, timer,
                         output_target=output_target,
                         prefetched_rag=scored_chunks,
+                        prefetched_rag_top_score=rag_top_raw,
                         file_context_block=file_block,
                     )
                 return await _dispatch_long_form(
@@ -1352,6 +1387,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                     instance_name, context_size, messages, search_error_wrapper, timer,
                     output_target=output_target,
                     prefetched_rag=scored_chunks,
+                    prefetched_rag_top_score=rag_top_raw,
                     file_context_block=file_block,
                 )
             case "meta_cognitive":
@@ -1362,7 +1398,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 # 渡し、ツールループ / コンテンツ生成 / fallback の system に
                 # [参考例] として注入する (Level 1 進化を create 生成へ反映)。
                 _cancel_pending_task(judge_task)
-                # create mode + pipeline=staged + Pro + assist 健全 のときは、
+                # create mode + pipeline=staged + Pro + aux 健全 のときは、
                 # is_long_form でない create 要求 (「テトリスを作成して」級) も
                 # staged パイプラインへ。is_long_form ブランチと同一ゲート。
                 if _staged_create_enabled(req, cfg, state):
@@ -1372,6 +1408,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                         search_error_wrapper, timer,
                         output_target=output_target,
                         prefetched_rag=scored_chunks,
+                        prefetched_rag_top_score=rag_top_raw,
                         file_context_block=file_block,
                     )
                 return await _dispatch_meta_cognitive(

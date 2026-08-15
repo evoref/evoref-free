@@ -202,7 +202,7 @@ class ModeRenameMigrator:
         except KeyError:  # pragma: no cover - LOCAL_DEFAULTS 由来なので通常起きない
             learning_dir = None
         if learning_dir and learning_dir.is_dir():
-            # <stem>/coding/ と assist/<...>/coding/ (mode パーティション)
+            # <stem>/coding/ と aux/<...>/coding/ (mode パーティション)
             targets.extend(learning_dir.glob("*/coding"))
             targets.extend(learning_dir.glob("*/*/coding"))
             # <stem>/prompts/coding.md, coding.meta.json, history/coding_v*.md

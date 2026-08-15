@@ -15,7 +15,7 @@ class MtpConfig(BaseModel):
     **MTP ヘッドを内蔵した GGUF でのみ有効** (Qwen3.5/3.6 等。GGUF メタデータ
     ``<arch>.nextn_predict_layers > 0`` で判定)。非対応モデルに対しては
     ``scripts/launch_llama.py`` 側で warning + フラグ未付与で素通りさせる
-    (graceful degrade)。base / assist で共有する。
+    (graceful degrade)。
 
     起動フラグ (llama-server): ``--spec-type draft-mtp`` +
     ``--spec-draft-n-max <draft_n_max>``。
@@ -59,17 +59,28 @@ class LlamaSpeculativeConfig(BaseModel):
             r"ngram-map-k|ngram-map-k4v|draft-model)$"
         ),
     )
-    # ngram / draft-model 共通: 1 サイクルで採択を試みる draft トークン数の
-    # 上下限 (上流 ``--draft-max`` / ``--draft-min``)。null で未指定 (= 上流既定)。
+    # 以下の 3 つは上流 llama.cpp が 2026-05 に総称フラグを削除し mode 別へ
+    # 分割したため、実フラグ名が mode 依存になる。対応表と、対応フラグを持たない
+    # 組み合わせの graceful degrade は ``scripts/launch_llama.py`` の
+    # ``build_speculative_args`` (と ``_NGRAM_MOD_MODES`` / ``_NGRAM_SIZED_MODES``)
+    # が単一情報源。
+
+    # 1 サイクルで採択を試みる draft トークン数の上下限。null で未指定 (= 上流既定)。
+    # default / ngram-mod → ``--spec-ngram-mod-n-max`` / ``-n-min``
+    # それ以外            → ``--spec-draft-n-max`` / ``-n-min``
     draft_max: int | None = Field(default=64, ge=0)
     draft_min: int | None = Field(default=48, ge=0)
-    # draft 確率閾値 (greedy 採択時の足切り)。null で未指定。
+    # draft 確率閾値 (greedy 採択時の足切り、上流 ``--draft-p-min``)。null で未指定。
     draft_p_min: float | None = Field(default=None, ge=0.0, le=1.0)
-    # draft 文脈長 (上流 ``-cd``)。0 で model から取得 (上流既定)。
+    # ⚠ 現在は **無視される**。上流が ``-cd`` / ``--ctx-size-draft`` を代替フラグごと
+    # 削除したため、>0 を指定しても warning が出るだけでフラグは付与されない。
     ctx_size_draft: int = Field(default=0, ge=0)
-    # ngram lookup 長 (上流 ``--spec-ngram-size-n``)。
+    # ngram lookup 長。default / ngram-mod → ``--spec-ngram-mod-n-match``、
+    # ngram-simple / ngram-map-k / ngram-map-k4v → ``--spec-<mode>-size-n``、
+    # ngram-cache / draft-model → 対応フラグ無し (warning)。
     ngram_size_n: int | None = Field(default=24, ge=0)
-    # ngram draft 長 (上流 ``--spec-ngram-size-m``)。
+    # ngram draft 長。ngram-simple / ngram-map-k / ngram-map-k4v →
+    # ``--spec-<mode>-size-m``。それ以外は対応フラグ無し (warning)。
     ngram_size_m: int | None = Field(default=None, ge=0)
     # mode="draft-model" 専用: 外部 draft モデル GGUF 相対 / 絶対パス。
     draft_model_path: str | None = None
@@ -94,7 +105,7 @@ class LlamaConfig(BaseModel):
     # ``"auto"`` 指定時は scripts/launch_llama.py の resolve 関数が
     # GPU 物理容量 + GGUF layer 数 + Vulkan host buffer headroom から
     # 段階的に縮小した値 (100% / 80% / 60% / 40% / 0%) を算出する。
-    # iGPU 環境で base/assist の GPU メモリ占有を抑え、embed の
+    # iGPU 環境で base の GPU メモリ占有を抑え、embed の
     # Vulkan host buffer 確保失敗 (ErrorOutOfDeviceMemory) を回避する用途。
     gpu_layers: int | Literal["auto"] = Field(default=999)
 
@@ -117,7 +128,11 @@ class LlamaConfig(BaseModel):
     flash_attn: bool = True
     mlock: bool = False
     cache_prompt: bool = True
-    slots: int = Field(default=1, ge=1, le=16)
+    # 2 = チャットとバックグラウンド (学習 / sleep-time) をスロット分離する既定。
+    # 1 に落とすと両者が直列化し、Level 1 変異 1 回ぶん (実測 16〜32 秒) チャットが
+    # 待たされる。kv_unified が slots>1 で自動付与されるため per-seq context は
+    # n_ctx のままで、VRAM は増えない。
+    slots: int = Field(default=2, ge=1, le=16)
     cache_type_k: str = Field(
         default="q8_0", pattern=r"^(f16|bf16|q8_0|q5_1|q5_0|q4_1|q4_0)$"
     )
@@ -130,7 +145,7 @@ class LlamaConfig(BaseModel):
     # ⚠️ SWA (sliding window attention) モデル (gemma-4 等) では llama.cpp が
     # ``cache_reuse is not supported by this context`` で自動無効化し、毎ターン
     # full re-prefill するため **no-op** (フラグは無害に無視される)。非 SWA base
-    # に差し替えた場合のみ有効。AssistModelLocalConfig.cache_reuse と同型。
+    # に差し替えた場合のみ有効。AuxModelLocalConfig.cache_reuse と同型。
     cache_reuse: int = Field(default=256, ge=0)
     max_tokens: int = Field(default=1024, ge=0)  # 0=無制限
     lora_target: str = "auto"
@@ -159,7 +174,7 @@ class LlamaConfig(BaseModel):
     mtp: MtpConfig = Field(default_factory=MtpConfig)
     # モデル arch 別の起動フラグ / sampling 自動決定。true で GGUF メタデータ +
     # 同梱 model_profiles から --jinja / --reasoning-format / MoE / sampling 既定を
-    # 解決する (base / assist 共通)。false で全機構 OFF (従来挙動)。
+    # 解決する。false で全機構 OFF (従来挙動)。
     auto_model_flags: bool = True
     extra_args: list[str] = Field(default_factory=list)
 
@@ -169,7 +184,7 @@ class ProfileSamplingConfig(BaseModel):
 
     モデルカードが推奨する生成パラメータの宣言先。宣言したキーだけが
     ``model_dump(exclude_none=True)`` で返り、未宣言キーは ``modes.*`` (base) /
-    呼出側既定 (assist) に委ねられる。プロファイル由来の値は llama-server の
+    呼出側既定に委ねられる。プロファイル由来の値は llama-server の
     リクエストへ直接載るため、``extra="forbid"`` + 範囲制約で早期に弾く
     (検証に失敗したセクションは WARNING を出して丸ごと無視する)。
     """
@@ -200,7 +215,7 @@ class ProfileReasoningConfig(BaseModel):
     mode: Literal["toggle", "always", "none"] = "none"
     enable_thinking: bool | None = None  # toggle 型の既定
 
-    # サーバ側制御 (server_control=True; 起動フラグへ。AssistModelLocalConfig と同型)
+    # サーバ側制御 (server_control=True; 起動フラグへ。AuxModelLocalConfig と同型)
     # 配線状況の SSOT は docs/c_15 §2.7。reasoning_format は未消費 (--reasoning-format は
     # profile launch_flags 由来)、budget_default/budget_message のみ起動フラグへ反映。
     server_control: bool = False

@@ -1,6 +1,6 @@
 """llama-server プロセスマネージャ
 
-base / assist / embedding の 3 種 llama-server プロセスを
+base / embedding の 2 種 llama-server プロセスを
 単一のレジストリで管理する。`migrate_component` API がモデル切替成功後に
 `restart()` を呼び出し、無停止 (ユーザーが手動シェル操作不要) でモデルを
 切り替える。
@@ -30,8 +30,8 @@ from backend.log_config import get_logger
 logger = get_logger("core.llama_process_manager")
 
 
-# 3 種のコンポーネント名 (assist/embedding は L1 と一致)
-PROCESS_COMPONENTS: tuple[str, ...] = ("base", "assist", "embedding")
+# コンポーネント名 (embedding は L1 と一致)
+PROCESS_COMPONENTS: tuple[str, ...] = ("base", "embedding")
 
 
 class ProcessManagerError(Exception):
@@ -55,9 +55,6 @@ def _resolve_endpoint(component: str, cfg: dict) -> tuple[str, int]:
     if component == "base":
         lc = cfg.get("llama", {}) or {}
         return lc.get("host", "127.0.0.1"), int(lc.get("port", 8080))
-    if component == "assist":
-        lcfg = (cfg.get("assist_model", {}) or {}).get("local", {}) or {}
-        return lcfg.get("host", "127.0.0.1"), int(lcfg.get("port", 8081))
     if component == "embedding":
         emb = cfg.get("embedding", {}) or {}
         return (
@@ -84,9 +81,25 @@ def _build_cmd(component: str, cfg: dict, project_root: Path) -> list[str] | Non
     spec.loader.exec_module(mod)
 
     if component == "base":
-        return mod.build_llama_cmd(cfg, project_root)
-    if component == "assist":
-        return mod.build_assist_cmd(cfg, project_root)
+        # 学習済み base LoRA は (モデル×モード) パーティション配下にあるため、
+        # build_llama_cmd 内の flat フォールバックでは拾えない。解決 + 互換検証を
+        # 共有述語へ委譲し、モード切替経路 (backend.free.api.config.mode) と
+        # 同じ判断で --lora を付与する。
+        from backend.config import get_path_resolver, resolve_base_lora_for_launch
+
+        try:
+            mode = get_path_resolver().active_mode
+        except RuntimeError:
+            # config 未ロード (単体テスト等)。起動時の既定モードへ倒す。
+            mode = "chat"
+        lora_override, lora_fallback = resolve_base_lora_for_launch(
+            cfg, project_root, mode,
+        )
+        return mod.build_llama_cmd(
+            cfg, project_root,
+            lora_override=lora_override,
+            lora_fallback=lora_fallback,
+        )
     if component == "embedding":
         return mod.build_embed_cmd(cfg, project_root)
     raise ProcessManagerError(f"Unknown component: {component}")

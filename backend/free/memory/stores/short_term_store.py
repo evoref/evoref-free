@@ -129,13 +129,34 @@ def _note_to_dict(note: MemoryNote) -> dict:
     }
 
 
+def _sanitize_tags(tags: list[str], source: str) -> list[str]:
+    """保存済みノートのタグを現行ルールへ揃える (読込時の遡及修復)。
+
+    ``NoteBuilder.auto_tag`` は assistant 発話に ``fact`` を付けなくなったが、
+    **既に保存されたノートには残っている**。``fact`` ノートは
+    ``MemoryInjector`` がプロンプトへ「(過去の記録)」として注入し、システム
+    プロンプトが「[関連する記憶] は自分の記憶より優先」と規定しているため、
+    過去の誤答が以後のターンでモデル自身の知識を上書きし続ける
+    (2026-08-15 ライブ監査で三名園の誤答が別セッションへ注入されていた)。
+
+    生成側の修正だけでは既存データが直らないので、読込時にも同じルールを
+    適用する。冪等で、次回保存時にファイルからも消える。
+    """
+    if source != "assistant" or not tags:
+        return tags
+    from backend.free.memory.notes.note_builder import NoteBuilder
+
+    return [t for t in tags if t not in NoteBuilder.ASSISTANT_EXCLUDED_TAGS]
+
+
 def _note_from_dict(d: dict) -> MemoryNote:
     emb = d.get("embedding")
+    source = d.get("source", "user")
     return MemoryNote(
         id=d["id"],
         content=d["content"],
         keywords=d.get("keywords", []),
-        tags=d.get("tags", []),
+        tags=_sanitize_tags(d.get("tags", []), source),
         embedding=np.array(emb, dtype=np.float32) if emb is not None else None,
         lightmem_score=d.get("lightmem_score", 0.5),
         created_at=d.get("created_at", 0.0),
@@ -147,7 +168,7 @@ def _note_from_dict(d: dict) -> MemoryNote:
         conflict_candidate=d.get("conflict_candidate", False),
         conflict_partner_id=d.get("conflict_partner_id"),
         # EvorefMem 拡張
-        source=d.get("source", "user"),
+        source=source,
         confidence=d.get("confidence", 1.0),
         pin_flag=d.get("pin_flag", False),
         pin_reason=d.get("pin_reason"),

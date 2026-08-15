@@ -25,7 +25,7 @@ type LineEndingSetting = EditorConfig['default_line_ending'];
 const BASE_TAB_SECTIONS: Readonly<Record<string, readonly string[]>> = {
 	general: ['instance', 'server', 'theme', 'i18n'],
 	inference: ['llama'],
-	model: ['model_paths', 'assist_model', 'embedding'],
+	model: ['model_paths', 'embedding'],
 	rag: ['rag'],
 	memory: ['memory'],
 	learning: ['learning', 'agent'],
@@ -207,7 +207,7 @@ promptLocale.subscribe((newLocale) => {
 /**
  * model_paths の単一フィールドを即時保存する (migrate 非対象キー用。create_model 等)
  *
- * base/assist/embed のような model_state 追跡キーは migrate API 経由でしか変更できないが、
+ * base/embed のような model_state 追跡キーは migrate API 経由でしか変更できないが、
  * create_model は非追跡なので config 直保存でよい。追跡キーは現在値のまま同梱して送ると
  * バックエンドの immutable ガードを通過する (値が変化したキーのみ 403)。
  * 保存後の dirty クリア / 再スナップショットは呼び出し側の loadConfig 再取得に委ねる。
@@ -381,7 +381,6 @@ async function syncAppStores(changedSections: string[]): Promise<void> {
 /** サーバープロセスに影響する設定セクション (保存後にサイドバーを即時更新する) */
 const SERVER_AFFECTING_SECTIONS = new Set([
 	'model_paths',
-	'assist_model',
 	'embedding',
 	'llama'
 ]);
@@ -390,7 +389,7 @@ const SERVER_AFFECTING_SECTIONS = new Set([
  * サーバー関連セクションを保存した場合、サイドバーの状態 (緑ランプ / VRAM) を
  * 即時更新する。
  *
- * assist_model.enabled の ON/OFF はバックエンドで llama-server プロセスの
+ * aux_model.enabled の ON/OFF はバックエンドで llama-server プロセスの
  * 自動起動 / 停止を伴うため、次のポーリングを待たずに緑ランプとメモリ容量を
  * 揃えて反映させる。
  */

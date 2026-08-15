@@ -147,9 +147,20 @@ export const KATEX_SANITIZE_OPTIONS: {
 
 let installed = false;
 
-/** marked シングルトンへ数式拡張を一度だけ登録する。 */
+/**
+ * marked シングルトンへチャット向け設定を一度だけ登録する (数式拡張 + 改行の扱い)。
+ *
+ * `breaks: true` は CommonMark 既定 (単一改行を無視して段落内で連結) を、チャット
+ * 応答で期待される「1 改行 = 1 行」へ変える。既定のままだと LLM が改行で区切った
+ * 出力が 1 行に潰れ、書式指定そのものが守られていないように見える (2026-08-12
+ * ライブ監査:「必ず 3 行ちょうどで」の依頼に 3 行で応答したが、画面上は
+ * 「甘くてジューシーです。 vitaminも豊富です。 健康に良い果実です。」と 1 行に
+ * 連結された。会話の要約も同様に箇条書きが 1 行に潰れていた)。
+ * 段落・リスト・コードブロックの解釈は変わらない。
+ */
 export function installKatexExtension(): void {
 	if (installed) return;
 	installed = true;
 	marked.use(katexExtension);
+	marked.use({ breaks: true });
 }

@@ -200,7 +200,7 @@
     "mode_create_pro_only_warning": "--mode create is Pro-only. Falling back to chat mode in Free.",
     "mode_default_resolved": "Mode: {mode} (edition default)",
     "develop_banner": "DEVELOP MODE ON [{level}] — develop logging enabled",
-    "learning_disabled_banner": "Self-learning disabled (--no-learning) — Level 0/1/2 and Pro assist injection are no-op; SemMem reads continue.",
+    "learning_disabled_banner": "Self-learning disabled (--no-learning) — Level 0/1/2 and Pro learn injection are no-op; SemMem reads continue.",
     "develop_level_develop_only": "--develop={level} requires Develop edition. Use --develop=debug or --develop=investigate instead.",
     "develop_mode_active": "Develop mode is active",
     "history_empty": "No conversation history",
@@ -432,8 +432,7 @@
       "invalid_response": "Received invalid response from inference server.",
       "model_not_found": "Model file not found: {path}",
       "process_crashed": "Inference server crashed. Attempting restart.",
-      "request_rejected": "Embedding server rejected the request: {detail}. You may need to raise embedding.context_size.",
-      "assist_unavailable": "The assist model is currently stopped (it does not run during chat). This work runs in the next idle window."
+      "request_rejected": "Embedding server rejected the request: {detail}. You may need to raise embedding.context_size."
     },
     "fs": {
       "index_corrupted": "Vector index corrupted. Attempting recovery.",

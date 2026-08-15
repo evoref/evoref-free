@@ -1,15 +1,15 @@
-"""アシスト purpose 別 timeout の自己較正値の永続化 (model-keyed)
+"""補助タスク purpose 別 timeout の自己較正値の永続化 (model-keyed)
 
-`AssistModelClient` が観測した ReadTimeout から反応的に引き上げた purpose 別
-timeout 天井を、アシストモデルの GGUF ファイル名でキー化して JSON 永続化する。
-モデルを切り替えた際に別モデルの較正値を誤用しないよう、ファイル名が一致する
-entry のみをロードする。
+`AuxClient` が観測したタイムアウトから反応的に引き上げた purpose 別 timeout
+天井を、ベースモデルの GGUF ファイル名でキー化して JSON 永続化する。モデルを
+切り替えた際に別モデルの較正値を誤用しないよう、ファイル名が一致する entry
+のみをロードする。
 
 レイヤー責務:
-- `AssistModelClient`        — ドメイン (レイテンシ観測、天井引き上げ判定)
-- `AssistCalibrationStore`   — インフラ (JSON 永続化、ファイル I/O)
+- `AuxClient`             — ドメイン (レイテンシ観測、天井引き上げ判定)
+- `AuxCalibrationStore`   — インフラ (JSON 永続化、ファイル I/O)
 
-このため `AssistCalibrationStore` は import 時にドメインを参照せず、純粋な dict
+このため `AuxCalibrationStore` は import 時にドメインを参照せず、純粋な dict
 構造のみに依存する (循環依存防止 + 単体テスト容易性確保)。
 """
 
@@ -22,16 +22,16 @@ from backend.io.atomic import atomic_write_text
 from backend.log_config import get_logger
 from backend.utils import utc_now
 
-logger = get_logger("llm.assist_calibration_store")
+logger = get_logger("llm.aux_calibration_store")
 
 
-class AssistCalibrationStore:
-    """アシスト較正値の純粋な永続化担当 (model-keyed)
+class AuxCalibrationStore:
+    """補助タスク較正値の純粋な永続化担当 (model-keyed)
 
     JSON 構造::
 
         {
-          "<assist_model_filename>": {
+          "<base_model_filename>": {
             "timeouts": {"<purpose>": <float seconds>, ...},
             "calibrated_at": "<ISO8601 Z>",
             "source": "reactive"
@@ -51,7 +51,7 @@ class AssistCalibrationStore:
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
-            logger.warning("Failed to load assist calibration from %s: %s", p, e)
+            logger.warning("Failed to load aux calibration from %s: %s", p, e)
             return {}
         return data if isinstance(data, dict) else {}
 
@@ -64,7 +64,7 @@ class AssistCalibrationStore:
         """
         if not model_filename:
             return {}
-        entry = AssistCalibrationStore.load_all(path).get(model_filename)
+        entry = AuxCalibrationStore.load_all(path).get(model_filename)
         if not isinstance(entry, dict):
             return {}
         raw = entry.get("timeouts")
@@ -95,7 +95,7 @@ class AssistCalibrationStore:
         if not model_filename:
             return
         p = Path(path)
-        data = AssistCalibrationStore.load_all(p)
+        data = AuxCalibrationStore.load_all(p)
         data[model_filename] = {
             "timeouts": {str(k): float(v) for k, v in timeouts.items()},
             "calibrated_at": utc_now(),
@@ -107,6 +107,6 @@ class AssistCalibrationStore:
             encoding="utf-8",
         )
         logger.info(
-            "Saved assist calibration for model=%s (%d purposes) to %s",
+            "Saved aux calibration for model=%s (%d purposes) to %s",
             model_filename, len(timeouts), p,
         )

@@ -2,7 +2,7 @@
 	/**
 	 * モデル別サーバー制御 (単一 llama-server)
 	 *
-	 * モデルページの各モデル種別 (base / assist / embed) の直下に置き、対応する
+	 * モデルページの各モデル種別 (base / embed) の直下に置き、対応する
 	 * llama-server プロセスの起動・停止・強制再起動と接続状態 / VRAM を表示する。
 	 * モデル切替 (ComponentMigrateButton) 後に「必要なサーバの再起動」をその場で
 	 * 行えるようにするのが目的 (旧: 開発ページの ServerStatus を種別ごとに分割移設)。
@@ -23,24 +23,17 @@
 	let { server }: Props = $props();
 
 	// /api/status の ComponentStatus.name はモデル識別子 (model_id / ファイル stem /
-	// model_name) で、ロール名 (base/assist/embed) は持たない。一方 status.py の
-	// _collect_component_statuses は必ず base → assist → embed の固定順で append するため、
+	// model_name) で、ロール名 (base/embed) は持たない。一方 status.py の
+	// _collect_component_statuses は必ず base → embed の固定順で append するため、
 	// ロールは name 一致ではなく index で引く (旧 ServerStatus も同じ前提)。
 	// VRAM 側 (vram_monitor MODEL_NAMES) はロール名キーなので vramInline の find は name 一致で正しい。
-	const SERVER_INDEX: Record<ServerName, number> = { base: 0, assist: 1, embed: 2 };
+	const SERVER_INDEX: Record<ServerName, number> = { base: 0, embed: 1 };
 	let comp = $derived($serverState.components[SERVER_INDEX[server]]);
 	let connected = $derived(comp?.connected ?? false);
 	let busy = $derived($busyServer === server);
 
-	// アシストのオンデマンド常駐 (docs/c_14 §1.2)。停止は設計どおりの状態なので、
+	// 補助タスクのオンデマンド常駐 (docs/c_14 §1.2)。停止は設計どおりの状態なので、
 	// 未接続 (灰ランプ) を「異常」と読み違えないようラベルで理由を添える。
-	// `failed` だけが本当の異常。residency が無い (always / base / embed) なら未表示。
-	let residency = $derived(comp?.residency ?? null);
-	let residencyLabel = $derived(
-		residency === null || residency === 'ready'
-			? ''
-			: $t(`sidebar.assist_residency_${residency}`),
-	);
 
 	/** 直前の起動失敗を記録 (force restart 提案用) */
 	let startFailed = $state(false);
@@ -102,12 +95,9 @@
 		<span
 			class="status-dot"
 			class:connected
-			class:failed={(startFailed && !connected) || residency === 'failed'}
+			class:failed={startFailed && !connected}
 		></span>
 		<span class="vram-cell {vram.cls}">{vram.text}</span>
-		{#if residencyLabel}
-			<span class="residency" class:failed={residency === 'failed'}>{residencyLabel}</span>
-		{/if}
 		<div class="actions">
 			{#if connected}
 				<button

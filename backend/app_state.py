@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from backend.debug_logger import DebugLogger
-    from backend.free.agent.assist_prompt_manager import AssistPromptManager
+    from backend.free.agent.aux_prompt_manager import AuxPromptManager
     from backend.free.core.llama_process_manager import LlamaProcessManager
     from backend.free.core.policy_interpreter import PolicyInterpreter
     from backend.free.agent.agent_tracer import AgentTracer
@@ -35,19 +35,19 @@ if TYPE_CHECKING:
     from backend.free.agent.reactive import ReactiveAgent
     from backend.free.agent.tool_call_judge import ToolCallJudge
     from backend.free.agent.tools_registry import ToolsRegistry
+    from backend.free.learning.aux_experience import AuxExperienceBuffer
     from backend.free.learning.scheduler import LearningScheduler
-    from backend.free.llm.assist_client import AssistModelClient
-    from backend.free.llm.assist_residency import AssistResidencyManager
+    from backend.free.llm.aux_client import AuxClient
     from backend.free.llm.llm_client import LLMClient
     from backend.free.llm.local_client import LocalClient
     from backend.free.memory.stores.long_term import LongTermMemory
     from backend.free.memory.scheduler import SleepTimeScheduler
     from backend.free.memory.semantic.store import SemanticFactStore
-    from backend.free.memory.pipeline.rag_judge_assist_log import RagJudgeAssistLog
+    from backend.free.memory.pipeline.rag_judge_log import RagJudgeLog
     from backend.free.memory.stores.short_term import ShortTermMemory
     from backend.free.memory.stores.working import WorkingMemory
     from backend.free.memory.views.mem import MemFactView
-    from backend.free.rag.assist_judge_tracker import AssistJudgeUsageTracker
+    from backend.free.rag.judge_usage_tracker import JudgeUsageTracker
     from backend.free.rag.embedding_backend import EmbeddingBackend
     from backend.free.rag.lazy_contextual import LazyContextualPrefixService
     from backend.free.rag.cartridge_manager import CartridgeManager
@@ -105,12 +105,10 @@ class AppState:
     # ── LLM クライアント ──
     local_client: LocalClient | None = None
     llm_client: LLMClient | None = None
-    assist_client: AssistModelClient | None = None
-    # アシスト llama-server のオンデマンド常駐管理 (docs/c_14 §1.2)。
-    # ``assist_model.residency: on_demand`` (既定) では、アイドル窓と create
-    # モードの間だけプロセスを起動する。``None`` は未配線 (テスト等) を意味し、
-    # 呼出側は「常駐している」とみなして従来どおり振る舞う。
-    assist_residency: "AssistResidencyManager | None" = None
+    # 補助タスク (sleep-time / 学習 / 長文プラン / create の計画・仕様合成) を
+    # ベースモデルの専有スロットで実行するクライアント。``local_client`` が
+    # 未接続の間は ``None``。
+    aux_client: AuxClient | None = None
 
     # ── メモリシステム ──
     working_memory: WorkingMemory | None = None
@@ -132,21 +130,21 @@ class AppState:
     # の時のみ wire_pillars で構築・注入される。``None`` または
     # ``is_active=False`` の場合、search_pipeline 側は通知をスキップする。
     lazy_contextual: "LazyContextualPrefixService | None" = None
-    # Self-RAG assist_judge のセッション / クエリ単位カウンタ
+    # Self-RAG quality_judge のセッション / クエリ単位カウンタ
     # ``run_search_pipeline`` 経由で ``session_id`` と共に参照し、
-    # ``rag.self_rag.assist_judge.max_per_session`` / ``max_per_query`` の
+    # ``rag.self_rag.quality_judge.max_per_session`` / ``max_per_query`` の
     # 上限判定とセッション切替時のリセット (``reset_session``) を担う。
-    assist_judge_tracker: "AssistJudgeUsageTracker | None" = None
+    judge_tracker: "JudgeUsageTracker | None" = None
     # conflict_chat_judge のセッション単位発火カウンタ (RAG 用とは別インスタンス)。
     # ``maybe_resolve_pending_conflicts`` が ``memory.conflict.chat_review
     # .max_judge_per_session`` の上限判定とセッション切替リセットに使う。
     # ``check()`` は使わず ``record`` / ``get_session_count`` / ``reset_session``
     # のみ利用する。
-    conflict_judge_tracker: "AssistJudgeUsageTracker | None" = None
+    conflict_judge_tracker: "JudgeUsageTracker | None" = None
     # RAG necessity/quality の embedding 決定論的リコール用リングバッファ。
     # SemMem ではない (チャット応答パスで直接 record するだけ)。sleep-time
     # Step 8.7 (rag_judge_curator) が drain して world_fact 化する。
-    rag_judge_assist_log: "RagJudgeAssistLog | None" = None
+    rag_judge_log: "RagJudgeLog | None" = None
     # URL/executable_command/RAG necessity・quality の embedding リコールで
     # 共有する global scope の MemFactView。``_init_tools`` のローカル変数を
     # 他の呼出元 (search_pipeline.py) でも再利用するため state に昇格。
@@ -160,8 +158,13 @@ class AppState:
     # ── model_state.json / config.yaml 整合性 ──
     # 不一致検出時のみ dict を格納 (current_filename / config_filename / recommendation)
     model_state_mismatch: dict | None = None
-    # component (assist/embed) の不一致。{config_key: {model_state, config}}
+    # component (embed) の不一致。{config_key: {model_state, config}}
     component_state_mismatches: dict = field(default_factory=dict)
+    # llama-server が実際にロードしているモデル (/props) と config の不一致。
+    # モデル移行は稼働中の llama-server を差し替えないため、再起動するまで
+    # 別モデルが serve され続ける (2026-08-12 に 62.8 時間見逃した事象)。
+    # {served_filename / expected_filename / recommendation}
+    served_model_mismatch: dict | None = None
     # 出力品質プローブの記録 (QualityProbeStore)。モデル切替を検知した役割だけ
     # 検査され、結果は /api/status で参照される。型注釈を文字列にせず Any 相当で
     # 持つのは、AppState を EvorefGen 非依存に保つため (lazy import で構築)。
@@ -170,13 +173,15 @@ class AppState:
 
     # ── エージェント / プロンプト ──
     prompt_manager: SystemPromptManager | None = None
-    assist_prompt_manager: AssistPromptManager | None = None
+    aux_prompt_manager: AuxPromptManager | None = None
+    # 補助タスク (rag_necessity / rag_quality / tool_call / note_evolve) の経験
+    # バッファ。Level 1 Phase 2 の補助プロンプト進化が読む。
+    aux_experience_buffer: "AuxExperienceBuffer | None" = None
     feedback_collector: FeedbackCollector | None = None
-    # assist 経験記録 closure (Pro/Develop 起動時のみ非 None)。primitive 5 引数
-    # (action_type, input_context, output, outcome, mode) を受け、Pro の assist 経験
-    # バッファへ記録する。mode は既定 "chat" (省略可)。factory 層で構築し、Free 側
-    # (chat_service / judge) は Pro 型非依存で呼ぶ。
-    assist_experience_recorder: "Callable[[str, str, str, float, str], None] | None" = None
+    # 判定経験記録 closure。primitive 5 引数
+    # (action_type, input_context, output, outcome, mode) を受け、補助タスク経験
+    # バッファと RAG 判定リングバッファへ記録する。mode は既定 "chat" (省略可)。
+    judge_experience_recorder: "Callable[[str, str, str, float, str], None] | None" = None
     file_manager: SessionFileManager | None = None
     learned_patterns_store: LearnedPatternStore | None = None
     tools_registry: ToolsRegistry | None = None
@@ -206,7 +211,7 @@ class AppState:
     # 自己学習サイクルの無効化フラグ (SSOT)。CLI フラグ `--no-learning`
     # で起動時に True になり、``EVOREF_LEARNING_DISABLED=1`` 環境変数で
     # サブプロセスへ伝播する。True の場合、LearningScheduler tick /
-    # Level 1 独立ループ / Level 2 runner 注入 / Pro assist 注入 /
+    # Level 1 独立ループ / Level 2 runner 注入 / Pro 学習コンポーネント注入 /
     # SleepTimeWorker 学習関連書戻し / FeedbackCollector.record が
     # すべて no-op となり、SemMem の読み込みやチャット応答は通常通り。
     learning_disabled: bool = False
@@ -323,42 +328,25 @@ class AppState:
 
         # ToolCallJudge._llm_client を同期 (ネイティブ tool calling 用)。
         # モード切替の base 再起動でクライアントが差し替わるため、ここで
-        # 追随しないと judge が閉じた旧オブジェクトを掴んだままになる
-        # (set_assist_client と同じ理由、docs/c_14 §1.2.2)。
+        # 追随しないと judge が閉じた旧オブジェクトを掴んだままになる。
         judge = self.tool_call_judge
         if judge is not None and hasattr(judge, "_llm_client"):
             judge._llm_client = client
 
-    def set_assist_client(self, client: AssistModelClient | None) -> None:
-        """アシストモデルクライアントを設定し、下流コンポーネントを同期する.
+        # 補助クライアントは同じ LocalClient の上に立つ。base を差し替えたら
+        # ここで追随させないと、閉じた旧クライアントを掴んだまま補助タスクが
+        # 全滅する (モード切替で base を再起動するたびに再現する)。
+        if self.aux_client is not None:
+            self.aux_client.local = client
 
-        起動時 health check 失敗で None にステージされた後、lazy_connect 経由
-        で本メソッドが呼ばれる。SleepTimeScheduler だけでなく、コンストラクタ
-        で client を握っているコンポーネント (SleepTimeWorker / ToolCallJudge)
-        の参照も差し替えないと、url_curator が永遠に degraded mode のままに
-        なる。
-        """
-        self.assist_client = client
-        if self.sleep_scheduler is not None and client is not None:
-            self.sleep_scheduler.set_assist_llm_client(client)
-
-        # SleepTimeWorker._assist_client を同期 (url_curator の入力)
-        sched = self.sleep_scheduler
-        if sched is not None:
-            worker = getattr(sched, "_worker", None)
-            if worker is not None and hasattr(worker, "_assist_client"):
-                worker._assist_client = client
-
-        # ToolCallJudge._assist_client を同期 (アシスト判定パス)
-        judge = self.tool_call_judge
-        if judge is not None and hasattr(judge, "_assist_client"):
-            judge._assist_client = client
-
-        # LearningScheduler.assist_llm_client を同期 (Level 1 プロンプト変異の
-        # assist ルーティング #5)。lazy_connect で assist が後から起きた場合も縮退を防ぐ。
-        ls = self.learning_scheduler
-        if ls is not None and client is not None and hasattr(ls, "assist_llm_client"):
-            ls.assist_llm_client = client
+        # SleepTimeScheduler にも追随させる。Level 1 常駐ループは
+        # ``_llm_client is None`` の tick を毎回 skip するため、起動時に
+        # llama-server が未接続だと (wire 時の ``if state.llm_client:`` が
+        # 通らず) lazy-connect 後もプロセスを再起動するまで Level 1 が
+        # 永久に走らない。base 差し替え時に閉じた旧クライアントを掴み続ける
+        # 問題も同じ経路で塞がる。
+        if self.sleep_scheduler is not None:
+            self.sleep_scheduler.set_llm_client(self.llm_client)
 
     # ── セッション管理 ──
 

@@ -10,11 +10,11 @@ develop モードを 3 段階 (``debug`` / ``investigate`` / ``evolve``)
 JSONL カテゴリの enabled / max_log_mb / log_retention_days を内部マップから
 導出する。``config.yaml`` の ``debug:`` セクションは廃止 (起動時に拒否)。
 
-公開 API (``log_request`` / ``log_assist_request`` / ``log_rag_result`` /
-``log_embedding`` / ``log_assist_judge`` /
+公開 API (``log_request`` / ``log_aux_request`` / ``log_rag_result`` /
+``log_embedding`` /
 ``log_memory_state`` / ``log_memory_op`` / ``log_learning_cycle`` /
 ``log_long_form_event`` / ``log_agent_trace_event`` / ``log_request_timing`` /
-``log_retry_attempt`` / ``log_assist_json_repair``)
+``log_retry_attempt`` / ``log_aux_json_repair``)
 のシグネチャは変更しないため、注入点 (CLAUDE.md §9 / `.claude/rules/backend.md`
 チェックリスト) の修正は不要。
 """
@@ -179,7 +179,7 @@ class DebugLogger:
             payload["response_full"] = response
         self._emit("requests", payload)
 
-    def log_assist_request(
+    def log_aux_request(
         self,
         messages_count: int,
         response_preview: str,
@@ -193,15 +193,15 @@ class DebugLogger:
         finish_reason: str = "",
         response_length: int = 0,
     ) -> None:
-        """アシストモデルのリクエスト/レスポンスを記録
+        """補助タスクのリクエスト/レスポンスを記録
 
         Args:
             priority: 用途別セマフォ選択
                 ``realtime`` / ``background`` / ``learning`` のいずれか。
-                ``AssistModelClient`` 以外から呼び出される場合のみ空文字列。
+                ``AuxClient`` 以外から呼び出される場合のみ空文字列。
             resolved_timeout: 実際に適用されたタイムアウト秒
-                purpose 別 override (``assist_model.timeouts`` または
-                ``PURPOSE_TIMEOUT_DEFAULTS``) と既定値のどちらが採用されたか
+                purpose 別の解決値 (``PURPOSE_TIMEOUT_DEFAULTS`` と
+                ``local/aux_calibration.json`` の較正) と既定値のどちらが採用されたか
                 を回帰追跡できるようにする。``None`` なら記録しない。
             cache_metrics: llama-server の KV キャッシュ命中率指標
 。``{"prompt_n": int, "cache_n": int, "hit_ratio": float}``
@@ -225,7 +225,7 @@ class DebugLogger:
             return
         entry: dict = {
             "timestamp": _now(),
-            "model": "assist",
+            "model": "aux",
             "purpose": purpose,
             "priority": priority,
             "messages_count": messages_count,
@@ -257,14 +257,14 @@ class DebugLogger:
         """tenacity リトライ発火を ``requests.jsonl`` に記録
 
         ``async_retry_http_call`` の ``before_sleep`` callback から呼ばれ、
-        backend (``base`` / ``assist`` / ``embedding``) ごとの
+        backend (``base`` / ``aux`` / ``embedding``) ごとの
         リトライ頻度・原因例外・status code をモニタする。
 
         Args:
             backend: リトライを発火させた HTTP クライアントの種別。
-                ``"base"`` (LocalClient) / ``"assist"`` (AssistModelClient) /
+                ``"base"`` (LocalClient) / ``"aux"`` (AuxClient) /
                 ``"embedding"`` (LlamaCppEmbedder) のいずれか。
-            purpose: assist リクエストの purpose 文字列。
+            purpose: aux リクエストの purpose 文字列。
                 base / embedding では空文字列。
             attempt: 1-based attempt 番号 (リトライ発火直前の試行回数)。
             wait_sec: 次の試行までの待機秒数 (jitter 込みの実値)。
@@ -295,7 +295,7 @@ class DebugLogger:
             entry["trace_id"] = trace_id
         self._emit("requests", entry)
 
-    def log_assist_json_repair(
+    def log_aux_json_repair(
         self,
         *,
         purpose: str,
@@ -303,7 +303,7 @@ class DebugLogger:
         raw_preview: str,
         repaired_preview: str,
     ) -> None:
-        """assist 応答が json-repair (戦略 4) で復旧されたことを記録
+        """aux 応答が json-repair (戦略 4) で復旧されたことを記録
 
         ``response_format=json_schema`` を適用しても
         ``max_tokens`` / ``reasoning_budgets`` 到達による truncation、Pro
@@ -314,7 +314,7 @@ class DebugLogger:
         ``requests.jsonl`` に追記し、GBNF 採用後の必要性評価と prompt /
         ``reasoning_budget`` 調整の機会を可視化する。
 
-        ``log_assist_request`` とは別エントリだが、``DebugLogSink``
+        ``log_aux_request`` とは別エントリだが、``DebugLogSink``
         が ``trace_id`` を自動付与するため、同一 trace_id で時系列に
         並べることで repair 対象のリクエストを特定できる。
 
@@ -331,7 +331,7 @@ class DebugLogger:
             return
         self._emit("requests", {
             "timestamp": _now(),
-            "model": "assist",
+            "model": "aux",
             "op": "json_repair",
             "purpose": purpose,
             "list_key": list_key or "",
@@ -453,15 +453,15 @@ class DebugLogger:
         kept_count: int,
         dropped_floor: int,
         dropped_dedup: int,
-        assist_used: bool,
-        assist_dropped: int,
-        assist_skipped_reason: str = "",
+        judge_used: bool,
+        judge_dropped: int,
+        judge_skipped_reason: str = "",
     ) -> None:
         """取得直後 content gate の prune 結果を ``rag.jsonl`` に記録
 
         Step 4 マージ後に低価値 chunk を pruning した内訳 (relevance floor /
-        近似重複除去 / 境界 assist) を ``op="content_gate"`` で書き出す。
-        create/chat mode 別の pruning 率と assist 発火状況を後追いし、
+        近似重複除去 / 境界 aux) を ``op="content_gate"`` で書き出す。
+        create/chat mode 別の pruning 率と aux 発火状況を後追いし、
         しきい値チューニングと品質回帰のモニタリングを可能にする。
         """
         if not self.enabled or not self.log_rag:
@@ -475,69 +475,13 @@ class DebugLogger:
             "kept_count": kept_count,
             "dropped_floor": dropped_floor,
             "dropped_dedup": dropped_dedup,
-            "assist_used": assist_used,
-            "assist_dropped": assist_dropped,
+            "judge_used": judge_used,
+            "judge_dropped": judge_dropped,
         }
-        if assist_skipped_reason:
-            entry["assist_skipped_reason"] = assist_skipped_reason
+        if judge_skipped_reason:
+            entry["judge_skipped_reason"] = judge_skipped_reason
         self._emit("rag", entry)
 
-    def log_assist_judge(
-        self,
-        *,
-        query_preview: str,
-        rule_based_quality: str,
-        used: bool,
-        final_quality: str,
-        session_count: int,
-        query_count: int,
-        skipped_reason: str = "",
-        elapsed_sec: float | None = None,
-        source: str = "unified_search",
-    ) -> None:
-        """Self-RAG assist_judge の発火/スキップ結果を記録
-
-        ``rag.jsonl`` に ``op="assist_judge"`` エントリとして書き出す。
-        セッション上限 / クエリ上限 / only_when_quality で skip された
-        ケースも ``used=False`` + ``skipped_reason=<理由>`` として記録し、
-        skip 率の追跡とチューニングに使う。
-
-        Args:
-            query_preview: クエリ先頭 100 文字 (プライバシー保護のため切詰)。
-            rule_based_quality: ルールベース判定の結果 ("high"/"medium"/"low")。
-            used: 実際にアシスト LLM を呼んだかどうか。
-            final_quality: 最終的に採用した品質ラベル。
-                ``used=False`` なら ``rule_based_quality`` と同値。
-            session_count: 判定前のセッション累計発火回数。
-                ``used=True`` の場合、DebugLogger に記録される値は
-                "発火前" の数値 (呼び出し側で再計算不要にするため)。
-            query_count: 判定前のクエリ内発火回数。
-            skipped_reason: skip 理由 (``session_cap`` / ``query_cap`` /
-                ``disabled`` / ``quality_not_applicable``)。
-                ``used=True`` なら空文字列。
-            elapsed_sec: アシスト LLM 呼び出し所要時間 (秒)。``used=False``
-                ならレイテンシは発生しないので ``None`` を渡す。
-            source: 呼び出し経路識別子 (既定 ``unified_search``)。
-        """
-        if not self.enabled or not self.log_rag:
-            return
-        entry: dict = {
-            "timestamp": _now(),
-            "op": "assist_judge",
-            "query_preview": query_preview[:100],
-            "rule_based_quality": rule_based_quality,
-            "assist_judge_used": bool(used),
-            "final_quality": final_quality,
-            "session_count": int(session_count),
-            "query_count": int(query_count),
-        }
-        if skipped_reason:
-            entry["assist_judge_skipped_reason"] = skipped_reason
-        if elapsed_sec is not None:
-            entry["elapsed_sec"] = round(float(elapsed_sec), 4)
-        if source:
-            entry["source"] = source
-        self._emit("rag", entry)
 
     # ------------------------------------------------------------------
     # memory.jsonl
@@ -660,13 +604,13 @@ class DebugLogger:
         レベルでは ``self.log_decisions=False`` のため no-op。
 
         Args:
-            decision_point: 分岐点の識別子 (例: ``"assist_health_fallback"``,
+            decision_point: 分岐点の識別子 (例: ``"aux_health_fallback"``,
                 ``"quality_gate_action"``, ``"loop_continue_or_abort"``)。
                 埋込点ごとにユニークな snake_case 文字列を採用する。
             chosen: 採択された候補の文字列 (例: ``"degraded_local"`` /
                 ``"retry"`` / ``"continue"``)。
             candidates: 候補集合 (例:
-                ``["external_assist", "local_assist", "degraded_local"]``)。
+                ``["external_aux", "local_aux", "degraded_local"]``)。
                 空 list を渡すと「分岐先が単一だったが記録すべき決定」を表す。
             reason: 採択理由を表す短い英語識別子
                 (例: ``"external_health_check_failed_3x"``,

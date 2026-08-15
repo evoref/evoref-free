@@ -7,7 +7,7 @@ executor**。単純なサイクルを延々と回し、失敗を ``failure_patte
 サイクル (1 タスクあたり):
 
     messages = harness.prepare(task_fact)          # failure/policy/fewshot 注入
-    response = assist_model.generate(messages)
+    response = aux_client.generate(messages)
     actions  = harness.parse(response)
     for action in actions[:max_actions_per_task]:
         result = action_runner.run_one(action)
@@ -48,19 +48,19 @@ from backend.free.memory.types import SemanticFact, make_fact
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
-    from backend.free.llm.assist_client import AssistModelClient
+    from backend.free.llm.aux_client import AuxClient
     from backend.free.loop.driver import TaskFactView
 
 logger = get_logger("loop.ralph_executor")
 
 
-POLICY_TEMPERATURE_KEYS = ("temperature", "assist_temperature")
-POLICY_MAX_TOKENS_KEYS = ("max_tokens", "assist_max_tokens")
-POLICY_TOP_K_KEYS = ("top_k", "assist_top_k")
+POLICY_TEMPERATURE_KEYS = ("temperature", "aux_temperature")
+POLICY_MAX_TOKENS_KEYS = ("max_tokens", "aux_max_tokens")
+POLICY_TOP_K_KEYS = ("top_k", "aux_top_k")
 
 DEFAULT_TEMPERATURE = 0.4
 # 1024 tokens (~4000 chars) では actions JSON が途中切断され parse 失敗する
-# 事象が発生したため 2048 に引き上げる。assist_client の ralph_loop timeout
+# 事象が発生したため 2048 に引き上げる。aux_client の ralph_loop timeout
 # (120s) に対し 2048 tokens 生成は実測 ~10s で十分収まる。
 DEFAULT_MAX_TOKENS = 2048
 
@@ -72,7 +72,7 @@ class RalphExecutor:
     Args:
         harness: `DefaultHarness` またはテスト用スタブ (`Harness` Protocol)
         action_runner: 書込先制限付き ActionRunner
-        assist_client: llama-server (assist) クライアント。None の場合は
+        aux_client: llama-server (aux) クライアント。None の場合は
             LLM 呼び出しをスキップし、Action 0 件 (skipped) を返す
             (デグラデーションモード)。
         quality_gates: 各サイクル後に走らせる ``QualityGate`` の列 (空可)
@@ -80,12 +80,12 @@ class RalphExecutor:
         policy_provider: ``mode -> dict`` を返す callable。温度 / top_k /
             max_tokens を LLM 呼び出しに反映するために参照する。None 可。
         mode: 通常 ``"create"``。policy lookup の key。
-        purpose: ``AssistModelClient.generate(purpose=...)`` に渡すラベル。
+        purpose: ``AuxClient.generate(purpose=...)`` に渡すラベル。
     """
 
     harness: Harness
     action_runner: ActionRunner
-    assist_client: "AssistModelClient | None"
+    aux_client: "AuxClient | None"
     quality_gates: Sequence[QualityGate] = ()
     max_actions_per_task: int = 10
     policy_provider: object | None = None  # Callable[[str], dict | None]
@@ -98,15 +98,15 @@ class RalphExecutor:
         """1 タスクを LLM 駆動で消化する。"""
         task_fact = _view_to_fact(task)
         messages = self.harness.prepare(task_fact)
-        if self.assist_client is None:
+        if self.aux_client is None:
             logger.warning(
-                "RalphExecutor: assist_client is None — skipping task=%s "
+                "RalphExecutor: aux_client is None — skipping task=%s "
                 "(degradation mode)", task.task_id,
             )
             return ExecutionOutcome(
                 status="skipped",
-                error="assist_client unavailable",
-                notes={"executor": self.name, "reason": "no_assist_client"},
+                error="aux_client unavailable",
+                notes={"executor": self.name, "reason": "no_aux_client"},
             )
 
         policy = self._lookup_policy()
@@ -119,7 +119,7 @@ class RalphExecutor:
 
         t0 = time.perf_counter()
         try:
-            resp = await self.assist_client.generate(
+            resp = await self.aux_client.generate(
                 messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -127,12 +127,12 @@ class RalphExecutor:
             )
         except Exception as exc:
             logger.warning(
-                "RalphExecutor: assist generate failed for task=%s: %s",
+                "RalphExecutor: aux generate failed for task=%s: %s",
                 task.task_id, exc,
             )
             return ExecutionOutcome(
                 status="failure",
-                error=f"assist_generate_error: {exc}",
+                error=f"aux_generate_error: {exc}",
                 notes={"executor": self.name, "stage": "generate"},
             )
         gen_ms = (time.perf_counter() - t0) * 1000.0

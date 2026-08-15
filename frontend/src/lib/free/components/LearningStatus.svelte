@@ -19,6 +19,10 @@
 		newExperienceCount?: number;
 		minExperiences?: number;
 		conditionsMet?: boolean;
+		/** Level 1 が今走れない理由 (走れる状態なら null) */
+		level1BlockedReason?: string | null;
+		/** waiting_for_idle のとき、アイドル成立までの残り秒数 */
+		level1SecondsUntilIdle?: number | null;
 		lastLevel1Run?: string | null;
 		lastLevel2Run?: string | null;
 		lastLevel0Record?: string | null;
@@ -41,6 +45,8 @@
 		newExperienceCount = 0,
 		minExperiences = 5,
 		conditionsMet = false,
+		level1BlockedReason = null,
+		level1SecondsUntilIdle = null,
 		lastLevel1Run = null,
 		lastLevel2Run = null,
 		experienceByMode = { chat: 0, create: 0 },
@@ -105,6 +111,26 @@
 		return map[phase] ?? phase;
 	}
 
+	/** Level 1 が止まっている理由の表示文 (詰まっていなければ空) */
+	let blockedHint = $derived.by(() => {
+		if (!level1BlockedReason) return '';
+		if (level1BlockedReason === 'waiting_for_idle') {
+			const minutes = Math.max(1, Math.ceil((level1SecondsUntilIdle ?? 0) / 60));
+			return $t('dashboard.level1_blocked_waiting_for_idle', { minutes });
+		}
+		const known = [
+			'user_active',
+			'no_llm_client',
+			'loop_not_started',
+			'already_running',
+			'learning_disabled'
+		];
+		if (known.includes(level1BlockedReason)) {
+			return $t(`dashboard.level1_blocked_${level1BlockedReason}`);
+		}
+		return '';
+	});
+
 	// ── 次の学習セクション ──
 	let remaining = $derived(Math.max(0, minExperiences - newExperienceCount));
 	let newExpProgress = $derived(
@@ -154,9 +180,9 @@
 		return phaseLabel(status.phase);
 	}
 
-	// ── Level 2 (base/assist) 個別状態 ──
+	// ── Level 2 状態 ──
 	interface Level2TargetView {
-		key: 'base' | 'assist';
+		key: 'base';
 		label: string;
 		isRunning: boolean;
 		method: string;
@@ -168,25 +194,45 @@
 		progress: number;
 	}
 
-	/** base/assist それぞれの状態 + 発火閾値を表示用に整形する */
-	function buildTargetView(key: 'base' | 'assist', tStat: Level2TargetStatus): Level2TargetView {
+	/** Level 2 の状態 + 発火閾値を表示用に整形する */
+	/** target の残りクールダウン時間（h、小数1桁）。算出不能なら null */
+	function remainingCooldownHours(key: 'base'): number | null {
+		const gates = level2?.gates;
+		if (!gates) return null;
+		const since = gates.seconds_since_run?.[key];
+		if (since === null || since === undefined) return null;
+		const cooldown = gates.cooldown_hours?.[key] ?? gates.overdue_hours;
+		const remain = cooldown - since / 3600;
+		return remain > 0 ? Math.round(remain * 10) / 10 : 0;
+	}
+
+	function buildTargetView(key: 'base', tStat: Level2TargetStatus): Level2TargetView {
 		const isRunning = runningTarget === key;
 		// 発火に必要な閾値: adapter 未生成なら bootstrap、生成済みは方式で分岐。
-		// base=lora(adapter有) と assist=none は no-op skip のため required=null。
+		// base=lora(adapter有) は no-op skip のため required=null。
 		let required: number | null;
 		if (!tStat.adapter_exists) {
 			required = tStat.bootstrap_min;
-		} else if (key === 'base' && tStat.method === 'cvector') {
+		} else if (tStat.method === 'cvector') {
 			required = tStat.cvector_min;
-		} else if (key === 'assist' && tStat.method === 'spsa-real-eval') {
+		} else if (tStat.method === 'spsa-real-eval') {
 			required = tStat.spsa_min;
 		} else {
 			required = null;
 		}
 		const current = tStat.experiences_current;
+		// データが揃っていても、クールダウン中の target は実際には起動しない
+		// (実機 2026-08-14: base は「発火可」表示のまま
+		//  `still within cooldown (24.0h); skipping` を 5 分おきに出し続けた)。
+		// 「発火可」はデータ充足 AND overdue のときだけ出す。overdue 未提供の
+		// 旧バックエンドは true 扱いで従来表示を維持する。
+		const overdue = level2?.gates?.overdue?.[key] ?? true;
+		const cooldownRemainH = remainingCooldownHours(key);
 		let statusLabel: string;
 		if (isRunning) statusLabel = $t('dashboard.level2_running');
 		else if (required === null) statusLabel = $t('dashboard.level2_noop');
+		else if (current >= required && !overdue)
+			statusLabel = $t('dashboard.level2_cooldown', { hours: cooldownRemainH ?? '?' });
 		else if (current >= required) statusLabel = $t('dashboard.level2_ready');
 		else statusLabel = $t('dashboard.level2_accumulating');
 		// backend が算出した発火不可理由 ("" = 発火可能) を i18n ラベル化する。
@@ -196,7 +242,7 @@
 			: '';
 		return {
 			key,
-			label: key === 'base' ? $t('dashboard.level2_base') : $t('dashboard.level2_assist'),
+			label: $t('dashboard.level2_base'),
 			isRunning,
 			method: tStat.method || '-',
 			versionLabel: tStat.adapter_exists
@@ -212,9 +258,27 @@
 
 	let level2Targets = $derived(
 		level2
-			? [buildTargetView('base', level2.base), buildTargetView('assist', level2.assist)]
+			? [buildTargetView('base', level2.base)]
 			: []
 	);
+
+	// 連続無改善で延長クールダウン中の target。素の overdue_hours だけを出すと
+	// 「期限を過ぎているのに発火しない」ように見えるため、実効値を併記する。
+	let level2Backoff = $derived.by(() => {
+		const gates = level2?.gates;
+		if (!gates) return null;
+		const streaks = gates.no_improve_streak ?? {};
+		const cooldowns = gates.cooldown_hours ?? {};
+		const threshold = gates.stale_streak ?? 0;
+		if (threshold <= 0) return null;
+		const stalled = Object.keys(streaks).filter((k) => (streaks[k] ?? 0) >= threshold);
+		if (stalled.length === 0) return null;
+		return {
+			targets: stalled.join(' / '),
+			hours: Math.max(...stalled.map((k) => cooldowns[k] ?? gates.overdue_hours)),
+			streak: Math.max(...stalled.map((k) => streaks[k] ?? 0))
+		};
+	});
 </script>
 
 <DashboardCard title={$t('dashboard.learning_status')}>
@@ -239,7 +303,10 @@
 					<span class="new-exp-value">{newExperienceCount} / {minExperiences}</span>
 				</div>
 				{#if conditionsMet}
-					<span class="hint-text">{$t('dashboard.ready_hint')}</span>
+					<!-- conditionsMet は経験件数だけの表示値。実ゲート (アイドル /
+					     ユーザー活動 / LLM 配線) で止まっている場合はその理由を出す。
+					     出さないと「条件を満たしているのに走らない」が原因不明に見える。 -->
+					<span class="hint-text">{blockedHint || $t('dashboard.ready_hint')}</span>
 				{:else}
 					<span class="hint-text">{$t('dashboard.remaining_hint', { count: remaining })}</span>
 				{/if}
@@ -308,7 +375,7 @@
 			{/if}
 		</StatusSection>
 
-		<!-- セクション 2.5: Level 2 (base/assist) 個別状態 + 発火条件 -->
+		<!-- セクション 2.5: Level 2 状態 + 発火条件 -->
 		{#if isPro && level2}
 			<StatusSection label={$t('dashboard.level2_section')}>
 				{#each level2Targets as tv (tv.key)}
@@ -345,6 +412,15 @@
 						{$t('dashboard.level2_gate_overdue', { hours: level2.gates.overdue_hours })} ・
 						{$t('dashboard.level2_gate_interval', { sec: level2.gates.recheck_interval_sec })}
 					</span>
+					{#if level2Backoff}
+						<span class="gate-line gate-backoff">
+							{$t('dashboard.level2_gate_backoff', {
+								targets: level2Backoff.targets,
+								streak: level2Backoff.streak,
+								hours: level2Backoff.hours
+							})}
+						</span>
+					{/if}
 				</div>
 			</StatusSection>
 		{/if}
@@ -518,7 +594,7 @@
 		padding-left: 16px;
 	}
 
-	/* ── Level 2: base/assist 個別状態 ── */
+	/* ── Level 2 状態 ── */
 	.level2-row {
 		display: flex;
 		align-items: center;
@@ -598,6 +674,9 @@
 		font-size: 0.6875rem;
 		color: var(--text-secondary);
 		font-variant-numeric: tabular-nums;
+	}
+	.gate-line.gate-backoff {
+		color: var(--color-warning, var(--text-secondary));
 	}
 
 	/* ── 探索/活用: パラメータ最適化 ── */

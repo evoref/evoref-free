@@ -8,8 +8,8 @@ from backend.edition import get_pro_handler, is_pro
 from backend.free.api._error_responses import api_error
 from backend.free.core.session_mode import is_valid_session_mode
 from backend.free.api.learning._optimize_collectors import (
-    collect_assist_prompt_history,
-    collect_assist_task_statuses,
+    collect_aux_prompt_history,
+    collect_aux_task_statuses,
     collect_prompt_history,
     collect_prompt_mode_statuses,
     extract_scheduler_params,
@@ -19,7 +19,7 @@ from backend.free.api.learning._optimize_collectors import (
 # Pydantic スキーマは _optimize_schemas に集約
 # 外部 import 互換性のため re-export する。
 from backend.free.api.learning._optimize_schemas import (
-    AssistTaskStatus,
+    AuxTaskStatus,
     Level1Status,
     Level2Status,
     LoRAHistoryEntry,
@@ -39,7 +39,7 @@ router = APIRouter(prefix="/api/optimize", tags=["optimize"])
 __all__ = [
     "router",
     # 互換性のため re-export (テストや外部から import される)
-    "AssistTaskStatus",
+    "AuxTaskStatus",
     "Level1Status",
     "Level2Status",
     "LoRAHistoryEntry",
@@ -51,28 +51,26 @@ __all__ = [
     "PromptModeStatus",
 ]
 
-# Level 1 で集計対象とするモード / アシストタスクのリスト
+# Level 1 で集計対象とするモード / 補助タスクタスクのリスト
 _LEVEL1_MODES = ["create", "chat"]
-_ASSIST_TASKS = ["rag_necessity", "rag_quality", "tool_call", "note_evolve"]
+_AUX_TASKS = ["rag_necessity", "rag_quality", "tool_call", "note_evolve"]
 
 
 def _level2_methods(scheduler) -> dict:
     """Level 2 の有効メソッドと実行可否を返す (#3a)。
 
-    base=lora / assist=none は no-op 経路でトリガ段階 skip されるため、実メソッド
-    (base=cvector / assist=spsa-real-eval) が有効かを ``will_run`` で示す。
+    base=lora は no-op 経路でトリガ段階 skip されるため、実メソッド
+    (base=cvector / base=spsa-real-eval) が有効かを ``will_run`` で示す。
     """
     base_method = getattr(scheduler, "level2_base_method", "lora") if scheduler else "lora"
-    assist_method = getattr(scheduler, "level2_assist_method", "none") if scheduler else "none"
     if base_method == "cvector":
         active = "cvector"
-    elif base_method == "spsa-real-eval" or assist_method == "spsa-real-eval":
+    elif base_method == "spsa-real-eval":
         active = "spsa-real-eval"
     else:
         active = "none"
     return {
         "base_method": base_method,
-        "assist_method": assist_method,
         "active_method": active,
         "will_run": active != "none",
     }
@@ -89,14 +87,14 @@ async def optimize_status(state: AppState = Depends(get_app_state)):
     scheduler = state.learning_scheduler
     resolver = get_path_resolver()
 
-    # Level 1: モード別 + アシストタスク別プロンプト進化状態
+    # Level 1: モード別 + 補助タスクタスク別プロンプト進化状態
     modes = collect_prompt_mode_statuses(state.prompt_manager, _LEVEL1_MODES)
     if is_pro():
-        assist_tasks = collect_assist_task_statuses(
-            state.assist_prompt_manager, _ASSIST_TASKS,
+        aux_tasks = collect_aux_task_statuses(
+            state.aux_prompt_manager, _AUX_TASKS,
         )
     else:
-        assist_tasks = []
+        aux_tasks = []
 
     # スケジューラ設定値 (未初期化時は既定値)
     params = extract_scheduler_params(scheduler)
@@ -105,7 +103,9 @@ async def optimize_status(state: AppState = Depends(get_app_state)):
     lora_adapter_exists = False
     if is_pro():
         try:
-            lora_path = resolver.resolve_local("lora_adapter")
+            # resolve_learning (パーティション対応) で引く。flat のままだと
+            # Level 2 が書き出した実アダプタを「無い」と誤報告する。
+            lora_path = resolver.resolve_learning("lora_adapter")
             lora_adapter_exists = lora_path.exists()
         except Exception:
             pass
@@ -124,7 +124,7 @@ async def optimize_status(state: AppState = Depends(get_app_state)):
         last_level2_run=last_l2,
         level1=Level1Status(
             modes=modes,
-            assist_tasks=assist_tasks,
+            aux_tasks=aux_tasks,
             generations=params["generations"],
             population_size=params["population_size"],
             min_experiences=params["min_experiences"],
@@ -194,7 +194,7 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
             message="Level 2 optimization requires Pro edition",
         )
 
-    # #3a: base=lora / assist=none は no-op 経路でトリガ段階 skip されるため、
+    # #3a: base=lora は no-op 経路でトリガ段階 skip されるため、
     # 実メソッドが無効なら「データ不足」ではなく「メソッド未有効」を明示する。
     methods = _level2_methods(scheduler)
     if not methods["will_run"]:
@@ -202,14 +202,14 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
             triggered=False,
             level="level2",
             message=(
-                "Level 2 real methods not enabled (base=lora/assist=none are no-op "
+                "Level 2 real method not enabled (base=lora is a no-op "
                 "and trigger-skipped). Set level2_base_method=cvector or "
-                "level2_assist_method=spsa-real-eval."
+                "or level2_base_method=spsa-real-eval."
             ),
         )
 
     # 実メソッド有効: 全パス集合を渡して trainer に委譲 (SleepTimeWorker と同形)。
-    # cvector は LoRA 不要、base/assist bootstrap は adapter 不在時に走るため、
+    # cvector は LoRA 不要、bootstrap は adapter 不在時に走るため、
     # adapter 存在を入口で要求しない (パス未解決は None で degraded に倒す)。
     resolver = get_path_resolver()
 
@@ -222,11 +222,16 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
     base_model_path = _safe(resolver.resolve_model, "base_model")
     started = scheduler.check_level2(
         is_user_active=False,
-        lora_path=_safe(resolver.resolve_local, "lora_adapter"),
+        # 学習データは (モデル×モード) パーティション配下にあるため
+        # resolve_learning で引く。resolve_local (flat)
+        # のままだと存在しないパスを渡してしまい、bootstrap 済みのアダプタが
+        # 「無い」と判定される (SleepTimeScheduler 経路とも食い違う)。
+        lora_path=_safe(resolver.resolve_learning, "lora_adapter"),
         current_model=base_model_path.name if base_model_path else "",
         base_model_path=base_model_path,
-        assist_lora_path=_safe(resolver.resolve_local, "assist_lora_adapter"),
-        assist_model_path=_safe(resolver.resolve_model, "assist_model"),
+        # 手動トリガは「今すぐ試す」意図なので overdue クールダウンは迂回する。
+        # データ量 / 実行中 / アダプタ互換のゲートはそのまま効く。
+        force=True,
     )
 
     message = (
@@ -247,11 +252,11 @@ async def optimize_history(state: AppState = Depends(get_app_state)):
 
     resolver = get_path_resolver()
 
-    # プロンプト進化履歴 (システム + アシスト)
+    # プロンプト進化履歴 (システム + 補助タスク)
     prompt_history = collect_prompt_history(state.prompt_manager, _LEVEL1_MODES)
     if is_pro():
         prompt_history.update(
-            collect_assist_prompt_history(state.assist_prompt_manager, _ASSIST_TASKS),
+            collect_aux_prompt_history(state.aux_prompt_manager, _AUX_TASKS),
         )
 
     # LoRA バージョン履歴（Pro のみ）
@@ -259,8 +264,10 @@ async def optimize_history(state: AppState = Depends(get_app_state)):
     LoRAVersionManager = get_pro_handler("lora_version_manager")
     if is_pro() and LoRAVersionManager is not None:
         try:
-            versions_dir = resolver.resolve_local("lora_versions_dir")
-            adapter_path = resolver.resolve_local("lora_adapter")
+            # resolve_learning (パーティション対応)。flat のままだと Level 2 が
+            # 実際に積んだ版履歴が 1 件も出ない。
+            versions_dir = resolver.resolve_learning("lora_versions_dir")
+            adapter_path = resolver.resolve_learning("lora_adapter")
             vmgr = LoRAVersionManager(versions_dir, adapter_path)
             for v in vmgr.list_versions():
                 lora_history.append(LoRAHistoryEntry(

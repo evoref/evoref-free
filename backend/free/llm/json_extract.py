@@ -1,7 +1,7 @@
 """LLM 応答から JSON を頑健に抽出するユーティリティ
 
 小規模 LLM はコードフェンス・前置き自然文・末尾切断などを混入させるため、
-複数戦略でフォールバックしながら JSON を抽出する。judge.py / assist_client /
+複数戦略でフォールバックしながら JSON を抽出する。judge.py / aux_client /
 cogwriter など JSON 応答をパースする箇所で共通利用する
 
 戦略 4: ``response_format=json_schema`` を採用しても

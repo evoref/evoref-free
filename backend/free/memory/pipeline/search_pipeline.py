@@ -11,7 +11,6 @@ import numpy as np
 
 from backend.log_config import get_logger
 from backend.trace_context import run_in_executor_with_context
-from backend.free.llm.assist_client import assist_ready
 from backend.free.rag.chunk_content_gate import ChunkContentGate, GateConfig
 from backend.free.rag.self_rag_judge import (
     QualityThresholds,
@@ -20,13 +19,12 @@ from backend.free.rag.self_rag_judge import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
 
     from backend.debug_logger import DebugLogger
     from backend.free.core.policy_interpreter import PolicyInterpreter
     from backend.free.core.stage_timer import StageTimer
     from backend.free.memory.views.mem import MemFactView
-    from backend.free.rag.assist_judge_tracker import AssistJudgeUsageTracker
+    from backend.free.rag.judge_usage_tracker import JudgeUsageTracker
     from backend.free.rag.lazy_contextual import LazyContextualPrefixService
 
 logger = get_logger("memory.search_pipeline")
@@ -42,6 +40,14 @@ class SearchResult:
     quality: str = "low"
     from_memory: bool = False
     skipped: bool = False
+    #: ``sources`` に採用されたチャンクの **生スコア** (cosine スケール) の最大値。
+    #: ``sources`` 側のスコアは ``score_normalization`` 適用後で、``minmax`` では
+    #: 層内 max が定義上 1.0 に張り付くため、検索品質の観測値としては使えない
+    #: (Level 0 の ``rag_top1_score`` が 21 ターン全てで厳密に 1.0 になり、
+    #: それを目的関数にする embed_instruction / policy `search` ドメインの
+    #: fitness が定数化していた)。品質判定・gate と同じ「判定は生スコア」の
+    #: 不変則 (docs/f_01 §8.3) に合わせるための観測用フィールド。
+    top_raw_score: float | None = None
 
 
 def _resolve_fetch_multiplier(cfg: dict) -> int:
@@ -91,25 +97,37 @@ def _resolve_search_params(
 
 async def _search_stm_layer(
     short_term, query_vec: np.ndarray, stm_top_k: int,
-) -> list[tuple[str, float, str]]:
-    """Layer 2 短期記憶検索 (< 1ms)。失敗時は空リスト。"""
+) -> tuple[list[tuple[str, float, str]], list[tuple[str, float, str]]]:
+    """Layer 2 短期記憶検索 (< 1ms)。``(順位付け用, ゲート用)`` を返す。
+
+    STM のスコアは ``類似度 × 0.6 + LightMem × 0.4`` (+ pin 加点) で、これは
+    順位付けには有用だがゲート判定には使えない。品質判定 / floor / content gate
+    は **cosine スケール前提**で閾値が決まっており、LTM は素の cosine を返す。
+    STM だけ別スケールを流すと閾値が層ごとに違う意味になるため、ゲート用には
+    素の cosine を載せた同順の別リストを返す (docs/f_02 §品質ゲート)。
+
+    失敗時は両方とも空リスト。
+    """
     loop = asyncio.get_running_loop()
     try:
         hits = await run_in_executor_with_context(
-            loop, _search_executor, short_term.retrieve_top_k, query_vec, stm_top_k,
+            loop, _search_executor,
+            short_term.retrieve_top_k_detailed, query_vec, stm_top_k,
         )
-        results = [(note.id, score, note.content) for note, score in hits]
+        ranked = [(note.id, combined, note.content) for note, combined, _ in hits]
+        gated = [(note.id, relevance, note.content) for note, _, relevance in hits]
         logger.debug(
-            "Step 2 STM: %d hits, scores=[%s]",
-            len(results),
-            ", ".join(f"{s:.3f}" for _, s, _ in results),
+            "Step 2 STM: %d hits, combined=[%s], relevance=[%s]",
+            len(ranked),
+            ", ".join(f"{s:.3f}" for _, s, _ in ranked),
+            ", ".join(f"{s:.3f}" for _, s, _ in gated),
         )
-        return results
+        return ranked, gated
     except asyncio.CancelledError:
         raise
     except (RuntimeError, ValueError, TypeError) as e:
         logger.warning("STM search failed: %s", e)
-        return []
+        return [], []
 
 
 async def _search_ltm_layer(
@@ -169,15 +187,15 @@ async def _search_cartridge_layer(
         return []
 
 
-def _resolve_assist_judge_cfg(rag_cfg: dict) -> dict:
-    """``rag.self_rag.assist_judge`` セクションを安全に取り出す
+def _resolve_quality_judge_cfg(rag_cfg: dict) -> dict:
+    """``rag.self_rag.quality_judge`` セクションを安全に取り出す
 
     セクション欠落時はデフォルト値相当の dict を返し、呼び出し側で
-    キーの存在チェックを不要にする。旧 ``rag.assist_judge_enabled``
+    キーの存在チェックを不要にする。旧 ``rag.aux_judge_enabled``
     フラット構造は廃止済み (後方互換なし)。
     """
     self_rag_cfg = rag_cfg.get("self_rag") or {}
-    aj_cfg = self_rag_cfg.get("assist_judge") or {}
+    aj_cfg = self_rag_cfg.get("quality_judge") or {}
     return {
         "enabled": bool(aj_cfg.get("enabled", True)),
         "max_top_score": float(aj_cfg.get("max_top_score", 0.75)),
@@ -187,18 +205,18 @@ def _resolve_assist_judge_cfg(rag_cfg: dict) -> dict:
     }
 
 
-def _resolve_assist_necessity_cfg(rag_cfg: dict) -> dict:
-    """``rag.self_rag.assist_necessity`` セクションを安全に取り出す
+def _resolve_necessity_judge_cfg(rag_cfg: dict) -> dict:
+    """``rag.self_rag.necessity_judge`` セクションを安全に取り出す
 
-    検索必要性のハイブリッド判定 (ルール → uncertain 時のみアシスト) を
-    制御する。``only_when_quality`` は ``AssistJudgeUsageTracker`` 互換の
+    検索必要性のハイブリッド判定 (ルール → uncertain 時のみ補助タスク) を
+    制御する。``only_when_quality`` は ``JudgeUsageTracker`` 互換の
     キーで、本機能の quality ラベルは ``"uncertain"`` のみを使う。
 
-    既定は無効 (``SelfRagAssistNecessityConfig`` の説明を参照)。実測で
+    既定は無効 (``SelfRagNecessityJudgeConfig`` の説明を参照)。実測で
     ゲート (3,407ms) がゲート対象の retrieval (21ms) の 165 倍高くついていた。
     """
     self_rag_cfg = rag_cfg.get("self_rag") or {}
-    an_cfg = self_rag_cfg.get("assist_necessity") or {}
+    an_cfg = self_rag_cfg.get("necessity_judge") or {}
     return {
         "enabled": bool(an_cfg.get("enabled", False)),
         "max_per_session": int(an_cfg.get("max_per_session", 10)),
@@ -225,25 +243,6 @@ def _resolve_necessity_recall_cfg(rag_cfg: dict) -> dict:
     }
 
 
-def _bind_recorder_mode(
-    recorder: "Callable[[str, str, str, float, str], None] | None",
-    mode: str,
-) -> "Callable[[str, str, str, float], None] | None":
-    """assist_experience_recorder (5引数版) を mode 束縛した 4引数版へラップする。
-
-    ``RetrievalNecessityJudge.judge_with_assist`` / ``RetrievalQualityJudge.judge_with_assist``
-    は ``record_assist`` を 4 引数 (action_type, input_context, output, outcome) で
-    呼ぶため、この呼び出しの ``mode`` を先に束縛しておく (下流を変更せずに済む)。
-    """
-    if recorder is None:
-        return None
-
-    def _record(action_type: str, input_context: str, output: str, outcome: float) -> None:
-        recorder(action_type, input_context, output, outcome, mode)
-
-    return _record
-
-
 def _resolve_quality_recall_cfg(rag_cfg: dict) -> dict:
     """``rag.self_rag.quality_recall`` セクションを安全に取り出す (necessity_recall と対称)。"""
     cfg = ((rag_cfg.get("self_rag") or {}).get("quality_recall")) or {}
@@ -256,153 +255,58 @@ def _resolve_quality_recall_cfg(rag_cfg: dict) -> dict:
     }
 
 
-async def _maybe_assist_judge_quality(
-    quality_judge: RetrievalQualityJudge,
+async def _maybe_recall_quality(
     quality: str,
-    merged: list[tuple[str, float, str]],
     query: str,
-    assist_client,
     rag_cfg: dict,
     *,
-    session_id: str = "default",
-    tracker: "AssistJudgeUsageTracker | None" = None,
     debug_logger: "DebugLogger | None" = None,
-    assist_experience_recorder: "Callable[[str, str, str, float], None] | None" = None,
     mem_view: "MemFactView | None" = None,
     query_vec: np.ndarray | None = None,
 ) -> str:
-    """marginal 境界 + アシスト有効時のみ LLM 品質再判定を行う
+    """marginal 境界の品質ラベルを embedding 決定論的リコールで上書きする。
 
-    発火条件は ``rag.self_rag.assist_judge`` の ``enabled`` /
-    ``only_when_quality`` / ``max_per_session`` / ``max_per_query`` で
-    制御する。上限超過・無効・quality 非該当の場合は ``debug_logger``
-    へ ``op="assist_judge"`` + ``assist_judge_skipped_reason`` を記録し、
-    ルールベース判定をそのまま返す。
+    対象は ``rag.self_rag.quality_judge.only_when_quality`` (既定 ``medium``)
+    の帯のみ。リコールが当たらなければルールベース判定をそのまま返す。
 
-    assist 呼出の前に、まず embedding 決定論的リコール
-    (``rag_judge_recall.try_recall_quality``) を試す。ヒットすれば
-    tracker 予算を消費せず、assist_client が None (degraded) でも
-    LLM 呼出をスキップして即決定する。対象は assist と同じ
-    ``only_when_quality`` (既定 ``medium``) のみ。
+    LLM による再判定は撤去済み。実測 (2026-08-12、``op="quality_judge"`` 244 件)
+    では実際に結果が変わる medium→low は全機会の 2.0% で、格下げの取り戻しより
+    誤格下げで検索結果を落とすリスクの方が大きいと判断した (docs/c_14 §1.2.6)。
     """
-    aj_cfg = _resolve_assist_judge_cfg(rag_cfg)
-
-    # 高スコア側では発火しない。この判定の実効果は medium → low の格下げだけで、
-    # medium → high は Step 6.5 で medium と同じ扱い (添付) になるため何も変えない。
-    # 実測 (2026-08-01) では 11 発火中 8 件が medium → high、つまり 6 秒かけて
-    # 挙動が変わらない呼出だった。格下げが起きる帯だけに絞る
-    # (``max_top_score`` の説明に実測表)。
-    max_top = aj_cfg["max_top_score"]
-    top_score = merged[0][1] if merged else 0.0
-    if max_top > 0 and top_score >= max_top:
-        if debug_logger is not None:
-            debug_logger.log_assist_judge(
-                query_preview=query[:80],
-                rule_based_quality=quality,
-                used=False,
-                final_quality=quality,
-                session_count=0,
-                query_count=0,
-                skipped_reason="top_score_above_band",
-            )
-        logger.debug(
-            "Step 5b assist judge skipped: top_score=%.3f >= %.2f",
-            top_score, max_top,
-        )
+    aj_cfg = _resolve_quality_judge_cfg(rag_cfg)
+    if quality not in aj_cfg["only_when_quality"]:
         return quality
 
-    if quality in aj_cfg["only_when_quality"]:
-        quality_recall_cfg = _resolve_quality_recall_cfg(rag_cfg)
-        if quality_recall_cfg["enabled"] and mem_view is not None and query_vec is not None:
-            from backend.free.memory.pipeline.rag_judge_recall import try_recall_quality
-            recalled = await try_recall_quality(query_vec, mem_view, quality_recall_cfg)
-            if recalled is not None:
-                label, recall_sim = recalled
-                logger.debug(
-                    "Step 5b quality recall: %s (sim=%.3f)", label, recall_sim,
-                )
-                if debug_logger is not None:
-                    debug_logger.log_decision(
-                        decision_point="self_rag_judge_path",
-                        chosen="embedding_recall",
-                        candidates=["rule_based", "assist_judge", "embedding_recall"],
-                        reason="embedding_recall_matched",
-                        context={
-                            "rule_based_quality": quality,
-                            "recalled_quality": label,
-                            "similarity": recall_sim,
-                        },
-                        scope="request",
-                    )
-                return label
-
-    # 前提条件: assist が無い / 非常駐なら判定不能 (skip ログは出さない)
-    if not assist_ready(assist_client, "retrieval_quality_judge"):
+    quality_recall_cfg = _resolve_quality_recall_cfg(rag_cfg)
+    if not (
+        quality_recall_cfg["enabled"]
+        and mem_view is not None
+        and query_vec is not None
+    ):
         return quality
 
-    # tracker が無いとセッション累計を追えないので、記録対象から外す
-    # (tracker=None のフローはテスト経路でのみ発生する想定)
-    if tracker is None:
-        if not aj_cfg["enabled"]:
-            return quality
-        if quality not in aj_cfg["only_when_quality"]:
-            return quality
-        new_quality = await quality_judge.judge_with_assist(
-            query, merged, assist_client, quality,
-            record_assist=assist_experience_recorder,
-        )
-        logger.debug("Step 5b assist judge (no tracker): %s", new_quality)
-        return new_quality
-
-    decision = tracker.check(
-        session_id=session_id,
-        namespace="quality",
-        quality=quality,
-        query_count=0,
-        config=aj_cfg,
-    )
-    if not decision.allowed:
-        logger.debug(
-            "Step 5b assist judge skipped: reason=%s, session=%d, query=%d",
-            decision.reason, decision.session_count, decision.query_count,
-        )
-        if debug_logger is not None:
-            debug_logger.log_assist_judge(
-                query_preview=query,
-                rule_based_quality=quality,
-                used=False,
-                final_quality=quality,
-                session_count=decision.session_count,
-                query_count=decision.query_count,
-                skipped_reason=decision.reason,
-            )
+    from backend.free.memory.pipeline.rag_judge_recall import try_recall_quality
+    recalled = await try_recall_quality(query_vec, mem_view, quality_recall_cfg)
+    if recalled is None:
         return quality
 
-    import time as _time
-    started = _time.perf_counter()
-    new_quality = await quality_judge.judge_with_assist(
-        query, merged, assist_client, quality,
-        record_assist=assist_experience_recorder,
-    )
-    elapsed = _time.perf_counter() - started
-    session_count_after = tracker.record(session_id, namespace="quality")
-    logger.debug(
-        "Step 5b assist judge: rule=%s -> final=%s (session_count=%d)",
-        quality, new_quality, session_count_after,
-    )
+    label, recall_sim = recalled
+    logger.debug("Step 5b quality recall: %s (sim=%.3f)", label, recall_sim)
     if debug_logger is not None:
-        # session_count は "発火後" の累計を記録することで、skip ログ側の
-        # "発火前" の数値と組み合わせて発火履歴を時系列で追える。
-        debug_logger.log_assist_judge(
-            query_preview=query,
-            rule_based_quality=quality,
-            used=True,
-            final_quality=new_quality,
-            session_count=session_count_after,
-            query_count=decision.query_count + 1,
-            elapsed_sec=elapsed,
+        debug_logger.log_decision(
+            decision_point="self_rag_judge_path",
+            chosen="embedding_recall",
+            candidates=["rule_based", "embedding_recall"],
+            reason="embedding_recall_matched",
+            context={
+                "rule_based_quality": quality,
+                "recalled_quality": label,
+                "similarity": recall_sim,
+                "query_preview": query[:80],
+            },
+            scope="request",
         )
-    return new_quality
+    return label
 
 
 async def _try_quality_expansion(
@@ -457,6 +361,27 @@ def _log_memory_search_state(
     )
 
 
+def _resolve_keep_floor(rag_cfg: dict, thresholds: QualityThresholds) -> float:
+    """``low_quality_keep_floor`` を ``threshold_mode`` に従って解決する。
+
+    ``auto`` かつ較正が効いているときは較正済み ``relevance`` と同じ棒を使う
+    (「関連性の棒を越えたチャンクは集計判定が low でも残す」)。``manual`` /
+    較正なしでは config の静的値をそのまま使う。config が ``0.0`` (= 従来どおり
+    クエリ単位の全件破棄) を明示している場合は較正より優先して尊重する。
+    """
+    self_rag = rag_cfg.get("self_rag") or {}
+    configured = float(self_rag.get("low_quality_keep_floor", 0.0))
+    if configured <= 0.0:
+        return 0.0
+    if str(self_rag.get("threshold_mode", "auto")) != "auto":
+        return configured
+    from backend.free.rag.memory_threshold_calibration import get_active_calibration
+
+    if get_active_calibration() is None:
+        return configured
+    return float(thresholds.relevance)
+
+
 async def unified_search(
     query: str,
     query_vec: np.ndarray,
@@ -465,7 +390,7 @@ async def unified_search(
     long_term,
     cartridge_mgr=None,
     config: dict | None = None,
-    assist_client=None,
+    aux_client=None,
     debug_logger=None,
     mode: str = "chat",
     policy: PolicyInterpreter | None = None,
@@ -474,40 +399,27 @@ async def unified_search(
     lazy_contextual: "LazyContextualPrefixService | None" = None,
     *,
     session_id: str = "default",
-    assist_judge_tracker: "AssistJudgeUsageTracker | None" = None,
-    necessity_prompt: str | None = None,
-    quality_prompt: str | None = None,
-    assist_experience_recorder: "Callable[[str, str, str, float, str], None] | None" = None,
+    judge_tracker: "JudgeUsageTracker | None" = None,
     mem_view: "MemFactView | None" = None,
 ) -> SearchResult:
     """統合検索パイプライン: Self-RAG + 3層メモリ
 
-    デフォルトはルールベース + ベクトル演算で完結（ベースモデル呼び出しゼロ）。
-    ``rag.self_rag.assist_judge.enabled=true`` (既定) 時、
-    ``only_when_quality`` に該当した検索品質判定 (既定 ``medium``) で
-    アシストモデル LLM を併用し marginal な結果を救済する
-    ``max_per_session`` / ``max_per_query`` の発火上限とセッション単位の
-    カウンタを追加し、ユーザ体感レイテンシへの影響を抑制する。
+    判定はルールベース + ベクトル演算で完結する (LLM 呼び出しゼロ)。
+    marginal 帯 (既定 ``medium``) の品質ラベルだけは embedding 決定論的
+    リコールで上書きしうる。
     STM / LTM / カートリッジ検索を asyncio.gather で並列実行する。
     ``rag.fetch_multiplier`` が 2 以上の場合、LTM / カートリッジの取得件数を
     `top_k * N` に拡張する (STM は `stm_top_k` 固定)。
 
     Args:
-        session_id: assist_judge の発火カウンタキー
+        session_id: content gate の発火カウンタキー。
             ``run_search_pipeline`` が ``WorkingMemory.session_id`` か
             フロントエンド指定 session_id を渡す。
-        assist_judge_tracker: セッション単位のカウンタ。``None`` の場合、
-            セッション上限は評価されずルールベース + quality gate のみで
-            判定する (テスト経路互換)。
+        judge_tracker: content gate (create モード) のセッション単位
+            カウンタ。``None`` なら上限を評価しない (テスト経路互換)。
     """
     cfg = config or {}
     rag_cfg = cfg.get("rag", {})
-    # assist_experience_recorder (state.assist_experience_recorder、5引数版
-    # (..., mode)) を、この呼び出しの mode に束縛した 4 引数版へラップしてから
-    # 下流 (necessity_judge / _maybe_assist_judge_quality) へ渡す。ラップしない
-    # まま渡すと下流は 4 引数で呼ぶため recorder 側の mode 既定値 "chat" に
-    # 落ち、create セッションの assist 経験が誤って chat タグで記録されてしまう。
-    assist_experience_recorder = _bind_recorder_mode(assist_experience_recorder, mode)
     top_k, stm_top_k, noise_sigma = _resolve_search_params(policy, rag_cfg, mode)
     multiplier = _resolve_fetch_multiplier(cfg)
     fetch_k = top_k * multiplier
@@ -516,25 +428,23 @@ async def unified_search(
         query[:80], top_k, fetch_k, multiplier,
     )
 
-    # Step 1: Self-RAG 検索必要性判定 (rule + uncertain 時のみアシスト)
-    # necessity_prompt は AssistPromptManager (task=rag_necessity) 由来の編集可能
-    # 指示部。composition 層から plain str で注入され、None なら judge 側既定に倒す。
-    necessity_judge = RetrievalNecessityJudge(necessity_instructions=necessity_prompt)
+    # Step 1: Self-RAG 検索必要性判定 (rule + uncertain 時のみ embedding リコール)
+    necessity_judge = RetrievalNecessityJudge()
     full_context = working_mem.get_context()
     context_count = len(full_context)
     # 末尾ターンは現在のユーザクエリ自身 (chat service が search 前に
-    # WorkingMemory.add_turn 済) なので、アシストプロンプトの "最新のクエリ"
+    # WorkingMemory.add_turn 済) なので、補助タスクプロンプトの "最新のクエリ"
     # と重複しないよう除外する。末尾が user role でない (テスト経路等) なら
     # 全件をそのまま渡す。
     if full_context and full_context[-1].get("role") == "user":
         recent_context = full_context[:-1]
     else:
         recent_context = full_context
-    necessity_cfg = _resolve_assist_necessity_cfg(rag_cfg)
+    necessity_cfg = _resolve_necessity_judge_cfg(rag_cfg)
     necessity_recall_cfg = _resolve_necessity_recall_cfg(rag_cfg)
 
     # Step 1 全体を計測する。ここが未計測だったため「遅い検索の 89.7% が
-    # 内訳不明」という状態が続き、実際の支配要因 (necessity assist の往復) が
+    # 内訳不明」という状態が続き、実際の支配要因 (necessity aux の往復) が
     # 見えていなかった (2026-08-01 プロファイリング)。
     if timer is not None:
         timer.start("necessity_ms")
@@ -572,20 +482,7 @@ async def unified_search(
                     scope="request",
                 )
     if necessity is None:
-        if necessity_cfg["enabled"] and assist_client is not None:
-            necessity = await necessity_judge.judge_with_assist(
-                query,
-                context_count,
-                assist_client,
-                recent_context=recent_context,
-                session_id=session_id,
-                tracker=assist_judge_tracker,
-                debug_logger=debug_logger,
-                config=necessity_cfg,
-                record_assist=assist_experience_recorder,
-            )
-        else:
-            necessity = necessity_judge.judge(query, context_count=context_count)
+        necessity = necessity_judge.judge(query, context_count=context_count)
     if timer is not None:
         timer.stop("necessity_ms")
     logger.debug("Step 1 necessity: %s (context_count=%d)", necessity, context_count)
@@ -604,13 +501,15 @@ async def unified_search(
     # (ゲートが取得より高くつく状態を検出できるようにする)。
     if timer is not None:
         timer.start("retrieval_ms")
-    stm_results, ltm_results, cart_results = await asyncio.gather(
+    stm_pair, ltm_results, cart_results = await asyncio.gather(
         _search_stm_layer(short_term, query_vec, stm_top_k),
         _search_ltm_layer(long_term, query_vec, fetch_k),
         _search_cartridge_layer(
             cartridge_mgr, query_vec, fetch_k, timeout_ms=cart_timeout_ms,
         ),
     )
+    # STM は順位付け用 (combined) とゲート用 (素の cosine) の 2 系統を返す。
+    stm_results, stm_gate_results = stm_pair
     if timer is not None:
         timer.stop("retrieval_ms")
 
@@ -628,10 +527,13 @@ async def unified_search(
     # Step 4: 結果マージ。merged_raw は生スコア (品質判定 / gate / クエリ拡張用)、
     # merged は最終順位付け用。score_normalization でクロスレイヤ正規化を適用し、
     # STM/LTM/cartridge の異種スコアスケールの歪みを吸収する。
+    # merged_raw は STM のゲート用スコア (素の cosine) を使う。LTM / cartridge は
+    # 元から cosine なので、これで 3 層すべてが同じスケールに揃う。merged 側は
+    # 従来どおり STM の combined (LightMem / pin 込み) で順位付けする。
     norm = rag_cfg.get("score_normalization", "none")
-    merged_raw = _merge_results(stm_results, ltm_results, cart_results)
+    merged_raw = _merge_results(stm_gate_results, ltm_results, cart_results)
     if norm == "none":
-        merged = merged_raw
+        merged = _merge_results(stm_results, ltm_results, cart_results)
     else:
         merged = _merge_results(
             stm_results, ltm_results, cart_results, normalization=norm,
@@ -644,7 +546,7 @@ async def unified_search(
     # Step 4.5: 取得直後の内容精査ゲート — 低価値 chunk を pruning し、後続の
     # 品質判定 / クエリ拡張の候補数を縮小する。
     # create mode を主対象 (chat mode は近似重複除去のみ)。marginal band の
-    # prose のみ assist で 1 回関連性判定する (assist 無/cap 超過/error は純ルール)。
+    # prose のみ aux で 1 回関連性判定する (aux 無/cap 超過/error は純ルール)。
     # gate は生スコア (relevance_floor は cosine 前提) で判定するため merged_raw に
     # 適用し、残った chunk_id 集合を正規化側 merged にも射影する。
     gate_cfg = GateConfig.from_rag_cfg(rag_cfg)
@@ -653,43 +555,34 @@ async def unified_search(
             gate_cfg, debug_logger=debug_logger,
         ).filter(
             query, merged_raw, mode,
-            assist_client=assist_client,
-            tracker=assist_judge_tracker,
+            aux_client=aux_client,
+            tracker=judge_tracker,
             session_id=session_id,
         )
-        if norm == "none":
-            merged = merged_raw
-        else:
-            kept = {cid for cid, _, _ in merged_raw}
-            merged = [t for t in merged if t[0] in kept]
+        kept = {cid for cid, _, _ in merged_raw}
+        merged = [t for t in merged if t[0] in kept]
         logger.debug("Step 4.5 content gate: %d results after prune", len(merged_raw))
 
-    # Step 5: Self-RAG 品質判定 + (オプション) アシスト強化（< 0.1ms）
+    # Step 5: Self-RAG 品質判定 (ベクトル閾値、< 0.1ms)
     # 判定は常に生スコア (merged_raw) に対して行う。品質3閾値は cosine 分布前提の
     # ため、正規化スコアを渡すと閾値の意味が崩れる。
     thresholds = QualityThresholds.from_config(rag_cfg)
     # decision.jsonl に記録 (decision_point=``self_rag_judge_path``)
-    quality_judge = RetrievalQualityJudge(
-        thresholds, debug_logger=debug_logger,
-        quality_instructions=quality_prompt,
-    )
+    quality_judge = RetrievalQualityJudge(thresholds, debug_logger=debug_logger)
     quality = quality_judge.judge(merged_raw)
     logger.debug("Step 5 quality: %s", quality)
     if timer is not None:
-        timer.start("assist_judge_ms")
+        timer.start("content_gate_ms")
     try:
-        quality = await _maybe_assist_judge_quality(
-            quality_judge, quality, merged_raw, query, assist_client, rag_cfg,
-            session_id=session_id,
-            tracker=assist_judge_tracker,
+        quality = await _maybe_recall_quality(
+            quality, query, rag_cfg,
             debug_logger=debug_logger,
-            assist_experience_recorder=assist_experience_recorder,
             mem_view=mem_view,
             query_vec=query_vec,
         )
     finally:
         if timer is not None:
-            timer.stop("assist_judge_ms")
+            timer.stop("content_gate_ms")
 
     # Step 6: 品質不足時のクエリ拡張フォールバック (生スコアで再検索)。
     # 拡張が発火した場合 (quality=="low" の稀ケース) は結果集合が変わるため、
@@ -702,24 +595,65 @@ async def unified_search(
         merged_raw = expanded
         merged = expanded
 
-    # Step 6.5: 品質 low の結果は添付しない。クエリ拡張 (Step 6) を経ても
-    # low のままなら、無関連チャンクをコンテキストへ注入する害の方が大きい
+    # Step 6.5: 品質 low の結果はそのままでは添付しない。クエリ拡張 (Step 6) を
+    # 経ても low のままなら、無関連チャンクをコンテキストへ注入する害の方が大きい
     # (2026-07-15: final_quality=low の 13 件がそのまま添付され、内容は全て
     # 無関連の過去雑談ノートだった)。「low と判定したのに全件添付」を塞ぐ。
+    #
+    # ただし判定は merged 全体に対する **単一スカラ (top_score)** で、これは
+    # 「この質問に記憶が要るか」を弁別しない。実測 (2026-08-12、STM 94 / LTM 103、
+    # 監査 24 クエリ): 記憶が要るクエリの top_score 中央値 0.472 に対し、
+    # 要らないクエリは 0.541 と **逆転** していた。閾値をどこに置いても
+    # 誤注入 >= recall になる一方、正解ノート自体は 5 プローブ中 3 件で
+    # merged 1 位に来ていた (0.547 / 0.605 / 0.544)。つまり検索は当たっており、
+    # 全件破棄だけが効いていた (31 ターンの実会話で採用 0 件)。
+    #
+    # そこで low のときは「クエリ単位の全件破棄」ではなく「チャンク単位のフロア」
+    # で絞る。実測のフロア別 recall / 漏れ (正解が残る件数 / 記憶不要クエリの
+    # 通過チャンク数): 0.45 -> 3/5・平均 1.3 件、0.40 -> 4/5・平均 1.3 件、
+    # 0.35 -> 5/5・平均 2.8 件。上記インシデントの 13 件とは桁が違う。
+    #
+    # フロアは生スコア (cosine スケール) 前提なので merged_raw で判定し、
+    # 残った chunk_id を正規化側 merged に射影する (Step 4.5 と同じ形)。
+    # 既定 0.0 は「従来どおり全件破棄」で、有効化は config.yaml 側で明示する。
+    # **進化対象にはしない**: このゲートはモデルが何を見るかを決めるため、
+    # モデル自身の出力由来の turn_outcome で自動調整すると閉ループになる。
+    #
+    # フロアの値は threshold_mode に従う。``auto`` (較正が効いている) では
+    # **較正済み relevance と同じ棒**を使う。``low`` は「top が低い」場合だけで
+    # なく「top は高いが top3_avg が support を下回る」(単発の強いヒット +
+    # 弱い周辺) でも起きるため、フロアは死んでいない。静的既定 0.40 は上の
+    # 実測と同じく旧スケール (STM の combined) で決めた値で、cosine スケールでは
+    # 実測 need の下限 0.338 / p25 0.367 を上回り、救済すべき単発ヒットを捨てる。
+    # relevance と同じ棒にすれば「関連性の棒を越えたチャンクは、集計判定が low
+    # でも残す」という一貫した意味になる。
     if quality == "low":
+        floor = _resolve_keep_floor(rag_cfg, thresholds)
+        kept_ids = (
+            {cid for cid, score, _ in merged_raw if score >= floor}
+            if floor > 0.0 else set()
+        )
+        rescued = [t for t in merged if t[0] in kept_ids]
         logger.info(
-            "Search results discarded (final quality=low): %d candidates "
-            "for query: %s", len(merged), query[:50],
+            "Search results below quality floor (final quality=low): "
+            "%d/%d chunks passed floor=%.2f for query: %s",
+            len(rescued), len(merged), floor, query[:50],
         )
-        _log_memory_search_state(
-            debug_logger, context_count, stm_results, ltm_results,
-            semmem_stats=semmem_stats,
-        )
-        return SearchResult(
-            sources=[],
-            quality=quality,
-            from_memory=bool(stm_results),
-        )
+        if not rescued:
+            _log_memory_search_state(
+                debug_logger, context_count, stm_results, ltm_results,
+                semmem_stats=semmem_stats,
+            )
+            return SearchResult(
+                sources=[],
+                quality=quality,
+                from_memory=bool(stm_results),
+            )
+        merged = rescued
+        # 公平性保証 (Step 7.5) は cart_results から未代表カートリッジを
+        # 強制注入するため、フロアを通していないチャンクが裏口から戻る。
+        # 救済経路ではカートリッジ側にも同じフロアを掛ける。
+        cart_results = [c for c in cart_results if c[0] in kept_ids]
 
     # Step 7: 最終順位付け (merged はスコア降順) から top_k 件を採用
     final_sources = merged[:top_k]
@@ -743,7 +677,26 @@ async def unified_search(
         sources=final_sources,
         quality=quality,
         from_memory=bool(stm_results),
+        top_raw_score=_top_raw_score(final_sources, merged_raw),
     )
+
+
+def _top_raw_score(
+    final_sources: list[tuple[str, float, str]],
+    merged_raw: list[tuple[str, float, str]],
+) -> float | None:
+    """採用チャンクの生スコア (cosine スケール) の最大値を返す。
+
+    `final_sources` のスコアは `score_normalization` 適用後なので観測値に使えない
+    (`minmax` では先頭が定義上 1.0)。`merged_raw` 側の生スコアを chunk_id で
+    引き直す。gate/拡張で `merged_raw` から落ちた chunk (カートリッジ公平性で
+    裏口から戻った等) は引けないので単に除外する。1 件も引けなければ `None`。
+    """
+    if not final_sources:
+        return None
+    raw_by_id = {cid: score for cid, score, _ in merged_raw}
+    scores = [raw_by_id[cid] for cid, _, _ in final_sources if cid in raw_by_id]
+    return max(scores) if scores else None
 
 
 def _cartridge_id_of(chunk_id: str) -> str | None:

@@ -304,7 +304,12 @@ export async function initTheme(): Promise<void> {
 		const initialMode = data.color_mode ?? 'dark';
 		colorMode.set(isColorMode(initialMode) ? initialMode : 'dark');
 
-		if (activeId) {
+		// active_theme_id は config の `theme.active` をそのまま返すため、該当テーマが
+		// 未インストールでも空にならない (テーマ 0 件でも既定の "fallback" が返る)。
+		// 存在確認をせずに activateTheme を呼ぶと 404 で throw し、catch へ抜けて
+		// 下の「テーマなし」処理ごとスキップされる (= 旧テーマの CSS/スロットが残る)。
+		const installed = data.themes.some((t) => t.theme_id === activeId);
+		if (activeId && installed) {
 			// テーマがアクティブな場合は CSS / layout / スロットを適用
 			await activateTheme(activeId, isColorMode(initialMode) ? initialMode : 'dark');
 		} else {

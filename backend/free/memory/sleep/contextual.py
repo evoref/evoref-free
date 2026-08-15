@@ -4,7 +4,7 @@
 として実装されていた contextual prefix 生成ロジックを独立 module に切り出した。
 
 VectorStore と CartridgeManager 内の ``has_context=false`` チャンクに対し、
-アシストモデルでコンテキストプレフィックスを生成し、プレフィックス付き
+補助タスクでコンテキストプレフィックスを生成し、プレフィックス付き
 テキストで再埋め込み → BM25 再構築を行う。
 
 本 module は EvorefMem pillar 内部扱いだが、実質は EvorefGen pillar の
@@ -49,7 +49,7 @@ async def generate_prefixes_for_store(
 
     ``min_chunk_tokens`` が 1 以上のときは、metadata の ``tokens`` が
     その値未満の chunk をスキップする。短文 chunk は
-    プレフィックスの retrieval 寄与が薄いためアシストモデル呼び出しを節約する。
+    プレフィックスの retrieval 寄与が薄いため補助タスク呼び出しを節約する。
     """
     if store is None:
         return 0
@@ -173,7 +173,7 @@ async def generate_contextual_prefixes(
 
     Args:
         llm_client: プレフィックス生成に使う LLM クライアント
-            (AssistModelClient 相当)。
+            (AuxClient 相当)。
         config: ``rag.contextual_prefix`` セクション (enabled / mode /
             batch_size / min_chunk_tokens 等) を含む設定 dict。
         embedder: 再埋め込みに使う

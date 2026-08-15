@@ -1,0 +1,79 @@
+# Qwen3.8-27B (Q4_K_M / Unsloth 量子化) 固有のプロファイル。
+# arch は "qwen35" を報告するため models/profiles/qwen35.yaml が土台になり、本ファイルの
+# 宣言だけが差分上書きされる (dict は再帰マージ、list とスカラーは置換)。ファイル名は
+# GGUF ファイル名の拡張子なし部分と完全一致させること。反映は llama-server / backend の
+# 再起動時のみ (キャッシュキーは GGUF の mtime で、本 YAML の mtime は見ない)。
+#
+# GGUF メタデータ実測 (2026-08-15, models/Qwen3.8-27B-Q4_K_M.gguf):
+#   architecture=qwen35 / block_count=65 / context_length=262144 / expert_count=0
+#   attention.head_count=24 / head_count_kv=4 / key_length=value_length=256
+#   embedding_length=5120 / feed_forward_length=17408 / rope.freq_base=1e7
+#   full_attention_interval=4 → 64 層中 16 層のみ full attention、残り 48 層は
+#   Gated DeltaNet (ssm.state_size=128 / ssm.inner_size=6144 / ssm.conv_kernel=4)
+#   nextn_predict_layers=1 (MTP ヘッド内蔵)
+#   general.sampling: temp=1.0 / top_p=0.95 / top_k=20 (= モデルカードの thinking 用推奨)
+#
+# 同 arch の Qwen3.5-27B-Q4_K_M との差分は 3 点だけ (attention 形状・ctx・ssm 構成は同一):
+#   ① nextn_predict_layers 0 → 1  MTP ヘッド内蔵 = 自己投機デコードが使える
+#   ② block_count 64 → 65         +1 は MTP/NextN 層
+#   ③ chat_template 刷新          thinking 既定が反転 / reasoning_effort / XML tool_call
+# よって launch_flags (--jinja / --reasoning-format auto) / moe / reasoning / context_size は
+# arch 層のままで正しく、ここでは宣言しない (list の launch_flags は置換なので、書くなら
+# arch 側の値も全部書き直す必要がある)。
+#
+# context_size について: arch 層の 32768 は VRAM 都合の保守既定で、本モデルの
+# n_ctx_train は 262144。現状は config.yaml の llama.context_size=8192 が明示ピンで
+# 勝つため (config 明示 > profile > 既定) どちらも inert。伸ばすなら config 側を触る。
+
+# ── サンプリング ────────────────────────────────────────
+# モデルカード (Qwen/Qwen3.8-27B) の推奨値:
+#   thinking     : temperature 1.0 / top_p 0.95 / top_k 20 / min_p 0.0 / presence_penalty 0.0
+#   non-thinking : temperature 0.7 / top_p 0.80 / top_k 20 / min_p 0.0 / presence_penalty 1.5
+# 本リポジトリは enable_thinking=false 運用なので non-thinking 側が該当する。
+#
+# ただし profile.sampling は **モード横断で** modes.* を上書きする
+# (backend/config.py get_mode_generation_params: {**defaults, **modes.*, **profile.sampling})。
+# chat (temp 0.7) と create (temp 0.3) で値の割れる temperature / top_p を宣言すると
+# モード別チューニングを一律に潰すため、arch 層と同じ理由で宣言しない。
+#
+# top_k だけ宣言する: 20 は thinking / non-thinking 双方で同じ推奨値で、modes.coding は
+# 既に 20、modes.chat だけ 40 で乖離している。モード別チューニングを壊さずに
+# モデルカードへ寄せられる唯一のキー。
+#
+# presence_penalty 1.5 は意図的に不採用 — (a) create/coding では識別子の正当な反復まで
+# 罰する、(b) Qwen 系は presence_penalty > 0 で language mixing が出やすく日本語運用で
+# リスクがある。必要なら config.yaml の modes.chat.presence_penalty に明示すること。
+sampling:
+  top_k: 20
+
+# ── MTP (自己投機デコード) — profile では有効化できない ──────
+# 本モデルは NextN ヘッドを内蔵する (nextn_predict_layers=1) ため llama-server の
+# --spec-type draft-mtp が使える (外部 draft モデル不要 = 追加 VRAM なし)。
+# **MTP の SSOT は profile ではなく config.yaml の llama.mtp** (backend/schemas/llm.py の
+# MtpConfig → scripts/launch_llama.py build_mtp_args)。有効化は config 側で:
+#
+#   llama:
+#     mtp:
+#       enabled: true
+#       draft_n_max: 3      # 上流 --spec-draft-n-max の既定
+#
+# launch_flags に --spec-type を直書きしないこと。config の gate と speculative との
+# 排他解決 (MTP 優先 + speculative 無効化) を素通りしてしまう。
+# 手元の llama-server は --spec-type の選択肢に draft-mtp を持つことを確認済み
+# (llama.cpp b9180 以降。b9180 未満は旧名 --spec-type mtp で非互換)。
+
+# ── thinking の既定が Qwen3.5 から反転している ────────────
+# 新 chat_template は `enable_thinking is undefined or enable_thinking is true` 判定で
+# **thinking ON が既定**、かつ thinking ON のとき reasoning_effort の既定が 'xhigh' で
+# 「慎重に考えろ」の指示が system へ注入される。enable_thinking=false を送ると
+# `<think>\n\n</think>` を空で閉じて完全に無効化される。
+# arch 層の reasoning.mode=toggle / enable_thinking=false がそのまま正しく効くので
+# 上書き不要。llama.enable_thinking=true へ切り替える場合は、reasoning_effort=xhigh の
+# 冗長な思考が既定になる点に注意 (reasoning_effort は 'xhigh'/'medium'/'low' のみ受理、
+# 'high' だけ 'xhigh' へ正規化、それ以外はテンプレートが raise_exception する。
+# 本リポジトリは reasoning_effort を送らないので現状は該当しない)。
+
+# ── 画像 / 動画 ────────────────────────────────────────
+# Qwen3.8 はマルチモーダルで chat_template も image/video を扱うが、この GGUF は
+# テキスト側のみ (vision テンソルなし)。使うには別途 mmproj GGUF と --mmproj が要る
+# (本リポジトリは未配線)。

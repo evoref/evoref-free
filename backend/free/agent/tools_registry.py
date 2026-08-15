@@ -94,8 +94,8 @@ class ToolsRegistry:
     def list_names(self) -> list[str]:
         """登録済みツール名を登録順で返す。
 
-        ネイティブ tool calling の ``tools`` 配列構築 (``native_tools.
-        build_oai_tools``) が全ツールを走査するための公開口。``hidden`` は
+        文法制約ツール分類の enum 構築 (``grammar_tool_classifier.
+        available_tool_names``) が全ツールを走査するための公開口。``hidden`` は
         ここでは除外しない — hidden は「プロンプトのツール一覧に出さない」印で
         あって「使わせない」印ではないため、絞り込みは呼出側の責務。
         """
@@ -137,6 +137,23 @@ class ToolsRegistry:
                     continue
                 req_marker = "required" if k in required else "optional"
                 lines.append(f"    - {k} ({req_marker}): {desc}")
+        return "\n".join(lines)
+
+    def get_capability_summary(self, mode: str | None = None) -> str:
+        """ユーザー向けのツール一覧 (名前 + 説明のみ、1 行 1 ツール)。
+
+        ``get_descriptions_text`` と違い引数シグネチャを展開せず、``hidden``
+        も含める。hidden は「モデルへのツールメニューに出さない」印であって
+        「ユーザーに隠す」印ではなく、実行結果は UI の Agentic ステップに
+        そのまま表示されている。「何のツールが使えるか」を尋ねられたときに
+        hidden を落とすと、実際に走っている ``run_command_readonly`` などが
+        一覧から消えて回答が実態とずれる。
+        """
+        lines = []
+        for tool in self._tools.values():
+            if mode and mode not in tool.modes:
+                continue
+            lines.append(f"- {tool.name}: {tool.description}")
         return "\n".join(lines)
 
     @staticmethod

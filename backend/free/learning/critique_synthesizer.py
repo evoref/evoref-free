@@ -3,7 +3,7 @@
 Darwinian Evolver の変異生成前に経験バッファの失敗パターンを分析し、
 構造化された批評を変異ヒントとして提供する。
 
-アシストモデル接続時は LLM で深い分析を行い、
+補助タスク接続時は LLM で深い分析を行い、
 未接続時はルールベースのパターン分析にフォールバックする。
 
 参考論文: PromptWizard (arXiv:2405.18369) の批評・合成ループ
@@ -20,7 +20,6 @@ from backend.log_config import get_logger
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
-    from backend.free.llm.assist_model_client import AssistModelClient
 
 logger = get_logger("learning.critique_synthesizer")
 
@@ -62,7 +61,12 @@ class CritiqueResult:
     """批評の要約"""
 
     source: str = "rule_based"
-    """批評の生成元: "assist" | "rule_based" """
+    """批評の生成元: ``"llm"`` | ``"rule_based"``。
+
+    ``"llm"`` は「LLM に生成させた」の意。批評はベースモデルで走る。
+    過去の `learning_state.json` には旧値 ``"aux"`` が残るが、この値で分岐する
+    コードは無い (ログ・デバッグ JSONL 用の記述ラベル)。
+    """
 
 
 def _analyze_correction_rate(
@@ -218,22 +222,23 @@ def _format_critique_summary(
 class CritiqueSynthesizer:
     """経験バッファの失敗パターンを批評し、変異ヒントを生成する
 
-    アシストモデルが利用可能な場合は LLM で構造化分析を行い、
+    LLM が利用可能な場合は構造化分析を行い、
     利用不可の場合はルールベースのパターン分析にフォールバックする。
     """
 
     def __init__(
         self,
-        assist_client: AssistModelClient | None = None,
+        llm_client=None,
         debug_logger: DebugLogger | None = None,
     ) -> None:
         """初期化
 
         Args:
-            assist_client: AssistModelClient インスタンス（None ならルールベース専用）
+            llm_client: 批評合成に使う LLM クライアント (ベースモデルの
+                ``AuxClient``)。``None`` ならルールベース専用。
             debug_logger: DebugLogger インスタンス（任意）
         """
-        self._assist_client = assist_client
+        self._llm_client = llm_client
         self._debug_logger = debug_logger
 
     async def critique(self, experiences: list[dict]) -> CritiqueResult:
@@ -261,13 +266,13 @@ class CritiqueSynthesizer:
 
         t0 = time.monotonic()
 
-        # アシストモデルが利用可能かチェック
-        if self._assist_client is not None:
+        # LLM が利用可能かチェック
+        if self._llm_client is not None:
             try:
-                result = await self._assist_critique(failures, experiences)
+                result = await self._llm_critique(failures, experiences)
                 elapsed = time.monotonic() - t0
                 logger.info(
-                    "Assist critique completed: %d patterns, %d hints (%.2fs)",
+                    "LLM critique completed: %d patterns, %d hints (%.2fs)",
                     len(result.failure_patterns),
                     len(result.improvement_hints),
                     elapsed,
@@ -276,7 +281,7 @@ class CritiqueSynthesizer:
                 return result
             except Exception as e:
                 logger.warning(
-                    "Assist critique failed, falling back to rule-based: %s: %s",
+                    "LLM critique failed, falling back to rule-based: %s: %s",
                     type(e).__name__, e,
                 )
 
@@ -292,12 +297,12 @@ class CritiqueSynthesizer:
         self._log_critique(result, elapsed)
         return result
 
-    async def _assist_critique(
+    async def _llm_critique(
         self,
         failures: list[dict],
         all_experiences: list[dict],
     ) -> CritiqueResult:
-        """アシストモデルによる失敗パターン分析
+        """補助タスクによる失敗パターン分析
 
         失敗経験を構造化して LLM に渡し、根本原因と改善提案を得る。
         """
@@ -353,7 +358,7 @@ class CritiqueSynthesizer:
             "- Focus on the most impactful changes"
         )
 
-        data = await self._assist_client.generate_json(
+        data = await self._llm_client.generate_json(
             prompt,
             max_tokens=512,
             temperature=0.3,
@@ -361,7 +366,7 @@ class CritiqueSynthesizer:
         )
 
         if not data:
-            raise ValueError("Assist model returned empty JSON")
+            raise ValueError("Critique model returned empty JSON")
 
         hints = [
             h for h in data.get("improvement_hints", [])
@@ -371,7 +376,7 @@ class CritiqueSynthesizer:
             failure_patterns=data.get("failure_patterns", [])[:4],
             improvement_hints=hints[:4],
             summary=data.get("summary", ""),
-            source="assist",
+            source="llm",
         )
 
     def _rule_based_critique(
@@ -452,7 +457,7 @@ class CritiqueSynthesizer:
                 - ``signature``: failure_signature (任意)
 
         Returns:
-            ``CritiqueResult``。``source="assist"`` / ``"rule_based"`` の
+            ``CritiqueResult``。``source="llm"`` / ``"rule_based"`` の
             既存仕様を踏襲する。
         """
         if len(cluster_facts) < 2:

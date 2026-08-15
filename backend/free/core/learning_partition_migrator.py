@@ -7,7 +7,6 @@
 ``local/learning/.partition_migrated_v1`` で一度だけ実行する。
 
 設計上の約束:
-- assist 学習 (assist プロンプト / assist LoRA / experience_assist) は対象外 = 共有のまま。
 - experience エントリは ``base_model`` タグ別にバケツ分けし、別モデルのエントリは
   そのモデルのパーティションへ振り分ける (クロスモデル履歴を非破壊保持)。
 - LoRA / 制御ベクトル / learning_state は mode-blind なのでモデルルート直下。
@@ -41,7 +40,7 @@ MARKER_NAME = ".partition_migrated_v1"
 # "model" → "model_mode" に切り替えるケースがあり、発火タイミングが異なるため。
 ADAPTER_MODE_MARKER_NAME = ".adapter_mode_migrated_v1"
 
-# flat prompts_dir から base パーティションへ移すファイル名 (assist_* は移さない)。
+# flat prompts_dir から base パーティションへ移すファイル名。
 _BASE_PROMPT_FILES = (
     "chat.md", "chat.meta.json",
     "create.md", "create.meta.json",
@@ -54,7 +53,7 @@ _BASE_PROMPT_FILES = (
 )
 # 同じく移すサブディレクトリ。
 _BASE_PROMPT_SUBDIRS = ("level1_history",)
-# history/ 配下で移す base プロンプト版 (assist_*_v*.md は残置)。
+# history/ 配下で移す base プロンプト版。
 _BASE_HISTORY_GLOBS = ("chat_v*.md", "create_v*.md")
 
 
@@ -200,7 +199,7 @@ class LearningPartitionMigrator:
 
         ``{mode}.md`` / ``.meta.json`` / learning_state / L1 セッション /
         exploration / policy_evolver / fewshot_pool / ratios と
-        ``history/{mode}_v*.md`` / ``level1_history/`` を対象。assist_* は残置。
+        ``history/{mode}_v*.md`` / ``level1_history/`` を対象。
         """
         src_dir = self._resolver.resolve_local("prompts_dir")
         dst_dir = self._resolver.learning_path_for("prompts_dir", stem)
@@ -276,7 +275,7 @@ class LearningPartitionMigrator:
     def migrate_adapter_partition_mode_if_needed(self, stem: str) -> bool:
         """``level2_adapter_partition=="model_mode"`` 初回有効化時の非破壊移行。
 
-        既存の (model のみ) パーティション済み base/assist LoRA を "chat" バケットへ
+        既存の (model のみ) パーティション済み base LoRA を "chat" バケットへ
         コピーする(原本は残置)。既定モードが "chat" (``AppState.current_mode`` /
         Free CLI 既定と一致) なので、既存の共有アダプタは主に chat セッションの
         経験を反映していると見なすのが最も実態に近い、という前提。
@@ -296,15 +295,6 @@ class LearningPartitionMigrator:
         for key in ("lora_adapter", "lora_versions_dir", "lora_spsa_checkpoint"):
             src = self._resolver.learning_path_for(key, stem)
             dst = self._resolver.learning_path_for(key, stem, mode="chat")
-            copied += self._copy_if_missing(src, dst)
-
-        for key in (
-            "assist_lora_adapter",
-            "assist_lora_versions_dir",
-            "assist_lora_spsa_checkpoint",
-        ):
-            src = self._resolver.resolve_local(key)
-            dst = self._resolver.resolve_assist_learning(key, mode="chat")
             copied += self._copy_if_missing(src, dst)
 
         self._write_adapter_mode_marker(stem, copied)

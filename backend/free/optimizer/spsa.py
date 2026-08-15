@@ -107,6 +107,7 @@ class SPSAOptimizer:
         initial_loss: float | None = None,
         eval_current_params: bool = True,
         invalid_loss: float | None = None,
+        early_stop_patience: int | None = None,
     ) -> tuple[np.ndarray, float]:
         """SPSA 最適化ループ
 
@@ -124,6 +125,10 @@ class SPSAOptimizer:
                 での反復あたり起動回数を 1/3 削減する。
             invalid_loss: 評価不能を表す番兵値。探索点がこの値なら勾配 0 でスキップし、
                 best 追跡からも除外する（番兵による暴発・誤採用を防ぐ）。
+            early_stop_patience: best が更新されないまま連続でこの反復数を超えたら
+                打ち切る（None / 0 で無効 = 従来挙動）。1 反復が候補 LoRA の実サーバ
+                起動 2 回に相当する高コスト eval で、探索が空振りしていることが
+                確定している後半を回し切らないための天井。
 
         Returns:
             (最適化後パラメータ, 最終損失値)
@@ -138,6 +143,9 @@ class SPSAOptimizer:
             len(params), iterations, best_loss,
         )
 
+        patience = int(early_stop_patience or 0)
+        stagnant = 0
+
         for k in range(1, iterations + 1):
             a_k, c_k = self._decay_schedule(k)
 
@@ -150,12 +158,14 @@ class SPSAOptimizer:
             prev_params = params
             params = prev_params - a_k * gradient
 
+            improved = False
             if eval_current_params:
                 # 更新後パラメータを評価して best 追跡（従来挙動）
                 current_loss = eval_func(params)
                 if current_loss < best_loss:
                     best_loss = current_loss
                     best_params = params.copy()
+                    improved = True
                 cb_loss = current_loss
             else:
                 # 追加評価を省き、2 探索点 (prev_params ± perturbation) の良い方で
@@ -169,6 +179,7 @@ class SPSAOptimizer:
                     if ploss < best_loss:
                         best_loss = ploss
                         best_params = ppoint.copy()
+                        improved = True
                 cb_loss = min(loss_plus, loss_minus)
 
             if callback:
@@ -179,5 +190,14 @@ class SPSAOptimizer:
                     "SPSA iter %d/%d: loss=%.6f, best=%.6f, a_k=%.6f, c_k=%.6f",
                     k, iterations, cb_loss, best_loss, a_k, c_k,
                 )
+
+            stagnant = 0 if improved else stagnant + 1
+            if patience and stagnant >= patience:
+                logger.info(
+                    "SPSA early stop at iter %d/%d: best=%.6f unchanged for "
+                    "%d iterations",
+                    k, iterations, best_loss, stagnant,
+                )
+                break
 
         return best_params, best_loss

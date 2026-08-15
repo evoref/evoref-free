@@ -355,10 +355,7 @@ def collect_configured_ports(config: dict) -> list[int]:
     llama_cfg = config.get("llama", {})
     ports.append(llama_cfg.get("port", 8080))
 
-    # アシストモデル
-    assist_local = config.get("assist_model", {}).get("local", {})
-    if assist_local.get("port"):
-        ports.append(assist_local["port"])
+    # 補助タスク
 
     # 埋め込み (llama-cpp バックエンドの場合)
     embed_cfg = config.get("embedding", {})

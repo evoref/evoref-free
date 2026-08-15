@@ -86,7 +86,7 @@ def _resolve_develop_level() -> str:
         if not is_develop():
             # ログ詳細度 (observability) の不整合でサーバ全体を落とさない。
             # evolve は Develop 限定だが、非 Develop で要求された場合は
-            # investigate に縮退して起動を継続する (assist degraded / tz
+            # investigate に縮退して起動を継続する (degraded / tz
             # フォールバックと同じ degraded-mode 方針)。原因は WARNING で示す。
             logger.warning(
                 "--develop=%s requires Develop edition (current edition is "
@@ -117,7 +117,7 @@ def _init_logging(state: AppState, cfg: dict[str, Any], project_root: Path) -> "
     if state.learning_disabled:
         logger.info(
             "Self-learning disabled by --no-learning flag "
-            "(Level 0/1/2 + Pro assist injection are no-op; reads continue)",
+            "(Level 0/1/2 + Pro learn injection are no-op; reads continue)",
         )
 
     # Pro 同梱時のみ data isolation 等の overrides を適用

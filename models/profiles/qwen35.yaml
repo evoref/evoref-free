@@ -13,11 +13,19 @@ launch_flags:
   - "--jinja"
   - "--reasoning-format"
   - "auto"
-# context_size (-c)。Qwen3.5 dense の学習時最大コンテキスト (n_ctx_train) = 32768。
+# context_size (-c)。**モデルの上限ではなく VRAM 都合の保守既定**。
+# 実測 (2026-08-15) では Qwen3.5-27B / 9B / Qwen3.8-27B いずれも GGUF の
+# n_ctx_train (<arch>.context_length) = 262144 で、32768 はその 1/8 に留めた値。
 # config.yaml の llama.context_size が未指定 / null のとき採用される
-# (解決順: config 明示 > profile > 8192)。32768 を超える拡張 (131072 等) は YaRN/RoPE 必須。
+# (解決順: config 明示 > profile > 8192)。262144 を超える拡張は YaRN/RoPE 必須。
 # 32768 は KV キャッシュ VRAM が 8192 比で約4倍。VRAM が厳しい場合は config 側で
 # context_size を明示 (8192 等) して上書きするか cache_type_k/v を量子化する。
+#
+# なお本 arch は full attention と Gated DeltaNet の hybrid で
+# (<arch>.full_attention_interval=4 → 4 層に 1 層だけが KV を持つ)、
+# 残り 3/4 の層は文脈長に依存しない固定長の再帰状態を持つ。同じ層数の
+# 純 attention モデルより文脈メモリは軽い (推定式は scripts/launch_llama.py の
+# estimate_kv_cache_mb)。
 context_size: 32768
 moe:
   enabled: false

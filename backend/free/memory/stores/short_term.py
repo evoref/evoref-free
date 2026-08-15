@@ -93,7 +93,7 @@ class MemoryNote:
     """コマンドを実行したツール名 (通常 "run_command"、それ以外は None)"""
 
     tool_command_success: bool | None = None
-    #: 判定層 ("rule" / "assist" / "recall" ...)。executable_command_curator が
+    #: 判定層 ("rule" / "aux" / "recall" ...)。executable_command_curator が
     #: "recall" 由来 (= 過去 fact の引き当てで発火) を学習対象から外すために使う。
     #: これが無いと「誤発火 → 成功記録 → fact 延命 → また誤発火」で自己強化する。
     tool_command_source: str | None = None
@@ -305,14 +305,26 @@ class ShortTermMemory:
         )
         return note
 
-    def retrieve_top_k(self, query_vec: np.ndarray, k: int = 3) -> list[tuple[MemoryNote, float]]:
-        """スコア加重検索: ベクトル類似度 × LightMem スコア"""
+    def retrieve_top_k_detailed(
+        self, query_vec: np.ndarray, k: int = 3,
+    ) -> list[tuple[MemoryNote, float, float]]:
+        """``(note, combined, relevance)`` を返すスコア加重検索。
+
+        ``combined`` は ``類似度 × 0.6 + LightMem × 0.4`` (+ pin 加点) で
+        **順位付け専用**。``relevance`` は加工前の素のコサイン類似度で、検索品質
+        ゲート (``QualityThresholds`` / ``low_quality_keep_floor`` /
+        ``ChunkContentGate``) 用の値。これらのゲートは cosine スケールを前提に
+        閾値が決められているため、LightMem を混ぜた ``combined`` を渡すと
+        (a) スコアが圧縮されて閾値に到達せず、(b) LightMem が高いだけの無関連
+        ノートが上位に来る (実測 2026-08-12: cos -0.05 のノートが 1 位)。
+        したがって順位付けとゲートで別の値を使う。
+        """
         if not self.notes:
             return []
 
         self._rebuild_cache_if_needed()
 
-        scored: list[tuple[MemoryNote, float]] = []
+        scored: list[tuple[MemoryNote, float, float]] = []
         query_dim = int(query_vec.shape[0])
         skipped_dim = 0
         for note in self._cache:
@@ -326,7 +338,7 @@ class ShortTermMemory:
             combined = sim * 0.6 + note.lightmem_score * 0.4
             if note.pin_flag:
                 combined += _PIN_RETRIEVAL_BOOST
-            scored.append((note, combined))
+            scored.append((note, combined, sim))
 
         if skipped_dim > 0:
             logger.warning(
@@ -339,18 +351,29 @@ class ShortTermMemory:
         scored.sort(key=lambda x: -x[1])
 
         # アクセス記録
-        for note, _ in scored[:k]:
+        for note, _, _ in scored[:k]:
             note.access_count += 1
             note.accessed_at = time.time()
 
         if scored:
             logger.debug(
-                "retrieve_top_k: %d/%d notes with embeddings, top scores=[%s]",
+                "retrieve_top_k: %d/%d notes with embeddings, "
+                "top combined=[%s] relevance=[%s]",
                 len(scored), len(self.notes),
-                ", ".join(f"{s:.3f}" for _, s in scored[:k]),
+                ", ".join(f"{c:.3f}" for _, c, _ in scored[:k]),
+                ", ".join(f"{r:.3f}" for _, _, r in scored[:k]),
             )
 
         return scored[:k]
+
+    def retrieve_top_k(self, query_vec: np.ndarray, k: int = 3) -> list[tuple[MemoryNote, float]]:
+        """スコア加重検索: ベクトル類似度 × LightMem スコア
+
+        順位付け用の ``combined`` のみを返す従来 API。ゲート判定にも使う
+        呼出側は :meth:`retrieve_top_k_detailed` を使うこと。
+        """
+        return [(note, combined) for note, combined, _ in
+                self.retrieve_top_k_detailed(query_vec, k)]
 
     def save(self, path: str | Path) -> None:
         """JSON 永続化"""

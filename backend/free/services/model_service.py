@@ -61,22 +61,6 @@ def build_model_info_sync(
             connected=llama_connected,
         ))
 
-    # アシストモデル
-    assist = sp.get("assist_model", "")
-    if assist:
-        assist_connected = False
-        if status_data:
-            assist_cfg = cfg.get("assist_model", {}).get("local", {})
-            if assist_cfg:
-                assist_host = assist_cfg.get("host", "127.0.0.1")
-                assist_port = assist_cfg.get("port", 8081)
-                assist_connected = check_health_sync(assist_host, assist_port)
-        models.append(ModelInfoItem(
-            label="assist",
-            name=Path(assist).stem,
-            connected=assist_connected,
-        ))
-
     # 埋め込みモデル
     embed = sp.get("embed_model") or ""
     embed_cfg = cfg.get("embedding", {})
@@ -128,21 +112,6 @@ async def build_model_info_async(
             label="base",
             name=Path(base).stem,
             connected=llama_connected,
-        ))
-
-    # アシストモデル
-    assist = sp.get("assist_model", "")
-    if assist:
-        assist_connected = False
-        assist_cfg = cfg.get("assist_model", {}).get("local", {})
-        if assist_cfg and status_data:
-            assist_host = assist_cfg.get("host", "127.0.0.1")
-            assist_port = assist_cfg.get("port", 8081)
-            assist_connected = await check_health_async(assist_host, assist_port)
-        models.append(ModelInfoItem(
-            label="assist",
-            name=Path(assist).stem,
-            connected=assist_connected,
         ))
 
     # 埋め込みモデル

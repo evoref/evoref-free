@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from backend.free.agent.context_budget import resolve_meta_cognitive_loop_budget
 from backend.free.agent.safety_patterns import strip_command_literals
 from backend.free.core.intent_vocab import (
+    DATETIME_QUERY_RE,
     GREETING_PUNCTUATION_JA,
     HISTORY_KEYWORDS as _HISTORY_KEYWORDS,
     HISTORY_KEYWORDS_EN as _HISTORY_KEYWORDS_EN,
@@ -400,8 +401,13 @@ KNOWLEDGE_QUERY_PATTERNS = [
 # ください」と回答した。ファクトは保持しており (類似度 0.490)、注入経路に
 # 到達しさえすれば正答する。所有格 + 短い属性名 + ``は？`` で終わる形だけを
 # 採るので、「私の作ったコードは動きますか」のような依頼文は掛からない。
+# 属性を 2 つ以上並べる形は読点を挟む。読点を除外していたため
+# 「私の好きな色と、飼っているペットの数は？」(21 文字) が personal_recall を
+# 外れ、short_query → reactive_light に落ちて 6 ターン前に伝えた事実を
+# 「提供されていません」と回答した (2026-08-12 ライブ監査 ターン22)。
+# 句点 (文の切れ目) は従来どおり除外して依頼文を巻き込まない。
 _PERSONAL_RECALL_RE = re.compile(
-    r"(?:私|わたし|僕|ぼく|俺|おれ|自分)の[^。、？?\n]{1,12}は[？?]\s*$"
+    r"(?:私|わたし|僕|ぼく|俺|おれ|自分)の[^。？?\n]{1,24}は[？?]\s*$"
     r"|(?:私|わたし|僕|ぼく|俺|おれ|自分)(?:の|は|が)[^。？?\n]{0,24}"
     r"(?:覚えて|おぼえて|記憶して|思い出|確認|言って|"
     r"何(?:です|でした|だった)|は何|でしたか|だっけ)",
@@ -499,14 +505,9 @@ _EXECUTABLE_QUERY_PATTERNS = [
         + r")",
         re.IGNORECASE,
     ),
-    # 「何月|何日|何曜日」は明確な疑問語のみ追加 (「今日|明日|昨日」単独は
-    # 「今日の予定」等の文脈で誤検出するため見送り)。
-    # 「日時」「日付」の直後に 型/形式/フォーマット/カラム/列 が続く場合は
-    # **データ型やスキーマの話** であって現在日時の要求ではない
-    # (実インシデント 2026-08-09 2 回目のライブ監査: 「入会日を持たせるとき、
-    # 日付型と文字列型のどちらが良いですか」で現在時刻の取得コマンドが撃たれ、
-    # 1 往復を空費した)。
-    re.compile(r"(?:何時|何月|何日|何曜日|(?:日時|日付)(?!型|形式|フォーマット|カラム|列)|現在時刻|(?<![A-Za-z])today(?![A-Za-z])|(?<![A-Za-z])now(?![A-Za-z])|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z]))", re.IGNORECASE),
+    # 現在日時クエリ。定義は core.intent_vocab が SSOT
+    # (tool_call_judge と同一定義を各自持っていたが細部が食い違っていた)。
+    DATETIME_QUERY_RE,
     re.compile(r"(?:IP\s*アドレス|ホスト名|(?<![A-Za-z])hostname(?![A-Za-z])|(?<![A-Za-z])ip\s*address)", re.IGNORECASE),
     re.compile(r"(?:(?<![A-Za-z])OS(?![A-Za-z])|オペレーティングシステム|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])|(?<![A-Za-z])Mac(?![A-Za-z]))", re.IGNORECASE),
     re.compile(r"(?:Python|python)\s*(?:バージョン|version)", re.IGNORECASE),

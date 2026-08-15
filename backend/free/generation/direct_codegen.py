@@ -2,7 +2,7 @@
 
 ``LongFormOrchestrator`` (CogWriterStrategy) はモジュール内部で instruction から
 独自に plan JSON / CodeSpec を **再合成**し、CodeUnit (関数/クラス粒度) に分割して
-個別生成・連結する。この再合成はアシスト LLM を介した lossy な圧縮であり、
+個別生成・連結する。この再合成は補助タスク LLM を介した lossy な圧縮であり、
 staged executor が組み立てた instruction (spec.md 全文 + flowchart + 契約ブロック)
 の大半は base モデルのユニット生成プロンプトに一切届かない
 (``build_code_unit_messages`` が見るのは再合成後の CodeSpec render / plan 由来の

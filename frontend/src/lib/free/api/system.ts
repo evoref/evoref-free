@@ -12,7 +12,7 @@ export type VramSource = 'estimate' | 'actual' | 'mixed';
 export type VramPlacement = 'GPU' | 'CPU' | 'none';
 
 export interface VramModelInfo {
-	name: string; // "base" | "assist" | "embed"
+	name: string; // "base" | "embed"
 	present: boolean;
 	vram_mb: number;
 	gpu_layers: number;

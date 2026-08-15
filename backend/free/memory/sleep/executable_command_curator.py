@@ -3,7 +3,7 @@
 ユーザの直近セッションで ``run_command`` が実行されたターンについて、
 コマンド文字列と成否を ``world_fact`` (subject =
 ``mem.world.executable_command.*``) として SemMem に永続化する。次回類似
-クエリで ``ToolCallJudge`` がアシスト呼出より先に引き当てる (読み取りは A3)。
+クエリで ``ToolCallJudge`` が補助タスク呼出より先に引き当てる (読み取りは A3)。
 
 CLAUDE.md §6 不変則 #2 より、SemMem への書込は sleep-time に限定される。
 本モジュールは ``SleepTimeWorker.run_full`` の Step 8.6 として呼び出され、
@@ -18,7 +18,7 @@ CLAUDE.md §6 不変則 #2 より、SemMem への書込は sleep-time に限定�
   success_history / success_avg / exec_count / last_query /
   last_executed_at) を載せる。SemanticFact の round-trip でそのまま JSONL に
   保持される。
-- url_curator と違い **アシスト採点はしない**。``MemoryNote.tool_command_success``
+- url_curator と違い **補助タスク採点はしない**。``MemoryNote.tool_command_success``
   (run_command 戻り値が "Error:" prefix でないか) を真偽として記録する。
   ``success=False`` は既存 fact を penalize するのみで新規作成しない。
 
@@ -36,8 +36,6 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from backend.free.memory.sleep._curator_common import (
-    build_scoring_prompt,
-    coerce_bare_score,
     subject_digest,
     truncate_for_prompt,
 )
@@ -225,7 +223,7 @@ async def curate_executable_command_facts(
         # last_executed_at が更新され TTL による唯一の排除経路がリセット →
         # また誤発火」で自己強化する (実測 2026-07-25: 好みの表明・記憶想起の
         # ターンで発火した datetime コマンドが 2 世代にわたり延命されていた)。
-        # rule / assist が能動的に選んだ実行のみを学習対象にする。
+        # rule / aux が能動的に選んだ実行のみを学習対象にする。
         if assistant_note.tool_command_source == "recall":
             assistant_note.command_curated_at = now_fn()
             continue

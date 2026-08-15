@@ -1,6 +1,6 @@
 """staged クリエイトのタスクグラフ合成。
 
-ユーザーのクリエイト要求 (例: 「Xを作って」) を、アシストモデルに粗計画
+ユーザーのクリエイト要求 (例: 「Xを作って」) を、補助タスクに粗計画
 (``summary`` + ``modules[]``) として返させ、Python 側で **決定的に**
 spec → code → test の task ファクト三層へ展開する。
 
@@ -8,7 +8,7 @@ spec → code → test の task ファクト三層へ展開する。
 - LLM には粗計画のみ返させる (purpose=``create_task_graph``、schema は
   ``PURPOSE_SCHEMAS`` から自動解決)。三層展開・依存配線・slug 衝突回避は
   本モジュールが Python で行い、非循環な依存グラフを保証する。
-- アシスト未接続 / 解析失敗 / モジュール 0 件 のときは ``[]`` を返し、呼出側
+- 補助タスク未接続 / 解析失敗 / モジュール 0 件 のときは ``[]`` を返し、呼出側
   (チャットディスパッチ) に旧 longform 経路へのフォールバックを指示する。
 - 依存配線: code タスクは spec タスクに依存し、test タスクは対応する code
   タスクに依存する。code タスク同士は相互依存させない (cross-file import 配線は
@@ -29,7 +29,7 @@ from backend.log_config import get_logger
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
-    from backend.free.llm.assist_client import AssistModelClient
+    from backend.free.llm.aux_client import AuxClient
 
 logger = get_logger("loop.staged.synthesizer")
 
@@ -406,7 +406,7 @@ async def synthesize_create_task_graph(
     *,
     request: str,
     project_id: str,
-    assist_client: "AssistModelClient | None",
+    aux_client: "AuxClient | None",
     include_tests: bool = True,
     debug_logger: "DebugLogger | None" = None,
 ) -> list[SemanticFact]:
@@ -415,36 +415,36 @@ async def synthesize_create_task_graph(
     Args:
         request: ユーザーのクリエイト指示。
         project_id: タスクを所属させる project_id。
-        assist_client: アシストモデル。``None`` (degraded) なら ``[]`` を返す。
+        aux_client: 補助タスク。``None`` (degraded) なら ``[]`` を返す。
         include_tests: ``False`` なら test 工程を生成しない (config の
             ``create.staged.test_stage_enabled=false`` 用)。
         debug_logger: chat モードの meta_cognitive_llm_route と同種の
-            assist 利用可否判定を ``create_task_graph_synthesis_path`` として
+            aux 利用可否判定を ``create_task_graph_synthesis_path`` として
             構造化記録する (任意)。
 
     Returns:
         spec → code* → test* の順に並んだ ``task`` 型 SemanticFact リスト
-        (まだストアには追加されていない)。アシスト未接続 / 解析失敗 /
+        (まだストアには追加されていない)。補助タスク未接続 / 解析失敗 /
         モジュール 0 件 の場合は ``[]`` (= 呼出側で longform へフォールバック)。
     """
-    _candidates = ["assist_synthesis", "assist_unavailable_fallback"]
-    if assist_client is None:
-        logger.info("synthesize_create_task_graph: assist_client is None — fallback")
+    _candidates = ["aux_synthesis", "aux_unavailable_fallback"]
+    if aux_client is None:
+        logger.info("synthesize_create_task_graph: aux_client is None — fallback")
         if debug_logger is not None:
             debug_logger.log_decision(
                 decision_point="create_task_graph_synthesis_path",
-                chosen="assist_unavailable_fallback",
+                chosen="aux_unavailable_fallback",
                 candidates=_candidates,
-                reason="assist_client_unavailable",
+                reason="aux_client_unavailable",
                 scope="loop_iter",
             )
         return []
     if debug_logger is not None:
         debug_logger.log_decision(
             decision_point="create_task_graph_synthesis_path",
-            chosen="assist_synthesis",
+            chosen="aux_synthesis",
             candidates=_candidates,
-            reason="assist_client_available",
+            reason="aux_client_available",
             scope="loop_iter",
         )
     if not project_id:
@@ -457,7 +457,7 @@ async def synthesize_create_task_graph(
     )
     graph_telemetry: dict = {}
     try:
-        result = await assist_client.generate_json(
+        result = await aux_client.generate_json(
             prompt,
             purpose="create_task_graph",
             max_tokens=1536,

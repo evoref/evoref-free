@@ -69,18 +69,18 @@ class ActiveSessionInfo(BaseModel):
 
 
 class Level2TargetStatus(BaseModel):
-    """Level 2 の base / assist 個別状態 + 発火条件（Pro）"""
+    """Level 2 の状態 + 発火条件（Pro）"""
     method: str = ""
     bootstrap_enabled: bool = False
     adapter_exists: bool = False
     version: int = 0
-    # 蓄積中の発火データ数 (base=失敗数 / assist=経験数)
+    # 蓄積中の発火データ数 (失敗数)
     experiences_current: int = 0
     bootstrap_min: int = 0
     spsa_min: int = 0
     cvector_min: int = 0
     # 発火しない理由コード ("" = 発火可能)。表示ラベル化はフロント側 i18n が行う。
-    # 例: noop_base_lora / noop_assist_method / bootstrap_disabled /
+    # 例: noop_base_lora / bootstrap_disabled /
     #     insufficient_data / components_missing
     block_reason: str = ""
 
@@ -90,14 +90,27 @@ class Level2GatesModel(BaseModel):
     active_minutes: float = 5.0
     overdue_hours: float = 24.0
     recheck_interval_sec: float = 300.0
+    #: target ごとの **実効** クールダウン時間 (h)。連続無改善が
+    #: ``stale_streak`` に達した target は延長クールダウンへ落ちるため、
+    #: 素の ``overdue_hours`` とは一致しないことがある。
+    cooldown_hours: dict[str, float] = Field(default_factory=dict)
+    #: target ごとの連続無改善回数 (採用成功で 0 に戻る)。
+    no_improve_streak: dict[str, int] = Field(default_factory=dict)
+    #: 延長クールダウンへ落ちる連続無改善回数の閾値。
+    stale_streak: int = 2
+    #: target ごとの「クールダウンを過ぎているか」。データ充足
+    #: (``block_reason == ""``) と AND を取って初めて「発火可」になる。
+    #: 実行側と同じ単一述語 (``is_level2_overdue``) 由来。
+    overdue: dict[str, bool] = Field(default_factory=dict)
+    #: target ごとの前回実行からの経過秒。未実行は ``None``。
+    seconds_since_run: dict[str, float | None] = Field(default_factory=dict)
 
 
 class Level2StatusModel(BaseModel):
-    """Level 2 (LoRA) の base/assist 個別状態（Pro のみ非 None）"""
+    """Level 2 (LoRA) の状態（Pro のみ非 None）"""
     running_target: str | None = None
     next_target: str = "base"
     base: Level2TargetStatus = Field(default_factory=Level2TargetStatus)
-    assist: Level2TargetStatus = Field(default_factory=Level2TargetStatus)
     gates: Level2GatesModel = Field(default_factory=Level2GatesModel)
 
 
@@ -110,12 +123,23 @@ class SchedulerStatusModel(BaseModel):
     experience_count: int = 0
     new_experience_count: int = 0
     min_experiences: int = 0
+    #: **経験件数だけ** を見た表示値。Level 1 の実際の起動ゲートには
+    #: アイドル時間 / ユーザー活動 / LLM クライアント配線も含まれるため、
+    #: これが True でも走らないことは正常状態として起こる。実際に何で
+    #: 止まっているかは ``level1_blocked_reason`` を見る。
     conditions_met: bool = False
+    #: Level 1 が「今」走れない理由。走れる状態なら None。
+    #: ``learning_disabled`` / ``already_running`` / ``insufficient_experiences``
+    #: / ``no_llm_client`` / ``loop_not_started`` / ``user_active`` /
+    #: ``waiting_for_idle`` のいずれか。
+    level1_blocked_reason: str | None = None
+    #: ``waiting_for_idle`` のとき、アイドル成立までの残り秒数。
+    level1_seconds_until_idle: float | None = None
     last_level1_run: str | None = None
     last_level2_run: str | None = None
-    # 実行中の Level 2 対象 ("base"/"assist"/None)
+    # 実行中の Level 2 対象 ("base"/None)
     running_target: str | None = None
-    # Level 2 (LoRA) base/assist 個別状態 + 発火条件（Pro のみ非 None）
+    # Level 2 (LoRA) の状態 + 発火条件（Pro のみ非 None）
     level2: Level2StatusModel | None = None
     # Level 0 詳細
     last_level0_record: str | None = None
@@ -175,4 +199,3 @@ class ImprovementPoint(BaseModel):
 
 class ImprovementCurveResponse(BaseModel):
     lora_scores: list[ImprovementPoint] = Field(default_factory=list)
-    assist_scores: list[ImprovementPoint] = Field(default_factory=list)

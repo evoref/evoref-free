@@ -17,7 +17,6 @@
 - ``memory.py`` : EvorefMem 関連 + ``VALID_FACT_TYPES``
 - ``learning.py``: 学習サイクル + ``ScheduleConfig``
 - ``loop.py``   : 自律ループ driver
-- ``assist_model.py``: アシストモデル設定
 - ``paths.py``  : ``ModelPathsConfig`` / ``LocalPathsConfig``
 """
 
@@ -46,11 +45,6 @@ from backend.schemas._common import (
     WidgetProxyConfig,
 )
 from backend.schemas._root import EvorefConfig, validate_config
-from backend.schemas.assist_model import (
-    AssistConcurrencyConfig,
-    AssistModelConfig,
-    AssistModelLocalConfig,
-)
 from backend.schemas.create import CreateConfig, CreateStagedConfig
 from backend.schemas.learning import (
     FeedbackPipeConfig,
@@ -87,16 +81,13 @@ from backend.schemas.rag import (
     ContextualPrefixConfig,
     EmbeddingConfig,
     RAGConfig,
-    SelfRagAssistJudgeConfig,
+    SelfRagQualityJudgeConfig,
     SelfRagConfig,
 )
 
 __all__ = [
     "VALID_FACT_TYPES",
     "AgentConfig",
-    "AssistConcurrencyConfig",
-    "AssistModelConfig",
-    "AssistModelLocalConfig",
     "CLIConfig",
     "CLITimeoutsConfig",
     "CartridgeGateConfig",
@@ -139,7 +130,7 @@ __all__ = [
     "RAGConfig",
     "RuntimeConfig",
     "ScheduleConfig",
-    "SelfRagAssistJudgeConfig",
+    "SelfRagQualityJudgeConfig",
     "SelfRagConfig",
     "SemMemConflictConfig",
     "SemMemLimitsConfig",

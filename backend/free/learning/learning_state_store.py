@@ -37,10 +37,15 @@ class LearningState:
     """
 
     last_level1_run: float = 0.0
-    #: target ("base"/"assist") ごとの最終 Level 2 実行時刻。base の失敗が
-    #: assist の overdue 判定まで巻き込んで 24h ブロックしていた回帰
+    #: target ("base"/"aux") ごとの最終 Level 2 実行時刻。base の失敗が
+    #: aux の overdue 判定まで巻き込んで 24h ブロックしていた回帰
     #: (2026-07-18) の修正で、単一 float から target 別 dict へ分離した。
     last_level2_run: dict[str, float] = field(default_factory=dict)
+    #: target ごとの「連続で改善が採用されなかった回数」。Level 2 は 1 サイクル
+    #: 1 時間規模の実推論最適化なので、探索が空振りし続ける局面でそのまま
+    #: 24h 間隔を回し続けるとリソースを浪費する。連続無改善が続いた target を
+    #: 延長クールダウンへ落とすためのカウンタ (採用に成功したら 0 へ戻す)。
+    level2_no_improve_streak: dict[str, int] = field(default_factory=dict)
     level1_run_count: int = 0
     last_level1_results: dict[str, Any] = field(default_factory=dict)
     fitness_history: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
@@ -65,6 +70,7 @@ class LearningStateStore:
         return {
             "last_level1_run": state.last_level1_run,
             "last_level2_run": state.last_level2_run,
+            "level2_no_improve_streak": state.level2_no_improve_streak,
             "level1_run_count": state.level1_run_count,
             "last_level1_results": state.last_level1_results,
             "fitness_history": state.fitness_history,
@@ -77,8 +83,8 @@ class LearningStateStore:
     def _deserialize_last_level2_run(raw: Any) -> dict[str, float]:
         """``last_level2_run`` を target 別 dict へ正規化する。
 
-        旧フォーマット (単一 float、base/assist 共有) との後方互換: float の
-        場合は base/assist 両方に同じ値を適用する (旧仕様では両ターゲットの
+        旧フォーマット (単一 float、base/aux 共有) との後方互換: float の
+        場合は base/aux 両方に同じ値を適用する (旧仕様では両ターゲットの
         実行がこの単一値を共有更新していたため、片方だけ「未実行」扱いに
         してしまうと移行直後に不要な overdue 発火を招く)。
         """
@@ -95,8 +101,28 @@ class LearningStateStore:
                     )
             return result
         if isinstance(raw, (int, float)) and raw:
-            return {"base": float(raw), "assist": float(raw)}
+            return {"base": float(raw), "aux": float(raw)}
         return {}
+
+    @staticmethod
+    def _deserialize_no_improve_streak(raw: Any) -> dict[str, int]:
+        """``level2_no_improve_streak`` を target 別 dict へ正規化する。
+
+        欠損 (旧フォーマット) は空 dict = 全 target ストリーク 0 として扱う。
+        """
+        if not isinstance(raw, dict):
+            return {}
+        result: dict[str, int] = {}
+        for k, v in raw.items():
+            if not isinstance(k, str):
+                continue
+            try:
+                result[k] = max(0, int(v or 0))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Skipping malformed level2_no_improve_streak entry: %r=%r", k, v,
+                )
+        return result
 
     @staticmethod
     def deserialize(data: dict[str, Any]) -> LearningState:
@@ -126,6 +152,11 @@ class LearningStateStore:
             last_level1_run=float(data.get("last_level1_run", 0.0) or 0.0),
             last_level2_run=LearningStateStore._deserialize_last_level2_run(
                 data.get("last_level2_run"),
+            ),
+            level2_no_improve_streak=(
+                LearningStateStore._deserialize_no_improve_streak(
+                    data.get("level2_no_improve_streak"),
+                )
             ),
             level1_run_count=int(data.get("level1_run_count", 0) or 0),
             last_level1_results=dict(data.get("last_level1_results", {}) or {}),

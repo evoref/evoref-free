@@ -71,7 +71,7 @@ class CreateStagedConfig(BaseModel):
     )
     spec_deepen_enabled: bool = Field(
         default=True,
-        description="spec 工程でモジュール節を 1 節 1 assist 呼出で実装水準 "
+        description="spec 工程でモジュール節を 1 節 1 呼出で実装水準 "
                     "(メソッド毎挙動・属性・定数) まで深化させる。ガード棄却時は"
                     "原節維持の best-effort",
     )
@@ -88,8 +88,8 @@ class CreateStagedConfig(BaseModel):
     )
     spec_timeout_sec: float = Field(
         default=600.0, gt=0.0, le=1800.0,
-        description="spec 工程の assist 生成タイムアウト (create_spec_doc / "
-                    "create_spec_deepen)。明示指定のため assist の反応的較正より"
+        description="spec 工程の生成タイムアウト (create_spec_doc / "
+                    "create_spec_deepen)。明示指定のため反応的較正より"
                     "優先される。iGPU 実測 (7-13 t/s) で 6144 tok 級の生成を賄う "
                     "(timeout は description への全損フォールバックで救済が無い)",
     )
@@ -119,7 +119,7 @@ class CreateStagedConfig(BaseModel):
     )
     max_spec_revision_rounds: int = Field(
         default=1, ge=0, le=3,
-        description="test 不合格時に spec 該当節を assist で点検・改訂して再生成する"
+        description="test 不合格時に spec 該当節を LLM で点検・改訂して再生成する"
                     "サイクルのワークスペース全体での上限。0 で無効",
     )
     max_iterations: int = Field(

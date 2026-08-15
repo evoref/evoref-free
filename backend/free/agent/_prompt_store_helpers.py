@@ -1,14 +1,14 @@
 """プロンプト履歴 + 本文 / メタストア共通ヘルパ
 
-`SystemPromptManager` と `AssistPromptManager` で重複していた
+`SystemPromptManager` と `AuxPromptManager` で重複していた
 履歴 / 本文 / メタファイルの読み書き処理を集約する。
 
 両マネージャはキー命名規則だけが異なる:
 - システムプロンプト: `{mode}.md` / `{mode}.meta.json` / `history/{mode}_v{NNN}.md`
   → key_prefix = mode (例: "chat", "create")
-- アシストプロンプト: `assist_{task}.md` / `assist_{task}.meta.json` /
-  `history/assist_{task}_v{NNN}.md`
-  → key_prefix = f"assist_{task}" (例: "assist_rag_necessity")
+- 補助タスクプロンプト: `aux_{task}.md` / `aux_{task}.meta.json` /
+  `history/aux_{task}_v{NNN}.md`
+  → key_prefix = f"aux_{task}" (例: "aux_rag_necessity")
 
 ここで定義する関数はすべて key_prefix を引数に取る純粋関数または薄い I/O 委譲。
 副作用は引数で受け取った Path 配下のファイル I/O のみで、ドメインロジック
@@ -48,7 +48,7 @@ def parse_version_from_filename(filename: str, key_prefix: str) -> int | None:
 
     Args:
         filename: ファイル名 (ディレクトリ部分は含まない)
-        key_prefix: モード名またはアシストタスクのフルプレフィックス
+        key_prefix: モード名または補助タスクタスクのフルプレフィックス
 
     Returns:
         バージョン番号、または None (パース失敗時)

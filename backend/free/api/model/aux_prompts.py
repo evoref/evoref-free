@@ -1,4 +1,4 @@
-"""アシストプロンプト管理 API エンドポイント"""
+"""補助タスクプロンプト管理 API エンドポイント"""
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -6,9 +6,9 @@ from pydantic import BaseModel
 from backend.app_state import AppState, get_app_state
 from backend.log_config import get_logger
 
-logger = get_logger("api.assist_prompts")
+logger = get_logger("api.aux_prompts")
 
-router = APIRouter(prefix="/api/assist-prompts", tags=["assist-prompts"])
+router = APIRouter(prefix="/api/aux-prompts", tags=["aux-prompts"])
 
 
 class PromptUpdateRequest(BaseModel):
@@ -20,17 +20,17 @@ class RollbackRequest(BaseModel):
 
 
 @router.get("")
-async def list_assist_prompts(state: AppState = Depends(get_app_state)):
-    """全タスクのアシストプロンプト一覧"""
-    logger.debug("GET /api/assist-prompts")
-    mgr = state.assist_prompt_manager
+async def list_aux_prompts(state: AppState = Depends(get_app_state)):
+    """全タスクの補助タスクプロンプト一覧"""
+    logger.debug("GET /api/aux-prompts")
+    mgr = state.aux_prompt_manager
     if mgr is None:
-        raise HTTPException(503, "Assist prompt manager not initialized")
+        raise HTTPException(503, "Aux prompt manager not initialized")
 
     result = []
     for task in mgr.TASKS:
         meta = mgr.get_meta(task)
-        content = mgr.get_assist_prompt(task)
+        content = mgr.get_aux_prompt(task)
         result.append({
             "task": task,
             "version": meta.version,
@@ -43,16 +43,16 @@ async def list_assist_prompts(state: AppState = Depends(get_app_state)):
 
 
 @router.get("/{task}")
-async def get_assist_prompt(task: str, state: AppState = Depends(get_app_state)):
-    """タスク別アシストプロンプト詳細"""
-    logger.debug("GET /api/assist-prompts/%s", task)
-    mgr = state.assist_prompt_manager
+async def get_aux_prompt(task: str, state: AppState = Depends(get_app_state)):
+    """タスク別補助タスクプロンプト詳細"""
+    logger.debug("GET /api/aux-prompts/%s", task)
+    mgr = state.aux_prompt_manager
     if mgr is None:
-        raise HTTPException(503, "Assist prompt manager not initialized")
+        raise HTTPException(503, "Aux prompt manager not initialized")
 
     try:
         meta = mgr.get_meta(task)
-        content = mgr.get_assist_prompt(task)
+        content = mgr.get_aux_prompt(task)
     except ValueError:
         raise HTTPException(404, f"Unknown task: {task}")
 
@@ -67,12 +67,12 @@ async def get_assist_prompt(task: str, state: AppState = Depends(get_app_state))
 
 
 @router.put("/{task}")
-async def update_assist_prompt(task: str, body: PromptUpdateRequest, state: AppState = Depends(get_app_state)):
-    """アシストプロンプト手動更新"""
-    logger.debug("PUT /api/assist-prompts/%s: content_len=%d", task, len(body.content))
-    mgr = state.assist_prompt_manager
+async def update_aux_prompt(task: str, body: PromptUpdateRequest, state: AppState = Depends(get_app_state)):
+    """補助タスクプロンプト手動更新"""
+    logger.debug("PUT /api/aux-prompts/%s: content_len=%d", task, len(body.content))
+    mgr = state.aux_prompt_manager
     if mgr is None:
-        raise HTTPException(503, "Assist prompt manager not initialized")
+        raise HTTPException(503, "Aux prompt manager not initialized")
 
     try:
         mgr.update_manual(task, body.content)
@@ -83,12 +83,12 @@ async def update_assist_prompt(task: str, body: PromptUpdateRequest, state: AppS
 
 
 @router.post("/{task}/reload")
-async def reload_assist_prompt(task: str, state: AppState = Depends(get_app_state)):
+async def reload_aux_prompt(task: str, state: AppState = Depends(get_app_state)):
     """ディスクから再読込み"""
-    logger.debug("POST /api/assist-prompts/%s/reload", task)
-    mgr = state.assist_prompt_manager
+    logger.debug("POST /api/aux-prompts/%s/reload", task)
+    mgr = state.aux_prompt_manager
     if mgr is None:
-        raise HTTPException(503, "Assist prompt manager not initialized")
+        raise HTTPException(503, "Aux prompt manager not initialized")
 
     if task not in mgr.TASKS:
         raise HTTPException(404, f"Unknown task: {task}")
@@ -98,12 +98,12 @@ async def reload_assist_prompt(task: str, state: AppState = Depends(get_app_stat
 
 
 @router.get("/{task}/history")
-async def get_assist_prompt_history(task: str, state: AppState = Depends(get_app_state)):
+async def get_aux_prompt_history(task: str, state: AppState = Depends(get_app_state)):
     """タスク別履歴一覧"""
-    logger.debug("GET /api/assist-prompts/%s/history", task)
-    mgr = state.assist_prompt_manager
+    logger.debug("GET /api/aux-prompts/%s/history", task)
+    mgr = state.aux_prompt_manager
     if mgr is None:
-        raise HTTPException(503, "Assist prompt manager not initialized")
+        raise HTTPException(503, "Aux prompt manager not initialized")
 
     try:
         return mgr.get_history(task)
@@ -112,12 +112,12 @@ async def get_assist_prompt_history(task: str, state: AppState = Depends(get_app
 
 
 @router.post("/{task}/rollback")
-async def rollback_assist_prompt(task: str, body: RollbackRequest, state: AppState = Depends(get_app_state)):
+async def rollback_aux_prompt(task: str, body: RollbackRequest, state: AppState = Depends(get_app_state)):
     """過去バージョンへのロールバック"""
-    logger.debug("POST /api/assist-prompts/%s/rollback: version=%d", task, body.version)
-    mgr = state.assist_prompt_manager
+    logger.debug("POST /api/aux-prompts/%s/rollback: version=%d", task, body.version)
+    mgr = state.aux_prompt_manager
     if mgr is None:
-        raise HTTPException(503, "Assist prompt manager not initialized")
+        raise HTTPException(503, "Aux prompt manager not initialized")
 
     try:
         mgr.rollback(task, body.version)

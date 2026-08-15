@@ -63,7 +63,6 @@ from backend.free.agent.meta_cognitive_utils import (
     fewshot_seems_relevant,
     fix_json_backslashes,
     generated_content_rejection,
-    looks_like_path_not_content,
     looks_like_task_log_residue,
     rescue_quoted_write_literal,
     strip_markdown_wrapper,
@@ -74,12 +73,12 @@ from backend.free.agent.meta_cognitive_utils import (
     summarize_file_content,
     summarize_tool_args,
     text_looks_like_code,
+    unwrap_sole_code_fence,
     tool_result_succeeded,
     truncate_repetition,
 )
 from backend.free.agent.step_compactor import StepCompactor, StepResult
 from backend.free.core.inference import build_messages_for_loop
-from backend.free.llm.assist_client import assist_ready
 from backend.free.llm.editor_filename import derive_editor_filename_stem
 from backend.utils import estimate_tokens as _estimate_tokens
 from backend.log_config import get_logger
@@ -91,7 +90,7 @@ if TYPE_CHECKING:
     from backend.free.agent.agent_tracer import AgentTracer
     from backend.free.agent.tool_call_judge import ToolCallJudge
     from backend.free.core.policy_interpreter import PolicyInterpreter
-    from backend.free.llm.assist_client import AssistModelClient
+    from backend.free.llm.aux_client import AuxClient
     from backend.free.memory.views.loop import LoopFactView
 
 logger = get_logger("agent.meta_cognitive")
@@ -217,6 +216,24 @@ RICH_DOC_CONTENT_INSTRUCTION = (
     "No code fences around the whole document."
 )
 
+# .md は Markdown そのものが本文フォーマット。既定の CONTENT_GENERATION_PROMPT は
+# 「no explanations, no markdown fences」を無条件に指示するため、これを打ち消さないと
+# 見出しもコードフェンスも説明文も書けず、拡張子だけ .md の裸テキストになる。
+#
+# 実インシデント (2026-08-14 ライブ監査 ターン13-14): 「デコレータの説明とコードを
+# Markdown にまとめて E:\tmp\retry_decorator.md に保存して」で説明文・見出し・
+# ```python フェンスがすべて落ちた生の Python コードが書かれ、「Markdown 形式
+# (見出し・説明文・```python フェンス) で保存し直して」と明示し直しても
+# 1962 → 1966 バイトの同じ生コードのままだった。
+MARKDOWN_CONTENT_INSTRUCTION = (
+    "The target is a Markdown document, so Markdown IS the content format: "
+    "the 'no explanations / no markdown fences' rule above does NOT apply here. "
+    "Write it as the user asked — use `#` headings, explanatory prose, bullet "
+    "lists, and fenced code blocks (```python etc.) wherever they belong. "
+    "Do not wrap the whole document in a single outer code fence, and do not "
+    "add commentary about writing the file."
+)
+
 # ユーザークエリ/タスク記述中の明示的な絶対パス (Windows ドライブレター形式)。
 # plan 後のパス脱落補完 (_normalize_planned_paths) で使用する。
 # 定義は core.intent_vocab が SSOT (agent.feedback が同一定義を持っていた)。
@@ -255,7 +272,7 @@ _PRIOR_CONTENT_REFERENCE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# assist がパラメータ名をそのまま値として返したときに現れる「パスもどき」。
+# aux がパラメータ名をそのまま値として返したときに現れる「パスもどき」。
 # ディレクトリ成分も拡張子も持たず、意味のあるファイル名ではない。
 _PLACEHOLDER_WRITE_PATH_NAMES: frozenset[str] = frozenset({
     "file_path", "filepath", "file", "filename", "file_name", "fname",
@@ -331,7 +348,7 @@ class MetaCognitiveAgent:
         agent_tracer: AgentTracer | None = None,
         loop_view: "LoopFactView | None" = None,
         project_id: str | None = None,
-        assist_client: "AssistModelClient | None" = None,
+        aux_client: "AuxClient | None" = None,
         debug_logger: "DebugLogger | None" = None,
         semmem_block: str | None = None,
         rag_block: str | None = None,
@@ -369,10 +386,10 @@ class MetaCognitiveAgent:
         self.reminder_system = EventReminderSystem(cfg)
         self._tool_judge = tool_judge
         self._agent_tracer = agent_tracer
-        # に従いアシストモデルで実行する。``None`` の場合 (assist_client
+        # に従い補助タスクで実行する。``None`` の場合 (aux_client
         # health_check 失敗による degraded mode) は計画生成をスキップして
         # 単一タスクへフォールバックする。
-        self._assist_client = assist_client
+        self._aux_client = aux_client
         # に記録する (decision_point=``meta_cognitive_llm_route``)。
         self._debug_logger = debug_logger
 
@@ -685,15 +702,15 @@ class MetaCognitiveAgent:
         llm_client,  # noqa: ARG002
         on_step=None,
     ) -> list[TaskItem]:
-        """アシストモデルにタスク計画を生成させる
+        """補助タスクにタスク計画を生成させる
 
-        CLAUDE.md §1 に従い、判定 / 計画系の JSON 応答処理はアシスト
-        モデル (``assist_client.generate_json``) で実行する。``llm_client``
+        CLAUDE.md §1 に従い、判定 / 計画系の JSON 応答処理は補助タスク
+        モデル (``aux_client.generate_json``) で実行する。``llm_client``
         引数はベースモデル (Meta-Cognitive のメイン応答 / ツール呼び出し
         ループ用) の参照を保つため受け取り続けるが、計画生成自体には
         利用しない。
 
-        ``assist_client`` が ``None`` (health_check 失敗で degraded mode)
+        ``aux_client`` が ``None`` (health_check 失敗で degraded mode)
         の場合は空リストを返し、呼び出し側で単一タスクフォールバックする。
         """
         if on_step:
@@ -703,25 +720,19 @@ class MetaCognitiveAgent:
                 "status": "running",
             })
 
-        # ``is None`` (未設定) だけでなく residency 非常駐も同じ扱いにする
-        # (docs/c_14 §6.1 の移行)。``assist_model.residency: on_demand`` では
-        # **チャット中つねに非常駐**なので、ここを ``is None`` のままにすると
-        # 毎回 HTTP 手前まで進んで ``AssistUnavailableError`` を踏み、
-        # 「Plan generation failed」という **失敗に見える WARNING** が
-        # ファイル操作のたびに出ていた (2026-08-09 ライブ監査)。設計どおりの
-        # 縮退なので、事前に判定して静かに単一タスクへ倒す。
-        if not assist_ready(self._assist_client, "meta_cognitive_plan"):
+        # ベース llama-server 未接続 (degraded mode) では計画を諦め、静かに
+        # 単一タスクへ倒す。
+        if self._aux_client is None:
             logger.info(
-                "Plan generation skipped: assist model is not available "
-                "(not configured, or not resident during chat); "
+                "Plan generation skipped: aux client is not wired; "
                 "falling back to single task",
             )
             if self._debug_logger is not None:
                 self._debug_logger.log_decision(
                     decision_point="meta_cognitive_llm_route",
                     chosen="single_task_fallback",
-                    candidates=["base_model", "assist_model", "single_task_fallback"],
-                    reason="assist_client_unavailable",
+                    candidates=["aux_plan", "single_task_fallback"],
+                    reason="aux_client_unavailable",
                     scope="request",
                 )
             return []
@@ -729,9 +740,9 @@ class MetaCognitiveAgent:
         if self._debug_logger is not None:
             self._debug_logger.log_decision(
                 decision_point="meta_cognitive_llm_route",
-                chosen="assist_plan",
-                candidates=["base_model", "assist_model", "single_task_fallback"],
-                reason="assist_client_available",
+                chosen="aux_plan",
+                candidates=["aux_plan", "single_task_fallback"],
+                reason="aux_client_available",
                 scope="request",
             )
 
@@ -739,15 +750,12 @@ class MetaCognitiveAgent:
         prompt = f"{PLAN_SYSTEM_PROMPT}\n\n{user_content}"
 
         try:
-            # 二重 timeout の意図: 内側の assist realtime 経路が
-            # PURPOSE_TIMEOUT_DEFAULTS["meta_cognitive_plan"]=30s を
-            # asyncio.timeout で総予算強制するため、realtime 運用では実効上限は
-            # 内側 30s 側。外側 wait_for(=_llm_call_timeout, 既定 90s) は
-            # (a) config timeouts.meta_cognitive_plan を 90s 超に上書きした場合、
-            # または (b) 将来 priority が realtime 以外へ退化し内側 asyncio.timeout
-            # が nullcontext 化した場合に、計画生成の総時間を保証する保険。
+            # 二重 timeout の意図: 内側は AuxClient が purpose 別の実効
+            # タイムアウト (較正込み) を HTTP 層へ渡す。外側 wait_for
+            # (=_llm_call_timeout, 既定 90s) は、内側がリトライで伸びた場合でも
+            # 計画生成の総時間を保証する保険。
             data = await asyncio.wait_for(
-                self._assist_client.generate_json(
+                self._aux_client.generate_json(
                     prompt,
                     max_tokens=256,
                     temperature=0.3,
@@ -805,7 +813,7 @@ class MetaCognitiveAgent:
     ) -> list[TaskItem]:
         """ユーザー明示パスが plan タスクから脱落した場合に決定論で補完する。
 
-        小型 assist は PLAN_SYSTEM_PROMPT の例文をエコーしてユーザー指定の
+        小型 aux は PLAN_SYSTEM_PROMPT の例文をエコーしてユーザー指定の
         出力パスを落とすことがある (2026-07-15: パス無し "Generate the full
         program..." が 2 ターンで write 不発 → 失敗)。クエリに明示的な
         絶対パスがあるのに、どのタスクにもパスが含まれない場合、最初の
@@ -1027,11 +1035,10 @@ class MetaCognitiveAgent:
             self._chat_code_parts.append(f"```{language}\n{content}\n```")
             return f"Generated {len(content)} chars (chat)", []
         if filename is None:
-            # 明示パス由来のファイル名が無い場合、生成内容からアシストモデルで
+            # 明示パス由来のファイル名が無い場合、指示文と言語から
             # ASCII snake_case 名を導出する (日本語タブ名を出さないため)。
-            stem = await derive_editor_filename_stem(
-                self._assist_client,
-                content=content, hint=original_query, language=language,
+            stem = derive_editor_filename_stem(
+                hint=original_query, language=language,
             )
             filename = f"{stem}.{_LANGUAGE_EXT_MAP.get(language, 'txt')}"
         self._editor_artifacts.append(
@@ -1637,7 +1644,7 @@ class MetaCognitiveAgent:
         from backend.free.agent.tool_call_judge import _extract_file_path
 
         if _is_placeholder_write_path(file_path):
-            # 小型 assist はパラメータ名をそのまま値として返すことがある
+            # 小型 aux はパラメータ名をそのまま値として返すことがある
             # (実インシデント 2026-07-28 ライブ検証:
             # `{"tool": "write_file", "args": {"file_path": "file_path", ...}}`
             # がそのまま実行され、リポジトリ直下に `file_path` という名前の
@@ -2113,7 +2120,7 @@ class MetaCognitiveAgent:
         logger.info("Tool fast path: %s(%s)", tool_name, tool_args)
 
         # search_code は create 専用 (modes=["create"]) だが、この判定は
-        # ToolCallJudge の rule/assist 判定結果をそのまま実行するため
+        # ToolCallJudge の rule/aux 判定結果をそのまま実行するため
         # ToolDefinition.modes を経由しない。_execute_tool と同じ理由で
         # search_code のみ mode ゲートを追加する (write_file は対象外)。
         if tool_name == "search_code" and not is_create_mode(self._mode):
@@ -2608,6 +2615,8 @@ class MetaCognitiveAgent:
             system_content = f"{system_content}\n{TABLE_CONTENT_INSTRUCTION}"
         elif is_rich_table_output(file_path):
             system_content = f"{system_content}\n{RICH_DOC_CONTENT_INSTRUCTION}"
+        elif file_path.lower().endswith((".md", ".markdown")):
+            system_content = f"{system_content}\n{MARKDOWN_CONTENT_INSTRUCTION}"
         # 出力言語指示 (locale 追従)。ここは write 全経路 (ツールループ /
         # ファストパス / auto-recovery / editor タスク) の合流点なので、
         # この 1 箇所で全ファイル出力に効く。
@@ -2639,6 +2648,7 @@ class MetaCognitiveAgent:
 
         return await self._stream_and_clean(
             llm_client, messages, gen_max_tokens,
+            preserve_markdown=file_path.lower().endswith((".md", ".markdown")),
         )
 
     #: 生成プロンプトに添える直近会話の上限。
@@ -2834,8 +2844,18 @@ class MetaCognitiveAgent:
         llm_client,
         messages: list[dict],
         gen_max_tokens: int,
+        *,
+        preserve_markdown: bool = False,
     ) -> str:
         """LLM ストリーミング生成 + 後処理（フェンス除去・繰り返し切除）
+
+        ``preserve_markdown`` は出力先が Markdown 文書 (.md/.markdown) の場合に
+        立てる。``strip_markdown_wrapper`` は「最長のフェンス内」だけを取り出す
+        ため、見出し・散文・```python フェンスが混在する正しい Markdown を渡すと
+        **地の文を全部落としてコードだけ** を残す (実インシデント 2026-08-14
+        ライブ監査 ターン13-14)。Markdown 文書ではフェンスは成果物の一部なので、
+        「全体が 1 つのフェンス」のときだけ剥がす ``unwrap_sole_code_fence`` に
+        切り替える。
 
         最初の1トークンまでは別枠の長めタイムアウト
         (``content_gen_first_token_timeout``) で待つ。これは llama-server が他の
@@ -2896,7 +2916,11 @@ class MetaCognitiveAgent:
                     )
                     return f"(Content generation failed: timeout after {self._content_gen_timeout}s)"
             raw = "".join(chunks).strip()
-            content = strip_markdown_wrapper(raw)
+            content = (
+                unwrap_sole_code_fence(raw)
+                if preserve_markdown
+                else strip_markdown_wrapper(raw)
+            )
             content = truncate_repetition(content)
             if not content:
                 logger.warning("Content generation returned empty content")

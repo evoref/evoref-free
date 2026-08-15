@@ -1,4 +1,4 @@
-/** プロンプト管理 API (システムプロンプト + アシストプロンプト) */
+/** プロンプト管理 API (システムプロンプト + 補助タスクプロンプト) */
 
 import { request, requestVoid } from './_client';
 
@@ -81,10 +81,10 @@ export async function switchPromptLocale(locale: string): Promise<PromptLocaleSw
 	return request<PromptLocaleSwitchResponse>('POST', '/prompts/locale', { locale });
 }
 
-// ── アシストプロンプト管理 API ──
+// ── 補助タスクプロンプト管理 API ──
 
-/** アシストプロンプト一覧アイテム */
-export interface AssistPromptListItem {
+/** 補助タスクプロンプト一覧アイテム */
+export interface AuxPromptListItem {
 	task: string;
 	version: number;
 	source: string;
@@ -93,8 +93,8 @@ export interface AssistPromptListItem {
 	content_preview: string;
 }
 
-/** アシストプロンプト詳細 */
-export interface AssistPromptDetail {
+/** 補助タスクプロンプト詳細 */
+export interface AuxPromptDetail {
 	task: string;
 	version: number;
 	source: string;
@@ -103,35 +103,35 @@ export interface AssistPromptDetail {
 	content: string;
 }
 
-/** アシストプロンプト一覧取得 */
-export async function getAssistPrompts(): Promise<AssistPromptListItem[]> {
-	return request<AssistPromptListItem[]>('GET', '/assist-prompts');
+/** 補助タスクプロンプト一覧取得 */
+export async function getAuxPrompts(): Promise<AuxPromptListItem[]> {
+	return request<AuxPromptListItem[]>('GET', '/aux-prompts');
 }
 
-/** アシストプロンプト詳細取得 */
-export async function getAssistPromptDetail(task: string): Promise<AssistPromptDetail> {
-	return request<AssistPromptDetail>('GET', `/assist-prompts/${task}`);
+/** 補助タスクプロンプト詳細取得 */
+export async function getAuxPromptDetail(task: string): Promise<AuxPromptDetail> {
+	return request<AuxPromptDetail>('GET', `/aux-prompts/${task}`);
 }
 
-/** アシストプロンプト更新 */
-export async function updateAssistPrompt(
+/** 補助タスクプロンプト更新 */
+export async function updateAuxPrompt(
 	task: string,
 	content: string
 ): Promise<PromptUpdateResponse> {
-	return request<PromptUpdateResponse>('PUT', `/assist-prompts/${task}`, { content });
+	return request<PromptUpdateResponse>('PUT', `/aux-prompts/${task}`, { content });
 }
 
-/** アシストプロンプト履歴取得 */
-export async function getAssistPromptHistory(task: string): Promise<PromptHistoryItem[]> {
-	return request<PromptHistoryItem[]>('GET', `/assist-prompts/${task}/history`);
+/** 補助タスクプロンプト履歴取得 */
+export async function getAuxPromptHistory(task: string): Promise<PromptHistoryItem[]> {
+	return request<PromptHistoryItem[]>('GET', `/aux-prompts/${task}/history`);
 }
 
-/** アシストプロンプトロールバック */
-export async function rollbackAssistPrompt(
+/** 補助タスクプロンプトロールバック */
+export async function rollbackAuxPrompt(
 	task: string,
 	version: number
 ): Promise<PromptUpdateResponse> {
-	return request<PromptUpdateResponse>('POST', `/assist-prompts/${task}/rollback`, {
+	return request<PromptUpdateResponse>('POST', `/aux-prompts/${task}/rollback`, {
 		version
 	});
 }

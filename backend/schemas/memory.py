@@ -147,7 +147,7 @@ class ConflictChatReviewConfig(BaseModel):
     """pending 競合のチャット確認フロー設定
 
     ``review_status="pending"`` の競合をチャットの SemMem 注入で提示し、
-    ユーザー回答を assist (``conflict_chat_judge``) で判定して即時解決する
+    ユーザー回答を LLM (``conflict_chat_judge``) で判定して即時解決する
     フローを制御する。
     """
 
@@ -163,7 +163,7 @@ class ConflictChatReviewConfig(BaseModel):
     # 多いグループを抑えられないため併用する。設計書 §203 の「drop されない」
     # 保証のため、上限を超えても最低 1 グループは必ず注入する。
     max_tokens: int = Field(default=400, ge=0)
-    # conflict_chat_judge (assist) のセッション内発火上限。上限到達後は
+    # conflict_chat_judge のセッション内発火上限。上限到達後は
     # 同一セッションでの判定と pending 注入を停止し、滞留 pending が
     # 毎ターン realtime スロットを専有するのを防ぐ。0 = 無制限 (従来動作)。
     max_judge_per_session: int = Field(default=3, ge=0)

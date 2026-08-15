@@ -42,7 +42,7 @@ Pro 拡張 (`backend/pro/` / `frontend/src/lib/pro/`) はプロプライエタ�
 
 ---
 
-## Qwen3.5-4B (アシストモデル — 既定)
+## Qwen3.5-4B (補助タスク — 既定)
 
 - **提供元**: Qwen Team (Alibaba Cloud) / GGUF 配布: Unsloth
 - **リポジトリ**: https://huggingface.co/unsloth/Qwen3.5-4B-GGUF

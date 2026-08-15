@@ -50,7 +50,7 @@ def ts_to_iso(ts: float | None) -> str | None:
 
 
 def latest_level2_run(raw_last_level2_run: object) -> float:
-    """target 別 dict (``{"base": ts, "assist": ts}``) から最新の実行時刻を取る。
+    """target 別 dict (``{"base": ts}``) から最新の実行時刻を取る。
 
     ``LearningScheduler.get_status()`` の ``last_level2_run`` は 2026-07-18 の
     修正で単一 float から target 別 dict へ変わった。API 層はまだ単一の
@@ -135,7 +135,7 @@ def map_policy_evolver_status(
     return result
 
 
-# ── Pro: Level 2 (base/assist) 状態マッピング ────────────────
+# ── Pro: Level 2 状態マッピング ────────────────
 
 
 def _map_level2_target(raw: object) -> Level2TargetStatus:
@@ -171,6 +171,23 @@ def map_level2_status(raw: object | None) -> Level2StatusModel | None:
             recheck_interval_sec=float(
                 raw_gates.get("recheck_interval_sec", 300.0) or 300.0,
             ),
+            cooldown_hours={
+                str(k): float(v)
+                for k, v in (raw_gates.get("cooldown_hours") or {}).items()
+            },
+            no_improve_streak={
+                str(k): int(v)
+                for k, v in (raw_gates.get("no_improve_streak") or {}).items()
+            },
+            stale_streak=int(raw_gates.get("stale_streak", 2) or 2),
+            overdue={
+                str(k): bool(v)
+                for k, v in (raw_gates.get("overdue") or {}).items()
+            },
+            seconds_since_run={
+                str(k): (None if v is None else float(v))
+                for k, v in (raw_gates.get("seconds_since_run") or {}).items()
+            },
         )
     else:
         gates = Level2GatesModel()
@@ -178,7 +195,6 @@ def map_level2_status(raw: object | None) -> Level2StatusModel | None:
         running_target=raw.get("running_target"),
         next_target=str(raw.get("next_target", "base")),
         base=_map_level2_target(raw.get("base")),
-        assist=_map_level2_target(raw.get("assist")),
         gates=gates,
     )
 

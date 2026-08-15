@@ -96,7 +96,10 @@ class GenerationDeltaStore:
             logger.warning("Failed to load generation deltas from %s: %s", path, e)
             return None
         deltas = GenerationDeltaStore.deserialize(data)
-        logger.info("Loaded generation deltas (%d modes) from %s", len(deltas), path)
+        # 起動時に一度だけ読むファイルではなく、生成パラメータ解決のたびに
+        # 参照される (キャッシュミス時のみここへ来る)。INFO で出すと
+        # learning.log がこの 1 行で埋まるため DEBUG に置く。
+        logger.debug("Loaded generation deltas (%d modes) from %s", len(deltas), path)
         return deltas
 
     @staticmethod
@@ -104,8 +107,39 @@ class GenerationDeltaStore:
         """指定モードのデルタのみを返す薄いヘルパー (config.py 用途)。
 
         ファイル未存在・モード未登録時は空辞書を返す。
+
+        ``get_mode_generation_params`` から **生成パラメータ解決のたび** に
+        呼ばれる (チャット 1 応答で複数回、アイドル時も背景処理から数十秒おき)
+        ため、mtime + size で無効化するキャッシュを噛ませる。素の ``load``
+        は毎回 read + json.loads + INFO ログを出していた。
         """
-        loaded = GenerationDeltaStore.load(path)
-        if loaded is None:
+        cached = _load_cached(Path(path))
+        if cached is None:
             return {}
-        return dict(loaded.get(mode, {}))
+        return dict(cached.get(mode, {}))
+
+
+#: ``load_mode`` のプロセス内キャッシュ。値は
+#: ``(mtime_ns, size, DeltaMap | None)``。書き戻し (Level 1 の
+#: ``GenerationParamEvolver``) は同一ファイルの mtime を進めるので、
+#: 別プロセスからの更新も次回参照時に反映される。
+_load_cache: dict[Path, tuple[int, int, "DeltaMap | None"]] = {}
+
+
+def _load_cached(path: Path) -> "DeltaMap | None":
+    """``GenerationDeltaStore.load`` の mtime ベースのキャッシュ版。"""
+    try:
+        st = path.stat()
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        # 未存在 = 「デルタなし」。存在確認だけなので毎回 stat してよい。
+        _load_cache.pop(path, None)
+        return None
+
+    hit = _load_cache.get(path)
+    if hit is not None and (hit[0], hit[1]) == key:
+        return hit[2]
+
+    loaded = GenerationDeltaStore.load(path)
+    _load_cache[path] = (key[0], key[1], loaded)
+    return loaded

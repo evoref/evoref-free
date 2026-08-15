@@ -4,8 +4,8 @@
 
 - :func:`_log_timings`                 : startup/shutdown timings サマリ INFO 出力
 - ``_shutdown_*`` ヘルパー (9 種)        : level1 loop 停止 / 学習 cancel /
-  WM flush / STM 永続化 / 経験バッファ / 学習済みパターン / アシスト経験 /
-  LLMClient / Embedder / AssistClient / Pro
+  WM flush / STM 永続化 / 経験バッファ / 学習済みパターン / 補助タスク経験 /
+  LLMClient / Embedder / AuxClient / Pro
 - :func:`_run_lifespan_startup`        : :func:`wire_pillars` への薄いエントリ
 - :func:`_run_lifespan_shutdown`       : 全 shutdown ステップを timings 計測しつつ実行
 - :func:`lifespan`                     : ``@asynccontextmanager`` 化された FastAPI lifespan
@@ -40,7 +40,6 @@ if TYPE_CHECKING:
     from backend.free.memory.scheduler import SleepTimeScheduler
     from backend.free.memory.stores.short_term import ShortTermMemory
     from backend.free.memory.stores.working import WorkingMemory
-    from backend.pro.assist_experience import AssistExperienceBuffer
 
 logger = get_logger("factory.lifespan")
 
@@ -149,6 +148,16 @@ def _shutdown_experience_save(exp_buf: "ExperienceBuffer", exp_file: Path) -> No
         logger.warning("Experience buffer save failed: %s", e)
 
 
+async def _shutdown_aux_experience_save(aux_exp_buf: Any, resolver: Any) -> None:
+    """補助タスク経験バッファを保存 (Level 1 Phase 2 の学習信号)。"""
+    if aux_exp_buf is None:
+        return
+    try:
+        await aux_exp_buf.save(resolver.resolve_learning("aux_experience_file"))
+    except Exception as e:
+        logger.warning("Aux experience buffer save failed: %s", e)
+
+
 def _shutdown_patterns_save(
     learned_patterns_store: "LearnedPatternStore", patterns_file: Path,
 ) -> None:
@@ -158,23 +167,6 @@ def _shutdown_patterns_save(
         logger.info("Learned patterns saved: %d patterns", learned_patterns_store.count)
     except Exception as e:
         logger.warning("Learned patterns save failed: %s", e)
-
-
-async def _shutdown_assist_experience_save(
-    assist_exp_buf: "AssistExperienceBuffer | None", resolver: Any,
-) -> None:
-    """アシストモデル経験バッファを保存"""
-    if assist_exp_buf is None:
-        return
-    try:
-        assist_exp_file = resolver.resolve_local("experience_assist_file")
-        await assist_exp_buf.save(assist_exp_file)
-        logger.info(
-            "Assist experience buffer saved: %d entries",
-            assist_exp_buf.count,
-        )
-    except Exception as e:
-        logger.warning("Assist experience buffer save failed: %s", e)
 
 
 async def _shutdown_llm_client(state: AppState) -> None:
@@ -205,33 +197,6 @@ async def _shutdown_embedder(state: AppState) -> None:
             await emb.aclose()
     except Exception as e:
         logger.warning("Embedder close failed: %s", e)
-
-
-async def _shutdown_assist_residency(state: AppState) -> None:
-    """オンデマンド起動したアシスト llama-server を停止する (docs/c_14 §1.2)。
-
-    アイドル窓や create モードの最中に backend が落ちると、こちらが起こした
-    llama-server が孤児として VRAM を掴んだまま残る。クライアントを閉じる前に
-    プロセスを落とす。
-    """
-    residency = getattr(state, "assist_residency", None)
-    if residency is None:
-        return
-    try:
-        await residency.shutdown()
-    except Exception as e:
-        logger.warning("Assist residency shutdown failed: %s", e)
-
-
-async def _shutdown_assist_client(state: AppState) -> None:
-    """アシストモデルクライアントを閉じる（lazy-connect で後から設定された場合も含む）"""
-    active_assist = state.assist_client
-    if active_assist is None:
-        return
-    try:
-        await active_assist.aclose()
-    except Exception as e:
-        logger.warning("AssistModelClient close failed: %s", e)
 
 
 async def _shutdown_pro(pro_shutdown: ProShutdownHook, state: AppState) -> None:
@@ -321,10 +286,10 @@ async def _run_lifespan_shutdown(
         _shutdown_semmem_index_flush(state)
     with _timed(shutdown_timings, "experience_save"):
         _shutdown_experience_save(ctx.exp_buf, ctx.exp_file)
+    with _timed(shutdown_timings, "aux_experience_save"):
+        await _shutdown_aux_experience_save(ctx.aux_exp_buf, ctx.resolver)
     with _timed(shutdown_timings, "patterns_save"):
         _shutdown_patterns_save(ctx.learned_patterns_store, ctx.patterns_file)
-    with _timed(shutdown_timings, "assist_experience_save"):
-        await _shutdown_assist_experience_save(ctx.assist_exp_buf, ctx.resolver)
     with _timed(shutdown_timings, "loop_run_cancel"):
         task = getattr(state, "loop_run_task", None)
         if task is not None and not task.done():
@@ -345,10 +310,6 @@ async def _run_lifespan_shutdown(
         await _shutdown_llm_client(state)
     with _timed(shutdown_timings, "embedder_close"):
         await _shutdown_embedder(state)
-    with _timed(shutdown_timings, "assist_residency_stop"):
-        await _shutdown_assist_residency(state)
-    with _timed(shutdown_timings, "assist_client_close"):
-        await _shutdown_assist_client(state)
     with _timed(shutdown_timings, "pro_shutdown"):
         await _shutdown_pro(ctx.pro_shutdown, state)
     with _timed(shutdown_timings, "develop_shutdown"):

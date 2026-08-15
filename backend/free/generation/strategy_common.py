@@ -35,7 +35,6 @@ from backend.free.generation.models import (
     extract_target_chars,
 )
 from backend.free.generation.spec_renderer import render_spec_for_prompt
-from backend.free.llm.assist_client import assist_ready
 from backend.free.llm.json_schemas import CodePlan, TextPlan
 from backend.i18n_helper import prose_language_name
 
@@ -43,7 +42,7 @@ logger = logging.getLogger("backend.free.generation.strategy_common")
 
 if TYPE_CHECKING:
     from backend.free.generation.rolling_context import RollingContext
-    from backend.free.llm.assist_client import AssistModelClient
+    from backend.free.llm.aux_client import AuxClient
     from backend.free.llm.json_schemas import CodeSpec
 
 
@@ -107,7 +106,7 @@ TEXT_UNIT_CONTINUATION_SYSTEM = """\
 # ── 計画パース ──
 
 # 1 ユニットあたりの estimated_tokens 上限。LLM (json_schema grammar を強制
-# しないアシストモデルもある) が桁違いの値を返すと、orchestrator の
+# しない補助タスクもある) が桁違いの値を返すと、orchestrator の
 # _split_oversized_text_units が n_splits = ceil(estimated_tokens /
 # unit_target_tokens) だけ同期ループしてイベントループを長時間ブロックする
 # (実運用で発生: /api/status ポーリングまで停止する完全ハング)。実際の
@@ -602,16 +601,16 @@ _PLAN_RETRY_TIMEOUT_SEC = 150.0
 
 
 async def generate_plan_json(
-    assist_client: AssistModelClient | None,
+    aux_client: AuxClient | None,
     prompt: str,
     content_type: ContentType,
     *,
     telemetry: dict | None = None,
 ) -> dict:
-    """アシストモデルで計画 JSON を生成する。
+    """補助タスクで計画 JSON を生成する。
 
     ``content_type`` に応じた schema (CodePlan / TextPlan) を明示選択し、
-    ``assist_client is None`` (degraded) / 例外時は空 dict を返して呼出側の
+    ``aux_client is None`` (degraded) / 例外時は空 dict を返して呼出側の
     単一ユニットフォールバックに委ねる。
 
     出力が ``max_tokens`` で切断された場合 (``telemetry['truncated']``)、ユニット
@@ -620,22 +619,16 @@ async def generate_plan_json(
 
     ``telemetry`` を渡すと最終結果の ``truncated`` / ``replanned`` 等が書き戻される。
     """
-    # ``is None`` (未設定) と residency 非常駐を同じ扱いにする
-    # (docs/c_14 §6.1 の移行)。``assist_model.residency: on_demand`` では
-    # チャット中つねに非常駐なので、``is None`` のままだと long_form のたびに
-    # HTTP 手前まで進んで例外を踏み、「Plan generation failed」という
-    # 失敗に見える WARNING が出ていた (2026-08-09 ライブ監査)。
-    if not assist_ready(assist_client, "long_form_planning"):
+    if aux_client is None:
         logger.info(
-            "create_plan: assist model is not available "
-            "(not configured, or not resident during chat); "
+            "create_plan: aux client is not wired; "
             "falling back to single-unit plan",
         )
         return {}
     plan_schema = CodePlan if content_type == ContentType.CODE else TextPlan
 
     async def _gen(max_tokens: int, timeout: float | None, tel: dict) -> dict:
-        return await assist_client.generate_json(
+        return await aux_client.generate_json(
             prompt,
             max_tokens=max_tokens,
             temperature=0.3,

@@ -95,14 +95,14 @@ class LearningConfig(BaseModel):
     # False: レガシー flat レイアウト (resolve_learning が resolve_local へ素通し)。
     #   既存環境の即時ロールバック用キルスイッチ。
     partition_by_base_model: bool = True
-    # Level 2 base/assist LoRA アダプタ (Pro) のパーティション粒度。
+    # Level 2 base LoRA アダプタ (Pro) のパーティション粒度。
     # 対象は LoRA のみ (control vector / cvector は本設定の対象外、常にモデル単位で
     # 不変 — ランタイム hot-swap 不可 + GGUF 再ロードが高コストなため)。
-    # "model" (既定): LoRA はモデル単位 (base/assist とも両モードの経験を1アダプタに
-    #   プール)。chat↔create 切替で base/assist サーバを再起動しない。
+    # "model" (既定): LoRA はモデル単位 (両モードの経験を 1 アダプタにプール)。
+    #   chat↔create 切替で base サーバを LoRA 差分では再起動しない。
     #   プロンプト/fewshot/policy/experience は (model×mode) で分離されるため
     #   軽量側のモード差は保たれる。
-    # "model_mode": base・assist とも LoRA を (model×mode) で分け、モード切替時に
+    # "model_mode": LoRA を (model×mode) で分け、モード切替時に
     #   LoRA パスが変わっていれば該当サーバを再起動して切り替える
     #   (プロセス再起動方式、切替レイテンシ増を許容する strict モード)。
     #   partition_by_base_model=true を前提とする (model_validator で強制)。
@@ -131,6 +131,23 @@ class LearningConfig(BaseModel):
     # Level 2 常駐ループ (再起動耐性): 03:00 固定 sleep を廃し overdue/idle 判定で発火
     level2_recheck_interval_sec: int = Field(default=300, ge=10)
     level2_overdue_hours: float = Field(default=24.0, ge=0.0)
+    # 連続で改善版を採用できなかった回数がこの値に達した target は
+    # level2_stale_backoff_hours の延長クールダウンへ落ちる。1 サイクルが実推論で
+    # 1 時間規模になりうるため、探索が局所最適に張り付いた状態で 24h 間隔を
+    # 回し続けないための天井 (採用に成功したらストリークは 0 へ戻る)。
+    level2_stale_streak: int = Field(default=2, ge=1)
+    level2_stale_backoff_hours: float = Field(default=72.0, ge=0.0)
+    # 採用に必要な最小改善幅 (baseline_loss に対する相対比)。実推論 eval は
+    # 決定論なので微小差も実差だが、少数の held-out ケースに対する 0.0x% の
+    # 改善は汎化ではなく過適合で、LoRA の版だけが増える。既定 0.1%。
+    level2_min_improvement_ratio: float = Field(default=0.001, ge=0.0, le=1.0)
+    # SPSA の best が更新されないまま連続でこの反復数を超えたら打ち切る (0 で無効)。
+    # 実推論 eval 経路のみ有効 (1 反復 = 候補サーバ 2 起動)。
+    level2_early_stop_patience: int = Field(default=10, ge=0)
+    # 候補評価用の使い捨て llama-server に --no-warmup を付ける。1 サイクルで
+    # 数十回起動するため空回しのウォームアップが積み上がる。旧 llama.cpp で
+    # フラグ非対応の場合のみ false にする。
+    level2_eval_no_warmup: bool = True
     # Level 2 初回 full-train (bootstrap): 既存 LoRA が無いとき初期アダプタを生成して
     # パイプラインを起動可能にする。llama.cpp の LoRA GGUF 形式を生成するため、実
     # llama-server へのロード検証が済むまで既定 False (誤った形式は server 起動を妨げる)。
@@ -144,13 +161,13 @@ class LearningConfig(BaseModel):
     # no-op (対称摂動で勾配 0) のためトリガ段階で skip され Level 2 base は何も起動しない
     # (#3a)。base の実学習は 'cvector' または 'spsa-real-eval' で有効化する
     # (実 llama-server ロード検証後)。
-    # 'spsa-real-eval': assist=B (level2_assist_method) と対称の CandidateEvalHarness を
+    # 'spsa-real-eval': CandidateEvalHarness を
     # base 用に配線し、候補 LoRA を ephemeral llama-server (base モデル + scratch port) に
     # 実ロードして eval_core.json ケースで実推論評価する。CPU 推論 (-ngl 0 相当) のため
-    # base モデルサイズ次第で assist より 1 サイクルが長時間化しうる。
+    # base モデルサイズ次第で 1 サイクルが長時間化しうる。
     level2_base_method: Literal["lora", "cvector", "spsa-real-eval"] = "lora"
-    # base=spsa-real-eval 実推論 eval 有効時の SPSA 反復数 (assist_realeval_spsa_iterations
-    # と同じ理由でコスト天井として低く設定)。
+    # base=spsa-real-eval 実推論 eval 有効時の SPSA 反復数
+    # (1 反復で候補サーバを複数回起動するためコスト天井として低く設定)。
     base_realeval_spsa_iterations: int = Field(default=30, ge=1)
     base_eval_scratch_port: int = Field(default=8091, ge=1024, le=65535)
     base_eval_loss_w1: float = Field(default=0.7, ge=0.0, le=1.0)  # keyword/pattern 一致項
@@ -183,31 +200,7 @@ class LearningConfig(BaseModel):
     fewshot_min_fitness: float = Field(default=0.7, ge=0.0, le=1.0)
     fewshot_max_examples: int = Field(default=3, ge=1)
     fewshot_diversity_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
-    # Level 2 アシストモデル
-    assist_level2_min_experiences: int = Field(default=30, ge=1)
-    assist_spsa_iterations: int = Field(default=300, ge=1)
-    # assist=B 実推論 eval 有効時の SPSA 反復数 (1 反復 = 候補サーバを 2 回起動するため
-    # コスト天井として低く設定。assist_spsa_iterations は no-op eval 時のみ使われる)。
-    assist_realeval_spsa_iterations: int = Field(default=30, ge=1)
-    assist_sparse_params: int = Field(default=100, ge=1)
-    # Level 2 assist=B: assist LoRA 候補を ephemeral llama-server に実ロードして
-    # held-out 構造化判定 (rag_necessity/rag_quality/tool_call) を実推論評価する。
-    # 'spsa-real-eval' 指定が enable (Pro 限定)。既定 'none' では改良 SPSA がトリガ段階で
-    # skip され Level 2 assist は何も起動しない (#3a)。assist の実学習は 'spsa-real-eval' で
-    # 有効化する (実 --lora ロード検証後)。
-    # コスト: SPSA は eval_current_params=False で 1 iter = 候補サーバ 2 回起動 (probe ±)、
-    # + 初回 1 回。反復数は assist_realeval_spsa_iterations (既定 30) を使う。
-    level2_assist_method: Literal["none", "spsa-real-eval"] = "none"
-    assist_eval_scratch_port: int = Field(default=8090, ge=1024, le=65535)
-    assist_eval_loss_w1: float = Field(default=0.7, ge=0.0, le=1.0)  # keyword/pattern 一致項
-    assist_eval_loss_w2: float = Field(default=0.3, ge=0.0, le=1.0)  # mean neg-logprob 項
-    assist_eval_max_tokens: int = Field(default=64, ge=1)
-    assist_eval_max_cases: int = Field(default=20, ge=1)
-    assist_eval_health_timeout: int = Field(default=120, ge=10)
-    # assist bootstrap (B=0 ゼロ初期化 LoRA 種)。実 --lora ロード検証まで既定 False。
-    level2_assist_bootstrap_enabled: bool = False
-    level2_assist_bootstrap_rank: int = Field(default=8, ge=1, le=256)
-    level2_assist_bootstrap_init_sigma: float = Field(default=1e-4, ge=0.0)
+    # Level 2 補助タスク
     # Level 2 最適化器切替
     # "spsa" は Free 版にも実装あり (`backend/free/optimizer/spsa.py`)。
     # "full-cma-es" は Pro 版で `cma` パッケージ利用 (`backend/pro/cma_es_full.py`)。
@@ -222,11 +215,6 @@ class LearningConfig(BaseModel):
     budget_sigma: float = Field(default=0.05, ge=0.0, le=1.0)
     # 各戦略の比率合計の上限 (generation 余地を確保するため 1.0 未満に抑える)
     budget_max_total_ratio: float = Field(default=0.7, gt=0.0, le=1.0)
-    # 変異生成 LLM 設定 ("main" = base モデル / "assist" = assist モデル)。
-    # base モードのプロンプト変異は既定で assist へ寄せる: 低速 base での
-    # 1024 tok 生成は HTTP read timeout を超過し Level 1 進化が停滞するため。
-    prompt_mutator_base: str = "assist"
-    prompt_mutator_assist: str = "main"
     # 品質ゲート結果 還流パイプ
     feedback_pipe: FeedbackPipeConfig = Field(default_factory=FeedbackPipeConfig)
     # ポリシー / 進化結果書き戻し設定

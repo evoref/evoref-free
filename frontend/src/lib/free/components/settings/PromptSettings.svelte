@@ -4,7 +4,7 @@
 	import { isPro } from '$lib/edition';
 	import {
 		systemPrompts,
-		assistPrompts,
+		auxPrompts,
 		selectedPrompt,
 		editContent,
 		currentDetail,
@@ -31,7 +31,7 @@
 	}
 
 	/** プロンプト切替前の未保存チェック */
-	async function handleSelect(category: 'system' | 'assist', id: string): Promise<void> {
+	async function handleSelect(category: 'system' | 'aux', id: string): Promise<void> {
 		if ($promptDirty) {
 			const ok = confirm($t('settings.prompts.unsaved_changes'));
 			if (!ok) return;
@@ -66,12 +66,12 @@
 				</button>
 			{/if}
 		{/each}
-		{#each $assistPrompts as p}
+		{#each $auxPrompts as p}
 			<button
 				type="button"
 				class="prompt-item"
-				class:prompt-item-active={$selectedPrompt?.category === 'assist' && $selectedPrompt?.id === p.task}
-				onclick={() => handleSelect('assist', p.task)}
+				class:prompt-item-active={$selectedPrompt?.category === 'aux' && $selectedPrompt?.id === p.task}
+				onclick={() => handleSelect('aux', p.task)}
 			>
 				<span class="prompt-name">{$t(`settings.prompts.task_${p.task}`)}</span>
 			</button>

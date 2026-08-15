@@ -1,9 +1,9 @@
 """Step 8.7: RAG necessity/quality リコール用のキュレーター
 
-チャット応答パスで発火した RAG necessity/quality の assist 判定
-(``RagJudgeAssistLog`` 経由でリングバッファに蓄積されたもの) を、STM の
+チャット応答パスで発火した RAG necessity/quality の aux 判定
+(``RagJudgeLog`` 経由でリングバッファに蓄積されたもの) を、STM の
 直近 Q&A ペアと突き合わせて「この判定は最終応答の観点で妥当だったか」を
-アシストで自己採点し、score が閾値以上のものを ``world_fact``
+補助タスクで自己採点し、score が閾値以上のものを ``world_fact``
 (subject = ``mem.world.rag_necessity.*`` / ``mem.world.rag_quality.*``) と
 して永続化する。``url_curator.py`` と対称の設計 (プロンプト差し替えのみ)。
 
@@ -33,8 +33,7 @@ from backend.free.memory.types import SemanticFact, make_fact
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
-    from backend.free.llm.assist_client import AssistModelClient
-    from backend.free.memory.pipeline.rag_judge_assist_log import RagJudgeAssistEvent
+    from backend.free.memory.pipeline.rag_judge_log import RagJudgeAuxEvent
     from backend.free.memory.semantic.store import SemanticFactStore
     from backend.free.memory.stores.short_term import MemoryNote
     from backend.free.rag.embedding_backend import EmbeddingBackend
@@ -85,22 +84,22 @@ _coerce_bare_score = coerce_bare_score
 
 
 async def _score_decision(
-    assist_client: "AssistModelClient",
+    scorer_client,
     *,
     kind: str,
     query: str,
     answer: str,
     decision: str,
 ) -> float | None:
-    """アシストモデルで判定の妥当性を採点する。失敗時は ``None``。"""
+    """補助タスクで判定の妥当性を採点する。失敗時は ``None``。"""
     try:
-        result = await assist_client.generate(
+        result = await scorer_client.generate(
             messages=[
                 {"role": "system", "content": _PROMPT_SYSTEM[kind]},
                 {"role": "user", "content": _build_user_prompt(query, answer, decision)},
             ],
             # 768: tool_judgment と同根拠 (2026-07-18 実インシデント)。gemma4 系
-            # アシストで reasoning_budget=0 が稀に実効せず、256 では reasoning
+            # 補助タスクで reasoning_budget=0 が稀に実効せず、256 では reasoning
             # 出力だけで max_tokens を使い切り空応答になる事例が確認された。
             max_tokens=768,
             temperature=0.1,
@@ -108,7 +107,7 @@ async def _score_decision(
             response_schema=UrlRelevanceJudgement,
         )
     except Exception as exc:
-        logger.warning("rag_judge_curator: assist scoring failed: %s", exc)
+        logger.warning("rag_judge_curator: relevance scoring failed: %s", exc)
         return None
     from backend.free.llm.json_extract import extract_json_object
     from backend.free.llm.utils import extract_content
@@ -136,7 +135,7 @@ async def _score_decision(
 def _find_answer_for_query(notes: list["MemoryNote"], query: str) -> str | None:
     """STM から ``query`` と完全一致する user note の直後 assistant note を探す。
 
-    ``RagJudgeAssistEvent`` は session_id を持たないため、全 session を対象に
+    ``RagJudgeAuxEvent`` は session_id を持たないため、全 session を対象に
     ``created_at`` 昇順で直近一致 (末尾から探索) を優先する。
     """
     ordered = sorted(notes, key=lambda n: n.created_at)
@@ -188,12 +187,12 @@ def _record_score(
 
 
 async def curate_rag_judge_facts(
-    events: list["RagJudgeAssistEvent"],
+    events: list["RagJudgeAuxEvent"],
     notes: list["MemoryNote"],
     *,
     config: dict | None,
     store_provider: Callable[[str], "SemanticFactStore | None"] | None,
-    assist_client: "AssistModelClient | None",
+    scorer_client,
     embedder: "EmbeddingBackend | None",
     profile_id: str = "default",
     debug_logger=None,
@@ -202,12 +201,13 @@ async def curate_rag_judge_facts(
     """RAG necessity/quality リコール用の ``world_fact`` を sleep-time で書き込む。
 
     Args:
-        events: ``RagJudgeAssistLog.drain()`` から得たイベント列。
+        events: ``RagJudgeLog.drain()`` から得たイベント列。
         notes: 直近の ``MemoryNote`` 群 (通常 ``ShortTermMemory.notes.values()``)。
         config: 全体 config。``rag.self_rag.necessity_recall`` /
             ``quality_recall`` セクションを参照する。
         store_provider: ``scope -> SemanticFactStore | None`` のコールバック。
-        assist_client: ``None`` の場合は no-op (degraded mode)。
+        scorer_client: 採点に使う LLM クライアント (sleep-time のベース
+            モデルアダプタ)。``None`` の場合は no-op。
         embedder: subject 用 embedding 生成用。``None`` で no-op。
         profile_id: 書込先 fact の profile_id。
         debug_logger: 任意の DebugLogger。
@@ -216,8 +216,8 @@ async def curate_rag_judge_facts(
     Returns:
         新規に書き込まれた / 更新された fact 件数。
     """
-    if assist_client is None:
-        logger.debug("rag_judge_curator: assist_client is None (degraded mode), skipping")
+    if scorer_client is None:
+        logger.debug("rag_judge_curator: scorer_client is None, skipping")
         return 0
     if embedder is None:
         logger.debug("rag_judge_curator: embedder is None, skipping")
@@ -254,7 +254,7 @@ async def curate_rag_judge_facts(
             continue
 
         score = await _score_decision(
-            assist_client, kind=ev.kind, query=ev.query, answer=answer,
+            scorer_client, kind=ev.kind, query=ev.query, answer=answer,
             decision=ev.decision,
         )
         if score is None or score < min_record:

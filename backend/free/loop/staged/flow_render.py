@@ -350,7 +350,7 @@ def renumber_steps(steps: list[FlowStep]) -> list[FlowStep]:
 def fallback_flow(module_entries: list[tuple[str, list[str]]]) -> list[FlowStep]:
     """正準モジュール一覧から線形フローを決定論構築する (LLM 不使用)。
 
-    合成が 2 回とも検証不能だった場合・assist degraded 時の縮退経路。
+    合成が 2 回とも検証不能だった場合・aux degraded 時の縮退経路。
     ``module_entries`` は ``(path, labels)`` — labels は spec の Behavior
     番号ステップ (取得できれば、そちらが優先) または purpose 先頭行 1 個の
     いずれか (呼出側が決定する。ラベル 0 個のモジュールは無視される)。

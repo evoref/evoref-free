@@ -35,14 +35,13 @@ logger = get_logger("core.vram_monitor")
 
 
 # 3 種モデルの固定順序 (GUI 表示順と合わせる)
-MODEL_NAMES: tuple[str, ...] = ("base", "assist", "embed")
+MODEL_NAMES: tuple[str, ...] = ("base", "embed")
 
 
 # LlamaProcessManager の component 名は "embedding"、本モジュールの GUI 表示 key は
 # "embed"。nvidia-smi 突合時のみの差分なので局所マップで解消する。
 _MODEL_TO_COMPONENT: dict[str, str] = {
     "base": "base",
-    "assist": "assist",
     "embed": "embedding",
 }
 
@@ -158,7 +157,7 @@ def _get_managed_pids(
     """LlamaProcessManager から 3 モデルの PID を抽出する
 
     Returns:
-        dict[model_name ("base"/"assist"/"embed"), pid]。
+        dict[model_name ("base"/"embed"), pid]。
         manager が None / 該当 component が未管理の場合はその key を含まない。
     """
     result: dict[str, int] = {}
@@ -260,7 +259,6 @@ def collect_vram_status(
     model_paths_cfg = cfg.get("model_paths", {}) or {}
     _KEY_MAP = {
         "base": "base_model",
-        "assist": "assist_model",
         "embed": "embed_model",
     }
     for name, key in _KEY_MAP.items():

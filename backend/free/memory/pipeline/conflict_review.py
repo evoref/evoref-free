@@ -26,10 +26,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-import httpx
 
 from backend.free.core.text_quality import carries_no_assertion
-from backend.free.llm.assist_client import assist_ready
 from backend.free.memory.pipeline.semantic_conflict_resolver import (
     CONFLICTS_PENDING_FILENAME,
     CONFLICTS_RESOLVED_FILENAME,
@@ -107,7 +105,7 @@ def collect_pending_groups(
 
     単独 pending (グループとして競合になっていないもの) は除外する。
     並びは ``(scope, subject, predicate)`` の決定的順序 — チャット注入の
-    ``[C1]`` 採番と assist 判定プロンプトで同一の番号を共有するため、
+    ``[C1]`` 採番をチャット注入ブロックと共有するため、
     呼び出しタイミングに依らず安定であること。
     """
     pending = [
@@ -492,11 +490,11 @@ def render_pending_conflicts_block(
     """pending 競合グループをプロンプト注入用テキストへ整形する。
 
     採番 (``[C1]``〜) は :func:`collect_pending_groups` の決定的順序に
-    従う。assist 判定プロンプト (:func:`judge_user_reply`) と同一の
+    従う。番号の採番規則と同一の
     レンダリングを共有し、ターン間で番号がずれないようにする。
 
     Args:
-        instruct: True で AI への確認指示行を含める。assist 未接続
+        instruct: True で AI への確認指示行を含める。aux 未接続
             (回答を判定できない) のときは False で情報提示のみにする。
         max_groups: 注入するグループ数の上限 (0 = 無制限)。超過分は
             件数のみ要約する。
@@ -536,92 +534,3 @@ def render_resolved_notice(
         f"{result.action} で解決し、記憶を更新済み。"
         "応答の冒頭で一言だけ反映した旨を伝えること。)"
     )
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# assist 回答判定
-# ──────────────────────────────────────────────────────────────────────────
-
-_JUDGE_PROMPT_TEMPLATE = """あなたは記憶管理アシスタント。直前の会話で、AI はユーザーに以下の記憶の競合について確認した可能性がある。
-
-競合一覧:
-{conflicts}
-
-直前の AI 発話 (抜粋):
-{assistant_message}
-
-ユーザーの最新発話:
-{user_message}
-
-ユーザーの発話が競合のどれかへの回答であるかを判定せよ。
-- 回答である場合: is_answer=true、group_index に対象番号 ([C1]=1)、action に keep_old (古い方が正しい) / keep_new (新しい方が正しい) / merge (両方正しい・統合) のいずれかを設定。merge の場合は merged_object に統合後の値を書く。
-- 雑談・無関係・どちらとも取れない場合: is_answer=false, action="none"。迷ったら必ず is_answer=false にすること。
-JSON のみで応答せよ。"""
-
-
-async def judge_user_reply(
-    assist_client,
-    *,
-    groups: list[PendingConflictGroup],
-    user_message: str,
-    last_assistant_message: str,
-    max_object_chars: int = 80,
-) -> dict | None:
-    """ユーザー発話が pending 競合への回答かを assist で判定する。
-
-    戻り値は検証済みの判定 dict (``group_index`` は 1 始まりで
-    ``groups`` の範囲内、``action`` は keep_old/keep_new/merge のいずれか)。
-    回答でない / 応答が壊れている / 例外時はすべて ``None`` (= no-op)。
-    アシストが json_schema grammar を強制しないモデル (LFM2 系) でも
-    安全なよう、消費側で多段バリデーションする。
-
-    タイムアウト (``httpx.TimeoutException`` / ``TimeoutError``) はインフラ的
-    失敗であり「ユーザーが競合に回答しなかった」とは意味が異なるため、
-    呼出元 (``chat_service.maybe_resolve_pending_conflicts``) がセッション cap
-    を消費しない判断ができるよう再送出する。
-    """
-    if not groups or not assist_ready(assist_client, "conflict_chat_judge"):
-        return None
-    conflicts_text = "\n".join(
-        _render_group_line(i, g, max_object_chars=max_object_chars)
-        for i, g in enumerate(groups, start=1)
-    )
-    prompt = _JUDGE_PROMPT_TEMPLATE.format(
-        conflicts=conflicts_text,
-        assistant_message=_truncate(last_assistant_message or "(なし)", 300),
-        user_message=_truncate(user_message, 500),
-    )
-    try:
-        result = await assist_client.generate_json(
-            prompt,
-            purpose="conflict_chat_judge",
-            max_tokens=192,
-            temperature=0.0,
-        )
-    except (httpx.TimeoutException, TimeoutError):
-        raise
-    except Exception as exc:
-        logger.warning("conflict_chat_judge failed: %s", exc)
-        return None
-
-    if not isinstance(result, dict):
-        return None
-    if not result.get("is_answer"):
-        return None
-    action = result.get("action")
-    if action not in ("keep_old", "keep_new", "merge"):
-        return None
-    try:
-        group_index = int(result.get("group_index", 0))
-    except (TypeError, ValueError):
-        return None
-    if not (1 <= group_index <= len(groups)):
-        return None
-    merged_object = str(result.get("merged_object") or "")
-    if action == "merge" and not merged_object.strip():
-        return None
-    return {
-        "group_index": group_index,
-        "action": action,
-        "merged_object": merged_object,
-    }

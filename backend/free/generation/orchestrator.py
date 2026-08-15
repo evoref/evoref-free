@@ -218,14 +218,14 @@ def drop_repeated_sentences(text: str) -> str:
 class LongFormOrchestrator:
     """長文生成のオーケストレーター
 
-    戦略の自動選択（assist_client 有無）、計画生成、ユニット逐次生成、
+    戦略の自動選択（aux_client 有無）、計画生成、ユニット逐次生成、
     レビュー、コード検証を統合管理する。
     """
 
     def __init__(
         self,
         main_client,
-        assist_client=None,
+        aux_client=None,
         memory_wm=None,
         retriever=None,
         embedder=None,
@@ -235,7 +235,7 @@ class LongFormOrchestrator:
         policy: PolicyInterpreter | None = None,
     ):
         self.main_client = main_client
-        self.assist_client = assist_client
+        self.aux_client = aux_client
         self.memory_wm = memory_wm
         self.retriever = retriever
         self.embedder = embedder
@@ -279,18 +279,18 @@ class LongFormOrchestrator:
         self._last_review_issue_count: int = 0
         self._last_unaddressed_issue_count: int = 0
 
-        # Recurrent も計画 / 要約再帰をアシストモデルで実行する
-        # ため ``assist_client`` を渡す。``None`` の場合は Recurrent 内部で
+        # Recurrent も計画 / 要約再帰を補助タスクで実行する
+        # ため ``aux_client`` を渡す。``None`` の場合は Recurrent 内部で
         # fallback_plan 単一ユニット計画 + 新セクション末尾保持にフォール
         # バックする (ベースモデル経由の JSON 抽出は行わない)。
         self.strategy: CogWriterStrategy | RecurrentStrategy = (
             CogWriterStrategy(
-                main_client, assist_client, self.config, debug_logger,
+                main_client, aux_client, self.config, debug_logger,
                 generation_params=self._generation_params,
             )
-            if assist_client
+            if aux_client
             else RecurrentStrategy(
-                main_client, assist_client, self.config, debug_logger,
+                main_client, aux_client, self.config, debug_logger,
                 generation_params=self._generation_params,
             )
         )
@@ -480,14 +480,14 @@ class LongFormOrchestrator:
     ) -> None:
         """生成コードを検証ゲート付きでリペアし ``last_code_output`` に保持する。
 
-        review 後の ``generated_units`` を assemble → 検証 → assist 修正 → 再検証。
+        review 後の ``generated_units`` を assemble → 検証 → aux 修正 → 再検証。
         create の editor/file 出力はこの結果を配信する (生ストリームの revise
         二重追記の解消)。リペア無効 / degraded 時は素の assembled をそのまま保持。
         """
         if content_type != ContentType.CODE or not rolling.generated_units:
             return
         repairer = CodeRepairer(
-            self.assist_client, self.config, debug_logger=self._debug_logger,
+            self.aux_client, self.config, debug_logger=self._debug_logger,
         )
         # 共有設計仕様 (契約) をリペアプロンプトへ同梱する。無いと修正が「検出
         # エラーを消すこと」だけを目標にでき、契約 (モジュール名 / データモデルの
@@ -1111,7 +1111,7 @@ class LongFormOrchestrator:
                 self.last_text_output = "\n\n".join(rolling.generated_units)
 
         # 8.5 検証ゲート付きコードリペア (CODE のみ)。review 後の generated_units を
-        # assemble → 検証 → assist 修正 → 再検証し、last_code_output に保持する。
+        # assemble → 検証 → aux 修正 → 再検証し、last_code_output に保持する。
         # 総時間超過時も最終出力品質のため実行する (max_repair_rounds で有界)。
         await self._repair_generated_code(rolling, content_type, on_step)
 
@@ -1323,7 +1323,7 @@ class LongFormOrchestrator:
                         "summary_length": len(rolling.long_term_summary),
                         "elapsed_sec": round(time.monotonic() - t0, 3),
                     })
-            # CogWriter: アシストが全文参照できるため要約不要
+            # CogWriter: 補助タスクが全文参照できるため要約不要
 
     @staticmethod
     def _get_extend_tail(rolling: RollingContext) -> str:

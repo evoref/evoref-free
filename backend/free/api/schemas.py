@@ -75,14 +75,6 @@ class ComponentStatus(BaseModel):
     """個別コンポーネント（モデル）のステータス"""
     name: str = ""
     connected: bool = False
-    # アシストのオンデマンド常駐状態 (docs/c_14 §1.2)。assist 以外は None。
-    #   "stopped" — 設計どおり停止中 (チャット中は起動しない)
-    #   "starting" / "stopping" — 遷移中
-    #   "ready"   — アイドルバッチ or create モードで常駐中
-    #   "failed"  — 起動に失敗した (これだけが異常)
-    # ``assist_model.residency: always`` では常に None を返し、従来どおり
-    # ``connected`` だけで判断させる。
-    residency: str | None = None
 
 
 class LearningBriefStatus(BaseModel):
@@ -113,7 +105,7 @@ class CapabilityInfo(BaseModel):
     ``probed=False`` で観測フィールドは ``None``。``probe_divergence`` は宣言と
     実機の食い違い (例: json_schema grammar 非強制 / <think> 未閉じ) の記録。
     """
-    slot: str = ""  # "base" | "assist"
+    slot: str = ""  # "base"
     model_id: str = ""
     probed: bool = False
     effective_reasoning_mode: str | None = None
@@ -144,24 +136,24 @@ class StatusResponse(BaseModel):
     capabilities: list[CapabilityInfo] = Field(default_factory=list)
 
 
-# ===== Assist Model =====
+# ===== Aux Model =====
 
-class AssistModelConcurrency(BaseModel):
-    """アシストモデル用途別セマフォスロット数"""
+class AuxModelConcurrency(BaseModel):
+    """補助タスク用途別セマフォスロット数"""
     realtime: int = 0
     background: int = 0
     learning: int = 0
 
 
-class AssistModelStatusResponse(BaseModel):
-    """アシストモデルのステータス（Free版: ローカル専用）"""
+class AuxModelStatusResponse(BaseModel):
+    """補助タスクのステータス（Free版: ローカル専用）"""
     configured: bool = False
     connected: bool = False
     url: str = ""
     host: str = ""
     port: int = 0
     model_params_b: float | None = None
-    concurrency: AssistModelConcurrency = Field(default_factory=AssistModelConcurrency)
+    concurrency: AuxModelConcurrency = Field(default_factory=AuxModelConcurrency)
     timeout_seconds: float = 0
 
 
@@ -407,10 +399,10 @@ class RollbackResponse(BaseModel):
     lora_restored: bool
 
 
-# --- Component (assist / embedding) migration ---
+# --- Component (embedding) migration ---
 
 class ComponentMigrateRequest(BaseModel):
-    """assist / embedding モデルの切替リクエスト"""
+    """embedding モデルの切替リクエスト"""
     new_model_path: str
     dry_run: bool = False
     # L2: 既定で auto_restart=True。LlamaProcessManager が当該
@@ -477,6 +469,11 @@ class ModelStateResponse(BaseModel):
     lora_compatible: bool = True
     strict_startup_check: bool = False
     recommendation: str = ""
+    # llama-server が実際にロードしているモデル (/props)。モデル移行は稼働中の
+    # サーバを差し替えないため、再起動するまでここだけが古いままになりうる。
+    served_filename: str = ""
+    served_mismatch: bool = False
+    served_recommendation: str = ""
 
 
 class ModelQualityCheck(BaseModel):
@@ -490,7 +487,7 @@ class ModelQualityCheck(BaseModel):
 
 
 class ModelQualityRole(BaseModel):
-    """役割 (base/assist/embedding) 1 つ分の品質プローブ結果"""
+    """役割 (base/embedding) 1 つ分の品質プローブ結果"""
 
     role: str
     model: str
@@ -745,7 +742,7 @@ class VramModelInfo(BaseModel):
     backend 無効等のケース。
     """
 
-    name: str  # "base" | "assist" | "embed"
+    name: str  # "base" | "embed"
     present: bool = False
     vram_mb: int = 0
     gpu_layers: int = 0

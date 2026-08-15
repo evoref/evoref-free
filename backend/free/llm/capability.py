@@ -189,8 +189,8 @@ async def probe_model_capabilities(
     """カナリアを投げて実挙動を観測し ``CapabilitySnapshot`` を返す。
 
     ``chat_fn`` は raw OAI ``/v1/chat/completions`` 応答 JSON を返す async 関数。
-    ``probe_json=False`` で P3 (json_schema 強制) をスキップする (ベースチャットモデルは
-    json purpose を持たないため、不要な canary とノイズ divergence を避ける)。
+    ``probe_json=False`` で P3 (json_schema 強制) をスキップする。アシスト撤去以降は
+    補助タスクの json purpose もベースモデルが担うため、ベースでも既定で観測する。
     個々のプローブ失敗は握りつぶし観測を ``None`` のままにする (prior フォールバック)。
     全失敗でも例外は投げない (degraded 安全)。
     """
@@ -215,7 +215,7 @@ async def probe_model_capabilities(
     except Exception as exc:
         logger.warning("capability probe P1/P2 failed (prior fallback): %s", exc)
 
-    # P3: json_schema grammar 強制 (json purpose を持つ assist モデルのみ)
+    # P3: json_schema grammar 強制 (補助タスクの json purpose 用)
     if probe_json:
         try:
             resp = await chat_fn(
@@ -269,15 +269,34 @@ async def probe_model_capabilities(
     return snapshot
 
 
-def make_llama_chat_fn(llama_url: str, *, debug_logger=None, timeout: float = 20.0) -> ChatFn:
+def make_llama_chat_fn(
+    llama_url: str,
+    *,
+    debug_logger=None,
+    timeout: float = 120.0,
+    id_slot: int | None = None,
+) -> ChatFn:
     """実機 llama-server ``/v1/chat/completions`` を叩く ``chat_fn`` を生成する。
 
     ``model_metadata.fetch_model_metadata`` と同じく httpx + ``async_retry_http_call``
     の統一ポリシーに乗せる。OAI 互換エンドポイントのみ (e_03)。
+
+    ``timeout`` はカナリア 1 本あたりの上限。P1/P2 は 128 token 生成するため、
+    ロード直後の大型 thinking モデルでは decode だけで容易に 20 秒を超える
+    (アシスト撤去前は小型モデルが対象だったので 20 秒で足りていた)。プローブは
+    起動をブロックしない背景タスクなので、観測を取り切る方を優先する。短すぎると
+    reasoning 系の観測が恒久的に ``None`` のままになり、``enable_thinking`` の
+    自動再解決が宣言値のまま固定される。
+
+    ``id_slot`` を渡すとそのスロットへ固定する。プローブは補助タスクと同じく
+    背景処理なので専有スロットへ寄せ、起動直後のユーザー初回応答と KV を分離する。
     """
     retry_logger = make_retry_logger(debug_logger, backend="base", purpose="startup/probe")
 
     async def _chat(payload: dict) -> dict:
+        if id_slot is not None:
+            payload = {**payload, "id_slot": id_slot}
+
         async def _post() -> dict:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(

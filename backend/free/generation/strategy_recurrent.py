@@ -2,7 +2,7 @@
 
 設計書 f_08_long_form_generation.md §6 準拠。
 RecurrentGPT 方式のローリングコンテキストにより、メインモデルは生成 (`generate_unit`)
-に専念し、計画 (`create_plan`) と要約再帰 (`update_summary`) はアシストモデルが
+に専念し、計画 (`create_plan`) と要約再帰 (`update_summary`) は補助タスクが
 担当する
 """
 
@@ -39,7 +39,7 @@ from backend.free.llm.utils import extract_content
 from backend.i18n_helper import prose_language_name
 
 if TYPE_CHECKING:
-    from backend.free.llm.assist_client import AssistModelClient
+    from backend.free.llm.aux_client import AuxClient
     from backend.free.llm.local_client import LocalClient
 
 logger = logging.getLogger("backend.free.generation.strategy_recurrent")
@@ -175,7 +175,7 @@ class RecurrentStrategy:
     """Recurrent 戦略（ローリングコンテキスト型）
 
     メインモデルはユニット逐次生成に専念し、計画立案 / 要約再帰 / その他の
-    判定処理は ``assist_client`` (アシストモデル) に委ねる
+    判定処理は ``aux_client`` (補助タスク) に委ねる
 
     RecurrentGPT 方式のローリングコンテキストにより、固定サイズのコンテキスト
     ウィンドウで任意長の出力を生成する。CogWriter とは異なり ``review`` /
@@ -185,18 +185,18 @@ class RecurrentStrategy:
     def __init__(
         self,
         main_client: LocalClient,
-        assist_client: AssistModelClient | None,
+        aux_client: AuxClient | None,
         config: dict,
         debug_logger=None,
         generation_params: dict | None = None,
     ):
         self.main_client = main_client
-        # assist_client は CLAUDE.md §1 に従い計画 / 要約再帰の
-        # 判定系処理を担う。``None`` (assist health_check 失敗の degraded
+        # aux_client は CLAUDE.md §1 に従い計画 / 要約再帰の
+        # 判定系処理を担う。``None`` (aux health_check 失敗の degraded
         # mode) の場合は ``fallback_plan`` 単一ユニット計画 + 新セクション
         # 末尾保持にフォールバックする (ベースモデル経由の JSON 抽出は
         # 行わない)。
-        self.assist_client = assist_client
+        self.aux_client = aux_client
         self.config = config
         self._debug_logger = debug_logger
         self._lf_config = config.get("long_form", {})
@@ -214,9 +214,9 @@ class RecurrentStrategy:
         content_type: ContentType,
         budget: TokenBudget,  # noqa: ARG002
     ) -> GenerationPlan:
-        """アシストモデルで計画を JSON 生成
+        """補助タスクで計画を JSON 生成
 
-        ``assist_client=None`` の degraded mode では即座に
+        ``aux_client=None`` の degraded mode では即座に
         ``fallback_plan`` (単一ユニット) を返す。
         """
         t0 = time.monotonic()
@@ -275,10 +275,10 @@ class RecurrentStrategy:
 
         max_units = resolve_max_units(self._lf_config, long_form_mode)
 
-        # content_type に応じた schema 選択・assist None / 例外フォールバックは共通化
+        # content_type に応じた schema 選択・aux None / 例外フォールバックは共通化
         plan_telemetry: dict = {}
         data = await generate_plan_json(
-            self.assist_client, prompt, content_type, telemetry=plan_telemetry,
+            self.aux_client, prompt, content_type, telemetry=plan_telemetry,
         )
         if plan_telemetry.get("truncated"):
             logger.warning(
@@ -356,14 +356,14 @@ class RecurrentStrategy:
         new_section: str,
         budget: TokenBudget,
     ) -> str:
-        """アシストモデルで既存要約 + 新セクションを再要約
+        """補助タスクで既存要約 + 新セクションを再要約
 
-        ``assist_client=None`` の degraded mode では新セクション末尾を
+        ``aux_client=None`` の degraded mode では新セクション末尾を
         フォールバックとして返す (ベースモデル経由の JSON 抽出を避ける)。
         """
-        if self.assist_client is None:
+        if self.aux_client is None:
             logger.warning(
-                "Recurrent update_summary: assist_client is None, "
+                "Recurrent update_summary: aux_client is None, "
                 "returning new section tail as fallback",
             )
             return new_section[-300:]
@@ -374,7 +374,7 @@ class RecurrentStrategy:
             new_section=new_section[-500:],
         )
         try:
-            result = await self.assist_client.generate(
+            result = await self.aux_client.generate(
                 [{"role": "user", "content": prompt}],
                 max_tokens=budget.skeleton_or_summary,
                 temperature=0.3,

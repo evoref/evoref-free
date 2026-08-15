@@ -1,7 +1,7 @@
 /**
  * プロンプト API サービス層
  *
- * system / assist プロンプトのカテゴリ分岐をアダプタパターンで一本化し、
+ * system / aux プロンプトのカテゴリ分岐をアダプタパターンで一本化し、
  * prompts ストアから分岐ロジックを除去する。
  */
 
@@ -11,21 +11,21 @@ import {
 	reloadPrompt,
 	getPromptHistory,
 	rollbackPrompt,
-	getAssistPromptDetail,
-	updateAssistPrompt,
-	getAssistPromptHistory,
-	rollbackAssistPrompt,
+	getAuxPromptDetail,
+	updateAuxPrompt,
+	getAuxPromptHistory,
+	rollbackAuxPrompt,
 	type PromptDetail,
 	type PromptHistoryItem
 } from '$lib/free/api';
 
-/** fitness_score を含むプロンプト詳細（system / assist 統一型） */
+/** fitness_score を含むプロンプト詳細（system / aux 統一型） */
 export interface PromptDetailWithScore extends PromptDetail {
 	fitness_score?: number;
 }
 
 /** プロンプト種別 */
-export type PromptCategory = 'system' | 'assist';
+export type PromptCategory = 'system' | 'aux';
 
 /** カテゴリ別 API アダプタ */
 export interface PromptAdapter {
@@ -59,10 +59,10 @@ const systemAdapter: PromptAdapter = {
 	}
 };
 
-/** アシストプロンプト用アダプタ */
-const assistAdapter: PromptAdapter = {
+/** 補助タスクプロンプト用アダプタ */
+const auxAdapter: PromptAdapter = {
 	async fetchDetail(id: string): Promise<PromptDetailWithScore> {
-		const detail = await getAssistPromptDetail(id);
+		const detail = await getAuxPromptDetail(id);
 		return {
 			mode: detail.task,
 			version: detail.version,
@@ -74,23 +74,23 @@ const assistAdapter: PromptAdapter = {
 	},
 
 	async save(id: string, content: string): Promise<void> {
-		await updateAssistPrompt(id, content);
+		await updateAuxPrompt(id, content);
 	},
 
 	async reload(_id: string): Promise<void> {
-		// アシストプロンプトは reload API なし（一覧再取得で対応）
+		// 補助タスクプロンプトは reload API なし（一覧再取得で対応）
 	},
 
 	async fetchHistory(id: string): Promise<PromptHistoryItem[]> {
-		return getAssistPromptHistory(id);
+		return getAuxPromptHistory(id);
 	},
 
 	async rollback(id: string, version: number): Promise<void> {
-		await rollbackAssistPrompt(id, version);
+		await rollbackAuxPrompt(id, version);
 	}
 };
 
 /** カテゴリに応じた API アダプタを返す */
 export function getPromptAdapter(category: PromptCategory): PromptAdapter {
-	return category === 'system' ? systemAdapter : assistAdapter;
+	return category === 'system' ? systemAdapter : auxAdapter;
 }

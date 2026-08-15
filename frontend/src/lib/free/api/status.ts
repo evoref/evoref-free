@@ -21,18 +21,9 @@ export interface MemoryStats {
 	long_term_chunks: number;
 }
 
-/** アシストのオンデマンド常駐状態 (docs/c_14 §1.2)。assist 以外は null。 */
-export type AssistResidencyState = 'stopped' | 'starting' | 'ready' | 'stopping' | 'failed';
-
 export interface ComponentStatus {
 	name: string;
 	connected: boolean;
-	/**
-	 * assist のみ。`assist_model.residency: on_demand` のときだけ値が入る。
-	 * `stopped` は設計どおりの停止 (チャット中は起動しない) であって異常ではない。
-	 * 異常として扱うのは `failed` だけ。
-	 */
-	residency?: AssistResidencyState | null;
 }
 
 export interface LearningBriefStatus {
@@ -54,7 +45,7 @@ export interface DebugStatusInfo {
 
 /** モデル能力プローブ結果 (docs/c_15)。未プローブ時は probed=false。 */
 export interface CapabilityInfo {
-	slot: string; // "base" | "assist"
+	slot: string; // "base"
 	model_id: string;
 	probed: boolean;
 	effective_reasoning_mode: string | null;

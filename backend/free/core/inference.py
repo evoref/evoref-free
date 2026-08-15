@@ -122,6 +122,83 @@ def _char_limit_note(history: list[ChatMessage]) -> str:
     )
 
 
+#: 「数値だけ」「一言で」型の **答えだけを求める** 指定。
+#:
+#: 実インシデント (2026-08-14 ライブ監査 ターン15): 「摂氏 23 度は華氏何度ですか？
+#: 数値だけ答えてください。」に対し 300 字超の解説を返した。
+#: 「だけ」の後に **応答を指す動詞** を要求する。これが無いと
+#: 「この値だけを使って計算して」(= 使う値の限定) まで拾ってしまう。
+_ANSWER_ONLY_RE = re.compile(
+    r"(?:数値|数字|値|結論|答え|回答)\s*だけ\s*(?:を|で)?\s*"
+    r"(?:答え|回答|示し|教え|出力|返し|書い|述べ|お願い)"
+    r"|(?:一言|ひとこと|一語|単語)\s*(?:で|だけ)\s*"
+    r"(?:答え|回答|示し|教え|言っ|いっ|まとめ|表現|お願い)"
+    r"|(?<![A-Za-z])(?:just|only)\s+the\s+(?:number|value|answer)(?![A-Za-z])"
+    r"|(?<![A-Za-z])in\s+one\s+word(?![A-Za-z])"
+    r"|(?<![A-Za-z])(?:number|value|answer)\s+only(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+#: 「箇条書きで」型の **出力形式** 指定。
+#:
+#: 実インシデント (2026-08-14 ライブ監査 ターン39): 「利点と欠点を、各 3 つずつ
+#: 箇条書きで。」に対し「利点：A、B、C」と読点区切りの 1 行で返した。
+_BULLET_FORM_RE = re.compile(
+    r"箇条書き|リスト形式|(?:マークダウン|markdown)\s*の?\s*リスト"
+    r"|(?<![A-Za-z])bullet(?:\s+points?|\s+list)?(?![A-Za-z])"
+    r"|(?<![A-Za-z])as\s+a\s+list(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+#: 「各 3 つずつ」「3 個挙げて」型の個数指定 (箇条書き指定と併用されたときだけ使う)。
+_ITEM_COUNT_RE = re.compile(
+    r"(?:各)?\s*(\d{1,2})\s*(?:つ|個|点|項目)\s*(?:ずつ|ずつで|挙げ|書|列挙)"
+    r"|(\d{1,2})\s*(?:items?|points?|bullets?)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def _output_form_note(history: list[ChatMessage]) -> str:
+    """最新 user ターンの **出力形式** 指定を、遵守を促す注記へ変換する。
+
+    文字数指定 (``_char_limit_note``) と同じ立て付けだが、守らせたいのが
+    「長さ」ではなく「形」である点が違う。小型モデルはこの種の指定を
+    しばしば無視する (2026-08-14 ライブ監査で「数値だけ」「箇条書きで」の
+    両方が破られた)。
+
+    Returns:
+        注記文字列。形式指定が無ければ空文字列 (純粋関数)。
+    """
+    last_user = next(
+        (t for t in reversed(history) if t.get("role") == "user"), None,
+    )
+    if last_user is None:
+        return ""
+    text = str(last_user.get("content") or "")
+
+    notes: list[str] = []
+    if _ANSWER_ONLY_RE.search(text):
+        notes.append(
+            "今回のユーザーの指示は答えそのものだけを求めている。"
+            "前置き・理由・計算過程・補足を書かず、答えの値だけを述べること。"
+            # 「正しい値が出せない」ケースまで黙らせると、誤ったツール結果を
+            # そのまま値として述べる方向へ倒れる。開示だけは残す。
+            "ただし正しい値を確定できない場合に限り、その理由を 1 文だけ添えること。"
+        )
+    if _BULLET_FORM_RE.search(text):
+        note = (
+            "今回のユーザーの指示は箇条書き形式を求めている。"
+            "読点や中黒で列挙した 1 行の文にせず、"
+            "1 項目 1 行の Markdown リスト (行頭に `- `) で書くこと。"
+        )
+        m = _ITEM_COUNT_RE.search(text)
+        if m:
+            count = next(g for g in m.groups() if g)
+            note += f"項目数は指定どおり {count} 個ちょうどにすること。"
+        notes.append(note)
+    return "\n".join(notes)
+
+
 #: 日付の解釈を要するクエリのシグナル。明示日付と相対表現の双方を拾う。
 _DATE_CONTEXT_RE = re.compile(
     r"\d{1,4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日"
@@ -381,9 +458,17 @@ def _select_rag_block(
 #: 予約」「先ほど訂正された通り健康診断が 20 日（水）」と、この会話には存在
 #: しない予定と訂正を捏造した)。注入ブロックは全体 context に収まらないと
 #: 丸ごと破棄されるため、guidance は 1 行に収めてトークン増を最小にする。
+#: 併せて「今回の会話が勝つ」ことも明示する。ラベルだけでは "古い記録である"
+#: と伝わっても "衝突したらどちらを採るか" が決まらず、システムプロンプト側の
+#: 「[関連する記憶] を回答の根拠として優先する」と噛み合って古い方が採用される
+#: (実インシデント 2026-08-14 ライブ監査 ターン20: 同じプロンプト内に今回の
+#: 発言「私はコーヒーをよく飲みます」と前セッションの note「コーヒーは苦手で
+#: 紅茶派です」が両方あり、「好きな飲み物は紅茶です。コーヒーは苦手とのこと
+#: でした」と反転して回答した)。
 _SEMMEM_BLOCK_LABEL = (
     "[関連する記憶] "
     "(過去の会話や記録から想起したもの。今回の会話で述べられた内容ではない。"
+    "今回の会話の発言と食い違う場合は必ず今回の会話を優先する。"
     "今回の質問に関係しなければ無視し、ここに無い予定・日付・数値を創作しないこと)"
 )
 
@@ -698,6 +783,7 @@ def build_messages(
         _current_date_note(history),
         _persona_question_note(history),
         _char_limit_note(history),
+        _output_form_note(history),
     ):
         if note:
             _append_note_to_last_user(trimmed, note)
@@ -780,6 +866,7 @@ def build_messages_for_loop(
         _current_date_note(history),
         _persona_question_note(history),
         _char_limit_note(history),
+        _output_form_note(history),
     ):
         if note:
             _append_note_to_last_user(trimmed_history, note)

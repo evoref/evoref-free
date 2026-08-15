@@ -55,7 +55,7 @@ class AutoServeState:
     """auto-serve で管理するプロセス群の状態"""
     procs: list[subprocess.Popen] = field(default_factory=list)
     # procs と並走するコンポーネント名 (stderr ログの stem: llama-base /
-    # llama-assist / llama-embed / backend)。死亡検知時の特定用
+    # llama-embed / backend)。死亡検知時の特定用
     proc_names: list[str] = field(default_factory=list)
     llama_port: int = 0  # llama-server のポート（停止時にポートから kill 用）
     managed_ports: list[int] = field(default_factory=list)  # 全管理対象ポート
@@ -118,7 +118,7 @@ def _build_serve_parser() -> argparse.ArgumentParser:
         "--no-learning", action="store_true",
         help=(
             "Disable self-learning cycle (Level 0 experience record / "
-            "Level 1 prompt evolution / Level 2 LoRA / Pro assist injection). "
+            "Level 1 prompt evolution / Level 2 LoRA / Pro learn injection). "
             "All side-effecting writes become no-op; reads continue. "
             "Useful with --develop=evolve to observe initial behavior."
         ),
@@ -514,12 +514,25 @@ def _load_config(project_root: Path) -> dict:
 
 
 def _build_llama_cmd(project_root: Path, cfg: dict | None = None) -> list[str]:
-    """config.yaml から llama-server 起動コマンドを構築"""
+    """config.yaml から llama-server 起動コマンドを構築
+
+    学習済み base LoRA は ``local/learning/<model>/[<mode>/]models/adapter.gguf``
+    に置かれるため、``build_llama_cmd`` 内の flat フォールバック
+    (``local_paths.lora_adapter``) では拾えない。CLI プロセスにはグローバル
+    ``PathResolver`` の active stem が無いので、cfg だけで解決できる
+    ``resolve_base_lora_for_launch`` を経由する (起動時モードは既定の "chat")。
+    """
+    from backend.config import resolve_base_lora_for_launch
     from scripts.launch_llama import build_llama_cmd
 
     if cfg is None:
         cfg = _load_config(project_root)
-    return build_llama_cmd(cfg, project_root)
+    lora_override, lora_fallback = resolve_base_lora_for_launch(cfg, project_root)
+    return build_llama_cmd(
+        cfg, project_root,
+        lora_override=lora_override,
+        lora_fallback=lora_fallback,
+    )
 
 
 def _build_embed_cmd(project_root: Path, cfg: dict | None = None) -> list[str] | None:
@@ -531,36 +544,13 @@ def _build_embed_cmd(project_root: Path, cfg: dict | None = None) -> list[str] |
     return build_embed_cmd(cfg, project_root)
 
 
-def _build_assist_cmd(project_root: Path, cfg: dict | None = None) -> list[str] | None:
-    """config.yaml からアシストモデル用 llama-server コマンドを構築（設定時のみ）
-
-    ``assist_model.residency: on_demand`` (既定) では ``None`` を返し、CLI からは
-    起動しない。アシストはアイドル窓 (sleep-time / Level 1-2) と create モードの
-    間だけ backend の ``AssistResidencyManager`` が起こす (docs/c_14 §1.2)。
-    ここを唯一の分岐点にすることで ``_spawn_extra_servers`` と
-    ``ensure_extra_servers`` の両経路を一度に塞ぐ。
-    """
-    from scripts.launch_llama import assist_residency_is_on_demand, build_assist_cmd
-
-    if cfg is None:
-        cfg = _load_config(project_root)
-    if assist_residency_is_on_demand(cfg):
-        logger.info(
-            "Assist server is managed on demand "
-            "(assist_model.residency=on_demand); not starting it from the CLI"
-        )
-        return None
-    return build_assist_cmd(cfg, project_root)
-
-
 # ────────────────────────────────────────────
-# 追加サーバー起動（アシスト・埋め込み）
+# 追加サーバー起動（補助タスク・埋め込み）
 # ────────────────────────────────────────────
 
 # (name, config_key, port_key, default_port, build_cmd_func) の定義
 _EXTRA_SERVERS: list[tuple[str, str, str, int]] = [
     # (表示名, config セクションキー, ポートキー, デフォルトポート)
-    ("assist", "assist_model.local", "port", 8081),
     ("embed", "embedding", "llama_port", 8082),
 ]
 
@@ -581,7 +571,7 @@ def _spawn_extra_servers(
     stderr_files: list,
     console,
 ) -> dict[str, tuple[str, int]]:
-    """補助サーバー（assist/embed）を一括スポーン（ヘルスチェックなし）
+    """補助サーバー（embed）を一括スポーン（ヘルスチェックなし）
 
     Popen はノンブロッキングなので全サーバーを即座にスポーンし、
     ヘルスチェックは呼び出し元の _wait_for_health_all() に委譲する。
@@ -590,7 +580,6 @@ def _spawn_extra_servers(
         {name: (host, port)} — スポーンしたサーバーのみ
     """
     builders = {
-        "assist": _build_assist_cmd,
         "embed": _build_embed_cmd,
     }
     servers: dict[str, tuple[str, int]] = {}
@@ -698,14 +687,13 @@ async def ensure_extra_servers(
     project_root: Path,
     auto_serve_state: "AutoServeState",
 ) -> None:
-    """設定済みだが未起動の補助サーバー（assist/embed）を自動起動
+    """設定済みだが未起動の補助サーバー（embed）を自動起動
 
     バックエンドが既に起動している状態で、--auto-serve を使わずに
     evoref create を実行した場合に補助サーバーを補完する。
     """
     cfg = _load_config(project_root)
     builders = {
-        "assist": _build_assist_cmd,
         "embed": _build_embed_cmd,
     }
 
@@ -750,7 +738,7 @@ def _spawn_all_servers(
 ) -> dict[str, tuple[str, int]]:
     """全 llama-server を一括スポーン（並列起動、ヘルスチェックなし）
 
-    base + assist + embed を同時に起動し、
+    base + embed を同時に起動し、
     ヘルスチェックは呼び出し元の _health_check_loop に委譲する。
 
     Args:
@@ -761,7 +749,6 @@ def _spawn_all_servers(
     """
     servers: dict[str, tuple[str, int]] = {}
     builders = {
-        "assist": _build_assist_cmd,
         "embed": _build_embed_cmd,
     }
 
@@ -789,7 +776,7 @@ def _spawn_all_servers(
         except (FileNotFoundError, ValueError, OSError) as e:
             logger.warning("auto-serve: base llama-server start failed: %s", e)
 
-    # ── extra servers (assist / embed) ──
+    # ── extra servers (embed) ──
     for name, config_key, port_key, default_port in _EXTRA_SERVERS:
         build_fn = builders[name]
         try:
@@ -970,7 +957,7 @@ class _HealthCheckSpinner:
 def _check_procs_alive(state: AutoServeState) -> bool:
     """子プロセスのいずれかが死亡していたら ``False``。
 
-    どのコンポーネント (llama-base / llama-assist / llama-embed / backend)
+    どのコンポーネント (llama-base / llama-embed / backend)
     が死んだかを stderr ログ名とともに ERROR に出す — pid だけでは事後に
     プロセスを特定できない。
     """
@@ -1204,7 +1191,7 @@ async def _maybe_spawn_auto_serve_llama(
         )
         render_info(console, msg("cli.auto_serve_llama_exists"))
         state.llama_port = llama_port_val
-    # ベースが既存でも、assist/embed は未起動の可能性があるため常にスポーン
+    # ベースが既存でも、embed は未起動の可能性があるため常にスポーン
     return _spawn_all_servers(
         project_root, cfg, state,
         skip_base=llama_already_running,
@@ -1407,7 +1394,7 @@ def _auto_serve_cleanup(state: AutoServeState, console) -> None:
     if state.llama_port > 0:
         _kill_by_port(state.llama_port)
 
-    # 3. アシスト/エンベッド/リランカーのポートも kill
+    # 3. 補助タスク/エンベッド/リランカーのポートも kill
     for port in state.managed_ports:
         _kill_by_port(port)
 

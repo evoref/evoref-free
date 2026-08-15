@@ -21,9 +21,8 @@ from backend.free.memory.pipeline.lightmem_scorer import FadeMemScorer, MemoryEv
 from backend.free.rag.bm25_retriever import BM25Retriever
 
 if TYPE_CHECKING:
-    from backend.free.agent.assist_prompt_manager import AssistPromptManager
-    from backend.free.llm.assist_client import AssistModelClient
-    from backend.free.memory.pipeline.rag_judge_assist_log import RagJudgeAssistLog
+    from backend.free.agent.aux_prompt_manager import AuxPromptManager
+    from backend.free.memory.pipeline.rag_judge_log import RagJudgeLog
     from backend.free.memory.semantic.store import SemanticFactStore
     from backend.free.memory.notes.subject_canonicalizer import SubjectCanonicalizer
     from backend.free.rag.embedding_backend import EmbeddingBackend
@@ -78,15 +77,14 @@ class SleepTimeWorker:
         vector_store: VectorStore | None = None,
         cartridge_manager: CartridgeManager | None = None,
         policy=None,
-        assist_prompt_manager: AssistPromptManager | None = None,
+        aux_prompt_manager: AuxPromptManager | None = None,
         semantic_store_provider: SemanticStoreProvider | None = None,
         current_project_id: str | None = None,
         agent_trace_dir: Path | None = None,
         subject_canonicalizer: SubjectCanonicalizer | None = None,
         semantic_store_invalidator: SemanticStoreInvalidator | None = None,
-        assist_client: AssistModelClient | None = None,
         profile_id: str = "default",
-        rag_judge_assist_log: "RagJudgeAssistLog | None" = None,
+        rag_judge_log: "RagJudgeLog | None" = None,
     ):
         self.short_term = short_term
         self.long_term = long_term
@@ -99,7 +97,7 @@ class SleepTimeWorker:
         self.learned_patterns = learned_patterns
         self.vector_store = vector_store
         self.cartridge_manager = cartridge_manager
-        self._assist_prompt_manager = assist_prompt_manager
+        self._aux_prompt_manager = aux_prompt_manager
         self._bm25_retriever: BM25Retriever | None = None
         self._cancelled = False
         # ── Step 8 (Extractor) 用 ──
@@ -111,11 +109,9 @@ class SleepTimeWorker:
         self._subject_canonicalizer = subject_canonicalizer
         # ── Step 10 で アーカイブ後にキャッシュ破棄するための callback ──
         self._semantic_store_invalidator = semantic_store_invalidator
-        # ── Step 8.5 (URL curator) 用 ──
-        self._assist_client = assist_client
         self._profile_id = profile_id
         # ── Step 8.7 (RAG judge curator) 用 ──
-        self._rag_judge_assist_log = rag_judge_assist_log
+        self._rag_judge_aux_log = rag_judge_log
         # MDPTraceExtractor はプロセス内で episode の二重抽出を防ぐため
         # ワーカー側で 1 インスタンスを保持する。
         self._mdp_trace_extractor = None
@@ -298,7 +294,7 @@ class SleepTimeWorker:
         evolver = NoteEvolver(
             self.config,
             params_b=params_b,
-            assist_prompt_manager=self._assist_prompt_manager,
+            aux_prompt_manager=self._aux_prompt_manager,
             debug_logger=self._debug_logger,
         )
         # リンク張り直し + クラスタリング (LLM 不要)
@@ -355,8 +351,8 @@ class SleepTimeWorker:
 
         Args:
             llm_client: LLM クライアント（Steps 6-10 で使用）。
-                        AssistModelClient（推奨）または LocalClient。
-                        設計書 §5.5.2 に基づき、アシストモデルの使用を推奨。
+                        AuxClient（推奨）または LocalClient。
+                        設計書 §5.5.2 に基づき、補助タスクの使用を推奨。
 
         Returns:
             実行結果サマリ dict
@@ -430,7 +426,7 @@ class SleepTimeWorker:
 
         # Step 8.5: URL リコール用 world_fact のキュレーション
         # CLAUDE.md §6 #2 に従い、SemMem 書込はここに閉じる。
-        # アシスト未接続 (degraded) の場合は no-op で通過する。
+        # 補助タスク未接続 (degraded) の場合は no-op で通過する。
         ts = time.monotonic()
         result["url_facts_curated"] = await self._step8_5_curate_urls(
             llm_client,
@@ -441,7 +437,7 @@ class SleepTimeWorker:
 
         # Step 8.6: executable command リコール用 world_fact のキュレーション
         # run_command 成功ターン (MemoryNote.tool_command) を world_fact 化する。
-        # アシスト採点不要なので degraded でも動作する。SemMem 書込はここに閉じる。
+        # 補助タスク採点不要なので degraded でも動作する。SemMem 書込はここに閉じる。
         ts = time.monotonic()
         result["command_facts_curated"] = await self._step8_6_curate_commands()
         step_durations["step8_6_command_curator"] = round(time.monotonic() - ts, 3)
@@ -449,9 +445,9 @@ class SleepTimeWorker:
             return result
 
         # Step 8.7: RAG necessity/quality リコール用 world_fact のキュレーション
-        # チャット応答パスで RagJudgeAssistLog に蓄積された判定を自己採点して
+        # チャット応答パスで RagJudgeLog に蓄積された判定を自己採点して
         # world_fact 化する。CLAUDE.md §6 #2 に従い、SemMem 書込はここに閉じる。
-        # アシスト未接続 (degraded) の場合は no-op で通過する。
+        # 補助タスク未接続 (degraded) の場合は no-op で通過する。
         ts = time.monotonic()
         result["rag_judge_facts_curated"] = await self._step8_7_curate_rag_judge_facts(
             llm_client,
@@ -603,7 +599,12 @@ class SleepTimeWorker:
         refined = 0
         for note in self.short_term.notes.values():
             if not note.tags:
-                note.tags = NoteBuilder.auto_tag(note.content)
+                # 生成時と同じ source を渡す。渡さないと assistant ノートに
+                # ``fact`` が付き直し、生成側の抑止 (ASSISTANT_EXCLUDED_TAGS) が
+                # sleep-time で無効化されてしまう。
+                note.tags = NoteBuilder.auto_tag(
+                    note.content, getattr(note, "source", "user"),
+                )
                 if note.tags:
                     refined += 1
             if not note.keywords:
@@ -769,26 +770,17 @@ class SleepTimeWorker:
         実ロジックは :mod:`backend.free.memory.sleep.url_curator`
         に分離されている。本メソッドは state を詰め替える薄いラッパ。
 
-        ``self._assist_client`` がコンストラクタ時点で None だった場合
-        (起動時 health check 失敗で degraded staged) でも、``run_full`` 経由で
-        渡された ``llm_client`` が AssistModelClient なら lazy_connect 後の
-        最新参照とみなしてそちらを使う。
+        採点は ``run_full`` 経由で渡された sleep-time クライアント (ベース
+        モデルの :class:`AuxClient`) で行う。
         """
-        from backend.free.llm.assist_client import AssistModelClient
         from backend.free.memory.sleep.url_curator import curate_url_facts
-
-        assist_client = self._assist_client
-        if assist_client is None and isinstance(llm_client, AssistModelClient):
-            assist_client = llm_client
-            # 以後の sleep-time でも使えるよう保持
-            self._assist_client = assist_client
 
         notes = list(self.short_term.notes.values())
         return await curate_url_facts(
             notes,
             config=self.config,
             store_provider=self._semantic_store_provider,
-            assist_client=assist_client,
+            scorer_client=llm_client,
             embedder=self.embedder,
             profile_id=self._profile_id,
             debug_logger=self._debug_logger,
@@ -800,8 +792,8 @@ class SleepTimeWorker:
         実ロジックは
         :mod:`backend.free.memory.sleep.executable_command_curator` に分離。
         本メソッドは state を詰め替える薄いラッパ。url_curator と違い
-        アシスト採点をしない (``MemoryNote.tool_command_success`` を使う) ため
-        ``assist_client`` は渡さない。
+        補助タスク採点をしない (``MemoryNote.tool_command_success`` を使う) ため
+        ``aux_client`` は渡さない。
         """
         from backend.free.memory.sleep.executable_command_curator import (
             curate_executable_command_facts,
@@ -824,17 +816,11 @@ class SleepTimeWorker:
         に分離されている。本メソッドは state を詰め替える薄いラッパ
         (``_step8_5_curate_urls`` と同型)。
         """
-        from backend.free.llm.assist_client import AssistModelClient
         from backend.free.memory.sleep.rag_judge_curator import curate_rag_judge_facts
 
-        assist_client = self._assist_client
-        if assist_client is None and isinstance(llm_client, AssistModelClient):
-            assist_client = llm_client
-            self._assist_client = assist_client
-
-        if self._rag_judge_assist_log is None:
+        if self._rag_judge_aux_log is None:
             return 0
-        events = self._rag_judge_assist_log.drain()
+        events = self._rag_judge_aux_log.drain()
         if not events:
             return 0
 
@@ -844,7 +830,7 @@ class SleepTimeWorker:
             notes,
             config=self.config,
             store_provider=self._semantic_store_provider,
-            assist_client=assist_client,
+            scorer_client=llm_client,
             embedder=self.embedder,
             profile_id=self._profile_id,
             debug_logger=self._debug_logger,
