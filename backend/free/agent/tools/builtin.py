@@ -1217,6 +1217,86 @@ def _make_run_command_readonly(config: dict):
 # 既存の import 経路を保つためここから再エクスポートする。
 SEARCH_HISTORY_NO_RESULTS_PREFIX = _SEARCH_HISTORY_NO_RESULTS_PREFIX
 
+#: 「この会話の最初/最後に何を言ったか」という **位置指定** の自己参照。
+#:
+#: この種の質問は逐語一致では絶対に当たらない。``session_id`` スコープ検索の
+#: 唯一のヒット源は ``_find_matched_turns`` (逐語/トークン一致) であり、
+#: 「一番最初に話しかけた内容」という語は当の 1 通目には出てこないためである。
+#: 進行中セッションは ``summary`` も空 (要約は sleep-time でしか付かない) なので、
+#: 「summary も matched_turns も無いヒットは捨てる」ガードで最後の 1 件も落ち、
+#: 結果は必ず「該当なし」になる。
+#:
+#: 2026-08-16 ライブ監査ターン 35「今日の会話で、私が一番最初に話しかけた内容は
+#: 何でしたか？」: index には ``first_user_preview`` として正解
+#: (「こんばんは。今ちょうど夜中の0時半で、まだ起きてます。」) が入っており、
+#: セッション本体にも 80 ターン全てが残っていた。それでも検索は該当なしを返し、
+#: モデルは窓に残っていた最古の発話 (21 ターン目) を「最初」と答えた。
+#:
+#: 位置指定の質問には検索ではなく **境界ターンの直接取得** で答える。
+_POSITIONAL_SESSION_QUERY_RE = re.compile(
+    r"(一番最初|いちばん最初|最初に|冒頭|初めに|はじめに|書き出し"
+    r"|一番最後|いちばん最後|最後に|末尾|直近|さいご"
+    r"|\bfirst\b|\bearliest\b|\bbeginning\b|\blast\b|\blatest\b|\bend\b)",
+    re.IGNORECASE,
+)
+#: 末尾側 (最後/last) を指しているか。上のどちらにも当たらなければ先頭側。
+_POSITIONAL_TAIL_RE = re.compile(
+    r"(一番最後|いちばん最後|最後に|末尾|直近|さいご|\blast\b|\blatest\b|\bend\b)",
+    re.IGNORECASE,
+)
+#: 境界ターンとして返す user 発話の件数。1 件だと「最初の方に何を話したか」の
+#: ような幅のある問いに答えられず、多すぎると窓を圧迫する。
+_POSITIONAL_TURN_LIMIT = 3
+
+
+def _boundary_turns_answer(
+    manager: HistoryManager, session_id: str, query: str,
+) -> str | None:
+    """位置指定の自己参照質問に、セッションの境界ターンで直接答える。
+
+    位置指定でない / セッションが取れない / user 発話が無い場合は ``None`` を
+    返し、呼出側は従来どおり「該当なし」に落ちる。
+
+    ``role`` は user に限る: 「私が最初に話しかけた内容」に対して assistant の
+    応答を混ぜると、どちらが誰の発言か曖昧なまま「最初の発言」として提示される。
+    """
+    if not _POSITIONAL_SESSION_QUERY_RE.search(query):
+        return None
+    try:
+        session = manager.get_session(session_id)
+    except Exception as e:  # pragma: no cover - 履歴 I/O 失敗は従来経路へ
+        logger.warning("Boundary turn lookup failed for %s: %s", session_id, e)
+        return None
+    if session is None:
+        return None
+    user_turns = [
+        (i, t) for i, t in enumerate(session.turns)
+        if t.get("role") == "user" and (t.get("content") or "").strip()
+    ]
+    if not user_turns:
+        return None
+
+    tail = bool(_POSITIONAL_TAIL_RE.search(query))
+    picked = (
+        user_turns[-_POSITIONAL_TURN_LIMIT:] if tail
+        else user_turns[:_POSITIONAL_TURN_LIMIT]
+    )
+    where = "最後" if tail else "最初"
+    lines = [
+        SEARCH_HISTORY_CURRENT_SESSION_HEADER,
+        f"[この会話の{where}の user 発話 {len(picked)} 件 "
+        f"(全 {len(session.turns)} ターン中)]",
+    ]
+    for idx, turn in picked:
+        content = (turn.get("content") or "").strip()
+        preview = content if len(content) <= 200 else content[:200] + "…"
+        lines.append(f"  turn#{idx} (user): {preview}")
+    logger.info(
+        "search_history answered a positional query from session boundaries "
+        "(session=%s, tail=%s, turns=%d)", session_id, tail, len(picked),
+    )
+    return "\n".join(lines)
+
 
 def _make_search_history(manager: HistoryManager):
     """search_history ツールハンドラを生成（HistoryManager をクロージャでバインド）"""
@@ -1275,6 +1355,15 @@ def _make_search_history(manager: HistoryManager):
                 if r.get("summary") or r.get("matched_turns")
             ]
             if not results:
+                # 位置指定の自己参照 (「この会話の一番最初に言ったこと」) は
+                # 逐語一致では構造的に当たらない。セッションが特定できている
+                # ときに限り、境界ターンを直接返す (_POSITIONAL_SESSION_QUERY_RE)。
+                boundary = (
+                    _boundary_turns_answer(manager, session_id, query)
+                    if session_id else None
+                )
+                if boundary:
+                    return boundary
                 return f"{SEARCH_HISTORY_NO_RESULTS_PREFIX}{query}"
 
             lines: list[str] = []
@@ -1372,6 +1461,16 @@ def register_builtin_tools(
         modes=["create"],
     )
 
+    # chat でも使える。read_file (ファイル全文) と list_directory (ツリー全体) は
+    # 既に chat 可なのに、**両者より読み取り範囲が狭い** search_code だけが
+    # create 限定だった。結果、chat で所在を問われたモデルには「全文を読む」か
+    # 「ツリーを列挙する」しか手が無い。
+    #
+    # 2026-08-16 ライブ監査ターン 19「このプロジェクトで LangChain はどこで
+    # 使われていますか？」: list_directory が 5,477 文字のツリーを返し、その
+    # 再 prefill で **218.6 秒** (当セッション最長) を消費したうえ、
+    # 「一覧は途中が省略されているため確認できません」で終わった。
+    # grep 1 回で済む質問だった。
     registry.register(
         name="search_code",
         func=search_code,
@@ -1380,7 +1479,7 @@ def register_builtin_tools(
             "pattern": {"type": "string", "description": "Regex pattern to search for"},
             "directory": {"type": "string", "description": "Directory to search in"},
         },
-        modes=["create"],
+        modes=["chat", "create"],
     )
 
     registry.register(

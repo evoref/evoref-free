@@ -52,10 +52,44 @@ class ShortTermMemoryStore:
         return notes
 
     @staticmethod
-    def save(notes: dict[str, MemoryNote], path: str | Path) -> None:
-        """`notes` を JSON ファイルに書き出す。親ディレクトリは自動作成。"""
+    def save(
+        notes: dict[str, MemoryNote],
+        path: str | Path,
+        *,
+        allow_empty: bool = False,
+    ) -> None:
+        """`notes` を JSON ファイルに書き出す。親ディレクトリは自動作成。
+
+        **空の STM で既存スナップショットを上書きしない** (``allow_empty`` で解除)。
+
+        ロードが何らかの理由で 0 件になった直後、SleepTimeWorker とシャットダウン
+        フックは無条件に保存する。結果、一度でも空で起動すると次の保存で
+        ディスク上の全ノートが消え、以後どれだけ再起動しても空のまま復帰しない
+        (自己増殖する取りこぼし)。
+
+        2026-08-16 ライブ監査での実際の進行:
+
+            23:38 Saved 0 notes    ← 空の STM がスナップショットを潰した
+            00:34 Loaded 0 notes   ← 当然 0 件で起動
+            00:34 Memory threshold calibration skipped: only 0 notes with embeddings
+            00:43〜 Step 2 STM: 0 hits (14 ターン連続)
+            → MemoryInjector budget=800 に対し used=0 が 40 ターン中 37 ターン
+
+        ``_note_from_dict`` の防御的読取 (links / cluster_id の KeyError 対策) は
+        「読めなくなる」側の再発を塞いだが、**読めなかった後に書き潰す**側は
+        素通しだった。保存側にもガードを置く。
+        """
         path = Path(path)
         data = ShortTermMemoryStore.serialize(notes)
+        if not data and not allow_empty:
+            existing = _peek_note_count(path)
+            if existing:
+                logger.warning(
+                    "Refusing to overwrite %s: in-memory STM is empty but the "
+                    "snapshot holds %d notes. Pass allow_empty=True to clear "
+                    "intentionally.", path, existing,
+                )
+                return
         atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
         logger.info("Saved %d notes to %s", len(data), path)
 
@@ -79,6 +113,24 @@ class ShortTermMemoryStore:
 # ──────────────────────────────────────────────────────────────────────────
 # private serialize / deserialize helpers (一行ずつ純粋関数として保つ)
 # ──────────────────────────────────────────────────────────────────────────
+
+
+def _peek_note_count(path: Path) -> int:
+    """スナップショットの件数だけを数える (空上書きガード用)。
+
+    ノート本体の 95% は埋め込みベクトルで実測 1.5MB になるが、この読取は
+    「保存しようとしている STM が空」のときにしか走らないので稀。読めない
+    ファイルは 0 扱いにして保存を通す (壊れたスナップショットに縛られない)。
+    """
+    try:
+        if not path.exists():
+            return 0
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return len(data) if isinstance(data, list) else 0
+    except Exception as e:  # pragma: no cover - 壊れたファイルは上書きを許す
+        logger.warning("Could not read existing STM snapshot %s: %s", path, e)
+        return 0
 
 
 def _note_to_dict(note: MemoryNote) -> dict:

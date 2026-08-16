@@ -312,9 +312,19 @@ def _init_memory(
     # URL/コマンド curation や fact 抽出が再起動前のノートを取りこぼす。
     # stm.load() はファイル未存在なら no-op。save とパスは完全一致させる。
     try:
-        stm.load(resolver.resolve_local("memory_dir") / "short_term_notes.json")
+        stm_path = resolver.resolve_local("memory_dir") / "short_term_notes.json"
+        stm.load(stm_path)
         if stm.notes:
             logger.info("STM loaded on startup: %d notes", len(stm.notes))
+        elif stm_path.exists():
+            # 「ファイルはあるのに 0 件」は異常系。ここを黙って通すと STM 検索・
+            # 閾値較正・記憶注入が揃って無言で死ぬ (2026-08-16 ライブ監査:
+            # 40 ターン中 37 ターンで注入 0 件)。成功時しかログが無かったため
+            # 起動ログからは正常と区別が付かなかった。
+            logger.warning(
+                "STM snapshot %s exists but yielded 0 notes; memory retrieval "
+                "and threshold calibration will be inert this run", stm_path,
+            )
     except Exception as e:
         logger.warning("STM load on startup skipped: %s", e)
 

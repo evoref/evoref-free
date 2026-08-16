@@ -654,7 +654,7 @@ class DeliberativeAgent:
     @staticmethod
     def _append_session_position_fact(
         messages: list[dict], conversation: list[dict] | None, query: str,
-        evicted_turns: int = 0,
+        evicted_turns: int = 0, session_head: str = "",
     ) -> str | None:
         """「この会話で最初/最後に言ったこと」を決定論的に確定して注記する。
 
@@ -669,13 +669,16 @@ class DeliberativeAgent:
         Args:
             evicted_turns: ワーキングメモリから押し出したメッセージ数。
                 0 より大きい = 窓の先頭は **会話の先頭ではない** ため、
-                ``first`` の pin は行わない。ここを見ないと「窓で最初の発言」を
-                「会話で最初の発言」として ``確定事実`` の枠で断定してしまう
-                (実インシデント 2026-08-09 ライブ監査: 33 ターンの会話で
-                「一番最初に依頼したことは？」に窓の先頭 = 24 番目の質問を
+                窓から拾った値で ``first`` を pin してはいけない。ここを見ないと
+                「窓で最初の発言」を「会話で最初の発言」として ``確定事実`` の枠で
+                断定してしまう (実インシデント 2026-08-09 ライブ監査: 33 ターンの
+                会話で「一番最初に依頼したことは？」に窓の先頭 = 24 番目の質問を
                 回答。切り詰め注記は併記されていたのに、``確定事実`` の方が
                 強く効いて矛盾した回答になった)。``last`` は窓の末尾が常に
                 会話の末尾なので影響を受けない。
+            session_head: セッションで最初に届いた user 発話
+                (``WorkingMemory.session_first_user_turn``)。押し出し後でも
+                これがあれば ``first`` を決定論で確定できる。
 
         Returns:
             注記した位置種別 ("first" / "last")。対象外なら None。
@@ -684,10 +687,37 @@ class DeliberativeAgent:
         if position is None:
             return None
         if position == "first" and evicted_turns > 0:
+            head = (session_head or "").strip()
+            if head and head != query.strip():
+                # 押し出されていても、会話の先頭は WorkingMemory が 1 件だけ
+                # 保持している。並び順で決まる事実なので検索にもモデルの読解にも
+                # 委ねない。
+                #
+                # 実インシデント (2026-08-16 ライブ監査 ターン34): 正解
+                # 「おはよう。今朝はけっこう冷え込んでるね…」は [参考情報 2] として
+                # **プロンプトに載っていた** のに、併記された切り詰め注記が勝ち、
+                # 窓の先頭 (「SaaS の解約率を…」) を「確認できる範囲での最古」と
+                # して答えた。注記は「確定できない」と言い切るので、根拠が
+                # 隣にあっても採用されない。
+                logger.info(
+                    "Session position fact pinned (first) from the retained "
+                    "session head despite %d evicted message(s)", evicted_turns,
+                )
+                append_to_last_user(
+                    messages,
+                    f"\n\n確定事実: この会話でユーザーが最初に送ったメッセージは"
+                    f"「{head}」である。これは会話の並び順から機械的に確定した値"
+                    f"なので、この値をそのまま答えること。"
+                    f"(この会話の冒頭 {evicted_turns} 件は文脈の上限を超えて"
+                    f"表示できていないが、最初の発言はこの値で確定している。"
+                    f"上の値を答えとして述べること)",
+                    separator="",
+                )
+                return "first"
             logger.info(
                 "Session position fact skipped: history truncated "
-                "(%d messages evicted); the window head is not the "
-                "conversation head", evicted_turns,
+                "(%d messages evicted) and no retained session head; "
+                "the window head is not the conversation head", evicted_turns,
             )
             # 黙って降りると、視界の先頭を「会話の先頭」として断定する。
             # 実インシデント (2026-08-14 ライブ監査 ターン19): 19 件が窓外に
@@ -850,6 +880,7 @@ class DeliberativeAgent:
         tool_judge_task: "asyncio.Task | None" = None,
         session_id: str = "",
         evicted_turns: int = 0,
+        session_head: str = "",
     ) -> tuple[str | None, str | None, str | None, bool | None, str | None]:
         """ツール判定 → 実行 → messages へのツール結果注入を一括で行う。
 
@@ -876,7 +907,7 @@ class DeliberativeAgent:
         # 旧セッションのヒットを引いて誤答)。答えが決定論で出ている以上、
         # ツール結果は誤答の材料にしかならない。
         if self._append_session_position_fact(
-            messages, conversation, query, evicted_turns,
+            messages, conversation, query, evicted_turns, session_head,
         ):
             if tool_judge_task is not None and not tool_judge_task.done():
                 tool_judge_task.cancel()
@@ -1022,6 +1053,7 @@ class DeliberativeAgent:
         tool_judge_task: "asyncio.Task | None" = None,
         session_id: str = "",
         evicted_turns: int = 0,
+        session_head: str = "",
     ) -> DeliberativeResponse | AsyncIterator[str]:
         """Deliberative 層で LLM 推論を実行
 
@@ -1054,7 +1086,7 @@ class DeliberativeAgent:
         ) = await self._judge_and_execute_tool(
             query, mode, conversation, messages, llm_client, state, on_step,
             tool_judge_task=tool_judge_task, session_id=session_id,
-            evicted_turns=evicted_turns,
+            evicted_turns=evicted_turns, session_head=session_head,
         )
 
         # MDP トレース: tool 判定/実行を 1 step エピソードとして記録する。

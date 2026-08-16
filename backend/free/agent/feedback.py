@@ -267,6 +267,55 @@ WEAK_CORRECTION_PATTERNS_EN = [
     re.compile(r"\bit'?s\s+.{0,15}\bagain\b", re.IGNORECASE),
 ]
 
+# ── 記録との食い違いの指摘 (2 条件の AND) ────────────────────────────
+#
+# 「アシスタントの言い分」と「自分が言ったこと」が食い違うと指摘する形は、
+# 誤りを名指す語 (違う / 間違い / 訂正) を **一つも含まない** ことがある。
+# 実インシデント (2026-08-16 ライブ監査 ターン39):
+#   「えっ、私が紅茶派って言った？私はコーヒーを1日3杯飲むって言ったはずだけど。
+#    どっちが正しい？」
+# 応答自体は正しく訂正できたのに、学習側は correction=False /
+# correction_detected_by=null で取りこぼした (40 ターン中 訂正シグナル 0 件)。
+#
+# 単独ではどちらも一般語法なので **両方** を要求する。片方だけだと
+# 「私が言ったとおりに実装して」(前者のみ) や
+# 「Python と Go はどっちが正しい書き方ですか」(後者のみ) を巻き込む。
+#: (a) ユーザーが「自分は何と言ったか」を引き合いに出す。
+_USER_STATED_REF_RE = re.compile(
+    r"(?:私|僕|俺|自分)(?:が|は|の).{0,24}?"
+    r"(?:言(?:った|いました|ってた|ってました)|話(?:した|しました)"
+    r"|伝え(?:た|ました))",
+)
+#: (b) 記録との食い違いを述べる / どちらが正しいかを問う。
+_RECORD_DIVERGENCE_RE = re.compile(
+    r"はず(?:だけど|ですけど|ですが|だが|なんだけど|なんですけど)"
+    r"|どっち(?:が|は)?\s*正し|どちら(?:が|は)?\s*正し"
+    r"|(?:って|と)言(?:った|いました)(?:っけ|か)?[?？]",
+)
+
+_USER_STATED_REF_RE_EN = re.compile(
+    r"\bi\s+(?:said|told\s+you|mentioned)\b", re.IGNORECASE,
+)
+_RECORD_DIVERGENCE_RE_EN = re.compile(
+    r"\bwhich\s+(?:one\s+)?is\s+(?:right|correct)\b"
+    r"|\bdid\s+i\s+(?:say|tell)\b"
+    r"|\bi\s+(?:said|told\s+you)\b.{0,30}\b(?:though|but)\b",
+    re.IGNORECASE,
+)
+
+
+def cites_record_divergence(query: str) -> bool:
+    """「自分はこう言ったはず」と記録の食い違いを指摘しているか (純粋関数)。
+
+    誤りを名指す語を含まない訂正を拾うための 2 条件 AND
+    (:data:`_USER_STATED_REF_RE` / :data:`_RECORD_DIVERGENCE_RE` の説明を参照)。
+    """
+    stated = select_locale_variant(_USER_STATED_REF_RE, _USER_STATED_REF_RE_EN)
+    diverge = select_locale_variant(
+        _RECORD_DIVERGENCE_RE, _RECORD_DIVERGENCE_RE_EN,
+    )
+    return bool(stated.search(query) and diverge.search(query))
+
 # 応答の失敗マーカー (meta_cognitive の最終応答フォーマット "- [failed] ...")
 _FAILED_MARKER_RE = re.compile(r"(?:^|\n)\s*-\s*\[failed\]", re.IGNORECASE)
 _DONE_MARKER_RE = re.compile(r"(?:^|\n)\s*-\s*\[done\]", re.IGNORECASE)
@@ -698,12 +747,18 @@ class FeedbackCollector:
 
         Returns:
             (correction_text, detected_by): 検出テキストと検出元
-            detected_by: "hardcoded" | "prev_failed" | "same_target" | None
+            detected_by: "hardcoded" | "record_divergence" | "prev_failed"
+            | "same_target" | None
         """
         # 1. ハードコードパターン（高確度、優先）
         for pattern in CORRECTION_PATTERNS:
             if pattern.search(query):
                 return query, "hardcoded"
+
+        # 1a. 記録との食い違いの指摘。誤りを名指す語を一つも含まない訂正を
+        # 2 条件 AND で拾う (``cites_record_divergence`` の説明を参照)。
+        if cites_record_divergence(query):
+            return query, "record_divergence"
 
         # 1b. create モードの実行結果報告。訂正対象 (直前ターン) が無い最初の
         # ターンでは新規の質問/依頼である可能性が高く、文末が新規依頼の完結形

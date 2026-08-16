@@ -106,7 +106,8 @@ async def backfill_fact_embeddings(
             if is_cancelled is not None and is_cancelled():
                 break
             batch = targets[start:start + _BATCH_SIZE]
-            texts = [(f.object or "")[:_MAX_CHARS] for f in batch]
+            # 正規化済みの命題があればそちらを埋め込む (検索も命題で当たる)。
+            texts = [(f.text or "")[:_MAX_CHARS] for f in batch]
             try:
                 vecs = await embedder.embed(texts, is_query=False)
             except Exception as exc:

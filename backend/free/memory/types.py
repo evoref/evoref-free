@@ -154,6 +154,22 @@ class SemanticFact:
     type: FactType
     scope: str  # "global" or "project:<project_id>"
 
+    statement: str | None = None
+    """正規化済みの命題。``None`` は未正規化 (``object`` をそのまま使う)。
+
+    ``object`` には発話原文がそのまま入る (抽出器は原文を切り出すだけ)。
+    そのため ``[関連する記憶]`` には会話の足場や一人称がついた行が並び、
+    値としての比較もできない。実データ (2026-08-16 監査時点):
+
+        mem.personal.user states:
+        「コーヒー派？紅茶派？私はコーヒーを1日3杯は飲んじゃう。」
+
+    ここに正規化後の命題を **別フィールドで** 持ち、``object`` は証拠として
+    残す。上書きしないのは、正規化が誤ったときに復旧できるようにするため
+    (未検証の生成物が権威ある事実として永続化される事故を、このリポジトリは
+    繰り返し踏んでいる)。消費側は ``fact.text`` を使う。
+    """
+
     # ── メタ ────────────────────────────────────────────────────────────
     subject_aliases: list[str] = field(default_factory=list)
     scope_locked: bool = False
@@ -216,6 +232,16 @@ class SemanticFact:
 
     # ── ヘルパ ──────────────────────────────────────────────────────────
 
+    @property
+    def text(self) -> str:
+        """提示・比較・埋め込みに使う本文。
+
+        正規化済みの :attr:`statement` があればそれを、無ければ ``object``
+        (発話原文) を返す。正規化が入っていない環境・古いファクトでも従来と
+        同じ値になるので、消費側はこれを使えば分岐が要らない。
+        """
+        return self.statement or self.object
+
     @staticmethod
     def new_id() -> str:
         """新規ファクト用の短縮 ID を生成する"""
@@ -252,6 +278,7 @@ _KNOWN_FACT_KEYS: frozenset[str] = frozenset({
     "subject_aliases",
     "predicate",
     "object",
+    "statement",
     "type",
     "scope",
     "scope_locked",
@@ -298,6 +325,7 @@ def serialize_fact(fact: SemanticFact) -> dict[str, Any]:
         "subject_aliases": list(fact.subject_aliases),
         "predicate": fact.predicate,
         "object": fact.object,
+        "statement": fact.statement,
         "type": fact.type,
         "scope": fact.scope,
         "scope_locked": fact.scope_locked,
@@ -354,6 +382,7 @@ def deserialize_fact(d: dict[str, Any]) -> SemanticFact:
         subject_aliases=list(d.get("subject_aliases", [])),
         predicate=d["predicate"],
         object=d["object"],
+        statement=d.get("statement"),
         type=d["type"],
         scope=d["scope"],
         scope_locked=bool(d.get("scope_locked", False)),

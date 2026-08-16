@@ -4,6 +4,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+#: 1 メッセージあたりの推定トークン数 (``working_max_turns`` と
+#: ``working_max_tokens`` のどちらが先に効くかの判定にのみ使う概算)。
+#: 2026-08-16 ライブ監査の実セッション (80 メッセージ / 7,264 tok) の実測値。
+_TYPICAL_TOKENS_PER_MESSAGE = 91
+
 
 # FadeMem タグ別半減期の有効タグ集合
 # `backend.free.memory.types.FactType` と同期させること。
@@ -197,6 +202,13 @@ class SemMemConflictConfig(BaseModel):
     # pinned / project / policy タグを含むグループは対象外 (チャット回答でのみ解決)。
     # default_mode=manual でも有効 (無効化は 0 を指定)。
     pending_auto_resolve_days: float = Field(default=3.0, ge=0.0)
+    # 同 (subject, predicate) のファクトを「同じ属性についての言い直し」とみなす
+    # 最小コサイン類似度。subject は属性単位へ分割される設計だが、トリガ辞書に
+    # 無い属性は mem.personal.user へフォールバックするため、飲み物の好みと
+    # 食べ物の好みが同じスロットに同居して偽の競合になる (2026-08-16 ライブ監査)。
+    # 実測では真の競合 0.796〜0.963 / 偽の競合 0.316〜0.418 で完全に分離する。
+    # 0 で無効 (従来どおり subject+predicate だけで束ねる)。
+    attribute_similarity_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     chat_review: ConflictChatReviewConfig = Field(
         default_factory=ConflictChatReviewConfig,
     )
@@ -491,4 +503,46 @@ class MemoryConfig(BaseModel):
             )
         if errors:
             raise ValueError("; ".join(errors))
+        return self
+
+    @model_validator(mode="after")
+    def warn_turn_cap_binds_before_token_cap(self) -> "MemoryConfig":
+        """ターン数上限がトークン上限より先に効く構成を warning で通知する。
+
+        ``working_max_turns`` は「無圧縮のハード eviction」で、超過すると
+        ``working_evict_block`` 件がまとめて窓から消える。一方
+        ``working_max_tokens`` 側は ``compress_turn`` による段階的縮退なので、
+        設計上はトークン側を主たる制約にする (``working_max_turns`` の
+        コメント参照)。
+
+        ところが ``working_max_tokens`` だけを引き上げてターン数を既定の
+        まま置くと precedence が反転し、**トークン予算に余裕があるのに
+        ターン数で足切りされる**。窓の先頭が動く回数が増え、llama-server の
+        接頭辞 KV キャッシュが毎回無効化されてプロンプト全体が再 prefill される。
+
+        2026-08-16 ライブ監査 (Qwen3.8-27B / n_ctx 8192 / 40 ターン) の実測:
+        ``working_max_turns=30`` + ``working_max_tokens=4096`` の構成では窓が
+        25→27→29→25 と 3 ターン周期で振動し、押し出しターン中央値 141.4 秒 /
+        非押し出し 42.7 秒。同セッションの発話長で ``working_max_turns=48`` に
+        すると先頭が動く回数は 9 → 2 に減り、保持メッセージ数の平均も
+        22.9 → 28.4 へ増えた (両立する)。
+
+        エラーにはしない: 短い発言ばかりの用途では意図的にターン数で
+        抑えたい場合もある。
+        """
+        from backend.log_config import get_logger
+
+        estimated = self.working_max_turns * _TYPICAL_TOKENS_PER_MESSAGE
+        if estimated < self.working_max_tokens:
+            get_logger("config").warning(
+                "memory.working_max_turns=%d binds before "
+                "working_max_tokens=%d (%d msgs x ~%d tok = %d). The turn cap "
+                "evicts uncompressed and shifts the prompt prefix, which "
+                "invalidates the llama-server prefix KV cache and forces a full "
+                "re-prefill. Raise working_max_turns to at least %d so the "
+                "token cap binds first.",
+                self.working_max_turns, self.working_max_tokens,
+                self.working_max_turns, _TYPICAL_TOKENS_PER_MESSAGE, estimated,
+                -(-self.working_max_tokens // _TYPICAL_TOKENS_PER_MESSAGE),
+            )
         return self

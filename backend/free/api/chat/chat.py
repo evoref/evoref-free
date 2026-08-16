@@ -40,7 +40,7 @@ from backend.free.api.chat.chat_service import (
     build_chat_messages, build_semmem_injection, convert_file_contexts,
     ensure_base_model_health,
     collect_pending_conflicts, ensure_llm_client, prepare_memory_context,
-    run_search_pipeline, session_evicted_turns,
+    run_search_pipeline, session_evicted_turns, session_first_user_message,
 )
 from backend.free.api.chat.chat_streaming import (
     _cancel_flags,
@@ -1108,6 +1108,7 @@ async def _dispatch_deliberative(
                 # 窓の先頭が会話の先頭かを deliberative 側で判定するために渡す
                 # (``_append_session_position_fact`` 参照)。
                 evicted_turns=session_evicted_turns(state),
+                session_head=session_first_user_message(state),
             ))),
             media_type="text/event-stream",
         )
@@ -1125,6 +1126,7 @@ async def _dispatch_deliberative(
             tool_judge_task=tool_judge_task,
             escalated_from=escalated_from,
             evicted_turns=session_evicted_turns(state),
+            session_head=session_first_user_message(state),
         )
 
 

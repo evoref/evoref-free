@@ -22,6 +22,11 @@ if TYPE_CHECKING:
 
 logger = get_logger("memory.scheduler")
 
+#: Trigger B のアイドル待ちの下限 (秒)。上限超過で残り 0 になっても、応答直後に
+#: 0 秒で起きると生成がまだ in-flight のまま ``chat_in_flight`` で弾かれ、次の応答が
+#: 来るまで再試行できない (実質デッドロック)。生成が畳まれる分の余裕を必ず取る。
+_FULL_MIN_WAIT_SEC = 30.0
+
 
 def _emit_bg_task_outcome(
     debug_logger: "DebugLogger | None",
@@ -65,6 +70,22 @@ class SleepTimeScheduler:
         self._local_tz = self._resolve_local_tz(self.local_tz_name)
         # Trigger B: Full sleep-time のアイドル閾値
         self.full_idle_minutes: float = learning.get("full_idle_minutes", 10)
+        # Trigger B: アイドルを待ち続けた場合の上限。会話が途切れずに続くと
+        # ``on_response_sent`` が毎ターン タイマーを張り直すため、Full は
+        # **一度も走らない**。実測 (2026-08-16 ライブ監査、40 ターン / 53 分):
+        # full の起動試行 39 件が全て cancelled=True / skipped_reason=debounced
+        # で、実行 0 回。``memory.facts.trigger: idle_full_only`` と噛み合って
+        # 40 ターン分のファクトが 1 件も SemMem へ入らず、「覚えておいて」に
+        # 「記憶しました」と答えているのに [関連する記憶] は空のままだった。
+        # 最後に Full が完了してからこの時間を超えたら、ユーザーが会話中でも
+        # 1 回走らせる (書込は従来どおり SleepTimeWorker = 専有スロット上なので
+        # チャットの KV とは分離されている)。0 以下で無効。
+        self.full_max_defer_minutes: float = learning.get(
+            "full_max_defer_minutes", 30,
+        )
+        #: 最後に Full を **実行** した時刻 (``time.time()``、``_started_at`` と
+        #: 同じ時計)。0 は未実行。
+        self._last_full_run: float = 0.0
         # Trigger C: Level 1 のアイドル閾値（独立常駐ループから参照）
         self.level1_idle_minutes: float = learning.get("level1_idle_minutes", 30)
         # Trigger C: Level 1 ループの再評価間隔（秒）
@@ -312,6 +333,68 @@ class SleepTimeScheduler:
             )
             trace_id_var.reset(token)
 
+    def _full_deferred_seconds(self) -> float:
+        """Full を待たせ続けている秒数 (未実行ならプロセス起動から)。"""
+        since = self._last_full_run or self._started_at
+        return max(0.0, time.time() - since)
+
+    def _full_defer_expired(self) -> bool:
+        """Full を待たせ続けた時間が上限を超えたか。
+
+        会話が途切れないと ``on_response_sent`` が毎ターン Trigger B のタイマーを
+        張り直すため、アイドル待ちだけでは Full が一度も走らない。最後の実行から
+        ``full_max_defer_minutes`` を超えたら、ユーザーがアクティブでも 1 回だけ
+        通す。未実行 (プロセス起動後 0 回) の場合は起動時刻を起点にする。
+        """
+        limit = self.full_max_defer_minutes
+        if limit <= 0:
+            return False
+        waited_min = self._full_deferred_seconds() / 60
+        if waited_min < limit:
+            return False
+        logger.info(
+            "Trigger B: running despite a recently active user "
+            "(deferred for %.1f min >= %.1f min limit)", waited_min, limit,
+        )
+        return True
+
+    def _full_wait_seconds(self) -> float:
+        """Trigger B のアイドル待ち秒数。
+
+        素朴に ``full_idle_minutes`` だけ待つと、会話が続く限り
+        ``on_response_sent`` が毎ターン待機をキャンセルして張り直すため、
+        **待機が一度も完走せず** 上限判定 (``_full_defer_expired``) に到達しない。
+        上限までの残り時間で待機を打ち切ることで、上限が近づくほど待機が短くなり、
+        ユーザーが応答を読んでいる数十秒の隙間で完走できるようになる。
+
+        下限 :data:`_FULL_MIN_WAIT_SEC` を置くのは、応答直後に 0 秒で起きると
+        まだ生成が in-flight のまま ``chat_in_flight`` で弾かれ、次の応答まで
+        再試行できないため (実質デッドロック)。下限は **残り時間の側にだけ**
+        掛ける — 設定された ``full_idle_minutes`` より長く待つことは無い
+        (テストや極小構成が 0.6 秒指定で 30 秒待たされないように)。
+        """
+        idle_s = float(self.full_idle_minutes) * 60
+        limit = self.full_max_defer_minutes
+        if limit <= 0:
+            return idle_s
+        remaining = max(0.0, limit * 60 - self._full_deferred_seconds())
+        return min(idle_s, max(_FULL_MIN_WAIT_SEC, remaining))
+
+    def _chat_in_flight(self) -> bool:
+        """チャット生成が実行中か。
+
+        ``is_user_active`` は「直近 ``active_minutes`` に入力があった」も含むが、
+        こちらは **今まさにベースモデルが生成中か** だけを見る。上限超過での
+        強制実行でも、生成中に割り込むことはしない (同一 llama-server 上で
+        スロットとバッチを奪い合うため)。
+        """
+        if self._llm_client is None:
+            return False
+        try:
+            return int(getattr(self._llm_client, "in_flight_chat_count", 0)) > 0
+        except Exception:
+            return False
+
     async def _schedule_full(self) -> None:
         """Trigger B: full_idle_minutes 後に Full 版を実行する。
 
@@ -337,15 +420,24 @@ class SleepTimeScheduler:
         executed = False
         skipped_reason: str | None = None
         try:
-            await asyncio.sleep(self.full_idle_minutes * 60)
+            await asyncio.sleep(self._full_wait_seconds())
 
             if self._worker is None:
                 success = True
                 skipped_reason = "no_worker"
                 return
 
-            # ユーザーがアクティブなら実行しない
-            if self.is_user_active():
+            # 生成中は上限超過でも割り込まない (同一 llama-server 上でスロットと
+            # バッチを奪い合う)。次の応答で再スケジュールされる。
+            if self._chat_in_flight():
+                logger.info("Trigger B: skipped, a chat generation is in flight")
+                success = True
+                skipped_reason = "chat_in_flight"
+                return
+
+            # ユーザーがアクティブなら実行しない。ただし待ち続けて上限を超えた
+            # 場合は 1 回走らせる (self.full_max_defer_minutes の説明を参照)。
+            if self.is_user_active() and not self._full_defer_expired():
                 logger.info("Trigger B: skipped, user is active")
                 success = True
                 skipped_reason = "user_active"
@@ -354,6 +446,7 @@ class SleepTimeScheduler:
             logger.info("Trigger B: starting Full sleep-time update")
             self._running = True
             executed = True
+            self._last_full_run = time.time()
             # sleep-time の LLM ステージを回すクライアント。ベースを
             # AuxClient 越しに使う。アイドル窓かつ専有スロットなので
             # 不変則 (CLAUDE.md §6 #1 / docs/c_14 §1.1) を満たす。未接続なら

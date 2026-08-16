@@ -492,6 +492,14 @@ rag:
     # **較正済み relevance と同じ棒**を使う (「関連性の棒を越えたチャンクは集計判定が
     # low でも残す」)。manual では本値をそのまま使う。0.0 は「従来どおりクエリ単位の
     # 全件破棄」で、auto でも 0.0 が優先される。
+    # ⚠ フロアは **集計判定 (quality) と独立に常時**掛かる。quality は merged 全体に
+    #   対する単一スカラで「セットとして使えるか」しか見ず、top1 が強ければ high に
+    #   なるため、以前は同じ検索の 2 位以下が無関連でも全通しだった。
+    #   実測 (2026-08-16 / chat 23 ターン): high 12 / medium 7 / low 4 のうち
+    #   フロアが掛かったのは low の 4 ターンだけで、[参考情報] の 67% (58/87 件)・
+    #   73% (8,711/11,904 tok) が別セッションの生ログ (mdp_trace) で埋まっていた。
+    #   それらの対クエリ類似度は平均 0.119 で、較正済み閾値 0.259 を 1 件も
+    #   超えていない。閾値の分離性能自体は健全 (関連 0.467 / 無関連 0.196 以下)。
     low_quality_keep_floor: 0.40
     # 品質3閾値 (rag.relevance_threshold / support_threshold / confidence_threshold)
     # の決め方。
@@ -694,6 +702,12 @@ memory:
     # pinned / project / policy を含むグループは対象外 (チャット回答でのみ解決)。
     # default_mode: manual でも有効。0 で無効。
     pending_auto_resolve_days: 3.0
+    # 同 (subject, predicate) を「同じ属性についての言い直し」とみなす最小類似度。
+    # subject は属性単位へ分割される設計だが、トリガ辞書に無い属性は
+    # mem.personal.user へフォールバックするため、飲み物の好みと食べ物の好みが
+    # 同じスロットに同居して偽の競合になる。実測では真の競合 0.796〜0.963 /
+    # 偽の競合 0.316〜0.418 で完全に分離する。0 で無効。
+    attribute_similarity_threshold: 0.55
     # pending 競合のチャット確認フロー。チャット注入で AI がユーザーに確認し、
     # 回答を LLM (conflict_chat_judge) で判定して即時解決する。
     chat_review:
@@ -723,6 +737,17 @@ memory:
   # system プロンプト以降まるごと無効化される (実測: prompt eval 2,898 tok で 27.7 秒、
   # decode は 7.6 tok/s と正常)。まとめて押し出すと次に上限へ達するまで先頭が動かず、
   # 再 prefill の回数が約 1/3 になる。代償は保持ターン数が平均 max_turns の約 90% になること。
+  #
+  # ⚠ working_max_tokens だけを引き上げて working_max_turns を既定のまま置かないこと。
+  #   ターン数側が先に効く構成になると (目安: max_turns * 91tok < max_tokens)、
+  #   トークン予算に余裕があるのにターン数で足切りされ、窓の先頭が動く回数が増える。
+  #   2026-08-16 ライブ監査 (Qwen3.8-27B / n_ctx 8192 / 40 ターン) の実測では
+  #   30 turns + 4096 tokens の構成で窓が 25→27→29→25 と 3 ターン周期で振動し、
+  #   押し出しターン中央値 141.4 秒 / 非押し出し 42.7 秒 (3.1 倍)。押し出しは
+  #   全ターンの 22.5% でしか起きないのに LLM 総時間の 48% を占めていた。
+  #   同条件で working_max_turns を 48 にすると先頭が動く回数は 9 → 2 に減り、
+  #   保持メッセージ数の平均は 22.9 → 28.4 へ増えた (遅延と保持量が同時に改善)。
+  #   起動時に precedence が反転していると WARNING を出す。
   working_max_tokens: 2048        # ワーキングメモリの最大トークン数
   # 推奨: 512〜(context_size * 0.6) の範囲で設定
   # | context_size | 上限目安 | 推奨値 |
@@ -840,6 +865,9 @@ learning:
     create: 20
   # アイドル判定タイマー
   full_idle_minutes: 10           # Trigger B: sleep-time Full の起動アイドル時間（分）
+  full_max_defer_minutes: 30      # Trigger B: アイドルを待つ上限（分）。会話が続くと
+                                  # 毎ターン タイマーが張り直されて Full が一度も走らない
+                                  # ため、この時間を超えたら会話中でも 1 回実行する。0 で無効
   level1_idle_minutes: 30         # Trigger C: Level 1 の起動アイドル時間（分）
   level1_recheck_interval_sec: 60 # Level 1 ループ再評価間隔（秒）
   priority_threshold_ratio: 0.5   # 優先 Level 1 の経験数閾値緩和率

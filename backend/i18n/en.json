@@ -498,6 +498,9 @@
     "edition": {
       "downgrade": "⚠ Edition downgraded ({old} -> {new}). Features exclusive to the previous edition are now disabled, but all saved data is preserved.",
       "lora_unavailable": "⚠ LoRA adapter and Level 2 learning are unavailable in Free edition. LoRA data is preserved locally, but recovery may be difficult if the base model is changed."
+    },
+    "llm": {
+      "response_truncated": "\n\n> ⚠ Output token limit reached; this response is cut off. Ask to continue if you need the rest."
     }
   }
 }

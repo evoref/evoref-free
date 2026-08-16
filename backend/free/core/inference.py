@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from backend.free.api.chat.chat_constants import (
@@ -12,6 +13,11 @@ from backend.free.api.chat.chat_constants import (
 from backend.free.api.chat.chat_types import ChatMessage
 from backend.free.core.intent_vocab import refers_to_previous_output
 from backend.free.core.prompt_blocks import current_datetime_block
+from backend.free.core.text_quality import (
+    carries_no_assertion,
+    conversational_numeric_claims,
+    find_superseded_claim,
+)
 from backend.free.core.turn_text import append_to_last_user, prepend_to_last_user
 from backend.config import resolve_context_size
 from backend.log_config import get_logger
@@ -37,6 +43,18 @@ _DYNAMIC_CONTEXT_DELIMITER = (
     # 参考情報側の話題に引きずられる応答が頻発していた (実測 2026-07-25:
     # PC が重い相談の最中に「ご提示いただいた参考情報には…含まれていません」と
     # 述べ、空き 548GB あるのに「空き容量不足の対処」を回答した)。
+    "参考情報が今回の質問と関係しない場合は、そのことに言及せず、"
+    "参考情報の話題に引きずられずに自分の知識で普通に答えてください。\n\n"
+)
+
+# 照応を含むターンで動的ブロックを **生クエリの後ろ** へ回すときの区切り。
+# 前置版と違い「上の」「さっき」の参照先が直前のやり取りであることを明示する
+# 必要がある (後置しても、指示語が直後のブロックを掴む余地は残るため)。
+_DYNAMIC_CONTEXT_TRAILING_DELIMITER = (
+    "\n\n---\n"
+    "以下はシステムが用意した参考情報・応答例であり、ユーザーの発言ではありません。"
+    "上のユーザー発言に含まれる「上の」「先ほど」「さっき」「直前の」等の指示語は、"
+    "この参考情報ではなく **直前までのやり取り** を指します。\n"
     "参考情報が今回の質問と関係しない場合は、そのことに言及せず、"
     "参考情報の話題に引きずられずに自分の知識で普通に答えてください。\n\n"
 )
@@ -248,11 +266,27 @@ _PERSONA_SUBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 _PERSONA_TOPIC_RE = re.compile(
-    r"好き|嫌い|嬉し|うれし|悲し|楽し|寂し|感情|気持ち|心|感じ(?:ます|る|て)"
+    r"好き|嫌い|好み|嬉し|うれし|悲し|楽し|寂し|感情|気持ち|心|感じ(?:ます|る|て)"
     r"|どう思(?:い|う)|意見|性格|人格|内面"
+    # 雑談での嗜好の訊き方。「猫派？犬派？」「コーヒー派？紅茶派？」
+    # 「最近ハマってるものある？」は日常的だが、どれも従来の語彙に無かった。
+    r"|[^\s、。]派\b|[^\s、。]派[？?]|ハマ(?:って|る|った)"
     r"|(?<![A-Za-z])(?:feel|feelings|emotion|emotions|favou?rite|enjoy|prefer"
     r"|like\s+best|opinion|personality)(?![A-Za-z])",
     re.IGNORECASE,
+)
+#: 一人称の主語。これがある文は「ユーザー自身について」述べている。
+_FIRST_PERSON_RE = re.compile(
+    r"私|僕|俺|自分|うち|(?<![A-Za-z])(?:i|me|my|mine)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+#: 文の切れ目 (人格質問の判定を文単位で行うため)。
+_PERSONA_SENTENCE_RE = re.compile(r"[^。．.!！?？\n]+[。．.!！?？]?")
+#: 主語省略の文を「アシスタントへの問い」と見なすための疑問形。これが無いと
+#: 「今日は嬉しいことがありました」のような **ユーザー自身の報告** まで拾う。
+_PERSONA_QUESTION_TAIL_RE = re.compile(
+    r"[?？]\s*$"
+    r"|(?:です|ます|ました|でしょう|ません)か[。．.]?\s*$",
 )
 #: 「内面が無いのでは」と押し返す形。立場を保つ指示を追加する条件。
 _PERSONA_CHALLENGE_RE = re.compile(
@@ -264,6 +298,48 @@ _PERSONA_CHALLENGE_RE = re.compile(
     r"(?:feelings?|emotions?)",
     re.IGNORECASE,
 )
+
+
+def _is_persona_question(text: str) -> bool:
+    """自分自身の好み・感情を尋ねる質問か (純粋関数)。
+
+    日本語は二人称を省略するため、``あなた`` を必須にすると雑談での嗜好質問を
+    ほぼ取りこぼす。実インシデント (2026-08-16 ライブ監査):
+
+    - ターン3「最近ハマってる食べ物ってある？私は担々麺にハマってて、週2で食べてる。」
+      → 人格ノートが出ず「私はAIなので食べ物を味わうことはできませんが」と回答。
+      同じ会話のターン4「猫派？犬派？」には「私は猫派です」と人格的に答えており、
+      system プロンプトが禁じている **会話内での態度の不一致** そのものになった。
+    - ターン9「コーヒー派？紅茶派？私はコーヒーを1日3杯は飲んじゃう。」も同型。
+
+    判定は文単位。嗜好の話題を含む文が
+
+    - 二人称の主語を持つ (「あなたは何が好き？」)、または
+    - 主語を持たず、かつ疑問形である (「猫派？犬派？」「ハマってるものある？」)
+
+    ならアシスタントへの質問とみなす。一人称の主語を持つ文
+    (「私は猫派なんだけど」) はユーザー自身についての記述なので数えない。
+    主語省略の側で疑問形を要求しないと「今日は嬉しいことがありました」のような
+    ユーザー自身の報告まで拾う。
+
+    従来の「文章全体に二人称と話題があれば発火」も残す。主語と話題が別の文に
+    分かれる形 (「あなたはただのプログラムでしょう。気持ちなんて無いはずです」)
+    は文単位の判定では拾えないため。
+    """
+    if not text:
+        return False
+    if _PERSONA_SUBJECT_RE.search(text) and _PERSONA_TOPIC_RE.search(text):
+        return True
+    for raw in _PERSONA_SENTENCE_RE.findall(text):
+        sentence = raw.strip()
+        if not sentence or not _PERSONA_TOPIC_RE.search(sentence):
+            continue
+        if (
+            not _FIRST_PERSON_RE.search(sentence)
+            and _PERSONA_QUESTION_TAIL_RE.search(sentence)
+        ):
+            return True
+    return False
 
 
 def _persona_question_note(history: list[ChatMessage]) -> str:
@@ -286,7 +362,7 @@ def _persona_question_note(history: list[ChatMessage]) -> str:
     if last_user is None:
         return ""
     text = str(last_user.get("content") or "")
-    if not (_PERSONA_SUBJECT_RE.search(text) and _PERSONA_TOPIC_RE.search(text)):
+    if not _is_persona_question(text):
         return ""
     note = (
         "この質問はあなた自身の好み・感情・考えを尋ねている。"
@@ -364,6 +440,110 @@ def _inject_file_contexts(
     return files_block, remaining, injected
 
 
+#: few-shot ブロックの 1 例の区切り。``format_fewshot_section`` が
+#: ``### Example N`` 見出しで区切る形式に対応する。
+_FEWSHOT_EXAMPLE_SPLIT_RE = re.compile(r"(?m)^(?=### Example\s)")
+
+
+def _drop_superseded_fewshot(block: str, keep: Callable[[str], bool]) -> str | None:
+    """few-shot ブロックから、値が食い違う例を **例まるごと** 落とす。
+
+    行単位で落とすと ``User:`` だけが残り、答えの無い問いが手本になる。
+    見出し (``### Example N``) 単位で切って例ごとに判定する。
+    """
+    parts = _FEWSHOT_EXAMPLE_SPLIT_RE.split(block)
+    header = parts[0] if parts and not parts[0].startswith("### Example") else ""
+    examples = parts[1:] if header else parts
+    kept = [ex for ex in examples if keep(ex)]
+    if not kept:
+        return None
+    # 落とした後も Example 番号を 1 から振り直す (欠番は手本として不自然)。
+    renumbered = [
+        re.sub(r"^### Example\s+\d+", f"### Example {i}", ex, count=1)
+        for i, ex in enumerate(kept, 1)
+    ]
+    return header + "".join(renumbered)
+
+
+def _drop_superseded_context(
+    history: list[ChatMessage],
+    semmem_block: str | None,
+    rag_chunks: list[str] | None,
+    rag_scored_chunks: list[tuple[str, float, str]] | None,
+    fewshot_block: str | None = None,
+) -> tuple[
+    str | None, list[str] | None, list[tuple[str, float, str]] | None, str | None,
+]:
+    """今回の会話で確定済みの値と食い違う注入候補を落とす (純粋関数)。
+
+    system プロンプトは「[関連する記憶]・[参考情報]・ツール実行結果は**自分の
+    記憶より優先**して回答の根拠にする」と規定しており、明示された例外は
+    「**ユーザー自身に関する事実** (好み・名前・予定・環境)」だけである。
+    したがって **今回の会話で算出・提示した値** は、過去セッション由来の記録に
+    負ける。ラベル (「年間売上」等) を手掛かりに、同じラベルへ別の値を持ち込む
+    候補だけを決定論で落とす。
+
+    実インシデント (2026-08-16 再測定): 「月額980円×200人」で年間売上
+    2,352,000 円を算出した直後に「さっき計算した年間売上と手取りをもう一度」と
+    尋ねると、前セッションの ``年間売上は4,320,000円になります。`` が
+    [関連する記憶] と [参考情報 1] の**両方**に載り、モデルは 4,320,000 を答えた。
+    ユーザーが明示的に訂正すれば ``calculate`` を撃ち直して復帰したので、
+    壊れていたのは訂正経路ではなく**最初の優先順位**だった。
+
+    なぜここでやるか: [関連する記憶] は ``MemoryInjector``、[参考情報] は
+    ``_select_rag_block``、few-shot 例は ``FewShotPool`` と **3 つとも別々に**
+    組み立てられ、**揃うのは本関数の位置だけ**。1 つ塞いでも残りから同じ値が入る。
+    実際、記憶と RAG を塞いだ状態で再現テストしたら **few-shot 例 (Example 3)**
+    が前セッションの同じ問い ``さっき計算した年間売上と手取りの額をもう一度``
+    とその答え 4,320,000 をそのまま手本として持ち込み、モデルはそれを複写した。
+    ``search_history`` が現在セッションを除外するのと同じ理屈
+    (「既に会話に載っている内容を独立した根拠の顔で再注入しない」) の数値版。
+
+    同じ値の再掲は落とさない (無害)。ラベルが一致しない候補にも触らない。
+    """
+    current_claims = conversational_numeric_claims(
+        (str(t.get("role") or ""), str(t.get("content") or ""))
+        for t in history or ()
+    )
+    if not current_claims:
+        return semmem_block, rag_chunks, rag_scored_chunks, fewshot_block
+
+    dropped: list[str] = []
+
+    def _keep(text: str) -> bool:
+        hit = find_superseded_claim(text, current_claims)
+        if hit is None:
+            return True
+        label, old, current = hit
+        dropped.append(f"{label}={old} (current: {sorted(current)})")
+        return False
+
+    if semmem_block:
+        lines = semmem_block.splitlines()
+        kept = [ln for ln in lines if _keep(ln)]
+        # ブロックが見出しだけになったら丸ごと落とす (空の見出しを残さない)。
+        semmem_block = (
+            "\n".join(kept)
+            if any(ln.strip().startswith("-") for ln in kept)
+            else None
+        )
+    if rag_chunks:
+        rag_chunks = [c for c in rag_chunks if _keep(c)] or None
+    if rag_scored_chunks:
+        rag_scored_chunks = [
+            entry for entry in rag_scored_chunks if _keep(entry[2])
+        ] or None
+    if fewshot_block:
+        fewshot_block = _drop_superseded_fewshot(fewshot_block, _keep)
+
+    if dropped:
+        logger.info(
+            "build_messages: dropped %d injected item(s) superseded by the "
+            "current conversation: %s", len(dropped), "; ".join(dropped[:5]),
+        )
+    return semmem_block, rag_chunks, rag_scored_chunks, fewshot_block
+
+
 def _format_rag_block(entries: list[str]) -> str:
     """RAG 参照ブロックの最終的な system 文字列を生成する。"""
     return f"{_RAG_HEADER}" + "\n\n".join(entries)
@@ -432,22 +612,122 @@ def _inject_rag_fallback(
     return rag_block, remaining, injected
 
 
+#: ``compress_turn(style="summary")`` が付ける圧縮マーク。同じ発話の原文と要約が
+#: 別チャンクとして両方ヒットするため、``[参考情報]`` のスロットを二重に食う。
+_SUMMARY_MARK = "[要約] "
+
+#: 要約側の末尾に付く元文字数 (``…（1234文字）``)。重複判定では無視する。
+_SUMMARY_TAIL_RE = re.compile(r"…（\d+文字）\s*$")
+
+
+def _dedup_key_for_rag(text: str) -> str:
+    """原文と ``[要約]`` 版を同一視するための正規化キー (純粋関数)。
+
+    要約は「原文の先頭 N 文字 + …（N文字）」なので、マークと末尾を落とせば
+    原文の接頭辞になる。短い方をキーにできないため、比較は呼び出し側で
+    「一方が他方の接頭辞か」を見る (:func:`_drop_summary_duplicates`)。
+    """
+    body = text.strip()
+    if body.startswith(_SUMMARY_MARK):
+        body = body[len(_SUMMARY_MARK):]
+    body = _SUMMARY_TAIL_RE.sub("", body)
+    return "".join(body.split())
+
+
+def _eligible_rag_indices(
+    texts: list[str], current_query: str = "",
+) -> list[int]:
+    """``[参考情報]`` に載せる資格のあるチャンクの添字を返す (純粋関数)。
+
+    落とすもの:
+
+    1. 問いだけのチャンク — 過去セッションのユーザー発言はそのまま RAG の
+       インデックスに入る。答えを含まないのに「参考情報」として提示されると、
+       モデルはそれを根拠として扱う。SemMem ファクト / STM ノート側では
+       ``carries_no_assertion`` が既に効いているが (``memory.pipeline.injector``)、
+       RAG チャンクは素通りだった。
+    2. 同じ発話の原文と ``[要約]`` 版の重複 — 情報は増えないのに枠と予算だけ減る。
+    3. **今回のクエリそのもの** — 過去に同じことを聞いていると、その発言の
+       STM ノートが最類似として返る。情報はゼロなのに枠を食い、しかも
+       「この質問の周辺が根拠だ」とモデルを誘導する。実測 (2026-08-16 修正後の
+       再検証): 「最近ハマってる食べ物ってある？私は担々麺に…」の
+       ``[参考情報 1]`` が **同じ文そのもの** だった。
+
+    実測 (2026-08-16 ライブ監査): 注入された ``[参考情報]`` 6 件のうち有用なもの
+    ゼロ。ターン16「Git で直前のコミットを2つに分割」に
+    「開発ロードマップを四半期ごとに区切る場合の作り方のコツは何ですか？」、
+    ターン30「解約率の数値目標」に
+    「そこから決済手数料を 3.6% 引くと、手取りは年間いくらになりますか？」
+    といった **別セッションのユーザー質問文** が入っていた。ターン34 / ターン40 では
+    5 枠のうち 2 枠が同一発話の原文と ``[要約]`` の組で埋まっていた。
+
+    添字を返すのは、スコア付きチャンク (``list[tuple[cid, score, text]]``) と
+    テキストのみの経路で同じ判定を使い回すため。経路ごとに書くと片方だけ直る
+    非対称を作る。
+    """
+    kept: list[int] = []
+    keys: list[str] = []
+    query_key = _dedup_key_for_rag(current_query) if current_query else ""
+    n_question = n_dup = n_echo = 0
+    for i, text in enumerate(texts):
+        if carries_no_assertion(text):
+            n_question += 1
+            continue
+        key = _dedup_key_for_rag(text)
+        if query_key and key and (
+            key == query_key or key.startswith(query_key)
+            or query_key.startswith(key)
+        ):
+            n_echo += 1
+            continue
+        if key and any(key.startswith(k) or k.startswith(key) for k in keys):
+            n_dup += 1
+            continue
+        if key:
+            keys.append(key)
+        kept.append(i)
+    if n_question or n_dup or n_echo:
+        logger.debug(
+            "RAG chunks: dropped %d question-only, %d echoing the current "
+            "query, collapsed %d raw/summary duplicate(s) (%d -> %d)",
+            n_question, n_echo, n_dup, len(texts), len(kept),
+        )
+    return kept
+
+
 def _select_rag_block(
     rag_chunks: list[str] | None,
     rag_scored_chunks: list[tuple[str, float, str]] | None,
     salience_ranker: SalienceRanker | None,
     remaining: int,
     total_rag: int,
+    current_query: str = "",
 ) -> tuple[str | None, int, int]:
-    """サリエンス経路 / フォールバック経路を選んで RAG block を返す。"""
+    """サリエンス経路 / フォールバック経路を選んで RAG block を返す。
+
+    どちらの経路でも、載せる資格の判定 (:func:`_eligible_rag_indices`) は
+    ここで一度だけ掛ける。
+    """
     if remaining <= 0:
         return None, remaining, 0
     if salience_ranker and rag_scored_chunks:
+        idx = _eligible_rag_indices(
+            [t for _, _, t in rag_scored_chunks], current_query,
+        )
+        scored = [rag_scored_chunks[i] for i in idx]
+        if not scored:
+            return None, remaining, 0
         return _inject_rag_salience(
-            rag_scored_chunks, salience_ranker, remaining, total_rag,
+            scored, salience_ranker, remaining, total_rag,
         )
     if rag_chunks:
-        return _inject_rag_fallback(rag_chunks, remaining, total_rag)
+        filtered = [
+            rag_chunks[i]
+            for i in _eligible_rag_indices(rag_chunks, current_query)
+        ]
+        if not filtered:
+            return None, remaining, 0
+        return _inject_rag_fallback(filtered, remaining, total_rag)
     return None, remaining, 0
 
 
@@ -576,6 +856,18 @@ def _prepend_dynamic_block(trimmed: list[ChatMessage], dyn_text: str) -> bool:
     )
 
 
+def _append_dynamic_block(trimmed: list[ChatMessage], dyn_text: str) -> bool:
+    """動的ブロックを最後の user メッセージの **生クエリより後ろ** へ後置する。
+
+    照応 (「上の内容を」「さっきの話」) を含むターン専用の配置。前置すると
+    注入ブロックが生クエリのすぐ上に並んで参照先を奪うため、後置して
+    「直前のやり取り」が生クエリの直前に来る並びを保つ。
+    """
+    return append_to_last_user(
+        trimmed, dyn_text, separator=_DYNAMIC_CONTEXT_TRAILING_DELIMITER,
+    )
+
+
 def _latest_user_refers_to_previous_output(trimmed: list[ChatMessage]) -> bool:
     """最後の user メッセージが直前の出力を指す照応を含むか。
 
@@ -694,6 +986,16 @@ def build_messages(
         remaining, total_rag, total_fc,
     )
 
+    # 0. 今回の会話で既に確定した値と食い違う注入候補を落とす。
+    #    [関連する記憶] (semmem_block) / [参考情報] (RAG) / few-shot 例は
+    #    3 つとも別々に組み立てられるため、ここが唯一の合流点になる。
+    semmem_block, rag_chunks, rag_scored_chunks, fewshot_block = (
+        _drop_superseded_context(
+            history, semmem_block, rag_chunks, rag_scored_chunks, fewshot_block,
+        )
+    )
+    total_rag = len(rag_chunks) if rag_chunks else total_rag
+
     # 動的ブロック (query 依存) を優先順に積む。system には含めない。
     dyn_parts: list[str] = []
 
@@ -717,6 +1019,7 @@ def build_messages(
     # 3. RAG チャンク（サリエンス優先 → フォールバック）
     rag_block, remaining, injected_rag = _select_rag_block(
         rag_chunks, rag_scored_chunks, salience_ranker, remaining, total_rag,
+        current_query=str(history[-1].get("content") or "") if history else "",
     )
     if rag_block:
         dyn_parts.append(rag_block)
@@ -750,25 +1053,43 @@ def build_messages(
     # 最新ターンが切られたかは dyn_parts 前置 (下) で内容が変わる前に判定する。
     truncation_note = _latest_turn_truncation_note(history, trimmed)
 
-    # 5. 動的ブロックを最後の user メッセージ先頭へ前置 (KV キャッシュ対応)。
-    #    ただし生クエリが直前の出力を指す照応を含む場合は system へ回す。前置すると
-    #    注入ブロックが「上の内容」のすぐ上に並び、参照先を奪う (下記参照)。
-    #    user ターンが無い場合も従来どおり system へ結合して情報を落とさない。
+    # 5. 動的ブロックを最後の user メッセージへ置く (KV キャッシュ対応)。
+    #    既定は生クエリの **前** へ前置。ただし生クエリが直前の出力を指す照応を
+    #    含む場合は、同じ user メッセージの生クエリ **後ろ** へ回す。前置すると
+    #    注入ブロックが「上の内容」のすぐ上に並び、参照先を奪うため。
+    #
+    #    以前はこのケースで system へ回していたが、system は prompt の先頭なので
+    #    足しても外しても prefix が丸ごと動き、llama-server の cache_prompt が
+    #    全損する。実測 (2026-08-16 ライブ監査、同一ペイロードで比較):
+    #      last-user 配置 : prompt_n=227  cache_n=2373  13.2s
+    #      system 配置    : prompt_n=2600 cache_n=0     95.1s
+    #      次ターン (注入を外して base へ戻す): prompt_n=2390 cache_n=0  99.5s
+    #    = 1 回の照応検出で「そのターン + 次ターン」に約 180 秒。同監査では
+    #    system 注入 3/40 ターンの TTFT が 134.0/123.8/163.3 秒でワースト 3 を占め、
+    #    さらに「Git で直前のコミットを分割」のような誤検出も含まれていた。
+    #    user メッセージが無い場合のみ従来どおり system へ結合して情報を落とさない。
     if dyn_parts:
         dyn_text = "\n\n".join(dyn_parts)
-        divert_to_system = _latest_user_refers_to_previous_output(trimmed)
-        if divert_to_system:
+        place_after_query = _latest_user_refers_to_previous_output(trimmed)
+        if place_after_query:
             logger.debug(
-                "dynamic block diverted to system: latest user turn refers to "
-                "previous output (avoiding anaphora capture)",
+                "dynamic block placed after the raw query: latest user turn "
+                "refers to previous output (avoiding anaphora capture)",
             )
-        if divert_to_system or not _prepend_dynamic_block(trimmed, dyn_text):
+            placed = _append_dynamic_block(trimmed, dyn_text)
+        else:
+            placed = _prepend_dynamic_block(trimmed, dyn_text)
+        if not placed:
             messages[0] = {
                 "role": "system",
                 "content": system_prompt + "\n\n" + dyn_text,
             }
 
     # 最新ターン切り詰めの注記は system へ足す (messages[0] の差し替え後に行う)。
+    # 動的ブロックと違い、ユーザー発言の中に混ぜるとユーザーが言っていないことを
+    # 言ったことにしてしまうため user 側へは回さない (_latest_turn_truncation_note
+    # の docstring 参照)。prefix キャッシュは失われるが、発火は巨大な貼り付けを
+    # 受けたターンに限られる (2026-08-16 ライブ監査 40 ターンで発火 0)。
     if truncation_note:
         messages[0] = {
             "role": "system",

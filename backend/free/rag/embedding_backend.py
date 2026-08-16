@@ -12,6 +12,7 @@ Qwen3-Embedding は instruction-aware かつ非対称な埋め込みモデルで
 ``config.yaml`` の ``embedding.instructions`` で定義される。
 """
 
+import asyncio
 import re
 from collections import OrderedDict
 from typing import Protocol, runtime_checkable
@@ -127,6 +128,8 @@ class QueryCacheMixin:
     _cache_misses: int
     _cache_maxsize: int
     _debug_logger: object | None
+    #: 進行中の埋め込み。同じキーの 2 人目以降はこの Future を待つ。
+    _query_inflight: dict[str, "asyncio.Future[np.ndarray]"]
 
     def _init_query_cache(self, maxsize: int = DEFAULT_QUERY_CACHE_MAXSIZE) -> None:
         """キャッシュの初期化（__init__ から呼び出す）"""
@@ -134,6 +137,7 @@ class QueryCacheMixin:
         self._cache_hits = 0
         self._cache_misses = 0
         self._cache_maxsize = maxsize
+        self._query_inflight = {}
 
     async def _embed_single_query(
         self, query: str, mode: str = DEFAULT_MODE
@@ -141,33 +145,65 @@ class QueryCacheMixin:
         """単一クエリの埋め込み生成（サブクラスで実装）"""
         raise NotImplementedError
 
+    def _record_cache_hit(self, mode: str) -> None:
+        self._cache_hits += 1
+        logger.debug(
+            "embed_query: cache hit mode=%s (hits=%d, misses=%d)",
+            mode, self._cache_hits, self._cache_misses,
+        )
+        dl = self._debug_logger
+        if dl:
+            dl.log_embedding(
+                batch_size=1, backend=self.backend_type(),
+                elapsed_sec=0.0, is_query=True, cache_hit=True,
+            )
+
     async def embed_query(
         self, query: str, *, mode: str = DEFAULT_MODE
     ) -> np.ndarray:
-        """単一クエリの埋め込み（LRU キャッシュ対応 + mode 名前空間分離）"""
+        """単一クエリの埋め込み（LRU キャッシュ対応 + mode 名前空間分離）
+
+        キャッシュへの書き込みは ``await`` の **後** に起きるので、同じクエリを
+        並行で投げる呼び出し元が複数あると全員がミスして同じ HTTP 往復を重複
+        実行する。チャット 1 ターンでは検索パイプラインとツール判定が
+        ``asyncio.create_task`` で同時に走るため、これが常態になっていた
+        (実測 2026-08-16 ライブ監査: is_query の埋め込み 123 件すべて cache_hit=false、
+        1 ターンあたり同一クエリを 2〜3 回埋め込み ≒ 0.7〜0.9 秒の無駄)。
+
+        進行中の呼び出しを Future で共有し、2 人目以降はそれを待つ。
+        """
         cache_key = make_query_cache_key(query, mode)
         if cache_key in self._query_cache:
-            self._cache_hits += 1
             self._query_cache.move_to_end(cache_key)
-            logger.debug(
-                "embed_query: cache hit mode=%s (hits=%d, misses=%d)",
-                mode, self._cache_hits, self._cache_misses,
-            )
-            dl = self._debug_logger
-            if dl:
-                dl.log_embedding(
-                    batch_size=1, backend=self.backend_type(),
-                    elapsed_sec=0.0, is_query=True, cache_hit=True,
-                )
+            self._record_cache_hit(mode)
             return self._query_cache[cache_key]
 
+        inflight = self._query_inflight.get(cache_key)
+        if inflight is not None:
+            self._record_cache_hit(mode)
+            return await asyncio.shield(inflight)
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[np.ndarray] = loop.create_future()
+        self._query_inflight[cache_key] = fut
         self._cache_misses += 1
-        vec = await self._embed_single_query(query, mode)
+        try:
+            vec = await self._embed_single_query(query, mode)
+        except BaseException as e:
+            if not fut.done():
+                fut.set_exception(e)
+            # 例外は待ち手にも伝えるが、誰も見ないままだと
+            # "Future exception was never retrieved" が出る。
+            fut.exception()
+            raise
+        finally:
+            self._query_inflight.pop(cache_key, None)
 
         if len(self._query_cache) >= self._cache_maxsize:
             self._query_cache.popitem(last=False)
         self._query_cache[cache_key] = vec
-
+        if not fut.done():
+            fut.set_result(vec)
         return vec
 
     @property

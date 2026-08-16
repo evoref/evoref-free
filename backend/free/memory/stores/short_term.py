@@ -375,10 +375,14 @@ class ShortTermMemory:
         return [(note, combined) for note, combined, _ in
                 self.retrieve_top_k_detailed(query_vec, k)]
 
-    def save(self, path: str | Path) -> None:
-        """JSON 永続化"""
+    def save(self, path: str | Path, *, allow_empty: bool = False) -> None:
+        """JSON 永続化
+
+        既定では **空の STM で既存スナップショットを上書きしない**
+        (理由は ``ShortTermMemoryStore.save`` の docstring)。
+        """
         from backend.free.memory.stores.short_term_store import ShortTermMemoryStore
-        ShortTermMemoryStore.save(self.notes, path)
+        ShortTermMemoryStore.save(self.notes, path, allow_empty=allow_empty)
 
     def load(self, path: str | Path) -> None:
         """JSON からロード

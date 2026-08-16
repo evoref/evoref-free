@@ -121,6 +121,11 @@ class LearningConfig(BaseModel):
     )
     # アイドル判定タイマー
     full_idle_minutes: int = Field(default=10, ge=1)        # Trigger B: Full sleep-time
+    # Trigger B: アイドルを待ち続ける上限 (分)。会話が途切れないと毎ターン
+    # タイマーが張り直されて Full が一度も走らない (2026-08-16 ライブ監査:
+    # 40 ターン / 53 分で起動試行 39 件が全て debounced、実行 0 回)。この時間を
+    # 超えたらユーザーが会話中でも 1 回走らせる。0 で無効 (従来のアイドル専用)。
+    full_max_defer_minutes: int = Field(default=30, ge=0)
     level1_idle_minutes: int = Field(default=30, ge=1)      # Trigger C: Level 1
     level1_recheck_interval_sec: int = Field(default=60, ge=1)  # Level 1 ループ再評価間隔
     priority_threshold_ratio: float = Field(default=0.5, ge=0.0, le=1.0)  # 優先 Level 1 の経験数閾値緩和率
