@@ -199,10 +199,51 @@ def _start_capability_probe(
                     snapshot.effective_reasoning_mode,
                 )
                 client._enable_thinking = new_enable
+            await _calibrate_token_estimate(client, llama_url)
         except Exception as e:
             logger.warning("Capability probe task failed (prior retained): %s", e)
 
     client._capability_probe_task = asyncio.create_task(_run())
+
+
+#: CJK 項の較正に使うサンプル。**日本語のみ**にすること — ASCII を混ぜると比が
+#: 薄まるうえ、コードは逆に過小評価側なので係数の意味が壊れる
+#: (``backend.utils._CJK_TOKEN_SCALE`` の解説を参照)。
+_TOKEN_CALIBRATION_SAMPLE = (
+    "あなたの名前はアリスです。ユーザーに名前を聞かれた場合や自己紹介を求められた"
+    "場合は、この名前で答えてください。質問に直接答えることを最優先し、前置きや"
+    "質問の復唱、断り書きから始めず、最初の文で答えの核心を述べてください。"
+    "挨拶や雑談、単純な事実の質問には短く答え、手順や比較、複数の論点を含む質問は"
+    "見出しや箇条書きで構造化します。聞かれていない周辺知識は付け足しません。"
+    "曖昧な質問には自分の解釈を一文で示してから答えるか、確認の質問を一つだけ"
+    "返してください。過去の記録と今回の会話が食い違う場合は今回の会話を優先します。"
+)
+
+
+async def _calibrate_token_estimate(client: Any, llama_url: str) -> None:  # noqa: ARG001
+    """``estimate_tokens`` の CJK 項を実トークナイザで較正する。
+
+    素の推定 (CJK 1 文字 ≒ 1 トークン) は Qwen3 系の日本語で 1.5 倍前後の過大評価に
+    なり、予算が推定トークン建てである以上そのぶんコンテキストを使い残す。
+    ``/tokenize`` を 1 回だけ叩いて比を取り、以後の予算計算へ反映する。
+    失敗しても係数 1.0 のまま = 従来動作なので、起動は止めない。
+    """
+    from backend.utils import estimate_tokens, set_cjk_token_scale
+
+    sample = _TOKEN_CALIBRATION_SAMPLE
+    actual = await client.count_tokens(sample)
+    if not actual:
+        logger.warning(
+            "CJK token scale calibration skipped: /tokenize returned no tokens",
+        )
+        return
+    raw = estimate_tokens(sample)
+    scale = set_cjk_token_scale(raw, actual)
+    logger.info(
+        "CJK token scale calibrated: raw=%d actual=%d (over-estimate %.2fx) "
+        "-> scale=%.3f",
+        raw, actual, (raw / actual) if actual else 0.0, scale,
+    )
 
 
 async def _init_pro_gen_pillar(

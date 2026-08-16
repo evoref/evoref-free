@@ -163,6 +163,49 @@ _SUMMARY_MARK = "[要約] "
 _SUMMARY_TAIL_RE = re.compile(r"…（\d+文字）\s*$")
 
 
+def _collapse_equivalent_candidates(
+    candidates: list[tuple[MemoryNote, SemanticFact]],
+) -> tuple[list[tuple[MemoryNote, SemanticFact]], int]:
+    """同じ命題を指す候補を 1 本に畳む (純粋関数)。
+
+    同一発話が STM に 2 本のノートとして残ることがあり (原文と
+    ``compress_turn(style="summary")`` の ``[要約]`` 版)、それぞれからファクトが
+    起きて **statement が完全一致する重複** ができる。両方 active のまま残ると
+    競合検出が「内容が矛盾している」と見なして恒久 pending 化し、
+    ``[記憶の競合 — 未解決]`` として無関係な質問にまで注入される
+    (2026-08-16 実データ: ``sf_127618cb29fb`` 原文 / ``sf_852c5461ce09`` ``[要約]``、
+    同一 subject・同一秒・statement 一致)。
+
+    :func:`normalize_statement` が既に ``[要約]`` を剥がしているので、突き合わせは
+    ``(subject, predicate, statement)`` で行う。``statement`` が立たなかった候補は
+    ``object`` で代用する (従来と同じ挙動)。先に現れた候補 = 原文側を残す。
+
+    Returns:
+        ``(畳んだ後の候補, 落とした件数)``。
+    """
+    seen: set[tuple[str, str, str]] = set()
+    kept: list[tuple[MemoryNote, SemanticFact]] = []
+    collapsed = 0
+    for note, fact in candidates:
+        key = (
+            fact.subject or "",
+            fact.predicate or "",
+            (fact.statement or fact.object or "").strip(),
+        )
+        if key[2] and key in seen:
+            collapsed += 1
+            continue
+        if key[2]:
+            seen.add(key)
+        kept.append((note, fact))
+    if collapsed:
+        logger.debug(
+            "ChatExtractor: collapsed %d duplicate fact candidate(s) "
+            "(same subject/predicate/statement)", collapsed,
+        )
+    return kept, collapsed
+
+
 def normalize_statement(
     content: str, trigger_words: tuple[str, ...],
 ) -> str | None:
@@ -424,6 +467,7 @@ class ChatExtractor(BaseExtractor):
                 )
                 candidates.append((note, fact))
 
+        candidates, collapsed = _collapse_equivalent_candidates(candidates)
         kept, dropped = self.apply_session_caps(candidates, ctx)
         result.cap_dropped = dropped
         result.facts = [fact for _, fact in kept]
@@ -432,11 +476,13 @@ class ChatExtractor(BaseExtractor):
             if fact.id not in note.extracted_fact_ids:
                 note.extracted_fact_ids.append(fact.id)
         logger.debug(
-            "ChatExtractor: processed=%d skipped=%d already=%d facts=%d dropped=%d",
+            "ChatExtractor: processed=%d skipped=%d already=%d facts=%d "
+            "dropped=%d collapsed=%d",
             result.notes_processed,
             result.notes_skipped,
             result.already_extracted,
             len(result.facts),
             result.cap_dropped,
+            collapsed,
         )
         return result

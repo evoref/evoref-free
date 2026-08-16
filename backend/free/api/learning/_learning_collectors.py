@@ -148,6 +148,7 @@ def _map_level2_target(raw: object) -> Level2TargetStatus:
         adapter_exists=bool(raw.get("adapter_exists", False)),
         version=int(raw.get("version", 0) or 0),
         experiences_current=int(raw.get("experiences_current", 0) or 0),
+        experiences_total=int(raw.get("experiences_total", 0) or 0),
         bootstrap_min=int(raw.get("bootstrap_min", 0) or 0),
         spsa_min=int(raw.get("spsa_min", 0) or 0),
         cvector_min=int(raw.get("cvector_min", 0) or 0),

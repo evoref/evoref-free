@@ -4,7 +4,7 @@ import time
 from uuid import uuid4
 
 from backend.log_config import get_logger
-from backend.utils import compress_turn, estimate_tokens as _estimate_tokens
+from backend.utils import estimate_tokens as _estimate_tokens
 
 logger = get_logger("memory.working")
 
@@ -212,20 +212,24 @@ class WorkingMemory:
             "_enforce_limits: tokens %d > max %d, compressing/evicting to %d",
             total, self.max_tokens, token_target,
         )
+        # 先頭を ``[要約]`` へ書き換えてから押し出す 2 段構えは廃止した。
+        # 圧縮しても次の反復で必ず押し出されるため (2026-08-16 ライブ監査:
+        # ``compressing oldest turn`` 23 回に対し ``evicting compressed turn``
+        # も 23 回 = 生き残りゼロ)、保持量は 1 件も増えないまま副作用だけが残る:
+        #   1. 窓の先頭 (system 直後) を書き換えるので llama-server の接頭辞
+        #      KV キャッシュが押し出しとは別に無効化される。
+        #   2. 同じターンが原文と ``[要約]`` の 2 回 ``_evicted`` へ積まれ、
+        #      STM に同一発話のノートが 2 本できる。そこから起こしたファクトは
+        #      statement が完全一致するため「未解決の競合」として恒久 pending 化し、
+        #      無関係な質問のプロンプトにまで注入される (実データ:
+        #      sf_127618cb29fb 原文 / sf_852c5461ce09 ``[要約]``、同一秒・同一 subject)。
+        # 押し出しのみにすると窓の先頭は単調に前進し、転送も 1 ターン 1 回になる。
         while self._total_tokens() > token_target and len(self.turns) > 1:
-            oldest = self.turns[0]
-            if not oldest.get("compressed"):
-                # 未圧縮なら圧縮で対処
-                logger.debug(
-                    "_enforce_limits: compressing oldest turn (role=%s, %d chars)",
-                    oldest.get("role"), len(oldest.get("content", "")),
-                )
-                self._evicted.append(oldest)  # 原文を転送バッファに
-                self.turns[0] = compress_turn(oldest, max_chars=60, style="summary")
-            else:
-                # 圧縮済みは押し出し
-                logger.debug("_enforce_limits: evicting compressed turn")
-                self._evict_oldest()
+            logger.debug(
+                "_enforce_limits: evicting oldest turn (role=%s, %d chars)",
+                self.turns[0].get("role"), len(self.turns[0].get("content", "")),
+            )
+            self._evict_oldest()
 
     def _evict_oldest(self) -> None:
         """最古ターンを押し出し

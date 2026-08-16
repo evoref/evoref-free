@@ -75,7 +75,8 @@ class Level2TargetStatus(BaseModel):
     adapter_exists: bool = False
     version: int = 0
     # 蓄積中の発火データ数 (失敗数)
-    experiences_current: int = 0
+    experiences_current: int = 0  # 失敗数 (総経験数ではない)
+    experiences_total: int = 0
     bootstrap_min: int = 0
     spsa_min: int = 0
     cvector_min: int = 0

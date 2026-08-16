@@ -776,6 +776,17 @@ def _select_semmem_block(
     return labeled, remaining - cost
 
 
+#: 動的ブロック (few-shot / file / semmem / RAG) へ切る固定予約枠 (token)。
+#: 内訳の目安: few-shot ≤ 600 (:data:`_FEWSHOT_TOKEN_CAP`) + semmem ≤ 800
+#: (MemoryInjector 側の tier 予算) + RAG 残余。**実際の注入量ではなくこの値を
+#: 履歴予算から引く** ことが要点で、RAG のヒット件数が履歴の切り落とし位置を
+#: 動かさないようにする (:func:`build_messages` の 4. を参照)。
+_DYN_BLOCK_RESERVE = 1600
+
+#: 予約枠が残予算に占めてよい上限。小さな context_size では固定値の 1600 が
+#: 残予算を丸ごと食って履歴が 0 になるため、割合でも抑える。
+_DYN_BLOCK_MAX_SHARE = 0.4
+
 #: few-shot ブロックの token 上限。無上限だとセッション中に数千 token へ膨張し
 #: (2026-07-15: 2739 tokens → 3 回全ドロップ = 学習効果ゼロ、通常時も履歴予算を
 #: 圧迫)、all-or-nothing ドロップで無意味化する。上限内へ例単位で切り詰める。
@@ -965,11 +976,15 @@ def build_messages(
     # 過去履歴の最低確保 (床)。実履歴量・残予算・working_max でキャップし、
     # 履歴が現在の質問のみ (新規セッション) の場合は 0 に縮退する —
     # 空回りの予約で動的ブロックを痩せさせない。
+    # ``reserved_latest`` が押さえた最新 user ターン以外 = 履歴予算が要る分。
+    # 履歴が assistant で終わる場合 (reserved_latest == 0) は最後の 1 件も
+    # 「過去」に含める — 除くと予算が 0 に潰れて履歴が丸ごと落ちる。
+    _past_turns = history[:-1] if reserved_latest else history
+    past_tokens = sum(
+        _estimate_tokens(t.get("content", "")) for t in _past_turns
+    )
     hist_floor = 0
     if history_min_tokens > 0 and len(history) > 1:
-        past_tokens = sum(
-            _estimate_tokens(t.get("content", "")) for t in history[:-1]
-        )
         hist_floor = min(
             history_min_tokens,
             past_tokens,
@@ -997,28 +1012,55 @@ def build_messages(
     total_rag = len(rag_chunks) if rag_chunks else total_rag
 
     # 動的ブロック (query 依存) を優先順に積む。system には含めない。
+    #
+    # **動的ブロックには固定の予約枠を切る**。以前は「余った分を全部使ってよい /
+    # 使い残しは履歴へ回す」という配分だったため、RAG のヒット件数 (0〜5 件) が
+    # そのまま履歴予算の増減になり、``_trim_history`` の切り落とし位置が毎ターン
+    # 前後した。プロンプトの **途中** が入れ替わると llama-server の接頭辞 KV
+    # キャッシュは全損する (実測 2026-08-16 ライブ監査: rag 3 件注入のターンで
+    # history 29→20 に切られ cache 23.2% / 再評価 4122 tokens / prefill 151 秒)。
+    # 予約を固定すると、履歴予算は system と最新ターンの長さだけで決まり、
+    # 履歴の窓は会話の伸長に対して単調に動く。
+    # 履歴予算を先に確定させる。上限は 3 つ:
+    #   1. working_max_tokens (従来どおり)
+    #   2. 予約枠を残した上での空き (= 動的ブロックのヒット件数に依存しない)
+    #   3. **過去履歴が実際に必要とする量** — 新規セッション等で守る履歴が無い
+    #      ときに予約が空回りして動的ブロックを痩せさせないため。
+    # 動的ブロックは確定後の残りを受け取る。これで RAG が 0 件でも 5 件でも
+    # 履歴の切り落とし位置は変わらない。
+    dyn_floor = min(
+        _DYN_BLOCK_RESERVE, int(max(0, remaining) * _DYN_BLOCK_MAX_SHARE),
+    )
+    history_budget = min(
+        working_max_tokens,
+        reserved_latest + hist_floor + max(0, remaining - dyn_floor),
+        reserved_latest + hist_floor + past_tokens,
+    )
+    dyn_budget = max(
+        0, remaining - max(0, history_budget - reserved_latest - hist_floor),
+    )
     dyn_parts: list[str] = []
 
     # 1. few-shot 例（query 依存、動的ブロック先頭）
-    fewshot_part, remaining = _select_fewshot_block(fewshot_block, remaining)
+    fewshot_part, dyn_budget = _select_fewshot_block(fewshot_block, dyn_budget)
     if fewshot_part:
         dyn_parts.append(fewshot_part)
 
     # 2. ファイルコンテキスト（ユーザー明示 → RAG より優先）
-    fc_block, remaining, injected_fc = _inject_file_contexts(
-        file_contexts, remaining, total_fc,
+    fc_block, dyn_budget, injected_fc = _inject_file_contexts(
+        file_contexts, dyn_budget, total_fc,
     )
     if fc_block:
         dyn_parts.append(fc_block)
 
     # 2.5 セマンティックメモリ注入（MemoryInjector、RAG より優先）
-    semmem_part, remaining = _select_semmem_block(semmem_block, remaining)
+    semmem_part, dyn_budget = _select_semmem_block(semmem_block, dyn_budget)
     if semmem_part:
         dyn_parts.append(semmem_part)
 
     # 3. RAG チャンク（サリエンス優先 → フォールバック）
-    rag_block, remaining, injected_rag = _select_rag_block(
-        rag_chunks, rag_scored_chunks, salience_ranker, remaining, total_rag,
+    rag_block, dyn_budget, injected_rag = _select_rag_block(
+        rag_chunks, rag_scored_chunks, salience_ranker, dyn_budget, total_rag,
         current_query=str(history[-1].get("content") or "") if history else "",
     )
     if rag_block:
@@ -1027,10 +1069,21 @@ def build_messages(
     # 静的 system メッセージ (動的部は含めない)
     messages: list[ChatMessage] = [{"role": "system", "content": system_prompt}]
 
-    # 4. 会話履歴（予約分 + 床 + 残余予算。上限は working_max_tokens）
-    history_budget = min(
-        working_max_tokens, reserved_latest + hist_floor + max(0, remaining),
-    )
+    # 4. 会話履歴 (history_budget は動的ブロックを積む前に確定済み)
+    if history_budget < min(working_max_tokens, reserved_latest + past_tokens):
+        # WorkingMemory は working_max_tokens まで溜める一方、prompt 側はここまで
+        # しか載らない = 窓を決める主体が 2 つある状態。WM のブロック押し出しと
+        # _trim_history のブロック切り落としが別々のタイミングで先頭を動かすため、
+        # 接頭辞 KV キャッシュが崩れる回数が倍になる。config で
+        # memory.working_max_tokens をこの値以下へ寄せると WM 単独が窓を決める。
+        logger.warning(
+            "build_messages: working_max_tokens=%d exceeds the prompt history "
+            "budget=%d (context_size=%d, generation_reserve=%d, system=%d, "
+            "dyn_reserve=%d) — history is trimmed twice; consider lowering "
+            "memory.working_max_tokens to %d or less",
+            working_max_tokens, history_budget, context_size, generation_reserve,
+            sys_tokens, _DYN_BLOCK_RESERVE, history_budget,
+        )
     if len(history) > 1 and history_budget <= reserved_latest:
         logger.warning(
             "build_messages: context budget squeeze — past history got 0 tokens "
@@ -1105,6 +1158,7 @@ def build_messages(
         _persona_question_note(history),
         _char_limit_note(history),
         _output_form_note(history),
+        _dropped_history_note(history, trimmed),
     ):
         if note:
             _append_note_to_last_user(trimmed, note)
@@ -1262,6 +1316,61 @@ def latest_turn_truncation(
     return len(original_text), len(kept)
 
 
+#: 「この会話そのもの」を対象にした問い。窓外に落ちたターンを指している可能性が
+#: 高いので、履歴が切られているときは見えない範囲があることを明示させる。
+_CONVERSATION_SCOPE_RE = re.compile(
+    r"(今日|本日|ここまで|これまで|さっき|先ほど|最初の方|冒頭|序盤|今までの|"
+    r"一連の|この会話|会話全体|話した(こと|話題|内容)|振り返)",
+)
+
+#: 会話スコープの問いに対して「何を求めているか」を示す語。単に「さっき」が
+#: 出てくるだけの雑談で発火させないための第 2 条件。
+_CONVERSATION_RECALL_RE = re.compile(
+    r"(挙げ|列挙|まとめ|要約|振り返|覚えて|何だっけ|どれ|いくつ|3つ|三つ|"
+    r"教えて|言って|整理)",
+)
+
+
+def _dropped_history_note(
+    history: list[ChatMessage],
+    trimmed: list[ChatMessage],
+) -> str:
+    """会話スコープの問いなのに古い履歴が落ちている場合の注記を返す。
+
+    窓外のターンは復元経路が無いため、モデルは **見えている範囲だけ** で答える。
+    手掛かりが皆無なら「参照できない」と正しく降参するが、可視範囲に部分一致
+    する材料があるとそちらが優先され、黙って別物を答える (2026-08-16 ライブ監査:
+    「今日話した技術的な話題を3つ」に対し、実際の技術ターン 8 件は全て窓外で、
+    直前に見えていたビジネス話題 3 件を「技術的な話題」として提示した。同じ
+    セッションの「困っていたこと」の問いには正しく降参している = 能力ではなく
+    優先順の問題)。切り落としが起きたターンでは常に可視範囲の限界を明示させる。
+
+    空文字を返す = 注記なし (:func:`_append_note_to_last_user` は falsy を無視)。
+    """
+    if len(trimmed) >= len(history):
+        return ""
+    latest = next(
+        (t for t in reversed(history) if t.get("role") == "user"), None,
+    )
+    if latest is None:
+        return ""
+    text = str(latest.get("content") or "")
+    if not (_CONVERSATION_SCOPE_RE.search(text)
+            and _CONVERSATION_RECALL_RE.search(text)):
+        return ""
+    dropped = len(history) - len(trimmed)
+    logger.debug(
+        "_dropped_history_note: conversation-scope query with %d dropped "
+        "message(s); adding visibility note", dropped,
+    )
+    return (
+        f"[可視範囲] この会話の古い {dropped} メッセージは長さ制限で渡されて"
+        "いない。会話の内容を振り返る問いには、見えている範囲だけで答え、"
+        "見えていない前半がある旨を必ず明示すること。見えている範囲に該当が"
+        "無ければ、別の話題で埋め合わせず「参照できない」と答えること。"
+    )
+
+
 def _latest_turn_truncation_note(
     history: list[ChatMessage],
     trimmed: list[ChatMessage],
@@ -1295,6 +1404,44 @@ def _latest_turn_truncation_note(
     )
 
 
+#: 履歴を切り落とすときの最小ブロック (メッセージ数)。予算ちょうどまでしか
+#: 落とさないと、履歴が 1 ターン伸びるたびに窓の先頭が 1 つ進み、llama-server の
+#: 接頭辞 KV キャッシュが **毎ターン** 無効化される (``WorkingMemory`` が
+#: ``working_evict_block`` で同じ問題を避けているのと同じ理由)。落とす数を
+#: ブロック単位へ切り上げて先頭をブロック境界で止め、次にブロックを跨ぐまで
+#: 保持集合をバイト単位で不変にする。12 = 6 往復。
+_HISTORY_DROP_BLOCK = 12
+
+
+def _quantize_history_drop(
+    history: list[ChatMessage], max_tokens: int,
+) -> list[ChatMessage]:
+    """予算超過分の切り落としをブロック単位へ切り上げた履歴を返す (純粋関数)。
+
+    予算内に収まっている / 最新 1 ターンしか残らない場合は ``history`` をそのまま
+    返し、呼出側の既存経路 (最新ターンの圧縮保持) に委ねる。
+    """
+    if len(history) <= 1:
+        return history
+    fit = 0
+    total = 0
+    for turn in reversed(history):
+        total += _estimate_tokens(turn.get("content", ""))
+        if total > max_tokens:
+            break
+        fit += 1
+    if fit >= len(history):
+        return history
+    over = len(history) - fit
+    blocks = -(-over // _HISTORY_DROP_BLOCK)  # ceil
+    drop = min(len(history) - 1, blocks * _HISTORY_DROP_BLOCK)
+    logger.debug(
+        "_trim_history: dropping %d oldest messages (need %d, block=%d)",
+        drop, over, _HISTORY_DROP_BLOCK,
+    )
+    return history[drop:]
+
+
 def _trim_history(
     history: list[ChatMessage],
     max_tokens: int,
@@ -1311,6 +1458,9 @@ def _trim_history(
     if not history:
         logger.debug("_trim_history: empty history, nothing to trim")
         return []
+
+    original_len = len(history)
+    history = _quantize_history_drop(history, max_tokens)
 
     result: list[ChatMessage] = []
     total_tokens = 0
@@ -1366,7 +1516,7 @@ def _trim_history(
 
     logger.debug(
         "_trim_history: %d/%d turns kept, %d estimated tokens (max=%d)",
-        len(result), len(history), total_tokens, max_tokens,
+        len(result), original_len, total_tokens, max_tokens,
     )
     return result
 
