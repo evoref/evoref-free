@@ -46,7 +46,7 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Iterable, Literal
 
-from backend.free.core.text_quality import carries_no_assertion
+from backend.free.core.text_quality import carries_no_assertion, is_payload_dump
 from backend.free.core.session_mode import (
     is_chat_mode,
     is_create_mode,
@@ -121,6 +121,46 @@ DEFAULT_PINNED_RELEVANCE_MIN_SCORE = 0.10
 #: セッション要約ファクトの subject 接頭辞。会話のメタ記録であって、ユーザーに
 #: ついての事実ではないため [関連する記憶] へ注入しない (``inject`` 内の判定参照)。
 _SESSION_SUMMARY_SUBJECT_PREFIX = "mem.decision.history.session"
+
+#: MDP エピソードトレース由来の decision ファクトの subject 接頭辞
+#: (``MDPTraceExtractor`` が ``mem.decision.<episode_id>`` で書く。episode_id は
+#: ``ep_`` 始まり)。セッション要約と同じく「アシスタントが何をしたか」の内部記録で、
+#: ユーザーについての事実ではない。
+#:
+#: 実インシデント (2026-08-16 ライブ監査 ターン34): 「今日の会話のいちばん最初、
+#: 私は何の話をした？」の [関連する記憶] に
+#:   - (decision) mem.decision.ep_5666c421 resolved:
+#:     outcome=success; result=No results found for: …; actions=search_history
+#: が入っていた。**0 件で終わった検索が「成功した記録」として** ユーザー向けの
+#: 根拠枠に並ぶ。outcome=success 自体はツールが壊れていない意味で正しい
+#: (``agent.deliberative._trace_tool_episode`` の設計) が、それをそのまま
+#: [関連する記憶] に出すと読み手には検索が当たったように見える。
+#: 「前回何をしたか」は search_history ツールの担当。
+#:
+#: ``mem.decision.*`` 全体は落とさない — create モードの採否判断
+#: (``mem.decision.<project_id>``) は正当なユーザーファクト。
+_EPISODE_TRACE_SUBJECT_PREFIX = "mem.decision.ep_"
+
+#: executable command リコール索引の subject 接頭辞
+#: (``memory.sleep.executable_command_curator``)。``world_fact`` を流用して
+#: いるが中身は「このクエリはこのコマンドで答えた」という **索引** で、
+#: ``object`` には過去のユーザーの質問文がそのまま入る。読み手は
+#: ``ToolCallJudge`` だけ (``agent.tool_call_judge`` が同じ接頭辞で引く)。
+#:
+#: [関連する記憶] に並べると、過去の質問文が「世界の事実」として提示される。
+#: 実データ (2026-08-16 監査時点):
+#:   (world_fact) mem.world.executable_command.chat.0e480f56 answers_query:
+#:   今日は8月16日ですよね。今日から100日後は何月何日になりますか？
+#: セッション要約 / エピソードトレースと同じ「内部索引」の類。
+_EXECUTABLE_COMMAND_SUBJECT_PREFIX = "mem.world.executable_command."
+
+#: [関連する記憶] へ注入しない内部索引の subject 接頭辞。
+#: いずれも「アシスタント側の記録」であってユーザーについての事実ではない。
+_INTERNAL_INDEX_SUBJECT_PREFIXES: tuple[str, ...] = (
+    _SESSION_SUMMARY_SUBJECT_PREFIX,
+    _EPISODE_TRACE_SUBJECT_PREFIX,
+    _EXECUTABLE_COMMAND_SUBJECT_PREFIX,
+)
 
 
 def _normalize_for_dup(text: str) -> str:
@@ -327,7 +367,9 @@ class MemoryInjector:
             # 実ストアでは live 50 件中 33 件 (66%) がこの種別で、注入予算も
             # 大きく食っていた (想起クエリで 582 → 219 文字)。
             # 「前回何を話したか」は search_history ツールの担当。
-            if fact.subject.startswith(_SESSION_SUMMARY_SUBJECT_PREFIX):
+            # MDP エピソードトレース / executable command 索引も同じ理由で落とす
+            # (:data:`_INTERNAL_INDEX_SUBJECT_PREFIXES` の各説明を参照)。
+            if fact.subject.startswith(_INTERNAL_INDEX_SUBJECT_PREFIXES):
                 filtered_out += 1
                 continue
             if not self._is_relevant(
@@ -370,6 +412,14 @@ class MemoryInjector:
             # ライブ監査:「今日は何曜日ですか。」が過去の記録として想起され、
             # 同文がそのまま出力された)。明示的に pin されたものは尊重する。
             if not pinned and carries_no_assertion(getattr(note, "content", "")):
+                filtered_out += 1
+                continue
+            # 本文の過半がコードフェンスの中身 = 「いつでも取り直せるデータの
+            # コピー」。記憶として再注入すると内容が古びるうえ、「ペイロードを
+            # 貼るのが正解」という手本として働く (2026-08-16 動作検証: README を
+            # 全文ダンプした回答がノート化され、(過去の記録) として再注入され、
+            # 次のターンでまたダンプさせていた — 自己増幅ループ)。
+            if not pinned and is_payload_dump(getattr(note, "content", "")):
                 filtered_out += 1
                 continue
             if not self._is_relevant(
@@ -635,7 +685,7 @@ class MemoryInjector:
     def _render_fact(self, fact: SemanticFact) -> str:
         age = self._fact_age_days(fact)
         if age is None or age < _FACT_STALE_LABEL_DAYS:
-            return f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.object}"
+            return f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.text}"
         # 何日前の記録かを行ごとに書く。ノート側 (_render_note の (過去の記録))
         # と同じ理由で、ブロック先頭の注意書きは数百トークン離れると効かない。
         #

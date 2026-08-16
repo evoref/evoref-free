@@ -25,6 +25,11 @@ import hashlib
 import re
 from collections.abc import Iterable
 
+from backend.free.core.text_quality import (
+    strip_discourse_prefix,
+    strip_first_person_topic,
+    strip_interrogative_sentences,
+)
 from backend.free.memory.extractors.base import (
     BaseExtractor,
     ExtractionContext,
@@ -145,6 +150,71 @@ def _tag_evidence_is_question_only(content: str, trigger_words: tuple[str, ...])
     if not relevant:
         return False
     return all(_QUESTION_ENDING_RE.search(s.strip()) for s in relevant)
+
+#: 規則ベース正規化で残す文の下限 (これ未満なら正規化失敗として原文を使う)。
+_STATEMENT_MIN_CHARS = 2
+
+#: 接頭辞剥がしの最大反復。「ところで、私は…」のような入れ子を解くため繰り返すが、
+#: 無限ループにはしない。実際は 2 回で収束する。
+_STATEMENT_STRIP_PASSES = 3
+
+#: ``compress_turn(style="summary")`` の圧縮マークと末尾の元文字数。
+_SUMMARY_MARK = "[要約] "
+_SUMMARY_TAIL_RE = re.compile(r"…（\d+文字）\s*$")
+
+
+def normalize_statement(
+    content: str, trigger_words: tuple[str, ...],
+) -> str | None:
+    """発話原文から「ユーザーについての命題」を規則だけで切り出す (純粋関数)。
+
+    ``object`` には発話原文が入るため、``[関連する記憶]`` には会話の足場や
+    一人称のついた行が並ぶ (2026-08-16 監査時点の実データ:
+    ``mem.personal.user states: コーヒー派？紅茶派？私はコーヒーを1日3杯は飲んじゃう。``)。
+
+    ここで落とすのは **語彙に依存しない構造的なノイズ** だけ:
+
+    1. 疑問文だけの文 (問いは主張ではない)
+    2. トリガ語を含まない文 (その属性と無関係な部分)
+    3. 文頭の談話標識 (「ところで」「実は」)
+    4. 文頭の一人称主題 (「私は」— 主語は subject が持つ)
+
+    「紅茶派です」→「紅茶」のような **値の抽出** は語順・助詞の解析が要るので
+    ここでは行わない (LLM 併用の Phase 2 で扱う想定)。
+
+    Returns:
+        正規化後の命題。原文と変わらない / 短くなりすぎる場合は ``None``
+        (呼出側は ``statement`` を立てず ``object`` をそのまま使う)。
+    """
+    text = (content or "").strip()
+    if not text:
+        return None
+    kept = strip_interrogative_sentences(text)
+    if trigger_words:
+        sentences = [s for s in _SENTENCE_SPLIT_RE.split(kept) if s.strip()]
+        relevant = [
+            s for s in sentences
+            if any(t in s.lower() for t in trigger_words)
+        ]
+        if relevant:
+            kept = "".join(relevant)
+    kept = kept.strip()
+    # 圧縮マークはシステムが足したもので、ユーザーの発話ではない。
+    # これを落とすと原文と [要約] が同じ命題に畳まれ、競合・重複判定でも揃う。
+    if kept.startswith(_SUMMARY_MARK):
+        kept = kept[len(_SUMMARY_MARK):].strip()
+    kept = _SUMMARY_TAIL_RE.sub("", kept).strip()
+    # 談話標識と一人称主題は入れ子になる (「ところで、私は…」「私、実は…」)。
+    # 変化が無くなるまで繰り返し剥がす。
+    for _ in range(_STATEMENT_STRIP_PASSES):
+        peeled = strip_first_person_topic(strip_discourse_prefix(kept)).strip()
+        if peeled == kept:
+            break
+        kept = peeled
+    if len(kept) < _STATEMENT_MIN_CHARS or kept == text:
+        return None
+    return kept
+
 
 #: コード断片らしさの指標 (EvorefMem は EvorefLoop の utils を import できない
 #: ため、meta_cognitive_utils.contains_code_indicator と同旨の最小実装を持つ)
@@ -334,7 +404,19 @@ class ChatExtractor(BaseExtractor):
                 fact = self.make_fact(
                     subject=subject,
                     predicate=_PREDICATE_BY_TAG.get(tag, "states"),
-                    object_text=note.content or "",
+                    # 末尾の問いは記憶として意味を持たないうえ、[関連する記憶] に
+                    # 「答えではなく問い」が根拠として並ぶ原因になる。
+                    # (2026-08-16 監査時点の実データ:
+                    #  mem.emotion.user feels: 夜更かしすると次の日つらいですよね。
+                    #  何かいい対策ありますか？)
+                    object_text=strip_interrogative_sentences(note.content or ""),
+                    # 規則で切り出せる分だけ命題化する。object (原文) は証拠として
+                    # 残し、提示・比較・埋め込みは fact.text 経由で statement を
+                    # 優先する。切り出せなければ None のままで従来と同じ挙動。
+                    statement=normalize_statement(
+                        note.content or "",
+                        tuple(self._builder.fact_triggers.get(tag, ())),
+                    ),
                     fact_type=fact_type,
                     scope=SemanticFact.make_global_scope(),
                     note=note,

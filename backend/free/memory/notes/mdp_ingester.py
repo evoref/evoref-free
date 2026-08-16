@@ -50,12 +50,50 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from backend.free.constants import READ_FILE_META_PREFIX
 from backend.free.core.session_mode import normalize_session_mode
 from backend.free.memory.extractors.mdp_trace import episode_task_and_result
 from backend.free.memory.stores.short_term import MemoryNote
 from backend.log_config import get_logger
 
 logger = get_logger("memory.mdp_ingester")
+
+
+#: 記憶から読み出すだけのツール。これらだけで完結したエピソードはエピソード記憶へ
+#: 昇格させない (``EpisodeRecord.is_memory_read_only`` 参照)。外界を観測する
+#: ツール (read_file / run_command_readonly / search_code / fetch_url 等) は
+#: 記憶する価値があるので含めない。
+_MEMORY_READ_ACTIONS: frozenset[str] = frozenset({"search_history"})
+
+#: エピソード記憶に載せる観測値の上限。
+_OBSERVATION_MAX_CHARS = 300
+
+
+def _summarize_observation(observation: str) -> str:
+    """観測値をエピソード記憶用に要約する (純粋関数)。
+
+    エピソード記憶が記録すべきは「**何をしたか**」であって、ツールが返した
+    ペイロードそのものではない。``read_file`` の結果は先頭にメタ行
+    ``[file: <path> | lines: N | chars: M]`` が付き、その後ろにファイル本文が
+    続く。本文まで載せると:
+
+    - 別セッションで読んだファイルの中身が ``[参考情報]`` として提示され、
+      現在の話題と無関係な内容へ引きずられる
+    - 同じ内容が LTM に重複して溜まり、注入予算を食う
+
+    実データ (2026-08-16 再測定): ``result=[file: E:\\...\\README.md | lines: 121
+    | chars: 3331 | showing lines 1-5] # evoref — 自己進化型ローカル LLM ア...``
+    のように本文が貼られ、``[参考情報]`` のトークンを占有していた。
+
+    メタ行だけ残せば「そのファイルを読んだ / 何行何文字だった」は保てる。
+    メタ行を持たない観測値は従来どおり先頭 300 文字で切る。
+    """
+    text = observation.strip()
+    if text.startswith(READ_FILE_META_PREFIX):
+        end = text.find("]")
+        if end != -1:
+            return text[: end + 1]
+    return text[:_OBSERVATION_MAX_CHARS]
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -81,6 +119,35 @@ class EpisodeRecord:
 
     def is_complete(self) -> bool:
         return self.end is not None
+
+    def actions(self) -> list[str]:
+        """ステップの ``action`` (ツール名) を順に返す。空 / ``none`` は除く。"""
+        out: list[str] = []
+        for step in self.steps:
+            action = str(step.get("action") or "")
+            if action and action != "none":
+                out.append(action)
+        return out
+
+    def is_memory_read_only(self) -> bool:
+        """記憶の読み出しだけで完結したエピソードか。
+
+        ``search_history`` は**記憶から読み出した結果を整形して返すツール**で、
+        その出力は新しい観測ではない。これをエピソード記憶へ書き戻すと、
+        注入用に組み立てたテキストが次のセッションで「参考情報」として蘇る
+        循環になる。
+
+        実害 (2026-08-16 再測定): 位置指定の自己参照回答 (PR #435) の出力
+        ``[以下は**今回の会話**の記録です] [この会話の最初の user 発話 3 件…]``
+        が LTM に取り込まれていた。**「今回の会話」というラベルごと別セッションへ
+        持ち越される**ため、読んだモデルは他人の会話を自分の会話として帰属する。
+
+        外界を観測するツール (read_file / run_command_readonly / search_code /
+        fetch_url など) は記憶する価値があるので対象外。``search_history`` と
+        実際の操作が混在するエピソードも、操作の側に記録価値があるので残す。
+        """
+        actions = self.actions()
+        return bool(actions) and set(actions) <= _MEMORY_READ_ACTIONS
 
     def conversation_id(self) -> str | None:
         if self.begin and isinstance(self.begin, dict):
@@ -262,6 +329,13 @@ class MDPIngester:
                 if ep.trace_id and ep.trace_id in private_set:
                     self._mark_processed(ep_id, already_processed)
                     continue
+                if ep.is_memory_read_only():
+                    logger.debug(
+                        "MDPIngester: skipping memory-read episode %s "
+                        "(actions=%s)", ep_id, ep.actions(),
+                    )
+                    self._mark_processed(ep_id, already_processed)
+                    continue
                 completed.append(ep)
                 self._mark_processed(ep_id, already_processed)
 
@@ -309,7 +383,7 @@ class MDPIngester:
         if task_desc:
             content_parts.append(f"task={task_desc[:300]}")
         if observation:
-            content_parts.append(f"result={observation[:300]}")
+            content_parts.append(f"result={_summarize_observation(observation)}")
         if last_actions:
             content_parts.append("actions=" + " > ".join(last_actions))
         if conv := episode.conversation_id():

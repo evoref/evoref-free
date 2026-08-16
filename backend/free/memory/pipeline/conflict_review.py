@@ -31,6 +31,9 @@ from backend.free.core.text_quality import carries_no_assertion
 from backend.free.memory.pipeline.semantic_conflict_resolver import (
     CONFLICTS_PENDING_FILENAME,
     CONFLICTS_RESOLVED_FILENAME,
+    DEFAULT_ATTRIBUTE_SIMILARITY_THRESHOLD,
+    distinct_conflict_objects,
+    split_by_attribute_similarity,
 )
 from backend.free.memory.semantic.store import SemanticFactStore
 from backend.utils import estimate_tokens
@@ -93,6 +96,7 @@ class ResolutionResult:
 
 def collect_pending_groups(
     store: SemanticFactStore, scope: str,
+    similarity_threshold: float = DEFAULT_ATTRIBUTE_SIMILARITY_THRESHOLD,
 ) -> list[PendingConflictGroup]:
     """``review_status="pending"`` の active ファクトを (subject, predicate)
     でグルーピングして返す。
@@ -121,21 +125,37 @@ def collect_pending_groups(
         if len(facts) < 2:
             continue
         facts.sort(key=lambda f: f.created_at)
-        # type 混在グループの表示用に member facts から導出する。
-        type_ = "/".join(sorted({f.type for f in facts}))
-        groups.append(PendingConflictGroup(
-            scope=scope,
-            subject=subject,
-            predicate=predicate,
-            type=type_,
-            facts=tuple(facts),
-        ))
-    groups.sort(key=lambda g: (g.scope, g.subject, g.predicate, g.type))
+        # producer が類似度で塊に割っているので、consumer 側でも同じ割り方を
+        # する。しないと別々に pending になった無関係な塊が (subject, predicate)
+        # だけで再合流し、producer が避けた偽の競合が表示側で復活する。
+        for cluster in split_by_attribute_similarity(
+            facts, similarity_threshold,
+        ):
+            if len(cluster) < 2:
+                continue
+            # 原文と [要約] だけの塊は矛盾ではなく重複。
+            if len(distinct_conflict_objects(cluster)) < 2:
+                continue
+            # type 混在グループの表示用に member facts から導出する。
+            type_ = "/".join(sorted({f.type for f in cluster}))
+            groups.append(PendingConflictGroup(
+                scope=scope,
+                subject=subject,
+                predicate=predicate,
+                type=type_,
+                facts=tuple(cluster),
+            ))
+    groups.sort(
+        key=lambda g: (
+            g.scope, g.subject, g.predicate, g.type, g.facts[0].created_at,
+        ),
+    )
     return groups
 
 
 def collect_review_groups(
     store: SemanticFactStore, scope: str,
+    similarity_threshold: float = DEFAULT_ATTRIBUTE_SIMILARITY_THRESHOLD,
 ) -> list[PendingConflictGroup]:
     """**表示用**の競合グループ。スロットの現在値まで含めて返す。
 
@@ -176,13 +196,30 @@ def collect_review_groups(
         by_slot.setdefault((f.subject, f.predicate), []).append(f)
 
     groups: list[PendingConflictGroup] = []
-    for base in collect_pending_groups(store, scope):
+    for base in collect_pending_groups(store, scope, similarity_threshold):
         newest_by_object: dict[str, SemanticFact] = {}
         for f in by_slot.get((base.subject, base.predicate), []):
             cur = newest_by_object.get(f.object)
             if cur is None or f.created_at > cur.created_at:
                 newest_by_object[f.object] = f
         members = list(newest_by_object.values())
+        if len(members) < 2:
+            continue
+        # スロット全件を引き戻すので、pending の塊と同じ属性を語っているものだけに
+        # 絞り直す。これをしないと producer / collect_pending_groups で分けた
+        # 無関係なファクトが表示段階で戻ってくる。
+        members.sort(key=lambda f: f.created_at)
+        pending_ids = {f.id for f in base.facts}
+        members = next(
+            (
+                cluster
+                for cluster in split_by_attribute_similarity(
+                    members, similarity_threshold,
+                )
+                if any(f.id in pending_ids for f in cluster)
+            ),
+            [],
+        )
         if len(members) < 2:
             continue
         members.sort(key=lambda f: f.created_at)

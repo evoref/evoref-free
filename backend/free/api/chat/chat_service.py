@@ -510,6 +510,19 @@ def session_evicted_turns(state: AppState) -> int:
     return int(getattr(working, "session_evicted_turns", 0) or 0)
 
 
+def session_first_user_message(state: AppState) -> str:
+    """現在セッションで最初に届いた user 発話を安全に取る。
+
+    窓から押し出されても ``WorkingMemory`` が 1 件だけ保持している
+    (``session_first_user_turn``)。「この会話で最初に何を言ったか」を
+    押し出し後も決定論で答えるための材料。
+
+    pillar 未構築 (degraded / テストの部分モック) では空文字列を返す。
+    """
+    working = getattr(getattr(state, "mem", None), "working_memory", None)
+    return str(getattr(working, "session_first_user_turn", "") or "")
+
+
 def build_chat_messages(
     system_prompt: str, history: list[ChatMessage],
     rag_chunks: list[str] | None,

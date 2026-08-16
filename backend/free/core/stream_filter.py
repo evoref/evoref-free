@@ -562,3 +562,123 @@ def strip_thinking_blocks(text: str) -> str:
             len(text.strip()) - len(filtered),
         )
     return filtered
+
+
+#: 内部の根拠枠 ([参考情報 N] / [関連する記憶] / ツール実行結果) への言い及び。
+#: 括弧書きの出典表記 (「（参考情報1に基づく）」) と、文中の言及の両方を拾う。
+#: 枠名は ``core.inference`` の ``_RAG_HEADER`` / ``_SEMMEM_BLOCK_LABEL`` と
+#: ``agent.deliberative`` のツール結果ヘッダに対応する。
+_INTERNAL_FRAME_WORDS = r"参考情報|関連する記憶|ツール実行結果|参照情報"
+
+#: 括弧でくくられた出典表記。丸ごと落としても文は成立する。
+_INTERNAL_FRAME_PAREN_RE = re.compile(
+    r"[（(]\s*(?:" + _INTERNAL_FRAME_WORDS + r")\s*\d*\s*"
+    r"(?:に基づく|より|参照|から|を参照|に記載)?\s*[）)]",
+)
+
+#: 括弧なしの読点区切りの出典表記 (「参考情報1によると、」)。読点まで落とす。
+_INTERNAL_FRAME_CLAUSE_RE = re.compile(
+    r"(?:" + _INTERNAL_FRAME_WORDS + r")\s*\d*\s*"
+    r"(?:に基づくと|によると|に基づけば|に記載のとおり|を踏まえると)\s*[、,]?\s*",
+)
+
+
+def strip_internal_frame_mentions(text: str) -> str:
+    """内部の根拠枠への言及を落とす (純粋関数)。
+
+    システムプロンプトは「[関連する記憶]・[参考情報]・ツール実行結果が
+    『有ったか / 無かったか』自体を話題にしない」と規定し、動的ブロックの区切り文でも
+    同じことを言っているが、実機では両方とも破られる。
+
+    実インシデント (2026-08-16 ライブ監査 ターン25): 「競合が20%値下げしてきた。
+    追随すべきか」への応答が「自社の差別化要因（参考情報1に基づく）」と、
+    ユーザーには見えない内部枠を名指しした。指示文での抑止は 2 層とも効かなかったので
+    決定論で落とす。
+    """
+    out = _INTERNAL_FRAME_PAREN_RE.sub("", text)
+    out = _INTERNAL_FRAME_CLAUSE_RE.sub("", out)
+    return out
+
+
+#: 枠名の全接頭辞。ストリーミング中に「まだ枠名になりうるか」を 1 文字単位で
+#: 判定するために使う (「関数」の「関」で一度バッファしても、次の 1 文字で
+#: 見切れるようにする)。
+_FRAME_WORD_PREFIXES = frozenset(
+    w[:i]
+    for w in ("参考情報", "関連する記憶", "ツール実行結果", "参照情報")
+    for i in range(1, len(w) + 1)
+)
+
+
+class InternalFrameMentionFilter:
+    """ストリーミング中に内部の根拠枠への言及を落とす。
+
+    表記は括弧や読点で閉じるまで判定できないため、開き括弧または枠名になりうる
+    文字が見えた時点でバッファし、閉じるか「もう枠名にならない」と分かった時点で
+    吐き出す。「関数」「参加」のような通常語は 1〜2 文字の遅延で見切れるので、
+    体感できるストリーミングの引っかかりは生じない。
+
+    StreamFilter プロトコル準拠: process() / flush()
+    """
+
+    #: 表記が閉じないままこの文字数を超えたら、通常の本文とみなして吐き出す。
+    #: 「（参考情報1に基づく）」で 13 文字なので 48 あれば十分な余裕がある。
+    _MAX_BUFFER_CHARS = 48
+
+    _OPEN_PARENS = ("（", "(")
+
+    def __init__(self) -> None:
+        self._buffer = ""
+
+    @classmethod
+    def _could_still_match(cls, buf: str) -> bool:
+        """バッファがまだ枠名への言及になりうるか。"""
+        body = buf.lstrip("（(")
+        if not body:
+            return True
+        # 枠名の途中 (「参考情」) か、枠名を言い切った後 (「参考情報1に基づ」)。
+        for w in ("参考情報", "関連する記憶", "ツール実行結果", "参照情報"):
+            if body.startswith(w):
+                return True
+        return body in _FRAME_WORD_PREFIXES
+
+    def _trigger_index(self, text: str) -> int | None:
+        for i, ch in enumerate(text):
+            if ch in self._OPEN_PARENS or ch in _FRAME_WORD_PREFIXES:
+                return i
+        return None
+
+    def process(self, text: str) -> str:
+        if not text:
+            return ""
+        if not self._buffer:
+            idx = self._trigger_index(text)
+            if idx is None:
+                return text
+            head, self._buffer = text[:idx], text[idx:]
+        else:
+            head = ""
+            self._buffer += text
+        cleaned = strip_internal_frame_mentions(self._buffer)
+        if cleaned != self._buffer:
+            # 表記が閉じた。除去後を出して、続きは素通しに戻す。
+            logger.info(
+                "InternalFrameMentionFilter: removed a mention of the internal "
+                "evidence frame from the visible answer",
+            )
+            self._buffer = ""
+            return head + cleaned
+        if (
+            not self._could_still_match(self._buffer)
+            or len(self._buffer) >= self._MAX_BUFFER_CHARS
+        ):
+            out, self._buffer = self._buffer, ""
+            return head + out
+        return head
+
+    def flush(self) -> str:
+        if not self._buffer:
+            return ""
+        out = strip_internal_frame_mentions(self._buffer)
+        self._buffer = ""
+        return out

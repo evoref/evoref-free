@@ -442,6 +442,7 @@ class VectorStore:
         embedding_model: str = "",
         embedding_backend: str = "",
         has_context: bool = False,
+        speaker: str | None = None,
     ) -> list[str]:
         """ベクトル（float32）を受け取り、int8 量子化して追加
 
@@ -449,6 +450,12 @@ class VectorStore:
         自己完結したチャンク（memory ノート等）は prefix を付けても価値が薄く、
         Step 5.8 (contextual) の source text 探索を空振りさせるだけのため、
         最初から has_context=True で登録し未処理スキャンから除外する。
+
+        ``speaker`` は memory 由来チャンクの発話者 (``user`` / ``assistant`` /
+        ``rag`` / ``system``)。検索側が「ユーザーが述べた事実」と「アシスタント
+        自身が過去に答えた内容」を区別するために使う。``LongTermMemory.note_meta``
+        にも同じ値が入るが、あちらは **プロセス内メモリのみで永続化されない**
+        ため、再起動後は読めない。ドキュメント由来のチャンクでは ``None``。
         """
         if len(vectors) != len(chunks):
             raise ValueError("vectors and chunks must have the same length")
@@ -494,6 +501,8 @@ class VectorStore:
             }
             if has_context:
                 meta_entry["has_context"] = True
+            if speaker:
+                meta_entry["speaker"] = speaker
             if embedding_model:
                 meta_entry["embedding_model"] = embedding_model
             if embedding_backend:

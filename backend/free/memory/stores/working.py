@@ -10,7 +10,25 @@ logger = get_logger("memory.working")
 
 #: トークン上限を超えたときに落とす下限水位 (``max_tokens`` に対する比)。
 #: 上限ちょうどで止めると次ターンで即また超えて毎ターン先頭が動く。
-_TOKEN_EVICT_KEEP_RATIO = 0.8
+#:
+#: この比は「次に上限へ達するまでの猶予ターン数」を決める。窓の先頭が動くと
+#: llama-server の接頭辞 KV キャッシュが system プロンプト以降まるごと無効化
+#: され、プロンプト全体が再 prefill される。hybrid (recurrent) アーキテクチャの
+#: モデルでは ``--cache-reuse`` による部分再利用も無効化されるため、逃げ道が無い。
+#:
+#: 2026-08-16 ライブ監査 (40 ターン / Qwen3.8-27B / n_ctx 8192) の実測:
+#:
+#:   押し出しが起きたターン   n=9  中央値 141.4 秒
+#:   起きなかったターン       n=31 中央値  42.7 秒
+#:
+#: ツール発火の有無で層別しても 141.4 秒 vs 44.9 秒 (3.1 倍) で、押し出しは
+#: 全 40 ターンの 22.5% でしか起きないのに LLM 総時間 2,848 秒の 48% (1,373 秒)
+#: を占めていた。1 回あたり約 +96 秒の純損失。
+#:
+#: 同セッションの実発話長 (80 メッセージ / 平均 91 tok) で水位を振ると、
+#: 先頭が動いた回数は 0.8 → 0.6 で **7 回 → 4 回** (出荷既定の 30/2048 構成)。
+#: 保持メッセージ数の平均は 15.2 → 14.1 とわずかに下がるだけで、割に合う。
+_TOKEN_EVICT_KEEP_RATIO = 0.6
 
 
 class WorkingMemory:
@@ -55,6 +73,22 @@ class WorkingMemory:
         #: 「この会話で依頼したファイル操作を全部」と聞かれ、
         #: 「ファイル操作はありません」と断言した)。
         self.session_evicted_turns: int = 0
+        #: このセッションで最初に届いた user 発話 (``clear()`` でリセット)。
+        #:
+        #: 「この会話で最初に何を言ったか」は並び順で決まる事実なので、検索にも
+        #: モデルの読解にも委ねる理由が無い。ところが窓から押し出されると
+        #: ``turns`` からも ``_evicted`` からも消えるため、押し出し後は
+        #: **注記を出して降りる** しかなかった (``agent.deliberative.
+        #: _append_session_position_fact``)。
+        #:
+        #: 実インシデント (2026-08-16 ライブ監査 ターン34):
+        #: 「今日の会話のいちばん最初、私は何の話をした？」に対し、正解
+        #: 「おはよう。今朝はけっこう冷え込んでるね…」は ``[参考情報 2]`` として
+        #: **プロンプトに載っていた** のに、併記された「冒頭 42 件は見えていない・
+        #: 断定するな」の注記が勝ち、窓の先頭 (「SaaS の解約率を…」) を
+        #: 「確認できる範囲での最古」として答えた。1 文字保持しておけば
+        #: 決定論で確定できる。
+        self.session_first_user_turn: str = ""
 
     def add_turn(
         self,
@@ -113,6 +147,8 @@ class WorkingMemory:
             turn["tool_command_source"] = tool_command_source
         if tool_command_query is not None:
             turn["tool_command_query"] = tool_command_query
+        if role == "user" and not self.session_first_user_turn and content.strip():
+            self.session_first_user_turn = content
         self.turns.append(turn)
         self._enforce_limits()
 
@@ -132,6 +168,7 @@ class WorkingMemory:
         # clear() はセッション切替時に呼ばれる。新しいセッションでは「前半が
         # 落ちている」状態ではないのでカウンタも畳む。
         self.session_evicted_turns = 0
+        self.session_first_user_turn = ""
 
     def drain_evicted(self) -> list[dict]:
         """Layer 2 への転送用: 押し出されたターンを取得してバッファをクリア"""

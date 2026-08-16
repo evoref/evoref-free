@@ -234,6 +234,71 @@ _CODE_SEARCH_PATTERNS = (
     ),
 )
 
+# 所在を問う言い回し (「<識別子> はどこで使われていますか」) の共起ガード。
+#
+# ``_CODE_SEARCH_PATTERNS`` は「コード/ファイル語 × 検索動詞」を要求するが、
+# この言い方は **どちらの語も含まない**。結果、ルール層を素通りして文法制約
+# 分類器へ落ち、分類器は所在探索に無意味な ``list_directory`` を選ぶ。
+#
+# 2026-08-16 ライブ監査ターン 19「このプロジェクトで LangChain はどこで
+# 使われていますか？」: ``list_directory`` が 5,477 文字のツリーを返し、それを
+# 再 prefill した結果 **218.6 秒** (当セッション最長) を消費したうえ、
+# 「一覧は途中が省略されているため確認できません」で終わった。同じ質問は
+# ``search_code`` なら 1 回の grep で答えが出る。
+_CODE_USAGE_LOCATION_RE = re.compile(
+    r"(?:どこ|どの(?:ファイル|モジュール|クラス|関数|パッケージ)"
+    r"|\bwhere\b|which\s+(?:file|module|class|function))",
+    re.IGNORECASE,
+)
+#: 所在を問う対象の動詞。可能形 (「使えますか」) は「利用可否」の質問であって
+#: 所在の質問ではないので採らない (受身/サ変の語幹だけを見る)。
+_CODE_USAGE_VERB_RE = re.compile(
+    r"(?:使わ|使用さ|利用さ|定義さ|実装さ|呼ば|宣言さ|参照さ|書かれ"
+    r"|\bused\b|\bdefined\b|\bimplemented\b|\bdeclared\b|\breferenced\b"
+    r"|\bcalled\b)",
+    re.IGNORECASE,
+)
+#: 検索対象になりうる ASCII 識別子。これが無いクエリ (「敬語はどこで使われますか」
+#: のような自然言語の質問) では発火させない — search_code はコード検索であり、
+#: 識別子が取れないなら撃つ意味がない。
+_CODE_IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w{2,}")
+
+
+#: 所在質問の骨組みを成す英語の機能語。``_extract_search_pattern`` はこれらを
+#: 落とさないため、"where is search_code used?" で ``where`` を検索語に採って
+#: しまう (grep 対象として無意味)。この経路専用に除外する。
+_CODE_USAGE_STOPWORDS = frozenset({
+    "where", "which", "what", "file", "files", "module", "modules", "class",
+    "classes", "function", "functions", "package", "packages", "the", "this",
+    "that", "these", "those", "and", "for", "from", "with", "into", "does",
+    "did", "are", "was", "were", "been", "being", "used", "uses", "use",
+    "defined", "define", "defines", "implemented", "implements", "declared",
+    "declares", "referenced", "references", "called", "calls", "project",
+    "codebase", "repository", "repo", "code", "source",
+})
+
+
+def _is_code_usage_location_query(query: str) -> bool:
+    """「<識別子> はどこで使われているか」型の所在質問か。"""
+    return bool(
+        _CODE_USAGE_LOCATION_RE.search(query)
+        and _CODE_USAGE_VERB_RE.search(query)
+        and _CODE_IDENTIFIER_RE.search(query),
+    )
+
+
+def _code_usage_location_pattern(query: str) -> str:
+    """所在質問から grep 対象の識別子を取り出す。
+
+    質問の骨組み (where / file / used ...) を除いた最初の ASCII 識別子。
+    残らなければ空文字 (呼出側はルール発火を見送る)。
+    """
+    for token in _CODE_IDENTIFIER_RE.findall(query):
+        if token.lower() not in _CODE_USAGE_STOPWORDS:
+            return token
+    return ""
+
+
 # ルールベースフォールバック用パターン
 # 注意: 「検索」等の汎用語は知識質問にもマッチするため、
 # コード/ファイル文脈を要求するパターンのみ含める。
@@ -1197,12 +1262,28 @@ _ORDER_QUERY_SCAFFOLD_RE = re.compile(
 )
 # 内容ラン (漢字 / カタカナ / ラテン / 数字。ひらがなの助詞・活用語尾は自然に
 # 脱落する)。
+#
+# ひらがなを語の一部として取り込む案は採らない。送り仮名 (食べ物) と助詞・活用
+# 語尾 (私が今日 / 話した / 見た映画) を辞書無しで区別できず、取り込むと
+# 「が今日ハマってるって話した食べ物」のような **1 個の巨大な融合語** になる。
+# 融合語は照合側の定足数を確実に落とすため、分割 (食べ物 → 食 / 物) より害が
+# 大きい。語の分断は照合側の定足数を緩めることで受け止める
+# (``history.history_manager._text_matches_query``)。
 _ORDER_QUERY_CONTENT_RE = re.compile(
     r"[一-鿿゠-ヿ々〆a-zA-Z0-9]+",
 )
+
+#: 1 文字の内容ランは検索語として意味を持たない (良 / 久 / 泣 / 人 / 勧)。
+#: 照合側が 2 文字未満を捨てるため効きもしないのに、クエリ文字列だけを膨らませる
+#: (実インシデント 2026-08-16 ライブ監査 ターン5:
+#: ``昨日見 映画 良 久 泣 人 勧`` の 7 語のうち 5 語が 1 文字だった)。
+_ORDER_QUERY_MIN_TERM_LEN = 2
 # 内容ランのうち scaffolding とみなして落とす語 (質問・順序・自己参照の骨組み)。
 _ORDER_QUERY_STOPWORD_RUNS = frozenset({
     "会話", "一番", "最初", "最後", "直近", "以前", "前回", "今日", "今回", "今",
+    # 時点の scaffolding。「今日」だけが登録されていたため「昨日見た映画が…」が
+    # ``昨日見`` という壊れた融合語になっていた (2026-08-16 ライブ監査 ターン5)。
+    "昨日", "明日", "昨夜", "今朝", "先日", "最近", "先週", "先月",
     "問題", "質問", "内容", "話題", "話", "何", "誰", "私", "貴方", "君", "僕",
     "俺", "覚", "番目", "回目", "先",
     # 明示的な履歴検索依頼の骨組み (「過去の会話で〜を探して/調べて」)
@@ -1228,9 +1309,14 @@ def _strip_stopword_affixes(run: str) -> str:
     フルパスをもう一度教えてください」→ ``今日私 読 ファイル フルパス 一度教``
     で 0 件。``今日``+``私``、``一度``+``教`` がそれぞれ融合していた)。
 
-    剥がすのは **残りが 2 文字以上、または残り自体がストップワード** の場合
-    だけにする。無条件に剥がすと「教育」→「育」のように内容語を壊す
-    (``教`` がストップワード)。
+    剥がすのは **残りが 2 文字以上、残り自体がストップワード、または剥がした
+    ストップワードが 2 文字以上** の場合だけにする。無条件に剥がすと「教育」→
+    「育」のように内容語を壊す (``教`` がストップワード)。
+
+    3 つ目の条件は「2 文字以上の時点語 + 1 文字の動詞」の融合を解くためのもの
+    (実インシデント 2026-08-16 ライブ監査 ターン5: 「昨日見た映画が…」が
+    ``昨日見`` という実在しない語になり、照合の定足数を確実に落としていた)。
+    1 文字のストップワードでは発動しないので「教育」は壊れない。
     """
     changed = True
     while changed and run:
@@ -1244,7 +1330,11 @@ def _strip_stopword_affixes(run: str) -> str:
             ):
                 if rest is None:
                     continue
-                if len(rest) >= 2 or rest in _ORDER_QUERY_STOPWORD_RUNS:
+                if (
+                    len(rest) >= 2
+                    or rest in _ORDER_QUERY_STOPWORD_RUNS
+                    or len(stopword) >= 2
+                ):
                     run, changed = rest, True
                     break
             if changed:
@@ -1306,8 +1396,14 @@ def _reduce_ordered_history_query(query: str) -> str:
     for run in content_re.findall(stripped):
         # 日本語はランの融合を解いてから照合する (英語は空白で切れており不要)。
         term = run if en else _strip_stopword_affixes(run)
-        if term and term.lower() not in stopwords:
-            terms.append(term)
+        if not term or term.lower() in stopwords:
+            continue
+        # 1 文字の内容語は照合側が捨てるので、ここで落としてクエリを汚さない
+        # (:data:`_ORDER_QUERY_MIN_TERM_LEN`)。英語側は元から空白区切りで
+        # 1 文字語がほぼ出ないため、日本語だけに掛ける。
+        if not en and len(term) < _ORDER_QUERY_MIN_TERM_LEN:
+            continue
+        terms.append(term)
     reduced = " ".join(terms).strip()
     return reduced if len(reduced) >= 2 else query
 
@@ -1384,6 +1480,11 @@ def _query_has_tool_signal(query: str, context: str = "") -> bool:
         # 暗算に倒れる (2026-08-08 ライブ監査:「時速240kmで2時間30分走ると
         # 何km進みますか。」→ 540km。正解 600km)。
         or looks_like_numeric_question(query, context)
+        # 「<識別子> はどこで使われていますか」は _TOOL_PATTERNS のどれにも
+        # 当たらず、文末の「〜ですか」で knowledge query として落ちる。
+        # ルール層を素通りした結果、分類器が所在探索に無意味な list_directory
+        # を選び 218.6 秒を捨てていた (2026-08-16 ライブ監査ターン 19)。
+        or _is_code_usage_location_query(query)
     )
 
 
@@ -2410,6 +2511,13 @@ class ToolCallJudge:
                 "immediate_children_depth",
                 lambda r: self._scope_list_directory_depth(r, query),
             ),
+            # 深さ絞りと同じ「依頼文から決まる引数の確定」。決定論層は
+            # _extract_head_line_count を見るが文法制約分類器は見ないため、
+            # 分類器で確定した瞬間に「先頭 N 行」の指定が消えていた。
+            (
+                "read_file_line_range",
+                lambda r: self._scope_read_file_line_range(r, query),
+            ),
             (
                 "proximal_recall_excluded_session",
                 lambda r: self._suppress_proximal_recall_cross_session(r, query),
@@ -2598,6 +2706,48 @@ class ToolCallJudge:
         logger.info(
             "list_directory scoped to immediate children for query: %s",
             query[:60],
+        )
+        return ToolJudgement(
+            tool_needed=True,
+            tool_name=result.tool_name,
+            tool_args=args,
+            source=result.source,
+        )
+
+    def _scope_read_file_line_range(
+        self, result: "ToolJudgement", query: str,
+    ) -> "ToolJudgement":
+        """「先頭 N 行だけ」の読取依頼で ``read_file`` を範囲指定に絞る。
+
+        ``list_directory`` の深さ絞り (:meth:`_scope_list_directory_depth`) と
+        同じく、依頼文から決まる**引数の確定**であって抑止ではない。したがって
+        層を問わず適用してよい (ツール名が違えば no-op)。
+
+        層ごとに書き写していたため実際に食い違っていた: ``_infer_tool`` と
+        ``_referential_read_judgement`` は ``_extract_head_line_count`` を見るが、
+        **文法制約ツール分類 (層5.9) は見ない**。分類器は ``file_path`` しか
+        埋めないため、そこで確定した瞬間に範囲指定が消える。
+
+        実インシデント (2026-08-16 再測定ターン 14):「そのファイルの先頭2行だけ
+        見せてください。」→ ``Tool classifier selected: read_file({'file_path': ...})``
+        で全文 3,405 文字が返り、2 行の依頼に対して全文が渡っていた。同じ意味の
+        「全文は長すぎます。そのファイルの先頭5行だけをそのまま見せてください。」は
+        決定論層が拾って ``showing lines 1-5`` になる。**言い回しで挙動が割れていた**。
+
+        既に範囲が入っている判定 (決定論層が確定させた場合) は触らない。
+        """
+        if result.tool_name != "read_file" or not query:
+            return result
+        args = dict(result.tool_args or {})
+        if args.get("start_line") is not None or args.get("end_line") is not None:
+            return result
+        head = _extract_head_line_count(query)
+        if head is None:
+            return result
+        args["start_line"] = 1
+        args["end_line"] = head
+        logger.info(
+            "read_file scoped to head %d lines for query: %s", head, query[:60],
         )
         return ToolJudgement(
             tool_needed=True,
@@ -3703,10 +3853,16 @@ class ToolCallJudge:
         # 数えても正確にならないため read_file のメタ行 (lines / chars) を
         # 使わせる (実測 2026-08-05: ツール未発火のまま「確認できません」と
         # 回答放棄した)。パス抽出済みの分岐なので誤爆はファイル参照時に限る。
+        # 有無を問う語 (存在し / ありますか / exists ...) も読み取り側に含める。
+        # パス抽出済みの分岐なので「ファイルの話」であることは確定しており、
+        # これが無いと「E:\tmp\a.txt はまだありますか」がツール未発火のまま
+        # base の記憶で断定される (2026-08-16 監査の「存在しますか」形とは
+        # 語尾違いで挙動が割れていた)。
         if re.search(
             r"(?:読[みむ]込|読んで|開いて|見せて|見て|確認|チェック|確かめ"
             r"|正し[いく]|合って|内容|中身|何文字|文字数|何行|行数"
-            r"|read|show|check|verify|correct|content|view"
+            r"|存在し|ありますか|あるか|残ってい|消えてい"
+            r"|read|show|check|verify|correct|content|view|exists?"
             r"|how many (?:characters|chars|lines))",
             q,
         ):
@@ -3722,6 +3878,11 @@ class ToolCallJudge:
                     if head_lines is not None:
                         args["start_line"] = 1
                         args["end_line"] = head_lines
+                    elif asks_file_existence_only(query):
+                        # 有無だけを問う質問に全文を渡すとモデルが全文を復唱する。
+                        # メタ行 (lines / chars) だけで答えられるので 1 行に絞る。
+                        args["start_line"] = 1
+                        args["end_line"] = 1
                     return "read_file", args
 
         # ファイル書き込み/出力パターン
@@ -3759,6 +3920,19 @@ class ToolCallJudge:
         # の部分一致にも誤爆するため、コード/ファイル文脈語との共起を要求する
         # — 2026-07-22 監査で判明。裸の検索語だけで抽出パターンが確定し、
         # 無関係ファイルへの search_code 誤発火を招いていた)
+        # 所在を問う言い回し (「<識別子> はどこで使われていますか」)。
+        # _CODE_SEARCH_PATTERNS は「コード/ファイル語 × 検索動詞」の共起を
+        # 要求するため、この言い方は**どちらの語も含まず**ルール層を素通りする。
+        #
+        # より一般的な _CODE_SEARCH_PATTERNS より **先に** 判定する: 所在質問は
+        # 疑問詞が骨組みなので、汎用の _extract_search_pattern だと疑問詞自体を
+        # 検索語に採ってしまう ("where is search_code used?" → pattern="where")。
+        if (_is_code_usage_location_query(query)
+                and tools_registry.is_available("search_code", mode)):
+            pattern = _code_usage_location_pattern(query)
+            if pattern:
+                return "search_code", {"pattern": pattern}
+
         if (any(p.search(query) for p in _CODE_SEARCH_PATTERNS)
                 and tools_registry.has("search_code")):
             # クエリからキーワードを抽出して pattern 引数に設定
@@ -4135,6 +4309,40 @@ def _referential_read_judgement(
 _HEAD_LINES_RE = re.compile(
     r"(?:最初|先頭|冒頭|頭|first|head|top)\D{0,6}?([0-9０-９]{1,4})\s*(?:行|lines?)",
 )
+
+#: 「このファイルは存在しますか」= 有無だけを問う質問。
+_FILE_EXISTENCE_RE = re.compile(
+    r"(?:存在し|ありますか|あるか|残ってい|消えてい|できてい"
+    r"|\bexists?\b|\bis there\b|\bstill there\b)",
+    re.IGNORECASE,
+)
+#: 本文そのものを求める語。存在確認と併記されていれば内容要求が優先される
+#: (「まだ存在しますか？先頭3行だけ見せてください」)。
+_FILE_CONTENT_REQUEST_RE = re.compile(
+    r"(?:見せ|見たい|中身|内容|読[んみむ]|表示|出力|全文|何文字|文字数|何行|行数"
+    r"|\bshow\b|\bcontent\b|\bread\b|\bdisplay\b|\bprint\b|\bdump\b)",
+    re.IGNORECASE,
+)
+
+
+def asks_file_existence_only(query: str) -> bool:
+    """ファイルの有無だけを問い、本文は求めていないか。
+
+    有無だけを聞かれているのに ``read_file`` を範囲指定なしで撃つと全文が
+    ツール結果として返り、モデルはそれを回答に丸ごと復唱する。
+
+    2026-08-16 ライブ監査ターン 14「E:\\...\\README.md というファイルは存在
+    しますか？」: 3,331 文字の全文が返り、モデルは全文の復唱を始めて
+    **ちょうど 1,024 トークン (llama.max_tokens の既定値) で表の途中で切断**
+    された。yes/no の質問に **197 秒** かけ、しかも回答は未完だった。
+
+    ``read_file`` は先頭にメタ行 ``[file: ... | lines: N | chars: M]`` を付ける
+    ので、1 行だけ読めば「存在する / 何行・何文字か」は決定論的に答えられる。
+    """
+    return bool(
+        _FILE_EXISTENCE_RE.search(query)
+        and not _FILE_CONTENT_REQUEST_RE.search(query),
+    )
 
 
 def _extract_head_line_count(query: str) -> int | None:

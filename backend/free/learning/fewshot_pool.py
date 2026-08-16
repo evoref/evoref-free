@@ -30,8 +30,10 @@ from backend.free.agent.prompt_utils import (
 )
 from backend.free.core.session_mode import is_valid_session_mode, normalize_session_mode
 from backend.free.core.text_quality import (
+    asks_verbatim_excerpt,
     has_boilerplate_closing,
     has_broken_ja_spacing,
+    has_chinese_token_leak,
     is_query_echo,
 )
 from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
@@ -160,6 +162,13 @@ def _response_leaks_internal_scaffold(response: str) -> bool:
 #: — 別々に定義すると片方だけ直る。
 _response_has_broken_ja_spacing = has_broken_ja_spacing
 
+#: 日本語の応答に中国語の語彙が紛れた例も手本にしない。語間空白と同じく
+#: 「崩れた出力が手本として再生産される自己増幅」を断つための決定論ゲート。
+#: 2026-08-16 ライブ監査 (Qwen3.8-27B): 「私について知っていること」を 2 度
+#: 尋ねた両方で「名前**是**小川さんです。」と繋辞の ``是`` が出た (2 度目は
+#: 1 度目の出力が文脈に残っていたための複写)。
+_response_has_chinese_token_leak = has_chinese_token_leak
+
 
 #: 発話時点の「いま」を指す語。これを含む問いへの答えは、その日にしか成立しない。
 _PRESENT_TIME_RE = re.compile(
@@ -276,6 +285,11 @@ def find_content_rejection(query: str, response: str) -> str | None:
     # 毎ターン選択され本文なしの極小ファイル生成を誘発した)。
     if _response_is_task_log_only(response):
         return "task-log-only response"
+    # 逐語の抜粋を求める依頼への応答は「ツール出力の逐語コピー」であって文体の
+    # 手本ではない。載せると「ペイロードを貼るのが正解」というバイアスを注入し、
+    # 別の質問にも本文の貼り付けを誘発する (2026-08-16 動作検証 T9)。
+    if asks_verbatim_excerpt(query):
+        return "response is a verbatim excerpt, not a style example"
     # 内部足場の語彙を含む応答は PROTECTED 違反の実例なので手本にしない
     if _response_leaks_internal_scaffold(response):
         return "leaks internal scaffold vocabulary"
@@ -283,6 +297,9 @@ def find_content_rejection(query: str, response: str) -> str | None:
     # 手本として再生産される自己増幅ループになる (_JA_INTERWORD_SPACE_RE 参照)。
     if _response_has_broken_ja_spacing(response):
         return "broken JA spacing"
+    # 日本語に中国語の語彙が紛れた応答も同じ理由で手本にしない。
+    if _response_has_chinese_token_leak(response):
+        return "Chinese token leaked into JA response"
     # 質問を逐語で繰り返しただけの応答は「問いをそのまま返すのが正解」という
     # バイアスを注入する (2026-08-04 ライブ監査: 同文 5 回で答えが出なくなった)。
     if is_query_echo(response, query):

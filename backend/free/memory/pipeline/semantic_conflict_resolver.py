@@ -49,15 +49,141 @@ EvorefMem 統合仕様 における sleep-time **Step 6** の SemMem 対応分
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Literal
+
+import numpy as np
 
 from backend.free.memory.semantic.store import SemanticFactStore
 from backend.free.memory.types import SemanticFact
 from backend.log_config import get_logger
 
 logger = get_logger("memory.semantic.conflict")
+
+#: 同 ``(subject, predicate)`` のファクトを「同じ属性についての言い直し」と
+#: みなす最小コサイン類似度。
+#:
+#: subject は属性単位へ分割される設計だが (``resolve_fact_attribute``)、
+#: トリガ辞書に無い属性は ``mem.personal.user`` へフォールバックする。すると
+#: **飲み物の好みと食べ物の好みが同じスロットに入り**、``(subject, predicate)``
+#: だけで束ねる検出器がそれを競合と誤判定する。
+#:
+#: 実インシデント (2026-08-16 ライブ監査): 毎ターン注入されていた競合ブロック
+#:   [C1] (personal_fact) mem.personal.user states:
+#:   旧「私はコーヒーより紅茶派です。」/ 旧「…担々麺にハマってて、週2で…」/
+#:   旧「コーヒー派？紅茶派？私はコーヒーを1日3杯は飲んじゃう。」…
+#: は、飲み物 2 件 + 食べ物 1 件 (と各々の [要約]) を 1 つの矛盾として提示していた。
+#:
+#: 実測 (同ストアの実ファクト、LFM2.5-Embedding-350M):
+#:   真の競合 (同じ属性の言い直し) … 0.796 / 0.798 / 0.956 / 0.963
+#:   偽の競合 (別の属性)          … 0.316 / 0.329 / 0.335 / 0.371 / 0.383 / 0.418
+#: 分離は完全で、0.45〜0.75 のどこを取っても正しく分かれる。競合の取りこぼしは
+#: 古い値が残り続ける害があるため (2026-08-16 監査の主要因の一つ)、中央より
+#: 低めの 0.55 を採る。
+#:
+#: ``memory.conflict_similarity_threshold`` (0.85) とは別物。あちらは STM ノートの
+#: 「同一ノートか」の判定で、ここは「同じ属性についての言明か」の判定。
+DEFAULT_ATTRIBUTE_SIMILARITY_THRESHOLD = 0.55
+
+
+#: ``compress_turn(style="summary")`` の圧縮マークと末尾の元文字数。
+_SUMMARY_MARK = "[要約] "
+_SUMMARY_TAIL_RE = re.compile(r"…（\d+文字）\s*$")
+
+
+def normalize_object_for_conflict(text: str) -> str:
+    """競合の「値が違うか」を見るための object 正規化 (純粋関数)。
+
+    同じ発話から原文と ``[要約]`` 版の 2 ファクトが生まれることがある。文字列
+    としては違うので「値が 2 つある = 競合」と判定されるが、中身は同じ発話で
+    矛盾していない。
+
+    実インシデント (2026-08-16 ライブ監査): 「最近ハマってる食べ物ってある？
+    私は担々麺に…」とその ``[要約]`` 版が「内容が矛盾しています」として毎ターン
+    提示されていた。
+    """
+    body = (text or "").strip()
+    if body.startswith(_SUMMARY_MARK):
+        body = body[len(_SUMMARY_MARK):]
+    body = _SUMMARY_TAIL_RE.sub("", body)
+    return "".join(body.split())
+
+
+def distinct_conflict_objects(facts: Iterable[SemanticFact]) -> set[str]:
+    """競合判定に使う「異なる値」の集合。
+
+    原文と ``[要約]`` は同一視する (:func:`normalize_object_for_conflict`)。
+    片方が他方の接頭辞になる場合 (要約は先頭 N 文字) も同一視する。
+    """
+    keys: list[str] = []
+    for f in facts:
+        key = normalize_object_for_conflict(f.text or "")
+        if not key:
+            continue
+        if any(key.startswith(k) or k.startswith(key) for k in keys):
+            continue
+        keys.append(key)
+    return set(keys)
+
+
+def split_by_attribute_similarity(
+    facts: list[SemanticFact], threshold: float,
+) -> list[list[SemanticFact]]:
+    """同スロットのファクト群を「同じ属性について語っている塊」へ分ける。
+
+    類似度が ``threshold`` 以上のペアを辺として連結成分を取る。埋め込みを持たない
+    ファクトは判定できないので **単独では切り離さず** 全体と繋いだままにする
+    (競合の取りこぼしより偽の競合の方がまし、という判断はしない — 取りこぼすと
+    古い値が恒久的に残る)。
+
+    Returns:
+        塊のリスト。入力順 (created_at 昇順) は各塊の中で保たれる。
+    """
+    if len(facts) < 2 or threshold <= 0:
+        return [facts]
+    vectors: list[Any] = []
+    no_embedding: list[int] = []
+    for i, f in enumerate(facts):
+        emb = getattr(f, "embedding", None)
+        if emb is None:
+            no_embedding.append(i)
+            vectors.append(None)
+            continue
+        vec = np.asarray(emb, dtype=np.float32)
+        norm = float(np.linalg.norm(vec))
+        vectors.append(vec / norm if norm else None)
+        if norm == 0:
+            no_embedding.append(i)
+    # union-find
+    parent = list(range(len(facts)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(len(facts)):
+        for j in range(i + 1, len(facts)):
+            vi, vj = vectors[i], vectors[j]
+            if vi is None or vj is None:
+                # 判定できない組は繋いだままにする (取りこぼし防止)。
+                union(i, j)
+                continue
+            if float(vi @ vj) >= threshold:
+                union(i, j)
+
+    groups: dict[int, list[SemanticFact]] = {}
+    for i, f in enumerate(facts):
+        groups.setdefault(find(i), []).append(f)
+    return list(groups.values())
 
 
 CONFLICTS_PENDING_FILENAME = "conflicts.jsonl"
@@ -109,6 +235,12 @@ class SemanticConflictResolver:
         # pending 競合の TTL 自動解消 (秒)。0 で無効。
         self.pending_ttl_sec: float = (
             float(cfg.get("pending_auto_resolve_days", 3.0)) * 86400.0
+        )
+        self.attribute_similarity_threshold: float = float(
+            cfg.get(
+                "attribute_similarity_threshold",
+                DEFAULT_ATTRIBUTE_SIMILARITY_THRESHOLD,
+            ),
         )
         self._now_provider = now_provider or time.time
 
@@ -220,6 +352,11 @@ class SemanticConflictResolver:
 
         ``review_status == "pending"`` のファクトは前サイクルで既に pending
         と判定済みなので再処理しない (二重通知防止)。
+
+        スロットは属性単位に分かれている **はず** だが、トリガ辞書に無い属性は
+        ``mem.personal.user`` へフォールバックするため、無関係な事実が同居する。
+        そのまま束ねると偽の競合になるので、類似度で塊に割ってから競合とみなす
+        (:func:`split_by_attribute_similarity`)。
         """
         active = self.store.all_facts(include_superseded=False)
         buckets: dict[tuple[str, str], list[SemanticFact]] = {}
@@ -231,11 +368,15 @@ class SemanticConflictResolver:
         for facts in buckets.values():
             if len(facts) < 2:
                 continue
-            objects = {f.object for f in facts}
-            if len(objects) < 2:
-                continue
             facts.sort(key=lambda x: x.created_at)
-            groups.append(facts)
+            for cluster in split_by_attribute_similarity(
+                facts, self.attribute_similarity_threshold,
+            ):
+                if len(cluster) < 2:
+                    continue
+                if len(distinct_conflict_objects(cluster)) < 2:
+                    continue
+                groups.append(cluster)
         return groups
 
     # ── 判定 ─────────────────────────────────────────────────────────

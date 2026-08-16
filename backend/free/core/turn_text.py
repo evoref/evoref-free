@@ -13,7 +13,12 @@
 
 1. 動的ブロック (few-shot / RAG / 記憶) — ``prepend_to_last_user`` で **前置**。
    生クエリは末尾に残る。
-2. 現在日付 / 人格 / 文字数上限の注記 — ``append_to_last_user`` で後置
+   例外: 生クエリが直前の出力を指す照応 (「上の内容を」「さっきの話」) を含む
+   ターンだけは ``append_to_last_user`` で **生クエリの後ろ** へ回す。前置すると
+   注入ブロックが指示語の参照先を奪うため。system へは回さない (prefix KV
+   キャッシュが全損する)。
+2. 最新ターン切り詰めの注記 / 現在日付 / 人格 / 文字数上限の注記 —
+   ``append_to_last_user`` で後置
    (``core.inference.build_messages`` / ``build_messages_for_loop``)。
 3. ツール実行結果 + 話題再フォーカス — 後置 (``agent.deliberative``)。
 

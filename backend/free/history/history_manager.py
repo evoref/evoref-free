@@ -34,6 +34,22 @@ _TOKEN_OVERLAP_RATIO = 0.7
 # 短いクエリは完全部分文字列一致 (高速パス) で既に救済されている前提。
 _TOKEN_OVERLAP_MIN_QUERY_TOKENS = 5
 
+# 空白区切りのキーワード列 (判定側の抽出器が渡す形) に使う最小重なり割合。
+#
+# bi-gram 側の 0.7 をそのまま流用していたが、あの厳しさは「助詞絡みの連結詞的
+# bi-gram が偶然重なる」ことへの対策であって、2 文字以上の内容語には当てはまら
+# ない。しかも ceil の効き方で 2 語なら 2 件、3 語なら 3 件が必要になり、**実質
+# AND** になっていた。抽出器は語を落とす方向に不完全 (漢字ランだけを拾うため
+# 「食べ物」→「食」「物」、「昨日見た映画」→「昨日見」「映画」) なので、全語一致を
+# 要求すると 1 個の壊れた語が検索全体を殺す。
+#
+# 実インシデント (2026-08-16 ライブ監査): search_history の発火 4 件が全て 0 件。
+# 「昨日見た映画が…」→ ``昨日見 映画`` は ceil(2*0.7)=2 で ``昨日見`` との AND に
+# なり、そんな語は履歴に存在しないため構造的に当たらなかった。
+#
+# 精度はここではなく ``_score_entry`` のランキングと呼出側の limit で担保する。
+_KEYWORD_OVERLAP_RATIO = 0.5
+
 
 @lru_cache(maxsize=64)
 def _tokenize_cached(text: str) -> frozenset[str]:
@@ -88,7 +104,10 @@ def _text_matches_query(text: str, query_lower: str) -> bool:
     terms = [t for t in query_lower.split() if len(t) >= 2]
     if terms and len(query_lower.split()) > 1:
         hit = sum(1 for t in terms if t in text_lower)
-        if hit >= math.ceil(len(terms) * _TOKEN_OVERLAP_RATIO):
+        # 抽出器が語を落とす方向に不完全なので、全語一致は要求しない
+        # (:data:`_KEYWORD_OVERLAP_RATIO` の説明を参照)。
+        required = max(1, math.ceil(len(terms) * _KEYWORD_OVERLAP_RATIO))
+        if hit >= required:
             return True
     query_tokens = _tokenize_cached(query_lower)
     if len(query_tokens) < _TOKEN_OVERLAP_MIN_QUERY_TOKENS:

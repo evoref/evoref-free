@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class MtpConfig(BaseModel):
@@ -177,6 +177,36 @@ class LlamaConfig(BaseModel):
     # 解決する。false で全機構 OFF (従来挙動)。
     auto_model_flags: bool = True
     extra_args: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def warn_idle_slot_cache_without_ram_budget(self) -> "LlamaConfig":
+        """``cache_idle_slots`` が ``cache_ram_mib=0`` で無効化される構成を通知する。
+
+        ``--cache-idle-slots`` は退避先 (``--cache-ram``) が無いと機能しない。
+        llama-server はこれを起動時に自分で無効化するが、警告は **ランチャの
+        端末にしか出ずログファイルに残らない**ため、config 上は有効に見えたまま
+        効いていない状態が続く。
+
+            W srv init: --cache-idle-slots requires --cache-ram, disabling
+
+        (2026-08-16 ライブ監査時の llama-base.stderr.log で確認。同セッションでは
+        窓の押し出しごとに全再 prefill が走っており、idle slot の KV 退避は
+        まさに効かせたい機構だった。)
+
+        エラーにはしない: ``cache_idle_slots`` を明示 false にせず ``cache_ram_mib``
+        だけで機構ごと切るのは正当な設定なので、片方を触った時に気付ければよい。
+        """
+        if self.cache_idle_slots and self.cache_ram_mib == 0:
+            from backend.log_config import get_logger
+
+            get_logger("config").warning(
+                "llama.cache_idle_slots=true has no effect while "
+                "llama.cache_ram_mib=0: llama-server disables --cache-idle-slots "
+                "when --cache-ram is absent. Set cache_ram_mib > 0 (or -1 for "
+                "unlimited) to keep idle slot KV, or set cache_idle_slots=false "
+                "to make the intent explicit.",
+            )
+        return self
 
 
 class ProfileSamplingConfig(BaseModel):

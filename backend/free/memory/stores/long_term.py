@@ -16,6 +16,25 @@ class LongTermMemory:
         self.vectors = vector_store
         self.note_meta: dict[str, dict] = {}  # {note_id: meta_dict}
 
+    def chunk_source(self, chunk_id: str) -> str | None:
+        """チャンクの発話者 (``user`` / ``assistant`` / ``rag`` / ``system``)。
+
+        ``note_meta`` (プロセス内) を先に見て、無ければベクトルストアの
+        ``metadata.json`` を見る。前者は再起動で消えるため、**永続化されている
+        後者が本命**。どちらにも無ければ ``None`` (ドキュメント由来のチャンクと、
+        speaker を記録する前に取り込まれた古いチャンク)。
+        """
+        meta = self.note_meta.get(chunk_id) or {}
+        if meta.get("source"):
+            return meta["source"]
+        try:
+            for entry in getattr(self.vectors, "metadata", []) or []:
+                if entry.get("id") == chunk_id:
+                    return entry.get("speaker")
+        except Exception:
+            return None
+        return None
+
     def search(
         self,
         query_vec: np.ndarray,
@@ -99,6 +118,9 @@ class LongTermMemory:
             source=f"memory:{note.session_id}",
             category="memory",
             has_context=True,
+            # 発話者は下の note_meta にも入れるが、あちらはプロセス内メモリのみで
+            # 永続化されない。再起動後に読めるよう metadata.json 側にも残す。
+            speaker=getattr(note, "source", None),
         )
 
         chunk_id = chunk_ids[0]

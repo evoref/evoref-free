@@ -40,8 +40,8 @@ from backend.free.agent.tool_call_judge import _extract_file_path
 from backend.free.agent.output_format import infer_output_extension
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.core.stream_filter import (
-    HeadBufferFilter, QueryEchoFilter, RepetitionGuardFilter,
-    StreamThinkingFilter,
+    HeadBufferFilter, InternalFrameMentionFilter, QueryEchoFilter,
+    RepetitionGuardFilter, StreamThinkingFilter,
 )
 from backend.free.core.stream_pipeline import StreamPipeline
 from backend.free.llm.local_client import LocalClient
@@ -1786,6 +1786,10 @@ async def _stream_filtered_token_pipeline(
         # 思考ブロック除去・先頭ラベル除去を通したあとの「実際にユーザーへ出る
         # テキスト」に対して反復を判定する (前段が落とす行を数えないため)。
         RepetitionGuardFilter(query),
+        # 内部の根拠枠 (「（参考情報1に基づく）」) の名指しを最後に落とす。
+        # system プロンプトと動的ブロックの区切り文の両方で禁じているのに
+        # 実機では破られた (2026-08-16 ライブ監査 ターン25)。
+        InternalFrameMentionFilter(),
     ])
     aiter = token_stream.__aiter__()
     pending: asyncio.Task[str] | None = None
@@ -1883,6 +1887,7 @@ async def _retry_zero_tokens_deliberative(
         HeadBufferFilter(),
         QueryEchoFilter(query),
         RepetitionGuardFilter(query),
+        InternalFrameMentionFilter(),
     ])
     async for token in retry_stream:
         if _cancel_flags.get(session_id):
@@ -1997,6 +2002,7 @@ async def stream_deliberative(
     tool_judge_task: "asyncio.Task | None" = None,
     escalated_from: str | None = None,
     evicted_turns: int = 0,
+    session_head: str = "",
 ):
     """Deliberative 層の SSE ストリーミング
 
@@ -2051,6 +2057,7 @@ async def stream_deliberative(
                 tool_judge_task=tool_judge_task,
                 session_id=session_id,
                 evicted_turns=evicted_turns,
+                session_head=session_head,
             ))
             # process() はトークンを返す前にツール判定と実行を完了させる。
             # ここを素の await にすると、その間 SSE フレームが 1 つも流れず、
@@ -2161,6 +2168,7 @@ async def sync_deliberative(
     tool_judge_task: "asyncio.Task | None" = None,
     escalated_from: str | None = None,  # noqa: ARG001
     evicted_turns: int = 0,
+    session_head: str = "",
 ) -> ChatResponse:
     """Deliberative 層の非ストリーミング応答 (escalated_from は API 一貫性用、未使用)"""
     logger.debug("Sync deliberative: session=%s, messages=%d", session_id, len(messages))
@@ -2184,6 +2192,7 @@ async def sync_deliberative(
             tool_judge_task=tool_judge_task,
             session_id=session_id,
             evicted_turns=evicted_turns,
+            session_head=session_head,
         )
 
         if timer:

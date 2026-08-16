@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -11,6 +12,11 @@ import numpy as np
 
 from backend.log_config import get_logger
 from backend.trace_context import run_in_executor_with_context
+from backend.free.constants import (
+    SEARCH_HISTORY_CURRENT_SESSION_HEADER,
+    SEARCH_HISTORY_NO_RESULTS_PREFIX,
+    SEARCH_HISTORY_OTHER_SESSIONS_HEADER,
+)
 from backend.free.rag.chunk_content_gate import ChunkContentGate, GateConfig
 from backend.free.rag.self_rag_judge import (
     QualityThresholds,
@@ -95,8 +101,65 @@ def _resolve_search_params(
     return top_k, stm_top_k, noise_sigma
 
 
+#: ``compress_turn(style="summary")`` の圧縮マークと末尾の元文字数。
+_SUMMARY_MARK = "[要約] "
+_SUMMARY_TAIL_RE = re.compile(r"…（\d+文字）\s*$")
+
+#: 「同じ質問の繰り返し」と見なす最小文字数。短い相槌 (「ありがとう」「はい」) は
+#: 何度でも出るので、これを繰り返し扱いにすると assistant ノートを不当に落とす。
+_REPEAT_MIN_CHARS = 12
+
+
+def _normalize_utterance(text: str) -> str:
+    """発話の同一判定用の正規化 (空白除去 + 圧縮マーク剥がし)。"""
+    body = (text or "").strip()
+    if body.startswith(_SUMMARY_MARK):
+        body = body[len(_SUMMARY_MARK):]
+    body = _SUMMARY_TAIL_RE.sub("", body)
+    return "".join(body.split())
+
+
+def _is_repeat_of_a_stored_turn(query: str, notes: list) -> bool:
+    """今回のクエリが、保存済みの user 発話の焼き直しか (純粋関数)。
+
+    「前にも同じことを聞いた」状態を検出する。この状態でだけ、検索結果に含まれる
+    assistant の発話 = **その質問への前回の回答** が意味を持ってしまう
+    (モデルがそれを丸写しする)。
+    """
+    q = _normalize_utterance(query)
+    if len(q) < _REPEAT_MIN_CHARS:
+        return False
+    for note in notes:
+        if getattr(note, "source", "user") != "user":
+            continue
+        c = _normalize_utterance(getattr(note, "content", "") or "")
+        if not c:
+            continue
+        if c == q or c.startswith(q) or q.startswith(c):
+            return True
+    return False
+
+
+def query_repeats_a_stored_turn(short_term, query: str) -> bool:
+    """STM 全体を走査して「前にも同じことを聞いたか」を判定する。
+
+    層検索は ``asyncio.gather`` で並列に走るため、STM の検索結果を待ってから
+    LTM の扱いを決めることはできない。判定に必要なのはベクトル検索ではなく
+    保存済みノートの文字列一致だけなので、層を起動する **前** に同期で済ませる
+    (ノートは上限 100 件程度、実測 1ms 未満)。
+    """
+    if short_term is None or not query:
+        return False
+    try:
+        notes = list(getattr(short_term, "notes", {}).values())
+    except Exception:
+        return False
+    return _is_repeat_of_a_stored_turn(query, notes)
+
+
 async def _search_stm_layer(
     short_term, query_vec: np.ndarray, stm_top_k: int,
+    drop_past_answers: bool = False,
 ) -> tuple[list[tuple[str, float, str]], list[tuple[str, float, str]]]:
     """Layer 2 短期記憶検索 (< 1ms)。``(順位付け用, ゲート用)`` を返す。
 
@@ -114,6 +177,21 @@ async def _search_stm_layer(
             loop, _search_executor,
             short_term.retrieve_top_k_detailed, query_vec, stm_top_k,
         )
+        # 同じ質問を前にもしていた場合だけ、assistant ノート (= その質問への
+        # 前回の回答) を落とす。詳細は _is_repeat_of_a_stored_turn を参照。
+        if drop_past_answers:
+            before = len(hits)
+            hits = [
+                h for h in hits
+                if getattr(h[0], "source", "user") == "user"
+            ]
+            if len(hits) != before:
+                logger.info(
+                    "Step 2 STM: this query repeats an earlier turn; dropped "
+                    "%d assistant note(s) so the previous answer is not "
+                    "handed back as reference material",
+                    before - len(hits),
+                )
         ranked = [(note.id, combined, note.content) for note, combined, _ in hits]
         gated = [(note.id, relevance, note.content) for note, _, relevance in hits]
         logger.debug(
@@ -130,10 +208,167 @@ async def _search_stm_layer(
         return [], []
 
 
+#: 「注入するために組み立てたテキスト」だけに現れるマーカー。これを含む LTM
+#: チャンクは、こちらが生成した提示用の文字列が記憶へ回り込んだもの。
+#:
+#: 取り込み側は ``MDPIngester`` が塞いだが (記憶読み出しツールのエピソードは
+#: 昇格させない)、**既に取り込まれたベクトルは残る**。生成側の修正だけでは
+#: 既存データが直らないので、読込側でも同じルールを適用する (STM の
+#: ``_sanitize_tags`` と同じ遡及修復の形)。
+#:
+#: 実害 (2026-08-16 再測定): ``[以下は**今回の会話**の記録です]`` を含む
+#: mdp_trace が LTM に入っており、**「今回の会話」というラベルごと別セッションへ
+#: 持ち越される**。読んだモデルは他人の会話を自分の会話として帰属する。
+_INJECTED_OUTPUT_MARKERS: tuple[str, ...] = (
+    SEARCH_HISTORY_CURRENT_SESSION_HEADER,
+    SEARCH_HISTORY_OTHER_SESSIONS_HEADER,
+    SEARCH_HISTORY_NO_RESULTS_PREFIX,
+)
+
+
+def _is_injected_output(text: str) -> bool:
+    """こちらが注入用に組み立てた文字列か (純粋関数)。"""
+    return any(marker in text for marker in _INJECTED_OUTPUT_MARKERS)
+
+
+#: 既に LTM へ入っている mdp_trace の ``result=[file: …]`` に続くファイル本文。
+#: メタ行の閉じ ``]`` から、次のフィールド区切り (``; actions=`` 等) までを切る。
+_MDP_FILE_PAYLOAD_RE = re.compile(
+    r"(result=\[file:[^\]]*\])(?:(?!;\s*(?:actions|conversation)=).)*",
+    re.DOTALL,
+)
+
+
+def _trim_file_payload(text: str) -> str:
+    """エピソード記憶チャンクからファイル本文を落とす (純粋関数)。
+
+    取り込み側は ``MDPIngester._summarize_observation`` が塞いだが、**既に
+    取り込まれたベクトルには本文が入ったまま**残る。生成側の修正だけでは既存
+    データが直らないので、読込側でも同じルールを適用する (STM の
+    ``_sanitize_tags`` / ``_INJECTED_OUTPUT_MARKERS`` と同じ遡及修復の形)。
+
+    実インシデント (2026-08-16 動作検証): 「README.md は存在しますか？」に対し
+    ツールは 1 行しか読んでいない (``start_line=1, end_line=1``) のに応答は全文
+    ダンプのままだった。プロンプトの ``[参考情報 3]`` に
+    ``[mdp_trace] episode=...; result=[file: ... | lines: 121 | chars: 3331]``
+    に続けて README 本文がまるごと入った、**旧仕様のままのチャンク**があった。
+    ツール側 (PR #436/#439)、few-shot 側 (PR #446)、STM ノート側 (PR #447) を
+    塞いでも、この経路が残っている限り同じダンプが再生産される。
+
+    メタ行 (``lines`` / ``chars``) は残すので「そのファイルを読んだ / 何行何文字
+    だった」は保てる。
+    """
+    return _MDP_FILE_PAYLOAD_RE.sub(lambda m: m.group(1), text)
+
+
+#: エピソード記憶チャンクのフィールド境界。``MDPIngester.to_memory_note`` は
+#: ``"; "`` で連結する。``task`` 本文に ``;`` が混じっても壊れないよう、
+#: 既知のキーで始まらない断片は直前のフィールドへ戻す (下記 ``_split_mdp_fields``)。
+_MDP_FIELD_KEY_RE = re.compile(r"^(episode|outcome|task|result|actions|conversation)=")
+
+#: 根拠枠に出さないフィールド。``episode`` / ``conversation`` は内部 ID で、
+#: 後者は別会話の UUID をそのまま露出する。``outcome`` は「ツールが壊れなかったか」
+#: であって「役に立ったか」ではない (``agent.deliberative._trace_tool_episode`` は
+#: 0 件検索も ``success`` にし、有用性は ``reward`` 側で表す) ため、根拠枠に出すと
+#: 読み手には検索が当たったように見える。
+_MDP_INTERNAL_FIELDS = frozenset({"episode", "outcome", "conversation"})
+
+#: 残っていれば情報があると見なすフィールド。``actions`` は含めない —
+#: 「どのツールが動いたか」だけでは「何のために / 何が出たか」が無く、根拠枠に
+#: 置いても読み手には使えない (実例: ``actions=search_history`` だけのチャンク)。
+_MDP_INFORMATIVE_FIELDS = frozenset({"task", "result"})
+
+_MDP_MARKER = "[mdp_trace]"
+
+
+def _split_mdp_fields(body: str) -> list[str]:
+    """``"; "`` 連結のフィールド列へ分解する (``task`` 内の ``;`` を壊さない)。"""
+    fields: list[str] = []
+    for seg in body.split(";"):
+        if _MDP_FIELD_KEY_RE.match(seg.strip()) or not fields:
+            fields.append(seg.strip())
+        else:
+            fields[-1] = f"{fields[-1]};{seg}"
+    return [f for f in fields if f]
+
+
+def _sanitize_episode_chunk(text: str) -> str | None:
+    """エピソード記憶チャンクから内部識別子を落とす (純粋関数)。
+
+    ``[参考情報 N]`` はユーザーに見える根拠枠なので、``episode=ep_xxx`` /
+    ``conversation=<uuid>`` / ``outcome=success`` のような内部テレメトリを
+    そのまま出さない。``task`` / ``result`` / ``actions`` は残す
+    (「何をしてどうなったか」はエピソード想起の本体)。
+
+    実インシデント (2026-08-16 ライブ監査 ターン30): 解約率の数値目標を尋ねた
+    ターンの ``[参考情報 2]`` が
+    ``[mdp_trace] episode=ep_4720a1a5; outcome=success;``
+    ``result=[file: E:\\tmp\\事業メモ.md | lines: 7 | chars: 451 …];``
+    ``actions=read_file; conversation=3d818afc-…``
+    だった。ローカル絶対パスと別会話の UUID が根拠枠へ露出していた。
+
+    Returns:
+        整形後のテキスト。識別子しか無く情報が残らない場合は ``None``
+        (呼び出し側がチャンクごと落とす)。
+    """
+    if _MDP_MARKER not in text:
+        return text
+    body = text.split(_MDP_MARKER, 1)[1].strip()
+    kept: list[str] = []
+    informative = False
+    for field in _split_mdp_fields(body):
+        m = _MDP_FIELD_KEY_RE.match(field)
+        key = m.group(1) if m else ""
+        if key in _MDP_INTERNAL_FIELDS:
+            continue
+        if key in _MDP_INFORMATIVE_FIELDS and field[len(key) + 1:].strip():
+            informative = True
+        kept.append(field)
+    if not informative:
+        return None
+    return "; ".join(kept)
+
+
+def _drop_past_answers(
+    long_term, results: list[tuple[str, float, str]],
+) -> list[tuple[str, float, str]]:
+    """assistant 由来のチャンクを落とす (繰り返し質問のときだけ呼ぶ)。
+
+    発話者は ``absorb_from_short_term`` が ``note_meta`` に残しているので、
+    ``LongTermMemory.chunk_source`` で読める。素性は 2026-08-09 に「検索側で
+    どう扱うかは観測できるようになってから実測で決める」として保存され、
+    読み側では使われていなかった。
+
+    実測 (2026-08-16): STM 84 件のうち assistant 39 件 (46%)。技術質問では上位
+    5 件中 3〜4 件が過去の回答で、それらは **有用な参照** だった (asyncio の
+    コード例など)。したがって一律には落とさず、「前にも同じことを聞いていた」
+    ターンに限る — その場合に返るのは同じ質問への前回の回答であり、モデルは
+    それを丸写しする。
+    """
+    kept: list[tuple[str, float, str]] = []
+    for cid, score, text in results:
+        if long_term.chunk_source(cid) == "assistant":
+            continue
+        kept.append((cid, score, text))
+    if len(kept) != len(results):
+        logger.info(
+            "Step 3 LTM: this query repeats an earlier turn; dropped %d "
+            "assistant chunk(s) so the previous answer is not handed back "
+            "as reference material",
+            len(results) - len(kept),
+        )
+    return kept
+
+
 async def _search_ltm_layer(
     long_term, query_vec: np.ndarray, top_k: int,
+    drop_past_answers: bool = False,
 ) -> list[tuple[str, float, str]]:
-    """Layer 3 長期記憶検索 (< 5ms)。LTM 未設定 / 失敗時は空リスト。"""
+    """Layer 3 長期記憶検索 (< 5ms)。LTM 未設定 / 失敗時は空リスト。
+
+    注入用に組み立てた文字列が回り込んだチャンクはここで落とす
+    (:data:`_INJECTED_OUTPUT_MARKERS`)。
+    """
     if long_term is None:
         return []
     loop = asyncio.get_running_loop()
@@ -141,6 +376,41 @@ async def _search_ltm_layer(
         results = await run_in_executor_with_context(
             loop, _search_executor, long_term.search, query_vec, top_k,
         )
+        if drop_past_answers:
+            results = _drop_past_answers(long_term, results)
+        kept = [r for r in results if not _is_injected_output(r[2])]
+        if len(kept) != len(results):
+            logger.info(
+                "Step 3 LTM: dropped %d chunk(s) that are our own injected "
+                "output (search_history render) from episodic memory",
+                len(results) - len(kept),
+            )
+        trimmed = [(cid, score, _trim_file_payload(text)) for cid, score, text in kept]
+        n_trimmed = sum(1 for a, b in zip(kept, trimmed) if a[2] != b[2])
+        if n_trimmed:
+            logger.info(
+                "Step 3 LTM: trimmed file payload from %d legacy episodic "
+                "chunk(s) (ingested before the summariser)", n_trimmed,
+            )
+        # エピソード記憶の内部識別子 (episode / conversation / outcome) を落とす。
+        # 識別子だけで情報が残らないチャンクは丸ごと捨てる。
+        sanitized: list[tuple[str, float, str]] = []
+        n_dropped = n_cleaned = 0
+        for cid, score, text in trimmed:
+            cleaned = _sanitize_episode_chunk(text)
+            if cleaned is None:
+                n_dropped += 1
+                continue
+            if cleaned != text:
+                n_cleaned += 1
+            sanitized.append((cid, score, cleaned))
+        if n_cleaned or n_dropped:
+            logger.info(
+                "Step 3 LTM: stripped internal ids from %d episodic chunk(s), "
+                "dropped %d that carried nothing but ids",
+                n_cleaned, n_dropped,
+            )
+        results = sanitized
         logger.debug("Step 3 LTM: %d results", len(results))
         return results
     except asyncio.CancelledError:
@@ -361,25 +631,62 @@ def _log_memory_search_state(
     )
 
 
-def _resolve_keep_floor(rag_cfg: dict, thresholds: QualityThresholds) -> float:
+#: 較正が効いていないときに使う「top 相対」の棒の比率。
+#:
+#: 静的な絶対閾値は埋め込みモデルを替えると**到達不能になって黙って全部落とす**。
+#: このプロジェクトは同じ壊れ方を 2 度している:
+#:
+#: - ``relevance_threshold: 0.65`` — Qwen3-Embedding 前提。LFM2.5 で記憶採用 0 件
+#: - ``low_quality_keep_floor: 0.40`` — 旧 STM combined スケール前提。2026-08-16
+#:   の実測で観測最大 0.381 を上回り、45 候補の **通過 0 件**
+#:
+#: 較正 (``threshold_mode: auto``) が効いていれば実データから棒が決まるので
+#: この問題は起きない。効かない条件 (ノート数不足 / ``manual``) だけが脆い。
+#: そこで「静的値」と「その検索の top のβ倍」の**低い方**を採る。静的値より
+#: 厳しくはならず、静的値がそのスケールで到達不能なときだけ緩む。
+_RELATIVE_FLOOR_RATIO = 0.6
+
+#: 相対フロアの下限 (絶対値)。
+#:
+#: 相対フロアだけだと「**どれも無関係な検索でも top の 60% は残る**」ことになり、
+#: 「関連が無い」を「一番マシなもの」へすり替えてしまう。相対は静的値を緩める
+#: 方向にだけ働かせ、ノイズ帯より下へは落とさない。
+#: 実測 (2026-08-16、LFM2.5-Embedding): 無関係ペアの類似度は全ペア中央値 0.105 /
+#: p90 0.238 で、関連ペアは 0.467 だった。0.15 はノイズの中央値より上、
+#: 関連の下限より十分下に位置する。
+_RELATIVE_FLOOR_ABSOLUTE_MIN = 0.15
+
+
+def _resolve_keep_floor(
+    rag_cfg: dict,
+    thresholds: QualityThresholds,
+    top_raw_score: float = 0.0,
+) -> float:
     """``low_quality_keep_floor`` を ``threshold_mode`` に従って解決する。
 
     ``auto`` かつ較正が効いているときは較正済み ``relevance`` と同じ棒を使う
     (「関連性の棒を越えたチャンクは集計判定が low でも残す」)。``manual`` /
-    較正なしでは config の静的値をそのまま使う。config が ``0.0`` (= 従来どおり
-    クエリ単位の全件破棄) を明示している場合は較正より優先して尊重する。
+    較正なしでは config の静的値を使うが、そのままだと埋め込みスケールが
+    変わったときに到達不能になるため、``top_raw_score`` との相対でも抑える
+    (:data:`_RELATIVE_FLOOR_RATIO`)。config が ``0.0`` (= 従来どおりクエリ単位の
+    全件破棄) を明示している場合は較正より優先して尊重する。
     """
     self_rag = rag_cfg.get("self_rag") or {}
     configured = float(self_rag.get("low_quality_keep_floor", 0.0))
     if configured <= 0.0:
         return 0.0
-    if str(self_rag.get("threshold_mode", "auto")) != "auto":
-        return configured
     from backend.free.rag.memory_threshold_calibration import get_active_calibration
 
-    if get_active_calibration() is None:
-        return configured
-    return float(thresholds.relevance)
+    calibrated = (
+        str(self_rag.get("threshold_mode", "auto")) == "auto"
+        and get_active_calibration() is not None
+    )
+    if calibrated:
+        return float(thresholds.relevance)
+    if top_raw_score > 0.0:
+        relaxed = min(configured, top_raw_score * _RELATIVE_FLOOR_RATIO)
+        return max(relaxed, min(configured, _RELATIVE_FLOOR_ABSOLUTE_MIN))
+    return configured
 
 
 async def unified_search(
@@ -501,9 +808,18 @@ async def unified_search(
     # (ゲートが取得より高くつく状態を検出できるようにする)。
     if timer is not None:
         timer.start("retrieval_ms")
+    # 「前にも同じことを聞いたか」は層検索の結果ではなく保存済みノートの文字列
+    # 一致で決まるので、gather の前に同期で確定させる (層は並列に走るため、
+    # STM の結果を待ってから LTM の扱いを決めることはできない)。
+    drop_past_answers = query_repeats_a_stored_turn(short_term, query)
+    if drop_past_answers:
+        logger.info(
+            "This query repeats an earlier turn; past answers will be kept out "
+            "of the reference block (query=%r)", query[:50],
+        )
     stm_pair, ltm_results, cart_results = await asyncio.gather(
-        _search_stm_layer(short_term, query_vec, stm_top_k),
-        _search_ltm_layer(long_term, query_vec, fetch_k),
+        _search_stm_layer(short_term, query_vec, stm_top_k, drop_past_answers),
+        _search_ltm_layer(long_term, query_vec, fetch_k, drop_past_answers),
         _search_cartridge_layer(
             cartridge_mgr, query_vec, fetch_k, timeout_ms=cart_timeout_ms,
         ),
@@ -608,52 +924,72 @@ async def unified_search(
     # merged 1 位に来ていた (0.547 / 0.605 / 0.544)。つまり検索は当たっており、
     # 全件破棄だけが効いていた (31 ターンの実会話で採用 0 件)。
     #
-    # そこで low のときは「クエリ単位の全件破棄」ではなく「チャンク単位のフロア」
-    # で絞る。実測のフロア別 recall / 漏れ (正解が残る件数 / 記憶不要クエリの
-    # 通過チャンク数): 0.45 -> 3/5・平均 1.3 件、0.40 -> 4/5・平均 1.3 件、
-    # 0.35 -> 5/5・平均 2.8 件。上記インシデントの 13 件とは桁が違う。
+    # そこで「クエリ単位の全件破棄」ではなく「チャンク単位のフロア」で絞る。
+    # 実測のフロア別 recall / 漏れ (正解が残る件数 / 記憶不要クエリの通過チャンク
+    # 数): 0.45 -> 3/5・平均 1.3 件、0.40 -> 4/5・平均 1.3 件、0.35 -> 5/5・平均
+    # 2.8 件。上記インシデントの 13 件とは桁が違う。
     #
     # フロアは生スコア (cosine スケール) 前提なので merged_raw で判定し、
     # 残った chunk_id を正規化側 merged に射影する (Step 4.5 と同じ形)。
-    # 既定 0.0 は「従来どおり全件破棄」で、有効化は config.yaml 側で明示する。
+    # 0.0 で無効化 = 従来どおり「low はクエリ単位で全件破棄 / それ以外は全通し」。
     # **進化対象にはしない**: このゲートはモデルが何を見るかを決めるため、
     # モデル自身の出力由来の turn_outcome で自動調整すると閉ループになる。
     #
     # フロアの値は threshold_mode に従う。``auto`` (較正が効いている) では
-    # **較正済み relevance と同じ棒**を使う。``low`` は「top が低い」場合だけで
-    # なく「top は高いが top3_avg が support を下回る」(単発の強いヒット +
-    # 弱い周辺) でも起きるため、フロアは死んでいない。静的既定 0.40 は上の
-    # 実測と同じく旧スケール (STM の combined) で決めた値で、cosine スケールでは
-    # 実測 need の下限 0.338 / p25 0.367 を上回り、救済すべき単発ヒットを捨てる。
-    # relevance と同じ棒にすれば「関連性の棒を越えたチャンクは、集計判定が low
-    # でも残す」という一貫した意味になる。
-    if quality == "low":
-        floor = _resolve_keep_floor(rag_cfg, thresholds)
-        kept_ids = (
-            {cid for cid, score, _ in merged_raw if score >= floor}
-            if floor > 0.0 else set()
-        )
-        rescued = [t for t in merged if t[0] in kept_ids]
-        logger.info(
-            "Search results below quality floor (final quality=low): "
-            "%d/%d chunks passed floor=%.2f for query: %s",
-            len(rescued), len(merged), floor, query[:50],
-        )
-        if not rescued:
-            _log_memory_search_state(
-                debug_logger, context_count, stm_results, ltm_results,
-                semmem_stats=semmem_stats,
+    # **較正済み relevance と同じ棒**を使う。静的既定 0.40 は旧スケール
+    # (STM の combined) で決めた値で、cosine スケールでは実測 need の下限 0.338 /
+    # p25 0.367 を上回り、救済すべき単発ヒットを捨てる。relevance と同じ棒に
+    # すれば「関連性の棒を越えたチャンクだけを残す」という一貫した意味になる。
+    # フロアは **集計判定と独立に常時**掛ける。``quality`` は merged 全体に対する
+    # 単一スカラで、「セットとして使えるか」しか見ない。top1 が強ければ high に
+    # なり、**同じ検索の 2〜8 位が無関連でも全部通っていた**。
+    #
+    # 実測 (2026-08-16 再測定、chat 23 ターン): quality は high 12 / medium 7 /
+    # low 4 で、フロアが掛かったのは low の 4 ターンだけ。残り 19 ターン (83%) は
+    # merge 8 件が無条件で全通しになり、``[参考情報]`` の **67% (58/87 件) /
+    # 73% (8,711/11,904 tok)** が別セッションの mdp_trace ログで埋まっていた。
+    # それらの対クエリ類似度は平均 0.119 で、較正済み閾値 0.259 を **1 件も
+    # 超えていない**。閾値の分離性能自体は健全で、同じ実測で関連チャンクは 0.467、
+    # 無関連は 0.196 以下だった。効いていなかったのは適用範囲だけ。
+    #
+    # ``quality`` の役割は「フロアを掛けるか」ではなく「フロアを通ったものが
+    # 1 件も無いときにどう扱うか」に限定する。
+    floor = _resolve_keep_floor(
+        rag_cfg, thresholds,
+        top_raw_score=max((s for _, s, _ in merged_raw), default=0.0),
+    )
+    if floor > 0.0:
+        kept_ids = {cid for cid, score, _ in merged_raw if score >= floor}
+        passed = [t for t in merged if t[0] in kept_ids]
+        if len(passed) != len(merged):
+            logger.info(
+                "Relevance floor: %d/%d chunks passed floor=%.2f "
+                "(quality=%s) for query: %s",
+                len(passed), len(merged), floor, quality, query[:50],
             )
-            return SearchResult(
-                sources=[],
-                quality=quality,
-                from_memory=bool(stm_results),
-            )
-        merged = rescued
+        merged = passed
         # 公平性保証 (Step 7.5) は cart_results から未代表カートリッジを
         # 強制注入するため、フロアを通していないチャンクが裏口から戻る。
-        # 救済経路ではカートリッジ側にも同じフロアを掛ける。
+        # カートリッジ側にも同じ棒を掛ける (関連性の棒は経路で変わらない)。
         cart_results = [c for c in cart_results if c[0] in kept_ids]
+    elif quality == "low":
+        # フロア無効 (0.0) の構成では従来どおり「low はクエリ単位で全件破棄」。
+        logger.info(
+            "Search results discarded (quality=low, floor disabled) "
+            "for query: %s", query[:50],
+        )
+        merged = []
+
+    if not merged:
+        _log_memory_search_state(
+            debug_logger, context_count, stm_results, ltm_results,
+            semmem_stats=semmem_stats,
+        )
+        return SearchResult(
+            sources=[],
+            quality=quality,
+            from_memory=bool(stm_results),
+        )
 
     # Step 7: 最終順位付け (merged はスコア降順) から top_k 件を採用
     final_sources = merged[:top_k]

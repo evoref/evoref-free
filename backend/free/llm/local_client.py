@@ -22,6 +22,25 @@ from backend.utils import estimate_tokens
 
 logger = get_logger("llm.local_client")
 
+
+def _truncation_notice() -> str:
+    """max_tokens 到達でストリームが途中終了したことをユーザーへ開示する注記。
+
+    i18n_helper は横断基盤なので pillar から参照してよい。``msg`` は未解決キーを
+    **キー文字列のまま返す** 仕様なので、それを検出して素の英語へ縮退させる
+    (i18n 未初期化のパスでも注記そのものは消さない — **切断を黙って完結扱いに
+    しない**ことが本注記の目的)。
+    """
+    key = "warning.llm.response_truncated"
+    fallback = "\n\n> ⚠ Output token limit reached; this response is cut off."
+    try:
+        from backend.i18n_helper import msg
+        text = msg(key)
+    except Exception:  # pragma: no cover - i18n 未初期化時の保険
+        return fallback
+    return fallback if text == key else text
+
+
 # スロット定数
 SLOT_CHAT = 0
 SLOT_BACKGROUND = 1
@@ -684,6 +703,15 @@ class LocalClient(BaseHTTPClient):
                 )
             data = resp.json()
             content = extract_content(data)
+            if (data.get("choices") or [{}])[0].get("finish_reason") == "length":
+                # 非ストリーミング経路は補助タスク (JSON 応答) にも使われるため
+                # **本文へ注記を足さない** (パースを壊す)。診断できるようログだけ
+                # 残す。ユーザーへの開示はチャット応答が通るストリーム経路で行う。
+                logger.warning(
+                    "Sync generate hit max_tokens=%s (finish_reason=length); "
+                    "output is truncated (%d chars)",
+                    payload.get("max_tokens"), len(content),
+                )
             logger.debug(
                 "Sync generate complete: response_length=%d chars",
                 len(content),
@@ -772,6 +800,15 @@ class LocalClient(BaseHTTPClient):
         reasoning_filter = _ReasoningFilter()
         first_data_received = False
         think_chunk_count = 0  # watchdog: 未閉じ <think> 内の連続 chunk 数 (docs/c_15 B3)
+        #: 最後に観測した ``finish_reason``。``"length"`` なら max_tokens 到達で
+        #: 応答が文の途中で切れている。ストリーム経路はこれを見ておらず
+        #: (先頭 3 チャンクの DEBUG ログのみ)、**切断がユーザーにもログにも
+        #: 一切出ていなかった**。2026-08-16 ライブ監査ターン 14: 「README.md は
+        #: 存在しますか？」に対し全文復唱を始め、ちょうど 1,024 トークン
+        #: (llama.max_tokens の既定値) で「| llama-server (base / embed) | 8080 / 8」
+        #: と表の途中で停止。197 秒かけた回答が未完のまま、完結した回答として
+        #: 提示されていた。
+        last_finish_reason: str | None = None
         try:
             # ストリーミング専用の新規クライアント（接続プール共有による stale 接続を回避）
             async with httpx.AsyncClient(timeout=120.0) as stream_client:
@@ -808,6 +845,9 @@ class LocalClient(BaseHTTPClient):
                         content, reasoning, chunk = self._parse_sse_delta(data)
                         if chunk is None:
                             continue
+                        reason = (chunk.get("choices") or [{}])[0].get("finish_reason")
+                        if reason:
+                            last_finish_reason = reason
 
                         if content:
                             first_data_received = True
@@ -876,6 +916,16 @@ class LocalClient(BaseHTTPClient):
                         tail = reasoning_filter.flush()
                         if tail:
                             yield tail
+
+                    if last_finish_reason == "length":
+                        # 切断を黙って完結扱いにしない。ログ (英語固定) と、
+                        # ユーザーに見える注記 (i18n) の両方へ出す。
+                        logger.warning(
+                            "Stream hit max_tokens=%s (finish_reason=length); "
+                            "the response is cut mid-sentence after %d tokens",
+                            payload.get("max_tokens"), token_count,
+                        )
+                        yield _truncation_notice()
         except httpx.ConnectError as e:
             raise LLMConnectionError(
                 f"llama-server unreachable: {e}", host=self.url,

@@ -231,9 +231,14 @@ class SelfRagConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    # 品質 low と判定されたときの救済フロア (生スコア = cosine スケール)。
+    # チャンク単位の関連度フロア (生スコア = cosine スケール)。
     # フロア以上のチャンクだけを残して添付する (1 件も残らなければ空)。
-    # 0.0 で無効化 = 従来どおりクエリ単位の全件破棄へ切り戻せる。
+    # **集計判定 (quality) と独立に常時**掛かる。quality は merged 全体に対する
+    # 単一スカラで「セットとして使えるか」しか見ず、top1 が強ければ high になる
+    # ため、以前は同じ検索の 2 位以下が無関連でも全通しだった (2026-08-16 実測:
+    # [参考情報] の 67% が別セッションの生ログで、対クエリ類似度は較正済み閾値を
+    # 1 件も超えていなかった)。キー名は歴史的経緯で low_ が残っている。
+    # 0.0 で無効化 = 従来どおり「low はクエリ単位で全件破棄 / それ以外は全通し」。
     # 既定 0.40 の根拠と実測は config.yaml.example / search_pipeline Step 6.5 を参照。
     # Level 1 進化の対象外 (policy_interpreter の search ドメインに登録しない)。
     low_quality_keep_floor: float = Field(default=0.40, ge=0.0, le=1.0)
