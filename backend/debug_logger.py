@@ -422,6 +422,39 @@ class DebugLogger:
             "scores": scores,
         })
 
+    def log_rag_selection(
+        self,
+        *,
+        query: str,
+        quality: str,
+        floor: float,
+        kept: list[tuple[str, float]],
+        rejected: list[tuple[str, float]],
+    ) -> None:
+        """関連性フロア通過後の採否を chunk 単位で ``rag.jsonl`` に記録
+
+        フロアの値は埋め込みごとに較正される (``memory_threshold_calibration``)
+        が、較正の負例が「無作為なノート対」なので、**同じ話題で答えが違う**
+        チャンクは背景分布より高いスコアを取って素通りする。2026-08-16 の監査では
+        contextvars の質問に asyncio.gather/wait の解説 4 件が載った。
+        再較正には「どの chunk が何点で通ったか」が要るが、``rag.jsonl`` には
+        ``embedding`` と ``fewshot_select`` しか出ておらず、prompt 本文の目視に
+        頼るしかなかった。ここで採否とスコアを残す。
+        """
+        if not self.enabled or not self.log_rag:
+            return
+        self._emit("rag", {
+            "timestamp": _now(),
+            "op": "rag_selection",
+            "query": query[:100],
+            "quality": quality,
+            "floor": round(floor, 4),
+            "n_kept": len(kept),
+            "n_rejected": len(rejected),
+            "kept": [(cid, round(score, 4)) for cid, score in kept[:10]],
+            "rejected": [(cid, round(score, 4)) for cid, score in rejected[:10]],
+        })
+
     def log_embedding(
         self,
         batch_size: int,

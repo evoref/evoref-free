@@ -115,16 +115,30 @@ class GenerationParamEvolver:
                 mode, current_fitness, best_fitness, best_deltas,
             )
         else:
-            logger.info(
-                "Mode %s generation params: no improvement (%.4f)",
-                mode, current_fitness,
+            # 「改善しなかった」と「そもそも評価できない」を区別して出す。
+            # 後者は経験レコードに生成パラメータが残っていない限り解消しない。
+            reason = (
+                "no_improvement" if self._has_outcome_signal(mode_exp)
+                else "no_outcome_signal"
             )
+            logger.info(
+                "Mode %s generation params: %s (fitness %.4f, n=%d)",
+                mode, reason, current_fitness, len(mode_exp),
+            )
+            return {
+                "improved": False,
+                "fitness_before": current_fitness,
+                "fitness_after": best_fitness,
+                "deltas": dict(current),
+                "reason": reason,
+            }
 
         return {
             "improved": improved,
             "fitness_before": current_fitness,
             "fitness_after": best_fitness,
-            "deltas": best_deltas if improved else dict(current),
+            "deltas": best_deltas,
+            "reason": "improved",
         }
 
     def _generate_candidate(self, current: dict[str, float]) -> dict[str, float]:
@@ -140,56 +154,61 @@ class GenerationParamEvolver:
             candidate[param] = round(new_val, 4)
         return candidate
 
+    #: フィットネスに使う **欠陥シグナル** と重み。
+    #:
+    #: 旧実装は ``conversation_ended`` を加点 (+1.0) の主項にしていたが、この
+    #: シグナルは実データで 201/205 = **98% が True** で情報量がほぼ無い。さらに
+    #: ``turn_outcome`` は 205/205 が ``"success"`` の **恒真** な成功判定だった
+    #: (2026-08-16 実測)。結果フィットネスは 0.987 に張り付き、改善余地は 0.0129 しか
+    #: 残らない = Level 1 は実質的に評価不能な状態で回っていた。
+    #:
+    #: ここでは「観測された欠陥の率」だけを見る。1.0 は「欠陥が観測されなかった」
+    #: を意味し、加点シグナルの恒真性に引きずられない。
+    _DEFECT_WEIGHTS = {
+        "user_correction": 1.0,
+        "assistant_self_retraction": 1.0,
+        "rephrased_query": 0.6,
+        "tool_routing_false_negative": 0.5,
+        "tool_routing_false_positive": 0.5,
+    }
+
     def _evaluate_fitness(self, experiences: list[dict]) -> float:
-        """経験バッファのシグナルからフィットネスを計算"""
+        """観測された欠陥の率からフィットネスを計算する (1.0 = 欠陥なし)。"""
         if not experiences:
             return 0.5
-
-        score = 0.0
+        defects = 0.0
         for exp in experiences:
-            signals = exp.get("signals", {})
-            # 肯定的シグナル
-            if signals.get("conversation_ended"):
-                score += 1.0
-            # 否定的シグナル
-            if signals.get("user_correction"):
-                score -= 0.8
-            if signals.get("rephrased_query"):
-                score -= 0.5
+            signals = exp.get("signals") or {}
+            for key, weight in self._DEFECT_WEIGHTS.items():
+                if signals.get(key):
+                    defects += weight
+        return max(0.0, min(1.0, 1.0 - defects / len(experiences)))
 
-        return max(0.0, min(1.0, (score / len(experiences) + 1) / 2))
+    def _has_outcome_signal(self, experiences: list[dict]) -> bool:
+        """欠陥シグナルが 1 件でも立っているか (= 評価に使える分散があるか)。"""
+        return any(
+            (exp.get("signals") or {}).get(key)
+            for exp in experiences
+            for key in self._DEFECT_WEIGHTS
+        )
 
     def _evaluate_with_deltas(
-        self, experiences: list[dict], deltas: dict[str, float],
+        self, experiences: list[dict], deltas: dict[str, float],  # noqa: ARG002
     ) -> float:
-        """デルタ適用時のフィットネスを推定
+        """デルタ適用時のフィットネス。**方向ボーナスは廃止した**。
 
-        実際に LLM を呼び出すわけではなく、デルタの方向性と
-        経験シグナルの相関からフィットネスを推定する。
+        旧実装は「訂正が少ない → 温度を上げても安全なので +0.02」のような
+        **デルタの符号だけを見た加点** を返していた。実際にそのデルタで生成した
+        結果を見ているわけではないので、改善の根拠がゼロのまま ``improved=True``
+        を宣言しうる。加点幅 (+0.02〜+0.05) が実データの改善余地 (0.0129) より
+        大きく、事実上「符号でスコアが決まる」状態だった。
+
+        経験レコードに **その応答を生成したときのパラメータが残っていない** ため、
+        現状は候補と現行を区別する材料が無い。区別できないことを素直に返し、
+        :meth:`evolve` 側で ``reason`` として可視化する (でっち上げの改善より、
+        評価不能であることが見えている方が良い)。
         """
-        base_fitness = self._evaluate_fitness(experiences)
-
-        # デルタの方向性ボーナス/ペナルティ
-        adjustment = 0.0
-
-        temp_delta = deltas.get("temperature_delta", 0.0)
-        # 訂正が多い場合: temperature を下げる方向が良い
-        correction_rate = sum(
-            1 for e in experiences
-            if e.get("signals", {}).get("user_correction")
-        ) / max(len(experiences), 1)
-
-        if correction_rate > 0.3 and temp_delta < 0:
-            adjustment += 0.05  # 訂正が多い → 温度を下げると改善
-        elif correction_rate < 0.1 and temp_delta > 0:
-            adjustment += 0.02  # 訂正が少ない → 多様性を上げても安全
-
-        # presence_penalty: 繰り返しが多い場合に上げる方向が良い
-        pp_delta = deltas.get("presence_penalty_delta", 0.0)
-        if pp_delta > 0 and correction_rate < 0.2:
-            adjustment += 0.02  # 繰り返し抑制
-
-        return max(0.0, min(1.0, base_fitness + adjustment))
+        return self._evaluate_fitness(experiences)
 
 
 def apply_deltas(params: dict, deltas: dict[str, float]) -> dict:

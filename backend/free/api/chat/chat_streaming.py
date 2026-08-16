@@ -136,6 +136,22 @@ def _emit_timing(
         updated_at=time.monotonic(),
     )
 
+    # llama-server の timings から接頭辞 KV キャッシュの効きを timing へ畳み込む。
+    # prompt_n = 再評価したトークン / cache_n = 再利用できたトークン。
+    # これが requests.jsonl に無いと、キャッシュの効きは llama-base.stderr.log の
+    # 行をチャットターンへ手で突き合わせるしかなく、aux と取り違えやすい。
+    client = getattr(getattr(state, "gen", None), "llm_client", None)
+    llama_timings = getattr(getattr(client, "local", client), "_last_timings", None)
+    if isinstance(llama_timings, dict):
+        prompt_n = llama_timings.get("prompt_n")
+        cache_n = llama_timings.get("cache_n")
+        if isinstance(prompt_n, int) and isinstance(cache_n, int):
+            total = prompt_n + cache_n
+            timing["prompt_n"] = prompt_n
+            timing["cache_n"] = cache_n
+            if total > 0:
+                timing["cache_hit_pct"] = round(100.0 * cache_n / total, 1)
+
     dl = state.debug_logger
     if dl is None:
         return
@@ -1829,11 +1845,17 @@ async def _stream_filtered_token_pipeline(
         # HeadBufferFilter によるバッファリングで SSE フレーム数と乖離するため、
         # フィルタ出力の有無にかかわらず受信トークンをそのまま数える。
         state.tokens_generated += 1
+        # TTFT は **モデルから最初のトークンが届いた時刻** で止める。
+        # 以前は filtered (フィルタが実際に吐いた瞬間) で止めていたため、
+        # HeadBufferFilter が最後までバッファする短い応答では
+        # llm_first_token_ms が記録されないまま終わっていた
+        # (2026-08-16 の監査では 40 ターン中 25 ターンしか値が無く、
+        #  この系で最も重要な指標が短い応答ほど欠落していた)。
+        if not state.first_token_recorded and timer:
+            timer.stop("llm_first_token_ms")
+            state.first_token_recorded = True
         filtered = pipeline.process(token)
         if filtered:
-            if not state.first_token_recorded and timer:
-                timer.stop("llm_first_token_ms")
-                state.first_token_recorded = True
             state.emitted_chars += len(filtered)
             yield sse.token(filtered)
             last_frame_at = time.monotonic()

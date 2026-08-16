@@ -967,6 +967,14 @@ async def unified_search(
                 "(quality=%s) for query: %s",
                 len(passed), len(merged), floor, quality, query[:50],
             )
+        if debug_logger is not None:
+            debug_logger.log_rag_selection(
+                query=query,
+                quality=quality,
+                floor=floor,
+                kept=[(cid, s) for cid, s, _ in merged_raw if s >= floor],
+                rejected=[(cid, s) for cid, s, _ in merged_raw if s < floor],
+            )
         merged = passed
         # 公平性保証 (Step 7.5) は cart_results から未代表カートリッジを
         # 強制注入するため、フロアを通していないチャンクが裏口から戻る。

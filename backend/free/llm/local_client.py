@@ -371,21 +371,28 @@ class LocalClient(BaseHTTPClient):
         # 型: CapabilitySnapshot | None。未プローブ / プローブ無効時は None (prior 動作)。
         self.capabilities = None
         self._capability_probe_task = None
-        # モデル能力スナップショット (capability probe が背景で確定する; docs/c_15)。
-        # 型: CapabilitySnapshot | None。未プローブ / プローブ無効時は None (prior 動作)。
-        self.capabilities = None
-        self._capability_probe_task = None
+        #: 直近ストリームの llama-server ``timings`` (prompt_n / cache_n 等)。
+        #: 接頭辞 KV キャッシュの効きを測れる唯一の一次情報で、これが無いと
+        #: llama-base.stderr.log の行とチャットターンを突き合わせるしかない。
+        self._last_timings: dict | None = None
 
     @property
     def chat_slot(self) -> int:
-        """チャット用スロット ID
+        """チャット用スロット ID（2スロット以上で 0、それ以外は -1=自動割当）
 
-        常に -1（自動割当）を返す。
-        以前は slots>=2 で SLOT_CHAT(0) を固定していたが、
-        Qwen3 等の reasoning モデルで stale KV キャッシュが思考ループを引き起こす
-        問題があるため、llama-server 側の自動割当に委譲する。
+        ``background_slot`` (=1) と物理的に分離し、aux / sleep-time の呼び出しが
+        会話の KV を踏まないようにする (CLAUDE.md §6 #1「チャットと KV を分離」)。
+
+        一時期 **常に -1** を返していた。Qwen3 系で stale KV キャッシュが思考
+        ループを誘発したための回避で、自動割当を llama-server に委ねていた。
+        この前提は既に無い — thinking は ``llama.enable_thinking`` (既定 false、
+        ``resolve_enable_thinking`` が解決) で切っており、2026-08-16 のライブ監査
+        でも生成トークン数と本文トークン数が一致していた (eval 767 / 本文 762 =
+        reasoning 出力ゼロ)。一方で自動割当の実害は大きく、同監査では会話が
+        slot 0 と slot 1 の間を渡り歩き、aux が slot 0 を取った直後のターンで
+        cache 18.4% / prefill 125 秒の全損が出ていた。
         """
-        return -1
+        return SLOT_CHAT if self._slots >= 2 else -1
 
     @property
     def background_slot(self) -> int:
@@ -556,6 +563,14 @@ class LocalClient(BaseHTTPClient):
         # KVキャッシュ最適化
         if self._cache_prompt:
             payload["cache_prompt"] = True
+        # 最終チャンクに usage を載せてもらう (OAI 標準)。
+        # ``usage.prompt_tokens_details.cached_tokens`` が接頭辞 KV キャッシュの
+        # 再利用量で、``_generate_stream`` の usage ハンドラと
+        # ``DebugLogger.log_kv_cache`` は元からこれを待っていたが、この 1 行が
+        # 無いため llama-server が usage チャンクを送らず、**キャッシュ計測が
+        # 丸ごと死んでいた** (``GET /api/status`` の cache_hit_rate が常に 0.0)。
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
         if id_slot is not None and id_slot >= 0:
             payload["id_slot"] = id_slot
 
@@ -569,14 +584,19 @@ class LocalClient(BaseHTTPClient):
 
         payload.update(extra)
 
+        # chat_template_kwargs は extra ではなく payload へ直接入るため、
+        # extra_keys だけを出すと enable_thinking を送ったのかが分からない
+        # (2026-08-16 の監査では eval トークン数から逆算する羽目になった)。
         logger.debug(
             "Payload built: stream=%s, temperature=%.2f, max_tokens=%s, "
             "top_p=%s, top_k=%s, presence_penalty=%s, frequency_penalty=%s, "
             "repetition_penalty=%s, "
-            "id_slot=%s, cache_prompt=%s, messages=%d, extra_keys=%s",
+            "id_slot=%s, cache_prompt=%s, chat_template_kwargs=%s, "
+            "messages=%d, extra_keys=%s",
             stream, temperature, max_tokens,
             top_p, top_k, presence_penalty, frequency_penalty, repetition_penalty,
-            id_slot, self._cache_prompt, len(msgs),
+            id_slot, self._cache_prompt,
+            payload.get("chat_template_kwargs") or "none", len(msgs),
             list(extra.keys()) or "none",
         )
         return payload
@@ -769,7 +789,14 @@ class LocalClient(BaseHTTPClient):
         """
         try:
             chunk = json.loads(data)
-            delta = chunk["choices"][0].get("delta", {})
+            # ``stream_options.include_usage`` を付けると llama-server は最終チャンクを
+            # **choices 空配列 + usage** で送る (OAI 仕様)。``choices[0]`` を無条件に
+            # 引くと IndexError になり、chunk ごと捨てられて usage ハンドラまで
+            # 届かない。**KV キャッシュ計測が丸ごと死んでいた原因がこれ**。
+            choices = chunk.get("choices") or []
+            if not choices:
+                return "", "", chunk
+            delta = choices[0].get("delta", {}) or {}
             content = delta.get("content") or ""
             reasoning = delta.get("reasoning_content") or ""
             return content, reasoning, chunk
@@ -848,6 +875,11 @@ class LocalClient(BaseHTTPClient):
                         reason = (chunk.get("choices") or [{}])[0].get("finish_reason")
                         if reason:
                             last_finish_reason = reason
+                        # llama.cpp が timings を載せる構成なら、より正確なそちらを優先。
+                        # (既定では付かないので通常は下の usage 経路が使われる)
+                        timings = chunk.get("timings")
+                        if isinstance(timings, dict) and "cache_n" in timings:
+                            self._last_timings = timings
 
                         if content:
                             first_data_received = True
@@ -892,21 +924,33 @@ class LocalClient(BaseHTTPClient):
                             continue
 
                         # KV キャッシュヒット情報を usage チャンクから捕捉
-                        if "usage" in chunk and self._debug_logger is not None:
-                            usage = chunk["usage"]
-                            cached = usage.get("prompt_tokens_details", {}).get("cached_tokens")
+                        if "usage" in chunk:
+                            usage = chunk["usage"] or {}
+                            details = usage.get("prompt_tokens_details") or {}
+                            cached = details.get("cached_tokens")
                             if cached is not None:
-                                self._debug_logger.log_kv_cache(
-                                    tokens_prompt=usage.get("prompt_tokens", 0),
-                                    tokens_cached=cached,
-                                )
+                                prompt_tokens = usage.get("prompt_tokens", 0)
+                                # 再評価分 = プロンプト全体 - 再利用分。
+                                # requests.jsonl の timing へ畳んで、ターン単位で
+                                # 接頭辞キャッシュの効きを追えるようにする。
+                                self._last_timings = {
+                                    "prompt_n": max(0, prompt_tokens - cached),
+                                    "cache_n": cached,
+                                }
+                                if self._debug_logger is not None:
+                                    self._debug_logger.log_kv_cache(
+                                        tokens_prompt=prompt_tokens,
+                                        tokens_cached=cached,
+                                    )
 
                         if data_line_count <= 3:
-                            finish = chunk["choices"][0].get("finish_reason")
+                            # usage チャンクは choices 空配列なので添字を引かない
+                            first = (chunk.get("choices") or [{}])[0]
+                            finish = first.get("finish_reason")
                             logger.debug(
                                 "SSE non-content chunk #%d: delta=%s, finish_reason=%s",
                                 data_line_count,
-                                chunk["choices"][0].get("delta", {}), finish,
+                                first.get("delta", {}), finish,
                             )
                     else:
                         logger.warning(
