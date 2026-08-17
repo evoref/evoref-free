@@ -28,12 +28,12 @@ class LLMClient:
     カウントするだけ。バックグラウンド処理 (学習 / sleep-time) との協調は、
     この進行中数 (``is_serving_user``) を読む SleepTimeScheduler.is_user_active
     → LearningScheduler.should_yield の協調 yield 機構が担う
-    (f_04_self_learning.md §8.1)。
+    (`is_user_active` の定義は f_02_memory_system.md §4.3)。
     """
 
     def __init__(self, local: LocalClient):
         self.local = local
-        # f_04 §8.1 / §8.2: フォアグラウンドのチャット進行中数
+        # フォアグラウンドのチャット進行中数 (f_02 §4.3 の協調 yield 用)
         self._in_flight_chat_count: int = 0
 
     @property
@@ -43,12 +43,12 @@ class LLMClient:
 
     @property
     def is_serving_user(self) -> bool:
-        """現在ユーザーへのチャット応答を生成中かどうか (f_04 §8.1)"""
+        """現在ユーザーへのチャット応答を生成中かどうか (f_02 §4.3)"""
         return self._in_flight_chat_count > 0
 
     @asynccontextmanager
     async def chat_in_flight(self):
-        """フォアグラウンドのチャット応答進行中マーカー (f_04 §8.1)
+        """フォアグラウンドのチャット応答進行中マーカー (f_02 §4.3)
 
         ユーザー応答パスはこのコンテキストマネージャでくくる。フォアグラウンド
         応答は決してブロックされない。バックグラウンド処理は ``is_serving_user``

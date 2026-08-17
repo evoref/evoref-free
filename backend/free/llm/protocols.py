@@ -6,7 +6,7 @@ EvorefGen (llm / rag / generation pillar) が他 pillar に公開する補助タ
 が本 Protocol を満たす
 Pro 実装は存在しない。
 
-設計原則 (CLAUDE.md §8 / `docs/f_02_memory_system.md` §6.5):
+設計原則 (CLAUDE.md §3 / `docs/f_02_memory_system.md` §6):
 - 最小 API 原則: ``generate`` と ``health_check`` のみ
 - 実装は duck typing で Protocol を満たす
 - Protocol ファイルは他 pillar を import しない

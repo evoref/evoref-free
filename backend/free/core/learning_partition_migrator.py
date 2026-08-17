@@ -10,7 +10,7 @@
 - experience エントリは ``base_model`` タグ別にバケツ分けし、別モデルのエントリは
   そのモデルのパーティションへ振り分ける (クロスモデル履歴を非破壊保持)。
 - LoRA / 制御ベクトル / learning_state は mode-blind なのでモデルルート直下。
-- ``--develop=evolve`` 中は LogIngestor の inode 整合のため移行を見送る (p_03 §9.4)。
+- ``--develop=evolve`` 中は LogIngestor の inode 整合のため移行を見送る (p_03 §9)。
 
 Pro 型を import しない純ファイル操作 (Free-safe)。Pro の LoRA / cvector も
 存在すればコピーする。SemMem ``learn.*`` ファクトの再キーは SemMem 構築後に

@@ -3,7 +3,7 @@
 各ストリーミング関数（reactive / deliberative / meta_cognitive / long_form）で
 個別に実装されていた SSE フレーム生成を統一する。
 
-フレーム形式は c_05_data_schemas.md §12 に準拠。
+フレーム形式は c_06_api_specification.md §3 に準拠。
 """
 
 import json

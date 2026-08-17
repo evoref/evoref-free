@@ -15,7 +15,7 @@ import してはならない** (Free → Pro 参照は依存方向違反)。従�
 コンポーネントも **サブ Protocol として宣言** し、具象実装 (Free / Pro 側)
 が duck typing でサブ Protocol を満たすよう設計する。
 
-設計原則 (CLAUDE.md §8 / ``docs/p_01_advanced_learning.md`` §0.1):
+設計原則 (CLAUDE.md §3 / ``docs/p_01_advanced_learning.md`` §2):
 - 最小 API 原則: 現在 ``LearningScheduler`` が Pro コンポーネントに対し
   呼び出しているメソッドだけを宣言
 - ``@runtime_checkable``: isinstance チェックを可能にする

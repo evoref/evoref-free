@@ -3,7 +3,7 @@
 4 pillar アーキテクチャ における :class:`SemanticFact.subject` の
 命名規則 (``loop.*`` / ``learn.*`` / ``mem.*``) を生成・検証するヘルパ群。
 
-## 設計方針 (CLAUDE.md §8 / docs/f_02_memory_system.md §7.1 / docs/c_05_data_schemas.md §21.3)
+## 設計方針 (CLAUDE.md §3 / docs/f_02_memory_system.md §2.3 / docs/c_05_data_schemas.md §1.3)
 
 - 全 subject は ``{pillar}.{kind}.{...parts}`` の形式
 - pillar prefix は owner pillar に一致させる (例: ``policy`` は EvorefLearn
@@ -103,7 +103,7 @@ LOOP_KINDS: frozenset[str] = frozenset({
     "failure",
     "artifact",
 })
-"""EvorefLoop owned subject の ``<kind>`` 集合 (docs/c_05 §21.3)。"""
+"""EvorefLoop owned subject の ``<kind>`` 集合 (docs/c_05 §1.3)。"""
 
 LEARN_KINDS: frozenset[str] = frozenset({
     "policy",
@@ -115,7 +115,7 @@ LEARN_KINDS: frozenset[str] = frozenset({
     # prefix が異なるため衝突しない)。
     "failure_pattern",
 })
-"""EvorefLearn owned subject の ``<kind>`` 集合 (docs/c_05 §21.3)。"""
+"""EvorefLearn owned subject の ``<kind>`` 集合 (docs/c_05 §1.3)。"""
 
 MEM_KINDS: frozenset[str] = frozenset({
     "personal",

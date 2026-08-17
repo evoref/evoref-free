@@ -80,7 +80,6 @@ _SCOPE_PATTERN = re.compile(r'^(def |class )', re.MULTILINE)
 def split_by_scope(text: str, budget: int) -> list[str]:
     """Pythonコードをdef/class境界でトークン予算内チャンクに分割する。
 
-    設計書 f_02_memory_system.md §3.3 準拠。
     def/class境界が見つからない場合はテキスト全体を1チャンクとして返す。
     単一ブロックが予算を超える場合はそのまま1チャンクとして返す
     （関数途中で分割すると意味が壊れるため）。

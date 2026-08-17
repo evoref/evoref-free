@@ -148,7 +148,6 @@ def _raise_file_service_error(e: ExtractionError, path: Path) -> None:
 def prepare_file_context(path: Path, budget: int) -> list[str]:
     """ファイルをコンテキスト予算に収まるチャンクに分割する。
 
-    設計書 f_02_memory_system.md §3.1 準拠。
     予算内に収まる場合はそのまま1チャンクとして返す。
     予算超過時はdef/class境界で分割する。
 

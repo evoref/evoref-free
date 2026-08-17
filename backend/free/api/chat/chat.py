@@ -83,7 +83,7 @@ async def _with_chat_in_flight(client, inner_gen):
 
     LLMClient にユーザー応答進行中であることを通知し、バックグラウンド
     処理（Level 1 進化、sleep-time）が協調的に yield できるようにする
-    （f_04_self_learning.md §8.2）。
+    （`is_user_active` の定義は f_02_memory_system.md §4.3）。
     """
     async with client.chat_in_flight():
         async for frame in inner_gen:

@@ -18,7 +18,7 @@ type LineEndingSetting = EditorConfig['default_line_ending'];
 /** タブ → 設定セクションのベースマッピング（変更不可）
  *
  * CLI フラグ `--develop=<level>` (debug | investigate | evolve) の SSOT に
- * 集約された (詳細 docs/f_06_cli.md §18)。`config.yaml` の `debug:` セクションは
+ * 集約された (詳細 docs/f_06_cli.md §6)。`config.yaml` の `debug:` セクションは
  * 廃止 (起動時 ValidationError)、サーバ側の `EvorefConfig` も `debug` フィールドを
  * 持たないため `/api/config/debug` は 404 を返す。
  */
