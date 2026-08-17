@@ -1,6 +1,6 @@
 """Level 1 セッション + 優先キューのデータクラスと永続化ヘルパー
 
-f_04 §5.4 / §5.5 の設計に従い、Level 1 の中断・再開を可能にする
+f_04 §4.2 / §7.1 の設計に従い、Level 1 の中断・再開を可能にする
 セッション単位の進捗管理と、アイドル判定をバイパスして Level 1 を要求する
 優先キューを提供する。
 
@@ -21,7 +21,7 @@ from backend.log_config import get_logger
 logger = get_logger("learning.level1_session")
 
 
-# ── PriorityRequest（f_04 §5.4）─────────────────────────────
+# ── PriorityRequest（f_04 §4.2）─────────────────────────────
 
 
 @dataclass
@@ -49,7 +49,7 @@ class PriorityRequest:
         )
 
 
-# ── Level1Session（f_04 §5.5）───────────────────────────────
+# ── Level1Session（f_04 §7.1）───────────────────────────────
 
 
 @dataclass

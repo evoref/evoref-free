@@ -5,7 +5,7 @@
 実行時に owner 以外が書込を試みた場合は :class:`PillarOwnershipError` を
 送出し、pillar 境界違反を検出する。
 
-## 設計方針 (CLAUDE.md §8 / docs/f_02_memory_system.md §7.2 / docs/c_05_data_schemas.md §21.2)
+## 設計方針 (CLAUDE.md §3 / docs/f_02_memory_system.md §3 / docs/c_05_data_schemas.md §1.2)
 
 - **owner** は書込権を持つ唯一の pillar。Fact View 層
   (`MemFactView` / `LoopFactView` / `LearnFactView`) は書込前に

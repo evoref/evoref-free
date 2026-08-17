@@ -7,38 +7,21 @@
 
 from __future__ import annotations
 
-import ast
 import re
-import shlex
-from collections.abc import Callable
-from dataclasses import dataclass, replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
 
 from backend.config import get_project_root
 from backend.free.agent.router import (
-    HISTORY_KEYWORDS,
-    HISTORY_KEYWORDS_EN,
     asks_directory_listing,
     is_environment_fact_query,
-)
-from backend.free.core.intent_vocab import (
-    DATETIME_QUERY_RE,
-    NUMBER_LITERAL_RE,
-    PROXIMAL_RECALL_KEYWORDS,
-    SESSION_ANCHOR_EN,
-    SESSION_PROXIMITY_WINDOW_EN,
-    SESSION_TOPIC_BREAK_LOOKAHEAD_EN,
-    looks_like_numeric_question,
-    session_self_reference_pattern_ja,
 )
 from backend.free.core.locale_patterns import is_en_locale, select_locale_variant
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.safety_patterns import (
     extract_command_literal,
-    reject_readonly_violation,
     strip_command_literals,
 )
 from backend.free.agent.tools_registry import ToolDefinition, ToolsRegistry
@@ -50,6 +33,166 @@ from backend.free.agent.grammar_tool_classifier import (
 )
 from backend.free.llm.json_extract import extract_json_object
 from backend.log_config import get_logger
+
+# --- 責務別モジュール ---------------------------------------------------------
+# 判定に使う正規表現・純粋関数は責務ごとに分割してある。本モジュールは判定フロー
+# (``ToolCallJudge.judge`` の層構成) だけを持ち、以下は **再エクスポート** として
+# 取り込む。既存の呼出元・テストが ``tool_call_judge.<名前>`` を直接参照しており、
+# ``mock.patch("...tool_call_judge.Path.exists")`` のようなパッチ対象にもなって
+# いるため、名前の見え方は分割前と一致させる。
+from backend.free.agent.tool_judge_types import (
+    ToolJudgement,
+)
+from backend.free.agent.tool_judge_dialogue import (
+    _CALCULATE_CONTEXT_TURNS,
+    _JUDGE_CONTEXT_CHARS,
+    _dialogue_text,
+    _recent_dialogue_messages,
+    _recent_dialogue_text,
+)
+from backend.free.agent.tool_judge_signals import (
+    _ASSISTANT_PREFERENCE_PATTERNS,
+    _CODE_IDENTIFIER_RE,
+    _CODE_SEARCH_PATTERNS,
+    _CODE_USAGE_LOCATION_RE,
+    _CODE_USAGE_STOPWORDS,
+    _CODE_USAGE_VERB_RE,
+    _DELETE_FS_TARGET_RE,
+    _DELETE_INTENT_RE,
+    _EXPLICIT_EXEC_VERB_RE,
+    _FIRST_PERSON_REFERENCE_RE,
+    _HARDWARE_MEMORY_QUERY_RE,
+    _IMMEDIATE_CHILDREN_RE,
+    _INFER_TOOL_EXEC_QUERY_RE,
+    _INFER_TOOL_EXEC_QUERY_RE_EN,
+    _KNOWLEDGE_PATTERNS,
+    _KNOWLEDGE_PATTERNS_EN,
+    _LOCAL_FILE_REFERENCE_RE,
+    _PATH_OR_URL_SIGNAL_RE,
+    _READ_PATH_TOOLS,
+    _RECURSIVE_LISTING_RE,
+    _SELF_ACTION_PATTERNS,
+    _SELF_SESSION_REFERENCE_PATTERNS,
+    _SELF_SESSION_REFERENCE_PATTERNS_EN,
+    _SESSION_REFLECTIVE_VOCAB_BROAD_EN,
+    _SESSION_REFLECTIVE_VOCAB_BROAD_JA,
+    _SESSION_REFLECTIVE_VOCAB_LEADING_EN,
+    _SESSION_TOPIC_BREAK_LEAD_RE_EN,
+    _TOOL_PATTERNS,
+    _TOOL_PATTERNS_EN,
+    _WEB_REFERENCE_RE,
+    _code_usage_location_pattern,
+    _is_code_usage_location_query,
+    _query_has_tool_signal,
+    _query_targets_local_file_only,
+)
+from backend.free.agent.tool_judge_grounding import (
+    _DURATION_H_HALF_RE,
+    _DURATION_H_RE,
+    _DURATION_HM_RE,
+    _DURATION_M_RE,
+    _DURATION_MS_RE,
+    _FULLWIDTH_DIGITS,
+    _GROUPED_NUMBER_RE,
+    _INTERVAL_M_RE,
+    _NUMBER_LITERAL_RE,
+    _NUMERIC_LITERAL_RE,
+    _PERCENT_LITERAL_RE,
+    _UNIT_SYSTEM_CONSTANTS,
+    _WEEKDAY_ORDER,
+    _WEEKDAY_RANGE_RE,
+    _duration_derived_numbers,
+    _known_numbers,
+    _numeric_literals,
+    _synthesized_expression_grounded,
+    _ungrounded_numbers,
+)
+from backend.free.agent.tool_judge_commands import (
+    _DATE_ARITHMETIC_RE,
+    _DATETIME_NOW_COMMAND,
+    _DATETIME_QUERY_RE,
+    _DRIVE_LETTER_RE,
+    _EXECUTABLE_QUERY_COMMANDS,
+    _OFFSET_UNITS,
+    _READONLY_INSPECT_COMMANDS,
+    _REL_PREFIX,
+    _REL_SUFFIX,
+    _RELATIVE_OFFSET_RE,
+    _build_datetime_command,
+    _build_spec_command,
+    _command_is_readonly_inspection,
+    _infer_executable_command,
+    _readonly_command_rejected,
+    recalled_command_fits_query,
+)
+from backend.free.agent.tool_judge_args import (
+    _ARITH_BARE_TAIL_RE,
+    _ARITH_DATE_LIKE_RE,
+    _ARITH_NORMALIZE,
+    _ARITH_REQUEST_CUE_RE,
+    _ARITH_RUN_RE,
+    _ARITH_SAFE_NODES,
+    _DIR_PATH_RE,
+    _FILE_CONTENT_REQUEST_RE,
+    _FILE_EXISTENCE_RE,
+    _HEAD_LINES_RE,
+    _NAMED_DIRECTORY_RE,
+    _PROJECT_ROOT_REFERENCE_RE,
+    _QUOTE_PAIRS,
+    _URL_IN_QUERY_RE,
+    _ZENKAKU_DIGITS,
+    _coerce_positive_int,
+    _extract_arithmetic_expression,
+    _extract_file_path,
+    _extract_head_line_count,
+    _extract_quoted_filename,
+    _extract_search_pattern,
+    _is_numeric_expression,
+    _normalize_path_separators,
+    _normalize_path_text,
+    _trim_nonexistent_path_tail,
+    asks_file_existence_only,
+    resolve_listing_directory,
+)
+from backend.free.agent.tool_judge_history import (
+    _ANAPHORIC_REFERENCE_RE,
+    _HISTORY_SEARCH_DEFAULT_LIMIT,
+    _ORDER_QUERY_CONTENT_RE,
+    _ORDER_QUERY_CONTENT_RE_EN,
+    _ORDER_QUERY_MIN_TERM_LEN,
+    _ORDER_QUERY_SCAFFOLD_RE,
+    _ORDER_QUERY_SCAFFOLD_RE_EN,
+    _ORDER_QUERY_STOPWORD_RUNS,
+    _ORDER_QUERY_STOPWORD_RUNS_EN,
+    _ORDER_QUERY_STOPWORDS_BY_LEN,
+    _ORDERED_HISTORY_QUERY_RE,
+    _RETROSPECTIVE_QUESTION_RE,
+    _has_history_recall_keywords,
+    _only_proximal_recall_keywords,
+    _reduce_ordered_history_query,
+    _strip_stopword_affixes,
+    asks_about_prior_conversation_entity,
+)
+from backend.free.agent import tool_judge_guards as guards
+from backend.free.agent.tool_judge_guards import (
+    _COMMAND_TOOL_NAMES,
+    _MODE_CAPABILITY_SIBLINGS,
+    _STATE_CHANGING_TOOL_NAMES,
+    _TEXT_OPERAND_TOOLS,
+    GuardContext,
+    apply_guards,
+)
+from backend.free.agent.tool_judge_referential import (
+    _FILE_CONTENT_DISPLAY_RE,
+    _FILE_METRICS_RE,
+    _FILE_NOUN_RE,
+    _PATH_SEPARATOR_RE,
+    _REFERENTIAL_TARGET_RE,
+    _REWRITE_VERB_RE,
+    _referential_read_judgement,
+    _referential_rewrite_judgement,
+    _resolve_referenced_path,
+)
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
@@ -63,66 +206,8 @@ logger = get_logger("agent.tool_call_judge")
 # executable command リコールの候補プールがこの件数未満のとき、類似度閾値を
 # ``_RECALL_SMALL_POOL_MARGIN`` だけ嵩上げする。学習初期は top-K も success_avg も
 # 選別として機能せず、類似度ゲート 1 本で決まってしまうため。
-#: 実行可能コマンドを載せるツール名 (mode により片方のみ利用可能)。
-_COMMAND_TOOL_NAMES = frozenset({"run_command", "run_command_readonly"})
-
-#: 「実行するとファイル/環境の状態が変わる」ツール名。mode 制約で撃てなかった
-#: 場合、``action_blocked`` を立てて完了報告の捏造を禁じる必要がある
-#: (``run_command`` は読取専用の兄弟へ載せ替わる経路があるため
-#: ``_COMMAND_TOOL_NAMES`` 側で measurement_blocked として扱う)。
-_STATE_CHANGING_TOOL_NAMES = frozenset({"write_file", "apply_patch", "delete_file"})
-
-#: 「直下だけ」を指す表現。再帰的な列挙を明示する語 (再帰 / 全部 / 配下すべて)
-#: が同居する依頼は対象外にして、意図が割れる文には手を入れない。
-_IMMEDIATE_CHILDREN_RE = re.compile(
-    r"直下|直下の|トップレベル|第一階層|一階層目"
-    # 「ルートディレクトリにあるファイルとフォルダ」も直下要求だが、語彙が
-    # 「直下」に限られていたため素通りし、既定 3 階層のツリー (5,523 字) が
-    # TOOL_RESULT_MAX_CHARS で切り詰められた (実インシデント 2026-08-04
-    # ライブ監査: 実在する frontend/ を「見当たりません」と誤答)。
-    r"|ルート(?:ディレクトリ|フォルダ)?直下|ルート(?:ディレクトリ|フォルダ)にある"
-    r"|最上位|一番上"
-    r"|immediate\s+children|top[-\s]?level|first\s+level|root\s+(?:directory|folder)",
-    re.IGNORECASE,
-)
-_RECURSIVE_LISTING_RE = re.compile(
-    r"再帰|階層すべて|配下すべて|すべての階層|全階層|recursive(?:ly)?",
-    re.IGNORECASE,
-)
-
-#: 処理対象の本文そのものを引数に取るツール。判定プロンプトの会話は切り詰めて
-#: あるため、aux の転記をそのまま使うと断片だけが処理される。
-_TEXT_OPERAND_TOOLS = frozenset({"summarize", "translate"})
-
-#: 判定プロンプトへ載せる会話 1 メッセージあたりの文字数上限。切り詰め側と
-#: 復元側で同じ定数を共有する (別々に持つと片方の変更で復元が効かなくなる)。
-_JUDGE_CONTEXT_CHARS = 100
-
-#: 同じ能力を持ち権限だけが違うツールの対応表 (優先順)。aux が mode 外の
-#: 兄弟名を返したとき、撃てる方へ載せ替えて判定の意図を保つ。緩い側から厳しい
-#: 側への一方向にだけ張る (逆向きに張ると chat が特権ツールへ昇格してしまう)。
-_MODE_CAPABILITY_SIBLINGS: dict[str, tuple[str, ...]] = {
-    "run_command": ("run_command_readonly",),
-}
-
 _RECALL_SMALL_POOL_SIZE = 3
 _RECALL_SMALL_POOL_MARGIN = 0.1
-
-# Windows / Unix の明示パス、または URL。ユーザーが対象を書いた決定論的シグナルで、
-# aux の否定票より優先してよい (``_upgrade_command_via_aux`` の降格例外)。
-#: ドライブレターの区切りは ``\`` と ``/`` の双方を受ける。バックスラッシュ限定
-#: だったため ``E:/tmp/a.txt`` がツールシグナルとして検出されず、明示パス付きの
-#: 依頼が knowledge query に落ちて「存在しない」と誤答していた (実インシデント
-#: 2026-08-04 ライブ監査)。
-_PATH_OR_URL_SIGNAL_RE = re.compile(
-    r"[A-Za-z]:[\\/]|(?:^|[\s　])(?:/[\w._-]+){2,}|https?://",
-)
-
-
-
-
-
-
 
 
 def _executable_tool_for_mode(tools_registry: ToolsRegistry, mode: str) -> str:
@@ -145,1528 +230,6 @@ def _executable_tool_for_mode(tools_registry: ToolsRegistry, mode: str) -> str:
     if tools_registry.is_available("run_command_readonly", mode):
         return "run_command_readonly"
     return ""
-
-
-#: readonly の allow-list (python のみ) から漏れるが、**状態を変えないことが
-#: 明らかな**検査コマンドの実行ファイル名。
-#:
-#: 用途は「拒否されたコマンドが *変更の試み* だったのか *測定の試み* だったのか」
-#: の振り分けのみで、**実行可否は一切変わらない** (どちらも allow-list 違反として
-#: 拒否される)。変わるのは base へ足す注記が ``_UNPERFORMED_ACTION_GUIDANCE``
-#: (何も実行していない) か ``_UNMEASURED_FACT_GUIDANCE`` (測っていない) かだけ。
-#:
-#: 実インシデント (2026-08-15 ライブ監査 ターン12): 「本当に削除されましたか？
-#: 確認して。」にネイティブ層が ``test -f <path>`` を選び、allow-list 違反で
-#: 拒否 → 一律 ``_action_blocked`` が立ち「状態を変える操作を実行していない」の
-#: 注記が入った結果、base が「ファイルの存在確認を行うツールが利用できない」と
-#: 誤った説明で締めた (実際は read_file / list_directory が使える)。
-#:
-#: mutation を read と誤分類すると完了の捏造 (2026-08-08 の ``echo >> file``)
-#: に戻るため、**曖昧なものは載せない**。判定不能なら従来どおり action 扱い。
-_READONLY_INSPECT_COMMANDS: frozenset[str] = frozenset({
-    "test", "ls", "dir", "cat", "type", "stat",
-    "head", "tail", "wc", "grep", "findstr", "where", "which",
-})
-
-
-def _command_is_readonly_inspection(command: str) -> bool:
-    """``command`` が「状態を変えない検査」と確実に言えるか。
-
-    リダイレクト (``>`` / ``>>``) や連鎖 (``&&`` / ``;`` / ``|``) を含む場合は、
-    先頭が検査コマンドでも後続で状態を変えうるので False を返す
-    (``test -f x && rm x`` のような形を read と誤分類しない)。
-    """
-    if not command or any(t in command for t in (">", ">>", "&&", "||", ";", "|")):
-        return False
-    try:
-        tokens = shlex.split(command, posix=True)
-    except ValueError:
-        return False
-    if not tokens:
-        return False
-    return Path(tokens[0]).name.lower().removesuffix(".exe") in (
-        _READONLY_INSPECT_COMMANDS
-    )
-
-
-def _readonly_command_rejected(exec_tool: str, command: str) -> bool:
-    """readonly ツールに載せる ``command`` が readonly 検証に違反するか。
-
-    ``exec_tool`` が ``run_command_readonly`` のときだけ
-    ``reject_readonly_violation`` を適用する (create の run_command は対象外)。
-    judge 段でこれを弾くと、synth が返した非 readonly コマンド (PowerShell
-    スニペット等) が実行段の "Error: readonly violation" ではなく no_tool に
-    倒れ、LLM 知識回答へクリーンに落ちる。実行段のラッパ検証は最終防衛として
-    別途残る (二重ガード)。
-    """
-    if exec_tool != "run_command_readonly":
-        return False
-    reject = reject_readonly_violation(command)
-    if reject is not None:
-        logger.info(
-            "Readonly executable command rejected at judge stage (%s): %s",
-            reject, command[:80],
-        )
-        return True
-    return False
-
-
-# コード/ファイル検索の共起ガード。汎用「検索」単独は知識質問にもマッチする
-# ため、コード/ファイル文脈語との共起を要求する (下記 _TOOL_PATTERNS の設計
-# 原則と同じ)。_TOOL_PATTERNS / _TOOL_PATTERNS_EN のこのエントリと
-# ToolCallJudge._infer_tool 内の search_code 判定の単一の情報源。JA/EN で
-# 同一の複合パターンを使う (両トークンを同一正規表現に含めているため locale
-# で分岐不要)。
-_CODE_SEARCH_PATTERNS = (
-    re.compile(
-        r"(?:コード|ファイル|ソース|関数|クラス|(?<![A-Za-z])code(?![A-Za-z])"
-        r"|(?<![A-Za-z])file(?![A-Za-z])|(?<![A-Za-z])source(?![A-Za-z]))"
-        r".*(?:検索|(?<![A-Za-z])search(?![A-Za-z])|(?<![A-Za-z])grep(?![A-Za-z])"
-        r"|(?<![A-Za-z])find(?![A-Za-z]))",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?:検索|(?<![A-Za-z])search(?![A-Za-z])|(?<![A-Za-z])grep(?![A-Za-z])"
-        r"|(?<![A-Za-z])find(?![A-Za-z]))"
-        r".*(?:コード|ファイル|ソース|(?<![A-Za-z])code(?![A-Za-z])"
-        r"|(?<![A-Za-z])file(?![A-Za-z])|(?<![A-Za-z])source(?![A-Za-z]))",
-        re.IGNORECASE,
-    ),
-)
-
-# 所在を問う言い回し (「<識別子> はどこで使われていますか」) の共起ガード。
-#
-# ``_CODE_SEARCH_PATTERNS`` は「コード/ファイル語 × 検索動詞」を要求するが、
-# この言い方は **どちらの語も含まない**。結果、ルール層を素通りして文法制約
-# 分類器へ落ち、分類器は所在探索に無意味な ``list_directory`` を選ぶ。
-#
-# 2026-08-16 ライブ監査ターン 19「このプロジェクトで LangChain はどこで
-# 使われていますか？」: ``list_directory`` が 5,477 文字のツリーを返し、それを
-# 再 prefill した結果 **218.6 秒** (当セッション最長) を消費したうえ、
-# 「一覧は途中が省略されているため確認できません」で終わった。同じ質問は
-# ``search_code`` なら 1 回の grep で答えが出る。
-_CODE_USAGE_LOCATION_RE = re.compile(
-    r"(?:どこ|どの(?:ファイル|モジュール|クラス|関数|パッケージ)"
-    r"|\bwhere\b|which\s+(?:file|module|class|function))",
-    re.IGNORECASE,
-)
-#: 所在を問う対象の動詞。可能形 (「使えますか」) は「利用可否」の質問であって
-#: 所在の質問ではないので採らない (受身/サ変の語幹だけを見る)。
-_CODE_USAGE_VERB_RE = re.compile(
-    r"(?:使わ|使用さ|利用さ|定義さ|実装さ|呼ば|宣言さ|参照さ|書かれ"
-    r"|\bused\b|\bdefined\b|\bimplemented\b|\bdeclared\b|\breferenced\b"
-    r"|\bcalled\b)",
-    re.IGNORECASE,
-)
-#: 検索対象になりうる ASCII 識別子。これが無いクエリ (「敬語はどこで使われますか」
-#: のような自然言語の質問) では発火させない — search_code はコード検索であり、
-#: 識別子が取れないなら撃つ意味がない。
-_CODE_IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w{2,}")
-
-
-#: 所在質問の骨組みを成す英語の機能語。``_extract_search_pattern`` はこれらを
-#: 落とさないため、"where is search_code used?" で ``where`` を検索語に採って
-#: しまう (grep 対象として無意味)。この経路専用に除外する。
-_CODE_USAGE_STOPWORDS = frozenset({
-    "where", "which", "what", "file", "files", "module", "modules", "class",
-    "classes", "function", "functions", "package", "packages", "the", "this",
-    "that", "these", "those", "and", "for", "from", "with", "into", "does",
-    "did", "are", "was", "were", "been", "being", "used", "uses", "use",
-    "defined", "define", "defines", "implemented", "implements", "declared",
-    "declares", "referenced", "references", "called", "calls", "project",
-    "codebase", "repository", "repo", "code", "source",
-})
-
-
-def _is_code_usage_location_query(query: str) -> bool:
-    """「<識別子> はどこで使われているか」型の所在質問か。"""
-    return bool(
-        _CODE_USAGE_LOCATION_RE.search(query)
-        and _CODE_USAGE_VERB_RE.search(query)
-        and _CODE_IDENTIFIER_RE.search(query),
-    )
-
-
-def _code_usage_location_pattern(query: str) -> str:
-    """所在質問から grep 対象の識別子を取り出す。
-
-    質問の骨組み (where / file / used ...) を除いた最初の ASCII 識別子。
-    残らなければ空文字 (呼出側はルール発火を見送る)。
-    """
-    for token in _CODE_IDENTIFIER_RE.findall(query):
-        if token.lower() not in _CODE_USAGE_STOPWORDS:
-            return token
-    return ""
-
-
-# ルールベースフォールバック用パターン
-# 注意: 「検索」等の汎用語は知識質問にもマッチするため、
-# コード/ファイル文脈を要求するパターンのみ含める。
-_TOOL_PATTERNS = [
-    re.compile(r"(?:ファイル|file).*(?:読|書|開|作成|削除)", re.IGNORECASE),
-    re.compile(r"(?:コマンド|command).*(?:実行|run)", re.IGNORECASE),
-    # コード/ファイル検索: 汎用「検索」は知識質問にマッチするため除外。
-    # ASCII トークンは単語境界必須 ("crossencoder" の 'code' 等への部分一致誤爆対策、
-    # CPU/RAM 境界ガードと同じ理由)。日本語側 (コード/ファイル/ソース/検索) は対象外。
-    *_CODE_SEARCH_PATTERNS,
-    re.compile(r"(?:URL|url|https?://|ウェブ|web|サイト|site|ページ|page|ニュース|news|フェッチ|fetch|ブラウズ|browse)", re.IGNORECASE),
-    re.compile(r"(?:計算|calculate)\s", re.IGNORECASE),
-    # ファイルパスを含むクエリ（C:\, E:\, /home/ 等）+ 出力/保存/生成系動詞
-    re.compile(r"[A-Za-z]:\\", re.IGNORECASE),
-    re.compile(r"(?:出力|保存|生成|作成|書き出|エクスポート).*(?:して|する)", re.IGNORECASE),
-    re.compile(r"(?:プログラム|コード|スクリプト|関数|クラス).*(?:作|書|生成)", re.IGNORECASE),
-    # 「実行して」「動かして」等の動詞（ファイルパスやバッククォート付き）
-    re.compile(r"(?:実行|動かし|起動|run|exec).*(?:して|する|しろ)", re.IGNORECASE),
-    # バッククォート内コマンド
-    re.compile(r"`[^`]+`", re.IGNORECASE),
-    # --- Python 実行可能クエリ: システム情報 ---
-    # 注意: \b は日本語文字を \w とみなすため英語-日本語境界で機能しない。
-    # 英語の短いキーワードは (?<![A-Za-z])...(?![A-Za-z]) で ASCII 境界を使用。
-    # CPU/RAM/GPU/VRAM も境界必須 (IGNORECASE で "program" の 'ram' 等に
-    # 部分マッチし、文書タスクへ OS スペックコマンドを誤発火した実績あり)。
-    # 「容量」単独は外す。``capacity`` を外したのと同じ理由で、**データ量の話に
-    # 普通に現れる**ため機械スペックの要求とは限らない (実インシデント
-    # 2026-08-10 ライブ監査: 「DBの容量は1.2TB…合計容量は何TBですか」
-    # 「フルと増分を合わせた総容量」「RPO・RTO・容量効率の列で表を」の 4 ターンで
-    # OS/CPU/コア数の取得コマンドが撃たれた)。機器を名指しする質問は
-    # ディスク / ストレージ / ドライブ / disk / drive 側で拾えるので取りこぼさない。
-    re.compile(r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])|メモリ|(?<![A-Za-z])RAM(?![A-Za-z])|(?<![A-Za-z])GPU(?![A-Za-z])|(?<![A-Za-z])VRAM(?![A-Za-z])|ディスク|(?:空き|残り|使用)容量|ストレージ|ドライブ|(?<![A-Za-z])spec(?![A-Za-z])|(?<![A-Za-z])drive(?![A-Za-z]))", re.IGNORECASE),
-    # 「何月|何日|何曜日」追加 (router.py:101 と同期)
-    # 「日時型」「日付フォーマット」等はデータ型/スキーマの話 (router の
-    # _EXECUTABLE_QUERY_PATTERNS の同じエントリのコメント参照)。
-    re.compile(r"(?:何時|何月|何日|何曜日|(?:日時|日付)(?!型|形式|フォーマット|カラム|列)|現在時刻|(?<![A-Za-z])today(?![A-Za-z])|(?<![A-Za-z])now(?![A-Za-z])|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z]))", re.IGNORECASE),
-    re.compile(r"(?:IP\s*アドレス|ホスト名|(?<![A-Za-z])hostname(?![A-Za-z])|(?<![A-Za-z])ip\s*address)", re.IGNORECASE),
-    re.compile(r"(?:(?<![A-Za-z])OS(?![A-Za-z])|オペレーティングシステム|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])|(?<![A-Za-z])Mac(?![A-Za-z]))", re.IGNORECASE),
-    re.compile(r"(?:Python|python)\s*(?:バージョン|version)", re.IGNORECASE),
-    re.compile(r"(?:環境変数|(?<![A-Za-z])env(?![A-Za-z])|(?<![A-Za-z])PATH(?![A-Za-z]))", re.IGNORECASE),
-    # --- Python 実行可能クエリ: 数値処理 ---
-    # 「16進に変換して」のように「数」が入らない書き方も基数変換。bare「変換」を
-    # 外したぶん、ここで基数そのものを見る。
-    re.compile(r"(?:階乗|素数|フィボナッチ|素因数|進数変換|\d+\s*進(?:数|法)?|桁)", re.IGNORECASE),
-    # --- Python 実行可能クエリ: データ処理 ---
-    re.compile(r"(?:集計|合計|平均|中央値|標準偏差|ソート|統計)", re.IGNORECASE),
-    # --- Python 実行可能クエリ: 変換 ---
-    # 「変換」単独は外す。表・JSON・Markdown の書き換えなど **LLM 自身がやる
-    # 内容変換** まで実行可能クエリ扱いになり、そこから層 0.5 (コマンド想起) が
-    # 開いて無関係な過去コマンドが再生される (実インシデント 2026-08-10 ライブ
-    # 監査:「その表を JSON Schema (draft 2020-12) に変換してください。」で
-    # OS/CPU スペック取得コマンドが実行された)。コマンドが要る変換は符号化・
-    # 基数・ハッシュ・時刻に限られ、いずれも固有語で拾える。
-    re.compile(r"(?:エンコード|デコード|Base64|ハッシュ|タイムスタンプ|文字コード|エポック秒?|UNIX\s*時間)", re.IGNORECASE),
-]
-
-# _TOOL_PATTERNS の英語版。GUI 左下の言語設定が 'en' の場合のみ使う
-# (_TOOL_PATTERNS とは locale で完全に排他利用される)。既に ASCII/日英混在で
-# 機能するエントリ (コード検索/URL/計算/日時/OS/env 等) は locale='en' でも
-# 引き続き評価できるようそのまま複製する。
-_TOOL_PATTERNS_EN = [
-    re.compile(r"\bfile\b.*\b(?:read|open)\b.*\b(?:write|modify|change|update|delete|remove|edit)\b", re.IGNORECASE),
-    re.compile(r"(?:コマンド|command).*(?:実行|run)", re.IGNORECASE),
-    *_CODE_SEARCH_PATTERNS,
-    re.compile(r"(?:URL|url|https?://|web|site|page|news|fetch|browse)", re.IGNORECASE),
-    re.compile(r"(?:計算|calculate)\s", re.IGNORECASE),
-    re.compile(r"[A-Za-z]:\\", re.IGNORECASE),
-    re.compile(r"\b(?:save|export|output)\b.{0,20}\b(?:it|this|that|to|as|file)\b", re.IGNORECASE),
-    re.compile(
-        r"\b(?:program|code|script|function|class)\b.*"
-        r"\b(?:write|create|generate|build|implement)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(r"\b(?:run|execute|exec)\b.{0,20}\b(?:this|that|it|the\s+\w+)\b", re.IGNORECASE),
-    re.compile(r"`[^`]+`", re.IGNORECASE),
-    re.compile(r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])|memory|(?<![A-Za-z])RAM(?![A-Za-z])|(?<![A-Za-z])GPU(?![A-Za-z])|(?<![A-Za-z])VRAM(?![A-Za-z])|disk|capacity|storage|drive|(?<![A-Za-z])specs?(?![A-Za-z]))", re.IGNORECASE),
-    # 「日時型」「日付フォーマット」等はデータ型/スキーマの話 (router の
-    # _EXECUTABLE_QUERY_PATTERNS の同じエントリのコメント参照)。
-    re.compile(r"(?:何時|何月|何日|何曜日|(?:日時|日付)(?!型|形式|フォーマット|カラム|列)|現在時刻|(?<![A-Za-z])today(?![A-Za-z])|(?<![A-Za-z])now(?![A-Za-z])|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z]))", re.IGNORECASE),
-    re.compile(r"(?:IP\s*address|hostname|(?<![A-Za-z])hostname(?![A-Za-z])|(?<![A-Za-z])ip\s*address)", re.IGNORECASE),
-    re.compile(r"(?:(?<![A-Za-z])OS(?![A-Za-z])|operating\s*system|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])|(?<![A-Za-z])Mac(?![A-Za-z]))", re.IGNORECASE),
-    re.compile(r"(?:Python|python)\s*version", re.IGNORECASE),
-    re.compile(r"(?:environment\s*variable|(?<![A-Za-z])env(?![A-Za-z])|(?<![A-Za-z])PATH(?![A-Za-z]))", re.IGNORECASE),
-    # --- Python 実行可能クエリ: 数値処理 (171行目相当の英語版) ---
-    # base N / hex / binary / octal は基数変換そのもので、bare "convert" を
-    # 外した後もここで拾う (bare "convert" を外した理由は変換パターン側の
-    # コメント参照)。
-    re.compile(r"\b(?:factorial|prime(?:\s*numbers?)?|fibonacci|prime\s*factorization|base\s*conversion|base\s*\d+|hex(?:adecimal)?|binary|octal|radix|number\s*of\s*digits?|digits?)\b", re.IGNORECASE),
-    # --- Python 実行可能クエリ: データ処理 (173行目相当の英語版) ---
-    # sum/average/mean/sort は日常会話で極めて頻出する多義語 ("What do you
-    # mean?"/"I sort of agree"/"on average, this works fine") のため、
-    # 単独では発火させず数値/データ文脈語との近接共起を要求する (2026-07-22
-    # 監査で判明、router.py の _EXECUTABLE_QUERY_PATTERNS_EN と同期)。
-    # total/median/standard deviation/std dev/statistics/aggregate は
-    # 既存テスト (test_data_processing_queries_en の bare "What's the
-    # total?") が単独発火を前提としており、日常会話での多義性も相対的に
-    # 低いため単独発火のまま維持する。
-    re.compile(r"\b(?:total|median|standard\s*deviation|std\s*dev|statistics|aggregate)\b", re.IGNORECASE),
-    re.compile(
-        r"\b(?:sum|average|mean|sort(?:ed|ing)?)\b.{0,20}"
-        r"\b(?:numbers?|data|list|array|values?|dataset|figures?)\b"
-        r"|\b(?:numbers?|data|list|array|values?|dataset|figures?)\b.{0,20}"
-        r"\b(?:sum|average|mean|sort(?:ed|ing)?)\b",
-        re.IGNORECASE,
-    ),
-    # --- Python 実行可能クエリ: 変換 (175行目相当の英語版) ---
-    # bare "convert" は日本語版の「変換」と同じ理由で外す (内容変換の依頼が
-    # 実行可能クエリになり、層 0.5 のコマンド想起が開く)。
-    re.compile(r"\b(?:encode|decode|encoding|decoding|Base64|hash(?:ing)?|timestamp|epoch)\b", re.IGNORECASE),
-]
-
-# _infer_tool() の実行可能クエリ判定ゲート (システム情報・数値処理・
-# データ処理・変換)。_TOOL_PATTERNS/_TOOL_PATTERNS_EN の該当エントリと
-# 語彙が重複するが、_infer_tool は「どのツールを選ぶか」を決める別の判定
-# フェーズであり、単一の結合正規表現として設計されているため独立して保持する。
-# CPU/RAM/GPU/VRAM 等の短い ASCII トークンは境界必須 (IGNORECASE で
-# "program" の 'ram' 等に部分マッチした実績が _TOOL_PATTERNS 側にあり
-# 159-162行目で対策済み。本パターンは同期しておらず 2026-07-22 監査で
-# 判明するまで同じ穴が残っていた)。
-_INFER_TOOL_EXEC_QUERY_RE = re.compile(
-    r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])|メモリ|(?<![A-Za-z])RAM(?![A-Za-z])"
-    # 「容量」単独を外す理由は _TOOL_PATTERNS の同じエントリのコメント参照。
-    r"|(?<![A-Za-z])GPU(?![A-Za-z])|(?<![A-Za-z])VRAM(?![A-Za-z])"
-    r"|ディスク|(?:空き|残り|使用)容量|ストレージ|ドライブ"
-    r"|(?<![A-Za-z])spec(?![A-Za-z])"
-    r"|何時|何月|何日|何曜日|日時|日付|現在時刻"
-    # 裸の now は時刻クエリのシグナルにならない ("from now on" / "right now" /
-    # "know now" 等の非時制表現に誤爆する。2026-07-26 ライブ検証で
-    # "From now on, always reply in English. Tell me what a deadlock is" が
-    # run_command_readonly の時刻取得を発火させた)。EN 版 (_..._RE_EN) は
-    # 2026-07-22 監査で既に句単位に絞ってあるので、同じ形へ揃える。
-    r"|(?<![A-Za-z])today(?![A-Za-z])"
-    r"|what'?s?\s*(?:the\s*)?(?:time|date)|current\s*(?:time|date)"
-    r"|IP\s*アドレス|ホスト名|(?<![A-Za-z])hostname(?![A-Za-z])"
-    r"|(?<![A-Za-z])OS(?![A-Za-z])|オペレーティングシステム"
-    r"|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])"
-    r"|(?<![A-Za-z])Mac(?![A-Za-z])"
-    r"|Python\s*(?:バージョン|version)"
-    r"|環境変数|(?<![A-Za-z])env(?![A-Za-z])"
-    r"|階乗|素数|フィボナッチ|素因数|進数変換|桁"
-    r"|集計|合計|平均|中央値|標準偏差|ソート|統計"
-    r"|変換|エンコード|デコード|Base64|ハッシュ|タイムスタンプ)",
-    re.IGNORECASE,
-)
-
-# _INFER_TOOL_EXEC_QUERY_RE の英語版。JA 側と同じ理由で ASCII トークンは
-# 全て境界必須 (境界無しだと program/framework/diagram/anagram が
-# memory/RAM 等に、summary/resume/assume が sum/mean 等に部分マッチする。
-# 2026-07-22 監査で判明)。
-_INFER_TOOL_EXEC_QUERY_RE_EN = re.compile(
-    r"(?:(?<![A-Za-z])specs?(?![A-Za-z])|(?<![A-Za-z])CPU(?![A-Za-z])"
-    r"|(?<![A-Za-z])memory(?![A-Za-z])|(?<![A-Za-z])RAM(?![A-Za-z])"
-    r"|(?<![A-Za-z])GPU(?![A-Za-z])|(?<![A-Za-z])VRAM(?![A-Za-z])"
-    # ``capacity`` はデータ項目名として普通に現れるため対象外
-    # (_EXECUTABLE_QUERY_COMMANDS の同名エントリのコメント参照)。
-    r"|(?<![A-Za-z])disk(?![A-Za-z])|(?<![A-Za-z])storage(?![A-Za-z])"
-    r"|what'?s?\s*(?:the\s*)?(?:time|date)|current\s*(?:time|date)"
-    r"|today'?s?\s*date|what\s*day\s*(?:is\s*it|of\s*the\s*week)"
-    r"|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z])"
-    r"|IP\s*address|(?<![A-Za-z])hostname(?![A-Za-z])"
-    r"|(?<![A-Za-z])OS(?![A-Za-z])|operating\s*system"
-    r"|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])|(?<![A-Za-z])Mac(?![A-Za-z])"
-    r"|Python\s*version"
-    r"|environment\s*variable|(?<![A-Za-z])env(?![A-Za-z])|(?<![A-Za-z])PATH(?![A-Za-z])"
-    r"|(?<![A-Za-z])factorial(?![A-Za-z])|(?<![A-Za-z])prime(?![A-Za-z])(?:\s*numbers?)?"
-    r"|(?<![A-Za-z])fibonacci(?![A-Za-z])|prime\s*factorization|base\s*conversion"
-    r"|number\s*of\s*digits?|(?<![A-Za-z])digits?(?![A-Za-z])"
-    r"|(?<![A-Za-z])sum(?![A-Za-z])|(?<![A-Za-z])total(?![A-Za-z])|(?<![A-Za-z])average(?![A-Za-z])"
-    r"|(?<![A-Za-z])mean(?![A-Za-z])|(?<![A-Za-z])median(?![A-Za-z])"
-    r"|standard\s*deviation|std\s*dev|(?<![A-Za-z])sort(?:ed|ing)?(?![A-Za-z])"
-    r"|(?<![A-Za-z])statistics(?![A-Za-z])|(?<![A-Za-z])aggregate(?![A-Za-z])"
-    r"|(?<![A-Za-z])convert(?![A-Za-z])|(?<![A-Za-z])encod(?:e|ing)(?![A-Za-z])"
-    r"|(?<![A-Za-z])decod(?:e|ing)(?![A-Za-z])|(?<![A-Za-z])Base64(?![A-Za-z])"
-    r"|(?<![A-Za-z])hash(?:ing)?(?![A-Za-z])|(?<![A-Za-z])timestamp(?![A-Za-z]))",
-    re.IGNORECASE,
-)
-
-# ユーザークエリからドライブレターを抽出するパターン
-# 「Eドライブ」「C:」「D drive」等のパターンにマッチし、
-# 単一の英字（ドライブレター）をキャプチャする。
-# ASCII 境界を使用して "PCの" 等の複数文字並びに誤マッチしないよう、
-# 直前が英字でないことを保証する。
-_DRIVE_LETTER_RE = re.compile(
-    r"(?:^|[^A-Za-z])([A-Za-z])(?::|\s*ドライブ|\s*drive(?![A-Za-z]))",
-    re.IGNORECASE,
-)
-
-# クエリ先頭の URL を抽出する。非 ASCII (CJK 等) を除外し、「URL + 日本語」
-# 入力で末尾テキストを URL に取り込まないようにする
-# (例: https://news.yahoo.co.jp/で取得して... → https://news.yahoo.co.jp/ のみ)。
-_URL_IN_QUERY_RE = re.compile(r"(https?://[^\s\]）」』\u0080-\U0010ffff]+)")
-
-
-#: 搭載メモリ量を尋ねるクエリ。専用ツール ``system_hardware_info`` へ振る。
-#:
-#: 2026-07-27 に ``メモリ`` / ``RAM`` を spec コマンド (``_build_spec_command``)
-#: から外した経緯があるが、それは「コマンドが搭載メモリ量を一切出力しないのに
-#: パターンだけ一致して 1 ターンを浪費する」ためだった。allow-list
-#: (``_READONLY_SAFE_MODULES``) はチャットから渡される **コマンド文字列** にしか
-#: 掛からず、backend 自身の Python は制約外なので、シェルを経由しない
-#: ``free/core/system_info`` で測れる (``free/core/vram_monitor`` が nvidia-smi を
-#: 直接叩いているのと同じ立て付け)。allow-list は広げていない。
-#:
-#: ``メモリ`` 単独は EvorefMem の話 (「メモリに保存して」「記憶メモリ」) と
-#: 衝突するため、容量を問う語との共起を要求する。
-#: 英語は量を問う語が名詞の **前** に来る ("how much memory") ため別枝で受ける。
-#:
-#: 「空き」「使用率」などの **状態を問う語** も同じツールで答えられる
-#: (``format_hardware_facts`` は available RAM と CPU usage を出す)。これらが
-#: 抜けていたため、状態クエリは spec コマンド (搭載 RAM も CPU 使用率も
-#: 出力しない) へ落ちていた。実インシデント (2026-08-14 ライブ監査 ターン6):
-#: 「この PC の空きメモリと CPU 使用率を教えてください。」に対し
-#: ``run_command_readonly`` が OS/CPU/Cores/Disk だけを返し、
-#: 「取得した情報に含まれていないためお答えできません」と回答した。
-_HARDWARE_MEMORY_QUERY_RE = re.compile(
-    r"(?:(?:搭載|物理|実装|空き|使用|利用可能|残り|フリー)?メモリ"
-    r"|(?<![A-Za-z])RAM(?![A-Za-z])"
-    r"|(?<![A-Za-z])memory(?![A-Za-z]))"
-    r"[^。．\n]{0,12}"
-    r"(?:容量|サイズ|何\s*(?:GB|ギガ|MB)|いくつ|どれ(?:く|ぐ)らい|積んで|載って"
-    r"|使用[率量]|空き|残[りって]|使って"
-    r"|(?<![A-Za-z])(?:size|usage|used|free|available)(?![A-Za-z]))"
-    r"|(?:空き|残り|利用可能な|フリー)(?:メモリ|RAM)"
-    r"|CPU\s*(?:の)?\s*(?:使用[率量]|利用[率量]|負荷)"
-    r"|(?<![A-Za-z])cpu\s+(?:usage|load|utilization)(?![A-Za-z])"
-    r"|(?<![A-Za-z])(?:how\s+much|total|physical|installed|available|free)\s+"
-    r"(?:ram|memory)(?![A-Za-z])",
-    re.IGNORECASE,
-)
-
-
-
-def _build_spec_command(query: str) -> str:
-    """システムスペックコマンドを生成する
-
-    クエリにドライブレター指定（「Eドライブ」「C:」等）が含まれる場合は、
-    そのドライブの容量を取得する。指定がなければシステムドライブ
-    (Windows は %SystemDrive%、Unix は '/')。
-    Windows / Unix の両方で動作するよう、パスはフォワードスラッシュで構築する
-    （shutil.disk_usage は Windows でも 'E:/' を受理する）。
-
-    フォールバックはかつてカレントディレクトリ ('.') だったが、これは backend
-    プロセスの起動位置という**ユーザーから見えない値**に測定対象が依存する。
-    実測 (2026-07-27 ライブ監査): 「C ドライブの空き容量は?」→ C: の 138 GB を
-    回答した直後、「さっき調べた空き容量はディスク全体の何%?」でドライブ名が
-    落ちて '.' にフォールバックし、cwd のある E: (553 GB free) を測って
-    「さっき調べた空き容量 553 GB」と自己矛盾した回答を返した。
-    「この PC の空き容量」はシステムドライブを指すのが自然で、かつ起動位置に
-    依存せず決定論的になる。
-    """
-    m = _DRIVE_LETTER_RE.search(query)
-    if m:
-        letter = m.group(1).upper()
-        py_path = f"'{letter}:/'"
-    else:
-        # サブプロセス側で評価する (実行ホストのシステムドライブを見る)。
-        # os は既に import 済みで、os.environ / .get とも readonly guard の
-        # 禁止属性ではない。
-        py_path = "(os.environ.get('SystemDrive','C:')+'/' if os.name=='nt' else '/')"
-    return (
-        "python -c \""
-        "import platform,os,shutil;"
-        " print('OS:',platform.platform());"
-        " print('CPU:',platform.processor() or platform.machine());"
-        " print('Cores:',os.cpu_count());"
-        f" t,u,f=shutil.disk_usage({py_path});"
-        " print('Disk:',t//(1024**3),'GB total,',f//(1024**3),'GB free')"
-        "\""
-    )
-
-
-# 現在時刻 / 日付クエリ。executable 判定の中で最も曖昧さが小さく、aux が
-# 否定票を返しても regex 結果を維持してよい唯一の高特異度パターン
-# (``_upgrade_command_via_aux`` の降格例外)。
-# 定義は core.intent_vocab が SSOT (agent.router が同一定義を持っていたが、
-# ``(?!間)`` ガードの有無など細部が食い違っていた)。
-_DATETIME_QUERY_RE = DATETIME_QUERY_RE
-
-#: 「N 日後 / N 年前」等の相対日付。単位の直後に 前/後 を要求するので
-#: 「1 月 3 日」のような絶対日付には掛からない。
-_RELATIVE_OFFSET_RE = re.compile(
-    r"(\d{1,4})\s*(週間|週|[かヶケヵ箇]月|月|日|年)\s*(前|後|先)",
-)
-
-#: コマンドが日付演算をしている印。``_build_datetime_command`` が相対日付用に
-#: 生成するコマンドは必ずどちらかを含む。リコールで引き当てた過去のコマンドが
-#: 相対日付クエリに答えられるかの判定に使う (``recalled_command_fits_query``)。
-_DATE_ARITHMETIC_RE = re.compile(r"timedelta|datetime\.datetime\(|datetime\.date\(")
-
-#: 相対日付の単位 → コマンド生成の種別。
-_OFFSET_UNITS = {
-    "日": "days", "週": "weeks", "週間": "weeks",
-    "月": "months", "か月": "months", "ヶ月": "months",
-    "ケ月": "months", "ヵ月": "months", "箇月": "months",
-    "年": "years",
-}
-
-#: 現在日時のみを返す既定コマンド。
-#:
-#: ``astimezone()`` を付けて **UTC オフセット付き**で出力する。プロンプトには
-#: 別途 ``[現在日時 (UTC基準)]`` が注入されており、コマンド出力が naive
-#: ローカル時刻だと 2 つの時計が無印で並ぶ。JST では 00:00-09:00 の間、
-#: ローカル日付と UTC 日付が 1 日ずれるため、モデルはどちらを「今日」と
-#: 呼ぶべきか判断できない (2026-08-05 ライブ監査で構造として確認)。
-_DATETIME_NOW_COMMAND = (
-    'python -c "import datetime; print(datetime.datetime.now().astimezone())"'
-)
-
-#: 相対日付コマンドの共通前置き (now と目標日を両方出す)。
-_REL_PREFIX = 'python -c "import datetime; n=datetime.datetime.now().astimezone();'
-_REL_SUFFIX = (
-    " print('now:',n);"
-    " print('target:',t.strftime('%Y-%m-%d (%A)'))\""
-)
-
-
-def _build_datetime_command(query: str) -> str:
-    """日付 / 時刻クエリ用のコマンドを組み立てる。
-
-    相対表現 (「3 年前の今日」「今日から 100 日後」) が含まれる場合は **目標日と
-    その曜日まで Python に計算させる**。現在時刻だけを渡してモデルに暗算させると
-    外す (実インシデント 2026-08-07 ライブ監査: 「3 年前の今日は何曜日でしたか？」
-    に「火曜日」と回答。2023-08-07 は月曜日)。同じ日に「今日から 100 日後」は
-    正答しており、暗算が当たるかどうかは運になっていた。
-
-    相対表現が無ければ従来どおり現在日時のみを返す。
-    """
-    m = _RELATIVE_OFFSET_RE.search(query or "")
-    if m is None:
-        return _DATETIME_NOW_COMMAND
-    kind = _OFFSET_UNITS.get(m.group(2))
-    if kind is None:
-        return _DATETIME_NOW_COMMAND
-    n = int(m.group(1))
-    signed = -n if m.group(3) == "前" else n
-
-    if kind in ("days", "weeks"):
-        body = f" t=n+datetime.timedelta({kind}={signed});"
-    else:
-        # 月/年は timedelta で表せない。月末クランプ (1/31 の 1 か月後 = 2/28 等)
-        # を含めて構築する。``calendar`` は readonly guard の許可モジュール外、
-        # ``datetime.replace`` は禁止属性なのでコンストラクタで組み立てる。
-        total = " tm=(n.year*12+n.month-1)+" + str(
-            signed * 12 if kind == "years" else signed,
-        ) + ";"
-        body = (
-            total
-            + " y=tm//12; mo=tm%12+1;"
-            " lp=(y%4==0 and (y%100!=0 or y%400==0));"
-            " dim=[31,29 if lp else 28,31,30,31,30,31,31,30,31,30,31][mo-1];"
-            " t=datetime.datetime(y,mo,min(n.day,dim));"
-        )
-    return _REL_PREFIX + body + _REL_SUFFIX
-
-# Python 実行で正確に答えられるシステム情報クエリのコマンドマッピング
-# パターンにマッチしたクエリに対して、具体的な Python コマンドを生成する。
-# コマンドは Windows cmd.exe / Unix sh の両方で動作するよう、
-# 外側を "..." で囲み内側で '...' を使用する。
-# 第二要素が Callable の場合はクエリ文字列を渡して動的に生成する
-_EXECUTABLE_QUERY_COMMANDS: list[tuple[re.Pattern, "str | Callable[[str], str]"]] = [
-    # 現在時刻 / 日付 (「何月|何日|何曜日」は明確な疑問語のみ追加、
-    # 「今日|明日|昨日」単独は誤検出するため見送り)
-    # ``astimezone()`` を付けて **UTC オフセット付き**で出力する。プロンプトには
-    # 別途 ``[現在日時 (UTC基準)]`` が注入されており、コマンド出力が naive
-    # ローカル時刻だと 2 つの時計が無印で並ぶ。JST では 00:00-09:00 の間、
-    # ローカル日付と UTC 日付が 1 日ずれるため、モデルはどちらを「今日」と
-    # 呼ぶべきか判断できない (2026-08-05 ライブ監査で構造として確認。当日は
-    # 22:43 JST = 13:43 UTC で偶然一致しており表面化しなかった)。
-    # オフセットを添えれば両者の関係が出力から読み取れる。
-    (_DATETIME_QUERY_RE, _build_datetime_command),
-    # システムスペック（OS / CPU / コア数 / ディスク）
-    # ドライブレター指定があれば指定ドライブの容量を返す
-    # CPU 等の英字略語は ASCII 境界必須 ("program" の 'ram' 誤マッチ対策)
-    # spec(s)? で複数形 ("PC specs") も許容する。
-    # メモリ / memory / RAM は 2026-07-27 に外した。GPU/VRAM (下記) と同じ理由で、
-    # コマンドが搭載メモリ量を一切出力しないのにパターンだけ一致して発火し、
-    # サブプロセスと 1 ターンを消費した末に「ツール結果にメモリ容量の数値は
-    # 記載されていません」としか返せなかった (実測: 「この PC のメモリは何 GB
-    # 積んでいますか？」)。Windows で搭載 RAM を取る手段 (ctypes / wmic /
-    # Get-CimInstance) は _READONLY_SAFE_MODULES / 危険コマンド判定が全て拒否
-    # するため、正しい情報を返すコマンドへ差し替える経路は存在しない。
-    # ``capacity`` は 2026-08-09 に外した。他の語と違い **データ項目名として
-    # 普通に現れる** ため、機械スペックの要求とは限らない (2 回目のライブ監査:
-    # 「同じ表を JSON 配列にしてください。キーは category, fee, capacity で…」
-    # という純粋な整形依頼で OS/CPU/コア数の取得コマンドが撃たれた。
-    # `capacity` を別名に変えると発火しない = この語が唯一の引き金だった)。
-    # ``容量`` 単独も 2026-08-10 に外した (同じ理由。「DBの容量」「総容量」
-    # 「容量効率」で spec コマンドが撃たれた)。機器を名指しする質問は
-    # ストレージ / ディスク / ドライブ / disk / drive 側で拾えるので
-    # 取りこぼしは実質無い。「空き容量」「残り容量」「使用容量」は残す。
-    # ``disk`` / ``storage`` は他の ASCII トークンと同じく境界必須へ揃える
-    # (このファイルの規約。境界無しだと部分一致で誤爆する)。
-    (re.compile(
-        r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])"
-        r"|ディスク|(?:空き|残り|使用)容量|ストレージ|ドライブ"
-        r"|(?<![A-Za-z])disk(?![A-Za-z])|(?<![A-Za-z])storage(?![A-Za-z])"
-        r"|(?<![A-Za-z])specs?(?![A-Za-z])"
-        r"|(?<![A-Za-z])drive(?![A-Za-z]))",
-        re.IGNORECASE,
-    ), _build_spec_command),
-    # GPU / VRAM のエントリは 2026-07-25 に削除した。
-    # コマンドが platform.platform() / platform.machine() しか実行しておらず
-    # GPU 型番も VRAM 容量も一切返さないのに、実行が成功扱いになっていた
-    # (実測: 「さっき伝えた GPU は？」→ "Platform: Windows-11 / Machine: AMD64" →
-    #  「ツール結果に GPU 型番は含まれていません」と誤答)。
-    # safety_patterns._READONLY_SAFE_MODULES が wmic / Get-CimInstance /
-    # nvidia-smi / 外部ライブラリをすべて拒否するため、正しい情報を返すコマンドへ
-    # 差し替える経路は存在しない。エントリを消すと _infer_tool が引数なしを返し
-    # _suppress_commandless_run_command が no_tool へ落とすので、GPU/VRAM は
-    # 会話履歴と LLM 知識に委ねる (そちらの方が誤答が少ない)。
-    # IP アドレス / ホスト名
-    (re.compile(
-        r"(?:IP\s*アドレス|ホスト名"
-        r"|(?<![A-Za-z])hostname(?![A-Za-z])"
-        r"|(?<![A-Za-z])ip\s*address)",
-        re.IGNORECASE,
-    ), "python -c \""
-       "import socket;"
-       " h=socket.gethostname();"
-       " print('Hostname:',h);"
-       " print('IP:',socket.gethostbyname(h))"
-       "\""),
-    # OS
-    (re.compile(
-        r"(?:(?<![A-Za-z])OS(?![A-Za-z])|オペレーティングシステム"
-        r"|(?<![A-Za-z])Windows(?![A-Za-z])"
-        r"|(?<![A-Za-z])Linux(?![A-Za-z])"
-        r"|(?<![A-Za-z])Mac(?![A-Za-z]))",
-        re.IGNORECASE,
-    ), "python -c \""
-       "import platform,sys;"
-       " print(platform.platform());"
-       " print(sys.platform,platform.release())"
-       "\""),
-    # Python バージョン
-    (re.compile(
-        r"(?:Python|python)\s*(?:バージョン|version)",
-        re.IGNORECASE,
-    ), "python --version"),
-    # 環境変数
-    (re.compile(
-        r"(?:環境変数|(?<![A-Za-z])env(?![A-Za-z])"
-        r"|(?<![A-Za-z])PATH(?![A-Za-z]))",
-        re.IGNORECASE,
-    ), "python -c \""
-       "import os;"
-       " [print(k,'=',v[:80]) for k,v in sorted(os.environ.items())[:30]]"
-       "\""),
-]
-
-
-
-
-
-
-
-#: 数値計算クエリの事前フィルタ。式が書かれていれば層1 (_extract_arithmetic_expression)
-#: が決定論的に処理するため、ここは「数値は複数あるが式は書かれていない」ものだけを
-#: 対象にする。aux 往復 (realtime) を増やさないよう条件は厳しめにする。
-#: 実体は ``core.intent_vocab`` が SSOT (``agent.router`` も同じ判定を使う)。
-#: 既存の呼出元とテストのために旧名を残す。
-_NUMBER_LITERAL_RE = NUMBER_LITERAL_RE
-
-
-#: 単位系の定義そのものに由来する定数。ユーザーが書いた数値ではないが、
-#: 「モデルが知識から思い出した換算率」でもない (分/時、時/日、SI 接頭辞、
-#: パーセント)。定義上一意なので誤記憶しようがなく、捏造検出の対象外にする。
-#: マイル→キロ (1.609) のような **知識** の換算率はここに入れない
-#: (実インシデント 2026-07-29 ライブ監査: 「時速72kmで45分間に進む距離は
-#: 何kmですか？」で 45/60 の 60 がグラウンディングに落ち、base の暗算で
-#: 90km と誤答した。正解 54km)。
-#:
-#: 2 進接頭辞 (1024 の冪) も SI 接頭辞と同じ **定義** であり、記憶違いの余地が
-#: ない。バイト→KiB/MiB/GiB の換算で式に必ず現れるため、外すとサイズ計算が
-#: 丸ごと no_tool へ落ちる (実インシデント 2026-08-09 ライブ監査: 直前ターンの
-#: 1,277,500 行 × 240 バイトに対しネイティブ層が
-#: ``(1277500 * 240) / (1024 * 1024)`` を正しく合成したのに、``1024`` が
-#: グラウンディングに落ちて棄却され、base の暗算で「約288MB」と誤答した。
-#: 正解は 306,600,000 バイト = 292.4 MiB)。
-#: 暦の周期 (週/年、うるう年の日数、秒/日) も 365 や 1440 と同じ**暦の定義**で、
-#: 知識として思い出す換算率ではない。52 が無いために「週に3冊なら年間何冊か」で
-#: ネイティブ層が正しく合成した ``3 * 52`` が ungrounded で棄却され、base の
-#: 暗算に落ちていた (実インシデント 2026-08-10 ライブ監査)。
-_UNIT_SYSTEM_CONSTANTS = frozenset({
-    "7", "10", "12", "24", "52", "60", "100", "365", "366",
-    "1000", "1440", "3600", "86400",
-    "0.1", "0.01", "0.001",
-    # SI 接頭辞 (10 の冪) — 1000 は上にある
-    "1000000", "1000000000", "1000000000000",
-    # 2 進接頭辞 (2 の冪): KiB / MiB / GiB / TiB
-    "1024", "1048576", "1073741824", "1099511627776",
-})
-
-
-def _synthesized_expression_grounded(
-    expression: str, query: str, context: str = "",
-) -> bool:
-    """合成式の数値がすべてクエリ / 直近の会話に現れるか (純粋関数)。
-
-    aux が知識から定数を補う (例: クエリにも会話にも無い換算率を持ち出す) と、
-    ツールは「正しく計算された嘘」を返してしまう。式に現れる数値リテラルが
-    クエリまたは ``context`` 中に文字列として存在することを要求し、捏造を
-    決定論的に弾く。``context`` を許すのは、会話で一度提示された数値は
-    「対話に書かれた事実」であってモデルの想像ではないため。
-    """
-    numbers = _NUMBER_LITERAL_RE.findall(expression)
-    if not numbers:
-        return False
-    return not _ungrounded_numbers(expression, query, context)
-
-
-def _ungrounded_numbers(
-    expression: str, query: str, context: str = "",
-) -> tuple[str, ...]:
-    """式のうち対話から辿れない数値リテラルを、出現順に重複なく返す (純粋関数)。
-
-    ``_synthesized_expression_grounded`` の真偽ではなく **どの値が説明できないか**
-    を返す。式を捨てずに実行する経路 (補助タスク非常駐) で、その値を回答に開示
-    させるために使う。
-    """
-    known = _known_numbers(query) | _known_numbers(context)
-    known.update(_UNIT_SYSTEM_CONSTANTS)
-    seen: list[str] = []
-    for n in _NUMBER_LITERAL_RE.findall(expression):
-        if n not in known and n not in seen:
-            seen.append(n)
-    return tuple(seen)
-
-
-#: 桁区切り入りの数字 (``2,660`` / ``1,234,567``)。アシスタント自身が金額を
-#: この書式で提示するため、次のターンでその数値を使う式が「対話に無い数値」と
-#: 誤判定されていた (実インシデント 2026-08-03 ライブ監査: 直前の回答
-#: 「2,660円です」を受けた ``2926 + 500`` が ungrounded で no_tool に落ち、
-#: 決定論の calculate 経路を失って base の暗算に回っていた)。
-_GROUPED_NUMBER_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?")
-
-#: 明示されたパーセント (``10%`` / ``10 パーセント``)。
-_PERCENT_LITERAL_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:%|％|パーセント)")
-
-#: 時間の長さ表現 (``2時間30分`` / ``2時間半`` / ``90分`` / ``3時間``)。
-#: 「2時間30分」から 2.5 (時間) と 150 (分) は **表記から決定論で導ける**値で、
-#: モデルが知識から持ち出した定数ではない。桁区切り・パーセントと同じ扱い。
-_DURATION_HM_RE = re.compile(r"(\d+(?:\.\d+)?)\s*時間\s*(\d+(?:\.\d+)?)\s*分")
-_DURATION_H_HALF_RE = re.compile(r"(\d+(?:\.\d+)?)\s*時間半")
-_DURATION_H_RE = re.compile(r"(\d+(?:\.\d+)?)\s*時間")
-_DURATION_M_RE = re.compile(r"(\d+(?:\.\d+)?)\s*分(?!の)")
-#: 「5分30秒」型 (分 + 秒)。``時間 + 分`` と同じ構造なのに欠けていた。
-#: ペース (「キロ5分30秒」) や所要時間で普通に使う表記で、式に現れるのは
-#: ``5.5`` (分) や ``330`` (秒) であってクエリに書かれた ``5`` と ``30`` ではない。
-_DURATION_MS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*分\s*(\d+(?:\.\d+)?)\s*秒")
-
-#: 時間の刻み幅 (``30分刻み`` / ``15分単位`` / ``10分ごと`` / ``30分間隔``)。
-#: 式に現れるのは「1時間あたりの区画数」(30分刻み → 2) で、クエリには 30 しか
-#: 書かれていない。時間+分・分+秒と同じく **表記から一意に導ける**値。
-#: 実インシデント 2026-08-10 ライブ監査: 「9時から18時まで30分刻み、8部屋、
-#: 5営業日」でネイティブ層が正しく ``8 * 5 * (18 - 9) * 2`` (= 720) を合成したのに
-#: ``2`` が ungrounded 判定になり no_tool へ落ち、base の暗算で 1,680 / 1,440 と
-#: 誤答した (しかも見出しと計算式が食い違った)。
-_INTERVAL_M_RE = re.compile(r"(\d+(?:\.\d+)?)\s*分\s*(?:刻み|単位|ごと|間隔)")
-
-#: 曜日のレンジ (``月〜金`` / ``月曜から金曜まで``)。日数はレンジから一意に決まる
-#: (月〜金 → 5) が、クエリに数字としては現れない。上の刻み幅と同じ回で必要に
-#: なった (2026-08-10 ライブ監査の総スロット数は ``8 * 5 * (18 - 9) * 2`` で、
-#: ``5`` も ``2`` も書かれていなかった)。
-_WEEKDAY_ORDER = "月火水木金土日"
-_WEEKDAY_RANGE_RE = re.compile(
-    r"([月火水木金土日])\s*(?:曜日?)?\s*(?:〜|～|-|–|から)\s*([月火水木金土日])\s*(?:曜日?)?",
-)
-
-
-def _known_numbers(text: str) -> set[str]:
-    """``text`` に「書かれている」とみなせる数値リテラルを集める (純粋関数)。
-
-    素の数字に加えて 2 種類を同一視する。どちらも **対話に現れた表記から決定論で
-    導ける**もので、モデルが知識から持ち出した定数ではない:
-
-    - 桁区切り: ``2,660`` → ``2660``。数える側 (式) は区切りを打たないため、
-      正規化しないと自分が直前に提示した金額を「知らない数値」と判定してしまう
-    - パーセント: ``10%`` → ``0.1`` / ``1.1`` / ``1.10``。税率・割引率の計算で
-      式に現れる倍率は、クエリ中の百分率から一意に決まる
-    """
-    known = set(_NUMBER_LITERAL_RE.findall(text))
-    for grouped in _GROUPED_NUMBER_RE.findall(text):
-        known.add(grouped.replace(",", ""))
-    for pct in _PERCENT_LITERAL_RE.findall(text):
-        try:
-            rate = float(pct) / 100.0
-        except ValueError:
-            continue
-        # 「10%」からは 0.1 (率) と 1.1 (加算後の倍率) が導ける。式側の表記ゆれ
-        # (1.1 / 1.10) を吸収するため両方を登録する。
-        for value in (rate, 1.0 + rate):
-            known.add(f"{value:g}")
-            known.add(f"{value:.2f}")
-    known.update(_duration_derived_numbers(text))
-    return known
-
-
-def _duration_derived_numbers(text: str) -> set[str]:
-    """時間の長さ表現から導ける数値を集める (純粋関数)。
-
-    「2時間30分で何km進むか」型の文章題では、式に現れるのは ``2.5`` (時間) や
-    ``150`` (分) であって、クエリに書かれた ``2`` と ``30`` ではない。桁区切り・
-    パーセントと同じく **表記から一意に導ける**値なので、捏造ではない。
-
-    実インシデント (2026-08-08 ライブ監査): 「時速240kmで2時間30分走ると何km
-    進みますか。」でネイティブ層が正しく ``240 * 2.5`` を選んだのに、``2.5`` が
-    クエリに無いという理由で ungrounded 判定になり no_tool へ落ちた。
-
-    「分 + 秒」も同じ構造なのに欠けていた (2026-08-09 2 回目のライブ監査):
-    「フルマラソンの距離を キロ5分30秒 のペースで走ると何時間何分？」で
-    ネイティブ層が正しく ``42.195 * 5.5`` を選んだのに、``5.5`` が
-    (5 と 30 しか書かれていないため) ungrounded 判定になり no_tool へ落ち、
-    base の暗算で「3時間47分15秒」と誤答した (正 3時間52分4秒)。
-    補助タスク非常駐でも救済経路自体は生きており、塞いでいたのはこのゲートだった。
-    """
-    derived: set[str] = set()
-
-    def add(value: float) -> None:
-        derived.add(f"{value:g}")
-        derived.add(f"{value:.2f}")
-
-    for hours, minutes in _DURATION_HM_RE.findall(text):
-        total_h = float(hours) + float(minutes) / 60.0
-        add(total_h)
-        add(float(hours) * 60.0 + float(minutes))
-    for minutes, seconds in _DURATION_MS_RE.findall(text):
-        # 分単位 (5分30秒 → 5.5) と秒単位 (→ 330)。時間+分と同じ 2 通り。
-        add(float(minutes) + float(seconds) / 60.0)
-        add(float(minutes) * 60.0 + float(seconds))
-    for hours in _DURATION_H_HALF_RE.findall(text):
-        add(float(hours) + 0.5)
-        add((float(hours) + 0.5) * 60.0)
-    for hours in _DURATION_H_RE.findall(text):
-        add(float(hours) * 60.0)
-    for minutes in _DURATION_M_RE.findall(text):
-        add(float(minutes) / 60.0)
-    for minutes in _INTERVAL_M_RE.findall(text):
-        step = float(minutes)
-        if step > 0:
-            # 1 時間あたりの区画数 (30分刻み → 2) と、区画の時間 (→ 0.5)。
-            add(60.0 / step)
-            add(step / 60.0)
-    for start, end in _WEEKDAY_RANGE_RE.findall(text):
-        # 両端を含む日数 (月〜金 → 5)。週をまたぐ指定 (金〜月) も剰余で数える。
-        span = (_WEEKDAY_ORDER.index(end) - _WEEKDAY_ORDER.index(start)) % 7 + 1
-        add(float(span))
-    return derived
-
-
-#: 層5.2 の数値グラウンディングに使う直近ターン数。長く取るほど無関係な数値を
-#: 拾いやすくなるため短く保つ。
-_CALCULATE_CONTEXT_TURNS = 4
-
-
-
-# 明示的な実行動詞。バッククォートのコマンドと共起したとき「実測要求」とみなす。
-_EXPLICIT_EXEC_VERB_RE = re.compile(
-    r"(?:実行|叩いて|走らせ"
-    r"|(?<![A-Za-z])run(?![A-Za-z])"
-    r"|(?<![A-Za-z])exec(?:ute[sd]?|uting)?(?![A-Za-z]))",
-    re.IGNORECASE,
-)
-
-# 削除を求める依頼。**どのモードにも削除ツールは存在しない** (ToolsRegistry に
-# delete_file / remove_file は登録されておらず、run_command_readonly の allow-list は
-# remove / unlink / rmdir / rmtree をすべて拒否する)。撃てるツールが無いまま
-# no_tool で base に丸投げすると、実行していない削除の完了を報告する。
-#
-# 実インシデント (2026-08-12 ライブ監査 ターン29-30): 「さっき作った
-# audit_test.txt を削除してください。」に対しツールを 1 つも実行しないまま
-# 「E:\tmp\audit_test.txt を削除しました。」と回答し、続く「本当に削除できました
-# か？ファイルが存在するか確認して。」にも確認せず「存在しません。削除は完了して
-# います。」と断定した。実ファイルは両ターンとも残っていた。
-_DELETE_INTENT_RE = re.compile(
-    r"(?:削除|消去|除去|抹消|(?:を|も)?消して|消しといて|捨てて|破棄)"
-    r"|(?<![A-Za-z])(?:delete|remove|erase|unlink)(?![A-Za-z])"
-    r"|(?<![A-Za-z])rm\s+-?[A-Za-z]*\s*[\w./\\]",
-    re.IGNORECASE,
-)
-
-#: 削除対象がファイル / ディレクトリであることの手掛かり。会話履歴やメモリの
-#: 削除依頼 (「さっきの記憶を消して」) を巻き込まないための AND 条件。
-_DELETE_FS_TARGET_RE = re.compile(
-    r"(?:ファイル|フォルダ|ディレクトリ|ドライブ)"
-    r"|(?<![A-Za-z])(?:file|folder|directory)(?![A-Za-z])"
-    r"|[\w-]+\.(?:txt|md|csv|json|yaml|yml|log|py|js|ts|html|xlsx|docx|pptx|pdf)"
-    r"|[A-Za-z]:[\\/]",
-    re.IGNORECASE,
-)
-
-# パス引数を取る「読み取り系」ツール。存在しないパスを渡しても失敗するだけで
-# 副作用が無い代わりに、捏造パスを実行する価値もまったく無い。
-_READ_PATH_TOOLS: frozenset[str] = frozenset({
-    "read_file", "list_directory", "verify_syntax",
-})
-
-
-def _normalize_path_text(text: str) -> str:
-    """パス照合用にセパレータと大小文字を正規化する (純粋関数)。"""
-    return text.replace("\\", "/").casefold()
-
-
-def _dialogue_text(
-    conversation: list[dict] | None, turns: int | None = None,
-) -> str:
-    """会話本文を連結して返す (純粋関数)。
-
-    「対話に現れた数値」を数えるために使う。role は問わない (換算率は
-    アシスタント発話側に出る)。``turns`` を渡すと末尾その数のターンに絞る。
-    """
-    if not conversation:
-        return ""
-    window = conversation[-turns:] if turns else conversation
-    parts = [
-        str(turn.get("content") or "")
-        for turn in window
-        if isinstance(turn, dict)
-    ]
-    return "\n".join(p for p in parts if p)
-
-
-def _recent_dialogue_text(conversation: list[dict] | None) -> str:
-    """直近 ``_CALCULATE_CONTEXT_TURNS`` ターンの本文を連結して返す (純粋関数)。
-
-    層5.2 の事前フィルタと合成式のグラウンディング検証で使う。式を合成する
-    層なので、捏造の余地を絞るために窓は狭く保つ。
-    """
-    return _dialogue_text(conversation, _CALCULATE_CONTEXT_TURNS)
-
-
-def _recent_dialogue_messages(
-    conversation: list[dict] | None,
-    turns: int = _CALCULATE_CONTEXT_TURNS,
-) -> list[dict]:
-    """直近 ``turns`` 件を messages 配列として返す (純粋関数)。
-
-    ネイティブ tool calling へ渡す最小の文脈。「そのファイルを読んで」のような
-    照応をモデルが解けるように直近だけ載せ、prefill を膨らませない
-    (1 メッセージ ``_JUDGE_CONTEXT_CHARS`` 文字で切り詰め)。
-    """
-    if not conversation:
-        return []
-    messages: list[dict] = []
-    for turn in conversation[-turns:]:
-        role = turn.get("role")
-        content = turn.get("content")
-        if role not in ("user", "assistant") or not isinstance(content, str):
-            continue
-        messages.append({"role": role, "content": content[:_JUDGE_CONTEXT_CHARS]})
-    return messages
-
-
-# 知識質問パターン — ツール判定をスキップすべきクエリ
-# 「簡単に説明してください」「〜の使い分けは？」は疑問形の末尾 (教えて/ですか等)
-# を伴わない体言止め・依頼形のため、上のパターンにマッチせず層4 (aux
-# tool_judgment) まで素通りしていた。実インシデント (2026-07-20):
-# 「カーディネーリティという言葉を初めて知りました。簡単に説明してください。」
-# で無関係な過去セッションが誤ヒット (score=0.5)、「インターフェースと抽象
-# クラスの使い分けは？」で search_history が "No results found" を返す —
-# どちらも履歴参照の意図が皆無な純粋な知識質問で、小型 aux モデルが
-# tool_needed=True と誤判定した。
-_KNOWLEDGE_PATTERNS = [
-    re.compile(r"(?:教えて|おしえて|とは|って何|ですか|でしょうか|ありますか)", re.IGNORECASE),
-    re.compile(r"(?:について|に関して|に関する)", re.IGNORECASE),
-    re.compile(r"(?:知りたい|確認したい|調べたい)", re.IGNORECASE),
-    re.compile(r"(?:説明して|使い分け)", re.IGNORECASE),
-    re.compile(r"(?:what is|tell me|explain|describe)\b", re.IGNORECASE),
-]
-
-# _KNOWLEDGE_PATTERNS の英語版。「about」は汎用前置詞のため直訳せず、
-# 限定的な表現で構成する (誤爆抑制)。
-_KNOWLEDGE_PATTERNS_EN = [
-    re.compile(r"\bwhat(?:'s|\s+is|\s+are)\b", re.IGNORECASE),
-    re.compile(r"\b(?:tell\s+me|explain|describe|walk\s+me\s+through)\b", re.IGNORECASE),
-    re.compile(r"\b(?:i\s+want\s+to\s+know|curious\s+about|wondering\s+about)\b", re.IGNORECASE),
-    re.compile(r"\bdifference\s+between\b|\bwhen\s+(?:should|do)\s+i\s+use\b", re.IGNORECASE),
-]
-
-# アシスタント自身の意見・嗜好・感想を尋ねる質問パターン — 「好きな〜は
-# ありますか」「好きな〜とかあったりしますか」等。search_history は
-# ユーザー自身の過去発言を検索するツールであり、アシスタント自身の意見を
-# 尋ねる質問には無関係だが、明確なツールシグナルが無いため層4 (aux
-# tool_judgment) まで素通りし、小型 aux モデルが誤って search_history を
-# 選ぶ実インシデントが多発した (2026-07-17/18 の2日分ログで
-# tool_call_decision=aux の 48% が該当)。「あったりしますか」等の口語的な
-# 疑問文末尾も拾う (上の _KNOWLEDGE_PATTERNS の「ありますか」は完全一致部分
-# 文字列のみを拾うため「あったりします(か)」を取りこぼす)。
-# あえて _KNOWLEDGE_PATTERNS 側に「あったり」単体を追加しない: _KNOWLEDGE_PATTERNS
-# は _judge_with_rules (層1) でも無条件に (一人称マーカーを考慮せず) 参照される
-# ため、汎用パターンとして追加すると「私は好きな〜あったりしますか」のような
-# 一人称クエリまで層1で誤って即 no_tool になり、下記の一人称除外が層4に届く
-# 前に握り潰されてしまう (レビューで判明)。
-# ただし「私の/私は/僕の/僕は/自分の/自分は」等の一人称マーカーを含む場合は
-# ユーザー自身の過去発言 (例:「私の好きなプログラミング言語は？」) を指す
-# 可能性があるため除外せず、層4 (aux) 判定に委ねる (実際に "Rust" 等の
-# 固有名詞を正しく抽出できた実績がある)。
-_ASSISTANT_PREFERENCE_PATTERNS = [
-    re.compile(
-        r"(?:好きな|嫌いな|得意な|苦手な|おすすめの).{0,20}?"
-        r"(?:ますか|ありますか|でしょうか|ですか"
-        # 「あったり」は文中でも出現しやすい語のため (例:「あったりして
-        # 困った」)、疑問文末尾の用法に限定して文末アンカーを課す。
-        r"|あったり(?:します)?(?:か)?[？?]?\s*$)",
-    ),
-]
-_FIRST_PERSON_REFERENCE_RE = re.compile(
-    r"私の|私が|私は|僕の|僕が|僕は|俺の|俺が|俺は"
-    r"|自分の|自分が|自分は|わたしの|わたしが|わたしは",
-)
-
-
-# セッション自己参照パターン — 「この会話で」等、現在のセッション自体を参照
-# する発話。会話履歴は working memory の予算を超えると古いターンからコンテキ
-# ストに含まれなくなるため、層4 (tool_judgment) を無条件スキップすると
-# 「会話の最初に〜」のような長距離 recall が失敗する (2026-07-19 実インシデ
-# ント: 20+ ターンの会話で最初の発話内容を正しく想起できなかった)。
-# そのため層4 のスキップ判定には使わず、``ToolCallJudge._maybe_scope_session_
-# search`` が search_history 選択後に ``tool_args["session_id"]`` を強制注入し、
-# 現在セッションのみへスコープ限定する形で対応する。
-# 実インシデント (2026-07-17/18): 「この会話で一番面白かったやり取りは？」が
-# スコープ限定前の search_history に振られ、無関係な過去セッション (別日の
-# 雑談) の内容を誤って参照・混同した。session_id スコープ限定によりこの事故
-# 再発を防ぎつつ、同一セッション内の recall は許可する。
-#
-# 「この会話」等の言及だけで無条件マッチにすると、「この会話の続きですが、
-# 量子もつれについて詳しく教えて」のように自己参照を前置きにしつつ外部知識を
-# 要する質問まで誤ってスキップしてしまうため、会話自体を振り返る反省的な語
-# (面白い/振り返る/まとめ/感想等) との近接共起を要求する。
-# 近接窓は「同一文内 (句点・疑問符・感嘆符を跨がない) の 40 文字以内」。
-# 旧実装の任意文字 {0,20} は「この会話で一番最初に私が計算させた問題は
-# 何だったか覚えてますか？」(間 21 文字) を 1 文字超過で取りこぼし、
-# session_id 非注入 → 全セッション横断検索で前回会話の類似ターンがヒット
-# する near-miss を起こした (2026-07-20 ライブ再検証で確認)。一方、窓を
-# 任意文字のまま {0,50} へ広げるだけでは「この会話とは別に、相対性理論に
-# ついて詳しく教えてください。とても面白いですよね？」のような外部知識
-# 質問まで誤ってマッチする (過去レビューで判明) ため、(a) 文境界を跨がない
-# 文字クラスで窓を絞り、(b) 「とは別/とは関係」等の明示的な話題切断の
-# 前置きを negative lookahead で弾く、の二重ガード付きで窓を 40 に広げる。
-# 上記の構造 (アンカー / 否定先読み / 近接窓) は core.intent_vocab から派生させ、
-# backend/free/rag/self_rag_judge.py の TRIVIAL_QUESTION_PATTERNS と機械的に
-# 同期する (以前は両ファイルへ書き写しており、窓幅を変えるたびに手で両方を直す
-# 必要があった)。ただし **語彙を同一にしてはいけない** — self_rag 側はマッチすると
-# RAG 検索を丸ごと skip するため誤検出コストが桁違いに高く、話題ポインタにも
-# なる語 (質問/指摘/言った/話した/聞いた/順番) は self_rag 側では意図的に採って
-# いない。詳細な実測は self_rag_judge.py の「語彙が同一でない理由」コメント参照。
-# 反省的な語には時系列順序語 (最初/最後/何番目/何回目) も含める。
-# 「この会話で一番最初に計算させた問題は?」(2026-07-21 ライブ検証 ターン18)
-# は反省語 (覚えて等) を欠きスコープ注入が漏れ、cross-session 検索が前回
-# 会話の類似ターンを引き当て誤答した。順序語の追加でマッチ面が広がる分、
-# 「この会話じゃなくて/ではなく」の明示的な話題切断も lookahead へ追加する。
-#: 会話自体を振り返る語 (BROAD)。マッチしても search_history を現在セッションへ
-#: 限定するだけで誤検出コストが軽微なため、話題ポインタにもなる語 (順番/質問/
-#: 指摘/言った/話した/聞いた) まで広く採る。self_rag_judge 側の NARROW との差は
-#: 意図的 (core.intent_vocab の該当コメント参照)。
-#:
-#: 訂正/指摘/直した/思い出/言った/話した/聞いた は 2026-07-25 追加。これらが
-#: 無いため「今日の会話の中で、私があなたの回答を訂正した箇所が 3 回ある」が
-#: セッション限定されず、前日の別セッションを引用して他人のペルソナ設定を
-#: ユーザー本人の訂正として提示した。
-#: 順番/順序/列挙/並べ/質問 は 2026-07-27 追加。順序・列挙を尋ねる語が無いため
-#: 「この会話で私が質問した順番を…列挙してください。」が自己参照と判定されず、
-#: 逆に exclude_session_id が注入され、「この会話」について尋ねているのに現在
-#: セッションだけを除外して検索していた。
-_SESSION_REFLECTIVE_VOCAB_BROAD_JA = (
-    r"面白|印象|振り返|まとめ|要約|感想|どう思|覚えて|何でした|どうでした"
-    r"|訂正|指摘|直した|思い出|言った|話した|聞いた"
-    r"|最初|最後|何番目|何回目"
-    r"|順番|順序|列挙|並べ|質問"
-)
-
-_SELF_SESSION_REFERENCE_PATTERNS = [
-    re.compile(
-        session_self_reference_pattern_ja(_SESSION_REFLECTIVE_VOCAB_BROAD_JA),
-    ),
-]
-
-# _SELF_SESSION_REFERENCE_PATTERNS の英語版。英語の話題切断表現
-# ("aside from"/"apart from") は名詞句の前に来る (日本語の後置とは語順が
-# 逆) ため、_SESSION_TOPIC_BREAK_LEAD_RE_EN の前置きガードと併用する
-# (_maybe_scope_session_search 側で参照)。
-# (pillar境界のため backend/free/rag/self_rag_judge.py の
-# TRIVIAL_QUESTION_PATTERNS_EN と同趣旨の定義を重複させている。JA 側と同様に
-# 語彙は意図的に完全一致させていない — ``asked`` は self_rag 側では採らない。
-# 理由と実測は self_rag_judge.py の「語彙が同一でない理由」コメント参照)。
-#: 英語版 BROAD 語彙。order/sequence/enumerate/asked は 2026-07-27 追加
-#: (JA 側の 順番/順序/列挙/質問 と対応)。
-_SESSION_REFLECTIVE_VOCAB_BROAD_EN = (
-    r"interesting|memorable|impressive|funn(?:y|iest)"
-    r"|summar\w*|recap\w*|think|thought|feel|felt|remember"
-    r"|order|sequence|enumerate|asked"
-    r"|first|last|earliest|latest"
-)
-#: 逆順 (修飾語が先) の共起で使う語彙。動詞 (think/asked 等) は
-#: 「〜について考えた this conversation」の語順が不自然なので採らない。
-_SESSION_REFLECTIVE_VOCAB_LEADING_EN = (
-    r"interesting|memorable|impressive|funn(?:y|iest)"
-    r"|summar\w*|recap\w*|first|last|earliest|latest"
-)
-
-_SELF_SESSION_REFERENCE_PATTERNS_EN = [
-    re.compile(
-        SESSION_ANCHOR_EN
-        + SESSION_TOPIC_BREAK_LOOKAHEAD_EN
-        + SESSION_PROXIMITY_WINDOW_EN
-        + f"(?:{_SESSION_REFLECTIVE_VOCAB_BROAD_EN})"
-        # 英語は修飾語 (interesting 等) が「this conversation」より前に
-        # 来る語順も自然なため (日本語の後置とは逆)、逆順の共起も許容する。
-        # 前置きガードは _SESSION_TOPIC_BREAK_LEAD_RE_EN 側で別途行う。
-        + f"|(?:{_SESSION_REFLECTIVE_VOCAB_LEADING_EN})"
-        + SESSION_PROXIMITY_WINDOW_EN
-        + r"(?:this\s+conversation|this\s+chat|our\s+conversation)",
-        re.IGNORECASE,
-    ),
-]
-# 話題切断が前置される英語特有の言い回し (「この会話とは別に」の語順違い対策)。
-_SESSION_TOPIC_BREAK_LEAD_RE_EN = re.compile(
-    r"\b(?:aside|apart|other than|separate)\s+from\s+(?:this|our)\s+conversation\b",
-    re.IGNORECASE,
-)
-
-def _coerce_positive_int(value: object) -> int | None:
-    """aux の型崩れ JSON 由来の値を正の int へ正規化する (int / 数値文字列 /
-    整数値 float を受理)。bool や非数値、0 以下は ``None`` を返す。"""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value > 0 else None
-    if isinstance(value, float):
-        return int(value) if value.is_integer() and value > 0 else None
-    if isinstance(value, str):
-        s = value.strip()
-        if s.isdigit():
-            n = int(s)
-            return n if n > 0 else None
-    return None
-
-
-# 時系列順序指定を含む履歴クエリの検出 (「一番最初に」「最後に」等)。
-# aux が合成する小さい limit (例: limit=1) は字句スコア最上位への
-# 切り詰めであり時系列意味論を持たないため、順序指定クエリでは limit を
-# ハンドラ既定値まで引き上げ、turn# 付きの全マッチターンを digest に渡す。
-_ORDERED_HISTORY_QUERY_RE = re.compile(
-    r"最初|最後|何番目|何回目|直近|first|last|earliest|latest",
-    re.IGNORECASE,
-)
-
-# builtin._make_search_history の limit 既定と同期
-_HISTORY_SEARCH_DEFAULT_LIMIT = 10
-
-# 順序リコール質問から search_history 用の内容キーワードを抽出するための定義。
-# 「この会話で一番最初に計算させた問題は何？」→「計算」。
-# 除去対象の scaffolding フレーズ (self-reference / 複合順序語)。単純な文字
-# クラス抽出では「一番最初」等が 1 つの漢字ランに連結するため、先にフレーズ
-# 単位で除去してから内容ランを取り出す。
-_ORDER_QUERY_SCAFFOLD_RE = re.compile(
-    r"今までの(?:会話|やり取り)|今日の(?:追加分の)?会話|今回の(?:追加分の)?会話"
-    r"|前回の会話|この会話|このやり取り|その会話"
-    r"|過去の(?:会話|やり取り)|以前の会話|会話履歴"
-    r"|一番最初|一番最後|何番目|何回目",
-)
-# 内容ラン (漢字 / カタカナ / ラテン / 数字。ひらがなの助詞・活用語尾は自然に
-# 脱落する)。
-#
-# ひらがなを語の一部として取り込む案は採らない。送り仮名 (食べ物) と助詞・活用
-# 語尾 (私が今日 / 話した / 見た映画) を辞書無しで区別できず、取り込むと
-# 「が今日ハマってるって話した食べ物」のような **1 個の巨大な融合語** になる。
-# 融合語は照合側の定足数を確実に落とすため、分割 (食べ物 → 食 / 物) より害が
-# 大きい。語の分断は照合側の定足数を緩めることで受け止める
-# (``history.history_manager._text_matches_query``)。
-_ORDER_QUERY_CONTENT_RE = re.compile(
-    r"[一-鿿゠-ヿ々〆a-zA-Z0-9]+",
-)
-
-#: 1 文字の内容ランは検索語として意味を持たない (良 / 久 / 泣 / 人 / 勧)。
-#: 照合側が 2 文字未満を捨てるため効きもしないのに、クエリ文字列だけを膨らませる
-#: (実インシデント 2026-08-16 ライブ監査 ターン5:
-#: ``昨日見 映画 良 久 泣 人 勧`` の 7 語のうち 5 語が 1 文字だった)。
-_ORDER_QUERY_MIN_TERM_LEN = 2
-# 内容ランのうち scaffolding とみなして落とす語 (質問・順序・自己参照の骨組み)。
-_ORDER_QUERY_STOPWORD_RUNS = frozenset({
-    "会話", "一番", "最初", "最後", "直近", "以前", "前回", "今日", "今回", "今",
-    # 時点の scaffolding。「今日」だけが登録されていたため「昨日見た映画が…」が
-    # ``昨日見`` という壊れた融合語になっていた (2026-08-16 ライブ監査 ターン5)。
-    "昨日", "明日", "昨夜", "今朝", "先日", "最近", "先週", "先月",
-    "問題", "質問", "内容", "話題", "話", "何", "誰", "私", "貴方", "君", "僕",
-    "俺", "覚", "番目", "回目", "先",
-    # 明示的な履歴検索依頼の骨組み (「過去の会話で〜を探して/調べて」)
-    "過去", "履歴", "探", "検索", "調", "教", "知",
-    # 「もう一度」「〜させた」等の依頼骨組み (2026-08-05 追加)。
-    "一度", "度", "全部", "全て", "読",
-})
-#: 日本語ストップワードを長い順に固定した並び (最長一致 + 決定論のため)。
-#: frozenset をそのまま走査すると反復順が実行ごとに変わり、剥がれ方が
-#: 非決定になる。
-_ORDER_QUERY_STOPWORDS_BY_LEN: tuple[str, ...] = tuple(
-    sorted(_ORDER_QUERY_STOPWORD_RUNS, key=len, reverse=True),
-)
-
-
-def _strip_stopword_affixes(run: str) -> str:
-    """内容ランの前後に貼り付いたストップワードを剥がす (純粋関数)。
-
-    日本語側は「漢字・カタカナ・ラテンの連続」を 1 ランとして切り出すため、
-    隣接したストップワード同士が 1 つのランに融合してしまう。ラン単位の
-    ストップワード照合はこの融合語を素通しし、語中で切れた無意味なキーワードが
-    検索クエリに載る (2026-08-05 ライブ監査: 「今日私が最初に読ませたファイルの
-    フルパスをもう一度教えてください」→ ``今日私 読 ファイル フルパス 一度教``
-    で 0 件。``今日``+``私``、``一度``+``教`` がそれぞれ融合していた)。
-
-    剥がすのは **残りが 2 文字以上、残り自体がストップワード、または剥がした
-    ストップワードが 2 文字以上** の場合だけにする。無条件に剥がすと「教育」→
-    「育」のように内容語を壊す (``教`` がストップワード)。
-
-    3 つ目の条件は「2 文字以上の時点語 + 1 文字の動詞」の融合を解くためのもの
-    (実インシデント 2026-08-16 ライブ監査 ターン5: 「昨日見た映画が…」が
-    ``昨日見`` という実在しない語になり、照合の定足数を確実に落としていた)。
-    1 文字のストップワードでは発動しないので「教育」は壊れない。
-    """
-    changed = True
-    while changed and run:
-        changed = False
-        for stopword in _ORDER_QUERY_STOPWORDS_BY_LEN:
-            if len(stopword) >= len(run):
-                continue
-            for rest in (
-                run[len(stopword):] if run.startswith(stopword) else None,
-                run[: -len(stopword)] if run.endswith(stopword) else None,
-            ):
-                if rest is None:
-                    continue
-                if (
-                    len(rest) >= 2
-                    or rest in _ORDER_QUERY_STOPWORD_RUNS
-                    or len(stopword) >= 2
-                ):
-                    run, changed = rest, True
-                    break
-            if changed:
-                break
-    return run
-
-# _ORDER_QUERY_SCAFFOLD_RE/_ORDER_QUERY_CONTENT_RE/_ORDER_QUERY_STOPWORD_RUNS
-# の英語版。日本語版の「文字クラスで内容語/機能語を分離」は英語 (全て
-# Latin script) には構造上適用できないため、単語トークン化 + ストップ
-# ワードセット方式に設計変更する (_reduce_ordered_history_query 側で分岐)。
-_ORDER_QUERY_SCAFFOLD_RE_EN = re.compile(
-    r"\bin\s+(?:this|our)\s+conversation\b"
-    r"|\bthis\s+(?:chat|conversation|thread)\b"
-    r"|\bwhat\s+we\s+(?:talked|discussed)\s+about\b"
-    r"|\b(?:very\s+)?first\s+(?:thing|time|question|message)\b"
-    r"|\b(?:very\s+)?last\s+(?:thing|time|question|message)\b",
-    re.IGNORECASE,
-)
-_ORDER_QUERY_CONTENT_RE_EN = re.compile(r"[A-Za-z0-9']+")
-_ORDER_QUERY_STOPWORD_RUNS_EN = frozenset({
-    "the", "a", "an", "in", "on", "at", "of", "to", "is", "was", "were",
-    "what", "when", "where", "who", "which", "did", "do", "does",
-    "i", "you", "we", "me", "my", "our", "your",
-    "conversation", "chat", "thread", "talk", "talked", "discussed",
-    "first", "last", "earliest", "latest", "very", "thing", "things",
-    "time", "question", "message", "asked", "ask", "about",
-    # 明示的な履歴検索依頼の骨組み
-    "past", "previous", "history", "search", "find", "look", "tell",
-    "ever", "any", "topic", "topics",
-})
-
-
-def _reduce_ordered_history_query(query: str) -> str:
-    """履歴リコール質問から search_history 用の内容キーワードを抽出する。
-
-    レイヤー5.5 の強制フォールバックが search_history に生クエリ全文を渡すと、
-    HistoryManager の字句照合は長い疑問文を短い会話ターンにマッチできない
-    (2026-07-21 ライブ検証: 「この会話で一番最初に計算させた問題は何？」が
-    索引の search_text に「計算」を含むのに No results found。2026-07-27
-    ライブ検証: 「過去の会話で、登山の話題をしたことはありますか？探して
-    ください。」→「登山」)。self-reference / 順序語 / 検索依頼 /
-    疑問 scaffolding を除去して内容キーワードを残す。
-    抽出できなければ生クエリを返す (悪化させない安全側)。digest には別途 raw
-    query が渡るため、順序解釈 (「一番最初」) はこの縮約で失われない。
-    """
-    en = is_en_locale()
-    if en:
-        scaffold_re, content_re, stopwords = (
-            _ORDER_QUERY_SCAFFOLD_RE_EN, _ORDER_QUERY_CONTENT_RE_EN,
-            _ORDER_QUERY_STOPWORD_RUNS_EN,
-        )
-    else:
-        scaffold_re, content_re, stopwords = (
-            _ORDER_QUERY_SCAFFOLD_RE, _ORDER_QUERY_CONTENT_RE,
-            _ORDER_QUERY_STOPWORD_RUNS,
-        )
-    stripped = scaffold_re.sub(" ", query)
-    terms: list[str] = []
-    for run in content_re.findall(stripped):
-        # 日本語はランの融合を解いてから照合する (英語は空白で切れており不要)。
-        term = run if en else _strip_stopword_affixes(run)
-        if not term or term.lower() in stopwords:
-            continue
-        # 1 文字の内容語は照合側が捨てるので、ここで落としてクエリを汚さない
-        # (:data:`_ORDER_QUERY_MIN_TERM_LEN`)。英語側は元から空白区切りで
-        # 1 文字語がほぼ出ないため、日本語だけに掛ける。
-        if not en and len(term) < _ORDER_QUERY_MIN_TERM_LEN:
-            continue
-        terms.append(term)
-    reduced = " ".join(terms).strip()
-    return reduced if len(reduced) >= 2 else query
-
-# ユーザー自身の行動宣言パターン — アシスタントへの依頼ではない雑談発話。
-# 「探してみるね」のような一人称の意思表明をツール起動と誤解しないための除外。
-# 依頼形 (「探してみて(ください)」= て止め) とは区別する (こちらは末尾が「て」)。
-_SELF_ACTION_PATTERNS = [
-    # 「〜てみる(ね/よ/わ/かな/から)」自分で試す宣言 (文末)
-    re.compile(r"(?:て|で)みる(?:ね|よ|わ|な|かな|から)?[\s　!！。.…]*$"),
-    # 「〜しておく/やっておく/調べておく(ね/よ)」自己完結の行動宣言 (文末)
-    re.compile(r"(?:してお|やってお|探してお|調べてお|見てお|やっと)く(?:ね|よ|わ|から)?[\s　!！。.…]*$"),
-    # 一人称主語で自分が行う宣言 (文末の意思・断定形に限定)。
-    # 旧実装は主語マーカー単独の無アンカー部分一致で、「この会話で一番最初に
-    # 私が計算させた問題は何だったか覚えてますか？」のような関係節中の一人称
-    # 主語まで自己行動宣言と誤検出し skip_judgment=True を招いていた
-    # (2026-07-20 ライブ検証で確認、層5.5 フォールバックが実害を吸収)。
-    # 主語マーカーの後、同一文内 (文境界・疑問符を跨がない) で動詞終止形
-    # (u 段かな) または ます形の文末で終わる発話のみ宣言とみなす。
-    # 丁寧断定「です」は情報提供であって行動宣言ではないため lookbehind で
-    # 除外し (「ます」の「す」は前が「ま」なので通る)、疑問形終端
-    # (「〜ますか？」等) は末尾許容クラスに「？」を含めないことで弾く。
-    # 取りこぼし (「私がやるから大丈夫」等の複文) は層4 aux 判定に
-    # 落ちるだけで安全側。
-    re.compile(
-        r"(?:自分で|自分が|私が|僕が|俺が|わたしが|こっちで|こちらで)"
-        r"[^。．!！?？\n]*"
-        r"(?:[うくぐつぬぶむる]|(?<!で)す)"
-        r"(?:ね|よ|わ|から|かな)?"
-        r"[\s　!！。.…]*$",
-    ),
-]
-
-
-
-#: ローカルファイル/ディレクトリを対象にしていることが明確な語。パス自体は
-#: 含まれていなくてよい (「そのファイル」のような anaphoric 参照を拾うため)。
-_LOCAL_FILE_REFERENCE_RE = re.compile(
-    r"(?:ファイル|フォルダ|ディレクトリ|保存した"
-    r"|(?<![A-Za-z])file(?![A-Za-z])|(?<![A-Za-z])folder(?![A-Za-z])"
-    r"|(?<![A-Za-z])directory(?![A-Za-z]))",
-    re.IGNORECASE,
-)
-#: web リソースを対象にしていることを示す語。1 つでもあればローカル限定と
-#: みなさない (「そのURLをファイルに保存して」等の url_write 正規フロー保護)。
-_WEB_REFERENCE_RE = re.compile(
-    r"(?:URL|https?://|ウェブ|サイト|ページ|ニュース|記事|ブログ|ドメイン|リンク"
-    r"|(?<![A-Za-z])web(?![A-Za-z])|(?<![A-Za-z])site(?![A-Za-z])"
-    r"|(?<![A-Za-z])page(?![A-Za-z])|(?<![A-Za-z])news(?![A-Za-z])"
-    r"|(?<![A-Za-z])fetch(?![A-Za-z])|(?<![A-Za-z])browse(?![A-Za-z])"
-    r"|(?<![A-Za-z])link(?![A-Za-z])|(?<![A-Za-z])domain(?![A-Za-z]))",
-    re.IGNORECASE,
-)
-
-
-def _query_targets_local_file_only(query: str) -> bool:
-    """ローカルファイル参照が明確で、web 参照シグナルが無いか (純粋関数)。"""
-    return bool(_LOCAL_FILE_REFERENCE_RE.search(query)) and not _WEB_REFERENCE_RE.search(
-        query,
-    )
-
-
-def _query_has_tool_signal(query: str, context: str = "") -> bool:
-    """クエリにツール操作シグナル (ツールパターン / Windows・Unix パス / URL) を含むか。"""
-    patterns = select_locale_variant(_TOOL_PATTERNS, _TOOL_PATTERNS_EN)
-    return (
-        any(p.search(query) for p in patterns)
-        or bool(_PATH_OR_URL_SIGNAL_RE.search(query))
-        # ディレクトリ列挙は _TOOL_PATTERNS のどれにも当たらず、knowledge query
-        # として落ちて捏造回答になっていた (2026-08-03 ライブ監査)。
-        or asks_directory_listing(query)
-        # 式が書かれていない計算文章題も calculate が要る。補助タスク常駐時は
-        # 5.2 層 (_judge_with_calculate_fallback) が拾うが、on_demand では
-        # そこが撃てないため、ここを通さないとネイティブ層にも届かず base の
-        # 暗算に倒れる (2026-08-08 ライブ監査:「時速240kmで2時間30分走ると
-        # 何km進みますか。」→ 540km。正解 600km)。
-        or looks_like_numeric_question(query, context)
-        # 「<識別子> はどこで使われていますか」は _TOOL_PATTERNS のどれにも
-        # 当たらず、文末の「〜ですか」で knowledge query として落ちる。
-        # ルール層を素通りした結果、分類器が所在探索に無意味な list_directory
-        # を選び 218.6 秒を捨てていた (2026-08-16 ライブ監査ターン 19)。
-        or _is_code_usage_location_query(query)
-    )
-
-
-#: 「プロジェクトのルート」を指す表現。列挙対象をカレントディレクトリに解決する。
-_PROJECT_ROOT_REFERENCE_RE = re.compile(
-    r"(?:プロジェクト|リポジトリ|ルート|トップ(?:レベル)?|一番上)"
-    r"|(?<![A-Za-z])(?:project|repo(?:sitory)?|root|top[-\s]?level)(?![A-Za-z])",
-    re.IGNORECASE,
-)
-
-#: ``<名前> ディレクトリ`` / ``<名前> フォルダ`` の ``<名前>`` を取る。パス片として
-#: ありうる文字だけを許し、和文は取らない (「このディレクトリ」の「この」等を
-#: 対象名と誤認しないため)。
-_NAMED_DIRECTORY_RE = re.compile(
-    r"([A-Za-z0-9._/\\-]+)\s*(?:ディレクトリ|フォルダ)"
-    r"|(?:director(?:y|ies)|folders?)\s+([A-Za-z0-9._/\\-]+)",
-    re.IGNORECASE,
-)
-
-
-def resolve_listing_directory(query: str, root: Path) -> str | None:
-    """列挙対象のディレクトリを解決する。**実在するものだけ**返す (純粋関数)。
-
-    存在しないパスを返さないのは、捏造パスを実行しても失敗するだけで価値が無い
-    ためで、``_READ_PATH_TOOLS`` の方針と同じ。解決できなければ ``None`` を返し、
-    呼び出し側は後段の層 (aux 判定) へ委ねる — 当てずっぽうの引数でツールを
-    撃つより、シグナルだけ立てて判断を渡すほうが安全。
-    """
-    for match in _NAMED_DIRECTORY_RE.finditer(query):
-        name = match.group(1) or match.group(2)
-        if not name:
-            continue
-        candidate = Path(name)
-        if not candidate.is_absolute():
-            candidate = root / name
-        if candidate.is_dir():
-            return name
-    if _PROJECT_ROOT_REFERENCE_RE.search(query):
-        return "."
-    return None
-
-
-
-
-
-
-#: 進行中の会話を指す近接リコール語。これらは「今のセッションの中」を指すので、
-#: 現在セッションを除外した search_history では構造的に当たらない。
-def _only_proximal_recall_keywords(query: str) -> bool:
-    """履歴参照語が近接リコール語だけか (純粋関数)。
-
-    長距離リコール語 (「以前」「最初に」「覚えて」等) が 1 つでもあれば False。
-    """
-    q_lower = query.lower()
-    keywords = select_locale_variant(HISTORY_KEYWORDS, HISTORY_KEYWORDS_EN)
-    matched = [kw for kw in keywords if kw in q_lower]
-    if not matched:
-        return False
-    return all(kw in PROXIMAL_RECALL_KEYWORDS for kw in matched)
-
-
-def _has_history_recall_keywords(query: str) -> bool:
-    """明示的な履歴参照キーワード (router.HISTORY_KEYWORDS) を含むか。
-
-    router.ComplexityClassifier._has_history_keywords と同じ判定 (小文字化
-    後の部分文字列一致) を、layer 分類とは独立に tool 強制発火の判定に使う。
-    """
-    q_lower = query.lower()
-    keywords = select_locale_variant(HISTORY_KEYWORDS, HISTORY_KEYWORDS_EN)
-    return any(kw in q_lower for kw in keywords)
-
-
-#: 会話に既出の対象を指す連体詞 + 名詞。「今日」「現在」のような直示語は
-#: 含めない (それらは実測して答えるのが正しい)。
-_ANAPHORIC_REFERENCE_RE = re.compile(
-    r"(?:その|あの|例の|先ほどの|さきほどの|さっきの|前述の|上記の|くだんの)"
-    r"\s*[^\s、。，．]{1,12}",
-)
-#: 過去に述べられた内容を尋ね直す文末形。
-_RETROSPECTIVE_QUESTION_RE = re.compile(
-    r"でした(?:か|っけ)|だった(?:か|っけ)|でしたよね|だっけ"
-    r"|と言(?:い|っ)ました|と伝えました",
-)
-
-
-def asks_about_prior_conversation_entity(query: str) -> bool:
-    """会話に既出の対象について尋ね直しているか (純粋関数)。
-
-    ``_INFER_TOOL_EXEC_QUERY_RE`` は「何曜日」「日付」等の語だけで実行可能
-    クエリと判定するため、会話で決めた予定を尋ね直す文まで日時取得コマンドに
-    乗ってしまう。ツール結果は「唯一の事実根拠」として base に渡るので、
-    現在時刻が会話の文脈を押しのけて誤答になる (実インシデント 2026-07-29
-    ライブ監査: 「来週の水曜日に東京で」→「大阪の木曜に訂正」と直した直後に
-    「その打ち合わせは何曜日にどこでしたか？」と尋ねたところ、
-    ``datetime.now()`` が発火し、訂正前の「来週の水曜日に東京で打ち合わせが
-    あります。」がそのまま返った)。
-
-    連体詞による既出参照と、過去を尋ね直す文末形の **両方** を要求する。
-    「今日は何曜日でしたっけ?」は既出参照が無いので従来どおり実測へ回る。
-    """
-    if not query:
-        return False
-    return bool(
-        _ANAPHORIC_REFERENCE_RE.search(query)
-        and _RETROSPECTIVE_QUESTION_RE.search(query)
-    )
-
-
-#: 数値リテラル抽出用。小数と整数を拾う (単位や記号は含めない)。
-_NUMERIC_LITERAL_RE = re.compile(r"\d+(?:\.\d+)?")
-#: 全角数字を半角に寄せる変換表 (日本語入力のクエリ対策)。
-_FULLWIDTH_DIGITS = str.maketrans("０１２３４５６７８９．", "0123456789.")
-
-
-def _numeric_literals(text: str) -> set[str]:
-    """テキスト中の数値リテラル集合を返す (全角は半角へ正規化。純粋関数)。"""
-    if not text:
-        return set()
-    normalized = text.translate(_FULLWIDTH_DIGITS)
-    return {
-        m.lstrip("0") or "0" for m in _NUMERIC_LITERAL_RE.findall(normalized)
-    }
-
-
-def recalled_command_fits_query(
-    command: str, origin_query: str, query: str,
-) -> bool:
-    """引き当てたコマンドを別クエリへ再生してよいかを判定する (純粋関数)。
-
-    executable_command リコールの根拠は embedding 類似度と過去成功率だけで、
-    コマンドに焼き込まれた「そのクエリ固有の値」を見ていない。日付や日数の
-    ような値が本文へ埋まったコマンドを類似クエリへ再生すると、質問と無関係な
-    数字を「ツールで確かめた事実」として提示してしまう
-    (実インシデント 2026-07-29 ライブ監査: 「私の誕生日は3月14日です。今日から
-    誕生日まであと何日ですか。」から学習した ``datetime.date(y,3,14)`` 入りの
-    コマンドが、類似度 0.52 で「2026年3月15日から11月8日までは何日間ですか」へ
-    再生され、無関係な ``228`` が返った)。
-
-    コマンドと **合成元クエリ** の両方に現れる数値をクエリ由来のパラメータと
-    みなし、それが今回のクエリに無ければ再生を拒否する。合成元クエリに数値が
-    無いコマンド (``1024**3`` を含むディスク容量取得等) は構造上の定数しか
-    持たないため、そのまま再利用できる。
-
-    Args:
-        command: 引き当てたコマンド文字列。
-        origin_query: そのコマンドを合成した元のクエリ (fact.object)。
-            空なら判定不能として True を返す (従来挙動を維持)。
-        query: 今回のクエリ。
-    """
-    # 相対日付を尋ねているのに、引き当てたコマンドが日付演算を含まない場合は
-    # 拒否する。数値パラメータを持たないコマンド (現在時刻の print だけ) は
-    # 下の literal 判定を無条件に通ってしまい、「今日から100日後」に対して
-    # 現在時刻だけが返る。差分はモデルの暗算に倒れ、当たるかどうかが運になる
-    # (実インシデント 2026-08-08 ライブ監査: 修正済みの _build_datetime_command
-    # ではなく、修正前に学習した現在時刻コマンドが sim=0.69 で再生された)。
-    if _RELATIVE_OFFSET_RE.search(query or "") and not _DATE_ARITHMETIC_RE.search(
-        command,
-    ):
-        return False
-    if not origin_query:
-        return True
-    parameters = _numeric_literals(command) & _numeric_literals(origin_query)
-    if not parameters:
-        return True
-    return parameters <= _numeric_literals(query)
-
-
-@dataclass
-class ToolJudgement:
-    """ツール呼び出し判定結果"""
-    tool_needed: bool
-    tool_name: str = ""
-    tool_args: dict = None  # type: ignore[assignment]
-    source: str = "rule"  # "llm" | "rule" | "cartridge" | "learned"
-    #: calculate の式に含まれる、対話から辿れない数値リテラル。式を捨てずに
-    #: 実行したときだけ入り、回答側でその値の出所を開示させるために使う
-    #: (``_suppress_ungrounded_calculate`` 参照)。
-    unexplained_numbers: tuple[str, ...] = ()
-
-    def __post_init__(self):
-        if self.tool_args is None:
-            self.tool_args = {}
 
 
 class ToolCallJudge:
@@ -2498,573 +1061,116 @@ class ToolCallJudge:
                 ターン13: ファイル追記が 1 度も実行されないまま「追記しました。
                 行数は5行です」と捏造。実ファイルは 1 行のまま無変更だった)。
         """
-        guards: list[tuple[str, Callable[[ToolJudgement], ToolJudgement]]] = [
-            ("unfetchable_fetch_url", self._suppress_unfetchable_fetch_url),
-            ("commandless_run_command", self._suppress_commandless_run_command),
-            ("expressionless_calculate", self._suppress_expressionless_calculate),
-            # 深さ絞りは抑止ではなく、依頼文から決まる引数の確定なので層を
-            # 問わず安全 (対象ツール名が違えば no-op)。aux 限定にしていた
-            # ため rule 層の list_directory が素通りし、同じ依頼でも層が変わる
-            # と再発した (実インシデント 2026-08-04: source=aux では効き、
-            # source=rule では既定 3 階層のまま 5,523 字が切り詰められた)。
-            (
-                "immediate_children_depth",
-                lambda r: self._scope_list_directory_depth(r, query),
-            ),
-            # 深さ絞りと同じ「依頼文から決まる引数の確定」。決定論層は
-            # _extract_head_line_count を見るが文法制約分類器は見ないため、
-            # 分類器で確定した瞬間に「先頭 N 行」の指定が消えていた。
-            (
-                "read_file_line_range",
-                lambda r: self._scope_read_file_line_range(r, query),
-            ),
-            (
-                "proximal_recall_excluded_session",
-                lambda r: self._suppress_proximal_recall_cross_session(r, query),
-            ),
-        ]
-        if aux_guards:
-            guards += [
-                (
-                    "truncated_text_operand",
-                    lambda r: self._restore_truncated_text_operand(
-                        r, conversation,
-                    ),
-                ),
-                (
-                    "ungrounded_calculate",
-                    lambda r: self._suppress_ungrounded_calculate(
-                        r, query, conversation,
-                    ),
-                ),
-                (
-                    "ungrounded_read_path",
-                    lambda r: self._suppress_ungrounded_read_path(
-                        r, query, conversation,
-                    ),
-                ),
-            ]
-            if not hidden_tools_offered:
-                guards.append(
-                    (
-                        "hidden_tool_from_aux",
-                        lambda r: self._suppress_hidden_tool_from_aux(
-                            r, tools_registry,
-                        ),
-                    ),
-                )
-        # 可用性チェックは常に最後。mode 制約で撃てなかった場合に
-        # ``_measurement_blocked`` を立てるため、引数欠落で先に降格した
-        # ケースと区別できる位置に置く必要がある。
-        guards.append(
-            (
-                "tool_availability",
-                lambda r: self._validate_tool_availability(
-                    r, tools_registry, mode,
-                ),
-            ),
+        ctx = GuardContext(
+            tools_registry=tools_registry,
+            mode=mode,
+            query=query,
+            conversation=conversation,
+            aux_guards=aux_guards,
+            hidden_tools_offered=hidden_tools_offered,
         )
-
-        for name, guard in guards:
-            was_needed = result.tool_needed
-            result = guard(result)
-            if was_needed and not result.tool_needed:
-                # 以降のガードは no_tool を素通しするだけなので打ち切る。
-                # どのガードが降格させたかは切り分けに効くので残す。
-                logger.debug(
-                    "Judge guard %s downgraded the judgement to no_tool", name,
-                )
-                break
+        result = apply_guards(result, ctx)
+        self._absorb_blocked_flags(ctx)
         return result
 
-    def _suppress_proximal_recall_cross_session(
-        self, result: "ToolJudgement", query: str,
-    ) -> "ToolJudgement":
-        """近接リコール語だけを根拠に現在セッションを除外した検索を撃たせない。
+    def _absorb_blocked_flags(self, ctx: GuardContext) -> None:
+        """ガードが立てた「実行できなかった」印をインスタンスへ引き継ぐ。
 
-        「さっき」「先ほど」等が指しているのは**進行中の会話**であり、それを
-        ``exclude_session_id`` で除外した検索先に答えは無い。結果は 2 通りしか
-        なく、どちらも有害:
-
-        - 0 件 → 10 秒前後を捨てたうえ「該当なし」が根拠として base に渡り、
-          進行中の会話の内容まで否定させる (2026-07-28 ライブ検証)
-        - 別セッションがヒット → その内容が「さっきの話」として提示される
-          (2026-08-05 ライブ監査: 「さっき E:\\tmp\\...txt に書き込んで
-          もらったはず」に対し、**別セッション**の
-          ``E:\\tmp\\監査メモ.txt に「検証コードはアオサギ42」`` を今回の
-          会話で依頼されたファイル操作として列挙した)
-
-        このガードは元々 ``judge()`` の層5.5 (history_keyword_forced_fallback)
-        にインラインで書かれており、**aux 経路 (層4) には掛かっていなかった**。
-        上記 2026-08-05 の実インシデントはまさに ``source=aux`` の判定で
-        起きている。同責務の抑止は層ごとに書き写さず ``_finalize`` の funnel
-        へ集約する (funnel の docstring 参照)。
-
-        ``query`` 未指定 (既定 "") の呼出では ``_only_proximal_recall_keywords``
-        が False を返すため安全に no-op。
+        ガードは純粋関数なので ``ctx`` にしか書かない。``judge()`` は冒頭で両
+        フラグを落とすため、ここでは立った側だけを取り込めばよい。
         """
-        if result.tool_name != "search_history" or not result.tool_needed:
-            return result
-        if not (result.tool_args or {}).get("exclude_session_id"):
-            return result
-        if not _only_proximal_recall_keywords(query):
-            return result
-        logger.debug(
-            "Suppressing search_history: proximal recall word refers to the "
-            "ongoing session, which is excluded from the search: %s", query[:50],
+        self._measurement_blocked = (
+            self._measurement_blocked or ctx.measurement_blocked
         )
-        return ToolJudgement(tool_needed=False, source=result.source)
+        self._action_blocked = self._action_blocked or ctx.action_blocked
+
+    # --- ガードへの薄い委譲 -------------------------------------------------
+    # 実体は :mod:`backend.free.agent.tool_judge_guards` の純粋関数
+    # (適用順は :data:`~backend.free.agent.tool_judge_guards.GUARD_PIPELINE`)。
+    # ここに残すのは「ガードを 1 件だけ掛ける呼出面」と、``ctx`` に立った印を
+    # インスタンスへ引き継ぐ責務の 2 つだけ。
+
+    def _suppress_proximal_recall_cross_session(
+        self, result: ToolJudgement, query: str,
+    ) -> ToolJudgement:
+        """ガード ``proximal_recall_excluded_session`` を単体で掛ける。"""
+        return guards._suppress_proximal_recall_cross_session(
+            result, GuardContext(query=query),
+        )
 
     def _validate_tool_availability(
-        self, result: "ToolJudgement", tools_registry: ToolsRegistry, mode: str,
-    ) -> "ToolJudgement":
-        """tool_name が実在し、かつ現在の mode で利用可能かを最終チェックする。
-
-        ``_judge_with_rules`` / ``_judge_with_learned_patterns`` 等の各判定層は
-        ``tools_registry.has()`` (存在チェックのみ、mode 非考慮) で判定するため、
-        chat モードで ``modes=["create"]`` のツール (例: run_command) が
-        ``tool_needed=True`` のまま返り得る。実行自体は
-        ``deliberative._execute_tool`` のモードゲートで阻止されるが、判定結果が
-        True のまま turn_outcome=failed → 次ターンの訂正誤検出 → 無関係語の
-        correction 誤学習、というカスケードを引き起こす (2026-07-18 の会話
-        ログで実際に発生・確認済み)。
-
-        また ``_json_to_judgement`` は ``tool == "no_tool"`` の完全一致でのみ
-        no-tool と判定するため、tool_judgment 応答が max_tokens 到達で
-        ``{"tool": "no_`` のように途中切断され ``json_repair`` が
-        ``tool_name="no_"`` へ復元した場合、存在しないツール名のまま
-        ``tool_needed=True`` で返ってしまう (2026-07-18 実インシデントで確認)。
-        レジストリに存在しないツール名も判定確定の最終防衛としてここで
-        no_tool に倒す。
-        """
-        if not result.tool_needed or not result.tool_name:
-            return result
-        tool_def = tools_registry.get(result.tool_name)
-        if tool_def is None:
-            logger.info(
-                "Tool %s not found in registry (truncated JSON or "
-                "hallucinated name?); downgrading to no_tool before "
-                "returning judgement",
-                result.tool_name,
-            )
-            if result.tool_name in _STATE_CHANGING_TOOL_NAMES:
-                # 未登録のまま _STATE_CHANGING_TOOL_NAMES に載っている名前
-                # (delete_file / apply_patch) は、この分岐が mode ゲートより
-                # 先に立つため下の action_blocked に到達しない。状態を変える
-                # 意図が選ばれた事実は同じなので、ここでも記録する
-                # (2026-08-12 ライブ監査で削除完了の捏造を確認)。
-                self._action_blocked = True
-            return ToolJudgement(tool_needed=False, source=result.source)
-        if mode not in tool_def.modes:
-            remapped = self._remap_to_mode_sibling(
-                result, tools_registry, mode, tool_def,
-            )
-            if remapped is not None:
-                return remapped
-            logger.info(
-                "Tool %s not available in mode=%s (allowed: %s); "
-                "downgrading to no_tool before returning judgement",
-                result.tool_name, mode, tool_def.modes,
-            )
-            if result.tool_name in _COMMAND_TOOL_NAMES:
-                # 実測しようとして mode 制約で撃てなかったケース。
-                # 「ツール不要」と区別して記録する (measurement_blocked 参照)。
-                self._measurement_blocked = True
-            elif result.tool_name in _STATE_CHANGING_TOOL_NAMES:
-                # 状態を変える操作を選んだのに mode 制約で撃てなかった。
-                # 黙って no_tool に落とすと base が完了報告を捏造する
-                # (chat の ``write_file`` は create 限定で、書込みは
-                # meta_cognitive 経路が担う)。実インシデント 2026-08-09
-                # ライブ監査: 裸のファイル名を指した追記依頼がツール 0 回のまま
-                # 「E:\tmp\inventory_notes.txt の末尾に追記しました」と
-                # **フルパスまで補って** 報告され、実ファイルは無変更だった。
-                self._action_blocked = True
-            return ToolJudgement(tool_needed=False, source=result.source)
+        self, result: ToolJudgement, tools_registry: ToolsRegistry, mode: str,
+    ) -> ToolJudgement:
+        """ガード ``tool_availability`` を単体で掛ける。"""
+        ctx = GuardContext(tools_registry=tools_registry, mode=mode)
+        result = guards._validate_tool_availability(result, ctx)
+        self._absorb_blocked_flags(ctx)
         return result
 
     def _scope_list_directory_depth(
-        self, result: "ToolJudgement", query: str,
-    ) -> "ToolJudgement":
-        """「直下だけ」の一覧依頼で ``list_directory`` を 1 階層に絞る。
-
-        既定の 3 階層ツリーを返すと、受け取ったモデルがインデントを読み違えて
-        入れ子の項目を直下の項目として並べる (実インシデント 2026-08-01 再検証:
-        「直下にあるファイルとフォルダを一覧して」に対し backend/ の下の
-        develop/ api/ tests/ を直下として列挙した)。深さは依頼文から決まる
-        決定論的な値なので、モデルの転記に委ねず code 側で確定させる。
-        """
-        if result.tool_name != "list_directory" or not query:
-            return result
-        if not _IMMEDIATE_CHILDREN_RE.search(query):
-            return result
-        if _RECURSIVE_LISTING_RE.search(query):
-            return result
-        args = dict(result.tool_args or {})
-        if _coerce_positive_int(args.get("max_depth")) == 1:
-            return result
-        args["max_depth"] = 1
-        logger.info(
-            "list_directory scoped to immediate children for query: %s",
-            query[:60],
-        )
-        return ToolJudgement(
-            tool_needed=True,
-            tool_name=result.tool_name,
-            tool_args=args,
-            source=result.source,
-        )
+        self, result: ToolJudgement, query: str,
+    ) -> ToolJudgement:
+        """ガード ``immediate_children_depth`` を単体で掛ける。"""
+        return guards._scope_list_directory_depth(result, GuardContext(query=query))
 
     def _scope_read_file_line_range(
-        self, result: "ToolJudgement", query: str,
-    ) -> "ToolJudgement":
-        """「先頭 N 行だけ」の読取依頼で ``read_file`` を範囲指定に絞る。
-
-        ``list_directory`` の深さ絞り (:meth:`_scope_list_directory_depth`) と
-        同じく、依頼文から決まる**引数の確定**であって抑止ではない。したがって
-        層を問わず適用してよい (ツール名が違えば no-op)。
-
-        層ごとに書き写していたため実際に食い違っていた: ``_infer_tool`` と
-        ``_referential_read_judgement`` は ``_extract_head_line_count`` を見るが、
-        **文法制約ツール分類 (層5.9) は見ない**。分類器は ``file_path`` しか
-        埋めないため、そこで確定した瞬間に範囲指定が消える。
-
-        実インシデント (2026-08-16 再測定ターン 14):「そのファイルの先頭2行だけ
-        見せてください。」→ ``Tool classifier selected: read_file({'file_path': ...})``
-        で全文 3,405 文字が返り、2 行の依頼に対して全文が渡っていた。同じ意味の
-        「全文は長すぎます。そのファイルの先頭5行だけをそのまま見せてください。」は
-        決定論層が拾って ``showing lines 1-5`` になる。**言い回しで挙動が割れていた**。
-
-        既に範囲が入っている判定 (決定論層が確定させた場合) は触らない。
-        """
-        if result.tool_name != "read_file" or not query:
-            return result
-        args = dict(result.tool_args or {})
-        if args.get("start_line") is not None or args.get("end_line") is not None:
-            return result
-        head = _extract_head_line_count(query)
-        if head is None:
-            return result
-        args["start_line"] = 1
-        args["end_line"] = head
-        logger.info(
-            "read_file scoped to head %d lines for query: %s", head, query[:60],
-        )
-        return ToolJudgement(
-            tool_needed=True,
-            tool_name=result.tool_name,
-            tool_args=args,
-            source=result.source,
-        )
+        self, result: ToolJudgement, query: str,
+    ) -> ToolJudgement:
+        """ガード ``read_file_line_range`` を単体で掛ける。"""
+        return guards._scope_read_file_line_range(result, GuardContext(query=query))
 
     def _restore_truncated_text_operand(
-        self, result: "ToolJudgement", conversation: list[dict] | None,
-    ) -> "ToolJudgement":
-        """text 引数へ転記された「切り詰め済み会話」の断片を全文へ復元する。
-
-        判定用プロンプトは会話を 1 メッセージ ``_JUDGE_CONTEXT_CHARS`` 文字で
-        切って aux に見せる。summarize / translate のように**処理対象の本文
-        そのものを引数に取る**ツールでは、aux はその切り詰められた断片しか
-        転記できず、後段は断片だけを処理してしまう (実インシデント 2026-08-01
-        ライブ監査: 4 ユニット 530 文字の四季の文章を「1 行に要約して」と頼んだ
-        ところ、先頭 100 文字 = 春の節だけが要約された)。
-
-        引数が会話中メッセージの真の接頭辞になっている場合、それは切り詰めの
-        産物であって「その部分だけを対象にする」という意図ではない。元メッセージ
-        全文へ差し替える。引数が全文と一致していれば何もしない。
-
-        文字数上限を引き上げる対処では、上限を超える長さで同じ欠落が再発する。
-        転記させず code 側で解決するのが構造的な解。
-        """
-        if not result.tool_needed or result.tool_name not in _TEXT_OPERAND_TOOLS:
-            return result
-        excerpt = (result.tool_args or {}).get("text")
-        if not isinstance(excerpt, str) or not excerpt.strip():
-            return result
-        excerpt = excerpt.strip()
-        for msg in reversed(conversation or []):
-            content = msg.get("content")
-            if not isinstance(content, str):
-                continue
-            full = content.strip()
-            if len(full) > len(excerpt) and full.startswith(excerpt):
-                logger.info(
-                    "Restored truncated text operand for %s: %d -> %d chars",
-                    result.tool_name, len(excerpt), len(full),
-                )
-                args = dict(result.tool_args or {})
-                args["text"] = full
-                return ToolJudgement(
-                    tool_needed=True,
-                    tool_name=result.tool_name,
-                    tool_args=args,
-                    source=result.source,
-                )
-        return result
-
-    def _remap_to_mode_sibling(
-        self,
-        result: "ToolJudgement",
-        tools_registry: ToolsRegistry,
-        mode: str,
-        tool_def: ToolDefinition,
-    ) -> "ToolJudgement | None":
-        """mode 外のツール名を、同じ能力を持つ mode 内の兄弟ツールへ載せ替える。
-
-        aux へ渡すカタログは mode で絞ってあるが、モデルは学習事前分布から
-        カタログ外の兄弟名を返すことがある (実インシデント 2026-08-01 ライブ監査:
-        chat モードで ``run_command`` を返し、ガードが no_tool へ落として
-        「ツールを実行できなかった」という曖昧な断りだけが残った。実際には
-        ``run_command_readonly`` が同じ ``command`` 引数で撃てた)。
-
-        判定そのものは正しいのに名前だけが外れている場合に意図を捨てないための
-        載せ替え。引数スキーマが被覆関係にある (兄弟の必須引数をすべて満たせる)
-        ときだけ行い、満たせなければ従来どおり no_tool へ落とす。権限は兄弟側の
-        ツールが自前で検証するため、ここで緩むことはない。
-
-        Returns:
-            載せ替えた判定。該当が無ければ None (純粋な判定、副作用なし)。
-        """
-        for sibling in _MODE_CAPABILITY_SIBLINGS.get(result.tool_name, ()):
-            if not tools_registry.is_available(sibling, mode):
-                continue
-            supplied = set(result.tool_args or {})
-            if not tools_registry.required_params(sibling) <= supplied:
-                continue
-            logger.info(
-                "Tool %s not available in mode=%s (allowed: %s); remapping to "
-                "same-capability sibling %s",
-                result.tool_name, mode, tool_def.modes, sibling,
-            )
-            return ToolJudgement(
-                tool_needed=True,
-                tool_name=sibling,
-                tool_args=dict(result.tool_args or {}),
-                source=result.source,
-            )
-        return None
-
-    def _suppress_unfetchable_fetch_url(
-        self, result: "ToolJudgement",
-    ) -> "ToolJudgement":
-        """url 引数を補完できない ``fetch_url`` を ``tool_needed=False`` に格下げ.
-
-        URL リコール (``_maybe_recall_url`` / ``_judge_with_url_recall``) でも
-        補完できず、LLM 判定でも url が validate されなかったケースを
-        ``deliberative._execute_tool`` の手前で抑制する。これにより:
-
-        - "fetch_url() requires args but none provided, skipping" の警告と
-          UI 上の空ステップ表示を防ぐ
-        - LLM が事前知識のみで応答する経路にクリーンに落ちる
-
-        ``fetch_url`` 以外のツール / url が補完済みの fetch_url はそのまま返す。
-        """
-        if not result.tool_needed or result.tool_name != "fetch_url":
-            return result
-        args = result.tool_args or {}
-        if args.get("url"):
-            return result
-        logger.info(
-            "Suppressing fetch_url with no URL argument (no recall hit, "
-            "no in-query URL); LLM will respond from prior knowledge",
+        self, result: ToolJudgement, conversation: list[dict] | None,
+    ) -> ToolJudgement:
+        """ガード ``truncated_text_operand`` を単体で掛ける。"""
+        return guards._restore_truncated_text_operand(
+            result, GuardContext(conversation=conversation),
         )
-        return ToolJudgement(
-            tool_needed=False,
-            tool_name="",
-            tool_args={},
-            source=result.source,
-        )
+
+    def _suppress_unfetchable_fetch_url(self, result: ToolJudgement) -> ToolJudgement:
+        """ガード ``unfetchable_fetch_url`` を単体で掛ける。"""
+        return guards._suppress_unfetchable_fetch_url(result, GuardContext())
 
     def _suppress_commandless_run_command(
-        self, result: "ToolJudgement",
-    ) -> "ToolJudgement":
-        """command 引数を補完できない ``run_command`` を ``tool_needed=False`` に格下げ.
-
-        ``_suppress_unfetchable_fetch_url`` と対称。rule / learned 層は字句
-        マッチだけで ``run_command`` を選ぶことがあり (learned 層は
-        ``_infer_tool`` が推定できない場合の run_command フォールバックを持つ)、
-        ルール層のコマンド解決でも command が
-        埋まらなかった場合、実行段階で "requires args but none provided" と
-        空振りするだけの判定が残る。実インシデント (2026-07-20 ライブ検証):
-        学習済み tool_routing パターン「説明」(w=0.630) が知識質問
-        「〜を説明して」にマッチし、create モードで引数なし run_command が
-        返り得た (chat モードは run_command の mode ゲートで偶然無害化されて
-        いた)。ここで no_tool に倒し、クエリを通常の LLM 応答パスに落とす。
-        """
-        if not result.tool_needed or result.tool_name not in (
-            "run_command", "run_command_readonly",
-        ):
-            return result
-        if (result.tool_args or {}).get("command"):
-            return result
-        logger.info(
-            "Suppressing %s with no command argument (no rule "
-            "inference, no aux synthesis); downgrading to no_tool",
-            result.tool_name,
-        )
-        return ToolJudgement(
-            tool_needed=False,
-            tool_name="",
-            tool_args={},
-            source=result.source,
-        )
+        self, result: ToolJudgement,
+    ) -> ToolJudgement:
+        """ガード ``commandless_run_command`` を単体で掛ける。"""
+        return guards._suppress_commandless_run_command(result, GuardContext())
 
     def _suppress_hidden_tool_from_aux(
-        self, result: "ToolJudgement", tools_registry: ToolsRegistry,
-    ) -> "ToolJudgement":
-        """提示していない hidden ツール名が返された場合 no_tool に格下げ.
-
-        hidden ツール (run_command_readonly 等) はプロンプトのツール一覧
-        (``get_descriptions_text``) に出ないため、それを見て判定したモデルが
-        その名前を返すのは定義上 hallucination。``_validate_tool_availability``
-        は登録済み + mode 適合なら通してしまう (chat で modes=["chat"] の
-        hidden ツールは素通り) ため、free-form 判定層の防衛としてここで弾く。
-        judge のコード側注入経路 (early-return / recall / fallback /
-        _infer_tool) は本メソッドを通らないため影響しない。
-
-        **hidden ツールを提示した経路には掛けない** (``_finalize`` の
-        ``hidden_tools_offered``)。文法制約ツール分類は enum に hidden も
-        載せるので、そこで選ばれた名前は hallucination ではない。
-        """
-        if not result.tool_needed or not result.tool_name:
-            return result
-        tool_def = tools_registry.get(result.tool_name)
-        if tool_def is None or not tool_def.hidden:
-            return result
-        logger.warning(
-            "Suppressing hidden tool %s: it was not in the tool list shown to "
-            "the model (source=%s); downgrading to no_tool",
-            result.tool_name, result.source,
+        self, result: ToolJudgement, tools_registry: ToolsRegistry,
+    ) -> ToolJudgement:
+        """ガード ``hidden_tool_from_aux`` を単体で掛ける。"""
+        return guards._suppress_hidden_tool_from_aux(
+            result, GuardContext(tools_registry=tools_registry),
         )
-        return ToolJudgement(tool_needed=False, source=result.source)
 
     def _suppress_expressionless_calculate(
-        self, result: "ToolJudgement",
-    ) -> "ToolJudgement":
-        """expression 引数を補完できない ``calculate`` を ``tool_needed=False`` に格下げ.
-
-        ``_suppress_commandless_run_command`` と対称。rule / learned 層の
-        ``_infer_tool`` は「計算」の字句マッチだけで calculate を選ぶが式抽出
-        ロジックを持たず常に空 args を返し、aux 層も free-form args のため
-        ``{"tool": "calculate", "args": {}}`` があり得る。実行段の必須引数
-        チェックで "requires args but none provided" と空振りするだけの判定が
-        残る。実インシデント (2026-07-21 ライブ検証 ターン35):
-        「フィボナッチ数列の10番目を計算して」が rule 層で ``calculate, {}``
-        になり WARN + UI 空ステップ (running フレームのみで完了フレーム無し)。
-        ここで no_tool に倒し、クエリを通常の LLM 応答パスに落とす
-        (格下げ後の応答は LLM 知識で正解した実測あり)。
-        """
-        if not result.tool_needed or result.tool_name != "calculate":
-            return result
-        if (result.tool_args or {}).get("expression"):
-            return result
-        logger.info(
-            "Suppressing calculate with no expression argument; "
-            "downgrading to no_tool",
-        )
-        return ToolJudgement(
-            tool_needed=False,
-            tool_name="",
-            tool_args={},
-            source=result.source,
-        )
+        self, result: ToolJudgement,
+    ) -> ToolJudgement:
+        """ガード ``expressionless_calculate`` を単体で掛ける。"""
+        return guards._suppress_expressionless_calculate(result, GuardContext())
 
     def _suppress_ungrounded_calculate(
         self,
-        result: "ToolJudgement",
+        result: ToolJudgement,
         query: str,
         conversation: list[dict] | None,
-    ) -> "ToolJudgement":
-        """クエリにも会話にも無い数値を含む ``calculate`` を no_tool へ格下げ.
-
-        層5.2 (``_judge_with_calculate_fallback``) は合成式へ
-        ``_synthesized_expression_grounded`` を掛けて捏造数値を弾くが、層4
-        (aux ``tool_judgment``) には同じ検証が無く、素通りしていた。ツールの
-        戻り値は「確かめた事実」として base に最優先で渡されるため、捏造された
-        式の結果は **正しく計算された嘘** になり、素の暗算より有害になる
-        (実インシデント 2026-07-29 ライブ監査: 「本当にそれで合っていますか？
-        計算を見直してください。」に対し aux が ``57.8 - 4 * 1.5`` を合成。
-        ``1.5`` はクエリにも会話にも無く、結果 51.8 が「正解」として提示された。
-        正しくは ``57.8 - 4 * 3.4`` = 44.2)。
-
-        格下げ後は後続層 (5.2) がグラウンディング検証付きで式を組み直す機会を
-        得るため、計算そのものを諦めることにはならない。
-
-        ホワイトリストには層5.2 の直近 4 ターンではなく **判定に渡された会話
-        全体** を使う。層5.2 は式を *合成* するので狭い窓で捏造の余地を絞るのが
-        正しいが、こちらは既に選ばれた式を *拒否* するだけなので、窓を狭めると
-        「その距離を時速12キロで…」のような照応で数ターン前の数値を参照した
-        正当な式まで巻き込む。捏造の信号 (会話のどこにも無い数値) は広い窓でも
-        変わらず立つ。
-        """
-        if not result.tool_needed or result.tool_name != "calculate":
-            return result
-        expression = str((result.tool_args or {}).get("expression") or "")
-        if not expression:
-            return result
-        context = _dialogue_text(conversation)
-        unexplained = _ungrounded_numbers(expression, query, context)
-        if not unexplained:
-            return result
-        # 格下げが正当なのは、式を組み直す層が実際に走れるときだけ。その層
-        # (旧 5.2 の式合成) は撤去済みなので、格下げの落ち先は base の暗算に
-        # なる。実測では暗算のほうが誤答しやすく、しかも式が見えないぶん
-        # 誤りに気づけない (2026-08-08 以降のライブ監査で 4 回連続。いずれも
-        # 「式は正しかったのに 1 つの数値が書かれていない」ケースで、
-        # 42.195*5.5 / 3*52 / 8*5*(18-9)*2 などが棄却された)。式は残し、
-        # 説明できない数値を回答側で開示させる。
-        logger.info(
-            "Keeping calculate with unexplained numbers %s in %r; "
-            "the answer must disclose them",
-            list(unexplained), expression[:80],
+    ) -> ToolJudgement:
+        """ガード ``ungrounded_calculate`` を単体で掛ける。"""
+        return guards._suppress_ungrounded_calculate(
+            result, GuardContext(query=query, conversation=conversation),
         )
-        return replace(result, unexplained_numbers=unexplained)
 
     def _suppress_ungrounded_read_path(
         self,
-        result: "ToolJudgement",
+        result: ToolJudgement,
         query: str,
         conversation: list[dict] | None,
-    ) -> "ToolJudgement":
-        """クエリにも会話にも現れないパスの読み取りツールを no_tool へ格下げ.
-
-        層4 (aux ``tool_judgment``) は「ファイルの金額を合計して」のような
-        パスを含まないタスクに対しても read 系ツールを選び、``file_path`` を
-        でっち上げることがある。捏造パスの読み取りは構造的に必ず失敗するか、
-        最悪の場合まったく別のファイルを読むため、実行する価値が無い
-        (実インシデント 2026-07-29 ライブ監査: 「合計を計算して / 中身も
-        見せて」という 2 サブタスクが ``read_file(prices.txt)`` と
-        ``read_file(unknown)`` になり、直前ステップで内容は取れていたのに
-        「1 件のタスクを完了し、2 件が失敗しました。」だけが返った)。
-
-        格下げすると後続層およびツールループが、パスを持たないタスクとして
-        扱い直す機会を得る。書込み系は対象外 — 出力先の既定解決 (
-        ``_resolve_write_path`` 等) が別途あり、パス未指定の生成依頼を
-        巻き込むため。
-        """
-        if not result.tool_needed or result.tool_name not in _READ_PATH_TOOLS:
-            return result
-        args = result.tool_args or {}
-        path = str(
-            args.get("file_path") or args.get("path") or args.get("directory") or "",
-        )
-        if not path:
-            return result
-        haystack = _normalize_path_text(f"{query}\n{_dialogue_text(conversation)}")
-        if _normalize_path_text(path) in haystack:
-            return result
-        # ドライブ / ディレクトリ表記の揺れを許すためベース名でも照合する。
-        basename = _normalize_path_text(PurePosixPath(path.replace("\\", "/")).name)
-        if basename and basename in haystack:
-            return result
-        logger.info(
-            "Suppressing ungrounded %s path %r (absent from query and dialogue); "
-            "downgrading to no_tool", result.tool_name, path[:120],
-        )
-        return ToolJudgement(
-            tool_needed=False,
-            tool_name="",
-            tool_args={},
-            source=result.source,
+    ) -> ToolJudgement:
+        """ガード ``ungrounded_read_path`` を単体で掛ける。"""
+        return guards._suppress_ungrounded_read_path(
+            result, GuardContext(query=query, conversation=conversation),
         )
 
     async def _judge_with_url_recall(
@@ -4027,577 +2133,6 @@ class ToolCallJudge:
             content[:100],
         )
         return ToolJudgement(tool_needed=False, source="llm")
-
-
-def _infer_executable_command(query: str) -> str:
-    """executable query パターンから具体的な Python コマンドを生成する
-
-    _EXECUTABLE_QUERY_COMMANDS の各パターンを順に照合し、
-    最初にマッチしたコマンドを返す。
-    マッチしない場合（数値処理・データ処理等）は空文字列を返す。
-
-    Returns:
-        生成されたシェルコマンド。該当なしの場合は空文字列。
-    """
-    for pattern, command in _EXECUTABLE_QUERY_COMMANDS:
-        if pattern.search(query):
-            if callable(command):
-                return command(query)
-            return command
-    return ""
-
-
-def _extract_search_pattern(query: str) -> str:
-    """クエリから検索パターンを抽出する
-
-    「検索」「search」等のキーワード自体を除外し、
-    実際の検索対象となる語句を返す。
-
-    例:
-        "関数名 hello を検索して" → "hello"
-        "search for parse_config" → "parse_config"
-        "grep pattern" → "pattern"
-    """
-    # バッククォート内のパターン
-    m = re.search(r'`([^`]+)`', query)
-    if m:
-        return m.group(1)
-
-    # 引用符内のパターン
-    m = re.search(r'[「"\'](.*?)[」"\']', query)
-    if m:
-        return m.group(1)
-
-    # 検索/search/grep/find 等を除去した残りからキーワードを抽出
-    cleaned = re.sub(
-        r"(?:を|で|して|する|しろ|で検索|を検索|検索して|検索する"
-        r"|search\s+(?:for|in)|grep|find|検索)",
-        " ", query,
-    )
-    # 英数字・アンダースコアで構成されるトークンを探す
-    tokens = re.findall(r"[A-Za-z_]\w{2,}", cleaned)
-    if tokens:
-        return tokens[0]
-
-    return ""
-
-
-# ディレクトリパス抽出用: ドライブレター配下のパスセグメントを解析する。
-# 各セグメントは「\」直後が非空白文字で始まる前提とする
-# (``[A-Za-z0-9_.]`` から開始し、内部は空白を含んでよい)。
-# 「...\aa\ with the content」のように、ディレクトリ指定の直後に自然文
-# (英語の説明文) が「\」+ 空白で続くケースを誤ってパスセグメントとして
-# 飲み込まないための境界条件 (#incident: 日本語ファイル名クエリで
-# planner が生成した英語タスク記述の一部がパスに混入した)。
-# 実在の Windows パスでバックスラッシュ直後が空白になることはない
-# ("Program Files" のようにセグメント内部に空白を含むのは許容する)。
-#: ドライブレター付きパスの区切り。Windows はスラッシュ区切りも等価に受け付け、
-#: ユーザーもツール出力もそちらを書く。バックスラッシュ限定にしていたため
-#: ``E:/tmp/a.txt`` が 1 つも抽出できず、ルール層が read_file を選べないまま
-#: aux 層へ落ちていた (実インシデント 2026-08-04 ライブ監査: 同じ依頼が
-#: read_file / search_history / ツール未発火に割れる原因)。
-_DIR_PATH_RE = re.compile(
-    r"([A-Za-z]:(?:[\\/][A-Za-z0-9_.][A-Za-z0-9_. -]*)*)",
-)
-
-# クォート文字の対応表（開き, 閉じ）。ファイル名の語幹 (拡張子直前) が
-# 日本語等の非ASCIIの場合に、明示的にクォートされたファイル名を抽出する
-# 際に使う。
-_QUOTE_PAIRS: tuple[tuple[str, str], ...] = (
-    ('"', '"'), ("'", "'"), ("「", "」"), ("『", "』"),
-)
-
-
-def _extract_quoted_filename(query: str) -> str | None:
-    """クォートで明示的に囲まれたファイル名を抽出する（非ASCII語幹対応）。
-
-    ``[A-Za-z0-9_-]+\\.ext`` 前提の ASCII 限定パターンでは、「テスト.docx」の
-    ように拡張子直前が日本語等の非ASCIIだと一切マッチしない。クォートで
-    明示されていれば語幹の文字種を問わず抽出する（クォート無しの非ASCII
-    語幹は文中の地の文と区別できず誤検出リスクが高いため対象外）。
-    """
-    for open_q, close_q in _QUOTE_PAIRS:
-        m = re.search(
-            re.escape(open_q)
-            + r"([^\n" + re.escape(open_q) + re.escape(close_q) + r"]{1,200}"
-            r"\.[A-Za-z0-9]{1,10})"
-            + re.escape(close_q),
-            query,
-        )
-        if m:
-            return m.group(1).strip()
-    return None
-
-
-#: 「同じファイルに」「そのファイルを」等、保存先を直前の文脈に委ねる表現。
-#: ``さきほど`` (ひらがな) は 2026-08-09 に追加。``先ほど`` / ``さっき`` しか
-#: 無く、「さきほど作った notes.txt に追記して」が参照表現として認識されず
-#: 書込みが 1 度も走らないまま完了を捏造していた。
-_REFERENTIAL_TARGET_RE = re.compile(
-    r"(?:同じ|その|この|先ほどの?|さきほどの?|さっきの?)\s*(?:ファイル|ところ|場所)"
-    r"|保存し直|上書き|書き直して保存|同じ場所に"
-    r"|\b(?:same|that)\s+file\b|\boverwrite\b",
-    re.IGNORECASE,
-)
-#: 保存/書き出しを求める動詞 (パス無しの参照依頼を拾うための最小集合)。
-#: ``追記`` / ``書き足`` / ``書[きい]て`` は 2026-08-09 に追加 (実インシデント:
-#: 「そのファイルの末尾に追記して書いて」が保存動詞として認識されなかった)。
-_REWRITE_VERB_RE = re.compile(
-    r"保存|書き込|書き出|書き足|追記|上書き|セーブ|書[きい]て"
-    r"|\bsave\b|\bwrite\b|\bappend\b|\boverwrite\b",
-    re.IGNORECASE,
-)
-#: パス区切りを含むか (ドライブ接頭辞 / スラッシュ / バックスラッシュ)。
-#: 含まない = 裸のファイル名で、書込み先としては **どのディレクトリか未確定**。
-_PATH_SEPARATOR_RE = re.compile(r"[\\/]")
-
-
-def _resolve_referenced_path(
-    query_path: str | None, conversation: list[dict] | None,
-) -> str | None:
-    """書込み/読取の対象パスを会話から解決する (純粋関数)。
-
-    ``query_path`` の状態で 3 通りに分かれる:
-
-    - ディレクトリを含む絶対/相対パス → そのまま採用 (解決不要)
-    - 裸のファイル名 (``notes.txt``) → 会話に **同じ basename** の
-      フルパスがあればそれを採用。無ければ ``None``
-    - ``None`` / 空 (「そのファイル」型) → 会話で最後に出たパスを採用
-
-    裸のファイル名をそのままツールへ渡すとカレントディレクトリに着地して
-    しまい、ユーザーが指した既存ファイルとは別物を作る。会話で確定している
-    場合のみ解決し、確定できなければ ``None`` を返して後続層に委ねる
-    (推測でパスを埋めない)。
-    """
-    if query_path and _PATH_SEPARATOR_RE.search(query_path):
-        return query_path
-    want = (query_path or "").strip().lower() or None
-    for msg in reversed(list(conversation or [])):
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get("content")
-        if not isinstance(content, str):
-            continue
-        path = _extract_file_path(content)
-        if not path or not _PATH_SEPARATOR_RE.search(path):
-            continue
-        if want and _PATH_SEPARATOR_RE.split(path)[-1].lower() != want:
-            continue
-        return path
-    return None
-
-
-def _referential_rewrite_judgement(
-    query: str, conversation: list[dict] | None, tools_registry: ToolsRegistry,
-) -> "ToolJudgement | None":
-    """「同じファイルに保存し直して」型の依頼を write_file に確定させる。
-
-    保存動詞があり、かつ書込み先がクエリだけでは確定しない (参照表現、または
-    ディレクトリを伴わない裸のファイル名) 場合に、直近の会話からパスを引いて
-    ``write_file`` を返す。該当しない (ディレクトリ付きパスが本文にある /
-    参照も裸名も無い / 会話にパスが無い) 場合は ``None`` で後続層に委ねる。
-    純粋関数 (レジストリ参照のみ)。
-
-    裸のファイル名を拾うのは 2026-08-09 のライブ監査で判明した実害への対処:
-    「inventory_notes.txt に 1 行追記してください」がどの層にも拾われず
-    deliberative に落ち、ツールを 1 つも撃たないまま **フルパスを補って**
-    「E:\\tmp\\inventory_notes.txt の末尾に追記しました」と報告した
-    (実ファイルは無変更)。フルパスで同じ依頼をすると正常に書き込まれており、
-    差はパス表記だけだった。
-    """
-    if not tools_registry.has("write_file"):
-        return None
-    if not _REWRITE_VERB_RE.search(query):
-        return None
-    query_path = _extract_file_path(query) or None
-    if query_path and _PATH_SEPARATOR_RE.search(query_path):
-        return None  # ディレクトリ付きパスが本文にあるなら通常のルール層で足りる
-    if not query_path and not _REFERENTIAL_TARGET_RE.search(query):
-        return None
-    path = _resolve_referenced_path(query_path, conversation)
-    if not path:
-        return None
-    logger.info(
-        "Referential rewrite: resolved target from conversation: %s "
-        "(query_path=%r)", path, query_path,
-    )
-    return ToolJudgement(
-        tool_needed=True,
-        tool_name="write_file",
-        tool_args={"file_path": path},
-        source="rule",
-    )
-
-
-#: ファイルの中身を「見せる」ことを求める表現。read_file を撃たずに答えると
-#: 記憶から再構成した偽の内容を「ファイルの中身」として提示する
-#: (2026-08-09 ライブ監査: 追記直後の「全文をそのまま見せて」で 3 行とも実
-#: ファイルと不一致、しかも同一セッション内の誤答が中身として混入した)。
-_FILE_CONTENT_DISPLAY_RE = re.compile(
-    r"(?:全文|中身|内容|そのまま|中身をそのまま)"
-    r".{0,20}?(?:見せ|表示|出して|教えて|確認)"
-    r"|(?:見せ|表示).{0,10}?(?:全文|中身|内容)"
-    r"|\bshow\s+(?:me\s+)?(?:the\s+)?(?:full\s+)?(?:content|contents|file)\b"
-    r"|\b(?:display|print)\s+(?:the\s+)?(?:content|contents|file)\b",
-    re.IGNORECASE,
-)
-#: 「ファイル」を指す語。表示要求が **ファイルに関するもの** かの絞り込みに使う。
-_FILE_NOUN_RE = re.compile(r"ファイル|\bfile\b", re.IGNORECASE)
-
-#: ファイルの計測値 (行数・文字数・サイズ) を尋ねる表現。``read_file`` の結果には
-#: ``lines`` / ``chars`` のメタ行が付くので、読めば決定論で答えられる。撃たないと
-#: モデルが数値を捏造する — しかも **正解が直前ターンに出ていても**捏造する
-#: (実インシデント 2026-08-10 ライブ監査: 直前の read_file 出力に
-#: ``lines: 10 | chars: 411`` と表示されていたのに「12 行、357 文字」と答えた)。
-_FILE_METRICS_RE = re.compile(
-    r"(?:行数|文字数|バイト数|何行|何文字|ファイルサイズ)"
-    r"|\b(?:line|character|byte|word)\s*count\b"
-    r"|\bhow\s+many\s+(?:lines|characters|bytes|words)\b",
-    re.IGNORECASE,
-)
-
-
-def _referential_read_judgement(
-    query: str, conversation: list[dict] | None, tools_registry: ToolsRegistry,
-) -> "ToolJudgement | None":
-    """「そのファイルの全文を見せて」型の依頼を read_file に確定させる。
-
-    ``_referential_rewrite_judgement`` の読取版。書込み側と同じく、対象が
-    クエリだけでは確定しない (参照表現 / 裸のファイル名) 場合に会話から
-    パスを引く。ディレクトリ付きパスが本文にあるなら通常のルール層で足りる。
-
-    ファイル名詞または参照表現を要求するので、「さっきの説明の中身を見せて」の
-    ような非ファイルの表示要求は拾わない。純粋関数 (レジストリ参照のみ)。
-    """
-    if not tools_registry.has("read_file"):
-        return None
-    # 計測値の問い合わせも読取で決まる (read_file が lines/chars を返す)。
-    wants_metrics = bool(_FILE_METRICS_RE.search(query))
-    if not (_FILE_CONTENT_DISPLAY_RE.search(query) or wants_metrics):
-        return None
-    query_path = _extract_file_path(query) or None
-    if query_path and _PATH_SEPARATOR_RE.search(query_path):
-        return None
-    if not query_path and not (
-        _REFERENTIAL_TARGET_RE.search(query) or _FILE_NOUN_RE.search(query)
-    ):
-        return None
-    path = _resolve_referenced_path(query_path, conversation)
-    if not path:
-        return None
-    logger.info(
-        "Referential read: resolved target from conversation: %s "
-        "(query_path=%r)", path, query_path,
-    )
-    tool_args: dict = {"file_path": path}
-    # 計測は全文を読まないと数えられないので範囲指定しない。
-    head = None if wants_metrics else _extract_head_line_count(query)
-    if head is not None:
-        # ``_infer_tool`` と同じ引数形 (read_file は start/end_line を取る)。
-        tool_args["start_line"] = 1
-        tool_args["end_line"] = head
-    return ToolJudgement(
-        tool_needed=True,
-        tool_name="read_file",
-        tool_args=tool_args,
-        source="rule",
-    )
-
-
-#: 「最初の 3 行」「先頭 10 行」「first 5 lines」等、ファイル先頭からの行数指定。
-#: 全角数字も拾う (日本語入力では「３行」になりやすい)。
-_HEAD_LINES_RE = re.compile(
-    r"(?:最初|先頭|冒頭|頭|first|head|top)\D{0,6}?([0-9０-９]{1,4})\s*(?:行|lines?)",
-)
-
-#: 「このファイルは存在しますか」= 有無だけを問う質問。
-_FILE_EXISTENCE_RE = re.compile(
-    r"(?:存在し|ありますか|あるか|残ってい|消えてい|できてい"
-    r"|\bexists?\b|\bis there\b|\bstill there\b)",
-    re.IGNORECASE,
-)
-#: 本文そのものを求める語。存在確認と併記されていれば内容要求が優先される
-#: (「まだ存在しますか？先頭3行だけ見せてください」)。
-_FILE_CONTENT_REQUEST_RE = re.compile(
-    r"(?:見せ|見たい|中身|内容|読[んみむ]|表示|出力|全文|何文字|文字数|何行|行数"
-    r"|\bshow\b|\bcontent\b|\bread\b|\bdisplay\b|\bprint\b|\bdump\b)",
-    re.IGNORECASE,
-)
-
-
-def asks_file_existence_only(query: str) -> bool:
-    """ファイルの有無だけを問い、本文は求めていないか。
-
-    有無だけを聞かれているのに ``read_file`` を範囲指定なしで撃つと全文が
-    ツール結果として返り、モデルはそれを回答に丸ごと復唱する。
-
-    2026-08-16 ライブ監査ターン 14「E:\\...\\README.md というファイルは存在
-    しますか？」: 3,331 文字の全文が返り、モデルは全文の復唱を始めて
-    **ちょうど 1,024 トークン (llama.max_tokens の既定値) で表の途中で切断**
-    された。yes/no の質問に **197 秒** かけ、しかも回答は未完だった。
-
-    ``read_file`` は先頭にメタ行 ``[file: ... | lines: N | chars: M]`` を付ける
-    ので、1 行だけ読めば「存在する / 何行・何文字か」は決定論的に答えられる。
-    """
-    return bool(
-        _FILE_EXISTENCE_RE.search(query)
-        and not _FILE_CONTENT_REQUEST_RE.search(query),
-    )
-
-
-def _extract_head_line_count(query: str) -> int | None:
-    """「最初の N 行」の N を返す (指定が無ければ ``None``)。
-
-    本文全体を渡すとモデルが行数指定を守らずほぼ全文を出力するため
-    (実測 2026-08-05: NOTICE.md の「最初の 3 行」で約 1,264 文字を出力)、
-    read_file 側で切り出せるようにツール引数へ渡す。
-    """
-    m = _HEAD_LINES_RE.search(query)
-    if not m:
-        return None
-    try:
-        count = int(m.group(1).translate(_ZENKAKU_DIGITS))
-    except ValueError:
-        return None
-    return count if count > 0 else None
-
-
-#: 全角数字 → ASCII。
-_ZENKAKU_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
-
-
-def _extract_file_path(query: str) -> str:
-    """クエリからファイルパスを抽出する
-
-    日本語の自然言語テキストからファイルパスを抽出する。
-    「e:\\直下にa.txtのファイル名で...」→ 「e:\\a.txt」のように、
-    ドライブレターとファイル名を組み合わせて解釈する。
-    抽出後、連続バックスラッシュ (\\\\) をシングル (\\) に正規化する。
-    """
-    # URL はファイル名抽出の対象から除外する。URL ドメイン (例: soccer.yahoo.co.jp)
-    # が「co.jp」のようなファイル名として誤抽出されるのを防ぐ。
-    query = _URL_IN_QUERY_RE.sub(" ", query)
-
-    # 1a. 非 ASCII を含みうるフルパス: E:\tmp\日本語テスト.txt / E:/tmp/日本語.txt
-    #     ASCII 限定にすると日本語ファイル名が拡張子の手前で切れ、切り詰めた
-    #     パスがたまたま実在ディレクトリだと read_file ではなく list_directory が
-    #     選ばれ、実在するファイルを「見つからない」と答える (実測 2026-08-05)。
-    #     区切りは \ と / の双方を受ける。バックスラッシュ限定だと ``E:/tmp/a.txt``
-    #     が 1 つも抽出できず、同じ依頼が read_file / search_history / ツール
-    #     未発火に割れていた (実測 2026-08-04)。
-    #     地の文を飲み込まないための境界条件は 2 つ:
-    #       - 空白 (半角/全角) とクォートを含まない (「E:\tmp に置いた report.txt」)
-    #       - ドライブ直下ではなく 1 階層以上下 (「e:\直下にa.txtのファイル名で」)。
-    #         ドライブ直下 + 非 ASCII は地の文と構造的に区別できないため、
-    #         従来どおり Pattern 2 (ドライブ + ファイル名) に委ねる。
-    m = re.search(
-        r"[A-Za-z]:[\\/][^\s　\"'「」『』\\/]+[\\/][^\s　\"'「」『』]*\.[A-Za-z0-9]{1,10}",
-        query,
-    )
-    if m:
-        return _normalize_path_separators(m.group(0))
-
-    # 1b. 空白を含む ASCII パス: C:\Program Files\app.exe
-    #     空白を許容する代償として本体は ASCII 限定にし、地の文 (日本語) で
-    #     停止させる。区切りは 1a と同様に \ と / の双方を受ける。
-    m = re.search(r"[A-Za-z]:[\\/][A-Za-z0-9_.\\/ -]+\.[A-Za-z0-9]{1,10}", query)
-    if m:
-        return _normalize_path_separators(m.group(0).rstrip(" "))
-
-    # 2. ドライブレター + 自然言語でのファイル名指定
-    #    例: 「e:\直下にa.txtのファイル名で」→ e:\a.txt
-    #    ディレクトリとファイル名が日本語/全角スペースで分断されていても、
-    #    ディレクトリ部 (Pattern 3 と同じ捕捉) を取り出してファイル名と結合し、
-    #    サブ階層を保持する。深い階層が無い (ドライブ直下指定) 場合のみ
-    #    従来どおりドライブ直下へフォールバックする。
-    #    \w は日本語にもマッチするため ASCII 限定で検索
-    drive_match = re.search(r"([A-Za-z]):[\\/]", query)
-    file_match = re.search(r"([A-Za-z0-9_-]+\.[A-Za-z0-9]{1,10})(?=[^A-Za-z0-9_.]|$)", query)
-    # ファイル名の語幹が非ASCII (日本語等) だと file_match はマッチしない
-    # ("テスト.docx" 等)。その場合はクォートで明示されたファイル名を拾う。
-    filename = file_match.group(1) if file_match else _extract_quoted_filename(query)
-    if drive_match and filename:
-        dir_match = _DIR_PATH_RE.search(query)
-        if dir_match:
-            # セグメント内部は空白を許容するため ("Program Files" 等)、末尾に
-            # 地の文へ続く空白が巻き込まれることがある (例: "aa に保存して" の
-            # "aa " )。rstrip() で末尾空白 (全角含む) を落としてから区切りも除去。
-            # さらに英語の地の文が空白のみで続くケース ("aa in Excel format") は
-            # 実在チェックで切り落とす。
-            directory = _trim_nonexistent_path_tail(
-                _normalize_path_separators(
-                    dir_match.group(1).rstrip(),
-                ).rstrip("\\/"),
-            )
-            return f"{directory}\\{filename}"
-        return f"{drive_match.group(1)}:\\{filename}"
-
-    # 3. ディレクトリパスのみ（ファイル名なし）: E:\xxx\ や E:\xxx 等
-    #    配下のファイルを参照する文脈では、ディレクトリパスを返す。
-    #    全角スペース (U+3000) 等の Unicode 空白や文末で終端しても、
-    #    セグメント単位で解析する _DIR_PATH_RE が自然に正しい境界で止まる。
-    if drive_match:
-        dir_match = _DIR_PATH_RE.search(query)
-        if dir_match:
-            return _trim_nonexistent_path_tail(
-                _normalize_path_separators(dir_match.group(1).rstrip()),
-            )
-
-    # 4. Unix パス: /home/user/file.txt
-    m = re.search(r"(?:^|[\s　])((?:/[\w._-]+){2,})", query)
-    if m:
-        return m.group(1)
-
-    # 5. bare ファイル名 (拡張子付き): dice_roller.py / README.md / app.svelte
-    #    ドライブレターも Unix パスもない場合のフォールバック。CWD 相対として
-    #    のタスクを出したとき write_file の auto-recovery / fast-path が働くようにする。
-    #    誤検出防止のため拡張子は英字始まりに限定 (「3.12」「v1.2」等を弾く)。
-    m = re.search(
-        r"(?:^|[\s　`'\"(\[])"
-        r"([A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\.[A-Za-z][A-Za-z0-9]{0,9})"
-        r"(?=$|[\s　`'\")\].,;:!?])",
-        query,
-    )
-    if m:
-        return m.group(1)
-
-    return ""
-
-
-# --- 算術式抽出 (calculate ツールの決定論的ルーティング) ---------------------
-# 全角の数字・演算子を ASCII へ寄せる。カタカナ長音符 (ー) や罫線 (―) は
-# 日本語語中に頻出するため意図的に含めない (マイナスへ誤変換すると
-# 「コーヒー」等が式断片に見えてしまう)。
-_ARITH_NORMALIZE = str.maketrans({
-    "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
-    "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
-    "＋": "+", "－": "-", "−": "-",
-    "×": "*", "✕": "*", "＊": "*",
-    "÷": "/", "／": "/", "％": "%", "＾": "^",
-    "（": "(", "）": ")", "．": ".",
-})
-# 算術式になりうる文字だけからなる連続領域
-_ARITH_RUN_RE = re.compile(r"[0-9.+\-*/%^()\s]+")
-# 日付・バージョン番号の誤検出除け (2026-07-27 は BinOp として parse できてしまう)
-_ARITH_DATE_LIKE_RE = re.compile(
-    r"^(?:\d{4}\s*-\s*\d{1,2}\s*-\s*\d{1,2}"
-    r"|\d{1,2}\s*/\s*\d{1,2}(?:\s*/\s*\d{2,4})?)$",
-)
-# 「式の値を求めている」ことの手掛かり。式だけが裸で書かれた場合は不要。
-_ARITH_REQUEST_CUE_RE = re.compile(
-    r"(?:いくつ|いくら|答え|計算|求め|何になる|=|＝"
-    r"|(?<![A-Za-z])calculate(?![A-Za-z])|(?<![A-Za-z])compute(?![A-Za-z])"
-    r"|what\s+is|how\s+much|(?<![A-Za-z])equals?(?![A-Za-z]))",
-    re.IGNORECASE,
-)
-# 式の直後に助詞と疑問符しか残らない形 (「1+1は？」「12*34」) も計算依頼とみなす
-_ARITH_BARE_TAIL_RE = re.compile(r"^[\s　]*(?:とは|って|は|の)?[\s　]*[?？。!！]*$")
-_ARITH_SAFE_NODES = (
-    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
-    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
-    ast.USub, ast.UAdd,
-)
-
-
-def _is_numeric_expression(expression: str) -> bool:
-    """``expression`` が数値リテラルと算術演算子だけで構成されるか (純粋関数)。"""
-    try:
-        tree = ast.parse(expression, mode="eval")
-    except SyntaxError:
-        return False
-    has_operator = False
-    for node in ast.walk(tree):
-        if not isinstance(node, _ARITH_SAFE_NODES):
-            return False
-        if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
-            return False
-        if isinstance(node, ast.BinOp):
-            has_operator = True
-    return has_operator
-
-
-def _extract_arithmetic_expression(query: str) -> str:
-    """クエリに書かれた算術式を Python 構文へ正規化して返す (純粋関数)。
-
-    「1234 × 5678 はいくつですか？」のような明示的な計算依頼で ``calculate``
-    を決定論的に発火させるための抽出器。ルール層は従来「計算」の字句しか
-    見ておらず、式そのものを書かれるとツール無しで base の暗算に落ちて
-    誤答していた (実インシデント 2026-07-27 ライブ検証: 1234 × 5678 に
-    7060672 と回答。正解は 7006652)。
-
-    誤検出を避けるため、以下をすべて満たす場合のみ式を返す:
-
-    * 数値リテラルと算術演算子のみで構成され、二項演算を 1 つ以上含む
-    * 日付 (2026-07-27) / 日付表記 (7/27) ではない
-    * 値を尋ねる手掛かり語があるか、式の前に文が無く後ろも助詞・疑問符だけ
-      (「12*34」「1+1は？」のような裸の式)
-
-    Returns:
-        正規化済みの式。抽出できなければ空文字列。
-    """
-    normalized = query.translate(_ARITH_NORMALIZE)
-    for match in _ARITH_RUN_RE.finditer(normalized):
-        candidate = match.group(0).strip()
-        if not candidate or _ARITH_DATE_LIKE_RE.match(candidate):
-            continue
-        # ^ は Python では XOR。書かれた意図は冪乗なので ** へ寄せる。
-        candidate = candidate.replace("^", "**")
-        if not _is_numeric_expression(candidate):
-            continue
-        head = normalized[: match.start()]
-        tail = normalized[match.end():]
-        bare = (
-            not any(c.isalnum() for c in head)
-            and _ARITH_BARE_TAIL_RE.match(tail) is not None
-        )
-        if bare or _ARITH_REQUEST_CUE_RE.search(normalized):
-            return candidate
-    return ""
-
-
-
-
-def _normalize_path_separators(path: str) -> str:
-    """連続バックスラッシュをシングルに正規化する
-
-    LLM や JSON パース経由でパスが二重エスケープされるケースに対応。
-    例: E:\\\\xxx\\\\tetris.py → E:\\xxx\\tetris.py
-    """
-    # 連続する2つ以上の \ を1つに置換
-    return re.sub(r"\\{2,}", r"\\", path)
-
-
-def _trim_nonexistent_path_tail(path: str) -> str:
-    """実在チェックに基づき、パス末尾へ混入した自然文トークンを切り落とす。
-
-    ``_DIR_PATH_RE`` はセグメント内部の空白を許容する ("Program Files") ため、
-    LLM 生成のタスク記述がパス直後に空白 + 英語の修飾語を続けると
-    (実インシデント: ``...to C:\\...\\Desktop\\aa in Excel format``) 地の文が
-    末尾セグメントへ飲み込まれ、実在しない拡張子なしパスへの平文書込みに
-    化ける (リッチ文書経路・検証ゲートをすべてバイパス)。
-
-    捕捉パスが実在しない場合のみ、空白区切りトークンを右から 1 つずつ外し
-    ながら「実在する最長の空白境界プレフィックス」を探して返す。地の文の
-    混入は必ず空白境界で起きるため、バックスラッシュ境界では分割しない。
-    どのプレフィックスも実在しなければ原文のまま返す (新規パスの指定を
-    壊さない)。
-    """
-    try:
-        if not path or Path(path).exists():
-            return path
-    except (OSError, ValueError):
-        return path
-    candidate = path
-    while " " in candidate:
-        candidate = candidate.rsplit(" ", 1)[0].rstrip()
-        if not candidate or candidate.endswith(":"):
-            break
-        try:
-            if Path(candidate).exists():
-                return candidate
-        except (OSError, ValueError):
-            break
-    return path
 
 
 def _json_to_judgement(data: dict) -> ToolJudgement:

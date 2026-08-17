@@ -1,6 +1,6 @@
 """コンテンツ種別判定
 
-設計書 f_08_long_form_generation.md §11 準拠。
+設計書 f_08_long_form_generation.md §3.1 準拠。
 パターンマッチによるコード/テキストの自動判定。
 """
 

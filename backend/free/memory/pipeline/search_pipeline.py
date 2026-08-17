@@ -541,7 +541,7 @@ async def _maybe_recall_quality(
 
     LLM による再判定は撤去済み。実測 (2026-08-12、``op="quality_judge"`` 244 件)
     では実際に結果が変わる medium→low は全機会の 2.0% で、格下げの取り戻しより
-    誤格下げで検索結果を落とすリスクの方が大きいと判断した (docs/c_14 §1.2.6)。
+    誤格下げで検索結果を落とすリスクの方が大きいと判断した (docs/c_14 §1.2)。
     """
     aj_cfg = _resolve_quality_judge_cfg(rag_cfg)
     if quality not in aj_cfg["only_when_quality"]:

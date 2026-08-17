@@ -9,7 +9,7 @@ wire_pillars での DI を Protocol 境界に乗せる
 Protocol は duck typing で十分機能する (別実装を差し込む必要が生じたら
 将来的に実装差替を行う)
 
-設計原則 (CLAUDE.md §8 / `docs/f_02_memory_system.md` §6.5):
+設計原則 (CLAUDE.md §3 / `docs/f_02_memory_system.md` §6):
 - 最小 API 原則: 実装が実際に呼び出している API だけを宣言する
 - `@runtime_checkable`: isinstance チェックを可能にする
 - Protocol ファイルは他 pillar を import しない (最下流 pillar の不変条件)

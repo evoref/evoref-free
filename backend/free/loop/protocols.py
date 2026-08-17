@@ -9,7 +9,7 @@ Protocol として固定する。``LoopDriver`` か独立クラスが
 他 pillar (特に harness / agent) は 本 Protocol 経由に
 切り替える。
 
-設計原則 (CLAUDE.md §8 / `docs/f_02_memory_system.md` §6.5):
+設計原則 (CLAUDE.md §3 / `docs/f_02_memory_system.md` §6):
 - 最小 API 原則: Loop owner facts の書込 3 メソッドのみ
 - Mem pillar の ``SemanticFact`` を返すが、書込先ストアは
   実装側が ``store_provider`` 等で保持する想定

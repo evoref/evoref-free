@@ -19,7 +19,7 @@
 	import { loadConfig, activeTab, configLoaded, configLoadError } from '$lib/free/stores/settings';
 
 	/** タブID → コンポーネントのレジストリ
-	 * `--develop=<level>` の SSOT に集約された (詳細 docs/f_06_cli.md §18)。
+	 * `--develop=<level>` の SSOT に集約された (詳細 docs/f_06_cli.md §6)。
 	 */
 	const TAB_COMPONENTS: Record<string, Component> = {
 		general: GeneralSettings,

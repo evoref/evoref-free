@@ -69,7 +69,7 @@ async def switch_prompt_locale(
     save_config_section("i18n", i18n_section)
 
     # 優先 Level 1 再学習を優先キューへ push
-    # f_04 §5.4 に従い、`prompt_locale_switch` 理由で relax_ratio=0.5 を要求する。
+    # f_04 §4.2 に従い、`prompt_locale_switch` 理由で relax_ratio=0.5 を要求する。
     # キューは永続化されるため LLM 未接続でも次回 tick で実行される。
     triggered = False
     queue_length = 0

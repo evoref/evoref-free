@@ -679,7 +679,7 @@ class LearningScheduler:
         )
 
     def cancel(self, *, graceful: bool = True) -> None:
-        """学習を中断する（f_04 §8.3）
+        """学習を中断する（f_04 §7.1）
 
         Args:
             graceful: True (デフォルト) の場合、_yield_event を立てるだけで
@@ -704,7 +704,7 @@ class LearningScheduler:
     # ── 協調 yield 用ヘルパー ────────
 
     def should_yield(self) -> bool:
-        """Evolver から呼ばれる協調 yield 判定（f_04 §8.2）
+        """Evolver から呼ばれる協調 yield 判定（f_02 §4.3）
 
         以下のいずれかが True なら yield すべきと返す:
         - _yield_event が立っている（cancel/ユーザー入力）
@@ -1439,7 +1439,7 @@ class LearningScheduler:
         ベースモデルのモード別プロンプト進化
         補助タスクのタスク別プロンプト進化（Pro 以上, §7.1.2）
         エンベッド検索指示プロンプト進化（f_04 §4.2）
-        トークン予算比率進化（f_09 §12）
+        トークン予算比率進化（f_04 §4）
         パターン重み進化
         生成パラメータ進化
         ツール誘導パターン重み進化
@@ -1753,7 +1753,7 @@ class LearningScheduler:
         results: dict[str, dict],
         phase_durations: dict[str, float],
     ) -> None:
-        """トークン予算比率進化（f_09 §12）"""
+        """トークン予算比率進化（f_04 §4）"""
         if self._cancelled:
             return
 
@@ -2284,7 +2284,7 @@ class LearningScheduler:
             "total": store.count,
         }
 
-    # ── トークン予算比率進化（f_09 §12）──
+    # ── トークン予算比率進化（f_04 §4）──
 
     async def _evolve_token_budget(
         self, experiences: list[dict],
@@ -2349,7 +2349,7 @@ class LearningScheduler:
     def _calc_budget_fitness(
         self, ratios: dict, experiences: list[dict],  # noqa: ARG002
     ) -> float:
-        """品質 × 効率のフィットネス（f_09 §12.5）"""
+        """品質 × 効率のフィットネス（f_04 §4）"""
         if not experiences:
             return 0.5
 

@@ -385,7 +385,7 @@ async def collect_pending_conflicts(
     """このターンで提示する pending 競合を集める。
 
     ユーザー回答の LLM 判定は撤去済み。pending は sleep-time の
-    ``conflict_resolution`` と TTL 自動解決に委ねる (docs/c_14 §1.2.5)。
+    ``conflict_resolution`` と TTL 自動解決に委ねる (docs/c_14 §1.2)。
     本関数は注入用の pending グループを収集するだけで、SemMem へは書かない。
 
     ゲート:

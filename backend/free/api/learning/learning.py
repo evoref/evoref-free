@@ -91,7 +91,7 @@ async def trigger_learning(req: TriggerRequest, state: AppState = Depends(get_ap
     # LLM ステージのクライアントは通常のスケジュール経路 (scheduler.py の
     # Trigger B) と同じ ``resolve_sleep_client()`` で解決する
     # (sleep-time はベースモデルで実行する)。
-    # どちらも未接続なら run_full を呼ばず Step 5.8-10 をスキップする (c_14 §6.2)。
+    # どちらも未接続なら run_full を呼ばず Step 5.8-10 をスキップする (c_14 §6)。
     if req.level == "full":
         sleep_sched = state.sleep_scheduler
         if sleep_sched is not None and sleep_sched._worker is not None:
