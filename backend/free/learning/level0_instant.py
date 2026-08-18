@@ -69,6 +69,21 @@ class FeedbackSignals:
     # 検出されていなかった)。
     assistant_self_retraction: bool = False
     perplexity: float | None = None
+    # ── コストシグナル (2026-08-18 配線) ──
+    # 「取得件数・予算を増やすほど品質指標が上がる」単調パラメータは、代償が
+    # fitness に現れない限り最適化器が必ず制約の端まで膨らませる。実際に
+    # search.top_k は上限を 50→10 へ切る対症療法が入り、long_form の
+    # unit_target_tokens は下限を 128→512 に上げている。恒久的な対処には
+    # コストを観測項として持つ必要があるため、既に一次情報が取れている 3 つを
+    # 記録する。
+    #
+    # completion_tokens は生成トークン数 (呼出側が既に保持している厳密値)。
+    # prompt_tokens / cached_prompt_tokens は llama-server の usage 由来で、
+    # 再プリフィル量 = prompt_tokens - cached_prompt_tokens。取得不能な構成では
+    # いずれも None (0 ではない = 「計測できなかった」と「消費ゼロ」を区別する)。
+    completion_tokens: int | None = None
+    prompt_tokens: int | None = None
+    cached_prompt_tokens: int | None = None
     # 長文生成シグナル
     long_form_used: bool = False
     long_form_content_type: str | None = None    # "code" | "text"

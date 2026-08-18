@@ -28,6 +28,34 @@ logger = get_logger("api.chat.recorder")
 # ルーティング誤り (long_form_success の判定材料)。
 _DOC_TARGET_EXT_RE = re.compile(r"\.(?:md|txt|csv)\b", re.IGNORECASE)
 
+def read_llama_prompt_tokens(state: AppState) -> tuple[int | None, int | None]:
+    """直近ストリームの ``(prompt_tokens, cached_prompt_tokens)`` を返す。
+
+    llama-server の ``usage.prompt_tokens_details.cached_tokens`` を
+    :class:`~backend.free.llm.local_client.LocalLLMClient` が ``_last_timings``
+    (``prompt_n`` = 再評価分 / ``cache_n`` = 再利用分) へ畳んでいる。
+    ``prompt_tokens`` はその合計。
+
+    **プロンプト側コストの唯一の一次情報**なので読み手をここに集約する
+    (``requests.jsonl`` の timing 畳み込みと Level 0 の経験記録の両方が使う)。
+    取得できない構成 (クライアント未接続 / usage 非対応) では ``(None, None)``
+    を返し、呼出側は「消費ゼロ」ではなく「未計測」として扱う。
+
+    注意: クライアント単位の直近値なので、並行チャット中は別ターンの値を読み
+    うる。既存の timing 畳み込みが元から持っていた制約と同じで、個々のターンの
+    厳密値ではなく統計量としての利用を前提とする。
+    """
+    client = getattr(getattr(state, "gen", None), "llm_client", None)
+    timings = getattr(getattr(client, "local", client), "_last_timings", None)
+    if not isinstance(timings, dict):
+        return None, None
+    prompt_n = timings.get("prompt_n")
+    cache_n = timings.get("cache_n")
+    if not isinstance(prompt_n, int) or not isinstance(cache_n, int):
+        return None, None
+    return prompt_n + cache_n, cache_n
+
+
 def is_content_type_mismatch(metrics: dict, user_query: str) -> bool:
     """文書拡張子への出力依頼なのに ``content_type=code`` を返したか。
 
@@ -353,12 +381,16 @@ def record_response(
         try:
             # 同一ターンの明確な失敗 = ツールをルーティングしたが失敗 → false_positive。
             tool_fp = tool_command is not None and tool_command_success is False
+            prompt_tokens, cached_tokens = read_llama_prompt_tokens(state)
             fc.record(
                 query=user_query, response=full_response, mode=mode,
                 tool_routing_success=tool_routing_success,
                 tool_routing_false_positive=tool_fp,
                 cartridge_ids=_loaded_cartridge_ids(state),
                 rag_used=rag_used, rag_top1_score=rag_top1_score,
+                completion_tokens=tokens_generated,
+                prompt_tokens=prompt_tokens,
+                cached_prompt_tokens=cached_tokens,
             )
         except Exception as e:
             logger.warning("FeedbackCollector.record failed: %s", e)
@@ -419,6 +451,7 @@ def record_meta_cognitive_response(
                 {"step_index": c.step_index, "action": c.action, "credit": c.credit}
                 for c in step_credits
             ] if step_credits else []
+            prompt_tokens, cached_tokens = read_llama_prompt_tokens(state)
             fc.record(
                 query=user_query,
                 response=full_response,
@@ -430,6 +463,9 @@ def record_meta_cognitive_response(
                 tool_routing_false_positive=tool_routing_false_positive,
                 cartridge_ids=_loaded_cartridge_ids(state),
                 step_credits=credits_dicts,
+                completion_tokens=tokens_generated,
+                prompt_tokens=prompt_tokens,
+                cached_prompt_tokens=cached_tokens,
             )
         except Exception as e:
             logger.warning("FeedbackCollector.record failed (meta-cognitive): %s", e)
@@ -486,6 +522,7 @@ def record_long_form_response(
             units_completed = int(metrics.get("units_completed", 0) or 0)
             validation_errors = int(metrics.get("validation_errors", 0) or 0)
             long_form_success = judge_long_form_success(metrics, user_query)
+            prompt_tokens, cached_tokens = read_llama_prompt_tokens(state)
 
             fc.record(
                 query=user_query,
@@ -510,6 +547,9 @@ def record_long_form_response(
                 cartridge_ids=_loaded_cartridge_ids(state),
                 rag_used=rag_used,
                 rag_top1_score=rag_top1_score,
+                completion_tokens=tokens_generated,
+                prompt_tokens=prompt_tokens,
+                cached_prompt_tokens=cached_tokens,
             )
         except Exception as e:
             logger.warning("FeedbackCollector.record failed (long-form): %s", e)
