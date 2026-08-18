@@ -109,8 +109,18 @@ async def prepare_memory_context(
                 "Session switch detected: %s -> %s, clearing WorkingMemory",
                 old_session_id, req.session_id,
             )
-            drain_evicted_to_stm(wm, stm, old_session_id)
+            # ``clear()`` を **先に** 実行してから drain する (f_02 §1.2 経路 (b))。
+            # 逆順だと drain が拾えるのは「窓超過で既に押し出された分」だけで、
+            # ``clear()`` が積んだ会話本体は次ターンの
+            # ``drain_evicted_to_stm`` まで滞留する。そちらは現在の
+            # ``session_id`` を渡すため、旧セッションのターンが **新しい**
+            # セッション ID で STM に吸収され帰属がずれていた。
+            # 先に clear すれば、窓超過分と会話本体を 1 回の drain で、
+            # かつ正しい旧セッション ID で吸収できる。
+            # プロセス終了時の flush (factory/_lifespan.py `_shutdown_wm_flush`)
+            # も clear → flush の順で、これで両経路が揃う。
             wm.clear()
+            drain_evicted_to_stm(wm, stm, old_session_id)
             wm.session_id = req.session_id
             # 旧セッションの蓄積データをクリーンアップ（メモリ解放）
             clear_session_data(old_session_id)

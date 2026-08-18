@@ -2292,6 +2292,15 @@ async def _build_mem_pillar(
         # bg_task wrapper の outcome.jsonl 記録のため debug_logger を注入
         sleep_scheduler = SleepTimeScheduler(cfg, debug_logger=debug_logger)
         state.sleep_scheduler = sleep_scheduler
+        # Full 実行の直前に WM → STM スナップショットを走らせる
+        # (f_02 §1.2 経路 (c) / §4.3)。押し出しが起きていない進行中セッション
+        # では、これが Step 8 抽出への唯一の供給経路になる。吸収処理
+        # (エコー落とし) は api 層にあるため、mem pillar からは注入で受ける。
+        from backend.free.api.chat.chat_recorder import snapshot_wm_to_stm
+
+        sleep_scheduler.set_pre_full_flush(
+            lambda: snapshot_wm_to_stm(wm, stm, wm.session_id or ""),
+        )
 
     from backend.pillars import MemPillar
     return MemPillar(

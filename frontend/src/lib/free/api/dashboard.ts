@@ -216,4 +216,6 @@ export interface LoRAVersion {
 	name: string;
 	date: string;
 	current: boolean;
+	/** スナップショットの実バイト数 (不明時は null)。日時と併せて表示する */
+	sizeBytes?: number | null;
 }

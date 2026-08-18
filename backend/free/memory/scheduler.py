@@ -118,6 +118,9 @@ class SleepTimeScheduler:
         self._level1_loop_task: asyncio.Task | None = None
         self._level2_loop_task: asyncio.Task | None = None
         self._worker = None  # SleepTimeWorker, set via set_worker()
+        #: Full 実行の直前に WM → STM のスナップショットを行うコールバック
+        #: (f_02 §1.2 経路 (c))。api 層が注入する。未設定なら no-op。
+        self._pre_full_flush = None
         self._llm_client = None  # LocalClient for Full mode
         self._learning_scheduler = None  # LearningScheduler for Level 1/2
         self._lora_path = None  # Path to LoRA adapter for Level 2
@@ -190,6 +193,20 @@ class SleepTimeScheduler:
         self._learning_scheduler = scheduler
         if scheduler is not None:
             scheduler.set_user_active_checker(self.is_user_active)
+
+    def set_pre_full_flush(self, callback) -> None:
+        """Full 実行の直前に走らせる WM → STM スナップショットを登録する。
+
+        f_02 §1.2 経路 (c) / §4.3。sleep-time Step 8 の入力は STM ノートだが、
+        窓に収まる長さの会話は押し出しが起きず、セッションが終わるまで STM
+        ノートを 1 件も生まない。その状態で Full が走ると入力が空のまま
+        ``facts_extracted=0`` になる。
+
+        WM は mem pillar のものだがエコー落とし規則を持つ吸収処理は api 層に
+        あるため、``set_user_active_checker`` と同じく **注入** で受け取り、
+        mem pillar から api 層へ依存しない。
+        """
+        self._pre_full_flush = callback
 
     def set_lora_path(self, path) -> None:
         """Level 2 で使用する LoRA アダプタパスを設定"""
@@ -395,6 +412,23 @@ class SleepTimeScheduler:
         except Exception:
             return False
 
+    def _run_pre_full_flush(self) -> None:
+        """``set_pre_full_flush`` で注入された WM → STM 転送を実行する。
+
+        未設定なら no-op。例外は握って警告に留める — スナップショットは Full の
+        入力を増やすための最適化であり、失敗しても既存 STM ノートに対する
+        Full は成立するため、ここで中断すると縮退幅が広がりすぎる。
+        """
+        if self._pre_full_flush is None:
+            return
+        try:
+            self._pre_full_flush()
+        except Exception as exc:
+            logger.warning(
+                "Pre-full WM snapshot failed (continuing with existing "
+                "STM notes): %s", exc,
+            )
+
     async def _schedule_full(self) -> None:
         """Trigger B: full_idle_minutes 後に Full 版を実行する。
 
@@ -447,6 +481,10 @@ class SleepTimeScheduler:
             self._running = True
             executed = True
             self._last_full_run = time.time()
+            # Step 8 の入力 (STM ノート) を用意してから走らせる。押し出しが
+            # 起きていない進行中セッションでは、これが唯一の供給経路になる
+            # (f_02 §1.2 経路 (c))。失敗しても Full 本体は止めない。
+            self._run_pre_full_flush()
             # sleep-time の LLM ステージを回すクライアント。ベースを
             # AuxClient 越しに使う。アイドル窓かつ専有スロットなので
             # 不変則 (CLAUDE.md §6 #1 / docs/c_14 §1.1) を満たす。未接続なら

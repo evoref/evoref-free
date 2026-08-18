@@ -298,10 +298,38 @@ def drain_evicted_to_stm(
     汚染ノートを除去したら 5/5 で解消した)。エコー部分を落として中身が
     残ればその中身だけを吸収し、何も残らなければ丸ごと捨てる。
     """
-    evicted = wm.drain_evicted()
+    _absorb_turns_to_stm(wm.drain_evicted(), stm, session_id, origin="evicted")
+
+
+def snapshot_wm_to_stm(
+    wm: WorkingMemory, stm: ShortTermMemory, session_id: str,
+) -> None:
+    """WorkingMemory の未転送ターンを **非破壊で** ShortTermMemory へ写す。
+
+    f_02 §1.2 経路 (c)。sleep-time Full の直前に呼ばれ、押し出しが起きていない
+    進行中セッションでも Step 8 抽出の入力を用意する。WM のターンは残るので
+    会話 context は壊れない。エコー落としは押し出し経路と同じ規則を使う。
+    """
+    _absorb_turns_to_stm(
+        wm.snapshot_unabsorbed(), stm, session_id, origin="snapshot",
+    )
+
+
+def _absorb_turns_to_stm(
+    turns: list[dict], stm: ShortTermMemory, session_id: str, *, origin: str,
+) -> None:
+    """ターン列を STM へ吸収する共通処理 (押し出し / スナップショット共用)。
+
+    直前のユーザー発言を逐語コピーしただけの assistant 応答は、記憶として
+    保存しない。保存すると同じ問いで想起されて再生産され、繰り返し回数が
+    増えていく自己増幅ループになる (実インシデント 2026-08-04 ライブ監査:
+    「今日は何曜日ですか。」が 5 回繰り返され答えが出ない状態まで悪化。
+    汚染ノートを除去したら 5/5 で解消した)。エコー部分を落として中身が
+    残ればその中身だけを吸収し、何も残らなければ丸ごと捨てる。
+    """
     last_user = ""
     dropped = 0
-    for turn in evicted:
+    for turn in turns:
         content = turn.get("content") or ""
         if turn.get("role") == "user" or turn.get("source") == "user":
             last_user = content
@@ -318,13 +346,13 @@ def drain_evicted_to_stm(
             "Dropped %d echo-only assistant turn(s) before STM absorb (session=%s)",
             dropped, session_id,
         )
-    if evicted:
-        total_chars = sum(len(t.get("content", "")) for t in evicted)
+    if turns:
+        total_chars = sum(len(t.get("content", "")) for t in turns)
         logger.debug(
-            "Drained %d turns to STM: total_chars=%d, session=%s",
-            len(evicted), total_chars, session_id,
+            "Absorbed %d %s turns to STM: total_chars=%d, session=%s",
+            len(turns), origin, total_chars, session_id,
         )
-        logger.info("Drained %d evicted turns to STM", len(evicted))
+        logger.info("Absorbed %d %s turns to STM", len(turns), origin)
 
 
 def record_response(

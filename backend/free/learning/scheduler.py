@@ -1362,7 +1362,13 @@ class LearningScheduler:
             if key not in self._fitness_history:
                 self._fitness_history[key] = []
             self._fitness_history[key].append({
-                "run": self._level1_run_count + 1,
+                # ``_level1_finalize`` が **この呼出の前に** カウンタを
+                # インクリメント済みなので、今回の run 番号はそのままの値。
+                # ``+ 1`` すると初回完了時点の点が run=2 になり、run=1 の点が
+                # 永久に存在しないまま improvement-curve の X 軸が
+                # ``level1_run_count`` と 1 ずれる (2026-08-18 ライブ監査:
+                # level1_run_count=1 に対し fitness_history が run=2)。
+                "run": self._level1_run_count,
                 "fitness": round(fa, 4),
             })
             # 直近 10 件のみ保持

@@ -198,6 +198,31 @@ _ASKS_ABOUT_CORRECTION_RE = re.compile(
     r"(?:答え|挙げ|教え|列挙|示し|説明し|何回|何件|いくつ|どこ|点を|箇所)",
 )
 
+#: 2 つの物事の相違点を **尋ねる** 疑問文。訂正ではない。
+#:
+#: ``CORRECTION_PATTERNS`` の先頭 ``違[うわえおっく]`` は「それは違う」を拾う
+#: ためのものだが、「A と B はどう違うのか」という比較質問の ``違う`` にも
+#: 一致する。実インシデント (2026-08-18 ライブ監査 ターン4):
+#: 「Python の GIL があることで、CPU バウンド処理と I/O バウンド処理で
+#: スレッドの効果が**どう違うのか**、簡潔に説明してください。」という純粋な
+#: 知識質問が ``correction_detected_by=hardcoded`` で訂正として記録された。
+#: 訂正シグナルは Level 1 の fitness で **欠陥** として数えられ
+#: (``_calc_fitness_memory`` / ``_calc_fitness_router``)、Level 2 の失敗
+#: コーパスにも入るため、正しく答えたターンが失敗として学習される。
+#:
+#: 疑問の代用形 (どう / どこが / 何が …) が ``違う`` の直前に来る形だけを
+#: 除外する。「それは違います」「答えが違う」のような本物の指摘は代用形を
+#: 伴わないので影響を受けない。「〜の違いを教えて」は ``違い`` の後に
+#: ``ます/ません/まし`` が続かないため、そもそも先頭パターンに一致しない。
+#: アシスタント出力への言及 (``_ASSISTANT_OUTPUT_REF_RE``) は本関数の先頭で
+#: ``assistant`` を返すため、この除外より先に確定する。丁寧形の「どう違います
+#: か」はその ``違います`` に先に一致するのでここには到達しない — 判別できない
+#: ものは ``assistant`` に倒すという本モジュールの方針どおり、順序は変えない。
+_ASKS_ABOUT_DIFFERENCE_RE = re.compile(
+    r"(?:どう|どの(?:よう|ように)|どこ(?:が|に)|何(?:が|は)|なに(?:が|は))"
+    r"[^。！？\n]{0,12}?違う",
+)
+
 #: 出力形式・言語の変更依頼。内容の誤りを指していない。
 _REFORMAT_REQUEST_RE = re.compile(
     r"同じ内容を.{0,10}(?:日本語|英語|中国語)で"
@@ -237,6 +262,8 @@ def classify_correction_target(query: str) -> str:
     if _SELF_CORRECTION_RE.search(query):
         return "self"
     if _ASKS_ABOUT_CORRECTION_RE.search(query):
+        return "not_correction"
+    if _ASKS_ABOUT_DIFFERENCE_RE.search(query):
         return "not_correction"
     if _REFORMAT_REQUEST_RE.search(query):
         return "not_correction"

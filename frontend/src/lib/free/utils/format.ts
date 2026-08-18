@@ -21,6 +21,24 @@ export function formatSize(mb: number): string {
 }
 
 /**
+ * バイト数を人間可読文字列に変換する ("36.4 MB" / "512 KB" / "800 B")。
+ * null / undefined / 負値は '-' を返す (サイズ不明を数値として見せない)。
+ *
+ * `formatSize` は MB 入力を前提としており、API がバイトで返す値
+ * (LoRA スナップショットのファイルサイズ等) には使えないため別に持つ。
+ */
+export function formatBytes(bytes: number | null | undefined): string {
+	if (bytes === null || bytes === undefined || !Number.isFinite(bytes) || bytes < 0) {
+		return '-';
+	}
+	const mb = bytes / (1024 * 1024);
+	if (mb >= 1) return `${mb.toFixed(1)} MB`;
+	const kb = bytes / 1024;
+	if (kb >= 1) return `${kb.toFixed(0)} KB`;
+	return `${bytes} B`;
+}
+
+/**
  * ISO 文字列を日時文字列 (`toLocaleString()`) に変換する。
  * 空文字列やパース失敗時は '-' を返す。
  */
