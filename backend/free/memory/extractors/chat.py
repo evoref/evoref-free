@@ -132,14 +132,42 @@ _QUESTION_ENDING_RE = re.compile(
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?])\s*")
 
 
+#: アシスタントへの **依頼** の文末。疑問形ではないが、ユーザー自身の事実の
+#: 表明でもない。
+#:
+#: 実インシデント (2026-08-18 ライブ監査): 「データ分析で**よく使う**可視化
+#: ライブラリを 3 つ挙げてください。」が preference トリガ ``よく使う`` に
+#: 一致し、依頼文がまるごと ``mem.preference.user`` の object として保存された。
+#: 疑問符も「〜ですか」も無いため ``_QUESTION_ENDING_RE`` では拾えない。
+_REQUEST_ENDING_RE = re.compile(
+    r"(?:(?:て|で)(?:ください|下さい)"
+    r"|(?:して|で)(?:ほしい|欲しい)"
+    r"|お願いします|願います"
+    r"|(?:教え|挙げ|見せ|出し|作っ|書い|説明し|列挙し|示し)て)"
+    r"[。．.、,！!\s\"'」』）)]*\s*$",
+)
+
+#: 一人称マーカー。依頼形でもこれを伴う文は本人の事実表明を含みうるため
+#: (例:「私はダークテーマが好きなので、そう設定してください。」)、依頼を
+#: 理由に捨てない。
+_SELF_REFERENCE_RE = re.compile(r"(?:私|僕|俺|自分|わたし|ぼく|うち)")
+
+
 def _tag_evidence_is_question_only(content: str, trigger_words: tuple[str, ...]) -> bool:
-    """トリガ語を含む文が、すべて疑問形かどうかを判定する。
+    """トリガ語を含む文が、すべて **ユーザー自身の表明でない** かを判定する。
 
     ノート全体の文末だけで判定すると、平叙文の嗜好表明に無関係な質問が
     続く複合発話 (例:「Pythonが好きです。あなたは何が好きですか?」) まで
     丸ごと除外してしまう (レビューで判明)。トリガ語を含む文だけを見て、
-    それが全て疑問形の場合のみ「質問文のみの根拠」とみなす。該当文が
+    それが全てそうである場合のみ「根拠が表明でない」とみなす。該当文が
     無ければ (呼出側の判定に委ねるため) False を返す。
+
+    「そうでない文」は 2 種類:
+
+    - **疑問形** (``_QUESTION_ENDING_RE``) — 「あなたは何が好きですか?」
+    - **依頼形** (``_REQUEST_ENDING_RE``) — 「よく使うライブラリを挙げて
+      ください。」。ただし一人称を含む文は本人の事実表明を兼ねうるので
+      除外しない (``_SELF_REFERENCE_RE``)。
     """
     sentences = [s for s in _SENTENCE_SPLIT_RE.split(content) if s.strip()]
     text_lower_sentences = [(s, s.lower()) for s in sentences]
@@ -149,7 +177,16 @@ def _tag_evidence_is_question_only(content: str, trigger_words: tuple[str, ...])
     ]
     if not relevant:
         return False
-    return all(_QUESTION_ENDING_RE.search(s.strip()) for s in relevant)
+
+    def _is_non_assertive(sentence: str) -> bool:
+        s = sentence.strip()
+        if _QUESTION_ENDING_RE.search(s):
+            return True
+        return bool(
+            _REQUEST_ENDING_RE.search(s) and not _SELF_REFERENCE_RE.search(s),
+        )
+
+    return all(_is_non_assertive(s) for s in relevant)
 
 #: 規則ベース正規化で残す文の下限 (これ未満なら正規化失敗として原文を使う)。
 _STATEMENT_MIN_CHARS = 2

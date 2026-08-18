@@ -649,15 +649,26 @@ class ToolCallJudge:
             )
             if command and not self._reject_readonly(exec_tool, command):
                 logger.debug("Executable query detected: %s", query[:50])
-                result = ToolJudgement(
-                    tool_needed=True,
-                    tool_name=exec_tool,
-                    tool_args={"command": command},
-                    source="rule",
+                result = self._finalize(
+                    ToolJudgement(
+                        tool_needed=True,
+                        tool_name=exec_tool,
+                        tool_args={"command": command},
+                        source="rule",
+                    ),
+                    tools_registry, mode, query=query,
                 )
-                return self._finalize(
-                    result, tools_registry, mode, query=query,
-                )
+                # 層1 と同じ理由で降格時は後続層へ落とす。ここだけ
+                # ``_finalize`` の戻りを無条件に返しており、ガードが no_tool へ
+                # 降格させると層0.9〜5.9 が丸ごとスキップされていた。
+                # 併せて ``_log_tool_decision`` を追加する: judge() の全 exit の
+                # うちこの層だけが decision.jsonl に何も残さず、ツールを実際に
+                # 実行したターンが記録から消えていた (2026-08-18 ライブ監査:
+                # 8 ターン中 2 ターンが run_command_readonly を実行したのに
+                # tool_call_decision エントリ無し)。
+                if result.tool_needed:
+                    self._log_tool_decision(result, "executable_command_rule")
+                    return result
 
 
         # 0.9. 「同じファイルに保存し直して」型: パスは直前ターンにしか無い。

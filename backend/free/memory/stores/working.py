@@ -30,6 +30,12 @@ logger = get_logger("memory.working")
 #: 保持メッセージ数の平均は 15.2 → 14.1 とわずかに下がるだけで、割に合う。
 _TOKEN_EVICT_KEEP_RATIO = 0.6
 
+#: turn dict に立てる「STM へ転送済み」の印。``snapshot_unabsorbed`` が立て、
+#: ``_evict_oldest`` / ``clear`` が転送バッファへの二重積みを抑止するのに使う。
+#: turn dict はそのまま ``ShortTermMemory.absorb`` へ渡るが、absorb は必要な
+#: キーだけを読むため未知キーが増えても影響しない。
+_ABSORBED_KEY = "absorbed"
+
 
 class WorkingMemory:
     """Layer 1: ゼロレイテンシの会話コンテキスト"""
@@ -160,10 +166,41 @@ class WorkingMemory:
         """LLM用 messages 形式で返す（role + content のみ）"""
         return [{"role": t["role"], "content": t["content"]} for t in self.turns]
 
+    def snapshot_unabsorbed(self) -> list[dict]:
+        """まだ STM へ渡していないターンを **非破壊で** 返し、転送済みに印を付ける。
+
+        f_02 §1.2 経路 (c)。窓 (``working_max_turns`` / ``working_max_tokens``)
+        に収まる長さの会話は押し出しが起きず、セッションが終わるまで STM
+        ノートを 1 件も生まない。sleep-time Step 8 の入力は STM ノートなので、
+        その間に走った Full は入力が空のまま ``facts_extracted=0`` になる
+        (2026-08-18 ライブ監査: 21 ターンの会話が再起動まで 1 件も
+        ファクト化されなかった)。Full の直前にここを呼び、WM を保ったまま
+        STM 側だけ先に埋める。
+
+        WM からは取り除かない (会話 context を壊さない)。後で同じターンが
+        押し出されても二重に吸収しないよう ``absorbed`` フラグを立て、
+        :meth:`_evict_oldest` / :meth:`clear` が転送バッファへ積むのを抑止する。
+        """
+        pending = [t for t in self.turns if not t.get(_ABSORBED_KEY)]
+        for turn in pending:
+            turn[_ABSORBED_KEY] = True
+        if pending:
+            logger.debug(
+                "snapshot_unabsorbed: %d/%d turns handed to Layer 2 (WM retained)",
+                len(pending), len(self.turns),
+            )
+        return pending
+
     def clear(self) -> None:
         """コンテキストクリア"""
-        logger.debug("clear: evicting all %d turns to transfer buffer", len(self.turns))
-        self._evicted.extend(self.turns)
+        # 既に snapshot で STM へ渡したターンは転送バッファへ積まない
+        # (二重ノートになる)。
+        pending = [t for t in self.turns if not t.get(_ABSORBED_KEY)]
+        logger.debug(
+            "clear: evicting %d/%d turns to transfer buffer",
+            len(pending), len(self.turns),
+        )
+        self._evicted.extend(pending)
         self.turns.clear()
         # clear() はセッション切替時に呼ばれる。新しいセッションでは「前半が
         # 落ちている」状態ではないのでカウンタも畳む。
@@ -251,11 +288,15 @@ class WorkingMemory:
         """
         if self.turns:
             evicted = self.turns.pop(0)
-            self._evicted.append(evicted)
+            # snapshot 済みのターンは転送バッファへ積まない (二重ノート防止)。
+            # 窓から落ちた事実は変わらないのでカウンタは通常どおり進める。
+            if not evicted.get(_ABSORBED_KEY):
+                self._evicted.append(evicted)
             self.session_evicted_turns += 1
         while len(self.turns) > 1 and self.turns[0].get("role") == "assistant":
             orphan = self.turns.pop(0)
-            self._evicted.append(orphan)
+            if not orphan.get(_ABSORBED_KEY):
+                self._evicted.append(orphan)
             self.session_evicted_turns += 1
 
     def _total_tokens(self) -> int:

@@ -14,7 +14,6 @@ ACE (arXiv:2510.04618) のデルタ更新パターンを参考に、
 from __future__ import annotations
 
 import json
-import random
 from pathlib import Path
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
@@ -1024,9 +1023,21 @@ class PolicyParamEvolver(JsonStateStore):
         if not evolvable_keys:
             return {}
 
-        # ACE 式: ランダムにサブセットを選択
+        # ACE 式: ランダムにサブセットを選択。
+        # ノイズと同じ ``np.random`` ストリームから引く。以前は stdlib の
+        # ``random.sample`` を使っており、1 回の進化ステップが **2 本の独立な
+        # RNG** に跨っていた。``np.random.seed()` だけではサブセット選択が
+        # 固定されず、同じシードでもステップが再現しない (自己進化サイクルの
+        # 再生・切り分けができない)。テストでも順序依存の偽 fail を生んでいた:
+        # 選ばれた key がすべて境界に張り付いた int だと下の「変化なし」判定で
+        # 全件 continue し、delta が空 = action が ``evolved`` ではなく
+        # ``skipped`` になる (2026-08-18: stdlib 側の状態次第で
+        # ``test_evolve_freezes_when_fitness_never_moves`` が再現性なく落ちた)。
         n_params = min(MAX_PARAMS_PER_STEP, len(evolvable_keys))
-        selected_keys = random.sample(evolvable_keys, n_params)
+        selected_idx = np.random.choice(
+            len(evolvable_keys), size=n_params, replace=False,
+        )
+        selected_keys = [evolvable_keys[int(i)] for i in selected_idx]
 
         delta: dict = {}
         for key in selected_keys:

@@ -22,6 +22,8 @@ export interface LoraVersionInfo {
 	eval_score: number;
 	created_at: string;
 	metadata: Record<string, unknown>;
+	/** スナップショットの adapter.gguf の実バイト数 (ファイル不在時は null) */
+	size_bytes?: number | null;
 }
 
 /** 1 系列分のバージョン一覧 (バックエンド TargetVersionsResponse 準拠) */
