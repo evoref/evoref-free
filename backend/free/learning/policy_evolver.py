@@ -59,6 +59,169 @@ FITNESS_EPSILON: float = 0.001
 # fitness 履歴の保持上限 (無上限 append によるメモリ・永続化肥大を防ぐ)
 _FITNESS_HISTORY_CAP: int = 100
 
+# fitness の算出に必要な、ドメイン固有シグナルの最小サンプル数。これ未満だと
+# 1 件の増減が fitness を 1/N 動かすため、摂動の良し悪しではなくサンプルの
+# 偏りを見ていることになる。実測 (2026-08-18、経験 206 件): agent ドメインの
+# 母集合 (agent_loops > 0) は **1 件** しかなく、その 1 件から fitness=1.0 が
+# 確定して best_fitness に焼き付き、以後ロールバック不能なまま摂動だけが
+# 続いていた。
+MIN_FITNESS_SAMPLES: int = 10
+
+# 恒真ガードの評価窓。直近この件数の fitness が FITNESS_EPSILON 未満の幅しか
+# 動いていなければ、その fitness は当該ドメインの摂動を判別できていないと
+# みなす。実測データでは window=4 が memory / agent (span=0.0) を捕捉し、
+# router (span=0.0135) / search (span=0.0972) は素通しする。
+DEGENERATE_WINDOW: int = 4
+
+#: 永続化された評価状態 (fitness_history / best_fitness / best_params …) が
+#: どの fitness 定義の下で採られたかを示すバージョン。**fitness 関数を変更したら
+#: 上げる**。ロード時に不一致なら評価状態を捨てる — 旧定義下の平坦な履歴を新定義の
+#: 履歴として続けると、恒真ガードが「新 fitness も恒真」と誤判定して凍結し、
+#: 尺度の違う best_fitness が更新不能な基準として残る。
+#:
+#: v3: コスト項を fitness に導入 (:data:`COST_WEIGHT`)。
+FITNESS_SCHEMA_VERSION: int = 3
+
+#: fitness に占めるコスト項の重み。``fitness = (1-w) * 品質 + w * (1 - コスト)``。
+#:
+#: **実測から導出** (2026-08-18、``scripts/calibrate_cost_weight.py``)。fitness は
+#: 経験集合の平均を見るので、選択圧になるのは各項の **tick 間 span** (プレフィックス
+#: 平均が tick ごとに動く幅) である。両項の寄与を釣り合わせる重みは
+#: ``w* = span_Q / (span_Q + span_C)``。
+#:
+#: 実機で 56 ターン回してコスト付き経験を 50 件貯めた時点の実測:
+#:
+#: ===============  ==========  ======================================
+#: 項                span        出所
+#: ===============  ==========  ======================================
+#: コスト            0.0922      経験バッファ (再プリフィル率、n=50)
+#: コスト            0.1280      llama ログ復元 (slot 0、n=162) — 独立系統
+#: 品質 memory       0.0181      3 回の測定で 0.0203 / 0.0183 / 0.0181 と安定
+#: ===============  ==========  ======================================
+#:
+#: → ``w*`` = 0.0181 / (0.0181 + 0.0922) = **0.164**、llama ログ側の span を使うと
+#: 0.123。**0.12〜0.17 のレンジ**なので中央の 0.15 を採る。
+#:
+#: 独立した 2 系統が同オーダーで一致していることが根拠の主。当初は 0.3 と見積もって
+#: いたが、実測ではコスト側の自然変動が想定より大きく、**釣り合わせるのに必要な重みは
+#: 小さい**。
+#:
+#: 下限側の妥当性: 取得件数の膨張を止めるのに必要な重みは ``w > 0.03`` 程度
+#: (top_k 5→10 で ΔC ≈ +0.19 に対し Δ品質 ≲ 0.005)。0.15 は十分に上回る。
+#:
+#: 解除対象を持つドメインのうち品質 span を実測できたのは memory だけ。
+#: agent / long_form は該当経験がまだ足りない (それぞれ agent_loops>0 と
+#: long_form_used の母集合が :data:`MIN_FITNESS_SAMPLES` 未満)。溜まったら
+#: ``scripts/calibrate_cost_weight.py`` を再実行して測り直す。
+#:
+#: **本値を変えたら fitness の尺度が変わるので :data:`FITNESS_SCHEMA_VERSION` も
+#: 上げること** (旧尺度の best_fitness が更新不能な基準として残る)。
+COST_WEIGHT: float = 0.15
+
+#: プロンプト側コストで評価するドメイン。
+#:
+#: **コスト項は :data:`MONOTONE_PARAMS` を解除するために入れる**ので、解除対象を
+#: 持つドメインにだけ適用する。持たないドメイン (``router`` / ``search``) では、
+#: 残る進化キー (重み・閾値の類) がプロンプト量に影響しないため、コスト項は
+#: **相関のないノイズ**として fitness に乗るだけで摂動の判別力を落とす。
+#: 両集合の一致はテストで固定する。
+_PROMPT_COST_DOMAINS: frozenset[str] = frozenset({"memory", "agent"})
+
+#: 生成側コストで評価するドメイン。凍結キーが生成トークン量を増やす方向のもの。
+_COMPLETION_COST_DOMAINS: frozenset[str] = frozenset({"long_form"})
+
+#: **コスト項を入れても解除しない**パラメータと、その理由。
+#:
+#: 解除の条件は「コストが観測できること」だけでは足りず、**品質項とコスト項の
+#: 双方がそのパラメータに反応すること**が要る。片方でも無反応だと最適解が制約の
+#: 端に固定される — コストが見えなければ最大へ、品質が見えなければ最小へ張り付く
+#: だけで、病理の向きが変わるにすぎない。
+#:
+#: 値は「なぜ恒久凍結か」の根拠。テストが policy 側のキー実在を検証する。
+PERMANENTLY_FROZEN_PARAMS: dict[str, dict[str, str]] = {
+    "search": {
+        # 品質項 mean(rag_top1_score) は **top-1 の類似度** なので、取得件数を
+        # 増やしても減らしても動かない。コスト項だけ入れると「最大へ膨張」が
+        # 「最小へ縮退」に変わるだけ。解除には取得幅に反応する品質指標が要る。
+        "top_k": "品質項 mean(rag_top1_score) が取得件数に無反応",
+        "stm_top_k": "品質項 mean(rag_top1_score) が取得件数に無反応",
+        # int8 粗検索 → float32 rescore の候補数 (vector_store.search)。返す
+        # チャンク数は top_k が決めるので、増やしてもプロンプトは 1 トークンも
+        # 増えない。代償は CPU 時間だけで、配線済みのどのシグナルにも出ない。
+        "rescore_candidates": "コストが CPU 時間にのみ出てトークン数に現れない",
+        # _default_policies() 以外に参照が無い (2026-08-18 時点)。摂動しても
+        # 何も起きないので進化スロットの無駄。キー自体の存廃は別途判断する。
+        "candidates_multiplier": "消費側が存在しない dead key",
+    },
+    "agent": {
+        # 「残コンテキストがこの値以上なら meta-cognitive を許可」という**ゲート
+        # 閾値** (router._can_use_meta_cognitive)。上げるほど meta-cognitive が
+        # 発火せず、ループ数もトークンも減る = 品質項 (1/loops) とコスト項の
+        # 両方が「機能を止めること」を報酬する。解除には meta-cognitive が
+        # 使えたことの価値を測るシグナルが要る。
+        "meta_cognitive_min_budget": "上げるほど機能が停止し品質項・コスト項の両方が改善する",
+    },
+    "memory": {
+        # sleep-time の LLM 呼び出し回数を食うだけで、チャットターンの
+        # プロンプト/生成トークンには一切現れない。
+        "conflict_batch_size": "コストが sleep-time の LLM 呼び出しにのみ出る",
+    },
+}
+
+#: 品質項だけでは **単調** なパラメータ。増やす (または減らす) ほど品質指標が
+#: 改善する一方、その代償 (コンテキスト量・レイテンシ) が品質項には現れない。
+#: 最適化器へ渡すと必ず制約の端へ張り付く。
+#:
+#: **凍結は動的**: その tick の経験集合にコスト実データが
+#: :data:`MIN_FITNESS_SAMPLES` 件以上あれば ``fitness`` にコスト項が入り、
+#: 単調性が解けるので本表のキーも進化対象に戻る (:func:`is_cost_observable`)。
+#: コストが観測できない tick では従来どおり凍結する。フラグではなくデータで
+#: 切り替えるのは、コスト項が ``None`` に縮退したまま解除されると単調膨張が
+#: そのまま戻るため。
+#:
+#: コスト項が入っても解除されないキーは :data:`PERMANENTLY_FROZEN_PARAMS` を参照。
+#:
+#: 既に個別の対症療法が入っていた 2 件 — ``search.top_k`` の上限 50→10 と
+#: ``long_form.unit_target_tokens`` の下限 128→512 (いずれも
+#: :func:`backend.free.core.policy_interpreter._default_policies` のコメント参照) —
+#: と同じ病理を、ドメイン横断で構造的に塞ぐ。
+#:
+#: **constraints (policy JSON) ではなくコード側に置く理由**: constraints は
+#: 「値として妥当な範囲」、本表は「最適化器が触ってよいか」で関心が違う。加えて
+#: ``PolicyInterpreter._merge_with_defaults`` の constraints マージはパラメータ名
+#: 単位の浅いマージなので、既存インストールの policy JSON に後からサブキーを
+#: 足しても伝播しない (凍結が静かに無効化される)。
+MONOTONE_PARAMS: dict[str, frozenset[str]] = {
+    "agent": frozenset({
+        # 圧縮を弱める / スケルトン化を減らすほどステップの情報量が増え、代償は
+        # プロンプトのみ。品質項 (1/loops) は情報量が足りないとループが増える形で
+        # 反応するため、双方が効く。
+        "file_skeleton_threshold",
+        "step_compaction_rag_lines", "step_compaction_command_head_tail",
+    }),
+    "long_form": frozenset({
+        # ユニット予算と再試行回数を増やすほど完了率 (品質項) は上がり、
+        # 予算消費率 (コスト項) も上がる。双方が反応する最も素直なケース。
+        "unit_max_tokens", "unit_target_tokens", "max_extend_rounds",
+    }),
+    "memory": frozenset({
+        # 保持期間を延ばすほど想起は増え (欠陥率が下がる)、代償は想起注入による
+        # プロンプト増。
+        "decay_days",
+    }),
+}
+
+#: コスト未観測時に **全パラメータ** が凍結されるドメイン。その tick の進化
+#: ステップは常に ``skipped`` になる。
+#:
+#: ``agent`` の 4 パラメータはステップ圧縮 2 種 / スケルトン閾値 / 最小予算ゲート
+#: しかなく、前 3 者は :data:`MONOTONE_PARAMS`、最後は
+#: :data:`PERMANENTLY_FROZEN_PARAMS` に入るため、品質項だけで評価できるものが
+#: 1 つも残らない。ドメインごと凍結されるのは事故ではなく意図した状態なので
+#: 明示しておく (テストが両者の一致を検証する)。プロンプト側コストが観測できる
+#: tick では前 3 者が解除される。
+FULLY_FROZEN_DOMAINS: frozenset[str] = frozenset({"agent"})
+
 # SemMem 書き戻し時の subject prefix と初期値。owner pillar は EvorefLearn。
 LEARN_POLICY_SUBJECT_PREFIX: str = "learn.policy."
 """SemMem 上のポリシーファクト subject prefix。
@@ -78,6 +241,20 @@ PROMOTION_SURVIVAL_CYCLES: int = 2
 policy ファクトを activation_min まで昇格する (proven とみなす評価期間)。"""
 
 EvolveWriteback = Literal["yaml", "semmem"]
+
+
+def is_degenerate_fitness(history: list[float]) -> bool:
+    """直近 :data:`DEGENERATE_WINDOW` 件の fitness が実質同一かを返す。
+
+    ``True`` = その fitness は摂動を判別できていない。このとき摂動を続けても
+    選択圧が無く、かつ「低下」が起きないので ``_maybe_rollback`` も永久に発火
+    しない = 制約範囲内の乱歩になる。窓が埋まるまで (``< DEGENERATE_WINDOW``)
+    は判定を保留する。
+    """
+    if len(history) < DEGENERATE_WINDOW:
+        return False
+    recent = history[-DEGENERATE_WINDOW:]
+    return (max(recent) - min(recent)) < FITNESS_EPSILON
 
 
 class PolicyParamEvolver(JsonStateStore):
@@ -402,20 +579,25 @@ class PolicyParamEvolver(JsonStateStore):
         fitness: float,
         sigma: float,
         phase: str,
+        *,
+        cost_observed: bool = False,
     ) -> dict:
         """ガウス摂動でデルタ生成 → ACE 適用。デルタ無しなら ``skipped``。"""
-        delta = self._generate_delta(domain, mode, sigma)
+        delta = self._generate_delta(
+            domain, mode, sigma, cost_observed=cost_observed,
+        )
         if not delta:
             logger.debug(
                 "Policy evolution skipped: domain=%s, mode=%s "
-                "(no evolvable params)",
-                domain, mode,
+                "(no evolvable params, cost_observed=%s)",
+                domain, mode, cost_observed,
             )
             return {
                 "action": "skipped",
                 "fitness": fitness,
                 "sigma": sigma,
                 "phase": phase,
+                "cost_observed": cost_observed,
             }
 
         self._policy.apply_delta(domain, delta, mode)
@@ -450,11 +632,12 @@ class PolicyParamEvolver(JsonStateStore):
 
         logger.info(
             "Policy evolved: domain=%s, mode=%s, fitness=%.4f, "
-            "sigma=%.4f, phase=%s, delta_keys=%s",
-            domain, mode, fitness, sigma, phase, delta_keys,
+            "sigma=%.4f, phase=%s, cost_observed=%s, delta_keys=%s",
+            domain, mode, fitness, sigma, phase, cost_observed, delta_keys,
         )
         self._log_evolution(
             domain, mode, "evolved", fitness, sigma, phase, delta_keys,
+            cost_observed=cost_observed,
         )
         return {
             "action": "evolved",
@@ -462,6 +645,7 @@ class PolicyParamEvolver(JsonStateStore):
             "delta_keys": delta_keys,
             "sigma": sigma,
             "phase": phase,
+            "cost_observed": cost_observed,
         }
 
     def _promote_active_facts(
@@ -555,8 +739,15 @@ class PolicyParamEvolver(JsonStateStore):
             - delta_keys: 摂動したパラメータ名リスト（evolved 時のみ）
             - sigma: 使用した変異スケール
             - phase: ExplorationController のフェーズ
+            - cost_observed: fitness にコスト項が入り、単調パラメータの凍結が
+              解けている tick か
         """
         key = (domain, mode)
+
+        # 0. コスト項が fitness に入るだけの標本があるか。入っていれば単調性が
+        # 解けるので MONOTONE_PARAMS の凍結を外す。fitness の合成と同じ判定を
+        # 使うので、「コスト項が効いていないのに凍結だけ解ける」状態は作れない。
+        cost_observed = is_cost_observable(domain, experiences)
 
         # 1. 現在の fitness を算出。無情報 (該当シグナルゼロ) なら None が返る。
         # この場合は履歴に積まず摂動もせず即 skip し、無情報ドメインの乱歩を防ぐ。
@@ -564,10 +755,14 @@ class PolicyParamEvolver(JsonStateStore):
         if base_fitness is None:
             sigma = self._exploration.get_mutation_scale(domain, mode)
             phase = self._exploration.get_phase(domain, mode)
-            self._log_evolution(domain, mode, "skipped_no_signal", 0.0, sigma, phase)
+            self._log_evolution(
+                domain, mode, "skipped_no_signal", 0.0, sigma, phase,
+                cost_observed=cost_observed,
+            )
             return {
                 "action": "skipped_no_signal", "fitness": None,
                 "sigma": sigma, "phase": phase,
+                "cost_observed": cost_observed,
             }
 
         fitness = self._blend_semmem_success_rate(domain, mode, base_fitness)
@@ -581,26 +776,57 @@ class PolicyParamEvolver(JsonStateStore):
         sigma = self._exploration.get_mutation_scale(domain, mode)
         phase = self._exploration.get_phase(domain, mode)
 
+        # 2.5. 恒真ガード。直近窓の fitness が動いていない = この fitness は当該
+        # ドメインの摂動を判別できていない。摂動を続けても選択圧が無く、低下も
+        # 起きないのでロールバックも発火せず、制約範囲内の乱歩になる。
+        # 実測 (2026-08-18、経験 206 件): memory / agent の 2 ドメインが span=0.0
+        # でこの状態にあり、memory の conflict_similarity_threshold が上限 1.0 へ
+        # 張り付いて STM の競合検出が実質無効化されていた。
+        if is_degenerate_fitness(history):
+            logger.info(
+                "Policy evolution frozen (degenerate fitness): domain=%s, mode=%s, "
+                "fitness=%.4f, window=%d",
+                domain, mode, fitness, DEGENERATE_WINDOW,
+            )
+            self._log_evolution(
+                domain, mode, "skipped_degenerate", fitness, sigma, phase,
+                cost_observed=cost_observed,
+            )
+            return {
+                "action": "skipped_degenerate",
+                "fitness": fitness,
+                "sigma": sigma,
+                "phase": phase,
+                "cost_observed": cost_observed,
+            }
+
         # 3. 連続低下判定 → 自動ロールバック
         prev_best = self._best_fitness.get(key, 0.0)
         rollback_result = self._maybe_rollback(
             domain, mode, history, fitness, prev_best, sigma, phase,
         )
         if rollback_result is not None:
+            rollback_result["cost_observed"] = cost_observed
             return rollback_result
 
         # 3.5. decline 継続中 (ロールバック閾値未満の連続低下) は新摂動を打たず hold。
         # 劣化中に摂動を重ねて複利的に悪化するのを断つ。
         if self._decline_count.get(key, 0) > 0:
-            self._log_evolution(domain, mode, "hold", fitness, sigma, phase)
+            self._log_evolution(
+                domain, mode, "hold", fitness, sigma, phase,
+                cost_observed=cost_observed,
+            )
             return {
                 "action": "hold", "fitness": fitness,
                 "sigma": sigma, "phase": phase,
                 "decline_count": self._decline_count[key],
+                "cost_observed": cost_observed,
             }
 
         # 4-5. ガウス摂動でデルタ生成 → ACE 適用
-        return self._apply_evolved_step(domain, mode, fitness, sigma, phase)
+        return self._apply_evolved_step(
+            domain, mode, fitness, sigma, phase, cost_observed=cost_observed,
+        )
 
     def evolve_all(
         self,
@@ -651,6 +877,9 @@ class PolicyParamEvolver(JsonStateStore):
                 "decline_count": self._decline_count.get((domain, mode), 0),
                 "sigma": self._exploration.get_mutation_scale(domain, mode),
                 "phase": self._exploration.get_phase(domain, mode),
+                # 恒真ガードで凍結中か。乱歩は「静かに」起きるので、状態として
+                # 外から見えるようにしておく (/api/learning/status 経由)。
+                "degenerate": is_degenerate_fitness(history),
             }
         return status
 
@@ -658,6 +887,7 @@ class PolicyParamEvolver(JsonStateStore):
 
     def _to_payload(self) -> JsonPayload:
         return {
+            "fitness_schema_version": FITNESS_SCHEMA_VERSION,
             "fitness_history": {
                 f"{d}:{m}": h
                 for (d, m), h in self._fitness_history.items()
@@ -686,6 +916,26 @@ class PolicyParamEvolver(JsonStateStore):
                 f"policy_evolver_state.json must be a dict, "
                 f"got {type(payload).__name__}"
             )
+
+        stored_version = payload.get("fitness_schema_version", 1)
+        if stored_version != FITNESS_SCHEMA_VERSION:
+            # fitness の定義が変わった = 旧履歴を新定義の履歴として続けられない。
+            # 続けると (a) 恒真ガードが旧値の平坦さを見て新 fitness を誤って凍結し、
+            # (b) 尺度の違う best_fitness が更新されない基準として残り、
+            # (c) 旧 fitness 下で採られた best_params が復元先として焼き付く。
+            # 評価状態だけを捨てて測り直す (現行 params には触れない — 値の是正は
+            # PolicyInterpreter 側の責務)。
+            logger.info(
+                "PolicyEvolver fitness schema changed (%s -> %s): "
+                "discarding stored evaluation state (params are left untouched)",
+                stored_version, FITNESS_SCHEMA_VERSION,
+            )
+            self._fitness_history.clear()
+            self._decline_count.clear()
+            self._best_fitness.clear()
+            self._best_params.clear()
+            self._survived_count.clear()
+            return
 
         self._fitness_history.clear()
         for key_str, history in payload.get("fitness_history", {}).items():
@@ -728,6 +978,8 @@ class PolicyParamEvolver(JsonStateStore):
         domain: str,
         mode: str,
         sigma: float,
+        *,
+        cost_observed: bool = False,
     ) -> dict:
         """ガウス摂動でパラメータのデルタを生成する
 
@@ -738,6 +990,9 @@ class PolicyParamEvolver(JsonStateStore):
             domain: ポリシードメイン
             mode: "chat" | "create"
             sigma: 変異スケール（制約の range に対する比率）
+            cost_observed: この tick の fitness にコスト項が入っているか。
+                ``True`` なら :data:`MONOTONE_PARAMS` の凍結を解く
+                (:data:`PERMANENTLY_FROZEN_PARAMS` は解かない)。
 
         Returns:
             {param_name: new_value, ...}
@@ -749,9 +1004,15 @@ class PolicyParamEvolver(JsonStateStore):
         except KeyError:
             return {}
 
-        # 進化可能なパラメータを抽出（bool / str 除外）
+        # 進化可能なパラメータを抽出（bool / str / 凍結パラメータを除外）。
+        # 単調パラメータはコストが観測できた tick でのみ解除する。
+        frozen = set(PERMANENTLY_FROZEN_PARAMS.get(domain, {}))
+        if not cost_observed:
+            frozen |= MONOTONE_PARAMS.get(domain, frozenset())
         evolvable_keys = []
         for key in current_params:
+            if key in frozen:
+                continue
             constraint = constraints.get(key, {})
             param_type = constraint.get("type", "float")
             if param_type in _NON_EVOLVABLE_TYPES:
@@ -809,6 +1070,8 @@ class PolicyParamEvolver(JsonStateStore):
         sigma: float,
         phase: str,
         delta_keys: list[str] | None = None,
+        *,
+        cost_observed: bool | None = None,
     ) -> None:
         """デバッグログに進化ステップを記録する"""
         dl = self._debug_logger
@@ -825,14 +1088,131 @@ class PolicyParamEvolver(JsonStateStore):
             "sigma": sigma,
             "exploration_phase": phase,
             "delta_keys": delta_keys or [],
+            # 単調パラメータが解除されている tick かどうか。凍結/解除の切替が
+            # データ次第で起きるので、後から追えるように残す。
+            "cost_observed": cost_observed,
         })
 
 
 # ── ドメイン別 fitness 関数 ──
 
+#: 欠陥シグナルと重み。**加点シグナルを使わない** のが要点。
+#: ``conversation_ended`` は :meth:`ExperienceBuffer._mark_loaded_conversations_ended`
+#: が読み込み時に全エントリへ立てるため構造的に恒真へ寄り (実測 205/206 = 99.5%)、
+#: ``turn_outcome`` も実測 206/206 が ``"success"`` だった。これらを加点項に置くと
+#: fitness が上限へ張り付いて選択圧が消える。観測された欠陥の率だけを見れば、
+#: 加点シグナルの恒真性に引きずられない。
+#:
+#: :class:`~backend.free.learning.generation_param_evolver.GenerationParamEvolver`
+#: が同じ問題に対して先に採った設計と揃えてある。
+DEFECT_WEIGHTS: dict[str, float] = {
+    "user_correction": 1.0,
+    "assistant_self_retraction": 1.0,
+    "rephrased_query": 0.6,
+    "tool_routing_false_negative": 0.5,
+    "tool_routing_false_positive": 0.5,
+}
+
+
+def _defect_rate_fitness(
+    experiences: list[dict],
+    weights: dict[str, float] | None = None,
+) -> float:
+    """観測された欠陥の重み付き率から fitness を返す (1.0 = 欠陥なし)。
+
+    呼出側が非空を保証すること (サンプル数の下限判定は各 fitness 関数の責務)。
+    """
+    table = DEFECT_WEIGHTS if weights is None else weights
+    defects = 0.0
+    for e in experiences:
+        signals = e.get("signals") or {}
+        for key, weight in table.items():
+            if signals.get(key):
+                defects += weight
+    return max(0.0, min(1.0, 1.0 - defects / len(experiences)))
+
+
+# ── コスト項 ──
+
+
+def _prompt_cost_samples(experiences: list[dict]) -> list[float]:
+    """ターンごとの **再プリフィル率** ``(prompt - cached) / prompt`` を集める。
+
+    生のプロンプトトークン数ではなく比率を使う理由は 3 つ:
+
+    1. 無次元 [0, 1] なので、正規化定数 (context_size 等) を fitness 関数へ
+       持ち込まずに品質項と合成できる。
+    2. 再プリフィルは実測でレイテンシの支配項 (ライブ監査で 64〜80%)。
+    3. **キャッシュに乗る膨張を罰しない**。静的な前置きを増やしても接頭辞
+       キャッシュに乗るので比率は上がらない。一方 top_k を上げて増える取得
+       テキストはクエリ依存で毎ターン再計算されるため比率が上がる。罰したい
+       種類の膨張だけが効く。
+
+    ``prompt_tokens`` / ``cached_prompt_tokens`` が揃っていないエントリは除外する
+    (未計測を 0 と扱わない)。
+    """
+    samples: list[float] = []
+    for e in experiences:
+        signals = e.get("signals") or {}
+        prompt = signals.get("prompt_tokens")
+        cached = signals.get("cached_prompt_tokens")
+        if not isinstance(prompt, int) or not isinstance(cached, int):
+            continue
+        if prompt <= 0:
+            continue
+        samples.append(max(0.0, min(1.0, (prompt - cached) / prompt)))
+    return samples
+
+
+def _completion_cost_samples(experiences: list[dict]) -> list[float]:
+    """長文生成の **予算消費率** を集める。
+
+    ``long_form_budget_used_pct`` は長文経路が自前で持つ「割り当て予算のうち
+    どれだけ使ったか」で、既に [0, 100] 正規化済み。``unit_max_tokens`` /
+    ``unit_target_tokens`` / ``max_extend_rounds`` を上げれば単調に増える =
+    凍結を解くのに必要なコスト項として過不足がない。
+    """
+    samples: list[float] = []
+    for e in experiences:
+        signals = e.get("signals") or {}
+        pct = signals.get("long_form_budget_used_pct")
+        if not isinstance(pct, (int, float)) or isinstance(pct, bool):
+            continue
+        samples.append(max(0.0, min(1.0, float(pct) / 100.0)))
+    return samples
+
+
+def cost_samples(domain: str, experiences: list[dict]) -> list[float]:
+    """ドメインに対応するコスト標本 (0.0 = 無コスト / 1.0 = 最大) を返す。
+
+    解除対象 (:data:`MONOTONE_PARAMS`) を持たないドメイン (``router`` /
+    ``search``) は空リスト = 品質項のまま。これらの残る進化キーはプロンプト量に
+    影響しないので、コスト項を足しても摂動と無相関なノイズが乗るだけになる。
+    """
+    if domain in _PROMPT_COST_DOMAINS:
+        return _prompt_cost_samples(experiences)
+    if domain in _COMPLETION_COST_DOMAINS:
+        return _completion_cost_samples(experiences)
+    return []
+
+
+def is_cost_observable(domain: str, experiences: list[dict]) -> bool:
+    """コスト項が ``fitness`` に実際に入るだけの標本があるか。
+
+    ``True`` のとき :data:`MONOTONE_PARAMS` の凍結が解ける。品質項と同じ
+    :data:`MIN_FITNESS_SAMPLES` を要求するのは、少数標本のコスト平均で
+    単調性が解けたと誤判定すると膨張が再発するため。
+    """
+    return len(cost_samples(domain, experiences)) >= MIN_FITNESS_SAMPLES
+
 
 def calc_fitness(domain: str, experiences: list[dict]) -> float | None:
     """ドメインに適した fitness 値を算出する
+
+    ``(1 - COST_WEIGHT) * 品質 + COST_WEIGHT * (1 - コスト)``。コスト標本が
+    :data:`MIN_FITNESS_SAMPLES` に満たない場合は**品質項のみ**へ縮退する
+    (コスト未計測を 0 コストと扱わない)。縮退時は :func:`is_cost_observable`
+    も ``False`` を返すので、単調パラメータは凍結されたままになる。
 
     Args:
         domain: ポリシードメイン
@@ -843,16 +1223,26 @@ def calc_fitness(domain: str, experiences: list[dict]) -> float | None:
         (呼出側は履歴に積まず進化を skip する)。
     """
     fn = _FITNESS_FUNCTIONS.get(domain, _calc_fitness_default)
-    return fn(experiences)
+    quality = fn(experiences)
+    if quality is None:
+        return None
+
+    samples = cost_samples(domain, experiences)
+    if len(samples) < MIN_FITNESS_SAMPLES:
+        return quality
+
+    cost = sum(samples) / len(samples)
+    blended = (1.0 - COST_WEIGHT) * quality + COST_WEIGHT * (1.0 - cost)
+    return max(0.0, min(1.0, blended))
 
 
 def _calc_fitness_router(experiences: list[dict]) -> float | None:
     """router fitness: ルーティング精度（ユーザー修正率の逆数）
 
-    修正・言い換えが少ないほど高スコア。経験ゼロは評価不能 (None)。
+    修正・言い換えが少ないほど高スコア。サンプル不足は評価不能 (None)。
     """
     total = len(experiences)
-    if total == 0:
+    if total < MIN_FITNESS_SAMPLES:
         return None
 
     bad = sum(
@@ -864,26 +1254,20 @@ def _calc_fitness_router(experiences: list[dict]) -> float | None:
 
 
 def _calc_fitness_memory(experiences: list[dict]) -> float | None:
-    """memory fitness: 会話品質指標
+    """memory fitness: 観測された欠陥の率 (1.0 = 欠陥なし)。
 
-    会話完了（good）と修正・言い換え（bad）のバランスで評価。経験ゼロは None。
+    旧実装は ``conversation_ended`` を加点の主項に置いていたが、この信号は
+    :meth:`ExperienceBuffer._mark_loaded_conversations_ended` が読み込み時に
+    全エントリへ立てるため構造的に恒真へ寄る。結果 fitness は clamp 上限の
+    1.0 に張り付き、**選択圧ゼロ・ロールバック不能**の乱歩になっていた
+    (実測 2026-08-18、経験 206 件: 現行 span=0.0000 / distinct=1)。
+
+    欠陥率へ差し替えると同じ実データで span=0.0203 / distinct=9 の判別力が出る。
+    サンプル不足は評価不能 (None)。
     """
-    total = len(experiences)
-    if total == 0:
+    if len(experiences) < MIN_FITNESS_SAMPLES:
         return None
-
-    good = sum(
-        1 for e in experiences
-        if e.get("signals", {}).get("conversation_ended")
-    )
-    bad = sum(
-        1 for e in experiences
-        if (e.get("signals", {}).get("user_correction")
-            or e.get("signals", {}).get("rephrased_query"))
-    )
-    # [-0.5, 1.0] を [0.0, 1.0] にマッピング
-    raw = (good - bad * 0.5) / total
-    return max(0.0, min(1.0, raw + 0.5))
+    return _defect_rate_fitness(experiences)
 
 
 def _calc_fitness_search(experiences: list[dict]) -> float | None:
@@ -903,23 +1287,29 @@ def _calc_fitness_search(experiences: list[dict]) -> float | None:
         for e in rag_exps
         if e.get("signals", {}).get("rag_top1_score") is not None
     ]
-    if not scores:
+    if len(scores) < MIN_FITNESS_SAMPLES:
         return None
 
     return max(0.0, min(1.0, sum(scores) / len(scores)))
 
 
 def _calc_fitness_agent(experiences: list[dict]) -> float | None:
-    """agent fitness: ステップ効率
+    """agent fitness: ステップ効率 (ループ数が少ないほど高スコア)。
 
-    エージェントループ数が少なく、会話が完了しているほど高スコア。
-    agent 経験ゼロは評価不能 (None)。
+    ``conversation_ended`` による +0.3 の加点は**外した**。この信号は実測 99.5%
+    が True なうえ、``1/loops`` が 1.0 (= 単発ループ) のとき 1.3 → clamp 1.0 と
+    なり、**単発ループのターンが全て厳密に 1.0 に潰れる**。ループ数という唯一の
+    判別項を clamp の天井が消していた。
+
+    agent 母集合 (``agent_loops > 0``) のサンプル不足は評価不能 (None)。実測
+    2026-08-18 では 206 件中 1 件しかなく、この 1 件から fitness=1.0 が
+    best_fitness へ焼き付いていた。
     """
     agent_exps = [
         e for e in experiences
         if e.get("signals", {}).get("agent_loops", 0) > 0
     ]
-    if not agent_exps:
+    if len(agent_exps) < MIN_FITNESS_SAMPLES:
         return None
 
     scores = []
@@ -927,8 +1317,6 @@ def _calc_fitness_agent(experiences: list[dict]) -> float | None:
         signals = e.get("signals", {})
         loops = max(1, signals.get("agent_loops", 1))
         efficiency = 1.0 / loops
-        if signals.get("conversation_ended"):
-            efficiency += 0.3
         if signals.get("user_correction"):
             efficiency -= 0.3
         scores.append(max(0.0, min(1.0, efficiency)))
@@ -960,28 +1348,23 @@ def _calc_fitness_long_form(experiences: list[dict]) -> float | None:
             error_penalty = min(0.3, errors * 0.1)
             scores.append(max(0.0, min(1.0, completion_rate - error_penalty)))
 
-    if not scores:
+    if len(scores) < MIN_FITNESS_SAMPLES:
         return None
 
     return sum(scores) / len(scores)
 
 
 def _calc_fitness_default(experiences: list[dict]) -> float | None:
-    """デフォルト fitness: 会話完了率ベース。経験ゼロは評価不能 (None)。"""
-    total = len(experiences)
-    if total == 0:
-        return None
+    """デフォルト fitness: 観測された欠陥の率。サンプル不足は評価不能 (None)。
 
-    good = sum(
-        1 for e in experiences
-        if e.get("signals", {}).get("conversation_ended")
-    )
-    bad = sum(
-        1 for e in experiences
-        if (e.get("signals", {}).get("user_correction")
-            or e.get("signals", {}).get("rephrased_query"))
-    )
-    return max(0.0, min(1.0, (good - bad * 0.5) / total + 0.5))
+    新ドメイン追加時のフォールバック。旧実装は ``conversation_ended`` 加点
+    ベースだったが、それは恒真で選択圧を持たない (``_calc_fitness_memory`` の
+    docstring 参照)。既定を欠陥率にしておくことで、新ドメインが黙って乱歩を
+    始めることを防ぐ。
+    """
+    if len(experiences) < MIN_FITNESS_SAMPLES:
+        return None
+    return _defect_rate_fitness(experiences)
 
 
 _FITNESS_FUNCTIONS: dict[str, Callable[..., float | None]] = {

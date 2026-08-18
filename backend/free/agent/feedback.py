@@ -448,6 +448,9 @@ class FeedbackCollector:
         long_form_false_positive: bool = False,
         long_form_false_negative: bool = False,
         step_credits: list[dict] | None = None,
+        completion_tokens: int | None = None,
+        prompt_tokens: int | None = None,
+        cached_prompt_tokens: int | None = None,
     ) -> ExperienceEntry:
         """シグナル収集 → ExperienceBuffer に記録"""
         if self._disabled:
@@ -508,6 +511,9 @@ class FeedbackCollector:
             long_form_false_positive=long_form_false_positive,
             long_form_false_negative=long_form_false_negative,
             step_credits=step_credits or [],
+            completion_tokens=completion_tokens,
+            prompt_tokens=prompt_tokens,
+            cached_prompt_tokens=cached_prompt_tokens,
         )
 
         entry = ExperienceEntry(

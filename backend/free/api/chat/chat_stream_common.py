@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 from backend.app_state import AppState
 from backend.free.api.chat.chat_constants import MAX_STEP_QUEUE_SIZE
+from backend.free.api.chat.chat_recorder import read_llama_prompt_tokens
 from backend.free.api.chat.chat_service import make_token_info
 from backend.free.api.chat.chat_types import ChatMessage, StepCallback
 from backend.free.api.schemas import ChatResponse, TokenInfo
@@ -104,17 +105,12 @@ def _emit_timing(
     # prompt_n = 再評価したトークン / cache_n = 再利用できたトークン。
     # これが requests.jsonl に無いと、キャッシュの効きは llama-base.stderr.log の
     # 行をチャットターンへ手で突き合わせるしかなく、aux と取り違えやすい。
-    client = getattr(getattr(state, "gen", None), "llm_client", None)
-    llama_timings = getattr(getattr(client, "local", client), "_last_timings", None)
-    if isinstance(llama_timings, dict):
-        prompt_n = llama_timings.get("prompt_n")
-        cache_n = llama_timings.get("cache_n")
-        if isinstance(prompt_n, int) and isinstance(cache_n, int):
-            total = prompt_n + cache_n
-            timing["prompt_n"] = prompt_n
-            timing["cache_n"] = cache_n
-            if total > 0:
-                timing["cache_hit_pct"] = round(100.0 * cache_n / total, 1)
+    total, cache_n = read_llama_prompt_tokens(state)
+    if total is not None and cache_n is not None:
+        timing["prompt_n"] = total - cache_n
+        timing["cache_n"] = cache_n
+        if total > 0:
+            timing["cache_hit_pct"] = round(100.0 * cache_n / total, 1)
 
     dl = state.debug_logger
     if dl is None:

@@ -819,6 +819,14 @@ class LocalClient(BaseHTTPClient):
         """
         import time as _time
 
+        # 直近 timings を捨ててから開始する。``_last_timings`` は「このクライアント
+        # が最後に観測した値」でしかないため、今回のリクエストが usage を伴わずに
+        # 終わると **前回のターンの値がそのまま読まれる**。実測 (2026-08-18): 連続
+        # 2 ターンが同一の prompt=2337 / cached=3 で記録され、2 ターン目は生成を
+        # 通っていなかった。未計測は None のまま残すのが正しい (消費側は「未計測」
+        # と「消費ゼロ」を区別する)。
+        self._last_timings = None
+
         logger.debug("Stream generate: POST %s/v1/chat/completions", self.url)
         line_count = 0
         data_line_count = 0
