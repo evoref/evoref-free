@@ -594,6 +594,13 @@ embedding:
   llama_port: 8082                 # llama-server ポート（backend: llama-cpp 時）
   dim: 1024                        # 埋め込みベクトルの次元数（Qwen3-Embedding-0.6B: 1024）
   timeout: 30.0                    # 埋め込みリクエストのタイムアウト（秒）
+  # チャット応答パスの単一クエリ埋め込みだけに掛かるデッドライン（秒、0 で無効）。
+  # バッチ／ドキュメント側には掛からない（sleep-time の 64 件バッチは本来長い）。
+  # 超過時はそのターンだけ記憶なしで応答を続ける（カートリッジ検索と同じ縮退）。
+  # 実測 2026-08-18 の実往復 262 件: 中央値 217ms / p90 1292ms / p95 3122ms /
+  # 最大 8057ms。1.0s 超は 16.0% だが 2.0s 超は 6.1% と二峰で、3.0s 超の 5.7% が
+  # 「埋め込みサーバが詰まっている」区間。既定はその裾だけを切る位置に置く。
+  query_timeout: 3.0
   model_name: Qwen/Qwen3-Embedding-0.6B       # HuggingFace モデル名
   max_length: 8192                # 入力最大トークン長
   # 文脈長 (-c)。必ず max_length 以上にすること (下回ると長入力で 500)。
@@ -699,8 +706,11 @@ memory:
     auto_for_evolved_policies: true                            # 例外: auto_evolved=True の policy のみ自動マージ
     # pending 競合の TTL 自動解消: グループ内最新ファクトの created_at から
     # N 日経過した pending を sleep-time Step 6B が keep_new で自動解消する。
-    # pinned / project / policy を含むグループは対象外 (チャット回答でのみ解決)。
-    # default_mode: manual でも有効。0 で無効。
+    # pinned / project / policy も対象 (以前は「チャット回答でのみ解決」として
+    # 除外していたが、そのチャット回答の判定経路は 2026-08-14 に撤去されており、
+    # 除外したままだと解決手段がゼロになり永久に pending へ滞留する)。
+    # keep_new は同じスロットの古い世代を supersede するだけで、最新の値は残る。
+    # default_mode: manual でも有効。0 で無効 (自動解決そのものを止める)。
     pending_auto_resolve_days: 3.0
     # 同 (subject, predicate) を「同じ属性についての言い直し」とみなす最小類似度。
     # subject は属性単位へ分割される設計だが、トリガ辞書に無い属性は
@@ -708,15 +718,15 @@ memory:
     # 同じスロットに同居して偽の競合になる。実測では真の競合 0.796〜0.963 /
     # 偽の競合 0.316〜0.418 で完全に分離する。0 で無効。
     attribute_similarity_threshold: 0.55
-    # pending 競合のチャット確認フロー。チャット注入で AI がユーザーに確認し、
-    # 回答を LLM (conflict_chat_judge) で判定して即時解決する。
+    # pending 競合のチャット提示。未解決の競合を [記憶の競合] セクションとして
+    # プロンプトへ連結し、AI が会話の流れでユーザーに確認できるようにする。
+    # ユーザー回答の LLM 判定 (旧 conflict_chat_judge) は 2026-08-14 に撤去済で、
+    # 解決は sleep-time の競合解決と上の TTL 自動解消が担う。
     chat_review:
-      enabled: true                                            # false で注入・判定とも停止
+      enabled: true                                            # false で提示を停止
       max_groups: 3                                            # 注入グループ上限 (0=無制限、超過分は件数のみ要約)
       max_tokens: 400                                          # ブロック全体のトークン上限 (0=無制限、最低1グループは必ず注入)
-      # conflict_chat_judge のセッション内発火上限。上限到達後は同一
-      # セッションでの判定と pending 注入を停止する (滞留 pending が毎ターン
-      # realtime スロットを専有するのを防ぐ)。0 = 無制限。
+      # 撤去済みの判定経路の名残 (現在は未参照)。スキーマ互換のため残している。
       max_judge_per_session: 3
   # --- MemoryInjector ---
   # NOTE: policy ファクトの active 閾値は learning.policy.activation_min_confidence
@@ -726,8 +736,19 @@ memory:
     chat_budget_tokens: 800                                    # チャットモードの注入予算 (tokens)
     create_budget_tokens: 2000                                 # クリエイトモードの注入予算 (tokens)
     relevance_enabled: true                                    # クエリ埋め込みとの関連度で注入候補を足切りする
-    relevance_min_score: 0.35                                  # 関連度ゲートのコサイン類似度閾値
-    pinned_relevance_min_score: 0.10                           # pinned に課す下限。0 にすると完全迂回し、無関係なターンにも毎回載る
+    # 閾値の解決方法。auto は較正 (memory_threshold_calibration) があればそれを使い、
+    # 無ければ下の静的値へ縮退する。manual は常に静的値。
+    # 静的な絶対閾値は埋め込みモデルを替えると到達不能になり黙って全部落とす
+    # (rag.relevance_threshold 0.65 と low_quality_keep_floor 0.40 で 2 度発生済)。
+    # RAG 側は threshold_mode: auto で守られていたが、注入側のこの 1 本だけが
+    # 静的なまま残っていたため揃えた。
+    threshold_mode: auto
+    relevance_min_score: 0.35                                  # 関連度ゲートのコサイン類似度閾値 (manual / 較正なしのとき)
+    # pinned に課す下限。0 にすると完全迂回し、無関係なターンにも毎回載る。
+    # auto かつ較正ありのときは較正 relevance の半分を使う (現行 embedder で 0.151)。
+    # 静的既定 0.10 は背景ノイズ分布 (p50 0.039 / p95 0.302) の内側で、pin が付いた
+    # 瞬間にほぼ全ターン載る位置にある。
+    pinned_relevance_min_score: 0.10
     tier_ratios:
       chat: [0.40, 0.35, 0.15, 0.10]                           # Tier 1〜4 比率 (合計 1.0)
       create: [0.40, 0.35, 0.15, 0.10]                         # Tier 1〜4 比率 (合計 1.0)
@@ -908,6 +929,10 @@ learning:
   # Few-shot プール
   fewshot_pool_size: 50               # モード別最大プールサイズ
   fewshot_min_fitness: 0.7            # プール追加の最低 fitness
+  # GC (Step 14) で無条件に破棄する quality_score の下限。採点は採用の後に走るため
+  # intake では掛けられず、従来はサイズ超過時の下位切りしか無かった。実データでは
+  # 0.1 と 0.9 の二極分布で、0.1 帯の例がプール上限に達するまで滞留していた。
+  fewshot_min_quality_score: 0.5
   fewshot_max_examples: 3             # プロンプトに埋め込む最大 Few-shot 数
   fewshot_diversity_threshold: 0.8    # 重複判定のコサイン類似度上限
   # トークン予算進化

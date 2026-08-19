@@ -261,22 +261,31 @@ class InjectionConfig(BaseModel):
             "従来の静的スコアのみ (recency / type / tier) に戻る"
         ),
     )
+    threshold_mode: Literal["auto", "manual"] = Field(
+        default="auto",
+        description=(
+            "関連度ゲートの閾値解決。auto は較正 (memory_threshold_calibration) が"
+            "あればそれを使い、無ければ下の静的値へ縮退する。manual は常に静的値。"
+            "rag.self_rag.threshold_mode と同じ意味"
+        ),
+    )
     relevance_min_score: float = Field(
         default=0.35, ge=0.0, le=1.0,
         description=(
-            "関連度ゲートのコサイン類似度閾値。実測 (LFM2.5-Embedding-350M) で"
-            "真陽性 0.38〜0.44 / ノイズ中央値 0.12〜0.17"
+            "関連度ゲートのコサイン類似度閾値 (manual / 較正なしのときの静的値)。"
+            "実測 (LFM2.5-Embedding-350M) で真陽性 0.38〜0.44 / ノイズ中央値 0.12〜0.17"
         ),
     )
     pinned_relevance_min_score: float = Field(
         default=0.10, ge=0.0, le=1.0,
         description=(
-            "pinned ファクトに課す関連度の下限。pin は優先度の指定であって"
-            "「常に関連する」の宣言ではなく、しかも「覚えておいてください」等の"
-            "語で自動 pin されるため、0 (完全迂回) だと無関係なターンにも毎回"
-            "載り続ける。実測 2026-08-09: 0 → 0.10 で記憶不要ターンの注入が"
-            "297→81 token (約 2.2→0.6 秒) に減り、想起ターンは注入量・正答とも"
-            "無変化。0.35 で想起が壊れ始める"
+            "pinned ファクトに課す関連度の下限 (manual / 較正なしのときの静的値)。"
+            "pin は優先度の指定であって「常に関連する」の宣言ではなく、しかも"
+            "「覚えておいてください」等の語で自動 pin されるため、0 (完全迂回) だと"
+            "無関係なターンにも毎回載り続ける。実測 2026-08-09: 0 → 0.10 で記憶不要"
+            "ターンの注入が 297→81 token (約 2.2→0.6 秒) に減り、想起ターンは注入量・"
+            "正答とも無変化。0.35 で想起が壊れ始める。auto かつ較正ありのときは"
+            "較正 relevance の半分を使う (MemoryInjector の PINNED_RELEVANCE_RATIO)"
         ),
     )
 

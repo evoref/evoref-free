@@ -96,6 +96,8 @@ def create_embedding_backend(
             model_name = emb_cfg.get("model_name", "Qwen/Qwen3-Embedding-0.6B")
             dim = emb_cfg.get("dim", 1024)
             timeout = emb_cfg.get("timeout", 30.0)
+            # チャット応答パスの単一クエリだけに掛かるデッドライン。
+            query_timeout = emb_cfg.get("query_timeout", 3.0)
             max_length = emb_cfg.get("max_length", 8192)
             # instruction-aware プレフィックス (Qwen3 等)。
             # ``embedding.instructions`` が config.yaml に無い場合は schema 既定値が
@@ -116,6 +118,7 @@ def create_embedding_backend(
                 model_name_str=model_name,
                 dim_size=dim,
                 timeout=timeout,
+                query_timeout=query_timeout,
                 max_length=max_length,
                 instructions=instructions,
                 query_template=query_template,

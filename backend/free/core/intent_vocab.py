@@ -900,3 +900,48 @@ DATETIME_QUERY_RE = re.compile(
     r"(?<![A-Za-z])(?:date|time)(?![A-Za-z]))",
     re.IGNORECASE,
 )
+
+
+#: 問い・依頼を表すマーカー。これが 1 つでもあれば平叙の自己申告ではない。
+#: ``agent.router._ENV_FACT_ASK_RE`` より広く取る (「調べたい」「表示して」等の
+#: 語幹も拾う) — こちらは **実行を止める** 側の判定なので、取りこぼしより
+#: 過剰抑止の方が害が大きい。
+_REQUEST_MARKER_RE = re.compile(
+    r"[?？]"
+    r"|(?:教えて|おしえて|ですか|でしょうか|ありますか|ますか"
+    r"|知りたい|見たい|調べ|確認|表示|出力|見せ|示して|挙げ|列挙|一覧"
+    r"|ください|下さい|くれる|ほしい|欲しい|頂け|いただけ|できますか)"
+    r"|(?:what|which|how|why|when|where|who"
+    r"|show|tell|list|print|check|give)",
+    re.IGNORECASE,
+)
+
+#: 平叙文の文末 (「〜です。」「〜使っています。」「〜しました」)。
+#: 体言止め (「PC のスペック」「hostname」) は含めない — 短い名詞句クエリは
+#: 実際の問い合わせとして頻出するため。
+_STATEMENT_TAIL_RE = re.compile(
+    r"(?:です|ます|でした|ました|ている|ています|でいる|だった|かった"
+    r"|しました|なりました|らしい|そうです|らしいです)"
+    r"\s*[。．.!！]*\s*$",
+)
+
+
+def is_plain_statement(query: str) -> bool:
+    """問い・依頼のマーカーが無く、平叙の文末で終わる **自己申告** か (純粋関数)。
+
+    語彙一致だけで実行を決めるルール表は、ユーザーの自己紹介・状況説明にも
+    当たる。実インシデント (2026-08-19 ライブ監査 ターン3):
+    「愛用エディタは Neovim で、ターミナルは Windows Terminal を使っています。」
+    という **単なる報告** に ``Windows`` が部分一致し、``run_command_readonly``
+    で ``platform.platform()`` が撃たれた (17 秒消費し、回答も OS の話に流れた)。
+
+    ``asks_environment_fact`` (router) の裏返しだが、こちらは「問いのマーカーが
+    無い」だけでは False を返さない。「PC のスペック」「hostname」のような
+    体言止めの問い合わせを止めないためで、**平叙の文末で終わる場合に限って**
+    True を返す。
+    """
+    if not query:
+        return False
+    if _REQUEST_MARKER_RE.search(query):
+        return False
+    return bool(_STATEMENT_TAIL_RE.search(query.strip()))

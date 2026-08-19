@@ -28,6 +28,9 @@ from datetime import datetime, timezone
 
 
 from backend.free.core.text_quality import carries_no_assertion
+from backend.free.memory.pipeline.injector import (
+    INTERNAL_INDEX_SUBJECT_PREFIXES,
+)
 from backend.free.memory.pipeline.semantic_conflict_resolver import (
     CONFLICTS_PENDING_FILENAME,
     CONFLICTS_RESOLVED_FILENAME,
@@ -188,6 +191,22 @@ def collect_review_groups(
        ``旧「私の趣味をもう一度確認させてください。」/ 新「私の趣味をもう一度
        確認させてください。」`` のように **同じ文が旧と新の両方**に並び、
        ブロック自体が自己矛盾する (実測 2026-08-09)。
+
+    4. **内部索引の subject を除く。**
+       ``MemoryInjector`` はセッション要約 / MDP エピソードトレース /
+       executable command 索引を ``[関連する記憶]`` から落としている
+       (:data:`~backend.free.memory.pipeline.injector.INTERNAL_INDEX_SUBJECT_PREFIXES`)。
+       いずれも「アシスタント側の記録」であってユーザーについての事実ではなく、
+       根拠枠に並べると自分の過去の出力が事実として提示されるため。
+       **``[記憶の競合]`` にはこのフィルタが無い**ため、同じ内容が別の窓から
+       出うる。実データ (2026-08-19 時点) の global scope の pending は
+       **全 2 件ともセッション要約**だった (この 2 件は属性類似度で別クラスタへ
+       割れるため表示グループにはなっていないが、同じ属性の要約が 2 世代
+       並べば「アシスタント自身の過去の要約のどちらが正しいか」がそのまま
+       ユーザーへ出る)。
+
+       落とすのは表示だけで、解決 (supersede / TTL) の対象は変えない
+       — ``collect_pending_groups`` は素通しのままにする。
     """
     by_slot: dict[tuple[str, str], list[SemanticFact]] = {}
     for f in store.all_facts(include_superseded=False):
@@ -197,6 +216,8 @@ def collect_review_groups(
 
     groups: list[PendingConflictGroup] = []
     for base in collect_pending_groups(store, scope, similarity_threshold):
+        if base.subject.startswith(INTERNAL_INDEX_SUBJECT_PREFIXES):
+            continue
         newest_by_object: dict[str, SemanticFact] = {}
         for f in by_slot.get((base.subject, base.predicate), []):
             cur = newest_by_object.get(f.object)

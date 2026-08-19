@@ -113,6 +113,50 @@ def _parse_nvidia_smi_csv(output: str) -> dict[int, int]:
     return result
 
 
+def gpu_memory_snapshot(timeout_sec: float = 2.0) -> list[dict[str, object]] | None:
+    """搭載 GPU ごとの ``(name, used_mb, total_mb)`` を返す。測れなければ ``None``。
+
+    ``nvidia_smi_snapshot`` はプロセス単位 (``--query-compute-apps``) の使用量で、
+    「GPU 全体の VRAM 使用状況」には答えられない。こちらは ``--query-gpu`` を使う。
+
+    ``nvidia-smi`` が無い環境 (AMD / Apple Silicon / Intel GPU) では ``None`` を
+    返す。**推測値で埋めない** — 埋めると base がそれを実測値として述べる
+    (``free/core/system_info`` と同じ方針)。
+
+    ``system_hardware_info`` ツール経由でチャット応答パスから呼ばれるため
+    timeout は短め。``shutil.which`` が None を返す環境では subprocess を
+    起動しないので追加コストは無い。
+    """
+    if not nvidia_smi_available():
+        return None
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=name,memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout_sec, check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        logger.debug("nvidia-smi --query-gpu failed: %s", e)
+        return None
+    if proc.returncode != 0:
+        logger.debug("nvidia-smi --query-gpu non-zero (%s)", proc.returncode)
+        return None
+    gpus: list[dict[str, object]] = []
+    for raw_line in proc.stdout.splitlines():
+        parts = [p.strip() for p in raw_line.split(",")]
+        if len(parts) < 3:
+            continue
+        used = "".join(ch for ch in parts[1] if ch.isdigit())
+        total = "".join(ch for ch in parts[2] if ch.isdigit())
+        if not used or not total:
+            continue
+        gpus.append({"name": parts[0], "used_mb": int(used), "total_mb": int(total)})
+    return gpus or None
+
+
 def nvidia_smi_snapshot(timeout_sec: float = 3.0) -> dict[int, int] | None:
     """``nvidia-smi --query-compute-apps=pid,used_memory`` を実行して dict で返す
 

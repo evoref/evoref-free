@@ -137,12 +137,28 @@ async def prepare_memory_context(
             if state.feedback_collector is not None:
                 state.feedback_collector.mark_conversation_ended()
 
+        # 値の言い直しの印。ここで立てておくと (a) 抽出器が直前の名前付き属性を
+        # 継承して訂正が対象と同じスロットへ入り、(b) sleep-time の競合解決が
+        # 「同一セッションだから微妙ケース」として pending へ落とすのを免除する。
+        # アシスタントの誤りの指摘だけでなく、ユーザー自身の申告訂正
+        # (「すみません、登山ではなく写真の間違いでした」) も含む — 記憶側は
+        # 「現在値が何か」を持つので、後者も正当な値更新として扱う
+        # (restates_a_value / SemanticFact.from_correction 参照)。
+        # 判定は純粋関数で、失敗しても訂正の印が付かないだけなので握って続ける。
+        try:
+            from backend.free.agent.feedback import restates_a_value
+
+            correction = restates_a_value(req.message)
+        except Exception as exc:
+            logger.warning("correction detection failed (continuing): %s", exc)
+            correction = False
         wm.add_turn(
             "user",
             req.message,
             private=req.private,
             mode=req.mode,
             source="user",
+            correction=correction,
         )
         history = wm.get_messages()
 
@@ -430,12 +446,28 @@ def build_semmem_injection(
     ``conflict_ctx`` に pending 競合がある場合、Tier パッキングとは独立した
     「記憶の競合」セクションを末尾に連結する (Tier 予算の drop 対象に
     しないことで毎ターンの注入を保証する)。
+
+    **埋め込みが取れなかったターンは facts / notes を注入しない。**
+    ``MemoryInjector`` は ``query_embedding=None`` を「関連度ゲート無効」と
+    解釈して全候補を通す (``_is_relevant`` 冒頭)。これは embedder 自体が無い
+    構成のための後方互換だが、embedder はあるのに埋め込みが失敗 / デッドライン
+    超過したターンでも同じ経路に落ちるため、**ゲートが最も要る場面で全店注入に
+    切り替わる**。予算 800 トークンが無関係な記憶で埋まり、弱い base モデルが
+    それを回答対象と誤解する — 関連度ゲートを入れた元の事象そのもの。
+    embedder があるのに ``query_vec`` が無い = そのターンの埋め込みが失敗した、
+    と判定して注入を見送る (競合セクションは関連度と無関係なので出す)。
     """
     mem_sys = state.get_memory_system()
     if not mem_sys:
         return None
     inj_mode = normalize_session_mode(mode)
     rendered: str | None = None
+    if state.embedder is not None and query_vec is None:
+        logger.info(
+            "semmem injection skipped: query embedding unavailable this turn "
+            "(the relevance gate would be bypassed and inject the whole store)",
+        )
+        return _render_conflict_section(cfg, conflict_ctx)
     try:
         from backend.free.memory.pipeline.injector import MemoryInjector
 

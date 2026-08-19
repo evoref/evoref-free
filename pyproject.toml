@@ -27,7 +27,7 @@ include = ["backend*"]
 # === テストカバレッジ計測 (pytest-cov / coverage) ===
 # ローカル実行前提
 # Free 版ベースラインを取得するため backend/pro/* は除外する。
-# 詳細: docs/c_08_testing_strategy.md §7.6
+# 詳細: docs/c_08_testing_strategy.md §2.3 / §5.4
 [tool.coverage.run]
 source = ["backend"]
 branch = true

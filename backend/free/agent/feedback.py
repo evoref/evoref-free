@@ -18,8 +18,19 @@ from backend.free.core.intent_vocab import (
     EXPLICIT_WINDOWS_PATH_RE,
     REFERENTIAL_WRITE_TARGET_RE,
 )
-from backend.free.core.locale_patterns import select_locale_variant
+from backend.free.core.locale_patterns import is_en_locale, select_locale_variant
 from backend.free.core.session_mode import is_create_mode
+from backend.free.core.response_arithmetic import find_arithmetic_contradictions
+from backend.free.core.text_quality import (
+    has_broken_ja_spacing,
+    has_chinese_token_leak,
+    retracts_own_conclusion,
+)
+from backend.free.core.text_similarity import (
+    bigram_coverage,
+    bigram_cosine,
+    content_bigram_cosine,
+)
 from backend.free.learning.level0_instant import (
     RESPONSE_FULL_CAP,
     RESPONSE_SUMMARY_CAP,
@@ -331,6 +342,57 @@ _RECORD_DIVERGENCE_RE_EN = re.compile(
 )
 
 
+def _correction_attribution(query: str) -> str | None:
+    """字句一致した訂正候補の **帰属** を返す。訂正でなければ ``None``。
+
+    「訂正の言い回しが出ているか」(字句) と「誰が誤っていたか」(帰属) を 1 箇所に
+    まとめる。下の 2 つの公開述語はここから作る — **記憶層と学習層で必要な
+    「訂正」の範囲が違う**ので、判定の芯だけを共有して境界だけ分ける。
+
+    戻り値は :func:`classify_correction_target` と同じ ``assistant`` /
+    ``self`` / ``not_correction``。
+    """
+    if not query:
+        return None
+    lexical = any(p.search(query) for p in CORRECTION_PATTERNS) or (
+        cites_record_divergence(query)
+    )
+    if not lexical:
+        return None
+    return classify_correction_target(query)
+
+
+def restates_a_value(query: str) -> bool:
+    """この発話が **ユーザー自身の値の言い直し** か (純粋関数)。
+
+    **記憶層** (SemMem のスロット更新) が使う述語。``assistant`` (アシスタントの
+    誤りの指摘) と ``self`` (ユーザー自身の申告訂正) の両方を拾う。
+
+    学習の欠陥シグナルより広いのは、両者で必要な意味が違うため:
+
+    - 学習は「アシスタントが誤ったか」を数える。「すみません、火曜ではなく水曜の
+      間違いでした」はアシスタントの応答が正しいので **欠陥ではない**
+      (``FeedbackCollector._detect_correction`` が ``self`` を落とす)。
+    - 記憶は「その属性の現在値が何か」を持つ。上の発話は **正当な値更新** で、
+      落とすと古い値が live のまま残る。
+
+    ``not_correction`` (訂正について尋ねる質問 / 比較質問 / 書式変更依頼 /
+    既存ファイルへの編集依頼) は両者とも対象外。
+
+    用途: チャット応答パスが ``WorkingMemory.add_turn(correction=...)`` へ渡し、
+    ``MemoryNote.is_correction`` → ``SemanticFact.from_correction`` と伝播する。
+    伝播先は 2 つ —
+
+    1. ``ChatExtractor`` が **直前の名前付き属性を継承**して、訂正が対象と
+       同じスロットへ入るようにする (継承しないと「違います、ほうじ茶です」の
+       ように属性語を含まない訂正が ``mem.*.user`` へ落ち、競合検出が対に
+       できない。実測 2026-08-19: 訂正済みの「緑茶」が sim 0.762 で最上位、
+       訂正後の「ほうじ茶」が 0.487 で下位に並んでいた)
+    2. ``SemanticConflictResolver._decide`` が確認を挟まず即 supersede する
+    """
+    return _correction_attribution(query) in ("assistant", "self")
+
+
 def cites_record_divergence(query: str) -> bool:
     """「自分はこう言ったはず」と記録の食い違いを指摘しているか (純粋関数)。
 
@@ -351,8 +413,53 @@ _DONE_MARKER_RE = re.compile(r"(?:^|\n)\s*-\s*\[done\]", re.IGNORECASE)
 # 定義は core.intent_vocab が SSOT (agent.meta_cognitive が同一定義を持っていた)。
 _QUERY_PATH_RE = EXPLICIT_WINDOWS_PATH_RE
 
-# 言い換えパターン（同じ質問の言い直し検出用）
-REPHRASE_THRESHOLD = 0.5  # 類似度閾値
+# ── 言い換え (同じ質問の言い直し) の検出 ──────────────────────────
+#
+# 旧実装は **文字集合の Jaccard** (順序も出現回数も無視) で閾値 0.5 だった。
+# 日本語は助詞・語尾・句読点の文字が共通するため、同じテンプレートの別質問が
+# 必ず閾値を超える。しかも ``rephrased_query`` は Level 1 の欠陥重み 0.6 を持ち、
+# **選択圧の主成分**になっている。
+#
+# 実測 (2026-08-18、経験 136 件 / 旧実装が言い換えと判定した 17 組を全数確認):
+#
+#   真の言い直し   1 件 (完全同文の再入力)
+#   別の質問       1 件 「あなたの名前を教えて」→「あなたの得意なことを教えて」
+#   深掘り        15 件 「Xを3行で教えて」→「Xを、Yに絞って3行で教えて」
+#
+#   欠陥重みの内訳 13.2 = rephrased 17×0.6 + user_correction 3×1.0
+#   → 9.6 (73%) が誤検出由来
+#
+# 指標を 2 つに分ける:
+#
+# 1. **深掘りの除外** — 前の発話がほぼそのまま残り、新しい語が足された形。
+#    ``bigram_coverage`` (非対称) と長さ比の AND で見る。実測の分離:
+#      深掘り   coverage 0.929〜0.955 / 長さ比 1.45〜1.73
+#      言い直し coverage 0.857        / 長さ比 1.27
+#      別の質問 coverage 0.667        / 長さ比 1.30
+# 2. **類似度** — 日本語は **内容語だけ** の bi-gram コサインで測る
+#    (``content_bigram_cosine``)。生のコサインでは機能語が支配的になり、
+#    真偽が逆転する:
+#
+#      言い直し 「Pythonのリスト操作を教えて」→「Pythonでリストの操作方法は？」
+#               生 0.516 / 内容語 0.870
+#      別の質問 「あなたの名前を教えて」→「あなたの得意なことを教えて」
+#               生 0.577 / 内容語 0.000
+#      別の質問 「欠損値の扱いを3行で教えて」→「外れ値の検出を3行で教えて」
+#               生 0.706 / 内容語 0.333
+#
+#    内容語で測ると 真 0.866〜1.000 / 偽 0.000〜0.333 / 深掘り 0.589 に分離する。
+#
+#: 深掘りとみなす coverage の下限。
+_DRILLDOWN_MIN_COVERAGE = 0.90
+#: 深掘りとみなす長さ比 (現/前) の下限。
+_DRILLDOWN_MIN_LENGTH_RATIO = 1.30
+#: 言い直しとみなす内容語 bi-gram コサインの下限 (日本語)。
+#: 実測の真 (0.866+) と 深掘り (0.589) / 偽 (0.333-) の間に置く。
+REPHRASE_THRESHOLD = 0.70
+#: 英語ロケールの閾値。内容語の抽出はひらがな前提なので英語では効かず、生の
+#: bi-gram コサインで測る。**ラベル付きの英語標本が無いため未較正** で、旧実装の
+#: 実効水位 (0.5) をそのまま置いている (指標は集合 Jaccard より厳密になっている)。
+REPHRASE_THRESHOLD_EN = 0.5
 
 # オウム返し (応答がユーザー発話と同一) 判定の最小文字数。これ未満は
 # 「こんにちは」→「こんにちは」のような正当な同語応答があり得るため
@@ -658,8 +765,30 @@ class FeedbackCollector:
         """ターン成否 ("success" | "partial" | "failed") を決定論導出する。
 
         SSE 完走 = 成功ではなく、応答本文の [failed] マーカー・step_credits
-        全 0・ルーティング false_positive・ユーザー発話のオウム返しを失敗
-        シグナルとして扱う。
+        全 0・ルーティング false_positive・ユーザー発話のオウム返し、および
+        **本文の決定論的な破綻** を失敗シグナルとして扱う。
+
+        本文の破綻を見る理由: 実測 (2026-08-18、経験 136 件) で
+        ``turn_outcome`` は **136/136 が success** の恒真だった。純粋なチャット
+        応答では既存の 4 条件がどれも成立しないためで、Level 1 / critique /
+        few-shot の成否シグナルが実質的に情報を持たない。
+
+        一方で few-shot 側は同じ応答に対して 10 種の決定論ゲートを持っている
+        (``fewshot_pool.find_content_rejection``)。ところがその判定は
+        **「手本に採らない」で止まり、成否には反映されていなかった**。判定器の
+        実体が横断基盤 (``core.text_quality`` / ``core.response_arithmetic``) に
+        あるものだけをここでも掛け、「壊れた出力を成功として学習する」経路を塞ぐ。
+
+        採る 4 つ (いずれも誤検出コストが低い決定論):
+
+        - 算術矛盾 — 本文に書かれた式の検算が合わない
+        - 日本語の語間空白 — 崩れた出力の目印 (正常な日本語では発生しない)
+        - 中国語語彙の混入 — 同上
+        - 応答中の自己撤回 — 1 つの応答に結論が 2 つ入っている
+
+        実測での発火は **0/136** (この corpus を出した Qwen3.8-27B には該当が
+        無い)。恒真性が即座に解けるわけではなく、モデルが劣化したときに
+        「壊れた出力が手本として再生産される自己増幅」を断つための網である。
         """
         text = response or ""
         if _FAILED_MARKER_RE.search(text):
@@ -672,7 +801,29 @@ class FeedbackCollector:
             return "failed"
         if _is_user_echo(query, text):
             return "failed"
+        broken = FeedbackCollector._find_broken_output_reason(text)
+        if broken is not None:
+            logger.info("Turn marked failed (%s)", broken)
+            return "failed"
         return "success"
+
+    @staticmethod
+    def _find_broken_output_reason(text: str) -> str | None:
+        """応答本文の決定論的な破綻を返す (無ければ ``None``)。
+
+        判定器はすべて横断基盤の純粋関数。few-shot の内容棄却ゲートと同じ
+        実体を共有する (片方だけ直る状態を作らない)。
+        """
+        contradictions = find_arithmetic_contradictions(text)
+        if contradictions:
+            return f"arithmetic contradiction: {contradictions[0]}"
+        if has_broken_ja_spacing(text):
+            return "broken JA spacing"
+        if has_chinese_token_leak(text):
+            return "Chinese token leaked into JA response"
+        if retracts_own_conclusion(text):
+            return "response retracts its own conclusion mid-answer"
+        return None
 
     def _same_target_path(self, query: str) -> bool:
         """直前クエリと同じ明示出力先パスを再指定しているかを判定する。"""
@@ -685,11 +836,16 @@ class FeedbackCollector:
         return prev.group(0).lower() == curr.group(0).lower()
 
     def _detect_rephrase(self, query: str) -> bool:
-        """直前の質問との類似度で言い換えを検出（簡易版: 文字重複率）
+        """直前の発話の **言い直し** か (制約を足した深掘りは含めない)。
 
         双方に明示的な出力先パスがあり、それが異なる場合は「類似した別の
         新規依頼」(テンプレ連続依頼等) なので rephrase としない
         (2026-07-15: 31 連続の類似依頼で偽陽性 2 件)。
+
+        指標と閾値の根拠は :data:`REPHRASE_THRESHOLD` 周辺のコメントを参照。
+        深掘り (「Xを3行で」→「Xを、Yに絞って3行で」) を先に落とすのが要点で、
+        旧実装 (文字集合 Jaccard) はこれを言い直しとして数え、Level 1 の
+        選択圧の 73% を誤検出で占めていた。
         """
         if self._prev_query is None:
             return False
@@ -703,17 +859,25 @@ class FeedbackCollector:
         ):
             return False
 
-        # 簡易的な文字重複率
-        prev_chars = set(self._prev_query)
-        curr_chars = set(query)
-        if not prev_chars or not curr_chars:
+        prev, curr = self._prev_query.strip(), query.strip()
+        if not prev or not curr:
             return False
 
-        overlap = len(prev_chars & curr_chars)
-        union = len(prev_chars | curr_chars)
-        similarity = overlap / union if union > 0 else 0
+        # 深掘り: 前の発話がほぼそのまま残り、そこへ制約が足されている。
+        # ユーザーが問いを絞り込んだのであって、答えが通じなかったのではない。
+        if (
+            bigram_coverage(prev, curr) >= _DRILLDOWN_MIN_COVERAGE
+            and len(curr) >= len(prev) * _DRILLDOWN_MIN_LENGTH_RATIO
+        ):
+            logger.debug(
+                "Rephrase candidate is a drill-down (constraints added); "
+                "not counting it as a defect: %s", curr[:60],
+            )
+            return False
 
-        return similarity > REPHRASE_THRESHOLD
+        if is_en_locale():
+            return bigram_cosine(prev, curr) >= REPHRASE_THRESHOLD_EN
+        return content_bigram_cosine(prev, curr) >= REPHRASE_THRESHOLD
 
     def _apply_self_retraction(self, signals, response: str) -> None:
         """アシスタント自身の撤回を検出し、**直前ターン**を failed へ落とす。

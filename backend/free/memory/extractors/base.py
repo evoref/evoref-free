@@ -187,6 +187,7 @@ class BaseExtractor:
         - subject は ``ctx.canonicalizer`` で正規化 (バイパスは尊重)
         - provenance を 1 件付与 (note 由来 or trace 由来)
         - pinned はノートの ``pin_flag`` を継承
+        - ``from_correction`` はノートの ``is_correction`` を継承
         - confidence はデフォルト 0.5
         """
         canonical = subject.strip()
@@ -221,6 +222,10 @@ class BaseExtractor:
             provenances=[prov],
             confidence=confidence,
             pinned=bool(getattr(note, "pin_flag", False)),
+            # 訂正ターン由来か。ノートから引き継ぎ、競合解決が「同一セッション
+            # だから微妙ケース」として pending へ落とすのを免除する
+            # (SemanticFact.from_correction の説明を参照)。
+            from_correction=bool(getattr(note, "is_correction", False)),
             created_at=now,
             accessed_at=now,
             session_ids=(

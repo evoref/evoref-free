@@ -1,6 +1,6 @@
 """CodeSkeleton — 正規表現によるコード構造抽出
 
-設計書 f_08_long_form_generation.md §3.2, §8 準拠。
+設計書 f_08_long_form_generation.md §3.3.1 準拠。
 生成済みコードから型・シグネチャ・import 等のスケルトンを
 LLM 不要のルールベースで抽出し、ローリングコンテキストに利用する。
 """

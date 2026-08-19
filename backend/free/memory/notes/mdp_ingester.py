@@ -52,7 +52,10 @@ from typing import Any
 
 from backend.free.constants import READ_FILE_META_PREFIX
 from backend.free.core.session_mode import normalize_session_mode
-from backend.free.memory.extractors.mdp_trace import episode_task_and_result
+from backend.free.memory.extractors.mdp_trace import (
+    episode_task_and_result,
+    strip_volatile_measurements,
+)
 from backend.free.memory.stores.short_term import MemoryNote
 from backend.log_config import get_logger
 
@@ -93,7 +96,7 @@ def _summarize_observation(observation: str) -> str:
         end = text.find("]")
         if end != -1:
             return text[: end + 1]
-    return text[:_OBSERVATION_MAX_CHARS]
+    return strip_volatile_measurements(text)[:_OBSERVATION_MAX_CHARS]
 
 
 # ──────────────────────────────────────────────────────────────────────────

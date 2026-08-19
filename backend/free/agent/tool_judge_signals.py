@@ -342,7 +342,16 @@ _HARDWARE_MEMORY_QUERY_RE = re.compile(
     r"|CPU\s*(?:の)?\s*(?:使用[率量]|利用[率量]|負荷)"
     r"|(?<![A-Za-z])cpu\s+(?:usage|load|utilization)(?![A-Za-z])"
     r"|(?<![A-Za-z])(?:how\s+much|total|physical|installed|available|free)\s+"
-    r"(?:ram|memory)(?![A-Za-z])",
+    r"(?:ram|memory)(?![A-Za-z])"
+    # GPU / VRAM も同じツールで答える (``format_hardware_facts`` が GPU 行を
+    # 出す。測れない環境では「測れない」と明示する)。ここが抜けていたため
+    # 「GPU の VRAM 使用状況は？」は単独ではどの層にも掛からず、base の
+    # 想像か「分からない」に落ちていた (2026-08-19 ライブ監査 ターン8)。
+    r"|(?<![A-Za-z])VRAM(?![A-Za-z])"
+    r"|(?:GPU|グラボ|グラフィック(?:ス)?\s*(?:カード|ボード)?)"
+    r"[^。．\n]{0,12}"
+    r"(?:メモリ|使用[率量]|空き|残[りって]|容量|積んで|載って"
+    r"|(?<![A-Za-z])(?:memory|usage|used|free|available)(?![A-Za-z]))",
     re.IGNORECASE,
 )
 # 明示的な実行動詞。バッククォートのコマンドと共起したとき「実測要求」とみなす。

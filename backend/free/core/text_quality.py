@@ -494,3 +494,24 @@ __all__ = [
     "strip_discourse_prefix",
     "strip_first_person_topic",
 ]
+
+#: 応答の途中で自分の結論を撤回する言い回し。1 つの応答に結論が 2 つ入る。
+#:
+#: 実インシデント (2026-08-07 ライブ監査):「2の10乗と10の3乗ではどちらが
+#: 大きいですか？」に対し「10の3乗の方が大きいです。… 失礼しました、正しくは
+#: 2の10乗（1,024）の方が大きいです。」と、誤った結論と訂正が同居した応答を
+#: 返した。算術自体は正しいので ``find_arithmetic_contradictions`` では捕まらない。
+#:
+#: 消費側は 2 つ: few-shot の内容棄却ゲート (EvorefLearn) と、ターン成否の
+#: 決定論判定 (``FeedbackCollector._derive_turn_outcome``、EvorefLoop)。
+#: 「手本に採らない」だけでは学習の成否シグナルに届かないため、両方で見る。
+_SELF_RETRACTION_RE = re.compile(
+    r"(?:失礼しました|すみません|申し訳|訂正(?:します|いたします)|"
+    r"間違えました|誤りでした)[、。,\s]*(?:正しくは|訂正)"
+    r"|正しくは.{0,12}でした[。\s]*$",
+)
+
+
+def retracts_own_conclusion(text: str) -> bool:
+    """応答が自分の結論を途中で撤回しているか (純粋関数)。"""
+    return bool(_SELF_RETRACTION_RE.search(text or ""))

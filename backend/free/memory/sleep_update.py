@@ -115,6 +115,11 @@ class SleepTimeWorker:
         # MDPTraceExtractor はプロセス内で episode の二重抽出を防ぐため
         # ワーカー側で 1 インスタンスを保持する。
         self._mdp_trace_extractor = None
+        #: 最後に Step 8 (ファクト抽出) が走った時刻。Step 4 の eviction が
+        #: 「まだ抽出器が見ていないノート」を落とさないための基準
+        #: (:meth:`MemoryEviction.evict` の ``unextracted_cutoff``)。
+        #: 0.0 は「まだ一度も走っていない」= 全ノートを保護する側に倒す。
+        self._last_extraction_at: float = 0.0
         # ── MDPIngester (agent_trace*.jsonl → episodic LTM) ──
         # log_dir は debug_logger の出力先を流用 (agent_trace_dir そのもの)。
         # state ファイルはメモリディレクトリ配下に置く想定だが、テスト容易性
@@ -424,6 +429,18 @@ class SleepTimeWorker:
         if self._check_cancelled():
             return result
 
+        # Step 8.4: Step 8 が型付けできなかった言明のキュレーション。
+        # 日本語の断定は大半が「です」で終わり world_fact トリガに掛からず、
+        # subject 側も ASCII 英字必須で日本語キーワードを弾くため、Step 8 では
+        # 構造的に届かない (2026-08-19 ライブ監査)。命名だけ補助タスクへ出す。
+        ts = time.monotonic()
+        result["assertion_facts_curated"] = await self._step8_4_curate_assertions(
+            llm_client,
+        )
+        step_durations["step8_4_assertion_curator"] = round(time.monotonic() - ts, 3)
+        if self._check_cancelled():
+            return result
+
         # Step 8.5: URL リコール用 world_fact のキュレーション
         # CLAUDE.md §6 #2 に従い、SemMem 書込はここに閉じる。
         # 補助タスク未接続 (degraded) の場合は no-op で通過する。
@@ -646,6 +663,7 @@ class SleepTimeWorker:
             exp_dict,
             self.scorer,
             self.config,
+            unextracted_cutoff=self._extraction_cutoff(),
         )
         if evicted:
             logger.info("Step 4: evicted %d notes", evicted)
@@ -653,6 +671,17 @@ class SleepTimeWorker:
             logger.debug("Step 4: no notes evicted")
         return evicted
 
+
+    def _extraction_cutoff(self) -> float | None:
+        """eviction へ渡す「Step 8 が最後に走った時刻」。
+
+        抽出が無効な構成では ``None`` を返して保護を掛けない — 走らない工程の
+        入力を守り続けると STM が伸びるだけになる。
+        """
+        facts_cfg = (self.config.get("memory") or {}).get("facts") or {}
+        if not facts_cfg.get("enable_extraction", True):
+            return None
+        return self._last_extraction_at
 
     def _step5_5_decay_patterns(self) -> int:
         """Step 5.5: 学習済みパターンの重み減衰と永続化
@@ -751,6 +780,9 @@ class SleepTimeWorker:
         from backend.free.memory.sleep.extraction import extract_semantic_facts
 
         notes = list(self.short_term.notes.values())
+        # 抽出を「走らせた」時刻。次サイクル以降の eviction は、これより後に
+        # 作られたノートだけを保護する (未消費の入力を落とさないため)。
+        self._last_extraction_at = time.time()
         total, self._mdp_trace_extractor = extract_semantic_facts(
             notes,
             config=self.config,
@@ -761,6 +793,27 @@ class SleepTimeWorker:
             mdp_trace_extractor=self._mdp_trace_extractor,
         )
         return total
+
+    # ── Step 8.4 (assertion curator) ───────────────────
+
+    async def _step8_4_curate_assertions(self, llm_client=None) -> int:
+        """Step 8.4: 型付けできなかった言明を ``world_fact`` として書く。
+
+        実ロジックは :mod:`backend.free.memory.sleep.assertion_curator`
+        に分離されている。本メソッドは state を詰め替える薄いラッパ。
+        """
+        from backend.free.memory.sleep.assertion_curator import (
+            curate_assertion_facts,
+        )
+
+        notes = list(self.short_term.notes.values())
+        return await curate_assertion_facts(
+            notes,
+            store_provider=self._semantic_store_provider,
+            aux_client=llm_client,
+            embedder=self.embedder,
+            profile_id=self._profile_id,
+        )
 
     # ── Step 8.5 (URL curator) ─────────────────────────
 

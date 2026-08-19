@@ -48,6 +48,7 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
         model_name_str: str = "qwen3-embedding",
         dim_size: int = 1024,
         timeout: float = 30.0,
+        query_timeout: float = 0.0,
         max_length: int = 8192,
         instructions: dict[str, str] | None = None,
         query_template: str = "Instruct: {task}\nQuery: {query}",
@@ -78,13 +79,16 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
         # 初回レスポンスフラグ: 初回は次元 auto-detect を許可
         # 2 回目以降の変化は異常とみなして例外送出する
         self._dim_detected = False
-        self._init_query_cache()
+        # 単一クエリ側だけにデッドラインを掛ける (バッチ / ドキュメントは
+        # ``timeout`` のまま)。詳細は EmbeddingConfig.query_timeout を参照。
+        self._init_query_cache(deadline_sec=query_timeout)
         logger.info(
             "LlamaCppEmbedder initialized: url=%s, model=%s, dim=%d, max_length=%d, "
-            "instruction_modes=%s, query_template=%r, doc_template=%r",
+            "instruction_modes=%s, query_template=%r, doc_template=%r, "
+            "query_deadline=%.1fs",
             self._url, model_name_str, dim_size, max_length,
             sorted(self._instructions.keys()),
-            self._query_template, self._doc_template,
+            self._query_template, self._doc_template, query_timeout,
         )
 
     def _format_text(self, text: str, *, is_query: bool, mode: str) -> str:

@@ -149,8 +149,51 @@ _REQUEST_ENDING_RE = re.compile(
 
 #: 一人称マーカー。依頼形でもこれを伴う文は本人の事実表明を含みうるため
 #: (例:「私はダークテーマが好きなので、そう設定してください。」)、依頼を
-#: 理由に捨てない。
+#: 理由に捨てない。ただし **一人称があるだけでは免除しない** —
+#: :func:`_asserts_before_request` を参照。
 _SELF_REFERENCE_RE = re.compile(r"(?:私|僕|俺|自分|わたし|ぼく|うち)")
+
+#: 従属節の切れ目 (接続助詞 + 読点)。依頼文の中で「言明の節」と「依頼の節」を
+#: 分ける境界として使う。読点を必須にするのは、体言の並列 (「AとB、Cを…」) を
+#: 節の切れ目と誤認しないため。
+#:
+#: 実インシデント (2026-08-19 ライブ監査): 「私の好きな飲み物をもう一度教えて
+#: ください。」が ``mem.personal.beverage states`` / ``mem.preference.beverage
+#: prefers`` の 2 件として保存され、さらに本人の実際の言明
+#: (「私の好きな飲み物は緑茶です」) と同じ (subject, predicate) に並んだため
+#: 競合の当事者になり pending に滞留した。依頼形ゲート自体は存在したが、
+#: 一人称を含むだけで無条件に免除していたため機能していなかった。
+#:
+#: ``で`` / ``て`` は入れない。「私の好きな飲み物を調べて、教えてください。」の
+#: ような**依頼の中の依頼**まで免除してしまい、直そうとしている誤りが戻る。
+#: 取りこぼす側 (「私は東京在住で、近くの店を教えてください。」) の損失は
+#: 候補 1 件であり、ゴミを入れる損失より小さい。
+_CLAUSE_BREAK_RE = re.compile(
+    r"(?:ので|のに|から|ため|けれども|けれど|けど|ですが|だが|ますが)[、,]",
+)
+
+
+def _asserts_before_request(sentence: str) -> bool:
+    """依頼文が、依頼節より **前の節** に本人の言明を含むかを判定する。
+
+    一人称の有無だけで判定すると、一人称が依頼の**目的語**でしかない文
+    (「私の好きな飲み物をもう一度教えてください。」) まで本人の表明として
+    通ってしまう。言明は依頼とは別の節に立つはずなので、従属節の切れ目
+    (:data:`_CLAUSE_BREAK_RE`) より前に一人称があることを要求する。
+
+    - ``私はダークテーマが好きなので、そう設定してください。`` → ``ので、``
+      より前に「私」がある → True (本人の表明を含む)
+    - ``私の好きな飲み物をもう一度教えてください。`` → 節の切れ目が無い
+      → False (依頼でしかない)
+    - ``明日の予定を、私の代わりに調べてください。`` → 読点はあるが接続助詞
+      ではなく、そもそも「私」は読点より後 → False
+    """
+    last_break = -1
+    for m in _CLAUSE_BREAK_RE.finditer(sentence):
+        last_break = m.end()
+    if last_break < 0:
+        return False
+    return bool(_SELF_REFERENCE_RE.search(sentence[:last_break]))
 
 
 def _tag_evidence_is_question_only(content: str, trigger_words: tuple[str, ...]) -> bool:
@@ -166,8 +209,9 @@ def _tag_evidence_is_question_only(content: str, trigger_words: tuple[str, ...])
 
     - **疑問形** (``_QUESTION_ENDING_RE``) — 「あなたは何が好きですか?」
     - **依頼形** (``_REQUEST_ENDING_RE``) — 「よく使うライブラリを挙げて
-      ください。」。ただし一人称を含む文は本人の事実表明を兼ねうるので
-      除外しない (``_SELF_REFERENCE_RE``)。
+      ください。」。ただし依頼節より前の節に本人の言明がある複合文
+      (「私は〜なので、〜してください。」) は本人の事実表明を兼ねるので
+      除外しない (``_asserts_before_request``)。
     """
     sentences = [s for s in _SENTENCE_SPLIT_RE.split(content) if s.strip()]
     text_lower_sentences = [(s, s.lower()) for s in sentences]
@@ -182,9 +226,9 @@ def _tag_evidence_is_question_only(content: str, trigger_words: tuple[str, ...])
         s = sentence.strip()
         if _QUESTION_ENDING_RE.search(s):
             return True
-        return bool(
-            _REQUEST_ENDING_RE.search(s) and not _SELF_REFERENCE_RE.search(s),
-        )
+        if not _REQUEST_ENDING_RE.search(s):
+            return False
+        return not _asserts_before_request(s)
 
     return all(_is_non_assertive(s) for s in relevant)
 
@@ -382,6 +426,56 @@ def _world_fact_subject_parts(keyword: str, content: str) -> tuple[str, str]:
     return keyword, digest
 
 
+def resolve_inherited_attributes(
+    notes: list[MemoryNote], builder: "ChatNoteBuilder",
+) -> dict[tuple[str, str], str]:
+    """訂正ノートが継ぐべき属性を ``(note_id, tag) -> attr`` で返す (純粋関数)。
+
+    ``resolve_fact_attribute`` は **その発話自身の文** から属性を引く。ところが
+    訂正は属性名詞を落として言うのが普通で、「違います、私はほうじ茶が一番
+    好きです。」には ``飲み物`` も ``コーヒー`` も出てこない。結果 ``None`` →
+    ``mem.preference.user`` へフォールバックし、訂正対象の
+    ``mem.preference.beverage`` と **別スロット**になる。スロットが違うと
+    競合検出が対にできず、``from_correction`` の即時解決も
+    ``_collapse_to_current_values`` の畳み込みも効かない。
+
+    実測 (2026-08-19 ライブ検証): 「私の好きな飲み物は何ですか？」への注入候補で
+    訂正済みの「緑茶」が sim 0.762 で最上位、訂正後の「ほうじ茶」が 0.487 で
+    下位に並んでいた。どちらも同日なので ``(N日前の記録)`` ラベルも付かない。
+
+    **埋め込みでスロットを束ねる案は使えない**。訂正と対象の類似度は実測で
+    真 0.575〜0.714 / 偽 0.429〜0.529 と重なり、閾値を置ける分離が無い
+    (``split_by_attribute_similarity`` が使う「同じ属性の言い直しか」の分離は
+    真 0.796〜0.963 / 偽 0.316〜0.418 で、そちらとは別物)。
+
+    そこで **直前の言明から継ぐ**。発火条件を絞って副作用を閉じる:
+
+    - ノートに ``is_correction`` が立っている (値の言い直し)
+    - **かつ** そのノート自身の属性解決が ``None`` (既存の解決を上書きしない)
+    - **かつ** 同一セッションの直前に、同じ tag で属性を解決できたノートがある
+
+    実測 (STM 42 ノートでのシミュレーション): 発火は狙った 1 件のみで、
+    残り 41 件は無変化だった。
+    """
+    ordered = sorted(
+        notes, key=lambda n: (n.session_id or "", float(n.created_at or 0.0)),
+    )
+    last_named: dict[tuple[str, str], str] = {}
+    inherited: dict[tuple[str, str], str] = {}
+    for note in ordered:
+        content = note.content or ""
+        for tag in _USER_SUBJECT_TAGS:
+            key = (note.session_id or "", tag)
+            attr = resolve_fact_attribute(
+                content, tag, mode="chat", triggers_dir=builder.triggers_dir,
+            )
+            if attr:
+                last_named[key] = attr
+            elif getattr(note, "is_correction", False) and key in last_named:
+                inherited[(note.id, tag)] = last_named[key]
+    return inherited
+
+
 class ChatExtractor(BaseExtractor):
     """チャットモード用 SemanticFact 抽出器。"""
 
@@ -406,7 +500,11 @@ class ChatExtractor(BaseExtractor):
     ) -> ExtractionResult:
         result = ExtractionResult()
         candidates: list[tuple[MemoryNote, SemanticFact]] = []
-        for note in notes:
+        note_list = list(notes)
+        # 訂正ノートが継ぐ属性を先に決める (本ループの順序は変えない —
+        # apply_session_caps の採否順に影響するため)。
+        inherited = resolve_inherited_attributes(note_list, self._builder)
+        for note in note_list:
             if not self.is_eligible(note, self.mode):
                 result.notes_skipped += 1
                 continue
@@ -469,6 +567,10 @@ class ChatExtractor(BaseExtractor):
                         content, tag, mode="chat",
                         triggers_dir=self._builder.triggers_dir,
                     )
+                    # 属性語を落とした訂正は直前の言明からスロットを継ぐ
+                    # (resolve_inherited_attributes の説明を参照)。
+                    if attr is None:
+                        attr = inherited.get((note.id, tag))
                     subject = make_mem_subject(kind, attr or "user")
                 else:
                     # world_fact のみ: keyword (sanitized) + 内容ハッシュを

@@ -130,14 +130,21 @@ class QueryCacheMixin:
     _debug_logger: object | None
     #: 進行中の埋め込み。同じキーの 2 人目以降はこの Future を待つ。
     _query_inflight: dict[str, "asyncio.Future[np.ndarray]"]
+    #: 単一クエリ埋め込みのデッドライン (秒)。0 で無効。
+    _query_deadline_sec: float
 
-    def _init_query_cache(self, maxsize: int = DEFAULT_QUERY_CACHE_MAXSIZE) -> None:
+    def _init_query_cache(
+        self,
+        maxsize: int = DEFAULT_QUERY_CACHE_MAXSIZE,
+        deadline_sec: float = 0.0,
+    ) -> None:
         """キャッシュの初期化（__init__ から呼び出す）"""
         self._query_cache = OrderedDict()
         self._cache_hits = 0
         self._cache_misses = 0
         self._cache_maxsize = maxsize
         self._query_inflight = {}
+        self._query_deadline_sec = max(0.0, float(deadline_sec))
 
     async def _embed_single_query(
         self, query: str, mode: str = DEFAULT_MODE
@@ -171,6 +178,12 @@ class QueryCacheMixin:
         1 ターンあたり同一クエリを 2〜3 回埋め込み ≒ 0.7〜0.9 秒の無駄)。
 
         進行中の呼び出しを Future で共有し、2 人目以降はそれを待つ。
+
+        ``_query_deadline_sec`` が正なら、埋め込み往復にデッドラインを掛ける
+        (``embedding.query_timeout``)。超過は :class:`asyncio.TimeoutError` を
+        送出し、呼出側 (``run_search_pipeline``) がそのターンだけ記憶なしで
+        応答を続ける。**バッチ / ドキュメント側には掛からない** — sleep-time の
+        64 件バッチは本来長く、同じ棒を当てると埋め込み工程が永久に完了しない。
         """
         cache_key = make_query_cache_key(query, mode)
         if cache_key in self._query_cache:
@@ -188,7 +201,23 @@ class QueryCacheMixin:
         self._query_inflight[cache_key] = fut
         self._cache_misses += 1
         try:
-            vec = await self._embed_single_query(query, mode)
+            deadline = self._query_deadline_sec
+            if deadline > 0:
+                vec = await asyncio.wait_for(
+                    self._embed_single_query(query, mode), timeout=deadline,
+                )
+            else:
+                vec = await self._embed_single_query(query, mode)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "embed_query exceeded the %.1fs deadline (mode=%s, query=%r); "
+                "this turn continues without memory retrieval",
+                deadline, mode, query[:60],
+            )
+            if not fut.done():
+                fut.set_exception(asyncio.TimeoutError())
+            fut.exception()
+            raise
         except BaseException as e:
             if not fut.done():
                 fut.set_exception(e)

@@ -22,6 +22,7 @@ import os
 import platform
 import time
 
+from backend.free.core.vram_monitor import gpu_memory_snapshot
 from backend.log_config import get_logger
 
 logger = get_logger("core.system_info")
@@ -156,6 +157,29 @@ def get_cpu_usage_percent(interval_sec: float = 0.15) -> float | None:
     return max(0.0, min(100.0, usage))
 
 
+def get_gpu_lines() -> list[str]:
+    """GPU / VRAM の状況を 1 GPU 1 行のテキストで返す。
+
+    測れない環境でも「測れない」と明示する 1 行を返す。行そのものが無いと、
+    base は「提供された情報に含まれていない」としか言えず、ユーザーには
+    *ツールが答えられなかった* のか *この環境では測れない* のかが区別できない
+    (実インシデント 2026-08-19 ライブ監査 ターン8:「この PC の空きメモリと GPU
+    の VRAM 使用状況を教えてください。」に RAM だけ答え、VRAM は
+    「該当するデータが含まれていない」と返した)。
+
+    推測値は入れない。VRAM の推定値は ``GET /api/system/vram_status`` が別途
+    持つが、あれは *モデルサイズからの見積り* であって実測の使用量ではないため、
+    ここで実測値として並べてはいけない (本モジュール冒頭の方針と同じ)。
+    """
+    gpus = gpu_memory_snapshot()
+    if not gpus:
+        return ["GPU VRAM: unknown (not measurable on this host)"]
+    return [
+        f"GPU{i} {g['name']}: {g['used_mb']} MB used / {g['total_mb']} MB total"
+        for i, g in enumerate(gpus)
+    ]
+
+
 def get_hardware_facts() -> dict[str, object]:
     """実行ホストのハードウェア事実を返す (純粋な読み取り、副作用なし)。
 
@@ -202,4 +226,5 @@ def format_hardware_facts() -> str:
         f"Cores: {f['cores']}",
         ram_line,
         cpu_usage_line,
+        *get_gpu_lines(),
     ])

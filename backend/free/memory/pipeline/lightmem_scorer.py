@@ -171,6 +171,13 @@ class MemoryEviction:
     def __init__(self, policy: PolicyInterpreter | None = None):
         self._policy = policy
 
+    #: 未抽出ノートの保護を降ろすノート数の上限 (``max_notes`` 倍)。
+    #:
+    #: Step 8 が一度も走らない構成 (extraction 無効 / Full が来ない) で STM が
+    #: 無限に伸びるのを防ぐ安全弁。ここを超えたら保護を外し、従来どおり
+    #: スコア下位から落とす。
+    UNEXTRACTED_PROTECTION_CEILING = 2.0
+
     def evict(
         self,
         short_term,
@@ -178,10 +185,41 @@ class MemoryEviction:
         experience_buf: dict | None,
         scorer: FadeMemScorer,
         config: dict,
+        unextracted_cutoff: float | None = None,
     ) -> int:
-        """Eviction を実行。削除/降格したノート数を返す。"""
+        """Eviction を実行。削除/降格したノート数を返す。
+
+        ``unextracted_cutoff`` に「最後に Step 8 (ファクト抽出) が走った時刻」を
+        渡すと、それより後に作られたノートを **降格対象から外す**。
+
+        なぜ必要か: Full sleep-time は直前に ``snapshot_unabsorbed`` /
+        ``drain_evicted_to_stm`` で会話ターンを STM へ流し込み、その STM ノートを
+        Step 8 の入力にする。ところが Step 4 (本 eviction) は run_light の中に
+        あり **Step 8 より先に走る**。新しいノートは ``access_count=0`` で
+        frequency 項が 0 になるため FadeMem スコアが下位に固まり、
+        「流し込んだ 20 件がそのまま下位 20% として降格される」形になっていた。
+
+        実測 (2026-08-19 ライブ検証、chat 40 ターン / 4 セッション):
+
+        - 17:25:14 に 20 ターンを STM へ吸収 → 17:25:15 に同じ id が
+          ``Demoted note ... to LTM (score=0.431)`` で降格
+        - セッション切替で吸収したテーマ B (16:55) / テーマ C (17:13) の
+          ノートは、次の Light サイクルで降格され **1 件も残らなかった**
+        - 結果 Step 8 の chat 抽出は **40 ターンで 1 ファクト**、訂正ターンは
+          SemMem に一度も届かなかった
+
+        降格自体は LTM への移動なのでエピソード記憶は失われないが、SemMem の
+        入力は STM ノートだけなので、抽出前に落とすと意味記憶が育たない。
+
+        ``None`` (既定) では従来どおり保護しない。
+        """
         if len(short_term.notes) < short_term.max_notes:
             return 0
+        protect_unextracted = (
+            unextracted_cutoff is not None
+            and len(short_term.notes)
+            < short_term.max_notes * self.UNEXTRACTED_PROTECTION_CEILING
+        )
 
         # ポリシー優先、フォールバックは config → デフォルト
         threshold = get_policy_value(
@@ -199,11 +237,19 @@ class MemoryEviction:
         evict_count = int(len(scored) * eviction_ratio)
         removed = 0
 
+        skipped_unextracted = 0
         for note, score in scored[:evict_count]:
             if not can_fade(note.id, experience_buf, config):
                 continue
             # pinned MemoryNote は常に保持
             if getattr(note, "pin_flag", False):
+                continue
+            # Step 8 がまだ見ていないノートは SemMem の唯一の入力なので残す
+            # (docstring の ``unextracted_cutoff`` 参照)。
+            if protect_unextracted and float(
+                getattr(note, "created_at", 0.0) or 0.0,
+            ) > unextracted_cutoff:
+                skipped_unextracted += 1
                 continue
 
             # プライベートノートは LTM に昇格させず破棄のみ
@@ -224,6 +270,12 @@ class MemoryEviction:
                 logger.info("Demoted note %s to LTM (score=%.3f)", note.id, score)
             removed += 1
 
+        if skipped_unextracted:
+            logger.info(
+                "Eviction: kept %d note(s) that Step 8 has not consumed yet "
+                "(they are the only input for SemMem extraction)",
+                skipped_unextracted,
+            )
         if removed > 0:
             short_term._cache_dirty = True
 

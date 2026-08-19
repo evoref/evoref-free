@@ -1,6 +1,6 @@
 """LongFormOrchestrator — 長文生成エントリポイント
 
-設計書 f_08_long_form_generation.md §2, §9, §10 準拠。
+設計書 f_08_long_form_generation.md §2, §3.5, §6 準拠。
 Router が長文判定した場合に Meta-Cognitive 層から委任される。
 """
 

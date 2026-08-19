@@ -207,6 +207,19 @@ class SemanticFact:
     """PolicyEvolver により自動進化したファクトか
     (`conflict.auto_for_evolved_policies` の判定に使用)"""
 
+    from_correction: bool = False
+    """ユーザーが自分の値を言い直したターン由来か。
+
+    判定は :func:`backend.free.agent.feedback.restates_a_value` で、
+    チャット応答パス → ``WorkingMemory.add_turn(correction=...)`` →
+    ``MemoryNote.is_correction`` → 抽出器、と伝播する。
+
+    ``SemanticConflictResolver._decide`` がこれを見て、同一スロットの旧値との
+    競合を **pending にせず即 supersede** する。``_is_borderline`` は
+    「同 ``session_id``」または「``confirm_window_hours`` 以内」を微妙ケース
+    として pending にするが、**会話中の訂正はその両方を必ず満たす**ため、
+    印が無いといちばん確度の高い訂正がいちばん自動解決されなかった。"""
+
     failure_signature: str | None = None
     """failure_pattern の照合用ハッシュ
     (error_type, normalized_file_path, last_3_step_actions) の SHA1 先頭 12 桁"""
@@ -301,6 +314,7 @@ _KNOWN_FACT_KEYS: frozenset[str] = frozenset({
     "trace_id",
     "credit_score",
     "auto_evolved",
+    "from_correction",
     "failure_signature",
     "eval_metric",
     "_version",
@@ -349,6 +363,7 @@ def serialize_fact(fact: SemanticFact) -> dict[str, Any]:
         "trace_id": fact.trace_id,
         "credit_score": fact.credit_score,
         "auto_evolved": fact.auto_evolved,
+        "from_correction": fact.from_correction,
         "failure_signature": fact.failure_signature,
         "eval_metric": dict(fact.eval_metric) if fact.eval_metric is not None else None,
         "_version": int(fact._version),
@@ -405,6 +420,7 @@ def deserialize_fact(d: dict[str, Any]) -> SemanticFact:
         trace_id=d.get("trace_id"),
         credit_score=d.get("credit_score"),
         auto_evolved=bool(d.get("auto_evolved", False)),
+        from_correction=bool(d.get("from_correction", False)),
         failure_signature=d.get("failure_signature"),
         eval_metric=eval_metric,
         _version=int(d.get("_version", 1)),

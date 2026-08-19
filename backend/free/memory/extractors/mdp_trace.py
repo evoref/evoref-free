@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -80,6 +81,44 @@ def _is_failure_outcome(outcome: str, steps: list[dict[str, Any]] | None = None)
     if s == "partial" and steps:
         return all(not (st.get("reward") or 0) for st in steps)
     return False
+
+
+#: ホスト計測ブロック (``system_hardware_info`` / spec 系 ``run_command_readonly``)
+#: の見出し。``OS:`` で始まり ``Cores:`` を含む形は両者に共通。
+_HOST_MEASUREMENT_RE = re.compile(r"\AOS:.*\n(?:.*\n)*?Cores:", re.MULTILINE)
+
+#: ホスト計測ブロックのうち **時間で変わる値**。エピソード記憶に残すと、
+#: 後日の検索でその数値が「現在の値」として注入される。
+#:
+#: 実インシデント (2026-08-19 ライブ監査 再検証): 「このPCのスペックを教えて」
+#: に spec コマンド (OS/CPU/Cores/Disk のみ、RAM を一切出さない) が走った直後、
+#: 27 分前の別ターンの計測を貼り付けた LTM チャンク
+#: ``[mdp_trace] ... result=... RAM: 63.3 GB total (64795 MB), 23.6 GB available;
+#: CPU usage: 10.5%`` が RAG 1 位 (0.3966) で注入され、モデルが
+#: 「空き 23.6 GB」を **今回の計測値として** 回答した (実際の当該時点の空きは
+#: 23.0 GB / 22.4 GB)。
+#:
+#: 静的な値 (OS / CPU / コア数 / 総 RAM / ディスク総量) は変わらないので残す。
+#: 値を消すだけでラベルは残すのは、``read_file`` のメタ行だけ残す扱いと同じ理由 —
+#: 「何を測ったか」は記憶に値するが「そのときいくつだったか」は値しない。
+_VOLATILE_FIELD_SUBS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^CPU usage:.*$", re.MULTILINE), "CPU usage: (not recorded)"),
+    (re.compile(r"^(GPU[^\n:]*:).*$", re.MULTILINE), r"\1 (not recorded)"),
+    (re.compile(r"(^RAM:[^\n]*?),\s*[\d.]+\s*GB available", re.MULTILINE), r"\1"),
+    (re.compile(r"(^Disk:[^\n]*?GB total),?\s+[\d.]+\s*GB free", re.MULTILINE), r"\1"),
+)
+
+
+def strip_volatile_measurements(text: str) -> str:
+    """ホスト計測ブロックから時間で変わる値だけを落とす (純粋関数)。
+
+    計測ブロックでなければ入力をそのまま返す。
+    """
+    if not _HOST_MEASUREMENT_RE.search(text):
+        return text
+    for pattern, replacement in _VOLATILE_FIELD_SUBS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def episode_task_and_result(steps: list[dict[str, Any]]) -> tuple[str, str]:
@@ -260,6 +299,14 @@ class MDPTraceExtractor(BaseExtractor):
                     ctx=ctx,
                 )
             fact.mode_origin = episode_mode  # type: ignore[assignment]
+            # provenance 側も同じモードへ揃える。``_make_fact`` はクラス既定
+            # (``self.mode`` = "create") を入れるため、mode_origin だけ直しても
+            # 由来の記録は create のまま残る (2026-08-19 ライブ監査:
+            # decision ファクト 62/62 が mode_origin="chat" /
+            # provenance.mode="create" で保存されていた)。provenance は経路を
+            # 追うための唯一の記録なので、食い違うと調査が誤誘導される。
+            for prov in fact.provenances:
+                prov.mode = episode_mode
             result.facts.append(fact)
             self._processed_episode_ids.add(episode_id)
 
@@ -354,7 +401,10 @@ class MDPTraceExtractor(BaseExtractor):
         if task_desc:
             parts.append(f"task={task_desc}")
         if observation:
-            parts.append(f"result={observation}")
+            # 揮発する計測値 (空き RAM / CPU 使用率 / 空きディスク) は落とす。
+            # SemMem 経由の注入は LTM とは独立した供給経路で、片方だけ塞いでも
+            # もう一方から同じ古い値が「現在の値」として出てくる。
+            parts.append(f"result={strip_volatile_measurements(observation)}")
         meaningful_actions = [a for a in last_actions if a and a != "none"]
         if meaningful_actions:
             parts.append(f"actions={'/'.join(meaningful_actions)}")

@@ -61,6 +61,19 @@ class MemoryNote:
     pin_reason: str | None = None
     """pin が付いた理由 ("user_explicit" / "auto_detect:keep_in_mind" 等)"""
 
+    is_correction: bool = False
+    """ユーザーが **自分の値を言い直した** ターンか。
+
+    判定は :func:`backend.free.agent.feedback.restates_a_value` で、アシスタントの
+    誤りの指摘 (``assistant``) とユーザー自身の申告訂正 (``self``) の両方を含む
+    — 記憶側は「その属性の現在値が何か」を持つので、後者も正当な値更新。
+    学習側の欠陥シグナル (``FeedbackCollector``) は従来どおり ``assistant`` のみ。
+
+    チャット応答パス (``prepare_memory_context``) が ``WorkingMemory.add_turn``
+    に渡し、sleep-time Step 8 が ``SemanticFact.from_correction`` へ引き継ぐ。
+    抽出器はこの印が立っているノートに限り **直前の名前付き属性を継承** する。
+    """
+
     extracted_fact_ids: list[str] = field(default_factory=list)
     """このノートから抽出された SemanticFact の ID 一覧"""
 
@@ -145,6 +158,16 @@ class MemoryNote:
     """executable_command_curator (Step 8.6) がこの assistant note を処理済みに
     した時刻。None は未処理。次サイクルで同一コマンドを再記録しないためのマーカー。"""
 
+    assertion_curated_at: float | None = None
+    """assertion_curator (Step 8.4) がこの user note を処理済みにした時刻。
+    None は未処理。次サイクルで同じ言明を再命名・再記録しないためのマーカー。"""
+
+    assertion_slug: str | None = None
+    """assertion_curator (Step 8.4) がこのノートに割り当てた subject slug。
+    訂正ノートは被訂正ノートからこれを継ぐ (別 slug になると SemMem の
+    競合検出が対にできず supersede できない)。サイクルを跨いで継げるよう
+    ノート側に持たせる。"""
+
     # ── conflict 解決の失敗 quarantine マーカー ─────────
     conflict_fail_count: int = 0
     """このノートを含むペアが LLM マージに連続失敗した回数。閾値到達で
@@ -216,6 +239,7 @@ class ShortTermMemory:
         # ``BaseExtractor.is_eligible`` および ``LightMemScorer.evict_low_score``
         # 側でスキップされる。
         private: bool = bool(turn.get("private", False))
+        is_correction: bool = bool(turn.get("is_correction", False))
 
         # ツール出力は WM までで止め、STM 以降には残さない
         if is_tool_output:
@@ -290,6 +314,7 @@ class ShortTermMemory:
             tool_command_success=turn.get("tool_command_success"),
             tool_command_source=turn.get("tool_command_source"),
             tool_command_query=turn.get("tool_command_query"),
+            is_correction=is_correction,
         )
         self.notes[note.id] = note
         self._cache_dirty = True

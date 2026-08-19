@@ -355,6 +355,34 @@ def _absorb_turns_to_stm(
         logger.info("Absorbed %d %s turns to STM", len(turns), origin)
 
 
+def _schedule_sleep_time(state: AppState, user_query: str, private: bool) -> None:
+    """sleep-time update をスケジュールする (record_* 3 経路の共通処理)。
+
+    訂正ターンでは Full を **前倒し** する。ファクト抽出 (Step 8) と競合解決
+    (Step 6B) は Full にしか無く (``memory.facts.trigger: idle_full_only``)、
+    Light は Step 1-5.5 (埋め込み / タグ / スコア / eviction) だけ。そのため
+    既定 (アイドル 10 分 / 繰り延べ上限 30 分) では、ユーザーが訂正しても
+    SemMem に反映されるまで最大 30 分かかる。訂正は反映が遅れると意味が薄れる
+    ので、そのターンだけ待ち時間を下限まで縮める。
+
+    private ターンは SemMem へ書かない契約なので前倒ししない。
+    """
+    scheduler = state.sleep_scheduler
+    if scheduler is None:
+        return
+    if not private and user_query:
+        try:
+            from backend.free.agent.feedback import restates_a_value
+
+            if restates_a_value(user_query):
+                scheduler.request_full_soon("value_restated")
+        except Exception as exc:
+            logger.warning(
+                "correction-triggered full request skipped: %s", exc,
+            )
+    scheduler.on_response_sent()
+
+
 def record_response(
     state: AppState, full_response: str, messages: list[ChatMessage],
     session_id: str, user_query: str, mode: str,
@@ -423,10 +451,8 @@ def record_response(
         except Exception as e:
             logger.warning("FeedbackCollector.record failed: %s", e)
 
-    # sleep-time update をスケジュール
-    scheduler = state.sleep_scheduler
-    if scheduler:
-        scheduler.on_response_sent()
+    # sleep-time update をスケジュール (訂正ターンは Full を前倒し)
+    _schedule_sleep_time(state, user_query, private)
 
     # ターンを蓄積（WM エビクションに依存しない完全な履歴）
     _accumulate_turn(session_id, "user", user_query, private=private)
@@ -498,10 +524,8 @@ def record_meta_cognitive_response(
         except Exception as e:
             logger.warning("FeedbackCollector.record failed (meta-cognitive): %s", e)
 
-    # sleep-time update をスケジュール
-    scheduler = state.sleep_scheduler
-    if scheduler:
-        scheduler.on_response_sent()
+    # sleep-time update をスケジュール (訂正ターンは Full を前倒し)
+    _schedule_sleep_time(state, user_query, private)
 
     # ターンを蓄積（WM エビクションに依存しない完全な履歴）
     _accumulate_turn(session_id, "user", user_query, private=private)
@@ -582,10 +606,8 @@ def record_long_form_response(
         except Exception as e:
             logger.warning("FeedbackCollector.record failed (long-form): %s", e)
 
-    # sleep-time update をスケジュール
-    scheduler = state.sleep_scheduler
-    if scheduler:
-        scheduler.on_response_sent()
+    # sleep-time update をスケジュール (訂正ターンは Full を前倒し)
+    _schedule_sleep_time(state, user_query, private)
 
     # ターンを蓄積（WM エビクションに依存しない完全な履歴）
     _accumulate_turn(session_id, "user", user_query, private=private)

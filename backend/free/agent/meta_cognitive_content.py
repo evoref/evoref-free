@@ -7,6 +7,7 @@ import time
 
 from pathlib import Path
 from backend.config import resolve_context_size_for_mode
+from backend.free.agent.context_budget import SEND_GUARD_RESERVE_TOKENS
 from backend.free.core.prompt_blocks import current_datetime_block
 from backend.free.agent.output_format import (
     is_rich_table_output,
@@ -314,9 +315,18 @@ class _ContentGenerationMixin:
     def _calc_gen_max_tokens(
         self, prompt_text: str, ctx_size: int,
     ) -> int:
-        """コンテンツ生成用の max_tokens を計算する"""
+        """コンテンツ生成用の max_tokens を計算する
+
+        ``SEND_GUARD_RESERVE_TOKENS`` を残すのは、送信直前ガード
+        (``LocalClient._enforce_context_budget``) が
+        ``budget = n_ctx - マージン - max_tokens`` でプロンプト上限を決めるため。
+        残さないと budget が必ずプロンプト長を下回り、**このパスのプロンプトが
+        毎回中略される** (2026-08-19 ライブ監査で実測)。
+        """
         input_tokens = _estimate_tokens(prompt_text)
-        available = max(ctx_size - input_tokens - 128, 1024)
+        available = max(
+            ctx_size - input_tokens - 128 - SEND_GUARD_RESERVE_TOKENS, 1024,
+        )
         gen_max_tokens = min(self._execute_max_tokens, available)
         logger.debug(
             "Content generation: input_tokens≈%d, ctx_size=%d, max_tokens=%d",

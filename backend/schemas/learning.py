@@ -203,6 +203,9 @@ class LearningConfig(BaseModel):
     # Few-shot プール
     fewshot_pool_size: int = Field(default=50, ge=1)
     fewshot_min_fitness: float = Field(default=0.7, ge=0.0, le=1.0)
+    # GC で無条件に破棄する quality_score の下限。採点は採用の後に走るため
+    # intake では掛けられず、従来の GC はサイズ超過時の下位切りしか無かった。
+    fewshot_min_quality_score: float = Field(default=0.5, ge=0.0, le=1.0)
     fewshot_max_examples: int = Field(default=3, ge=1)
     fewshot_diversity_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
     # Level 2 補助タスク

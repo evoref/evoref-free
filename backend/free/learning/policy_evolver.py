@@ -79,7 +79,11 @@ DEGENERATE_WINDOW: int = 4
 #: 尺度の違う best_fitness が更新不能な基準として残る。
 #:
 #: v3: コスト項を fitness に導入 (:data:`COST_WEIGHT`)。
-FITNESS_SCHEMA_VERSION: int = 3
+#: v4: ``rephrased_query`` の検出を差し替え (文字集合 Jaccard → 内容語 bi-gram
+#:     コサイン + 深掘り除外)。この信号は :data:`DEFECT_WEIGHTS` の最大寄与項で、
+#:     同じ経験 136 件で発火が 17 → 1 件に減る。fitness 関数自体は同じでも
+#:     **入力の尺度が変わる**ので、旧尺度の best_fitness を基準として残さない。
+FITNESS_SCHEMA_VERSION: int = 4
 
 #: fitness に占めるコスト項の重み。``fitness = (1-w) * 品質 + w * (1 - コスト)``。
 #:

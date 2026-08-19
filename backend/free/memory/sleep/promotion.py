@@ -205,6 +205,47 @@ def _resolve_scope(
     return "global", project_id
 
 
+def _supersede_earlier_summaries(
+    store: "SemanticFactStore",
+    subject: str,
+    winner: "SemanticFact",
+    session_id: str,
+) -> None:
+    """同じセッションの古い要約ファクトを ``winner`` で置き換える。
+
+    セッション要約は **1 セッション 1 値** のスロット
+    (``mem.<type>.history.session.<id12>`` / ``summary_of_session``)。会話が伸びると
+    再要約が走る (``sleep.summarize`` は ``turn_count > summary_turn_count`` を対象に
+    する) ため、同じ subject に複数世代が live で並びうる。
+
+    並んだままだと ``SemanticConflictResolver`` がそれを「値が 2 つある = 競合」と
+    判定して pending に落とす。実データ (2026-08-19 時点) で global scope の
+    pending は **全 2 件ともこれ**だった。要約は言い直しであって矛盾ではないので、
+    競合にする前に上書きへ倒す (滞留した pending は TTL まで残り、同じ属性の
+    世代が並べば ``[記憶の競合]`` にも出る)。
+
+    照合は subject ではなく **provenance の ``session_id``** で行う。subject は
+    ``session_id[:12]`` で切り詰められており (``_build_subject``)、接頭辞が同じ
+    別セッションが同じ subject を共有しうる。subject だけで束ねると
+    **別の会話の要約を消してしまう**。
+
+    失敗は握って警告に留める — 昇格そのものは成立しており、残った旧世代は
+    次サイクルの競合解決 (または TTL) が拾える。
+    """
+    for old in store.search_by_subject(subject, include_superseded=False):
+        if old.id == winner.id or old.predicate != winner.predicate:
+            continue
+        if not any(p.session_id == session_id for p in old.provenances):
+            continue
+        try:
+            store.supersede(old.id, winner.id)
+        except (KeyError, ValueError) as exc:
+            logger.warning(
+                "Step 9 promotion: failed to supersede the earlier summary "
+                "%s -> %s: %s", old.id, winner.id, exc,
+            )
+
+
 def promote_history_to_semmem(
     history_manager: "HistoryManager",
     store_provider: Callable[[str], "SemanticFactStore | None"],
@@ -284,6 +325,9 @@ def promote_history_to_semmem(
         ]
         try:
             store.add_fact(fact)
+            _supersede_earlier_summaries(
+                store, subject, fact, entry.session_id,
+            )
         except Exception as exc:
             logger.warning(
                 "Step 9 promotion: failed to add fact for session %s: %s",

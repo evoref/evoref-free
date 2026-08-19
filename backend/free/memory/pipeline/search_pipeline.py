@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from backend.log_config import get_logger
+from backend.free.memory.corrections import corrections_by_target
 from backend.trace_context import run_in_executor_with_context
 from backend.free.constants import (
     SEARCH_HISTORY_CURRENT_SESSION_HEADER,
@@ -156,6 +157,66 @@ def query_repeats_a_stored_turn(short_term, query: str) -> bool:
         return False
     return _is_repeat_of_a_stored_turn(query, notes)
 
+
+
+
+#: 訂正済みノートに付ける注記。SemMem 側の ``(訂正後の記録)``
+#: (``pipeline.injector._render_fact``) と対になる。
+_SUPERSEDED_MARK = "（訂正済み）"
+
+
+def attach_superseding_corrections(
+    short_term, sources: list[tuple[str, float, str]],
+) -> list[tuple[str, float, str]]:
+    """採用済みチャンクのうち訂正されたものに注記を付け、訂正本文を随伴させる。
+
+    relevance floor は **生の cosine** に掛かるため、訂正ノートにスコア加点を
+    しても救済できない (``_PIN_RETRIEVAL_BOOST`` 方式では届かない)。訂正は
+    省略形で話題語を落としているぶん、対象より必ず類似度が低くなる。
+
+    実インシデント (2026-08-19 ライブ監査): 新セッションで
+    「あさひプロジェクトの締切はいつでしたか？」に対し、訂正**前**の
+    「…締切は9月30日です。」が 0.7294 で採用され、訂正
+    「訂正します、締切は10月15日に変更になりました。」は floor 0.302 に
+    届かず落ちて、**訂正前の値が回答された**。
+
+    被訂正ノートを落とすのではなく **両方残す**。訂正は話題語を落としている
+    ため単独では「何の締切か」が失われる。
+    """
+    if short_term is None or not sources:
+        return sources
+    try:
+        notes = list(getattr(short_term, "notes", {}).values())
+    except Exception:
+        return sources
+    kept_ids = {cid for cid, _, _ in sources}
+    links = [
+        (target_id, getattr(corr, "id", ""), getattr(corr, "content", "") or "")
+        for target_id, corr in corrections_by_target(notes).items()
+        if target_id in kept_ids
+    ]
+    if not links:
+        return sources
+
+    marked = {sid for sid, _, _ in links}
+    present = {cid for cid, _, _ in sources}
+    out: list[tuple[str, float, str]] = []
+    for chunk_id, score, text in sources:
+        if chunk_id in marked and not (text or "").rstrip().endswith(_SUPERSEDED_MARK):
+            text = f"{(text or '').rstrip()}{_SUPERSEDED_MARK}"
+        out.append((chunk_id, score, text))
+    for superseded_id, corr_id, corr_text in links:
+        if corr_id and corr_id not in present and corr_text:
+            present.add(corr_id)
+            score = next(
+                (s for cid, s, _ in sources if cid == superseded_id), 0.0,
+            )
+            out.append((corr_id, score, corr_text))
+    logger.info(
+        "Attached %d correction note(s) alongside superseded reference(s): %s",
+        len(links), ", ".join(sid for sid, _, _ in links),
+    )
+    return out
 
 async def _search_stm_layer(
     short_term, query_vec: np.ndarray, stm_top_k: int,
@@ -1007,6 +1068,11 @@ async def unified_search(
     final_sources = _ensure_cartridge_fairness(
         final_sources, cart_results, top_k,
     )
+
+    # Step 7.6: 採用ノートが後続の訂正で上書きされているなら、訂正も一緒に出す。
+    # top_k で切った **後** に足す — 訂正は席を争う候補ではなく随伴情報であり、
+    # floor / top_k のどちらで落ちても「訂正前の値だけが残る」状態になる。
+    final_sources = attach_superseding_corrections(short_term, final_sources)
 
     logger.info(
         "Search completed: %d results, quality=%s, from_memory=%s",
