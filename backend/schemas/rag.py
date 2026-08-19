@@ -381,6 +381,18 @@ class EmbeddingConfig(BaseModel):
     llama_port: int = Field(default=8082, ge=1024, le=65535)
     dim: int = Field(default=1024, ge=1)
     timeout: float = Field(default=30.0, ge=0.1)
+    # チャット応答パスの **単一クエリ** 埋め込みだけに掛かるデッドライン (秒)。
+    # 0 で無効 (``timeout`` のみ)。バッチ / ドキュメント側には掛からない
+    # (sleep-time の 64 件バッチは本来長い)。
+    #
+    # 実測 (2026-08-18、chat 136 ターン / 実往復 262 件): 中央値 216.7ms /
+    # p90 1292.1ms / p95 3122ms / p99 5977ms / 最大 8057ms。分布は二峰で、
+    # 1.0s 超が 16.0% ある一方 2.0s 超は 6.1% しかない。3.0s 超の 5.7% は
+    # 「埋め込みサーバが詰まっている」区間で、そのままターンの TTFT に前置き
+    # される (TTFT 中央値 17s に対し最大 8s = +47%)。
+    # 既定 3.0 は ``rag.cartridge_search_timeout_ms`` (3000) と同じ水準に揃え、
+    # p95 までは通しつつ病的な裾だけを切る。
+    query_timeout: float = Field(default=3.0, ge=0.0)
     max_length: int = Field(default=8192, ge=1)
     # 文脈長 (llama-server ``-c``)。埋め込みは max_length トークンまでの入力を
     # 扱うため、必ず max_length 以上にすること (下回ると長い入力で 500)。モデル

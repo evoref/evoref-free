@@ -175,6 +175,42 @@ _SESSION_REFLECTIVE_VOCAB_NARROW_JA = (
     r"|何番目|何回目"
 )
 
+#: 会話の前の方 / 過去のやりとりを指す**後方参照**の語。
+#:
+#: ルール 6 (``context_count >= 3`` → skip) は「質問マーカーが無く、会話が
+#: 続いている = 継続フィラー」という推定で立っている。ところが依頼文の多くは
+#: 質問マーカーを持たないため、**会話 3 通目以降は照応を含む依頼まで一律に
+#: skip される**。「さっきのライブラリの件、まとめて」「前に貼ったログをもう一度
+#: 整理して」はどれもエピソード記憶 (STM / LTM) を引かないと答えられない。
+#:
+#: 実測 (2026-08-18、chat 135 ターン): retrieval が走らなかったのは 33 ターン
+#: (24%)。一方 retrieval の実コストは中央値 7.5ms しかなく、skip して得られる
+#: 節約はほぼ無い (支配項は埋め込み往復で、これは skip でも払う)。
+#:
+#: したがって後方参照があるターンだけルール 6 を降ろす。誤って降ろしても代償は
+#: 7.5ms + フロア (較正値) を越えたチャンクだけの注入で、取りこぼしの代償
+#: (「さっきの件」に答えられない) より小さい非対称がある。
+#:
+#: 語彙は「会話の前を指す」ことがほぼ確定するものに絞る。指示語単独
+#: (それ / これ) は「それでいいです」のような相槌に当たるので採らない。
+_PAST_REFERENCE_RE = re.compile(
+    # 時間の後方参照
+    r"さっき|さきほど|先ほど|先程|前回|この前|以前|冒頭"
+    # 指示語 + 事物名詞 (「その件」「例の話」)
+    r"|(?:例|その|あの)の?(?:件|話|やつ|とき|時)"
+    # 直前の発話・成果物への言及 (過去形に限る)
+    r"|(?:言|話|伝え|教え|挙げ|出し|貼っ|渡し|送っ)(?:った|た|ました|てた|ていた)",
+)
+
+#: :data:`_PAST_REFERENCE_RE` の英語版。短い一般語 (before) が別語の内部へ
+#: 当たらないよう単語境界を必須にする。
+_PAST_REFERENCE_RE_EN = re.compile(
+    r"\bearlier\b|\bpreviously\b|\bbefore\b|\blast\s+time\b"
+    r"|\b(?:you|i|we)\s+(?:mentioned|said|gave|showed|pasted|sent)\b",
+    re.IGNORECASE,
+)
+
+
 TRIVIAL_QUESTION_PATTERNS = re.compile(
     r"(今.{0,3}(何時|何分|時刻|時間)"
     r"|今日.{0,3}(何月|何日|何曜)"
@@ -400,7 +436,9 @@ class RetrievalNecessityJudge:
             5. SKIP_PATTERNS (挨拶/相槌) + 短文 → skip
                 (QUESTION より後に置くのは「発売日はいつ」など SKIP の "はい"
                 substring に誤マッチする知識質問を retrieve に倒すため)
-            6. context_count >= 3 → skip (会話継続フィラー)
+            6. context_count >= 3 → skip (会話継続フィラー)。
+               ただし会話の前を指す後方参照 (さっき / 前回 / その件 …) が
+               あれば uncertain へ降ろす (:data:`_PAST_REFERENCE_RE`)
             7. デフォルト → uncertain (呼出側のリコール送り)
         """
         query_stripped = query.strip()
@@ -411,6 +449,7 @@ class RetrievalNecessityJudge:
         codegen_pat = CODE_DOC_GEN_INTENT_PATTERNS_EN if en else CODE_DOC_GEN_INTENT_PATTERNS
         howto_pat = _HOWTO_QUESTION_RE_EN if en else _HOWTO_QUESTION_RE
         question_pat = QUESTION_PATTERNS_EN if en else QUESTION_PATTERNS
+        past_ref_pat = _PAST_REFERENCE_RE_EN if en else _PAST_REFERENCE_RE
 
         # 1. 短すぎるクエリはスキップ
         if len(query_stripped) < 3:
@@ -476,7 +515,16 @@ class RetrievalNecessityJudge:
 
         # 6. コンテキストが十分ある場合はスキップ
         # (質問マーカーなし + 多ターン会話の場合は会話継続フィラーとみなす)
+        # ただし会話の前を指す後方参照があるターンは降ろす
+        # (:data:`_PAST_REFERENCE_RE` の説明を参照)。
         if context_count >= 3:
+            if past_ref_pat.search(query_stripped):
+                logger.debug(
+                    "Necessity: uncertain (back-reference to an earlier turn "
+                    "overrides the sufficient-context skip: %r)",
+                    query_stripped[:50],
+                )
+                return "uncertain"
             logger.debug("Necessity: skip (sufficient context: %d turns)", context_count)
             return "skip"
 
@@ -545,7 +593,7 @@ class RetrievalQualityJudge:
         """
         if not results:
             logger.debug("Quality: low (no results)")
-            return "low"
+            return self._record("low", "no_results", results, 0.0, 0.0)
 
         th = self.thresholds
         top_score = results[0][1]
@@ -567,7 +615,8 @@ class RetrievalQualityJudge:
         # 高信頼: トップスコアがヒステリシス上限以上
         if top_score >= high_boundary:
             logger.debug("Quality: high (top_score %.3f >= %.2f)", top_score, high_boundary)
-            return "high"
+            return self._record("high", "top_score_above_confidence_band",
+                                results, top_score, top_3_avg)
 
         # ヒステリシス帯: 境界付近は安定して medium を返す
         if top_score >= low_boundary:
@@ -575,12 +624,56 @@ class RetrievalQualityJudge:
                 "Quality: medium (hysteresis band: %.3f in [%.2f, %.2f))",
                 top_score, low_boundary, high_boundary,
             )
-            return "medium"
+            return self._record("medium", "hysteresis_band",
+                                results, top_score, top_3_avg)
 
         # 中信頼: トップスコアが関連性閾値以上 かつ 上位3件の平均が支持閾値以上
         if top_score >= th.relevance and top_3_avg >= th.support:
             logger.debug("Quality: medium (top=%.3f, avg=%.3f)", top_score, float(top_3_avg))
-            return "medium"
+            return self._record("medium", "relevance_and_support_met",
+                                results, top_score, top_3_avg)
 
         logger.debug("Quality: low (top_score=%.3f below thresholds)", top_score)
-        return "low"
+        return self._record("low", "top_score_below_thresholds",
+                            results, top_score, top_3_avg)
+
+    def _record(
+        self,
+        quality: str,
+        reason: str,
+        results: list[tuple[str, float, str]],
+        top_score: float,
+        top_3_avg: float,
+    ) -> str:
+        """判定を ``decision.jsonl`` に残して ``quality`` をそのまま返す。
+
+        ``__init__`` は 2026-07 から ``debug_logger`` を受け取り docstring も
+        「``self_rag_judge_path`` を記録する」と書いていたが、``judge()`` は
+        一度もそれを呼んでいなかった (保持するだけ)。実測 2026-08-18 の
+        ``decision.jsonl`` 313 行に ``self_rag_judge_path`` は **0 行**で、
+        「品質ラベルがどう決まったか」を後から追えない状態が続いていた。
+
+        品質ラベルは relevance floor の適用結果 (``log_rag_selection``) と
+        並べて初めて意味を持つので、同じ ``trace_id`` で join できるここに出す。
+        """
+        dl = self._debug_logger
+        if dl is None:
+            return quality
+        th = self.thresholds
+        dl.log_decision(
+            decision_point="self_rag_judge_path",
+            chosen=quality,
+            candidates=["high", "medium", "low"],
+            reason=reason,
+            context={
+                "n_results": len(results),
+                "top_score": round(float(top_score), 4),
+                "top3_avg": round(float(top_3_avg), 4),
+                "confidence": th.confidence,
+                "relevance": th.relevance,
+                "support": th.support,
+                "hysteresis_band": th.hysteresis_band,
+            },
+            scope="request",
+        )
+        return quality

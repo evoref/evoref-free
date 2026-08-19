@@ -5,7 +5,7 @@ config.yaml の llama / embedding セクションから起動コマンドを組�
 
 サブコマンド:
   (なし)     ベースモデル llama-server のみ起動
-  --all      ベース + 補助タスク + エンベッドを一括起動
+  --all      ベース + エンベッドを一括起動
   --embed    エンベッド用 llama-server のみ起動
 
   --all 起動時に ``runtime.total_vram_budget_mb`` (config.yaml) を参照し、
@@ -22,7 +22,7 @@ config.yaml の llama / embedding セクションから起動コマンドを組�
   検出失敗 (None) として警告のみで継続。
 
   llama.cpp
-  slot 退避機構 (``--cache-ram`` / ``--cache-idle-slots``) を全 3 サーバ
+  slot 退避機構 (``--cache-ram`` / ``--cache-idle-slots``) を全サーバ
   (base / embed) で明示制御する。``cache_ram_mib`` /
   ``cache_idle_slots`` を ``config.yaml`` から駆動し、上流のデフォルト
   (8192 MiB / true) を黙従する状態を解消する。``slots > 1`` かつ

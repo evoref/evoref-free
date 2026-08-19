@@ -1,6 +1,6 @@
 """RollingContext — セクション間の文脈受け渡し
 
-設計書 f_08_long_form_generation.md §3.4 準拠。
+設計書 f_08_long_form_generation.md §3.3.1 準拠。
 """
 
 from __future__ import annotations

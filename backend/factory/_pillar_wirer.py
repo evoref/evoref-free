@@ -1303,6 +1303,7 @@ def _init_learning_scheduler(
     fewshot_pool = FewShotPool(
         pool_size=learning_cfg.get("fewshot_pool_size", 50),
         min_fitness=learning_cfg.get("fewshot_min_fitness", 0.7),
+        min_quality_score=learning_cfg.get("fewshot_min_quality_score", 0.5),
         max_examples=learning_cfg.get("fewshot_max_examples", 3),
         diversity_threshold=learning_cfg.get("fewshot_diversity_threshold", 0.8),
         debug_logger=debug_logger,

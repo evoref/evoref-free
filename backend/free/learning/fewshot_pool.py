@@ -35,9 +35,10 @@ from backend.free.core.text_quality import (
     has_broken_ja_spacing,
     has_chinese_token_leak,
     is_query_echo,
+    retracts_own_conclusion,
 )
 from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
-from backend.free.learning.response_arithmetic import find_arithmetic_contradictions
+from backend.free.core.response_arithmetic import find_arithmetic_contradictions
 from backend.free.llm.json_schemas import FewShotQualityJudgement
 from backend.free.memory.types import make_fact
 from backend.log_config import get_logger
@@ -52,15 +53,38 @@ logger = get_logger("learning.fewshot_pool")
 # デフォルト設定
 DEFAULT_POOL_SIZE = 50            # モード別最大プールサイズ
 DEFAULT_MIN_FITNESS = 0.7         # プール追加の最低 fitness
+
+#: GC で無条件に破棄する ``quality_score`` の下限。
+#:
+#: 採点は採用の **後** に走るので intake では掛けられず、GC はサイズ超過時の
+#: 下位切りしか無かった。結果、低品質と採点された例がプールに滞留する
+#: (実データ 2026-08-19、chat 50 件: ``quality_score`` は 0.9 が 28 件 /
+#: 0.95 が 14 件 / 1.0 が 5 件 / **0.1 が 3 件**)。プールが上限に達するまで
+#: 0.1 の 3 件も選択候補に残り、``select`` の重み付きサンプリングでも引かれうる。
+#:
+#: 0.5 は「採点器が明確に低いと言った」帯だけを切る位置。実データの分布は
+#: 0.1 と 0.9 に二極化しており、中間帯を巻き込まない。
+DEFAULT_MIN_QUALITY_SCORE = 0.5
 DEFAULT_MAX_EXAMPLES = 3          # プロンプトに埋め込む最大 Few-shot 数
 DEFAULT_DIVERSITY_THRESHOLD = 0.8  # コサイン類似度の上限（これ以上は重複とみなす）
 
 # _calc_experience_fitness の生スコア理論域 (係数の総和)。
 # min = -(rephrase 0.5 + correction 0.8 + loops 0.3 + verr 0.3) = -1.9
-# max = (ended 1.0 + rag 0.3 + long_form 完了 0.3 + lf_success 0.1) = +1.7
+# max = (rag 0.3 + long_form 完了 0.3 + lf_success 0.1) = +0.7
 # 係数を変えたらこの 2 定数も更新する。
+#
+# ``conversation_ended`` の +1.0 は外した。この信号は
+# ``ExperienceBuffer._mark_loaded_conversations_ended`` が **読み込み時に全件へ
+# 立てる**ため構造的に恒真で (実測 2026-08-18: 135/136 = 99.3%)、
+# 「そのターンがどうだったか」を一切表さない。PolicyEvolver は同じ理由で
+# 2026-08-18 に加点項から外しており、few-shot 側だけ残っていた。
+#
+# 外した効果 (同じ経験 136 件): 最頻値は 0.8056 → 0.7308 へ平行移動し、
+# ``min_fitness`` (既定 0.7) を通る件数は 123 → 116 になる。減る 7 件は
+# 「わずかに負の段階項を持つターンが +1.0 で押し上げられていた」分で、
+# 内容ゲート (``find_content_rejection``) では落ちない類。
 _FITNESS_LO = -1.9
-_FITNESS_HI = 1.7
+_FITNESS_HI = 0.7
 
 #: quality_score が付いている例で、fitness と品質採点を混ぜる比率。
 #:
@@ -221,18 +245,6 @@ _PERSONAL_ATTRIBUTION_RE = re.compile(
     r"|個人情報",
 )
 
-#: 応答の途中で自分の結論を撤回する言い回し。1 つの応答に結論が 2 つ入る。
-#:
-#: 実インシデント (2026-08-07 ライブ監査):「2の10乗と10の3乗ではどちらが
-#: 大きいですか？」に対し「10の3乗の方が大きいです。… 失礼しました、正しくは
-#: 2の10乗（1,024）の方が大きいです。」と、誤った結論と訂正が同居した応答を
-#: 返した。算術自体は正しいので ``find_arithmetic_contradictions`` では捕まらない。
-#: 手本に載ると「まず外して後から直す」形が正解として再生産される。
-_SELF_RETRACTION_RE = re.compile(
-    r"(?:失礼しました|すみません|申し訳|訂正(?:します|いたします)|"
-    r"間違えました|誤りでした)[、。,\s]*(?:正しくは|訂正)"
-    r"|正しくは.{0,12}でした[。\s]*$",
-)
 
 
 def _find_volatile_reason(query: str, response: str) -> str | None:
@@ -316,7 +328,7 @@ def find_content_rejection(query: str, response: str) -> str | None:
         return f"arithmetic contradiction: {contradictions[0]}"
     # 途中で結論を撤回した応答は、正しい結論に辿り着いていても手本にしない
     # (_SELF_RETRACTION_RE 参照)。
-    if _SELF_RETRACTION_RE.search(response):
+    if retracts_own_conclusion(response):
         return "response retracts its own conclusion mid-answer"
     return _find_volatile_reason(query, response)
 
@@ -380,9 +392,10 @@ def _cosine_similarity(a: Counter, b: Counter) -> float:
 def _calc_experience_fitness(signals: dict) -> float:
     """経験 1 件のシグナルから段階的 fitness を計算する。
 
-    基準項 (conversation_ended / rephrased_query / user_correction) の係数は
-    PromptEvolver._calc_fitness と揃える。これに RAG ヒット品質・エージェント
-    反復・長文生成の完了率/検証エラーを段階項として加減算し [0,1] に正規化する。
+    基準項 (rephrased_query / user_correction) の係数は PromptEvolver.
+    _calc_fitness と揃える。これに RAG ヒット品質・エージェント反復・長文生成の
+    完了率/検証エラーを段階項として加減算し [0,1] に正規化する。
+    ``conversation_ended`` は恒真なので加点しない (:data:`_FITNESS_HI` 参照)。
     欠損シグナル (None / 0 / False) は加点も減点もせず中立に倒すため、シグナル
     未配線のモードでも従来の基準項のみで評価される。連続値を返すことで、
     プールに入った例の fitness が 1.0 に縮退せず select() の重み付けと
@@ -391,8 +404,6 @@ def _calc_experience_fitness(signals: dict) -> float:
     score = 0.0
 
     # ── 基準項 (係数は PromptEvolver._calc_fitness と同一) ──
-    if signals.get("conversation_ended", False):
-        score += 1.0
     if signals.get("rephrased_query", False):
         score -= 0.5
     if signals.get("user_correction") is not None:
@@ -437,6 +448,7 @@ class FewShotPool(JsonStateStore):
         self,
         pool_size: int = DEFAULT_POOL_SIZE,
         min_fitness: float = DEFAULT_MIN_FITNESS,
+        min_quality_score: float = DEFAULT_MIN_QUALITY_SCORE,
         max_examples: int = DEFAULT_MAX_EXAMPLES,
         diversity_threshold: float = DEFAULT_DIVERSITY_THRESHOLD,
         debug_logger: DebugLogger | None = None,
@@ -452,6 +464,7 @@ class FewShotPool(JsonStateStore):
                 semmem モードではプール側 GC を停止し、SemMem 側
                 ``semmem_limits.policy`` + ``gc_strategy=lowest_score`` に委譲)
             min_fitness: プール追加の最低 fitness
+            min_quality_score: GC で無条件に破棄する quality_score の下限
             max_examples: プロンプトに埋め込む最大 Few-shot 数
             diversity_threshold: コサイン類似度の上限
             debug_logger: DebugLogger (任意)
@@ -465,6 +478,7 @@ class FewShotPool(JsonStateStore):
         """
         self.pool_size = pool_size
         self.min_fitness = min_fitness
+        self.min_quality_score = min_quality_score
         self.max_examples = max_examples
         self.diversity_threshold = diversity_threshold
         self._debug_logger = debug_logger
@@ -1182,9 +1196,10 @@ class FewShotPool(JsonStateStore):
         sleep-time scheduler の **Step 14** から呼び出される。動作モードは
         ``evolve_writeback`` 設定で切り替わる:
 
-        - ``yaml`` (従来動作): 各モードプールを fitness 昇順でソートし、
-          ``pool_size`` を超える分を最低 fitness から除去する。除去した
-          example は ``_bigram_cache`` からも追い出す。
+        - ``yaml`` (従来動作): (1) ``quality_score`` が
+          ``min_quality_score`` 未満の example を **サイズに関わらず** 除去し、
+          (2) 残りが ``pool_size`` を超える分を実効 fitness の低い順に除去する。
+          除去した example は ``_bigram_cache`` からも追い出す。
         - ``semmem``: GC は SemMem 側 ``semmem_limits.policy``
           + ``gc_strategy=lowest_score`` に委譲されるため、本メソッドは
           in-memory プールに触れず ``delegated_to_semmem=True`` を返す
@@ -1216,16 +1231,35 @@ class FewShotPool(JsonStateStore):
 
         removed_per_mode: dict[str, int] = {}
         for mode, pool in self._pools.items():
-            if len(pool) <= self.pool_size:
-                continue
-            pool.sort(key=_effective_fitness)
-            excess = len(pool) - self.pool_size
             seen = self._seen_hashes.setdefault(mode, set())
-            for _ in range(excess):
-                removed = pool.pop(0)
-                self._bigram_cache.pop(removed.id, None)
-                seen.discard(self._content_hash(removed.query, removed.response))
-            removed_per_mode[mode] = excess
+            removed_count = 0
+
+            # 1) 品質の絶対下限。サイズに空きがあっても残さない
+            #    (:data:`DEFAULT_MIN_QUALITY_SCORE` 参照)。未採点 (None) は
+            #    判定材料が無いので対象外。
+            low_quality = [
+                ex for ex in pool
+                if ex.quality_score is not None
+                and ex.quality_score < self.min_quality_score
+            ]
+            for ex in low_quality:
+                pool.remove(ex)
+                self._bigram_cache.pop(ex.id, None)
+                seen.discard(self._content_hash(ex.query, ex.response))
+            removed_count += len(low_quality)
+
+            # 2) サイズ超過分を実効 fitness の低い順に落とす
+            if len(pool) > self.pool_size:
+                pool.sort(key=_effective_fitness)
+                excess = len(pool) - self.pool_size
+                for _ in range(excess):
+                    removed = pool.pop(0)
+                    self._bigram_cache.pop(removed.id, None)
+                    seen.discard(self._content_hash(removed.query, removed.response))
+                removed_count += excess
+
+            if removed_count:
+                removed_per_mode[mode] = removed_count
 
         removed_total = sum(removed_per_mode.values())
         remaining = {m: len(p) for m, p in self._pools.items()}

@@ -70,6 +70,22 @@ DEFAULT_TIER_RATIOS: tuple[float, float, float, float] = (0.40, 0.35, 0.15, 0.10
 #: pin ボーナス値
 PINNED_BONUS = 1.0
 
+#: ``from_correction`` ファクトのスコア加点。
+#:
+#: スロット継承 (``ChatExtractor``) が効けば訂正は対象と同じスロットに入り、
+#: ``_collapse_to_current_values`` が最新だけを残すのでこの加点は要らない。
+#: **効かなかった残り** — 対象が数ターン前で継承できなかった / 対象自体が
+#: フォールバックスロットだった場合 — に、古い値と訂正後の値が別スロットで
+#: 並ぶことがある。そのとき順位で訂正側を上に出すための保険。
+#:
+#: 実測 (2026-08-19 ライブ検証): 「私の好きな飲み物は何ですか？」に対し
+#: 訂正済みの「緑茶」が sim 0.762 で最上位、訂正後の「ほうじ茶」が 0.487 で
+#: 下位に並んでいた。関連度はクエリとの類似で決まるため、訂正の方が下に来る。
+#:
+#: pin (1.0) より小さくするのは、明示 pin の優先を崩さないため。
+
+CORRECTION_BONUS = 0.5
+
 #: policy ファクトを active と見なす最小 confidence
 DEFAULT_POLICY_ACTIVATION_MIN_CONFIDENCE = 0.7
 
@@ -117,6 +133,19 @@ DEFAULT_RELEVANCE_MIN_SCORE = 0.35
 #: 破綻するのは 0.35 なので 3.5 倍の余裕がある。
 DEFAULT_PINNED_RELEVANCE_MIN_SCORE = 0.10
 
+#: 較正が効いているときの pinned 下限 = ``relevance × この比率``。
+#:
+#: 静的既定 0.10 は **背景ノイズ帯の内側**にある。実測の背景分布
+#: (LFM2.5-Embedding-350M / 2026-08-18 の較正キャッシュ) は p50 0.039 / p95 0.302
+#: で、0.10 は無関係ペアの過半より上とはいえ p95 を大きく下回る。つまり pin が
+#: 付いた瞬間、そのファクトはほぼ全ターンに載る。
+#:
+#: 較正値に対する比率にすれば埋め込みスケールに追随する。0.5 は現行 embedder で
+#: 0.302 × 0.5 = 0.151 となり、実測表 (0.10 / 0.25 とも想起は全 OK、0.35 で 1 件 NG)
+#: の安全域の中に収まる。pin は「優先度」であって「常に関連する」の宣言ではない
+#: ので、通常ゲートより緩く・ノイズ帯より上、という位置付けを保つ。
+PINNED_RELEVANCE_RATIO = 0.5
+
 
 #: セッション要約ファクトの subject 接頭辞。会話のメタ記録であって、ユーザーに
 #: ついての事実ではないため [関連する記憶] へ注入しない (``inject`` 内の判定参照)。
@@ -154,9 +183,14 @@ _EPISODE_TRACE_SUBJECT_PREFIX = "mem.decision.ep_"
 #: セッション要約 / エピソードトレースと同じ「内部索引」の類。
 _EXECUTABLE_COMMAND_SUBJECT_PREFIX = "mem.world.executable_command."
 
-#: [関連する記憶] へ注入しない内部索引の subject 接頭辞。
-#: いずれも「アシスタント側の記録」であってユーザーについての事実ではない。
-_INTERNAL_INDEX_SUBJECT_PREFIXES: tuple[str, ...] = (
+#: 内部索引の subject 接頭辞。いずれも「アシスタント側の記録」であって
+#: ユーザーについての事実ではないため、ユーザーに見える枠へ出さない。
+#:
+#: 消費側は 2 つ: ``[関連する記憶]`` (本モジュールの :meth:`MemoryInjector.inject`)
+#: と ``[記憶の競合]`` (``conflict_review.collect_review_groups``)。片方だけに
+#: 掛けると同じ内容が別の窓から出る — 実際 2026-08-19 時点の pending は全 2 件が
+#: セッション要約で、競合セクション側から素通しになっていた。
+INTERNAL_INDEX_SUBJECT_PREFIXES: tuple[str, ...] = (
     _SESSION_SUMMARY_SUBJECT_PREFIX,
     _EPISODE_TRACE_SUBJECT_PREFIX,
     _EXECUTABLE_COMMAND_SUBJECT_PREFIX,
@@ -271,16 +305,57 @@ class MemoryInjector:
         self.relevance_enabled: bool = bool(
             cfg.get("relevance_enabled", True),
         )
-        self.relevance_min_score: float = float(
+        (
+            self.relevance_min_score,
+            self.pinned_relevance_min_score,
+        ) = self._resolve_relevance_thresholds(cfg)
+        self._now_provider = now_provider or time.time
+
+    @staticmethod
+    def _resolve_relevance_thresholds(cfg: dict) -> tuple[float, float]:
+        """``(relevance_min_score, pinned_relevance_min_score)`` を解決する。
+
+        ``threshold_mode: auto`` (既定) で較正
+        (:mod:`backend.free.rag.memory_threshold_calibration`) が効いていれば、
+        RAG 側の ``relevance`` と **同じ棒**を使う。
+
+        なぜ較正に載せるか: 静的な絶対閾値は埋め込みモデルを替えると到達不能に
+        なり、**黙って全部落とす**。このプロジェクトは既に 2 度同じ壊れ方をして
+        いる (``rag.relevance_threshold: 0.65`` が LFM2.5 で記憶採用 0 件、
+        ``low_quality_keep_floor: 0.40`` が観測最大 0.381 を上回り通過 0 件)。
+        RAG 側は ``threshold_mode: auto`` + 相対フロアで二重に守られたが、
+        **注入側のこの 1 本だけが静的なまま残っていた**。
+
+        相対フロア (top × 0.6) は採らない。RAG のそれは「このクエリで検索して
+        取れた結果集合」の top を基準にするので意味を持つが、注入側の候補は
+        **ストア全件**で、大半はクエリと無関係。無関係な集合の top に対する相対で
+        緩めると、ノイズの中の最上位を「関連あり」に格上げしてしまう。到達不能を
+        防ぐ役割は較正が果たし、較正が効かない構成では静的値のまま
+        (:meth:`inject` が全件却下をログに出すので、沈黙はしない)。
+        """
+        static_relevance = float(
             cfg.get("relevance_min_score", DEFAULT_RELEVANCE_MIN_SCORE),
         )
-        self.pinned_relevance_min_score: float = float(
+        static_pinned = float(
             cfg.get(
                 "pinned_relevance_min_score",
                 DEFAULT_PINNED_RELEVANCE_MIN_SCORE,
             ),
         )
-        self._now_provider = now_provider or time.time
+        if str(cfg.get("threshold_mode", "auto")) != "auto":
+            return static_relevance, static_pinned
+
+        from backend.free.rag.memory_threshold_calibration import (
+            get_active_calibration,
+        )
+
+        calibration = get_active_calibration()
+        if not calibration:
+            return static_relevance, static_pinned
+        relevance = float(
+            calibration.get("relevance_threshold", static_relevance),
+        )
+        return relevance, relevance * PINNED_RELEVANCE_RATIO
 
     # ── public API ────────────────────────────────────────────────────
 
@@ -322,6 +397,11 @@ class MemoryInjector:
         tier_budgets = self._tier_budgets(budget, ratios)
         query_vec = self._prepare_query_vec(query_embedding)
         filtered_out = 0
+        # 関連度ゲートに **到達した** 候補と、そこで落ちた数。到達数と却下数が
+        # 一致したら「棒が到達不能になっている」サイン (較正が効かない構成で
+        # 埋め込みモデルを替えたとき、静的閾値が黙って全部落とす)。
+        gate_reached = 0
+        gate_rejected = 0
 
         # Tier ごとに分類
         buckets: dict[int, list[InjectedItem]] = {1: [], 2: [], 3: [], 4: []}
@@ -368,15 +448,17 @@ class MemoryInjector:
             # 大きく食っていた (想起クエリで 582 → 219 文字)。
             # 「前回何を話したか」は search_history ツールの担当。
             # MDP エピソードトレース / executable command 索引も同じ理由で落とす
-            # (:data:`_INTERNAL_INDEX_SUBJECT_PREFIXES` の各説明を参照)。
-            if fact.subject.startswith(_INTERNAL_INDEX_SUBJECT_PREFIXES):
+            # (:data:`INTERNAL_INDEX_SUBJECT_PREFIXES` の各説明を参照)。
+            if fact.subject.startswith(INTERNAL_INDEX_SUBJECT_PREFIXES):
                 filtered_out += 1
                 continue
+            gate_reached += 1
             if not self._is_relevant(
                 query_vec, getattr(fact, "embedding", None),
                 pinned=bool(fact.pinned),
             ):
                 filtered_out += 1
+                gate_rejected += 1
                 continue
             tier = self._classify_fact(
                 fact, mode, current_project_id, sigs,
@@ -422,6 +504,7 @@ class MemoryInjector:
             if not pinned and is_payload_dump(getattr(note, "content", "")):
                 filtered_out += 1
                 continue
+            gate_reached += 1
             if not self._is_relevant(
                 query_vec, getattr(note, "embedding", None),
                 # MemoryNote 側の pin 属性は ``pin_flag`` (SemanticFact は ``pinned``)。
@@ -429,6 +512,7 @@ class MemoryInjector:
                 require_embedding=True,
             ):
                 filtered_out += 1
+                gate_rejected += 1
                 continue
             tier = self._classify_note(note, mode, current_project_id)
             if tier is None:
@@ -472,6 +556,18 @@ class MemoryInjector:
             len(plan.dropped), current_project_id, len(sigs),
             "on" if query_vec is not None else "off", filtered_out,
         )
+        # 全件却下は「関連する記憶が無いターン」でも起きるが、それが**続く**なら
+        # 棒が到達不能になっている。静的閾値のまま埋め込みモデルを替えたときの
+        # 沈黙故障 (このプロジェクトで 2 度起きている) を観測可能にする。
+        if query_vec is not None and gate_reached and gate_rejected == gate_reached:
+            logger.info(
+                "MemoryInjector: the relevance gate rejected all %d candidate(s) "
+                "(min_score=%.3f, pinned_min=%.3f). If this persists across turns, "
+                "the threshold is unreachable on this embedding scale - check the "
+                "calibration cache (memory_threshold_calibration).",
+                gate_reached, self.relevance_min_score,
+                self.pinned_relevance_min_score,
+            )
         return plan
 
     # ── 関連度ゲート ──────────────────────────────────────────────────
@@ -663,6 +759,8 @@ class MemoryInjector:
         base += self._recency_term(fact.accessed_at)
         if fact.pinned:
             base += PINNED_BONUS
+        if getattr(fact, "from_correction", False):
+            base += CORRECTION_BONUS
         return base
 
     def _score_note(self, note: MemoryNote) -> float:
@@ -684,8 +782,21 @@ class MemoryInjector:
 
     def _render_fact(self, fact: SemanticFact) -> str:
         age = self._fact_age_days(fact)
+        corrected = bool(getattr(fact, "from_correction", False))
         if age is None or age < _FACT_STALE_LABEL_DAYS:
+            if corrected:
+                # 同じ日に古い値と並ぶと、下の「N日前の記録」も付かないため
+                # どちらが現在値かを示す手掛かりが行に無くなる。
+                return (
+                    f"- ({fact.type}) {fact.subject} {fact.predicate}:"
+                    f" {fact.text} (訂正後の記録)"
+                )
             return f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.text}"
+        if corrected:
+            return (
+                f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.object}"
+                f" (訂正後の記録・{int(age)}日前)"
+            )
         # 何日前の記録かを行ごとに書く。ノート側 (_render_note の (過去の記録))
         # と同じ理由で、ブロック先頭の注意書きは数百トークン離れると効かない。
         #

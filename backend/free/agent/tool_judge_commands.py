@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import datetime
 import re
 import shlex
 from collections.abc import Callable
@@ -13,7 +14,7 @@ from pathlib import Path
 
 from backend.free.agent.safety_patterns import reject_readonly_violation
 from backend.free.agent.tool_judge_grounding import _numeric_literals
-from backend.free.core.intent_vocab import DATETIME_QUERY_RE
+from backend.free.core.intent_vocab import DATETIME_QUERY_RE, is_plain_statement
 from backend.log_config import get_logger
 
 logger = get_logger("agent.tool_call_judge")
@@ -146,6 +147,20 @@ _RELATIVE_OFFSET_RE = re.compile(
 #: 相対日付クエリに答えられるかの判定に使う (``recalled_command_fits_query``)。
 _DATE_ARITHMETIC_RE = re.compile(r"timedelta|datetime\.datetime\(|datetime\.date\(")
 
+#: 完全に特定された絶対日付 (年・月・日がすべて書かれている)。年を必須にする
+#: ことで「1 月 3 日は何曜日ですか」のような年抜き表現は従来どおり除外する。
+_ABSOLUTE_DATE_RE = re.compile(
+    r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日"
+    r"|(\d{4})[-/](\d{1,2})[-/](\d{1,2})",
+)
+
+#: 曜日を尋ねていることを示す語。
+_WEEKDAY_ASK_RE = re.compile(
+    r"曜日|(?<![A-Za-z])day\s+of\s+the\s+week(?![A-Za-z])"
+    r"|(?<![A-Za-z])weekday(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
 #: 相対日付の単位 → コマンド生成の種別。
 _OFFSET_UNITS = {
     "日": "days", "週": "weeks", "週間": "weeks",
@@ -173,6 +188,37 @@ _REL_SUFFIX = (
 )
 
 
+def _absolute_weekday_command(query: str) -> str:
+    """「YYYY年M月D日は何曜日？」用に、その日の曜日を計算するコマンドを返す。
+
+    該当しない (曜日を尋ねていない / 年月日が揃っていない / 実在しない日付) 場合は
+    空文字列を返し、呼び出し側が従来のコマンドへ倒す。
+
+    相対日付は既に Python で計算させているのに、**絶対日付だけモデルの暗算に
+    委ねられていた**。ツールは現在時刻しか返さないため、曜日は完全に base の
+    記憶頼みになる (実インシデント 2026-08-19 ライブ監査 ターン19:
+    「西暦2000年1月1日は何曜日でしたか？」で ``datetime.now()`` だけが実行され、
+    回答の「土曜日」はツールで裏取りされていなかった)。
+    """
+    if not _WEEKDAY_ASK_RE.search(query or ""):
+        return ""
+    m = _ABSOLUTE_DATE_RE.search(query or "")
+    if m is None:
+        return ""
+    parts = m.groups()
+    triple = parts[:3] if parts[0] is not None else parts[3:]
+    try:
+        year, month, day = (int(v) for v in triple)
+        datetime.date(year, month, day)
+    except (TypeError, ValueError):
+        return ""
+    return (
+        'python -c "import datetime;'
+        f" t=datetime.datetime({year},{month},{day});"
+        " print('target:',t.strftime('%Y-%m-%d (%A)'))\""
+    )
+
+
 def _build_datetime_command(query: str) -> str:
     """日付 / 時刻クエリ用のコマンドを組み立てる。
 
@@ -182,11 +228,14 @@ def _build_datetime_command(query: str) -> str:
     に「火曜日」と回答。2023-08-07 は月曜日)。同じ日に「今日から 100 日後」は
     正答しており、暗算が当たるかどうかは運になっていた。
 
-    相対表現が無ければ従来どおり現在日時のみを返す。
+    年月日が揃った絶対日付の曜日を尋ねる場合も同じ理由で Python に計算させる
+    (``_absolute_weekday_command``)。
+
+    どちらでもなければ従来どおり現在日時のみを返す。
     """
     m = _RELATIVE_OFFSET_RE.search(query or "")
     if m is None:
-        return _DATETIME_NOW_COMMAND
+        return _absolute_weekday_command(query) or _DATETIME_NOW_COMMAND
     kind = _OFFSET_UNITS.get(m.group(2))
     if kind is None:
         return _DATETIME_NOW_COMMAND
@@ -366,9 +415,17 @@ def _infer_executable_command(query: str) -> str:
     最初にマッチしたコマンドを返す。
     マッチしない場合（数値処理・データ処理等）は空文字列を返す。
 
+    ルール表は語彙一致なので、ユーザーの自己申告 (「ターミナルは Windows
+    Terminal を使っています。」) にも当たる。問い・依頼のマーカーが無い平叙文は
+    実行要求ではないため、照合前に落とす (2026-08-19 ライブ監査 ターン3 で
+    ``platform.platform()`` が撃たれた)。
+
     Returns:
         生成されたシェルコマンド。該当なしの場合は空文字列。
     """
+    if is_plain_statement(query):
+        logger.debug("Plain statement, no executable command: %s", query[:50])
+        return ""
     for pattern, command in _EXECUTABLE_QUERY_COMMANDS:
         if pattern.search(query):
             if callable(command):

@@ -483,11 +483,21 @@ async def _build_messages_with_search(
 
     # SemMem facts + STM notes を MemoryInjector で tier 整形して注入
     # (RAG とは独立、読み取りのみ)。pending 競合セクションも併せて連結する。
-    semmem_block = build_semmem_injection(
-        state, cfg, mode=req.mode, conflict_ctx=conflict_ctx,
-        # 検索で算出済みのクエリ埋め込みを再利用し、無関係な記憶の注入を防ぐ
-        query_vec=search_result.query_vec,
-    )
+    #
+    # ``semmem_ms`` を計測するのは、この経路が全件ロード (``all_facts()``) +
+    # ファクトごとの numpy 演算 + レンダリングを**イベントループ上で同期**に
+    # 回すため。``search_ms`` は RAG しか覆っておらず、ここは実測の空白だった
+    # (2026-08-18 の requests.jsonl に区間が無い)。ストアが育ったときに
+    # 最初に効いてくる場所なので、先に見えるようにしておく。
+    timer.start("semmem_ms")
+    try:
+        semmem_block = build_semmem_injection(
+            state, cfg, mode=req.mode, conflict_ctx=conflict_ctx,
+            # 検索で算出済みのクエリ埋め込みを再利用し、無関係な記憶の注入を防ぐ
+            query_vec=search_result.query_vec,
+        )
+    finally:
+        timer.stop("semmem_ms")
 
     messages = build_chat_messages(
         system_prompt, history, rag_chunks, file_contexts,

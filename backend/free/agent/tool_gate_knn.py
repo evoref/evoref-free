@@ -42,9 +42,22 @@ DEFAULT_K = 5
 #: 2 段階構成にせず、まず同梱のみ。育成経路は今後 Level 1 側で足す。
 _DEFAULTS_FILE = Path(__file__).parent / "_defaults" / "tool_gate_exemplars.jsonl"
 
-#: exemplar 埋め込みのクエリ整形。検索と同じテンプレートを使う (質問文と
-#: 平叙文で埋め込みが非対称なため、判定側も同じ側に揃える)。
-_QUERY_TEMPLATE = "query: {query}"
+# exemplar も判定クエリも **素のテキストのまま** 埋め込む (前置きを足さない)。
+#
+# 質問文と平叙文の非対称は埋め込みバックエンド側の ``query_template``
+# (``Instruct: {task}\nQuery: {query}``) が既に吸収している。その上に独自の
+# 前置き (旧 ``"query: {query}"``) を重ねると、**``embed_query`` の LRU キーが
+# 検索パイプラインと食い違い、同じクエリを 1 ターンに 2 回埋め込む**。しかも
+# 検索パイプラインとツール判定は ``asyncio.create_task`` で同時に走るため、
+# in-flight 共有 (``_query_inflight``) にも乗らない。
+#
+# 実測 (2026-08-18、chat 136 ターン / 145 トレース): query 埋め込みが 433 回
+# = 3.0 回/ターン、うち実往復 (cache_hit=false) が 2 回のトレースが 103 本
+# (71%)。実往復は中央値 216.7ms / p90 1292.1ms / 最大 8057.5ms、合計 171.1 秒
+# = **1.18 秒/ターン** を同じ文字列の再埋め込みに払っていた。
+#
+# exemplar 側も同じ扱いなので、前置きを外しても両者の相対位置 (= kNN の判定)
+# は変わらない。``TestSharesQueryEmbeddingCache`` が両経路の入力一致を固定する。
 
 
 def load_exemplars(path: Path | None = None) -> list[tuple[str, str]]:
@@ -107,9 +120,7 @@ class ToolGateKNN:
             )
             return False
         try:
-            texts = [
-                _QUERY_TEMPLATE.format(query=q) for q, _ in self._exemplars
-            ]
+            texts = [q for q, _ in self._exemplars]
             vecs = await self._embedder.embed(texts, is_query=True, mode="chat")
             mat = np.asarray(vecs, dtype=np.float32)
             norms = np.linalg.norm(mat, axis=1, keepdims=True)
@@ -135,9 +146,10 @@ class ToolGateKNN:
         if not self.is_ready() or not query.strip():
             return None
         try:
-            qv = await self._embedder.embed_query(
-                _QUERY_TEMPLATE.format(query=query), mode="chat",
-            )
+            # 素のクエリで引く。検索パイプライン (run_search_pipeline) が同じ
+            # (query, mode) で先に埋め込んでいるので LRU ヒットになり、埋め込み
+            # サーバへの往復が消える (モジュール冒頭の実測コメント参照)。
+            qv = await self._embedder.embed_query(query, mode="chat")
             q = np.asarray(qv, dtype=np.float32)
             norm = float(np.linalg.norm(q))
             if norm == 0.0:

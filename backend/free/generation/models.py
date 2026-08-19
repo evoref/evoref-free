@@ -1,6 +1,6 @@
 """長文生成エンジンのデータモデル
 
-設計書 f_08_long_form_generation.md §3 準拠。
+設計書 f_08_long_form_generation.md §3.2 準拠。
 CogWriter / Recurrent 両戦略で共通の計画・ユニット定義。
 """
 

@@ -27,6 +27,10 @@ logger = get_logger("memory.scheduler")
 #: 来るまで再試行できない (実質デッドロック)。生成が畳まれる分の余裕を必ず取る。
 _FULL_MIN_WAIT_SEC = 30.0
 
+#: 期限切れ / 前倒し要求済みの Full が、進行中の生成の終了を待つ上限 (秒)。
+#: これを超えても生成中なら諦めて次の応答で再試行する (生成に割り込まない)。
+_FULL_INFLIGHT_WAIT_SEC = 180.0
+
 
 def _emit_bg_task_outcome(
     debug_logger: "DebugLogger | None",
@@ -86,6 +90,9 @@ class SleepTimeScheduler:
         #: 最後に Full を **実行** した時刻 (``time.time()``、``_started_at`` と
         #: 同じ時計)。0 は未実行。
         self._last_full_run: float = 0.0
+        #: 「次の Full を前倒しで走らせる」要求 (:meth:`request_full_soon`)。
+        #: 訂正ターンのように、記憶へ早く反映しないと意味が薄れる出来事で立てる。
+        self._full_requested: bool = False
         # Trigger C: Level 1 のアイドル閾値（独立常駐ループから参照）
         self.level1_idle_minutes: float = learning.get("level1_idle_minutes", 30)
         # Trigger C: Level 1 ループの再評価間隔（秒）
@@ -230,11 +237,32 @@ class SleepTimeScheduler:
             self._light_task = None
             logger.info("Light task cancelled by user input")
 
-        # Full タスクをキャンセル
+        # Full タスクをキャンセル。ただし **期限切れ / 前倒し要求済み** の Full は
+        # 残す。
+        #
+        # ここで無条件にキャンセルすると、ユーザーが入力するたびにタイマーが
+        # 振り出しに戻るため、``full_max_defer_minutes`` (上限 30 分) も
+        # ``request_full_soon`` も **会話が続いている限り一度も発火しない**。
+        # 実測 (2026-08-19 ライブ検証、chat 40 ターン): 訂正で前倒しを要求した
+        # 16:52 から、会話が止まる 17:25 までの 33 分間に
+        # ``Full task cancelled by user input`` が 168 回 /
+        # ``Full schedule debounced`` が 39 回で、Full の実行は 0 回。
+        # ``chat_in_flight`` によるスキップは 0 回 — つまりタスクは待機中に
+        # 毎回消されており、生成との競合判定まで到達していなかった。
+        #
+        # 生成中に割り込まない保証は ``_chat_in_flight`` (と下の worker.cancel)
+        # が担うので、待機タスクを残しても実行タイミングの安全性は変わらない。
         if self._full_task is not None and not self._full_task.done():
-            self._full_task.cancel()
-            self._full_task = None
-            logger.info("Full task cancelled by user input")
+            if self._full_requested or self._full_defer_expired():
+                logger.debug(
+                    "Full task kept alive across user input "
+                    "(requested=%s, deferred=%.1f min)",
+                    self._full_requested, self._full_deferred_seconds() / 60,
+                )
+            else:
+                self._full_task.cancel()
+                self._full_task = None
+                logger.info("Full task cancelled by user input")
 
         # Level 1/2 学習を協調 yield
         # 現世代を完走させて Level1Session に進捗を残し、次回 tick で resume する
@@ -272,6 +300,28 @@ class SleepTimeScheduler:
         if self._worker is None or self._running:
             return
         await self._run_light()
+
+    def request_full_soon(self, reason: str) -> None:
+        """次の Trigger B (Full) を前倒しで走らせる。
+
+        ファクト抽出 (Step 8) と競合解決 (Step 6B) は **Full にしか無い**
+        (``memory.facts.trigger: idle_full_only``)。Light は Step 1-5.5 だけで、
+        埋め込み・タグ・スコア・eviction しかやらない。そのため既定では
+        「アイドル 10 分」か「繰り延べ上限 30 分」まで、ユーザーの訂正が
+        SemMem に一切反映されない。
+
+        訂正のように **反映が遅れると意味が薄れる** 出来事では、待ち時間を
+        下限まで縮め、ユーザーがアクティブでも 1 回通す (``_full_defer_expired``
+        と同じ扱い)。書込は従来どおり SleepTimeWorker = 専有スロット上で走るので、
+        チャットの KV とは分離されている。
+
+        呼ぶだけで即実行はしない — 実際の起動は次の ``on_response_sent`` が
+        張るタイマーが担う (生成中の割り込みは ``_chat_in_flight`` が止める)。
+        """
+        if self._worker is None or self._full_requested:
+            return
+        self._full_requested = True
+        logger.info("Trigger B: full sleep-time requested early (reason=%s)", reason)
 
     def on_response_sent(self) -> None:
         """応答完了通知: Trigger B (Full) タイマーをリセット（§8.1）"""
@@ -363,6 +413,8 @@ class SleepTimeScheduler:
         ``full_max_defer_minutes`` を超えたら、ユーザーがアクティブでも 1 回だけ
         通す。未実行 (プロセス起動後 0 回) の場合は起動時刻を起点にする。
         """
+        if self._full_requested:
+            return True
         limit = self.full_max_defer_minutes
         if limit <= 0:
             return False
@@ -390,6 +442,10 @@ class SleepTimeScheduler:
         掛ける — 設定された ``full_idle_minutes`` より長く待つことは無い
         (テストや極小構成が 0.6 秒指定で 30 秒待たされないように)。
         """
+        if self._full_requested:
+            # 前倒し要求時は下限だけ待つ (0 秒で起きると生成が in-flight のまま
+            # chat_in_flight で弾かれ、次の応答まで再試行できない)。
+            return _FULL_MIN_WAIT_SEC
         idle_s = float(self.full_idle_minutes) * 60
         limit = self.full_max_defer_minutes
         if limit <= 0:
@@ -461,13 +517,37 @@ class SleepTimeScheduler:
                 skipped_reason = "no_worker"
                 return
 
-            # 生成中は上限超過でも割り込まない (同一 llama-server 上でスロットと
-            # バッチを奪い合う)。次の応答で再スケジュールされる。
+            # 生成中は割り込まない (同一 llama-server 上でスロットとバッチを
+            # 奪い合う)。ただし **期限切れ / 前倒し要求済み** の Full は、
+            # スキップして次の応答を待つのではなく **生成が終わるまで待って**
+            # から走らせる。
+            #
+            # スキップに倒すと「起きる → 生成中 → 諦める → 次の応答で再
+            # スケジュール → また生成中」を繰り返し、会話が途切れるまで
+            # 一度も走らない (上の on_user_input のコメントと同じ実測)。
             if self._chat_in_flight():
-                logger.info("Trigger B: skipped, a chat generation is in flight")
-                success = True
-                skipped_reason = "chat_in_flight"
-                return
+                if not (self._full_requested or self._full_defer_expired()):
+                    logger.info("Trigger B: skipped, a chat generation is in flight")
+                    success = True
+                    skipped_reason = "chat_in_flight"
+                    return
+                logger.info(
+                    "Trigger B: waiting for the in-flight generation to finish "
+                    "(up to %.0fs) before running the deferred full",
+                    _FULL_INFLIGHT_WAIT_SEC,
+                )
+                waited = 0.0
+                while self._chat_in_flight() and waited < _FULL_INFLIGHT_WAIT_SEC:
+                    await asyncio.sleep(1.0)
+                    waited += 1.0
+                if self._chat_in_flight():
+                    logger.info(
+                        "Trigger B: generation still in flight after %.0fs; "
+                        "retrying on the next response", waited,
+                    )
+                    success = True
+                    skipped_reason = "chat_in_flight"
+                    return
 
             # ユーザーがアクティブなら実行しない。ただし待ち続けて上限を超えた
             # 場合は 1 回走らせる (self.full_max_defer_minutes の説明を参照)。
@@ -480,6 +560,7 @@ class SleepTimeScheduler:
             logger.info("Trigger B: starting Full sleep-time update")
             self._running = True
             executed = True
+            self._full_requested = False
             self._last_full_run = time.time()
             # Step 8 の入力 (STM ノート) を用意してから走らせる。押し出しが
             # 起きていない進行中セッションでは、これが唯一の供給経路になる

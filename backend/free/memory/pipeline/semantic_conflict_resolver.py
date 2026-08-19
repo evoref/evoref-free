@@ -22,8 +22,9 @@ EvorefMem 統合仕様 における sleep-time **Step 6** の SemMem 対応分
 6. ``pending_auto_resolve_days`` (既定 3 日) 超過の滞留 pending は
    ``resolve()`` 冒頭の TTL pre-pass (``_resolve_expired_pending``) が
    keep_new で自動解消する (``conflicts_resolved.jsonl`` に
-   ``decision="ttl_auto"``)。pinned / project / policy は対象外。
-   ``default_mode=manual`` でも有効、0 で無効。
+   ``decision="ttl_auto"``)。**pinned / project / policy も対象**
+   (チャット回答での解決経路が 2026-08-14 に撤去され、除外すると解決手段が
+   ゼロになるため)。``default_mode=manual`` でも有効、0 で無効。
 
 ファイル出力 (1 ストアあたり)::
 
@@ -289,10 +290,26 @@ class SemanticConflictResolver:
         """TTL 超過の pending 競合グループを keep_new で自動解消する (pre-pass)。
 
         グループ内最新ファクトの ``created_at`` から ``pending_ttl_sec`` 経過した
-        グループが対象。pinned を含む / type に project・policy を含むグループは
-        除外する (チャット回答でのみ解決)。``default_mode=manual`` でも有効で、
-        無効化は ``pending_auto_resolve_days=0`` を指定する。``result`` の
+        グループが対象。``default_mode=manual`` でも有効で、無効化は
+        ``pending_auto_resolve_days=0`` を指定する。``result`` の
         ``ttl_auto_resolved`` を解消グループ数だけ加算する。
+
+        **pinned / project / policy も対象に含める。** 以前はこの 3 種を
+        「チャット回答でのみ解決」として除外していたが、**その チャット回答の
+        判定経路は 2026-08-14 に撤去された** (docs/f_02 §5.3)。撤去後も除外だけが
+        残っていたため、この 3 種は解決経路がゼロになり永久に pending へ滞留する。
+        滞留した pending は Tier 予算の外で毎ターン最大 400 トークン注入され続け、
+        しかも関連度ゲートが掛からない。
+
+        pin を対象にしてよい理由: TTL は ``keep_new`` で、**同じスロットの古い世代を
+        supersede するだけ**。最新の値は active のまま残り、supersede は削除では
+        ないので内容は失われない。pin は「優先度」の指定であって「不変」の宣言では
+        ない (``MemoryInjector`` 側の pin の扱いと同じ立場) うえ、pin は
+        「覚えておいてください」等の語で **自動的に** 付くため、除外したままだと
+        普通の会話で恒久 pending が量産される。
+
+        自動解決そのものを望まない構成は ``pending_auto_resolve_days: 0`` で
+        止められる (従来どおり)。
         """
         if self.pending_ttl_sec <= 0:
             return
@@ -306,10 +323,6 @@ class SemanticConflictResolver:
         scope = self._infer_scope()
         now = float(self._now_provider())
         for group in collect_pending_groups(self.store, scope):
-            if any(f.pinned for f in group.facts):
-                continue
-            if {f.type for f in group.facts} & _MANUAL_BASE_TAGS:
-                continue
             if now - group.newest.created_at < self.pending_ttl_sec:
                 continue
             loser_ids = [f.id for f in group.facts if f.id != group.newest.id]
@@ -385,6 +398,28 @@ class SemanticConflictResolver:
         """1 グループの自動/手動判定を返す。``facts`` は created_at 昇順。"""
         winner = facts[-1]
         losers = tuple(facts[:-1])
+        types_in_group = {f.type for f in facts}
+
+        # ユーザーが明示的に訂正したターン由来の値は、確認を挟まず即採用する。
+        #
+        # ``_is_borderline`` は「同 session_id」または「confirm_window_hours 以内」を
+        # 微妙ケースとして pending にするが、**会話中の訂正はその両方を必ず満たす**。
+        # つまり「違います、コーヒーです」のような **いちばん確度の高い訂正が
+        # いちばん自動解決されない** 経路に入っていた。しかも解決経路は TTL
+        # (既定 3 日) しか残っていない。
+        #
+        # pinned より優先する: pin は「覚えておいてください」等の語で自動的に
+        # 付くので、ユーザーが後から明示的に否定した値を pin が守る理由は無い。
+        # 一方 ``default_mode: manual`` と project / policy タグは尊重する
+        # (前者は運用者の明示指定、後者はチャットの訂正が及ぶ対象ではない)。
+        if (
+            winner.from_correction
+            and self.default_mode != "manual"
+            and not (types_in_group & _MANUAL_BASE_TAGS)
+        ):
+            return ConflictDecision(
+                "auto", "user_correction", winner, losers,
+            )
 
         if any(f.pinned for f in facts):
             return ConflictDecision(
@@ -396,7 +431,6 @@ class SemanticConflictResolver:
                 "pending", "default_manual", winner, losers,
             )
 
-        types_in_group = {f.type for f in facts}
         manual_tag_hit = types_in_group & _MANUAL_BASE_TAGS
         if manual_tag_hit and self.project_tag_always_manual:
             if (

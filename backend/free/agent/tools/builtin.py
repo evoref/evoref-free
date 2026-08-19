@@ -560,7 +560,8 @@ def register_builtin_tools(
         hidden=True,
     )
 
-    # 搭載 RAM / CPU / OS を **シェルを介さず** に返す chat 専用ツール。
+    # 搭載 / 空き RAM・CPU・OS・CPU 使用率・GPU VRAM を **シェルを介さず**
+    # 返す chat 専用ツール。
     # readonly allow-list (_READONLY_SAFE_MODULES) はチャットから渡される
     # コマンド文字列にしか掛からないため、backend 内の実装で測る
     # (free/core/vram_monitor が nvidia-smi を直接叩いているのと同じ立て付け)。
@@ -569,8 +570,9 @@ def register_builtin_tools(
         name="system_hardware_info",
         func=lambda: format_hardware_facts(),
         description=(
-            "Report host hardware facts (OS / CPU / cores / physical RAM) "
-            "without a shell (injected by the tool judge; not directly selectable)"
+            "Report host hardware facts (OS / CPU / cores / RAM / CPU usage / "
+            "GPU VRAM) without a shell (injected by the tool judge; not "
+            "directly selectable)"
         ),
         parameters={},
         modes=["chat"],

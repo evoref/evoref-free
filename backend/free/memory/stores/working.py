@@ -110,6 +110,7 @@ class WorkingMemory:
         tool_command_success: bool | None = None,
         tool_command_source: str | None = None,
         tool_command_query: str | None = None,
+        correction: bool = False,
     ) -> None:
         """ターンを追加し、トークン上限を超えたら圧縮・押し出し
 
@@ -122,6 +123,15 @@ class WorkingMemory:
         sleep-time の executable_command_curator が参照する (それ以外は None)。
         ``tool_command_query`` は当該コマンドを発火させたユーザークエリで、
         curator が STM 走査で対応付けを推測しないために持たせる。
+
+        ``correction=True`` は「この発話がユーザー自身の値の言い直し」であることを
+        表す (判定は :func:`backend.free.agent.feedback.restates_a_value`。
+        アシスタントの誤りの指摘と、ユーザー自身の申告訂正の両方を含む)。
+        ``MemoryNote.is_correction`` → ``SemanticFact.from_correction`` と伝播し、
+        (a) 抽出器が直前の名前付き属性を継承して訂正が対象と同じスロットへ入り、
+        (b) sleep-time の競合解決が「同一セッション内だから微妙ケース」として
+        pending へ落とすのを免除する。訂正は会話中に起きるので、この印が無いと
+        **いちばん確度の高い訂正がいちばん自動解決されない**。
         """
         est_tokens = _estimate_tokens(content)
         logger.debug(
@@ -153,6 +163,8 @@ class WorkingMemory:
             turn["tool_command_source"] = tool_command_source
         if tool_command_query is not None:
             turn["tool_command_query"] = tool_command_query
+        if correction:
+            turn["is_correction"] = True
         if role == "user" and not self.session_first_user_turn and content.strip():
             self.session_first_user_turn = content
         self.turns.append(turn)

@@ -418,6 +418,29 @@ _PERSONAL_RECALL_EN_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 会話で既出のものを問い直す想起形 (談話照応)。一人称を伴わない。
+#
+# ``_PERSONAL_RECALL_RE`` は一人称 (``私`` / ``僕`` 等) を必須にしているため、
+# **ユーザー自身ではなく会話で出てきた対象**を問い直すクエリが漏れる。
+# 日本語の過去形疑問「〜でしたか」「〜だっけ」は *その場で初めて聞く事柄* には
+# 使わない — 「HTTP とは何ですか」とは言うが「何でしたか」とは言わない。
+# 既出であることを前提にした形なので、記憶を引くべきクエリの強いシグナルになる。
+#
+# 実インシデント (2026-08-19 ライブ監査): 前のセッションで「あさひプロジェクトの
+# 締切は10月15日」と伝えた後、新しいセッションで
+# 「あさひプロジェクトの締切はいつでしたか？」(22 文字) が一人称を含まないため
+# personal_recall を外れ、short_query → reactive_light に落ちて SemMem を一度も
+# 引かないまま「確認できていません。」と回答した。同一セッション内では直近窓に
+# 残っていたため正答しており、**窓から出た瞬間だけ失敗する**構造だった。
+#
+# 誤爆しても代償は deliberative の実行コストだけ。逆に取りこぼすと「記憶して
+# いるのに情報が無いと答える」ため、非対称を踏まえて広めに採る。ただし
+# ``ましたか`` (「わかりましたか？」等の一般的な確認) は含めない。
+_DISCOURSE_RECALL_RE = re.compile(
+    r"(?:でしたか|だったか|でしたっけ|だったっけ|だっけ)"
+    r"[。．.、,！!？?\s\"'」』）)]*\s*$",
+)
+
 # 前提の同意を求める確認形。「〜ですよね？」「〜で合っていますか」など。
 #
 # knowledge_query の strict パターンは ``ですか|でしょうか|とは|教えて`` を持つが、
@@ -908,6 +931,12 @@ _CLASSIFY_RULES: tuple[_ClassifyRule, ...] = (
         "personal_recall", "deliberative",
         lambda c, x: c._is_personal_recall_query(x.query),
     ),
+    # 一人称を伴わない想起形 (「〜でしたか」) も同じ経路へ逃がす
+    # (_DISCOURSE_RECALL_RE 参照)。
+    _ClassifyRule(
+        "discourse_recall", "deliberative",
+        lambda c, x: c._is_discourse_recall_query(x.query),
+    ),
     # 計算を求めるクエリを reactive に落とすとツール判定に一度も到達せず、
     # base の暗算に倒れる (2026-08-08 ライブ監査:「時速240kmで2時間30分走ると
     # 何km進みますか。」(26 文字) が short_query → reactive で 540km と誤答。
@@ -1227,6 +1256,10 @@ class ComplexityClassifier:
             _PERSONAL_RECALL_RE.search(query)
             or _PERSONAL_RECALL_EN_RE.search(query),
         )
+
+    def _is_discourse_recall_query(self, query: str) -> bool:
+        """会話で既出の事柄を問い直す想起形かを判定する (_DISCOURSE_RECALL_RE 参照)。"""
+        return bool(_DISCOURSE_RECALL_RE.search(query.strip()))
 
     def _is_premise_confirmation_query(self, query: str) -> bool:
         """前提の同意を求める確認形かを判定する (_PREMISE_CONFIRMATION_RE 参照)。"""

@@ -17,6 +17,15 @@ OUTPUT_RESERVE_TOKENS = 512
 # 推測であり、根拠となる設計文書は未確認。
 LOOP_OVERHEAD_TOKENS = 400
 
+# 送信直前ガード (``LocalClient._enforce_context_budget``) が確保する余白の
+# 見積り。ガードは ``budget = n_ctx - 安全マージン - max_tokens`` でプロンプト
+# 側の上限を決めるため、``max_tokens`` を ``n_ctx - プロンプト長`` いっぱいまで
+# 積むと budget がプロンプト長を必ず下回り、**毎回プロンプト側が中略される**
+# (実測 2026-08-19 ライブ監査: ファイル書き込みの本文生成で
+# ``est=900 > budget=828`` となり user メッセージが 2135 → 1621 文字へ削られた)。
+# 内訳は安全マージン 192 + メッセージ毎オーバーヘッド (4 tok × 最大 16 通)。
+SEND_GUARD_RESERVE_TOKENS = 256
+
 
 def resolve_meta_cognitive_loop_budget(config: dict, mode: str = "chat") -> int:
     """Meta-Cognitive ループが使えるトークン予算を計算する。

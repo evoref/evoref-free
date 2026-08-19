@@ -154,6 +154,7 @@ def _note_to_dict(note: MemoryNote) -> dict:
         "confidence": note.confidence,
         "pin_flag": note.pin_flag,
         "pin_reason": note.pin_reason,
+        "is_correction": note.is_correction,
         "extracted_fact_ids": list(note.extracted_fact_ids),
         "private": note.private,
         "mode": note.mode,
@@ -176,6 +177,8 @@ def _note_to_dict(note: MemoryNote) -> dict:
         "cluster_id": note.cluster_id,
         "url_curated_at": note.url_curated_at,
         "command_curated_at": note.command_curated_at,
+        "assertion_curated_at": note.assertion_curated_at,
+        "assertion_slug": note.assertion_slug,
         "conflict_fail_count": note.conflict_fail_count,
         "conflict_cooldown_until": note.conflict_cooldown_until,
     }
@@ -224,6 +227,7 @@ def _note_from_dict(d: dict) -> MemoryNote:
         confidence=d.get("confidence", 1.0),
         pin_flag=d.get("pin_flag", False),
         pin_reason=d.get("pin_reason"),
+        is_correction=d.get("is_correction", False),
         extracted_fact_ids=list(d.get("extracted_fact_ids", [])),
         private=d.get("private", False),
         mode=d.get("mode", "chat"),
@@ -249,6 +253,8 @@ def _note_from_dict(d: dict) -> MemoryNote:
         cluster_id=d.get("cluster_id"),
         url_curated_at=d.get("url_curated_at"),
         command_curated_at=d.get("command_curated_at"),
+        assertion_curated_at=d.get("assertion_curated_at"),
+        assertion_slug=d.get("assertion_slug"),
         conflict_fail_count=d.get("conflict_fail_count", 0),
         conflict_cooldown_until=d.get("conflict_cooldown_until"),
     )

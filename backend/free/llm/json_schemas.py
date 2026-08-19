@@ -357,6 +357,31 @@ class UrlRelevanceJudgement(_StrictModel):
     reason: str = Field(max_length=200)
 
 
+# ── 型付けできなかった言明の命名 (assertion_naming) ──
+
+
+class AssertionNaming(_StrictModel):
+    """`backend/free/memory/sleep/assertion_curator.py` の言明命名。
+
+    ``candidate_fact_tags`` が空を返した断定文 (日本語の「〜です」で終わる
+    言明の大半) に対し、SemMem の subject に使える **ASCII slug** と
+    命題化した object を補助タスクに付けさせる。
+
+    ``subject_ns._SAFE_PART_RE`` が ASCII 英数字 / ``_`` / ``-`` しか許さない
+    ため、日本語のキーワードからは決定論的に subject を導けない
+    (``extractors.chat._is_usable_world_keyword`` が英字必須で弾く)。
+    ``fact_attributes.yaml`` の JA→ASCII 辞書は登録済みの話題しか拾えない。
+    ここだけモデルに命名させることで未登録の話題にも届かせる。
+
+    ``is_assertion=False`` を返させる余地を残すのは、規則側の疑問形 / 依頼形
+    ゲートをすり抜けた非言明を最後に落とすため。
+    """
+
+    is_assertion: bool
+    slug: str = Field(max_length=40)
+    object: str = Field(max_length=300)
+
+
 # ── few-shot 手本の品質採点 (fewshot_quality_score) ──
 
 
@@ -515,6 +540,7 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "meta_cognitive_plan": MetaCognitivePlan,
     "cartridge_eval_generation": CartridgeEvalQAList,
     "url_relevance_score": UrlRelevanceJudgement,
+    "assertion_naming": AssertionNaming,
     "rag_judge_relevance_score": UrlRelevanceJudgement,
     "fewshot_quality_score": FewShotQualityJudgement,
     "editor_filename": EditorFilenameResult,
