@@ -69,6 +69,22 @@ def _strip_think_tags(text: str) -> str:
 #: ``<mode>`` → ``<fact_type>`` → 部分一致トリガ語 tuple
 FactTriggerMap = dict[str, dict[str, tuple[str, ...]]]
 
+#: 訂正の **構文形**。``fact_triggers.yaml`` の各 fact_type にも載っているが、
+#: これらは「これは訂正だ」としか言わず **何についての訂正か** を示さない。
+#: 単独では候補化の根拠にせず、属性が解決できたときだけ採る
+#: (:meth:`_ModeAwareNoteBuilder.candidate_fact_tags` を参照)。
+#:
+#: YAML 側との同期は ``test_correction_form_triggers_are_declared_weak`` が検証する。
+CORRECTION_FORM_TRIGGERS: frozenset[str] = frozenset({
+    "ではなく",
+    "じゃなくて",
+    "間違いでした",
+    "間違えました",
+    "正しくは",
+    "actually it's",
+    "i meant",
+})
+
 #: 同梱 default で期待される fact_type 集合 (mode 別)
 _EXPECTED_TAGS: dict[MemoryMode, tuple[str, ...]] = {
     "chat": ("personal_fact", "world_fact", "preference", "emotion", "opinion"),
@@ -271,6 +287,39 @@ def resolve_fact_attributes_path(triggers_dir: str | Path | None = None) -> Path
     return resolve_trigger_file("fact_attributes.yaml", triggers_dir=triggers_dir)
 
 
+def resolve_fact_attribute_match(
+    text: str,
+    fact_type: str,
+    *,
+    mode: str = "chat",
+    triggers_dir: str | Path | None = None,
+) -> tuple[str | None, tuple[str, ...]]:
+    """``resolve_fact_attribute`` の内部実装 — スラグと採用した trigger 語を返す。
+
+    trigger 語まで返すのは、抽出側が **その属性の根拠になった文だけ** を
+    fact の object に採るため。複数の属性を 1 発話で述べた
+    (「私の名前は小川です。プロジェクトは X で、締め切りは 9/30 です。」)
+    ときに発話全文を object にすると、``mem.personal.name`` の中へ後から
+    訂正される値まで同居し、訂正ファクトは別 subject なので supersede されず
+    陳腐化した値が恒久的に注入され続ける (2026-08-22 ライブ監査 ターン100:
+    訂正後にも「EvorefAudit / 2026年9月30日」を回答)。
+    """
+    if not text:
+        return None, ()
+    if triggers_dir is None:
+        triggers_dir = _DEFAULT_TRIGGERS_DIR
+    attrs = get_fact_attributes(resolve_fact_attributes_path(triggers_dir))
+    per_type = attrs.get(mode) or {}
+    ordered = per_type.get(fact_type) or ()
+    if not ordered:
+        return None, ()
+    haystack = _normalize_trigger(text)
+    for slug, words in ordered:
+        if any(w in haystack for w in words):
+            return slug, tuple(words)
+    return None, ()
+
+
 def resolve_fact_attribute(
     text: str,
     fact_type: str,
@@ -286,20 +335,9 @@ def resolve_fact_attribute(
     subject の粒度を属性単位にすることで、競合検出 (``(subject, predicate)``
     キー) が無関係な事実を同一事実の競合版と誤判定するのを防ぐ。
     """
-    if not text:
-        return None
-    if triggers_dir is None:
-        triggers_dir = _DEFAULT_TRIGGERS_DIR
-    attrs = get_fact_attributes(resolve_fact_attributes_path(triggers_dir))
-    per_type = attrs.get(mode) or {}
-    ordered = per_type.get(fact_type) or ()
-    if not ordered:
-        return None
-    haystack = _normalize_trigger(text)
-    for slug, words in ordered:
-        if any(w in haystack for w in words):
-            return slug
-    return None
+    return resolve_fact_attribute_match(
+        text, fact_type, mode=mode, triggers_dir=triggers_dir,
+    )[0]
 
 
 def resolve_fact_triggers_path(triggers_dir: str | Path | None = None) -> Path:
@@ -589,11 +627,40 @@ class _ModeAwareNoteBuilder(NoteBuilder):
         return self._fact_triggers_cached
 
     def candidate_fact_tags(self, content: str) -> list[str]:
+        """候補ファクトタイプを返す。
+
+        **訂正マーカーだけが根拠のときは属性の裏取りを要求する。**
+        ``ではなく`` / ``正しくは`` 等は「これは訂正だ」としか言っておらず、
+        **何についての訂正か** を一切示さない。訂正は算術・ファイルパス・
+        アシスタントの主張など何にでも掛かるので、これを単独の根拠にすると
+        無関係な発話が personal_fact / preference の候補になる。
+
+        実インシデント (2026-08-23 ライブ監査): 「さっきの 1234 × 5678 の答えは
+        間違っています。正しくは 7006653 です。」が ``正しくは`` だけを根拠に
+        ``personal_fact`` と ``preference`` の候補になり、自属性が解決できない
+        ため ``is_correction`` の継承が直前の名前付きスロットを埋めて、
+        ``mem.personal.birthday states: …7006653…`` と
+        ``mem.preference.food prefers: …7006653…`` の 2 件が SemMem に残った。
+
+        ``fact_triggers.yaml`` のコメントは既に「属性を伴う訂正形だけを採り、
+        話題語を落とした訂正は curator に委ねる」と宣言している。ここはその
+        宣言をコードで満たす (従来は宣言だけで、実際は全訂正形を採っていた)。
+        """
         text = content.lower()
         results: list[str] = []
         for tag, triggers in self.fact_triggers.items():
-            if any(t in text for t in triggers):
-                results.append(tag)
+            hits = [t for t in triggers if t in text]
+            if not hits:
+                continue
+            if all(h in CORRECTION_FORM_TRIGGERS for h in hits):
+                own_attribute = resolve_fact_attribute(
+                    content, tag,
+                    mode=self.mode,
+                    triggers_dir=self._effective_triggers_dir,
+                )
+                if own_attribute is None:
+                    continue
+            results.append(tag)
         return results
 
 

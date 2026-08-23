@@ -4,10 +4,24 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-#: 1 メッセージあたりの推定トークン数 (``working_max_turns`` と
-#: ``working_max_tokens`` のどちらが先に効くかの判定にのみ使う概算)。
+#: 1 メッセージあたりの推定トークン数 (平均)。
 #: 2026-08-16 ライブ監査の実セッション (80 メッセージ / 7,264 tok) の実測値。
 _TYPICAL_TOKENS_PER_MESSAGE = 91
+
+#: 1 メッセージあたりの推定トークン数 (**下限**)。``working_max_turns`` と
+#: ``working_max_tokens`` のどちらが先に効くかの判定にはこちらを使う。
+#:
+#: precedence の保証は「平均的な会話で成り立つ」では足りない。**発話が短いほど
+#: ターン数側が先に効く** ので、保証すべきは実運用で起こりうる最も短い側での
+#: 成立であって、平均での成立ではない。平均 (91) で判定していたため、短い
+#: 一問一答が続く会話では警告が出ないまま precedence が反転していた。
+#:
+#: 実測 (2026-08-23 ライブ監査、chat 94 ターン): 1 メッセージ 16.4 トークン。
+#: 37 メッセージ / 607 トークン (``working_max_tokens=4352`` の 14%) で
+#: ``working_max_turns=48`` に到達し 12 件をまとめて押し出していた。押し出しは
+#: 5 回起き、そのたび cache_n 2500 → 826 / prompt_n 1682〜2040 の全履歴
+#: 再 prefill となり TTFT が 3〜5 秒から 35〜42 秒へ跳ねた。
+_SHORT_TURN_TOKENS_PER_MESSAGE = 16
 
 
 # FadeMem タグ別半減期の有効タグ集合
@@ -432,7 +446,7 @@ class MemoryConfig(BaseModel):
     # しか見えず、会話全体を走査する質問が前半を「無い」と断定した)。
     # 上限を超えた分は WorkingMemory.session_evicted_turns に計上され、
     # 全体走査質問には切り詰め注記が付く (chat_service._append_truncated_history_note)。
-    working_max_turns: int = Field(default=30, ge=1)
+    working_max_turns: int = Field(default=128, ge=1)
     working_max_tokens: int = Field(default=2048, ge=256)
     # 上限に達したときに **まとめて** 押し出すターン数 (ヒステリシス)。
     # 1 ターンずつ削ると窓の先頭が毎ターン動き、llama-server の接頭辞 KV
@@ -536,12 +550,20 @@ class MemoryConfig(BaseModel):
         すると先頭が動く回数は 9 → 2 に減り、保持メッセージ数の平均も
         22.9 → 28.4 へ増えた (両立する)。
 
+        判定に使うのは平均 (:data:`_TYPICAL_TOKENS_PER_MESSAGE`) ではなく
+        **下限** (:data:`_SHORT_TURN_TOKENS_PER_MESSAGE`)。ターン数側が先に
+        効くのは発話が短いときなので、平均で判定すると「平均的な会話では
+        成り立つが実運用では反転している」構成を見逃す。実際 2026-08-23 の
+        ライブ監査では 48/4352 という **平均基準では警告が出ない** 構成で
+        precedence が反転していた (詳細は
+        :data:`_SHORT_TURN_TOKENS_PER_MESSAGE`)。
+
         エラーにはしない: 短い発言ばかりの用途では意図的にターン数で
         抑えたい場合もある。
         """
         from backend.log_config import get_logger
 
-        estimated = self.working_max_turns * _TYPICAL_TOKENS_PER_MESSAGE
+        estimated = self.working_max_turns * _SHORT_TURN_TOKENS_PER_MESSAGE
         if estimated < self.working_max_tokens:
             get_logger("config").warning(
                 "memory.working_max_turns=%d binds before "
@@ -551,7 +573,7 @@ class MemoryConfig(BaseModel):
                 "re-prefill. Raise working_max_turns to at least %d so the "
                 "token cap binds first.",
                 self.working_max_turns, self.working_max_tokens,
-                self.working_max_turns, _TYPICAL_TOKENS_PER_MESSAGE, estimated,
-                -(-self.working_max_tokens // _TYPICAL_TOKENS_PER_MESSAGE),
+                self.working_max_turns, _SHORT_TURN_TOKENS_PER_MESSAGE, estimated,
+                -(-self.working_max_tokens // _SHORT_TURN_TOKENS_PER_MESSAGE),
             )
         return self

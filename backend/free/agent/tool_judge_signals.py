@@ -13,6 +13,7 @@ from backend.free.agent.router import (
     asks_directory_listing,
 )
 from backend.free.core.intent_vocab import (
+    RUNTIME_INFO_QUERY_RE,
     SESSION_ANCHOR_EN,
     SESSION_PROXIMITY_WINDOW_EN,
     SESSION_TOPIC_BREAK_LOOKAHEAD_EN,
@@ -354,6 +355,11 @@ _HARDWARE_MEMORY_QUERY_RE = re.compile(
     r"|(?<![A-Za-z])(?:memory|usage|used|free|available)(?![A-Za-z]))",
     re.IGNORECASE,
 )
+# evoref 自身の実行構成を尋ねるクエリ (`evoref_runtime_info` の発火条件)。
+# 定義は core.intent_vocab が SSOT — 同じ判定を agent.router の分類表
+# (`self_config_query` ルール) も使うため。後方互換で再輸出する。
+_RUNTIME_INFO_QUERY_RE = RUNTIME_INFO_QUERY_RE
+
 # 明示的な実行動詞。バッククォートのコマンドと共起したとき「実測要求」とみなす。
 _EXPLICIT_EXEC_VERB_RE = re.compile(
     r"(?:実行|叩いて|走らせ"

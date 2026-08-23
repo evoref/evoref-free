@@ -15,8 +15,10 @@ from backend.free.core.intent_vocab import refers_to_previous_output
 from backend.free.core.prompt_blocks import current_datetime_block
 from backend.free.core.text_quality import (
     carries_no_assertion,
+    states_no_user_value,
     conversational_numeric_claims,
     find_superseded_claim,
+    match_length_directive,
 )
 from backend.free.core.turn_text import append_to_last_user, prepend_to_last_user
 from backend.config import resolve_context_size
@@ -29,60 +31,42 @@ if TYPE_CHECKING:
 logger = get_logger("core.inference")
 
 
-_RAG_HEADER = "以下の参考情報を踏まえて回答してください:\n\n"
-_FILES_HEADER = "以下のファイルがコンテキストとして提供されています:\n\n"
+# 動的ブロック (few-shot / file / semmem / RAG) の枠を示すマーカー群。
+#
+# **ここに置いた文字はすべて毎ターン再プリフィルされる**。動的ブロックは最後の
+# user メッセージへ前置され、接頭辞 KV キャッシュの外にあるため、内容が定数でも
+# キャッシュは効かない。実測 (2026-08-18/19、chat 232 ターン、未キャッシュ
+# prompt_n 1 トークンあたり 21〜37ms):
+#   区切り文 105 tok × 133 ターン (57%) / 記憶ラベル 105 tok × 92 ターン (40%) /
+#   RAG ヘッダ 20 tok × 87 ターン (38%)
+# = 定数の指示文だけで 1 ターンあたり平均 90 トークン前後を再プリフィルしていた。
+#
+# そこで **指示の本文は静的システムプロンプトへ置き** (``chat._resolve_system_prompt``
+# の ``_REFERENCE_BLOCK_DIRECTIVE``、接頭辞キャッシュに乗る)、ここには枠を示す
+# **短いマーカーだけ**を残す。指示内容は減らしていない — 置き場所を変えただけ。
+# ``_RAG_HEADER`` は空。チャンクは両経路とも ``[参考情報 N]`` で自己記述する
+# ので、その上にもう 1 行ヘッダを置くのは重複でしかない。
+_RAG_HEADER = ""
+_FILES_HEADER = "[添付ファイル]\n\n"
 
 # 動的コンテキストブロックと生クエリの境界に挟む固定文。
-# few-shot 例 / 参考情報をユーザー発言と混同させないための区切り。固定文字列
-# なのでターン内の prefix divergence (KV キャッシュ) には影響しない (どうせ tail)。
+# few-shot 例 / 参考情報をユーザー発言と混同させないための区切り。
+# 「無関係なら言及せず自分の知識で普通に答える」等の指示本文は
+# ``_REFERENCE_BLOCK_DIRECTIVE`` (system 側) が持つ。
 _DYNAMIC_CONTEXT_DELIMITER = (
-    "\n\n---\n"
-    "上記はシステムが用意した参考情報・応答例です。"
-    "以下のユーザーの発言にのみ回答してください。\n"
-    # 参考情報が今回の質問と無関係な場合、その事実を前置きとして述べたうえで
-    # 参考情報側の話題に引きずられる応答が頻発していた (実測 2026-07-25:
-    # PC が重い相談の最中に「ご提示いただいた参考情報には…含まれていません」と
-    # 述べ、空き 548GB あるのに「空き容量不足の対処」を回答した)。
-    "参考情報が今回の質問と関係しない場合は、そのことに言及せず、"
-    "参考情報の話題に引きずられずに自分の知識で普通に答えてください。\n\n"
+    "\n\n---\n[ここまで参考枠 / ここからユーザーの発言]\n"
 )
 
 # 照応を含むターンで動的ブロックを **生クエリの後ろ** へ回すときの区切り。
 # 前置版と違い「上の」「さっき」の参照先が直前のやり取りであることを明示する
-# 必要がある (後置しても、指示語が直後のブロックを掴む余地は残るため)。
+# 必要がある (後置しても、指示語が直後のブロックを掴む余地は残るため)。この
+# 指示は **配置に依存する** ので system へは移さない。発火は実測 232 ターン中
+# 2 件 (1%) で、再プリフィルの寄与も小さい。
 _DYNAMIC_CONTEXT_TRAILING_DELIMITER = (
     "\n\n---\n"
-    "以下はシステムが用意した参考情報・応答例であり、ユーザーの発言ではありません。"
+    "以下はシステムが用意した参考枠であり、ユーザーの発言ではありません。"
     "上のユーザー発言に含まれる「上の」「先ほど」「さっき」「直前の」等の指示語は、"
-    "この参考情報ではなく **直前までのやり取り** を指します。\n"
-    "参考情報が今回の質問と関係しない場合は、そのことに言及せず、"
-    "参考情報の話題に引きずられずに自分の知識で普通に答えてください。\n\n"
-)
-
-
-#: 「10 文字以内」「200字以下」型の上限指定。数値と単位が隣接する形だけを拾う。
-_CHAR_LIMIT_RE = re.compile(
-    r"(\d{1,5})\s*(?:文字|字)\s*(?:以内|以下|まで)"
-    r"|(?:within|under|at\s+most)\s+(\d{1,5})\s*(?:characters?|chars?)",
-    re.IGNORECASE,
-)
-
-
-#: 「300字ちょうど」「ちょうど300文字で」型の **厳密指定**。上限指定
-#: (_CHAR_LIMIT_RE) とは守り方が違う (足りない側も直す必要がある) ため分ける。
-_CHAR_EXACT_RE = re.compile(
-    r"(?:ちょうど|丁度|きっかり|正確に)\s*(\d{1,5})\s*(?:文字|字)"
-    r"|(\d{1,5})\s*(?:文字|字)\s*(?:ちょうど|丁度|きっかり|で書|で説明|で答)"
-    r"|exactly\s+(\d{1,5})\s*(?:characters?|chars?)",
-    re.IGNORECASE,
-)
-
-#: 「「あ」を50回」型の反復回数指定。
-_REPEAT_COUNT_RE = re.compile(
-    r"(\d{1,4})\s*回\s*(?:だけ)?\s*(?:続けて|繰り返|repeat)"
-    r"|(?:続けて|繰り返して)\s*(\d{1,4})\s*回"
-    r"|repeat(?:ed)?\s+(\d{1,4})\s+times",
-    re.IGNORECASE,
+    "この参考枠ではなく **直前までのやり取り** を指します。\n\n"
 )
 
 
@@ -109,9 +93,13 @@ def _char_limit_note(history: list[ChatMessage]) -> str:
         return ""
     text = str(last_user.get("content") or "")
 
-    m = _CHAR_EXACT_RE.search(text)
-    if m:
-        exact = next(g for g in m.groups() if g)
+    directive = match_length_directive(text)
+    if directive is None:
+        return ""
+    kind, value = directive
+
+    if kind == "exact":
+        exact = value
         return (
             f"今回のユーザーの指示は回答本文を {exact} 文字ちょうどにすることを"
             f"求めている。句読点・記号・空白も 1 文字として数えること。"
@@ -119,19 +107,15 @@ def _char_limit_note(history: list[ChatMessage]) -> str:
             f"{exact} 文字に合わせること。"
         )
 
-    m = _REPEAT_COUNT_RE.search(text)
-    if m:
-        times = next(g for g in m.groups() if g)
+    if kind == "repeat":
+        times = value
         return (
             f"今回のユーザーの指示は {times} 回ちょうどの繰り返しを求めている。"
             f"書き終えたら個数を数え直し、多くても少なくても {times} 個に"
             f"合わせること。"
         )
 
-    m = _CHAR_LIMIT_RE.search(text)
-    if not m:
-        return ""
-    limit = m.group(1) or m.group(2)
+    limit = value
     return (
         f"今回のユーザーの指示は回答を {limit} 文字以内に収めることを求めている。"
         f"句読点・記号・空白も 1 文字として数え、回答本文全体が "
@@ -445,6 +429,80 @@ def _inject_file_contexts(
 _FEWSHOT_EXAMPLE_SPLIT_RE = re.compile(r"(?m)^(?=### Example\s)")
 
 
+def _drop_restated_slots(
+    history: list[ChatMessage] | None,
+    semmem_block: str | None,
+    rag_chunks: list[str] | None,
+    rag_scored_chunks: list[tuple[str, float, str]] | None,
+    fewshot_block: str | None,
+    slot_resolver: "Callable[[str], frozenset[tuple[str, str]]] | None",
+) -> tuple[
+    str | None, list[str] | None, list[tuple[str, float, str]] | None, str | None,
+]:
+    """今回の会話で述べ直した **属性スロット** の注入候補を全経路から落とす。
+
+    ``[関連する記憶]`` のラベルには「今回の会話と食い違えば今回が優先」と書いて
+    あるが、規範文では勝てない。実インシデント (2026-08-23 ライブ監査セット 2
+    ターン 87): 「私は今、埼玉県川口市に住んでいます。」の後の「私が住んでいるの
+    はどこでしたか？」に、前セッションの ``mem.personal.location`` が勝って
+    「武蔵野市です」と答えた。
+
+    **なぜここか**: 供給経路は 1 本ではない。SemMem 側だけ塞いだ状態で再測定
+    したところ、同じ古い値が (a) few-shot の手本 (``User: 私が住んでいるのは
+    どこでしたか？ / Assistant: 武蔵野市です。``) と (b) ``[参考情報 2]`` の
+    LTM チャンクから戻り、回答は 1 文字も変わらなかった。4 経路が揃うのは
+    ``_drop_superseded_context`` と同じくこの位置だけ。
+
+    属性の同定は呼出側から渡す ``slot_resolver`` に委ねる (``core`` から
+    EvorefMem の辞書を直接引かないため)。``None`` なら何もしない。
+    """
+    if slot_resolver is None or not history:
+        return semmem_block, rag_chunks, rag_scored_chunks, fewshot_block
+
+    restated: set[tuple[str, str]] = set()
+    # ``ChatMessage`` は TypedDict (実行時は素の dict)。属性アクセスにすると
+    # 常に空になり、判定が黙って無効化される (2026-08-23 実機検証で発覚)。
+    for turn in history:
+        if str(turn.get("role") or "") != "user":
+            continue
+        restated |= slot_resolver(str(turn.get("content") or ""))
+    if not restated:
+        return semmem_block, rag_chunks, rag_scored_chunks, fewshot_block
+
+    dropped = 0
+
+    def _keep(text: str) -> bool:
+        nonlocal dropped
+        if slot_resolver(text) & restated:
+            dropped += 1
+            return False
+        return True
+
+    if semmem_block:
+        lines = semmem_block.splitlines()
+        kept = [ln for ln in lines if _keep(ln)]
+        semmem_block = (
+            "\n".join(kept)
+            if any(ln.strip().startswith("-") for ln in kept)
+            else None
+        )
+    if rag_chunks:
+        rag_chunks = [c for c in rag_chunks if _keep(c)] or None
+    if rag_scored_chunks:
+        rag_scored_chunks = [
+            entry for entry in rag_scored_chunks if _keep(entry[2])
+        ] or None
+    if fewshot_block:
+        fewshot_block = _drop_superseded_fewshot(fewshot_block, _keep)
+
+    if dropped:
+        logger.info(
+            "build_messages: dropped %d injected item(s) whose attribute slot "
+            "was restated in the current conversation", dropped,
+        )
+    return semmem_block, rag_chunks, rag_scored_chunks, fewshot_block
+
+
 def _drop_superseded_fewshot(block: str, keep: Callable[[str], bool]) -> str | None:
     """few-shot ブロックから、値が食い違う例を **例まるごと** 落とす。
 
@@ -471,6 +529,7 @@ def _drop_superseded_context(
     rag_chunks: list[str] | None,
     rag_scored_chunks: list[tuple[str, float, str]] | None,
     fewshot_block: str | None = None,
+    slot_resolver: "Callable[[str], frozenset[tuple[str, str]]] | None" = None,
 ) -> tuple[
     str | None, list[str] | None, list[tuple[str, float, str]] | None, str | None,
 ]:
@@ -501,6 +560,12 @@ def _drop_superseded_context(
 
     同じ値の再掲は落とさない (無害)。ラベルが一致しない候補にも触らない。
     """
+    dropped_slots = _drop_restated_slots(
+        history, semmem_block, rag_chunks, rag_scored_chunks, fewshot_block,
+        slot_resolver,
+    )
+    semmem_block, rag_chunks, rag_scored_chunks, fewshot_block = dropped_slots
+
     current_claims = conversational_numeric_claims(
         (str(t.get("role") or ""), str(t.get("content") or ""))
         for t in history or ()
@@ -544,9 +609,86 @@ def _drop_superseded_context(
     return semmem_block, rag_chunks, rag_scored_chunks, fewshot_block
 
 
+def _normalize_for_frame_dedup(text: str) -> str:
+    """枠をまたいだ同一判定用の正規化 (純粋関数)。
+
+    ``[関連する記憶]`` は行頭に ``- (過去の記録) `` を付けて整形するため、
+    ``[参考情報]`` 側の生テキストと文字列としては一致しない。装飾と空白だけを
+    落として突き合わせる。
+    """
+    stripped = re.sub(r"^\s*[-*]\s*", "", text.strip())
+    stripped = re.sub(r"^[（(]?過去の記録[）)]?\s*", "", stripped)
+    return re.sub(r"\s+", "", stripped)
+
+
+def _drop_rag_duplicates_of_semmem(
+    semmem_block: str | None,
+    rag_chunks: list[str] | None,
+    rag_scored_chunks: list[tuple[str, float, str]] | None,
+) -> tuple[list[str] | None, list[tuple[str, float, str]] | None]:
+    """``[関連する記憶]`` に既に載っている本文を ``[参考情報]`` から落とす。
+
+    2 つの枠は別々に組み立てられる (``MemoryInjector`` と ``_select_rag_block``)
+    ため、同じ STM ノートが両方に載る。同じ文をもう一度見せても根拠は増えず、
+    動的ブロックの予算とプロンプト長だけを食う。
+
+    実測 (2026-08-23 ライブ監査セット 1 ターン 51): 「このPCの空きメモリを
+    教えてください。」のプロンプトで、PC 環境に関する 2 つの文が
+    ``[関連する記憶]`` に 2 行、``[参考情報 1]`` / ``[参考情報 2]`` にも同じ 2 文、
+    合計 **4 コピー** 載っていた。
+
+    Returns:
+        重複を落とした ``(rag_chunks, rag_scored_chunks)``。
+    """
+    if not semmem_block or not (rag_chunks or rag_scored_chunks):
+        return rag_chunks, rag_scored_chunks
+    seen = {
+        _normalize_for_frame_dedup(line)
+        for line in semmem_block.splitlines()
+        if line.strip()
+    }
+    seen.discard("")
+    dropped = 0
+
+    def _is_dup(text: str) -> bool:
+        nonlocal dropped
+        if _normalize_for_frame_dedup(text) in seen:
+            dropped += 1
+            return True
+        return False
+
+    if rag_chunks:
+        rag_chunks = [c for c in rag_chunks if not _is_dup(c)] or None
+    if rag_scored_chunks:
+        rag_scored_chunks = [
+            entry for entry in rag_scored_chunks if not _is_dup(entry[2])
+        ] or None
+    if dropped:
+        logger.info(
+            "build_messages: dropped %d RAG chunk(s) already shown in "
+            "[関連する記憶]", dropped,
+        )
+    return rag_chunks, rag_scored_chunks
+
+
 def _format_rag_block(entries: list[str]) -> str:
     """RAG 参照ブロックの最終的な system 文字列を生成する。"""
     return f"{_RAG_HEADER}" + "\n\n".join(entries)
+
+
+#: 1 チャンクあたりの枠の費用 (``"[参考情報 N]"`` + 区切りの改行)。
+#: ランカーへ渡す予算はチャンク本文の分なので、枠の分を先に引かないと
+#: 組み上げた block が ``remaining`` を超える。以前はこれを計上しておらず、
+#: ``_RAG_HEADER`` (20 トークン) が偶然の安全余裕として効いていただけだった
+#: (ヘッダを畳んだ時点で余裕ごと消える)。
+_RAG_ENTRY_FRAME_TOKENS = _estimate_tokens("[参考情報 10]\n\n")
+
+
+def _rag_frame_overhead(n_candidates: int) -> int:
+    """候補 ``n_candidates`` 件を載せる場合の枠の総費用 (トークン)。"""
+    return _RAG_ENTRY_FRAME_TOKENS * max(0, n_candidates) + _estimate_tokens(
+        _RAG_HEADER,
+    )
 
 
 def _inject_rag_salience(
@@ -556,8 +698,7 @@ def _inject_rag_salience(
     total_rag: int,
 ) -> tuple[str | None, int, int]:
     """サリエンスランカーで RAG チャンクを選別し block を返す。"""
-    header_overhead = _estimate_tokens(_RAG_HEADER)
-    chunk_budget = remaining - header_overhead
+    chunk_budget = remaining - _rag_frame_overhead(len(rag_scored_chunks))
     ranked_texts = salience_ranker.rank(rag_scored_chunks, chunk_budget)
     if not ranked_texts:
         return None, remaining, 0
@@ -670,7 +811,16 @@ def _eligible_rag_indices(
     query_key = _dedup_key_for_rag(current_query) if current_query else ""
     n_question = n_dup = n_echo = 0
     for i, text in enumerate(texts):
-        if carries_no_assertion(text):
+        # ``carries_no_assertion`` は「問いだけか」しか見ないので、
+        # 「〜してください」型の **依頼** が素通りする。依頼は事実を含まないのに
+        # 「参考情報」として提示され、根拠として扱われる。注入側 (``[関連する記憶]``)
+        # は既に ``states_no_user_value`` を使っており、こちらだけ 1 段緩かった。
+        #
+        # 実測 (2026-08-23 ライブ監査、注入側の修正後): 「私が来月出張する都市を、
+        # 確信度を付けて答えてください。」が ``[参考情報 1]`` として残っていた。
+        # 本関数の docstring が自ら警告している「経路ごとに書くと片方だけ直る
+        # 非対称」がそのまま起きていた形。
+        if carries_no_assertion(text) or states_no_user_value(text):
             n_question += 1
             continue
         key = _dedup_key_for_rag(text)
@@ -731,26 +881,21 @@ def _select_rag_block(
     return None, remaining, 0
 
 
-#: メモリブロックのラベル。「過去の会話の記録である」ことを明示しないと、
-#: 小型モデルが注入された note を今回の発言として復唱する (実インシデント
-#: 2026-07-27 ライブ検証: 新規セッションの 1 ターン目「明日の予定を整理して
-#: おいてください」に対し、過去セッションの note を根拠に「10 日（金）に歯科の
-#: 予約」「先ほど訂正された通り健康診断が 20 日（水）」と、この会話には存在
-#: しない予定と訂正を捏造した)。注入ブロックは全体 context に収まらないと
-#: 丸ごと破棄されるため、guidance は 1 行に収めてトークン増を最小にする。
-#: 併せて「今回の会話が勝つ」ことも明示する。ラベルだけでは "古い記録である"
-#: と伝わっても "衝突したらどちらを採るか" が決まらず、システムプロンプト側の
+#: メモリブロックのラベル。「過去の会話の記録である」ことと「今回の会話が勝つ」
+#: ことは **注入内容のすぐ隣**に置く。ラベルだけでは "古い記録である" と伝わっても
+#: "衝突したらどちらを採るか" が決まらず、システムプロンプト側の
 #: 「[関連する記憶] を回答の根拠として優先する」と噛み合って古い方が採用される
 #: (実インシデント 2026-08-14 ライブ監査 ターン20: 同じプロンプト内に今回の
 #: 発言「私はコーヒーをよく飲みます」と前セッションの note「コーヒーは苦手で
 #: 紅茶派です」が両方あり、「好きな飲み物は紅茶です。コーヒーは苦手とのこと
 #: でした」と反転して回答した)。
-_SEMMEM_BLOCK_LABEL = (
-    "[関連する記憶] "
-    "(過去の会話や記録から想起したもの。今回の会話で述べられた内容ではない。"
-    "今回の会話の発言と食い違う場合は必ず今回の会話を優先する。"
-    "今回の質問に関係しなければ無視し、ここに無い予定・日付・数値を創作しないこと)"
-)
+#:
+#: 残りの指示 (「今回の質問に関係しなければ無視する」「ここに無い予定・日付・
+#: 数値を創作しない」) は ``_REFERENCE_BLOCK_DIRECTIVE`` (system 側、接頭辞
+#: キャッシュに乗る) が持つ。ラベル本文は毎ターン再プリフィルされるので、
+#: **配置に意味があるものだけ**を残す (実測 2026-08-18/19: 105 トークンの
+#: ラベルが 232 ターン中 92 ターンに載っていた)。
+_SEMMEM_BLOCK_LABEL = "[関連する記憶] (過去の記録。今回の会話と食い違えば今回が優先)"
 
 
 def _select_semmem_block(
@@ -916,6 +1061,7 @@ def build_messages(
     semmem_block: str | None = None,
     fewshot_block: str | None = None,
     history_min_tokens: int = 0,
+    slot_resolver: "Callable[[str], frozenset[tuple[str, str]]] | None" = None,
 ) -> list[ChatMessage]:
     """
     messages リストを組み立て、トークン予算内に収める。
@@ -1007,7 +1153,12 @@ def build_messages(
     semmem_block, rag_chunks, rag_scored_chunks, fewshot_block = (
         _drop_superseded_context(
             history, semmem_block, rag_chunks, rag_scored_chunks, fewshot_block,
+            slot_resolver,
         )
+    )
+    # 枠をまたいだ同一本文の二重掲載を落とす (両枠が揃うのはここだけ)。
+    rag_chunks, rag_scored_chunks = _drop_rag_duplicates_of_semmem(
+        semmem_block, rag_chunks, rag_scored_chunks,
     )
     total_rag = len(rag_chunks) if rag_chunks else total_rag
 

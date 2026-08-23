@@ -48,6 +48,39 @@ _TYPE_CONVERTERS: dict[str, type] = {
 }
 
 
+#: パラメータ **間** の順序不変則: ``(domain, 下限キー, 上限キー)``。
+#:
+#: ``constraints`` は 1 キーずつ独立に clamp するだけなので、進化は
+#: 「下限 > 上限」の**空の窓**を作れてしまう。実測 (2026-08-21、
+#: ``local/policies/router_policy.json``): ``short_query_min_tokens: 3`` /
+#: ``short_query_max_tokens: 2`` に進化しており、``_is_short_query`` の
+#: ``tokens >= min and tokens < max`` が **恒偽** になっていた。英語 3 語以上の
+#: クエリは語数分岐に到達せず文字数判定へ落ちる (``"What is DNS?"`` が
+#: short=False)。ノブは動いているのに何も決めていない状態で、
+#: fitness には現れないまま探索の 1 次元が死ぬ。
+#:
+#: 違反時は **上限側**を ``下限 + 1`` へ引き上げて修復する (下限を下げると
+#: 「短い」の定義が意図せず広がるため)。
+_ORDERED_PARAM_PAIRS: tuple[tuple[str, str, str], ...] = (
+    ("router", "short_query_min_tokens", "short_query_max_tokens"),
+)
+
+
+def _repair_ordered_pairs(domain: str, mode_params: dict) -> list[str]:
+    """順序不変則を満たすよう ``mode_params`` を修復し、直したキーを返す。"""
+    repaired: list[str] = []
+    for dom, lo_key, hi_key in _ORDERED_PARAM_PAIRS:
+        if dom != domain:
+            continue
+        lo, hi = mode_params.get(lo_key), mode_params.get(hi_key)
+        if lo is None or hi is None:
+            continue
+        if hi <= lo:
+            mode_params[hi_key] = lo + 1
+            repaired.append(hi_key)
+    return repaired
+
+
 def _default_policies() -> dict[str, dict]:
     """全ドメインのデフォルトポリシー定義を返す"""
     return {
@@ -691,6 +724,14 @@ class PolicyInterpreter:
                     value = _clamp(value, constraints[key])
                 mode_params[key] = value
 
+            repaired = _repair_ordered_pairs(domain, mode_params)
+            if repaired:
+                logger.info(
+                    "Policy %s/%s: repaired ordered pair(s) %s -> %s",
+                    domain, mode, repaired,
+                    {k: mode_params[k] for k in repaired},
+                )
+
             logger.info(
                 "Policy delta applied: domain=%s, mode=%s, keys=%s",
                 domain, mode, list(delta.keys()),
@@ -752,6 +793,19 @@ class PolicyInterpreter:
                     self._data[domain] = self._merge_with_defaults(
                         data, defaults.get(domain, {}),
                     )
+                    # 既に壊れた状態で保存されているファイルは apply_delta を
+                    # 通らないので、読込時にも順序不変則を掛ける。
+                    for mode_params in (
+                        self._data[domain].get("params") or {}
+                    ).values():
+                        fixed = _repair_ordered_pairs(domain, mode_params)
+                        if fixed:
+                            logger.warning(
+                                "Policy %s: repaired ordered pair(s) %s on load "
+                                "-> %s (evolution had produced an empty window)",
+                                domain, fixed,
+                                {k: mode_params[k] for k in fixed},
+                            )
                     logger.debug("Loaded policy: %s", path)
                 except (json.JSONDecodeError, OSError) as e:
                     logger.warning(

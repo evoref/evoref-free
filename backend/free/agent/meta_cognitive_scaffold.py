@@ -10,6 +10,10 @@ from __future__ import annotations
 import re
 
 from backend.free.core.prompt_blocks import CURRENT_DATETIME_LABEL
+from backend.free.core.text_quality import (
+    _TASK_LOG_FRAGMENT_RE as _CORE_TASK_LOG_FRAGMENT_RE,
+    looks_like_task_log_residue as _looks_like_task_log_residue,
+)
 
 from backend.free.agent.meta_cognitive_write_rescue import (
     _LEAD_IN_LINE_RE,
@@ -222,25 +226,10 @@ def strip_task_log_scaffold(content: str) -> str:
     return "\n".join(lines[idx:]).strip("\n")
 
 
-#: 進捗ノートの断片が行頭以外に現れる形。``_TASK_LOG_LINE_RE`` は行頭
-#: アンカーなので、ノート行と別のテキストが 1 行に連結されると素通りする
-#: (実インシデント 2026-07-29 ライブ監査: 改行を含む本文の書込み依頼で、
-#: 応答本文が ``行2 行3' to the file E:\\tmp\\audit_r9.txt / Read and display
-#: the contents of the file … Written 16 bytes to E:\\tmp\\audit_r9.txt``
-#: という内部タスク文の断片になった)。
-_TASK_LOG_FRAGMENT_RE = re.compile(
-    r"Written\s+\d+\s+bytes\s+to\s+\S"
-    r"|\[(?:done|failed|skipped)\]\s",
-)
-
-
-def looks_like_task_log_residue(text: str) -> bool:
-    """テキストが進捗ノートの残骸 (ユーザー向け本文ではない) かを判定する。
-
-    ``strip_task_log_scaffold`` で行単位に落とし切れなかった断片を拾う
-    (純粋関数)。
-    """
-    return bool(_TASK_LOG_FRAGMENT_RE.search(text))
+#: 進捗ノートの残骸判定は core.text_quality が SSOT (注入側 = EvorefMem からも
+#: 使うため)。ここは後方互換のための再エクスポート (どちらも不変)。
+_TASK_LOG_FRAGMENT_RE = _CORE_TASK_LOG_FRAGMENT_RE
+looks_like_task_log_residue = _looks_like_task_log_residue
 
 
 def fewshot_contains_task_log(fewshot_block: str) -> bool:

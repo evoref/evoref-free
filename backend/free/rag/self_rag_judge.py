@@ -211,6 +211,19 @@ _PAST_REFERENCE_RE_EN = re.compile(
 )
 
 
+#: 「この会話で〜」「ここまでのやり取りで〜」型の**セッション自己参照**。
+#:
+#: :data:`TRIVIAL_QUESTION_PATTERNS` の一枝として使うが、単独でも参照できる形で
+#: 切り出してある。この枝の skip は「答えは今の会話ウィンドウの中にある」という
+#: 前提の上に立っており、WorkingMemory が 1 件でも押し出した後はその前提が
+#: 成り立たない (:meth:`RetrievalNecessityJudge._judge_rule` の ``window_complete``
+#: を参照)。
+_SESSION_SELF_REFERENCE_JA_SRC = session_self_reference_pattern_ja(
+    _SESSION_REFLECTIVE_VOCAB_NARROW_JA,
+)
+SESSION_SELF_REFERENCE_PATTERNS = re.compile(_SESSION_SELF_REFERENCE_JA_SRC)
+
+
 TRIVIAL_QUESTION_PATTERNS = re.compile(
     r"(今.{0,3}(何時|何分|時刻|時間)"
     r"|今日.{0,3}(何月|何日|何曜)"
@@ -237,7 +250,7 @@ TRIVIAL_QUESTION_PATTERNS = re.compile(
     r"|調子はどう"
     r"|元気\?"
     r"|元気？"
-    rf"|{session_self_reference_pattern_ja(_SESSION_REFLECTIVE_VOCAB_NARROW_JA)})",
+    rf"|{_SESSION_SELF_REFERENCE_JA_SRC})",
 )
 
 # TRIVIAL_QUESTION_PATTERNS の英語版。
@@ -264,18 +277,9 @@ _EN_ORDINAL_WITH_SPEECH = (
     rf"|(?:{_EN_SPEECH_UNIT})[^.!?\n]{{0,24}}?(?:first|last|earliest|latest)"
 )
 
-TRIVIAL_QUESTION_PATTERNS_EN = re.compile(
-    r"(^\s*(?:what\s+time\s+is\s+it"
-    r"|what'?s?\s+(?:today'?s?\s+date|the\s+date)"
-    r"|what\s+day\s+is\s+it"
-    r"|current\s+time"
-    r"|what'?s\s+your\s+name"
-    r"|who\s+are\s+you"
-    r"|what\s+are\s+you"
-    r"|how\s+are\s+you"
-    r"|how'?re\s+you\s+doing"
-    r"|how'?s\s+it\s+going)\s*[?.!]*\s*$"
-    r"|(?:this\s+conversation|this\s+chat|our\s+conversation"
+#: :data:`SESSION_SELF_REFERENCE_PATTERNS` の英語版 (切り出す理由は JA 側と同じ)。
+_SESSION_SELF_REFERENCE_EN_SRC = (
+    r"(?:this\s+conversation|this\s+chat|our\s+conversation"
     r"|what\s+we\s+(?:talked|discussed|were\s+talking)\s+about"
     r"|earlier\s+in\s+this\s+(?:conversation|chat)"
     r"|so\s+far\s+in\s+this\s+conversation)"
@@ -296,7 +300,24 @@ TRIVIAL_QUESTION_PATTERNS_EN = re.compile(
     r"|summar\w*|recap\w*|order|sequence|enumerate"
     rf"|{_EN_ORDINAL_WITH_SPEECH})"
     r"[^.!?\n]{0,40}?"
-    r"(?:this\s+conversation|this\s+chat|our\s+conversation))",
+    r"(?:this\s+conversation|this\s+chat|our\s+conversation)"
+)
+SESSION_SELF_REFERENCE_PATTERNS_EN = re.compile(
+    _SESSION_SELF_REFERENCE_EN_SRC, re.IGNORECASE,
+)
+
+TRIVIAL_QUESTION_PATTERNS_EN = re.compile(
+    r"(^\s*(?:what\s+time\s+is\s+it"
+    r"|what'?s?\s+(?:today'?s?\s+date|the\s+date)"
+    r"|what\s+day\s+is\s+it"
+    r"|current\s+time"
+    r"|what'?s\s+your\s+name"
+    r"|who\s+are\s+you"
+    r"|what\s+are\s+you"
+    r"|how\s+are\s+you"
+    r"|how'?re\s+you\s+doing"
+    r"|how'?s\s+it\s+going)\s*[?.!]*\s*$"
+    rf"|{_SESSION_SELF_REFERENCE_EN_SRC})",
     re.IGNORECASE,
 )
 
@@ -421,12 +442,16 @@ class RetrievalNecessityJudge:
     安全側の `"retrieve"` に正規化する。
     """
 
-    def _judge_rule(self, query: str, context_count: int = 0) -> str:
+    def _judge_rule(
+        self, query: str, context_count: int = 0, *, window_complete: bool = True,
+    ) -> str:
         """純ルール判定 (3 値 + uncertain).
 
         Returns: "retrieve" | "fetch" | "skip" | "uncertain"
 
         判定順 (上から先勝ち):
+            0. ``window_complete=False`` かつセッション自己参照 → uncertain
+               (下の「窓の完全性」を参照)
             1. クエリ < 3 文字 → skip
             2. URL 含む or 明示的 fetch 動詞 → fetch (確定)
             3. TRIVIAL (時刻/自己同一性/雑談) → skip
@@ -436,10 +461,32 @@ class RetrievalNecessityJudge:
             5. SKIP_PATTERNS (挨拶/相槌) + 短文 → skip
                 (QUESTION より後に置くのは「発売日はいつ」など SKIP の "はい"
                 substring に誤マッチする知識質問を retrieve に倒すため)
-            6. context_count >= 3 → skip (会話継続フィラー)。
+            6. context_count >= 3 かつ ``window_complete`` → skip (会話継続フィラー)。
                ただし会話の前を指す後方参照 (さっき / 前回 / その件 …) が
                あれば uncertain へ降ろす (:data:`_PAST_REFERENCE_RE`)
             7. デフォルト → uncertain (呼出側のリコール送り)
+
+        **窓の完全性 (``window_complete``)**
+
+        ルール 3 のセッション自己参照枝とルール 6 は、どちらも「答えは今の会話
+        ウィンドウの中にある」という前提で skip している。この前提が真なのは
+        WorkingMemory が 1 件も押し出していない間だけで、押し出しが起きた
+        瞬間から恒久的に偽になる — にもかかわらず ``context_count >= 3`` は
+        押し出し後も常に真のままなので、**セッションの残り全部で記憶検索が
+        skip され続ける**。
+
+        実インシデント (2026-08-23 ライブ監査セット 1 ターン 91):
+        「私が来月出張する都市を、確信度を付けて答えてください。」が質問マーカー
+        を持たないためルール 6 に落ち、``skip (sufficient context: 37 turns)``。
+        その 37 ターンは押し出し後の窓で、出張先を述べたターンは既に窓の外に
+        あった。記憶検索が一度も走らないまま「確信度は 100% です。…東京です。」
+        と作話した (正解は大阪)。同一セッションでルール 6 の skip は 35/94
+        ターン (37%) を占めていた。
+
+        窓が不完全なら前提が崩れているので skip せず uncertain へ降ろす。
+        降ろす先の埋め込みリコールは query ベクトルを既に計算済みの経路で、
+        追加コストは検索実体の中央値 7.5ms のみ (:data:`_PAST_REFERENCE_RE`
+        の実測を参照)。
         """
         query_stripped = query.strip()
         en = is_en_locale()
@@ -450,6 +497,19 @@ class RetrievalNecessityJudge:
         howto_pat = _HOWTO_QUESTION_RE_EN if en else _HOWTO_QUESTION_RE
         question_pat = QUESTION_PATTERNS_EN if en else QUESTION_PATTERNS
         past_ref_pat = _PAST_REFERENCE_RE_EN if en else _PAST_REFERENCE_RE
+        session_ref_pat = (
+            SESSION_SELF_REFERENCE_PATTERNS_EN if en
+            else SESSION_SELF_REFERENCE_PATTERNS
+        )
+
+        # 0. 窓が不完全なセッション自己参照は「窓の中で完結する」前提が崩れている
+        #    (docstring の「窓の完全性」を参照)。TRIVIAL より先に評価する。
+        if not window_complete and session_ref_pat.search(query_stripped):
+            logger.debug(
+                "Necessity: uncertain (session self-reference with an "
+                "incomplete window: %r)", query_stripped[:50],
+            )
+            return "uncertain"
 
         # 1. 短すぎるクエリはスキップ
         if len(query_stripped) < 3:
@@ -517,7 +577,7 @@ class RetrievalNecessityJudge:
         # (質問マーカーなし + 多ターン会話の場合は会話継続フィラーとみなす)
         # ただし会話の前を指す後方参照があるターンは降ろす
         # (:data:`_PAST_REFERENCE_RE` の説明を参照)。
-        if context_count >= 3:
+        if context_count >= 3 and window_complete:
             if past_ref_pat.search(query_stripped):
                 logger.debug(
                     "Necessity: uncertain (back-reference to an earlier turn "
@@ -533,7 +593,9 @@ class RetrievalNecessityJudge:
         logger.debug("Necessity: uncertain (default, query=%r)", query_stripped[:50])
         return "uncertain"
 
-    def judge(self, query: str, context_count: int = 0) -> str:
+    def judge(
+        self, query: str, context_count: int = 0, *, window_complete: bool = True,
+    ) -> str:
         """ルール判定の後方互換ラッパ (2 値返却).
 
         `_judge_rule` の 3 値 + uncertain を旧 API の 2 値
@@ -544,21 +606,27 @@ class RetrievalNecessityJudge:
 
         3 値のまま扱いたい呼出側は ``judge_rule_only`` を使うこと。
         """
-        rule = self._judge_rule(query, context_count)
+        rule = self._judge_rule(
+            query, context_count, window_complete=window_complete,
+        )
         if rule == "uncertain":
             return "retrieve"
         if rule == "fetch":
             return "skip"
         return rule
 
-    def judge_rule_only(self, query: str, context_count: int = 0) -> str:
+    def judge_rule_only(
+        self, query: str, context_count: int = 0, *, window_complete: bool = True,
+    ) -> str:
         """ルール判定の 3 値 (``uncertain`` 含む) をそのまま返す。
 
         embedding 決定論的リコール (``rag_judge_recall``) が「ルールで確定
         できるか」を判定するための公開 API。``uncertain`` の場合のみ呼出側が
         リコールへフォールバックする。
         """
-        return self._judge_rule(query, context_count)
+        return self._judge_rule(
+            query, context_count, window_complete=window_complete,
+        )
 
 
 class RetrievalQualityJudge:

@@ -23,6 +23,7 @@ from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.core.stream_filter import (
     HeadBufferFilter,
     InternalFrameMentionFilter,
+    LengthDisclosureFilter,
     QueryEchoFilter,
     RepetitionGuardFilter,
     StreamThinkingFilter,
@@ -69,6 +70,10 @@ class _DeliberativeStreamState:
     tool_command_name: str | None = None
     tool_command_success: bool | None = None
     tool_command_source: str | None = None
+    #: このターンの「状態を変える操作を撃てなかった」印 (判定結果由来)。
+    #: 共有判定器の属性を記録側が後から読むと並行リクエストで消えるため、
+    #: ターンごとの値をここまで運ぶ (ToolJudgement.action_blocked のコメント参照)。
+    action_blocked: bool = False
 
 
 
@@ -116,6 +121,9 @@ async def _stream_filtered_token_pipeline(
         # system プロンプトと動的ブロックの区切り文の両方で禁じているのに
         # 実機では破られた (2026-08-16 ライブ監査 ターン25)。
         InternalFrameMentionFilter(),
+        # 明示された文字数指定を破ったことを末尾で開示する。層の終端処理では
+        # なくパイプラインに置く (LengthDisclosureFilter の docstring 参照)。
+        LengthDisclosureFilter(query),
     ])
     aiter = token_stream.__aiter__()
     pending: asyncio.Task[str] | None = None
@@ -220,6 +228,9 @@ async def _retry_zero_tokens_deliberative(
         QueryEchoFilter(query),
         RepetitionGuardFilter(query),
         InternalFrameMentionFilter(),
+        # 明示された文字数指定を破ったことを末尾で開示する。層の終端処理では
+        # なくパイプラインに置く (LengthDisclosureFilter の docstring 参照)。
+        LengthDisclosureFilter(query),
     ])
     async for token in retry_stream:
         if _cancel_flags.get(session_id):
@@ -305,6 +316,7 @@ async def _finalize_deliberative_stream(
         tool_command_success=state.tool_command_success,
         tool_command_source=state.tool_command_source,
         tool_routing_success=state.tool_command_success is True,
+        action_blocked=state.action_blocked,
         rag_used=rag_used,
         rag_top1_score=rag_top1_score,
     )
@@ -413,6 +425,7 @@ async def stream_deliberative(
             stream_state.tool_command_name = tool_capture.get("command_name")
             stream_state.tool_command_success = tool_capture.get("success")
             stream_state.tool_command_source = tool_capture.get("command_source")
+            stream_state.action_blocked = bool(tool_capture.get("action_blocked"))
 
             async for frame in _drain_deliberative_step_queue(step_queue):
                 yield frame

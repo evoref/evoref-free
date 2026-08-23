@@ -46,7 +46,12 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Iterable, Literal
 
-from backend.free.core.text_quality import carries_no_assertion, is_payload_dump
+from backend.free.core.text_quality import (
+    carries_no_assertion,
+    is_payload_dump,
+    looks_like_task_log_residue,
+    states_no_user_value,
+)
 from backend.free.core.session_mode import (
     is_chat_mode,
     is_create_mode,
@@ -197,6 +202,16 @@ INTERNAL_INDEX_SUBJECT_PREFIXES: tuple[str, ...] = (
 )
 
 
+#: 属性スロットを持つユーザーファクトの型 (``fact_attributes.yaml`` の chat 節)。
+#: ``extractors.chat._USER_SUBJECT_TAGS`` と同じ集合 — 片方だけ増やさないこと。
+_USER_ATTRIBUTE_FACT_TYPES: tuple[str, ...] = (
+    "personal_fact",
+    "preference",
+    "emotion",
+    "opinion",
+)
+
+
 def _normalize_for_dup(text: str) -> str:
     """重複判定用の正規化 (空白除去のみ)。曖昧一致はしない。"""
     return "".join((text or "").split())
@@ -247,6 +262,34 @@ class InjectionPlan:
 # ──────────────────────────────────────────────────────────────────────────
 # MemoryInjector
 # ──────────────────────────────────────────────────────────────────────────
+
+
+#: スロット同定に使えない汎用の末尾セグメント。``mem.personal.user`` /
+#: ``mem.world.assertion`` のように属性名が入っていない subject は、属性単位の
+#: 畳み込みから外す (同じキーに無関係な事実が集まってしまう)。
+_GENERIC_SUBJECT_TAIL: frozenset[str] = frozenset(
+    {"user", "assertion", "fact", "info", "note", "misc", "other", "value"},
+)
+
+
+def _attribute_key(subject: str) -> str | None:
+    """subject から「実世界の属性名」を取り出す (純粋関数)。
+
+    ``mem.personal.beverage`` / ``mem.preference.beverage`` はどちらも
+    **同じ属性**を指すのに ``(subject, predicate)`` が違うためスロット畳み込みが
+    効かない。末尾セグメントを属性キーとして扱い、名前空間をまたいで 1 値へ
+    寄せるために使う。
+
+    Returns:
+        属性キー。取り出せない (階層が浅い / 汎用語) 場合は ``None``。
+    """
+    parts = (subject or "").split(".")
+    if len(parts) < 3:
+        return None
+    tail = parts[-1]
+    if not tail or tail in _GENERIC_SUBJECT_TAIL:
+        return None
+    return tail
 
 
 class MemoryInjector:
@@ -357,6 +400,43 @@ class MemoryInjector:
         )
         return relevance, relevance * PINNED_RELEVANCE_RATIO
 
+    @staticmethod
+    def _restated_slots(
+        session_user_texts: Iterable[str], mode: MemoryMode,
+    ) -> set[tuple[str, str]]:
+        """今回の会話でユーザーが値を述べ直した ``(fact_type, attribute)`` 集合。
+
+        属性の同定は ``fact_attributes.yaml`` の決定論辞書
+        (:func:`resolve_fact_attribute`) をそのまま使う — 抽出側が subject を
+        決めるのと同じ辞書なので、注入側だけ別基準になることがない。
+        LLM 呼び出しは無い。
+        """
+        from backend.free.memory.notes.note_builder import resolve_fact_attribute
+
+        slots: set[tuple[str, str]] = set()
+        for text in session_user_texts or ():
+            if not text:
+                continue
+            for fact_type in _USER_ATTRIBUTE_FACT_TYPES:
+                attr = resolve_fact_attribute(text, fact_type, mode=mode)
+                if attr:
+                    slots.add((fact_type, attr))
+        return slots
+
+    @staticmethod
+    def _slot_restated_in_session(
+        fact: SemanticFact, restated: set[tuple[str, str]],
+    ) -> bool:
+        """``fact`` の属性スロットが今回の会話で述べ直されているか。"""
+        if not restated:
+            return False
+        fact_type = str(getattr(fact, "type", "") or "")
+        subject = str(getattr(fact, "subject", "") or "")
+        if not fact_type or "." not in subject:
+            return False
+        attr = subject.rsplit(".", 1)[-1]
+        return (fact_type, attr) in restated
+
     # ── public API ────────────────────────────────────────────────────
 
     def inject(
@@ -368,6 +448,7 @@ class MemoryInjector:
         current_project_id: str | None = None,
         failure_signatures: Iterable[str] | None = None,
         query_embedding: "np.ndarray | None" = None,
+        session_user_texts: Iterable[str] = (),
     ) -> InjectionPlan:
         """注入計画を構築する。
 
@@ -380,6 +461,9 @@ class MemoryInjector:
                 すべて他プロジェクト扱いになる。
             failure_signatures: Tier 1 注入を許可する failure_pattern の
                 ``failure_signature`` 集合 (signature 一致時のみ Tier 1)。
+            session_user_texts: 今回の会話でユーザーが述べた本文の列。ここに
+                同じ属性スロットの言明があるファクトは注入しない
+                (:meth:`_restated_slots` を参照)。
             query_embedding: 現在のユーザー発話の埋め込み。与えられた場合、
                 埋め込みを持つ候補は類似度 ``relevance_min_score`` 未満なら
                 注入しない (``pinned`` は明示指定なので常に通す)。``None``
@@ -408,9 +492,22 @@ class MemoryInjector:
 
         facts, collapsed, stale_texts = self._collapse_to_current_values(facts)
         filtered_out += collapsed
+        restated = self._restated_slots(session_user_texts, mode)
 
         for fact in facts:
             if fact.superseded_by:
+                continue
+            # 今回の会話で同じ属性スロットを述べ直しているファクトは注入しない。
+            # ラベルには「今回の会話と食い違えば今回が優先」と書いてあるが、
+            # 規範文では勝てない — 実インシデント (2026-08-23 ライブ監査
+            # セット 2): 「私は今、埼玉県川口市に住んでいます。」と述べた後の
+            # 「私が住んでいるのはどこでしたか？」に対し、前セッションの
+            # ``mem.personal.location states: …武蔵野市に引っ越しました。`` が
+            # 勝って「武蔵野市です」と答えた。数値ラベル版の同じ対処
+            # (``core.inference._drop_superseded_context``) を属性スロットへ
+            # 一般化したもの。
+            if self._slot_restated_in_session(fact, restated):
+                filtered_out += 1
                 continue
             # 問いだけのファクトは主張を含まないのに「(personal_fact)
             # mem.personal.birthday states: ...」と **断定形** で注入され、
@@ -427,7 +524,13 @@ class MemoryInjector:
             # 2026-08-07 ライブ監査: 「私の猫の名前と誕生日を覚えていますか。」
             # が pinned な personal_fact として全ターンの [関連する記憶] に
             # 載り続けていた — pin 例外を付けるとこの実例が素通りする)。
-            if carries_no_assertion(fact.object or ""):
+            # 依頼形も落とす (``states_no_user_value``)。「私の好きな飲み物を
+            # もう一度教えてください。」が ``mem.personal.beverage states: …``
+            # として **断定形**で並び、本人の実際の言明と競合していた
+            # (2026-08-19 実測: 実ストアの依頼形 21 件中 14 件が飲み物スロット)。
+            # ノート側 (下) は ``carries_no_assertion`` のまま — 依頼は
+            # 「後から引きたい記録」としては正当なので落とさない。
+            if states_no_user_value(fact.object or ""):
                 filtered_out += 1
                 continue
             # セッション要約は「会話で何が起きたか」のメタ記録であって、
@@ -496,12 +599,50 @@ class MemoryInjector:
             if not pinned and carries_no_assertion(getattr(note, "content", "")):
                 filtered_out += 1
                 continue
+            # 依頼だけのノートも同じ理由で ``(過去の記録)`` に載せない。
+            # ``carries_no_assertion`` は「問いだけか」しか見ないので、
+            # 「〜を全部挙げてください」型の依頼が素通りする。
+            #
+            # 実インシデント (2026-08-23 ライブ監査セット 2 ターン 1): 挨拶
+            # 「おはようございます。改めて、私は小川宏之です。」に 11 件が注入され、
+            # うち「この会話で私が訂正した項目はいくつありますか？内容も挙げて
+            # ください。」「ここまでで私について覚えたことを、箇条書きで全部挙げて
+            # ください。」など **過去のユーザーの依頼文** が (過去の記録) として
+            # 並んでいた。依頼は事実を含まないので根拠にならず、本物のファクトを
+            # 予算から押し出す。ノート自体は残るので履歴検索からは引ける。
+            if not pinned and states_no_user_value(getattr(note, "content", "")):
+                filtered_out += 1
+                continue
+            # アシスタント自身の発話は ``(過去の記録)`` の根拠にしない。
+            #
+            # 派生物であって出典ではない。ユーザーの言明を復唱しただけのものは
+            # **同じ事実の重複** になり (2026-08-23 実測: PC 環境の 2 文が
+            # [関連する記憶] と [参考情報] に計 4 コピー)、過去の回答が誤って
+            # いた場合は **作話が「過去の記録」に昇格** する (同監査セット 1 の
+            # 「確信度は100%です。あなたが来月出張する都市は東京です。」が
+            # セット 2 で過去の記録として注入された。正解は大阪)。
+            # system プロンプトは既に「自分自身の過去の発言をそのまま繰り返さない」
+            # と書いているが、規範文では勝てない。
+            if not pinned and getattr(note, "source", "user") == "assistant":
+                filtered_out += 1
+                continue
             # 本文の過半がコードフェンスの中身 = 「いつでも取り直せるデータの
             # コピー」。記憶として再注入すると内容が古びるうえ、「ペイロードを
             # 貼るのが正解」という手本として働く (2026-08-16 動作検証: README を
             # 全文ダンプした回答がノート化され、(過去の記録) として再注入され、
             # 次のターンでまたダンプさせていた — 自己増幅ループ)。
             if not pinned and is_payload_dump(getattr(note, "content", "")):
+                filtered_out += 1
+                continue
+            # 内部タスク進捗ノート (「- [done] … / Written N bytes to …」) は
+            # ユーザー向け本文ではない。記録側の浄化漏れで STM に入ってしまうと
+            # (過去の記録) として注入され、**実行していない操作の完了報告**を
+            # モデルに手本として与える。実インシデント 2026-08-22 ライブ監査:
+            # ``- [done] Confirm the file <path> has been deleted``
+            # が注入され、削除ツールが無いターンで「削除しました。」と答えた
+            # (ファイルは残存)。記録側 (meta_cognitive_recorded_text) を直しても
+            # 既存ノートは寿命が尽きるまで残るため、読み出し側でも落とす。
+            if looks_like_task_log_residue(getattr(note, "content", "")):
                 filtered_out += 1
                 continue
             gate_reached += 1
@@ -571,6 +712,34 @@ class MemoryInjector:
         return plan
 
     # ── 関連度ゲート ──────────────────────────────────────────────────
+
+    def relevant_fact_ids(
+        self,
+        facts: Iterable[SemanticFact],
+        query_embedding: "np.ndarray | None",
+    ) -> set[str] | None:
+        """関連度ゲートを通ったファクト id を返す。ゲート無効時は ``None``。
+
+        Tier パッキングを経由しない注入経路 (``[記憶の競合]`` セクション) が、
+        注入本体と **同じ棒** を使うための入口。``None`` は「ゲートを掛けられ
+        なかった」を意味し、呼出側は従来どおり全件を通す。
+
+        競合セクションは予算の外で毎ターン連結されるため、ゲートが無いと
+        クエリと無関係な矛盾が全ターンのプロンプトに載り続ける (実測
+        2026-08-19: 飲み物の競合 2 件が、飲み物と無関係な 28/29 ターンへ
+        注入されていた)。
+        """
+        query_vec = self._prepare_query_vec(query_embedding)
+        if query_vec is None:
+            return None
+        return {
+            f.id
+            for f in facts
+            if self._is_relevant(
+                query_vec, getattr(f, "embedding", None),
+                pinned=bool(getattr(f, "pinned", False)),
+            )
+        }
 
     def _prepare_query_vec(
         self, query_embedding: "np.ndarray | None",
@@ -817,6 +986,38 @@ class MemoryInjector:
             return None
         return max(0.0, (self._now_provider() - created_at) / 86400.0)
 
+    @staticmethod
+    def _supersedes(candidate: SemanticFact, current: SemanticFact) -> bool:
+        """同一スロットで ``candidate`` が ``current`` を置き換えるべきか。
+
+        ``created_at`` の新しい方を残すのが基本だが、**同着を落としてはいけない**。
+        1 回の sleep-time バッチで抽出されたファクトは秒未満の差しか持たず、
+        実測では ``created_at`` が完全に一致する。訂正は同じセッションで起きる
+        ため、まさにその同着に当たる。
+
+        実インシデント (2026-08-22 ライブ監査 2 回目): ``mem.preference.beverage``
+        ``prefers`` に
+
+          - 「私はコーヒーより紅茶が好きです。」 (created_at 1787362137.6008642)
+          - 「さっき「紅茶が好き」と言いましたが、やっぱりコーヒーの方が好きです。」
+            (created_at 1787362137.6017072)
+
+        が並び、厳密な ``>`` 比較では **先に見た訂正前の値が残った**。ファクトは
+        会話順に append されるので、同着なら **後から来た方が新しい**。加えて
+        ``from_correction`` が立っている行は訂正そのものなので、同着では常に
+        優先する (同一バッチ内で順序が入れ替わっても壊れないようにする)。
+        """
+        cand_at = float(getattr(candidate, "created_at", 0.0) or 0.0)
+        cur_at = float(getattr(current, "created_at", 0.0) or 0.0)
+        if cand_at != cur_at:
+            return cand_at > cur_at
+        cand_corr = bool(getattr(candidate, "from_correction", False))
+        cur_corr = bool(getattr(current, "from_correction", False))
+        if cand_corr != cur_corr:
+            return cand_corr
+        # 同着かつ訂正フラグも同じ — 抽出順 (= 会話順) で後の方が新しい。
+        return True
+
     def _collapse_to_current_values(
         self, facts: Iterable[SemanticFact],
     ) -> tuple[list[SemanticFact], int, set[str]]:
@@ -871,14 +1072,14 @@ class MemoryInjector:
             # **主張を含まない行はスロットの代表になれない。**
             #
             # 畳み込みは「最新を残す」ので、質問が最新だとそれがスロットを取り、
-            # 後段の carries_no_assertion で落とされて **スロットごと消える**。
+            # 後段の states_no_user_value で落とされて **スロットごと消える**。
             # 実インシデント (2026-08-09): mem.personal.birthday に
             #   「私の誕生日は 3 月 14 日で、飼っている猫の名前はコトラです。」(答え)
             #   「私の猫の名前と誕生日を覚えていますか。」(質問・同日で後勝ち)
             # が並び、質問が代表になった結果「猫の名前は？」に対して答えが 1 件も
             # 注入されず「文脈が不足しています」と回答した (類似度 0.490 で
             # 関連度ゲートは通っていた)。判定順序だけの問題。
-            if carries_no_assertion(fact.object or ""):
+            if states_no_user_value(fact.object or ""):
                 out.append(fact)          # 既存ループ側の同じ判定に委ねる
                 continue
             exact = (fact.subject, fact.predicate, fact.object)
@@ -893,19 +1094,65 @@ class MemoryInjector:
                 out.append(fact)
                 continue
             dropped += 1
-            if float(getattr(fact, "created_at", 0.0) or 0.0) > float(
-                getattr(current, "created_at", 0.0) or 0.0,
-            ):
+            if self._supersedes(fact, current):
                 stale_texts.add(_normalize_for_dup(current.object))
                 out[out.index(current)] = fact
                 by_slot[slot] = fact
             else:
                 stale_texts.add(_normalize_for_dup(fact.object))
+        # ここまでは ``(subject, predicate)`` 単位。**同じ属性が別スロットへ
+        # 分散する** ケースはこれでは畳めない。実測 (2026-08-22 ライブ監査
+        # 2 回目、実ファクトストア): 「好きな飲み物」が
+        # ``mem.personal.beverage`` / ``mem.preference.beverage`` /
+        # ``mem.personal.user`` / ``mem.preference.user`` の 4 スロットへ散り、
+        # 緑茶 / ほうじ茶 / 紅茶 / コーヒーの歴代 4 世代がすべて live のまま
+        # 注入されていた。その結果、同じ会話で「緑茶」に訂正した直後の
+        # 「好きな飲み物は？」に **数日前の「ほうじ茶」**、まとめでは
+        # 「コーヒー」と答えた。属性名 (subject の末尾セグメント) で
+        # もう一段畳んで最新 1 値に寄せる。
+        out, attr_dropped = self._collapse_by_attribute(out, stale_texts)
+        dropped += attr_dropped
         if dropped:
             logger.debug(
                 "MemoryInjector: collapsed %d duplicate/stale fact rows", dropped,
             )
         return out, dropped, stale_texts
+
+    def _collapse_by_attribute(
+        self, facts: list[SemanticFact], stale_texts: set[str],
+    ) -> tuple[list[SemanticFact], int]:
+        """属性名 (subject 末尾) をまたいだ世代を 1 値へ畳む。
+
+        ``_attribute_key`` が ``None`` を返す subject (階層が浅い / 汎用語) は
+        対象外。会話要約 (``mem.decision.history.session.<id>``) は末尾が
+        セッション ID なので互いに衝突せず、そのまま残る。
+        """
+        by_attr: dict[str, SemanticFact] = {}
+        out: list[SemanticFact] = []
+        dropped = 0
+        for fact in facts:
+            if getattr(fact, "superseded_by", None) or states_no_user_value(
+                fact.object or "",
+            ):
+                out.append(fact)
+                continue
+            key = _attribute_key(fact.subject)
+            if key is None:
+                out.append(fact)
+                continue
+            current = by_attr.get(key)
+            if current is None:
+                by_attr[key] = fact
+                out.append(fact)
+                continue
+            dropped += 1
+            if self._supersedes(fact, current):
+                stale_texts.add(_normalize_for_dup(current.object))
+                out[out.index(current)] = fact
+                by_attr[key] = fact
+            else:
+                stale_texts.add(_normalize_for_dup(fact.object))
+        return out, dropped
 
     @staticmethod
     def _is_stale_duplicate(content: str, stale_texts: set[str]) -> bool:

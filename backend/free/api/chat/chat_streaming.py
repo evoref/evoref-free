@@ -49,6 +49,7 @@ from backend.free.api.chat.chat_stream_meta import (
     _emit_meta_cognitive_result_frames,
     _finalize_meta_cognitive_stream,
     _meta_cognitive_body_text,
+    meta_cognitive_recorded_text,
     _STEP_DESCRIPTION_MAX_CHARS,
     stream_meta_cognitive,
     stream_reactive,

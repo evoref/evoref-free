@@ -8,9 +8,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from backend.free.agent.context_budget import resolve_meta_cognitive_loop_budget
+from backend.free.agent.meta_cognitive_text import assigns_file_content
 from backend.free.agent.safety_patterns import strip_command_literals
 from backend.free.core.intent_vocab import (
     DATETIME_QUERY_RE,
+    persist_request,
+    runtime_info_question,
+    tool_inventory_question,
     GREETING_PUNCTUATION_JA,
     HISTORY_KEYWORDS as _HISTORY_KEYWORDS,
     HISTORY_KEYWORDS_EN as _HISTORY_KEYWORDS_EN,
@@ -776,20 +780,18 @@ class _ClassifyContext:
     変わっても判定は変わらない (早期マッチ時に評価されないよう遅延させている)。
     """
 
-    __slots__ = ("_c", "_cache", "context", "mode", "query", "rag_results")
+    __slots__ = ("_c", "_cache", "context", "mode", "query")
 
     def __init__(
         self,
         classifier: "ComplexityClassifier",
         query: str,
         mode: str,
-        rag_results: list,
         context: str = "",
     ) -> None:
         self._c = classifier
         self.query = query
         self.mode = mode
-        self.rag_results = rag_results
         #: 直近会話の本文。被演算子の片方が前ターンにしか無い計算クエリを
         #: reactive に落とさないために使う (``looks_like_numeric_question``)。
         self.context = context
@@ -813,15 +815,6 @@ class _ClassifyContext:
     @property
     def is_long_form_candidate(self) -> bool:
         return self._memo("lf", lambda: self._c._detect_long_form(self.query))
-
-    @property
-    def rag_threshold(self) -> float:
-        return self._memo(
-            "rt",
-            lambda: self._c._get_policy(
-                "router", "rag_score_threshold", self.mode, 0.8,
-            ),
-        )
 
 
 @dataclass(frozen=True)
@@ -910,16 +903,9 @@ _CLASSIFY_RULES: tuple[_ClassifyRule, ...] = (
         "complex_keywords", "deliberative",
         lambda c, x: c._has_complex_keywords(x.query),
     ),
-    _ClassifyRule(
-        "short_high_rag", "reactive",
-        lambda c, x: bool(
-            x.is_short and x.rag_results and x.rag_results[0][1] > x.rag_threshold
-        ),
-    ),
     # reactive / reactive_light は検索パイプラインを一切走らせないため、短い
     # 知識質問を short_query で reactive に落とすとカートリッジを参照せず
-    # 事前知識だけで答えてしまう。short_high_rag の後に置くことで、RAG ヒット
-    # 済みの短文即応答は従来挙動を保つ。
+    # 事前知識だけで答えてしまう。short_query の手前に置く。
     _ClassifyRule(
         "knowledge_query", "deliberative",
         lambda c, x: x.is_knowledge,
@@ -951,19 +937,65 @@ _CLASSIFY_RULES: tuple[_ClassifyRule, ...] = (
         "premise_confirmation", "deliberative",
         lambda c, x: c._is_premise_confirmation_query(x.query),
     ),
+    # 自分自身の構成 / ツール目録を尋ねるクエリも short_query の手前に置く。
+    # 根拠はすべて決定論で取れる (ToolsRegistry / config / llama-server の
+    # /props) のに、その注入はどれも deliberative 側にしか無い
+    # (``deliberative._append_tool_inventory_fact`` / ツール判定層 0.6b)。
+    # reactive_light へ落ちるとツール判定ごと外れ、base が事前知識だけで
+    # 答えて **存在しないツール名を並べる**。実インシデント
+    # (2026-08-22 ライブ監査 2 回目 ターン8): 「あなたが使えるツールを箇条書きで
+    # 列挙してください。」(30 文字) が short_query → reactive_light に落ち、
+    # 「web_search / fetch_url / execute_code / get_weather / get_stock_price /
+    # get_sports_results」という **1 つも登録されていない** 一覧を回答した。
+    # knowledge_query / personal_recall / numeric_question を short_query の
+    # 手前に置いたのと同じ理由。
+    # 「ファイルに保存して」型の永続化依頼は、保存先が書かれていなくても
+    # reactive へ落とさない。``local_write_intent`` はパスを必須にするため、
+    # パスの無い依頼はツール判定に一度も到達しない。実インシデント
+    # (2026-08-22 ライブ監査 2 回目 ターン 252): 「ファイルに保存しておいて。」
+    # (12 文字) が short_query → reactive に落ち、「ファイル保存機能は利用
+    # できないため、保存できません。」と回答した。**同じ会話のターン 122 で
+    # write_file が成功している** ので能力が無いという説明自体が誤りだった。
+    # 保存先が無いなら聞き返すのが正しい応答で、それは deliberative でしか出せない。
+    _ClassifyRule(
+        "persist_intent", "deliberative",
+        lambda c, x: persist_request(x.query),
+    ),
+    _ClassifyRule(
+        "self_config_query", "deliberative",
+        lambda c, x: tool_inventory_question(x.query) or runtime_info_question(x.query),
+    ),
     _ClassifyRule(
         "short_query", "reactive",
         lambda c, x: x.is_short,
     ),
     _ClassifyRule(
-        "no_rag_results", "deliberative",
-        lambda c, x: not x.rag_results,
-    ),
-    _ClassifyRule(
         "tool_patterns", _META,
         lambda c, x: c._needs_tools(x.query),
     ),
-    _ClassifyRule("default", "reactive", lambda c, x: True),
+    # 表の終端。ここまで落ちてきたクエリは「短くもなく、知識質問でも履歴参照でも
+    # ツール要求でもない」もので、reactive の視界 (直近 6 メッセージ / 記憶なし)
+    # では足りない。
+    #
+    # かつて終端は reactive で、その手前に ``not x.rag_results`` を条件とする
+    # ``no_rag_results`` ルールが居た。しかし ``classify()`` の本番呼出は
+    # ``rag_results`` を渡さない (検索は投機並列化され、分類の時点では結果が
+    # 無い) ため、この条件は **恒真** で、終端の 2 ルール
+    # (``tool_patterns`` / ``default``) は到達不能だった。実測でも
+    # ``no_rag_results`` は 31 回発火する一方 ``tool_patterns`` は 0 回で、
+    # meta_cognitive へは ``local_write_intent`` からしか入っていない。
+    # 恒真ルールを消して終端を deliberative にすることで、実質の振り分けを
+    # 変えずに (実測 233 ターンの再生で差分 0) ``tool_patterns`` の経路を戻す。
+    #
+    # TODO: これで ``policy_interpreter`` の router ドメイン
+    # ``rag_score_threshold`` は **消費者ゼロ** になった (唯一の読み手だった
+    # ``short_high_rag`` の閾値)。実ファイル
+    # (``local/learning/*/prompts/policy_evolver_state.json``) では 1.0 まで
+    # 進化しており、何にも効かないノブに router 探索の 1 次元を使い続けている。
+    # 撤去は永続化された進化ステートのスキーマ変更を伴い、
+    # ``test_policy_interpreter.py`` が本キーを float の標準サンプルとして
+    # 約 90 箇所で使っているため、別タスクとして切る。
+    _ClassifyRule("default", "deliberative", lambda c, x: True),
 )
 
 
@@ -1000,7 +1032,6 @@ class ComplexityClassifier:
         self,
         query: str,
         mode: str = "chat",
-        rag_results: list | None = None,
         context_turns: int = 0,  # noqa: ARG002
         context: str = "",
     ) -> str:
@@ -1012,15 +1043,20 @@ class ComplexityClassifier:
         加える (以前は 18 個の if が本体に並び、後付け層が 1.4 / 2.5 / 8.5 の
         ような小数コメントで表現されていた)。
 
+        **判定は query / mode / 直近会話だけを見る**。検索結果は渡さない —
+        検索は分類の後に投機起動されるため、分類の時点では存在しない。かつて
+        ``rag_results`` 引数があったが本番呼出は一度も渡しておらず、それを条件
+        にする 2 ルールが「永久に false」と「恒真」になっていた (表末尾の
+        ``default`` のコメント参照)。
+
         Returns:
             "reactive" | "deliberative" | "meta_cognitive"
         """
-        rag_results = rag_results or []
         self.is_long_form = False
         self._classify_mode = mode
         self._last_classify_reason = "default"
 
-        ctx = _ClassifyContext(self, query, mode, rag_results, context)
+        ctx = _ClassifyContext(self, query, mode, context)
         for rule in _CLASSIFY_RULES:
             if not rule.predicate(self, ctx):
                 continue
@@ -1152,7 +1188,10 @@ class ComplexityClassifier:
         # 「いま書いたそのファイル」のような既出成果物への言及は、依頼された
         # 動作ではなく対象の説明。書込み動詞判定から除外する。
         probe = _DESCRIPTIVE_WRITE_CLAUSE_RE.sub(" ", probe)
-        if not _WRITE_VERB_RE.search(probe):
+        # 書込み動詞の列挙に加えて **本文代入** の構文も受ける。「内容を『X』に
+        # してください」は書込み依頼だが動詞を 1 つも含まないため、動詞だけの
+        # 判定では読取へ落ちる (assigns_file_content の docstring 参照)。
+        if not _WRITE_VERB_RE.search(probe) and not assigns_file_content(probe):
             return False
         if _LOCAL_PATH_RE.search(probe):
             return True

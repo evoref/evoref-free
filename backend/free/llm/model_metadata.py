@@ -35,6 +35,12 @@ class ModelMetadata:
     eos_token: str = ""
     model_id: str = ""
     template_family: TemplateFamily = "unknown"
+    #: llama-server が実際にロードしているコンテキスト長とスロット数。
+    #: config の宣言値と食い違いうる (config を書き替えても llama-server を
+    #: 再起動しなければ反映されない) ため、**自己構成を答えるときは実測側を使う**。
+    #: 取得できなければ 0 (未知)。
+    n_ctx: int = 0
+    total_slots: int = 0
 
     @property
     def params_b(self) -> float:
@@ -164,6 +170,8 @@ async def fetch_model_metadata(
         props.get("bos_token", ""), props.get("eos_token", ""),
     )
 
+    gen = props.get("default_generation_settings") or {}
+    n_ctx = gen.get("n_ctx") if isinstance(gen, dict) else None
     return ModelMetadata(
         chat_template=tmpl,
         has_system_role=has_sys,
@@ -171,4 +179,6 @@ async def fetch_model_metadata(
         eos_token=props.get("eos_token", ""),
         model_id=model_id,
         template_family=family,
+        n_ctx=int(n_ctx) if isinstance(n_ctx, (int, float)) else 0,
+        total_slots=int(props.get("total_slots") or 0),
     )

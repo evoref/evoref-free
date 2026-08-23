@@ -115,6 +115,35 @@ _LITERAL_WRITE_CONTENT_RE = re.compile(
     r"(?:そのまま\s*)?"
     r"(?:保存|書き込|書き出|書いて|出力)",
 )
+#: 「中身は『…』にして」「内容を『…』でお願いします」型の **代入構文**。
+#:
+#: :data:`_LITERAL_WRITE_CONTENT_RE` は「引用の直後に書き込み動詞」を要求する
+#: 形で、動詞の語彙を並べて拾っている。この形は必ず漏れる — 実インシデント
+#: (2026-08-23 ライブ監査セット 1 T5-1):
+#: 「E:\\tmp\\audit_test\\memo.txt というファイルを作って、中身は
+#: 「evoref 動作確認 2026-08-23」にしてください。」で、書き込み動詞 (作って) が
+#: 引用の **前** にあり閉じ括弧の後ろは「にしてください」だったため literal
+#: 抽出が外れ、生成経路に落ちて本文に実況文「ファイルを作成しました。」が
+#: 書き込まれた。
+#:
+#: 動詞を足すのではなく、引用の **文法的役割** で判定する。本文を指す名詞
+#: (中身 / 内容 / 本文 / テキスト) が主題・目的語として引用を支配し、引用が
+#: 述語 (にする / とする / です) で同定されていれば、それは「ファイルの中身は
+#: X である」という代入であって話題提示ではない。この関数は既に「書き込み
+#: タスクである」と確定した文脈からのみ呼ばれるので、代入と分かれば本文で確定する。
+#:
+#: 「『山の話』という内容で作文を書いて」のような **主題提示** は引用が名詞の
+#: 前に来るため対象外 (名詞→引用の語順を必須にしている)。
+_LITERAL_WRITE_ASSIGNMENT_RE = re.compile(
+    r"(?:中身|内容|本文|テキスト|中味)\s*(?:は|を|が)\s*"
+    r"[「『]([^「」『』]{1,2000})[」』]\s*"
+    # 述語は **節の終わり** であることを要求する。境界を見ないと「だけに
+    # 書き直して」の ``だ`` に当たるなど、代入でない位置で切れる。
+    r"(?:に\s*(?:して|し|する|しといて|しておいて)"
+    r"|と\s*(?:する|して|し)"
+    r"|で\s*(?:お願い|よろしく)"
+    r"|(?:です|だ)(?=[。．、,\s]|$))",
+)
 #: 引用が本文ではなくタイトル/ファイル名を指しているケースの除外
 _LITERAL_WRITE_REJECT_RE = re.compile(
     r"[」』]\s*と?\s*いう?\s*(?:タイトル|題名|件名|ファイル名|名前|名称)",
@@ -136,6 +165,27 @@ _ENUMERATED_LINE_RE = re.compile(
 )
 #: 行本文を包む引用符 (抽出後に剥がす)
 _ENUMERATED_LINE_QUOTES = ("「」", "『』", '""', "''", "``")
+
+
+def assigns_file_content(query: str) -> bool:
+    """「〈対象〉の内容を『X』にして」型の **本文代入** かどうか (純粋関数)。
+
+    代入は書込み依頼だが、書込み動詞 (作って / 保存 / 追記 …) を 1 つも含まない。
+    そのためルータの ``_is_local_write_intent`` (動詞の列挙で判定) を外れる。
+
+    実インシデント (2026-08-23 ライブ監査セット 2 T3-3):
+    「E:\\tmp\\audit2\\notes.md の内容を「Falcon 納期は12月15日」にしてください。」が
+    ``knowledge_query`` として deliberative へ回り、明示パスの既定である
+    ``read_file`` が走って「ファイルが存在しないため変更できませんでした」で
+    終わった (ファイルは作られなかった)。同じ会話の
+    「spec.txt を作って、中身は「…」にしてください」は動詞 (作って) を含むため
+    通っており、**同じ意味の依頼が語形だけで生死を分けていた**。
+
+    判定は :data:`_LITERAL_WRITE_ASSIGNMENT_RE` と同一の構文を使う。本文抽出
+    (:func:`extract_literal_write_content`) と意図判定でパターンが分かれると、
+    片方だけ直したときに「意図は拾うが本文は拾えない」非対称が生まれる。
+    """
+    return bool(_LITERAL_WRITE_ASSIGNMENT_RE.search(query or ""))
 
 
 def extract_literal_write_content(query: str, file_path: str) -> str:
@@ -161,6 +211,9 @@ def extract_literal_write_content(query: str, file_path: str) -> str:
     match = _LITERAL_WRITE_CONTENT_RE.search(query)
     if match:
         return match.group(1).strip()
+    assigned = _LITERAL_WRITE_ASSIGNMENT_RE.search(query)
+    if assigned:
+        return assigned.group(1).strip()
     return extract_enumerated_line_content(query)
 
 

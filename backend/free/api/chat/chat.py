@@ -35,8 +35,6 @@ from backend.free.api.chat.chat_types import ChatMessage
 from backend.free.api.chat.chat_service import (
     ConflictTurnContext,
     SearchPipelineResult,
-    _render_conflict_section,
-    apply_grounding_notes,
     build_chat_messages, build_semmem_injection, convert_file_contexts,
     ensure_base_model_health,
     collect_pending_conflicts, ensure_llm_client, prepare_memory_context,
@@ -59,6 +57,7 @@ from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
 from backend.free.agent.reactive import ReactiveAgent
 from backend.free.agent.router import ComplexityClassifier
+from backend.free.agent.tool_ledger import set_ledger_target
 from backend.free.core.stage_timer import StageTimer
 from backend.free.generation.orchestrator import LongFormOrchestrator
 from backend.free.llm.aux_client import AuxClient
@@ -200,25 +199,81 @@ def _response_language_directive() -> str:
     )
 
 
+# 参考枠 ([参考情報] / [関連する記憶] / [参考例] / [添付ファイル]) の扱いを述べる
+# **静的**な指示。動的ブロック側のマーカーから本文を移してきたもの。
+#
+# なぜ system 側なのか: 動的ブロックは最後の user メッセージへ前置されるため
+# 接頭辞 KV キャッシュの外にあり、内容が定数でも **毎ターン再プリフィル**される。
+# 実測 (2026-08-18/19、chat 232 ターン): 区切り文 105 tok × 57% のターン /
+# 記憶ラベル 105 tok × 40% / RAG ヘッダ 20 tok × 38% で、定数の指示文だけに
+# 1 ターン平均 90 トークン前後を払っていた。未キャッシュ 1 トークンは 21〜37ms
+# なので、これだけで数秒の TTFT になる。system へ移せば同じ文字が接頭辞
+# キャッシュに乗り、2 ターン目以降の再プリフィルはゼロになる。
+#
+# PromptManager の外で付加する理由は ``_RESPONSE_LANGUAGE_DIRECTIVES`` と同じ:
+# Level 1 進化がプロンプト本文へ焼き込んで劣化させるのを防ぐ。
+#
+# 内容は既存の指示の移設で、**新しい制約は足していない**:
+#   - 「無関係なら言及せず自分の知識で答える」  ← 旧 _DYNAMIC_CONTEXT_DELIMITER
+#     (実測 2026-07-25: PC が重い相談の最中に「ご提示いただいた参考情報には…
+#      含まれていません」と述べ、空き 548GB あるのに空き容量不足の対処を回答)
+#   - 「今回の質問に関係しなければ無視する / 無い予定・日付・数値を創作しない」
+#     ← 旧 _SEMMEM_BLOCK_LABEL (実測 2026-07-27: 過去 note を根拠に、この会話に
+#        存在しない歯科の予約と健康診断を捏造)
+_REFERENCE_BLOCK_DIRECTIVES: dict[str, str] = {
+    "ja": (
+        "（[参考情報]・[関連する記憶]・[参考例]・[添付ファイル] は"
+        "システムが用意した参考枠であり、ユーザーの発言ではない。"
+        "今回の質問に関係しない場合は、そのことに言及せず、"
+        "参考枠の話題に引きずられずに自分の知識で普通に答えること。"
+        "参考枠に無い予定・日付・数値を創作しないこと。）"
+    ),
+    "en": (
+        "([参考情報] / [関連する記憶] / [参考例] / [添付ファイル] blocks are "
+        "reference material supplied by the system, not user input. "
+        "If they are unrelated to the question, do not mention that fact and "
+        "do not let them steer the topic - just answer from your own knowledge. "
+        "Never invent schedules, dates, or numbers that are not in them.)"
+    ),
+}
+
+
+def _reference_block_directive() -> str:
+    """参考枠の扱いを述べる静的指示行を返す (未知 locale / 取得失敗は ja)。"""
+    try:
+        locale = get_config().get("i18n", {}).get("prompt_locale", "ja")
+    except Exception:
+        locale = "ja"
+    return _REFERENCE_BLOCK_DIRECTIVES.get(
+        locale, _REFERENCE_BLOCK_DIRECTIVES["ja"],
+    )
+
+
 def _resolve_system_prompt(
     state: AppState, mode: str, instance_name: str,
 ) -> str:
     """静的システムプロンプトを取得（PromptManager 未設定時はフォールバック）。
 
     query 非依存 (few-shot を含まない) なので連続リクエスト間で安定し、
-    llama-server の prefix KV キャッシュが効く (応答言語指示も config 固定文字列
-    のため安定)。few-shot は ``_resolve_fewshot_block`` で別途取得し最後の
-    user メッセージへ前置する。
+    llama-server の prefix KV キャッシュが効く (応答言語指示・参考枠の扱いも
+    config 固定文字列のため安定)。few-shot は ``_resolve_fewshot_block`` で
+    別途取得し最後の user メッセージへ前置する。
+
+    末尾に付ける 2 つの指示は **ここに置くこと自体が要点**。どちらも内容が
+    ターンに依らない定数なので、動的ブロック側 (最後の user へ前置される =
+    毎ターン再プリフィルされる) に置くと、同じ文字を毎回払うことになる。
     """
-    directive = _response_language_directive()
+    directives = "\n\n".join(
+        (_response_language_directive(), _reference_block_directive()),
+    )
     prompt_mgr = state.prompt_manager
     if prompt_mgr:
         get_static = getattr(prompt_mgr, "get_prompt_static", None)
         if get_static is not None:
-            return f"{get_static(mode)}\n\n{directive}"
+            return f"{get_static(mode)}\n\n{directives}"
         # 後方互換: get_prompt_static 未実装の Mock 等は query なし get_prompt へ縮退
-        return f"{prompt_mgr.get_prompt(mode)}\n\n{directive}"
-    return f"You are {instance_name}, a helpful AI assistant.\n\n{directive}"
+        return f"{prompt_mgr.get_prompt(mode)}\n\n{directives}"
+    return f"You are {instance_name}, a helpful AI assistant.\n\n{directives}"
 
 
 def _resolve_fewshot_block(state: AppState, mode: str, query: str | None) -> str:
@@ -308,12 +363,15 @@ async def _gate_reactive_light(
         return "deliberative", judge_task, "file_context"
     if state.tool_call_judge is None or state.tools_registry is None:
         return "deliberative", judge_task, "judge_unavailable"
-    # 会話全体を見ないと答えられない質問を、直近 REACTIVE_LIGHT_HISTORY_TURNS
-    # メッセージ + STM/SemMem 注入なしの視界で答えさせない。窓に収まっている
-    # 間は軽量パスでも正答できるので、実際に切り詰めが起きる場合だけ上げる
-    # (実インシデント 2026-08-12 ライブ監査 ターン21:「ここまでの会話を 5 行
-    # 以内で要約して。」が 21 文字で short_query → 軽量パスに落ち、直近 3 往復
-    # だけを要約した。31 ターン中の残り 28 ターンは要約に含まれなかった)。
+    # 会話全体を見ないと答えられない質問は、STM/SemMem/RAG 注入なしの視界で
+    # 答えさせない (実インシデント 2026-08-12 ライブ監査 ターン21:「ここまでの
+    # 会話を 5 行以内で要約して。」が 21 文字で short_query → 軽量パスに落ち、
+    # 直近 3 往復だけを要約した)。
+    #
+    # 軽量パスの履歴窓は build_chat_messages へ委ねたので、視界の差は履歴では
+    # なく **記憶と検索の有無** になった。それでも上げる価値はある — 窓外へ
+    # 押し出されたターンは STM/search_history からしか辿れない。閾値は
+    # 「会話が単発でない」ことを見るだけの目安。
     if (
         len(history) > REACTIVE_LIGHT_HISTORY_TURNS
         and is_whole_session_scope_query(req.message)
@@ -337,6 +395,30 @@ async def _gate_reactive_light(
         if judge_task is None:
             judge_task = asyncio.create_task(_completed(judgement))
         return "deliberative", judge_task, "tool_needed"
+
+    # 「撃てなかった」と分かっているターンは軽量パスに落とさない。
+    #
+    # ``action_blocked`` / ``measurement_blocked`` は「状態を変える / 実測する
+    # 依頼なのに、それを実行できるツールが無い」という判定結果で、これが立った
+    # ターンは deliberative が ``_UNPERFORMED_ACTION_GUIDANCE`` /
+    # ``_UNMEASURED_FACT_GUIDANCE`` を最後の user メッセージへ足して完了・断定の
+    # 捏造を止める。ところが軽量パスは few-shot/RAG/semmem/tool を全て外すので
+    # 注記も付かず、判定だけログに出て **プロンプトには何も伝わらない**。
+    #
+    # 実インシデント 2026-08-22 ライブ監査 (修正の実機検証): 書込み直後の
+    # 「そのファイルを削除してください。」(16 文字) が short_query で
+    # reactive へ落ち、``Action blocked: file deletion requested but no tool can
+    # delete`` がログに出ていながら回答は「削除しました。」。ファイルは残存。
+    # 判定結果から読む。共有インスタンスの属性を後から読むと、チャットが
+    # 2 本重なったときに他方の judge() がリセット済みでガードが消える
+    # (ToolJudgement.action_blocked のコメント参照)。
+    blocked = judgement is not None and (
+        judgement.action_blocked or judgement.measurement_blocked
+    )
+    if blocked:
+        if judge_task is None:
+            judge_task = asyncio.create_task(_completed(judgement))
+        return "deliberative", judge_task, "blocked_action"
     return "light", judge_task, "judge_no_tool"
 
 
@@ -344,6 +426,7 @@ async def _dispatch_reactive_light(
     req: ChatRequest,
     client,
     state: AppState,
+    cfg: dict,
     gen_params: dict,
     history: list,
     session_id: str,
@@ -351,28 +434,40 @@ async def _dispatch_reactive_light(
     context_size: int,
     max_tokens: int | None,
     timer: StageTimer,
-    conflict_notice: str | None = None,
 ) -> "StreamingResponse | ChatResponse":
-    """Reactive 軽量パス dispatch: 静的 system + 履歴末尾で base 1 ターン (few-shot/RAG/semmem なし)。
+    """Reactive 軽量パス dispatch: 静的 system + 履歴で base 1 ターン (few-shot/RAG/semmem なし)。
 
-    ``conflict_notice`` が指定された場合のみ、記憶の競合セクション
-    (解決通知・確認指示) を system プロンプトに連結して surface する。
-    deliberative の build_semmem_injection と同じ注入機構だが、軽量パスを
-    維持したまま通知を出すための最小注入。
+    ``system`` は静的なまま保つ。以前は記憶の競合セクションをここで連結して
+    いたが、system の書き換えは接頭辞 KV キャッシュの境界そのものを動かす
+    (競合の出現 / 解消 / 採番替えのたびに全損する)。競合の提示は関連度ゲートを
+    掛けられる経路 (build_semmem_injection) だけが担う。
+
+    履歴の切り出しは ``build_chat_messages`` (= ``_trim_history``) に委ねる。
+    以前は ``history[-REACTIVE_LIGHT_HISTORY_TURNS:]`` の **末尾スライド窓**を
+    自前で切っていたが、これは接頭辞キャッシュと最悪の相性で、会話が 1 ターン
+    伸びるたびに ``system`` の直後が別物になり **窓の全体が再プリフィル**される。
+    実測 (2026-08-19): 軽量パス 21 ターンの ``prompt_n`` 中央値 311 に対し、
+    ユーザー本文は 6〜10 文字しかなかった。``_trim_history`` は
+    ``_quantize_history_drop`` で先頭をブロック境界に止めるため、窓はブロックを
+    跨ぐまで不変になる。未キャッシュのトークンはキャッシュ済みの 6〜12 倍高い
+    ので、視界を広げてなお速くなる (2026-08-05 の捏造 2 件はどちらもこの経路の
+    視界の狭さが原因でもあった)。
+
+    軽量さは「RAG / SemMem / few-shot / ツール判定を通さない」ことと
+    ``max_tokens`` の上限で担保しており、履歴を削ることではない。
     """
     system_prompt = _resolve_system_prompt(state, req.mode, instance_name)
-    if conflict_notice:
-        system_prompt = f"{system_prompt}\n\n{conflict_notice}"
-    light_messages: list[ChatMessage] = [{"role": "system", "content": system_prompt}]
-    light_messages.extend(history[-REACTIVE_LIGHT_HISTORY_TURNS:])
-    # 軽量パスは全経路の中で視界が最も狭い (直近 6 メッセージ)。切り詰め注記と
-    # 自己出力の計量は build_chat_messages を通らないここにも掛ける
-    # (2026-08-05 ライブ監査で捏造が起きた 2 ターンはどちらもこの経路だった)。
-    # 押し出し数は WM 側の押し出しに軽量パス自身の切り詰めを足した実効値。
-    apply_grounding_notes(
-        light_messages, history,
-        session_evicted_turns(state)
-        + max(0, len(history) - REACTIVE_LIGHT_HISTORY_TURNS),
+    light_messages = build_chat_messages(
+        system_prompt, history,
+        rag_chunks=None, file_contexts=None,
+        context_size=context_size, max_tokens=max_tokens,
+        working_max_tokens=int(
+            (cfg.get("memory") or {}).get(
+                "working_max_tokens", DEFAULT_WORKING_MAX_TOKENS,
+            ),
+        ),
+        # 軽量パスも切り詰め注記 / 自己出力の計量を通す (build_chat_messages 内)。
+        evicted_turns=session_evicted_turns(state),
     )
     light_max = min(max_tokens or REACTIVE_LIGHT_MAX_TOKENS, REACTIVE_LIGHT_MAX_TOKENS)
     if req.stream:
@@ -420,6 +515,24 @@ async def _run_search_timed(
         )
     finally:
         timer.stop("search_ms")
+
+
+async def _collect_conflicts_timed(
+    state: AppState, cfg: dict, mode: str, timer: StageTimer,
+) -> ConflictTurnContext:
+    """競合収集を ``conflict_ms`` 計測付きで実行する。
+
+    ``collect_review_groups`` は各スコープの ``all_facts()`` 全ロードと属性
+    類似度クラスタリングを **イベントループ上で同期に** 回す。ストアが育った
+    ときに効いてくる場所なのに区間が無く、``search_ms`` / ``semmem_ms`` の
+    どちらにも入っていなかった (``semmem_ms`` を足したのと同じ理由)。
+    内部に await が無いので、ここの実測値はそのままイベントループの占有時間。
+    """
+    timer.start("conflict_ms")
+    try:
+        return await collect_pending_conflicts(state, cfg, mode=mode)
+    finally:
+        timer.stop("conflict_ms")
 
 
 def _cancel_pending_task(task: "asyncio.Task | None") -> None:
@@ -1169,6 +1282,10 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
 
     history, session_id = await prepare_memory_context(req, state)
     file_contexts = convert_file_contexts(req)
+    # このリクエストのツール実行の記録先を確定する。記録自体は実行の合流点
+    # (``ToolsRegistry.execute``) が行い、ここは宛先を渡すだけ
+    # (tool_ledger._current_target のコメント参照)。
+    set_ledger_target(session_id, req.message)
     # system は静的 (query 非依存) に保ち KV キャッシュを効かせる。query 依存の
     # few-shot は動的ブロックとして最後の user メッセージへ前置する (build_messages)。
     system_prompt = _resolve_system_prompt(state, req.mode, instance_name)
@@ -1227,7 +1344,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     try:
         if _realtime_parallel_enabled(state):
             conflict_task = asyncio.create_task(
-                collect_pending_conflicts(state, cfg, mode=req.mode)
+                _collect_conflicts_timed(state, cfg, req.mode, timer),
             )
             if (
                 agent_layer != "meta_cognitive"
@@ -1257,18 +1374,23 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         # reactive→deliberative エスカレート時に Level 0 経験記録の出自を残す。
         escalated_from: str | None = None
 
-        # pending / 解決済み競合がある場合、競合セクション (解決通知・確認指示) を
-        # 必ず surface する必要がある。従来は full deliberative へ昇格していたが、
-        # 雑談返信でも 32-140s かかる。通知ブロックを軽量パス (reactive_light) の
-        # プロンプトへ差し込めば、同じ base 生成機構で surface しつつ重経路を回避
-        # できる (注入機構は deliberative と同一: プロンプト連結 + base 生成。
-        # むしろ短いプロンプトで通知が目立つ)。rule-instant の canned 応答だけは
-        # 通知を運べないため、競合時はスキップして必ず LLM ターンを経由させる。
-        conflict_notice: str | None = None
-        if agent_layer == "reactive" and (
-            conflict_ctx.pending_groups or conflict_ctx.resolved is not None
-        ):
-            conflict_notice = _render_conflict_section(cfg, conflict_ctx)
+        # 競合セクションは reactive / reactive_light には載せない。この 2 経路は
+        # 検索もクエリ埋め込みも走らせないため、注入本体と同じ関連度ゲートを
+        # 掛けられず、無関係な矛盾をそのまま出すことになる。
+        #
+        # かつては「canned 応答では通知を運べない」を理由に rule-instant を
+        # スキップし、通知を軽量パスの **system プロンプトへ連結** していた。
+        # その前提だったチャット内解決 (ユーザーの回答を判定して
+        # apply_resolution へ流す経路) は撤去済みで、ブロックは情報提示のみに
+        # なっている。実測 (2026-08-19): reactive 21 ターン中 14 ターンで
+        # system が書き換わり、挨拶や短文の即答 (ReactiveAgent.process) が
+        # 丸ごと LLM ターンに化けていた。解決は sleep-time と TTL が担うので、
+        # 即答経路を潰す理由は無い。
+        #
+        # 注: 「今は何時ですか？」「今日の日付を教えてください。」は
+        # ``executable_query`` で deliberative に分類されるため、そもそも
+        # rule-instant には到達しない (2026-08-21 に実機で確認)。影響を受ける
+        # のは ``greeting`` / ``short_query`` で reactive に落ちたターン。
 
         if agent_layer == "reactive":
             # URL recall プリチェック: 過去会話で fetch 済みの URL fact が
@@ -1299,13 +1421,8 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                     )
 
         if agent_layer == "reactive":
-            # 競合通知がある場合は canned 即応答 (挨拶/日時/キャッシュ) では通知を
-            # 運べないため rule-instant をスキップし、必ず LLM ターン経由で surface する。
-            reactive_response = (
-                None if conflict_notice
-                else _try_reactive_layer(
-                    req, state, session_id, instance_name, context_size,
-                )
+            reactive_response = _try_reactive_layer(
+                req, state, session_id, instance_name, context_size,
             )
             if reactive_response is not None:
                 # reactive 即応答 (挨拶/日時/キャッシュ) は検索/tool 判定結果を
@@ -1324,16 +1441,15 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 _cancel_pending_task(judge_task)
                 _cancel_pending_task(search_task)
                 _log_layer_escalation(
-                    state, chosen="reactive_light",
-                    reason="conflict_notice" if conflict_notice else gate_reason,
+                    state, chosen="reactive_light", reason=gate_reason,
                 )
                 return await _dispatch_reactive_light(
-                    req, client, state, gen_params, history,
+                    req, client, state, cfg, gen_params, history,
                     session_id, instance_name, context_size, max_tokens, timer,
-                    conflict_notice=conflict_notice,
                 )
             # deliberative へエスカレート (judge_task は tool 実行用に流用される)。
-            # 競合通知は conflict_ctx 経由で build_semmem_injection が surface する。
+            # 競合は conflict_ctx 経由で build_semmem_injection が (関連度ゲート
+            # を通ったときだけ) surface する。
             agent_layer = "deliberative"
             escalated_from = "reactive"
             _log_layer_escalation(state, chosen="deliberative", reason=gate_reason)

@@ -24,7 +24,10 @@ from backend.free.agent.tools.builtin import (
 )
 from backend.free.constants import READ_FILE_META_PREFIX
 from backend.free.core.session_mode import is_create_mode
+from backend.free.agent.tool_ledger import format_ledger
 from backend.free.core.intent_vocab import (
+    own_process_question,
+    persist_request,
     resolve_session_position_message,
     session_position_kind,
     tool_inventory_question,
@@ -91,6 +94,25 @@ _UNMEASURED_FACT_GUIDANCE = (
 #: インタプリタしか許さないため正しく拒否された。その後 base は「追記しました」
 #: と述べ、**存在しない 4 行のファイル内容まで書き出した**。実ファイルは 1 行の
 #: まま無変更だった。
+#: 保存を求められたが保存先が特定できず、ツールを 1 つも撃てなかった場合の文言。
+#:
+#: ``_UNPERFORMED_ACTION_GUIDANCE`` とは理由が違う。あちらは「その操作を実行
+#: できるツールが無い」で確定しており、他の理由を推測することを禁じている。
+#: 保存は ``write_file`` が実在するので、能力が無いのではなく **宛先が無い**。
+#:
+#: 実インシデント (2026-08-22 ライブ監査 2 回目 ターン 252):
+#: 「ファイルに保存しておいて。」に「ファイル保存機能は利用できないため、
+#: 保存できません。」と回答した。同じ会話のターン 122 で ``write_file`` が
+#: 成功しており、能力が無いという説明そのものが誤りだった。
+_WRITE_TARGET_UNKNOWN_GUIDANCE = (
+    "\n\nこの依頼はファイルへの保存を求めているが、保存先のパスが特定できず"
+    "**何も実行していない**。「保存しました」と完了を報告してはならない。"
+    "また、**保存する機能が無い / 利用できない とも述べてはならない** — "
+    "保存自体はこのモードで実行できる。実行していない理由は保存先が"
+    "分からないことだけである。保存先の完全なパス (例: E:\\tmp\\メモ.txt) を"
+    "1 文で尋ねること。"
+)
+
 _UNPERFORMED_ACTION_GUIDANCE = (
     "\n\nこの依頼はファイルやシステムの状態を変える操作を含むが、"
     "今回のターンではその操作を実行できるツールが無く、**何も実行していない**。"
@@ -790,9 +812,62 @@ class DeliberativeAgent:
         return True
 
     @staticmethod
+    def _append_tool_ledger_fact(
+        messages: list[dict], query: str, session_id: str,
+    ) -> bool:
+        """「実際に何を実行したか」に ``tool_ledger`` の実記録を根拠として渡す。
+
+        会話履歴にはツール実行の痕跡が残らないため、窓を越えた自己申告は base の
+        作話になる。実インシデント (2026-08-22 ライブ監査 2 回目 ターン 40):
+        「これまでの計算のうち、ツールを使わず暗算したものはどれですか？」に対し
+        ``calculate`` / ``run_command_readonly`` が繰り返し走っていた 17 件を
+        **すべて暗算だったと申告**した。ツール目録 (`_append_tool_inventory_fact`)
+        と同じ立て付けで、数えるのはコード・モデルは読み上げるだけにする。
+
+        Returns:
+            注記したか。
+        """
+        if not session_id or not own_process_question(query):
+            return False
+        ledger = format_ledger(session_id)
+        if ledger:
+            body = (
+                "\n\n確定事実: この会話でシステムが実際に実行したツールは以下が"
+                "すべてである。これは実行時に機械的に記録した値なので、"
+                "この記録に基づいて答えること。ここに無い実行を述べず、"
+                "記録にある実行を「していない」とも述べないこと。"
+                "一覧に無いターンではツールを実行していない。\n" + ledger
+            )
+        else:
+            body = (
+                "\n\n確定事実: この会話でシステムが実行したツールは 1 件も無い"
+                "(実行記録が空)。ツールを実行したとは述べないこと。"
+            )
+        append_to_last_user(messages, body, separator="")
+        logger.info("Tool ledger fact pinned (session=%s)", session_id[:12])
+        return True
+
+    @staticmethod
     def _append_unmeasured_fact_note(messages: list[dict]) -> None:
         """最後の user メッセージへ「実測できなかった」注記を追記する。"""
         append_to_last_user(messages, _UNMEASURED_FACT_GUIDANCE, separator="")
+
+    @staticmethod
+    def _append_write_target_unknown_note(
+        messages: list[dict], query: str,
+    ) -> bool:
+        """保存依頼なのに宛先が解決できなかったターンへ注記する。
+
+        判定層がツールを 1 つも選ばなかった = 保存先を解決できていない、が
+        呼出条件。``_WRITE_TARGET_UNKNOWN_GUIDANCE`` 参照。
+        """
+        if not persist_request(query):
+            return False
+        append_to_last_user(
+            messages, _WRITE_TARGET_UNKNOWN_GUIDANCE, separator="",
+        )
+        logger.info("Write-target-unknown note pinned: %s", query[:50])
+        return True
 
     @staticmethod
     def _append_unperformed_action_note(messages: list[dict]) -> None:
@@ -800,7 +875,7 @@ class DeliberativeAgent:
         append_to_last_user(messages, _UNPERFORMED_ACTION_GUIDANCE, separator="")
 
     def _append_unperformed_action_note_if_blocked(
-        self, messages: list[dict],
+        self, messages: list[dict], judgement: "ToolJudgement | None" = None,
     ) -> None:
         """ツールが走った場合でも、状態変更が未実行なら注記を足す。
 
@@ -810,7 +885,15 @@ class DeliberativeAgent:
         (実インシデント 2026-08-14 ライブ監査 ターン37)。実行されたツールが
         状態を変えていない以上、注記の要否はツールの有無と独立に決まる。
         """
-        if getattr(self._tool_judge, "action_blocked", False):
+        # 判定結果から読む。共有インスタンスの属性を後から読むと、チャットが
+        # 2 本重なったときに他方の judge() がリセット済みでガードが消える
+        # (ToolJudgement.action_blocked のコメント参照)。judgement を渡せない
+        # 経路のみ従来どおり判定器を見る。
+        blocked = (
+            judgement.action_blocked if judgement is not None
+            else getattr(self._tool_judge, "action_blocked", False)
+        )
+        if blocked:
             self._append_unperformed_action_note(messages)
 
     @staticmethod
@@ -921,6 +1004,13 @@ class DeliberativeAgent:
                 tool_judge_task.cancel()
             return None, None, None, None, None
 
+        # 「実際にツールを使ったか」も同じ — 答えは tool_ledger にあり、
+        # 新たにツールを撃っても増えるのは記録だけで根拠にはならない。
+        if self._append_tool_ledger_fact(messages, query, session_id):
+            if tool_judge_task is not None and not tool_judge_task.done():
+                tool_judge_task.cancel()
+            return None, None, None, None, None
+
         if self._tool_judge is None or self._tools_registry is None:
             # 判定経路が無いなら precomputed タスクも使えない。残っていれば破棄。
             if tool_judge_task is not None and not tool_judge_task.done():
@@ -945,16 +1035,21 @@ class DeliberativeAgent:
                 query, self._tools_registry, mode, conversation or [],
                 session_id=session_id,
             )
+        state.action_blocked = bool(judgement.action_blocked)
         if not (judgement.tool_needed and judgement.tool_name):
             # 確認形で持ち込まれた未検証の数値は、ツールが撃てないターンほど
             # 危険。丸投げすると自分が計算した値を捨てて追認する
             # (_append_unverified_claim_note の docstring 参照)。
             self._append_unverified_claim_note(messages, query, conversation)
-            if getattr(self._tool_judge, "action_blocked", False):
+            # 保存依頼で宛先が解決できなかった場合は「能力が無い」ではなく
+            # 「宛先が分からない」— 理由を取り違えると同じ会話で成功している
+            # write_file を「利用できない」と説明してしまう。
+            self._append_write_target_unknown_note(messages, query)
+            if judgement.action_blocked:
                 # 状態を変えようとして撃てなかった。丸投げすると「追記しました」
                 # と完了を捏造する (_UNPERFORMED_ACTION_GUIDANCE 参照)。
                 self._append_unperformed_action_note(messages)
-            elif getattr(self._tool_judge, "measurement_blocked", False):
+            elif judgement.measurement_blocked:
                 # 実測を試みたが撃てなかった。この状態で base に丸投げすると
                 # 測っていない値を断定する (_UNMEASURED_FACT_GUIDANCE 参照)。
                 self._append_unmeasured_fact_note(messages)
@@ -982,7 +1077,7 @@ class DeliberativeAgent:
             self._append_tool_result_to_last_user(
                 messages, judgement.tool_name, prompt_result_text, query=query,
             )
-            self._append_unperformed_action_note_if_blocked(messages)
+            self._append_unperformed_action_note_if_blocked(messages, judgement)
             # 成否は下の通常経路と同じ SSOT (tool_result_succeeded) で決める。
             # 以前は success を True 固定で書いており、0 件検索が reward=1.0 で
             # 正例として記録されるという、まさに tool_result_succeeded が塞いだ
@@ -1024,7 +1119,7 @@ class DeliberativeAgent:
         # 実行段の失敗はこれまで何の注記も伴っていなかった。
         if is_tool_error(tool_result_text):
             self._append_unmeasured_fact_note(messages)
-        self._append_unperformed_action_note_if_blocked(messages)
+        self._append_unperformed_action_note_if_blocked(messages, judgement)
         # 「実行できた」ではなく「役に立つ結果が出た」を成否とする (SSOT)。
         # 非ゼロ終了の run_command / 0 件の search_history を成功にすると、
         # executable_command の SemMem 学習と tool_routing の選択圧が汚染される。
@@ -1111,6 +1206,9 @@ class DeliberativeAgent:
             # 頼ったターンを事後に切り分けられるようにする)。
             tool_capture["tool_name"] = tool_name_used
             tool_capture["tool_success"] = tool_success
+            # 当ターンの「撃てなかった」印。共有インスタンスの属性を記録側が
+            # 後から読むと並行リクエストで消えるため、ここで確定値を渡す。
+            tool_capture["action_blocked"] = bool(state.action_blocked)
 
         # ツール結果に基づく接地回答は創作不要。chat 既定 0.7 のままだと weak base が
         # 非決定的に拒否/話題混同しやすい (実機: ニュースで 0.7→~25%拒否、0.2→安定)。

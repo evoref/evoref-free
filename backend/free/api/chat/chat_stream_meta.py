@@ -247,6 +247,31 @@ async def _emit_meta_cognitive_result_frames(resp) -> AsyncIterator[str]:
         yield sse.token(resp.content)
 
 
+def meta_cognitive_recorded_text(resp) -> str:
+    """履歴・WM へ記録する本文 — **UI に出したのと同じテキスト** を返す。
+
+    以前は表示だけ ``_meta_cognitive_body_text`` で浄化し、記録は
+    ``resp.content`` (= タスク進捗ノートの生文) を使っていた。結果、履歴には
+    ``- [done] Create … / Written 373 bytes to …`` が残り、次のターンで
+    ベースがその形式を **模倣** する。模倣は deliberative 層から出るので
+    ここの浄化を通らず、そのままユーザーへ届く。
+
+    実インシデント 2026-08-22 ライブ監査 (ターン77-78): ファイル書込みの次に
+    「そのファイルを削除してください」と頼むと、削除ツールは存在せず
+    ``tool_call_judge`` も ``Action blocked: file deletion requested but no tool
+    can delete`` を出していたのに、回答は
+    ``[done] Delete the file E:\\tmp\\bs_audit.py``。続く「本当に削除できたか
+    確認してください」も ``[done] Confirm the file … has been deleted``。
+    実行していない操作を 2 ターン続けて完了として提示していた
+    (ファイルは実際に残っていた)。
+    """
+    if resp is None:
+        return ""
+    if resp.tasks:
+        return _meta_cognitive_body_text(resp)
+    return resp.content or ""
+
+
 def _finalize_meta_cognitive_stream(
     resp,
     *,
@@ -275,7 +300,7 @@ def _finalize_meta_cognitive_stream(
         steps, tool_calls_count, elapsed,
     )
 
-    content = resp.content if resp else ""
+    content = meta_cognitive_recorded_text(resp)
     step_credits = resp.step_credits if resp else []
     estimated_tokens = max(1, _estimate_tokens(content))
     record_meta_cognitive_response(
@@ -445,7 +470,9 @@ async def sync_meta_cognitive(
 
         # 非ストリームではエディタチャネルが無いため、エディタ経路の生成コードは
         # コードブロックとして応答本文に畳み込む (CLI 等で内容を失わない)。
-        response_text = resp.content
+        # 非ストリームでも本文はストリームと同じ浄化を通す
+        # (meta_cognitive_recorded_text の説明を参照)。
+        response_text = meta_cognitive_recorded_text(resp)
         editor_artifacts = getattr(resp, "editor_artifacts", None)
         if editor_artifacts:
             blocks = "\n\n".join(

@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from backend.log_config import get_logger
+from backend.free.memory.volatile_values import is_volatile_measurement_report
 from backend.free.memory.notes.note_builder import get_note_builder
 from backend.free.memory.notes.pin_detector import (
     PinTriggers,
@@ -246,6 +247,17 @@ class ShortTermMemory:
             logger.debug(
                 "absorb: skip tool_output turn (mode=%s, session=%s, len=%d)",
                 mode, session_id, len(content),
+            )
+            return None
+
+        # ツール出力を **言い直した** アシスタント発話も同じ扱いにする。
+        # ここを通すと ``is_tool_output`` の除外が 1 ホップで迂回され、揮発する
+        # 計測値がエピソード記憶に焼き付く (詳細は
+        # :func:`is_volatile_measurement_report` の docstring)。
+        if role == "assistant" and is_volatile_measurement_report(content):
+            logger.debug(
+                "absorb: skip volatile measurement report (session=%s, len=%d)",
+                session_id, len(content),
             )
             return None
 

@@ -26,6 +26,8 @@ import re
 from collections.abc import Iterable
 
 from backend.free.core.text_quality import (
+    _asserts_before_request,
+    _REQUEST_ENDING_RE,
     strip_discourse_prefix,
     strip_first_person_topic,
     strip_interrogative_sentences,
@@ -37,7 +39,8 @@ from backend.free.memory.extractors.base import (
 )
 from backend.free.memory.notes.note_builder import (
     ChatNoteBuilder,
-    resolve_fact_attribute,
+    _normalize_trigger,
+    resolve_fact_attribute_match,
 )
 from backend.free.memory.stores.short_term import MemoryNote
 from backend.free.memory.notes.subject_ns import make_mem_subject
@@ -59,6 +62,14 @@ _KIND_BY_TAG: dict[str, str] = {
 # chat extractor で生成する subject の固定「parts」(= user を主語とする)
 _USER_SUBJECT_TAGS: frozenset[str] = frozenset(
     {"personal_fact", "preference", "emotion", "opinion"},
+)
+
+#: 走査順を固定した版 (frozenset の反復順は実行ごとに変わりうる)。
+_USER_SUBJECT_TAGS_ORDERED: tuple[str, ...] = (
+    "personal_fact",
+    "preference",
+    "emotion",
+    "opinion",
 )
 
 _PREDICATE_BY_TAG: dict[str, str] = {
@@ -132,70 +143,6 @@ _QUESTION_ENDING_RE = re.compile(
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?])\s*")
 
 
-#: アシスタントへの **依頼** の文末。疑問形ではないが、ユーザー自身の事実の
-#: 表明でもない。
-#:
-#: 実インシデント (2026-08-18 ライブ監査): 「データ分析で**よく使う**可視化
-#: ライブラリを 3 つ挙げてください。」が preference トリガ ``よく使う`` に
-#: 一致し、依頼文がまるごと ``mem.preference.user`` の object として保存された。
-#: 疑問符も「〜ですか」も無いため ``_QUESTION_ENDING_RE`` では拾えない。
-_REQUEST_ENDING_RE = re.compile(
-    r"(?:(?:て|で)(?:ください|下さい)"
-    r"|(?:して|で)(?:ほしい|欲しい)"
-    r"|お願いします|願います"
-    r"|(?:教え|挙げ|見せ|出し|作っ|書い|説明し|列挙し|示し)て)"
-    r"[。．.、,！!\s\"'」』）)]*\s*$",
-)
-
-#: 一人称マーカー。依頼形でもこれを伴う文は本人の事実表明を含みうるため
-#: (例:「私はダークテーマが好きなので、そう設定してください。」)、依頼を
-#: 理由に捨てない。ただし **一人称があるだけでは免除しない** —
-#: :func:`_asserts_before_request` を参照。
-_SELF_REFERENCE_RE = re.compile(r"(?:私|僕|俺|自分|わたし|ぼく|うち)")
-
-#: 従属節の切れ目 (接続助詞 + 読点)。依頼文の中で「言明の節」と「依頼の節」を
-#: 分ける境界として使う。読点を必須にするのは、体言の並列 (「AとB、Cを…」) を
-#: 節の切れ目と誤認しないため。
-#:
-#: 実インシデント (2026-08-19 ライブ監査): 「私の好きな飲み物をもう一度教えて
-#: ください。」が ``mem.personal.beverage states`` / ``mem.preference.beverage
-#: prefers`` の 2 件として保存され、さらに本人の実際の言明
-#: (「私の好きな飲み物は緑茶です」) と同じ (subject, predicate) に並んだため
-#: 競合の当事者になり pending に滞留した。依頼形ゲート自体は存在したが、
-#: 一人称を含むだけで無条件に免除していたため機能していなかった。
-#:
-#: ``で`` / ``て`` は入れない。「私の好きな飲み物を調べて、教えてください。」の
-#: ような**依頼の中の依頼**まで免除してしまい、直そうとしている誤りが戻る。
-#: 取りこぼす側 (「私は東京在住で、近くの店を教えてください。」) の損失は
-#: 候補 1 件であり、ゴミを入れる損失より小さい。
-_CLAUSE_BREAK_RE = re.compile(
-    r"(?:ので|のに|から|ため|けれども|けれど|けど|ですが|だが|ますが)[、,]",
-)
-
-
-def _asserts_before_request(sentence: str) -> bool:
-    """依頼文が、依頼節より **前の節** に本人の言明を含むかを判定する。
-
-    一人称の有無だけで判定すると、一人称が依頼の**目的語**でしかない文
-    (「私の好きな飲み物をもう一度教えてください。」) まで本人の表明として
-    通ってしまう。言明は依頼とは別の節に立つはずなので、従属節の切れ目
-    (:data:`_CLAUSE_BREAK_RE`) より前に一人称があることを要求する。
-
-    - ``私はダークテーマが好きなので、そう設定してください。`` → ``ので、``
-      より前に「私」がある → True (本人の表明を含む)
-    - ``私の好きな飲み物をもう一度教えてください。`` → 節の切れ目が無い
-      → False (依頼でしかない)
-    - ``明日の予定を、私の代わりに調べてください。`` → 読点はあるが接続助詞
-      ではなく、そもそも「私」は読点より後 → False
-    """
-    last_break = -1
-    for m in _CLAUSE_BREAK_RE.finditer(sentence):
-        last_break = m.end()
-    if last_break < 0:
-        return False
-    return bool(_SELF_REFERENCE_RE.search(sentence[:last_break]))
-
-
 def _tag_evidence_is_question_only(content: str, trigger_words: tuple[str, ...]) -> bool:
     """トリガ語を含む文が、すべて **ユーザー自身の表明でない** かを判定する。
 
@@ -223,6 +170,10 @@ def _tag_evidence_is_question_only(content: str, trigger_words: tuple[str, ...])
         return False
 
     def _is_non_assertive(sentence: str) -> bool:
+        # 疑問の判定だけ抽出側の式を使う。読み出し側 (text_quality) の
+        # ``_INTERROGATIVE_TAIL_RE`` は語尾の閉じた集合で、こちらは
+        # 「丁寧形の助動詞 + か」を拾う (体言止めの取りこぼしが違う)。
+        # 依頼形の判定は共通実装を使う。
         s = sentence.strip()
         if _QUESTION_ENDING_RE.search(s):
             return True
@@ -231,6 +182,39 @@ def _tag_evidence_is_question_only(content: str, trigger_words: tuple[str, ...])
         return not _asserts_before_request(s)
 
     return all(_is_non_assertive(s) for s in relevant)
+
+
+def _attribute_evidence_text(content: str, attr_words: tuple[str, ...]) -> str:
+    """``attr_words`` を含む文だけを連結して返す (絞れなければ空文字列)。
+
+    1 発話で複数の属性を述べても、fact の subject は 1 つしか付かない。
+    object に発話全文を入れると、その subject と無関係な値まで同居する。
+    実インシデント 2026-08-22 ライブ監査 (100 ターン): 初回の自己紹介
+    「私の名前は小川です。いま取り組んでいるプロジェクトは EvorefAudit と
+    いう名前で、締め切りは 2026年9月30日です。」が丸ごと
+    ``mem.personal.name`` の object になった。その後ユーザーは
+    プロジェクト名と締め切りを訂正したが、訂正は
+    ``mem.world.assertion.deadline_correction`` 等の **別 subject** に入るため
+    ``mem.personal.name`` は supersede されない。結果、両方が
+    ``[関連する記憶]`` に並び、より直截な自己申告に見える古い方が採用されて
+    「EvorefAudit / 2026年9月30日」と回答した。
+
+    絞り込みは **文が 2 つ以上あり、実際に減る** ときだけ行う。該当文が
+    無い / 全文が該当する場合は空文字列を返し、呼出側は従来どおり全文を使う。
+    """
+    if not attr_words or not content:
+        return ""
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(content) if s.strip()]
+    if len(sentences) < 2:
+        return ""
+    kept = [
+        s for s in sentences
+        if any(w in _normalize_trigger(s) for w in attr_words)
+    ]
+    if not kept or len(kept) == len(sentences):
+        return ""
+    return "".join(kept).strip()
+
 
 #: 規則ベース正規化で残す文の下限 (これ未満なら正規化失敗として原文を使う)。
 _STATEMENT_MIN_CHARS = 2
@@ -460,19 +444,36 @@ def resolve_inherited_attributes(
     ordered = sorted(
         notes, key=lambda n: (n.session_id or "", float(n.created_at or 0.0)),
     )
-    last_named: dict[tuple[str, str], str] = {}
+    #: セッションごとの「直近で属性が確定した 1 発話」の tag -> attribute。
+    #:
+    #: 継承は **その 1 発話が解決したスロットだけ** を丸ごと写す。タグごとに
+    #: 独立した「最後に見た属性」を継ぐと、別々の発話に由来する無関係な
+    #: スロットが 1 件の訂正へ同時に流れ込む。実インシデント (2026-08-23
+    #: ライブ監査): 算術の訂正 1 件が mem.personal.birthday と
+    #: mem.preference.food の両方へ書かれ、どちらも supersede されずに残った。
+    #:
+    #: 同一発話が複数タグで同じ属性を解決した場合 (「私の好きな飲み物は緑茶です」
+    #: は personal_fact / preference の双方が beverage) は両方を継ぐ — 先行発話の
+    #: スロット構成をそのまま写すだけなので、無関係なスロットは混ざらない。
+    last_resolved: dict[str, dict[str, str]] = {}
     inherited: dict[tuple[str, str], str] = {}
     for note in ordered:
         content = note.content or ""
-        for tag in _USER_SUBJECT_TAGS:
-            key = (note.session_id or "", tag)
-            attr = resolve_fact_attribute(
+        session = note.session_id or ""
+        resolved: dict[str, str] = {}
+        for tag in _USER_SUBJECT_TAGS_ORDERED:
+            attr, _words = resolve_fact_attribute_match(
                 content, tag, mode="chat", triggers_dir=builder.triggers_dir,
             )
             if attr:
-                last_named[key] = attr
-            elif getattr(note, "is_correction", False) and key in last_named:
-                inherited[(note.id, tag)] = last_named[key]
+                resolved[tag] = attr
+        if resolved:
+            last_resolved[session] = resolved
+            continue
+        if not getattr(note, "is_correction", False):
+            continue
+        for tag, attr in (last_resolved.get(session) or {}).items():
+            inherited[(note.id, tag)] = attr
     return inherited
 
 
@@ -544,6 +545,8 @@ class ChatExtractor(BaseExtractor):
                     continue
                 fact_type: FactType = tag  # type: ignore[assignment]
                 kind = _KIND_BY_TAG[tag]
+                #: この fact の根拠に絞った本文 (絞れなければ発話全文)。
+                evidence = content
                 if tag in _USER_SUBJECT_TAGS:
                     # ファイル出力の指示文 (明示パス付き) は嗜好/感情ではなく
                     # 作業依頼なので preference/emotion/opinion にしない。
@@ -563,7 +566,7 @@ class ChatExtractor(BaseExtractor):
                     # (コメント方針 vs GPU 仕様) まで同一事実の競合版と誤判定され
                     # 恒久 pending 化する (2026-07-25)。辞書に無ければ従来どおり
                     # "user" へフォールバックするので退行しない。
-                    attr = resolve_fact_attribute(
+                    attr, attr_words = resolve_fact_attribute_match(
                         content, tag, mode="chat",
                         triggers_dir=self._builder.triggers_dir,
                     )
@@ -572,9 +575,23 @@ class ChatExtractor(BaseExtractor):
                     if attr is None:
                         attr = inherited.get((note.id, tag))
                     subject = make_mem_subject(kind, attr or "user")
+                    # subject が属性単位なら object もその属性の根拠文に絞る
+                    # (_attribute_evidence_text の説明を参照)。
+                    evidence = _attribute_evidence_text(content, attr_words) or content
                 else:
-                    # world_fact のみ: keyword (sanitized) + 内容ハッシュを
-                    # parts に使用 (keyword 単独では subject が衝突する)
+                    # world_fact もユーザーが断定した知識に限る。トリガ語
+                    # (「とは」「である」) を含む文が疑問形/依頼形しかない
+                    # ノートは、_USER_SUBJECT_TAGS と同じ理由で候補にしない。
+                    # このガードが world_fact 側だけ抜けていたため、質問文が
+                    # そのまま「世界の事実」になっていた (2026-08-22 ライブ監査:
+                    # mem.world.RRF.3fa274d4 is:「RRF (Reciprocal Rank Fusion)
+                    # とは何ですか？」)。
+                    if _tag_evidence_is_question_only(
+                        content, self._builder.fact_triggers.get(tag, ()),
+                    ):
+                        continue
+                    # keyword (sanitized) + 内容ハッシュを parts に使用
+                    # (keyword 単独では subject が衝突する)
                     keyword = _world_fact_keyword(note)
                     if keyword == _SAFE_KEYWORD_FALLBACK:
                         # 有効な keyword を導けないノートは world_fact 化しない
@@ -591,12 +608,12 @@ class ChatExtractor(BaseExtractor):
                     # (2026-08-16 監査時点の実データ:
                     #  mem.emotion.user feels: 夜更かしすると次の日つらいですよね。
                     #  何かいい対策ありますか？)
-                    object_text=strip_interrogative_sentences(note.content or ""),
+                    object_text=strip_interrogative_sentences(evidence),
                     # 規則で切り出せる分だけ命題化する。object (原文) は証拠として
                     # 残し、提示・比較・埋め込みは fact.text 経由で statement を
                     # 優先する。切り出せなければ None のままで従来と同じ挙動。
                     statement=normalize_statement(
-                        note.content or "",
+                        evidence,
                         tuple(self._builder.fact_triggers.get(tag, ())),
                     ),
                     fact_type=fact_type,

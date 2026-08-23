@@ -10,6 +10,9 @@ from typing import Any
 
 from backend.log_config import get_logger
 
+from backend.free.agent.meta_cognitive_tool_io import tool_result_succeeded
+from backend.free.agent.tool_ledger import record_current
+
 logger = get_logger("agent.tools_registry")
 
 
@@ -194,9 +197,16 @@ class ToolsRegistry:
         logger.info("Executing tool: %s(%s)", name, kwargs)
 
         if inspect.iscoroutinefunction(tool.func):
-            return await tool.func(**kwargs)
-        # 同期関数はスレッドプールで実行し、イベントループをブロックしない
-        return await asyncio.to_thread(tool.func, **kwargs)
+            result = await tool.func(**kwargs)
+        else:
+            # 同期関数はスレッドプールで実行し、イベントループをブロックしない
+            result = await asyncio.to_thread(tool.func, **kwargs)
+
+        # 自己申告の根拠 (「この会話で実際に何を実行したか」)。実行経路は 6 箇所に
+        # 分かれているので、記録は **唯一の合流点であるここ** で行う。呼出側に
+        # 配ると必ず取りこぼす (詳細は tool_ledger._current_target のコメント)。
+        record_current(name, tool_result_succeeded(name, str(result)))
+        return result
 
     @staticmethod
     def _validate_args(tool: ToolDefinition, kwargs: dict[str, Any]) -> str | None:

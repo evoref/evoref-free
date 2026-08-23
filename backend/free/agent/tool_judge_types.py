@@ -20,6 +20,19 @@ class ToolJudgement:
     #: 実行したときだけ入り、回答側でその値の出所を開示させるために使う
     #: (``_suppress_ungrounded_calculate`` 参照)。
     unexplained_numbers: tuple[str, ...] = ()
+    #: このターンで「状態を変える操作を選んだが実行できなかった」か。
+    #:
+    #: 以前は ``ToolCallJudge`` のインスタンス属性 (``_action_blocked``) に置き、
+    #: 呼出側は ``state.tool_call_judge`` を後から読んでいた。判定器は
+    #: **プロセス唯一の共有インスタンス** で ``judge()`` の中に ``await`` が
+    #: あるため、チャットが 2 本重なると片方の ``judge()`` が他方の読み取り前に
+    #: フラグをリセットする。読み手は 4 箇所 (reactive-light ゲート / 経験記録 /
+    #: deliberative の注記 2 箇所) にあり、どれも judge() 完了後の別タイミング。
+    #: 失われるのは「やっていない操作を完了と言わせない」ガードなので、
+    #: リクエスト毎の値は判定結果そのものに載せる。
+    action_blocked: bool = False
+    #: このターンで「実測しようとしたが実行できなかった」か (上と同じ理由)。
+    measurement_blocked: bool = False
 
     def __post_init__(self):
         if self.tool_args is None:

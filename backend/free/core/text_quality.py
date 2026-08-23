@@ -274,6 +274,106 @@ def asks_verbatim_excerpt(query: str) -> bool:
     return bool(_VERBATIM_EXCERPT_RE.search(query or ""))
 
 
+#: ``_append_self_output_measurement`` がプロンプトへ差し込む実測値行の目印。
+#: 抽出側 (``extract_measured_values``) と注入側 (chat_service) で共有する。
+SYSTEM_MEASUREMENT_MARKER = "[システム計測]"
+
+#: 「86 文字」「12 行」「200 語」のような 数値 + 単位。
+_MEASURED_VALUE_RE = re.compile(r"(\d+)\s*(文字|行|語)")
+
+
+def extract_measured_values(text: str) -> dict[str, set[int]]:
+    """``[システム計測]`` 行から ``{単位: 実測値集合}`` を取り出す (純粋関数)。
+
+    実測値を注入したターンだけ、その数値と応答の食い違いを検出できるように
+    するための入力。マーカー行が無ければ空 dict。
+    """
+    out: dict[str, set[int]] = {}
+    for line in (text or "").splitlines():
+        if SYSTEM_MEASUREMENT_MARKER not in line:
+            continue
+        for num, unit in _MEASURED_VALUE_RE.findall(line):
+            out.setdefault(unit, set()).add(int(num))
+    return out
+
+
+def contradicts_measured_values(
+    response: str, measured: dict[str, set[int]],
+) -> str | None:
+    """応答が注入済みの実測値と食い違う数値を述べていれば理由を返す (純粋関数)。
+
+    「数えるのはコード、モデルは読み上げるだけ」という前提 (``[システム計測]``
+    の注入) が破られたターンを検出する。実インシデント 2026-08-22 ライブ監査:
+    「ちょうど100文字で要約して」に 86 文字で答えた次のターン、実測値
+    (86 / 84 文字) を注入済みだったにもかかわらず「100文字です」と断定した。
+    要求した数をそのまま復唱しており、**検証可能な量の虚偽申告**になっている。
+
+    同じ単位で、注入した値のどれとも一致しない数値を述べたときだけ失敗とする
+    (単位ごとに独立。注入していない単位は判定しない)。
+    """
+    if not measured or not response:
+        return None
+    for num, unit in _MEASURED_VALUE_RE.findall(response):
+        known = measured.get(unit)
+        if known and int(num) not in known:
+            return (
+                f"asserted {num} {unit} but the injected measurement was "
+                f"{sorted(known)}"
+            )
+    return None
+
+
+#: 状態変更の **完了** を述べる言い回し。丁寧過去 (「削除しました」) と
+#: 「〜済み」だけを見る。否定形 (「削除できていません」「削除していません」) は
+#: ``しました`` に一致しないので自然に外れ、疑問形 (「削除しましたか」) は
+#: 直後の ``か`` で除外する。
+_COMPLETION_CLAIM_RE = re.compile(
+    r"(?:削除|消去|作成|生成|書き込み|書込み|追記|保存|上書き|更新|移動|コピー"
+    r"|リネーム|改名|実行|適用)"
+    r"(?:を)?(?:し|いたし|完了し)?(?:ました(?![かがのけ])|済みです|済みました)",
+)
+
+
+def claims_completed_state_change(text: str) -> str | None:
+    """本文が状態変更の完了を述べていれば、その語を返す (純粋関数)。
+
+    「撃てるツールが無かった」ことをシステムが既に知っているターンで使う。
+    知っている側と述べている側が食い違うので、真偽の推定ではなく **矛盾の検出**
+    になる。実インシデント 2026-08-22 ライブ監査: ``tool_call_judge`` が
+    ``Action blocked: file deletion requested but no tool can delete`` を出して
+    いたターンで、応答は「削除しました。」。ファイルは実際に残っていた。
+    """
+    m = _COMPLETION_CLAIM_RE.search(text or "")
+    return m.group(0) if m else None
+
+
+#: 進捗ノートの断片。行頭アンカーの ``_TASK_LOG_LINE_RE`` (agent 側) では
+#: 落とし切れない、ノート行が他のテキストと 1 行に連結された形も拾う
+#: (実インシデント 2026-07-29 ライブ監査: 改行を含む本文の書込み依頼で、応答本文が
+#: ``行2 行3' to the file E:\tmp\audit_r9.txt / … Written 16 bytes to …``
+#: という内部タスク文の断片になった)。
+#:
+#: EvorefMem (注入側) と EvorefLoop (生成側) の両方から使うため core に置く。
+_TASK_LOG_FRAGMENT_RE = re.compile(
+    r"Written\s+\d+\s+bytes\s+to\s+\S"
+    r"|\[(?:done|failed|skipped)\]\s",
+)
+
+
+def looks_like_task_log_residue(text: str) -> bool:
+    """テキストが進捗ノートの残骸 (ユーザー向け本文ではない) かを判定する (純粋関数)。
+
+    生成側では ``strip_task_log_scaffold`` で落とし切れなかった断片の検出に、
+    注入側では **既に記憶へ入ってしまった残骸** を再注入しないために使う。
+
+    実インシデント 2026-08-22 ライブ監査: 記録側の浄化漏れで
+    ``- [done] Confirm the file E:\tmp\bs_audit.py has been deleted`` が
+    STM ノートになり、次の会話でも ``(過去の記録)`` として注入されていた。
+    記録側を直しても、既存ノートは寿命が尽きるまで残る。
+    """
+    return bool(_TASK_LOG_FRAGMENT_RE.search(text or ""))
+
+
 #: 本文に占めるコードフェンス内テキストの比率がこれ以上なら「ペイロードの
 #: 貼り付け」とみなす。
 #:
@@ -460,6 +560,71 @@ def strip_first_person_topic(text: str) -> str:
     return _FIRST_PERSON_TOPIC_RE.sub("", text or "", count=1)
 
 
+#: アシスタントへの **依頼** の文末。疑問形ではないが、ユーザー自身の事実の
+#: 表明でもない。
+#:
+#: 実インシデント (2026-08-18 ライブ監査): 「データ分析で**よく使う**可視化
+#: ライブラリを 3 つ挙げてください。」が preference トリガ ``よく使う`` に
+#: 一致し、依頼文がまるごと ``mem.preference.user`` の object として保存された。
+#: 疑問符も「〜ですか」も無いため ``_QUESTION_ENDING_RE`` では拾えない。
+_REQUEST_ENDING_RE = re.compile(
+    r"(?:(?:て|で)(?:ください|下さい)"
+    r"|(?:して|で)(?:ほしい|欲しい)"
+    r"|お願いします|願います"
+    r"|(?:教え|挙げ|見せ|出し|作っ|書い|説明し|列挙し|示し)て)"
+    r"[。．.、,！!\s\"'」』）)]*\s*$",
+)
+
+#: 一人称マーカー。依頼形でもこれを伴う文は本人の事実表明を含みうるため
+#: (例:「私はダークテーマが好きなので、そう設定してください。」)、依頼を
+#: 理由に捨てない。ただし **一人称があるだけでは免除しない** —
+#: :func:`_asserts_before_request` を参照。
+_SELF_REFERENCE_RE = re.compile(r"(?:私|僕|俺|自分|わたし|ぼく|うち)")
+
+#: 従属節の切れ目 (接続助詞 + 読点)。依頼文の中で「言明の節」と「依頼の節」を
+#: 分ける境界として使う。読点を必須にするのは、体言の並列 (「AとB、Cを…」) を
+#: 節の切れ目と誤認しないため。
+#:
+#: 実インシデント (2026-08-19 ライブ監査): 「私の好きな飲み物をもう一度教えて
+#: ください。」が ``mem.personal.beverage states`` / ``mem.preference.beverage
+#: prefers`` の 2 件として保存され、さらに本人の実際の言明
+#: (「私の好きな飲み物は緑茶です」) と同じ (subject, predicate) に並んだため
+#: 競合の当事者になり pending に滞留した。依頼形ゲート自体は存在したが、
+#: 一人称を含むだけで無条件に免除していたため機能していなかった。
+#:
+#: ``で`` / ``て`` は入れない。「私の好きな飲み物を調べて、教えてください。」の
+#: ような**依頼の中の依頼**まで免除してしまい、直そうとしている誤りが戻る。
+#: 取りこぼす側 (「私は東京在住で、近くの店を教えてください。」) の損失は
+#: 候補 1 件であり、ゴミを入れる損失より小さい。
+_CLAUSE_BREAK_RE = re.compile(
+    r"(?:ので|のに|から|ため|けれども|けれど|けど|ですが|だが|ますが)[、,]",
+)
+
+
+def _asserts_before_request(sentence: str) -> bool:
+    """依頼文が、依頼節より **前の節** に本人の言明を含むかを判定する。
+
+    一人称の有無だけで判定すると、一人称が依頼の**目的語**でしかない文
+    (「私の好きな飲み物をもう一度教えてください。」) まで本人の表明として
+    通ってしまう。言明は依頼とは別の節に立つはずなので、従属節の切れ目
+    (:data:`_CLAUSE_BREAK_RE`) より前に一人称があることを要求する。
+
+    - ``私はダークテーマが好きなので、そう設定してください。`` → ``ので、``
+      より前に「私」がある → True (本人の表明を含む)
+    - ``私の好きな飲み物をもう一度教えてください。`` → 節の切れ目が無い
+      → False (依頼でしかない)
+    - ``明日の予定を、私の代わりに調べてください。`` → 読点はあるが接続助詞
+      ではなく、そもそも「私」は読点より後 → False
+    """
+    last_break = -1
+    for m in _CLAUSE_BREAK_RE.finditer(sentence):
+        last_break = m.end()
+    if last_break < 0:
+        return False
+    return bool(_SELF_REFERENCE_RE.search(sentence[:last_break]))
+
+
+
 def carries_no_assertion(text: str) -> bool:
     """本文が疑問だけで、知識としての主張を含まないかを判定する (純粋関数)。
 
@@ -477,10 +642,54 @@ def carries_no_assertion(text: str) -> bool:
     return all(_INTERROGATIVE_TAIL_RE.search(s) for s in sentences)
 
 
+def states_no_user_value(text: str) -> bool:
+    """本文が **ユーザーについての値** を述べていないかを判定する (純粋関数)。
+
+    :func:`carries_no_assertion` (問いだけか) より広く、**純粋な依頼**も
+    「値ではない」と扱う。依頼はノートとしては残す価値がある (「明日までに
+    資料をまとめてください。」は後から引きたい) ので
+    ``carries_no_assertion`` は変えず、**ファクトの値として扱ってよいか**を
+    問う場面だけこちらを使う:
+
+    - ``[関連する記憶]`` へ「(personal_fact) mem.personal.X states: …」と
+      **断定形**で並べるとき (:class:`MemoryInjector`)
+    - ``[記憶の競合]`` の当事者として「旧/新」を付けて並べるとき
+      (:func:`collect_review_groups`)
+
+    実インシデント (2026-08-19 ライブ監査): 「私の好きな飲み物をもう一度
+    教えてください。」が ``mem.personal.beverage states`` /
+    ``mem.preference.beverage prefers`` の 2 件として保存され、本人の実際の
+    言明と同じスロットに並んで **競合の当事者**になり pending に滞留した。
+    抽出側には依頼形ゲートがあるが (``extractors/chat.py``)、それ以前に
+    保存された行は残り続けるため読み出し側にも同じ判定が要る。
+    実測 (2026-08-21、実ストア): active 146 件中 21 件が依頼形で、うち
+    **14 件が飲み物スロット**に滞留していた。
+
+    依頼節より前の節に本人の言明がある複合文 (「私は〜なので、〜して
+    ください。」) は事実表明を兼ねるので落とさない
+    (:func:`_asserts_before_request`)。
+    """
+    sentences = [s.strip() for s in _SENTENCE_RE.findall(text or "")]
+    sentences = [s for s in sentences if s]
+    if not sentences:
+        return True
+    return all(_is_non_assertive_sentence(s) for s in sentences)
+
+
+def _is_non_assertive_sentence(sentence: str) -> bool:
+    """1 文が「値の表明ではない」か (疑問形 または 純粋な依頼形)。"""
+    if _INTERROGATIVE_TAIL_RE.search(sentence):
+        return True
+    if not _REQUEST_ENDING_RE.search(sentence):
+        return False
+    return not _asserts_before_request(sentence)
+
+
 __all__ = [
     "asks_verbatim_excerpt",
     "is_payload_dump",
     "carries_no_assertion",
+    "states_no_user_value",
     "conversational_numeric_claims",
     "find_superseded_claim",
     "has_boilerplate_closing",
@@ -493,6 +702,8 @@ __all__ = [
     "strip_interrogative_sentences",
     "strip_discourse_prefix",
     "strip_first_person_topic",
+    "match_length_directive",
+    "violates_length_constraint",
 ]
 
 #: 応答の途中で自分の結論を撤回する言い回し。1 つの応答に結論が 2 つ入る。
@@ -512,6 +723,136 @@ _SELF_RETRACTION_RE = re.compile(
 )
 
 
+#: 「A と答えましたが、正しくは B」型の訂正フレーム。A と B を取り出す。
+#:
+#: 謝罪語を伴わない訂正 (``_SELF_RETRACTION_RE`` が要求する形) を拾うためでは
+#: なく、**訂正として退化しているか** を見るために使う。訂正は「誤った値 A を
+#: 正しい値 B に置き換える」構造なので、**A == B なら訂正が成立していない**。
+#: これは語形ではなく構造から決まるので、言い回しを列挙する必要がない。
+#:
+#: 実インシデント (2026-08-23 ライブ監査): 「1234 × 5678 の答えを「7,006,652」と
+#: 答えましたが、**正しくは 7,006,652 であり**、ここは正しくありません
+#: （※実際には計算ミスではなく正解ですが…）」が few-shot の手本に載っていた。
+#: 謝罪語が無いため ``_SELF_RETRACTION_RE`` は非マッチ。
+_DEGENERATE_CORRECTION_RE = re.compile(
+    # ``before`` は「と答え」の直前の数値。あいだに別の数値を挟ませない
+    # (挟ませると文頭の被演算子 (「1234 × 5678 の答え」の 1234) を拾ってしまい、
+    #  退化していない訂正まで別値と判定して見逃す)。
+    r"[「『\s]?(?P<before>[\d,．.０-９]{2,})[」』\s]?"
+    r"[^。．\n\d０-９]{0,40}?"
+    r"(?:と(?:答え|述べ|言い|回答))[^。．\n]{0,20}?"
+    r"[、,][^。．\n]{0,20}?正しくは\s*"
+    r"[「『]?(?P<after>[\d,．.０-９]{2,})",
+)
+
+
 def retracts_own_conclusion(text: str) -> bool:
     """応答が自分の結論を途中で撤回しているか (純粋関数)。"""
-    return bool(_SELF_RETRACTION_RE.search(text or ""))
+    if _SELF_RETRACTION_RE.search(text or ""):
+        return True
+    return degenerate_correction(text) is not None
+
+
+def degenerate_correction(text: str) -> str | None:
+    """「A と答えたが正しくは A」型の **成立していない訂正** を検出する。
+
+    Returns:
+        退化を表す ``"<value>"`` 文字列。該当しなければ ``None`` (純粋関数)。
+    """
+    for m in _DEGENERATE_CORRECTION_RE.finditer(text or ""):
+        before = _normalize_number(m.group("before"))
+        after = _normalize_number(m.group("after"))
+        if before and before == after:
+            return before
+    return None
+
+
+# ── 明示された出力長の指定と、その遵守判定 ──
+#
+# 指定の抽出はプロンプト注記 (``core.inference._char_limit_note``) と遵守判定
+# (``violates_length_constraint``) の **両方** が必要とする。別々に書くと
+# 「注記では拾うのに検証では拾わない」形の食い違いが静かに残るため、正規表現も
+# 優先順位もここを SSOT とする。
+
+#: 「10 文字以内」「200字以下」型の上限指定。数値と単位が隣接する形だけを拾う。
+_CHAR_LIMIT_RE = re.compile(
+    r"(\d{1,5})\s*(?:文字|字)\s*(?:以内|以下|まで)"
+    r"|(?:within|under|at\s+most)\s+(\d{1,5})\s*(?:characters?|chars?)",
+    re.IGNORECASE,
+)
+
+#: 「300字ちょうど」「ちょうど300文字で」型の **厳密指定**。上限指定
+#: (_CHAR_LIMIT_RE) とは守り方が違う (足りない側も直す必要がある) ため分ける。
+_CHAR_EXACT_RE = re.compile(
+    r"(?:ちょうど|丁度|きっかり|正確に)\s*(\d{1,5})\s*(?:文字|字)"
+    r"|(\d{1,5})\s*(?:文字|字)\s*(?:ちょうど|丁度|きっかり|で書|で説明|で答)"
+    r"|exactly\s+(\d{1,5})\s*(?:characters?|chars?)",
+    re.IGNORECASE,
+)
+
+#: 「「あ」を50回」型の反復回数指定。
+_REPEAT_COUNT_RE = re.compile(
+    r"(\d{1,4})\s*回\s*(?:だけ)?\s*(?:続けて|繰り返|repeat)"
+    r"|(?:続けて|繰り返して)\s*(\d{1,4})\s*回"
+    r"|repeat(?:ed)?\s+(\d{1,4})\s+times",
+    re.IGNORECASE,
+)
+
+
+def match_length_directive(text: str) -> tuple[str, int] | None:
+    """発話に含まれる出力長の指定を ``(種別, 数)`` で返す (純粋関数)。
+
+    種別は ``exact`` (ちょうど N 文字) / ``repeat`` (N 回) / ``limit``
+    (N 文字以内)。厳密指定を先に見るのは「300字ちょうど」が上限指定の
+    パターンにも部分一致しうるため。指定が無ければ ``None``。
+    """
+    for kind, pattern in (
+        ("exact", _CHAR_EXACT_RE),
+        ("repeat", _REPEAT_COUNT_RE),
+        ("limit", _CHAR_LIMIT_RE),
+    ):
+        m = pattern.search(text or "")
+        if m:
+            return kind, int(next(g for g in m.groups() if g))
+    return None
+
+
+def violates_length_constraint(query: str, response: str) -> str | None:
+    """応答が発話中の文字数指定を破っていれば理由を返す (純粋関数)。
+
+    指定を注記としてプロンプトへ渡してはいた (``_char_limit_note``) が、
+    **守れたかを誰も見ていなかった**。そのため実インシデント 2026-08-22
+    ライブ監査の「ちょうど100文字で要約して」→ 86 文字は ``turn_outcome``
+    上は success として学習に入り、few-shot の手本にもなり得た。
+    指定は本文にあり長さは数えるだけなので、真偽の推定ではなく **矛盾**
+    であり、``claims_completed_state_change`` / ``contradicts_measured_values``
+    と同格に扱える。
+
+    数え方の曖昧さ (改行・空白を数えるか) は **どちらかの数え方で満たして
+    いれば違反としない** ことで回避する。プロンプトへ注入する実測値
+    (``chat_service._measure_text``) も総文字数と空白・改行を除いた数の
+    両方を出しており、モデルに要求している基準と揃う。
+
+    反復回数指定 (``repeat``) は数える対象の同定が要るため見ない。
+    """
+    directive = match_length_directive(query)
+    if directive is None:
+        return None
+    kind, expected = directive
+    if kind == "repeat" or not (response or "").strip():
+        return None
+    total = len(response)
+    stripped = len("".join(response.split()))
+    if kind == "limit":
+        if min(total, stripped) <= expected:
+            return None
+        return (
+            f"asked for at most {expected} chars but the answer is "
+            f"{total} ({stripped} without whitespace)"
+        )
+    if expected in (total, stripped):
+        return None
+    return (
+        f"asked for exactly {expected} chars but the answer is "
+        f"{total} ({stripped} without whitespace)"
+    )

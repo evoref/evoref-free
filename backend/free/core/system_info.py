@@ -27,6 +27,28 @@ from backend.log_config import get_logger
 
 logger = get_logger("core.system_info")
 
+#: backend プロセスの起動時刻 (uptime の SSOT)。import 時に確定する。
+#: ``free/api/system/status.py`` の ``/api/status`` も同じ値を使う —
+#: 別々に持つと「稼働時間は？」の回答が API と食い違う。
+PROCESS_START_TIME: float = time.time()
+
+
+def process_uptime_seconds() -> float:
+    """backend プロセスの稼働秒数を返す。"""
+    return max(0.0, time.time() - PROCESS_START_TIME)
+
+
+def format_uptime(seconds: float) -> str:
+    """稼働秒数を ``3h 12m 05s`` 形式へ整形する。"""
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {sec:02d}s"
+    if m:
+        return f"{m}m {sec:02d}s"
+    return f"{sec}s"
+
 
 class _MemoryStatusEx(ctypes.Structure):
     """Win32 ``MEMORYSTATUSEX`` (winbase.h)。"""
@@ -228,3 +250,80 @@ def format_hardware_facts() -> str:
         cpu_usage_line,
         *get_gpu_lines(),
     ])
+
+
+def format_runtime_facts(cfg: dict, metadata: object | None = None) -> str:
+    """evoref 自身の実行構成をツール結果向けテキストへ整形する (準純粋関数)。
+
+    「今動いているモデルは？」「コンテキストサイズは？」「llama-server の
+    ポートは？」に答える経路がどこにも無かった。ハードウェアと同じで、
+    シェル経由では取れない (readonly allow-list は config も /props も読めない)
+    ため backend 内の値をそのまま渡す。実インシデント (2026-08-22 ライブ監査):
+    「今動いているモデルの名前を教えてください。」→「私は「Alice」という名前で
+    対応しています」(インスタンス名であってモデル名ではない)、「埋め込みモデルは
+    何ですか？」→「特定の埋め込みモデル名を保持したり開示したりする仕様では
+    ありません」(存在しない方針の捏造)、ポート / n_ctx →「確認できていません」。
+
+    **実測 (llama-server の ``/props`` 由来) と宣言 (config) を区別して書く**。
+    config を書き替えても llama-server を再起動しなければ反映されないため、
+    両者は食い違いうる (2026-08-13: 62.8 時間ちがうモデルを serve していた)。
+    ``metadata`` が無い / 値が 0 の項目は config 側を ``configured`` と明示する。
+    """
+    from pathlib import Path
+
+    llama = cfg.get("llama", {}) or {}
+    embedding = cfg.get("embedding", {}) or {}
+    instance = cfg.get("instance", {}) or {}
+
+    configured_base = Path(
+        (cfg.get("model_paths", {}) or {}).get("base_model") or "",
+    ).name
+    served = getattr(metadata, "model_id", "") or ""
+    if served:
+        base_line = f"Base model (served): {Path(served).name}"
+        if configured_base and Path(served).name != configured_base:
+            base_line += f"  [config declares: {configured_base}]"
+    elif configured_base:
+        base_line = f"Base model (configured, not verified): {configured_base}"
+    else:
+        base_line = "Base model: unknown"
+
+    n_ctx = int(getattr(metadata, "n_ctx", 0) or 0)
+    if n_ctx:
+        ctx_line = f"Context size (n_ctx, served): {n_ctx}"
+    else:
+        ctx_line = (
+            f"Context size (n_ctx, configured): {llama.get('context_size', 'unknown')}"
+        )
+    slots = int(getattr(metadata, "total_slots", 0) or 0)
+    slots_line = (
+        f"Slots (served): {slots}" if slots
+        else f"Slots (configured): {llama.get('slots', 'unknown')}"
+    )
+
+    embed_name = embedding.get("model_name") or "unknown"
+    # バージョン / エディション / 稼働時間 — どれも backend 内にしか無く、
+    # ``run_command_readonly`` の allow-list では取れない。ここが欠けていたため
+    # 「あなたのバージョン番号は？」→「提供されていません」、「稼働時間は？」→
+    # 「確認できるツールが利用できない」、「Free 版ですか Pro 版ですか？」→
+    # 「該当しません」と、ツールは撃たれているのに答えられなかった
+    # (2026-08-22 ライブ監査 2 回目 ターン 6/7/9)。
+    from backend.edition import current_edition
+    from backend.version import get_runtime_version
+
+    lines = [
+        f"Instance name: {instance.get('name') or 'unknown'}"
+        "  (this is the assistant's display name, NOT the model name)",
+        f"evoref version: {get_runtime_version()}",
+        f"Edition: {current_edition().name.lower()}",
+        f"Backend uptime: {format_uptime(process_uptime_seconds())}",
+        base_line,
+        f"Embedding model: {embed_name}",
+        ctx_line,
+        slots_line,
+        f"llama-server (base): {llama.get('host', 'localhost')}:"
+        f"{llama.get('port', 'unknown')}",
+        f"llama-server (embedding): {embedding.get('llama_host', 'localhost')}:"
+        f"{embedding.get('llama_port', 'unknown')}",
+    ]
+    return "\n".join(lines)
