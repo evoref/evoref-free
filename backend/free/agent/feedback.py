@@ -16,15 +16,19 @@ from typing import TYPE_CHECKING
 
 from backend.free.core.intent_vocab import (
     EXPLICIT_WINDOWS_PATH_RE,
+    NUMBER_LITERAL_RE,
     REFERENTIAL_WRITE_TARGET_RE,
 )
 from backend.free.core.locale_patterns import is_en_locale, select_locale_variant
 from backend.free.core.session_mode import is_create_mode
 from backend.free.core.response_arithmetic import find_arithmetic_contradictions
 from backend.free.core.text_quality import (
+    claims_completed_state_change,
+    contradicts_measured_values,
     has_broken_ja_spacing,
     has_chinese_token_leak,
     retracts_own_conclusion,
+    violates_length_constraint,
 )
 from backend.free.core.text_similarity import (
     bigram_coverage,
@@ -514,6 +518,12 @@ class FeedbackCollector:
         # 直前ターンの成否 ([failed] マーカー等から導出)。失敗直後のターンは
         # 無条件で訂正候補とみなす (2026-07-15: 訂正 2 ターンが検出漏れ)。
         self._prev_turn_failed: bool = False
+        # 値が食い違う訂正の「保留」。訂正の検出時点では真偽が分からないため、
+        # 次のターンでアシスタントが元の値を維持したら撤回する
+        # (``_settle_pending_correction`` の説明を参照)。
+        self._pending_correction: dict | None = None
+        # 直前ターンのアシスタント応答 (保留判定の材料)。
+        self._prev_response: str = ""
         # 現在ロード中のモデル名 (GGUF ファイル名)。record() の base_model /
         # embedding_model が明示指定されないとき既定値として埋める。
         #
@@ -585,6 +595,8 @@ class FeedbackCollector:
         completion_tokens: int | None = None,
         prompt_tokens: int | None = None,
         cached_prompt_tokens: int | None = None,
+        action_blocked: bool = False,
+        measured_values: dict[str, set[int]] | None = None,
     ) -> ExperienceEntry:
         """シグナル収集 → ExperienceBuffer に記録"""
         if self._disabled:
@@ -607,6 +619,8 @@ class FeedbackCollector:
             query=query,
             tool_routing_false_positive=tool_routing_false_positive,
             long_form_false_positive=long_form_false_positive,
+            action_blocked=action_blocked,
+            measured_values=measured_values,
         )
         if turn_outcome == "failed":
             # 失敗ターンの成功シグナルは矛盾なので failed 側に倒す
@@ -704,9 +718,21 @@ class FeedbackCollector:
 
         self._apply_self_retraction(signals, response)
 
+        # 前ターンで保留した訂正を、当ターンの応答で確定 / 撤回する。
+        # entry を buffer へ積む前に回す (撤回対象は前 entry なので順序は
+        # どちらでもよいが、ログの並びを「撤回 → 記録」に揃える)。
+        self._settle_pending_correction(response)
+        if correction_text is not None:
+            self._arm_pending_correction(entry, query)
+            # 当ターンの応答が既に反論しているケース (実測 2026-08-22:
+            # 「約100kmという値は事実と異なります。」) はここで確定する。
+            # 判断材料が出ていなければ保留のまま次ターンへ持ち越す。
+            self._settle_pending_correction(response)
+
         self.buffer.record(entry)
         self._session_entries.append(entry)
         self._prev_query = query
+        self._prev_response = response or ""
         self._prev_entry = entry
         self._prev_routed_tool = current_routed_tool
         self._prev_used_long_form = long_form_used
@@ -752,6 +778,8 @@ class FeedbackCollector:
         self._prev_routed_tool = False
         self._prev_used_long_form = False
         self._prev_turn_failed = False
+        self._pending_correction = None
+        self._prev_response = ""
 
     @staticmethod
     def _derive_turn_outcome(
@@ -761,6 +789,8 @@ class FeedbackCollector:
         query: str = "",
         tool_routing_false_positive: bool = False,
         long_form_false_positive: bool = False,
+        action_blocked: bool = False,
+        measured_values: dict[str, set[int]] | None = None,
     ) -> str:
         """ターン成否 ("success" | "partial" | "failed") を決定論導出する。
 
@@ -804,6 +834,30 @@ class FeedbackCollector:
         broken = FeedbackCollector._find_broken_output_reason(text)
         if broken is not None:
             logger.info("Turn marked failed (%s)", broken)
+            return "failed"
+        # システムが「撃てなかった」と知っているのに本文が完了を述べている =
+        # 真偽の推定ではなく **矛盾**。2026-08-22 ライブ監査で 2 ターン続けて
+        # 起きた形 (Action blocked が出ているのに「削除しました。」、ファイルは残存)。
+        if action_blocked:
+            claim = claims_completed_state_change(text)
+            if claim is not None:
+                logger.info(
+                    "Turn marked failed (claimed %r while the action was "
+                    "blocked)", claim,
+                )
+                return "failed"
+        # 実測値を注入したのに別の数を述べている = 同じく矛盾。
+        # 2026-08-22 ライブ監査: 実測 86 文字を注入済みで「100文字です」。
+        mismatch = contradicts_measured_values(text, measured_values or {})
+        if mismatch is not None:
+            logger.info("Turn marked failed (%s)", mismatch)
+            return "failed"
+        # 明示された文字数指定を破っている = 指定は本文にあり長さは数えるだけ
+        # なので、これも推定ではなく矛盾。2026-08-22 ライブ監査の
+        # 「ちょうど100文字で」→ 86 文字は success として学習に入っていた。
+        broken_length = violates_length_constraint(query, text)
+        if broken_length is not None:
+            logger.info("Turn marked failed (%s)", broken_length)
             return "failed"
         return "success"
 
@@ -900,6 +954,105 @@ class FeedbackCollector:
         logger.info(
             "Assistant retracted its previous answer; marking the previous "
             "turn as failed (prev_query=%s)", (self._prev_query or "")[:60],
+        )
+
+    def _arm_pending_correction(self, entry, query: str) -> None:
+        """値が食い違う訂正を「保留」に置く (確定は次ターン)。
+
+        検出時点ではユーザーの主張が正しいかを知る手段が無い。ところが
+        ``user_correction`` は critique_synthesizer が失敗事例として消費し、
+        generation_param_evolver は重み 1.0 で見るため、**誤った主張を 1 件
+        受け取るだけで自分の正答が失敗として学習される**。
+
+        実インシデント 2026-08-22 ライブ監査: 「東京・大阪間は約100kmです」
+        (誤) に「訂正ありがとうございます。承知しました。」と応じて
+        ``correction=True (by=hardcoded)`` が記録された。**次のターンで
+        「本当に100kmですか？」と聞くと「約370kmです」と元の値を維持** して
+        おり、さらに後で「私が誤った情報を伝えた箇所は？」と聞けば正しく
+        指摘できた。壊れているのは記録側だけで、判断材料は 1 ターン後に出る。
+
+        保留は **数値の食い違いが明確な場合だけ**。訂正クエリに数値があり、
+        直前のアシスタント応答にも数値があり、両者が重ならないときに限る。
+        判定材料が無いケースは従来どおり即確定 (挙動を変えない)。
+        """
+        corrected = {m for m in NUMBER_LITERAL_RE.findall(query or "")}
+        prior = {m for m in NUMBER_LITERAL_RE.findall(self._prev_response or "")}
+        if not corrected or not prior or (corrected & prior):
+            return
+        self._pending_correction = {
+            "entry": entry,
+            "corrected": corrected,
+            "prior": prior,
+        }
+        logger.debug(
+            "Correction held pending (corrected=%s vs prior=%s); "
+            "the next turn decides", sorted(corrected), sorted(prior),
+        )
+
+    #: 「100km ではありません」のように、直後で打ち消す言い回し。値に **言及した**
+    #: ことと **採用した** ことを分ける。実測 (2026-08-22 の修正検証): 訂正の
+    #: ターンで「東京と大阪の直線距離は約370kmです。約100kmという値は事実と
+    #: 異なります。」と即座に反論したため、訂正値 100 が本文に現れて「採用」と
+    #: 誤判定され、撤回が発火しなかった。
+    _VALUE_REJECTION_RE = re.compile(
+        r"(?:では?あり?ま?せん|ではなく|では無く|は誤り|は間違|"
+        r"正しくありません|事実と異な|正確ではあ|ではないです|ではない)",
+    )
+
+    @classmethod
+    def _values_adopted(cls, response: str, values: set[str]) -> bool:
+        """応答が ``values`` のいずれかを **自分の答えとして採った** か。
+
+        単なる出現では判定しない。値の直後が打ち消しなら、言及はしていても
+        採用はしていない (``_VALUE_REJECTION_RE`` の説明を参照)。
+        """
+        text = response or ""
+        for value in values:
+            start = 0
+            while True:
+                idx = text.find(value, start)
+                if idx < 0:
+                    break
+                tail = text[idx + len(value): idx + len(value) + 14]
+                if not cls._VALUE_REJECTION_RE.search(tail):
+                    return True
+                start = idx + len(value)
+        return False
+
+    def _settle_pending_correction(self, response: str) -> None:
+        """保留中の訂正を、応答が採った値で確定 / 撤回する。
+
+        - 応答が **訂正前の値** を含み、訂正値を **採用していない** →
+          アシスタントは自分の答えを維持した = ユーザーの主張を採らなかった
+          → **撤回**。
+        - それ以外 (訂正値を採用した / どちらも出てこない) → 保留のまま次ターンへ
+          持ち越すか、そのまま確定。
+
+        「採用していない」は出現の有無ではなく ``_values_adopted`` で見る。
+        アシスタントは「約100kmという値は事実と異なります」のように **打ち消し
+        ながら値に言及する** ため、出現だけを見ると採用と誤判定する。
+
+        撤回は前 entry の ``signals`` を書き換える。``_prev_entry`` への遡及
+        マーク (tool_routing_false_negative 等) と同じで、buffer は同一オブジェクトを
+        保持しているため反映される。
+        """
+        pending = self._pending_correction
+        if pending is None:
+            return
+        found = {m for m in NUMBER_LITERAL_RE.findall(response or "")}
+        if not (found & pending["prior"]):
+            # まだ判断材料が出ていない (「承知しました。」等)。次ターンへ持ち越す。
+            return
+        self._pending_correction = None
+        if self._values_adopted(response, pending["corrected"]):
+            return
+        entry = pending["entry"]
+        entry.signals.user_correction = None
+        entry.signals.correction_detected_by = "retracted_not_accepted"
+        logger.info(
+            "Correction retracted: the assistant kept its original value "
+            "(prior=%s) instead of the user's claim (%s); not learning from it",
+            sorted(pending["prior"]), sorted(pending["corrected"]),
         )
 
     def _detect_correction(

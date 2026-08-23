@@ -83,15 +83,21 @@ rem --- Stop services ---
 :stop
 echo [stop] Stopping evoref services...
 
-taskkill /fi "WINDOWTITLE eq llama-server" /t /f >nul 2>&1
-taskkill /im "llama-server.exe" /f >nul 2>&1
-echo   llama-server stopped
-
-taskkill /fi "WINDOWTITLE eq evoref-backend" /t /f >nul 2>&1
-echo   FastAPI backend stopped
-
-taskkill /fi "WINDOWTITLE eq evoref-frontend" /t /f >nul 2>&1
-echo   SvelteKit frontend stopped
+rem Window-title taskkill only matches processes started by this script.
+rem Services started any other way (evoref serve / uvicorn / a wrapper) survive
+rem it, and the old code printed "stopped" without checking. stop_services.py
+rem kills by port occupancy and verifies the ports are actually free.
+if exist ".venv\Scripts\python.exe" (
+    set "STOP_PYTHON=%CD%\.venv\Scripts\python.exe"
+) else (
+    set "STOP_PYTHON=python"
+)
+"%STOP_PYTHON%" scripts\stop_services.py
+if errorlevel 1 (
+    echo.
+    echo === Stop FAILED: some services are still listening ===
+    exit /b 1
+)
 
 echo.
 echo === All services stopped ===

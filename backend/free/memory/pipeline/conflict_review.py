@@ -1,24 +1,33 @@
-"""SemMem pending 競合のユーザー解決ヘルパ (EvorefMem 内部)
+"""SemMem pending 競合の集約・提示・解決ヘルパ (EvorefMem 内部)
 
 ``semantic_conflict_resolver.py`` (sleep-time Step 6B) が ``review_status=
-"pending"`` に振り分けた競合を、ユーザーの意思決定で解決するための共通
-ロジックを提供する。チャット確認フロー (``conflict_chat_judge`` /
-``chat_service.maybe_resolve_pending_conflicts``) から利用する
-(専用 API 層は PR #106 のメモリインスペクタ削除で撤去済)。
+"pending"`` に振り分けた競合を、(a) チャットへ **情報として** 提示する形に
+整形し、(b) sleep-time / TTL 側から解決するための共通ロジックを提供する。
 
 提供する操作:
 
 - :func:`collect_pending_groups` — pending ファクトの (subject, predicate)
   グルーピング (読取のみ)
+- :func:`collect_review_groups` — 表示用グループ (スロットの現在値込み)
+- :func:`dedupe_equivalent_groups` — 表示上同一のグループを畳む
+- :func:`render_pending_conflicts_block` — プロンプト注入用テキストへ整形
 - :func:`apply_resolution` — keep_old / keep_new / merge の supersede 反映 +
   ``conflicts.jsonl`` の pending 行掃除 + ``conflicts_resolved.jsonl`` への
   audit 追記までを一体で実行する
 
-書込例外について: チャット応答パスからの SemMem 書込は sleep-time に
-閉じる不変則の例外 2 例目として、:func:`apply_resolution` のみ許可される
-(CLAUDE.md §6.2 / docs/f_02_memory_system.md §5.2 参照)。
-"""
+**チャット内でユーザーの回答を判定して解決する経路は存在しない。**
+かつては ``conflict_chat_judge`` (補助タスク) が回答を判定し
+``chat_service`` が同ターンで :func:`apply_resolution` を呼んでいたが、
+その経路は撤去済みで、現在 :func:`apply_resolution` の呼出元は
+``semantic_conflict_resolver`` (sleep-time / TTL 自動解決) だけ。
+したがって注入ブロックは **情報提示のみ** で、ユーザーへ確認を促す指示は
+出さない (答えても反映される先が無いため)。
 
+書込例外について: チャット応答パスからの SemMem 書込は sleep-time に
+閉じる不変則の例外として :func:`apply_resolution` のみ許可されるが、
+上記のとおり現在チャット応答パスからは呼ばれない
+(CLAUDE.md §6 / docs/f_02_memory_system.md §5.2 参照)。
+"""
 from __future__ import annotations
 
 import json
@@ -27,7 +36,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 
-from backend.free.core.text_quality import carries_no_assertion
+from backend.free.core.text_quality import states_no_user_value
 from backend.free.memory.pipeline.injector import (
     INTERNAL_INDEX_SUBJECT_PREFIXES,
 )
@@ -56,9 +65,8 @@ _RESOLVED_ACTION_TO_STATUS: dict[str, str] = {
 class AlreadyResolvedError(ValueError):
     """対象ファクトが既に supersede 済み (= 解決済み) の場合に送出する。
 
-    チャット確認フロー (``chat_service.maybe_resolve_pending_conflicts``) では
-    汎用 except に吸収され pending 維持で no-op になる (専用 API 層と 409 への
-    対応付けは PR #106 のメモリインスペクタ削除で撤去済)。
+    唯一の呼出元である sleep-time の ``SemanticConflictResolver`` では
+    汎用 except に吸収され pending 維持で no-op になる。
     """
 
 
@@ -181,10 +189,18 @@ def collect_review_groups(
        最も強い現在値の信号**で、記憶注入 / few-shot / RAG をすべて正しくしても
        これだけで古い値が採用され続けた。
 
-    2. **問いだけのファクトを除く。**
+    2. **値を述べていないファクトを除く** (問いだけ / 純粋な依頼)。
        「私の猫の名前と誕生日を覚えていますか。」が競合の当事者として並び、
-       最新であるがゆえに winner 扱いされていた。問いは主張ではないので
-       競合し得ない。注入層は同じ判定をファクトへ既に掛けている。
+       最新であるがゆえに winner 扱いされていた。問いも依頼も値の表明では
+       ないので競合し得ない。注入層は同じ判定 (``states_no_user_value``) を
+       ファクトへ掛けている。
+
+       依頼形の実害 (2026-08-19 ライブ監査): 「私の好きな飲み物をもう一度
+       教えてください。」が ``mem.personal.beverage`` / ``mem.preference.
+       beverage`` の 2 件として保存され、本人の実際の言明と同じスロットに
+       並んで **「新」ラベル付きの現在値**として提示されていた。実測
+       (2026-08-21、実ストア): active 146 件中 21 件が依頼形で、うち 14 件が
+       飲み物スロット。
 
     3. **同一 object は 1 件に畳む。**
        ストアは append-only で同じ文が複数 id で残る。畳まないと
@@ -210,7 +226,7 @@ def collect_review_groups(
     """
     by_slot: dict[tuple[str, str], list[SemanticFact]] = {}
     for f in store.all_facts(include_superseded=False):
-        if carries_no_assertion(f.object or ""):
+        if states_no_user_value(f.object or ""):
             continue
         by_slot.setdefault((f.subject, f.predicate), []).append(f)
 
@@ -496,28 +512,30 @@ def _render_group_line(
 def _render_block_lines(
     groups: list[PendingConflictGroup],
     *,
-    instruct: bool,
     max_object_chars: int,
 ) -> list[str]:
-    """ブロック本文 (ヘッダ + 指示 + グループ行) を組み立てる。"""
-    lines = ["[記憶の競合 — 未解決]"]
-    if instruct:
-        lines.append(
-            "以下の記憶は内容が矛盾しています。会話の流れを壊さない範囲で、"
-            "どちらが正しいか自然にユーザーへ確認してください (1 ターンに 1 件まで)。"
-        )
-    else:
-        lines.append("以下の記憶は内容が矛盾しています (確認待ち)。")
-    for i, g in enumerate(groups, start=1):
-        lines.append(_render_group_line(i, g, max_object_chars=max_object_chars))
-    return lines
+    """ブロック本文 (ヘッダ + グループ行) を組み立てる。
+
+    かつては ``instruct=True`` で「どちらが正しいかユーザーへ確認してください」
+    という指示行を出せた。チャット内でユーザーの回答を判定して
+    :func:`apply_resolution` へ流す経路が撤去された今、その指示は
+    **答えても何も起きない質問** をモデルに書かせるだけなので落とした
+    (解決は sleep-time の ``SemanticConflictResolver`` と TTL が担う)。
+    """
+    return [
+        "[記憶の競合 — 未解決]",
+        "以下の記憶は内容が矛盾しています (確認待ち)。",
+        *(
+            _render_group_line(i, g, max_object_chars=max_object_chars)
+            for i, g in enumerate(groups, start=1)
+        ),
+    ]
 
 
 def _fit_groups_to_tokens(
     groups: list[PendingConflictGroup],
     max_tokens: int,
     *,
-    instruct: bool,
     max_object_chars: int,
 ) -> list[PendingConflictGroup]:
     """トークン上限に収まる先頭 N グループを返す (最低 1 件は残す)。"""
@@ -527,9 +545,7 @@ def _fit_groups_to_tokens(
     for g in groups:
         candidate = [*fitted, g]
         text = "\n".join(
-            _render_block_lines(
-                candidate, instruct=instruct, max_object_chars=max_object_chars,
-            ),
+            _render_block_lines(candidate, max_object_chars=max_object_chars),
         )
         if fitted and estimate_tokens(text) > max_tokens:
             break
@@ -537,10 +553,37 @@ def _fit_groups_to_tokens(
     return fitted
 
 
+def dedupe_equivalent_groups(
+    groups: list[PendingConflictGroup],
+) -> list[PendingConflictGroup]:
+    """**表示上**まったく同じ内容になるグループを 1 件に畳む (先勝ち)。
+
+    抽出は 1 つの言い直しを複数の型へ書き出す。実データ (2026-08-19) では
+    「緑茶 → 麦茶」の 1 件が ``mem.personal.beverage`` (personal_fact) と
+    ``mem.preference.beverage`` (preference) の 2 グループになり、同じ
+    「旧…/新…」の並びが 2 行ぶん注入されていた。ユーザーから見れば 1 つの
+    矛盾なので、行も 1 本でよい。
+
+    畳む鍵は **member の object 集合**。subject / predicate / type が違っても
+    提示される値が同じなら重複とみなす。解決 (supersede / TTL) の対象は
+    変えない — :func:`collect_pending_groups` は素通しのままにする。
+    """
+    seen: set[frozenset[str]] = set()
+    out: list[PendingConflictGroup] = []
+    for g in groups:
+        key = frozenset((f.object or "").strip() for f in g.facts)
+        # member を持たないグループ (テスト用の部分モック等) は畳まない。
+        # 空集合を鍵にすると互いに無関係なものまで 1 件に潰れる。
+        if key and key in seen:
+            continue
+        seen.add(key)
+        out.append(g)
+    return out
+
+
 def render_pending_conflicts_block(
     groups: list[PendingConflictGroup],
     *,
-    instruct: bool = True,
     max_groups: int = 0,
     max_object_chars: int = 80,
     max_tokens: int = 0,
@@ -552,8 +595,6 @@ def render_pending_conflicts_block(
     レンダリングを共有し、ターン間で番号がずれないようにする。
 
     Args:
-        instruct: True で AI への確認指示行を含める。aux 未接続
-            (回答を判定できない) のときは False で情報提示のみにする。
         max_groups: 注入するグループ数の上限 (0 = 無制限)。超過分は
             件数のみ要約する。
         max_tokens: ブロック全体のトークン上限 (0 = 無制限)。グループ数上限
@@ -566,29 +607,9 @@ def render_pending_conflicts_block(
     shown = groups if max_groups <= 0 else groups[:max_groups]
     if max_tokens > 0:
         shown = _fit_groups_to_tokens(
-            shown, max_tokens, instruct=instruct,
-            max_object_chars=max_object_chars,
+            shown, max_tokens, max_object_chars=max_object_chars,
         )
-    lines = _render_block_lines(
-        shown, instruct=instruct, max_object_chars=max_object_chars,
-    )
+    lines = _render_block_lines(shown, max_object_chars=max_object_chars)
     if len(groups) > len(shown):
         lines.append(f"(他 {len(groups) - len(shown)} 件)")
     return "\n".join(lines)
-
-
-def render_resolved_notice(
-    result: ResolutionResult, group: PendingConflictGroup,
-) -> str:
-    """直前のユーザー回答で解決した競合の確認通知行を返す。
-
-    同ターンの注入ブロック末尾に追加し、AI に「記憶を更新した」旨を
-    一言返させる。解決後は pending ブロックの ``[C1..]`` が再収集で振り直される
-    ため、``[C{index}]`` 参照は同一ターン内ですら別の競合を指し得る。それを
-    避けるため、解決した競合は番号ではなく内容 (subject / predicate) で示す。
-    """
-    return (
-        f"(直前のユーザー回答により記憶の競合「{group.subject} {group.predicate}」を "
-        f"{result.action} で解決し、記憶を更新済み。"
-        "応答の冒頭で一言だけ反映した旨を伝えること。)"
-    )

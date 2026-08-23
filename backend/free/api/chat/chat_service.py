@@ -29,7 +29,6 @@ if TYPE_CHECKING:
     from backend.free.core.stage_timer import StageTimer
     from backend.free.memory.pipeline.conflict_review import (
         PendingConflictGroup,
-        ResolutionResult,
     )
 
 logger = get_logger("api.chat.service")
@@ -332,15 +331,17 @@ async def run_search_pipeline(
 class ConflictTurnContext:
     """1 ターン分の pending 競合コンテキスト。
 
-    ``maybe_resolve_pending_conflicts`` が構築し、同ターンの SemMem 注入
-    (``build_semmem_injection``) に渡される。``resolved`` が非 None の場合、
-    直前のユーザー発話で解決が反映済み (注入には確認通知を含める)。
+    ``collect_pending_conflicts`` が構築し、同ターンの SemMem 注入
+    (``build_semmem_injection``) に渡される。
+
+    かつては ``resolved`` / ``resolved_group`` を持ち、直前のユーザー回答で
+    解決した競合の確認通知を同ターンに載せていた。回答を判定して
+    ``apply_resolution`` へ流す経路が撤去された後もフィールドだけが残り、
+    **どこからも代入されない恒偽の分岐**になっていたので落とした
+    (解決は sleep-time の ``SemanticConflictResolver`` と TTL が担う)。
     """
 
     pending_groups: list["PendingConflictGroup"] = field(default_factory=list)
-    resolved: "ResolutionResult | None" = None
-    # 解決した競合グループ (解決通知を番号でなく内容で示すため保持する)。
-    resolved_group: "PendingConflictGroup | None" = None
 
 
 def _iter_scopes(state: AppState):
@@ -375,7 +376,9 @@ def _collect_all_pending_groups(state: AppState, mode: str = "chat") -> list:
     # 表示用グループを使う (collect_pending_groups ではない)。pending だけを
     # 並べるとスロットの最新値が欠け、古い値に「新」ラベルが付く
     # (``collect_review_groups`` の docstring 参照)。解決対象は変わらない。
-    from backend.free.memory.pipeline.conflict_review import collect_review_groups
+    from backend.free.memory.pipeline.conflict_review import (
+        collect_review_groups, dedupe_equivalent_groups,
+    )
 
     groups: list = []
     for scope, store in _iter_scopes(state):
@@ -383,6 +386,9 @@ def _collect_all_pending_groups(state: AppState, mode: str = "chat") -> list:
             groups.extend(collect_review_groups(store, scope))
         except Exception as exc:
             logger.warning("collect pending conflicts failed (%s): %s", scope, exc)
+    # 1 つの言い直しが複数の型へ書き出されると、同じ「旧…/新…」が
+    # グループ数だけ並ぶ。スコープを跨いで畳めるのはここだけ。
+    groups = dedupe_equivalent_groups(groups)
     if is_chat_mode(mode):
         before = len(groups)
         groups = [
@@ -431,6 +437,45 @@ async def collect_pending_conflicts(
     return ctx
 
 
+def _attribute_slots(text: str) -> frozenset[tuple[str, str]]:
+    """本文が述べているユーザー属性スロット ``(fact_type, attribute)`` の集合。
+
+    抽出側が subject を決めるのと同じ決定論辞書 (``fact_attributes.yaml``) を
+    使う。``core.inference`` から EvorefMem を直接引かせないため、解決器は
+    呼出側 (ここ) から渡す。LLM 呼び出しは無い。
+    """
+    from backend.free.memory.notes.note_builder import resolve_fact_attribute
+    from backend.free.memory.pipeline.injector import _USER_ATTRIBUTE_FACT_TYPES
+
+    if not text:
+        return frozenset()
+    slots: set[tuple[str, str]] = set()
+    for fact_type in _USER_ATTRIBUTE_FACT_TYPES:
+        attr = resolve_fact_attribute(text, fact_type, mode="chat")
+        if attr:
+            slots.add((fact_type, attr))
+    return frozenset(slots)
+
+
+def _session_user_texts(state: AppState) -> list[str]:
+    """今回の会話でユーザーが述べた本文を返す (属性スロットの述べ直し検出用)。
+
+    窓に残っているものだけで足りる — 押し出された発話は「今回の会話の方が
+    新しい」という主張の根拠として使えるほど近くない。
+    """
+    working = getattr(getattr(state, "mem", None), "working_memory", None)
+    if working is None:
+        return []
+    try:
+        return [
+            str(t.get("content") or "")
+            for t in working.get_context()
+            if t.get("role") == "user"
+        ]
+    except Exception:
+        return []
+
+
 def build_semmem_injection(
     state: AppState, cfg: dict, mode: str = "chat",
     conflict_ctx: ConflictTurnContext | None = None,
@@ -467,7 +512,9 @@ def build_semmem_injection(
             "semmem injection skipped: query embedding unavailable this turn "
             "(the relevance gate would be bypassed and inject the whole store)",
         )
-        return _render_conflict_section(cfg, conflict_ctx)
+        # 競合セクションも同じ理由で見送る。ゲートを掛けられないターンに
+        # 出すと、クエリと無関係な矛盾がプロンプトへ入る。
+        return None
     try:
         from backend.free.memory.pipeline.injector import MemoryInjector
 
@@ -494,50 +541,87 @@ def build_semmem_injection(
                 current_project_id=pid,
                 failure_signatures=(),
                 query_embedding=query_vec,
+                session_user_texts=_session_user_texts(state),
             )
             rendered = plan.render() or None
     except Exception as e:
         logger.warning("semmem injection skipped: %s", e)
         rendered = None
 
-    conflict_block = _render_conflict_section(cfg, conflict_ctx)
+    conflict_block = _render_conflict_section(
+        cfg, conflict_ctx, query_vec=query_vec,
+    )
     if conflict_block:
         rendered = f"{rendered}\n\n{conflict_block}" if rendered else conflict_block
     return rendered
 
 
+def _gate_groups_by_relevance(
+    cfg: dict, groups: list, query_vec,
+) -> list:
+    """競合グループをクエリとの関連度で絞る (ゲート無効なら素通し)。
+
+    競合セクションは Tier 予算の外で毎ターン連結される。予算に載せないのは
+    「drop されない」保証のためだが、その代わり **関連度の棒も掛かって
+    いなかった**。実測 (2026-08-19、chat 29 ターン): 飲み物の競合 2 件が
+    28 ターンへ注入され、そのうち飲み物についての質問は **0 件**だった
+    (話題は担当プロジェクト / 空きディスク容量 / HTTP と HTTPS / JWT / 日付)。
+    中央値 155 トークンを毎ターン再プリフィルしたうえ、無関係な矛盾を
+    弱い base に見せ続けることになる。
+
+    棒は注入本体と同じ ``MemoryInjector`` の較正済み閾値を使う
+    (:meth:`MemoryInjector.relevant_fact_ids`)。グループは member の
+    いずれかが棒を越えれば残す — 競合は「同じスロットの複数の値」なので、
+    片方だけがクエリに近いのが普通。
+    """
+    if not groups:
+        return groups
+    try:
+        from backend.free.memory.pipeline.injector import MemoryInjector
+
+        facts = [f for g in groups for f in g.facts]
+        relevant = MemoryInjector(cfg).relevant_fact_ids(facts, query_vec)
+    except Exception as exc:
+        logger.warning("conflict relevance gate failed (passing through): %s", exc)
+        return groups
+    if relevant is None:
+        return groups
+    kept = [g for g in groups if any(f.id in relevant for f in g.facts)]
+    if len(kept) != len(groups):
+        logger.debug(
+            "conflict groups: %d/%d passed the relevance gate",
+            len(kept), len(groups),
+        )
+    return kept
+
+
 def _render_conflict_section(
-    cfg: dict, conflict_ctx: ConflictTurnContext | None,
+    cfg: dict, conflict_ctx: ConflictTurnContext | None, *, query_vec=None,
 ) -> str | None:
-    """pending 競合セクション (+ 解決済み通知) を組み立てる。失敗時は None。"""
-    if conflict_ctx is None:
-        return None
-    if not conflict_ctx.pending_groups and conflict_ctx.resolved is None:
+    """pending 競合セクションを組み立てる。失敗時 / 該当なしは None。
+
+    ``query_vec`` を渡すと関連度ゲートが掛かる
+    (:func:`_gate_groups_by_relevance`)。``None`` はゲート無効 = 素通しで、
+    embedder 自体が無い構成のための後方互換。
+    """
+    if conflict_ctx is None or not conflict_ctx.pending_groups:
         return None
     try:
         from backend.free.memory.pipeline.conflict_review import (
             render_pending_conflicts_block,
-            render_resolved_notice,
         )
 
+        groups = _gate_groups_by_relevance(
+            cfg, conflict_ctx.pending_groups, query_vec,
+        )
+        if not groups:
+            return None
         review_cfg = _chat_review_cfg(cfg)
-        parts: list[str] = []
-        block = render_pending_conflicts_block(
-            conflict_ctx.pending_groups,
-            # 回答を判定する経路が無いので、指示なしの情報提示に留める。
-            instruct=False,
+        return render_pending_conflicts_block(
+            groups,
             max_groups=int(review_cfg.get("max_groups", 3) or 0),
             max_tokens=int(review_cfg.get("max_tokens", 400) or 0),
         )
-        if block:
-            parts.append(block)
-        if conflict_ctx.resolved is not None and conflict_ctx.resolved_group is not None:
-            parts.append(
-                render_resolved_notice(
-                    conflict_ctx.resolved, conflict_ctx.resolved_group,
-                ),
-            )
-        return "\n".join(parts) or None
     except Exception as exc:
         logger.warning("conflict section render failed: %s", exc)
         return None
@@ -600,6 +684,7 @@ def build_chat_messages(
         fewshot_block=fewshot_block,
         history_min_tokens=history_min_tokens,
         working_max_tokens=working_max_tokens,
+        slot_resolver=_attribute_slots,
     )
     apply_grounding_notes(messages, history, evicted_turns)
     logger.debug("Messages assembled: %d messages for LLM", len(messages))

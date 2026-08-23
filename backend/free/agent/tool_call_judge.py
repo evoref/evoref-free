@@ -18,6 +18,7 @@ from backend.free.agent.router import (
     asks_directory_listing,
     is_environment_fact_query,
 )
+from backend.free.core.intent_vocab import is_plain_statement
 from backend.free.core.locale_patterns import is_en_locale, select_locale_variant
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.safety_patterns import (
@@ -62,6 +63,7 @@ from backend.free.agent.tool_judge_signals import (
     _EXPLICIT_EXEC_VERB_RE,
     _FIRST_PERSON_REFERENCE_RE,
     _HARDWARE_MEMORY_QUERY_RE,
+    _RUNTIME_INFO_QUERY_RE,
     _IMMEDIATE_CHILDREN_RE,
     _INFER_TOOL_EXEC_QUERY_RE,
     _INFER_TOOL_EXEC_QUERY_RE_EN,
@@ -446,6 +448,31 @@ class ToolCallJudge:
         conversation: list[dict] | None = None,
         session_id: str = "",
     ) -> ToolJudgement:
+        """ツール呼び出しの要否を判定し、**ターン固有の値を結果に載せて** 返す。
+
+        ``action_blocked`` / ``measurement_blocked`` は判定の途中でインスタンス
+        属性へ立つが、本インスタンスはプロセス唯一の共有オブジェクトで、
+        呼出側は judge() 完了後の別タイミング (reactive-light ゲート / 経験記録 /
+        deliberative の注記) で読む。チャットが 2 本重なると他方の judge() が
+        先にリセットするため、ここで **await を挟まずに** 結果へ写し取る。
+        以後の読み手は ``ToolJudgement`` 側を見ること。
+        """
+        result = await self._judge_inner(
+            query, tools_registry, mode, conversation, session_id,
+        )
+        # ここに await を入れないこと (入れた瞬間に共有状態のレースが戻る)。
+        result.action_blocked = self._action_blocked
+        result.measurement_blocked = self._measurement_blocked
+        return result
+
+    async def _judge_inner(
+        self,
+        query: str,
+        tools_registry: ToolsRegistry,
+        mode: str = "create",
+        conversation: list[dict] | None = None,
+        session_id: str = "",
+    ) -> ToolJudgement:
         """ツール呼び出しの要否を判定
 
         判定は安価な順に実行し、最初にマッチした結果を返す:
@@ -530,9 +557,23 @@ class ToolCallJudge:
         # これは aux 呼出を省くための意図的な順序 (テストで固定) なので
         # 変えていない。コマンド表を直したときは、対応する
         # ``mem.world.executable_command.*`` ファクトの purge が要る。
-        recall_allowed = is_create_mode(mode) or (
-            _query_has_tool_signal(query)
-            and not _has_history_recall_keywords(query)
+        # 層0.6 / 0.6b の専用ツール (system_hardware_info / evoref_runtime_info)
+        # が答える質問はリコールの対象外。あちらは「シェル経由では **原理的に**
+        # 取れない」ために作った層で、引き当てたコマンドが代役になれない。
+        # 実インシデント (2026-08-22 ライブ監査 2 回目、セット1/2 で 2 回再現):
+        # 「このPCの搭載メモリの総量と空き容量を教えてください。」に対し
+        # spec コマンド (platform / os / shutil。**RAM を出力しない**) が
+        # リコールで再生され、「搭載メモリの総量は確認できていません」と回答した。
+        # 層0.6 の正規表現は当たっており、順序だけの問題だった。
+        dedicated_tool_query = bool(
+            _HARDWARE_MEMORY_QUERY_RE.search(query)
+            or _RUNTIME_INFO_QUERY_RE.search(query),
+        )
+        recall_allowed = not dedicated_tool_query and (
+            is_create_mode(mode) or (
+                _query_has_tool_signal(query)
+                and not _has_history_recall_keywords(query)
+            )
         )
         if recall_allowed:
             cmd_recall_result = await self._judge_with_executable_command_recall(
@@ -570,6 +611,33 @@ class ToolCallJudge:
             )
             self._log_tool_decision(hw_result, "hardware_facts_query")
             return hw_result
+
+        # 0.6b. evoref 自身の実行構成 — 決定論、非シェル。
+        # ハードウェアと同じ理由でどの層も答えられない: readonly allow-list は
+        # config も /props も読めず、モデル名・n_ctx・ポートは backend 内に
+        # しか無い。実測 (2026-08-22 ライブ監査): 「今動いているモデルの名前を
+        # 教えてください。」→「私は「Alice」という名前で対応しています」
+        # (インスタンス名)、「埋め込みモデルは？」→「開示したりする仕様では
+        # ありません」(存在しない方針の捏造)、ポート / n_ctx →
+        # 「確認できていません」。
+        # 自己申告の平叙文 (「llama-server は 8080 で動かしています。」) は
+        # 実行要求ではないので落とす (_infer_executable_command と同じ扱い)。
+        if (
+            _RUNTIME_INFO_QUERY_RE.search(query)
+            and not is_plain_statement(query)
+            and tools_registry.is_available("evoref_runtime_info", mode)
+        ):
+            rt_result = self._finalize(
+                ToolJudgement(
+                    tool_needed=True,
+                    tool_name="evoref_runtime_info",
+                    tool_args={},
+                    source="rule",
+                ),
+                tools_registry, mode, query=query,
+            )
+            self._log_tool_decision(rt_result, "runtime_info_query")
+            return rt_result
 
         # 決定論ショートカット: 明示された算術式 / URL / パス / 実行可能
         # コマンドは「強い意図表明」なのでモデル判断を仰がずここで確定させる。
@@ -946,6 +1014,15 @@ class ToolCallJudge:
                 messages,
                 response_format=schema,
                 max_tokens=self._tool_classifier_max_tokens,
+                # 補助判定は専有スロット固定 (CLAUDE.md §6 #1)。省略すると
+                # llama-server が LCP 類似度 / LRU でスロットを選ぶため、
+                # (a) 自分の前ターンの KV を再利用できずに毎回フルプリフィル
+                # (2026-08-23 実測: 450〜590 トークン / 11〜16 秒 を 13 回)、
+                # (b) 選ばれたのがチャットスロットならチャット側の接頭辞
+                # キャッシュを破壊する、の 2 つを踏む。``generate_constrained``
+                # の他の呼出元 (AuxClient / PromptEvolver) は全て固定済みで、
+                # ここだけが漏れていた。
+                id_slot=getattr(client, "background_slot", -1),
                 timeout=self._tool_classifier_timeout_sec,
             )
         except httpx.HTTPStatusError as exc:

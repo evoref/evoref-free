@@ -713,9 +713,61 @@ _RELATIVE_FLOOR_RATIO = 0.6
 #: 「関連が無い」を「一番マシなもの」へすり替えてしまう。相対は静的値を緩める
 #: 方向にだけ働かせ、ノイズ帯より下へは落とさない。
 #: 実測 (2026-08-16、LFM2.5-Embedding): 無関係ペアの類似度は全ペア中央値 0.105 /
-#: p90 0.238 で、関連ペアは 0.467 だった。0.15 はノイズの中央値より上、
-#: 関連の下限より十分下に位置する。
-_RELATIVE_FLOOR_ABSOLUTE_MIN = 0.15
+#: p90 0.238 で、関連ペアは 0.467 だった。
+#:
+#: 旧値 0.15 は「ノイズの **中央値** より上」を根拠にしていたが、中央値より上と
+#: いうことは **ノイズの約半分が通る** ということで、「ノイズ帯より下へは落とさ
+#: ない」という上のポリシー宣言と食い違っていた。相対の棒は
+#: ``max(absolute, top_raw_score * ratio)`` なので top1 は定義上必ず越える —
+#: つまり **この絶対値だけが「このターンには関連する記憶が無い」を表現できる
+#: 唯一の手段** で、そこがノイズ帯の中にあると「関連なし」を表現できない。
+#:
+#: 実測 (2026-08-23 ライブ監査セット 1): 較正が未成立の状態 (新規 local/) で
+#: 実効フロアは 0.15〜0.22 まで下がり、「√2 を小数第 6 位まで教えてください」
+#: に大阪出張の予定が cos 0.1735 で、「税抜き 12,800 円の消費税」に同じ予定が
+#: 0.1863 / 0.1656 で ``[参考情報]`` として注入された。同セッションで本当に
+#: 関連するチャンク (猫の名前の問いに対する猫の記録) は 0.344 / 0.3377 で、
+#: ノイズ帯とは分離していた。
+#:
+#: そこで宣言どおりノイズ分布の p90 に置く。関連ペア (0.467、実測の一致は
+#: 0.34 以上) は十分上に残る。
+_RELATIVE_FLOOR_ABSOLUTE_MIN = 0.24
+
+#: 「そのターンの最良証拠」に対する相対の棒 (既定値)。
+#:
+#: :data:`_RELATIVE_FLOOR_RATIO` とは **符号が逆** なので混同しないこと。
+#: あちらは静的閾値がそのスケールで到達不能なときに floor を **緩める**
+#: 到達性の保険。こちらは top1 と比べて明らかに弱いチャンクを **落とす** 棒。
+#:
+#: なぜ絶対値の棒だけでは足りないか: 較正が効いているとき floor は
+#: ``relevance`` = **background_p95** (ノイズ分布の 95 パーセンタイル) になる。
+#: 構造上ノイズの 5% が通る棒で、「関連しているか」ではなく「ノイズより上か」
+#: しか見ていない。実測 (2026-08-19、chat 56 ターン / 採用 183 チャンク、
+#: 較正値 background_p95=0.302 / match_top1_p25=0.475): 採用スコアは p25 0.352 /
+#: 中央値 0.401 で、**75% が「真の一致の下位 25%」より下**。実サンプルでは
+#: 他人のペルソナを含む挨拶文が 0.32〜0.40 で 5 件通っていた。
+#:
+#: なぜ絶対値を上げるのではなく相対にするか (同じ 42 ターンでの実測):
+#:   絶対 0.40 -> 採用 51%、**15/42 ターンが空になる**
+#:   相対 0.75 -> 採用 73%、**空になるターンは 0**
+#: top1 は定義上必ず棒を越えるので、相対は検索結果を空にしない。
+#: 「ノイズより上か」(絶対) と「このクエリで取れた最良証拠と比べられるか」
+#: (相対) は別の問いで、候補集合が「このクエリの検索結果」である RAG 側では
+#: 後者が意味を持つ (注入側 MemoryInjector が相対を採らない理由は
+#: ``_resolve_relevance_thresholds`` の docstring 参照 — あちらの候補は
+#: ストア全件なので、無関係な集合の top に対する相対は意味を持たない)。
+#: 0.0 で無効化。
+_RELATIVE_KEEP_RATIO = 0.75
+
+
+def _resolve_relative_keep_ratio(rag_cfg: dict) -> float:
+    """``relative_keep_ratio`` を [0, 1] にクランプして返す。"""
+    self_rag = rag_cfg.get("self_rag") or {}
+    try:
+        ratio = float(self_rag.get("relative_keep_ratio", _RELATIVE_KEEP_RATIO))
+    except (TypeError, ValueError):
+        ratio = _RELATIVE_KEEP_RATIO
+    return max(0.0, min(1.0, ratio))
 
 
 def _resolve_keep_floor(
@@ -725,12 +777,19 @@ def _resolve_keep_floor(
 ) -> float:
     """``low_quality_keep_floor`` を ``threshold_mode`` に従って解決する。
 
-    ``auto`` かつ較正が効いているときは較正済み ``relevance`` と同じ棒を使う
-    (「関連性の棒を越えたチャンクは集計判定が low でも残す」)。``manual`` /
-    較正なしでは config の静的値を使うが、そのままだと埋め込みスケールが
-    変わったときに到達不能になるため、``top_raw_score`` との相対でも抑える
-    (:data:`_RELATIVE_FLOOR_RATIO`)。config が ``0.0`` (= 従来どおりクエリ単位の
-    全件破棄) を明示している場合は較正より優先して尊重する。
+    棒は 2 段で決まる。
+
+    1. **絶対の棒** — ``auto`` かつ較正が効いていれば較正済み ``relevance``、
+       ``manual`` / 較正なしでは config の静的値。静的値は埋め込みスケールが
+       変わると到達不能になるので ``top_raw_score`` との相対で緩める
+       (:data:`_RELATIVE_FLOOR_RATIO`、**緩める方向**)。
+    2. **相対の棒** — そのターンの ``top_raw_score`` の
+       :data:`_RELATIVE_KEEP_RATIO` 倍 (**絞る方向**)。絶対の棒は
+       「ノイズより上か」しか見ておらず、較正時は定義上ノイズの 5% が通る。
+
+    最終的な floor は 1 と 2 の **高い方**。top1 は定義上 2 を越えるため、
+    相対の棒で結果集合が空になることはない。config が ``0.0`` (= 従来どおり
+    クエリ単位の全件破棄) を明示している場合は較正より優先して尊重する。
     """
     self_rag = rag_cfg.get("self_rag") or {}
     configured = float(self_rag.get("low_quality_keep_floor", 0.0))
@@ -743,11 +802,19 @@ def _resolve_keep_floor(
         and get_active_calibration() is not None
     )
     if calibrated:
-        return float(thresholds.relevance)
-    if top_raw_score > 0.0:
+        absolute = float(thresholds.relevance)
+    elif top_raw_score > 0.0:
         relaxed = min(configured, top_raw_score * _RELATIVE_FLOOR_RATIO)
-        return max(relaxed, min(configured, _RELATIVE_FLOOR_ABSOLUTE_MIN))
-    return configured
+        absolute = max(relaxed, min(configured, _RELATIVE_FLOOR_ABSOLUTE_MIN))
+    else:
+        absolute = configured
+
+    # 絶対の棒を通ったうえで、そのターンの最良証拠と比べて弱いものを落とす。
+    # top1 は定義上必ず越えるので結果集合が空になることはない。
+    ratio = _resolve_relative_keep_ratio(rag_cfg)
+    if ratio > 0.0 and top_raw_score > 0.0:
+        return max(absolute, top_raw_score * ratio)
+    return absolute
 
 
 async def unified_search(
@@ -800,6 +867,12 @@ async def unified_search(
     necessity_judge = RetrievalNecessityJudge()
     full_context = working_mem.get_context()
     context_count = len(full_context)
+    # 「答えは今の窓の中にある」という前提で skip するルール (自明質問の
+    # セッション自己参照枝 / 十分コンテキスト) は、WorkingMemory が 1 件でも
+    # 押し出した時点で前提が崩れる。押し出し後も ``context_count`` は上限付近
+    # で張り付くため、そのままだとセッションの残り全部で記憶検索が skip され
+    # 続ける (2026-08-23 ライブ監査: 35/94 ターン)。
+    window_complete = int(getattr(working_mem, "session_evicted_turns", 0) or 0) == 0
     # 末尾ターンは現在のユーザクエリ自身 (chat service が search 前に
     # WorkingMemory.add_turn 済) なので、補助タスクプロンプトの "最新のクエリ"
     # と重複しないよう除外する。末尾が user role でない (テスト経路等) なら
@@ -816,7 +889,9 @@ async def unified_search(
     # 見えていなかった (2026-08-01 プロファイリング)。
     if timer is not None:
         timer.start("necessity_ms")
-    rule_necessity = necessity_judge.judge_rule_only(query, context_count)
+    rule_necessity = necessity_judge.judge_rule_only(
+        query, context_count, window_complete=window_complete,
+    )
     necessity: str | None = None
     if rule_necessity != "uncertain":
         necessity = rule_necessity
@@ -850,10 +925,15 @@ async def unified_search(
                     scope="request",
                 )
     if necessity is None:
-        necessity = necessity_judge.judge(query, context_count=context_count)
+        necessity = necessity_judge.judge(
+            query, context_count=context_count, window_complete=window_complete,
+        )
     if timer is not None:
         timer.stop("necessity_ms")
-    logger.debug("Step 1 necessity: %s (context_count=%d)", necessity, context_count)
+    logger.debug(
+        "Step 1 necessity: %s (context_count=%d, window_complete=%s)",
+        necessity, context_count, window_complete,
+    )
     # `fetch` は外部 fetch_url 委譲シグナル — RAG パイプラインは `skip` と同等に
     # 即終了し、ToolCallJudge / fetch_url ツールに委ねる。
     if necessity in ("skip", "fetch"):

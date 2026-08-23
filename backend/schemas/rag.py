@@ -243,6 +243,18 @@ class SelfRagConfig(BaseModel):
     # Level 1 進化の対象外 (policy_interpreter の search ドメインに登録しない)。
     low_quality_keep_floor: float = Field(default=0.40, ge=0.0, le=1.0)
 
+    # 「そのターンの最良証拠 (top1 の生スコア)」に対する相対の棒。
+    # low_quality_keep_floor が「ノイズより上か」を見るのに対し、こちらは
+    # 「このクエリで取れた最良証拠と比べられるか」を見る。較正が効いていると
+    # 絶対の棒は background_p95 になり、構造上ノイズの 5% が通る。実測
+    # (2026-08-19、chat 56 ターン / 採用 183 チャンク、background_p95=0.302 /
+    # match_top1_p25=0.475): 採用スコアの 75% が「真の一致の下位 25%」より下で、
+    # 他人のペルソナを含む挨拶文が 0.32〜0.40 で通っていた。
+    # 絶対値を 0.40 へ上げると 15/42 ターンが空になるのに対し、相対 0.75 は
+    # 採用を 73% に絞りつつ空になるターンが 0 (top1 は定義上必ず越えるため)。
+    # 0.0 で無効化。Level 1 進化の対象外 (low_quality_keep_floor と同じ理由)。
+    relative_keep_ratio: float = Field(default=0.75, ge=0.0, le=1.0)
+
     # 品質 3 閾値 (relevance / support / confidence) の決め方。
     # ``auto``  : 実ストアのスコア分布から較正した値を使う (埋め込みモデル指紋で
     #             キャッシュ)。較正が無ければ config の静的値へ縮退する。

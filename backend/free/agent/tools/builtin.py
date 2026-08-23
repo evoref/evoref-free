@@ -7,7 +7,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from backend.free.api.chat.chat_constants import LLM_TOOL_EXECUTION_TIMEOUT_SEC
-from backend.free.core.system_info import format_hardware_facts
+from backend.free.core.system_info import (
+    format_hardware_facts,
+    format_runtime_facts,
+)
 from backend.free.llm.utils import extract_content
 from backend.i18n_helper import prose_language_name
 from backend.log_config import get_logger
@@ -573,6 +576,27 @@ def register_builtin_tools(
             "Report host hardware facts (OS / CPU / cores / RAM / CPU usage / "
             "GPU VRAM) without a shell (injected by the tool judge; not "
             "directly selectable)"
+        ),
+        parameters={},
+        modes=["chat"],
+        hidden=True,
+    )
+
+    # 自己構成 (どのモデルを serve しているか / n_ctx / ポート)。ハードウェアと
+    # 同じ立て付けで、シェル経由では取れない (readonly allow-list は config も
+    # /props も読めない)。hidden=True で層0.6b が注入する。
+    # 実測 (/props 由来の metadata) と宣言 (config) を区別して返す —
+    # config を書き替えても llama-server を再起動しなければ反映されない。
+    registry.register(
+        name="evoref_runtime_info",
+        func=lambda: format_runtime_facts(
+            cfg, getattr(local_client, "metadata", None),
+        ),
+        description=(
+            "Report this assistant's own runtime configuration (served base "
+            "model, embedding model, context size, slots, llama-server ports) "
+            "without a shell (injected by the tool judge; not directly "
+            "selectable)"
         ),
         parameters={},
         modes=["chat"],

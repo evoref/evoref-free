@@ -22,6 +22,9 @@ from backend.free.api.schemas import (
     StatusResponse,
 )
 from backend.config import get_config, resolve_context_size
+from backend.free.core.system_info import (
+    PROCESS_START_TIME as _PROCESS_START_TIME,
+)
 from backend.edition import current_edition
 from backend.log_config import get_logger
 from backend.version import get_runtime_version, get_version_info
@@ -30,7 +33,10 @@ logger = get_logger("api.status")
 
 router = APIRouter(prefix="/api", tags=["status"])
 
-_start_time = time.time()
+# uptime の SSOT は ``core.system_info.PROCESS_START_TIME``。ここで独自に
+# 起点を持つと、``evoref_runtime_info`` (チャットの自己構成回答) と
+# ``/api/status`` の稼働時間が食い違う。
+_start_time = _PROCESS_START_TIME
 
 
 async def _collect_component_statuses(

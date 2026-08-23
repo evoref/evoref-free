@@ -35,8 +35,32 @@ if TYPE_CHECKING:
 logger = get_logger("learning.policy_evolver")
 
 # 進化対象ドメイン（learning は進化のメタパラメータなので対象外）
+#: ``router`` は **意図的に含めない**。
+#:
+#: router の param は層の振り分け閾値 (``short_query_*``) と消費者ゼロの
+#: ``rag_score_threshold`` しか無い。前者は上げるほど **記憶なし経路**
+#: (reactive / reactive_light は RAG / SemMem / few-shot / ツール判定を全て外す)
+#: へ落ちるターンが増え、プロンプトが縮んでコスト項が改善する。一方 router の
+#: 品質項は
+#:     fitness = 1 - (user_correction or rephrased_query) / total
+#: で、「引くべき記憶を引かずに『確認できていません』と答えた」ことは
+#: ユーザーが訂正も再質問もしない限り 1 件も数えられない。片側だけが動く
+#: 構造なので、最適化器は制約上限まで広げ続ける。
+#:
+#: 実測 (2026-08-23 ライブ監査): local/ を全消去した状態から同一セッション内の
+#: 2 進化ステップで chat の ``short_query_max_chars`` が 20 → 34 へ動き、
+#: fitness は 0.9362 → 0.9453 と **改善判定** された (decline_count=0)。同じ
+#: コード・同じ 203 クエリの再分類で reactive は 5 件 (2.5%) → 53 件 (26.1%) と
+#: 10.6 倍。落ちた中には「リーダーは佐藤さんではなく鈴木さんに交代しました。」の
+#: ような訂正や、ツール台帳が要る自己申告の問いが含まれていた。
+#:
+#: relevance floor に既に書かれている原則 (``search_pipeline``: 「このゲートは
+#: モデルが何を見るかを決めるため、モデル自身の出力由来の turn_outcome で
+#: 自動調整すると閉ループになる」) と同じ性質で、router だけが未適用だった。
+#: 恒久凍結だけで全滅するドメインは進化対象に置かない
+#: (``test_no_domain_is_frozen_forever`` の不変則) ため、
+#: :data:`PERMANENTLY_FROZEN_PARAMS` ではなくここで外す。
 EVOLVABLE_DOMAINS: list[str] = [
-    "router",
     "memory",
     "search",
     "agent",

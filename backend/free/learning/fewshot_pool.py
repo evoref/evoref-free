@@ -29,6 +29,7 @@ from backend.free.agent.prompt_utils import (
     format_fewshot_section,  # noqa: F401  (re-export for tests)
 )
 from backend.free.core.session_mode import is_valid_session_mode, normalize_session_mode
+from backend.free.core.intent_vocab import own_process_question
 from backend.free.core.text_quality import (
     asks_verbatim_excerpt,
     has_boilerplate_closing,
@@ -36,6 +37,7 @@ from backend.free.core.text_quality import (
     has_chinese_token_leak,
     is_query_echo,
     retracts_own_conclusion,
+    violates_length_constraint,
 )
 from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
 from backend.free.core.response_arithmetic import find_arithmetic_contradictions
@@ -330,6 +332,22 @@ def find_content_rejection(query: str, response: str) -> str | None:
     # (_SELF_RETRACTION_RE 参照)。
     if retracts_own_conclusion(response):
         return "response retracts its own conclusion mid-answer"
+    # 明示された文字数指定を破った応答は「指定は無視してよい」というバイアスを
+    # 注入する。判定器はターン成否と共有する (片方だけ直る状態を作らない)。
+    broken_length = violates_length_constraint(query, response)
+    if broken_length is not None:
+        return f"violates the requested length: {broken_length}"
+    # 自分が何を実行したかの問い (「どのツールを使ったか」「暗算したか」) は、
+    # 正解がそのセッションの実行台帳にしか無い。どんな答えを手本にしても
+    # **別のセッションでは必ず誤り**になるので、内容の正誤に関わらず除外する。
+    #
+    # 実インシデント (2026-08-23 ライブ監査): セット 1 で作話した
+    # 「いま計算した中で、あなたが電卓ツールを使ったのはどれですか？」→
+    # 「電卓ツールは使っていません。」(実際は calculate が 7 回実行済) が
+    # few-shot に載り、セット 2 の同種の問いに Example 1 として提示されていた。
+    # 欠陥が手本に昇格して自己増幅する経路。
+    if own_process_question(query):
+        return "self-report about this session's own tool use (not transferable)"
     return _find_volatile_reason(query, response)
 
 

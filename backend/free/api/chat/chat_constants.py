@@ -36,7 +36,13 @@ DEFAULT_KEEPALIVE_INTERVAL_SEC: float = 15.0
 # Reactive 軽量パス層
 # ---------------------------------------------------------------------------
 
-#: 軽量パス (base 1 ターン) で渡す履歴ターン数 (末尾。現在クエリを含む)
+#: 軽量パスへエスカレーション判定を掛ける履歴長の目安 (メッセージ数)。
+#:
+#: かつては軽量パスへ渡す履歴を ``history[-N:]`` で切る値だった。末尾スライド窓は
+#: 会話が 1 ターン伸びるたびに接頭辞 KV キャッシュを捨てるため、履歴の切り出しは
+#: ``build_chat_messages`` (``_trim_history`` + ``_quantize_history_drop``) へ
+#: 移した。現在この値は ``_gate_reactive_light`` が「会話が単発でない」ことを
+#: 見る目安としてのみ使う。
 REACTIVE_LIGHT_HISTORY_TURNS: int = 6
 
 #: 軽量パスの max_tokens 上限。reactive 分類は短文応答前提で、reasoning 暴走の上限も兼ねる

@@ -682,3 +682,49 @@ class InternalFrameMentionFilter:
         out = strip_internal_frame_mentions(self._buffer)
         self._buffer = ""
         return out
+
+
+class LengthDisclosureFilter:
+    """明示された文字数指定を破ったことを、応答の末尾で開示する。
+
+    ``violates_length_constraint`` は学習シグナル (``FeedbackCollector``) と
+    few-shot の除外にしか使われておらず、**応答時は無検証**だった。指定は本文に
+    あり長さは数えるだけなので、これは推定ではなく確定した矛盾である。黙って
+    出すと「制約違反の隠蔽」になり、後続ターンの自己申告 (「いま書いた説明は
+    何文字でしたか？」) とも食い違う。
+
+    実測 (2026-08-23 ライブ監査 194 ターン): 違反 2 件 (20 文字ちょうどの指定に
+    28 文字 / 30 文字ちょうどの指定に 38 文字)。再生成はストリーミングの
+    作り直しが必要で、この発火率には見合わない。
+
+    **フィルタとして実装する理由**: 判定を層 (deliberative / reactive / …) の
+    終端処理に置くと、そこを通らない層で黙って外れる。実インシデント
+    (2026-08-23 検証): 終端処理へ入れた直後の再測定で「20文字ちょうどで自己
+    紹介してください。」が ``short_query`` → **reactive** に分類され、注記が
+    一度も出なかった。パイプラインは全 LLM ストリーミング経路が組むので、
+    ここに置けば層に依存しない。
+    """
+
+    def __init__(self, query: str = "") -> None:
+        self._query = query or ""
+        self._seen: list[str] = []
+
+    def process(self, token: str) -> str:
+        if token:
+            self._seen.append(token)
+        return token
+
+    def flush(self) -> str:
+        from backend.free.core.text_quality import violates_length_constraint
+
+        if not self._query:
+            return ""
+        response = "".join(self._seen)
+        self._seen.clear()
+        if not response.strip():
+            return ""
+        reason = violates_length_constraint(self._query, response)
+        if reason is None:
+            return ""
+        logger.info("Length constraint violated (%s)", reason)
+        return f"\n\n(注: 指定された文字数に対し、上の回答は {len(response.strip())} 文字です)"

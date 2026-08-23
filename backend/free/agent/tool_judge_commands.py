@@ -176,8 +176,16 @@ _OFFSET_UNITS = {
 #: ローカル時刻だと 2 つの時計が無印で並ぶ。JST では 00:00-09:00 の間、
 #: ローカル日付と UTC 日付が 1 日ずれるため、モデルはどちらを「今日」と
 #: 呼ぶべきか判断できない (2026-08-05 ライブ監査で構造として確認)。
+#:
+#: 曜日 (``%A``) も出す。出さないと「今日は何曜日」以外のターンで曜日に触れた
+#: とき、モデルが日付から曜日を暗算して外す (実測 2026-08-22 ライブ監査の
+#: 修正検証: 「今の時刻を教えてください。」→「2026年8月22日（金）の午前1時37分」。
+#: 8/22 は土曜)。``datetime.datetime.now()`` は ``_DATE_ARITHMETIC_RE``
+#: (``datetime.datetime(``) に一致しないので、リコール時の日付演算ガードは
+#: この追加後も従来どおり now-only コマンドを弾く。
 _DATETIME_NOW_COMMAND = (
-    'python -c "import datetime; print(datetime.datetime.now().astimezone())"'
+    'python -c "import datetime; n=datetime.datetime.now().astimezone();'
+    " print(n); print('weekday:', n.strftime('%A'))\""
 )
 
 #: 相対日付コマンドの共通前置き (now と目標日を両方出す)。
@@ -219,6 +227,133 @@ def _absolute_weekday_command(query: str) -> str:
     )
 
 
+#: 「あと何日」「何日間」「残り日数」等、**2 点間の日数** を尋ねる語。
+_DAY_COUNT_ASK_RE = re.compile(
+    r"何日間|あと何日|残り\s*(?:の)?\s*日数|日数は|何日ある|何日です"
+    r"|まで(?:は)?\s*何日"
+    r"|(?<![A-Za-z])how\s+many\s+days(?![A-Za-z])"
+    r"|(?<![A-Za-z])days\s+(?:left|remaining|until)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+#: 「今年の残り」「年末まで」— 年末までの日数。
+_YEAR_REMAINDER_RE = re.compile(
+    r"今年.{0,6}(?:残り|あと)|年末まで|(?:残り|あと).{0,4}今年"
+    r"|(?<![A-Za-z])rest\s+of\s+(?:the\s+)?year(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def _iter_absolute_dates(query: str) -> list[tuple[int, int, int]]:
+    """クエリ中の実在する絶対日付 (年月日が揃ったもの) を出現順に返す。"""
+    found: list[tuple[int, int, int]] = []
+    for m in _ABSOLUTE_DATE_RE.finditer(query or ""):
+        parts = m.groups()
+        triple = parts[:3] if parts[0] is not None else parts[3:]
+        try:
+            year, month, day = (int(v) for v in triple)
+            datetime.date(year, month, day)
+        except (TypeError, ValueError):
+            continue
+        found.append((year, month, day))
+    return found
+
+
+def _day_count_command(query: str) -> str:
+    """日数を数えるクエリ用に、差分まで Python に計算させるコマンドを返す。
+
+    該当しなければ空文字列 (呼び出し側が従来のコマンドへ倒す)。
+
+    相対日付 (「100 日後」) と絶対日付の曜日は既に Python 側で計算させて
+    いるのに、**2 点間の日数だけモデルの暗算に残っていた**。ツールは現在時刻
+    しか返さないので、月ごとの日数の足し上げと引き算がそのまま出力に乗る。
+    実インシデント 2026-08-22 ライブ監査:
+
+    - 「締め切りまであと何日ありますか？」(締切 2026-10-15 / 当日 2026-08-21)
+      → ``run_command_readonly`` は現在日時だけを返し、回答は「25 日」。正解 55。
+    - 「今年の残り日数は何日ですか？」→ 1〜7 月の合計を 182 日 (正 212)、
+      さらに ``365 - 203`` を 62 と誤り、回答は「62 日」。正解 132。
+
+    同じ日に「2026年8月21日から2026年10月15日までは何日間ありますか？」
+    (両端が本文にある) は 55 日と正答している。数えられないのではなく、
+    **一方の端がツール出力や記憶から来ると崩れる**。
+
+    対応するのはクエリだけで両端が決まる 3 形:
+
+    1. 絶対日付が 2 つ → その差
+    2. 絶対日付が 1 つ → 今日との差
+    3. 「今年の残り / 年末まで」 → 今日から 12/31 までの差
+    """
+    if not _DAY_COUNT_ASK_RE.search(query or ""):
+        return ""
+    dates = _iter_absolute_dates(query)
+    if len(dates) >= 2:
+        (y1, m1, d1), (y2, m2, d2) = dates[0], dates[1]
+        return (
+            'python -c "import datetime;'
+            f" a=datetime.date({y1},{m1},{d1}); b=datetime.date({y2},{m2},{d2});"
+            " print('from:',a); print('to:',b);"
+            " print('days:',abs((b-a).days))\""
+        )
+    if len(dates) == 1:
+        y, mo, d = dates[0]
+        return (
+            'python -c "import datetime;'
+            " n=datetime.datetime.now().astimezone(); t=n.date();"
+            f" a=datetime.date({y},{mo},{d});"
+            " print('now:',n); print('target:',a);"
+            " print('days:',(a-t).days)\""
+        )
+    if _YEAR_REMAINDER_RE.search(query or ""):
+        return (
+            'python -c "import datetime;'
+            " n=datetime.datetime.now().astimezone(); t=n.date();"
+            " e=datetime.date(t.year,12,31);"
+            " print('now:',n); print('year_end:',e);"
+            " print('days:',(e-t).days)\""
+        )
+    return ""
+
+
+#: 「(過去に述べられた事実) は何日でしたか？」型の想起。``何月`` / ``何日`` /
+#: ``何時`` は ``DATETIME_QUERY_RE`` に載っているため、**ユーザーが以前伝えた
+#: 日付を訊き直しただけ**のターンでも現在日時コマンドが撃たれていた。
+#: 実インシデント (2026-08-22 ライブ監査 2 回目 ターン 18/26):
+#: 「私の誕生日は何年何月何日でしたか？」「誕生日は変わっていませんよね？
+#: 何日でしたか？」の 2 ターンで ``datetime.now()`` が実行された。求められて
+#: いるのは記憶の想起であって現在時刻ではなく、注入された「今日の日付」は
+#: 誤答の材料にしかならない。
+#:
+#: 抑止は **now-only コマンドに落ちる分岐だけ** に掛ける。絶対日付
+#: (「1987年3月14日は何曜日でしたか？」) や相対日付 (「3年前の今日は何曜日
+#: でしたか？」) は過去形でも計算が要るため、従来どおり撃つ。
+_PAST_RECALL_TAIL_RE = re.compile(
+    r"でした(?:か|っけ)|だった(?:か|っけ)|だっけ"
+    r"|(?:と)?(?:言|いい|伝え|教え)(?:い?ました|った)"
+    r"|覚えて(?:い|ま|る)",
+)
+
+#: 「現在」を指す語。1 つでもあれば now-only コマンドを抑止しない。
+#: ``いま`` / ``きょう`` は 2 文字の部分文字列で、無関係な語に埋もれる
+#: (変わって**いま**せん / **興味** → きょうみ)。実際に「誕生日は変わって
+#: いませんよね？何日でしたか？」の「て**いま**せん」が現在アンカーとして
+#: 誤ヒットし、抑止が効かなかった。後続文字で除外する。
+_PRESENT_ANCHOR_RE = re.compile(
+    r"今日|本日|現在|ただいま|只今|今[のはがもへ、。 ]|今$"
+    r"|いま(?![すせしそまん])|きょう(?![みりょ])"
+    r"|(?<![A-Za-z])(?:now|today|current|currently)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def _is_past_fact_recall(query: str) -> bool:
+    """現在日時ではなく「以前述べられた日付」を訊いているか (純粋関数)。"""
+    q = query or ""
+    if _PRESENT_ANCHOR_RE.search(q):
+        return False
+    return bool(_PAST_RECALL_TAIL_RE.search(q))
+
+
 def _build_datetime_command(query: str) -> str:
     """日付 / 時刻クエリ用のコマンドを組み立てる。
 
@@ -229,13 +364,23 @@ def _build_datetime_command(query: str) -> str:
     正答しており、暗算が当たるかどうかは運になっていた。
 
     年月日が揃った絶対日付の曜日を尋ねる場合も同じ理由で Python に計算させる
-    (``_absolute_weekday_command``)。
+    (``_absolute_weekday_command``)。2 点間の日数も同様 (``_day_count_command``)。
 
-    どちらでもなければ従来どおり現在日時のみを返す。
+    どれでもなければ従来どおり現在日時のみを返す。
     """
+    day_count = _day_count_command(query)
+    if day_count:
+        return day_count
     m = _RELATIVE_OFFSET_RE.search(query or "")
     if m is None:
-        return _absolute_weekday_command(query) or _DATETIME_NOW_COMMAND
+        absolute = _absolute_weekday_command(query)
+        if absolute:
+            return absolute
+        # now-only へ落ちる分岐だけ、過去事実の想起を抑止する
+        # (_is_past_fact_recall 参照)。
+        if _is_past_fact_recall(query):
+            return ""
+        return _DATETIME_NOW_COMMAND
     kind = _OFFSET_UNITS.get(m.group(2))
     if kind is None:
         return _DATETIME_NOW_COMMAND
@@ -402,6 +547,38 @@ def recalled_command_fits_query(
         command,
     ):
         return False
+    # 日数を数えるクエリも同じ。``_day_count_command`` が答えを出せる形なのに
+    # 日付演算を含まないコマンドを引き当てると、ビルダの出力が捨てられて差分が
+    # 暗算に戻る。実測 (2026-08-22 ライブ監査、修正の実機検証):
+    # 「今年の残り日数は何日ですか？」に対し sim=0.4563 (下限 0.45) で
+    # 「今から100日後」由来の **現在時刻 print だけ** のコマンドが再生され、
+    # 回答は 134 日 (正 131)。相対日付ガードは ``_RELATIVE_OFFSET_RE`` を
+    # 見るので、オフセット表現の無いこの形には掛からなかった。
+    if _day_count_command(query) and not _DATE_ARITHMETIC_RE.search(command):
+        return False
+    # 過去に述べられた日付の想起 (「私の誕生日は何年何月何日でしたか？」) には
+    # 現在日時コマンドを撃たない。``_build_datetime_command`` 側は抑止済みだが、
+    # **リコール層はビルダを通らない** ため素通りしていた。実測
+    # (2026-08-22 ライブ監査 2 回目の修正検証、セット2 ターン42):
+    # ビルダ側の抑止を入れた直後の再測定で ``executable_command_recall_matched``
+    # として同じ now-only コマンドが再生された。日付演算を含むコマンド
+    # (絶対日付・相対日付) は従来どおり通す。
+    if _is_past_fact_recall(query) and not _DATE_ARITHMETIC_RE.search(command):
+        return False
+    # クエリに **絶対日付が書かれている** なら、引き当てたコマンドはその年月日を
+    # 含んでいなければならない。「日付演算を含むか」だけでは足りない —
+    # 別の日付が焼き込まれたコマンドも ``_DATE_ARITHMETIC_RE`` に当たるため。
+    # 実インシデント (2026-08-22 ライブ監査 2 回目 セット2 ターン48):
+    # 「今日から2027年1月1日まで何日ありますか？」に対し「今年の残り日数」用の
+    # ``datetime.date(t.year,12,31)`` 入りコマンドが再生され、``days: 131``
+    # (今年の残り) が返った。origin_query 側に数値が無いため既存の
+    # literal 判定も素通りしていた。ビルダ (``_day_count_command``) は
+    # クエリの日付でコマンドを組むので、リコールで代用する理由が無い。
+    date_m = _ABSOLUTE_DATE_RE.search(query or "")
+    if date_m:
+        groups = [g for g in date_m.groups() if g]
+        if not all(str(int(g)) in command for g in groups):
+            return False
     if not origin_query:
         return True
     parameters = _numeric_literals(command) & _numeric_literals(origin_query)
@@ -429,6 +606,12 @@ def _infer_executable_command(query: str) -> str:
     for pattern, command in _EXECUTABLE_QUERY_COMMANDS:
         if pattern.search(query):
             if callable(command):
-                return command(query)
+                built = command(query)
+                # ビルダが「このクエリには撃たない」と判断した場合 (空文字) は
+                # 後続のパターンへ委ねる。ここで即 return すると、先頭に居る
+                # 日時パターンが後続表 (スペック / ディスク等) を飲み込む。
+                if not built:
+                    continue
+                return built
             return command
     return ""

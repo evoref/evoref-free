@@ -93,6 +93,10 @@ class SleepTimeScheduler:
         #: 「次の Full を前倒しで走らせる」要求 (:meth:`request_full_soon`)。
         #: 訂正ターンのように、記憶へ早く反映しないと意味が薄れる出来事で立てる。
         self._full_requested: bool = False
+        #: 期限切れ / 前倒し要求で **実際に走り出した** Full の実行中フラグ。
+        #: True の間は :meth:`on_user_input` が worker も待機タスクも止めない
+        #: (:meth:`_schedule_full` の説明を参照)。
+        self._full_forced_run: bool = False
         # Trigger C: Level 1 のアイドル閾値（独立常駐ループから参照）
         self.level1_idle_minutes: float = learning.get("level1_idle_minutes", 30)
         # Trigger C: Level 1 ループの再評価間隔（秒）
@@ -227,8 +231,24 @@ class SleepTimeScheduler:
         """ユーザー入力通知: 実行中のタスクをキャンセル"""
         self._last_user_input = time.time()
 
-        # 実行中のワーカーをキャンセル
-        if self._worker is not None:
+        # 実行中のワーカーをキャンセル。ただし **期限切れ / 前倒し要求で
+        # 走り出した Full** は止めない。
+        #
+        # 待機タスクを残す対策 (下の ``_full_task`` 側) だけでは足りなかった。
+        # ``_schedule_full`` は実行開始時に ``_full_requested = False`` /
+        # ``_last_full_run = now`` を置くため、走り出した瞬間に
+        # ``_full_defer_expired()`` が False へ戻る。結果、次のユーザー入力で
+        # worker がキャンセルされ、待機タスクも「期限切れではない」ものとして
+        # 消される。実測 (2026-08-22 ライブ監査、chat 100 ターン):
+        # 00:10:45 に 32.5 分待って強制起動した Full が 00:11:02 に
+        # ``cancelled mid-run`` で落ち、45 分 / 50 ターンで Full の完走 0 回、
+        # SemMem の chat ファクトは 0 件だった (手動 trigger で走らせると
+        # 同じ STM から 30 件抽出された)。
+        #
+        # sleep-time は AuxClient の専有スロットを使うので、チャット生成の
+        # KV とは分離されている (CLAUDE.md §6 #1)。強制実行分を走り切らせても
+        # 応答パスの安全性は変わらない。
+        if self._worker is not None and not self._full_forced_run:
             self._worker.cancel()
 
         # Light タスクをキャンセル
@@ -253,11 +273,16 @@ class SleepTimeScheduler:
         # 生成中に割り込まない保証は ``_chat_in_flight`` (と下の worker.cancel)
         # が担うので、待機タスクを残しても実行タイミングの安全性は変わらない。
         if self._full_task is not None and not self._full_task.done():
-            if self._full_requested or self._full_defer_expired():
+            if (
+                self._full_forced_run
+                or self._full_requested
+                or self._full_defer_expired()
+            ):
                 logger.debug(
                     "Full task kept alive across user input "
-                    "(requested=%s, deferred=%.1f min)",
-                    self._full_requested, self._full_deferred_seconds() / 60,
+                    "(forced_run=%s, requested=%s, deferred=%.1f min)",
+                    self._full_forced_run, self._full_requested,
+                    self._full_deferred_seconds() / 60,
                 )
             else:
                 self._full_task.cancel()
@@ -328,6 +353,17 @@ class SleepTimeScheduler:
         self._last_response = time.time()
 
         if self._worker is None:
+            return
+
+        # 強制実行中の Full は張り直さない。ここは応答のたびに無条件で
+        # タスクを作り替えるため、``on_user_input`` 側だけ免除しても
+        # **応答完了のタイミングで同じ Full が消える** (実測 2026-08-22
+        # ライブ監査: 00:10:45 開始 → 00:11:02 に worker cancel、
+        # 00:11:12 の on_response_sent で待機タスクごと差し替え)。
+        if self._full_forced_run:
+            logger.debug(
+                "Trigger B: a forced full is running; keeping the current task",
+            )
             return
 
         # 既存の Full タスクをキャンセル
@@ -560,6 +596,13 @@ class SleepTimeScheduler:
             logger.info("Trigger B: starting Full sleep-time update")
             self._running = True
             executed = True
+            # 「待たされ続けた末に強制で走らせた回」かどうかを、状態を潰す前に
+            # 確定させる。この後 ``_full_requested`` / ``_last_full_run`` を
+            # 更新すると ``_full_defer_expired()`` は False へ戻るため、
+            # on_user_input 側からは判別できなくなる。
+            self._full_forced_run = (
+                self._full_requested or self._full_defer_expired()
+            )
             self._full_requested = False
             self._last_full_run = time.time()
             # Step 8 の入力 (STM ノート) を用意してから走らせる。押し出しが
@@ -591,8 +634,12 @@ class SleepTimeScheduler:
             logger.error("Full sleep-time update failed: %s", e, exc_info=True)
         finally:
             self._running = False
+            forced = self._full_forced_run
+            self._full_forced_run = False
             elapsed_ms = (time.monotonic() - t_start) * 1000
-            extra: dict = {"cancelled": cancelled, "executed": executed}
+            extra: dict = {
+                "cancelled": cancelled, "executed": executed, "forced": forced,
+            }
             if skipped_reason is not None:
                 extra["skipped_reason"] = skipped_reason
             _emit_bg_task_outcome(

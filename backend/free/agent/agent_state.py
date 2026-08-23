@@ -20,6 +20,14 @@ class AgentState:
     last_error: str = ""
     pending_tool: str | None = None
     pending_args: dict = field(default_factory=dict)
+    #: このターンで「状態を変える操作を選んだが実行できなかった」か。
+    #:
+    #: ``ToolCallJudge`` はプロセス唯一の共有インスタンスで、判定中に ``await``
+    #: を挟む。呼出側が後から属性を読むと、チャットが 2 本重なったときに他方の
+    #: ``judge()`` がリセット済みで値が消える。``AgentState`` はターンごとに
+    #: 生成されるので、判定結果をここへ写して以後の読み手に渡す
+    #: (``ToolJudgement.action_blocked`` のコメント参照)。
+    action_blocked: bool = False
 
     # 出力状態
     expected_format: str | None = None  # 'json' | 'unified_diff' | None
