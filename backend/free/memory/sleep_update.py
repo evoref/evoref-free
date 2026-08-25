@@ -99,6 +99,7 @@ class SleepTimeWorker:
         self.cartridge_manager = cartridge_manager
         self._aux_prompt_manager = aux_prompt_manager
         self._bm25_retriever: BM25Retriever | None = None
+        self._fewshot_pool = None
         self._cancelled = False
         # ── Step 8 (Extractor) 用 ──
         self._semantic_store_provider = semantic_store_provider
@@ -129,6 +130,10 @@ class SleepTimeWorker:
     def set_bm25_retriever(self, bm25: BM25Retriever) -> None:
         """BM25Retriever を設定（プレフィックス生成後の再構築に使用）"""
         self._bm25_retriever = bm25
+
+    def set_fewshot_pool(self, pool) -> None:
+        """FewShotPool を設定 (手本の埋め込み backfill に使用)。"""
+        self._fewshot_pool = pool
 
     def cancel(self) -> None:
         """実行中の処理をキャンセル（現在のステップ完了後に停止）"""
@@ -532,11 +537,81 @@ class SleepTimeWorker:
         result["compressed"] = self._step10_compact_sessions()
         step_durations["step10b_history_compact"] = round(time.monotonic() - ts, 3)
 
+        # Step 10b-2: 手本 (few-shot) の埋め込みを遡って生成する。
+        # 埋め込みが載るまでその手本は密ベクトル選択の候補にならない
+        # (STM ノートが embed 工程を通るまで注入対象にならないのと同じ契約)。
+        ts = time.monotonic()
+        result["fewshot_embeddings_backfilled"] = (
+            await self._step10b2_backfill_fewshot_embeddings()
+        )
+        step_durations["step10b2_fewshot_embedding"] = round(time.monotonic() - ts, 3)
+
+        # Step 10c: 語彙索引 (BM25) をベクトルストアと同期させる。
+        # チャット応答経路の LTM がこの索引を引くようになったため、昇格した
+        # ばかりのチャンクが語彙検索から漏れたままになるのを防ぐ。
+        # 以前の再構築点は contextual prefix 生成 (Step 5.8) の中だけで、
+        # ``contextual_prefix.enabled=false`` の構成では **一度も更新されなかった**。
+        ts = time.monotonic()
+        result["lexical_index_rebuilt"] = self._step10c_refresh_lexical_index()
+        step_durations["step10c_lexical_index"] = round(time.monotonic() - ts, 3)
+
         # 永続化 + 完了ログ
         self._save_state()
         elapsed = round(time.monotonic() - t0, 3)
         self._log_full_completion(result, started_at, elapsed, step_durations)
         return result
+
+    async def _step10b2_backfill_fewshot_embeddings(self) -> int:
+        """手本プールの未埋め込みエントリを遡って埋め込む。
+
+        起動時にも背景タスクで一度張るが (``_pillar_wirer``)、以降に採用された
+        手本はここで拾う。埋め込みは永続化しない設計なので、件数は高々
+        「前回サイクル以降の新規」に収まる。
+
+        Returns:
+            埋め込みを新たに付与した手本の数。
+        """
+        pool = self._fewshot_pool
+        if pool is None or self.embedder is None:
+            return 0
+        backfill = getattr(pool, "backfill_embeddings", None)
+        if backfill is None:
+            return 0
+        try:
+            return await backfill(self.embedder)
+        except Exception as e:
+            logger.warning("Step 10b-2: fewshot embedding backfill failed: %s", e)
+            return 0
+
+    def _step10c_refresh_lexical_index(self) -> int:
+        """BM25 索引をベクトルストアの現在のチャンク集合へ張り直す。
+
+        件数が一致していれば no-op。再構築は O(N) のトークナイズなので、
+        チャット応答をブロックしない sleep-time にだけ置く。
+
+        Returns:
+            張り直した場合はチャンク数、no-op なら 0。
+        """
+        bm25 = self._bm25_retriever
+        vs = self.vector_store
+        if bm25 is None or vs is None:
+            return 0
+        try:
+            if bm25.count == vs.count:
+                return 0
+            from backend.free.rag.bm25_retriever import (
+                build_index_from_vector_store,
+            )
+
+            n = build_index_from_vector_store(bm25, vs)
+            logger.info(
+                "Step 10c: lexical index rebuilt (%d -> %d chunks)",
+                bm25.count if n == 0 else n, vs.count,
+            )
+            return n
+        except Exception as e:
+            logger.warning("Step 10c: lexical index rebuild failed: %s", e)
+            return 0
 
     async def _step1_embed_notes(self) -> int:
         """Step 1: 未埋め込みノートの埋め込み生成

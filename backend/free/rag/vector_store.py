@@ -1,6 +1,7 @@
 """numpy ベースのベクトルインデックス（int8 量子化 + memmap 対応）"""
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
@@ -654,6 +655,36 @@ class VectorStore:
             ", ".join(f"{s:.3f}" for _, s, _ in results),
         )
         return results
+
+    def similarity_for(
+        self, query_vec: np.ndarray, chunk_ids: Iterable[str],
+    ) -> dict[str, float]:
+        """指定チャンクとクエリの **素のコサイン類似度** を返す。
+
+        BM25 など別チャネルが見つけたチャンクを、ベクトル検索の結果と
+        同じスケールへ載せ直すための入口。品質判定・関連度フロアはすべて
+        cosine スケール前提なので、別スケールのスコアを混ぜてはいけない
+        (`unified_search` の Step 5 / 6.5 のコメント参照)。
+
+        見つからない ``chunk_id`` は戻り値に含まれない。
+        """
+        want = {cid for cid in chunk_ids if cid}
+        if self.vectors_q8 is None or len(self.vectors_q8) == 0 or not want:
+            return {}
+        idxs = [i for i, m in enumerate(self.metadata) if m.get("id") in want]
+        if not idxs:
+            return {}
+        query_f32 = np.asarray(query_vec, dtype=np.float32).ravel()
+        restored = dequantize_int8(
+            np.asarray(self.vectors_q8)[idxs], np.asarray(self.scales)[idxs],
+        )
+        norms = np.linalg.norm(restored, axis=1).clip(min=1e-9)
+        query_norm = float(np.linalg.norm(query_f32).clip(min=1e-9))
+        sims = restored @ query_f32 / (norms * query_norm)
+        return {
+            self.metadata[gi]["id"]: float(sim)
+            for gi, sim in zip(idxs, sims)
+        }
 
     def delete(self, chunk_ids: list[str]) -> int:
         """指定されたチャンクを削除"""

@@ -132,7 +132,7 @@ class LlamaConfig(BaseModel):
     # 1 に落とすと両者が直列化し、Level 1 変異 1 回ぶん (実測 16〜32 秒) チャットが
     # 待たされる。kv_unified が slots>1 で自動付与されるため per-seq context は
     # n_ctx のままで、VRAM は増えない。
-    slots: int = Field(default=2, ge=1, le=16)
+    slots: int = Field(default=3, ge=1, le=16)
     cache_type_k: str = Field(
         default="q8_0", pattern=r"^(f16|bf16|q8_0|q5_1|q5_0|q4_1|q4_0)$"
     )

@@ -704,6 +704,13 @@ __all__ = [
     "strip_first_person_topic",
     "match_length_directive",
     "violates_length_constraint",
+    "ANSWER_ONLY_RE",
+    "BULLET_FORM_RE",
+    "ITEM_COUNT_RE",
+    "match_output_form_directive",
+    "violates_output_form",
+    "has_verifiable_output_constraint",
+    "length_disclosure_note",
 ]
 
 #: 応答の途中で自分の結論を撤回する言い回し。1 つの応答に結論が 2 つ入る。
@@ -855,4 +862,162 @@ def violates_length_constraint(query: str, response: str) -> str | None:
     return (
         f"asked for exactly {expected} chars but the answer is "
         f"{total} ({stripped} without whitespace)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 出力形式の指定と、その **検証**
+#
+# 文字数と同じ立て付け。指定は本文にあり、守れたかは数えれば分かる。プロンプト
+# へ注記を足すだけで検証しないと、破られたことに誰も気づかない
+# (``violates_length_constraint`` の docstring 参照)。
+#
+# 正規表現の実体はここに置く。以前は ``core.inference`` にあり、注記の生成に
+# しか使われていなかった。検証側 (ストリーム終端) と注記側 (プロンプト構築) が
+# **同じ定義**を見るようにする — 語彙が 2 箇所に分かれると片方だけ直る。
+# ---------------------------------------------------------------------------
+
+#: 「数値だけ」「一言で」型の **答えだけを求める** 指定。
+#:
+#: 実インシデント (2026-08-14 ライブ監査 ターン15): 「摂氏 23 度は華氏何度ですか？
+#: 数値だけ答えてください。」に対し 300 字超の解説を返した。
+#: 「だけ」の後に **応答を指す動詞** を要求する。これが無いと
+#: 「この値だけを使って計算して」(= 使う値の限定) まで拾ってしまう。
+ANSWER_ONLY_RE = re.compile(
+    r"(?:数値|数字|値|結論|答え|回答)\s*だけ\s*(?:を|で)?\s*"
+    r"(?:答え|回答|示し|教え|出力|返し|書い|述べ|お願い)"
+    r"|(?:一言|ひとこと|一語|単語)\s*(?:で|だけ)\s*"
+    r"(?:答え|回答|示し|教え|言っ|いっ|まとめ|表現|お願い)"
+    r"|(?<![A-Za-z])(?:just|only)\s+the\s+(?:number|value|answer)(?![A-Za-z])"
+    r"|(?<![A-Za-z])in\s+one\s+word(?![A-Za-z])"
+    r"|(?<![A-Za-z])(?:number|value|answer)\s+only(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+#: 「箇条書きで」型の **出力形式** 指定。
+#:
+#: 実インシデント (2026-08-14 ライブ監査 ターン39): 「利点と欠点を、各 3 つずつ
+#: 箇条書きで。」に対し「利点：A、B、C」と読点区切りの 1 行で返した。
+BULLET_FORM_RE = re.compile(
+    r"箇条書き|リスト形式|(?:マークダウン|markdown)\s*の?\s*リスト"
+    r"|(?<![A-Za-z])bullet(?:\s+points?|\s+list)?(?![A-Za-z])"
+    r"|(?<![A-Za-z])as\s+a\s+list(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+#: 「各 3 つずつ」「3 個挙げて」型の個数指定 (箇条書き指定と併用されたときだけ使う)。
+ITEM_COUNT_RE = re.compile(
+    r"(?:各)?\s*(\d{1,2})\s*(?:つ|個|点|項目)\s*"
+    r"(?:ずつ|ずつで|挙げ|書|列挙|箇条書き|リスト)"
+    r"|(\d{1,2})\s*(?:items?|points?|bullets?)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+#: 箇条書きの 1 項目として数える行頭。Markdown のリストと日本語の中黒・番号。
+#:
+#: 中黒 (``・``) だけは **空白を要求しない**。日本語の箇条書きは ``・項目`` と
+#: 詰めて書くのが普通で、空白必須にすると正しい出力を違反と誤判定する。
+#: 一方 ``-`` / ``*`` / 番号は空白を必須にする — ``-1度`` や ``3.14`` のような
+#: 数値表現をリスト項目と数えないため。
+_BULLET_LINE_RE = re.compile(r"^\s*(?:・\s*|(?:[-*+]|\d{1,2}[.)、])\s+)\S")
+
+#: ``answer_only`` を破ったと **確信できる** 長さ。
+#:
+#: 「答えだけ」への正解は高々 1 文なので、これを大きく超えたら解説が付いている。
+#: 閾値をきつくしないのは、**誤検知が無駄な再生成を生む**ため。実インシデントは
+#: 300 字超で、この棒の 3 倍以上あった。
+_ANSWER_ONLY_MAX_CHARS = 80
+
+
+def match_output_form_directive(text: str) -> dict[str, int | bool] | None:
+    """発話に含まれる出力形式の指定を返す (純粋関数)。
+
+    Returns:
+        ``{"answer_only": bool, "bullet": bool, "items": int}``。
+        どの指定も無ければ ``None``。``items`` は箇条書き指定と併用された
+        個数指定 (無ければ 0)。
+    """
+    t = text or ""
+    answer_only = bool(ANSWER_ONLY_RE.search(t))
+    bullet = bool(BULLET_FORM_RE.search(t))
+    if not (answer_only or bullet):
+        return None
+    items = 0
+    if bullet:
+        m = ITEM_COUNT_RE.search(t)
+        if m:
+            items = int(next(g for g in m.groups() if g))
+    return {"answer_only": answer_only, "bullet": bullet, "items": items}
+
+
+def violates_output_form(query: str, response: str) -> str | None:
+    """応答が発話中の **形式指定** を破っていれば理由を返す (純粋関数)。
+
+    判定はすべて数えるだけで、真偽の推定を含まない。誤検知は無駄な再生成に
+    なるので、どの規則も「破ったと確信できる」側に倒してある。
+    """
+    directive = match_output_form_directive(query)
+    if directive is None:
+        return None
+    body = (response or "").strip()
+    if not body:
+        return None
+
+    bullet_lines = [ln for ln in body.splitlines() if _BULLET_LINE_RE.match(ln)]
+
+    if directive["bullet"] and not bullet_lines:
+        return "asked for a bullet list but the answer has no list items"
+
+    items = int(directive["items"] or 0)
+    if directive["bullet"] and items and bullet_lines:
+        # 「各 N つずつ」は複数グループに分かれることがあるので、総数が N の
+        # 倍数なら満たしているとみなす (2 グループ × 3 項目 = 6 行)。
+        if len(bullet_lines) % items != 0:
+            return (
+                f"asked for {items} items but the answer has "
+                f"{len(bullet_lines)} list items"
+            )
+
+    if directive["answer_only"] and len(body) > _ANSWER_ONLY_MAX_CHARS:
+        return (
+            f"asked for the answer only but the reply is {len(body)} chars"
+        )
+    return None
+
+
+def has_verifiable_output_constraint(query: str) -> bool:
+    """発話に **決定論で検証できる** 出力制約が含まれるか (純粋関数)。
+
+    ``True`` のターンだけ、応答をバッファして検証・修復する価値がある
+    (:mod:`backend.free.api.chat.chat_stream_common` の repair 経路)。
+    """
+    q = query or ""
+    return (
+        match_length_directive(q) is not None
+        or match_output_form_directive(q) is not None
+    )
+
+
+def length_disclosure_note(query: str, response: str) -> str:
+    """文字数指定を満たせなかったときに末尾へ足す開示文 (純粋関数)。
+
+    黙って出すと「制約違反の隠蔽」になり、後続ターンの自己申告
+    (「いま書いた説明は何文字でしたか？」) とも食い違う。ストリームの開示
+    フィルタ (``LengthDisclosureFilter``) と修復経路
+    (``api.chat.constraint_repair``) の両方がこれを使う — 文言を 2 箇所に
+    書くと片方だけ直る。
+
+    **指定値も併記する。** 実測値だけだと、ユーザーは自分が何文字と言ったかを
+    覚えていないと過不足が判断できない (2026-08-25 ライブ監査: 「ちょうど50
+    文字で」への 45 文字の回答に「上の回答は 45 文字です」とだけ出た)。
+    """
+    measured = len((response or "").strip())
+    directive = match_length_directive(query or "")
+    prefix = chr(10) * 2
+    if directive is None:
+        return prefix + f"(注: 上の回答は {measured} 文字です)"
+    kind, expected = directive
+    unit = "文字以内" if kind == "limit" else "文字ちょうど"
+    return prefix + (
+        f"(注: {expected} {unit}の指定に対し、上の回答は {measured} 文字です)"
     )

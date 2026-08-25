@@ -44,11 +44,14 @@ def _truncation_notice() -> str:
 # スロット定数
 SLOT_CHAT = 0
 SLOT_BACKGROUND = 1
+#: ツール分類器 (層 5.9) 専用スロット。``llama.slots >= 3`` のときだけ使う。
+SLOT_CLASSIFIER = 2
 
 __all__ = [
     "LocalClient",
     "SLOT_CHAT",
     "SLOT_BACKGROUND",
+    "SLOT_CLASSIFIER",
     "MAX_ATTEMPTS",
     "RETRYABLE_STATUS_CODES",
 ]
@@ -398,6 +401,32 @@ class LocalClient(BaseHTTPClient):
     def background_slot(self) -> int:
         """バックグラウンド用スロット ID（2スロット以上で 1、それ以外は -1=自動割当）"""
         return SLOT_BACKGROUND if self._slots >= 2 else -1
+
+    @property
+    def classifier_slot(self) -> int:
+        """ツール分類器 (層 5.9) 用スロット ID。3 スロット未満なら背景スロット。
+
+        **なぜ専用スロットが要るか**: 分類器のプロンプトは
+        「ツールメニュー (385 トークン、毎回同一) + 直近会話 + クエリ」で、
+        メニュー部分は接頭辞キャッシュに完全に乗る形をしている。ところが
+        背景スロットを sleep-time / aux と共有しているため、ターンとターンの
+        あいだに走る補助タスクが毎回そのプレフィクスを追い出す。結果、
+        **分類器は毎回 cache_n=0 でフルプリフィル**していた。
+
+        実測 (2026-08-25、Qwen3.8-27B / iGPU、prefill 約 16 tok/s):
+
+            追い出される側 (背景スロット)   422 tok / cache 0   … 37.7 秒
+            追い出されない側 (専用スロット) 同一クエリ再送     … 10.2 秒
+            同上・**別のクエリ**  28 tok / cache 390          … 11.3 秒
+
+        別のクエリでも 390/418 トークンが再利用でき、**1 回あたり約 26 秒**
+        (3.3 倍) 縮む。層 5.9 はチャット遅延の最大成分なので効果が直接出る。
+
+        3 スロット未満の構成では従来どおり背景スロットへ倒す (退行しない)。
+        """
+        if self._slots >= 3:
+            return SLOT_CLASSIFIER
+        return self.background_slot
 
     def _apply_system_fallback(self, messages: list[dict]) -> list[dict]:
         """systemロール非対応モデル: systemをuserの先頭に結合"""

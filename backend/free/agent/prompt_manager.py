@@ -367,13 +367,16 @@ class SystemPromptManager:
         prefix = template.format(name=self.instance_name)
         return prefix + self.contents[mode]
 
-    def get_fewshot_block(self, mode: str, query: str | None = None) -> str:
+    def get_fewshot_block(
+        self, mode: str, query: str | None = None, query_vec=None,
+    ) -> str:
         """query 依存の Few-shot 例を整形済みブロックで返す ("" = 無し)。
 
         ``query`` と selector が両方あれば query 類似で動的選択 (主経路)、無ければ
         進化が凍結した ``meta.candidates`` にフォールバック (後方互換)。
+        ``query_vec`` を渡すと選択が密ベクトル (記憶検索と同じ尺度) になる。
         """
-        examples = self._resolve_fewshot(mode, query)
+        examples = self._resolve_fewshot(mode, query, query_vec)
         return format_fewshot_section(examples) if examples else ""
 
     def get_prompt(self, mode: str, query: str | None = None) -> str:
@@ -386,13 +389,21 @@ class SystemPromptManager:
         return self.get_prompt_static(mode) + self.get_fewshot_block(mode, query)
 
     def _resolve_fewshot(
-        self, mode: str, query: str | None,
+        self, mode: str, query: str | None, query_vec=None,
     ) -> list[FewShotExample]:
         """few-shot 例を解決する: 動的 selector 優先、無ければ凍結 candidates。"""
         selector = self._fewshot_selector
         if query and selector is not None:
             try:
-                examples = selector.select_top_k(mode, query, self._fewshot_k)
+                try:
+                    examples = selector.select_top_k(
+                        mode, query, self._fewshot_k, query_vec,
+                    )
+                except TypeError:
+                    # query_vec を受けない旧シグネチャの実装 (テスト用 Mock 等)
+                    examples = selector.select_top_k(
+                        mode, query, self._fewshot_k,
+                    )
                 if examples:
                     return examples
             except Exception as e:  # selector 障害は静的経路へ縮退

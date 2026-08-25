@@ -447,6 +447,8 @@ class ToolCallJudge:
         mode: str = "create",
         conversation: list[dict] | None = None,
         session_id: str = "",
+        *,
+        allow_classifier: bool = True,
     ) -> ToolJudgement:
         """ツール呼び出しの要否を判定し、**ターン固有の値を結果に載せて** 返す。
 
@@ -459,6 +461,7 @@ class ToolCallJudge:
         """
         result = await self._judge_inner(
             query, tools_registry, mode, conversation, session_id,
+            allow_classifier=allow_classifier,
         )
         # ここに await を入れないこと (入れた瞬間に共有状態のレースが戻る)。
         result.action_blocked = self._action_blocked
@@ -472,8 +475,17 @@ class ToolCallJudge:
         mode: str = "create",
         conversation: list[dict] | None = None,
         session_id: str = "",
+        *,
+        allow_classifier: bool = True,
     ) -> ToolJudgement:
         """ツール呼び出しの要否を判定
+
+        ``allow_classifier=False`` で層 5.9 (ベースモデルの文法制約分類) を
+        外し、**決定論層と学習済みリコールだけ**で判定する。層 5.9 はこの
+        判定系で唯一の推論往復で、実測 34〜39 秒かかる。同じクエリを 2 度
+        判定する経路 (deliberative の 2 手目) では、分類器は同じ答えを返す
+        だけなので撃つ意味が無い — 2 手目に意味があるのは、決定論層が
+        1 手目の実行後に初めて解決できる参照 (会話から引くパス等) だけ。
 
         判定は安価な順に実行し、最初にマッチした結果を返す:
         1. 組み込みパターン照合（ルールベース）
@@ -511,84 +523,6 @@ class ToolCallJudge:
         # 一覧を成功結果として受け取った base が「すべて削除しました」と報告した
         # (実ファイルは 307 件すべて無変更)。
         self._mark_blocked_if_unsupported_mutation(query)
-
-        # 0. URL リコール先回り判定 (mode / enabled に関係なく実行)
-        # ``_try_recall_url`` は決定論的 (embedding 類似度 + 過去採点平均閾値)
-        # で、補助タスク同期発火やルール正規表現のような副作用がない。早期 return
-        # 経路 (chat モード + tool_judge_enabled=false) で判定がスキップされる
-        # と「過去 URL は SemMem にあるのに fetch されない」という不整合が起きる
-        # ため、ここで先回りで引き当てる。
-        url_recall_result = await self._judge_with_url_recall(
-            query, tools_registry, mode=mode,
-        )
-        if url_recall_result is not None:
-            url_recall_result = self._finalize(
-                url_recall_result, tools_registry, mode, query=query,
-            )
-            self._log_tool_decision(url_recall_result, "url_recall_matched")
-            return url_recall_result
-
-        # 0.5. executable command リコール先回り判定 (mode / enabled 非依存)
-        # 過去成功した run_command を SemMem から決定論的に引き当てる。URL
-        # リコールと同様、chat early-return / create 4 層のどちらに入る前にも
-        # 短絡させることで、学習済みクエリでは aux (合成 / 5 層目) を一切
-        # 呼ばずにコマンドを確定できる。
-        #
-        # ただし URL リコールが「ユーザーが URL を書いた」という決定論的根拠を
-        # 持つのに対し、command recall の根拠は類似度のみ。ツール意図のシグナルが
-        # 無いクエリ (好みの表明 / 記憶想起 / 感謝) まで先回りで奪うと、会話履歴で
-        # 答えられる質問が「ツール結果に含まれていません」に化ける
-        # (実測 2026-07-25: 誤発火 6 件中 4 件がこの型)。層0.5 の適用は
-        # ツールシグナルを持つクエリに限定し、かつ記憶想起クエリは除外する。
-        # 「さっき伝えた GPU は何だった？」は 'GPU' が _TOOL_PATTERNS に載るため
-        # ツールシグナル判定を通ってしまうが、答えは会話履歴にある。ここで
-        # コマンドを撃つと、ツール結果が文脈を上書きして
-        # 「ツール結果に GPU 型番は含まれていません」と誤答する (実測 2026-07-25。
-        # 同じ会話の 1 ターン前では Radeon 890M を正しく想起できていた)。
-        # create では run_command が一級のツールで、「依存を入れて」→ 学習済み
-        # `pip install ...` の引き当てが本機能の主目的なのでゲートしない。
-        # 注意: リコールはルール表 (_EXECUTABLE_QUERY_COMMANDS) より **先** に
-        # 短絡する。したがって一度保存されたコマンドはルール表を恒久的に隠し、
-        # コード側でコマンドを直しても学習済みクエリには反映されない
-        # (2026-08-06 実測: 日時コマンドを astimezone() 付きへ直した後も、
-        # SemMem の naive 版が sim=0.9478 で引き当たり旧形式が実行された。
-        # ルール表が非該当の「一年は何日ありますか？」はリコールが外れて
-        # 新コマンドが走っており、差は経路だけだった)。
-        # これは aux 呼出を省くための意図的な順序 (テストで固定) なので
-        # 変えていない。コマンド表を直したときは、対応する
-        # ``mem.world.executable_command.*`` ファクトの purge が要る。
-        # 層0.6 / 0.6b の専用ツール (system_hardware_info / evoref_runtime_info)
-        # が答える質問はリコールの対象外。あちらは「シェル経由では **原理的に**
-        # 取れない」ために作った層で、引き当てたコマンドが代役になれない。
-        # 実インシデント (2026-08-22 ライブ監査 2 回目、セット1/2 で 2 回再現):
-        # 「このPCの搭載メモリの総量と空き容量を教えてください。」に対し
-        # spec コマンド (platform / os / shutil。**RAM を出力しない**) が
-        # リコールで再生され、「搭載メモリの総量は確認できていません」と回答した。
-        # 層0.6 の正規表現は当たっており、順序だけの問題だった。
-        dedicated_tool_query = bool(
-            _HARDWARE_MEMORY_QUERY_RE.search(query)
-            or _RUNTIME_INFO_QUERY_RE.search(query),
-        )
-        recall_allowed = not dedicated_tool_query and (
-            is_create_mode(mode) or (
-                _query_has_tool_signal(query)
-                and not _has_history_recall_keywords(query)
-            )
-        )
-        if recall_allowed:
-            cmd_recall_result = await self._judge_with_executable_command_recall(
-                query, tools_registry, mode=mode,
-            )
-        else:
-            cmd_recall_result = None
-        if cmd_recall_result is not None:
-            cmd_recall_result = self._finalize(
-                cmd_recall_result, tools_registry, mode, query=query,
-            )
-            self._log_tool_decision(
-                cmd_recall_result, "executable_command_recall_matched",
-            )
-            return cmd_recall_result
 
         # 0.6. ハードウェア事実 (搭載 RAM) — 決定論、非シェル。
         # 他のどの層もこの質問に答えられない: spec コマンドは RAM を出力せず
@@ -881,6 +815,85 @@ class ToolCallJudge:
                 )
                 return forced_result
 
+        # ── 学習済みリコール (層 5.6 / 5.7) ───────────────────────────
+        #
+        # **決定論層がすべて外れてから引き当てる。** 以前は層 0 / 0.5 として
+        # 決定論層より **前** に短絡していたため、一度保存されたコマンドが
+        # ルール表と専用ツール層を恒久的に隠していた。実インシデント:
+        #
+        #   - 日時コマンドを astimezone() 付きへ直した後も、SemMem の naive 版が
+        #     sim=0.9478 で引き当たり旧形式が実行された (2026-08-06)。
+        #     ルール表が非該当のクエリだけが新コマンドを実行できていた。
+        #   - 「このPCの搭載メモリの総量と空き容量」に対し、**RAM を出力しない**
+        #     spec コマンドがリコールで再生され「確認できていません」と回答した
+        #     (2026-08-22、2 セットで再現)。層0.6 の正規表現は当たっていた。
+        #
+        # 対処として ``dedicated_tool_query`` の除外リストを手で足してきたが、
+        # 語彙を列挙する対処は必ず漏れる。順序そのものを直す。
+        #
+        # **コストは増えない。** 先回りの動機は「aux / 分類器の往復を省く」
+        # ことだったが、層 0.6〜5.5 はすべて純粋な正規表現で、リコールを
+        # それらの後ろへ動かしても増えるのは正規表現の評価だけ。リコールは
+        # 依然として層 5.9 (ベースモデルの文法制約分類 = 唯一の推論往復) より
+        # 前にあるので、学習済みクエリが分類器を撃つことはない。
+        # 5.6. URL リコール (mode / enabled に関係なく実行)
+        # ``_try_recall_url`` は決定論的 (embedding 類似度 + 過去採点平均閾値)
+        # で、補助タスク同期発火やルール正規表現のような副作用がない。早期 return
+        # 経路 (chat モード + tool_judge_enabled=false) で判定がスキップされる
+        # と「過去 URL は SemMem にあるのに fetch されない」という不整合が起きる
+        # ため、ここで先回りで引き当てる。
+        url_recall_result = await self._judge_with_url_recall(
+            query, tools_registry, mode=mode,
+        )
+        if url_recall_result is not None:
+            url_recall_result = self._finalize(
+                url_recall_result, tools_registry, mode, query=query,
+            )
+            self._log_tool_decision(url_recall_result, "url_recall_matched")
+            return url_recall_result
+
+        # 5.7. executable command リコール (mode / enabled 非依存)
+        # 過去成功した run_command を SemMem から決定論的に引き当てる。層 5.9
+        # (ベースモデルの文法制約分類 = 唯一の推論往復) より前にあるので、
+        # 学習済みクエリで分類器を撃つことはない。
+        #
+        # URL リコールが「ユーザーが URL を書いた」という決定論的根拠を持つのに
+        # 対し、command recall の根拠は類似度のみ。ツール意図のシグナルが無い
+        # クエリ (好みの表明 / 記憶想起 / 感謝) まで引き当てると、会話履歴で
+        # 答えられる質問が「ツール結果に含まれていません」に化ける
+        # (実測 2026-07-25: 誤発火 6 件中 4 件がこの型)。適用はツールシグナルを
+        # 持つクエリに限定し、かつ記憶想起クエリは除外する。
+        # 「さっき伝えた GPU は何だった？」は 'GPU' が _TOOL_PATTERNS に載るため
+        # ツールシグナル判定を通ってしまうが、答えは会話履歴にある。ここで
+        # コマンドを撃つと、ツール結果が文脈を上書きして
+        # 「ツール結果に GPU 型番は含まれていません」と誤答する (実測 2026-07-25。
+        # 同じ会話の 1 ターン前では Radeon 890M を正しく想起できていた)。
+        # create では run_command が一級のツールで、「依存を入れて」→ 学習済み
+        # `pip install ...` の引き当てが本機能の主目的なのでゲートしない。
+        #
+        # 専用ツール (層 0.6 / 0.6b) やルール表 (層 1) の除外リストはもう要らない。
+        # それらはこの層より前に評価されるため、claim されたクエリはここまで
+        # 降りてこない (以前は逆順で、除外語彙を手で足し続けていた)。
+        recall_allowed = is_create_mode(mode) or (
+            _query_has_tool_signal(query)
+            and not _has_history_recall_keywords(query)
+        )
+        if recall_allowed:
+            cmd_recall_result = await self._judge_with_executable_command_recall(
+                query, tools_registry, mode=mode,
+            )
+        else:
+            cmd_recall_result = None
+        if cmd_recall_result is not None:
+            cmd_recall_result = self._finalize(
+                cmd_recall_result, tools_registry, mode, query=query,
+            )
+            self._log_tool_decision(
+                cmd_recall_result, "executable_command_recall_matched",
+            )
+            return cmd_recall_result
+
+
         # 5.9. ベースモデルの文法制約ツール分類 (docs/c_14 §1.3)。
         # 「ツールが要るのに撃たれない」穴を埋める最後の層。決定論層が
         # すべて外れてから実行する (決定論のシグナルの方がモデル判断より
@@ -890,7 +903,7 @@ class ToolCallJudge:
             await self._judge_with_tool_classifier(
                 query, tools_registry, mode, conversation, session_id,
             )
-            if self.enabled else None
+            if (self.enabled and allow_classifier) else None
         )
         if classified is not None:
             self._log_tool_decision(classified, "tool_classifier")
@@ -936,6 +949,28 @@ class ToolCallJudge:
         正規表現側は数値計算の判定だけ直近の会話も見る (被演算子の片方が前
         ターンにしか無い言い回しがあるため。``looks_like_numeric_question``)。
         """
+        # **平叙の自己申告は問答無用で止める。**
+        #
+        # 層 5.9 はこの判定系で唯一の推論往復で、実測 34〜39 秒かかる
+        # (2026-08-25 ライブ監査、Qwen3.8-27B)。同じ監査で kNN ゲートが
+        # 「ツールが要る」と判定した 8 種のうち **3 種が単なる事実の申告**
+        # だった:
+        #
+        #   「ビルドで SIGSEGV_A17X というエラーコードが出ることがあります。」(votes 3/5)
+        #   「毎週火曜日の15時に定例会議があります。」                        (votes 3/5)
+        #   「私の誕生日は3月14日です。」                                     (votes 3/5)
+        #
+        # どれもツールでは答えようがない。1 件あたり 34 秒を捨てていた。
+        # 判定は層 0.6b と同じ ``is_plain_statement`` — 問い・依頼のマーカーが
+        # 無く、かつ平叙の文末で終わる場合だけ True になるので、体言止めの
+        # 問い合わせ (「PC のスペック」) は止めない。実測 13 クエリで
+        # 誤発火 6 件を全て捕捉し、正当な 7 件は 1 件も止めなかった。
+        if is_plain_statement(query):
+            logger.debug(
+                "Tool classifier gate: plain statement, not a request: %s",
+                query[:50],
+            )
+            return False
         gate = self._tool_gate
         if gate is not None:
             verdict = await gate.needs_tool(query)
@@ -1022,7 +1057,19 @@ class ToolCallJudge:
                 # キャッシュを破壊する、の 2 つを踏む。``generate_constrained``
                 # の他の呼出元 (AuxClient / PromptEvolver) は全て固定済みで、
                 # ここだけが漏れていた。
-                id_slot=getattr(client, "background_slot", -1),
+                #
+                # **さらに背景スロットとも分ける** (``classifier_slot``)。
+                # 背景スロットは sleep-time / aux と共有で、ターンの合間に走る
+                # 補助タスクが分類器のプレフィクス (ツールメニュー 385 トークン、
+                # 毎回同一) を毎回追い出していた。実測 (2026-08-25、Qwen3.8-27B):
+                # 追い出される側は 422 tok / cache 0 で 37.7 秒、追い出されない
+                # 側は **別のクエリでも** cache 390/418 で 11.3 秒。
+                # 1 回あたり約 26 秒 (3.3 倍) 縮む。``llama.slots < 3`` の構成では
+                # 従来どおり背景スロットへ倒れる。
+                id_slot=getattr(
+                    client, "classifier_slot",
+                    getattr(client, "background_slot", -1),
+                ),
                 timeout=self._tool_classifier_timeout_sec,
             )
         except httpx.HTTPStatusError as exc:

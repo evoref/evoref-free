@@ -31,6 +31,11 @@ DEFAULT_STOPWORD_BIGRAMS: frozenset[str] = frozenset(
 )
 
 
+#: :meth:`BM25Retriever.rare_query_tokens` の既定閾値。コーパスの 1% 未満の
+#: ドキュメントにしか現れないトークンを「希少」とみなす。
+DEFAULT_RARE_TOKEN_DF_RATIO: float = 0.01
+
+
 def _split_ascii_token(raw: str) -> list[str]:
     """camelCase / snake_case / 連続数字の ASCII トークンをサブトークンに分割する。
 
@@ -122,6 +127,10 @@ class BM25Retriever:
         self._bm25: BM25Plus | None = None
         self._chunk_ids: list[str] = []
         self._chunks: list[str] = []
+        #: トークン -> 出現ドキュメント数。``rare_query_tokens`` が使う。
+        self._df: dict[str, int] = {}
+        #: chunk_id -> トークン集合。``lexical_anchors`` が使う (再トークナイズ回避)。
+        self._doc_tokens: dict[str, frozenset[str]] = {}
         self._k1 = k1
         self._b = b
         self._delta = delta
@@ -147,8 +156,14 @@ class BM25Retriever:
         tokenized = [self._tokenize(c) for c in chunks]
         self._bm25 = BM25Plus(tokenized, k1=self._k1, b=self._b, delta=self._delta)
         vocab: set[str] = set()
-        for tokens in tokenized:
-            vocab.update(tokens)
+        self._df = {}
+        self._doc_tokens = {}
+        for cid, tokens in zip(chunk_ids, tokenized):
+            uniq = frozenset(tokens)
+            vocab.update(uniq)
+            self._doc_tokens[cid] = uniq
+            for t in uniq:
+                self._df[t] = self._df.get(t, 0) + 1
         logger.info("BM25 index built: %d documents", len(chunks))
         logger.debug(
             "BM25 build stats: docs=%d, vocab_size=%d, total_tokens=%d, "
@@ -188,6 +203,68 @@ class BM25Retriever:
         )
         return results
 
+    def rare_query_tokens(
+        self, query: str, max_df_ratio: float = DEFAULT_RARE_TOKEN_DF_RATIO,
+    ) -> frozenset[str]:
+        """クエリ中の **希少な** トークン (出現ドキュメント比が閾値未満) を返す。
+
+        「ユーザーが珍しい文字列を名指しした」ことの決定論的な証拠として使う。
+        型番・ファイルパス・固有名詞・エラーコードのような literal は密ベクトルが
+        最も苦手とする一方、BM25 では df が極端に小さいトークンとして必ず立つ。
+
+        閾値は **相対** (コーパス全体に対する比) なので、コーパスの大きさや
+        埋め込みモデルを替えても意味が変わらない。絶対値の閾値がモデル差し替えで
+        到達不能になる事故を繰り返しているため、ここでは絶対値を持たない。
+
+        索引未構築なら空集合 (呼出側は「証拠なし」として扱えばよい)。
+        """
+        if not self._df or not self._chunk_ids:
+            return frozenset()
+        cutoff = max(1, int(len(self._chunk_ids) * max_df_ratio))
+        return frozenset(
+            t for t in set(self._tokenize(query))
+            if 0 < self._df.get(t, 0) <= cutoff
+        )
+
+    def lexical_anchors(
+        self,
+        query: str,
+        chunk_ids: Iterable[str],
+        max_df_ratio: float = DEFAULT_RARE_TOKEN_DF_RATIO,
+    ) -> frozenset[str]:
+        """``chunk_ids`` のうち、クエリの希少トークンを実際に含むものを返す。
+
+        「珍しい語で名指しされ、その語を本当に持っているチャンク」だけが残る。
+        コサイン類似度のフロアを免除する根拠として使う (:mod:`search_pipeline`)。
+        """
+        rare = self.rare_query_tokens(query, max_df_ratio)
+        if not rare:
+            return frozenset()
+        return frozenset(
+            cid for cid in chunk_ids
+            if self._doc_tokens.get(cid, frozenset()) & rare
+        )
+
     @property
     def count(self) -> int:
         return len(self._chunk_ids)
+
+
+def build_index_from_vector_store(bm25: BM25Retriever, vector_store) -> int:
+    """``vector_store`` の全チャンクから BM25 索引を張り直す。
+
+    索引の作り方 (contextual prefix 付きのテキストを使う) を 1 箇所に集約する。
+    以前は起動時の配線と sleep-time のプレフィックス生成後の 2 箇所に同じ 4 行が
+    複写されており、**チャット応答経路が使い始めた後もどちらか片方しか
+    更新されない**危険があった。
+
+    Returns:
+        索引に入れたチャンク数 (メタデータが空なら 0、索引はそのまま)。
+    """
+    metadata = getattr(vector_store, "metadata", None) or []
+    if not metadata:
+        return 0
+    chunk_ids = [m["id"] for m in metadata]
+    chunks = [vector_store.get_contextual_text(cid) for cid in chunk_ids]
+    bm25.build(chunk_ids, chunks)
+    return len(chunk_ids)

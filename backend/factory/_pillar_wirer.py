@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from backend.free.memory.scheduler import SleepTimeScheduler
     from backend.free.memory.stores.short_term import ShortTermMemory
     from backend.free.rag.embedding_backend import EmbeddingBackend
+    from backend.free.rag.bm25_retriever import BM25Retriever
     from backend.free.rag.retriever import HybridRetriever
     from backend.free.rag.vector_store import VectorStore
     from backend.pillars import GenPillar, LearnPillar, LoopPillar, MemPillar
@@ -756,26 +757,28 @@ async def _check_embedding_dim(state: AppState, cfg: dict[str, Any]) -> None:
         )
 
 
-def _build_hybrid_retriever(
+def _build_bm25_index(
     vs: "VectorStore | None",
-    embedder: "EmbeddingBackend | None",
-    debug_logger: "DebugLogger",
-    policy_interpreter: "PolicyInterpreter",
     cfg: dict[str, Any] | None = None,
-) -> "HybridRetriever | None":
-    """7d-2. HybridRetriever 構築（ベンチマーク・カートリッジ評価で使用）
+) -> "BM25Retriever | None":
+    """メインベクトルストアの BM25 索引を構築する。
 
-    BM25 パラメータ (k1/b/delta/trigram/ASCII split/stopword) と
-    融合パラメータ (fusion_method/rrf_k/bm25_weight/vector_weight) を config から反映する。
+    **1 インスタンスを全経路で共有する。** チャット応答経路の LTM
+    ハイブリッド検索・sleep-time のプレフィックス再構築・``HybridRetriever``
+    (ベンチ / 長文生成) が同じ索引を見ないと、片方だけ新しいチャンクを
+    知っている状態が生まれる。
+
+    BM25 パラメータ (k1/b/delta/trigram/ASCII split/stopword) を config から反映。
+    ストアが空でもインスタンスは返す (後で sleep-time が張り直す)。
     """
-    if not (vs and embedder):
+    if vs is None:
         return None
     try:
         from backend.free.rag.bm25_retriever import (
             BM25Retriever,
             DEFAULT_STOPWORD_BIGRAMS,
+            build_index_from_vector_store,
         )
-        from backend.free.rag.retriever import HybridRetriever
 
         rag_cfg = (cfg or {}).get("rag", {}) if cfg else {}
         stop_cfg = rag_cfg.get("bm25_stopword_bigrams", None)
@@ -793,10 +796,38 @@ def _build_hybrid_retriever(
             split_ascii=bool(rag_cfg.get("bm25_split_ascii", True)),
             stopwords=stopwords,
         )
-        if vs.metadata:
-            chunk_ids = [m["id"] for m in vs.metadata]
-            chunks = [vs.get_contextual_text(cid) for cid in chunk_ids]
-            bm25.build(chunk_ids, chunks)
+        n = build_index_from_vector_store(bm25, vs)
+        logger.info("BM25 index initialized: %d chunks", n)
+        return bm25
+    except Exception as e:
+        logger.warning("BM25 index init skipped: %s", e)
+        return None
+
+
+def _build_hybrid_retriever(
+    vs: "VectorStore | None",
+    embedder: "EmbeddingBackend | None",
+    debug_logger: "DebugLogger",
+    policy_interpreter: "PolicyInterpreter",
+    cfg: dict[str, Any] | None = None,
+    bm25: "BM25Retriever | None" = None,
+) -> "HybridRetriever | None":
+    """7d-2. HybridRetriever 構築（ベンチマーク・長文生成の unit 検索で使用）
+
+    融合パラメータ (fusion_method/rrf_k/bm25_weight/vector_weight) を config から
+    反映する。BM25 索引は :func:`_build_bm25_index` が作った共有インスタンスを
+    受け取る (無ければ本関数内で作る)。
+    """
+    if not (vs and embedder):
+        return None
+    try:
+        from backend.free.rag.retriever import HybridRetriever
+
+        rag_cfg = (cfg or {}).get("rag", {}) if cfg else {}
+        if bm25 is None:
+            bm25 = _build_bm25_index(vs, cfg)
+        if bm25 is None:
+            return None
 
         hybrid_retriever = HybridRetriever(
             vector_store=vs,
@@ -1032,7 +1063,7 @@ def _init_sleep_time_worker(
     learned_patterns_store: "LearnedPatternStore",
     policy_interpreter: "PolicyInterpreter",
     aux_prompt_mgr: "AuxPromptManager",
-    hybrid_retriever: "HybridRetriever | None" = None,
+    bm25_retriever: "BM25Retriever | None" = None,
 ) -> None:
     """7e. SleepTimeWorker（EmbeddingBackend + FadeMemScorer が必要）"""
     try:
@@ -1115,10 +1146,10 @@ def _init_sleep_time_worker(
             semantic_store_invalidator=_semantic_invalidator,
             rag_judge_log=state.rag_judge_log,
         )
-        # contextual prefix 生成後にメイン BM25 索引を再構築できるよう、
-        # HybridRetriever が保持する生きた BM25 インスタンスを worker に渡す。
-        if hybrid_retriever is not None:
-            worker.set_bm25_retriever(hybrid_retriever.bm25)
+        # 新しく昇格したチャンクを語彙検索でも引けるよう、共有 BM25
+        # インスタンスを worker に渡す (sleep-time が索引を張り直す)。
+        if bm25_retriever is not None:
+            worker.set_bm25_retriever(bm25_retriever)
         sleep_scheduler.set_worker(worker)
         logger.info(
             "SleepTimeWorker initialized (project_id=%s, agent_trace_dir=%s)",
@@ -1333,6 +1364,17 @@ def _init_learning_scheduler(
         semmem_writeback_scope,
         fewshot_pool.total_count,
     )
+    # 手本の埋め込みを背景で張る。埋め込みが載るまでは従来の文字 bi-gram で
+    # 選ぶので、起動を待たせる必要はない (tool_gate_warmup と同じ扱い)。
+    # 永続化しない設計なので、毎起動ここで張り直す (pool_size 件だけ)。
+    if state.embedder is not None:
+        try:
+            asyncio.create_task(
+                fewshot_pool.backfill_embeddings(state.embedder),
+                name="fewshot_embedding_warmup",
+            )
+        except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
+            logger.info("Fewshot embedding warmup deferred: no running event loop")
 
     # 7f-5. FeedbackPipe — 品質ゲート結果 → 学習サイクル 還流
     from backend.free.learning.feedback_pipe import FeedbackPipe
@@ -2331,10 +2373,26 @@ def _build_gen_pillar_retrieval(
     debug_logger = base.debug_logger
     policy_interpreter = base.policy_interpreter
 
+    rag_cfg = (cfg or {}).get("rag", {}) or {}
+    with _timed(timings, "bm25_index"):
+        bm25 = _build_bm25_index(mem.vector_store, cfg)
+        gen.bm25_retriever = bm25
+        # チャット応答経路の LTM をハイブリッド (ベクトル + BM25 RRF) にする。
+        # ``rag.hybrid_search`` は長らくチャット経路では no-op だったが、
+        # ここで実際に効くようになった (config.yaml.example の NOTE も更新済)。
+        if (
+            bm25 is not None
+            and mem.long_term_memory is not None
+            and bool(rag_cfg.get("hybrid_search", True))
+        ):
+            mem.long_term_memory.set_bm25_retriever(
+                bm25, rrf_k=int(rag_cfg.get("rrf_k", 60)),
+            )
+            logger.info("LTM hybrid retrieval enabled (vector + BM25 RRF)")
     with _timed(timings, "hybrid_retriever"):
         hybrid_retriever = _build_hybrid_retriever(
             mem.vector_store, gen.embedder,
-            debug_logger, policy_interpreter, cfg,
+            debug_logger, policy_interpreter, cfg, bm25=bm25,
         )
         gen.hybrid_retriever = hybrid_retriever
     with _timed(timings, "lazy_contextual"):
@@ -2345,6 +2403,25 @@ def _build_gen_pillar_retrieval(
         )
     with _timed(timings, "judge_tracker"):
         _init_judge_tracker(state)
+
+
+def _wire_fewshot_pool_to_sleep_worker(
+    state: AppState, learning_scheduler: Any, mem: "MemPillar",
+) -> None:
+    """FewShotPool を SleepTimeWorker へ後付けする (構築順の都合)。
+
+    どちらかが未構築 (--no-learning / degraded) なら黙って no-op。
+    """
+    pool = getattr(learning_scheduler, "_fewshot_pool", None)
+    scheduler = getattr(mem, "sleep_scheduler", None)
+    worker = getattr(scheduler, "_worker", None) if scheduler else None
+    if pool is None or worker is None:
+        return
+    setter = getattr(worker, "set_fewshot_pool", None)
+    if setter is None:
+        return
+    setter(pool)
+    logger.info("FewShotPool wired to SleepTimeWorker for embedding backfill")
 
 
 async def _build_learn_pillar(
@@ -2393,7 +2470,7 @@ async def _build_learn_pillar(
                 mem.long_term_memory, gen.embedder, mem.vector_store,
                 exp_buf, debug_logger, learned_patterns_store,
                 policy_interpreter, aux_prompt_mgr,
-                hybrid_retriever=gen.hybrid_retriever,
+                bm25_retriever=gen.bm25_retriever,
             )
     else:
         logger.info("SleepTimeWorker setup skipped (learning disabled)")
@@ -2403,6 +2480,13 @@ async def _build_learn_pillar(
             state, cfg, exp_buf, prompt_mgr, debug_logger,
             policy_interpreter, learned_patterns_store, resolver,
         )
+
+    # FewShotPool は LearningScheduler 構築の中で作られるため、SleepTimeWorker
+    # (先に構築済み) へはここで後から渡す。新規に採用された手本の埋め込みを
+    # sleep-time で張るのに使う — 埋め込みが載るまでその手本は密ベクトル選択の
+    # 候補にならない (STM ノートが embed 工程を通るまで注入対象にならないのと
+    # 同じ契約)。
+    _wire_fewshot_pool_to_sleep_worker(state, learning_scheduler, mem)
 
     with _timed(timings, "component_wiring"):
         _wire_sleep_scheduler_models(

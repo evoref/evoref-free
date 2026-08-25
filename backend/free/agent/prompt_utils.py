@@ -25,7 +25,10 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    import numpy as np
 
 # ─────────────────────────────────────────────────────────────────────
 # FewShotExample / format_fewshot_section
@@ -48,6 +51,13 @@ class FewShotExample:
     #: 算術を「正確」と評価するため (実測 2026-07-31)、内容の正誤は
     #: ``response_arithmetic`` の決定論検算が担当する。
     quality_score: float | None = None
+    #: ``query`` の埋め込み (list 化、JSON 永続化のため)。未生成なら ``None``。
+    #:
+    #: few-shot の選択は長らく文字 bi-gram コサインだけで、**記憶検索 (密ベクトル)
+    #: と別の「関連性」の尺度**を使っていた。言い換えに弱く、同じ問いでも語の
+    #: 選び方が違うだけで手本が外れる。埋め込みは sleep-time で遡って生成する
+    #: (STM ノートが embed 工程を通るまで注入対象にならないのと同じ契約)。
+    embedding: list[float] | None = None
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -67,6 +77,7 @@ class FewShotSelector(Protocol):
 
     def select_top_k(
         self, mode: str, query: str, k: int = 3,
+        query_vec: "np.ndarray | None" = None,
     ) -> list[FewShotExample]: ...
 
 

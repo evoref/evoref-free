@@ -14,6 +14,7 @@ from backend.config import (
     resolve_context_size_for_mode,
 )
 from backend.free.api.chat.chat_constants import (
+    CONTEXT_GROUNDED_TEMPERATURE,
     DEFAULT_HISTORY_MIN_TOKENS,
     DEFAULT_KEEPALIVE_INTERVAL_SEC, DEFAULT_MAX_TOKENS,
     MAX_FILE_CONTEXT_TOTAL_CHARS, MAX_FILE_CONTEXT_TOTAL_CHUNKS,
@@ -276,15 +277,25 @@ def _resolve_system_prompt(
     return f"You are {instance_name}, a helpful AI assistant.\n\n{directives}"
 
 
-def _resolve_fewshot_block(state: AppState, mode: str, query: str | None) -> str:
-    """query 依存の few-shot ブロックを取得 ("" = 無し / PromptManager 未設定)。"""
+def _resolve_fewshot_block(
+    state: AppState, mode: str, query: str | None, query_vec=None,
+) -> str:
+    """query 依存の few-shot ブロックを取得 ("" = 無し / PromptManager 未設定)。
+
+    ``query_vec`` を渡すと手本の選択が密ベクトル (記憶検索と同じ尺度) になる。
+    渡さない経路 (meta_cognitive の scaffold 用) は従来の文字 bi-gram のまま。
+    """
     prompt_mgr = state.prompt_manager
     if prompt_mgr is None:
         return ""
     get_block = getattr(prompt_mgr, "get_fewshot_block", None)
     if get_block is None:
         return ""
-    return get_block(mode, query)
+    try:
+        return get_block(mode, query, query_vec)
+    except TypeError:
+        # query_vec を受けない旧シグネチャ (Mock 等) への後方互換
+        return get_block(mode, query)
 
 
 def _try_reactive_layer(
@@ -347,6 +358,7 @@ async def _gate_reactive_light(
     cfg: dict,
     history: list,
     judge_task: "asyncio.Task | None",
+    timer: "StageTimer | None" = None,
     session_id: str = "",
 ) -> tuple[str, "asyncio.Task | None", str]:
     """reactive ルール miss 後、軽量パス採否を判定する。
@@ -378,6 +390,13 @@ async def _gate_reactive_light(
     ):
         return "deliberative", judge_task, "whole_session_scope"
 
+    # 軽量パスは「ツール判定の結論」を待たないと採否を決められない。判定の
+    # 最終層 (層5.9) はベースモデルの文法制約分類で、**推論 1 往復ぶんの待ち**
+    # になりうる。決定論プリゲートが大半を落とすとはいえ、落ちなかったターンは
+    # 「軽量」と呼びながら推論を 1 回払っている。実測が無いと調整もできないので
+    # 待ち時間を計測して requests JSONL に載せる。
+    if timer is not None:
+        timer.start("light_gate_judge_ms")
     try:
         if judge_task is not None:
             judgement = await judge_task  # 投機起動済み (並列構成)、残り時間のみ待つ
@@ -389,6 +408,9 @@ async def _gate_reactive_light(
     except Exception as exc:
         logger.warning("reactive-light judge failed, escalating: %s", exc)
         return "deliberative", judge_task, "judge_error"
+    finally:
+        if timer is not None:
+            timer.stop("light_gate_judge_ms")
 
     if judgement is not None and judgement.tool_needed:
         # deliberative へ流用 (直列構成なら done タスク化して再 judge を防ぐ)
@@ -420,6 +442,50 @@ async def _gate_reactive_light(
             judge_task = asyncio.create_task(_completed(judgement))
         return "deliberative", judge_task, "blocked_action"
     return "light", judge_task, "judge_no_tool"
+
+
+async def _light_semmem_block(
+    req: ChatRequest, state: AppState, cfg: dict, timer: StageTimer,
+) -> str | None:
+    """軽量パス用の ``[関連する記憶]`` ブロック (検索は走らせない)。
+
+    **層の切り替えを「崖」にしない**ための経路。軽量パスは長らく RAG・SemMem・
+    few-shot・ツール判定を **同時に全部** 落としていたため、``short_query`` で
+    ここへ落ちた瞬間に記憶へ一度も到達しなくなり、「覚えているのに『情報が
+    ありません』と答える」事故が繰り返し起きた。救済のたびに ``short_query``
+    の手前へルールを積む対処を重ねてきたが、語彙の列挙は必ず漏れる。
+
+    重いのは **検索パイプライン** (STM/LTM/カートリッジ + 各ゲート) であって、
+    記憶の注入そのものではない。注入に必要なのはクエリ埋め込み 1 回だけなので、
+    検索は落としたまま注入だけ残す — これで軽量パスは「速いが記憶が無い」から
+    「速いが検索をしない」に変わる。
+
+    埋め込みが取れなければ ``None`` を返す (``build_semmem_injection`` は
+    ``query_vec=None`` を全店注入に読み替えるため、ここで止めるのが安全側)。
+    """
+    if not cfg.get("agent", {}).get("reactive_light_memory_enabled", True):
+        return None
+    if state.embedder is None:
+        return None
+    timer.start("light_embedding_ms")
+    try:
+        query_vec = await state.embedder.embed_query(req.message, mode=req.mode)
+    except Exception as exc:
+        logger.warning("reactive-light embedding failed (no memory): %s", exc)
+        return None
+    finally:
+        timer.stop("light_embedding_ms")
+    timer.start("semmem_ms")
+    try:
+        return build_semmem_injection(
+            state, cfg, mode=req.mode, query_vec=query_vec,
+            query_text=req.message,
+        )
+    except Exception as exc:
+        logger.warning("reactive-light semmem injection failed: %s", exc)
+        return None
+    finally:
+        timer.stop("semmem_ms")
 
 
 async def _dispatch_reactive_light(
@@ -457,9 +523,11 @@ async def _dispatch_reactive_light(
     ``max_tokens`` の上限で担保しており、履歴を削ることではない。
     """
     system_prompt = _resolve_system_prompt(state, req.mode, instance_name)
+    semmem_block = await _light_semmem_block(req, state, cfg, timer)
     light_messages = build_chat_messages(
         system_prompt, history,
         rag_chunks=None, file_contexts=None,
+        semmem_block=semmem_block,
         context_size=context_size, max_tokens=max_tokens,
         working_max_tokens=int(
             (cfg.get("memory") or {}).get(
@@ -587,6 +655,14 @@ async def _build_messages_with_search(
     scored_chunks = search_result.scored_chunks
     rag_top_raw_score = search_result.rag_top_score
 
+    # 手本の選択も密ベクトルへ揃える。検索で算出済みのクエリ埋め込みを再利用
+    # するので追加の埋め込み呼出は無い。記憶検索と手本選択で別々の「関連性」を
+    # 使っていると、言い換えただけで手本が外れる (文字 bi-gram の弱点)。
+    if search_result.query_vec is not None:
+        fewshot_block = _resolve_fewshot_block(
+            state, req.mode, req.message, search_result.query_vec,
+        )
+
     salience_ranker = None
     if scored_chunks:
         from backend.free.core.salience_ranker import SalienceRanker
@@ -608,6 +684,7 @@ async def _build_messages_with_search(
             state, cfg, mode=req.mode, conflict_ctx=conflict_ctx,
             # 検索で算出済みのクエリ埋め込みを再利用し、無関係な記憶の注入を防ぐ
             query_vec=search_result.query_vec,
+            query_text=req.message,
         )
     finally:
         timer.stop("semmem_ms")
@@ -1204,6 +1281,17 @@ async def _dispatch_deliberative(
     ``tool_judge_task`` が渡された場合は chat() が先行起動した tool 判定タスクを
     再利用する (process() 内で await)。None の場合は process() が判定を直列実行。
     ``escalated_from`` は reactive からエスカレートした場合の出自 (outcome 観測用)。"""
+    # 参考情報が付いたターンは接地回答なので温度を下げる (ツール接地と同じ
+    # 理屈、ただし記憶は実測値ではないので 0.2 まで下げない。
+    # CONTEXT_GROUNDED_TEMPERATURE のコメント参照)。既に低ければ据え置く。
+    if rag_used:
+        gen_params = {
+            **gen_params,
+            "temperature": min(
+                gen_params.get("temperature", CONTEXT_GROUNDED_TEMPERATURE),
+                CONTEXT_GROUNDED_TEMPERATURE,
+            ),
+        }
     delib_agent = DeliberativeAgent(
         config=cfg,
         tool_judge=state.tool_call_judge,
@@ -1434,7 +1522,8 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             # ルールベース miss → 軽量パス gating。tool 判定 (judge) で tool 不要
             # なら base 1 ターンの軽量パス、tool 必要なら deliberative へエスカレート。
             decision, judge_task, gate_reason = await _gate_reactive_light(
-                req, state, cfg, history, judge_task, session_id=session_id,
+                req, state, cfg, history, judge_task, timer,
+                session_id=session_id,
             )
             if decision == "light":
                 # 軽量パスは検索を使わない。judge_task も tool 不要なので破棄。

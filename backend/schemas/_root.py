@@ -58,6 +58,13 @@ def _reset_pro_only_warning_cache() -> None:
 # ── トップレベル設定モデル ──────────────────────────────────
 
 
+#: ``memory.working_max_tokens`` が ``llama.context_size`` に占めるべき割合の
+#: 下限 / 上限。config.yaml.example の推奨表 (context 8192 → 4096 = 50%) と
+#: 「context_size * 0.6 を超えない」という既存の但し書きから採った。
+_WORKING_WINDOW_MIN_SHARE = 0.35
+_WORKING_WINDOW_MAX_SHARE = 0.60
+
+
 class EvorefConfig(BaseModel):
     """evoref 全体設定スキーマ
 
@@ -149,6 +156,43 @@ class EvorefConfig(BaseModel):
                 "config.yaml.",
             )
         return data
+
+    @model_validator(mode="after")
+    def warn_working_memory_vs_context(self) -> "EvorefConfig":
+        """会話窓 (memory) とコンテキスト窓 (llama) の食い違いを warning で通知する。
+
+        ``memory.working_max_tokens`` は **プロンプトに載る会話履歴の上限**、
+        ``llama.context_size`` は **モデルが受け取れる総量**。前者は後者に対する
+        割合で決めるべきなのに、両者は別セクションの独立した定数なので、
+        片方だけ動かすと黙って不整合になる。実際に既定同士が食い違っていた
+        (context 8192 に対し会話窓 2048 = 25%)。
+
+        - 低すぎる: 窓の半分も使わないうちに押し出しが始まり、そのたびに
+          接頭辞 KV キャッシュが無効化されて全履歴が再 prefill される。
+        - 高すぎる: 動的ブロック (few-shot / 参考情報 / 添付) と生成予約を
+          押し出し、``build_messages`` が毎ターン切り詰めることになる。
+
+        エラーにはしない (用途によっては意図的に狭めたい)。
+        """
+        from backend.log_config import get_logger
+
+        context = int(getattr(self.llama, "context_size", 0) or 0)
+        window = int(self.memory.working_max_tokens)
+        if context <= 0:
+            return self
+        share = window / context
+        if share < _WORKING_WINDOW_MIN_SHARE or share > _WORKING_WINDOW_MAX_SHARE:
+            get_logger("config").warning(
+                "memory.working_max_tokens=%d is %.0f%% of llama.context_size=%d "
+                "(recommended %.0f-%.0f%%, i.e. %d-%d). Too small wastes the "
+                "window and forces frequent prefix-cache invalidation; too large "
+                "squeezes the dynamic blocks and the generation reserve.",
+                window, share * 100, context,
+                _WORKING_WINDOW_MIN_SHARE * 100, _WORKING_WINDOW_MAX_SHARE * 100,
+                int(context * _WORKING_WINDOW_MIN_SHARE),
+                int(context * _WORKING_WINDOW_MAX_SHARE),
+            )
+        return self
 
     @model_validator(mode="after")
     def warn_pro_only_keys_in_free(self) -> "EvorefConfig":

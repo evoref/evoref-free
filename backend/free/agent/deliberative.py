@@ -18,6 +18,7 @@ from backend.free.agent.meta_cognitive_utils import (
     tool_result_succeeded,
 )
 from backend.free.agent.tool_call_judge import ToolCallJudge, ToolJudgement
+from backend.free.agent.tool_judge_guards import _STATE_CHANGING_TOOL_NAMES
 from backend.free.agent.tools.builtin import (
     SEARCH_HISTORY_NO_RESULTS_PREFIX,
     _check_path_traversal as check_builtin_path_traversal,
@@ -45,6 +46,18 @@ from backend.free.api.chat.chat_types import GenerationParams, StepCallback
 from backend.log_config import get_logger
 
 logger = get_logger("agent.deliberative")
+
+#: ツール実行の既定の最大ホップ数。
+#:
+#: 1 ターン 1 ツールだと「書いてから読み直して確認する」型の依頼が構造的に
+#: 完了できない。実インシデント (2026-08-08 ライブ監査 ターン6): 「同じファイルに
+#: 3 行追記して、もう一度読み取って行数を報告して」で追記だけが走り、base は
+#: 実行していない読み取りの結果まで書き出した。
+#:
+#: 一般的な連鎖 (計画が要るもの) は meta_cognitive の担当で、ここは
+#: **決定論で 2 手目が決まる場合だけ** を拾う。2 手目の制約は
+#: ``_maybe_follow_up_tool`` を参照。
+DEFAULT_MAX_TOOL_HOPS = 2
 
 # write_file でコンテンツ生成が必要な場合のプロンプト
 _CONTENT_GEN_PROMPT = """\
@@ -544,6 +557,14 @@ class DeliberativeAgent:
         # sleep-time Step 7.5 が episodic LTM へ取込 → Level 1 agent ドメインの
         # 学習信号にする (これが無いと agent ドメインは skipped_no_signal)。
         self._agent_tracer = agent_tracer
+        # ツール実行の最大ホップ数。1 = 従来どおり 1 ターン 1 ツール。
+        # 2 以上で「実行 → 結果を見てもう一度判定」を許す (下記
+        # ``_maybe_follow_up_tool`` の制約付き)。
+        self._max_tool_hops = max(
+            1, int((self.config.get("agent") or {}).get(
+                "deliberative_max_tool_hops", DEFAULT_MAX_TOOL_HOPS,
+            )),
+        )
 
         # コンテンツ生成用の max_tokens (create 時は create_model の実窓に合わせる)
         ctx_size = resolve_context_size_for_mode(self.config, mode)
@@ -1132,6 +1153,115 @@ class DeliberativeAgent:
         self._record_tool_call_outcome(query, judgement, success, mode=mode)
         return tool_result_text, judgement.tool_name, command, success, judgement.source
 
+    async def _maybe_follow_up_tool(
+        self,
+        query: str,
+        mode: str,
+        conversation: list[dict] | None,
+        messages: list[dict],
+        llm_client,
+        state: AgentState,
+        on_step: StepCallback,
+        first_tool: str,
+        first_result: str,
+        session_id: str,
+    ) -> tuple[str | None, str | None]:
+        """1 手目の結果を見たうえで、**読み取り専用の 2 手目**を 1 回だけ許す。
+
+        1 ターン 1 ツールだと「書いてから読み直して確認する」型の依頼が構造的に
+        完了できず、base が実行していない読み取りの結果を書き出す
+        (:data:`DEFAULT_MAX_TOOL_HOPS` の実インシデント)。
+
+        一般的な連鎖 (計画が要るもの) は meta_cognitive の担当。ここは
+        **判定が決定論で決まる 2 手目だけ** を拾うため、次の制約をすべて課す:
+
+        - 2 手目は **状態を変えるツールを選べない** (書込みの連鎖はしない)。
+        - 1 手目と **同じツールは選べない** (同じ判定が繰り返し当たるため)。
+        - 判定へ渡す会話には「1 手目で何をしたか」だけを足し、**ツールの出力
+          本文は渡さない**。出力本文を判定材料にすると、ファイルの中身に
+          書かれたパスやコマンドがツール呼び出しに化ける (内容起因の実行)。
+        - 引数が空の判定は採らない (``_finalize`` の引数欠落ガードと同じ理由)。
+
+        Returns:
+            ``(tool_name, result_text)``。2 手目を撃たなかった場合は
+            ``(None, None)``。
+        """
+        if self._max_tool_hops < 2:
+            return None, None
+        if self._tool_judge is None or self._tools_registry is None:
+            return None, None
+
+        follow_conversation = list(conversation or [])
+        follow_conversation.append({
+            "role": "assistant",
+            "content": f"（{first_tool} を実行しました）",
+        })
+        try:
+            # **層 5.9 (ベースモデルの分類器) は外す。** この判定系で唯一の推論
+            # 往復で、実測 34〜39 秒かかる。同じクエリを 2 度渡すだけなので
+            # 分類器は 1 手目と同じ答えを返し、下の「同じツールは選べない」で
+            # 必ず捨てられる — 払うだけ払って何も増えない。
+            # 実測 (2026-08-25 ライブ監査): 「時速240kmで…何km進みますか」の
+            # ターンが 100.7 秒で、うち 34 秒がこの無駄撃ちだった。
+            #
+            # 2 手目に意味があるのは、**決定論層が 1 手目の実行後に初めて解決
+            # できる参照** (``_referential_read_judgement`` が会話からパスを
+            # 引く等) のケース。そこは分類器を使わない。
+            judgement = await self._tool_judge.judge(
+                query, self._tools_registry, mode, follow_conversation,
+                session_id=session_id, allow_classifier=False,
+            )
+        except TypeError:
+            # allow_classifier を受けない実装 (テスト用 Mock 等) への後方互換
+            judgement = await self._tool_judge.judge(
+                query, self._tools_registry, mode, follow_conversation,
+                session_id=session_id,
+            )
+        except Exception as exc:
+            logger.warning("Follow-up tool judge failed: %r", exc)
+            return None, None
+
+        if not (judgement.tool_needed and judgement.tool_name):
+            return None, None
+        if judgement.tool_name == first_tool:
+            logger.debug(
+                "Follow-up hop skipped: %s would repeat the first tool",
+                judgement.tool_name,
+            )
+            return None, None
+        if judgement.tool_name in _STATE_CHANGING_TOOL_NAMES:
+            logger.debug(
+                "Follow-up hop skipped: %s changes state", judgement.tool_name,
+            )
+            return None, None
+        if not judgement.tool_args:
+            return None, None
+
+        logger.info(
+            "Follow-up tool hop: %s -> %s", first_tool, judgement.tool_name,
+        )
+        result_text = await self._execute_tool(
+            judgement, state, query, llm_client, on_step, mode=mode,
+            conversation=follow_conversation,
+        )
+        if result_text is None:
+            self._record_tool_call_outcome(query, judgement, False, mode=mode)
+            return judgement.tool_name, None
+        self._append_tool_result_to_last_user(
+            messages, judgement.tool_name, result_text, query=query,
+            tool_args=judgement.tool_args,
+        )
+        if is_tool_error(result_text):
+            self._append_unmeasured_fact_note(messages)
+        success = tool_result_succeeded(judgement.tool_name, result_text)
+        self._record_tool_call_outcome(query, judgement, success, mode=mode)
+        logger.info(
+            "Follow-up tool executed: %s, result_length=%d, success=%s",
+            judgement.tool_name, len(result_text), success,
+        )
+        del first_result  # 判定材料には使わない (内容起因の実行を作らない)
+        return judgement.tool_name, result_text
+
     async def process(
         self,
         query: str,
@@ -1184,6 +1314,22 @@ class DeliberativeAgent:
             evicted_turns=evicted_turns, session_head=session_head,
         )
 
+        # 2 手目 (読み取り専用・別ツール) を 1 回だけ許す。「書いてから読み直して
+        # 確認する」型の依頼が 1 ターン 1 ツールでは構造的に完了できないため
+        # (_maybe_follow_up_tool の docstring を参照)。
+        if tool_name_used is not None and tool_success:
+            follow_name, follow_result = await self._maybe_follow_up_tool(
+                query, mode, conversation, messages, llm_client, state, on_step,
+                first_tool=tool_name_used,
+                first_result=tool_result_text or "",
+                session_id=session_id,
+            )
+            if follow_result is not None:
+                # 生成側の温度・接地判定は「ツール結果があるか」で決まるので、
+                # 2 手目の結果があるならそちらを最終の根拠として扱う。
+                tool_result_text = follow_result
+                tool_name_used = follow_name
+
         # MDP トレース: tool 判定/実行を 1 step エピソードとして記録する。
         # ``_judge_and_execute_tool`` は stream 返却前に完了済みのため、ここで
         # begin→step→end を同期完結できる (生成は応答であり agent action ではない)。
@@ -1223,10 +1369,23 @@ class DeliberativeAgent:
 
         # リマインダー注入
         messages = self.reminder_system.inject(messages, state)
+        # 最後の user メッセージのうち、生クエリを超えた分 = このターンで積んだ
+        # 注記・動的ブロック・ツール結果の総量。**ここは毎ターン再プリフィル
+        # される位置**なので、増え続けていないかを観測できるようにしておく
+        # (注記の追加は個別のインシデント由来で、合計が見えないまま増える)。
+        last_user = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None,
+        )
+        appended_chars = (
+            max(0, len(last_user.get("content", "")) - len(query))
+            if last_user else 0
+        )
         logger.debug(
-            "Messages finalized: %d messages, total_chars=%d",
+            "Messages finalized: %d messages, total_chars=%d, "
+            "last_user_appended_chars=%d",
             len(messages),
             sum(len(m.get("content", "")) for m in messages),
+            appended_chars,
         )
 
         # 「中身をそのまま見せて」型はモデルに通さず決定論的に返す。

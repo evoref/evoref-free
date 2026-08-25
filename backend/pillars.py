@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from backend.free.memory.stores.working import WorkingMemory
     from backend.free.rag.cartridge_manager import CartridgeManager
     from backend.free.rag.embedding_backend import EmbeddingBackend
+    from backend.free.rag.bm25_retriever import BM25Retriever
     from backend.free.rag.retriever import HybridRetriever
     from backend.free.rag.vector_store import VectorStore
     from backend.pro.learn_components import ProLearnComponents
@@ -60,13 +61,18 @@ class GenPillar:
         llm_client: LocalClient を束ねたファサード (chat_in_flight / is_serving_user を提供)。
         aux_client: 補助タスク LLM クライアント。未設定時は ``None``。
         embedder: 埋め込みバックエンド (llama-cpp server 経由)。未初期化時は ``None``。
-        hybrid_retriever: BM25 + Vector ハイブリッド検索器 (ベンチマーク専用)。
+        bm25_retriever: BM25 語彙検索索引。**全経路で共有する 1 インスタンス**
+            (チャット応答経路の LTM ハイブリッド / sleep-time の索引更新 /
+            hybrid_retriever)。
+        hybrid_retriever: BM25 + Vector ハイブリッド検索器
+            (ベンチマーク・長文生成の unit 検索)。
     """
 
     local_client: "LocalClient | None" = None
     llm_client: "LLMClient | None" = None
     aux_client: "AuxClient | None" = None
     embedder: "EmbeddingBackend | None" = None
+    bm25_retriever: "BM25Retriever | None" = None
     hybrid_retriever: "HybridRetriever | None" = None
 
 

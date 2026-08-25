@@ -987,14 +987,14 @@ _CLASSIFY_RULES: tuple[_ClassifyRule, ...] = (
     # 恒真ルールを消して終端を deliberative にすることで、実質の振り分けを
     # 変えずに (実測 233 ターンの再生で差分 0) ``tool_patterns`` の経路を戻す。
     #
-    # TODO: これで ``policy_interpreter`` の router ドメイン
-    # ``rag_score_threshold`` は **消費者ゼロ** になった (唯一の読み手だった
-    # ``short_high_rag`` の閾値)。実ファイル
-    # (``local/learning/*/prompts/policy_evolver_state.json``) では 1.0 まで
-    # 進化しており、何にも効かないノブに router 探索の 1 次元を使い続けている。
-    # 撤去は永続化された進化ステートのスキーマ変更を伴い、
-    # ``test_policy_interpreter.py`` が本キーを float の標準サンプルとして
-    # 約 90 箇所で使っているため、別タスクとして切る。
+    # 注: ``policy_interpreter`` の router ドメイン ``rag_score_threshold`` は
+    # これで **消費者ゼロ** になった (唯一の読み手だった ``short_high_rag`` の
+    # 閾値)。ただし探索の次元を食う問題は既に解消している — router ドメイン
+    # 自体が ``policy_evolver.EVOLVABLE_DOMAINS`` から外れ、摂動の対象では
+    # なくなったため (層の振り分け閾値を、モデル自身の出力由来の turn_outcome で
+    # 動かすのは閉ループになる)。残っているのは永続化された進化ステートとの
+    # スキーマ互換のためのキーだけで、実行時には誰も読まない。
+    # 不変則は ``test_router_domain_stays_frozen`` が固定する。
     _ClassifyRule("default", "deliberative", lambda c, x: True),
 )
 
