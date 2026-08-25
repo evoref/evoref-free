@@ -60,15 +60,43 @@ def get_cjk_token_scale() -> float:
     return _CJK_TOKEN_SCALE
 
 
+#: 「1 文字 ≒ 1 トークン」側に数える文字クラス。
+#:
+#: 以前は漢字 (U+4E00–U+9FFF) と かな (U+3040–U+30FF) しか見ておらず、**全角の
+#: 句読点・括弧 (U+3000–U+303F) が丸ごと ASCII 項へ落ちていた**。``、。「」（）・``
+#: は日本語文の 5〜10% を占め、どれも 1 文字 1 トークンになるのに 4 文字 = 1
+#: トークンとして数えられるため、**句読点が多い文ほど過小評価**される。
+#: 実測 (較正サンプル 259 文字): 15 文字が漏れ、素の推定 247 → 259。
+#:
+#: 係数 (:data:`_CJK_TOKEN_SCALE`) は単一スカラなので、**文字クラスの取りこぼしは
+#: 較正では直せない** — 句読点密度の違う文の間で誤差の向きが変わるだけになる。
+#: 分類そのものを直したうえで較正する必要がある。
+#:
+#: 走査は正規表現で行う (実測で内包表記の約 1.5 倍速。``estimate_tokens`` は
+#: 予算計算のたびに全履歴へ掛かる hot path)。
+_CJK_LIKE_RE = re.compile(
+    "["
+    "　-〿"   # CJK 記号・句読点 (、。「」〜・)
+    "぀-ヿ"   # ひらがな / カタカナ (長音符 U+30FC 含む)
+    "ㇰ-ㇿ"   # カタカナ拡張
+    "㐀-䶿"   # CJK 統合漢字 拡張A
+    "一-鿿"   # CJK 統合漢字
+    "豈-﫿"   # CJK 互換漢字
+    "＀-￯"   # 全角英数・記号 / 半角カナ
+    "]"
+)
+
+
 def estimate_tokens(text: str) -> int:
     """高速トークン数推定（CJK: 1文字≒1トークン、ASCII: 4文字≒1トークン）
 
+    CJK 判定は :data:`_CJK_LIKE_RE` (漢字・かな・**全角句読点**・全角英数)。
     CJK 項のみ実トークナイザ較正済みの係数を掛ける
     (:func:`set_cjk_token_scale`)。未較正なら係数 1.0 = 従来どおり。
     """
     if not text:
         return 0
-    cjk = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff')
+    cjk = len(_CJK_LIKE_RE.findall(text))
     ascii_ = len(text) - cjk
     raw = int(cjk * _CJK_TOKEN_SCALE) + ascii_ // 4
     return max(1, raw) if (cjk or ascii_ >= 4) else raw

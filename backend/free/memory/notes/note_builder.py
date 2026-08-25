@@ -320,6 +320,56 @@ def resolve_fact_attribute_match(
     return None, ()
 
 
+#: 1 発話から取り出す属性の上限。自己紹介は 2〜3 属性が普通で、それを超える
+#: 発話は「属性の羅列」ではなく雑談なので、切っても失うものが少ない。
+#: セッション上限 (``memory.facts.extraction_max_per_session``) を 1 発話で
+#: 食い潰さないための保険でもある。
+MAX_ATTRIBUTES_PER_TEXT = 3
+
+
+def resolve_fact_attribute_matches(
+    text: str,
+    fact_type: str,
+    *,
+    mode: str = "chat",
+    triggers_dir: str | Path | None = None,
+    limit: int = MAX_ATTRIBUTES_PER_TEXT,
+) -> list[tuple[str, tuple[str, ...]]]:
+    """``text`` に含まれる **すべての** 属性を YAML 記載順で返す。
+
+    ``resolve_fact_attribute_match`` は最初の 1 件で打ち切るため、1 発話で
+    複数の属性を述べると **記載順で先に来た属性以外は丸ごと失われる**。
+
+    実インシデント (2026-08-25 ライブ監査): 「私は小川宏之といいます。埼玉県
+    川口市に住んでいます。」から ``mem.personal.location`` だけが作られ、
+    名前のファクトは 1 件も作られなかった (YAML の記載順で location が name
+    より前にある)。その結果「私の名前を覚えていますか。」に答えられなかった。
+    日本語の自己紹介は 1 発話に複数属性を詰めるのが普通なので、最初の 1 件で
+    打ち切る設計そのものが噛み合っていない。
+
+    根拠文の絞り込み (``_attribute_evidence_text``) は属性ごとの trigger 語で
+    行うので、属性を複数返しても object が混ざることはない。
+    """
+    if not text:
+        return []
+    if triggers_dir is None:
+        triggers_dir = _DEFAULT_TRIGGERS_DIR
+    attrs = get_fact_attributes(resolve_fact_attributes_path(triggers_dir))
+    per_type = attrs.get(mode) or {}
+    ordered = per_type.get(fact_type) or ()
+    if not ordered:
+        return []
+    haystack = _normalize_trigger(text)
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for slug, words in ordered:
+        hit = tuple(w for w in words if w in haystack)
+        if hit:
+            out.append((slug, tuple(words)))
+            if len(out) >= max(1, limit):
+                break
+    return out
+
+
 def resolve_fact_attribute(
     text: str,
     fact_type: str,

@@ -424,19 +424,33 @@ def _drop_past_answers(
 async def _search_ltm_layer(
     long_term, query_vec: np.ndarray, top_k: int,
     drop_past_answers: bool = False,
-) -> list[tuple[str, float, str]]:
+    query_text: str = "",
+) -> tuple[list[tuple[str, float, str]], frozenset[str]]:
     """Layer 3 長期記憶検索 (< 5ms)。LTM 未設定 / 失敗時は空リスト。
+
+    ``search_hybrid`` があれば **ベクトル + BM25 の RRF** で候補を集める。
+    スコアは常に素のコサインなので、後段の品質判定 / フロアの閾値は不変。
 
     注入用に組み立てた文字列が回り込んだチャンクはここで落とす
     (:data:`_INJECTED_OUTPUT_MARKERS`)。
+
+    Returns:
+        ``(結果リスト, 語彙アンカーの chunk_id 集合)``。
     """
     if long_term is None:
-        return []
+        return [], frozenset()
     loop = asyncio.get_running_loop()
+    anchors: frozenset[str] = frozenset()
     try:
-        results = await run_in_executor_with_context(
-            loop, _search_executor, long_term.search, query_vec, top_k,
-        )
+        hybrid = getattr(long_term, "search_hybrid", None)
+        if hybrid is not None and query_text:
+            results, anchors = await run_in_executor_with_context(
+                loop, _search_executor, hybrid, query_vec, query_text, top_k,
+            )
+        else:
+            results = await run_in_executor_with_context(
+                loop, _search_executor, long_term.search, query_vec, top_k,
+            )
         if drop_past_answers:
             results = _drop_past_answers(long_term, results)
         kept = [r for r in results if not _is_injected_output(r[2])]
@@ -472,13 +486,14 @@ async def _search_ltm_layer(
                 n_cleaned, n_dropped,
             )
         results = sanitized
+        kept_ids = {cid for cid, _, _ in results}
         logger.debug("Step 3 LTM: %d results", len(results))
-        return results
+        return results, frozenset(anchors & kept_ids)
     except asyncio.CancelledError:
         raise
     except (RuntimeError, ValueError, TypeError, OSError) as e:
         logger.warning("LTM search failed: %s", e)
-        return []
+        return [], frozenset()
 
 
 async def _search_cartridge_layer(
@@ -958,15 +973,19 @@ async def unified_search(
             "This query repeats an earlier turn; past answers will be kept out "
             "of the reference block (query=%r)", query[:50],
         )
-    stm_pair, ltm_results, cart_results = await asyncio.gather(
+    stm_pair, ltm_pair, cart_results = await asyncio.gather(
         _search_stm_layer(short_term, query_vec, stm_top_k, drop_past_answers),
-        _search_ltm_layer(long_term, query_vec, fetch_k, drop_past_answers),
+        _search_ltm_layer(
+            long_term, query_vec, fetch_k, drop_past_answers, query,
+        ),
         _search_cartridge_layer(
             cartridge_mgr, query_vec, fetch_k, timeout_ms=cart_timeout_ms,
         ),
     )
     # STM は順位付け用 (combined) とゲート用 (素の cosine) の 2 系統を返す。
     stm_results, stm_gate_results = stm_pair
+    # LTM は結果と「語彙アンカー」(クエリの希少語を実際に含む chunk_id) を返す。
+    ltm_results, lexical_anchors = ltm_pair
     if timer is not None:
         timer.stop("retrieval_ms")
 
@@ -990,7 +1009,20 @@ async def unified_search(
     norm = rag_cfg.get("score_normalization", "none")
     merged_raw = _merge_results(stm_gate_results, ltm_results, cart_results)
     if norm == "none":
-        merged = _merge_results(stm_results, ltm_results, cart_results)
+        # 正規化なしのときは **3 層とも素の cosine** で並べる。
+        #
+        # 以前は STM だけ combined (cosine*0.6 + LightMem*0.4 + pin 加点) を
+        # 順位付けに使っていた。層ごとにスケールが違う値を 1 本の降順ソートへ
+        # 混ぜると、LightMem 項のぶん STM が LTM / カートリッジより系統的に
+        # 上へ来る。``merged[:top_k]`` は層をまたいだ順位で切るので、これは
+        # 「新しい会話ノートが、より関連する長期記憶を押しのける」形で効く。
+        #
+        # LightMem の役割は失われない。STM の内部で **どのノートを候補に
+        # するか** (``retrieve_top_k_detailed`` が combined 順に stm_top_k 件)
+        # を決めるのが本来の仕事で、層をまたいだ関連性の比較は素の cosine の
+        # 担当。ゲート (品質判定 / floor / content gate) が既に素の cosine を
+        # 使っているのと同じ理由。
+        merged = _merge_results(stm_gate_results, ltm_results, cart_results)
     else:
         merged = _merge_results(
             stm_results, ltm_results, cart_results, normalization=norm,
@@ -1101,6 +1133,27 @@ async def unified_search(
     )
     if floor > 0.0:
         kept_ids = {cid for cid, score, _ in merged_raw if score >= floor}
+        # 語彙アンカーの免除。
+        #
+        # フロアはコサインの棒なので、**密ベクトルが原理的に苦手なもの**
+        # (型番・パス・エラーコード・固有名詞のような literal) は、ユーザーが
+        # 名指ししていても低いコサインのまま落ちる。BM25 側の df から
+        # 「コーパスの 1% 未満にしか現れないトークン」を希少語と定義し、
+        # そのトークンを **実際に含む** チャンクだけをフロアから免除する。
+        #
+        # 相対バーではなく df を使うのは、相対バーだと top1 が定義上必ず越えて
+        # しまうため (注入側で同じ理由から相対フロアを採らなかった。
+        # ``MemoryInjector._resolve_relevance_thresholds`` のコメント参照)。
+        # df 比はコーパス規模にも埋め込みモデルにも依存しないので、静的な絶対
+        # 閾値が差し替えで到達不能になる事故を繰り返さない。
+        anchored = {cid for cid in lexical_anchors if cid not in kept_ids}
+        if anchored:
+            kept_ids |= anchored
+            logger.info(
+                "Relevance floor: %d chunk(s) exempted as lexical anchors "
+                "(query names a rare literal they contain) for query: %s",
+                len(anchored), query[:50],
+            )
         passed = [t for t in merged if t[0] in kept_ids]
         if len(passed) != len(merged):
             logger.info(
@@ -1113,8 +1166,10 @@ async def unified_search(
                 query=query,
                 quality=quality,
                 floor=floor,
-                kept=[(cid, s) for cid, s, _ in merged_raw if s >= floor],
-                rejected=[(cid, s) for cid, s, _ in merged_raw if s < floor],
+                kept=[(cid, s) for cid, s, _ in merged_raw if cid in kept_ids],
+                rejected=[
+                    (cid, s) for cid, s, _ in merged_raw if cid not in kept_ids
+                ],
             )
         merged = passed
         # 公平性保証 (Step 7.5) は cart_results から未代表カートリッジを
@@ -1149,6 +1204,17 @@ async def unified_search(
         final_sources, cart_results, top_k,
     )
 
+    # Step 7.55: 語彙アンカーは席を争わせない。
+    #
+    # ``_merge_results`` は最終的にスコア (= cosine) 降順で並べ直すため、LTM 側の
+    # RRF 順は「候補集合に入る/入らない」にしか効かない。密ベクトルが苦手な
+    # literal (型番・パス・エラーコード) は cosine が低いままなので、フロアを
+    # 免除しても ``merged[:top_k]`` で切られて結局届かない。訂正の随伴注入
+    # (Step 7.6) と同じ形で、**top_k を切った後に**足す。
+    final_sources = _attach_lexical_anchors(
+        final_sources, merged, lexical_anchors,
+    )
+
     # Step 7.6: 採用ノートが後続の訂正で上書きされているなら、訂正も一緒に出す。
     # top_k で切った **後** に足す — 訂正は席を争う候補ではなく随伴情報であり、
     # floor / top_k のどちらで落ちても「訂正前の値だけが残る」状態になる。
@@ -1169,6 +1235,37 @@ async def unified_search(
         from_memory=bool(stm_results),
         top_raw_score=_top_raw_score(final_sources, merged_raw),
     )
+
+
+#: ``_attach_lexical_anchors`` が随伴注入する上限。コンテキストを膨らませない
+#: ための保守的な値 (context rot: 意味的に近いが無関係な文脈ほど有害)。
+MAX_LEXICAL_ANCHOR_ATTACHMENTS: int = 2
+
+
+def _attach_lexical_anchors(
+    final_sources: list[tuple[str, float, str]],
+    merged: list[tuple[str, float, str]],
+    lexical_anchors: frozenset[str],
+    limit: int = MAX_LEXICAL_ANCHOR_ATTACHMENTS,
+) -> list[tuple[str, float, str]]:
+    """語彙アンカーのうち top_k から漏れたものを末尾へ足す (純粋関数)。
+
+    ユーザーが希少な literal を名指ししているのに、それを含むチャンクが
+    cosine 順位だけで落ちる状態を防ぐ。上限付きなので注入量は増えすぎない。
+    """
+    if not lexical_anchors:
+        return final_sources
+    present = {cid for cid, _, _ in final_sources}
+    extra = [
+        entry for entry in merged
+        if entry[0] in lexical_anchors and entry[0] not in present
+    ][:limit]
+    if not extra:
+        return final_sources
+    logger.info(
+        "Attached %d lexical anchor chunk(s) that fell outside top_k", len(extra),
+    )
+    return final_sources + extra
 
 
 def _top_raw_score(

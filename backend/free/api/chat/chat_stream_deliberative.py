@@ -14,6 +14,11 @@ from backend.app_state import AppState
 from backend.free.api.chat.chat_constants import DEFAULT_KEEPALIVE_INTERVAL_SEC
 from backend.free.api.chat.chat_recorder import record_response
 from backend.free.api.chat.chat_service import make_token_info
+from backend.free.api.chat.constraint_repair import (
+    needs_verification,
+    repair_if_violated,
+)
+from backend.free.core.text_quality import length_disclosure_note
 from backend.free.api.chat.chat_types import (
     ChatMessage,
     GenerationParams,
@@ -74,6 +79,8 @@ class _DeliberativeStreamState:
     #: 共有判定器の属性を記録側が後から読むと並行リクエストで消えるため、
     #: ターンごとの値をここまで運ぶ (ToolJudgement.action_blocked のコメント参照)。
     action_blocked: bool = False
+    #: バッファモード (出力制約の検証ターン) で溜めたフィルタ通過後の本文。
+    filtered_output: str = ""
 
 
 
@@ -100,6 +107,7 @@ async def _stream_filtered_token_pipeline(
     session_id: str,
     timer: StageTimer | None,
     query: str = "",
+    buffer_only: bool = False,
 ) -> AsyncIterator[str]:
     """フィルタパイプライン (思考ブロック除去 + 先頭ラベル除去) でトークンを yield する。
 
@@ -107,8 +115,15 @@ async def _stream_filtered_token_pipeline(
     SSE keepalive コメントを送出してフロントエンドの chunk timeout を防ぐ。
 
     ``query`` は復唱除去用。渡さない場合は復唱フィルタが素通しになる。
+
+    ``buffer_only`` はフィルタ結果をユーザーへ流さず ``state.filtered_output``
+    へ溜める (keepalive だけ流す)。出力制約の検証・修復ターンで使う: 破った
+    回答を先に流してしまうと書き直せない。長さ・形式の指定があるターンの回答は
+    定義上短いので、TTFT の犠牲は限定的。開示フィルタ
+    (``LengthDisclosureFilter``) はこのモードでは外す — 修復前の本文へ注記が
+    混ざると、それがそのまま修復生成の入力になってしまう。
     """
-    pipeline = StreamPipeline([
+    filters = [
         StreamThinkingFilter(),
         HeadBufferFilter(),
         # 先頭ラベル除去のあとに復唱を判定する (「**回答:** 今日は何曜日ですか。」
@@ -121,10 +136,13 @@ async def _stream_filtered_token_pipeline(
         # system プロンプトと動的ブロックの区切り文の両方で禁じているのに
         # 実機では破られた (2026-08-16 ライブ監査 ターン25)。
         InternalFrameMentionFilter(),
+    ]
+    if not buffer_only:
         # 明示された文字数指定を破ったことを末尾で開示する。層の終端処理では
         # なくパイプラインに置く (LengthDisclosureFilter の docstring 参照)。
-        LengthDisclosureFilter(query),
-    ])
+        # buffer_only のときは修復を試みたあとで呼出側が開示する。
+        filters.append(LengthDisclosureFilter(query))
+    pipeline = StreamPipeline(filters)
     aiter = token_stream.__aiter__()
     pending: asyncio.Task[str] | None = None
     # keepalive を「LLM からトークンが来ない時間」ではなく「SSE フレームを
@@ -173,7 +191,12 @@ async def _stream_filtered_token_pipeline(
             timer.stop("llm_first_token_ms")
             state.first_token_recorded = True
         filtered = pipeline.process(token)
-        if filtered:
+        if filtered and buffer_only:
+            state.filtered_output += filtered
+            if time.monotonic() - last_frame_at >= DEFAULT_KEEPALIVE_INTERVAL_SEC:
+                yield sse.keepalive()
+                last_frame_at = time.monotonic()
+        elif filtered:
             state.emitted_chars += len(filtered)
             yield sse.token(filtered)
             last_frame_at = time.monotonic()
@@ -184,9 +207,44 @@ async def _stream_filtered_token_pipeline(
             last_frame_at = time.monotonic()
 
     remaining = pipeline.flush()
-    if remaining:
+    if remaining and buffer_only:
+        state.filtered_output += remaining
+    elif remaining:
         state.emitted_chars += len(remaining)
         yield sse.token(remaining)
+
+
+async def _emit_verified_output(
+    state: _DeliberativeStreamState,
+    query: str,
+    messages: list[ChatMessage],
+    client: LocalClient,
+    max_tokens: int | None,
+    generation_params: GenerationParams | None,
+) -> AsyncIterator[str]:
+    """バッファした本文を検証し、必要なら 1 回だけ書き直してから流す。
+
+    修復が成功すれば書き直した本文を、失敗すれば元の本文 + 開示注記を出す。
+    ``full_response`` も **ユーザーが実際に見たもの** で置き換える — 記録と
+    画面が食い違うと、次のターンの自己申告 (「いま書いた要約は何文字？」) が
+    記録側の古い本文を根拠に答えてしまう。
+    """
+    body = state.filtered_output
+    if not body.strip():
+        return
+    final_text, unresolved = await repair_if_violated(
+        query=query,
+        response=body,
+        messages=messages,
+        client=client,
+        max_tokens=max_tokens,
+        generation_params=generation_params,
+    )
+    if unresolved is not None:
+        final_text += length_disclosure_note(query, final_text)
+    state.emitted_chars += len(final_text)
+    state.full_response = final_text
+    yield sse.token(final_text)
 
 
 async def _retry_zero_tokens_deliberative(
@@ -430,10 +488,28 @@ async def stream_deliberative(
             async for frame in _drain_deliberative_step_queue(step_queue):
                 yield frame
 
+            verify_output = needs_verification(query)
+            if verify_output:
+                # バッファモードは本文を 1 文字も流さないので、進捗の手掛かりが
+                # 無いと **空の吹き出しが数十秒間そのまま**になる (実測
+                # 2026-08-25 ライブ監査: 「ちょうど30文字で」のターンが 40 秒
+                # 無表示)。既存の step フレームで「何をしているか」を出す。
+                yield sse.step({
+                    "type": "task_result", "status": "running",
+                    "detail": "指定された長さ・形式に合わせて回答を組み立てています",
+                })
             async for frame in _stream_filtered_token_pipeline(
                 token_stream, stream_state, session_id, timer, query,
+                buffer_only=verify_output,
             ):
                 yield frame
+
+            if verify_output:
+                async for frame in _emit_verified_output(
+                    stream_state, query, messages, client,
+                    max_tokens, generation_params,
+                ):
+                    yield frame
 
             async for frame in _retry_zero_tokens_deliberative(
                 stream_state, messages, client, max_tokens, session_id, query,
@@ -628,10 +704,19 @@ async def stream_reactive_light(
             _apply_generation_params(gen_kwargs, generation_params)
             token_stream = await client.generate(list(messages), **gen_kwargs)
 
+            verify_output = needs_verification(query)
             async for frame in _stream_filtered_token_pipeline(
                 token_stream, stream_state, session_id, timer, query,
+                buffer_only=verify_output,
             ):
                 yield frame
+
+            if verify_output:
+                async for frame in _emit_verified_output(
+                    stream_state, query, messages, client,
+                    max_tokens, generation_params,
+                ):
+                    yield frame
 
             async for frame in _retry_zero_tokens_deliberative(
                 stream_state, messages, client, max_tokens, session_id, query,

@@ -272,6 +272,34 @@ _GENERIC_SUBJECT_TAIL: frozenset[str] = frozenset(
 )
 
 
+#: 「ほぼ同じ本文」とみなす bi-gram Jaccard の下限。``ChunkContentGate`` の
+#: ``dedup_jaccard`` と同じ棒。意味的に近いだけの別内容を巻き込まないため
+#: 高めに置く (相対でなく絶対だが、Jaccard は 0..1 の比なのでスケール依存が無い)。
+NEAR_DUPLICATE_JACCARD: float = 0.85
+
+#: 「尋ねられている属性」に一致するファクトへ足すスコア。
+#:
+#: 他の加点 (confidence 最大 1.0 + access_count の対数 + recency 最大 1.0 +
+#: pinned/correction ボーナス) の合計を確実に上回る量にする。属性一致は
+#: 埋め込みのスケールに依存しない決定論の根拠なので、確率的なスコアと
+#: 競わせる意味が無い (競わせると実測で飲み物が趣味に勝つ)。
+_ASKED_ATTRIBUTE_BONUS: float = 100.0
+
+#: 近似重複判定は O(n^2)。注入候補がこの件数を超えたら判定ごと見送る
+#: (実運用の候補数は数十件で、超えるのは異常系)。
+_NEAR_DUP_MAX_ITEMS: int = 200
+
+
+def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
+    """2 つのトークン集合の Jaccard 係数 (純粋関数)。"""
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    if not inter:
+        return 0.0
+    return inter / len(a | b)
+
+
 def _attribute_key(subject: str) -> str | None:
     """subject から「実世界の属性名」を取り出す (純粋関数)。
 
@@ -417,6 +445,25 @@ class MemoryInjector:
         for text in session_user_texts or ():
             if not text:
                 continue
+            # **問い・依頼は「値の述べ直し」ではない。**
+            #
+            # 属性辞書は「どの属性の話か」しか見ないので、
+            # 「私が住んでいるのはどこでしたか。」も location に解決される。
+            # その結果この判定が真になり、**想起の質問そのものが「もう述べた」
+            # 扱いになって記憶が抑止される** — 想起したいときほど記憶が消える
+            # という逆転が起きる。
+            #
+            # 実インシデント (2026-08-25 ライブ監査): 新規セッションで
+            # 「私が住んでいるのはどこでしたか。」「私の好きな飲み物は？」
+            # 「私の趣味は何でしたか。」等 6 問すべてに「確認できる情報を
+            # 持ち合わせていません」と回答した。ストアには正しいファクトが
+            # あり、属性も正しく解決できていた (asked_attrs=['location'])。
+            # 落ちていたのはこの判定だけ。
+            #
+            # 判定は既存の決定論ヘルパを使う (実測で問い 3 件 / 言明 2 件を
+            # 完全分離)。語彙を新しく列挙しない。
+            if states_no_user_value(text) or carries_no_assertion(text):
+                continue
             for fact_type in _USER_ATTRIBUTE_FACT_TYPES:
                 attr = resolve_fact_attribute(text, fact_type, mode=mode)
                 if attr:
@@ -437,6 +484,50 @@ class MemoryInjector:
         attr = subject.rsplit(".", 1)[-1]
         return (fact_type, attr) in restated
 
+    @staticmethod
+    def _asked_attributes(query_text: str, mode: MemoryMode) -> set[str]:
+        """発話が **どの属性を尋ねているか** を決定論辞書で解決する。
+
+        書き込み側 (抽出器が subject を決める) と読み出し側で同じ辞書
+        (``fact_attributes.yaml`` / :func:`resolve_fact_attribute`) を使う。
+        「私の趣味は何でしたか。」→ ``{"hobby"}``、
+        「私が住んでいるのはどこでしたか。」→ ``{"location"}``。
+
+        **なぜ要るか**: 記憶は正規化された三人称の命題として保存される
+        (「小川宏之は埼玉県川口市に住んでいる。」) が、想起クエリは一人称
+        (「私が住んでいるのはどこでしたか。」)。実測 (2026-08-25 ライブ監査、
+        LFM2.5-Embedding-350M):
+
+            正規化後(三人称) の保存文 vs 一人称クエリ … cos +0.098
+            一人称のままの文   vs 同じクエリ        … cos +0.330
+
+        較正済みの関連度フロアは 0.29 なので、**正規化した瞬間にフロアの下へ
+        落ちる**。しかも順位も壊れていて、「私の趣味は何でしたか。」に対し
+        飲み物のファクト (+0.352) が趣味のファクト (+0.228) を上回っていた。
+        実機では 6 問中 6 問が「確認できる情報を持ち合わせていません」。
+
+        属性名の一致は **埋め込みのスケールに依存しない決定論の根拠** なので、
+        ここだけはコサインの棒を免除できる (RAG 側の語彙アンカーと同じ立て付け)。
+        """
+        if not query_text:
+            return set()
+        from backend.free.memory.notes.note_builder import resolve_fact_attribute
+
+        attrs: set[str] = set()
+        for fact_type in _USER_ATTRIBUTE_FACT_TYPES:
+            try:
+                attr = resolve_fact_attribute(query_text, fact_type, mode=mode)
+            except Exception:
+                continue
+            if attr:
+                attrs.add(attr)
+        return attrs
+
+    @staticmethod
+    def _fact_attribute(fact: SemanticFact) -> str | None:
+        """ファクトの属性名 (subject 末尾)。取り出せなければ ``None``。"""
+        return _attribute_key(str(getattr(fact, "subject", "") or ""))
+
     # ── public API ────────────────────────────────────────────────────
 
     def inject(
@@ -449,6 +540,7 @@ class MemoryInjector:
         failure_signatures: Iterable[str] | None = None,
         query_embedding: "np.ndarray | None" = None,
         session_user_texts: Iterable[str] = (),
+        query_text: str = "",
     ) -> InjectionPlan:
         """注入計画を構築する。
 
@@ -464,6 +556,9 @@ class MemoryInjector:
             session_user_texts: 今回の会話でユーザーが述べた本文の列。ここに
                 同じ属性スロットの言明があるファクトは注入しない
                 (:meth:`_restated_slots` を参照)。
+            query_text: 現在のユーザー発話の本文。**どの属性を尋ねているか**を
+                決定論辞書 (:func:`resolve_fact_attribute`) で解決し、一致する
+                ファクトを関連度ゲートから免除する (:meth:`_asked_attributes`)。
             query_embedding: 現在のユーザー発話の埋め込み。与えられた場合、
                 埋め込みを持つ候補は類似度 ``relevance_min_score`` 未満なら
                 注入しない (``pinned`` は明示指定なので常に通す)。``None``
@@ -493,6 +588,8 @@ class MemoryInjector:
         facts, collapsed, stale_texts = self._collapse_to_current_values(facts)
         filtered_out += collapsed
         restated = self._restated_slots(session_user_texts, mode)
+        asked_attrs = self._asked_attributes(query_text, mode)
+        attr_exempt = 0
 
         for fact in facts:
             if fact.superseded_by:
@@ -556,7 +653,14 @@ class MemoryInjector:
                 filtered_out += 1
                 continue
             gate_reached += 1
-            if not self._is_relevant(
+            # 尋ねられている属性と subject の属性が一致するファクトは、
+            # コサインの棒を免除する (:meth:`_asked_attributes` の実測を参照)。
+            asked_this = bool(
+                asked_attrs and self._fact_attribute(fact) in asked_attrs
+            )
+            if asked_this:
+                attr_exempt += 1
+            elif not self._is_relevant(
                 query_vec, getattr(fact, "embedding", None),
                 pinned=bool(fact.pinned),
             ):
@@ -569,6 +673,12 @@ class MemoryInjector:
             if tier is None:
                 continue
             score = self._score_fact(fact)
+            if asked_this:
+                # 順位も直す。免除しただけでは Tier 内の並びで負ける
+                # (実測: 「私の趣味は何でしたか。」で飲み物 +0.352 が
+                #  趣味 +0.228 を上回っていた)。属性一致は決定論の根拠なので、
+                #  スコアの下駄ではなく **確実に先頭へ** 出す量を足す。
+                score += _ASKED_ATTRIBUTE_BONUS
             text = self._render_fact(fact)
             tokens = estimate_tokens(text)
             buckets[tier].append(
@@ -672,6 +782,20 @@ class MemoryInjector:
                 ),
             )
 
+        # 近似重複の抑止 (tier をまたいで掛ける)。
+        #
+        # 完全一致の重複はファクト側 (_collapse_to_current_values) と
+        # ノート側 (_is_stale_duplicate) で既に落としているが、**言い回しが
+        # 少し違うだけの同一内容**は素通りする。しかも 2 つのストアは同じ発話を
+        # 別々に持つので、同じ事実がファクト行とノート行で並ぶ (実測 2026-08-23:
+        # PC 環境の 2 文が [関連する記憶] と [参考情報] に計 4 コピー)。
+        # 予算を食うだけでなく、**同じ主張が複数回現れることが重み付けとして
+        # 働く** — 複製数の多い古い値が新しい値に勝つ壊れ方は既に一度起きている。
+        #
+        # 意味的に近いだけの別内容まで巻き込まないよう、判定は「ほぼ同じ本文」
+        # に限る (bi-gram 集合の Jaccard、既定 0.85 = ChunkContentGate と同じ棒)。
+        dedup_dropped = self._suppress_near_duplicates(buckets)
+
         plan = InjectionPlan(
             mode=mode,
             budget_tokens=budget,
@@ -692,10 +816,12 @@ class MemoryInjector:
 
         logger.debug(
             "MemoryInjector.inject: mode=%s budget=%d used=%d items=%d "
-            "dropped=%d project=%s sigs=%d relevance=%s filtered=%d",
+            "dropped=%d project=%s sigs=%d relevance=%s filtered=%d "
+            "near_dup=%d asked_attrs=%s attr_exempt=%d",
             mode, budget, plan.used_tokens, len(plan.items),
             len(plan.dropped), current_project_id, len(sigs),
             "on" if query_vec is not None else "off", filtered_out,
+            dedup_dropped, sorted(asked_attrs) or "-", attr_exempt,
         )
         # 全件却下は「関連する記憶が無いターン」でも起きるが、それが**続く**なら
         # 棒が到達不能になっている。静的閾値のまま埋め込みモデルを替えたときの
@@ -1181,6 +1307,54 @@ class MemoryInjector:
         return f"- (過去の記録) {note.content}"
 
     # ── パッキング ───────────────────────────────────────────────────
+
+    def _suppress_near_duplicates(
+        self, buckets: dict[int, list["InjectedItem"]],
+    ) -> int:
+        """tier をまたいで近似重複を落とす (buckets を破壊的に更新)。
+
+        走査は「上位 tier / 高スコア順」で、先に採った項目に似すぎている後続を
+        落とす。判定は bi-gram 集合の Jaccard で、``NEAR_DUPLICATE_JACCARD``
+        以上を「ほぼ同じ本文」とみなす。
+
+        Returns:
+            落とした項目数。
+        """
+        order = [
+            (tier, item)
+            for tier in (1, 2, 3, 4)
+            for item in sorted(buckets.get(tier, []), key=lambda it: -it.score)
+        ]
+        if len(order) <= 1 or len(order) > _NEAR_DUP_MAX_ITEMS:
+            return 0
+        try:
+            from backend.free.rag.bm25_retriever import tokenize_ja
+        except Exception:  # 語彙トークナイザが無い構成では抑止しない
+            return 0
+
+        kept: dict[int, list["InjectedItem"]] = {1: [], 2: [], 3: [], 4: []}
+        kept_tokens: list[frozenset[str]] = []
+        dropped = 0
+        for tier, item in order:
+            tokens = frozenset(tokenize_ja(item.text))
+            if not tokens:
+                kept[tier].append(item)
+                continue
+            if any(
+                _jaccard(tokens, other) >= NEAR_DUPLICATE_JACCARD
+                for other in kept_tokens
+            ):
+                dropped += 1
+                continue
+            kept_tokens.append(tokens)
+            kept[tier].append(item)
+        if dropped:
+            for tier in (1, 2, 3, 4):
+                buckets[tier] = kept[tier]
+            logger.debug(
+                "MemoryInjector: suppressed %d near-duplicate item(s)", dropped,
+            )
+        return dropped
 
     def _pack_tier(
         self,

@@ -119,8 +119,14 @@ def _extract_search_pattern(query: str) -> str:
 #: ``E:/tmp/a.txt`` が 1 つも抽出できず、ルール層が read_file を選べないまま
 #: aux 層へ落ちていた (実インシデント 2026-08-04 ライブ監査: 同じ依頼が
 #: read_file / search_history / ツール未発火に割れる原因)。
+#: セグメント部の繰り返しは ``*`` ではなく ``+``。**区切りの無い裸のドライブ
+#: レター (``E:``) にはマッチさせない**。``*`` だとセグメントが非 ASCII で
+#: 始まるクエリ (「E:\日本語.txt を読んで」) で 0 回マッチが成立し、
+#: ディレクトリとして ``"E:"`` を返していた — 実在しないパスであり、しかも
+#: ファイル要求がディレクトリ要求に化ける。ドライブ直下そのものを指す
+#: ``E:\`` は第 2 選択肢で拾う。
 _DIR_PATH_RE = re.compile(
-    r"([A-Za-z]:(?:[\\/][A-Za-z0-9_.][A-Za-z0-9_. -]*)*)",
+    r"([A-Za-z]:(?:[\\/][A-Za-z0-9_.][A-Za-z0-9_. -]*)+|[A-Za-z]:[\\/])",
 )
 
 # クォート文字の対応表（開き, 閉じ）。ファイル名の語幹 (拡張子直前) が
@@ -258,6 +264,19 @@ def _extract_file_path(query: str) -> str:
     # ファイル名の語幹が非ASCII (日本語等) だと file_match はマッチしない
     # ("テスト.docx" 等)。その場合はクォートで明示されたファイル名を拾う。
     filename = file_match.group(1) if file_match else _extract_quoted_filename(query)
+    if filename is None and drive_match:
+        # ドライブ直下の非 ASCII ファイル名 (``E:\日本語.txt``)。Pattern 1a は
+        # 「ドライブ直下 + 非 ASCII」を地の文と区別できないとして除外している
+        # (「e:\直下にa.txtのファイル名で」が丸ごと 1 つのパスに見えてしまう) が、
+        # **クエリ全体に ASCII のファイル名もクォート付きファイル名も無い**
+        # ときだけは曖昧さが無い (上の 2 つが先に効くため、除外例は必ずそちらで
+        # 拾われる)。区切り直後から拡張子までを取る。
+        m = re.search(
+            r"[A-Za-z]:[\\/]([^\s　\"'「」『』\\/]{1,128}\.[A-Za-z][A-Za-z0-9]{0,9})",
+            query,
+        )
+        if m:
+            filename = m.group(1)
     if drive_match and filename:
         dir_match = _DIR_PATH_RE.search(query)
         if dir_match:
@@ -302,6 +321,14 @@ def _extract_file_path(query: str) -> str:
     )
     if m:
         return m.group(1)
+
+    # 6. クォートで明示された非 ASCII ファイル名 (「メモ.txt」)。
+    #    Pattern 5 は語幹を ASCII に限っているので日本語のファイル名を拾えず、
+    #    ドライブレターが無いクエリでは Pattern 2 の quoted fallback にも
+    #    到達しなかった。クォートされている以上、地の文との区別は付いている。
+    quoted = _extract_quoted_filename(query)
+    if quoted:
+        return quoted
 
     return ""
 # --- 算術式抽出 (calculate ツールの決定論的ルーティング) ---------------------

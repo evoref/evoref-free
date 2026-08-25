@@ -29,6 +29,7 @@ from backend.free.core.text_quality import (
     has_chinese_token_leak,
     retracts_own_conclusion,
     violates_length_constraint,
+    violates_output_form,
 )
 from backend.free.core.text_similarity import (
     bigram_coverage,
@@ -858,6 +859,13 @@ class FeedbackCollector:
         broken_length = violates_length_constraint(query, text)
         if broken_length is not None:
             logger.info("Turn marked failed (%s)", broken_length)
+            return "failed"
+        # 形式指定 (箇条書き / 項目数 / 数値だけ) も同じ扱い。数えるだけで
+        # 決まるので推定を含まない。文字数だけ見て形式を見ないと、
+        # 「3つ箇条書きで」に 1 行で答えたターンが success として学習に入る。
+        broken_form = violates_output_form(query, text)
+        if broken_form is not None:
+            logger.info("Turn marked failed (%s)", broken_form)
             return "failed"
         return "success"
 

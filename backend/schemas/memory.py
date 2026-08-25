@@ -446,8 +446,14 @@ class MemoryConfig(BaseModel):
     # しか見えず、会話全体を走査する質問が前半を「無い」と断定した)。
     # 上限を超えた分は WorkingMemory.session_evicted_turns に計上され、
     # 全体走査質問には切り詰め注記が付く (chat_service._append_truncated_history_note)。
-    working_max_turns: int = Field(default=128, ge=1)
-    working_max_tokens: int = Field(default=2048, ge=256)
+    # 既定は ``llama.context_size`` の既定 8192 に対する推奨値
+    # (docs / config.yaml.example の表: context 8192 → 4096)。以前の 2048 は
+    # context 4096 前提の値が残ったもので、既定同士が食い違っていた
+    # (窓の半分しか使わないぶん、押し出しが早く来て再 prefill が増える)。
+    # ターン数側は「短い発話でもトークン側が先に効く」よう tokens/16 に置く
+    # (:data:`_SHORT_TURN_TOKENS_PER_MESSAGE` の解説を参照)。
+    working_max_turns: int = Field(default=256, ge=1)
+    working_max_tokens: int = Field(default=4096, ge=256)
     # 上限に達したときに **まとめて** 押し出すターン数 (ヒステリシス)。
     # 1 ターンずつ削ると窓の先頭が毎ターン動き、llama-server の接頭辞 KV
     # キャッシュが system プロンプト以降まるごと無効化される。実測

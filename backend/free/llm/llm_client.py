@@ -77,6 +77,11 @@ class LLMClient:
         return self.local.background_slot
 
     @property
+    def classifier_slot(self) -> int:
+        """ツール分類器用スロット (LocalClient.classifier_slot の委譲)。"""
+        return self.local.classifier_slot
+
+    @property
     def metadata(self):
         """モデルメタデータ (ローカル LLM)"""
         return self.local.metadata

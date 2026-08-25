@@ -132,6 +132,16 @@ _TOPK_MIN_SCORE = 0.40
 # を出さないだけ) の非対称性から、観測ノイズ上限を上回る 0.25 を採る。
 _TOPK_MIN_SIM = 0.25
 
+#: 密ベクトルで選ぶときの最小類似度。
+#:
+#: bi-gram の 0.25 とは **別の値**にする。同じ「0.25」でも分布が違う: 文字
+#: bi-gram は語が重ならなければ 0 に張り付くが、埋め込みは無関連でも 0.1〜0.3 に
+#: 散る。RAG の較正 (memory_threshold_calibration) が効いていればその relevance を
+#: 使い、無ければこの静的値へ縮退する — 注入側の関連度ゲートと同じ作りにして、
+#: 埋め込みモデルを替えたときに「黙って全部落とす / 全部通す」のどちらにも
+#: ならないようにする。
+_TOPK_MIN_SIM_DENSE_STATIC = 0.35
+
 # タスク進捗ノート行 (エージェントの最終応答フォーマット)。
 # meta_cognitive_utils._TASK_LOG_LINE_RE と同旨だが、pillar 境界
 # (EvorefLearn → EvorefLoop の utils は import 対象外) のため最小実装を持つ。
@@ -384,6 +394,23 @@ EvolveWriteback = Literal["yaml", "semmem"]
 #: 未知キー (旧スキーマ / フィールド削除) を無視して TypeError によるプール
 #: 全消失を防ぐ (level0_instant の FeedbackSignals 復元と対称)。
 _EXAMPLE_FIELD_NAMES = frozenset(f.name for f in fields(FewShotExample))
+
+
+def _resolve_dense_min_sim() -> float:
+    """密ベクトル選択の最小類似度 (較正があればそれ、無ければ静的値)。"""
+    try:
+        from backend.free.rag.memory_threshold_calibration import (
+            get_active_calibration,
+        )
+
+        calibration = get_active_calibration()
+    except Exception:
+        return _TOPK_MIN_SIM_DENSE_STATIC
+    if not calibration:
+        return _TOPK_MIN_SIM_DENSE_STATIC
+    return float(
+        calibration.get("relevance_threshold", _TOPK_MIN_SIM_DENSE_STATIC),
+    )
 
 
 def _char_bigrams(text: str) -> Counter:
@@ -836,6 +863,60 @@ class FewShotPool(JsonStateStore):
         """指定モードのプール全体を返す"""
         return list(self._pools.get(mode, []))
 
+    @staticmethod
+    def _dense_similarities(
+        query_vec: "np.ndarray", examples: list[FewShotExample],
+    ) -> list[float]:
+        """クエリベクトルと例の埋め込みのコサイン類似度 (純粋計算)。"""
+        q = np.asarray(query_vec, dtype=np.float32).ravel()
+        qn = float(np.linalg.norm(q))
+        if not qn or not np.isfinite(qn):
+            return [0.0] * len(examples)
+        q = q / qn
+        sims: list[float] = []
+        for ex in examples:
+            v = np.asarray(ex.embedding, dtype=np.float32).ravel()
+            if v.shape != q.shape:
+                sims.append(0.0)
+                continue
+            n = float(np.linalg.norm(v))
+            sims.append(float(q @ (v / n)) if n and np.isfinite(n) else 0.0)
+        return sims
+
+    async def backfill_embeddings(self, embedder) -> int:
+        """埋め込みが無い例の ``query`` を遡って埋め込む。
+
+        hot path では絶対に呼ばない — 起動直後の背景タスクと sleep-time から
+        呼ぶ。埋め込みは永続化しない (プロセス内キャッシュ)。ファクトの object
+        へ 1024 次元を書き込むとストアが膨らみ、ファクト自身の埋め込み対象
+        テキストも汚れるため。プールは高々 ``pool_size`` 件なので再生成は安い。
+
+        Returns:
+            埋め込みを新たに付与した例の数。
+        """
+        if embedder is None:
+            return 0
+        filled = 0
+        for mode, pool in self._pools.items():
+            targets = [ex for ex in pool if not ex.embedding and ex.query.strip()]
+            if not targets:
+                continue
+            try:
+                vecs = await embedder.embed(
+                    [ex.query for ex in targets], is_query=True, mode=mode,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "fewshot embedding backfill failed for mode=%s: %s", mode, exc,
+                )
+                continue
+            for ex, vec in zip(targets, np.asarray(vecs)):
+                ex.embedding = [float(x) for x in np.asarray(vec).ravel()]
+                filled += 1
+        if filled:
+            logger.info("fewshot embedding backfill: %d example(s) embedded", filled)
+        return filled
+
     def _get_bigrams(self, example: FewShotExample) -> Counter:
         """例の bi-gram を取得（キャッシュ付き）"""
         if example.id not in self._bigram_cache:
@@ -1082,13 +1163,25 @@ class FewShotPool(JsonStateStore):
         mode: str,
         query: str,
         k: int | None = None,
+        query_vec: "np.ndarray | None" = None,
     ) -> list[FewShotExample]:
-        """query 類似度 (char bi-gram cosine) × fitness 重み付けで上位 k を返す。
+        """query 類似度 × fitness 重み付けで上位 k を返す。
 
-        推論時の動的 few-shot 選択器 (FewShotSelector Protocol の実装)。埋め込み
-        サーバは使わず同期・低遅延。``combined = SIM_W * sim + (1-SIM_W) * fitness``。
-        pool が大きい場合は fitness 上位 ``_TOPK_SELECT_CAP`` 件に足切りしてから
-        類似計算する (hot path のレイテンシ抑制)。query/pool が空なら ``[]``。
+        推論時の動的 few-shot 選択器 (FewShotSelector Protocol の実装)。
+        ``combined = SIM_W * sim + (1-SIM_W) * fitness``。pool が大きい場合は
+        fitness 上位 ``_TOPK_SELECT_CAP`` 件に足切りしてから類似計算する
+        (hot path のレイテンシ抑制)。query/pool が空なら ``[]``。
+
+        類似度の尺度は 2 つ:
+
+        - ``query_vec`` が渡され、かつ埋め込み済みの例があれば **密ベクトル**。
+          記憶検索と同じ尺度になるので、「言い換えただけで手本が外れる」
+          (文字 bi-gram の弱点) が消える。候補は埋め込み済みの例だけに絞る —
+          異なるスケールを 1 つの順位表に混ぜない (STM が順位用とゲート用を
+          分けているのと同じ理由)。未生成の例は sleep-time の backfill を
+          待って選択対象に入る (STM ノートが embed 工程を通るまで注入対象に
+          ならないのと同じ契約)。
+        - それ以外は従来の文字 bi-gram コサイン (埋め込みサーバ不要・同期)。
         """
         k = k or self.max_examples
         pool = self._pools.get(mode, [])
@@ -1098,10 +1191,23 @@ class FewShotPool(JsonStateStore):
         # 実効スコア上位 cap 件に足切り (全件 cosine を避ける)
         if len(pool) > _TOPK_SELECT_CAP:
             pool = sorted(pool, key=lambda e: -_effective_fitness(e))[:_TOPK_SELECT_CAP]
-        q_bg = _char_bigrams(q)  # query bi-gram は 1 回だけ計算
+
+        dense_pool = (
+            [ex for ex in pool if ex.embedding] if query_vec is not None else []
+        )
+        if dense_pool:
+            sims = self._dense_similarities(query_vec, dense_pool)
+            candidates = list(zip(dense_pool, sims))
+            min_sim = _resolve_dense_min_sim()
+        else:
+            q_bg = _char_bigrams(q)  # query bi-gram は 1 回だけ計算
+            candidates = [
+                (ex, _cosine_similarity(q_bg, self._get_bigrams(ex))) for ex in pool
+            ]
+            min_sim = _TOPK_MIN_SIM
+
         scored: list[tuple[float, float, FewShotExample]] = []
-        for ex in pool:
-            sim = _cosine_similarity(q_bg, self._get_bigrams(ex))
+        for ex, sim in candidates:
             combined = (
                 _TOPK_SIM_WEIGHT * sim
                 + (1.0 - _TOPK_SIM_WEIGHT) * _effective_fitness(ex)
@@ -1114,7 +1220,7 @@ class FewShotPool(JsonStateStore):
         selected = [
             ex
             for s, sim, ex in scored[:k]
-            if s >= _TOPK_MIN_SCORE and sim >= _TOPK_MIN_SIM
+            if s >= _TOPK_MIN_SCORE and sim >= min_sim
         ]
 
         dl = self._debug_logger
@@ -1311,8 +1417,16 @@ class FewShotPool(JsonStateStore):
     # ── 永続化 (JsonStateStore) ──
 
     def _to_payload(self) -> JsonPayload:
+        # ``embedding`` は永続化しない。1024 次元 × プール件数を状態ファイルへ
+        # 書くと肥大するうえ、埋め込みモデルを替えた瞬間に **次元が合わない
+        # ベクトル** が復元されて黙って類似度 0 になる (=「手本が 1 件も
+        # 選ばれない」という気づきにくい壊れ方)。プールは高々 pool_size 件
+        # なので、起動後の背景タスクと sleep-time で張り直す方が安全。
         return {
-            mode: [asdict(ex) for ex in pool]
+            mode: [
+                {k: v for k, v in asdict(ex).items() if k != "embedding"}
+                for ex in pool
+            ]
             for mode, pool in self._pools.items()
         }
 

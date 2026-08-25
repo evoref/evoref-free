@@ -480,6 +480,7 @@ def build_semmem_injection(
     state: AppState, cfg: dict, mode: str = "chat",
     conflict_ctx: ConflictTurnContext | None = None,
     query_vec=None,
+    query_text: str = "",
 ) -> str | None:
     """SemMem facts + STM notes を MemoryInjector で tier 整形し、
     プロンプト注入用テキストを返す。
@@ -542,6 +543,7 @@ def build_semmem_injection(
                 failure_signatures=(),
                 query_embedding=query_vec,
                 session_user_texts=_session_user_texts(state),
+                query_text=query_text,
             )
             rendered = plan.render() or None
     except Exception as e:

@@ -18,6 +18,9 @@ from backend.free.core.text_quality import (
     states_no_user_value,
     conversational_numeric_claims,
     find_superseded_claim,
+    ANSWER_ONLY_RE,
+    BULLET_FORM_RE,
+    ITEM_COUNT_RE,
     match_length_directive,
 )
 from backend.free.core.turn_text import append_to_last_user, prepend_to_last_user
@@ -124,42 +127,6 @@ def _char_limit_note(history: list[ChatMessage]) -> str:
     )
 
 
-#: 「数値だけ」「一言で」型の **答えだけを求める** 指定。
-#:
-#: 実インシデント (2026-08-14 ライブ監査 ターン15): 「摂氏 23 度は華氏何度ですか？
-#: 数値だけ答えてください。」に対し 300 字超の解説を返した。
-#: 「だけ」の後に **応答を指す動詞** を要求する。これが無いと
-#: 「この値だけを使って計算して」(= 使う値の限定) まで拾ってしまう。
-_ANSWER_ONLY_RE = re.compile(
-    r"(?:数値|数字|値|結論|答え|回答)\s*だけ\s*(?:を|で)?\s*"
-    r"(?:答え|回答|示し|教え|出力|返し|書い|述べ|お願い)"
-    r"|(?:一言|ひとこと|一語|単語)\s*(?:で|だけ)\s*"
-    r"(?:答え|回答|示し|教え|言っ|いっ|まとめ|表現|お願い)"
-    r"|(?<![A-Za-z])(?:just|only)\s+the\s+(?:number|value|answer)(?![A-Za-z])"
-    r"|(?<![A-Za-z])in\s+one\s+word(?![A-Za-z])"
-    r"|(?<![A-Za-z])(?:number|value|answer)\s+only(?![A-Za-z])",
-    re.IGNORECASE,
-)
-
-#: 「箇条書きで」型の **出力形式** 指定。
-#:
-#: 実インシデント (2026-08-14 ライブ監査 ターン39): 「利点と欠点を、各 3 つずつ
-#: 箇条書きで。」に対し「利点：A、B、C」と読点区切りの 1 行で返した。
-_BULLET_FORM_RE = re.compile(
-    r"箇条書き|リスト形式|(?:マークダウン|markdown)\s*の?\s*リスト"
-    r"|(?<![A-Za-z])bullet(?:\s+points?|\s+list)?(?![A-Za-z])"
-    r"|(?<![A-Za-z])as\s+a\s+list(?![A-Za-z])",
-    re.IGNORECASE,
-)
-
-#: 「各 3 つずつ」「3 個挙げて」型の個数指定 (箇条書き指定と併用されたときだけ使う)。
-_ITEM_COUNT_RE = re.compile(
-    r"(?:各)?\s*(\d{1,2})\s*(?:つ|個|点|項目)\s*(?:ずつ|ずつで|挙げ|書|列挙)"
-    r"|(\d{1,2})\s*(?:items?|points?|bullets?)(?![A-Za-z])",
-    re.IGNORECASE,
-)
-
-
 def _output_form_note(history: list[ChatMessage]) -> str:
     """最新 user ターンの **出力形式** 指定を、遵守を促す注記へ変換する。
 
@@ -179,7 +146,7 @@ def _output_form_note(history: list[ChatMessage]) -> str:
     text = str(last_user.get("content") or "")
 
     notes: list[str] = []
-    if _ANSWER_ONLY_RE.search(text):
+    if ANSWER_ONLY_RE.search(text):
         notes.append(
             "今回のユーザーの指示は答えそのものだけを求めている。"
             "前置き・理由・計算過程・補足を書かず、答えの値だけを述べること。"
@@ -187,13 +154,13 @@ def _output_form_note(history: list[ChatMessage]) -> str:
             # そのまま値として述べる方向へ倒れる。開示だけは残す。
             "ただし正しい値を確定できない場合に限り、その理由を 1 文だけ添えること。"
         )
-    if _BULLET_FORM_RE.search(text):
+    if BULLET_FORM_RE.search(text):
         note = (
             "今回のユーザーの指示は箇条書き形式を求めている。"
             "読点や中黒で列挙した 1 行の文にせず、"
             "1 項目 1 行の Markdown リスト (行頭に `- `) で書くこと。"
         )
-        m = _ITEM_COUNT_RE.search(text)
+        m = ITEM_COUNT_RE.search(text)
         if m:
             count = next(g for g in m.groups() if g)
             note += f"項目数は指定どおり {count} 個ちょうどにすること。"
@@ -465,7 +432,16 @@ def _drop_restated_slots(
     for turn in history:
         if str(turn.get("role") or "") != "user":
             continue
-        restated |= slot_resolver(str(turn.get("content") or ""))
+        text = str(turn.get("content") or "")
+        # **問い・依頼は「値の述べ直し」ではない。** 属性辞書は「どの属性の
+        # 話か」しか見ないので、「私が住んでいるのはどこでしたか。」も location
+        # に解決される。ガードが無いと **想起の質問そのものが「もう述べた」
+        # 扱いになって記憶が落ちる** (2026-08-25 ライブ監査: 新規セッションの
+        # 想起 6 問すべてで「確認できる情報を持ち合わせていません」)。
+        # 判定は注入側 (``MemoryInjector._restated_slots``) と同じ決定論ヘルパ。
+        if states_no_user_value(text) or carries_no_assertion(text):
+            continue
+        restated |= slot_resolver(text)
     if not restated:
         return semmem_block, rag_chunks, rag_scored_chunks, fewshot_block
 

@@ -41,6 +41,7 @@ from backend.free.memory.notes.note_builder import (
     ChatNoteBuilder,
     _normalize_trigger,
     resolve_fact_attribute_match,
+    resolve_fact_attribute_matches,
 )
 from backend.free.memory.stores.short_term import MemoryNote
 from backend.free.memory.notes.subject_ns import make_mem_subject
@@ -545,8 +546,9 @@ class ChatExtractor(BaseExtractor):
                     continue
                 fact_type: FactType = tag  # type: ignore[assignment]
                 kind = _KIND_BY_TAG[tag]
-                #: この fact の根拠に絞った本文 (絞れなければ発話全文)。
-                evidence = content
+                #: (subject, その属性の根拠に絞った本文) の列。
+                #: 1 発話が複数属性を述べていれば複数要素になる。
+                attr_specs: list[tuple[str, str]] = []
                 if tag in _USER_SUBJECT_TAGS:
                     # ファイル出力の指示文 (明示パス付き) は嗜好/感情ではなく
                     # 作業依頼なので preference/emotion/opinion にしない。
@@ -566,18 +568,29 @@ class ChatExtractor(BaseExtractor):
                     # (コメント方針 vs GPU 仕様) まで同一事実の競合版と誤判定され
                     # 恒久 pending 化する (2026-07-25)。辞書に無ければ従来どおり
                     # "user" へフォールバックするので退行しない。
-                    attr, attr_words = resolve_fact_attribute_match(
+                    # **1 発話に複数の属性があれば、そのぶんファクトを作る。**
+                    # 単数版は YAML 記載順で最初の 1 件を返して打ち切るため、
+                    # 「私は小川宏之といいます。埼玉県川口市に住んでいます。」
+                    # から location しか作られず名前が 1 件も残らなかった
+                    # (2026-08-25 ライブ監査:「私の名前を覚えていますか。」に
+                    # 答えられなかった)。日本語の自己紹介は 1 発話へ複数属性を
+                    # 詰めるのが普通なので、打ち切る設計そのものが噛み合わない。
+                    # 根拠文は属性ごとの trigger 語で絞るので object は混ざらない。
+                    matches = resolve_fact_attribute_matches(
                         content, tag, mode="chat",
                         triggers_dir=self._builder.triggers_dir,
                     )
-                    # 属性語を落とした訂正は直前の言明からスロットを継ぐ
-                    # (resolve_inherited_attributes の説明を参照)。
-                    if attr is None:
-                        attr = inherited.get((note.id, tag))
-                    subject = make_mem_subject(kind, attr or "user")
-                    # subject が属性単位なら object もその属性の根拠文に絞る
-                    # (_attribute_evidence_text の説明を参照)。
-                    evidence = _attribute_evidence_text(content, attr_words) or content
+                    if not matches:
+                        # 属性語を落とした訂正は直前の言明からスロットを継ぐ
+                        # (resolve_inherited_attributes の説明を参照)。
+                        matches = [(inherited.get((note.id, tag)) or "user", ())]
+                    attr_specs = [
+                        (
+                            make_mem_subject(kind, attr or "user"),
+                            _attribute_evidence_text(content, attr_words) or content,
+                        )
+                        for attr, attr_words in matches
+                    ]
                 else:
                     # world_fact もユーザーが断定した知識に限る。トリガ語
                     # (「とは」「である」) を含む文が疑問形/依頼形しかない
@@ -597,31 +610,36 @@ class ChatExtractor(BaseExtractor):
                         # 有効な keyword を導けないノートは world_fact 化しない
                         # (mem.world.unknown の量産防止)
                         continue
-                    subject = make_mem_subject(
-                        kind, *_world_fact_subject_parts(keyword, content),
+                    attr_specs = [(
+                        make_mem_subject(
+                            kind, *_world_fact_subject_parts(keyword, content),
+                        ),
+                        content,
+                    )]
+                for subject, evidence in attr_specs:
+                    fact = self.make_fact(
+                        subject=subject,
+                        predicate=_PREDICATE_BY_TAG.get(tag, "states"),
+                        # 末尾の問いは記憶として意味を持たないうえ、
+                        # [関連する記憶] に「答えではなく問い」が根拠として
+                        # 並ぶ原因になる (2026-08-16 監査時点の実データ:
+                        #  mem.emotion.user feels: 夜更かしすると次の日つらい
+                        #  ですよね。何かいい対策ありますか？)。
+                        object_text=strip_interrogative_sentences(evidence),
+                        # 規則で切り出せる分だけ命題化する。object (原文) は
+                        # 証拠として残し、提示・比較・埋め込みは fact.text 経由で
+                        # statement を優先する。切り出せなければ None のままで
+                        # 従来と同じ挙動。
+                        statement=normalize_statement(
+                            evidence,
+                            tuple(self._builder.fact_triggers.get(tag, ())),
+                        ),
+                        fact_type=fact_type,
+                        scope=SemanticFact.make_global_scope(),
+                        note=note,
+                        ctx=ctx,
                     )
-                fact = self.make_fact(
-                    subject=subject,
-                    predicate=_PREDICATE_BY_TAG.get(tag, "states"),
-                    # 末尾の問いは記憶として意味を持たないうえ、[関連する記憶] に
-                    # 「答えではなく問い」が根拠として並ぶ原因になる。
-                    # (2026-08-16 監査時点の実データ:
-                    #  mem.emotion.user feels: 夜更かしすると次の日つらいですよね。
-                    #  何かいい対策ありますか？)
-                    object_text=strip_interrogative_sentences(evidence),
-                    # 規則で切り出せる分だけ命題化する。object (原文) は証拠として
-                    # 残し、提示・比較・埋め込みは fact.text 経由で statement を
-                    # 優先する。切り出せなければ None のままで従来と同じ挙動。
-                    statement=normalize_statement(
-                        evidence,
-                        tuple(self._builder.fact_triggers.get(tag, ())),
-                    ),
-                    fact_type=fact_type,
-                    scope=SemanticFact.make_global_scope(),
-                    note=note,
-                    ctx=ctx,
-                )
-                candidates.append((note, fact))
+                    candidates.append((note, fact))
 
         candidates, collapsed = _collapse_equivalent_candidates(candidates)
         kept, dropped = self.apply_session_caps(candidates, ctx)

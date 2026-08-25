@@ -727,4 +727,7 @@ class LengthDisclosureFilter:
         if reason is None:
             return ""
         logger.info("Length constraint violated (%s)", reason)
-        return f"\n\n(注: 指定された文字数に対し、上の回答は {len(response.strip())} 文字です)"
+        # 文言は修復経路と共有する (2 箇所に書くと片方だけ直る)。
+        from backend.free.core.text_quality import length_disclosure_note
+
+        return length_disclosure_note(self._query, response)

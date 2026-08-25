@@ -142,12 +142,14 @@ async def generate_prefixes_for_store(
         store.save()
 
         if store is main_store and bm25_retriever is not None:
-            chunk_ids = [m["id"] for m in store.metadata]
-            texts = [store.get_contextual_text(cid) for cid in chunk_ids]
-            bm25_retriever.build(chunk_ids, texts)
+            from backend.free.rag.bm25_retriever import (
+                build_index_from_vector_store,
+            )
+
+            n = build_index_from_vector_store(bm25_retriever, store)
             logger.info(
                 "Step 5.8 [%s]: rebuilt BM25 index with %d contextual texts",
-                label, len(chunk_ids),
+                label, n,
             )
 
     return generated
