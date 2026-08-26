@@ -81,7 +81,6 @@ from backend.schemas.rag import (
     ContextualPrefixConfig,
     EmbeddingConfig,
     RAGConfig,
-    SelfRagQualityJudgeConfig,
     SelfRagConfig,
 )
 
@@ -130,7 +129,6 @@ __all__ = [
     "RAGConfig",
     "RuntimeConfig",
     "ScheduleConfig",
-    "SelfRagQualityJudgeConfig",
     "SelfRagConfig",
     "SemMemConflictConfig",
     "SemMemLimitsConfig",

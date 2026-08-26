@@ -2,9 +2,7 @@
 
 検索結果の品質判定 (:class:`RetrievalQualityJudge`) はベクトル閾値、検索
 必要性判定 (:class:`RetrievalNecessityJudge`) は正規表現ルールで完結する。
-判別不能な ``uncertain`` ケースは呼出側 (``search_pipeline``) が embedding
-決定論的リコール (``rag_judge_recall``) で補い、それでも決まらなければ
-安全側の ``retrieve`` に倒す。
+判別不能な ``uncertain`` ケースは安全側の ``retrieve`` に倒す。
 """
 
 from __future__ import annotations
@@ -51,11 +49,8 @@ SKIP_PATTERNS_EN = re.compile(
 
 # 外部 fetch 意図パターン (確実シグナルのみ)
 # URL を含む / 明示的 fetch 動詞は 100% fetch 意図とみなし RAG をスキップ。
-# リアルタイムキーワード (ニュース / 株価 / 天気 等) はLLM 判定に委譲し、
-# 固定キーワードリストの陳腐化を避ける。旧 Phase 2 (learned_pattern 化) の
-# 代替として embedding 決定論的リコール (backend.free.memory.pipeline.
-# rag_judge_recall) を導入済み — 意味的類似性が支配的な判定には正規表現
-# キーワードより embedding の方が適合するため。
+# リアルタイムキーワード (ニュース / 株価 / 天気 等) は固定キーワードリストの
+# 陳腐化を避けるため採らない (取りこぼしは安全側の retrieve に倒れる)。
 FETCH_INTENT_PATTERNS = re.compile(
     r"(https?://"
     r"|フェッチ|fetch"
@@ -620,9 +615,8 @@ class RetrievalNecessityJudge:
     ) -> str:
         """ルール判定の 3 値 (``uncertain`` 含む) をそのまま返す。
 
-        embedding 決定論的リコール (``rag_judge_recall``) が「ルールで確定
-        できるか」を判定するための公開 API。``uncertain`` の場合のみ呼出側が
-        リコールへフォールバックする。
+        ``judge()`` が ``uncertain`` を ``retrieve`` へ丸める前の生の判定を
+        見たい呼出元 (テスト / 診断) 向けの公開 API。
         """
         return self._judge_rule(
             query, context_count, window_complete=window_complete,

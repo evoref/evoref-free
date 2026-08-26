@@ -85,7 +85,7 @@ async def switch_mode(
     model_changed = old_params["model"] != new_params["model"]
 
     # base LoRA パスの比較 (level2_adapter_partition=="model_mode" の
-    # ときのみ差が出る。既定 "model" では get_mode_lora_path は常に同一パスを
+    # ときのみ差が出る。レガシー "model" では get_mode_lora_path は常に同一パスを
     # 返すため lora_changed は常に False = 再起動トリガーへの影響なし)。
     new_lora_path = get_mode_lora_path(new_mode)
     lora_changed = get_mode_lora_path(old_mode) != new_lora_path
@@ -128,7 +128,7 @@ async def _restart_base_server(
     """ベースサーバーを新モデルで再起動する
 
     ``lora_path`` は ``get_mode_lora_path(new_mode)`` の解決結果 (存在確認前)。
-    "model" (既定) スキームでは常に ``None`` 相当 (呼出元の ``_resolve_lora_override``
+    レガシー "model" スキームでは常に ``None`` 相当 (呼出元の ``_resolve_lora_override``
     が ``adapter_partition_mode!="model_mode"`` を見て ``(None, True)`` に丸める
     ため、legacy flat フォールバックへ委譲され挙動は完全に従来通り)。
 

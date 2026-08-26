@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
     from backend.free.core.policy_interpreter import PolicyInterpreter
     from backend.free.core.stage_timer import StageTimer
-    from backend.free.memory.views.mem import MemFactView
     from backend.free.rag.judge_usage_tracker import JudgeUsageTracker
     from backend.free.rag.lazy_contextual import LazyContextualPrefixService
 
@@ -533,128 +532,6 @@ async def _search_cartridge_layer(
         return []
 
 
-def _resolve_quality_judge_cfg(rag_cfg: dict) -> dict:
-    """``rag.self_rag.quality_judge`` セクションを安全に取り出す
-
-    セクション欠落時はデフォルト値相当の dict を返し、呼び出し側で
-    キーの存在チェックを不要にする。旧 ``rag.aux_judge_enabled``
-    フラット構造は廃止済み (後方互換なし)。
-    """
-    self_rag_cfg = rag_cfg.get("self_rag") or {}
-    aj_cfg = self_rag_cfg.get("quality_judge") or {}
-    return {
-        "enabled": bool(aj_cfg.get("enabled", True)),
-        "max_top_score": float(aj_cfg.get("max_top_score", 0.75)),
-        "max_per_session": int(aj_cfg.get("max_per_session", 5)),
-        "max_per_query": int(aj_cfg.get("max_per_query", 1)),
-        "only_when_quality": list(aj_cfg.get("only_when_quality", ["medium"])),
-    }
-
-
-def _resolve_necessity_judge_cfg(rag_cfg: dict) -> dict:
-    """``rag.self_rag.necessity_judge`` セクションを安全に取り出す
-
-    検索必要性のハイブリッド判定 (ルール → uncertain 時のみ補助タスク) を
-    制御する。``only_when_quality`` は ``JudgeUsageTracker`` 互換の
-    キーで、本機能の quality ラベルは ``"uncertain"`` のみを使う。
-
-    既定は無効 (``SelfRagNecessityJudgeConfig`` の説明を参照)。実測で
-    ゲート (3,407ms) がゲート対象の retrieval (21ms) の 165 倍高くついていた。
-    """
-    self_rag_cfg = rag_cfg.get("self_rag") or {}
-    an_cfg = self_rag_cfg.get("necessity_judge") or {}
-    return {
-        "enabled": bool(an_cfg.get("enabled", False)),
-        "max_per_session": int(an_cfg.get("max_per_session", 10)),
-        "max_per_query": int(an_cfg.get("max_per_query", 1)),
-        "only_when_quality": list(an_cfg.get("only_when_quality", ["uncertain"])),
-        "timeout_s": float(an_cfg.get("timeout_s", 5.0)),
-        "context_turns": int(an_cfg.get("context_turns", 2)),
-    }
-
-
-def _resolve_necessity_recall_cfg(rag_cfg: dict) -> dict:
-    """``rag.self_rag.necessity_recall`` セクションを安全に取り出す
-
-    embedding 決定論的リコール (``rag_judge_recall.try_recall_necessity``) の
-    閾値設定。url/executable_command recall と同型。
-    """
-    cfg = ((rag_cfg.get("self_rag") or {}).get("necessity_recall")) or {}
-    return {
-        "enabled": bool(cfg.get("enabled", True)),
-        "topk": int(cfg.get("topk", 5)),
-        "min_score": float(cfg.get("min_score", 0.75)),
-        "min_record_score": float(cfg.get("min_record_score", 0.65)),
-        "ttl_days": int(cfg.get("ttl_days", 14)),
-    }
-
-
-def _resolve_quality_recall_cfg(rag_cfg: dict) -> dict:
-    """``rag.self_rag.quality_recall`` セクションを安全に取り出す (necessity_recall と対称)。"""
-    cfg = ((rag_cfg.get("self_rag") or {}).get("quality_recall")) or {}
-    return {
-        "enabled": bool(cfg.get("enabled", True)),
-        "topk": int(cfg.get("topk", 5)),
-        "min_score": float(cfg.get("min_score", 0.75)),
-        "min_record_score": float(cfg.get("min_record_score", 0.65)),
-        "ttl_days": int(cfg.get("ttl_days", 14)),
-    }
-
-
-async def _maybe_recall_quality(
-    quality: str,
-    query: str,
-    rag_cfg: dict,
-    *,
-    debug_logger: "DebugLogger | None" = None,
-    mem_view: "MemFactView | None" = None,
-    query_vec: np.ndarray | None = None,
-) -> str:
-    """marginal 境界の品質ラベルを embedding 決定論的リコールで上書きする。
-
-    対象は ``rag.self_rag.quality_judge.only_when_quality`` (既定 ``medium``)
-    の帯のみ。リコールが当たらなければルールベース判定をそのまま返す。
-
-    LLM による再判定は撤去済み。実測 (2026-08-12、``op="quality_judge"`` 244 件)
-    では実際に結果が変わる medium→low は全機会の 2.0% で、格下げの取り戻しより
-    誤格下げで検索結果を落とすリスクの方が大きいと判断した (docs/c_14 §1.2)。
-    """
-    aj_cfg = _resolve_quality_judge_cfg(rag_cfg)
-    if quality not in aj_cfg["only_when_quality"]:
-        return quality
-
-    quality_recall_cfg = _resolve_quality_recall_cfg(rag_cfg)
-    if not (
-        quality_recall_cfg["enabled"]
-        and mem_view is not None
-        and query_vec is not None
-    ):
-        return quality
-
-    from backend.free.memory.pipeline.rag_judge_recall import try_recall_quality
-    recalled = await try_recall_quality(query_vec, mem_view, quality_recall_cfg)
-    if recalled is None:
-        return quality
-
-    label, recall_sim = recalled
-    logger.debug("Step 5b quality recall: %s (sim=%.3f)", label, recall_sim)
-    if debug_logger is not None:
-        debug_logger.log_decision(
-            decision_point="self_rag_judge_path",
-            chosen="embedding_recall",
-            candidates=["rule_based", "embedding_recall"],
-            reason="embedding_recall_matched",
-            context={
-                "rule_based_quality": quality,
-                "recalled_quality": label,
-                "similarity": recall_sim,
-                "query_preview": query[:80],
-            },
-            scope="request",
-        )
-    return label
-
-
 async def _try_quality_expansion(
     quality: str,
     merged: list[tuple[str, float, str]],
@@ -850,13 +727,10 @@ async def unified_search(
     *,
     session_id: str = "default",
     judge_tracker: "JudgeUsageTracker | None" = None,
-    mem_view: "MemFactView | None" = None,
 ) -> SearchResult:
     """統合検索パイプライン: Self-RAG + 3層メモリ
 
     判定はルールベース + ベクトル演算で完結する (LLM 呼び出しゼロ)。
-    marginal 帯 (既定 ``medium``) の品質ラベルだけは embedding 決定論的
-    リコールで上書きしうる。
     STM / LTM / カートリッジ検索を asyncio.gather で並列実行する。
     ``rag.fetch_multiplier`` が 2 以上の場合、LTM / カートリッジの取得件数を
     `top_k * N` に拡張する (STM は `stm_top_k` 固定)。
@@ -878,7 +752,7 @@ async def unified_search(
         query[:80], top_k, fetch_k, multiplier,
     )
 
-    # Step 1: Self-RAG 検索必要性判定 (rule + uncertain 時のみ embedding リコール)
+    # Step 1: Self-RAG 検索必要性判定 (純ルール、uncertain は retrieve に倒す)
     necessity_judge = RetrievalNecessityJudge()
     full_context = working_mem.get_context()
     context_count = len(full_context)
@@ -896,53 +770,14 @@ async def unified_search(
         recent_context = full_context[:-1]
     else:
         recent_context = full_context
-    necessity_cfg = _resolve_necessity_judge_cfg(rag_cfg)
-    necessity_recall_cfg = _resolve_necessity_recall_cfg(rag_cfg)
-
     # Step 1 全体を計測する。ここが未計測だったため「遅い検索の 89.7% が
-    # 内訳不明」という状態が続き、実際の支配要因 (necessity aux の往復) が
-    # 見えていなかった (2026-08-01 プロファイリング)。
+    # 内訳不明」という状態が続き、実際の支配要因が見えていなかった
+    # (2026-08-01 プロファイリング)。
     if timer is not None:
         timer.start("necessity_ms")
-    rule_necessity = necessity_judge.judge_rule_only(
-        query, context_count, window_complete=window_complete,
+    necessity = necessity_judge.judge(
+        query, context_count=context_count, window_complete=window_complete,
     )
-    necessity: str | None = None
-    if rule_necessity != "uncertain":
-        necessity = rule_necessity
-    elif (
-        # リコールは necessity 判定そのもののキャッシュなので、判定を無効に
-        # したらキャッシュも効かせない。切り離すと「判定は止めたのに過去の
-        # 判定結果が skip を出し続ける」状態になり、無効化の意図が骨抜きになる。
-        # しかもキュレータは閾値 (min_record_score) を超えたものだけ残すため、
-        # 「retrieve は不要だった」と採点されやすい現行ルーブリックの下では
-        # skip 判定が選択的に蓄積される (2026-08-01 実測: retrieve 判定の
-        # 採点は 0.0 で捨てられた)。無効時に生かすと退行方向にしか働かない。
-        necessity_cfg["enabled"]
-        and necessity_recall_cfg["enabled"]
-        and mem_view is not None
-    ):
-        from backend.free.memory.pipeline.rag_judge_recall import try_recall_necessity
-        recalled = await try_recall_necessity(query_vec, mem_view, necessity_recall_cfg)
-        if recalled is not None:
-            necessity, recall_sim = recalled
-            logger.info(
-                "Necessity recall: %s (sim=%.3f, query=%r)",
-                necessity, recall_sim, query[:50],
-            )
-            if debug_logger is not None:
-                debug_logger.log_decision(
-                    decision_point="self_rag_necessity_path",
-                    chosen=necessity,
-                    candidates=["retrieve", "fetch", "skip"],
-                    reason="embedding_recall_matched",
-                    context={"similarity": recall_sim},
-                    scope="request",
-                )
-    if necessity is None:
-        necessity = necessity_judge.judge(
-            query, context_count=context_count, window_complete=window_complete,
-        )
     if timer is not None:
         timer.stop("necessity_ms")
     logger.debug(
@@ -1040,14 +875,20 @@ async def unified_search(
     # 適用し、残った chunk_id 集合を正規化側 merged にも射影する。
     gate_cfg = GateConfig.from_rag_cfg(rag_cfg)
     if gate_cfg.enabled and merged_raw:
-        merged_raw = await ChunkContentGate(
-            gate_cfg, debug_logger=debug_logger,
-        ).filter(
-            query, merged_raw, mode,
-            aux_client=aux_client,
-            tracker=judge_tracker,
-            session_id=session_id,
-        )
+        if timer is not None:
+            timer.start("content_gate_ms")
+        try:
+            merged_raw = await ChunkContentGate(
+                gate_cfg, debug_logger=debug_logger,
+            ).filter(
+                query, merged_raw, mode,
+                aux_client=aux_client,
+                tracker=judge_tracker,
+                session_id=session_id,
+            )
+        finally:
+            if timer is not None:
+                timer.stop("content_gate_ms")
         kept = {cid for cid, _, _ in merged_raw}
         merged = [t for t in merged if t[0] in kept]
         logger.debug("Step 4.5 content gate: %d results after prune", len(merged_raw))
@@ -1060,18 +901,6 @@ async def unified_search(
     quality_judge = RetrievalQualityJudge(thresholds, debug_logger=debug_logger)
     quality = quality_judge.judge(merged_raw)
     logger.debug("Step 5 quality: %s", quality)
-    if timer is not None:
-        timer.start("content_gate_ms")
-    try:
-        quality = await _maybe_recall_quality(
-            quality, query, rag_cfg,
-            debug_logger=debug_logger,
-            mem_view=mem_view,
-            query_vec=query_vec,
-        )
-    finally:
-        if timer is not None:
-            timer.stop("content_gate_ms")
 
     # Step 6: 品質不足時のクエリ拡張フォールバック (生スコアで再検索)。
     # 拡張が発火した場合 (quality=="low" の稀ケース) は結果集合が変わるため、

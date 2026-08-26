@@ -22,7 +22,6 @@ from backend.free.rag.bm25_retriever import BM25Retriever
 
 if TYPE_CHECKING:
     from backend.free.agent.aux_prompt_manager import AuxPromptManager
-    from backend.free.memory.pipeline.rag_judge_log import RagJudgeLog
     from backend.free.memory.semantic.store import SemanticFactStore
     from backend.free.memory.notes.subject_canonicalizer import SubjectCanonicalizer
     from backend.free.rag.embedding_backend import EmbeddingBackend
@@ -84,7 +83,6 @@ class SleepTimeWorker:
         subject_canonicalizer: SubjectCanonicalizer | None = None,
         semantic_store_invalidator: SemanticStoreInvalidator | None = None,
         profile_id: str = "default",
-        rag_judge_log: "RagJudgeLog | None" = None,
     ):
         self.short_term = short_term
         self.long_term = long_term
@@ -111,8 +109,6 @@ class SleepTimeWorker:
         # ── Step 10 で アーカイブ後にキャッシュ破棄するための callback ──
         self._semantic_store_invalidator = semantic_store_invalidator
         self._profile_id = profile_id
-        # ── Step 8.7 (RAG judge curator) 用 ──
-        self._rag_judge_aux_log = rag_judge_log
         # MDPTraceExtractor はプロセス内で episode の二重抽出を防ぐため
         # ワーカー側で 1 インスタンスを保持する。
         self._mdp_trace_extractor = None
@@ -463,18 +459,6 @@ class SleepTimeWorker:
         ts = time.monotonic()
         result["command_facts_curated"] = await self._step8_6_curate_commands()
         step_durations["step8_6_command_curator"] = round(time.monotonic() - ts, 3)
-        if self._check_cancelled():
-            return result
-
-        # Step 8.7: RAG necessity/quality リコール用 world_fact のキュレーション
-        # チャット応答パスで RagJudgeLog に蓄積された判定を自己採点して
-        # world_fact 化する。CLAUDE.md §6 #2 に従い、SemMem 書込はここに閉じる。
-        # 補助タスク未接続 (degraded) の場合は no-op で通過する。
-        ts = time.monotonic()
-        result["rag_judge_facts_curated"] = await self._step8_7_curate_rag_judge_facts(
-            llm_client,
-        )
-        step_durations["step8_7_rag_judge_curator"] = round(time.monotonic() - ts, 3)
         if self._check_cancelled():
             return result
 
@@ -932,33 +916,6 @@ class SleepTimeWorker:
             notes,
             config=self.config,
             store_provider=self._semantic_store_provider,
-            embedder=self.embedder,
-            profile_id=self._profile_id,
-            debug_logger=self._debug_logger,
-        )
-
-    async def _step8_7_curate_rag_judge_facts(self, llm_client=None) -> int:
-        """Step 8.7: RAG necessity/quality リコール用の ``world_fact`` を書く。
-
-        実ロジックは :mod:`backend.free.memory.sleep.rag_judge_curator`
-        に分離されている。本メソッドは state を詰め替える薄いラッパ
-        (``_step8_5_curate_urls`` と同型)。
-        """
-        from backend.free.memory.sleep.rag_judge_curator import curate_rag_judge_facts
-
-        if self._rag_judge_aux_log is None:
-            return 0
-        events = self._rag_judge_aux_log.drain()
-        if not events:
-            return 0
-
-        notes = list(self.short_term.notes.values())
-        return await curate_rag_judge_facts(
-            events,
-            notes,
-            config=self.config,
-            store_provider=self._semantic_store_provider,
-            scorer_client=llm_client,
             embedder=self.embedder,
             profile_id=self._profile_id,
             debug_logger=self._debug_logger,

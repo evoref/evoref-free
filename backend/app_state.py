@@ -35,7 +35,6 @@ if TYPE_CHECKING:
     from backend.free.agent.reactive import ReactiveAgent
     from backend.free.agent.tool_call_judge import ToolCallJudge
     from backend.free.agent.tools_registry import ToolsRegistry
-    from backend.free.learning.aux_experience import AuxExperienceBuffer
     from backend.free.learning.scheduler import LearningScheduler
     from backend.free.llm.aux_client import AuxClient
     from backend.free.llm.llm_client import LLMClient
@@ -43,7 +42,6 @@ if TYPE_CHECKING:
     from backend.free.memory.stores.long_term import LongTermMemory
     from backend.free.memory.scheduler import SleepTimeScheduler
     from backend.free.memory.semantic.store import SemanticFactStore
-    from backend.free.memory.pipeline.rag_judge_log import RagJudgeLog
     from backend.free.memory.stores.short_term import ShortTermMemory
     from backend.free.memory.stores.working import WorkingMemory
     from backend.free.memory.views.mem import MemFactView
@@ -141,11 +139,7 @@ class AppState:
     # ``check()`` は使わず ``record`` / ``get_session_count`` / ``reset_session``
     # のみ利用する。
     conflict_judge_tracker: "JudgeUsageTracker | None" = None
-    # RAG necessity/quality の embedding 決定論的リコール用リングバッファ。
-    # SemMem ではない (チャット応答パスで直接 record するだけ)。sleep-time
-    # Step 8.7 (rag_judge_curator) が drain して world_fact 化する。
-    rag_judge_log: "RagJudgeLog | None" = None
-    # URL/executable_command/RAG necessity・quality の embedding リコールで
+    # URL/executable_command の embedding リコールで
     # 共有する global scope の MemFactView。``_init_tools`` のローカル変数を
     # 他の呼出元 (search_pipeline.py) でも再利用するため state に昇格。
     mem_view: "MemFactView | None" = None
@@ -174,14 +168,7 @@ class AppState:
     # ── エージェント / プロンプト ──
     prompt_manager: SystemPromptManager | None = None
     aux_prompt_manager: AuxPromptManager | None = None
-    # 補助タスク (rag_necessity / rag_quality / tool_call / note_evolve) の経験
-    # バッファ。Level 1 Phase 2 の補助プロンプト進化が読む。
-    aux_experience_buffer: "AuxExperienceBuffer | None" = None
     feedback_collector: FeedbackCollector | None = None
-    # 判定経験記録 closure。primitive 5 引数
-    # (action_type, input_context, output, outcome, mode) を受け、補助タスク経験
-    # バッファと RAG 判定リングバッファへ記録する。mode は既定 "chat" (省略可)。
-    judge_experience_recorder: "Callable[[str, str, str, float, str], None] | None" = None
     file_manager: SessionFileManager | None = None
     learned_patterns_store: LearnedPatternStore | None = None
     tools_registry: ToolsRegistry | None = None

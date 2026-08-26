@@ -608,38 +608,6 @@ def _init_learning_core(
     )
     state.feedback_collector = fc
 
-    # 判定経験の記録 closure: RAG 必要性 / RAG 品質の判定結果を embedding
-    # リコール用リングバッファへ best-effort で記録する。--no-learning では
-    # no-op。例外は握り潰し、記録失敗がチャット応答パスを壊さないようにする。
-    def _record_judge_experience(
-        action_type: str, input_context: str, output: str, outcome: float,
-        mode: str = "chat",
-    ) -> None:
-        if state.learning_disabled:
-            return
-        # SemMem 書込みではない (プロセス内リングバッファ、sleep-time Step 8.7 が
-        # drain して world_fact 化する)。
-        if state.rag_judge_log is not None and action_type in (
-            "rag_necessity", "rag_quality",
-        ):
-            state.rag_judge_log.record(action_type, input_context, output)
-        buf = state.aux_experience_buffer
-        if buf is None:
-            return
-        try:
-            cart_ids = (
-                list(state.cartridge_manager.loaded)
-                if state.cartridge_manager is not None else []
-            )
-            buf.record(
-                action_type, input_context[:2000], output, outcome,
-                cart_ids, mode=mode,
-            )
-        except Exception as e:
-            logger.debug("aux experience record skipped: %s", e)
-
-    state.judge_experience_recorder = _record_judge_experience
-
     # 7b. プロンプトマネージャ（§6.6.4: モード別システムプロンプト）
     # base システムプロンプト (chat.md / create.md + meta + history + learning_state)
     # は (model×mode) partition 配下 (resolve_learning)。補助タスクのプロンプトは
@@ -1022,28 +990,15 @@ async def _run_memory_threshold_calibration(
 def _init_judge_tracker(state: AppState) -> None:
     """Self-RAG quality_judge のセッション / クエリ単位カウンタを初期化する
 
-    config の ``rag.self_rag.quality_judge`` 設定読取は ``search_pipeline``
-    側で都度行うため、ここではトラッカーのみ生成する。enabled=False の
-    場合でも tracker 自体は生成して問題ない (判定時に disabled skip)。
+    config の ``rag.self_rag.content_gate`` 設定読取は消費側で都度行うため、
+    ここではトラッカーのみ生成する。enabled=False の場合でも tracker 自体は
+    生成して問題ない (判定時に disabled skip)。
     """
     from backend.free.rag.judge_usage_tracker import JudgeUsageTracker
     state.judge_tracker = JudgeUsageTracker()
     # conflict_chat_judge のセッション内発火上限用に別インスタンスを生成
     # (RAG 判定とカウントを混在させない)。
     state.conflict_judge_tracker = JudgeUsageTracker()
-
-    from backend.free.memory.pipeline.rag_judge_log import RagJudgeLog
-    # 永続化する: 消費側は Full サイクル (実測 22 回 / light 557 回) にしか
-    # 無く、間に再起動が入ると in-memory バッファが丸ごと消えていた
-    # (キュレータ実行 22 回中 16 回が空の入力)。
-    try:
-        from backend.config import get_path_resolver
-        rag_judge_events_path = get_path_resolver().resolve_local(
-            "rag_judge_events_file",
-        )
-    except Exception:
-        rag_judge_events_path = None
-    state.rag_judge_log = RagJudgeLog(path=rag_judge_events_path)
 
     logger.info(
         "JudgeUsageTracker initialized (self_rag + conflict_chat_judge)",
@@ -1144,7 +1099,6 @@ def _init_sleep_time_worker(
             agent_trace_dir=agent_trace_dir,
             subject_canonicalizer=subject_canonicalizer,
             semantic_store_invalidator=_semantic_invalidator,
-            rag_judge_log=state.rag_judge_log,
         )
         # 新しく昇格したチャンクを語彙検索でも引けるよう、共有 BM25
         # インスタンスを worker に渡す (sleep-time が索引を張り直す)。
@@ -1172,24 +1126,10 @@ def _init_learning_scheduler(
     """7f. LearningScheduler (Level 1/2) + Evolver / Critique / FewShot 接続"""
     from backend.free.learning.scheduler import LearningScheduler
 
-    # 補助タスク経験バッファ (rag_necessity / rag_quality / tool_call)。
-    # Level 1 Phase 2 の補助プロンプト進化が読む学習信号。
-    from backend.free.learning.aux_experience import AuxExperienceBuffer
-
-    aux_exp_buf = AuxExperienceBuffer()
-    aux_exp_file = resolver.resolve_learning("aux_experience_file")
-    if aux_exp_file.exists():
-        try:
-            aux_exp_buf.load(aux_exp_file)
-        except Exception as e:
-            logger.warning("Aux experience buffer load failed: %s", e)
-    state.aux_experience_buffer = aux_exp_buf
-
     learning_scheduler = LearningScheduler(
         config=cfg,
         experience_buf=exp_buf,
         prompt_manager=prompt_mgr,
-        aux_experience_buf=aux_exp_buf,
         debug_logger=debug_logger,
         policy=policy_interpreter,
         disabled=state.learning_disabled,
@@ -1423,7 +1363,7 @@ def _wire_sleep_scheduler_models(
     # resolve_learning 経由に統一 (Issue #251 修正): 従来 resolve_local (flat)
     # で構築していたため、partition_by_base_model=true 環境でもここだけモデル
     # パーティションから孤立していた。mode は明示せず resolver.active_mode
-    # (起動時既定 "chat") に委ねる — "model" (既定) スキームでは mode を無視して
+    # (起動時既定 "chat") に委ねる — レガシー "model" スキームでは mode を無視して
     # 従来と同じ flat 相当のパスを返すため、この変更で挙動が変わるのは
     # partition_by_base_model=true のユーザーのみ (元々 partition される "べき"
     # だった箇所の是正)。
@@ -1532,7 +1472,6 @@ def _init_tools(
     cfg: dict[str, Any],
     client: "LocalClient | None",
     learned_patterns_store: "LearnedPatternStore",
-    aux_prompt_mgr: "AuxPromptManager",
     embedder: "EmbeddingBackend | None" = None,
 ) -> None:
     """7j. ToolsRegistry + ToolCallJudge + ReactiveAgent 初期化（3層エージェントディスパッチ用）"""
@@ -1578,7 +1517,6 @@ def _init_tools(
     state.mem_view = mem_view
 
     tool_judge = ToolCallJudge(
-        prompt_manager=aux_prompt_mgr,
         config=cfg,
         cartridge_manager=state.cartridge_manager,
         learned_patterns=learned_patterns_store,
@@ -2075,7 +2013,6 @@ class _LifespanContext:
     exp_file: Any
     learned_patterns_store: Any
     patterns_file: Any
-    aux_exp_buf: Any
     pro_shutdown: Any
     instance_name: str
     # Develop エディション起動時のみ非 None
@@ -2547,7 +2484,7 @@ def _build_loop_pillar(
     with _timed(timings, "tools"):
         _init_tools(
             state, cfg, gen.local_client,
-            learn.learned_patterns_store, learn.aux_prompt_manager,
+            learn.learned_patterns_store,
             embedder=gen.embedder,
         )
     with _timed(timings, "agent_tracer"):
@@ -2887,7 +2824,6 @@ async def wire_pillars(
         exp_file=exp_file,
         learned_patterns_store=learn.learned_patterns_store,
         patterns_file=patterns_file,
-        aux_exp_buf=state.aux_experience_buffer,
         pro_shutdown=pro_shutdown,
         instance_name=instance_name,
         develop_shutdown=develop_shutdown,

@@ -8,7 +8,7 @@ EvorefLearn (learning / optimizer pillar) の Pro 拡張ポイントを Protocol
 
 - Free: :class:`NoopLearnComponents` (全 ``None`` を返すスタブ)
 - Pro:  :class:`~backend.pro.learn_components.ProLearnComponents`
-  (Level2Runner / AuxPromptEvolver / LoRAVersionManager / ...)
+  (Level2Runner / LoRAVersionManager / ...)
 
 pillar 境界の不変条件により、本 Protocol ファイルは **Pro 具象クラスを
 import してはならない** (Free → Pro 参照は依存方向違反)。従って、各
@@ -27,9 +27,9 @@ Pro 拡張は :class:`LearnComponentsProtocol` インスタンス 1 本に集約
 注入する。Protocol には以下の 2 系統のフィールドが含まれる:
 
 1. **運用コンポーネント** (Level 1 サイクルで使う)
-   - ``prompt_manager`` / ``version_manager``
+   - ``version_manager``
 2. **Level 2 拡張** (Pro 専用の LoRA 微調整 / プロンプト進化 / カートリッジ変更)
-   - ``level2_runner`` / ``aux_prompt_evolver`` / ``cartridge_change_handler``
+   - ``level2_runner`` / ``cartridge_change_handler``
 
 Free 版は全部 ``None`` を返す :class:`NoopLearnComponents` を渡し、Pro 版
 は ``backend.pro.learn_components.ProLearnComponents`` を渡す。
@@ -63,30 +63,6 @@ class LoRAVersionManagerProtocol(Protocol):
         ...
 
 
-@runtime_checkable
-class AuxPromptManagerProtocol(Protocol):
-    """補助タスクプロンプトマネージャ (§7.1.2) の抽象。
-
-    Free 版・Pro 版共通の ``backend.free.agent.aux_prompt_manager.AuxPromptManager``
-    が本 Protocol を満たす。Free 版でも **インスタンス自体は存在** するが、
-    ``AuxPromptEvolver`` が無効化されるため ``LearningScheduler`` から見ると
-    Protocol 経由で参照される必要はない (直接 ``None`` で可)。
-    """
-
-    def get_aux_prompt(self, task: str) -> str:
-        """タスク別プロンプトを返す。存在しなければ ``ValueError``。"""
-        ...
-
-    def update_aux_prompt(
-        self,
-        task: str,
-        prompt: str,
-        fitness: float,
-    ) -> None:
-        """タスク別プロンプトを更新する。"""
-        ...
-
-
 # ──────────────────────────────────────────────────────────────────────────
 # Level 2 拡張 Protocol (Pro 専用)
 # ──────────────────────────────────────────────────────────────────────────
@@ -107,19 +83,6 @@ class Level2RunnerProtocol(Protocol):
         **kwargs: Any,
     ) -> bool:
         """Level 2 トリガー判定と実行開始。学習を開始したら ``True``。"""
-        ...
-
-
-@runtime_checkable
-class AuxPromptEvolverProtocol(Protocol):
-    """補助タスクプロンプト進化 (§7.1.2) の抽象。
-
-    Free 版では実装なし。Pro 版は
-    ``backend.pro.aux_prompt_evolver.AuxPromptEvolver`` が実装する。
-    """
-
-    def evolve(self, *args: Any, **kwargs: Any) -> Any:
-        """プロンプト進化 1 サイクルを実行する。"""
         ...
 
 
@@ -174,21 +137,11 @@ class LearnComponentsProtocol(Protocol):
         """Pro 版でベース LoRA の VersionManager を返す。Free 版は ``None``。"""
         ...
 
-    @property
-    def prompt_manager(self) -> AuxPromptManagerProtocol | None:
-        """Free / Pro 共通の AuxPromptManager を返す。未初期化時は ``None``。"""
-        ...
-
     # ── Level 2 拡張 (Pro 専用) ───────────────────────────────────────
 
     @property
     def level2_runner(self) -> Level2RunnerProtocol | None:
         """Pro 版で Level 2 ランナーを返す。Free 版は常に ``None``。"""
-        ...
-
-    @property
-    def aux_prompt_evolver(self) -> AuxPromptEvolverProtocol | None:
-        """Pro 版で AuxPromptEvolver を返す。Free 版は常に ``None``。"""
         ...
 
     @property
@@ -209,13 +162,7 @@ class NoopLearnComponents:
     Pro 拡張が存在しない環境で ``LearningScheduler.set_learn_components``
     に渡すと、全 Property が ``None`` を返して no-op となる。
     ``app_factory`` は edition を判定し Pro が無効なら本クラスを生成する。
-
-    :class:`AuxPromptManagerProtocol` のみは Free でも実体が存在しうる
-    ため、呼び出し側が必要に応じて ``prompt_manager=...`` を渡せるよう
-    dataclass の field として許可する (他は ``None`` 固定)。
     """
-
-    prompt_manager: AuxPromptManagerProtocol | None = None
 
     @property
     def version_manager(self) -> LoRAVersionManagerProtocol | None:
@@ -226,17 +173,11 @@ class NoopLearnComponents:
         return None
 
     @property
-    def aux_prompt_evolver(self) -> AuxPromptEvolverProtocol | None:
-        return None
-
-    @property
     def cartridge_change_handler(self) -> CartridgeChangeHandlerProtocol | None:
         return None
 
 
 __all__ = [
-    "AuxPromptEvolverProtocol",
-    "AuxPromptManagerProtocol",
     "CartridgeChangeHandlerProtocol",
     "ExperienceEvaluatorProtocol",
     "LearnComponentsProtocol",

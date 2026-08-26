@@ -283,7 +283,7 @@ async def run_search_pipeline(
             timer.stop("embedding_ms")
 
         wm, stm, ltm = mem_sys
-        # quality_judge のセッション上限判定に使う session_id は
+        # content gate のセッション上限判定に使う session_id は
         # WorkingMemory 側で常に同期されている (セッション切替時に
         # prepare_memory_context が wm.session_id を更新する)。
         session_id = getattr(wm, "session_id", None) or "default"
@@ -304,7 +304,6 @@ async def run_search_pipeline(
             lazy_contextual=state.lazy_contextual,
             session_id=session_id,
             judge_tracker=state.judge_tracker,
-            mem_view=state.mem_view,
         )
         if not search_result.skipped and search_result.sources:
             rag_chunks = [content for _, _, content in search_result.sources]

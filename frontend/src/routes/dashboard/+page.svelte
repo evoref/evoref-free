@@ -34,7 +34,7 @@
 	let components: ProComponentMap | null = $state(null);
 	let learningData: DashboardLearningData = $state({ ...DEFAULT_LEARNING_DATA });
 	// LoRA は chat / create を上下段で並べて表示する (以前はセレクトで切り替えて
-	// いたが、既定の level2_adapter_partition="model" ではアダプタがモード非依存で
+	// いたが、レガシーの level2_adapter_partition="model" ではアダプタがモード非依存で
 	// 切り替えても内容が変わらず、動作していないように見えていた)。
 	let loraModes = $state<DashboardLoraModes>(emptyLoraModes());
 	let improvement = $state<ImprovementSeries>({ base: [] });

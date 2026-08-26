@@ -53,7 +53,7 @@ __all__ = [
 
 # Level 1 で集計対象とするモード / 補助タスクタスクのリスト
 _LEVEL1_MODES = ["create", "chat"]
-_AUX_TASKS = ["rag_necessity", "rag_quality", "tool_call", "note_evolve"]
+_AUX_TASKS = ["note_evolve"]
 
 
 def _level2_methods(scheduler) -> dict:
