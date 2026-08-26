@@ -55,6 +55,12 @@
 		</p>
 	{/if}
 
+	{#if !isUser && message.output_truncated}
+		<p class="truncation-notice">
+			{$t('chat.output_truncated')}
+		</p>
+	{/if}
+
 	{#if !isUser && message.rag_debug}
 		<RagDebugPanel ragDebug={message.rag_debug} />
 	{/if}
@@ -68,7 +74,7 @@
 		border-radius: var(--border-radius);
 		margin-bottom: 12px;
 	}
-	/* 長さ制限で先頭のみ送られた旨の注記 (該当 user 発言に付く) */
+	/* 切り詰め注記 (入力側は該当 user 発言、出力側は該当 assistant 応答に付く) */
 	.truncation-notice {
 		margin-top: 6px;
 		padding-top: 6px;

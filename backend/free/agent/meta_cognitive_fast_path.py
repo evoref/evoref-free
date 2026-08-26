@@ -26,6 +26,7 @@ from backend.free.agent.meta_cognitive_utils import (
 from backend.free.agent.meta_cognitive_defs import (
     _DATA_BEARING_TOOLS,
     read_existing_file,
+    resolve_read_path,
 )
 
 from backend.log_config import get_logger
@@ -40,6 +41,27 @@ class _FastPathMixin:
     回さずに実行する層。書込みでは本文の解決・検証・救出までを担う。
     """
 
+    def _resolve_read_args(self, tool_args: dict, query: str) -> dict:
+        """read_file の ``file_path`` を文脈から解決する (裸の名前の救済)。
+
+        ``_resolve_referenced_path`` の docstring は最初から「書込み/**読取**の
+        対象パスを会話から解決する」と書いているのに、配線されていたのは
+        書込み側だけだった。解決できないときは元の値を返す (退行させない)。
+        """
+        file_path = tool_args.get("file_path")
+        if not isinstance(file_path, str) or not file_path:
+            return tool_args
+        resolved = resolve_read_path(
+            file_path, query, getattr(self, "_conversation", None),
+        )
+        if resolved == file_path:
+            return tool_args
+        logger.info(
+            "Read target resolved from context: %s (bare=%r)",
+            resolved, file_path,
+        )
+        return {**tool_args, "file_path": resolved}
+
     async def _execute_tool_fast(
         self,
         tool_name: str,
@@ -48,8 +70,27 @@ class _FastPathMixin:
         tools_registry,
         on_step=None,
         prefix: str = "",
+        original_query: str = "",
     ) -> tuple[str, list[dict]]:
         """read_file / run_command / search_code のファストパス実行"""
+        # 裸のファイル名を会話中のフルパスへ寄せる。書込み側は
+        # ``_resolve_write_path`` / ``_referential_write_path`` で解決済みなのに
+        # **読取側だけ解決が無く**、プランナーが裸の名前を出すと
+        # ``read_file`` がプロセスの CWD を見て File not found になる。
+        #
+        # 実インシデント (2026-08-26 の修正検証): 「rd_b.txt の中身を rd_a.txt の
+        # 末尾に追記してください。」でプランが
+        # ``["Read the content of rd_b.txt", ...]`` と裸の名前になり、
+        # ``read_file({'file_path': 'rd_b.txt'})`` が失敗した。ディレクトリは
+        # このターンのクエリに無く、前のターンの会話にしかない。
+        # 読み取りが失敗すると ``is_tool_error`` で ``_fetched_tool_outputs`` に
+        # 入らないため、後続の書込みは供給元を失って内容を捏造する。
+        #
+        # ⚠ 最初この解決を ``_normalize_loop_tool_args`` (ツールループ側) に
+        # 入れたが、read_file は **このファストパス** を通るため一度も効かな
+        # かった。実機のログ (``Tool fast path: read_file``) で判明。
+        if tool_name == "read_file":
+            tool_args = self._resolve_read_args(tool_args, original_query)
         logger.info("Tool fast path: %s(%s)", tool_name, tool_args)
 
         # search_code は create 専用 (modes=["create"]) だが、この判定は
@@ -391,7 +432,7 @@ class _FastPathMixin:
         prefix: str,
     ) -> dict | None:
         """LLM がツールコール JSON を出力しなかった場合の自動リカバリー"""
-        from backend.free.agent.tool_call_judge import _extract_file_path
+        from backend.free.agent.tool_judge_args import extract_write_target_path
 
         # 「同じファイルに追記して」型はタスク文にパスが無く、直前ターンに
         # しか無い。プラン生成側 (write fast path) は既に
@@ -401,7 +442,10 @@ class _FastPathMixin:
         # 2026-08-08 ライブ監査 ターン6: ルータは local_write_intent へ
         # 正しく振ったが、ここで毎回 no file path になっていた)。
         # 裸のファイル名も同じく未確定として会話から解決する (2026-08-09)。
-        file_path = _extract_file_path(task.description)
+        # 2 ファイルが登場するタスクでは先頭は常に source (読む側)。
+        # 先頭一致だと書き込み先が source に化ける
+        # (extract_write_target_path の docstring 参照)。
+        file_path = extract_write_target_path(task.description)
         file_path = self._referential_write_path(file_path or None) or file_path
         if not file_path:
             logger.warning(

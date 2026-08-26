@@ -23,6 +23,7 @@
 		"agentic_step_elapsed": "{elapsed}s",
 		"search_history_no_match": "search_history: 過去の会話に該当なし",
 		"input_truncated": "⚠ この発言は長さ制限のため先頭のみが送信されました ({sent} / {original} 文字)。後半は AI に渡っていないため、全体を対象とする件数・集計の回答は正確でない可能性があります。",
+		"output_truncated": "⚠ 出力トークンの上限に達したため、この応答は途中で終わっています。「続けて」と送ると続きを生成します。",
 		"input_truncated_toast": "メッセージが長すぎるため、先頭のみが送信されました",
 		"step_complete": "✓ {detail}",
 		"rag_hits": "RAG検索: {count}件ヒット",

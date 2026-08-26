@@ -164,3 +164,63 @@ def parse_classifier_response(
     if param and arg:
         args[param] = arg
     return name, args
+
+
+#: 式合成 (層 5.95) の応答スキーマ。分類器と違い **選択肢は無い** — 「式を
+#: 書くか否か」を判断させると引き算は「不要」と判定されるため。
+EXPRESSION_SCHEMA: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "arithmetic_expression",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {"expression": {"type": "string"}},
+            "required": ["expression"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+#: 式合成のシステムプロンプト。
+#:
+#: **判断させないことが要点。** 実測 (2026-08-26、Qwen3.8-27B、温度 0、各 4 回):
+#:
+#:   「ツールが要るか判定せよ」(calculate / no_tool) → **4/4 no_tool**
+#:   「式を合成せよ」(選択肢なし)                   → **4/4 ``12-12`` で正答**
+#:
+#: 不足しているのは合成能力ではなく判断。分類器 (層5.9) は割り算のような
+#: 「難しい」計算では calculate を選ぶが、引き算は自分で暗算できると判断し、
+#: そのうえで実測 5/8 しか正答しない。
+EXPRESSION_SYSTEM = (
+    "あなたは数式合成器です。ユーザーの最後の質問に答えるための算術式を"
+    "1 つだけ作り、JSON だけを返してください。回答本文や説明は書かないこと。\n"
+    "制約:\n"
+    "- expression には会話中に実際に現れた数値だけを使うこと。\n"
+    "- 新しい数値を発明しないこと。\n"
+    "- 式は Python の算術式として評価できる形にすること。"
+)
+EXPRESSION_SYSTEM_EN = (
+    "You are an arithmetic expression synthesizer. Build exactly one "
+    "expression that answers the user's last question and return JSON only. "
+    "Do not write the reply itself.\n"
+    "Constraints:\n"
+    "- Use only numbers that actually appear in the conversation.\n"
+    "- Never invent a number.\n"
+    "- The expression must evaluate as a Python arithmetic expression."
+)
+
+
+def parse_expression_response(content: str) -> str:
+    """式合成の応答から ``expression`` を取り出す。取れなければ空文字。"""
+    try:
+        data = json.loads(content)
+    except (ValueError, TypeError):
+        data = extract_json_object(content)
+    if not isinstance(data, dict):
+        logger.info(
+            "expression synthesis: unparseable response: %r", content[:120],
+        )
+        return ""
+    expression = data.get("expression")
+    return expression.strip() if isinstance(expression, str) else ""

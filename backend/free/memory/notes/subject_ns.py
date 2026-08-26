@@ -208,6 +208,38 @@ def make_mem_subject(kind: str, *parts: str) -> str:
     return _join_subject("mem", kind, parts)
 
 
+#: セッション要約ファクトの subject の **形**。
+#:
+#: ``sleep.promotion._build_subject`` が
+#: ``make_mem_subject(fact_type, "history", "session", session_id[:12])`` で
+#: 組み立てる。``fact_type`` は本文から推定されるので ``decision`` にも
+#: ``commitment`` にもなり、**呼び出し側は事前にどちらか分からない**。
+#:
+#: 消費側 (注入フィルタ / 競合レビュー) が接頭辞リテラルを持つと、片方の型しか
+#: 塞げない。実インシデント (2026-08-25 ライブ監査の追調査):
+#: ``injector._SESSION_SUMMARY_SUBJECT_PREFIX`` が
+#: ``"mem.decision.history.session"`` という単一型リテラルだったため、
+#: ``mem.commitment.history.session.*`` の 2 件だけが注入フィルタを素通りし、
+#: 「神戸在住のソフトウェアエンジニアである小川浩之が、…9月14日の大阪での
+#: 登壇予定などを共有しました。」が [関連する記憶] に載り続けた。訂正後の
+#: 登壇日 (9月20日) を尋ねても訂正前の 9月14日 が返る直接の供給源。
+#: ``decision`` 側 25 件は正しく除外されていたので、症状は型によって出たり
+#: 出なかったりした。
+#:
+#: kind を列挙せず ``[a-z_]+`` で受けるのは、要約の型が将来増えても
+#: 消費側が自動的に追従するため (列挙は必ず片方が漏れる)。
+SESSION_SUMMARY_SUBJECT_RE = re.compile(r"^mem\.[a-z_]+\.history\.session\.")
+
+
+def is_session_summary_subject(subject: str) -> bool:
+    """``subject`` がセッション要約ファクトのものか (純粋関数)。
+
+    型 (``decision`` / ``commitment``) を問わず判定する
+    (:data:`SESSION_SUMMARY_SUBJECT_RE` の説明を参照)。
+    """
+    return bool(subject) and bool(SESSION_SUMMARY_SUBJECT_RE.match(subject))
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # subject 検証
 # ──────────────────────────────────────────────────────────────────────────

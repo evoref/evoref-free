@@ -9,7 +9,10 @@ import numpy as np
 
 from backend.log_config import get_logger
 from backend.free.memory.volatile_values import is_volatile_measurement_report
-from backend.free.memory.notes.note_builder import get_note_builder
+from backend.free.memory.notes.note_builder import (
+    get_note_builder,
+    restates_attribute_value,
+)
 from backend.free.memory.notes.pin_detector import (
     PinTriggers,
     detect_pin,
@@ -73,6 +76,14 @@ class MemoryNote:
     チャット応答パス (``prepare_memory_context``) が ``WorkingMemory.add_turn``
     に渡し、sleep-time Step 8 が ``SemanticFact.from_correction`` へ引き継ぐ。
     抽出器はこの印が立っているノートに限り **直前の名前付き属性を継承** する。
+
+    応答パスが立てなかった場合でも、``absorb`` が
+    :func:`~backend.free.memory.notes.note_builder.restates_attribute_value`
+    で拾い直す。``XではなくY`` 形は feedback 側では
+    ``WEAK_CORRECTION_PATTERNS`` 扱い (直前ターンの失敗を伴うときだけ訂正) で、
+    記憶層に必要な範囲と食い違うため (2026-08-25 の実測で
+    「登壇日は11月3日ではなく11月10日に変更になりました。」が
+    ``from_correction=False`` で書かれ、新旧 2 世代が live のまま残った)。
     """
 
     extracted_fact_ids: list[str] = field(default_factory=list)
@@ -241,6 +252,27 @@ class ShortTermMemory:
         # 側でスキップされる。
         private: bool = bool(turn.get("private", False))
         is_correction: bool = bool(turn.get("is_correction", False))
+        if not is_correction and (source or "user") == "user":
+            # 応答パス側の判定 (``agent.feedback.restates_a_value``) が取り
+            # こぼした値の言い直しを、**属性の裏取り付き**でここで拾い直す。
+            #
+            # ``XではなくY`` は日本語で最も普通の訂正形だが、feedback 側では
+            # ``WEAK_CORRECTION_PATTERNS`` に置かれており、直前ターンの失敗か
+            # 同一成果物の再指定を伴うときだけ訂正とみなす (学習層は「アシス
+            # タントが誤ったか」を数えるので、それが正しい)。**記憶層は
+            # 「その属性の現在値は何か」を持つ** ので必要な範囲が違う。
+            #
+            # 実インシデント (2026-08-25 ライブ監査の追調査): 「登壇日は11月3日
+            # ではなく11月10日に変更になりました。」「犬の名前はコタロウではなく
+            # ハナでした。」がどちらも ``from_correction=False`` で書かれ、
+            # ``SemanticConflictResolver._decide`` の ``user_correction`` 即時
+            # supersede が発火せず、新旧 2 世代が live のまま残った。
+            #
+            # 属性が解決できることを条件にするのは ``candidate_fact_tags`` が
+            # 訂正形単独の証拠に課しているのと同じゲート — 「さっきの
+            # 1234 × 5678 の答えは間違っています。正しくは 7006653 です。」の
+            # ような、値の言い直しでない訂正を拾わないため。
+            is_correction = restates_attribute_value(content, mode=mode)
 
         # ツール出力は WM までで止め、STM 以降には残さない
         if is_tool_output:

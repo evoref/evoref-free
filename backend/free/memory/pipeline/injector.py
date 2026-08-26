@@ -57,6 +57,7 @@ from backend.free.core.session_mode import (
     is_create_mode,
     is_valid_session_mode,
 )
+from backend.free.memory.notes.subject_ns import is_session_summary_subject
 from backend.free.memory.stores.short_term import MemoryNote
 from backend.free.memory.types import MemoryMode, SemanticFact
 from backend.log_config import get_logger
@@ -152,9 +153,16 @@ DEFAULT_PINNED_RELEVANCE_MIN_SCORE = 0.10
 PINNED_RELEVANCE_RATIO = 0.5
 
 
-#: セッション要約ファクトの subject 接頭辞。会話のメタ記録であって、ユーザーに
-#: ついての事実ではないため [関連する記憶] へ注入しない (``inject`` 内の判定参照)。
-_SESSION_SUMMARY_SUBJECT_PREFIX = "mem.decision.history.session"
+#: セッション要約ファクトの判定は :func:`is_session_summary_subject` (SSOT は
+#: ``notes.subject_ns``)。会話のメタ記録であってユーザーについての事実ではない
+#: ため [関連する記憶] へ注入しない (``inject`` 内の判定参照)。
+#:
+#: **接頭辞リテラルを持たない** — 要約の subject は
+#: ``mem.<decision|commitment>.history.session.<id12>`` で型が本文から推定される
+#: ため、片方をリテラルで書くと他方が素通りする。実際
+#: ``"mem.decision.history.session"`` と書かれていた期間、
+#: ``mem.commitment.history.session.*`` だけが注入され、訂正前の値を運び続けた
+#: (:data:`~backend.free.memory.notes.subject_ns.SESSION_SUMMARY_SUBJECT_RE`)。
 
 #: MDP エピソードトレース由来の decision ファクトの subject 接頭辞
 #: (``MDPTraceExtractor`` が ``mem.decision.<episode_id>`` で書く。episode_id は
@@ -196,10 +204,28 @@ _EXECUTABLE_COMMAND_SUBJECT_PREFIX = "mem.world.executable_command."
 #: 掛けると同じ内容が別の窓から出る — 実際 2026-08-19 時点の pending は全 2 件が
 #: セッション要約で、競合セクション側から素通しになっていた。
 INTERNAL_INDEX_SUBJECT_PREFIXES: tuple[str, ...] = (
-    _SESSION_SUMMARY_SUBJECT_PREFIX,
     _EPISODE_TRACE_SUBJECT_PREFIX,
     _EXECUTABLE_COMMAND_SUBJECT_PREFIX,
 )
+
+
+def is_internal_index_subject(subject: str) -> bool:
+    """``subject`` が内部索引 (ユーザー向けに出さない記録) のものか。
+
+    セッション要約は型が可変なので接頭辞ではなく形で判定する
+    (:func:`~backend.free.memory.notes.subject_ns.is_session_summary_subject`)。
+    エピソードトレースと executable command 索引は subject が固定接頭辞。
+
+    **両方の消費側 (注入 / 競合レビュー) は必ずこの関数を通す** — 片方だけに
+    掛けると同じ内容が別の窓から出る (:data:`INTERNAL_INDEX_SUBJECT_PREFIXES`
+    のコメント参照)。
+    """
+    if not subject:
+        return False
+    return (
+        is_session_summary_subject(subject)
+        or subject.startswith(INTERNAL_INDEX_SUBJECT_PREFIXES)
+    )
 
 
 #: 属性スロットを持つユーザーファクトの型 (``fact_attributes.yaml`` の chat 節)。
@@ -234,6 +260,9 @@ class InjectedItem:
     text: str
     tokens: int
     score: float
+    #: ファクトの属性スロット名 (``location`` / ``schedule`` …)。ノートは ``None``。
+    #: 採用された item だけを見て ``InjectionPlan.covered_attributes`` を作る。
+    attribute: str | None = None
 
 
 @dataclass
@@ -250,6 +279,12 @@ class InjectionPlan:
     items: list[InjectedItem] = field(default_factory=list)
     dropped: list[InjectedItem] = field(default_factory=list)
     used_tokens: int = 0
+
+    #: 実際に注入されたファクトの属性スロット名 (``location`` / ``schedule`` …)。
+    #: 「この属性の現在値はもうプロンプトに載っている」を呼出側が判定するための
+    #: 出力。``dropped`` になった候補は含めない — 載っていないものを載ったと
+    #: 数えると、履歴検索の抑止が「答えを持たないまま撃たない」に化ける。
+    covered_attributes: set[str] = field(default_factory=set)
 
     def render(self) -> str:
         """注入対象を 1 つのテキストに連結する (改行区切り)。"""
@@ -649,7 +684,7 @@ class MemoryInjector:
             # 「前回何を話したか」は search_history ツールの担当。
             # MDP エピソードトレース / executable command 索引も同じ理由で落とす
             # (:data:`INTERNAL_INDEX_SUBJECT_PREFIXES` の各説明を参照)。
-            if fact.subject.startswith(INTERNAL_INDEX_SUBJECT_PREFIXES):
+            if is_internal_index_subject(fact.subject):
                 filtered_out += 1
                 continue
             gate_reached += 1
@@ -689,6 +724,7 @@ class MemoryInjector:
                     text=text,
                     tokens=tokens,
                     score=score,
+                    attribute=self._fact_attribute(fact),
                 ),
             )
 
@@ -801,6 +837,13 @@ class MemoryInjector:
             budget_tokens=budget,
             tier_budgets=tier_budgets,
         )
+        # item_id (= fact.id) → 属性スロット。パック後に **採用されたものだけ**
+        # を covered_attributes へ移す。
+        attr_by_fact_id = {
+            it.item_id: it.attribute
+            for tier_items in buckets.values() for it in tier_items
+            if it.source == "fact" and it.attribute
+        }
 
         # Tier 1 → 4 の順にパック
         for tier in (1, 2, 3, 4):
@@ -809,6 +852,11 @@ class MemoryInjector:
             plan.items.extend(accepted)
             plan.dropped.extend(dropped)
             plan.used_tokens += sum(it.tokens for it in accepted)
+
+        plan.covered_attributes = {
+            attr for it in plan.items
+            if (attr := attr_by_fact_id.get(it.item_id))
+        }
 
         # 総予算オーバー時は Tier 4 から削除
         if plan.used_tokens > budget:
@@ -1076,6 +1124,14 @@ class MemoryInjector:
     # ── レンダリング ─────────────────────────────────────────────────
 
     def _render_fact(self, fact: SemanticFact) -> str:
+        """1 ファクトを [関連する記憶] の 1 行へ整形する。
+
+        本文は **必ず ``fact.text``** (= ``statement or object``) を使う。
+        古い記録の 2 分岐だけが生の ``object`` を読んでおり、``statement`` が
+        埋まると同じファクトが鮮度によって別の本文で出ていた
+        (2026-08-26 に是正)。訂正ファクトの ``object`` は古い値を同居させた
+        原文なので、この分岐だけ陳腐値を出し続ける形になっていた。
+        """
         age = self._fact_age_days(fact)
         corrected = bool(getattr(fact, "from_correction", False))
         if age is None or age < _FACT_STALE_LABEL_DAYS:
@@ -1089,7 +1145,7 @@ class MemoryInjector:
             return f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.text}"
         if corrected:
             return (
-                f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.object}"
+                f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.text}"
                 f" (訂正後の記録・{int(age)}日前)"
             )
         # 何日前の記録かを行ごとに書く。ノート側 (_render_note の (過去の記録))
@@ -1101,7 +1157,7 @@ class MemoryInjector:
         # 「趣味は自転車と写真」が検索で 1.000 の最上位に立った。**どちらが今の
         # 話かを示す情報が行に無かった**ため、古い方がそのまま回答になった。
         return (
-            f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.object}"
+            f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.text}"
             f" ({int(age)}日前の記録)"
         )
 

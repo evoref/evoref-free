@@ -49,10 +49,20 @@ from backend.free.api.chat.chat_streaming import (
     stream_reactive_light, stream_staged_create,
     sync_deliberative, sync_long_form, sync_meta_cognitive, sync_reactive_light,
 )
+from backend.free.api.chat._continuation import (
+    TruncatedResponse,
+    build_continuation_query,
+    resume_from_last_response,
+    take_continuation,
+)
 from backend.edition import is_pro
 from backend.free.core.inference import latest_turn_truncation
 from backend.free.core.intent_vocab import is_whole_session_scope_query
-from backend.free.core.session_mode import is_create_mode, is_valid_session_mode
+from backend.free.core.session_mode import (
+    is_create_mode,
+    is_valid_session_mode,
+    normalize_session_mode,
+)
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
@@ -488,6 +498,104 @@ async def _light_semmem_block(
         timer.stop("semmem_ms")
 
 
+async def _dispatch_continuation(
+    req: ChatRequest,
+    client,
+    state: AppState,
+    cfg: dict,
+    gen_params: dict,
+    history: list,
+    pending: TruncatedResponse,
+    session_id: str,
+    instance_name: str,
+    context_size: int,
+    max_tokens: int | None,
+    timer: StageTimer,
+) -> "StreamingResponse | ChatResponse":
+    """継続生成 dispatch: 直前の切断応答の **続きだけ** を書かせる。
+
+    分類器を通さない。「続けて」は 3 文字なので必ず ``short_query`` →
+    ``reactive_light`` へ落ち、切れた履歴を見たモデルが最善の推測として
+    直前ブロックを再掲する (2026-08-25 実測: 2 回試して 2 回とも同一の
+    末尾ブロックが返り、履歴に残っていた切断注記まで逐語コピーされた)。
+    切断ケースの発火条件は ``take_continuation`` が握る観測事実 (直前ターンの
+    ``finish_reason="length"``)。切断していない応答への「続けて」は
+    ``resume_from_last_response`` が同じ材料を組み、指示文だけが変わる。
+    どちらも **直前に assistant の応答がある** ことが前提なので、会話の
+    1 ターン目の「続けて」はこの経路に入らない。
+
+    生成そのものは軽量パスを使う (RAG / SemMem / ツール判定は続きの執筆に
+    寄与しない)。ただし:
+
+    - ``max_tokens`` は軽量パスの上限 (512) ではなく通常のチャット既定を使う。
+      512 で切ったのがそもそもの原因なので、続きまで同じ幅で切らない。
+    - 応答を ReactiveAgent キャッシュへ入れない (``cacheable=False``)。
+      「続けて」をキーに入れると、後日の無関係な「続けて」へ 5 分以内に
+      同じ続きが再生される。
+    """
+    system_prompt = _resolve_system_prompt(state, req.mode, instance_name)
+    # 履歴の最後 (= 今回の「続けて」) を継続指示へ差し替える。WM 側は
+    # ユーザーの実発話のまま残すので、記録と表示は「続けて」で一貫する。
+    cont_history = list(history)
+    instruction = build_continuation_query(pending)
+    if cont_history and cont_history[-1].get("role") == "user":
+        cont_history[-1] = {**cont_history[-1], "content": instruction}
+    else:
+        cont_history.append({"role": "user", "content": instruction})
+    cont_messages = build_chat_messages(
+        system_prompt, cont_history,
+        rag_chunks=None, file_contexts=None,
+        semmem_block=None,
+        context_size=context_size, max_tokens=max_tokens,
+        working_max_tokens=int(
+            (cfg.get("memory") or {}).get(
+                "working_max_tokens", DEFAULT_WORKING_MAX_TOKENS,
+            ),
+        ),
+        evicted_turns=session_evicted_turns(state),
+    )
+    logger.info(
+        "Continuation dispatch: resuming %s response (tail=%d chars)",
+        "truncated" if pending.truncated else "completed",
+        len(pending.tail),
+    )
+    # layer_escalation とは別の decision_point にする。既存キーの候補集合
+    # (reactive_rule / reactive_light / deliberative) に無い chosen を混ぜると
+    # policy_adjuster の (decision_point, chosen) 集計が汚れる。
+    dl = getattr(state, "debug_logger", None)
+    if dl is not None:
+        dl.log_decision(
+            decision_point="continuation_resume",
+            chosen="continuation",
+            candidates=["continuation", "normal"],
+            reason=(
+                "prev_turn_finish_reason_length"
+                if pending.truncated
+                else "prev_turn_completed_followup"
+            ),
+            scope="request",
+        )
+    if req.stream:
+        return StreamingResponse(
+            _with_chat_in_flight(client, stream_reactive_light(
+                req.message, cont_messages, client, state, session_id,
+                instance_name, context_size,
+                mode=req.mode, max_tokens=max_tokens,
+                generation_params=gen_params, timer=timer, private=req.private,
+                cacheable=False,
+            )),
+            media_type="text/event-stream",
+        )
+    async with client.chat_in_flight():
+        return await sync_reactive_light(
+            req.message, cont_messages, client, state, session_id,
+            instance_name, context_size,
+            mode=req.mode, max_tokens=max_tokens,
+            generation_params=gen_params, timer=timer, private=req.private,
+            cacheable=False,
+        )
+
+
 async def _dispatch_reactive_light(
     req: ChatRequest,
     client,
@@ -609,6 +717,27 @@ def _cancel_pending_task(task: "asyncio.Task | None") -> None:
         task.cancel()
 
 
+def _answered_attributes(
+    query: str, mode: str, covered: set[str],
+) -> frozenset[str]:
+    """クエリが尋ねている属性のうち、**今回注入済み** のものを返す。
+
+    ``search_history`` の抑止条件。過去の監査で「答えは今の窓の中にある」を
+    前提にしたスキップが、WorkingMemory が 1 件でも押し出した瞬間から永久に
+    偽になった (2026-08-23)。ここは会話窓ではなく **このターンのプロンプトに
+    実際に載ったファクト** を根拠にするので、その失敗にはならない —
+    載っていなければ空集合になり、抑止は起きない。
+
+    尋ねている属性が解決できないクエリ (自由な話題) は空集合。
+    """
+    if not covered:
+        return frozenset()
+    from backend.free.memory.pipeline.injector import MemoryInjector
+
+    asked = MemoryInjector._asked_attributes(query, normalize_session_mode(mode))
+    return frozenset(asked & covered)
+
+
 async def _build_messages_with_search(
     req: ChatRequest,
     state: AppState,
@@ -623,6 +752,7 @@ async def _build_messages_with_search(
     conflict_ctx: ConflictTurnContext | None = None,
     search_task: "asyncio.Task | None" = None,
     fewshot_block: str | None = None,
+    covered_attributes: set[str] | None = None,
 ) -> tuple[
     list, StreamWrapper, str | None,
     list[tuple[str, float, str]] | None, float | None,
@@ -685,6 +815,7 @@ async def _build_messages_with_search(
             # 検索で算出済みのクエリ埋め込みを再利用し、無関係な記憶の注入を防ぐ
             query_vec=search_result.query_vec,
             query_text=req.message,
+            covered_attributes=covered_attributes,
         )
     finally:
         timer.stop("semmem_ms")
@@ -1275,6 +1406,7 @@ async def _dispatch_deliberative(
     rag_top1_score: float | None = None,
     tool_judge_task: "asyncio.Task | None" = None,
     escalated_from: str | None = None,
+    answered_attributes: frozenset[str] = frozenset(),
 ) -> StreamingResponse | ChatResponse:
     """Deliberative 経路: ツール判定 + LLM 推論。
 
@@ -1320,6 +1452,7 @@ async def _dispatch_deliberative(
                 # (``_append_session_position_fact`` 参照)。
                 evicted_turns=session_evicted_turns(state),
                 session_head=session_first_user_message(state),
+                answered_attributes=answered_attributes,
             ))),
             media_type="text/event-stream",
         )
@@ -1338,6 +1471,7 @@ async def _dispatch_deliberative(
             escalated_from=escalated_from,
             evicted_turns=session_evicted_turns(state),
             session_head=session_first_user_message(state),
+            answered_attributes=answered_attributes,
         )
 
 
@@ -1377,6 +1511,25 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     # system は静的 (query 非依存) に保ち KV キャッシュを効かせる。query 依存の
     # few-shot は動的ブロックとして最後の user メッセージへ前置する (build_messages)。
     system_prompt = _resolve_system_prompt(state, req.mode, instance_name)
+
+    # 直前の応答が max_tokens で切れていて、今回の発話が「続けて」だけなら
+    # 分類器を通さず継続生成へ。分類器を通すと必ず short_query →
+    # reactive_light に落ち、切れた履歴からモデルが直前ブロックを再掲する
+    # (_dispatch_continuation の docstring 参照)。
+    #
+    # 切断が観測されていない場合も、直前に assistant の応答があれば同じ経路へ
+    # 流す (resume_from_last_response)。層分類を deliberative へ上げるだけでは
+    # 足りず、検索意図を持たない 3 文字に SemMem ブロックが噛み合って
+    # 「あなたについて、現在確認できる情報はありません。」を返した (2026-08-25)。
+    pending_continuation = take_continuation(
+        state, session_id, req.message, req.mode,
+    ) or resume_from_last_response(history, req.message, req.mode)
+    if pending_continuation is not None:
+        return await _dispatch_continuation(
+            req, client, state, cfg, gen_params, history, pending_continuation,
+            session_id, instance_name, context_size, max_tokens, StageTimer(),
+        )
+
     fewshot_block = _resolve_fewshot_block(state, req.mode, req.message)
 
     # classify は conflict 結果に依存しない (req.message のみ) ため先に確定し、
@@ -1561,12 +1714,17 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             output_target = "file"
             editor_route = None
 
+        # 実際に注入されたファクトの属性スロット。「この属性の現在値はもう
+        # プロンプトに載っている」を判定して search_history を抑止する
+        # (_dispatch_deliberative → process の answered_attributes)。
+        covered_attributes: set[str] = set()
         messages, search_error_wrapper, semmem_block, scored_chunks, rag_top_raw = (
             await _build_messages_with_search(
                 req, state, cfg, system_prompt, history, file_contexts,
                 context_size, max_tokens, timer,
                 editor_route=editor_route,
                 conflict_ctx=conflict_ctx,
+                covered_attributes=covered_attributes,
                 search_task=search_task,
                 fewshot_block=fewshot_block,
             )
@@ -1650,6 +1808,9 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                     rag_top1_score=rag_top1_score,
                     tool_judge_task=judge_task,
                     escalated_from=escalated_from,
+                    answered_attributes=_answered_attributes(
+                        req.message, req.mode, covered_attributes,
+                    ),
                 )
     except BaseException:
         # 例外が伝播する経路 (build/dispatch 等) で未消費の投機タスクが残らない

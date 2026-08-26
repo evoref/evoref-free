@@ -27,6 +27,7 @@ from backend.free.constants import READ_FILE_META_PREFIX
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.tool_ledger import format_ledger
 from backend.free.core.intent_vocab import (
+    names_file_target,
     own_process_question,
     persist_request,
     resolve_session_position_message,
@@ -126,6 +127,20 @@ _WRITE_TARGET_UNKNOWN_GUIDANCE = (
     "1 文で尋ねること。"
 )
 
+#: 直前の保存依頼に引数だけを与えたターンで、ツールが 1 度も実行されなかった
+#: 場合の注記。``_UNPERFORMED_ACTION_GUIDANCE`` (ツールが無い) とも
+#: ``_WRITE_TARGET_UNKNOWN_GUIDANCE`` (宛先が分からない) とも理由が違う —
+#: 宛先はユーザーが今まさに与えており、**判定がそれを保存依頼と見なさなかった**
+#: だけ。だから「保存先を教えて」と聞き返すのも誤りになる。
+_PENDING_WRITE_NOT_EXECUTED_GUIDANCE = (
+    "\n\nこのターンでは書き込みツールが **1 度も実行されていない**。"
+    "したがって「保存しました」「書き込みました」「作成しました」等の"
+    "完了報告をしてはならず、保存先のパスを実在するものとして述べても"
+    "ならない。直前の保存依頼はまだ実行されていない状態である。"
+    "指定されたファイル名でよいかを 1 文で確認し、"
+    "改めて保存の指示を求めること。"
+)
+
 _UNPERFORMED_ACTION_GUIDANCE = (
     "\n\nこの依頼はファイルやシステムの状態を変える操作を含むが、"
     "今回のターンではその操作を実行できるツールが無く、**何も実行していない**。"
@@ -202,6 +217,28 @@ _CALCULATE_RESULT_GUIDANCE = (
     "式に現れていない係数・比重・補正 (例:「比重 1.3 を掛けた」) を"
     "計算の根拠として述べないこと。実際に評価されたのは上記の式だけである。"
 )
+
+
+def _previous_user_text(
+    conversation: list[dict] | None, current_query: str = "",
+) -> str:
+    """会話履歴から **1 つ前の user 発話** を返す (無ければ空文字列)。
+
+    ``conversation`` (= ``history``) の末尾には **今回のターン自身** が入って
+    いることがある。素直に末尾の user 発話を返すと今回のクエリが返り、
+    「直前が保存依頼だったか」の判定が常に今回の発話を見てしまう
+    (2026-08-26 の実機検証で ``_append_pending_write_note`` が発火しなかった
+    原因)。今回のクエリと一致するものは飛ばす。
+    """
+    current = (current_query or "").strip()
+    for message in reversed(conversation or ()):
+        if message.get("role") != "user":
+            continue
+        text = str(message.get("content") or "")
+        if current and text.strip() == current:
+            continue
+        return text
+    return ""
 
 
 def _unexplained_numbers_note(numbers: tuple[str, ...]) -> str:
@@ -545,6 +582,9 @@ class DeliberativeAgent:
         self.reminder_system = EventReminderSystem(self.config)
         self._tool_judge = tool_judge
         self._tools_registry = tools_registry
+        #: このターンの [関連する記憶] に載った、クエリが尋ねている属性。
+        #: ``process()`` の入口で毎ターン差し替える。
+        self._answered_attributes: frozenset[str] = frozenset()
         # _execute_tool の mode ゲートの既定値。process() 呼び出し毎の実際の mode は
         # _judge_and_execute_tool から明示的に渡される (こちらは直接 _execute_tool を
         # 呼ぶ既存テスト等のフォールバック用)。
@@ -832,6 +872,44 @@ class DeliberativeAgent:
         logger.info("Tool inventory fact pinned (mode=%s)", mode)
         return True
 
+    def _suppress_redundant_history_search(
+        self, judgement: "ToolJudgement", query: str,
+    ) -> bool:
+        """尋ねられた属性の現在値が **もうプロンプトに載っている** なら
+        ``search_history`` を撃たない。
+
+        コストは検索そのものではない。実測 (2026-08-25、42.35 秒のターン):
+
+            分類器 (層 5.9)                       15 秒
+            search_history の実行                 1 秒未満
+            ツール結果 1252 文字を載せた最終生成   28 秒
+
+        同じ会話でツールを撃たなかった直前のターンは 8.5 秒だった。効くのは
+        **ツール結果をプロンプトへ載せない**ことで、``last_user_appended_chars``
+        が 2286 増えて接頭辞キャッシュが崩れるのを避けられる。
+
+        判定の根拠は会話窓ではなく ``answered_attributes`` — このターンの
+        ``[関連する記憶]`` に実際に載ったファクトの属性スロット
+        (``InjectionPlan.covered_attributes`` ∩ 尋ねられた属性)。過去の監査で
+        「答えは今の窓の中にある」を前提にしたスキップが、WorkingMemory が
+        1 件でも押し出した瞬間から永久に偽になった (2026-08-23)。載っていなければ
+        空集合になり抑止は起きないので、その失敗にはならない。
+
+        抑止するのは ``search_history`` **だけ**。ターン全体を短絡させると
+        「私の登壇日は何曜日ですか？」のような、属性は載っていても日付計算が
+        要るクエリで ``run_command_readonly`` まで撃てなくなる。
+        """
+        if not self._answered_attributes:
+            return False
+        if judgement.tool_name != "search_history":
+            return False
+        logger.info(
+            "search_history suppressed: asked attribute(s) already injected "
+            "(%s) for query: %s",
+            ",".join(sorted(self._answered_attributes)), query[:60],
+        )
+        return True
+
     @staticmethod
     def _append_tool_ledger_fact(
         messages: list[dict], query: str, session_id: str,
@@ -888,6 +966,41 @@ class DeliberativeAgent:
             messages, _WRITE_TARGET_UNKNOWN_GUIDANCE, separator="",
         )
         logger.info("Write-target-unknown note pinned: %s", query[:50])
+        return True
+
+    @staticmethod
+    def _append_pending_write_note(
+        messages: list[dict], query: str, conversation: list[dict] | None,
+    ) -> bool:
+        """直前の保存依頼に **引数だけを与えた** ターンで完了の捏造を止める。
+
+        「E:\\tmp に保存してください。」の次に「ファイル名は inventory.txt で
+        お願いします。」と言うのは、保存依頼の絞り込みであって新しい依頼では
+        ない。この形は動詞も保存語も含まないため ``persist_request`` を外れ、
+        ``local_write_intent`` (パス必須) も外れ、``deliberative (default)``
+        へ落ちてツール判定も ``no_tool`` になる。
+
+        既存の完了捏造ガードは **撃とうとして撃てなかった** ケース
+        (``action_blocked``) にしか掛からず、「そもそも撃たれなかった」を
+        覆っていなかった。実インシデント (2026-08-26 ライブ監査 T2-5):
+        ツールが 1 度も実行されていないのに「E:\\tmp\\inventory.txt に
+        保存しました。」と回答し、次ターンの ``read_file`` が
+        ``File not found`` を返した。さらにその次のターンで「どこに保存したか」に
+        **存在しないパスをそのまま再提示**して捏造が連鎖した。
+
+        発火条件は 2 つの観測事実の AND — 今回のターンがファイル名 / パスを
+        名指ししていること、直前の user 発話が保存依頼だったこと。単独では
+        どちらも普通のターンなので、片方だけでは発火させない。
+        """
+        if not names_file_target(query):
+            return False
+        previous = _previous_user_text(conversation, query)
+        if not previous or not persist_request(previous):
+            return False
+        append_to_last_user(
+            messages, _PENDING_WRITE_NOT_EXECUTED_GUIDANCE, separator="",
+        )
+        logger.info("Pending-write note pinned (no tool ran): %s", query[:50])
         return True
 
     @staticmethod
@@ -1057,6 +1170,12 @@ class DeliberativeAgent:
                 session_id=session_id,
             )
         state.action_blocked = bool(judgement.action_blocked)
+        if self._suppress_redundant_history_search(judgement, query):
+            judgement = ToolJudgement(
+                tool_needed=False, tool_name="", tool_args={},
+                source=judgement.source,
+            )
+
         if not (judgement.tool_needed and judgement.tool_name):
             # 確認形で持ち込まれた未検証の数値は、ツールが撃てないターンほど
             # 危険。丸投げすると自分が計算した値を捨てて追認する
@@ -1066,6 +1185,10 @@ class DeliberativeAgent:
             # 「宛先が分からない」— 理由を取り違えると同じ会話で成功している
             # write_file を「利用できない」と説明してしまう。
             self._append_write_target_unknown_note(messages, query)
+            # 直前の保存依頼に引数だけを与えたターン。宛先は今まさに与えられて
+            # いるので「保存先を教えて」ではなく「まだ実行していない」を伝える
+            # (_append_pending_write_note の docstring 参照)。
+            self._append_pending_write_note(messages, query, conversation)
             if judgement.action_blocked:
                 # 状態を変えようとして撃てなかった。丸投げすると「追記しました」
                 # と完了を捏造する (_UNPERFORMED_ACTION_GUIDANCE 参照)。
@@ -1279,6 +1402,7 @@ class DeliberativeAgent:
         session_id: str = "",
         evicted_turns: int = 0,
         session_head: str = "",
+        answered_attributes: frozenset[str] = frozenset(),
     ) -> DeliberativeResponse | AsyncIterator[str]:
         """Deliberative 層で LLM 推論を実行
 
@@ -1294,6 +1418,9 @@ class DeliberativeAgent:
             generation_params: モード別生成パラメータ（temperature, top_p 等）
             tool_judge_task: chat() が先行起動した tool 判定タスク (並列化時)。
                 None なら判定をここで直列実行する。
+            answered_attributes: このターンの [関連する記憶] に **実際に載った**
+                ファクトのうち、クエリが尋ねている属性のスロット名
+                (``_suppress_redundant_history_search`` 参照)。
 
         Returns:
             stream=False: DeliberativeResponse
@@ -1303,6 +1430,10 @@ class DeliberativeAgent:
             "process: query=%r, messages=%d, stream=%s, mode=%s",
             query[:50], len(messages), stream, mode,
         )
+
+        # ターン固有の値なので process() の入口で差し替える (インスタンスは
+        # セッションを跨いで再利用されない — chat() が毎リクエスト生成する)。
+        self._answered_attributes = answered_attributes
 
         state = self._init_deliberative_state(mode)
         (
@@ -1409,7 +1540,7 @@ class DeliberativeAgent:
             )
 
         if stream:
-            return self._stream_response(
+            return await self._stream_response(
                 messages, llm_client, max_tokens,
                 tool_result=tool_result_text, tool_name=tool_name_used,
                 generation_params=generation_params,
@@ -1512,7 +1643,13 @@ class DeliberativeAgent:
         tool_name: str | None = None,  # noqa: ARG002
         generation_params: GenerationParams | None = None,
     ) -> AsyncIterator[str]:
-        """ストリーミング応答（生トークンのイテレータを返す）"""
+        """ストリーミング応答（生トークンのイテレータを返す）
+
+        ``LocalClient.generate`` の戻り値を **そのまま** 返す。中継用の
+        async generator で包むと ``TokenStream.outcome`` (max_tokens 到達の
+        終端メタ) が失われ、切断の開示が呼出側へ届かなくなる。トークン数は
+        呼出側 (``_DeliberativeStreamState.tokens_generated``) が数えている。
+        """
         kwargs: dict = {"stream": True, "id_slot": llm_client.chat_slot}
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
@@ -1521,15 +1658,7 @@ class DeliberativeAgent:
             for k in ("temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "repetition_penalty"):
                 if k in generation_params:
                     kwargs[k] = generation_params[k]
-        token_gen = await llm_client.generate(messages, **kwargs)
-        tokens_generated = 0
-        async for token in token_gen:
-            tokens_generated += 1
-            yield token
-        logger.debug(
-            "Deliberative stream complete: tokens_generated=%d",
-            tokens_generated,
-        )
+        return await llm_client.generate(messages, **kwargs)
 
     async def _ensure_write_file_content(
         self,

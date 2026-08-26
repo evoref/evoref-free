@@ -146,8 +146,42 @@ _ORDER_QUERY_STOPWORD_RUNS_EN = frozenset({
 })
 
 
+#: ユーザーが明示的に括った検索語。``「猫」`` ``『Python』`` ``"foo"`` を拾う。
+#: 括弧の中身は **ユーザー自身が「これを探せ」と指定した語** なので、内容語の
+#: 抽出規則より優先する。
+_QUOTED_TERM_RE = re.compile(
+    r"[「『]([^「」『』\n]{1,40})[」』]"
+    r"|[“”\"]([^“”\"\n]{1,40})[“”\"]",
+)
+
+
+def quoted_search_terms(query: str) -> list[str]:
+    """クエリ中で括られた検索語を出現順に返す (純粋関数)。
+
+    実インシデント (2026-08-25 ライブ監査): 「過去の会話から**「猫」**について
+    話した内容を検索してください。」で ``search_history`` に **生の文全体** が
+    渡り 0 件。内容語抽出は 1 文字語を落とすため (``_ORDER_QUERY_MIN_TERM_LEN``、
+    ``tokenize_ja`` が bi-gram なので 1 文字はトークンが作れないことに由来)、
+    縮約に掛けても「猫」は残らず生クエリへフォールバックしていた。
+
+    括られた語は長さを問わず採る。``HistoryManager._text_matches_query`` の
+    **部分一致 (tier 0) は 1 文字でも当たる** ので、キーワード段・bi-gram 段の
+    1 文字制限は問題にならない。
+    """
+    out: list[str] = []
+    for m in _QUOTED_TERM_RE.finditer(query or ""):
+        term = (m.group(1) or m.group(2) or "").strip()
+        if term and term not in out:
+            out.append(term)
+    return out
+
+
 def _reduce_ordered_history_query(query: str) -> str:
     """履歴リコール質問から search_history 用の内容キーワードを抽出する。
+
+    ユーザーが検索語を括っている場合 (:func:`quoted_search_terms`) はそれを
+    そのまま返す。内容語抽出より優先するのは、括った語が **ユーザー自身の
+    指定** だから。
 
     レイヤー5.5 の強制フォールバックが search_history に生クエリ全文を渡すと、
     HistoryManager の字句照合は長い疑問文を短い会話ターンにマッチできない
@@ -159,6 +193,9 @@ def _reduce_ordered_history_query(query: str) -> str:
     抽出できなければ生クエリを返す (悪化させない安全側)。digest には別途 raw
     query が渡るため、順序解釈 (「一番最初」) はこの縮約で失われない。
     """
+    quoted = quoted_search_terms(query)
+    if quoted:
+        return " ".join(quoted)
     en = is_en_locale()
     if en:
         scaffold_re, content_re, stopwords = (

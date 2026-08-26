@@ -23,9 +23,15 @@ from backend.free.agent.tool_judge_args import (
     _extract_head_line_count,
     _normalize_path_text,
 )
-from backend.free.agent.tool_judge_dialogue import _dialogue_text
+from backend.free.agent.tool_judge_dialogue import (
+    _dialogue_text,
+    _recent_dialogue_text,
+)
 from backend.free.agent.tool_judge_grounding import _ungrounded_numbers
-from backend.free.agent.tool_judge_history import _only_proximal_recall_keywords
+from backend.free.agent.tool_judge_history import (
+    _has_history_recall_keywords,
+    _only_proximal_recall_keywords,
+)
 from backend.free.agent.tool_judge_signals import (
     _IMMEDIATE_CHILDREN_RE,
     _READ_PATH_TOOLS,
@@ -33,6 +39,7 @@ from backend.free.agent.tool_judge_signals import (
 )
 from backend.free.agent.tool_judge_types import ToolJudgement
 from backend.free.agent.tools_registry import ToolDefinition, ToolsRegistry
+from backend.free.core.intent_vocab import looks_like_numeric_question
 from backend.log_config import get_logger
 
 logger = get_logger("agent.tool_call_judge")
@@ -127,6 +134,51 @@ def _suppress_proximal_recall_cross_session(
         ctx.query[:50],
     )
     return ToolJudgement(tool_needed=False, source=result.source)
+
+
+def _suppress_computable_recall_cross_session(
+    result: ToolJudgement, ctx: GuardContext,
+) -> ToolJudgement:
+    """被演算子が今の会話に見えている計算クエリで、除外検索を撃たせない。
+
+    ``_suppress_proximal_recall_cross_session`` と同じ構造の抑止。あちらは
+    「さっき」等の近接リコール語を根拠にするが、こちらは **数値の所在** を
+    根拠にする。``looks_like_numeric_question`` が直近窓を context にして
+    True を返す = 被演算子はこのセッションに見えている、ということなので、
+    ``exclude_session_id`` で現在セッションを外した検索先に答えは無い。
+
+    実インシデント (2026-08-26 ライブ検証): 在庫を 12→9→14→12 と追った直後の
+    「最初の在庫からいくつ減りましたか？」に対し、分類器 (層5.9) が
+    ``search_history({'query': 'ノートPC 在庫', 'exclude_session_id': ...})``
+    を選び、**無関係な別会話 1154 文字** をプロンプトへ載せた。値は 4 ターン
+    すべて現在の窓にあり、除外検索は原理的に寄与しない。
+
+    既存の属性ベース抑止 (``chat._answered_attributes``) は「私の猫の名前」の
+    ような **属性スロット** を根拠にするため、「在庫」のようなドメイン量には
+    構造的に発火しない。
+
+    明示的な履歴参照語 (``前回`` / ``以前`` / ``過去の会話`` 等) が 1 つでも
+    あれば抑止しない。「前回の会話の予算からいくら増えた？」は本当に別
+    セッションを見る必要があるため。``最初の在庫`` は ``HISTORY_KEYWORDS`` の
+    どれにも当たらない (同リストが持つのは ``最初に言`` / ``一番最初`` の
+    ような **発話行為** への参照だけ) ので、この条件で分離できる。
+    """
+    if result.tool_name != "search_history" or not result.tool_needed:
+        return result
+    if not (result.tool_args or {}).get("exclude_session_id"):
+        return result
+    if _has_history_recall_keywords(ctx.query):
+        return result
+    if not looks_like_numeric_question(
+        ctx.query, _recent_dialogue_text(ctx.conversation),
+    ):
+        return result
+    logger.debug(
+        "Suppressing search_history: the operands are visible in the ongoing "
+        "session, which is excluded from the search: %s", ctx.query[:50],
+    )
+    return ToolJudgement(tool_needed=False, source=result.source)
+
 
 def _validate_tool_availability(
     result: ToolJudgement, ctx: GuardContext,
@@ -623,6 +675,10 @@ GUARD_PIPELINE: tuple[GuardSpec, ...] = (
     GuardSpec("read_file_line_range", _scope_read_file_line_range),
     GuardSpec(
         "proximal_recall_excluded_session", _suppress_proximal_recall_cross_session,
+    ),
+    GuardSpec(
+        "computable_recall_excluded_session",
+        _suppress_computable_recall_cross_session,
     ),
     GuardSpec("truncated_text_operand", _restore_truncated_text_operand, _aux_only),
     GuardSpec("ungrounded_calculate", _suppress_ungrounded_calculate, _aux_only),

@@ -11,6 +11,10 @@ from typing import (
     TYPE_CHECKING,
 )
 from backend.app_state import AppState
+from backend.free.api.chat._continuation import (
+    arm_continuation,
+    disarm_continuation,
+)
 from backend.free.api.chat.chat_constants import DEFAULT_KEEPALIVE_INTERVAL_SEC
 from backend.free.api.chat.chat_recorder import record_response
 from backend.free.api.chat.chat_service import make_token_info
@@ -81,6 +85,13 @@ class _DeliberativeStreamState:
     action_blocked: bool = False
     #: バッファモード (出力制約の検証ターン) で溜めたフィルタ通過後の本文。
     filtered_output: str = ""
+    #: llama-server が ``finish_reason="length"`` を返した = 応答が
+    #: ``max_tokens`` 到達で文の途中で切れている。開示は **本文の外**
+    #: (``sse.output_truncated``) で行う (``StreamOutcome`` の docstring 参照)。
+    truncated: bool = False
+    #: 切断時の生トークン数 / 上限 (開示フレームの中身)。
+    truncated_tokens: int = 0
+    truncated_max_tokens: int | None = None
 
 
 
@@ -213,6 +224,26 @@ async def _stream_filtered_token_pipeline(
         state.emitted_chars += len(remaining)
         yield sse.token(remaining)
 
+    _capture_stream_outcome(token_stream, state)
+
+
+def _capture_stream_outcome(
+    token_stream: AsyncIterator[str], state: _DeliberativeStreamState,
+) -> None:
+    """``TokenStream.outcome`` から切断メタを吸い上げる。
+
+    ``outcome`` を持たないイテレータ (テストの mock / 中継 generator) は
+    素通しする — 切断が分からないだけで、本文は従来どおり流れる。
+    """
+    outcome = getattr(token_stream, "outcome", None)
+    if outcome is None:
+        return
+    # 再生成 (0 トークン再試行 / 制約修復) がこの関数を再度通る。切断の有無は
+    # **最後に画面へ出した生成** で上書きする (前回の切断を引きずらない)。
+    state.truncated = bool(getattr(outcome, "truncated", False))
+    state.truncated_tokens = outcome.tokens_generated
+    state.truncated_max_tokens = outcome.max_tokens
+
 
 async def _emit_verified_output(
     state: _DeliberativeStreamState,
@@ -303,6 +334,8 @@ async def _retry_zero_tokens_deliberative(
     if remaining:
         state.emitted_chars += len(remaining)
         yield sse.token(remaining)
+    # 再試行が本流を置き換えたので、切断メタも再試行側で上書きする。
+    _capture_stream_outcome(retry_stream, state)
 
     if state.emitted_chars > 0:
         logger.info("Retry succeeded: tokens=%d", state.tokens_generated)
@@ -339,6 +372,32 @@ def _maybe_cache_reactive_response(
     if not response or not response.strip():
         return
     agent.cache_response(query, response)
+
+
+def _truncation_frame(
+    sess_state: AppState,
+    state: _DeliberativeStreamState,
+    session_id: str,
+    mode: str,
+) -> str | None:
+    """切断の開示フレームを返し、継続待ちを武装 / 解除する。
+
+    開示は **本文の外** (SSE フレーム) で出す。本文へ注記を連結すると
+    ``full_response`` に積まれて履歴 / WM / STM / experience まで保存され、
+    次ターンでモデルが逐語復唱する (``StreamOutcome`` の docstring 参照)。
+
+    切れていないターンでは継続待ちを解除する — 完結した応答のあとの
+    「続けて」を継続生成に化けさせないため。
+    """
+    if not state.truncated:
+        disarm_continuation(sess_state, session_id)
+        return None
+    arm_continuation(
+        sess_state, session_id, response=state.full_response, mode=mode,
+    )
+    return sse.output_truncated(
+        state.truncated_tokens, state.truncated_max_tokens,
+    )
 
 
 async def _finalize_deliberative_stream(
@@ -383,6 +442,9 @@ async def _finalize_deliberative_stream(
         private=private, tool_command=state.tool_command, session_id=session_id,
     )
     _emit_timing(sess_state, timer, "deliberative", state.tokens_generated, mode=mode)
+    truncation = _truncation_frame(sess_state, state, session_id, mode)
+    if truncation:
+        yield truncation
     ti = make_token_info(
         messages, state.tokens_generated, context_size, instance_name,
     )
@@ -405,6 +467,7 @@ async def stream_deliberative(
     escalated_from: str | None = None,
     evicted_turns: int = 0,
     session_head: str = "",
+    answered_attributes: frozenset[str] = frozenset(),
 ):
     """Deliberative 層の SSE ストリーミング
 
@@ -460,6 +523,7 @@ async def stream_deliberative(
                 session_id=session_id,
                 evicted_turns=evicted_turns,
                 session_head=session_head,
+                answered_attributes=answered_attributes,
             ))
             # process() はトークンを返す前にツール判定と実行を完了させる。
             # ここを素の await にすると、その間 SSE フレームが 1 つも流れず、
@@ -584,6 +648,7 @@ async def sync_deliberative(
     escalated_from: str | None = None,  # noqa: ARG001
     evicted_turns: int = 0,
     session_head: str = "",
+    answered_attributes: frozenset[str] = frozenset(),
 ) -> ChatResponse:
     """Deliberative 層の非ストリーミング応答 (escalated_from は API 一貫性用、未使用)"""
     logger.debug("Sync deliberative: session=%s, messages=%d", session_id, len(messages))
@@ -608,6 +673,7 @@ async def sync_deliberative(
             session_id=session_id,
             evicted_turns=evicted_turns,
             session_head=session_head,
+            answered_attributes=answered_attributes,
         )
 
         if timer:
@@ -675,6 +741,7 @@ async def stream_reactive_light(
     generation_params: "GenerationParams | None" = None,
     timer: "StageTimer | None" = None,
     private: bool = False,
+    cacheable: bool = True,
 ):
     """Reactive 軽量パス: few-shot/RAG/semmem/tool なしの最小プロンプトで base 1 ターン。
 
@@ -731,11 +798,15 @@ async def stream_reactive_light(
                 private=private,
                 rag_used=False,
             )
-            _maybe_cache_reactive_response(
-                state, query, stream_state.full_response,
-                private=private, tool_command=None, session_id=session_id,
-            )
+            if cacheable:
+                _maybe_cache_reactive_response(
+                    state, query, stream_state.full_response,
+                    private=private, tool_command=None, session_id=session_id,
+                )
             _emit_timing(state, timer, "reactive", stream_state.tokens_generated, mode=mode)
+            truncation = _truncation_frame(state, stream_state, session_id, mode)
+            if truncation:
+                yield truncation
             ti = make_token_info(
                 messages, stream_state.tokens_generated, context_size, instance_name,
             )
@@ -777,6 +848,7 @@ async def sync_reactive_light(
     generation_params: "GenerationParams | None" = None,
     timer: "StageTimer | None" = None,
     private: bool = False,
+    cacheable: bool = True,
 ) -> ChatResponse:
     """Reactive 軽量パスの非ストリーミング応答。"""
     from backend.free.llm.utils import extract_content
@@ -805,10 +877,11 @@ async def sync_reactive_light(
             private=private,
             rag_used=False,
         )
-        _maybe_cache_reactive_response(
-            state, query, content,
-            private=private, tool_command=None, session_id=session_id,
-        )
+        if cacheable:
+            _maybe_cache_reactive_response(
+                state, query, content,
+                private=private, tool_command=None, session_id=session_id,
+            )
         _log_chat_outcome(
             state,
             started_at=t_start,

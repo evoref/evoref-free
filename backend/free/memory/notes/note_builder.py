@@ -26,12 +26,15 @@ import threading
 import time
 import unicodedata
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
 import yaml
 
+from backend.free.core.intent_vocab import is_plain_statement
 from backend.free.core.session_mode import is_create_mode
+from backend.free.core.text_quality import states_no_user_value
 from backend.free.memory.types import MemoryMode, NoteSource
 from backend.log_config import get_logger
 
@@ -84,6 +87,44 @@ CORRECTION_FORM_TRIGGERS: frozenset[str] = frozenset({
     "actually it's",
     "i meant",
 })
+
+#: 属性スロットを持つ fact_type (``fact_attributes.yaml`` の chat 節)。
+#: :func:`restates_attribute_value` が走査する対象。
+_ATTRIBUTE_FACT_TYPES: tuple[str, ...] = (
+    "personal_fact", "preference", "emotion", "opinion",
+)
+
+
+def restates_attribute_value(
+    text: str,
+    *,
+    mode: str = "chat",
+    triggers_dir: str | Path | None = None,
+) -> bool:
+    """この発話が **既知の属性スロットの値を言い直している** か (純粋関数)。
+
+    「訂正の構文形が出ている」+「どの属性の話かが解決できる」の AND。
+    ``agent.feedback.restates_a_value`` が取りこぼす ``XではなくY`` 形を、
+    記憶層の要件 (「その属性の現在値は何か」) で拾い直すための述語。
+
+    属性の裏取りを必須にするのは、訂正形が **何についての訂正か** を示さない
+    ため。「さっきの 1234 × 5678 の答えは間違っています。正しくは 7006653
+    です。」のような値の言い直しでない訂正は、属性が解決できないので False。
+    これは :meth:`_ModeAwareNoteBuilder.candidate_fact_tags` が訂正形単独の
+    証拠に課しているゲートと同じ。
+    """
+    if not text:
+        return False
+    haystack = _normalize_trigger(text)
+    if not any(t in haystack for t in CORRECTION_FORM_TRIGGERS):
+        return False
+    return any(
+        resolve_fact_attribute(
+            text, fact_type, mode=mode, triggers_dir=triggers_dir,
+        ) is not None
+        for fact_type in _ATTRIBUTE_FACT_TYPES
+    )
+
 
 #: 同梱 default で期待される fact_type 集合 (mode 別)
 _EXPECTED_TAGS: dict[MemoryMode, tuple[str, ...]] = {
@@ -147,6 +188,29 @@ def _coerce_triggers(items: Any) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
+    """YAML の 1 スロットを :class:`AttributeSpec` へ変換する。
+
+    2 つの記法を受ける (既存の YAML を書き換えずに済ませるため):
+
+    - ``slug: [trigger, ...]`` — ガード無し (従来形)
+    - ``slug: {triggers: [...], requires_self_possessor: true}``
+
+    trigger が 1 つも無ければ ``None`` (呼出側がスキップする)。
+    """
+    if isinstance(raw, dict):
+        words = _coerce_triggers(raw.get("triggers"))
+        requires_self = bool(raw.get("requires_self_possessor", False))
+    else:
+        words = _coerce_triggers(raw)
+        requires_self = False
+    if not words:
+        return None
+    return AttributeSpec(
+        slug=slug, triggers=words, requires_self_possessor=requires_self,
+    )
+
+
 def load_fact_triggers(path: str | Path) -> FactTriggerMap:
     """``fact_triggers.yaml`` をロードして ``{mode: {fact_type: triggers}}``
     を返す。ファイル欠落 / パース失敗時は空辞書を返し、呼び出し側は
@@ -206,9 +270,122 @@ def reset_fact_triggers_cache() -> None:
         _TRIGGERS_CACHE.clear()
 
 
-#: ``{mode: {fact_type: ((attribute_slug, (trigger, ...)), ...)}}``。
+#: 一人称の所有者。``requires_self_possessor`` の判定に使う。
+#: ``_normalize_trigger`` 後 (NFKC + lowercase) の文字列に対して照合する。
+_SELF_POSSESSOR_RE = re.compile(
+    r"(?:私|僕|俺|自分|わたし|ぼく|おれ|あたし|わたくし|うち)\s*の\s*$",
+)
+
+#: 直前が「〜の」で修飾されているか (所有者が明示されている形)。
+#: 読点・句点・空白を挟む場合は修飾が切れているとみなす。
+_ANY_POSSESSOR_RE = re.compile(r"[^\s、。，．,.]\s*の\s*$")
+
+#: 文の区切り。話題 (``〜は`` / ``〜が`` / ``〜を``) のスコープはここで切れる。
+#: 読点は **切らない** — 「猫を飼っていて、名前は…」のような te 形の連結節では
+#: 話題が持ち越されるため。
+_SENTENCE_BREAK_RE = re.compile(r"[。．.!！?？\n]")
+
+#: 一人称の話題語 (``私は`` / ``僕が`` …) の名詞部分。
+_SELF_NOUNS: frozenset[str] = frozenset({
+    "私", "僕", "俺", "自分", "わたし", "ぼく", "おれ", "あたし", "わたくし",
+    "うち", "i", "me", "my",
+})
+
+#: 話題マーカー。直前の名詞がその文の話題を握る。
+_TOPIC_MARKERS = "はがを"
+
+
+def _last_topic_noun(before: str) -> str | None:
+    """``before`` の **同じ文の中** で最後に話題マーカーを取った名詞を返す。
+
+    見つからなければ ``None`` (話題が明示されていない)。
+    """
+    break_match = None
+    for break_match in _SENTENCE_BREAK_RE.finditer(before):
+        pass
+    clause = before[break_match.end():] if break_match else before
+    marker_at = max((clause.rfind(m) for m in _TOPIC_MARKERS), default=-1)
+    if marker_at <= 0:
+        return None
+    noun = clause[:marker_at]
+    # 名詞は直前の連続した非区切り文字。助詞・記号で切る。
+    noun = re.split(r"[\s、，,のにでとへやもか]", noun)[-1]
+    return noun or None
+
+
+def _possessor_is_self(haystack: str, start: int) -> bool:
+    """``haystack[start:]`` の trigger がユーザー自身のものか (純粋関数)。
+
+    2 段で見る:
+
+    1. 所有格が明示されている (「X の名前は」) なら X が一人称かどうか。
+    2. 所有格が無ければ、**同じ文で最後に話題マーカーを取った名詞** が
+       一人称か / 話題が明示されていないか。
+
+    2 が要るのは te 形の連結節のため。「猫を 1 匹飼っていて、名前はソラです。」は
+    ``名前は`` の直前に所有格が無いので 1 だけでは通ってしまい、ペットの名前が
+    ユーザー本人の名前スロットへ入る。読点で話題は切れないが句点では切れるので、
+    「趣味は登山です。名前は小川です。」は従来どおり本人の名前として通る。
+
+    漏れたときの着地は ``mem.personal.user`` で、**本人のスロットは汚れない**。
+    """
+    before = haystack[:start]
+    if _ANY_POSSESSOR_RE.search(before):
+        return bool(_SELF_POSSESSOR_RE.search(before))
+    topic = _last_topic_noun(before)
+    return topic is None or topic in _SELF_NOUNS
+
+
+@dataclass(frozen=True, slots=True)
+class AttributeSpec:
+    """``fact_attributes.yaml`` の 1 スロット。
+
+    ``requires_self_possessor`` は「このスロットはユーザー自身の属性である」
+    という宣言。真のとき、trigger の直前が ``<一人称以外>の`` である出現は
+    一致とみなさない。
+
+    実インシデント (2026-08-25 ライブ監査の追調査): ``name`` の trigger
+    ``名前は`` が「**猫の**名前はソラではなくルナでした。」にも一致し、
+    ペットの名前が ``mem.personal.name`` (ユーザー本人の名前スロット) へ入った。
+    実ストアで同一 subject に「私の名前は小川浩之です。」と並んで live になり、
+    injector の slot collapse は ``(subject, predicate)`` 単位なので
+    **構造的に片方が必ず落ちる**。セッション要約からの補完 (別経路) を塞いだ
+    直後に「名前については、確認できる情報を持ち合わせていません。」が出た。
+
+    語彙を足すだけの対策 (``pet_name`` スロットの追加) は漏れが必ず残るが、
+    このガードがあれば漏れたときの着地点が ``mem.personal.user`` になる —
+    **本人のスロットを汚さない安全な失敗**に変わる。「妻の名前は」
+    「会社の名前は」「プロジェクトの名前は」にも同じ理屈で効く。
+    """
+
+    slug: str
+    triggers: tuple[str, ...]
+    requires_self_possessor: bool = False
+
+    def match(self, haystack: str) -> tuple[str, ...]:
+        """``haystack`` に一致した trigger 語を返す (無ければ空タプル)。"""
+        hit: list[str] = []
+        for word in self.triggers:
+            if not word:
+                continue
+            if not self.requires_self_possessor:
+                if word in haystack:
+                    hit.append(word)
+                continue
+            # 所有者ガード付きは **出現ごと** に判定する。1 つでも自己所有の
+            # 出現があれば一致 (「猫の名前はソラで、私の名前は小川です」)。
+            start = haystack.find(word)
+            while start != -1:
+                if _possessor_is_self(haystack, start):
+                    hit.append(word)
+                    break
+                start = haystack.find(word, start + 1)
+        return tuple(hit)
+
+
+#: ``{mode: {fact_type: (AttributeSpec, ...)}}``。
 #: attribute は YAML 記載順を保持する (先勝ちの優先順位になるため)。
-FactAttributeMap = dict[str, dict[str, tuple[tuple[str, tuple[str, ...]], ...]]]
+FactAttributeMap = dict[str, dict[str, tuple[AttributeSpec, ...]]]
 
 _ATTRS_LOCK = threading.Lock()
 _ATTRS_CACHE: dict[str, FactAttributeMap] = {}
@@ -240,17 +417,17 @@ def load_fact_attributes(path: str | Path) -> FactAttributeMap:
         section = raw.get(mode_key) or {}
         if not isinstance(section, dict):
             continue
-        per_type: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {}
+        per_type: dict[str, tuple[AttributeSpec, ...]] = {}
         for tag, attrs in section.items():
             if not isinstance(tag, str) or not isinstance(attrs, dict):
                 continue
-            ordered: list[tuple[str, tuple[str, ...]]] = []
+            ordered: list[AttributeSpec] = []
             for slug, triggers in attrs.items():
                 if not isinstance(slug, str):
                     continue
-                words = _coerce_triggers(triggers)
-                if words:
-                    ordered.append((slug, words))
+                spec = _coerce_attribute(slug, triggers)
+                if spec is not None:
+                    ordered.append(spec)
             if ordered:
                 per_type[tag] = tuple(ordered)
         result[mode_key] = per_type
@@ -314,9 +491,9 @@ def resolve_fact_attribute_match(
     if not ordered:
         return None, ()
     haystack = _normalize_trigger(text)
-    for slug, words in ordered:
-        if any(w in haystack for w in words):
-            return slug, tuple(words)
+    for spec in ordered:
+        if spec.match(haystack):
+            return spec.slug, spec.triggers
     return None, ()
 
 
@@ -361,10 +538,9 @@ def resolve_fact_attribute_matches(
         return []
     haystack = _normalize_trigger(text)
     out: list[tuple[str, tuple[str, ...]]] = []
-    for slug, words in ordered:
-        hit = tuple(w for w in words if w in haystack)
-        if hit:
-            out.append((slug, tuple(words)))
+    for spec in ordered:
+        if spec.match(haystack):
+            out.append((spec.slug, spec.triggers))
             if len(out) >= max(1, limit):
                 break
     return out
@@ -711,7 +887,56 @@ class _ModeAwareNoteBuilder(NoteBuilder):
                 if own_attribute is None:
                     continue
             results.append(tag)
+        results.extend(
+            tag for tag in self._attribute_backed_tags(content)
+            if tag not in results
+        )
         return results
+
+    #: 属性の解決だけで候補にしてよい fact_type。``fact_attributes.yaml`` の
+    #: スロットは「ユーザーが持ちうる属性」の定義そのものなので、平叙文が
+    #: スロットに解決できた時点で自己開示とみなせる。
+    ATTRIBUTE_BACKED_TAGS: tuple[str, ...] = ()
+
+    def _attribute_backed_tags(self, content: str) -> list[str]:
+        """属性が解決できる平叙文を候補タグにする (動詞リストに依存しない経路)。
+
+        ``fact_triggers.yaml`` の ``personal_fact`` は一人称代名詞か、断定の
+        述語形 (``住んでいます`` / ``勤めています`` …) の **列挙** を要求する。
+        日本語は一人称を落とすのが常態なので、この列挙は繰り返し漏れてきた
+        (2026-07-26 / 2026-08-22 の各ライブ監査で 1 度ずつ語を追加している)。
+
+        2026-08-25 ライブ監査では 4 発話が候補タグ **0 件** で、sleep-time
+        Step 8 の抽出対象にすらならなかった:
+
+        - 「猫を1匹飼っていて、名前はソラです。」
+        - 「来月の9月14日に大阪で技術カンファレンスの登壇があります。」
+        - 「登壇日は9月14日ではなく9月20日に変更になりました。」
+        - 「職業はソフトウェアエンジニアで、主にPythonとTypeScriptを書いています。」
+
+        語を足し続ける代わりに、判定の向きを変える: ``fact_attributes.yaml`` の
+        スロットは **ユーザーが持ちうる属性の定義そのもの** なので、
+        「平叙文である」+「既知の属性スロットに解決できる」が揃えば自己開示と
+        みなしてよい。依頼文・質問文は :func:`is_plain_statement` と
+        :func:`states_no_user_value` の 2 つで落ちる (「このファイルの名前を
+        変更してください。」「予定を教えてください。」「あなたの職業は何ですか？」は
+        いずれも両方に掛かる)。
+
+        誤って拾っても着地は候補タグまでで、Step 8 側の質問文・依頼文フィルタと
+        assistant 発話の除外が後段に残る。
+        """
+        if not self.ATTRIBUTE_BACKED_TAGS or not content:
+            return []
+        if not is_plain_statement(content) or states_no_user_value(content):
+            return []
+        return [
+            tag for tag in self.ATTRIBUTE_BACKED_TAGS
+            if resolve_fact_attribute(
+                content, tag,
+                mode=self.mode,
+                triggers_dir=self._effective_triggers_dir,
+            ) is not None
+        ]
 
 
 class ChatNoteBuilder(_ModeAwareNoteBuilder):
@@ -727,6 +952,13 @@ class ChatNoteBuilder(_ModeAwareNoteBuilder):
     """
 
     mode: MemoryMode = "chat"
+
+    #: personal_fact / preference のスロットは「ユーザーが持ちうる属性」の
+    #: 定義そのものなので、平叙文が解決できれば自己開示とみなす
+    #: (:meth:`_ModeAwareNoteBuilder._attribute_backed_tags`)。
+    #: emotion / opinion は入れない — 属性語 (``workload`` / ``tech_stack``) が
+    #: 一般名詞で、平叙文であれば何にでも当たってしまう。
+    ATTRIBUTE_BACKED_TAGS: tuple[str, ...] = ("personal_fact", "preference")
 
 
 # ──────────────────────────────────────────────────────────────────────────

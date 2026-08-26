@@ -23,6 +23,7 @@
 		"agentic_step_elapsed": "{elapsed}s",
 		"search_history_no_match": "search_history: no match in past conversations",
 		"input_truncated": "⚠ Only the beginning of this message was sent due to the length limit ({sent} / {original} chars). The rest never reached the AI, so counts or totals over the whole text may be inaccurate.",
+		"output_truncated": "⚠ The output token limit was reached, so this response is cut off. Send \"continue\" to generate the rest.",
 		"input_truncated_toast": "Message too long — only the beginning was sent",
 		"step_complete": "✓ {detail}",
 		"rag_hits": "RAG search: {count} hit(s)",

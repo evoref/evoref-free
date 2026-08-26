@@ -250,6 +250,11 @@ class AppState:
     # ── セッションレジストリ ──
     _active_sessions: dict[str, SessionInfo] = field(default_factory=dict)
 
+    # max_tokens 到達で切れた応答の継続待ち (session_id -> TruncatedResponse)。
+    # 次ターンの「続けて」を実際の継続生成へ繋ぐための観測事実で、
+    # 読み書きは backend.free.api.chat._continuation に閉じる。
+    truncated_responses: dict[str, "Any"] = field(default_factory=dict)
+
     # ── メモリシステムアクセス ──
 
     def get_memory_system(

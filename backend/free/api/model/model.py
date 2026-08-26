@@ -726,10 +726,12 @@ async def reembed_facts(
     # ── same-model: live global store を in-place 更新 (再起動不要) ──
     store = state.get_semantic_store("global")
     live_facts = store.all_facts(include_superseded=False)
+    # 本文は Step 8.8 と同じ ``fact.text`` (= statement or object)。``object``
+    # を使うと再埋め込み済みと未処理で本文が食い違う (split-brain)。
     targets_g = [
-        (f.id, (f.object or "").strip())
+        (f.id, (f.text or "").strip())
         for f in live_facts
-        if f.embedding is not None and (f.object or "").strip()
+        if f.embedding is not None and (f.text or "").strip()
     ]
     if dry_run:
         return {"dry_run": True, "fact_count": len(targets_g)}

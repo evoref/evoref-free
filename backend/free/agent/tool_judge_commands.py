@@ -10,6 +10,7 @@ import datetime
 import re
 import shlex
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from backend.free.agent.safety_patterns import reject_readonly_violation
@@ -154,6 +155,27 @@ _ABSOLUTE_DATE_RE = re.compile(
     r"|(\d{4})[-/](\d{1,2})[-/](\d{1,2})",
 )
 
+#: 年が書かれていない日付 (「9 月 14 日」「9/14」)。会話で日付を口にするときの
+#: **もっとも自然な形**だが、``_ABSOLUTE_DATE_RE`` が 4 桁年を必須にするため
+#: 日付として一切認識されていなかった。年は実行時に ``n.year`` で埋める
+#: (ビルド時に埋めると ``mem.world.executable_command`` として学習された
+#: コマンドが翌年に誤答する)。
+#:
+#: 実インシデント (2026-08-25 ライブ監査 T2-3 / T2-9):
+#:
+#: - 「9 月 14 日まであと何日ですか？」→ ``_day_count_command`` が日付を 1 つも
+#:   拾えず now-only コマンドへ落ち、「20 日」はモデルの暗算だった。
+#: - 「9 月 14 日の 3 週間前は何月何日ですか？」→ 相対オフセットが常に *今日* を
+#:   基点にするため ``target: 2026-08-04`` を出力 (正しくは 8/24)。回答本文は
+#:   8 月 24 日で、**自分のツール出力と食い違う**表示になった。
+#:
+#: ``\d{1,2}/\d{1,2}`` は日付以外 (分数・比率) とも衝突するため、月日いずれも
+#: 実在する範囲のときだけ採用する (``_iter_query_dates`` で検証)。
+_PARTIAL_DATE_RE = re.compile(
+    r"(\d{1,2})\s*月\s*(\d{1,2})\s*日"
+    r"|(?<![\d/-])(\d{1,2})/(\d{1,2})(?![\d/-])",
+)
+
 #: 曜日を尋ねていることを示す語。
 _WEEKDAY_ASK_RE = re.compile(
     r"曜日|(?<![A-Za-z])day\s+of\s+the\s+week(?![A-Za-z])"
@@ -207,34 +229,92 @@ def _absolute_weekday_command(query: str) -> str:
     記憶頼みになる (実インシデント 2026-08-19 ライブ監査 ターン19:
     「西暦2000年1月1日は何曜日でしたか？」で ``datetime.now()`` だけが実行され、
     回答の「土曜日」はツールで裏取りされていなかった)。
+
+    年なしの「9 月 14 日は何曜日？」も対象にする。年は実行時の ``n.year``
+    (:data:`_PARTIAL_DATE_RE`)。
     """
     if not _WEEKDAY_ASK_RE.search(query or ""):
         return ""
-    m = _ABSOLUTE_DATE_RE.search(query or "")
-    if m is None:
-        return ""
-    parts = m.groups()
-    triple = parts[:3] if parts[0] is not None else parts[3:]
-    try:
-        year, month, day = (int(v) for v in triple)
-        datetime.date(year, month, day)
-    except (TypeError, ValueError):
+    dates = _iter_query_dates(query)
+    if not dates:
         return ""
     return (
         'python -c "import datetime;'
-        f" t=datetime.datetime({year},{month},{day});"
+        " n=datetime.datetime.now().astimezone();"
+        f" t={dates[0].datetime_expr()};"
         " print('target:',t.strftime('%Y-%m-%d (%A)'))\""
     )
 
 
 #: 「あと何日」「何日間」「残り日数」等、**2 点間の日数** を尋ねる語。
 _DAY_COUNT_ASK_RE = re.compile(
-    r"何日間|あと何日|残り\s*(?:の)?\s*日数|日数は|何日ある|何日です"
+    # ``何日です`` は「何月何日ですか」(= 日付を訊く問い) も飲み込む。年なし日付を
+    # 読むようになって初めて実害が出た: 「9 月 14 日の 3 週間前は何月何日ですか？」
+    # が日数カウント側に取られ、``days: 20`` (今日から 9/14 までの日数) を返した。
+    # 直前が ``何月`` のときだけ除外し、「あと何日ですか」は従来どおり拾う。
+    r"何日間|あと何日|残り\s*(?:の)?\s*日数|日数は|何日ある|(?<!何月)何日です"
     r"|まで(?:は)?\s*何日"
     r"|(?<![A-Za-z])how\s+many\s+days(?![A-Za-z])"
     r"|(?<![A-Za-z])days\s+(?:left|remaining|until)(?![A-Za-z])",
     re.IGNORECASE,
 )
+
+#: 「今週 / 来週 / 再来週 / 先週 / 先々週」の何曜日、という指定。
+#:
+#: 相対オフセット (``_RELATIVE_OFFSET_RE``) は数字を要求するので掛からず、
+#: 絶対日付でもないため **now-only コマンドへ落ちて曜日→日付の変換が丸ごと
+#: モデルの暗算に残っていた**。当たるかどうかは運になる。
+#:
+#: 実インシデント (2026-08-26 ライブ監査 T9-3): 当日 8/26 (水) に
+#: 「来週の金曜日に歯科の予約があります。」と伝えたところ「来週の金曜日は
+#: 2026年8月28日」と応答した。8/28 は **今週の**金曜で、来週の金曜は 9/4。
+#: 前日の監査では同型の「来週の月曜日」に正答しており、暗算の当否が
+#: 揺れていることが確認できる。
+#:
+#: 週の起点は月曜 (ISO / 日本の慣行)。``今週`` はその週、``来週`` は +7 日、
+#: ``再来週`` は +14 日、``先週`` は -7 日、``先々週`` は -14 日。
+_WEEK_OFFSETS: dict[str, int] = {
+    "今週": 0, "こんしゅう": 0,
+    "来週": 7, "らいしゅう": 7,
+    "再来週": 14, "さらいしゅう": 14,
+    "先週": -7, "せんしゅう": -7,
+    "先々週": -14, "せんせんしゅう": -14,
+}
+
+#: 曜日名 → ``datetime.weekday()`` の値 (月曜 = 0)。
+_WEEKDAY_INDEX: dict[str, int] = {
+    "月": 0, "火": 1, "水": 2, "木": 3, "金": 4, "土": 5, "日": 6,
+}
+
+_WEEK_OF_WEEKDAY_RE = re.compile(
+    r"(先々週|再来週|今週|来週|先週|こんしゅう|らいしゅう|さらいしゅう"
+    r"|せんせんしゅう|せんしゅう)"
+    r"\s*の?\s*([月火水木金土日])曜",
+)
+
+
+def _week_of_weekday_command(query: str) -> str:
+    """「来週の金曜日」型の指定を Python に解かせるコマンドを返す。
+
+    該当しなければ空文字列 (呼び出し側が従来のコマンドへ倒す)。
+    週の起点は月曜で計算する (:data:`_WEEK_OFFSETS`)。
+    """
+    m = _WEEK_OF_WEEKDAY_RE.search(query or "")
+    if m is None:
+        return ""
+    offset = _WEEK_OFFSETS.get(m.group(1))
+    weekday = _WEEKDAY_INDEX.get(m.group(2))
+    if offset is None or weekday is None:
+        return ""
+    return (
+        'python -c "import datetime;'
+        " n=datetime.datetime.now().astimezone(); t=n.date();"
+        # その週の月曜へ寄せてから、週オフセットと曜日を足す。
+        f" w=t-datetime.timedelta(days=t.weekday())+datetime.timedelta(days={offset}+{weekday});"
+        " print('now:',n);"
+        " print('target:',w.strftime('%Y-%m-%d (%A)'))\""
+    )
+
 
 #: 「今年の残り」「年末まで」— 年末までの日数。
 _YEAR_REMAINDER_RE = re.compile(
@@ -259,6 +339,68 @@ def _iter_absolute_dates(query: str) -> list[tuple[int, int, int]]:
     return found
 
 
+#: ``_iter_query_dates`` が返す 1 件。``year`` が ``None`` なら年が書かれて
+#: いない日付で、コマンド側では ``n.year`` (実行時の年) で埋める。
+#: ``start`` はクエリ内の出現位置 (相対オフセットの基点判定に使う)。
+@dataclass(frozen=True, slots=True)
+class _QueryDate:
+    year: int | None
+    month: int
+    day: int
+    start: int
+    end: int
+
+    def date_expr(self) -> str:
+        """``datetime.date(...)`` 式 (年なしは実行時の ``n.year`` で埋める)。"""
+        year = str(self.year) if self.year is not None else "n.year"
+        return f"datetime.date({year},{self.month},{self.day})"
+
+    def datetime_expr(self) -> str:
+        """``datetime.datetime(...)`` 式 (年なしは実行時の ``n.year``)。"""
+        year = str(self.year) if self.year is not None else "n.year"
+        return f"datetime.datetime({year},{self.month},{self.day})"
+
+
+def _iter_query_dates(query: str) -> list[_QueryDate]:
+    """クエリ中の日付を出現順に返す (年なしの「9 月 14 日」も含む)。
+
+    年が揃った日付を先に採り、その範囲に重なる年なしマッチは捨てる
+    (「2026年9月14日」の中の「9月14日」を二重に数えないため)。年なしの月日は
+    その年の実在日として妥当なもの (うるう年を跨ぐ 2/29 も含めて 1〜12 月 /
+    1〜31 日) だけ採用する。
+    """
+    q = query or ""
+    found: list[_QueryDate] = []
+    spans: list[tuple[int, int]] = []
+    for m in _ABSOLUTE_DATE_RE.finditer(q):
+        parts = m.groups()
+        triple = parts[:3] if parts[0] is not None else parts[3:]
+        try:
+            year, month, day = (int(v) for v in triple)
+            datetime.date(year, month, day)
+        except (TypeError, ValueError):
+            continue
+        found.append(_QueryDate(year, month, day, m.start(), m.end()))
+        spans.append((m.start(), m.end()))
+    for m in _PARTIAL_DATE_RE.finditer(q):
+        if any(s <= m.start() < e for s, e in spans):
+            continue
+        parts = m.groups()
+        pair = parts[:2] if parts[0] is not None else parts[2:]
+        try:
+            month, day = (int(v) for v in pair)
+        except (TypeError, ValueError):
+            continue
+        # 年が分からないのでうるう年を仮定して実在判定する (2/29 を落とさない)。
+        try:
+            datetime.date(2024, month, day)
+        except ValueError:
+            continue
+        found.append(_QueryDate(None, month, day, m.start(), m.end()))
+    found.sort(key=lambda d: d.start)
+    return found
+
+
 def _day_count_command(query: str) -> str:
     """日数を数えるクエリ用に、差分まで Python に計算させるコマンドを返す。
 
@@ -280,27 +422,31 @@ def _day_count_command(query: str) -> str:
 
     対応するのはクエリだけで両端が決まる 3 形:
 
-    1. 絶対日付が 2 つ → その差
-    2. 絶対日付が 1 つ → 今日との差
+    1. 日付が 2 つ → その差
+    2. 日付が 1 つ → 今日との差
     3. 「今年の残り / 年末まで」 → 今日から 12/31 までの差
+
+    日付は年なし (「9 月 14 日」) も対象で、年は実行時に ``n.year`` で埋める
+    (:data:`_PARTIAL_DATE_RE`)。年を要求していた頃は「9 月 14 日まであと何日
+    ですか？」が now-only コマンドへ落ち、日数はモデルの暗算に残っていた。
     """
     if not _DAY_COUNT_ASK_RE.search(query or ""):
         return ""
-    dates = _iter_absolute_dates(query)
+    dates = _iter_query_dates(query)
     if len(dates) >= 2:
-        (y1, m1, d1), (y2, m2, d2) = dates[0], dates[1]
+        a, b = dates[0], dates[1]
         return (
             'python -c "import datetime;'
-            f" a=datetime.date({y1},{m1},{d1}); b=datetime.date({y2},{m2},{d2});"
+            " n=datetime.datetime.now().astimezone();"
+            f" a={a.date_expr()}; b={b.date_expr()};"
             " print('from:',a); print('to:',b);"
             " print('days:',abs((b-a).days))\""
         )
     if len(dates) == 1:
-        y, mo, d = dates[0]
         return (
             'python -c "import datetime;'
             " n=datetime.datetime.now().astimezone(); t=n.date();"
-            f" a=datetime.date({y},{mo},{d});"
+            f" a={dates[0].date_expr()};"
             " print('now:',n); print('target:',a);"
             " print('days:',(a-t).days)\""
         )
@@ -346,6 +492,17 @@ _PRESENT_ANCHOR_RE = re.compile(
 )
 
 
+def _relative_anchor(query: str, offset_start: int) -> "_QueryDate | None":
+    """相対オフセットの基点になる日付を返す (無ければ ``None`` = 今日基点)。
+
+    採るのは **オフセット表現より前に完全に現れている** 日付だけ。重なりを
+    許すと「9 月 14 日前」のような表現で ``14日前`` を相対オフセット、
+    ``9月14日`` を基点として二重に読んでしまう。
+    """
+    candidates = [d for d in _iter_query_dates(query) if d.end <= offset_start]
+    return candidates[-1] if candidates else None
+
+
 def _is_past_fact_recall(query: str) -> bool:
     """現在日時ではなく「以前述べられた日付」を訊いているか (純粋関数)。"""
     q = query or ""
@@ -366,11 +523,27 @@ def _build_datetime_command(query: str) -> str:
     年月日が揃った絶対日付の曜日を尋ねる場合も同じ理由で Python に計算させる
     (``_absolute_weekday_command``)。2 点間の日数も同様 (``_day_count_command``)。
 
+    相対表現の **基点** は既定では今日だが、クエリ内でオフセット表現より前に
+    日付が書かれていればその日付を基点にする。基点を常に今日にしていたため
+    「9 月 14 日の 3 週間前は何月何日ですか？」が *今日から* 3 週間前を計算し、
+    ``target: 2026-08-04`` (正しくは 8/24) を出力していた
+    (2026-08-25 ライブ監査 T2-9)。
+
     どれでもなければ従来どおり現在日時のみを返す。
     """
+    # 日数カウントは **両端が決まるときだけ** コマンドを返す。返せたならそれが
+    # 最も具体的なので優先する。
     day_count = _day_count_command(query)
     if day_count:
         return day_count
+    # 「来週の金曜日」型は数字を伴わないので相対オフセットに掛からず、絶対日付
+    # でもないため now-only へ落ちて曜日→日付の変換が暗算に残っていた。
+    # 日数カウントが空を返した後に見る — 「今週の金曜日は何日ですか？」は
+    # ``何日です`` で日数側の語彙に掛かるが両端が決まらず空になるので、ここで
+    # 拾える (now-only より常に情報が多い)。
+    week_of = _week_of_weekday_command(query)
+    if week_of:
+        return week_of
     m = _RELATIVE_OFFSET_RE.search(query or "")
     if m is None:
         absolute = _absolute_weekday_command(query)
@@ -387,23 +560,32 @@ def _build_datetime_command(query: str) -> str:
     n = int(m.group(1))
     signed = -n if m.group(3) == "前" else n
 
+    anchor = _relative_anchor(query, m.start())
+    if anchor is None:
+        base = " b=n;"
+        base_echo = ""
+    else:
+        base = f" b={anchor.datetime_expr()};"
+        base_echo = " print('base:',b.strftime('%Y-%m-%d'));"
+
     if kind in ("days", "weeks"):
-        body = f" t=n+datetime.timedelta({kind}={signed});"
+        body = base + f" t=b+datetime.timedelta({kind}={signed});"
     else:
         # 月/年は timedelta で表せない。月末クランプ (1/31 の 1 か月後 = 2/28 等)
         # を含めて構築する。``calendar`` は readonly guard の許可モジュール外、
         # ``datetime.replace`` は禁止属性なのでコンストラクタで組み立てる。
-        total = " tm=(n.year*12+n.month-1)+" + str(
+        total = " tm=(b.year*12+b.month-1)+" + str(
             signed * 12 if kind == "years" else signed,
         ) + ";"
         body = (
-            total
+            base
+            + total
             + " y=tm//12; mo=tm%12+1;"
             " lp=(y%4==0 and (y%100!=0 or y%400==0));"
             " dim=[31,29 if lp else 28,31,30,31,30,31,31,30,31,30,31][mo-1];"
-            " t=datetime.datetime(y,mo,min(n.day,dim));"
+            " t=datetime.datetime(y,mo,min(b.day,dim));"
         )
-    return _REL_PREFIX + body + _REL_SUFFIX
+    return _REL_PREFIX + body + base_echo + _REL_SUFFIX
 
 # Python 実行で正確に答えられるシステム情報クエリのコマンドマッピング
 # パターンにマッチしたクエリに対して、具体的な Python コマンドを生成する。
