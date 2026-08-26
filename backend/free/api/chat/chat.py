@@ -1428,7 +1428,6 @@ async def _dispatch_deliberative(
         config=cfg,
         tool_judge=state.tool_call_judge,
         tools_registry=state.tools_registry,
-        judge_experience_recorder=state.judge_experience_recorder,
         agent_tracer=state.agent_tracer,
         # コンテンツ生成 max_tokens を create_model の実窓に合わせる
         mode=req.mode,

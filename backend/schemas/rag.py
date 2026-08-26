@@ -69,104 +69,6 @@ class ContextualPrefixConfig(BaseModel):
     prompt_template: str = ""
 
 
-class SelfRagQualityJudgeConfig(BaseModel):
-    """Self-RAG 補助タスク品質再判定設定
-
-    ルールベース Self-RAG の quality 判定が ``only_when_quality`` に
-    該当した場合に、補助タスク LLM による品質再判定で marginal な
-    検索結果を救済する。セッション / クエリ単位で発火上限を設けて、
-    ユーザ体感レイテンシと補助タスク負荷への影響を抑える。
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    # 機能の有効/無効。無効時はルールベース判定のみで確定する。
-    enabled: bool = True
-    # 発火する top_score の上限。この値以上のスコアでは発火しない。
-    #
-    # 実効果は「medium → low への格下げ (= チャンク破棄)」のみで、
-    # medium と high は Step 6.5 で同じ扱い (どちらも添付) になる。つまり
-    # medium → high の再判定は 6 秒かけて何も変えない。
-    #
-    # 実測 (2026-08-01、11 発火の top_score → 判定):
-    #   0.653 low / 0.659 low / 0.712 high / 0.721 high / 0.723 high /
-    #   0.727 low / 0.758 high / 0.768 high / 0.776 high / 0.784 high / 0.814 high
-    # 格下げは 0.727 以下に集中し、0.75 で切ると観測された格下げ 3/3 を保ったまま
-    # 発火を 11 → 6 (45% 減) にできる。**きれいな分離ではない** (0.727 が
-    # upgrade 帯 0.712〜0.814 に食い込む) ため、これ以上絞ると格下げを取りこぼす。
-    # 標本 11 件なので、値を動かすときは上の表を取り直すこと。
-    # 0 以下で無効化 (= 従来どおり only_when_quality 帯全域で発火)。
-    max_top_score: float = Field(default=0.75, ge=0.0, le=1.0)
-    # 1 セッション (session_id 単位) で発火可能な最大回数。0 以下で無制限。
-    # 上限超過時は raw hybrid 結果で返し、DebugLogger に
-    # ``judge_skipped_reason="session_cap"`` を記録する。
-    max_per_session: int = Field(default=5, ge=0)
-    # 1 クエリ (= 1 unified_search 呼び出し) 内の最大発火回数。
-    # 現行実装では LLM 再判定は 1 クエリあたり 1 回しか呼ばれないが、
-    # 将来の多段判定導入に備えた防御線として残す。0 以下で無制限。
-    max_per_query: int = Field(default=1, ge=0)
-    # 発火条件の quality ラベル集合。ルールベース判定がこのいずれかに
-    # 該当した場合のみ LLM 再判定を呼ぶ。既定は marginal ラベルのみ
-    # (high = 高信頼なので不要、low = クエリ拡張フォールバック側で処理)。
-    only_when_quality: list[str] = Field(default_factory=lambda: ["medium"])
-
-    @model_validator(mode="after")
-    def validate_only_when_quality(self) -> "SelfRagQualityJudgeConfig":
-        valid = {"high", "medium", "low"}
-        invalid = [q for q in self.only_when_quality if q not in valid]
-        if invalid:
-            raise ValueError(
-                "self_rag.quality_judge.only_when_quality に不正な値があります: "
-                f"{invalid}。許容値は {sorted(valid)}",
-            )
-        return self
-
-
-class SelfRagNecessityJudgeConfig(BaseModel):
-    """Self-RAG 補助タスク検索必要性判定設定
-
-    ルールで `retrieve` / `skip` を確定できない短い質問 (uncertain) のみ
-    補助タスクに 1 bit JSON (`{"need_rag": bool}`) を問い、`true` なら
-    retrieve、`false` なら skip。失敗 / タイムアウト / 上限到達時は安全側
-    (`retrieve`) にフォールバック。
-
-    **既定は無効** (2026-08-01 プロファイリングの結果)。この判定は「検索を
-    実行すべきか」を決めるゲートだが、実測で **ゲートがゲート対象の 165 倍**
-    高くついていた:
-
-        necessity judge   median 3,407ms  (2,552〜4,165ms)
-        retrieval (実作業) median    21ms  (7〜24ms)
-
-    21ms の作業を回避するかどうかを決めるのに 3.4 秒かける構図で、`skip` と
-    判定されたターンでも判定料金だけは必ず発生する (実測: 3,827ms かけて
-    21ms の作業を回避)。無効時は `judge()` が `uncertain → retrieve` の
-    安全側に倒すため、取りこぼしではなく「常に引く」方向へ縮退する。
-    無関係チャンクの混入は下流の品質判定 (Step 5) と
-    「品質 low は添付しない」(Step 6.5) が既に防いでいる。
-
-    有効化すると LLM 1 往復ぶんのレイテンシと引き換えに、検索を省く判断が
-    得られる。コーパスが十分大きく retrieval が実測で秒オーダーになる環境では
-    再検討する価値がある (その場合は上の実測値を取り直すこと)。
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    # 機能の有効/無効。無効時は純ルール判定のみで確定する
-    # (uncertain は安全側の retrieve に倒れる)。
-    enabled: bool = False
-    # 1 セッション (session_id 単位) で発火可能な最大回数。0 以下で無制限。
-    max_per_session: int = Field(default=10, ge=0)
-    # 1 クエリ内の最大発火回数。0 以下で無制限。
-    max_per_query: int = Field(default=1, ge=0)
-    # tracker キー互換 (本機能の quality ラベルは "uncertain" のみ)
-    only_when_quality: list[str] = Field(default_factory=lambda: ["uncertain"])
-    # 補助タスク wall-clock 上限 (秒)。超過時は安全側 retrieve にフォールバック。
-    timeout_s: float = Field(default=5.0, gt=0.0, le=60.0)
-    # 判定プロンプトに埋め込む直前ターン数 (user + assistant 合計)。
-    # 0 で会話文脈を含めない (旧挙動)。1〜2 が推奨。
-    context_turns: int = Field(default=2, ge=0, le=10)
-
-
 class SelfRagContentGateConfig(BaseModel):
     """取得直後の chunk 内容精査ゲート設定 (heuristics-first + 境界 LLM 判定)
 
@@ -204,29 +106,10 @@ class SelfRagContentGateConfig(BaseModel):
     max_per_query: int = Field(default=1, ge=0)
 
 
-class SelfRagRecallConfig(BaseModel):
-    """RAG necessity/quality の embedding 決定論的リコール設定
-
-    ``ToolCallJudge._try_recall_url`` / ``_try_recall_executable_command``
-    と同型の閾値構成。necessity_recall / quality_recall で共用する
-    (両者ともフィールド構成が同一のため)。
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = True
-    topk: int = Field(default=5, ge=1, le=50)
-    min_score: float = Field(default=0.75, ge=0.0, le=1.0)
-    min_record_score: float = Field(default=0.65, ge=0.0, le=1.0)
-    record_history_size: int = Field(default=10, ge=1, le=100)
-    ttl_days: int = Field(default=14, ge=0)
-
-
 class SelfRagConfig(BaseModel):
     """Self-RAG 設定ルート
 
-    ルールベース Self-RAG の補助機能 (補助タスク LLM 再判定 / 検索必要性
-    判定) をネスト構造に集約する。
+    ルールベース Self-RAG の閾値と content gate をネスト構造に集約する。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -263,21 +146,35 @@ class SelfRagConfig(BaseModel):
     # 到達不能になりゲートが閉じたままになる (実測 LFM2.5-Embedding-350M で
     # 記憶採用 0 件)。既定を ``auto`` にしてモデル差を吸収する。
     threshold_mode: Literal["auto", "manual"] = "auto"
-    quality_judge: SelfRagQualityJudgeConfig = Field(
-        default_factory=SelfRagQualityJudgeConfig,
-    )
-    necessity_judge: SelfRagNecessityJudgeConfig = Field(
-        default_factory=SelfRagNecessityJudgeConfig,
-    )
     content_gate: SelfRagContentGateConfig = Field(
         default_factory=SelfRagContentGateConfig,
     )
-    necessity_recall: SelfRagRecallConfig = Field(
-        default_factory=SelfRagRecallConfig,
-    )
-    quality_recall: SelfRagRecallConfig = Field(
-        default_factory=SelfRagRecallConfig,
-    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_removed_judge_sections(cls, data: object) -> object:
+        """LLM 再判定とその決定リコールの旧セクションを明示的に拒否する。
+
+        専用アシストモデル撤去 (2026-08-14) で LLM 版の検索必要性 / 品質判定は
+        消え、残っていた決定リコール (``*_recall``) も供給元が無いまま読み側
+        だけが動いていたため 2026-08-26 に削除した。``extra="forbid"`` の
+        素のエラーだと「どのキーを消せばよいか」が伝わらないので、
+        ``reject_legacy_reranker_section`` と同じ形で理由を示す。
+        """
+        removed = [
+            k for k in ("quality_judge", "necessity_judge",
+                        "necessity_recall", "quality_recall")
+            if isinstance(data, dict) and k in data
+        ]
+        if removed:
+            raise ValueError(
+                "rag.self_rag must not contain "
+                f"{', '.join(removed)} anymore. LLM-based retrieval "
+                "necessity/quality judging and its decision recall were "
+                "removed; retrieval necessity is decided by rules and quality "
+                "by vector thresholds. Remove these keys from config.yaml.",
+            )
+        return data
 
 
 class RAGConfig(BaseModel):
@@ -345,8 +242,6 @@ class RAGConfig(BaseModel):
     confidence_threshold: float = Field(default=0.80, ge=0.0, le=1.0)
     hysteresis_band: float = Field(default=0.02, ge=0.0, le=0.5)
     # --- Self-RAG 補助機能 ---
-    # 旧 `aux_judge_enabled` は本ネスト構造 (`self_rag.quality_judge.enabled`)
-    # へ移行された。後方互換は維持しない。
     self_rag: SelfRagConfig = Field(default_factory=SelfRagConfig)
 
     @model_validator(mode="after")

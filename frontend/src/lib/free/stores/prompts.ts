@@ -18,7 +18,7 @@ import { addToast } from './toast';
 /** 選択中のプロンプト識別子 */
 export interface PromptSelection {
 	category: PromptCategory;
-	id: string; // mode (chat/create) or task (rag_necessity/...)
+	id: string; // mode (chat/create) or task (note_evolve/...)
 }
 
 // PromptCategory と PromptDetailWithScore を re-export
@@ -58,7 +58,7 @@ export const historyOpen = writable(false);
 let originalContent = '';
 
 /** 補助タスクプロンプトのデフォルトタスク一覧 */
-const DEFAULT_AUX_TASKS = ['rag_necessity', 'rag_quality', 'tool_call', 'note_evolve'];
+const DEFAULT_AUX_TASKS = ['note_evolve'];
 
 /** API未取得時のフォールバック用補助タスクプロンプト一覧 */
 function defaultAuxPrompts(): AuxPromptListItem[] {

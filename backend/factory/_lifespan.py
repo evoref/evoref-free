@@ -148,16 +148,6 @@ def _shutdown_experience_save(exp_buf: "ExperienceBuffer", exp_file: Path) -> No
         logger.warning("Experience buffer save failed: %s", e)
 
 
-async def _shutdown_aux_experience_save(aux_exp_buf: Any, resolver: Any) -> None:
-    """補助タスク経験バッファを保存 (Level 1 Phase 2 の学習信号)。"""
-    if aux_exp_buf is None:
-        return
-    try:
-        await aux_exp_buf.save(resolver.resolve_learning("aux_experience_file"))
-    except Exception as e:
-        logger.warning("Aux experience buffer save failed: %s", e)
-
-
 def _shutdown_patterns_save(
     learned_patterns_store: "LearnedPatternStore", patterns_file: Path,
 ) -> None:
@@ -286,8 +276,6 @@ async def _run_lifespan_shutdown(
         _shutdown_semmem_index_flush(state)
     with _timed(shutdown_timings, "experience_save"):
         _shutdown_experience_save(ctx.exp_buf, ctx.exp_file)
-    with _timed(shutdown_timings, "aux_experience_save"):
-        await _shutdown_aux_experience_save(ctx.aux_exp_buf, ctx.resolver)
     with _timed(shutdown_timings, "patterns_save"):
         _shutdown_patterns_save(ctx.learned_patterns_store, ctx.patterns_file)
     with _timed(shutdown_timings, "loop_run_cancel"):

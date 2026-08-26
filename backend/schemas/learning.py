@@ -98,15 +98,15 @@ class LearningConfig(BaseModel):
     # Level 2 base LoRA アダプタ (Pro) のパーティション粒度。
     # 対象は LoRA のみ (control vector / cvector は本設定の対象外、常にモデル単位で
     # 不変 — ランタイム hot-swap 不可 + GGUF 再ロードが高コストなため)。
-    # "model" (既定): LoRA はモデル単位 (両モードの経験を 1 アダプタにプール)。
-    #   chat↔create 切替で base サーバを LoRA 差分では再起動しない。
-    #   プロンプト/fewshot/policy/experience は (model×mode) で分離されるため
-    #   軽量側のモード差は保たれる。
-    # "model_mode": LoRA を (model×mode) で分け、モード切替時に
-    #   LoRA パスが変わっていれば該当サーバを再起動して切り替える
-    #   (プロセス再起動方式、切替レイテンシ増を許容する strict モード)。
+    # "model_mode" (既定): LoRA を (model×mode) で分け、chat/create で別々に
+    #   訓練・保存し、モード切替時に LoRA パスが変わっていれば該当サーバを
+    #   再起動して切り替える。同一モデルを両モードで使う構成でも
+    #   chat 用 / create 用のアダプタは混ざらない。
     #   partition_by_base_model=true を前提とする (model_validator で強制)。
-    level2_adapter_partition: Literal["model", "model_mode"] = "model"
+    # "model": LoRA はモデル単位 (両モードの経験を 1 アダプタにプール)。
+    #   chat↔create 切替で base サーバを LoRA 差分では再起動しないため
+    #   切替レイテンシを最優先したい場合のレガシー互換値。
+    level2_adapter_partition: Literal["model", "model_mode"] = "model_mode"
 
     level1_min_experiences: int = Field(default=20, ge=1)
     level1_generations: int = Field(default=10, ge=1)

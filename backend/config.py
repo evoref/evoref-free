@@ -56,10 +56,8 @@ class PathResolver:
         "control_vector_adapter": "local/models/control_vector.gguf",
         "control_vector_versions_dir": "local/models/control_vector_versions/",
         "cvector_work_dir": "local/cvector/",
-        "aux_experience_file": "local/aux_experience.json",
         "aux_prompts_dir": "local/aux_prompts/",
         "aux_calibration_file": "local/aux_calibration.json",
-        "rag_judge_events_file": "local/rag_judge_events.jsonl",
         "lora_archive_dir": "local/lora_archive/",
         "embed_lora_adapter": "local/models/embed_adapter.gguf",
         "embed_lora_versions_dir": "local/models/embed_lora_versions/",
@@ -94,11 +92,9 @@ class PathResolver:
     _LEARNING_SUBPATH = {
         "experience_file": "experience.json",
         "prompts_dir": "prompts",
-        # 補助タスク (rag_necessity / rag_quality / tool_call / note_evolve) の
-        # プロンプトと経験。判定はベースモデルが行うので base 軸で分離する
-        # (モデルを替えたら進化済みの文面を引き継がず既定から作り直す)。
+        # 補助タスクのプロンプト。実行するのはベースモデルなので base 軸で
+        # 分離する (モデルを替えたら既定から作り直す)。
         "aux_prompts_dir": "aux_prompts",
-        "aux_experience_file": "aux_experience.json",
         "lora_adapter": "models/adapter.gguf",
         "lora_versions_dir": "models/lora_versions",
         "lora_spsa_checkpoint": "models/lora_spsa_checkpoint.json",
@@ -131,13 +127,15 @@ class PathResolver:
         # base 学習パーティション (_active_stem) とは独立した軸。
         self._active_embed_stem: str | None = None
         # Level 2 base LoRA アダプタの (mode) パーティション state。
-        # "model" (既定) では resolve_learning は mode 引数を
+        # レガシー "model" では resolve_learning は mode 引数を
         # 無視し、従来どおりモデル単位で 1 アダプタを共有する。"model_mode" のときのみ
         # chat/create で別ファイルへ分離する。AppState.current_mode の初期値と揃え、
         # active_mode の既定は "chat"。
         self._active_mode: str = "chat"
         self._adapter_partition_mode: str = str(
-            (config.get("learning", {}) or {}).get("level2_adapter_partition", "model"),
+            (config.get("learning", {}) or {}).get(
+                "level2_adapter_partition", "model_mode",
+            ),
         )
 
     def resolve_model(self, key: str) -> Path:
@@ -245,7 +243,7 @@ class PathResolver:
 
         ``mode`` は ``key`` が ``_MODE_PARTITIONED_KEYS`` に属し、かつ
         ``adapter_partition_mode=="model_mode"`` のときだけ効く (``learning_path_for``
-        参照)。省略時は ``active_mode`` を使う。"model" (既定) スキームでは mode に
+        参照)。省略時は ``active_mode`` を使う。レガシー "model" スキームでは mode に
         関わらず常に同一パスを返す (後方互換)。
         """
         if (
@@ -299,7 +297,7 @@ class PathResolver:
 
         ``mode`` は ``key in _MODE_PARTITIONED_KEYS`` かつ
         ``adapter_partition_mode=="model_mode"`` のときのみ ``<stem>/<mode>/...`` と
-        サブディレクトリを追加する。それ以外 (既定 "model" スキーム、または
+        サブディレクトリを追加する。それ以外 (レガシー "model" スキーム、または
         mode 分割対象外キー) は従来どおり ``<stem>/...`` のまま (mode を無視する)。
         """
         if key not in self._LEARNING_SUBPATH:
@@ -844,7 +842,7 @@ def get_mode_generation_params(mode: str) -> dict:
 def get_mode_lora_path(mode: str) -> Path:
     """指定モードで使用すべき base LoRA アダプタの絶対パスを解決する (存在確認はしない)。
 
-    ``learning.level2_adapter_partition=="model"`` (既定) のときは mode に依らず
+    レガシーの ``learning.level2_adapter_partition=="model"`` のときは mode に依らず
     常に同一パスを返す — ``/api/mode/switch`` の再起動判定がこの関数の戻り値を
     比較するだけで LoRA 差分による再起動要否を導けるようにするため
     (既定運用では常に等しい = 再起動トリガーなし、後方互換)。

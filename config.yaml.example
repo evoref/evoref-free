@@ -343,10 +343,8 @@ local_paths:
   learning_dir: local/learning/                      # base 学習データの (モデル×モード) パーティションルート (learning.partition_by_base_model=true 時に使用)
   experience_file: local/experience.json             # ベースモデル経験バッファ
   eval_core_file: local/eval_core.json               # ベースモデル コア評価セット
-  aux_experience_file: local/aux_experience.json     # 補助タスク (RAG 必要性/品質・ツール判定) の経験バッファ。Level 1 Phase 2 の進化が読む
   aux_prompts_dir: local/aux_prompts/                # 補助タスクのタスク別プロンプト (partition 有効時は base モデル配下へ rebase)
   aux_calibration_file: local/aux_calibration.json   # 補助タスク purpose 別 timeout の反応的自己較正値 (モデル切替後に自動調整)
-  rag_judge_events_file: local/rag_judge_events.jsonl # RAG necessity/quality 判定イベント (sleep-time が world_fact 化するまでの保持先)
   learned_patterns_file: local/learned_patterns.json # 学習済みパターン検出キーワード
   model_state_file: local/model_state.json           # モデル切替・LoRA 装着状態の永続化
   model_quality_file: local/model_quality.json       # モデル切替時の出力品質プローブ結果
@@ -548,41 +546,6 @@ rag:
     # 0.338〜0.636 に対し relevance=0.65 は一度も超えず、31 ターンの実会話で
     # 記憶採用 0 件)。auto はこのモデル差を吸収する。
     threshold_mode: auto
-    quality_judge:
-      enabled: true               # 補助タスクによる品質再判定（marginal 結果の救済）
-      # 発火する top_score の上限。実効果は medium → low の格下げ (チャンク破棄) だけで、
-      # medium → high は Step 6.5 で medium と同じ扱い (添付) なので何も変わらない。
-      # 実測 2026-08-01: 11 発火中 8 件が medium → high = 6 秒かけて挙動不変だった。
-      # 格下げは top_score 0.727 以下に集中しており、0.75 で切ると観測された格下げ
-      # 3/3 を保ったまま発火を 45% 減らせる。標本 11 件なので変更時は取り直すこと。
-      max_top_score: 0.75         # これ以上のスコアでは発火しない (0 以下で無効)
-      max_per_session: 5          # 1 セッション内の発火上限 (0 以下で無制限)
-      max_per_query: 1            # 1 クエリ内の発火上限 (0 以下で無制限)
-      only_when_quality: ["medium"]  # 発火条件の quality ラベル (high/medium/low から指定)
-    necessity_judge:
-      # 検索必要性のハイブリッド 3 値判定 (Phase 1 で旧 2 値から拡張)。
-      # ルール層 (URL含む / 明示fetch動詞 / TRIVIAL / 長文 question) で
-      # `retrieve` / `fetch` / `skip` が確定するケースは補助タスク 0 呼び出しで即返す。
-      # それ以外の uncertain ケースだけ 補助タスクに 3 値 JSON
-      # ({"action": "retrieve" | "fetch" | "skip"}) を問い合わせる。
-      # `fetch` は外部 fetch_url ツールに委ねるシグナルで、search_pipeline は
-      # `skip` 同等にローカル RAG をスキップする。
-      # 失敗 / タイムアウト / 上限到達時は安全側 (`retrieve`) にフォールバック。
-      #
-      # 既定は false。2026-08-01 の実測でゲートがゲート対象の 165 倍高くついた:
-      #   necessity judge   median 3,407ms / retrieval (実作業) median 21ms
-      # 21ms の作業を省くか決めるのに 3.4 秒かかる構図で、skip と判定した
-      # ターンでも判定料金は必ず発生する。false のときは uncertain が安全側の
-      # retrieve に倒れる (取りこぼしではなく「常に引く」方向へ縮退)。
-      # 無関係チャンクは下流の品質判定と「品質 low は添付しない」が防ぐ。
-      # コーパスが大きく retrieval が秒オーダーになる環境では true を検討する
-      # (その際は necessity_ms / retrieval_ms を実測し直すこと)。
-      enabled: false              # uncertain 時の補助タスク発火 (true で有効化)
-      max_per_session: 10         # 1 セッション内の発火上限 (0 以下で無制限)
-      max_per_query: 1            # 1 クエリ内の発火上限 (0 以下で無制限)
-      only_when_quality: ["uncertain"]  # tracker キー (互換、変更非推奨)
-      timeout_s: 5.0              # 補助タスク wall-clock 上限 (秒)
-      context_turns: 2            # 補助タスクプロンプトに含める直前ターン数 (0 で会話文脈なし)
     content_gate:
       # 取得直後 (Step 4 マージ後) の chunk 内容精査ゲート。低価値 chunk を
       # 事前 pruning し、quality judge / query expansion の候補数を
@@ -597,27 +560,6 @@ rag:
       judge_enabled: true         # marginal band の LLM 救済 (false で純ルール)
       max_per_session: 5          # 1 セッション内の LLM 判定発火上限 (0 以下で無制限)
       max_per_query: 1            # 1 クエリ内の LLM 判定発火上限 (0 以下で無制限)
-    necessity_recall:
-      # embedding 決定論的リコール (ToolCallJudge._try_recall_url と同型)。
-      # ルール判定が uncertain になったクエリについて、過去の類似クエリ +
-      # 自己採点 (sleep-time Step 8.7) から action を直接引き当て、
-      # LLM 呼出をスキップする。tracker (necessity_judge の発火上限) を
-      # 消費せず、LLM 未接続 (degraded) でも動作する。
-      enabled: true
-      topk: 5
-      min_score: 0.75             # 質問 embedding 類似度閾値 (url/command recall の 0.7 よりやや高め)
-      min_record_score: 0.65      # 過去自己採点平均の閾値
-      record_history_size: 10
-      ttl_days: 14                 # KB変化の影響を受けやすいため url recall (30日) より短め
-    quality_recall:
-      # necessity_recall と同型。ルールベース品質判定が marginal
-      # (既定 "medium") のクエリについて quality_judge の呼出をスキップする。
-      enabled: true
-      topk: 5
-      min_score: 0.75
-      min_record_score: 0.65
-      record_history_size: 10
-      ttl_days: 14
 
 # ===== 埋め込みモデル設定 =====
 embedding:
@@ -917,7 +859,7 @@ schedule:
 learning:
   # base モデルの自己学習データを (base モデル識別子 × モード) で分離する。
   partition_by_base_model: true   # true: local/learning/<base_model_stem>/ 配下へ分離しモデル切替で差し替え（未知モデルはゼロから学習）。false: レガシー flat（即ロールバック用）
-  level2_adapter_partition: model # LoRA限定(cvectorは常にモデル単位・対象外)。model（既定=モデル単位・mode切替で再起動なし）/ model_mode（mode単位・切替時にLoRAパスが変わればサーバ再起動、partition_by_base_model=true必須）
+  level2_adapter_partition: model_mode # LoRA限定(cvectorは常にモデル単位・対象外)。model_mode（既定=chat/createで別アダプタ・切替時にLoRAパスが変わればサーバ再起動、partition_by_base_model=true必須）/ model（レガシー=モデル単位でchat/create共有・mode切替で再起動なし）
   level1_min_experiences: 20      # Level 1 トリガーに必要な最小経験数
   level1_generations: 10          # Level 1 の世代数
   level1_population_size: 5       # Level 1 の集団サイズ

@@ -62,7 +62,6 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "contextual_prefix": 120.0,
     "url_relevance_score": 45.0,
     "assertion_naming": 45.0,
-    "rag_judge_relevance_score": 45.0,
     # ── 学習サイクル ─────────────────────────────────────────────────
     "critique_synthesis": 120.0,
     "policy_evolution": 120.0,

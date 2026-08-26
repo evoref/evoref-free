@@ -140,10 +140,6 @@ class ProLearnPillar:
 
     Attributes:
         components: :class:`LearnComponentsProtocol` 準拠の集約コンポーネント。
-
-    補助タスク経験バッファは Free 側 (``AppState.aux_experience_buffer``) が
-    所有する — アシストモデル撤去で判定自体がベースへ移り、Pro 限定である
-    必要がなくなったため。
     """
 
     components: "ProLearnComponents | None" = None

@@ -574,7 +574,6 @@ class DeliberativeAgent:
         config: dict | None = None,
         tool_judge: ToolCallJudge | None = None,
         tools_registry=None,
-        judge_experience_recorder=None,
         agent_tracer=None,
         mode: str = "chat",
     ):
@@ -589,9 +588,6 @@ class DeliberativeAgent:
         # _judge_and_execute_tool から明示的に渡される (こちらは直接 _execute_tool を
         # 呼ぶ既存テスト等のフォールバック用)。
         self._mode = mode
-        # aux 由来ツール判定の実行成否を aux 経験へ記録する closure。
-        # Pro/Develop 起動時のみ非 None (factory 層が注入)。None なら記録 no-op。
-        self._judge_experience_recorder = judge_experience_recorder
         # MDP トレース。develop モード時のみ非 None (factory 層が注入)。
         # deliberative の tool 判定/実行を 1 step エピソードとして記録し、
         # sleep-time Step 7.5 が episodic LTM へ取込 → Level 1 agent ドメインの
@@ -1069,22 +1065,6 @@ class DeliberativeAgent:
         )
         return True
 
-    def _record_tool_call_outcome(
-        self, query: str, judgement: ToolJudgement, success: bool, mode: str = "chat",
-    ) -> None:
-        """LLM 由来ツール判定の実行成否を補助タスク経験へ記録する (best-effort)。
-
-        rule / learned / cartridge 由来は LLM 出力ではないため記録しない
-        (プロンプト進化が学ぶのは LLM のツール判定のみ)。recorder 未注入
-        (--no-learning) なら no-op。例外は recorder 側で握り潰される。
-        ``mode`` は呼び出し元 (``_judge_and_execute_tool`` の明示引数、
-        ``self._mode`` ではなく実際の処理対象モード) をそのまま渡す。
-        """
-        rec = self._judge_experience_recorder
-        if rec is None or judgement.source != "llm":
-            return
-        rec("tool_call", query, judgement.tool_name or "", 1.0 if success else 0.0, mode)
-
     async def _judge_and_execute_tool(
         self,
         query: str,
@@ -1210,7 +1190,6 @@ class DeliberativeAgent:
         )
         if tool_result_text is None:
             # 実行されたが結果 None (失敗)。command は penalize 用に返す。
-            self._record_tool_call_outcome(query, judgement, False, mode=mode)
             return None, judgement.tool_name, command, False, judgement.source
 
         # 空振りと分かっている search_history の結果は、raw をそのまま
@@ -1234,7 +1213,6 @@ class DeliberativeAgent:
                 judgement.tool_name, len(tool_result_text), judgement.source,
                 success,
             )
-            self._record_tool_call_outcome(query, judgement, success, mode=mode)
             return (
                 tool_result_text, judgement.tool_name, command, success,
                 judgement.source,
@@ -1273,7 +1251,6 @@ class DeliberativeAgent:
             judgement.tool_name, len(tool_result_text), judgement.source,
             success,
         )
-        self._record_tool_call_outcome(query, judgement, success, mode=mode)
         return tool_result_text, judgement.tool_name, command, success, judgement.source
 
     async def _maybe_follow_up_tool(
@@ -1368,7 +1345,6 @@ class DeliberativeAgent:
             conversation=follow_conversation,
         )
         if result_text is None:
-            self._record_tool_call_outcome(query, judgement, False, mode=mode)
             return judgement.tool_name, None
         self._append_tool_result_to_last_user(
             messages, judgement.tool_name, result_text, query=query,
@@ -1377,7 +1353,6 @@ class DeliberativeAgent:
         if is_tool_error(result_text):
             self._append_unmeasured_fact_note(messages)
         success = tool_result_succeeded(judgement.tool_name, result_text)
-        self._record_tool_call_outcome(query, judgement, success, mode=mode)
         logger.info(
             "Follow-up tool executed: %s, result_length=%d, success=%s",
             judgement.tool_name, len(result_text), success,

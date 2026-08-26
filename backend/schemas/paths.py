@@ -63,6 +63,21 @@ class ModelPathsConfig(BaseModel):
         return data
 
 
+#: 機能ごと削除された ``local_paths`` キーと、その理由。
+_REMOVED_LOCAL_PATH_KEYS: dict[str, str] = {
+    "rag_judge_events_file": (
+        "RAG necessity/quality decision recall was removed (the LLM judges "
+        "that fed it are gone); necessity is decided by rules and quality by "
+        "vector thresholds"
+    ),
+    "aux_experience_file": (
+        "the aux prompt evolution loop was removed (its only remaining "
+        "prompt had no experience producer, so evolution never ran); aux "
+        "prompts are edited manually via /api/aux-prompts"
+    ),
+}
+
+
 class LocalPathsConfig(BaseModel):
     """ローカルパス（読み書き、PC 個別保存）
 
@@ -72,6 +87,23 @@ class LocalPathsConfig(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_removed_keys(cls, data: object) -> object:
+        """機能ごと削除されたキーを理由付きで拒否する。
+
+        ``extra="forbid"`` の素のエラーだと「どのキーをなぜ消すのか」が
+        伝わらないため、``reject_legacy_reranker_section`` と同じ形で示す。
+        """
+        if isinstance(data, dict):
+            for key, reason in _REMOVED_LOCAL_PATH_KEYS.items():
+                if key in data:
+                    raise ValueError(
+                        f"local_paths.{key} was removed: {reason}. "
+                        "Remove the line from config.yaml.",
+                    )
+        return data
 
     lora_adapter: str = Field(
         default="local/models/adapter.gguf",
@@ -95,12 +127,10 @@ class LocalPathsConfig(BaseModel):
     # 補助タスク (rag_necessity / rag_quality / tool_call / note_evolve) の
     # 経験バッファとプロンプト。Level 1 Phase 2 の進化が読む。partition 有効時は
     # base モデルパーティション配下へ rebase される (PathResolver._LEARNING_SUBPATH)。
-    aux_experience_file: str = "local/aux_experience.json"
     aux_prompts_dir: str = "local/aux_prompts/"
     # 補助タスク purpose 別 timeout の反応的自己較正値 (model-keyed)。
     # AuxClient がタイムアウト観測から引き上げた天井を永続化する。
     aux_calibration_file: str = "local/aux_calibration.json"
-    rag_judge_events_file: str = "local/rag_judge_events.jsonl"
     lora_archive_dir: str = "local/lora_archive/"
     embed_lora_adapter: str = Field(
         default="local/models/embed_adapter.gguf",

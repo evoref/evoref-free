@@ -30,36 +30,6 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-# ── 検索品質判定 (retrieval_quality_judge) ──
-
-class RetrievalQualityJudgement(_StrictModel):
-    """`backend/free/rag/self_rag_judge.py` の閾値境界判定。"""
-
-    quality: Literal["high", "medium", "low"]
-
-
-# ── 検索必要性判定 (retrieval_necessity_judge) ──
-
-class RetrievalNecessityJudgement(_StrictModel):
-    """`backend/free/rag/self_rag_judge.py` の uncertain 救済判定。
-
-    ルールで確定できないクエリに対して、補助タスクが 3 択で意図を返す:
-
-    - ``retrieve``: ローカル RAG (ドキュメント / 過去会話 / カートリッジ) を
-      参照する必要がある (How-to / 既知ドキュメント質問 / 過去会話参照)。
-    - ``fetch``: 外部からリアルタイムに情報を取りに行く必要がある
-      (最新ニュース / 株価 / 天気 / 公式サイトの最新状態)。RAG ではなく
-      ``fetch_url`` ツールに委ねる。
-    - ``skip``: どちらも不要な雑談 / 自明な質問。
-
-    新規追加。旧 ``need_rag: bool`` 2 値からの差分は、
-    呼出側で ``action == "skip"`` を `"skip"`、それ以外 (``retrieve`` /
-    ``fetch``) を該当値に解釈する。
-    """
-
-    action: Literal["retrieve", "fetch", "skip"]
-
-
 # ── 取得直後 content gate の関連性判定 (retrieval_chunk_gate) ──
 
 class ChunkGateRelevance(_StrictModel):
@@ -522,8 +492,6 @@ class ChatConflictJudgement(_StrictModel):
 # 文字列から自動解決する。content_type で schema が分岐する purpose
 # (``long_form_planning``) は本マップに含めず、呼出側が明示する。
 PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
-    "retrieval_quality_judge": RetrievalQualityJudgement,
-    "retrieval_necessity_judge": RetrievalNecessityJudgement,
     "retrieval_chunk_gate": ChunkGateRelevance,
     "critique_synthesis": CritiqueSynthesisResult,
     "long_form_code_review": ReviewIssues,
@@ -541,7 +509,6 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "cartridge_eval_generation": CartridgeEvalQAList,
     "url_relevance_score": UrlRelevanceJudgement,
     "assertion_naming": AssertionNaming,
-    "rag_judge_relevance_score": UrlRelevanceJudgement,
     "fewshot_quality_score": FewShotQualityJudgement,
     "editor_filename": EditorFilenameResult,
     "conflict_chat_judge": ChatConflictJudgement,

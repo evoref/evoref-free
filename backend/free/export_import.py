@@ -25,7 +25,6 @@ CATEGORY_PATHS: dict[str, list[str]] = {
     "memory": ["memory_dir"],
     "experience": [
         "experience_file", "eval_core_file",
-        "aux_experience_file",
     ],
     "rag": ["vectors_dir", "knowledge_dir"],
     "prompts": ["prompts_dir"],

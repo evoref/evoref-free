@@ -8,7 +8,7 @@
   → key_prefix = mode (例: "chat", "create")
 - 補助タスクプロンプト: `aux_{task}.md` / `aux_{task}.meta.json` /
   `history/aux_{task}_v{NNN}.md`
-  → key_prefix = f"aux_{task}" (例: "aux_rag_necessity")
+  → key_prefix = f"aux_{task}" (例: "aux_note_evolve")
 
 ここで定義する関数はすべて key_prefix を引数に取る純粋関数または薄い I/O 委譲。
 副作用は引数で受け取った Path 配下のファイル I/O のみで、ドメインロジック

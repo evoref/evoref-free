@@ -200,10 +200,12 @@ class LearningScheduler:
         )
         # Level 2 base=C: control vector (既定 'lora' = 既存 SPSA/LoRA 経路、挙動変更なし)
         self.level2_base_method: str = learning.get("level2_base_method", "lora")
-        # Level 2 base アダプタの (mode) パーティション粒度。既定 "model"
+        # Level 2 base アダプタの (mode) パーティション粒度。既定 "model_mode"
         # (chat/create で 1 アダプタ共有、挙動変更なし)。"model_mode" で
         # Level2Runner が chat/create を交互に別サイクルとして訓練する。
-        self.level2_adapter_partition: str = learning.get("level2_adapter_partition", "model")
+        self.level2_adapter_partition: str = learning.get(
+            "level2_adapter_partition", "model_mode",
+        )
         # base=spsa-real-eval: 候補 LoRA を ephemeral サーバで実推論評価する
         self.base_realeval_spsa_iterations: int = int(
             learning.get("base_realeval_spsa_iterations", 30)
@@ -260,9 +262,6 @@ class LearningScheduler:
         # 品質ゲート 還流パイプ
         self._feedback_pipe = None
         self._last_feedback_summary: dict = {}
-        # 補助タスク用コンポーネント (Pro プラグインから注入)
-        self.aux_prompt_mgr = None
-        self.aux_prompt_evolver = None
         # ランタイム注入用 callable / runner
         self._task: asyncio.Task | None = None
         self._user_active_checker = None  # callable: () -> bool
@@ -308,7 +307,6 @@ class LearningScheduler:
         cartridge_mgr=None,
         version_manager=None,
         eval_core_manager=None,
-        aux_experience_buf=None,
         debug_logger=None,
         policy: PolicyInterpreter | None = None,
         disabled: bool = False,
@@ -333,9 +331,6 @@ class LearningScheduler:
         self.cartridge_mgr = cartridge_mgr
         self.version_manager = version_manager
         self.eval_core_manager = eval_core_manager
-        # 補助タスク (rag_necessity / rag_quality / tool_call / note_evolve) の
-        # 経験バッファ。Level 1 Phase 2 の補助プロンプト進化がこれを読む。
-        self.aux_experience_buf = aux_experience_buf
         self._debug_logger = debug_logger
         self._evolver = PromptEvolver()
 
@@ -644,8 +639,6 @@ class LearningScheduler:
                 (Pro 版は ``backend.pro.learn_components.ProLearnComponents``,
                 Free 版は ``NoopLearnComponents``)。
         """
-        self.aux_prompt_mgr = components.prompt_manager
-        self.aux_prompt_evolver = components.aux_prompt_evolver
         if components.version_manager is not None:
             self.version_manager = components.version_manager
         # Level 2 拡張 (Pro 専用): level2_runner は従来の setter 経由でも
@@ -653,11 +646,8 @@ class LearningScheduler:
         if components.level2_runner is not None:
             self._level2_runner = components.level2_runner
         logger.info(
-            "Learn components injected: vm=%s, prompt_mgr=%s, "
-            "prompt_evolver=%s, l2_runner=%s",
+            "Learn components injected: vm=%s, l2_runner=%s",
             self.version_manager is not None,
-            self.aux_prompt_mgr is not None,
-            self.aux_prompt_evolver is not None,
             self._level2_runner is not None,
         )
 
@@ -959,9 +949,6 @@ class LearningScheduler:
         両経路から共有される。各 phase は未注入コンポーネント・経験不足・
         cancel を自身でガードして no-op する。
         """
-        await self._level1_phase2_aux_prompt(
-            experiences, llm_client, results, phase_durations,
-        )
         await self._level1_phase3_embed_instruction(
             experiences, llm_client, results, phase_durations,
         )
@@ -1424,17 +1411,6 @@ class LearningScheduler:
         logger.info("Level 1 manually triggered (%d experiences)", len(safe_exp))
         return True, f"Level 1 triggered with {len(safe_exp)} experiences"
 
-    def _get_filtered_aux_experiences(self) -> list:
-        """補助タスク経験バッファからカートリッジフィルタ適用済みリストを取得"""
-        if self.aux_experience_buf is None:
-            return []
-
-        current_cart_ids = None
-        if self.cartridge_mgr is not None:
-            current_cart_ids = frozenset(self.cartridge_mgr.loaded.keys())
-
-        return self.aux_experience_buf.get_filtered(current_cart_ids)
-
     async def _run_level1(
         self,
         experiences: list[dict],
@@ -1642,46 +1618,6 @@ class LearningScheduler:
             "Mode %s prompt evolved: fitness %.4f → %.4f",
             mode, evo_result.initial_fitness, evo_result.final_fitness,
         )
-
-    async def _level1_phase2_aux_prompt(
-        self,
-        experiences: list[dict],  # noqa: ARG002
-        llm_client,
-        results: dict[str, dict],
-        phase_durations: dict[str, float],
-    ) -> None:
-        """補助タスクのタスク別プロンプト進化（§7.1.2）"""
-        if self._cancelled:
-            return
-        if self.aux_prompt_evolver is None or self.aux_prompt_mgr is None:
-            return
-
-        aux_experiences = self._get_filtered_aux_experiences()
-        if not aux_experiences:
-            logger.info("Level 1 aux prompt evolution skipped: no aux experiences")
-            return
-
-        logger.info(
-            "Level 1 aux prompt evolution (%d aux experiences)",
-            len(aux_experiences),
-        )
-        tp = time.monotonic()
-        aux_results = await self.aux_prompt_evolver.evolve_all_tasks(
-            aux_experiences=aux_experiences,
-            prompt_mgr=self.aux_prompt_mgr,
-            mutator_client=llm_client,
-            generations=self.generations,
-            population_size=self.population_size,
-        )
-        phase_durations["phase2_aux_prompt"] = round(time.monotonic() - tp, 3)
-
-        # 補助プロンプトの進化結果もメインの results に含める
-        for task, evo_result in aux_results.items():
-            results[f"aux_{task}"] = {
-                "improved": evo_result.final_fitness > evo_result.initial_fitness,
-                "fitness_before": evo_result.initial_fitness,
-                "fitness_after": evo_result.final_fitness,
-            }
 
     async def _level1_phase3_embed_instruction(
         self,

@@ -55,7 +55,6 @@ from backend.free.agent.tool_judge_types import (
 )
 from backend.free.agent.tool_judge_dialogue import (
     _CALCULATE_CONTEXT_TURNS,
-    _JUDGE_CONTEXT_CHARS,
     _dialogue_text,
     _SYNTHESIS_CONTEXT_TURNS,
     _recent_dialogue_messages,
@@ -270,7 +269,6 @@ class ToolCallJudge:
 
     def __init__(
         self,
-        prompt_manager=None,
         config: dict | None = None,
         cartridge_manager: CartridgeManager | None = None,
         learned_patterns: LearnedPatternStore | None = None,
@@ -282,7 +280,6 @@ class ToolCallJudge:
     ):
         """
         Args:
-            prompt_manager: AuxPromptManager インスタンス（None でデフォルトプロンプト使用）
             config: config.yaml 全体の dict
             cartridge_manager: CartridgeManager インスタンス（None でカートリッジ hints 無効）
             learned_patterns: LearnedPatternStore インスタンス（None で学習済みパターン無効）
@@ -299,7 +296,6 @@ class ToolCallJudge:
                 記録する。``evolve`` レベル限定で実発火、それ以外は no-op。
         """
         self._llm_client = llm_client
-        self._prompt_manager = prompt_manager
         self._config = config or {}
         self._cartridge_manager = cartridge_manager
         self._learned_patterns = learned_patterns
@@ -2375,48 +2371,6 @@ class ToolCallJudge:
 
         return "", {}
 
-    def _build_system_prompt(
-        self,
-        tools_registry: ToolsRegistry,
-        mode: str,
-    ) -> str:
-        """ツール判定用システムプロンプトを構築"""
-        # AuxPromptManager からタスク別プロンプトを取得
-        if self._prompt_manager is not None:
-            try:
-                base_prompt = self._prompt_manager.get_aux_prompt("tool_call")
-            except ValueError:
-                base_prompt = _DEFAULT_SYSTEM_PROMPT
-        else:
-            base_prompt = _DEFAULT_SYSTEM_PROMPT
-
-        # ツール一覧を動的に注入
-        tool_descriptions = tools_registry.get_descriptions_text(mode)
-        return f"{base_prompt}\n\n## 利用可能なツール\n{tool_descriptions}"
-
-    def _build_user_prompt(
-        self,
-        query: str,
-        conversation: list[dict] | None,
-    ) -> str:
-        """ユーザープロンプトを構築"""
-        parts = []
-
-        # 直近の会話コンテキスト（最大2ターン）
-        if conversation:
-            recent = conversation[-4:]  # 最大2ターン分
-            context_lines = []
-            for msg in recent:
-                role = msg.get("role", "")
-                content = msg.get("content", "")[:_JUDGE_CONTEXT_CHARS]
-                if role in ("user", "assistant"):
-                    context_lines.append(f"{role}: {content}")
-            if context_lines:
-                parts.append("## 直近の会話\n" + "\n".join(context_lines))
-
-        parts.append(f"## ユーザーのリクエスト\n{query}")
-        return "\n\n".join(parts)
-
     def _parse_response(self, content: str) -> ToolJudgement:
         """補助タスクの応答をパースして ToolJudgement に変換
 
@@ -2461,24 +2415,3 @@ def _json_to_judgement(data: dict) -> ToolJudgement:
         tool_args=args,
         source="llm",
     )
-
-
-_DEFAULT_SYSTEM_PROMPT = """\
-# ツール呼び出し判定
-
-ユーザーのリクエストを分析し、ツールの使用が必要かどうかを判定してください。
-
-## 判定基準
-- ファイルの読み書きが必要 → 該当ツールを選択
-- シェルコマンドの実行が必要 → run_command を選択
-- コード検索が必要 → search_code を選択
-- ツールが不要な質問（知識・説明・会話） → ツール不要 (tool="")
-- ユーザー自身が行う宣言（「探してみるね」「自分で調べる」等の一人称の意思表明）→ 依頼ではないためツール不要 (tool="")
-
-## 出力形式
-必ず JSON オブジェクトで出力してください (**1 行のコンパクト形式**、改行・余分な空白なし):
-- ツールが必要: {"tool": "ツール名", "args": {"引数名": "値"}}
-- ツールが不要: {"tool": "", "args": {}}
-
-grammar 非強制モデルでも余計な空白で token を浪費し切り詰められないよう、空白は最小化する。
-"""

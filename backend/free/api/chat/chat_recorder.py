@@ -149,30 +149,6 @@ def _loaded_cartridge_ids(state: AppState) -> list[str]:
     return list(mgr.loaded)
 
 
-def _attach_rag_judge_answer(
-    state: AppState, user_query: str, full_response: str,
-) -> None:
-    """RAG 判定イベントへ、確定した応答本文を紐付ける。
-
-    necessity/quality の aux 判定はターンの先頭で走るため、記録時点では
-    応答本文が存在しない。ここで結びつけておかないと sleep-time のキュレータが
-    STM を引き直すことになり、light サイクルの eviction 済みターンでは答えが
-    見つからず学習信号が落ちる (2026-08-01 プロファイリング: 生成 181 件に対し
-    world_fact 化は 3 件)。
-
-    全ての ``record_*_response`` から呼ぶ。網羅は
-    ``test_chat_recorder.py::TestRagJudgeAnswerAttachment`` が静的に強制する。
-    """
-    log = getattr(state, "rag_judge_log", None)
-    if log is None or not full_response:
-        return
-    try:
-        log.attach_answer(user_query, full_response)
-    except Exception:
-        # 学習用の付随処理。応答パスを壊さない。
-        logger.debug("rag judge answer attachment failed", exc_info=True)
-
-
 def _existing_summary(mgr, session_id: str) -> str | None:
     """既に生成済みのセッション要約を引き継ぐ (未生成なら ``None``)。
 
@@ -440,8 +416,6 @@ def record_response(
     run_command 実行ターンの learning メタで、assistant note に載せて
     sleep-time の executable_command_curator が参照する (それ以外は None)。
     """
-    _attach_rag_judge_answer(state, user_query, full_response)
-
     # メモリに応答を記録
     mem_sys = state.get_memory_system()
     if mem_sys and full_response:
@@ -525,8 +499,6 @@ def record_meta_cognitive_response(
 
     ``private=True`` の場合は WM/STM までの伝搬のみ
     """
-    _attach_rag_judge_answer(state, user_query, full_response)
-
     # メモリに応答を記録
     mem_sys = state.get_memory_system()
     if mem_sys and full_response:
@@ -603,8 +575,6 @@ def record_long_form_response(
 
     ``private=True`` の場合は WM/STM までの伝搬のみ
     """
-    _attach_rag_judge_answer(state, user_query, full_response)
-
     # メモリに応答を記録
     mem_sys = state.get_memory_system()
     if mem_sys and full_response:

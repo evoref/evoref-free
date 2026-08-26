@@ -18,7 +18,7 @@ FactType を決める。ところが **日本語の断定の大半は「です�
 設計上は抽出する意図) が、候補タグが 1 段手前で空だったため届いていなかった。
 
 そこで **命名だけを補助タスクへ出す**。Step 8.5 (url) / 8.6
-(executable_command) / 8.7 (rag_judge) と同じ curator 型で、SemMem 書込は
+(executable_command) と同じ curator 型で、SemMem 書込は
 sleep-time に閉じる (CLAUDE.md §6 不変則 #2)。
 
 設計ポリシー:

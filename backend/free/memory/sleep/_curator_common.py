@@ -1,12 +1,12 @@
-"""sleep-time キュレーター 3 兄弟の共通処理。
+"""sleep-time キュレーターの共通処理。
 
-``url_curator`` / ``rag_judge_curator`` / ``executable_command_curator`` は
+``url_curator`` / ``executable_command_curator`` / ``assertion_curator`` は
 「直近ノートから対を集める → 補助タスクで採点 → 既存ファクトと突合 → 書き戻す」
 という同型のパイプラインで、下記のヘルパを各ファイルへ byte 一致で書き写して
 いた。片方だけ直すと採点や subject の体裁がずれるため 1 箇所へ集約する。
 
-**subject の組み立て自体は共有しない**: url は host、rag_judge は種別テーブル、
-executable_command は正規化 mode と、prefix の決め方が本質的に異なる。共通なのは
+**subject の組み立て自体は共有しない**: url は host、executable_command は
+正規化 mode と、prefix の決め方が本質的に異なる。共通なのは
 「正規化済みテキストの sha1 先頭 12 桁」までなので、そこだけを
 ``subject_digest()`` として切り出す。
 """
