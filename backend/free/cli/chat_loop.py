@@ -37,6 +37,7 @@ from backend.free.cli.renderer import (
 from backend.free.cli.cli_theme import CLITheme
 from backend.free.cli.split_layout import SplitLayout, is_split_available
 from backend.error_handlers import E6001, E6004
+from backend.free.llm.local_client import truncation_notice
 from backend.i18n_helper import msg
 from backend.log_config import get_logger
 
@@ -55,6 +56,7 @@ class _ChatStreamState:
     - `error_received`: サーバーからエラーフレーム受信済み
     - `post_token_gap_shown`: テキスト→ステップ間の空行を表示済み (1 回のみ)
     - `shell_out_requests`: バックエンドから受信したシェルアウト要求コマンド列
+    - `output_truncated`: 応答が出力トークン上限で途中終了した (開示用)
     """
 
     full_response: str = ""
@@ -65,6 +67,7 @@ class _ChatStreamState:
     error_received: bool = False
     post_token_gap_shown: bool = False
     shell_out_requests: list[str] = field(default_factory=list)
+    output_truncated: bool = False
 
 
 def _build_chat_payload(
@@ -241,6 +244,11 @@ async def _process_sse_frame(
         )
     if "token_info" in data:
         _handle_token_info_frame(data["token_info"], sess_state)
+    if "output_truncated" in data:
+        # 本文には足さない。注記が応答本文に入ると履歴へ保存され、次ターンで
+        # モデルが逐語復唱する (StreamOutcome の docstring 参照)。表示は
+        # ストリーム終端 (_finalize_chat_stream) で本文の後ろに 1 行出す。
+        state.output_truncated = True
 
 
 def _render_chat_error(
@@ -291,6 +299,8 @@ async def _finalize_chat_stream(
     if non_interactive:
         sys.stdout.write("\n")
         sys.stdout.flush()
+        if state.output_truncated:
+            print(truncation_notice().strip(), file=sys.stderr)
         return
     if md_renderer:
         flushed = think_filter.flush()
@@ -301,6 +311,9 @@ async def _finalize_chat_stream(
         md_renderer.render_end_marker()
     else:
         console.print()  # 改行
+    if state.output_truncated:
+        # 本文の外に出す (``state.full_response`` には積まない)。
+        console.print(truncation_notice().strip(), style="yellow")
 
 
 async def chat_stream(

@@ -11,6 +11,10 @@ import re
 from pathlib import Path
 from backend.free.core.intent_vocab import EXPLICIT_WINDOWS_PATH_RE
 
+#: パス区切り (ドライブ接頭辞 / スラッシュ / バックスラッシュ) を含むか。
+#: 含まない = 裸のファイル名で、どのディレクトリか未確定。
+_PATH_SEPARATOR_RE = re.compile(r"[\\/]")
+
 # ---------------------------------------------------------------------------
 # システムプロンプト
 # ---------------------------------------------------------------------------
@@ -254,3 +258,56 @@ def read_existing_file(file_path: str) -> str:
         except Exception:
             pass
     return ""
+
+
+def resolve_read_path(
+    file_path: str, query: str, conversation: list[dict] | None,
+) -> str:
+    """read_file の裸のファイル名を、文脈で確定しているディレクトリへ解決する。
+
+    書込み側には解決層が 2 つ (``_resolve_referenced_path`` = 会話に同じ
+    basename のフルパスがある / ``_resolve_write_path`` = クエリのパスの
+    **ディレクトリ**へ寄せる) あるのに、読取側は片方も配線されていなかった。
+    そのため plannerが裸の名前を出すと ``read_file`` がプロセスの CWD を見て
+    ``File not found`` になり、供給元を失った後続の書込みが本文を捏造する。
+
+    実インシデント (2026-08-26 ライブ検証): 「E:\tmp に rs_a.txt を作り…」の
+    次のターンで「rd_secret.txt の中身を rs_a.txt の末尾に追記してください。」
+    と依頼すると ``read_file({'file_path': 'rd_secret.txt'})`` が失敗し、
+    実ファイルの中身が ``SECRET-4417`` であるにもかかわらず
+    ``ALPHA\nSECRET_CONTENT`` が書き込まれた。
+
+    解決は **実在するときだけ** 行う。候補ディレクトリ配下に同名ファイルが
+    無ければ元の値をそのまま返す (推測でパスを埋めない)。
+    """
+    if not file_path or _PATH_SEPARATOR_RE.search(file_path):
+        return file_path
+
+    name = Path(file_path).name
+
+    # 1. 会話に同じ basename のフルパスがある (既存の参照解決と同じ強さ)
+    from backend.free.agent.tool_call_judge import _resolve_referenced_path
+
+    same = _resolve_referenced_path(file_path, conversation)
+    if same:
+        return same
+
+    # 2. 文脈で確定しているディレクトリ配下に実在するか。
+    #    現在のクエリを最優先し、次に会話を新しい順に見る。
+    texts = [query or ""]
+    for msg in reversed(list(conversation or [])):
+        if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+            texts.append(msg["content"])
+
+    from backend.free.agent.tool_call_judge import _extract_file_path
+
+    for text in texts:
+        found = _extract_file_path(text)
+        if not found or not _PATH_SEPARATOR_RE.search(found):
+            continue
+        base = Path(found)
+        directory = base if base.is_dir() else base.parent
+        candidate = directory / name
+        if candidate.is_file():
+            return str(candidate)
+    return file_path

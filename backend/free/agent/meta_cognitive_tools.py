@@ -53,6 +53,7 @@ def infer_tool_from_task(
         (tool_name, args) または None（推論不可の場合）
     """
     from backend.free.agent.tool_call_judge import _extract_file_path
+    from backend.free.agent.tool_judge_args import extract_write_target_path
 
     # バッククォート内コマンドの引数パスは読み書きの対象ではない。パス抽出は
     # コマンドを除いた本文に対して行う (コマンド抽出は生の description を見る)。
@@ -63,7 +64,10 @@ def infer_tool_from_task(
             continue
 
         if tool_name == "write_file":
-            file_path = _extract_file_path(path_source)
+            # 2 ファイルが登場するタスクでは先頭は常に source (読む側)。
+            # 先頭一致だと書き込み先が source に化ける
+            # (extract_write_target_path の docstring 参照)。
+            file_path = extract_write_target_path(path_source)
             if file_path:
                 return ("write_file", {"file_path": file_path})
 

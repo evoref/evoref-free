@@ -14,6 +14,7 @@
 		setStreamingEditorCode,
 		clearStreamingEditorCode,
 		markLastUserTruncated,
+		markLastAssistantTruncated,
 		nextMessageId,
 		tokenInfo,
 		sessionId,
@@ -123,6 +124,10 @@
 					// 発言バブルに内訳を残し、見落とし防止にトーストも出す
 					markLastUserTruncated(event.input_truncated);
 					addToast({ type: 'error', i18nKey: 'chat.input_truncated_toast' });
+				} else if (event.type === 'output_truncated' && event.output_truncated) {
+					// 応答バブルに注記を付ける。本文へ連結すると履歴に保存され、
+					// 次ターンでモデルが逐語復唱する (2026-08-25 実測)。
+					markLastAssistantTruncated(event.output_truncated);
 				} else if (event.type === 'rag_debug' && event.rag_debug) {
 					setRagDebugToLastAssistant(event.rag_debug);
 				} else if (event.type === 'editor_route' && event.editor_route) {

@@ -481,6 +481,7 @@ def build_semmem_injection(
     conflict_ctx: ConflictTurnContext | None = None,
     query_vec=None,
     query_text: str = "",
+    covered_attributes: set[str] | None = None,
 ) -> str | None:
     """SemMem facts + STM notes を MemoryInjector で tier 整形し、
     プロンプト注入用テキストを返す。
@@ -502,6 +503,11 @@ def build_semmem_injection(
     それを回答対象と誤解する — 関連度ゲートを入れた元の事象そのもの。
     embedder があるのに ``query_vec`` が無い = そのターンの埋め込みが失敗した、
     と判定して注入を見送る (競合セクションは関連度と無関係なので出す)。
+
+    ``covered_attributes`` を渡すと、**実際に注入されたファクト** の属性スロット名を
+    その場で書き込む (``InjectionPlan.covered_attributes``)。呼出側が
+    「この属性の現在値はもうプロンプトに載っている」を判定するための出力で、
+    ``search_history`` の抑止に使う。``dropped`` になった候補は含めない。
     """
     mem_sys = state.get_memory_system()
     if not mem_sys:
@@ -546,6 +552,8 @@ def build_semmem_injection(
                 query_text=query_text,
             )
             rendered = plan.render() or None
+            if covered_attributes is not None:
+                covered_attributes.update(plan.covered_attributes)
     except Exception as e:
         logger.warning("semmem injection skipped: %s", e)
         rendered = None

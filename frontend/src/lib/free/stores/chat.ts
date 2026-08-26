@@ -49,6 +49,12 @@ export interface ChatMessage {
 	 * 見えなかったため (2026-07-26 実測)、発言バブル自体に表示する。
 	 */
 	input_truncated?: { original_chars: number; sent_chars: number };
+	/**
+	 * この応答が出力トークン上限に達して途中終了した場合の内訳。
+	 * 注記文字列を本文へ連結すると履歴に保存され、次ターンでモデルが
+	 * 逐語復唱する (2026-08-25 実測)。本文の外に持って表示だけに使う。
+	 */
+	output_truncated?: { tokens_generated: number; max_tokens: number | null };
 }
 
 /** モード別メッセージバッファ */
@@ -215,6 +221,28 @@ export function markLastUserTruncated(info: {
 			if (msgs[i].role === 'user') {
 				const updated = [...msgs];
 				updated[i] = { ...msgs[i], input_truncated: info };
+				return updated;
+			}
+		}
+		return msgs;
+	});
+}
+
+/**
+ * 直近のアシスタントメッセージに「出力上限で途中終了した」内訳を付ける。
+ *
+ * 通知は応答ストリームの終端 (token_info の直前) で届くため、対象は
+ * 末尾のアシスタントメッセージ。
+ */
+export function markLastAssistantTruncated(info: {
+	tokens_generated: number;
+	max_tokens: number | null;
+}): void {
+	messages.update((msgs) => {
+		for (let i = msgs.length - 1; i >= 0; i--) {
+			if (msgs[i].role === 'assistant') {
+				const updated = [...msgs];
+				updated[i] = { ...msgs[i], output_truncated: info };
 				return updated;
 			}
 		}

@@ -32,6 +32,7 @@ from backend.free.agent.meta_cognitive_defs import (
     EXECUTE_SYSTEM_PROMPT,
     _DATA_BEARING_TOOLS,
     _is_placeholder_write_path,
+    resolve_read_path,
 )
 
 from backend.log_config import get_logger
@@ -127,6 +128,7 @@ class _TaskExecutionMixin:
                 judgement.tool_name, judgement.tool_args, task,
                 tools_registry,
                 on_step=on_step, prefix=prefix,
+                original_query=original_query,
             )
 
         return None
@@ -445,6 +447,7 @@ class _TaskExecutionMixin:
     @staticmethod
     def _normalize_loop_tool_args(
         tool_name: str, tool_args: dict, original_query: str,
+        conversation: list[dict] | None = None,
     ) -> dict:
         """`write_file` / `read_file` の args を正規化する。それ以外は素通し。"""
         if tool_name == "write_file":
@@ -456,8 +459,43 @@ class _TaskExecutionMixin:
                 )
             return args
         if tool_name == "read_file":
-            return normalize_read_file_args(tool_args, original_query)
+            args = normalize_read_file_args(tool_args, original_query)
+            fp = args.get("file_path", "")
+            if fp:
+                args["file_path"] = _TaskExecutionMixin._resolve_read_path(
+                    fp, original_query, conversation,
+                )
+            return args
         return tool_args
+
+    @staticmethod
+    def _resolve_read_path(
+        file_path: str, original_query: str, conversation: list[dict] | None,
+    ) -> str:
+        """read_file の対象パスを文脈から解決する (裸のファイル名の救済)。
+
+        書込み側は ``_resolve_write_path`` + ``_referential_write_path`` で
+        裸の名前を会話中のフルパスへ寄せているのに、**読取側にはその解決が
+        無かった**。``_resolve_referenced_path`` の docstring は最初から
+        「書込み/読取の対象パスを会話から解決する」と書いており、読取だけ
+        配線が漏れていた。
+
+        実インシデント (2026-08-26 ライブ監査の修正検証): 「mrg_b.txt の中身を
+        mrg_a.txt の末尾に追記してください。」でプランナーが裸の名前で
+        ``["Read the content of mrg_b.txt", ...]`` を出し、
+        ``read_file({'file_path': 'mrg_b.txt'})`` が **File not found** で失敗した
+        (ディレクトリはこのターンのクエリに無く、前のターンの会話にしかない)。
+        読み取りが失敗すると ``is_tool_error`` で ``_fetched_tool_outputs`` にも
+        入らないため、書込み内容の供給元が空のままになる。
+        """
+        resolved = resolve_read_path(file_path, original_query, conversation)
+        if resolved and resolved != file_path:
+            logger.info(
+                "Read target resolved from conversation: %s (bare=%r)",
+                resolved, file_path,
+            )
+            return resolved
+        return file_path
 
     @staticmethod
     def _resolve_write_path(file_path: str, query: str) -> str:
@@ -577,6 +615,7 @@ class _TaskExecutionMixin:
         tool_name = tool_call.get("tool", "")
         tool_args = self._normalize_loop_tool_args(
             tool_name, tool_call.get("args", {}), original_query,
+            getattr(self, "_conversation", None),
         )
 
         # 取得専任タスク (collapse 済み) では write_file を実行しない。出力は後続の

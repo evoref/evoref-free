@@ -129,6 +129,28 @@ class SSEFrameBuilder:
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     @staticmethod
+    def output_truncated(tokens_generated: int, max_tokens: int | None) -> str:
+        """出力切り詰めフレーム: 応答が ``max_tokens`` 到達で途中終了した旨の通知。
+
+        ``input_truncated`` と同じ理由で **本文の外** に出す。かつては注記文字列
+        を content ストリームへ流していたが、それは応答本文として履歴 / WM /
+        STM / experience まで保存され、次ターンでモデルが逐語復唱した
+        (2026-08-25 実インシデント。``StreamOutcome`` の docstring 参照)。
+        表示に必要な事実だけを構造化して渡し、文面はクライアント側の i18n で持つ。
+
+        Args:
+            tokens_generated: 切断されるまでに生成された生トークン数
+            max_tokens: このリクエストで指定した上限 (未指定なら ``None``)
+        """
+        payload = {
+            "output_truncated": {
+                "tokens_generated": tokens_generated,
+                "max_tokens": max_tokens,
+            },
+        }
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    @staticmethod
     def rag_debug(chunks: list[dict], search_time_ms: float) -> str:
         """RAG デバッグフレーム: 検索結果チャンクの可視化（debug.enabled 時のみ送信）
 

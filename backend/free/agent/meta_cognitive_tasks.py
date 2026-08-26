@@ -114,12 +114,31 @@ def merge_same_file_tasks(tasks: list[TaskItem]) -> list[TaskItem]:
 
     PLAN_SYSTEM_PROMPT で「1ファイル=1タスク」を指示しているが、
     ローカル LLM が無視して分割するケースへの防御策。
+
+    グループ化のキーは **書き込み先** (:func:`extract_write_target_path`)。
+    以前は ``_extract_file_path`` (= 先頭のパス) を使っていたため、
+    **2 ファイルにまたがる操作が同一ファイル扱いで潰れていた**。
+
+    実インシデント (2026-08-26 ライブ監査 T7-7)。プランナーの実出力:
+
+        {"tasks": ["Read the content of E:\\tmp\\dest_b.txt",
+                   "Append the content of E:\\tmp\\dest_b.txt to the end of
+                    E:\\tmp\\dest_a.txt"]}
+
+    どちらも **先頭のパスが dest_b.txt** なので同じグループに入り
+    ``" / "`` で 1 タスクへ連結された (``Task merging: 2 tasks → 1 tasks``)。
+    読み取りタスクが消えて ``read_file`` が一度も走らず、書き込み内容の
+    供給元 (``_fetched_tool_outputs``) が空のままになる。プランナーは
+    正しく 2 タスクに分けていたのに、防御策の側が壊していた。
+
+    書き込み先で束ねれば「Read B」は B、「Append B→A」は A になり分離する。
+    本来の目的 (同じファイルへの過分割をまとめる) は変わらない。
     """
-    from backend.free.agent.tool_call_judge import _extract_file_path
+    from backend.free.agent.tool_judge_args import extract_write_target_path as _key
 
     file_groups: dict[str, tuple[int, list[str]]] = {}
     for i, task in enumerate(tasks):
-        path = _extract_file_path(task.description)
+        path = _key(task.description)
         if path:
             if path not in file_groups:
                 file_groups[path] = (i, [task.description])
@@ -139,11 +158,11 @@ def merge_same_file_tasks(tasks: list[TaskItem]) -> list[TaskItem]:
             merged_desc = " / ".join(descriptions)
             result_items.append((first_idx, TaskItem(description=merged_desc)))
             for j, task in enumerate(tasks):
-                if _extract_file_path(task.description) == path:
+                if _key(task.description) == path:
                     merged_indices.add(j)
 
     for i, task in enumerate(tasks):
-        if i not in merged_indices and not _extract_file_path(task.description):
+        if i not in merged_indices and not _key(task.description):
             result_items.append((i, task))
 
     result_items.sort(key=lambda x: x[0])

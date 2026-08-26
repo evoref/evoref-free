@@ -44,6 +44,12 @@ export interface InputTruncatedInfo {
 	sent_chars: number;
 }
 
+/** 応答が出力トークン上限に達して途中終了した旨の通知 */
+export interface OutputTruncatedInfo {
+	tokens_generated: number;
+	max_tokens: number | null;
+}
+
 export interface ChatStreamEvent {
 	type:
 		| 'token'
@@ -54,7 +60,8 @@ export interface ChatStreamEvent {
 		| 'rag_debug'
 		| 'editor_route'
 		| 'editor_code'
-		| 'input_truncated';
+		| 'input_truncated'
+		| 'output_truncated';
 	token?: string;
 	token_info?: TokenInfo;
 	error?: string;
@@ -63,6 +70,7 @@ export interface ChatStreamEvent {
 	editor_route?: { target: 'editor' | 'chat' };
 	editor_code?: EditorCodeArtifact;
 	input_truncated?: InputTruncatedInfo;
+	output_truncated?: OutputTruncatedInfo;
 }
 
 /** SSE ストリーミングチャット */
@@ -180,6 +188,9 @@ export async function* chatStream(
 					}
 					if (parsed.input_truncated) {
 						yield { type: 'input_truncated', input_truncated: parsed.input_truncated };
+					}
+					if (parsed.output_truncated) {
+						yield { type: 'output_truncated', output_truncated: parsed.output_truncated };
 					}
 					if (parsed.editor_route) {
 						yield { type: 'editor_route', editor_route: parsed.editor_route };

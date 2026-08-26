@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 
 from backend.free.core.text_quality import states_no_user_value
 from backend.free.memory.pipeline.injector import (
-    INTERNAL_INDEX_SUBJECT_PREFIXES,
+    is_internal_index_subject,
 )
 from backend.free.memory.pipeline.semantic_conflict_resolver import (
     CONFLICTS_PENDING_FILENAME,
@@ -211,7 +211,7 @@ def collect_review_groups(
     4. **内部索引の subject を除く。**
        ``MemoryInjector`` はセッション要約 / MDP エピソードトレース /
        executable command 索引を ``[関連する記憶]`` から落としている
-       (:data:`~backend.free.memory.pipeline.injector.INTERNAL_INDEX_SUBJECT_PREFIXES`)。
+       (:func:`~backend.free.memory.pipeline.injector.is_internal_index_subject`)。
        いずれも「アシスタント側の記録」であってユーザーについての事実ではなく、
        根拠枠に並べると自分の過去の出力が事実として提示されるため。
        **``[記憶の競合]`` にはこのフィルタが無い**ため、同じ内容が別の窓から
@@ -232,7 +232,7 @@ def collect_review_groups(
 
     groups: list[PendingConflictGroup] = []
     for base in collect_pending_groups(store, scope, similarity_threshold):
-        if base.subject.startswith(INTERNAL_INDEX_SUBJECT_PREFIXES):
+        if is_internal_index_subject(base.subject):
             continue
         newest_by_object: dict[str, SemanticFact] = {}
         for f in by_slot.get((base.subject, base.predicate), []):

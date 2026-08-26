@@ -112,21 +112,59 @@ def normalize_object_for_conflict(text: str) -> str:
     return "".join(body.split())
 
 
+def _truncation_marked(text: str) -> bool:
+    """``text`` が切り詰め済みであることを **印で** 判定する (純粋関数)。
+
+    切り詰めの経路は 2 つで、どちらも印を残す:
+
+    - 要約 (``compress_turn(style="summary")``) — ``[要約] `` 接頭辞と
+      ``…（N文字）`` 末尾
+    - object の長さ制限 (``BaseExtractor.truncate``) — 末尾の ``…``
+    """
+    t = (text or "").strip()
+    return (
+        t.startswith(_SUMMARY_MARK)
+        or bool(_SUMMARY_TAIL_RE.search(t))
+        or t.endswith("…")
+    )
+
+
 def distinct_conflict_objects(facts: Iterable[SemanticFact]) -> set[str]:
     """競合判定に使う「異なる値」の集合。
 
     原文と ``[要約]`` は同一視する (:func:`normalize_object_for_conflict`)。
-    片方が他方の接頭辞になる場合 (要約は先頭 N 文字) も同一視する。
+    片方が他方の接頭辞になる場合も同一視するが、**切り詰めの印がある側が
+    あるときだけ** (:func:`_truncation_marked`)。
+
+    印を要求するのは、判定が ``fact.text`` (= ``statement or object``) に
+    掛かるため。``statement`` が正規化済みの短い命題で埋まると、印の無い
+    「名前は小川」と「名前は小川浩之」が接頭辞一致で同じ値と見なされ、
+    **本物の競合が検出されなくなる** (= 古い値が supersede されない)。
+    長さの閾値では要約側の実長 (テストでは 12 文字) と命題の実長が重なって
+    区別できないので、**印そのもの** を判定に使う (2026-08-26)。
     """
-    keys: list[str] = []
+    keys: list[tuple[str, bool]] = []
     for f in facts:
-        key = normalize_object_for_conflict(f.text or "")
+        raw = f.text or ""
+        key = normalize_object_for_conflict(raw)
         if not key:
             continue
-        if any(key.startswith(k) or k.startswith(key) for k in keys):
+        marked = _truncation_marked(raw)
+        if any(
+            _is_same_value(key, marked, k, k_marked) for k, k_marked in keys
+        ):
             continue
-        keys.append(key)
-    return set(keys)
+        keys.append((key, marked))
+    return {k for k, _ in keys}
+
+
+def _is_same_value(a: str, a_marked: bool, b: str, b_marked: bool) -> bool:
+    """``a`` と ``b`` が同じ値を指すか (切り詰め違いを含む、純粋関数)。"""
+    if a == b:
+        return True
+    if not (a_marked or b_marked):
+        return False
+    return a.startswith(b) or b.startswith(a)
 
 
 def split_by_attribute_similarity(

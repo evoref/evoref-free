@@ -12,6 +12,7 @@ from backend.free.agent.meta_cognitive_text import assigns_file_content
 from backend.free.agent.safety_patterns import strip_command_literals
 from backend.free.core.intent_vocab import (
     DATETIME_QUERY_RE,
+    continuation_request,
     persist_request,
     runtime_info_question,
     tool_inventory_question,
@@ -964,6 +965,19 @@ _CLASSIFY_RULES: tuple[_ClassifyRule, ...] = (
     _ClassifyRule(
         "self_config_query", "deliberative",
         lambda c, x: tool_inventory_question(x.query) or runtime_info_question(x.query),
+    ),
+    # 「続けて」型の継続要求も short_query の手前に置く。切断が観測されていれば
+    # 分類器の手前で ``_dispatch_continuation`` が奪うが、**切れずに完結した
+    # 直後の「続けて」** はここへ降りてくる。3 文字なので必ず short_query →
+    # reactive_light に落ち、直近数件の履歴しか見ないモデルが直前の user 発話を
+    # 逐語で復唱する。実インシデント (2026-08-25 ライブ監査 T6-5):
+    # 長文生成 (cogwriter, 972 tokens) が正常終了した次ターンの「続けて」に対し
+    # 「Pythonのデコレータについて2000文字程度で詳しく解説してください。」という
+    # **前ターンの依頼文そのもの** を返した。続きを書くには何をどこまで書いたかを
+    # 見る必要があり、それは deliberative でしか出せない。
+    _ClassifyRule(
+        "continuation_request", "deliberative",
+        lambda c, x: continuation_request(x.query),
     ),
     _ClassifyRule(
         "short_query", "reactive",

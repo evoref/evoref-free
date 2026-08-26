@@ -23,13 +23,17 @@ from backend.utils import estimate_tokens
 logger = get_logger("llm.local_client")
 
 
-def _truncation_notice() -> str:
+def truncation_notice() -> str:
     """max_tokens 到達でストリームが途中終了したことをユーザーへ開示する注記。
 
     i18n_helper は横断基盤なので pillar から参照してよい。``msg`` は未解決キーを
     **キー文字列のまま返す** 仕様なので、それを検出して素の英語へ縮退させる
     (i18n 未初期化のパスでも注記そのものは消さない — **切断を黙って完結扱いに
     しない**ことが本注記の目的)。
+
+    この文字列は **表示専用** で、応答本文へは決して連結しない
+    (:class:`StreamOutcome` の docstring 参照)。SSE を持たない表示経路
+    (CLI) だけが呼ぶ。
     """
     key = "warning.llm.response_truncated"
     fallback = "\n\n> ⚠ Output token limit reached; this response is cut off."
@@ -41,6 +45,65 @@ def _truncation_notice() -> str:
     return fallback if text == key else text
 
 
+@dataclass
+class StreamOutcome:
+    """ストリーム終端で確定するメタ情報。**本文には決して混ぜない**。
+
+    かつて ``finish_reason == "length"`` の開示は :func:`truncation_notice` を
+    content ストリームへ ``yield`` することで行っていた。注記はそのまま
+    ``full_response`` に積まれ、履歴 / WM / STM / experience / few-shot まで
+    **モデル自身の出力として保存** されていた。実インシデント
+    (2026-08-25 セッション ``20260825_045637``): 512 トークンで切れた小説に
+    注記が付いて履歴へ入り、次ターンの「続けて」でモデルが末尾ブロックごと
+    **注記を逐語コピー** した (backend.log にその 2 ターンの
+    ``Stream hit max_tokens`` 警告は無く、注記はモデルが書いたもの)。
+
+    非ストリーム経路 (``_generate_sync``) は同じ理由で最初から本文へ足さず
+    ログだけ残す方針だった。ストリーム経路をその方針に揃える。
+    """
+
+    #: llama-server が返した最後の ``finish_reason`` (未観測なら ``None``)。
+    finish_reason: str | None = None
+    #: フィルタ前の生トークン数 (デバッグ / 開示用)。
+    tokens_generated: int = 0
+    #: このリクエストで指定した ``max_tokens`` (未指定なら ``None``)。
+    max_tokens: int | None = None
+
+    @property
+    def truncated(self) -> bool:
+        """max_tokens 到達で文の途中で切れたか。"""
+        return self.finish_reason == "length"
+
+
+class TokenStream:
+    """``AsyncIterator[str]`` + 終端メタ (:attr:`outcome`)。
+
+    既存の消費側は ``async for token in stream`` のまま **str だけ** を受け取る。
+    切断を扱う消費側だけがループ後に ``stream.outcome.truncated`` を見る。
+    センチネル値を本文ストリームへ混ぜる設計は採らない — 見落とした消費側が
+    ``chunks.append(token)`` / ``text += token`` で壊れる (``meta_cognitive`` /
+    ``strategy_cogwriter`` / ``task_exec`` が該当)。
+    """
+
+    __slots__ = ("_agen", "outcome")
+
+    def __init__(self, agen: AsyncIterator[str], outcome: StreamOutcome) -> None:
+        self._agen = agen
+        self.outcome = outcome
+
+    def __aiter__(self) -> "TokenStream":
+        return self
+
+    async def __anext__(self) -> str:
+        return await self._agen.__anext__()
+
+    async def aclose(self) -> None:
+        """基底 async generator を閉じる (呼出側の早期 break 用)。"""
+        aclose = getattr(self._agen, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
 # スロット定数
 SLOT_CHAT = 0
 SLOT_BACKGROUND = 1
@@ -49,6 +112,9 @@ SLOT_CLASSIFIER = 2
 
 __all__ = [
     "LocalClient",
+    "StreamOutcome",
+    "TokenStream",
+    "truncation_notice",
     "SLOT_CHAT",
     "SLOT_BACKGROUND",
     "SLOT_CLASSIFIER",
@@ -643,7 +709,7 @@ class LocalClient(BaseHTTPClient):
         repetition_penalty: float | None = None,
         id_slot: int | None = None,
         request_timeout: float | None = None,
-    ) -> dict | AsyncIterator[str]:
+    ) -> dict | TokenStream:
         """llama-server に推論リクエストを送信
 
         Args:
@@ -674,7 +740,10 @@ class LocalClient(BaseHTTPClient):
         )
 
         if stream:
-            return self._generate_stream(payload)
+            # TokenStream は str のイテレータのまま (既存の消費側は無改変)。
+            # 切断を扱う消費側だけがループ後に ``.outcome`` を見る。
+            outcome = StreamOutcome()
+            return TokenStream(self._generate_stream(payload, outcome), outcome)
         else:
             return await self._generate_sync(payload, request_timeout=request_timeout)
 
@@ -836,8 +905,14 @@ class LocalClient(BaseHTTPClient):
             )
             return "", "", None
 
-    async def _generate_stream(self, payload: dict) -> AsyncIterator[str]:
+    async def _generate_stream(
+        self, payload: dict, outcome: StreamOutcome,
+    ) -> AsyncIterator[str]:
         """ストリーミング推論（async generator）
+
+        ``outcome`` は終端メタの書き戻し先。**本文へは何も足さない** ため、
+        切断の開示は呼出側が ``outcome.truncated`` を見て行う
+        (:class:`StreamOutcome` 参照)。
 
         接続プールの stale 接続問題を回避するため、毎回新規クライアントを使用。
         初回トークンまでのタイムアウト（STREAM_FIRST_TOKEN_TIMEOUT）を設け、
@@ -873,6 +948,7 @@ class LocalClient(BaseHTTPClient):
         #: と表の途中で停止。197 秒かけた回答が未完のまま、完結した回答として
         #: 提示されていた。
         last_finish_reason: str | None = None
+        outcome.max_tokens = payload.get("max_tokens")
         try:
             # ストリーミング専用の新規クライアント（接続プール共有による stale 接続を回避）
             async with httpx.AsyncClient(timeout=120.0) as stream_client:
@@ -912,6 +988,7 @@ class LocalClient(BaseHTTPClient):
                         reason = (chunk.get("choices") or [{}])[0].get("finish_reason")
                         if reason:
                             last_finish_reason = reason
+                            outcome.finish_reason = reason
                         # llama.cpp が timings を載せる構成なら、より正確なそちらを優先。
                         # (既定では付かないので通常は下の usage 経路が使われる)
                         timings = chunk.get("timings")
@@ -998,15 +1075,18 @@ class LocalClient(BaseHTTPClient):
                         if tail:
                             yield tail
 
+                    outcome.tokens_generated = token_count
                     if last_finish_reason == "length":
-                        # 切断を黙って完結扱いにしない。ログ (英語固定) と、
-                        # ユーザーに見える注記 (i18n) の両方へ出す。
+                        # 切断を黙って完結扱いにしない。ログ (英語固定) はここで、
+                        # ユーザーへの開示は呼出側が ``outcome.truncated`` を見て
+                        # **本文の外** (SSE フレーム / CLI の別行) で行う。
+                        # 本文へ注記を連結すると履歴へ保存され、次ターンで
+                        # モデルが復唱する (StreamOutcome の docstring 参照)。
                         logger.warning(
                             "Stream hit max_tokens=%s (finish_reason=length); "
                             "the response is cut mid-sentence after %d tokens",
                             payload.get("max_tokens"), token_count,
                         )
-                        yield _truncation_notice()
         except httpx.ConnectError as e:
             raise LLMConnectionError(
                 f"llama-server unreachable: {e}", host=self.url,

@@ -18,7 +18,12 @@ from backend.free.agent.router import (
     asks_directory_listing,
     is_environment_fact_query,
 )
-from backend.free.core.intent_vocab import is_plain_statement
+from backend.free.core.intent_vocab import (
+    ANAPHORIC_OPERAND_RE,
+    NUMBER_LITERAL_RE,
+    is_plain_statement,
+    looks_like_numeric_question,
+)
 from backend.free.core.locale_patterns import is_en_locale, select_locale_variant
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.safety_patterns import (
@@ -28,9 +33,13 @@ from backend.free.agent.safety_patterns import (
 from backend.free.agent.tools_registry import ToolDefinition, ToolsRegistry
 from backend.free.agent.grammar_tool_classifier import (
     CLASSIFY_MAX_TOKENS,
+    EXPRESSION_SCHEMA,
+    EXPRESSION_SYSTEM,
+    EXPRESSION_SYSTEM_EN,
     build_classifier_schema,
     build_tool_menu,
     parse_classifier_response,
+    parse_expression_response,
 )
 from backend.free.llm.json_extract import extract_json_object
 from backend.log_config import get_logger
@@ -48,6 +57,7 @@ from backend.free.agent.tool_judge_dialogue import (
     _CALCULATE_CONTEXT_TURNS,
     _JUDGE_CONTEXT_CHARS,
     _dialogue_text,
+    _SYNTHESIS_CONTEXT_TURNS,
     _recent_dialogue_messages,
     _recent_dialogue_text,
 )
@@ -210,6 +220,21 @@ logger = get_logger("agent.tool_call_judge")
 # 選別として機能せず、類似度ゲート 1 本で決まってしまうため。
 _RECALL_SMALL_POOL_SIZE = 3
 _RECALL_SMALL_POOL_MARGIN = 0.1
+
+
+#: 「これは文であってキーワードではない」ことを示す印。文末記号と依頼形は
+#: 検索語には現れないので、分類器が生の質問文をそのまま渡したことの目印になる。
+_SENTENCE_SHAPE_RE = re.compile(r"[。．？?！!]|ください|下さい|お願い")
+
+
+def _looks_like_sentence(candidate: str, raw_query: str) -> bool:
+    """``candidate`` がキーワードではなく **文** か (純粋関数)。"""
+    c = (candidate or "").strip()
+    if not c:
+        return False
+    if c == (raw_query or "").strip():
+        return True
+    return bool(_SENTENCE_SHAPE_RE.search(c))
 
 
 def _executable_tool_for_mode(tools_registry: ToolsRegistry, mode: str) -> str:
@@ -909,6 +934,15 @@ class ToolCallJudge:
             self._log_tool_decision(classified, "tool_classifier")
             return classified
 
+        # 5.95. 差分クエリの式合成 (最後の接地手段)。
+        # 分類器 (層5.9) が no_tool と判断した後だけ走る。
+        synthesized = await self._judge_with_expression_synthesis(
+            query, tools_registry, mode, conversation,
+        )
+        if synthesized is not None:
+            self._log_tool_decision(synthesized, "expression_synthesis")
+            return synthesized
+
         # 6. 全フォールバック失敗時の no_tool 結末を記録
         # (削除依頼の記録は judge() 冒頭で済ませてある)
         self._mark_blocked_if_unexecutable_command(
@@ -919,6 +953,98 @@ class ToolCallJudge:
             no_tool_result, "no_match_in_any_layer",
         )
         return no_tool_result
+
+    async def _judge_with_expression_synthesis(
+        self,
+        query: str,
+        tools_registry: ToolsRegistry,
+        mode: str,
+        conversation: list[dict] | None,
+    ) -> "ToolJudgement | None":
+        """被演算子が会話にしかない差分クエリで、式だけを合成させて calculate を撃つ。
+
+        **判断させず合成だけ命じる**のが要点。層5.9 の分類器は「ツールが要るか」
+        を判定するため、割り算のような難しい計算では ``calculate`` を選ぶが、
+        引き算は自分で暗算できると判断して ``no_tool`` を返す。そして実際には
+        間違える。
+
+        実測 (2026-08-26 ライブ A/B、Qwen3.8-27B、在庫 12→9→14→12 の直後に
+        「最初の在庫からいくつ減りましたか？」を尋ねる。正解 0):
+
+        - 応答全体の正答率 **5/8** (誤答は ``6台`` / ``2台`` / ``12台``)
+        - 分類器に ``calculate`` / ``no_tool`` だけ与えても **4/4 で no_tool**
+        - 選択肢を与えず「式を合成せよ」と命じると **4/4 で ``12-12`` → 0**
+
+        合成した式は ``_ungrounded_numbers`` で検証する。会話に無い数値が 1 つ
+        でも混ざれば捨てる (捏造された式の結果は「正しく計算された嘘」になり、
+        素の暗算より有害。``_suppress_ungrounded_calculate`` の docstring 参照)。
+
+        発火条件を「クエリに数値が無い差分/照応形」に閉じるのは、往復 1 回
+        (実測 15〜20 秒) を無関係なターンへ足さないため。被演算子がクエリ側に
+        あるケースは層5.9 が既に ``calculate`` を選べる。
+        """
+        if not tools_registry.has("calculate"):
+            return None
+        # 被演算子がクエリにあるなら層5.9 で足りる。ここは「会話にしかない」形専用。
+        if NUMBER_LITERAL_RE.search(query):
+            return None
+        if not ANAPHORIC_OPERAND_RE.search(query):
+            return None
+        if not looks_like_numeric_question(
+            query, _recent_dialogue_text(conversation),
+        ):
+            return None
+        client = self._llm_client
+        if client is None or not hasattr(client, "generate_constrained"):
+            return None
+
+        # ⚠ 判定用の 4 ターン窓を渡してはいけない。基準値 (「最初の〜」) が
+        # 窓の外にあると、窓内の最古の値で式を作って必ず間違える。
+        messages = _recent_dialogue_messages(
+            conversation, _SYNTHESIS_CONTEXT_TURNS,
+        )
+        messages.append({"role": "user", "content": query})
+        messages.insert(0, {
+            "role": "system",
+            "content": select_locale_variant(
+                EXPRESSION_SYSTEM, EXPRESSION_SYSTEM_EN,
+            ),
+        })
+        try:
+            content = await client.generate_constrained(
+                messages,
+                response_format=EXPRESSION_SCHEMA,
+                max_tokens=CLASSIFY_MAX_TOKENS,
+                # 分類器と同じ専有スロット (CLAUDE.md §6 #1)。
+                id_slot=getattr(
+                    client, "classifier_slot",
+                    getattr(client, "background_slot", -1),
+                ),
+                timeout=self._tool_classifier_timeout_sec,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info("expression synthesis failed: %s", exc)
+            return None
+
+        expression = parse_expression_response(content)
+        if not expression:
+            return None
+        unexplained = _ungrounded_numbers(
+            expression, query, _dialogue_text(conversation),
+        )
+        if unexplained:
+            logger.info(
+                "Expression synthesis rejected: %s uses numbers absent from "
+                "the conversation (%s)", expression, ", ".join(unexplained),
+            )
+            return None
+        result = ToolJudgement(
+            tool_needed=True,
+            tool_name="calculate",
+            tool_args={"expression": expression},
+            source="classifier",
+        )
+        return self._finalize(result, tools_registry, mode, query=query)
 
     _NATIVE_JUDGE_SYSTEM = (
         "あなたはツール選択器です。ユーザーの発言に答えるのに必要なツールを"
@@ -1104,6 +1230,9 @@ class ToolCallJudge:
         # (自己参照は現在セッションへ限定 / 順序リコールは横断へ拡張)。
         self._maybe_scope_session_search(result, query, session_id)
         self._maybe_expand_ordered_history_search(result, query)
+        # 分類器は自由生成の arg をそのまま query に入れるため、文のまま
+        # 渡ってくることがある (層 5.5 と違い縮約が掛からない)。
+        self._maybe_reduce_history_query(result, query)
 
         result = self._finalize(
             result,
@@ -1456,6 +1585,45 @@ class ToolCallJudge:
         logger.debug(
             "search_history excludes current session (already in context): %s",
             query[:50],
+        )
+
+    def _maybe_reduce_history_query(
+        self, result: "ToolJudgement", query: str,
+    ) -> None:
+        """``search_history`` の検索語が **文のまま** なら内容キーワードへ縮約する.
+
+        層 5.5 の強制フォールバックは ``_reduce_ordered_history_query`` を通すが、
+        分類器 (層 5.9) は文法制約 JSON の ``arg`` をそのまま
+        ``tool_args["query"]`` に入れるため縮約が掛からない。ツール説明は
+        「Keywords to search for, NOT the user's question verbatim」と書いて
+        いるが、**説明は守られないことがある**。
+
+        実インシデント (2026-08-25 ライブ監査): 「過去の会話から「猫」について
+        話した内容を検索してください。」で検索語が生の文全体になり 0 件。
+        ``HistoryManager`` の字句照合は長い疑問文を短い会話ターンに当てられない。
+
+        縮約するのは **文らしいときだけ**。分類器が良いキーワード
+        (``登壇予定日``) を出しているときに書き換えると悪化する。文らしさは
+        「生クエリと同一」か「文末記号・依頼形を含む」で見る (どちらも
+        キーワードには現れない)。in-place で更新する。
+        """
+        if result.tool_name != "search_history":
+            return
+        args = result.tool_args or {}
+        raw = args.get("query")
+        if not isinstance(raw, str) or not raw.strip():
+            return
+        current = raw.strip()
+        if not _looks_like_sentence(current, query):
+            return
+        reduced = _reduce_ordered_history_query(query)
+        if not reduced or reduced.strip() == current:
+            return
+        args["query"] = reduced
+        result.tool_args = args
+        logger.debug(
+            "search_history query reduced (classifier passed a sentence): "
+            "%r -> %r", current[:60], reduced[:60],
         )
 
     def _maybe_expand_ordered_history_search(

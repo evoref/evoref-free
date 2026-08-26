@@ -93,8 +93,9 @@ def collect_reembed_targets(
     """全 scope の「embedding を持つ live fact」を列挙する.
 
     Returns:
-        ``(scope_name, scope_root, fact_id, object_text)`` のリスト。
-        ``embedding`` が None / superseded / object 空の fact は除外。
+        ``(scope_name, scope_root, fact_id, embed_text)`` のリスト。
+        ``embedding`` が None / superseded / 本文が空の fact は除外。
+        本文は ``fact.text`` (= ``statement or object``)。
     """
     targets: list[tuple[str, Path, str, str]] = []
     for scope in enumerate_scopes(memory_dir):
@@ -102,7 +103,11 @@ def collect_reembed_targets(
         for fact in store.all_facts(include_superseded=False):
             if fact.embedding is None:
                 continue
-            text = (fact.object or "").strip()
+            # Step 8.8 (sleep/fact_embedding) と同じ本文を使う。片方が
+            # ``object``、片方が ``text`` だと、モデル切替後のストアで
+            # **同じファクトが別の本文で埋め込まれた状態** (split-brain) が残り、
+            # 検索の当たり方が再埋め込みの有無で変わる (2026-08-26 に是正)。
+            text = (fact.text or "").strip()
             if not text:
                 continue
             targets.append((scope.name, scope.root_dir, fact.id, text))

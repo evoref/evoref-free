@@ -228,6 +228,66 @@ _STATEMENT_STRIP_PASSES = 3
 _SUMMARY_MARK = "[要約] "
 _SUMMARY_TAIL_RE = re.compile(r"…（\d+文字）\s*$")
 
+#: 文末の断定辞と句点。命題には要らないので落とす。
+#: ``になりました`` 等の複合述語は **落とさない** — 値の一部を運んでいる
+#: (「11月10日に変更になりました」)。
+_STATEMENT_TAIL_RE = re.compile(r"(?:です|でした|だ|である|でございます)?\s*[。．.]?\s*$")
+
+#: 「正しくは B」— 訂正の後半だけが現在値。前半 (「さっき神戸に住んでいると
+#: 言いましたが、」) は **古い値を運ぶだけ** なので落とす。
+_CORRECTION_RIGHT_RE = re.compile(r"^.*?正しくは、?\s*(?P<new>.+)$")
+
+#: 「<枠>は<旧>ではなく<新>」— 枠を残して値だけ差し替える。
+#: 枠 (``猫の名前は``) を残すのは、``[関連する記憶]`` の 1 行が
+#: ``mem.personal.pet states: ルナ`` だけになると何の名前か読めなくなるため。
+#: 枠が無い形 (「緑茶ではなく紅茶です」) は新しい値だけを残す。
+#: ``ない`` (単なる否定) は含めない。「急ぎではないので、ゆっくりで大丈夫です。」を
+#: 差し替えると「ので、ゆっくりで大丈夫」という壊れた命題になる。訂正の意味を
+#: 持つのは対比の ``なく`` / ``なくて`` だけで、これは
+#: ``note_builder.CORRECTION_FORM_TRIGGERS`` (``ではなく`` / ``じゃなくて``) とも揃う。
+_CORRECTION_NOT_RE = re.compile(
+    r"^(?P<head>.*?)(?:では|じゃ)なく(?:て)?、?\s*(?P<new>.+)$",
+)
+
+#: ``ではなく`` が訂正でない形。これらは「A に加えて B」「A というわけではない」で、
+#: 差し替えると **A が消える**。実例: 「Python だけではなく TypeScript も書きます」を
+#: 差し替えると Python が失われる。
+_NOT_A_CORRECTION_RE = re.compile(r"(?:だけ|のみ|ばかり|わけ|訳|はず|そう)(?:では|じゃ)なく")
+
+#: 枠の切れ目 (最後の話題マーカー)。``猫の名前はソラではなく`` の ``は`` を指す。
+_FRAME_SPLIT_RE = re.compile(r"^(?P<frame>.*[はが])(?P<old>[^はが]*)$")
+
+
+def _reduce_correction_statement(text: str) -> str | None:
+    """訂正形の発話から **現在値だけ** を残した命題を返す (純粋関数)。
+
+    訂正は必ず「古い値」と「新しい値」を 1 文に同居させる。``object`` は原文を
+    残す設計なので、正規化しないと ``[関連する記憶]`` に古い値がそのまま並ぶ。
+    実インシデント (2026-08-25 ライブ監査の追調査): 訂正後の
+    ``mem.personal.location`` の本文が「さっき**神戸**に住んでいると言いましたが、
+    正しくは横浜です。」で、**訂正ファクト自身が古い値を運んで**いた。
+
+    Returns:
+        正規化後の命題。訂正形でなければ ``None``。
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = _CORRECTION_RIGHT_RE.match(t)
+    if m:
+        return _STATEMENT_TAIL_RE.sub("", m.group("new").strip()).strip() or None
+    if _NOT_A_CORRECTION_RE.search(t):
+        return None
+    m = _CORRECTION_NOT_RE.match(t)
+    if m is None:
+        return None
+    new = _STATEMENT_TAIL_RE.sub("", m.group("new").strip()).strip()
+    if not new:
+        return None
+    frame_m = _FRAME_SPLIT_RE.match(m.group("head").strip())
+    frame = frame_m.group("frame") if frame_m else ""
+    return (frame + new) if frame else new
+
 
 def _collapse_equivalent_candidates(
     candidates: list[tuple[MemoryNote, SemanticFact]],
@@ -288,8 +348,18 @@ def normalize_statement(
     3. 文頭の談話標識 (「ところで」「実は」)
     4. 文頭の一人称主題 (「私は」— 主語は subject が持つ)
 
-    「紅茶派です」→「紅茶」のような **値の抽出** は語順・助詞の解析が要るので
-    ここでは行わない (LLM 併用の Phase 2 で扱う想定)。
+    5. 訂正形の古い値 (``_reduce_correction_statement``)
+    6. 文末の断定辞と句点 (``_STATEMENT_TAIL_RE``)
+
+    5 と 6 を足したのは、``statement`` が **一度も埋まっていなかった** ため
+    (2026-08-25 実測: live 143 件中 0 件)。3/4 だけでは素直な平叙文
+    (「私の名前は小川浩之です。」) が ``kept == text`` で ``None`` に落ち、
+    ``fact.text`` が実運用上ずっと ``object`` と同一だった。訂正形はとくに
+    **古い値を本文に同居させる** ので、正規化しないと訂正後も陳腐値が
+    ``[関連する記憶]`` に並ぶ。
+
+    「紅茶派です」→「紅茶」のような助詞解析を要する **値の抽出** は依然として
+    ここでは行わない (取りこぼしは LLM 併用で扱う想定)。
 
     Returns:
         正規化後の命題。原文と変わらない / 短くなりすぎる場合は ``None``
@@ -320,6 +390,11 @@ def normalize_statement(
         if peeled == kept:
             break
         kept = peeled
+    corrected = _reduce_correction_statement(kept)
+    if corrected:
+        kept = corrected
+    else:
+        kept = _STATEMENT_TAIL_RE.sub("", kept).strip()
     if len(kept) < _STATEMENT_MIN_CHARS or kept == text:
         return None
     return kept

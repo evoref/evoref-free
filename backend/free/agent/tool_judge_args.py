@@ -331,6 +331,82 @@ def _extract_file_path(query: str) -> str:
         return quoted
 
     return ""
+
+
+#: 書き込み先を後置で導く語 (英語)。``to`` / ``into`` の **後ろ** が宛先。
+#: タスクグラフの記述は英語で生成されるため、実際に踏むのはこちら
+#: (実測: ``Read the content of audit2_b.txt / Append the content to audit2_a.txt``)。
+_WRITE_DEST_MARKERS_EN: tuple[str, ...] = (" into ", " onto ", " to ")
+
+#: 書き込み先を前置で導く語 (日本語)。これらの **手前** が宛先。
+#: 「の末尾に」は「A の中身を B の末尾に追記」の形を拾うために要る。
+_WRITE_DEST_MARKER_JA_RE = re.compile(
+    r"(?:の)?(?:末尾|先頭|後ろ)?\s*[にへ]\s*(?:追記|書[きい]|保存|出力|コピー|貼)",
+)
+
+#: 日本語の助詞・区切り。パス候補の切り出しに使う。
+#: **コロンは入れない** — ``E:\\tmp\\out.md`` のドライブレターを切ってしまい、
+#: 残骸が抽出器に掛からなくなる (実測でこの 1 件だけ落ちた)。
+_PATH_SPLIT_RE = re.compile(r"[\s　、。,;「」『』\"'（）()]+|[をのがはへに]")
+
+
+def _extract_last_file_path(text: str) -> str:
+    """``text`` の中で **最後に現れる** ファイルパスを返す。
+
+    ``_extract_file_path`` は最初の 1 件で打ち切るため、末尾側の宛先を取れない。
+    パス候補は空白・助詞を含まないので、区切って右から順に既存の抽出器へ
+    掛ければよい (パターン集合を二重管理しない)。
+    """
+    chunks = [c for c in _PATH_SPLIT_RE.split(text or "") if c]
+    for chunk in reversed(chunks):
+        found = _extract_file_path(chunk)
+        if found:
+            return found
+    return ""
+
+
+def extract_write_target_path(text: str) -> str:
+    """**書き込み先** のファイルパスを返す (見つからなければ空文字列)。
+
+    ``_extract_file_path`` は最初に現れたパスを返す。1 ファイルしか出てこない
+    依頼ではそれが正しいが、**2 ファイルが登場するタスクでは先頭は常に
+    source (読む側)** なので、書き込み先が source に化ける。
+
+    実インシデント (2026-08-26 ライブ監査 T7-7):
+    「audit2_b.txt の中身を audit2_a.txt の末尾に追記してください。」に対し
+    ``write_file({'file_path': 'E:\\tmp\\audit2_b.txt', 'content': 'ブラボー'})``
+    が実行され、**source を自分の中身で上書き**した。a.txt は未変更のまま、
+    失敗の報告も無い (表示は「audit2_b.txt に書き込みました」で正直だが、
+    ユーザーの指示は実行されていない)。日英どちらの語順でも同じに再現する。
+
+    選び方は 3 段:
+
+    1. 英語の後置マーカー (``to`` / ``into``) の **後ろ** から採る
+    2. 日本語の前置マーカー (``に追記`` / ``の末尾に書き`` 等) の **手前** で
+       最後に現れるパスを採る
+    3. どちらも無ければ従来どおり ``_extract_file_path`` (先頭一致)
+
+    3 を残すのは、マーカーが無い普通の依頼 (「E:\\tmp\\a.txt に書いて」) で
+    挙動を変えないため。
+    """
+    body = text or ""
+    if not body:
+        return ""
+    for marker in _WRITE_DEST_MARKERS_EN:
+        idx = body.lower().rfind(marker)
+        if idx == -1:
+            continue
+        found = _extract_file_path(body[idx + len(marker):])
+        if found:
+            return found
+    m = _WRITE_DEST_MARKER_JA_RE.search(body)
+    if m:
+        found = _extract_last_file_path(body[:m.start()])
+        if found:
+            return found
+    return _extract_file_path(body)
+
+
 # --- 算術式抽出 (calculate ツールの決定論的ルーティング) ---------------------
 # 全角の数字・演算子を ASCII へ寄せる。カタカナ長音符 (ー) や罫線 (―) は
 # 日本語語中に頻出するため意図的に含めない (マイナスへ誤変換すると
