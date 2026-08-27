@@ -88,24 +88,30 @@ async def trigger_learning(req: TriggerRequest, state: AppState = Depends(get_ap
         )
 
     # Full モード: まず sleep-time update を実行する。
-    # LLM ステージのクライアントは通常のスケジュール経路 (scheduler.py の
-    # Trigger B) と同じ ``resolve_sleep_client()`` で解決する
-    # (sleep-time はベースモデルで実行する)。
-    # どちらも未接続なら run_full を呼ばず Step 5.8-10 をスキップする (c_14 §6)。
+    #
+    # **``_worker.run_full()`` を直接呼ばない**。スケジューラの
+    # ``run_full_now()`` を通すと WM → STM スナップショット
+    # (``_run_pre_full_flush``) とクライアント解決が自動 Trigger B と揃う。
+    # private 属性を直接触ってクライアント解決をコピーしていたため 2 経路が
+    # 乖離し、**手動トリガーだけスナップショットを飛ばしていた** —
+    # 進行中セッションのターンが Step 8 の入力から丸ごと抜ける
+    # (2026-08-27 ライブ監査で実測。詳細は ``run_full_now`` の docstring)。
+    #
+    # LLM 未接続なら False が返り、Step 5.8-10 はスキップされる (c_14 §6)。
     if req.level == "full":
         sleep_sched = state.sleep_scheduler
-        if sleep_sched is not None and sleep_sched._worker is not None:
-            sleep_client = sleep_sched.resolve_sleep_client()
-            if sleep_client:
-                try:
+        if sleep_sched is not None:
+            try:
+                logger.info("Manual trigger: running Full sleep-time update first")
+                ran = await sleep_sched.run_full_now()
+                if not ran:
                     logger.info(
-                        "Manual trigger: running Full sleep-time update first (client=%s)",
-                        type(sleep_client).__name__,
+                        "Manual trigger: Full sleep-time skipped "
+                        "(worker or sleep client unavailable)",
                     )
-                    await sleep_sched._worker.run_full(sleep_client)
-                except Exception as e:
-                    logger.error("Full sleep-time update failed during manual trigger: %s", e)
-                    # Full が失敗しても Level 1 は要求として積む
+            except Exception as e:
+                logger.error("Full sleep-time update failed during manual trigger: %s", e)
+                # Full が失敗しても Level 1 は要求として積む
 
     # 優先キューに manual 要求を push（LLM 未接続でも OK）
     req_obj = PriorityRequest(

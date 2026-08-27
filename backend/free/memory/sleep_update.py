@@ -122,6 +122,8 @@ class SleepTimeWorker:
         # state ファイルはメモリディレクトリ配下に置く想定だが、テスト容易性
         # のため lazy 初期化する。
         self._mdp_ingester = None
+        #: 「今チャット生成が走っているか」の判定 (scheduler が注入)。
+        self._chat_in_flight_probe = None
 
     def set_bm25_retriever(self, bm25: BM25Retriever) -> None:
         """BM25Retriever を設定（プレフィックス生成後の再構築に使用）"""
@@ -130,6 +132,25 @@ class SleepTimeWorker:
     def set_fewshot_pool(self, pool) -> None:
         """FewShotPool を設定 (手本の埋め込み backfill に使用)。"""
         self._fewshot_pool = pool
+
+    def set_chat_in_flight(self, probe: "Callable[[], bool] | None") -> None:
+        """「今チャット生成が走っているか」を返す判定を注入する。
+
+        LLM を逐次に何度も叩くステップ (Step 7 のノート進化) が、ユーザーの
+        ターンを待たせないための協調 yield に使う。``SleepTimeScheduler`` が
+        ``set_worker`` 時に自分の ``_chat_in_flight`` を渡す。
+        """
+        self._chat_in_flight_probe = probe
+
+    def _chat_in_flight(self) -> bool:
+        """チャット生成が実行中か (未注入なら常に False = 従来どおり止まらない)。"""
+        probe = getattr(self, "_chat_in_flight_probe", None)
+        if probe is None:
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            return False
 
     def cancel(self) -> None:
         """実行中の処理をキャンセル（現在のステップ完了後に停止）"""
@@ -309,6 +330,7 @@ class SleepTimeWorker:
         result["notes_clusters"] = link_stats.get("clusters", 0)
         result["notes_evolved"] = await evolver.evolve_notes(
             self.short_term, self.long_term, llm_client,
+            should_pause=self._chat_in_flight,
         )
 
     async def _step6_5_reembed_after_conflicts(
@@ -539,11 +561,33 @@ class SleepTimeWorker:
         result["lexical_index_rebuilt"] = self._step10c_refresh_lexical_index()
         step_durations["step10c_lexical_index"] = round(time.monotonic() - ts, 3)
 
+        # Step 10d: 起動時に条件を満たさず見送られた閾値較正を拾い直す。
+        # 較正は起動時 1 回きりだったため、ノートが少ない状態で起動すると
+        # プロセスの生涯にわたり config の静的閾値 (別モデル前提で到達不能)
+        # が使われ続けていた。ここまでで Step 1-8 がノートを増やしているので、
+        # 同じサイクル内で増えた分をそのまま使える。
+        ts = time.monotonic()
+        result["threshold_calibrated"] = await self._step10d_retry_calibration()
+        step_durations["step10d_threshold_calibration"] = round(
+            time.monotonic() - ts, 3,
+        )
+
         # 永続化 + 完了ログ
         self._save_state()
         elapsed = round(time.monotonic() - t0, 3)
         self._log_full_completion(result, started_at, elapsed, step_durations)
         return result
+
+    async def _step10d_retry_calibration(self) -> bool:
+        """未確定の記憶検索閾値較正を 1 回だけ再試行する (失敗は握る)。"""
+        try:
+            from backend.free.rag.memory_threshold_calibration import (
+                retry_pending_calibration,
+            )
+            return await retry_pending_calibration()
+        except Exception as e:
+            logger.warning("Step 10d: threshold recalibration failed: %s", e)
+            return False
 
     async def _step10b2_backfill_fewshot_embeddings(self) -> int:
         """手本プールの未埋め込みエントリを遡って埋め込む。

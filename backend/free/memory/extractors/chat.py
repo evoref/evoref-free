@@ -185,7 +185,60 @@ def _tag_evidence_is_question_only(content: str, trigger_words: tuple[str, ...])
     return all(_is_non_assertive(s) for s in relevant)
 
 
-def _attribute_evidence_text(content: str, attr_words: tuple[str, ...]) -> str:
+def _mentions_any(sentence: str, words: tuple[str, ...]) -> bool:
+    """``sentence`` が ``words`` のいずれかを含むか (正規化して比較)。"""
+    if not words:
+        return False
+    normalized = _normalize_trigger(sentence)
+    return any(w in normalized for w in words)
+
+
+#: 「値」とみなす内容語の並び (漢字 / カタカナ / ラテン文字 / 数字が 2 文字以上)。
+#: ひらがなを入れないのは、述語 (「変わりました」「しています」) が全部
+#: ひらがなで、値の有無を弁別できなくなるため。
+_CONTENT_RUN_RE = re.compile(
+    r"[一-鿿゠-ヿA-Za-z0-9][一-鿿゠-ヿA-Za-z0-9]+"
+)
+
+
+def _states_attribute_value(sentence: str, attr_words: tuple[str, ...]) -> bool:
+    """``sentence`` がその属性の **値** を述べているか (純粋関数)。
+
+    属性語を取り除いてなお内容語が残れば値がある、と判定する:
+
+        「職業は建築設計士です。」 − 職業 → 「建築設計士」が残る → 値あり
+        「職業も変わりました。」   − 職業 → 「変」しか残らない   → 値なし
+        「私の名前は小川です。」   − 名前 → 「小川」が残る       → 値あり
+
+    値なしと判定した文だけが後続文を引き継ぐので、**誤って「値あり」と
+    出るのは安全側** (従来どおり絞り込むだけ)。
+    """
+    stripped = sentence
+    for word in attr_words:
+        stripped = stripped.replace(word, " ")
+    return bool(_CONTENT_RUN_RE.search(stripped))
+
+
+def _carries_no_value(sentence: str) -> bool:
+    """1 文が「値の表明ではない」か (疑問形 または 純粋な依頼形)。
+
+    ``_tag_evidence_is_question_only`` の内側と同じ規則。属性文に続く文を
+    引き継ぐかどうかの判定に使う (「よろしくお願いします。」を値として
+    連れて行かないため)。
+    """
+    s = sentence.strip()
+    if _QUESTION_ENDING_RE.search(s):
+        return True
+    if not _REQUEST_ENDING_RE.search(s):
+        return False
+    return not _asserts_before_request(s)
+
+
+def _attribute_evidence_text(
+    content: str,
+    attr_words: tuple[str, ...],
+    all_attr_words: tuple[str, ...] = (),
+) -> str:
     """``attr_words`` を含む文だけを連結して返す (絞れなければ空文字列)。
 
     1 発話で複数の属性を述べても、fact の subject は 1 つしか付かない。
@@ -202,16 +255,57 @@ def _attribute_evidence_text(content: str, attr_words: tuple[str, ...]) -> str:
 
     絞り込みは **文が 2 つ以上あり、実際に減る** ときだけ行う。該当文が
     無い / 全文が該当する場合は空文字列を返し、呼出側は従来どおり全文を使う。
+
+    **属性語を含まない文は直前の属性文に属する** (``all_attr_words`` を渡した
+    場合)。日本語は「属性名を出す文」と「値を述べる文」が分かれるのが普通で、
+    属性語だけで絞ると **値そのものが落ちる**:
+
+        「職業も変わりました。今は構造設計士です。」
+          → 旧: 「職業も変わりました。」   (値が無い)
+          → 新: 「職業も変わりました。今は構造設計士です。」
+
+    実インシデント (2026-08-27 ライブ監査): 上の発話から
+    ``mem.personal.occupation`` の object が「職業も変わりました。」になり、
+    新セッションで「あなたの現在の職業は**「職業も変わりました」という記録しか
+    確認できず**、具体的な職種は不明です。」とユーザーへ露出した。
+
+    引き継ぐのは **どの属性語も含まない** 文だけなので、別属性の値を巻き込む
+    ことはない (含んでいればその属性の文として扱われる)。ただし疑問形 /
+    純粋な依頼形は値を運ばないので引き継がない — 日本語の自己紹介は
+    「…といいます。よろしくお願いします。」で終わるのが常態で、
+    そのまま連れて行くと object に依頼文が混ざる。
+
+    Args:
+        attr_words: この属性のトリガ語。
+        all_attr_words: この発話で解決した **全属性** のトリガ語。省略時は
+            引き継ぎを行わず従来どおりの絞り込みになる (後方互換)。
     """
     if not attr_words or not content:
         return ""
     sentences = [s for s in _SENTENCE_SPLIT_RE.split(content) if s.strip()]
     if len(sentences) < 2:
         return ""
-    kept = [
-        s for s in sentences
-        if any(w in _normalize_trigger(s) for w in attr_words)
-    ]
+
+    kept: list[str] = []
+    awaiting_value = False
+    for sentence in sentences:
+        if _mentions_any(sentence, attr_words):
+            kept.append(sentence)
+            # 値を述べていない属性文 (「職業も変わりました。」) だけが
+            # 後続文を引き継ぐ。値がある文は従来どおり単独で完結させる。
+            awaiting_value = not _states_attribute_value(sentence, attr_words)
+            continue
+        if not all_attr_words:
+            # 引き継ぎ無効 (呼出側が全属性語を渡していない) = 従来どおり。
+            continue
+        if _mentions_any(sentence, all_attr_words):
+            # 別属性の文。以降の「属性語なし」文はそちらに属する。
+            awaiting_value = False
+            continue
+        if awaiting_value and not _carries_no_value(sentence):
+            kept.append(sentence)
+            awaiting_value = False  # 引き継ぐのは 1 文だけ
+
     if not kept or len(kept) == len(sentences):
         return ""
     return "".join(kept).strip()
@@ -659,10 +753,18 @@ class ChatExtractor(BaseExtractor):
                         # 属性語を落とした訂正は直前の言明からスロットを継ぐ
                         # (resolve_inherited_attributes の説明を参照)。
                         matches = [(inherited.get((note.id, tag)) or "user", ())]
+                    # 「属性語を含まない文は直前の属性文に属する」判定に、
+                    # この発話で解決した全属性のトリガ語を渡す
+                    # (詳細は _attribute_evidence_text の docstring)。
+                    all_attr_words = tuple({
+                        word for _, words in matches for word in words
+                    })
                     attr_specs = [
                         (
                             make_mem_subject(kind, attr or "user"),
-                            _attribute_evidence_text(content, attr_words) or content,
+                            _attribute_evidence_text(
+                                content, attr_words, all_attr_words,
+                            ) or content,
                         )
                         for attr, attr_words in matches
                     ]

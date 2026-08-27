@@ -10,12 +10,49 @@ set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 
 if "%~1"=="" goto usage
+
+rem Second argument selects the develop level and is handed to the backend via
+rem EVOREF_DEVELOP_LEVEL (backend/factory/_bootstrap.py reads it). The backend is
+rem spawned as `uvicorn backend.main:app`, bypassing the CLI, so a `--develop`
+rem flag cannot reach it -- the environment variable is the only channel.
+rem Without this, `evoref-ctl start` always ran at the normal level and the
+rem debug JSONL under local/logs/debug stayed empty, which cost time in two live
+rem audits (2026-08-23 and 2026-08-27) before the cause was spotted.
+set "EVOREF_DEVELOP_LEVEL="
+set "EVOREF_LEARNING_DISABLED="
+if not "%~2"=="" call :parse_mode "%~2" || exit /b 1
+if not "%~3"=="" call :parse_mode "%~3" || exit /b 1
+
 if /i "%~1"=="start" goto start
 if /i "%~1"=="start-core" goto start_core
 if /i "%~1"=="stop" goto stop
 if /i "%~1"=="restart" goto restart
 if /i "%~1"=="status" goto status
 goto usage
+
+rem --- Parse one optional mode argument (develop level or --no-learning) ---
+:parse_mode
+set "ARG=%~1"
+if /i "%ARG%"=="--no-learning" (
+    set "EVOREF_LEARNING_DISABLED=1"
+    echo [start] learning disabled ^(EVOREF_LEARNING_DISABLED=1^)
+    exit /b 0
+)
+if /i "%ARG%"=="debug"       goto set_level
+if /i "%ARG%"=="investigate" goto set_level
+if /i "%ARG%"=="evolve"      goto set_level
+if /i "%ARG:~0,10%"=="--develop=" (
+    set "ARG=%ARG:~10%"
+    if /i "!ARG!"=="debug"       goto set_level
+    if /i "!ARG!"=="investigate" goto set_level
+    if /i "!ARG!"=="evolve"      goto set_level
+)
+echo ERROR: unknown option '%~1' ^(expected debug ^| investigate ^| evolve ^| --no-learning^)
+exit /b 1
+:set_level
+set "EVOREF_DEVELOP_LEVEL=%ARG%"
+echo [start] develop level: %ARG% ^(EVOREF_DEVELOP_LEVEL^)
+exit /b 0
 
 rem --- Start all services (llama + backend + frontend) ---
 :start
@@ -141,13 +178,23 @@ goto :eof
 
 rem --- Usage ---
 :usage
-echo Usage: %~nx0 {start^|stop^|restart^|status}
+echo Usage: %~nx0 {start^|stop^|restart^|status} [debug^|investigate^|evolve] [--no-learning]
 echo.
 echo Commands:
 echo   start    Start all services (llama-server, FastAPI, SvelteKit)
 echo   stop     Stop all running services
 echo   restart  Restart all services
 echo   status   Show status of all services
+echo.
+echo Options (start / start-core / restart):
+echo   debug^|investigate^|evolve   Develop level; sets EVOREF_DEVELOP_LEVEL for the backend.
+echo                              Without it the backend runs at the normal level and
+echo                              local/logs/debug stays empty.
+echo   --no-learning              Disable the self-learning cycle (EVOREF_LEARNING_DISABLED=1).
+echo.
+echo Examples:
+echo   %~nx0 start evolve
+echo   %~nx0 restart investigate --no-learning
 exit /b 1
 
 rem --- Dependency check ---

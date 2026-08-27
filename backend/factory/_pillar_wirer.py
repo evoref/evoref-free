@@ -914,6 +914,23 @@ def _init_memory_threshold_calibration(
         )
         return
 
+    # 起動時に条件を満たさなくても諦めない。較正は **起動時 1 回きり** だった
+    # ため、ノート 0 件で起動するとそのプロセスの生涯にわたって config の静的
+    # 閾値が使われ続けていた (実測 2026-08-27: その後 STM が 105 件まで増えても
+    # 再較正されず、Quality: low が 12/12。観測 top_score の最大 0.428 に対し
+    # relevance_threshold 0.65 は到達不能)。sleep-time Full の末尾から
+    # ``retry_pending_calibration()`` が拾えるよう、バインド済みの再試行口を
+    # 登録しておく。
+    from backend.free.rag.memory_threshold_calibration import (
+        set_pending_recalibration,
+    )
+
+    set_pending_recalibration(
+        lambda: _run_memory_threshold_calibration(
+            memory_dir, fingerprint, short_term, embedder,
+        ),
+    )
+
     try:
         asyncio.create_task(
             _run_memory_threshold_calibration(

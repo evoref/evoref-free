@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -99,14 +100,32 @@ async def prepare_memory_context(
 
     wm, stm, ltm = mem_sys
 
+    # ``session_id`` 未指定は **新規セッションの要求** として扱う。
+    #
+    # 以前は None が下の分岐に入らず、WorkingMemory の現行セッションをそのまま
+    # 継続していた。しかも応答には **古い session_id** が載るため、呼出側は
+    # 「新しい会話を始めたつもりが前の会話に足されている」ことを検知できない
+    # (2026-08-27 ライブ監査: 想起テストのつもりで送った 6 ターンが直前の
+    # 108 ターンの続きになり、窓の中を読むだけで答えられてしまった)。
+    # API に「新しい会話を始める」手段が無い状態でもあった。
+    #
+    # 既存 UI は常に session_id を送るので影響を受けない。
+    requested_session = req.session_id
+    if not requested_session:
+        requested_session = str(uuid.uuid4())
+        logger.info(
+            "Chat request without session_id: starting a new session %s",
+            requested_session,
+        )
+
     # セッション切替検出: フロントエンドの session_id が変わったら WM をリセット
     # asyncio.Lock で排他制御し、並列リクエストでの競合を防止
     async with _session_switch_lock:
-        if req.session_id and wm.session_id != req.session_id:
+        if requested_session and wm.session_id != requested_session:
             old_session_id = wm.session_id
             logger.info(
                 "Session switch detected: %s -> %s, clearing WorkingMemory",
-                old_session_id, req.session_id,
+                old_session_id, requested_session,
             )
             # ``clear()`` を **先に** 実行してから drain する (f_02 §1.2 経路 (b))。
             # 逆順だと drain が拾えるのは「窓超過で既に押し出された分」だけで、
@@ -120,7 +139,7 @@ async def prepare_memory_context(
             # も clear → flush の順で、これで両経路が揃う。
             wm.clear()
             drain_evicted_to_stm(wm, stm, old_session_id)
-            wm.session_id = req.session_id
+            wm.session_id = requested_session
             # 旧セッションの蓄積データをクリーンアップ（メモリ解放）
             clear_session_data(old_session_id)
             # quality_judge のセッション単位カウンタもリセット
@@ -168,7 +187,7 @@ async def prepare_memory_context(
         "Memory context: %d history messages from WorkingMemory", len(history),
     )
 
-    session_id = req.session_id or wm.session_id
+    session_id = requested_session or wm.session_id
     return history, session_id
 
 
