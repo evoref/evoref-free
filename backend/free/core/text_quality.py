@@ -208,6 +208,50 @@ def conversational_numeric_claims(
     return claims
 
 
+#: 「100km ではありません」のように、値の直後で打ち消す言い回し。値に **言及した**
+#: ことと **採用した** ことを分ける。実測 (2026-08-22): 訂正のターンで
+#: 「東京と大阪の直線距離は約370kmです。約100kmという値は事実と異なります。」と
+#: 即座に反論したため、訂正値 100 が本文に現れて「採用」と誤判定された。
+VALUE_REJECTION_RE = re.compile(
+    r"(?:では?あり?ま?せん|ではなく|では無く|は誤り|は間違|"
+    r"正しくありません|事実と異な|正確ではあ|ではないです|ではない)",
+)
+
+
+def value_was_adopted(response: str, values: set[str]) -> bool:
+    """応答が ``values`` のいずれかを **自分の答えとして採った** か (純粋関数)。
+
+    単なる出現では判定しない。値の直後が打ち消しなら、言及はしていても採用は
+    していない (:data:`VALUE_REJECTION_RE` の説明を参照)。
+
+    「ユーザーが主張した値をアシスタントが採ったか」は 2 箇所で要る:
+
+    - 学習層 (:class:`~backend.free.agent.feedback.FeedbackCollector`) —
+      採らなかったなら ``user_correction`` を撤回する (自分の正答を失敗として
+      学習しないため)。
+    - 記憶層 (``sleep.assertion_curator``) — 採らなかった値を world_fact として
+      永続化しない。実インシデント (2026-08-27 ライブ監査): ユーザーの
+      「いや、それは間違いです。答えは 63800 ですよ。」(誤) が
+      ``mem.world.assertion.correct_answer`` として live になった。アシスタントは
+      同じ会話で 3 回とも 63802 を維持していたのに、記録側だけが誤りを残していた。
+
+    2 箇所で書き写すと必ず食い違うのでここに置く (pillar をまたぐ純粋関数の
+    正準置き場)。
+    """
+    text = response or ""
+    for value in values:
+        start = 0
+        while True:
+            idx = text.find(value, start)
+            if idx < 0:
+                break
+            tail = text[idx + len(value): idx + len(value) + 14]
+            if not VALUE_REJECTION_RE.search(tail):
+                return True
+            start = idx + len(value)
+    return False
+
+
 def find_superseded_claim(
     candidate: str, current_claims: dict[str, set[str]],
 ) -> tuple[str, str, set[str]] | None:
@@ -692,6 +736,11 @@ __all__ = [
     "states_no_user_value",
     "conversational_numeric_claims",
     "find_superseded_claim",
+    "match_enumeration_count",
+    "count_list_items",
+    "violates_enumeration_count",
+    "value_was_adopted",
+    "VALUE_REJECTION_RE",
     "has_boilerplate_closing",
     "has_broken_ja_spacing",
     "has_chinese_token_leak",
@@ -921,6 +970,84 @@ ITEM_COUNT_RE = re.compile(
 #: 数値表現をリスト項目と数えないため。
 _BULLET_LINE_RE = re.compile(r"^\s*(?:・\s*|(?:[-*+]|\d{1,2}[.)、])\s+)\S")
 
+#: 「47 都道府県を全部列挙して」型の **列挙個数** 指定。
+#:
+#: :data:`ITEM_COUNT_RE` は数値が ``つ`` / ``個`` / ``点`` / ``項目`` に付く形しか
+#: 拾わないので、数値が対象の名詞に直結する日本語 (``47都道府県`` / ``5教科``) を
+#: 取りこぼす。しかも個数チェックは箇条書き指定との AND でしか走らなかった。
+#:
+#: 実インシデント (2026-08-27 ライブ監査): 「日本の47都道府県を、県庁所在地と
+#: ともに全部列挙してください。」に **46 件** で答え (沖縄県が欠落)、検証も
+#: 修復も走らなかった。数値は本文にあり、返ってきた行は数えられる。
+#:
+#: 「数値 + 短い名詞 + を + 列挙動詞」の形だけを採る。列挙動詞を必須にするのは、
+#: 「1387 かける 46 は」「45 日後は」のような数値を含む別種のクエリを
+#: 列挙要求と誤認しないため。
+ENUMERATION_COUNT_RE = re.compile(
+    r"(\d{1,3})\s*[^\s、。0-9]{1,8}?\s*を"
+    r"[^。]{0,24}?(?:列挙|挙げ|並べ|書き出|リストアップ)",
+)
+
+#: 列挙個数の検証で「リストとして数えてよい」とみなす最小行数。
+_ENUM_MIN_LINES = 3
+#: 同上、1 項目とみなす行の最大長。これを超える行が多い応答は散文なので数えない。
+_ENUM_ITEM_MAX_CHARS = 40
+#: 非空行のうち、短い行が占める最小割合。
+_ENUM_SHORT_LINE_RATIO = 0.8
+
+
+def match_enumeration_count(text: str) -> int:
+    """発話中の列挙個数指定を返す (純粋関数)。無ければ ``0``。"""
+    m = ENUMERATION_COUNT_RE.search(text or "")
+    if m:
+        return int(m.group(1))
+    m2 = ITEM_COUNT_RE.search(text or "")
+    if m2:
+        return int(next(g for g in m2.groups() if g))
+    return 0
+
+
+def count_list_items(response: str) -> int:
+    """応答を「1 行 1 項目のリスト」として数える (純粋関数)。
+
+    リストと **確信できる** 形のときだけ数え、そうでなければ ``0`` を返す。
+    誤検知は無駄な再生成になるので、散文を項目数 0 として扱う側に倒す。
+
+    箇条書き行があればそれを数え、無ければ「短い行が大半を占める複数行」を
+    リストとみなす。実インシデントの回答は ``北海道: 札幌市`` のような
+    **記号の無い 1 行 1 項目** だった。
+    """
+    body = (response or "").strip()
+    if not body:
+        return 0
+    bullets = [ln for ln in body.splitlines() if _BULLET_LINE_RE.match(ln)]
+    if bullets:
+        return len(bullets)
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if len(lines) < _ENUM_MIN_LINES:
+        return 0
+    short = [ln for ln in lines if len(ln) <= _ENUM_ITEM_MAX_CHARS]
+    if len(short) / len(lines) < _ENUM_SHORT_LINE_RATIO:
+        return 0
+    return len(lines)
+
+
+def violates_enumeration_count(query: str, response: str) -> str | None:
+    """列挙個数の指定に **足りない** ときだけ理由を返す (純粋関数)。
+
+    超過は見ない — 「各 3 つずつ」のようにグループ化された正当な出力を
+    違反と誤判定するため (:func:`violates_output_form` が同じ理由で剰余判定に
+    している)。足りない側だけが実インシデント (46/47) の形。
+    """
+    wanted = match_enumeration_count(query)
+    if wanted <= 0:
+        return None
+    got = count_list_items(response)
+    if got <= 0 or got >= wanted:
+        return None
+    return f"asked to enumerate {wanted} items but the answer lists {got}"
+
+
 #: ``answer_only`` を破ったと **確信できる** 長さ。
 #:
 #: 「答えだけ」への正解は高々 1 文なので、これを大きく超えたら解説が付いている。
@@ -995,6 +1122,10 @@ def has_verifiable_output_constraint(query: str) -> bool:
     return (
         match_length_directive(q) is not None
         or match_output_form_directive(q) is not None
+        # 「47 都道府県を全部列挙して」型。箇条書き指定が無いので
+        # match_output_form_directive では拾えないが、数値は本文にあり
+        # 返ってきた行は数えられる (2026-08-27 ライブ監査: 46/47 を見逃した)。
+        or match_enumeration_count(q) > 0
     )
 
 

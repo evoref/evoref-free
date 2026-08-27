@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,47 @@ def set_active_calibration(thresholds: dict[str, float] | None) -> None:
 def get_active_calibration() -> dict[str, float] | None:
     """アクティブ較正値。未較正なら ``None`` (呼出側は config 値へ縮退)。"""
     return _ACTIVE_CALIBRATION
+
+
+#: 起動時に較正できなかったときの再試行口。起動時のバインド済み引数
+#: (memory_dir / fingerprint / short_term / embedder) を閉じ込めた 0 引数の
+#: コルーチンファクトリを ``_pillar_wirer`` が登録する。
+_PENDING_RECALIBRATION: "Callable[[], Any] | None" = None
+
+
+def set_pending_recalibration(factory: "Callable[[], Any] | None") -> None:
+    """較正の再試行口を登録する (起動時に較正できなかった場合のみ)。"""
+    global _PENDING_RECALIBRATION
+    _PENDING_RECALIBRATION = factory
+
+
+async def retry_pending_calibration() -> bool:
+    """較正がまだ確定していなければ 1 回だけ再試行する。
+
+    **なぜ要るか**: 較正は起動時に 1 回しか走らない。``MIN_NOTES`` (=30) に
+    満たない状態で起動すると skip され、そのプロセスの生涯にわたって config の
+    静的閾値が使われ続ける。出荷時の既定 (relevance 0.65 等) は別の埋め込み
+    モデルの分布を前提にした値なので、**品質ゲートが恒久的に閉じたまま**になる。
+
+    実測 (2026-08-27 ライブ監査、LFM2.5-Embedding-350M): 起動時ノート 0 件で
+    skip → その後 STM は 105 件まで増えたが再較正されず、``Quality: low`` が
+    12/12。観測された top_score の最大は 0.428 で、``relevance_threshold``
+    0.65 には到達しようがなかった。
+
+    sleep-time Full の末尾から呼ぶ (ノートが増えるのは Step 1-8 の後なので、
+    同じサイクル内で増えた分をそのまま使える)。
+
+    Returns:
+        このコールで較正が確定したか。既に確定済み / 未登録 / 条件未達なら
+        ``False``。
+    """
+    if _ACTIVE_CALIBRATION is not None:
+        return False
+    factory = _PENDING_RECALIBRATION
+    if factory is None:
+        return False
+    await factory()
+    return _ACTIVE_CALIBRATION is not None
 
 
 def embedder_fingerprint(model_id: str, dim: int) -> str:

@@ -21,6 +21,7 @@ from backend.free.api.chat.chat_service import make_token_info
 from backend.free.api.chat.constraint_repair import (
     needs_verification,
     repair_if_violated,
+    verify_and_repair_sync,
 )
 from backend.free.core.text_quality import length_disclosure_note
 from backend.free.api.chat.chat_types import (
@@ -652,6 +653,7 @@ async def sync_deliberative(
 ) -> ChatResponse:
     """Deliberative 層の非ストリーミング応答 (escalated_from は API 一貫性用、未使用)"""
     logger.debug("Sync deliberative: session=%s, messages=%d", session_id, len(messages))
+    t_start = time.monotonic()
     try:
         # Trigger A: LLM 生成開始直後に sleep-time Light を並列実行（§8.1）
         scheduler = state.sleep_scheduler
@@ -679,9 +681,21 @@ async def sync_deliberative(
         if timer:
             timer.stop("llm_total_ms")
 
-        estimated_tokens = max(1, _estimate_tokens(resp.content))
+        # ストリーミング側と同じ結末を与える (検証 → 1 回だけ修復 → 開示)。
+        # 検証も修復も stream 経路にしか無く、stream=False の API 呼び出しは
+        # 制約違反がそのまま返っていた (2026-08-27 ライブ監査: 50 字指定に
+        # 34 字で答え、修復も開示も走らなかった)。
+        content = await verify_and_repair_sync(
+            query=query,
+            response=resp.content,
+            messages=list(messages),
+            client=client,
+            max_tokens=max_tokens,
+            generation_params=generation_params,
+        )
+        estimated_tokens = max(1, _estimate_tokens(content))
         record_response(
-            state, resp.content, messages, session_id,
+            state, content, messages, session_id,
             query, mode, estimated_tokens,
             private=private,
             tool_command=resp.tool_command,
@@ -693,14 +707,33 @@ async def sync_deliberative(
             rag_top1_score=rag_top1_score,
         )
         _maybe_cache_reactive_response(
-            state, query, resp.content,
+            state, query, content,
             private=private, tool_command=resp.tool_command, session_id=session_id,
         )
 
+        # ストリーミング側と同じ形で結末を残す。``_log_chat_outcome`` の
+        # docstring は「5 つの層 (meta_cognitive / long_form / deliberative /
+        # reactive 軽量パスのストリーム・同期) を集約する」と書いているが、
+        # **同期 deliberative だけ呼び出しが漏れていた**。実測
+        # (2026-08-27 ライブ監査): UI 経由 (stream=True) の 13 ターンは
+        # outcome JSONL に載るのに、API 経由 (stream=False) の 20 ターン超は
+        # 1 行も出ていなかった。--develop=evolve は「loop 自己進化の観測」が
+        # 目的なので、非ストリーミングのターンが盲点になる。
+        signals: dict = {"agent_layer": "deliberative"}
+        if resp.tool_name:
+            signals["tool_name"] = resp.tool_name
+            signals["tool_success"] = bool(resp.tool_command_success)
+        _log_chat_outcome(
+            state,
+            started_at=t_start,
+            success=True,
+            tokens_out=estimated_tokens,
+            signals=signals,
+        )
         return _sync_chat_response(
             state, timer,
             agent_layer="deliberative",
-            text=resp.content,
+            text=content,
             tokens=estimated_tokens,
             messages=messages,
             session_id=session_id,
@@ -710,6 +743,13 @@ async def sync_deliberative(
         )
     except Exception as e:
         logger.error("Deliberative error: %s", e)
+        _log_chat_outcome(
+            state,
+            started_at=t_start,
+            success=False,
+            tokens_out=0,
+            signals={"agent_layer": "deliberative", "error": type(e).__name__},
+        )
         raise HTTPException(status_code=503, detail=str(e))
     finally:
         # process() が判定タスクを await する前に例外で抜けた場合の衛生。
@@ -869,6 +909,17 @@ async def sync_reactive_light(
         content = extract_content(data) if isinstance(data, dict) else str(data)
         if timer:
             timer.stop("llm_total_ms")
+
+        # 軽量パスも制約の対象。ストリーミング側 (stream_reactive_light) は
+        # needs_verification を見ているので、同期側だけ素通ししない。
+        content = await verify_and_repair_sync(
+            query=query,
+            response=content,
+            messages=list(messages),
+            client=client,
+            max_tokens=max_tokens,
+            generation_params=generation_params,
+        )
 
         estimated_tokens = max(1, _estimate_tokens(content))
         record_response(

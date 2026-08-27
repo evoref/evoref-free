@@ -170,8 +170,17 @@ class SleepTimeScheduler:
         return timezone.utc
 
     def set_worker(self, worker) -> None:
-        """SleepTimeWorker を設定"""
+        """SleepTimeWorker を設定
+
+        あわせて ``_chat_in_flight`` を注入する。``on_user_input`` の
+        ``worker.cancel()`` は ``_full_forced_run`` のとき **意図的に呼ばない**
+        (2026-08-22 の修正: 止めると Full が一度も完走しない) ため、走り出した
+        Full の中で LLM を逐次に叩くステップは自前で手を止める必要がある。
+        """
         self._worker = worker
+        setter = getattr(worker, "set_chat_in_flight", None)
+        if callable(setter):
+            setter(self._chat_in_flight)
 
     def set_llm_client(self, client) -> None:
         """Full 版で使用する LLM クライアントを設定（ベースモデル、フォールバック用）"""
@@ -520,6 +529,38 @@ class SleepTimeScheduler:
                 "Pre-full WM snapshot failed (continuing with existing "
                 "STM notes): %s", exc,
             )
+
+    async def run_full_now(self) -> bool:
+        """Full sleep-time を即座に 1 回走らせる (手動トリガー用)。
+
+        自動 Trigger B (:meth:`_schedule_full`) と **同じ前処理** を通すための
+        入口。``_worker.run_full()`` を直接呼ぶと ``_run_pre_full_flush()``
+        (WM → STM スナップショット) を飛ばしてしまい、押し出しが起きていない
+        進行中セッションのターンが Step 8 の入力から丸ごと抜ける。
+        :func:`~backend.free.api.chat.chat_recorder.snapshot_wm_to_stm` の
+        docstring が言うとおり、それが「Step 8 抽出への唯一の供給経路」。
+
+        実測 (2026-08-27 ライブ監査): ``snapshot_unabsorbed`` のログは自動
+        Trigger B の 3 回だけで、手動トリガー 2 回では 1 行も出ていなかった。
+        新セッションで 3 ターン話してから手動 Full を叩くと STM ノート 0 件 /
+        ファクト 0 件で、その後セッション切替 (WM ドレインが走る経路) を挟むと
+        同じ 3 ターンが正しく吸収された。**「今の会話を覚えさせたい」ときに
+        押すボタンで、今の会話だけが入力から抜けていた。**
+
+        ``_last_full_run`` は更新しない — 手動実行は自動スケジュールの
+        デバウンス状態とは独立に扱う (従来挙動を変えない)。
+
+        Returns:
+            実際に走ったか。ワーカー未設定 / LLM 未接続なら ``False``。
+        """
+        if self._worker is None:
+            return False
+        self._run_pre_full_flush()
+        client = self.resolve_sleep_client()
+        if client is None:
+            return False
+        await self._worker.run_full(client)
+        return True
 
     async def _schedule_full(self) -> None:
         """Trigger B: full_idle_minutes 後に Full 版を実行する。

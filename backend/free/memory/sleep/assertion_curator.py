@@ -42,6 +42,8 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from backend.free.core.intent_vocab import NUMBER_LITERAL_RE
+from backend.free.core.text_quality import value_was_adopted
 from backend.free.llm.json_schemas import AssertionNaming
 from backend.free.memory.corrections import correction_target
 from backend.free.memory.types import make_fact
@@ -116,6 +118,70 @@ def assertive_body(content: str) -> str | None:
         and not _REQUEST_ENDING_RE.search(sentence)
     ]
     return "".join(kept) or None
+
+
+def _next_assistant_note(note: "MemoryNote", notes: list) -> "MemoryNote | None":
+    """``note`` の直後にある同一セッションの assistant ノート (無ければ None)。"""
+    at = float(getattr(note, "created_at", 0.0) or 0.0)
+    session = getattr(note, "session_id", None)
+    best = None
+    best_at = None
+    for other in notes:
+        if getattr(other, "source", "user") != "assistant":
+            continue
+        if getattr(other, "session_id", None) != session:
+            continue
+        other_at = float(getattr(other, "created_at", 0.0) or 0.0)
+        if other_at < at:
+            continue
+        if best_at is None or other_at < best_at:
+            best, best_at = other, other_at
+    return best
+
+
+def _assistant_rejected_the_claim(note: "MemoryNote", notes: list) -> bool:
+    """ユーザーが述べた値を、直後のアシスタント応答が **採らなかった** か。
+
+    採らなかった主張を world_fact として残すと、アシスタントが会話では
+    正しく反論しているのに記録側だけが誤りを永続化する。
+
+    実インシデント (2026-08-27 ライブ監査): 「いや、それは間違いです。
+    答えは 63800 ですよ。」(誤) が ``mem.world.assertion.correct_answer`` として
+    live になった。アシスタントは同じ会話で 3 回とも 63802 を維持しており、
+    subject 名が ``correct_answer`` なので次の算術質問で注入されうる状態だった。
+
+    判定は学習層 (``FeedbackCollector._settle_pending_correction``) と **同じ
+    条件・同じ述語** を使う:
+
+    - ユーザー側に数値があり、直後のアシスタント応答にも数値がある
+    - アシスタントが **自分の値を出し** (両者の数値が重ならない)
+    - かつユーザーの値を **採用していない**
+      (:func:`~backend.free.core.text_quality.value_was_adopted`。
+      「約100kmという値は事実と異なります」のように打ち消しながら言及する
+      ケースを出現だけで採用と誤判定しないため)
+
+    判定材料が無いケース (アシスタントが「承知しました。」とだけ返した等) は
+    ``False`` = 従来どおり curate する。**安全側は「残す」**。
+    """
+    claimed = set(NUMBER_LITERAL_RE.findall(note.content or ""))
+    if not claimed:
+        return False
+    reply = _next_assistant_note(note, notes)
+    if reply is None:
+        return False
+    reply_text = reply.content or ""
+    # 疑問形しか無い応答 (「10月1日からでよいですか？」) は反論ではなく確認。
+    # 値が違っても却下と見なさない。
+    if assertive_body(reply_text) is None:
+        return False
+    prior = set(NUMBER_LITERAL_RE.findall(reply_text))
+    if not (prior - claimed):
+        # アシスタントが数値を出していない / ユーザーの値しか含まない
+        # = 自分の値を対置していない。
+        return False
+    # 出現の有無で見てはいけない。「約100kmという値は事実と異なります」のように
+    # **打ち消しながら言及する** ため、含まれていても採用とは限らない。
+    return not value_was_adopted(reply_text, claimed)
 
 
 def _is_curatable(note: "MemoryNote", builder) -> bool:
@@ -231,7 +297,13 @@ async def curate_assertion_facts(
 
         builder = ChatNoteBuilder()
 
-    candidates = [n for n in notes if _is_curatable(n, builder)]
+    candidates = [
+        n for n in notes
+        if _is_curatable(n, builder)
+        # アシスタントが採らなかった主張は永続化しない
+        # (_assistant_rejected_the_claim の docstring 参照)。
+        and not _assistant_rejected_the_claim(n, notes)
+    ]
     if not candidates:
         return 0
     candidates.sort(key=lambda n: float(getattr(n, "created_at", 0.0) or 0.0))

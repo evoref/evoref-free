@@ -479,7 +479,16 @@ def register_builtin_tools(
             "file_path": {"type": "string", "description": "Path to the file to write"},
             "content": {"type": "string", "description": "Content to write"},
         },
+        # 選択は create 限定のまま。chat では meta_cognitive の書き出し経路が
+        # パス解決と action_blocked のガードを通したうえで execute するので、
+        # 分類器へ直接選ばせてそのガードを飛ばしたくない。
         modes=["create"],
+        # ただし chat でも **実際に実行される** ので目録には載せる。
+        # 実インシデント (2026-08-27 ライブ監査): chat で write_file を 3 回
+        # 実行した直後の「使えるツールの一覧」に write_file だけが無かった。
+        # 同じ会話の別の問いには「write_file を 3 回呼んだ」と正しく答えており、
+        # 目録だけが実態とずれていた。
+        inventory_modes=["chat", "create"],
     )
 
     # chat でも使える。read_file (ファイル全文) と list_directory (ツリー全体) は

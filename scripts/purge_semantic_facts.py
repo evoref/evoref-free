@@ -13,6 +13,19 @@
     python scripts/purge_semantic_facts.py --contains "7006653" --dry-run
     python scripts/purge_semantic_facts.py --contains "7006653"
 
+``--subject`` は subject の前方一致で選ぶ。抽出のバグが **スロット単位** で
+書いたファクトを掃除するときは、文字列を思い出さなくても済むこちらを使う。
+実インシデント (2026-08-27 ライブ監査): ユーザーの誤主張
+「答えは 63800 ですよ。」がアシスタントの反論にもかかわらず
+``mem.world.assertion.correct_answer`` として live になった。新規作成は
+``sleep.assertion_curator`` 側で塞いだが (``_assistant_rejected_the_claim``)、
+**既に書かれた行は遡及されない**。
+
+    python scripts/purge_semantic_facts.py --subject mem.world.assertion.correct_answer --dry-run
+    python scripts/purge_semantic_facts.py --subject mem.world.assertion.correct_answer
+
+両方を渡すと AND で絞る。
+
 ログは英語固定 (リポジトリ規約)。
 """
 
@@ -59,18 +72,36 @@ def _live_facts(rows: list[dict]) -> dict[str, dict]:
     }
 
 
-def purge(local_root: Path, needle: str, *, dry_run: bool) -> int:
+def _matches(row: dict, needle: str | None, subject: str | None) -> bool:
+    """選択条件 (AND)。両方 None は呼出側で弾く。"""
+    if needle is not None and needle not in json.dumps(row, ensure_ascii=False):
+        return False
+    if subject is not None and not str(row.get("subject") or "").startswith(subject):
+        return False
+    return True
+
+
+def purge(
+    local_root: Path,
+    needle: str | None = None,
+    *,
+    subject: str | None = None,
+    dry_run: bool,
+) -> int:
+    label = " and ".join(
+        part for part in (
+            f"contains {needle!r}" if needle is not None else "",
+            f"subject startswith {subject!r}" if subject is not None else "",
+        ) if part
+    )
     total = 0
     for path in _iter_fact_files(local_root):
         rows = _load_versions(path)
         live = _live_facts(rows)
-        targets = [
-            row for row in live.values()
-            if needle in json.dumps(row, ensure_ascii=False)
-        ]
+        targets = [row for row in live.values() if _matches(row, needle, subject)]
         if not targets:
             continue
-        print(f"[purge] {path}: {len(targets)} live fact(s) match {needle!r}")
+        print(f"[purge] {path}: {len(targets)} live fact(s) match {label}")
         for row in targets:
             print(
                 f"  - {row.get('subject')} {row.get('predicate')} "
@@ -92,17 +123,30 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Supersede SemMem facts whose JSON contains a substring",
     )
-    parser.add_argument("--contains", required=True, help="substring to match")
+    parser.add_argument(
+        "--contains", default=None,
+        help="substring to match anywhere in the fact JSON",
+    )
+    parser.add_argument(
+        "--subject", default=None,
+        help=(
+            "subject prefix to match (e.g. mem.world.assertion.correct_answer). "
+            "Combined with --contains as AND."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--local-root", default=None)
     args = parser.parse_args(argv)
+
+    if args.contains is None and args.subject is None:
+        parser.error("at least one of --contains / --subject is required")
 
     root = (
         Path(args.local_root)
         if args.local_root
         else Path(__file__).resolve().parent.parent / "local"
     )
-    n = purge(root, args.contains, dry_run=args.dry_run)
+    n = purge(root, args.contains, subject=args.subject, dry_run=args.dry_run)
     print(f"[purge] {'would supersede' if args.dry_run else 'superseded'}: {n}")
     return 0
 

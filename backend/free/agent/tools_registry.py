@@ -37,6 +37,28 @@ class ToolDefinition:
     #: 会議テンプレート生成で 30 秒に達し、タイムアウト文言がそのまま回答に
     #: なった)。低速な環境ほど顕著なため、ツール側で宣言できるようにする。
     timeout_sec: float | None = None
+    #: 「このモードで使えるツールは何か」に **載せる** モード。既定は
+    #: :attr:`modes` と同じ。
+    #:
+    #: ``modes`` が制御するのは **選択** (分類器のメニュー / ``is_available``)
+    #: だけで、``execute()`` はモードを強制しない。そのため
+    #: 「``modes`` には無いが、そのモードの別の層から実際に実行される」ツールが
+    #: 生まれる。実インシデント (2026-08-27 ライブ監査): chat で
+    #: ``write_file`` を 3 回実行した直後に「使えるツールの一覧」を尋ねると、
+    #: ``write_file`` だけが抜けた一覧が返った (``modes=["create"]`` のため)。
+    #: 同じ会話の別の問いには「write_file を 3 回呼んだ」と正しく答えており、
+    #: **目録だけが実態とずれていた**。
+    #:
+    #: 選択側を広げると分類器が直接そのツールを選べるようになり、経由していた
+    #: 層のガード (パス解決 / action_blocked) を飛ばすため、**目録だけを**
+    #: 実態に合わせる。
+    inventory_modes: list[str] | None = None
+
+    def listed_in(self, mode: str | None) -> bool:
+        """``mode`` の capability summary に載せるべきか (純粋関数)。"""
+        if not mode:
+            return True
+        return mode in (self.inventory_modes or self.modes)
 
 
 class ToolsRegistry:
@@ -54,8 +76,14 @@ class ToolsRegistry:
         modes: list[str] | None = None,
         hidden: bool = False,
         timeout_sec: float | None = None,
+        inventory_modes: list[str] | None = None,
     ) -> None:
-        """ツールを登録"""
+        """ツールを登録
+
+        ``inventory_modes`` は「使えるツール一覧」に載せるモード
+        (既定は ``modes``)。選択可否は変えずに目録だけ広げたいときに使う
+        (:attr:`ToolDefinition.inventory_modes` の説明を参照)。
+        """
         self._tools[name] = ToolDefinition(
             name=name,
             func=func,
@@ -64,6 +92,7 @@ class ToolsRegistry:
             modes=modes or ["chat", "create"],
             hidden=hidden,
             timeout_sec=timeout_sec,
+            inventory_modes=inventory_modes,
         )
         logger.info("Registered tool: %s", name)
 
@@ -154,7 +183,7 @@ class ToolsRegistry:
         """
         lines = []
         for tool in self._tools.values():
-            if mode and mode not in tool.modes:
+            if not tool.listed_in(mode):
                 continue
             lines.append(f"- {tool.name}: {tool.description}")
         return "\n".join(lines)

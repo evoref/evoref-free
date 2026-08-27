@@ -11,6 +11,7 @@ context_description 生成に加え、STM ノート間の
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -47,9 +48,13 @@ _FALLBACK_SYSTEM_PROMPT = (
 #: sleep-time をベースモデル (27B) で回すようになり、素の線形スケールでは
 #: 呼出間に 3.86 秒 (= 1.0 × 27/7) の待機が入るようになった。1 サイクル 10〜15 件
 #: なら 40〜58 秒がまるまる待機で消える。インターバルの役割 (チャットへ GPU を
-#: 明け渡す) は、専有スロット (``background_slot``) と協調 yield
-#: (``is_user_active`` → キャンセル) が既に担っており、かつ大きいモデルほど
-#: 1 呼出自体が長くなるので、待機まで比例させる必要はない。
+#: 明け渡す) は :meth:`NoteEvolver.evolve_notes` の ``should_pause`` (1 件ごとの
+#: 協調 yield) が担っており、かつ大きいモデルほど 1 呼出自体が長くなるので、
+#: 待機まで比例させる必要はない。
+#:
+#: **専有スロットは当てにしない** — llama-server は全スロットを逐次実行するので
+#: ``background_slot`` は KV を分離するがレイテンシは分離しない
+#: (2026-08-27 ライブ監査で実測)。
 _MAX_INTERVAL_SCALE = 2.0
 
 
@@ -128,8 +133,13 @@ class NoteEvolver:
         short_term: ShortTermMemory,
         long_term: LongTermMemory,
         llm_client,
+        should_pause: Callable[[], bool] | None = None,
     ) -> int:
         """evolution_pending なノートの context_description を LLM で生成
+
+        Args:
+            should_pause: ``True`` を返したらループを打ち切る協調 yield。
+                残りのノートは ``evolution_pending`` のままなので次サイクルが拾う。
 
         Returns:
             進化させたノート数
@@ -220,7 +230,33 @@ class NoteEvolver:
         total_failures = 0
         total_attempts = 0
 
+        paused = 0
         for note in targets:
+            # 協調 yield: チャット生成が走っている間は 1 件ごとに手を止める。
+            #
+            # llama-server は**全スロットを逐次実行**する (launch_slot_ と
+            # release が交互に出る) ため、専有スロット (``background_slot``) は
+            # KV を分離するがレイテンシは分離しない。1 呼出 25〜30 秒 ×
+            # ``max_per_cycle`` 件が丸ごとユーザーターンの待ち時間に乗る。
+            #
+            # 実測 (2026-08-27 ライブ監査、Qwen3.8-27B / iGPU):
+            #   06:19:21 Full 開始 → 06:21:16〜06:25:28 に 10 件を逐次 LLM
+            #   06:23:06 に届いたユーザーターンの応答は 06:26:55 (228,311 ms)
+            #
+            # ここを止めても Full サイクル自体は完走する (Step 8 のファクト
+            # 抽出は別ステップ)。残りは ``evolution_pending`` のままなので
+            # 次サイクルが続きから拾う。``on_user_input`` 側の
+            # ``worker.cancel()`` は ``_full_forced_run`` のとき意図的に
+            # 呼ばれない (2026-08-22 の修正: 止めると Full が一度も完走しない)
+            # ので、**そこには頼れない**。
+            if should_pause is not None and should_pause():
+                paused = len(targets) - evolved - total_failures
+                logger.info(
+                    "Note evolution paused for the user turn: %d note(s) left "
+                    "pending for the next cycle", paused,
+                )
+                break
+
             # サーキットブレーカー: 連続3回失敗で残りをスキップ
             if consecutive_failures >= 3:
                 logger.warning(
@@ -264,6 +300,7 @@ class NoteEvolver:
         stats["llm_evolved"] = evolved
         stats["llm_failures"] = total_failures
         stats["rule_based_evolved"] = rule_based_evolved
+        stats["paused_for_user"] = paused
         stats["health_skipped"] = False
         self._log_op_stats(stats)
         return evolved + rule_based_evolved

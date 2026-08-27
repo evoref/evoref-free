@@ -27,7 +27,9 @@ from typing import TYPE_CHECKING
 from backend.free.core.stream_filter import strip_thinking_blocks
 from backend.free.core.text_quality import (
     has_verifiable_output_constraint,
+    length_disclosure_note,
     match_length_directive,
+    violates_enumeration_count,
     violates_length_constraint,
     violates_output_form,
 )
@@ -55,6 +57,7 @@ def violation_reason(query: str, response: str) -> str | None:
     return (
         violates_length_constraint(query, response)
         or violates_output_form(query, response)
+        or violates_enumeration_count(query, response)
     )
 
 
@@ -193,3 +196,43 @@ def _extract_text(result) -> str:
     else:
         return ""
     return strip_thinking_blocks(content).strip()
+
+async def verify_and_repair_sync(
+    *,
+    query: str,
+    response: str,
+    messages: "list[ChatMessage]",
+    client,
+    max_tokens: int | None = None,
+    generation_params: "GenerationParams | None" = None,
+) -> str:
+    """同期応答用: 検証 → 1 回だけ修復 → 直らなければ開示注記を付けて返す。
+
+    ストリーミング経路の ``_emit_verified_output`` と **同じ結末** を、本文を
+    まとめて持っている同期経路にも与える。検証も修復もストリーミング側に
+    しか無く、``stream=False`` の API 呼び出しは制約違反がそのまま返っていた
+    (``_log_chat_outcome`` が同期 deliberative だけ漏れていたのと同じ非対称)。
+
+    実測 (2026-08-27 ライブ監査、API 経由): 「木の家の良さを50字で説明して
+    ください。」に 34 文字で答え、修復も開示も走らなかった。検証器自体は
+    違反を正しく検出できている::
+
+        violates_length_constraint(q, a)
+          → 'asked for exactly 50 chars but the answer is 34'
+
+    発火するのは ``needs_verification(query)`` が真のターンだけなので、
+    通常の会話にコストは乗らない。
+    """
+    if not response.strip() or not needs_verification(query):
+        return response
+    final_text, unresolved = await repair_if_violated(
+        query=query,
+        response=response,
+        messages=messages,
+        client=client,
+        max_tokens=max_tokens,
+        generation_params=generation_params,
+    )
+    if unresolved is not None:
+        final_text += length_disclosure_note(query, final_text)
+    return final_text

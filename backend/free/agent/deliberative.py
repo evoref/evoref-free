@@ -27,6 +27,8 @@ from backend.free.constants import READ_FILE_META_PREFIX
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.tool_ledger import format_ledger
 from backend.free.core.intent_vocab import (
+    assistant_code_blocks,
+    prior_code_block_request,
     names_file_target,
     own_process_question,
     persist_request,
@@ -831,6 +833,50 @@ class DeliberativeAgent:
         )
         return position
 
+    def _append_prior_code_block_fact(
+        self, messages: list[dict], query: str, conversation: list[dict] | None,
+    ) -> bool:
+        """「過去に書いたコードをそのまま見せろ」に実物を渡す。
+
+        実物は会話窓にあるのに、モデルは記憶から書き直す。実インシデント
+        (2026-08-27 ライブ監査): 「最初に書いたメモ化前の関数をもう一度そのまま
+        見せてください。」に対し **メモ化後の lru_cache 版** を返した。5 ターン
+        前の実物がプロンプトに載っていたにもかかわらず。
+
+        ``asks_verbatim_excerpt`` は「逐語で見せろ」を検出できていたが、消費側は
+        few-shot の除外だけで **回答を接地する側では誰も使っていなかった**。
+        ツール目録 / 自己構成 / 実行台帳と同じで、決定論で確定する事実は
+        思い出させず、事実として渡す。
+
+        対象はフェンス付きコードブロックに限る — 機械的に切り出せて、
+        「どれを指しているか」が序数で確定できるため。
+
+        Returns:
+            注記したか。
+        """
+        index = prior_code_block_request(query)
+        if index is None:
+            return False
+        blocks = assistant_code_blocks(conversation)
+        if not blocks:
+            return False
+        try:
+            target = blocks[index]
+        except IndexError:
+            return False
+        append_to_last_user(
+            messages,
+            "\n\n確定事実: ユーザーが指しているのは以下のコードである。"
+            "これは会話履歴から機械的に取り出した実物なので、"
+            "**一字一句そのまま** 出力すること。書き直さないこと。\n"
+            "```\n" + target + "\n```",
+            separator="",
+        )
+        logger.info(
+            "Prior code block pinned (index=%d of %d)", index, len(blocks),
+        )
+        return True
+
     def _append_tool_inventory_fact(
         self, messages: list[dict], query: str, mode: str,
     ) -> bool:
@@ -1114,6 +1160,13 @@ class DeliberativeAgent:
         # SSOT)。ツールを撃つ意味は無いので、位置事実と同様に注記だけ足して
         # 判定経路を短絡させる。
         if self._append_tool_inventory_fact(messages, query, mode):
+            if tool_judge_task is not None and not tool_judge_task.done():
+                tool_judge_task.cancel()
+            return None, None, None, None, None
+
+        # 「過去に書いたコードをそのまま見せろ」も決定論で確定する
+        # (会話窓のフェンス付きブロックが SSOT)。ツールを撃つ意味は無い。
+        if self._append_prior_code_block_fact(messages, query, conversation):
             if tool_judge_task is not None and not tool_judge_task.done():
                 tool_judge_task.cancel()
             return None, None, None, None, None

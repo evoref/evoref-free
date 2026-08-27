@@ -19,6 +19,7 @@ from backend.free.agent.router import (
     is_environment_fact_query,
 )
 from backend.free.core.intent_vocab import (
+    asks_to_restate_prior_report,
     ANAPHORIC_OPERAND_RE,
     NUMBER_LITERAL_RE,
     is_plain_statement,
@@ -59,6 +60,7 @@ from backend.free.agent.tool_judge_dialogue import (
     _SYNTHESIS_CONTEXT_TURNS,
     _recent_dialogue_messages,
     _recent_dialogue_text,
+    query_needs_dialogue,
 )
 from backend.free.agent.tool_judge_signals import (
     _ASSISTANT_PREFERENCE_PATTERNS,
@@ -554,6 +556,15 @@ class ToolCallJudge:
         if (
             _HARDWARE_MEMORY_QUERY_RE.search(query)
             and tools_registry.is_available("system_hardware_info", mode)
+            # 既報の値の **再掲** 要求は測り直さない。値は揮発するので測り直せば
+            # 必ず違う値になり、ユーザーからは「さっきと言っていることが違う」に
+            # なる。実測 (2026-08-27 ライブ監査):
+            #   「このPCの空きRAMはどれくらいですか？」        → 23.1GB
+            #   「さっき教えてくれた空きRAMの値をもう一度」    → 22.7GB (測り直した)
+            # ツールを撃たなければ、値は会話窓に残っているのでモデルが読み上げる。
+            # 「もう一度測って」のような明示的な再計測要求は
+            # ``asks_to_restate_prior_report`` 側が False を返すので通る。
+            and not asks_to_restate_prior_report(query)
         ):
             hw_result = self._finalize(
                 ToolJudgement(
@@ -1154,7 +1165,18 @@ class ToolCallJudge:
         if schema is None:
             return None
 
-        messages = _recent_dialogue_messages(conversation)
+        # 対話窓は **照応のあるクエリだけ** に載せる。
+        #
+        # プロンプトは [system=ツールメニュー (毎回同一)][対話窓][クエリ] の順で、
+        # 中間の対話窓が毎ターン入れ替わるため接頭辞キャッシュが崩壊する。
+        # 通常 attention なら ``--cache-reuse`` (KV シフト) が救うが、hybrid
+        # recurrent モデルでは llama-server が cache_reuse ごと無効化するので
+        # 救えない (launch_llama.py が起動時に warning を出している事実)。
+        # 実測は ``query_needs_dialogue`` の docstring を参照。
+        if query_needs_dialogue(query):
+            messages = _recent_dialogue_messages(conversation)
+        else:
+            messages = []
         messages.append({"role": "user", "content": query})
         # 役割を宣言しないと、モデルは判定ではなく **回答本文** を書き始める
         # (詳細は _NATIVE_JUDGE_SYSTEM のコメント)。文法制約は形式を保証するが

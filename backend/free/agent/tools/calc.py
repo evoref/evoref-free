@@ -27,8 +27,21 @@ _SAFE_NODES = {
 # できない。Attribute ノードを許可しないため ``x.__class__`` 等の経由もできない。
 # ``**`` が既に許可されている以上、pow / factorial による巨大値生成のリスクは
 # 現状から増えない。
+#: ``sum`` は **載せない**。引数に渡せる列 (``range`` / リストリテラル) が
+#: どちらも作れないので構造的に到達不能で、それでいて名前だけは許可リストと
+#: エラーメッセージ (``_DISALLOWED_NODE_HINTS``) に出るため、モデルを必ず
+#: 失敗する式へ誘導していた。実測 (2026-08-27 ライブ監査):
+#:
+#:     sum(range(1,101))  -> Error: Unsafe expression (unknown name: range)
+#:     sum([1, 2, 3])     -> Error: Unsafe expression (disallowed node: List)
+#:
+#: 「1から100までの整数の和」で分類器が ``sum(range(1,101))`` を組み立てて
+#: 失敗し (agent_trace の reward=0.0)、暗算フォールバックでたまたま正答した
+#: ためユーザーからは見えなかった。``range`` を足す案は上限なしだと
+#: ``sum(range(10**12))`` を許すことになり、AST の許可面も広がるので採らない
+#: (数個の加算は ``1+2+3`` で足りる)。
 _SAFE_NAMES: dict[str, object] = {
-    "abs": abs, "round": round, "min": min, "max": max, "sum": sum,
+    "abs": abs, "round": round, "min": min, "max": max,
     "pow": pow,
     "sqrt": math.sqrt, "exp": math.exp,
     "log": math.log, "log2": math.log2, "log10": math.log10,

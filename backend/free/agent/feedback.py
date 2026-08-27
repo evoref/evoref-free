@@ -28,6 +28,8 @@ from backend.free.core.text_quality import (
     has_broken_ja_spacing,
     has_chinese_token_leak,
     retracts_own_conclusion,
+    value_was_adopted,
+    VALUE_REJECTION_RE,
     violates_length_constraint,
     violates_output_form,
 )
@@ -997,35 +999,19 @@ class FeedbackCollector:
             "the next turn decides", sorted(corrected), sorted(prior),
         )
 
-    #: 「100km ではありません」のように、直後で打ち消す言い回し。値に **言及した**
-    #: ことと **採用した** ことを分ける。実測 (2026-08-22 の修正検証): 訂正の
-    #: ターンで「東京と大阪の直線距離は約370kmです。約100kmという値は事実と
-    #: 異なります。」と即座に反論したため、訂正値 100 が本文に現れて「採用」と
-    #: 誤判定され、撤回が発火しなかった。
-    _VALUE_REJECTION_RE = re.compile(
-        r"(?:では?あり?ま?せん|ではなく|では無く|は誤り|は間違|"
-        r"正しくありません|事実と異な|正確ではあ|ではないです|ではない)",
-    )
+    #: 実装は :func:`~backend.free.core.text_quality.VALUE_REJECTION_RE` へ移した。
+    #: 記憶層 (``sleep.assertion_curator``) も同じ判定を要るため
+    #: (採らなかった値を world_fact にしない)、書き写すと必ず食い違う。
+    _VALUE_REJECTION_RE = VALUE_REJECTION_RE
 
     @classmethod
     def _values_adopted(cls, response: str, values: set[str]) -> bool:
         """応答が ``values`` のいずれかを **自分の答えとして採った** か。
 
-        単なる出現では判定しない。値の直後が打ち消しなら、言及はしていても
-        採用はしていない (``_VALUE_REJECTION_RE`` の説明を参照)。
+        実装は :func:`~backend.free.core.text_quality.value_was_adopted`
+        (pillar をまたぐ純粋関数の正準置き場)。
         """
-        text = response or ""
-        for value in values:
-            start = 0
-            while True:
-                idx = text.find(value, start)
-                if idx < 0:
-                    break
-                tail = text[idx + len(value): idx + len(value) + 14]
-                if not cls._VALUE_REJECTION_RE.search(tail):
-                    return True
-                start = idx + len(value)
-        return False
+        return value_was_adopted(response, values)
 
     def _settle_pending_correction(self, response: str) -> None:
         """保留中の訂正を、応答が採った値で確定 / 撤回する。
