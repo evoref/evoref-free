@@ -49,6 +49,11 @@ from backend.free.api.chat.chat_streaming import (
     stream_reactive_light, stream_staged_create,
     sync_deliberative, sync_long_form, sync_meta_cognitive, sync_reactive_light,
 )
+from backend.free.api.chat._artifact import (
+    peek_artifact,
+    references_artifact,
+    render_artifact_block,
+)
 from backend.free.api.chat._continuation import (
     TruncatedResponse,
     build_continuation_query,
@@ -68,6 +73,8 @@ from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
 from backend.free.agent.reactive import ReactiveAgent
 from backend.free.agent.router import ComplexityClassifier
+from backend.free.agent.issue_ledger import issue_ledger_scope
+from backend.free.agent.file_ledger import file_ledger_scope
 from backend.free.agent.tool_ledger import set_ledger_target
 from backend.free.core.stage_timer import StageTimer
 from backend.free.generation.orchestrator import LongFormOrchestrator
@@ -583,6 +590,7 @@ async def _dispatch_continuation(
                 mode=req.mode, max_tokens=max_tokens,
                 generation_params=gen_params, timer=timer, private=req.private,
                 cacheable=False,
+                continuation_tail=pending.tail,
             )),
             media_type="text/event-stream",
         )
@@ -593,6 +601,7 @@ async def _dispatch_continuation(
             mode=req.mode, max_tokens=max_tokens,
             generation_params=gen_params, timer=timer, private=req.private,
             cacheable=False,
+            continuation_tail=pending.tail,
         )
 
 
@@ -738,6 +747,43 @@ def _answered_attributes(
     return frozenset(asked & covered)
 
 
+#: 成果物ブロックへ割り当てる文字数の上限。動的ブロック全体の予算は
+#: ``build_messages`` が決めるので、ここは「渡す前に常識的な大きさへ畳む」
+#: ための上限にすぎない (入り切らなければ build_messages 側が更に切る)。
+_ARTIFACT_BLOCK_MAX_CHARS = 6000
+
+
+def _resolve_artifact_block(
+    state: AppState, session_id: str, query: str,
+) -> str | None:
+    """この発話が直前の成果物を指していれば、その参照ブロックを返す。
+
+    2 条件の AND:
+
+    1. **観測事実** — 直前ターンで長文成果物を作った (レジストリに在る)
+    2. この発話がそれを指している (:func:`references_artifact`)
+
+    1 を先に置くのが要点。「その」「全体」のような語だけで判定すると、
+    成果物が無いターンでも拾ってしまう。逆に成果物の **種類** を表す語
+    (計画書 / レポート / 仕様書 …) を列挙する方式は取らない — 属性語の
+    列挙は 2026-07 以降 4 回破れている。
+    """
+    if not session_id:
+        return None
+    artifact = peek_artifact(state, session_id)
+    if artifact is None or not references_artifact(query):
+        return None
+    block = render_artifact_block(
+        artifact, budget_chars=_ARTIFACT_BLOCK_MAX_CHARS, query=query,
+    )
+    logger.info(
+        "Artifact reference: injecting the previous long-form output "
+        "(%d chars stored, %d chars injected)",
+        len(artifact.text), len(block),
+    )
+    return block
+
+
 async def _build_messages_with_search(
     req: ChatRequest,
     state: AppState,
@@ -753,6 +799,7 @@ async def _build_messages_with_search(
     search_task: "asyncio.Task | None" = None,
     fewshot_block: str | None = None,
     covered_attributes: set[str] | None = None,
+    session_id: str = "",
 ) -> tuple[
     list, StreamWrapper, str | None,
     list[tuple[str, float, str]] | None, float | None,
@@ -820,9 +867,15 @@ async def _build_messages_with_search(
     finally:
         timer.stop("semmem_ms")
 
+    # 直前ターンで作った長文成果物が、この発話の対象になっているか。
+    # 長文は履歴予算に入らず次ターンで消えるため、これが無いとモデルは
+    # 「履歴に含まれていない」としか言えない (_artifact の説明を参照)。
+    artifact_block = _resolve_artifact_block(state, session_id, req.message)
+
     messages = build_chat_messages(
         system_prompt, history, rag_chunks, file_contexts,
         context_size, max_tokens,
+        artifact_block=artifact_block,
         rag_scored_chunks=scored_chunks,
         salience_ranker=salience_ranker,
         semmem_block=semmem_block,
@@ -839,6 +892,9 @@ async def _build_messages_with_search(
         ),
         # 会話の前半が窓外へ落ちている状態を「全体を走査する質問」にだけ伝える。
         evicted_turns=session_evicted_turns(state),
+        # 「何ターン目?」「「横浜」は何回?」は窓の中だけでは数えられない。
+        # 蓄積バッファを引くために session_id を渡す。
+        session_id=session_id,
     )
 
     sse_notify = SSEFrameBuilder()
@@ -1294,6 +1350,39 @@ async def _dispatch_staged_create(
     )
 
 
+def _with_artifact_material(
+    state: AppState, session_id: str, history: list,
+) -> list:
+    """直前の成果物を ``history`` の末尾へ合成 assistant 発話として足す。
+
+    ``MetaCognitiveAgent`` は ``conversation`` を
+    ``meta_cognitive_content._inject_recent_conversation`` へ渡し、書くべき
+    本文の素材にする。仕組みは既にあるが、長文成果物は履歴予算 (実測 1612
+    トークン) に入らず落ちているため **素材が空のまま生成が走る**。
+
+    素材が無いと小型モデルは別物を作る。実インシデントは 2 件:
+
+    - 2026-08-10: 「先ほどの JSON Schema の内容で上書きして」→ draft-07 の
+      別スキーマを新規作成
+    - 2026-08-27: 6696 文字の計画書を ``plan.md`` へ保存させたら、構成も
+      文面も違う 3867 文字の文書が書かれた (再生成した事実は非開示)
+
+    既に履歴へ載っている場合は足さない (同じ本文の二重掲載で素材予算を食う)。
+    """
+    artifact = peek_artifact(state, session_id)
+    if artifact is None:
+        return history
+    body = artifact.text
+    for msg in reversed(history[-6:]):
+        if isinstance(msg, dict) and body[:200] in (msg.get("content") or ""):
+            return history
+    logger.info(
+        "Artifact material: handing the previous long-form output to the "
+        "content generator (%d chars)", len(body),
+    )
+    return [*history, {"role": "assistant", "content": body}]
+
+
 async def _dispatch_meta_cognitive(
     req: ChatRequest,
     client,
@@ -1317,6 +1406,12 @@ async def _dispatch_meta_cognitive(
     rag_top1_score: float | None = None,
 ) -> StreamingResponse | ChatResponse:
     """Meta-Cognitive (通常) 経路: 計画 + ツールループ。"""
+    # 「その計画書を保存して」型の依頼に、直前の成果物を **素材** として渡す。
+    # ``_generate_content`` は既に「直近の会話」を素材にする仕組みを持つが、
+    # 長文成果物は履歴予算に入らず落ちているので素材が空になり、**別物を
+    # 新規生成して書き込む** (2026-08-27 ライブ監査 T10-8: 6696 文字の計画書を
+    # 保存させたら 3867 文字の別文書が書かれ、再生成した事実は開示されなかった)。
+    history = _with_artifact_material(state, session_id, history)
     # @self 仮想カートリッジ用 LoopFactView 配線
     loop_view = _resolve_loop_view_for_agent(state)
     # create モード: editor/chat 出力のコード生成を LongForm 細粒度生成へ委譲する
@@ -1507,6 +1602,11 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     # (``ToolsRegistry.execute``) が行い、ここは宛先を渡すだけ
     # (tool_ledger._current_target のコメント参照)。
     set_ledger_target(session_id, req.message)
+    # 不首尾の台帳も同じ宛先に向ける (tool_ledger と対)。自己申告の問いに
+    # 「システムが観測した不首尾」を決定論的に渡すための材料。
+    issue_ledger_scope(session_id, req.message)
+    # ファイル台帳も同じ宛先へ (「保存したファイルを読んで」の解決材料)。
+    file_ledger_scope(session_id)
     # system は静的 (query 非依存) に保ち KV キャッシュを効かせる。query 依存の
     # few-shot は動的ブロックとして最後の user メッセージへ前置する (build_messages)。
     system_prompt = _resolve_system_prompt(state, req.mode, instance_name)
@@ -1726,6 +1826,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 covered_attributes=covered_attributes,
                 search_task=search_task,
                 fewshot_block=fewshot_block,
+                session_id=session_id,
             )
         )
 

@@ -20,6 +20,32 @@ if TYPE_CHECKING:
 logger = get_logger("memory.conflict_resolver")
 
 
+def _is_user_utterance(note: object) -> bool:
+    """ユーザー本人の発話ノートか。
+
+    ``ConflictResolver`` は競合ペアを LLM で 1 つに統合し、
+    ``note_a.content`` を **生成文で上書き** して ``note_b`` を削除する。
+    アシスタント発話やツール出力の言い直しなら無害だが、ユーザー発話に
+    掛けると「ユーザーが何と言ったか」という唯一の接地が消える。
+
+    実インシデント (2026-08-27 ライブ監査の修正検証): STM に
+
+        「私の名前は御堂 陽介です。」          (言明)
+        「私の名前は御堂ではなく田中でしたよね。」 (確認を求める問い)
+
+    が並び、統合結果として **「私の名前は田中です。」** という
+    どちらでもない平叙文 1 件だけが残った。元の言明は削除され、
+    疑問形は言明へ変換されている。この書き換えは抽出より前に起きるため、
+    「確認形はファクトにしない」「訂正はスロットを supersede する」と
+    いった下流のガードは **content を見る時点で既に迂回されている**。
+
+    ユーザー発話の世代管理は SemMem の supersede が担う
+    (``sleep/extraction._supersede_corrected_slots``)。STM では両方を
+    そのまま残し、原文を壊さない。
+    """
+    return (getattr(note, "source", "user") or "user") == "user"
+
+
 class ConflictResolver:
     """類似度の高いノートを LLM で統合"""
 
@@ -89,11 +115,18 @@ class ConflictResolver:
 
         quarantine cooldown 中のノートを含むペアは除外する (livelock 防止)。
 
+        **ユーザー発話は対象外** (:func:`_is_user_utterance`)。統合は
+        ``note_a.content`` を LLM 生成文で上書きするため、ユーザー自身の
+        言葉が失われる。
+
         Returns:
             list of (note_id_a, note_id_b) pairs
         """
         now = time.time()
-        notes = [n for n in short_term.notes.values() if n.embedding is not None]
+        notes = [
+            n for n in short_term.notes.values()
+            if n.embedding is not None and not _is_user_utterance(n)
+        ]
         if len(notes) < 2:
             self._last_cooldown_skipped = 0
             return []

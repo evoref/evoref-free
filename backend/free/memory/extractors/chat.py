@@ -39,6 +39,7 @@ from backend.free.memory.extractors.base import (
 )
 from backend.free.memory.notes.note_builder import (
     ChatNoteBuilder,
+    _CONFIRMATION_SEEKING_RE,
     _normalize_trigger,
     resolve_fact_attribute_match,
     resolve_fact_attribute_matches,
@@ -143,6 +144,16 @@ _QUESTION_ENDING_RE = re.compile(
 #: 文区切り (。！？!?) の直後で分割する。
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?])\s*")
 
+#: 節区切り (読点を含む) の直後で分割する。文単位で属性を分けられないときの
+#: 第 2 段。日本語は 1 文へ複数属性を読点で並べるのが常態で、文単位だけでは
+#: 「職業はデータベース管理者で、名古屋に住んでいます。」を分離できない。
+_CLAUSE_SPLIT_RE = re.compile(r"(?<=[。！？!?、，,])\s*")
+
+#: 節を根拠に採ったときに末尾へ残る接続。読点と、その直前の連用形の
+#: 断定辞 ``で`` (「職業はデータベース管理者で、」) を落として命題にする。
+#: ``て`` (「住んでいて、」) は動詞の一部なので対象外。
+_CLAUSE_TAIL_RE = re.compile(r"(?<![ていしっ])で?[、，,]\s*$")
+
 
 def _tag_evidence_is_question_only(content: str, trigger_words: tuple[str, ...]) -> bool:
     """トリガ語を含む文が、すべて **ユーザー自身の表明でない** かを判定する。
@@ -177,6 +188,13 @@ def _tag_evidence_is_question_only(content: str, trigger_words: tuple[str, ...])
         # 依頼形の判定は共通実装を使う。
         s = sentence.strip()
         if _QUESTION_ENDING_RE.search(s):
+            return True
+        # 「〜でしたよね」「〜でしたっけ」は確認を求める問い。``です/ます + か``
+        # を見る _QUESTION_ENDING_RE では拾えないが、本人の言明ではないので
+        # ファクトの根拠にしない (2026-08-27 ライブ監査 T14: 「私の名前は御堂
+        # ではなく田中でしたよね。」が mem.personal.name のファクトになり、
+        # 訂正前の値と並んで live のまま残った)。
+        if _CONFIRMATION_SEEKING_RE.search(s):
             return True
         if not _REQUEST_ENDING_RE.search(s):
             return False
@@ -282,31 +300,67 @@ def _attribute_evidence_text(
     """
     if not attr_words or not content:
         return ""
-    sentences = [s for s in _SENTENCE_SPLIT_RE.split(content) if s.strip()]
-    if len(sentences) < 2:
+    narrowed = _narrow_by_units(
+        content, _SENTENCE_SPLIT_RE, attr_words, all_attr_words,
+    )
+    if narrowed:
+        return narrowed
+    # 文単位で分けられなかった。1 文へ複数属性を読点で並べた形
+    # (「職業はデータベース管理者で、名古屋に住んでいます。」) は節単位なら
+    # 分離できる。**他属性のトリガ語が渡っているときだけ** 試す — 単一属性の
+    # 発話を節へ刻むと、値を運ぶ節が落ちて命題が壊れる。
+    if not _has_other_attribute_words(attr_words, all_attr_words):
+        return ""
+    narrowed = _narrow_by_units(
+        content, _CLAUSE_SPLIT_RE, attr_words, all_attr_words,
+    )
+    return _CLAUSE_TAIL_RE.sub("", narrowed) if narrowed else ""
+
+
+def _has_other_attribute_words(
+    attr_words: tuple[str, ...], all_attr_words: tuple[str, ...],
+) -> bool:
+    """``all_attr_words`` に ``attr_words`` 以外の属性語が含まれるか。"""
+    own = set(attr_words)
+    return any(word not in own for word in all_attr_words)
+
+
+def _narrow_by_units(
+    content: str,
+    splitter: re.Pattern[str],
+    attr_words: tuple[str, ...],
+    all_attr_words: tuple[str, ...],
+) -> str:
+    """``splitter`` の単位で ``attr_words`` の根拠だけを残す (絞れなければ "")。
+
+    :func:`_attribute_evidence_text` の本体。文単位・節単位で 2 回使うため、
+    分割規則だけを差し替えられるように切り出してある。
+    """
+    units = [u for u in splitter.split(content) if u.strip()]
+    if len(units) < 2:
         return ""
 
     kept: list[str] = []
     awaiting_value = False
-    for sentence in sentences:
-        if _mentions_any(sentence, attr_words):
-            kept.append(sentence)
+    for unit in units:
+        if _mentions_any(unit, attr_words):
+            kept.append(unit)
             # 値を述べていない属性文 (「職業も変わりました。」) だけが
             # 後続文を引き継ぐ。値がある文は従来どおり単独で完結させる。
-            awaiting_value = not _states_attribute_value(sentence, attr_words)
+            awaiting_value = not _states_attribute_value(unit, attr_words)
             continue
         if not all_attr_words:
             # 引き継ぎ無効 (呼出側が全属性語を渡していない) = 従来どおり。
             continue
-        if _mentions_any(sentence, all_attr_words):
+        if _mentions_any(unit, all_attr_words):
             # 別属性の文。以降の「属性語なし」文はそちらに属する。
             awaiting_value = False
             continue
-        if awaiting_value and not _carries_no_value(sentence):
-            kept.append(sentence)
+        if awaiting_value and not _carries_no_value(unit):
+            kept.append(unit)
             awaiting_value = False  # 引き継ぐのは 1 文だけ
 
-    if not kept or len(kept) == len(sentences):
+    if not kept or len(kept) == len(units):
         return ""
     return "".join(kept).strip()
 
@@ -426,8 +480,42 @@ def _collapse_equivalent_candidates(
     return kept, collapsed
 
 
+def _relevant_sentences(
+    text: str, trigger_words: tuple[str, ...],
+) -> list[str]:
+    """トリガ語を含む文と、**その値を運ぶ後続文** を返す (純粋関数)。
+
+    トリガ語を含む文だけを残すと、日本語でごく普通の
+    「属性名を出す文」+「値を述べる文」の組から **値の側が落ちる**:
+
+        「職業も変わりました。今は構造設計士です。」
+          → 旧: 「職業も変わりました」   (値が無い)
+          → 新: 「職業も変わりました。今は構造設計士です」
+
+    :func:`_attribute_evidence_text` は同じ規則を既に持っていたが、
+    ``statement`` 側にだけ無かった。``fact.text`` は statement を優先する
+    ため、根拠本文を正しく絞っても **注入される 1 行は値を失っていた**
+    (2026-08-27 ライブ監査の再検証で、新規セッションへ「職業も変わりました」
+    という記録だけが露出した)。
+    """
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    kept: list[str] = []
+    awaiting_value = False
+    for sentence in sentences:
+        if any(t in sentence.lower() for t in trigger_words):
+            kept.append(sentence)
+            awaiting_value = not _states_attribute_value(sentence, trigger_words)
+            continue
+        if awaiting_value and not _carries_no_value(sentence):
+            kept.append(sentence)
+            awaiting_value = False  # 引き継ぐのは 1 文だけ
+    return kept
+
+
 def normalize_statement(
-    content: str, trigger_words: tuple[str, ...],
+    content: str,
+    trigger_words: tuple[str, ...],
+    attr_words: tuple[str, ...] = (),
 ) -> str | None:
     """発話原文から「ユーザーについての命題」を規則だけで切り出す (純粋関数)。
 
@@ -463,12 +551,13 @@ def normalize_statement(
     if not text:
         return None
     kept = strip_interrogative_sentences(text)
-    if trigger_words:
-        sentences = [s for s in _SENTENCE_SPLIT_RE.split(kept) if s.strip()]
-        relevant = [
-            s for s in sentences
-            if any(t in s.lower() for t in trigger_words)
-        ]
+    # 文の取捨は **その属性のトリガ語** で行う。fact_type のトリガ語
+    # (``私は`` / ``ではなく`` / ``変わりました`` …) は属性を指さないので、
+    # 「値なしの属性文」を判定できず後続文の引き継ぎが働かない
+    # (``職業も変わりました。今は構造設計士です。`` の値が落ちていた)。
+    relevance_words = attr_words or trigger_words
+    if relevance_words:
+        relevant = _relevant_sentences(kept, relevance_words)
         if relevant:
             kept = "".join(relevant)
     kept = kept.strip()
@@ -580,6 +669,111 @@ def _world_fact_subject_parts(keyword: str, content: str) -> tuple[str, str]:
     return keyword, digest
 
 
+#: 値アンカーで採用する最短の値。1 文字の値 (「猫」「A」) は別の文へ偶然
+#: 含まれるため、スロットの決め手にしない。
+_VALUE_ANCHOR_MIN_CHARS = 2
+
+
+def _value_anchors(value: str) -> tuple[str, ...]:
+    """スロットの現在値から、照合に使う文字列を取り出す (純粋関数)。
+
+    ``fact.text`` は命題 (「名古屋に住んでいます」) であって値そのもの
+    (「名古屋」) ではない。訂正はふつう値だけを名指す — 「さっき**名古屋**と
+    言いましたが、正しくは横浜です。」— ので、命題まるごとで部分一致を取ると
+    永久に当たらない。
+
+    形態素解析は入れず、``_CONTENT_RUN_RE`` の内容語 (漢字 / カタカナ /
+    ラテン文字 / 数字が 2 文字以上) を候補にする。助詞と述語はひらがな
+    なので自然に落ちる:
+
+        「名古屋に住んでいます」        → ("名古屋に住んでいます", "名古屋")
+        「職業はデータベース管理者」    → (..., "職業", "データベース管理者")
+
+    命題そのものも候補に残す (値がひらがなだけの場合の保険)。
+    """
+    text = (value or "").strip()
+    if len(text) < _VALUE_ANCHOR_MIN_CHARS:
+        return ()
+    anchors = [text]
+    anchors.extend(
+        run for run in _CONTENT_RUN_RE.findall(text)
+        if len(run) >= _VALUE_ANCHOR_MIN_CHARS
+    )
+    return tuple(dict.fromkeys(anchors))
+
+
+def resolve_value_anchored_attributes(
+    notes: Iterable[MemoryNote],
+    live_values: dict[tuple[str, str], tuple[str, ...]],
+) -> dict[tuple[str, str], str]:
+    """訂正が **どのスロットの現在値** を名指しているかで属性を決める (純粋関数)。
+
+    ``(note_id, tag) -> attr`` を返す。
+
+    従来、訂正のスロットは属性語 (``住んで`` / ``在住`` / ``職業`` …) の
+    列挙で解決していた。日本語の訂正は属性名を落として値だけを言い直すのが
+    普通なので、この列挙は繰り返し破れてきた — 2026-07-26 / 2026-08-22 /
+    2026-08-25 と 3 回、実インシデントのたびに語を足している。
+
+    2026-08-27 ライブ監査で 4 回目が出た::
+
+        「さっき名古屋と言いましたが、正しくは横浜です。訂正します。」
+
+    ``location`` のトリガ語 (``在住`` / ``住んで`` / ``住まい`` / ``出身`` /
+    ``引っ越`` / ``地元`` / ``勤務地``) を **1 つも含まない**。結果
+    ``candidate_fact_tags`` が 0 件を返し、``resolve_inherited_attributes``
+    による継承にすら到達せず、``横浜`` を含むファクトが 1 件も生まれなかった。
+    新規セッションでの想起は 2 回とも訂正前の「名古屋」を返した。
+
+    語を足す代わりに **ストアが既に持っている値** を手掛かりにする。訂正は
+    必ず古い値と新しい値を 1 文へ同居させるので、古い値の側が既存スロットの
+    現在値と一致すれば、それがこの訂正の宛先である。
+
+    - 「さっき **名古屋** と言いましたが、正しくは横浜です。」
+      → ``名古屋`` は ``mem.personal.location`` の現在値 → location への訂正
+    - 「さっきの 1234 × 5678 の答えは間違っています。正しくは 7006653 です。」
+      → どのスロットの現在値とも一致しない → **不採用** (2026-08-23 の
+        実インシデントで birthday と food の両方へ書かれた発話)
+
+    語彙表の保守が要らず、宛先が実在するスロットに限られるので誤爆も閉じる。
+    自属性が解決できる発話・継承で解決できる発話には手を出さない
+    (呼出側が最後の手段として使う)。
+
+    Args:
+        notes: 走査対象のノート。``is_correction`` が立っているものだけ見る。
+        live_values: ``{(tag, attr): (現在値, ...)}``。ストアの live ファクトの
+            ``text`` から呼出側が組む。
+
+    Returns:
+        ``(note_id, tag) -> attr``。解決できなかったノートは含まない。
+    """
+    if not live_values:
+        return {}
+    resolved: dict[tuple[str, str], str] = {}
+    for note in notes:
+        if not getattr(note, "is_correction", False):
+            continue
+        content = note.content or ""
+        if not content:
+            continue
+        haystack = _normalize_trigger(content)
+        #: 同じ発話が複数スロットの値を含むことがある (「職業はデータベース
+        #: 管理者ではなく…」は occupation の値と pet の「猫」を同時に含みうる)。
+        #: **より長く一致した方** を採る — 短い値ほど偶然の混入になりやすい。
+        best: dict[str, tuple[int, str]] = {}
+        for (tag, attr), values in live_values.items():
+            for value in values:
+                for anchor in _value_anchors(value):
+                    if _normalize_trigger(anchor) not in haystack:
+                        continue
+                    current = best.get(tag)
+                    if current is None or len(anchor) > current[0]:
+                        best[tag] = (len(anchor), attr)
+        for tag, (_length, attr) in best.items():
+            resolved[(note.id, tag)] = attr
+    return resolved
+
+
 def resolve_inherited_attributes(
     notes: list[MemoryNote], builder: "ChatNoteBuilder",
 ) -> dict[tuple[str, str], str]:
@@ -675,6 +869,13 @@ class ChatExtractor(BaseExtractor):
         # 訂正ノートが継ぐ属性を先に決める (本ループの順序は変えない —
         # apply_session_caps の採否順に影響するため)。
         inherited = resolve_inherited_attributes(note_list, self._builder)
+        # 属性語も継承も効かない訂正を、既存スロットの現在値で拾い直す。
+        # 「さっき名古屋と言いましたが、正しくは横浜です。」は location の
+        # トリガ語を 1 つも含まず、候補タグ 0 件で入口に到達しなかった
+        # (resolve_value_anchored_attributes の説明を参照)。
+        value_anchored = resolve_value_anchored_attributes(
+            note_list, ctx.live_attribute_values,
+        )
         for note in note_list:
             if not self.is_eligible(note, self.mode):
                 result.notes_skipped += 1
@@ -710,6 +911,11 @@ class ChatExtractor(BaseExtractor):
                 result.notes_skipped += 1
                 continue
             tags = self._builder.candidate_fact_tags(content)
+            # 値アンカーで宛先が決まったタグは、トリガ語が無くても候補にする。
+            tags = tags + [
+                tag for (note_id, tag) in value_anchored
+                if note_id == note.id and tag not in tags
+            ]
             for tag in tags:
                 if tag not in self.SUPPORTED_TAGS:
                     continue
@@ -717,7 +923,8 @@ class ChatExtractor(BaseExtractor):
                 kind = _KIND_BY_TAG[tag]
                 #: (subject, その属性の根拠に絞った本文) の列。
                 #: 1 発話が複数属性を述べていれば複数要素になる。
-                attr_specs: list[tuple[str, str]] = []
+                #: (subject, 根拠本文, その属性のトリガ語) の列。
+                attr_specs: list[tuple[str, str, tuple[str, ...]]] = []
                 if tag in _USER_SUBJECT_TAGS:
                     # ファイル出力の指示文 (明示パス付き) は嗜好/感情ではなく
                     # 作業依頼なので preference/emotion/opinion にしない。
@@ -752,7 +959,15 @@ class ChatExtractor(BaseExtractor):
                     if not matches:
                         # 属性語を落とした訂正は直前の言明からスロットを継ぐ
                         # (resolve_inherited_attributes の説明を参照)。
-                        matches = [(inherited.get((note.id, tag)) or "user", ())]
+                        # 継承も効かないときは、訂正文が名指した既存スロットの
+                        # 現在値から決める (value_anchored)。継承より後に置くのは
+                        # 「直前の言明」の方が近い文脈だから。
+                        matches = [(
+                            inherited.get((note.id, tag))
+                            or value_anchored.get((note.id, tag))
+                            or "user",
+                            (),
+                        )]
                     # 「属性語を含まない文は直前の属性文に属する」判定に、
                     # この発話で解決した全属性のトリガ語を渡す
                     # (詳細は _attribute_evidence_text の docstring)。
@@ -765,6 +980,7 @@ class ChatExtractor(BaseExtractor):
                             _attribute_evidence_text(
                                 content, attr_words, all_attr_words,
                             ) or content,
+                            attr_words,
                         )
                         for attr, attr_words in matches
                     ]
@@ -792,8 +1008,9 @@ class ChatExtractor(BaseExtractor):
                             kind, *_world_fact_subject_parts(keyword, content),
                         ),
                         content,
+                        (),
                     )]
-                for subject, evidence in attr_specs:
+                for subject, evidence, attr_words in attr_specs:
                     fact = self.make_fact(
                         subject=subject,
                         predicate=_PREDICATE_BY_TAG.get(tag, "states"),
@@ -810,6 +1027,7 @@ class ChatExtractor(BaseExtractor):
                         statement=normalize_statement(
                             evidence,
                             tuple(self._builder.fact_triggers.get(tag, ())),
+                            attr_words,
                         ),
                         fact_type=fact_type,
                         scope=SemanticFact.make_global_scope(),

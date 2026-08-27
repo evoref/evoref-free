@@ -161,6 +161,86 @@ class StreamThinkingFilter:
         )
 
 
+class ContinuationRepeatFilter:
+    """継続生成の冒頭にある **直前応答の末尾の再掲** を落とす。
+
+    接続点を示すために ``[直前の応答の末尾]`` を見せると、モデルはそこから
+    書き始める — つまり再掲する。プロンプトには「既に書いた部分は繰り返さない」
+    と明記してあるが、実測では効かない (2026-08-27 ライブ監査 T10-3)。
+    指示に期待せず、出力側で保証する。
+
+    判定は文単位。冒頭の文が ``tail`` と十分に重なっていれば落とし、重ならない
+    文が出た時点で以降は素通しにする。**逐語一致は要求しない** — 実データの
+    再掲は前半が言い換えられていた (``_continuation.strip_repeated_prefix``
+    の説明を参照)。
+
+    先頭の判定が済むまで出力を保持するので、その分だけ表示が遅れる。保持は
+    文末か :data:`_MAX_BUFFER_CHARS` までで、無制限には溜めない。
+
+    StreamFilter プロトコルに準拠: process() / flush()
+    """
+
+    #: 判定のために保持する最大文字数 (文末が来なくてもここで打ち切る)。
+    _MAX_BUFFER_CHARS = 240
+
+    #: 冒頭から見る文の数。それを超えたら以降は素通し。
+    _MAX_SENTENCES = 3
+
+    def __init__(self, tail: str) -> None:
+        self._tail = tail or ""
+        self._buffer = ""
+        self._sentences_checked = 0
+        self._passthrough = not self._tail
+
+    def process(self, chunk: str) -> str | None:
+        if self._passthrough:
+            return chunk
+        self._buffer += chunk
+        out: list[str] = []
+        while not self._passthrough:
+            emitted = self._drain_ready_sentence()
+            if emitted is None:
+                break
+            if emitted:
+                out.append(emitted)
+        return "".join(out) or None
+
+    def _drain_ready_sentence(self) -> str | None:
+        """判定できる 1 文を処理する。まだ判定できなければ ``None``。"""
+        from backend.free.api.chat._continuation import strip_repeated_prefix
+
+        idx = _SENTENCE_TERMINATOR_RE.search(self._buffer)
+        over_cap = len(self._buffer) >= self._MAX_BUFFER_CHARS
+        if idx is None and not over_cap:
+            return None
+        cut = idx.end() if idx is not None else len(self._buffer)
+        sentence, self._buffer = self._buffer[:cut], self._buffer[cut:]
+        self._sentences_checked += 1
+        kept = strip_repeated_prefix(sentence, self._tail)
+        if kept.strip():
+            # 再掲でない文が出た = 以降は本文。素通しへ切り替える。
+            self._passthrough = True
+            return kept + self._buffer if self._buffer else kept
+        if self._sentences_checked >= self._MAX_SENTENCES:
+            self._passthrough = True
+            return self._buffer
+        return ""
+
+    def flush(self) -> str | None:
+        if self._passthrough:
+            return None
+        from backend.free.api.chat._continuation import strip_repeated_prefix
+
+        rest, self._buffer = self._buffer, ""
+        self._passthrough = True
+        kept = strip_repeated_prefix(rest, self._tail) if rest else ""
+        return kept or None
+
+
+#: 文末。``ContinuationRepeatFilter`` が 1 文を切り出すのに使う。
+_SENTENCE_TERMINATOR_RE = re.compile(r"[。．.!！?？]\s*")
+
+
 class RepetitionGuardFilter:
     """同一行の暴走反復を検知して以降の出力を打ち切る。
 
@@ -191,6 +271,11 @@ class RepetitionGuardFilter:
     _MIN_LINE_CHARS = 12
     _MAX_CONSECUTIVE = 3
     _MAX_DUPLICATE_LINES = 4
+    #: これ以上の長さの行は「たまたま同じ」が起こらない。短い箇条書きの項目は
+    #: 正当に繰り返しうるが、長い段落が逐語で再出現するのは退化しかない。
+    _LONG_LINE_CHARS = 60
+    #: 長い行に適用する、より厳しい再出現の上限。
+    _MAX_DUPLICATE_LONG_LINES = 2
     _LIST_MARKER_RE = re.compile(r"^(?:\d{1,3}[.)]|[-*+・>#]+)\s*")
 
     #: 1 行の中で同一トークンが連続してよい回数の上限。判定が行単位なので
@@ -290,7 +375,19 @@ class RepetitionGuardFilter:
             return False
         if normalized in self._seen_lines:
             self._duplicate_count += 1
-            if self._duplicate_count >= self._MAX_DUPLICATE_LINES:
+            # 長い段落の逐語再出現は少ない回数で打ち切る。
+            #
+            # 実インシデント (2026-08-27 ライブ監査 T09-8): 118 文字の同じ段落が
+            # 5 回現れる 1008 文字の応答が **そのまま画面に出た**。一律 4 回の
+            # 閾値では ``_duplicate_count`` が 3 までしか上がらず発火しない —
+            # 最後の 1 回は上限で切れて改行が来ず、行として評価されないため。
+            # 長さで閾値を変えれば 3 回目の出現で止まる。
+            limit = (
+                self._MAX_DUPLICATE_LONG_LINES
+                if len(normalized) >= self._LONG_LINE_CHARS
+                else self._MAX_DUPLICATE_LINES
+            )
+            if self._duplicate_count >= limit:
                 logger.warning(
                     "RepetitionGuardFilter: truncated output after %d duplicated "
                     "lines (line=%.40s)",

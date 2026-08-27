@@ -18,12 +18,18 @@
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 
 from backend.app_state import AppState
 from backend.free.core.intent_vocab import continuation_request
+from backend.log_config import get_logger
 from backend.utils import utc_now_dt
+
+logger = get_logger("api.chat.continuation")
 
 __all__ = [
     "TruncatedResponse",
@@ -32,6 +38,7 @@ __all__ = [
     "take_continuation",
     "is_continuation_request",
     "build_continuation_query",
+    "strip_repeated_prefix",
     "resume_from_last_response",
 ]
 
@@ -129,6 +136,83 @@ def is_continuation_request(query: str) -> bool:
     すると質問そのものが失われる)。
     """
     return continuation_request(query)
+
+
+#: 復唱とみなす最短の重なり。これ未満は偶然の一致がありうる
+#: (「また、」「その後」のような接続句)。
+MIN_REPEATED_OVERLAP_CHARS = 12
+
+#: 1 文がどれだけ ``tail`` と重なったら復唱とみなすか (文の長さに対する割合)。
+#: 実インシデントの復唱は 77% だった。0.6 は「言い換えを含む再掲」を拾い、
+#: 「同じ語をいくつか使った続き」は拾わない位置。
+REPEATED_SENTENCE_RATIO = 0.6
+
+#: 先頭から見る文の数の上限。それ以上に長い再掲は「続き」ではなく別の問題。
+MAX_REPEATED_SENTENCES = 3
+
+_SENTENCE_END_RE = re.compile(r"(?<=[。．.!！?？])")
+
+
+def _normalize_for_overlap(text: str) -> str:
+    """重なり判定用に空白と改行を落とす (純粋関数)。"""
+    return "".join((text or "").split())
+
+
+def _longest_common_run(a: str, b: str) -> int:
+    """``a`` と ``b`` の最長共通部分文字列の長さ (純粋関数)。"""
+    if not a or not b:
+        return 0
+    match = SequenceMatcher(None, a, b, autojunk=False).find_longest_match(
+        0, len(a), 0, len(b),
+    )
+    return match.size
+
+
+def strip_repeated_prefix(continuation: str, tail: str) -> str:
+    """継続出力の先頭にある **直前応答の末尾の再掲** を落とす (純粋関数)。
+
+    接続点を示すために ``[直前の応答の末尾]`` を見せると、モデルはそこから
+    書き始める — つまり再掲する。プロンプトには「既に書いた部分は繰り返さない」
+    と明記してあるが、実測では効かない。
+
+    実インシデント (2026-08-27 ライブ監査 T10-3)::
+
+        2/8 の末尾: 「…継続的な交流や次なる企画立案の基盤として活用していく
+                     ことで、旅の意義を長期的に持続させることができる。」
+        3/8 の冒頭: 「長期的な交流や企画立案の基盤として活用していくことで、
+                     旅の意義を長期的に持続させることができる。」
+
+    **逐語ではなく前半が言い換えられている** ので、接尾辞と接頭辞の完全一致
+    では捕まらない。文単位で見て、その文の :data:`REPEATED_SENTENCE_RATIO`
+    以上が ``tail`` 内の連続部分として現れるなら再掲とみなして落とす。
+    上の実データの重なりは 77% だった。
+    """
+    body = (continuation or "").lstrip()
+    if not body or not tail:
+        return continuation or ""
+    flat_tail = _normalize_for_overlap(tail)
+    if not flat_tail:
+        return continuation or ""
+
+    sentences = [x for x in _SENTENCE_END_RE.split(body) if x]
+    dropped = 0
+    for sentence in sentences[:MAX_REPEATED_SENTENCES]:
+        flat = _normalize_for_overlap(sentence)
+        if len(flat) < MIN_REPEATED_OVERLAP_CHARS:
+            break
+        run = _longest_common_run(flat, flat_tail)
+        if run < MIN_REPEATED_OVERLAP_CHARS:
+            break
+        if run / len(flat) < REPEATED_SENTENCE_RATIO:
+            break
+        dropped += len(sentence)
+    if dropped <= 0:
+        return continuation or ""
+    logger.info(
+        "Continuation: dropped %d chars restated from the previous response "
+        "tail", dropped,
+    )
+    return body[dropped:].lstrip()
 
 
 def build_continuation_query(pending: TruncatedResponse) -> str:

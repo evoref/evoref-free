@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -15,10 +16,16 @@ from backend.free.api.chat.chat_recorder import clear_session_data, drain_evicte
 from backend.free.api.chat.chat_types import ChatMessage, FileContextDict
 from backend.free.api.schemas import ChatRequest
 from backend.free.core.intent_vocab import (
+    _PRIOR_OUTPUT_CODE_RE,
+    conversation_turn_count_question,
     is_whole_session_scope_query,
+    referenced_quantity,
+    occurrence_count_term,
     self_output_measure_kinds,
 )
 from backend.free.core.session_mode import is_chat_mode, normalize_session_mode
+from backend.free.core.text_quality import count_response_lines
+from backend.free.core.text_quality import conversational_numeric_claims
 from backend.free.core.inference import build_messages
 from backend.free.core.turn_text import append_to_last_user
 from backend.free.llm.llm_client import LLMClient
@@ -170,6 +177,13 @@ async def prepare_memory_context(
         except Exception as exc:
             logger.warning("correction detection failed (continuing): %s", exc)
             correction = False
+        if correction:
+            # 「この会話で私が訂正した回数は何回ですか。」に答える材料。
+            # 監査では「1回です」(実際は 4 回) と答え、しかも挙げた 1 件は
+            # **モデルがユーザーを訂正した** ケースで主体が逆だった。
+            from backend.free.agent.issue_ledger import record_correction
+
+            record_correction(requested_session, req.message)
         wm.add_turn(
             "user",
             req.message,
@@ -323,6 +337,12 @@ async def run_search_pipeline(
             lazy_contextual=state.lazy_contextual,
             session_id=session_id,
             judge_tracker=state.judge_tracker,
+            # STM は [関連する記憶] と [参考情報] の 2 経路で注入される。
+            # 訂正で退役した値は **両方**で止める (片方だけだともう片方から
+            # 訂正前の値が返る — 2026-08-27 実機検証)。
+            retired_note_ids=_collect_retired_note_ids(
+                state, state.current_project_id,
+            ),
         )
         if not search_result.skipped and search_result.sources:
             rag_chunks = [content for _, _, content in search_result.sources]
@@ -494,6 +514,49 @@ def _session_user_texts(state: AppState) -> list[str]:
         return []
 
 
+def _collect_retired_note_ids(state, project_id: str | None) -> set[str]:
+    """値が supersede された発話ノートの ID を集める。
+
+    SemMem 側で世代を閉じても (``sleep/extraction._supersede_corrected_slots``)、
+    その値を述べた **STM ノートの原文** はそのまま残る。STM は
+    ``[関連する記憶]`` の Tier 2 として注入されるので、訂正前の発話が
+    「現在値」として読まれ続ける。
+
+    実機検証 (2026-08-27、クリーンなストア):
+    ``mem.personal.occupation`` は「データベース管理者」が supersede され
+    「ネットワークエンジニア」が live になっていたにもかかわらず、新規
+    セッションの「私の職業と住んでいる場所を教えてください。」が
+    **「データベース管理者」** を返した。供給元は STM に残った
+    「職業はデータベース管理者で、名古屋に住んでいます。」のノートだった。
+
+    ノート単位で見て、そこから生まれたファクトが **すべて** supersede
+    済みのときだけ落とす。1 つでも live が残っていれば、そのノートは
+    まだ現在値を運んでいる。
+
+    履歴そのものは消さない — ``search_history`` や会話履歴ファイルからは
+    従来どおり辿れる。ここで止めるのは「現在値として黙って提示する」経路
+    だけ。
+    """
+    retired: dict[str, bool] = {}
+    for scope in ("global", f"project:{project_id}" if project_id else None):
+        if scope is None:
+            continue
+        try:
+            store = state.get_semantic_store(scope)
+            all_facts = store.all_facts(include_superseded=True)
+        except Exception:
+            continue
+        for fact in all_facts:
+            is_retired = bool(getattr(fact, "superseded_by", None))
+            for prov in getattr(fact, "provenances", ()) or ():
+                note_id = getattr(prov, "note_id", None)
+                if not note_id:
+                    continue
+                # live が 1 つでもあれば False で確定させる。
+                retired[note_id] = retired.get(note_id, True) and is_retired
+    return {note_id for note_id, only_retired in retired.items() if only_retired}
+
+
 def build_semmem_injection(
     state: AppState, cfg: dict, mode: str = "chat",
     conflict_ctx: ConflictTurnContext | None = None,
@@ -558,6 +621,7 @@ def build_semmem_injection(
             except Exception:
                 continue
         stm_notes = list(getattr(stm, "notes", {}).values())
+        retired_note_ids = _collect_retired_note_ids(state, pid)
         if facts or stm_notes:
             plan = MemoryInjector(cfg).inject(
                 mode=inj_mode,
@@ -568,6 +632,7 @@ def build_semmem_injection(
                 query_embedding=query_vec,
                 session_user_texts=_session_user_texts(state),
                 query_text=query_text,
+                retired_note_ids=retired_note_ids,
             )
             rendered = plan.render() or None
             if covered_attributes is not None:
@@ -689,6 +754,8 @@ def build_chat_messages(
     history_min_tokens: int = 0,
     working_max_tokens: int = DEFAULT_WORKING_MAX_TOKENS,
     evicted_turns: int = 0,
+    artifact_block: str | None = None,
+    session_id: str = "",
 ) -> list[ChatMessage]:
     """messages 組み立て（build_messages で few-shot・file・メモリ・RAG・履歴を統合）。
 
@@ -713,16 +780,179 @@ def build_chat_messages(
         history_min_tokens=history_min_tokens,
         working_max_tokens=working_max_tokens,
         slot_resolver=_attribute_slots,
+        artifact_block=artifact_block,
     )
-    apply_grounding_notes(messages, history, evicted_turns)
+    apply_grounding_notes(messages, history, evicted_turns, session_id)
     logger.debug("Messages assembled: %d messages for LLM", len(messages))
     return messages
+
+
+_QUANTITY_GROUNDING_GUIDANCE = (
+    "\n\n[システム計測] この会話で確定している値: {values}。"
+    "「{quantity}」を使う計算では **この値** を式に入れること。"
+    "直前の回答に出た別の数値で代用しないこと。"
+)
+
+
+def _append_quantity_grounding(
+    messages: list[ChatMessage], history: list[ChatMessage],
+) -> None:
+    """「同じ<量>を」が指す値を確定事実として渡す (in-place)。
+
+    実インシデント (2026-08-27 ライブ監査 T12-4)::
+
+        T12-1 「東京駅と横浜駅の直線距離はおよそ何kmですか。」→ 15km
+        T12-2 「それを自転車で時速18kmで走ると何時間かかりますか。」
+              → calculate(15 / 18) = 0.83 時間  ✓
+        T12-4 「同じ距離を時速4.5kmで歩くとどうなりますか。」
+              → calculate(0.83 * 4.5) = 3.735   ✗  (正: 15 / 4.5 = 3.33)
+
+    「**同じ距離**を」と言っているのに、距離 (15) ではなく直前の時間 (0.83)
+    を掴んだ。calculate は渡された式を正しく計算しており、誤りは **モデルが
+    立てた式** の側。誤値は 4 ターン伝播して最終的な表にも残った。
+
+    次元解析は入れない (単位の追跡は重く、扱えない単位で必ず穴が空く)。
+    代わりに「その量の値はこれだ」を先に渡す — 式を立てる前に正しい値が
+    目の前にあれば、直前の別の数値を掴む余地が減る。値が会話で確定して
+    いなければ何もしない (**観測事実が無ければ注入しない**)。
+    """
+    query = ""
+    for msg in reversed(history):
+        if msg.get("role") == "user":
+            query = str(msg.get("content") or "")
+            break
+    quantity = referenced_quantity(query)
+    if not quantity:
+        return
+    claims = conversational_numeric_claims(
+        [(str(m.get("role") or ""), str(m.get("content") or "")) for m in history],
+    )
+    # ラベルは「東京駅と横浜駅の直線距離」のように修飾が付く。参照側は裸の
+    # 「距離」なので、**ラベルが参照語を含む** ものを拾う。
+    matched = {
+        label: values for label, values in claims.items()
+        if quantity in label and len(values) == 1
+    }
+    if not matched:
+        return
+    # 同じ値を指す複数のラベル (接尾辞違い) は 1 件に畳む。
+    values = {next(iter(v)) for v in matched.values()}
+    if len(values) != 1:
+        # 候補が割れているなら黙る — どれを使うべきか決められない。
+        return
+    label = min(matched, key=len)
+    value = next(iter(values))
+    if append_to_last_user(
+        messages,
+        _QUANTITY_GROUNDING_GUIDANCE.format(
+            values=f"{label} = {value}", quantity=quantity,
+        ),
+        separator="",
+    ):
+        logger.info(
+            "Quantity grounding injected: %s = %s (referenced as %s)",
+            label, value, quantity,
+        )
+
+
+_CONVERSATION_MEASUREMENT_GUIDANCE = (
+    "\n\n[システム計測] {values}。"
+    "この数値をそのまま使って答えること。自分で数え直したり概算したりしないこと。"
+)
+
+
+def _append_conversation_measurement(
+    messages: list[ChatMessage], history: list[ChatMessage], session_id: str,
+) -> None:
+    """会話全体を対象にした計量の問いへ実測値を添える (in-place)。
+
+    ``_append_self_output_measurement`` は **直前の自分の出力** を測る。
+    こちらは **会話全体** で、窓に入っている分しか見えないモデルには原理的に
+    数えられない:
+
+    - 「この会話はいま何ターン目ですか。」→ 148 ターン目に「50ターン目です」
+      (2026-08-27 ライブ監査 T19-4。窓の中だけを数えていた)
+    - 「これまでの会話に「横浜」は何回出てきましたか。」→「5回」(実際 4 回。
+      同 T08-7。ツールを使わず数を断定した)
+
+    真実は ``chat_recorder`` の蓄積バッファにある。数えるのはコードの仕事。
+    """
+    if not session_id:
+        return
+    query = ""
+    for msg in reversed(history):
+        if msg.get("role") == "user":
+            query = str(msg.get("content") or "")
+            break
+    quantity = referenced_quantity(query)
+    if not quantity:
+        return
+    claims = conversational_numeric_claims(
+        [(str(m.get("role") or ""), str(m.get("content") or "")) for m in history],
+    )
+    # ラベルは「東京駅と横浜駅の直線距離」のように修飾が付く。参照側は裸の
+    # 「距離」なので、**ラベルが参照語を含む** ものを拾う。
+    matched = {
+        label: values for label, values in claims.items()
+        if quantity in label and len(values) == 1
+    }
+    if not matched:
+        return
+    # 同じ値を指す複数のラベル (接尾辞違い) は 1 件に畳む。
+    values = {next(iter(v)) for v in matched.values()}
+    if len(values) != 1:
+        # 候補が割れているなら黙る — どれを使うべきか決められない。
+        return
+    label = min(matched, key=len)
+    value = next(iter(values))
+    if append_to_last_user(
+        messages,
+        _QUANTITY_GROUNDING_GUIDANCE.format(
+            values=f"{label} = {value}", quantity=quantity,
+        ),
+        separator="",
+    ):
+        logger.info(
+            "Quantity grounding injected: %s = %s (referenced as %s)",
+            label, value, quantity,
+        )
+    if not query:
+        return
+
+    from backend.free.api.chat.chat_recorder import (
+        count_term_in_session,
+        session_turn_count,
+    )
+
+    parts: list[str] = []
+    if conversation_turn_count_question(query):
+        # 蓄積は「今回の user 発話を記録する前」の状態なので、進行中のターンを
+        # 足して「いま何ターン目か」に合わせる。
+        parts.append(
+            f"この会話の累計ターン数 (user + assistant) は "
+            f"{session_turn_count(session_id) + 1} です",
+        )
+    term = occurrence_count_term(query)
+    if term:
+        parts.append(
+            f"この会話の全ターン本文に「{term}」が現れた回数は "
+            f"{count_term_in_session(session_id, term)} 回です",
+        )
+    if not parts:
+        return
+    if append_to_last_user(
+        messages,
+        _CONVERSATION_MEASUREMENT_GUIDANCE.format(values="、".join(parts)),
+        separator="",
+    ):
+        logger.debug("Conversation measurement injected: %s", parts)
 
 
 def apply_grounding_notes(
     messages: list[ChatMessage],
     history: list[ChatMessage],
     evicted_turns: int,
+    session_id: str = "",
 ) -> None:
     """視界の欠落と自己出力の計量に関する注記をまとめて付ける (in-place)。
 
@@ -738,6 +968,8 @@ def apply_grounding_notes(
     """
     _append_truncated_history_note(messages, history, evicted_turns)
     _append_self_output_measurement(messages, history)
+    _append_quantity_grounding(messages, history)
+    _append_conversation_measurement(messages, history, session_id)
 
 
 # 会話の前半がワーキングメモリから押し出された状態で、会話全体を走査しないと
@@ -821,10 +1053,66 @@ def _measure_text(text: str, kinds: tuple[str, ...]) -> list[str]:
                 f" (空白・改行を除くと {len(stripped)} 文字)",
             )
         elif kind == "lines":
-            parts.append(f"{label} {len(text.splitlines())} 行")
+            # 「行」の定義は開示側 (text_quality.count_response_lines) と揃える。
+            # splitlines() は空行とシステムの開示注記まで数えるため、両者が
+            # 食い違っていた。実測 (2026-08-27 の WS6 検証): 1 行の回答 +
+            # 空行 + 注記 を 3 行と数えて渡し、モデルは忠実に「3行でした」と
+            # 答えた (ユーザーから見た本文は 1 行)。
+            parts.append(f"{label} {count_response_lines(text)} 行")
         else:
             parts.append(f"{label} {len(text.split())} 語")
     return parts
+
+
+#: システムが後付けした開示注記。文末の ``(注: …)`` に限る。
+#:
+#: 実インシデント (2026-08-27 ライブ監査 T09): 「登山の魅力をちょうど50文字で」
+#: への回答は本文 45 文字 + 開示注記 34 文字だった。次のターンの「いま書いた
+#: 文章は何文字でしたか。」に **81 文字** と答えている — 45 + 注記。
+#: ユーザーが尋ねているのは本文の長さで、システムが付けた注記ではない。
+_SYSTEM_NOTE_RE = re.compile(r"\n*\s*[（(]注[:：][^）)]*[）)]\s*$")
+
+#: コードフェンス。計量対象を「直近のコード成果物」に絞るときの目印。
+_CODE_FENCE_BLOCK_RE = re.compile(r"```")
+
+
+def _strip_system_notes(text: str) -> str:
+    """システムが後付けした開示注記を落とす (純粋関数)。
+
+    :data:`_SYSTEM_NOTE_RE` の説明を参照。本文中の丸括弧は落とさない —
+    対象は文末の ``(注: …)`` だけ。
+    """
+    return _SYSTEM_NOTE_RE.sub("", text or "").strip()
+
+
+def _measurement_target(history: list[ChatMessage], query: str) -> str:
+    """計量の対象になる自分の出力を選ぶ (純粋関数)。
+
+    従来は **直前の assistant メッセージ全文** に固定していた。そのため
+    対象を取り違える:
+
+        T13-7 「保存したファイルを読んで」→「ファイルの内容を確認できません。」
+        T13-8 「いま書いたコードは何行ですか。」→「1行です」
+
+    実ファイルは 26 行。機構は直前の失敗通知 (1 行) を **忠実に測って**
+    答えていた。「いま書いたコード」が指すのは直前の発話ではなく、直近の
+    コード成果物。
+
+    クエリがコードを名指ししていれば、コードフェンスを含む直近の assistant
+    発話を選ぶ。無ければ従来どおり直前の発話に落ちる (退行しない)。
+    どちらの場合もシステムの開示注記は除く。
+    """
+    assistants = [
+        str(m.get("content") or "")
+        for m in history if m.get("role") == "assistant"
+    ]
+    if not assistants:
+        return ""
+    if _PRIOR_OUTPUT_CODE_RE.search(query or ""):
+        for text in reversed(assistants):
+            if _CODE_FENCE_BLOCK_RE.search(text):
+                return _strip_system_notes(text)
+    return _strip_system_notes(assistants[-1])
 
 
 def _append_self_output_measurement(
@@ -832,7 +1120,7 @@ def _append_self_output_measurement(
 ) -> None:
     """「今の回答は何文字?」に実測値を添える (in-place)。
 
-    直前の assistant 発言が無い / 計量質問でない場合は何もしない。
+    計量対象が無い / 計量質問でない場合は何もしない。
     """
     query = ""
     for msg in reversed(history):
@@ -842,11 +1130,7 @@ def _append_self_output_measurement(
     kinds = self_output_measure_kinds(query)
     if not kinds:
         return
-    previous = ""
-    for msg in reversed(history):
-        if msg.get("role") == "assistant":
-            previous = str(msg.get("content") or "")
-            break
+    previous = _measurement_target(history, query)
     if not previous.strip():
         return
     values = "、".join(_measure_text(previous, kinds))

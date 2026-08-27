@@ -30,6 +30,7 @@ from backend.free.core.text_quality import (
     length_disclosure_note,
     match_length_directive,
     violates_enumeration_count,
+    violates_line_count,
     violates_length_constraint,
     violates_output_form,
 )
@@ -58,6 +59,9 @@ def violation_reason(query: str, response: str) -> str | None:
         violates_length_constraint(query, response)
         or violates_output_form(query, response)
         or violates_enumeration_count(query, response)
+        # 行数の指定 (「3行で紹介して」) は #502 の列挙個数の検証に無く、
+        # 1 行で答えても検証も開示もされなかった (2026-08-27 ライブ監査 T09-5)。
+        or violates_line_count(query, response)
     )
 
 

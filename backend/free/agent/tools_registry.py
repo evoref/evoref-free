@@ -61,6 +61,52 @@ class ToolDefinition:
         return mode in (self.inventory_modes or self.modes)
 
 
+#: ツールが「成功したが該当 0 件」を表す出力。``search_history`` の空振りは
+#: 実行としては成功だが、ユーザーから見れば見つからなかったターン。
+#: 監査では 7 回空振りし、そのうえで「見つからなかった項目はありません」と
+#: 答えていた。
+_EMPTY_RESULT_MARKERS: tuple[str, ...] = (
+    "No results found",
+    "該当する結果はありません",
+    "見つかりませんでした",
+)
+
+
+def _record_tool_issue(name: str, succeeded: bool, rendered: str) -> None:
+    """ツール実行の不首尾を issue 台帳へ落とす。"""
+    from backend.free.agent.issue_ledger import record_current_issue
+
+    if not succeeded:
+        record_current_issue("tool_failed", f"{name}: {rendered[:80]}")
+        return
+    if any(marker in rendered for marker in _EMPTY_RESULT_MARKERS):
+        record_current_issue("tool_empty", f"{name}: {rendered[:80]}")
+
+#: ファイルを対象にするツールと、そのパス引数の名前。
+#: 台帳へ入れるのは **成功した実行だけ** — 失敗したパスを「直前のファイル」に
+#: すると、次の暗黙参照が存在しないファイルへ向く。
+_FILE_PATH_ARGS: dict[str, tuple[str, ...]] = {
+    "write_file": ("path", "file_path", "filename"),
+    "read_file": ("path", "file_path", "filename"),
+}
+
+
+def _record_touched_file(name: str, succeeded: bool, kwargs: dict) -> None:
+    """ファイル操作のパスを file 台帳へ落とす。"""
+    if not succeeded:
+        return
+    arg_names = _FILE_PATH_ARGS.get(name)
+    if not arg_names:
+        return
+    from backend.free.agent.file_ledger import record_current_file
+
+    for arg in arg_names:
+        value = kwargs.get(arg)
+        if isinstance(value, str) and value.strip():
+            record_current_file(value)
+            return
+
+
 class ToolsRegistry:
     """ツールの登録・取得・実行を管理"""
 
@@ -234,7 +280,17 @@ class ToolsRegistry:
         # 自己申告の根拠 (「この会話で実際に何を実行したか」)。実行経路は 6 箇所に
         # 分かれているので、記録は **唯一の合流点であるここ** で行う。呼出側に
         # 配ると必ず取りこぼす (詳細は tool_ledger._current_target のコメント)。
-        record_current(name, tool_result_succeeded(name, str(result)))
+        succeeded = tool_result_succeeded(name, str(result))
+        record_current(name, succeeded)
+        # 不首尾も同じ合流点で記録する。自己申告の問い (「見つからなかった
+        # 項目はありましたか」) に対し、監査では 7 回すべて「ありません」と
+        # 答えていた — 会話履歴にツールの成否も空振りも残らないため。
+        _record_tool_issue(name, succeeded, str(result))
+
+        # 「保存したファイルを読んで」型の暗黙参照を解決する材料。
+        # パスはクエリの文字列からは取れないので、実行時に覚えておく
+        # (file_ledger のモジュール docstring を参照)。
+        _record_touched_file(name, succeeded, kwargs)
         return result
 
     @staticmethod

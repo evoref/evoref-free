@@ -42,6 +42,17 @@ logger = get_logger("memory.extractors.base")
 # ──────────────────────────────────────────────────────────────────────────
 
 
+def _utterance_time(note: object, fallback: float) -> float:
+    """ノートの発話時刻 (無ければ ``fallback``)。
+
+    :meth:`BaseExtractor.make_fact` が ``created_at`` に使う。抽出時刻を
+    入れると 1 バッチ分のファクトが全部同じ秒になり、世代の前後が
+    ストアから失われる (詳細は呼出側のコメント)。
+    """
+    created_at = float(getattr(note, "created_at", 0.0) or 0.0)
+    return created_at if created_at > 0 else fallback
+
+
 @dataclass
 class ExtractionContext:
     """Extractor 共通のコンテキスト。
@@ -70,6 +81,14 @@ class ExtractionContext:
     max_pinned_per_session: int = -1
     canonicalizer: SubjectCanonicalizer | None = None
     now: float | None = None
+    #: ``{(fact_type, 属性スロット): (現在値, ...)}``。属性語を落とした訂正の
+    #: 宛先を「既存スロットの現在値を名指しているか」で決めるために使う
+    #: (:func:`~backend.free.memory.extractors.chat.
+    #: resolve_value_anchored_attributes`)。空なら値アンカーは働かず、
+    #: 従来どおり属性語と継承だけで解決する。
+    live_attribute_values: dict[tuple[str, str], tuple[str, ...]] = field(
+        default_factory=dict,
+    )
 
     def current_time(self) -> float:
         return self.now if self.now is not None else time.time()
@@ -226,7 +245,13 @@ class BaseExtractor:
             # だから微妙ケース」として pending へ落とすのを免除する
             # (SemanticFact.from_correction の説明を参照)。
             from_correction=bool(getattr(note, "is_correction", False)),
-            created_at=now,
+            # **発話時刻**を継ぐ (抽出時刻ではない)。sleep-time は 1 回の
+            # バッチで会話全体を抽出するため ``now`` を入れると全ファクトの
+            # ``created_at`` が同一秒になり、「新しい方を採る」判定が原理的に
+            # 成立しない。実データ (2026-08-27 ライブ監査) では 12 件すべてが
+            # ``1787814691.47〜.48`` に潰れており、訂正と初出の前後関係が
+            # ストアから失われていた。``(N日前の記録)`` ラベルの根拠でもある。
+            created_at=_utterance_time(note, now),
             accessed_at=now,
             session_ids=(
                 {getattr(note, "session_id", "")} if note and note.session_id else set()

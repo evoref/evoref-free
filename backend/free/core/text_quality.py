@@ -103,10 +103,18 @@ def has_chinese_token_leak(text: str) -> bool:
 #: 数値は桁区切りと全角を許す。
 #:
 #: 例: 「年間売上は4,320,000円になります。」→ (年間売上, 4320000)
+#: ラベルと数値の間に挟まる **ぼかし**。「直線距離は、およそ15kmです。」の
+#: ように読点とヘッジが入るのが日本語では普通で、これを許さないと
+#: 「<ラベル>は<数値>」の抽出が実会話でほとんど当たらない (実測 2026-08-27:
+#: 監査 T12 の距離の言明「東京駅と横浜駅の直線距離は、およそ15kmです。」が
+#: 1 件も取れなかった)。
+_HEDGE_BEFORE_NUMBER = r"(?:[、,]\s*)?(?:およそ|約|おおよそ|ほぼ|だいたい|概ね)?\s*"
+
 _LABELED_NUMBER_RE = re.compile(
     r"(?P<label>[0-9A-Za-z_ぁ-んァ-ヶーｦ-ﾟ一-龥]{2,24})"
     r"\s*(?:は|が|＝|=|:|：|\bis\b|\bwas\b|\bwere\b|\bare\b)\s*"
-    r"(?P<num>[0-9０-９][0-9０-９,，.]*)",
+    + _HEDGE_BEFORE_NUMBER
+    + r"(?P<num>[0-9０-９][0-9０-９,，.]*)",
     re.IGNORECASE,
 )
 
@@ -162,6 +170,31 @@ def _add_claim(claims: dict[str, set[str]], run: str, number: str) -> None:
         return
     for label in _label_variants(run):
         claims.setdefault(label, set()).add(number)
+
+
+#: システムが後付けした開示注記 (文末の ``(注: …)``)。
+#:
+#: 開示そのものは必要 (制約を破ったことを黙るのは隠蔽) だが、**記憶に残す
+#: 本文ではない**。注記込みで保存すると、次のターンでモデルがそれを自分が
+#: 書いた文の一部として読む。
+#:
+#: 実インシデント (2026-08-27 ライブ監査 T09-2): 本文 45 文字 + 注記 34 文字を
+#: 保存した結果、「いま書いた文章は何文字でしたか。」に **81 文字** と答えた。
+#: 同 T10-3 では「※会話の前半は参照できないため…」という別の注記が継続出力の
+#: 末尾に焼き付いた。
+#:
+#: 「制約を破った」という信号自体は issue 台帳 (agent.issue_ledger) が持つので、
+#: 履歴から落としても失われない。
+SYSTEM_NOTE_TAIL_RE = re.compile(r"\n*\s*[（(]注[:：][^）)]*[）)]\s*$")
+
+
+def strip_system_notes(text: str) -> str:
+    """システムが後付けした開示注記を落とす (純粋関数)。
+
+    :data:`SYSTEM_NOTE_TAIL_RE` の説明を参照。本文中の丸括弧は落とさない —
+    対象は文末の ``(注: …)`` だけ。
+    """
+    return SYSTEM_NOTE_TAIL_RE.sub("", text or "").rstrip()
 
 
 def labeled_numeric_claims(text: str) -> dict[str, set[str]]:
@@ -736,7 +769,10 @@ __all__ = [
     "states_no_user_value",
     "conversational_numeric_claims",
     "find_superseded_claim",
+    "count_response_lines",
     "match_enumeration_count",
+    "match_line_count",
+    "violates_line_count",
     "count_list_items",
     "violates_enumeration_count",
     "value_was_adopted",
@@ -746,6 +782,8 @@ __all__ = [
     "has_chinese_token_leak",
     "is_japanese_text",
     "labeled_numeric_claims",
+    "strip_system_notes",
+    "SYSTEM_NOTE_TAIL_RE",
     "is_query_echo",
     "strip_echoed_query",
     "strip_interrogative_sentences",
@@ -1032,6 +1070,59 @@ def count_list_items(response: str) -> int:
     return len(lines)
 
 
+#: 「N 行で」型の行数指定。``1行は20文字以内`` のような **1 行あたりの制約**
+#: とは別物なので、``1行は`` の形は拾わない。
+#:
+#: 実インシデント (2026-08-27 ライブ監査 T09-5): 「横浜を3行で紹介してください。
+#: 1行は20文字以内にしてください。」に **1 行** で答え、しかも文字数制約には
+#: 出る開示注記が行数には出なかった。#502 の列挙個数の検証は箇条書きには
+#: 効いていたが (同 T09-3 は 7 個ちょうど成功)、「N 行」という単位に無かった。
+LINE_COUNT_RE = re.compile(
+    r"(?<![0-9０-９])([0-9０-９]{1,3})\s*行(?:で|に|以内で)?"
+    r"(?![^。]{0,6}(?:以内|まで)\s*[^。]{0,4}(?:文字|字))",
+)
+
+
+def match_line_count(text: str) -> int:
+    """発話中の行数指定を返す (純粋関数)。無ければ ``0``。"""
+    for m in LINE_COUNT_RE.finditer(text or ""):
+        # 「1行は20文字以内」は 1 行あたりの制約であって行数の指定ではない。
+        tail = (text or "")[m.end():m.end() + 12]
+        if tail.startswith(("は", "あたり", "当たり", "につき")):
+            continue
+        raw = m.group(1).translate(_FULLWIDTH_DIGITS)
+        if raw.isdigit() and int(raw) > 0:
+            return int(raw)
+    return 0
+
+
+def count_response_lines(response: str) -> int:
+    """応答の行数を数える (純粋関数)。
+
+    空行は数えない (段落の区切りであって行ではない)。システムが後付けした
+    開示注記も除く — 数えた結果を開示に使うので、注記を数えると自分の注記で
+    行数が増える。
+    """
+    body = _SYSTEM_NOTE_TAIL_RE.sub("", response or "")
+    return len([ln for ln in body.splitlines() if ln.strip()])
+
+
+def violates_line_count(query: str, response: str) -> str | None:
+    """行数の指定と食い違うときだけ理由を返す (純粋関数)。
+
+    列挙個数 (``violates_enumeration_count``) は不足だけを見るが、行数は
+    **過不足の両方** を見る。「3 行で」は文字数の ``exact`` と同じく
+    ぴったりを求める指定で、4 行返すのも指定違反になる。
+    """
+    wanted = match_line_count(query)
+    if wanted <= 0:
+        return None
+    got = count_response_lines(response)
+    if got <= 0 or got == wanted:
+        return None
+    return f"asked for {wanted} lines but the answer has {got}"
+
+
 def violates_enumeration_count(query: str, response: str) -> str | None:
     """列挙個数の指定に **足りない** ときだけ理由を返す (純粋関数)。
 
@@ -1126,7 +1217,12 @@ def has_verifiable_output_constraint(query: str) -> bool:
         # match_output_form_directive では拾えないが、数値は本文にあり
         # 返ってきた行は数えられる (2026-08-27 ライブ監査: 46/47 を見逃した)。
         or match_enumeration_count(q) > 0
+        or match_line_count(q) > 0
     )
+
+
+#: システムが後付けした開示注記 (文末の ``(注: …)``)。計量から除く。
+_SYSTEM_NOTE_TAIL_RE = re.compile(r"\n*\s*[（(]注[:：][^）)]*[）)]\s*$")
 
 
 def length_disclosure_note(query: str, response: str) -> str:
@@ -1145,10 +1241,46 @@ def length_disclosure_note(query: str, response: str) -> str:
     measured = len((response or "").strip())
     directive = match_length_directive(query or "")
     prefix = chr(10) * 2
+    parts: list[str] = []
     if directive is None:
-        return prefix + f"(注: 上の回答は {measured} 文字です)"
-    kind, expected = directive
-    unit = "文字以内" if kind == "limit" else "文字ちょうど"
-    return prefix + (
-        f"(注: {expected} {unit}の指定に対し、上の回答は {measured} 文字です)"
-    )
+        parts.append(f"上の回答は {measured} 文字です")
+    else:
+        kind, expected = directive
+        unit = "文字以内" if kind == "limit" else "文字ちょうど"
+        parts.append(
+            f"{expected} {unit}の指定に対し、上の回答は {measured} 文字です",
+        )
+        # 制約を満たせなかったことを不首尾の台帳へ落とす。この関数は開示文の
+        # 唯一の生成点 (ストリームフィルタと修復経路の両方が使う) なので、
+        # ここで記録すれば経路の取りこぼしが出ない。
+        # 監査では「いままでの出力形式の指定に、全部従えましたか。」に
+        # 「はい、すべて従いました。」と答えていた。
+        _record_constraint_issue(f"{expected} {unit}の指定に対し {measured} 文字")
+    # 行数の指定があれば併記する。文字数だけ開示して行数を黙っていると、
+    # 「3 行で」に 1 行で答えた事実がユーザーにもモデルにも残らない
+    # (2026-08-27 ライブ監査 T09-5)。
+    wanted_lines = match_line_count(query or "")
+    if wanted_lines > 0:
+        got_lines = count_response_lines(response)
+        if got_lines != wanted_lines:
+            parts.append(
+                f"{wanted_lines} 行の指定に対し、上の回答は {got_lines} 行です",
+            )
+            _record_constraint_issue(
+                f"{wanted_lines} 行の指定に対し {got_lines} 行",
+            )
+    return prefix + "(注: " + "。".join(parts) + ")"
+
+
+def _record_constraint_issue(detail: str) -> None:
+    """制約違反を不首尾の台帳へ記録する (失敗は握る)。
+
+    ``text_quality`` は agent pillar に依存しない純粋関数の置き場なので、
+    import は関数内に閉じる。台帳が無い経路 (単体テスト等) では no-op。
+    """
+    try:
+        from backend.free.agent.issue_ledger import record_current_issue
+
+        record_current_issue("constraint_violated", detail)
+    except Exception:  # noqa: BLE001 - 記録の失敗で開示自体を止めない
+        pass

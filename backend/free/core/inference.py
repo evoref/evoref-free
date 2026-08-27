@@ -938,6 +938,31 @@ def _truncate_fewshot_to_budget(block: str, budget: int) -> str | None:
     return kept.rstrip() + "\n"
 
 
+def _select_artifact_block(
+    artifact_block: str | None, remaining: int,
+) -> tuple[str, int]:
+    """直前の成果物ブロックを予算内で採る。
+
+    ``_select_fewshot_block`` と同じ形。予算に入らなければ **切り詰めて渡す**
+    — 呼出側 (``_artifact.render_artifact_block``) が既に見出しの一覧へ
+    縮退させているので、ここでさらに落とすと「何も無い」に戻ってしまう。
+    """
+    if not artifact_block or remaining <= 0:
+        return "", remaining
+    block = artifact_block.strip()
+    tokens = _estimate_tokens(block)
+    if tokens <= remaining:
+        return block, remaining - tokens
+    # 予算の 95% までを文字数で概算して切る (トークン推定の誤差ぶんの余裕)。
+    keep_chars = max(0, int(len(block) * (remaining / max(1, tokens)) * 0.95))
+    clipped = block[:keep_chars]
+    logger.info(
+        "build_messages: artifact block clipped to fit the budget "
+        "(%d -> ~%d tokens)", tokens, remaining,
+    )
+    return clipped, 0
+
+
 def _select_fewshot_block(
     fewshot_block: str | None,
     remaining: int,
@@ -1038,6 +1063,7 @@ def build_messages(
     fewshot_block: str | None = None,
     history_min_tokens: int = 0,
     slot_resolver: "Callable[[str], frozenset[tuple[str, str]]] | None" = None,
+    artifact_block: str | None = None,
 ) -> list[ChatMessage]:
     """
     messages リストを組み立て、トークン予算内に収める。
@@ -1069,6 +1095,11 @@ def build_messages(
         rag_scored_chunks: スコア付き検索結果 [(chunk_id, score, text), ...]。
             salience_ranker と同時に指定した場合、rag_chunks より優先される。
         salience_ranker: BudgetMem 式サリエンスランカー。
+        artifact_block: 直前ターンで生成した長文成果物 (:mod:`backend.free.
+            api.chat._artifact`)。**動的ブロックの先頭**に置く — 質問が
+            直接指している対象なので、few-shot や参考情報より優先する。
+            長文は履歴予算 (実測 1612 トークン) に入らず次ターンで消えるため、
+            これが無いとモデルは「履歴に含まれていない」としか言えない。
         fewshot_block: ``format_fewshot_section`` 整形済みの few-shot ブロック
             (query 依存)。動的ブロックの先頭に置く。``None`` / 空なら付与しない。
         history_min_tokens: 過去履歴の最低確保トークン数 (床)。動的ブロック配分前に
@@ -1168,7 +1199,12 @@ def build_messages(
     )
     dyn_parts: list[str] = []
 
-    # 1. few-shot 例（query 依存、動的ブロック先頭）
+    # 0. 直前の成果物（質問が直接指している対象。何より優先する）
+    artifact_part, dyn_budget = _select_artifact_block(artifact_block, dyn_budget)
+    if artifact_part:
+        dyn_parts.append(artifact_part)
+
+    # 1. few-shot 例（query 依存）
     fewshot_part, dyn_budget = _select_fewshot_block(fewshot_block, dyn_budget)
     if fewshot_part:
         dyn_parts.append(fewshot_part)

@@ -811,6 +811,119 @@ def names_file_target(query: str) -> bool:
     return bool(query) and bool(_NAMES_FILE_TARGET_RE.search(query))
 
 
+#: 「同じ距離を」「その時間を」のように **既出の量** を指す参照。
+#:
+#: 実インシデント (2026-08-27 ライブ監査 T12-4)::
+#:
+#:     T12-1 「東京駅と横浜駅の直線距離はおよそ何kmですか。」→ 15km
+#:     T12-2 「それを自転車で時速18kmで走ると何時間かかりますか。」
+#:           → calculate(15 / 18) = 0.83 時間  ✓
+#:     T12-4 「同じ距離を時速4.5kmで歩くとどうなりますか。」
+#:           → calculate(0.83 * 4.5) = 3.735   ✗  (正: 15 / 4.5 = 3.33)
+#:
+#: 「**同じ距離**を」と言っているのに、距離 (15) ではなく直前の時間 (0.83) を
+#: 掴んだ。calculate ツールは渡された式を正しく計算しており、誤りは
+#: **モデルが立てた式** の側。しかも誤値は 4 ターン伝播して最終的な表にも残った。
+#:
+#: 量の語は列挙しない — 「距離」「時間」「金額」…を数え始めると必ず漏れる。
+#: 見るのは **指示語 + 「〜を」で受ける名詞** という構造で、その名詞が会話で
+#: 数値として確定しているかどうかは呼出側が実データに問い合わせて決める。
+_ESTABLISHED_QUANTITY_REF_RE = re.compile(
+    r"(?:同じ|その|この|先ほどの|さっきの|上記の)\s*"
+    r"(?P<quantity>[ぁ-んァ-ヶーｦ-ﾟ一-龥A-Za-z]{2,12}?)\s*(?:を|で|に|は|が)",
+)
+
+
+def referenced_quantity(query: str) -> str | None:
+    """「同じ<量>を」の ``<量>`` を返す (純粋関数)。無ければ ``None``。
+
+    :data:`_ESTABLISHED_QUANTITY_REF_RE` の説明を参照。名詞を返すだけで、
+    それが会話で確定した数値かどうかは判定しない (呼出側の仕事)。
+    """
+    m = _ESTABLISHED_QUANTITY_REF_RE.search(query or "")
+    if not m:
+        return None
+    quantity = (m.group("quantity") or "").strip()
+    return quantity or None
+#: 「この会話はいま何ターン目ですか」型。会話全体の長さを訊いている。
+#:
+#: 実インシデント (2026-08-27 ライブ監査 T19-4): 148 ターン目に
+#: 「50ターン目です」と答えた。窓に入っている分しか数えられないため約 3 倍の
+#: 乖離で、注記は付いていたが値そのものは無意味だった。全ターンは
+#: ``chat_recorder`` が蓄積しているので、数えるのはコードの仕事。
+_TURN_COUNT_QUESTION_RE = re.compile(
+    r"(?:何ターン|何往復|何回(?:の)?(?:やり取り|やりとり|会話)"
+    r"|いくつ(?:の)?(?:やり取り|やりとり))",
+)
+
+#: 「これまでの会話に「横浜」は何回出てきましたか」型。
+#: 数える語は **鉤括弧か引用符で括られている** ことを条件にする。括りが無い
+#: 語まで拾うと文中のどの語を数えるのか決まらない。
+_OCCURRENCE_COUNT_RE = re.compile(
+    r"[「『\"']\s*(?P<term>[^」』\"']{1,40}?)\s*[」』\"']"
+    r"[^。]{0,20}?(?:は)?\s*(?:何回|何度|いくつ)",
+)
+
+
+def conversation_turn_count_question(query: str) -> bool:
+    """会話全体のターン数を訊いているか (純粋関数)。"""
+    return bool(query) and bool(_TURN_COUNT_QUESTION_RE.search(query))
+
+
+def occurrence_count_term(query: str) -> str | None:
+    """「<語>は何回出てきましたか」の ``<語>`` を返す (純粋関数)。
+
+    実インシデント (2026-08-27 ライブ監査 T08-7): 「これまでの会話に「横浜」は
+    何回出てきましたか。」に **「5回」** と答えた (実際 4 回)。ツールを使わず
+    数を断定していた。数え上げは決定論に落とせる。
+    """
+    m = _OCCURRENCE_COUNT_RE.search(query or "")
+    if not m:
+        return None
+    term = (m.group("term") or "").strip()
+    return term or None
+
+#: **自己評価を求める問い**。「うまくいかなかったことはあったか」を訊いている。
+#:
+#: 語彙で「何が」を数えない — 見るのは 2 つの構造の AND:
+#: (a) 不首尾・正直さを表す語、(b) 問いかけ / 依頼の形。
+#:
+#: 実インシデント (2026-08-27 ライブ監査): 自己申告を求める問いが **7 回すべて
+#: 肯定** で返った。「検索で見つからなかった項目があれば、正直にそう言って
+#: ください。」→「ありません。」(2 ターン前に search_history が 0 件を返して
+#: いる)。「事実と異なるものがあれば正直に挙げてください。」→「ありません
+#: でした。」。一方で本文に失敗が表示されていた read_file の件は正しく報告
+#: できており、**窓に残っていない不首尾だけが見えていない**。
+#: 動詞は列挙しない。「できなかった」「従えなかった」「見つからなかった」
+#: 「答えられなかった」を語彙で数えると必ず漏れる (実際 1 回目の実装で
+#: 「従えなかったものがあれば挙げてください」を取りこぼした)。**否定の過去形**
+#: という文法クラスで受ける。
+_SELF_ASSESSMENT_TOPIC_RE = re.compile(
+    r"(?:.なかった|.ませんでした|正直|失敗|事実と異なる|誤り|間違い"
+    r"|うまくいかな|不首尾|問題(?:は|が)あ|訂正した"
+    r"|couldn't|could not|failed|honest)",
+)
+
+#: 問いかけ / 依頼の形。「〜ありましたか」「〜挙げてください」「〜教えて」。
+_SELF_ASSESSMENT_ASK_RE = re.compile(
+    r"(?:ありました?か|ありませんでした?か|ありますか|ますか[?？]?\s*$"
+    r"|挙げて|教えて|言って|報告して|[?？]\s*$|何回|いくつ)",
+)
+
+
+def self_assessment_question(query: str) -> bool:
+    """クエリが「この会話でうまくいかなかったこと」を訊いているか (純粋関数)。
+
+    :data:`_SELF_ASSESSMENT_TOPIC_RE` の説明を参照。
+    """
+    q = query or ""
+    if not q:
+        return False
+    return bool(
+        _SELF_ASSESSMENT_TOPIC_RE.search(q) and _SELF_ASSESSMENT_ASK_RE.search(q),
+    )
+
+
 def own_process_question(query: str) -> bool:
     """クエリが「自分が実際に何を実行したか」を尋ねているか (純粋関数)。"""
     q = query or ""
@@ -1303,6 +1416,52 @@ def continuation_request(query: str) -> bool:
     if not normalized:
         return False
     return CONTINUATION_REQUEST_RE.match(normalized) is not None
+
+
+#: 「あなたの記憶は何種類ありますか」型。**自分の記憶構成** を訊いている。
+#:
+#: 実インシデント (2026-08-27 ライブ監査 T06-7): 「会話メモリ / セッション
+#: メモリ / 永続メモリ」の 3 種と答えた。実装は WM / STM / LTM + SemMem で、
+#: 「ファイルとして永続的に保存」という説明も実装と違う。しかも次のターンで
+#: この幻覚を「設定値に基づくもの」と称して二重に正当化した。
+#:
+#: ツール目録 (``tool_inventory_question``) と同じ立て付けにする — 自己構成は
+#: system プロンプトに載っていないので、base は知らないまま答える。
+_MEMORY_ARCHITECTURE_RE = re.compile(
+    r"(?:あなた|君|きみ|お前|evoref|アシスタント)?[のは]?\s*"
+    r"[^。]{0,12}?記憶"
+    r"[^。]{0,20}?"
+    r"(?:何種類|どんな種類|いくつ|仕組み|構成|どうなって|種類は|階層)",
+)
+
+#: 「今動いているモデルの名前は？」型。
+#:
+#: 実インシデント (2026-08-27 ライブ監査 T06-3): ``evoref_runtime_info`` は
+#: 撃たれ、その出力の 1 行目が
+#: ``Instance name: Alice  (this is the assistant's display name, NOT the
+#: model name)`` で、**同じ出力の中に** ``Base model (served):
+#: Qwen3.8-27B-Q4_K_M.gguf`` があった。それでも「私はAliceです」と答えた —
+#: 明示的な否定文が同じ行にあるのに 1 行目を掴んでいる。
+#:
+#: 行順を直すだけでは同じ形が再発しうるので、**問いに対応する 1 行だけ** を
+#: 確定事実として渡す。
+_MODEL_IDENTITY_RE = re.compile(
+    r"(?:モデル|model)[^。]{0,12}?(?:名前|名は|何|どれ|which|name)"
+    r"|(?:何|どの|どんな)[^。]{0,8}?モデル"
+    # 英語形。「what model are you」「which model is running」。
+    r"|(?:what|which)\s+model\b",
+    re.IGNORECASE,
+)
+
+
+def memory_architecture_question(query: str) -> bool:
+    """自分の記憶構成を訊いているか (純粋関数)。"""
+    return bool(query) and bool(_MEMORY_ARCHITECTURE_RE.search(query))
+
+
+def model_identity_question(query: str) -> bool:
+    """今動いているモデルの識別を訊いているか (純粋関数)。"""
+    return bool(query) and bool(_MODEL_IDENTITY_RE.search(query))
 
 
 def tool_inventory_question(query: str) -> bool:

@@ -25,12 +25,16 @@ from backend.free.agent.tools.builtin import (
 )
 from backend.free.constants import READ_FILE_META_PREFIX
 from backend.free.core.session_mode import is_create_mode
+from backend.free.agent.issue_ledger import count_kind, format_issues
 from backend.free.agent.tool_ledger import format_ledger
 from backend.free.core.intent_vocab import (
     assistant_code_blocks,
     prior_code_block_request,
     names_file_target,
+    memory_architecture_question,
+    model_identity_question,
     own_process_question,
+    self_assessment_question,
     persist_request,
     resolve_session_position_message,
     session_position_kind,
@@ -560,6 +564,31 @@ class DeliberativeResponse:
     tool_command_source: str | None = None
 
 
+#: 記憶構成の確定事実。実装 (EvorefMem) に基づく。
+#:
+#: 「何種類あるか」に数を答えられるよう、層を明示的に数え上げる。
+_MEMORY_ARCHITECTURE_FACT = (
+    "\n\n確定事実: このアシスタントの記憶は次の 4 層で構成される。"
+    "これは実装そのものなので、この内容で答えること。ここに無い層を述べない。\n"
+    "- WorkingMemory (WM): 現在の会話の窓。直近のターンを保持し、"
+    "窓を超えた分は ShortTermMemory へ押し出される。\n"
+    "- ShortTermMemory (STM): 会話から作ったノート。埋め込みを持ち、"
+    "関連度で検索される。\n"
+    "- LongTermMemory (LTM): 会話をチャンク化したベクトルストア。"
+    "過去の会話の断片を意味検索で引く。\n"
+    "- SemanticMemory (SemMem): 属性ごとの「現在値」を持つファクトストア。"
+    "訂正されると旧世代は supersede され、セッションを跨いで参照される。"
+)
+
+#: モデル識別の確定事実。``{model}`` に **実測** のモデル名が入る。
+_MODEL_IDENTITY_FACT = (
+    "\n\n確定事実: いま実際に動いているベースモデルは **{model}** である"
+    "(llama-server が現在ロードしているファイル名)。"
+    "インスタンス名 (このアシスタントの表示名) はモデル名ではないので、"
+    "モデルを訊かれてインスタンス名を答えないこと。"
+)
+
+
 class DeliberativeAgent:
     """Deliberative 層: LLM 推論 + 補助タスクによるツール判定
 
@@ -877,6 +906,61 @@ class DeliberativeAgent:
         )
         return True
 
+    def _append_self_description_fact(
+        self, messages: list[dict], query: str, llm_client=None,
+    ) -> bool:
+        """自己構成の問いへ実装に基づく確定事実を渡す。
+
+        ツール目録 (``_append_tool_inventory_fact``) と同じ立て付け。自己構成は
+        チャット応答パスの system プロンプトに載っていないので、base は知らない
+        まま答える。
+
+        **記憶の種類** (2026-08-27 ライブ監査 T06-7): 「会話メモリ / セッション
+        メモリ / 永続メモリ」の 3 種と答えた。実装は WM / STM / LTM + SemMem で、
+        「ファイルとして永続的に保存」という説明も違う。しかも次のターンで
+        この幻覚を「設定値に基づくもの」と称して二重に正当化した。
+
+        **モデルの識別** (同 T06-3): ``evoref_runtime_info`` は撃たれ、その出力
+        1 行目が ``Instance name: Alice  (this is the assistant's display name,
+        NOT the model name)``、**同じ出力の中に** ``Base model (served):
+        Qwen3.8-27B-Q4_K_M.gguf`` があった。それでも「私はAliceです」と答えた。
+        明示的な否定文が同じ行にあるのに 1 行目を掴んでいる。行順を直すだけでは
+        同じ形が再発しうるので、**問いに対応する 1 行だけ** を渡す。
+
+        Returns:
+            注記したか。
+        """
+        if memory_architecture_question(query):
+            append_to_last_user(messages, _MEMORY_ARCHITECTURE_FACT, separator="")
+            logger.info("Memory architecture fact pinned")
+            return True
+        if model_identity_question(query):
+            served = self._served_model_name(llm_client)
+            if not served:
+                return False
+            append_to_last_user(
+                messages,
+                _MODEL_IDENTITY_FACT.format(model=served),
+                separator="",
+            )
+            logger.info("Model identity fact pinned: %s", served)
+            return True
+        return False
+
+    @staticmethod
+    def _served_model_name(llm_client=None) -> str:
+        """llama-server が実際にロードしているモデル名 (取れなければ空文字)。
+
+        **宣言 (config) ではなく実測 (``/props``) を使う**。モデル移行は稼働中の
+        llama-server を差し替えないため、再起動するまで別モデルが serve され
+        続ける (2026-08-12 に 62.8 時間見逃した事象)。
+        """
+        from pathlib import Path
+
+        metadata = getattr(llm_client, "metadata", None) if llm_client else None
+        model_id = getattr(metadata, "model_id", "") or ""
+        return Path(model_id).name if model_id else ""
+
     def _append_tool_inventory_fact(
         self, messages: list[dict], query: str, mode: str,
     ) -> bool:
@@ -949,6 +1033,65 @@ class DeliberativeAgent:
             "search_history suppressed: asked attribute(s) already injected "
             "(%s) for query: %s",
             ",".join(sorted(self._answered_attributes)), query[:60],
+        )
+        return True
+
+    @staticmethod
+    def _append_issue_ledger_fact(
+        messages: list[dict], query: str, session_id: str,
+    ) -> bool:
+        """自己評価の問いへ「システムが観測した不首尾」を確定事実として渡す。
+
+        2026-08-27 ライブ監査で、自己申告を求める問いが **7 回すべて肯定**
+        で返った:
+
+        - 「検索で見つからなかった項目があれば、正直にそう言ってください。」
+          → 「検索で見つからなかった項目はありません。」
+          (2 ターン前に ``search_history: No results found`` が出ている)
+        - 「この会話で私が訂正した回数は何回ですか。」→「1回です」(実際 4 回)
+        - 「事実と異なるものがあれば正直に挙げてください。」→「ありません」
+
+        一方で ``read_file`` の失敗は **正しく報告できていた**。違いは
+        「失敗が本文に表示されていたか」で、会話履歴にはツールの成否も
+        制約違反も残らない。窓を越えた自己申告は base の作話になる。
+
+        ツール目録 (``_append_tool_ledger_fact``) と同じ立て付け —
+        数えるのはコード、モデルは読み上げるだけにする。
+
+        **限界**: 「96 日 (正 126 日)」のような自分の答えの算術誤りは
+        システムも知らないので台帳に無い。ここで断つのは「観測されている
+        不首尾を無かったことにする」経路だけで、全ての事実誤りを検出する
+        機構ではない。
+
+        Returns:
+            注記したか。
+        """
+        if not session_id or not self_assessment_question(query):
+            return False
+        issues = format_issues(session_id)
+        corrections = count_kind(session_id, "user_correction")
+        if issues:
+            body = (
+                "\n\n確定事実: この会話でシステムが観測した不首尾は以下がすべて"
+                "である。これは発生時に機械的に記録した値なので、この記録に"
+                "基づいて答えること。ここにある項目を「無かった」と述べては"
+                "ならない。\n" + issues
+                + f"\n(うちユーザーによる訂正は {corrections} 回)"
+                + "\nなお、この記録はシステムが観測できた範囲であり、"
+                "回答内容そのものの誤り (計算違い等) は含まれない。"
+                "「記録上は以上」と断ったうえで答えること。"
+            )
+        else:
+            body = (
+                "\n\n確定事実: この会話でシステムが観測した不首尾は 1 件も無い"
+                "(ツールの失敗・空振り・制約違反・訂正のいずれも記録が空)。"
+                "ただしこれは観測できた範囲であり、回答内容そのものの誤りは"
+                "含まれない。断定するなら「記録上は」と限定すること。"
+            )
+        append_to_last_user(messages, body, separator="")
+        logger.info(
+            "Issue ledger fact pinned (session=%s, entries=%d)",
+            session_id[:12], len(issues.splitlines()) if issues else 0,
         )
         return True
 
@@ -1164,6 +1307,13 @@ class DeliberativeAgent:
                 tool_judge_task.cancel()
             return None, None, None, None, None
 
+        # 自己構成 (記憶の種類 / 動いているモデル) も同じ立て付け。
+        # system プロンプトに載っていないので base は知らないまま答える。
+        if self._append_self_description_fact(messages, query, llm_client):
+            if tool_judge_task is not None and not tool_judge_task.done():
+                tool_judge_task.cancel()
+            return None, None, None, None, None
+
         # 「過去に書いたコードをそのまま見せろ」も決定論で確定する
         # (会話窓のフェンス付きブロックが SSOT)。ツールを撃つ意味は無い。
         if self._append_prior_code_block_fact(messages, query, conversation):
@@ -1174,6 +1324,12 @@ class DeliberativeAgent:
         # 「実際にツールを使ったか」も同じ — 答えは tool_ledger にあり、
         # 新たにツールを撃っても増えるのは記録だけで根拠にはならない。
         if self._append_tool_ledger_fact(messages, query, session_id):
+            if tool_judge_task is not None and not tool_judge_task.done():
+                tool_judge_task.cancel()
+            return None, None, None, None, None
+
+        # 「うまくいかなかったことはあったか」も同じ立て付け。数えるのはコード。
+        if self._append_issue_ledger_fact(messages, query, session_id):
             if tool_judge_task is not None and not tool_judge_task.done():
                 tool_judge_task.cancel()
             return None, None, None, None, None

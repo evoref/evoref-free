@@ -58,18 +58,133 @@ def persist_facts(
         実際に書き込まれたファクト数。
     """
     written = 0
+    persisted: list = []
     for fact in result.facts:
         try:
             store.add_fact(fact)
             written += 1
+            persisted.append(fact)
         except Exception as exc:
             logger.warning(
                 "Step 8 [%s]: failed to add fact %s: %s",
                 label, fact.id, exc,
             )
+    _supersede_corrected_slots(store, persisted, label)
     if written:
         logger.debug("Step 8 [%s]: persisted %d facts", label, written)
     return written
+
+
+def _supersede_corrected_slots(
+    store: "SemanticFactStore", persisted: list, label: str,
+) -> int:
+    """訂正ファクトを書いたら、同じスロットの旧世代を supersede する。
+
+    ``SemanticFactStore.supersede`` は既に存在するが、**抽出経路からは
+    一度も呼ばれていなかった**。呼んでいたのはセッション要約の昇格
+    (``sleep.promotion``)、競合解決 (``conflict_review`` /
+    ``SemanticConflictResolver``)、learn / loop の書き戻しだけで、
+    チャット由来の属性ファクトは新旧が live のまま積み上がる。
+
+    実データ (2026-08-27 ライブ監査、``semantic/global/facts.jsonl`` 12 件):
+    全件が ``supersedes: []`` / ``superseded_by: None``。``from_correction``
+    は 4 件立っているのに旧世代が 1 つも無効化されていない。結果、
+
+    - ``mem.personal.occupation`` に「データベース管理者」と
+      「ネットワークエンジニア」が同時に live
+    - ``mem.personal.name`` に 3 世代 (テスト太郎 / 御堂 陽介 / 田中) が live
+
+    となり、新規セッションでの想起が **同じ問いに毎回ちがう値** を返した
+    (名前は 1 回目「御堂 陽介」/ 2 回目「田中」)。注入側の
+    ``_collapse_to_current_values`` は 1 スロット 1 値へ畳むが、
+    **畳む前に検索へ乗るのは全世代**で、埋め込み検索の上位に旧値が来れば
+    その時点で負ける。ストア側で世代を閉じるのが本筋。
+
+    畳む条件は ``from_correction`` が立っていることに限る。訂正でない再言明
+    (同じ値を言い直しただけ) まで supersede すると、``pet`` のように 1 人が
+    複数値を持ちうるスロットで正当な値を落とす。
+
+    Returns:
+        supersede した旧ファクト数。
+    """
+    superseded = 0
+    for fact in persisted:
+        if not getattr(fact, "from_correction", False):
+            continue
+        try:
+            siblings = store.search_by_subject(
+                fact.subject, include_superseded=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Step 8 [%s]: failed to list slot %s: %s",
+                label, fact.subject, exc,
+            )
+            continue
+        for old in siblings:
+            if old.id == fact.id or old.predicate != fact.predicate:
+                continue
+            if old.superseded_by:
+                continue
+            try:
+                store.supersede(old.id, fact.id)
+                superseded += 1
+            except (KeyError, ValueError) as exc:
+                # 昇格側と同じ扱い — 書き込み自体は成立しているので警告に留め、
+                # 残った旧世代は競合解決 / TTL に委ねる。
+                logger.warning(
+                    "Step 8 [%s]: failed to supersede %s -> %s: %s",
+                    label, old.id, fact.id, exc,
+                )
+    if superseded:
+        logger.info(
+            "Step 8 [%s]: superseded %d stale slot value(s) by corrections",
+            label, superseded,
+        )
+    return superseded
+
+
+#: ``mem.<kind>.<attr>`` の ``kind`` → ``FactType``。値アンカー用の逆引き。
+_FACT_TYPE_BY_KIND: dict[str, str] = {
+    "personal": "personal_fact",
+    "world": "world_fact",
+    "preference": "preference",
+    "emotion": "emotion",
+    "opinion": "opinion",
+}
+
+
+def collect_live_attribute_values(
+    store: "SemanticFactStore",
+) -> dict[tuple[str, str], tuple[str, ...]]:
+    """live ファクトから ``{(fact_type, 属性スロット): (現在値, ...)}`` を組む。
+
+    属性語を落とした訂正 (「さっき名古屋と言いましたが、正しくは横浜です。」)
+    の宛先を決めるための材料。詳細は
+    :func:`~backend.free.memory.extractors.chat.
+    resolve_value_anchored_attributes`。
+
+    ``user`` スロットは除く — 属性が解決できなかったファクトの受け皿なので、
+    そこを名指しても宛先を絞れない。
+    """
+    values: dict[tuple[str, str], list[str]] = {}
+    try:
+        facts = store.all_facts(include_superseded=False)
+    except Exception as exc:
+        logger.warning("Step 8: failed to read live facts: %s", exc)
+        return {}
+    for fact in facts:
+        parts = (fact.subject or "").split(".")
+        if len(parts) != 3 or parts[0] != "mem":
+            continue
+        fact_type = _FACT_TYPE_BY_KIND.get(parts[1])
+        attr = parts[2]
+        if not fact_type or attr == "user":
+            continue
+        text = (fact.text or "").strip()
+        if text:
+            values.setdefault((fact_type, attr), []).append(text)
+    return {key: tuple(vals) for key, vals in values.items()}
 
 
 def _drop_facts_with_existing_subject(
@@ -247,6 +362,9 @@ def extract_semantic_facts(
 
     # ── 1. ChatExtractor → global ──
     if global_store is not None:
+        # 属性語を落とした訂正の宛先を決めるため、既存スロットの現在値を渡す
+        # (chat.resolve_value_anchored_attributes の説明を参照)。
+        ctx.live_attribute_values = collect_live_attribute_values(global_store)
         chat_result = ChatExtractor().extract(notes, ctx)
         total_extracted += persist_facts(global_store, chat_result, "chat")
 
@@ -295,4 +413,8 @@ def extract_semantic_facts(
     return total_extracted, mdp_trace_extractor
 
 
-__all__ = ["extract_semantic_facts", "persist_facts"]
+__all__ = [
+    "collect_live_attribute_values",
+    "extract_semantic_facts",
+    "persist_facts",
+]

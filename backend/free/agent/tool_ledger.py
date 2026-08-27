@@ -135,6 +135,17 @@ def record_current(tool_name: str | None, success: bool) -> None:
     record_tool_use(session_id, tool_name, success, query)
 
 
+def current_session_id() -> str:
+    """現在のリクエストの ``session_id`` (未設定なら空文字)。
+
+    宛先を既に contextvar で運んでいるので、``session_id`` を引数で回せない
+    純粋関数側 (``tool_judge_args._extract_file_path``) が参照するための
+    読み出し口。
+    """
+    target = _current_target.get()
+    return target[0] if target else ""
+
+
 def format_ledger(session_id: str) -> str:
     """台帳を「確定事実」ブロック向けのテキストへ整形する。
 

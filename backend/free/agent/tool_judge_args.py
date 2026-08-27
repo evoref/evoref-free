@@ -11,6 +11,10 @@ import ast
 import re
 from pathlib import Path
 
+from backend.log_config import get_logger
+
+logger = get_logger("agent.tool_judge_args")
+
 # クエリ先頭の URL を抽出する。非 ASCII (CJK 等) を除外し、「URL + 日本語」
 # 入力で末尾テキストを URL に取り込まないようにする
 # (例: https://news.yahoo.co.jp/で取得して... → https://news.yahoo.co.jp/ のみ)。
@@ -215,7 +219,56 @@ def _extract_head_line_count(query: str) -> int | None:
 #: 全角数字 → ASCII。
 _ZENKAKU_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
 def _extract_file_path(query: str) -> str:
-    """クエリからファイルパスを抽出する
+    """クエリからファイルパスを抽出する (暗黙参照は台帳へフォールバック)"""
+    found = _extract_file_path_literal(query)
+    if found:
+        return found
+    # 文字列としてのパスが無い依頼 (「保存したファイルを読んで」「その中身を
+    # 見せて」) は、いくら正規表現を足しても解けない。解けるのは「直前に何を
+    # 書いたか」という観測事実の側で、それは ToolsRegistry が実行時に知って
+    # いる (file_ledger のモジュール docstring を参照)。
+    #
+    # 実インシデント (2026-08-27 ライブ監査、再現 2/2):
+    #   T13-7 「保存したファイルを読んで、構文エラーがないか確認してください。」
+    #         → read_file が 1 回も撃たれず 238 秒後に「確認できません」
+    #   T15-7 「その中身を見せてください。」→「表示できません」
+    # どちらも実ファイルは存在し、明示パスを与えた T05 では正常に動いていた。
+    return _resolve_implicit_file_path(query)
+
+
+def _resolve_implicit_file_path(query: str) -> str:
+    """暗黙参照を直近に触れたファイルへ解決する (無ければ空文字)。
+
+    ゲートは 2 条件の AND:
+
+    1. この発話が指示/過去参照 + ファイル対象語 (``references_recent_file``)
+    2. **観測事実** — この会話で実際にファイルを読み書きしている
+
+    2 を必須にするのが要点。「その中身」だけで台帳を引くと、ファイルに一度も
+    触れていないターンでも直前の何かを掴んでしまう。
+    """
+    from backend.free.agent.file_ledger import (
+        last_file_path,
+        references_recent_file,
+    )
+    from backend.free.agent.tool_ledger import current_session_id
+
+    if not references_recent_file(query):
+        return ""
+    session_id = current_session_id()
+    if not session_id:
+        return ""
+    resolved = last_file_path(session_id)
+    if resolved:
+        logger.info(
+            "Implicit file reference resolved to the most recent file: %s",
+            resolved,
+        )
+    return resolved
+
+
+def _extract_file_path_literal(query: str) -> str:
+    """クエリの **文字列から** ファイルパスを抽出する
 
     日本語の自然言語テキストからファイルパスを抽出する。
     「e:\\直下にa.txtのファイル名で...」→ 「e:\\a.txt」のように、

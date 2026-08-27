@@ -242,6 +242,12 @@ class AppState:
     # 読み書きは backend.free.api.chat._continuation に閉じる。
     truncated_responses: dict[str, "Any"] = field(default_factory=dict)
 
+    # 直前ターンで生成した長文成果物 (session_id -> LastArtifact)。
+    # 長文は履歴予算 (実測 1612 トークン) に入らず次ターンで消えるため、
+    # 「いまの計画書は何章?」「保存して」に答える材料がどこにも残らない。
+    # 読み書きは backend.free.api.chat._artifact に閉じる。
+    last_artifacts: dict[str, "Any"] = field(default_factory=dict)
+
     # ── メモリシステムアクセス ──
 
     def get_memory_system(

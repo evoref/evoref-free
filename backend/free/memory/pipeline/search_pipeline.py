@@ -220,6 +220,7 @@ def attach_superseding_corrections(
 async def _search_stm_layer(
     short_term, query_vec: np.ndarray, stm_top_k: int,
     drop_past_answers: bool = False,
+    retired_note_ids: set[str] | None = None,
 ) -> tuple[list[tuple[str, float, str]], list[tuple[str, float, str]]]:
     """Layer 2 短期記憶検索 (< 1ms)。``(順位付け用, ゲート用)`` を返す。
 
@@ -250,6 +251,20 @@ async def _search_stm_layer(
                     "Step 2 STM: this query repeats an earlier turn; dropped "
                     "%d assistant note(s) so the previous answer is not "
                     "handed back as reference material",
+                    before - len(hits),
+                )
+        # 値が supersede された発話は現在値として参照させない。
+        # MemoryInjector 側 ([関連する記憶]) は別途落としているが、STM は
+        # **2 経路で注入される** — ここを塞がないと同じノートが [参考情報]
+        # として出る (2026-08-27 の実機検証: injector が 3 件落とした同じ
+        # ターンで「データベース管理者」が返り続けた)。
+        if retired_note_ids:
+            before = len(hits)
+            hits = [h for h in hits if h[0].id not in retired_note_ids]
+            if len(hits) != before:
+                logger.info(
+                    "Step 2 STM: dropped %d note(s) whose value was "
+                    "superseded by a later correction",
                     before - len(hits),
                 )
         ranked = [(note.id, combined, note.content) for note, combined, _ in hits]
@@ -727,6 +742,7 @@ async def unified_search(
     *,
     session_id: str = "default",
     judge_tracker: "JudgeUsageTracker | None" = None,
+    retired_note_ids: set[str] | None = None,
 ) -> SearchResult:
     """統合検索パイプライン: Self-RAG + 3層メモリ
 
@@ -809,7 +825,10 @@ async def unified_search(
             "of the reference block (query=%r)", query[:50],
         )
     stm_pair, ltm_pair, cart_results = await asyncio.gather(
-        _search_stm_layer(short_term, query_vec, stm_top_k, drop_past_answers),
+        _search_stm_layer(
+            short_term, query_vec, stm_top_k, drop_past_answers,
+            retired_note_ids=retired_note_ids,
+        ),
         _search_ltm_layer(
             long_term, query_vec, fetch_k, drop_past_answers, query,
         ),

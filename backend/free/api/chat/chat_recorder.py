@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from backend.app_state import AppState
+from backend.free.core.text_quality import strip_system_notes
+from backend.free.api.chat._artifact import remember_artifact
 from backend.free.api.chat.chat_types import ChatMessage
 from backend.free.core.text_quality import is_query_echo, strip_echoed_query
 from backend.free.history.history_manager import (
@@ -68,7 +70,9 @@ def is_content_type_mismatch(metrics: dict, user_query: str) -> bool:
     )
 
 
-def judge_long_form_success(metrics: dict, user_query: str) -> bool:
+def judge_long_form_success(
+    metrics: dict, user_query: str, delivered: str | None = None,
+) -> bool:
     """長文生成ターンの成否を判定する (Level 0 記録 / MDP episode 共通)。
 
     条件:
@@ -83,6 +87,19 @@ def judge_long_form_success(metrics: dict, user_query: str) -> bool:
     新規追加も走らない。record 側と agent_trace 側で式が食い違うと同じターンが
     別々の成否で二重学習されるため、両者はこの関数を共有する。
     """
+    # ユーザーへ 1 文字も届かなかったターンは成功ではない。
+    #
+    # 実インシデント (2026-08-27、WS2 検証中に 1 回観測): 長文生成が 605 秒
+    # かけて **空応答** を返した。units_completed だけを見ていると、内部で
+    # ユニットを組み立てた形跡があるかぎり「成功」として正例学習される。
+    # 画面には何も出ていないので、ユーザーから見れば完全な失敗。
+    if delivered is not None and not delivered.strip():
+        logger.warning(
+            "Long-form turn delivered no text (units=%s, elapsed metrics=%s); "
+            "recording it as a failure",
+            metrics.get("units_completed"), metrics.get("budget_used_pct"),
+        )
+        return False
     units_completed = int(metrics.get("units_completed", 0) or 0)
     validation_errors = int(metrics.get("validation_errors", 0) or 0)
     return (
@@ -101,6 +118,20 @@ _session_turns: dict[str, list[dict]] = {}
 # private ターンを 1 度でも含んだセッション ID
 # (``memory.private.history_storage: skip`` でセッションごと永続化を落とす判定に使う)
 _session_had_private: set[str] = set()
+
+
+def _recorded_body(response: str) -> str:
+    """記憶へ積む本文 (システムの開示注記を除いたもの)。
+
+    開示そのものは必要だが、**記憶に残す本文ではない**。注記込みで保存すると
+    次のターンでモデルがそれを自分が書いた文の一部として読む。実インシデント
+    (2026-08-27 ライブ監査 T09-2): 本文 45 文字 + 注記 34 文字を保存した結果、
+    「いま書いた文章は何文字でしたか。」に **81 文字** と答えた。
+
+    「制約を破った」という信号は issue 台帳が持つので、履歴から落としても
+    失われない。
+    """
+    return strip_system_notes(response)
 
 
 def _accumulate_turn(
@@ -128,6 +159,31 @@ def _accumulate_turn(
         "content": content,
         "timestamp": time.time(),
     })
+
+
+def session_turn_count(session_id: str) -> int:
+    """このセッションの累計ターン数 (user + assistant)。
+
+    ``WorkingMemory`` は窓を越えた分を押し出すので、会話全体を数えられるのは
+    こちらの蓄積バッファだけ。実インシデント (2026-08-27 ライブ監査 T19-4):
+    148 ターン目に「50ターン目です」と答えた (窓に入っている分だけを数えた)。
+    """
+    return len(_session_turns.get(session_id) or ())
+
+
+def count_term_in_session(session_id: str, term: str) -> int:
+    """このセッションの全ターン本文に ``term`` が現れた回数。
+
+    実インシデント (2026-08-27 ライブ監査 T08-7): 「これまでの会話に「横浜」は
+    何回出てきましたか。」に「5回」と答えた (実際 4 回)。ツールを使わず数を
+    断定していた。
+    """
+    if not term:
+        return 0
+    return sum(
+        str(turn.get("content") or "").count(term)
+        for turn in (_session_turns.get(session_id) or ())
+    )
 
 
 def clear_session_data(session_id: str) -> None:
@@ -392,6 +448,27 @@ def _turn_contradiction_inputs(
     return action_blocked, measured
 
 
+#: 成果物として保持する最小の応答長 (文字)。履歴予算 (実測 1612 トークン
+#: ≒ 日本語 2000 文字強) の半分を目安にする — 他のターンと合わさると
+#: この程度から落ち始める。短い応答まで保持すると、直後の相槌で本物の
+#: 成果物を上書きしてしまう。
+ARTIFACT_MIN_CHARS = 1200
+
+
+def _remember_if_artifact_sized(
+    state: AppState, session_id: str, response: str, query: str, mode: str,
+) -> None:
+    """長い応答だけを「直前の成果物」として保持する。
+
+    短い確認応答 (「plan.md に書き込みました。」) まで保持すると、直後の
+    「その中身を見せて」で **確認応答の方** が素材になり、本物の成果物への
+    参照が切れる。閾値で分けるのはそのため。
+    """
+    if len(response or "") < ARTIFACT_MIN_CHARS:
+        return
+    remember_artifact(state, session_id, text=response, query=query, mode=mode)
+
+
 def record_response(
     state: AppState, full_response: str, messages: list[ChatMessage],
     session_id: str, user_query: str, mode: str,
@@ -421,7 +498,7 @@ def record_response(
     if mem_sys and full_response:
         wm, stm, _ltm = mem_sys
         wm.add_turn(
-            "assistant", full_response,
+            "assistant", _recorded_body(full_response),
             private=private, mode=mode, source="assistant",
             tool_command=tool_command,
             tool_command_name=tool_command_name,
@@ -433,6 +510,12 @@ def record_response(
             tool_command_query=user_query if tool_command else None,
         )
         drain_evicted_to_stm(wm, stm, session_id)
+
+    # 履歴予算に入らない長さの応答は成果物として保持する。
+    # 実測 (2026-08-27 ライブ監査) の履歴予算は 1612 トークン。これを超える
+    # 出力は次ターンで落ちるため、「いま書いたコードは何行ですか」に
+    # **「1行です」** (実際は 26 行) と答えていた。
+    _remember_if_artifact_sized(state, session_id, full_response, user_query, mode)
 
     # デバッグログ
     dl = state.debug_logger
@@ -504,7 +587,7 @@ def record_meta_cognitive_response(
     if mem_sys and full_response:
         wm, stm, _ltm = mem_sys
         wm.add_turn(
-            "assistant", full_response,
+            "assistant", _recorded_body(full_response),
             private=private, mode=mode, source="assistant",
         )
         drain_evicted_to_stm(wm, stm, session_id)
@@ -580,10 +663,22 @@ def record_long_form_response(
     if mem_sys and full_response:
         wm, stm, _ltm = mem_sys
         wm.add_turn(
-            "assistant", full_response,
+            "assistant", _recorded_body(full_response),
             private=private, mode=mode, source="assistant",
         )
         drain_evicted_to_stm(wm, stm, session_id)
+
+    # 成果物として保持する。WM へ積んでも **次のターンには残らない** —
+    # 実測 (2026-08-27 ライブ監査 T10) で 6696 文字の計画書を出した次のターンが
+    # ``_trim_history: 5/5 turns kept, 812 estimated tokens (max=1612)`` で、
+    # 履歴予算に入らず落ちていた。その結果「いまの計画書は何章?」に
+    # 「履歴に含まれていないので、計画書のテキストを共有いただければ」と
+    # 答えていた (ユーザーが 1 ターン前に受け取った本文を貼り直せ、という要求)。
+    if full_response:
+        remember_artifact(
+            state, session_id,
+            text=full_response, query=user_query, mode=mode,
+        )
 
     # デバッグログ
     dl = state.debug_logger
@@ -596,7 +691,9 @@ def record_long_form_response(
         try:
             units_completed = int(metrics.get("units_completed", 0) or 0)
             validation_errors = int(metrics.get("validation_errors", 0) or 0)
-            long_form_success = judge_long_form_success(metrics, user_query)
+            long_form_success = judge_long_form_success(
+                metrics, user_query, full_response,
+            )
             prompt_tokens, cached_tokens = read_llama_prompt_tokens(state)
 
             blocked, measured = _turn_contradiction_inputs(

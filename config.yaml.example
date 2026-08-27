@@ -167,11 +167,23 @@ llama:
   #   kv_unified (下記) が守るので、cache_ram_mib は RAM 退避が欲しい時のみ >0 にすればよい。
   # cache_idle_slots: 上流既定 true (idle slot を退避対象にする)。
   #   false で機構自体を OFF（``--no-cache-idle-slots`` 付与）。
+  #   **既定は false**。true にしても cache_ram_mib=0 では退避先が無く、
+  #   llama-server 側で無効化される (起動時に警告が出る)。宣言と実効が食い違う
+  #   設定を同梱すると、恒常的に出る警告を全員が読み飛ばすようになる。
+  #
+  #   実測 (2026-08-27 ライブ監査 171 ターン) でも >0 にする根拠は無かった:
+  #   キャッシュ率は中央値 92% / p10 56% で、低キャッシュだった deliberative
+  #   7 件のうち 6 件は **aux の直後ではない**。prompt_n 2897〜5288 に対し
+  #   cache_n 0〜1317 で、プロンプト前方が変わった形 (窓のスライド / 動的
+  #   ブロックの変化) だった。idle 退避が救うのはスロットが追い出される
+  #   ケースなので、この形には効かない。host RAM だけを消費する。
+  #   RAM 退避が要るワークロード (slots を増やす / 長時間 idle が挟まる) では
+  #   cache_ram_mib を >0 にしたうえで true に戻す。
   # kv_unified: null=auto (slots>1 で ``--kv-unified`` 自動付与) / true|false で明示上書き。
   #   非 unified だと per-seq context が n_ctx/slots に半減する (-c 8192 -np 2 で 4096)。
   #   unified は VRAM 増なしに各 seq へ full n_ctx を与える。cache_ram_mib とは独立。
   cache_ram_mib: 0
-  cache_idle_slots: true
+  cache_idle_slots: false
   kv_unified: null
   # --- self-speculative decoding ---
   # Pro 限定。``evoref create`` モード (Pro デフォルト) の base モデルで
