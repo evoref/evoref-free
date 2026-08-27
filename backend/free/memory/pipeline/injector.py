@@ -576,6 +576,7 @@ class MemoryInjector:
         query_embedding: "np.ndarray | None" = None,
         session_user_texts: Iterable[str] = (),
         query_text: str = "",
+        retired_note_ids: "set[str] | None" = None,
     ) -> InjectionPlan:
         """注入計画を構築する。
 
@@ -591,6 +592,13 @@ class MemoryInjector:
             session_user_texts: 今回の会話でユーザーが述べた本文の列。ここに
                 同じ属性スロットの言明があるファクトは注入しない
                 (:meth:`_restated_slots` を参照)。
+            retired_note_ids: 値が supersede された発話ノートの ID 集合。
+                SemMem 側で世代を閉じても STM ノートの原文は残るため、
+                訂正前の発話が「現在値」として Tier 2 に載り続ける。
+                実機検証 (2026-08-27) では occupation が supersede 済みでも
+                「職業はデータベース管理者で、名古屋に住んでいます。」の
+                ノートから訂正前の値が返っていた。履歴は消さず、
+                **現在値として黙って提示する経路だけ**を止める。
             query_text: 現在のユーザー発話の本文。**どの属性を尋ねているか**を
                 決定論辞書 (:func:`resolve_fact_attribute`) で解決し、一致する
                 ファクトを関連度ゲートから免除する (:meth:`_asked_attributes`)。
@@ -616,6 +624,8 @@ class MemoryInjector:
         # 埋め込みモデルを替えたとき、静的閾値が黙って全部落とす)。
         gate_reached = 0
         gate_rejected = 0
+        retired_dropped = 0
+        retired = retired_note_ids or set()
 
         # Tier ごとに分類
         buckets: dict[int, list[InjectedItem]] = {1: [], 2: [], 3: [], 4: []}
@@ -791,6 +801,15 @@ class MemoryInjector:
             if looks_like_task_log_residue(getattr(note, "content", "")):
                 filtered_out += 1
                 continue
+            # 値が supersede された発話は「現在値」として提示しない。
+            # SemMem 側で世代を閉じても STM の原文は残るため、訂正前の発話が
+            # Tier 2 に載り続ける (retired_note_ids の説明を参照)。
+            # ``pinned`` も免除しない — ユーザーが pin したのは当時の値で、
+            # 本人が後から訂正している。
+            if retired and note.id in retired:
+                filtered_out += 1
+                retired_dropped += 1
+                continue
             gate_reached += 1
             if not self._is_relevant(
                 query_vec, getattr(note, "embedding", None),
@@ -865,12 +884,20 @@ class MemoryInjector:
         logger.debug(
             "MemoryInjector.inject: mode=%s budget=%d used=%d items=%d "
             "dropped=%d project=%s sigs=%d relevance=%s filtered=%d "
-            "near_dup=%d asked_attrs=%s attr_exempt=%d",
+            "near_dup=%d asked_attrs=%s attr_exempt=%d retired=%d",
             mode, budget, plan.used_tokens, len(plan.items),
             len(plan.dropped), current_project_id, len(sigs),
             "on" if query_vec is not None else "off", filtered_out,
             dedup_dropped, sorted(asked_attrs) or "-", attr_exempt,
+            retired_dropped,
         )
+        if retired_dropped:
+            # 訂正が効いているかを実機で追えるようにする (沈黙で落とさない)。
+            logger.info(
+                "MemoryInjector: dropped %d STM note(s) whose value was "
+                "superseded by a later correction",
+                retired_dropped,
+            )
         # 全件却下は「関連する記憶が無いターン」でも起きるが、それが**続く**なら
         # 棒が到達不能になっている。静的閾値のまま埋め込みモデルを替えたときの
         # 沈黙故障 (このプロジェクトで 2 度起きている) を観測可能にする。

@@ -23,6 +23,7 @@ from backend.free.api.chat.constraint_repair import (
     repair_if_violated,
     verify_and_repair_sync,
 )
+from backend.free.api.chat._continuation import strip_repeated_prefix
 from backend.free.core.text_quality import length_disclosure_note
 from backend.free.api.chat.chat_types import (
     ChatMessage,
@@ -33,6 +34,7 @@ from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.core.stream_filter import (
     HeadBufferFilter,
     InternalFrameMentionFilter,
+    ContinuationRepeatFilter,
     LengthDisclosureFilter,
     QueryEchoFilter,
     RepetitionGuardFilter,
@@ -120,6 +122,7 @@ async def _stream_filtered_token_pipeline(
     timer: StageTimer | None,
     query: str = "",
     buffer_only: bool = False,
+    continuation_tail: str = "",
 ) -> AsyncIterator[str]:
     """フィルタパイプライン (思考ブロック除去 + 先頭ラベル除去) でトークンを yield する。
 
@@ -154,6 +157,10 @@ async def _stream_filtered_token_pipeline(
         # なくパイプラインに置く (LengthDisclosureFilter の docstring 参照)。
         # buffer_only のときは修復を試みたあとで呼出側が開示する。
         filters.append(LengthDisclosureFilter(query))
+    if continuation_tail:
+        # 継続生成の冒頭にある直前応答の再掲を落とす。プロンプトの
+        # 「繰り返さない」指示は実測で効かない (2026-08-27 T10-3)。
+        filters.insert(0, ContinuationRepeatFilter(continuation_tail))
     pipeline = StreamPipeline(filters)
     aiter = token_stream.__aiter__()
     pending: asyncio.Task[str] | None = None
@@ -782,6 +789,7 @@ async def stream_reactive_light(
     timer: "StageTimer | None" = None,
     private: bool = False,
     cacheable: bool = True,
+    continuation_tail: str = "",
 ):
     """Reactive 軽量パス: few-shot/RAG/semmem/tool なしの最小プロンプトで base 1 ターン。
 
@@ -815,6 +823,8 @@ async def stream_reactive_light(
             async for frame in _stream_filtered_token_pipeline(
                 token_stream, stream_state, session_id, timer, query,
                 buffer_only=verify_output,
+                # 継続生成ターンのみ非空。冒頭の再掲を落とす。
+                continuation_tail=continuation_tail,
             ):
                 yield frame
 
@@ -889,6 +899,7 @@ async def sync_reactive_light(
     timer: "StageTimer | None" = None,
     private: bool = False,
     cacheable: bool = True,
+    continuation_tail: str = "",
 ) -> ChatResponse:
     """Reactive 軽量パスの非ストリーミング応答。"""
     from backend.free.llm.utils import extract_content
@@ -907,6 +918,11 @@ async def sync_reactive_light(
         _apply_generation_params(gen_kwargs, generation_params)
         data = await client.generate(list(messages), **gen_kwargs)
         content = extract_content(data) if isinstance(data, dict) else str(data)
+        if continuation_tail:
+            # 継続生成の冒頭にある直前応答の再掲を落とす。ストリーミング側
+            # (ContinuationRepeatFilter) と同じ判定を同期側にも掛ける —
+            # 片方だけだと経路によって挙動が割れる。
+            content = strip_repeated_prefix(content, continuation_tail)
         if timer:
             timer.stop("llm_total_ms")
 

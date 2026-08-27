@@ -191,7 +191,7 @@ def _emit_long_form_episode(
         validation_errors = int(metrics.get("validation_errors", 0) or 0)
         # Level 0 記録側 (chat_recorder) と同一式を共有する。式が食い違うと
         # 同じターンが reward=1.0 と long_form_success=False で二重学習される。
-        success = judge_long_form_success(metrics, query)
+        success = judge_long_form_success(metrics, query, delivered)
         episode_id = tracer.begin_episode(session_id, mode)
         tracer.record_step(episode_id, MDPStep(
             step_index=0,

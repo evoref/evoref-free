@@ -161,7 +161,17 @@ class LlamaConfig(BaseModel):
     # 黙従しないよう launch_llama.py から常に明示付与する。
     cache_ram_mib: int = Field(default=0, ge=-1)
     # 上流既定 true (idle slot を退避対象にする)。false で機構自体を OFF。
-    cache_idle_slots: bool = True
+    #
+    # **本プロジェクトの既定は False**。true にしても cache_ram_mib=0 では
+    # 退避先が無く llama-server 側で無効化されるため、宣言と実効が食い違う
+    # (下の warn_idle_slot_cache_without_ram_budget が毎起動で警告する)。
+    # 恒常的に出る警告は読み飛ばされるようになるので、既定は実効に合わせる。
+    #
+    # 実測 (2026-08-27 ライブ監査 171 ターン) でも >0 にする根拠は無かった —
+    # 低キャッシュだった deliberative 7 件のうち 6 件は aux の直後ではなく、
+    # プロンプト前方が変わった形だった。idle 退避が救うのはスロットが
+    # 追い出されるケースなので、この形には効かない。
+    cache_idle_slots: bool = False
     # null=auto (slots>1 で ``--kv-unified`` 自動付与) / true|false で明示上書き。
     # unified KV は multi-slot で VRAM 増なく各シーケンスへ full n_ctx を与え
     # (非 unified だと per-seq context が n_ctx/slots に半減)、かつ cache-ram の

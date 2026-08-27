@@ -108,6 +108,23 @@ _ATTRIBUTE_FACT_TYPES: tuple[str, ...] = (
     "personal_fact", "preference", "emotion", "opinion",
 )
 
+#: **確認を求める終助詞**。「〜でしたよね」「〜ですよね」「〜でしたっけ」は
+#: 値の言明ではなく、記憶の**問い合わせ**である。訂正形の語 (``ではなく``) と
+#: 同居しても、ユーザーは値を確定していない。
+#:
+#: 実インシデント (2026-08-27 ライブ監査 T14): 「私の名前は御堂ではなく田中
+#: でしたよね。」の 1 発話で ``mem.personal.name`` が「田中」に置き換わり、
+#: 以後そのセッションでずっと「田中です」と答え、成果物 ``summary.md`` にも
+#: ``ユーザー名: 田中`` として書き出された。同じ会話でユーザーが「1マイルは
+#: 1.2kmですよね」と数値の誤りを主張した際は正しく否定できており、
+#: **記憶属性にだけ抵抗機構が無い**という非対称になっていた。
+#:
+#: 裸の ``ね`` は採らない — 「正しくは横浜ですね」のような相槌混じりの
+#: 言い直しまで落ちる。確認を求める形に限る ``よね`` / ``っけ`` だけを見る。
+_CONFIRMATION_SEEKING_RE = re.compile(
+    r"(?:よ\s*ね|っけ)[。．.、,！!？?\s\"'」』）)]*$",
+)
+
 
 def restates_attribute_value(
     text: str,
@@ -128,6 +145,10 @@ def restates_attribute_value(
     証拠に課しているゲートと同じ。
     """
     if not text:
+        return False
+    if _CONFIRMATION_SEEKING_RE.search(text.strip()):
+        # 「〜でしたよね」は記憶の問い合わせ。値は確定していないので
+        # スロットを書き換えない (:data:`_CONFIRMATION_SEEKING_RE` 参照)。
         return False
     haystack = _normalize_trigger(text)
     if not any(t in haystack for t in CORRECTION_FORM_TRIGGERS):
@@ -557,7 +578,59 @@ def resolve_fact_attribute_matches(
             out.append((spec.slug, spec.triggers))
             if len(out) >= max(1, limit):
                 break
-    return out
+    return _drop_name_owned_by_another_entity(out, haystack)
+
+
+#: 「名前」を持ちうる **ユーザー以外のエンティティ** のスロット。
+#: 同じ発話でこれらが解決していれば、所有格の無い「名前は…」は
+#: そのエンティティのものと読む。
+_NAME_OWNING_ENTITY_SLUGS: frozenset[str] = frozenset({"pet", "family"})
+
+
+def _drop_name_owned_by_another_entity(
+    matches: list[tuple[str, tuple[str, ...]]], haystack: str,
+) -> list[tuple[str, tuple[str, ...]]]:
+    """別エンティティの名前が ``name`` スロットへ入るのを防ぐ (純粋関数)。
+
+    ``AttributeSpec.requires_self_possessor`` は所有格 (「猫**の**名前は」) と
+    **同じ文の** 話題マーカーを見る。話題のスコープは句点で切れる設計なので
+    (「趣味は登山です。名前は小川です。」を本人の名前として通すため)、
+    **句点で区切られた形は素通りする**::
+
+        「猫を飼っています。名前はミケです。」
+            → pet と name の両方が解決し、``mem.personal.name`` に
+              「名前はミケ」が live で入る
+
+    実インシデント (2026-08-27 ライブ監査の修正検証、クリーン状態):
+    上の 1 発話だけで、新規セッションの「私の名前を覚えていますか。」が
+    **「あなたの名前はミケですね。」** を返した。さらにこのファクトは
+    「猫の名前はミケではなくトラでした。」の訂正が ``pet`` スロットへ行くため
+    **永久に supersede されず**、猫の名前を聞いても訂正前の「ミケ」が勝った。
+
+    語彙 (猫 / 犬 / 妻 …) を数えるのではなく、**同じ発話で解決した他の
+    スロット** を見る。``pet`` / ``family`` は「名前を持ちうる別の存在」を
+    指すスロットそのものなので、これが立っていて ``name`` の側に一人称の
+    裏付けが無ければ、その名前は本人のものではない。
+
+    ``requires_self_possessor`` が既に自己所有を確認できた場合
+    (「猫の名前はソラで、私の名前は小川です」) は落とさない —
+    その出現には一人称の所有格が付いている。
+
+    落ちた ``name`` は ``mem.personal.user`` へフォールバックするので、
+    **本人のスロットは汚れない安全な失敗** になる。
+    """
+    slugs = {slug for slug, _ in matches}
+    if "name" not in slugs or not (slugs & _NAME_OWNING_ENTITY_SLUGS):
+        return matches
+    if _SELF_POSSESSED_NAME_RE.search(haystack):
+        return matches
+    return [(slug, words) for slug, words in matches if slug != "name"]
+
+
+#: 一人称の所有格が直接付いた「名前」。これがあれば本人の名前と読む。
+_SELF_POSSESSED_NAME_RE = re.compile(
+    r"(?:私|僕|俺|自分|わたし|ぼく|おれ|あたし|わたくし|うち)\s*の\s*名前",
+)
 
 
 def resolve_fact_attribute(
