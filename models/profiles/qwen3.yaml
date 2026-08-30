@@ -49,3 +49,13 @@ embedding:
   recall:
     url_recall_min_score: 0.7
     executable_command_recall_min_score: 0.7
+  # コサインを絶対値で比べる閾値 (config の memory.* / rag.* へ転写)。
+  # 2026-08-30 実測: 真の競合 0.418-0.812 / 偽の競合 0.185-0.336、
+  # 関連ノート 0.333-0.615 / 無関係ノート 0.184-0.329。
+  # 現行既定 (note_link 0.5 / attribute 0.55) は誤検出 0 で機能するため据え置き。
+  memory:
+    note_link_threshold: 0.5
+    conflict_similarity_threshold: 0.85
+    attribute_similarity_threshold: 0.55
+  rag:
+    cartridge_gate_threshold: 0.45

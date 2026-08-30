@@ -316,6 +316,17 @@ def _week_of_weekday_command(query: str) -> str:
     )
 
 
+#: 年なしの月日を **過去側** の巡りへ寄せる問い (「8 月 1 日から何日経ちましたか」)。
+#: 該当しなければ未来側 (「あと何日」「まで何日」) に寄せる。日数を尋ねる問いの
+#: 語彙 (:data:`_DAY_COUNT_ASK_RE`) は圧倒的に未来向きなので、既定を未来にして
+#: 過去向きの語が出たときだけ反転させる。
+_DAY_COUNT_BACKWARD_RE = re.compile(
+    r"経ち|経過|過ぎ|以来|から今日|から現在"
+    r"|(?<![A-Za-z])since(?![A-Za-z])"
+    r"|(?<![A-Za-z])ago(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
 #: 「今年の残り」「年末まで」— 年末までの日数。
 _YEAR_REMAINDER_RE = re.compile(
     r"今年.{0,6}(?:残り|あと)|年末まで|(?:残り|あと).{0,4}今年"
@@ -359,6 +370,44 @@ class _QueryDate:
         """``datetime.datetime(...)`` 式 (年なしは実行時の ``n.year``)。"""
         year = str(self.year) if self.year is not None else "n.year"
         return f"datetime.datetime({year},{self.month},{self.day})"
+
+    def occurrence_stmt(self, var: str, *, forward: bool) -> str:
+        """年なしの月日を **今日を基準にした最寄りの巡り** へ寄せる文を返す。
+
+        年が書かれている日付はそのまま (寄せない)。年が無い日付を実行時の年で
+        固定すると、既に過ぎた月日では日数が負になる。
+
+        実インシデント (2026-08-28 ライブ監査 T03-7):
+        「私の誕生日は5月3日です。今日から次の誕生日まで何日ですか。」
+        (当日 2026-08-28) で ``a=datetime.date(n.year,5,3)`` が組まれ、
+        ツール出力は ``days: -117``。モデルはこれを使わず「260日です」と答えた
+        (正解 248 日)。**負の日数はどちらの向きの問いにも答えになっていない**
+        ので、そもそも渡さない。
+
+        ``forward`` が真なら今日以降の最初の巡り、偽なら今日以前の最後の巡りを
+        採る。2/29 は 4 年に一度しか無いので、実在する年まで進める / 戻す。
+        """
+        if self.year is not None:
+            return f" {var}={self.date_expr()};"
+        if (self.month, self.day) == (2, 29):
+            years = (
+                "range(n.year,n.year+9)" if forward else "range(n.year,n.year-9,-1)"
+            )
+            cmp_ = ">=" if forward else "<="
+            pick = "min" if forward else "max"
+            return (
+                f" {var}={pick}(d0 for d0 in (datetime.date(y,2,29)"
+                f" for y in {years}"
+                " if y%4==0 and (y%100!=0 or y%400==0))"
+                f" if d0{cmp_}t);"
+            )
+        shift = "+1" if forward else "-1"
+        cmp_ = ">=" if forward else "<="
+        return (
+            f" {var}={self.date_expr()};"
+            f" {var}={var} if {var}{cmp_}t"
+            f" else datetime.date(n.year{shift},{self.month},{self.day});"
+        )
 
 
 def _iter_query_dates(query: str) -> list[_QueryDate]:
@@ -443,12 +492,17 @@ def _day_count_command(query: str) -> str:
             " print('days:',abs((b-a).days))\""
         )
     if len(dates) == 1:
+        forward = not _DAY_COUNT_BACKWARD_RE.search(query or "")
+        occurrence = dates[0].occurrence_stmt("a", forward=forward)
+        # 差は問いの向きで引く。「まであと何日」は a-t、「から何日経ったか」は
+        # t-a。年なしの日付は上で最寄りの巡りへ寄せてあるので、どちらも非負になる。
+        diff = "(a-t).days" if forward else "(t-a).days"
         return (
             'python -c "import datetime;'
             " n=datetime.datetime.now().astimezone(); t=n.date();"
-            f" a={dates[0].date_expr()};"
+            f"{occurrence}"
             " print('now:',n); print('target:',a);"
-            " print('days:',(a-t).days)\""
+            f" print('days:',{diff})\""
         )
     if _YEAR_REMAINDER_RE.search(query or ""):
         return (

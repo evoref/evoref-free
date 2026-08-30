@@ -43,7 +43,10 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from backend.free.core.intent_vocab import NUMBER_LITERAL_RE
-from backend.free.core.text_quality import value_was_adopted
+from backend.free.core.text_quality import (
+    contradicts_asserted_value,
+    value_was_adopted,
+)
 from backend.free.llm.json_schemas import AssertionNaming
 from backend.free.memory.corrections import correction_target
 from backend.free.memory.types import make_fact
@@ -163,9 +166,6 @@ def _assistant_rejected_the_claim(note: "MemoryNote", notes: list) -> bool:
     判定材料が無いケース (アシスタントが「承知しました。」とだけ返した等) は
     ``False`` = 従来どおり curate する。**安全側は「残す」**。
     """
-    claimed = set(NUMBER_LITERAL_RE.findall(note.content or ""))
-    if not claimed:
-        return False
     reply = _next_assistant_note(note, notes)
     if reply is None:
         return False
@@ -173,6 +173,16 @@ def _assistant_rejected_the_claim(note: "MemoryNote", notes: list) -> bool:
     # 疑問形しか無い応答 (「10月1日からでよいですか？」) は反論ではなく確認。
     # 値が違っても却下と見なさない。
     if assertive_body(reply_text) is None:
+        return False
+    # 数値を含まない誤主張は数値集合では見えない。同じ話題に別の値が対置された
+    # かを先に見る (2026-08-28 ライブ監査 T11-3:「日本の首都は大阪ですよね。」に
+    # 「日本の首都は東京です。大阪は……首都ではありません。」と返しているのに
+    # ``mem.world.assertion.capital_of_japan`` = 「日本の首都は大阪です。」が
+    # live になった。2026-08-27 に入れた数値ゲートと同じ欠陥の非数値版)。
+    if contradicts_asserted_value(note.content or "", reply_text):
+        return True
+    claimed = set(NUMBER_LITERAL_RE.findall(note.content or ""))
+    if not claimed:
         return False
     prior = set(NUMBER_LITERAL_RE.findall(reply_text))
     if not (prior - claimed):

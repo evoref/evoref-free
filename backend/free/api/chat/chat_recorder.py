@@ -398,6 +398,21 @@ def _schedule_sleep_time(state: AppState, user_query: str, private: bool) -> Non
     SemMem に反映されるまで最大 30 分かかる。訂正は反映が遅れると意味が薄れる
     ので、そのターンだけ待ち時間を下限まで縮める。
 
+    **訂正でない更新** (引っ越し / 転職) も同じ理由で前倒しする。単値スロットの
+    旧値を畳むのは Step 8 だけなので、Full が走るまでの間は
+
+    - 旧値: SemMem ファクト (Tier 1)
+    - 新値: STM ノートだけ (Tier 2)
+
+    となり、**Tier の序列上どうやっても旧値が勝つ**。実測 (2026-08-29 ライブ監査
+    F38): 「転職してデータサイエンティストになりました」の直後の新セッションで
+    「インフラエンジニアです」と旧値を返し、自己検査も「古い情報は含まれて
+    いません」と保証した。``restates_a_value`` は「〜ではなく〜」型の言い直しを
+    拾う述語なので、この種の更新には掛からない。
+
+    前倒しの誤爆は「Full が少し早く走る」だけで、正しい値を消す方向の失敗が
+    無い — 窓を縮める側に倒す。
+
     private ターンは SemMem へ書かない契約なので前倒ししない。
     """
     scheduler = state.sleep_scheduler
@@ -406,9 +421,14 @@ def _schedule_sleep_time(state: AppState, user_query: str, private: bool) -> Non
     if not private and user_query:
         try:
             from backend.free.agent.feedback import restates_a_value
+            from backend.free.memory.notes.note_builder import (
+                states_single_valued_attribute,
+            )
 
             if restates_a_value(user_query):
                 scheduler.request_full_soon("value_restated")
+            elif states_single_valued_attribute(user_query):
+                scheduler.request_full_soon("single_valued_attribute_stated")
         except Exception as exc:
             logger.warning(
                 "correction-triggered full request skipped: %s", exc,

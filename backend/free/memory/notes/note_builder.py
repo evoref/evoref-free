@@ -229,20 +229,25 @@ def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
     2 つの記法を受ける (既存の YAML を書き換えずに済ませるため):
 
     - ``slug: [trigger, ...]`` — ガード無し (従来形)
-    - ``slug: {triggers: [...], requires_self_possessor: true}``
+    - ``slug: {triggers: [...], requires_self_possessor: true, single_valued: true}``
 
     trigger が 1 つも無ければ ``None`` (呼出側がスキップする)。
     """
     if isinstance(raw, dict):
         words = _coerce_triggers(raw.get("triggers"))
         requires_self = bool(raw.get("requires_self_possessor", False))
+        single_valued = bool(raw.get("single_valued", False))
     else:
         words = _coerce_triggers(raw)
         requires_self = False
+        single_valued = False
     if not words:
         return None
     return AttributeSpec(
-        slug=slug, triggers=words, requires_self_possessor=requires_self,
+        slug=slug,
+        triggers=words,
+        requires_self_possessor=requires_self,
+        single_valued=single_valued,
     )
 
 
@@ -396,6 +401,35 @@ class AttributeSpec:
     slug: str
     triggers: tuple[str, ...]
     requires_self_possessor: bool = False
+    #: 1 人につき値が 1 つしか成立しないスロットか。
+    #:
+    #: 真のとき、Step 8 は同じスロットの旧ファクトを **訂正でなくても**
+    #: supersede する (:func:`sleep.extraction.supersede_stale_slot_values`)。
+    #: 既定は偽 — 宣言していないスロットの挙動は一切変わらない。
+    #:
+    #: 実インシデント (2026-08-29 ライブ監査): supersede は
+    #: ``from_correction`` が立ったファクトにしか走らないため、**訂正ではない
+    #: 更新** (「先月、横浜から札幌に引っ越しました」「転職してデータエンジニア
+    #: になりました」) で旧値が live のまま残った。``mem.personal.location`` に
+    #: 横浜 / 札幌 / 名古屋 が 3 つとも live になり、次セッションの想起で
+    #: 旧値が返った (T28: 「39歳, 横浜市, ソフトウェアエンジニア」)。
+    #:
+    #: 一括で畳まないのは、``pet`` / ``family`` / ``hobby`` のように **1 人が
+    #: 複数値を持つのが正当な** スロットで正しい値を落とすため (既存の
+    #: supersede 制限の理由そのもの)。宣言は「値が 1 つしか成立し得ない」
+    #: スロットだけに限る。
+    #:
+    #: **``name`` / ``birthday`` には付けない。** これらは他者の値が同じ
+    #: スロットへ落ちうる。実測 (2026-08-29): 「猫も1匹飼い始めました。
+    #: 名前はミルクです。」が ``name`` へ解決され、単値化していると
+    #: ペットの名前が **本人の名前を supersede** する。所有者ガード
+    #: (``requires_self_possessor``) は trigger 直前の「<非一人称>の」しか
+    #: 見ないため、文をまたいだ暗黙の所有者は落とせない。重複 live のままなら
+    #: injector の collapse が選ぶだけで、正しい値が消えることはない。
+    #:
+    #: 現在の宣言は ``location`` / ``origin`` / ``occupation`` の 3 つだけ
+    #: (範囲は ``TestSingleValuedSlotDeclaration`` が固定している)。
+    single_valued: bool = False
 
     def match(self, haystack: str) -> tuple[str, ...]:
         """``haystack`` に一致した trigger 語を返す (無ければ空タプル)。"""
@@ -578,7 +612,90 @@ def resolve_fact_attribute_matches(
             out.append((spec.slug, spec.triggers))
             if len(out) >= max(1, limit):
                 break
-    return _drop_name_owned_by_another_entity(out, haystack)
+    return _reassign_name_to_owning_entity(out, haystack)
+
+
+#: ``mem.<kind>.<attr>`` の ``kind`` → ``fact_attributes.yaml`` の fact_type。
+_ATTR_FACT_TYPE_BY_KIND: dict[str, str] = {
+    "personal": "personal_fact",
+    "preference": "preference",
+    "emotion": "emotion",
+    "opinion": "opinion",
+}
+
+
+def is_single_valued_subject(
+    subject: str,
+    *,
+    mode: str = "chat",
+    triggers_dir: str | Path | None = None,
+) -> bool:
+    """``subject`` が **単値スロット** として宣言されているか (純粋関数)。
+
+    ``mem.personal.location`` のように ``mem.<kind>.<attr>`` の形をした subject
+    だけを見る。辞書に無い / 形が違う / 宣言が無い場合は ``False`` — つまり
+    **既定は従来どおり多値扱い**で、宣言したスロット以外の挙動は変わらない。
+    """
+    if not subject:
+        return False
+    parts = subject.split(".")
+    if len(parts) != 3 or parts[0] != "mem":
+        return False
+    fact_type = _ATTR_FACT_TYPE_BY_KIND.get(parts[1])
+    if fact_type is None:
+        return False
+    if triggers_dir is None:
+        triggers_dir = _DEFAULT_TRIGGERS_DIR
+    attrs = get_fact_attributes(resolve_fact_attributes_path(triggers_dir))
+    for spec in (attrs.get(mode) or {}).get(fact_type) or ():
+        if spec.slug == parts[2]:
+            return spec.single_valued
+    return False
+
+
+def states_single_valued_attribute(
+    text: str,
+    *,
+    mode: str = "chat",
+    triggers_dir: str | Path | None = None,
+) -> bool:
+    """**単値スロットの値を言明している**発話か (純粋関数)。
+
+    「先週、仙台から京都に引っ越しました。」「転職してデータアナリストに
+    なりました。」のような **属性の更新** を拾う。問い (「私の好きな飲み物は。」)
+    と純粋な依頼は :func:`states_no_user_value` で落とす。
+
+    **なぜ要るか** — 単値スロットの旧値を畳むのは Step 8 (Full sleep-time) だが、
+    Full は既定でアイドル 10 分 / 繰り延べ上限 30 分。その間、注入は
+
+    - 旧値: SemMem ファクト (Tier 1)
+    - 新値: STM ノートだけ (Tier 2)
+
+    となり、**Tier の序列上どうやっても旧値が勝つ**。実測 (2026-08-29 ライブ監査
+    F38): 「転職してデータサイエンティストになりました」の直後の新セッションで
+    「インフラエンジニアです」と旧値を返し、自己検査も「古い情報は含まれて
+    いません」と保証した。
+
+    そこで更新を観測したターンだけ Full を前倒しする
+    (:meth:`SleepTimeScheduler.request_full_soon`)。誤爆しても代償は
+    「Full が少し早く走る」だけで、**正しい値を消す方向の失敗が無い**。
+
+    訂正 (``restates_a_value``) とは別の経路。あちらは「〜ではなく〜」型の
+    言い直しを拾うが、引っ越し・転職のような **訂正ではない更新** は拾えない。
+    """
+    if not text:
+        return False
+    if states_no_user_value(text):
+        return False
+    for kind, fact_type in _ATTR_FACT_TYPE_BY_KIND.items():
+        for slug, _ in resolve_fact_attribute_matches(
+            text, fact_type, mode=mode, triggers_dir=triggers_dir,
+        ):
+            if is_single_valued_subject(
+                f"mem.{kind}.{slug}", mode=mode, triggers_dir=triggers_dir,
+            ):
+                return True
+    return False
 
 
 #: 「名前」を持ちうる **ユーザー以外のエンティティ** のスロット。
@@ -587,10 +704,10 @@ def resolve_fact_attribute_matches(
 _NAME_OWNING_ENTITY_SLUGS: frozenset[str] = frozenset({"pet", "family"})
 
 
-def _drop_name_owned_by_another_entity(
+def _reassign_name_to_owning_entity(
     matches: list[tuple[str, tuple[str, ...]]], haystack: str,
 ) -> list[tuple[str, tuple[str, ...]]]:
-    """別エンティティの名前が ``name`` スロットへ入るのを防ぐ (純粋関数)。
+    """別エンティティの名前を ``name`` から **その所有者のスロットへ移す** (純粋関数)。
 
     ``AttributeSpec.requires_self_possessor`` は所有格 (「猫**の**名前は」) と
     **同じ文の** 話題マーカーを見る。話題のスコープは句点で切れる設計なので
@@ -613,18 +730,77 @@ def _drop_name_owned_by_another_entity(
     裏付けが無ければ、その名前は本人のものではない。
 
     ``requires_self_possessor`` が既に自己所有を確認できた場合
-    (「猫の名前はソラで、私の名前は小川です」) は落とさない —
+    (「猫の名前はソラで、私の名前は小川です」) は移さない —
     その出現には一人称の所有格が付いている。
 
-    落ちた ``name`` は ``mem.personal.user`` へフォールバックするので、
-    **本人のスロットは汚れない安全な失敗** になる。
+    **落とすだけでは名前が消える。** 根拠文の絞り込み
+    (:func:`~backend.free.memory.extractors.chat._attribute_evidence_text`) は
+    **その属性のトリガ語を含む文** だけを残すので、``name`` を捨てると
+    「名前は…」の文はどのスロットにも属さなくなり、object から消える::
+
+        「柴犬を1匹飼っています。名前はソラです。」
+          → mem.personal.pet の object = 「柴犬を1匹飼っています。」
+
+    実インシデント (2026-08-30 ライブ監査 T02#9): 上の 1 発話のあと、
+    新セッションの「飼っている犬の名前は。」に **「確認できていません。」**
+    を返した。SemMem には ``pet`` ファクトが live で在ったのに、
+    **名前がその object に入っていなかった**。
+
+    そこで捨てずに、``name`` のトリガ語を **所有者スロットのトリガ語へ併合**
+    する。所有者側の根拠文が「名前は…」の文まで伸びるので、値が残る。
+    ``name`` スロット自体は生成されないままなので、本人の名前が別エンティティ
+    の名前で汚れる元の防御はそのまま効く。
+
+    所有者が複数解決した場合 (``pet`` と ``family`` が同時) は、**「名前」の
+    出現位置より前にある最後のトリガ語** を持つスロットへ寄せる。日本語では
+    直前に述べたエンティティの名前を続けるのが自然なため。
     """
     slugs = {slug for slug, _ in matches}
     if "name" not in slugs or not (slugs & _NAME_OWNING_ENTITY_SLUGS):
         return matches
     if _SELF_POSSESSED_NAME_RE.search(haystack):
         return matches
-    return [(slug, words) for slug, words in matches if slug != "name"]
+    name_words = next(
+        (words for slug, words in matches if slug == "name"), (),
+    )
+    owner = _nearest_owning_slug(matches, haystack, name_words)
+    return [
+        (slug, tuple(dict.fromkeys(words + name_words)) if slug == owner else words)
+        for slug, words in matches
+        if slug != "name"
+    ]
+
+
+def _nearest_owning_slug(
+    matches: list[tuple[str, tuple[str, ...]]],
+    haystack: str,
+    name_words: tuple[str, ...],
+) -> str | None:
+    """「名前」の直前に現れた所有者スロットを返す (純粋関数)。
+
+    位置が取れない場合は記載順で最初の所有者スロットへ寄せる。
+    """
+    name_at = min(
+        (haystack.find(w) for w in name_words if haystack.find(w) >= 0),
+        default=-1,
+    )
+    best: str | None = None
+    best_at = -1
+    for slug, words in matches:
+        if slug not in _NAME_OWNING_ENTITY_SLUGS:
+            continue
+        at = max((haystack.find(w) for w in words), default=-1)
+        if at < 0:
+            continue
+        if name_at >= 0 and at > name_at:
+            continue
+        if at > best_at:
+            best, best_at = slug, at
+    if best is not None:
+        return best
+    return next(
+        (slug for slug, _ in matches if slug in _NAME_OWNING_ENTITY_SLUGS), None,
+    )
 
 
 #: 一人称の所有格が直接付いた「名前」。これがあれば本人の名前と読む。

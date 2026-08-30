@@ -25,6 +25,7 @@ import hashlib
 import re
 from collections.abc import Iterable
 
+from backend.free.core.intent_vocab import is_plain_statement
 from backend.free.core.text_quality import (
     _asserts_before_request,
     _REQUEST_ENDING_RE,
@@ -134,10 +135,22 @@ _LOCAL_PATH_HINT_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"']+")
 #: まで拾うと「イカ。」「〜とか。」のような名詞・引用の文末を巻き込む。
 #: 活用形を列挙するのではなく助動詞そのものを列挙するのは、語尾のバリエーションで
 #: 取りこぼす失敗を繰り返さないため。
+#: **体言止めの問い** (「私の好きな飲み物は。」) も値を持たない。助動詞も疑問符も
+#: 伴わないため上の 2 つの規則をすり抜けていた。実インシデント
+#: (2026-08-29 ライブ監査): F11 修正後の Full で新規抽出された 9 件のうち 4 件が
+#: 想起の問いで、``mem.preference.media = 私が好きな音楽のジャンルは。``
+#: ``mem.personal.beverage = 私の好きな飲み物は。`` が **その属性の現在値** として
+#: 保存された。次の想起でこの質問文が「過去の記録」として注入されるため、
+#: **想起するたびに記憶が汚染される**。
+#:
+#: 主題の ``は`` が文の最後に来る形は日本語の平叙文には無い — 値の言明は必ず
+#: ``は`` の後ろに語が続く (「私の猫の名前は**ミケです**。」)。よって末尾の ``は``
+#: だけで問いと言明を分離できる (router の ``_PERSONAL_RECALL_RE`` と同じ判別)。
 _QUESTION_ENDING_RE = re.compile(
     r"(?:[?？]"
     r"|(?:ます|です|ました|でした|ません|ませんでした|でしょう|ましょう"
-    r"|だろう|であろう)か)"
+    r"|だろう|であろう)か"
+    r"|(?<=.)は)"
     r"[。．.、,！!\s\"'」』）)]*\s*$",
 )
 
@@ -235,6 +248,85 @@ def _states_attribute_value(sentence: str, attr_words: tuple[str, ...]) -> bool:
     for word in attr_words:
         stripped = stripped.replace(word, " ")
     return bool(_CONTENT_RUN_RE.search(stripped))
+
+
+#: **常体 (だ・である体) の言明** の文末。用言で終わる形を採る。
+#:
+#: ``is_plain_statement`` の ``_STATEMENT_TAIL_RE`` は敬体 (です / ます) を
+#: 前提にしているため、「このやり方が良いと思う」「リモートの方が集中できる」
+#: のような常体の自己申告を落としてしまう。
+#:
+#: 過剰に通るのは **安全側** — このゲートは既存の否定形ガード
+#: (``_tag_evidence_is_question_only`` / ``_assertive_evidence``) に AND で
+#: 重ねる追加条件なので、通しすぎても新しい漏れは作らない。逆に落としすぎると
+#: 正当な言明が記憶されなくなる。
+#:
+#: 想起の問いは主題の ``は`` か体言で終わる (「私の職業は。」「ペットをもう
+#: 一度。」) ので、用言の語尾では拾われない。
+_PLAIN_FORM_TAIL_RE = re.compile(
+    r"(?:う|る|た|い|だ|ぬ|く|す|む|ぶ|つ|ぐ|ず|ん)[。．.!！\s]*$",
+)
+
+
+def _states_a_value(content: str, attr_words: tuple[str, ...] = ()) -> bool:
+    """発話が **値を言明している** か (純粋関数)。
+
+    ユーザー由来のファクト (personal_fact / preference / emotion / opinion) を
+    作ってよいかの **肯定側のゲート**。既存の判定はすべて「疑問形か / 依頼形か」
+    を語彙で列挙する否定形で、外れた形は素通りする。
+
+    ``is_plain_statement`` を **文単位** で見て 1 文でも平叙なら通す。
+    発話全体に掛けると「言明 + 依頼」の複合文
+    (「私はコーヒーが好きですが、紅茶のおすすめも教えてください。」) が
+    依頼マーカーで落ちてしまい、2026-07 以来の
+    ``test_request_guard_does_not_swallow_real_preferences`` が退行する。
+    1 文に収まった複合形は ``_asserts_before_request`` が拾う (同じ判定を
+    ``_carries_no_value`` も使っている)。
+
+    ``attr_words`` を渡すと **体言止めの言明** も通す。``is_plain_statement``
+    は平叙の文末 (``です`` / ``ます`` 等) を要求するため、「私は東京在住」の
+    ような名詞で終わる自己申告を落としてしまう
+    (``test_memory_note_trace_id_propagates_to_semantic_fact``)。属性語を
+    取り除いてなお内容語が残るなら値を述べている
+    (:func:`_states_attribute_value`) ので、そちらでも通す。
+    """
+    if not content:
+        return False
+    if _asserts_before_request(content):
+        return True
+    for raw in _SENTENCE_SPLIT_RE.split(content):
+        sentence = raw.strip()
+        if not sentence:
+            continue
+        if is_plain_statement(sentence) or _PLAIN_FORM_TAIL_RE.search(sentence):
+            return True
+    return bool(attr_words) and _states_attribute_value(content, attr_words)
+
+
+def _assertive_evidence(evidence: str) -> str:
+    """証拠テキストから **言明の文だけ** を残す (純粋関数)。
+
+    ``strip_interrogative_sentences`` は問いだけを落としていたので、依頼の文
+    (「〜してください。」) が object に残っていた。属性が解決できない発話は
+    フォールバック subject (``mem.personal.user``) へ落ちる設計なので、
+    **依頼だけの発話ほどそのスロットに溜まる**。
+
+    実インシデント (2026-08-28 ライブ監査、実ストアで確認):
+    ``mem.personal.user states: 私の好みを踏まえて、通勤についてアドバイスを
+    ください。`` が live で残り、以後 ``[関連する記憶]`` に依頼文が並んだ。
+    2026-08-19 の監査でも「依頼形の発話がファクト化して競合の当事者になる」と
+    記録されている。
+
+    判定は ``_carries_no_value`` (= ``_tag_evidence_is_question_only`` の内側)
+    と同じ規則。依頼節より前に本人の言明がある複合文
+    (「私は〜なので、〜してください。」) は残る。
+    """
+    kept = [
+        sentence
+        for raw in _SENTENCE_SPLIT_RE.split(evidence or "")
+        if (sentence := raw.strip()) and not _carries_no_value(sentence)
+    ]
+    return "".join(kept)
 
 
 def _carries_no_value(sentence: str) -> bool:
@@ -938,6 +1030,32 @@ class ChatExtractor(BaseExtractor):
                     trigger_words = self._builder.fact_triggers.get(tag, ())
                     if _tag_evidence_is_question_only(content, trigger_words):
                         continue
+                    # **否定形のガードだけでは想起の問いがファクトになる。**
+                    # 上の判定も ``_assertive_evidence`` も「疑問形か / 依頼形か」
+                    # を語彙で列挙する閉じた規則で、体言止めの想起は素通りする。
+                    # そして属性スロットの多くは ``single_valued`` なので、
+                    # **問いから作られたゴミが正しい値を supersede して消す**。
+                    #
+                    # 実インシデント (2026-08-30 ライブ監査の検証、実ストア)::
+                    #
+                    #   LIVE  mem.personal.pet         | ペットをもう一度。
+                    #   SUPER mem.personal.pet         | 柴犬を1匹飼っています。
+                    #   LIVE  mem.personal.occupation  | 職業
+                    #   SUPER mem.personal.occupation  | …SREになりました。
+                    #   LIVE  mem.personal.origin      | 私の出身地と居住地をもう一度。
+                    #
+                    # 「私の名前、住所、職業、ペットをもう一度。」という **問い
+                    # そのもの** が、その問いの答えを永久に破壊していた。実機の
+                    # 回答は「あなたの職業は会社員です」「ペットは、猫です」。
+                    #
+                    # そこで注入側 (``MemoryInjector._restated_slots``) と同じく
+                    # **肯定の証拠を要求する**。代償は非対称 — 取りこぼしても
+                    # ファクトが 1 件増えないだけだが、誤って作ると正しい値が消える。
+                    # 実データ (experience 313 件中、候補になった 102 件) で
+                    # 言明 18 / 問い・依頼 84 を完全分離した。
+                    if not _states_a_value(content, trigger_words):
+                        result.notes_skipped += 1
+                        continue
                     # subject を属性単位に分割する (mem.personal.machine_spec 等)。
                     # 一律 "user" だと、競合検出が (subject, predicate) キーで
                     # 類似度を見ずにグルーピングするため、無関係な事実
@@ -1011,6 +1129,16 @@ class ChatExtractor(BaseExtractor):
                         (),
                     )]
                 for subject, evidence, attr_words in attr_specs:
+                    # 依頼の文は記憶として意味を持たない。問いを落とすのと
+                    # 同じ理由で落とし、**1 文も残らなければファクトにしない**
+                    # (2026-08-28 ライブ監査: 「私の好みを踏まえて、通勤について
+                    # アドバイスをください。」が mem.personal.user の live な
+                    # ファクトになり、以後 [関連する記憶] に依頼文が並んだ。
+                    # 属性が解決できない発話はフォールバック subject へ落ちる
+                    # ので、**依頼だけの発話ほどこのスロットに溜まる**)。
+                    object_text = _assertive_evidence(evidence)
+                    if not object_text:
+                        continue
                     fact = self.make_fact(
                         subject=subject,
                         predicate=_PREDICATE_BY_TAG.get(tag, "states"),
@@ -1019,7 +1147,7 @@ class ChatExtractor(BaseExtractor):
                         # 並ぶ原因になる (2026-08-16 監査時点の実データ:
                         #  mem.emotion.user feels: 夜更かしすると次の日つらい
                         #  ですよね。何かいい対策ありますか？)。
-                        object_text=strip_interrogative_sentences(evidence),
+                        object_text=object_text,
                         # 規則で切り出せる分だけ命題化する。object (原文) は
                         # 証拠として残し、提示・比較・埋め込みは fact.text 経由で
                         # statement を優先する。切り出せなければ None のままで

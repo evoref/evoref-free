@@ -750,9 +750,65 @@ class SleepTimeWorker:
             logger.info("Updated scores for %d notes", updated)
         return updated
 
+    def _extract_before_overflow(self) -> int:
+        """未抽出ノートを **捨てる前に** Step 8 を前倒しする (背圧)。
+
+        なぜ要るか: SemMem の唯一の入力は STM のノートで、抽出 (Step 8) は
+        idle Full にしか載っていない (``memory.facts.trigger =
+        idle_full_only``)。会話が続く限り Full は来ないので STM は伸び続け、
+        ``UNEXTRACTED_PROTECTION_CEILING`` に当たった時点で保護が **丸ごと**
+        外れ、下位 20% が古い順に降格される。落ちるのは「まだ抽出器が見て
+        いない最も古いノート」— つまり **SemMem の入力そのもの**。
+
+        実インシデント (2026-08-28 ライブ監査、20 テーマ 200 ターン):
+
+        - Full は会話中ずっと保留された (``deferred=57.3 min``)
+        - STM が 200 件に達するたび 40 件が降格され、これが 6 回起きた
+          (08:41 / 08:46 / 08:51 / 08:59 / 09:05 / 09:12、計 237 件)
+        - 降格された中にテーマ 1 の「私の名前は佐倉レンです。」があり、
+          ``mem.personal.name`` のファクトは **最後まで 1 件も作られなかった**
+          (居住地 / 職業 / 猫 / 飲み物 / 誕生日 / 会員番号 は全て作られている)
+        - 結果「あなたの名前は確認できていません」と「佐倉レンさんですね」が
+          問いの言い回し次第で入れ替わる (LTM / 履歴検索へのフォールバックは
+          語順に依存するため)
+
+        天井の意味を「抽出を諦める」から「抽出が遅れている — 今すぐ走らせる」
+        へ反転させる。Step 8 は LLM 非依存の同期処理で、実測 590 秒の Full の
+        中でも計上されない (< 0.5 秒) ため、この前倒しはほぼ無償。抽出済みの
+        ノートは ``extracted_fact_ids`` で弾かれるので二重抽出も起きない。
+
+        書き込みは sleep-time の内側 (SleepTimeWorker) に閉じたままなので、
+        「SemMem はチャット応答パスから読むだけ」の不変則は保たれる。
+
+        Returns:
+            前倒しで抽出したファクト数 (前倒し不要なら ``0``)。
+        """
+        mem_cfg = (self.config.get("memory") or {})
+        if not ((mem_cfg.get("facts") or {}).get("enable_extraction", True)):
+            return 0
+        max_notes = int(mem_cfg.get("short_term_max_notes", 100))
+        ceiling = max_notes * MemoryEviction.UNEXTRACTED_PROTECTION_CEILING
+        if len(self.short_term.notes) < ceiling:
+            return 0
+        cutoff = self._last_extraction_at
+        if not any(
+            float(getattr(n, "created_at", 0.0) or 0.0) > cutoff
+            for n in self.short_term.notes.values()
+        ):
+            return 0
+        extracted = self._step8_extract_facts()
+        logger.info(
+            "Step 4: extraction pulled forward before eviction "
+            "(%d notes at ceiling %d, %d facts extracted)",
+            len(self.short_term.notes), int(ceiling), extracted,
+        )
+        return extracted
+
     def _step4_eviction(self) -> int:
         """Step 4: FadeMem eviction 判定"""
         logger.info("Step 4: running eviction check on %d notes", len(self.short_term.notes))
+        # 捨てる前に抽出する (:meth:`_extract_before_overflow`)。
+        self._extract_before_overflow()
         eviction = MemoryEviction(policy=getattr(self, "_policy", None))
         exp_dict = None
         if self.experience_buf is not None:

@@ -259,6 +259,38 @@ _PERSONAL_ATTRIBUTION_RE = re.compile(
 
 
 
+#: **問いの側** に現れるユーザー自身への言及。
+#:
+#: ``_PERSONAL_ATTRIBUTE_ASSERTION_RE`` は応答を見るが、揮発性を決めるのは
+#: **問い** の方である。「あなたの / さん」を含まない短い答え方をされると
+#: 応答側のゲートはまるごと素通りし、その手本は
+#: **「この質問にはこう答える」** をモデルへ教え続ける。
+#:
+#: 実インシデント (2026-08-30 ライブ監査): 監査中の誤答がそのまま手本になり、
+#: 検証セッションのプロンプトに以下が並んだ::
+#:
+#:     ### Example 1
+#:     User: 私が決めたことは何でしたか。
+#:     Assistant: 来月から毎朝6時に起きることです。
+#:     ### Example 2
+#:     User: 私が苦手だと言ったことは。
+#:     Assistant: 毎朝6時に起きることです。      ← 誤答が手本に昇格
+#:     ### Example 3
+#:     User: 私について知っていることを全部教えてください。
+#:     Assistant: …情報をお聞かせいただいていないため…  ← 「知らない」の手本
+#:
+#: 実機では実際に「私が苦手だと言ったことは。」へ「毎朝6時に起きることです。」を
+#: 返しており、**手本が誤答を再生産する自己増幅**になっていた。
+#:
+#: 判定は「ユーザー自身への言及があるか」だけを見る広いゲート。棄却の方向は
+#: 安全側 (手本が 1 件減るだけ) で、採用の方向は嘘の手本を数週間常駐させる。
+#: 実データでの較正 (experience 313 件): 現行ゲート 22 件 + 本ゲート 62 件を
+#: 棄却し、**229 件が残る**。
+_USER_SELF_REFERENCE_RE = re.compile(
+    r"(?:私|わたし|僕|ぼく|俺|おれ|自分|うち)\s*(?:の|は|が|に|も|自身)",
+)
+
+
 def _find_volatile_reason(query: str, response: str) -> str | None:
     """例が「その時点でしか成立しない」ものかを判定する (純粋関数)。
 
@@ -287,6 +319,8 @@ def _find_volatile_reason(query: str, response: str) -> str | None:
         and _PERSONAL_ATTRIBUTION_RE.search(response)
     ):
         return "user-dependent answer (asserts the user's personal attributes)"
+    if _USER_SELF_REFERENCE_RE.search(query):
+        return "user-dependent answer (the question is about the user themselves)"
     return None
 
 

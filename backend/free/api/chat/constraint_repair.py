@@ -29,10 +29,12 @@ from backend.free.core.text_quality import (
     has_verifiable_output_constraint,
     length_disclosure_note,
     match_length_directive,
+    violates_banned_content,
     violates_enumeration_count,
     violates_line_count,
     violates_length_constraint,
     violates_output_form,
+    violates_word_count,
 )
 from backend.log_config import get_logger
 
@@ -54,15 +56,30 @@ def violation_reason(query: str, response: str) -> str | None:
     """発話の出力制約に対する違反理由 (英語、ログ用)。守れていれば ``None``。
 
     長さと形式の両方を見る。純粋関数。
+
+    **1 つ目で打ち切らない**: 1 ターンに検証できる制約が複数あるとき、先に
+    立った理由だけを返すと残りは検証も開示もされない。実インシデント
+    (2026-08-28 ライブ監査 T07-5):「箇条書きでちょうど7項目、各項目20文字
+    以内で書いてください。」に 5 項目で答えたのに、開示されたのは長さの側
+    (しかも per-item 指定を全文長で測った偽の違反) だけで、本当の違反である
+    項目数の不足は最後まで出なかった。
     """
-    return (
-        violates_length_constraint(query, response)
-        or violates_output_form(query, response)
-        or violates_enumeration_count(query, response)
-        # 行数の指定 (「3行で紹介して」) は #502 の列挙個数の検証に無く、
-        # 1 行で答えても検証も開示もされなかった (2026-08-27 ライブ監査 T09-5)。
-        or violates_line_count(query, response)
-    )
+    reasons = [
+        r for r in (
+            violates_length_constraint(query, response),
+            violates_output_form(query, response),
+            violates_enumeration_count(query, response),
+            # 行数の指定 (「3行で紹介して」) は #502 の列挙個数の検証に無く、
+            # 1 行で答えても検証も開示もされなかった (2026-08-27 ライブ監査 T09-5)。
+            violates_line_count(query, response),
+            # 禁止語・禁止文字種も数えれば分かる制約 (2026-08-28 ライブ監査 T18-3)。
+            violates_banned_content(query, response),
+            # 英語の語数上限も同様 (2026-08-29 ライブ監査 T28#3: 40 words 指定に
+            # 42 words。日本語の文字数だけを見ていたため開示すらされなかった)。
+            violates_word_count(query, response),
+        ) if r
+    ]
+    return "; ".join(reasons) if reasons else None
 
 
 def needs_verification(query: str) -> bool:
