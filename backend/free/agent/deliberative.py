@@ -19,6 +19,7 @@ from backend.free.agent.meta_cognitive_utils import (
 )
 from backend.free.agent.tool_call_judge import ToolCallJudge, ToolJudgement
 from backend.free.agent.tool_judge_guards import _STATE_CHANGING_TOOL_NAMES
+from backend.free.agent.tool_judge_history import asks_about_past_conversation
 from backend.free.agent.tools.builtin import (
     SEARCH_HISTORY_NO_RESULTS_PREFIX,
     _check_path_traversal as check_builtin_path_traversal,
@@ -39,6 +40,7 @@ from backend.free.core.intent_vocab import (
     resolve_session_position_message,
     session_position_kind,
     tool_inventory_question,
+    unused_tool_question,
     unverified_claim_numbers,
 )
 from backend.free.core.turn_text import append_to_last_user
@@ -101,6 +103,22 @@ _UNMEASURED_FACT_GUIDANCE = (
     "正直に伝え、ユーザーが自分で確認する方法を 1 つ示すこと。"
     "実行していないツールについて、実行した / 実行を試みたと述べない。"
     "推測値を断定形で述べない。"
+)
+
+#: 過去の会話について訊かれたが、履歴検索を 1 度も実行しなかった場合の文言。
+#:
+#: 「実行していないツールについて実行したと述べない」は
+#: :data:`_UNMEASURED_FACT_GUIDANCE` にもあるが、あちらは実行環境の実測が
+#: 対象で、履歴参照のターンには注記そのものが付かない。過去会話の **日時** は
+#: 検索結果にしか無いため、撃たなかったターンでは必ず捏造になる。
+_HISTORY_NOT_SEARCHED_GUIDANCE = (
+    "\n\n確定事実: このターンでは過去の会話を検索するツールを 1 つも実行して"
+    "いない。したがって「検索しました」「記録を確認しました」のように"
+    "**調べた体で述べてはならない**。"
+    "過去の会話が行われた日付・時刻は検索結果にしか無いので、"
+    "**具体的な日付を述べてはならない** (推測した日付は必ず誤りになる)。"
+    "いま会話に残っている範囲から答えられることは、その旨を明示して答えてよい。"
+    "残っていないなら「確認できていない」と正直に伝えること。"
 )
 
 #: 状態を変える依頼だったが、実行できるツールが 1 つも無かった場合の文言。
@@ -987,12 +1005,23 @@ class DeliberativeAgent:
         summary = self._tools_registry.get_capability_summary(mode)
         if not summary:
             return False
+        # 「使っていないツールは？」は目録そのものではなく、目録と実行台帳の差を
+        # 答える問い。「一覧をそのまま答えること」と書くと差集合を作らない。
+        if unused_tool_question(query):
+            instruction = (
+                "この一覧と、上の実行記録に無いものの差を取って答えること。"
+                "ここに無いツール名を挙げてはならない。"
+            )
+        else:
+            instruction = (
+                "この一覧をそのまま答えること。ここに無いものを挙げず、"
+                "「ツールは無い」とも述べないこと。"
+            )
         append_to_last_user(
             messages,
             f"\n\n確定事実: このモード ({mode}) で実際に実行できるツールは"
             f"以下がすべてである。これは実装の登録内容から機械的に取得した値なので、"
-            f"この一覧をそのまま答えること。ここに無いものを挙げず、"
-            f"「ツールは無い」とも述べないこと。\n{summary}",
+            f"{instruction}\n{summary}",
             separator="",
         )
         logger.info("Tool inventory fact pinned (mode=%s)", mode)
@@ -1121,6 +1150,20 @@ class DeliberativeAgent:
                 "この記録に基づいて答えること。ここに無い実行を述べず、"
                 "記録にある実行を「していない」とも述べないこと。"
                 "一覧に無いターンではツールを実行していない。\n" + ledger
+                # 「不在」からの推論を **明示的な結論として** 渡す。一覧を出す
+                # だけでは、記録が無い = 実行していない = 暗算、という向きを
+                # 取り違える。実インシデント (2026-08-29 ライブ監査 T27#7):
+                # 「ツールを使わず暗算したものはありますか」に対し、実測では
+                # 4 ターンが no_tool だったのに「いいえ、ありません。すべて
+                # ツールを使用して算出しています」と回答し、さらに
+                # 「ツール実行履歴に該当する計算依頼が含まれていないため、
+                # ツールを使用していない計算は存在しません」と **論理を反転**
+                # させた (履歴に無いことは、まさに暗算だった証拠である)。
+                + "\nしたがって、この一覧に載っていない依頼は"
+                "**ツールを使わずに答えた (暗算・記憶で答えた)** ものである。"
+                "記録に無いことを「ツールを使った」の根拠にしてはならない。"
+                "一覧に無い依頼が 1 件でもあるなら"
+                "「すべてツールで計算した」は偽になる。"
             )
         else:
             body = (
@@ -1135,6 +1178,45 @@ class DeliberativeAgent:
     def _append_unmeasured_fact_note(messages: list[dict]) -> None:
         """最後の user メッセージへ「実測できなかった」注記を追記する。"""
         append_to_last_user(messages, _UNMEASURED_FACT_GUIDANCE, separator="")
+
+    @staticmethod
+    def _append_history_not_searched_note(
+        messages: list[dict], query: str,
+    ) -> bool:
+        """過去会話を尋ねられたのに履歴検索を撃たなかったターンへ注記する。
+
+        ``_UNMEASURED_FACT_GUIDANCE`` の履歴版。あちらは「この環境を測る」
+        ツールの不在を扱うが、過去の会話の有無・日時は **履歴検索を実行しない
+        限り根拠が無い** という別の欠落。
+
+        実インシデント (2026-08-29 ライブ監査 T17):
+        ``tool_call_decision`` が ``no_tool`` だったターンで、あたかも検索した
+        かのように断定した。
+
+        - 「私が出張の話をしたのはいつですか。」→
+          「**2026年6月17日**に行われた会話の中で言及されました」
+          (実際は同日 2026-08-29、40 分前の会話。日付は完全な捏造)
+        - 「過去に、私が猫について話したことはありますか。」→
+          「はい、**記録があります**」(検索していない)
+        - 「『私の車の話』を探してみてください。」→
+          「過去の会話記録を**確認しましたが**見つかりませんでした」
+
+        逆に search_history が実際に走ったターン (#1/#2) は空振りし、
+        撃たなかったターンが答えるという **逆転** が起きていた。
+
+        窓に残っている内容から答えること自体は禁じない (T17#3 の「トラ」は
+        WM/STM 由来で正しい)。禁じるのは **検索した体で語ること** と
+        **日時の捏造** だけ。
+
+        Returns:
+            注記したか。
+        """
+        if not asks_about_past_conversation(query or ""):
+            return False
+        append_to_last_user(
+            messages, _HISTORY_NOT_SEARCHED_GUIDANCE, separator="",
+        )
+        return True
 
     @staticmethod
     def _append_write_target_unknown_note(
@@ -1299,6 +1381,13 @@ class DeliberativeAgent:
                 tool_judge_task.cancel()
             return None, None, None, None, None
 
+        # 「一度も使っていないツールは？」は目録と実行台帳の **差集合** なので、
+        # 目録だけ渡すと差を base が作話する (2026-08-28 ライブ監査 T06-19:
+        # 未登録の delete_file / move_file を挙げた)。目録の短絡より前に台帳を
+        # 足しておく。
+        if unused_tool_question(query):
+            self._append_tool_ledger_fact(messages, query, session_id)
+
         # 「どんなツールが使えるか」も決定論で答えが出る事実 (ToolsRegistry が
         # SSOT)。ツールを撃つ意味は無いので、位置事実と同様に注記だけ足して
         # 判定経路を短絡させる。
@@ -1378,6 +1467,10 @@ class DeliberativeAgent:
             # いるので「保存先を教えて」ではなく「まだ実行していない」を伝える
             # (_append_pending_write_note の docstring 参照)。
             self._append_pending_write_note(messages, query, conversation)
+            # 過去会話を訊かれたのに検索を撃てなかったターン。丸投げすると
+            # 「確認しましたが」と調べた体で語り、日付まで捏造する
+            # (_HISTORY_NOT_SEARCHED_GUIDANCE 参照)。
+            self._append_history_not_searched_note(messages, query)
             if judgement.action_blocked:
                 # 状態を変えようとして撃てなかった。丸投げすると「追記しました」
                 # と完了を捏造する (_UNPERFORMED_ACTION_GUIDANCE 参照)。

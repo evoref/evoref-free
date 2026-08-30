@@ -655,8 +655,15 @@ _SELF_OUTPUT_REFERENCE_RE = re.compile(
 #: 緩い方では ``その`` / ``この`` を採らない — 「この本は何文字ありますか？」の
 #: ような外部対象を巻き込むため。時間的な照応語だけが「直前の自分の出力」を
 #: 一意に指す。
+#: ``それは`` / ``それって`` の裸の照応も採る。名詞を伴わないので「この本は」の
+#: ような外部対象を指しようがなく、直前の自分の出力を一意に指す。
+#: 実インシデント (2026-08-29 ライブ監査 T28#2): 直前ターンの開示注記が
+#: 「上の回答は **57 文字** です」と正しく出た直後に「**それは**何文字ですか。」で
+#: 照応が拾えず、実測 57 文字に対し **「43文字です」** と断定した
+#: (43 は約 1 時間半前・別テーマの応答長)。
 _SELF_OUTPUT_REFERENCE_LOOSE_RE = re.compile(
     r"(?:今|いま|先(?:ほど|程)|さっき|直前|上記|一つ前|ひとつ前)"
+    r"|それ(?:は|って|の)"
     r"|(?:your\s+)?(?:previous|last|above)(?![A-Za-z])",
     re.IGNORECASE,
 )
@@ -929,6 +936,10 @@ def own_process_question(query: str) -> bool:
     q = query or ""
     if not q:
         return False
+    # 「使っていないツールは？」は目録との差集合を訊く問いで、答えるには実行の
+    # 台帳も要る (:data:`_TOOL_UNUSED_RE`)。否定形なので過去形の判定には載らない。
+    if unused_tool_question(q):
+        return True
     # 「過去の実行を訊いている」構造。名詞化辞の列挙 (旧実装) ではなく動作語の
     # 過去形で受ける (:data:`_OWN_PROCESS_ACTION_PAST_RE` のコメントを参照)。
     if not (
@@ -1318,6 +1329,32 @@ _TOOL_INVENTORY_EXCLUDE_RE = re.compile(
     r"|[A-Za-z]:[\/]",
 )
 
+#: 「一度も使っていないツールはありますか」型 — **目録と台帳の差集合** を訊く問い。
+#:
+#: 目録 (:func:`tool_inventory_question`) にも過去の実行 (
+#: :func:`own_process_question`) にも当たらず、決定論の事実が 1 つも注入され
+#: ないまま base が答えていた。実インシデント (2026-08-28 ライブ監査 T06-19):
+#: 「このセッションで一度も使っていないツールはありますか。」に
+#: 「``delete_file`` や ``move_file`` など」と **未登録のツール名を捏造**
+#: した (同じ会話の T06-15 では実行済みツールを正しく列挙できていた)。
+#:
+#: 差集合には両方が要るので、この形は目録と台帳の **どちらの述語も真** にする。
+_TOOL_UNUSED_RE = re.compile(
+    r"(?:使(?:って|え|わ|用して|用でき)|呼(?:んで|ば|び出して)|実行(?:して|し|でき))"
+    r"\s*(?:い)?な(?:い|かった)[^。]{0,12}?(?:ツール|機能|tool)"
+    r"|(?:ツール|機能|tool)[^。]{0,20}?"
+    r"(?:使(?:って|え|わ|用して)|呼(?:んで|ば|び出して)|実行(?:して|し|でき))"
+    r"\s*(?:い)?な(?:い|かった)"
+    r"|未使用の?\s*(?:ツール|機能|tool)"
+    r"|\btools?\b[^.]{0,20}?\b(?:not|never|haven'?t|hasn'?t)\b[^.]{0,12}?\bused\b",
+    re.IGNORECASE,
+)
+
+
+def unused_tool_question(query: str) -> bool:
+    """「使っていないツールはどれか」を訊いているか (純粋関数)。"""
+    return bool(query) and bool(_TOOL_UNUSED_RE.search(query))
+
 
 #: evoref 自身の実行構成を尋ねるクエリ (`evoref_runtime_info` の発火条件)。
 #:
@@ -1485,6 +1522,10 @@ def tool_inventory_question(query: str) -> bool:
     """
     if not query:
         return False
+    # 「使っていないツールは？」は目録と台帳の差集合なので、両方を真にする
+    # (:data:`_TOOL_UNUSED_RE`)。過去形の判定より先に置く。
+    if unused_tool_question(query):
+        return True
     if own_process_question(query):
         return False
     if _TOOL_INVENTORY_EXCLUDE_RE.search(query):

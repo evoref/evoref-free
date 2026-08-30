@@ -349,6 +349,38 @@ _RECORD_DIVERGENCE_RE_EN = re.compile(
 )
 
 
+#: 対比による言い直し (「X ではなく Y **でした**」)。**記憶層だけ**が使う。
+#:
+#: ``CORRECTION_PATTERNS`` は裸の ``〜ではなく`` を意図的に外している —
+#: 話題導入・比較の一般語法 (「これはバグではなく仕様です」「Python ではなく
+#: Go で書いてください」「A ではなく B を使うべきだと思います」) と識別できず、
+#: 見送った実績がある (同リストの冒頭コメント)。その判断は正しい。
+#:
+#: ただし **過去形の断定で文が終わる** 形は別で、「記録されている値は実は Y
+#: だった」以外の読み方が無い。実測 (2026-08-29 ライブ監査の追調査):
+#:
+#: ```
+#: False  すみません、好きな飲み物はコーヒーではなく紅茶でした。
+#: False  猫の名前はミケではなくトラでした。
+#: True   違います、ほうじ茶です。
+#: True   訂正です。猫の名前はトラです。
+#: ```
+#:
+#: **最も典型的な訂正形が最も弱い**状態だった。``from_correction`` が立たない
+#: ため、属性の継承も即 supersede も走らない。
+#:
+#: ``CORRECTION_PATTERNS`` へは足さない。あちらは学習の欠陥シグナル
+#: (``FeedbackCollector._detect_correction``) と共有で、この形は
+#: ``classify_correction_target`` が ``assistant`` を返すことがあり、
+#: **ユーザー自身の言い直しをアシスタントの失敗として数えてしまう**。
+#: 記憶層と学習層で必要な範囲が違うという既存の設計 (:func:`restates_a_value`
+#: の説明) に従い、記憶側だけを広げる。
+_CONTRASTIVE_RESTATEMENT_RE = re.compile(
+    r"(?:ではなく|じゃなく|では無く)[^。！？!?\n]{1,24}(?:でした|だった)"
+    r"[。．.！!\s]*$",
+)
+
+
 def _correction_attribution(query: str) -> str | None:
     """字句一致した訂正候補の **帰属** を返す。訂正でなければ ``None``。
 
@@ -396,8 +428,18 @@ def restates_a_value(query: str) -> bool:
        できない。実測 2026-08-19: 訂正済みの「緑茶」が sim 0.762 で最上位、
        訂正後の「ほうじ茶」が 0.487 で下位に並んでいた)
     2. ``SemanticConflictResolver._decide`` が確認を挟まず即 supersede する
+
+    ``CORRECTION_PATTERNS`` に加えて、**記憶層だけ** が
+    :data:`_CONTRASTIVE_RESTATEMENT_RE` (「X ではなく Y でした」) を拾う。
+    最も典型的な訂正形なのに、裸の ``ではなく`` が一般語法と混ざるため
+    共有リストからは外されていた (同定数の説明を参照)。
     """
-    return _correction_attribution(query) in ("assistant", "self")
+    if _correction_attribution(query) in ("assistant", "self"):
+        return True
+    if not query or not _CONTRASTIVE_RESTATEMENT_RE.search(query):
+        return False
+    # 帰属の判定 (質問 / 比較 / 書式変更依頼を落とす) は共有経路と同じものを通す。
+    return classify_correction_target(query) in ("assistant", "self")
 
 
 def cites_record_divergence(query: str) -> bool:

@@ -25,6 +25,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from backend.free.memory.notes.note_builder import is_single_valued_subject
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -100,16 +101,50 @@ def _supersede_corrected_slots(
     **畳む前に検索へ乗るのは全世代**で、埋め込み検索の上位に旧値が来れば
     その時点で負ける。ストア側で世代を閉じるのが本筋。
 
-    畳む条件は ``from_correction`` が立っていることに限る。訂正でない再言明
-    (同じ値を言い直しただけ) まで supersede すると、``pet`` のように 1 人が
-    複数値を持ちうるスロットで正当な値を落とす。
+    畳む条件は ``from_correction`` が立っているか、**スロットが単値と宣言されて
+    いる** こと。訂正でない再言明まで無条件に supersede すると、``pet`` のように
+    1 人が複数値を持ちうるスロットで正当な値を落とすため、一括では畳まない。
+
+    単値スロット (``fact_attributes.yaml`` の ``single_valued: true``) を条件に
+    加えたのは、**訂正ではない更新** が旧値を live のまま残していたから。
+    実データ (2026-08-29 ライブ監査、``semantic/global/facts.jsonl``):
+
+    - 「先月、横浜から札幌に引っ越しました」→ ``from_correction`` が立たず、
+      ``mem.personal.location`` に 横浜 / 札幌 / 名古屋 が **3 つとも live**
+    - その結果、次セッションの想起が旧値を返した
+      (T28: 「39歳, **横浜市**, **ソフトウェアエンジニア**」/ T29: 更新前の出張日程)
+    - 自己検査も「古い情報は含まれていません」と旧値を最新だと保証した
+
+    ``single_valued`` を宣言していないスロットの挙動は一切変わらない
+    (既定 ``False``)。
 
     Returns:
         supersede した旧ファクト数。
     """
     superseded = 0
+    #: 同一バッチで同じスロットへ複数の値が書かれたとき、**勝者を 1 つに決めて
+    #: から** 畳む。素朴に「新規ファクトごとに他の live を supersede する」と、
+    #: 同じ subject の 2 件が **互いを supersede** して live が 0 件になる。
+    #:
+    #: 実データ (2026-08-29 クリーンストア検証): 「今は千葉に住んでいます」と
+    #: 「先週、千葉から神戸に引っ越しました」が同じ Full で抽出され、
+    #: ``mem.personal.location`` の **2 件とも SUPERSEDED** になった
+    #: (``occupation`` も同様)。想起は「確認できていません」に落ちる。
+    #: 勝者は ``persisted`` の **最後** に来たもの (抽出順 = 発話順)。
+    winners: dict[tuple[str, str], object] = {}
     for fact in persisted:
-        if not getattr(fact, "from_correction", False):
+        if not is_single_valued_subject(getattr(fact, "subject", "") or ""):
+            continue
+        winners[(fact.subject, fact.predicate)] = fact
+    for fact in persisted:
+        if not (
+            getattr(fact, "from_correction", False)
+            or is_single_valued_subject(getattr(fact, "subject", "") or "")
+        ):
+            continue
+        # 単値スロットは勝者だけが畳む側に回る (敗者は何も supersede しない)。
+        winner = winners.get((fact.subject, fact.predicate))
+        if winner is not None and winner is not fact:
             continue
         try:
             siblings = store.search_by_subject(

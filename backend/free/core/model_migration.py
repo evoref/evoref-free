@@ -836,6 +836,45 @@ class ModelMigrator:
             "(結果は GET /api/model/quality)",
         ]
 
+    #: プロファイルの ``embedding.<予約キー>`` → 転写先 config セクションと、
+    #: そこで受け付けるキーの許可リスト。
+    #:
+    #: **なぜ profile に置くか** — ここに並ぶのはすべて「2 つの埋め込みの
+    #: コサインを絶対値で比べる」閾値で、到達可能なスコア域が埋め込みモデル
+    #: ごとに大きく違う。実測 (2026-08-30、同一ペアで 3 モデル比較):
+    #:
+    #:     無関係ペアの cos 中央値   LFM2.5 0.105 / Qwen3 0.273 / bge-m3 0.459
+    #:
+    #: つまり LFM2.5 で「無関係」を意味する 0.3 は、bge-m3 では **全件が超える**。
+    #: 較正 (memory_threshold_calibration) が面倒を見るのは rag.* と
+    #: memory.relevance_min_score だけで、ここに並ぶ値は **どこにも自動追従が
+    #: 無く、モデルを替えると旧モデル前提の値が黙って残る**。
+    #:
+    #: リコール閾値 (tools.*) は 2026-06-29 に同じ方式で profile 化済みで、
+    #: 本表はその一般化。許可リスト方式にしてあるので、プロファイルが
+    #: 無関係な config を書き換えることはできない。
+    _EMBEDDING_SCALED_THRESHOLDS: dict[str, tuple[str, ...]] = {
+        "recall": (
+            "url_recall_min_score",
+            "executable_command_recall_min_score",
+        ),
+        "memory": (
+            "note_link_threshold",
+            "conflict_similarity_threshold",
+            "attribute_similarity_threshold",
+        ),
+        "rag": (
+            "cartridge_gate_threshold",
+        ),
+    }
+
+    #: 予約キー → config のトップレベルセクション名。
+    _THRESHOLD_SECTION: dict[str, str] = {
+        "recall": "tools",
+        "memory": "memory",
+        "rag": "rag",
+    }
+
     def _resolve_embedding_profile_params(self, resolved_path: Path) -> dict:
         """新 embed モデルの ``embedding.*`` パラメータを解決する。
 
@@ -903,20 +942,16 @@ class ModelMigrator:
             ):
                 if key in emb_prof:
                     params[key] = emb_prof[key]
-            # リコール閾値は埋め込みモデルの sim 分布に依存する model 固有値。
-            # embedding.* ではなく tools.* へ送るため予約キー "recall" に退避する。
-            recall_prof = emb_prof.get("recall")
-            if isinstance(recall_prof, dict):
-                recall = {
-                    k: recall_prof[k]
-                    for k in (
-                        "url_recall_min_score",
-                        "executable_command_recall_min_score",
-                    )
-                    if k in recall_prof
-                }
-                if recall:
-                    params["recall"] = recall
+            # コサインを直接比べる閾値は **埋め込みモデルの sim 分布に依存する
+            # model 固有値**。embedding.* ではない別セクションへ送るため、
+            # 予約キーに退避して :meth:`_update_component_config` でルーティングする。
+            for reserved, allowed in self._EMBEDDING_SCALED_THRESHOLDS.items():
+                block = emb_prof.get(reserved)
+                if not isinstance(block, dict):
+                    continue
+                picked = {k: block[k] for k in allowed if k in block}
+                if picked:
+                    params[reserved] = picked
         else:
             logger.warning(
                 "embed config sync: %s has no embedding profile; query/doc "
@@ -924,6 +959,32 @@ class ModelMigrator:
                 resolved_path.name,
             )
         return params
+
+    #: プロファイルのキー → config 上の **実際の位置** (トップレベルからのパス)。
+    #: ここに無いキーは ``<section>.<key>`` へそのまま書く。
+    #:
+    #: config は素の平坦な辞書ではなくネストしたスキーマなので、位置を間違えると
+    #: ``extra_forbidden`` で **起動しなくなる**。実インシデント (2026-08-30):
+    #: ``attribute_similarity_threshold`` を ``memory.*`` 直下へ書いてしまい、
+    #: 切替後の backend が Config validation failed で落ちた。
+    #: :class:`TestEmbeddingScaledThresholdSync` が実スキーマで検証する。
+    _THRESHOLD_CONFIG_PATH: dict[str, tuple[str, ...]] = {
+        "cartridge_gate_threshold": ("rag", "cartridge_gate", "threshold"),
+        "attribute_similarity_threshold": (
+            "memory", "conflict", "attribute_similarity_threshold",
+        ),
+    }
+
+    @classmethod
+    def _apply_routed(cls, target: dict, routed: dict[str, dict]) -> None:
+        """予約キー由来の閾値を config ツリーの **正しい位置** へ書き込む。"""
+        for section, values in routed.items():
+            for key, value in values.items():
+                path = cls._THRESHOLD_CONFIG_PATH.get(key, (section, key))
+                node = target
+                for part in path[:-1]:
+                    node = node.setdefault(part, {})
+                node[path[-1]] = value
 
     def _update_component_config(
         self, component: str, new_model_path: str,
@@ -941,18 +1002,21 @@ class ModelMigrator:
         # を同期する。これをやらないと旧モデルの prefix スキームで新モデルが駆動され
         # RAG が静かに劣化する (同 dim swap では dimension_check も検知しない)。
         emb_params: dict = {}
-        recall_params: dict = {}
+        routed: dict[str, dict] = {}
         if component == "embedding":
             resolved = Path(new_model_path)
             if not resolved.is_absolute():
                 resolved = self.project_root / resolved
             emb_params = self._resolve_embedding_profile_params(resolved)
-            # リコール閾値は embedding.* ではなく tools.* へルーティングする。
-            recall_params = emb_params.pop("recall", {})
+            # コサインスケール依存の閾値は embedding.* ではなく、それぞれの
+            # セクション (tools / memory / rag) へルーティングする。
+            for reserved, section in self._THRESHOLD_SECTION.items():
+                picked = emb_params.pop(reserved, {})
+                if picked:
+                    routed[section] = picked
+            self._apply_routed(cfg, routed)
             if emb_params:
                 cfg.setdefault("embedding", {}).update(emb_params)
-            if recall_params:
-                cfg.setdefault("tools", {}).update(recall_params)
         with open(config_path, "w", encoding="utf-8") as f:
             yaml.dump(
                 cfg, f,
@@ -969,10 +1033,11 @@ class ModelMigrator:
             logger.info(
                 "embed config synced: embedding.%s", sorted(emb_params.keys()),
             )
-        if recall_params:
-            self.config.setdefault("tools", {}).update(recall_params)
+        if routed:
+            self._apply_routed(self.config, routed)
             logger.info(
-                "recall thresholds synced: tools.%s", sorted(recall_params.keys()),
+                "embedding-scaled thresholds synced: %s",
+                {sec: sorted(vals) for sec, vals in routed.items()},
             )
         logger.info(
             "config.yaml updated: model_paths.%s = %s",

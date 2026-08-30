@@ -369,14 +369,32 @@ class SleepTimeScheduler:
         # **応答完了のタイミングで同じ Full が消える** (実測 2026-08-22
         # ライブ監査: 00:10:45 開始 → 00:11:02 に worker cancel、
         # 00:11:12 の on_response_sent で待機タスクごと差し替え)。
-        if self._full_forced_run:
+        #
+        # 免除条件は ``on_user_input`` と揃える。``_full_forced_run`` だけを見て
+        # いた頃は、**まだ走り出していない** (前倒し要求済み / 期限切れの) Full が
+        # 応答のたびに確実に消えていた。``_full_forced_run`` は
+        # ``_schedule_full`` が in-flight 待ちを抜けた後にしか立たないため、
+        # ターン間隔が ``_FULL_MIN_WAIT_SEC`` + in-flight 待ちより短い会話では
+        # **一度も到達しない**。実測 (2026-08-29 ライブ監査、chat 80 ターン):
+        # `waiting for the in-flight generation` の 1〜18 秒後に必ず
+        # `debounced (cancelled while idle-waiting)` が続き、58 分で完走 0 回 /
+        # SemMem のユーザーファクト 0 件だった。
+        pending_alive = self._full_task is not None and not self._full_task.done()
+        if pending_alive and (
+            self._full_forced_run
+            or self._full_requested
+            or self._full_defer_expired(quiet=True)
+        ):
             logger.debug(
-                "Trigger B: a forced full is running; keeping the current task",
+                "Trigger B: keeping the pending full across the response "
+                "(forced_run=%s, requested=%s, deferred=%.1f min)",
+                self._full_forced_run, self._full_requested,
+                self._full_deferred_seconds() / 60,
             )
             return
 
         # 既存の Full タスクをキャンセル
-        if self._full_task is not None and not self._full_task.done():
+        if pending_alive and self._full_task is not None:
             self._full_task.cancel()
 
         self._full_task = asyncio.create_task(
@@ -450,13 +468,17 @@ class SleepTimeScheduler:
         since = self._last_full_run or self._started_at
         return max(0.0, time.time() - since)
 
-    def _full_defer_expired(self) -> bool:
+    def _full_defer_expired(self, *, quiet: bool = False) -> bool:
         """Full を待たせ続けた時間が上限を超えたか。
 
         会話が途切れないと ``on_response_sent`` が毎ターン Trigger B のタイマーを
         張り直すため、アイドル待ちだけでは Full が一度も走らない。最後の実行から
         ``full_max_defer_minutes`` を超えたら、ユーザーがアクティブでも 1 回だけ
         通す。未実行 (プロセス起動後 0 回) の場合は起動時刻を起点にする。
+
+        Args:
+            quiet: True なら「これから走らせる」ログを出さない。イベント通知から
+                述語として呼ぶ用 (毎応答で INFO が並ぶのを避ける)。
         """
         if self._full_requested:
             return True
@@ -466,10 +488,11 @@ class SleepTimeScheduler:
         waited_min = self._full_deferred_seconds() / 60
         if waited_min < limit:
             return False
-        logger.info(
-            "Trigger B: running despite a recently active user "
-            "(deferred for %.1f min >= %.1f min limit)", waited_min, limit,
-        )
+        if not quiet:
+            logger.info(
+                "Trigger B: running despite a recently active user "
+                "(deferred for %.1f min >= %.1f min limit)", waited_min, limit,
+            )
         return True
 
     def _full_wait_seconds(self) -> float:
@@ -585,6 +608,7 @@ class SleepTimeScheduler:
         success = False
         cancelled = False
         executed = False
+        waiting_for_generation = False
         skipped_reason: str | None = None
         try:
             await asyncio.sleep(self._full_wait_seconds())
@@ -613,6 +637,7 @@ class SleepTimeScheduler:
                     "(up to %.0fs) before running the deferred full",
                     _FULL_INFLIGHT_WAIT_SEC,
                 )
+                waiting_for_generation = True
                 waited = 0.0
                 while self._chat_in_flight() and waited < _FULL_INFLIGHT_WAIT_SEC:
                     await asyncio.sleep(1.0)
@@ -660,7 +685,17 @@ class SleepTimeScheduler:
 
         except asyncio.CancelledError:
             cancelled = True
-            if not executed:
+            if waiting_for_generation and not executed:
+                # 生成待ちの最中に消された = **上で免除したはずの Full が
+                # それでも殺されている**。デバウンス (正常) と混ぜると
+                # outcome 上は健全に見えるので、失敗として区別する
+                # (2026-08-29 ライブ監査: この経路で 58 分 / 完走 0 回)。
+                logger.warning(
+                    "Full cancelled while waiting for the in-flight generation "
+                    "(the pending full should have been kept alive)",
+                )
+                skipped_reason = "cancelled_waiting_for_generation"
+            elif not executed:
                 # アイドル待機中のデバウンス (次の応答でタイマーが張り直される)
                 logger.debug("Full schedule debounced (cancelled while idle-waiting)")
                 success = True

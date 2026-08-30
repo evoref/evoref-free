@@ -184,6 +184,7 @@ from backend.free.agent.tool_judge_history import (
     _only_proximal_recall_keywords,
     _reduce_ordered_history_query,
     _strip_stopword_affixes,
+    asks_about_past_conversation,
     asks_about_prior_conversation_entity,
 )
 from backend.free.agent import tool_judge_guards as guards
@@ -822,9 +823,15 @@ class ToolCallJudge:
         # 誤って一致し skip_judgment=True になっていた (2026-07-20 テストで
         # 判明)。履歴参照キーワードという強いシグナルがある以上、雑談判定
         # 側の誤検出よりこちらを優先する。
+        # 語彙 (``_has_history_recall_keywords``) だけでなく **構造**
+        # (``asks_about_past_conversation`` = 過去形の言及動詞 + 問いかけ) でも
+        # 撃つ。閉じた語彙は必ず漏れ、漏れた側は **履歴ストアにしか無い時刻を
+        # 捏造する** ことが実測で出た (2026-08-30 ライブ監査 T06: 10 ターン
+        # すべてが no_match_in_any_layer で、「いつ、どんな話をしましたか。」に
+        # 「2025年6月15日（日）の午後4時20分頃に」と断定した。実際は同日 20 分前)。
         if (
             tools_registry.has("search_history")
-            and _has_history_recall_keywords(query)
+            and asks_about_past_conversation(query)
         ):
             search_query = _reduce_ordered_history_query(query)
             forced_result = ToolJudgement(

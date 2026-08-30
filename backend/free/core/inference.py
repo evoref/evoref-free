@@ -11,7 +11,10 @@ from backend.free.api.chat.chat_constants import (
     DEFAULT_MAX_TOKENS, DEFAULT_WORKING_MAX_TOKENS,
 )
 from backend.free.api.chat.chat_types import ChatMessage
-from backend.free.core.intent_vocab import refers_to_previous_output
+from backend.free.core.intent_vocab import (
+    is_plain_statement,
+    refers_to_previous_output,
+)
 from backend.free.core.prompt_blocks import current_datetime_block
 from backend.free.core.text_quality import (
     carries_no_assertion,
@@ -439,6 +442,25 @@ def _drop_restated_slots(
         # 扱いになって記憶が落ちる** (2026-08-25 ライブ監査: 新規セッションの
         # 想起 6 問すべてで「確認できる情報を持ち合わせていません」)。
         # 判定は注入側 (``MemoryInjector._restated_slots``) と同じ決定論ヘルパ。
+        #
+        # **否定形の列挙だけでは漏れる。** 問い / 依頼の形を挙げる閉じた語彙
+        # なので、外れた瞬間に想起クエリが「述べ直し」に化け、**答えを持つ
+        # 行がここで落ちる**。しかも抑止経路は 2 本ある —
+        # ``MemoryInjector._restated_slots`` を直しても、この関数が同じ判定を
+        # もう一度掛けるので回答は変わらない。
+        #
+        # 実インシデント (2026-08-30 ライブ監査 T21 / 検証 V1): 体言止めの
+        # 想起 (「私の職業は。」「私の趣味は。」「私の誕生日は。」) が
+        # どちらのガードにも当たらず、``asked_attrs`` と属性免除が正しく
+        # 効いて ``items=2`` を作った直後に、この関数が同じ属性の行を落とし、
+        # プロンプトから ``[関連する記憶]`` が消えていた。実機の回答は
+        # 「プログラマーです」「読書です」「1995年8月15日です」— いずれも
+        # ユーザーが一度も述べていない **捏造**。
+        #
+        # 注入側と同じく **肯定の証拠を要求する** 側へ反転する。判定を外した
+        # ときの代償が非対称 (抑止し損ね = 古い値が並ぶ / 誤抑止 = 答えが消える)。
+        if not is_plain_statement(text):
+            continue
         if states_no_user_value(text) or carries_no_assertion(text):
             continue
         restated |= slot_resolver(text)

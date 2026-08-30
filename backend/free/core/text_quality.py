@@ -285,6 +285,70 @@ def value_was_adopted(response: str, values: set[str]) -> bool:
     return False
 
 
+#: 「<話題> は <値> です」型の断定。``ですよね`` / ``ですね`` / ``でしょう`` も含む
+#: (ユーザーの同意要求はこの形で来る)。値は読点・句点を跨がない短い名詞句に限る。
+_TOPIC_VALUE_RE = re.compile(
+    r"(?P<topic>[^、。！!？?]{1,24})は\s*(?P<value>[^、。！!？?]{1,24}?)\s*"
+    r"(?:です|だ|である|でした)(?:よ)?ね?(?:う)?[。．!！]?\s*$",
+)
+
+#: 話題側から落とす飾り (「さっき」「実は」など、同じ話題の別表記を作る語)。
+_TOPIC_NOISE_RE = re.compile(r"^(?:でも|ただ|実は|さっき|たしか|確か|やっぱり|でも、)")
+
+
+def assertion_topic_value(sentence: str) -> tuple[str, str] | None:
+    """1 文を ``(話題, 値)`` に割る (純粋関数)。断定形でなければ ``None``。
+
+    「日本の首都は大阪です」→ ``("日本の首都", "大阪")``。
+    「日本の首都は東京です」→ ``("日本の首都", "東京")``。
+
+    用途は **同じ話題に別の値が対置されたか** の判定で、値の型を問わない。
+    数値だけを見る判定 (:func:`value_was_adopted` を数値集合で使う経路) は
+    「日本の首都は大阪ですよね。」のような **数値を含まない誤主張** を
+    素通りさせるため (2026-08-28 ライブ監査 T11-3)。
+    """
+    m = _TOPIC_VALUE_RE.search((sentence or "").strip())
+    if m is None:
+        return None
+    topic = _TOPIC_NOISE_RE.sub("", m.group("topic").strip()).strip()
+    value = m.group("value").strip()
+    if not topic or not value:
+        return None
+    return topic, value
+
+
+def contradicts_asserted_value(claim: str, reply: str) -> bool:
+    """``reply`` が ``claim`` と **同じ話題に別の値** を対置したか (純粋関数)。
+
+    「日本の首都は大阪ですよね。」に「日本の首都は東京です。大阪は……首都では
+    ありません。」が返れば ``True``。同じ値を言い直しただけなら ``False``。
+
+    出現の有無では判定できない — 反論する側は打ち消しながら相手の値に言及する
+    ので、``大阪`` が本文にあること自体は採用の証拠にならない
+    (:func:`value_was_adopted` と同じ理由)。話題を揃えて値を比べる。
+    """
+    claims: dict[str, str] = {}
+    for raw in _SENTENCE_SPLIT_FOR_CLAIMS.split(claim or ""):
+        pair = assertion_topic_value(raw)
+        if pair is not None:
+            claims[pair[0]] = pair[1]
+    if not claims:
+        return False
+    for raw in _SENTENCE_SPLIT_FOR_CLAIMS.split(reply or ""):
+        pair = assertion_topic_value(raw)
+        if pair is None:
+            continue
+        topic, value = pair
+        other = claims.get(topic)
+        if other is not None and other != value:
+            return True
+    return False
+
+
+#: 文分割 (``extractors.chat._SENTENCE_SPLIT_RE`` と同じ規則を pillar 非依存で持つ)。
+_SENTENCE_SPLIT_FOR_CLAIMS = re.compile(r"(?<=[。．!！?？\n])")
+
+
 def find_superseded_claim(
     candidate: str, current_claims: dict[str, set[str]],
 ) -> tuple[str, str, set[str]] | None:
@@ -645,9 +709,32 @@ def strip_first_person_topic(text: str) -> str:
 #: 一致し、依頼文がまるごと ``mem.preference.user`` の object として保存された。
 #: 疑問符も「〜ですか」も無いため ``_QUESTION_ENDING_RE`` では拾えない。
 _REQUEST_ENDING_RE = re.compile(
-    r"(?:(?:て|で)(?:ください|下さい)"
+    # ``ください`` は直前の助詞を問わず文末の依頼マーカー。``て/で`` を必須に
+    # していたため「アドバイスを**ください**。」が依頼として認識されず、
+    # ``mem.personal.user states: 私の好みを踏まえて、通勤についてアドバイスを
+    # ください。`` が live なファクトとして残った (2026-08-28 ライブ監査、
+    # 実ストアで確認)。語彙を 1 つ足すのではなく助詞依存を外す
+    # (「語彙列挙は必ず漏れる」— 2026-08-23 / 08-25 でも同じ形で再発している)。
+    # 文末に錨を張るので「〜と言ってくださいました。」のような非依頼は掛からない。
+    # ``もう一度`` / ``再度`` は **依頼動詞が省略された依頼**
+    # (「〜をもう一度 (教えてください)。」)。日本語では常態だが動詞が無いため
+    # 上のどの語尾にも当たらない。実インシデント (2026-08-30 ライブ監査の検証、
+    # 実ストアで確認): 「私の名前、住所、職業、ペットをもう一度。」
+    # 「私の勤務地と居住地をもう一度。」が **そのままファクト化** し、
+    # 単値スロットゆえに正しい値を supersede して消した::
+    #
+    #     LIVE  mem.personal.pet        | ペットをもう一度。
+    #     SUPER mem.personal.pet        | 柴犬を1匹飼っています。
+    #     LIVE  mem.personal.occupation | 職業
+    #     SUPER mem.personal.occupation | …SREになりました。
+    #
+    # **その問いの答えを、問うた瞬間に破壊していた**。実機の回答は
+    # 「あなたの職業は会社員です」「飼っているペットは、猫です」(いずれも捏造)。
+    # 文末アンカーなので「もう一度確認しました。」のような言明は掛からない。
+    r"(?:ください|下さい"
     r"|(?:して|で)(?:ほしい|欲しい)"
     r"|お願いします|願います"
+    r"|もう一度|もう1度|もういちど|再度"
     r"|(?:教え|挙げ|見せ|出し|作っ|書い|説明し|列挙し|示し)て)"
     r"[。．.、,！!\s\"'」』）)]*\s*$",
 )
@@ -798,6 +885,9 @@ __all__ = [
     "violates_output_form",
     "has_verifiable_output_constraint",
     "length_disclosure_note",
+    "match_word_limit",
+    "count_response_words",
+    "violates_word_count",
 ]
 
 #: 応答の途中で自分の結論を撤回する言い回し。1 つの応答に結論が 2 つ入る。
@@ -893,22 +983,218 @@ _REPEAT_COUNT_RE = re.compile(
 )
 
 
+#: 「各項目 20 文字以内」「1 行は 20 文字以内」型の **1 項目あたり** の文字数上限。
+#: 応答全体の上限 (:data:`_CHAR_LIMIT_RE`) とは測る対象が違う。
+#:
+#: 実インシデント (2026-08-28 ライブ監査 T07-5):
+#: 「箇条書きでちょうど7項目、各項目20文字以内で書いてください。」に対し
+#: 5 項目 (各 4〜5 文字) で答えたのに、開示注記は
+#: 「20 文字以内の指定に対し、上の回答は 34 文字です」だった。34 は応答全文の
+#: 長さで、per-item 指定を全文長として測っていた。しかも偽の違反が先に立つため、
+#: 本当の違反 (7 項目指定に対し 5 項目) は検証にも開示にも出なかった。
+#:
+#: 数量詞に続く **単位の名詞を必須** にする ("120文字以内" の先頭 1 を
+#: 「1 項目」と読まないため)。
+_PER_ITEM_CHAR_LIMIT_RE = re.compile(
+    r"(?:各|1|１|一)\s*(?:項目|行|つ|個|文|箇条|要素)\s*"
+    r"(?:は|あたり|当たり|につき|ずつ|に)?\s*"
+    r"([0-9０-９]{1,4})\s*(?:文字|字)\s*(?:以内|以下|まで)"
+    r"|それぞれ\s*([0-9０-９]{1,4})\s*(?:文字|字)\s*(?:以内|以下|まで)",
+)
+
+
+def match_per_item_char_limit(text: str) -> int:
+    """1 項目あたりの文字数上限を返す (純粋関数)。無ければ ``0``。"""
+    m = _PER_ITEM_CHAR_LIMIT_RE.search(text or "")
+    if not m:
+        return 0
+    raw = next(g for g in m.groups() if g).translate(_FULLWIDTH_DIGITS)
+    return int(raw) if raw.isdigit() else 0
+
+
+def _per_item_limit_spans(text: str) -> list[tuple[int, int]]:
+    """per-item 上限指定の出現範囲 (全文上限との取り違え防止に使う)。"""
+    return [m.span() for m in _PER_ITEM_CHAR_LIMIT_RE.finditer(text or "")]
+
+
+#: 「40 words 以内」「40語以内」型の **語数** 上限。
+#:
+#: 文字数・行数・項目数と同じく数えれば分かる制約なのに、検証も開示も無かった。
+#: 実インシデント (2026-08-29 ライブ監査 T28#3): 「同じ内容を、今度は英語で
+#: **40 words 以内**で。」に **42 words** で答え、日本語の文字数制約では必ず
+#: 付く開示注記が **1 つも付かなかった** (検証が日本語の文字数/行数に限定
+#: されていたため)。
+_WORD_LIMIT_RE = re.compile(
+    r"([0-9０-９]{1,4})\s*(?:words?|語|単語|ワード)\s*(?:以内|以下|まで)"
+    r"|(?:within|under|at\s+most|no\s+more\s+than)\s+"
+    r"([0-9０-９]{1,4})\s*(?:words?)",
+    re.IGNORECASE,
+)
+
+#: 語のトークン。英数字とアポストロフィ・ハイフンで 1 語 (don't / e-mail)。
+_WORD_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’-]*")
+
+
+def match_word_limit(text: str) -> int:
+    """発話中の語数上限を返す (純粋関数)。無ければ ``0``。"""
+    m = _WORD_LIMIT_RE.search(text or "")
+    if not m:
+        return 0
+    raw = next(g for g in m.groups() if g).translate(_FULLWIDTH_DIGITS)
+    return int(raw) if raw.isdigit() else 0
+
+
+def count_response_words(response: str) -> int:
+    """応答の語数を数える (純粋関数)。
+
+    システムが後付けした開示注記は除く (自分の注記で違反を作らないため)。
+    """
+    body = _SYSTEM_NOTE_TAIL_RE.sub("", response or "")
+    return len(_WORD_TOKEN_RE.findall(body))
+
+
+def violates_word_count(query: str, response: str) -> str | None:
+    """語数の上限を超えていれば理由を返す (純粋関数)。
+
+    上限だけを見る (文字数の ``limit`` と同じ)。「ちょうど N words」は
+    実用上ほぼ現れないので扱わない。
+    """
+    limit = match_word_limit(query)
+    if limit <= 0:
+        return None
+    got = count_response_words(response)
+    if got <= limit:
+        return None
+    return f"asked for at most {limit} words but the answer has {got} words"
+
+
 def match_length_directive(text: str) -> tuple[str, int] | None:
-    """発話に含まれる出力長の指定を ``(種別, 数)`` で返す (純粋関数)。
+    """発話に含まれる **応答全体** の出力長指定を ``(種別, 数)`` で返す。
 
     種別は ``exact`` (ちょうど N 文字) / ``repeat`` (N 回) / ``limit``
     (N 文字以内)。厳密指定を先に見るのは「300字ちょうど」が上限指定の
     パターンにも部分一致しうるため。指定が無ければ ``None``。
+
+    「各項目 20 文字以内」型は **1 項目あたり** の指定なので全体の指定として
+    返さない (:func:`match_per_item_char_limit` が扱う)。純粋関数。
     """
+    spans = _per_item_limit_spans(text)
     for kind, pattern in (
         ("exact", _CHAR_EXACT_RE),
         ("repeat", _REPEAT_COUNT_RE),
         ("limit", _CHAR_LIMIT_RE),
     ):
-        m = pattern.search(text or "")
-        if m:
+        for m in pattern.finditer(text or ""):
+            if any(s <= m.start() and m.end() <= e for s, e in spans):
+                continue
             return kind, int(next(g for g in m.groups() if g))
     return None
+
+
+#: 「「AI」という単語を使わずに」型の **禁止語**。引用符か「という単語/語/言葉」を
+#: 要求して、「AI を使わずに実装して」(道具としての AI) と切り分ける。
+_BANNED_WORD_RE = re.compile(
+    r"[「『\"']\s*([^「」『』\"']{1,20}?)\s*[」』\"']\s*(?:という)?\s*"
+    r"(?:単語|語|言葉)?\s*(?:を|は)?\s*使わ(?:ず|ない)"
+    r"|([^\s、。「」]{1,20}?)\s*という\s*(?:単語|語|言葉)\s*(?:を|は)?\s*使わ(?:ず|ない)",
+)
+
+#: 「カタカナを使わずに」型の **禁止文字種**。名詞は閉じた集合で、判定は
+#: Unicode の範囲で行う (語彙の列挙ではない)。
+_BANNED_SCRIPT_RE = re.compile(
+    r"(カタカナ|片仮名|ひらがな|平仮名|漢字|英語|アルファベット)"
+    r"\s*(?:を|は)?\s*使わ(?:ず|ない)",
+)
+
+#: 文字種名 → その文字種にマッチする正規表現。
+_SCRIPT_PATTERNS: dict[str, "re.Pattern[str]"] = {
+    "カタカナ": re.compile(r"[ァ-ヶー]"),
+    "片仮名": re.compile(r"[ァ-ヶー]"),
+    "ひらがな": re.compile(r"[ぁ-ゖ]"),
+    "平仮名": re.compile(r"[ぁ-ゖ]"),
+    "漢字": re.compile(r"[一-鿿]"),
+    "英語": re.compile(r"[A-Za-z]"),
+    "アルファベット": re.compile(r"[A-Za-z]"),
+}
+
+
+def match_banned_content(query: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """発話中の「使うな」指定を ``(禁止語, 禁止文字種)`` で返す (純粋関数)。"""
+    words: list[str] = []
+    for m in _BANNED_WORD_RE.finditer(query or ""):
+        token = next((g for g in m.groups() if g), "").strip()
+        if token:
+            words.append(token)
+    scripts = [m.group(1) for m in _BANNED_SCRIPT_RE.finditer(query or "")]
+    return tuple(dict.fromkeys(words)), tuple(dict.fromkeys(scripts))
+
+
+def violates_banned_content(query: str, response: str) -> str | None:
+    """禁止語・禁止文字種の指定を破っていれば理由を返す (純粋関数)。
+
+    文字数・行数・個数と同じく **数えれば分かる** 制約なのに、検証も開示も
+    無かった。実インシデント (2026-08-28 ライブ監査 T18-3):
+    「カタカナを使わずに、コンピュータを説明してください。」に
+    「コンピュータは、電気信号を使って計算や情報処理を行う機械です。」と答え、
+    同じ会話の最後の自己申告 (T18-10) でもこの違反は挙がらなかった
+    (挙がったのは文字数の 1 件だけ)。
+
+    システムが後付けした開示注記は数えない (自分の注記で違反を作らないため)。
+    """
+    words, scripts = match_banned_content(query)
+    if not (words or scripts):
+        return None
+    body = _SYSTEM_NOTE_TAIL_RE.sub("", response or "").strip()
+    if not body:
+        return None
+    hits: list[str] = []
+    hits.extend(f"the banned word {w!r}" for w in words if w and w in body)
+    for name in scripts:
+        pattern = _SCRIPT_PATTERNS.get(name)
+        if pattern is not None and pattern.search(body):
+            hits.append(f"banned script {name}")
+    if not hits:
+        return None
+    return "asked not to use " + ", ".join(hits) + " but the answer contains it"
+
+
+def violates_per_item_length(query: str, response: str) -> str | None:
+    """1 項目あたりの文字数上限を破っていれば理由を返す (純粋関数)。
+
+    指定が無い / 応答をリストとして数えられない場合は ``None`` (後続の全体長
+    判定へ委ねず、per-item 指定があるなら全体長では測らない — 測る対象が
+    違うので、数えられないなら黙って通す)。
+    """
+    limit = match_per_item_char_limit(query)
+    if limit <= 0:
+        return None
+    items = _list_item_texts(response)
+    if not items:
+        return None
+    longest = max(items, key=len)
+    if len(longest) <= limit:
+        return None
+    return (
+        f"asked for at most {limit} chars per item but the longest item is "
+        f"{len(longest)}"
+    )
+
+
+def _list_item_texts(response: str) -> list[str]:
+    """応答をリストとして項目本文の一覧に分解する (純粋関数)。
+
+    箇条書き記号を落として本文だけを返す。リストと確信できなければ空リスト
+    (:func:`count_list_items` と同じ判定を項目本文にも使う)。
+    """
+    body = _SYSTEM_NOTE_TAIL_RE.sub("", response or "").strip()
+    if not body:
+        return []
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    bullets = [ln for ln in lines if _BULLET_LINE_RE.match(ln)]
+    picked = bullets or lines
+    if not bullets and len(picked) < _ENUM_MIN_LINES:
+        return []
+    return [_BULLET_MARKER_RE.sub("", ln).strip() for ln in picked]
 
 
 def violates_length_constraint(query: str, response: str) -> str | None:
@@ -928,7 +1214,12 @@ def violates_length_constraint(query: str, response: str) -> str | None:
     両方を出しており、モデルに要求している基準と揃う。
 
     反復回数指定 (``repeat``) は数える対象の同定が要るため見ない。
+
+    「各項目 20 文字以内」型は 1 項目ずつ測る (:func:`violates_per_item_length`)。
     """
+    per_item = violates_per_item_length(query, response)
+    if per_item is not None:
+        return per_item
     directive = match_length_directive(query)
     if directive is None:
         return None
@@ -1008,6 +1299,9 @@ ITEM_COUNT_RE = re.compile(
 #: 数値表現をリスト項目と数えないため。
 _BULLET_LINE_RE = re.compile(r"^\s*(?:・\s*|(?:[-*+]|\d{1,2}[.)、])\s+)\S")
 
+#: :data:`_BULLET_LINE_RE` の記号部だけ (本文 1 文字を巻き込まずに剥がす)。
+_BULLET_MARKER_RE = re.compile(r"^\s*(?:・\s*|(?:[-*+]|\d{1,2}[.)、])\s+)")
+
 #: 「47 都道府県を全部列挙して」型の **列挙個数** 指定。
 #:
 #: :data:`ITEM_COUNT_RE` は数値が ``つ`` / ``個`` / ``点`` / ``項目`` に付く形しか
@@ -1034,6 +1328,19 @@ _ENUM_ITEM_MAX_CHARS = 40
 _ENUM_SHORT_LINE_RATIO = 0.8
 
 
+#: 「7 項目」のように **個数だけ** の形。:data:`ITEM_COUNT_RE` は後続の動詞
+#: (``挙げ`` / ``書`` / ``列挙`` …) を要求するため、個数の直後で文が区切れると
+#: 拾えない。箇条書き指定が別に立っているときだけ使う (単独で使うと
+#: 「5 個のりんごを持っています」のような数量表現まで個数指定に読む)。
+#:
+#: 実インシデント (2026-08-28 ライブ監査 T07-5):
+#: 「箇条書きでちょうど7項目、各項目20文字以内で書いてください。」の ``7項目``
+#: の直後が読点で、個数指定として認識されず 5 項目の回答が違反にならなかった。
+_ITEM_COUNT_BARE_RE = re.compile(
+    r"(?:ちょうど|丁度|きっかり|正確に)?\s*(\d{1,2})\s*(?:つ|個|点|項目)",
+)
+
+
 def match_enumeration_count(text: str) -> int:
     """発話中の列挙個数指定を返す (純粋関数)。無ければ ``0``。"""
     m = ENUMERATION_COUNT_RE.search(text or "")
@@ -1042,6 +1349,11 @@ def match_enumeration_count(text: str) -> int:
     m2 = ITEM_COUNT_RE.search(text or "")
     if m2:
         return int(next(g for g in m2.groups() if g))
+    # 箇条書き / リスト形式の指定が立っているなら、個数だけの形も個数指定と読む。
+    if BULLET_FORM_RE.search(text or ""):
+        m3 = _ITEM_COUNT_BARE_RE.search(text or "")
+        if m3:
+            return int(m3.group(1))
     return 0
 
 
@@ -1083,12 +1395,35 @@ LINE_COUNT_RE = re.compile(
 )
 
 
+#: 行数が **既出の出力への参照** であることを示す後続語。
+#: 「その3行**のうち**」「3行**目**」は今回の出力への指定ではない。
+_LINE_COUNT_REFERENCE_TAIL = ("のうち", "の中", "目")
+#: 同じく直前語。「**その**3行」「**先ほどの**3行」。
+_LINE_COUNT_REFERENCE_HEAD = (
+    "その", "この", "あの", "先ほどの", "さっきの", "上の", "上記の", "先の",
+)
+
+
 def match_line_count(text: str) -> int:
-    """発話中の行数指定を返す (純粋関数)。無ければ ``0``。"""
-    for m in LINE_COUNT_RE.finditer(text or ""):
+    """発話中の行数指定を返す (純粋関数)。無ければ ``0``。
+
+    **参照は指定ではない。** 「その 3 行のうち、2 行目だけを 10 文字に縮めて
+    ください。」は *前ターンの出力* を指しているだけで、今回の応答に 3 行を
+    求めてはいない。これを指定として拾っていたため、1 行で答えるのが正しい
+    ターンに `(注: 3 行の指定に対し、上の回答は 1 行です)` という **偽の違反
+    注記** が付いた (2026-08-29 ライブ監査 T04#4)。序数 (「2 行目」) も同様に
+    行数の指定ではない。
+    """
+    src = text or ""
+    for m in LINE_COUNT_RE.finditer(src):
         # 「1行は20文字以内」は 1 行あたりの制約であって行数の指定ではない。
-        tail = (text or "")[m.end():m.end() + 12]
+        tail = src[m.end():m.end() + 12]
         if tail.startswith(("は", "あたり", "当たり", "につき")):
+            continue
+        if tail.startswith(_LINE_COUNT_REFERENCE_TAIL):
+            continue
+        head = src[: m.start()]
+        if head.endswith(_LINE_COUNT_REFERENCE_HEAD):
             continue
         raw = m.group(1).translate(_FULLWIDTH_DIGITS)
         if raw.isdigit() and int(raw) > 0:
@@ -1218,6 +1553,14 @@ def has_verifiable_output_constraint(query: str) -> bool:
         # 返ってきた行は数えられる (2026-08-27 ライブ監査: 46/47 を見逃した)。
         or match_enumeration_count(q) > 0
         or match_line_count(q) > 0
+        # 「「AI」という単語を使わずに」「カタカナを使わずに」も数えれば分かる
+        # (2026-08-28 ライブ監査 T18-3)。
+        or any(match_banned_content(q))
+        or match_per_item_char_limit(q) > 0
+        # 「40 words 以内で」も数えれば分かる。日本語の文字数だけを見ていた
+        # ため、英語の語数違反は検証も開示もされなかった
+        # (2026-08-29 ライブ監査 T28#3: 40 words 指定に 42 words)。
+        or match_word_limit(q) > 0
     )
 
 
@@ -1242,9 +1585,26 @@ def length_disclosure_note(query: str, response: str) -> str:
     directive = match_length_directive(query or "")
     prefix = chr(10) * 2
     parts: list[str] = []
-    if directive is None:
+    # 「各項目 20 文字以内」型は 1 項目あたりの指定。全文の長さを開示すると
+    # 守れている出力を破ったように見せる (2026-08-28 ライブ監査 T07-5:
+    # 各項目 4〜5 文字の箇条書きに「20 文字以内の指定に対し 34 文字」と出た)。
+    per_item_limit = match_per_item_char_limit(query or "")
+    if per_item_limit > 0:
+        items = _list_item_texts(response)
+        longest = max((len(t) for t in items), default=0)
+        if longest > per_item_limit:
+            parts.append(
+                f"1 項目 {per_item_limit} 文字以内の指定に対し、"
+                f"最長の項目は {longest} 文字です",
+            )
+            _record_constraint_issue(
+                f"1 項目 {per_item_limit} 文字以内の指定に対し最長 {longest} 文字",
+            )
+    elif directive is None and match_word_limit(query or "") <= 0:
+        # 語数指定のターンで文字数を併記すると、訊かれていない単位の数字が
+        # 先に立って読み手を混乱させる (「40 語以内」に「308 文字です」)。
         parts.append(f"上の回答は {measured} 文字です")
-    else:
+    if directive is not None:
         kind, expected = directive
         unit = "文字以内" if kind == "limit" else "文字ちょうど"
         parts.append(
@@ -1269,6 +1629,48 @@ def length_disclosure_note(query: str, response: str) -> str:
             _record_constraint_issue(
                 f"{wanted_lines} 行の指定に対し {got_lines} 行",
             )
+    # 列挙個数も併記する。長さの側だけ開示すると、「ちょうど 7 項目」に 5 項目で
+    # 答えた事実が残らない (2026-08-28 ライブ監査 T07-5)。
+    wanted_items = match_enumeration_count(query or "")
+    if wanted_items > 0:
+        got_items = count_list_items(response)
+        if 0 < got_items < wanted_items:
+            parts.append(
+                f"{wanted_items} 項目の指定に対し、上の回答は {got_items} 項目です",
+            )
+            _record_constraint_issue(
+                f"{wanted_items} 項目の指定に対し {got_items} 項目",
+            )
+    # 語数の上限も併記する。日本語の文字数には必ず注記が付くのに、英語の語数は
+    # 検証も開示も無く、40 words 指定に 42 words で答えても黙っていた
+    # (2026-08-29 ライブ監査 T28#3)。
+    word_limit = match_word_limit(query or "")
+    if word_limit > 0:
+        got_words = count_response_words(response)
+        if got_words > word_limit:
+            parts.append(
+                f"{word_limit} 語以内の指定に対し、上の回答は {got_words} 語です",
+            )
+            _record_constraint_issue(
+                f"{word_limit} 語以内の指定に対し {got_words} 語",
+            )
+    # 禁止語・禁止文字種も開示する。守れなかったことを黙っていると、後続ターンの
+    # 自己申告 (「守れなかった制約を挙げて」) から丸ごと落ちる
+    # (2026-08-28 ライブ監査 T18-10 は文字数の 1 件しか挙げなかった)。
+    banned_words, banned_scripts = match_banned_content(query or "")
+    if banned_words or banned_scripts:
+        body = _SYSTEM_NOTE_TAIL_RE.sub("", response or "").strip()
+        broken = [w for w in banned_words if w and w in body]
+        broken += [
+            name for name in banned_scripts
+            if (pat := _SCRIPT_PATTERNS.get(name)) is not None and pat.search(body)
+        ]
+        if broken:
+            joined = "・".join(broken)
+            parts.append(f"{joined} を使わない指定に対し、上の回答は使っています")
+            _record_constraint_issue(f"{joined} を使わない指定に違反")
+    if not parts:
+        return ""
     return prefix + "(注: " + "。".join(parts) + ")"
 
 

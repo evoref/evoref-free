@@ -39,6 +39,7 @@ EvorefMem 統合仕様 におけるモード別の意味記憶 / 短期記憶注
 
 from __future__ import annotations
 
+import re
 import math
 import time
 
@@ -46,6 +47,7 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Iterable, Literal
 
+from backend.free.core.intent_vocab import is_plain_statement
 from backend.free.core.text_quality import (
     carries_no_assertion,
     is_payload_dump,
@@ -320,6 +322,42 @@ NEAR_DUPLICATE_JACCARD: float = 0.85
 #: 競わせる意味が無い (競わせると実測で飲み物が趣味に勝つ)。
 _ASKED_ATTRIBUTE_BONUS: float = 100.0
 
+#: 語彙アンカーで通した候補に足すスコア。属性一致 (決定論) ほど強くはないが、
+#: コサインだけで並ぶ候補より上に出す。
+_ANCHOR_BONUS: float = 50.0
+
+#: クエリから取り出す **内容語**。2 文字以上の漢字 / カタカナ / 英数字の連なり。
+#: 1 文字を採らないのは助詞・接辞の断片が全文にマッチしてしまうため。
+_QUERY_ANCHOR_RE = re.compile(r"[一-鿿]{2,}|[ァ-ヴー]{2,}|[A-Za-z0-9]{2,}")
+
+#: 想起の **足場語**。どの想起クエリにも現れるので、これが一致しても
+#: 「その話題だ」とは言えない。アンカーから除く。
+_ANCHOR_SCAFFOLD: frozenset[str] = frozenset({
+    "自分", "今回", "会話", "記録", "情報", "内容", "以前", "過去", "確認",
+    "教えて", "何度", "全部", "一度", "本当", "具体", "詳細", "最初", "最後",
+    "さっき", "先ほど", "いま", "現在",
+})
+
+
+def query_anchors(query_text: str) -> tuple[str, ...]:
+    """クエリの内容語 (語彙アンカー) を返す (純粋関数)。
+
+    埋め込みのスケールに依存しない **決定論の根拠**。属性辞書に無い話題
+    (「蕎麦」「苦手」「約束」) はコサインでしか拾えず、実測ではその
+    コサインが背景と重なって届かない (下記 :meth:`_is_relevant` の測定)。
+    """
+    if not query_text:
+        return ()
+    return tuple({
+        w for w in _QUERY_ANCHOR_RE.findall(query_text)
+        if w not in _ANCHOR_SCAFFOLD
+    })
+
+
+def _has_anchor(text: str, anchors: tuple[str, ...]) -> bool:
+    """``text`` に語彙アンカーのいずれかがそのまま出現するか。"""
+    return bool(anchors) and any(a in text for a in anchors)
+
 #: 近似重複判定は O(n^2)。注入候補がこの件数を超えたら判定ごと見送る
 #: (実運用の候補数は数十件で、超えるのは異常系)。
 _NEAR_DUP_MAX_ITEMS: int = 200
@@ -497,6 +535,31 @@ class MemoryInjector:
             #
             # 判定は既存の決定論ヘルパを使う (実測で問い 3 件 / 言明 2 件を
             # 完全分離)。語彙を新しく列挙しない。
+            #
+            # **否定形の防御だけでは漏れ続ける。** 上の 2 つは「問い / 依頼の
+            # 形」を列挙して落とす閉じた語彙で、外れた瞬間に想起クエリが
+            # 「述べ直し」に化け、**答えを持つファクトが消える**。
+            #
+            # 実インシデント (2026-08-30 ライブ監査 T12#7): 「私の名前を、いま
+            # 確実に知っていますか。根拠も。」は ``states_no_user_value`` /
+            # ``carries_no_assertion`` の**どちらにも当たらず**
+            # (末尾が「根拠も。」で問いの形をしていない)、``name`` スロットが
+            # restated 扱いになった。``asked_attrs=['name']`` まで正しく出て
+            # いたのに、属性免除に到達する前にファクトが落ちて
+            # ``attr_exempt=0 items=0``。実機の回答は「いいえ、知りません。」。
+            #
+            # そこで **肯定の証拠を要求する** 側へ反転する。抑止は
+            # 「ユーザーがこのセッションで値を言明した」ときだけ働けばよく、
+            # 判定を外した場合の代償は非対称:
+            #
+            #   - 抑止し損ね → 古い値が新しい値と並ぶ (ラベルとプロンプト規範
+            #     で「今回の会話が優先」と示されており、実害は小さい)
+            #   - 誤って抑止 → **答えそのものが消える** (上の実インシデント)
+            #
+            # ``is_plain_statement`` は平叙文かどうかだけを見る既存の決定論
+            # ヘルパ。実測 16 件 (言明 6 / 想起の問い 10) で完全分離した。
+            if not is_plain_statement(text):
+                continue
             if states_no_user_value(text) or carries_no_assertion(text):
                 continue
             for fact_type in _USER_ATTRIBUTE_FACT_TYPES:
@@ -546,16 +609,29 @@ class MemoryInjector:
         """
         if not query_text:
             return set()
-        from backend.free.memory.notes.note_builder import resolve_fact_attribute
+        from backend.free.memory.notes.note_builder import (
+            resolve_fact_attribute_matches,
+        )
 
         attrs: set[str] = set()
         for fact_type in _USER_ATTRIBUTE_FACT_TYPES:
             try:
-                attr = resolve_fact_attribute(query_text, fact_type, mode=mode)
+                # **複数形の解決を使う。** 単数版は YAML 記載順で最初の 1 件を
+                # 返して打ち切るため、1 つの問いが 2 つ以上の属性を尋ねると
+                # **先頭以外は免除されず、コサインのゲートに落ちる**。
+                #
+                # 実インシデント (2026-08-30 ライブ監査の検証 V4):
+                # 「私の勤務地と居住地をもう一度。」→ ``work_location`` だけ、
+                # 「私の名前、住所、職業、ペットをもう一度。」→ ``occupation``
+                # だけが解決し、実機は「確認できていません」と答えた。抽出側は
+                # 同じ理由で 2026-08-25 に複数形へ移行済みで、読み出し側だけ
+                # 単数のまま残っていた。
+                matches = resolve_fact_attribute_matches(
+                    query_text, fact_type, mode=mode,
+                )
             except Exception:
                 continue
-            if attr:
-                attrs.add(attr)
+            attrs.update(slug for slug, _ in matches)
         return attrs
 
     @staticmethod
@@ -635,6 +711,8 @@ class MemoryInjector:
         restated = self._restated_slots(session_user_texts, mode)
         asked_attrs = self._asked_attributes(query_text, mode)
         attr_exempt = 0
+        anchors = query_anchors(query_text)
+        anchor_exempt = 0
 
         for fact in facts:
             if fact.superseded_by:
@@ -703,8 +781,15 @@ class MemoryInjector:
             asked_this = bool(
                 asked_attrs and self._fact_attribute(fact) in asked_attrs
             )
+            # 語彙アンカー: クエリの内容語がファクト本文にそのまま出ていれば、
+            # 属性辞書に無い話題でも「その話をしている」ことが決定論で言える。
+            anchored = not asked_this and _has_anchor(
+                str(getattr(fact, "object", "") or ""), anchors,
+            )
             if asked_this:
                 attr_exempt += 1
+            elif anchored:
+                anchor_exempt += 1
             elif not self._is_relevant(
                 query_vec, getattr(fact, "embedding", None),
                 pinned=bool(fact.pinned),
@@ -718,6 +803,8 @@ class MemoryInjector:
             if tier is None:
                 continue
             score = self._score_fact(fact)
+            if anchored:
+                score += _ANCHOR_BONUS
             if asked_this:
                 # 順位も直す。免除しただけでは Tier 内の並びで負ける
                 # (実測: 「私の趣味は何でしたか。」で飲み物 +0.352 が
@@ -751,8 +838,27 @@ class MemoryInjector:
             # 問いだけのノートは答えを含まないのに (過去の記録) として注入され、
             # モデルがそれを回答として復唱する (実インシデント 2026-08-04
             # ライブ監査:「今日は何曜日ですか。」が過去の記録として想起され、
-            # 同文がそのまま出力された)。明示的に pin されたものは尊重する。
-            if not pinned and carries_no_assertion(getattr(note, "content", "")):
+            # 同文がそのまま出力された)。
+            #
+            # **pin を例外にしない。** ファクト側は 2026-08-07 に同じ結論へ
+            # 到達済み — pin 検出は「重要」「覚えて」等の語で発火するため、
+            # **問い自体がその語を含むと自動で pin され、この 2 つのガードを
+            # まるごと迂回する**。ノート側だけ ``not pinned and`` が残っていた。
+            #
+            # 実測 (2026-08-30 ライブ監査、300 ターン): 注入された記憶行
+            # 165 件のうち **106 件 (64%) がユーザー自身の過去の問い / 依頼**
+            # で、上位 4 件はすべて pin 免除で通っていた:
+            #
+            #   38 回「訂正前の値を覚えていますか。…」        (pin 語「覚え」)
+            #   29 回「その重要な点だけを補足として3行で…」  (pin 語「重要」)
+            #   22 回「圧縮で落とした情報のうち、重要な…」    (pin 語「重要」)
+            #   17 回「いま答えた内容に、私が訂正した古い値は…」
+            #
+            # いずれも ``states_no_user_value`` / ``carries_no_assertion`` が
+            # 正しく真を返しており、落ちていたのは pin 免除だけ。本物のファクトは
+            # 1〜6 回しか載らず、予算を問いに食われていた。
+            # ノート自体は残るので履歴検索からは従来どおり引ける。
+            if carries_no_assertion(getattr(note, "content", "")):
                 filtered_out += 1
                 continue
             # 依頼だけのノートも同じ理由で ``(過去の記録)`` に載せない。
@@ -766,7 +872,8 @@ class MemoryInjector:
             # ください。」など **過去のユーザーの依頼文** が (過去の記録) として
             # 並んでいた。依頼は事実を含まないので根拠にならず、本物のファクトを
             # 予算から押し出す。ノート自体は残るので履歴検索からは引ける。
-            if not pinned and states_no_user_value(getattr(note, "content", "")):
+            # pin を例外にしない理由は上の ``carries_no_assertion`` と同じ。
+            if states_no_user_value(getattr(note, "content", "")):
                 filtered_out += 1
                 continue
             # アシスタント自身の発話は ``(過去の記録)`` の根拠にしない。
@@ -884,11 +991,13 @@ class MemoryInjector:
         logger.debug(
             "MemoryInjector.inject: mode=%s budget=%d used=%d items=%d "
             "dropped=%d project=%s sigs=%d relevance=%s filtered=%d "
-            "near_dup=%d asked_attrs=%s attr_exempt=%d retired=%d",
+            "near_dup=%d asked_attrs=%s attr_exempt=%d anchors=%s "
+            "anchor_exempt=%d retired=%d",
             mode, budget, plan.used_tokens, len(plan.items),
             len(plan.dropped), current_project_id, len(sigs),
             "on" if query_vec is not None else "off", filtered_out,
             dedup_dropped, sorted(asked_attrs) or "-", attr_exempt,
+            sorted(anchors) or "-", anchor_exempt,
             retired_dropped,
         )
         if retired_dropped:
