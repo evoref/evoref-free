@@ -44,18 +44,40 @@ embedding:
   # profile では設定せず config/schema 既定に委ねる (並列スロット分の KV が必要なため)。
   max_length: 8192
   # URL/コマンドリコールの sim 閾値 (embed 切替時 config.yaml tools.* へ転写)。Qwen3-Embedding
-  # は instruction-aware で正例 sim が高め (0.6-0.8) のため既定の 0.7。LFM2.5 からの戻し時に
-  # tools.* を 0.7 へ復元する。
+  # ── 実測較正 (2026-08-30) ─────────────────────────────────────
+  # 3 モデル (LFM2.5-Embedding-350M / Qwen3-Embedding-0.6B / BGE-M3) を
+  # **同一データ・同一手順** で測って導いた。測定対象はコード上の実際の
+  # 比較対象に合わせてある:
+  #
+  #   url / executable_command … クエリ ↔ 保存済み話題
+  #   note_link / conflict      … STM ノート ↔ ノート
+  #   min_merge                 … 同上 (LLM 統合を行う上位の閾値)
+  #   attribute_similarity      … 同一 (subject,predicate) 内のファクト object 同士
+  #   cartridge_gate            … クエリ ↔ カートリッジ **重心**
+  #
+  # 閾値はゲートごとのコスト非対称性で選定した。外部作用を伴うもの
+  # (URL 取得 / コマンド実行 / 誤マージ / 偽の競合) は **誤検出 0** を要求し、
+  # コストが余分な検索・LLM 呼び出しに留まるものは取りこぼしを減らす側へ寄せた。
+  #
+  # データは合成セット (話題 8 / 正例 13-14 / 雑音 20、ノート対 10+12、
+  # ファクト対 8+10、カートリッジ 3 x 6 チャンク)。実ストアではない点に注意。
+  #
+  # ⚠ 再較正でこの値を変えるときは scripts/tests/test_launch_llama_profiles.py の
+  #   _CALIBRATED_THRESHOLDS も同じコミットで更新すること (更新漏れは同テストが検知する)。
   recall:
-    url_recall_min_score: 0.7
-    executable_command_recall_min_score: 0.7
-  # コサインを絶対値で比べる閾値 (config の memory.* / rag.* へ転写)。
-  # 2026-08-30 実測: 真の競合 0.418-0.812 / 偽の競合 0.185-0.336、
-  # 関連ノート 0.333-0.615 / 無関係ノート 0.184-0.329。
-  # 現行既定 (note_link 0.5 / attribute 0.55) は誤検出 0 で機能するため据え置き。
+    # 5/14 通過・誤検出 0/20
+    url_recall_min_score: 0.76
+    # 10/13 通過・誤検出 0/20
+    executable_command_recall_min_score: 0.6
   memory:
-    note_link_threshold: 0.5
-    conflict_similarity_threshold: 0.85
+    # 10/10 通過・誤検出 0/12
+    note_link_threshold: 0.35
+    # 10/10 通過・誤検出 0/22
+    conflict_similarity_threshold: 0.69
+    # 10/10 通過・誤検出 0/22
+    min_merge_similarity: 0.69
+    # 7/8 通過・誤検出 0/10
     attribute_similarity_threshold: 0.55
   rag:
-    cartridge_gate_threshold: 0.45
+    # 9/9 通過・誤検出 0/8
+    cartridge_gate_threshold: 0.49

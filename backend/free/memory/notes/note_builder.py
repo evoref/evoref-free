@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 import threading
+from functools import lru_cache
 import time
 import unicodedata
 from pathlib import Path
@@ -159,6 +160,37 @@ def restates_attribute_value(
         ) is not None
         for fact_type in _ATTRIBUTE_FACT_TYPES
     )
+
+
+#: **ユーザー自身の属性** を表す fact_type。
+#: (``extractors.chat._USER_SUBJECT_TAGS`` と同じ集合。tag 語彙はこちらが持つ)
+_USER_SUBJECT_FACT_TAGS: frozenset[str] = frozenset(
+    {"personal_fact", "preference", "emotion", "opinion"},
+)
+
+
+def _drop_user_subject_tags_from_assistant(
+    tags: list[str], source: str | None,
+) -> list[str]:
+    """アシスタント発話から **ユーザー自身の属性** タグを外す (純粋関数)。
+
+    ユーザーの属性を主張できるのはユーザーだけ。アシスタントの発話に
+    ``personal_fact`` 等が付くと、モデルが口にしただけの値が「過去の記録」
+    として STM から再注入され、さらに sleep-time が SemMem の現在値へ
+    昇格させる。
+
+    実インシデント (2026-08-31 ライブ監査 T06#3): 「私の誕生日を当ててみて。」
+    に **「誕生日は1995年4月12日です。」** と答え (ユーザーは一度も誕生日を
+    述べていない)、その発話が ``source=assistant`` / ``tags=['personal_fact']``
+    の STM ノートとして保存された。以後この捏造値がユーザーの誕生日として
+    想起される。
+
+    アシスタントがユーザーの申告を復唱した場合もタグは落ちるが、**同じ内容は
+    ユーザー自身のターンから既に抽出されている** ので失うものは無い。
+    """
+    if source != "assistant" or not tags:
+        return tags
+    return [t for t in tags if t not in _USER_SUBJECT_FACT_TAGS]
 
 
 #: 同梱 default で期待される fact_type 集合 (mode 別)
@@ -376,6 +408,41 @@ def _possessor_is_self(haystack: str, start: int) -> bool:
     return topic is None or topic in _SELF_NOUNS
 
 
+@lru_cache(maxsize=4096)
+def _trigger_variants(word: str) -> tuple[str, ...]:
+    """trigger 語とその並列形 (``AttributeSpec._variants`` の説明を参照)。
+
+    trigger 語は YAML 由来で種類が少なく、属性解決はノート × fact_type の
+    二重ループで何度も回るため結果をキャッシュする (毎回組み直すと
+    ``backend/free/memory`` のテストが 249s → 600s 超に落ちた)。
+    """
+    if word.endswith(_COPULA_SUFFIX) and len(word) > len(_COPULA_SUFFIX):
+        # 「<役割>です」は「<役割>をしています」等とも言う。実インシデント
+        # (2026-08-31 ライブ監査): 「医療機器メーカーで組込みエンジニアを
+        # しています。」から occupation が 1 件も作られず、新セッションの
+        # 「私の職業は？」に答えられなかった (trigger は ``エンジニアです`` のみ)。
+        stem = word[: -len(_COPULA_SUFFIX)]
+        return (word, *(stem + v for v in _COPULA_ACTIVITY_FORMS))
+    if len(word) < 2 or word[-1] not in _TOPIC_PARTICLES:
+        return (word,)
+    stem = word[:-1]
+    return (word, *(stem + c for c in _ENUMERATION_CONNECTORS))
+
+
+#: 属性 trigger の末尾に付く話題・格助詞。語幹を切り出す判定に使う。
+_TOPIC_PARTICLES: frozenset[str] = frozenset({"は", "が", "を"})
+#: 属性を並べるときに助詞の代わりに入る連結詞
+#: (``AttributeSpec._variants`` の説明を参照)。
+_ENUMERATION_CONNECTORS: tuple[str, ...] = ("と", "や", "、", ",", "・")
+#: 「<役割>です」形の trigger の語尾。
+_COPULA_SUFFIX = "です"
+#: ``<役割>です`` と同じ属性を指す「〜している」系の言い回し。
+_COPULA_ACTIVITY_FORMS: tuple[str, ...] = (
+    "をしています", "をしている", "をやっています", "をやっている",
+    "として働", "を務めて",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class AttributeSpec:
     """``fact_attributes.yaml`` の 1 スロット。
@@ -427,28 +494,74 @@ class AttributeSpec:
     #: 見ないため、文をまたいだ暗黙の所有者は落とせない。重複 live のままなら
     #: injector の collapse が選ぶだけで、正しい値が消えることはない。
     #:
-    #: 現在の宣言は ``location`` / ``origin`` / ``occupation`` の 3 つだけ
+    #: 現在の宣言は ``location`` / ``origin`` / ``occupation`` /
+    #: ``preference.editor`` の 4 つだけ
     #: (範囲は ``TestSingleValuedSlotDeclaration`` が固定している)。
     single_valued: bool = False
 
+    def _variants(self, word: str) -> tuple[str, ...]:
+        """``word`` と、その **並列形** を返す。
+
+        属性の trigger は「名前**は**」「名前**が**」のように助詞で終わるものが
+        多い。ところが日本語で属性を並べると助詞は連結詞に置き換わる::
+
+            「私の名前は？」            → 名前は  … 一致
+            「私の名前と職業は？」      → 名前と  … **どの trigger にも一致しない**
+
+        その結果 **並べられた属性は、最後の 1 つ以外すべて失われる**。読み出し側
+        では尋ねた属性が解決できず、その属性のファクトはコサインの棒を免除
+        されないまま落ちる (``pipeline.injector._asked_attributes``)。
+
+        実インシデント (2026-08-31 ライブ監査 t20#1): 「私の名前と職業を教えて
+        ください。」に **「記載がありません」**。``mem.personal.name`` は live で
+        在ったのに ``asked_attrs=['occupation']`` で name が免除されなかった。
+        同 2026-08-30 の検証 V4「私の名前、住所、職業、ペットをもう一度。」も
+        同じ形で occupation だけが解決していた。
+
+        語彙を足す対処 (``名前と`` を trigger に追加) は並びの数だけ漏れるので、
+        **trigger の構造** から並列形を導く: 助詞で終わる trigger は、その語幹 +
+        連結詞も同じ属性を指す。
+        """
+        return _trigger_variants(word)
+
     def match(self, haystack: str) -> tuple[str, ...]:
-        """``haystack`` に一致した trigger 語を返す (無ければ空タプル)。"""
+        """``haystack`` に **実際に現れた** trigger 語形を返す (無ければ空タプル)。
+
+        返すのは YAML の原語ではなく :meth:`_variants` が導いた **一致した
+        語形そのもの**。抽出側はこの語を ``in`` で本文に当てて根拠文を絞る
+        (:func:`~backend.free.memory.extractors.chat._attribute_evidence_text`)
+        ため、本文に無い原語を返すと **絞り込みが必ず空振りし、発話全文が
+        object になる**。
+
+        実インシデント (2026-08-31 ライブ監査 T01#1):
+        「はじめまして。私は佐藤健一といいます。名古屋市中区に住んでいて、
+        精密機械メーカーで生産技術のエンジニアをしています。」から
+        ``mem.personal.occupation`` の object が **発話全文** になった。
+        occupation が一致したのは派生形 ``エンジニアをしています`` なのに、
+        返していたのは原語 ``エンジニアです`` で、本文のどの文にも含まれない。
+        """
         hit: list[str] = []
         for word in self.triggers:
             if not word:
                 continue
-            if not self.requires_self_possessor:
-                if word in haystack:
-                    hit.append(word)
-                continue
-            # 所有者ガード付きは **出現ごと** に判定する。1 つでも自己所有の
-            # 出現があれば一致 (「猫の名前はソラで、私の名前は小川です」)。
-            start = haystack.find(word)
-            while start != -1:
-                if _possessor_is_self(haystack, start):
-                    hit.append(word)
+            for variant in self._variants(word):
+                if not self.requires_self_possessor:
+                    if variant in haystack:
+                        hit.append(variant)
+                        break
+                    continue
+                # 所有者ガード付きは **出現ごと** に判定する。1 つでも自己所有の
+                # 出現があれば一致 (「猫の名前はソラで、私の名前は小川です」)。
+                start = haystack.find(variant)
+                matched = False
+                while start != -1:
+                    if _possessor_is_self(haystack, start):
+                        hit.append(variant)
+                        matched = True
+                        break
+                    start = haystack.find(variant, start + 1)
+                if matched:
                     break
-                start = haystack.find(word, start + 1)
         return tuple(hit)
 
 
@@ -561,8 +674,9 @@ def resolve_fact_attribute_match(
         return None, ()
     haystack = _normalize_trigger(text)
     for spec in ordered:
-        if spec.match(haystack):
-            return spec.slug, spec.triggers
+        matched = spec.match(haystack)
+        if matched:
+            return spec.slug, matched
     return None, ()
 
 
@@ -571,6 +685,14 @@ def resolve_fact_attribute_match(
 #: セッション上限 (``memory.facts.extraction_max_per_session``) を 1 発話で
 #: 食い潰さないための保険でもある。
 MAX_ATTRIBUTES_PER_TEXT = 3
+
+#: **読み出し側** の上限。書き込み側の保険 (ファクトを作りすぎない) は
+#: 読み出しには要らない — 尋ねられた属性を余分に免除しても、その属性の
+#: ファクトが無ければ何も注入されないだけで害が無い。逆に切ると
+#: 「私の名前、住所、職業、ペットをもう一度。」のような列挙で **後ろの属性が
+#: 免除されずコサインのゲートに落ちる** (2026-08-31: 住所を語彙に足した途端、
+#: 上限に当たって name が押し出された)。
+MAX_ASKED_ATTRIBUTES = 8
 
 
 def resolve_fact_attribute_matches(
@@ -608,8 +730,9 @@ def resolve_fact_attribute_matches(
     haystack = _normalize_trigger(text)
     out: list[tuple[str, tuple[str, ...]]] = []
     for spec in ordered:
-        if spec.match(haystack):
-            out.append((spec.slug, spec.triggers))
+        matched = spec.match(haystack)
+        if matched:
+            out.append((spec.slug, matched))
             if len(out) >= max(1, limit):
                 break
     return _reassign_name_to_owning_entity(out, haystack)
@@ -946,6 +1069,9 @@ class NoteBuilder:
             # ツール出力は候補抽出も行わない (sleep-time Extractor に流さない)
             candidate_tags = (
                 [] if is_tool_output else self.candidate_fact_tags(content)
+            )
+            candidate_tags = _drop_user_subject_tags_from_assistant(
+                candidate_tags, effective_source,
             )
 
         merged_tags = sorted(set(generic_tags + candidate_tags))

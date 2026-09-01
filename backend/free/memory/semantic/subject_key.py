@@ -201,9 +201,33 @@ class SubjectKey:
         )
 
 
+#: 属性を解決できなかった発話が落ちる汎用フォールバックの葉。
+#: ``extractors.chat`` が ``resolve_fact_attribute_matches`` で 0 件のときに使う。
+GENERIC_ATTRIBUTE = "user"
+
+
+def is_generic_subject(subject: str) -> bool:
+    """``mem.<kind>.user`` — 属性としての身元を持たない汎用スロットか。
+
+    汎用スロットは「分類できなかった発話」の置き場で、固有の属性を主張しない。
+    そのため訂正の宛先にもならず、``asked_attrs`` の免除にも掛からない。実質
+    その発話の **影** であり、影の元 (同じノートから起きた固有スロットの
+    ファクト) が supersede されたら一緒に畳む必要がある
+    (:meth:`SemanticFactStore._supersede_generic_shadows`)。
+    """
+    parts = (subject or "").split(".")
+    return (
+        len(parts) == 3
+        and parts[0] == "mem"
+        and parts[2] == GENERIC_ATTRIBUTE
+    )
+
+
 __all__ = [
     "ALL_PILLARS",
+    "GENERIC_ATTRIBUTE",
     "SubjectKey",
     "SubjectKeyError",
     "SubjectPillar",
+    "is_generic_subject",
 ]

@@ -63,6 +63,22 @@ TOOL_EXECUTION_TIMEOUT_SEC: float = 30.0
 #: 生成に 30〜60 秒かかるため、その 3 倍程度を確保する。
 LLM_TOOL_EXECUTION_TIMEOUT_SEC: float = 180.0
 
+#: 生成系ツール (summarize / translate / draft_document) の ``max_tokens``。
+#:
+#: **未指定にしてはいけない。** ``LocalClient.generate`` は ``max_tokens=None``
+#: のとき payload からキーごと落とすので、llama-server は n_ctx を使い切るまで
+#: 生成し続ける。上の実行タイムアウト (180 秒) と組み合わさると、遅い環境では
+#: **必ず** タイムアウトする — 待ち時間だけ掛かって根拠枠にはエラー文字列が載る。
+#:
+#: 実インシデント (2026-08-31 ライブ監査 T07#1): 「目次案を10章分作って」で
+#: ``draft_document`` が選ばれ ``max_tokens=None`` で発行 → 180 秒で
+#: ``Tool execution timed out`` → その後ベースモデルが自力で答えた。
+#: **タイムアウト分 (180 秒) がまるごと無駄** になった。
+#:
+#: 値は「タイムアウト内に必ず終わる」ことを優先して決める。実測の decode は
+#: 遅い環境で 5 tok/s 程度なので、180 秒なら 900 トークンが上限の目安。
+LLM_TOOL_MAX_TOKENS: int = 900
+
 #: ツール結果の最大文字数（超過分は先頭/末尾のみ残す）
 TOOL_RESULT_MAX_CHARS: int = 4096
 

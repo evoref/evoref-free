@@ -396,7 +396,17 @@ def _attribute_evidence_text(
         content, _SENTENCE_SPLIT_RE, attr_words, all_attr_words,
     )
     if narrowed:
-        return narrowed
+        # 文単位で絞れても、**残った文にまだ別属性の値が同居している** ことが
+        # ある。日本語は 1 文へ属性を読点で並べるのが普通なので、そのときは
+        # 節単位でもう一段絞る。
+        #
+        # 実インシデント (2026-08-31 ライブ監査 T01#1): 「名古屋市中区に
+        # 住んでいて、精密機械メーカーで生産技術のエンジニアをしています。」
+        # から ``mem.personal.location`` の object が **職業まで含んだ 1 文**
+        # になった。location を訂正しても職業側の値は別 subject なので
+        # supersede されず、陳腐化した職業が location の現在値として注入され
+        # 続ける (``_attribute_evidence_text`` が防ごうとしている形そのもの)。
+        return _narrow_further_by_clause(narrowed, attr_words, all_attr_words)
     # 文単位で分けられなかった。1 文へ複数属性を読点で並べた形
     # (「職業はデータベース管理者で、名古屋に住んでいます。」) は節単位なら
     # 分離できる。**他属性のトリガ語が渡っているときだけ** 試す — 単一属性の
@@ -407,6 +417,50 @@ def _attribute_evidence_text(
         content, _CLAUSE_SPLIT_RE, attr_words, all_attr_words,
     )
     return _CLAUSE_TAIL_RE.sub("", narrowed) if narrowed else ""
+
+
+def _narrow_further_by_clause(
+    narrowed: str, attr_words: tuple[str, ...], all_attr_words: tuple[str, ...],
+) -> str:
+    """文単位で絞った結果に他属性が残っていれば、節単位でもう一段絞る。
+
+    絞れなければ ``narrowed`` をそのまま返す (純粋関数)。単一属性しか無い
+    発話は :func:`_has_other_attribute_words` が偽になるので触らない。
+    """
+    if not _has_other_attribute_words(attr_words, all_attr_words):
+        return narrowed
+    others = tuple(w for w in all_attr_words if w not in set(attr_words))
+    if not _mentions_any(narrowed, others):
+        return narrowed
+    tighter = _narrow_by_units(
+        narrowed, _CLAUSE_SPLIT_RE, attr_words, all_attr_words,
+    )
+    if not tighter:
+        return narrowed
+    tighter = _CLAUSE_TAIL_RE.sub("", tighter)
+    return tighter or narrowed
+
+
+def _resolves_a_concrete_attribute(
+    content: str,
+    tags: list[str],
+    supported: frozenset[str] | set[str] | tuple[str, ...],
+    triggers_dir,
+) -> bool:
+    """``content`` が **いずれかのユーザー属性タグ** で具体スロットに着地するか。
+
+    汎用フォールバック (``mem.<kind>.user``) を出すかどうかの判定に使う
+    (純粋関数 — trigger 辞書はキャッシュ済み)。
+    """
+    for tag in tags:
+        if tag not in supported or tag not in _USER_SUBJECT_TAGS:
+            continue
+        matches = resolve_fact_attribute_matches(
+            content, tag, mode="chat", triggers_dir=triggers_dir,
+        )
+        if any(slug and slug != "user" for slug, _ in matches):
+            return True
+    return False
 
 
 def _has_other_attribute_words(
@@ -765,6 +819,27 @@ def _world_fact_subject_parts(keyword: str, content: str) -> tuple[str, str]:
 #: 含まれるため、スロットの決め手にしない。
 _VALUE_ANCHOR_MIN_CHARS = 2
 
+#: 値アンカーにしてはいけない語 — 訂正・変更を告げる言い回しそのもの。
+#:
+#: ファクトの ``object`` は値ではなく **発話まるごと** なので、訂正から作られた
+#: ファクトの現在値には「訂正」「変更」が内容語として入る。それをアンカーに
+#: すると、**以後のあらゆる訂正発話がそのスロットに吸い寄せられる** —
+#: 訂正は必ずこれらの語を含むからである。1 件の訂正がスロットを磁石に変え、
+#: 誤りが自己増幅する。
+#:
+#: 実データ (2026-08-30 ライブ監査): ``mem.personal.birthday`` の現在値が
+#: 「訂正します、私の誕生日は3月14日ではなく5月22日でした。」だったため、
+#: アンカーに「訂正」が生まれた。別セッションの
+#: 「すみません訂正です。デプロイ先は AWS ではなく GCP…」と
+#: 「インスタンスタイプも訂正で、t3.medium ではなく e2-standard-4 です。」が
+#: **どちらも birthday スロットへ書かれ**、互いを supersede して
+#: スロットの live が 0 件になった (:meth:`SemanticFactStore.supersede`)。
+#: 想起は訂正前の「3月14日」を返した。
+_CORRECTION_MARKER_ANCHORS = frozenset({
+    "訂正", "修正", "変更", "間違", "誤り", "正しく", "正しい",
+    "すみません", "ごめん", "失礼", "先ほど", "さっき",
+})
+
 
 def _value_anchors(value: str) -> tuple[str, ...]:
     """スロットの現在値から、照合に使う文字列を取り出す (純粋関数)。
@@ -781,7 +856,10 @@ def _value_anchors(value: str) -> tuple[str, ...]:
         「名古屋に住んでいます」        → ("名古屋に住んでいます", "名古屋")
         「職業はデータベース管理者」    → (..., "職業", "データベース管理者")
 
-    命題そのものも候補に残す (値がひらがなだけの場合の保険)。
+    訂正を告げる語 (:data:`_CORRECTION_MARKER_ANCHORS`) は値ではないので
+    除く。命題そのものも候補に残す (値がひらがなだけの場合の保険) が、
+    それが訂正の言い回しで始まる場合は他の訂正へ当たらないので害は無い
+    (全文一致は事実上起きない)。
     """
     text = (value or "").strip()
     if len(text) < _VALUE_ANCHOR_MIN_CHARS:
@@ -790,6 +868,7 @@ def _value_anchors(value: str) -> tuple[str, ...]:
     anchors.extend(
         run for run in _CONTENT_RUN_RE.findall(text)
         if len(run) >= _VALUE_ANCHOR_MIN_CHARS
+        and run not in _CORRECTION_MARKER_ANCHORS
     )
     return tuple(dict.fromkeys(anchors))
 
@@ -1080,12 +1159,26 @@ class ChatExtractor(BaseExtractor):
                         # 継承も効かないときは、訂正文が名指した既存スロットの
                         # 現在値から決める (value_anchored)。継承より後に置くのは
                         # 「直前の言明」の方が近い文脈だから。
-                        matches = [(
+                        destination = (
                             inherited.get((note.id, tag))
                             or value_anchored.get((note.id, tag))
-                            or "user",
-                            (),
-                        )]
+                        )
+                        if destination is None and _resolves_a_concrete_attribute(
+                            content, tags, self.SUPPORTED_TAGS,
+                            self._builder.triggers_dir,
+                        ):
+                            # 同じ発話が別のタグで **具体スロット** に着地して
+                            # いるなら、汎用フォールバック (``user``) の行は
+                            # 同じ本文の影にしかならない。訂正はその具体スロット
+                            # へ入るので、影は supersede されず永久に live で
+                            # 残る (MEMORY: 汎用スロットの影)。
+                            #
+                            # 実測 (2026-08-31 ライブ監査 T02、実ストア):
+                            # 「私の愛用しているエディタは Vim です。」が
+                            # ``mem.preference.tooling`` と
+                            # ``mem.personal.user`` の **両方** に live で入った。
+                            continue
+                        matches = [(destination or "user", ())]
                     # 「属性語を含まない文は直前の属性文に属する」判定に、
                     # この発話で解決した全属性のトリガ語を渡す
                     # (詳細は _attribute_evidence_text の docstring)。

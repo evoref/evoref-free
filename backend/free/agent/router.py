@@ -26,6 +26,7 @@ from backend.free.core.intent_vocab import (
     PREMISE_CONFIRMATION_RE,
 )
 from backend.free.core.session_mode import is_chat_mode, is_create_mode
+from backend.free.core.text_quality import count_belongs_to_another_subject
 from backend.free.document_nouns import (
     DOCUMENT_NOUN_LEARNABLE_JA,
     DOCUMENT_NOUNS_NEEDS_SUFFIX,
@@ -54,9 +55,20 @@ LONG_FORM_PATTERNS = [
     # content_detector.py (EvorefGen) の TEXT_PATTERNS と共有する。router は
     # 常にサフィックス必須で運用するため、名詞単体マッチ許容語彙
     # (DOCUMENT_NOUNS_STANDALONE) もここではサフィックス必須の安全側で使う。
+    # サフィックスの ``書`` は「〜を書いて」の動詞を拾うためのもの。**書式語の
+    # 中の「書」に当ててはいけない** — 「箇条書き」は長さではなく **形式** の
+    # 指定で、むしろ短い一覧を求めるいちばん強いシグナルなのに、
+    # ``(文書名詞).*(書)`` が「チェックリストを箇条書」に一致して長文生成へ
+    # 振っていた。
+    #
+    # 実インシデント (2026-08-31 ライブ監査 T11#4):
+    # 「装置立ち上げのチェックリストを箇条書きで7項目。」が cogwriter へ回り、
+    # 127 秒かけて **箇条書きゼロの散文** を返した (backend.log に
+    # ``Turn marked failed (asked for a bullet list but the answer has no
+    # list items)``)。
     re.compile(
         rf"({'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX + DOCUMENT_NOUNS_STANDALONE)})"
-        r".*(書|作成|生成|まとめ|出力)",
+        r".*((?<!箇条)(?<!横)(?<!縦)書|作成|生成|まとめ|出力)",
     ),
     # 「長文」「長編」の言及、または「長い」+ 創作文書系名詞 (物語/小説等、
     # pattern[1] の文書名詞リストには含まれない) の言及が、生成依頼のて形
@@ -738,12 +750,22 @@ def requests_long_output(query: str) -> bool:
 
     単位ごとの閾値以上を 1 つでも指定していれば True。分量指定が無い、
     または閾値未満なら False (他の long_form シグナルの判定へ委ねる)。
+
+    **応答以外の対象に付いた数量は分量指定ではない**
+    (:func:`count_belongs_to_another_subject`)。実インシデント
+    (2026-08-31 ライブ監査 T05#2): 「2つ目は、1ファイルの行数を500行以内に
+    することです。」というコーディング規約の申告が ``500行`` で long_form に
+    振られ、**「どのような内容・主題の文書をご希望ですか？」** と返した。
     """
     for regex in (_LENGTH_REQUEST_RE, _LENGTH_REQUEST_RE_EN):
-        for amount, unit in regex.findall(query):
+        for m in regex.finditer(query):
+            amount, unit = m.group(1), m.group(2)
             threshold = _LONG_FORM_MIN_BY_UNIT.get(unit.lower())
-            if threshold is not None and int(amount) >= threshold:
-                return True
+            if threshold is None or int(amount) < threshold:
+                continue
+            if count_belongs_to_another_subject(query[: m.start()]):
+                continue
+            return True
     return False
 
 
@@ -762,10 +784,15 @@ def requests_short_output(query: str) -> bool:
     「October 25th」を捏造した。
     """
     for regex in (_ANY_LENGTH_REQUEST_RE, _ANY_LENGTH_REQUEST_RE_EN):
-        for amount, unit in regex.findall(query):
+        for m in regex.finditer(query):
+            amount, unit = m.group(1), m.group(2)
             cap = _SHORT_FORM_MAX_BY_UNIT.get(unit.lower())
-            if cap is not None and int(amount) <= cap:
-                return True
+            if cap is None or int(amount) > cap:
+                continue
+            # 長文側と同じ帰属判定を通す (片方だけ直すと非対称になる)。
+            if count_belongs_to_another_subject(query[: m.start()]):
+                continue
+            return True
     return False
 
 
@@ -1039,6 +1066,30 @@ _ARTIFACT_QUESTION_RE = re.compile(
 )
 
 
+#: ユーザー **自身の** 予定・約束の申告。生成依頼ではないので長文生成から外す。
+#:
+#: 実インシデント (2026-08-30 ライブ監査 T11#4): 「来週までにアーキテクチャ
+#: 設計書を書くと約束しました。」が meta_cognitive (long_form) へ振られ、
+#: **693 秒 (11.5 分)** かけて 577 トークンの一般論エッセイを生成した。同じ
+#: テーマの他の申告 (「締切は9月30日です」「チームは4人です」) はすべて 1 行の
+#: 復唱で返っている。``設計書`` + ``書`` が ``LONG_FORM_PATTERNS[0]`` に当たる。
+#:
+#: 依頼と申告を分けるのは ``_ARTIFACT_QUESTION_RE`` と同じく **文末の形**。
+#: 語彙 (設計書 / レポート …) では分けられない。引用節 (「〜と約束しました」)
+#: や予定の言い切りが文の終わりに来ていれば、それは報告であって依頼ではない。
+#: 文末に錨を打つので「レポートを書くと言ったよね、書いてくれる？」のように
+#: 後ろに本物の依頼が続くクエリは除外されない。
+_SELF_COMMITMENT_REPORT_RE = re.compile(
+    r"(?:"
+    r"と(?:約束|宣言|明言|報告|連絡)(?:を)?し(?:まし)?た"
+    r"|と(?:言い|伝え|話し|決め)(?:まし)?た"
+    r"|ことに(?:なり|し)(?:まし)?た"
+    r"|(?:予定|つもり)(?:です|だ|でした)"
+    r")"
+    r"[。．.、,！!\s\"'」』）)]*$",
+)
+
+
 class ComplexityClassifier:
     """クエリの複雑度を分類し、適切なエージェント層を決定する
 
@@ -1285,6 +1336,10 @@ class ComplexityClassifier:
         # 「計画書」「出力」という語で長文生成候補になり、meta_cognitive が
         # 新規の文書生成依頼として受けてしまう。文末が問いなら生成しない。
         if _ARTIFACT_QUESTION_RE.search(query):
+            return False
+        # ユーザー自身の予定・約束の申告も依頼ではない
+        # (``_SELF_COMMITMENT_REPORT_RE`` のコメント参照)。
+        if _SELF_COMMITMENT_REPORT_RE.search(query):
             return False
         # 「さきほどの表で上書きして」型も同じ。書くべき本文は会話にあり、
         # 生成する対象が無い (_PRIOR_ARTIFACT_REF_RE のコメント参照)。

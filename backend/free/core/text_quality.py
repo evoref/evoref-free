@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
 
 #: 日本語の語間に混じった空白。
 #:
@@ -731,12 +731,29 @@ _REQUEST_ENDING_RE = re.compile(
     # **その問いの答えを、問うた瞬間に破壊していた**。実機の回答は
     # 「あなたの職業は会社員です」「飼っているペットは、猫です」(いずれも捏造)。
     # 文末アンカーなので「もう一度確認しました。」のような言明は掛からない。
+    # 依頼動詞の列挙は **また漏れた**。実インシデント (2026-08-31 ライブ監査、
+    # 実ストアで確認): 「私の誕生日を当ててみて。」が
+    # ``mem.personal.birthday states: 私の誕生日を当ててみて。`` として live に
+    # なった (``当ててみて`` はどの語にも当たらない)。この docstring 自身が
+    # 「語彙列挙は必ず漏れる」と 3 回書いている。
+    #
+    # 語を足す代わりに **形** で取る: 文が「て形の動詞」で終わっていれば依頼。
+    # 日本語の平叙文はて形で終わらない (て形は必ず後続節へ繋がる)。
+    # 条件を 2 つ課して言明を巻き込まないようにする:
+    #
+    # - 直前が **活用語尾のひらがな** であること。「すべて。」「全て。」
+    #   「初めて。」のような名詞・副詞を除く。
+    # - 終端の句読点に **読点を含めない**。「名古屋市中区に住んでいて、」は
+    #   節の途中であって依頼ではない (根拠文の絞り込みが節を残す形と衝突する)。
     r"(?:ください|下さい"
     r"|(?:して|で)(?:ほしい|欲しい)"
     r"|お願いします|願います"
     r"|もう一度|もう1度|もういちど|再度"
     r"|(?:教え|挙げ|見せ|出し|作っ|書い|説明し|列挙し|示し)て)"
-    r"[。．.、,！!\s\"'」』）)]*\s*$",
+    r"[。．.、,！!\s\"'」』）)]*\s*$"
+    # ``べ`` は ``すべて`` (副詞) と衝突するので、その 1 語だけ手前で外す。
+    r"|(?:[いえきぎしちにびみりっん]|(?<!す)べ)[てで]"
+    r"[。．.！!\s\"'」』）)]*\s*$",
 )
 
 #: 一人称マーカー。依頼形でもこれを伴う文は本人の事実表明を含みうるため
@@ -885,10 +902,76 @@ __all__ = [
     "violates_output_form",
     "has_verifiable_output_constraint",
     "length_disclosure_note",
+    "count_belongs_to_another_subject",
     "match_word_limit",
     "count_response_words",
     "violates_word_count",
+    "claimed_written_files",
+    "unwritten_file_claims",
+    "unwritten_file_disclosure_note",
 ]
+
+#: 「<パス> に書き込みました」型の主張。**実際に書けたか** は別途 file system で
+#: 確かめる (下記 :func:`unwritten_file_claims`)。
+#:
+#: 拡張子を持つトークンだけを対象にする。「メモに保存しました」のような対象が
+#: ファイルでない言い回しを拾わないための境界。
+_WRITE_CLAIM_RE = re.compile(
+    r"(?P<path>(?:[A-Za-z]:[\\/])?[^\s、。「」『』（）()\[\]]*"
+    r"[A-Za-z0-9_\-぀-ヿ一-鿿][.][A-Za-z0-9]{1,8})"
+    r"\s*(?:[へに]|に対して)\s*"
+    r"(?:[^\s、。]{0,8})?"
+    r"(?:書き込|書き出|書きだ|保存|出力|作成|生成|エクスポート|セーブ)"
+    r"(?:み|し|きま)?(?:ました|ます|た|できました)",
+)
+
+
+def claimed_written_files(response: str) -> list[str]:
+    """応答が「書き込んだ」と述べているファイルパスを出現順に返す (純粋関数)。"""
+    out: list[str] = []
+    for m in _WRITE_CLAIM_RE.finditer(response or ""):
+        path = m.group("path").strip()
+        if path and path not in out:
+            out.append(path)
+    return out
+
+
+def unwritten_file_claims(response: str, exists: "Callable[[str], bool]") -> list[str]:
+    """主張されたのに **存在しない** ファイルパスを返す (純粋関数)。
+
+    ``exists`` はパス文字列の実在判定 (呼出側が file system を注入する)。
+
+    実インシデント (2026-08-30 ライブ監査 T17-6): 「CSV形式で、名前と年齢の
+    3件のサンプルデータをファイルに出してください。」に
+    **「sample_data.csv に書き込みました。」** と答えたが、その턴では書込み
+    ツールが 1 度も実行されておらず (backend.log に Executing tool の行が無い)、
+    ファイルも存在しなかった。次のターンの read_file は
+    ``File not found: sample_data.csv`` で失敗している。
+
+    ツール実行の有無ではなく **実体の有無** で判定する。長文生成や
+    meta_cognitive の計画経路など、書込みが成立する経路は複数あり、層ごとに
+    「書いたか」を集めると取りこぼす。同ターンに実体があれば主張は正しい。
+    """
+    return [
+        path for path in claimed_written_files(response)
+        if not exists(path)
+    ]
+
+
+def unwritten_file_disclosure_note(paths: "Sequence[str]") -> str:
+    """存在しないファイルを主張したときに末尾へ足す開示文 (純粋関数)。
+
+    黙って出すと「保存できたつもり」でユーザーが離れる。長さ制約の開示
+    (:func:`length_disclosure_note`) と同じ扱いで、本文の外ではなく末尾注記に
+    する (``strip_system_notes`` が記憶へ積む前に落とすので履歴は汚れない)。
+    """
+    if not paths:
+        return ""
+    listed = "、".join(paths)
+    return (
+        f"\n\n(注: {listed} は実際には作成されていません。"
+        f"書き込みは行われませんでした)"
+    )
 
 #: 応答の途中で自分の結論を撤回する言い回し。1 つの応答に結論が 2 つ入る。
 #:
@@ -1403,6 +1486,42 @@ _LINE_COUNT_REFERENCE_HEAD = (
     "その", "この", "あの", "先ほどの", "さっきの", "上の", "上記の", "先の",
 )
 
+#: 「<X>の行数を N 行以内」の <X>。ここが応答を指す語なら今回の出力への指定、
+#: そうでなければ **別の対象についての規約** を述べているだけ。
+_COUNT_SUBJECT_RE = re.compile(
+    r"([^\s、。,.]{1,12})の(?:行数|行の数|文字数|字数|文字量|長さ|サイズ)を?$",
+)
+#: 応答そのものを指す語。ここに載る語が主語なら分量指定として扱う。
+_REPLY_SUBJECT_WORDS = frozenset({
+    "回答", "答え", "返答", "応答", "出力", "本文", "文章", "説明", "記事",
+    "要約", "text", "レス", "返事", "それ", "これ",
+})
+
+
+def count_belongs_to_another_subject(head: str) -> bool:
+    """数量指定の直前 (``head``) を見て、その数量が **応答以外** の属性か。
+
+    「1ファイルの行数を500行以内にする」の ``500行`` はファイルについての規約で、
+    今回の応答を 500 行にしろという依頼ではない。いっぽう「回答の行数を3行以内に」
+    は応答への指定なので拾う。判定は帰属先の語だけで決まる。
+
+    **この判定は 2 箇所が必要とする** — 制約検証 (:func:`match_line_count`) と
+    router の分量判定 (``agent.router.requests_long_output`` /
+    ``requests_short_output``)。同じ関係を 2 実装に分けると片方だけ直る
+    (本リポジトリで繰り返し起きている「食い違った複製」)。ここを唯一の出所とする。
+
+    実インシデント:
+
+    - 2026-08-30 ライブ監査 T04#2: 「関数の行数を50行以内に収めることです。」への
+      承諾 1 文に ``(注: 50 行の指定に対し、上の回答は 1 行です)`` が付いた
+      (検証側で発生)。
+    - 2026-08-31 ライブ監査 T05#2: 「1ファイルの行数を500行以内にすることです。」が
+      **long_form へ振られ**、``どのような内容・主題の文書をご希望ですか？`` と
+      返した (router 側で発生 — 検証側だけ直していたため残っていた)。
+    """
+    subject = _COUNT_SUBJECT_RE.search(head or "")
+    return bool(subject) and subject.group(1).lower() not in _REPLY_SUBJECT_WORDS
+
 
 def match_line_count(text: str) -> int:
     """発話中の行数指定を返す (純粋関数)。無ければ ``0``。
@@ -1413,6 +1532,13 @@ def match_line_count(text: str) -> int:
     ターンに `(注: 3 行の指定に対し、上の回答は 1 行です)` という **偽の違反
     注記** が付いた (2026-08-29 ライブ監査 T04#4)。序数 (「2 行目」) も同様に
     行数の指定ではない。
+
+    **他人の行数も指定ではない。** 「2つ目の基準は、関数の行数を50行以内に
+    収めることです。」はコードレビュー規約の申告であって、応答を 50 行にしろ
+    という依頼ではない。ここを拾ったため、承諾の 1 文に
+    `(注: 上の回答は 30 文字です。50 行の指定に対し、上の回答は 1 行です)` と
+    いう二重の偽注記が付いた (2026-08-30 ライブ監査 T04#2)。行数の帰属先が
+    応答を指す語 (:data:`_REPLY_SUBJECT_WORDS`) でなければ指定ではない。
     """
     src = text or ""
     for m in LINE_COUNT_RE.finditer(src):
@@ -1424,6 +1550,8 @@ def match_line_count(text: str) -> int:
             continue
         head = src[: m.start()]
         if head.endswith(_LINE_COUNT_REFERENCE_HEAD):
+            continue
+        if count_belongs_to_another_subject(head):
             continue
         raw = m.group(1).translate(_FULLWIDTH_DIGITS)
         if raw.isdigit() and int(raw) > 0:

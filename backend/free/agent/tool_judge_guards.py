@@ -31,6 +31,7 @@ from backend.free.agent.tool_judge_grounding import _ungrounded_numbers
 from backend.free.agent.tool_judge_history import (
     _has_history_recall_keywords,
     _only_proximal_recall_keywords,
+    asks_about_past_conversation,
 )
 from backend.free.agent.tool_judge_signals import (
     _IMMEDIATE_CHILDREN_RE,
@@ -39,7 +40,11 @@ from backend.free.agent.tool_judge_signals import (
 )
 from backend.free.agent.tool_judge_types import ToolJudgement
 from backend.free.agent.tools_registry import ToolDefinition, ToolsRegistry
-from backend.free.core.intent_vocab import looks_like_numeric_question
+from backend.free.core.intent_vocab import (
+    excludes_current_conversation,
+    has_long_range_recall_keyword,
+    looks_like_numeric_question,
+)
 from backend.log_config import get_logger
 
 logger = get_logger("agent.tool_call_judge")
@@ -132,6 +137,54 @@ def _suppress_proximal_recall_cross_session(
         "Suppressing search_history: proximal recall word refers to the "
         "ongoing session, which is excluded from the search: %s",
         ctx.query[:50],
+    )
+    return ToolJudgement(tool_needed=False, source=result.source)
+
+
+def _suppress_unjustified_cross_session_search(
+    result: ToolJudgement, ctx: GuardContext,
+) -> ToolJudgement:
+    """過去セッションを指す根拠が 1 つも無い除外検索を撃たせない。
+
+    ``search_history`` は ``exclude_session_id`` で **現在セッションを除外** して
+    検索する。だから「いま話したこと」を尋ねるクエリで撃つと、答えのある場所を
+    避けて探すことになり構造的に当たらない。
+
+    :func:`_suppress_proximal_recall_cross_session` は「さっき」等の近接リコール語
+    が **在る** ことを根拠に抑止するが、実測で空振りしたクエリの大半は履歴参照語を
+    **1 つも持たない** ため素通りしていた。実測 (2026-08-31 ライブ監査、
+    search_history 11 回中 7 回が空振り)::
+
+        規約を2つとも復唱してください。
+        保存したファイルのフルパスを教えてください。
+        その記事の見出しだけを列挙してください。
+        予算とチーム人数をまとめて教えてください。
+
+    どれも直前数ターンで述べられた内容で、他セッションには無い。コストは検索
+    自体ではなく **分類器 15 秒** (:meth:`_suppress_redundant_history_search` の
+    実測) なので、撃つ前に落とす必要がある。
+
+    抑止しないのは「過去セッションを指す語がある」か「過去の会話そのものを
+    尋ねている」場合。2026-08-29 / 08-30 の捏造インシデント
+    (「いつ、どんな話をしましたか。」→ 実在しない日時を断定) はどちらもこの
+    条件に当たるので、履歴検索は従来どおり撃たれる。
+    """
+    if result.tool_name != "search_history" or not result.tool_needed:
+        return result
+    if not (result.tool_args or {}).get("exclude_session_id"):
+        # 現在セッションを含む検索は当たりうるので触らない。
+        return result
+    if has_long_range_recall_keyword(ctx.query):
+        return result
+    if asks_about_past_conversation(ctx.query):
+        return result
+    if excludes_current_conversation(ctx.query):
+        # 「この会話とは別に」は探す先が外だと明示している。
+        return result
+    logger.debug(
+        "Suppressing search_history: nothing in the query points at another "
+        "session, and the current one is excluded from the search: %s",
+        ctx.query[:60],
     )
     return ToolJudgement(tool_needed=False, source=result.source)
 
@@ -679,6 +732,10 @@ GUARD_PIPELINE: tuple[GuardSpec, ...] = (
     GuardSpec(
         "computable_recall_excluded_session",
         _suppress_computable_recall_cross_session,
+    ),
+    GuardSpec(
+        "unjustified_excluded_session_search",
+        _suppress_unjustified_cross_session_search,
     ),
     GuardSpec("truncated_text_operand", _restore_truncated_text_operand, _aux_only),
     GuardSpec("ungrounded_calculate", _suppress_ungrounded_calculate, _aux_only),

@@ -503,11 +503,20 @@ def record_response(
     rag_used: bool = False,
     rag_top1_score: float | None = None,
     action_blocked: bool | None = None,
+    sent_messages: list[ChatMessage] | None = None,
 ) -> None:
     """応答をメモリ・デバッグログ・経験バッファに記録する
 
     ``private=True`` の場合は WM/STM までの伝搬のみ行い
     会話履歴ディスク永続化と feedback collector への記録をスキップする。
+
+    ``sent_messages`` は **実際に llama-server へ送った** メッセージ配列。
+    ``messages`` は ``build_messages()`` 直後の配列で、``DeliberativeAgent``
+    には ``list(messages)`` の浅いコピーが渡るため、``## ツール実行結果`` や
+    リマインダーを積んだ後の姿は入っていない。--develop=evolve の
+    ``requests`` JSONL は「プロンプト起因の不具合をログから追う」ためのもの
+    なので、送信版がある場合はそちらを記録する (2026-08-30 ライブ監査:
+    ツール接地ターンの根拠ブロックがログから丸ごと欠けていた)。
 
     ``tool_command`` / ``tool_command_name`` / ``tool_command_success`` は
     run_command 実行ターンの learning メタで、assistant note に載せて
@@ -540,7 +549,9 @@ def record_response(
     # デバッグログ
     dl = state.debug_logger
     if dl:
-        dl.log_request(tokens_generated, messages, full_response)
+        dl.log_request(
+            tokens_generated, sent_messages or messages, full_response,
+        )
 
     # 経験バッファに記録 (Level 0) — private は学習対象外
     fc = state.feedback_collector

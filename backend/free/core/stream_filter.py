@@ -828,3 +828,66 @@ class LengthDisclosureFilter:
         from backend.free.core.text_quality import length_disclosure_note
 
         return length_disclosure_note(self._query, response)
+
+
+class UnwrittenFileClaimFilter:
+    """「<パス> に書き込みました」と述べたのに実体が無いことを末尾で開示する。
+
+    実インシデント (2026-08-30 ライブ監査 T17-6): 「CSV形式で、名前と年齢の
+    3件のサンプルデータをファイルに出してください。」に **「sample_data.csv に
+    書き込みました。」** と答えたが、そのターンでは書込みツールが 1 度も実行
+    されておらず (backend.log に ``Executing tool`` の行が無い)、ファイルも
+    存在しなかった。次のターンの ``read_file`` は ``File not found`` で失敗して
+    いる。ユーザーには「保存された」としか見えない。
+
+    **ツール実行の有無ではなく実体の有無で判定する**。書込みが成立する経路は
+    deliberative のツール / meta_cognitive の計画 / long_form の書出しと複数
+    あり、層ごとに「書いたか」を集めると取りこぼす (実際 T17-4 の
+    meta_cognitive 経由の書込みは成立していた)。同ターンに実体があれば主張は
+    正しいので、存在するファイルには何も足さない = 誤検知が構造的に出ない。
+
+    ``LengthDisclosureFilter`` と同じくパイプラインへ置く (層に依存しない)。
+    """
+
+    def __init__(self, exists: "Callable[[str], bool] | None" = None) -> None:
+        self._seen: list[str] = []
+        self._exists = exists or self._default_exists
+
+    @staticmethod
+    def _default_exists(path: str) -> bool:
+        from pathlib import Path
+
+        try:
+            # write_file と同じ解決 (Path をそのまま使う = プロセス CWD 基準)。
+            return Path(path).exists()
+        except (OSError, ValueError):
+            # 不正なパス文字列は「実体なし」ではなく「判定不能」。主張を
+            # 否定する根拠が無いので存在するものとして扱い、開示しない。
+            return True
+
+    def process(self, token: str) -> str:
+        if token:
+            self._seen.append(token)
+        return token
+
+    def flush(self) -> str:
+        from backend.free.core.text_quality import (
+            unwritten_file_claims,
+            unwritten_file_disclosure_note,
+        )
+
+        response = "".join(self._seen)
+        self._seen.clear()
+        if not response.strip():
+            return ""
+        try:
+            missing = unwritten_file_claims(response, self._exists)
+        except Exception as exc:
+            # 実在判定が壊れても本文は出す。フィルタは開示のためのもので、
+            # ここで例外を上げるとストリームごと落ちる。
+            logger.warning("Unwritten-file check failed (continuing): %s", exc)
+            return ""
+        if not missing:
+            return ""
+        logger.info("Claimed file write with no file on disk: %s", missing)
+        return unwritten_file_disclosure_note(missing)

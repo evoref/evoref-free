@@ -610,6 +610,7 @@ class MemoryInjector:
         if not query_text:
             return set()
         from backend.free.memory.notes.note_builder import (
+            MAX_ASKED_ATTRIBUTES,
             resolve_fact_attribute_matches,
         )
 
@@ -628,6 +629,9 @@ class MemoryInjector:
                 # 単数のまま残っていた。
                 matches = resolve_fact_attribute_matches(
                     query_text, fact_type, mode=mode,
+                    # 読み出しは書き込みの上限に縛られない
+                    # (``MAX_ASKED_ATTRIBUTES`` の説明を参照)。
+                    limit=MAX_ASKED_ATTRIBUTES,
                 )
             except Exception:
                 continue

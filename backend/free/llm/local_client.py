@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+import asyncio
 import json
 
 import httpx
@@ -126,6 +127,19 @@ __all__ = [
 # 最初のデータまでの最大待機時間 (秒)。``LlamaConfig.stream_first_token_timeout_sec``
 # のデフォルトと合わせる。冷えた KV キャッシュ + 長プロンプト + iGPU 環境を許容。
 STREAM_FIRST_TOKEN_TIMEOUT = 60.0
+#: 最初のトークンまでの締め切りに **プロンプト長ぶんを足す** ときの prefill 速度
+#: (tok/s)。締め切りは ``stream_first_token_timeout + prompt_tokens / この値``。
+#:
+#: 固定 60 秒だと、プロンプトが伸びた分だけ prefill が延びて **健全な要求まで
+#: 打ち切る**。実インシデント (2026-08-31 ライブ監査 T07#3): 長文生成の直後、
+#: 履歴 67 ターン (約 4,500 トークン) の要約依頼が
+#: ``First token timeout after 60s: lines=2, data_lines=0`` で落ち、ユーザーには
+#: ``Error: llama-server streaming timeout:`` だけが表示された (ターンは失われた)。
+#: llama-server は詰まっていない — prefill が 60 秒に収まらなかっただけ。
+#:
+#: 同じ環境の実測は 70〜80 tok/s。壁時計の上限そのものは残さないと 51.9 分の
+#: ハング (2026-08-31 t06#10) を取り逃すので、**比例項を足すだけ** にする。
+STREAM_PREFILL_TOKENS_PER_SEC = 40.0
 STREAM_CONTENT_TIMEOUT_BASE = 30.0  # reasoning 開始から最初の content トークンまでの初期タイムアウト（秒）
 STREAM_CONTENT_TIMEOUT_EXTEND = 10.0  # reasoning チャンク受信ごとの延長（秒）
 STREAM_CONTENT_TIMEOUT_CAP = 120.0  # 最大タイムアウト上限（秒）
@@ -536,6 +550,23 @@ class LocalClient(BaseHTTPClient):
             estimate_tokens(str(m.get("content") or "")) + self._CTX_GUARD_PER_MSG
             for m in messages
         )
+
+    def _first_token_budget(self, messages: list[dict]) -> float:
+        """最初のトークンを待つ秒数 (プロンプト長に比例させた締め切り)。
+
+        ``stream_first_token_timeout`` を **下限** とし、prefill に要する分
+        (``prompt_tokens / STREAM_PREFILL_TOKENS_PER_SEC``) を足す。壁時計の
+        上限そのものは残るので、スロット詰まりの長時間ハングは従来どおり
+        捕まる (``STREAM_PREFILL_TOKENS_PER_SEC`` の説明を参照)。
+        """
+        base = self._stream_first_token_timeout
+        if not messages:
+            return base
+        try:
+            tokens = self._estimate_prompt_tokens(messages)
+        except Exception:
+            return base
+        return base + tokens / STREAM_PREFILL_TOKENS_PER_SEC
 
     def _enforce_context_budget(
         self, messages: list[dict], max_tokens: int | None = None,
@@ -949,6 +980,12 @@ class LocalClient(BaseHTTPClient):
         #: 提示されていた。
         last_finish_reason: str | None = None
         outcome.max_tokens = payload.get("max_tokens")
+        # 最初のトークンまでの締め切りは **プロンプト長に比例させる**
+        # (``STREAM_PREFILL_TOKENS_PER_SEC`` の説明を参照)。固定値だと、
+        # 履歴が伸びた分だけ延びる prefill を「ハング」と誤判定して健全な
+        # 要求を打ち切る。
+        first_token_budget = self._first_token_budget(payload.get("messages") or [])
+        started_at = _time.monotonic()
         try:
             # ストリーミング専用の新規クライアント（接続プール共有による stale 接続を回避）
             async with httpx.AsyncClient(timeout=120.0) as stream_client:
@@ -958,122 +995,141 @@ class LocalClient(BaseHTTPClient):
                     json=payload,
                     timeout=httpx.Timeout(
                         connect=10.0,
-                        read=self._stream_first_token_timeout,
+                        read=first_token_budget,
                         write=10.0,
                         pool=5.0,
                     ),
                 ) as resp:
                     await self._check_stream_response(resp)
-                    async for line in resp.aiter_lines():
-                        line_count += 1
-                        if line_count <= 3 or (line.startswith("data: ") and data_line_count < 3):
-                            logger.debug("SSE raw line #%d: %s", line_count, line[:300])
-                        if not line.startswith("data: "):
-                            continue
-                        data_line_count += 1
-                        data = line[6:]
-                        if data.strip() == "[DONE]":
-                            logger.debug(
-                                "SSE [DONE]: lines=%d, data=%d, tokens=%d, reasoning=%d",
+                    # ``httpx`` の ``read`` タイムアウトは **バイト間の空き** に
+                    # 掛かるもので、最初のトークンまでの壁時計時間は縛れない。
+                    # llama-server がスロット待ちで接続を開いたまま少しずつ
+                    # 何かを流すと、read タイマは毎回リセットされて発火しない。
+                    #
+                    # 実インシデント (2026-08-31 ライブ監査 t06#10):
+                    # ``read=60s`` を設定していたのに、ストリーム開始
+                    # 04:58:45 → タイムアウト 05:50:36 と **51.9 分** 待たされ、
+                    # ユーザーには空応答が返った (``lines=0, data_lines=0`` の
+                    # まま = 1 行も届いていない)。ログは "after 60s" と出るので
+                    # 実際の待ち時間が分からず、二重に紛らわしい。
+                    #
+                    # 最初のデータが来るまでは壁時計で締め切り、来たら解除して
+                    # 以降は従来どおり read タイムアウトに委ねる。
+                    async with asyncio.timeout(
+                        first_token_budget,
+                    ) as first_token_deadline:
+                        async for line in resp.aiter_lines():
+                            if first_data_received:
+                                first_token_deadline.reschedule(None)
+                            line_count += 1
+                            if line_count <= 3 or (line.startswith("data: ") and data_line_count < 3):
+                                logger.debug("SSE raw line #%d: %s", line_count, line[:300])
+                            if not line.startswith("data: "):
+                                continue
+                            data_line_count += 1
+                            data = line[6:]
+                            if data.strip() == "[DONE]":
+                                logger.debug(
+                                    "SSE [DONE]: lines=%d, data=%d, tokens=%d, reasoning=%d",
+                                    line_count, data_line_count, token_count, reasoning_timer.count,
+                                )
+                                tail = reasoning_filter.flush()
+                                if tail:
+                                    yield tail
+                                break
+
+                            content, reasoning, chunk = self._parse_sse_delta(data)
+                            if chunk is None:
+                                continue
+                            reason = (chunk.get("choices") or [{}])[0].get("finish_reason")
+                            if reason:
+                                last_finish_reason = reason
+                                outcome.finish_reason = reason
+                            # llama.cpp が timings を載せる構成なら、より正確なそちらを優先。
+                            # (既定では付かないので通常は下の usage 経路が使われる)
+                            timings = chunk.get("timings")
+                            if isinstance(timings, dict) and "cache_n" in timings:
+                                self._last_timings = timings
+
+                            if content:
+                                first_data_received = True
+                                filtered = reasoning_filter.feed(content)
+                                # 暴走 reasoning watchdog (docs/c_15 B3): 未閉じ <think> が
+                                # client_think_budget chunk を超えたらストリームを中断する
+                                # (thinking=0 モデルの runaway 上限化)。サーバ側で reasoning が
+                                # 分離されるモデルは content に <think> が出ないため発火しない。
+                                if reasoning_filter.in_think:
+                                    think_chunk_count += 1
+                                    if (
+                                        self._client_think_budget
+                                        and think_chunk_count > self._client_think_budget
+                                    ):
+                                        logger.warning(
+                                            "Reasoning watchdog: unclosed <think> exceeded %d "
+                                            "chunks, aborting stream (on_runaway=%s)",
+                                            self._client_think_budget, self._on_runaway,
+                                        )
+                                        # on_runaway はログ表示のみ。reask(二段生成)/truncate の
+                                        # variant 別挙動は未配線で、現状いずれも stream 中断
+                                        # (docs/c_15 §2.7)。
+                                        break
+                                else:
+                                    think_chunk_count = 0
+                                if filtered:
+                                    token_count += 1
+                                    yield filtered
+                                continue
+
+                            if reasoning:
+                                first_data_received = True
+                                if reasoning_timer.observe(_time.monotonic(), token_count):
+                                    logger.warning(
+                                        "Reasoning-only timeout: %.0fs without content tokens "
+                                        "(reasoning=%d chunks, timeout=%.0fs). "
+                                        "Aborting stream for retry.",
+                                        reasoning_timer.elapsed(_time.monotonic()),
+                                        reasoning_timer.count, reasoning_timer.timeout,
+                                    )
+                                    break
+                                continue
+
+                            # KV キャッシュヒット情報を usage チャンクから捕捉
+                            if "usage" in chunk:
+                                usage = chunk["usage"] or {}
+                                details = usage.get("prompt_tokens_details") or {}
+                                cached = details.get("cached_tokens")
+                                if cached is not None:
+                                    prompt_tokens = usage.get("prompt_tokens", 0)
+                                    # 再評価分 = プロンプト全体 - 再利用分。
+                                    # requests.jsonl の timing へ畳んで、ターン単位で
+                                    # 接頭辞キャッシュの効きを追えるようにする。
+                                    self._last_timings = {
+                                        "prompt_n": max(0, prompt_tokens - cached),
+                                        "cache_n": cached,
+                                    }
+                                    if self._debug_logger is not None:
+                                        self._debug_logger.log_kv_cache(
+                                            tokens_prompt=prompt_tokens,
+                                            tokens_cached=cached,
+                                        )
+
+                            if data_line_count <= 3:
+                                # usage チャンクは choices 空配列なので添字を引かない
+                                first = (chunk.get("choices") or [{}])[0]
+                                finish = first.get("finish_reason")
+                                logger.debug(
+                                    "SSE non-content chunk #%d: delta=%s, finish_reason=%s",
+                                    data_line_count,
+                                    first.get("delta", {}), finish,
+                                )
+                        else:
+                            logger.warning(
+                                "SSE stream ended without [DONE]: lines=%d, data=%d, tokens=%d, reasoning=%d",
                                 line_count, data_line_count, token_count, reasoning_timer.count,
                             )
                             tail = reasoning_filter.flush()
                             if tail:
                                 yield tail
-                            break
-
-                        content, reasoning, chunk = self._parse_sse_delta(data)
-                        if chunk is None:
-                            continue
-                        reason = (chunk.get("choices") or [{}])[0].get("finish_reason")
-                        if reason:
-                            last_finish_reason = reason
-                            outcome.finish_reason = reason
-                        # llama.cpp が timings を載せる構成なら、より正確なそちらを優先。
-                        # (既定では付かないので通常は下の usage 経路が使われる)
-                        timings = chunk.get("timings")
-                        if isinstance(timings, dict) and "cache_n" in timings:
-                            self._last_timings = timings
-
-                        if content:
-                            first_data_received = True
-                            filtered = reasoning_filter.feed(content)
-                            # 暴走 reasoning watchdog (docs/c_15 B3): 未閉じ <think> が
-                            # client_think_budget chunk を超えたらストリームを中断する
-                            # (thinking=0 モデルの runaway 上限化)。サーバ側で reasoning が
-                            # 分離されるモデルは content に <think> が出ないため発火しない。
-                            if reasoning_filter.in_think:
-                                think_chunk_count += 1
-                                if (
-                                    self._client_think_budget
-                                    and think_chunk_count > self._client_think_budget
-                                ):
-                                    logger.warning(
-                                        "Reasoning watchdog: unclosed <think> exceeded %d "
-                                        "chunks, aborting stream (on_runaway=%s)",
-                                        self._client_think_budget, self._on_runaway,
-                                    )
-                                    # on_runaway はログ表示のみ。reask(二段生成)/truncate の
-                                    # variant 別挙動は未配線で、現状いずれも stream 中断
-                                    # (docs/c_15 §2.7)。
-                                    break
-                            else:
-                                think_chunk_count = 0
-                            if filtered:
-                                token_count += 1
-                                yield filtered
-                            continue
-
-                        if reasoning:
-                            first_data_received = True
-                            if reasoning_timer.observe(_time.monotonic(), token_count):
-                                logger.warning(
-                                    "Reasoning-only timeout: %.0fs without content tokens "
-                                    "(reasoning=%d chunks, timeout=%.0fs). "
-                                    "Aborting stream for retry.",
-                                    reasoning_timer.elapsed(_time.monotonic()),
-                                    reasoning_timer.count, reasoning_timer.timeout,
-                                )
-                                break
-                            continue
-
-                        # KV キャッシュヒット情報を usage チャンクから捕捉
-                        if "usage" in chunk:
-                            usage = chunk["usage"] or {}
-                            details = usage.get("prompt_tokens_details") or {}
-                            cached = details.get("cached_tokens")
-                            if cached is not None:
-                                prompt_tokens = usage.get("prompt_tokens", 0)
-                                # 再評価分 = プロンプト全体 - 再利用分。
-                                # requests.jsonl の timing へ畳んで、ターン単位で
-                                # 接頭辞キャッシュの効きを追えるようにする。
-                                self._last_timings = {
-                                    "prompt_n": max(0, prompt_tokens - cached),
-                                    "cache_n": cached,
-                                }
-                                if self._debug_logger is not None:
-                                    self._debug_logger.log_kv_cache(
-                                        tokens_prompt=prompt_tokens,
-                                        tokens_cached=cached,
-                                    )
-
-                        if data_line_count <= 3:
-                            # usage チャンクは choices 空配列なので添字を引かない
-                            first = (chunk.get("choices") or [{}])[0]
-                            finish = first.get("finish_reason")
-                            logger.debug(
-                                "SSE non-content chunk #%d: delta=%s, finish_reason=%s",
-                                data_line_count,
-                                first.get("delta", {}), finish,
-                            )
-                    else:
-                        logger.warning(
-                            "SSE stream ended without [DONE]: lines=%d, data=%d, tokens=%d, reasoning=%d",
-                            line_count, data_line_count, token_count, reasoning_timer.count,
-                        )
-                        tail = reasoning_filter.flush()
-                        if tail:
-                            yield tail
 
                     outcome.tokens_generated = token_count
                     if last_finish_reason == "length":
@@ -1091,17 +1147,31 @@ class LocalClient(BaseHTTPClient):
             raise LLMConnectionError(
                 f"llama-server unreachable: {e}", host=self.url,
             ) from e
-        except httpx.TimeoutException as e:
+        except (httpx.TimeoutException, TimeoutError) as e:
+            # ``TimeoutError`` は上の ``asyncio.timeout`` (最初のトークンまでの
+            # 壁時計の締め切り) 由来。httpx の read タイムアウトと同じ結末へ
+            # 落とす — 呼出側から見ればどちらも「llama-server が応答しない」。
+            waited = _time.monotonic() - started_at
             if not first_data_received:
                 logger.warning(
-                    "First token timeout after %.0fs: lines=%d, data_lines=%d "
+                    "First token timeout after %.1fs (budget %.0fs): "
+                    "lines=%d, data_lines=%d "
                     "(llama-server may have a stuck slot or resource contention; "
                     "increase llama.stream_first_token_timeout_sec if cold prefill "
                     "regularly exceeds this window)",
-                    self._stream_first_token_timeout, line_count, data_line_count,
+                    waited, first_token_budget, line_count, data_line_count,
                 )
+            # ``asyncio.TimeoutError`` は ``str(e)`` が空。そのまま埋め込むと
+            # ユーザーには ``Error: llama-server streaming timeout:`` という
+            # 中身の無い行だけが表示される (2026-08-31 ライブ監査 T07#3 実測)。
+            # 何秒待って諦めたのかを必ず書く。
+            detail = str(e) or (
+                f"no data for {waited:.0f}s (budget {first_token_budget:.0f}s)"
+                if not first_data_received
+                else f"stream stalled after {waited:.0f}s"
+            )
             raise LLMTimeoutError(
-                f"llama-server streaming timeout: {e}", host=self.url,
+                f"llama-server streaming timeout: {detail}", host=self.url,
             ) from e
 
     async def generate_with_logprobs(

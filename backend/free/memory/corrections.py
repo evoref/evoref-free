@@ -21,6 +21,20 @@
 訂正側にも話題語が残る。実測 (2026-08-19、STM 83 件): ``is_correction`` は
 2 件のみ (2.4%) で、keyword を持つ 1 件は同一セッションの先行 6 ノート中
 **1 件だけ**と重なり (「締切」)、残り 5 件は重なりゼロだった。
+
+**候補は user 発話に限り、順位は重なり語数が先** (2026-08-30 ライブ監査)。
+チャットでは値の申告の直後にアシスタントが必ず復唱し、その復唱ノートは
+(a) 対象と同じ keyword を持ち (b) 対象より新しく (c) ``assertion_slug`` を
+持たない。「直前」だけで選ぶと訂正は毎回この復唱に結び付き、
+``assertion_curator`` は継ぐ slug が無いまま別 slug を書き、
+``attach_superseding_corrections`` は復唱の方に supersede 印を付ける。
+実測: 「デプロイ先は AWS…」→ 訂正「AWS ではなく GCP…」で
+``mem.world.assertion.deployment_region`` (AWS) と
+``…deployment_target`` (GCP) が **両方 live のまま並び**、以後の全ターンへ
+AWS が注入され続けた。復唱を除いても「直前」だけでは足りない —
+間に挟まる別属性の申告 (「インスタンスタイプは t3.medium」) の方が新しい。
+重なり語数を第一キー、新しさを同点時のキーにすると、訂正は
+**話題語を最も多く共有する言明** に付く。
 """
 
 from __future__ import annotations
@@ -39,12 +53,24 @@ def _keywords(note: Any) -> set[str]:
     return set(getattr(note, "keywords", None) or ())
 
 
+def _is_user_note(note: Any) -> bool:
+    """ユーザー自身の発話ノートか。
+
+    ``source`` を持たない古いノート / テスト用ダブルは user とみなす
+    (訂正の対象になり得ないのはアシスタント発話だけなので、既定は通す)。
+    """
+    return (getattr(note, "source", None) or "user") != "assistant"
+
+
 def correction_target(correction: Any, notes: list) -> Any | None:
     """``correction`` が言い直している **元の言明ノート** を返す (純粋関数)。
 
-    条件は「同一セッション」「訂正より前」「keyword が
+    条件は「同一セッション」「ユーザー発話」「訂正より前」「keyword が
     :data:`CORRECTION_LINK_MIN_OVERLAP` 語以上重なる」。候補が複数あれば
-    **最も新しいもの** を採る (直前の言明を言い直すのが訂正の常態)。
+    **重なり語数が最も多いもの**、同数なら **最も新しいもの** を採る。
+
+    アシスタントの復唱を候補から外す理由と、重なり語数を新しさより優先する
+    理由はモジュール docstring を参照。
     """
     corr_kw = _keywords(correction)
     if not corr_kw:
@@ -52,18 +78,23 @@ def correction_target(correction: Any, notes: list) -> Any | None:
     corr_at = _created_at(correction)
     corr_sess = getattr(correction, "session_id", None)
     best = None
+    best_rank = (0, 0.0)
     for note in notes:
         if note is correction or getattr(note, "is_correction", False):
+            continue
+        if not _is_user_note(note):
             continue
         if getattr(note, "session_id", None) != corr_sess:
             continue
         note_at = _created_at(note)
         if note_at >= corr_at:
             continue
-        if len(corr_kw & _keywords(note)) < CORRECTION_LINK_MIN_OVERLAP:
+        overlap = len(corr_kw & _keywords(note))
+        if overlap < CORRECTION_LINK_MIN_OVERLAP:
             continue
-        if best is None or note_at > _created_at(best):
-            best = note
+        rank = (overlap, note_at)
+        if best is None or rank > best_rank:
+            best, best_rank = note, rank
     return best
 
 

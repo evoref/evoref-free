@@ -6,7 +6,10 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from backend.free.api.chat.chat_constants import LLM_TOOL_EXECUTION_TIMEOUT_SEC
+from backend.free.api.chat.chat_constants import (
+    LLM_TOOL_EXECUTION_TIMEOUT_SEC,
+    LLM_TOOL_MAX_TOKENS,
+)
 from backend.free.core.system_info import (
     format_hardware_facts,
     format_runtime_facts,
@@ -117,6 +120,9 @@ def _make_summarize(client: LocalClient):
         try:
             result = await client.generate(
                 messages, stream=False, temperature=0.3,
+                # 上限を渡さないと n_ctx を使い切るまで生成し、実行タイム
+                # アウトに必ず当たる (LLM_TOOL_MAX_TOKENS の説明を参照)。
+                max_tokens=LLM_TOOL_MAX_TOKENS,
                 id_slot=client.background_slot,
             )
             return extract_content(result)
@@ -152,6 +158,9 @@ def _make_translate(client: LocalClient):
         try:
             result = await client.generate(
                 messages, stream=False, temperature=0.3,
+                # 上限を渡さないと n_ctx を使い切るまで生成し、実行タイム
+                # アウトに必ず当たる (LLM_TOOL_MAX_TOKENS の説明を参照)。
+                max_tokens=LLM_TOOL_MAX_TOKENS,
                 id_slot=client.background_slot,
             )
             return extract_content(result)
@@ -185,6 +194,9 @@ def _make_draft_document(client: LocalClient):
         try:
             result = await client.generate(
                 messages, stream=False, temperature=0.7,
+                # 上限を渡さないと n_ctx を使い切るまで生成し、実行タイム
+                # アウトに必ず当たる (LLM_TOOL_MAX_TOKENS の説明を参照)。
+                max_tokens=LLM_TOOL_MAX_TOKENS,
                 id_slot=client.background_slot,
             )
             return extract_content(result)
