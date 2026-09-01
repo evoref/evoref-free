@@ -33,6 +33,7 @@ from backend.free.core.intent_vocab import (
     prior_code_block_request,
     names_file_target,
     memory_architecture_question,
+    self_learning_question,
     model_identity_question,
     own_process_question,
     self_assessment_question,
@@ -598,6 +599,59 @@ _MEMORY_ARCHITECTURE_FACT = (
     "訂正されると旧世代は supersede され、セッションを跨いで参照される。"
 )
 
+#: 自己学習の確定事実。実装 (EvorefLearn + sleep-time) に基づく。
+#:
+#: base は汎用 LLM の前提 (「推論時のみ動作し、セッションは独立」) で答えて
+#: しまう。実インシデント (2026-08-30 ライブ監査 T07-5): 「自己学習をします
+#: か？」に「いいえ」と答え、**同じ会話の 1 ターン目** で SemMem を含む 4 層を
+#: 正しく列挙していたことと矛盾した。
+#:
+#: 会話中に重みが変わらないのは事実なので、そこは否定せずに残す。誤りは
+#: 「セッションを跨いで何も残らない」「過去の対話が将来の回答を変えない」の
+#: 2 点なので、そこだけを実装で置き換える。
+_SELF_LEARNING_FACT_HEAD = (
+    "\n\n確定事実: このアシスタントは自己学習する。これは実装そのものなので、"
+    "この内容で答えること。ここに無い仕組みを述べない。\n"
+    "- 会話の結末は経験として記録される (Level 0)。\n"
+    "- 蓄積した経験から応答方針そのものが変異・選択で更新される (Level 1)。\n"
+)
+#: Pro のみ。Free には Level 2 が無いので、有ると答えさせない。
+_SELF_LEARNING_FACT_LEVEL2 = (
+    "- 学習サイクルが LoRA を訓練し、ベースモデルの応答を更新する (Level 2)。\n"
+)
+_SELF_LEARNING_FACT_TAIL = (
+    "- アイドル時間に会話が整理され、属性ごとの現在値が SemMem へ書き戻される"
+    " (sleep-time)。\n"
+    "したがってセッションは独立ではなく、過去の対話は将来の回答に反映される。"
+    "ただし **会話の最中にベースモデルの重みが書き換わることはない** — "
+    "学習はチャットとは別の窓で走る。"
+)
+#: 学習を切って起動している場合 (``--no-learning``) の確定事実。
+_SELF_LEARNING_DISABLED_FACT = (
+    "\n\n確定事実: このアシスタントは自己学習の機能を持つが、いまは "
+    "--no-learning で起動しているため学習サイクルは止まっている。"
+    "経験記録・方針更新・sleep-time の書き戻しは行われない。"
+    "記憶の読み出しと応答は通常どおり動作する。"
+)
+
+
+def _self_learning_fact() -> str:
+    """いまの起動状態に合わせた自己学習の確定事実を組み立てる。
+
+    ``--no-learning`` は ``AppState.learning_disabled`` が SSOT だが、
+    ``DeliberativeAgent`` は AppState を持たない。子プロセスへの伝播に使う
+    環境変数 (CLAUDE.md §9) を読めば同じ値が取れるので、配線を増やさない。
+    """
+    import os
+
+    from backend.edition import is_pro
+
+    if os.environ.get("EVOREF_LEARNING_DISABLED") == "1":
+        return _SELF_LEARNING_DISABLED_FACT
+    level2 = _SELF_LEARNING_FACT_LEVEL2 if is_pro() else ""
+    return _SELF_LEARNING_FACT_HEAD + level2 + _SELF_LEARNING_FACT_TAIL
+
+
 #: モデル識別の確定事実。``{model}`` に **実測** のモデル名が入る。
 _MODEL_IDENTITY_FACT = (
     "\n\n確定事実: いま実際に動いているベースモデルは **{model}** である"
@@ -951,6 +1005,10 @@ class DeliberativeAgent:
         if memory_architecture_question(query):
             append_to_last_user(messages, _MEMORY_ARCHITECTURE_FACT, separator="")
             logger.info("Memory architecture fact pinned")
+            return True
+        if self_learning_question(query):
+            append_to_last_user(messages, _self_learning_fact(), separator="")
+            logger.info("Self-learning fact pinned")
             return True
         if model_identity_question(query):
             served = self._served_model_name(llm_client)
@@ -1680,6 +1738,7 @@ class DeliberativeAgent:
         evicted_turns: int = 0,
         session_head: str = "",
         answered_attributes: frozenset[str] = frozenset(),
+        prompt_capture: list[dict] | None = None,
     ) -> DeliberativeResponse | AsyncIterator[str]:
         """Deliberative 層で LLM 推論を実行
 
@@ -1698,6 +1757,15 @@ class DeliberativeAgent:
             answered_attributes: このターンの [関連する記憶] に **実際に載った**
                 ファクトのうち、クエリが尋ねている属性のスロット名
                 (``_suppress_redundant_history_search`` 参照)。
+            prompt_capture: 渡すと、**実際に送信する** メッセージ配列を
+                ここへ書き戻す。呼出側は ``list(messages)`` の浅いコピーを
+                渡してくるため、``## ツール実行結果``・リマインダー・各種注記を
+                積んだ後の配列は呼出側からは見えない。--develop=evolve の
+                ``requests`` JSONL はこの配列を記録するので、渡さないと
+                **ツール接地ターンの根拠ブロックがログから丸ごと欠落する**
+                (2026-08-30 ライブ監査: 「来週の月曜日は？」で
+                ``target: 2026-08-31 (Monday)`` を得ていたのにログ上は
+                プロンプトに無く、原因の切り分けを 1 段誤らせた)。
 
         Returns:
             stream=False: DeliberativeResponse
@@ -1795,6 +1863,11 @@ class DeliberativeAgent:
             sum(len(m.get("content", "")) for m in messages),
             appended_chars,
         )
+
+        # 呼出側は list(messages) の浅いコピーを渡すので、ここまでで積んだ
+        # ブロックは呼出側の配列には反映されない。実際に送るものを書き戻す。
+        if prompt_capture is not None:
+            prompt_capture[:] = messages
 
         # 「中身をそのまま見せて」型はモデルに通さず決定論的に返す。
         verbatim = verbatim_file_echo(

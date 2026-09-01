@@ -51,19 +51,40 @@ embedding:
   # 乖離していた。稼働 embed へ当日クエリを再投入した実測では、executable でない
   # クエリ (好みの表明 / 記憶想起 / 履歴検索依頼) が 0.31-0.36 に載り、閾値 0.3 が
   # ノイズ帯の下にあった。正例 (日付質問) は 0.4323 なので、その間を取る。
-  # url 側は「ユーザーが URL を書いた」という決定論的根拠を伴い、当セッションで
-  # 誤発火の実測が無いため 0.3 のまま据え置く。
+  # ── 実測較正 (2026-08-30) ─────────────────────────────────────
+  # 3 モデル (LFM2.5-Embedding-350M / Qwen3-Embedding-0.6B / BGE-M3) を
+  # **同一データ・同一手順** で測って導いた。測定対象はコード上の実際の
+  # 比較対象に合わせてある:
+  #
+  #   url / executable_command … クエリ ↔ 保存済み話題
+  #   note_link / conflict      … STM ノート ↔ ノート
+  #   min_merge                 … 同上 (LLM 統合を行う上位の閾値)
+  #   attribute_similarity      … 同一 (subject,predicate) 内のファクト object 同士
+  #   cartridge_gate            … クエリ ↔ カートリッジ **重心**
+  #
+  # 閾値はゲートごとのコスト非対称性で選定した。外部作用を伴うもの
+  # (URL 取得 / コマンド実行 / 誤マージ / 偽の競合) は **誤検出 0** を要求し、
+  # コストが余分な検索・LLM 呼び出しに留まるものは取りこぼしを減らす側へ寄せた。
+  #
+  # データは合成セット (話題 8 / 正例 13-14 / 雑音 20、ノート対 10+12、
+  # ファクト対 8+10、カートリッジ 3 x 6 チャンク)。実ストアではない点に注意。
+  #
+  # ⚠ 再較正でこの値を変えるときは scripts/tests/test_launch_llama_profiles.py の
+  #   _CALIBRATED_THRESHOLDS も同じコミットで更新すること (更新漏れは同テストが検知する)。
   recall:
-    url_recall_min_score: 0.3
-    executable_command_recall_min_score: 0.45
-  # コサインを絶対値で比べる閾値 (config の memory.* / rag.* へ転写)。
-  # 2026-08-30 実測 (同一ペアで 3 モデル比較): 無関係ペアの cos 中央値は
-  # LFM2.5 0.105 / Qwen3 0.273 / bge-m3 0.459 と大きく違い、モデルを替えると
-  # 旧モデル前提の値が黙って残る。ここに書いておけば切替で自動追従する。
-  # 本ブロックは **現行の config 既定値をそのまま明示** したもの (挙動不変)。
+    # 5/14 通過・誤検出 0/20 (既定 0.3 では誤検出 3/20)
+    url_recall_min_score: 0.75
+    # 10/13 通過・誤検出 0/20
+    executable_command_recall_min_score: 0.41
   memory:
-    note_link_threshold: 0.5
-    conflict_similarity_threshold: 0.85
+    # 10/10 通過・誤検出 0/12
+    note_link_threshold: 0.18
+    # 10/10 通過・誤検出 2/22
+    conflict_similarity_threshold: 0.65
+    # 7/10 通過・誤検出 0/22
+    min_merge_similarity: 0.74
+    # 7/8 通過・誤検出 0/10
     attribute_similarity_threshold: 0.55
   rag:
-    cartridge_gate_threshold: 0.3
+    # 9/9 通過・誤検出 1/8
+    cartridge_gate_threshold: 0.17

@@ -16,6 +16,7 @@ from backend.free.api.chat.chat_recorder import clear_session_data, drain_evicte
 from backend.free.api.chat.chat_types import ChatMessage, FileContextDict
 from backend.free.api.schemas import ChatRequest
 from backend.free.core.intent_vocab import (
+    split_user_text_measurement,
     _PRIOR_OUTPUT_CODE_RE,
     conversation_turn_count_question,
     is_whole_session_scope_query,
@@ -1115,18 +1116,39 @@ def _measurement_target(history: list[ChatMessage], query: str) -> str:
     return _strip_system_notes(assistants[-1])
 
 
+_USER_TEXT_MEASUREMENT_GUIDANCE = (
+    "\n\n[システム計測] あなたが示した文章を機械的に数えた結果: {values}。"
+    "この数値をそのまま使って答えること。自分で数え直したり概算したりしないこと。"
+)
+
+
 def _append_self_output_measurement(
     messages: list[ChatMessage], history: list[ChatMessage],
 ) -> None:
     """「今の回答は何文字?」に実測値を添える (in-place)。
 
     計量対象が無い / 計量質問でない場合は何もしない。
+
+    ユーザーが **同じ発話の中で示した文章** についての計量
+    (「<本文> ← これは何文字ですか？」) はそちらを優先する。指示対象が
+    「自分の直前の出力」ではなく「いま渡された文章」で別物だから。実インシデント
+    (2026-08-31 ライブ監査 t18#9): 1213 文字の入力に **「500文字です」**
+    (入力は欠損なく届いており、単に数え違えていた)。
     """
     query = ""
     for msg in reversed(history):
         if msg.get("role") == "user":
             query = str(msg.get("content") or "")
             break
+    payload, payload_kinds = split_user_text_measurement(query)
+    if payload and payload_kinds:
+        values = "、".join(_measure_text(payload, payload_kinds))
+        if append_to_last_user(
+            messages, _USER_TEXT_MEASUREMENT_GUIDANCE.format(values=values),
+            separator="",
+        ):
+            logger.debug("User-text measurement injected: %s", values)
+        return
     kinds = self_output_measure_kinds(query)
     if not kinds:
         return

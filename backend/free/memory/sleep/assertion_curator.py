@@ -374,8 +374,63 @@ async def curate_assertion_facts(
                 "assertion_curator: wrote mem.world.%s.%s from note %s",
                 _SUBJECT_PREFIX, slug, note.id,
             )
+            if getattr(note, "is_correction", False):
+                _supersede_same_slug(store, fact)
         except Exception as exc:
             logger.warning(
                 "assertion_curator: persist failed for slug=%s: %s", slug, exc,
             )
     return written
+
+
+def _supersede_same_slug(store: "SemanticFactStore", correction: object) -> int:
+    """訂正が書かれたスロットの **古い値** を畳む。
+
+    このモジュールが slug に内容ハッシュを付けないのは「同じ話題の言い直しが
+    同じ subject に並ぶ方が正しい。並べば競合検出が対にでき、**訂正が
+    supersede できる**」ためだが (モジュール docstring)、書き込みは
+    ``store.add_fact`` で終わっており **畳む処理がどこにも無かった**。
+    ``sleep.extraction._supersede_corrected_slots`` は ``ChatExtractor`` が
+    作ったファクトだけを見るので、curator の書き込みは対象外。
+
+    実データ (2026-08-31 ライブ監査): 「コードネームは「ハヤブサ」ではなく
+    「ツバメ」に変わりました。」で slug 継承は成功し
+    ``mem.world.assertion.project_codename`` に両方が並んだが、**4 件すべて
+    live** のままで、訂正前の「ハヤブサ」が注入され続ける状態だった。
+
+    畳むのは **訂正ターンのみ**。独立した 2 つの言明がたまたま同じ slug を
+    もらうことがあり、無条件に畳むと片方が消える。訂正なら「同じ属性の
+    言い直し」であることが ``is_correction`` で確定している。
+    """
+    folded = 0
+    try:
+        siblings = store.search_by_subject(
+            correction.subject, include_superseded=False,
+        )
+    except Exception as exc:
+        logger.warning(
+            "assertion_curator: failed to list slot %s: %s",
+            correction.subject, exc,
+        )
+        return 0
+    for old in siblings:
+        if old.id == correction.id or old.predicate != correction.predicate:
+            continue
+        if old.superseded_by:
+            continue
+        try:
+            store.supersede(old.id, correction.id)
+        except (KeyError, ValueError) as exc:
+            # 閉路ガード等で弾かれた場合は残しておく (競合解決 / TTL に委ねる)。
+            logger.warning(
+                "assertion_curator: failed to supersede %s -> %s: %s",
+                old.id, correction.id, exc,
+            )
+            continue
+        folded += 1
+    if folded:
+        logger.info(
+            "assertion_curator: superseded %d stale value(s) in %s",
+            folded, correction.subject,
+        )
+    return folded

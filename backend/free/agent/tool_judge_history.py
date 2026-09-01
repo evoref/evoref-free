@@ -81,7 +81,16 @@ _ORDER_QUERY_STOPWORD_RUNS = frozenset({
     "過去", "履歴", "探", "検索", "調", "教", "知",
     # 「もう一度」「〜させた」等の依頼骨組み (2026-08-05 追加)。
     "一度", "度", "全部", "全て", "読",
+    # 出力の指図 (「箇条書きで挙げて」「違いを説明して」「推測は入れないで」)。
+    # 話題語ではないのに内容ランとして残り、検索語を薄めていた
+    # (2026-08-30 ライブ監査: ``箇条書 推測`` / ``デプロイ 説明`` /
+    # ``周辺 観光地 3つ挙`` の 3 例が揃って 0 件だった)。
+    "説明", "箇条書", "推測", "挙", "列挙", "復唱",
 })
+
+#: 「3つ」「5個」のような **個数だけ** の語。指図の一部であって話題語ではない。
+#: ストップワード剥がしの後に残る (「3つ挙」→ ``挙`` を剥がして ``3つ``)。
+_ORDER_QUERY_COUNT_ONLY_RE = re.compile(r"^[0-9０-９]+[つ個件点名章行字]?$")
 #: 日本語ストップワードを長い順に固定した並び (最長一致 + 決定論のため)。
 #: frozenset をそのまま走査すると反復順が実行ごとに変わり、剥がれ方が
 #: 非決定になる。
@@ -230,6 +239,8 @@ def _reduce_ordered_history_query(query: str) -> str:
         # (:data:`_ORDER_QUERY_MIN_TERM_LEN`)。英語側は元から空白区切りで
         # 1 文字語がほぼ出ないため、日本語だけに掛ける。
         if not en and len(term) < _ORDER_QUERY_MIN_TERM_LEN:
+            continue
+        if not en and _ORDER_QUERY_COUNT_ONLY_RE.match(term):
             continue
         terms.append(term)
     reduced = " ".join(terms).strip()

@@ -261,6 +261,16 @@ def _executable_tool_for_mode(tools_registry: ToolsRegistry, mode: str) -> str:
     return ""
 
 
+#: 「〜を訳してください:「本文」」の括り。訳す対象は必ずここに入る。
+_QUOTED_SPAN_RE = re.compile(r"[「『\"“]([^」』\"”\n]{2,400})[」』\"”]")
+
+
+def _first_quoted_span(query: str) -> str | None:
+    """クエリ中で最初に括られた文字列を返す (純粋関数)。無ければ None。"""
+    m = _QUOTED_SPAN_RE.search(query or "")
+    return m.group(1).strip() if m else None
+
+
 class ToolCallJudge:
     """補助タスクによるツール呼び出し判定
 
@@ -1258,6 +1268,9 @@ class ToolCallJudge:
         # 分類器は自由生成の arg をそのまま query に入れるため、文のまま
         # 渡ってくることがある (層 5.5 と違い縮約が掛からない)。
         self._maybe_reduce_history_query(result, query)
+        # 分類器は 1 つの arg しか生成しないので、必須引数が 2 つ以上ある
+        # ツールは呼び出しが必ず失敗する (下記)。
+        self._drop_if_required_args_missing(result, query, tools_registry)
 
         result = self._finalize(
             result,
@@ -1611,6 +1624,63 @@ class ToolCallJudge:
             "search_history excludes current session (already in context): %s",
             query[:50],
         )
+
+    #: 分類器の arg から埋められない必須引数を、クエリから決定論で補う口。
+    #: ``translate`` の ``text`` は「訳してください:「〜」」の括りに必ず入る。
+    _ARG_FILLERS: dict = {
+        "translate.text": ("quoted", staticmethod(_first_quoted_span)),
+    }
+
+    def _drop_if_required_args_missing(
+        self, result: "ToolJudgement", query: str, tools_registry,
+    ) -> None:
+        """必須引数が埋まらないツール選択を取り下げる (純粋な後処理)。
+
+        文法制約 JSON の分類器 (層 5.9) は **arg を 1 つしか生成しない**。
+        必須引数が 2 つ以上あるツールを選ぶと、残りが空のまま実行され
+        ``Error: Missing required argument(s): ...`` で必ず失敗する。失敗しても
+        ツール実行の待ち時間は掛かり、根拠枠にはエラー文字列が載る。
+
+        実インシデント (2026-08-31 ライブ監査 t16#4):
+        「次の文を英語とドイツ語に訳してください:「次の定例は火曜の14時からです」」
+        で ``translate({'target_lang': 'English'})`` が選ばれ、``text`` 欠落で
+        失敗。回答は英訳だけになり **ドイツ語訳が落ちた**。
+
+        埋められるものは埋め (``_ARG_FILLERS``)、それでも足りなければツール選択
+        自体を取り下げてモデルに直接答えさせる (失敗を渡すより良い)。
+        """
+        if not result.tool_needed or not result.tool_name:
+            return
+        try:
+            required = tools_registry.required_args(result.tool_name)
+        except Exception:
+            return
+        args = result.tool_args or {}
+        missing = [a for a in required if not str(args.get(a) or "").strip()]
+        if not missing:
+            return
+        for name in list(missing):
+            filler = self._ARG_FILLERS.get(f"{result.tool_name}.{name}")
+            if filler is None:
+                continue
+            value = filler[1](query)
+            if value:
+                args[name] = value
+                missing.remove(name)
+        result.tool_args = args
+        if not missing:
+            logger.info(
+                "Filled missing arg(s) for %s from the query", result.tool_name,
+            )
+            return
+        logger.info(
+            "Dropping %s: required arg(s) %s could not be filled "
+            "(the classifier emits a single arg)",
+            result.tool_name, missing,
+        )
+        result.tool_needed = False
+        result.tool_name = None
+        result.tool_args = {}
 
     def _maybe_reduce_history_query(
         self, result: "ToolJudgement", query: str,

@@ -213,6 +213,42 @@ PROXIMAL_RECALL_KEYWORDS: frozenset[str] = frozenset(
     if distance == "proximal"
 )
 
+#: :data:`PROXIMAL_RECALL_KEYWORDS` の対。**過去のセッション** を指す語。
+#: ``search_history`` は現在セッションを除外して検索するので、これが 1 つも
+#: 無いクエリでの検索は構造的に当たらない
+#: (``tool_judge_guards._suppress_unjustified_cross_session_search``)。
+LONG_RANGE_RECALL_KEYWORDS: frozenset[str] = frozenset(
+    kw
+    for kw, distance in (*_HISTORY_KEYWORD_DISTANCE, *_HISTORY_KEYWORD_DISTANCE_EN)
+    if distance == "long_range"
+)
+
+
+def has_long_range_recall_keyword(query: str) -> bool:
+    """過去のセッションを指す語を含むか (純粋関数)。"""
+    q = (query or "").lower()
+    return any(kw in q for kw in LONG_RANGE_RECALL_KEYWORDS)
+
+
+#: 「この会話は **別として**」— 現在の会話を明示的に脇へ置く言い回し。
+#: 自己参照 (:data:`_SESSION_ANCHOR_ANY_RE`) の逆で、探す先が現在セッションの
+#: **外** であることを積極的に示す。
+_EXCLUDES_CURRENT_CONVERSATION_RE = re.compile(
+    r"(?:aside\s+from|apart\s+from|other\s+than|besides|except\s+for)\s+"
+    r"(?:this|our)\s+(?:conversation|chat|session)"
+    r"|(?:この|今回の)(?:会話|チャット|やり取り)(?:とは別|以外|を除)",
+    re.IGNORECASE,
+)
+
+
+def excludes_current_conversation(query: str) -> bool:
+    """現在の会話を明示的に除外しているか (純粋関数)。
+
+    「この会話とは別に」「aside from this conversation」は、探す先が現在
+    セッションの外だと言っている = 除外検索が正当化される。
+    """
+    return bool(query) and bool(_EXCLUDES_CURRENT_CONVERSATION_RE.search(query))
+
 
 # ─────────────────────────────────────────────────────────────────────
 # セッション自己参照 (「この会話で〜」)
@@ -954,6 +990,94 @@ def own_process_question(query: str) -> bool:
     )
 
 
+#: 「<本文> ← これは何文字ですか？」— **ユーザーが同じ発話で示した文章** の計量。
+#: :func:`self_output_measure_kinds` (直前の *自分の* 出力を測る) の対で、
+#: 指示対象が違う。文末に錨を打ち、その手前をすべて計量対象とする。
+_USER_TEXT_MEASURE_RE = re.compile(
+    r"[←→:：\-\s]*"
+    r"(?:これ|この文章|この文字列|この文|この単語|上記の?文?章?|上の文章?)"
+    r"\s*(?:は|って|の)?\s*(?:全部で)?\s*(?:何|なん)(?:文字|行|単語|語)"
+    r"[^。\n]{0,14}[。？?！!]*\s*$",
+)
+
+
+def split_user_text_measurement(message: str) -> tuple[str, tuple[str, ...]]:
+    """「<本文> これは何文字？」を ``(本文, 計量種別)`` に割る (純粋関数)。
+
+    計量質問でない、または本文が短すぎる場合は ``("", ())``。
+
+    **なぜ要るか**: 文字数はモデルには数えられない。実インシデント
+    (2026-08-31 ライブ監査 t18#9): 1213 文字の入力に「これは何文字ですか？」で
+    **「500文字です」**。入力は欠損なくバックエンドへ届いており
+    (``message_len=1213``)、単に数え違えていた。
+
+    :func:`self_output_measure_kinds` は **直前の自分の出力** を測る判定なので
+    ここには使えない — 指示対象が「ユーザーが今示した文章」で別物。同じ理由で
+    「いまの回答は何文字でしたか」はこちらでは拾わない (本文が無いため)。
+    """
+    text = message or ""
+    m = _USER_TEXT_MEASURE_RE.search(text)
+    if m is not None:
+        payload = text[: m.start()].strip(" \t\r\n←→:：-")
+        if len(payload) >= _USER_TEXT_MEASURE_MIN_CHARS:
+            kinds = _measure_kinds_in(m.group(0))
+            if kinds:
+                return payload, kinds
+    return _split_leading_measure_question(text)
+
+
+#: 「次の文章は何文字ありますか？「<本文>」」— **問いが先、本文が後** の形。
+#: 後置形 (``_USER_TEXT_MEASURE_RE``) だけを見ていたため、日本語で普通に多い
+#: この語順が素通りしてモデルの目分量に落ちていた。実測 (2026-08-31 ライブ監査
+#: T19#1): 52 文字の文章に **「58文字です」**。
+_LEADING_MEASURE_QUESTION_RE = re.compile(
+    r"^[^「『\"“\n]{0,40}?"
+    r"(?:次|以下|下記|この後|後述)の?(?:文章|文字列|文|テキスト|文言)"
+    r"[^「『\"“\n]{0,24}?"
+    r"(?:何|なん)(?:文字|行|単語|語)[^「『\"“\n]{0,14}",
+)
+
+#: 問いの後ろに置かれた本文の括り。
+_MEASURE_PAYLOAD_SPAN_RE = re.compile(
+    r"[「『\"“]([^」』\"”]{2,4000})[」』\"”]",
+)
+
+
+def _measure_kinds_in(fragment: str) -> tuple[str, ...]:
+    """``fragment`` が指している計量の種別 (純粋関数)。"""
+    return tuple(
+        kind for kind, pattern in _MEASURE_KIND_PATTERNS
+        if pattern.search(fragment)
+    )
+
+
+def _split_leading_measure_question(text: str) -> tuple[str, tuple[str, ...]]:
+    """「次の文章は何文字？「<本文>」」を ``(本文, 計量種別)`` に割る (純粋関数)。
+
+    本文は **括りから取る**。括りが無い場合は本文の境界が決まらないので
+    従来どおりモデルに委ねる (「次の文章は何文字ですか」だけで本文が
+    別ターンにある形を、誤って直前の断片で測らないため)。
+    """
+    m = _LEADING_MEASURE_QUESTION_RE.search(text)
+    if m is None:
+        return "", ()
+    kinds = _measure_kinds_in(m.group(0))
+    if not kinds:
+        return "", ()
+    span = _MEASURE_PAYLOAD_SPAN_RE.search(text, m.end())
+    if span is None:
+        return "", ()
+    payload = span.group(1).strip()
+    if len(payload) < _USER_TEXT_MEASURE_MIN_CHARS:
+        return "", ()
+    return payload, kinds
+
+
+#: 計量対象として扱う最小の本文長。短い断片は「これ」が何を指すか曖昧なので
+#: 従来どおりモデルに委ねる。
+_USER_TEXT_MEASURE_MIN_CHARS = 20
+
+
 def self_output_measure_kinds(query: str) -> tuple[str, ...]:
     """直前の自分の出力の計量を尋ねているか判定する (純粋関数)。
 
@@ -1464,12 +1588,57 @@ def continuation_request(query: str) -> bool:
 #:
 #: ツール目録 (``tool_inventory_question``) と同じ立て付けにする — 自己構成は
 #: system プロンプトに載っていないので、base は知らないまま答える。
+#:
+#: **記憶 / メモリ / memory を同義に扱う。** 漢字表記だけを見ていたため
+#: 「あなたのメモリ階層はどうなっていますか？」が一致せず、確定事実が渡らない
+#: まま「永続メモリ / 会話履歴 / 参考情報」という 3 層の幻覚を返した
+#: (2026-08-31 ライブ監査 T05#3。``Memory architecture fact pinned`` が
+#: backend.log に 1 行も無い)。技術用語としては **カタカナの方が普通** で、
+#: 語彙を漢字に限る理由が無い。
+_MEMORY_WORD = r"(?:記憶|メモリ(?:ー)?|memory)"
 _MEMORY_ARCHITECTURE_RE = re.compile(
     r"(?:あなた|君|きみ|お前|evoref|アシスタント)?[のは]?\s*"
-    r"[^。]{0,12}?記憶"
+    r"[^。]{0,12}?" + _MEMORY_WORD +
     r"[^。]{0,20}?"
-    r"(?:何種類|どんな種類|いくつ|仕組み|構成|どうなって|種類は|階層)",
+    r"(?:何種類|どんな種類|いくつ|仕組み|構成|どうなって|種類は|階層"
+    r"|how many|architecture|hierarchy|structure)",
+    re.IGNORECASE,
 )
+
+#: 「あなたは自己学習しますか」型。**自分が学習するか** を訊いている。
+#:
+#: 実インシデント (2026-08-30 ライブ監査 T07-5): 「あなたは自己学習をします
+#: か？」に「いいえ、自己学習はしません。私は推論時のみ動作するモデルであり、
+#: …各セッションは独立しており、過去の対話内容から自動的に新しいパターンを
+#: 学習して将来の回答を変化させることはありません。」と回答した。同じ会話の
+#: 1 ターン目では SemMem を含む 4 層の記憶を正しく列挙している。自己構成は
+#: system プロンプトに載らないので、base は汎用 LLM の前提で答えてしまう
+#: (``_MEMORY_ARCHITECTURE_RE`` / ``tool_inventory_question`` と同じ立て付け)。
+#:
+#: 一般的な機械学習の話題 (「機械学習とは」「強化学習の仕組み」) には掛けない。
+_GENERIC_ML_TERM_RE = re.compile(
+    r"機械学習|深層学習|強化学習|転移学習|事前学習|教師あり|教師なし"
+    r"|ディープラーニング|ファインチューニング|machine learning|deep learning",
+    re.IGNORECASE,
+)
+_SELF_LEARNING_RE = re.compile(
+    r"自己学習|自己進化|自律学習"
+    r"|(?:あなた|君|きみ|お前|evoref|アシスタント|自分)[のは]?\s*"
+    r"[^。]{0,16}?(?:学習|学ぶ|学ん|学び|成長|進化|賢く)",
+)
+
+
+def self_learning_question(query: str) -> bool:
+    """自分が学習するのか / どう学習するのかを訊いているか (純粋関数)。
+
+    一般的な機械学習の解説要求は対象外 (``_GENERIC_ML_TERM_RE``)。
+    """
+    if not query:
+        return False
+    if _GENERIC_ML_TERM_RE.search(query):
+        return False
+    return bool(_SELF_LEARNING_RE.search(query))
+
 
 #: 「今動いているモデルの名前は？」型。
 #:
@@ -1491,9 +1660,27 @@ _MODEL_IDENTITY_RE = re.compile(
 )
 
 
+#: 計算機ハードウェアの「メモリ」。カタカナを同義語に加えたことで、
+#: 「PC のメモリの仕組みを教えて」まで自己構成の問いに見えてしまうため除外する
+#: (``_GENERIC_ML_TERM_RE`` と同じ立て付け)。
+_HARDWARE_MEMORY_RE = re.compile(
+    r"ram|rom|dram|vram|ddr\d|メモリ(?:ー)?(?:容量|使用量|不足|リーク|swap)"
+    r"|物理メモリ|仮想メモリ|メインメモリ|空きメモリ|搭載メモリ"
+    r"|(?:pc|パソコン|マシン|サーバ|gpu|cpu)[のは]?\s*[^。]{0,6}メモリ",
+    re.IGNORECASE,
+)
+
+
 def memory_architecture_question(query: str) -> bool:
-    """自分の記憶構成を訊いているか (純粋関数)。"""
-    return bool(query) and bool(_MEMORY_ARCHITECTURE_RE.search(query))
+    """自分の記憶構成を訊いているか (純粋関数)。
+
+    計算機ハードウェアの「メモリ」の問い (``_HARDWARE_MEMORY_RE``) は対象外。
+    """
+    if not query:
+        return False
+    if _HARDWARE_MEMORY_RE.search(query):
+        return False
+    return bool(_MEMORY_ARCHITECTURE_RE.search(query))
 
 
 def model_identity_question(query: str) -> bool:

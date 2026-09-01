@@ -157,6 +157,35 @@ class ToolsRegistry:
         """ツール定義を取得"""
         return self._tools.get(name)
 
+    def required_args(self, name: str) -> tuple[str, ...]:
+        """``name`` の **必須引数** を宣言順で返す (未登録なら空)。
+
+        判定は実装関数のシグネチャ — **既定値を持たない引数が必須**。
+        ``parameters`` の宣言には required/optional の区別が無いので、
+        そちらから required を読むと ``list_directory`` の ``max_depth``
+        (既定 3) まで必須になってしまう。
+
+        文法制約 JSON の分類器が arg を 1 つしか生成しないため、必須が 2 つ
+        以上あるツールは呼び出しが必ず失敗する。その事前判定に使う
+        (``tool_call_judge._drop_if_required_args_missing``)。
+        """
+        import inspect
+
+        tool = self._tools.get(name)
+        if tool is None:
+            return ()
+        try:
+            sig = inspect.signature(tool.func)
+        except (TypeError, ValueError):
+            return ()
+        declared = set(tool.parameters or {})
+        return tuple(
+            p.name for p in sig.parameters.values()
+            if p.default is inspect.Parameter.empty
+            and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+            and (not declared or p.name in declared)
+        )
+
     def is_available(self, name: str, mode: str) -> bool:
         """ツールが登録済みかつ現在の ``mode`` で利用可能か。
 

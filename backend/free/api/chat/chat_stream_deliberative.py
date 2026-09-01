@@ -36,6 +36,7 @@ from backend.free.core.stream_filter import (
     InternalFrameMentionFilter,
     ContinuationRepeatFilter,
     LengthDisclosureFilter,
+    UnwrittenFileClaimFilter,
     QueryEchoFilter,
     RepetitionGuardFilter,
     StreamThinkingFilter,
@@ -157,6 +158,11 @@ async def _stream_filtered_token_pipeline(
         # なくパイプラインに置く (LengthDisclosureFilter の docstring 参照)。
         # buffer_only のときは修復を試みたあとで呼出側が開示する。
         filters.append(LengthDisclosureFilter(query))
+    # 「<パス> に書き込みました」と述べたのに実体が無いことを開示する。
+    # buffer_only (制約の検証・修復) 中も付けない — 修復生成の入力に注記が
+    # 混ざるため。呼出側が修復後の本文に対して改めて判定する。
+    if not buffer_only:
+        filters.append(UnwrittenFileClaimFilter())
     if continuation_tail:
         # 継続生成の冒頭にある直前応答の再掲を落とす。プロンプトの
         # 「繰り返さない」指示は実測で効かない (2026-08-27 T10-3)。
@@ -328,6 +334,7 @@ async def _retry_zero_tokens_deliberative(
         # 明示された文字数指定を破ったことを末尾で開示する。層の終端処理では
         # なくパイプラインに置く (LengthDisclosureFilter の docstring 参照)。
         LengthDisclosureFilter(query),
+        UnwrittenFileClaimFilter(),
     ])
     async for token in retry_stream:
         if _cancel_flags.get(session_id):
@@ -408,6 +415,23 @@ def _truncation_frame(
     )
 
 
+def _disclose_unwritten_files(content: str) -> str:
+    """存在しないファイルの書込み主張に開示注記を足す (同期経路用)。
+
+    ストリーミング経路は ``UnwrittenFileClaimFilter`` がパイプラインで同じ
+    ことをする。同期経路にだけ無いと ``stream=False`` の API 呼び出しが
+    黙って「書き込みました」を返す — 検証と開示がストリーミング側にしか
+    無かった過去の非対称 (``verify_and_repair_sync`` の docstring) と同型。
+    """
+    from backend.free.core.stream_filter import UnwrittenFileClaimFilter
+
+    if not content.strip():
+        return content
+    checker = UnwrittenFileClaimFilter()
+    checker.process(content)
+    return content + checker.flush()
+
+
 async def _finalize_deliberative_stream(
     state: _DeliberativeStreamState,
     sess_state: AppState,
@@ -422,8 +446,13 @@ async def _finalize_deliberative_stream(
     private: bool = False,
     rag_used: bool = False,
     rag_top1_score: float | None = None,
+    sent_messages: list[ChatMessage] | None = None,
 ) -> AsyncIterator[str]:
-    """Deliberative ストリーム終端処理: timer 停止 + record + token_info + done."""
+    """Deliberative ストリーム終端処理: timer 停止 + record + token_info + done.
+
+    ``sent_messages`` は ``process()`` が書き戻した **送信版** プロンプト
+    (``record_response`` の同名引数を参照)。
+    """
     if timer:
         timer.stop("llm_total_ms")
     elapsed = time.monotonic() - t_start
@@ -444,6 +473,7 @@ async def _finalize_deliberative_stream(
         action_blocked=state.action_blocked,
         rag_used=rag_used,
         rag_top1_score=rag_top1_score,
+        sent_messages=sent_messages,
     )
     _maybe_cache_reactive_response(
         sess_state, query, state.full_response,
@@ -503,6 +533,11 @@ async def stream_deliberative(
         # try の外で束縛する — finally の outcome ログが参照するため、
         # try 内の早期例外で未定義になると NameError で握り潰される。
         tool_capture: dict = {}
+        # 実際に送ったプロンプト (ツール結果・リマインダー込み) の受け皿。
+        # process() には list(messages) の浅いコピーを渡すため、ここで
+        # 書き戻さないと --develop=evolve の requests JSONL が送信前の姿を
+        # 記録してしまう。
+        sent_messages: list[dict] = []
 
         try:
             yield sse.agent_layer("deliberative")
@@ -532,6 +567,7 @@ async def stream_deliberative(
                 evicted_turns=evicted_turns,
                 session_head=session_head,
                 answered_attributes=answered_attributes,
+                prompt_capture=sent_messages,
             ))
             # process() はトークンを返す前にツール判定と実行を完了させる。
             # ここを素の await にすると、その間 SSE フレームが 1 つも流れず、
@@ -594,6 +630,7 @@ async def stream_deliberative(
                 private=private,
                 rag_used=rag_used,
                 rag_top1_score=rag_top1_score,
+                sent_messages=sent_messages,
             ):
                 yield frame
             outcome_success = True
@@ -661,6 +698,9 @@ async def sync_deliberative(
     """Deliberative 層の非ストリーミング応答 (escalated_from は API 一貫性用、未使用)"""
     logger.debug("Sync deliberative: session=%s, messages=%d", session_id, len(messages))
     t_start = time.monotonic()
+    # ストリーミング側と同じ理由で送信版プロンプトを受け取る (record_response
+    # の ``sent_messages`` 参照)。
+    sent_messages: list[dict] = []
     try:
         # Trigger A: LLM 生成開始直後に sleep-time Light を並列実行（§8.1）
         scheduler = state.sleep_scheduler
@@ -683,6 +723,7 @@ async def sync_deliberative(
             evicted_turns=evicted_turns,
             session_head=session_head,
             answered_attributes=answered_attributes,
+            prompt_capture=sent_messages,
         )
 
         if timer:
@@ -700,6 +741,7 @@ async def sync_deliberative(
             max_tokens=max_tokens,
             generation_params=generation_params,
         )
+        content = _disclose_unwritten_files(content)
         estimated_tokens = max(1, _estimate_tokens(content))
         record_response(
             state, content, messages, session_id,
@@ -712,6 +754,7 @@ async def sync_deliberative(
             tool_routing_success=resp.tool_command_success is True,
             rag_used=rag_used,
             rag_top1_score=rag_top1_score,
+            sent_messages=sent_messages,
         )
         _maybe_cache_reactive_response(
             state, query, content,
@@ -937,6 +980,7 @@ async def sync_reactive_light(
             generation_params=generation_params,
         )
 
+        content = _disclose_unwritten_files(content)
         estimated_tokens = max(1, _estimate_tokens(content))
         record_response(
             state, content, messages, session_id,

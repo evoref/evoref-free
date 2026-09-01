@@ -862,6 +862,7 @@ class ModelMigrator:
             "note_link_threshold",
             "conflict_similarity_threshold",
             "attribute_similarity_threshold",
+            "min_merge_similarity",
         ),
         "rag": (
             "cartridge_gate_threshold",
@@ -972,6 +973,9 @@ class ModelMigrator:
         "cartridge_gate_threshold": ("rag", "cartridge_gate", "threshold"),
         "attribute_similarity_threshold": (
             "memory", "conflict", "attribute_similarity_threshold",
+        ),
+        "min_merge_similarity": (
+            "memory", "conflict_resolver", "min_merge_similarity",
         ),
     }
 

@@ -131,9 +131,21 @@ def _supersede_corrected_slots(
     #: ``mem.personal.location`` の **2 件とも SUPERSEDED** になった
     #: (``occupation`` も同様)。想起は「確認できていません」に落ちる。
     #: 勝者は ``persisted`` の **最後** に来たもの (抽出順 = 発話順)。
+    #:
+    #: **畳む側になり得る全ファクトを勝者表に載せる。** 以前は
+    #: ``is_single_valued_subject`` のものだけを載せていたため、``from_correction``
+    #: で畳みに来る多値スロットのファクトは ``winners.get`` が None になり、
+    #: 同じ subject の訂正 2 件が揃って supersede ループへ入って **互いを
+    #: supersede** した。実データ (2026-08-30 ライブ監査): デプロイ訂正と
+    #: インスタンスタイプ訂正が同じ ``mem.personal.birthday`` (多値) に載り、
+    #: ``sf_17c4c4ac9939 <-> sf_9f97d02bb6b0`` の 2-閉路になってスロットの live が
+    #: 0 件になった。この関数の入口条件と勝者表の条件は同じでなければならない。
     winners: dict[tuple[str, str], object] = {}
     for fact in persisted:
-        if not is_single_valued_subject(getattr(fact, "subject", "") or ""):
+        if not (
+            getattr(fact, "from_correction", False)
+            or is_single_valued_subject(getattr(fact, "subject", "") or "")
+        ):
             continue
         winners[(fact.subject, fact.predicate)] = fact
     for fact in persisted:

@@ -61,7 +61,10 @@ from backend.free.memory.semantic.embedding_store import (
     EmbeddingStore,
 )
 from backend.free.memory.semantic.manifest import Manifest
-from backend.free.memory.semantic.subject_key import SubjectKey
+from backend.free.memory.semantic.subject_key import (
+    SubjectKey,
+    is_generic_subject,
+)
 from backend.free.memory.types import (
     FactType,
     SemanticFact,
@@ -276,8 +279,63 @@ class SemanticFactStore:
                         continue
                     # last-write-wins on id
                     self._facts[fact.id] = fact
+        self._break_supersede_cycles()
         self._rebuild_indexes()
         # 埋め込みは EmbeddingStore 側で既にロード済 (__init__ 内)。
+
+    def _break_supersede_cycles(self) -> int:
+        """``superseded_by`` の閉路を解いて live を 1 件戻す (起動時の自己修復)。
+
+        :meth:`supersede` の閉路ガードは **これから作る** 閉路を防ぐだけで、
+        既に書かれたストアは直らない。閉路に入ったスロットは live が 0 件に
+        なり、想起が静かに 1 世代前の生テキストへ落ちる (:meth:`supersede` の
+        docstring の実データを参照)。
+
+        解き方は「閉路の中で **最も新しい** ファクトを live に戻す」。訂正は
+        後から来るので、最新を現在値とみなすのが訂正の意味論と一致する。
+        戻すのは ``superseded_by`` のみで ``supersedes`` は触らない — 由来の
+        記録であって現在値の判定には使われない。
+
+        Returns:
+            live に戻したファクト数。
+        """
+        repaired = 0
+        # ``superseded_by`` は 1 ノード 1 出辺の関数グラフなので、経路を辿って
+        # **その経路上に** 戻った地点から先が閉路そのもの。訪問済みを持ち回して
+        # 各ノードを 1 度だけ見る。
+        settled: set[str] = set()
+        for start in list(self._facts):
+            if start in settled:
+                continue
+            path: list[str] = []
+            index: dict[str, int] = {}
+            cur: str | None = start
+            while cur is not None and cur not in settled and cur not in index:
+                index[cur] = len(path)
+                path.append(cur)
+                node = self._facts.get(cur)
+                cur = node.superseded_by if node else None
+            settled.update(path)
+            if cur is None or cur not in index:
+                continue  # 閉路ではなく終端 / 既知の経路へ合流しただけ
+            ring = path[index[cur]:]
+            if len(ring) < 2:
+                continue  # 自己ループは supersede() が既に弾いている
+            newest = max(
+                ring,
+                key=lambda fid: float(
+                    getattr(self._facts[fid], "created_at", 0.0) or 0.0,
+                ),
+            )
+            # ロード中なので在メモリだけ直す (``update_fact`` は追記を伴う)。
+            # 次にこのファクトが更新されたときにディスクへも落ちる。
+            self._facts[newest].superseded_by = None
+            repaired += 1
+            logger.warning(
+                "Repaired supersede cycle %s: restored %s as the live value",
+                " -> ".join(ring), newest,
+            )
+        return repaired
 
     def _rebuild_indexes(self) -> None:
         self._by_subject.clear()
@@ -449,8 +507,14 @@ class SemanticFactStore:
         """ファクトを物理削除する
 
         - in-memory 状態 / 索引 / pinned 集合 / 埋め込み行列から取り除く
+        - **消えたファクトを指す supersession 参照を解消する** (下記)
         - ``facts.jsonl`` を残存ファクトのみで書き換える (rewrite)
         - 索引 / 埋め込みファイルも持続化を更新する
+
+        削除したファクトを ``superseded_by`` に持つファクトは、そのままだと
+        **存在しない世代に置き換えられた** 状態で残る。読み出し系は既定で
+        supersede 済を除外するので、そのスロットは live 0 件になり、閉路のとき
+        と同じ「現在値が引けない」壊れ方をする。参照を外して live へ戻す。
 
         Returns:
             実際に削除された場合 ``True``、未存在の場合 ``False``。
@@ -460,9 +524,24 @@ class SemanticFactStore:
             return False
         self._remove_from_indexes(fact)
         self._remove_embedding(fact_id)
+        self._clear_dangling_supersession(fact_id)
         self._rewrite_facts_log()
         logger.debug("delete_fact: id=%s subject=%s", fact_id, fact.subject)
         return True
+
+    def _clear_dangling_supersession(self, removed_id: str) -> None:
+        """削除された ``removed_id`` を指す supersession 参照を取り除く。"""
+        for other in self._facts.values():
+            if other.superseded_by == removed_id:
+                other.superseded_by = None
+                logger.info(
+                    "delete_fact: restored %s as live (its superseder %s was "
+                    "deleted)", other.id, removed_id,
+                )
+            if removed_id in other.supersedes:
+                other.supersedes = [
+                    s for s in other.supersedes if s != removed_id
+                ]
 
     def _remove_embedding(self, fact_id: str) -> None:
         """EmbeddingStore からの削除に委譲する."""
@@ -488,11 +567,37 @@ class SemanticFactStore:
             return len(ids)
         return sum(1 for fid in ids if not self._facts[fid].superseded_by)
 
+    def _supersede_chain_reaches(self, start_id: str, target_id: str) -> bool:
+        """``start_id`` から ``superseded_by`` を辿って ``target_id`` に届くか。"""
+        seen: set[str] = set()
+        cur: str | None = start_id
+        while cur and cur not in seen:
+            if cur == target_id:
+                return True
+            seen.add(cur)
+            fact = self._facts.get(cur)
+            cur = fact.superseded_by if fact else None
+        return False
+
     def supersede(self, old_id: str, new_id: str) -> None:
         """`old_id` を `new_id` で置き換える supersession チェーンを構築する。
 
         `old.superseded_by = new_id` と `new.supersedes += [old_id]` を更新。
         既に supersede 済の old を再 supersede しようとすると `ValueError`。
+
+        **閉路は作らせない。** ``A -> B`` の後に ``B -> A`` を通すと両方の
+        ``superseded_by`` が埋まり、``live_facts`` / ``search_*`` が既定で
+        supersede 済を除外するため **そのスロットの live が 0 件になる**。
+        値が消えるのではなく「現在値が引けない」形で壊れるので、想起は静かに
+        1 世代前の生テキスト (LTM) へ落ちる。
+
+        実データ (2026-08-30 ライブ監査): ``mem.personal.birthday`` の 4 件が
+        ``sf_17c4c4ac9939 <-> sf_9f97d02bb6b0`` の 2-閉路を含む鎖で全滅し、
+        「私の誕生日はいつですか？」に **訂正前の 3月14日** が返った。訂正後の
+        値は SemMem に正しく入っていたのに 1 件も注入されていない。閉路は
+        バッチを跨いで作られるため、抽出側のバッチ内ガード
+        (``sleep.extraction`` の ``winners``) では防ぎ切れない。ここが
+        supersession の SSOT なので、不変則はここで守る。
         """
         old = self._facts.get(old_id)
         new = self._facts.get(new_id)
@@ -506,12 +611,77 @@ class SemanticFactStore:
             raise ValueError(
                 f"fact {old_id} already superseded by {old.superseded_by}",
             )
+        if self._supersede_chain_reaches(new_id, old_id):
+            raise ValueError(
+                f"superseding {old_id} by {new_id} would create a cycle "
+                f"({new_id} is already superseded by {old_id} transitively)",
+            )
         self.update_fact(old_id, superseded_by=new_id)
         merged: list[str] = list(new.supersedes)
         if old_id not in merged:
             merged.append(old_id)
         self.update_fact(new_id, supersedes=merged)
         logger.info("supersede: %s -> %s", old_id, new_id)
+        self._supersede_generic_shadows(old_id, new_id)
+
+    def _supersede_generic_shadows(self, old_id: str, new_id: str) -> int:
+        """``old_id`` と同じノート由来の **汎用スロット** ファクトも一緒に畳む。
+
+        1 つの発話は複数の tag で抽出されるため、属性を解決できた tag は
+        ``mem.preference.tooling`` のような固有スロットへ、解決できなかった tag は
+        ``mem.<kind>.user`` の **汎用フォールバック** へ入る。訂正は固有スロットに
+        しか届かないので、汎用側の値は **supersede されないまま live に残る**。
+        属性を持たないぶん ``asked_attrs`` の免除にも掛からず、埋め込み類似だけで
+        いつまでも注入され続ける。
+
+        実データ (2026-08-30 ライブ監査の追試): 「私の使っているエディタは Vim
+        です。」がノート ``44cdd772ec6f`` から 2 件になり、
+        ``mem.preference.tooling`` は Neovim の訂正で supersede されたのに
+        ``mem.personal.user`` の Vim は live のまま残った。
+
+        **汎用スロットは属性としての身元を持たない = その発話の影**なので、影の
+        元が畳まれたら影も畳む。同一ノートでも **属性を持つ** 兄弟には手を出さない
+        — 「私の名前は小川で、猫はミケです。」のような 1 発話 2 主張を巻き込まない
+        ため (name を訂正しても pet は別の主張)。
+
+        Returns:
+            追加で supersede した件数。
+        """
+        old = self._facts.get(old_id)
+        if old is None:
+            return 0
+        note_ids = {
+            p.note_id for p in (old.provenances or []) if p.note_id
+        }
+        if not note_ids:
+            # セッション要約 (mem.decision.history.*) は note_id を持たない。
+            # ここを通すと「note_id なし」同士が 1 つの主張として束ねられる。
+            return 0
+        done = 0
+        for fact in list(self._facts.values()):
+            if fact.id in (old_id, new_id) or fact.superseded_by:
+                continue
+            if fact.scope != old.scope:
+                continue
+            if not is_generic_subject(fact.subject):
+                continue
+            if not note_ids.intersection(
+                p.note_id for p in (fact.provenances or []) if p.note_id
+            ):
+                continue
+            try:
+                self.update_fact(fact.id, superseded_by=new_id)
+            except (KeyError, ValueError) as exc:
+                logger.warning(
+                    "Failed to retire generic shadow %s: %s", fact.id, exc,
+                )
+                continue
+            done += 1
+            logger.info(
+                "supersede: retired generic shadow %s (%s) with %s",
+                fact.id, fact.subject, old_id,
+            )
+        return done
 
     # ── 検索 ──────────────────────────────────────────────────────────
 
