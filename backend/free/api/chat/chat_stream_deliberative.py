@@ -579,6 +579,7 @@ async def stream_deliberative(
                 session_id=session_id,
                 evicted_turns=evicted_turns,
                 session_head=session_head,
+                private=private,
                 answered_attributes=answered_attributes,
                 prompt_capture=sent_messages,
             ))
@@ -738,6 +739,7 @@ async def sync_deliberative(
             session_id=session_id,
             evicted_turns=evicted_turns,
             session_head=session_head,
+            private=private,
             answered_attributes=answered_attributes,
             prompt_capture=sent_messages,
         )

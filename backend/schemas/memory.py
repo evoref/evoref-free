@@ -104,7 +104,8 @@ class FactsConfig(BaseModel):
     """pinned ノート由来の抽出上限。``-1`` で無制限"""
 
     extract_from_mdp_trace: bool = True
-    """``agent_trace.jsonl`` から MDPTraceExtractor を実行するか"""
+    """常設ストア (``local_paths.agent_trace_dir``) の ``agent_trace*.jsonl`` から
+    MDPTraceExtractor を実行するか"""
 
     ingest_mdp_trace_to_ltm: bool = True
     """``agent_trace*.jsonl`` を episodic LTM に取り込むか

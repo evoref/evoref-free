@@ -157,6 +157,11 @@ def _redaction_processor(
     return {k: _redact_value(k, v) for k, v in event_dict.items()}
 
 
+def redact_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """structlog を通さない書き手 (常設ストア等) 向けに同じ redaction を掛ける。"""
+    return {k: _redact_value(k, v) for k, v in payload.items()}
+
+
 # ---------------------------------------------------------------------------
 # Processor: JSONL レンダラ (event キーは出力しない)
 # ---------------------------------------------------------------------------

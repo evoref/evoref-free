@@ -78,7 +78,7 @@ class SleepTimeScheduler:
         # ``on_response_sent`` が毎ターン タイマーを張り直すため、Full は
         # **一度も走らない**。実測 (2026-08-16 ライブ監査、40 ターン / 53 分):
         # full の起動試行 39 件が全て cancelled=True / skipped_reason=debounced
-        # で、実行 0 回。``memory.facts.trigger: idle_full_only`` と噛み合って
+        # で、実行 0 回。ファクト抽出 (Step 8) が Full にしか無いことと噛み合って
         # 40 ターン分のファクトが 1 件も SemMem へ入らず、「覚えておいて」に
         # 「記憶しました」と答えているのに [関連する記憶] は空のままだった。
         # 最後に Full が完了してからこの時間を超えたら、ユーザーが会話中でも
@@ -354,8 +354,8 @@ class SleepTimeScheduler:
     def request_full_soon(self, reason: str) -> None:
         """次の Trigger B (Full) を前倒しで走らせる。
 
-        ファクト抽出 (Step 8) と競合解決 (Step 6B) は **Full にしか無い**
-        (``memory.facts.trigger: idle_full_only``)。Light は Step 1-5.5 だけで、
+        ファクト抽出 (Step 8) と競合解決 (Step 6B) は **Full にしか無い**。
+        Light は Step 1-5.5 だけで、
         埋め込み・タグ・スコア・eviction しかやらない。そのため既定では
         「アイドル 10 分」か「繰り延べ上限 30 分」まで、ユーザーの訂正が
         SemMem に一切反映されない。

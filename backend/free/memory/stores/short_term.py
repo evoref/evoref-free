@@ -216,11 +216,10 @@ class ShortTermMemory:
         # package 同梱 default の 2 段階で解決する。``triggers_dir=None`` の
         # 場合は override を使わず default のみ (テスト / 最小 config 用途)。
         self._pin_triggers_dir: str | Path | None = triggers_dir
-        # NOTE: config キー ``memory.pin.auto_detect_confirm`` は将来の
-        # 「自動 pin 検出時にユーザー確認を挟む」フローのための予約 (未実装)。
-        # 現状この値を消費するコードは無いため、ここでは読み込まない
-        # (config.yaml.example には予約キーとして残す)。確認フローを実装する際に
-        # 本クラス or pin_detector で参照する。
+        # NOTE: config キー ``memory.pin.auto_detect_confirm`` (「自動 pin 検出時に
+        # ユーザー確認を挟む」フロー用に予約されていた) は値を読むコードが無いため
+        # 撤去済み (``MemoryConfig.REMOVED_MEMORY_KEYS``)。確認フローを実装する際は
+        # 新たにキーを追加した上で本クラス or pin_detector で参照する。
 
     def _load_pin_triggers(self) -> PinTriggers:
         """Pin トリガ辞書をプロセス内シングルトンから取得 (パスごと cache)。"""

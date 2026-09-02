@@ -156,6 +156,9 @@ class LocalPathsConfig(BaseModel):
     # EvorefMem ローカル状態
     local_state_file: str = "local/state.json"
     memory_dir: str = "local/memory/"
+    # AgentTracer の MDP トレース常設ストア (agent_trace_YYYY-MM-DD.jsonl)。
+    # develop フラグに依らず書かれ、sleep-time の MDP ingest (episodic LTM) が読む。
+    agent_trace_dir: str = "local/memory/agent_trace/"
     prompts_dir: str = "local/prompts/"
     cartridges_dir: str = "local/cartridges/"
     history_dir: str = "local/history/"

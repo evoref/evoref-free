@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from backend.io import atomic_write_text
 from backend.log_config import get_logger
 
 logger = get_logger("agent.prompt_store")
@@ -114,7 +115,7 @@ def archive_to_history(
     history_dir = prompt_dir / "history"
     history_dir.mkdir(parents=True, exist_ok=True)
     dst = history_file_path(prompt_dir, key_prefix, version)
-    dst.write_text(content, encoding="utf-8")
+    atomic_write_text(dst, content, encoding="utf-8")
 
 
 def read_history_version(
@@ -170,7 +171,7 @@ def write_body(prompt_dir: Path, key_prefix: str, content: str) -> None:
     """本文ファイルへ UTF-8 で書き込む。親ディレクトリは自動作成。"""
     prompt_dir.mkdir(parents=True, exist_ok=True)
     path = body_file_path(prompt_dir, key_prefix)
-    path.write_text(content, encoding="utf-8")
+    atomic_write_text(path, content, encoding="utf-8")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -210,7 +211,8 @@ def write_meta_dict(prompt_dir: Path, key_prefix: str, data: dict) -> None:
     """メタ dict を JSON として書き込む。親ディレクトリは自動作成。"""
     prompt_dir.mkdir(parents=True, exist_ok=True)
     path = meta_file_path(prompt_dir, key_prefix)
-    path.write_text(
+    atomic_write_text(
+        path,
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )

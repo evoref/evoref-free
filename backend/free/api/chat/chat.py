@@ -39,6 +39,7 @@ from backend.free.api.chat.chat_service import (
     build_chat_messages, build_semmem_injection, convert_file_contexts,
     ensure_base_model_health,
     collect_pending_conflicts, deliberative_post_append_reserve_tokens,
+    notes_post_append_reserve_tokens,
     ensure_llm_client, prepare_memory_context,
     run_search_pipeline, session_evicted_turns, session_first_user_message,
 )
@@ -510,6 +511,8 @@ async def _dispatch_continuation(
         ),
         evicted_turns=session_evicted_turns(state, session_id),
         session_id=session_id,
+        # ツール結果は積まれないが、接地注記は全経路で積まれる。
+        post_append_reserve_tokens=notes_post_append_reserve_tokens(),
     )
     logger.info(
         "Continuation dispatch: resuming %s response (tail=%d chars)",
@@ -612,6 +615,8 @@ async def _dispatch_reactive_light(
         evicted_turns=session_evicted_turns(state, session_id),
         # 会話全体の計量 (「何ターン目?」) は session_id が無いと no-op になる。
         session_id=session_id,
+        # ツール結果は積まれないが、接地注記は全経路で積まれる。
+        post_append_reserve_tokens=notes_post_append_reserve_tokens(),
     )
     light_max = min(max_tokens or REACTIVE_LIGHT_MAX_TOKENS, REACTIVE_LIGHT_MAX_TOKENS)
     if req.stream:

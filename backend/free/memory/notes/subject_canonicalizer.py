@@ -38,12 +38,13 @@ SemanticFact の `subject` フィールドは検索・索引・コンフリク�
 いずれも :meth:`SubjectKey.try_parse` が ``None`` を返す不正形式 (空セグメント
 など) の場合は passthrough にフォールバックする。
 
-## auto_expand について
+## 自動拡張について
 
-「最小から、自動拡張なし」と決まっている。本モジュールはエントリの
-自動学習・自動追加を **行わない**。エントリ追加はユーザーによる
-``subject_dictionary.json`` の手編集、または将来の専用管理 API 経由で
-行う想定。
+「最小から、自動拡張なし」と決まっている (旧 config キー
+``memory.subject_dictionary.auto_expand`` は仕様上 ``false`` 固定だったため撤去済み)。
+本モジュールはエントリの自動学習・自動追加を **行わない**。エントリ追加は
+ユーザーによる ``subject_dictionary.json`` の手編集、または将来の専用管理 API
+経由で行う想定。
 
 ## ファイル形式
 

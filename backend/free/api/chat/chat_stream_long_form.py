@@ -220,6 +220,7 @@ def _emit_long_form_episode(
             reward=1.0 if success else 0.0,
         ))
         tracer.end_episode(episode_id, "success" if success else "failure")
+        tracer.cleanup_episode(episode_id)
     except Exception as e:
         logger.debug("long_form episode emit skipped: %s", e)
 

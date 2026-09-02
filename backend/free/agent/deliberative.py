@@ -27,7 +27,7 @@ from backend.free.agent.tools.builtin import (
 from backend.free.constants import READ_FILE_META_PREFIX
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.issue_ledger import count_kind, format_issues
-from backend.free.agent.tool_ledger import format_ledger, record_current
+from backend.free.agent.tool_ledger import format_ledger
 from backend.free.core.intent_vocab import (
     assistant_code_blocks,
     prior_code_block_request,
@@ -2192,6 +2192,7 @@ class DeliberativeAgent:
         session_head: str = "",
         answered_attributes: frozenset[str] = frozenset(),
         prompt_capture: list[dict] | None = None,
+        private: bool = False,
     ) -> DeliberativeResponse | AsyncIterator[str]:
         """Deliberative 層で LLM 推論を実行
 
@@ -2264,6 +2265,7 @@ class DeliberativeAgent:
         # begin→step→end を同期完結できる (生成は応答であり agent action ではない)。
         self._trace_tool_episode(
             session_id, mode, query, tool_name_used, tool_result_text, tool_success,
+            private=private,
         )
 
         # streaming 経路は DeliberativeResponse を返さないため、command を
@@ -2364,6 +2366,8 @@ class DeliberativeAgent:
         tool_name: str | None,
         tool_result: str | None,
         tool_success: bool | None,
+        *,
+        private: bool = False,
     ) -> None:
         """deliberative の tool 実行を 1 step MDP エピソードとして記録する。
 
@@ -2389,7 +2393,10 @@ class DeliberativeAgent:
         reward = 1.0 if tool_success else 0.0
         errored = is_tool_error(tool_result)
         try:
-            episode_id = tracer.begin_episode(session_id, mode)
+            # private は begin に刻む (Step 7.5 / 8 がエピソード記憶と decision
+            # ファクトへ昇格させないための一次情報。STM の private ノートは
+            # Full より先に押し出されることがある)。
+            episode_id = tracer.begin_episode(session_id, mode, private=private)
             tracer.record_step(episode_id, MDPStep(
                 step_index=0,
                 state={"query": query[:200], "agent_layer": "deliberative"},
@@ -2553,9 +2560,8 @@ class DeliberativeAgent:
         except asyncio.TimeoutError:
             error_text = f"Error: tool execution timed out after {timeout_sec}s"
             state.on_tool_failure(tool_name, error_text)
-            # ``ToolsRegistry.execute`` の記録点に届かないので、台帳の
-            # 「実行したツールはこれがすべて」を保つためここで失敗を記録する。
-            record_current(tool_name, False)
+            # 台帳への記録は ``ToolsRegistry.execute`` (唯一の合流点) が
+            # CancelledError を捕まえて行う。ここで足すと二重に載る。
             logger.warning(
                 "Tool execution timed out: %s (%.0fs)", tool_name, timeout_sec,
             )
@@ -2564,7 +2570,6 @@ class DeliberativeAgent:
         except Exception as e:
             error_text = f"Error: {e}"
             state.on_tool_failure(tool_name, str(e))
-            record_current(tool_name, False)
             logger.warning("Tool execution failed: %s - %s", tool_name, e)
             _emit_tool_failure_step(on_step, tool_name, error_text)
             return error_text

@@ -309,6 +309,13 @@ async def _run_lifespan_shutdown(
         await _shutdown_evolve_pipeline(
             ctx.log_ingestor, ctx.policy_adjuster, ctx.log_ingestor_bridge_task,
         )
+    with _timed(shutdown_timings, "agent_trace_close"):
+        tracer = getattr(state, "agent_tracer", None)
+        if tracer is not None and hasattr(tracer, "close"):
+            try:
+                tracer.close()
+            except Exception as e:
+                logger.warning("AgentTracer close failed: %s", e)
     with _timed(shutdown_timings, "llm_client_close"):
         await _shutdown_llm_client(state)
     with _timed(shutdown_timings, "embedder_close"):

@@ -21,6 +21,7 @@ from backend.free.llm._base_client import (
     async_retry_http_call,
     make_retry_logger,
 )
+from backend.free.core.turn_text import split_last_user
 from backend.free.llm.model_metadata import ModelMetadata
 from backend.free.llm.utils import extract_content
 from backend.log_config import get_logger
@@ -478,51 +479,9 @@ def _ctx_truncation_notice() -> str:
         return _CTX_TRUNCATION_NOTICE["ja"]
 
 
-#: ``turn_text.split_last_user`` が未提供のときの区切り (fallback 用)。
-#: ``core.inference._DYNAMIC_CONTEXT_DELIMITER`` / ``agent.deliberative`` の
-#: ``## ツール実行結果`` と同じ文字列。
-_FALLBACK_DYNAMIC_DELIMITER = "[ここまで参考枠 / ここからユーザーの発言]\n"
-_FALLBACK_TOOL_RESULT_HEADER = "## ツール実行結果"
-
-
-def _split_last_user_fallback(content: str) -> tuple[str, str, str]:
-    """``split_last_user`` が無いときの簡易分割 ``(prefix_blocks, raw_query, suffix)``。
-
-    前置ブロックは最後の動的区切りまで、後置はツール実行結果の見出し以降。
-    ``prefix + raw_query + suffix == content`` を保つ。
-    """
-    prefix = ""
-    body = content
-    idx = body.rfind(_FALLBACK_DYNAMIC_DELIMITER)
-    if idx >= 0:
-        cut = idx + len(_FALLBACK_DYNAMIC_DELIMITER)
-        prefix, body = body[:cut], body[cut:]
-    suffix = ""
-    tidx = body.find(_FALLBACK_TOOL_RESULT_HEADER)
-    if tidx > 0:
-        # 見出し直前の空行 (``\n\n## ツール実行結果``) も suffix 側へ寄せる
-        while tidx > 0 and body[tidx - 1] == "\n":
-            tidx -= 1
-        body, suffix = body[:tidx], body[tidx:]
-    return prefix, body, suffix
-
-
 def _split_last_user(content: str) -> tuple[str, str, str]:
-    """最後の user メッセージを ``(prefix_blocks, raw_query, suffix)`` に分ける。
-
-    ``backend.free.core.turn_text.split_last_user`` (区切りの SSOT) があれば
-    それを使い、無ければ :func:`_split_last_user_fallback`。
-    """
-    try:
-        from backend.free.core.turn_text import split_last_user
-    except ImportError:
-        return _split_last_user_fallback(content)
-    prefix, raw, suffix = split_last_user(content)
-    if not isinstance(prefix, str):
-        prefix = "".join(prefix)
-    if not isinstance(suffix, str):
-        suffix = "".join(suffix)
-    return prefix, raw, suffix
+    """最後の user メッセージを ``(prefix_blocks, raw_query, suffix)`` に分ける。"""
+    return split_last_user(content)
 
 
 def _history_drop_block() -> int:

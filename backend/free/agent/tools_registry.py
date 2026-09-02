@@ -345,15 +345,31 @@ class ToolsRegistry:
         validation_error = self._validate_args(tool, kwargs)
         if validation_error:
             logger.warning("Tool arg validation failed: %s - %s", name, validation_error)
+            # 実行に至らなかった撃ち方も「実行しようとした」記録として残す。
+            # 台帳が空だとモデルは「そのツールは使っていません」と答える。
+            record_current(name, False, reason="invalid_args")
+            _record_tool_issue(name, False, validation_error)
             return f"Error: {validation_error}"
 
         logger.info("Executing tool: %s(%s)", name, _summarize_args_for_log(kwargs))
 
-        if inspect.iscoroutinefunction(tool.func):
-            result = await tool.func(**kwargs)
-        else:
-            # 同期関数はスレッドプールで実行し、イベントループをブロックしない
-            result = await asyncio.to_thread(tool.func, **kwargs)
+        try:
+            if inspect.iscoroutinefunction(tool.func):
+                result = await tool.func(**kwargs)
+            else:
+                # 同期関数はスレッドプールで実行し、イベントループをブロックしない
+                result = await asyncio.to_thread(tool.func, **kwargs)
+        except asyncio.CancelledError:
+            # 呼出側の ``asyncio.wait_for`` による timeout もここへ届く
+            # (キャンセルは await 中のこのコルーチンに配送される)。呼出側で
+            # 記録すると経路ごとに取りこぼすので、合流点であるここで残す。
+            record_current(name, False, reason="timeout")
+            _record_tool_issue(name, False, "timeout")
+            raise
+        except Exception as e:
+            record_current(name, False, reason="error")
+            _record_tool_issue(name, False, str(e))
+            raise
 
         # 自己申告の根拠 (「この会話で実際に何を実行したか」)。実行経路は 6 箇所に
         # 分かれているので、記録は **唯一の合流点であるここ** で行う。呼出側に

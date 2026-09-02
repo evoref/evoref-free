@@ -426,6 +426,9 @@
     "tool_ledger": {
       "success": "succeeded",
       "failure": "failed",
+      "failure_timeout": "failed (timeout)",
+      "failure_error": "failed (error)",
+      "failure_invalid_args": "failed (invalid arguments)",
       "entry": "- {index}. {tool} ({status}) — request “{query}”",
       "omitted": "({count} older entries omitted)"
     },

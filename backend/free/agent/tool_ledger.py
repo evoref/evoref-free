@@ -50,6 +50,9 @@ class ToolUse:
     tool_name: str
     success: bool
     query_head: str
+    #: 失敗理由の識別子 (``timeout`` / ``error`` / ``invalid_args``)。
+    #: 空なら理由を添えずに「失敗」とだけ表示する。
+    reason: str = ""
 
 
 _ledger: "OrderedDict[str, deque[ToolUse]]" = OrderedDict()
@@ -69,6 +72,7 @@ def _bucket(session_id: str) -> "deque[ToolUse]":
 
 def record_tool_use(
     session_id: str, tool_name: str | None, success: bool, query: str,
+    reason: str = "",
 ) -> None:
     """ツール実行を台帳へ追記する。``tool_name`` が空なら no-op。"""
     if not session_id or not tool_name:
@@ -78,6 +82,7 @@ def record_tool_use(
             tool_name=tool_name,
             success=bool(success),
             query_head=(query or "")[:40],
+            reason=reason,
         ),
     )
 
@@ -123,16 +128,18 @@ def ledger_scope(session_id: str, query: str) -> Iterator[None]:
         _current_target.reset(token)
 
 
-def record_current(tool_name: str | None, success: bool) -> None:
+def record_current(tool_name: str | None, success: bool, reason: str = "") -> None:
     """``ledger_scope`` が設定した宛先へツール実行を記録する。
 
     スコープ外 (sleep-time / 学習ジョブ等) の実行は宛先が無いので no-op。
+    ``reason`` は失敗時のみ意味を持つ (``timeout`` / ``error`` /
+    ``invalid_args``)。
     """
     target = _current_target.get()
     if target is None:
         return
     session_id, query = target
-    record_tool_use(session_id, tool_name, success, query)
+    record_tool_use(session_id, tool_name, success, query, reason)
 
 
 def mark_last_failed(tool_name: str | None = None) -> bool:
@@ -159,6 +166,7 @@ def mark_last_failed(tool_name: str | None = None) -> bool:
         return False
     bucket[-1] = ToolUse(
         tool_name=last.tool_name, success=False, query_head=last.query_head,
+        reason=last.reason,
     )
     return True
 
@@ -172,6 +180,21 @@ def current_session_id() -> str:
     """
     target = _current_target.get()
     return target[0] if target else ""
+
+
+#: 失敗理由 -> i18n キー。未知の理由は理由なしの「失敗」へ縮退させる。
+_REASON_KEYS: dict[str, str] = {
+    "timeout": "agent.tool_ledger.failure_timeout",
+    "error": "agent.tool_ledger.failure_error",
+    "invalid_args": "agent.tool_ledger.failure_invalid_args",
+}
+
+
+def _status_key(entry: ToolUse) -> str:
+    """1 件の成否 (と失敗理由) に対応する i18n キー。"""
+    if entry.success:
+        return "agent.tool_ledger.success"
+    return _REASON_KEYS.get(entry.reason, "agent.tool_ledger.failure")
 
 
 def format_ledger(session_id: str) -> str:
@@ -191,10 +214,7 @@ def format_ledger(session_id: str) -> str:
             "agent.tool_ledger.entry",
             index=i,
             tool=e.tool_name,
-            status=msg(
-                "agent.tool_ledger.success" if e.success
-                else "agent.tool_ledger.failure",
-            ),
+            status=msg(_status_key(e)),
             query=e.query_head,
         )
         for i, e in enumerate(tail, start=len(entries) - len(tail) + 1)

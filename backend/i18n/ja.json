@@ -426,6 +426,9 @@
     "tool_ledger": {
       "success": "成功",
       "failure": "失敗",
+      "failure_timeout": "失敗 (タイムアウト)",
+      "failure_error": "失敗 (エラー)",
+      "failure_invalid_args": "失敗 (引数不正)",
       "entry": "- {index}. {tool} ({status}) — 依頼「{query}」",
       "omitted": "(古い {count} 件は省略)"
     },

@@ -17,6 +17,7 @@ from backend.log_config import get_logger
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
+    from backend.free.agent.agent_trace_store import AgentTraceStore
 
 logger = get_logger("agent.tracer")
 
@@ -36,13 +37,23 @@ class MDPStep:
 class AgentTracer:
     """エージェント実行を MDP エピソード形式で記録
 
-    デバッグモード時に agent_trace.jsonl へ JSONL 出力し、
-    同時にインメモリでステップを保持してクレジット割当に利用する。
+    イベントは常設の :class:`AgentTraceStore` (``local/memory/agent_trace/``、
+    エピソード記憶の入力) へ書き、develop モードでは同じものを DebugLogger の
+    ``agent_trace`` JSONL にも出す (観測用)。同時にインメモリでステップを
+    保持してクレジット割当に利用する。
     """
 
-    def __init__(self, debug_logger: DebugLogger | None = None) -> None:
+    def __init__(
+        self,
+        debug_logger: DebugLogger | None = None,
+        trace_store: AgentTraceStore | None = None,
+    ) -> None:
         self._debug_logger = debug_logger
+        self._trace_store = trace_store
         self._episodes: dict[str, list[MDPStep]] = {}
+        #: episode_id → conversation_id。例外 / キャンセルで ``end_episode`` に
+        #: 到達しなかったエピソードを ``abort_open_episodes`` で閉じるための索引。
+        self._conversation_of: dict[str, str] = {}
 
     def begin_episode(
         self, conversation_id: str, mode: str, *, private: bool = False,
@@ -55,6 +66,7 @@ class AgentTracer:
         """
         episode_id = f"ep_{uuid.uuid4().hex[:8]}"
         self._episodes[episode_id] = []
+        self._conversation_of[episode_id] = conversation_id
 
         event: dict = {
             "event": "begin",
@@ -111,9 +123,36 @@ class AgentTracer:
     def cleanup_episode(self, episode_id: str) -> None:
         """エピソードのインメモリデータを破棄"""
         self._episodes.pop(episode_id, None)
+        self._conversation_of.pop(episode_id, None)
+
+    def abort_open_episodes(
+        self, conversation_id: str, outcome: str = "failure: aborted",
+    ) -> int:
+        """``conversation_id`` の未終了エピソードを ``outcome`` で閉じて破棄する。
+
+        呼出側が例外 / タイムアウト / 切断で ``end_episode`` に届かなかった
+        場合の後始末。``end`` が無いエピソードは MDP ingest の保留に永久滞留し、
+        インメモリの ``_episodes`` も増え続ける。正常終了後に呼んでも no-op。
+        """
+        open_ids = [
+            ep for ep, conv in self._conversation_of.items() if conv == conversation_id
+        ]
+        for ep in open_ids:
+            self.end_episode(ep, outcome)
+            self.cleanup_episode(ep)
+        return len(open_ids)
+
+    def close(self) -> None:
+        """常設ストアのファイルハンドルを閉じる (lifespan shutdown)。"""
+        store = self._trace_store
+        if store is not None:
+            store.close()
 
     def _log(self, data: dict) -> None:
-        """DebugLogger 経由で agent_trace.jsonl に書き込み"""
+        """常設ストアと (develop 時は) DebugLogger の両方へ書き込み"""
+        store = self._trace_store
+        if store is not None:
+            store.append(data)
         dl = self._debug_logger
         if dl is not None:
             dl.log_agent_trace_event(data)

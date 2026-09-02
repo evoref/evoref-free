@@ -3,7 +3,6 @@
 import json
 from collections.abc import Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -11,9 +10,6 @@ from backend.exceptions import VectorDimensionMismatchError
 from backend.io import atomic_write_text
 from backend.log_config import get_logger
 from backend.utils import utc_now_dt
-
-if TYPE_CHECKING:
-    from backend.debug_logger import DebugLogger
 
 logger = get_logger("rag.vector_store")
 
@@ -131,14 +127,11 @@ class VectorStore:
         vectors_dir: str | Path,
         memmap_threshold: int = DEFAULT_MEMMAP_THRESHOLD,
         quantization: str = "int8",
-        debug_logger: "DebugLogger | None" = None,
     ):
         """
         Args:
             vectors_dir: インデックスの配置ディレクトリ
             memmap_threshold: memmap に切り替えるベクトル件数の閾値
-            debug_logger: ``rag`` JSONL 出力先 (``wire_pillars`` の既存
-                インスタンスを注入。``None`` なら出力なし)
             quantization: 検索時の量子化利用方針 (config ``rag.quantization``)。
 
                 - ``int8`` (既定): int8 粗検索で候補を絞り、候補のみ float32 に
@@ -150,7 +143,6 @@ class VectorStore:
                 変える。
         """
         self.quantization = quantization
-        self._debug_logger = debug_logger
         self.vectors_dir = Path(vectors_dir)
         self.chunks_dir = self.vectors_dir / "chunks"
         self.source_texts_dir = self.vectors_dir / "source_texts"

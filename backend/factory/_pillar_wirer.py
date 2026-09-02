@@ -836,7 +836,6 @@ def _build_bm25_index(
             use_trigrams=bool(rag_cfg.get("bm25_use_trigrams", False)),
             split_ascii=bool(rag_cfg.get("bm25_split_ascii", True)),
             stopwords=stopwords,
-            debug_logger=state.debug_logger,
         )
         n = build_index_from_vector_store(bm25, vs)
         logger.info("BM25 index initialized: %d chunks", n)
@@ -927,9 +926,7 @@ def _init_lazy_contextual(
         from backend.free.rag.contextual_prefix import ContextualPrefixGenerator
         from backend.free.rag.lazy_contextual import LazyContextualPrefixService
 
-        generator = ContextualPrefixGenerator(
-            state.aux_client, cfg, debug_logger=state.debug_logger,
-        )
+        generator = ContextualPrefixGenerator(state.aux_client, cfg)
         service = LazyContextualPrefixService(
             generator=generator,
             embedder=embedder,
@@ -1165,15 +1162,10 @@ def _init_sleep_time_worker(
         except Exception as exc:
             logger.warning("Step 8 wiring: subject canonicalizer init failed: %s", exc)
 
-        # agent_trace*.jsonl は debug_logger.log_dir 配下に日付付き
-        # ファイル名 (``agent_trace_YYYY-MM-DD.jsonl``) で出力されるため、
-        # ディレクトリそのものを Step 8 / MDPIngester に渡す
-        agent_trace_dir = None
-        try:
-            if debug_logger is not None and debug_logger.enabled:
-                agent_trace_dir = debug_logger.log_dir
-        except Exception:
-            agent_trace_dir = None
+        # agent_trace*.jsonl は AgentTraceStore が常設ディレクトリへ日付付き
+        # ファイル名 (``agent_trace_YYYY-MM-DD.jsonl``) で出力する (develop
+        # フラグ非依存)。ディレクトリそのものを Step 8 / MDPIngester に渡す。
+        agent_trace_dir = _agent_trace_dir()
 
         # Step 10 でアーカイブ後にキャッシュ済 SemanticFactStore を破棄
         def _semantic_invalidator(scope: str) -> None:
@@ -1643,13 +1635,26 @@ def _init_tools(
     logger.info("ReactiveAgent initialized (resident)")
 
 
-def _init_agent_tracer(state: AppState, debug_logger: "DebugLogger") -> None:
-    """7k. AgentTracer 初期化（MDP トレース構造化ログ）"""
-    from backend.free.agent.agent_tracer import AgentTracer
+def _agent_trace_dir() -> Path | None:
+    """MDP トレース常設ストアのディレクトリ (``local_paths.agent_trace_dir``)。"""
+    try:
+        from backend.config import get_path_resolver
+        return get_path_resolver().resolve_local("agent_trace_dir")
+    except Exception as exc:
+        logger.warning("agent_trace_dir unresolved, MDP trace store disabled: %s", exc)
+        return None
 
-    agent_tracer = AgentTracer(debug_logger=debug_logger)
+
+def _init_agent_tracer(state: AppState, debug_logger: "DebugLogger") -> None:
+    """7k. AgentTracer 初期化（MDP トレース: 常設ストア + develop 時の JSONL）"""
+    from backend.free.agent.agent_tracer import AgentTracer
+    from backend.free.agent.agent_trace_store import AgentTraceStore
+
+    trace_dir = _agent_trace_dir()
+    trace_store = AgentTraceStore(trace_dir) if trace_dir is not None else None
+    agent_tracer = AgentTracer(debug_logger=debug_logger, trace_store=trace_store)
     state.agent_tracer = agent_tracer
-    logger.info("AgentTracer initialized")
+    logger.info("AgentTracer initialized (trace_dir=%s)", trace_dir)
 
 
 def _init_loop_driver(

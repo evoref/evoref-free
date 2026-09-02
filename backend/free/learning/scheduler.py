@@ -989,6 +989,7 @@ class LearningScheduler:
             cartridge_ids=cart_ids,
             experiences=safe_exp,
             reason=reason,
+            experience_cutoff=self._last_run,
         )
         self.save_active_session(session)
         logger.info(
@@ -1166,6 +1167,7 @@ class LearningScheduler:
         llm_client,
         results: dict[str, dict],
         phase_durations: dict[str, float],
+        experience_cutoff: float = 0.0,
     ) -> list[str]:
         """Level 1 追加最適化 (f_04 §4): prompt 進化以外の evolver 群を一括実行する
 
@@ -1196,7 +1198,7 @@ class LearningScheduler:
             experiences, results, phase_durations,
         ))
         await _phase("phase7_tool_routing", lambda: self._level1_phase7_tool_routing(
-            experiences, results, phase_durations,
+            experiences, results, phase_durations, experience_cutoff,
         ))
         # Step 12 — PolicyEvolver 評価/書き戻し
         await _phase("step12_policy_evolver", lambda: self._step12_policy_evolver(
@@ -1334,6 +1336,7 @@ class LearningScheduler:
                     skipped_phases = await self._run_extra_optimizations(
                         session.experience_snapshot, llm_client,
                         extra_results, phase_durations,
+                        session.experience_cutoff,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -1551,6 +1554,20 @@ class LearningScheduler:
         self._exp_cache_key = key
         self._exp_cache = filtered
         return list(filtered)
+
+    @staticmethod
+    def _select_new_experiences(
+        experiences: list[dict], cutoff: float,
+    ) -> list[dict]:
+        """``cutoff`` (epoch 秒) より新しい経験だけを返す。0.0 なら全件。
+
+        比較は ``_get_new_experience_count`` と同じ ISO タイムスタンプ文字列の
+        辞書順比較。
+        """
+        if cutoff <= 0.0:
+            return experiences
+        cutoff_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(cutoff))
+        return [e for e in experiences if e.get("timestamp", "") > cutoff_str]
 
     def _get_new_experience_count(self) -> int:
         """前回 Level 1 実行以降の新規経験数を返す"""
@@ -1955,11 +1972,19 @@ class LearningScheduler:
         experiences: list[dict],
         results: dict[str, dict],
         phase_durations: dict[str, float],
+        experience_cutoff: float = 0.0,
     ) -> None:
-        """ツール誘導パターン重み進化 + 長文ルーティングパターン重み進化"""
+        """ツール誘導パターン重み進化 + 長文ルーティングパターン重み進化
+
+        f_04 §3.4: ブースト / 減衰は非冪等なので、``experience_cutoff``
+        (session 開始時の ``_last_run``) 以降の新規経験だけに適用する。
+        snapshot 全件へ再適用すると同じ成功ターンが毎 tick ブーストされ、
+        重みが上限へ飽和する。
+        """
         if self._cancelled or self._learned_patterns is None:
             return
         tp = time.monotonic()
+        experiences = self._select_new_experiences(experiences, experience_cutoff)
         tool_exp = [
             e for e in experiences
             if (e.get("signals", {}).get("tool_routing_success")
@@ -2220,7 +2245,7 @@ class LearningScheduler:
         legacy_path = self._find_legacy_embed_instruction_source()
         if embed_dir != self.prompt_manager.prompt_dir and legacy_path is not None:
             content = legacy_path.read_text(encoding="utf-8")
-            path.write_text(content, encoding="utf-8")
+            atomic_write_text(path, content, encoding="utf-8")
             logger.info(
                 "Migrated embed_instruction.md from legacy base partition "
                 "(%s) to %s", legacy_path, path,
@@ -2228,7 +2253,7 @@ class LearningScheduler:
             return content
 
         # デフォルトを書き込んで返す
-        path.write_text(DEFAULT_EMBED_INSTRUCTION, encoding="utf-8")
+        atomic_write_text(path, DEFAULT_EMBED_INSTRUCTION, encoding="utf-8")
         logger.info("Created default embed_instruction.md")
         return DEFAULT_EMBED_INSTRUCTION
 
@@ -2317,14 +2342,14 @@ class LearningScheduler:
 
             if signals.get("tool_routing_success"):
                 # 成功: マッチしたパターンの重みをブースト
-                matches = store.match(query, category="tool_routing")
+                matches = store.match(query, category="tool_routing", record_hit=False)
                 for kw, _ in matches:
                     store.boost(kw, amount=boost_amount)
                     boosted += 1
 
             if signals.get("tool_routing_false_positive"):
                 # 誤検出: マッチしたパターンの重みを減衰
-                matches = store.match(query, category="tool_routing")
+                matches = store.match(query, category="tool_routing", record_hit=False)
                 for kw, _ in matches:
                     store.decay_one(kw, amount=decay_amount)
                     decayed += 1
@@ -2393,13 +2418,13 @@ class LearningScheduler:
             query = exp.get("query", "")
 
             if signals.get("long_form_success"):
-                matches = store.match(query, category="long_form")
+                matches = store.match(query, category="long_form", record_hit=False)
                 for kw, _ in matches:
                     store.boost(kw, amount=boost_amount)
                     boosted += 1
 
             if signals.get("long_form_false_positive"):
-                matches = store.match(query, category="long_form")
+                matches = store.match(query, category="long_form", record_hit=False)
                 for kw, _ in matches:
                     store.decay_one(kw, amount=decay_amount)
                     decayed += 1
