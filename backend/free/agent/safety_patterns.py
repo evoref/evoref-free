@@ -128,33 +128,6 @@ _READONLY_FORBIDDEN_ATTRS: frozenset[str] = frozenset({
 })
 
 
-def extract_python_c_payload(command: str) -> str | None:
-    """``python -c <code>`` 形式ならその ``<code>`` を返す。それ以外は ``None``。
-
-    分離形 (``python -c "code"``) と密着形 (``python -c"code"``) の両方を扱う。
-    ``_reject_synthesized_command`` (synth 出力の egress / 構文検証) との互換の
-    ため維持する共有ヘルパ。読み取り専用ガードは ``reject_readonly_violation``
-    がより厳格な allow-list として使う。
-    """
-    try:
-        tokens = shlex.split(command, posix=True)
-    except ValueError:
-        return None
-    if not tokens:
-        return None
-    base = Path(tokens[0]).name.lower()
-    if not (base.startswith("python") or base in {"py", "py.exe"}):
-        return None
-    rest = tokens[1:]
-    for i, tok in enumerate(rest[:-1]):
-        if tok == "-c":
-            return rest[i + 1]
-    # 密着形 python -c"code"
-    if rest and rest[0].startswith("-c") and len(rest[0]) > 2:
-        return rest[0][2:]
-    return None
-
-
 def _reject_unsafe_python_payload(payload: str) -> str | None:
     """``python -c`` ペイロードを AST で検査し、副作用があれば理由を返す。
 

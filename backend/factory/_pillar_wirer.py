@@ -320,6 +320,21 @@ def _init_llm_client(
         logger.info("LLMClient initialized (local llama-server)")
 
 
+def _track_background_task(
+    state: AppState, coro: "Awaitable[Any]", *, name: str,
+) -> "asyncio.Task[Any]":
+    """fire-and-forget の背景タスクを ``state.background_tasks`` に保持して起動する。
+
+    イベントループはタスクを弱参照しか持たないため、戻り値を捨てると実行途中で
+    GC され得る。完了時に集合から自ら抜ける。イベントループ外では
+    ``asyncio.create_task`` と同じく ``RuntimeError``。
+    """
+    task = asyncio.create_task(coro, name=name)
+    state.background_tasks.add(task)
+    task.add_done_callback(state.background_tasks.discard)
+    return task
+
+
 def _init_aux_client(
     state: AppState,
     cfg: dict[str, Any],
@@ -1326,7 +1341,8 @@ def _init_learning_scheduler(
     # 永続化しない設計なので、毎起動ここで張り直す (pool_size 件だけ)。
     if state.embedder is not None:
         try:
-            asyncio.create_task(
+            _track_background_task(
+                state,
                 fewshot_pool.backfill_embeddings(state.embedder),
                 name="fewshot_embedding_warmup",
             )
@@ -1499,9 +1515,12 @@ def _init_tools(
     from backend.free.history.history_manager import get_history_manager
 
     tools_reg = ToolsRegistry()
+    # aux_client は Gen pillar 構築時 (_init_aux_client) に state へ載っている。
+    # base 未接続なら None で、LLM 委譲ツールは LocalClient 直呼びへ縮退する。
     register_builtin_tools(
         tools_reg, cfg, client,
         history_manager=get_history_manager(),
+        aux_client=state.aux_client,
     )
 
     # Pro 拡張ツール: ``register_pro_tools`` ハンドラが
@@ -1529,9 +1548,6 @@ def _init_tools(
             mem_view = MemFactView(global_store)
     except Exception as exc:
         logger.warning("URL recall mem_view init skipped: %s", exc)
-    # RAG necessity/quality の embedding recall (search_pipeline.py) でも
-    # 同じ global scope MemFactView を再利用するため state に昇格。
-    state.mem_view = mem_view
 
     tool_judge = ToolCallJudge(
         config=cfg,
@@ -1551,8 +1567,8 @@ def _init_tools(
     # ツール要否ゲートの exemplar 埋め込み (実測 ~5.6 秒 / 137 件)。起動を
     # 待たせないので背景タスクにし、完了までは従来の正規表現ゲートへ縮退する。
     try:
-        asyncio.create_task(
-            tool_judge.warmup_tool_gate(), name="tool_gate_warmup",
+        _track_background_task(
+            state, tool_judge.warmup_tool_gate(), name="tool_gate_warmup",
         )
     except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
         logger.info("Tool gate warmup deferred: no running event loop")

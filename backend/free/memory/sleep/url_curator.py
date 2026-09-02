@@ -32,9 +32,12 @@ from urllib.parse import urlparse, urlunparse
 import numpy as np
 
 from backend.free.memory.sleep._curator_common import (
+    URL_SUBJECT_PREFIX,
     build_scoring_prompt,
     coerce_bare_score,
+    embed_kwargs_for_subject,
     public_notes,
+    redact_for_store,
     subject_digest,
     truncate_for_prompt,
 )
@@ -53,7 +56,8 @@ logger = get_logger("memory.sleep.url_curator")
 # 非 ASCII (CJK 等) も除外し、「URL + 日本語」入力で末尾テキストを
 # URL に取り込まないようにする (例: https://news.yahoo.co.jp/で取得して...)。
 _URL_RE = re.compile(r"(?i:https?)://[^\s\]\)」』、,\u0080-\U0010ffff]+")
-_SUBJECT_PREFIX = "mem.world.url."
+#: 接頭辞は _curator_common が SSOT (埋め込み側の定義と同じ場所に置く)。
+_SUBJECT_PREFIX = URL_SUBJECT_PREFIX
 
 # fetch_url が失敗した時にユーザ応答に残る代表的なシグナル文字列。
 # 1 つでもマッチすれば「URL は今回有効でなかった」とみなし、
@@ -156,7 +160,8 @@ def _topic_text(query: str) -> str:
     cleaned = re.sub(_URL_RE, "", query or "").strip()
     if not cleaned:
         cleaned = (query or "").strip()
-    return _truncate(cleaned, 200)
+    # object として生で保存されるので秘匿情報を伏せる。
+    return _truncate(redact_for_store(cleaned), 200)
 
 
 def _existing_url_fact(
@@ -194,7 +199,7 @@ def _record_score(
             "score_avg": round(score_avg, 4),
             "score_count": len(history),
             "last_fetched_at": now,
-            "last_query": _truncate(query or "", 200),
+            "last_query": _truncate(redact_for_store(query), 200),
         },
     )
     return extra
@@ -393,22 +398,28 @@ async def curate_url_facts(
                 else:
                     embedding = None
                     try:
-                        emb = await embedder.embed([topic], is_query=False)
+                        # 側の定義は _curator_common.INDEX_EMBED_IS_QUERY が
+                        # SSOT (再埋め込み側もそこを読む)。
+                        emb = await embedder.embed(
+                            [topic], **(embed_kwargs_for_subject(subject) or {}),
+                        )
                         if emb is not None and len(emb) > 0:
                             embedding = np.asarray(emb[0], dtype=np.float32)
                     except Exception as exc:
                         logger.warning("url_curator: embed failed: %s", exc)
 
                     extra = {
-                        "url": raw_url,
-                        "url_normalized": normalized,
+                        "url": redact_for_store(raw_url),
+                        "url_normalized": redact_for_store(normalized),
                         "host": host,
                         "fetch_count": 1,
                         "score_history": [round(float(score), 4)],
                         "score_avg": round(float(score), 4),
                         "score_count": 1,
                         "last_fetched_at": now,
-                        "last_query": _truncate(user_note.content or "", 200),
+                        "last_query": _truncate(
+                            redact_for_store(user_note.content), 200,
+                        ),
                     }
                     fact = fact_from_note(
                         user_note,

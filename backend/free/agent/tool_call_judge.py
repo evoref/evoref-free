@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -42,7 +42,6 @@ from backend.free.agent.grammar_tool_classifier import (
     parse_classifier_response,
     parse_expression_response,
 )
-from backend.free.llm.json_extract import extract_json_object
 from backend.log_config import get_logger
 
 # --- 責務別モジュール ---------------------------------------------------------
@@ -63,7 +62,7 @@ from backend.free.agent.tool_judge_dialogue import (
     query_needs_dialogue,
 )
 from backend.free.agent.tool_judge_signals import (
-    _ASSISTANT_PREFERENCE_PATTERNS,
+    _CALCULATE_RE,
     _CODE_IDENTIFIER_RE,
     _CODE_SEARCH_PATTERNS,
     _CODE_USAGE_LOCATION_RE,
@@ -72,7 +71,6 @@ from backend.free.agent.tool_judge_signals import (
     _DELETE_FS_TARGET_RE,
     _DELETE_INTENT_RE,
     _EXPLICIT_EXEC_VERB_RE,
-    _FIRST_PERSON_REFERENCE_RE,
     _HARDWARE_MEMORY_QUERY_RE,
     _RUNTIME_INFO_QUERY_RE,
     _IMMEDIATE_CHILDREN_RE,
@@ -84,7 +82,6 @@ from backend.free.agent.tool_judge_signals import (
     _PATH_OR_URL_SIGNAL_RE,
     _READ_PATH_TOOLS,
     _RECURSIVE_LISTING_RE,
-    _SELF_ACTION_PATTERNS,
     _SELF_SESSION_REFERENCE_PATTERNS,
     _SELF_SESSION_REFERENCE_PATTERNS_EN,
     _SESSION_REFLECTIVE_VOCAB_BROAD_EN,
@@ -93,6 +90,7 @@ from backend.free.agent.tool_judge_signals import (
     _SESSION_TOPIC_BREAK_LEAD_RE_EN,
     _TOOL_PATTERNS,
     _TOOL_PATTERNS_EN,
+    _VERIFY_SYNTAX_INTENT_RE,
     _WEB_REFERENCE_RE,
     _code_usage_location_pattern,
     _is_code_usage_location_query,
@@ -117,7 +115,6 @@ from backend.free.agent.tool_judge_grounding import (
     _duration_derived_numbers,
     _known_numbers,
     _numeric_literals,
-    _synthesized_expression_grounded,
     _ungrounded_numbers,
 )
 from backend.free.agent.tool_judge_commands import (
@@ -165,6 +162,7 @@ from backend.free.agent.tool_judge_args import (
     _normalize_path_text,
     _trim_nonexistent_path_tail,
     asks_file_existence_only,
+    quoted_spans,
     resolve_listing_directory,
 )
 from backend.free.agent.tool_judge_history import (
@@ -194,6 +192,7 @@ from backend.free.agent.tool_judge_guards import (
     _STATE_CHANGING_TOOL_NAMES,
     _TEXT_OPERAND_TOOLS,
     GuardContext,
+    JudgeCall,
     apply_guards,
 )
 from backend.free.agent.tool_judge_referential import (
@@ -208,6 +207,11 @@ from backend.free.agent.tool_judge_referential import (
     _resolve_referenced_path,
 )
 
+from backend.free.memory.views import (
+    EXECUTABLE_COMMAND_SUBJECT_PREFIX,
+    URL_SUBJECT_PREFIX,
+)
+
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
     from backend.free.agent.learned_patterns import LearnedPatternStore
@@ -217,8 +221,8 @@ if TYPE_CHECKING:
 
 logger = get_logger("agent.tool_call_judge")
 
-# executable command リコールの候補プールがこの件数未満のとき、類似度閾値を
-# ``_RECALL_SMALL_POOL_MARGIN`` だけ嵩上げする。学習初期は top-K も success_avg も
+# executable command リコールの **索引件数** (``count_by_subject_prefix``) が
+# この件数未満のとき、類似度閾値を ``_RECALL_SMALL_POOL_MARGIN`` だけ嵩上げする。学習初期は top-K も success_avg も
 # 選別として機能せず、類似度ゲート 1 本で決まってしまうため。
 _RECALL_SMALL_POOL_SIZE = 3
 _RECALL_SMALL_POOL_MARGIN = 0.1
@@ -261,14 +265,13 @@ def _executable_tool_for_mode(tools_registry: ToolsRegistry, mode: str) -> str:
     return ""
 
 
-#: 「〜を訳してください:「本文」」の括り。訳す対象は必ずここに入る。
-_QUOTED_SPAN_RE = re.compile(r"[「『\"“]([^」』\"”\n]{2,400})[」』\"”]")
-
-
 def _first_quoted_span(query: str) -> str | None:
-    """クエリ中で最初に括られた文字列を返す (純粋関数)。無ければ None。"""
-    m = _QUOTED_SPAN_RE.search(query or "")
-    return m.group(1).strip() if m else None
+    """クエリ中で最初に括られた 2 文字以上の文字列 (純粋関数)。無ければ None。
+
+    「〜を訳してください:「本文」」の括り。訳す対象は必ずここに入る。括りの
+    取り出しは ``tool_judge_args.quoted_spans`` (判定系で唯一の実装)。
+    """
+    return next((s for s in quoted_spans(query) if len(s) >= 2), None)
 
 
 class ToolCallJudge:
@@ -347,47 +350,29 @@ class ToolCallJudge:
             self._tool_gate = ToolGateKNN(
                 embedder, k=int(agent_cfg.get("tool_gate_knn_k", DEFAULT_K)),
             )
-        # 直近の層0.5 リコールの診断値 (sim / min_sim / success_avg / 候補数)。
-        # _log_tool_decision が decision.jsonl の context に載せる。
-        self._last_recall_diag: dict[str, Any] = {}
-        # 直近の judge() で「実測しようとしたが実行できなかった」か。
-        # readonly 検証違反 (PowerShell 等) / mode 非対応での降格で立つ。
-        # deliberative がこれを見て、測っていない値の捏造を禁じる注記を付ける。
-        self._measurement_blocked: bool = False
-        # 直近の judge() で「状態を変える操作を選んだが実行できなかった」か。
-        # measurement_blocked (値を測れなかった) とは別物で、こちらは
-        # 「やっていないことをやったと言わせない」ためのフラグ。
-        self._action_blocked: bool = False
-        # 直近の judge() のユーザークエリ。measurement_blocked の適用可否判定用。
-        self._last_query: str = ""
-        # 直近の judge() の会話履歴。コマンド合成の指示語解決に使う
-        # conversation を持たないため、単一の入口である judge() で保持する)。
-        self._last_conversation: list[dict] = []
+        # URL リコールで許容する profile_id (Pro の team 解決を含む)。初回の
+        # リコールで 1 度だけ解決する (以前は毎ターン Pro resolver を組み直していた)。
+        self._url_recall_profiles: set[str] | None = None
+        # ターン固有の値 (blocked フラグ / クエリ / リコール診断) は **ここに
+        # 置かない**。本インスタンスはプロセス唯一の共有オブジェクトで、
+        # ``judge()`` の中に await があるため、チャットが 2 本重なると他方が上書き
+        # する。``judge()`` が 1 回ごとに作る ``JudgeCall`` に載せる。
 
-    @property
-    def measurement_blocked(self) -> bool:
-        """直近の判定で実行可能コマンドが「棄却されて」ツールが立たなかったか。
+    def rebind_embedder(self, embedder: "EmbeddingBackend | None") -> None:
+        """埋め込みバックエンドの差し替えに追随する (kNN ゲートは再 warmup 待ち)。
 
-        「そもそもツールが不要だった」(知識質問等) とは区別する。True のときは
-        システムが実測を試みて失敗しているので、呼出側は測っていない値を
-        断定させないためのガードを掛ける。
+        ``/api/model/{component}/migrate`` の embedding rebind は ``state.embedder``
+        を差し替えるが、判定器と kNN ゲートは構築時の参照を握ったままだった。
+        旧モデル空間の exemplar ベクトルは新モデルのクエリベクトルと比較できない
+        (次元が同じでも幾何が違う) ので捨て、呼出側が :meth:`warmup_tool_gate` で
+        埋め直す。
         """
-        return self._measurement_blocked
+        self._embedder = embedder
+        if self._tool_gate is not None:
+            self._tool_gate.reset(embedder)
 
-    @property
-    def action_blocked(self) -> bool:
-        """直近の判定で「状態を変える操作」が選ばれたのに実行できなかったか。
-
-        chat には書込みツールが無く (``write_file`` は create 限定)、
-        ``run_command_readonly`` は書込みコマンドを正しく拒否する。その結果
-        ツールが 1 つも立たないまま base に丸投げされると、**やっていない操作を
-        やったと報告する** (2026-08-08 ライブ監査 ターン6)。呼出側はこれを見て
-        完了報告を禁じる注記を付ける。
-        """
-        return self._action_blocked
-
-    def _user_requested_measurement(self) -> bool:
-        """直近クエリが実測 (環境事実の取得 / コマンド実行) を求めているか。
+    def _user_requested_measurement(self, query: str) -> bool:
+        """クエリが実測 (環境事実の取得 / コマンド実行) を求めているか。
 
         層5 のコマンド合成は環境事実を尋ねていないクエリにも投機的に走るため、
         合成の棄却だけで「実測できなかった」と記録すると、測定を求めていない
@@ -401,25 +386,28 @@ class ToolCallJudge:
 
         判定材料が無い場合 (クエリ未設定の直接呼出) は従来どおり True。
         """
-        if not self._last_query:
+        if not query:
             return True
-        return is_environment_fact_query(self._last_query) or bool(
-            extract_command_literal(self._last_query),
+        return is_environment_fact_query(query) or bool(
+            extract_command_literal(query),
         )
 
-    def _reject_readonly(self, exec_tool: str, command: str) -> bool:
+    def _reject_readonly(
+        self, exec_tool: str, command: str, call: JudgeCall,
+    ) -> bool:
         """``_readonly_command_rejected`` に「実測が阻まれた」記録を足したもの。
 
-        コマンドは層5 が投機的に合成したものでもあり得るため、ユーザーが実測を
+        コマンドは投機的に合成 / 引き当てたものでもあり得るため、ユーザーが実測を
         求めていないクエリでは記録しない (``_user_requested_measurement`` 参照)。
+        記録先は ``call`` (ターン固有)。
         """
         rejected = _readonly_command_rejected(exec_tool, command)
-        if rejected and self._user_requested_measurement():
-            self._measurement_blocked = True
+        if rejected and self._user_requested_measurement(call.query):
+            call.measurement_blocked = True
         return rejected
 
     def _mark_blocked_if_unexecutable_command(
-        self, query: str, tools_registry: ToolsRegistry, mode: str,
+        self, query: str, tools_registry: ToolsRegistry, mode: str, call: JudgeCall,
     ) -> None:
         """明示コマンドを撃てないまま no_tool に落ちる場合、実測失敗を記録する。
 
@@ -446,9 +434,11 @@ class ToolCallJudge:
             "Measurement blocked: explicit command %r cannot be executed in "
             "mode=%s (exec_tool=%s)", command[:80], mode, exec_tool or "none",
         )
-        self._measurement_blocked = True
+        call.measurement_blocked = True
 
-    def _mark_blocked_if_unsupported_mutation(self, query: str) -> None:
+    def _mark_blocked_if_unsupported_mutation(
+        self, query: str, call: JudgeCall,
+    ) -> None:
         """ファイル削除依頼のまま no_tool に落ちる場合、未実行を記録する。
 
         削除ツールはどのモードにも存在しない (``_DELETE_INTENT_RE`` のコメント
@@ -463,13 +453,14 @@ class ToolCallJudge:
             "Action blocked: file deletion requested but no tool can delete: %s",
             query[:80],
         )
-        self._action_blocked = True
+        call.action_blocked = True
 
     @property
     def enabled(self) -> bool:
         """ツール判定が有効かどうか (``agent.tool_judge_enabled``、既定 True)。
 
-        False にすると最終層のベースモデル分類を撃たなくなる。決定論層は
+        False にすると **ベースモデルへの往復を伴う層** — 層 5.9 の文法制約
+        分類と層 5.95 の式合成 — を撃たなくなる。決定論層と学習済みリコールは
         本フラグに関係なく常に動く。
         """
         return self._config.get("agent", {}).get("tool_judge_enabled", True)
@@ -486,48 +477,12 @@ class ToolCallJudge:
     ) -> ToolJudgement:
         """ツール呼び出しの要否を判定し、**ターン固有の値を結果に載せて** 返す。
 
-        ``action_blocked`` / ``measurement_blocked`` は判定の途中でインスタンス
-        属性へ立つが、本インスタンスはプロセス唯一の共有オブジェクトで、
-        呼出側は judge() 完了後の別タイミング (reactive-light ゲート / 経験記録 /
-        deliberative の注記) で読む。チャットが 2 本重なると他方の judge() が
-        先にリセットするため、ここで **await を挟まずに** 結果へ写し取る。
-        以後の読み手は ``ToolJudgement`` 側を見ること。
-        """
-        result = await self._judge_inner(
-            query, tools_registry, mode, conversation, session_id,
-            allow_classifier=allow_classifier,
-        )
-        # ここに await を入れないこと (入れた瞬間に共有状態のレースが戻る)。
-        result.action_blocked = self._action_blocked
-        result.measurement_blocked = self._measurement_blocked
-        return result
-
-    async def _judge_inner(
-        self,
-        query: str,
-        tools_registry: ToolsRegistry,
-        mode: str = "create",
-        conversation: list[dict] | None = None,
-        session_id: str = "",
-        *,
-        allow_classifier: bool = True,
-    ) -> ToolJudgement:
-        """ツール呼び出しの要否を判定
-
-        ``allow_classifier=False`` で層 5.9 (ベースモデルの文法制約分類) を
-        外し、**決定論層と学習済みリコールだけ**で判定する。層 5.9 はこの
-        判定系で唯一の推論往復で、実測 34〜39 秒かかる。同じクエリを 2 度
-        判定する経路 (deliberative の 2 手目) では、分類器は同じ答えを返す
-        だけなので撃つ意味が無い — 2 手目に意味があるのは、決定論層が
-        1 手目の実行後に初めて解決できる参照 (会話から引くパス等) だけ。
-
-        判定は安価な順に実行し、最初にマッチした結果を返す:
-        1. 組み込みパターン照合（ルールベース）
-        2. カートリッジ tool_hints 照合
-        3. 補助タスク判定（LLM）
-
-        クリエイトモードでは tool_judge_enabled が false でも
-        ルールベース + カートリッジ hints 判定を実行する。
+        ターン固有の値 (``action_blocked`` / ``measurement_blocked`` / リコール
+        診断) は 1 回ごとに作る ``JudgeCall`` に載せ、判定の完了後に結果へ写す。
+        本インスタンスはプロセス唯一の共有オブジェクトで、呼出側は judge() 完了後
+        の別タイミング (reactive-light ゲート / 経験記録 / deliberative の注記) で
+        読むため、インスタンス属性に置くとチャットが 2 本重なった瞬間に他方が
+        上書きする。以後の読み手は ``ToolJudgement`` 側を見ること。
 
         Args:
             query: ユーザーのクエリ
@@ -539,14 +494,54 @@ class ToolCallJudge:
                 一致する場合に ``_maybe_scope_session_search`` が
                 ``tool_args["session_id"]`` へ注入し、検索を現在セッションに
                 限定する (未指定時は従来どおり cross-session 検索のまま)。
-
-        Returns:
-            ToolJudgement
+            allow_classifier: 層 5.9 (文法制約分類) / 5.95 (式合成) を許すか。
         """
-        self._measurement_blocked = False
-        self._action_blocked = False
-        self._last_query = query
-        self._last_conversation = list(conversation or [])
+        call = JudgeCall(
+            tools_registry=tools_registry,
+            mode=mode,
+            query=query,
+            conversation=conversation,
+            session_id=session_id,
+        )
+        result = await self._judge_inner(call, allow_classifier=allow_classifier)
+        # ここに await を入れないこと (結果へ写す前に他の judge() が走っても
+        # call はこの呼出専用なので壊れないが、規約として単純に保つ)。
+        result.action_blocked = call.action_blocked
+        result.measurement_blocked = call.measurement_blocked
+        return result
+
+    async def _judge_inner(
+        self, call: JudgeCall, *, allow_classifier: bool = True,
+    ) -> ToolJudgement:
+        """ツール呼び出しの要否を判定 (層構成の本体)。
+
+        ``allow_classifier=False`` で層 5.9 (ベースモデルの文法制約分類) と
+        層 5.95 (式合成) を外し、**決定論層と学習済みリコールだけ**で判定する。
+        層 5.9 はこの判定系で唯一の推論往復で、実測 34〜39 秒かかる。同じ
+        クエリを 2 度判定する経路 (deliberative の 2 手目) では、分類器は同じ
+        答えを返すだけなので撃つ意味が無い — 2 手目に意味があるのは、決定論層が
+        1 手目の実行後に初めて解決できる参照 (会話から引くパス等) だけ。
+
+        判定は安価な順に実行し、最初に確定した結果を返す:
+        0.6〜3. 決定論層 (専用ツール / 明示式・URL・パス / ルール表 /
+                参照解決 / カートリッジ / 学習済みパターン)
+        5.5〜5.7. 履歴キーワードの安全網 / SemMem リコール
+        5.9 / 5.95. ベースモデルの文法制約分類 / 式合成 (唯一の推論往復)
+
+        各層の exit は ``_finalize`` (ガード列) を通し、**ガードが no_tool へ
+        降格させたら次の層へ落とす**。「このツールは使えない」は「ツールは
+        不要」ではないため (層 1 のコメント参照)。
+
+        Args:
+            call: この呼出の文脈 (クエリ / レジストリ / mode / 会話 /
+                session_id)。ターン固有の副作用 (blocked フラグ / 診断値) も
+                ここへ書く。
+        """
+        query = call.query
+        tools_registry = call.tools_registry
+        mode = call.mode
+        conversation = call.conversation
+        session_id = call.session_id
 
         # 削除依頼は「どのツールが選ばれたか」と無関係に記録する。以前はこの
         # 判定が層6 (全フォールバック失敗時) にしか無く、パスを含む削除依頼は
@@ -556,7 +551,7 @@ class ToolCallJudge:
         # 「中身」「確認」で読取りパターンに一致し list_directory へ解決され、
         # 一覧を成功結果として受け取った base が「すべて削除しました」と報告した
         # (実ファイルは 307 件すべて無変更)。
-        self._mark_blocked_if_unsupported_mutation(query)
+        self._mark_blocked_if_unsupported_mutation(query, call)
 
         # 0.6. ハードウェア事実 (搭載 RAM) — 決定論、非シェル。
         # 他のどの層もこの質問に答えられない: spec コマンドは RAM を出力せず
@@ -584,10 +579,11 @@ class ToolCallJudge:
                     tool_args={},
                     source="rule",
                 ),
-                tools_registry, mode, query=query,
+                call=call,
             )
-            self._log_tool_decision(hw_result, "hardware_facts_query")
-            return hw_result
+            if hw_result.tool_needed:
+                self._log_tool_decision(hw_result, "hardware_facts_query", call)
+                return hw_result
 
         # 0.6b. evoref 自身の実行構成 — 決定論、非シェル。
         # ハードウェアと同じ理由でどの層も答えられない: readonly allow-list は
@@ -611,10 +607,11 @@ class ToolCallJudge:
                     tool_args={},
                     source="rule",
                 ),
-                tools_registry, mode, query=query,
+                call=call,
             )
-            self._log_tool_decision(rt_result, "runtime_info_query")
-            return rt_result
+            if rt_result.tool_needed:
+                self._log_tool_decision(rt_result, "runtime_info_query", call)
+                return rt_result
 
         # 決定論ショートカット: 明示された算術式 / URL / パス / 実行可能
         # コマンドは「強い意図表明」なのでモデル判断を仰がずここで確定させる。
@@ -634,10 +631,10 @@ class ToolCallJudge:
                     tool_args={"expression": expression},
                     source="rule",
                 ),
-                tools_registry, mode, query=query,
+                call=call,
             )
             if result.tool_needed:
-                self._log_tool_decision(result, "arithmetic_expression")
+                self._log_tool_decision(result, "arithmetic_expression", call)
                 return result
 
         # クエリに URL が明示的に含まれる場合は tool_judge_enabled に
@@ -646,17 +643,18 @@ class ToolCallJudge:
         url_match = _URL_IN_QUERY_RE.search(query)
         if url_match and tools_registry.has("fetch_url"):
             logger.debug("Explicit URL detected: %s", query[:50])
-            result = ToolJudgement(
-                tool_needed=True,
-                tool_name="fetch_url",
-                tool_args={"url": url_match.group(1)},
-                source="rule",
-            )
             result = self._finalize(
-                result, tools_registry, mode, query=query,
+                ToolJudgement(
+                    tool_needed=True,
+                    tool_name="fetch_url",
+                    tool_args={"url": url_match.group(1)},
+                    source="rule",
+                ),
+                call=call,
             )
-            self._log_tool_decision(result, "explicit_url")
-            return result
+            if result.tool_needed:
+                self._log_tool_decision(result, "explicit_url", call)
+                return result
 
         # 明示パスも URL と同じ扱いにする。ユーザーがパスを書く =
         # 「これを見て」の強い意図表明で、LLM 判断を仰ぐ理由が無い。
@@ -667,7 +665,9 @@ class ToolCallJudge:
         # ``_infer_tool`` は読み書きの動詞が無ければ空を返すので、パスに
         # 言及しただけの文は従来どおり後続へ落ちる。
         if _PATH_OR_URL_SIGNAL_RE.search(query):
-            path_tool, path_args = self._infer_tool(query, tools_registry, mode)
+            path_tool, path_args = self._infer_tool(
+                query, tools_registry, mode, call=call,
+            )
             if path_tool:
                 logger.debug(
                     "Explicit path resolved to %s: %s", path_tool, query[:50],
@@ -679,20 +679,18 @@ class ToolCallJudge:
                         tool_args=path_args,
                         source="rule",
                     ),
-                    tools_registry, mode, query=query,
+                    call=call,
                 )
                 if result.tool_needed:
-                    self._log_tool_decision(result, "explicit_path")
+                    self._log_tool_decision(result, "explicit_path", call)
                     return result
 
-        # 実行可能コマンドを解決する (ルール表 + 学習済みリコール)。
+        # 実行可能コマンドをルール表 (regex) から解決する。
         # ツール名は mode から解決する (chat は run_command_readonly)。
         exec_tool = _executable_tool_for_mode(tools_registry, mode)
         if exec_tool:
-            command = await self._resolve_executable_command(
-                query, readonly=exec_tool == "run_command_readonly",
-            )
-            if command and not self._reject_readonly(exec_tool, command):
+            command = _infer_executable_command(query)
+            if command and not self._reject_readonly(exec_tool, command, call):
                 logger.debug("Executable query detected: %s", query[:50])
                 result = self._finalize(
                     ToolJudgement(
@@ -701,7 +699,7 @@ class ToolCallJudge:
                         tool_args={"command": command},
                         source="rule",
                     ),
-                    tools_registry, mode, query=query,
+                    call=call,
                 )
                 # 層1 と同じ理由で降格時は後続層へ落とす。ここだけ
                 # ``_finalize`` の戻りを無条件に返しており、ガードが no_tool へ
@@ -712,9 +710,8 @@ class ToolCallJudge:
                 # 8 ターン中 2 ターンが run_command_readonly を実行したのに
                 # tool_call_decision エントリ無し)。
                 if result.tool_needed:
-                    self._log_tool_decision(result, "executable_command_rule")
+                    self._log_tool_decision(result, "executable_command_rule", call)
                     return result
-
 
         # 0.9. 「同じファイルに保存し直して」型: パスは直前ターンにしか無い。
         # ルール層はパス必須、aux 層は read_file を選びがちで、書込みが
@@ -722,11 +719,13 @@ class ToolCallJudge:
         # 「体重を4.5kgに直して、同じファイルに保存し直して」→ read_file のみ
         # 実行され、ファイルは旧内容のまま「保存し直した」体で回答された)。
         # 会話から直近のパスを引いて write_file に確定させる。
-        rewrite = _referential_rewrite_judgement(query, conversation, tools_registry)
+        rewrite = _referential_rewrite_judgement(
+            query, conversation, tools_registry, call=call,
+        )
         if rewrite is not None:
-            rewrite = self._finalize(rewrite, tools_registry, mode, query=query)
+            rewrite = self._finalize(rewrite, call=call)
             if rewrite.tool_needed:
-                self._log_tool_decision(rewrite, "referential_rewrite")
+                self._log_tool_decision(rewrite, "referential_rewrite", call)
                 return rewrite
 
         # 0.95. 「そのファイルの全文を見せて」型: 0.9 の読取版。read_file が
@@ -735,11 +734,13 @@ class ToolCallJudge:
         # 実ファイルと不一致。明示的に「read_file で読み直して」と言うと正しく
         # 読み「先ほどの内容は記憶に基づくものでした」と自己訂正した = ゲートが
         # 開かないだけだった)。
-        ref_read = _referential_read_judgement(query, conversation, tools_registry)
+        ref_read = _referential_read_judgement(
+            query, conversation, tools_registry, call=call,
+        )
         if ref_read is not None:
-            ref_read = self._finalize(ref_read, tools_registry, mode, query=query)
+            ref_read = self._finalize(ref_read, call=call)
             if ref_read.tool_needed:
-                self._log_tool_decision(ref_read, "referential_read")
+                self._log_tool_decision(ref_read, "referential_read", call)
                 return ref_read
 
         # 1. 組み込みパターン照合（ルールベース）
@@ -755,13 +756,13 @@ class ToolCallJudge:
         # ツール名が空のときは後続層 (カートリッジ / 学習済み / aux) に
         # 具体化を委ねる。aux 層は会話履歴を見るため、本文に無いパスを
         # 直前ターンから補える。
-        result = self._judge_with_rules(query, tools_registry, mode)
+        result = self._judge_with_rules(query, tools_registry, mode, call=call)
         if result.tool_needed and result.tool_name:
             await self._maybe_recall_url(result, query, mode=mode)
             self._maybe_scope_session_search(result, query, session_id)
-            result = self._finalize(result, tools_registry, mode, query=query)
+            result = self._finalize(result, call=call)
             if result.tool_needed:
-                self._log_tool_decision(result, "rule_pattern_matched")
+                self._log_tool_decision(result, "rule_pattern_matched", call)
                 return result
             # 降格 (aux の not-executable 判定 / 引数欠落 / mode 不可) は
             # 「このツールは使えない」であって「ツールは不要」ではない。ここで
@@ -785,18 +786,26 @@ class ToolCallJudge:
             # (カートリッジはツール名しか宣言しない) ため、引数欠落ガードは
             # 特にこの層で効く。tool_hints はカートリッジのメタデータ由来で
             # ユーザーが書けるため、この経路は実データで到達可能。
-            result = self._finalize(result, tools_registry, mode, query=query)
-            self._log_tool_decision(result, "cartridge_hint_matched")
-            return result
+            result = self._finalize(result, call=call)
+            if result.tool_needed:
+                self._log_tool_decision(result, "cartridge_hint_matched", call)
+                return result
+            # 層1 と同じ理由で降格時は後続層へ落とす。ここだけ ``_finalize`` の
+            # 戻りを無条件に返しており、引数欠落で降格した瞬間に層 3〜5.95 が
+            # 丸ごとスキップされていた (2026-09-02 監査)。
+            logger.debug(
+                "Cartridge layer match downgraded to no_tool; falling through to "
+                "later layers: %s", query[:50],
+            )
 
         # 3. 学習済みパターン照合
-        result = self._judge_with_learned_patterns(query, tools_registry, mode)
+        result = self._judge_with_learned_patterns(query, tools_registry, mode, call=call)
         if result.tool_needed:
             await self._maybe_recall_url(result, query, mode=mode)
             self._maybe_scope_session_search(result, query, session_id)
-            result = self._finalize(result, tools_registry, mode, query=query)
+            result = self._finalize(result, call=call)
             if result.tool_needed:
-                self._log_tool_decision(result, "learned_pattern_matched")
+                self._log_tool_decision(result, "learned_pattern_matched", call)
                 return result
             # 層1 と同じ理由で降格時は後続層へ落とす。
             logger.debug(
@@ -851,16 +860,14 @@ class ToolCallJudge:
                 source="rule",
             )
             self._maybe_scope_session_search(forced_result, query, session_id)
-            forced_result = self._finalize(
-                forced_result, tools_registry, mode, query=query,
-            )
+            forced_result = self._finalize(forced_result, call=call)
             # 「近接リコール語だけ + 現在セッション除外」の組合せは
             # _finalize の proximal_recall_excluded_session ガードが
             # no_tool へ降格させる (以前はここにインライン実装されており、
-            # aux 経路には掛かっていなかった)。
+            # 分類器経路には掛かっていなかった)。
             if forced_result.tool_needed:
                 self._log_tool_decision(
-                    forced_result, "history_keyword_forced_fallback",
+                    forced_result, "history_keyword_forced_fallback", call,
                 )
                 return forced_result
 
@@ -892,14 +899,13 @@ class ToolCallJudge:
         # と「過去 URL は SemMem にあるのに fetch されない」という不整合が起きる
         # ため、ここで先回りで引き当てる。
         url_recall_result = await self._judge_with_url_recall(
-            query, tools_registry, mode=mode,
+            query, tools_registry, mode=mode, call=call,
         )
         if url_recall_result is not None:
-            url_recall_result = self._finalize(
-                url_recall_result, tools_registry, mode, query=query,
-            )
-            self._log_tool_decision(url_recall_result, "url_recall_matched")
-            return url_recall_result
+            url_recall_result = self._finalize(url_recall_result, call=call)
+            if url_recall_result.tool_needed:
+                self._log_tool_decision(url_recall_result, "url_recall_matched", call)
+                return url_recall_result
 
         # 5.7. executable command リコール (mode / enabled 非依存)
         # 過去成功した run_command を SemMem から決定論的に引き当てる。層 5.9
@@ -924,58 +930,60 @@ class ToolCallJudge:
         # それらはこの層より前に評価されるため、claim されたクエリはここまで
         # 降りてこない (以前は逆順で、除外語彙を手で足し続けていた)。
         recall_allowed = is_create_mode(mode) or (
-            _query_has_tool_signal(query)
-            and not _has_history_recall_keywords(query)
+            call.has_tool_signal and not _has_history_recall_keywords(query)
         )
         if recall_allowed:
             cmd_recall_result = await self._judge_with_executable_command_recall(
-                query, tools_registry, mode=mode,
+                query, tools_registry, mode=mode, call=call,
             )
         else:
             cmd_recall_result = None
         if cmd_recall_result is not None:
-            cmd_recall_result = self._finalize(
-                cmd_recall_result, tools_registry, mode, query=query,
-            )
-            self._log_tool_decision(
-                cmd_recall_result, "executable_command_recall_matched",
-            )
-            return cmd_recall_result
-
+            cmd_recall_result = self._finalize(cmd_recall_result, call=call)
+            if cmd_recall_result.tool_needed:
+                self._log_tool_decision(
+                    cmd_recall_result, "executable_command_recall_matched", call,
+                )
+                return cmd_recall_result
 
         # 5.9. ベースモデルの文法制約ツール分類 (docs/c_14 §1.3)。
         # 「ツールが要るのに撃たれない」穴を埋める最後の層。決定論層が
         # すべて外れてから実行する (決定論のシグナルの方がモデル判断より
         # 信頼できる)。内部の決定論プリゲート (``_gate_allows``) が、ツール
         # シグナルの無い雑談で推論を 1 往復も増やさないようにする。
+        # 層 5.95 (式合成) も同じ推論往復なので、同じ門 (``enabled`` /
+        # ``allow_classifier``) で止める — 以前は分類器だけを止めて式合成は
+        # 無条件に走っており、``tool_judge_enabled=false`` でも往復していた。
+        model_layers_allowed = self.enabled and allow_classifier
         classified = (
             await self._judge_with_tool_classifier(
-                query, tools_registry, mode, conversation, session_id,
+                query, tools_registry, mode, conversation, session_id, call=call,
             )
-            if (self.enabled and allow_classifier) else None
+            if model_layers_allowed else None
         )
         if classified is not None:
-            self._log_tool_decision(classified, "tool_classifier")
+            self._log_tool_decision(classified, "tool_classifier", call)
             return classified
 
         # 5.95. 差分クエリの式合成 (最後の接地手段)。
         # 分類器 (層5.9) が no_tool と判断した後だけ走る。
-        synthesized = await self._judge_with_expression_synthesis(
-            query, tools_registry, mode, conversation,
+        synthesized = (
+            await self._judge_with_expression_synthesis(
+                query, tools_registry, mode, conversation, call=call,
+            )
+            if model_layers_allowed else None
         )
         if synthesized is not None:
-            self._log_tool_decision(synthesized, "expression_synthesis")
+            self._log_tool_decision(synthesized, "expression_synthesis", call)
             return synthesized
 
         # 6. 全フォールバック失敗時の no_tool 結末を記録
         # (削除依頼の記録は judge() 冒頭で済ませてある)
         self._mark_blocked_if_unexecutable_command(
-            query, tools_registry, mode,
+            query, tools_registry, mode, call,
         )
         no_tool_result = ToolJudgement(tool_needed=False, source="rule")
-        self._log_tool_decision(
-            no_tool_result, "no_match_in_any_layer",
-        )
+        self._log_tool_decision(no_tool_result, "no_match_in_any_layer", call)
         return no_tool_result
 
     async def _judge_with_expression_synthesis(
@@ -984,6 +992,7 @@ class ToolCallJudge:
         tools_registry: ToolsRegistry,
         mode: str,
         conversation: list[dict] | None,
+        call: JudgeCall | None = None,
     ) -> "ToolJudgement | None":
         """被演算子が会話にしかない差分クエリで、式だけを合成させて calculate を撃つ。
 
@@ -1009,14 +1018,17 @@ class ToolCallJudge:
         """
         if not tools_registry.has("calculate"):
             return None
+        if call is None:
+            call = JudgeCall(
+                tools_registry=tools_registry, mode=mode, query=query,
+                conversation=conversation,
+            )
         # 被演算子がクエリにあるなら層5.9 で足りる。ここは「会話にしかない」形専用。
         if NUMBER_LITERAL_RE.search(query):
             return None
         if not ANAPHORIC_OPERAND_RE.search(query):
             return None
-        if not looks_like_numeric_question(
-            query, _recent_dialogue_text(conversation),
-        ):
+        if not looks_like_numeric_question(query, call.recent_dialogue_text):
             return None
         client = self._llm_client
         if client is None or not hasattr(client, "generate_constrained"):
@@ -1053,9 +1065,7 @@ class ToolCallJudge:
         expression = parse_expression_response(content)
         if not expression:
             return None
-        unexplained = _ungrounded_numbers(
-            expression, query, _dialogue_text(conversation),
-        )
+        unexplained = _ungrounded_numbers(expression, query, call.dialogue_text)
         if unexplained:
             logger.info(
                 "Expression synthesis rejected: %s uses numbers absent from "
@@ -1068,7 +1078,7 @@ class ToolCallJudge:
             tool_args={"expression": expression},
             source="classifier",
         )
-        return self._finalize(result, tools_registry, mode, query=query)
+        return self._finalize(result, call=call)
 
     _NATIVE_JUDGE_SYSTEM = (
         "あなたはツール選択器です。ユーザーの発言に答えるのに必要なツールを"
@@ -1087,7 +1097,11 @@ class ToolCallJudge:
     )
 
     async def _gate_allows(
-        self, query: str, conversation: list[dict] | None,
+        self,
+        query: str,
+        conversation: list[dict] | None = None,
+        *,
+        call: JudgeCall | None = None,
     ) -> bool:
         """分類器を撃つかどうかの門。
 
@@ -1098,7 +1112,13 @@ class ToolCallJudge:
 
         正規表現側は数値計算の判定だけ直近の会話も見る (被演算子の片方が前
         ターンにしか無い言い回しがあるため。``looks_like_numeric_question``)。
+
+        どの門がどう判定したか (kNN の票数を含む) は ``call.gate_diag`` に残し、
+        ``_log_tool_decision`` が decision.jsonl へ載せる — ゲートの較正を
+        ログだけで事後検証できるようにするため。
         """
+        if call is None:
+            call = JudgeCall(query=query, conversation=conversation, mode="chat")
         # **平叙の自己申告は問答無用で止める。**
         #
         # 層 5.9 はこの判定系で唯一の推論往復で、実測 34〜39 秒かかる
@@ -1120,13 +1140,24 @@ class ToolCallJudge:
                 "Tool classifier gate: plain statement, not a request: %s",
                 query[:50],
             )
+            call.gate_diag = {"gate": "plain_statement", "gate_verdict": False}
             return False
         gate = self._tool_gate
         if gate is not None:
-            verdict = await gate.needs_tool(query)
-            if verdict is not None:
-                return verdict
-        return _query_has_tool_signal(query, _recent_dialogue_text(conversation))
+            # 判定側の mode で埋め込む — 検索パイプラインと同じ (query, mode) の
+            # LRU キーを共有するため (``ToolGateKNN.vote`` のコメント参照)。
+            vote = await gate.vote(query, mode=call.mode or "chat")
+            if vote is not None:
+                call.gate_diag = vote.as_context()
+                return vote.needed
+        # 正規表現ゲート。``_query_has_tool_signal(query, context)`` は
+        # ``_query_has_tool_signal(query)`` に「直近会話つきの数値判定」を足した
+        # ものなので、前者は call の memo を使う。
+        verdict = call.has_tool_signal or looks_like_numeric_question(
+            query, call.recent_dialogue_text,
+        )
+        call.gate_diag = {"gate": "rule", "gate_verdict": verdict}
+        return verdict
 
     async def warmup_tool_gate(self) -> bool:
         """ツール要否ゲートの exemplar を埋め込む (起動後の背景タスク用)。"""
@@ -1141,10 +1172,11 @@ class ToolCallJudge:
         mode: str,
         conversation: list[dict] | None = None,
         session_id: str = "",
+        call: JudgeCall | None = None,
     ) -> "ToolJudgement | None":
         """ベースモデルに文法制約 JSON でツールを選ばせる (docs/c_14 §1.3)。
 
-        決定論層と層4 の補助タスク判定がいずれも結論を出さなかったときに走る
+        決定論層と学習済みリコールがいずれも結論を出さなかったときに走る
         最終層 (層5.9)。「ツールが要るのに撃たれない」穴を埋める。
 
         選ばせ方は OAI ``tools`` ではなく ``response_format`` (json_schema) の
@@ -1154,11 +1186,12 @@ class ToolCallJudge:
         "required"`` でも 6 件中 3 件で無視された)。json_schema は llama-server
         側の GBNF 制約なので必ず従い、出力トークン数の上限が読める。
 
-        コスト対策として、呼ぶ前に決定論プリゲート ``_query_has_tool_signal``
-        を通す。ツールシグナルの無い雑談で推論を 1 往復増やさないため。
-        なお本ゲートは再現率が低く (実測 20 ケースでツールが要る 14 件中 6 件を
-        遮断)、単位換算のような「ツールシグナルの無い算術」を落とす。これは
-        埋め込み kNN の一次振り分けで置き換える予定 (別作業)。
+        コスト対策として、呼ぶ前に決定論プリゲート ``_gate_allows`` を通す
+        (平叙文除外 → ``ToolGateKNN`` の投票 → 正規表現 ``_query_has_tool_signal``
+        への縮退)。ツールシグナルの無い雑談で推論を 1 往復増やさないため。
+        正規表現単独では再現率が低く (実測 20 ケースでツールが要る 14 件中 6 件を
+        遮断)、単位換算のような「ツールシグナルの無い算術」を落としていたので、
+        kNN を一次判定に置いている。
 
         判定結果は ``_finalize(aux_guards=True)`` を通す。分類器の引数も
         モデルが自由生成したものであり、LLM 判定と同じグラウンディングの
@@ -1174,8 +1207,13 @@ class ToolCallJudge:
         client = self._llm_client
         if client is None or not hasattr(client, "generate_constrained"):
             return None
+        if call is None:
+            call = JudgeCall(
+                tools_registry=tools_registry, mode=mode, query=query,
+                conversation=conversation, session_id=session_id,
+            )
         # プリゲート: ツールが要らないターンでは 1 往復も増やさない。
-        if not await self._gate_allows(query, conversation):
+        if not await self._gate_allows(query, conversation, call=call):
             return None
 
         schema = build_classifier_schema(tools_registry, mode)
@@ -1273,10 +1311,7 @@ class ToolCallJudge:
         self._drop_if_required_args_missing(result, query, tools_registry)
 
         result = self._finalize(
-            result,
-            tools_registry, mode, query=query,
-            conversation=conversation, aux_guards=True,
-            hidden_tools_offered=True,
+            result, call=call, aux_guards=True, hidden_tools_offered=True,
         )
         if not result.tool_needed:
             return None
@@ -1288,7 +1323,7 @@ class ToolCallJudge:
         # そのまま乗ってしまう。
         command = (result.tool_args or {}).get("command")
         if isinstance(command, str) and command and self._reject_readonly(
-            result.tool_name, command,
+            result.tool_name, command, call,
         ):
             logger.info(
                 "Native tool call rejected: %s is not read-only (%s)",
@@ -1306,9 +1341,9 @@ class ToolCallJudge:
             # ``_user_requested_measurement`` を待たず measurement を記録してよい
             # (``_reject_readonly`` の docstring 参照)。
             if _command_is_readonly_inspection(command):
-                self._measurement_blocked = True
+                call.measurement_blocked = True
             else:
-                self._action_blocked = True
+                call.action_blocked = True
             return None
 
         logger.info(
@@ -1320,15 +1355,21 @@ class ToolCallJudge:
     def _finalize(
         self,
         result: "ToolJudgement",
-        tools_registry: ToolsRegistry,
-        mode: str,
+        tools_registry: ToolsRegistry | None = None,
+        mode: str = "",
         *,
         query: str = "",
         conversation: list[dict] | None = None,
         aux_guards: bool = False,
         hidden_tools_offered: bool = False,
+        call: JudgeCall | None = None,
     ) -> "ToolJudgement":
         """``judge()`` の全 exit が通る唯一の後処理 funnel.
+
+        判定本体は ``call`` (この呼出の :class:`JudgeCall`) を渡す。ガードが立てる
+        「実行できなかった」印はその ``call`` に残り、``judge()`` が結果へ写す。
+        ``call`` を持たない呼出 (単体テスト / 外部からの後処理) は従来どおり
+        ``tools_registry`` / ``mode`` / ``query`` / ``conversation`` から文脈を組む。
 
         各判定層 (rule / cartridge / learned / aux / 各種リコール・
         フォールバック) は、確定した ``ToolJudgement`` を必ず本メソッドへ通して
@@ -1363,34 +1404,23 @@ class ToolCallJudge:
                 ターン13: ファイル追記が 1 度も実行されないまま「追記しました。
                 行数は5行です」と捏造。実ファイルは 1 行のまま無変更だった)。
         """
-        ctx = GuardContext(
-            tools_registry=tools_registry,
-            mode=mode,
-            query=query,
-            conversation=conversation,
-            aux_guards=aux_guards,
-            hidden_tools_offered=hidden_tools_offered,
-        )
-        result = apply_guards(result, ctx)
-        self._absorb_blocked_flags(ctx)
-        return result
-
-    def _absorb_blocked_flags(self, ctx: GuardContext) -> None:
-        """ガードが立てた「実行できなかった」印をインスタンスへ引き継ぐ。
-
-        ガードは純粋関数なので ``ctx`` にしか書かない。``judge()`` は冒頭で両
-        フラグを落とすため、ここでは立った側だけを取り込めばよい。
-        """
-        self._measurement_blocked = (
-            self._measurement_blocked or ctx.measurement_blocked
-        )
-        self._action_blocked = self._action_blocked or ctx.action_blocked
+        if call is None:
+            call = JudgeCall(
+                tools_registry=tools_registry,
+                mode=mode,
+                query=query,
+                conversation=conversation,
+            )
+        # exit ごとの適用条件。同じ call で複数の exit を通ることは無い
+        # (return するか、降格して次の層へ進むかのどちらか) ので上書きでよい。
+        call.aux_guards = aux_guards
+        call.hidden_tools_offered = hidden_tools_offered
+        return apply_guards(result, call)
 
     # --- ガードへの薄い委譲 -------------------------------------------------
     # 実体は :mod:`backend.free.agent.tool_judge_guards` の純粋関数
     # (適用順は :data:`~backend.free.agent.tool_judge_guards.GUARD_PIPELINE`)。
-    # ここに残すのは「ガードを 1 件だけ掛ける呼出面」と、``ctx`` に立った印を
-    # インスタンスへ引き継ぐ責務の 2 つだけ。
+    # ここに残すのは「ガードを 1 件だけ掛ける呼出面」だけ。
 
     def _suppress_proximal_recall_cross_session(
         self, result: ToolJudgement, query: str,
@@ -1401,13 +1431,20 @@ class ToolCallJudge:
         )
 
     def _validate_tool_availability(
-        self, result: ToolJudgement, tools_registry: ToolsRegistry, mode: str,
+        self,
+        result: ToolJudgement,
+        tools_registry: ToolsRegistry,
+        mode: str,
+        call: GuardContext | None = None,
     ) -> ToolJudgement:
-        """ガード ``tool_availability`` を単体で掛ける。"""
-        ctx = GuardContext(tools_registry=tools_registry, mode=mode)
-        result = guards._validate_tool_availability(result, ctx)
-        self._absorb_blocked_flags(ctx)
-        return result
+        """ガード ``tool_availability`` を単体で掛ける。
+
+        「撃てなかった」印は ``call`` (渡されなければ使い捨ての文脈) に立つ。
+        """
+        ctx = call if call is not None else GuardContext(
+            tools_registry=tools_registry, mode=mode,
+        )
+        return guards._validate_tool_availability(result, ctx)
 
     def _scope_list_directory_depth(
         self, result: ToolJudgement, query: str,
@@ -1480,6 +1517,7 @@ class ToolCallJudge:
         query: str,
         tools_registry: ToolsRegistry,
         mode: str = "create",
+        call: JudgeCall | None = None,
     ) -> "ToolJudgement | None":
         """URL リコール単独で fetch_url 判定を返す (mode / enabled 非依存).
 
@@ -1504,7 +1542,10 @@ class ToolCallJudge:
         # 書込み先ディレクトリ指定 (url_write 正規フロー) は is_file()=False の
         # ため影響せず、後段の rule/learned 層が fetch_url を選べば
         # ``_maybe_recall_url`` の URL 補完も引き続き機能する。
-        referenced = _extract_file_path(query)
+        referenced = (
+            call.extract_file_path(query) if call is not None
+            else _extract_file_path(query)
+        )
         if referenced:
             try:
                 if Path(referenced).is_file():
@@ -1527,7 +1568,7 @@ class ToolCallJudge:
                 query[:50],
             )
             return None
-        recalled = await self._try_recall_url(query, mode=mode)
+        recalled = await self._try_recall_url(query, mode=mode, call=call)
         if not recalled:
             return None
         logger.info(
@@ -1761,14 +1802,42 @@ class ToolCallJudge:
                 limit, _HISTORY_SEARCH_DEFAULT_LIMIT, query[:50],
             )
 
-    async def _try_recall_url(self, query: str, mode: str = "create") -> str | None:
+    def _url_recall_allowed_profiles(self) -> set[str]:
+        """URL リコールで採用する profile_id 集合 (初回に 1 度だけ解決する)。
+
+        Pro 拡張: team プロファイルの URL fact も引き当て候補に含める。Free build
+        では factory が登録されていないため ``{self._profile_id}`` のみ。以前は
+        毎ターン Pro resolver を組み直していたが、結果は設定と profile で決まり
+        判定中に変わらない。
+        """
+        if self._url_recall_profiles is not None:
+            return self._url_recall_profiles
+        allowed: set[str] = {self._profile_id}
+        try:
+            from backend.edition import get_pro_handler
+            factory = get_pro_handler("url_recall_resolver_factory")
+            if callable(factory):
+                resolver = factory(self._config)
+                if resolver is not None:
+                    for pid in resolver.allowed_profile_ids():
+                        if pid:
+                            allowed.add(pid)
+        except Exception as exc:
+            logger.warning("URL recall: pro resolver init failed: %s", exc)
+        self._url_recall_profiles = allowed
+        return allowed
+
+    async def _try_recall_url(
+        self, query: str, mode: str = "create", call: JudgeCall | None = None,
+    ) -> str | None:
         """過去質問の URL fact から類似質問の URL を返す。
 
         条件:
           - ``mem_view`` / ``embedder`` が両方提供されている
           - ``tools.url_recall_enabled`` が True
-          - top-K 候補のうち ``world_fact`` で subject prefix が
-            ``mem.world.url.`` のもの
+          - ``mem.world.url.`` 接頭辞で **絞ってから** 引いた top-K 候補のうち
+            ``world_fact`` のもの (グローバル top-K を引いてから接頭辞で絞ると、
+            ストアが育った時点で索引行が top-K に入らなくなる — 2026-09-02 監査 H3)
           - 類似度 >= ``url_recall_min_score``
           - 過去採点平均 (``_extra.score_avg``) >= ``url_recall_min_record_score``
           - profile_id が一致する (異プロファイルの URL を引かない)
@@ -1804,26 +1873,20 @@ class ToolCallJudge:
         ttl_days = int(tools_cfg.get("url_recall_ttl_days", 30))
         ttl_seconds = float(ttl_days) * 86400.0 if ttl_days > 0 else 0.0
         try:
-            candidates = self._mem_view.search_by_embedding(q_vec, top_k=top_k)
+            candidates = self._mem_view.search_by_embedding(
+                q_vec, top_k=top_k, subject_prefix=URL_SUBJECT_PREFIX,
+            )
         except Exception as exc:
             logger.warning("URL recall: search_by_embedding failed: %s", exc)
             return None
+        if call is not None:
+            call.recall_diag.update({
+                "url_candidates": len(candidates),
+                "url_best_sim": round(float(candidates[0][1]), 4) if candidates else 0.0,
+                "url_min_sim": round(min_sim, 4),
+            })
 
-        # Pro 拡張: team プロファイルの URL fact も引き当て候補に含める。
-        # Free build では factory が登録されていないため allowed = {self._profile_id}
-        # のみで Phase 1 と等価。
-        allowed_profiles: set[str] = {self._profile_id}
-        try:
-            from backend.edition import get_pro_handler
-            factory = get_pro_handler("url_recall_resolver_factory")
-            if callable(factory):
-                resolver = factory(self._config)
-                if resolver is not None:
-                    for pid in resolver.allowed_profile_ids():
-                        if pid:
-                            allowed_profiles.add(pid)
-        except Exception as exc:
-            logger.warning("URL recall: pro resolver init failed: %s", exc)
+        allowed_profiles = self._url_recall_allowed_profiles()
 
         import time as _time
         now = _time.time()
@@ -1836,8 +1899,6 @@ class ToolCallJudge:
 
         for fact, sim in candidates:
             if fact.type != "world_fact":
-                continue
-            if not fact.subject.startswith("mem.world.url."):
                 continue
             if best_subject is None:
                 best_subject, best_sim, best_reason = fact.subject, sim, "sim_below_min"
@@ -1912,6 +1973,7 @@ class ToolCallJudge:
         query: str,
         tools_registry: ToolsRegistry,
         mode: str = "create",
+        call: JudgeCall | None = None,
     ) -> "ToolJudgement | None":
         """SemMem の過去成功コマンド引き当てで executable 判定を返す.
 
@@ -1940,10 +2002,14 @@ class ToolCallJudge:
             return None
         if self._mem_view is None or self._embedder is None:
             return None
-        recalled = await self._try_recall_executable_command(query, mode=mode)
+        if call is None:
+            call = JudgeCall(tools_registry=tools_registry, mode=mode, query=query)
+        recalled = await self._try_recall_executable_command(
+            query, mode=mode, call=call,
+        )
         if not recalled:
             return None
-        if self._reject_readonly(exec_tool, recalled):
+        if self._reject_readonly(exec_tool, recalled, call):
             return None
         logger.info(
             "Executable command recall: matched command for query=%s",
@@ -1960,15 +2026,18 @@ class ToolCallJudge:
         )
 
     async def _try_recall_executable_command(
-        self, query: str, mode: str = "create",
+        self, query: str, mode: str = "create", call: JudgeCall | None = None,
     ) -> str | None:
         """過去成功した run_command を SemMem から類似クエリで引き当てる.
+
+        診断値 (候補数 / sim / 閾値) は ``call.recall_diag`` へ書く
+        (``_log_tool_decision`` が decision.jsonl に載せる)。
 
         ``_try_recall_url`` と対称。条件:
           - ``mem_view`` / ``embedder`` が両方提供されている
           - ``tools.executable_command_recall_enabled`` が True
-          - top-K 候補のうち ``world_fact`` で subject prefix が
-            ``mem.world.executable_command.`` のもの
+          - ``mem.world.executable_command.`` 接頭辞で **絞ってから** 引いた
+            top-K 候補のうち ``world_fact`` のもの (H3、URL リコールと同じ)
           - 類似度 >= ``executable_command_recall_min_score``
           - 過去成功率 (``_extra.success_avg``) >=
             ``executable_command_recall_min_record_score``
@@ -2003,34 +2072,45 @@ class ToolCallJudge:
         ttl_days = int(tools_cfg.get("executable_command_recall_ttl_days", 30))
         ttl_seconds = float(ttl_days) * 86400.0 if ttl_days > 0 else 0.0
         try:
-            candidates = self._mem_view.search_by_embedding(q_vec, top_k=top_k)
+            candidates = self._mem_view.search_by_embedding(
+                q_vec, top_k=top_k,
+                subject_prefix=EXECUTABLE_COMMAND_SUBJECT_PREFIX,
+            )
+            pool_size = int(
+                self._mem_view.count_by_subject_prefix(
+                    EXECUTABLE_COMMAND_SUBJECT_PREFIX,
+                ),
+            )
         except Exception as exc:
             logger.warning(
                 "Executable command recall: search_by_embedding failed: %s", exc,
             )
             return None
 
-        # 候補プールが小さいうちは top-K も success_avg も選別として機能しないため
+        # 索引の件数が小さいうちは top-K も success_avg も選別として機能しないため
         # (実測 2026-07-25: executable_command fact は global に 1 件のみで、
         # 類似度ゲートだけが唯一のフィルタだった)、閾値を嵩上げして保守的に倒す。
-        if len(candidates) < _RECALL_SMALL_POOL_SIZE:
+        # 件数は ``count_by_subject_prefix`` (索引そのものの件数) で見る — 返って
+        # きた候補数は top_k で切られており、プールの大きさを表さない。
+        if pool_size < _RECALL_SMALL_POOL_SIZE:
             min_sim += _RECALL_SMALL_POOL_MARGIN
 
         import time as _time
         now = _time.time()
 
         best_sim = candidates[0][1] if candidates else 0.0
-        self._last_recall_diag = {
+        diag = call.recall_diag if call is not None else {}
+        diag.clear()
+        diag.update({
             "candidates": len(candidates),
+            "pool_size": pool_size,
             "best_sim": round(float(best_sim), 4),
             "min_sim": round(min_sim, 4),
             "min_avg": min_avg,
-        }
+        })
 
         for fact, sim in candidates:
             if fact.type != "world_fact":
-                continue
-            if not fact.subject.startswith("mem.world.executable_command."):
                 continue
             if sim < min_sim:
                 # candidates は score 降順想定。閾値未満は以降全て無効。
@@ -2070,7 +2150,7 @@ class ToolCallJudge:
                     "literals missing (sim=%.4f subject=%s origin=%s)",
                     sim, fact.subject, str(fact.object or "")[:60],
                 )
-                self._last_recall_diag["rejected"] = "literal_mismatch"
+                diag["rejected"] = "literal_mismatch"
                 continue
 
             if command and effective_score >= min_avg:
@@ -2083,7 +2163,7 @@ class ToolCallJudge:
                     sim, min_sim, success_avg, effective_score, min_avg,
                     len(candidates), fact.subject,
                 )
-                self._last_recall_diag.update({
+                diag.update({
                     "sim": round(float(sim), 4),
                     "success_avg": round(success_avg, 3),
                     "effective_score": round(effective_score, 3),
@@ -2098,13 +2178,16 @@ class ToolCallJudge:
         return None
 
     def _log_tool_decision(
-        self, result: "ToolJudgement", reason: str,
+        self, result: "ToolJudgement", reason: str, call: JudgeCall | None = None,
     ) -> None:
-        """
+        """ツール判定の決着を ``decision.jsonl`` に記録する。
 
-        chosen は ``rule`` / ``cartridge`` / ``learned`` / ``aux`` /
-        ``no_tool`` のいずれかで、4 段階フォールバックのどの層で決着したかを
-        identify する。``evolve`` レベル限定で実発火、それ以外は no-op。
+        ``chosen`` は ``ToolJudgement.source`` (``rule`` / ``cartridge`` /
+        ``learned`` / ``recall`` / ``classifier``) か ``no_tool`` で、多段
+        フォールバックのどの層で決着したかを識別する。``reason`` は層名。
+        ``call`` があればリコールの診断値 (類似度 / 閾値) と分類器ゲートの判定
+        (kNN の票数) も context に載せる — どちらも decision.jsonl だけで閾値
+        較正を事後検証するため。``evolve`` レベル限定で実発火、それ以外は no-op。
         """
         if self._debug_logger is None:
             return
@@ -2116,34 +2199,29 @@ class ToolCallJudge:
         command = (getattr(result, "tool_args", None) or {}).get("command")
         if command:
             context["command"] = str(command)[:120]
-        # 層0.5 の採否は類似度が唯一の根拠なので、decision.jsonl だけで
-        # 閾値較正を検証できるよう診断値を載せる。
-        if reason.startswith("executable_command_recall") and self._last_recall_diag:
-            context.update(self._last_recall_diag)
+        if call is not None:
+            # 層 5.6 / 5.7 の採否は類似度が唯一の根拠。
+            if reason.startswith(("executable_command_recall", "url_recall")):
+                context.update(call.recall_diag)
+            # 層 5.9 の門がどう判定したか (kNN なら票数も)。
+            context.update(call.gate_diag)
         self._debug_logger.log_decision(
             decision_point="tool_call_decision",
             chosen=chosen,
-            candidates=["rule", "cartridge", "learned", "llm", "recall", "no_tool"],
+            candidates=[
+                "rule", "cartridge", "learned", "recall", "classifier", "no_tool",
+            ],
             reason=reason,
             context=context,
             scope="request",
         )
-
-    async def _resolve_executable_command(
-        self, query: str, readonly: bool = False,  # noqa: ARG002 - 面の互換
-    ) -> str:
-        """executable command をルール表 (regex) から解決する.
-
-        Returns:
-            実行可能と判定された場合のコマンド文字列。それ以外は ``""``。
-        """
-        return _infer_executable_command(query)
 
     def _judge_with_rules(
         self,
         query: str,
         tools_registry: ToolsRegistry,
         mode: str,
+        call: JudgeCall | None = None,
     ) -> ToolJudgement:
         """ルールベースでツール呼び出しを判定（フォールバック）
 
@@ -2184,7 +2262,9 @@ class ToolCallJudge:
         # 知識質問はツール不要（RAG パイプラインで処理）
         # ただしツールパターン・ファイルパス・URL にもマッチするクエリは
         # ツール操作の可能性が高いため知識質問判定を適用しない
-        has_tool_signal = _query_has_tool_signal(query)
+        has_tool_signal = (
+            call.has_tool_signal if call is not None else _query_has_tool_signal(query)
+        )
         knowledge_patterns = select_locale_variant(_KNOWLEDGE_PATTERNS, _KNOWLEDGE_PATTERNS_EN)
         if not has_tool_signal and any(p.search(query) for p in knowledge_patterns):
             logger.debug("Rule-based: knowledge query detected, skipping tool: %s", query[:50])
@@ -2192,13 +2272,17 @@ class ToolCallJudge:
 
         # 明示パス / URL があり、かつ具体的なツールまで決定論で解決できるなら
         # ``_TOOL_PATTERNS`` に無い言い回しでもここで確定させる。パス付きの依頼が
-        # aux 層任せになっており、同じ依頼が read_file / search_history /
+        # 分類器任せになっており、同じ依頼が read_file / search_history /
         # ツール未発火に割れていた (実インシデント 2026-08-04 ライブ監査:
         # 「E:/tmp/a.txt の中身を見せて、あわせて文字数も教えてください。」で
         # ツールが 1 つも走らず「存在しない」と誤答)。``_infer_tool`` は読み書きの
         # 動詞が無ければ空を返すので、パスに言及しただけの文は従来経路へ落ちる。
+        # 推定は 1 度だけ行い、下のパターン一致分岐でも同じ結果を使う
+        # (以前は同じ引数で 2 回呼んでいた。fs stat を伴うので無駄が大きい)。
+        inferred: tuple[str, dict] | None = None
         if has_tool_signal:
-            signal_name, signal_args = self._infer_tool(query, tools_registry, mode)
+            inferred = self._infer_tool(query, tools_registry, mode, call=call)
+            signal_name, signal_args = inferred
             if signal_name:
                 logger.debug(
                     "Rule-based: path/URL signal resolved to %s: %s",
@@ -2218,7 +2302,9 @@ class ToolCallJudge:
         logger.debug("Rule-based: tool pattern matched for query: %s", query[:50])
 
         # ツール名と引数の推定
-        tool_name, tool_args = self._infer_tool(query, tools_registry, mode)
+        tool_name, tool_args = inferred if inferred is not None else self._infer_tool(
+            query, tools_registry, mode, call=call,
+        )
 
         return ToolJudgement(
             tool_needed=True,
@@ -2274,6 +2360,7 @@ class ToolCallJudge:
         query: str,
         tools_registry: ToolsRegistry,
         mode: str,
+        call: JudgeCall | None = None,
     ) -> ToolJudgement:
         """学習済み tool_routing パターンでツール呼び出しを判定
 
@@ -2297,7 +2384,7 @@ class ToolCallJudge:
         )
 
         # ツール名と引数を推定（静的パターンと同じロジック）
-        tool_name, tool_args = self._infer_tool(query, tools_registry, mode)
+        tool_name, tool_args = self._infer_tool(query, tools_registry, mode, call=call)
         if not tool_name:
             # _infer_tool が推定できない場合の run_command フォールバックは
             # 「引数なしの仮判定」であり、judge() 側で
@@ -2323,13 +2410,18 @@ class ToolCallJudge:
         query: str,
         tools_registry: ToolsRegistry,
         mode: str,
+        call: JudgeCall | None = None,
     ) -> tuple[str, dict]:
         """クエリからツール名と引数を推定する
+
+        ``call`` があればパス抽出 (fs stat を伴う) を memo する — 1 判定で同じ
+        文字列に対して最大 4 回呼ばれていた。
 
         Returns:
             (tool_name, tool_args): 推定結果。推定できない場合は ("", {})。
         """
         q = query.lower()
+        extract_path = call.extract_file_path if call is not None else _extract_file_path
         # ファイルパス抽出用のクエリ。バッククォート内コマンドの引数パスは
         # 読み書きの対象ではないため取り除く (コマンド実行分岐は生の ``query``
         # を見るのでコマンド自体は失われない)。これが無いと「コマンド
@@ -2342,23 +2434,25 @@ class ToolCallJudge:
         url_match = _URL_IN_QUERY_RE.search(query)
         if url_match and tools_registry.has("fetch_url"):
             return "fetch_url", {"url": url_match.group(1)}
-        if re.search(
-            r"(?:フェッチ|fetch|取得して|アクセス|ウェブ|web|サイト|site|ページ|page"
-            r"|ニュース|news|ブラウズ|browse)",
-            q,
-        ) and tools_registry.has("fetch_url"):
-            # URL がクエリに含まれていないが、フェッチ意図がある場合
+        # URL がクエリに含まれていないが、フェッチ意図がある場合。語彙は
+        # ``_WEB_REFERENCE_RE`` (web 意図の唯一の定義、ASCII 語は境界付き)。
+        # 旧定義は ``site`` / ``page`` が境界無しで "opposite" / "homepage" に
+        # 部分一致し、ローカルファイルの依頼が fetch_url へ振られていた。
+        if _WEB_REFERENCE_RE.search(query) and tools_registry.has("fetch_url"):
             return "fetch_url", {}
 
         # コード検証パターン（read_file より優先）
-        # 「動作する？」「正しく動く？」等はファイルを読むより構文チェックの方が確実
-        if re.search(
-            r"(?:動作|動[くい]|実行でき|エラー|バグ|正常|正しく動)"
-            r"|(?:work|run correctly|execute|error|bug)",
-            q,
-        ):
-            path = _extract_file_path(query)
-            if path and path.endswith(".py") and tools_registry.has("verify_syntax"):
+        # 「動作する？」「正しく動く？」等はファイルを読むより構文チェックの方が確実。
+        # ただし現在の mode で使えるときだけ — chat には verify_syntax が無く、
+        # ``has()`` で選ぶと mode ガードが no_tool へ降格させ、下の read_file 分岐
+        # に到達しないまま「構文エラーはありません」と読まずに答えていた
+        # (2026-08-28 ライブ監査 T15-15)。使えなければ read_file 側へ落とす。
+        if _VERIFY_SYNTAX_INTENT_RE.search(q):
+            path = extract_path(query)
+            if (
+                path and path.endswith(".py")
+                and tools_registry.is_available("verify_syntax", mode)
+            ):
                 return "verify_syntax", {"file_path": path}
 
         # ファイル読込みパターン
@@ -2382,7 +2476,7 @@ class ToolCallJudge:
             r"|how many (?:characters|chars|lines))",
             q,
         ):
-            path = _extract_file_path(path_query)
+            path = extract_path(path_query)
             if path:
                 # ディレクトリ指定 (配下のファイルを点検する文脈) は read_file だと
                 # "Not a file" になるため list_directory に振り分ける。
@@ -2406,7 +2500,7 @@ class ToolCallJudge:
         # 捏造する (記述的な「出力」誤マッチで read 指示がここへ落ちるケースを含む)。
         # ディレクトリは書込み対象から除外する。
         if re.search(r"(?:書[きく]込|書いて|出力|保存|生成|作成|write|save|output)", q):
-            path = _extract_file_path(path_query)
+            path = extract_path(path_query)
             if path and not Path(path).is_dir() and tools_registry.has("write_file"):
                 return "write_file", {"file_path": path}
 
@@ -2422,7 +2516,7 @@ class ToolCallJudge:
             q,
         ) and tools_registry.has("run_command"):
             # ファイルパスがあれば python で実行
-            path = _extract_file_path(query)
+            path = extract_path(query)
             if path and path.endswith(".py"):
                 return "run_command", {"command": f'python "{path}"'}
             # バッククォート内のコマンド
@@ -2477,52 +2571,7 @@ class ToolCallJudge:
         # 10番目を計算して」のように両方にマッチするクエリは、式抽出を持たない
         # calculate {} で潰さず run_command 合成経路 (aux synth) に乗せる。
         # 2026-07-21 ライブ検証 ターン35 のインシデント対策)
-        if re.search(r"(?:計算|calculate)", q) and tools_registry.has("calculate"):
+        if _CALCULATE_RE.search(q) and tools_registry.has("calculate"):
             return "calculate", {}
 
         return "", {}
-
-    def _parse_response(self, content: str) -> ToolJudgement:
-        """補助タスクの応答をパースして ToolJudgement に変換
-
-        ``response_format=json_schema`` 制約サンプリングが効いている場合は
-        ``{"tool": "...", "args": {...}}`` 形式の有効な JSON が必ず返る。
-        フラグ無効化時 / 古い llama-server build / max_tokens 切断時の
-        フォールバックとして共通実装 ``extract_json_object`` を経由する。
-        """
-        # 共通 JSON 抽出経路
-        data = extract_json_object(content)
-        if isinstance(data, dict):
-            return _json_to_judgement(data)
-
-        # JSON が抽出できないケースはツール不要と判定 (安全側)
-        logger.warning(
-            "Could not parse LLM response for tool judgement: %s",
-            content[:100],
-        )
-        return ToolJudgement(tool_needed=False, source="llm")
-
-
-def _json_to_judgement(data: dict) -> ToolJudgement:
-    """JSON dict を ToolJudgement に変換
-
-    補助タスク応答は ``response_format`` 無効 / 古い llama-server / max_tokens 切断
-    時に ``json_repair`` で機械修復されるため、``tool`` / ``args`` が非想定型
-    (list / str 等) になりうる。``ToolJudgement.tool_args`` は dict 契約なので、
-    下流 (``deliberative._execute_tool`` の ``dict(tool_args)`` 等) が落ちないよう
-    ここで強制正規化する。
-    """
-    tool = data.get("tool", "")
-    if not isinstance(tool, str):
-        tool = ""
-    if not tool or tool == "no_tool":
-        return ToolJudgement(tool_needed=False, source="llm")
-    args = data.get("args", {})
-    if not isinstance(args, dict):
-        args = {}
-    return ToolJudgement(
-        tool_needed=True,
-        tool_name=tool,
-        tool_args=args,
-        source="llm",
-    )

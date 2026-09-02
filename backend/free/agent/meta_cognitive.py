@@ -154,6 +154,8 @@ class MetaCognitiveAgent(
         # 構築時モード (内部 loop/token 予算の context_size 解決に使う)。
         # process() でも同値を再設定する (呼出側が同じ req.mode を渡す契約)。
         self._mode = mode
+        # ツールループ system 用のツール説明文 (mode 別)。process() 毎にリセット。
+        self._tool_descriptions_cache: dict[str, str] = {}
         self.compactor = StepCompactor(cfg, policy=policy)
         self.reminder_system = EventReminderSystem(cfg)
         self._tool_judge = tool_judge
@@ -356,6 +358,7 @@ class MetaCognitiveAgent(
         # process 呼び出しごとにリセット (meta_agent はリクエスト毎に生成される)。
         self._output_target = output_target
         self._mode = mode
+        self._tool_descriptions_cache = {}
         self._editor_artifacts: list[EditorArtifact] = []
         self._chat_code_parts: list[str] = []
         # データ取得系ツール (fetch_url / read_file 等) の生結果をタスク横断で蓄積。
@@ -1018,8 +1021,10 @@ class MetaCognitiveAgent(
 
         if self._tool_judge is not None:
             try:
+                # mode は要求のもの (chat.py が req.mode を渡す)。"create" 固定
+                # だと chat のタスクで create 専用ツールが選ばれる。
                 judgement = await self._tool_judge.judge(
-                    task_description, tools_registry, mode="create",
+                    task_description, tools_registry, mode=self._mode,
                 )
                 if judgement.tool_needed and judgement.tool_name:
                     return judgement

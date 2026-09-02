@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from backend.free.core.locale_patterns import select_locale_variant
 from backend.free.llm.json_extract import extract_json_object
 from backend.log_config import get_logger
 
@@ -116,16 +117,29 @@ def build_classifier_schema(
     }
 
 
+#: メニューの locale 依存部分。役割宣言 (``_NATIVE_JUDGE_SYSTEM`` / ``_EN``) と
+#: 同じ仕組み (``select_locale_variant``) で切り替える — 以前は ``none`` 行と
+#: 「引数なし」の注記だけが日本語固定で、英語 UI でも混在していた。
+_EMPTY_ARG_NOTE = " [arg は空文字]"
+_EMPTY_ARG_NOTE_EN = " [arg is an empty string]"
+_NO_TOOL_LINE = "ツールを使わず自分の知識と会話から答える"
+_NO_TOOL_LINE_EN = "answer from your own knowledge and the conversation, without a tool"
+
+
 def build_tool_menu(tools_registry: "ToolsRegistry", mode: str) -> str:
     """システムプロンプトへ挿す「ツール名 = 説明 (主引数)」の一覧。"""
+    empty_note = select_locale_variant(_EMPTY_ARG_NOTE, _EMPTY_ARG_NOTE_EN)
     lines = []
     for name in available_tool_names(tools_registry, mode):
         tool = tools_registry.get(name)
         desc = (getattr(tool, "description", "") or "").strip().replace("\n", " ")
         param = primary_param(tools_registry, name)
-        suffix = f" [arg={param}]" if param else " [arg は空文字]"
+        suffix = f" [arg={param}]" if param else empty_note
         lines.append(f"- {name}: {desc}{suffix}")
-    lines.append(f"- {NO_TOOL}: ツールを使わず自分の知識と会話から答える [arg は空文字]")
+    lines.append(
+        f"- {NO_TOOL}: {select_locale_variant(_NO_TOOL_LINE, _NO_TOOL_LINE_EN)}"
+        f"{empty_note}",
+    )
     return "\n".join(lines)
 
 

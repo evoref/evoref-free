@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +38,28 @@ logger = get_logger("agent.tool_gate_knn")
 #: 近傍投票数。ベンチでは k=1 が recall 92.6%、k=5 が 98.5%。取りこぼしの
 #: コスト (誤答) が無駄撃ちのコスト (分類器 1 回) より高いので k=5 を採る。
 DEFAULT_K = 5
+
+#: exemplar を埋め込む際の instruction mode。判定クエリ側は呼出側の mode
+#: (chat / create) で埋め込むが、Qwen3 系の instruction prefix はクエリ側にしか
+#: 付かず文書側には付かないため、exemplar 側の mode は幾何に影響しない。
+EXEMPLAR_EMBED_MODE = "chat"
+
+
+@dataclass(frozen=True, slots=True)
+class GateVote:
+    """kNN 投票の結果。``needed`` が判定、残りは decision.jsonl 向けの診断値。"""
+
+    needed: bool
+    tool_votes: int
+    k: int
+
+    def as_context(self) -> dict[str, object]:
+        """``_log_tool_decision`` の context に載せる形。"""
+        return {
+            "gate": "knn",
+            "gate_verdict": self.needed,
+            "gate_votes": f"{self.tool_votes}/{self.k}",
+        }
 
 #: 同梱 exemplar (tracked)。ユーザ override は ``local/triggers`` と同じ
 #: 2 段階構成にせず、まず同梱のみ。育成経路は今後 Level 1 側で足す。
@@ -109,6 +132,20 @@ class ToolGateKNN:
         """判定に使える状態か。``False`` なら呼出側は従来ゲートへ縮退する。"""
         return self._vectors is not None and len(self._labels) >= self._k
 
+    def reset(self, embedder=None) -> None:
+        """exemplar ベクトルを捨て、再 :meth:`warmup` できる状態に戻す。
+
+        埋め込みモデルが実行時に差し替わると (``/api/model/{component}/migrate``
+        の embedding rebind)、旧モデル空間の exemplar ベクトルと新モデルのクエリ
+        ベクトルは次元が同じでも **幾何が別物** になり、次元不一致の縮退にも
+        掛からずに投票だけが狂う。差し替え時はここで捨てて再 warmup する。
+        ``embedder`` を渡せば埋め込み先も差し替える。
+        """
+        self._vectors = None
+        self._labels = []
+        if embedder is not None:
+            self._embedder = embedder
+
     async def warmup(self) -> bool:
         """exemplar を埋め込む。成功で ``True``。失敗しても例外は投げない。"""
         if self._vectors is not None:
@@ -121,7 +158,9 @@ class ToolGateKNN:
             return False
         try:
             texts = [q for q, _ in self._exemplars]
-            vecs = await self._embedder.embed(texts, is_query=True, mode="chat")
+            vecs = await self._embedder.embed(
+                texts, is_query=True, mode=EXEMPLAR_EMBED_MODE,
+            )
             mat = np.asarray(vecs, dtype=np.float32)
             norms = np.linalg.norm(mat, axis=1, keepdims=True)
             norms[norms == 0] = 1.0
@@ -137,19 +176,32 @@ class ToolGateKNN:
             logger.warning("Tool gate kNN warmup failed: %s", e)
             return False
 
-    async def needs_tool(self, query: str) -> bool | None:
+    async def needs_tool(
+        self, query: str, *, mode: str = EXEMPLAR_EMBED_MODE,
+    ) -> bool | None:
         """ツールが要りそうなら ``True``。判定できなければ ``None``。
 
         ``None`` は「この門では決められない」を意味し、呼出側は従来の
-        正規表現ゲートへ縮退する (誤って閉じない)。
+        正規表現ゲートへ縮退する (誤って閉じない)。診断値も要るなら :meth:`vote`。
+        """
+        vote = await self.vote(query, mode=mode)
+        return None if vote is None else vote.needed
+
+    async def vote(
+        self, query: str, *, mode: str = EXEMPLAR_EMBED_MODE,
+    ) -> GateVote | None:
+        """近傍投票を行い、判定と票数を返す。判定できなければ ``None``。
+
+        ``mode`` は判定側 (``ToolCallJudge``) のセッション mode。検索パイプライン
+        (``run_search_pipeline``) が同じ ``(query, mode)`` で先に埋め込んでいるので、
+        同じキーで引けば LRU ヒットになり埋め込みサーバへの往復が消える。
+        ``"chat"`` 固定だった頃は create セッションで毎ターン二重に埋め込んでいた。
         """
         if not self.is_ready() or not query.strip():
             return None
         try:
-            # 素のクエリで引く。検索パイプライン (run_search_pipeline) が同じ
-            # (query, mode) で先に埋め込んでいるので LRU ヒットになり、埋め込み
-            # サーバへの往復が消える (モジュール冒頭の実測コメント参照)。
-            qv = await self._embedder.embed_query(query, mode="chat")
+            # 素のクエリで引く (前置きを足さない理由はモジュール冒頭の実測コメント)。
+            qv = await self._embedder.embed_query(query, mode=mode)
             q = np.asarray(qv, dtype=np.float32)
             norm = float(np.linalg.norm(q))
             if norm == 0.0:
@@ -172,9 +224,10 @@ class ToolGateKNN:
         k = min(self._k, sims.shape[0])
         idx = np.argpartition(sims, -k)[-k:]
         votes = [self._labels[int(i)] for i in idx]
-        needed = votes.count("tool") * 2 > k
+        tool_votes = votes.count("tool")
+        needed = tool_votes * 2 > k
         logger.debug(
             "Tool gate kNN: %s (votes tool=%d/%d) for %r",
-            needed, votes.count("tool"), k, query[:50],
+            needed, tool_votes, k, query[:50],
         )
-        return needed
+        return GateVote(needed=needed, tool_votes=tool_votes, k=k)

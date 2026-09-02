@@ -414,7 +414,18 @@
     "task_done": "タスクを完了しました。",
     "files_written": "{paths} に書き込みました。",
     "tasks_partially_done": "{done} 件のタスクを完了し、{failed} 件が失敗しました。",
-    "tasks_all_failed": "タスクの実行に失敗しました。"
+    "tasks_all_failed": "タスクの実行に失敗しました。",
+    "tool_ledger": {
+      "success": "成功",
+      "failure": "失敗",
+      "entry": "- {index}. {tool} ({status}) — 依頼「{query}」",
+      "omitted": "(古い {count} 件は省略)"
+    },
+    "boundary_turns": {
+      "first": "最初",
+      "last": "最後",
+      "header": "[この会話の{where}の user 発話 {count} 件 (全 {total} ターン中)]"
+    }
   },
   "terminal": {
     "errors": {

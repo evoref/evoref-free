@@ -23,6 +23,37 @@ logger = get_logger("agent.tools.builtin")
 # 別スレッド実行下でもイベントループを事実上ブロックする (実インシデントで確認済み)。
 # 通常のソースファイルはこれより十分小さい。
 _TOOL_MAX_FILE_READ_BYTES = 2_000_000
+
+#: read_file のデコード候補 (先頭から順に厳格デコードを試す)。BOM 付きは
+#: utf-8-sig、Windows 既定のメモ帳 / 旧ツール出力は cp932。
+_READ_FILE_ENCODINGS = ("utf-8", "utf-8-sig", "cp932")
+
+
+def _decode_text_file(raw: bytes) -> tuple[str, str]:
+    """ファイルのバイト列をデコードし ``(本文, 使ったエンコーディング)`` を返す。
+
+    改行は ``Path.read_text`` (universal newlines) と同じく ``\\n`` へ正規化する。
+    全候補で失敗した場合は utf-8 の置換デコードに落ちる。
+    """
+    if raw.startswith(b"\xef\xbb\xbf"):
+        candidates: tuple[str, ...] = ("utf-8-sig",)
+    else:
+        candidates = tuple(e for e in _READ_FILE_ENCODINGS if e != "utf-8-sig")
+    text: str | None = None
+    used = "utf-8"
+    for enc in candidates:
+        try:
+            text = raw.decode(enc)
+            used = enc
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        text = raw.decode("utf-8", errors="replace")
+        used = "utf-8 (replace)"
+    return text.replace("\r\n", "\n").replace("\r", "\n"), used
+
+
 def read_file(
     file_path: str,
     start_line: int | None = None,
@@ -53,12 +84,14 @@ def read_file(
                 f"Error: file too large to read ({size} bytes, "
                 f"limit {_TOOL_MAX_FILE_READ_BYTES}): {file_path}"
             )
-        content = p.read_text(encoding="utf-8")
+        content, used_encoding = _decode_text_file(p.read_bytes())
         lines = content.splitlines()
         header = (
             f"{READ_FILE_META_PREFIX}{file_path}"
             f" | lines: {len(lines)} | chars: {len(content)}"
         )
+        if used_encoding != "utf-8":
+            header += f" | encoding: {used_encoding}"
 
         if start_line is not None or end_line is not None:
             start = max(1, int(start_line or 1))
@@ -388,7 +421,11 @@ def _walk_tree(path: Path, lines: list[str], prefix: str, depth: int, max_depth:
     """
     if depth >= max_depth:
         return
-    entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name))
+    try:
+        entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name))
+    except PermissionError:
+        lines.append(f"{prefix}└── (permission denied)")
+        return
     skip_dirs = {".git", "node_modules", "__pycache__", ".svelte-kit", "dist"}
     for i, entry in enumerate(entries):
         if entry.name.startswith(".") and entry.is_dir():
@@ -404,16 +441,53 @@ def _walk_tree(path: Path, lines: list[str], prefix: str, depth: int, max_depth:
             _walk_tree(entry, lines, prefix + extension, depth + 1, max_depth)
 
 
+def _check_diff_header_paths(p: Path, diff_text: str) -> str | None:
+    """diff ヘッダ (``---`` / ``+++``) のパスが ``p`` と同じディレクトリを指すか検査する。
+
+    ``patch -p0`` は ``cwd=p.parent`` でヘッダのパスをそのまま使うため、
+    ``../etc/x`` や絶対パスを書いたヘッダは ``file_path`` の外を書き換える。
+    """
+    parent = p.resolve().parent
+    for line in diff_text.splitlines():
+        if not (line.startswith("--- ") or line.startswith("+++ ")):
+            continue
+        target = line[4:].split("\t", 1)[0].strip()
+        if not target or target == "/dev/null":
+            continue
+        if ".." in target.replace("\\", "/").split("/"):
+            return f"Error: path traversal not allowed in diff header: {target}"
+        try:
+            resolved = (p.parent / target).resolve()
+        except (OSError, ValueError):
+            return f"Error: invalid path in diff header: {target}"
+        if resolved.parent != parent:
+            return (
+                f"Error: diff header path is outside the target directory: {target}"
+            )
+    return None
+
+
 def apply_diff(file_path: str, diff_text: str) -> str:
     """unified diff をファイルに適用する
 
     失敗時は原文を保持し、エラーメッセージを返す。
     """
+    traversal_error = _check_path_traversal(file_path)
+    if traversal_error:
+        return traversal_error
     p = Path(file_path)
     if not p.exists():
         return f"Error: File not found: {file_path}"
+    if not p.is_file():
+        return f"Error: Not a file: {file_path}"
+    header_error = _check_diff_header_paths(p, diff_text)
+    if header_error:
+        return header_error
 
-    original = p.read_text(encoding="utf-8")
+    try:
+        original = p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        return f"Error: {e}"
 
     try:
         result = subprocess.run(

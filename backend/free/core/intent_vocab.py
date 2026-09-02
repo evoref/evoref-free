@@ -1808,3 +1808,233 @@ def is_plain_statement(query: str) -> bool:
     if _REQUEST_MARKER_RE.search(query):
         return False
     return bool(_STATEMENT_TAIL_RE.search(query.strip()))
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 履歴参照キーワードの照合
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _contains_any_keyword(query: str, keywords) -> bool:
+    """小文字化した ``query`` に ``keywords`` のいずれかが部分一致するか。"""
+    q = (query or "").lower()
+    return any(kw in q for kw in keywords)
+
+
+def has_history_recall_keyword(query: str, *, locale_aware: bool = True) -> bool:
+    """明示的な履歴参照キーワード (:data:`HISTORY_KEYWORDS`) を含むか (純粋関数)。
+
+    ``locale_aware=True`` (既定) は GUI の言語設定に従って JA / EN の片方だけを
+    見る (``tool_judge_history`` の強制発火判定)。``False`` は両方を見る
+    (``agent.router`` の層分類 — locale に関係なく英語の履歴参照を拾う)。
+    以前は 3 箇所 (router / tool_judge_history / ここの長距離版) に同じ
+    小文字化 + 部分一致が書き写されていた。
+    """
+    if not locale_aware:
+        return _contains_any_keyword(query, HISTORY_KEYWORDS) or _contains_any_keyword(
+            query, HISTORY_KEYWORDS_EN,
+        )
+    from backend.free.core.locale_patterns import select_locale_variant
+
+    return _contains_any_keyword(
+        query, select_locale_variant(HISTORY_KEYWORDS, HISTORY_KEYWORDS_EN),
+    )
+
+
+#: 「(過去に述べられた事実) は何日でしたか？」型の **想起の文末**。
+#:
+#: 2 つの消費側が別々に持っていた語彙の和集合:
+#:
+#: - ``tool_judge_commands._is_past_fact_recall``: now-only の日時コマンドを
+#:   抑止する (「私の誕生日は何日でしたか？」で ``datetime.now()`` を撃たない)。
+#: - ``tool_judge_history.asks_about_prior_conversation_entity``: 既出対象の
+#:   尋ね直しを実行可能クエリから外す (「その打ち合わせは何曜日でしたか？」)。
+#:
+#: どちらも「現在時刻ではなく会話で述べられた値を訊いている」ことの signal で、
+#: 語彙が食い違う理由は無かった (片方にだけ ``覚えて`` / ``でしたよね`` があった)。
+PAST_RECALL_TAIL_RE = re.compile(
+    r"でした(?:か|っけ|よね)|だった(?:か|っけ)|だっけ"
+    r"|(?:と)?(?:言|いい|伝え|教え)(?:い?ました|った)"
+    r"|覚えて(?:い|ま|る)",
+)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 実行可能クエリ (Python 実行で正確に答えられる問い) の語彙
+# ─────────────────────────────────────────────────────────────────────
+#
+# 4 つの消費側が同じ語彙を各自で持っていた:
+#
+# - ``tool_judge_signals._TOOL_PATTERNS`` (ツール要否シグナル)
+# - ``tool_judge_signals._INFER_TOOL_EXEC_QUERY_RE`` (``_infer_tool`` の分岐ゲート)
+# - ``tool_judge_commands._EXECUTABLE_QUERY_COMMANDS`` (コマンド合成のルール表)
+# - ``agent.router._EXECUTABLE_QUERY_PATTERNS`` (deliberative への昇格)
+#
+# 片方だけに入った修正 (「変換」の除外 / 「日付型」のガード / ``CPU バウンド`` の
+# 除外) が他へ伝播せず、同じ誤発火が別の経路から再発していた。語彙はここで
+# 1 度だけ定義し、消費側は **同じ部品** を組み合わせる。
+#
+# 意図的に分岐する部分は名前付き定数にする:
+#
+# - :data:`MEMORY_SPEC_TERMS` (メモリ / RAM / GPU / VRAM) は **コマンド合成側には
+#   載せない**。spec コマンドはそれらの値を一切出力しないため、一致しても
+#   1 ターンを浪費するだけ (2026-07-27 / 2026-07-25 に外した経緯)。搭載メモリは
+#   層 0.6 の専用ツール ``system_hardware_info`` が答える。
+# - :data:`DATETIME_SIGNAL_TERMS_EN` (裸の today / now / date / time) は **ツール要否
+#   シグナルにだけ** 使う。``_infer_tool`` / コマンド合成では
+#   ``DATETIME_QUERY_RE`` (疑問構文限定) を使う — 裸の ``now`` は "from now on"
+#   等の非時制表現に誤爆する (2026-07-26 ライブ検証)。
+
+#: ``CPU``。ワークロードの分類名 (``CPU バウンド`` / ``CPU-bound`` / ``CPU 集約``)
+#: は **このマシンの部品ではない** ので除外する (2026-08-18 ライブ監査 ターン4:
+#: GIL の知識質問で OS/CPU/コア数の取得コマンドが撃たれた)。
+CPU_HARDWARE_TERM = (
+    ascii_boundary("CPU") + r"(?!\s*[-‐-—]?\s*(?:bound|バウンド|集約))"
+)
+
+#: 記憶装置 / 機体スペックを名指しする語 (JA + EN)。
+#:
+#: 「容量」単独と ``capacity`` は外す。**データ量の話に普通に現れる** ため機械
+#: スペックの要求とは限らない (2026-08-10 ライブ監査: 「DBの容量は1.2TB…合計
+#: 容量は何TBですか」で OS/CPU の取得コマンドが撃たれた / 2026-08-09: JSON の
+#: キー名 ``capacity`` が唯一の引き金だった)。機器を名指しする問いは
+#: ディスク / ストレージ / ドライブ 側で拾えるので取りこぼさない。
+STORAGE_SPEC_TERMS = (
+    r"スペック|ディスク|(?:空き|残り|使用)容量|ストレージ|ドライブ|"
+    + ascii_boundary_alternation("specs?", "disk", "storage", "drive")
+)
+
+#: メモリ / GPU 系。要否シグナルと層分類には載せるが、コマンド合成側は採らない
+#: (上記の分岐理由を参照)。
+MEMORY_SPEC_TERMS = r"メモリ|" + ascii_boundary_alternation(
+    "memory", "RAM", "GPU", "VRAM",
+)
+
+#: 機体スペック全般 (要否シグナル / ``_infer_tool`` / router 用)。
+HARDWARE_SPEC_TERMS = f"{STORAGE_SPEC_TERMS}|{CPU_HARDWARE_TERM}|{MEMORY_SPEC_TERMS}"
+
+#: 裸の時制語。**ツール要否シグナル専用** (分岐理由は節頭のコメント)。
+DATETIME_SIGNAL_TERMS_EN = ascii_boundary_alternation("today", "now", "date", "time")
+
+#: IP アドレス / ホスト名。
+NETWORK_IDENTITY_TERMS = (
+    r"IP\s*アドレス|ホスト名|(?<![A-Za-z])IP\s*address|"
+    + ascii_boundary("hostname")
+)
+
+#: OS。``Windows`` / ``Linux`` / ``Mac`` は製品名なので単独で受ける。
+OS_QUERY_TERMS = (
+    r"オペレーティングシステム|operating\s*system|"
+    + ascii_boundary_alternation("OS", "Windows", "Linux", "Mac")
+)
+
+#: Python のバージョン。
+PYTHON_VERSION_TERMS = r"Python\s*(?:バージョン|version)"
+
+#: 環境変数。
+ENV_VAR_TERMS = r"環境変数|environment\s*variable|" + ascii_boundary_alternation(
+    "env", "PATH",
+)
+
+#: 数値処理 (階乗 / 素数 / 基数変換 / 桁)。「16進に変換して」のように「数」が
+#: 入らない書き方も基数変換なので、bare「変換」を外したぶん基数そのものを見る。
+NUMERIC_COMPUTE_TERMS_JA = (
+    r"階乗|素数|フィボナッチ|素因数|進数変換|\d+\s*進(?:数|法)?|桁"
+)
+NUMERIC_COMPUTE_TERMS_EN = (
+    r"(?<![A-Za-z])(?:factorial|prime(?:\s*numbers?)?|fibonacci"
+    r"|prime\s*factorization|base\s*conversion|base\s*\d+|hex(?:adecimal)?"
+    r"|binary|octal|radix|number\s*of\s*digits?|digits?)(?![A-Za-z])"
+)
+
+#: データ処理 (集計 / 統計)。
+#:
+#: 英語の sum / average / mean / sort は日常会話で極めて頻出する多義語
+#: ("What do you mean?" / "I sort of agree" / "on average, this works fine")
+#: なので、単独では発火させず数値 / データ文脈語との近接共起を要求する
+#: (2026-07-22 監査)。total / median / standard deviation / statistics /
+#: aggregate は多義性が低いので単独で受ける。
+DATA_PROCESSING_TERMS_JA = r"集計|合計|平均|中央値|標準偏差|ソート|統計"
+DATA_PROCESSING_TERMS_EN = (
+    r"(?<![A-Za-z])(?:total|median|standard\s*deviation|std\s*dev|statistics"
+    r"|aggregate)(?![A-Za-z])"
+    r"|(?<![A-Za-z])(?:sum|average|mean|sort(?:ed|ing)?)(?![A-Za-z]).{0,20}"
+    r"(?<![A-Za-z])(?:numbers?|data|list|array|values?|dataset|figures?)(?![A-Za-z])"
+    r"|(?<![A-Za-z])(?:numbers?|data|list|array|values?|dataset|figures?)(?![A-Za-z])"
+    r".{0,20}(?<![A-Za-z])(?:sum|average|mean|sort(?:ed|ing)?)(?![A-Za-z])"
+)
+
+#: 符号化・基数・ハッシュ・時刻の変換。**bare「変換」/ ``convert`` は採らない**。
+#: 表・JSON・Markdown の書き換えなど LLM 自身がやる内容変換まで実行可能クエリ
+#: 扱いになり、そこからコマンド想起が開いて無関係な過去コマンドが再生された
+#: (2026-08-10 ライブ監査: 「その表を JSON Schema に変換してください」で
+#: OS/CPU スペック取得コマンドが実行された)。コマンドが要る変換は固有語で拾える。
+ENCODING_CONVERSION_TERMS_JA = (
+    r"エンコード|デコード|Base64|ハッシュ|タイムスタンプ|文字コード|エポック秒?"
+    r"|UNIX\s*時間"
+)
+ENCODING_CONVERSION_TERMS_EN = (
+    r"(?<![A-Za-z])(?:encode|decode|encoding|decoding|Base64|hash(?:ing)?"
+    r"|timestamp|epoch)(?![A-Za-z])"
+)
+
+#: 「計算」/ ``calculate``。旧定義 ``(?:計算|calculate)\s`` は末尾の ``\s`` が
+#: 日本語 (「計算して」は空白を挟まない) で **一度も一致しなかった**。
+#: ``_infer_tool`` 側 (``\s`` 無し) と揃え、ASCII 側だけ境界を付ける。
+CALCULATE_TERM = r"計算|" + ascii_boundary("calculate")
+
+
+def _compile_groups(groups) -> list[re.Pattern]:
+    """語彙グループ列を **1 グループ = 1 パターン** で compile する。
+
+    既に compile 済みの要素 (``DATETIME_QUERY_RE``) はそのまま通す。router の
+    既存テストが同一オブジェクトの包含を検査しているため、再 compile しない。
+    """
+    return [
+        g if isinstance(g, re.Pattern) else re.compile(f"(?:{g})", re.IGNORECASE)
+        for g in groups
+    ]
+
+
+def _union_pattern(groups) -> re.Pattern:
+    """語彙グループ列を 1 本の alternation に畳む (``_infer_tool`` のゲート用)。"""
+    parts = [g.pattern if isinstance(g, re.Pattern) else g for g in groups]
+    return re.compile("(?:" + "|".join(f"(?:{p})" for p in parts) + ")", re.IGNORECASE)
+
+
+#: 日本語 locale の実行可能クエリ語彙 (グループ順は従来のリスト順を保つ)。
+EXECUTABLE_QUERY_TERM_GROUPS_JA: tuple = (
+    HARDWARE_SPEC_TERMS,
+    DATETIME_QUERY_RE,
+    NETWORK_IDENTITY_TERMS,
+    OS_QUERY_TERMS,
+    PYTHON_VERSION_TERMS,
+    ENV_VAR_TERMS,
+    NUMERIC_COMPUTE_TERMS_JA,
+    DATA_PROCESSING_TERMS_JA,
+    ENCODING_CONVERSION_TERMS_JA,
+)
+#: 英語 locale の実行可能クエリ語彙。
+EXECUTABLE_QUERY_TERM_GROUPS_EN: tuple = (
+    HARDWARE_SPEC_TERMS,
+    DATETIME_QUERY_RE,
+    NETWORK_IDENTITY_TERMS,
+    OS_QUERY_TERMS,
+    PYTHON_VERSION_TERMS,
+    ENV_VAR_TERMS,
+    NUMERIC_COMPUTE_TERMS_EN,
+    DATA_PROCESSING_TERMS_EN,
+    ENCODING_CONVERSION_TERMS_EN,
+)
+
+#: グループごとの compile 済みパターン列 (``_TOOL_PATTERNS`` / router 用)。
+EXECUTABLE_QUERY_PATTERNS_JA: list[re.Pattern] = _compile_groups(
+    EXECUTABLE_QUERY_TERM_GROUPS_JA,
+)
+EXECUTABLE_QUERY_PATTERNS_EN: list[re.Pattern] = _compile_groups(
+    EXECUTABLE_QUERY_TERM_GROUPS_EN,
+)
+
+#: 1 本に畳んだゲート (``_infer_tool`` 用)。
+EXECUTABLE_QUERY_RE_JA = _union_pattern(EXECUTABLE_QUERY_TERM_GROUPS_JA)
+EXECUTABLE_QUERY_RE_EN = _union_pattern(EXECUTABLE_QUERY_TERM_GROUPS_EN)

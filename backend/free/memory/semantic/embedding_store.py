@@ -383,6 +383,8 @@ class EmbeddingStore:
         self,
         query: np.ndarray,
         top_k: int = 10,
+        *,
+        fact_ids: Iterable[str] | None = None,
     ) -> list[tuple[str, float]]:
         """cosine similarity top-k を返す (fact_id, score の降順).
 
@@ -392,6 +394,11 @@ class EmbeddingStore:
         取り出す (``np.argsort`` は常に全件 O(N log N) を払う)。行のノルムは
         :meth:`_row_norms` がキャッシュし、正規化済みストアでは計算自体を
         省く。
+
+        Args:
+            fact_ids: 与えると **その行だけ** を候補にして順位付けする
+                (subject 接頭辞で絞った索引リコール用)。ストアに無い id は
+                黙って落とす。``None`` なら全行。
         """
         if self._vectors is None or self._vectors.shape[0] == 0:
             return []
@@ -404,12 +411,21 @@ class EmbeddingStore:
         qn = float(np.linalg.norm(q))
         if qn == 0.0:
             return []
-        sims = self._vectors @ q
+        rows: np.ndarray | None = None
+        if fact_ids is not None:
+            picked = sorted(
+                {r for fid in fact_ids if (r := self._id_to_row.get(fid)) is not None},
+            )
+            if not picked:
+                return []
+            rows = np.asarray(picked, dtype=np.int64)
+        vectors = self._vectors if rows is None else self._vectors[rows]
+        sims = vectors @ q
         norms = self._row_norms()
         if norms is None:
             sims = sims / qn
         else:
-            denom = norms * qn
+            denom = (norms if rows is None else norms[rows]) * qn
             denom[denom == 0.0] = 1e-9
             sims = sims / denom
         n = int(sims.shape[0])
@@ -421,7 +437,10 @@ class EmbeddingStore:
         else:
             order = np.argsort(-sims)
         return [
-            (self._row_to_id[int(row)], float(sims[int(row)]))
+            (
+                self._row_to_id[int(row) if rows is None else int(rows[int(row)])],
+                float(sims[int(row)]),
+            )
             for row in order
         ]
 

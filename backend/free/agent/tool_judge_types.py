@@ -15,7 +15,11 @@ class ToolJudgement:
     tool_needed: bool
     tool_name: str = ""
     tool_args: dict = None  # type: ignore[assignment]
-    source: str = "rule"  # "llm" | "rule" | "cartridge" | "learned"
+    #: 判定を確定させた層。``rule`` (決定論層 / URL リコール) / ``cartridge`` /
+    #: ``learned`` / ``recall`` (executable command リコール。curator が再学習から
+    #: 除外するために区別する) / ``classifier`` (層 5.9 の文法制約分類・層 5.95 の
+    #: 式合成)。
+    source: str = "rule"
     #: calculate の式に含まれる、対話から辿れない数値リテラル。式を捨てずに
     #: 実行したときだけ入り、回答側でその値の出所を開示させるために使う
     #: (``_suppress_ungrounded_calculate`` 参照)。

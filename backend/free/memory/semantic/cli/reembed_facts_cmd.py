@@ -32,12 +32,13 @@ live fact の ``fact.object`` テキスト** を受け取り、doc 側 (正規�
 
 from __future__ import annotations
 
+import inspect
 import shutil
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -58,9 +59,104 @@ from backend.free.memory.semantic.stale_guard import (
     clear_semmem_reembed_required,
 )
 from backend.free.memory.semantic.store import SemanticFactStore
+from backend.free.memory.sleep._curator_common import embed_kwargs_for_subject
+from backend.log_config import get_logger
 
-# embed_fn: 生の object テキスト列 -> doc 側ベクトル列 (正規化済み)。
-EmbedFn = Callable[[list[str]], Sequence[Sequence[float]]]
+logger = get_logger("memory.semantic.cli.reembed_facts")
+
+# embed_fn: 生の object テキスト列 -> ベクトル列 (正規化済み)。
+# 内部索引ファクト (executable command 等) は query 側で埋め込む必要がある
+# (``_curator_common.INDEX_EMBED_IS_QUERY``)。embed_fn が ``is_query`` /
+# ``mode`` キーワードを受け取れる場合はそれを渡し、受け取れない (doc 側専用の)
+# embed_fn には渡さず WARNING を出して doc 側で埋める。
+EmbedFn = Callable[..., Sequence[Sequence[float]]]
+
+
+class ReembedTarget(NamedTuple):
+    """再埋め込み対象 1 件。
+
+    ``embed_kwargs`` は ``embedder.embed(texts, **embed_kwargs)`` へ渡す側の
+    指定 (``None`` = document 側の既定)。``targets[i][3]`` で本文を取る既存
+    呼出側 (``POST /api/model/reembed-facts``) との互換のため tuple のまま。
+    """
+
+    scope_name: str
+    scope_root: Path
+    fact_id: str
+    text: str
+    embed_kwargs: dict[str, Any] | None = None
+
+
+def group_targets_by_embed_kwargs(
+    targets: Sequence[ReembedTarget],
+) -> list[tuple[dict[str, Any] | None, list[int]]]:
+    """``embed_kwargs`` が同じ target の添字をまとめる (順序は初出順)。"""
+    groups: dict[tuple[tuple[str, Any], ...] | None, list[int]] = {}
+    kwargs_of: dict[tuple[tuple[str, Any], ...] | None, dict[str, Any] | None] = {}
+    for i, t in enumerate(targets):
+        kw = t[4] if len(t) > 4 else None
+        key = None if not kw else tuple(sorted(kw.items()))
+        groups.setdefault(key, []).append(i)
+        kwargs_of.setdefault(key, kw or None)
+    return [(kwargs_of[k], idxs) for k, idxs in groups.items()]
+
+
+def _embed_fn_accepts_side(embed_fn: Callable[..., Any]) -> bool:
+    """``embed_fn`` が ``is_query`` キーワード (または ``**kwargs``) を受けるか。"""
+    try:
+        params = inspect.signature(embed_fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if "is_query" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def embed_targets(
+    embed_fn: EmbedFn, targets: Sequence[ReembedTarget],
+) -> list[Sequence[float]]:
+    """``targets`` を側ごとにまとめて embed し、元の順序でベクトル列を返す (sync)。"""
+    out: list[Sequence[float] | None] = [None] * len(targets)
+    accepts_side = _embed_fn_accepts_side(embed_fn)
+    for kwargs, idxs in group_targets_by_embed_kwargs(targets):
+        texts = [targets[i][3] for i in idxs]
+        if kwargs and not accepts_side:
+            logger.warning(
+                "reembed-facts: embed_fn does not accept is_query/mode; %d "
+                "index fact(s) will be embedded on the document side "
+                "(recall similarity will be degraded)", len(idxs),
+            )
+        vecs = embed_fn(texts, **kwargs) if (kwargs and accepts_side) else embed_fn(texts)
+        if len(vecs) != len(idxs):
+            raise ValueError(
+                f"embed_fn returned {len(vecs)} vectors for {len(idxs)} texts",
+            )
+        for i, v in zip(idxs, vecs):
+            out[i] = v
+    return [v if v is not None else [] for v in out]
+
+
+async def embed_targets_async(
+    embedder: Any, targets: Sequence[ReembedTarget],
+) -> list[Sequence[float]]:
+    """``embedder.embed(texts, is_query=..., mode=...)`` で側ごとに埋め込む (async)。
+
+    ``POST /api/model/reembed-facts`` のような ``EmbeddingBackend`` を持つ呼出側
+    向け。全 target を doc 側で ``embed(objs, is_query=False)`` すると索引
+    ファクトの側が反転するので、こちらを使うこと。
+    """
+    out: list[Sequence[float] | None] = [None] * len(targets)
+    for kwargs, idxs in group_targets_by_embed_kwargs(targets):
+        texts = [targets[i][3] for i in idxs]
+        vecs = await embedder.embed(texts, **(kwargs or {"is_query": False}))
+        if vecs is None or len(vecs) != len(idxs):
+            raise ValueError(
+                f"embedder returned {0 if vecs is None else len(vecs)} vectors "
+                f"for {len(idxs)} texts",
+            )
+        for i, v in zip(idxs, vecs):
+            out[i] = v
+    return [v if v is not None else [] for v in out]
 
 
 @dataclass
@@ -89,15 +185,17 @@ class ReembedFactsReport:
 
 def collect_reembed_targets(
     memory_dir: Path, manifest,
-) -> list[tuple[str, Path, str, str]]:
+) -> list[ReembedTarget]:
     """全 scope の「embedding を持つ live fact」を列挙する.
 
     Returns:
-        ``(scope_name, scope_root, fact_id, embed_text)`` のリスト。
-        ``embedding`` が None / superseded / 本文が空の fact は除外。
-        本文は ``fact.text`` (= ``statement or object``)。
+        :class:`ReembedTarget` (``scope_name, scope_root, fact_id, embed_text,
+        embed_kwargs``) のリスト。``embedding`` が None / superseded / 本文が
+        空の fact は除外。本文は ``fact.text`` (= ``statement or object``)。
+        ``embed_kwargs`` は内部索引ファクトのみ非 None
+        (:func:`~backend.free.memory.sleep._curator_common.embed_kwargs_for_subject`)。
     """
-    targets: list[tuple[str, Path, str, str]] = []
+    targets: list[ReembedTarget] = []
     for scope in enumerate_scopes(memory_dir):
         store = SemanticFactStore(scope.root_dir, manifest=manifest)
         for fact in store.all_facts(include_superseded=False):
@@ -110,14 +208,17 @@ def collect_reembed_targets(
             text = (fact.text or "").strip()
             if not text:
                 continue
-            targets.append((scope.name, scope.root_dir, fact.id, text))
+            targets.append(ReembedTarget(
+                scope.name, scope.root_dir, fact.id, text,
+                embed_kwargs_for_subject(fact.subject),
+            ))
     return targets
 
 
 def apply_reembed_swap(
     memory_dir: Path,
     migration_archive_dir: Path,
-    targets: Sequence[tuple[str, Path, str, str]],
+    targets: Sequence[ReembedTarget],
     vectors: Sequence[Sequence[float]],
     *,
     new_model_id: str,
@@ -191,7 +292,8 @@ def apply_reembed_swap(
     new_manifest = load_manifest(memory_dir)
     stores: dict[Path, SemanticFactStore] = {}
     reembedded = 0
-    for (_scope_name, scope_root, fact_id, _text), vec in zip(targets, vecs):
+    for target, vec in zip(targets, vecs):
+        scope_root, fact_id = target[1], target[2]
         store = stores.get(scope_root)
         if store is None:
             store = SemanticFactStore(scope_root, manifest=new_manifest)
@@ -243,7 +345,8 @@ def run_reembed_facts(
         return rep
 
     targets = collect_reembed_targets(memory_dir, manifest)
-    for scope_name, _root, _fid, _text in targets:
+    for target in targets:
+        scope_name = target[0]
         rep.per_scope_counts[scope_name] = (
             rep.per_scope_counts.get(scope_name, 0) + 1
         )
@@ -260,8 +363,8 @@ def run_reembed_facts(
         return rep
 
     # ベクトルを swap 前に全件計算する (embed 失敗時に manifest を壊さないため)。
-    texts = [t[3] for t in targets]
-    vectors = embed_fn(texts)
+    # 内部索引ファクトは query 側で埋める (embed_fn が側を受け取れる場合)。
+    vectors = embed_targets(embed_fn, targets)
     try:
         reembedded, backup_path = apply_reembed_swap(
             memory_dir, migration_archive_dir, targets, vectors,
@@ -319,8 +422,12 @@ def format_report_text(report: ReembedFactsReport) -> str:
 __all__ = [
     "EmbedFn",
     "ReembedFactsReport",
+    "ReembedTarget",
     "apply_reembed_swap",
     "collect_reembed_targets",
+    "embed_targets",
+    "embed_targets_async",
     "format_report_text",
+    "group_targets_by_embed_kwargs",
     "run_reembed_facts",
 ]

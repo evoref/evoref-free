@@ -371,121 +371,6 @@ class FewShotQualityJudgement(_StrictModel):
     reason: str = Field(max_length=200)
 
 
-# ── 実行可能クエリのコマンド合成 (executable_command_synth) ──
-
-class ExecutableCommandSynth(_StrictModel):
-    """`backend/free/agent/tool_call_judge.py` の executable query 判定 + コマンド合成.
-
-    「Chrome のバージョン」「現在のディスク使用量」「インストール済み Python
-    パッケージ」のような環境依存事実 (Python / シェルから取得できる事実) を、
-    パターン辞書 (`_EXECUTABLE_QUERY_COMMANDS`) ではなく 補助タスクで
-    判定する。
-
-    出力フィールド:
-
-    - ``is_executable``: クエリが Python / シェルで取得できる環境依存事実か。
-      知識質問 / 一般会話 / 副作用を伴う依頼の場合は ``False``。
-    - ``command``: ``is_executable=True`` 時に取得用の単一行コマンド。
-      ``python -c "..."`` 形式または OS ネイティブ短コマンド。30 秒以内に
-      終了し、副作用 (書き込み / 削除 / ネットワーク送信 / 対話) を持たない
-      ものに限定する。``is_executable=False`` のときは ``""``。
-    - ``rationale``: 1 行説明 (ログ用、UI 非表示)。
-    """
-
-    is_executable: bool
-    command: str = ""
-    rationale: str = ""
-
-
-# ── 数値文章題の式合成 (calculate_expression_synth) ──
-
-class CalculateExpressionSynth(_StrictModel):
-    """`backend/free/agent/tool_call_judge.py` の数値文章題 → 式 合成.
-
-    「1マイルは約1.609キロメートルです。42.195キロメートルは何マイルですか？」
-    のように計算を求めているが式が書かれていないクエリから、``calculate``
-    ツールへ渡す Python 構文の算術式を合成する。式が書かれているクエリは
-    ルール層 (`_extract_arithmetic_expression`) が決定論的に処理するため、
-    ここへは到達しない。
-
-    出力フィールド:
-
-    - ``is_calculation``: クエリが数値計算の答えを求めているか。知識質問 /
-      一般会話 / 計算不要の場合は ``False``。
-    - ``expression``: ``is_calculation=True`` 時の算術式。数値リテラルと
-      ``+ - * / % ** // ( )`` のみで構成し、**クエリに現れる数値だけ**を使う
-      (関数呼び出し・変数・単位記号は不可)。``is_calculation=False`` のときは ``""``。
-    - ``rationale``: 1 行説明 (ログ用、UI 非表示)。
-    """
-
-    is_calculation: bool
-    expression: str = ""
-    rationale: str = ""
-
-
-# ── ツール呼出判定 (tool_judgment) ──
-
-class ToolJudgmentResult(_StrictModel):
-    """`backend/free/agent/tool_call_judge.py` のLLM 判定。
-
-    既存プロンプト (`_DEFAULT_SYSTEM_PROMPT`) の出力形式
-    ``{"tool": "<ツール名>" | "", "args": {...}}`` に合わせる。
-    旧仕様のリテラル文字列 ``"no_tool"`` は廃止
-    ツール不要時は ``tool=""`` を返す。
-
-    ``args`` フィールドは tool ごとに任意の引数を取るため、free-form
-    object (``additionalProperties: True``) として扱う。``ToolsRegistry``
-    が引数バリデーションを担当するため、JSON 構文レベルの strict 化は不要。
-    """
-
-    tool: str = ""
-    args: dict[str, Any] = Field(
-        default_factory=dict,
-        json_schema_extra={"additionalProperties": True},
-    )
-
-
-# ── エディタ出力ファイル名導出 (editor_filename) ──
-
-class EditorFilenameResult(_StrictModel):
-    """`backend/free/llm/editor_filename.py` のエディタタブ名導出.
-
-    クリエイトモードで生成したコード/仕様書を Pro エディタへタブ表示する際、
-    生成内容から **拡張子なしの ASCII snake_case** ファイル名 stem を 1 つ
-    導出する。日本語見出しをそのまま流用するとタブ名が日本語化するため、
-    補助タスクに英語の簡潔名を生成させる (SPLIT モードの ``file_name`` と
-    同思想)。
-
-    - ``file_name``: 英小文字 + 数字 + アンダースコアのみ、拡張子なし。
-      呼出側が言語に応じた拡張子を付与する。LLM が日本語/記号を返しても
-      呼出側で ASCII slug 化 + 言語別フォールバックするため安全。
-    """
-
-    file_name: str = ""
-
-
-# ── pending 競合のチャット回答判定 (conflict_chat_judge) ──
-
-class ChatConflictJudgement(_StrictModel):
-    """`backend/free/memory/pipeline/conflict_review.py` のチャット回答判定。
-
-    SemMem の pending 競合をチャットでユーザーに確認した後、直近の
-    ユーザー発話が「どの競合への、どの解決指示か」を分類する。
-
-    - ``is_answer``: 発話が競合への回答なら True。雑談・無関係・曖昧なら False
-    - ``group_index``: 注入ブロックの ``[C1]`` 採番に対応 (1 始まり)。
-      非該当時は 0
-    - ``action``: ``keep_old`` (古い方を残す) / ``keep_new`` (新しい方を残す) /
-      ``merge`` (両立・統合) / ``none`` (判定不能)
-    - ``merged_object``: ``action="merge"`` のときの統合後の値
-    """
-
-    is_answer: bool = False
-    group_index: int = 0
-    action: Literal["keep_old", "keep_new", "merge", "none"] = "none"
-    merged_object: str = ""
-
-
 # ── purpose -> schema 自動解決マップ ──
 #
 # 呼出側が ``response_schema`` を明示しない場合、AuxClient が purpose
@@ -502,16 +387,11 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "flow_spec_synthesis": FlowSpec,
     "flow_spec_part_synthesis": FlowSpec,
     "spec_revision_judge": SpecRevisionJudgement,
-    "tool_judgment": ToolJudgmentResult,
-    "executable_command_synth": ExecutableCommandSynth,
-    "calculate_expression_synth": CalculateExpressionSynth,
     "meta_cognitive_plan": MetaCognitivePlan,
     "cartridge_eval_generation": CartridgeEvalQAList,
     "url_relevance_score": UrlRelevanceJudgement,
     "assertion_naming": AssertionNaming,
     "fewshot_quality_score": FewShotQualityJudgement,
-    "editor_filename": EditorFilenameResult,
-    "conflict_chat_judge": ChatConflictJudgement,
 }
 
 
@@ -555,7 +435,7 @@ def _enforce_additional_properties_false(node: Any) -> Any:
     ``additionalProperties: false`` を必ず明記しないことがあるため、
     schema 全体を走査して明示的に追加する。llama.cpp の strict サンプリ
     ングが「未定義キー」を許してしまわないようにするための保険。
-    既に ``True`` が明示されているノード (例: ``ToolJudgmentResult.args``)
+    既に ``True`` が明示されているノード (free-form object を宣言したフィールド)
     は ``setdefault`` の挙動で上書きされない。
     """
     if isinstance(node, dict):
@@ -654,14 +534,10 @@ __all__ = [
     "TextPlan",
     "ReviewIssueItem",
     "ReviewIssues",
-    "ToolJudgmentResult",
-    "ExecutableCommandSynth",
     "MetaCognitivePlan",
     "CartridgeEvalQAItem",
     "CartridgeEvalQAList",
     "UrlRelevanceJudgement",
-    "EditorFilenameResult",
-    "ChatConflictJudgement",
     "SpecRevisionJudgement",
     "PURPOSE_SCHEMAS",
     "make_response_format",

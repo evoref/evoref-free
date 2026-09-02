@@ -24,7 +24,13 @@ logger = get_logger("agent.tools.builtin")
 # 最後の run_command 全文出力バッファ（/page コマンド用）
 _last_full_output: str = ""
 _last_full_output_lines: int = 0
-async def run_command(command: str, timeout: int = 30, config: dict | None = None) -> str:
+async def run_command(
+    command: str,
+    timeout: int = 30,
+    config: dict | None = None,
+    *,
+    kill_on_timeout: bool = False,
+) -> str:
     """シェルコマンドを非同期で実行する（危険コマンドガード + 対話的コマンドガード付き）
 
     config['agent']['dangerous_command_block'] が true（デフォルト）の場合、
@@ -33,8 +39,11 @@ async def run_command(command: str, timeout: int = 30, config: dict | None = Non
     対話的コマンド（vim, python REPL 等）は TTY パススルーが必要なため、
     バックエンド側では実行せずにシェルアウト要求メッセージを返す（設計書 09 §9.4.4）。
 
-    長時間実行プロセス（GUI アプリ等）はタイムアウト後もプロセスを終了させず
-    バックグラウンドで継続させる。
+    ``kill_on_timeout=False`` (create の ``run_command``) では長時間実行
+    プロセス (GUI アプリ等) をタイムアウト後も終了させずバックグラウンドで
+    継続させる。``True`` (chat の ``run_command_readonly``) ではタイムアウト時に
+    プロセスを kill する — 読み取り専用の環境問い合わせに居残るプロセスは
+    無く、放置すると ``communicate()`` のワーカースレッドも一緒に残る。
     """
     cfg = config or {}
     if cfg.get("agent", {}).get("dangerous_command_block", True):
@@ -58,7 +67,9 @@ async def run_command(command: str, timeout: int = 30, config: dict | None = Non
     if mkdir_match:
         return _mkdir_safe(mkdir_match.group(1).strip().strip('"').strip("'"))
 
-    return await _run_command_async_impl(command, timeout)
+    return await _run_command_async_impl(
+        command, timeout, kill_on_timeout=kill_on_timeout,
+    )
 
 
 def _mkdir_safe(dir_path: str) -> str:
@@ -75,11 +86,18 @@ def _decode_subprocess_output(raw: bytes) -> str:
 
     Windows の子プロセス (cmd / git / python 等) は OEM コードページ
     (日本語環境では cp932) で出力するため、utf-8 固定 decode では日本語が
-    mojibake 化する。OEM/mbcs → ロケール推奨エンコーディング → utf-8(replace)
-    の順でフォールバックする (cli/pid_manager._decode_windows_console_output と同方針)。
+    mojibake 化する。一方 ``scripts/evoref*.bat`` は ``PYTHONUTF8=1`` を立てる
+    ため python 子プロセスは UTF-8 で出力し、cp932 を先に試すと UTF-8 の
+    日本語が「成功裏に」mojibake へ化ける。厳格 utf-8 → OEM/mbcs →
+    ロケール推奨エンコーディング → utf-8(replace) の順でフォールバックする
+    (cli/pid_manager._decode_windows_console_output と同方針)。
     """
     if not raw:
         return ""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
     candidates: list[str] = []
     if sys.platform == "win32":
         candidates.extend(["oem", "mbcs"])
@@ -94,11 +112,15 @@ def _decode_subprocess_output(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-async def _run_command_async_impl(cmd: str, timeout: int = 30) -> str:
+async def _run_command_async_impl(
+    cmd: str, timeout: int = 30, *, kill_on_timeout: bool = False,
+) -> str:
     """シェルコマンドの非同期実行本体
 
     stdlib subprocess.Popen をワーカースレッド経由で呼び出すことでイベントループを
-    ブロックしない。タイムアウト時はプロセスを終了させず、バックグラウンドで継続させる。
+    ブロックしない。タイムアウト時は ``kill_on_timeout`` が False ならプロセスを
+    終了させずバックグラウンドで継続させる (``communicate()`` のスレッドは
+    プロセス終了まで残る)。True なら kill してスレッドも回収する。
 
     asyncio.create_subprocess_shell を使わないのは、Windows の ProactorEventLoop が
     生成するパイプトランスポートが、タイムアウト時に Process オブジェクトを放置する
@@ -120,14 +142,22 @@ async def _run_command_async_impl(cmd: str, timeout: int = 30) -> str:
                 asyncio.to_thread(proc.communicate), timeout=timeout,
             )
         except asyncio.TimeoutError:
+            _last_full_output = ""
+            _last_full_output_lines = 0
+            if kill_on_timeout:
+                # pipe が閉じるので communicate() のワーカースレッドも抜ける
+                proc.kill()
+                logger.warning(
+                    "Process killed after %ds timeout: PID=%s, cmd=%s",
+                    timeout, proc.pid, cmd[:100],
+                )
+                return f"Error: command timed out after {timeout}s and was killed"
             # プロセスがタイムアウト内に終了しなかった（GUI/デーモン/長時間処理）
             # プロセスは終了させずバックグラウンドで継続させる
             logger.info(
                 "Process still running after %ds, left in background: PID=%s, cmd=%s",
                 timeout, proc.pid, cmd[:100],
             )
-            _last_full_output = ""
-            _last_full_output_lines = 0
             return (
                 f"Process (PID {proc.pid}) is still running after {timeout}s. "
                 "It was left running in the background."

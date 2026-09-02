@@ -38,6 +38,8 @@ logger = get_logger("agent.file_ledger")
 
 __all__ = [
     "file_ledger_scope",
+    "forget_current_file",
+    "forget_file",
     "last_file_path",
     "record_current_file",
     "record_file",
@@ -99,6 +101,32 @@ def record_current_file(path: str) -> None:
     session_id = _current_session.get()
     if session_id:
         record_file(session_id, path)
+
+
+def forget_file(session_id: str, path: str) -> bool:
+    """記録済みのパスを取り消す (取り消せたら True)。
+
+    ``ToolsRegistry.execute`` は戻り値だけで ``write_file`` の成功を記録するため、
+    書込後の読み戻し突合で失敗と分かった時点では、壊れたファイルが「直近に触れた
+    ファイル」として残っている。そのままだと次ターンの「保存したファイルを読んで」
+    が壊れたファイルへ向く。呼出側 (meta 経路の ``_write_file``) が失敗確定直後に
+    呼び、その前に触れていたファイルを直近へ戻す。
+    """
+    cleaned = (path or "").strip().strip("\"'")
+    bucket = _ledger.get(session_id)
+    if not bucket or cleaned not in bucket:
+        return False
+    while cleaned in bucket:
+        bucket.remove(cleaned)
+    return True
+
+
+def forget_current_file(path: str) -> bool:
+    """現在のリクエストの宛先から ``path`` の記録を取り消す。"""
+    session_id = _current_session.get()
+    if not session_id:
+        return False
+    return forget_file(session_id, path)
 
 
 def last_file_path(session_id: str) -> str:

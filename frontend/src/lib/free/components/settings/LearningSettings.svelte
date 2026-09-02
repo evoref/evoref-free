@@ -46,7 +46,7 @@
 		<ToggleField label="settings.agent.reminders_enabled" value={Boolean(agent.reminders_enabled ?? true)} onchange={fieldUpdater('agent', 'reminders_enabled')} />
 		<NumberField label="settings.agent.max_reminders_per_turn" value={Number(agent.max_reminders_per_turn ?? 2)} min={0} onchange={fieldUpdater('agent', 'max_reminders_per_turn')} />
 		<ToggleField label="settings.agent.dangerous_command_block" value={Boolean(agent.dangerous_command_block ?? true)} onchange={fieldUpdater('agent', 'dangerous_command_block')} />
-		<ToggleField label="settings.agent.tool_judge_enabled" value={Boolean(agent.tool_judge_enabled ?? false)} onchange={fieldUpdater('agent', 'tool_judge_enabled')} />
+		<ToggleField label="settings.agent.tool_judge_enabled" value={Boolean(agent.tool_judge_enabled ?? true)} onchange={fieldUpdater('agent', 'tool_judge_enabled')} />
 		<ToggleField label="settings.agent.meta_cognitive_enabled" value={Boolean(agent.meta_cognitive_enabled ?? true)} onchange={fieldUpdater('agent', 'meta_cognitive_enabled')} />
 		<NumberField label="settings.agent.meta_cognitive_min_budget" value={Number(agent.meta_cognitive_min_budget ?? 512)} min={0} onchange={fieldUpdater('agent', 'meta_cognitive_min_budget')} />
 	</FieldGroup>

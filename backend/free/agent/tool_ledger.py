@@ -85,8 +85,8 @@ def record_tool_use(
 #: 現在のリクエストの ``(session_id, query)``。``ToolsRegistry.execute`` が
 #: 台帳へ落とすときの宛先で、``ledger_scope`` が設定する。
 #:
-#: なぜ contextvar か: ツール実行は 6 箇所 (deliberative のツールループ /
-#: meta_cognitive のファストパス 3 種 / タスク実行ループ / agentic_loop) に
+#: なぜ contextvar か: ツール実行は 5 箇所 (deliberative のツールループ /
+#: meta_cognitive のファストパス 3 種 / タスク実行ループ) に
 #: 分かれており、記録を **呼出側に配る** と必ず取りこぼす。実インシデント
 #: (2026-08-23 ライブ監査セット 2): 記録は deliberative の 1 箇所にしか無く、
 #: meta_cognitive 経由の ``write_file`` 3 回が台帳に入らなかった。台帳を
@@ -135,6 +135,34 @@ def record_current(tool_name: str | None, success: bool) -> None:
     record_tool_use(session_id, tool_name, success, query)
 
 
+def mark_last_failed(tool_name: str | None = None) -> bool:
+    """現在のリクエストの台帳で **直前の 1 件** を失敗に書き換える。
+
+    ``ToolsRegistry.execute`` は戻り値の文字列だけで成否を決めて記録するが、
+    ``write_file`` は実行後に呼出側 (meta_cognitive の ``_verify_written_file``)
+    が実ファイルを読み戻して初めて失敗と分かることがある。その時点で台帳に
+    「成功」が残っていると、自己申告が実態とずれる。検証で失敗が判明した
+    直後に呼ぶ。``tool_name`` を渡した場合は直前の 1 件がそのツールのときだけ
+    書き換える (別ツールの成功を巻き込まない)。
+
+    Returns:
+        書き換えたら True。宛先なし / 台帳が空 / ツール名不一致なら False。
+    """
+    target = _current_target.get()
+    if target is None:
+        return False
+    bucket = _ledger.get(target[0])
+    if not bucket:
+        return False
+    last = bucket[-1]
+    if tool_name and last.tool_name != tool_name:
+        return False
+    bucket[-1] = ToolUse(
+        tool_name=last.tool_name, success=False, query_head=last.query_head,
+    )
+    return True
+
+
 def current_session_id() -> str:
     """現在のリクエストの ``session_id`` (未設定なら空文字)。
 
@@ -152,17 +180,29 @@ def format_ledger(session_id: str) -> str:
     Returns:
         1 件も無ければ空文字列 (呼出側が「1 度も実行していない」と述べる)。
     """
+    from backend.i18n_helper import msg
+
     entries = list(_ledger.get(session_id) or ())
     if not entries:
         return ""
     tail = entries[-MAX_RENDERED_ENTRIES:]
     lines = [
-        f"- {i}. {e.tool_name} ({'成功' if e.success else '失敗'}) "
-        f"— 依頼「{e.query_head}」"
+        msg(
+            "agent.tool_ledger.entry",
+            index=i,
+            tool=e.tool_name,
+            status=msg(
+                "agent.tool_ledger.success" if e.success
+                else "agent.tool_ledger.failure",
+            ),
+            query=e.query_head,
+        )
         for i, e in enumerate(tail, start=len(entries) - len(tail) + 1)
     ]
     if len(entries) > len(tail):
-        lines.insert(0, f"(古い {len(entries) - len(tail)} 件は省略)")
+        lines.insert(
+            0, msg("agent.tool_ledger.omitted", count=len(entries) - len(tail)),
+        )
     return "\n".join(lines)
 
 

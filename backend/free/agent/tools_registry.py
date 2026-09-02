@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -10,7 +11,10 @@ from typing import Any
 
 from backend.log_config import get_logger
 
-from backend.free.agent.meta_cognitive_tool_io import tool_result_succeeded
+from backend.free.agent.meta_cognitive_tool_io import (
+    tool_result_lacks_information,
+    tool_result_succeeded,
+)
 from backend.free.agent.tool_ledger import record_current
 
 logger = get_logger("agent.tools_registry")
@@ -61,25 +65,21 @@ class ToolDefinition:
         return mode in (self.inventory_modes or self.modes)
 
 
-#: ツールが「成功したが該当 0 件」を表す出力。``search_history`` の空振りは
-#: 実行としては成功だが、ユーザーから見れば見つからなかったターン。
-#: 監査では 7 回空振りし、そのうえで「見つからなかった項目はありません」と
-#: 答えていた。
-_EMPTY_RESULT_MARKERS: tuple[str, ...] = (
-    "No results found",
-    "該当する結果はありません",
-    "見つかりませんでした",
-)
-
-
 def _record_tool_issue(name: str, succeeded: bool, rendered: str) -> None:
-    """ツール実行の不首尾を issue 台帳へ落とす。"""
+    """ツール実行の不首尾を issue 台帳へ落とす。
+
+    「成功したが該当 0 件」(``search_history`` / ``search_code`` の空振り) は
+    実行としては成功だが、ユーザーから見れば見つからなかったターン。監査では
+    7 回空振りし、そのうえで「見つからなかった項目はありません」と答えていた。
+    空振りの判定は ``meta_cognitive_tool_io._TOOL_EMPTY_RESULT_PREFIXES`` が
+    SSOT (成否判定と同じ表を見る)。
+    """
     from backend.free.agent.issue_ledger import record_current_issue
 
     if not succeeded:
         record_current_issue("tool_failed", f"{name}: {rendered[:80]}")
         return
-    if any(marker in rendered for marker in _EMPTY_RESULT_MARKERS):
+    if tool_result_lacks_information(name, rendered):
         record_current_issue("tool_empty", f"{name}: {rendered[:80]}")
 
 #: ファイルを対象にするツールと、そのパス引数の名前。
@@ -105,6 +105,73 @@ def _record_touched_file(name: str, succeeded: bool, kwargs: dict) -> None:
         if isinstance(value, str) and value.strip():
             record_current_file(value)
             return
+
+
+@functools.lru_cache(maxsize=256)
+def _signature_params(func: Callable) -> tuple[inspect.Parameter, ...]:
+    """ツール関数の (self / cls / *args / **kwargs を除いた) 引数を宣言順で返す。
+
+    シグネチャ取得不可 (C 実装等) なら空。``required_args`` /
+    ``required_params`` / ``_validate_args`` / ``get_descriptions_text`` が
+    それぞれ別々にシグネチャを走査していた重複の合流点。
+    """
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return ()
+    return tuple(
+        p for name, p in sig.parameters.items()
+        if name not in ("self", "cls")
+        and p.kind not in (
+            inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD,
+        )
+    )
+
+
+def _accepts_var_kwargs(func: Callable) -> bool:
+    """関数が ``**kwargs`` を受けるか (未知引数を落としてよいかの判定)。"""
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return True
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+
+
+def _coerce_declared_type(value: Any, declared: str) -> Any:
+    """``parameters`` の型宣言に従って文字列値を単純型へ寄せる。
+
+    文法制約 JSON の分類器はスキーマ上 string しか出せない経路があり、
+    ``max_depth="1"`` / ``timeout="5"`` のような値がそのまま関数へ届く。
+    変換できなければ ``ValueError``。
+    """
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if declared == "integer":
+        return int(text)
+    if declared == "number":
+        return float(text)
+    if declared == "boolean":
+        lowered = text.lower()
+        if lowered in ("true", "1", "yes"):
+            return True
+        if lowered in ("false", "0", "no"):
+            return False
+        raise ValueError(text)
+    return value
+
+
+def _summarize_args_for_log(kwargs: dict[str, Any]) -> str:
+    """ログ向けに引数値を 80 文字へ切り詰める (write_file の本文全文を落とさない)。"""
+    parts = []
+    for k, v in kwargs.items():
+        text = repr(v)
+        if len(text) > 80:
+            text = text[:80] + f"...({len(text)} chars)"
+        parts.append(f"{k}={text}")
+    return ", ".join(parts)
 
 
 class ToolsRegistry:
@@ -169,20 +236,13 @@ class ToolsRegistry:
         以上あるツールは呼び出しが必ず失敗する。その事前判定に使う
         (``tool_call_judge._drop_if_required_args_missing``)。
         """
-        import inspect
-
         tool = self._tools.get(name)
         if tool is None:
             return ()
-        try:
-            sig = inspect.signature(tool.func)
-        except (TypeError, ValueError):
-            return ()
         declared = set(tool.parameters or {})
         return tuple(
-            p.name for p in sig.parameters.values()
+            p.name for p in _signature_params(tool.func)
             if p.default is inspect.Parameter.empty
-            and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
             and (not declared or p.name in declared)
         )
 
@@ -266,22 +326,10 @@ class ToolsRegistry:
     @staticmethod
     def _required_param_names(tool: ToolDefinition) -> set[str]:
         """ツール関数シグネチャから default なしパラメータ名を抽出"""
-        try:
-            sig = inspect.signature(tool.func)
-        except (ValueError, TypeError):
-            return set()
-        required: set[str] = set()
-        for name, param in sig.parameters.items():
-            if name in ("self", "cls"):
-                continue
-            if param.kind in (
-                inspect.Parameter.VAR_POSITIONAL,
-                inspect.Parameter.VAR_KEYWORD,
-            ):
-                continue
-            if param.default is inspect.Parameter.empty:
-                required.add(name)
-        return required
+        return {
+            p.name for p in _signature_params(tool.func)
+            if p.default is inspect.Parameter.empty
+        }
 
     async def execute(self, name: str, **kwargs: Any) -> Any:
         """ツールを実行
@@ -292,13 +340,14 @@ class ToolsRegistry:
         if tool is None:
             raise ValueError(f"Unknown tool: {name}")
 
-        # 必須引数のバリデーション（全ツール共通）
+        # 引数のバリデーション（全ツール共通）。未知引数の除去と型寄せは
+        # kwargs をその場で書き換える。
         validation_error = self._validate_args(tool, kwargs)
         if validation_error:
             logger.warning("Tool arg validation failed: %s - %s", name, validation_error)
             return f"Error: {validation_error}"
 
-        logger.info("Executing tool: %s(%s)", name, kwargs)
+        logger.info("Executing tool: %s(%s)", name, _summarize_args_for_log(kwargs))
 
         if inspect.iscoroutinefunction(tool.func):
             result = await tool.func(**kwargs)
@@ -324,58 +373,73 @@ class ToolsRegistry:
 
     @staticmethod
     def _validate_args(tool: ToolDefinition, kwargs: dict[str, Any]) -> str | None:
-        """関数シグネチャに基づいて必須引数を検証する
+        """関数シグネチャと ``parameters`` 宣言に基づいて引数を検証・正規化する。
+
+        - 既定値なしの引数が欠落 / ``None`` なら必須引数エラー
+        - 既定値ありの引数に ``None`` が来たら落として既定値に任せる
+        - シグネチャに無い引数は WARNING を出して落とす (``**kwargs`` を受ける
+          関数は除く)。以前は ``TypeError`` で実行ごと失敗していた
+        - ``parameters`` で integer / number / boolean と宣言された引数に文字列が
+          来たら変換する。変換できなければエラー
+
+        ``kwargs`` は **その場で書き換える**。
 
         Returns:
             エラーメッセージ。問題なければ None。
         """
-        try:
-            sig = inspect.signature(tool.func)
-        except (ValueError, TypeError):
-            return None  # シグネチャ取得不可ならスキップ
+        params = _signature_params(tool.func)
+        if not params and _accepts_var_kwargs(tool.func):
+            return None  # シグネチャ取得不可 / 全て **kwargs ならスキップ
 
         missing: list[str] = []
-        for param_name, param in sig.parameters.items():
-            if param_name in ("self", "cls"):
-                continue
-            if param.kind in (
-                inspect.Parameter.VAR_POSITIONAL,
-                inspect.Parameter.VAR_KEYWORD,
-            ):
-                continue
-            # デフォルト値なし = 必須引数
+        for param in params:
             if param.default is inspect.Parameter.empty:
-                if param_name not in kwargs or kwargs[param_name] is None:
-                    missing.append(param_name)
+                if param.name not in kwargs or kwargs[param.name] is None:
+                    missing.append(param.name)
+            elif param.name in kwargs and kwargs[param.name] is None:
+                del kwargs[param.name]
 
-        if not missing:
-            return None
-
-        # LLM が引数を修正できるようにシグネチャ情報を含める
-        expected_parts: list[str] = []
-        for p_name, p in sig.parameters.items():
-            if p_name in ("self", "cls"):
-                continue
-            if p.kind in (
-                inspect.Parameter.VAR_POSITIONAL,
-                inspect.Parameter.VAR_KEYWORD,
-            ):
-                continue
-            ann = (
-                p.annotation.__name__
-                if p.annotation is not inspect.Parameter.empty
-                and hasattr(p.annotation, "__name__")
-                else "any"
+        if missing:
+            # LLM が引数を修正できるようにシグネチャ情報を含める
+            expected_parts: list[str] = []
+            for p in params:
+                ann = (
+                    p.annotation.__name__
+                    if p.annotation is not inspect.Parameter.empty
+                    and hasattr(p.annotation, "__name__")
+                    else "any"
+                )
+                if p.default is inspect.Parameter.empty:
+                    expected_parts.append(f"{p.name}: {ann}")
+                else:
+                    expected_parts.append(f"{p.name}: {ann} = {p.default!r}")
+            return (
+                f"Missing required argument(s): {', '.join(missing)}. "
+                f"Expected: {tool.name}({', '.join(expected_parts)})"
             )
-            if p.default is inspect.Parameter.empty:
-                expected_parts.append(f"{p_name}: {ann}")
-            else:
-                expected_parts.append(f"{p_name}: {ann} = {p.default!r}")
 
-        return (
-            f"Missing required argument(s): {', '.join(missing)}. "
-            f"Expected: {tool.name}({', '.join(expected_parts)})"
-        )
+        if not _accepts_var_kwargs(tool.func):
+            known = {p.name for p in params}
+            for extra in [k for k in kwargs if k not in known]:
+                logger.warning(
+                    "Dropping unknown argument for tool %s: %s", tool.name, extra,
+                )
+                del kwargs[extra]
+
+        for key, spec in (tool.parameters or {}).items():
+            if key not in kwargs or not isinstance(spec, dict):
+                continue
+            declared = spec.get("type")
+            if declared not in ("integer", "number", "boolean"):
+                continue
+            try:
+                kwargs[key] = _coerce_declared_type(kwargs[key], declared)
+            except (TypeError, ValueError):
+                return (
+                    f"Invalid value for argument '{key}': expected {declared}, "
+                    f"got {kwargs[key]!r}"
+                )
+        return None
 
     @property
     def count(self) -> int:

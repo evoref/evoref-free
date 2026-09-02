@@ -414,7 +414,18 @@
     "task_done": "Task completed.",
     "files_written": "Wrote {paths}.",
     "tasks_partially_done": "Completed {done} task(s); {failed} failed.",
-    "tasks_all_failed": "Task execution failed."
+    "tasks_all_failed": "Task execution failed.",
+    "tool_ledger": {
+      "success": "succeeded",
+      "failure": "failed",
+      "entry": "- {index}. {tool} ({status}) — request “{query}”",
+      "omitted": "({count} older entries omitted)"
+    },
+    "boundary_turns": {
+      "first": "first",
+      "last": "last",
+      "header": "[{where} {count} user message(s) of this conversation (of {total} turns)]"
+    }
   },
   "terminal": {
     "errors": {

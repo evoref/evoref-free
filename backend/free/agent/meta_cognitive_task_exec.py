@@ -8,7 +8,6 @@ import time
 from pathlib import Path
 from backend.config import resolve_context_size_for_mode
 from backend.free.agent.agent_state import AgentState
-from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.meta_cognitive_tasks import (
     TaskItem,
     task_expects_write,
@@ -25,6 +24,12 @@ from backend.free.agent.meta_cognitive_utils import (
     tool_result_succeeded,
 )
 from backend.free.agent.step_compactor import StepResult
+from backend.free.api.chat.chat_constants import (
+    TOOL_EXECUTION_TIMEOUT_SEC,
+    TOOL_RESULT_HEAD_RATIO,
+    TOOL_RESULT_MAX_CHARS,
+    TOOL_RESULT_OMISSION_CHARS,
+)
 from backend.free.core.inference import build_messages_for_loop
 from backend.utils import estimate_tokens as _estimate_tokens
 
@@ -38,6 +43,74 @@ from backend.free.agent.meta_cognitive_defs import (
 from backend.log_config import get_logger
 
 logger = get_logger("agent.meta_cognitive")
+
+
+def tool_mode_error(tools_registry, tool_name: str, mode: str) -> str | None:
+    """``ToolDefinition.modes`` に基づく実行時の mode ゲート (deliberative と同じ規則)。
+
+    ``modes`` は元々 LLM 向け説明文のフィルタにしか使われず、meta 経路の
+    実行時には無視されていた (search_code だけ個別にガードしていた)。
+    create 専用ツール (run_command / apply_diff / verify_syntax 等) が chat
+    モードのタスクから実行されないよう、登録済み定義があれば必ず照合する。
+    例外は ``write_file`` のみ: 選択は create 限定だが chat の書き出し経路から
+    正規に実行されるため、``inventory_modes`` に載っているモードでは許可する
+    (:attr:`ToolDefinition.inventory_modes` 参照)。
+
+    Returns:
+        拒否時は ``Error:`` 文字列、許可時は None。
+    """
+    tool_def = tools_registry.get(tool_name)
+    if tool_def is None or mode in tool_def.modes:
+        return None
+    if tool_name == "write_file" and tool_def.listed_in(mode):
+        return None
+    logger.warning(
+        "Tool not allowed in mode=%s: %s (allowed modes: %s)",
+        mode, tool_name, tool_def.modes,
+    )
+    return f"Error: {tool_name} is not available in mode '{mode}'"
+
+
+async def execute_tool_with_timeout(
+    tools_registry, tool_name: str, tool_args: dict,
+) -> str:
+    """ツールを timeout 付きで実行し結果テキストを返す (deliberative と同じ規則)。
+
+    timeout は ``ToolsRegistry.timeout_for`` (ツール宣言 > 既定 30 秒)。
+    超過時は ``Error:`` 文字列を返し、``tool_result_succeeded`` が失敗と
+    扱えるようにする。timeout 以外の例外は呼出側で扱う (経路ごとに
+    state / ログの処理が異なるため)。
+    """
+    timeout_sec = tools_registry.timeout_for(tool_name, TOOL_EXECUTION_TIMEOUT_SEC)
+    try:
+        result = await asyncio.wait_for(
+            tools_registry.execute(tool_name, **tool_args), timeout=timeout_sec,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Tool execution timed out: %s (%.0fs)", tool_name, timeout_sec,
+        )
+        return f"Error: tool '{tool_name}' timed out after {timeout_sec:g}s"
+    return str(result)
+
+
+def truncate_tool_result(text: str, max_chars: int = TOOL_RESULT_MAX_CHARS) -> str:
+    """ツール結果が max_chars を超える場合、先頭と末尾を残して切り詰める。
+
+    deliberative の ``_truncate_tool_result`` と同じ体裁。meta のツールループは
+    最新 step の出力を全文で LLM に渡す (StepCompactor は最新反復を圧縮しない)
+    ため、巨大な結果がそのままコンテキストを食い潰さないようここで上限を掛ける。
+    """
+    if len(text) <= max_chars:
+        return text
+    head_size = int(max_chars * TOOL_RESULT_HEAD_RATIO)
+    tail_size = max_chars - head_size - TOOL_RESULT_OMISSION_CHARS
+    omitted = len(text) - head_size - tail_size
+    return (
+        text[:head_size]
+        + f"\n\n... ({omitted} chars omitted) ...\n\n"
+        + text[-tail_size:]
+    )
 
 
 class _TaskExecutionMixin:
@@ -145,7 +218,11 @@ class _TaskExecutionMixin:
         """
         tool_descriptions = ""
         if tools_registry is not None:
-            tool_descriptions = tools_registry.get_descriptions_text(mode=self._mode)
+            # 1 回の process() 内でタスク/反復ごとに再構築されていたので mode 別に cache
+            cache = self._tool_descriptions_cache
+            if self._mode not in cache:
+                cache[self._mode] = tools_registry.get_descriptions_text(mode=self._mode)
+            tool_descriptions = cache[self._mode]
         context_text = "\n".join(context_parts) if context_parts else "(none)"
         if len(context_text) > 3000:
             context_text = context_text[:3000] + "\n... (truncated)"
@@ -581,17 +658,19 @@ class _TaskExecutionMixin:
         """ツール実行結果 (`status=done|failed`) のコールバック emit。"""
         if on_step is None:
             return
-        is_error = is_tool_error(tool_result_text)
+        # deliberative と同じ規則: run_command の非ゼロ終了 (``[exit code: N]``)
+        # も失敗として表示する (Error: プレフィックスだけでは ✓ になっていた)。
+        succeeded = tool_result_succeeded(tool_name, tool_result_text)
         await call_callback(on_step, {
             "type": "tool_call",
             "detail": f"{prefix} {tool_name}: {tool_result_text[:100]}",
-            "status": "failed" if is_error else "done",
+            "status": "done" if succeeded else "failed",
         })
 
     async def _execute_loop_tool_call(
         self,
         tool_call: dict,
-        text: str,
+        text: str,  # noqa: ARG002
         task: TaskItem,
         original_query: str,
         llm_client,
@@ -681,10 +760,11 @@ class _TaskExecutionMixin:
 
         step_results.append(StepResult(
             tool_name=tool_name,
-            output=tool_result_text,
+            output=truncate_tool_result(tool_result_text),
             iteration=loop,
         ))
         # データ取得結果をタスク横断アキュムレータへ (write タスクの素材に再利用)。
+        # ここは書込み素材なので切り詰めない (全文を保持する)。
         if tool_name in _DATA_BEARING_TOOLS and not is_tool_error(tool_result_text):
             self._fetched_tool_outputs.append(tool_result_text)
             # 取得専任タスクは取得成功時点で完了 (後続 write タスクへ委譲)。
@@ -704,12 +784,8 @@ class _TaskExecutionMixin:
             )
             return tool_result_text, tool_calls
 
-        # ツール結果をメッセージに追加して再ループ
-        result_msg = self._build_tool_result_message(
-            tool_name, tool_result_text, consecutive_errors,
-        )
-        messages.append({"role": "assistant", "content": text})
-        messages.append({"role": "user", "content": result_msg})
+        # 再ループ。次反復の messages は step_results から ``_rebuild_loop_messages``
+        # が再構築する (ここで messages に追記しても上書きされて LLM に届かない)。
         logger.info("Tool call #%d: %s", loop + 1, tool_name)
         return None
 
@@ -836,24 +912,23 @@ class _TaskExecutionMixin:
         state: AgentState,
     ) -> str:
         """ツールを実行して結果テキストを返す"""
-        # search_code は create 専用ツールだが (modes=["create"])、ここは LLM
-        # プランナーが自由選択するループ経路であり ToolDefinition.modes は元々
-        # 参照されていない。chat モードの CWD 全域 os.walk が実インシデントの
-        # 直接原因になったため、search_code に限り mode ゲートを追加する
-        # (write_file は meta_cognitive の長文書き出し機能で chat モードからも
-        # 正規に使われるため対象外)。
-        if tool_name == "search_code" and not is_create_mode(self._mode):
-            result_text = f"Error: search_code is not available in mode '{self._mode}'"
-            state.on_tool_failure(tool_name, result_text)
-            logger.warning(
-                "Tool not allowed in mode %s: %s", self._mode, tool_name,
-            )
-            return result_text
         if tools_registry is not None and tools_registry.has(tool_name):
+            # ToolDefinition.modes は元々 LLM 向け説明文のフィルタにしか使われず、
+            # LLM プランナーが自由選択するこのループ経路では実行時に無視されて
+            # いた (chat モードの search_code による CWD 全域 os.walk が実
+            # インシデント)。deliberative と同じ規則で全ツールを照合する。
+            mode_error = tool_mode_error(tools_registry, tool_name, self._mode)
+            if mode_error is not None:
+                state.on_tool_failure(tool_name, mode_error)
+                return mode_error
             try:
-                tool_result = await tools_registry.execute(tool_name, **tool_args)
-                result_text = str(tool_result)
-                state.on_tool_success(tool_name)
+                result_text = await execute_tool_with_timeout(
+                    tools_registry, tool_name, tool_args,
+                )
+                if is_tool_error(result_text):
+                    state.on_tool_failure(tool_name, result_text)
+                else:
+                    state.on_tool_success(tool_name)
             except Exception as e:
                 result_text = f"Error: {e}"
                 state.on_tool_failure(tool_name, str(e))
@@ -862,34 +937,3 @@ class _TaskExecutionMixin:
             result_text = f"Error: Unknown tool '{tool_name}'"
             state.on_tool_failure(tool_name, result_text)
         return result_text
-
-    @staticmethod
-    def _build_tool_result_message(
-        tool_name: str, tool_result_text: str, consecutive_errors: int,
-    ) -> str:
-        """ツール実行結果を次ループ用メッセージに変換する"""
-        is_success = not is_tool_error(tool_result_text)
-        if is_success:
-            return (
-                f"Tool result ({tool_name}): {tool_result_text}"
-                "\n\nThe tool executed successfully. "
-                "If the current task is complete, respond with a plain text summary. "
-                "Only call another tool if additional work is needed."
-            )
-        if "Missing required argument" in tool_result_text:
-            return (
-                f"Tool call FAILED: {tool_result_text}\n\n"
-                "Fix the arguments and try again, or use a different tool. "
-                "If no tool is needed, respond with plain text."
-            )
-        if consecutive_errors >= 2:
-            return (
-                f"Tool call FAILED ({consecutive_errors} consecutive errors): "
-                f"{tool_result_text}\n\n"
-                "IMPORTANT: Multiple failures occurred. "
-                "Use a DIFFERENT tool or respond with plain text."
-            )
-        return (
-            f"Tool call FAILED: {tool_result_text}\n"
-            "Fix and retry, or use a different approach."
-        )

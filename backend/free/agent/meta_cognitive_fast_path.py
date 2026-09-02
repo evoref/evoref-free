@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.meta_cognitive_tasks import TaskItem
+from backend.free.agent.meta_cognitive_task_exec import (
+    execute_tool_with_timeout,
+    tool_mode_error,
+)
 from backend.free.agent.output_format import wants_fetched_table
+from backend.free.agent.file_ledger import forget_current_file
+from backend.free.agent.tool_ledger import mark_last_failed
 from backend.free.agent.meta_cognitive_utils import (
     call_callback,
     extract_literal_write_content,
@@ -93,16 +98,13 @@ class _FastPathMixin:
             tool_args = self._resolve_read_args(tool_args, original_query)
         logger.info("Tool fast path: %s(%s)", tool_name, tool_args)
 
-        # search_code は create 専用 (modes=["create"]) だが、この判定は
-        # ToolCallJudge の rule/aux 判定結果をそのまま実行するため
-        # ToolDefinition.modes を経由しない。_execute_tool と同じ理由で
-        # search_code のみ mode ゲートを追加する (write_file は対象外)。
-        if tool_name == "search_code" and not is_create_mode(self._mode):
-            result_text = f"Error: search_code is not available in mode '{self._mode}'"
-            logger.warning(
-                "Tool fast path not allowed in mode %s: %s", self._mode, tool_name,
-            )
-            return result_text, [{
+        # ToolCallJudge の rule/aux 判定結果をそのまま実行する経路なので
+        # ToolDefinition.modes を経由しない。deliberative / _execute_tool と
+        # 同じ規則で全ツールを mode ゲートに通す (create 専用の run_command /
+        # search_code 等が chat のタスクから走らないように)。
+        mode_error = tool_mode_error(tools_registry, tool_name, self._mode)
+        if mode_error is not None:
+            return mode_error, [{
                 "tool": tool_name,
                 "args": tool_args,
                 "success": False,
@@ -117,8 +119,9 @@ class _FastPathMixin:
             })
 
         try:
-            result = await tools_registry.execute(tool_name, **tool_args)
-            result_text = str(result)
+            result_text = await execute_tool_with_timeout(
+                tools_registry, tool_name, tool_args,
+            )
             is_success = tool_result_succeeded(tool_name, result_text)
         except Exception as e:
             result_text = f"Error: {e}"
@@ -357,15 +360,26 @@ class _FastPathMixin:
     ) -> tuple[str, list[dict]]:
         """write_file を実行して結果を返す"""
         tool_args = {"file_path": file_path, "content": content}
+        mode_error = tool_mode_error(tools_registry, "write_file", self._mode)
+        if mode_error is not None:
+            return mode_error, [{
+                "tool": "write_file", "args": tool_args, "success": False,
+            }]
         try:
-            result = await tools_registry.execute("write_file", **tool_args)
-            result_text = str(result)
+            result_text = await execute_tool_with_timeout(
+                tools_registry, "write_file", tool_args,
+            )
             is_success = not is_tool_error(result_text)
             if is_success:
                 verify_error = self._verify_written_file(file_path, content)
                 if verify_error:
                     result_text = f"Error: {verify_error}"
                     is_success = False
+                    # ToolsRegistry.execute は戻り値だけで台帳へ「成功」を記録済み。
+                    # 実ファイル突合で失敗と分かった時点で台帳側も失敗へ揃え、
+                    # 壊れたファイルを「直近に触れたファイル」から外す。
+                    mark_last_failed("write_file")
+                    forget_current_file(file_path)
                     logger.error(
                         "write_file post-verification failed: %s (%s)",
                         file_path, verify_error,
@@ -512,9 +526,12 @@ class _FastPathMixin:
             })
 
         tool_args = {"file_path": file_path, "content": content}
+        if tool_mode_error(tools_registry, "write_file", self._mode) is not None:
+            return None
         try:
-            result = await tools_registry.execute("write_file", **tool_args)
-            result_text = str(result)
+            result_text = await execute_tool_with_timeout(
+                tools_registry, "write_file", tool_args,
+            )
             is_success = not is_tool_error(result_text)
             logger.info("Auto-recovery write_file: %s → %s", file_path, result_text[:100])
 

@@ -94,8 +94,22 @@ class SemanticFactStoreProtocol(Protocol):
         top_k: int = 10,
         *,
         include_superseded: bool = False,
+        subject_prefix: str | tuple[str, ...] | None = None,
     ) -> list[tuple[SemanticFact, float]]:
-        """埋め込みベクトルで cosine similarity 検索する。"""
+        """埋め込みベクトルで cosine similarity 検索する。
+
+        ``subject_prefix`` を与えると、その接頭辞の subject を持つファクトだけを
+        候補にして順位付けする (索引リコール用)。
+        """
+        ...
+
+    def count_by_subject_prefix(
+        self,
+        prefix: str | tuple[str, ...],
+        *,
+        include_superseded: bool = False,
+    ) -> int:
+        """``subject`` が ``prefix`` で始まるファクト数を返す。"""
         ...
 
     def all_facts(self, *, include_superseded: bool = True) -> list[SemanticFact]:

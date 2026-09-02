@@ -15,11 +15,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from functools import cached_property
 from pathlib import PurePosixPath
+from typing import Any
 
 from backend.free.agent.tool_judge_args import (
     _coerce_positive_int,
+    _extract_file_path,
     _extract_head_line_count,
     _normalize_path_text,
 )
@@ -90,12 +93,90 @@ class GuardContext:
     mode: str = ""
     query: str = ""
     conversation: list[dict] | None = None
-    #: aux (層4) 専用ガードも適用するか (``_finalize`` の同名引数)。
+    #: 自由生成の引数 (層 5.9 の分類器) 向けガードも適用するか
+    #: (``_finalize`` の同名引数)。
     aux_guards: bool = False
     #: モデルへ提示したツール一覧に hidden ツールを含めたか。
     hidden_tools_offered: bool = False
     measurement_blocked: bool = False
     action_blocked: bool = False
+
+    # 会話本文の連結は 1 判定で最大 6 箇所 (ガード 3 つ / ゲート / 式合成 2 つ)
+    # が同じ結果を再計算していた。会話は判定中に変わらないので 1 度だけ作る。
+    @cached_property
+    def dialogue_text(self) -> str:
+        """会話全体の本文 (``_dialogue_text(conversation)``)。"""
+        return _dialogue_text(self.conversation)
+
+    @cached_property
+    def recent_dialogue_text(self) -> str:
+        """直近 ``_CALCULATE_CONTEXT_TURNS`` ターンの本文。"""
+        return _recent_dialogue_text(self.conversation)
+
+
+@dataclass
+class JudgeCall(GuardContext):
+    """``ToolCallJudge.judge()`` **1 回ぶん** の文脈。
+
+    判定器はプロセス唯一の共有インスタンスで、``judge()`` の中に ``await``
+    (分類器 / 埋め込み / リコール) がある。ターン固有の値をインスタンス属性に
+    置くと、チャットが 2 本重なった瞬間に他方の ``judge()`` が上書きする
+    (2026-08-23 に ``action_blocked`` で実害、2026-09-02 監査で ``_last_query`` /
+    ``_last_recall_diag`` にも同じ穴を確認)。ターン固有の値は **すべて** この
+    オブジェクトに載せ、インスタンスは設定と依存だけを持つ。
+
+    :class:`GuardContext` を拡張しているので、そのまま ``apply_guards`` へ渡せる
+    (``aux_guards`` / ``hidden_tools_offered`` は ``_finalize`` が exit ごとに立てる)。
+
+    後続フェーズ (SemMem の subject prefix 検索の統合) はリコール関数
+    (``_try_recall_url`` / ``_try_recall_executable_command``) にこの ``call`` を
+    渡す前提で、診断値は :attr:`recall_diag` へ書く。
+    """
+
+    session_id: str = ""
+    #: 層 5.7 (executable command リコール) の診断値 (sim / min_sim /
+    #: success_avg / 候補数)。``_log_tool_decision`` が decision.jsonl の
+    #: context に載せる。
+    recall_diag: dict[str, Any] = field(default_factory=dict)
+    #: 分類器ゲート (``_gate_allows``) の判定と kNN 票数。同じく context へ載せ、
+    #: ゲートの較正を decision.jsonl だけで事後検証できるようにする。
+    gate_diag: dict[str, Any] = field(default_factory=dict)
+    #: ``_extract_file_path`` は fs stat を伴い、1 判定で最大 4 回同じ文字列に
+    #: 対して呼ばれていた。引数文字列ごとに 1 度だけ引く。
+    _file_paths: dict[str, str] = field(default_factory=dict, repr=False)
+    #: 会話からのパス解決 (層 0.9 / 0.95 が同じ走査を 2 度していた)。
+    _referenced_paths: dict[str | None, str | None] = field(
+        default_factory=dict, repr=False,
+    )
+
+    def extract_file_path(self, text: str) -> str:
+        """``_extract_file_path(text)`` の結果を ``text`` ごとに memo する。"""
+        try:
+            return self._file_paths[text]
+        except KeyError:
+            found = _extract_file_path(text)
+            self._file_paths[text] = found
+            return found
+
+    def referenced_path(
+        self, query_path: str | None,
+        resolve: Callable[[str | None, list[dict] | None], str | None],
+    ) -> str | None:
+        """会話からのパス解決を ``query_path`` ごとに memo する。
+
+        ``resolve`` は ``tool_judge_referential._resolve_referenced_path``
+        (循環 import を避けるため呼出側から渡す)。
+        """
+        if query_path not in self._referenced_paths:
+            self._referenced_paths[query_path] = resolve(query_path, self.conversation)
+        return self._referenced_paths[query_path]
+
+    @cached_property
+    def has_tool_signal(self) -> bool:
+        """``_query_has_tool_signal(query)`` (1 判定で 3 箇所が評価していた)。"""
+        from backend.free.agent.tool_judge_signals import _query_has_tool_signal
+
+        return _query_has_tool_signal(self.query)
 
 
 Guard = Callable[[ToolJudgement, "GuardContext"], ToolJudgement]
@@ -222,9 +303,7 @@ def _suppress_computable_recall_cross_session(
         return result
     if _has_history_recall_keywords(ctx.query):
         return result
-    if not looks_like_numeric_question(
-        ctx.query, _recent_dialogue_text(ctx.conversation),
-    ):
+    if not looks_like_numeric_question(ctx.query, ctx.recent_dialogue_text):
         return result
     logger.debug(
         "Suppressing search_history: the operands are visible in the ongoing "
@@ -247,13 +326,12 @@ def _validate_tool_availability(
     correction 誤学習、というカスケードを引き起こす (2026-07-18 の会話
     ログで実際に発生・確認済み)。
 
-    また ``_json_to_judgement`` は ``tool == "no_tool"`` の完全一致でのみ
-    no-tool と判定するため、tool_judgment 応答が max_tokens 到達で
-    ``{"tool": "no_`` のように途中切断され ``json_repair`` が
-    ``tool_name="no_"`` へ復元した場合、存在しないツール名のまま
-    ``tool_needed=True`` で返ってしまう (2026-07-18 実インシデントで確認)。
-    レジストリに存在しないツール名も判定確定の最終防衛としてここで
-    no_tool に倒す。
+    また自由生成の応答が max_tokens 到達で ``{"tool": "no_`` のように途中
+    切断され、JSON 修復が ``tool_name="no_"`` へ復元すると、存在しないツール名の
+    まま ``tool_needed=True`` で返ってしまう (2026-07-18 実インシデントで確認。
+    当時の aux パーサは撤去済みだが、文法制約分類でも ``parse_classifier_response``
+    の救済経路で同じ形が起こりうる)。レジストリに存在しないツール名も判定確定の
+    最終防衛としてここで no_tool に倒す。
     """
     if not result.tool_needed or not result.tool_name:
         return result
@@ -583,44 +661,36 @@ def _suppress_expressionless_calculate(
 def _suppress_ungrounded_calculate(
     result: ToolJudgement, ctx: GuardContext,
 ) -> ToolJudgement:
-    """クエリにも会話にも無い数値を含む ``calculate`` を no_tool へ格下げ.
+    """クエリにも会話にも無い数値を含む ``calculate`` に、その数値を **印付け** する.
 
-    層5.2 (``_judge_with_calculate_fallback``) は合成式へ
-    ``_synthesized_expression_grounded`` を掛けて捏造数値を弾くが、層4
-    (aux ``tool_judgment``) には同じ検証が無く、素通りしていた。ツールの
-    戻り値は「確かめた事実」として base に最優先で渡されるため、捏造された
-    式の結果は **正しく計算された嘘** になり、素の暗算より有害になる
+    分類器 (層 5.9) の式は自由生成なので、モデルが知識から定数を補うことがある
     (実インシデント 2026-07-29 ライブ監査: 「本当にそれで合っていますか？
-    計算を見直してください。」に対し aux が ``57.8 - 4 * 1.5`` を合成。
-    ``1.5`` はクエリにも会話にも無く、結果 51.8 が「正解」として提示された。
-    正しくは ``57.8 - 4 * 3.4`` = 44.2)。
+    計算を見直してください。」に対し ``57.8 - 4 * 1.5`` を合成。``1.5`` は
+    クエリにも会話にも無く、結果 51.8 が「正解」として提示された。正しくは
+    ``57.8 - 4 * 3.4`` = 44.2)。ツールの戻り値は「確かめた事実」として base に
+    最優先で渡されるため、捏造された式の結果は **正しく計算された嘘** になる。
 
-    格下げ後は後続層 (5.2) がグラウンディング検証付きで式を組み直す機会を
-    得るため、計算そのものを諦めることにはならない。
+    **格下げはしない。** 格下げが正当なのは式を組み直す層が実際に走れるときだけで、
+    その層 (旧 5.2 の式合成) は撤去済み。格下げの落ち先は base の暗算になり、
+    実測では暗算のほうが誤答しやすく、しかも式が見えないぶん誤りに気づけない
+    (2026-08-08 以降のライブ監査で 4 回連続。いずれも「式は正しかったのに 1 つの
+    数値が書かれていない」ケースで、42.195*5.5 / 3*52 / 8*5*(18-9)*2 などが
+    棄却されていた)。式は残し、説明できない数値を ``unexplained_numbers`` に載せて
+    回答側で出所を開示させる (``deliberative`` が注記を足す)。
 
-    ホワイトリストには層5.2 の直近 4 ターンではなく **判定に渡された会話
-    全体** を使う。層5.2 は式を *合成* するので狭い窓で捏造の余地を絞るのが
-    正しいが、こちらは既に選ばれた式を *拒否* するだけなので、窓を狭めると
-    「その距離を時速12キロで…」のような照応で数ターン前の数値を参照した
-    正当な式まで巻き込む。捏造の信号 (会話のどこにも無い数値) は広い窓でも
-    変わらず立つ。
+    ホワイトリストには直近 4 ターンではなく **判定に渡された会話全体** を使う。
+    ここは既に選ばれた式を *検査* するだけなので、窓を狭めると「その距離を時速
+    12キロで…」のような照応で数ターン前の数値を参照した正当な式まで巻き込む。
+    捏造の信号 (会話のどこにも無い数値) は広い窓でも変わらず立つ。
     """
     if not result.tool_needed or result.tool_name != "calculate":
         return result
     expression = str((result.tool_args or {}).get("expression") or "")
     if not expression:
         return result
-    context = _dialogue_text(ctx.conversation)
-    unexplained = _ungrounded_numbers(expression, ctx.query, context)
+    unexplained = _ungrounded_numbers(expression, ctx.query, ctx.dialogue_text)
     if not unexplained:
         return result
-    # 格下げが正当なのは、式を組み直す層が実際に走れるときだけ。その層
-    # (旧 5.2 の式合成) は撤去済みなので、格下げの落ち先は base の暗算に
-    # なる。実測では暗算のほうが誤答しやすく、しかも式が見えないぶん
-    # 誤りに気づけない (2026-08-08 以降のライブ監査で 4 回連続。いずれも
-    # 「式は正しかったのに 1 つの数値が書かれていない」ケースで、
-    # 42.195*5.5 / 3*52 / 8*5*(18-9)*2 などが棄却された)。式は残し、
-    # 説明できない数値を回答側で開示させる。
     logger.info(
         "Keeping calculate with unexplained numbers %s in %r; "
         "the answer must disclose them",
@@ -655,9 +725,7 @@ def _suppress_ungrounded_read_path(
     )
     if not path:
         return result
-    haystack = _normalize_path_text(
-        f"{ctx.query}\n{_dialogue_text(ctx.conversation)}",
-    )
+    haystack = _normalize_path_text(f"{ctx.query}\n{ctx.dialogue_text}")
     if _normalize_path_text(path) in haystack:
         return result
     # ドライブ / ディレクトリ表記の揺れを許すためベース名でも照合する。
@@ -682,16 +750,16 @@ def _always(ctx: GuardContext) -> bool:
 
 
 def _aux_only(ctx: GuardContext) -> bool:
-    """aux (層4) の free-form args 向けガード。
+    """モデルが引数を自由生成する経路 (層 5.9 の分類器) 向けガード。
 
     コード側がツール名や引数を注入する経路に掛けると正当な判定を潰すため、
-    aux 経路でのみ有効化する。
+    ``aux_guards=True`` の経路でのみ有効化する。
     """
     return ctx.aux_guards
 
 
 def _aux_without_hidden_offer(ctx: GuardContext) -> bool:
-    """hidden ツールを **提示していない** aux 経路のみ。
+    """hidden ツールを **提示していない** 自由生成経路のみ。
 
     「プロンプトの一覧に出ない名前が返るのは hallucination」という前提は、
     提示していないときにしか成り立たない。文法制約ツール分類は hidden も enum に

@@ -385,9 +385,12 @@ async def stream_staged_create(
             yield frame
         return
 
+    # 書込は LoopFactView 経由 (owner / namespace 検証を通す)。store 直呼びは
+    # 隔離ストアの生成 (上の for_project) だけに限る。
+    staged_view = _staged_view(_STAGED_PROJECT_ID)
     for f in facts:
         try:
-            staged_store.add_fact(f)
+            staged_view.add_facts([f])
             tv = decode_task_fact(f)
             ws.upsert_task(
                 task_id=tv.task_id, title=tv.title, stage=tv.stage or "code",

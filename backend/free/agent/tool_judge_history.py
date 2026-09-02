@@ -13,7 +13,12 @@ from backend.free.agent.router import (
     HISTORY_KEYWORDS,
     HISTORY_KEYWORDS_EN,
 )
-from backend.free.core.intent_vocab import PROXIMAL_RECALL_KEYWORDS
+from backend.free.agent.tool_judge_args import quoted_spans
+from backend.free.core.intent_vocab import (
+    PAST_RECALL_TAIL_RE,
+    PROXIMAL_RECALL_KEYWORDS,
+    has_history_recall_keyword,
+)
 from backend.free.core.locale_patterns import is_en_locale, select_locale_variant
 
 # 時系列順序指定を含む履歴クエリの検出 (「一番最初に」「最後に」等)。
@@ -167,13 +172,11 @@ _ORDER_QUERY_STOPWORD_RUNS_EN = frozenset({
 })
 
 
-#: ユーザーが明示的に括った検索語。``「猫」`` ``『Python』`` ``"foo"`` を拾う。
-#: 括弧の中身は **ユーザー自身が「これを探せ」と指定した語** なので、内容語の
-#: 抽出規則より優先する。
-_QUOTED_TERM_RE = re.compile(
-    r"[「『]([^「」『』\n]{1,40})[」』]"
-    r"|[“”\"]([^“”\"\n]{1,40})[“”\"]",
-)
+#: ユーザーが明示的に括った検索語の長さ上限。``「猫」`` ``『Python』`` ``"foo"``
+#: を拾う。括弧の中身は **ユーザー自身が「これを探せ」と指定した語** なので、
+#: 内容語の抽出規則より優先する。括りの取り出しは ``tool_judge_args.quoted_spans``
+#: (判定系で唯一の実装) を使う。
+_QUOTED_TERM_MAX_LEN = 40
 
 
 def quoted_search_terms(query: str) -> list[str]:
@@ -189,12 +192,7 @@ def quoted_search_terms(query: str) -> list[str]:
     **部分一致 (tier 0) は 1 文字でも当たる** ので、キーワード段・bi-gram 段の
     1 文字制限は問題にならない。
     """
-    out: list[str] = []
-    for m in _QUOTED_TERM_RE.finditer(query or ""):
-        term = (m.group(1) or m.group(2) or "").strip()
-        if term and term not in out:
-            out.append(term)
-    return out
+    return quoted_spans(query, max_len=_QUOTED_TERM_MAX_LEN)
 
 
 def _reduce_ordered_history_query(query: str) -> str:
@@ -311,25 +309,21 @@ def asks_about_past_conversation(query: str) -> bool:
 
 
 def _has_history_recall_keywords(query: str) -> bool:
-    """明示的な履歴参照キーワード (router.HISTORY_KEYWORDS) を含むか。
+    """明示的な履歴参照キーワード (``HISTORY_KEYWORDS``) を locale に従って含むか。
 
-    router.ComplexityClassifier._has_history_keywords と同じ判定 (小文字化
-    後の部分文字列一致) を、layer 分類とは独立に tool 強制発火の判定に使う。
+    実体は ``core.intent_vocab.has_history_recall_keyword`` (router の層分類と
+    同じ照合)。こちらは locale で JA / EN の片方だけを見る。
     """
-    q_lower = query.lower()
-    keywords = select_locale_variant(HISTORY_KEYWORDS, HISTORY_KEYWORDS_EN)
-    return any(kw in q_lower for kw in keywords)
+    return has_history_recall_keyword(query, locale_aware=True)
 #: 会話に既出の対象を指す連体詞 + 名詞。「今日」「現在」のような直示語は
 #: 含めない (それらは実測して答えるのが正しい)。
 _ANAPHORIC_REFERENCE_RE = re.compile(
     r"(?:その|あの|例の|先ほどの|さきほどの|さっきの|前述の|上記の|くだんの)"
     r"\s*[^\s、。，．]{1,12}",
 )
-#: 過去に述べられた内容を尋ね直す文末形。
-_RETROSPECTIVE_QUESTION_RE = re.compile(
-    r"でした(?:か|っけ)|だった(?:か|っけ)|でしたよね|だっけ"
-    r"|と言(?:い|っ)ました|と伝えました",
-)
+#: 過去に述べられた内容を尋ね直す文末形。語彙は core.intent_vocab が SSOT
+#: (``tool_judge_commands`` の now-only 抑止と同じ形)。後方互換で旧名を残す。
+_RETROSPECTIVE_QUESTION_RE = PAST_RECALL_TAIL_RE
 
 
 def asks_about_prior_conversation_entity(query: str) -> bool:
