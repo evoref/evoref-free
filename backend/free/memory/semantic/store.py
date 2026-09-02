@@ -59,6 +59,8 @@ import numpy as np
 from backend.io import AtomicWriter, IncrementalIndexUpdater
 from backend.free.memory.semantic.embedding_store import (
     EmbeddingStore,
+    register_new_model,
+    reset_model_store,
 )
 from backend.free.memory.semantic.manifest import Manifest
 from backend.free.memory.semantic.subject_key import (
@@ -513,6 +515,36 @@ class SemanticFactStore:
         """``defer_embedding_writes`` で溜めたベクトルを永続化する。"""
         self._embedding_store.flush()
 
+    @property
+    def embedding_model_id(self) -> str:
+        """アクティブな埋め込みストアの model_id。"""
+        return self._embedding_store.model_id
+
+    @property
+    def embedding_dim(self) -> int | None:
+        """アクティブな埋め込みストアの次元 (空なら ``None``)。"""
+        return self._embedding_store.dim
+
+    def switch_embedding_model(self, new_model_id: str) -> None:
+        """アクティブな埋め込みストアを ``new_model_id`` の **空ストア** へ切り替える。
+
+        埋め込みモデルが別次元のものへ替わった後の遡及再埋め込み (Step 8.8)
+        が使う。旧 model_id のディレクトリは残す (retention GC の担当)。
+        在メモリの ``fact.embedding`` は触らないので、呼出側が
+        :meth:`update_fact` で順に書き直す。manifest の swap は呼出側の責務
+        (:func:`~backend.free.memory.semantic.embedding_store.swap_active_model_id`)。
+        """
+        if not new_model_id:
+            raise ValueError("new_model_id must be non-empty")
+        if new_model_id == self._embedding_store.model_id:
+            return
+        reset_model_store(self.root_dir, new_model_id)
+        self._embedding_store = register_new_model(self.root_dir, new_model_id)
+        logger.info(
+            "switched active embedding store at %s -> %s",
+            self.root_dir, new_model_id,
+        )
+
     def embedding_scores(self, query: np.ndarray) -> dict[str, float]:
         """クエリに対する全ファクトの cosine similarity を返す。
 
@@ -885,26 +917,91 @@ class SemanticFactStore:
                 ids.add(fact_id)
         return self._collect(ids, include_superseded)
 
+    def _ids_by_subject_prefix(
+        self,
+        prefix: str | tuple[str, ...],
+        *,
+        include_superseded: bool,
+    ) -> set[str]:
+        """``subject`` が ``prefix`` で始まる fact id 集合 (索引経由)。
+
+        pillar namespace (``mem.`` 等) で始まる prefix は ``_by_pillar``
+        バケットだけを走査する。それ以外は全件走査。
+        """
+        prefixes = (prefix,) if isinstance(prefix, str) else tuple(prefix)
+        pillars = {pf.split(".", 1)[0] for pf in prefixes}
+        if all(_matches_pillar_prefix(pf) for pf in prefixes):
+            candidates: Iterable[str] = set().union(
+                *(self._by_pillar.get(pl, set()) for pl in pillars),
+            )
+        else:
+            candidates = self._facts.keys()
+        out: set[str] = set()
+        for fid in candidates:
+            fact = self._facts.get(fid)
+            if fact is None or not fact.subject.startswith(prefixes):
+                continue
+            if not include_superseded and fact.superseded_by:
+                continue
+            out.add(fid)
+        return out
+
+    def count_by_subject_prefix(
+        self,
+        prefix: str | tuple[str, ...],
+        *,
+        include_superseded: bool = False,
+    ) -> int:
+        """``subject`` が ``prefix`` で始まるファクト数を返す。
+
+        索引リコール (URL / executable command) の呼出側が「候補プールが
+        小さいときの margin 判定」を **その索引の件数** で行うためのもの。
+        """
+        return len(
+            self._ids_by_subject_prefix(prefix, include_superseded=include_superseded),
+        )
+
     def search_by_embedding(
         self,
         query: np.ndarray,
         top_k: int = 10,
         *,
         include_superseded: bool = False,
+        subject_prefix: str | tuple[str, ...] | None = None,
     ) -> list[tuple[SemanticFact, float]]:
         """埋め込みベクトルで cosine similarity 検索する。
+
+        Args:
+            subject_prefix: 与えると ``subject`` がこの接頭辞で始まる
+                ファクトだけを候補にして順位付けする。索引リコール
+                (``mem.world.url.`` / ``mem.world.executable_command.``) は
+                以前グローバル top-k を引いてから接頭辞で絞っていたため、
+                ストアが育つと索引行が top-k に入らなくなっていた
+                (2026-09-02 監査 H3)。候補を **cosine の前に** 絞るので、
+                件数が増えてもコストは索引の大きさにしか比例しない。
 
         Returns:
             (fact, score) のリスト。score は cosine similarity (-1.0〜1.0)。
         """
+        store_count = self._embedding_store.count
+        if store_count == 0:
+            return []
+        if subject_prefix is not None:
+            ids = self._ids_by_subject_prefix(
+                subject_prefix, include_superseded=include_superseded,
+            )
+            if not ids:
+                return []
+            raw = self._embedding_store.search(query, top_k=top_k, fact_ids=ids)
+            return [
+                (fact, score) for fid, score in raw
+                if (fact := self._facts.get(fid)) is not None
+            ]
         # EmbeddingStore は fact filter を知らないため、superseded 除外 /
         # 存在チェックで落ちる分だけ多めに引く。以前は無条件に **全件**
         # (``top_k=store_count``) を要求しており、``search`` が常に全件
         # ``argsort`` を払っていた。落ちうる件数は数えられるので、その分だけ
         # 上乗せすれば足りる (足りなければ全件へフォールバック)。
-        store_count = self._embedding_store.count
-        if store_count == 0:
-            return []
         skippable = 0
         if not include_superseded:
             skippable = sum(

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
 from backend.free.agent.tool_judge_args import (
     _extract_file_path,
@@ -17,6 +18,9 @@ from backend.free.agent.tool_judge_args import (
 from backend.free.agent.tool_judge_types import ToolJudgement
 from backend.free.agent.tools_registry import ToolsRegistry
 from backend.log_config import get_logger
+
+if TYPE_CHECKING:
+    from backend.free.agent.tool_judge_guards import JudgeCall
 
 logger = get_logger("agent.tool_call_judge")
 
@@ -96,8 +100,25 @@ def _resolve_referenced_path(
     return None
 
 
+def _query_path_of(query: str, call: "JudgeCall | None") -> str | None:
+    """クエリ本文のパス (memo 付き)。"""
+    found = call.extract_file_path(query) if call is not None else _extract_file_path(query)
+    return found or None
+
+
+def _resolve_with_call(
+    query_path: str | None, conversation: list[dict] | None,
+    call: "JudgeCall | None",
+) -> str | None:
+    """会話からのパス解決。``call`` があれば層 0.9 / 0.95 で 1 度だけ走査する。"""
+    if call is None:
+        return _resolve_referenced_path(query_path, conversation)
+    return call.referenced_path(query_path, _resolve_referenced_path)
+
+
 def _referential_rewrite_judgement(
     query: str, conversation: list[dict] | None, tools_registry: ToolsRegistry,
+    call: "JudgeCall | None" = None,
 ) -> "ToolJudgement | None":
     """「同じファイルに保存し直して」型の依頼を write_file に確定させる。
 
@@ -120,10 +141,10 @@ def _referential_rewrite_judgement(
         return None
     if _path_is_written_in_query(query):
         return None  # ディレクトリ付きパスが本文にあるなら通常のルール層で足りる
-    query_path = _extract_file_path(query) or None
+    query_path = _query_path_of(query, call)
     if not query_path and not _REFERENTIAL_TARGET_RE.search(query):
         return None
-    path = _resolve_referenced_path(query_path, conversation)
+    path = _resolve_with_call(query_path, conversation, call)
     if not path:
         return None
     logger.info(
@@ -199,6 +220,7 @@ _FILE_METRICS_RE = re.compile(
 
 def _referential_read_judgement(
     query: str, conversation: list[dict] | None, tools_registry: ToolsRegistry,
+    call: "JudgeCall | None" = None,
 ) -> "ToolJudgement | None":
     """「そのファイルの全文を見せて」型の依頼を read_file に確定させる。
 
@@ -225,12 +247,12 @@ def _referential_read_judgement(
         return None
     if _path_is_written_in_query(query):
         return None
-    query_path = _extract_file_path(query) or None
+    query_path = _query_path_of(query, call)
     if not query_path and not (
         _REFERENTIAL_TARGET_RE.search(query) or _FILE_NOUN_RE.search(query)
     ):
         return None
-    path = _resolve_referenced_path(query_path, conversation)
+    path = _resolve_with_call(query_path, conversation, call)
     if not path:
         return None
     logger.info(

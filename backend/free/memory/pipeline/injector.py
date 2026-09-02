@@ -202,6 +202,13 @@ _EPISODE_TRACE_SUBJECT_PREFIX = "mem.decision.ep_"
 #: セッション要約 / エピソードトレースと同じ「内部索引」の類。
 _EXECUTABLE_COMMAND_SUBJECT_PREFIX = "mem.world.executable_command."
 
+#: URL リコール索引の subject 接頭辞 (``memory.sleep.url_curator``)。
+#: executable command 索引と同型で、``object`` は過去のユーザーの質問文
+#: (``answers_topic``)。読み手は ``ToolCallJudge`` の URL リコールだけ。
+#: 接頭辞リストから漏れていたため ``world_fact`` として [関連する記憶] へ
+#: 出ていた (2026-09-02 監査 M21)。
+_URL_INDEX_SUBJECT_PREFIX = "mem.world.url."
+
 #: 内部索引の subject 接頭辞。いずれも「アシスタント側の記録」であって
 #: ユーザーについての事実ではないため、ユーザーに見える枠へ出さない。
 #:
@@ -212,6 +219,7 @@ _EXECUTABLE_COMMAND_SUBJECT_PREFIX = "mem.world.executable_command."
 INTERNAL_INDEX_SUBJECT_PREFIXES: tuple[str, ...] = (
     _EPISODE_TRACE_SUBJECT_PREFIX,
     _EXECUTABLE_COMMAND_SUBJECT_PREFIX,
+    _URL_INDEX_SUBJECT_PREFIX,
 )
 
 

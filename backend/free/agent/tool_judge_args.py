@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import ast
+import functools
 import re
 from pathlib import Path
 
@@ -74,6 +75,47 @@ def resolve_listing_directory(query: str, root: Path) -> str | None:
     if _PROJECT_ROOT_REFERENCE_RE.search(query):
         return "."
     return None
+#: 括り記号の対応表 (開き, 閉じ)。開きと閉じは **対で** 見る — 開きの ``"`` を
+#: 閉じの ``」`` で受けるような混在は許さない (文中の引用符が別の括りの内側まで
+#: 飲み込むため)。
+_QUOTE_PAIRS: tuple[tuple[str, str], ...] = (
+    ('"', '"'), ("“", "”"), ("「", "」"), ("『", "』"),
+)
+#: ``'`` の括り。英文の所有格・短縮形 (``don't`` / ``it's``) と区別できないので
+#: 既定では採らず、検索語・ファイル名の抽出 (ユーザーが明示的に括る文脈) だけが
+#: ``single_quotes=True`` で受ける。
+_SINGLE_QUOTE_PAIR: tuple[str, str] = ("'", "'")
+
+
+@functools.lru_cache(maxsize=None)
+def _quoted_span_regex(pairs: tuple[tuple[str, str], ...], max_len: int) -> re.Pattern:
+    """括り対ごとの alternation を組む (中身は同じ括り記号と改行を含まない)。"""
+    alts = []
+    for open_q, close_q in pairs:
+        inner = f"[^\\n{re.escape(open_q)}{re.escape(close_q)}]{{1,{max_len}}}"
+        alts.append(f"{re.escape(open_q)}({inner}){re.escape(close_q)}")
+    return re.compile("|".join(alts))
+
+
+def quoted_spans(
+    query: str, *, max_len: int = 400, single_quotes: bool = False,
+) -> list[str]:
+    """クエリ中で括られた文字列を出現順に (重複なく、前後空白を除いて) 返す。
+
+    判定系で括りを取り出す **唯一の実装**。以前は 4 箇所 (判定本体の
+    ``_first_quoted_span`` / 履歴の ``quoted_search_terms`` / 検索語抽出 /
+    クォート付きファイル名) が微妙に違う正規表現を各自で持っていた。
+    ``max_len`` は中身の長さ上限 (呼出側の用途で変える: 検索語 40 / 訳文 400)。
+    """
+    pairs = _QUOTE_PAIRS + ((_SINGLE_QUOTE_PAIR,) if single_quotes else ())
+    out: list[str] = []
+    for m in _quoted_span_regex(pairs, max_len).finditer(query or ""):
+        span = next((g for g in m.groups() if g), "").strip()
+        if span and span not in out:
+            out.append(span)
+    return out
+
+
 def _extract_search_pattern(query: str) -> str:
     """クエリから検索パターンを抽出する
 
@@ -91,9 +133,9 @@ def _extract_search_pattern(query: str) -> str:
         return m.group(1)
 
     # 引用符内のパターン
-    m = re.search(r'[「"\'](.*?)[」"\']', query)
-    if m:
-        return m.group(1)
+    quoted = quoted_spans(query, single_quotes=True)
+    if quoted:
+        return quoted[0]
 
     # 検索/search/grep/find 等を除去した残りからキーワードを抽出
     cleaned = re.sub(
@@ -133,12 +175,8 @@ _DIR_PATH_RE = re.compile(
     r"([A-Za-z]:(?:[\\/][A-Za-z0-9_.][A-Za-z0-9_. -]*)+|[A-Za-z]:[\\/])",
 )
 
-# クォート文字の対応表（開き, 閉じ）。ファイル名の語幹 (拡張子直前) が
-# 日本語等の非ASCIIの場合に、明示的にクォートされたファイル名を抽出する
-# 際に使う。
-_QUOTE_PAIRS: tuple[tuple[str, str], ...] = (
-    ('"', '"'), ("'", "'"), ("「", "」"), ("『", "』"),
-)
+#: 括られた文字列がファイル名と言えるための拡張子 (末尾)。
+_QUOTED_FILENAME_EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,10}$")
 
 
 def _extract_quoted_filename(query: str) -> str | None:
@@ -149,16 +187,9 @@ def _extract_quoted_filename(query: str) -> str | None:
     明示されていれば語幹の文字種を問わず抽出する（クォート無しの非ASCII
     語幹は文中の地の文と区別できず誤検出リスクが高いため対象外）。
     """
-    for open_q, close_q in _QUOTE_PAIRS:
-        m = re.search(
-            re.escape(open_q)
-            + r"([^\n" + re.escape(open_q) + re.escape(close_q) + r"]{1,200}"
-            r"\.[A-Za-z0-9]{1,10})"
-            + re.escape(close_q),
-            query,
-        )
-        if m:
-            return m.group(1).strip()
+    for span in quoted_spans(query, max_len=200, single_quotes=True):
+        if _QUOTED_FILENAME_EXT_RE.search(span):
+            return span
     return None
 #: 「最初の 3 行」「先頭 10 行」「first 5 lines」等、ファイル先頭からの行数指定。
 #: 全角数字も拾う (日本語入力では「３行」になりやすい)。

@@ -82,9 +82,32 @@ def infer_tool_from_task(
                 return ("run_command", {"command": cmd})
 
         elif tool_name == "search_code":
-            return ("search_code", {"pattern": "", "directory": "."})
+            # 空パターンは全行にマッチし CWD 全域を舐めるので、抽出できた
+            # ときだけ確定する (抽出不能ならツールループへ委譲)。
+            pattern_text = extract_search_pattern(description)
+            if pattern_text:
+                return ("search_code", {"pattern": pattern_text, "directory": "."})
 
     return None
+
+
+def extract_search_pattern(description: str) -> str:
+    """タスク記述から search_code の検索パターンを抽出する
+
+    バッククォート / 引用符で囲まれた語を優先し、無ければ
+    「search for X in ...」型の X を採る。抽出できなければ空文字。
+    """
+    m = re.search(r'[`"\'「]([^`"\'」]+)[`"\'」]', description)
+    if m:
+        return m.group(1).strip()
+    m = re.search(
+        r'(?:search|grep|find|look)\s+(?:for\s+)?(.+?)'
+        r'(?:\s+(?:in|within|under|inside)\s+.+)?$',
+        description, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip()
+    return ""
 
 
 def extract_command(description: str) -> str:

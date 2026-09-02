@@ -13,10 +13,17 @@ from backend.free.agent.router import (
     asks_directory_listing,
 )
 from backend.free.core.intent_vocab import (
+    CALCULATE_TERM,
+    DATETIME_SIGNAL_TERMS_EN,
+    EXECUTABLE_QUERY_PATTERNS_EN,
+    EXECUTABLE_QUERY_PATTERNS_JA,
+    EXECUTABLE_QUERY_RE_EN,
+    EXECUTABLE_QUERY_RE_JA,
     RUNTIME_INFO_QUERY_RE,
     SESSION_ANCHOR_EN,
     SESSION_PROXIMITY_WINDOW_EN,
     SESSION_TOPIC_BREAK_LOOKAHEAD_EN,
+    ascii_boundary_alternation,
     looks_like_numeric_question,
     session_self_reference_pattern_ja,
 )
@@ -134,9 +141,47 @@ def _code_usage_location_pattern(query: str) -> str:
         if token.lower() not in _CODE_USAGE_STOPWORDS:
             return token
     return ""
+#: web リソースを対象にしていることを示す語。**web 意図の唯一の定義** —
+#: ツール要否シグナル (``_TOOL_PATTERNS`` / ``_TOOL_PATTERNS_EN``)、
+#: ``_infer_tool`` の fetch_url 分岐、``_query_targets_local_file_only`` の
+#: 3 箇所が同じ語彙を使う。1 つでもあればローカル限定とみなさない
+#: (「そのURLをファイルに保存して」等の url_write 正規フロー保護)。
+#: ASCII 語は境界必須 — 境界無しの ``site`` は "opposite" に、``page`` は
+#: "homepage" に部分一致し、無関係な依頼が fetch_url へ振られていた。
+_WEB_REFERENCE_RE = re.compile(
+    r"(?:URL|https?://|ウェブ|サイト|ページ|ニュース|記事|ブログ|ドメイン|リンク"
+    r"|(?<![A-Za-z])web(?![A-Za-z])|(?<![A-Za-z])site(?![A-Za-z])"
+    r"|(?<![A-Za-z])page(?![A-Za-z])|(?<![A-Za-z])news(?![A-Za-z])"
+    r"|(?<![A-Za-z])fetch(?![A-Za-z])|(?<![A-Za-z])browse(?![A-Za-z])"
+    r"|(?<![A-Za-z])link(?![A-Za-z])|(?<![A-Za-z])domain(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+
+#: 「動くか / エラーが無いか」を確かめる依頼 (``_infer_tool`` の verify_syntax
+#: 分岐)。ASCII 語は境界必須 — 境界無しの ``work`` は "network.py" に、``bug`` は
+#: "debug.py" に部分一致し、単なる読取依頼が構文検証へ振られていた。
+_VERIFY_SYNTAX_INTENT_RE = re.compile(
+    r"(?:動作|動[くい]|実行でき|エラー|バグ|正常|正しく動)|"
+    + ascii_boundary_alternation("work", "run correctly", "execute", "error", "bug"),
+    re.IGNORECASE,
+)
+
+#: 「計算 / calculate」。語彙は core.intent_vocab が SSOT (``_infer_tool`` と共有)。
+_CALCULATE_RE = re.compile(CALCULATE_TERM, re.IGNORECASE)
+
+#: 裸の時制語 (today / now / date / time)。**ツール要否シグナル専用** の分岐 —
+#: ``_infer_tool`` / コマンド合成は疑問構文限定の ``DATETIME_QUERY_RE`` を使う
+#: (core.intent_vocab の分岐理由コメント参照)。
+_DATETIME_SIGNAL_RE_EN = re.compile(DATETIME_SIGNAL_TERMS_EN, re.IGNORECASE)
+
 # ルールベースフォールバック用パターン
 # 注意: 「検索」等の汎用語は知識質問にもマッチするため、
 # コード/ファイル文脈を要求するパターンのみ含める。
+# 実行可能クエリ (システム情報 / 日時 / 数値処理 / データ処理 / 変換) の語彙は
+# core.intent_vocab が SSOT (``EXECUTABLE_QUERY_PATTERNS_JA``)。router の
+# ``_EXECUTABLE_QUERY_PATTERNS`` / ``_infer_tool`` のゲート / コマンド合成の
+# ルール表と同じ部品から組む — 以前は 4 箇所に書き写され、「変換」の除外や
+# 「日付型」のガードが片方にしか入っていなかった。
 _TOOL_PATTERNS = [
     re.compile(r"(?:ファイル|file).*(?:読|書|開|作成|削除)", re.IGNORECASE),
     re.compile(r"(?:コマンド|command).*(?:実行|run)", re.IGNORECASE),
@@ -144,8 +189,8 @@ _TOOL_PATTERNS = [
     # ASCII トークンは単語境界必須 ("crossencoder" の 'code' 等への部分一致誤爆対策、
     # CPU/RAM 境界ガードと同じ理由)。日本語側 (コード/ファイル/ソース/検索) は対象外。
     *_CODE_SEARCH_PATTERNS,
-    re.compile(r"(?:URL|url|https?://|ウェブ|web|サイト|site|ページ|page|ニュース|news|フェッチ|fetch|ブラウズ|browse)", re.IGNORECASE),
-    re.compile(r"(?:計算|calculate)\s", re.IGNORECASE),
+    _WEB_REFERENCE_RE,
+    _CALCULATE_RE,
     # ファイルパスを含むクエリ（C:\, E:\, /home/ 等）+ 出力/保存/生成系動詞
     re.compile(r"[A-Za-z]:\\", re.IGNORECASE),
     re.compile(r"(?:出力|保存|生成|作成|書き出|エクスポート).*(?:して|する)", re.IGNORECASE),
@@ -154,40 +199,9 @@ _TOOL_PATTERNS = [
     re.compile(r"(?:実行|動かし|起動|run|exec).*(?:して|する|しろ)", re.IGNORECASE),
     # バッククォート内コマンド
     re.compile(r"`[^`]+`", re.IGNORECASE),
-    # --- Python 実行可能クエリ: システム情報 ---
-    # 注意: \b は日本語文字を \w とみなすため英語-日本語境界で機能しない。
-    # 英語の短いキーワードは (?<![A-Za-z])...(?![A-Za-z]) で ASCII 境界を使用。
-    # CPU/RAM/GPU/VRAM も境界必須 (IGNORECASE で "program" の 'ram' 等に
-    # 部分マッチし、文書タスクへ OS スペックコマンドを誤発火した実績あり)。
-    # 「容量」単独は外す。``capacity`` を外したのと同じ理由で、**データ量の話に
-    # 普通に現れる**ため機械スペックの要求とは限らない (実インシデント
-    # 2026-08-10 ライブ監査: 「DBの容量は1.2TB…合計容量は何TBですか」
-    # 「フルと増分を合わせた総容量」「RPO・RTO・容量効率の列で表を」の 4 ターンで
-    # OS/CPU/コア数の取得コマンドが撃たれた)。機器を名指しする質問は
-    # ディスク / ストレージ / ドライブ / disk / drive 側で拾えるので取りこぼさない。
-    re.compile(r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])|メモリ|(?<![A-Za-z])RAM(?![A-Za-z])|(?<![A-Za-z])GPU(?![A-Za-z])|(?<![A-Za-z])VRAM(?![A-Za-z])|ディスク|(?:空き|残り|使用)容量|ストレージ|ドライブ|(?<![A-Za-z])spec(?![A-Za-z])|(?<![A-Za-z])drive(?![A-Za-z]))", re.IGNORECASE),
-    # 「何月|何日|何曜日」追加 (router.py:101 と同期)
-    # 「日時型」「日付フォーマット」等はデータ型/スキーマの話 (router の
-    # _EXECUTABLE_QUERY_PATTERNS の同じエントリのコメント参照)。
-    re.compile(r"(?:何時|何月|何日|何曜日|(?:日時|日付)(?!型|形式|フォーマット|カラム|列)|現在時刻|(?<![A-Za-z])today(?![A-Za-z])|(?<![A-Za-z])now(?![A-Za-z])|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z]))", re.IGNORECASE),
-    re.compile(r"(?:IP\s*アドレス|ホスト名|(?<![A-Za-z])hostname(?![A-Za-z])|(?<![A-Za-z])ip\s*address)", re.IGNORECASE),
-    re.compile(r"(?:(?<![A-Za-z])OS(?![A-Za-z])|オペレーティングシステム|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])|(?<![A-Za-z])Mac(?![A-Za-z]))", re.IGNORECASE),
-    re.compile(r"(?:Python|python)\s*(?:バージョン|version)", re.IGNORECASE),
-    re.compile(r"(?:環境変数|(?<![A-Za-z])env(?![A-Za-z])|(?<![A-Za-z])PATH(?![A-Za-z]))", re.IGNORECASE),
-    # --- Python 実行可能クエリ: 数値処理 ---
-    # 「16進に変換して」のように「数」が入らない書き方も基数変換。bare「変換」を
-    # 外したぶん、ここで基数そのものを見る。
-    re.compile(r"(?:階乗|素数|フィボナッチ|素因数|進数変換|\d+\s*進(?:数|法)?|桁)", re.IGNORECASE),
-    # --- Python 実行可能クエリ: データ処理 ---
-    re.compile(r"(?:集計|合計|平均|中央値|標準偏差|ソート|統計)", re.IGNORECASE),
-    # --- Python 実行可能クエリ: 変換 ---
-    # 「変換」単独は外す。表・JSON・Markdown の書き換えなど **LLM 自身がやる
-    # 内容変換** まで実行可能クエリ扱いになり、そこから層 0.5 (コマンド想起) が
-    # 開いて無関係な過去コマンドが再生される (実インシデント 2026-08-10 ライブ
-    # 監査:「その表を JSON Schema (draft 2020-12) に変換してください。」で
-    # OS/CPU スペック取得コマンドが実行された)。コマンドが要る変換は符号化・
-    # 基数・ハッシュ・時刻に限られ、いずれも固有語で拾える。
-    re.compile(r"(?:エンコード|デコード|Base64|ハッシュ|タイムスタンプ|文字コード|エポック秒?|UNIX\s*時間)", re.IGNORECASE),
+    # --- Python 実行可能クエリ (SSOT: core.intent_vocab) ---
+    *EXECUTABLE_QUERY_PATTERNS_JA,
+    _DATETIME_SIGNAL_RE_EN,
 ]
 
 # _TOOL_PATTERNS の英語版。GUI 左下の言語設定が 'en' の場合のみ使う
@@ -195,11 +209,19 @@ _TOOL_PATTERNS = [
 # 機能するエントリ (コード検索/URL/計算/日時/OS/env 等) は locale='en' でも
 # 引き続き評価できるようそのまま複製する。
 _TOOL_PATTERNS_EN = [
-    re.compile(r"\bfile\b.*\b(?:read|open)\b.*\b(?:write|modify|change|update|delete|remove|edit)\b", re.IGNORECASE),
+    # 「ファイル + 読み書き動詞」。旧定義は read/open の **後に** write 系動詞を
+    # 必須にしており、"read the file config.yaml" のような単一操作に一度も
+    # 一致しなかった (JA 側の ``ファイル.*(?:読|書|…)`` と非対称だった)。英語は
+    # 動詞が名詞の前に来る ("read the file") ので語順も問わない。
+    re.compile(
+        r"\bfile\b.*\b(?:read|open|write|modify|change|update|delete|remove|edit)\b"
+        r"|\b(?:read|open|write|modify|change|update|delete|remove|edit)\b.*\bfile\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"(?:コマンド|command).*(?:実行|run)", re.IGNORECASE),
     *_CODE_SEARCH_PATTERNS,
-    re.compile(r"(?:URL|url|https?://|web|site|page|news|fetch|browse)", re.IGNORECASE),
-    re.compile(r"(?:計算|calculate)\s", re.IGNORECASE),
+    _WEB_REFERENCE_RE,
+    _CALCULATE_RE,
     re.compile(r"[A-Za-z]:\\", re.IGNORECASE),
     re.compile(r"\b(?:save|export|output)\b.{0,20}\b(?:it|this|that|to|as|file)\b", re.IGNORECASE),
     re.compile(
@@ -209,107 +231,21 @@ _TOOL_PATTERNS_EN = [
     ),
     re.compile(r"\b(?:run|execute|exec)\b.{0,20}\b(?:this|that|it|the\s+\w+)\b", re.IGNORECASE),
     re.compile(r"`[^`]+`", re.IGNORECASE),
-    re.compile(r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])|memory|(?<![A-Za-z])RAM(?![A-Za-z])|(?<![A-Za-z])GPU(?![A-Za-z])|(?<![A-Za-z])VRAM(?![A-Za-z])|disk|capacity|storage|drive|(?<![A-Za-z])specs?(?![A-Za-z]))", re.IGNORECASE),
-    # 「日時型」「日付フォーマット」等はデータ型/スキーマの話 (router の
-    # _EXECUTABLE_QUERY_PATTERNS の同じエントリのコメント参照)。
-    re.compile(r"(?:何時|何月|何日|何曜日|(?:日時|日付)(?!型|形式|フォーマット|カラム|列)|現在時刻|(?<![A-Za-z])today(?![A-Za-z])|(?<![A-Za-z])now(?![A-Za-z])|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z]))", re.IGNORECASE),
-    re.compile(r"(?:IP\s*address|hostname|(?<![A-Za-z])hostname(?![A-Za-z])|(?<![A-Za-z])ip\s*address)", re.IGNORECASE),
-    re.compile(r"(?:(?<![A-Za-z])OS(?![A-Za-z])|operating\s*system|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])|(?<![A-Za-z])Mac(?![A-Za-z]))", re.IGNORECASE),
-    re.compile(r"(?:Python|python)\s*version", re.IGNORECASE),
-    re.compile(r"(?:environment\s*variable|(?<![A-Za-z])env(?![A-Za-z])|(?<![A-Za-z])PATH(?![A-Za-z]))", re.IGNORECASE),
-    # --- Python 実行可能クエリ: 数値処理 (171行目相当の英語版) ---
-    # base N / hex / binary / octal は基数変換そのもので、bare "convert" を
-    # 外した後もここで拾う (bare "convert" を外した理由は変換パターン側の
-    # コメント参照)。
-    re.compile(r"\b(?:factorial|prime(?:\s*numbers?)?|fibonacci|prime\s*factorization|base\s*conversion|base\s*\d+|hex(?:adecimal)?|binary|octal|radix|number\s*of\s*digits?|digits?)\b", re.IGNORECASE),
-    # --- Python 実行可能クエリ: データ処理 (173行目相当の英語版) ---
-    # sum/average/mean/sort は日常会話で極めて頻出する多義語 ("What do you
-    # mean?"/"I sort of agree"/"on average, this works fine") のため、
-    # 単独では発火させず数値/データ文脈語との近接共起を要求する (2026-07-22
-    # 監査で判明、router.py の _EXECUTABLE_QUERY_PATTERNS_EN と同期)。
-    # total/median/standard deviation/std dev/statistics/aggregate は
-    # 既存テスト (test_data_processing_queries_en の bare "What's the
-    # total?") が単独発火を前提としており、日常会話での多義性も相対的に
-    # 低いため単独発火のまま維持する。
-    re.compile(r"\b(?:total|median|standard\s*deviation|std\s*dev|statistics|aggregate)\b", re.IGNORECASE),
-    re.compile(
-        r"\b(?:sum|average|mean|sort(?:ed|ing)?)\b.{0,20}"
-        r"\b(?:numbers?|data|list|array|values?|dataset|figures?)\b"
-        r"|\b(?:numbers?|data|list|array|values?|dataset|figures?)\b.{0,20}"
-        r"\b(?:sum|average|mean|sort(?:ed|ing)?)\b",
-        re.IGNORECASE,
-    ),
-    # --- Python 実行可能クエリ: 変換 (175行目相当の英語版) ---
-    # bare "convert" は日本語版の「変換」と同じ理由で外す (内容変換の依頼が
-    # 実行可能クエリになり、層 0.5 のコマンド想起が開く)。
-    re.compile(r"\b(?:encode|decode|encoding|decoding|Base64|hash(?:ing)?|timestamp|epoch)\b", re.IGNORECASE),
+    # --- Python 実行可能クエリ (SSOT: core.intent_vocab) ---
+    *EXECUTABLE_QUERY_PATTERNS_EN,
+    _DATETIME_SIGNAL_RE_EN,
 ]
 
 # _infer_tool() の実行可能クエリ判定ゲート (システム情報・数値処理・
-# データ処理・変換)。_TOOL_PATTERNS/_TOOL_PATTERNS_EN の該当エントリと
-# 語彙が重複するが、_infer_tool は「どのツールを選ぶか」を決める別の判定
-# フェーズであり、単一の結合正規表現として設計されているため独立して保持する。
-# CPU/RAM/GPU/VRAM 等の短い ASCII トークンは境界必須 (IGNORECASE で
-# "program" の 'ram' 等に部分マッチした実績が _TOOL_PATTERNS 側にあり
-# 159-162行目で対策済み。本パターンは同期しておらず 2026-07-22 監査で
-# 判明するまで同じ穴が残っていた)。
-_INFER_TOOL_EXEC_QUERY_RE = re.compile(
-    r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])|メモリ|(?<![A-Za-z])RAM(?![A-Za-z])"
-    # 「容量」単独を外す理由は _TOOL_PATTERNS の同じエントリのコメント参照。
-    r"|(?<![A-Za-z])GPU(?![A-Za-z])|(?<![A-Za-z])VRAM(?![A-Za-z])"
-    r"|ディスク|(?:空き|残り|使用)容量|ストレージ|ドライブ"
-    r"|(?<![A-Za-z])spec(?![A-Za-z])"
-    r"|何時|何月|何日|何曜日|日時|日付|現在時刻"
-    # 裸の now は時刻クエリのシグナルにならない ("from now on" / "right now" /
-    # "know now" 等の非時制表現に誤爆する。2026-07-26 ライブ検証で
-    # "From now on, always reply in English. Tell me what a deadlock is" が
-    # run_command_readonly の時刻取得を発火させた)。EN 版 (_..._RE_EN) は
-    # 2026-07-22 監査で既に句単位に絞ってあるので、同じ形へ揃える。
-    r"|(?<![A-Za-z])today(?![A-Za-z])"
-    r"|what'?s?\s*(?:the\s*)?(?:time|date)|current\s*(?:time|date)"
-    r"|IP\s*アドレス|ホスト名|(?<![A-Za-z])hostname(?![A-Za-z])"
-    r"|(?<![A-Za-z])OS(?![A-Za-z])|オペレーティングシステム"
-    r"|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])"
-    r"|(?<![A-Za-z])Mac(?![A-Za-z])"
-    r"|Python\s*(?:バージョン|version)"
-    r"|環境変数|(?<![A-Za-z])env(?![A-Za-z])"
-    r"|階乗|素数|フィボナッチ|素因数|進数変換|桁"
-    r"|集計|合計|平均|中央値|標準偏差|ソート|統計"
-    r"|変換|エンコード|デコード|Base64|ハッシュ|タイムスタンプ)",
-    re.IGNORECASE,
-)
+# データ処理・変換)。語彙は _TOOL_PATTERNS と同じ SSOT を 1 本の alternation に
+# 畳んだもの。以前は独立に保持されており、bare「変換」/ 無ガードの「日付」/
+# ``CPU バウンド`` の除外漏れが **ここだけ** に残っていた (2026-09-02 監査)。
+_INFER_TOOL_EXEC_QUERY_RE = EXECUTABLE_QUERY_RE_JA
 
-# _INFER_TOOL_EXEC_QUERY_RE の英語版。JA 側と同じ理由で ASCII トークンは
-# 全て境界必須 (境界無しだと program/framework/diagram/anagram が
-# memory/RAM 等に、summary/resume/assume が sum/mean 等に部分マッチする。
-# 2026-07-22 監査で判明)。
-_INFER_TOOL_EXEC_QUERY_RE_EN = re.compile(
-    r"(?:(?<![A-Za-z])specs?(?![A-Za-z])|(?<![A-Za-z])CPU(?![A-Za-z])"
-    r"|(?<![A-Za-z])memory(?![A-Za-z])|(?<![A-Za-z])RAM(?![A-Za-z])"
-    r"|(?<![A-Za-z])GPU(?![A-Za-z])|(?<![A-Za-z])VRAM(?![A-Za-z])"
-    # ``capacity`` はデータ項目名として普通に現れるため対象外
-    # (_EXECUTABLE_QUERY_COMMANDS の同名エントリのコメント参照)。
-    r"|(?<![A-Za-z])disk(?![A-Za-z])|(?<![A-Za-z])storage(?![A-Za-z])"
-    r"|what'?s?\s*(?:the\s*)?(?:time|date)|current\s*(?:time|date)"
-    r"|today'?s?\s*date|what\s*day\s*(?:is\s*it|of\s*the\s*week)"
-    r"|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z])"
-    r"|IP\s*address|(?<![A-Za-z])hostname(?![A-Za-z])"
-    r"|(?<![A-Za-z])OS(?![A-Za-z])|operating\s*system"
-    r"|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])|(?<![A-Za-z])Mac(?![A-Za-z])"
-    r"|Python\s*version"
-    r"|environment\s*variable|(?<![A-Za-z])env(?![A-Za-z])|(?<![A-Za-z])PATH(?![A-Za-z])"
-    r"|(?<![A-Za-z])factorial(?![A-Za-z])|(?<![A-Za-z])prime(?![A-Za-z])(?:\s*numbers?)?"
-    r"|(?<![A-Za-z])fibonacci(?![A-Za-z])|prime\s*factorization|base\s*conversion"
-    r"|number\s*of\s*digits?|(?<![A-Za-z])digits?(?![A-Za-z])"
-    r"|(?<![A-Za-z])sum(?![A-Za-z])|(?<![A-Za-z])total(?![A-Za-z])|(?<![A-Za-z])average(?![A-Za-z])"
-    r"|(?<![A-Za-z])mean(?![A-Za-z])|(?<![A-Za-z])median(?![A-Za-z])"
-    r"|standard\s*deviation|std\s*dev|(?<![A-Za-z])sort(?:ed|ing)?(?![A-Za-z])"
-    r"|(?<![A-Za-z])statistics(?![A-Za-z])|(?<![A-Za-z])aggregate(?![A-Za-z])"
-    r"|(?<![A-Za-z])convert(?![A-Za-z])|(?<![A-Za-z])encod(?:e|ing)(?![A-Za-z])"
-    r"|(?<![A-Za-z])decod(?:e|ing)(?![A-Za-z])|(?<![A-Za-z])Base64(?![A-Za-z])"
-    r"|(?<![A-Za-z])hash(?:ing)?(?![A-Za-z])|(?<![A-Za-z])timestamp(?![A-Za-z]))",
-    re.IGNORECASE,
-)
+# _INFER_TOOL_EXEC_QUERY_RE の英語版 (SSOT 由来。ASCII 語は全て境界付き —
+# 境界無しだと program/framework/diagram が RAM 等に、summary/resume/assume が
+# sum/mean 等に部分マッチする。2026-07-22 監査で判明)。
+_INFER_TOOL_EXEC_QUERY_RE_EN = EXECUTABLE_QUERY_RE_EN
 #: 搭載メモリ量を尋ねるクエリ。専用ツール ``system_hardware_info`` へ振る。
 #:
 #: 2026-07-27 に ``メモリ`` / ``RAM`` を spec コマンド (``_build_spec_command``)
@@ -321,7 +257,11 @@ _INFER_TOOL_EXEC_QUERY_RE_EN = re.compile(
 #: 直接叩いているのと同じ立て付け)。allow-list は広げていない。
 #:
 #: ``メモリ`` 単独は EvorefMem の話 (「メモリに保存して」「記憶メモリ」) と
-#: 衝突するため、容量を問う語との共起を要求する。
+#: 衝突するため、容量を問う語との共起を要求する。それでも「メモリに保存して
+#: **使って**ください」「メモリに**残って**いますか」は状態語の共起で当たって
+#: いた (2026-09-02 監査) ので、``メモリ(に|で|へ)`` の直後が記憶動詞
+#: (保存 / 残 / 記録 / 覚え …) なら EvorefMem の話として除外する。ハードウェア側の
+#: 「メモリに何GB積んで」は記憶動詞ではないので通る。
 #: 英語は量を問う語が名詞の **前** に来る ("how much memory") ため別枝で受ける。
 #:
 #: 「空き」「使用率」などの **状態を問う語** も同じツールで答えられる
@@ -333,12 +273,16 @@ _INFER_TOOL_EXEC_QUERY_RE_EN = re.compile(
 #: 「取得した情報に含まれていないためお答えできません」と回答した。
 _HARDWARE_MEMORY_QUERY_RE = re.compile(
     r"(?:(?:搭載|物理|実装|空き|使用|利用可能|残り|フリー)?メモリ"
+    r"(?![にでへ]\s*(?:保存|残|記録|入れ|覚え|書|蓄え|溜め|しま))"
     r"|(?<![A-Za-z])RAM(?![A-Za-z])"
     r"|(?<![A-Za-z])memory(?![A-Za-z]))"
     r"[^。．\n]{0,12}"
-    r"(?:容量|サイズ|何\s*(?:GB|ギガ|MB)|いくつ|どれ(?:く|ぐ)らい|積んで|載って"
+    # 総量 / 合計 / トータル / いくら は 2026-09-02 追加 (「搭載メモリの総量は？」
+    # 「搭載メモリはいくら？」が語彙に無くどの層にも掛からなかった)。
+    r"(?:容量|サイズ|総量|合計|トータル|いくら|何\s*(?:GB|ギガ|MB)|いくつ"
+    r"|どれ(?:く|ぐ)らい|積んで|載って"
     r"|使用[率量]|空き|残[りって]|使って"
-    r"|(?<![A-Za-z])(?:size|usage|used|free|available)(?![A-Za-z]))"
+    r"|(?<![A-Za-z])(?:size|usage|used|free|available|total)(?![A-Za-z]))"
     r"|(?:空き|残り|利用可能な|フリー)(?:メモリ|RAM)"
     r"|CPU\s*(?:の)?\s*(?:使用[率量]|利用[率量]|負荷)"
     r"|(?<![A-Za-z])cpu\s+(?:usage|load|utilization)(?![A-Za-z])"
@@ -387,8 +331,11 @@ _DELETE_INTENT_RE = re.compile(
 
 #: 削除対象がファイル / ディレクトリであることの手掛かり。会話履歴やメモリの
 #: 削除依頼 (「さっきの記憶を消して」) を巻き込まないための AND 条件。
+#: 「ドライブ」はドライブレターを伴う形 (``E ドライブ``) だけ採る — 裸の
+#: 「ドライブ」は「ハードドライブの寿命について記憶を消して」のような
+#: **記憶の削除依頼** にも現れる (2026-09-02 監査)。
 _DELETE_FS_TARGET_RE = re.compile(
-    r"(?:ファイル|フォルダ|ディレクトリ|ドライブ)"
+    r"(?:ファイル|フォルダ|ディレクトリ|(?<![A-Za-z])[A-Za-z]\s*ドライブ)"
     r"|(?<![A-Za-z])(?:file|folder|directory)(?![A-Za-z])"
     r"|[\w-]+\.(?:txt|md|csv|json|yaml|yml|log|py|js|ts|html|xlsx|docx|pptx|pdf)"
     r"|[A-Za-z]:[\\/]",
@@ -425,39 +372,6 @@ _KNOWLEDGE_PATTERNS_EN = [
     re.compile(r"\b(?:i\s+want\s+to\s+know|curious\s+about|wondering\s+about)\b", re.IGNORECASE),
     re.compile(r"\bdifference\s+between\b|\bwhen\s+(?:should|do)\s+i\s+use\b", re.IGNORECASE),
 ]
-
-# アシスタント自身の意見・嗜好・感想を尋ねる質問パターン — 「好きな〜は
-# ありますか」「好きな〜とかあったりしますか」等。search_history は
-# ユーザー自身の過去発言を検索するツールであり、アシスタント自身の意見を
-# 尋ねる質問には無関係だが、明確なツールシグナルが無いため層4 (aux
-# tool_judgment) まで素通りし、小型 aux モデルが誤って search_history を
-# 選ぶ実インシデントが多発した (2026-07-17/18 の2日分ログで
-# tool_call_decision=aux の 48% が該当)。「あったりしますか」等の口語的な
-# 疑問文末尾も拾う (上の _KNOWLEDGE_PATTERNS の「ありますか」は完全一致部分
-# 文字列のみを拾うため「あったりします(か)」を取りこぼす)。
-# あえて _KNOWLEDGE_PATTERNS 側に「あったり」単体を追加しない: _KNOWLEDGE_PATTERNS
-# は _judge_with_rules (層1) でも無条件に (一人称マーカーを考慮せず) 参照される
-# ため、汎用パターンとして追加すると「私は好きな〜あったりしますか」のような
-# 一人称クエリまで層1で誤って即 no_tool になり、下記の一人称除外が層4に届く
-# 前に握り潰されてしまう (レビューで判明)。
-# ただし「私の/私は/僕の/僕は/自分の/自分は」等の一人称マーカーを含む場合は
-# ユーザー自身の過去発言 (例:「私の好きなプログラミング言語は？」) を指す
-# 可能性があるため除外せず、層4 (aux) 判定に委ねる (実際に "Rust" 等の
-# 固有名詞を正しく抽出できた実績がある)。
-_ASSISTANT_PREFERENCE_PATTERNS = [
-    re.compile(
-        r"(?:好きな|嫌いな|得意な|苦手な|おすすめの).{0,20}?"
-        r"(?:ますか|ありますか|でしょうか|ですか"
-        # 「あったり」は文中でも出現しやすい語のため (例:「あったりして
-        # 困った」)、疑問文末尾の用法に限定して文末アンカーを課す。
-        r"|あったり(?:します)?(?:か)?[？?]?\s*$)",
-    ),
-]
-_FIRST_PERSON_REFERENCE_RE = re.compile(
-    r"私の|私が|私は|僕の|僕が|僕は|俺の|俺が|俺は"
-    r"|自分の|自分が|自分は|わたしの|わたしが|わたしは",
-)
-
 
 # セッション自己参照パターン — 「この会話で」等、現在のセッション自体を参照
 # する発話。会話履歴は working memory の予算を超えると古いターンからコンテキ
@@ -567,50 +481,12 @@ _SESSION_TOPIC_BREAK_LEAD_RE_EN = re.compile(
     r"\b(?:aside|apart|other than|separate)\s+from\s+(?:this|our)\s+conversation\b",
     re.IGNORECASE,
 )
-# ユーザー自身の行動宣言パターン — アシスタントへの依頼ではない雑談発話。
-# 「探してみるね」のような一人称の意思表明をツール起動と誤解しないための除外。
-# 依頼形 (「探してみて(ください)」= て止め) とは区別する (こちらは末尾が「て」)。
-_SELF_ACTION_PATTERNS = [
-    # 「〜てみる(ね/よ/わ/かな/から)」自分で試す宣言 (文末)
-    re.compile(r"(?:て|で)みる(?:ね|よ|わ|な|かな|から)?[\s　!！。.…]*$"),
-    # 「〜しておく/やっておく/調べておく(ね/よ)」自己完結の行動宣言 (文末)
-    re.compile(r"(?:してお|やってお|探してお|調べてお|見てお|やっと)く(?:ね|よ|わ|から)?[\s　!！。.…]*$"),
-    # 一人称主語で自分が行う宣言 (文末の意思・断定形に限定)。
-    # 旧実装は主語マーカー単独の無アンカー部分一致で、「この会話で一番最初に
-    # 私が計算させた問題は何だったか覚えてますか？」のような関係節中の一人称
-    # 主語まで自己行動宣言と誤検出し skip_judgment=True を招いていた
-    # (2026-07-20 ライブ検証で確認、層5.5 フォールバックが実害を吸収)。
-    # 主語マーカーの後、同一文内 (文境界・疑問符を跨がない) で動詞終止形
-    # (u 段かな) または ます形の文末で終わる発話のみ宣言とみなす。
-    # 丁寧断定「です」は情報提供であって行動宣言ではないため lookbehind で
-    # 除外し (「ます」の「す」は前が「ま」なので通る)、疑問形終端
-    # (「〜ますか？」等) は末尾許容クラスに「？」を含めないことで弾く。
-    # 取りこぼし (「私がやるから大丈夫」等の複文) は層4 aux 判定に
-    # 落ちるだけで安全側。
-    re.compile(
-        r"(?:自分で|自分が|私が|僕が|俺が|わたしが|こっちで|こちらで)"
-        r"[^。．!！?？\n]*"
-        r"(?:[うくぐつぬぶむる]|(?<!で)す)"
-        r"(?:ね|よ|わ|から|かな)?"
-        r"[\s　!！。.…]*$",
-    ),
-]
 #: ローカルファイル/ディレクトリを対象にしていることが明確な語。パス自体は
 #: 含まれていなくてよい (「そのファイル」のような anaphoric 参照を拾うため)。
 _LOCAL_FILE_REFERENCE_RE = re.compile(
     r"(?:ファイル|フォルダ|ディレクトリ|保存した"
     r"|(?<![A-Za-z])file(?![A-Za-z])|(?<![A-Za-z])folder(?![A-Za-z])"
     r"|(?<![A-Za-z])directory(?![A-Za-z]))",
-    re.IGNORECASE,
-)
-#: web リソースを対象にしていることを示す語。1 つでもあればローカル限定と
-#: みなさない (「そのURLをファイルに保存して」等の url_write 正規フロー保護)。
-_WEB_REFERENCE_RE = re.compile(
-    r"(?:URL|https?://|ウェブ|サイト|ページ|ニュース|記事|ブログ|ドメイン|リンク"
-    r"|(?<![A-Za-z])web(?![A-Za-z])|(?<![A-Za-z])site(?![A-Za-z])"
-    r"|(?<![A-Za-z])page(?![A-Za-z])|(?<![A-Za-z])news(?![A-Za-z])"
-    r"|(?<![A-Za-z])fetch(?![A-Za-z])|(?<![A-Za-z])browse(?![A-Za-z])"
-    r"|(?<![A-Za-z])link(?![A-Za-z])|(?<![A-Za-z])domain(?![A-Za-z]))",
     re.IGNORECASE,
 )
 
@@ -631,11 +507,10 @@ def _query_has_tool_signal(query: str, context: str = "") -> bool:
         # ディレクトリ列挙は _TOOL_PATTERNS のどれにも当たらず、knowledge query
         # として落ちて捏造回答になっていた (2026-08-03 ライブ監査)。
         or asks_directory_listing(query)
-        # 式が書かれていない計算文章題も calculate が要る。補助タスク常駐時は
-        # 5.2 層 (_judge_with_calculate_fallback) が拾うが、on_demand では
-        # そこが撃てないため、ここを通さないとネイティブ層にも届かず base の
-        # 暗算に倒れる (2026-08-08 ライブ監査:「時速240kmで2時間30分走ると
-        # 何km進みますか。」→ 540km。正解 600km)。
+        # 式が書かれていない計算文章題も calculate が要る。ここを通さないと
+        # 分類器 (層 5.9) のゲートが閉じたまま base の暗算に倒れる
+        # (2026-08-08 ライブ監査:「時速240kmで2時間30分走ると何km進みますか。」
+        # → 540km。正解 600km)。
         or looks_like_numeric_question(query, context)
         # 「<識別子> はどこで使われていますか」は _TOOL_PATTERNS のどれにも
         # 当たらず、文末の「〜ですか」で knowledge query として落ちる。

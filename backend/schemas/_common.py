@@ -199,6 +199,17 @@ class AgentConfig(BaseModel):
     tool_judge_enabled: bool = True
     meta_cognitive_enabled: bool = True
     meta_cognitive_min_budget: int = Field(default=512, ge=0)
+    # Meta-Cognitive の 1 タスク内でツール実行を繰り返す上限 (タスク数の上限では
+    # ない)。``MetaCognitiveAgent.max_tool_iterations`` として参照される。
+    max_tool_iterations: int = Field(
+        default=5, ge=1, le=20,
+        description="Meta-Cognitive の 1 タスク内ツール実行ループ上限",
+    )
+    # 書き込み系タスクが失敗したとき 1 回だけリトライするか。
+    retry_failed_writes: bool = Field(
+        default=True,
+        description="失敗した書き込みタスクを 1 回リトライする",
+    )
     # reactive 分類クエリがルールベース即応 (挨拶/日時/キャッシュ) に該当しない場合、
     # ツール判定で tool 不要と判定されたら base 1 ターンの軽量パスで応答する。
     # tool 必要なら deliberative へエスカレート。False で常に deliberative。

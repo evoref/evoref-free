@@ -128,6 +128,10 @@ def _redact_string(value: str) -> str:
     return redacted
 
 
+#: 公開別名。ログ処理以外 (SemMem 索引ファクトの秘匿化) からも同じ規則で伏せる。
+redact_string = _redact_string
+
+
 def _redact_value(key: str, value: Any) -> Any:
     """key / value の組に対して redaction を適用する。
 

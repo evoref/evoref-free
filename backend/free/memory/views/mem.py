@@ -55,6 +55,13 @@ from typing import Any
 import numpy as np
 
 from backend.free.memory.ownership import Pillar
+# 索引ファクトの subject 接頭辞。定義は sleep 側 (curator) が SSOT だが、他 pillar
+# (EvorefLoop の ToolCallJudge) は memory 内部モジュールを import できないため、
+# View 層の公開 API としてここから再輸出する。
+from backend.free.memory.sleep._curator_common import (  # noqa: F401
+    EXECUTABLE_COMMAND_SUBJECT_PREFIX,
+    URL_SUBJECT_PREFIX,
+)
 from backend.free.memory.protocols import SemanticFactStoreProtocol
 from backend.free.memory.types import FactType, SemanticFact
 from backend.free.memory.views.base import FactViewBase
@@ -140,10 +147,36 @@ class MemFactView(FactViewBase):
         top_k: int = 10,
         *,
         include_superseded: bool = False,
+        subject_prefix: str | tuple[str, ...] | None = None,
     ) -> list[tuple[SemanticFact, float]]:
-        """埋め込みベクトルで cosine similarity 検索する。"""
+        """埋め込みベクトルで cosine similarity 検索する。
+
+        Args:
+            subject_prefix: 与えると ``subject`` がこの接頭辞で始まるファクト
+                だけを候補にする。``ToolCallJudge`` の URL / コマンドリコールは
+                ``mem.world.url.`` / ``mem.world.executable_command.`` を渡す
+                こと — グローバル top-k を引いてから接頭辞で絞ると、ストアが
+                育った時点で索引行が top-k に入らなくなる (2026-09-02 監査 H3)。
+                ``None`` は従来どおり全件。
+        """
         return self._store.search_by_embedding(
             query, top_k=top_k, include_superseded=include_superseded,
+            subject_prefix=subject_prefix,
+        )
+
+    def count_by_subject_prefix(
+        self,
+        prefix: str | tuple[str, ...],
+        *,
+        include_superseded: bool = False,
+    ) -> int:
+        """``subject`` が ``prefix`` で始まる live ファクト数を返す。
+
+        索引リコールの「候補プールが小さいときの margin 判定」は、ストア全体
+        ではなく **その索引の件数** で行うこと。
+        """
+        return self._store.count_by_subject_prefix(
+            prefix, include_superseded=include_superseded,
         )
 
     def all_facts(self, *, include_superseded: bool = True) -> list[SemanticFact]:

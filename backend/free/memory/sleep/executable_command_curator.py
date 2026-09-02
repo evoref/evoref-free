@@ -36,7 +36,10 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from backend.free.memory.sleep._curator_common import (
+    EXECUTABLE_COMMAND_SUBJECT_PREFIX,
+    embed_kwargs_for_subject,
     public_notes,
+    redact_for_store,
     subject_digest,
     truncate_for_prompt,
 )
@@ -52,7 +55,8 @@ if TYPE_CHECKING:
 
 logger = get_logger("memory.sleep.executable_command_curator")
 
-_SUBJECT_PREFIX = "mem.world.executable_command."
+#: 接頭辞は _curator_common が SSOT (埋め込み側の定義と同じ場所に置く)。
+_SUBJECT_PREFIX = EXECUTABLE_COMMAND_SUBJECT_PREFIX
 _WS_RE = re.compile(r"\s+")
 
 
@@ -152,7 +156,7 @@ def _record_success(
             "exec_count": exec_count,
             "success_history": history,
             "success_avg": round(success_avg, 4),
-            "last_query": _truncate(query or "", 200),
+            "last_query": _truncate(redact_for_store(query), 200),
             "last_executed_at": now,
         },
     )
@@ -244,7 +248,9 @@ async def curate_executable_command_facts(
             continue
         seen_subjects.add(subject)
         success = bool(assistant_note.tool_command_success)
-        topic = _truncate(user_query, 200)
+        # 質問文は object / last_query として生で保存されるので秘匿情報を
+        # 伏せる (subject の digest は正規化コマンドから作るので影響しない)。
+        topic = _truncate(redact_for_store(user_query), 200)
         now = now_fn()
 
         existing = _existing_command_fact(store, subject)
@@ -264,11 +270,15 @@ async def curate_executable_command_facts(
                 embedding = None
                 try:
                     # 読み出し側 (tool_call_judge._try_recall_executable_command)
-                    # は is_query=True で埋め込むため、保存側も揃える。
-                    # instruction-aware な embed では query/document で prefix が
-                    # 変わり、同一テキストの自己類似度が 0.78 程度まで落ちる。
-                    # 非対称のままだと閾値が本来の尺度で意味を持たない。
-                    emb = await embedder.embed([topic], is_query=True)
+                    # は embed_query(query, mode=mode) で埋め込むため、保存側も
+                    # 側と mode を揃える。instruction-aware な embed では
+                    # query/document で prefix が変わり、同一テキストの
+                    # 自己類似度が 0.78 程度まで落ちる。側の定義は
+                    # ``_curator_common.INDEX_EMBED_IS_QUERY`` が SSOT
+                    # (再埋め込み側もそこを読む)。
+                    emb = await embedder.embed(
+                        [topic], **(embed_kwargs_for_subject(subject) or {}),
+                    )
                     if emb is not None and len(emb) > 0:
                         embedding = np.asarray(emb[0], dtype=np.float32)
                 except Exception as exc:
@@ -276,8 +286,8 @@ async def curate_executable_command_facts(
                         "executable_command_curator: embed failed: %s", exc,
                     )
                 extra = {
-                    "command": command,
-                    "command_normalized": normalized,
+                    "command": redact_for_store(command),
+                    "command_normalized": redact_for_store(normalized),
                     "mode": mode,
                     "exec_count": 1,
                     "success_history": [1.0],

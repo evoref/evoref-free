@@ -90,6 +90,12 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "flow_spec_synthesis": 240.0,
     "flow_spec_part_synthesis": 120.0,
     "ralph_loop": 240.0,
+    # ── LLM 委譲ツール (chat の summarize / translate / draft_document) ──
+    # 自由文生成。ツール側の実行上限 (chat_constants.LLM_TOOL_EXECUTION_TIMEOUT_SEC
+    # = 180 秒) と揃える。
+    "tool_summarize": 180.0,
+    "tool_translate": 180.0,
+    "tool_draft_document": 180.0,
     # ── Pro ──────────────────────────────────────────────────────────
     "cartridge_eval_generation": 120.0,
 }

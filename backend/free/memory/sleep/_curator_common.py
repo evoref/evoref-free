@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from backend.structlog_config import redact_string
 
 if TYPE_CHECKING:
     from backend.free.memory.stores.short_term import MemoryNote
@@ -25,7 +27,62 @@ QUERY_PROMPT_LIMIT = 1000
 #: プロンプトへ載せる応答の最大文字数。
 ANSWER_PROMPT_LIMIT = 2000
 
+#: URL リコール索引の subject 接頭辞 (``mem.world.url.<host>.<digest>``)。
+URL_SUBJECT_PREFIX = "mem.world.url."
+#: executable command リコール索引の subject 接頭辞
+#: (``mem.world.executable_command.<mode>.<digest>``)。
+EXECUTABLE_COMMAND_SUBJECT_PREFIX = "mem.world.executable_command."
+
+#: 内部索引ファクトの **埋め込み側** (``is_query``) の SSOT。
+#:
+#: 索引は「過去の質問文」を埋め込み、読み出し側 (``ToolCallJudge``) が今の
+#: 質問を埋め込んで突き合わせる。instruction-aware なモデルでは query 側と
+#: document 側で prefix が変わり、同一テキストの自己類似度が 0.78 程度まで
+#: 落ちるので、**書く側と読む側と再埋め込みで側を揃える** 必要がある。
+#: 以前は curator が ``is_query=True`` で書き、``reembed-facts`` /
+#: Step 8.8 が ``is_query=False`` で書き直しており、再埋め込みのたびに側が
+#: 反転していた (2026-09-02 監査 M19)。
+#:
+#: - executable command: 読み手が ``embed_query(query, mode=mode)`` なので
+#:   query 側 + subject の ``<mode>`` セグメント。
+#: - URL: curator が document 側で書いてきた既存契約を維持する。
+INDEX_EMBED_IS_QUERY: dict[str, bool] = {
+    EXECUTABLE_COMMAND_SUBJECT_PREFIX: True,
+    URL_SUBJECT_PREFIX: False,
+}
+
 _BARE_SCORE_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def embed_kwargs_for_subject(subject: str) -> dict[str, Any] | None:
+    """``subject`` が内部索引なら、その埋め込みに使う ``embed()`` kwargs を返す。
+
+    内部索引でなければ ``None`` (呼出側は document 側の既定で埋め込む)。
+    executable command 索引は ``mode`` を subject の 3 番目のセグメントから
+    取る (``mem.world.executable_command.<mode>.<digest>``)。
+    """
+    for prefix, is_query in INDEX_EMBED_IS_QUERY.items():
+        if not subject.startswith(prefix):
+            continue
+        kwargs: dict[str, Any] = {"is_query": is_query}
+        if is_query:
+            rest = subject[len(prefix):].split(".")
+            kwargs["mode"] = rest[0] if rest and rest[0] else "chat"
+        return kwargs
+    return None
+
+
+def redact_for_store(text: str | None) -> str:
+    """SemMem へ保存する前に秘匿情報 (Bearer / API キー / メール等) を伏せる。
+
+    内部索引は生のコマンド文字列や質問文をそのまま ``_extra`` / ``object`` に
+    載せる。ログ側は :mod:`backend.structlog_config` の redaction processor が
+    守っているが、SemMem は素通りだった (2026-09-02 監査 B-5)。パターンは
+    ログ側と同じ定義を使い、二重管理しない。
+    """
+    if not text:
+        return ""
+    return redact_string(text)
 
 
 def truncate_for_prompt(text: str, limit: int) -> str:

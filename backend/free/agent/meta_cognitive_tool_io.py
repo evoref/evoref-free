@@ -53,8 +53,11 @@ def command_run_failed(text: str) -> bool:
 
 #: 「ツールは正常終了したが結果が 0 件」を示すツール別の先頭マーカー。
 #: 新しいツールで空振り表現を足すときはここへ登録する (判定側は触らない)。
+#: 成否判定 (``tool_result_succeeded``) と issue 台帳
+#: (``tools_registry._record_tool_issue``) の両方がこの 1 つの表を見る。
 _TOOL_EMPTY_RESULT_PREFIXES: dict[str, tuple[str, ...]] = {
     "search_history": (SEARCH_HISTORY_NO_RESULTS_PREFIX,),
+    "search_code": ("No matches found",),
 }
 
 #: 結果本文のマーカーで「走ったプログラム自身の失敗」を判定するツール。
@@ -106,7 +109,7 @@ def try_parse_tool_dict(text: str) -> dict | None:
     """text を JSON としてパースし、'tool' キーを持つ dict ならそれを返す。
 
     パース失敗・dict 以外・'tool' キー欠落のいずれも None を返す。
-    meta_cognitive / agentic_loop の _parse_tool_call から共有される。
+    meta_cognitive の _parse_tool_call から共有される。
     """
     try:
         data = json.loads(text)

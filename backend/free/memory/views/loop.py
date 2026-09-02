@@ -544,6 +544,25 @@ class LoopFactView(FactViewBase):
     # 書込系 — task
     # ──────────────────────────────────────────────────────────────────
 
+    def add_facts(self, facts: Iterable[SemanticFact]) -> list[SemanticFact]:
+        """Loop 所有のファクト群 (合成済み task graph 等) を writeback_store へ追加する。
+
+        全件の owner / subject namespace 検証を **先に** 通してから書く
+        (途中で 1 件だけ弾かれて半端な graph が残らないように)。
+        ``chat_stream_staged`` が隔離ストアへ ``store.add_fact`` を直呼びして
+        いた経路の受け皿 (2026-09-02 監査 M22)。
+
+        Raises:
+            WriteOwnershipError: いずれかの ``fact.type`` の owner が Loop でない。
+            SubjectNamespaceError: いずれかの ``fact.subject`` が ``mem.*`` /
+                ``learn.*`` namespace を持つ。
+        """
+        items = list(facts)
+        for fact in items:
+            self._assert_write(fact.type)
+            self._assert_subject_owner(fact.subject)
+        return [self._writeback_store.add_fact(fact) for fact in items]
+
     def update_task_status(
         self,
         fact_id: str,

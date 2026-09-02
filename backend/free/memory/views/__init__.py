@@ -30,9 +30,15 @@ from backend.free.memory.views.base import (
 from backend.free.memory.views.harness import HarnessFactView
 from backend.free.memory.views.learn import LearnFactView
 from backend.free.memory.views.loop import LoopBootstrapResult, LoopFactView
-from backend.free.memory.views.mem import MemFactView
+from backend.free.memory.views.mem import (
+    EXECUTABLE_COMMAND_SUBJECT_PREFIX,
+    URL_SUBJECT_PREFIX,
+    MemFactView,
+)
 
 __all__ = [
+    "EXECUTABLE_COMMAND_SUBJECT_PREFIX",
+    "URL_SUBJECT_PREFIX",
     "FactViewBase",
     "HarnessFactView",
     "LearnFactView",

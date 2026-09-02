@@ -437,7 +437,7 @@ def _schedule_sleep_time(state: AppState, user_query: str, private: bool) -> Non
 
 
 def _turn_contradiction_inputs(
-    state: AppState,
+    state: AppState,  # noqa: ARG001 - 呼出面の互換 (判定器を後から覗く経路は撤去)
     messages: list[ChatMessage],
     action_blocked: bool | None = None,
 ) -> tuple[bool, dict[str, set[int]]]:
@@ -447,25 +447,21 @@ def _turn_contradiction_inputs(
     真偽の推定なしに矛盾を検出できる (``_derive_turn_outcome`` 参照)。
 
     - ``action_blocked``: 状態を変える依頼なのに撃てるツールが無かったか。
-      ``ToolCallJudge`` が当ターンの ``judge()`` 冒頭でリセットし、以後この
-      ターンの間は保持する。deliberative が注記の要否を決めるのに読むのと
-      同じ値をここでも読む。
+      当ターンの ``ToolJudgement.action_blocked`` (deliberative が注記の要否を
+      決めるのに読むのと同じ値) を呼出側が渡す。
     - ``measured_values``: ``[システム計測]`` として最後の user メッセージへ
       注入した実測値。注入したのはこのプロセスなので、プロンプトから読み戻す
       (新しい引数を 5 つの層へ通す代わりに、注入結果そのものを見る)。
     """
-    # 当ターンの判定結果から渡された値を優先する。``ToolCallJudge`` は
-    # プロセス唯一の共有インスタンスなので、後から属性を読むとチャットが
-    # 2 本重なったときに他方の judge() がリセット済みで値が消える
-    # (``ToolJudgement.action_blocked`` のコメント参照)。渡されない経路
-    # (reactive 即応答等) のみ従来どおり判定器を見る。
-    if action_blocked is None:
-        judge = getattr(state, "tool_call_judge", None)
-        action_blocked = bool(getattr(judge, "action_blocked", False))
+    # 判定結果が渡されない経路 (reactive 即応答等) はツール判定を経ていない
+    # ので「撃てなかった」も無い。``ToolCallJudge`` はターン固有の値を保持
+    # しない (プロセス唯一の共有インスタンスで、後から属性を読むとチャットが
+    # 2 本重なったときに他方の値を読む — ``ToolJudgement.action_blocked`` の
+    # コメント参照) ため、判定器を後から覗く経路は撤去した。
     measured: dict[str, set[int]] = {}
     if messages:
         measured = extract_measured_values(str(messages[-1].get("content") or ""))
-    return action_blocked, measured
+    return bool(action_blocked), measured
 
 
 #: 成果物として保持する最小の応答長 (文字)。履歴予算 (実測 1612 トークン

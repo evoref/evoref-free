@@ -64,6 +64,63 @@ _DISALLOWED_NODE_HINTS: dict[str, str] = {
 }
 
 
+#: 評価コストの上限。``**`` / ``pow`` / ``factorial`` は許可リストに載って
+#: いるので、``10**10**10`` や ``factorial(10**6)`` のような式を素通しすると
+#: eval がイベントループのスレッドプールを長時間占有する (chat 応答パスの
+#: 同期ツールは ``to_thread`` で走る)。指数・引数の大きさと結果のビット数で
+#: 事前に打ち切る。
+_MAX_POW_EXPONENT = 10_000
+_MAX_FACTORIAL_ARG = 5_000
+_MAX_INT_POW_RESULT_BITS = 1_000_000
+
+
+def _eval_subtree(node: ast.expr) -> object:
+    """許可リスト検証済みの部分木を評価する (コスト検査用)。"""
+    expr = ast.fix_missing_locations(ast.Expression(body=node))
+    return eval(  # noqa: S307 - 呼出側で AST 許可リスト検証済み、builtins も無効
+        compile(expr, "<calc>", "eval"), {"__builtins__": {}}, dict(_SAFE_NAMES),
+    )
+
+
+def _reject_expensive(node: ast.AST) -> str | None:
+    """指数・階乗の大きさを **子から順に** 検査し、超過なら理由を返す。
+
+    子を先に検査するので、ある Pow の指数部を評価する時点でその中の Pow /
+    factorial は全て上限内と分かっている (評価自体が高コストにならない)。
+    """
+    for child in ast.iter_child_nodes(node):
+        reason = _reject_expensive(child)
+        if reason:
+            return reason
+    exponent: object = None
+    base: object = None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+        exponent = _eval_subtree(node.right)
+        base = _eval_subtree(node.left)
+    elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        if node.func.id == "pow" and len(node.args) >= 2:
+            exponent = _eval_subtree(node.args[1])
+            base = _eval_subtree(node.args[0])
+        elif node.func.id == "factorial" and node.args:
+            n = _eval_subtree(node.args[0])
+            if isinstance(n, (int, float)) and n > _MAX_FACTORIAL_ARG:
+                return (
+                    f"Error: factorial argument too large ({n} > "
+                    f"{_MAX_FACTORIAL_ARG})"
+                )
+            return None
+    if exponent is None:
+        return None
+    if isinstance(exponent, (int, float)) and abs(exponent) > _MAX_POW_EXPONENT:
+        return f"Error: exponent too large (|{exponent}| > {_MAX_POW_EXPONENT})"
+    if (
+        isinstance(base, int) and isinstance(exponent, int) and exponent > 0
+        and abs(base).bit_length() * exponent > _MAX_INT_POW_RESULT_BITS
+    ):
+        return "Error: result too large to compute"
+    return None
+
+
 def _format_calc_result(result: object) -> str:
     """計算結果を人間が読める形に整形する (純粋関数)。
 
@@ -115,6 +172,9 @@ def calculate(expression: str) -> str:
                         "Error: Unsafe expression (keyword arguments are not "
                         "supported)"
                     )
+        cost_error = _reject_expensive(tree)
+        if cost_error:
+            return cost_error
         result = eval(  # noqa: S307 - AST を許可リストで検証済み、builtins も無効
             compile(tree, "<calc>", "eval"),
             {"__builtins__": {}}, dict(_SAFE_NAMES),

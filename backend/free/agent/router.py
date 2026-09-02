@@ -12,7 +12,10 @@ from backend.free.agent.meta_cognitive_text import assigns_file_content
 from backend.free.agent.safety_patterns import strip_command_literals
 from backend.free.core.intent_vocab import (
     DATETIME_QUERY_RE,
+    EXECUTABLE_QUERY_PATTERNS_EN,
+    EXECUTABLE_QUERY_PATTERNS_JA,
     continuation_request,
+    has_history_recall_keyword,
     persist_request,
     runtime_info_question,
     tool_inventory_question,
@@ -20,7 +23,6 @@ from backend.free.core.intent_vocab import (
     HISTORY_KEYWORDS as _HISTORY_KEYWORDS,
     HISTORY_KEYWORDS_EN as _HISTORY_KEYWORDS_EN,
     REFERENTIAL_WRITE_TARGET_RE,
-    ascii_boundary_alternation,
     exact_greeting_pattern,
     looks_like_numeric_question,
     PREMISE_CONFIRMATION_RE,
@@ -539,73 +541,16 @@ TOOL_PATTERNS_EN = [
 
 # Python 実行で正確に答えられるクエリのパターン
 # 知識質問パターンにマッチしてもこれらを含む場合は deliberative に昇格して
-# ToolCallJudge によるツール実行を誘導する
-_EXECUTABLE_QUERY_PATTERNS = [
-    # 注意: \b は日本語文字を \w とみなすため英語-日本語境界で機能しない。
-    # 英語の短いキーワードは (?<![A-Za-z])...(?![A-Za-z]) で ASCII 境界を使用。
-    # CPU/RAM/GPU/VRAM/spec は ASCII 境界必須。境界を付けないと IGNORECASE で
-    # "program" / "diagram" / "telegram" の 'ram' に部分マッチし、無関係な
-    # クエリが executable_query として deliberative へ強制昇格していた。
-    # tool_call_judge 側は 2026-07-22 監査で塞がれたが、こちらは残っていた。
-    # 「容量」単独は外す (tool_call_judge._TOOL_PATTERNS の同じエントリと同期。
-    # データ量の話に普通に現れ、機械スペックの要求とは限らない)。judge 側に
-    # あって router に無かった ``ドライブ`` をここで補い、「E ドライブの容量は?」
-    # のような機器名指しの質問が reactive に落ちないようにする。
-    re.compile(
-        r"(?:スペック|メモリ|ディスク|(?:空き|残り|使用)容量|ストレージ|ドライブ|"
-        + ascii_boundary_alternation("CPU", "RAM", "GPU", "VRAM", "spec")
-        + r")",
-        re.IGNORECASE,
-    ),
-    # 現在日時クエリ。定義は core.intent_vocab が SSOT
-    # (tool_call_judge と同一定義を各自持っていたが細部が食い違っていた)。
-    DATETIME_QUERY_RE,
-    re.compile(r"(?:IP\s*アドレス|ホスト名|(?<![A-Za-z])hostname(?![A-Za-z])|(?<![A-Za-z])ip\s*address)", re.IGNORECASE),
-    re.compile(r"(?:(?<![A-Za-z])OS(?![A-Za-z])|オペレーティングシステム|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])|(?<![A-Za-z])Mac(?![A-Za-z]))", re.IGNORECASE),
-    re.compile(r"(?:Python|python)\s*(?:バージョン|version)", re.IGNORECASE),
-    re.compile(r"(?:環境変数|(?<![A-Za-z])env(?![A-Za-z])|(?<![A-Za-z])PATH(?![A-Za-z]))", re.IGNORECASE),
-    re.compile(r"(?:階乗|素数|フィボナッチ|素因数|進数変換|\d+\s*進(?:数|法)?|桁)", re.IGNORECASE),
-    re.compile(r"(?:集計|合計|平均|中央値|標準偏差|ソート|統計)", re.IGNORECASE),
-    # 「変換」単独は外す (tool_call_judge._TOOL_PATTERNS の同じエントリと同期。
-    # 理由はそちらのコメント参照)。内容変換の依頼が executable_query になり、
-    # 不要に deliberative へ回っていた。
-    re.compile(r"(?:エンコード|デコード|Base64|ハッシュ|タイムスタンプ|文字コード|エポック秒?|UNIX\s*時間)", re.IGNORECASE),
-]
+# ToolCallJudge によるツール実行を誘導する。
+# 語彙は core.intent_vocab が SSOT (``EXECUTABLE_QUERY_PATTERNS_JA`` / ``_EN``)。
+# tool_call_judge 側の ``_TOOL_PATTERNS`` / ``_infer_tool`` のゲート / コマンド
+# 合成のルール表と同じ部品から組む — 以前は 4 箇所に書き写され、「変換」の
+# 除外・「日付型」のガード・``CPU バウンド`` の除外が片方にしか入っていなかった
+# (ASCII 境界も router 側だけ無く "program" の 'ram' に部分マッチしていた)。
+_EXECUTABLE_QUERY_PATTERNS = EXECUTABLE_QUERY_PATTERNS_JA
 
 # _EXECUTABLE_QUERY_PATTERNS の英語版。
-_EXECUTABLE_QUERY_PATTERNS_EN = [
-    # ``capacity`` は 2026-08-09 に外した。データ項目名として普通に現れ、
-    # 機械スペックの要求とは限らない (詳細は
-    # ``tool_call_judge._EXECUTABLE_QUERY_COMMANDS`` の同名エントリのコメント)。
-    re.compile(r"(?<![A-Za-z])(?:specs?|CPU|memory|RAM|GPU|VRAM|disk|storage)(?![A-Za-z])", re.IGNORECASE),
-    re.compile(
-        r"\b(?:what'?s?\s*(?:the\s*)?(?:time|date)|current\s*(?:time|date)"
-        r"|today'?s?\s*date|what\s*day\s*(?:is\s*it|of\s*the\s*week))\b"
-        r"|(?<![A-Za-z])date(?![A-Za-z])|(?<![A-Za-z])time(?![A-Za-z])",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(?:IP\s*address|hostname|(?<![A-Za-z])hostname(?![A-Za-z]))", re.IGNORECASE),
-    re.compile(r"(?:(?<![A-Za-z])OS(?![A-Za-z])|operating\s*system|(?<![A-Za-z])Windows(?![A-Za-z])|(?<![A-Za-z])Linux(?![A-Za-z])|(?<![A-Za-z])Mac(?![A-Za-z]))", re.IGNORECASE),
-    re.compile(r"(?:Python|python)\s*version", re.IGNORECASE),
-    re.compile(r"(?:environment\s*variable|(?<![A-Za-z])env(?![A-Za-z])|(?<![A-Za-z])PATH(?![A-Za-z]))", re.IGNORECASE),
-    re.compile(r"\b(?:factorial|prime(?:\s*numbers?)?|fibonacci|prime\s*factorization|base\s*conversion|base\s*\d+|hex(?:adecimal)?|binary|octal|radix|number\s*of\s*digits?|digits?)\b", re.IGNORECASE),
-    # sum/average/mean/sort は日常会話で極めて頻出する多義語 ("What do you
-    # mean?"/"I sort of agree"/"on average, this works fine") のため、
-    # 単独では発火させず数値/データ文脈語との近接共起を要求する (2026-07-22
-    # 監査で判明)。total/median/standard deviation/std dev/statistics/
-    # aggregate は既存テスト (test_tool_call_judge.py の bare "What's the
-    # total?") が単独発火を前提としており、日常会話での多義性も相対的に
-    # 低いため単独発火のまま維持する。
-    re.compile(r"\b(?:total|median|standard\s*deviation|std\s*dev|statistics|aggregate)\b", re.IGNORECASE),
-    re.compile(
-        r"\b(?:sum|average|mean|sort(?:ed|ing)?)\b.{0,20}"
-        r"\b(?:numbers?|data|list|array|values?|dataset|figures?)\b"
-        r"|\b(?:numbers?|data|list|array|values?|dataset|figures?)\b.{0,20}"
-        r"\b(?:sum|average|mean|sort(?:ed|ing)?)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(r"\b(?:encode|decode|encoding|decoding|Base64|hash(?:ing)?|timestamp|epoch)\b", re.IGNORECASE),
-]
+_EXECUTABLE_QUERY_PATTERNS_EN = EXECUTABLE_QUERY_PATTERNS_EN
 
 # 挨拶・簡単な定型パターン → Reactive 層で即応答
 # 体裁 (クエリ全体が挨拶だけであることの要求) は core.intent_vocab から派生させる。
@@ -1232,11 +1177,12 @@ class ComplexityClassifier:
         return _matches_any(COMPLEX_KEYWORDS_EN_PATTERNS, query)
 
     def _has_history_keywords(self, query: str) -> bool:
-        """履歴参照キーワードを検出"""
-        q_lower = query.lower()
-        return any(kw in q_lower for kw in HISTORY_KEYWORDS) or any(
-            kw in q_lower for kw in HISTORY_KEYWORDS_EN
-        )
+        """履歴参照キーワードを検出 (locale を問わず JA / EN 両方を見る)。
+
+        実体は ``core.intent_vocab.has_history_recall_keyword``
+        (tool_call_judge の強制発火判定と同じ照合)。
+        """
+        return has_history_recall_keyword(query, locale_aware=False)
 
     def _has_meta_keywords(self, query: str) -> bool:
         """Meta-Cognitive 層へのエスカレーションキーワードを検出"""

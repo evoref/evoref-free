@@ -351,6 +351,21 @@ async def migrate_component(
     )
 
 
+def _follow_embedder_rebind(component: str, state: AppState) -> None:
+    """embedding の差し替えにツール判定器 (kNN ゲート) を追随させる。
+
+    ``rebind_component`` は ``state.embedder`` を差し替えるが、``ToolCallJudge``
+    と ``ToolGateKNN`` は構築時の参照を握ったまま、しかも旧モデル空間の exemplar
+    ベクトルを持ち続けていた (次元が同じなら縮退にも掛からず投票だけが狂う)。
+    参照を差し替えて exemplar を捨て、再 warmup は背景で行う (起動時と同じ扱い)。
+    """
+    if component != "embedding":
+        return
+    from backend.free.api.config.component_reload import follow_embedder_rebind
+
+    follow_embedder_rebind(state)
+
+
 async def _restart_and_rebind(
     component: str, state: AppState, migrator,
 ) -> bool:
@@ -367,6 +382,7 @@ async def _restart_and_rebind(
     try:
         manager.restart(component, cfg)
         await rebind_component(component, state, cfg)
+        _follow_embedder_rebind(component, state)
         logger.info(
             "Component restart + rebind succeeded: %s", component,
         )
@@ -383,6 +399,7 @@ async def _restart_and_rebind(
                 manager.restart(component, cfg_after)
                 from backend.free.core.component_rebind import rebind_component
                 await rebind_component(component, state, cfg_after)
+                _follow_embedder_rebind(component, state)
             except Exception as recover_err:
                 logger.error(
                     "Rollback restart also failed for %s: %s",
@@ -615,9 +632,12 @@ async def reembed_facts(
 
     from backend.free.memory.semantic.cli._paths import cli_backup_root
     from backend.free.memory.semantic.cli.reembed_facts_cmd import (
+        ReembedTarget,
         apply_reembed_swap,
         collect_reembed_targets,
+        embed_targets_async,
     )
+    from backend.free.memory.sleep._curator_common import embed_kwargs_for_subject
     from backend.free.memory.semantic.manifest import (
         load_manifest,
         normalize_embedding_model_id,
@@ -687,10 +707,12 @@ async def reembed_facts(
                 status_code=500,
                 detail="cannot resolve new embedding model_id from embedder",
             )
-        objs = [t[3] for t in targets]
         t0 = time.monotonic()
+        # 内部索引ファクト (URL / コマンド) は query 側で埋め込む。全件を doc 側で
+        # ``embed(objs, is_query=False)`` すると索引の側が反転し、リコールの
+        # 類似度が崩れる (2026-09-02 監査 M19)。側は target ごとに持たせてある。
         vectors = (
-            await state.embedder.embed(objs, is_query=False) if objs else []
+            await embed_targets_async(state.embedder, targets) if targets else []
         )
         elapsed = time.monotonic() - t0
         # LlamaCppEmbedder.embed は常に L2 正規化して返すため normalized=True。
@@ -728,8 +750,12 @@ async def reembed_facts(
     live_facts = store.all_facts(include_superseded=False)
     # 本文は Step 8.8 と同じ ``fact.text`` (= statement or object)。``object``
     # を使うと再埋め込み済みと未処理で本文が食い違う (split-brain)。
+    # 側 (is_query / mode) は subject から決める (cross-model 経路と同じ規則)。
     targets_g = [
-        (f.id, (f.text or "").strip())
+        ReembedTarget(
+            "global", memory_dir, f.id, (f.text or "").strip(),
+            embed_kwargs_for_subject(f.subject),
+        )
         for f in live_facts
         if f.embedding is not None and (f.text or "").strip()
     ]
@@ -764,15 +790,13 @@ async def reembed_facts(
     except Exception as exc:
         logger.warning("reembed-facts: backup skipped: %s", exc)
 
-    objs = [t[1] for t in targets_g]
     t0 = time.monotonic()
-    vectors = await state.embedder.embed(objs, is_query=False)
-    if len(vectors) != len(objs):
-        raise HTTPException(
-            status_code=500,
-            detail=f"embedder returned {len(vectors)} vectors for {len(objs)} texts",
-        )
-    for (fid, _), vec in zip(targets_g, vectors):
+    try:
+        vectors = await embed_targets_async(state.embedder, targets_g)
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    for target, vec in zip(targets_g, vectors):
+        fid = target.fact_id
         arr = np.asarray(vec, dtype=np.float32).reshape(-1)
         if arr.shape[0] != embedder_dim:
             raise HTTPException(

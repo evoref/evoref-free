@@ -17,7 +17,7 @@
 <SettingsSection tabId="integration">
 	<!-- Free: Tools -->
 	<FieldGroup label="settings.group_tools">
-		<ToggleField label="settings.tools.fetch_url_enabled" value={Boolean(tools.fetch_url_enabled ?? false)} onchange={fieldUpdater('tools', 'fetch_url_enabled')} />
+		<ToggleField label="settings.tools.fetch_url_enabled" value={Boolean(tools.fetch_url_enabled ?? true)} onchange={fieldUpdater('tools', 'fetch_url_enabled')} />
 		<NumberField label="settings.tools.fetch_url_timeout" value={Number(tools.fetch_url_timeout ?? 10)} min={1} onchange={fieldUpdater('tools', 'fetch_url_timeout')} />
 	</FieldGroup>
 

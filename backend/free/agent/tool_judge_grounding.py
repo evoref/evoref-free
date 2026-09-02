@@ -49,31 +49,18 @@ _UNIT_SYSTEM_CONSTANTS = frozenset({
 })
 
 
-def _synthesized_expression_grounded(
-    expression: str, query: str, context: str = "",
-) -> bool:
-    """合成式の数値がすべてクエリ / 直近の会話に現れるか (純粋関数)。
-
-    aux が知識から定数を補う (例: クエリにも会話にも無い換算率を持ち出す) と、
-    ツールは「正しく計算された嘘」を返してしまう。式に現れる数値リテラルが
-    クエリまたは ``context`` 中に文字列として存在することを要求し、捏造を
-    決定論的に弾く。``context`` を許すのは、会話で一度提示された数値は
-    「対話に書かれた事実」であってモデルの想像ではないため。
-    """
-    numbers = _NUMBER_LITERAL_RE.findall(expression)
-    if not numbers:
-        return False
-    return not _ungrounded_numbers(expression, query, context)
-
-
 def _ungrounded_numbers(
     expression: str, query: str, context: str = "",
 ) -> tuple[str, ...]:
     """式のうち対話から辿れない数値リテラルを、出現順に重複なく返す (純粋関数)。
 
-    ``_synthesized_expression_grounded`` の真偽ではなく **どの値が説明できないか**
-    を返す。式を捨てずに実行する経路 (補助タスク非常駐) で、その値を回答に開示
-    させるために使う。
+    モデルが知識から定数を補う (例: クエリにも会話にも無い換算率を持ち出す) と、
+    ツールは「正しく計算された嘘」を返してしまう。式に現れる数値リテラルが
+    クエリまたは ``context`` 中に文字列として存在するかを見て、説明できない値を
+    返す。``context`` を許すのは、会話で一度提示された数値は「対話に書かれた
+    事実」であってモデルの想像ではないため。空タプルなら式は接地している。
+    真偽ではなく **どの値が説明できないか** を返すのは、式を捨てずに実行する
+    経路でその値を回答に開示させるため (``_suppress_ungrounded_calculate``)。
     """
     known = _known_numbers(query) | _known_numbers(context)
     known.update(_UNIT_SYSTEM_CONSTANTS)

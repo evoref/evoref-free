@@ -23,6 +23,25 @@ logger = get_logger("api.component_reload")
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 
+def follow_embedder_rebind(state: "AppState") -> None:
+    """embedder の差し替えにツール判定器 (kNN ゲート) を追随させる。
+
+    ``state.embedder`` を差し替える経路 (config API の再生成 / model migrate の
+    rebind) は、``ToolCallJudge`` と ``ToolGateKNN`` が構築時の参照と旧モデル空間の
+    exemplar ベクトルを握ったままにしていた (次元が同じなら縮退にも掛からず投票
+    だけが狂う)。参照を差し替えて exemplar を捨て、再 warmup は背景で行う。
+    """
+    judge = getattr(state, "tool_call_judge", None)
+    if judge is None:
+        return
+    judge.rebind_embedder(state.embedder)
+    if state.embedder is None:
+        return
+    import asyncio
+
+    asyncio.create_task(judge.warmup_tool_gate(), name="tool_gate_rewarmup")
+
+
 async def reload_embedder(state: AppState) -> None:
     """embedding セクション変更時に embedder を再生成して差し替える"""
     from backend.free.rag.embedding_factory import create_embedding_backend
@@ -49,6 +68,7 @@ async def reload_embedder(state: AppState) -> None:
     except Exception as e:
         logger.error("Failed to reload embedder: %s", e)
         state.embedder = None
+    follow_embedder_rebind(state)
 
     # 次元整合性を再評価
     try:

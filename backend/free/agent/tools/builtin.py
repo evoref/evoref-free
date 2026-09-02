@@ -15,11 +15,12 @@ from backend.free.core.system_info import (
     format_runtime_facts,
 )
 from backend.free.llm.utils import extract_content
-from backend.i18n_helper import prose_language_name
+from backend.i18n_helper import msg, prose_language_name
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
     from backend.free.history.history_manager import HistoryManager
+    from backend.free.llm.aux_client import AuxClient
     from backend.free.llm.local_client import LocalClient
 
 logger = get_logger("agent.tools.builtin")
@@ -105,7 +106,39 @@ from backend.free.constants import (
 )
 
 
-def _make_summarize(client: LocalClient):
+async def _generate_for_tool(
+    client: LocalClient,
+    aux_client: AuxClient | None,
+    messages: list[dict],
+    *,
+    temperature: float,
+    purpose: str,
+) -> str:
+    """LLM 委譲ツールの生成本体。
+
+    補助タスクの規約 (CLAUDE.md §6 #1 / docs/c_14) に従い ``AuxClient`` 経由で
+    専有スロットを使う (purpose 別タイムアウト・較正・debug ログが乗る)。
+    ``aux_client`` が無い (base 未接続で degraded) 場合だけ従来どおり
+    ``LocalClient`` の background_slot を直接叩く。
+    """
+    if aux_client is not None:
+        result = await aux_client.generate(
+            messages, temperature=temperature,
+            # 上限を渡さないと n_ctx を使い切るまで生成し、実行タイム
+            # アウトに必ず当たる (LLM_TOOL_MAX_TOKENS の説明を参照)。
+            max_tokens=LLM_TOOL_MAX_TOKENS,
+            purpose=purpose,
+        )
+    else:
+        result = await client.generate(
+            messages, stream=False, temperature=temperature,
+            max_tokens=LLM_TOOL_MAX_TOKENS,
+            id_slot=client.background_slot,
+        )
+    return extract_content(result)
+
+
+def _make_summarize(client: LocalClient, aux_client: AuxClient | None = None):
     """summarize ツールハンドラを生成（LocalClient をクロージャでバインド）"""
 
     async def summarize(text: str) -> str:
@@ -118,14 +151,10 @@ def _make_summarize(client: LocalClient):
             {"role": "user", "content": f"Summarize the following text:\n\n{text}"},
         ]
         try:
-            result = await client.generate(
-                messages, stream=False, temperature=0.3,
-                # 上限を渡さないと n_ctx を使い切るまで生成し、実行タイム
-                # アウトに必ず当たる (LLM_TOOL_MAX_TOKENS の説明を参照)。
-                max_tokens=LLM_TOOL_MAX_TOKENS,
-                id_slot=client.background_slot,
+            return await _generate_for_tool(
+                client, aux_client, messages,
+                temperature=0.3, purpose="tool_summarize",
             )
-            return extract_content(result)
         except Exception as e:
             logger.error("summarize tool failed: %s", e)
             return f"Error: {e}"
@@ -133,7 +162,7 @@ def _make_summarize(client: LocalClient):
     return summarize
 
 
-def _make_translate(client: LocalClient):
+def _make_translate(client: LocalClient, aux_client: AuxClient | None = None):
     """translate ツールハンドラを生成（LocalClient をクロージャでバインド）"""
 
     async def translate(text: str, target_lang: str) -> str:
@@ -156,14 +185,10 @@ def _make_translate(client: LocalClient):
             {"role": "user", "content": f"Translate the following text to {target_lang}:\n\n{text}"},
         ]
         try:
-            result = await client.generate(
-                messages, stream=False, temperature=0.3,
-                # 上限を渡さないと n_ctx を使い切るまで生成し、実行タイム
-                # アウトに必ず当たる (LLM_TOOL_MAX_TOKENS の説明を参照)。
-                max_tokens=LLM_TOOL_MAX_TOKENS,
-                id_slot=client.background_slot,
+            return await _generate_for_tool(
+                client, aux_client, messages,
+                temperature=0.3, purpose="tool_translate",
             )
-            return extract_content(result)
         except Exception as e:
             logger.error("translate tool failed: %s", e)
             return f"Error: {e}"
@@ -171,7 +196,7 @@ def _make_translate(client: LocalClient):
     return translate
 
 
-def _make_draft_document(client: LocalClient):
+def _make_draft_document(client: LocalClient, aux_client: AuxClient | None = None):
     """draft_document ツールハンドラを生成（LocalClient をクロージャでバインド）"""
 
     async def draft_document(instruction: str, format: str = "markdown") -> str:
@@ -192,14 +217,10 @@ def _make_draft_document(client: LocalClient):
             {"role": "user", "content": instruction},
         ]
         try:
-            result = await client.generate(
-                messages, stream=False, temperature=0.7,
-                # 上限を渡さないと n_ctx を使い切るまで生成し、実行タイム
-                # アウトに必ず当たる (LLM_TOOL_MAX_TOKENS の説明を参照)。
-                max_tokens=LLM_TOOL_MAX_TOKENS,
-                id_slot=client.background_slot,
+            return await _generate_for_tool(
+                client, aux_client, messages,
+                temperature=0.7, purpose="tool_draft_document",
             )
-            return extract_content(result)
         except Exception as e:
             logger.error("draft_document tool failed: %s", e)
             return f"Error: {e}"
@@ -240,7 +261,9 @@ def _make_run_command_readonly(config: dict):
                 "Readonly command rejected (%s): %s", reject, command[:100],
             )
             return f"Error: readonly violation: {reject}"
-        return await run_command(command, timeout, config)
+        # chat の環境問い合わせに居残るプロセスは無い。タイムアウトしたら kill
+        # して communicate() のスレッドも回収する (shell.run_command 参照)。
+        return await run_command(command, timeout, config, kill_on_timeout=True)
 
     return wrapped
 
@@ -314,11 +337,15 @@ def _boundary_turns_answer(
         user_turns[-_POSITIONAL_TURN_LIMIT:] if tail
         else user_turns[:_POSITIONAL_TURN_LIMIT]
     )
-    where = "最後" if tail else "最初"
+    where = msg(
+        "agent.boundary_turns.last" if tail else "agent.boundary_turns.first",
+    )
     lines = [
         SEARCH_HISTORY_CURRENT_SESSION_HEADER,
-        f"[この会話の{where}の user 発話 {len(picked)} 件 "
-        f"(全 {len(session.turns)} ターン中)]",
+        msg(
+            "agent.boundary_turns.header",
+            where=where, count=len(picked), total=len(session.turns),
+        ),
     ]
     for idx, turn in picked:
         content = (turn.get("content") or "").strip()
@@ -436,8 +463,13 @@ def register_builtin_tools(
     config: dict | None = None,
     local_client: LocalClient | None = None,
     history_manager: HistoryManager | None = None,
+    aux_client: AuxClient | None = None,
 ) -> None:
-    """ビルトインツールをレジストリに一括登録"""
+    """ビルトインツールをレジストリに一括登録
+
+    ``aux_client`` は LLM 委譲ツール (summarize / translate / draft_document)
+    の生成経路。``None`` (degraded) なら ``local_client`` を直接使う。
+    """
     cfg = config or {}
 
     registry.register(
@@ -651,7 +683,7 @@ def register_builtin_tools(
     if local_client is not None:
         registry.register(
             name="summarize",
-            func=_make_summarize(local_client),
+            func=_make_summarize(local_client, aux_client),
             description="Summarize the given text concisely",
             parameters={
                 "text": {"type": "string", "description": "Text to summarize"},
@@ -662,7 +694,7 @@ def register_builtin_tools(
 
         registry.register(
             name="translate",
-            func=_make_translate(local_client),
+            func=_make_translate(local_client, aux_client),
             description="Translate text to a target language",
             parameters={
                 "text": {"type": "string", "description": "Text to translate"},
@@ -674,7 +706,7 @@ def register_builtin_tools(
 
         registry.register(
             name="draft_document",
-            func=_make_draft_document(local_client),
+            func=_make_draft_document(local_client, aux_client),
             description="Generate a document based on instructions",
             parameters={
                 "instruction": {"type": "string", "description": "Instructions for document generation"},

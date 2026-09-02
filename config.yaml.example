@@ -998,6 +998,8 @@ agent:
   tool_judge_enabled: true               # 最終層のベースモデル文法制約ツール分類。false で決定論層のみに縮退
   meta_cognitive_enabled: true           # Meta-Cognitive 層（計画+多段推論+ツールループ）の有効/無効
   meta_cognitive_min_budget: 512         # Meta-Cognitive 発動に必要な最小ループ予算（トークン数）
+  max_tool_iterations: 5                 # Meta-Cognitive の 1 タスク内ツール実行ループ上限（タスク数の上限ではない）
+  retry_failed_writes: true              # 失敗した書き込みタスクを 1 回だけリトライする（false でリトライしない）
   reactive_light_enabled: true           # reactive 分類かつルール即応に該当しないクエリを、tool 判定で tool 不要なら base 1 ターンの軽量パスで応答（false で常に deliberative）
   # 軽量パスでも [関連する記憶] を注入する (検索パイプラインは走らせない)。
   # 層の切り替えを「崖」にしないためのスイッチ。軽量パスは以前 RAG・SemMem・
@@ -1010,12 +1012,14 @@ agent:
   # ツールの出力本文を渡さない (ファイルの中身に書かれたパスが実行に化けるのを防ぐ)。
   # 計画が要る一般的な連鎖は meta_cognitive の担当。
   deliberative_max_tool_hops: 2
-  # ── ネイティブ tool calling (補助タスク非常駐時の代替、docs/c_14 §1.3) ──
-  # 撃てないため、ベースモデル自身の OAI tool calling でツールを選ばせる。
-  # 決定論プリゲート (ツールパターン / パス / URL / ディレクトリ列挙) を通った
-  # ターンだけ tools を載せるので、雑談ターンのコストは増えない。
-  # tools 非対応の llama-server build / chat template では初回 4xx で自動的に
-  # 無効化される (毎ターン 4xx を踏まない)。
+  # ── 文法制約ツール分類器 (docs/c_14 §1.3) ──
+  # 決定論層がすべて外れたとき、ベースモデル自身にツールを選ばせる最終層。
+  # 選ばせ方は OAI tools ではなく response_format (json_schema) の enum 分類。
+  # tools は 200 で受理されてもモデルが tool_call を出さず本文を書き始め、
+  # max_tokens を使い切る実測があるため採用しない。json_schema は llama-server
+  # 側の GBNF 制約なので必ず従い、出力トークン数の上限が読める。
+  # 決定論プリゲートを通ったターンだけ発火するので雑談ターンのコストは増えない。
+  # response_format 非対応の build では初回 4xx で自動的に無効化される。
   # 分類器を撃つかどうかの門。従来の正規表現ゲートは実クエリ137件のベンチで
   # recall 66.2%（ツールが要るクエリの3分の1を取りこぼし）。埋め込み exemplar
   # 近傍なら k=5 の leave-one-out で recall 98.5%。precision は 84.9%→81.7% と

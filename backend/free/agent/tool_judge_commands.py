@@ -15,7 +15,17 @@ from pathlib import Path
 
 from backend.free.agent.safety_patterns import reject_readonly_violation
 from backend.free.agent.tool_judge_grounding import _numeric_literals
-from backend.free.core.intent_vocab import DATETIME_QUERY_RE, is_plain_statement
+from backend.free.core.intent_vocab import (
+    CPU_HARDWARE_TERM,
+    DATETIME_QUERY_RE,
+    ENV_VAR_TERMS,
+    NETWORK_IDENTITY_TERMS,
+    OS_QUERY_TERMS,
+    PAST_RECALL_TAIL_RE,
+    PYTHON_VERSION_TERMS,
+    STORAGE_SPEC_TERMS,
+    is_plain_statement,
+)
 from backend.log_config import get_logger
 
 logger = get_logger("agent.tool_call_judge")
@@ -335,21 +345,6 @@ _YEAR_REMAINDER_RE = re.compile(
 )
 
 
-def _iter_absolute_dates(query: str) -> list[tuple[int, int, int]]:
-    """クエリ中の実在する絶対日付 (年月日が揃ったもの) を出現順に返す。"""
-    found: list[tuple[int, int, int]] = []
-    for m in _ABSOLUTE_DATE_RE.finditer(query or ""):
-        parts = m.groups()
-        triple = parts[:3] if parts[0] is not None else parts[3:]
-        try:
-            year, month, day = (int(v) for v in triple)
-            datetime.date(year, month, day)
-        except (TypeError, ValueError):
-            continue
-        found.append((year, month, day))
-    return found
-
-
 #: ``_iter_query_dates`` が返す 1 件。``year`` が ``None`` なら年が書かれて
 #: いない日付で、コマンド側では ``n.year`` (実行時の年) で埋める。
 #: ``start`` はクエリ内の出現位置 (相対オフセットの基点判定に使う)。
@@ -527,11 +522,9 @@ def _day_count_command(query: str) -> str:
 #: 抑止は **now-only コマンドに落ちる分岐だけ** に掛ける。絶対日付
 #: (「1987年3月14日は何曜日でしたか？」) や相対日付 (「3年前の今日は何曜日
 #: でしたか？」) は過去形でも計算が要るため、従来どおり撃つ。
-_PAST_RECALL_TAIL_RE = re.compile(
-    r"でした(?:か|っけ)|だった(?:か|っけ)|だっけ"
-    r"|(?:と)?(?:言|いい|伝え|教え)(?:い?ました|った)"
-    r"|覚えて(?:い|ま|る)",
-)
+#: 語彙は core.intent_vocab が SSOT (``tool_judge_history`` の既出対象の
+#: 尋ね直し判定と同じ文末形)。後方互換で旧名を残す。
+_PAST_RECALL_TAIL_RE = PAST_RECALL_TAIL_RE
 
 #: 「現在」を指す語。1 つでもあれば now-only コマンドを抑止しない。
 #: ``いま`` / ``きょう`` は 2 文字の部分文字列で、無関係な語に埋もれる
@@ -688,15 +681,11 @@ _EXECUTABLE_QUERY_COMMANDS: list[tuple[re.Pattern, "str | Callable[[str], str]"]
     # 「Python の GIL があることで、CPU バウンド処理と I/O バウンド処理で
     # スレッドの効果がどう違うのか、簡潔に説明してください。」という純粋な
     # 知識質問で OS/CPU/コア数/ディスクの取得コマンドが撃たれ、無関係な実測値が
-    # 「唯一の事実根拠」枠で base に渡された。層1 の知識質問ゲートは
-    # ``_query_has_tool_signal`` が True になるため到達できず、この層より後段に
-    # あるため構造的に救済不能。
+    # 「唯一の事実根拠」枠で base に渡された。
+    # 語彙は core.intent_vocab が SSOT。ここは **メモリ / GPU 系
+    # (``MEMORY_SPEC_TERMS``) を意図的に載せない** 唯一の消費側 (上記の理由)。
     (re.compile(
-        r"(?:スペック|(?<![A-Za-z])CPU(?![A-Za-z])(?!\s*[-‐-—]?\s*(?:bound|バウンド|集約))"
-        r"|ディスク|(?:空き|残り|使用)容量|ストレージ|ドライブ"
-        r"|(?<![A-Za-z])disk(?![A-Za-z])|(?<![A-Za-z])storage(?![A-Za-z])"
-        r"|(?<![A-Za-z])specs?(?![A-Za-z])"
-        r"|(?<![A-Za-z])drive(?![A-Za-z]))",
+        f"(?:{STORAGE_SPEC_TERMS}|{CPU_HARDWARE_TERM})",
         re.IGNORECASE,
     ), _build_spec_command),
     # GPU / VRAM のエントリは 2026-07-25 に削除した。
@@ -711,9 +700,7 @@ _EXECUTABLE_QUERY_COMMANDS: list[tuple[re.Pattern, "str | Callable[[str], str]"]
     # 会話履歴と LLM 知識に委ねる (そちらの方が誤答が少ない)。
     # IP アドレス / ホスト名
     (re.compile(
-        r"(?:IP\s*アドレス|ホスト名"
-        r"|(?<![A-Za-z])hostname(?![A-Za-z])"
-        r"|(?<![A-Za-z])ip\s*address)",
+        f"(?:{NETWORK_IDENTITY_TERMS})",
         re.IGNORECASE,
     ), "python -c \""
        "import socket;"
@@ -723,10 +710,7 @@ _EXECUTABLE_QUERY_COMMANDS: list[tuple[re.Pattern, "str | Callable[[str], str]"]
        "\""),
     # OS
     (re.compile(
-        r"(?:(?<![A-Za-z])OS(?![A-Za-z])|オペレーティングシステム"
-        r"|(?<![A-Za-z])Windows(?![A-Za-z])"
-        r"|(?<![A-Za-z])Linux(?![A-Za-z])"
-        r"|(?<![A-Za-z])Mac(?![A-Za-z]))",
+        f"(?:{OS_QUERY_TERMS})",
         re.IGNORECASE,
     ), "python -c \""
        "import platform,sys;"
@@ -735,13 +719,12 @@ _EXECUTABLE_QUERY_COMMANDS: list[tuple[re.Pattern, "str | Callable[[str], str]"]
        "\""),
     # Python バージョン
     (re.compile(
-        r"(?:Python|python)\s*(?:バージョン|version)",
+        f"(?:{PYTHON_VERSION_TERMS})",
         re.IGNORECASE,
     ), "python --version"),
     # 環境変数
     (re.compile(
-        r"(?:環境変数|(?<![A-Za-z])env(?![A-Za-z])"
-        r"|(?<![A-Za-z])PATH(?![A-Za-z]))",
+        f"(?:{ENV_VAR_TERMS})",
         re.IGNORECASE,
     ), "python -c \""
        "import os;"

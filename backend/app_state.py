@@ -21,6 +21,7 @@ from fastapi import Request
 from backend.log_config import DevelopLevel
 
 if TYPE_CHECKING:
+    import asyncio
     from collections.abc import Callable
 
     from backend.debug_logger import DebugLogger
@@ -44,7 +45,6 @@ if TYPE_CHECKING:
     from backend.free.memory.semantic.store import SemanticFactStore
     from backend.free.memory.stores.short_term import ShortTermMemory
     from backend.free.memory.stores.working import WorkingMemory
-    from backend.free.memory.views.mem import MemFactView
     from backend.free.rag.judge_usage_tracker import JudgeUsageTracker
     from backend.free.rag.embedding_backend import EmbeddingBackend
     from backend.free.rag.lazy_contextual import LazyContextualPrefixService
@@ -139,10 +139,6 @@ class AppState:
     # ``check()`` は使わず ``record`` / ``get_session_count`` / ``reset_session``
     # のみ利用する。
     conflict_judge_tracker: "JudgeUsageTracker | None" = None
-    # URL/executable_command の embedding リコールで
-    # 共有する global scope の MemFactView。``_init_tools`` のローカル変数を
-    # 他の呼出元 (search_pipeline.py) でも再利用するため state に昇格。
-    mem_view: "MemFactView | None" = None
     # 埋め込みモデルとストアの次元不一致フラグ
     embedding_dim_mismatch: bool = False
     # 不一致時の参考情報（fronend のバナー表示用）
@@ -233,6 +229,11 @@ class AppState:
     # develop=evolve 時のみ稼働する LogIngestor → PolicyAdjuster
     # ブリッジタスク。lifespan shutdown で cancel + flush_all される。
     log_ingestor_bridge_task: "Any | None" = None
+
+    # 起動時に fire-and-forget で張る背景タスク (tool gate warmup /
+    # fewshot 埋め込み backfill 等) の参照。イベントループは弱参照しか
+    # 持たないので、参照を保持しないと途中で GC される。完了時に自ら抜ける。
+    background_tasks: set["asyncio.Task[Any]"] = field(default_factory=set)
 
     # ── セッションレジストリ ──
     _active_sessions: dict[str, SessionInfo] = field(default_factory=dict)

@@ -6,10 +6,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import socket
 
 from ipaddress import ip_address
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from backend.log_config import get_logger
 
 from backend.free.agent.tools.html_text import (
@@ -39,10 +40,17 @@ _FETCH_URL_MAX_TEXT_CHARS = 8_000
 # 表はトークンが短く、メタ認知ループのツール結果として消費されるため、ベース LLM の
 # プリフィル懸念 (8000 制限の理由) は当てはまりにくい。
 _FETCH_URL_MAX_TEXT_CHARS_TABLE = 40_000
-def _validate_fetch_url(url: str, *, allow_private_ip: bool) -> str | None:
+#: リダイレクト扱いにするステータス。``follow_redirects=True`` に任せると
+#: 30x の Location 先 (127.0.0.1 / 169.254.169.254 等) が検証を通らずに
+#: 取得されるため、追跡は自前で行い各ホップを ``_validate_fetch_url`` に通す。
+_FETCH_URL_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
+async def _validate_fetch_url(url: str, *, allow_private_ip: bool) -> str | None:
     """fetch_url の URL を検証する。エラー時はユーザー向け文字列、安全なら None。
 
-    theme_installer.install_from_url の検証パターンをミラー。
+    theme_installer.install_from_url の検証パターンをミラー。名前解決は
+    イベントループの executor で行い、応答パスをブロックしない。
     """
     parsed = urlparse(url)
     if parsed.scheme not in _FETCH_URL_ALLOWED_SCHEMES:
@@ -52,7 +60,8 @@ def _validate_fetch_url(url: str, *, allow_private_ip: bool) -> str | None:
     if allow_private_ip:
         return None
     try:
-        resolved = socket.getaddrinfo(parsed.hostname, None)
+        loop = asyncio.get_running_loop()
+        resolved = await loop.getaddrinfo(parsed.hostname, None)
     except socket.gaierror as e:
         return f"Error: Failed to resolve hostname {parsed.hostname!r}: {e}"
     for _, _, _, _, sockaddr in resolved:
@@ -81,7 +90,7 @@ async def fetch_url(
     if not url:
         return "Error: URL is required"
 
-    err = _validate_fetch_url(url, allow_private_ip=allow_private_ip)
+    err = await _validate_fetch_url(url, allow_private_ip=allow_private_ip)
     if err:
         return err
 
@@ -90,24 +99,48 @@ async def fetch_url(
     body_bytes = bytearray()
     truncated = False
     encoding = "utf-8"
+    current_url = url
     try:
         async with _httpx.AsyncClient(
-            follow_redirects=True,
-            max_redirects=_FETCH_URL_MAX_REDIRECTS,
-            timeout=timeout,
+            follow_redirects=False,
+            timeout=_httpx.Timeout(timeout),
             headers={"User-Agent": _FETCH_URL_USER_AGENT},
         ) as client:
-            async with client.stream("GET", url) as r:
-                r.raise_for_status()
-                ctype = r.headers.get("content-type", "").lower()
-                if not any(ctype.startswith(p) for p in _FETCH_URL_TEXT_CONTENT_TYPE_PREFIXES):
-                    return f"Error: Unsupported content-type: {ctype or '(none)'}"
-                encoding = r.encoding or "utf-8"
-                async for chunk in r.aiter_bytes():
-                    body_bytes.extend(chunk)
-                    if len(body_bytes) >= _FETCH_URL_MAX_BYTES:
-                        truncated = True
-                        break
+            for _hop in range(_FETCH_URL_MAX_REDIRECTS + 1):
+                async with client.stream("GET", current_url) as r:
+                    location = r.headers.get("location")
+                    if r.status_code in _FETCH_URL_REDIRECT_STATUSES and location:
+                        next_url = urljoin(current_url, location)
+                        err = await _validate_fetch_url(
+                            next_url, allow_private_ip=allow_private_ip,
+                        )
+                        if err:
+                            logger.warning(
+                                "fetch_url redirect blocked: from=%s to=%s",
+                                _redact_url_for_log(current_url),
+                                _redact_url_for_log(next_url),
+                            )
+                            return err
+                        current_url = next_url
+                        continue
+                    r.raise_for_status()
+                    ctype = r.headers.get("content-type", "").lower()
+                    if not any(
+                        ctype.startswith(p)
+                        for p in _FETCH_URL_TEXT_CONTENT_TYPE_PREFIXES
+                    ):
+                        return f"Error: Unsupported content-type: {ctype or '(none)'}"
+                    encoding = r.encoding or "utf-8"
+                    async for chunk in r.aiter_bytes():
+                        body_bytes.extend(chunk)
+                        if len(body_bytes) >= _FETCH_URL_MAX_BYTES:
+                            truncated = True
+                            break
+                    break
+            else:
+                return (
+                    f"Error: Too many redirects (limit {_FETCH_URL_MAX_REDIRECTS})"
+                )
     except Exception as e:
         logger.warning("fetch_url failed: url=%s err=%r", _redact_url_for_log(url), e)
         return f"Error fetching URL ({type(e).__name__}): {e}"

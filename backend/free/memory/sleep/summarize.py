@@ -24,6 +24,9 @@ if TYPE_CHECKING:
 
 logger = get_logger("memory.sleep.summarize")
 
+#: 要約プロンプトへ載せるターン数 (末尾から)。
+_SUMMARY_TURN_WINDOW = 20
+
 
 async def summarize_unsummarized_sessions(
     llm_client: Any,
@@ -41,7 +44,7 @@ async def summarize_unsummarized_sessions(
     2. インデックスから ``summary is None`` のセッションを順次取得
        (1 サイクルあたり ``batch_size`` 件まで)。
     3. LLM に「以下の会話を 1-2 文で要約してください」プロンプトを投げ、
-       先頭 20 ターン (各 200 文字まで) を入力とする。
+       末尾 20 ターン (各 200 文字まで) を入力とする。
     4. 生成された要約をセッションオブジェクトに保存し、続けて embedder で
        埋め込みベクトルを作り ``summary_embedding`` に格納する。
     5. :meth:`HistoryManager.save_session` で永続化、インデックス更新。
@@ -88,9 +91,12 @@ async def summarize_unsummarized_sessions(
         if session is None or not session.turns:
             continue
 
+        # 入力は **末尾** の 20 ターン。先頭 20 ターン固定だと、再要約の条件
+        # (会話が伸びた) を満たしても入力が変わらず、20 ターン目以降の訂正は
+        # 要約に決して載らなかった (2026-09-02 監査 H7)。
         turns_text = "\n".join(
             f"{t.get('role', 'user')}: {t.get('content', '')[:200]}"
-            for t in session.turns[:20]
+            for t in session.turns[-_SUMMARY_TURN_WINDOW:]
         )
         try:
             result = await llm_client.generate(
