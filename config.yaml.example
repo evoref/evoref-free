@@ -704,6 +704,14 @@ memory:
     # 同じスロットに同居して偽の競合になる。実測では真の競合 0.796〜0.963 /
     # 偽の競合 0.316〜0.418 で完全に分離する。0 で無効。
     attribute_similarity_threshold: 0.55
+    # 同じ属性が別スロットへ分散した世代を sleep-time で 1 値へ寄せる。
+    # _detect_groups は (subject, predicate) の厳密一致でしか束ねないため、
+    # 「好きな飲み物」が mem.personal.beverage / mem.preference.beverage /
+    # mem.personal.user / mem.preference.user の 4 スロットへ散ると歴代の値が
+    # すべて live のまま注入される (2026-08-22 ライブ監査で実測)。注入側は
+    # 毎ターン 1 値へ寄せているが結果を書き戻していなかったため、同じ計算を
+    # 全ターン永久にやり直していた。false で従来どおり読み出し側のみ。
+    cross_slot_collapse: true
     # pending 競合のチャット提示。未解決の競合を [記憶の競合] セクションとして
     # プロンプトへ連結し、AI が会話の流れでユーザーに確認できるようにする。
     # ユーザー回答の LLM 判定 (旧 conflict_chat_judge) は 2026-08-14 に撤去済で、
@@ -823,6 +831,15 @@ memory:
     model: 1000                   # モデル能力プローブ由来のファクト
     enforcement: hard             # hard | soft (soft は削除しない計測専用)
     gc_strategy: lowest_score     # 削除戦略 (現在は lowest_score のみ)
+    # supersede 済みファクトの保持日数 (0 で無効 = 従来どおり永久保持)。
+    # 上の type 別上限は active ファクトにしか効かず (GC は
+    # include_superseded=False しか見ない)、compact も supersede 済みを
+    # 落とさないため、回収経路が 1 つも無かった。実測 (2026-09-01 実ストア):
+    # global 25.5% / project 48.0% が supersede 済みで、vectors.npy 側でも
+    # 29% が死んだ行として search_by_embedding のソート対象に入っていた。
+    # 訂正の由来を追える期間は残しつつ無限成長を止める。他ファクトの
+    # supersedes から参照されているものは対象外 (鎖を切らない)。
+    superseded_retention_days: 90
   # --- プロジェクトアーカイブ ---
   # 指定日数アクセスのないプロジェクトを semantic/archive/ に物理移動する
   # (自動削除はしない)。0 で無効化。

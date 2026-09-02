@@ -15,6 +15,10 @@ from __future__ import annotations
 
 import hashlib
 import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from backend.free.memory.stores.short_term import MemoryNote
 
 #: プロンプトへ載せる質問の最大文字数。
 QUERY_PROMPT_LIMIT = 1000
@@ -29,6 +33,30 @@ def truncate_for_prompt(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "...(truncated)"
+
+
+def public_notes(notes: list["MemoryNote"]) -> list["MemoryNote"]:
+    """private セッション由来のノートを落とす (純粋関数)。
+
+    private ターンは ``memory_only`` で動き、LTM / SemMem への昇格をしない契約
+    (``config.yaml`` の ``memory.private``)。Step 8 の抽出器はこれを
+    ``extractors/base.py`` の ``if note.private: skip`` で守っているが、後から
+    足された Step 8.4 / 8.5 / 8.6 の 3 キュレーターは **同じ
+    ``short_term.notes.values()`` を受け取りながら同じガードを持っていなかった**。
+
+    実害 (2026-09-01 監査で再現): private ターンで実行した
+    ``run_command_readonly`` が ``mem.world.executable_command.chat.<digest>`` の
+    ``world_fact`` として書き込まれ、しかも生成側が ``private`` を引き継がない
+    ため ``fact.private=False`` になる。``MemoryInjector._classify_fact`` の
+    ``if fact.private: return None`` にも掛からず、``ToolCallJudge`` の
+    コマンドリコールが **後続の通常セッションから引き当てる**。漏れる中身は
+    private ターンで踏んだ URL・実行したコマンド文字列・そのときの質問文。
+
+    3 キュレーターが各々ガードを書くと 4 度目の抜けを作るので、ここを SSOT に
+    して全員が入口で必ず通す。呼出側 (``sleep_update``) も渡す前に落とす
+    (二重防御)。
+    """
+    return [n for n in notes if not getattr(n, "private", False)]
 
 
 def subject_digest(normalized: str) -> str:

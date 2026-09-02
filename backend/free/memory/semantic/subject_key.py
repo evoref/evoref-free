@@ -214,6 +214,14 @@ def is_generic_subject(subject: str) -> bool:
     その発話の **影** であり、影の元 (同じノートから起きた固有スロットの
     ファクト) が supersede されたら一緒に畳む必要がある
     (:meth:`SemanticFactStore._supersede_generic_shadows`)。
+
+    .. note::
+       上位の SSOT は :func:`backend.free.memory.attribute_key.is_generic_slot`
+       で、そちらが本関数の別名。``subject_key`` は ``attribute_key`` に
+       依存しない下位モジュールなので実体をここに置く (import の向きは
+       ``attribute_key`` → ``subject_key`` の一方向)。「属性名ではない末尾」
+       (:data:`~backend.free.memory.attribute_key.NON_ATTRIBUTE_TAILS`) は
+       これより広い集合で、別の判断に使う — 混同しないこと。
     """
     parts = (subject or "").split(".")
     return (

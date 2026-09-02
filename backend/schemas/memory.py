@@ -223,6 +223,20 @@ class SemMemConflictConfig(BaseModel):
     # 実測では真の競合 0.796〜0.963 / 偽の競合 0.316〜0.418 で完全に分離する。
     # 0 で無効 (従来どおり subject+predicate だけで束ねる)。
     attribute_similarity_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
+    cross_slot_collapse: bool = True
+    """同じ属性が別スロットへ分散した世代を sleep-time で 1 値へ寄せるか。
+
+    ``_detect_groups`` は ``(subject, predicate)`` の厳密一致でしか束ねないため、
+    同じ実世界の属性が別の名前空間へ散ると取り逃す。実測 (2026-08-22 ライブ監査
+    2 回目、実ストア): 「好きな飲み物」が ``mem.personal.beverage`` /
+    ``mem.preference.beverage`` / ``mem.personal.user`` /
+    ``mem.preference.user`` の 4 スロットへ散り、歴代 4 世代がすべて live の
+    まま注入されていた。
+
+    注入側 (``MemoryInjector._collapse_by_attribute``) は毎ターンこれを 1 値へ
+    寄せているが結果をストアへ書き戻さないため、同じ計算を全ターン永久に
+    やり直していた。``false`` にすると従来どおり読み出し側の畳み込みだけになる。
+    """
     chat_review: ConflictChatReviewConfig = Field(
         default_factory=ConflictChatReviewConfig,
     )
@@ -383,6 +397,23 @@ class SemMemLimitsConfig(BaseModel):
     model: int = Field(default=1000, ge=0)
     enforcement: Literal["hard", "soft"] = "hard"
     gc_strategy: Literal["lowest_score"] = "lowest_score"
+    superseded_retention_days: float = Field(default=90.0, ge=0.0)
+    """supersede 済みファクトを保持する日数 (0 で無効 = 従来どおり永久保持)。
+
+    上の type 別上限は **active ファクトにしか効かない** (GC は
+    ``search_by_type()`` の既定 ``include_superseded=False`` しか見ず、
+    ``select_gc_candidates`` もさらに ``not f.superseded_by`` で絞る)。
+    ``compact`` も同一 id の重複行を畳むだけで supersede 済みは落とさない。
+    つまり回収経路が 1 つも無く、メモリ上の ``_facts`` にも ``facts.jsonl``
+    にも ``vectors.npy`` にも永久に残っていた。
+
+    実測 (2026-09-01、実ストア): global は live 70 / superseded 24 (25.5%)、
+    project は live 77 / superseded 71 (48.0%)。npy 108 行のうち 31 行が
+    supersede 済み分で、``search_by_embedding`` が毎回ソート対象に含めていた。
+
+    訂正の由来を追える期間は残しつつ無限成長を止める。他のファクトの
+    ``supersedes`` から参照されているものは対象外 (鎖を切らない)。
+    """
 
     def limit_for(self, fact_type: str) -> int | None:
         """``fact_type`` の上限を返す。未定義 type は ``None``。"""

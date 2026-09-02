@@ -537,6 +537,11 @@ def _collect_retired_note_ids(state, project_id: str | None) -> set[str]:
     履歴そのものは消さない — ``search_history`` や会話履歴ファイルからは
     従来どおり辿れる。ここで止めるのは「現在値として黙って提示する」経路
     だけ。
+
+    **ストアの世代番号でキャッシュする。** この走査は全ファクト × 全
+    provenance で、チャット 1 ターンごとに scope の数だけ走る。ストアは
+    プロセス常駐なので、書込 (= sleep-time) が無い間は結果が変わらない。
+    ``SemanticFactStore.revision`` が動いたときだけ作り直す。
     """
     retired: dict[str, bool] = {}
     for scope in ("global", f"project:{project_id}" if project_id else None):
@@ -544,18 +549,65 @@ def _collect_retired_note_ids(state, project_id: str | None) -> set[str]:
             continue
         try:
             store = state.get_semantic_store(scope)
-            all_facts = store.all_facts(include_superseded=True)
         except Exception:
             continue
-        for fact in all_facts:
-            is_retired = bool(getattr(fact, "superseded_by", None))
-            for prov in getattr(fact, "provenances", ()) or ():
-                note_id = getattr(prov, "note_id", None)
-                if not note_id:
-                    continue
-                # live が 1 つでもあれば False で確定させる。
-                retired[note_id] = retired.get(note_id, True) and is_retired
+        cached = _retired_note_ids_for_store(store)
+        if cached is None:
+            continue
+        for note_id, only_retired in cached.items():
+            retired[note_id] = retired.get(note_id, True) and only_retired
     return {note_id for note_id, only_retired in retired.items() if only_retired}
+
+
+#: ``_collect_retired_note_ids`` のストア別キャッシュ。
+#: ``id(store) -> (revision, {note_id: そのノート由来のファクトが全部 supersede 済みか})``
+#: ストアはプロセス常駐なので ``id()`` は寿命の間安定する。
+_RETIRED_NOTE_CACHE: dict[int, tuple[int, dict[str, bool]]] = {}
+
+
+def _retired_note_ids_for_store(store) -> dict[str, bool] | None:
+    """1 ストア分の ``{note_id: 全部 supersede 済みか}`` を返す (revision キャッシュ)。"""
+    try:
+        revision = int(store.revision)
+    except Exception:
+        revision = -1
+    key = id(store)
+    hit = _RETIRED_NOTE_CACHE.get(key)
+    if hit is not None and hit[0] == revision and revision >= 0:
+        return hit[1]
+    try:
+        all_facts = store.all_facts(include_superseded=True)
+    except Exception:
+        return None
+    computed: dict[str, bool] = {}
+    for fact in all_facts:
+        is_retired = bool(getattr(fact, "superseded_by", None))
+        for prov in getattr(fact, "provenances", ()) or ():
+            note_id = getattr(prov, "note_id", None)
+            if not note_id:
+                continue
+            # live が 1 つでもあれば False で確定させる。
+            computed[note_id] = computed.get(note_id, True) and is_retired
+    if revision >= 0:
+        _RETIRED_NOTE_CACHE[key] = (revision, computed)
+    return computed
+
+
+def _semmem_embeddings_are_stale() -> bool:
+    """SemMem ファクトの埋め込みが embed モデル切替で stale になっているか。
+
+    ``stale_guard`` のマーカー (``.reembed_facts_required``) を見る。判定に
+    失敗したら ``False`` (= 従来どおり注入する) — マーカーの読み取り失敗で
+    記憶を止める方が害が大きい。
+    """
+    try:
+        from backend.free.memory.semantic.stale_guard import (
+            is_semmem_reembed_required,
+        )
+
+        return is_semmem_reembed_required() is not None
+    except Exception:
+        return False
 
 
 def build_semmem_injection(
@@ -604,23 +656,44 @@ def build_semmem_injection(
         # 競合セクションも同じ理由で見送る。ゲートを掛けられないターンに
         # 出すと、クエリと無関係な矛盾がプロンプトへ入る。
         return None
+    if _semmem_embeddings_are_stale():
+        # embed モデルを替えた直後、ファクトのベクトルは旧モデル空間のまま
+        # 残る。関連度ゲートはこれを 2 通りに壊す — 次元が違えば形の不一致で
+        # 素通し (= 全店注入)、次元が同じで空間だけ違えばコサインが雑音に
+        # なって全件却下 (実測 2026-09-01: 通過率 0.00%)。閾値の較正
+        # (threshold_mode: auto) はスケールずれしか救えず、空間のずれには
+        # 効かない。どちらへ倒れるか予測できない以上、再 embed が済むまでは
+        # **注入しない** のが唯一の安全側 (履歴検索や RAG は従来どおり動く)。
+        logger.warning(
+            "semmem injection skipped: fact embeddings are stale after an "
+            "embed model change; the relevance gate cannot be trusted. "
+            "Run 'reembed-facts --apply' (or POST /api/model/reembed-facts).",
+        )
+        return None
     try:
         from backend.free.memory.pipeline.injector import MemoryInjector
 
         _, stm, _ = mem_sys
         facts: list = []
+        # 関連度スコアは埋め込み行列を持つストア側で 1 回の積として求める。
+        # 候補ごとに正規化し直すと N=10000 で 52.5ms、常駐行列なら 1.5ms
+        # (MemoryInjector._relevance_scores の実測)。
+        fact_scores: dict[str, float] = {}
         pid = state.current_project_id
         for scope in ("global", f"project:{pid}" if pid else None):
             if scope is None:
                 continue
             try:
-                facts.extend(
-                    state.get_semantic_store(scope).all_facts(
-                        include_superseded=False,
-                    ),
-                )
+                store = state.get_semantic_store(scope)
+                facts.extend(store.all_facts(include_superseded=False))
             except Exception:
                 continue
+            if query_vec is not None:
+                try:
+                    fact_scores.update(store.embedding_scores(query_vec))
+                except Exception:
+                    # スコアが取れなければ候補ごとの判定へ縮退するだけ。
+                    pass
         stm_notes = list(getattr(stm, "notes", {}).values())
         retired_note_ids = _collect_retired_note_ids(state, pid)
         if facts or stm_notes:
@@ -634,6 +707,7 @@ def build_semmem_injection(
                 session_user_texts=_session_user_texts(state),
                 query_text=query_text,
                 retired_note_ids=retired_note_ids,
+                fact_relevance_scores=fact_scores or None,
             )
             rendered = plan.render() or None
             if covered_attributes is not None:

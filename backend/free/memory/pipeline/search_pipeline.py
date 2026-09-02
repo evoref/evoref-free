@@ -746,6 +746,19 @@ async def unified_search(
 ) -> SearchResult:
     """統合検索パイプライン: Self-RAG + 3層メモリ
 
+    **SemMem はここでは検索しない。** 融合するのは STM / LTM / カートリッジの
+    3 層だけで、``semmem_stats`` はログ用の受け渡しにすぎない。SemMem が
+    プロンプトへ載る経路は ``chat_service.build_semmem_injection`` →
+    :class:`~backend.free.memory.pipeline.injector.MemoryInjector` の **完全に
+    別系統** (全件 + 関連度ゲート + Tier パッキング) で、RRF も top_k 融合も
+    通らない。2 系統に分かれているのは、SemMem が「属性スロットの現在値」を
+    扱うのに対し RAG は「チャンクの関連度」を扱うからで、順位付けとして混ぜる
+    対象ではない (2026-09-01 監査 F12 で設計書 §8 の記述を実装へ合わせた)。
+
+    層をまたぐ融合 (``_merge_results``) は **RRF ではない** — スコア降順の
+    マージ + 先勝ち dedup (``score_normalization`` を指定した場合は層内正規化を
+    挟む)。RRF は LTM 層の **内部** (``search_hybrid``) にのみある。
+
     判定はルールベース + ベクトル演算で完結する (LLM 呼び出しゼロ)。
     STM / LTM / カートリッジ検索を asyncio.gather で並列実行する。
     ``rag.fetch_multiplier`` が 2 以上の場合、LTM / カートリッジの取得件数を

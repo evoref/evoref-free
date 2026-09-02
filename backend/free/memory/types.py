@@ -136,7 +136,7 @@ class Provenance:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-@dataclass
+@dataclass(eq=False)
 class SemanticFact:
     """
 
@@ -144,6 +144,17 @@ class SemanticFact:
     (`global` / `project:<id>`) と `type` で物理分離・優先度制御する。
     `policy` / `failure_pattern` / `progress_marker` は統合された
     永続化先として用いられる。
+
+    ``eq=False`` (同一性比較) — ファクトは ``id`` で識別する設計なので値比較に
+    意味が無く、しかも ``embedding: np.ndarray`` を持つため生成される
+    ``__eq__`` は危険。dataclass の ``__eq__`` はフィールドのタプル比較で、
+    numpy 配列同士の比較は ``bool()`` で ``ValueError`` を投げる。
+
+    **旧実装が動いていたのは偶然**だった: 第 1 フィールドが ``id: str`` で、
+    id が違えばタプル比較がそこで False を返して打ち切られ ``embedding`` まで
+    到達しない。つまりフィールドの並び順が守っていただけで、``id`` を後ろへ
+    動かす / 別のフィールドを先頭に足す、といった無関係な変更で
+    ``list.index()`` や ``in`` が突然例外を投げるようになる (2026-09-01 監査)。
     """
 
     # ── 識別子・本体 ────────────────────────────────────────────────────
@@ -321,7 +332,9 @@ _KNOWN_FACT_KEYS: frozenset[str] = frozenset({
 })
 
 
-def serialize_fact(fact: SemanticFact) -> dict[str, Any]:
+def serialize_fact(
+    fact: SemanticFact, *, include_embedding: bool = True,
+) -> dict[str, Any]:
     """`SemanticFact` を JSON-serializable な dict に変換する。
 
     embedding は `tolist()` で list 化する。`session_ids` は set のため
@@ -330,6 +343,17 @@ def serialize_fact(fact: SemanticFact) -> dict[str, Any]:
 
     `_extra` に保持された未知フィールドはトップレベルに復元する。
     既知フィールドと同名キーを持つ場合は既知フィールド側を優先する
+
+    Args:
+        include_embedding: ``embedding`` をペイロードに含めるか。永続化
+            (``facts.jsonl``) では ``False`` を渡す — ベクトルの正は
+            ``embeddings/<model_id>/vectors.npy`` 側で、JSON へ二重に持つと
+            **実測でファイルの 92% がベクトルのテキスト表現** になる
+            (94 ファクトで 3.03MB、同じ 90 本の npy は 0.37MB)。しかも
+            ``facts.jsonl`` は追記式なので ``update_fact`` のたびに 1024 個の
+            float をもう 1 行足す。既定を ``True`` のままにしてあるのは、
+            export / デバッグダンプが従来どおり自己完結した dict を得られる
+            ようにするため。
     """
     # _extra を先に展開し、既知フィールドで上書きする (既知フィールド優先)。
     out: dict[str, Any] = dict(fact._extra)
@@ -353,7 +377,11 @@ def serialize_fact(fact: SemanticFact) -> dict[str, Any]:
         "supersedes": list(fact.supersedes),
         "requires_user_review": fact.requires_user_review,
         "review_status": fact.review_status,
-        "embedding": fact.embedding.tolist() if fact.embedding is not None else None,
+        "embedding": (
+            fact.embedding.tolist()
+            if include_embedding and fact.embedding is not None
+            else None
+        ),
         "created_at": fact.created_at,
         "accessed_at": fact.accessed_at,
         "access_count": fact.access_count,
@@ -428,13 +456,29 @@ def deserialize_fact(d: dict[str, Any]) -> SemanticFact:
     )
 
 
-def serialize_fact_jsonl(fact: SemanticFact) -> str:
-    """1 ファクトを JSONL 1 行 (改行無し) にエンコードする"""
-    return json.dumps(serialize_fact(fact), ensure_ascii=False)
+def serialize_fact_jsonl(
+    fact: SemanticFact, *, include_embedding: bool = False,
+) -> str:
+    """1 ファクトを JSONL 1 行 (改行無し) にエンコードする
+
+    **既定で ``embedding`` を書かない。** ベクトルの正は
+    ``embeddings/<model_id>/vectors.npy`` で、``facts.jsonl`` へ二重に持つ
+    意味は無い。読み戻しは ``SemanticFactStore._load`` が EmbeddingStore から
+    hydrate する。旧形式 (embedding 入り) の行はそのまま読めるので、移行は
+    「読めるが書かない」で足りる — 既存行は次の compact / rewrite で落ちる。
+    """
+    return json.dumps(
+        serialize_fact(fact, include_embedding=include_embedding),
+        ensure_ascii=False,
+    )
 
 
 def deserialize_fact_jsonl(line: str) -> SemanticFact:
-    """JSONL 1 行から `SemanticFact` を復元する"""
+    """JSONL 1 行から `SemanticFact` を復元する
+
+    旧形式 (``embedding`` を含む行) も読める。新形式では ``embedding`` は
+    ``None`` になり、``SemanticFactStore._load`` が EmbeddingStore から埋める。
+    """
     return deserialize_fact(json.loads(line))
 
 

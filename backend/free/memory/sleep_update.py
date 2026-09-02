@@ -484,18 +484,6 @@ class SleepTimeWorker:
         if self._check_cancelled():
             return result
 
-        # Step 8.8: 埋め込みが無いファクトの遡及生成
-        # Step 8 (extractor) / Step 9 (history 昇格) は同期関数で embedder を
-        # 持てないため、生成した直後にここで埋める。curator (8.5-8.7) の後に
-        # 置くことで当該サイクルの新規ファクトも同時に対象になる。
-        ts = time.monotonic()
-        result["fact_embeddings_backfilled"] = (
-            await self._step8_8_backfill_fact_embeddings()
-        )
-        step_durations["step8_8_fact_embedding"] = round(time.monotonic() - ts, 3)
-        if self._check_cancelled():
-            return result
-
         # Step 13: failure_pattern 統合
         # Step 8 の直後に呼ぶことで、当該イテレーションで新たに抽出された
         # failure_pattern と、既に loop.write_failure_note で即時書き込みされた
@@ -521,6 +509,24 @@ class SleepTimeWorker:
         ts = time.monotonic()
         result["semmem_promoted"] = self._step9_promote_summaries_to_semmem()
         step_durations["step9_promote"] = round(time.monotonic() - ts, 3)
+        if self._check_cancelled():
+            return result
+
+        # Step 8.8: 埋め込みが無いファクトの遡及生成
+        # Step 8 (extractor) / 8.4-8.6 (curator) / Step 9 (history 昇格) は
+        # いずれも同期関数で embedder を持てないため、生成した直後にここで埋める。
+        #
+        # **Step 9 promotion より後**に置くこと。以前は 8.6 の直後にあり、
+        # Step 9 が作った decision / commitment は embedding=None のまま
+        # 次サイクルまで残っていた。その間 MemoryInjector._is_relevant の
+        # 「埋め込みが無い候補は判定不能として通す」に該当し、関連度ゲートを
+        # 素通りする (セッション要約は is_internal_index_subject が落とすが、
+        # commitment とプロジェクト系 decision は落ちない)。
+        ts = time.monotonic()
+        result["fact_embeddings_backfilled"] = (
+            await self._step8_8_backfill_fact_embeddings()
+        )
+        step_durations["step8_8_fact_embedding"] = round(time.monotonic() - ts, 3)
         if self._check_cancelled():
             return result
 
@@ -953,6 +959,19 @@ class SleepTimeWorker:
         )
         return total
 
+    def _curatable_notes(self) -> list:
+        """キュレーター (Step 8.4 / 8.5 / 8.6) へ渡す STM ノート。
+
+        private セッション由来を落とす。キュレーター側も入口で
+        :func:`~backend.free.memory.sleep._curator_common.public_notes` を
+        通すので二重だが、「渡す前に落とす」を呼出側にも置くことで、新しい
+        キュレーターを足したときにガードを書き忘れても漏れない側へ倒す
+        (Step 8.4-8.6 は Step 8 抽出器の private ガードを継がずに足された)。
+        """
+        from backend.free.memory.sleep._curator_common import public_notes
+
+        return public_notes(list(self.short_term.notes.values()))
+
     # ── Step 8.4 (assertion curator) ───────────────────
 
     async def _step8_4_curate_assertions(self, llm_client=None) -> int:
@@ -965,7 +984,7 @@ class SleepTimeWorker:
             curate_assertion_facts,
         )
 
-        notes = list(self.short_term.notes.values())
+        notes = self._curatable_notes()
         return await curate_assertion_facts(
             notes,
             store_provider=self._semantic_store_provider,
@@ -987,7 +1006,7 @@ class SleepTimeWorker:
         """
         from backend.free.memory.sleep.url_curator import curate_url_facts
 
-        notes = list(self.short_term.notes.values())
+        notes = self._curatable_notes()
         return await curate_url_facts(
             notes,
             config=self.config,
@@ -1011,7 +1030,7 @@ class SleepTimeWorker:
             curate_executable_command_facts,
         )
 
-        notes = list(self.short_term.notes.values())
+        notes = self._curatable_notes()
         return await curate_executable_command_facts(
             notes,
             config=self.config,

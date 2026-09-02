@@ -21,11 +21,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Final
 
 import numpy as np
 
+from backend.io import AtomicWriter
 from backend.log_config import get_logger
 
 logger = get_logger("memory.semantic.embedding_store")
@@ -112,6 +114,12 @@ class EmbeddingStore:
         self._vectors: np.ndarray | None = None  # shape (N, dim)
         self._row_to_id: list[str] = []
         self._id_to_row: dict[str, int] = {}
+        #: ``flush=False`` の変更が未保存で残っているか (:meth:`flush` 用)。
+        self._dirty: bool = False
+        #: 行ノルムのキャッシュ (``None`` = 正規化済みで割り算不要)。
+        self._norms_cache: np.ndarray | None = None
+        #: ``_norms_cache`` を計算したときの行数 (行列が変わったら破棄する)。
+        self._norms_rows: int = -1
         self._load()
 
     # ── クラスメソッド ────────────────────────────────────────────────
@@ -218,42 +226,78 @@ class EmbeddingStore:
         self._vectors = arr.astype(np.float32, copy=False)
         self._row_to_id = list(row_to_id)
         self._id_to_row = {fid: i for i, fid in enumerate(self._row_to_id)}
+        self._norms_rows = -1
 
     def save(self) -> None:
         """現在の state を ``vectors.npy`` + ``row_to_id.json`` に書き出す.
 
         空の場合は既存ファイルを削除し、空ファイルを残さない。
+
+        **2 ファイルとも :class:`AtomicWriter` 経由で書く。** EvorefMem の
+        永続化はすべて atomic 書込を通る (manifest / local_state_store /
+        short_term_store / ``SemanticFactStore._rewrite_facts_log``) 中で、
+        ここだけが ``np.save`` + ``write_text`` の直接書き込みだった。この 2 手
+        の間で落ちると行数が食い違い、次回起動の :meth:`_load` が
+        ``len(row_to_id) != arr.shape[0]`` を検出して **WARNING 1 行を出して
+        ストアを空にする**。その後の最初の :meth:`upsert` が
+        ``self._vectors is None`` 分岐へ入り、(1, dim) の配列で
+        ``vectors.npy`` を上書きしてそのスコープの全ベクトルを消す。
+
+        順序は **vectors → row_to_id** に固定する。``facts.jsonl`` から
+        ベクトルを外した (:func:`~backend.free.memory.types.serialize_fact_jsonl`)
+        今、npy が唯一の正なので、破断時に復旧できない状態を作らない。
         """
         vp = self._vectors_path()
         ip = self._row_to_id_path()
         if self._vectors is None or self._vectors.shape[0] == 0:
-            for p in (vp, ip):
-                if p.exists():
-                    p.unlink()
+            for path in (vp, ip):
+                if path.exists():
+                    path.unlink()
+            self._dirty = False
             return
         vp.parent.mkdir(parents=True, exist_ok=True)
-        np.save(vp, self._vectors)
-        ip.write_text(
-            json.dumps({"row_to_id": list(self._row_to_id)}, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        with AtomicWriter(vp, mode="wb") as fh:
+            np.save(fh, self._vectors)
+        with AtomicWriter(ip) as fh:
+            fh.write(
+                json.dumps(
+                    {"row_to_id": list(self._row_to_id)}, ensure_ascii=False,
+                ),
+            )
+        self._dirty = False
+
+    def flush(self) -> None:
+        """``flush=False`` で溜めた変更があれば書き出す (無ければ何もしない)。"""
+        if self._dirty:
+            self.save()
 
     # ── CRUD ──────────────────────────────────────────────────────────
 
-    def upsert(self, fact_id: str, vec: np.ndarray) -> None:
+    def upsert(self, fact_id: str, vec: np.ndarray, *, flush: bool = True) -> None:
         """埋め込みを追加または上書きする.
 
         - 初回追加時は (1, dim) の配列を作る
         - 既存行があれば in-place 更新
         - 新規行は末尾 append
         - 次元が既存配列と一致しない場合は ``ValueError``
+
+        Args:
+            flush: ``True`` (既定) なら即座に :meth:`save` する。バッチで
+                書く呼出側 (Step 8.8 の埋め込み遡及生成は 1 サイクル最大 200
+                件、curator 群も対を束ねて書く) は ``False`` を渡し、末尾で
+                :meth:`flush` を 1 回呼ぶ。1 件ごとに保存すると **全配列を
+                毎回ディスクへ書き出す** ため、200 件で 200 回の全書き出しに
+                なる。
         """
         v = np.asarray(vec, dtype=np.float32).reshape(-1)
         if self._vectors is None or self._vectors.shape[0] == 0:
             self._vectors = v.reshape(1, -1).copy()
             self._row_to_id = [fact_id]
             self._id_to_row = {fact_id: 0}
-            self.save()
+            self._dirty = True
+            self._norms_rows = -1
+            if flush:
+                self.save()
             return
         if v.shape[0] != self._vectors.shape[1]:
             raise ValueError(
@@ -268,10 +312,17 @@ class EmbeddingStore:
             row = self._vectors.shape[0] - 1
             self._row_to_id.append(fact_id)
             self._id_to_row[fact_id] = row
-        self.save()
+        self._dirty = True
+        self._norms_rows = -1
+        if flush:
+            self.save()
 
-    def delete(self, fact_id: str) -> bool:
+    def delete(self, fact_id: str, *, flush: bool = True) -> bool:
         """指定 fact の埋め込みを取り除く.
+
+        Args:
+            flush: ``False`` なら保存を遅延する (:meth:`delete_many` /
+                バッチ削除用)。
 
         Returns:
             実際に削除した場合 True、元々存在しなかった場合 False。
@@ -282,8 +333,40 @@ class EmbeddingStore:
         self._vectors = np.delete(self._vectors, row, axis=0)
         del self._row_to_id[row]
         self._id_to_row = {fid: i for i, fid in enumerate(self._row_to_id)}
-        self.save()
+        self._dirty = True
+        self._norms_rows = -1
+        if flush:
+            self.save()
         return True
+
+    def delete_many(self, fact_ids: "Iterable[str]") -> int:
+        """複数 fact の埋め込みをまとめて取り除く.
+
+        1 件ずつ :meth:`delete` を回すと、``np.delete`` の配列コピー・
+        ``_id_to_row`` の全再構築・``vectors.npy`` の全書き出しが件数分
+        走る (M 件で O(N*M) + M 回の全書き出し)。行マスクを 1 度作って
+        1 回で落とす。
+
+        Returns:
+            実際に削除した件数。
+        """
+        if self._vectors is None or self._vectors.shape[0] == 0:
+            return 0
+        targets = {
+            fid for fid in fact_ids if fid in self._id_to_row
+        }
+        if not targets:
+            return 0
+        keep = [
+            i for i, fid in enumerate(self._row_to_id) if fid not in targets
+        ]
+        self._vectors = self._vectors[keep]
+        self._row_to_id = [self._row_to_id[i] for i in keep]
+        self._id_to_row = {fid: i for i, fid in enumerate(self._row_to_id)}
+        self._dirty = True
+        self._norms_rows = -1
+        self.save()
+        return len(targets)
 
     def get(self, fact_id: str) -> np.ndarray | None:
         """fact_id の埋め込みベクトル (コピー) を返す。無ければ None。"""
@@ -304,6 +387,11 @@ class EmbeddingStore:
         """cosine similarity top-k を返す (fact_id, score の降順).
 
         空ストアの場合は空リスト。query 次元不一致は ``ValueError``。
+
+        ``top_k`` が全件より小さいときは ``np.argpartition`` で上位だけを
+        取り出す (``np.argsort`` は常に全件 O(N log N) を払う)。行のノルムは
+        :meth:`_row_norms` がキャッシュし、正規化済みストアでは計算自体を
+        省く。
         """
         if self._vectors is None or self._vectors.shape[0] == 0:
             return []
@@ -316,15 +404,90 @@ class EmbeddingStore:
         qn = float(np.linalg.norm(q))
         if qn == 0.0:
             return []
+        sims = self._vectors @ q
+        norms = self._row_norms()
+        if norms is None:
+            sims = sims / qn
+        else:
+            denom = norms * qn
+            denom[denom == 0.0] = 1e-9
+            sims = sims / denom
+        n = int(sims.shape[0])
+        k = max(1, min(int(top_k), n))
+        if k < n:
+            # 上位 k 件だけを選んでから、その中だけを降順に並べる。
+            head = np.argpartition(-sims, k - 1)[:k]
+            order = head[np.argsort(-sims[head])]
+        else:
+            order = np.argsort(-sims)
+        return [
+            (self._row_to_id[int(row)], float(sims[int(row)]))
+            for row in order
+        ]
+
+    def score_all(self, query: np.ndarray) -> dict[str, float]:
+        """全 fact に対する cosine similarity を ``{fact_id: score}`` で返す.
+
+        並べ替えをしない点が :meth:`search` と違う。注入の関連度ゲートは
+        「閾値を超えたか」しか見ないので順位付けが要らず、**行列がストア側に
+        常駐している** ぶん候補ごとの numpy 演算をまるごと省ける。
+
+        実測 (2026-09-01、1024 次元): 候補ごとに ``np.asarray`` →
+        ``np.linalg.norm`` → 除算 を回すと N=10000 で 52.5ms かかるのに対し、
+        常駐行列との 1 回の積は 1.5ms (**35 倍**)。候補リストからその都度
+        行列を組み直す方式は ``np.stack`` のコピーが乗るぶん逆に遅くなるので
+        (実測で 0.5〜0.8 倍)、**行列を持っている側で計算する** ことが要点。
+
+        次元不一致 / 空ストア / ゼロクエリは空 dict を返す (呼出側は従来の
+        候補ごとの判定へ落ちる)。
+        """
+        if self._vectors is None or self._vectors.shape[0] == 0:
+            return {}
+        q = np.asarray(query, dtype=np.float32).reshape(-1)
+        if q.shape[0] != self._vectors.shape[1]:
+            return {}
+        qn = float(np.linalg.norm(q))
+        if not qn or not np.isfinite(qn):
+            return {}
+        sims = self._vectors @ q
+        norms = self._row_norms()
+        if norms is None:
+            sims = sims / qn
+        else:
+            denom = norms * qn
+            denom[denom == 0.0] = 1e-9
+            sims = sims / denom
+        return {
+            fid: float(sims[i]) for i, fid in enumerate(self._row_to_id)
+        }
+
+    def _row_norms(self) -> np.ndarray | None:
+        """行ごとの L2 ノルム。正規化済みと分かっていれば ``None``。
+
+        ``manifest.embedding.normalized`` は「L2 正規化済み」を宣言する
+        フィールドだが、**消費者が 1 つも無かった** — manifest / CLI 内で
+        書かれ比較されるだけで、検索側は誰も読んでいなかった (2026-09-01 監査
+        F8)。実ストアのベクトルは実際に ``norm min=1.0000 max=1.0000`` で、
+        それでも検索のたびに全行のノルムを計算し直していた。
+
+        宣言を鵜呑みにはしない: 実データを 1 度だけサンプル検査し、本当に
+        正規化されているときだけ計算を省く。結果は行列が入れ替わるまで
+        キャッシュする。
+        """
+        if self._vectors is None:
+            return None
+        rows = int(self._vectors.shape[0])
+        # ``_norms_rows`` が有効性の印。``_norms_cache is None`` は「正規化済み
+        # なので割り算不要」を意味するので、None を「未計算」と混同しない。
+        if self._norms_rows == rows:
+            return self._norms_cache
         norms = np.linalg.norm(self._vectors, axis=1)
-        denom = norms * qn
-        denom[denom == 0.0] = 1e-9
-        sims = (self._vectors @ q) / denom
-        order = np.argsort(-sims)
-        out: list[tuple[str, float]] = []
-        for row in order[:top_k]:
-            out.append((self._row_to_id[int(row)], float(sims[int(row)])))
-        return out
+        # 全行が単位ベクトルなら以後の割り算ごと省ける。
+        self._norms_cache = (
+            None if bool(np.allclose(norms, 1.0, atol=1e-4)) else norms
+        )
+        self._norms_rows = rows
+        return self._norms_cache
 
     # ── 観測 ──────────────────────────────────────────────────────────
 

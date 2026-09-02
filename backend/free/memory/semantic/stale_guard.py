@@ -6,9 +6,23 @@ embed モデルを (同 dim でも) 別モデルへ切り替えると、既存 f
 (:mod:`backend.free.rag.dimension_check`) と対称に、SemMem 側にも reembed 要求
 マーカーを置き、起動時 WARNING で ``evorefmem_cli reembed-facts`` を案内する。
 
-RAG はベクトルが stale だと「誤った検索結果」を返すため search をブロックするが、
-SemMem の stale は recall が「ヒットしない (= no-tool 縮退)」だけで誤結果には
-ならないため、ここでは **WARNING のみ** (ブロックしない)。
+**影響は URL / コマンドリコールだけではない。** 同じ ``fact.embedding`` を
+チャット 1 ターンごとの注入ゲート (``MemoryInjector._is_relevant``) も読む。
+stale はそこを 2 通りに壊す (実測 2026-09-01):
+
+- **次元が違う** → 形の不一致で判定できず、旧実装は素通しにしていた。
+  ゲートが全開になり **ストア全件が毎ターン注入される**。
+- **次元が同じで空間だけ違う** → コサインが雑音になり通過率 0.00%。
+  ゲートが **全件を黙って落とす**。
+
+閾値の較正 (``threshold_mode: auto``) はスケールずれしか救えず、ベクトル空間の
+ずれには効かない。したがってマーカーがある間は:
+
+- ``MemoryInjector._is_relevant`` は次元不一致のファクトを **落とす** (通さない)。
+- ``chat_service.build_semmem_injection`` は facts / notes の注入自体を見送る。
+
+ここは起動を止めないので **WARNING のみ** だが、「recall がヒットしなくなる
+だけで誤結果にはならない」という以前の整理は誤りだった。
 
 マーカーは:
 
@@ -118,7 +132,9 @@ def warn_if_semmem_reembed_required(
     model = info.get("new_model", "?")
     logger.warning(
         "SemMem fact embeddings are STALE (embed model changed to %s). "
-        "URL/command recall (search_by_embedding) will MISS until rebuilt. "
+        "Until rebuilt: URL/command recall (search_by_embedding) will MISS, "
+        "and chat memory injection is disabled (the relevance gate cannot be "
+        "trusted across embedding spaces). "
         "Click the Reembed button in the admin UI (POST /api/model/reembed-facts) "
         "or run 'python scripts/evorefmem_cli.py reembed-facts --apply'.",
         model,
