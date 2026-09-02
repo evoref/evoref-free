@@ -174,48 +174,7 @@ def _append_kv_unified_args(
         cmd += ["--kv-unified"]
 
 
-# ── reasoning OS-fence 解決 ─────────────────────────────
-
-
-_VALID_REASONING_MODES: frozenset[str] = frozenset({"on", "off", "auto"})
-
-
-def _append_reasoning_args(cmd: list[str], section_cfg: dict) -> None:
-    """``-rea`` / ``--reasoning-budget`` / ``--reasoning-budget-message``
-    を ``cmd`` に追加する
-
-    ``"on"`` / ``"off"`` / ``"auto"`` のいずれか (大文字小文字非依存)、
-    ``None`` / 空文字列なら付与しない (上流 default に追従)。
-
-    ``reasoning_budget_default`` の意味は上流に従う::
-
-        -1: 制限なし (--reasoning-budget を付与しない、上流既定挙動)
-         0: 即終了 (思考トリガー直後に thinking 終了 grammar)
-        N>0: N トークンで delayed-launch grammar が発動
-
-    ``reasoning_budget_message`` は budget 超過時に thinking 終了タグの
-    直前へ挿入される文字列。空文字列なら付与しない。
-
-    config schema (``AuxModelLocalConfig``) で値域は検証済みのため、
-    ここでは型・空文字列のみチェックする。
-    """
-    reasoning = section_cfg.get("reasoning")
-    if isinstance(reasoning, str):
-        normalized = reasoning.strip().lower()
-        if normalized in _VALID_REASONING_MODES:
-            cmd += ["-rea", normalized]
-
-    budget = section_cfg.get("reasoning_budget_default", -1)
-    try:
-        budget_int = int(budget)
-    except (TypeError, ValueError):
-        budget_int = -1
-    if budget_int >= 0:
-        cmd += ["--reasoning-budget", str(budget_int)]
-
-    message = section_cfg.get("reasoning_budget_message", "")
-    if isinstance(message, str) and message:
-        cmd += ["--reasoning-budget-message", message]
+# ── reasoning 解決 (プロファイル由来) ─────────────────────
 
 
 def _profile_reasoning_for_model(model_path: Path, project_root: Path) -> dict:

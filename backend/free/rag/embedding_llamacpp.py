@@ -317,6 +317,15 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
         """バックエンド種別"""
         return "llama-cpp"
 
+    def cache_identity(self) -> str:
+        """ドキュメント側ベクトルを変える設定の識別子 (永続キャッシュの鍵用)。
+
+        ``doc_template`` が空 (Qwen3 既定 = 素のテキスト) なら空文字列を返し、
+        既存キャッシュと鍵が変わらない。LoRA は llama-server 起動オプション側
+        なのでここでは表せない (モデル名で分かれる前提)。
+        """
+        return f"doc_template={self._doc_template}" if self._doc_template else ""
+
     def supports_lora(self) -> bool:
         """llama-server は --lora オプションで LoRA 適用可能"""
         return True

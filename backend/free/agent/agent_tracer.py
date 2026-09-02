@@ -44,18 +44,28 @@ class AgentTracer:
         self._debug_logger = debug_logger
         self._episodes: dict[str, list[MDPStep]] = {}
 
-    def begin_episode(self, conversation_id: str, mode: str) -> str:
-        """エピソードを開始し episode_id を返す"""
+    def begin_episode(
+        self, conversation_id: str, mode: str, *, private: bool = False,
+    ) -> str:
+        """エピソードを開始し episode_id を返す
+
+        ``private`` はリクエストの private フラグ。begin イベントに刻み、
+        MDP ingest (``mdp_ingester``) が STM の private ノートの残存に依らず
+        当該エピソードをエピソード記憶へ昇格させないための一次情報にする。
+        """
         episode_id = f"ep_{uuid.uuid4().hex[:8]}"
         self._episodes[episode_id] = []
 
-        self._log({
+        event: dict = {
             "event": "begin",
             "episode_id": episode_id,
             "conversation_id": conversation_id,
             "mode": mode,
             "timestamp": time.time(),
-        })
+        }
+        if private:
+            event["private"] = True
+        self._log(event)
 
         logger.debug(
             "Episode started: %s (conversation=%s, mode=%s)",

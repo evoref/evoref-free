@@ -25,6 +25,10 @@ export interface PolicyEvolverDomainStatus {
 	decline_count: number;
 	sigma: number;
 	phase: string;
+	/** 恒真 fitness (選択圧ゼロ) と判定され凍結中か */
+	degenerate?: boolean;
+	fitness_history_len?: number;
+	last_evolved_at?: string | null;
 }
 
 /** fitness 履歴の1ポイント */

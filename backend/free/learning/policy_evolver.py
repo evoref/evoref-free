@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 
 from backend.free.core.session_mode import normalize_session_mode
+from backend.free.learning.fitness import DEFECT_WEIGHTS, defect_rate_fitness
 from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
 from backend.free.memory.types import make_fact
 from backend.log_config import get_logger
@@ -179,6 +180,16 @@ PERMANENTLY_FROZEN_PARAMS: dict[str, dict[str, str]] = {
         # _default_policies() 以外に参照が無い (2026-08-18 時点)。摂動しても
         # 何も起きないので進化スロットの無駄。キー自体の存廃は別途判断する。
         "candidates_multiplier": "消費側が存在しない dead key",
+        # 品質項 mean(rag_top1_score) は **検索器の top-1 cosine** で、後段の
+        # SalienceRanker (salience_w_*) やノイズ注入 (noise_sigma) はスコアが
+        # 確定した後に走る。消費側は fitness 信号に一切影響しないので、摂動して
+        # も選択圧ゼロの乱歩になる (2026-09-02 監査 L-A8)。
+        "salience_w_query_relevance": "consumer does not affect the fitness signal",
+        "salience_w_tfidf": "consumer does not affect the fitness signal",
+        "salience_w_entity_density": "consumer does not affect the fitness signal",
+        "salience_w_info_density": "consumer does not affect the fitness signal",
+        "salience_w_position_bias": "consumer does not affect the fitness signal",
+        "noise_sigma": "consumer does not affect the fitness signal",
     },
     "agent": {
         # 「残コンテキストがこの値以上なら meta-cognitive を許可」という**ゲート
@@ -362,6 +373,11 @@ class PolicyParamEvolver(JsonStateStore):
         # PROMOTION_SURVIVAL_CYCLES 到達で active fact を昇格する。rollback でリセット。
         self._survived_count: dict[tuple[str, str], int] = {}
 
+        # (domain, mode) → 直近に params を動かした (evolved / rollback) 時点で
+        # 観測済みだった最新経験の timestamp (ISO)。次の評価はこれより新しい経験
+        # だけで行う (旧値で採ったデータと新値のデータを混ぜない、L-A4)。
+        self._last_evolved_at: dict[tuple[str, str], str] = {}
+
     # ── SemMem 書き戻しヘルパ ───────────────────────────
 
     @property
@@ -394,11 +410,25 @@ class PolicyParamEvolver(JsonStateStore):
     def set_base_model_id(self, base_model_id: str) -> None:
         """base 学習パーティションの active モデルスラグを差し替える。
 
-        モデル切替時に :func:`backend.factory._learning_rebind.rebind_base_learning`
-        から呼ばれ、以後の policy 書き戻し subject に当該モデルを埋め込む。空文字で
-        レガシー縮退。
+        以後の policy 書き戻し subject に当該モデルを埋め込む。空文字でレガシー
+        縮退。呼出元は構築時 (``_pillar_wirer``) と、ランタイム base 切替の
+        ``backend.factory._learning_rebind.rebind_base_learning`` (評価状態は
+        :meth:`reset_evaluation_state` → 新パーティションの ``load`` で張り直す)。
         """
         self._base_model_id = base_model_id or ""
+
+    def reset_evaluation_state(self) -> None:
+        """永続化対象の評価状態 (fitness 履歴 / best / survived 等) を空にする。
+
+        現行 params には触れない (値の是正は PolicyInterpreter 側の責務)。
+        fitness スキーマ変更時とパーティション切替時に使う。
+        """
+        self._fitness_history.clear()
+        self._decline_count.clear()
+        self._best_fitness.clear()
+        self._best_params.clear()
+        self._survived_count.clear()
+        self._last_evolved_at.clear()
 
     @staticmethod
     def _build_subject(base_model_id: str, mode: str, domain: str, key: str) -> str:
@@ -771,6 +801,27 @@ class PolicyParamEvolver(JsonStateStore):
         """
         key = (domain, mode)
 
+        # -1. 評価窓 = 直近に params を動かしてから記録された経験のみ。
+        # バッファ全体で評価すると、旧値の下で採れた経験が新値の評価を薄めて
+        # 「変えても fitness が動かない」= 恒真ガード誤発火 / 採用も棄却も
+        # できない状態に落ちる (L-A4)。窓が MIN_FITNESS_SAMPLES 未満なら hold。
+        experiences = self._window_since_last_evolved(key, experiences)
+        if key in self._last_evolved_at and len(experiences) < MIN_FITNESS_SAMPLES:
+            sigma = self._exploration.get_mutation_scale(domain, mode)
+            phase = self._exploration.get_phase(domain, mode)
+            self._log_evolution(
+                domain, mode, "hold", 0.0, sigma, phase,
+                cost_observed=False,
+            )
+            return {
+                "action": "hold", "fitness": None,
+                "reason": "insufficient_new_samples",
+                "new_samples": len(experiences),
+                "required": MIN_FITNESS_SAMPLES,
+                "sigma": sigma, "phase": phase,
+                "cost_observed": False,
+            }
+
         # 0. コスト項が fitness に入るだけの標本があるか。入っていれば単調性が
         # 解けるので MONOTONE_PARAMS の凍結を外す。fitness の合成と同じ判定を
         # 使うので、「コスト項が効いていないのに凍結だけ解ける」状態は作れない。
@@ -834,6 +885,7 @@ class PolicyParamEvolver(JsonStateStore):
         )
         if rollback_result is not None:
             rollback_result["cost_observed"] = cost_observed
+            self._mark_evolved(key, experiences)
             return rollback_result
 
         # 3.5. decline 継続中 (ロールバック閾値未満の連続低下) は新摂動を打たず hold。
@@ -851,9 +903,39 @@ class PolicyParamEvolver(JsonStateStore):
             }
 
         # 4-5. ガウス摂動でデルタ生成 → ACE 適用
-        return self._apply_evolved_step(
+        result = self._apply_evolved_step(
             domain, mode, fitness, sigma, phase, cost_observed=cost_observed,
         )
+        if result.get("action") == "evolved":
+            self._mark_evolved(key, experiences)
+        return result
+
+    @staticmethod
+    def _latest_timestamp(experiences: list[dict]) -> str:
+        """経験集合の最新 ``timestamp`` (ISO 文字列、無ければ空)。"""
+        return max((str(e.get("timestamp") or "") for e in experiences), default="")
+
+    def _window_since_last_evolved(
+        self, key: tuple[str, str], experiences: list[dict],
+    ) -> list[dict]:
+        """直近の params 変更以降に記録された経験だけを返す。
+
+        ``timestamp`` を持たないエントリは新規扱いで残す (テスト用の合成経験 /
+        旧フォーマット。実データは FeedbackCollector が必ず刻む)。
+        """
+        since = self._last_evolved_at.get(key)
+        if not since:
+            return experiences
+        return [
+            e for e in experiences
+            if not e.get("timestamp") or str(e["timestamp"]) > since
+        ]
+
+    def _mark_evolved(self, key: tuple[str, str], experiences: list[dict]) -> None:
+        """params を動かした時点の観測境界を記録する。"""
+        latest = self._latest_timestamp(experiences)
+        if latest:
+            self._last_evolved_at[key] = latest
 
     def evolve_all(
         self,
@@ -907,6 +989,8 @@ class PolicyParamEvolver(JsonStateStore):
                 # 恒真ガードで凍結中か。乱歩は「静かに」起きるので、状態として
                 # 外から見えるようにしておく (/api/learning/status 経由)。
                 "degenerate": is_degenerate_fitness(history),
+                # 評価窓の起点 (この timestamp より新しい経験だけで次を評価する)。
+                "last_evolved_at": self._last_evolved_at.get((domain, mode)),
             }
         return status
 
@@ -935,6 +1019,10 @@ class PolicyParamEvolver(JsonStateStore):
                 f"{d}:{m}": c
                 for (d, m), c in self._survived_count.items()
             },
+            "last_evolved_at": {
+                f"{d}:{m}": ts
+                for (d, m), ts in self._last_evolved_at.items()
+            },
         }
 
     def _from_payload(self, payload: JsonPayload) -> None:
@@ -957,11 +1045,7 @@ class PolicyParamEvolver(JsonStateStore):
                 "discarding stored evaluation state (params are left untouched)",
                 stored_version, FITNESS_SCHEMA_VERSION,
             )
-            self._fitness_history.clear()
-            self._decline_count.clear()
-            self._best_fitness.clear()
-            self._best_params.clear()
-            self._survived_count.clear()
+            self.reset_evaluation_state()
             return
 
         self._fitness_history.clear()
@@ -993,6 +1077,12 @@ class PolicyParamEvolver(JsonStateStore):
             parts = key_str.split(":", 1)
             if len(parts) == 2:
                 self._survived_count[(parts[0], parts[1])] = count
+
+        self._last_evolved_at.clear()
+        for key_str, ts in payload.get("last_evolved_at", {}).items():
+            parts = key_str.split(":", 1)
+            if len(parts) == 2 and isinstance(ts, str) and ts:
+                self._last_evolved_at[(parts[0], parts[1])] = ts
 
     def _on_save_success(self, path: Path) -> None:
         logger.debug("PolicyEvolver state saved: %s", path)
@@ -1135,22 +1225,9 @@ class PolicyParamEvolver(JsonStateStore):
 
 # ── ドメイン別 fitness 関数 ──
 
-#: 欠陥シグナルと重み。**加点シグナルを使わない** のが要点。
-#: ``conversation_ended`` は :meth:`ExperienceBuffer._mark_loaded_conversations_ended`
-#: が読み込み時に全エントリへ立てるため構造的に恒真へ寄り (実測 205/206 = 99.5%)、
-#: ``turn_outcome`` も実測 206/206 が ``"success"`` だった。これらを加点項に置くと
-#: fitness が上限へ張り付いて選択圧が消える。観測された欠陥の率だけを見れば、
-#: 加点シグナルの恒真性に引きずられない。
-#:
-#: :class:`~backend.free.learning.generation_param_evolver.GenerationParamEvolver`
-#: が同じ問題に対して先に採った設計と揃えてある。
-DEFECT_WEIGHTS: dict[str, float] = {
-    "user_correction": 1.0,
-    "assistant_self_retraction": 1.0,
-    "rephrased_query": 0.6,
-    "tool_routing_false_negative": 0.5,
-    "tool_routing_false_positive": 0.5,
-}
+#: 欠陥シグナルと重み。共有定義 :data:`backend.free.learning.fitness.DEFECT_WEIGHTS`
+#: をそのまま使う (根拠は同モジュールの docstring)。旧来の importer 向けに
+#: 本モジュールからも同名で参照できる。
 
 
 def _defect_rate_fitness(
@@ -1160,15 +1237,10 @@ def _defect_rate_fitness(
     """観測された欠陥の重み付き率から fitness を返す (1.0 = 欠陥なし)。
 
     呼出側が非空を保証すること (サンプル数の下限判定は各 fitness 関数の責務)。
+    実装は :func:`backend.free.learning.fitness.defect_rate_fitness` に委譲する。
     """
-    table = DEFECT_WEIGHTS if weights is None else weights
-    defects = 0.0
-    for e in experiences:
-        signals = e.get("signals") or {}
-        for key, weight in table.items():
-            if signals.get(key):
-                defects += weight
-    return max(0.0, min(1.0, 1.0 - defects / len(experiences)))
+    value = defect_rate_fitness(experiences, weights=weights)
+    return 1.0 if value is None else value
 
 
 # ── コスト項 ──

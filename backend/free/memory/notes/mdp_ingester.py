@@ -57,6 +57,7 @@ from backend.free.memory.extractors.mdp_trace import (
     strip_volatile_measurements,
 )
 from backend.free.memory.stores.short_term import MemoryNote
+from backend.io import atomic_write_text
 from backend.log_config import get_logger
 
 logger = get_logger("memory.mdp_ingester")
@@ -170,6 +171,17 @@ class EpisodeRecord:
         if self.end and isinstance(self.end, dict):
             return str(self.end.get("outcome") or "")
         return ""
+
+    def is_private(self) -> bool:
+        """begin イベントに private フラグが刻まれているか。
+
+        ``private_trace_ids`` (STM の private ノート由来) は、Full が走る前に
+        当該ノートが押し出されていると空になる。begin イベント自体の印は
+        ノートの寿命に依らないので、こちらを一次情報として併用する。
+        """
+        return bool(
+            isinstance(self.begin, dict) and self.begin.get("private"),
+        )
 
     def absorb_event(self, obj: dict[str, Any]) -> None:
         """1 行ぶんのイベントを取り込む。"""
@@ -290,10 +302,9 @@ class MDPIngester:
         if self.state_path is None:
             return
         try:
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.state_path.write_text(
+            atomic_write_text(
+                self.state_path,
                 json.dumps(self._state.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
             )
         except OSError as exc:
             logger.warning("MDPIngester: failed to save state %s: %s", self.state_path, exc)
@@ -329,7 +340,7 @@ class MDPIngester:
                 pending.pop(ep_id, None)
                 if ep_id in already_processed:
                     continue
-                if ep.trace_id and ep.trace_id in private_set:
+                if ep.is_private() or (ep.trace_id and ep.trace_id in private_set):
                     self._mark_processed(ep_id, already_processed)
                     continue
                 if ep.is_memory_read_only():

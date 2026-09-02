@@ -8,6 +8,7 @@ from backend.app_state import AppState, get_app_state
 from backend.config import get_path_resolver
 from backend.edition import get_pro_handler, is_pro
 from backend.free.api._error_responses import api_error
+from backend.i18n_helper import msg
 from backend.free.api.learning._learning_collectors import (
     extract_executed_phases,
     latest_level2_run,
@@ -123,9 +124,8 @@ async def trigger_learning(req: TriggerRequest, state: AppState = Depends(get_ap
     queue_length = scheduler.push_priority_request(req_obj)
     status = scheduler.get_status()
 
-    message = (
-        f"Manual {req.level} request queued (position={queue_length}). "
-        "Will be processed by Level 1 loop on next tick."
+    message = msg(
+        "api.learning_request_queued", level=req.level, position=queue_length,
     )
 
     return TriggerResponse(
@@ -301,9 +301,10 @@ def _build_scheduler_status(scheduler: object | None) -> SchedulerStatusModel:
     level1_results = map_level1_results(raw_l1)
     executed_phases = extract_executed_phases(raw_l1)
 
-    # Pro 拡張ステータス (Pro ガードは handler 側に残置)
+    # PolicyParamEvolver は Free でも配線される (Level 1 Step 12) ので
+    # エディションでゲートしない (未注入なら get_pro_status が空を返す)。
     policy_evolver_status = {}
-    if is_pro() and hasattr(scheduler, "get_pro_status"):
+    if hasattr(scheduler, "get_pro_status"):
         policy_evolver_status = map_policy_evolver_status(scheduler.get_pro_status())
 
     return SchedulerStatusModel(

@@ -11,8 +11,13 @@ class CartridgeGateConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
-    # cosine 類似度閾値。この値未満の centroid を持つカートリッジはスキップ
-    threshold: float = Field(default=0.3, ge=-1.0, le=1.0)
+    # cosine 類似度閾値。この値未満の centroid を持つカートリッジはスキップ。
+    # cos の絶対値は埋め込みモデルの sim 分布に依存する (無関係ペアの中央値が
+    # LFM2.5 0.105 / Qwen3 0.273 / bge-m3 0.459)。None (既定) = 有効な埋め込み
+    # モデルプロファイル (models/profiles/<arch>.yaml の
+    # embedding.rag.cartridge_gate_threshold) の値を使い、プロファイルに無ければ
+    # 0.3。明示値はプロファイルより優先 (cartridge_manager.resolve_cartridge_gate_threshold)。
+    threshold: float | None = Field(default=None, ge=-1.0, le=1.0)
     # gate 通過させる上限件数 (0 以下で無制限)
     max_cartridges: int = Field(default=10, ge=0)
     # 全カートリッジが threshold 未満で 0 件通過になったときの挙動:
@@ -221,6 +226,9 @@ class RAGConfig(BaseModel):
     )
     # --- ベクトル量子化 ---
     quantization: str = Field(default="int8", pattern=r"^(none|int8)$")
+    # int8 粗検索後に float32 で rescore する候補数。チャット応答経路の LTM /
+    # カートリッジ検索 (``search_pipeline`` → ``VectorStore.search``) へ渡る。
+    # 0 でストア側の既定 ``max(50, top_k*3)``。
     rescore_candidates: int = Field(default=50, ge=0)
     # --- memmap ---
     memmap_threshold: int = Field(default=10000, ge=100)

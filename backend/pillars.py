@@ -43,7 +43,10 @@ if TYPE_CHECKING:
     from backend.free.memory.stores.long_term import LongTermMemory
     from backend.free.memory.scheduler import SleepTimeScheduler
     from backend.free.memory.stores.short_term import ShortTermMemory
-    from backend.free.memory.stores.working import WorkingMemory
+    from backend.free.memory.stores.working import (
+        WorkingMemory,
+        WorkingMemoryRegistry,
+    )
     from backend.free.rag.cartridge_manager import CartridgeManager
     from backend.free.rag.embedding_backend import EmbeddingBackend
     from backend.free.rag.bm25_retriever import BM25Retriever
@@ -82,15 +85,20 @@ class MemPillar:
 
     ``SemanticFactStore`` は ``AppState._semantic_stores`` に scope ごと
     lazy 生成される (他 pillar は Fact View 経由でのみアクセス)。
+
+    ``working_memory`` は legacy (単一 WM 時代の名残)。WM はセッション別に
+    ``working_memory_registry`` が持つので、応答パスは
+    ``AppState.get_memory_system(session_id)`` 経由で引く。
     """
 
-    working_memory: "WorkingMemory"
+    working_memory: "WorkingMemory | None"
     short_term_memory: "ShortTermMemory"
     long_term_memory: "LongTermMemory | None"
     vector_store: "VectorStore | None"
     cartridge_manager: "CartridgeManager | None"
     sleep_scheduler: "SleepTimeScheduler"
     current_project_id: str | None = None
+    working_memory_registry: "WorkingMemoryRegistry | None" = None
 
 
 @dataclass

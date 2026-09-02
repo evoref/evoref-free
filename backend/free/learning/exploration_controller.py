@@ -56,6 +56,10 @@ class ExplorationController(JsonStateStore):
         # (domain, mode) → {"sigma": float, "phase": str}
         self._state: dict[tuple[str, str], dict] = {}
 
+    def reset(self) -> None:
+        """全 (domain, mode) の探索状態を初期化する (パーティション切替用)。"""
+        self._state.clear()
+
     def get_mutation_scale(self, domain: str, mode: str) -> float:
         """現在の変異スケール（σ）を返す
 

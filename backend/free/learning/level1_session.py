@@ -16,9 +16,36 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from backend.io import atomic_write_text
 from backend.log_config import get_logger
 
 logger = get_logger("learning.level1_session")
+
+#: ``level1_history/`` に残す完了 session の上限 (古いものから削除)。
+HISTORY_KEEP = 20
+
+#: ``experience_snapshot`` に残すクエリ本文の最大文字数。
+SNAPSHOT_QUERY_CHARS = 200
+
+
+def compact_experience(exp: dict) -> dict:
+    """session へ保存する経験の圧縮射影。
+
+    Level 1 が session snapshot から読むのは timestamp / mode / signals / query
+    (失敗語抽出) / cartridge_ids / base_model だけ。``response_full`` (応答全文)
+    を 1000 件 × 全モード分そのまま JSON へ書くと active session が数 MB になり
+    yield ごとの保存が重くなる (L-D3)。few-shot プール補充は live バッファから
+    行うので、応答本文は snapshot に要らない。
+    """
+    query = str(exp.get("query", "") or "")
+    return {
+        "timestamp": exp.get("timestamp", ""),
+        "mode": exp.get("mode", ""),
+        "query": query[:SNAPSHOT_QUERY_CHARS],
+        "base_model": exp.get("base_model", ""),
+        "cartridge_ids": list(exp.get("cartridge_ids", []) or []),
+        "signals": dict(exp.get("signals", {}) or {}),
+    }
 
 
 # ── PriorityRequest（f_04 §4.2）─────────────────────────────
@@ -64,8 +91,10 @@ class Level1Session:
     session_id: str
     started_at: float
     cartridge_snapshot: list[str]      # JSON シリアライズ可能形式
-    experience_snapshot: list[dict]    # 開始時に固定された経験リスト
+    experience_snapshot: list[dict]    # 開始時に固定された経験リスト (compact_experience 射影)
     completed_phases: list[str] = field(default_factory=list)
+    #: mode → yield 時点の進化進捗 (``PromptEvolver._snapshot_progress``:
+    #: population / generation / initial_fitness / best)。完了したモードは削除。
     phase_state: dict[str, dict] = field(default_factory=dict)
     reason: str = "idle"
     yield_count: int = 0
@@ -81,7 +110,7 @@ class Level1Session:
             session_id=str(uuid.uuid4()),
             started_at=time.time(),
             cartridge_snapshot=sorted(cartridge_ids),
-            experience_snapshot=list(experiences),
+            experience_snapshot=[compact_experience(e) for e in experiences],
             completed_phases=[],
             phase_state={},
             reason=reason,
@@ -111,12 +140,11 @@ class Level1Session:
 def save_active_session(path: Path, session: Level1Session) -> None:
     """SUSPENDED な Level1Session を JSON ファイルへアトミック保存する"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(
+    atomic_write_text(
+        path,
         json.dumps(session.to_dict(), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    tmp.replace(path)
     logger.debug("Active session saved: %s", path)
 
 
@@ -136,11 +164,13 @@ def archive_session(active_path: Path, history_dir: Path, session: Level1Session
     """完了した session を history へ移動する。
 
     active ファイルを削除し、`history_dir/{session_id}.json` に書き出す。
+    履歴は :data:`HISTORY_KEEP` 件を超えた分を古い順に削除する。
     返り値はアーカイブ後のパス。
     """
     history_dir.mkdir(parents=True, exist_ok=True)
     target = history_dir / f"{session.session_id}.json"
-    target.write_text(
+    atomic_write_text(
+        target,
         json.dumps(session.to_dict(), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -149,8 +179,24 @@ def archive_session(active_path: Path, history_dir: Path, session: Level1Session
             active_path.unlink()
         except OSError as e:
             logger.warning("Failed to remove active session file %s: %s", active_path, e)
+    _prune_history(history_dir, keep=HISTORY_KEEP)
     logger.info("Session archived: %s", target)
     return target
+
+
+def _prune_history(history_dir: Path, *, keep: int) -> int:
+    """history_dir の session JSON を更新日時順に ``keep`` 件だけ残す。"""
+    files = sorted(history_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    removed = 0
+    for old in files[:-keep] if keep > 0 else files:
+        try:
+            old.unlink()
+            removed += 1
+        except OSError as e:
+            logger.warning("Failed to prune session history %s: %s", old, e)
+    if removed:
+        logger.info("Pruned %d old Level 1 session archives from %s", removed, history_dir)
+    return removed
 
 
 def discard_active_session(path: Path) -> None:

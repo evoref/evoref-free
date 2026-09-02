@@ -16,15 +16,21 @@ create モードの計画・設計仕様合成) を一手に引き受ける。�
   分岐が消え、呼出側が「呼べば返る」前提で書けるようになる。
 
 不変則との関係 (CLAUDE.md §6 #1): 禁じられているのは「ユーザー応答の生成中に
-補助処理を同じスロットへ割り込ませる」こと。本クライアントは常に
-``LocalClient.background_slot`` を使い、チャットと KV を分離する。さらに
+補助処理を同じスロットへ割り込ませる」こと。本クライアントはチャットスロットを
+使わず、purpose 別のスロット方針 (``CHAT_PATH_PURPOSES`` はチャット応答パスで
+同期発火するので ``classifier_slot``、それ以外は ``background_slot``) で
+チャットと KV を分離する。同一スロットへの同時要求は per-slot ロックで直列化し、
+purpose タイムアウトは **ロック取得後 (dispatch) から** 数える。さらに
 json_schema が解決できる purpose は文法制約経路 (``generate_constrained``) を
 通すため、チャット応答パスから同期発火する補助判定も出力長が読める。
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import time
+from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -64,7 +70,6 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "assertion_naming": 45.0,
     # ── 学習サイクル ─────────────────────────────────────────────────
     "critique_synthesis": 120.0,
-    "policy_evolution": 120.0,
     "fewshot_quality_score": 45.0,
     # ── 長文生成 ─────────────────────────────────────────────────────
     "long_form_planning": 180.0,
@@ -113,10 +118,31 @@ PURPOSE_TIMEOUT_CALIBRATION_EXEMPT: frozenset[str] = frozenset({
     "retrieval_chunk_gate",  # timeout → prune せず全件通す
 })
 
-# 較正の引き上げ幅と上限倍率。per-attempt timeout を引き上げるため、
-# 総ウォールクロックは ``per_attempt * リトライ数`` になる点を踏まえ控えめに保つ。
+# 較正の引き上げ幅と上限 / 下限倍率。生成 POST は ``ReadTimeout`` をリトライ
+# しないので per-attempt timeout ≒ 総ウォールクロック。天井は既定の 3 倍、
+# 床は既定の 0.5 倍 (実測が速いモデルではタイムアウトを **縮める** 方向にも動く)。
 _CALIB_BUMP_FACTOR = 1.5
 _CALIB_MAX_SCALE = 3.0
+_CALIB_MIN_SCALE = 0.5
+#: 成功時の所要秒 p95 に掛ける余裕率。
+_CALIB_P95_HEADROOM = 1.3
+#: p95 を取る直近サンプル数と、較正を始める最小サンプル数。
+_CALIB_SAMPLE_WINDOW = 20
+_CALIB_MIN_SAMPLES = 3
+
+#: **チャット応答パスで同期発火する** purpose。背景スロットは sleep-time /
+#: 学習と共有で、そちらが走っていると per-slot ロック待ちでユーザー応答が
+#: 遅れる。``llama.slots >= 3`` なら分類器スロット (``classifier_slot``、
+#: ツール分類器と同じ「チャットの合間にしか使われない」スロット) へ寄せる。
+#: 3 スロット未満では ``classifier_slot`` 自体が背景へ倒れる。
+#: 判定基準は docs/c_14 §7 の「チャット応答パスで発火」の注記。
+CHAT_PATH_PURPOSES: frozenset[str] = frozenset({
+    "retrieval_chunk_gate",   # rag/chunk_content_gate (取得直後の関連性判定)
+    "meta_cognitive_plan",    # agent/meta_cognitive (create 応答パスの計画)
+    "tool_summarize",         # agent/tools/builtin (deliberative のツール実行)
+    "tool_translate",
+    "tool_draft_document",
+})
 
 
 class AuxClient:
@@ -125,12 +151,17 @@ class AuxClient:
     呼出側から見える約束:
 
     - ``id_slot`` / ``cache_prompt`` は面の互換のため受けるが無視する。スロットは
-      常に ``LocalClient.background_slot`` (チャットと KV を分離)、``cache_prompt``
-      は ``LocalClient`` 側で常時 ON
+      purpose 別方針 (:data:`CHAT_PATH_PURPOSES` → ``classifier_slot``、それ以外
+      → ``background_slot``) で決め、チャットスロットには決して触らない。
+      ``cache_prompt`` は ``LocalClient`` 側で常時 ON
+    - 同一スロットへの同時要求は per-slot ロックで直列化する (llama-server 側で
+      同じ ``id_slot`` を取り合うと KV を相互に追い出す)。ロック待ちは
+      ``queue_wait_sec`` として別計上し、purpose タイムアウトは dispatch から数える
     - ``purpose`` から json_schema・タイムアウトを解決する
     - json_schema が解決できる purpose は文法制約経路を通る
     - 失敗は握り潰さず、``generate_json`` は空 dict を返して呼出側の
-      フォールバックに委ねる
+      フォールバックに委ねる。``finish_reason=length`` (JSON が途中で切れた) も
+      修復せず空 dict (``telemetry["json_truncated"]=True``)
     """
 
     def __init__(
@@ -142,25 +173,55 @@ class AuxClient:
     ):
         self.local = local
         self._debug_logger = debug_logger
+        self._model_filename = ""
+        self._calibration_path = "local/aux_calibration.json"
+        self._calibrated: dict[str, float] = {}
+        #: purpose → 直近の成功所要秒 (p95 較正の母集団)。
+        self._samples: dict[str, deque[float]] = {}
+        #: スロット ID → ロック (同一スロットへの同時要求を直列化)。
+        self._slot_locks: dict[int, asyncio.Lock] = {}
+        self._load_calibration(config or {})
+
+    def _load_calibration(self, config: dict) -> None:
+        """config からモデル名 / 較正ファイルを解決し、較正値とサンプルを読み込む。"""
         #: 較正値の永続化キー (ベースモデルの GGUF ファイル名)。空なら永続化しない。
-        self._model_filename = _resolve_base_model_filename(config or {})
+        self._model_filename = _resolve_base_model_filename(config)
         self._calibration_path = str(
-            (config or {}).get("local_paths", {}).get(
+            (config.get("local_paths") or {}).get(
                 "aux_calibration_file", "local/aux_calibration.json",
             ),
         )
-        self._calibrated: dict[str, float] = {}
-        if self._model_filename:
-            from backend.free.llm.aux_calibration_store import AuxCalibrationStore
+        self._calibrated = {}
+        self._samples = {}
+        if not self._model_filename:
+            return
+        from backend.free.llm.aux_calibration_store import AuxCalibrationStore
 
-            self._calibrated = AuxCalibrationStore.load_timeouts(
-                self._calibration_path, self._model_filename,
+        self._calibrated = AuxCalibrationStore.load_timeouts(
+            self._calibration_path, self._model_filename,
+        )
+        for purpose, values in AuxCalibrationStore.load_samples(
+            self._calibration_path, self._model_filename,
+        ).items():
+            self._samples[purpose] = deque(values, maxlen=_CALIB_SAMPLE_WINDOW)
+        if self._calibrated:
+            logger.info(
+                "Loaded aux timeout calibration for model=%s (%d purposes)",
+                self._model_filename, len(self._calibrated),
             )
-            if self._calibrated:
-                logger.info(
-                    "Loaded aux timeout calibration for model=%s (%d purposes)",
-                    self._model_filename, len(self._calibrated),
-                )
+
+    def rebind(self, local: LocalClient, config: dict | None = None) -> None:
+        """ベース差し替え (モード切替 / モデル移行) に追随する。
+
+        ``local`` を差し替えるだけでは、較正値が **旧モデルのファイル名** に
+        ぶら下がったままになる (27B の較正値を 4B に適用する / 逆)。config を
+        渡せばモデル名を再解決して較正を読み直す。スロットロックは新クライアント
+        のスロット配置に合わせて捨てる。
+        """
+        self.local = local
+        self._slot_locks = {}
+        if config is not None:
+            self._load_calibration(config)
 
     @property
     def metadata(self):
@@ -194,12 +255,41 @@ class AuxClient:
             return resolve_response_format_for_purpose(purpose)
         return None
 
+    def _slot_for(self, purpose: str) -> int:
+        """purpose に応じたスロット ID (チャットスロットは決して返さない)。"""
+        background = int(self.local.background_slot)
+        if purpose in CHAT_PATH_PURPOSES:
+            classifier = getattr(self.local, "classifier_slot", background)
+            if isinstance(classifier, int) and not isinstance(classifier, bool):
+                return classifier
+        return background
+
+    def _lock_for(self, slot: int) -> asyncio.Lock:
+        lock = self._slot_locks.get(slot)
+        if lock is None:
+            lock = self._slot_locks[slot] = asyncio.Lock()
+        return lock
+
+    def _persist_calibration(self) -> None:
+        if not self._model_filename:
+            return
+        try:
+            from backend.free.llm.aux_calibration_store import AuxCalibrationStore
+
+            AuxCalibrationStore.save_timeouts(
+                self._calibration_path, self._model_filename, self._calibrated,
+                samples={k: list(v) for k, v in self._samples.items()},
+            )
+        except OSError as e:
+            logger.warning("Failed to persist aux calibration: %s", e)
+
     def _bump_calibrated_timeout(self, purpose: str) -> None:
         """タイムアウト観測を受けて当該 purpose の予算を引き上げる。
 
         ベースは構成 (量子化 / GPU レイヤ / コンテキスト長) でレイテンシが数倍
         変わるため、コード既定値が実機に合わない構成が必ず出る。天井は既定値の
-        ``_CALIB_MAX_SCALE`` 倍まで。
+        ``_CALIB_MAX_SCALE`` 倍まで。タイムアウトはロック取得後 (dispatch) から
+        数えているので、スロット待ちで消えた時間は原因に含まれない。
         """
         if not purpose or purpose in PURPOSE_TIMEOUT_CALIBRATION_EXEMPT:
             return
@@ -213,16 +303,40 @@ class AuxClient:
             "Aux timeout calibrated up for purpose=%s: %.1fs -> %.1fs (base %.1fs)",
             purpose, current, bumped, base,
         )
-        if not self._model_filename:
-            return
-        try:
-            from backend.free.llm.aux_calibration_store import AuxCalibrationStore
+        self._persist_calibration()
 
-            AuxCalibrationStore.save_timeouts(
-                self._calibration_path, self._model_filename, self._calibrated,
-            )
-        except OSError as e:
-            logger.warning("Failed to persist aux calibration: %s", e)
+    def _record_success(self, purpose: str, elapsed: float) -> None:
+        """成功所要秒を記録し、直近 p95 から較正値を組み直す。
+
+        ``calibrated = clamp(p95 × 1.3, base × 0.5, base × 3)``。旧実装はタイムアウト
+        時に引き上げるだけで、一度膨れた予算は二度と戻らなかった (モデルを軽い
+        ものへ替えても、失敗 1 回のコストが 3 倍のまま)。直近窓の p95 なら
+        実測が速くなれば自然に base 側へ戻る。
+        """
+        if not purpose or purpose in PURPOSE_TIMEOUT_CALIBRATION_EXEMPT:
+            return
+        samples = self._samples.setdefault(purpose, deque(maxlen=_CALIB_SAMPLE_WINDOW))
+        samples.append(float(elapsed))
+        if len(samples) < _CALIB_MIN_SAMPLES:
+            return
+        ordered = sorted(samples)
+        p95 = ordered[min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1))))]
+        base = PURPOSE_TIMEOUT_DEFAULTS.get(purpose, _DEFAULT_TIMEOUT)
+        target = min(max(p95 * _CALIB_P95_HEADROOM, base * _CALIB_MIN_SCALE), base * _CALIB_MAX_SCALE)
+        target = round(target, 1)
+        current = self._calibrated.get(purpose, base)
+        if abs(target - current) < 0.05 * base:
+            return
+        if target == base:
+            self._calibrated.pop(purpose, None)
+        else:
+            self._calibrated[purpose] = target
+        logger.info(
+            "Aux timeout recalibrated for purpose=%s: %.1fs -> %.1fs "
+            "(p95 %.1fs over %d samples, base %.1fs)",
+            purpose, current, target, p95, len(samples), base,
+        )
+        self._persist_calibration()
 
     async def generate(
         self,
@@ -231,7 +345,7 @@ class AuxClient:
         stream: bool = False,  # noqa: ARG002 - 常に非ストリーミング (面の互換のため受ける)
         temperature: float | None = None,
         max_tokens: int | None = 256,
-        id_slot: int | None = None,  # noqa: ARG002 - 常に background_slot
+        id_slot: int | None = None,  # noqa: ARG002 - スロットは purpose 別方針で決める
         timeout: float | None = None,
         purpose: str = "",
         cache_prompt: bool = False,  # noqa: ARG002 - LocalClient 側で常時 ON
@@ -243,64 +357,83 @@ class AuxClient:
         json_schema が解決できる purpose は文法制約経路
         (``generate_constrained``) を通す。解決できない自由文の purpose
         (``summarize`` / ``create_spec_doc`` 等) は通常生成へ落とす。
+        戻り値の ``choices[0].finish_reason`` は経路を問わず埋める
+        (``"length"`` = 切断)。
 
         Raises:
             TimeoutError: 予算超過。下位が投げる ``httpx.TimeoutException`` /
                 ``LLMTimeoutError`` は本例外へ正規化する — 呼出側は経路
                 (制約あり / なし) を意識せず 1 つの degraded 分岐で受けられる。
+                予算はスロットのロック取得後 (dispatch) から数える。
         """
         resolved = self._resolve_response_format(
             purpose, response_format, response_schema,
         )
-        slot = self.local.background_slot
+        slot = self._slot_for(purpose)
         effective_timeout = (
             timeout if timeout is not None else self.resolve_effective_timeout(purpose)
         )
-        started = time.monotonic()
-
-        try:
-            if resolved is not None:
-                content = await self.local.generate_constrained(
-                    messages,
-                    response_format=resolved,
-                    temperature=0.1 if temperature is None else temperature,
-                    max_tokens=max_tokens if max_tokens is not None else 256,
-                    id_slot=slot,
-                    timeout=effective_timeout,
+        queued_at = time.monotonic()
+        async with self._lock_for(slot):
+            started = time.monotonic()
+            queue_wait = started - queued_at
+            if queue_wait >= 1.0:
+                logger.info(
+                    "Aux request waited %.1fs for slot %d (purpose=%s)",
+                    queue_wait, slot, purpose or "<unspecified>",
                 )
-                result = {"choices": [{"message": {"content": content or ""}}]}
-            else:
-                result = await self.local.generate(
-                    messages=messages,
-                    stream=False,
-                    temperature=0.3 if temperature is None else temperature,
-                    max_tokens=max_tokens,
-                    id_slot=slot,
-                    request_timeout=effective_timeout,
-                )
-                if not isinstance(result, dict):
-                    # stream=False なので dict のはずだが、差し替え実装の事故は握り潰さない
-                    logger.warning(
-                        "Base generate returned %s for purpose=%s; treating as empty",
-                        type(result).__name__, purpose or "<unspecified>",
+            meta: dict = {}
+            try:
+                if resolved is not None:
+                    content = await self.local.generate_constrained(
+                        messages,
+                        response_format=resolved,
+                        temperature=0.1 if temperature is None else temperature,
+                        max_tokens=max_tokens if max_tokens is not None else 256,
+                        id_slot=slot,
+                        timeout=effective_timeout,
+                        result_meta=meta,
                     )
-                    result = {"choices": [{"message": {"content": ""}}]}
-        except (httpx.TimeoutException, LLMTimeoutError, TimeoutError) as e:
-            self._bump_calibrated_timeout(purpose)
-            self._log_request(
-                messages, {}, time.monotonic() - started,
-                purpose=purpose, effective_timeout=effective_timeout,
-                constrained=resolved is not None, finish_reason="timeout",
-            )
-            raise TimeoutError(
-                f"Aux generation timed out after {effective_timeout:.1f}s "
-                f"(purpose={purpose or '<unspecified>'})",
-            ) from e
+                    result = {"choices": [{
+                        "message": {"content": content or ""},
+                        "finish_reason": meta.get("finish_reason"),
+                    }]}
+                else:
+                    result = await self.local.generate(
+                        messages=messages,
+                        stream=False,
+                        temperature=0.3 if temperature is None else temperature,
+                        max_tokens=max_tokens,
+                        id_slot=slot,
+                        request_timeout=effective_timeout,
+                    )
+                    if not isinstance(result, dict):
+                        # stream=False なので dict のはずだが、差し替え実装の事故は握り潰さない
+                        logger.warning(
+                            "Base generate returned %s for purpose=%s; treating as empty",
+                            type(result).__name__, purpose or "<unspecified>",
+                        )
+                        result = {"choices": [{"message": {"content": ""}}]}
+            except (httpx.TimeoutException, LLMTimeoutError, TimeoutError) as e:
+                self._bump_calibrated_timeout(purpose)
+                self._log_request(
+                    messages, {}, time.monotonic() - started,
+                    purpose=purpose, effective_timeout=effective_timeout,
+                    constrained=resolved is not None, finish_reason="timeout",
+                    queue_wait=queue_wait, slot=slot,
+                )
+                raise TimeoutError(
+                    f"Aux generation timed out after {effective_timeout:.1f}s "
+                    f"(purpose={purpose or '<unspecified>'})",
+                ) from e
 
+        elapsed = time.monotonic() - started
+        self._record_success(purpose, elapsed)
         self._log_request(
-            messages, result, time.monotonic() - started,
+            messages, result, elapsed,
             purpose=purpose, effective_timeout=effective_timeout,
             constrained=resolved is not None,
+            queue_wait=queue_wait, slot=slot,
         )
         return result
 
@@ -317,7 +450,14 @@ class AuxClient:
         response_schema: type[BaseModel] | None = None,
         telemetry: dict | None = None,
     ) -> dict:
-        """JSON 出力を生成してパースする。パース不能時は空 dict を返す。"""
+        """JSON 出力を生成してパースする。パース不能時は空 dict を返す。
+
+        ``finish_reason=length`` (max_tokens 到達で JSON が途中で切れた) は
+        **修復しない**。``json_repair`` は ``[0, 1,`` を ``[0, 1]`` に閉じるので、
+        欠けた要素が「無かった」ことになって静かに誤った判定が通る (content
+        gate なら関連チャンクが落ちる)。空 dict で呼出側のフォールバックへ倒し、
+        ``telemetry["json_truncated"] = True`` で観測できるようにする。
+        """
         result = await self.generate(
             [{"role": "user", "content": prompt}],
             temperature=temperature,
@@ -329,6 +469,15 @@ class AuxClient:
         )
         content = _content_of(result)
         if not content.strip():
+            return {}
+        if _finish_reason_of(result) == "length":
+            if telemetry is not None:
+                telemetry["json_truncated"] = True
+            logger.warning(
+                "Aux JSON truncated at max_tokens=%d (purpose=%s, %d chars); "
+                "returning empty result instead of repairing",
+                max_tokens, purpose or "<unspecified>", len(content),
+            )
             return {}
 
         repair_telemetry: dict = telemetry if telemetry is not None else {}
@@ -364,21 +513,45 @@ class AuxClient:
         effective_timeout: float,
         constrained: bool,
         finish_reason: str = "",
+        queue_wait: float = 0.0,
+        slot: int | None = None,
     ) -> None:
-        """``requests`` JSONL へ補助呼出を記録する (DebugLogger 未注入時は no-op)。"""
+        """``requests`` JSONL へ補助呼出を記録する (DebugLogger 未注入時は no-op)。
+
+        ``queue_wait_sec`` / ``slot`` は ``log_aux_request`` がその kwarg を受ける
+        場合だけ渡す (debug_logger.py は本経路の管轄外なので、面が追随するまで
+        は落とす)。
+        """
         if self._debug_logger is None:
             return
         content = _content_of(result)
-        self._debug_logger.log_aux_request(
-            messages_count=len(messages),
-            response_preview=content,
-            elapsed_sec=elapsed,
-            purpose=purpose,
-            resolved_timeout=effective_timeout,
-            response_format_used=constrained,
-            finish_reason=finish_reason or _finish_reason_of(result),
-            response_length=len(content),
-        )
+        kwargs: dict[str, Any] = {
+            "messages_count": len(messages),
+            "response_preview": content,
+            "elapsed_sec": elapsed,
+            "purpose": purpose,
+            "resolved_timeout": effective_timeout,
+            "response_format_used": constrained,
+            "finish_reason": finish_reason or _finish_reason_of(result),
+            "response_length": len(content),
+        }
+        accepted = _accepted_kwargs(self._debug_logger.log_aux_request)
+        if accepted is None or "queue_wait_sec" in accepted:
+            kwargs["queue_wait_sec"] = round(queue_wait, 3)
+        if slot is not None and (accepted is None or "slot" in accepted):
+            kwargs["slot"] = slot
+        self._debug_logger.log_aux_request(**kwargs)
+
+
+def _accepted_kwargs(fn: Any) -> set[str] | None:
+    """``fn`` が受け取るキーワード名の集合 (``**kwargs`` を受けるなら ``None``)。"""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return None
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return None
+    return set(params)
 
 
 def _content_of(result: dict) -> str:
@@ -417,6 +590,7 @@ def _resolve_base_model_filename(config: dict) -> str:
 
 __all__ = [
     "AuxClient",
+    "CHAT_PATH_PURPOSES",
     "PURPOSE_TIMEOUT_CALIBRATION_EXEMPT",
     "PURPOSE_TIMEOUT_DEFAULTS",
 ]

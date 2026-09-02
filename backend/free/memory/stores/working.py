@@ -316,3 +316,156 @@ class WorkingMemory:
     def _total_tokens(self) -> int:
         """全ターンの推定トークン数"""
         return sum(_estimate_tokens(t["content"]) for t in self.turns)
+
+
+#: ``WorkingMemoryRegistry.drop`` の ``drain_to`` 既定値 (コンストラクタで
+#: 渡した STM を使う) を表す番兵。``None`` は「転送せず捨てる」の意味で使う。
+_DRAIN_DEFAULT = object()
+
+
+class WorkingMemoryRegistry:
+    """セッション別 :class:`WorkingMemory` の台帳 (LRU 上限付き)。
+
+    以前は WM がプロセスに 1 つしか無く、``prepare_memory_context`` がセッション
+    切替のたびに窓を空にして STM へ流していた。並行セッションでは A の生成中に
+    B が窓を奪い、A の応答が B の会話に載る (2026-09-02 監査 A-5 の迂回ガード
+    が要った理由)。ここでは session_id ごとに独立した WM を持ち、切替という
+    概念そのものを無くす。
+
+    - :meth:`get` は無ければ作る。触ったセッションを LRU の末尾へ動かし、
+      ``memory.working_max_sessions`` を超えたら最古のセッションを
+      **セッション終了と同じ経路** (``clear()`` → drain ハンドラ) で STM へ
+      流してから落とす (f_02 §1.2 経路 (b))。
+    - drain ハンドラは api 層のエコー落とし規則 (``chat_recorder.
+      drain_evicted_to_stm``) を持つため **注入** で受ける
+      (``SleepTimeScheduler.set_pre_full_flush`` と同じ配線パターン)。未注入
+      なら ``stm.absorb`` を直に呼ぶ縮退動作。
+    - :class:`WorkingMemory` 自体の意味 (窓 / 押し出しブロック / ``absorbed`` /
+      ``session_first_user_turn`` / ``session_evicted_turns``) は変えない。
+    """
+
+    def __init__(
+        self,
+        config: dict,
+        *,
+        drain_to=None,
+        drain_handler=None,
+    ) -> None:
+        mem = config.get("memory", {})
+        # フォールバックはスキーマ既定 (backend/schemas/memory.py) と同じ値。
+        self.max_sessions: int = max(1, int(mem.get("working_max_sessions", 8)))
+        self._config = config
+        self._drain_to = drain_to
+        self._drain_handler = drain_handler
+        self._sessions: dict[str, WorkingMemory] = {}
+        # legacy 読み手 (session_id を持たない統計 API 等) が 1 件も無いときに
+        # 見る空の窓。台帳には載せないので drain / snapshot の対象にならない。
+        self._scratch: WorkingMemory | None = None
+
+    # ── 取得 ────────────────────────────────────────────────────────
+
+    def get(self, session_id: str) -> WorkingMemory:
+        """``session_id`` の WM を返す (無ければ作る)。LRU の末尾へ動かす。"""
+        wm = self._sessions.pop(session_id, None)
+        if wm is None:
+            wm = WorkingMemory(self._config)
+            wm.session_id = session_id
+            logger.debug(
+                "registry: new working memory for session %s (active=%d)",
+                session_id, len(self._sessions) + 1,
+            )
+        self._sessions[session_id] = wm
+        self._evict_over_capacity(keep=session_id)
+        return wm
+
+    def peek(self, session_id: str) -> WorkingMemory | None:
+        """作らずに返す (無ければ ``None``)。LRU 順は動かさない。"""
+        return self._sessions.get(session_id)
+
+    def current(self) -> WorkingMemory:
+        """最後に触ったセッションの WM (legacy: session_id を持たない読み手向け)。
+
+        並行セッション下では「誰の窓か」が定まらないので、応答パスでは必ず
+        :meth:`get` を session_id 付きで使うこと。1 件も無ければ台帳外の空の
+        窓を返す (統計 API が ``len(wm.turns)`` を読めるように)。
+        """
+        if self._sessions:
+            return next(reversed(self._sessions.values()))
+        if self._scratch is None:
+            self._scratch = WorkingMemory(self._config)
+        return self._scratch
+
+    def active_sessions(self) -> list[str]:
+        """台帳にあるセッション ID (古い順)。"""
+        return list(self._sessions)
+
+    def __len__(self) -> int:
+        return len(self._sessions)
+
+    # ── 終了 / 転送 ────────────────────────────────────────────────
+
+    def drop(self, session_id: str, *, drain_to=_DRAIN_DEFAULT) -> WorkingMemory | None:
+        """セッションの WM を台帳から外す。
+
+        ``drain_to`` に STM を渡すと (既定はコンストラクタの ``drain_to``)、
+        まだ STM へ渡していないターンを **そのセッション ID で** 吸収してから
+        落とす (f_02 §1.2 経路 (b): ``clear()`` → drain)。``None`` なら捨てる。
+        無ければ ``None`` を返す。
+        """
+        wm = self._sessions.pop(session_id, None)
+        if wm is None:
+            return None
+        target = self._drain_to if drain_to is _DRAIN_DEFAULT else drain_to
+        pending = len(wm.turns)
+        # ``clear()`` を先に実行してから drain する。逆順だと窓超過で既に押し
+        # 出された分しか拾えず、会話本体は転送バッファに滞留する。
+        wm.clear()
+        if target is not None:
+            self._drain(wm, target, session_id)
+        logger.debug(
+            "registry: dropped session %s (%d turns pending, drained=%s, active=%d)",
+            session_id, pending, target is not None, len(self._sessions),
+        )
+        return wm
+
+    def drain_all(self, drain_to=_DRAIN_DEFAULT) -> int:
+        """全セッションを :meth:`drop` する (プロセス終了時)。落とした件数を返す。"""
+        sids = self.active_sessions()
+        for sid in sids:
+            self.drop(sid, drain_to=drain_to)
+        return len(sids)
+
+    def snapshot_all_unabsorbed(self) -> list[tuple[str, list[dict]]]:
+        """全セッションの未転送ターンを **非破壊で** 返す (Full 直前の経路 (c))。
+
+        ``[(session_id, turns), ...]`` を古いセッション順で返す。ターンには
+        ``absorbed`` の印が立つので、後で押し出されても二重吸収されない。
+        未転送が無いセッションは含めない。
+        """
+        out: list[tuple[str, list[dict]]] = []
+        for sid, wm in self._sessions.items():
+            pending = wm.snapshot_unabsorbed()
+            if pending:
+                out.append((sid, pending))
+        return out
+
+    # ── 内部 ────────────────────────────────────────────────────────
+
+    def _evict_over_capacity(self, *, keep: str) -> None:
+        while len(self._sessions) > self.max_sessions:
+            oldest = next(iter(self._sessions))
+            if oldest == keep:
+                # 上限 1 で自分しか居ない、等。取ったばかりの窓は落とさない。
+                break
+            logger.info(
+                "registry: session cap %d reached, draining LRU session %s to STM",
+                self.max_sessions, oldest,
+            )
+            self.drop(oldest)
+
+    def _drain(self, wm: WorkingMemory, stm, session_id: str) -> None:
+        if self._drain_handler is not None:
+            self._drain_handler(wm, stm, session_id)
+            return
+        for turn in wm.drain_evicted():
+            stm.absorb(turn, session_id)

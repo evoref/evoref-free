@@ -859,26 +859,29 @@ class SleepTimeWorker:
     def _step5_5_decay_patterns(self) -> int:
         """Step 5.5: 学習済みパターンの重み減衰と永続化
 
-        sleep-time Light で毎回実行。LLM 不要。
-        重みが閾値未満に低下したパターンは自動削除される。
+        sleep-time Light で毎回呼ばれるが、減衰そのものは
+        ``LearnedPatternStore.maybe_decay_all`` が壁時計で間引く
+        (``PATTERN_DECAY_INTERVAL_SEC``)。Light は LLM 生成ごとに走るため、
+        毎回減衰すると学習した語が数ターンで消えていた。永続化は追加 /
+        重み変更 / 削除があった時 (``dirty``) だけ行う。LLM 不要。
         """
         if self.learned_patterns is None:
             return 0
 
-        removed = self.learned_patterns.decay_all()
+        removed = self.learned_patterns.maybe_decay_all()
 
-        # 永続化
-        try:
-            from backend.config import get_path_resolver
-            resolver = get_path_resolver()
-            patterns_file = resolver.resolve_local("learned_patterns_file")
-            self.learned_patterns.save(patterns_file)
-        except Exception as e:
-            logger.warning("Failed to save learned patterns: %s", e)
+        if self.learned_patterns.dirty:
+            try:
+                from backend.config import get_path_resolver
+                resolver = get_path_resolver()
+                patterns_file = resolver.resolve_local("learned_patterns_file")
+                self.learned_patterns.save(patterns_file)
+            except Exception as e:
+                logger.warning("Failed to save learned patterns: %s", e)
 
         if removed:
             logger.info("Step 5.5: decayed %d patterns", removed)
-        return removed
+        return removed or 0
 
     async def _step5_8_contextual_prefixes(self, llm_client) -> int:
         """Step 5.8: Contextual Retrieval プレフィックス生成。

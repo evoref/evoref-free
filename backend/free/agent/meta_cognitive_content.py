@@ -41,6 +41,39 @@ from backend.log_config import get_logger
 logger = get_logger("agent.meta_cognitive")
 
 
+def note_stream_truncation(agent: object, stream: object, step: str) -> bool:
+    """消費し終えた ``TokenStream`` の ``outcome`` を見て切断をエージェントへ刻む。
+
+    メタ経路はストリームを内部で消費するため、deliberative の
+    ``_capture_stream_outcome`` に相当する観測点がここになる。``outcome`` を
+    持たないイテレータ (テストの mock) は素通し。切れていれば
+    ``agent._truncated_steps`` に ``step`` を積み、最後に切れた生成の
+    トークン数 / max_tokens を保持する (``MetaCognitiveResponse`` へ転写)。
+
+    Returns:
+        切断を記録したか。
+    """
+    outcome = getattr(stream, "outcome", None)
+    if outcome is None or not getattr(outcome, "truncated", False):
+        return False
+    steps = getattr(agent, "_truncated_steps", None)
+    if steps is None:
+        steps = []
+        agent._truncated_steps = steps  # type: ignore[attr-defined]
+    steps.append(step)
+    agent._truncated_tokens = int(  # type: ignore[attr-defined]
+        getattr(outcome, "tokens_generated", 0) or 0,
+    )
+    agent._truncated_max_tokens = getattr(  # type: ignore[attr-defined]
+        outcome, "max_tokens", None,
+    )
+    logger.warning(
+        "MetaCognitive %s generation hit max_tokens=%s (finish_reason=length)",
+        step, getattr(outcome, "max_tokens", None),
+    )
+    return True
+
+
 class _ContentGenerationMixin:
     """write_file へ渡す本文の生成。
 
@@ -410,6 +443,7 @@ class _ContentGenerationMixin:
                         self._content_gen_timeout,
                     )
                     return f"(Content generation failed: timeout after {self._content_gen_timeout}s)"
+            note_stream_truncation(self, stream, "content")
             raw = "".join(chunks).strip()
             content = (
                 unwrap_sole_code_fence(raw)

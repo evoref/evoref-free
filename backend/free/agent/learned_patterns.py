@@ -32,6 +32,15 @@ DEFAULT_BOOST_AMOUNT = 0.15
 DEFAULT_MIN_WEIGHT = 0.1
 DEFAULT_MATCH_THRESHOLD = 0.3
 
+#: ``decay_all`` を sleep-time から適用する最小間隔 (秒)。
+#:
+#: Step 5.5 は Light ごと (= LLM 生成のたび) に走るため、ターン単位で減衰
+#: すると初期重み 0.5 の語は 8 ターンで min_weight を割って消える
+#: (2026-09-02 監査 R-C1: 「学習した語が翌日には無い」)。減衰は「使われない
+#: まま時間が経った」の代理なので、壁時計で 6 時間に 1 回へ絞る。学習の
+#: 設定キーには載せない (schema 変更を避ける) 定数。
+PATTERN_DECAY_INTERVAL_SEC = 6 * 3600
+
 # 意図キーワード抽出用パターン（動詞・指示語を重点抽出）
 _INTENT_PATTERNS = [
     # 日本語動詞・指示語（「〜して」「〜しろ」「〜してください」等の語幹）
@@ -131,10 +140,23 @@ class LearnedPatternStore:
         self.match_threshold: float = cfg.get("pattern_match_threshold", DEFAULT_MATCH_THRESHOLD)
 
         self._patterns: dict[str, LearnedPattern] = {}
+        # 直近に ``decay_all`` を適用した壁時計。起動時刻で初期化し、
+        # ``load`` でファイルに残した値があればそれで上書きする (6h 間隔が
+        # 再起動で仕切り直されないようにする。欠損 = 旧形式は「今」扱い)。
+        self._last_decay_at: float = time.time()
+        # 重み / 件数が変わったか (Step 5.5 が「変更があった時だけ保存」する印)。
+        # ``match`` のヒット統計は含めない — 毎ターン変わる値で毎ターン書くのを
+        # 避ける (次の実変更時にまとめて永続化される)。
+        self._dirty: bool = False
 
     @property
     def count(self) -> int:
         return len(self._patterns)
+
+    @property
+    def dirty(self) -> bool:
+        """前回の ``save`` 以降にパターンの追加 / 重み変更 / 削除があったか。"""
+        return self._dirty
 
     @property
     def patterns(self) -> dict[str, LearnedPattern]:
@@ -187,6 +209,7 @@ class LearnedPatternStore:
             self._patterns[key] = pattern
             logger.info("Learned new pattern: '%s' (category=%s)", keyword, category)
 
+        self._dirty = True
         # 上限超過時は低重みパターンを削除
         self._enforce_limit()
         return pattern
@@ -195,12 +218,18 @@ class LearnedPatternStore:
         self,
         text: str,
         category: str | None = None,
+        *,
+        record_hit: bool = True,
     ) -> list[tuple[str, float]]:
         """テキストに対して学習済みパターンをマッチングする
 
         Args:
             text: マッチング対象テキスト
             category: フィルタするカテゴリ（None で全カテゴリ）
+            record_hit: ``hit_count`` / ``last_hit`` を更新するか。実際の
+                ルーティング判定 (tool judge / router) では True。評価・
+                Level 1 の再判定など「観測するだけ」の呼び出しでは False を
+                渡し、読むだけで統計が動かないようにする。
 
         Returns:
             マッチしたパターンのリスト [(keyword, weight), ...]
@@ -231,9 +260,9 @@ class LearnedPatternStore:
                 continue
             claimed.append((start, end))
             matches.append((pattern.keyword, pattern.weight))
-            # ヒットカウントを更新
-            pattern.hit_count += 1
-            pattern.last_hit = time.time()
+            if record_hit:
+                pattern.hit_count += 1
+                pattern.last_hit = time.time()
 
         return sorted(matches, key=lambda x: -x[1])
 
@@ -250,6 +279,7 @@ class LearnedPatternStore:
         amt = amount if amount is not None else self.boost_amount
         pattern = self._patterns[key]
         pattern.weight = min(1.0, pattern.weight + amt)
+        self._dirty = True
         logger.debug("Boosted pattern '%s': weight=%.3f (+%.3f)", key, pattern.weight, amt)
 
     def decay_one(self, keyword: str, amount: float | None = None) -> None:
@@ -267,6 +297,7 @@ class LearnedPatternStore:
         amt = amount if amount is not None else self.decay_rate
         pattern = self._patterns[key]
         pattern.weight -= amt
+        self._dirty = True
         if pattern.weight < self.min_weight:
             del self._patterns[key]
             logger.debug("Removed pattern '%s' (below min_weight after decay)", key)
@@ -291,9 +322,26 @@ class LearnedPatternStore:
             del self._patterns[key]
             removed += 1
 
+        if self._patterns or removed:
+            self._dirty = True
         if removed:
             logger.info("Decayed and removed %d patterns", removed)
         return removed
+
+    def maybe_decay_all(self, now: float | None = None) -> int | None:
+        """``PATTERN_DECAY_INTERVAL_SEC`` 以上経っていれば ``decay_all`` を適用する。
+
+        sleep-time Light (Step 5.5) から毎回呼ばれる入口。間隔内なら何もせず
+        ``None`` を返す (「減衰しなかった」と「減衰したが削除 0 件」を区別する)。
+
+        Returns:
+            適用時は削除されたパターン数、スキップ時は ``None``。
+        """
+        current = now if now is not None else time.time()
+        if current - self._last_decay_at < PATTERN_DECAY_INTERVAL_SEC:
+            return None
+        self._last_decay_at = current
+        return self.decay_all()
 
     def decrement_source_count(self, keyword: str) -> None:
         """パターンの source_count を減算する（カートリッジ unload 用）
@@ -305,6 +353,7 @@ class LearnedPatternStore:
             return
         pattern = self._patterns[key]
         pattern.source_count -= 1
+        self._dirty = True
         if pattern.source_count <= 0:
             del self._patterns[key]
             logger.debug("Removed pattern '%s' (source_count=0)", key)
@@ -428,6 +477,7 @@ class LearnedPatternStore:
         overflow = len(self._patterns) - self.max_patterns
         for key, _ in sorted_patterns[:overflow]:
             del self._patterns[key]
+        self._dirty = True
         logger.info("Removed %d low-weight patterns (limit: %d)", overflow, self.max_patterns)
 
     def get_stats(self) -> dict:
@@ -450,8 +500,14 @@ class LearnedPatternStore:
         }
 
     def save(self, path: str | Path) -> None:
-        """JSON ファイルに永続化する (infra 層に委譲)"""
-        LearnedPatternRepository.save(self._patterns, path)
+        """JSON ファイルに永続化する (infra 層に委譲)。常に書き、dirty を下ろす。
+
+        ``_last_decay_at`` も同じファイルへ残し、減衰間隔を再起動越しに保つ。
+        """
+        LearnedPatternRepository.save(
+            self._patterns, path, last_decay_at=self._last_decay_at,
+        )
+        self._dirty = False
 
     def load(self, path: str | Path) -> None:
         """JSON ファイルからロードする (infra 層に委譲)
@@ -462,9 +518,13 @@ class LearnedPatternStore:
         (``_TOOL_ROUTING_NONLEARNABLE_EXACT``) も除外し、除外セット導入前に
         学習された残存データ (「説明」w=0.630 等) を再起動時に自動浄化する。
         """
-        loaded = LearnedPatternRepository.load(path)
-        if loaded is None:
+        result = LearnedPatternRepository.load_with_meta(path)
+        if result is None:
             return
+        loaded, meta = result
+        stored_decay = meta.get("last_decay_at")
+        if isinstance(stored_decay, (int, float)) and stored_decay > 0:
+            self._last_decay_at = float(stored_decay)
 
         self._patterns.clear()
         for key, pattern in loaded.items():
@@ -486,4 +546,5 @@ class LearnedPatternStore:
                 )
                 continue
             self._patterns[key] = pattern
+        self._dirty = False
         logger.info("Loaded %d learned patterns from %s", len(self._patterns), path)

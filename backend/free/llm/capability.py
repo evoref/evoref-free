@@ -206,7 +206,7 @@ async def probe_model_capabilities(
                 "messages": [{"role": "user", "content": _REASONING_PROBE_PROMPT}],
                 "stream": False,
                 "temperature": 0.0,
-                "max_tokens": 128,
+                "max_tokens": PROBE_REASONING_MAX_TOKENS,
             },
         )
         reasoning_separated, emits_think, closes_think = interpret_reasoning_probe(
@@ -269,6 +269,30 @@ async def probe_model_capabilities(
     return snapshot
 
 
+#: プローブ 1 本のタイムアウトに含める固定分 (秒)。ロード直後の冷えた KV での
+#: prefill とスロット確保の揺れを吸収する。
+PROBE_BASE_SEC = 30.0
+#: decode 速度の見積り: ``PROBE_DECODE_TPS_NUMERATOR / params_b`` tok/s
+#: (4B ≒ 15 tok/s、27B ≒ 2.2 tok/s、iGPU での実測に合わせた粗い比例則)。
+#: 下限 ``PROBE_MIN_DECODE_TPS`` で 70B 級でも有限に収める。
+PROBE_DECODE_TPS_NUMERATOR = 60.0
+PROBE_MIN_DECODE_TPS = 1.5
+#: P1/P2 (reasoning) カナリアの max_tokens。
+PROBE_REASONING_MAX_TOKENS = 128
+
+
+def probe_timeout_sec(params_b: float, max_tokens: int) -> float:
+    """プローブ 1 本のタイムアウト秒をモデルサイズに追随させる。
+
+    ``PROBE_BASE_SEC + max_tokens / decode_tps(params_b)``。固定 120 秒 / 90 秒
+    だと、小型モデルでは長すぎて起動直後の失敗検知が遅れ、大型モデル (27B+) の
+    iGPU では 128 トークンの decode だけで足りない (観測が恒久的に ``None`` に
+    なり、``enable_thinking`` の自動再解決が宣言値のまま固定される)。
+    """
+    tps = max(PROBE_MIN_DECODE_TPS, PROBE_DECODE_TPS_NUMERATOR / max(1.0, float(params_b or 1.0)))
+    return PROBE_BASE_SEC + float(max_tokens) / tps
+
+
 def make_llama_chat_fn(
     llama_url: str,
     *,
@@ -321,5 +345,6 @@ __all__ = [
     "interpret_reasoning_probe",
     "resolve_effective_reasoning_mode",
     "probe_model_capabilities",
+    "probe_timeout_sec",
     "make_llama_chat_fn",
 ]

@@ -84,6 +84,11 @@ class PathResolver:
         "create_workspace_dir": "local/create/",
         # base 学習データの (model × mode) パーティションルート。
         "learning_dir": "local/learning/",
+        # Level 1 phase6 (GenerationParamEvolver) の学習デルタ。base モデル依存
+        # なので resolve_learning でパーティション配下へ置く。
+        "generation_deltas_file": "local/generation_deltas.json",
+        # develop=evolve の LogIngestor 進捗 (読み込みオフセット)。
+        "log_ingestor_file": "local/state/log_ingestor.json",
     }
 
     # resolve_learning で active モデルパーティション配下へ rebase する base 学習キーと、
@@ -101,6 +106,7 @@ class PathResolver:
         "control_vector_adapter": "models/control_vector.gguf",
         "control_vector_versions_dir": "models/control_vector_versions",
         "cvector_work_dir": "cvector",
+        "generation_deltas_file": "generation_deltas.json",
     }
 
     # ``_LEARNING_SUBPATH`` のうち、``learning.level2_adapter_partition=="model_mode"``
@@ -828,7 +834,13 @@ def get_mode_generation_params(mode: str) -> dict:
     try:
         from backend.free.learning.generation_delta_store import GenerationDeltaStore
         from backend.free.learning.generation_param_evolver import apply_deltas
-        delta_path = get_project_root() / "local" / "generation_deltas.json"
+        resolver = get_path_resolver()
+        delta_path = resolver.resolve_learning("generation_deltas_file")
+        if not delta_path.exists():
+            # 旧配置 (local/generation_deltas.json、パーティション導入前) を読む後方互換
+            legacy = resolver.resolve_local("generation_deltas_file")
+            if legacy.exists():
+                delta_path = legacy
         mode_deltas = GenerationDeltaStore.load_mode(delta_path, mode)
         if mode_deltas:
             params = apply_deltas(params, mode_deltas)

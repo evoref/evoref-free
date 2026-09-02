@@ -192,13 +192,20 @@ class DebugLogger:
         response_format_used: bool = False,
         finish_reason: str = "",
         response_length: int = 0,
+        queue_wait_sec: float | None = None,
+        slot: int | None = None,
     ) -> None:
         """補助タスクのリクエスト/レスポンスを記録
 
         Args:
-            priority: 用途別セマフォ選択
-                ``realtime`` / ``background`` / ``learning`` のいずれか。
-                ``AuxClient`` 以外から呼び出される場合のみ空文字列。
+            priority: 互換のため残す旧フィールド (セマフォは未実装)。
+                ``AuxClient`` は渡さないので通常は空文字列。
+            queue_wait_sec: slot ロック取得までの待ち秒。purpose timeout は
+                dispatch 起点で計るため、この値を分けて記録しないと
+                「モデルが遅い」と「slot 待ち」を較正側で区別できない。
+                ``None`` なら記録しない。
+            slot: 実際に送った ``id_slot`` (chat 経路 purpose は classifier
+                slot、それ以外は background slot)。``None`` なら記録しない。
             resolved_timeout: 実際に適用されたタイムアウト秒
                 purpose 別の解決値 (``PURPOSE_TIMEOUT_DEFAULTS`` と
                 ``local/aux_calibration.json`` の較正) と既定値のどちらが採用されたか
@@ -241,6 +248,10 @@ class DebugLogger:
             entry["finish_reason"] = finish_reason
         if response_length:
             entry["response_length"] = int(response_length)
+        if queue_wait_sec is not None:
+            entry["queue_wait_sec"] = round(float(queue_wait_sec), 3)
+        if slot is not None:
+            entry["slot"] = int(slot)
         self._emit("requests", entry)
 
     def log_retry_attempt(
@@ -306,7 +317,7 @@ class DebugLogger:
         """aux 応答が json-repair (戦略 4) で復旧されたことを記録
 
         ``response_format=json_schema`` を適用しても
-        ``max_tokens`` / ``reasoning_budgets`` 到達による truncation、Pro
+        ``max_tokens`` 到達による truncation (思考トークンが枝を食う場合を含む)、Pro
         外部 API (GBNF 非対応)、``--skip-chat-parsing`` の
         raw content 経路では構造的に不完全な JSON が返ることがある。
         ``json_extract.extract_json_object`` の戦略 4 が該当ケースを修復
@@ -360,6 +371,21 @@ class DebugLogger:
         if mode:
             entry["mode"] = mode
         self._emit("requests", entry)
+
+    def log_context_guard(self, op: str, stats: dict) -> None:
+        """送信直前の context guard (``LocalClient._enforce_context_budget``) 発火を記録
+
+        ``build_messages`` の予算計算の後に足された注記 / ツール結果で
+        コンテキストを超えた場合にだけ発火する。頻度と削った量を
+        ``requests.jsonl`` に残し、予算側 (``post_append_reserve``) の較正に使う。
+        """
+        if not self.enabled or not self.log_requests:
+            return
+        self._emit("requests", {
+            "timestamp": _now(),
+            "op": op,
+            **{k: v for k, v in (stats or {}).items() if k not in ("timestamp", "op")},
+        })
 
     def log_kv_cache(self, *, tokens_prompt: int, tokens_cached: int) -> None:
         """KV キャッシュヒット状況を記録（llama-server usage.prompt_tokens_details から）"""

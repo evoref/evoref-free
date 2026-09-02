@@ -4,12 +4,15 @@
 複数戦略でフォールバックしながら JSON を抽出する。judge.py / aux_client /
 cogwriter など JSON 応答をパースする箇所で共通利用する
 
-戦略 4: ``response_format=json_schema`` を採用しても
-``max_tokens`` / ``reasoning_budgets[purpose]`` 到達による構造的切断、Pro 外部
-API (GBNF 非対応)、``--skip-chat-parsing`` の raw content 経路
-古い llama-server build などでは依然として truncation が発生し得る。最終フォール
-バックとして ``json_repair`` で機械的に閉じ括弧補完を行い、購入後の必要性
-評価のため telemetry out-param で repair 使用を呼出側に伝える。
+戦略 4: ``response_format=json_schema`` を採用しても、Pro 外部 API (GBNF 非対応)、
+``--skip-chat-parsing`` の raw content 経路、古い llama-server build などでは
+依然として構造的不正が発生し得る。最終フォールバックとして ``json_repair`` で
+機械的に閉じ括弧補完を行い、必要性評価のため telemetry out-param で repair
+使用を呼出側に伝える。
+
+``max_tokens`` 到達 (``finish_reason=length``) の切断は **ここで修復しない**
+方針 — ``[0, 1,`` を ``[0, 1]`` に閉じると欠けた要素が「無かった」ことになる。
+``AuxClient.generate_json`` が finish_reason を見て空応答へ倒す。
 """
 
 from __future__ import annotations
@@ -20,6 +23,27 @@ import re
 from backend.log_config import get_logger
 
 logger = get_logger("llm.json_extract")
+
+#: ドライブ文字付きの Windows パス (``E:\tmp\x.py``)。LLM は JSON 文字列内で
+#: バックスラッシュをエスケープしないことが多く、``json.loads`` が ``\t`` / ``\f``
+#: を制御文字に化かして ``E:mpizz`` のようなパスになる (2026-09-02 実機)。
+_WINDOWS_PATH_RE = re.compile(r'(?<![A-Za-z0-9_])([A-Za-z]:)((?:\\+[^\\"\s]+)+)')
+_SINGLE_BACKSLASH_RE = re.compile(r"(?<!\\)\\(?!\\)")
+
+
+def escape_windows_path_backslashes(text: str) -> str:
+    """JSON 文字列内のドライブ付きパスで、単独のバックスラッシュを ``\\\\`` に直す。
+
+    既にエスケープ済み (``\\\\``) の箇所は触らない。パス以外の ``\\n`` (コード本文の
+    改行エスケープ) はドライブ文字に続かないので対象外。
+    """
+    if "\\" not in text:
+        return text
+
+    def _fix(m: re.Match) -> str:
+        return m.group(1) + _SINGLE_BACKSLASH_RE.sub(r"\\\\", m.group(2))
+
+    return _WINDOWS_PATH_RE.sub(_fix, text)
 
 
 def strip_code_fences(content: str) -> str:
@@ -105,7 +129,7 @@ def extract_json_object(
     if not content:
         return None
 
-    normalized = strip_code_fences(content)
+    normalized = escape_windows_path_backslashes(strip_code_fences(content))
 
     # 戦略 1: 正規化後の文字列をそのまま JSON として解釈
     try:

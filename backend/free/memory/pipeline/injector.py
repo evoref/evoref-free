@@ -45,7 +45,7 @@ import time
 
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Literal, Sequence
+from typing import Any, Callable, Iterable, Literal, Sequence
 
 from backend.free.core.intent_vocab import is_plain_statement
 from backend.free.core.text_quality import (
@@ -737,7 +737,31 @@ class MemoryInjector:
         # Tier ごとに分類
         buckets: dict[int, list[InjectedItem]] = {1: [], 2: [], 3: [], 4: []}
 
-        facts, collapsed, stale_texts = self._collapse_to_current_values(facts)
+        # ``states_no_user_value`` は正規表現の束で、以前は畳み込み 2 段 +
+        # 注入ループの 3 箇所で同じファクトに対して計 3 回走っていた。
+        # ファクト単位で 1 回に畳む (id(fact) 引き)。
+        no_value: dict[int, bool] = {}
+
+        # 属性またぎの畳み込み (``_collapse_by_attribute``) に参加させるファクト。
+        # 型はユーザー属性 4 種に限る (sleep-time 側の
+        # ``semantic_conflict_resolver._CROSS_SLOT_TYPES`` と同じ集合) — 別型の
+        # ``mem.project.<id>.location`` や ``loop.task.<x>.location`` が末尾
+        # セグメントの一致だけで ``mem.personal.location`` を畳み、しかも自分は
+        # chat で注入されない (``_classify_fact`` が None) ため、スロットごと
+        # 消えていた。**注入されない側が注入される側を抑えてはいけない** ので、
+        # 畳み込みは「この mode で配置対象になる」ファクト同士に限る。
+        def _collapsible(fact: SemanticFact) -> bool:
+            if fact.type not in _USER_ATTRIBUTE_FACT_TYPES:
+                return False
+            if str(fact.subject or "").startswith(("loop.", "learn.")):
+                return False
+            return self._classify_fact(
+                fact, mode, current_project_id, sigs,
+            ) is not None
+
+        facts, collapsed, stale_texts = self._collapse_to_current_values(
+            facts, collapsible=_collapsible, no_value_cache=no_value,
+        )
         filtered_out += collapsed
         # 関連度スコアは候補ごとの numpy 演算ではなく 1 回の行列積で求める
         # (:meth:`_relevance_scores`)。判定の意味は変わらない。
@@ -786,7 +810,7 @@ class MemoryInjector:
             # (2026-08-19 実測: 実ストアの依頼形 21 件中 14 件が飲み物スロット)。
             # ノート側 (下) は ``carries_no_assertion`` のまま — 依頼は
             # 「後から引きたい記録」としては正当なので落とさない。
-            if states_no_user_value(fact.object or ""):
+            if self._no_user_value(fact, no_value):
                 filtered_out += 1
                 continue
             # セッション要約は「会話で何が起きたか」のメタ記録であって、
@@ -1068,8 +1092,15 @@ class MemoryInjector:
         facts: Iterable[SemanticFact],
         query_embedding: "np.ndarray | None",
         fact_relevance_scores: "dict[str, float] | None" = None,
+        *,
+        require_embedding: bool = False,
     ) -> set[str] | None:
         """関連度ゲートを通ったファクト id を返す。ゲート無効時は ``None``。
+
+        ``require_embedding=True`` で、スコアも埋め込みも無いファクトを
+        「判定不能なので通す」ではなく落とす (競合セクション用。予算の外で
+        毎ターン連結される枠なので、判定できないものを通すと無関係な矛盾が
+        全ターンに載る)。``pinned`` は従来どおり通す。
 
         Tier パッキングを経由しない注入経路 (``[記憶の競合]`` セクション) が、
         注入本体と **同じ棒** を使うための入口。``None`` は「ゲートを掛けられ
@@ -1093,6 +1124,7 @@ class MemoryInjector:
             if self._passes_gate(
                 query_vec, f,
                 pinned=bool(getattr(f, "pinned", False)), scores=scores,
+                require_embedding=require_embedding,
             )
         }
 
@@ -1475,10 +1507,31 @@ class MemoryInjector:
         # 同着かつ訂正フラグも同じ — 抽出順 (= 会話順) で後の方が新しい。
         return True
 
+    @staticmethod
+    def _no_user_value(fact: SemanticFact, cache: "dict[int, bool] | None") -> bool:
+        """``states_no_user_value(fact.object)`` をファクト単位で 1 回だけ評価する。"""
+        if cache is None:
+            return states_no_user_value(fact.object or "")
+        key = id(fact)
+        hit = cache.get(key)
+        if hit is None:
+            hit = states_no_user_value(fact.object or "")
+            cache[key] = hit
+        return hit
+
     def _collapse_to_current_values(
-        self, facts: Iterable[SemanticFact],
+        self,
+        facts: Iterable[SemanticFact],
+        *,
+        collapsible: "Callable[[SemanticFact], bool] | None" = None,
+        no_value_cache: "dict[int, bool] | None" = None,
     ) -> tuple[list[SemanticFact], int, set[str]]:
         """1 スロット 1 値へ畳む (純粋関数的。入力は変更しない)。
+
+        ``collapsible`` は属性またぎの畳み込み (:meth:`_collapse_by_attribute`)
+        に参加させるファクトの述語。``None`` なら全件 (旧挙動、テスト互換)。
+        ``no_value_cache`` は ``states_no_user_value`` の評価結果を共有する
+        辞書 (:meth:`_no_user_value`)。
 
         2 段階で落とす:
 
@@ -1540,7 +1593,7 @@ class MemoryInjector:
             # が並び、質問が代表になった結果「猫の名前は？」に対して答えが 1 件も
             # 注入されず「文脈が不足しています」と回答した (類似度 0.490 で
             # 関連度ゲートは通っていた)。判定順序だけの問題。
-            if states_no_user_value(fact.object or ""):
+            if self._no_user_value(fact, no_value_cache):
                 out.append(fact)          # 既存ループ側の同じ判定に委ねる
                 continue
             exact = (fact.subject, fact.predicate, fact.object)
@@ -1572,7 +1625,9 @@ class MemoryInjector:
         # 「好きな飲み物は？」に **数日前の「ほうじ茶」**、まとめでは
         # 「コーヒー」と答えた。属性名 (subject の末尾セグメント) で
         # もう一段畳んで最新 1 値に寄せる。
-        out, attr_dropped = self._collapse_by_attribute(out, stale_texts)
+        out, attr_dropped = self._collapse_by_attribute(
+            out, stale_texts, collapsible=collapsible, no_value_cache=no_value_cache,
+        )
         dropped += attr_dropped
         if dropped:
             logger.debug(
@@ -1581,22 +1636,35 @@ class MemoryInjector:
         return out, dropped, stale_texts
 
     def _collapse_by_attribute(
-        self, facts: list[SemanticFact], stale_texts: set[str],
+        self,
+        facts: list[SemanticFact],
+        stale_texts: set[str],
+        *,
+        collapsible: "Callable[[SemanticFact], bool] | None" = None,
+        no_value_cache: "dict[int, bool] | None" = None,
     ) -> tuple[list[SemanticFact], int]:
         """属性名 (subject 末尾) をまたいだ世代を 1 値へ畳む。
 
         ``_attribute_key`` が ``None`` を返す subject (階層が浅い / 汎用語) は
         対象外。会話要約 (``mem.decision.history.session.<id>``) は末尾が
         セッション ID なので互いに衝突せず、そのまま残る。
+
+        ``collapsible`` が偽を返すファクトは畳み込みに **参加しない** (勝者にも
+        敗者にもならず、そのまま残る)。``mem.project.<id>.location`` のような
+        別型 / 別名前空間のファクトが、末尾セグメントの一致だけで
+        ``mem.personal.location`` を消していた (2026-09-02 監査 S-A2)。
         """
         by_attr: dict[str, SemanticFact] = {}
         attr_pos: dict[str, int] = {}
         out: list[SemanticFact] = []
         dropped = 0
         for fact in facts:
-            if getattr(fact, "superseded_by", None) or states_no_user_value(
-                fact.object or "",
+            if getattr(fact, "superseded_by", None) or self._no_user_value(
+                fact, no_value_cache,
             ):
+                out.append(fact)
+                continue
+            if collapsible is not None and not collapsible(fact):
                 out.append(fact)
                 continue
             key = _attribute_key(fact.subject)

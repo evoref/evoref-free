@@ -32,8 +32,10 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 from backend.log_config import get_logger
+from backend.trace_context import run_in_executor_with_context
 
 if TYPE_CHECKING:
+    from backend.debug_logger import DebugLogger
     from backend.free.rag.bm25_retriever import BM25Retriever
     from backend.free.rag.contextual_prefix import ContextualPrefixGenerator
     from backend.free.rag.embedding_backend import EmbeddingBackend
@@ -53,11 +55,13 @@ class LazyContextualPrefixService:
         *,
         bm25_retriever: "BM25Retriever | None" = None,
         config: dict,
+        debug_logger: "DebugLogger | None" = None,
     ) -> None:
         self._generator = generator
         self._embedder = embedder
         self._vector_store = vector_store
         self._bm25 = bm25_retriever
+        self._debug_logger = debug_logger
 
         rag_cfg = (config or {}).get("rag", {})
         cp_cfg = rag_cfg.get("contextual_prefix", {}) or {}
@@ -117,27 +121,43 @@ class LazyContextualPrefixService:
             generated = await self._generate_targets(targets)
 
         if generated > 0:
-            # Lazy 生成では metadata.json + vectors を即時永続化する
-            # (次回 retrieval から反映されるように)
-            try:
-                store.save()
-            except Exception as e:  # pragma: no cover - save failure は非致命
-                logger.warning("lazy contextual save failed: %s", e)
-
-            # BM25 も contextual text で再構築 (存在する場合のみ)
-            if self._bm25 is not None:
-                try:
-                    chunk_ids_all = [m["id"] for m in store.metadata]
-                    texts = [store.get_contextual_text(cid) for cid in chunk_ids_all]
-                    self._bm25.build(chunk_ids_all, texts)
-                except Exception as e:  # pragma: no cover
-                    logger.warning("lazy contextual bm25 rebuild failed: %s", e)
-
+            # 永続化 (metadata.json + vectors) と BM25 再構築は同期 I/O +
+            # 全文トークナイズで、チャンク数に比例して重い。本メソッドは
+            # 検索パイプラインから fire-and-forget で起動されるので、イベント
+            # ループ上で回すと **応答ストリーミングを止める**。ワーカー
+            # スレッドへ逃がす (trace_id は保全する)。
+            loop = asyncio.get_running_loop()
+            await run_in_executor_with_context(
+                loop, None, self._persist_after_generation, store,
+            )
             logger.info(
                 "Lazy contextual prefix generated for %d chunks", generated,
             )
+            if self._debug_logger is not None:
+                self._debug_logger.log_rag_result(
+                    generated, "lazy_contextual_prefix",
+                    [(m["id"], 0.0, "") for m in targets[:generated]],
+                )
 
         return generated
+
+    def _persist_after_generation(self, store: "VectorStore") -> None:
+        """生成後の永続化 + BM25 再構築 (ワーカースレッドで実行)。"""
+        # Lazy 生成では metadata.json + vectors を即時永続化する
+        # (次回 retrieval から反映されるように)
+        try:
+            store.save()
+        except Exception as e:  # pragma: no cover - save failure は非致命
+            logger.warning("lazy contextual save failed: %s", e)
+
+        # BM25 も contextual text で再構築 (存在する場合のみ)
+        if self._bm25 is not None:
+            try:
+                chunk_ids_all = [m["id"] for m in store.metadata]
+                texts = [store.get_contextual_text(cid) for cid in chunk_ids_all]
+                self._bm25.build(chunk_ids_all, texts)
+            except Exception as e:  # pragma: no cover
+                logger.warning("lazy contextual bm25 rebuild failed: %s", e)
 
     async def _generate_targets(self, targets: list[dict]) -> int:
         """対象 metadata リストに対してプレフィックスを 1 件ずつ生成する。

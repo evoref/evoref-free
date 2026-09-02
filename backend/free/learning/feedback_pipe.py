@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 from backend.free.memory.extractors.mdp_trace import LOOP_FAILURE_PREFIX
 from backend.free.memory.types import make_fact
 from backend.log_config import get_logger
+from backend.utils import utc_now
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
@@ -44,8 +45,30 @@ logger = get_logger("learning.feedback_pipe")
 # 定数
 # ──────────────────────────────────────────────────────────────────────────
 
-#: 経路 2 で書き戻す policy ファクトの subject prefix。owner pillar は EvorefLearn。
+#: 経路 2 で書き戻す policy ファクトの subject prefix (レガシー形、モデル無し)。
+#: owner pillar は EvorefLearn。partition 有効時は :func:`build_critique_policy_subject`
+#: が ``learn.policy.<model>.<mode>.critique.<sig>`` を組む。
 LEARN_CRITIQUE_POLICY_PREFIX = "learn.policy.critique."
+
+#: critique policy の mode_origin (経路 2 はラルフループ由来なので create 固定)。
+CRITIQUE_POLICY_MODE = "create"
+
+
+def build_critique_policy_subject(base_model_id: str, signature: str) -> str:
+    """critique policy の subject を組む。
+
+    ``PolicyInterpreter._apply_semmem_overrides`` は partition 有効時
+    ``learn.policy.<model>.`` prefix でしか policy を読まない。旧 subject
+    ``learn.policy.critique.<sig>`` は <model>.<mode> セグメントを欠いていて
+    **一度も読まれていなかった** (2026-09-02 監査 R-F1)。PolicyEvolver /
+    FewShotPool と同じ「``base_model_id`` 空 = レガシー縮退」の規則に揃える。
+    """
+    if base_model_id:
+        return (
+            f"learn.policy.{base_model_id}.{CRITIQUE_POLICY_MODE}"
+            f".critique.{signature}"
+        )
+    return f"{LEARN_CRITIQUE_POLICY_PREFIX}{signature}"
 
 #: 経路 2 で書き戻す policy ファクトの predicate
 CRITIQUE_POLICY_PREDICATE = "mitigation_for"
@@ -102,6 +125,8 @@ class FeedbackPipe:
         self._fewshot_pool = fewshot_pool
         self._critique = critique_synthesizer
         self._debug_logger = debug_logger
+        # base 学習パーティションの active モデルスラグ。空 = レガシー subject。
+        self._base_model_id: str = ""
 
         # 循環検出: 本 run 内で critique 書き戻しを試みた failure cluster
         # signature の集合。2 回目以降は skip + warn する。
@@ -116,6 +141,15 @@ class FeedbackPipe:
     @property
     def weight_semmem_success(self) -> float:
         return self._weight_semmem_success
+
+    def set_base_model_id(self, base_model_id: str) -> None:
+        """base 学習パーティションの active モデルスラグを差し替える。
+
+        以後の critique policy 書き戻しは ``learn.policy.<model>.create.critique.*``
+        を subject にする (PolicyEvolver / FewShotPool と同じ契約)。空文字で
+        レガシー縮退。
+        """
+        self._base_model_id = base_model_id or ""
 
     def set_components(
         self,
@@ -224,10 +258,7 @@ class FeedbackPipe:
                 response=response,
                 mode="create",
                 fitness=float(marker.confidence),
-                added_at=time.strftime(
-                    "%Y-%m-%dT%H:%M:%S",
-                    time.gmtime(marker.created_at),
-                ),
+                added_at=utc_now(),
             )
             if ex is not None:
                 accepted += 1
@@ -320,7 +351,7 @@ class FeedbackPipe:
         view = self._learn_view
         if view is None:
             return None
-        subject = f"{LEARN_CRITIQUE_POLICY_PREFIX}{signature}"
+        subject = build_critique_policy_subject(self._base_model_id, signature)
         payload = json.dumps(
             {
                 "failure_signature": signature,
@@ -337,7 +368,7 @@ class FeedbackPipe:
             object_=payload,
             type="policy",
             scope=self._writeback_scope,
-            mode_origin="create",
+            mode_origin=CRITIQUE_POLICY_MODE,
             confidence=CRITIQUE_POLICY_CONFIDENCE_INIT,
             auto_evolved=True,
         )

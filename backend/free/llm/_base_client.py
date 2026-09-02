@@ -21,6 +21,11 @@
 - **非リトライ対象**: 上記以外 (4xx の大半 / 500 以外の 5xx 等)。
   ``httpx.ConnectTimeout`` も含むが、これは ``ConnectError`` 経由で
   ``TimeoutException`` の派生として扱われる
+- **生成 POST の例外**: ``LocalClient._generate_sync`` / ``generate_constrained`` /
+  ``generate_with_logprobs`` は ``GENERATION_RETRYABLE_EXCEPTIONS`` を使い、
+  推論中の ``ReadTimeout`` を再 POST しない (二重投入 / スロット KV 汚染 /
+  purpose timeout の ×3 膨張を防ぐ)。``timeout × MAX_ATTEMPTS`` が壁時計の
+  worst case になるのは接続フェーズの失敗が連続した場合のみ
 - **健全性チェック例外**: 起動時 ``health_check`` はリトライしない
   (CLAUDE.md §1 「health_check 失敗は ``None`` 注入でデグラ継続」)。
   各クライアントの ``health_check`` は本ヘルパを経由せず単発で叩く
@@ -57,10 +62,11 @@ logger = get_logger("llm._base_client")
 # 旧実装の ``MAX_RETRIES=3`` (= 4 試行) から ``MAX_ATTEMPTS=3`` (= 3 試行) に変更し、
 # worst case のバックオフ待機 (0.5 + 1.0 + 2.0 = 3.5s + jitter) を抑える。
 # 注意: ここで制御するのは試行回数とバックオフ待機のみで、``timeout`` は
-# **per-attempt** に適用される (3 試行なら最悪 timeout×3 + 待機の壁時計時間)。
-# realtime 用途の purpose timeout を「総予算」として守りたい場合は、呼出側
-# (AuxClient._request_with_retry) でリトライループ全体を asyncio.timeout
-# で囲む必要がある。
+# **per-attempt** に適用される。ただし生成 POST
+# (``GENERATION_RETRYABLE_EXCEPTIONS``) は ``ReadTimeout`` をリトライしないため、
+# ``timeout × MAX_ATTEMPTS`` の壁時計になり得るのは **接続フェーズの失敗**
+# (ConnectError / WriteTimeout / PoolTimeout / 5xx・429) が連続した場合だけで、
+# 推論そのものが遅い場合は 1 回の ``timeout`` で確定する。
 MAX_ATTEMPTS = 3
 RETRY_WAIT_INITIAL = 0.5  # 秒、wait_exponential_jitter の初期値
 RETRY_WAIT_MAX = 4.0  # 秒、wait_exponential_jitter の上限
@@ -77,6 +83,20 @@ RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 _RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
     httpx.ConnectError,
     httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.PoolTimeout,
+    httpx.RemoteProtocolError,
+)
+
+# 生成 POST (``/v1/chat/completions`` の非ストリーミング) 用のリトライ対象。
+# ``ReadTimeout`` を **含めない**: 推論が遅くて read が切れたリクエストを再 POST
+# すると、llama-server 側では前の生成がまだ走っている (二重投入) うえ、chat
+# スロットへ落ちた場合は KV を汚す。aux の purpose timeout も per-attempt なので
+# 3 回で ×3 に膨れていた。read が切れた生成は 1 回で確定させ、呼出側の
+# ``LLMTimeoutError`` 分岐に任せる。接続フェーズの失敗 (バイトが流れる前) だけ
+# を再試行する。
+GENERATION_RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    httpx.ConnectError,
     httpx.WriteTimeout,
     httpx.PoolTimeout,
     httpx.RemoteProtocolError,
@@ -210,13 +230,16 @@ async def async_retry_http_call(
     request_label: str = "HTTP request",
     retryable_statuses: frozenset[int] | set[int] = RETRYABLE_STATUS_CODES,
     retry_logger: Callable[[int, BaseException, float], None] | None = None,
+    retryable_exceptions: tuple[type[BaseException], ...] = _RETRYABLE_EXCEPTIONS,
 ) -> T:
     """tenacity ベースの HTTP リトライヘルパ
 
     ``operation`` を ``MAX_ATTEMPTS`` 回まで試行する。
-    リトライ対象は ``_RETRYABLE_EXCEPTIONS`` および
+    リトライ対象は ``retryable_exceptions`` (既定 ``_RETRYABLE_EXCEPTIONS``) および
     ``HTTPStatusError`` のうち ``retryable_statuses`` に含まれるもの。
     その他の例外 (4xx / 非 retryable な 5xx 等) はキャッチせず即時伝播。
+    生成 POST は ``retryable_exceptions=GENERATION_RETRYABLE_EXCEPTIONS`` を渡し、
+    推論中の ``ReadTimeout`` を再 POST しない (二重投入の防止)。
 
     全試行が失敗した場合は最後に発生した例外を再 raise する
     (``reraise=True`` 動作)。呼び出し側は必要に応じて ``TimeoutException``
@@ -232,9 +255,10 @@ async def async_retry_http_call(
         retry_logger: 待機前に呼ばれる構造化ログコールバック。
             ``(attempt: int, exc: BaseException, wait_sec: float) -> None``。
             ``DebugLogger.log_retry_attempt`` を bind する想定。
+        retryable_exceptions: リトライ対象とする例外型のタプル。
     """
     retry_predicate = (
-        retry_if_exception_type(_RETRYABLE_EXCEPTIONS)
+        retry_if_exception_type(retryable_exceptions)
         | retry_if_exception(_make_status_retry_predicate(retryable_statuses))
     )
 

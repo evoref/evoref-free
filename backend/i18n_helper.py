@@ -68,8 +68,18 @@ def msg(key: str, **kwargs) -> str:
     メッセージ取得。ドット区切りのキーでネストをたどる。
     例: msg("cli.welcome", version="0.1.0", mode="create")
     """
+    return msg_for_locale(_locale, key, **kwargs)
+
+
+def msg_for_locale(locale: str, key: str, **kwargs) -> str:
+    """``locale`` を明示してメッセージを取得する (``msg`` は UI の ``_locale`` 固定)。
+
+    LLM プロンプトへ埋め込む文 (``agent.event_reminder``) は UI 言語ではなく
+    ``prompt_locale()`` に従うため、キーは i18n に置いたまま locale だけ差し替える。
+    見つからなければ ``_fallback`` → キー文字列。
+    """
     keys = key.split(".")
-    value = _resolve(keys, _locale)
+    value = _resolve(keys, locale)
     if value is None:
         value = _resolve(keys, _fallback)
     if value is None:

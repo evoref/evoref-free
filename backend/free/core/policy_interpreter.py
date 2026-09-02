@@ -63,6 +63,19 @@ _TYPE_CONVERTERS: dict[str, type] = {
 #: 「短い」の定義が意図せず広がるため)。
 _ORDERED_PARAM_PAIRS: tuple[tuple[str, str, str], ...] = (
     ("router", "short_query_min_tokens", "short_query_max_tokens"),
+    # 目標トークン数が上限を超えると単位生成が常に切断される (L-A9)。
+    ("long_form", "unit_target_tokens", "unit_max_tokens"),
+)
+
+#: 合計が 1 になるべきパラメータ群: ``(domain, (key, ...))``。
+#:
+#: 進化は 1 キーずつ独立に摂動するので、``bm25_weight`` だけ上がって
+#: ``vector_weight`` が据え置かれると RRF 融合の重みが 1 を超え、スコアの
+#: 尺度が tick ごとに変わる。fade_* も同様 (減衰式の係数和)。摂動後に群内で
+#: 正規化して不変則を守る (非負・合計 > 0 のときのみ)。
+_SUM_TO_ONE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("search", ("bm25_weight", "vector_weight")),
+    ("memory", ("fade_alpha", "fade_beta", "fade_gamma")),
 )
 
 
@@ -78,6 +91,24 @@ def _repair_ordered_pairs(domain: str, mode_params: dict) -> list[str]:
         if hi <= lo:
             mode_params[hi_key] = lo + 1
             repaired.append(hi_key)
+    return repaired
+
+
+def _normalize_sum_to_one_groups(domain: str, mode_params: dict) -> list[str]:
+    """合計 1 不変則を満たすよう ``mode_params`` を群内正規化し、直したキーを返す。"""
+    repaired: list[str] = []
+    for dom, keys in _SUM_TO_ONE_GROUPS:
+        if dom != domain:
+            continue
+        values = [mode_params.get(k) for k in keys]
+        if any(v is None for v in values):
+            continue
+        total = float(sum(max(0.0, float(v)) for v in values))
+        if total <= 0.0 or abs(total - 1.0) < 1e-9:
+            continue
+        for k, v in zip(keys, values, strict=True):
+            mode_params[k] = round(max(0.0, float(v)) / total, 6)
+            repaired.append(k)
     return repaired
 
 
@@ -355,10 +386,12 @@ class PolicyInterpreter:
     def set_base_model_id(self, base_model_id: str) -> None:
         """base 学習パーティションの active モデルスラグを差し替えて再適用する。
 
-        モデル切替時に :func:`backend.factory._learning_rebind.rebind_base_learning`
+        起動時の学習パーティション有効化 (``_pillar_wirer._activate_learning_partition``)
         から呼ばれる。``set_semmem_stores`` と同様、変更後に即
         :meth:`_apply_semmem_overrides` を再走させ、前モデルの override を
         当該モデルのもので置き換える (YAML 再ロード後の呼び出しが前提)。
+        ランタイム base 切替では ``backend.factory._learning_rebind.
+        rebind_base_learning`` が呼び、再起動なしで再スコープする。
         """
         with self._lock:
             self._base_model_id = base_model_id or ""
@@ -730,6 +763,13 @@ class PolicyInterpreter:
                     "Policy %s/%s: repaired ordered pair(s) %s -> %s",
                     domain, mode, repaired,
                     {k: mode_params[k] for k in repaired},
+                )
+            normalized = _normalize_sum_to_one_groups(domain, mode_params)
+            if normalized:
+                logger.info(
+                    "Policy %s/%s: normalized sum-to-one group %s -> %s",
+                    domain, mode, normalized,
+                    {k: mode_params[k] for k in normalized},
                 )
 
             logger.info(

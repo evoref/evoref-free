@@ -32,9 +32,13 @@ from fastapi import HTTPException
 
 from backend.free.api.chat.chat_stream_common import (
     _cancel_flags,
+    _capture_stream_outcome,
+    _close_token_stream,
+    _emit_stream_error,
     _emit_timing,
     _log_chat_outcome,
     _make_step_queue_callback,
+    _record_failed_generation,
     _sync_chat_response,
     cancel_scope,
     logger,
@@ -70,6 +74,13 @@ class _LongFormStreamState:
     #: 品質ゲートが検出した問題数。ユーザーには警告ステップとして見せている
     #: ため、成否シグナルにも同じ判断を反映させる (下の log_outcome 参照)。
     validation_errors: int = 0
+    #: 生成ストリームが ``finish_reason=length`` で切れたか (``TokenStream.outcome``
+    #: を公開するストリームのみ観測できる)。開示は本文の外 (``sse.output_truncated``)。
+    truncated: bool = False
+    truncated_tokens: int = 0
+    truncated_max_tokens: int | None = None
+    #: ``record_long_form_response`` まで到達したか (例外経路の失敗記録と二重にしない印)。
+    recorded: bool = False
 
 
 async def _emit_long_form_init_steps(
@@ -272,7 +283,11 @@ async def _finalize_long_form_stream(
         private=private,
         rag_used=rag_used,
         rag_top1_score=rag_top1_score,
+        # キャンセルで途中まで流した本文は経験に採らない / 切断は経験へ刻む。
+        cancelled=bool(_cancel_flags.get(session_id)),
+        truncated=state.truncated,
     )
+    state.recorded = True
 
     # 長文経路も MDP episode を残す (agent_trace 互換)。従来は agent_trace を
     # 経由しないため MDP ingest (decision/failure ファクト) から長文ターンが
@@ -366,7 +381,11 @@ async def _finalize_long_form_stream(
         yield sse.step({
             "type": "task_result", "detail": write_result, "status": "done",
         })
-    _emit_timing(sess_state, timer, "meta_cognitive", state.tokens_generated, mode=mode)
+    _emit_timing(sess_state, timer, "long_form", state.tokens_generated, mode=mode)
+    if state.truncated:
+        # 切断の開示は本文の外 (deliberative と同じ扱い)。本文へ注記を混ぜると
+        # 履歴 / STM へ保存され次ターンで復唱される。
+        yield sse.output_truncated(state.truncated_tokens, state.truncated_max_tokens)
     ti = make_token_info(
         messages, state.tokens_generated, context_size, instance_name,
     )
@@ -505,6 +524,8 @@ async def stream_long_form(
                 if _cancel_flags.get(session_id):
                     if pending is not None and not pending.done():
                         pending.cancel()
+                    # orchestrator の generator を閉じて下位の生成を止める
+                    await _close_token_stream(token_gen)
                     break
                 if pending is None:
                     pending = asyncio.create_task(aiter.__anext__())
@@ -556,6 +577,9 @@ async def stream_long_form(
                     yield sse.keepalive()
                     last_frame_at = time.monotonic()
 
+            # ``finish_reason=length`` の観測 (outcome を公開するストリームのみ)。
+            _capture_stream_outcome(token_gen, stream_state)
+
             async for frame in _flush():
                 yield frame
 
@@ -577,12 +601,19 @@ async def stream_long_form(
             outcome_success = True
 
         except Exception as e:
-            logger.error("Long-form stream error: %s", e, exc_info=True)
-            if timer:
-                timer.stop("llm_total_ms")
-            _emit_timing(state, timer, "meta_cognitive", stream_state.tokens_generated, mode=mode)
-            yield sse.error(str(e))
-            yield sse.done()
+            logger.debug("Long-form stream error traceback", exc_info=True)
+            async for frame in _emit_stream_error(
+                state, e, timer=timer, agent_layer="long_form", mode=mode,
+                tokens_generated=stream_state.tokens_generated,
+            ):
+                yield frame
+            if not stream_state.recorded:
+                _record_failed_generation(
+                    state, query=query, messages=messages,
+                    session_id=session_id, mode=mode, private=private,
+                    agent_layer="long_form",
+                    tokens_generated=stream_state.tokens_generated,
+                )
         finally:
             # 品質ゲートが問題を出した応答をユーザーには「要確認」と見せて
             # おきながら成功として記録すると、選択圧に失敗が一件も入らない

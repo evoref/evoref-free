@@ -131,6 +131,9 @@ def map_policy_evolver_status(
             decline_count=val.get("decline_count", 0),
             sigma=val.get("sigma", 0.0),
             phase=val.get("phase", ""),
+            degenerate=bool(val.get("degenerate", False)),
+            fitness_history_len=int(val.get("fitness_history_len", 0) or 0),
+            last_evolved_at=val.get("last_evolved_at"),
         )
     return result
 

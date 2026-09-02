@@ -84,6 +84,15 @@ class FeedbackSignals:
     completion_tokens: int | None = None
     prompt_tokens: int | None = None
     cached_prompt_tokens: int | None = None
+    # ── 生成の結末 (2026-09-02 配線) ──
+    # truncated: llama-server が finish_reason=length を返した = 応答が
+    # max_tokens 到達で文の途中で切れている。切れた応答は few-shot の手本に
+    # 採らない (FewShotPool.add_from_experiences)。
+    truncated: bool = False
+    # generation_failed: ユーザーへ 1 文字も届かなかった / error フレームで
+    # 終わったターン。response は空で記録され turn_outcome は failed。
+    # 以前はこのターンが記録されず、失敗が選択圧に一件も入らなかった。
+    generation_failed: bool = False
     # 長文生成シグナル
     long_form_used: bool = False
     long_form_content_type: str | None = None    # "code" | "text"
@@ -137,6 +146,34 @@ class ExperienceBuffer(JsonStateStore):
     def __init__(self, max_entries: int = MAX_ENTRIES):
         self.max_entries = max_entries
         self.entries: list[ExperienceEntry] = []
+        # 直近に load / save したパーティションのファイル (rebind 時の退避先)。
+        self.bound_path: Path | None = None
+
+    def save(self, path: str | Path) -> None:
+        super().save(path)
+        self.bound_path = Path(path)
+
+    def load(self, path: str | Path) -> None:
+        super().load(path)
+        self.bound_path = Path(path)
+
+    def rebind(self, path: str | Path, *, previous: str | Path | None = None) -> None:
+        """base モデル切替で経験バッファを新パーティションへ向け直す。
+
+        現在のエントリを **先に** 旧パーティション (``previous``、省略時は
+        :attr:`bound_path`) へ保存してから空にし、``path`` を読み込む
+        (ファイル未存在なら空のまま)。以後の save は ``path`` が既定になる。
+        """
+        prev = Path(previous) if previous is not None else self.bound_path
+        if prev is not None and self.entries:
+            self.save(prev)
+        self.entries = []
+        self.load(path)
+        self.bound_path = Path(path)
+        logger.info(
+            "Experience buffer rebound: %s -> %s (%d entries)",
+            prev, self.bound_path, len(self.entries),
+        )
 
     def record(self, entry: ExperienceEntry) -> None:
         """エントリを追加"""
@@ -207,28 +244,53 @@ class ExperienceBuffer(JsonStateStore):
             raise TypeError(
                 f"experience.json must be a list, got {type(payload).__name__}"
             )
-        self.entries.clear()
+        # 一時リストへ復元し、全件通ったあとで差し替える。以前は live の
+        # entries を先に clear してから逐次 append していたため、壊れた要素
+        # 1 件で途中の例外 → 半分だけ読んだ状態 → 次の save がそれをファイルへ
+        # 書き戻して残りを失っていた (2026-09-02 監査 R-B1)。壊れた要素は
+        # WARNING を出して飛ばす (黙って削らない)。
+        parsed: list[ExperienceEntry] = []
+        skipped = 0
         for d in payload:
-            signals_data = d.get("signals", {})
-            entry = ExperienceEntry(
-                timestamp=d.get("timestamp", ""),
-                mode=d.get("mode", "chat"),
-                query=d.get("query", ""),
-                response_summary=d.get("response_summary", ""),
-                response_full=d.get("response_full", ""),
-                base_model=d.get("base_model") or "",
-                embedding_model=d.get("embedding_model", ""),
-                cartridge_ids=d.get("cartridge_ids", []),
-                # JSON に存在するキーのみ採用 (欠損キーは FeedbackSignals の
-                # 既定値に委ねる)。新シグナル追加時もここの編集は不要。
-                signals=FeedbackSignals(**{
-                    k: signals_data[k]
-                    for k in _SIGNAL_FIELD_NAMES
-                    if k in signals_data
-                }),
+            try:
+                parsed.append(self._entry_from_dict(d))
+            except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                skipped += 1
+                logger.warning(
+                    "Skipping malformed experience entry on load: %s (%r)",
+                    exc, str(d)[:120],
+                )
+        if skipped:
+            logger.warning(
+                "Skipped %d malformed experience entr%s on load (kept %d)",
+                skipped, "y" if skipped == 1 else "ies", len(parsed),
             )
-            self.entries.append(entry)
+        self.entries = parsed
         self._mark_loaded_conversations_ended()
+
+    @staticmethod
+    def _entry_from_dict(d: dict) -> ExperienceEntry:
+        """JSON の 1 要素を ``ExperienceEntry`` へ復元する (壊れていれば例外)。"""
+        signals_data = d.get("signals", {})
+        if not isinstance(signals_data, dict):
+            raise TypeError("signals must be a dict")
+        return ExperienceEntry(
+            timestamp=d.get("timestamp", ""),
+            mode=d.get("mode", "chat"),
+            query=d.get("query", ""),
+            response_summary=d.get("response_summary", ""),
+            response_full=d.get("response_full", ""),
+            base_model=d.get("base_model") or "",
+            embedding_model=d.get("embedding_model", ""),
+            cartridge_ids=d.get("cartridge_ids", []),
+            # JSON に存在するキーのみ採用 (欠損キーは FeedbackSignals の
+            # 既定値に委ねる)。新シグナル追加時もここの編集は不要。
+            signals=FeedbackSignals(**{
+                k: signals_data[k]
+                for k in _SIGNAL_FIELD_NAMES
+                if k in signals_data
+            }),
+        )
 
     def _mark_loaded_conversations_ended(self) -> int:
         """読み込んだエントリの ``conversation_ended`` を確定させる。

@@ -31,6 +31,8 @@ from backend.free.agent.prompt_utils import (
 from backend.free.core.session_mode import is_valid_session_mode, normalize_session_mode
 from backend.free.core.intent_vocab import own_process_question
 from backend.free.core.text_quality import (
+    SYSTEM_MEASUREMENT_MARKER,
+    SYSTEM_NOTE_TAIL_RE,
     asks_verbatim_excerpt,
     has_boilerplate_closing,
     has_broken_ja_spacing,
@@ -39,6 +41,7 @@ from backend.free.core.text_quality import (
     retracts_own_conclusion,
     violates_length_constraint,
 )
+from backend.free.learning.fitness import defect_rate_fitness
 from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
 from backend.free.core.response_arithmetic import find_arithmetic_contradictions
 from backend.free.llm.json_schemas import FewShotQualityJudgement
@@ -70,23 +73,50 @@ DEFAULT_MIN_QUALITY_SCORE = 0.5
 DEFAULT_MAX_EXAMPLES = 3          # プロンプトに埋め込む最大 Few-shot 数
 DEFAULT_DIVERSITY_THRESHOLD = 0.8  # コサイン類似度の上限（これ以上は重複とみなす）
 
-# _calc_experience_fitness の生スコア理論域 (係数の総和)。
-# min = -(rephrase 0.5 + correction 0.8 + loops 0.3 + verr 0.3) = -1.9
-# max = (rag 0.3 + long_form 完了 0.3 + lf_success 0.1) = +0.7
-# 係数を変えたらこの 2 定数も更新する。
+# _calc_experience_fitness の生スコア = 共有欠陥率 fitness (``fitness.
+# defect_rate_fitness``、[0,1]、1.0 = 欠陥なし) + few-shot 固有ボーナス
+# (``FEWSHOT_BONUS_WEIGHTS``、[-0.6, +0.7])。
 #
-# ``conversation_ended`` の +1.0 は外した。この信号は
+# 欠陥側の係数は Level 1 evolver 群と同じ ``fitness.DEFECT_WEIGHTS`` を使う
+# (以前は rephrase -0.5 / correction -0.8 を PromptEvolver と手で揃えていたが、
+# assistant_self_retraction / tool_routing_* が few-shot 側だけ抜けていた)。
+#
+# ``conversation_ended`` は加点しない。この信号は
 # ``ExperienceBuffer._mark_loaded_conversations_ended`` が **読み込み時に全件へ
 # 立てる**ため構造的に恒真で (実測 2026-08-18: 135/136 = 99.3%)、
-# 「そのターンがどうだったか」を一切表さない。PolicyEvolver は同じ理由で
-# 2026-08-18 に加点項から外しており、few-shot 側だけ残っていた。
+# 「そのターンがどうだったか」を一切表さない (PolicyEvolver も 2026-08-18 に外した)。
 #
-# 外した効果 (同じ経験 136 件): 最頻値は 0.8056 → 0.7308 へ平行移動し、
-# ``min_fitness`` (既定 0.7) を通る件数は 123 → 116 になる。減る 7 件は
-# 「わずかに負の段階項を持つターンが +1.0 で押し上げられていた」分で、
-# 内容ゲート (``find_content_rejection``) では落ちない類。
-_FITNESS_LO = -1.9
-_FITNESS_HI = 0.7
+# 正規化 [_FITNESS_LO, _FITNESS_HI] → [0,1] は旧マッピング (欠陥なし = 0.7308、
+# ``min_fitness`` 既定 0.7 をぎりぎり通る) を保存するように選ぶ:
+#   LO = -0.6  : base 0 (欠陥で床) + 負ボーナス上限 (loops -0.3 / verr -0.3)
+#   HI = 1.59  : (1.0 - LO) / (HI - LO) = 0.7306 ≒ 旧最頻値 0.7308
+# 生スコア最大 (1.0 + 0.7 = 1.7) は HI を超えるので 1.0 へクリップする
+# (RAG top1=1.0 かつ長文完走+成功のみ)。テストフィクスチャでの写像:
+#   欠陥なし                       1.00 → 0.731 (採用)
+#   欠陥なし + agent_loops=2       0.90 → 0.685 (不採用、旧 0.692)
+#   rephrased のみ                 0.40 → 0.457 (旧 0.538)
+#   user_correction のみ           0.00 → 0.274 (旧 0.423)
+#   rephrased + user_correction    0.00 → 0.274 (旧 0.231)
+_FITNESS_LO = -0.6
+_FITNESS_HI = 1.59
+
+#: few-shot 固有のボーナス項 (共有 ``DEFECT_WEIGHTS`` に無い加減点)。
+#: 手本としての価値 = 「根拠が強い / 停滞せず / 成果物が完走した」を段階的に
+#: 表す連続値で、プールの fitness が 1 点に縮退しないようにする (select の
+#: 重み付け / garbage_collect の lowest-fitness eviction が意味を持つ)。
+#: 欠損シグナル (None / 0 / False) は加点も減点もせず中立。
+FEWSHOT_BONUS_WEIGHTS: dict[str, float] = {
+    # RAG top1 cos 類似 × 係数 (根拠が強いほど加点)
+    "rag_top1": 0.3,
+    # 反復 1 回超過ごとの減点 / その上限
+    "agent_loop_step": 0.1,
+    "agent_loop_cap": 0.3,
+    # 長文生成: 完了率 × 係数 / 検証エラー 1 件ごとの減点とその上限 / 成功加点
+    "long_form_completion": 0.3,
+    "long_form_verr_step": 0.1,
+    "long_form_verr_cap": 0.3,
+    "long_form_success": 0.1,
+}
 
 #: quality_score が付いている例で、fitness と品質採点を混ぜる比率。
 #:
@@ -324,6 +354,34 @@ def _find_volatile_reason(query: str, response: str) -> str | None:
     return None
 
 
+#: システムが後付けした開示文の目印。``(注: …)`` の注記本体は
+#: ``SYSTEM_NOTE_TAIL_RE`` が捕まえる。それとは別に、修復経路
+#: (``length_disclosure_note``) が本文へ連結する「〜文字以内の指定に対し …
+#: 文字です」/「指定は N 文字でしたが」型の開示文も手本には載せない。
+_SYSTEM_DISCLOSURE_RE = re.compile(
+    r"(?:文字以内|文字ちょうど|文字程度|文字)の指定に対し"
+    r"|指定は\s*\d+\s*文字でしたが"
+    r"|上の回答は\s*\d+\s*文字です",
+)
+
+
+def _response_carries_system_note(response: str) -> bool:
+    """応答にシステムの開示注記 / 実測行が含まれているか (純粋関数)。
+
+    記憶へは ``strip_system_notes`` で落とした本文が積まれるが、経験記録は
+    長らく生の ``full_response`` を受けていたため、注記込みの応答が手本に
+    昇格し、次のターンでモデルがそれを自分の文体として模倣していた
+    (2026-09-02 監査 R-D1)。注記は「制約を破った」の印でもあるので、含む例は
+    内容の良否に関わらず手本から外す。
+    """
+    text = response or ""
+    if SYSTEM_MEASUREMENT_MARKER in text:
+        return True
+    if SYSTEM_NOTE_TAIL_RE.search(text):
+        return True
+    return bool(_SYSTEM_DISCLOSURE_RE.search(text))
+
+
 def find_content_rejection(query: str, response: str) -> str | None:
     """few-shot 手本として不適な内容を決定論で判定する (純粋関数)。
 
@@ -343,6 +401,9 @@ def find_content_rejection(query: str, response: str) -> str | None:
     # 毎ターン選択され本文なしの極小ファイル生成を誘発した)。
     if _response_is_task_log_only(response):
         return "task-log-only response"
+    # システムの開示注記 / 実測行を含む応答は本文の一部として模倣される
+    if _response_carries_system_note(response):
+        return "contains a system note or disclosure"
     # 逐語の抜粋を求める依頼への応答は「ツール出力の逐語コピー」であって文体の
     # 手本ではない。載せると「ペイロードを貼るのが正解」というバイアスを注入し、
     # 別の質問にも本文の貼り付けを誘発する (2026-08-16 動作検証 T9)。
@@ -468,49 +529,46 @@ def _cosine_similarity(a: Counter, b: Counter) -> float:
     return dot / (norm_a * norm_b)
 
 
-def _calc_experience_fitness(signals: dict) -> float:
-    """経験 1 件のシグナルから段階的 fitness を計算する。
+def _fewshot_bonus(signals: dict) -> float:
+    """few-shot 固有ボーナス (:data:`FEWSHOT_BONUS_WEIGHTS`) の合計を返す。"""
+    w = FEWSHOT_BONUS_WEIGHTS
+    bonus = 0.0
 
-    基準項 (rephrased_query / user_correction) の係数は PromptEvolver.
-    _calc_fitness と揃える。これに RAG ヒット品質・エージェント反復・長文生成の
-    完了率/検証エラーを段階項として加減算し [0,1] に正規化する。
-    ``conversation_ended`` は恒真なので加点しない (:data:`_FITNESS_HI` 参照)。
-    欠損シグナル (None / 0 / False) は加点も減点もせず中立に倒すため、シグナル
-    未配線のモードでも従来の基準項のみで評価される。連続値を返すことで、
-    プールに入った例の fitness が 1.0 に縮退せず select() の重み付けと
-    garbage_collect の lowest-fitness eviction が意味を持つ。
-    """
-    score = 0.0
-
-    # ── 基準項 (係数は PromptEvolver._calc_fitness と同一) ──
-    if signals.get("rephrased_query", False):
-        score -= 0.5
-    if signals.get("user_correction") is not None:
-        score -= 0.8
-
-    # ── 段階項: RAG ヒット品質 (top1 cos 類似が高いほど根拠が強い)。欠損は中立 ──
+    # RAG ヒット品質 (top1 cos 類似が高いほど根拠が強い)。欠損は中立
     rag_top1 = signals.get("rag_top1_score")
     if rag_top1 is not None:
-        score += 0.3 * max(0.0, min(1.0, float(rag_top1)))
+        bonus += w["rag_top1"] * max(0.0, min(1.0, float(rag_top1)))
 
-    # ── 段階項: エージェント反復。<=1 は中立、多反復ほど停滞として減点 ──
+    # エージェント反復。<=1 は中立、多反復ほど停滞として減点
     loops = int(signals.get("agent_loops", 0) or 0)
     if loops > 1:
-        score -= min(0.3, 0.1 * (loops - 1))
+        bonus -= min(w["agent_loop_cap"], w["agent_loop_step"] * (loops - 1))
 
-    # ── 段階項: 長文生成 (used のときだけ評価)。完了率で加点・検証エラーで減点 ──
+    # 長文生成 (used のときだけ評価)。完了率で加点・検証エラーで減点
     if signals.get("long_form_used", False):
         total = int(signals.get("long_form_units_total", 0) or 0)
         completed = int(signals.get("long_form_units_completed", 0) or 0)
         if total > 0:
-            score += 0.3 * min(1.0, completed / total)
+            bonus += w["long_form_completion"] * min(1.0, completed / total)
         verr = int(signals.get("long_form_validation_errors", 0) or 0)
         if verr > 0:
-            score -= min(0.3, 0.1 * verr)
+            bonus -= min(w["long_form_verr_cap"], w["long_form_verr_step"] * verr)
         if signals.get("long_form_success", False):
-            score += 0.1
+            bonus += w["long_form_success"]
+    return bonus
 
-    # 正規化: score の理論域 [_FITNESS_LO, _FITNESS_HI] を [0,1] へ線形写像。
+
+def _calc_experience_fitness(signals: dict) -> float:
+    """経験 1 件のシグナルから段階的 fitness を計算する。
+
+    欠陥側は Level 1 evolver 群と共有の :func:`fitness.defect_rate_fitness`
+    (``DEFECT_WEIGHTS``、1 件なので「欠陥重みの和を 1.0 から引いた値」)。
+    これに few-shot 固有のボーナス (:func:`_fewshot_bonus`) を足し、
+    ``[_FITNESS_LO, _FITNESS_HI]`` を [0,1] へ線形写像する (写像表は定数の
+    コメント参照)。``conversation_ended`` は恒真なので加点しない。
+    """
+    base = defect_rate_fitness([{"signals": signals}])
+    score = (1.0 if base is None else base) + _fewshot_bonus(signals)
     return max(0.0, min(1.0, (score - _FITNESS_LO) / (_FITNESS_HI - _FITNESS_LO)))
 
 
@@ -610,11 +668,20 @@ class FewShotPool(JsonStateStore):
     def set_base_model_id(self, base_model_id: str) -> None:
         """base 学習パーティションの active モデルスラグを差し替える。
 
-        モデル切替時に :func:`backend.factory._learning_rebind.rebind_base_learning`
-        から呼ばれ、以後の writeback / bootstrap が当該モデルの fewshot ファクト
+        起動時の ``_activate_learning_partition`` と、ランタイム base 切替の
+        ``backend.factory._learning_rebind.rebind_base_learning`` から呼ばれ、以後の
+        writeback / bootstrap が当該モデルの fewshot ファクト
         (``learn.fewshot.<model>.*``) のみを対象にする。空文字でレガシー縮退。
+        プール内容は差し替えないので、切替時は :meth:`reset` → bootstrap / load
+        で新モデル分を張り直す。
         """
         self._base_model_id = base_model_id or ""
+
+    def reset(self) -> None:
+        """in-memory プールを空にする (パーティション切替で新モデル分を読み直す前に呼ぶ)。"""
+        self._pools = {}
+        self._bigram_cache = {}
+        self._seen_hashes = {}
 
     @staticmethod
     def _build_subject(base_model_id: str, mode: str, example_id: str) -> str:
@@ -630,6 +697,9 @@ class FewShotPool(JsonStateStore):
     @staticmethod
     def _example_to_object(example: FewShotExample) -> str:
         """FewShotExample を SemMem ファクトの object 用 JSON 文字列に変換"""
+        # quality_score も載せる。落とすと再起動ごとに未採点へ戻り、毎回
+        # 採点し直すうえ ``min_quality_score`` の GC が効かなかった
+        # (2026-09-02 監査 R-D3)。
         return json.dumps(
             {
                 "query": example.query,
@@ -637,6 +707,7 @@ class FewShotPool(JsonStateStore):
                 "mode": example.mode,
                 "fitness": float(example.fitness),
                 "added_at": example.added_at,
+                "quality_score": example.quality_score,
             },
             ensure_ascii=False,
         )
@@ -671,6 +742,10 @@ class FewShotPool(JsonStateStore):
             return None
         if not id_part:
             return None
+        raw_score = payload.get("quality_score")
+        quality_score = (
+            float(raw_score) if isinstance(raw_score, (int, float)) else None
+        )
         return FewShotExample(
             id=id_part,
             query=str(payload.get("query", "")),
@@ -678,6 +753,7 @@ class FewShotPool(JsonStateStore):
             mode=str(payload.get("mode", mode_part)),
             fitness=float(payload.get("fitness", 0.0)),
             added_at=str(payload.get("added_at", "")),
+            quality_score=quality_score,
         )
 
     def _writeback_example_fact(
@@ -750,11 +826,19 @@ class FewShotPool(JsonStateStore):
             facts = view.search_fewshot_by_prefix(prefix)
         except ValueError:
             return 0
+        dropped: Counter[str] = Counter()
         for fact in facts:
             example = self._example_from_fact(fact)
             if example is None:
                 continue
             if example.id in seen_ids:
+                continue
+            # 採用時 / JSON 読込時と同じ内容ゲートを通す。SemMem 経由の復元だけ
+            # 素通しだと、ゲートを増やしても過去分が手本として蘇る
+            # (2026-09-02 監査 R-D3)。
+            reject = find_content_rejection(example.query, example.response)
+            if reject is not None:
+                dropped[reject.split(":")[0]] += 1
                 continue
             seen_ids.add(example.id)
             pool = self._pools.setdefault(example.mode, [])
@@ -764,6 +848,11 @@ class FewShotPool(JsonStateStore):
                 self._content_hash(example.query, example.response),
             )
             loaded += 1
+        if dropped:
+            logger.warning(
+                "Dropped %d stale fewshot example(s) on semmem bootstrap: %s",
+                sum(dropped.values()), dict(dropped),
+            )
         if loaded:
             logger.info(
                 "fewshot_pool bootstrap_from_semmem: loaded=%d pools=%s",
@@ -1032,6 +1121,10 @@ class FewShotPool(JsonStateStore):
             if signals.get("rephrased_query", False):
                 continue
             if signals.get("turn_outcome") == "failed":
+                continue
+            # max_tokens で文の途中で切れた応答は手本にしない (途中で終わるのが
+            # 正解、というバイアスになる)。
+            if signals.get("truncated", False):
                 continue
 
             query = exp.get("query", "").strip()
@@ -1469,19 +1562,32 @@ class FewShotPool(JsonStateStore):
             raise TypeError(
                 f"fewshot_pool.json must be a dict, got {type(payload).__name__}"
             )
-        # 二重 load / bootstrap 後 load で旧モードが残らないよう全状態をリセット。
-        self._pools.clear()
-        self._bigram_cache.clear()
-        self._seen_hashes.clear()
+        # 一時構造へ復元し、全件通ったあとで live 状態と差し替える。以前は
+        # live を先に clear してから逐次 append していたため、壊れた要素 1 件
+        # (dict でない / 型不一致) で途中の例外 → 半分だけ読んだ状態 → 次の
+        # save がそれを書き戻して残りを失っていた (2026-09-02 監査 R-B1)。
+        # 壊れた要素は WARNING を出して飛ばす。
+        new_pools: dict[str, list[FewShotExample]] = {}
+        new_hashes: dict[str, set[str]] = {}
         dropped: Counter[str] = Counter()
+        malformed = 0
         for mode, entries in payload.items():
             pool: list[FewShotExample] = []
-            seen = self._seen_hashes.setdefault(mode, set())
-            for entry in entries:
-                # 未知キーを無視して復元 (旧スキーマ耐性、TypeError 全消失を防ぐ)。
-                ex = FewShotExample(**{
-                    k: v for k, v in entry.items() if k in _EXAMPLE_FIELD_NAMES
-                })
+            seen: set[str] = set()
+            for entry in entries if isinstance(entries, list) else []:
+                try:
+                    # 未知キーを無視して復元 (旧スキーマ耐性、TypeError 全消失を防ぐ)。
+                    ex = FewShotExample(**{
+                        k: v for k, v in entry.items() if k in _EXAMPLE_FIELD_NAMES
+                    })
+                    query, response = str(ex.query), str(ex.response)
+                except (AttributeError, TypeError, ValueError) as exc:
+                    malformed += 1
+                    logger.warning(
+                        "Skipping malformed fewshot example on load (mode=%s): %s",
+                        mode, exc,
+                    )
+                    continue
                 # 採用ゲート追加前に混入した手本を読み込み時に落とす。採用時の
                 # ゲートだけでは既存プールが永久に汚染されたままになる
                 # (実測 2026-08-02: 25 件中 17 件が語間空白の混入で、全ゲートを
@@ -1489,13 +1595,22 @@ class FewShotPool(JsonStateStore):
                 # quality_score 0.9 で常駐していた)。ゲートを増やしたら過去分も
                 # 自然に消えるよう、採用時と同じ判定を通す。件数と理由を必ず
                 # ログへ出す (黙って削らない)。
-                reject = find_content_rejection(ex.query, ex.response)
+                reject = find_content_rejection(query, response)
                 if reject is not None:
                     dropped[reject.split(":")[0]] += 1
                     continue
                 pool.append(ex)
-                seen.add(self._content_hash(ex.query, ex.response))
-            self._pools[mode] = pool
+                seen.add(self._content_hash(query, response))
+            new_pools[mode] = pool
+            new_hashes[mode] = seen
+        # 二重 load / bootstrap 後 load で旧モードが残らないよう全状態を差し替える。
+        self._pools = new_pools
+        self._seen_hashes = new_hashes
+        self._bigram_cache.clear()
+        if malformed:
+            logger.warning(
+                "Skipped %d malformed fewshot example(s) on load", malformed,
+            )
         if dropped:
             logger.warning(
                 "Dropped %d stale fewshot example(s) on load: %s",

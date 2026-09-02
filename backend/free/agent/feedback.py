@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import re
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -104,6 +106,23 @@ CORRECTION_PATTERNS = [
     ),
     re.compile(r"that'?s\s+incorrect", re.IGNORECASE),
 ]
+
+# 直前ターンが失敗した直後の **短い否定だけ** の発話。字句の訂正語彙
+# (CORRECTION_PATTERNS) にも同一成果物の再指定にも当たらないが、失敗の直後
+# に発話全体がこれだけなら訂正とみなせる (``prev_failed`` 層の唯一の入口)。
+# 以前は失敗の次のターンを **無条件で** 訂正としていたため、話題を変えた
+# だけの発話が user_correction に化けていた (2026-09-02 監査 R-B3)。
+SHORT_NEGATIVE_FEEDBACK_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:いや|いえ|うーん|えっ|え)?[、,。.\s]*"
+    r"(?:ちがう|ちがいます|違う|違います|だめ|ダメ|駄目)(?:です|だよ|よ|ね|って)?"
+    r"|(?:no|nope|nah)[,.!]?(?:\s+(?:not\s+that|that'?s\s+not\s+it|wrong))?"
+    r"|not\s+that(?:\s+one)?|wrong"
+    r")[。.!！?？\s]*$",
+    re.IGNORECASE,
+)
+#: 短い否定として認める発話長の上限 (これより長ければ「否定だけ」ではない)。
+_SHORT_NEGATIVE_MAX_CHARS = 16
 
 # create モードの実行結果報告 (2026-07-18: create 経験に訂正シグナルがほぼ発生
 # せず Level 1 fitness が無差別化する一因だった語彙)。「動かない」「エラー」
@@ -533,6 +552,37 @@ def _is_user_echo(query: str, response: str) -> bool:
     return q == r
 
 
+def is_short_negative_feedback(query: str) -> bool:
+    """発話が「違う」「だめ」「not that」型の短い否定 **だけ** か (純粋関数)。"""
+    text = (query or "").strip()
+    if not text or len(text) > _SHORT_NEGATIVE_MAX_CHARS:
+        return False
+    return bool(SHORT_NEGATIVE_FEEDBACK_RE.match(text))
+
+
+#: セッション別に保持する直前ターンの状態の上限 (LRU)。並行セッションは
+#: 高々数本なので tool_ledger と同じ 16 で足りる。
+_SESSION_STATE_CAP = 16
+
+
+@dataclass
+class _SessionTurnState:
+    """``FeedbackCollector`` がセッションごとに持ち回る直前ターンの状態。
+
+    以前はこれらがプロセス全体で 1 組しか無く、並行セッションが交互に
+    record すると別セッションの直前ターンと突き合わせて訂正 / 言い直しを
+    誤検出していた (2026-09-02 監査 R-B4)。
+    """
+
+    prev_query: str | None = None
+    prev_entry: ExperienceEntry | None = None
+    prev_routed_tool: bool = False
+    prev_used_long_form: bool = False
+    prev_turn_failed: bool = False
+    pending_correction: dict | None = None
+    prev_response: str = ""
+
+
 class FeedbackCollector:
     """暗黙的フィードバックシグナルを収集し経験バッファに記録
 
@@ -569,6 +619,11 @@ class FeedbackCollector:
         self._pending_correction: dict | None = None
         # 直前ターンのアシスタント応答 (保留判定の材料)。
         self._prev_response: str = ""
+        # 上記 ``_prev_*`` / ``_pending_correction`` は「いま record 中の
+        # セッション」の作業コピー。record() の入口でセッションの状態を載せ、
+        # 出口で書き戻す (``_load_session_state`` / ``_store_session_state``)。
+        # セッション未指定 ("") は単一セッション運用として 1 枠に畳む。
+        self._sessions: OrderedDict[str, _SessionTurnState] = OrderedDict()
         # 現在ロード中のモデル名 (GGUF ファイル名)。record() の base_model /
         # embedding_model が明示指定されないとき既定値として埋める。
         #
@@ -590,6 +645,14 @@ class FeedbackCollector:
                 "FeedbackCollector initialized in disabled mode "
                 "(Level 0 experience record is no-op)",
             )
+
+    def rebind_base_model(self, base_model_name: str) -> None:
+        """ランタイム base 切替で chat 既定のモデル名 (GGUF ファイル名) を差し替える。
+
+        以後の ``record()`` は新モデル名を ``base_model`` に刻む
+        (``_learning_rebind.rebind_base_learning`` から呼ばれる)。
+        """
+        self._base_model_name = base_model_name
 
     def _resolve_base_model_name(self, mode: str) -> str:
         """記録時のモードで実際にロードされている base モデルの GGUF 名を返す。
@@ -642,8 +705,18 @@ class FeedbackCollector:
         cached_prompt_tokens: int | None = None,
         action_blocked: bool = False,
         measured_values: dict[str, set[int]] | None = None,
+        truncated: bool = False,
+        generation_failed: bool = False,
+        session_id: str = "",
     ) -> ExperienceEntry:
-        """シグナル収集 → ExperienceBuffer に記録"""
+        """シグナル収集 → ExperienceBuffer に記録
+
+        ``truncated`` は llama-server が ``finish_reason=length`` を返した印、
+        ``generation_failed`` はユーザーへ本文が届かなかった / error で終わった印
+        (どちらも :class:`FeedbackSignals` へそのまま刻む。後者は
+        ``turn_outcome="failed"`` に倒す)。``session_id`` は直前ターンとの
+        突き合わせ (訂正 / 言い直し / 保留) をセッション単位に閉じる鍵。
+        """
         if self._disabled:
             # 学習無効化中: シグナル検出 / パターン学習 / バッファ書込を全てスキップ。
             # 呼出側 (chat_recorder) は戻り値を直接参照しないが、署名互換のため
@@ -659,6 +732,7 @@ class FeedbackCollector:
                 cartridge_ids=cartridge_ids or [],
                 signals=FeedbackSignals(),
             )
+        self._load_session_state(session_id)
         turn_outcome = self._derive_turn_outcome(
             response, step_credits,
             query=query,
@@ -667,6 +741,10 @@ class FeedbackCollector:
             action_blocked=action_blocked,
             measured_values=measured_values,
         )
+        if generation_failed:
+            # 本文が届かなかった / error フレームで終わったターン。
+            # 推定ではなく観測なので無条件に failed。
+            turn_outcome = "failed"
         if turn_outcome == "failed":
             # 失敗ターンの成功シグナルは矛盾なので failed 側に倒す
             # (偽成功が learned_patterns の正例学習 / Level 1 fitness に
@@ -707,6 +785,8 @@ class FeedbackCollector:
             completion_tokens=completion_tokens,
             prompt_tokens=prompt_tokens,
             cached_prompt_tokens=cached_prompt_tokens,
+            truncated=truncated,
+            generation_failed=generation_failed,
         )
 
         entry = ExperienceEntry(
@@ -782,6 +862,7 @@ class FeedbackCollector:
         self._prev_routed_tool = current_routed_tool
         self._prev_used_long_form = long_form_used
         self._prev_turn_failed = turn_outcome == "failed"
+        self._store_session_state(session_id)
 
         logger.info(
             "Recorded experience: mode=%s, rephrase=%s, correction=%s (by=%s)",
@@ -825,6 +906,39 @@ class FeedbackCollector:
         self._prev_turn_failed = False
         self._pending_correction = None
         self._prev_response = ""
+        self._sessions.clear()
+
+    # ── セッション別の直前ターン状態 ──
+
+    def _load_session_state(self, session_id: str) -> None:
+        """``session_id`` の直前ターン状態を作業コピー (``_prev_*``) へ載せる。"""
+        state = self._sessions.get(session_id)
+        if state is None:
+            state = _SessionTurnState()
+        else:
+            self._sessions.move_to_end(session_id)
+        self._prev_query = state.prev_query
+        self._prev_entry = state.prev_entry
+        self._prev_routed_tool = state.prev_routed_tool
+        self._prev_used_long_form = state.prev_used_long_form
+        self._prev_turn_failed = state.prev_turn_failed
+        self._pending_correction = state.pending_correction
+        self._prev_response = state.prev_response
+
+    def _store_session_state(self, session_id: str) -> None:
+        """作業コピーを ``session_id`` の枠へ書き戻す (LRU 上限 16)。"""
+        self._sessions[session_id] = _SessionTurnState(
+            prev_query=self._prev_query,
+            prev_entry=self._prev_entry,
+            prev_routed_tool=self._prev_routed_tool,
+            prev_used_long_form=self._prev_used_long_form,
+            prev_turn_failed=self._prev_turn_failed,
+            pending_correction=self._pending_correction,
+            prev_response=self._prev_response,
+        )
+        self._sessions.move_to_end(session_id)
+        while len(self._sessions) > _SESSION_STATE_CAP:
+            self._sessions.popitem(last=False)
 
     @staticmethod
     def _derive_turn_outcome(
@@ -1134,7 +1248,8 @@ class FeedbackCollector:
         Returns:
             (correction_text, detected_by): 検出テキストと検出元
             detected_by: "hardcoded" | "record_divergence" | "prev_failed"
-            | "same_target" | None
+            | "same_target" | None。``prev_failed`` は直前ターンの失敗 **かつ**
+            同一成果物の再指定 / 短い否定だけの発話 (状況証拠単独では立てない)。
         """
         # 1. ハードコードパターン（高確度、優先）
         for pattern in CORRECTION_PATTERNS:
@@ -1164,8 +1279,14 @@ class FeedbackCollector:
                 if pattern.search(query):
                     return query, "hardcoded"
 
-        # 2. 直前ターンが失敗 ([failed] 応答等) → 次ターンは訂正候補
-        if self._prev_turn_failed:
+        # 2. 直前ターンが失敗 ([failed] 応答等) → 次ターンは訂正候補。ただし
+        #    失敗の直後という状況証拠だけでは足りない — 話題を変えた新規依頼も
+        #    同じ位置に来る。同一成果物の再指定、または発話全体が短い否定
+        #    (「ちがう」「だめ」「not that」) のときだけ prev_failed とする。
+        #    字句の訂正語彙を含む発話は 1. で既に拾われている。
+        if self._prev_turn_failed and (
+            self._same_target_path(query) or is_short_negative_feedback(query)
+        ):
             return query, "prev_failed"
 
         # 3. 同一出力先パスの再指定 + 弱い訂正語 (「〜ではなく」等)

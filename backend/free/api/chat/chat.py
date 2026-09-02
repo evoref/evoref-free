@@ -38,7 +38,8 @@ from backend.free.api.chat.chat_service import (
     SearchPipelineResult,
     build_chat_messages, build_semmem_injection, convert_file_contexts,
     ensure_base_model_health,
-    collect_pending_conflicts, ensure_llm_client, prepare_memory_context,
+    collect_pending_conflicts, deliberative_post_append_reserve_tokens,
+    ensure_llm_client, prepare_memory_context,
     run_search_pipeline, session_evicted_turns, session_first_user_message,
 )
 from backend.free.api.chat.chat_streaming import (
@@ -71,6 +72,7 @@ from backend.free.core.session_mode import (
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
+from backend.free.agent.prompt_manager import ensure_static_directives
 from backend.free.agent.reactive import ReactiveAgent
 from backend.free.agent.router import ComplexityClassifier
 from backend.free.agent.issue_ledger import issue_ledger_scope
@@ -195,78 +197,6 @@ def _llm_unavailable_response(stream: bool) -> StreamingResponse:  # noqa: ARG00
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
-# 応答言語のランタイム指示 (i18n.prompt_locale 追従)。プロンプト本文 (.md) は
-# 初回生成 / ロケール切替時にしか再導出されないため、既存インストールの本文が
-# 古い locale のまま・create 本文に言語制約が無い場合でも設定に追従させる保険。
-# PromptManager の外で付加することで、Level 1 進化が本文へ焼き込む汚染を防ぐ
-# (名前プレフィックスの前例: prompt_manager._strip_name_prefix)。
-_RESPONSE_LANGUAGE_DIRECTIVES: dict[str, str] = {
-    "ja": "（ユーザーが使用言語を明示的に指定した場合を除き、応答は日本語で行うこと）",
-    "en": "(Respond in English unless the user explicitly requests another language.)",
-}
-
-
-def _response_language_directive() -> str:
-    """prompt_locale に応じた応答言語指示行を返す (未知 locale / 取得失敗は ja)。"""
-    try:
-        locale = get_config().get("i18n", {}).get("prompt_locale", "ja")
-    except Exception:
-        locale = "ja"
-    return _RESPONSE_LANGUAGE_DIRECTIVES.get(
-        locale, _RESPONSE_LANGUAGE_DIRECTIVES["ja"],
-    )
-
-
-# 参考枠 ([参考情報] / [関連する記憶] / [参考例] / [添付ファイル]) の扱いを述べる
-# **静的**な指示。動的ブロック側のマーカーから本文を移してきたもの。
-#
-# なぜ system 側なのか: 動的ブロックは最後の user メッセージへ前置されるため
-# 接頭辞 KV キャッシュの外にあり、内容が定数でも **毎ターン再プリフィル**される。
-# 実測 (2026-08-18/19、chat 232 ターン): 区切り文 105 tok × 57% のターン /
-# 記憶ラベル 105 tok × 40% / RAG ヘッダ 20 tok × 38% で、定数の指示文だけに
-# 1 ターン平均 90 トークン前後を払っていた。未キャッシュ 1 トークンは 21〜37ms
-# なので、これだけで数秒の TTFT になる。system へ移せば同じ文字が接頭辞
-# キャッシュに乗り、2 ターン目以降の再プリフィルはゼロになる。
-#
-# PromptManager の外で付加する理由は ``_RESPONSE_LANGUAGE_DIRECTIVES`` と同じ:
-# Level 1 進化がプロンプト本文へ焼き込んで劣化させるのを防ぐ。
-#
-# 内容は既存の指示の移設で、**新しい制約は足していない**:
-#   - 「無関係なら言及せず自分の知識で答える」  ← 旧 _DYNAMIC_CONTEXT_DELIMITER
-#     (実測 2026-07-25: PC が重い相談の最中に「ご提示いただいた参考情報には…
-#      含まれていません」と述べ、空き 548GB あるのに空き容量不足の対処を回答)
-#   - 「今回の質問に関係しなければ無視する / 無い予定・日付・数値を創作しない」
-#     ← 旧 _SEMMEM_BLOCK_LABEL (実測 2026-07-27: 過去 note を根拠に、この会話に
-#        存在しない歯科の予約と健康診断を捏造)
-_REFERENCE_BLOCK_DIRECTIVES: dict[str, str] = {
-    "ja": (
-        "（[参考情報]・[関連する記憶]・[参考例]・[添付ファイル] は"
-        "システムが用意した参考枠であり、ユーザーの発言ではない。"
-        "今回の質問に関係しない場合は、そのことに言及せず、"
-        "参考枠の話題に引きずられずに自分の知識で普通に答えること。"
-        "参考枠に無い予定・日付・数値を創作しないこと。）"
-    ),
-    "en": (
-        "([参考情報] / [関連する記憶] / [参考例] / [添付ファイル] blocks are "
-        "reference material supplied by the system, not user input. "
-        "If they are unrelated to the question, do not mention that fact and "
-        "do not let them steer the topic - just answer from your own knowledge. "
-        "Never invent schedules, dates, or numbers that are not in them.)"
-    ),
-}
-
-
-def _reference_block_directive() -> str:
-    """参考枠の扱いを述べる静的指示行を返す (未知 locale / 取得失敗は ja)。"""
-    try:
-        locale = get_config().get("i18n", {}).get("prompt_locale", "ja")
-    except Exception:
-        locale = "ja"
-    return _REFERENCE_BLOCK_DIRECTIVES.get(
-        locale, _REFERENCE_BLOCK_DIRECTIVES["ja"],
-    )
-
-
 def _resolve_system_prompt(
     state: AppState, mode: str, instance_name: str,
 ) -> str:
@@ -277,21 +207,21 @@ def _resolve_system_prompt(
     config 固定文字列のため安定)。few-shot は ``_resolve_fewshot_block`` で
     別途取得し最後の user メッセージへ前置する。
 
-    末尾に付ける 2 つの指示は **ここに置くこと自体が要点**。どちらも内容が
-    ターンに依らない定数なので、動的ブロック側 (最後の user へ前置される =
-    毎ターン再プリフィルされる) に置くと、同じ文字を毎回払うことになる。
+    末尾の固定指示 (応答言語 / 参考枠の扱い) は ``SystemPromptManager.
+    get_prompt_static`` が付けて返す (system 文の出所は PromptManager に閉じる、
+    docs/f_03 §12 #5)。フォールバック文と ``get_prompt_static`` を持たない代替
+    実装に対してだけ ``ensure_static_directives`` が補う (冪等)。
     """
-    directives = "\n\n".join(
-        (_response_language_directive(), _reference_block_directive()),
-    )
     prompt_mgr = state.prompt_manager
     if prompt_mgr:
         get_static = getattr(prompt_mgr, "get_prompt_static", None)
         if get_static is not None:
-            return f"{get_static(mode)}\n\n{directives}"
+            return ensure_static_directives(get_static(mode))
         # 後方互換: get_prompt_static 未実装の Mock 等は query なし get_prompt へ縮退
-        return f"{prompt_mgr.get_prompt(mode)}\n\n{directives}"
-    return f"You are {instance_name}, a helpful AI assistant.\n\n{directives}"
+        return ensure_static_directives(prompt_mgr.get_prompt(mode))
+    return ensure_static_directives(
+        f"You are {instance_name}, a helpful AI assistant.",
+    )
 
 
 def _resolve_fewshot_block(
@@ -475,6 +405,7 @@ async def _gate_reactive_light(
 
 async def _light_semmem_block(
     req: ChatRequest, state: AppState, cfg: dict, timer: StageTimer,
+    session_id: str | None = None,
 ) -> str | None:
     """軽量パス用の ``[関連する記憶]`` ブロック (検索は走らせない)。
 
@@ -508,7 +439,7 @@ async def _light_semmem_block(
     try:
         return build_semmem_injection(
             state, cfg, mode=req.mode, query_vec=query_vec,
-            query_text=req.message,
+            query_text=req.message, session_id=session_id,
         )
     except Exception as exc:
         logger.warning("reactive-light semmem injection failed: %s", exc)
@@ -566,12 +497,19 @@ async def _dispatch_continuation(
         rag_chunks=None, file_contexts=None,
         semmem_block=None,
         context_size=context_size, max_tokens=max_tokens,
+        # 履歴の床は主経路と同じ (続きを書くには直前の文脈が要る)。
+        history_min_tokens=int(
+            (cfg.get("memory") or {}).get(
+                "history_min_tokens", DEFAULT_HISTORY_MIN_TOKENS,
+            ),
+        ),
         working_max_tokens=int(
             (cfg.get("memory") or {}).get(
                 "working_max_tokens", DEFAULT_WORKING_MAX_TOKENS,
             ),
         ),
-        evicted_turns=session_evicted_turns(state),
+        evicted_turns=session_evicted_turns(state, session_id),
+        session_id=session_id,
     )
     logger.info(
         "Continuation dispatch: resuming %s response (tail=%d chars)",
@@ -652,19 +590,28 @@ async def _dispatch_reactive_light(
     ``max_tokens`` の上限で担保しており、履歴を削ることではない。
     """
     system_prompt = _resolve_system_prompt(state, req.mode, instance_name)
-    semmem_block = await _light_semmem_block(req, state, cfg, timer)
+    semmem_block = await _light_semmem_block(req, state, cfg, timer, session_id)
     light_messages = build_chat_messages(
         system_prompt, history,
         rag_chunks=None, file_contexts=None,
         semmem_block=semmem_block,
         context_size=context_size, max_tokens=max_tokens,
+        # 「履歴を削らない」が軽量パスの立て付けなので、履歴の床も主経路と同じ値。
+        # 0 のままだと動的ブロック (記憶) が履歴を押し出しうる。
+        history_min_tokens=int(
+            (cfg.get("memory") or {}).get(
+                "history_min_tokens", DEFAULT_HISTORY_MIN_TOKENS,
+            ),
+        ),
         working_max_tokens=int(
             (cfg.get("memory") or {}).get(
                 "working_max_tokens", DEFAULT_WORKING_MAX_TOKENS,
             ),
         ),
         # 軽量パスも切り詰め注記 / 自己出力の計量を通す (build_chat_messages 内)。
-        evicted_turns=session_evicted_turns(state),
+        evicted_turns=session_evicted_turns(state, session_id),
+        # 会話全体の計量 (「何ターン目?」) は session_id が無いと no-op になる。
+        session_id=session_id,
     )
     light_max = min(max_tokens or REACTIVE_LIGHT_MAX_TOKENS, REACTIVE_LIGHT_MAX_TOKENS)
     if req.stream:
@@ -688,6 +635,7 @@ async def _dispatch_reactive_light(
 
 async def _run_search_timed(
     req: ChatRequest, state: AppState, cfg: dict, timer: StageTimer,
+    session_id: str | None = None,
 ) -> SearchPipelineResult:
     """検索パイプラインを ``search_ms`` 計測付きで実行する。
 
@@ -699,6 +647,7 @@ async def _run_search_timed(
     try:
         return await run_search_pipeline(
             req.message, state, cfg, mode=req.mode, timer=timer,
+            session_id=session_id,
         )
     finally:
         timer.stop("search_ms")
@@ -828,7 +777,9 @@ async def _build_messages_with_search(
             logger.warning("Search task failed, continuing without RAG: %s", exc)
             search_result = SearchPipelineResult(error=str(exc))
     else:
-        search_result = await _run_search_timed(req, state, cfg, timer)
+        search_result = await _run_search_timed(
+            req, state, cfg, timer, session_id,
+        )
     rag_chunks = search_result.chunks
     search_error = search_result.error
     scored_chunks = search_result.scored_chunks
@@ -865,6 +816,7 @@ async def _build_messages_with_search(
             query_vec=search_result.query_vec,
             query_text=req.message,
             covered_attributes=covered_attributes,
+            session_id=session_id,
         )
     finally:
         timer.stop("semmem_ms")
@@ -893,10 +845,13 @@ async def _build_messages_with_search(
             ),
         ),
         # 会話の前半が窓外へ落ちている状態を「全体を走査する質問」にだけ伝える。
-        evicted_turns=session_evicted_turns(state),
+        evicted_turns=session_evicted_turns(state, session_id),
         # 「何ターン目?」「「横浜」は何回?」は窓の中だけでは数えられない。
         # 蓄積バッファを引くために session_id を渡す。
         session_id=session_id,
+        # この経路は deliberative へ流れ、ツール結果 (最大 TOOL_RESULT_MAX_CHARS)
+        # と各種注記が組み立て後に最後の user へ積まれる。その分を先に予約する。
+        post_append_reserve_tokens=deliberative_post_append_reserve_tokens(),
     )
 
     sse_notify = SSEFrameBuilder()
@@ -1014,6 +969,7 @@ def _format_file_block(
 
 def _build_long_form_orchestrator(
     client, state: AppState, cfg: dict, gen_params: dict,
+    session_id: str | None = None,
 ) -> LongFormOrchestrator:
     """LongFormOrchestrator を構築する (long_form ディスパッチ / コード委譲で共用)。
 
@@ -1022,7 +978,7 @@ def _build_long_form_orchestrator(
     起動する一次生成タスクで、本文生成そのものも同じベースモデルが担うため、
     補助段だけを別モデルへ逃がす理由がない (docs/c_14 §1.1 の例外)。
     """
-    mem_sys = state.get_memory_system()
+    mem_sys = state.get_memory_system(session_id)
     local = state.local_client
     planner = (
         AuxClient(local, config=cfg, debug_logger=state.debug_logger)
@@ -1118,7 +1074,7 @@ def make_code_artifact_generator(
         if detect_content_type(instruction, "create") != ContentType.CODE:
             return []
         orchestrator = _build_long_form_orchestrator(
-            client, state, gen_cfg, gen_params,
+            client, state, gen_cfg, gen_params, session_id,
         )
         try:
             # orchestrator の _call_step は sync 呼出 (on_step(data)) だが、
@@ -1182,7 +1138,9 @@ async def _dispatch_long_form(
             return _llm_unavailable_response(req.stream)
         raise HTTPException(status_code=503, detail="llama-server not connected")
 
-    orchestrator = _build_long_form_orchestrator(client, state, cfg, gen_params)
+    orchestrator = _build_long_form_orchestrator(
+        client, state, cfg, gen_params, session_id,
+    )
     existing_content = await read_existing_for_append(req.message, state)
 
     if req.stream:
@@ -1299,7 +1257,9 @@ async def _dispatch_staged_create(
             return _llm_unavailable_response(req.stream)
         raise HTTPException(status_code=503, detail="llama-server not connected")
 
-    orchestrator = _build_long_form_orchestrator(client, state, cfg, gen_params)
+    orchestrator = _build_long_form_orchestrator(
+        client, state, cfg, gen_params, session_id,
+    )
     existing_content = await read_existing_for_append(req.message, state)
 
     # staged はストリーミング前提。非ストリーム要求は従来 longform に委譲する。
@@ -1546,8 +1506,8 @@ async def _dispatch_deliberative(
                 escalated_from=escalated_from,
                 # 窓の先頭が会話の先頭かを deliberative 側で判定するために渡す
                 # (``_append_session_position_fact`` 参照)。
-                evicted_turns=session_evicted_turns(state),
-                session_head=session_first_user_message(state),
+                evicted_turns=session_evicted_turns(state, session_id),
+                session_head=session_first_user_message(state, session_id),
                 answered_attributes=answered_attributes,
             ))),
             media_type="text/event-stream",
@@ -1565,8 +1525,8 @@ async def _dispatch_deliberative(
             rag_top1_score=rag_top1_score,
             tool_judge_task=tool_judge_task,
             escalated_from=escalated_from,
-            evicted_turns=session_evicted_turns(state),
-            session_head=session_first_user_message(state),
+            evicted_turns=session_evicted_turns(state, session_id),
+            session_head=session_first_user_message(state, session_id),
             answered_attributes=answered_attributes,
         )
 
@@ -1704,7 +1664,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             )
         if agent_layer != "reactive":
             search_task = asyncio.create_task(
-                _run_search_timed(req, state, cfg, timer),
+                _run_search_timed(req, state, cfg, timer, session_id),
             )
         try:
             conflict_ctx = await conflict_task

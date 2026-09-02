@@ -26,6 +26,7 @@ from backend.free.rag.text_extractor import (
 )
 
 if TYPE_CHECKING:
+    from backend.debug_logger import DebugLogger
     from backend.free.agent.learned_patterns import LearnedPatternStore
     from backend.free.rag.embedding_backend import EmbeddingBackend
 
@@ -52,6 +53,61 @@ def _check_cancel(cancel_check: CancelCheck | None) -> None:
     """cancel_check が True を返したら CartridgeInstallCancelled を raise"""
     if cancel_check is not None and cancel_check():
         raise CartridgeInstallCancelled("Cartridge install cancelled")
+
+
+#: ``rag.cartridge_gate.threshold`` が未指定でプロファイルにも無いときの既定。
+DEFAULT_CARTRIDGE_GATE_THRESHOLD = 0.3
+
+
+def _profile_cartridge_gate_threshold() -> float | None:
+    """有効な埋め込みモデルプロファイルの ``embedding.rag.cartridge_gate_threshold``。
+
+    ``models/profiles/<arch>.yaml`` (+ ``by-model/<stem>.yaml``) を
+    ``model_paths.embed_model`` から解決する (起動フラグ / モデル移行と同じ
+    ローダ)。config 未ロード / モデル未設定 / プロファイル不在 / 読取失敗は
+    ``None`` (呼出側が 0.3 に倒す)。
+    """
+    try:
+        from backend.config import get_config, get_project_root
+        from scripts.launch_llama import load_model_profile_for
+
+        model_rel = (get_config().get("model_paths") or {}).get("embed_model")
+        if not model_rel:
+            return None
+        root = get_project_root()
+        model_path = Path(model_rel)
+        if not model_path.is_absolute():
+            model_path = root / model_path
+        profile = load_model_profile_for(model_path, root) or {}
+        value = (
+            ((profile.get("embedding") or {}).get("rag") or {})
+            .get("cartridge_gate_threshold")
+        )
+    except Exception as exc:
+        logger.debug("cartridge gate profile threshold unavailable: %s", exc)
+        return None
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def resolve_cartridge_gate_threshold(gate_cfg: dict | None) -> float:
+    """``rag.cartridge_gate.threshold`` の実効値を決める。
+
+    優先順: 明示値 → 有効な埋め込みプロファイルの値 → 0.3。cos の絶対値は
+    埋め込みモデルごとに分布が違う (無関係ペアの中央値が LFM2.5 0.105 /
+    Qwen3 0.273 / bge-m3 0.459) ため、未指定 (``None``) はモデル固有値に
+    追随させ、固定の 0.3 を転写しない。
+    """
+    explicit = (gate_cfg or {}).get("threshold")
+    if explicit is not None:
+        return float(explicit)
+    from_profile = _profile_cartridge_gate_threshold()
+    if from_profile is not None:
+        logger.info(
+            "Cartridge gate threshold resolved from embedding profile: %.2f",
+            from_profile,
+        )
+        return from_profile
+    return DEFAULT_CARTRIDGE_GATE_THRESHOLD
 
 
 @dataclass
@@ -128,8 +184,14 @@ def _save_centroid(cart_dir: Path, store: VectorStore) -> np.ndarray | None:
 class CartridgeManager:
     """ナレッジカートリッジの install / load / unload / uninstall / search"""
 
-    def __init__(self, cartridges_dir: str | Path, rag_config: dict | None = None):
+    def __init__(
+        self,
+        cartridges_dir: str | Path,
+        rag_config: dict | None = None,
+        debug_logger: "DebugLogger | None" = None,
+    ):
         self.cartridges_dir = Path(cartridges_dir)
+        self._debug_logger = debug_logger
         self.cartridges_dir.mkdir(parents=True, exist_ok=True)
         self.rag_config = rag_config or {}
         self._memmap_threshold = self.rag_config.get(
@@ -144,7 +206,7 @@ class CartridgeManager:
         )
         gate_cfg = self.rag_config.get("cartridge_gate", {}) or {}
         self._gate_enabled = bool(gate_cfg.get("enabled", True))
-        self._gate_threshold = float(gate_cfg.get("threshold", 0.3))
+        self._gate_threshold = resolve_cartridge_gate_threshold(gate_cfg)
         self._gate_max_cartridges = int(gate_cfg.get("max_cartridges", 10))
         self._gate_fallback_when_empty = bool(
             gate_cfg.get("fallback_when_empty", False),
@@ -163,7 +225,7 @@ class CartridgeManager:
         self._load_registry()
 
     def set_learned_patterns(self, learned_patterns: LearnedPatternStore) -> None:
-        """学習済みパターンストアを設定"""
+        """学習済みパターンストアを設定 (配線互換のため保持。現在は参照しない)"""
         self._learned_patterns = learned_patterns
 
     @staticmethod
@@ -379,9 +441,10 @@ class CartridgeManager:
             cartridge_id, "yes" if centroid is not None else "no",
         )
 
-        # tool_hints のキーワードを tool_routing カテゴリで学習パターンに追加
-        self._register_tool_hint_patterns(info)
-
+        # tool_hints は ``get_tool_hints()`` 経由で tool_call_judge が直接読む。
+        # 以前はここで learned_patterns にも登録していたが、ロードごとに +0.15
+        # ブーストされ、減衰と 200 件上限の押し出しで会話から学習した語を
+        # 追い出していたため撤去した (2026-09-02 監査 R-C4)。
         self._notify_change("load", cartridge_id)
         return info
 
@@ -398,9 +461,6 @@ class CartridgeManager:
         self._save_registry()
 
         logger.info("Unloaded cartridge %s", cartridge_id)
-
-        # tool_hints のキーワードの source_count を減算
-        self._unregister_tool_hint_patterns(info)
 
         self._notify_change("unload", cartridge_id)
         return info
@@ -681,6 +741,7 @@ class CartridgeManager:
         q = (query_vec / qnorm).astype(np.float32)
 
         scored: list[tuple[str, float]] = []
+        rejected: list[tuple[str, float]] = []
         uncomputed: list[str] = []
         for cid in cart_ids:
             data = self._loaded[cid]
@@ -692,10 +753,18 @@ class CartridgeManager:
             if sim >= self._gate_threshold:
                 scored.append((cid, sim))
             else:
+                rejected.append((cid, sim))
                 logger.debug(
                     "Cartridge gate reject: cartridge=%s sim=%.3f (threshold=%.2f)",
                     cid, sim, self._gate_threshold,
                 )
+        if rejected and self._debug_logger is not None:
+            # rag.jsonl (op=rag_selection) にゲートの採否を残す。query 本文は
+            # ここまで届かない (ベクトルのみ) ので識別子で埋める。
+            self._debug_logger.log_rag_selection(
+                query="cartridge_gate", quality="cartridge_gate",
+                floor=self._gate_threshold, kept=scored, rejected=rejected,
+            )
 
         # スコア上位 max_cartridges 件 (<=0 で無制限) + 未構築を常に含める
         if self._gate_max_cartridges > 0:
@@ -727,8 +796,10 @@ class CartridgeManager:
         passed_set = set(passed)
         return [cid for cid in cart_ids if cid in passed_set]
 
-    def search(self, query_vec: np.ndarray, top_k: int = 5) -> list[tuple[str, float, str]]:
-        """ロード済みカートリッジ横断検索
+    def search_detailed(
+        self, query_vec: np.ndarray, top_k: int = 5, rescore_candidates: int = 0,
+    ) -> list[tuple[str, float, str, float]]:
+        """ロード済みカートリッジ横断検索 (cosine と priority を分けて返す)。
 
         各カートリッジから top_k 件を取得し、ラウンドロビンでインターリーブして
         返す。スコアでグローバルソートしてから top_k で切り詰める旧実装は、
@@ -740,11 +811,23 @@ class CartridgeManager:
         ことが保証される。最終件数は ``top_k * n_loaded`` を上限とし、上流の
         salience ranker / `_ensure_cartridge_fairness` で最終的な
         絞り込みを行う。
+
+        戻り値は ``(chunk_id, cosine, text, priority)``。呼出側 (検索
+        パイプライン) は cosine を品質判定 / floor に、``cosine × priority``
+        を順位付けに使う — 掛けた値を閾値に流すと priority が閾値を偽装する。
+
+        次元不一致 (``VectorDimensionMismatchError``) のカートリッジは
+        ここでは捕まえない。``check_dimension_consistency`` が起動時に
+        ``_loaded`` から外しているのが本命で、呼出側は ``RAGError`` を層内で
+        握って空にする。
+
+        Args:
+            rescore_candidates: ``VectorStore.search`` の float32 rescore 候補数
+                (``rag.rescore_candidates``)。0 でストア側の既定。
         """
         if not self._loaded:
             return []
 
-        # 各カートリッジから top_k 件を取得 (priority 補正済み、スコア降順)
         # items() のスナップショットを取ってから move_to_end する (イテレーション中の変更を避ける)
         cart_ids = list(self._loaded.keys())
         cart_ids = self._apply_cartridge_gate(query_vec, cart_ids)
@@ -752,21 +835,23 @@ class CartridgeManager:
         if n_loaded == 0:
             return []
 
-        per_cart: list[list[tuple[str, float, str]]] = []
+        per_cart: list[list[tuple[str, float, str, float]]] = []
         for cart_id in cart_ids:
             data = self._loaded[cart_id]
-            results = data.store.search(query_vec, top_k=top_k)
-            adjusted = [
-                (f"{cart_id}:{chunk_id}", score * data.info.priority, text)
+            results = data.store.search(
+                query_vec, top_k=top_k, rescore_candidates=rescore_candidates,
+            )
+            priority = float(data.info.priority)
+            per_cart.append([
+                (f"{cart_id}:{chunk_id}", score, text, priority)
                 for chunk_id, score, text in results
-            ]
-            per_cart.append(adjusted)
+            ])
             self._loaded.move_to_end(cart_id)
 
         # ラウンドロビン: i 周回目に全カートリッジから i 番目に良いチャンクを
         # 取り出す。これにより各カートリッジの 1 位 → 2 位 → ... が交互に
         # 並び、必ず全カートリッジが代表される。
-        interleaved: list[tuple[str, float, str]] = []
+        interleaved: list[tuple[str, float, str, float]] = []
         max_len = max((len(c) for c in per_cart), default=0)
         for i in range(max_len):
             for cart_results in per_cart:
@@ -775,6 +860,21 @@ class CartridgeManager:
 
         # 上流レイヤが余裕を持って候補を扱えるよう、上限は top_k * n_loaded。
         return interleaved[: top_k * n_loaded]
+
+    def search(
+        self, query_vec: np.ndarray, top_k: int = 5, rescore_candidates: int = 0,
+    ) -> list[tuple[str, float, str]]:
+        """ロード済みカートリッジ横断検索 (``cosine × priority`` の 3 タプル)。
+
+        :meth:`search_detailed` の後方互換ラッパ。cosine と priority を
+        分けて扱いたい呼出側 (検索パイプライン) はそちらを使う。
+        """
+        return [
+            (chunk_id, cosine * priority, text)
+            for chunk_id, cosine, text, priority in self.search_detailed(
+                query_vec, top_k=top_k, rescore_candidates=rescore_candidates,
+            )
+        ]
 
     def list_cartridges(self) -> list[CartridgeInfo]:
         """インストール済みカートリッジ一覧"""
@@ -820,6 +920,12 @@ class CartridgeManager:
         不一致のカートリッジは `needs_rebuild = True` を立て、ID を返す。
         起動時 / リロード時に呼び出す。
 
+        不一致のカートリッジは **検索対象からも外す** (``_loaded`` から落とす。
+        registry 上は installed のまま)。載せたままにすると
+        ``VectorStore.search`` が ``VectorDimensionMismatchError`` を投げ、
+        1 つのカートリッジが検索パイプライン全体 (STM / LTM を含む) を
+        巻き込んで落としていた (2026-09-02 監査 S-A1)。
+
         Returns:
             次元不一致で needs_rebuild になったカートリッジ ID のリスト
         """
@@ -837,35 +943,16 @@ class CartridgeManager:
                     "marked needs_rebuild. Run 'evoref reindex --cartridge %s'.",
                     cart_id, cart_dim, embedder_dim, cart_id,
                 )
+                if cart_id in self._loaded:
+                    del self._loaded[cart_id]
+                    info.status = "installed"
+                    logger.warning(
+                        "Cartridge '%s' excluded from search until rebuilt "
+                        "(embedding dim mismatch)", cart_id,
+                    )
         if registry_changed:
             self._save_registry()
         return mismatched
-
-    def _register_tool_hint_patterns(self, info: CartridgeInfo) -> None:
-        """カートリッジの tool_hints キーワードを tool_routing パターンとして登録"""
-        if self._learned_patterns is None or not info.tool_hints:
-            return
-        for hint in info.tool_hints:
-            for pattern in hint.get("patterns", []):
-                if len(pattern) >= 2:
-                    self._learned_patterns.add_pattern(
-                        pattern, category="tool_routing",
-                    )
-        logger.debug(
-            "Registered tool_hint patterns for cartridge %s", info.id,
-        )
-
-    def _unregister_tool_hint_patterns(self, info: CartridgeInfo) -> None:
-        """カートリッジ unload 時: tool_hints キーワードの source_count を減算"""
-        if self._learned_patterns is None or not info.tool_hints:
-            return
-        for hint in info.tool_hints:
-            for pattern in hint.get("patterns", []):
-                if len(pattern) >= 2:
-                    self._learned_patterns.decrement_source_count(pattern)
-        logger.debug(
-            "Unregistered tool_hint patterns for cartridge %s", info.id,
-        )
 
     def get_tool_hints(self) -> list[dict]:
         """ロード済みカートリッジの tool_hints を集約して返す"""
@@ -1006,14 +1093,13 @@ class CartridgeManager:
                     break
             if victim_id is None:
                 return
-            victim_info = self._loaded.pop(victim_id).info
+            self._loaded.pop(victim_id)
             if victim_id in self._registry:
                 self._registry[victim_id].status = "installed"
             logger.info(
                 "Cartridge LRU eviction: %s (max_loaded=%d, L3)",
                 victim_id, self._max_loaded,
             )
-            self._unregister_tool_hint_patterns(victim_info)
             self._notify_change("unload", victim_id)
 
     def _maybe_build_cluster_index(self, store: VectorStore) -> None:

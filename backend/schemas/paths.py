@@ -174,3 +174,8 @@ class LocalPathsConfig(BaseModel):
     # base prompts / base LoRA・cvector を配置する。PathResolver.resolve_learning が
     # 参照する (共有データは従来どおり flat の local_paths を使う)。
     learning_dir: str = "local/learning/"
+    # Level 1 phase6 (GenerationParamEvolver) の学習デルタ。base モデル依存なので
+    # PathResolver.resolve_learning がパーティション配下へ rebase する。
+    generation_deltas_file: str = "local/generation_deltas.json"
+    # develop=evolve の LogIngestor 進捗ファイル (読み込みオフセット)。
+    log_ingestor_file: str = "local/state/log_ingestor.json"

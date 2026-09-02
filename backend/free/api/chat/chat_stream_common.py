@@ -10,14 +10,20 @@ from __future__ import annotations
 import time
 
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, AsyncIterator
 from backend.app_state import AppState
+from backend.exceptions import EvorefError
 from backend.free.api.chat.chat_constants import MAX_STEP_QUEUE_SIZE
-from backend.free.api.chat.chat_recorder import read_llama_prompt_tokens
+from backend.free.api.chat.chat_recorder import (
+    read_llama_prompt_tokens,
+    record_response,
+    tool_routing_signals,
+)
 from backend.free.api.chat.chat_service import make_token_info
 from backend.free.api.chat.chat_types import ChatMessage, StepCallback
 from backend.free.api.schemas import ChatResponse, TokenInfo
 from backend.free.core.sse import SSEFrameBuilder
+from backend.i18n_helper import msg
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -33,13 +39,14 @@ sse = SSEFrameBuilder()
 def meta_tool_routing_success(resp) -> bool:
     """meta-cognitive 応答でツールが 1 件以上実行成功したか (tool_routing 正例)。
 
-    deliberative の ``tool_command_success is True`` と同義 (ツールが呼ばれ成功)。
-    meta は複数ツールを呼ぶため any (1 件でも成功なら誘導は妥当)。tool_calls 空
-    (= ツール未使用) は False。phase7 がクエリ単位の弱い正例として消費する。
+    規則は :func:`~backend.free.api.chat.chat_recorder.tool_routing_signals`
+    (3 経路共通) に集約。meta は複数ツールを呼ぶため any (1 件でも成功なら
+    誘導は妥当)。tool_calls 空 (= ツール未使用) は False。
     """
     if resp is None:
         return False
-    return any(tc.get("success") for tc in (getattr(resp, "tool_calls", None) or []))
+    ok, _ = tool_routing_signals(getattr(resp, "tool_calls", None))
+    return ok
 
 
 def meta_last_command_call(resp) -> dict:
@@ -69,14 +76,44 @@ def meta_last_command_call(resp) -> dict:
 def meta_tool_routing_false_positive(resp) -> bool:
     """meta-cognitive 応答でツールを呼んだが全て失敗したか (tool_routing 誤検出)。
 
-    deliberative の ``tool_command is not None and tool_command_success is False``
-    と同義 (ルーティングしたが結果が伴わなかった同一ターンの明確な失敗)。tool_calls
-    空 (未使用) は False。phase7 + パターン decay がクエリ単位で消費する。
+    規則は :func:`~backend.free.api.chat.chat_recorder.tool_routing_signals`
+    (3 経路共通) に集約。tool_calls 空 (未使用) は False。
     """
     if resp is None:
         return False
-    tool_calls = getattr(resp, "tool_calls", None) or []
-    return bool(tool_calls) and not any(tc.get("success") for tc in tool_calls)
+    _, fp = tool_routing_signals(getattr(resp, "tool_calls", None))
+    return fp
+
+
+def _record_failed_generation(
+    state: AppState,
+    *,
+    query: str,
+    messages: list[ChatMessage],
+    session_id: str,
+    mode: str,
+    private: bool,
+    agent_layer: str,
+    tokens_generated: int = 0,
+) -> None:
+    """error フレームで終わったターンを ``response=""`` の失敗経験として記録する。
+
+    ストリーム層の ``except Exception`` から呼ぶ。以前は例外経路では
+    ``record_*`` が一切走らず、失敗ターンは経験バッファに 1 件も無かった
+    (2026-09-02 監査 R-A4)。メモリ / 履歴の帳簿 (user 発話の蓄積、押し出し
+    済みターンの STM 転送、sleep-time スケジュール) も同時に付く。記録の
+    失敗で error フレームの後始末を壊さないよう例外は握って ERROR ログに出す。
+    """
+    try:
+        record_response(
+            state, "", messages, session_id, query, mode, tokens_generated,
+            private=private, generation_failed=True,
+        )
+    except Exception:
+        logger.error(
+            "%s: failed to record the errored turn as an experience",
+            agent_layer, exc_info=True,
+        )
 
 
 def rag_signals_from_chunks(
@@ -144,6 +181,75 @@ def _emit_timing(
             timing, agent_layer=agent_layer,
             tokens_generated=tokens_generated, mode=mode,
         )
+
+
+def _capture_stream_outcome(token_stream: Any, state: Any) -> None:
+    """``TokenStream.outcome`` から切断メタを ``state`` へ吸い上げる。
+
+    ``state`` は ``truncated`` / ``truncated_tokens`` / ``truncated_max_tokens``
+    を持つ層別ストリーム状態 (deliberative / long_form)。``outcome`` を持たない
+    イテレータ (テストの mock / 中継 generator / orchestrator) は素通しする —
+    切断が分からないだけで、本文は従来どおり流れる。
+
+    以前は deliberative だけがこれを持ち、他の層では ``finish_reason=length``
+    が SSE に一切出なかった。再生成 (0 トークン再試行 / 制約修復) が再度通る
+    場合、切断の有無は **最後に画面へ出した生成** で上書きする。
+    """
+    outcome = getattr(token_stream, "outcome", None)
+    if outcome is None:
+        return
+    state.truncated = bool(getattr(outcome, "truncated", False))
+    state.truncated_tokens = int(getattr(outcome, "tokens_generated", 0) or 0)
+    state.truncated_max_tokens = getattr(outcome, "max_tokens", None)
+
+
+async def _close_token_stream(token_stream: Any) -> None:
+    """キャンセルで早期 break したストリームの基底 generator を閉じる。
+
+    ``TokenStream.aclose`` は存在していたが誰も呼んでいなかった。閉じないと
+    ``_generate_stream`` の ``async with httpx.AsyncClient`` が GC まで生き、
+    llama-server 側の生成は接続が切れるまで続く (キャンセル後もスロットを
+    占有する)。閉じる際の例外は握る — キャンセルの後始末で応答を壊さない。
+    """
+    aclose = getattr(token_stream, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception:  # pragma: no cover - 後始末の失敗は本流へ出さない
+        logger.debug("token stream aclose failed", exc_info=True)
+
+
+async def _emit_stream_error(
+    state: AppState,
+    exc: BaseException,
+    *,
+    timer: StageTimer | None,
+    agent_layer: str,
+    mode: str,
+    tokens_generated: int = 0,
+) -> AsyncIterator[str]:
+    """ストリーム層の ``except Exception`` 末尾の共通処理 (計測停止 → error → done)。
+
+    4 層 (deliberative / reactive 軽量 / meta_cognitive / long_form) が同じ
+    ブロックを写経し、ログの書式 (``%s`` / ``%r``) と timing の tokens が
+    揺れていた。型付き例外 (:class:`EvorefError`) は ``code`` 付きフレームで
+    送り、ユーザー向け文言は i18n キーが解決できればそれを、できなければ
+    例外メッセージ (英語) を使う。
+    """
+    logger.error("%s stream error: %r", agent_layer, exc)
+    if timer:
+        timer.stop("llm_total_ms")
+    _emit_timing(state, timer, agent_layer, tokens_generated, mode=mode)
+    if isinstance(exc, EvorefError):
+        text = msg(exc.i18n_key, **{k: v for k, v in exc.context.items() if isinstance(v, str | int | float)})
+        if text == exc.i18n_key or "{" in text:
+            text = str(exc) or exc.i18n_key
+        yield sse.error_with_code(exc.code, text)
+    else:
+        yield sse.error(str(exc))
+    yield sse.done()
+
 
 # ---------------------------------------------------------------------------
 # セッション別キャンセルフラグ（chat.py の cancel エンドポイントからも参照）

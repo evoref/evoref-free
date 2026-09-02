@@ -48,6 +48,7 @@ from backend.free.memory.pipeline.semantic_conflict_resolver import (
     split_by_attribute_similarity,
 )
 from backend.free.memory.semantic.store import SemanticFactStore
+from backend.i18n_helper import prompt_locale
 from backend.utils import estimate_tokens
 from backend.free.memory.types import Provenance, SemanticFact, make_fact
 from backend.log_config import get_logger
@@ -501,6 +502,32 @@ def apply_resolution(
 # ──────────────────────────────────────────────────────────────────────────
 
 
+#: 競合セクションの固定文 (``i18n.prompt_locale`` 別)。``ja`` が従来出力
+#: (byte 同一)。en 側を変えるときは ``core.inference._normalize_for_frame_dedup``
+#: が剥がすラベルも揃える。
+_CONFLICT_LABELS: dict[str, dict[str, str]] = {
+    "ja": {
+        "header": "[記憶の競合 — 未解決]",
+        "lead": "以下の記憶は内容が矛盾しています (確認待ち)。",
+        "new": "新「{value}」({date})",
+        "old": "旧「{value}」({date})",
+        "more": "(他 {n} 件)",
+    },
+    "en": {
+        "header": "[Memory conflicts — unresolved]",
+        "lead": "The following memories contradict each other (awaiting review).",
+        "new": "new \"{value}\" ({date})",
+        "old": "old \"{value}\" ({date})",
+        "more": "({n} more)",
+    },
+}
+
+
+def _conflict_labels() -> dict[str, str]:
+    """prompt_locale に応じたラベル辞書 (未知 locale は ja)。"""
+    return _CONFLICT_LABELS.get(prompt_locale(), _CONFLICT_LABELS["ja"])
+
+
 def _short_date(ts: float) -> str:
     """created_at (epoch) を MM-DD 表記へ。不正値は空文字列。"""
     try:
@@ -524,10 +551,12 @@ def _render_group_line(
     """
     facts = group.facts
     last = len(facts) - 1
+    labels = _conflict_labels()
     parts = [
-        f"新「{_truncate(f.object, max_object_chars)}」({_short_date(f.created_at)})"
-        if i == last
-        else f"旧「{_truncate(f.object, max_object_chars)}」({_short_date(f.created_at)})"
+        (labels["new"] if i == last else labels["old"]).format(
+            value=_truncate(f.object, max_object_chars),
+            date=_short_date(f.created_at),
+        )
         for i, f in enumerate(facts)
     ]
     return (
@@ -549,9 +578,10 @@ def _render_block_lines(
     **答えても何も起きない質問** をモデルに書かせるだけなので落とした
     (解決は sleep-time の ``SemanticConflictResolver`` と TTL が担う)。
     """
+    labels = _conflict_labels()
     return [
-        "[記憶の競合 — 未解決]",
-        "以下の記憶は内容が矛盾しています (確認待ち)。",
+        labels["header"],
+        labels["lead"],
         *(
             _render_group_line(i, g, max_object_chars=max_object_chars)
             for i, g in enumerate(groups, start=1)
@@ -638,5 +668,5 @@ def render_pending_conflicts_block(
         )
     lines = _render_block_lines(shown, max_object_chars=max_object_chars)
     if len(groups) > len(shown):
-        lines.append(f"(他 {len(groups) - len(shown)} 件)")
+        lines.append(_conflict_labels()["more"].format(n=len(groups) - len(shown)))
     return "\n".join(lines)

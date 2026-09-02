@@ -27,7 +27,10 @@ from backend.trace_context import run_in_executor_with_context
 from backend.utils import utc_now_dt
 
 if TYPE_CHECKING:
-    from backend.free.memory.stores.working import WorkingMemory
+    from backend.free.memory.stores.working import (
+        WorkingMemory,
+        WorkingMemoryRegistry,
+    )
     from backend.free.memory.stores.short_term import ShortTermMemory
 
 logger = get_logger("api.chat.recorder")
@@ -479,6 +482,54 @@ def snapshot_wm_to_stm(
     )
 
 
+def snapshot_all_wm_to_stm(
+    registry: WorkingMemoryRegistry, stm: ShortTermMemory,
+) -> None:
+    """**全セッション** の WM 未転送ターンを非破壊で STM へ写す (Full 直前)。
+
+    ``SleepTimeScheduler.set_pre_full_flush`` に注入される。単一 WM 時代は
+    現行セッションだけを写していたが、WM はセッション別なので、Full の入力から
+    抜けるセッションが出ないよう台帳を全部なめる。
+    """
+    for session_id, turns in registry.snapshot_all_unabsorbed():
+        _absorb_turns_to_stm(turns, stm, session_id, origin="snapshot")
+
+
+def release_session_turns(
+    wm: WorkingMemory, stm: ShortTermMemory, session_id: str,
+) -> None:
+    """セッション終了時の WM → STM 転送 + セッション蓄積の掃除 (f_02 §1.2 経路 (b))。
+
+    ``WorkingMemoryRegistry`` の drain ハンドラとして注入され、LRU 押し出し /
+    明示のセッション終了 / shutdown の 3 経路すべてがここを通る。台帳側が
+    ``clear()`` を先に済ませているので、ここでは押し出しバッファを **その
+    セッション ID で** 吸収する (エコー落とし規則込み) だけでよい。
+    """
+    drain_evicted_to_stm(wm, stm, session_id)
+    clear_session_data(session_id)
+
+
+def end_session(state: AppState, session_id: str) -> bool:
+    """明示のセッション終了: WM を drain して台帳から外し、セッション別カウンタを畳む。
+
+    セッション解除 API (``DELETE /api/sessions/{id}``) から呼ぶ。以前は
+    ``prepare_memory_context`` がセッション切替を検知して行っていた後始末
+    (WM drain / judge_tracker の reset) を、WM がセッション別になったことで
+    ここへ移した。台帳に無ければ ``False``。
+    """
+    registry = getattr(state, "working_memory_registry", None)
+    dropped = False
+    if registry is not None:
+        dropped = registry.drop(session_id) is not None
+    for tracker in (
+        getattr(state, "judge_tracker", None),
+        getattr(state, "conflict_judge_tracker", None),
+    ):
+        if tracker is not None:
+            tracker.reset_session(session_id)
+    return dropped
+
+
 def _absorb_turns_to_stm(
     turns: list[dict], stm: ShortTermMemory, session_id: str, *, origin: str,
     preceding_user: str = "",
@@ -524,7 +575,9 @@ def _absorb_turns_to_stm(
         logger.info("Absorbed %d %s turns to STM", len(turns), origin)
 
 
-def _wm_correction_flag(state: AppState, user_query: str) -> bool | None:
+def _wm_correction_flag(
+    state: AppState, user_query: str, session_id: str | None = None,
+) -> bool | None:
     """``prepare_memory_context`` が WM の user ターンに立てた訂正の印を読む。
 
     ``restates_a_value`` は応答パスの入口で 1 回判定し、結果を turn dict の
@@ -532,7 +585,14 @@ def _wm_correction_flag(state: AppState, user_query: str) -> bool | None:
     (同じ述語を 1 ターンに 3 回走らせていた)。該当ターンが窓から落ちて
     いる / WM が無い場合は ``None`` (呼出側で判定にフォールバック)。
     """
-    mem_sys = state.get_memory_system() if hasattr(state, "get_memory_system") else None
+    registry = getattr(state, "working_memory_registry", None)
+    if registry is not None and session_id and registry.peek(session_id) is None:
+        # 台帳に無いセッションの窓を読み出しのために再生しない (LRU 落ち / 終了済み)
+        return None
+    mem_sys = (
+        state.get_memory_system(session_id)
+        if hasattr(state, "get_memory_system") else None
+    )
     if not mem_sys:
         return None
     wm = mem_sys[0]
@@ -636,6 +696,62 @@ def _turn_contradiction_inputs(
 ARTIFACT_MIN_CHARS = 1200
 
 
+def tool_routing_signals(
+    tool_calls: list[dict] | None,
+) -> tuple[bool, bool]:
+    """ツール実行結果から ``(tool_routing_success, tool_routing_false_positive)`` を導く。
+
+    3 経路が別々の式で書いていた同じ規則を 1 箇所にする:
+
+    - **deliberative**: 判定層が撃った run_command 1 件 (``tool_command`` /
+      ``tool_command_success``)。:func:`command_tool_calls` で 1 要素のリストに
+      して渡す。success が None (実行されなかった) なら要素を作らない。
+    - **meta_cognitive**: ``resp.tool_calls`` (複数)。1 件でも成功なら誘導は
+      妥当 (success)、全部失敗なら誤検出 (false_positive)。
+    - **long_form**: ツールを撃たないので常に ``(False, False)``。
+
+    ``success is None`` の要素は「実行されなかった」なので数えない。呼ばれた
+    ツールが 1 件も無ければ両方 False (未使用は誤検出ではない)。
+    """
+    calls = [
+        tc for tc in (tool_calls or [])
+        if isinstance(tc, dict) and tc.get("success") is not None
+    ]
+    if not calls:
+        return False, False
+    ok = any(bool(tc.get("success")) for tc in calls)
+    return ok, not ok
+
+
+def command_tool_calls(
+    tool_command: str | None, tool_command_success: bool | None,
+) -> list[dict]:
+    """deliberative の単一 run_command を :func:`tool_routing_signals` の入力へ。"""
+    if tool_command is None or tool_command_success is None:
+        return []
+    return [{"tool": "run_command", "success": bool(tool_command_success)}]
+
+
+def _log_request_debug(
+    dl, tokens_generated: int, messages: list[ChatMessage], response: str,
+    *, private: bool,
+) -> None:
+    """``requests`` JSONL へ記録する。private ターンは本文を残さない。
+
+    件数 (トークン数 / メッセージ数) は残し、本文だけを伏せる。private の
+    契約は「ディスクへ本文を残さない」で、evolve の requests JSONL も
+    ディスクなので例外にしない (2026-09-02 監査 R-A6)。
+    """
+    if not private:
+        dl.log_request(tokens_generated, messages, response)
+        return
+    redacted = [
+        {"role": m.get("role", ""), "content": "[REDACTED: private turn]"}
+        for m in messages
+    ]
+    dl.log_request(tokens_generated, redacted, "[REDACTED: private turn]")
+
+
 def _remember_if_artifact_sized(
     state: AppState, session_id: str, response: str, query: str, mode: str,
 ) -> None:
@@ -664,64 +780,69 @@ def _record_assistant_turn_to_memory(
     - ``full_response`` が空でも **押し出し済みターンの STM 転送は行う**
       (空応答のターンで転送を飛ばすと、押し出されたターンが次の応答まで
       転送バッファに滞留する)。
-    - WM が **別セッション** に切り替わっていたら WM を迂回し、STM へ直接
-      正しい ``session_id`` で吸収する。並行セッション下では、生成中に
-      ``prepare_memory_context`` が別セッションへ切替えることがあり、そのまま
-      ``wm.add_turn`` すると回答が他人の会話に混ざる。WM の session_id が
-      文字列でない (テストのモック等) 場合は判定せず WM を信用する。
+    - WM は ``session_id`` のもの (``get_memory_system(session_id)``)。WM が
+      セッション別になる前は、生成中に別セッションへ切り替わった WM を迂回して
+      STM へ直接吸収するガードが要ったが、今は台帳が常に正しいセッションの窓を
+      返すので不要。
     - ``tool_command*`` は run_command 実行ターンの learning メタ。3 経路とも
       同じ kwargs を受けるので、meta-cognitive 経路の run_command も
       sleep-time Step 8.6 (executable_command_curator) に届く。
     """
-    mem_sys = state.get_memory_system()
+    registry = getattr(state, "working_memory_registry", None)
+    if (
+        registry is not None
+        and session_id
+        and registry.peek(session_id) is None
+        and full_response
+    ):
+        # 台帳から落ちたセッション (LRU 押し出し / 明示終了) に遅れて応答が返った。
+        # 新しい空の窓を作って assistant ターンだけを積むと、次の drain で
+        # 「user 不在の応答」が STM に落ちる。窓は再生せず、直前の user 発話と
+        # 対にして STM へ直接吸収する (エコー落としは _absorb_turns_to_stm 側)。
+        stm = getattr(state, "short_term_memory", None)
+        if stm is not None:
+            turn: dict = {
+                "role": "assistant", "content": _recorded_body(full_response),
+                "timestamp": time.time(), "source": "assistant", "mode": mode,
+            }
+            if private:
+                turn["private"] = True
+            if tool_command is not None:
+                turn.update(
+                    tool_command=tool_command, tool_command_name=tool_command_name,
+                    tool_command_success=tool_command_success,
+                    tool_command_source=tool_command_source,
+                    tool_command_query=user_query,
+                )
+            _absorb_turns_to_stm(
+                [turn], stm, session_id, origin="late_response",
+                preceding_user=user_query,
+            )
+            logger.info(
+                "record: session %s has no working memory (ended/evicted); "
+                "absorbed late assistant turn directly into STM", session_id[:8],
+            )
+        return
+    mem_sys = state.get_memory_system(session_id)
     if not mem_sys:
         return
     wm, stm, _ltm = mem_sys
-    wm_session = getattr(wm, "session_id", None)
-    wm_switched = isinstance(wm_session, str) and wm_session != session_id
     if full_response:
         body = _recorded_body(full_response)
         # 発火元のクエリを note に確定させる。curator が STM を走査して
         # 「直前で最も近い user note」から推測すると、当該ターンの user note が
         # 吸収されていない場合に別ターンのクエリと結び付く。
         tool_command_query = user_query if tool_command else None
-        if wm_switched:
-            logger.warning(
-                "WorkingMemory now belongs to session %s; absorbing the "
-                "assistant turn for session %s straight into STM",
-                wm_session, session_id,
-            )
-            turn: dict = {
-                "role": "assistant", "content": body, "timestamp": time.time(),
-                "mode": mode, "source": "assistant",
-            }
-            if private:
-                turn["private"] = True
-            for key, value in (
-                ("tool_command", tool_command),
-                ("tool_command_name", tool_command_name),
-                ("tool_command_success", tool_command_success),
-                ("tool_command_source", tool_command_source),
-                ("tool_command_query", tool_command_query),
-            ):
-                if value is not None:
-                    turn[key] = value
-            _absorb_turns_to_stm(
-                [turn], stm, session_id, origin="direct",
-                preceding_user=user_query,
-            )
-        else:
-            wm.add_turn(
-                "assistant", body,
-                private=private, mode=mode, source="assistant",
-                tool_command=tool_command,
-                tool_command_name=tool_command_name,
-                tool_command_success=tool_command_success,
-                tool_command_source=tool_command_source,
-                tool_command_query=tool_command_query,
-            )
-    # 押し出し済みターンは WM が現に属するセッションのもの。
-    drain_evicted_to_stm(wm, stm, wm_session if wm_switched else session_id)
+        wm.add_turn(
+            "assistant", body,
+            private=private, mode=mode, source="assistant",
+            tool_command=tool_command,
+            tool_command_name=tool_command_name,
+            tool_command_success=tool_command_success,
+            tool_command_source=tool_command_source,
+            tool_command_query=tool_command_query,
+        )
+    drain_evicted_to_stm(wm, stm, session_id)
 
 
 def _finish_turn_bookkeeping(
@@ -733,7 +854,7 @@ def _finish_turn_bookkeeping(
     # 入口で済んでいるので WM の印を読む (無ければ判定にフォールバック)。
     _schedule_sleep_time(
         state, user_query, private,
-        correction=_wm_correction_flag(state, user_query),
+        correction=_wm_correction_flag(state, user_query, session_id),
     )
 
     # ターンを蓄積（WM エビクションに依存しない完全な履歴）。user 側は入口で
@@ -762,11 +883,21 @@ def record_response(
     rag_top1_score: float | None = None,
     action_blocked: bool | None = None,
     sent_messages: list[ChatMessage] | None = None,
+    cancelled: bool = False,
+    truncated: bool = False,
+    generation_failed: bool = False,
 ) -> None:
     """応答をメモリ・デバッグログ・経験バッファに記録する
 
     ``private=True`` の場合は WM/STM までの伝搬のみ行い
     会話履歴ディスク永続化と feedback collector への記録をスキップする。
+
+    ``cancelled`` (クライアントキャンセルで途中まで) のターンはメモリ / 履歴
+    の帳簿は付けるが **経験としては記録しない** — 部分応答が成功例として
+    学習に入っていた (2026-09-02 監査 R-A2)。``truncated`` は
+    ``finish_reason=length`` の印で経験へそのまま刻む。``generation_failed``
+    (error フレームで終わった) と **空応答** は ``response=""`` の失敗経験と
+    して記録する — 以前は記録自体が無く、失敗が選択圧に一件も入らなかった。
 
     ``sent_messages`` は **実際に llama-server へ送った** メッセージ配列。
     ``messages`` は ``build_messages()`` 直後の配列で、``DeliberativeAgent``
@@ -799,22 +930,33 @@ def record_response(
     # デバッグログ
     dl = state.debug_logger
     if dl:
-        dl.log_request(
-            tokens_generated, sent_messages or messages, full_response,
+        _log_request_debug(
+            dl, tokens_generated, sent_messages or messages, full_response,
+            private=private,
         )
 
-    # 経験バッファに記録 (Level 0) — private は学習対象外
+    # 経験バッファに記録 (Level 0) — private / キャンセルは学習対象外
     fc = state.feedback_collector
-    if fc and full_response and not private:
+    if fc and cancelled and not private:
+        logger.info(
+            "Skipping experience record for cancelled turn (session=%s)",
+            session_id,
+        )
+    elif fc and not private:
         try:
+            # 記憶へ積む本文と同じもの (開示注記を落とした本文) を経験にも
+            # 使う。生の full_response を渡すと注記込みの応答が手本に昇格する。
+            body = _recorded_body(full_response)
             # 同一ターンの明確な失敗 = ツールをルーティングしたが失敗 → false_positive。
-            tool_fp = tool_command is not None and tool_command_success is False
+            _, tool_fp = tool_routing_signals(
+                command_tool_calls(tool_command, tool_command_success),
+            )
             prompt_tokens, cached_tokens = read_llama_prompt_tokens(state)
             blocked, measured = _turn_contradiction_inputs(
                 state, messages, action_blocked,
             )
             fc.record(
-                query=user_query, response=full_response, mode=mode,
+                query=user_query, response=body, mode=mode,
                 tool_routing_success=tool_routing_success,
                 tool_routing_false_positive=tool_fp,
                 cartridge_ids=_loaded_cartridge_ids(state),
@@ -824,6 +966,9 @@ def record_response(
                 cached_prompt_tokens=cached_tokens,
                 action_blocked=blocked,
                 measured_values=measured,
+                truncated=truncated,
+                generation_failed=generation_failed or not body.strip(),
+                session_id=session_id,
             )
         except Exception as e:
             # 経験記録の失敗でチャットを壊さない方針は維持するが、**握り潰さない**。
@@ -855,14 +1000,24 @@ def record_meta_cognitive_response(
     tool_command_success: bool | None = None,
     tool_command_source: str | None = None,
     sent_messages: list[ChatMessage] | None = None,
+    action_blocked: bool | None = None,
+    cancelled: bool = False,
+    truncated: bool = False,
+    generation_failed: bool = False,
 ) -> None:
     """Meta-Cognitive 層の応答をメモリ・経験バッファに記録（クレジット付き）
 
     ``private=True`` の場合は WM/STM までの伝搬のみ。
 
-    ``tool_command*`` / ``sent_messages`` は :func:`record_response` と同じ
-    意味。meta 経路で run_command が走ったターンも、呼出側がこれを渡せば
-    sleep-time Step 8.6 (executable_command_curator) の学習対象になる。
+    ``tool_command*`` / ``sent_messages`` / ``cancelled`` / ``truncated`` /
+    ``generation_failed`` は :func:`record_response` と同じ意味。meta 経路で
+    run_command が走ったターンも、呼出側がこれを渡せば sleep-time Step 8.6
+    (executable_command_curator) の学習対象になる。
+
+    ``action_blocked`` は deliberative の ``ToolJudgement.action_blocked`` に
+    相当する印だが、meta 経路にはそれを出す判定層が無い (ツールはタスク計画
+    から呼ばれ、「撃てるツールが無い」はタスク failed として現れる)。呼出側が
+    導けなければ ``None`` のまま = 矛盾検出のこの入力は使わない。
     """
     # メモリに応答を記録
     _record_assistant_turn_to_memory(
@@ -874,26 +1029,38 @@ def record_meta_cognitive_response(
         tool_command_source=tool_command_source,
     )
 
+    # 履歴予算に入らない長さの応答は成果物として保持する (deliberative と同じ)。
+    _remember_if_artifact_sized(state, session_id, full_response, user_query, mode)
+
     # デバッグログ
     dl = state.debug_logger
     if dl:
-        dl.log_request(tokens_generated, sent_messages or messages, full_response)
+        _log_request_debug(
+            dl, tokens_generated, sent_messages or messages, full_response,
+            private=private,
+        )
 
-    # 経験バッファに記録 (Level 0) — ステップクレジット付き / private は対象外
+    # 経験バッファに記録 (Level 0) — ステップクレジット付き / private・キャンセルは対象外
     fc = state.feedback_collector
-    if fc and full_response and not private:
+    if fc and cancelled and not private:
+        logger.info(
+            "Skipping experience record for cancelled turn (meta-cognitive, session=%s)",
+            session_id,
+        )
+    elif fc and not private:
         try:
+            body = _recorded_body(full_response)
             credits_dicts = [
                 {"step_index": c.step_index, "action": c.action, "credit": c.credit}
                 for c in step_credits
             ] if step_credits else []
             prompt_tokens, cached_tokens = read_llama_prompt_tokens(state)
             blocked, measured = _turn_contradiction_inputs(
-                state, messages,
+                state, messages, action_blocked,
             )
             fc.record(
                 query=user_query,
-                response=full_response,
+                response=body,
                 mode=mode,
                 action_blocked=blocked,
                 measured_values=measured,
@@ -907,6 +1074,9 @@ def record_meta_cognitive_response(
                 completion_tokens=tokens_generated,
                 prompt_tokens=prompt_tokens,
                 cached_prompt_tokens=cached_tokens,
+                truncated=truncated,
+                generation_failed=generation_failed or not body.strip(),
+                session_id=session_id,
             )
         except Exception as e:
             logger.error(
@@ -932,11 +1102,20 @@ def record_long_form_response(
     tool_command_success: bool | None = None,
     tool_command_source: str | None = None,
     sent_messages: list[ChatMessage] | None = None,
+    action_blocked: bool | None = None,
+    cancelled: bool = False,
+    truncated: bool = False,
+    generation_failed: bool = False,
 ) -> None:
     """長文生成の応答をメモリ・経験バッファに記録
 
     ``private=True`` の場合は WM/STM までの伝搬のみ。``tool_command*`` /
-    ``sent_messages`` は :func:`record_response` と同じ意味。
+    ``sent_messages`` / ``cancelled`` / ``truncated`` / ``generation_failed``
+    は :func:`record_response` と同じ意味。
+
+    ``action_blocked`` は長文経路では導出できない (ツール判定層を通らず、
+    状態を変える操作はユニット生成の外で write_file が担う) ため、呼出側は
+    渡さない = 矛盾検出のこの入力は使わない。
     """
     # メモリに応答を記録
     _record_assistant_turn_to_memory(
@@ -963,25 +1142,34 @@ def record_long_form_response(
     # デバッグログ
     dl = state.debug_logger
     if dl:
-        dl.log_request(tokens_generated, sent_messages or messages, full_response)
+        _log_request_debug(
+            dl, tokens_generated, sent_messages or messages, full_response,
+            private=private,
+        )
 
-    # 経験バッファに記録 (Level 0) — 長文生成メトリクス付き / private は対象外
+    # 経験バッファに記録 (Level 0) — 長文生成メトリクス付き / private・キャンセルは対象外
     fc = state.feedback_collector
-    if fc and full_response and not private:
+    if fc and cancelled and not private:
+        logger.info(
+            "Skipping experience record for cancelled turn (long-form, session=%s)",
+            session_id,
+        )
+    elif fc and not private:
         try:
+            body = _recorded_body(full_response)
             units_completed = int(metrics.get("units_completed", 0) or 0)
             validation_errors = int(metrics.get("validation_errors", 0) or 0)
             long_form_success = judge_long_form_success(
-                metrics, user_query, full_response,
+                metrics, user_query, body,
             )
             prompt_tokens, cached_tokens = read_llama_prompt_tokens(state)
 
             blocked, measured = _turn_contradiction_inputs(
-                state, messages,
+                state, messages, action_blocked,
             )
             fc.record(
                 query=user_query,
-                response=full_response,
+                response=body,
                 mode=mode,
                 action_blocked=blocked,
                 measured_values=measured,
@@ -1007,6 +1195,9 @@ def record_long_form_response(
                 completion_tokens=tokens_generated,
                 prompt_tokens=prompt_tokens,
                 cached_prompt_tokens=cached_tokens,
+                truncated=truncated,
+                generation_failed=generation_failed or not body.strip(),
+                session_id=session_id,
             )
         except Exception as e:
             logger.error(

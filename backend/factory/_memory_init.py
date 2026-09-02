@@ -2,7 +2,7 @@
 
 含まれる関数:
 
-- :func:`_init_memory` : ``WorkingMemory`` / ``ShortTermMemory`` /
+- :func:`_init_memory` : ``WorkingMemoryRegistry`` / ``ShortTermMemory`` /
   ``LongTermMemory`` / ``VectorStore`` の初期化と SchemaMigrator 連鎖。
   EvorefMem スキーマバージョン検査 → in-place migration → destructive init
   fallback の判定を行う。
@@ -25,7 +25,7 @@ from backend.log_config import get_logger
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
     from backend.free.memory.stores.short_term import ShortTermMemory
-    from backend.free.memory.stores.working import WorkingMemory
+    from backend.free.memory.stores.working import WorkingMemoryRegistry
     from backend.free.rag.vector_store import VectorStore
 
 logger = get_logger("factory.memory_init")
@@ -169,9 +169,14 @@ def apply_semmem_policy_overrides(
 
 def _init_memory(
     state: AppState, cfg: dict[str, Any], resolver: Any,
-) -> tuple["WorkingMemory", "ShortTermMemory", Any, "VectorStore | None"]:
-    """6. メモリシステム初期化"""
-    from backend.free.memory.stores.working import WorkingMemory
+) -> tuple["WorkingMemoryRegistry", "ShortTermMemory", Any, "VectorStore | None"]:
+    """6. メモリシステム初期化
+
+    WM はセッション別 (:class:`WorkingMemoryRegistry`)。LRU 押し出し / 明示の
+    セッション終了 / shutdown の転送は api 層の ``release_session_turns``
+    (エコー落とし規則 + セッション蓄積の掃除) を注入して行う。
+    """
+    from backend.free.memory.stores.working import WorkingMemoryRegistry
     from backend.free.memory.stores.short_term import ShortTermMemory
     from backend.free.memory.stores.long_term import LongTermMemory
     from backend.free.memory.init_evorefmem import (
@@ -295,7 +300,6 @@ def _init_memory(
             "store will run without manifest-backed dim verification", e,
         )
 
-    wm = WorkingMemory(cfg)
     # EvorefMem トリガ辞書 (pin / fact / classify) の user override 配置先。
     # 同梱 default は ``backend/free/memory/_defaults/triggers/`` 配下。
     triggers_dir = resolver.resolve_local("triggers_dir")
@@ -305,6 +309,11 @@ def _init_memory(
     from backend.free.memory.notes.note_builder import set_default_triggers_dir
     set_default_triggers_dir(triggers_dir)
     stm = ShortTermMemory(cfg, triggers_dir=triggers_dir)
+    from backend.free.api.chat.chat_recorder import release_session_turns
+
+    wm = WorkingMemoryRegistry(
+        cfg, drain_to=stm, drain_handler=release_session_turns,
+    )
 
     # 他の永続ストア (vector store / experience / learned patterns) と同様、
     # 前回終了時のスナップショット (_lifespan._shutdown_stm_save が保存) を
@@ -338,6 +347,7 @@ def _init_memory(
             vectors_dir,
             memmap_threshold=memmap_threshold,
             quantization=str(rag_cfg.get("quantization", "int8")),
+            debug_logger=state.debug_logger,
         )
         if vs.index_path.exists():
             vs.load()
@@ -350,7 +360,7 @@ def _init_memory(
 
     ltm = LongTermMemory(vs) if vs else None
 
-    state.working_memory = wm
+    state.working_memory_registry = wm
     state.short_term_memory = stm
     state.long_term_memory = ltm
     logger.info("Memory system initialized")

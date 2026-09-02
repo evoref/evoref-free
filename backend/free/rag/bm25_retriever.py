@@ -5,10 +5,14 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 from rank_bm25 import BM25Plus
 
 from backend.log_config import get_logger
+
+if TYPE_CHECKING:
+    from backend.debug_logger import DebugLogger
 
 logger = get_logger("rag.bm25_retriever")
 
@@ -34,6 +38,11 @@ DEFAULT_STOPWORD_BIGRAMS: frozenset[str] = frozenset(
 #: :meth:`BM25Retriever.rare_query_tokens` の既定閾値。コーパスの 1% 未満の
 #: ドキュメントにしか現れないトークンを「希少」とみなす。
 DEFAULT_RARE_TOKEN_DF_RATIO: float = 0.01
+
+
+#: 日本語 n-gram を切る「連続領域」。単語構成文字 (かな / 漢字 / 長音 等) の
+#: 連続で、ASCII 英数字・underscore・空白・句読点・記号で途切れる。
+_JA_RUN_RE = re.compile(r"[^\W\d_a-z]+")
 
 
 def _split_ascii_token(raw: str) -> list[str]:
@@ -82,20 +91,28 @@ def tokenize_ja(
                 if sub != low:
                     ascii_tokens.append(sub)
 
-    # 日本語バイグラム: ASCII / 空白 / underscore を除いた連続領域から
+    # 日本語 n-gram: ASCII / 空白 / 記号で区切った **連続領域ごと** に生成する。
+    # 以前は除去後の文字列を 1 本に繋いでから bi-gram を切っていたため、
+    # 「〜を使うで Python を〜」→「うで」、「〜です。次に〜」→「。次」のような
+    # 境界をまたぐ偽トークンが生まれていた。偽トークンは df が極端に小さく、
+    # ``rare_query_tokens`` で「希少語」として拾われて floor 免除の根拠になる。
     lower = nfkc.lower()
-    ja_text = re.sub(r"[a-z0-9_\s]", "", lower)
+    ja_runs = _JA_RUN_RE.findall(lower)
 
     stop_set = frozenset(stopwords) if stopwords is not None else frozenset()
 
-    bigrams = [ja_text[i : i + 2] for i in range(len(ja_text) - 1)]
+    bigrams = [
+        run[i : i + 2] for run in ja_runs for i in range(len(run) - 1)
+    ]
     if stop_set:
         bigrams = [b for b in bigrams if b not in stop_set]
 
     tokens = ascii_tokens + bigrams
 
     if use_trigrams:
-        trigrams = [ja_text[i : i + 3] for i in range(len(ja_text) - 2)]
+        trigrams = [
+            run[i : i + 3] for run in ja_runs for i in range(len(run) - 2)
+        ]
         if stop_set:
             trigrams = [t for t in trigrams if t not in stop_set]
         tokens += trigrams
@@ -123,7 +140,9 @@ class BM25Retriever:
         use_trigrams: bool = False,
         split_ascii: bool = True,
         stopwords: Iterable[str] | None = None,
+        debug_logger: "DebugLogger | None" = None,
     ):
+        self._debug_logger = debug_logger
         self._bm25: BM25Plus | None = None
         self._chunk_ids: list[str] = []
         self._chunks: list[str] = []

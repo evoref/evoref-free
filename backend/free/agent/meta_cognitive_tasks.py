@@ -52,6 +52,14 @@ class MetaCognitiveResponse:
     step_credits: list[StepCredit] = field(default_factory=list)
     # 出力先パス未指定時にエディタペインへ流す生成コード（write_file は行わない）
     editor_artifacts: list[EditorArtifact] = field(default_factory=list)
+    # 内部の LLM 生成 (ツールループ / コンテンツ生成 / フォールバック) のいずれかが
+    # ``finish_reason=length`` で切れたか。エージェントがストリームを内部で消費する
+    # ため、開示は呼出側 (chat_stream_meta) がこのフラグを見て SSE フレームで行う。
+    truncated: bool = False
+    truncated_steps: list[str] = field(default_factory=list)
+    # 最後に切れた生成の生トークン数 / max_tokens (``sse.output_truncated`` 用)
+    truncated_tokens: int = 0
+    truncated_max_tokens: int | None = None
 
 
 # ---------------------------------------------------------------------------
