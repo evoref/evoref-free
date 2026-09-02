@@ -42,8 +42,11 @@ class WorkingMemory:
 
     def __init__(self, config: dict):
         mem = config.get("memory", {})
-        self.max_turns: int = mem.get("working_max_turns", 30)
-        self.max_tokens: int = mem.get("working_max_tokens", 2048)
+        # フォールバックはスキーマ既定 (backend/schemas/memory.py) と同じ値。
+        # validate_config は既定値を実体化するので本番では常にキーがあるが、
+        # 素の dict で作るテストが別の窓で走らないよう揃える。
+        self.max_turns: int = mem.get("working_max_turns", 256)
+        self.max_tokens: int = mem.get("working_max_tokens", 4096)
         #: 上限に達したときに **まとめて** 押し出すターン数 (ヒステリシス)。
         #:
         #: 1 ターンずつ押し出すと、窓の先頭が毎ターン 1 つずれる。プロンプトは
@@ -66,7 +69,6 @@ class WorkingMemory:
             1, int(mem.get("working_evict_block", 6)),
         )
         self.turns: list[dict] = []
-        self.active_notes: list[str] = []
         self.session_id: str = uuid4().hex[:8]
         self._evicted: list[dict] = []  # Layer 2 転送用バッファ
         #: 現在のセッションで押し出したターン数 (``clear()`` でリセット)。
@@ -255,7 +257,7 @@ class WorkingMemory:
         if total <= self.max_tokens:
             return
         # 上限ちょうどまでしか削らないと次ターンで即また超える。窓の先頭を
-        # 動かす回数を減らすため下限水位 (既定 80%) まで落とす。
+        # 動かす回数を減らすため下限水位 (既定 60%) まで落とす。
         token_target = max(1, int(self.max_tokens * _TOKEN_EVICT_KEEP_RATIO))
         logger.debug(
             "_enforce_limits: tokens %d > max %d, compressing/evicting to %d",

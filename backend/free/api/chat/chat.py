@@ -350,11 +350,6 @@ def _try_reactive_layer(
     )
 
 
-async def _completed(value):
-    """既知の値を返す done タスク化用コルーチン (judge 結果を deliberative へ流用)。"""
-    return value
-
-
 def _log_layer_escalation(state: AppState, *, chosen: str, reason: str) -> None:
     """reactive→light/deliberative の分岐を decision.jsonl へ記録 (evolve レベル限定)。"""
     dl = getattr(state, "debug_logger", None)
@@ -369,6 +364,28 @@ def _log_layer_escalation(state: AppState, *, chosen: str, reason: str) -> None:
     )
 
 
+async def _url_recall_hit(req: ChatRequest, state: AppState) -> bool:
+    """過去に fetch 済みの URL ファクトがクエリに意味的に当たるか (reactive 昇格用)。
+
+    判定本体は ``ToolCallJudge.recall_url_judgement`` (閾値 / TTL / profile まで
+    見る)。埋め込みの HTTP 往復を伴うので、``mem.world.url.*`` が索引に 0 件なら
+    埋め込まずに False を返す。判定器が未配線 / 例外時も False (reactive のまま)。
+    """
+    judge = state.tool_call_judge
+    if judge is None or state.tools_registry is None:
+        return False
+    try:
+        if not judge.has_url_recall_candidates():
+            return False
+        judgement = await judge.recall_url_judgement(
+            req.message, state.tools_registry, mode=req.mode,
+        )
+    except Exception as exc:
+        logger.warning("URL recall pre-check failed (continuing as reactive): %s", exc)
+        return False
+    return judgement is not None and judgement.tool_needed
+
+
 async def _gate_reactive_light(
     req: ChatRequest,
     state: AppState,
@@ -376,7 +393,6 @@ async def _gate_reactive_light(
     history: list,
     judge_task: "asyncio.Task | None",
     timer: "StageTimer | None" = None,
-    session_id: str = "",
 ) -> tuple[str, "asyncio.Task | None", str]:
     """reactive ルール miss 後、軽量パス採否を判定する。
 
@@ -390,7 +406,13 @@ async def _gate_reactive_light(
     # 添付ファイルを無視した軽量応答は品質事故 → deliberative
     if getattr(req, "file_contexts", None):
         return "deliberative", judge_task, "file_context"
-    if state.tool_call_judge is None or state.tools_registry is None:
+    # judge_task は chat() が分類直後に投機起動する (前処理は常に並列)。None は
+    # 判定器が配線されていない構成だけ。
+    if (
+        state.tool_call_judge is None
+        or state.tools_registry is None
+        or judge_task is None
+    ):
         return "deliberative", judge_task, "judge_unavailable"
     # 会話全体を見ないと答えられない質問は、STM/SemMem/RAG 注入なしの視界で
     # 答えさせない (実インシデント 2026-08-12 ライブ監査 ターン21:「ここまでの
@@ -415,13 +437,7 @@ async def _gate_reactive_light(
     if timer is not None:
         timer.start("light_gate_judge_ms")
     try:
-        if judge_task is not None:
-            judgement = await judge_task  # 投機起動済み (並列構成)、残り時間のみ待つ
-        else:
-            judgement = await state.tool_call_judge.judge(  # 直列構成で直接実行
-                req.message, state.tools_registry, req.mode, history,
-                session_id=session_id,
-            )
+        judgement = await judge_task  # 投機起動済み、残り時間のみ待つ
     except Exception as exc:
         logger.warning("reactive-light judge failed, escalating: %s", exc)
         return "deliberative", judge_task, "judge_error"
@@ -430,9 +446,7 @@ async def _gate_reactive_light(
             timer.stop("light_gate_judge_ms")
 
     if judgement is not None and judgement.tool_needed:
-        # deliberative へ流用 (直列構成なら done タスク化して再 judge を防ぐ)
-        if judge_task is None:
-            judge_task = asyncio.create_task(_completed(judgement))
+        # deliberative へ流用 (done 済みタスクをそのまま渡す)
         return "deliberative", judge_task, "tool_needed"
 
     # 「撃てなかった」と分かっているターンは軽量パスに落とさない。
@@ -455,8 +469,6 @@ async def _gate_reactive_light(
         judgement.action_blocked or judgement.measurement_blocked
     )
     if blocked:
-        if judge_task is None:
-            judge_task = asyncio.create_task(_completed(judgement))
         return "deliberative", judge_task, "blocked_action"
     return "light", judge_task, "judge_no_tool"
 
@@ -618,7 +630,7 @@ async def _dispatch_reactive_light(
     max_tokens: int | None,
     timer: StageTimer,
 ) -> "StreamingResponse | ChatResponse":
-    """Reactive 軽量パス dispatch: 静的 system + 履歴で base 1 ターン (few-shot/RAG/semmem なし)。
+    """Reactive 軽量パス dispatch: 静的 system + 履歴で base 1 ターン (few-shot/RAG なし、SemMem は ``_light_semmem_block`` のみ)。
 
     ``system`` は静的なまま保つ。以前は記憶の競合セクションをここで連結して
     いたが、system の書き換えは接頭辞 KV キャッシュの境界そのものを動かす
@@ -672,16 +684,6 @@ async def _dispatch_reactive_light(
             mode=req.mode, max_tokens=light_max,
             generation_params=gen_params, timer=timer, private=req.private,
         )
-
-
-def _realtime_parallel_enabled(state: AppState) -> bool:  # noqa: ARG001
-    """チャット応答パスの前処理 (競合収集 / ツール判定 / 検索) を並列化してよいか。
-
-    以前は補助タスクの realtime セマフォ数で判定していた。チャット応答パスから
-    補助タスク呼出が無くなり、直列化の要因だったセマフォ自体が無くなったので
-    常に並列でよい (3 つとも互いに独立)。
-    """
-    return True
 
 
 async def _run_search_timed(
@@ -1641,9 +1643,11 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     # 直近会話を渡す。被演算子が前ターンにしか無い計算 (「その差を月あたりに
     # 直すと何分？」) は数値ゼロのクエリになり、context 無しでは short_query →
     # reactive に落ちてツール判定へ一度も到達しない (2026-08-10 ライブ監査)。
+    # context は遅延評価 — 消費するのは numeric_question ルールだけで、
+    # 大半のターンはそこへ到達する前に分類が確定する。
     agent_layer = classifier.classify(
         req.message, mode=req.mode,
-        context=_recent_dialogue_text(history),
+        context=lambda: _recent_dialogue_text(history),
     )
     logger.info(
         "Agent layer: %s (mode=%s) for query: %s",
@@ -1668,8 +1672,10 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     # 同ターンの semmem 注入へ反映)。private ターンは SemMem へ書かない契約のため
     # allow_write=False (注入のみ継続)。
     #
-    # realtime 並列化が有効なときは conflict 判定 / 検索パイプライン / tool 判定を
-    # 同時起動して直列待ちを畳む。依存順は守る:
+    # conflict 判定 / 検索パイプライン / tool 判定は同時起動して直列待ちを畳む
+    # (3 つとも互いに独立。以前は補助タスクの realtime セマフォ数で直列構成へ
+    # 切り替えていたが、チャット応答パスから補助タスク呼出が無くなり分岐自体が
+    # 恒真になったので撤去した)。依存順は守る:
     #   - conflict_ctx は build_semmem_injection より前に await 済みとし、解決
     #     通知の同ターン注入契約を維持する。検索パイプラインは SemMem facts を
     #     注入に使わない (読取は injection 側) ため conflict 書込と競合しない。
@@ -1682,34 +1688,29 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     judge_task: asyncio.Task | None = None
     search_task: asyncio.Task | None = None
     try:
-        if _realtime_parallel_enabled(state):
-            conflict_task = asyncio.create_task(
-                _collect_conflicts_timed(state, cfg, req.mode, timer),
-            )
-            if (
-                agent_layer != "meta_cognitive"
-                and state.tool_call_judge is not None
-                and state.tools_registry is not None
-            ):
-                judge_task = asyncio.create_task(
-                    state.tool_call_judge.judge(
-                        req.message, state.tools_registry, req.mode, history,
-                        session_id=session_id,
-                    )
+        conflict_task = asyncio.create_task(
+            _collect_conflicts_timed(state, cfg, req.mode, timer),
+        )
+        if (
+            agent_layer != "meta_cognitive"
+            and state.tool_call_judge is not None
+            and state.tools_registry is not None
+        ):
+            judge_task = asyncio.create_task(
+                state.tool_call_judge.judge(
+                    req.message, state.tools_registry, req.mode, history,
+                    session_id=session_id,
                 )
-            if agent_layer != "reactive":
-                search_task = asyncio.create_task(
-                    _run_search_timed(req, state, cfg, timer),
-                )
-            try:
-                conflict_ctx = await conflict_task
-            except Exception as exc:
-                logger.warning("Conflict review task failed (degrading): %s", exc)
-                conflict_ctx = ConflictTurnContext()
-        else:
-            conflict_ctx = await collect_pending_conflicts(
-                state, cfg, mode=req.mode,
             )
+        if agent_layer != "reactive":
+            search_task = asyncio.create_task(
+                _run_search_timed(req, state, cfg, timer),
+            )
+        try:
+            conflict_ctx = await conflict_task
+        except Exception as exc:
+            logger.warning("Conflict review task failed (degrading): %s", exc)
+            conflict_ctx = ConflictTurnContext()
 
         # reactive→deliberative エスカレート時に Level 0 経験記録の出自を残す。
         escalated_from: str | None = None
@@ -1733,34 +1734,6 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         # のは ``greeting`` / ``short_query`` で reactive に落ちたターン。
 
         if agent_layer == "reactive":
-            # URL recall プリチェック: 過去会話で fetch 済みの URL fact が
-            # クエリに意味的にヒットする場合、reactive で前知識のみ応答せず
-            # deliberative にエスカレートして fetch_url を実行させる。
-            # ``recall_url_judgement`` は閾値・TTL・profile match まで判定
-            # 済みのため、ヒット時のみ True/None を返す軽量チェック。
-            if (
-                state.tool_call_judge is not None
-                and state.tools_registry is not None
-            ):
-                try:
-                    recall_judgement = await state.tool_call_judge.recall_url_judgement(
-                        req.message, state.tools_registry, mode=req.mode,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "URL recall pre-check failed (continuing as reactive): %s", exc,
-                    )
-                    recall_judgement = None
-                if recall_judgement is not None and recall_judgement.tool_needed:
-                    agent_layer = "deliberative"
-                    escalated_from = "reactive"
-                    _log_layer_escalation(state, chosen="deliberative", reason="url_recall_hit")
-                    logger.info(
-                        "Reactive escalated to deliberative due to URL recall hit: %s",
-                        req.message[:80],
-                    )
-
-        if agent_layer == "reactive":
             reactive_response = _try_reactive_layer(
                 req, state, session_id, instance_name, context_size,
             )
@@ -1771,11 +1744,31 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 _cancel_pending_task(search_task)
                 return reactive_response
 
+            # URL recall プリチェック: 過去会話で fetch 済みの URL fact が
+            # クエリに意味的にヒットする場合、軽量パスで前知識のみ応答せず
+            # deliberative にエスカレートして fetch_url を実行させる。
+            # ``recall_url_judgement`` は閾値・TTL・profile match まで判定
+            # 済みのため、ヒット時のみ judgement を返す。
+            #
+            # ルール即応 (挨拶 / キャッシュ命中) の **後** に置く。クエリ埋め込みの
+            # HTTP 往復を伴うため、以前の位置 (即応の手前) では挨拶 1 つごとに
+            # 埋め込みを払っていた。URL ファクトが索引に 1 件も無い環境では
+            # 何を埋め込んでも当たらないので、件数で先に短絡する
+            # (2026-09-02 監査 C1)。
+            if await _url_recall_hit(req, state):
+                agent_layer = "deliberative"
+                escalated_from = "reactive"
+                _log_layer_escalation(state, chosen="deliberative", reason="url_recall_hit")
+                logger.info(
+                    "Reactive escalated to deliberative due to URL recall hit: %s",
+                    req.message[:80],
+                )
+
+        if agent_layer == "reactive":
             # ルールベース miss → 軽量パス gating。tool 判定 (judge) で tool 不要
             # なら base 1 ターンの軽量パス、tool 必要なら deliberative へエスカレート。
             decision, judge_task, gate_reason = await _gate_reactive_light(
                 req, state, cfg, history, judge_task, timer,
-                session_id=session_id,
             )
             if decision == "light":
                 # 軽量パスは検索を使わない。judge_task も tool 不要なので破棄。

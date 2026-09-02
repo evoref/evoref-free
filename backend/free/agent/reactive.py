@@ -12,12 +12,8 @@ from backend.free.core.intent_vocab import (
     GREETING_PUNCTUATION_JA,
     exact_greeting_pattern,
 )
-from backend.free.core.intent_vocab import (
-    GREETING_PUNCTUATION_EN,
-    GREETING_PUNCTUATION_JA,
-    exact_greeting_pattern,
-)
 from backend.free.core.locale_patterns import select_locale_variant
+from backend.i18n_helper import msg
 from backend.log_config import get_logger
 
 logger = get_logger("agent.reactive")
@@ -63,29 +59,33 @@ class ResponseCache:
         self._cache.clear()
 
 
-# 定型応答パターン: (regex, response)
+# 定型応答パターン: (regex, i18n キー)。応答文はユーザーに見える UI テキストなので
+# backend/i18n/<locale>.json の ``agent.reactive.greeting.*`` から ``msg()`` で引く
+# (CLAUDE.md §6 #6)。locale の選択は select_locale_variant (パターン側) と msg()
+# (文面側) が同じ ``i18n_helper.get_locale()`` を見るので食い違わない。
+_GREETING_KEY = "agent.reactive.greeting."
 GREETING_RESPONSES: list[tuple[re.Pattern, str]] = [
-    (re.compile(exact_greeting_pattern(r"こんにち[はわ]", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), "こんにちは！何かお手伝いできることはありますか？"),
-    (re.compile(exact_greeting_pattern(r"おはよう(?:ございます)?", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), "おはようございます！今日は何をしましょうか？"),
-    (re.compile(exact_greeting_pattern(r"こんばんは", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), "こんばんは！何かお手伝いしましょうか？"),
-    (re.compile(exact_greeting_pattern(r"やあ|ども|hi|hello|hey", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), "こんにちは！お気軽にどうぞ。"),
-    (re.compile(exact_greeting_pattern(r"ありがと[うございます]*|thanks|thank you", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), "どういたしまして！他に何かあればお気軽にどうぞ。"),
-    (re.compile(exact_greeting_pattern(r"おやすみ(?:なさい)?", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), "おやすみなさい。良い夜を！"),
-    (re.compile(exact_greeting_pattern(r"さようなら|bye|goodbye", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), "さようなら！またいつでもどうぞ。"),
+    (re.compile(exact_greeting_pattern(r"こんにち[はわ]", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), _GREETING_KEY + "hello"),
+    (re.compile(exact_greeting_pattern(r"おはよう(?:ございます)?", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), _GREETING_KEY + "good_morning"),
+    (re.compile(exact_greeting_pattern(r"こんばんは", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), _GREETING_KEY + "good_evening"),
+    (re.compile(exact_greeting_pattern(r"やあ|ども|hi|hello|hey", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), _GREETING_KEY + "casual"),
+    (re.compile(exact_greeting_pattern(r"ありがと[うございます]*|thanks|thank you", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), _GREETING_KEY + "thanks"),
+    (re.compile(exact_greeting_pattern(r"おやすみ(?:なさい)?", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), _GREETING_KEY + "good_night"),
+    (re.compile(exact_greeting_pattern(r"さようなら|bye|goodbye", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), _GREETING_KEY + "bye"),
 ]
 
 # GREETING_RESPONSES の英語版。GUI 左下の言語設定が 'en' の場合のみ使う
-# (パターンだけでなく返信テキストも英語化する必要があるため独立したリストにする)。
+# (パターンの語彙が違うため独立したリストにする。文面は同じ i18n キー)。
 # "good morning"/"good night" は日本語版の「おはよう」「おやすみ」相当だが、
-# 元の JA パターンには hi/hello/hey (72行目) が既に含まれているため、
+# 元の JA パターンには hi/hello/hey が既に含まれているため、
 # ここでも同様の口語挨拶を独立エントリとして残す。
 GREETING_RESPONSES_EN: list[tuple[re.Pattern, str]] = [
-    (re.compile(exact_greeting_pattern(r"hi|hello|hey", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), "Hello! What can I help you with?"),
-    (re.compile(exact_greeting_pattern(r"good\s*morning", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), "Good morning! What shall we work on today?"),
-    (re.compile(exact_greeting_pattern(r"good\s*(?:evening|afternoon)", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), "Good evening! How can I help?"),
-    (re.compile(exact_greeting_pattern(r"good\s*night", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), "Good night! Sleep well."),
-    (re.compile(exact_greeting_pattern(r"thanks|thank\s*you", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), "You're welcome! Feel free to ask anything else."),
-    (re.compile(exact_greeting_pattern(r"bye|goodbye", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), "Goodbye! Talk to you again soon."),
+    (re.compile(exact_greeting_pattern(r"hi|hello|hey", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), _GREETING_KEY + "hello"),
+    (re.compile(exact_greeting_pattern(r"good\s*morning", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), _GREETING_KEY + "good_morning"),
+    (re.compile(exact_greeting_pattern(r"good\s*(?:evening|afternoon)", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), _GREETING_KEY + "good_evening"),
+    (re.compile(exact_greeting_pattern(r"good\s*night", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), _GREETING_KEY + "good_night"),
+    (re.compile(exact_greeting_pattern(r"thanks|thank\s*you", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), _GREETING_KEY + "thanks"),
+    (re.compile(exact_greeting_pattern(r"bye|goodbye", punctuation=GREETING_PUNCTUATION_EN), re.IGNORECASE), _GREETING_KEY + "bye"),
 ]
 
 
@@ -133,9 +133,9 @@ class ReactiveAgent:
         """定型応答パターンで照合"""
         stripped = query.strip()
         responses = select_locale_variant(GREETING_RESPONSES, GREETING_RESPONSES_EN)
-        for pattern, response in responses:
+        for pattern, key in responses:
             if pattern.match(stripped):
-                return response
+                return msg(key)
         return None
 
     def _cache_key(self, query: str) -> str:

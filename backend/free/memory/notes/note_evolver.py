@@ -102,13 +102,11 @@ class NoteEvolver:
         )
         self.max_per_cycle: int = int(ne_cfg.get("max_per_cycle", 10))
 
-        # インターバル: 明示設定があればそのまま、なければモデルサイズから自動計算
-        explicit = mc.get("llm_call_interval")
+        # インターバル: モデルサイズから自動計算 (``memory.llm_call_base_interval``)。
+        # ``memory.llm_call_interval`` の直接指定は MemoryConfig (extra=forbid)
+        # に無く到達不能だったので読まない。
         base = mc.get("llm_call_base_interval", 1.0)
-        if explicit is not None:
-            self.llm_call_interval: float = float(explicit)
-        else:
-            self.llm_call_interval = compute_llm_call_interval(base, params_b)
+        self.llm_call_interval: float = compute_llm_call_interval(base, params_b)
 
         # システムプロンプト: aux_prompt_manager → フォールバック
         self._system_prompt = _FALLBACK_SYSTEM_PROMPT
@@ -494,8 +492,9 @@ class NoteEvolver:
         # クラスタ数 = 有効ノートの連結成分数 + 孤立ノート数
         stats["clusters"] = len(component_members) + stats["skipped"]
         # キャッシュ無効化 (lightmem_score は変えていないが links / cluster_id を反映)
-        if hasattr(short_term, "_cache_dirty"):
-            short_term._cache_dirty = True
+        mark = getattr(short_term, "mark_dirty", None)
+        if callable(mark):
+            mark()
         logger.info(
             "Rebuilt links/clusters: notes=%d valid=%d links=%d clusters=%d skipped=%d",
             stats["notes"], n_valid, stats["links"], stats["clusters"], stats["skipped"],

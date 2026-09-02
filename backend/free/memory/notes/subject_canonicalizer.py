@@ -7,7 +7,7 @@ EvorefMem における **意味記憶の subject 正規化** を担う。
 SemanticFact の `subject` フィールドは検索・索引・コンフリクト判定のキー
 となるため、表記ゆれを抑える必要がある。本モジュールは「最小エントリの
 辞書による *exact match* 正規化」を提供する。日本語/英語の一人称や所有
-表現を `mem.user` / `mem.user.company` 等の canonical な subject にまとめる。
+表現を `mem.personal.user` / `mem.personal.company` 等の canonical な subject にまとめる。
 
 ## バイパスルール (重要)
 
@@ -32,7 +32,7 @@ SemanticFact の `subject` フィールドは検索・索引・コンフリク�
 - バイパスヒット: :meth:`SubjectKey.try_parse` で structured 表現を得て、
   :meth:`SubjectKey.canonical` で再生成する (well-formed subject では入力と
   同一結果を返す idempotent な変換)
-- 辞書ヒット: 辞書から得た canonical 文字列 (例: ``"mem.user.company"``) に
+- 辞書ヒット: 辞書から得た canonical 文字列 (例: ``"mem.personal.company"``) に
   対して同じ SubjectKey round-trip を掛ける
 
 いずれも :meth:`SubjectKey.try_parse` が ``None`` を返す不正形式 (空セグメント
@@ -101,29 +101,38 @@ DEFAULT_BYPASS_REGEX = r"^(loop|learn|mem)\."
 """
 
 DEFAULT_SUBJECT_ENTRIES: dict[str, str] = {
-    # 一人称代名詞 (日本語) → "mem.user"
-    "私": "mem.user",
-    "僕": "mem.user",
-    "俺": "mem.user",
-    "自分": "mem.user",
-    "我々": "mem.user",
-    "うち": "mem.user",
-    # 一人称代名詞 (英語) → "mem.user"
+    # 一人称代名詞 (日本語) → "mem.personal.user"
+    "私": "mem.personal.user",
+    "僕": "mem.personal.user",
+    "俺": "mem.personal.user",
+    "自分": "mem.personal.user",
+    "我々": "mem.personal.user",
+    "うち": "mem.personal.user",
+    # 一人称代名詞 (英語) → "mem.personal.user"
     # 大文字/小文字は SubjectDictionary 内部で吸収するため、ここでは
     # 自然な書き方 (大文字 I) を保持する。
-    "I": "mem.user",
-    "me": "mem.user",
-    "my": "mem.user",
-    # 所属組織 → "mem.user.company"
-    "うちの会社": "mem.user.company",
-    "我が社": "mem.user.company",
-    "my company": "mem.user.company",
+    "I": "mem.personal.user",
+    "me": "mem.personal.user",
+    "my": "mem.personal.user",
+    # 所属組織 → "mem.personal.company"
+    "うちの会社": "mem.personal.company",
+    "我が社": "mem.personal.company",
+    "my company": "mem.personal.company",
 }
 """最小初期エントリ。
 
 合計 12 件 (10 件以上)。自動拡張なし。エントリ追加はユーザーによる
 ``subject_dictionary.json`` の手編集を想定している。
+
+値は現行の subject 規約 ``mem.<kind>.<attr>`` (3 セグメント) に揃える。
+旧値 ``mem.user`` (2 セグメント) は :func:`~backend.free.memory.notes
+.note_builder.is_single_valued_subject` 等の 3 セグメント前提と噛み合わない
+(2026-09-02 監査)。``^(loop|learn|mem)\\.`` バイパスがあるため実経路では
+到達しないが、辞書の形は規約と一致させておく。
 """
+
+#: :data:`DEFAULT_SUBJECT_ENTRIES` の値が従うべき形 (テストが全件検証する)。
+DEFAULT_SUBJECT_VALUE_RE = re.compile(r"^mem\.[a-z_]+\.[a-z_]+$")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -279,7 +288,7 @@ def _structured_canonical_or_passthrough(subject: str) -> str:
     """:class:`SubjectKey` で parse + canonical を試み、失敗時は原文を返す。
 
     pillar prefix を持ち SubjectKey に分解可能な文字列 (例:
-    ``"mem.user.company"``) は round-trip 経由で整形され、分解不能な
+    ``"mem.personal.company"``) は round-trip 経由で整形され、分解不能な
     文字列 (空セグメント / 自然文 subject) はそのまま返される。いずれも
     例外は投げない (silent passthrough)。
     """

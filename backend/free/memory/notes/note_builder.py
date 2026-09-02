@@ -352,6 +352,26 @@ _SELF_POSSESSOR_RE = re.compile(
 #: 読点・句点・空白を挟む場合は修飾が切れているとみなす。
 _ANY_POSSESSOR_RE = re.compile(r"[^\s、。，．,.]\s*の\s*$")
 
+#: 指示語 (この / その / あの / どの / もの)。「この名前は」「その職業は」の
+#: ``の`` は連体詞の一部で所有者ではない。所有格として扱うと
+#: :data:`_SELF_POSSESSOR_RE` に落ちて「一人称でない所有者」と判定され、
+#: 「私の名前は太郎です。この名前は仮名です。」の後半が本人の name スロットに
+#: 結び付かず ``mem.personal.user`` へ流れていた。
+#:
+#: 文頭・区切り・助詞の直後にあるときだけ指示語と読む — 「ね**この**名前」
+#: 「いと**この**名前」の語尾を指示語と誤認すると、ペット / 親族の名前が
+#: 話題判定 (:func:`_last_topic_noun`) 経由で本人に付いてしまう。
+_DEMONSTRATIVE_NO_RE = re.compile(
+    r"(?:^|[\s、。，．,.はがをにでもへ])(?:こ|そ|あ|ど|も)\s*の\s*$",
+)
+
+
+def _has_explicit_possessor(before: str) -> bool:
+    """``before`` の末尾が「<所有者>の」で終わるか (指示語は所有者に数えない)。"""
+    if not _ANY_POSSESSOR_RE.search(before):
+        return False
+    return not _DEMONSTRATIVE_NO_RE.search(before)
+
 #: 文の区切り。話題 (``〜は`` / ``〜が`` / ``〜を``) のスコープはここで切れる。
 #: 読点は **切らない** — 「猫を飼っていて、名前は…」のような te 形の連結節では
 #: 話題が持ち越されるため。
@@ -402,7 +422,7 @@ def _possessor_is_self(haystack: str, start: int) -> bool:
     漏れたときの着地は ``mem.personal.user`` で、**本人のスロットは汚れない**。
     """
     before = haystack[:start]
-    if _ANY_POSSESSOR_RE.search(before):
+    if _has_explicit_possessor(before):
         return bool(_SELF_POSSESSOR_RE.search(before))
     topic = _last_topic_noun(before)
     return topic is None or topic in _SELF_NOUNS
@@ -680,11 +700,15 @@ def resolve_fact_attribute_match(
     return None, ()
 
 
-#: 1 発話から取り出す属性の上限。自己紹介は 2〜3 属性が普通で、それを超える
-#: 発話は「属性の羅列」ではなく雑談なので、切っても失うものが少ない。
-#: セッション上限 (``memory.facts.extraction_max_per_session``) を 1 発話で
-#: 食い潰さないための保険でもある。
-MAX_ATTRIBUTES_PER_TEXT = 3
+#: 1 発話から取り出す属性の上限。セッション上限
+#: (``memory.facts.extraction_max_per_session``) を 1 発話で食い潰さないための
+#: 保険で、超えた分は YAML 記載順で後ろの属性から **黙って** 落ちていた。
+#:
+#: 3 では足りない: 日本語の自己紹介は「名前・居住地・職業・ペット」の 4 属性を
+#: 1 発話に詰めるのが普通で、記載順で最後に来る ``name`` が押し出されて
+#: 本人の名前が 1 件も作られなかった (2026-09-02 監査 B-2)。上限に当たった
+#: ときは WARNING で落とした slug を残す (:func:`resolve_fact_attribute_matches`)。
+MAX_ATTRIBUTES_PER_TEXT = 6
 
 #: **読み出し側** の上限。書き込み側の保険 (ファクトを作りすぎない) は
 #: 読み出しには要らない — 尋ねられた属性を余分に免除しても、その属性の
@@ -733,8 +757,14 @@ def resolve_fact_attribute_matches(
         matched = spec.match(haystack)
         if matched:
             out.append((spec.slug, matched))
-            if len(out) >= max(1, limit):
-                break
+    cap = max(1, limit)
+    if len(out) > cap:
+        logger.warning(
+            "resolve_fact_attribute_matches: %d attributes in one text exceed "
+            "cap=%d (fact_type=%s); dropping %s",
+            len(out), cap, fact_type, [slug for slug, _ in out[cap:]],
+        )
+        out = out[:cap]
     return _reassign_name_to_owning_entity(out, haystack)
 
 
@@ -1010,6 +1040,13 @@ class NoteBuilder:
 
     # ─── markdown フェンス検知 ──
     _CODE_FENCE_RE = re.compile(r"```")
+
+    # ノート本文 (``content``) は ``build()`` では切らない。STM / LTM の読み手は
+    # 全文を前提にしているため、上限は **使う側** が持つ:
+    #   - 埋め込み: ``sleep_update._EMBED_MAX_CHARS`` (1500 字、embed の n_ctx 対策)
+    #   - LLM 進化: ``note_evolver.MAX_NOTE_CONTENT_LEN`` (800 字、プロンプト対策)
+    # 長いアシスタント応答が丸ごと保存されるのは仕様で、ここで truncate すると
+    # 両者の前提 (原文が残っている) が崩れる。
 
     # ─── 公開 API ───────────────────────────────────────────────────────
 

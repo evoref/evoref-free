@@ -18,7 +18,8 @@ from backend.free.memory.notes.pin_detector import (
     detect_pin,
     get_pin_triggers_for,
 )
-from backend.free.memory.types import MemoryMode, NoteSource, TaskStatus
+from backend.free.memory.types import MemoryMode, NoteSource
+from backend.trace_context import get_trace_id
 
 logger = get_logger("memory.short_term")
 
@@ -41,6 +42,8 @@ class MemoryNote:
     #: 埋め込み生成の連続失敗回数。上限に達したノートは Step 1 の対象外にする
     #: (1 件の失敗ノートが毎サイクル Step 1 を落とし、sleep-time 全体が
     #: 前進しなくなるのを防ぐ。詳細は sleep_update._step1_embed_notes)。
+    #: 永続化対象 — 再起動でリセットされると恒久に失敗するノートを毎回
+    #: 上限まで再試行し続ける。
     embed_failures: int = 0
     lightmem_score: float = 0.5
     created_at: float = 0.0
@@ -118,11 +121,12 @@ class MemoryNote:
     """コマンドを実行したツール名 (通常 "run_command"、それ以外は None)"""
 
     tool_command_success: bool | None = None
-    #: 判定層 ("rule" / "aux" / "recall" ...)。executable_command_curator が
-    #: "recall" 由来 (= 過去 fact の引き当てで発火) を学習対象から外すために使う。
-    #: これが無いと「誤発火 → 成功記録 → fact 延命 → また誤発火」で自己強化する。
-    tool_command_source: str | None = None
     """コマンド実行が成功したか (出力が "Error:" prefix でない)。command 無しは None"""
+
+    tool_command_source: str | None = None
+    """判定層 ("rule" / "aux" / "recall" ...)。executable_command_curator が
+    "recall" 由来 (= 過去 fact の引き当てで発火) を学習対象から外すために使う。
+    これが無いと「誤発火 → 成功記録 → fact 延命 → また誤発火」で自己強化する。"""
 
     tool_command_query: str | None = None
     """このコマンドを発火させたユーザークエリ (executable_command_curator の対応付け用)。
@@ -136,21 +140,16 @@ class MemoryNote:
     走査による推測をなくす。
     """
 
-    # ── 統合追加フィールド ────────────────────────────────────────
-    task_status: TaskStatus | None = None
-    """task ファクト lifecycle 用ステータス (open/in_progress/done/failed)"""
-
-    task_id: str | None = None
-    """関連する task ファクト ID (自律ループ駆動用)"""
-
-    depends_on: list[str] = field(default_factory=list)
-    """依存する task / fact ID 一覧"""
-
-    failure_signature: str | None = None
-    """失敗パターンシグネチャ (failure_pattern 即時記録用)"""
+    extraction_deferred: bool = False
+    """Step 8 がセッション別上限 (``apply_session_caps``) で **今回は見送った**
+    ノートか。上限超過で落ちた候補は ``extracted_fact_ids`` を持たないため、
+    ``_last_extraction_at`` だけを基準にした eviction 保護から外れ、次の Step 8
+    が来る前に LTM へ降格されうる。この印を立てて保護対象に含める。次サイクル
+    で採用 (または候補にならなくなった) 時点で ``apply_session_caps`` が下ろす。"""
 
     trace_id: str | None = None
-    """MDP / リクエスト相関 ID (contextvar から自動付与される想定)"""
+    """リクエスト相関 ID。``absorb`` が :func:`backend.trace_context.get_trace_id`
+    (contextvar) から付与する。リクエスト外 (sleep-time の flush 等) では ``None``。"""
 
     # ── A-MEM ノートリンク + クラスタリング ─────────
     links: list[str] = field(default_factory=list)
@@ -206,6 +205,9 @@ class ShortTermMemory:
         self.notes: dict[str, MemoryNote] = {}
         self._cache: list[MemoryNote] = []
         self._cache_dirty: bool = False
+        #: 前回の ``save`` 以降にノートが変わったか。``_cache_dirty`` は検索
+        #: キャッシュの再構築で下りるため永続化の判定には使えない。
+        self._persist_dirty: bool = False
 
         # ── 自動 Pin 検出設定 ──
         pin_cfg = mem.get("pin", {}) or {}
@@ -223,6 +225,21 @@ class ShortTermMemory:
     def _load_pin_triggers(self) -> PinTriggers:
         """Pin トリガ辞書をプロセス内シングルトンから取得 (パスごと cache)。"""
         return get_pin_triggers_for(self._pin_triggers_dir)
+
+    def mark_dirty(self) -> None:
+        """ノート集合 / スコアが変わったことを記録する。
+
+        検索キャッシュを無効化し、次回 ``save`` の対象にする。sleep-time の
+        各 Step / eviction / conflict merge はノートを直接書き換えた後にこれを呼ぶ
+        (``_cache_dirty`` への直接代入は行わない)。
+        """
+        self._cache_dirty = True
+        self._persist_dirty = True
+
+    @property
+    def dirty(self) -> bool:
+        """前回の ``save`` 以降に永続化すべき変更があるか。"""
+        return self._persist_dirty
 
     def absorb(self, turn: dict, session_id: str) -> MemoryNote | None:
         """ワーキングメモリからターンを吸収してノート化
@@ -359,9 +376,10 @@ class ShortTermMemory:
             tool_command_source=turn.get("tool_command_source"),
             tool_command_query=turn.get("tool_command_query"),
             is_correction=is_correction,
+            trace_id=get_trace_id() or None,
         )
         self.notes[note.id] = note
-        self._cache_dirty = True
+        self.mark_dirty()
         logger.info(
             "Absorbed note %s (mode=%s, tags=%s, keywords=%s, code_block=%s, "
             "pin_flag=%s, pin_reason=%s)",
@@ -375,7 +393,7 @@ class ShortTermMemory:
         return note
 
     def retrieve_top_k_detailed(
-        self, query_vec: np.ndarray, k: int = 3,
+        self, query_vec: np.ndarray, k: int = 3, *, include_private: bool = False,
     ) -> list[tuple[MemoryNote, float, float]]:
         """``(note, combined, relevance)`` を返すスコア加重検索。
 
@@ -387,6 +405,12 @@ class ShortTermMemory:
         (a) スコアが圧縮されて閾値に到達せず、(b) LightMem が高いだけの無関連
         ノートが上位に来る (実測 2026-08-12: cos -0.05 のノートが 1 位)。
         したがって順位付けとゲートで別の値を使う。
+
+        ``private=True`` のノートは既定で返さない (``include_private=False``)。
+        プライベートセッションのターンは WM/STM に留めるだけの契約で、検索
+        結果として別セッションのプロンプトへ出てはいけない。``MemoryInjector``
+        は同じ除外を持っていたが ``[参考情報]`` 経路 (``_search_stm_layer``)
+        には無かったため、ここで塞ぐ。
         """
         if not self.notes:
             return []
@@ -398,6 +422,8 @@ class ShortTermMemory:
         skipped_dim = 0
         for note in self._cache:
             if note.embedding is None:
+                continue
+            if note.private and not include_private:
                 continue
             # 次元不一致ノートはスキップ
             if int(note.embedding.shape[0]) != query_dim:
@@ -419,10 +445,12 @@ class ShortTermMemory:
 
         scored.sort(key=lambda x: -x[1])
 
-        # アクセス記録
+        # アクセス記録 (FadeMem の frequency 項に効くので永続化対象)
         for note, _, _ in scored[:k]:
             note.access_count += 1
             note.accessed_at = time.time()
+        if scored:
+            self._persist_dirty = True
 
         if scored:
             logger.debug(
@@ -435,23 +463,29 @@ class ShortTermMemory:
 
         return scored[:k]
 
-    def retrieve_top_k(self, query_vec: np.ndarray, k: int = 3) -> list[tuple[MemoryNote, float]]:
+    def retrieve_top_k(
+        self, query_vec: np.ndarray, k: int = 3, *, include_private: bool = False,
+    ) -> list[tuple[MemoryNote, float]]:
         """スコア加重検索: ベクトル類似度 × LightMem スコア
 
         順位付け用の ``combined`` のみを返す従来 API。ゲート判定にも使う
         呼出側は :meth:`retrieve_top_k_detailed` を使うこと。
         """
         return [(note, combined) for note, combined, _ in
-                self.retrieve_top_k_detailed(query_vec, k)]
+                self.retrieve_top_k_detailed(
+                    query_vec, k, include_private=include_private,
+                )]
 
     def save(self, path: str | Path, *, allow_empty: bool = False) -> None:
         """JSON 永続化
 
         既定では **空の STM で既存スナップショットを上書きしない**
-        (理由は ``ShortTermMemoryStore.save`` の docstring)。
+        (理由は ``ShortTermMemoryStore.save`` の docstring)。書き出せたら
+        :attr:`dirty` を下ろす (拒否されたときは次回に持ち越す)。
         """
         from backend.free.memory.stores.short_term_store import ShortTermMemoryStore
-        ShortTermMemoryStore.save(self.notes, path, allow_empty=allow_empty)
+        if ShortTermMemoryStore.save(self.notes, path, allow_empty=allow_empty):
+            self._persist_dirty = False
 
     def load(self, path: str | Path) -> None:
         """JSON からロード
@@ -463,7 +497,7 @@ class ShortTermMemory:
         if loaded is None:
             return
         self.notes = loaded
-        self._cache_dirty = True
+        self.mark_dirty()
 
     def _rebuild_cache_if_needed(self) -> None:
         """スコア降順キャッシュを再構築"""

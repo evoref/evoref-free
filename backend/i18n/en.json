@@ -421,6 +421,17 @@
       "entry": "- {index}. {tool} ({status}) — request “{query}”",
       "omitted": "({count} older entries omitted)"
     },
+    "reactive": {
+      "greeting": {
+        "hello": "Hello! What can I help you with?",
+        "good_morning": "Good morning! What shall we work on today?",
+        "good_evening": "Good evening! How can I help?",
+        "casual": "Hello! Feel free to ask anything.",
+        "thanks": "You're welcome! Feel free to ask anything else.",
+        "good_night": "Good night! Sleep well.",
+        "bye": "Goodbye! Talk to you again soon."
+      }
+    },
     "boundary_turns": {
       "first": "first",
       "last": "last",

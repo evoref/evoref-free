@@ -171,13 +171,6 @@ _HISTORY_KEYWORD_DISTANCE: tuple[tuple[str, str], ...] = (
     ("過去に話", "long_range"),
     ("以前の会話", "long_range"),
     ("会話履歴", "long_range"),
-    ("earlier", "long_range"),
-    ("previously", "long_range"),
-    ("last time", "long_range"),
-    ("yesterday", "long_range"),
-    ("before", "long_range"),
-    ("remember", "long_range"),
-    ("recall", "long_range"),
 )
 
 #: ``_HISTORY_KEYWORD_DISTANCE`` の英語版 (locale='en' でのみ使う)。
@@ -224,10 +217,29 @@ LONG_RANGE_RECALL_KEYWORDS: frozenset[str] = frozenset(
 )
 
 
+def _keyword_union(keywords) -> "re.Pattern[str]":
+    """キーワード集合を 1 本の正規表現にする。
+
+    日本語語彙は素の部分一致のまま (単語境界が無い)。ASCII 語彙だけは
+    英字境界を要求する — 境界無しの部分一致では ``before`` が
+    "beforehand" に、``recall`` が "recalled" に当たり、履歴参照でない
+    英文で search_history が強制発火していた。
+    """
+    parts = []
+    for kw in sorted(keywords, key=len, reverse=True):
+        escaped = re.escape(kw)
+        if re.fullmatch(r"[A-Za-z ]+", kw):
+            escaped = rf"(?<![A-Za-z]){escaped}(?![A-Za-z])"
+        parts.append(escaped)
+    return re.compile("|".join(parts) or r"(?!x)x", re.IGNORECASE)
+
+
+_LONG_RANGE_RECALL_KEYWORD_RE = _keyword_union(LONG_RANGE_RECALL_KEYWORDS)
+
+
 def has_long_range_recall_keyword(query: str) -> bool:
     """過去のセッションを指す語を含むか (純粋関数)。"""
-    q = (query or "").lower()
-    return any(kw in q for kw in LONG_RANGE_RECALL_KEYWORDS)
+    return bool(_LONG_RANGE_RECALL_KEYWORD_RE.search(query or ""))
 
 
 #: 「この会話は **別として**」— 現在の会話を明示的に脇へ置く言い回し。
@@ -540,13 +552,16 @@ def resolve_session_position_message(
 #: (部分一致だと「こんにちは、ところで〜」のような本題付きまで反射応答に
 #: 落ちてしまう)。末尾の句読点・感嘆符は任意。
 def exact_greeting_pattern(alternation: str, *, punctuation: str) -> str:
-    r"""``^(?:<alternation>)\s*[<punctuation>]?\s*$`` を組み立てる (純粋関数)。
+    r"""``^(?:<alternation>)\s*[<punctuation>]*\s*$`` を組み立てる (純粋関数)。
+
+    末尾記号は **何個でも** 許す。1 個に限ると「こんにちは！！」/ "Hello!!" が
+    挨拶から外れて LLM ターンになる。
 
     Args:
         alternation: 挨拶語の alternation (``|`` 区切り)。
         punctuation: 許容する末尾記号の文字クラス中身 (日本語は全角を含む)。
     """
-    return rf"^(?:{alternation})\s*[{punctuation}]?\s*$"
+    return rf"^(?:{alternation})\s*[{punctuation}]*\s*$"
 
 
 #: 日本語クエリで許容する末尾記号 (全角の ！。 を含む)。
@@ -577,6 +592,63 @@ def ascii_boundary(term: str) -> str:
 def ascii_boundary_alternation(*terms: str) -> str:
     """複数の短い ASCII 語をまとめて境界付き alternation にする。"""
     return "|".join(ascii_boundary(t) for t in terms)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 問いの文末 / web 参照 / コード検索 (router と tool_judge_signals が共有)
+# ─────────────────────────────────────────────────────────────────────
+
+#: 「問うている」ことを示す日本語の明示的な疑問マーカー。
+#:
+#: 以前は router 内に 3 つの食い違う alternation
+#: (``_HOWTO_QUERY_RE`` / ``_KNOWLEDGE_QUERY_STRICT_PATTERNS[0]`` /
+#: ``_ENV_FACT_ASK_RE``) が同じ意味で別々に書かれていた。知識質問の strict
+#: 判定と、成果物について尋ねる問いの文末判定 (``_ARTIFACT_QUESTION_RE``) が
+#: 同じ語彙を見る。how-to (教示) の判定は **別物** — 疑問形一般ではなく
+#: 「方法を教えて」型だけを採る (router ``_HOWTO_QUERY_RE`` 参照)。
+QUESTION_TAIL_RE = re.compile(
+    r"(?:教えて|おしえて|とは|って何|ですか|でしょうか|ありますか)",
+)
+
+#: web リソースを対象にしていることを示す語。**web 意図の唯一の定義** —
+#: ツール要否シグナル (``tool_judge_signals._TOOL_PATTERNS`` / ``_EN``)、
+#: ``_infer_tool`` の fetch_url 分岐、``_query_targets_local_file_only``、
+#: router の ``TOOL_PATTERNS`` (URL エントリ) が同じ語彙を使う。
+#: ASCII 語は境界必須 — 境界無しの ``site`` は "opposite" に、``page`` は
+#: "homepage" に部分一致し、無関係な依頼が fetch_url へ振られていた。
+WEB_REFERENCE_RE = re.compile(
+    r"(?:URL|https?://|ウェブ|サイト|ページ|ニュース|記事|ブログ|ドメイン|リンク"
+    r"|" + ascii_boundary_alternation(
+        "web", "site", "page", "news", "fetch", "browse", "link", "domain",
+    ) + r")",
+    re.IGNORECASE,
+)
+
+#: 明示 URL リテラル (URL / http(s)://)。router の ``TOOL_PATTERNS`` はこちらを
+#: 使う — ``WEB_REFERENCE_RE`` の一般語 (サイト / ページ / 記事) まで含めると
+#: 知識質問が meta_cognitive へ振られる (意図的分岐)。
+URL_LITERAL_RE = re.compile(
+    r"https?://|" + ascii_boundary_alternation("URL", "url"),
+    re.IGNORECASE,
+)
+
+#: コード / ファイル検索の共起ガード。汎用「検索」単独は知識質問にもマッチする
+#: ため、コード / ファイル文脈語との共起を要求する。ASCII トークンは境界必須
+#: ("crossencoder" の 'code' 等への部分一致誤爆対策)。
+#: ``tool_judge_signals._TOOL_PATTERNS`` / ``_infer_tool`` の search_code 判定 /
+#: router ``TOOL_PATTERNS`` の単一の情報源。
+_CODE_CONTEXT_TERM = (
+    r"(?:コード|ファイル|ソース|関数|クラス|" + ascii_boundary_alternation(
+        "code", "file", "source",
+    ) + r")"
+)
+_SEARCH_VERB_TERM = (
+    r"(?:検索|" + ascii_boundary_alternation("search", "grep", "find") + r")"
+)
+CODE_SEARCH_PATTERNS: tuple["re.Pattern[str]", ...] = (
+    re.compile(rf"{_CODE_CONTEXT_TERM}.*{_SEARCH_VERB_TERM}", re.IGNORECASE),
+    re.compile(rf"{_SEARCH_VERB_TERM}.*{_CODE_CONTEXT_TERM}", re.IGNORECASE),
+)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1382,6 +1454,19 @@ ANAPHORIC_OPERAND_RE = re.compile(
 )
 
 
+#: 式が **そのまま書かれている** クエリ (「12345 + 67890」「12345 * 67890 = ?」
+#: 「√2の値は？」)。手掛かり語 (``CALCULATION_CUE_RE``) を持たないため
+#: ``looks_like_numeric_question`` を素通りし、router で short_query → reactive
+#: に落ちてツール判定に一度も到達しなかった。
+#: ``-`` / ``/`` は日付 (2026-09-02) やパス (a/b) に頻出するため両側の空白を
+#: 要求する。``+`` ``*`` ``×`` ``÷`` ``^`` は数字に挟まれていれば採る。
+BARE_ARITHMETIC_RE = re.compile(
+    r"\d\s*[+*×÷^]\s*[\d(]"
+    r"|\d\s+[-/]\s+\d"
+    r"|√\s*\d",
+)
+
+
 def looks_like_numeric_question(query: str, context: str = "") -> bool:
     """式は書かれていないが数値計算の答えを求めているクエリか (純粋関数)。
 
@@ -1408,6 +1493,9 @@ def looks_like_numeric_question(query: str, context: str = "") -> bool:
     """
     if CALCULATION_EXCLUDE_RE.search(query):
         return False
+    # 式が書かれていれば手掛かり語は要らない (``BARE_ARITHMETIC_RE`` 参照)。
+    if BARE_ARITHMETIC_RE.search(query):
+        return True
     if not CALCULATION_CUE_RE.search(query):
         return False
     query_numbers = NUMBER_LITERAL_RE.findall(query)
@@ -1766,7 +1854,7 @@ DATETIME_QUERY_RE = re.compile(
 
 
 #: 問い・依頼を表すマーカー。これが 1 つでもあれば平叙の自己申告ではない。
-#: ``agent.router._ENV_FACT_ASK_RE`` より広く取る (「調べたい」「表示して」等の
+#: :data:`QUESTION_TAIL_RE` より広く取る (「調べたい」「表示して」等の
 #: 語幹も拾う) — こちらは **実行を止める** 側の判定なので、取りこぼしより
 #: 過剰抑止の方が害が大きい。
 _REQUEST_MARKER_RE = re.compile(
@@ -1798,8 +1886,8 @@ def is_plain_statement(query: str) -> bool:
     という **単なる報告** に ``Windows`` が部分一致し、``run_command_readonly``
     で ``platform.platform()`` が撃たれた (17 秒消費し、回答も OS の話に流れた)。
 
-    ``asks_environment_fact`` (router) の裏返しだが、こちらは「問いのマーカーが
-    無い」だけでは False を返さない。「PC のスペック」「hostname」のような
+    問いのマーカー判定 (:data:`QUESTION_TAIL_RE` 系) の裏返しだが、こちらは
+    「問いのマーカーが無い」だけでは False を返さない。「PC のスペック」「hostname」のような
     体言止めの問い合わせを止めないためで、**平叙の文末で終わる場合に限って**
     True を返す。
     """
@@ -1815,10 +1903,13 @@ def is_plain_statement(query: str) -> bool:
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _contains_any_keyword(query: str, keywords) -> bool:
-    """小文字化した ``query`` に ``keywords`` のいずれかが部分一致するか。"""
-    q = (query or "").lower()
-    return any(kw in q for kw in keywords)
+_HISTORY_KEYWORD_RE = _keyword_union(HISTORY_KEYWORDS)
+_HISTORY_KEYWORD_RE_EN = _keyword_union(HISTORY_KEYWORDS_EN)
+
+
+def _contains_any_keyword(query: str, keyword_re: "re.Pattern[str]") -> bool:
+    """``query`` に履歴参照語が含まれるか (ASCII 語は境界付き、``_keyword_union`` 参照)。"""
+    return bool(keyword_re.search(query or ""))
 
 
 def has_history_recall_keyword(query: str, *, locale_aware: bool = True) -> bool:
@@ -1831,13 +1922,13 @@ def has_history_recall_keyword(query: str, *, locale_aware: bool = True) -> bool
     小文字化 + 部分一致が書き写されていた。
     """
     if not locale_aware:
-        return _contains_any_keyword(query, HISTORY_KEYWORDS) or _contains_any_keyword(
-            query, HISTORY_KEYWORDS_EN,
+        return _contains_any_keyword(query, _HISTORY_KEYWORD_RE) or _contains_any_keyword(
+            query, _HISTORY_KEYWORD_RE_EN,
         )
     from backend.free.core.locale_patterns import select_locale_variant
 
     return _contains_any_keyword(
-        query, select_locale_variant(HISTORY_KEYWORDS, HISTORY_KEYWORDS_EN),
+        query, select_locale_variant(_HISTORY_KEYWORD_RE, _HISTORY_KEYWORD_RE_EN),
     )
 
 

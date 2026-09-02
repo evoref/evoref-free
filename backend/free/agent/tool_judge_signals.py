@@ -14,6 +14,8 @@ from backend.free.agent.router import (
 )
 from backend.free.core.intent_vocab import (
     CALCULATE_TERM,
+    CODE_SEARCH_PATTERNS,
+    WEB_REFERENCE_RE,
     DATETIME_SIGNAL_TERMS_EN,
     EXECUTABLE_QUERY_PATTERNS_EN,
     EXECUTABLE_QUERY_PATTERNS_JA,
@@ -61,22 +63,8 @@ _PATH_OR_URL_SIGNAL_RE = re.compile(
 # ToolCallJudge._infer_tool 内の search_code 判定の単一の情報源。JA/EN で
 # 同一の複合パターンを使う (両トークンを同一正規表現に含めているため locale
 # で分岐不要)。
-_CODE_SEARCH_PATTERNS = (
-    re.compile(
-        r"(?:コード|ファイル|ソース|関数|クラス|(?<![A-Za-z])code(?![A-Za-z])"
-        r"|(?<![A-Za-z])file(?![A-Za-z])|(?<![A-Za-z])source(?![A-Za-z]))"
-        r".*(?:検索|(?<![A-Za-z])search(?![A-Za-z])|(?<![A-Za-z])grep(?![A-Za-z])"
-        r"|(?<![A-Za-z])find(?![A-Za-z]))",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?:検索|(?<![A-Za-z])search(?![A-Za-z])|(?<![A-Za-z])grep(?![A-Za-z])"
-        r"|(?<![A-Za-z])find(?![A-Za-z]))"
-        r".*(?:コード|ファイル|ソース|(?<![A-Za-z])code(?![A-Za-z])"
-        r"|(?<![A-Za-z])file(?![A-Za-z])|(?<![A-Za-z])source(?![A-Za-z]))",
-        re.IGNORECASE,
-    ),
-)
+# 定義は core.intent_vocab (router の TOOL_PATTERNS とも共有)。
+_CODE_SEARCH_PATTERNS = CODE_SEARCH_PATTERNS
 
 # 所在を問う言い回し (「<識別子> はどこで使われていますか」) の共起ガード。
 #
@@ -148,14 +136,8 @@ def _code_usage_location_pattern(query: str) -> str:
 #: (「そのURLをファイルに保存して」等の url_write 正規フロー保護)。
 #: ASCII 語は境界必須 — 境界無しの ``site`` は "opposite" に、``page`` は
 #: "homepage" に部分一致し、無関係な依頼が fetch_url へ振られていた。
-_WEB_REFERENCE_RE = re.compile(
-    r"(?:URL|https?://|ウェブ|サイト|ページ|ニュース|記事|ブログ|ドメイン|リンク"
-    r"|(?<![A-Za-z])web(?![A-Za-z])|(?<![A-Za-z])site(?![A-Za-z])"
-    r"|(?<![A-Za-z])page(?![A-Za-z])|(?<![A-Za-z])news(?![A-Za-z])"
-    r"|(?<![A-Za-z])fetch(?![A-Za-z])|(?<![A-Za-z])browse(?![A-Za-z])"
-    r"|(?<![A-Za-z])link(?![A-Za-z])|(?<![A-Za-z])domain(?![A-Za-z]))",
-    re.IGNORECASE,
-)
+#: 定義は core.intent_vocab.WEB_REFERENCE_RE (router の TOOL_PATTERNS とも共有)。
+_WEB_REFERENCE_RE = WEB_REFERENCE_RE
 
 #: 「動くか / エラーが無いか」を確かめる依頼 (``_infer_tool`` の verify_syntax
 #: 分岐)。ASCII 語は境界必須 — 境界無しの ``work`` は "network.py" に、``bug`` は

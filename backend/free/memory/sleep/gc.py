@@ -105,7 +105,8 @@ def run_semmem_gc(
     if enforcement != "hard":
         return {}
 
-    retention_days = float(limits_cfg.get("superseded_retention_days", 0.0) or 0.0)
+    # フォールバックはスキーマ既定 (SemMemLimitsConfig.superseded_retention_days)
+    retention_days = float(limits_cfg.get("superseded_retention_days", 90.0))
 
     deleted_total: dict[str, int] = {}
     for scope in _target_scopes(current_project_id):

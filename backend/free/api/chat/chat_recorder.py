@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -12,13 +14,16 @@ from backend.free.core.text_quality import strip_system_notes
 from backend.free.api.chat._artifact import remember_artifact
 from backend.free.api.chat.chat_types import ChatMessage
 from backend.free.core.text_quality import is_query_echo, strip_echoed_query
+from backend.free.history import history_manager as _history_manager_module
 from backend.free.history.history_manager import (
     SessionData,
     active_base_model_name,
     get_history_manager,
 )
+from backend.free.history.utils import parse_iso
 from backend.free.core.text_quality import extract_measured_values
 from backend.log_config import get_logger
+from backend.trace_context import run_in_executor_with_context
 from backend.utils import utc_now_dt
 
 if TYPE_CHECKING:
@@ -119,6 +124,14 @@ _session_turns: dict[str, list[dict]] = {}
 # (``memory.private.history_storage: skip`` でセッションごと永続化を落とす判定に使う)
 _session_had_private: set[str] = set()
 
+#: 履歴ファイル書き出し用の 1 スレッド executor。``HistoryManager.save_session``
+#: はセッション JSON 全体 + index.json を毎ターン書き直す同期 I/O で、非同期
+#: ハンドラの中でそのまま走らせるとストリーミングの末尾がその分止まる。
+#: 1 スレッドなので同一セッションの連続保存が追い越さない。
+_HISTORY_SAVE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="history-save",
+)
+
 
 def _recorded_body(response: str) -> str:
     """記憶へ積む本文 (システムの開示注記を除いたもの)。
@@ -161,18 +174,94 @@ def _accumulate_turn(
     })
 
 
+def accumulate_user_turn(
+    session_id: str, user_query: str, *, private: bool = False,
+) -> None:
+    """user 発話を蓄積バッファへ積む (**冪等**)。
+
+    応答パスの入口 (``prepare_memory_context`` が WM へ積んだ直後) から呼ぶ。
+    以前は ``record_*`` の末尾でしか積んでいなかったため、生成が失敗 /
+    タイムアウトしたターンは WM には居るのに履歴 (``_session_turns``) には
+    無い、という食い違いが起きていた。
+
+    冪等性: 直前に積まれたターンが同じ user 発話なら二重に積まない。
+    ``record_*`` も同じ経路を通るので、入口で積んだ後に record が走っても
+    1 回しか数えない。同じ文面を連続 2 回送って 1 回目が失敗したケースは
+    1 回に畳まれる (許容)。
+    """
+    if private:
+        _accumulate_turn(session_id, "user", user_query, private=True)
+        return
+    _ensure_session_restored(session_id)
+    turns = _session_turns.get(session_id)
+    if turns and turns[-1].get("role") == "user" and turns[-1].get("content") == user_query:
+        return
+    _accumulate_turn(session_id, "user", user_query)
+
+
+def _ensure_session_restored(session_id: str, mgr=None) -> None:
+    """再起動を跨いだセッションの開始時刻とターン列を索引 / ファイルから戻す。
+
+    保存先ファイル名は開始時刻から決まる (``HistoryManager._resolve_session_path``)。
+    プロセスが再起動すると ``_session_started`` / ``_session_turns`` は空になり、
+    同じ session_id の続きが **別ファイル** に書かれ、索引は session_id で置換
+    されるため旧ファイルが孤児になっていた。既知のセッションなら開始時刻と
+    既存ターンを引き継ぎ、同じファイルへ追記する形にする。
+
+    ``mgr=None`` のときは **既に構築済みのシングルトンだけ** を使う
+    (``get_history_manager`` の初回構築は checkpoint 昇格などの副作用を持つ
+    ので、応答パスの入口からは起こさない)。保存側は自分の ``mgr`` を渡す。
+    """
+    if session_id in _session_started:
+        return
+    if mgr is None:
+        mgr = _history_manager_module._manager_cache
+        if mgr is None:
+            return
+    try:
+        started = mgr.get_session_started_at(session_id)
+    except Exception as exc:
+        logger.debug("history lookup failed for %s: %s", session_id, exc)
+        return
+    if not isinstance(started, str) or not started:
+        return
+    _session_started[session_id] = started
+    try:
+        session = mgr.get_session(session_id)
+    except Exception as exc:
+        logger.debug("history load failed for %s: %s", session_id, exc)
+        return
+    if session is None or not session.turns:
+        return
+    restored: list[dict] = []
+    for t in session.turns:
+        entry = {"role": t.get("role", "user"), "content": t.get("content", "")}
+        ts = parse_iso(str(t.get("timestamp") or ""))
+        entry["timestamp"] = ts.timestamp() if ts else 0.0
+        restored.append(entry)
+    _session_turns[session_id] = restored + list(_session_turns.get(session_id) or [])
+    logger.info(
+        "Restored %d turn(s) of session %s from history (started_at=%s)",
+        len(restored), session_id, started,
+    )
+
+
 def session_turn_count(session_id: str) -> int:
-    """このセッションの累計ターン数 (user + assistant)。
+    """このセッションの累計ターン数 (user + assistant)。**進行中の user 発話を含む**。
 
     ``WorkingMemory`` は窓を越えた分を押し出すので、会話全体を数えられるのは
     こちらの蓄積バッファだけ。実インシデント (2026-08-27 ライブ監査 T19-4):
     148 ターン目に「50ターン目です」と答えた (窓に入っている分だけを数えた)。
+
+    user 発話は ``accumulate_user_turn`` で messages を組む前に積まれるため、
+    応答パスから読むと「いまのターン」がすでに 1 と数えられている
+    (:func:`count_term_in_session` と同じ契約)。
     """
     return len(_session_turns.get(session_id) or ())
 
 
 def count_term_in_session(session_id: str, term: str) -> int:
-    """このセッションの全ターン本文に ``term`` が現れた回数。
+    """このセッションの全ターン本文に ``term`` が現れた回数。**進行中の user 発話を含む**。
 
     実インシデント (2026-08-27 ライブ監査 T08-7): 「これまでの会話に「横浜」は
     何回出てきましたか。」に「5回」と答えた (実際 4 回)。ツールを使わず数を
@@ -209,16 +298,49 @@ def _existing_summary(mgr, session_id: str) -> str | None:
     """既に生成済みのセッション要約を引き継ぐ (未生成なら ``None``)。
 
     自動保存は毎ターン走るため、sleep-time の LLM 要約器が書いた要約を
-    次ターンの保存で消さないよう索引から読み直す。
+    次ターンの保存で消さないよう索引から読み直す (``HistoryManager.get_summary``)。
     """
     try:
-        index = mgr._load_index()
+        summary = mgr.get_summary(session_id)
     except Exception:
         return None
-    entry = next(
-        (e for e in index.sessions if e.session_id == session_id), None,
+    return summary if isinstance(summary, str) else None
+
+
+def _submit_history_save(mgr, session: SessionData) -> None:
+    """``mgr.save_session`` をワーカースレッドへ投げる (ループ外なら同期実行)。
+
+    ファイル書き出しは ``_HISTORY_SAVE_EXECUTOR`` (1 スレッド) で直列に走る。
+    非同期ハンドラの外 (CLI / テスト) から呼ばれた場合はその場で書く。
+    """
+    def _log_result(fut) -> None:
+        try:
+            path = fut.result()
+        except Exception as exc:
+            logger.warning("Failed to save session to history: %s", exc)
+            return
+        if path:
+            logger.debug(
+                "Session saved to history: %s (%d turns)",
+                session.session_id, session.turn_count,
+            )
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        path = mgr.save_session(session)
+        if path:
+            logger.debug(
+                "Session saved to history: %s (%d turns)",
+                session.session_id, session.turn_count,
+            )
+        return
+    fut = run_in_executor_with_context(
+        loop, _HISTORY_SAVE_EXECUTOR, mgr.save_session, session,
     )
-    return entry.summary if entry is not None else None
+    fut.add_done_callback(_log_result)
 
 
 def _save_session_to_history(
@@ -230,6 +352,12 @@ def _save_session_to_history(
     同一 session_id のファイルは上書きされるため冪等。
     WorkingMemory ではなく _session_turns を使用し、
     WM のエビクションで古いターンが失われる問題を回避する。
+
+    ``SessionData`` の組み立てはこのスレッドで行い (蓄積バッファは
+    イベントループ側で変わる)、ファイル I/O だけを ``_submit_history_save``
+    でワーカースレッドへ逃がす。
+
+    ``state`` は使っていないが、呼出面 (テスト含む) の互換のため残している。
     """
     turns = _session_turns.get(session_id, [])
     if not turns:
@@ -255,6 +383,11 @@ def _save_session_to_history(
             return
 
         mgr = get_history_manager()
+
+        # 再起動を跨いだ続きなら、索引の開始時刻と既存ターンを先に引き継ぐ
+        # (同じファイルへ追記する形にする)。
+        _ensure_session_restored(session_id, mgr)
+        turns = _session_turns.get(session_id, turns)
 
         # 開始時刻を記録（初回のみ）
         if session_id not in _session_started:
@@ -312,9 +445,7 @@ def _save_session_to_history(
             summary=summary,
         )
 
-        path = mgr.save_session(session)
-        if path:
-            logger.debug("Session saved to history: %s (%d turns)", session_id, len(history_turns))
+        _submit_history_save(mgr, session)
     except Exception as e:
         logger.warning("Failed to save session to history: %s", e)
 
@@ -350,6 +481,7 @@ def snapshot_wm_to_stm(
 
 def _absorb_turns_to_stm(
     turns: list[dict], stm: ShortTermMemory, session_id: str, *, origin: str,
+    preceding_user: str = "",
 ) -> None:
     """ターン列を STM へ吸収する共通処理 (押し出し / スナップショット共用)。
 
@@ -359,8 +491,12 @@ def _absorb_turns_to_stm(
     「今日は何曜日ですか。」が 5 回繰り返され答えが出ない状態まで悪化。
     汚染ノートを除去したら 5/5 で解消した)。エコー部分を落として中身が
     残ればその中身だけを吸収し、何も残らなければ丸ごと捨てる。
+
+    ``preceding_user`` は ``turns`` の先頭より前にあった user 発話。assistant
+    ターン単独を吸収する経路 (WM を迂回する直接吸収) でもエコー判定が
+    効くように、比較対象の初期値として使う。
     """
-    last_user = ""
+    last_user = preceding_user
     dropped = 0
     for turn in turns:
         content = turn.get("content") or ""
@@ -388,8 +524,35 @@ def _absorb_turns_to_stm(
         logger.info("Absorbed %d %s turns to STM", len(turns), origin)
 
 
-def _schedule_sleep_time(state: AppState, user_query: str, private: bool) -> None:
+def _wm_correction_flag(state: AppState, user_query: str) -> bool | None:
+    """``prepare_memory_context`` が WM の user ターンに立てた訂正の印を読む。
+
+    ``restates_a_value`` は応答パスの入口で 1 回判定し、結果を turn dict の
+    ``is_correction`` に置いている。record 側で再判定せずそれを読む
+    (同じ述語を 1 ターンに 3 回走らせていた)。該当ターンが窓から落ちて
+    いる / WM が無い場合は ``None`` (呼出側で判定にフォールバック)。
+    """
+    mem_sys = state.get_memory_system() if hasattr(state, "get_memory_system") else None
+    if not mem_sys:
+        return None
+    wm = mem_sys[0]
+    turns = getattr(wm, "turns", None)
+    if not isinstance(turns, list):
+        return None
+    for turn in reversed(turns):
+        if turn.get("role") == "user" and turn.get("content") == user_query:
+            return bool(turn.get("is_correction", False))
+    return None
+
+
+def _schedule_sleep_time(
+    state: AppState, user_query: str, private: bool,
+    *, correction: bool | None = None,
+) -> None:
     """sleep-time update をスケジュールする (record_* 3 経路の共通処理)。
+
+    ``correction`` は入口 (``prepare_memory_context``) で判定済みの
+    ``restates_a_value`` の結果。``None`` ならここで判定する。
 
     訂正ターンでは Full を **前倒し** する。ファクト抽出 (Step 8) と競合解決
     (Step 6B) は Full にしか無く (``memory.facts.trigger: idle_full_only``)、
@@ -425,7 +588,9 @@ def _schedule_sleep_time(state: AppState, user_query: str, private: bool) -> Non
                 states_single_valued_attribute,
             )
 
-            if restates_a_value(user_query):
+            if correction is None:
+                correction = restates_a_value(user_query)
+            if correction:
                 scheduler.request_full_soon("value_restated")
             elif states_single_valued_attribute(user_query):
                 scheduler.request_full_soon("single_valued_attribute_stated")
@@ -485,6 +650,103 @@ def _remember_if_artifact_sized(
     remember_artifact(state, session_id, text=response, query=query, mode=mode)
 
 
+def _record_assistant_turn_to_memory(
+    state: AppState, full_response: str, session_id: str, user_query: str,
+    mode: str, *,
+    private: bool,
+    tool_command: str | None = None,
+    tool_command_name: str | None = None,
+    tool_command_success: bool | None = None,
+    tool_command_source: str | None = None,
+) -> None:
+    """assistant 応答を WM → STM へ記録する (record_* 3 経路の共通処理)。
+
+    - ``full_response`` が空でも **押し出し済みターンの STM 転送は行う**
+      (空応答のターンで転送を飛ばすと、押し出されたターンが次の応答まで
+      転送バッファに滞留する)。
+    - WM が **別セッション** に切り替わっていたら WM を迂回し、STM へ直接
+      正しい ``session_id`` で吸収する。並行セッション下では、生成中に
+      ``prepare_memory_context`` が別セッションへ切替えることがあり、そのまま
+      ``wm.add_turn`` すると回答が他人の会話に混ざる。WM の session_id が
+      文字列でない (テストのモック等) 場合は判定せず WM を信用する。
+    - ``tool_command*`` は run_command 実行ターンの learning メタ。3 経路とも
+      同じ kwargs を受けるので、meta-cognitive 経路の run_command も
+      sleep-time Step 8.6 (executable_command_curator) に届く。
+    """
+    mem_sys = state.get_memory_system()
+    if not mem_sys:
+        return
+    wm, stm, _ltm = mem_sys
+    wm_session = getattr(wm, "session_id", None)
+    wm_switched = isinstance(wm_session, str) and wm_session != session_id
+    if full_response:
+        body = _recorded_body(full_response)
+        # 発火元のクエリを note に確定させる。curator が STM を走査して
+        # 「直前で最も近い user note」から推測すると、当該ターンの user note が
+        # 吸収されていない場合に別ターンのクエリと結び付く。
+        tool_command_query = user_query if tool_command else None
+        if wm_switched:
+            logger.warning(
+                "WorkingMemory now belongs to session %s; absorbing the "
+                "assistant turn for session %s straight into STM",
+                wm_session, session_id,
+            )
+            turn: dict = {
+                "role": "assistant", "content": body, "timestamp": time.time(),
+                "mode": mode, "source": "assistant",
+            }
+            if private:
+                turn["private"] = True
+            for key, value in (
+                ("tool_command", tool_command),
+                ("tool_command_name", tool_command_name),
+                ("tool_command_success", tool_command_success),
+                ("tool_command_source", tool_command_source),
+                ("tool_command_query", tool_command_query),
+            ):
+                if value is not None:
+                    turn[key] = value
+            _absorb_turns_to_stm(
+                [turn], stm, session_id, origin="direct",
+                preceding_user=user_query,
+            )
+        else:
+            wm.add_turn(
+                "assistant", body,
+                private=private, mode=mode, source="assistant",
+                tool_command=tool_command,
+                tool_command_name=tool_command_name,
+                tool_command_success=tool_command_success,
+                tool_command_source=tool_command_source,
+                tool_command_query=tool_command_query,
+            )
+    # 押し出し済みターンは WM が現に属するセッションのもの。
+    drain_evicted_to_stm(wm, stm, wm_session if wm_switched else session_id)
+
+
+def _finish_turn_bookkeeping(
+    state: AppState, full_response: str, session_id: str, user_query: str,
+    mode: str, *, private: bool,
+) -> None:
+    """record_* 3 経路の末尾処理: sleep-time スケジュール / 蓄積 / 履歴保存。"""
+    # sleep-time update をスケジュール (訂正ターンは Full を前倒し)。判定は
+    # 入口で済んでいるので WM の印を読む (無ければ判定にフォールバック)。
+    _schedule_sleep_time(
+        state, user_query, private,
+        correction=_wm_correction_flag(state, user_query),
+    )
+
+    # ターンを蓄積（WM エビクションに依存しない完全な履歴）。user 側は入口で
+    # 積まれているのが通常で、ここは冪等な保険。
+    accumulate_user_turn(session_id, user_query, private=private)
+    if full_response:
+        _accumulate_turn(session_id, "assistant", full_response, private=private)
+
+    # 会話履歴をディスクに保存 (private なら蓄積されていないので no-op)
+    if not private:
+        _save_session_to_history(state, session_id, mode)
+
+
 def record_response(
     state: AppState, full_response: str, messages: list[ChatMessage],
     session_id: str, user_query: str, mode: str,
@@ -519,22 +781,14 @@ def record_response(
     sleep-time の executable_command_curator が参照する (それ以外は None)。
     """
     # メモリに応答を記録
-    mem_sys = state.get_memory_system()
-    if mem_sys and full_response:
-        wm, stm, _ltm = mem_sys
-        wm.add_turn(
-            "assistant", _recorded_body(full_response),
-            private=private, mode=mode, source="assistant",
-            tool_command=tool_command,
-            tool_command_name=tool_command_name,
-            tool_command_success=tool_command_success,
-            tool_command_source=tool_command_source,
-            # 発火元のクエリを note に確定させる。curator が STM を走査して
-            # 「直前で最も近い user note」から推測すると、当該ターンの user note が
-            # 吸収されていない場合に別ターンのクエリと結び付く。
-            tool_command_query=user_query if tool_command else None,
-        )
-        drain_evicted_to_stm(wm, stm, session_id)
+    _record_assistant_turn_to_memory(
+        state, full_response, session_id, user_query, mode,
+        private=private,
+        tool_command=tool_command,
+        tool_command_name=tool_command_name,
+        tool_command_success=tool_command_success,
+        tool_command_source=tool_command_source,
+    )
 
     # 履歴予算に入らない長さの応答は成果物として保持する。
     # 実測 (2026-08-27 ライブ監査) の履歴予算は 1612 トークン。これを超える
@@ -580,17 +834,9 @@ def record_response(
                 "FeedbackCollector.record failed: %s", e, exc_info=True,
             )
 
-    # sleep-time update をスケジュール (訂正ターンは Full を前倒し)
-    _schedule_sleep_time(state, user_query, private)
-
-    # ターンを蓄積（WM エビクションに依存しない完全な履歴）
-    _accumulate_turn(session_id, "user", user_query, private=private)
-    if full_response:
-        _accumulate_turn(session_id, "assistant", full_response, private=private)
-
-    # 会話履歴をディスクに保存 (private なら蓄積されていないので no-op)
-    if not private:
-        _save_session_to_history(state, session_id, mode)
+    _finish_turn_bookkeeping(
+        state, full_response, session_id, user_query, mode, private=private,
+    )
 
 
 def record_meta_cognitive_response(
@@ -604,25 +850,34 @@ def record_meta_cognitive_response(
     rag_top1_score: float | None = None,
     tool_routing_success: bool = False,
     tool_routing_false_positive: bool = False,
+    tool_command: str | None = None,
+    tool_command_name: str | None = None,
+    tool_command_success: bool | None = None,
+    tool_command_source: str | None = None,
+    sent_messages: list[ChatMessage] | None = None,
 ) -> None:
     """Meta-Cognitive 層の応答をメモリ・経験バッファに記録（クレジット付き）
 
-    ``private=True`` の場合は WM/STM までの伝搬のみ
+    ``private=True`` の場合は WM/STM までの伝搬のみ。
+
+    ``tool_command*`` / ``sent_messages`` は :func:`record_response` と同じ
+    意味。meta 経路で run_command が走ったターンも、呼出側がこれを渡せば
+    sleep-time Step 8.6 (executable_command_curator) の学習対象になる。
     """
     # メモリに応答を記録
-    mem_sys = state.get_memory_system()
-    if mem_sys and full_response:
-        wm, stm, _ltm = mem_sys
-        wm.add_turn(
-            "assistant", _recorded_body(full_response),
-            private=private, mode=mode, source="assistant",
-        )
-        drain_evicted_to_stm(wm, stm, session_id)
+    _record_assistant_turn_to_memory(
+        state, full_response, session_id, user_query, mode,
+        private=private,
+        tool_command=tool_command,
+        tool_command_name=tool_command_name,
+        tool_command_success=tool_command_success,
+        tool_command_source=tool_command_source,
+    )
 
     # デバッグログ
     dl = state.debug_logger
     if dl:
-        dl.log_request(tokens_generated, messages, full_response)
+        dl.log_request(tokens_generated, sent_messages or messages, full_response)
 
     # 経験バッファに記録 (Level 0) — ステップクレジット付き / private は対象外
     fc = state.feedback_collector
@@ -659,17 +914,9 @@ def record_meta_cognitive_response(
                 exc_info=True,
             )
 
-    # sleep-time update をスケジュール (訂正ターンは Full を前倒し)
-    _schedule_sleep_time(state, user_query, private)
-
-    # ターンを蓄積（WM エビクションに依存しない完全な履歴）
-    _accumulate_turn(session_id, "user", user_query, private=private)
-    if full_response:
-        _accumulate_turn(session_id, "assistant", full_response, private=private)
-
-    # 会話履歴をディスクに保存 (private は no-op)
-    if not private:
-        _save_session_to_history(state, session_id, mode)
+    _finish_turn_bookkeeping(
+        state, full_response, session_id, user_query, mode, private=private,
+    )
 
 
 def record_long_form_response(
@@ -680,20 +927,26 @@ def record_long_form_response(
     private: bool = False,
     rag_used: bool = False,
     rag_top1_score: float | None = None,
+    tool_command: str | None = None,
+    tool_command_name: str | None = None,
+    tool_command_success: bool | None = None,
+    tool_command_source: str | None = None,
+    sent_messages: list[ChatMessage] | None = None,
 ) -> None:
     """長文生成の応答をメモリ・経験バッファに記録
 
-    ``private=True`` の場合は WM/STM までの伝搬のみ
+    ``private=True`` の場合は WM/STM までの伝搬のみ。``tool_command*`` /
+    ``sent_messages`` は :func:`record_response` と同じ意味。
     """
     # メモリに応答を記録
-    mem_sys = state.get_memory_system()
-    if mem_sys and full_response:
-        wm, stm, _ltm = mem_sys
-        wm.add_turn(
-            "assistant", _recorded_body(full_response),
-            private=private, mode=mode, source="assistant",
-        )
-        drain_evicted_to_stm(wm, stm, session_id)
+    _record_assistant_turn_to_memory(
+        state, full_response, session_id, user_query, mode,
+        private=private,
+        tool_command=tool_command,
+        tool_command_name=tool_command_name,
+        tool_command_success=tool_command_success,
+        tool_command_source=tool_command_source,
+    )
 
     # 成果物として保持する。WM へ積んでも **次のターンには残らない** —
     # 実測 (2026-08-27 ライブ監査 T10) で 6696 文字の計画書を出した次のターンが
@@ -710,7 +963,7 @@ def record_long_form_response(
     # デバッグログ
     dl = state.debug_logger
     if dl:
-        dl.log_request(tokens_generated, messages, full_response)
+        dl.log_request(tokens_generated, sent_messages or messages, full_response)
 
     # 経験バッファに記録 (Level 0) — 長文生成メトリクス付き / private は対象外
     fc = state.feedback_collector
@@ -761,14 +1014,6 @@ def record_long_form_response(
                 exc_info=True,
             )
 
-    # sleep-time update をスケジュール (訂正ターンは Full を前倒し)
-    _schedule_sleep_time(state, user_query, private)
-
-    # ターンを蓄積（WM エビクションに依存しない完全な履歴）
-    _accumulate_turn(session_id, "user", user_query, private=private)
-    if full_response:
-        _accumulate_turn(session_id, "assistant", full_response, private=private)
-
-    # 会話履歴をディスクに保存 (private は no-op)
-    if not private:
-        _save_session_to_history(state, session_id, mode)
+    _finish_turn_bookkeeping(
+        state, full_response, session_id, user_query, mode, private=private,
+    )

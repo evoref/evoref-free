@@ -200,6 +200,14 @@ class LearningConfig(BaseModel):
     tool_pattern_boost_success: float = Field(default=0.03, ge=0.0, le=1.0)
     tool_pattern_decay_false_pos: float = Field(default=0.1, ge=0.0, le=1.0)
     tool_pattern_match_threshold: float = Field(default=0.4, ge=0.1, le=0.9)
+    # 長文生成パターン学習 (router._contains_learned_long_form_patterns)
+    long_form_pattern_match_threshold: float = Field(
+        default=0.4, ge=0.1, le=0.9,
+        description=(
+            "学習済み long_form パターンを一致とみなす重みの下限。"
+            "閾値以上の一致が 2 語以上、または重み合計 0.8 以上で long_form へ振る"
+        ),
+    )
     # Few-shot プール
     fewshot_pool_size: int = Field(default=50, ge=1)
     fewshot_min_fitness: float = Field(default=0.7, ge=0.0, le=1.0)

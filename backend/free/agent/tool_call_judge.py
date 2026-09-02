@@ -1581,6 +1581,17 @@ class ToolCallJudge:
             source="rule",
         )
 
+    def has_url_recall_candidates(self) -> bool:
+        """``mem.world.url.*`` ファクトが 1 件でも索引にあるか。
+
+        ``recall_url_judgement`` はクエリの埋め込み (HTTP 往復) を伴う。URL
+        ファクトが 0 件なら何を埋め込んでも当たらないので、呼び元 (chat の
+        reactive プリチェック) はこれで先に短絡する。
+        """
+        if self._mem_view is None:
+            return False
+        return int(self._mem_view.count_by_subject_prefix(URL_SUBJECT_PREFIX)) > 0
+
     async def recall_url_judgement(
         self,
         query: str,

@@ -657,12 +657,12 @@ memory:
   subject_dictionary:
     enabled: true                                              # 正規化を有効化
     file: local/memory/semantic/subject_dictionary.json        # 辞書ファイルのパス
-    auto_expand: false                                         # 自動拡張は仕様で禁止
+    auto_expand: false                                         # 自動拡張は仕様で禁止 (未参照 / 予約)
   # --- ファクト抽出 ---
   facts:
     extraction_skip_subject_canonicalize_regex: '^(loop|learn|mem)\.'   # pillar が機械的に命名した subject は辞書スキップ
     enable_extraction: true                                    # Step 8 Extractor 全体オンオフ
-    trigger: idle_full_only                                    # 抽出トリガ (Trigger B = run_full のみ)
+    trigger: idle_full_only                                    # 抽出トリガ (Trigger B = run_full のみ、未参照 / 予約)
     extract_from_mdp_trace: true                               # agent_trace.jsonl から MDP 抽出
     ingest_mdp_trace_to_ltm: true                              # agent_trace.jsonl を episodic LTM に投入
     extraction_max_pinned_per_session: -1                      # pinned 由来の上限 (-1=無制限)
@@ -675,8 +675,8 @@ memory:
   # は local/triggers/<name>.yaml に置く 2 段階解決 (override 優先)。config では指定しない。
   pin:
     auto_detect: true                                          # 自動 Pin 検出 (覚えて/重要/忘れないで等)
-    auto_detect_confirm: false                                 # 検出時に確認を要求するか
-    unlimited: true                                            # pin 数上限なし
+    auto_detect_confirm: false                                 # 検出時に確認を要求するか (未参照 / 予約)
+    unlimited: true                                            # pin 数上限なし (未参照 / 予約)
   # --- プライベートセッション ---
   # private: true のターンは memory_only で動作し、LTM/SemMem への昇格と
   # 会話履歴のディスク永続化をスキップする。セッション終了時に揮発する。
@@ -940,6 +940,7 @@ learning:
   tool_pattern_boost_success: 0.03    # 成功時のブースト量
   tool_pattern_decay_false_pos: 0.1   # 誤検出時の減衰量
   tool_pattern_match_threshold: 0.4   # マッチ閾値（通常パターンより高め）
+  long_form_pattern_match_threshold: 0.4  # 学習済み long_form パターンの一致閾値 (router)
   # Few-shot プール
   fewshot_pool_size: 50               # モード別最大プールサイズ
   fewshot_min_fitness: 0.7            # プール追加の最低 fitness

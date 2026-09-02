@@ -13,7 +13,7 @@ Public API:
 - :class:`SchemaMigrator`
 - :func:`run_migrations` (ワンショットヘルパ)
 - :exc:`MigrationError` / :exc:`MigrationChainNotFoundError`
-- :data:`DEFAULT_MIGRATIONS` (登録済 Migration 集約点 / 現状は空)
+- :data:`DEFAULT_MIGRATIONS` (登録済 Migration 集約点 / 現状は index v1→v2 の 1 件)
 """
 
 from __future__ import annotations

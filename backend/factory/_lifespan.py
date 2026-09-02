@@ -85,14 +85,21 @@ async def _shutdown_learning_cancel(learning_scheduler: "LearningScheduler") -> 
 
 
 def _shutdown_wm_flush(wm: "WorkingMemory", stm: "ShortTermMemory") -> None:
-    """WorkingMemory の残存ターンを STM にフラッシュ"""
+    """WorkingMemory の残存ターンを STM にフラッシュ
+
+    吸収は ``chat_recorder.drain_evicted_to_stm`` に任せる — 応答パスと同じ
+    エコー落とし (直前の質問を逐語コピーしただけの応答を捨てる) を通す。
+    ここだけ ``stm.absorb`` を直に呼ぶと、終了時に流れたターンだけが
+    フィルタを迂回して汚染ノートになる。
+    """
+    from backend.free.api.chat.chat_recorder import drain_evicted_to_stm
+
     try:
+        pending = len(wm.turns)
         wm.clear()  # 全ターンを _evicted に移動
-        evicted = wm.drain_evicted()
-        for turn in evicted:
-            stm.absorb(turn, wm.session_id)
-        if evicted:
-            logger.info("Flushed %d remaining turns to STM on shutdown", len(evicted))
+        drain_evicted_to_stm(wm, stm, wm.session_id)
+        if pending:
+            logger.info("Flushed %d remaining turns to STM on shutdown", pending)
     except Exception as e:
         logger.warning("WM flush to STM failed: %s", e)
 

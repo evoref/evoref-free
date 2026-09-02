@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING
 
 from backend.app_state import AppState
 from backend.free.api.chat.chat_constants import DEFAULT_WORKING_MAX_TOKENS
-from backend.free.api.chat.chat_recorder import clear_session_data, drain_evicted_to_stm
+from backend.free.api.chat.chat_recorder import (
+    accumulate_user_turn,
+    clear_session_data,
+    drain_evicted_to_stm,
+)
 from backend.free.api.chat.chat_types import ChatMessage, FileContextDict
 from backend.free.api.schemas import ChatRequest
 from backend.free.core.intent_vocab import (
@@ -25,8 +29,12 @@ from backend.free.core.intent_vocab import (
     self_output_measure_kinds,
 )
 from backend.free.core.session_mode import is_chat_mode, normalize_session_mode
-from backend.free.core.text_quality import count_response_lines
-from backend.free.core.text_quality import conversational_numeric_claims
+from backend.free.core.text_quality import (
+    SYSTEM_MEASUREMENT_MARKER,
+    conversational_numeric_claims,
+    count_response_lines,
+    strip_system_notes,
+)
 from backend.free.core.inference import build_messages
 from backend.free.core.turn_text import append_to_last_user
 from backend.free.llm.llm_client import LLMClient
@@ -104,6 +112,7 @@ async def prepare_memory_context(
     if not mem_sys:
         logger.debug("Memory not initialized, using single-turn context")
         session_id = req.session_id or "default"
+        accumulate_user_turn(session_id, req.message, private=req.private)
         return [{"role": "user", "content": req.message}], session_id
 
     wm, stm, ltm = mem_sys
@@ -193,6 +202,10 @@ async def prepare_memory_context(
             source="user",
             correction=correction,
         )
+        # 履歴の蓄積バッファにも **ここで** 積む。record_* の末尾だけだと、
+        # 生成が失敗 / タイムアウトしたターンは WM に居るのに履歴には無い。
+        # 冪等なので record_* 側の保険と二重には数えない。
+        accumulate_user_turn(requested_session, req.message, private=req.private)
         history = wm.get_messages()
 
     # 単位はメッセージ数 (user/assistant を各 1 と数える)。往復数ではない —
@@ -862,11 +875,43 @@ def build_chat_messages(
     return messages
 
 
-_QUANTITY_GROUNDING_GUIDANCE = (
-    "\n\n[システム計測] この会話で確定している値: {values}。"
-    "「{quantity}」を使う計算では **この値** を式に入れること。"
-    "直前の回答に出た別の数値で代用しないこと。"
-)
+# ── 注記のロケール辞書 (i18n.prompt_locale 追従) ─────────────────────
+#
+# chat.py の ``_REFERENCE_BLOCK_DIRECTIVES`` と同じ形。以前は日本語固定で、
+# ``prompt_locale: en`` でも計測注記だけ日本語が混ざっていた。マーカー
+# ``[システム計測]`` (``SYSTEM_MEASUREMENT_MARKER``) は両ロケール共通 —
+# ``text_quality.extract_measured_values`` がプロンプトから実測値を読み戻す
+# 契約になっているため、ロケールで変えない。
+
+
+def _prompt_locale() -> str:
+    """``i18n.prompt_locale`` を返す (未知 / 取得失敗は ja)。"""
+    try:
+        from backend.config import get_config
+
+        locale = get_config().get("i18n", {}).get("prompt_locale", "ja")
+    except Exception:
+        locale = "ja"
+    return locale if locale in ("ja", "en") else "ja"
+
+
+def _localized(table: dict[str, str]) -> str:
+    return table.get(_prompt_locale(), table["ja"])
+
+
+_QUANTITY_GROUNDING_GUIDANCE: dict[str, str] = {
+    "ja": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " この会話で確定している値: {values}。"
+        "「{quantity}」を使う計算では **この値** を式に入れること。"
+        "直前の回答に出た別の数値で代用しないこと。"
+    ),
+    "en": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " Value established in this "
+        "conversation: {values}. Use **this value** in any calculation "
+        "involving \"{quantity}\"; do not substitute another number from the "
+        "previous answer."
+    ),
+}
 
 
 def _append_quantity_grounding(
@@ -919,7 +964,7 @@ def _append_quantity_grounding(
     value = next(iter(values))
     if append_to_last_user(
         messages,
-        _QUANTITY_GROUNDING_GUIDANCE.format(
+        _localized(_QUANTITY_GROUNDING_GUIDANCE).format(
             values=f"{label} = {value}", quantity=quantity,
         ),
         separator="",
@@ -930,10 +975,25 @@ def _append_quantity_grounding(
         )
 
 
-_CONVERSATION_MEASUREMENT_GUIDANCE = (
-    "\n\n[システム計測] {values}。"
-    "この数値をそのまま使って答えること。自分で数え直したり概算したりしないこと。"
-)
+_CONVERSATION_MEASUREMENT_GUIDANCE: dict[str, str] = {
+    "ja": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " {values}。"
+        "この数値をそのまま使って答えること。自分で数え直したり概算したりしないこと。"
+    ),
+    "en": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " {values}. "
+        "Use these numbers as they are; do not recount or estimate yourself."
+    ),
+}
+_CONVERSATION_TURN_COUNT_FACT: dict[str, str] = {
+    "ja": "この会話の累計ターン数 (user + assistant) は {n} です",
+    "en": "the total number of turns in this conversation (user + assistant) is {n}",
+}
+_CONVERSATION_TERM_COUNT_FACT: dict[str, str] = {
+    "ja": "この会話の全ターン本文に「{term}」が現れた回数は {n} 回です",
+    "en": "\"{term}\" appears {n} time(s) across every turn of this conversation",
+}
+_MEASUREMENT_JOINER: dict[str, str] = {"ja": "、", "en": "; "}
 
 
 def _append_conversation_measurement(
@@ -951,6 +1011,12 @@ def _append_conversation_measurement(
       同 T08-7。ツールを使わず数を断定した)
 
     真実は ``chat_recorder`` の蓄積バッファにある。数えるのはコードの仕事。
+
+    契約: 蓄積バッファには **進行中の user 発話がすでに積まれている**
+    (``prepare_memory_context`` → ``accumulate_user_turn`` が messages を組む
+    前に走る)。したがってターン数も語の出現回数も現在のターンを含めて数え、
+    ここで ``+1`` などの補正はしない (以前はターン数だけ +1 し、出現回数は
+    現在の発話を含まない、と契約が食い違っていた)。
     """
     if not session_id:
         return
@@ -959,38 +1025,6 @@ def _append_conversation_measurement(
         if msg.get("role") == "user":
             query = str(msg.get("content") or "")
             break
-    quantity = referenced_quantity(query)
-    if not quantity:
-        return
-    claims = conversational_numeric_claims(
-        [(str(m.get("role") or ""), str(m.get("content") or "")) for m in history],
-    )
-    # ラベルは「東京駅と横浜駅の直線距離」のように修飾が付く。参照側は裸の
-    # 「距離」なので、**ラベルが参照語を含む** ものを拾う。
-    matched = {
-        label: values for label, values in claims.items()
-        if quantity in label and len(values) == 1
-    }
-    if not matched:
-        return
-    # 同じ値を指す複数のラベル (接尾辞違い) は 1 件に畳む。
-    values = {next(iter(v)) for v in matched.values()}
-    if len(values) != 1:
-        # 候補が割れているなら黙る — どれを使うべきか決められない。
-        return
-    label = min(matched, key=len)
-    value = next(iter(values))
-    if append_to_last_user(
-        messages,
-        _QUANTITY_GROUNDING_GUIDANCE.format(
-            values=f"{label} = {value}", quantity=quantity,
-        ),
-        separator="",
-    ):
-        logger.info(
-            "Quantity grounding injected: %s = %s (referenced as %s)",
-            label, value, quantity,
-        )
     if not query:
         return
 
@@ -1001,23 +1035,25 @@ def _append_conversation_measurement(
 
     parts: list[str] = []
     if conversation_turn_count_question(query):
-        # 蓄積は「今回の user 発話を記録する前」の状態なので、進行中のターンを
-        # 足して「いま何ターン目か」に合わせる。
         parts.append(
-            f"この会話の累計ターン数 (user + assistant) は "
-            f"{session_turn_count(session_id) + 1} です",
+            _localized(_CONVERSATION_TURN_COUNT_FACT).format(
+                n=session_turn_count(session_id),
+            ),
         )
     term = occurrence_count_term(query)
     if term:
         parts.append(
-            f"この会話の全ターン本文に「{term}」が現れた回数は "
-            f"{count_term_in_session(session_id, term)} 回です",
+            _localized(_CONVERSATION_TERM_COUNT_FACT).format(
+                term=term, n=count_term_in_session(session_id, term),
+            ),
         )
     if not parts:
         return
     if append_to_last_user(
         messages,
-        _CONVERSATION_MEASUREMENT_GUIDANCE.format(values="、".join(parts)),
+        _localized(_CONVERSATION_MEASUREMENT_GUIDANCE).format(
+            values=_localized(_MEASUREMENT_JOINER).join(parts),
+        ),
         separator="",
     ):
         logger.debug("Conversation measurement injected: %s", parts)
@@ -1059,15 +1095,26 @@ def apply_grounding_notes(
 #
 # 「答えるな」ではなく「見えている範囲を答え、見えていない範囲を断定するな」
 # と書く。否定形の禁止だけを書くと退行する実測がある (2026-07-28)。
-_TRUNCATED_HISTORY_GUIDANCE = (
-    "\n\nこの質問は会話全体を見ないと正確に答えられないが、"
-    "この会話の前半 {n} 件のやり取りは文脈の上限を超えたため、"
-    "今のあなたには見えていない。"
-    "見えている範囲について答えたうえで、"
-    "「会話の前半は参照できないため、これより前にもあった可能性がある」"
-    "と明示すること。"
-    "見えていない範囲について「無い」「一度も〜していない」と断定しないこと。"
-)
+_TRUNCATED_HISTORY_GUIDANCE: dict[str, str] = {
+    "ja": (
+        "\n\nこの質問は会話全体を見ないと正確に答えられないが、"
+        "この会話の前半 {n} 件のやり取りは文脈の上限を超えたため、"
+        "今のあなたには見えていない。"
+        "見えている範囲について答えたうえで、"
+        "「会話の前半は参照できないため、これより前にもあった可能性がある」"
+        "と明示すること。"
+        "見えていない範囲について「無い」「一度も〜していない」と断定しないこと。"
+    ),
+    "en": (
+        "\n\nThis question cannot be answered accurately without the whole "
+        "conversation, but the first {n} exchanges of this conversation exceeded "
+        "the context limit and are not visible to you now. Answer for the part "
+        "you can see, then state explicitly that the earlier part of the "
+        "conversation is unavailable and there may have been more before it. "
+        "Do not assert that something \"never happened\" or \"does not exist\" "
+        "in the part you cannot see."
+    ),
+}
 
 
 def _append_truncated_history_note(
@@ -1090,7 +1137,7 @@ def _append_truncated_history_note(
     if not is_whole_session_scope_query(query):
         return
     if append_to_last_user(
-        messages, _TRUNCATED_HISTORY_GUIDANCE.format(n=evicted_turns),
+        messages, _localized(_TRUNCATED_HISTORY_GUIDANCE).format(n=evicted_turns),
         separator="",
     ):
         logger.debug(
@@ -1105,59 +1152,51 @@ def _append_truncated_history_note(
 # ターン33: 実測 633 文字の回答を「488 文字」と回答)。しかもクエリが短いため
 # router が reactive に落とし、ツール判定すら走らない経路だった。ファイルの
 # 文字数を read_file のメタ行で決定論化したのと同じ扱いにする。
-_SELF_OUTPUT_MEASURE_LABELS: dict[str, str] = {
-    "chars": "文字数",
-    "lines": "行数",
-    "words": "単語数",
+#: 計量結果の文面 ({kind: {locale: template}})。単位語 (文字 / 行 / 語) は
+#: ``text_quality._MEASURED_VALUE_RE`` が読み戻す契約なので ja は変えない。
+_SELF_OUTPUT_MEASURE_FORMATS: dict[str, dict[str, str]] = {
+    "chars": {
+        "ja": "文字数 {n} 文字 (空白・改行を除くと {stripped} 文字)",
+        "en": "{n} characters ({stripped} excluding whitespace and line breaks)",
+    },
+    "lines": {"ja": "行数 {n} 行", "en": "{n} lines"},
+    "words": {"ja": "単語数 {n} 語", "en": "{n} words"},
 }
-_SELF_OUTPUT_MEASUREMENT_GUIDANCE = (
-    "\n\n[システム計測] 直前のあなたの回答を機械的に数えた結果: {values}。"
-    "この数値をそのまま使って答えること。自分で数え直したり概算したりしないこと。"
-)
+_SELF_OUTPUT_MEASUREMENT_GUIDANCE: dict[str, str] = {
+    "ja": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " 直前のあなたの回答を機械的に数えた結果: {values}。"
+        "この数値をそのまま使って答えること。自分で数え直したり概算したりしないこと。"
+    ),
+    "en": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " Your previous answer, counted "
+        "mechanically: {values}. Use these numbers as they are; do not recount "
+        "or estimate yourself."
+    ),
+}
 
 
 def _measure_text(text: str, kinds: tuple[str, ...]) -> list[str]:
     """直前出力の計量結果を人間可読な文字列リストにする (純粋関数)。"""
     parts: list[str] = []
     for kind in kinds:
-        label = _SELF_OUTPUT_MEASURE_LABELS[kind]
+        template = _localized(_SELF_OUTPUT_MEASURE_FORMATS[kind])
         if kind == "chars":
             stripped = "".join(text.split())
-            parts.append(
-                f"{label} {len(text)} 文字"
-                f" (空白・改行を除くと {len(stripped)} 文字)",
-            )
+            parts.append(template.format(n=len(text), stripped=len(stripped)))
         elif kind == "lines":
             # 「行」の定義は開示側 (text_quality.count_response_lines) と揃える。
             # splitlines() は空行とシステムの開示注記まで数えるため、両者が
             # 食い違っていた。実測 (2026-08-27 の WS6 検証): 1 行の回答 +
             # 空行 + 注記 を 3 行と数えて渡し、モデルは忠実に「3行でした」と
             # 答えた (ユーザーから見た本文は 1 行)。
-            parts.append(f"{label} {count_response_lines(text)} 行")
+            parts.append(template.format(n=count_response_lines(text)))
         else:
-            parts.append(f"{label} {len(text.split())} 語")
+            parts.append(template.format(n=len(text.split())))
     return parts
 
 
-#: システムが後付けした開示注記。文末の ``(注: …)`` に限る。
-#:
-#: 実インシデント (2026-08-27 ライブ監査 T09): 「登山の魅力をちょうど50文字で」
-#: への回答は本文 45 文字 + 開示注記 34 文字だった。次のターンの「いま書いた
-#: 文章は何文字でしたか。」に **81 文字** と答えている — 45 + 注記。
-#: ユーザーが尋ねているのは本文の長さで、システムが付けた注記ではない。
-_SYSTEM_NOTE_RE = re.compile(r"\n*\s*[（(]注[:：][^）)]*[）)]\s*$")
-
 #: コードフェンス。計量対象を「直近のコード成果物」に絞るときの目印。
 _CODE_FENCE_BLOCK_RE = re.compile(r"```")
-
-
-def _strip_system_notes(text: str) -> str:
-    """システムが後付けした開示注記を落とす (純粋関数)。
-
-    :data:`_SYSTEM_NOTE_RE` の説明を参照。本文中の丸括弧は落とさない —
-    対象は文末の ``(注: …)`` だけ。
-    """
-    return _SYSTEM_NOTE_RE.sub("", text or "").strip()
 
 
 def _measurement_target(history: list[ChatMessage], query: str) -> str:
@@ -1175,7 +1214,8 @@ def _measurement_target(history: list[ChatMessage], query: str) -> str:
 
     クエリがコードを名指ししていれば、コードフェンスを含む直近の assistant
     発話を選ぶ。無ければ従来どおり直前の発話に落ちる (退行しない)。
-    どちらの場合もシステムの開示注記は除く。
+    どちらの場合もシステムの開示注記は除く (``text_quality.strip_system_notes``、
+    記録側 ``chat_recorder._recorded_body`` と同じ関数)。
     """
     assistants = [
         str(m.get("content") or "")
@@ -1186,14 +1226,21 @@ def _measurement_target(history: list[ChatMessage], query: str) -> str:
     if _PRIOR_OUTPUT_CODE_RE.search(query or ""):
         for text in reversed(assistants):
             if _CODE_FENCE_BLOCK_RE.search(text):
-                return _strip_system_notes(text)
-    return _strip_system_notes(assistants[-1])
+                return strip_system_notes(text).strip()
+    return strip_system_notes(assistants[-1]).strip()
 
 
-_USER_TEXT_MEASUREMENT_GUIDANCE = (
-    "\n\n[システム計測] あなたが示した文章を機械的に数えた結果: {values}。"
-    "この数値をそのまま使って答えること。自分で数え直したり概算したりしないこと。"
-)
+_USER_TEXT_MEASUREMENT_GUIDANCE: dict[str, str] = {
+    "ja": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " あなたが示した文章を機械的に数えた結果: {values}。"
+        "この数値をそのまま使って答えること。自分で数え直したり概算したりしないこと。"
+    ),
+    "en": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " The text you provided, counted "
+        "mechanically: {values}. Use these numbers as they are; do not recount "
+        "or estimate yourself."
+    ),
+}
 
 
 def _append_self_output_measurement(
@@ -1215,10 +1262,12 @@ def _append_self_output_measurement(
             query = str(msg.get("content") or "")
             break
     payload, payload_kinds = split_user_text_measurement(query)
+    joiner = _localized(_MEASUREMENT_JOINER)
     if payload and payload_kinds:
-        values = "、".join(_measure_text(payload, payload_kinds))
+        values = joiner.join(_measure_text(payload, payload_kinds))
         if append_to_last_user(
-            messages, _USER_TEXT_MEASUREMENT_GUIDANCE.format(values=values),
+            messages,
+            _localized(_USER_TEXT_MEASUREMENT_GUIDANCE).format(values=values),
             separator="",
         ):
             logger.debug("User-text measurement injected: %s", values)
@@ -1229,9 +1278,10 @@ def _append_self_output_measurement(
     previous = _measurement_target(history, query)
     if not previous.strip():
         return
-    values = "、".join(_measure_text(previous, kinds))
+    values = joiner.join(_measure_text(previous, kinds))
     if append_to_last_user(
-        messages, _SELF_OUTPUT_MEASUREMENT_GUIDANCE.format(values=values),
+        messages,
+        _localized(_SELF_OUTPUT_MEASUREMENT_GUIDANCE).format(values=values),
         separator="",
     ):
         logger.debug("Self-output measurement injected: %s", values)

@@ -66,10 +66,34 @@ from backend.free.memory.attribute_key import (
 from backend.free.memory.notes.subject_ns import is_session_summary_subject
 from backend.free.memory.stores.short_term import MemoryNote
 from backend.free.memory.types import MemoryMode, SemanticFact
+from backend.i18n_helper import prompt_locale
 from backend.log_config import get_logger
 from backend.utils import estimate_tokens
 
 logger = get_logger("memory.injector")
+
+#: 行末 / 行頭に添える固定文 (``i18n.prompt_locale`` 別)。``ja`` が従来出力。
+#: ``note`` の英語ラベル ``(past record)`` は ``inference._normalize_for_frame_dedup``
+#: が [参考情報] との重複判定で剥がすので、変えるときは両方を揃える。
+_RENDER_LABELS: dict[str, dict[str, str]] = {
+    "ja": {
+        "corrected": " (訂正後の記録)",
+        "corrected_aged": " (訂正後の記録・{age}日前)",
+        "aged": " ({age}日前の記録)",
+        "note": "- (過去の記録) {content}",
+    },
+    "en": {
+        "corrected": " (corrected record)",
+        "corrected_aged": " (corrected record, {age} days ago)",
+        "aged": " (recorded {age} days ago)",
+        "note": "- (past record) {content}",
+    },
+}
+
+
+def _render_labels() -> dict[str, str]:
+    """prompt_locale に応じたラベル辞書 (未知 locale は ja)。"""
+    return _RENDER_LABELS.get(prompt_locale(), _RENDER_LABELS["ja"])
 
 # ──────────────────────────────────────────────────────────────────────────
 # 定数
@@ -1384,19 +1408,20 @@ class MemoryInjector:
         """
         age = self._fact_age_days(fact)
         corrected = bool(getattr(fact, "from_correction", False))
+        labels = _render_labels()
         if age is None or age < _FACT_STALE_LABEL_DAYS:
             if corrected:
                 # 同じ日に古い値と並ぶと、下の「N日前の記録」も付かないため
                 # どちらが現在値かを示す手掛かりが行に無くなる。
                 return (
                     f"- ({fact.type}) {fact.subject} {fact.predicate}:"
-                    f" {fact.text} (訂正後の記録)"
+                    f" {fact.text}{labels['corrected']}"
                 )
             return f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.text}"
         if corrected:
             return (
                 f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.text}"
-                f" (訂正後の記録・{int(age)}日前)"
+                f"{labels['corrected_aged'].format(age=int(age))}"
             )
         # 何日前の記録かを行ごとに書く。ノート側 (_render_note の (過去の記録))
         # と同じ理由で、ブロック先頭の注意書きは数百トークン離れると効かない。
@@ -1408,7 +1433,7 @@ class MemoryInjector:
         # 話かを示す情報が行に無かった**ため、古い方がそのまま回答になった。
         return (
             f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.text}"
-            f" ({int(age)}日前の記録)"
+            f"{labels['aged'].format(age=int(age))}"
         )
 
     def _fact_age_days(self, fact: SemanticFact) -> float | None:
@@ -1617,7 +1642,7 @@ class MemoryInjector:
         する (実インシデント 2026-07-27 ライブ検証)。行ごとに過去の記録である
         ことを示す。
         """
-        return f"- (過去の記録) {note.content}"
+        return _render_labels()["note"].format(content=note.content)
 
     # ── パッキング ───────────────────────────────────────────────────
 

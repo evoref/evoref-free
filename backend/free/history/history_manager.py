@@ -560,6 +560,31 @@ class HistoryManager:
 
         return entries[offset:offset + limit], total
 
+    def get_summary(self, session_id: str) -> str | None:
+        """索引上の要約を返す (未登録 / 未要約なら ``None``)。
+
+        毎ターンの自動保存が sleep-time の要約を消さないよう、保存側は
+        これで既存要約を引き継ぐ (``_load_index`` を外から触らせない)。
+        """
+        entry = self._find_entry(session_id)
+        return entry.summary if entry is not None else None
+
+    def get_session_started_at(self, session_id: str) -> str | None:
+        """索引上の開始時刻 (ISO 8601) を返す。未登録なら ``None``。
+
+        保存先ファイル名は開始時刻から決まる。プロセス再起動後に同じ
+        セッションが続くと、in-process の開始時刻が失われて別ファイルが
+        できる — 保存側はまずこれで既存の開始時刻を引き継ぐ。
+        """
+        entry = self._find_entry(session_id)
+        return entry.started_at if entry is not None and entry.started_at else None
+
+    def _find_entry(self, session_id: str) -> IndexEntry | None:
+        index = self._load_index()
+        return next(
+            (e for e in index.sessions if e.session_id == session_id), None,
+        )
+
     def get_session(self, session_id: str) -> SessionData | None:
         """セッション詳細を取得"""
         index = self._load_index()
@@ -928,6 +953,7 @@ class HistoryManager:
                 except Exception as e:
                     logger.warning("Failed to index %s: %s", session_file, e)
 
+        index.sessions = _dedupe_by_session_id(index.sessions)
         index.total_sessions = len(index.sessions)
         index.total_turns = sum(e.turn_count for e in index.sessions)
         index.total_size_mb = sum(e.size_bytes for e in index.sessions) / (1024 * 1024)
@@ -991,6 +1017,23 @@ class HistoryManager:
                 logger.warning("Failed to delete %s: %s", filepath, e)
 
         return len(to_delete)
+
+
+def _dedupe_by_session_id(entries: list[IndexEntry]) -> list[IndexEntry]:
+    """同じ ``session_id`` のエントリは 1 件 (最新) に畳む。
+
+    再起動を跨いで続いたセッションが 2 ファイルに割れていた履歴に対し、
+    索引が両方を載せると一覧で同じ会話が 2 回並ぶ。ターン数が多い方 →
+    開始時刻が新しい方を残す。
+    """
+    best: dict[str, IndexEntry] = {}
+    for e in entries:
+        cur = best.get(e.session_id)
+        if cur is None or (e.turn_count, e.started_at) > (
+            cur.turn_count, cur.started_at,
+        ):
+            best[e.session_id] = e
+    return [e for e in entries if best.get(e.session_id) is e]
 
 
 def _now_iso() -> str:
