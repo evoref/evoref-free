@@ -36,11 +36,13 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from backend.free.memory.sleep._curator_common import (
+    public_notes,
     subject_digest,
     truncate_for_prompt,
 )
 from backend.free.core.session_mode import normalize_session_mode
-from backend.free.memory.types import SemanticFact, make_fact
+from backend.free.memory.note_facts import fact_from_note
+from backend.free.memory.types import SemanticFact
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -197,6 +199,9 @@ async def curate_executable_command_facts(
         return 0
     history_size = int(cfg.get("executable_command_recall_record_history_size", 10))
 
+    # private セッション由来のノートは SemMem へ昇格させない。
+    # (``_curator_common.public_notes`` の docstring に実害と経緯)
+    notes = public_notes(notes)
     pairs = _iter_command_pairs(notes)
     if not pairs:
         return 0
@@ -280,7 +285,8 @@ async def curate_executable_command_facts(
                     "last_query": topic,
                     "last_executed_at": now,
                 }
-                fact = make_fact(
+                fact = fact_from_note(
+                    assistant_note,
                     subject=subject,
                     predicate="answers_query",
                     object_=topic,

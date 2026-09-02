@@ -128,8 +128,12 @@ async def backfill_fact_embeddings(
                 try:
                     # touch=False — 保守処理はアクセスではない。accessed_at を
                     # 更新すると recency スコアと GC 判定が一斉に歪む。
+                    #
+                    # flush_embedding=False — 1 件ごとに vectors.npy を全書き
+                    # 出しすると 1 サイクル最大 200 件で 200 回の全書き出しに
+                    # なる。バッチ末尾で 1 回だけ flush する。
                     store.update_fact(
-                        fact.id, touch=False,
+                        fact.id, touch=False, flush_embedding=False,
                         embedding=np.asarray(vec, dtype=np.float32),
                     )
                     embedded += 1
@@ -138,6 +142,13 @@ async def backfill_fact_embeddings(
                         "Step 8.8: failed to persist embedding for %s: %s",
                         fact.id, exc,
                     )
+            try:
+                store.flush_embeddings()
+            except Exception as exc:
+                # 落ちても次サイクルで embedding=None の分が再挑戦される。
+                logger.warning(
+                    "Step 8.8: failed to flush embeddings in %s: %s", scope, exc,
+                )
 
     if embedded:
         logger.info("Step 8.8: backfilled embeddings for %d fact(s)", embedded)

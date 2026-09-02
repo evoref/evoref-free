@@ -8,6 +8,7 @@
     python scripts/evorefmem_cli.py init                             # 初期化 (init_evorefmem 委譲)
     python scripts/evorefmem_cli.py inspect [--scope SCOPE] [--json] # 統計表示
     python scripts/evorefmem_cli.py verify  [--scope SCOPE] [--json] # 整合性検査
+    python scripts/evorefmem_cli.py purge-private [--all-curated] [--apply]  # private 由来の索引を掃除
     python scripts/evorefmem_cli.py compact [--apply] [--scope S]    # facts.jsonl 圧縮
     python scripts/evorefmem_cli.py rebuild-indices [--apply]        # .idx 再生成
     python scripts/evorefmem_cli.py migrate [--to V] [--apply] [--list]
@@ -16,7 +17,7 @@
     python scripts/evorefmem_cli.py import PATH [--apply]             # リストア
 
 破壊的操作 (``migrate`` / ``compact`` / ``rebuild-indices`` / ``import`` /
-``migrate-embedding``) はデフォルトで dry-run。``--apply`` で実行する。
+``migrate-embedding`` / ``purge-private``) はデフォルトで dry-run。``--apply`` で実行する。
 
 多重起動防止のため ``local/.evorefmem_cli.lock`` を PID で占有する。
 """
@@ -71,6 +72,9 @@ from backend.free.memory.semantic.cli.migrate_embedding_cmd import (  # noqa: E4
 from backend.free.memory.semantic.cli.reembed_facts_cmd import (  # noqa: E402
     format_report_text as _reembed_fmt,
     run_reembed_facts,
+)
+from backend.free.memory.semantic.cli.purge_private_cmd import (  # noqa: E402
+    run_purge_private,
 )
 from backend.free.memory.semantic.cli.rebuild_indices_cmd import (  # noqa: E402
     format_report_text as _rebuild_fmt,
@@ -131,6 +135,50 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     else:
         print(_verify_fmt(report))
     return report.exit_code()
+
+
+def _cmd_purge_private(args: argparse.Namespace) -> int:
+    paths = resolve_cli_paths()
+    report = run_purge_private(
+        paths.memory_dir,
+        paths.migration_archive_dir,
+        apply=args.apply,
+        all_curated=args.all_curated,
+        scope_filter=args.scope,
+        since=args.since,
+        until=args.until,
+        sessions=args.session or None,
+    )
+    if args.json:
+        print(report.to_json())
+    else:
+        print(_purge_private_fmt(report))
+    return 0
+
+
+def _purge_private_fmt(report) -> str:
+    lines = [
+        f"memory_dir: {report.memory_dir}",
+        f"mode      : {report.mode}"
+        + ("" if report.notes_available else "  (STM ノート未読込: 厳密照合は無効)"),
+        f"candidates: {len(report.candidates)}",
+    ]
+    by_reason: dict[str, int] = {}
+    for c in report.candidates:
+        by_reason[c.reason] = by_reason.get(c.reason, 0) + 1
+    for reason, count in sorted(by_reason.items()):
+        lines.append(f"  - {reason}: {count}")
+    for c in report.candidates[:20]:
+        lines.append(f"    [{c.reason}] {c.scope} {c.subject}  {c.object_preview!r}")
+    if len(report.candidates) > 20:
+        lines.append(f"    ... (他 {len(report.candidates) - 20} 件)")
+    if report.applied:
+        lines.append(f"deleted   : {report.deleted}")
+        lines.append(f"notes 再生成待ちへ戻した: {report.notes_unmarked}")
+        lines.append(f"backup    : {report.backup_path}")
+    else:
+        lines.append("(dry-run: 削除するには --apply を付ける)")
+    return "\n".join(lines)
 
 
 def _cmd_compact(args: argparse.Namespace) -> int:
@@ -391,6 +439,42 @@ def _build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("verify", help="整合性を検査する (副作用なし)")
     sp.add_argument("--scope", default=None, help="特定 scope に限定")
     sp.set_defaults(func=_cmd_verify)
+
+    # compact
+    # purge-private
+    sp = sub.add_parser(
+        "purge-private",
+        help=(
+            "private セッション由来のキュレーターファクトを掃除する "
+            "(デフォルト dry-run)"
+        ),
+    )
+    sp.add_argument("--scope", default=None, help="特定 scope に限定")
+    sp.add_argument(
+        "--all-curated", action="store_true",
+        help=(
+            "mem.world.{assertion,executable_command,url}.* を丸ごと候補にする。"
+            "取りこぼしゼロだが正当な索引も一度消える (ノートのマーカーを戻すので"
+            "次の Full で再生成される。失うのは exec_count 等の統計のみ)"
+        ),
+    )
+    sp.add_argument(
+        "--since", type=float, default=None,
+        help="created_at がこの epoch 秒以降のものを候補にする",
+    )
+    sp.add_argument(
+        "--until", type=float, default=None,
+        help="created_at がこの epoch 秒以前のものを候補にする",
+    )
+    sp.add_argument(
+        "--session", action="append", default=[],
+        help="この session_id 由来のものを候補にする (複数指定可)",
+    )
+    sp.add_argument(
+        "--apply", action="store_true",
+        help="実際に削除する (未指定時は dry-run)",
+    )
+    sp.set_defaults(func=_cmd_purge_private)
 
     # compact
     sp = sub.add_parser(

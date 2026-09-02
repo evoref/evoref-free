@@ -4,11 +4,29 @@ EvorefMem pillar の内部で全 :class:`~backend.free.memory.types.FactType` �
 対するフルアクセスを提供する Fact View。Mem 所有 FactType に対する
 **sanctioned な書込/読取 API** を定義する。
 
-注: Mem 内部の sleep-time worker / conflict resolver / GC / Step 9 promotion は
-現状 :class:`~backend.free.memory.semantic.store.SemanticFactStore` を直接
-操作している (Mem 内部の store 直参照は pillar boundary test で許容)。本 View の
-高レベル API は将来それらを集約する受け皿であり、現時点で全メソッドが production
-から呼ばれているわけではない (越境 reader の入口としての利用が主)。
+## この View は何の検証点か
+
+**Mem 内部の書込はここを通っていない。** sleep-time worker / 3 curator /
+conflict resolver / GC / Step 9 promotion はいずれも
+:class:`~backend.free.memory.semantic.store.SemanticFactStore` を直接操作する
+(Mem 内部の store 直参照は pillar boundary test で許容)。つまり
+``FACT_OWNERSHIP`` の強制が実際に効いているのは **loop / learn の書込** と、
+**mem pillar の外から来る書込** だけ。
+
+設計書を読んで「ownership が全書込に効いている」と誤解しないこと — それが
+この構造の一番のコストだった (2026-09-01 監査 F11)。
+
+現時点で production から呼ばれるのは:
+
+- :meth:`search_by_embedding` — ``ToolCallJudge`` の URL / コマンドリコール。
+- :meth:`add_fact` — ``POST /api/memory/pin`` (API 層は mem pillar の外なので
+  必ずここを通す。2026-09-01 に store 直呼びから付け替えた)。
+
+残りは Mem 内部が store 直参照で済ませているぶんの受け皿で、**新しく mem の
+外から SemMem を触る経路を足すときはここを入口にする**。自己申告の
+placeholder だった ``promote_episodic_to_semantic`` は実体
+(:mod:`backend.free.memory.sleep.promotion`) が別に作られたまま置換されな
+かったため削除した。
 
 ## スコープ
 
@@ -280,47 +298,18 @@ class MemFactView(FactViewBase):
         self._assert_write(fact_type)
         from backend.free.memory.semantic.gc import select_gc_candidates
 
-        target = self._store.search_by_type(fact_type, include_superseded=True)
+        # ``select_gc_candidates`` は active 集合に対する上限として働く契約
+        # (docstring 参照) なので、supersede 済みは渡さない。渡しても内部で
+        # 落とされるが、``sleep.gc.run_semmem_gc`` と条件が食い違っていた。
+        target = self._store.search_by_type(fact_type, include_superseded=False)
         candidates = select_gc_candidates(target, max_count=max_count)
-        deleted = 0
-        for fid in candidates:
-            if self._store.delete_fact(fid):
-                deleted += 1
-        return deleted
-
-    def promote_episodic_to_semantic(
-        self,
-        *,
-        facts: list[SemanticFact],
-    ) -> list[SemanticFact]:
-        """エピソディック (STM 由来) を意味記憶に昇格する (Step 9 相当の placeholder)。
-
-        シンプル実装として、``decision`` / ``commitment``
-        ファクトを ``add_fact`` で追加するだけ
-        ``sleep_update.py`` の Step 9 promotion ロジックが専用 module
-        (``memory/promotion.py``) に分離され、本メソッドが本実装を呼び出す形に
-        置換される予定。
-
-        Args:
-            facts: 昇格対象のファクト群 (``decision`` / ``commitment`` のみ許容)。
-
-        Returns:
-            永続化された :class:`SemanticFact` のリスト。
-
-        Raises:
-            ValueError: 許容外の ``fact.type`` が含まれる。
-            WriteOwnershipError: owner が Mem でない type が含まれる。
-        """
-        allowed: set[str] = {"decision", "commitment"}
-        for fact in facts:
-            if fact.type not in allowed:
-                raise ValueError(
-                    "promote_episodic_to_semantic only supports "
-                    f"{sorted(allowed)!r}: got {fact.type!r}",
-                )
-            self._assert_write(fact.type)
-            self._assert_subject_owner(fact.subject)
-        return [self._store.add_fact(fact) for fact in facts]
+        if not candidates:
+            return 0
+        delete_many = getattr(self._store, "delete_facts", None)
+        if callable(delete_many):
+            return int(delete_many(candidates))
+        # Protocol 実装 (Pro の差し替え等) が一括版を持たない場合の縮退。
+        return sum(1 for fid in candidates if self._store.delete_fact(fid))
 
 
 __all__ = ["MemFactView"]

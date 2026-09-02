@@ -49,7 +49,8 @@ from backend.free.core.text_quality import (
 )
 from backend.free.llm.json_schemas import AssertionNaming
 from backend.free.memory.corrections import correction_target
-from backend.free.memory.types import make_fact
+from backend.free.memory.note_facts import fact_from_note
+from backend.free.memory.sleep._curator_common import public_notes
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -307,6 +308,10 @@ async def curate_assertion_facts(
 
         builder = ChatNoteBuilder()
 
+    # private セッション由来のノートは SemMem へ昇格させない。
+    # (``_curator_common.public_notes`` の docstring に実害と経緯)
+    notes = public_notes(notes)
+
     candidates = [
         n for n in notes
         if _is_curatable(n, builder)
@@ -357,7 +362,8 @@ async def curate_assertion_facts(
         try:
             embedding = await embedder.embed([obj], is_query=False)
             vec = embedding[0] if len(embedding) else None
-            fact = make_fact(
+            fact = fact_from_note(
+                note,
                 subject=f"mem.world.{_SUBJECT_PREFIX}.{slug}",
                 predicate="is",
                 object_=obj,

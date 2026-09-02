@@ -35,6 +35,12 @@ from backend.free.memory.pipeline.stats_calculator import (
     compute_ltm_stats,
     compute_stm_stats,
 )
+from backend.free.memory.ownership import FACT_OWNERSHIP
+from backend.free.memory.views.base import (
+    SubjectNamespaceError,
+    WriteOwnershipError,
+)
+from backend.free.memory.views.mem import MemFactView
 from backend.free.memory.types import FactType, SemanticFact, make_fact
 from backend.log_config import get_logger
 
@@ -47,7 +53,22 @@ router = APIRouter(prefix="/api/memory", tags=["memory"])
 # FactType Literal と同期
 # FactType Literal から直接導出して set のドリフトを防ぐ
 # (旧ハードコードは learned_failure_pattern を取りこぼしていた)。
-_ALLOWED_FACT_TYPES: frozenset[str] = frozenset(get_args(FactType))
+_KNOWN_FACT_TYPES: frozenset[str] = frozenset(get_args(FactType))
+
+#: 本 API から **新規作成** できる FactType。mem pillar が owner のものだけ。
+#:
+#: 以前は ``_KNOWN_FACT_TYPES`` (= 全 FactType) をそのまま受け、しかも
+#: ``MemFactView`` を経由せず ``store.add_fact()`` を直接呼んでいたため、
+#: ``type: "policy"`` (learn 所有) や ``subject: "loop.task.x"`` が素通りした
+#: (2026-09-01 監査で再現)。docs/f_02_memory_system.md §12 の禁則 3 / 4 が
+#: この 1 経路だけ効いていなかった。混入した learn 相当のファクトは
+#: PolicyInterpreter / HarnessFactView の読み出しに乗りうる。
+#:
+#: 検証の本体は :class:`MemFactView` (``_assert_write`` / ``_assert_subject_owner``)
+#: に委ねる。ここは 400 と 403 を区別するための事前チェックにすぎない。
+_ALLOWED_FACT_TYPES: frozenset[str] = frozenset(
+    t for t in _KNOWN_FACT_TYPES if FACT_OWNERSHIP[t].owner == "mem"  # type: ignore[index]
+)
 
 
 def _resolve_store(state: AppState, scope: str) -> SemanticFactStore:
@@ -266,8 +287,18 @@ async def pin_memory(
     logger.debug("POST /api/memory/pin: scope=%s id=%s", req.scope, req.fact_id)
     store = _resolve_store(state, req.scope)
 
-    if req.type not in _ALLOWED_FACT_TYPES:
+    if req.type not in _KNOWN_FACT_TYPES:
         raise HTTPException(status_code=400, detail=f"unknown type: {req.type}")
+    if req.type not in _ALLOWED_FACT_TYPES:
+        # loop / learn 所有の型はこの API から作れない (owner pillar が書く)。
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"fact type {req.type!r} is owned by pillar "
+                f"{FACT_OWNERSHIP[req.type].owner!r}; "  # type: ignore[index]
+                "the memory API can only create mem-owned facts"
+            ),
+        )
     if not is_valid_session_mode(req.mode_origin):
         raise HTTPException(
             status_code=400, detail=f"unknown mode_origin: {req.mode_origin}",
@@ -305,7 +336,15 @@ async def pin_memory(
         mode_origin=req.mode_origin,  # type: ignore[arg-type]
         confidence=1.0,
     )
-    added = store.add_fact(new_fact)
+    # 書込は MemFactView 経由 — ownership と subject namespace の検証点は
+    # View にしかない。以前はここが store 直呼びで、``type: "policy"`` +
+    # ``subject: "loop.task.x"`` が検証なしに書き込めた (2026-09-01 監査)。
+    try:
+        added = MemFactView(store).add_fact(new_fact)
+    except WriteOwnershipError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except SubjectNamespaceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     pinned = pin_fact(store, added.id, lock_duration_s=req.lock_duration_s)
     return PinFactResponse(fact=_to_pinned_info(pinned))
 

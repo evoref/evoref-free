@@ -169,6 +169,15 @@ class SemanticFactStore:
         self._by_type: dict[str, set[str]] = {}
         self._by_pillar: dict[str, set[str]] = {}
         self._pinned: set[str] = set()
+        #: ``_break_supersede_cycles`` が在メモリで live へ戻した fact id。
+        #: ``_load`` 完了後に :meth:`_persist_cycle_repairs` がディスクへ落とす。
+        self._pending_cycle_repairs: list[str] = []
+        #: 書込のたびに +1 する世代番号。呼出側が派生物 (live リスト /
+        #: note_id の写像 / ベクトル行列) をキャッシュしてよいかの判定に使う。
+        #: ストアはプロセス常駐で、チャット 1 ターンあたり ``all_facts()`` が
+        #: scope ごとに 4〜6 回呼ばれる (注入 / 競合表示 / 競合検出 / retired
+        #: 判定)。sleep-time の書込で自然に無効化される。
+        self._revision: int = 0
         # model_id 別ディレクトリで管理する。
         self._embedding_store: EmbeddingStore = self._init_embedding_store()
         # M5-c1: 統合索引 index.jsonl の dual write 用 updater。
@@ -186,6 +195,9 @@ class SemanticFactStore:
         self._index_dual_write_enabled = False
         self._load()
         self._index_dual_write_enabled = True
+        # 起動時に在メモリで解いた閉路をディスクへも落とす。dual write が
+        # 有効になってから (= _load 完了後) でないと index.jsonl に載らない。
+        self._persist_cycle_repairs()
         # index.jsonl を facts.jsonl (source of truth) と突合して自己修復する。
         # 新規ストア (index.jsonl 未生成) や前回 shutdown での pending 喪失を、
         # SCHEMA_VERSION の bump 無しに毎起動で埋める。
@@ -280,8 +292,40 @@ class SemanticFactStore:
                     # last-write-wins on id
                     self._facts[fact.id] = fact
         self._break_supersede_cycles()
+        self._hydrate_embeddings()
         self._rebuild_indexes()
-        # 埋め込みは EmbeddingStore 側で既にロード済 (__init__ 内)。
+
+    def _hydrate_embeddings(self) -> int:
+        """``fact.embedding`` を EmbeddingStore (vectors.npy) から埋める。
+
+        ベクトルの正は ``embeddings/<model_id>/vectors.npy``。``facts.jsonl``
+        へ JSON 配列として二重に書くのをやめた
+        (:func:`~backend.free.memory.types.serialize_fact_jsonl`) ため、
+        読み戻し側でここから戻す。消費側 (``MemoryInjector._is_relevant`` /
+        ``split_by_attribute_similarity``) は ``fact.embedding`` を見るので、
+        この 1 箇所で hydrate すれば上位は無改造で動く。
+
+        旧形式の行 (embedding 入り) を読んだ場合は既に値が入っているので
+        触らない — npy 側が正だが、両者は書き込み時点で同じ値になっている
+        (実測: only_inline=0 / only_npy=0 / value_diff=0)。
+
+        Returns:
+            埋め込みを復元したファクト数。
+        """
+        restored = 0
+        for fact in self._facts.values():
+            if fact.embedding is not None:
+                continue
+            vec = self._embedding_store.get(fact.id)
+            if vec is not None:
+                fact.embedding = vec
+                restored += 1
+        if restored:
+            logger.debug(
+                "hydrated %d fact embedding(s) from %s at %s",
+                restored, self._embedding_store.model_id, self.root_dir,
+            )
+        return restored
 
     def _break_supersede_cycles(self) -> int:
         """``superseded_by`` の閉路を解いて live を 1 件戻す (起動時の自己修復)。
@@ -327,13 +371,49 @@ class SemanticFactStore:
                     getattr(self._facts[fid], "created_at", 0.0) or 0.0,
                 ),
             )
-            # ロード中なので在メモリだけ直す (``update_fact`` は追記を伴う)。
-            # 次にこのファクトが更新されたときにディスクへも落ちる。
+            # ロード中は在メモリだけ直し (``update_fact`` は追記を伴う)、
+            # ``__init__`` の :meth:`_persist_cycle_repairs` でディスクへ落とす。
             self._facts[newest].superseded_by = None
+            self._pending_cycle_repairs.append(newest)
             repaired += 1
             logger.warning(
                 "Repaired supersede cycle %s: restored %s as the live value",
                 " -> ".join(ring), newest,
+            )
+        return repaired
+
+    def _persist_cycle_repairs(self) -> int:
+        """:meth:`_break_supersede_cycles` の修復をディスクへ書き戻す。
+
+        以前は「次にこのファクトが更新されたときにディスクへも落ちる」として
+        在メモリだけ直していたが、**訂正が終わった属性は普通もう更新されない**。
+        結果、毎起動で同じ WARNING が出続け、``facts.jsonl`` は壊れたまま残る。
+
+        実運用で効くのは、外部ツール (``evorefmem_cli inspect`` / ``verify``、
+        export したバックアップ) が見るのが **ディスク上の壊れた状態** だと
+        いう点。復旧手順を書く側と実行時の挙動が食い違う。
+
+        ``touch=False`` で ``accessed_at`` を汚さない — 自己修復はアクセス
+        ではない (``sleep.fact_embedding`` の遡及生成と同じ判断)。
+        """
+        if not self._pending_cycle_repairs:
+            return 0
+        repaired = 0
+        for fact_id in self._pending_cycle_repairs:
+            try:
+                self.update_fact(fact_id, touch=False, superseded_by=None)
+                repaired += 1
+            except (KeyError, ValueError, OSError) as exc:
+                # 書き戻せなくても在メモリの修復は生きている (縮退)。
+                logger.warning(
+                    "Failed to persist supersede cycle repair for %s: %s",
+                    fact_id, exc,
+                )
+        self._pending_cycle_repairs.clear()
+        if repaired:
+            logger.info(
+                "Persisted %d supersede cycle repair(s) at %s",
+                repaired, self.root_dir,
             )
         return repaired
 
@@ -423,9 +503,28 @@ class SemanticFactStore:
                 "(facts=%d)", self.root_dir, len(self._facts),
             )
 
-    def _upsert_embedding(self, fact_id: str, vec: np.ndarray) -> None:
+    def _upsert_embedding(
+        self, fact_id: str, vec: np.ndarray, *, flush: bool = True,
+    ) -> None:
         """EmbeddingStore に委譲する薄いラッパ (内部 API の見掛け互換用)."""
-        self._embedding_store.upsert(fact_id, vec)
+        self._embedding_store.upsert(fact_id, vec, flush=flush)
+
+    def flush_embeddings(self) -> None:
+        """``defer_embedding_writes`` で溜めたベクトルを永続化する。"""
+        self._embedding_store.flush()
+
+    def embedding_scores(self, query: np.ndarray) -> dict[str, float]:
+        """クエリに対する全ファクトの cosine similarity を返す。
+
+        注入の関連度ゲート用。ゲートは順位ではなく閾値しか見ないので、
+        :meth:`search_by_embedding` のような並べ替えは要らない。行列は
+        ``EmbeddingStore`` に常駐しているため、候補ごとに正規化し直すより
+        桁で速い (:meth:`EmbeddingStore.score_all` の実測を参照)。
+
+        埋め込みを持たないファクトはキーに現れない (呼出側は従来どおり
+        「判定不能なので通す」の分岐へ落ちる)。
+        """
+        return self._embedding_store.score_all(query)
 
     # ── CRUD ──────────────────────────────────────────────────────────
 
@@ -449,6 +548,7 @@ class SemanticFactStore:
         self._facts[fact.id] = fact
         self._add_to_indexes(fact)
         self._append_fact_line(fact)
+        self._revision += 1
         if fact.embedding is not None:
             self._upsert_embedding(fact.id, fact.embedding)
         logger.debug(
@@ -462,7 +562,12 @@ class SemanticFactStore:
         return self._facts.get(fact_id)
 
     def update_fact(
-        self, fact_id: str, *, touch: bool = True, **changes: Any,
+        self,
+        fact_id: str,
+        *,
+        touch: bool = True,
+        flush_embedding: bool = True,
+        **changes: Any,
     ) -> SemanticFact:
         """既存ファクトのフィールドを差分更新する。
 
@@ -475,6 +580,11 @@ class SemanticFactStore:
             touch: ``accessed_at`` を現在時刻へ更新するか。既定 True。
                 埋め込みの遡及生成のような **保守処理はアクセスではない** ため、
                 False を渡して recency スコアと GC 判定を歪めないようにする。
+            flush_embedding: ``embedding`` を含む更新で ``vectors.npy`` を
+                即座に書き出すか。バッチで埋める呼出側 (Step 8.8 は 1 サイクル
+                最大 200 件) は ``False`` を渡し、末尾で
+                :meth:`flush_embeddings` を 1 回呼ぶ。1 件ごとに保存すると
+                **全配列を毎回ディスクへ書き出す**。
         """
         fact = self._facts.get(fact_id)
         if fact is None:
@@ -492,12 +602,15 @@ class SemanticFactStore:
             fact.accessed_at = time.time()
         self._add_to_indexes(fact)
         self._append_fact_line(fact)
+        self._revision += 1
         if "embedding" in changes:
             # embedding を明示的に None へクリアした場合は EmbeddingStore からも
             # 除去する。さもないと vectors.npy に stale ベクトルが残り、
             # search_by_embedding が更新後も古いベクトルでヒットし続ける。
             if fact.embedding is not None:
-                self._upsert_embedding(fact.id, fact.embedding)
+                self._upsert_embedding(
+                    fact.id, fact.embedding, flush=flush_embedding,
+                )
             else:
                 self._remove_embedding(fact.id)
         logger.debug("update_fact: id=%s changes=%s", fact_id, sorted(changes.keys()))
@@ -516,31 +629,68 @@ class SemanticFactStore:
         supersede 済を除外するので、そのスロットは live 0 件になり、閉路のとき
         と同じ「現在値が引けない」壊れ方をする。参照を外して live へ戻す。
 
+        複数件を消すときは :meth:`delete_facts` を使うこと (rewrite と
+        npy 書き出しが件数分走らない)。
+
         Returns:
             実際に削除された場合 ``True``、未存在の場合 ``False``。
         """
-        fact = self._facts.pop(fact_id, None)
-        if fact is None:
-            return False
-        self._remove_from_indexes(fact)
-        self._remove_embedding(fact_id)
-        self._clear_dangling_supersession(fact_id)
-        self._rewrite_facts_log()
-        logger.debug("delete_fact: id=%s subject=%s", fact_id, fact.subject)
-        return True
+        return self.delete_facts([fact_id]) == 1
 
-    def _clear_dangling_supersession(self, removed_id: str) -> None:
-        """削除された ``removed_id`` を指す supersession 参照を取り除く。"""
+    def delete_facts(self, fact_ids: Iterable[str]) -> int:
+        """複数ファクトをまとめて物理削除する。
+
+        :meth:`delete_fact` を件数分回すと、1 件ごとに
+
+        - ``facts.jsonl`` 全行の rewrite (実測 58.8ms / 94 件・3.03MB のストア)
+        - ``vectors.npy`` の全書き出しと ``_id_to_row`` の全再構築
+        - dangling supersession 解決の全ファクト走査
+
+        が走る (M 件で O(N*M) + M 回の全書き出し)。Step 9 GC は候補を
+        1 件ずつ ``delete_fact`` していたため、100 件削除で約 6 秒・数百 MB の
+        書き込みになっていた。しかも ``_step9_run_semmem_gc`` は同期関数で
+        ``run_full`` から直接呼ばれる = **イベントループを占有する**。
+
+        ここでは 3 つの後始末をそれぞれ 1 回にまとめる。
+
+        Returns:
+            実際に削除された件数 (未存在の id は数えない)。
+        """
+        removed: list[SemanticFact] = []
+        for fact_id in fact_ids:
+            fact = self._facts.pop(fact_id, None)
+            if fact is None:
+                continue
+            removed.append(fact)
+            self._remove_from_indexes(fact)
+        if not removed:
+            return 0
+        removed_ids = {f.id for f in removed}
+        self._embedding_store.delete_many(removed_ids)
+        self._clear_dangling_supersession(removed_ids)
+        self._rewrite_facts_log()
+        self._revision += 1
+        logger.debug(
+            "delete_facts: removed %d fact(s) (first=%s)",
+            len(removed), removed[0].id,
+        )
+        return len(removed)
+
+    def _clear_dangling_supersession(self, removed_ids: set[str]) -> None:
+        """削除された ``removed_ids`` を指す supersession 参照を取り除く。
+
+        残ったファクトを 1 度だけ走査する (削除 1 件ごとに全走査しない)。
+        """
         for other in self._facts.values():
-            if other.superseded_by == removed_id:
-                other.superseded_by = None
+            if other.superseded_by in removed_ids:
                 logger.info(
-                    "delete_fact: restored %s as live (its superseder %s was "
-                    "deleted)", other.id, removed_id,
+                    "delete_facts: restored %s as live (its superseder %s was "
+                    "deleted)", other.id, other.superseded_by,
                 )
-            if removed_id in other.supersedes:
+                other.superseded_by = None
+            if any(s in removed_ids for s in other.supersedes):
                 other.supersedes = [
-                    s for s in other.supersedes if s != removed_id
+                    s for s in other.supersedes if s not in removed_ids
                 ]
 
     def _remove_embedding(self, fact_id: str) -> None:
@@ -748,11 +898,26 @@ class SemanticFactStore:
             (fact, score) のリスト。score は cosine similarity (-1.0〜1.0)。
         """
         # EmbeddingStore は fact filter を知らないため、superseded 除外 /
-        # 存在チェックの分だけ多めに引いて top_k を満たす。
+        # 存在チェックで落ちる分だけ多めに引く。以前は無条件に **全件**
+        # (``top_k=store_count``) を要求しており、``search`` が常に全件
+        # ``argsort`` を払っていた。落ちうる件数は数えられるので、その分だけ
+        # 上乗せすれば足りる (足りなければ全件へフォールバック)。
         store_count = self._embedding_store.count
         if store_count == 0:
             return []
-        raw = self._embedding_store.search(query, top_k=store_count)
+        skippable = 0
+        if not include_superseded:
+            skippable = sum(
+                1 for fid in self._embedding_store.row_to_id
+                if (f := self._facts.get(fid)) is None or f.superseded_by
+            )
+        else:
+            skippable = sum(
+                1 for fid in self._embedding_store.row_to_id
+                if fid not in self._facts
+            )
+        fetch_k = min(store_count, max(1, top_k) + skippable)
+        raw = self._embedding_store.search(query, top_k=fetch_k)
         results: list[tuple[SemanticFact, float]] = []
         for fid, score in raw:
             fact = self._facts.get(fid)
@@ -783,6 +948,16 @@ class SemanticFactStore:
         return out
 
     # ── 観測ヘルパ (テスト・統計用) ───────────────────────────────────
+
+    @property
+    def revision(self) -> int:
+        """書込世代番号。add / update / delete のたびに増える。
+
+        値そのものに意味は無く、**変わったかどうか** だけを見る。同じ
+        revision の間は ``all_facts()`` の結果と、そこから作った派生物が
+        変わらないことを保証する。
+        """
+        return self._revision
 
     def __len__(self) -> int:
         return len(self._facts)

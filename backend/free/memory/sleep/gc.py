@@ -17,7 +17,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from backend.free.memory.semantic.gc import select_gc_candidates
+from backend.free.memory.semantic.gc import (
+    select_expired_superseded,
+    select_gc_candidates,
+)
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -32,6 +35,43 @@ def _target_scopes(current_project_id: str | None) -> list[str]:
     if current_project_id:
         scopes.append(f"project:{current_project_id}")
     return scopes
+
+
+#: ``semmem_limits`` のうち type 別上限ではないキー。
+_NON_LIMIT_KEYS: frozenset[str] = frozenset({
+    "enforcement", "gc_strategy", "superseded_retention_days",
+})
+
+
+def _sweep_expired_superseded(
+    store: "SemanticFactStore", scope: str, retention_days: float,
+) -> int:
+    """保持期間を過ぎた supersede 済みファクトを回収する。
+
+    type 別上限は active ファクトにしか効かないため、これが無いと supersede
+    済みは永久に残る (実測 2026-09-01: global 25.5% / project 48.0%)。
+    """
+    if retention_days <= 0:
+        return 0
+    try:
+        candidates = select_expired_superseded(
+            store.all_facts(include_superseded=True),
+            retention_days=retention_days,
+        )
+        if not candidates:
+            return 0
+        deleted = store.delete_facts(candidates)
+    except Exception as exc:
+        logger.warning(
+            "Step 9 GC: superseded sweep failed in %s: %s", scope, exc,
+        )
+        return 0
+    if deleted:
+        logger.info(
+            "Step 9 GC: swept %d superseded fact(s) older than %.1f day(s) "
+            "in %s", deleted, retention_days, scope,
+        )
+    return deleted
 
 
 def run_semmem_gc(
@@ -65,6 +105,8 @@ def run_semmem_gc(
     if enforcement != "hard":
         return {}
 
+    retention_days = float(limits_cfg.get("superseded_retention_days", 0.0) or 0.0)
+
     deleted_total: dict[str, int] = {}
     for scope in _target_scopes(current_project_id):
         try:
@@ -74,8 +116,11 @@ def run_semmem_gc(
             continue
         if store is None:
             continue
+        expired = _sweep_expired_superseded(store, scope, retention_days)
+        if expired:
+            deleted_total[f"{scope}:superseded"] = expired
         for type_name, limit_raw in limits_cfg.items():
-            if type_name in ("enforcement", "gc_strategy"):
+            if type_name in _NON_LIMIT_KEYS:
                 continue
             if not isinstance(limit_raw, int) or limit_raw <= 0:
                 continue
@@ -83,16 +128,18 @@ def run_semmem_gc(
             if len(facts) <= limit_raw:
                 continue
             candidates = select_gc_candidates(facts, max_count=limit_raw)
+            # 1 件ずつ delete_fact すると facts.jsonl の全書き換えと
+            # vectors.npy の全書き出しが件数分走る (実測 58.8ms/件)。しかも
+            # 本関数は同期で run_full から直接呼ばれる = イベントループを
+            # 占有するため、100 件で約 6 秒ブロックしていた。
             deleted_for_type = 0
-            for fid in candidates:
-                try:
-                    if store.delete_fact(fid):
-                        deleted_for_type += 1
-                except Exception as exc:
-                    logger.warning(
-                        "Step 9 GC: failed to delete %s in %s: %s",
-                        fid, scope, exc,
-                    )
+            try:
+                deleted_for_type = store.delete_facts(candidates)
+            except Exception as exc:
+                logger.warning(
+                    "Step 9 GC: failed to delete %d fact(s) in %s: %s",
+                    len(candidates), scope, exc,
+                )
             if deleted_for_type:
                 key = f"{scope}:{type_name}"
                 deleted_total[key] = deleted_for_type

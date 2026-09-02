@@ -1844,6 +1844,12 @@ class ToolCallJudge:
             if sim < min_sim:
                 # candidates は score 降順想定。閾値未満は以降全て無効。
                 break
+            if fact.private:
+                # private セッション由来のファクトは想起させない。
+                # ``fact_from_note`` がノートの private を継承するようになった
+                # (2026-09-01) ので、ここが実際の防御線になる。注入側は
+                # ``MemoryInjector._classify_fact`` が同じ判定をしている。
+                continue
             if fact.profile_id and fact.profile_id not in allowed_profiles:
                 continue
             extra = fact._extra or {}
@@ -2029,6 +2035,12 @@ class ToolCallJudge:
             if sim < min_sim:
                 # candidates は score 降順想定。閾値未満は以降全て無効。
                 break
+            if fact.private:
+                # private セッション由来のファクトは想起させない。
+                # ``fact_from_note`` がノートの private を継承するようになった
+                # (2026-09-01) ので、ここが実際の防御線になる。注入側は
+                # ``MemoryInjector._classify_fact`` が同じ判定をしている。
+                continue
             if fact.profile_id and fact.profile_id != self._profile_id:
                 continue
             extra = fact._extra or {}

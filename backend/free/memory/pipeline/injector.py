@@ -45,7 +45,7 @@ import time
 
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Iterable, Literal
+from typing import Any, Iterable, Literal, Sequence
 
 from backend.free.core.intent_vocab import is_plain_statement
 from backend.free.core.text_quality import (
@@ -58,6 +58,10 @@ from backend.free.core.session_mode import (
     is_chat_mode,
     is_create_mode,
     is_valid_session_mode,
+)
+from backend.free.memory.attribute_key import (
+    NON_ATTRIBUTE_TAILS,
+    attribute_key,
 )
 from backend.free.memory.notes.subject_ns import is_session_summary_subject
 from backend.free.memory.stores.short_term import MemoryNote
@@ -301,12 +305,9 @@ class InjectionPlan:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-#: スロット同定に使えない汎用の末尾セグメント。``mem.personal.user`` /
-#: ``mem.world.assertion`` のように属性名が入っていない subject は、属性単位の
-#: 畳み込みから外す (同じキーに無関係な事実が集まってしまう)。
-_GENERIC_SUBJECT_TAIL: frozenset[str] = frozenset(
-    {"user", "assertion", "fact", "info", "note", "misc", "other", "value"},
-)
+#: スロット同定に使えない汎用の末尾セグメント。
+#: SSOT は :mod:`backend.free.memory.attribute_key` (後方互換の別名)。
+_GENERIC_SUBJECT_TAIL: frozenset[str] = NON_ATTRIBUTE_TAILS
 
 
 #: 「ほぼ同じ本文」とみなす bi-gram Jaccard の下限。``ChunkContentGate`` の
@@ -373,24 +374,10 @@ def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
     return inter / len(a | b)
 
 
-def _attribute_key(subject: str) -> str | None:
-    """subject から「実世界の属性名」を取り出す (純粋関数)。
-
-    ``mem.personal.beverage`` / ``mem.preference.beverage`` はどちらも
-    **同じ属性**を指すのに ``(subject, predicate)`` が違うためスロット畳み込みが
-    効かない。末尾セグメントを属性キーとして扱い、名前空間をまたいで 1 値へ
-    寄せるために使う。
-
-    Returns:
-        属性キー。取り出せない (階層が浅い / 汎用語) 場合は ``None``。
-    """
-    parts = (subject or "").split(".")
-    if len(parts) < 3:
-        return None
-    tail = parts[-1]
-    if not tail or tail in _GENERIC_SUBJECT_TAIL:
-        return None
-    return tail
+#: subject から属性名を取り出す純粋関数。SSOT は
+#: :mod:`backend.free.memory.attribute_key` — 「同じスロットか」の判定を
+#: 注入 / 競合 / 影の回収で分裂させないため (本モジュールの旧実装と同値)。
+_attribute_key = attribute_key
 
 
 class MemoryInjector:
@@ -454,6 +441,8 @@ class MemoryInjector:
             self.pinned_relevance_min_score,
         ) = self._resolve_relevance_thresholds(cfg)
         self._now_provider = now_provider or time.time
+        #: 次元不一致 WARNING の重複抑止 (_note_dim_mismatch)。
+        self._dim_mismatch_warned: bool = False
 
     @staticmethod
     def _resolve_relevance_thresholds(cfg: dict) -> tuple[float, float]:
@@ -657,6 +646,7 @@ class MemoryInjector:
         session_user_texts: Iterable[str] = (),
         query_text: str = "",
         retired_note_ids: "set[str] | None" = None,
+        fact_relevance_scores: "dict[str, float] | None" = None,
     ) -> InjectionPlan:
         """注入計画を構築する。
 
@@ -682,6 +672,11 @@ class MemoryInjector:
             query_text: 現在のユーザー発話の本文。**どの属性を尋ねているか**を
                 決定論辞書 (:func:`resolve_fact_attribute`) で解決し、一致する
                 ファクトを関連度ゲートから免除する (:meth:`_asked_attributes`)。
+            fact_relevance_scores: ``{fact_id: cosine}`` の事前計算済みスコア。
+                ``SemanticFactStore.embedding_scores(query_vec)`` の出力を
+                そのまま渡す。埋め込み行列を持っているストア側で 1 回の積を
+                取るのが最も安いため (:meth:`_relevance_scores` の実測)。
+                ``None`` なら従来どおり候補ごとに判定する。
             query_embedding: 現在のユーザー発話の埋め込み。与えられた場合、
                 埋め込みを持つ候補は類似度 ``relevance_min_score`` 未満なら
                 注入しない (``pinned`` は明示指定なので常に通す)。``None``
@@ -712,6 +707,11 @@ class MemoryInjector:
 
         facts, collapsed, stale_texts = self._collapse_to_current_values(facts)
         filtered_out += collapsed
+        # 関連度スコアは候補ごとの numpy 演算ではなく 1 回の行列積で求める
+        # (:meth:`_relevance_scores`)。判定の意味は変わらない。
+        fact_scores = self._relevance_scores(
+            query_vec, facts, fact_relevance_scores,
+        )
         restated = self._restated_slots(session_user_texts, mode)
         asked_attrs = self._asked_attributes(query_text, mode)
         attr_exempt = 0
@@ -794,9 +794,8 @@ class MemoryInjector:
                 attr_exempt += 1
             elif anchored:
                 anchor_exempt += 1
-            elif not self._is_relevant(
-                query_vec, getattr(fact, "embedding", None),
-                pinned=bool(fact.pinned),
+            elif not self._passes_gate(
+                query_vec, fact, pinned=bool(fact.pinned), scores=fact_scores,
             ):
                 filtered_out += 1
                 gate_rejected += 1
@@ -829,6 +828,10 @@ class MemoryInjector:
                 ),
             )
 
+        stm_notes = list(stm_notes)
+        # STM ノートは埋め込み行列を持つストアが無いので事前計算できない。
+        # 候補ごとの判定のまま (件数は ``memory.max_notes`` で抑えられている)。
+        note_scores: dict[int, float] = {}
         for note in stm_notes:
             pinned = bool(getattr(note, "pin_flag", False))
             # ファクト側で却下した世代が、同じ本文のままノート経由で戻るのを塞ぐ
@@ -922,10 +925,11 @@ class MemoryInjector:
                 retired_dropped += 1
                 continue
             gate_reached += 1
-            if not self._is_relevant(
-                query_vec, getattr(note, "embedding", None),
+            if not self._passes_gate(
+                query_vec, note,
                 # MemoryNote 側の pin 属性は ``pin_flag`` (SemanticFact は ``pinned``)。
                 pinned=pinned,
+                scores=note_scores,
                 require_embedding=True,
             ):
                 filtered_out += 1
@@ -1031,6 +1035,7 @@ class MemoryInjector:
         self,
         facts: Iterable[SemanticFact],
         query_embedding: "np.ndarray | None",
+        fact_relevance_scores: "dict[str, float] | None" = None,
     ) -> set[str] | None:
         """関連度ゲートを通ったファクト id を返す。ゲート無効時は ``None``。
 
@@ -1046,12 +1051,16 @@ class MemoryInjector:
         query_vec = self._prepare_query_vec(query_embedding)
         if query_vec is None:
             return None
+        materialized = list(facts)
+        scores = self._relevance_scores(
+            query_vec, materialized, fact_relevance_scores,
+        )
         return {
             f.id
-            for f in facts
-            if self._is_relevant(
-                query_vec, getattr(f, "embedding", None),
-                pinned=bool(getattr(f, "pinned", False)),
+            for f in materialized
+            if self._passes_gate(
+                query_vec, f,
+                pinned=bool(getattr(f, "pinned", False)), scores=scores,
             )
         }
 
@@ -1066,6 +1075,68 @@ class MemoryInjector:
         if not norm or not np.isfinite(norm):
             return None
         return v / norm
+
+    def _relevance_scores(
+        self,
+        query_vec: "np.ndarray | None",
+        items: "Sequence[Any]",
+        precomputed: "dict[str, float] | None" = None,
+    ) -> "dict[int, float]":
+        """候補の関連度スコアを ``id(item)`` 引きの辞書にまとめる。
+
+        速い経路は **ストア側で計算済みのスコアを受け取る** こと
+        (``precomputed``、:meth:`SemanticFactStore.embedding_scores`)。
+        埋め込み行列は ``EmbeddingStore`` に (N, dim) の連続配列として常駐して
+        いるので、そこで 1 回の積を取るのが最も安い。
+
+        実測 (2026-09-01、1024 次元): 候補ごとに ``np.asarray`` →
+        ``np.linalg.norm`` → 除算 を回すと N=10000 で 52.5ms、常駐行列との
+        積なら 1.5ms (**35 倍**)。**候補リストからその都度行列を組み直す方式は
+        採らない** — ``np.stack`` のコピーが乗るぶん候補ごとのループより
+        むしろ遅い (実測 0.48〜0.76 倍で全スケール敗北)。行列を持っていない
+        側でベクトル化しても勝てない。
+
+        ``precomputed`` に無い候補 (STM ノート / 別スコープ / 未 embed) は
+        辞書に載せず、呼出側が :meth:`_is_relevant` の候補ごとの分岐へ落ちる。
+        """
+        if query_vec is None or not precomputed:
+            return {}
+        out: dict[int, float] = {}
+        for item in items:
+            fid = getattr(item, "id", None)
+            if not fid:
+                continue
+            score = precomputed.get(fid)
+            if score is not None:
+                out[id(item)] = score
+        return out
+
+    def _passes_gate(
+        self,
+        query_vec: "np.ndarray | None",
+        item: "Any",
+        *,
+        pinned: bool,
+        scores: "dict[int, float]",
+        require_embedding: bool = False,
+    ) -> bool:
+        """事前計算したスコアで関連度ゲートを判定する。
+
+        スコアが引けている候補はその場で閾値比較し、引けなかった候補
+        (埋め込み無し / 次元不一致 / ゼロベクトル) だけ :meth:`_is_relevant`
+        の分岐へ落とす。判定の意味は :meth:`_is_relevant` と同一。
+        """
+        if query_vec is None:
+            return True
+        score = scores.get(id(item))
+        if score is None:
+            return self._is_relevant(
+                query_vec, getattr(item, "embedding", None),
+                pinned=pinned, require_embedding=require_embedding,
+            )
+        if pinned:
+            return score >= self.pinned_relevance_min_score
+        return score >= self.relevance_min_score
 
     def _is_relevant(
         self,
@@ -1125,7 +1196,22 @@ class MemoryInjector:
             return True if pinned else not require_embedding
         w = np.asarray(embedding, dtype=np.float32).ravel()
         if w.shape != query_vec.shape:
-            return True
+            # **次元違いは「判定不能」ではなく「壊れている」。**
+            #
+            # embed モデルを次元違いのものへ替えると、再 embed が済むまで既存
+            # ファクトは旧空間のベクトルを持つ。ここを ``True`` (素通し) に
+            # していたため、ゲートが最も要る状態で **ストア全件が毎ターン
+            # 注入されていた** — 関連度ゲートを入れた元の事象そのもの
+            # (実測 2026-09-01: 4096 次元のベクトルに対し 1024 次元のクエリで
+            # ``passes gate: True``)。
+            #
+            # ``embedding is None`` (まだ生成されていない) を通すのは、Step 8.8
+            # が次サイクルで必ず埋めるという前提があるから。次元違いには
+            # その前提が無く、``reembed-facts`` を人が走らせるまで直らない。
+            # 落とす側 = 記憶が出なくなるのは観測できるが、通す側 = 無関係な
+            # 記憶が全部載るのは静かに品質だけ壊す。
+            self._note_dim_mismatch(int(w.shape[0]), int(query_vec.shape[0]))
+            return False
         norm = float(np.linalg.norm(w))
         if not norm or not np.isfinite(norm):
             return True
@@ -1133,6 +1219,22 @@ class MemoryInjector:
         if pinned:
             return score >= self.pinned_relevance_min_score
         return score >= self.relevance_min_score
+
+    def _note_dim_mismatch(self, fact_dim: int, query_dim: int) -> None:
+        """次元不一致を 1 インスタンスにつき 1 回だけ WARNING に出す。
+
+        毎ファクト出すとログが埋まるので、``inject`` 1 回あたり 1 行に畳む。
+        """
+        if self._dim_mismatch_warned:
+            return
+        self._dim_mismatch_warned = True
+        logger.warning(
+            "Memory injection: fact embedding dim %d != query dim %d. "
+            "These facts are excluded from injection until re-embedded. "
+            "Run 'python scripts/evorefmem_cli.py reembed-facts --apply' "
+            "(or POST /api/model/reembed-facts).",
+            fact_dim, query_dim,
+        )
 
     # ── tier 分類 ────────────────────────────────────────────────────
 
@@ -1383,6 +1485,10 @@ class MemoryInjector:
             3 つ目は STM ノート側の重複抑止に使う (``_is_stale_duplicate``)。
         """
         by_slot: dict[tuple[str, str], SemanticFact] = {}
+        #: スロット -> ``out`` 内の位置。``out.index()`` は線形探索なので
+        #: 畳み込み全体が O(n^2) になる (``semmem_limits`` の既定まで伸びると
+        #: 効いてくる)。差し替え先を辞書で覚えておく。
+        slot_pos: dict[tuple[str, str], int] = {}
         seen_exact: set[tuple[str, str, str]] = set()
         out: list[SemanticFact] = []
         stale_texts: set[str] = set()
@@ -1413,12 +1519,13 @@ class MemoryInjector:
             current = by_slot.get(slot)
             if current is None:
                 by_slot[slot] = fact
+                slot_pos[slot] = len(out)
                 out.append(fact)
                 continue
             dropped += 1
             if self._supersedes(fact, current):
                 stale_texts.add(_normalize_for_dup(current.object))
-                out[out.index(current)] = fact
+                out[slot_pos[slot]] = fact
                 by_slot[slot] = fact
             else:
                 stale_texts.add(_normalize_for_dup(fact.object))
@@ -1450,6 +1557,7 @@ class MemoryInjector:
         セッション ID なので互いに衝突せず、そのまま残る。
         """
         by_attr: dict[str, SemanticFact] = {}
+        attr_pos: dict[str, int] = {}
         out: list[SemanticFact] = []
         dropped = 0
         for fact in facts:
@@ -1465,12 +1573,13 @@ class MemoryInjector:
             current = by_attr.get(key)
             if current is None:
                 by_attr[key] = fact
+                attr_pos[key] = len(out)
                 out.append(fact)
                 continue
             dropped += 1
             if self._supersedes(fact, current):
                 stale_texts.add(_normalize_for_dup(current.object))
-                out[out.index(current)] = fact
+                out[attr_pos[key]] = fact
                 by_attr[key] = fact
             else:
                 stale_texts.add(_normalize_for_dup(fact.object))

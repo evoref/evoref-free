@@ -34,11 +34,13 @@ import numpy as np
 from backend.free.memory.sleep._curator_common import (
     build_scoring_prompt,
     coerce_bare_score,
+    public_notes,
     subject_digest,
     truncate_for_prompt,
 )
 from backend.free.llm.json_schemas import UrlRelevanceJudgement
-from backend.free.memory.types import SemanticFact, make_fact
+from backend.free.memory.note_facts import fact_from_note
+from backend.free.memory.types import SemanticFact
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -291,6 +293,9 @@ async def curate_url_facts(
     min_record = float(cfg.get("url_recall_min_record_score", 0.6))
     history_size = int(cfg.get("url_recall_record_history_size", 10))
 
+    # private セッション由来のノートは SemMem へ昇格させない。
+    # (``_curator_common.public_notes`` の docstring に実害と経緯)
+    notes = public_notes(notes)
     pairs = _iter_qa_pairs(notes)
     if not pairs:
         return 0
@@ -405,7 +410,8 @@ async def curate_url_facts(
                         "last_fetched_at": now,
                         "last_query": _truncate(user_note.content or "", 200),
                     }
-                    fact = make_fact(
+                    fact = fact_from_note(
+                        user_note,
                         subject=subject,
                         predicate="answers_topic",
                         object_=topic,

@@ -49,7 +49,7 @@ from backend.free.memory.pipeline.semantic_conflict_resolver import (
 )
 from backend.free.memory.semantic.store import SemanticFactStore
 from backend.utils import estimate_tokens
-from backend.free.memory.types import SemanticFact, make_fact
+from backend.free.memory.types import Provenance, SemanticFact, make_fact
 from backend.log_config import get_logger
 
 logger = get_logger("memory.semantic.conflict_review")
@@ -108,6 +108,8 @@ class ResolutionResult:
 def collect_pending_groups(
     store: SemanticFactStore, scope: str,
     similarity_threshold: float = DEFAULT_ATTRIBUTE_SIMILARITY_THRESHOLD,
+    *,
+    active_facts: "list[SemanticFact] | None" = None,
 ) -> list[PendingConflictGroup]:
     """``review_status="pending"`` の active ファクトを (subject, predicate)
     でグルーピングして返す。
@@ -122,11 +124,17 @@ def collect_pending_groups(
     並びは ``(scope, subject, predicate)`` の決定的順序 — チャット注入の
     ``[C1]`` 採番をチャット注入ブロックと共有するため、
     呼び出しタイミングに依らず安定であること。
+
+    Args:
+        active_facts: 取得済みの active ファクト列。``collect_review_groups``
+            は自分でも同じ ``all_facts()`` を引くため、渡して 1 ターンあたりの
+            全件走査を 1 回に減らす (2026-09-01 監査 F9)。
     """
-    pending = [
-        f for f in store.all_facts(include_superseded=False)
-        if f.review_status == "pending"
-    ]
+    facts = (
+        store.all_facts(include_superseded=False)
+        if active_facts is None else active_facts
+    )
+    pending = [f for f in facts if f.review_status == "pending"]
     buckets: dict[tuple[str, str], list[SemanticFact]] = {}
     for f in pending:
         buckets.setdefault((f.subject, f.predicate), []).append(f)
@@ -224,14 +232,17 @@ def collect_review_groups(
        落とすのは表示だけで、解決 (supersede / TTL) の対象は変えない
        — ``collect_pending_groups`` は素通しのままにする。
     """
+    active_facts = store.all_facts(include_superseded=False)
     by_slot: dict[tuple[str, str], list[SemanticFact]] = {}
-    for f in store.all_facts(include_superseded=False):
+    for f in active_facts:
         if states_no_user_value(f.object or ""):
             continue
         by_slot.setdefault((f.subject, f.predicate), []).append(f)
 
     groups: list[PendingConflictGroup] = []
-    for base in collect_pending_groups(store, scope, similarity_threshold):
+    for base in collect_pending_groups(
+        store, scope, similarity_threshold, active_facts=active_facts,
+    ):
         if is_internal_index_subject(base.subject):
             continue
         newest_by_object: dict[str, SemanticFact] = {}
@@ -406,6 +417,18 @@ def apply_resolution(
             for sid in f.supersedes:
                 if sid not in merged_supersedes:
                     merged_supersedes.append(sid)
+        # 由来と privacy は入力ファクトから引き継ぐ。以前はどちらも落として
+        # おり、**private なファクトを含む merge が public なファクトを生む**
+        # 経路になっていた (2026-09-01 監査、make_fact 直呼びの静的検査で発見)。
+        # provenance も空になるため、統合後は出所が辿れなくなっていた。
+        sources = (winner, *losers)
+        merged_provenances: list[Provenance] = []
+        merged_sessions: set[str] = set()
+        for f in sources:
+            for prov in f.provenances or ():
+                if prov not in merged_provenances:
+                    merged_provenances.append(prov)
+            merged_sessions |= set(f.session_ids or ())
         new_fact = make_fact(
             subject=winner.subject,
             predicate=winner.predicate,
@@ -414,6 +437,10 @@ def apply_resolution(
             scope=winner.scope,
             mode_origin=winner.mode_origin,
             confidence=max(winner.confidence, *(l.confidence for l in losers)),
+            provenances=merged_provenances,
+            session_ids=merged_sessions,
+            # 1 件でも private が混じれば統合結果も private (安全側)。
+            private=any(bool(f.private) for f in sources),
         )
         added = store.add_fact(new_fact)
         new_fact_id = added.id

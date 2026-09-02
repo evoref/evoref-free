@@ -58,6 +58,7 @@ from typing import Any, Iterable, Literal
 import numpy as np
 
 from backend.free.memory.semantic.store import SemanticFactStore
+from backend.free.memory.attribute_key import attribute_key
 from backend.free.memory.types import SemanticFact
 from backend.log_config import get_logger
 
@@ -231,6 +232,35 @@ CONFLICTS_RESOLVED_FILENAME = "conflicts_resolved.jsonl"
 # 自動解決を許可しない (基本) タグ集合
 _MANUAL_BASE_TAGS: frozenset[str] = frozenset({"project", "policy"})
 
+#: 属性またぎの畳み込み (``_collapse_cross_slot_generations``) の対象 FactType。
+#: 分散が起きるのは抽出器が 1 発話を複数 tag へ書き出す経路だけなので、
+#: ユーザー属性ファクトに限る (``extractors.chat._USER_SUBJECT_TAGS`` と同じ集合)。
+_CROSS_SLOT_TYPES: frozenset[str] = frozenset({
+    "personal_fact", "preference", "emotion", "opinion",
+})
+
+
+def _newest_of(facts: list[SemanticFact]) -> SemanticFact:
+    """スロットの現在値を選ぶ (``created_at`` 昇順に並んだ ``facts`` から)。
+
+    ``MemoryInjector._supersedes`` と同じ意味論:
+
+    - ``created_at`` が新しい方を残す。
+    - **同着を落とさない** — 1 回の sleep-time バッチで抽出されたファクトは
+      秒未満の差しか持たず、実測では ``created_at`` が完全に一致する。訂正は
+      同じセッションで起きるのでまさにその同着に当たる。ファクトは会話順に
+      append されるので、同着なら後から来た方が新しい。
+    - ``from_correction`` は同着で常に優先する (同一バッチ内で順序が入れ替わって
+      も壊れないため)。
+    """
+    winner = facts[0]
+    for fact in facts[1:]:
+        if fact.created_at > winner.created_at:
+            winner = fact
+        elif fact.created_at == winner.created_at and not winner.from_correction:
+            winner = fact
+    return winner
+
 Decision = Literal["auto", "pending"]
 
 
@@ -281,6 +311,10 @@ class SemanticConflictResolver:
                 DEFAULT_ATTRIBUTE_SIMILARITY_THRESHOLD,
             ),
         )
+        # 属性またぎの世代畳み込み (_collapse_cross_slot_generations)。
+        self.cross_slot_collapse_enabled: bool = bool(
+            cfg.get("cross_slot_collapse", True),
+        )
         self._now_provider = now_provider or time.time
 
     # ── public API ────────────────────────────────────────────────────
@@ -303,8 +337,10 @@ class SemanticConflictResolver:
             "pending": 0,
             "groups": 0,
             "ttl_auto_resolved": 0,
+            "cross_slot_collapsed": 0,
         }
         self._resolve_expired_pending(result)
+        self._collapse_cross_slot_generations(result)
         groups = self._detect_groups()
         for facts in groups:
             result["groups"] += 1
@@ -321,6 +357,89 @@ class SemanticConflictResolver:
                 self._infer_scope(),
             )
         return result
+
+    # ── 属性またぎの世代畳み込み (pre-pass) ──────────────────────────
+
+    def _collapse_cross_slot_generations(self, result: dict[str, int]) -> None:
+        """同じ属性が別スロットへ分散した世代を supersede で 1 値に寄せる。
+
+        ``_detect_groups`` は ``(subject, predicate)`` の厳密一致でしか束ねない
+        ため、**同じ実世界の属性が別の名前空間へ散る** ケースを取り逃す。実測
+        (2026-08-22 ライブ監査 2 回目、実ストア): 「好きな飲み物」が
+        ``mem.personal.beverage`` / ``mem.preference.beverage`` /
+        ``mem.personal.user`` / ``mem.preference.user`` の 4 スロットへ散り、
+        緑茶 / ほうじ茶 / 紅茶 / コーヒーの歴代 4 世代がすべて live のまま
+        注入されていた。
+
+        注入側の ``MemoryInjector._collapse_by_attribute`` は毎ターンこれを
+        1 値へ寄せているが、結果を **ストアへ書き戻していなかった**ため、同じ
+        計算を全ターン永久にやり直していた (2026-09-01 監査 F10)。ここで
+        1 度だけ永続化する。
+
+        絞り込みは保守的に:
+
+        - **ユーザー属性ファクトだけ** (:data:`_CROSS_SLOT_TYPES`)。分散が
+          起きるのは抽出器が 1 発話を複数 tag へ書き出す経路だけ。
+        - **属性名を持つ subject だけ** (``attribute_key`` が ``None`` を返す
+          汎用スロットは対象外 — 同じキーに無関係な事実が集まる)。
+        - **subject が実際に 2 つ以上に割れている属性だけ**。同一 subject 内の
+          世代は ``_detect_groups`` の担当。
+        - **pinned を含む属性は触らない**。``_decide`` が pinned を pending に
+          回すのと同じ立場を取る (注入側の畳み込みは読み出しだけなので残る)。
+        - **値が実際に違うものだけ** (``distinct_conflict_objects``)。
+        - **属性類似度で 1 塊にまとまるものだけ**。末尾セグメントが同じでも
+          別の話題なら割れる (``_detect_groups`` と同じ棒)。
+
+        勝者は :meth:`_decide` と同じ意味論 — ``created_at`` 最新、同着なら
+        後から来た方 (会話順の append)、``from_correction`` は同着で常に優先。
+        """
+        if not self.cross_slot_collapse_enabled:
+            return
+        by_attr: dict[str, list[SemanticFact]] = {}
+        for fact in self.store.all_facts(include_superseded=False):
+            if fact.type not in _CROSS_SLOT_TYPES:
+                continue
+            key = attribute_key(fact.subject)
+            if key is None:
+                continue
+            by_attr.setdefault(key, []).append(fact)
+
+        for key, facts in by_attr.items():
+            if len({f.subject for f in facts}) < 2:
+                continue  # 同一 subject 内の世代は _detect_groups の担当
+            if any(f.pinned for f in facts):
+                continue
+            facts.sort(key=lambda f: f.created_at)
+            for cluster in split_by_attribute_similarity(
+                facts, self.attribute_similarity_threshold,
+            ):
+                if len(cluster) < 2:
+                    continue
+                if len({f.subject for f in cluster}) < 2:
+                    continue
+                if len(distinct_conflict_objects(cluster)) < 2:
+                    continue
+                winner = _newest_of(cluster)
+                for loser in cluster:
+                    if loser.id == winner.id or loser.superseded_by:
+                        continue
+                    try:
+                        self.store.supersede(loser.id, winner.id)
+                    except (KeyError, ValueError) as exc:
+                        # 閉路ガード等。書込自体は成立しているので警告に留め、
+                        # 残りは次サイクル / 注入側の畳み込みに委ねる。
+                        logger.warning(
+                            "cross-slot collapse: failed to supersede "
+                            "%s -> %s (%s): %s",
+                            loser.id, winner.id, key, exc,
+                        )
+                        continue
+                    result["cross_slot_collapsed"] += 1
+                    logger.info(
+                        "cross-slot collapse: %s (%s) superseded by %s (%s) "
+                        "for attribute %r",
+                        loser.id, loser.subject, winner.id, winner.subject, key,
+                    )
 
     # ── TTL pre-pass ──────────────────────────────────────────────────
 
@@ -618,6 +737,7 @@ def resolve_semmem_conflicts(
         "pending": 0,
         "groups": 0,
         "ttl_auto_resolved": 0,
+        "cross_slot_collapsed": 0,
     }
     for store in stores:
         if store is None:
