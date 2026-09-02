@@ -28,6 +28,23 @@ def get_locale() -> str:
     return _locale
 
 
+def prompt_locale(default: str = "ja") -> str:
+    """LLM プロンプトへ埋め込む固定文の言語 (``i18n.prompt_locale``、既定 ja)。
+
+    UI の ``_locale`` とは独立で、config がロードされていない (テスト / CLI
+    単体) 場合や未知の値は ``default`` に落とす。呼出側は
+    ``LABELS.get(prompt_locale(), LABELS["ja"])`` の形で辞書から引く
+    (``backend.free.api.chat.chat._REFERENCE_BLOCK_DIRECTIVES`` と同じ選び方)。
+    """
+    try:
+        from backend.config import get_config
+
+        value = (get_config().get("i18n") or {}).get("prompt_locale", default)
+    except Exception:
+        return default
+    return value if isinstance(value, str) and value else default
+
+
 # LLM 生成物 prose の出力言語指示に使う言語名 (ja 表記, en 表記)。
 _PROSE_LANGUAGE_NAMES: dict[str, tuple[str, str]] = {
     "ja": ("日本語", "Japanese"),

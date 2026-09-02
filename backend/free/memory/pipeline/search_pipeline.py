@@ -238,6 +238,10 @@ async def _search_stm_layer(
             loop, _search_executor,
             short_term.retrieve_top_k_detailed, query_vec, stm_top_k,
         )
+        # private ノートは [参考情報] 経路にも出さない (MemoryInjector 側の
+        # 除外と対。``retrieve_top_k_detailed`` の既定 ``include_private=False``
+        # が本命で、ここは簡易 STM 実装 / 旧シグネチャに対する二重ガード)。
+        hits = [h for h in hits if not getattr(h[0], "private", False)]
         # 同じ質問を前にもしていた場合だけ、assistant ノート (= その質問への
         # 前回の回答) を落とす。詳細は _is_repeat_of_a_stored_turn を参照。
         if drop_past_answers:

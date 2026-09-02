@@ -241,19 +241,25 @@ class MemoryEviction:
         for note, score in scored[:evict_count]:
             if not can_fade(note.id, experience_buf, config):
                 continue
-            # pinned MemoryNote は常に保持
-            if getattr(note, "pin_flag", False):
-                continue
-            # Step 8 がまだ見ていないノートは SemMem の唯一の入力なので残す
-            # (docstring の ``unextracted_cutoff`` 参照)。
-            if protect_unextracted and float(
-                getattr(note, "created_at", 0.0) or 0.0,
-            ) > unextracted_cutoff:
-                skipped_unextracted += 1
-                continue
-
-            # プライベートノートは LTM に昇格させず破棄のみ
+            # プライベートノートは LTM に昇格させず破棄のみ。pin より **先に**
+            # 判定する — pin 保護を先に見ると pinned な private ノートが
+            # セッション終了後も永久に残る (揮発する契約と矛盾する)。
             is_private = bool(getattr(note, "private", False))
+            if not is_private:
+                # pinned MemoryNote は常に保持
+                if getattr(note, "pin_flag", False):
+                    continue
+                # Step 8 がまだ見ていないノートは SemMem の唯一の入力なので残す
+                # (docstring の ``unextracted_cutoff`` 参照)。セッション別上限で
+                # 見送られたノート (``extraction_deferred``) は作成時刻が cutoff
+                # より前でも未消費なので同じく残す。
+                if protect_unextracted and (
+                    float(getattr(note, "created_at", 0.0) or 0.0)
+                    > unextracted_cutoff
+                    or getattr(note, "extraction_deferred", False)
+                ):
+                    skipped_unextracted += 1
+                    continue
 
             if score < threshold or is_private:
                 del short_term.notes[note.id]
@@ -277,6 +283,6 @@ class MemoryEviction:
                 skipped_unextracted,
             )
         if removed > 0:
-            short_term._cache_dirty = True
+            short_term.mark_dirty()
 
         return removed

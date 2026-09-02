@@ -65,6 +65,8 @@ class SubjectDictionaryConfig(BaseModel):
     enabled: bool = True
     file: str = "local/memory/semantic/subject_dictionary.json"
     auto_expand: bool = False
+    """自動拡張 (未参照 / 予約)。読むコードは無く、仕様上も false 固定。
+    ``extra="forbid"`` のため既存 config を壊さないよう残している。"""
 
 
 class FactsExtractionMaxPerSession(BaseModel):
@@ -92,7 +94,8 @@ class FactsConfig(BaseModel):
     """Step 8 Extractor 全体のオンオフ"""
 
     trigger: str = "idle_full_only"
-    """抽出トリガ。``idle_full_only`` のみ対応 (Trigger B = run_full)"""
+    """抽出トリガ (未参照 / 予約)。``idle_full_only`` のみ対応 (Trigger B = run_full)。
+    値を読むコードは無く、Step 8 が Full にしか無いことをコメントで指す用途のみ。"""
 
     extraction_max_per_session: FactsExtractionMaxPerSession = Field(
         default_factory=FactsExtractionMaxPerSession,
@@ -182,9 +185,9 @@ class ConflictChatReviewConfig(BaseModel):
     # 多いグループを抑えられないため併用する。設計書 §203 の「drop されない」
     # 保証のため、上限を超えても最低 1 グループは必ず注入する。
     max_tokens: int = Field(default=400, ge=0)
-    # conflict_chat_judge のセッション内発火上限。上限到達後は
-    # 同一セッションでの判定と pending 注入を停止し、滞留 pending が
-    # 毎ターン realtime スロットを専有するのを防ぐ。0 = 無制限 (従来動作)。
+    # conflict_chat_judge のセッション内発火上限 (未参照 / 予約)。判定経路は
+    # 撤去済みで読むコードは無い。``extra="forbid"`` のため既存 config を
+    # 壊さないよう残している。0 = 無制限 (従来動作)。
     max_judge_per_session: int = Field(default=3, ge=0)
 
 
@@ -331,10 +334,12 @@ class PinConfig(BaseModel):
     """自動 Pin 検出を有効化するか"""
 
     auto_detect_confirm: bool = False
-    """検出時にユーザー確認を要求するか"""
+    """検出時にユーザー確認を要求するか (未参照 / 予約)。確認フローは未実装で
+    読むコードは無い (``ShortTermMemory.__init__`` の NOTE 参照)。"""
 
     unlimited: bool = True
-    """pin 数上限なし"""
+    """pin 数上限なし (未参照 / 予約)。読むコードは無く、pin 数の上限は
+    どこにも実装されていない。"""
 
 
 class PrivateSessionConfig(BaseModel):

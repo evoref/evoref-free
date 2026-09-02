@@ -344,7 +344,7 @@ def run_migrations(
 
     `backend.factory._memory_init._init_memory` からワンショットで呼び出しやすい形に
     整えたもの。マイグレーション登録表は将来的にこのモジュール内の
-    `DEFAULT_MIGRATIONS` として集約する想定 (現状は空)。
+    `DEFAULT_MIGRATIONS` として集約する (現状は index v1→v2 の 1 件、bump 待ちの休眠)。
     """
     migrator = SchemaMigrator(
         migrations=migrations,

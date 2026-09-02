@@ -421,6 +421,17 @@
       "entry": "- {index}. {tool} ({status}) — 依頼「{query}」",
       "omitted": "(古い {count} 件は省略)"
     },
+    "reactive": {
+      "greeting": {
+        "hello": "こんにちは！何かお手伝いできることはありますか？",
+        "good_morning": "おはようございます！今日は何をしましょうか？",
+        "good_evening": "こんばんは！何かお手伝いしましょうか？",
+        "casual": "こんにちは！お気軽にどうぞ。",
+        "thanks": "どういたしまして！他に何かあればお気軽にどうぞ。",
+        "good_night": "おやすみなさい。良い夜を！",
+        "bye": "さようなら！またいつでもどうぞ。"
+      }
+    },
     "boundary_turns": {
       "first": "最初",
       "last": "最後",

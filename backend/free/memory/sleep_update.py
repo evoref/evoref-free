@@ -6,14 +6,17 @@ Trigger B (Full):  LLM あり、アイドル後に実行（Steps 1-10）
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from backend.log_config import get_logger
+from backend.trace_context import run_in_executor_with_context
 from backend.utils import utc_now
 from backend.free.memory.stores.short_term import ShortTermMemory
 from backend.free.memory.stores.long_term import LongTermMemory
@@ -38,6 +41,10 @@ SemanticStoreInvalidator = Callable[[str], None]
 キャッシュをクリアするため。"""
 
 logger = get_logger("memory.sleep_update")
+
+#: ``_save_state`` 用の 1 スレッド executor。保存を直列化して順序を保つ
+#: (:meth:`SleepTimeWorker._save_state_async`)。
+_SAVE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stm-save")
 
 # STM ノートを埋め込む際の本文上限 (文字数)。llama-server の embed インスタンスは
 # n_ctx_slot が 2048〜4096 程度で運用されるため、超過すると
@@ -224,7 +231,7 @@ class SleepTimeWorker:
             step_durations["step5_5_patterns"] = round(time.monotonic() - ts, 3)
         finally:
             # 永続化 (途中で落ちても、それまでの進捗は必ず書き出す)
-            self._save_state()
+            await self._save_state_async()
 
         elapsed = round(time.monotonic() - t0, 3)
         logger.info("Sleep-time Light completed in %.3fs: %s", elapsed, result)
@@ -579,7 +586,7 @@ class SleepTimeWorker:
         )
 
         # 永続化 + 完了ログ
-        self._save_state()
+        await self._save_state_async()
         elapsed = round(time.monotonic() - t0, 3)
         self._log_full_completion(result, started_at, elapsed, step_durations)
         return result
@@ -687,7 +694,7 @@ class SleepTimeWorker:
                 note.embed_failures = 0
                 embedded += 1
 
-        self.short_term._cache_dirty = True
+        self.short_term.mark_dirty()
         logger.info("Step 1: embedded %d notes", embedded)
         return embedded
 
@@ -752,7 +759,7 @@ class SleepTimeWorker:
                 updated += 1
 
         if updated > 0:
-            self.short_term._cache_dirty = True
+            self.short_term.mark_dirty()
             logger.info("Updated scores for %d notes", updated)
         return updated
 
@@ -799,6 +806,7 @@ class SleepTimeWorker:
         cutoff = self._last_extraction_at
         if not any(
             float(getattr(n, "created_at", 0.0) or 0.0) > cutoff
+            or getattr(n, "extraction_deferred", False)
             for n in self.short_term.notes.values()
         ):
             return 0
@@ -908,7 +916,7 @@ class SleepTimeWorker:
         return await summarize_unsummarized_sessions(
             llm_client,
             self.embedder,
-            batch_size=int(history_cfg.get("summary_batch_size", 5)),
+            batch_size=int(history_cfg.get("summary_batch_size", 20)),
             is_cancelled=self._check_cancelled,
         )
 
@@ -1165,15 +1173,30 @@ class SleepTimeWorker:
             store_invalidator=self._semantic_store_invalidator,
         )
 
+    async def _save_state_async(self) -> None:
+        """:meth:`_save_state` をワーカースレッドで走らせる。
+
+        STM の JSON (実測 1.5MB、95% が埋め込み) と LTM ベクトルの書き出しは
+        同期 I/O で、Light はチャットのストリーミング中にも走る。イベントループ
+        上で書くとその間トークンが 1 つも流れない。``run_in_executor_with_context``
+        で trace_id を保ったままスレッドへ逃がす。専用の 1 スレッド executor
+        なので保存同士は直列化され、順序が入れ替わらない。
+        """
+        loop = asyncio.get_running_loop()
+        await run_in_executor_with_context(loop, _SAVE_EXECUTOR, self._save_state)
+
     def _save_state(self) -> None:
-        """メモリ状態を永続化"""
+        """メモリ状態を永続化 (STM は前回保存以降に変更があるときだけ)"""
         from backend.config import get_path_resolver
 
         try:
-            resolver = get_path_resolver()
-            memory_dir = resolver.resolve_local("memory_dir")
-            self.short_term.save(memory_dir / "short_term_notes.json")
-            logger.info("State saved to disk")
+            if getattr(self.short_term, "dirty", True):
+                resolver = get_path_resolver()
+                memory_dir = resolver.resolve_local("memory_dir")
+                self.short_term.save(memory_dir / "short_term_notes.json")
+                logger.info("State saved to disk")
+            else:
+                logger.debug("STM unchanged since last save, skipping")
         except Exception as e:
             logger.warning("Failed to save state: %s", e)
 

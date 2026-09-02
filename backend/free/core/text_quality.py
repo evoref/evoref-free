@@ -419,8 +419,23 @@ def asks_verbatim_excerpt(query: str) -> bool:
 #: 抽出側 (``extract_measured_values``) と注入側 (chat_service) で共有する。
 SYSTEM_MEASUREMENT_MARKER = "[システム計測]"
 
-#: 「86 文字」「12 行」「200 語」のような 数値 + 単位。
-_MEASURED_VALUE_RE = re.compile(r"(\d+)\s*(文字|行|語)")
+#: 「86 文字」「12 行」「200 語」/ "86 characters" のような 数値 + 単位。
+#: en ロケールの注記 (chat_service の ``_localized``) も同じ抽出器で読めるよう
+#: 英語単位も受け、キーは日本語単位へ正規化する。
+_MEASURED_VALUE_RE = re.compile(
+    r"(\d+)\s*(文字|行|語|characters?|chars?|lines?|words?)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_UNIT_CANON = {
+    "文字": "文字", "character": "文字", "characters": "文字", "char": "文字", "chars": "文字",
+    "行": "行", "line": "行", "lines": "行",
+    "語": "語", "word": "語", "words": "語",
+}
+
+
+def _iter_measured(text: str):
+    for num, unit in _MEASURED_VALUE_RE.findall(text):
+        yield int(num), _UNIT_CANON[unit.lower()]
 
 
 def extract_measured_values(text: str) -> dict[str, set[int]]:
@@ -433,8 +448,8 @@ def extract_measured_values(text: str) -> dict[str, set[int]]:
     for line in (text or "").splitlines():
         if SYSTEM_MEASUREMENT_MARKER not in line:
             continue
-        for num, unit in _MEASURED_VALUE_RE.findall(line):
-            out.setdefault(unit, set()).add(int(num))
+        for num, unit in _iter_measured(line):
+            out.setdefault(unit, set()).add(num)
     return out
 
 
@@ -454,7 +469,7 @@ def contradicts_measured_values(
     """
     if not measured or not response:
         return None
-    for num, unit in _MEASURED_VALUE_RE.findall(response):
+    for num, unit in _iter_measured(response):
         known = measured.get(unit)
         if known and int(num) not in known:
             return (

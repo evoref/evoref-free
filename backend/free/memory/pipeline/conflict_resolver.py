@@ -46,6 +46,13 @@ def _is_user_utterance(note: object) -> bool:
     return (getattr(note, "source", "user") or "user") == "user"
 
 
+def _mark_dirty(short_term: object) -> None:
+    """``ShortTermMemory.mark_dirty`` を呼ぶ (テスト用の簡易 STM は持たないことがある)。"""
+    mark = getattr(short_term, "mark_dirty", None)
+    if callable(mark):
+        mark()
+
+
 class ConflictResolver:
     """類似度の高いノートを LLM で統合"""
 
@@ -90,13 +97,11 @@ class ConflictResolver:
         )
         self.max_per_cycle: int = int(cr_cfg.get("max_per_cycle", 5))
 
-        # インターバル: 明示設定があればそのまま、なければモデルサイズから自動計算
-        explicit = mc.get("llm_call_interval")
+        # インターバル: モデルサイズから自動計算 (``memory.llm_call_base_interval``)。
+        # ``memory.llm_call_interval`` の直接指定は MemoryConfig (extra=forbid)
+        # に無く到達不能だったので読まない。
         base = mc.get("llm_call_base_interval", 1.0)
-        if explicit is not None:
-            self.llm_call_interval: float = float(explicit)
-        else:
-            self.llm_call_interval = compute_llm_call_interval(base, params_b)
+        self.llm_call_interval: float = compute_llm_call_interval(base, params_b)
 
         # memory.jsonl へ LLM 呼び出し/スキップ件数を記録する任意ロガー
         self._debug_logger: DebugLogger | None = debug_logger
@@ -131,28 +136,33 @@ class ConflictResolver:
             self._last_cooldown_skipped = 0
             return []
 
+        # 次元が揃ったノートだけを 1 つの行列にして積を取る (ペアごとの
+        # np.dot は O(n^2) の Python ループで、200 件で 2 万回の呼出)。
+        # 混在する次元は最多のものに揃え、それ以外は今回の検出から外す。
+        dims = [int(n.embedding.shape[0]) for n in notes]
+        dim = max(set(dims), key=dims.count)
+        notes = [n for n, d in zip(notes, dims) if d == dim]
+        if len(notes) < 2:
+            self._last_cooldown_skipped = 0
+            return []
+        matrix = np.stack([n.embedding for n in notes]).astype(np.float32)
+        sims = matrix @ matrix.T
+        rows, cols = np.nonzero(np.triu(sims >= self.similarity_threshold, k=1))
+
         pairs: list[tuple[str, str]] = []
-        seen: set[frozenset[str]] = set()
         cooldown_skipped = 0
 
-        for i, a in enumerate(notes):
-            for b in notes[i + 1:]:
-                sim = float(np.dot(a.embedding, b.embedding))
-                if sim < self.similarity_threshold:
-                    continue
-                key = frozenset((a.id, b.id))
-                if key in seen:
-                    continue
-                seen.add(key)
-                # 失敗が続いて quarantine 中のペアはスキップ
-                if self._in_cooldown(a, now) or self._in_cooldown(b, now):
-                    cooldown_skipped += 1
-                    continue
-                pairs.append((a.id, b.id))
-                a.conflict_candidate = True
-                a.conflict_partner_id = b.id
-                b.conflict_candidate = True
-                b.conflict_partner_id = a.id
+        for i, j in zip(rows.tolist(), cols.tolist()):
+            a, b = notes[i], notes[j]
+            # 失敗が続いて quarantine 中のペアはスキップ
+            if self._in_cooldown(a, now) or self._in_cooldown(b, now):
+                cooldown_skipped += 1
+                continue
+            pairs.append((a.id, b.id))
+            a.conflict_candidate = True
+            a.conflict_partner_id = b.id
+            b.conflict_candidate = True
+            b.conflict_partner_id = a.id
 
         self._last_cooldown_skipped = cooldown_skipped
         logger.info(
@@ -297,12 +307,20 @@ class ConflictResolver:
                 note_a.conflict_partner_id = None
                 note_a.evolution_pending = True  # 再進化が必要
                 note_a.embedding = None  # 再埋め込みが必要
+                # 本文が変わったので Step 8 に再抽出させる (旧 ID を持ち越すと
+                # already_extracted で飛ばされ、統合後の内容がファクト化されない)
+                note_a.extracted_fact_ids = []
+                # pin / 訂正の印は片方にでも付いていれば統合先に引き継ぐ
+                note_a.pin_flag = bool(note_a.pin_flag or note_b.pin_flag)
+                note_a.is_correction = bool(
+                    note_a.is_correction or note_b.is_correction,
+                )
                 # 統合成功したので生存ノートの失敗マーカーをリセット
                 note_a.conflict_fail_count = 0
                 note_a.conflict_cooldown_until = None
 
                 del short_term.notes[id_b]
-                short_term._cache_dirty = True
+                _mark_dirty(short_term)
                 resolved += 1
                 consecutive_failures = 0
                 logger.info("Merged notes %s + %s", id_a, id_b)

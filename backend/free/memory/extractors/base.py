@@ -276,9 +276,26 @@ class BaseExtractor:
         - ``pin_flag=True`` のノート由来候補は pinned 別カウントで管理
         - ``ctx.max_pinned_per_session = -1`` (デフォルト) なら pinned は無制限
 
+        副作用として、候補を出したノートの ``extraction_deferred`` を更新する:
+        1 件も採用されなかったノートは ``True`` (次サイクルへ見送り。eviction
+        保護の対象になる)、採用されたノートは ``False``。
+
         Returns:
             (採用された (note, fact) のリスト, 破棄された候補数)
         """
+        kept, dropped = self._apply_session_caps(candidates, ctx)
+        kept_notes = {id(note) for note, _ in kept if note is not None}
+        for note, _ in candidates:
+            if note is not None:
+                note.extraction_deferred = id(note) not in kept_notes
+        return kept, dropped
+
+    def _apply_session_caps(
+        self,
+        candidates: list[tuple[MemoryNote, SemanticFact]],
+        ctx: ExtractionContext,
+    ) -> tuple[list[tuple[MemoryNote, SemanticFact]], int]:
+        """:meth:`apply_session_caps` の本体 (副作用なし)。"""
         cap = ctx.max_per_session.get(self.mode, 10)
         pinned_cap = ctx.max_pinned_per_session
         per_session_count: dict[str, int] = {}

@@ -38,6 +38,7 @@ from backend.free.api.chat.chat_stream_common import (
     _sync_chat_response,
     cancel_scope,
     logger,
+    meta_last_command_call,
     meta_tool_routing_false_positive,
     meta_tool_routing_success,
     sse,
@@ -312,6 +313,7 @@ def _finalize_meta_cognitive_stream(
         rag_top1_score=rag_top1_score,
         tool_routing_success=meta_tool_routing_success(resp),
         tool_routing_false_positive=meta_tool_routing_false_positive(resp),
+        **meta_last_command_call(resp),
     )
 
     _emit_timing(state, timer, "meta_cognitive", estimated_tokens, mode=mode)
@@ -490,6 +492,7 @@ async def sync_meta_cognitive(
             rag_top1_score=rag_top1_score,
             tool_routing_success=meta_tool_routing_success(resp),
             tool_routing_false_positive=meta_tool_routing_false_positive(resp),
+            **meta_last_command_call(resp),
         )
 
         return _sync_chat_response(

@@ -11,7 +11,8 @@ from backend.free.agent.context_budget import resolve_meta_cognitive_loop_budget
 from backend.free.agent.meta_cognitive_text import assigns_file_content
 from backend.free.agent.safety_patterns import strip_command_literals
 from backend.free.core.intent_vocab import (
-    DATETIME_QUERY_RE,
+    CALCULATE_TERM,
+    CODE_SEARCH_PATTERNS,
     EXECUTABLE_QUERY_PATTERNS_EN,
     EXECUTABLE_QUERY_PATTERNS_JA,
     continuation_request,
@@ -20,9 +21,10 @@ from backend.free.core.intent_vocab import (
     runtime_info_question,
     tool_inventory_question,
     GREETING_PUNCTUATION_JA,
-    HISTORY_KEYWORDS as _HISTORY_KEYWORDS,
-    HISTORY_KEYWORDS_EN as _HISTORY_KEYWORDS_EN,
+    QUESTION_TAIL_RE,
     REFERENTIAL_WRITE_TARGET_RE,
+    URL_LITERAL_RE,
+    ascii_boundary_alternation,
     exact_greeting_pattern,
     looks_like_numeric_question,
     PREMISE_CONFIRMATION_RE,
@@ -68,9 +70,22 @@ LONG_FORM_PATTERNS = [
     # 127 秒かけて **箇条書きゼロの散文** を返した (backend.log に
     # ``Turn marked failed (asked for a bullet list but the answer has no
     # list items)``)。
+    #
+    # 「まとめ」は **既存物の要約** にも使う。「このレポートをまとめて」
+    # 「README を読んで要点をまとめて」「この論文を要約してまとめてください」は
+    # 生成量を減らす依頼で、ユニット分割の長文生成は categorically 不適
+    # (2026-09-02 監査 A2)。要約系の語 (要約 / 要点 / 読んで / 整理) と共起する
+    # 「まとめ」、および指示詞 (この / その / あの) で既存の成果物を指した
+    # 文書名詞に付く「まとめ」は採らない。書 / 作成 / 生成 / 出力 は従来どおり。
     re.compile(
         rf"({'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX + DOCUMENT_NOUNS_STANDALONE)})"
-        r".*((?<!箇条)(?<!横)(?<!縦)書|作成|生成|まとめ|出力)",
+        r".*((?<!箇条)(?<!横)(?<!縦)書|作成|生成|出力)",
+    ),
+    re.compile(
+        r"^(?!.*(?:要約|要点|読んで|整理))"
+        r"(?<!この)(?<!その)(?<!あの)"
+        rf"(?:{'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX + DOCUMENT_NOUNS_STANDALONE)})"
+        r".*まとめ",
     ),
     # 「長文」「長編」の言及、または「長い」+ 創作文書系名詞 (物語/小説等、
     # pattern[1] の文書名詞リストには含まれない) の言及が、生成依頼のて形
@@ -86,8 +101,16 @@ LONG_FORM_PATTERNS = [
         r"(ファイル|モジュール|クラス|プロジェクト)"
         r".*(一式|全体|まるごと|フル).*(作成|生成|実装)",
     ),
-    re.compile(r"(実装|作成).*全体"),
-    re.compile(r"(完全|網羅的|包括的).*(実装|ガイド|解説)"),
+    # 「全体」「完全」は **依頼のて形** を伴うときだけ採る。旧定義
+    # ``(実装|作成).*全体`` / ``(完全|網羅的|包括的).*(実装|ガイド|解説)`` は
+    # 「実装全体を見直して」「作成した関数全体を見せて」「テストは完全に
+    # 実装済みです」のような点検依頼・状況報告まで長文生成へ振っていた
+    # (2026-09-02 監査 A2)。
+    re.compile(r"全体.*(?:実装|作成|生成)(?:して|しろ|(?:を)?お願い)"),
+    re.compile(
+        r"(?:完全|網羅的|包括的).*(?:実装|ガイド|解説)"
+        r".*(?:して|しろ|(?:を)?お願い|書いて|作って|作成|生成|出力)",
+    ),
 ]
 
 # LONG_FORM_PATTERNS の英語版。GUI locale に関わらず LONG_FORM_PATTERNS と
@@ -131,11 +154,13 @@ LONG_FORM_PATTERNS_EN = [
 # 要するため meta_cognitive 層へ振る。deliberative は 1 ターン 1 ツールで連鎖できず、
 # long_form は URL を取得せず散文を生成する (内容を捏造する) ため、いずれも不適。
 _URL_HINT_RE = re.compile(r"https?://", re.IGNORECASE)
+# 書込み **動詞** のみ。旧定義は名詞 (file / csv / excel / word …) を裸で並べて
+# いたため "in a few **words**" / "user pro**file**" / "ex**cel**lent" が
+# url_write_intent になり、逆に「URL を読んで要約して」まで meta_cognitive へ
+# 振られていた (2026-09-02 監査 A5)。
 _FILE_WRITE_INTENT_RE = re.compile(
-    r"(?:ファイル|file|csv|excel|エクセル|xlsx|スプレッドシート|ドキュメント|word|ワード"
-    r"|powerpoint|パワーポイント|パワポ|pptx|プレゼンテーション)"
-    r"|(?:出力|保存|書き出|書き込|エクスポート|export|セーブ"
-    r"|(?<![A-Za-z])save(?![A-Za-z]))",
+    r"(?:出力|保存|書き出|書き込|エクスポート|セーブ"
+    r"|" + ascii_boundary_alternation("export", "save") + r")",
     re.IGNORECASE,
 )
 
@@ -147,7 +172,9 @@ _FILE_WRITE_INTENT_RE = re.compile(
 _CJK_CHAR_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿]")
 # ローカルファイルパス (Windows ドライブ / Unix) の存在検出。
 _LOCAL_PATH_RE = re.compile(
-    r"[A-Za-z]:[\\/]"                  # Windows ドライブパス (C:\ / C:/)
+    # Windows ドライブパス (C:\ / C:/)。先頭境界が無いと "http://x" の
+    # ``p:/`` に当たる (2026-09-02 監査 A8)。
+    r"(?<![A-Za-z])[A-Za-z]:[\\/]"
     r"|(?:^|[\s　])(?:/[\w._-]+){2,}",  # Unix パス (/home/user/...)
 )
 # 書込み「動詞」のみ。名詞 (excel / docx 等) 単独では発火させない (「report.xlsx を
@@ -241,17 +268,24 @@ _TABULAR_TARGET_RE = re.compile(
 # 場合、その重み合計がこの値以上でなければ long_form に分類しない。
 _LEARNED_LONG_FORM_MIN_WEIGHT_SUM = 0.8
 
-# how-to / 質問形マーカー。「作成する方法を教えて」のような書込み動詞を含む
-# 知識質問を local_write_intent から除外する。``_is_knowledge_query`` は
-# 「一覧を…」等のデータ語を広く拾い正当な書込みコマンドまで除外してしまうため、
-# ここでは教示・疑問マーカーに限定する。locale で切替えず単一の正規表現に
-# JA/EN 両方の教示・疑問フレーズを併記する (末尾の [?？] は locale 非依存の
-# フォールバック)。英語側は疑問符依存のみだと "How do I create this report
-# at C:\reports\" のように疑問符無しで how-to 意図を書くクエリを取りこぼす
-# ため、明示的な how-to フレーズを追加した (2026-07-22 監査で判明)。
+# how-to (教示) マーカー。「作成する方法を教えて」のような書込み動詞を含む
+# 知識質問を local_write_intent / long_form から除外する。``_is_knowledge_query``
+# は「一覧を…」等のデータ語を広く拾い正当な書込みコマンドまで除外してしまう
+# ため、ここでは **教示** マーカーに限定する。locale で切替えず単一の正規表現に
+# JA/EN 両方の教示フレーズを併記する。英語側は "How do I create this report
+# at C:\reports\" のように疑問符無しで how-to 意図を書くクエリがあるため、
+# 明示的な how-to フレーズを列挙する (2026-07-22 監査で判明)。
+#
+# **疑問形一般 (ですか / ますか / でしょうか / ?) は含めない。** 以前は含めて
+# いたため、丁寧な依頼がすべて除外されていた — 「3000字のレポートを書いて
+# くれますか？」が long_form を外れて deliberative へ、"Can you write a
+# 3000-word article?" が reactive へ、「C:\tmp\a.txt に保存してくれますか？」
+# が local_write_intent を外れて persist_intent へ落ちた (2026-09-02 監査 A1)。
+# 成果物 **について** 尋ねる問いは ``_ARTIFACT_QUESTION_RE`` (文末に錨) が
+# 別に受ける。
 _HOWTO_QUERY_RE = re.compile(
-    r"(?:教えて|おしえて|どうやって|どうすれば|どうやったら"
-    r"|とは|って何|何ですか|ですか|ますか|でしょうか|ありますか|[?？]"
+    r"(?:教えて|おしえて|どうやって|どうすれば|どうやったら|やり方"
+    r"|方法(?:は|を|が|って|に)|とは|って何"
     r"|how\s+(?:do|can|should|would)\s+i\b|how\s+to\b"
     r"|(?:could|can|would)\s+you\s+(?:tell|show)\s+me\s+how\b"
     r"|tell\s+me\s+how\b|what'?s?\s+the\s+way\s+to\b)",
@@ -331,19 +365,18 @@ COMPLEX_KEYWORDS_EN_PATTERNS = [
 # tool_call_decision=no_tool / reason=no_match_in_any_layer で素通りし、
 # 実際には 1 時間前に登山の会話があったのに「見当たりません」と回答)。
 # 履歴参照キーワードは core.intent_vocab が SSOT (キーワードと「近接 / 長距離」の
-# 距離分類を 1 つの表で持つ)。従来ここに定義されていたため、後方互換で再輸出する。
-HISTORY_KEYWORDS = _HISTORY_KEYWORDS
-HISTORY_KEYWORDS_EN = _HISTORY_KEYWORDS_EN
+# 距離分類を 1 つの表で持つ)。照合は ``has_history_recall_keyword`` 経由。
 
 # Meta-Cognitive 層へのエスカレーションキーワード（同義語拡張済み）
 # 注意: 命令形（〜して）のみ対象。「計画を教えて」等の知識質問は
 # ここに含めない（RAG パイプラインで処理する）。
+# 英語語彙は **ここに載せない**。素の部分一致で照合するため、裸の英単語は
+# "designated" / "prefix" / "rebuild" に当たり、境界付きの
+# META_KEYWORDS_EN_PATTERNS を無効化していた (2026-09-02 監査 A6)。
 META_KEYWORDS = [
     "ステップ", "手順", "実装して", "作って", "作成して", "書いて",
     "リファクタ", "修正して", "デバッグ", "設計して", "組み立て",
     "構築", "ビルド", "テストして", "動かして",
-    "implement", "refactor", "fix", "debug",
-    "build", "design",
 ]
 
 # META_KEYWORDS の英語版。短い英単語の substring 誤爆 ("prefix"/"contest"/
@@ -375,7 +408,7 @@ META_KEYWORDS_EN_PATTERNS = [
 # index で除外すると (旧実装は ``if i != 1``)、リストに要素を 1 つ挿入した
 # 瞬間に除外対象が黙って別のパターンへすり替わる。
 _KNOWLEDGE_QUERY_STRICT_PATTERNS = [
-    re.compile(r"(?:教えて|おしえて|とは|って何|ですか|でしょうか|ありますか)", re.IGNORECASE),
+    QUESTION_TAIL_RE,
     re.compile(r"(?:について|に関して|に関する)", re.IGNORECASE),
     re.compile(r"(?:知りたい|確認したい|調べたい|わかる|分かる)", re.IGNORECASE),
     re.compile(r"(?:what is|tell me|explain|describe|how does)\b", re.IGNORECASE),
@@ -443,9 +476,14 @@ _PERSONAL_RECALL_RE = re.compile(
     r"(?:覚えて|おぼえて|記憶して|思い出|確認|言って|"
     r"何(?:です|でした|だった)|は何|でしたか|だっけ)",
 )
+# 双方向: 「my X — recall verb」だけでなく「what was — my X」の語順
+# ("What was my cat's name?" / "What did I say my hobby was?") も採る。
+# 旧定義は ``my`` が先行する形しか拾わず、想起の問いが short_query → reactive に
+# 落ちて記憶を引かなかった (2026-09-02 監査 A4)。
 _PERSONAL_RECALL_EN_RE = re.compile(
     r"\bmy\b[^.?!\n]{0,24}"
-    r"\b(?:remember|recall|what(?:'s| is| was)|again)\b",
+    r"\b(?:remember|recall|what(?:'s| is| was)|again)\b"
+    r"|\bwhat(?:'s| was| is| were)\b[^.?!\n]{0,30}\bmy\b",
     re.IGNORECASE,
 )
 
@@ -470,6 +508,13 @@ _PERSONAL_RECALL_EN_RE = re.compile(
 _DISCOURSE_RECALL_RE = re.compile(
     r"(?:でしたか|だったか|でしたっけ|だったっけ|だっけ)"
     r"[。．.、,！!？?\s\"'」』）)]*\s*$",
+)
+# 英語版。"What was the deadline again" / "What did you say my name was?" の
+# ように、会話で既出の値を問い直す形 (2026-09-02 監査 A4)。
+_DISCOURSE_RECALL_EN_RE = re.compile(
+    r"\bwhat\s+(?:was|were)\b.*\bagain\b"
+    r"|\bwhat\s+did\s+(?:i|you)\s+(?:say|tell|mention)\b",
+    re.IGNORECASE,
 )
 
 # 前提の同意を求める確認形。「〜ですよね？」「〜で合っていますか」など。
@@ -514,29 +559,37 @@ KNOWLEDGE_QUERY_PATTERNS_EN = [
 # 注意: 単純なファイル読み書きは Deliberative 層の ToolCallJudge が処理する。
 # ここには複数ツールの連携が必要なパターンのみ含める。
 # 「検索」等の汎用語は知識質問にもマッチするため、コード/ファイル文脈を要求する。
+# 日英共通エントリ (語彙は core.intent_vocab が SSOT)。以前は TOOL_PATTERNS と
+# TOOL_PATTERNS_EN に byte 一致の 4 エントリが複製され、コード検索の ASCII 語に
+# 境界が無く ("crossencoder" の 'code')、計算は ``(?:計算|calculate)\s`` の
+# 末尾 ``\s`` のせいで日本語 (「計算して」) に一度も一致しなかった
+# (2026-09-02 監査 A7 / B)。
+_TOOL_PATTERNS_SHARED = [
+    # コード/ファイル検索: 汎用「検索」ではなく、コード・ファイル文脈を要求
+    *CODE_SEARCH_PATTERNS,
+    # URL リテラルのみ。tool_judge_signals の web 参照語彙 (サイト / ページ /
+    # 記事 …) まで広げると「この記事について教えて」のような知識質問が
+    # meta_cognitive へ振られるため、層の振り分けでは明示 URL に限定する
+    # (意図的分岐、f_03 §12.1)。
+    URL_LITERAL_RE,
+    re.compile(CALCULATE_TERM, re.IGNORECASE),
+]
+
 TOOL_PATTERNS = [
     # ファイル操作: 読み取り+変更など複合操作のみ（単一操作は Deliberative で処理）
     re.compile(r"(?:ファイル|file).*(?:読|開).*(?:書|修正|変更|削除|追加)", re.IGNORECASE),
     re.compile(r"(?:コマンド|command).*(?:実行|run)", re.IGNORECASE),
-    # コード/ファイル検索: 汎用「検索」ではなく、コード・ファイル文脈を要求
-    re.compile(r"(?:コード|ファイル|ソース|関数|クラス|code|file|source|function|class).*(?:検索|search|grep|find)", re.IGNORECASE),
-    re.compile(r"(?:検索|search|grep|find).*(?:コード|ファイル|ソース|code|file|source)", re.IGNORECASE),
-    re.compile(r"(?:URL|url|https?://)", re.IGNORECASE),
-    re.compile(r"(?:計算|calculate)\s", re.IGNORECASE),
+    *_TOOL_PATTERNS_SHARED,
 ]
 
-# TOOL_PATTERNS の英語版。末尾4パターン (コード検索/URL/計算) は元々
-# ASCII 語彙のみで日英両対応済みのためそのまま複製する。1つ目 (ファイル
-# 読み書き複合操作) のみ、日本語版が活用語尾ゲート限定のため英語文で
-# 発火しない (128行目相当) ので、英語動詞で作り直す。2つ目 (コマンド実行)
-# も日本語活用語尾 (して/する) を要求せずに発火するよう緩和する。
+# TOOL_PATTERNS の英語版。1つ目 (ファイル読み書き複合操作) は日本語版が
+# 活用語尾ゲート限定のため英語文で発火しないので、英語動詞で作り直す。
+# 2つ目 (コマンド実行) も日本語活用語尾 (して/する) を要求せずに発火するよう
+# 緩和する。残りは ``_TOOL_PATTERNS_SHARED`` を共有する。
 TOOL_PATTERNS_EN = [
     re.compile(r"\bfile\b.*\b(?:read|open)\b.*\b(?:write|modify|change|update|delete|remove|edit|append)\b", re.IGNORECASE),
     re.compile(r"\b(?:run|execute|exec)\b.*\bcommand\b|\bcommand\b.*\b(?:run|execute|exec)\b", re.IGNORECASE),
-    re.compile(r"(?:コード|ファイル|ソース|関数|クラス|code|file|source|function|class).*(?:検索|search|grep|find)", re.IGNORECASE),
-    re.compile(r"(?:検索|search|grep|find).*(?:コード|ファイル|ソース|code|file|source)", re.IGNORECASE),
-    re.compile(r"(?:URL|url|https?://)", re.IGNORECASE),
-    re.compile(r"(?:計算|calculate)\s", re.IGNORECASE),
+    *_TOOL_PATTERNS_SHARED,
 ]
 
 # Python 実行で正確に答えられるクエリのパターン
@@ -630,31 +683,6 @@ def is_environment_fact_query(query: str) -> bool:
     )
 
 
-#: 環境事実を「問うている」ことを示す疑問・依頼マーカー。
-#:
-#: ``is_environment_fact_query`` 単体は語彙マッチなので、ユーザーの自己申告
-#: (「私のマシンはメモリは 64GB です」) にも当たる。実行判断にそのまま使うと
-#: 2026-07-25 に潰した「自己紹介文の 'メモリ' 部分マッチで環境コマンドが発火し、
-#: ツール結果が会話履歴を上書きする」不具合が戻る (実際に踏んだ)。
-_ENV_FACT_ASK_RE = re.compile(
-    r"[?？]\s*$"
-    r"|(?:教えて|おしえて|ですか|でしょうか|ありますか|知りたい|調べて|確認して)"
-    r"|\b(?:what(?:'s| is| are)|tell\s+me|show\s+me|which)\b",
-    re.IGNORECASE,
-)
-
-
-def asks_environment_fact(query: str) -> bool:
-    """この実行環境の事実を **問うている** か (純粋関数)。
-
-    ``is_environment_fact_query`` (語彙一致) との違いは疑問・依頼形であること。
-    言及や自己申告を実行要求と取り違えないための連言で、実行するか否かの判断は
-    必ずこちらを使う。語彙側と同居させるのは、片方だけ更新されて食い違うのを
-    防ぐため (``is_environment_fact_query`` の docstring と同じ理由)。
-    """
-    return is_environment_fact_query(query) and bool(_ENV_FACT_ASK_RE.search(query))
-
-
 #: ディレクトリを指す名詞。
 _DIRECTORY_NOUN_RE = re.compile(
     r"(?:ディレクトリ|フォルダ"
@@ -677,7 +705,7 @@ def asks_directory_listing(query: str) -> bool:
 
     ディレクトリ名詞と列挙表現の **連言** で判定する。片方だけでは必ず誤爆する —
     「ディレクトリとは何ですか」は名詞のみ、「利点を一覧で教えて」は列挙のみで、
-    どちらも実行要求ではない。同じ連言方式を ``asks_environment_fact`` でも使う。
+    どちらも実行要求ではない。
 
     実インシデント (2026-08-03 ライブ監査): 「backend ディレクトリの直下には何が
     ありますか」がツールシグナル無しと判定されて knowledge query に落ち、
@@ -765,22 +793,30 @@ class _ClassifyContext:
     変わっても判定は変わらない (早期マッチ時に評価されないよう遅延させている)。
     """
 
-    __slots__ = ("_c", "_cache", "context", "mode", "query")
+    __slots__ = ("_c", "_cache", "_context", "mode", "query")
 
     def __init__(
         self,
         classifier: "ComplexityClassifier",
         query: str,
         mode: str,
-        context: str = "",
+        context: str | Callable[[], str] = "",
     ) -> None:
         self._c = classifier
         self.query = query
         self.mode = mode
-        #: 直近会話の本文。被演算子の片方が前ターンにしか無い計算クエリを
-        #: reactive に落とさないために使う (``looks_like_numeric_question``)。
-        self.context = context
+        #: 直近会話の本文 (または遅延評価の callable)。被演算子の片方が前ターン
+        #: にしか無い計算クエリを reactive に落とさないために使う
+        #: (``looks_like_numeric_question``)。消費するルールは numeric_question
+        #: だけなので、そこまで到達しなかった呼出では組み立て自体を省く。
+        self._context = context
         self._cache: dict[str, object] = {}
+
+    @property
+    def context(self) -> str:
+        if callable(self._context):
+            self._context = self._context()
+        return self._context
 
     def _memo(self, key: str, compute):
         if key not in self._cache:
@@ -875,10 +911,6 @@ _CLASSIFY_RULES: tuple[_ClassifyRule, ...] = (
     _ClassifyRule(
         "executable_query", "deliberative",
         lambda c, x: c._contains_executable_query_keywords(x.query),
-    ),
-    _ClassifyRule(
-        "learned_tool_pattern", "deliberative",
-        lambda c, x: x.is_knowledge and c._contains_learned_tool_patterns(x.query),
     ),
     _ClassifyRule(
         "history_ref", "deliberative",
@@ -1002,12 +1034,24 @@ _CLASSIFY_RULES: tuple[_ClassifyRule, ...] = (
 #: 生成依頼と問いを分けるのは文末の形。「〜を書いてください」は依頼、
 #: 「〜はありましたか」「〜は何章ですか」は問い。語彙 (計画書 / レポート …)
 #: では分けられない — 同じ語が両方に出る。
+#: 文末記号。日本語の問いは疑問符を伴わず句点で閉じるのが普通。文末記号を
+#: 許さないと「…ありましたか。」が 1 件も当たらない。
+_SENTENCE_CLOSE = r"[。．.、,！!\s\"'」』）)]*$"
+#: 過去形の問い (「〜ましたか」「〜でしたか」)。**分量指定より先に** 評価する —
+#: 「3000字のレポートは出力されましたか」は分量を含んでいても依頼ではない。
+#: 旧定義の ``ありました?か`` は ``た`` を任意にした誤記で「ありましか」に当たり、
+#: 「切れましたか」「終わりましたか」「出力されましたか」を取りこぼしていた
+#: (2026-09-02 監査 A3)。
+_ARTIFACT_PAST_QUESTION_RE = re.compile(
+    r"(?:ありましたか|ありませんでしたか|(?:まし|でし)たか|ましたでしょうか)"
+    + _SENTENCE_CLOSE,
+)
+#: 現在形の問い / 疑問符閉じ。語彙は ``QUESTION_TAIL_RE`` (知識質問の strict
+#: 判定と同じ) + ``ますか`` + 疑問符。丁寧な依頼 (「〜書いてくれますか？」) も
+#: ここに当たるため、明示的な分量指定 (``requests_long_output``) の **後** に
+#: 評価する。
 _ARTIFACT_QUESTION_RE = re.compile(
-    r"(?:ありました?か|ありませんでした?か|ありますか|でしたか|ですか"
-    r"|でしょうか|[?？])"
-    # 日本語の問いは疑問符を伴わず句点で閉じるのが普通。文末記号を許さないと
-    # 「…ありましたか。」が 1 件も当たらない。
-    r"[。．.、,！!\s\"'」』）)]*$",
+    rf"(?:{QUESTION_TAIL_RE.pattern}|ますか|[?？])" + _SENTENCE_CLOSE,
 )
 
 
@@ -1053,11 +1097,7 @@ class ComplexityClassifier:
         self._policy = policy
         self.is_long_form: bool = False
         self._learned_patterns = learned_patterns
-        # ツールパターン学習の閾値
         learning_cfg = self._config.get("learning", {})
-        self._tool_routing_threshold: float = learning_cfg.get(
-            "tool_pattern_match_threshold", 0.4,
-        )
         # 長文生成パターン学習の閾値 (ハードコード regex に加えて
         # `category="long_form"` の学習済みパターンも OR 判定する)
         self._long_form_threshold: float = learning_cfg.get(
@@ -1068,8 +1108,7 @@ class ComplexityClassifier:
         self,
         query: str,
         mode: str = "chat",
-        context_turns: int = 0,  # noqa: ARG002
-        context: str = "",
+        context: str | Callable[[], str] = "",
     ) -> str:
         """クエリの複雑度を分類する
 
@@ -1085,6 +1124,9 @@ class ComplexityClassifier:
         にする 2 ルールが「永久に false」と「恒真」になっていた (表末尾の
         ``default`` のコメント参照)。
 
+        ``context`` は文字列か、それを返す callable (遅延評価)。消費するのは
+        numeric_question ルールだけなので、そこへ到達しない呼出では組み立てない。
+
         Returns:
             "reactive" | "deliberative" | "meta_cognitive"
         """
@@ -1096,16 +1138,22 @@ class ComplexityClassifier:
         for rule in _CLASSIFY_RULES:
             if not rule.predicate(self, ctx):
                 continue
+            reason = rule.reason
+            layer = rule.layer
+            if layer == _META:
+                layer = self._guard_meta_cognitive()
+                if layer != "meta_cognitive":
+                    # 予算不足で deliberative へ降格したターンは long_form 経路
+                    # (ユニット分割生成) に乗らない。旧実装は is_long_form=True と
+                    # reason="long_form" を残したまま deliberative を返しており、
+                    # decision.jsonl では降格が見えなかった (2026-09-02 監査 D1)。
+                    reason = f"{reason}:budget_downgrade"
+                    self.is_long_form = False
+                    return self._record_classification(layer, reason, query)
             self.is_long_form = rule.long_form
-            layer = (
-                self._guard_meta_cognitive()
-                if rule.layer == _META
-                else rule.layer
-            )
-            return self._record_classification(layer, rule.reason, query)
+            return self._record_classification(layer, reason, query)
 
-        # 表は必ず default ルールで終わるため到達しない。
-        return self._record_classification("reactive", "default", query)
+        raise AssertionError("_CLASSIFY_RULES must end with an unconditional rule")
 
     def _record_classification(self, layer: str, reason: str, query: str) -> str:
         """分類結果をログし matched-rule 識別子を保持して layer を返す。
@@ -1115,7 +1163,7 @@ class ComplexityClassifier:
         (context={"mode": ...} と併せて policy_adjuster の mode 別学習へ供給)。
         """
         self._last_classify_reason = reason
-        logger.info("Classified as %s (%s): %s", layer, reason, query[:50])
+        logger.debug("Classified as %s (%s): %s", layer, reason, query[:50])
         return layer
 
     def _guard_meta_cognitive(self) -> str:
@@ -1263,25 +1311,14 @@ class ComplexityClassifier:
         # (long_form) は URL 内容を取得できず捏造するため、学習語が一致しても除外する。
         if _URL_HINT_RE.search(query):
             return False
-        # how-to / 質問形は「作成方法の説明」を求めているのであり、実際の生成を
-        # 依頼しているわけではない。_is_local_write_intent と同じ _HOWTO_QUERY_RE
-        # で除外しないと、「手順書を作成する方法を教えて」/ "How do I create a
-        # status report at <path>" のような howto 質問が実際に長文ドキュメントを
-        # 生成・書込みしてしまう (2026-07-22 ライブ検証で判明。JA/EN 両方で
-        # 再現し、PR#298-300 の対象範囲より前から存在した既存バグ)。
-        if _HOWTO_QUERY_RE.search(query):
-            return False
-        # 「見出しだけ並べて」型は既出成果物の抽出であって生成ではない。
-        if _EXTRACTION_REQUEST_RE.search(query):
-            return False
-        # 成果物 **について尋ねる問い** も生成依頼ではない。
+        # 成果物 **について尋ねる過去形の問い** は生成依頼ではない。
         #
         # 実インシデント (2026-08-27 ライブ監査 T10-7):
         # 「計画書の出力が途中で切れた部分はありましたか。」に対し
         # **「どのような内容・主題の文書をご希望ですか？」** と返した。
         # 「計画書」「出力」という語で長文生成候補になり、meta_cognitive が
         # 新規の文書生成依頼として受けてしまう。文末が問いなら生成しない。
-        if _ARTIFACT_QUESTION_RE.search(query):
+        if _ARTIFACT_PAST_QUESTION_RE.search(query):
             return False
         # ユーザー自身の予定・約束の申告も依頼ではない
         # (``_SELF_COMMITMENT_REPORT_RE`` のコメント参照)。
@@ -1294,8 +1331,25 @@ class ComplexityClassifier:
             and _WRITE_TO_FILE_VERB_RE.search(query)
         ):
             return False
+        # 「見出しだけ並べて」型は既出成果物の抽出であって生成ではない。
+        if _EXTRACTION_REQUEST_RE.search(query):
+            return False
+        # 明示的な分量指定は、丁寧な依頼形 (「〜くれますか？」) や how-to 除外より
+        # 先に見る。「3000字のレポートを書いてくれますか？」は疑問符で閉じて
+        # いても長文生成の依頼 (2026-09-02 監査 A1)。
         if requests_long_output(query):
             return True
+        # how-to は「作成方法の説明」を求めているのであり、実際の生成を
+        # 依頼しているわけではない。_is_local_write_intent と同じ _HOWTO_QUERY_RE
+        # で除外しないと、「手順書を作成する方法を教えて」/ "How do I create a
+        # status report at <path>" のような howto 質問が実際に長文ドキュメントを
+        # 生成・書込みしてしまう (2026-07-22 ライブ検証で判明。JA/EN 両方で
+        # 再現し、PR#298-300 の対象範囲より前から存在した既存バグ)。
+        if _HOWTO_QUERY_RE.search(query):
+            return False
+        # 成果物について尋ねる現在形の問い / 疑問符閉じも生成依頼ではない。
+        if _ARTIFACT_QUESTION_RE.search(query):
+            return False
         # 明示的な短さ指定は文書種別名詞より優先する。長文側を先に見ているので、
         # 「2000字で」のような明示的な長文指定があればそちらが勝つ。
         if requests_short_output(query):
@@ -1348,7 +1402,11 @@ class ComplexityClassifier:
 
     def _is_discourse_recall_query(self, query: str) -> bool:
         """会話で既出の事柄を問い直す想起形かを判定する (_DISCOURSE_RECALL_RE 参照)。"""
-        return bool(_DISCOURSE_RECALL_RE.search(query.strip()))
+        stripped = query.strip()
+        return bool(
+            _DISCOURSE_RECALL_RE.search(stripped)
+            or _DISCOURSE_RECALL_EN_RE.search(stripped),
+        )
 
     def _is_premise_confirmation_query(self, query: str) -> bool:
         """前提の同意を求める確認形かを判定する (_PREMISE_CONFIRMATION_RE 参照)。"""
@@ -1366,15 +1424,6 @@ class ComplexityClassifier:
     def _contains_executable_query_keywords(self, query: str) -> bool:
         """Python 実行で正確に答えられるクエリのキーワードを検出"""
         return is_environment_fact_query(query)
-
-    def _contains_learned_tool_patterns(self, query: str) -> bool:
-        """学習済み tool_routing パターンにマッチするか判定"""
-        if self._learned_patterns is None:
-            return False
-        matches = self._learned_patterns.match(query, category="tool_routing")
-        if not matches:
-            return False
-        return matches[0][1] >= self._tool_routing_threshold
 
     def _needs_tools(self, query: str) -> bool:
         """ツール呼び出しが必要なパターンを検出"""

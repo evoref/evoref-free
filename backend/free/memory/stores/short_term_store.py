@@ -39,8 +39,18 @@ class ShortTermMemoryStore:
         """`MemoryNote` 辞書を JSON-serializable な list[dict] に変換する。
 
         埋め込みベクトルは `tolist()` で list 化し、None ノートはそのまま保持。
+
+        ``private=True`` のノートは **書き出さない**。プライベートセッションの
+        ターンは WM/STM に留めてセッション終了で揮発する契約
+        (``PrivateSessionConfig``) で、平文でディスクに残してはいけない。
+
+        ``notes.values()`` は一度 list に写す — 保存は executor スレッドで走る
+        ため、チャット側の ``absorb`` と重なると dict の走査中変更で落ちる。
         """
-        return [_note_to_dict(note) for note in notes.values()]
+        return [
+            _note_to_dict(note) for note in list(notes.values())
+            if not note.private
+        ]
 
     @staticmethod
     def deserialize(data: list[dict]) -> dict[str, MemoryNote]:
@@ -57,8 +67,10 @@ class ShortTermMemoryStore:
         path: str | Path,
         *,
         allow_empty: bool = False,
-    ) -> None:
+    ) -> bool:
         """`notes` を JSON ファイルに書き出す。親ディレクトリは自動作成。
+
+        書き出したら ``True``、空上書きガードで拒否したら ``False``。
 
         **空の STM で既存スナップショットを上書きしない** (``allow_empty`` で解除)。
 
@@ -89,9 +101,10 @@ class ShortTermMemoryStore:
                     "snapshot holds %d notes. Pass allow_empty=True to clear "
                     "intentionally.", path, existing,
                 )
-                return
+                return False
         atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
         logger.info("Saved %d notes to %s", len(data), path)
+        return True
 
     @staticmethod
     def load(path: str | Path) -> dict[str, MemoryNote] | None:
@@ -140,6 +153,7 @@ def _note_to_dict(note: MemoryNote) -> dict:
         "keywords": note.keywords,
         "tags": note.tags,
         "embedding": note.embedding.tolist() if note.embedding is not None else None,
+        "embed_failures": note.embed_failures,
         "lightmem_score": note.lightmem_score,
         "created_at": note.created_at,
         "accessed_at": note.accessed_at,
@@ -167,11 +181,9 @@ def _note_to_dict(note: MemoryNote) -> dict:
         "tool_command": note.tool_command,
         "tool_command_name": note.tool_command_name,
         "tool_command_success": note.tool_command_success,
-        # 統合追加
-        "task_status": note.task_status,
-        "task_id": note.task_id,
-        "depends_on": list(note.depends_on),
-        "failure_signature": note.failure_signature,
+        "tool_command_source": note.tool_command_source,
+        "tool_command_query": note.tool_command_query,
+        "extraction_deferred": note.extraction_deferred,
         "trace_id": note.trace_id,
         "links": list(note.links),
         "cluster_id": note.cluster_id,
@@ -213,6 +225,7 @@ def _note_from_dict(d: dict) -> MemoryNote:
         keywords=d.get("keywords", []),
         tags=_sanitize_tags(d.get("tags", []), source),
         embedding=np.array(emb, dtype=np.float32) if emb is not None else None,
+        embed_failures=int(d.get("embed_failures", 0) or 0),
         lightmem_score=d.get("lightmem_score", 0.5),
         created_at=d.get("created_at", 0.0),
         accessed_at=d.get("accessed_at", 0.0),
@@ -240,11 +253,9 @@ def _note_from_dict(d: dict) -> MemoryNote:
         tool_command=d.get("tool_command"),
         tool_command_name=d.get("tool_command_name"),
         tool_command_success=d.get("tool_command_success"),
-        # 統合追加
-        task_status=d.get("task_status"),
-        task_id=d.get("task_id"),
-        depends_on=list(d.get("depends_on", [])),
-        failure_signature=d.get("failure_signature"),
+        tool_command_source=d.get("tool_command_source"),
+        tool_command_query=d.get("tool_command_query"),
+        extraction_deferred=bool(d.get("extraction_deferred", False)),
         trace_id=d.get("trace_id"),
         # 他フィールドと同じく防御的に読む。links / cluster_id だけ直アクセスだと
         # 1 ノートで両キーを欠くスナップショットが KeyError で deserialize 全体を

@@ -42,6 +42,30 @@ def meta_tool_routing_success(resp) -> bool:
     return any(tc.get("success") for tc in (getattr(resp, "tool_calls", None) or []))
 
 
+def meta_last_command_call(resp) -> dict:
+    """meta-cognitive 応答で最後に実行された run_command 系ツールを recorder 向けに要約する。
+
+    deliberative の ``tool_command*`` と同じ kwargs (``tool_command`` /
+    ``tool_command_name`` / ``tool_command_success``) を返す。meta 経路の
+    コマンド実行も STM ノートへ載せ、Step 8.6 の executable command 索引の
+    学習対象にするため (未使用なら空 dict)。判定層は meta では固定でないので
+    ``tool_command_source`` は付けない。
+    """
+    for tc in reversed(getattr(resp, "tool_calls", None) or []):
+        name = tc.get("tool", "")
+        if name not in ("run_command", "run_command_readonly"):
+            continue
+        command = (tc.get("args") or {}).get("command")
+        if not command:
+            continue
+        return {
+            "tool_command": str(command),
+            "tool_command_name": name,
+            "tool_command_success": bool(tc.get("success")),
+        }
+    return {}
+
+
 def meta_tool_routing_false_positive(resp) -> bool:
     """meta-cognitive 応答でツールを呼んだが全て失敗したか (tool_routing 誤検出)。
 

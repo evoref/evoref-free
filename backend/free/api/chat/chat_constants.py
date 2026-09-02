@@ -19,7 +19,8 @@ DEFAULT_MAX_TOKENS: int = 1024
 DEFAULT_GENERATION_RESERVE: int = 512
 
 #: build_messages_for_loop の working_max_tokens デフォルト
-DEFAULT_WORKING_MAX_TOKENS: int = 2048
+#: (backend/schemas/memory.py の既定値と同期させること)
+DEFAULT_WORKING_MAX_TOKENS: int = 4096
 
 #: config.yaml memory.history_min_tokens のフォールバック値
 #: (backend/schemas/memory.py の既定値と同期させること)

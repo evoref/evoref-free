@@ -27,7 +27,8 @@ from backend.free.core.text_quality import (
     match_length_directive,
 )
 from backend.free.core.turn_text import append_to_last_user, prepend_to_last_user
-from backend.config import resolve_context_size
+from backend.config import get_config, resolve_context_size
+from backend.i18n_helper import prompt_locale
 from backend.log_config import get_logger
 from backend.utils import compress_turn, estimate_tokens as _estimate_tokens
 
@@ -615,7 +616,7 @@ def _normalize_for_frame_dedup(text: str) -> str:
     落として突き合わせる。
     """
     stripped = re.sub(r"^\s*[-*]\s*", "", text.strip())
-    stripped = re.sub(r"^[（(]?過去の記録[）)]?\s*", "", stripped)
+    stripped = re.sub(r"^[（(]?(?:過去の記録|past record)[）)]?\s*", "", stripped)
     return re.sub(r"\s+", "", stripped)
 
 
@@ -895,6 +896,22 @@ def _select_rag_block(
 #: ラベルが 232 ターン中 92 ターンに載っていた)。
 _SEMMEM_BLOCK_LABEL = "[関連する記憶] (過去の記録。今回の会話と食い違えば今回が優先)"
 
+#: ``i18n.prompt_locale`` 別のラベル。ブロック名 ``[関連する記憶]`` は
+#: ``_REFERENCE_BLOCK_DIRECTIVES`` (chat.py) が両 locale で同じ文字列を指すので
+#: 変えない。``ja`` は :data:`_SEMMEM_BLOCK_LABEL` と同一 (既定出力は不変)。
+_SEMMEM_BLOCK_LABELS: dict[str, str] = {
+    "ja": _SEMMEM_BLOCK_LABEL,
+    "en": (
+        "[関連する記憶] (past records; if they conflict with this "
+        "conversation, this conversation wins)"
+    ),
+}
+
+
+def _semmem_block_label() -> str:
+    """prompt_locale に応じたメモリブロックのラベル (未知 locale は ja)。"""
+    return _SEMMEM_BLOCK_LABELS.get(prompt_locale(), _SEMMEM_BLOCK_LABEL)
+
 
 def _select_semmem_block(
     semmem_block: str | None,
@@ -908,7 +925,7 @@ def _select_semmem_block(
     """
     if not semmem_block or remaining <= 0:
         return None, remaining
-    labeled = f"{_SEMMEM_BLOCK_LABEL}\n{semmem_block}"
+    labeled = f"{_semmem_block_label()}\n{semmem_block}"
     cost = _estimate_tokens(labeled)
     if cost > remaining:
         logger.debug(
@@ -1086,9 +1103,14 @@ def build_messages(
     history_min_tokens: int = 0,
     slot_resolver: "Callable[[str], frozenset[tuple[str, str]]] | None" = None,
     artifact_block: str | None = None,
+    working_evict_block: int | None = None,
 ) -> list[ChatMessage]:
     """
     messages リストを組み立て、トークン予算内に収める。
+
+    ``working_evict_block`` (``memory.working_evict_block``) は履歴を切り落とす
+    ブロック幅の基準。``None`` ならロード済み config から読み、無ければ従来値
+    (:data:`_HISTORY_DROP_BLOCK`) に落ちる。
 
     テンプレート変換は LocalClient に委譲するため、
     ここではロール・内容の組み立てのみを担う。
@@ -1287,7 +1309,11 @@ def build_messages(
     )
     if latest_tokens > history_budget:
         history_budget = max(0, history_budget - _TRUNCATION_NOTE_RESERVE)
-    trimmed = _trim_history(history, history_budget)
+    if working_evict_block is None:
+        working_evict_block = _configured_working_evict_block()
+    trimmed = _trim_history(
+        history, history_budget, working_evict_block=working_evict_block,
+    )
     # 最新ターンが切られたかは dyn_parts 前置 (下) で内容が変わる前に判定する。
     truncation_note = _latest_turn_truncation_note(history, trimmed)
 
@@ -1415,7 +1441,10 @@ def build_messages_for_loop(
         sys_content = system
 
     working_max = cfg.get("memory", {}).get("working_max_tokens", DEFAULT_WORKING_MAX_TOKENS)
-    trimmed_history = _trim_history(history, min(remaining, working_max))
+    trimmed_history = _trim_history(
+        history, min(remaining, working_max),
+        working_evict_block=cfg.get("memory", {}).get("working_evict_block"),
+    )
 
     # build_messages と同じ注記を最後の user メッセージ末尾へ置く。
     # これが無いと Meta-Cognitive 層に振られたクエリにだけ現在日付・人格制約・
@@ -1548,12 +1577,46 @@ def _dropped_history_note(
         "_dropped_history_note: conversation-scope query with %d dropped "
         "message(s); adding visibility note", dropped,
     )
-    return (
-        f"[可視範囲] この会話の古い {dropped} メッセージは長さ制限で渡されて"
+    template = _DROPPED_HISTORY_NOTES.get(
+        prompt_locale(), _DROPPED_HISTORY_NOTES["ja"],
+    )
+    return template.format(dropped=dropped)
+
+
+#: :func:`_dropped_history_note` の本文 (``i18n.prompt_locale`` 別)。
+_DROPPED_HISTORY_NOTES: dict[str, str] = {
+    "ja": (
+        "[可視範囲] この会話の古い {dropped} メッセージは長さ制限で渡されて"
         "いない。会話の内容を振り返る問いには、見えている範囲だけで答え、"
         "見えていない前半がある旨を必ず明示すること。見えている範囲に該当が"
         "無ければ、別の話題で埋め合わせず「参照できない」と答えること。"
-    )
+    ),
+    "en": (
+        "[Visible range] The oldest {dropped} message(s) of this conversation "
+        "were not passed due to the length limit. When asked to recall this "
+        "conversation, answer only from the visible part and always state that "
+        "an earlier part is not visible. If nothing in the visible part "
+        "applies, say it cannot be referenced instead of substituting another "
+        "topic."
+    ),
+}
+
+#: :func:`_latest_turn_truncation_note` の本文 (``i18n.prompt_locale`` 別)。
+_LATEST_TURN_TRUNCATION_NOTES: dict[str, str] = {
+    "ja": (
+        "注: 直近の{role}発言は長さ制限で先頭のみ"
+        "渡されている (元 {original} 文字 / 渡した {kept} 文字)。"
+        "未渡し部分を見たものとして扱わず、全体の件数・集計・網羅列挙は"
+        "断定せず途中までしか読めていない旨を明示すること。"
+    ),
+    "en": (
+        "Note: only the beginning of the latest {role} message was passed "
+        "due to the length limit ({original} chars originally / {kept} chars "
+        "passed). Do not treat the unpassed part as seen; do not assert totals, "
+        "aggregates, or exhaustive lists, and state that only part of it was "
+        "read."
+    ),
+}
 
 
 def _latest_turn_truncation_note(
@@ -1581,11 +1644,13 @@ def _latest_turn_truncation_note(
     kept_text = str(kept.get("content") or "")
     if len(kept_text) >= len(original_text):
         return None
-    return (
-        f"注: 直近の{original.get('role', 'user')}発言は長さ制限で先頭のみ"
-        f"渡されている (元 {len(original_text)} 文字 / 渡した {len(kept_text)} 文字)。"
-        "未渡し部分を見たものとして扱わず、全体の件数・集計・網羅列挙は"
-        "断定せず途中までしか読めていない旨を明示すること。"
+    template = _LATEST_TURN_TRUNCATION_NOTES.get(
+        prompt_locale(), _LATEST_TURN_TRUNCATION_NOTES["ja"],
+    )
+    return template.format(
+        role=original.get("role", "user"),
+        original=len(original_text),
+        kept=len(kept_text),
     )
 
 
@@ -1594,12 +1659,44 @@ def _latest_turn_truncation_note(
 #: 接頭辞 KV キャッシュが **毎ターン** 無効化される (``WorkingMemory`` が
 #: ``working_evict_block`` で同じ問題を避けているのと同じ理由)。落とす数を
 #: ブロック単位へ切り上げて先頭をブロック境界で止め、次にブロックを跨ぐまで
-#: 保持集合をバイト単位で不変にする。12 = 6 往復。
+#: 保持集合をバイト単位で不変にする。
+#:
+#: 既定 12 = 6 往復 = ``memory.working_evict_block`` (既定 6) × 2。WM の押し出し
+#: 単位と独立な定数にしておくと **窓の先頭を決める主体が 2 つ** になり、config で
+#: ``working_evict_block`` を動かしても prompt 側だけ 12 のまま境界がずれる
+#: (2026-09-02 監査 C-1)。:func:`_history_drop_block` で config から導出し、
+#: config が無い経路 (テスト / 単体呼出) だけこの値に落ちる。
 _HISTORY_DROP_BLOCK = 12
+
+#: ``working_evict_block`` に対する倍率。prompt 側の窓は WM より短いので、WM の
+#: 1 押し出しで prompt 側が 2 回ずれないよう 2 ブロック分まとめて落とす。
+_HISTORY_DROP_BLOCK_PER_EVICT = 2
+
+
+def _history_drop_block(working_evict_block: int | None) -> int:
+    """履歴を落とすブロック幅 (メッセージ数) を ``working_evict_block`` から導く。
+
+    ``None`` / 1 未満のときは :data:`_HISTORY_DROP_BLOCK` (従来値 12)。
+    """
+    if working_evict_block is None or working_evict_block < 1:
+        return _HISTORY_DROP_BLOCK
+    return _HISTORY_DROP_BLOCK_PER_EVICT * int(working_evict_block)
+
+
+def _configured_working_evict_block() -> int | None:
+    """ロード済み config の ``memory.working_evict_block`` (未ロード / 未設定は None)。"""
+    try:
+        value = (get_config().get("memory") or {}).get("working_evict_block")
+    except Exception:
+        return None
+    return int(value) if isinstance(value, int) and value >= 1 else None
 
 
 def _quantize_history_drop(
-    history: list[ChatMessage], max_tokens: int,
+    history: list[ChatMessage],
+    max_tokens: int,
+    *,
+    block: int = _HISTORY_DROP_BLOCK,
 ) -> list[ChatMessage]:
     """予算超過分の切り落としをブロック単位へ切り上げた履歴を返す (純粋関数)。
 
@@ -1608,6 +1705,7 @@ def _quantize_history_drop(
     """
     if len(history) <= 1:
         return history
+    block = max(1, block)
     fit = 0
     total = 0
     for turn in reversed(history):
@@ -1618,11 +1716,11 @@ def _quantize_history_drop(
     if fit >= len(history):
         return history
     over = len(history) - fit
-    blocks = -(-over // _HISTORY_DROP_BLOCK)  # ceil
-    drop = min(len(history) - 1, blocks * _HISTORY_DROP_BLOCK)
+    blocks = -(-over // block)  # ceil
+    drop = min(len(history) - 1, blocks * block)
     logger.debug(
         "_trim_history: dropping %d oldest messages (need %d, block=%d)",
-        drop, over, _HISTORY_DROP_BLOCK,
+        drop, over, block,
     )
     return history[drop:]
 
@@ -1630,12 +1728,17 @@ def _quantize_history_drop(
 def _trim_history(
     history: list[ChatMessage],
     max_tokens: int,
+    *,
+    working_evict_block: int | None = None,
 ) -> list[ChatMessage]:
     """トークン予算に収まるよう、古い履歴を圧縮・削除する。
 
     **最新ターン (通常は現在の user 質問) は予算超過でも drop しない**: 予算に
     収まる長さへ圧縮して保持する (下限は compress_turn 既定の 200 字 ≈ 203 トークン
     で、超過分は呼び出し側の generation_reserve が吸収する)。
+
+    ``working_evict_block`` は WM の押し出し単位 (``memory.working_evict_block``)。
+    切り落としのブロック幅はその倍数 (:func:`_history_drop_block`) に揃える。
 
     トークン推定は estimate_tokens() を使用
     （CJK: 1文字≒1トークン、ASCII: 4文字≒1トークン）。
@@ -1645,7 +1748,9 @@ def _trim_history(
         return []
 
     original_len = len(history)
-    history = _quantize_history_drop(history, max_tokens)
+    history = _quantize_history_drop(
+        history, max_tokens, block=_history_drop_block(working_evict_block),
+    )
 
     result: list[ChatMessage] = []
     total_tokens = 0

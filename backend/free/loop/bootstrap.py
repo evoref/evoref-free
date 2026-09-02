@@ -167,7 +167,6 @@ def reset_episodic_context(
         wm_evicted_dropped = len(wm._evicted)
         wm.turns.clear()
         wm._evicted.clear()
-        wm.active_notes.clear()
 
     stm_notes_dropped = 0
     if stm is not None:

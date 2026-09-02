@@ -9,12 +9,10 @@ from __future__ import annotations
 
 import re
 
-from backend.free.agent.router import (
-    HISTORY_KEYWORDS,
-    HISTORY_KEYWORDS_EN,
-)
 from backend.free.agent.tool_judge_args import quoted_spans
 from backend.free.core.intent_vocab import (
+    HISTORY_KEYWORDS,
+    HISTORY_KEYWORDS_EN,
     PAST_RECALL_TAIL_RE,
     PROXIMAL_RECALL_KEYWORDS,
     has_history_recall_keyword,

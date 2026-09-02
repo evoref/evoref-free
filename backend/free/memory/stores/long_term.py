@@ -48,6 +48,11 @@ class LongTermMemory:
         #: が使う。``None`` ならベクトル単独 (従来動作) に縮退する。
         self._bm25: "BM25Retriever | None" = None
         self._rrf_k: int = DEFAULT_RRF_K
+        #: ``chunk_id -> speaker`` の遅延キャッシュ (``chunk_source`` 用)。
+        #: ``metadata`` を毎回線形走査すると検索 1 回あたり ``候補数 × 全件``
+        #: になる。構築時の件数を添え、件数が変わったら作り直す。
+        self._speaker_by_id: dict[str, str | None] | None = None
+        self._speaker_cache_count: int = -1
 
     def set_bm25_retriever(
         self, bm25: "BM25Retriever | None", *, rrf_k: int = DEFAULT_RRF_K,
@@ -75,12 +80,28 @@ class LongTermMemory:
         if meta.get("source"):
             return meta["source"]
         try:
-            for entry in getattr(self.vectors, "metadata", []) or []:
-                if entry.get("id") == chunk_id:
-                    return entry.get("speaker")
+            return self._speaker_index().get(chunk_id)
         except Exception:
             return None
-        return None
+
+    def _speaker_index(self) -> dict[str, str | None]:
+        """``metadata`` から ``chunk_id -> speaker`` を作る (件数が変わるまで再利用)。"""
+        metadata = getattr(self.vectors, "metadata", []) or []
+        if (
+            self._speaker_by_id is None
+            or self._speaker_cache_count != len(metadata)
+        ):
+            self._speaker_by_id = {
+                entry.get("id"): entry.get("speaker")
+                for entry in metadata if entry.get("id")
+            }
+            self._speaker_cache_count = len(metadata)
+        return self._speaker_by_id
+
+    def _invalidate_speaker_index(self) -> None:
+        """ベクトル追加後にキャッシュを捨てる (次の ``chunk_source`` で再構築)。"""
+        self._speaker_by_id = None
+        self._speaker_cache_count = -1
 
     def search(
         self,
@@ -292,6 +313,7 @@ class LongTermMemory:
         )
 
         chunk_id = chunk_ids[0]
+        self._invalidate_speaker_index()
         # EvorefMem: trace_id を note_meta に保存し
         # ファクトと episodic LTM チャンクを ``trace_id`` で連結可能にする。
         self.note_meta[chunk_id] = {
