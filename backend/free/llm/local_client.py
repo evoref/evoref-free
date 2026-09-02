@@ -7,12 +7,17 @@ import json
 
 import httpx
 
-from backend.exceptions import LLMConnectionError, LLMTimeoutError
+from backend.exceptions import (
+    LLMConnectionError,
+    LLMError,
+    LLMInvalidResponseError,
+    LLMRequestRejectedError,
+    LLMTimeoutError,
+)
 from backend.free.llm._base_client import (
+    GENERATION_RETRYABLE_EXCEPTIONS,
     BaseHTTPClient,
     HealthLogGate,
-    MAX_ATTEMPTS,
-    RETRYABLE_STATUS_CODES,
     async_retry_http_call,
     make_retry_logger,
 )
@@ -119,8 +124,6 @@ __all__ = [
     "SLOT_CHAT",
     "SLOT_BACKGROUND",
     "SLOT_CLASSIFIER",
-    "MAX_ATTEMPTS",
-    "RETRYABLE_STATUS_CODES",
 ]
 
 # ストリーミング設定
@@ -140,6 +143,24 @@ STREAM_FIRST_TOKEN_TIMEOUT = 60.0
 #: 同じ環境の実測は 70〜80 tok/s。壁時計の上限そのものは残さないと 51.9 分の
 #: ハング (2026-08-31 t06#10) を取り逃すので、**比例項を足すだけ** にする。
 STREAM_PREFILL_TOKENS_PER_SEC = 40.0
+#: 最初のデータが届いた後の **総壁時計** 締め切りを組む decode 速度の下限
+#: (tok/s)。締め切りは ``max_tokens / この値 + STREAM_TOTAL_DEADLINE_MARGIN``。
+#:
+#: 以前は最初のデータで壁時計の締め切りを **解除** し、以降は httpx の read
+#: タイムアウト (バイト間の空き) だけに委ねていた。``_ReasoningTimeoutTracker``
+#: も content が 1 つ出た時点で止まる。そのため 1 トークン / 数秒でだらだら流れる
+#: 詰まったスロットは誰も打ち切らず、ターンが実質ハングしていた。iGPU の実測
+#: (2〜4 tok/s) を大きく下回る 1 tok/s を下限にして、健全な低速生成は切らない。
+STREAM_MIN_DECODE_TPS = 1.0
+#: 総壁時計締め切りの固定マージン (秒)。prefill 後の再評価 / スロット切替の揺れ分。
+STREAM_TOTAL_DEADLINE_MARGIN = 30.0
+#: ``max_tokens`` がペイロードに無い (呼出側が None / 0 = 無制限を渡し、かつ
+#: ``context_size`` も不明で残量へクランプできなかった) ときに総壁時計の計算へ
+#: 使う仮の上限トークン数。
+STREAM_DEADLINE_FALLBACK_MAX_TOKENS = 4096
+#: ``context_size`` が不明なときに無制限要求へ被せる ``max_tokens`` の上限。
+#: 上限なしで投げると llama-server は n_ctx を使い切るまで生成する。
+UNBOUNDED_MAX_TOKENS_CAP = 4096
 STREAM_CONTENT_TIMEOUT_BASE = 30.0  # reasoning 開始から最初の content トークンまでの初期タイムアウト（秒）
 STREAM_CONTENT_TIMEOUT_EXTEND = 10.0  # reasoning チャンク受信ごとの延長（秒）
 STREAM_CONTENT_TIMEOUT_CAP = 120.0  # 最大タイムアウト上限（秒）
@@ -407,6 +428,116 @@ class _ReasoningTimeoutTracker:
         return now - self.start
 
 
+def _map_llama_error(exc: BaseException, *, host: str, label: str) -> BaseException:
+    """llama-server 呼出の例外を evoref の型付き例外へ正規化する。
+
+    ``_generate_sync`` / ``generate_constrained`` / ``generate_with_logprobs`` /
+    ``_generate_stream`` の 4 経路がそれぞれ別々に ``except httpx.ConnectError``
+    を書き、揃っていなかった (stream だけ ``RuntimeError``、logprobs は素通し)。
+    呼出側の degraded 分岐は ``LLMError`` 系で受けるので、ここで 1 箇所に集める。
+
+    ``httpx.HTTPStatusError`` は **そのまま返す** — ``tool_call_judge`` が 4xx
+    (``response_format`` 非対応 build) を status code で見て分類器を無効化する
+    契約に依存しており、型を変えると毎ターン 4xx を踏み直す。HTTP 応答の
+    型付き変換は :meth:`LocalClient._check_stream_response` (リトライを通らない
+    ストリーム経路) だけが行う。
+    """
+    if isinstance(exc, LLMError | httpx.HTTPStatusError):
+        return exc
+    if isinstance(exc, httpx.ConnectError):
+        return LLMConnectionError(f"llama-server unreachable: {exc}", host=host)
+    if isinstance(exc, httpx.RemoteProtocolError):
+        return LLMConnectionError(
+            f"llama-server closed the connection ({label}): {exc}", host=host,
+        )
+    if isinstance(exc, httpx.TimeoutException | TimeoutError):
+        return LLMTimeoutError(f"llama-server timeout ({label})", host=host)
+    if isinstance(exc, ValueError):
+        # ``resp.json()`` の失敗 (JSONDecodeError は ValueError 派生)
+        return LLMInvalidResponseError(
+            f"llama-server returned a non-JSON body ({label}): {exc}", host=host,
+        )
+    return exc
+
+
+#: ``_enforce_context_budget`` が中間切除の跡に残す注記。プロンプトへ入るので
+#: ``i18n.prompt_locale`` に従う (UI の locale とは独立)。
+_CTX_TRUNCATION_NOTICE: dict[str, str] = {
+    "ja": "\n…(コンテキスト予算超過のため中略)…\n",
+    "en": "\n…(omitted: context budget exceeded)…\n",
+}
+
+
+def _ctx_truncation_notice() -> str:
+    """現在の prompt locale に対応する中略注記を返す。"""
+    try:
+        from backend.i18n_helper import prompt_locale
+
+        return _CTX_TRUNCATION_NOTICE.get(prompt_locale(), _CTX_TRUNCATION_NOTICE["ja"])
+    except Exception:  # pragma: no cover - i18n 未初期化時の保険
+        return _CTX_TRUNCATION_NOTICE["ja"]
+
+
+#: ``turn_text.split_last_user`` が未提供のときの区切り (fallback 用)。
+#: ``core.inference._DYNAMIC_CONTEXT_DELIMITER`` / ``agent.deliberative`` の
+#: ``## ツール実行結果`` と同じ文字列。
+_FALLBACK_DYNAMIC_DELIMITER = "[ここまで参考枠 / ここからユーザーの発言]\n"
+_FALLBACK_TOOL_RESULT_HEADER = "## ツール実行結果"
+
+
+def _split_last_user_fallback(content: str) -> tuple[str, str, str]:
+    """``split_last_user`` が無いときの簡易分割 ``(prefix_blocks, raw_query, suffix)``。
+
+    前置ブロックは最後の動的区切りまで、後置はツール実行結果の見出し以降。
+    ``prefix + raw_query + suffix == content`` を保つ。
+    """
+    prefix = ""
+    body = content
+    idx = body.rfind(_FALLBACK_DYNAMIC_DELIMITER)
+    if idx >= 0:
+        cut = idx + len(_FALLBACK_DYNAMIC_DELIMITER)
+        prefix, body = body[:cut], body[cut:]
+    suffix = ""
+    tidx = body.find(_FALLBACK_TOOL_RESULT_HEADER)
+    if tidx > 0:
+        # 見出し直前の空行 (``\n\n## ツール実行結果``) も suffix 側へ寄せる
+        while tidx > 0 and body[tidx - 1] == "\n":
+            tidx -= 1
+        body, suffix = body[:tidx], body[tidx:]
+    return prefix, body, suffix
+
+
+def _split_last_user(content: str) -> tuple[str, str, str]:
+    """最後の user メッセージを ``(prefix_blocks, raw_query, suffix)`` に分ける。
+
+    ``backend.free.core.turn_text.split_last_user`` (区切りの SSOT) があれば
+    それを使い、無ければ :func:`_split_last_user_fallback`。
+    """
+    try:
+        from backend.free.core.turn_text import split_last_user
+    except ImportError:
+        return _split_last_user_fallback(content)
+    prefix, raw, suffix = split_last_user(content)
+    if not isinstance(prefix, str):
+        prefix = "".join(prefix)
+    if not isinstance(suffix, str):
+        suffix = "".join(suffix)
+    return prefix, raw, suffix
+
+
+def _history_drop_block() -> int:
+    """履歴をまとめて落とすブロック幅 (``core.inference._history_drop_block`` と同値)。"""
+    try:
+        from backend.free.core.inference import (
+            _configured_working_evict_block,
+            _history_drop_block,
+        )
+
+        return max(1, int(_history_drop_block(_configured_working_evict_block())))
+    except Exception:
+        return 12
+
+
 class LocalClient(BaseHTTPClient):
     """llama-server /v1/chat/completions クライアント
 
@@ -601,24 +732,34 @@ class LocalClient(BaseHTTPClient):
             "reserved max_tokens=%s); re-trimming before send",
             estimate, budget, self._context_size, max_tokens,
         )
-        # (1) 先頭の system 群と末尾メッセージ (現在ターン) を保持し、
-        #     間の古いメッセージから順に落とす
+        # (1) 先頭の system 群と末尾メッセージ (現在ターン) を保持し、間の古い
+        #     メッセージを **ブロック単位** で落とす。1 件ずつ落とすと窓の先頭が
+        #     毎ターンずれて接頭辞 KV キャッシュが効かなくなる (``_trim_history``
+        #     の量子化と同じ理由)。
         trimmed = list(messages)
+        block = _history_drop_block()
+        dropped_msgs = 0
         while len(trimmed) > 2 and self._estimate_prompt_tokens(trimmed) > budget:
-            for i, m in enumerate(trimmed[:-1]):
-                if m.get("role") != "system":
-                    dropped = trimmed.pop(i)
-                    logger.info(
-                        "Context guard dropped %s message (%d chars)",
-                        dropped.get("role"), len(str(dropped.get("content") or "")),
-                    )
-                    break
-            else:
+            droppable = [
+                i for i, m in enumerate(trimmed[:-1]) if m.get("role") != "system"
+            ]
+            if not droppable:
                 break
+            for i in sorted(droppable[:block], reverse=True):
+                trimmed.pop(i)
+            dropped_msgs += len(droppable[:block])
+        if dropped_msgs:
+            logger.info(
+                "Context guard dropped %d oldest history message(s) (block=%d)",
+                dropped_msgs, block,
+            )
 
-        # (2) それでも超過する場合は最大メッセージの中間を切除する
-        #     (system プロンプト先頭 / クエリ末尾のような重要部を残す)
-        for _ in range(20):
+        # (2) それでも超過する場合は最大メッセージを切り詰める。最後の user
+        #     メッセージ (現在ターン) は **生クエリを決して削らない** — 後置の
+        #     ツール実行結果の末尾 → 前置ブロック (RAG / 記憶 / few-shot) の先頭
+        #     の順で削る。それ以外のメッセージは中間切除 (先頭 / 末尾を残す)。
+        truncated_msgs = 0
+        for _ in range(40):
             if self._estimate_prompt_tokens(trimmed) <= budget:
                 break
             idx = max(
@@ -626,16 +767,22 @@ class LocalClient(BaseHTTPClient):
                 key=lambda i: len(str(trimmed[i].get("content") or "")),
             )
             content = str(trimmed[idx].get("content") or "")
-            if len(content) <= self._CTX_GUARD_MIN_CONTENT_CHARS:
+            is_last_user = idx == len(trimmed) - 1 and trimmed[idx].get("role") == "user"
+            if is_last_user:
+                over = self._estimate_prompt_tokens(trimmed) - budget
+                new_content = self._shrink_last_user(content, over)
+            elif len(content) > self._CTX_GUARD_MIN_CONTENT_CHARS:
+                keep_head = int(len(content) * 0.5)
+                keep_tail = int(len(content) * 0.25)
+                new_content = (
+                    content[:keep_head] + _ctx_truncation_notice() + content[-keep_tail:]
+                )
+            else:
+                new_content = content
+            if new_content == content:
                 break
-            keep_head = int(len(content) * 0.5)
-            keep_tail = int(len(content) * 0.25)
-            new_content = (
-                content[:keep_head]
-                + "\n…(コンテキスト予算超過のため中略)…\n"
-                + content[-keep_tail:]
-            )
             trimmed[idx] = {**trimmed[idx], "content": new_content}
+            truncated_msgs += 1
             logger.info(
                 "Context guard truncated %s message: %d -> %d chars",
                 trimmed[idx].get("role"), len(content), len(new_content),
@@ -647,7 +794,80 @@ class LocalClient(BaseHTTPClient):
                 "Context guard could not fully fit prompt (est=%d > budget=%d); "
                 "sending as-is", final, budget,
             )
+        stats = {
+            "n_ctx": self._context_size,
+            "budget_tokens": budget,
+            "reserved_max_tokens": max_tokens or 0,
+            "estimate_before": estimate,
+            "estimate_after": final,
+            "messages_before": len(messages),
+            "messages_after": len(trimmed),
+            "dropped_messages": dropped_msgs,
+            "truncated_messages": truncated_msgs,
+            "drop_block": block,
+        }
+        logger.debug("context_guard_fired: %s", stats)
+        dl = self._debug_logger
+        if dl is not None:
+            # 専用メソッドが無いので ``log_memory_op`` の (op, stats) 面へ載せる
+            # (debug_logger.py は本経路の管轄外)。
+            emit = getattr(dl, "log_context_guard", None) or getattr(dl, "log_memory_op", None)
+            if callable(emit):
+                try:
+                    emit("context_guard_fired", stats)
+                except Exception:  # pragma: no cover - ログ失敗で送信を止めない
+                    logger.debug("context_guard_fired log failed", exc_info=True)
         return trimmed
+
+    def _shrink_last_user(self, content: str, over_tokens: int) -> str:
+        """現在ターンの user メッセージを、生クエリを保ったまま縮める。
+
+        ``over_tokens`` ぶんの超過を目標に、後置の ``suffix`` (ツール実行結果
+        等) の **末尾** から削り、足りなければ前置ブロック (``prefix_blocks``)
+        の **先頭** から削る。生クエリ (``raw_query``) は 1 文字も触らない。
+        削れる余地が無ければ入力をそのまま返す (呼出側は不変で打ち切りを検知)。
+
+        例外は **メッセージ全体が生クエリ** (前置も後置も無い、貼り付け文書など)
+        で単独で予算を超える場合。そのまま送ると llama-server が HTTP 400 を
+        返して応答ごと失われるので、従来どおり中間切除 (先頭 / 末尾を残す) に
+        倒す。
+        """
+        prefix, raw, suffix = _split_last_user(content)
+        notice = _ctx_truncation_notice()
+        if not prefix.strip() and not suffix.strip():
+            if len(raw) <= self._CTX_GUARD_MIN_CONTENT_CHARS:
+                return content
+            keep_head = int(len(raw) * 0.5)
+            keep_tail = int(len(raw) * 0.25)
+            return raw[:keep_head] + notice + raw[-keep_tail:]
+        # 推定は CJK 1 文字 ≒ 1 トークン / ASCII 4 文字 ≒ 1 トークンなので、
+        # 文字数換算は素直に「トークン超過 × 実測比」で見積もる。注記を 2 箇所
+        # (suffix 末尾 / prefix 先頭) に足す分も上乗せする。
+        ratio = len(content) / max(1, estimate_tokens(content))
+        need_chars = int(over_tokens * ratio) + 2 * len(notice) + 1
+        # 前回の反復で足した注記は一度剥がしてから削る (剥がさないと注記の
+        # 断片が残骸として積み重なり、毎回の削減量も注記分だけ相殺される)。
+        if suffix.endswith(notice):
+            suffix = suffix[: -len(notice)]
+        if prefix.startswith(notice):
+            prefix = prefix[len(notice):]
+        if suffix.strip():
+            # 見出し行 (先頭の空行 + ``## ツール実行結果``) は残し、本文の末尾から削る。
+            stripped = suffix.lstrip("\n")
+            lead = len(suffix) - len(stripped)
+            nl = stripped.find("\n")
+            head_len = lead + (nl + 1 if nl >= 0 else len(stripped))
+            removable = len(suffix) - head_len
+            cut = min(removable, need_chars)
+            if cut > 0:
+                suffix = suffix[: len(suffix) - cut] + notice
+                need_chars -= cut
+        if need_chars > 0 and prefix.strip():
+            cut = min(len(prefix), need_chars)
+            if cut > 0:
+                prefix = notice + prefix[cut:]
+                need_chars -= cut
+        return prefix + raw + suffix
 
     def _build_payload(
         self,
@@ -664,9 +884,30 @@ class LocalClient(BaseHTTPClient):
         id_slot: int | None = None,
         **extra,
     ) -> dict:
-        """共通ペイロード構築"""
+        """共通ペイロード構築
+
+        ``max_tokens`` が ``None`` / ``0`` (config ``llama.max_tokens: 0`` = 無制限、
+        ``chat.py`` は ``or None`` で落とす) のときは **無制限で投げない**。
+        llama-server は n_ctx を使い切るまで生成し続け、ストリームの総壁時計
+        締め切りも組めない。``context_size`` が分かればプロンプト推定を引いた
+        残量へ、分からなければ ``UNBOUNDED_MAX_TOKENS_CAP`` へクランプする。
+        """
         msgs = self._apply_system_fallback(messages)
         msgs = self._enforce_context_budget(msgs, max_tokens=max_tokens)
+        if not max_tokens:
+            if self._context_size:
+                remaining = (
+                    self._context_size
+                    - self._estimate_prompt_tokens(msgs)
+                    - self._CTX_GUARD_MARGIN
+                )
+                max_tokens = max(self._CTX_GUARD_MIN_BUDGET_TOKENS, remaining)
+            else:
+                max_tokens = UNBOUNDED_MAX_TOKENS_CAP
+            logger.debug(
+                "max_tokens unspecified/0; clamped to %d (n_ctx=%s)",
+                max_tokens, self._context_size,
+            )
 
         payload: dict = {
             "messages": msgs,
@@ -823,11 +1064,13 @@ class LocalClient(BaseHTTPClient):
         """非ストリーミング推論（リトライ付き）
 
         ``request_timeout`` 指定時はこの呼び出しに限り per-request タイムアウトを
-        上書きする (``async_retry_http_call`` は ``MAX_ATTEMPTS`` 回まで per-attempt
-        でこのタイムアウトを適用するため、大きい値を渡すと worst case は
-        ``request_timeout × MAX_ATTEMPTS`` の壁時計時間になり得る点に注意)。
+        上書きする。推論中の ``ReadTimeout`` はリトライしない
+        (``GENERATION_RETRYABLE_EXCEPTIONS``) ので、遅い生成は 1 回の
+        ``request_timeout`` で ``LLMTimeoutError`` に確定する。接続フェーズの失敗
+        (ConnectError / 5xx / 429) だけが最大 ``MAX_ATTEMPTS`` 回再試行される。
         """
         client = self._get_http_client()
+        retry_logger = make_retry_logger(self._debug_logger, backend="base")
         logger.debug("Sync generate: POST %s/v1/chat/completions", self.url)
 
         async def _do_post() -> dict:
@@ -871,22 +1114,20 @@ class LocalClient(BaseHTTPClient):
             return await async_retry_http_call(
                 _do_post,
                 request_label="LLM request",
+                retry_logger=retry_logger,
+                retryable_exceptions=GENERATION_RETRYABLE_EXCEPTIONS,
             )
-        except httpx.ConnectError as e:
-            raise LLMConnectionError(
-                f"llama-server unreachable: {e}", host=self.url,
-            ) from e
-        except httpx.TimeoutException as e:
-            raise LLMTimeoutError(
-                "llama-server timeout after retries", host=self.url,
-            ) from e
+        except Exception as e:
+            raise _map_llama_error(e, host=self.url, label="sync") from e
 
-    @staticmethod
-    async def _check_stream_response(resp: httpx.Response) -> None:
-        """ステータスエラー時にボディを読んで RuntimeError を投げる + content-type 警告。
+    async def _check_stream_response(self, resp: httpx.Response) -> None:
+        """ステータスエラー時にボディを読んで型付き例外を投げる + content-type 警告。
 
         ストリーミング応答では `raise_for_status()` だとボディ未読のためエラー詳細が
         取得できない。手動でステータスを確認し、エラー時は `aread()` でボディを取得。
+        4xx (context 長超過 / 不正ペイロード) は ``LLMRequestRejectedError``、
+        5xx (スロット枯渇 / 内部エラー) は ``LLMError`` — 旧 ``RuntimeError`` は
+        呼出側の degraded 分岐 (``except LLMError``) をすり抜けていた。
         """
         if resp.status_code >= 400:
             await resp.aread()
@@ -894,9 +1135,12 @@ class LocalClient(BaseHTTPClient):
             logger.error(
                 "llama-server returned HTTP %d: %s", resp.status_code, body,
             )
-            raise RuntimeError(
-                f"llama-server HTTP {resp.status_code}: {body}"
-            )
+            message = f"llama-server HTTP {resp.status_code}: {body}"
+            if resp.status_code < 500:
+                raise LLMRequestRejectedError(
+                    message, host=self.url, http_status=resp.status_code,
+                )
+            raise LLMError(message, host=self.url, http_status=resp.status_code)
         content_type = resp.headers.get("content-type", "")
         logger.debug(
             "Stream response: status=%d, content-type=%s",
@@ -1013,14 +1257,32 @@ class LocalClient(BaseHTTPClient):
                     # まま = 1 行も届いていない)。ログは "after 60s" と出るので
                     # 実際の待ち時間が分からず、二重に紛らわしい。
                     #
-                    # 最初のデータが来るまでは壁時計で締め切り、来たら解除して
-                    # 以降は従来どおり read タイムアウトに委ねる。
+                    # 最初のデータが来るまでは壁時計で締め切り、来たら **総壁時計**
+                    # (``max_tokens / STREAM_MIN_DECODE_TPS + マージン``) へ組み直す。
+                    # 以前はここで締め切りを解除していたため、1 トークン / 数秒で
+                    # だらだら流れる詰まったスロットは誰も打ち切れなかった
+                    # (read タイムアウトは毎行リセットされ、reasoning tracker は
+                    # content が 1 つ出た時点で止まる)。組み直しは **最初のデータを
+                    # 観測した行で即座に** 行う — 次の行が届いてからでは、その行が
+                    # 遅い場合に最初のトークン用の短い締め切りが先に発火する。
+                    total_budget = (
+                        (payload.get("max_tokens") or STREAM_DEADLINE_FALLBACK_MAX_TOKENS)
+                        / STREAM_MIN_DECODE_TPS
+                        + STREAM_TOTAL_DEADLINE_MARGIN
+                    )
+                    loop = asyncio.get_running_loop()
                     async with asyncio.timeout(
                         first_token_budget,
-                    ) as first_token_deadline:
-                        async for line in resp.aiter_lines():
+                    ) as stream_deadline:
+
+                        def _arm_total_deadline() -> None:
+                            nonlocal first_data_received
                             if first_data_received:
-                                first_token_deadline.reschedule(None)
+                                return
+                            first_data_received = True
+                            stream_deadline.reschedule(loop.time() + total_budget)
+
+                        async for line in resp.aiter_lines():
                             line_count += 1
                             if line_count <= 3 or (line.startswith("data: ") and data_line_count < 3):
                                 logger.debug("SSE raw line #%d: %s", line_count, line[:300])
@@ -1052,7 +1314,7 @@ class LocalClient(BaseHTTPClient):
                                 self._last_timings = timings
 
                             if content:
-                                first_data_received = True
+                                _arm_total_deadline()
                                 filtered = reasoning_filter.feed(content)
                                 # 暴走 reasoning watchdog (docs/c_15 B3): 未閉じ <think> が
                                 # client_think_budget chunk を超えたらストリームを中断する
@@ -1081,7 +1343,7 @@ class LocalClient(BaseHTTPClient):
                                 continue
 
                             if reasoning:
-                                first_data_received = True
+                                _arm_total_deadline()
                                 if reasoning_timer.observe(_time.monotonic(), token_count):
                                     logger.warning(
                                         "Reasoning-only timeout: %.0fs without content tokens "
@@ -1143,14 +1405,11 @@ class LocalClient(BaseHTTPClient):
                             "the response is cut mid-sentence after %d tokens",
                             payload.get("max_tokens"), token_count,
                         )
-        except httpx.ConnectError as e:
-            raise LLMConnectionError(
-                f"llama-server unreachable: {e}", host=self.url,
-            ) from e
         except (httpx.TimeoutException, TimeoutError) as e:
             # ``TimeoutError`` は上の ``asyncio.timeout`` (最初のトークンまでの
-            # 壁時計の締め切り) 由来。httpx の read タイムアウトと同じ結末へ
-            # 落とす — 呼出側から見ればどちらも「llama-server が応答しない」。
+            # 壁時計、または最初のデータ後の総壁時計) 由来。httpx の read
+            # タイムアウトと同じ結末へ落とす — 呼出側から見ればどちらも
+            # 「llama-server が応答しない」。
             waited = _time.monotonic() - started_at
             if not first_data_received:
                 logger.warning(
@@ -1161,6 +1420,13 @@ class LocalClient(BaseHTTPClient):
                     "regularly exceeds this window)",
                     waited, first_token_budget, line_count, data_line_count,
                 )
+            else:
+                logger.warning(
+                    "Stream stalled: %.1fs elapsed, tokens=%d, reasoning=%d "
+                    "(total deadline %.0fs for max_tokens=%s at >= %.1f tok/s)",
+                    waited, token_count, reasoning_timer.count,
+                    total_budget, payload.get("max_tokens"), STREAM_MIN_DECODE_TPS,
+                )
             # ``asyncio.TimeoutError`` は ``str(e)`` が空。そのまま埋め込むと
             # ユーザーには ``Error: llama-server streaming timeout:`` という
             # 中身の無い行だけが表示される (2026-08-31 ライブ監査 T07#3 実測)。
@@ -1168,11 +1434,18 @@ class LocalClient(BaseHTTPClient):
             detail = str(e) or (
                 f"no data for {waited:.0f}s (budget {first_token_budget:.0f}s)"
                 if not first_data_received
-                else f"stream stalled after {waited:.0f}s"
+                else f"stream stalled after {waited:.0f}s ({token_count} tokens)"
             )
             raise LLMTimeoutError(
                 f"llama-server streaming timeout: {detail}", host=self.url,
             ) from e
+        except LLMError:
+            raise
+        except Exception as e:
+            mapped = _map_llama_error(e, host=self.url, label="stream")
+            if mapped is e:
+                raise
+            raise mapped from e
 
     async def generate_with_logprobs(
         self,
@@ -1210,11 +1483,15 @@ class LocalClient(BaseHTTPClient):
             resp.raise_for_status()
             return resp.json()
 
-        data = await async_retry_http_call(
-            _do_post,
-            request_label="LocalClient /v1/chat/completions (logprobs)",
-            retry_logger=retry_logger,
-        )
+        try:
+            data = await async_retry_http_call(
+                _do_post,
+                request_label="LocalClient /v1/chat/completions (logprobs)",
+                retry_logger=retry_logger,
+                retryable_exceptions=GENERATION_RETRYABLE_EXCEPTIONS,
+            )
+        except Exception as e:
+            raise _map_llama_error(e, host=self.url, label="logprobs") from e
 
         choice = data["choices"][0]
         content = choice["message"].get("content", "")
@@ -1235,8 +1512,21 @@ class LocalClient(BaseHTTPClient):
         max_tokens: int = 64,
         id_slot: int | None = None,
         timeout: float | None = None,
+        result_meta: dict | None = None,
     ) -> str | None:
         """``response_format`` (json_schema) で文法制約した非ストリーミング生成。
+
+        ``result_meta`` (省略可) を渡すと ``finish_reason`` を書き戻す。
+        ``"length"`` は max_tokens 到達 = JSON が途中で切れている印で、呼出側
+        (``AuxClient.generate_json``) は修復せず安全側の空応答へ倒す。戻り値の
+        型を変えない (``tool_call_judge`` / ``prompt_evolver`` は ``str | None``
+        を前提) ための out-param。
+
+        toggle 型 reasoning モデル (``enable_thinking`` を送っている構成) では
+        **常に ``enable_thinking=False`` を強制** する。判定 JSON の
+        ``max_tokens`` (既定 64) は思考で使い切られ、content が空のまま
+        ``finish_reason=length`` になる (quality_probe の
+        ``_reasoning_consumed_budget`` と同じ現象)。
 
         OAI ``tools`` を使わない理由は **強制力**。実測
         (2026-08-12, Qwen3.5-27B / gemma-4-12b) では ``tools`` は 200 で受理
@@ -1252,13 +1542,16 @@ class LocalClient(BaseHTTPClient):
             呼出側は必ずパース失敗を許容すること (capability probe が
             ``json_schema grammar not enforced`` を警告する構成が実在する)。
         """
+        extra: dict = {"response_format": response_format}
+        if self._enable_thinking is not None:
+            extra["chat_template_kwargs"] = {"enable_thinking": False}
         payload = self._build_payload(
             messages,
             stream=False,
             temperature=temperature,
             max_tokens=max_tokens,
             id_slot=id_slot,
-            response_format=response_format,
+            **extra,
         )
 
         client = self._get_http_client()
@@ -1273,15 +1566,22 @@ class LocalClient(BaseHTTPClient):
             resp.raise_for_status()
             return resp.json()
 
-        data = await async_retry_http_call(
-            _do_post,
-            request_label="LocalClient /v1/chat/completions (json_schema)",
-            retry_logger=retry_logger,
-        )
+        try:
+            data = await async_retry_http_call(
+                _do_post,
+                request_label="LocalClient /v1/chat/completions (json_schema)",
+                retry_logger=retry_logger,
+                retryable_exceptions=GENERATION_RETRYABLE_EXCEPTIONS,
+            )
+        except Exception as e:
+            raise _map_llama_error(e, host=self.url, label="json_schema") from e
         choices = data.get("choices") or [{}]
         message = choices[0].get("message") or {}
         content = message.get("content")
-        if choices[0].get("finish_reason") == "length":
+        finish_reason = choices[0].get("finish_reason")
+        if result_meta is not None:
+            result_meta["finish_reason"] = finish_reason
+        if finish_reason == "length":
             logger.warning(
                 "Constrained generation hit max_tokens=%d; output is likely "
                 "truncated mid-JSON", max_tokens,
@@ -1301,6 +1601,9 @@ class LocalClient(BaseHTTPClient):
                     self._health_log_gate.take_suppressed(),
                 )
             return healthy
-        except (httpx.ConnectError, httpx.TimeoutException):
-            logger.debug("Health check: connection failed")
+        except httpx.HTTPError as e:
+            # ConnectError / TimeoutException に加え RemoteProtocolError /
+            # ReadError (再起動中の切断) も「不健全」で受ける。取りこぼすと
+            # ポーリング側 (``/api/status``) まで例外が上がる。
+            logger.debug("Health check: request failed (%s)", type(e).__name__)
             return False

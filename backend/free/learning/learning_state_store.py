@@ -52,6 +52,10 @@ class LearningState:
     prev_correction_rate: float | None = None
     prev_rag_usage_rate: float | None = None
     priority_queue: list[PriorityRequest] = field(default_factory=list)
+    #: mode → 採用直後のプロンプトを自動ロールバックで監視するための基準
+    #: (``rollback_to`` / ``baseline`` / ``adopted_at`` / ``windows``)。
+    #: 監視が完了 (合格 or rollback) したら mode ごと削除される。
+    prompt_adoptions: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class LearningStateStore:
@@ -77,6 +81,7 @@ class LearningStateStore:
             "prev_correction_rate": state.prev_correction_rate,
             "prev_rag_usage_rate": state.prev_rag_usage_rate,
             "priority_queue": [r.to_dict() for r in state.priority_queue],
+            "prompt_adoptions": state.prompt_adoptions,
         }
 
     @staticmethod
@@ -164,6 +169,11 @@ class LearningStateStore:
             prev_correction_rate=data.get("prev_correction_rate"),
             prev_rag_usage_rate=data.get("prev_rag_usage_rate"),
             priority_queue=priority_queue,
+            prompt_adoptions={
+                str(k): dict(v)
+                for k, v in (data.get("prompt_adoptions") or {}).items()
+                if isinstance(v, dict)
+            },
         )
 
     @staticmethod

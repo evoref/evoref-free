@@ -44,7 +44,10 @@ if TYPE_CHECKING:
     from backend.free.memory.scheduler import SleepTimeScheduler
     from backend.free.memory.semantic.store import SemanticFactStore
     from backend.free.memory.stores.short_term import ShortTermMemory
-    from backend.free.memory.stores.working import WorkingMemory
+    from backend.free.memory.stores.working import (
+        WorkingMemory,
+        WorkingMemoryRegistry,
+    )
     from backend.free.rag.judge_usage_tracker import JudgeUsageTracker
     from backend.free.rag.embedding_backend import EmbeddingBackend
     from backend.free.rag.lazy_contextual import LazyContextualPrefixService
@@ -109,7 +112,13 @@ class AppState:
     aux_client: AuxClient | None = None
 
     # ── メモリシステム ──
+    # legacy: session_id を持たない読み手 (統計 API / テストの seam) 向け。
+    # 本番では ``working_memory_registry`` が SSOT で、この属性は **最後に触った
+    # セッション** の WM を返すプロパティになる (クラス定義直後で差し替え)。
+    # 応答パスは必ず ``get_memory_system(session_id)`` を使うこと。
     working_memory: WorkingMemory | None = None
+    # セッション別 WM の台帳 (``memory.working_max_sessions`` で LRU 上限)。
+    working_memory_registry: WorkingMemoryRegistry | None = None
     short_term_memory: ShortTermMemory | None = None
     long_term_memory: LongTermMemory | None = None
     # SemanticFactStore: scope ("global" or "project:<id>") -> store
@@ -128,16 +137,14 @@ class AppState:
     # の時のみ wire_pillars で構築・注入される。``None`` または
     # ``is_active=False`` の場合、search_pipeline 側は通知をスキップする。
     lazy_contextual: "LazyContextualPrefixService | None" = None
-    # Self-RAG quality_judge のセッション / クエリ単位カウンタ
-    # ``run_search_pipeline`` 経由で ``session_id`` と共に参照し、
-    # ``rag.self_rag.quality_judge.max_per_session`` / ``max_per_query`` の
+    # 内容精査ゲート (``ChunkContentGate``、``rag.self_rag.content_gate.*``) の
+    # セッション / クエリ単位の aux 発火カウンタ。``run_search_pipeline`` 経由で
+    # ``session_id`` と共に参照し、``max_per_session`` / ``max_per_query`` の
     # 上限判定とセッション切替時のリセット (``reset_session``) を担う。
     judge_tracker: "JudgeUsageTracker | None" = None
-    # conflict_chat_judge のセッション単位発火カウンタ (RAG 用とは別インスタンス)。
-    # ``maybe_resolve_pending_conflicts`` が ``memory.conflict.chat_review
-    # .max_judge_per_session`` の上限判定とセッション切替リセットに使う。
-    # ``check()`` は使わず ``record`` / ``get_session_count`` / ``reset_session``
-    # のみ利用する。
+    # 競合確認のセッション単位カウンタ (RAG 用とは別インスタンス)。旧
+    # ``conflict_chat_judge`` 経路は撤去済みで、現在は ``prepare_memory_context``
+    # のセッション切替時 ``reset_session`` にしか使われない (予約)。
     conflict_judge_tracker: "JudgeUsageTracker | None" = None
     # 埋め込みモデルとストアの次元不一致フラグ
     embedding_dim_mismatch: bool = False
@@ -252,9 +259,19 @@ class AppState:
     # ── メモリシステムアクセス ──
 
     def get_memory_system(
-        self,
+        self, session_id: str | None = None,
     ) -> tuple[WorkingMemory, ShortTermMemory, LongTermMemory] | None:
-        """メモリシステム 3 層を返す（未初期化時は None）"""
+        """メモリシステム 3 層を返す（未初期化時は None）
+
+        ``session_id`` を渡すとそのセッションの WM (無ければ作る) を返す。
+        応答パスの読み書きはこちら。省略時は legacy 動作で、最後に触った
+        セッションの WM (台帳が空なら空の窓) — 統計 API 等、セッションを
+        持たない読み手専用で、並行セッション下では「誰の窓か」が定まらない。
+        """
+        registry = self.working_memory_registry
+        if registry is not None:
+            wm = registry.get(session_id) if session_id else registry.current()
+            return wm, self.short_term_memory, self.long_term_memory
         if self.working_memory is None:
             return None
         return self.working_memory, self.short_term_memory, self.long_term_memory
@@ -325,9 +342,10 @@ class AppState:
             from backend.free.llm.llm_client import LLMClient
             self.llm_client = LLMClient(local=client)
 
-        # ToolCallJudge._llm_client を同期 (ネイティブ tool calling 用)。
-        # モード切替の base 再起動でクライアントが差し替わるため、ここで
-        # 追随しないと judge が閉じた旧オブジェクトを掴んだままになる。
+        # ToolCallJudge._llm_client を同期 (文法制約 JSON のツール分類器が
+        # ``generate_constrained`` を叩く)。モード切替の base 再起動でクライアント
+        # が差し替わるため、ここで追随しないと judge が閉じた旧オブジェクトを
+        # 掴んだままになる。
         judge = self.tool_call_judge
         if judge is not None and hasattr(judge, "_llm_client"):
             judge._llm_client = client
@@ -335,8 +353,16 @@ class AppState:
         # 補助クライアントは同じ LocalClient の上に立つ。base を差し替えたら
         # ここで追随させないと、閉じた旧クライアントを掴んだまま補助タスクが
         # 全滅する (モード切替で base を再起動するたびに再現する)。
+        # ``rebind`` は較正値のモデルキーも再解決する (差し替えた base が別
+        # モデルなら旧モデルの timeout 較正を引き継がない)。config が読めない
+        # 経路 (テスト) では local の差し替えだけ行う。
         if self.aux_client is not None:
-            self.aux_client.local = client
+            try:
+                from backend.config import get_config
+                cfg = get_config()
+            except Exception:
+                cfg = None
+            self.aux_client.rebind(client, cfg)
 
         # SleepTimeScheduler にも追随させる。Level 1 常駐ループは
         # ``_llm_client is None`` の tick を毎回 skip するため、起動時に
@@ -387,3 +413,22 @@ class AppState:
 def get_app_state(request: Request) -> AppState:
     """FastAPI 依存性注入: リクエストから AppState を取得する"""
     return request.app.state.app_state
+
+
+def _legacy_working_memory(self: AppState) -> "WorkingMemory | None":
+    registry = self.working_memory_registry
+    if registry is not None:
+        return registry.current()
+    return self.__dict__.get("_working_memory_legacy")
+
+
+def _set_legacy_working_memory(self: AppState, wm: "WorkingMemory | None") -> None:
+    self.__dict__["_working_memory_legacy"] = wm
+
+
+# dataclass の ``__init__`` は ``self.working_memory = ...`` を実行するので、
+# フィールド宣言の既定値 (None) を dataclass に取り込ませた後でプロパティに
+# 差し替える。コンストラクタ引数 ``working_memory=`` と代入はそのまま通り、
+# 読み出しは台帳があれば最後に触ったセッションの WM を返す (legacy 読み手用)。
+AppState.working_memory = property(_legacy_working_memory, _set_legacy_working_memory)  # type: ignore[assignment]
+

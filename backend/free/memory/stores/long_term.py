@@ -108,13 +108,19 @@ class LongTermMemory:
         query_vec: np.ndarray,
         top_k: int = 5,
         tag_filter: list[str] | None = None,
+        rescore_candidates: int = 0,
     ) -> list[tuple[str, float, str]]:
         """ベクトル検索 + オプショナルタグフィルタ
+
+        ``rescore_candidates`` は ``VectorStore.search`` の float32 rescore
+        候補数 (``rag.rescore_candidates``、0 でストア側の既定)。
 
         Returns:
             list of (chunk_id, score, chunk_text)
         """
-        candidates = self.vectors.search(query_vec, top_k=top_k * 2)
+        candidates = self.vectors.search(
+            query_vec, top_k=top_k * 2, rescore_candidates=rescore_candidates,
+        )
         logger.debug("LTM search: %d candidates from vector store (fetch_k=%d)", len(candidates), top_k * 2)
 
         # 問いだけのチャンクは答えを含まないので、検索で当たっても参考情報に
@@ -195,6 +201,7 @@ class LongTermMemory:
         query_text: str,
         top_k: int = 5,
         tag_filter: list[str] | None = None,
+        rescore_candidates: int = 0,
     ) -> tuple[list[tuple[str, float, str]], frozenset[str]]:
         """ベクトル + BM25 の RRF ハイブリッド検索。
 
@@ -217,7 +224,9 @@ class LongTermMemory:
             免除する根拠に使う (:mod:`search_pipeline` Step 6.5)。
         """
         fetch_k = max(1, top_k) * 2
-        vec_hits = self.vectors.search(query_vec, top_k=fetch_k)
+        vec_hits = self.vectors.search(
+            query_vec, top_k=fetch_k, rescore_candidates=rescore_candidates,
+        )
         if self._bm25 is None or not (query_text or "").strip():
             candidates = self._apply_tag_filter(
                 self._drop_question_only(vec_hits), tag_filter,

@@ -862,14 +862,22 @@ async def reload_model(state: AppState = Depends(get_app_state)):
 
         # model_state 更新
         model_state = _get_model_state()
+        new_base_filename = Path(
+            cfg.get("model_paths", {}).get("base_model") or ""
+        ).name
         model_state.update_current(
-            filename=Path(
-                cfg.get("model_paths", {}).get("base_model") or ""
-            ).name,
+            filename=new_base_filename,
             chat_template_name=metadata.chat_template[:50] if metadata.chat_template else "",
             has_system_role=metadata.has_system_role,
         )
         model_state.save()
+
+        # base 切替が成立したので Learn pillar を新パーティションへ束ね直す
+        # (experience / base prompts / fewshot / policy)。同一モデルの再接続なら
+        # rebind 側が "unchanged" で no-op。
+        from backend.free.api.config.component_reload import follow_base_model_rebind
+
+        follow_base_model_rebind(state, new_base_filename)
 
         logger.info(
             "Model reloaded: model_id=%s, has_system_role=%s",

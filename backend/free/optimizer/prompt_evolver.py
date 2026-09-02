@@ -26,7 +26,8 @@ from backend.log_config import get_logger
 
 if TYPE_CHECKING:
     from backend.free.learning.critique_synthesizer import CritiqueSynthesizer
-    from backend.free.learning.level1_session import Level1Session
+from backend.free.learning.fitness import DEFECT_WEIGHTS, defect_rate_fitness
+from backend.free.learning.level1_session import Level1Session
 
 logger = get_logger("optimizer.prompt_evolver")
 
@@ -46,6 +47,37 @@ _CONTEXT_SAFETY_MARGIN = 256
 # 追記を含む) は非類似=採用に倒す (no-op 誤判定で全変異を棄却した旧バグの逆方向)。
 _TEXT_SIMILARITY_THRESHOLD = 0.97
 _TEXT_LEN_DELTA = 5
+
+#: base prompt 進化の欠陥重み: 共有表 (fitness.DEFECT_WEIGHTS) に、prompt 固有の
+#: 派生欠陥 2 種を足す。``turn_outcome=failed`` は出力が壊れていたターンの SSOT
+#: (2026-07-28 調査: 無罰点のまま壊れた応答を生むプロンプトが採用され続けた)。
+#: long_form 検証失敗は create モードの主要な失敗シグナル (2026-07-17 実データで
+#: rephrase/correction が 21 件中 0 件)。``conversation_ended`` は **主項に置かない**
+#: (読み込み時に全件へ立つため恒真、docs/f_04 §8 禁則 7)。
+PROMPT_DEFECT_WEIGHTS: dict[str, float] = {
+    **DEFECT_WEIGHTS,
+    "turn_outcome_failed": 0.8,
+    "long_form_failed": 0.5,
+}
+
+#: 候補長のハードゲート: 現行の ``LENGTH_GATE_RATIO`` 倍か ``+LENGTH_GATE_SLACK_CHARS``
+#: 文字の大きい方を超えた候補は fitness 0.0 で棄却する。旧実装は 2000 文字超で
+#: -0.02 の軟ペナルティしか無く、失敗語カバー率ボーナス (+0.1) が常にそれを
+#: 上回るため「失敗クエリの語を詰め込んで伸びる」方向が選択的優位だった (L-A3)。
+LENGTH_GATE_RATIO = 1.2
+LENGTH_GATE_SLACK_CHARS = 400
+
+#: 失敗クエリ語カバー率のボーナス上限。候補間のタイブレークにだけ使い、欠陥率
+#: (base) を覆さない。
+COVERAGE_TIEBREAK_MAX = 0.01
+
+
+def max_candidate_len(reference_len: int) -> int:
+    """現行プロンプト長 ``reference_len`` に対して許容する候補の最大長。"""
+    return int(max(
+        reference_len * LENGTH_GATE_RATIO,
+        reference_len + LENGTH_GATE_SLACK_CHARS,
+    ))
 
 # ── サーキットブレーカー閾値 ──
 # 連続失敗回数がこの閾値以上で早期終了
@@ -334,26 +366,35 @@ class PromptEvolver:
     経験バッファに基づく適応度計算でプロンプトを段階的に改善する。
     """
 
+    #: ``_darwinian_evolve`` が現行プロンプト長をセットする (長さゲートの基準)。
+    #: ``None`` ならゲート無し (単体テスト / 直接呼出)。
+    _reference_len: int | None = None
+
     def _calc_fitness(
         self,
         candidate: str,
         experiences: list[dict],
+        *,
+        reference_len: int | None = None,
     ) -> float:
         """経験バッファに基づく適応度計算
 
-        成功率ベースのスコアリング:
-        - conversation_ended=True → 成功（ユーザーが満足して離脱）
+        欠陥率ベース (:func:`backend.free.learning.fitness.defect_rate_fitness`、
+        重みは :data:`PROMPT_DEFECT_WEIGHTS`):
         - turn_outcome="failed" → 失敗（出力が壊れていたターンの SSOT）
         - rephrased_query=True → 失敗（ユーザーが言い直した）
-        - user_correction is not None → 失敗（ユーザーが訂正した）
+        - user_correction → 失敗（ユーザーが訂正した）
         - long_form_used かつ long_form_success=False → 失敗（生成物が検証エラー）
+        - ``conversation_ended`` は使わない (読み込み時に全件へ立つ恒真信号)
 
-        候補テキストの特徴（長さ、キーワード含有）も考慮し、
-        同一経験でも異なるプロンプトが異なるスコアを持つようにする。
+        候補テキスト由来の項は 2 つだけ:
+        - 長さゲート: ``max_candidate_len(reference_len)`` 超は 0.0 (棄却)
+        - 失敗クエリ語カバー率: 最大 :data:`COVERAGE_TIEBREAK_MAX` のタイブレーク
 
         Args:
             candidate: プロンプト候補テキスト
             experiences: 経験バッファのエントリリスト
+            reference_len: 現行プロンプト長 (省略時は ``self._reference_len``)
 
         Returns:
             適応度スコア (0.0〜1.0)
@@ -361,67 +402,20 @@ class PromptEvolver:
         if not experiences:
             return 0.5  # デフォルト中立スコア
 
-        total_weight = 0.0
-        score = 0.0
+        ref = self._reference_len if reference_len is None else reference_len
+        if ref is not None and len(candidate) > max_candidate_len(ref):
+            return 0.0
 
-        for exp in experiences:
-            signals = exp.get("signals", {})
-            weight = 1.0
-
-            # 成功シグナル
-            if signals.get("conversation_ended", False):
-                score += weight * 1.0
-
-            # 失敗シグナル
-            # turn_outcome は「このターンの出力が壊れていたか」の SSOT
-            # ([failed] マーカー / step_credits / オウム返し検出等から導出) だが、
-            # fitness はこれを一切見ておらず、壊れた応答を生むプロンプトが
-            # 無罰点のまま採用され続けていた (2026-07-28 調査: 経験 334 件のうち
-            # turn_outcome=failed が 4 件あるのに fitness の入力は 0 件)。
-            # critique_synthesizer / fewshot_pool は既に turn_outcome を見て
-            # いるので、Level 1 の選択圧だけが取り残されていた形。
-            # user_correction とは独立に導出されるため二重計上ではない
-            # (両方立つターンは実際に二重に悪い)。
-            if signals.get("turn_outcome") == "failed":
-                score -= weight * 0.8
-
-            if signals.get("rephrased_query", False):
-                score -= weight * 0.5
-
-            if signals.get("user_correction") is not None:
-                score -= weight * 0.8
-
-            # 長文生成 (create モードの成果物) の検証失敗も失敗シグナル。
-            # create モードは会話が単発で完結しがちで rephrase/user_correction が
-            # 皆無になりやすく (2026-07-17 実データで 21 件中 0 件)、この信号が
-            # ないと create モードの経験が base_score に一切反映されない。
-            if signals.get("long_form_used") and signals.get("long_form_success") is False:
-                score -= weight * 0.5
-
-            # RAG 使用はニュートラル
-            total_weight += weight
-
-        if total_weight == 0:
+        base_score = defect_rate_fitness(experiences, weights=PROMPT_DEFECT_WEIGHTS)
+        if base_score is None:
             return 0.5
 
-        base_score = (score / total_weight + 1) / 2
-
-        # プロンプト候補の特徴によるボーナス/ペナルティ。
         # 1 回の進化ランでは experiences が固定なので base_score は全候補で同一に
-        # なる。候補テキスト由来の差分をここで与えないと全候補が同 fitness に潰れ、
-        # _run_one_generation の strict > 置換が一度も発火せず進化が no-op 化する
-        # (initial==final が 10 世代続く)。base_score を支配項に保ちつつ、候補間を
-        # 識別できる有界な重みを与えて選択圧を回復する (重みは base_score を覆さない)。
+        # なる。候補間の識別は失敗クエリ語カバー率のタイブレークで与える
+        # (無いと strict > 置換が一度も発火せず進化が no-op 化する)。ただし
+        # 上限は base_score を覆さない大きさに留める (L-A3)。
         candidate_lower = candidate.lower()
         bonus = 0.0
-
-        # 失敗した経験のクエリ主要語を、その候補がどれだけカバーしているか
-        # (カバー率)。候補ごとに値が変わるため候補間識別の主因。最大 +0.1。
-        # rephrased_query/user_correction に加え、長文生成の検証失敗
-        # (long_form_used かつ long_form_success=False) も失敗経験として含める
-        # (create モードは前者 2 シグナルがほぼ発生しないため、これが無いと
-        # failure_keywords が常に空集合になり全候補の fitness が完全に一致する
-        # = 進化が no-op 化する 2026-07-17 の実障害と同じ状態になる)。
         failure_keywords: set[str] = set()
         for exp in experiences:
             signals = exp.get("signals", {})
@@ -439,17 +433,13 @@ class PromptEvolver:
                 )
         if failure_keywords:
             covered = sum(1 for w in failure_keywords if w in candidate_lower)
-            bonus += 0.1 * (covered / len(failure_keywords))
+            bonus += COVERAGE_TIEBREAK_MAX * (covered / len(failure_keywords))
 
-        # プロンプト長の適切さ（短すぎず長すぎない）
-        prompt_len = len(candidate)
-        if prompt_len < 50:
+        # 極端に短い候補 (指示が消えた) は罰する。長い側はハードゲートが担う。
+        if len(candidate) < 50:
             bonus -= 0.05
-        elif prompt_len > 2000:
-            bonus -= 0.02
 
-        raw = base_score + bonus
-        return max(0.0, min(1.0, raw))
+        return max(0.0, min(1.0, base_score + bonus))
 
     async def _score_candidate(
         self,
@@ -949,11 +939,15 @@ class PromptEvolver:
         cb: _CircuitBreaker,
         on_generation_complete: Callable[[int, PromptCandidate], None] | None,
         yield_check: Callable[[], bool] | None,
+        start_gen: int = 1,
     ) -> tuple[int, bool]:
-        """世代ループを実行する。`(generations_run, yielded)` を返す"""
-        generations_run = 0
+        """世代ループを実行する。`(generations_run, yielded)` を返す
+
+        ``start_gen`` は yield からの再開位置 (``phase_state`` の generation + 1)。
+        """
+        generations_run = max(0, start_gen - 1)
         yielded = False
-        for gen in range(1, generations + 1):
+        for gen in range(start_gen, generations + 1):
             if cb.tripped or cb.should_stop():
                 cb.tripped = True
                 logger.info(
@@ -1012,6 +1006,7 @@ class PromptEvolver:
         critique_synthesizer: CritiqueSynthesizer | None = None,
         yield_check: Callable[[], bool] | None = None,
         on_generation_complete: Callable[[int, PromptCandidate], None] | None = None,
+        resume_state: dict | None = None,
     ) -> EvolutionResult:
         """進化ループ (instruction-only)
 
@@ -1023,6 +1018,10 @@ class PromptEvolver:
             population_size: 集団サイズ
             seed: 乱数シード
             critique_synthesizer: 批評合成器。指定時は変異前に批評を実行
+            resume_state: yield 時に :meth:`_handle_mode_yield` が
+                ``Level1Session.phase_state[mode]`` へ保存した進捗
+                (``population`` / ``generation`` / ``initial_fitness``)。
+                指定時は初期集団の構築を飛ばし、その世代の次から再開する。
 
         Returns:
             進化結果
@@ -1035,42 +1034,57 @@ class PromptEvolver:
         has_protected = bool(extract_protected_sections(current))
 
         cb = _CircuitBreaker()
+        # 長さゲートの基準 = 現行プロンプト長 (このモードの進化中だけ有効)。
+        self._reference_len = len(current)
+        try:
+            resumed = self._restore_population(resume_state)
+            if resumed is not None:
+                population, initial_fitness, start_gen = resumed
+                logger.info(
+                    "Resuming evolution from generation %d (%d candidates)",
+                    start_gen, len(population),
+                )
+            else:
+                start_gen = 1
+                population, initial_fitness = await self._build_initial_population(
+                    current=current,
+                    failure_hints=failure_hints,
+                    llm_client=llm_client,
+                    population_size=population_size,
+                    has_protected=has_protected,
+                    experiences=experiences,
+                    cb=cb,
+                )
 
-        population, initial_fitness = await self._build_initial_population(
-            current=current,
-            failure_hints=failure_hints,
-            llm_client=llm_client,
-            population_size=population_size,
-            has_protected=has_protected,
-            experiences=experiences,
-            cb=cb,
-        )
+                unique_count = len({c.text for c in population})
+                logger.info(
+                    "Initial population: %d candidates (%d unique), "
+                    "fitness range [%.4f, %.4f]",
+                    len(population),
+                    unique_count,
+                    min(c.fitness for c in population),
+                    max(c.fitness for c in population),
+                )
 
-        unique_count = len({c.text for c in population})
-        logger.info(
-            "Initial population: %d candidates (%d unique), fitness range [%.4f, %.4f]",
-            len(population),
-            unique_count,
-            min(c.fitness for c in population),
-            max(c.fitness for c in population),
-        )
+            # 世代ループ
+            generations_run, yielded = await self._run_evolution_loop(
+                population=population,
+                current=current,
+                failure_hints=failure_hints,
+                llm_client=llm_client,
+                generations=generations,
+                has_protected=has_protected,
+                experiences=experiences,
+                seed=seed,
+                cb=cb,
+                on_generation_complete=on_generation_complete,
+                yield_check=yield_check,
+                start_gen=start_gen,
+            )
 
-        # 世代ループ
-        generations_run, yielded = await self._run_evolution_loop(
-            population=population,
-            current=current,
-            failure_hints=failure_hints,
-            llm_client=llm_client,
-            generations=generations,
-            has_protected=has_protected,
-            experiences=experiences,
-            seed=seed,
-            cb=cb,
-            on_generation_complete=on_generation_complete,
-            yield_check=yield_check,
-        )
-
-        best = self._finalize_best_candidate(population, current, has_protected)
+            best = self._finalize_best_candidate(population, current, has_protected)
+        finally:
+            self._reference_len = None
 
         return EvolutionResult(
             best_candidate=best,
@@ -1082,6 +1096,49 @@ class PromptEvolver:
             mutation_attempts=cb.total_attempts,
             mutation_failures=cb.total_failures,
         )
+
+    @staticmethod
+    def _restore_population(
+        resume_state: dict | None,
+    ) -> tuple[list[PromptCandidate], float, int] | None:
+        """``phase_state[mode]`` から (population, initial_fitness, start_gen) を復元する。
+
+        復元できない (未保存 / 空 / 壊れている) 場合は ``None``。
+        """
+        if not resume_state:
+            return None
+        raw = resume_state.get("population")
+        if not isinstance(raw, list) or not raw:
+            return None
+        population: list[PromptCandidate] = []
+        for item in raw:
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+                continue
+            population.append(PromptCandidate(
+                text=item["text"],
+                fitness=float(item.get("fitness", 0.0) or 0.0),
+                generation=int(item.get("generation", 0) or 0),
+            ))
+        if not population:
+            return None
+        initial_fitness = float(
+            resume_state.get("initial_fitness", population[0].fitness),
+        )
+        start_gen = int(resume_state.get("generation", 0) or 0) + 1
+        return population, initial_fitness, start_gen
+
+    @staticmethod
+    def _snapshot_progress(result: EvolutionResult) -> dict:
+        """yield 時に ``phase_state[mode]`` へ書く進捗 (再開に必要な最小集合)。"""
+        return {
+            "generation": result.generations_run,
+            "initial_fitness": result.initial_fitness,
+            "best": result.best_candidate.text,
+            "population": [
+                {"text": c.text, "fitness": c.fitness, "generation": c.generation}
+                for c in result.all_candidates
+            ],
+        }
 
     @staticmethod
     def _persist_session_safely(
@@ -1104,9 +1161,16 @@ class PromptEvolver:
         session: Level1Session | None,
         save_session: Callable[[Level1Session], None] | None,
     ) -> None:
-        """モード進化が yield された場合の session 更新と永続化。"""
+        """モード進化が yield された場合の session 更新と永続化。
+
+        ``phase_state[mode]`` に population / 世代 / 初期 fitness を保存し、
+        次回 ``evolve_all_modes`` が同じ世代の続きから再開できるようにする
+        (以前は ``yield_count`` を増やすだけで、再開のたびに初期集団の構築から
+        やり直していた — L-A6)。
+        """
         if session is not None:
             session.yield_count += 1
+            session.phase_state[mode] = self._snapshot_progress(result)
             self._persist_session_safely(session, save_session)
         logger.info(
             "Yielded during mode %s at generation %d/%d",
@@ -1124,6 +1188,8 @@ class PromptEvolver:
             return
         if mode not in session.completed_phases:
             session.completed_phases.append(mode)
+        # 完了したモードの途中進捗は不要 (session ファイルを肥大させない)。
+        session.phase_state.pop(mode, None)
         self._persist_session_safely(session, save_session)
 
     @staticmethod
@@ -1247,6 +1313,9 @@ class PromptEvolver:
                 seed=seed,
                 critique_synthesizer=critique_synthesizer,
                 yield_check=yield_check,
+                resume_state=(
+                    session.phase_state.get(mode) if session is not None else None
+                ),
             )
             results[mode] = result
 

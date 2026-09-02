@@ -103,18 +103,35 @@ async def _init_llama_server(
             f"{llama_url}/health", label="llama-server (base)",
         )
         metadata = await fetch_model_metadata(llama_url, debug_logger=debug_logger)
-        from backend.config import resolve_client_reasoning, resolve_enable_thinking
+        from backend.config import (
+            resolve_client_reasoning,
+            resolve_context_size,
+            resolve_enable_thinking,
+        )
         base_enable_thinking = resolve_enable_thinking(
             cfg, "base",
             explicit=llama_cfg.get("enable_thinking"),
             chat_template=getattr(metadata, "chat_template", None),
         )
         think_budget, on_runaway = resolve_client_reasoning(cfg, "base")
+        # config の slots は宣言値。llama-server が実際に確保したスロット数
+        # (``/props`` の total_slots) より多いと、``id_slot=2`` 等の要求が
+        # 存在しないスロットを指して 400 になる。少ない方へ丸めて警告する。
+        cfg_slots = int(llama_cfg.get("slots", 1) or 1)
+        total_slots = int(getattr(metadata, "total_slots", 0) or 0)
+        slots = cfg_slots
+        if total_slots > 0 and total_slots != cfg_slots:
+            slots = min(cfg_slots, total_slots)
+            logger.warning(
+                "llama.slots=%d does not match llama-server total_slots=%d; "
+                "using %d (restart llama-server after changing config.yaml)",
+                cfg_slots, total_slots, slots,
+            )
         client = LocalClient(
             llama_url,
             metadata,
             cache_prompt=llama_cfg.get("cache_prompt", True),
-            slots=llama_cfg.get("slots", 1),
+            slots=slots,
             enable_thinking=base_enable_thinking,
             stream_first_token_timeout=llama_cfg.get(
                 "stream_first_token_timeout_sec", 60.0,
@@ -123,15 +140,26 @@ async def _init_llama_server(
             client_think_budget=think_budget,
             on_runaway=on_runaway,
             # 送信前コンテキスト超過ガード用 (slots>1 でも launch_llama が
-            # --kv-unified を自動付与するため per-slot でも full n_ctx)
-            context_size=llama_cfg.get("context_size", 4096),
+            # --kv-unified を自動付与するため per-slot でも full n_ctx)。
+            # ``llama.context_size`` の既定は None (プロファイル委譲) なので
+            # ``.get(..., 4096)`` では None が入ってガードが無効化されていた。
+            # 起動フラグ ``-c`` と同じ優先順位で解決する。
+            context_size=resolve_context_size(cfg, "base"),
         )
         if await client.health_check():
             state.local_client = client
             logger.info(
-                "llama-server connected: %s (cache_prompt=%s, slots=%d, enable_thinking=%s)",
-                llama_url, client._cache_prompt, client._slots, client._enable_thinking,
+                "llama-server connected: %s (cache_prompt=%s, slots=%d, "
+                "enable_thinking=%s, n_ctx=%s)",
+                llama_url, client._cache_prompt, client._slots,
+                client._enable_thinking, client._context_size,
             )
+            if client.background_slot < 0:
+                logger.warning(
+                    "llama.slots=%d: no dedicated background slot — aux / "
+                    "sleep-time requests will share KV with chat (set slots >= 2)",
+                    client._slots,
+                )
             _start_capability_probe(
                 client, cfg, metadata, llama_url, llama_cfg, debug_logger,
             )
@@ -164,15 +192,21 @@ def _start_capability_probe(
 
     from backend.config import resolve_enable_thinking, resolve_reasoning_mode
     from backend.free.llm.capability import (
+        PROBE_REASONING_MAX_TOKENS,
         make_llama_chat_fn,
         probe_model_capabilities,
+        probe_timeout_sec,
     )
 
     chat_template = getattr(metadata, "chat_template", None)
+    params_b = float(getattr(metadata, "params_b", 0.0) or 0.0)
 
     async def _run() -> None:
         try:
             declared = resolve_reasoning_mode(cfg, "base", chat_template=chat_template)
+            # モデルサイズに追随したタイムアウト (固定 120 秒は 27B+ の iGPU で
+            # 足りず、観測が恒久的に None になっていた)
+            probe_timeout = probe_timeout_sec(params_b, PROBE_REASONING_MAX_TOKENS)
             snapshot = await probe_model_capabilities(
                 model_id=getattr(metadata, "model_id", ""),
                 template_family=getattr(metadata, "template_family", "unknown"),
@@ -180,12 +214,23 @@ def _start_capability_probe(
                 chat_fn=make_llama_chat_fn(
                     llama_url,
                     debug_logger=debug_logger,
+                    timeout=probe_timeout,
                     # プローブは背景処理。チャットの初回応答と KV を分離する
                     id_slot=client.background_slot,
                 ),
                 probe_json=True,  # 補助タスクの JSON purpose も base が担う
             )
             client.capabilities = snapshot
+            # 観測を使う (docs/c_15): </think> を閉じないモデルは暴走 reasoning
+            # の watchdog を必ず武装する。プロファイルが budget=0 (無効) でも、
+            # 実機が閉じないなら上限無しのまま流す理由が無い。
+            if snapshot.closes_think_tags is False and client._client_think_budget <= 0:
+                client._client_think_budget = _RUNAWAY_THINK_BUDGET_DEFAULT
+                logger.warning(
+                    "Capability probe: model emits <think> without closing it; "
+                    "arming client think watchdog (budget=%d chunks)",
+                    _RUNAWAY_THINK_BUDGET_DEFAULT,
+                )
             new_enable = resolve_enable_thinking(
                 cfg, "base",
                 explicit=llama_cfg.get("enable_thinking"),
@@ -205,6 +250,11 @@ def _start_capability_probe(
             logger.warning("Capability probe task failed (prior retained): %s", e)
 
     client._capability_probe_task = asyncio.create_task(_run())
+
+
+#: プローブが「</think> を閉じない」と観測したときに武装する watchdog の chunk
+#: 上限 (``ProfileReasoningConfig.client_think_budget`` の既定値と同じ)。
+_RUNAWAY_THINK_BUDGET_DEFAULT = 512
 
 
 #: CJK 項の較正に使うサンプル。**日本語のみ**にすること — ASCII を混ぜると比が
@@ -435,15 +485,25 @@ def _start_quality_probes(
                         expected_dim=(cfg.get("embedding", {}) or {}).get("dim"),
                     )
                 else:
-                    from backend.free.llm.capability import make_llama_chat_fn
+                    from backend.free.llm.capability import (
+                        make_llama_chat_fn,
+                        probe_timeout_sec,
+                    )
+                    from backend.free.llm.quality_probe import _PROBE_MAX_TOKENS
                     url = getattr(client, "url", "")
                     if not url:
                         continue
+                    params_b = float(
+                        getattr(getattr(client, "metadata", None), "params_b", 0.0) or 0.0,
+                    )
+                    # モデルサイズに追随 (固定 90 秒だと 27B+ の iGPU で 200 トークン
+                    # の decode が収まらない)
+                    quality_timeout = probe_timeout_sec(params_b, _PROBE_MAX_TOKENS)
                     result = await probe_text_quality(
                         role=role,
                         model=model_name,
                         chat_fn=make_llama_chat_fn(
-                            url, debug_logger=debug_logger, timeout=90.0,
+                            url, debug_logger=debug_logger, timeout=quality_timeout,
                             # 品質プローブも背景処理。チャットと KV を分離する
                             id_slot=client.background_slot,
                         ),
@@ -470,17 +530,13 @@ def _probe_enable_thinking(client: Any) -> bool | None:
     投げる必要がある。設定が違えば別のものを測ってしまう (既定のまま投げたところ、
     reasoning モデルで思考が生成上限を食い潰し content が空になった)。
 
-    保持場所がクライアント種別で異なる — ``LocalClient`` は ``_enable_thinking``、
-    ``AuxClient`` は ``_chat_template_kwargs["enable_thinking"]``。どちらも
-    起動時に ``resolve_enable_thinking`` で解決済みの値なので、ここでは読むだけで
-    再導出しない (二重解決は乖離のもと)。``None`` は「送らない」を意味する。
+    ``LocalClient._enable_thinking`` は起動時に ``resolve_enable_thinking`` で
+    解決済みの値なので、ここでは読むだけで再導出しない (二重解決は乖離のもと)。
+    ``None`` は「送らない」を意味する。
     """
     value = getattr(client, "_enable_thinking", None)
     if value is not None:
         return bool(value)
-    kwargs = getattr(client, "_chat_template_kwargs", None)
-    if isinstance(kwargs, dict) and "enable_thinking" in kwargs:
-        return bool(kwargs["enable_thinking"])
     return None
 
 
@@ -533,7 +589,9 @@ def _init_cartridge_manager(state: AppState, cfg: dict[str, Any], resolver: Any)
     try:
         cartridges_dir = resolver.resolve_local("cartridges_dir")
         rag_cfg = cfg.get("rag", {})
-        cart_mgr = CartridgeManager(cartridges_dir, rag_config=rag_cfg)
+        cart_mgr = CartridgeManager(
+            cartridges_dir, rag_config=rag_cfg, debug_logger=state.debug_logger,
+        )
         state.cartridge_manager = cart_mgr
         logger.info(
             "CartridgeManager initialized: dir=%s, installed=%d",
@@ -778,6 +836,7 @@ def _build_bm25_index(
             use_trigrams=bool(rag_cfg.get("bm25_use_trigrams", False)),
             split_ascii=bool(rag_cfg.get("bm25_split_ascii", True)),
             stopwords=stopwords,
+            debug_logger=state.debug_logger,
         )
         n = build_index_from_vector_store(bm25, vs)
         logger.info("BM25 index initialized: %d chunks", n)
@@ -868,12 +927,15 @@ def _init_lazy_contextual(
         from backend.free.rag.contextual_prefix import ContextualPrefixGenerator
         from backend.free.rag.lazy_contextual import LazyContextualPrefixService
 
-        generator = ContextualPrefixGenerator(state.aux_client, cfg)
+        generator = ContextualPrefixGenerator(
+            state.aux_client, cfg, debug_logger=state.debug_logger,
+        )
         service = LazyContextualPrefixService(
             generator=generator,
             embedder=embedder,
             vector_store=vector_store,
             config=cfg,
+            debug_logger=state.debug_logger,
         )
         state.lazy_contextual = service
         logger.info(
@@ -1194,11 +1256,11 @@ def _init_learning_scheduler(
 
     # 7f-1c. GenerationParamEvolver (Level 1 phase6)
     # 進化したデルタは config.get_generation_params() が読む
-    # ``local/generation_deltas.json`` に永続化される (reader と同一パス)。
-    from backend.config import get_project_root
+    # ``local_paths.generation_deltas_file`` (base モデルパーティション配下) に
+    # 永続化される (reader と同一の resolve_learning 経由)。
     from backend.free.learning.generation_param_evolver import GenerationParamEvolver
 
-    gen_delta_file = get_project_root() / "local" / "generation_deltas.json"
+    gen_delta_file = resolver.resolve_learning("generation_deltas_file")
     learning_scheduler.set_generation_param_evolver(
         GenerationParamEvolver(delta_file=gen_delta_file),
     )
@@ -1361,6 +1423,8 @@ def _init_learning_scheduler(
         critique_synthesizer=critique_synthesizer,
         debug_logger=debug_logger,
     )
+    # critique policy の subject を PolicyInterpreter が読む ``learn.policy.<model>.`` 前置に揃える
+    feedback_pipe.set_base_model_id(getattr(state, "active_base_model_slug", "") or "")
     learning_scheduler.set_feedback_pipe(feedback_pipe)
     logger.info(
         "FeedbackPipe initialized (enabled=%s, weight=%.2f)",
@@ -2039,7 +2103,7 @@ class _LifespanContext:
 
     sleep_scheduler: Any
     learning_scheduler: Any
-    wm: Any
+    wm: Any  # WorkingMemoryRegistry (全セッションを shutdown で drain する)
     stm: Any
     resolver: Any
     exp_buf: Any
@@ -2305,19 +2369,20 @@ async def _build_mem_pillar(
         # bg_task wrapper の outcome.jsonl 記録のため debug_logger を注入
         sleep_scheduler = SleepTimeScheduler(cfg, debug_logger=debug_logger)
         state.sleep_scheduler = sleep_scheduler
-        # Full 実行の直前に WM → STM スナップショットを走らせる
-        # (f_02 §1.2 経路 (c) / §4.3)。押し出しが起きていない進行中セッション
-        # では、これが Step 8 抽出への唯一の供給経路になる。吸収処理
+        # Full 実行の直前に **全セッション** の WM → STM スナップショットを
+        # 走らせる (f_02 §1.2 経路 (c) / §4.3)。押し出しが起きていない進行中
+        # セッションでは、これが Step 8 抽出への唯一の供給経路になる。吸収処理
         # (エコー落とし) は api 層にあるため、mem pillar からは注入で受ける。
-        from backend.free.api.chat.chat_recorder import snapshot_wm_to_stm
+        from backend.free.api.chat.chat_recorder import snapshot_all_wm_to_stm
 
         sleep_scheduler.set_pre_full_flush(
-            lambda: snapshot_wm_to_stm(wm, stm, wm.session_id or ""),
+            lambda: snapshot_all_wm_to_stm(wm, stm),
         )
 
     from backend.pillars import MemPillar
     return MemPillar(
-        working_memory=wm,
+        working_memory=None,
+        working_memory_registry=wm,
         short_term_memory=stm,
         long_term_memory=ltm,
         vector_store=vs,
@@ -2605,8 +2670,16 @@ async def _init_evolve_pipeline(
     from backend.free.loop.log_ingestor import LogIngestor
     from backend.free.memory.views.learn import LearnFactView
 
+    from backend.config import PathResolver, get_config
+
     debug_log_dir = project_root / "local" / "logs" / "debug"
-    state_path = project_root / "local" / "state" / "log_ingestor.json"
+    try:
+        _cfg_for_paths = get_config() or {}
+    except Exception:
+        _cfg_for_paths = {}
+    state_path = PathResolver(_cfg_for_paths, project_root).resolve_local(
+        "log_ingestor_file",
+    )
 
     # LearnFactView: PolicyParamEvolver と同じ scope 戦略 (global + project)
     global_store = state.get_semantic_store("global")
@@ -2635,6 +2708,7 @@ async def _init_evolve_pipeline(
         learn_view=learn_view,
         scope=f"project:{project_id}" if project_id else "global",
     )
+    adjuster.set_base_model_id(getattr(state, "active_base_model_slug", "") or "")
 
     await ingestor.start()
     bridge_task = asyncio.create_task(
@@ -2704,15 +2778,13 @@ def _activate_learning_partition(base: "_BaseContext", state: AppState) -> None:
         logger.warning("Learning partition: no base model identity; staying flat")
         return
 
-    stem = Path(active_filename).stem
-    resolver.set_active_model_stem(stem)
-    try:
-        state.active_base_model_slug = model_slug(active_filename)
-    except Exception as exc:
-        logger.warning("Learning partition: model_slug failed (%s); staying flat", exc)
-        resolver.set_active_model_stem(None)
-        state.active_base_model_slug = ""
+    # stem / slug の確定は _learning_rebind と共有 (ランタイム切替でも同じ規則で束ねる)
+    from backend.factory._learning_rebind import bind_active_base_model
+
+    bound = bind_active_base_model(resolver, state, active_filename)
+    if bound is None:
         return
+    stem, _ = bound
 
     # PolicyInterpreter (base 構築済) を active モデルへ再スコープ。
     if base.policy_interpreter is not None:
@@ -2823,6 +2895,10 @@ async def wire_pillars(
             state, base, project_root, gen, mem, timings,
         )
         state.learn = learn
+        # ランタイムの base 切替を検知したら Level 1 を止めずに再バインドする自己修復フック
+        from backend.factory._learning_rebind import install_rebind_hook
+
+        install_rebind_hook(state)
 
     # Loop pillar: tools / agent tracer / LoopDriver
     with _timed(timings, "pillar_loop"):
@@ -2850,7 +2926,7 @@ async def wire_pillars(
     ctx = _LifespanContext(
         sleep_scheduler=mem.sleep_scheduler,
         learning_scheduler=learn.scheduler,
-        wm=mem.working_memory,
+        wm=mem.working_memory_registry,
         stm=mem.short_term_memory,
         resolver=base.resolver,
         exp_buf=learn.experience_buffer,

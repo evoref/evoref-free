@@ -128,10 +128,13 @@ class LlamaConfig(BaseModel):
     flash_attn: bool = True
     mlock: bool = False
     cache_prompt: bool = True
-    # 2 = チャットとバックグラウンド (学習 / sleep-time) をスロット分離する既定。
-    # 1 に落とすと両者が直列化し、Level 1 変異 1 回ぶん (実測 16〜32 秒) チャットが
-    # 待たされる。kv_unified が slots>1 で自動付与されるため per-seq context は
-    # n_ctx のままで、VRAM は増えない。
+    # 3 = チャット (0) / バックグラウンド (1: 学習 / sleep-time) / 分類器 (2:
+    # ツール分類器 + チャット応答パスの補助判定) をスロット分離する既定。
+    # 2 では分類器が背景と相乗りし、1 では全部が直列化して Level 1 変異 1 回ぶん
+    # (実測 16〜32 秒) チャットが待たされる。kv_unified が slots>1 で自動付与
+    # されるため per-seq context は n_ctx のままで、VRAM は増えない。
+    # 起動時に llama-server の実スロット数 (``/props`` の total_slots) と照合し、
+    # 少ない方へ丸める (backend/factory/_pillar_wirer.py::_init_llama_server)。
     slots: int = Field(default=3, ge=1, le=16)
     cache_type_k: str = Field(
         default="q8_0", pattern=r"^(f16|bf16|q8_0|q5_1|q5_0|q4_1|q4_0)$"
@@ -145,9 +148,12 @@ class LlamaConfig(BaseModel):
     # ⚠️ SWA (sliding window attention) モデル (gemma-4 等) では llama.cpp が
     # ``cache_reuse is not supported by this context`` で自動無効化し、毎ターン
     # full re-prefill するため **no-op** (フラグは無害に無視される)。非 SWA base
-    # に差し替えた場合のみ有効。AuxModelLocalConfig.cache_reuse と同型。
+    # に差し替えた場合のみ有効。
     cache_reuse: int = Field(default=256, ge=0)
-    max_tokens: int = Field(default=1024, ge=0)  # 0=無制限
+    # 0 = 上限を config で決めない。ただし **無制限では投げない** —
+    # ``LocalClient._build_payload`` が context_size からプロンプト推定を引いた
+    # 残量 (下限 256) へクランプして送る。
+    max_tokens: int = Field(default=1024, ge=0)
     lora_target: str = "auto"
     # None = 未指定 (arch プロファイルの reasoning.enable_thinking / 能力判定で決定。
     # 非対応 arch には送らない)。True/False = ユーザー明示でプロファイルを上書き。
@@ -255,7 +261,7 @@ class ProfileReasoningConfig(BaseModel):
     mode: Literal["toggle", "always", "none"] = "none"
     enable_thinking: bool | None = None  # toggle 型の既定
 
-    # サーバ側制御 (server_control=True; 起動フラグへ。AuxModelLocalConfig と同型)
+    # サーバ側制御 (server_control=True; 起動フラグへ)
     # 配線状況の SSOT は docs/c_15 §2.7。reasoning_format は未消費 (--reasoning-format は
     # profile launch_flags 由来)、budget_default/budget_message のみ起動フラグへ反映。
     server_control: bool = False

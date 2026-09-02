@@ -358,6 +358,8 @@ local_paths:
   aux_prompts_dir: local/aux_prompts/                # 補助タスクのタスク別プロンプト (partition 有効時は base モデル配下へ rebase)
   aux_calibration_file: local/aux_calibration.json   # 補助タスク purpose 別 timeout の反応的自己較正値 (モデル切替後に自動調整)
   learned_patterns_file: local/learned_patterns.json # 学習済みパターン検出キーワード
+  generation_deltas_file: local/generation_deltas.json # Level 1 生成パラメータデルタ (base モデル別パーティション配下へ配置)
+  log_ingestor_file: local/state/log_ingestor.json  # develop=evolve の LogIngestor 進捗
   model_state_file: local/model_state.json           # モデル切替・LoRA 装着状態の永続化
   model_quality_file: local/model_quality.json       # モデル切替時の出力品質プローブ結果
   local_state_file: local/state.json                 # EvorefMem ローカル状態
@@ -445,12 +447,13 @@ rag:
     # 差し替えること (品質低下を防ぐため)。
     prompt_template: ""
   # --- ベクトル量子化 ---
-  # 注: 現状 VectorStore は常に int8 固定で格納・検索する (quantization は未配線 / no-op)。
-  # 検索は「全件 int8 粗検索 → 候補のみ float32 rescore」の 2 段で、none を選んでも float32 化しない。
-  quantization: int8             # ベクトル量子化方式（現状 no-op、常時 int8）
-  # 注: チャット応答経路 (LTM/cartridge) には未配線。VectorStore.search 内部既定
-  # max(50, top_k*3) が常時適用される (本キーの値は届かない)。
-  rescore_candidates: 50         # int8 粗検索後の float32 rescore 候補数（現状チャット経路では no-op）
+  # 保持形式は常に int8。本キーは検索時の挙動のみ変える:
+  #   int8: 全件 int8 粗検索 (行スケール込み) → 候補のみ float32 rescore の 2 段
+  #   none: 粗検索で絞らず全件を float32 rescore (低速だが取りこぼし無し)
+  quantization: int8             # ベクトル量子化方式 (int8 | none)
+  # int8 粗検索後の float32 rescore 候補数。チャット応答経路 (LTM / cartridge) の
+  # VectorStore.search に渡る。0 でストア側の既定 max(50, top_k*3)。
+  rescore_candidates: 50
   # --- memmap ---
   memmap_threshold: 10000        # この件数以上で numpy.memmap に切替（OS ページキャッシュに委譲しメモリ削減）
   # --- Cartridge スケーラビリティ運用制限 ---
@@ -460,10 +463,10 @@ rag:
   # Cartridge Gate: centroid 事前フィルタ。多数カートリッジ装着時に無関係な cart をベクトル検索前にスキップ
   cartridge_gate:
     enabled: true                     # 有効化。centroid 未構築 cart は常に通過するため既存環境でも安全
-    # NOTE: threshold=0.3 は Qwen3-Embedding の cosine 分布前提。BGE-M3 等に
-    # 切替えた場合は cosine 分布特性が変わるため、ベンチで全 cart skip / 全
-    # 通過になっていないか確認して再調整すること。
-    threshold: 0.3                    # cosine 類似度閾値。未満の cart はスキップ
+    # null = 有効な埋め込みプロファイル (models/profiles/<arch>.yaml の
+    # embedding.rag.cartridge_gate_threshold: qwen3 0.49 / bert 0.53 / lfm2 0.17) に
+    # 追随。プロファイルに無ければ 0.3。数値を書くとプロファイルより優先される。
+    threshold: null                   # cosine 類似度閾値。未満の cart はスキップ
     max_cartridges: 10                # gate 通過上限 (0 で無制限)
     # 全カートリッジが threshold 未満の場合の挙動:
     #   false (既定): カートリッジ検索を skip し chunk を返さない。雑談や
@@ -657,12 +660,10 @@ memory:
   subject_dictionary:
     enabled: true                                              # 正規化を有効化
     file: local/memory/semantic/subject_dictionary.json        # 辞書ファイルのパス
-    auto_expand: false                                         # 自動拡張は仕様で禁止 (未参照 / 予約)
   # --- ファクト抽出 ---
   facts:
     extraction_skip_subject_canonicalize_regex: '^(loop|learn|mem)\.'   # pillar が機械的に命名した subject は辞書スキップ
     enable_extraction: true                                    # Step 8 Extractor 全体オンオフ
-    trigger: idle_full_only                                    # 抽出トリガ (Trigger B = run_full のみ、未参照 / 予約)
     extract_from_mdp_trace: true                               # agent_trace.jsonl から MDP 抽出
     ingest_mdp_trace_to_ltm: true                              # agent_trace.jsonl を episodic LTM に投入
     extraction_max_pinned_per_session: -1                      # pinned 由来の上限 (-1=無制限)
@@ -675,8 +676,6 @@ memory:
   # は local/triggers/<name>.yaml に置く 2 段階解決 (override 優先)。config では指定しない。
   pin:
     auto_detect: true                                          # 自動 Pin 検出 (覚えて/重要/忘れないで等)
-    auto_detect_confirm: false                                 # 検出時に確認を要求するか (未参照 / 予約)
-    unlimited: true                                            # pin 数上限なし (未参照 / 予約)
   # --- プライベートセッション ---
   # private: true のターンは memory_only で動作し、LTM/SemMem への昇格と
   # 会話履歴のディスク永続化をスキップする。セッション終了時に揮発する。
@@ -720,8 +719,6 @@ memory:
       enabled: true                                            # false で提示を停止
       max_groups: 3                                            # 注入グループ上限 (0=無制限、超過分は件数のみ要約)
       max_tokens: 400                                          # ブロック全体のトークン上限 (0=無制限、最低1グループは必ず注入)
-      # 撤去済みの判定経路の名残 (現在は未参照)。スキーマ互換のため残している。
-      max_judge_per_session: 3
   # --- MemoryInjector ---
   # NOTE: policy ファクトの active 閾値は learning.policy.activation_min_confidence
   # に集約されている
@@ -748,6 +745,7 @@ memory:
       create: [0.40, 0.35, 0.15, 0.10]                         # Tier 1〜4 比率 (合計 1.0)
   working_max_turns: 256          # ワーキングメモリの最大ターン数 (ハード上限。通常は下の token 側で縮退させる = working_max_tokens / 16)
   working_evict_block: 6          # 上限到達時にまとめて押し出すターン数 (1=従来の1件ずつ)
+  working_max_sessions: 8         # 同時に窓を保持するセッション数 (LRU。超過分はセッション終了と同じ経路で STM へ流す)
   # 1 件ずつ押し出すと窓の先頭が毎ターンずれ、llama-server の接頭辞 KV キャッシュが
   # system プロンプト以降まるごと無効化される (実測: prompt eval 2,898 tok で 27.7 秒、
   # decode は 7.6 tok/s と正常)。まとめて押し出すと次に上限へ達するまで先頭が動かず、
@@ -940,6 +938,8 @@ learning:
   tool_pattern_boost_success: 0.03    # 成功時のブースト量
   tool_pattern_decay_false_pos: 0.1   # 誤検出時の減衰量
   tool_pattern_match_threshold: 0.4   # マッチ閾値（通常パターンより高め）
+  long_form_pattern_boost_success: 0.03   # long_form 成功時のブースト量
+  long_form_pattern_decay_false_pos: 0.1  # long_form 誤検出時の減衰量
   long_form_pattern_match_threshold: 0.4  # 学習済み long_form パターンの一致閾値 (router)
   # Few-shot プール
   fewshot_pool_size: 50               # モード別最大プールサイズ

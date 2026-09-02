@@ -22,6 +22,11 @@
 2 件のみ (2.4%) で、keyword を持つ 1 件は同一セッションの先行 6 ノート中
 **1 件だけ**と重なり (「締切」)、残り 5 件は重なりゼロだった。
 
+**訂正ノート自身も後続の訂正の対象になる** (2026-09-02 監査 S-A3)。
+A ← B ← C の連鎖で B (訂正) を候補から外していると、B は永久に「現在値」
+として提示され、C は A にしか付かない。連鎖は :func:`corrections_by_target`
+が終端 (それ以上訂正されていない訂正) まで辿って解く。
+
 **候補は user 発話に限り、順位は重なり語数が先** (2026-08-30 ライブ監査)。
 チャットでは値の申告の直後にアシスタントが必ず復唱し、その復唱ノートは
 (a) 対象と同じ keyword を持ち (b) 対象より新しく (c) ``assertion_slug`` を
@@ -68,6 +73,7 @@ def correction_target(correction: Any, notes: list) -> Any | None:
     条件は「同一セッション」「ユーザー発話」「訂正より前」「keyword が
     :data:`CORRECTION_LINK_MIN_OVERLAP` 語以上重なる」。候補が複数あれば
     **重なり語数が最も多いもの**、同数なら **最も新しいもの** を採る。
+    先行する訂正ノートも候補に含める (連鎖 A ← B ← C で B が対象になる)。
 
     アシスタントの復唱を候補から外す理由と、重なり語数を新しさより優先する
     理由はモジュール docstring を参照。
@@ -80,7 +86,7 @@ def correction_target(correction: Any, notes: list) -> Any | None:
     best = None
     best_rank = (0, 0.0)
     for note in notes:
-        if note is correction or getattr(note, "is_correction", False):
+        if note is correction:
             continue
         if not _is_user_note(note):
             continue
@@ -101,9 +107,11 @@ def correction_target(correction: Any, notes: list) -> Any | None:
 def corrections_by_target(notes: list) -> dict[str, Any]:
     """``被訂正 note_id -> その現在値を持つ訂正ノート`` を返す (純粋関数)。
 
-    同じ対象を複数回訂正している場合は **最後の訂正** が現在値。
+    同じ対象を複数回訂正している場合は **最後の訂正** が現在値。訂正が
+    さらに訂正されている連鎖 (A ← B ← C) では、A も B も **終端の C** に
+    解決する — B は「訂正済み」の印が付く側であって現在値ではない。
     """
-    out: dict[str, Any] = {}
+    direct: dict[str, Any] = {}
     for note in notes:
         if not getattr(note, "is_correction", False):
             continue
@@ -113,7 +121,18 @@ def corrections_by_target(notes: list) -> dict[str, Any]:
         target_id = getattr(target, "id", None)
         if not target_id:
             continue
-        prev = out.get(target_id)
+        prev = direct.get(target_id)
         if prev is None or _created_at(note) > _created_at(prev):
-            out[target_id] = note
-    return out
+            direct[target_id] = note
+
+    def _terminal(corr: Any) -> Any:
+        seen: set[str] = set()
+        while True:
+            cid = getattr(corr, "id", None)
+            nxt = direct.get(cid) if cid else None
+            if nxt is None or cid in seen:
+                return corr
+            seen.add(cid)
+            corr = nxt
+
+    return {target_id: _terminal(corr) for target_id, corr in direct.items()}

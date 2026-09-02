@@ -8,7 +8,8 @@ from dataclasses import dataclass
 
 from backend.free.agent.safety_patterns import DANGEROUS_PATTERNS
 from backend.free.agent.agent_state import AgentState
-from backend.i18n_helper import msg
+from backend.free.core.turn_text import append_to_last_user
+from backend.i18n_helper import msg_for_locale, prompt_locale
 from backend.log_config import get_logger
 
 logger = get_logger("agent.event_reminder")
@@ -132,7 +133,11 @@ class EventReminderSystem:
         """messages にリマインダーを注入して返す。
 
         critical は必ず注入、warning/info は上限まで。
-        注入位置: 最後の user メッセージの直前。
+        注入位置: **最後の user メッセージの末尾** (``turn_text`` の付与順序の
+        契約に従う注記の 1 つ)。以前は独立した user メッセージを直前へ挿入して
+        いたが、user ロールが 2 連続になり gemma 系テンプレートが 400 を返す
+        (2026-09-02 監査 P-A8)。user メッセージが無い場合だけ末尾へ user として
+        足す (情報を落とさないための縮退)。入力の list と要素は変更しない。
         """
         if not self.enabled:
             return messages
@@ -159,7 +164,6 @@ class EventReminderSystem:
         reminder_text = "\n".join(
             self._render(e) for e in selected
         )
-        reminder_msg = {"role": "user", "content": reminder_text}
 
         # ログ出力
         event_types = [e.event_type for e in selected]
@@ -185,16 +189,18 @@ class EventReminderSystem:
                     event.context.get("command", ""),
                 )
 
-        # 最後の user メッセージの直前に挿入
         result = list(messages)
-        for i in range(len(result) - 1, -1, -1):
-            if result[i]["role"] == "user":
-                result.insert(i, reminder_msg)
-                break
-        else:
-            result.append(reminder_msg)
+        if not append_to_last_user(result, reminder_text):
+            result.append({"role": "user", "content": reminder_text})
         return result
 
     def _render(self, event: ReminderEvent) -> str:
-        """i18n テンプレートを解決"""
-        return msg(f"agent.reminder.{event.event_type}", **event.context)
+        """i18n テンプレートを解決する (言語は UI ではなく ``prompt_locale``)。
+
+        リマインダーは LLM へ渡すプロンプト文なので、他の注記と同じく
+        ``i18n.prompt_locale`` に従う。キーは i18n に置いたまま locale だけ
+        差し替える (``msg`` は UI の locale 固定)。
+        """
+        return msg_for_locale(
+            prompt_locale(), f"agent.reminder.{event.event_type}", **event.context,
+        )

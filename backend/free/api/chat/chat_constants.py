@@ -9,8 +9,11 @@ config.yaml のデフォルト値として使われるものと、
 # コンテキスト・トークン関連のデフォルト値
 # ---------------------------------------------------------------------------
 
-#: config.yaml llama.context_size のフォールバック値
-DEFAULT_CONTEXT_SIZE: int = 4096
+#: config.yaml llama.context_size のフォールバック値。
+#: SSOT は ``backend.config._CONTEXT_SIZE_FALLBACK`` (config 明示も arch
+#: プロファイル宣言も無いときの ``-c``)。値を揃えないと、ここを既定に取る
+#: 経路 (``inference.build_messages`` の既定引数) だけが半分の窓で組み立てる。
+DEFAULT_CONTEXT_SIZE: int = 8192
 
 #: config.yaml llama.max_tokens のフォールバック値
 DEFAULT_MAX_TOKENS: int = 1024

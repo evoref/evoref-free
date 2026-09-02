@@ -201,6 +201,8 @@ class LearningConfig(BaseModel):
     tool_pattern_decay_false_pos: float = Field(default=0.1, ge=0.0, le=1.0)
     tool_pattern_match_threshold: float = Field(default=0.4, ge=0.1, le=0.9)
     # 長文生成パターン学習 (router._contains_learned_long_form_patterns)
+    long_form_pattern_boost_success: float = Field(default=0.03, ge=0.0, le=1.0)
+    long_form_pattern_decay_false_pos: float = Field(default=0.1, ge=0.0, le=1.0)
     long_form_pattern_match_threshold: float = Field(
         default=0.4, ge=0.1, le=0.9,
         description=(

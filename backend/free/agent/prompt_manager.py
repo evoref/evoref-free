@@ -25,10 +25,92 @@ from backend.free.agent.prompt_utils import (
     restore_protected_sections,
     validate_protected_sections,
 )
+from backend.i18n_helper import prompt_locale
 from backend.log_config import get_logger
 from backend.utils import utc_now as _now
 
 logger = get_logger("agent.prompt_manager")
+
+
+# ── 静的 system の末尾に付く固定指示 (i18n.prompt_locale 追従) ─────────────
+#
+# どちらも **本文 (.md) の外** に置く。本文は Level 1 進化と手動編集の対象で、
+# 焼き込むと (a) 進化が指示を劣化させる、(b) 既存インストールの本文が古い
+# locale のまま設定に追従しなくなる (名前プレフィックスの前例:
+# ``_strip_name_prefix``)。``get_prompt_static`` が prefix と同じ「進化しない枠」
+# として render 時に付ける。以前は ``chat._resolve_system_prompt`` が付けていたが、
+# system 文の出所は PromptManager に閉じる (docs/f_03 §12 #5)。
+
+#: 応答言語のランタイム指示。本文の初回生成 / ロケール切替時にしか言語が
+#: 再導出されないため、設定に追従させる保険。
+RESPONSE_LANGUAGE_DIRECTIVES: dict[str, str] = {
+    "ja": "（ユーザーが使用言語を明示的に指定した場合を除き、応答は日本語で行うこと）",
+    "en": "(Respond in English unless the user explicitly requests another language.)",
+}
+
+# 参考枠 ([参考情報] / [関連する記憶] / [参考例] / [添付ファイル]) の扱いを述べる
+# **静的**な指示。動的ブロック側のマーカーから本文を移してきたもの。
+#
+# なぜ system 側なのか: 動的ブロックは最後の user メッセージへ前置されるため
+# 接頭辞 KV キャッシュの外にあり、内容が定数でも **毎ターン再プリフィル**される。
+# 実測 (2026-08-18/19、chat 232 ターン): 区切り文 105 tok × 57% のターン /
+# 記憶ラベル 105 tok × 40% / RAG ヘッダ 20 tok × 38% で、定数の指示文だけに
+# 1 ターン平均 90 トークン前後を払っていた。未キャッシュ 1 トークンは 21〜37ms
+# なので、これだけで数秒の TTFT になる。system へ移せば同じ文字が接頭辞
+# キャッシュに乗り、2 ターン目以降の再プリフィルはゼロになる。
+#
+# 内容は既存の指示の移設で、**新しい制約は足していない**:
+#   - 「無関係なら言及せず自分の知識で答える」  ← 旧 _DYNAMIC_CONTEXT_DELIMITER
+#     (実測 2026-07-25: PC が重い相談の最中に「ご提示いただいた参考情報には…
+#      含まれていません」と述べ、空き 548GB あるのに空き容量不足の対処を回答)
+#   - 「今回の質問に関係しなければ無視する / 無い予定・日付・数値を創作しない」
+#     ← 旧 _SEMMEM_BLOCK_LABEL (実測 2026-07-27: 過去 note を根拠に、この会話に
+#        存在しない歯科の予約と健康診断を捏造)
+# ブロック名は両 locale で同じ文字列 (動的ブロック側のラベルが locale で
+# 変わらないため)。
+REFERENCE_BLOCK_DIRECTIVES: dict[str, str] = {
+    "ja": (
+        "（[参考情報]・[関連する記憶]・[参考例]・[添付ファイル] は"
+        "システムが用意した参考枠であり、ユーザーの発言ではない。"
+        "今回の質問に関係しない場合は、そのことに言及せず、"
+        "参考枠の話題に引きずられずに自分の知識で普通に答えること。"
+        "参考枠に無い予定・日付・数値を創作しないこと。）"
+    ),
+    "en": (
+        "([参考情報] / [関連する記憶] / [参考例] / [添付ファイル] blocks are "
+        "reference material supplied by the system, not user input. "
+        "If they are unrelated to the question, do not mention that fact and "
+        "do not let them steer the topic - just answer from your own knowledge. "
+        "Never invent schedules, dates, or numbers that are not in them.)"
+    ),
+}
+
+
+def static_directives(locale: str | None = None) -> str:
+    """応答言語指示 + 参考枠指示を 1 ブロックにして返す (未知 locale は ja)。"""
+    loc = locale or prompt_locale()
+    return "\n\n".join((
+        RESPONSE_LANGUAGE_DIRECTIVES.get(loc, RESPONSE_LANGUAGE_DIRECTIVES["ja"]),
+        REFERENCE_BLOCK_DIRECTIVES.get(loc, REFERENCE_BLOCK_DIRECTIVES["ja"]),
+    ))
+
+
+def static_directives_suffix(locale: str | None = None) -> str:
+    """本文の後ろへ連結する形 (``"\\n\\n" + 指示``)。"""
+    return "\n\n" + static_directives(locale)
+
+
+def ensure_static_directives(system_text: str) -> str:
+    """``system_text`` に固定指示が無ければ末尾へ付ける (冪等)。
+
+    ``SystemPromptManager.get_prompt_static`` は既に付けて返すので通常は
+    素通し。PromptManager 未設定のフォールバック文や、``get_prompt_static`` を
+    持たない代替実装 (テストの Mock 等) が返す本文だけがここで補われる。
+    """
+    directives = static_directives()
+    if directives in system_text:
+        return system_text
+    return f"{system_text}\n\n{directives}"
 
 _WS_RE = re.compile(r"\s+")
 
@@ -333,14 +415,21 @@ class SystemPromptManager:
         self._fewshot_selector = selector
         self._fewshot_k = k
 
+    def rebind_prompt_dir(self, prompt_dir: Path) -> None:
+        """base モデル切替で prompt_dir を新パーティションへ向け直し本文/メタを再ロードする。
+
+        旧パーティションの本文は既に書き込み時点で永続化済 (``write_body`` /
+        ``_save_meta`` は都度書く) なので退避は不要。新ディレクトリが空なら
+        既定プロンプトを生成する (起動時と同じ)。few-shot 選択器の注入は保持する。
+        """
+        self.prompt_dir = prompt_dir
+        self.contents = {}
+        self.metas = {}
+        self._load_all()
+
     def _current_locale(self) -> str:
-        """config.yaml からプロンプトロケールを取得"""
-        try:
-            from backend.config import get_config
-            config = get_config()
-            return config.get("i18n", {}).get("prompt_locale", "ja")
-        except Exception:
-            return "ja"
+        """config.yaml からプロンプトロケールを取得 (``i18n_helper.prompt_locale`` に委譲)"""
+        return prompt_locale()
 
     def _load_all(self) -> None:
         """起動時に全モードの本文とメタ情報をロード"""
@@ -395,7 +484,9 @@ class SystemPromptManager:
         locale = self._get_prompt_locale(mode)
         template = _PREFIX_TEMPLATES.get(locale, _PREFIX_TEMPLATES["ja"])
         prefix = template.format(name=self.instance_name)
-        return prefix + self.contents[mode]
+        # 末尾の固定指示は prefix と同じ「進化しない枠」。本文 (``contents``) には
+        # 含めないので Level 1 の変異 / 保存対象 (``get_raw_prompt``) に乗らない。
+        return prefix + self.contents[mode] + static_directives_suffix()
 
     def get_fewshot_block(
         self, mode: str, query: str | None = None, query_vec=None,

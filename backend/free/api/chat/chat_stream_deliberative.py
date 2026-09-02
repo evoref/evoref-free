@@ -16,7 +16,11 @@ from backend.free.api.chat._continuation import (
     disarm_continuation,
 )
 from backend.free.api.chat.chat_constants import DEFAULT_KEEPALIVE_INTERVAL_SEC
-from backend.free.api.chat.chat_recorder import record_response
+from backend.free.api.chat.chat_recorder import (
+    command_tool_calls,
+    record_response,
+    tool_routing_signals,
+)
 from backend.free.api.chat.chat_service import make_token_info
 from backend.free.api.chat.constraint_repair import (
     needs_verification,
@@ -48,9 +52,13 @@ from fastapi import HTTPException
 
 from backend.free.api.chat.chat_stream_common import (
     _cancel_flags,
+    _capture_stream_outcome,
+    _close_token_stream,
+    _emit_stream_error,
     _emit_timing,
     _log_chat_outcome,
     _make_step_queue_callback,
+    _record_failed_generation,
     _sync_chat_response,
     cancel_scope,
     logger,
@@ -96,6 +104,8 @@ class _DeliberativeStreamState:
     #: 切断時の生トークン数 / 上限 (開示フレームの中身)。
     truncated_tokens: int = 0
     truncated_max_tokens: int | None = None
+    #: ``record_response`` まで到達したか (例外経路の失敗記録と二重にしない印)。
+    recorded: bool = False
 
 
 
@@ -132,8 +142,14 @@ async def _stream_filtered_token_pipeline(
 
     ``query`` は復唱除去用。渡さない場合は復唱フィルタが素通しになる。
 
+    ``state.full_response`` には **フィルタ通過後にユーザーへ出た本文** を積む
+    (生トークンは ``tokens_generated`` で数えるだけ)。以前は生トークンを
+    連結していたため、復唱フィルタが落とした行が記憶 / 履歴 / 経験には残り、
+    画面と記録が食い違っていた (2026-09-02 監査 R-A1)。
+
     ``buffer_only`` はフィルタ結果をユーザーへ流さず ``state.filtered_output``
-    へ溜める (keepalive だけ流す)。出力制約の検証・修復ターンで使う: 破った
+    へ溜める (keepalive だけ流す)。このモードでは ``full_response`` は触らず、
+    呼出側 (``_emit_verified_output``) が実際に流した本文で確定させる。出力制約の検証・修復ターンで使う: 破った
     回答を先に流してしまうと書き直せない。長さ・形式の指定があるターンの回答は
     定義上短いので、TTFT の犠牲は限定的。開示フィルタ
     (``LengthDisclosureFilter``) はこのモードでは外す — 修復前の本文へ注記が
@@ -183,6 +199,9 @@ async def _stream_filtered_token_pipeline(
         if _cancel_flags.get(session_id):
             if pending is not None and not pending.done():
                 pending.cancel()
+            # 基底 generator を閉じ、llama-server 側の生成を止める
+            # (閉じないとキャンセル後もスロットを占有し続ける)。
+            await _close_token_stream(token_stream)
             break
         if pending is None:
             pending = asyncio.create_task(aiter.__anext__())
@@ -201,7 +220,6 @@ async def _stream_filtered_token_pipeline(
             pending = None
             break
         pending = None
-        state.full_response += token
         # raw トークン単位でカウント (tok/s 指標用)。
         # HeadBufferFilter によるバッファリングで SSE フレーム数と乖離するため、
         # フィルタ出力の有無にかかわらず受信トークンをそのまま数える。
@@ -222,6 +240,7 @@ async def _stream_filtered_token_pipeline(
                 yield sse.keepalive()
                 last_frame_at = time.monotonic()
         elif filtered:
+            state.full_response += filtered
             state.emitted_chars += len(filtered)
             yield sse.token(filtered)
             last_frame_at = time.monotonic()
@@ -235,28 +254,11 @@ async def _stream_filtered_token_pipeline(
     if remaining and buffer_only:
         state.filtered_output += remaining
     elif remaining:
+        state.full_response += remaining
         state.emitted_chars += len(remaining)
         yield sse.token(remaining)
 
     _capture_stream_outcome(token_stream, state)
-
-
-def _capture_stream_outcome(
-    token_stream: AsyncIterator[str], state: _DeliberativeStreamState,
-) -> None:
-    """``TokenStream.outcome`` から切断メタを吸い上げる。
-
-    ``outcome`` を持たないイテレータ (テストの mock / 中継 generator) は
-    素通しする — 切断が分からないだけで、本文は従来どおり流れる。
-    """
-    outcome = getattr(token_stream, "outcome", None)
-    if outcome is None:
-        return
-    # 再生成 (0 トークン再試行 / 制約修復) がこの関数を再度通る。切断の有無は
-    # **最後に画面へ出した生成** で上書きする (前回の切断を引きずらない)。
-    state.truncated = bool(getattr(outcome, "truncated", False))
-    state.truncated_tokens = outcome.tokens_generated
-    state.truncated_max_tokens = outcome.max_tokens
 
 
 async def _emit_verified_output(
@@ -336,17 +338,21 @@ async def _retry_zero_tokens_deliberative(
         LengthDisclosureFilter(query),
         UnwrittenFileClaimFilter(),
     ])
+    # 再試行が本流を置き換えるので、記録本文も再試行で出たものだけにする。
+    state.full_response = ""
     async for token in retry_stream:
         if _cancel_flags.get(session_id):
+            await _close_token_stream(retry_stream)
             break
-        state.full_response += token
         state.tokens_generated += 1
         filtered = pipeline.process(token)
         if filtered:
+            state.full_response += filtered
             state.emitted_chars += len(filtered)
             yield sse.token(filtered)
     remaining = pipeline.flush()
     if remaining:
+        state.full_response += remaining
         state.emitted_chars += len(remaining)
         yield sse.token(remaining)
     # 再試行が本流を置き換えたので、切断メタも再試行側で上書きする。
@@ -461,6 +467,9 @@ async def _finalize_deliberative_stream(
         "Deliberative stream complete: tokens=%d, elapsed=%.2fs, tok/s=%.1f, session=%s",
         state.tokens_generated, elapsed, tok_per_sec, session_id,
     )
+    tool_routing_success, _ = tool_routing_signals(
+        command_tool_calls(state.tool_command, state.tool_command_success),
+    )
     record_response(
         sess_state, state.full_response, messages, session_id,
         query, mode, state.tokens_generated,
@@ -469,12 +478,16 @@ async def _finalize_deliberative_stream(
         tool_command_name=state.tool_command_name,
         tool_command_success=state.tool_command_success,
         tool_command_source=state.tool_command_source,
-        tool_routing_success=state.tool_command_success is True,
+        tool_routing_success=tool_routing_success,
         action_blocked=state.action_blocked,
         rag_used=rag_used,
         rag_top1_score=rag_top1_score,
         sent_messages=sent_messages,
+        # キャンセルで途中まで流した本文は経験に採らない / 切断は経験へ刻む。
+        cancelled=bool(_cancel_flags.get(session_id)),
+        truncated=state.truncated,
     )
+    state.recorded = True
     _maybe_cache_reactive_response(
         sess_state, query, state.full_response,
         private=private, tool_command=state.tool_command, session_id=session_id,
@@ -637,14 +650,17 @@ async def stream_deliberative(
 
         except Exception as e:
             errored = True
-            # 例外がメッセージを持たないケース (httpx.ReadError('') 等) では
-            # %s だと原因不明のログ行しか残らないため repr で型を残す。
-            logger.error("Deliberative stream error: %r", e)
-            if timer:
-                timer.stop("llm_total_ms")
-            _emit_timing(state, timer, "deliberative", 0, mode=mode)
-            yield sse.error(str(e))
-            yield sse.done()
+            async for frame in _emit_stream_error(
+                state, e, timer=timer, agent_layer="deliberative", mode=mode,
+            ):
+                yield frame
+            if not stream_state.recorded:
+                _record_failed_generation(
+                    state, query=query, messages=messages,
+                    session_id=session_id, mode=mode, private=private,
+                    agent_layer="deliberative",
+                    tokens_generated=stream_state.tokens_generated,
+                )
         finally:
             # クライアント切断等でジェネレータが中断された場合、未完了の
             # precomputed tool 判定タスクが残らないよう cancel する (衛生)。
@@ -890,7 +906,10 @@ async def stream_reactive_light(
                 query, mode, stream_state.tokens_generated,
                 private=private,
                 rag_used=False,
+                cancelled=bool(_cancel_flags.get(session_id)),
+                truncated=stream_state.truncated,
             )
+            stream_state.recorded = True
             if cacheable:
                 _maybe_cache_reactive_response(
                     state, query, stream_state.full_response,
@@ -909,12 +928,17 @@ async def stream_reactive_light(
 
         except Exception as e:
             errored = True
-            logger.error("Reactive-light stream error: %s", e)
-            if timer:
-                timer.stop("llm_total_ms")
-            _emit_timing(state, timer, "reactive", 0, mode=mode)
-            yield sse.error(str(e))
-            yield sse.done()
+            async for frame in _emit_stream_error(
+                state, e, timer=timer, agent_layer="reactive", mode=mode,
+            ):
+                yield frame
+            if not stream_state.recorded:
+                _record_failed_generation(
+                    state, query=query, messages=messages,
+                    session_id=session_id, mode=mode, private=private,
+                    agent_layer="reactive",
+                    tokens_generated=stream_state.tokens_generated,
+                )
         finally:
             _log_chat_outcome(
                 state,

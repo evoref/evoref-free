@@ -42,6 +42,37 @@ def follow_embedder_rebind(state: "AppState") -> None:
     asyncio.create_task(judge.warmup_tool_gate(), name="tool_gate_rewarmup")
 
 
+def follow_base_model_rebind(state: "AppState", new_model_filename: str) -> dict:
+    """base モデルの差し替えに Learn pillar のパーティション束ねを追随させる。
+
+    llama-server を新 base で再起動して ``state.local_client`` を差し替えた直後
+    (``/api/model/reload``) に呼ぶ。experience / base prompts / fewshot / policy
+    等を新モデルの (model×mode) パーティションへ再バインドし、旧パーティションへは
+    先に退避する (``backend.factory._learning_rebind.rebind_base_learning``)。
+    失敗しても呼出側 (モデル reload 自体) は成功扱いにし、WARNING で残す。
+    """
+    from backend.factory._learning_rebind import rebind_base_learning
+
+    try:
+        result = rebind_base_learning(
+            state, get_config(), new_model_filename=new_model_filename,
+        )
+    except Exception as e:
+        logger.warning("Learning partition rebind failed after base swap: %s", e)
+        return {"rebound": False, "reason": f"error: {e}"}
+    if result.get("rebound"):
+        logger.info(
+            "Learning partition rebound after base swap: %s -> %s",
+            result.get("old_stem"), result.get("new_stem"),
+        )
+    else:
+        logger.info(
+            "Learning partition rebind skipped after base swap: %s",
+            result.get("reason"),
+        )
+    return result
+
+
 async def reload_embedder(state: AppState) -> None:
     """embedding セクション変更時に embedder を再生成して差し替える"""
     from backend.free.rag.embedding_factory import create_embedding_backend

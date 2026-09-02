@@ -7,6 +7,7 @@ from backend.config import get_path_resolver
 from backend.edition import get_pro_handler, is_pro
 from backend.free.api._error_responses import api_error
 from backend.free.core.session_mode import is_valid_session_mode
+from backend.i18n_helper import msg
 from backend.free.api.learning._optimize_collectors import (
     collect_aux_prompt_history,
     collect_aux_task_statuses,
@@ -191,7 +192,7 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
         return OptimizeTriggerResponse(
             triggered=False,
             level="level2",
-            message="Level 2 optimization requires Pro edition",
+            message=msg("api.optimize_level2_requires_pro"),
         )
 
     # #3a: base=lora は no-op 経路でトリガ段階 skip されるため、
@@ -201,11 +202,7 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
         return OptimizeTriggerResponse(
             triggered=False,
             level="level2",
-            message=(
-                "Level 2 real method not enabled (base=lora is a no-op "
-                "and trigger-skipped). Set level2_base_method=cvector or "
-                "or level2_base_method=spsa-real-eval."
-            ),
+            message=msg("api.optimize_level2_method_not_enabled"),
         )
 
     # 実メソッド有効: 全パス集合を渡して trainer に委譲 (SleepTimeWorker と同形)。
@@ -235,8 +232,8 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
     )
 
     message = (
-        "Level 2 optimization triggered" if started
-        else "Level 2 not started (idle/experience/corpus requirements not met)"
+        msg("api.optimize_level2_triggered") if started
+        else msg("api.optimize_level2_not_triggered")
     )
     return OptimizeTriggerResponse(
         triggered=started,

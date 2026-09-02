@@ -196,12 +196,26 @@ class QueryCacheMixin:
             self._record_cache_hit(mode)
             return await asyncio.shield(inflight)
 
+        # 生産者は **独立タスク** で走らせ、呼出側はそれを shield して待つ。
+        # 以前は呼出側のコルーチンがそのまま埋め込みを実行しており、その
+        # 呼出側が cancel されると共有 Future に CancelledError が載って、
+        # 同じクエリを待っていた他の呼出側 (同ターンのツール判定 等) まで
+        # 巻き添えで落ちていた。生産者を独立させれば、最初の呼出側が消えても
+        # 埋め込みは完走し、待ち手は結果を受け取れる。
         loop = asyncio.get_running_loop()
-        fut: asyncio.Future[np.ndarray] = loop.create_future()
-        self._query_inflight[cache_key] = fut
         self._cache_misses += 1
+        task = loop.create_task(self._produce_query_embedding(cache_key, query, mode))
+        # 待ち手が全員消えても "Task exception was never retrieved" を出さない。
+        task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+        self._query_inflight[cache_key] = task
+        return await asyncio.shield(task)
+
+    async def _produce_query_embedding(
+        self, cache_key: str, query: str, mode: str,
+    ) -> np.ndarray:
+        """進行中テーブルに登録された 1 クエリの埋め込みを生成し LRU へ入れる。"""
+        deadline = self._query_deadline_sec
         try:
-            deadline = self._query_deadline_sec
             if deadline > 0:
                 vec = await asyncio.wait_for(
                     self._embed_single_query(query, mode), timeout=deadline,
@@ -214,16 +228,6 @@ class QueryCacheMixin:
                 "this turn continues without memory retrieval",
                 deadline, mode, query[:60],
             )
-            if not fut.done():
-                fut.set_exception(asyncio.TimeoutError())
-            fut.exception()
-            raise
-        except BaseException as e:
-            if not fut.done():
-                fut.set_exception(e)
-            # 例外は待ち手にも伝えるが、誰も見ないままだと
-            # "Future exception was never retrieved" が出る。
-            fut.exception()
             raise
         finally:
             self._query_inflight.pop(cache_key, None)
@@ -231,8 +235,6 @@ class QueryCacheMixin:
         if len(self._query_cache) >= self._cache_maxsize:
             self._query_cache.popitem(last=False)
         self._query_cache[cache_key] = vec
-        if not fut.done():
-            fut.set_result(vec)
         return vec
 
     @property

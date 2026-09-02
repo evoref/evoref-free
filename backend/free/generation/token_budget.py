@@ -16,6 +16,7 @@ from typing import Literal
 
 from backend.exceptions import InsufficientContextError
 from backend.free.generation.models import ContentType
+from backend.io import atomic_write_text
 from backend.utils import estimate_tokens
 
 logger = logging.getLogger("backend.free.generation.token_budget")
@@ -127,7 +128,9 @@ def save_ratios(
         "source": "learned" if path.exists() else "default",
         "ratios": ratios,
     }
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(
+        path, json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8",
+    )
 
 
 def _resolve_ratios(

@@ -4,6 +4,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.log_config import get_logger
+
+logger = get_logger("config")
+
 #: 1 メッセージあたりの推定トークン数 (平均)。
 #: 2026-08-16 ライブ監査の実セッション (80 メッセージ / 7,264 tok) の実測値。
 _TYPICAL_TOKENS_PER_MESSAGE = 91
@@ -57,16 +61,14 @@ class SubjectDictionaryConfig(BaseModel):
 
     EvorefMem 統合仕様 における意味記憶 subject の表記ゆれ吸収
     に使う辞書ファイルの位置付けと挙動を定義する。
-    自動拡張は仕様で禁止 (`auto_expand: false` 固定が原則)。
+    自動拡張は仕様で禁止 (旧 ``auto_expand`` キーは撤去済み、
+    :data:`REMOVED_MEMORY_KEYS` 参照)。
     """
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
     file: str = "local/memory/semantic/subject_dictionary.json"
-    auto_expand: bool = False
-    """自動拡張 (未参照 / 予約)。読むコードは無く、仕様上も false 固定。
-    ``extra="forbid"`` のため既存 config を壊さないよう残している。"""
 
 
 class FactsExtractionMaxPerSession(BaseModel):
@@ -92,10 +94,6 @@ class FactsConfig(BaseModel):
     # ── 統合追加 ──
     enable_extraction: bool = True
     """Step 8 Extractor 全体のオンオフ"""
-
-    trigger: str = "idle_full_only"
-    """抽出トリガ (未参照 / 予約)。``idle_full_only`` のみ対応 (Trigger B = run_full)。
-    値を読むコードは無く、Step 8 が Full にしか無いことをコメントで指す用途のみ。"""
 
     extraction_max_per_session: FactsExtractionMaxPerSession = Field(
         default_factory=FactsExtractionMaxPerSession,
@@ -185,10 +183,6 @@ class ConflictChatReviewConfig(BaseModel):
     # 多いグループを抑えられないため併用する。設計書 §203 の「drop されない」
     # 保証のため、上限を超えても最低 1 グループは必ず注入する。
     max_tokens: int = Field(default=400, ge=0)
-    # conflict_chat_judge のセッション内発火上限 (未参照 / 予約)。判定経路は
-    # 撤去済みで読むコードは無い。``extra="forbid"`` のため既存 config を
-    # 壊さないよう残している。0 = 無制限 (従来動作)。
-    max_judge_per_session: int = Field(default=3, ge=0)
 
 
 class SemMemConflictConfig(BaseModel):
@@ -333,14 +327,6 @@ class PinConfig(BaseModel):
     auto_detect: bool = True
     """自動 Pin 検出を有効化するか"""
 
-    auto_detect_confirm: bool = False
-    """検出時にユーザー確認を要求するか (未参照 / 予約)。確認フローは未実装で
-    読むコードは無い (``ShortTermMemory.__init__`` の NOTE 参照)。"""
-
-    unlimited: bool = True
-    """pin 数上限なし (未参照 / 予約)。読むコードは無く、pin 数の上限は
-    どこにも実装されていない。"""
-
 
 class PrivateSessionConfig(BaseModel):
     """プライベートセッション設定
@@ -439,10 +425,57 @@ class SemMemProjectConfig(BaseModel):
     archive_dir: str = "local/memory/semantic/archive"
 
 
+#: 宣言だけがあって値を読むコードが 1 つも無かった config キー (2026-09-02 監査
+#: で撤去)。サブモデルは ``extra="forbid"`` なので、そのまま消すと既存の
+#: config.yaml が起動不能になる。:meth:`MemoryConfig.drop_removed_keys` が
+#: 検証前に取り除き、キーごとに 1 行 WARNING を出す。
+#: ``(サブセクションの path, キー名)``。path は ``memory`` 直下からのドット区切り。
+REMOVED_MEMORY_KEYS: tuple[tuple[str, str], ...] = (
+    ("pin", "unlimited"),
+    ("pin", "auto_detect_confirm"),
+    ("facts", "trigger"),
+    ("subject_dictionary", "auto_expand"),
+    ("conflict.chat_review", "max_judge_per_session"),
+)
+
+
 class MemoryConfig(BaseModel):
     """メモリシステム設定"""
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def drop_removed_keys(cls, data):
+        """撤去済みキー (:data:`REMOVED_MEMORY_KEYS`) を検証前に取り除く。
+
+        サブモデルが ``extra="forbid"`` のため、キーを残した既存 config は
+        ``ValidationError`` で起動が止まる。互換のためここで黙って捨てるのでは
+        なく、キーごとに WARNING を 1 行出して config.yaml からの削除を促す。
+        """
+        if not isinstance(data, dict):
+            return data
+        cleaned = data
+        for section_path, key in REMOVED_MEMORY_KEYS:
+            segs = section_path.split(".")
+            node = data
+            for seg in segs:
+                node = node.get(seg) if isinstance(node, dict) else None
+            if not (isinstance(node, dict) and key in node):
+                continue
+            # 呼出側の dict は変更しない (copy-on-write で該当パスだけ差し替える)。
+            if cleaned is data:
+                cleaned = dict(data)
+            parent = cleaned
+            for seg in segs:
+                parent[seg] = dict(parent[seg])
+                parent = parent[seg]
+            parent.pop(key)
+            logger.warning(
+                "memory.%s.%s was removed and is ignored; delete it from "
+                "config.yaml", section_path, key,
+            )
+        return cleaned
 
     # EvorefMem スキーマバージョン
     # 不一致時は scripts/init_evorefmem.py による初期化を促す。
@@ -501,6 +534,11 @@ class MemoryConfig(BaseModel):
     # 1 で従来どおり (1 件ずつ)。既定 6 で押し出し回数が約 1/3 になり、
     # 保持ターン数の平均は max_turns の約 90% を維持する。
     working_evict_block: int = Field(default=6, ge=1)
+    # 同時に窓を保持するセッション数の上限 (LRU)。WM はセッション別に独立して
+    # おり (``WorkingMemoryRegistry``)、上限を超えると最も古く触ったセッションの
+    # 窓をセッション終了と同じ経路で STM へ流してから落とす。並行して開く
+    # チャットタブ数の想定より少し多めにしておく。
+    working_max_sessions: int = Field(default=8, ge=1)
     # 過去履歴の最低確保トークン数 (床)。動的ブロック (few-shot/file/semmem/RAG) の
     # 配分前に予約し、予算圧迫時でも直近の会話文脈が丸ごと締め出されるのを防ぐ。
     # 実履歴量・残予算・working_max_tokens でキャップされ、履歴が現在の質問のみの

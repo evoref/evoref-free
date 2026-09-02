@@ -592,6 +592,9 @@ async def stream_staged_create(
         prefetched_rag=prefetched_rag,
         prefetched_rag_top_score=prefetched_rag_top_score,
         file_context_block=file_context_block,
+        # テストの fake executor (SimpleNamespace) は属性を持たないので getattr。
+        truncated_steps=list(getattr(executor, "truncated_steps", ()) or ()),
+        truncated_max_tokens=getattr(executor, "spec_max_tokens", None),
     ):
         yield frame
 
@@ -634,8 +637,16 @@ async def _finalize_staged_stream(
     prefetched_rag: list[tuple[str, float, str]] | None = None,
     prefetched_rag_top_score: float | None = None,
     file_context_block: str | None = None,
+    truncated_steps: list[str] | None = None,
+    truncated_max_tokens: int | None = None,
 ) -> AsyncIterator[str]:
-    """staged 終端: 生成物を集約し output_target 別に配信 + token_info/done。"""
+    """staged 終端: 生成物を集約し output_target 別に配信 + token_info/done。
+
+    ``truncated_steps`` は executor が集約した「切れたまま採用された生成」の
+    ラベル (``StagedCreateExecutor.truncated_steps``)。1 件でもあれば
+    ``finish_reason=length`` の開示を deliberative と同じ SSE フレーム
+    (``sse.output_truncated``) で行い、経験記録に ``truncated=True`` を刻む。
+    """
     if timer:
         timer.stop("llm_total_ms")
     code_map: dict[str, str] = {}
@@ -771,9 +782,24 @@ async def _finalize_staged_stream(
             state, assembled, messages, session_id, query, "create",
             _estimate_tokens(assembled), staged_metrics, private=private,
             rag_used=_staged_rag_used, rag_top1_score=_staged_rag_top1,
+            truncated=bool(truncated_steps),
         )
     except Exception as exc:
         logger.warning("staged: record_long_form_response failed: %s", exc)
+
+    if truncated_steps:
+        # 切断の開示は **本文の外** (deliberative の ``_truncation_frame`` と
+        # 同じフレーム)。どのユニットが切れたかは step で併記する。生成物は
+        # 複数ユニットの結合なので tokens_generated は個別値を持たない (0)。
+        yield sse.step({
+            "type": "task_result",
+            "detail": (
+                f"⚠ 出力トークン上限で切れたまま採用した生成: "
+                f"{', '.join(truncated_steps)}"
+            ),
+            "status": "failed",
+        })
+        yield sse.output_truncated(0, truncated_max_tokens)
 
     if not code_map:
         yield sse.step({

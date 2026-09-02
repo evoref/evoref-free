@@ -3,6 +3,7 @@
 import json
 from collections.abc import Iterable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -11,6 +12,9 @@ from backend.io import atomic_write_text
 from backend.log_config import get_logger
 from backend.utils import utc_now_dt
 
+if TYPE_CHECKING:
+    from backend.debug_logger import DebugLogger
+
 logger = get_logger("rag.vector_store")
 
 # rescore 候補数のデフォルト下限
@@ -18,6 +22,32 @@ _DEFAULT_RESCORE_MIN = 50
 
 # memmap 切替閾値のデフォルト（ベクトル件数）
 DEFAULT_MEMMAP_THRESHOLD = 10000
+
+#: int8 粗検索で一度に float32 化する行数。全件を一括で ``astype(float32)``
+#: すると N×dim×4 バイトの一時配列がクエリごとに生まれる (memmap の意味も
+#: 失われる)。ブロック単位に切って峰を抑える。
+_COARSE_BLOCK_ROWS = 4096
+
+
+def _coarse_scores(
+    q8: np.ndarray, scales: np.ndarray, query_f32: np.ndarray,
+) -> np.ndarray:
+    """int8 行列とクエリの **スケール込み** 内積 (粗検索用スコア)。
+
+    ``q8 @ q`` だけでは行ごとの量子化スケールが落ちる。各行は
+    ``v ≈ q8 * scale / 127`` で復元されるので、``v·q ∝ (q8·q) * scale``。
+    scale を無視すると裾の重い行 (1 成分だけ大きく、他が小さく量子化される
+    行) の内積が系統的に小さく見え、float32 の上位が候補から漏れる。
+    ブロックごとに float32 化して全件コピーを避ける。
+    """
+    n = len(q8)
+    out = np.empty(n, dtype=np.float32)
+    sc = np.asarray(scales, dtype=np.float32).reshape(-1)
+    for start in range(0, n, _COARSE_BLOCK_ROWS):
+        stop = min(start + _COARSE_BLOCK_ROWS, n)
+        block = np.asarray(q8[start:stop]).astype(np.float32)
+        out[start:stop] = (block @ query_f32) * sc[start:stop]
+    return out
 
 
 def quantize_int8(
@@ -101,11 +131,14 @@ class VectorStore:
         vectors_dir: str | Path,
         memmap_threshold: int = DEFAULT_MEMMAP_THRESHOLD,
         quantization: str = "int8",
+        debug_logger: "DebugLogger | None" = None,
     ):
         """
         Args:
             vectors_dir: インデックスの配置ディレクトリ
             memmap_threshold: memmap に切り替えるベクトル件数の閾値
+            debug_logger: ``rag`` JSONL 出力先 (``wire_pillars`` の既存
+                インスタンスを注入。``None`` なら出力なし)
             quantization: 検索時の量子化利用方針 (config ``rag.quantization``)。
 
                 - ``int8`` (既定): int8 粗検索で候補を絞り、候補のみ float32 に
@@ -117,6 +150,7 @@ class VectorStore:
                 変える。
         """
         self.quantization = quantization
+        self._debug_logger = debug_logger
         self.vectors_dir = Path(vectors_dir)
         self.chunks_dir = self.vectors_dir / "chunks"
         self.source_texts_dir = self.vectors_dir / "source_texts"
@@ -604,8 +638,8 @@ class VectorStore:
         restricted_indices = self._restrict_to_clusters(query_f32, top_k)
 
         if restricted_indices is None:
-            # 通常経路: 全件 int8 粗検索
-            dots = self.vectors_q8.astype(np.float32) @ query_f32
+            # 通常経路: 全件 int8 粗検索 (行スケール込み、ブロック単位で float32 化)
+            dots = _coarse_scores(self.vectors_q8, self.scales, query_f32)
             n_candidates = min(rescore_candidates, n_vectors)
             if n_candidates >= n_vectors:
                 candidate_indices = np.arange(n_vectors)
@@ -614,9 +648,12 @@ class VectorStore:
                     -n_candidates:
                 ]
         else:
-            # IVF 経路: 対象クラスタ内のみ dot を計算
-            sub_q8 = np.asarray(self.vectors_q8)[restricted_indices].astype(np.float32)
-            sub_dots = sub_q8 @ query_f32
+            # IVF 経路: 対象クラスタ内のみ dot を計算 (行スケール込み)
+            sub_dots = _coarse_scores(
+                np.asarray(self.vectors_q8)[restricted_indices],
+                np.asarray(self.scales)[restricted_indices],
+                query_f32,
+            )
             n_candidates = min(rescore_candidates, len(restricted_indices))
             if n_candidates >= len(restricted_indices):
                 candidate_indices = restricted_indices

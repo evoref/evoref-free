@@ -700,11 +700,20 @@ REFERENTIAL_WRITE_TARGET_RE = re.compile(
 #: (実測: last-user 配置 13.2s / system 配置 95.1s / 外して戻す次ターン 99.5s)。
 #: 「誤検出のコストは低い」という前提が配置先の選択で崩れていたため、後置へ変更した。
 #: 詳細は ``core.inference.build_messages`` の該当箇所を参照。
+#:
+#: 連体形 (「上の」「直前の」) は **出力を指す目的語** を後続に要求する。裸の
+#: 「直前の」「上記の」「above」「previous」は普通の名詞句にも現れ、位置の
+#: 切替 (それ自体は無害) の他に ``latest_turn_truncation`` 等の下流判定も揺らす
+#: (2026-09-02 監査 P-A6: 「Git で直前のコミットを分割する方法」「上記の件、
+#: 了解」「机の上の本」「previously unreleased album」「above average とは」が
+#: すべて照応扱いだった)。
 BACKREFERENCE_TO_OUTPUT_RE = re.compile(
-    r"(?:上の|上記の?|前述の?|先(?:ほど|程)の?|さっきの?|直前の)"
-    r"|(?:それ|これ|その内容|この内容|上記)を"
-    r"|(?<![A-Za-z])(?:the\s+)?above(?![A-Za-z])"
-    r"|(?<![A-Za-z])previous(?:ly)?(?![A-Za-z])",
+    r"(?:上の|上記の|前述の|先(?:ほど|程)の|さっきの|直前の)"
+    r"(?:内容|回答|返答|出力|文章|文|コード|話|答え|結果|説明|例|要約|一覧|リスト|表)"
+    r"|(?:それ|これ|その内容|この内容|上記|前述)を"
+    r"|(?<![A-Za-z])the\s+above(?![A-Za-z])"
+    r"|(?<![A-Za-z])previous\s+(?:answer|output|response|message|reply)(?![A-Za-z])"
+    r"|(?<![A-Za-z])what\s+you\s+(?:just\s+)?(?:said|wrote)(?![A-Za-z])",
     re.IGNORECASE,
 )
 

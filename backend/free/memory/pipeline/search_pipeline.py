@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import re
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
 
+from backend.exceptions import RAGError
+from backend.i18n_helper import prompt_locale
 from backend.log_config import get_logger
 from backend.free.memory.corrections import corrections_by_target
 from backend.trace_context import run_in_executor_with_context
@@ -35,8 +38,29 @@ if TYPE_CHECKING:
 
 logger = get_logger("memory.search_pipeline")
 
-# STM / LTM / カートリッジ用スレッドプール（設計書 4.10.1）
+# STM / LTM 用スレッドプール（設計書 4.10.1）
 _search_executor = ThreadPoolExecutor(max_workers=3)
+
+#: カートリッジ検索専用のスレッドプール。
+#:
+#: ``asyncio.wait_for`` はコルーチン側を打ち切るだけで、executor へ投げた
+#: 関数は走り続ける。STM / LTM と同じプールを共有していると、タイムアウトした
+#: カートリッジ検索がワーカーを占有したまま次ターンの STM / LTM 検索を待たせる
+#: (3 ワーカーが全部塞がれば記憶検索そのものが止まる)。専用プールへ隔離し、
+#: 影響をカートリッジ層の中に閉じる。
+_cartridge_executor = ThreadPoolExecutor(max_workers=2)
+
+#: fire-and-forget で起動した後始末タスクの参照。参照を持たないタスクは GC に
+#: 回収されうる (asyncio の既知の挙動) ので、完了まで束ねておく。
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro, *, name: str) -> asyncio.Task:
+    """参照を保持したまま補助タスクを起動する (完了時に自動で外す)。"""
+    task = asyncio.create_task(coro, name=name)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
 
 
 @dataclass
@@ -72,6 +96,18 @@ def _resolve_fetch_multiplier(cfg: dict) -> int:
     return max(1, min(5, multiplier))
 
 
+def _resolve_rescore_candidates(rag_cfg: dict) -> int:
+    """``rag.rescore_candidates`` (int8 粗検索後の float32 rescore 候補数)。
+
+    0 以下 / 不正値は 0 (= ``VectorStore.search`` の内部既定 ``max(50, top_k*3)``)。
+    """
+    try:
+        value = int(rag_cfg.get("rescore_candidates", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, value)
+
+
 def _resolve_search_params(
     policy: PolicyInterpreter | None,
     rag_cfg: dict,
@@ -101,9 +137,11 @@ def _resolve_search_params(
     return top_k, stm_top_k, noise_sigma
 
 
-#: ``compress_turn(style="summary")`` の圧縮マークと末尾の元文字数。
-_SUMMARY_MARK = "[要約] "
-_SUMMARY_TAIL_RE = re.compile(r"…（\d+文字）\s*$")
+#: ``compress_turn(style="summary")`` の圧縮マーク (ja / en) と末尾の元文字数。
+#: 生成側 (``backend.utils.compress_turn``) は ja 固定なので、こちらは両方を
+#: 剥がせるようにしておく (locale 切替で剥がし漏れを起こさないため)。
+_SUMMARY_MARKS: tuple[str, ...] = ("[要約] ", "[summary] ")
+_SUMMARY_TAIL_RE = re.compile(r"…(?:（\d+文字）|\(\d+ chars\))\s*$")
 
 #: 「同じ質問の繰り返し」と見なす最小文字数。短い相槌 (「ありがとう」「はい」) は
 #: 何度でも出るので、これを繰り返し扱いにすると assistant ノートを不当に落とす。
@@ -113,8 +151,10 @@ _REPEAT_MIN_CHARS = 12
 def _normalize_utterance(text: str) -> str:
     """発話の同一判定用の正規化 (空白除去 + 圧縮マーク剥がし)。"""
     body = (text or "").strip()
-    if body.startswith(_SUMMARY_MARK):
-        body = body[len(_SUMMARY_MARK):]
+    for mark in _SUMMARY_MARKS:
+        if body.startswith(mark):
+            body = body[len(mark):]
+            break
     body = _SUMMARY_TAIL_RE.sub("", body)
     return "".join(body.split())
 
@@ -159,9 +199,20 @@ def query_repeats_a_stored_turn(short_term, query: str) -> bool:
 
 
 
-#: 訂正済みノートに付ける注記。SemMem 側の ``(訂正後の記録)``
-#: (``pipeline.injector._render_fact``) と対になる。
-_SUPERSEDED_MARK = "（訂正済み）"
+#: 訂正済みノートに付ける注記 (``i18n.prompt_locale`` 別)。SemMem 側の
+#: ``(訂正後の記録)`` (``pipeline.injector._render_fact``) と対になる。
+#: en 側を変えるときは ``core.inference._normalize_for_frame_dedup`` も揃える。
+_SUPERSEDED_MARKS: dict[str, str] = {
+    "ja": "（訂正済み）",
+    "en": " (superseded by a later correction)",
+}
+#: 従来名 (ja)。テスト / 外部参照の後方互換用。
+_SUPERSEDED_MARK = _SUPERSEDED_MARKS["ja"]
+
+
+def _superseded_mark() -> str:
+    """prompt_locale に応じた訂正済み注記 (未知 locale は ja)。"""
+    return _SUPERSEDED_MARKS.get(prompt_locale(), _SUPERSEDED_MARKS["ja"])
 
 
 def attach_superseding_corrections(
@@ -199,10 +250,11 @@ def attach_superseding_corrections(
 
     marked = {sid for sid, _, _ in links}
     present = {cid for cid, _, _ in sources}
+    mark = _superseded_mark()
     out: list[tuple[str, float, str]] = []
     for chunk_id, score, text in sources:
-        if chunk_id in marked and not (text or "").rstrip().endswith(_SUPERSEDED_MARK):
-            text = f"{(text or '').rstrip()}{_SUPERSEDED_MARK}"
+        if chunk_id in marked and not (text or "").rstrip().endswith(mark):
+            text = f"{(text or '').rstrip()}{mark}"
         out.append((chunk_id, score, text))
     for superseded_id, corr_id, corr_text in links:
         if corr_id and corr_id not in present and corr_text:
@@ -443,11 +495,17 @@ async def _search_ltm_layer(
     long_term, query_vec: np.ndarray, top_k: int,
     drop_past_answers: bool = False,
     query_text: str = "",
+    rescore_candidates: int = 0,
 ) -> tuple[list[tuple[str, float, str]], frozenset[str]]:
     """Layer 3 長期記憶検索 (< 5ms)。LTM 未設定 / 失敗時は空リスト。
 
     ``search_hybrid`` があれば **ベクトル + BM25 の RRF** で候補を集める。
     スコアは常に素のコサインなので、後段の品質判定 / フロアの閾値は不変。
+
+    ``rescore_candidates`` (``rag.rescore_candidates``) が正なら
+    ``VectorStore.search`` の float32 rescore 候補数として渡す。0 は
+    渡さない (ストア側の既定 ``max(50, top_k*3)``、旧シグネチャの
+    ダブルとも互換)。
 
     注入用に組み立てた文字列が回り込んだチャンクはここで落とす
     (:data:`_INJECTED_OUTPUT_MARKERS`)。
@@ -461,13 +519,16 @@ async def _search_ltm_layer(
     anchors: frozenset[str] = frozenset()
     try:
         hybrid = getattr(long_term, "search_hybrid", None)
+        extra = {"rescore_candidates": rescore_candidates} if rescore_candidates > 0 else {}
         if hybrid is not None and query_text:
             results, anchors = await run_in_executor_with_context(
-                loop, _search_executor, hybrid, query_vec, query_text, top_k,
+                loop, _search_executor,
+                lambda: hybrid(query_vec, query_text, top_k, **extra),
             )
         else:
             results = await run_in_executor_with_context(
-                loop, _search_executor, long_term.search, query_vec, top_k,
+                loop, _search_executor,
+                lambda: long_term.search(query_vec, top_k, **extra),
             )
         if drop_past_answers:
             results = _drop_past_answers(long_term, results)
@@ -517,38 +578,70 @@ async def _search_ltm_layer(
 async def _search_cartridge_layer(
     cartridge_mgr, query_vec: np.ndarray, top_k: int,
     timeout_ms: int = 0,
-) -> list[tuple[str, float, str]]:
-    """カートリッジ検索。マネージャ未設定 / 失敗時は空リスト。
+    rescore_candidates: int = 0,
+) -> tuple[list[tuple[str, float, str]], list[tuple[str, float, str]]]:
+    """カートリッジ検索。``(順位付け用, ゲート用)`` を返す。
 
-    ``timeout_ms`` が 1 以上の場合、検索全体にタイムアウトを適用する
-。タイムアウト時は空リストを返し、チャット応答を
-    止めないようにする。
+    STM 層と同じ 2 系統。順位付け用は ``cosine × priority`` (カートリッジの
+    ``priority`` を層内・層間の並びに効かせる)、ゲート用は **素の cosine**。
+    品質判定 / floor / content gate は cosine スケール前提で閾値が決まって
+    いるので、priority を掛けた値を流すと **priority が閾値を偽装する**
+    (priority 2.0 のカートリッジは cosine 0.15 でも floor 0.3 を越える)。
+
+    ``search_detailed`` (cosine と priority を分けて返す) があればそれを使い、
+    無ければ ``search`` の戻りを両方に使う (旧ダブル互換)。
+
+    ``timeout_ms`` が 1 以上の場合、検索全体にタイムアウトを適用する。
+    タイムアウト時は空を返し、チャット応答を止めないようにする。
+    マネージャ未設定 / 失敗時 (:class:`~backend.exceptions.RAGError` を含む —
+    次元不一致のカートリッジが 1 つあるだけで ``asyncio.gather`` ごと落ち、
+    そのターンの記憶が全部消えていた) も空。
     """
     if cartridge_mgr is None or not hasattr(cartridge_mgr, "search"):
-        return []
+        return [], []
     loop = asyncio.get_running_loop()
+    detailed = getattr(cartridge_mgr, "search_detailed", None)
+    extra = {"rescore_candidates": rescore_candidates} if rescore_candidates > 0 else {}
     try:
-        coro = run_in_executor_with_context(
-            loop, _search_executor, cartridge_mgr.search, query_vec, top_k,
-        )
-        if timeout_ms > 0:
-            results = await asyncio.wait_for(coro, timeout=timeout_ms / 1000.0)
+        if detailed is not None:
+            coro = run_in_executor_with_context(
+                loop, _cartridge_executor,
+                lambda: detailed(query_vec, top_k, **extra),
+            )
         else:
-            results = await coro
-        logger.debug("Step 3b cartridge: %d results", len(results))
-        return results
+            coro = run_in_executor_with_context(
+                loop, _cartridge_executor,
+                lambda: cartridge_mgr.search(query_vec, top_k, **extra),
+            )
+        if timeout_ms > 0:
+            raw = await asyncio.wait_for(coro, timeout=timeout_ms / 1000.0)
+        else:
+            raw = await coro
+        ranked: list[tuple[str, float, str]] = []
+        gated: list[tuple[str, float, str]] = []
+        for entry in raw:
+            if len(entry) >= 4:
+                cid, cosine, text, priority = entry[0], entry[1], entry[2], entry[3]
+                ranked.append((cid, float(cosine) * float(priority), text))
+                gated.append((cid, float(cosine), text))
+            else:
+                cid, score, text = entry[0], entry[1], entry[2]
+                ranked.append((cid, score, text))
+                gated.append((cid, score, text))
+        logger.debug("Step 3b cartridge: %d results", len(ranked))
+        return ranked, gated
     except asyncio.TimeoutError:
         logger.warning(
             "Cartridge search timed out after %d ms (L3); "
             "returning empty results to keep chat responsive",
             timeout_ms,
         )
-        return []
+        return [], []
     except asyncio.CancelledError:
         raise
-    except (RuntimeError, ValueError, TypeError, OSError) as e:
+    except (RAGError, RuntimeError, ValueError, TypeError, OSError) as e:
         logger.warning("Cartridge search failed: %s", e)
-        return []
+        return [], []
 
 
 async def _try_quality_expansion(
@@ -780,6 +873,7 @@ async def unified_search(
     top_k, stm_top_k, noise_sigma = _resolve_search_params(policy, rag_cfg, mode)
     multiplier = _resolve_fetch_multiplier(cfg)
     fetch_k = top_k * multiplier
+    rescore_candidates = _resolve_rescore_candidates(rag_cfg)
     logger.debug(
         "unified_search: query=%r, top_k=%d, fetch_k=%d (mult=%d)",
         query[:80], top_k, fetch_k, multiplier,
@@ -841,22 +935,26 @@ async def unified_search(
             "This query repeats an earlier turn; past answers will be kept out "
             "of the reference block (query=%r)", query[:50],
         )
-    stm_pair, ltm_pair, cart_results = await asyncio.gather(
+    stm_pair, ltm_pair, cart_pair = await asyncio.gather(
         _search_stm_layer(
             short_term, query_vec, stm_top_k, drop_past_answers,
             retired_note_ids=retired_note_ids,
         ),
         _search_ltm_layer(
             long_term, query_vec, fetch_k, drop_past_answers, query,
+            rescore_candidates=rescore_candidates,
         ),
         _search_cartridge_layer(
             cartridge_mgr, query_vec, fetch_k, timeout_ms=cart_timeout_ms,
+            rescore_candidates=rescore_candidates,
         ),
     )
     # STM は順位付け用 (combined) とゲート用 (素の cosine) の 2 系統を返す。
     stm_results, stm_gate_results = stm_pair
     # LTM は結果と「語彙アンカー」(クエリの希少語を実際に含む chunk_id) を返す。
     ltm_results, lexical_anchors = ltm_pair
+    # カートリッジも順位付け用 (cosine × priority) とゲート用 (素の cosine)。
+    cart_results, cart_gate_results = cart_pair
     if timer is not None:
         timer.stop("retrieval_ms")
 
@@ -866,7 +964,7 @@ async def unified_search(
     # contextual_text が使えるようになる。
     if lazy_contextual is not None and lazy_contextual.is_active and ltm_results:
         ltm_chunk_ids = [cid for cid, _, _ in ltm_results]
-        asyncio.create_task(
+        _spawn_background(
             lazy_contextual.on_retrieval_hits(ltm_chunk_ids),
             name=f"lazy_contextual_hits[{len(ltm_chunk_ids)}]",
         )
@@ -874,11 +972,12 @@ async def unified_search(
     # Step 4: 結果マージ。merged_raw は生スコア (品質判定 / gate / クエリ拡張用)、
     # merged は最終順位付け用。score_normalization でクロスレイヤ正規化を適用し、
     # STM/LTM/cartridge の異種スコアスケールの歪みを吸収する。
-    # merged_raw は STM のゲート用スコア (素の cosine) を使う。LTM / cartridge は
+    # merged_raw は STM / cartridge のゲート用スコア (素の cosine) を使う。LTM は
     # 元から cosine なので、これで 3 層すべてが同じスケールに揃う。merged 側は
-    # 従来どおり STM の combined (LightMem / pin 込み) で順位付けする。
+    # STM の combined (LightMem / pin 込み) と cartridge の cosine × priority で
+    # 順位付けする。
     norm = rag_cfg.get("score_normalization", "none")
-    merged_raw = _merge_results(stm_gate_results, ltm_results, cart_results)
+    merged_raw = _merge_results(stm_gate_results, ltm_results, cart_gate_results)
     if norm == "none":
         # 正規化なしのときは **3 層とも素の cosine** で並べる。
         #
@@ -893,7 +992,14 @@ async def unified_search(
         # を決めるのが本来の仕事で、層をまたいだ関連性の比較は素の cosine の
         # 担当。ゲート (品質判定 / floor / content gate) が既に素の cosine を
         # 使っているのと同じ理由。
-        merged = _merge_results(stm_gate_results, ltm_results, cart_results)
+        #
+        # カートリッジの priority だけは順位付けに残す (ゲートには掛けない)。
+        # priority が既定 1.0 なら merged_raw と同一なので、そのときは
+        # マージを 2 度計算しない。
+        if cart_results == cart_gate_results:
+            merged = list(merged_raw)
+        else:
+            merged = _merge_results(stm_gate_results, ltm_results, cart_results)
     else:
         merged = _merge_results(
             stm_results, ltm_results, cart_results, normalization=norm,
@@ -927,6 +1033,9 @@ async def unified_search(
                 timer.stop("content_gate_ms")
         kept = {cid for cid, _, _ in merged_raw}
         merged = [t for t in merged if t[0] in kept]
+        # 公平性保証 (Step 7.5) は cart_results から強制注入するので、gate で
+        # 落としたチャンクが裏口から戻らないよう同じ集合に揃える。
+        cart_gate_results = [c for c in cart_gate_results if c[0] in kept]
         logger.debug("Step 4.5 content gate: %d results after prune", len(merged_raw))
 
     # Step 5: Self-RAG 品質判定 (ベクトル閾値、< 0.1ms)
@@ -1040,7 +1149,7 @@ async def unified_search(
         # 公平性保証 (Step 7.5) は cart_results から未代表カートリッジを
         # 強制注入するため、フロアを通していないチャンクが裏口から戻る。
         # カートリッジ側にも同じ棒を掛ける (関連性の棒は経路で変わらない)。
-        cart_results = [c for c in cart_results if c[0] in kept_ids]
+        cart_gate_results = [c for c in cart_gate_results if c[0] in kept_ids]
     elif quality == "low":
         # フロア無効 (0.0) の構成では従来どおり「low はクエリ単位で全件破棄」。
         logger.info(
@@ -1066,7 +1175,7 @@ async def unified_search(
     # Step 7.5: カートリッジ公平性保証
     # ロード済みカートリッジが上位選別で完全に欠落するのを防ぐ
     final_sources = _ensure_cartridge_fairness(
-        final_sources, cart_results, top_k,
+        final_sources, cart_gate_results, top_k,
     )
 
     # Step 7.55: 語彙アンカーは席を争わせない。
@@ -1237,7 +1346,7 @@ def _ensure_cartridge_fairness(
         # 満杯: 差し替え対象を選ぶ
         # 優先度1: 非カートリッジ (STM/LTM) のうち最低スコア
         # 優先度2: 既に他で代表されているカートリッジの最低スコア
-        replace_idx = _find_replaceable_index(result, output_carts)
+        replace_idx = _find_replaceable_index(result)
         if replace_idx is None:
             continue
         result[replace_idx] = chunk
@@ -1253,7 +1362,6 @@ def _ensure_cartridge_fairness(
 
 def _find_replaceable_index(
     final: list[tuple[str, float, str]],
-    output_carts: set[str],  # noqa: ARG001
 ) -> int | None:
     """差し替え可能な要素のインデックスを返す
 
@@ -1344,8 +1452,13 @@ def _merge_results(
     return merged
 
 
+def _expansion_seed(query: str) -> int:
+    """クエリ文字列から決定論的な乱数シードを作る (純粋関数)。"""
+    return zlib.crc32((query or "").encode("utf-8")) & 0xFFFFFFFF
+
+
 async def _expand_and_research(
-    query: str,  # noqa: ARG001
+    query: str,
     query_vec: np.ndarray,
     working_mem,
     long_term,
@@ -1357,6 +1470,11 @@ async def _expand_and_research(
     直近の会話コンテキストがある場合に限り、クエリベクトルを微小ノイズで
     摂動させて近傍を再取得する。会話コンテキストの内容自体は (キーワード抽出
     等で) 検索条件に反映しない簡易拡張。
+
+    摂動は **クエリ文字列から導いたシード** で生成する (:func:`_expansion_seed`)。
+    チャット応答パスの補助判定は決定論層で行う不変則 (CLAUDE.md §6 #1) に
+    従い、同じクエリには同じ拡張結果を返す (未シードの乱数だと再現も
+    テストもできない)。
     """
     # 直近 3 ターンに非空の発話があるときだけ拡張する。
     has_context = any(
@@ -1366,8 +1484,9 @@ async def _expand_and_research(
     if not has_context or long_term is None:
         return []
 
-    # クエリベクトルを少し摂動させて再検索（簡易的な拡張）
-    noise = np.random.randn(*query_vec.shape).astype(np.float32) * noise_sigma
+    # クエリベクトルを少し摂動させて再検索（簡易的な拡張、決定論）
+    rng = np.random.default_rng(_expansion_seed(query))
+    noise = rng.standard_normal(query_vec.shape).astype(np.float32) * noise_sigma
     expanded_vec = query_vec + noise
     norm = np.linalg.norm(expanded_vec)
     if norm > 0:

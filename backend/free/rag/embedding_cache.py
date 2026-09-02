@@ -1,7 +1,9 @@
 """チャンクハッシュベースの永続埋め込みキャッシュ
 
 同一チャンクの再登録・再構築時に埋め込み計算をスキップする。
-キャッシュキーは ``model_name:text`` の SHA-256 ハッシュ (16 文字)。
+キャッシュキーは ``model_name:text`` の SHA-256 ハッシュ (16 文字)。バックエンドが
+``cache_identity()`` (doc_template 等、ドキュメント側のベクトルを変える設定) を
+持つ場合はその値も鍵に混ぜる (旧エントリは単にミスするだけ)。
 永続化層は ``diskcache.Cache`` (SQLite-backed, WAL モード) を用いる。
 
 dim / model_name 整合性メタは ``cache_dir/meta.json`` に保存し、diskcache の
@@ -34,10 +36,27 @@ _DEFAULT_CACHE_MAX_MB = 100
 _META_FILENAME = "meta.json"
 
 
-def _cache_key(text: str, model_name: str) -> str:
-    """テキスト + モデル名の SHA-256 ハッシュ（16文字）"""
-    content = f"{model_name}:{text}"
+def _cache_key(text: str, model_name: str, identity: str = "") -> str:
+    """テキスト + モデル名 (+ バックエンド識別) の SHA-256 ハッシュ（16文字）
+
+    ``identity`` はドキュメント側のベクトルを変える設定 (``doc_template`` /
+    LoRA 等) を表す文字列。空なら従来どおり ``model_name:text`` で、既存
+    エントリと互換。非空なら鍵に混ぜ、テンプレートを替えた後に旧ベクトルが
+    ヒットし続ける (同じ本文 → 別ベクトルのはずが旧値を返す) のを防ぐ。
+    """
+    content = f"{model_name}:{text}" if not identity else f"{model_name}|{identity}:{text}"
     return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+
+def _backend_identity(inner: object) -> str:
+    """内部バックエンドの ``cache_identity()`` (任意) を安全に読む。"""
+    fn = getattr(inner, "cache_identity", None)
+    if fn is None:
+        return ""
+    try:
+        return str(fn() or "")
+    except Exception:
+        return ""
 
 
 def _read_meta(meta_path: Path) -> dict | None:
@@ -202,8 +221,9 @@ class CachedEmbeddingBackend:
 
         model = self._inner.model_name()
         dim = self._inner.dim()
+        identity = _backend_identity(self._inner)
 
-        keys = [_cache_key(t, model) for t in texts]
+        keys = [_cache_key(t, model, identity) for t in texts]
 
         result = np.empty((len(texts), dim), dtype=np.float32)
         miss_indices: list[int] = []

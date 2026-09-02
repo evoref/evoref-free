@@ -13,6 +13,7 @@ from typing import Literal
 
 import yaml
 
+from backend.io import atomic_write_text
 from backend.log_config import get_logger
 from backend.utils import utc_now as _now
 
@@ -240,7 +241,8 @@ class ModelState:
                 for name, comp in self._components.items()
             },
         }
-        self.path.write_text(
+        atomic_write_text(
+            self.path,
             json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
@@ -979,15 +981,35 @@ class ModelMigrator:
         ),
     }
 
+    #: 実行時にプロファイルから解決されるキー。config 側が **明示的に
+    #: ``None``** (= プロファイル追随を選んでいる) なら転写しない — 書くと
+    #: その時点の値で固定され、以後プロファイル (by-model 層) を直しても
+    #: 追随しなくなる。未記載 (キー自体が無い) は従来どおり転写する。
+    _RUNTIME_PROFILE_RESOLVED: frozenset[str] = frozenset({
+        "cartridge_gate_threshold",
+    })
+
     @classmethod
     def _apply_routed(cls, target: dict, routed: dict[str, dict]) -> None:
-        """予約キー由来の閾値を config ツリーの **正しい位置** へ書き込む。"""
+        """予約キー由来の閾値を config ツリーの **正しい位置** へ書き込む。
+
+        プロファイルに値が無いキーは ``routed`` に含まれないので、``None`` や
+        既定値 (0.3 等) を config へ書くことはない。
+        """
         for section, values in routed.items():
             for key, value in values.items():
+                if value is None:
+                    continue
                 path = cls._THRESHOLD_CONFIG_PATH.get(key, (section, key))
                 node = target
                 for part in path[:-1]:
                     node = node.setdefault(part, {})
+                if (
+                    key in cls._RUNTIME_PROFILE_RESOLVED
+                    and path[-1] in node
+                    and node[path[-1]] is None
+                ):
+                    continue
                 node[path[-1]] = value
 
     def _update_component_config(

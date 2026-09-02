@@ -22,10 +22,10 @@
 
 ## エラーハンドリング方針
 
-`save` / `load` ともに `OSError` / `json.JSONDecodeError` /
-`TypeError` / `ValueError` / `KeyError` を捕捉し、`_state_logger`
-(クラス変数で差し替え可能、デフォルトはモジュール logger) に WARNING を
-出力した後 silently return する。
+`save` は `OSError` / `TypeError` / `ValueError` を、`load` は読み込みで
+`OSError` / `json.JSONDecodeError` を、デシリアライズ (`_from_payload`) では
+あらゆる `Exception` を捕捉し、`_state_logger` (クラス変数で差し替え可能、
+デフォルトはモジュール logger) に WARNING を出力した後 silently return する。
 
 これは元の 4 実装のうち多数派 (3 / 4) が採用していたパターンで、
 学習サブシステムの save/load 失敗が呼び出し側のホットパス (チャット応答 /
@@ -104,7 +104,11 @@ class JsonStateStore:
             return
         try:
             self._from_payload(payload)
-        except (KeyError, ValueError, TypeError) as e:
+        except Exception as e:
+            # 型エラー 3 種に限っていたが、``AttributeError`` (要素が dict でない)
+            # 等が素通りして起動を落とし、半分読んだ状態を次の save が上書き
+            # していた (2026-09-02 監査 R-B1)。復元失敗は種類を問わず WARNING で
+            # 止め、呼出側のホットパスへ伝播させない。
             self._store_logger().warning(
                 "Failed to deserialize %s from %s: %s",
                 type(self).__name__, path, e,

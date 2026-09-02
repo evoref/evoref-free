@@ -33,8 +33,10 @@ from fastapi import HTTPException
 
 from backend.free.api.chat.chat_stream_common import (
     _cancel_flags,
+    _emit_stream_error,
     _emit_timing,
     _log_chat_outcome,
+    _record_failed_generation,
     _sync_chat_response,
     cancel_scope,
     logger,
@@ -81,11 +83,13 @@ def _build_meta_cognitive_agent_runner(
     step_queue: "asyncio.Queue[dict | None]",
     result_holder: dict,
     output_target: str = "file",
+    private: bool = False,
 ):
     """MetaCognitive agent.process() をバックグラウンド実行するコルーチンを生成。
 
     ステップは step_queue に push され、完了・例外時に None で終端を通知する。
-    結果または例外は result_holder に格納して呼び出し側に返す。
+    結果または例外は result_holder に格納して呼び出し側に返す。``private`` は
+    MDP エピソードの begin イベントに刻まれる (エピソード記憶へ昇格させない)。
     """
     async def on_step(step_data: dict) -> None:
         await step_queue.put(step_data)
@@ -103,6 +107,7 @@ def _build_meta_cognitive_agent_runner(
                 session_id=session_id,
                 mode=mode,
                 output_target=output_target,
+                private=private,
             )
             result_holder["resp"] = resp
         except Exception as e:
@@ -117,14 +122,23 @@ async def _drain_meta_cognitive_steps(
     step_queue: "asyncio.Queue[dict | None]",
     session_id: str,
     keepalive_interval: float,
+    agent_task: "asyncio.Task | None" = None,
 ):
-    """step_queue から step フレームを逐次 yield する（keepalive / cancel 対応）。"""
+    """step_queue から step フレームを逐次 yield する（keepalive / cancel 対応）。
+
+    キャンセルを検知したら ``agent_task`` も cancel する。以前は drain を抜ける
+    だけで、エージェント (ツール実行 / LLM 生成) はそのまま完走していた —
+    ユーザーが止めたのに llama-server のスロットとツールが動き続ける。
+    """
     while True:
         try:
             step_data = await asyncio.wait_for(
                 step_queue.get(), timeout=keepalive_interval,
             )
         except asyncio.TimeoutError:
+            if _cancel_flags.get(session_id):
+                _cancel_agent_task(agent_task, session_id)
+                return
             yield sse.keepalive()
             continue
 
@@ -132,9 +146,16 @@ async def _drain_meta_cognitive_steps(
             return
 
         if _cancel_flags.get(session_id):
+            _cancel_agent_task(agent_task, session_id)
             return
 
         yield sse.step(step_data)
+
+
+def _cancel_agent_task(agent_task: "asyncio.Task | None", session_id: str) -> None:
+    if agent_task is not None and not agent_task.done():
+        logger.info("MetaCognitive: cancelling agent task (session=%s)", session_id)
+        agent_task.cancel()
 
 
 def _meta_cognitive_body_text(resp) -> str:
@@ -248,6 +269,23 @@ async def _emit_meta_cognitive_result_frames(resp) -> AsyncIterator[str]:
         yield sse.token(resp.content)
 
 
+def _meta_truncation_frame(resp) -> str | None:
+    """内部生成が ``finish_reason=length`` で切れていれば開示フレームを返す。
+
+    deliberative の ``_truncation_frame`` と同じく **本文の外** (SSE フレーム)
+    に出す。メタ経路はエージェントがストリームを内部で消費するため、
+    切断は ``MetaCognitiveResponse.truncated`` 経由で知る。継続待ち
+    (「続けて」の継続生成) は武装しない — 本文はタスク結果の要約であって
+    切れた生成そのものではないため。
+    """
+    if resp is None or not getattr(resp, "truncated", False):
+        return None
+    return sse.output_truncated(
+        int(getattr(resp, "truncated_tokens", 0) or 0),
+        getattr(resp, "truncated_max_tokens", None),
+    )
+
+
 def meta_cognitive_recorded_text(resp) -> str:
     """履歴・WM へ記録する本文 — **UI に出したのと同じテキスト** を返す。
 
@@ -288,8 +326,13 @@ def _finalize_meta_cognitive_stream(
     private: bool = False,
     rag_used: bool = False,
     rag_top1_score: float | None = None,
+    cancelled: bool = False,
 ) -> TokenInfo:
-    """MetaCognitive ストリーム完了時の記録・タイミング計測を行い TokenInfo を返す。"""
+    """MetaCognitive ストリーム完了時の記録・タイミング計測を行い TokenInfo を返す。
+
+    ``cancelled`` (ユーザーキャンセルで途中終了) は経験記録をスキップする
+    (``record_meta_cognitive_response`` の同名引数)。
+    """
     if timer:
         timer.stop("llm_total_ms")
 
@@ -313,6 +356,9 @@ def _finalize_meta_cognitive_stream(
         rag_top1_score=rag_top1_score,
         tool_routing_success=meta_tool_routing_success(resp),
         tool_routing_false_positive=meta_tool_routing_false_positive(resp),
+        cancelled=cancelled,
+        # 内部生成の切断は経験へ刻む (deliberative の ``truncated=`` と同じ)。
+        truncated=bool(getattr(resp, "truncated", False)),
         **meta_last_command_call(resp),
     )
 
@@ -344,6 +390,8 @@ async def stream_meta_cognitive(
         step_queue: asyncio.Queue[dict | None] = asyncio.Queue()
         result_holder: dict = {"resp": None, "error": None}
         outcome_success = False
+        # 終端処理 (record) まで到達したか。例外経路の失敗記録と二重にしない。
+        recorded = False
 
         run_agent = _build_meta_cognitive_agent_runner(
             agent,
@@ -353,6 +401,7 @@ async def stream_meta_cognitive(
             generation_params=generation_params,
             step_queue=step_queue, result_holder=result_holder,
             output_target=output_target,
+            private=private,
         )
 
         try:
@@ -367,11 +416,17 @@ async def stream_meta_cognitive(
             agent_task = asyncio.create_task(run_agent())
 
             async for frame in _drain_meta_cognitive_steps(
-                step_queue, session_id, keepalive_interval,
+                step_queue, session_id, keepalive_interval, agent_task,
             ):
                 yield frame
 
-            await agent_task
+            try:
+                await agent_task
+            except asyncio.CancelledError:
+                # 自分が (ユーザーキャンセルで) 止めたタスクなら終端処理へ進む。
+                # 外側のタスク自体のキャンセル (クライアント切断) は伝播させる。
+                if not (agent_task.cancelled() and _cancel_flags.get(session_id)):
+                    raise
 
             if result_holder["error"] is not None:
                 raise result_holder["error"]
@@ -390,18 +445,27 @@ async def stream_meta_cognitive(
                 private=private,
                 rag_used=rag_used,
                 rag_top1_score=rag_top1_score,
+                cancelled=bool(_cancel_flags.get(session_id)),
             )
+            recorded = True
+            truncation = _meta_truncation_frame(resp)
+            if truncation and not _cancel_flags.get(session_id):
+                yield truncation
             yield sse.token_info(ti)
             yield sse.done()
             outcome_success = True
 
         except Exception as e:
-            logger.error("MetaCognitive stream error: %s", e)
-            if timer:
-                timer.stop("llm_total_ms")
-            _emit_timing(state, timer, "meta_cognitive", 0, mode=mode)
-            yield sse.error(str(e))
-            yield sse.done()
+            async for frame in _emit_stream_error(
+                state, e, timer=timer, agent_layer="meta_cognitive", mode=mode,
+            ):
+                yield frame
+            if not recorded:
+                _record_failed_generation(
+                    state, query=query, messages=messages,
+                    session_id=session_id, mode=mode, private=private,
+                    agent_layer="meta_cognitive",
+                )
         finally:
             resp_obj = result_holder.get("resp")
             tokens_out = (
@@ -465,6 +529,7 @@ async def sync_meta_cognitive(
             session_id=session_id,
             mode=mode,
             output_target=output_target,
+            private=private,
         )
 
         if timer:
@@ -492,6 +557,7 @@ async def sync_meta_cognitive(
             rag_top1_score=rag_top1_score,
             tool_routing_success=meta_tool_routing_success(resp),
             tool_routing_false_positive=meta_tool_routing_false_positive(resp),
+            truncated=bool(getattr(resp, "truncated", False)),
             **meta_last_command_call(resp),
         )
 

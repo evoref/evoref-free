@@ -81,11 +81,20 @@ class FewShotSelector(Protocol):
     ) -> list[FewShotExample]: ...
 
 
+#: few-shot ブロックの見出し。system 側の参考枠指示
+#: (``prompt_manager.REFERENCE_BLOCK_DIRECTIVES``) が ``[参考例]`` と名指しする
+#: ので同じ文字列にする (以前は ``## Few-shot Examples`` で、指示と噛み合って
+#: いなかった)。例の区切りは ``### Example N`` のまま
+#: (``core.inference._FEWSHOT_EXAMPLE_SPLIT_RE`` / 退化検出の
+#: ``_FEWSHOT_EXAMPLE_HEADING_RE`` が依存する)。
+FEWSHOT_BLOCK_HEADING = "[参考例]"
+
+
 def format_fewshot_section(examples: list[FewShotExample]) -> str:
     """Few-shot 例をシステムプロンプトに埋め込むテキストにフォーマットする"""
     if not examples:
         return ""
-    lines = ["\n## Few-shot Examples\n"]
+    lines = [f"\n{FEWSHOT_BLOCK_HEADING}\n"]
     for i, ex in enumerate(examples, 1):
         lines.append(f"### Example {i}")
         lines.append(f"User: {ex.query}")

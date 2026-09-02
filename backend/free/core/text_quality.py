@@ -185,14 +185,30 @@ def _add_claim(claims: dict[str, set[str]], run: str, number: str) -> None:
 #:
 #: 「制約を破った」という信号自体は issue 台帳 (agent.issue_ledger) が持つので、
 #: 履歴から落としても失われない。
-SYSTEM_NOTE_TAIL_RE = re.compile(r"\n*\s*[（(]注[:：][^）)]*[）)]\s*$")
+#:
+#: 形は 2 種:
+#:
+#: - ``(注: …)`` / ``（注：…）`` — 開示注記。括弧は 1 段までの入れ子を許す
+#:   (「(注: 上限 300 字 (空白込み) を超過)」のような形で ``[^）)]*`` が途中で
+#:   閉じて注記が残った)。連続して複数付くこともある (文字数 + 禁止語)。
+#: - ``※会話の前半は…`` — 可視範囲の断り (``chat_service._TRUNCATED_HISTORY_GUIDANCE``
+#:   の指示でモデルが末尾に足す)。行末まで。
+#:
+#: いずれも **文末に連なっている分だけ** を落とす。本文中の丸括弧には触らない。
+_SYSTEM_NOTE_UNIT = (
+    r"[（(]注[:：](?:[^（）()]|[（(][^（）()]*[）)])*[）)]"
+    r"|※会話の前半は[^\n]*"
+)
+SYSTEM_NOTE_TAIL_RE = re.compile(
+    r"(?:\s*(?:" + _SYSTEM_NOTE_UNIT + r"))+\s*$", re.DOTALL,
+)
 
 
 def strip_system_notes(text: str) -> str:
     """システムが後付けした開示注記を落とす (純粋関数)。
 
     :data:`SYSTEM_NOTE_TAIL_RE` の説明を参照。本文中の丸括弧は落とさない —
-    対象は文末の ``(注: …)`` だけ。
+    対象は文末に連なる ``(注: …)`` と ``※会話の前半は…`` だけ。
     """
     return SYSTEM_NOTE_TAIL_RE.sub("", text or "").rstrip()
 
@@ -1147,7 +1163,7 @@ def count_response_words(response: str) -> int:
 
     システムが後付けした開示注記は除く (自分の注記で違反を作らないため)。
     """
-    body = _SYSTEM_NOTE_TAIL_RE.sub("", response or "")
+    body = SYSTEM_NOTE_TAIL_RE.sub("", response or "")
     return len(_WORD_TOKEN_RE.findall(body))
 
 
@@ -1242,7 +1258,7 @@ def violates_banned_content(query: str, response: str) -> str | None:
     words, scripts = match_banned_content(query)
     if not (words or scripts):
         return None
-    body = _SYSTEM_NOTE_TAIL_RE.sub("", response or "").strip()
+    body = SYSTEM_NOTE_TAIL_RE.sub("", response or "").strip()
     if not body:
         return None
     hits: list[str] = []
@@ -1284,7 +1300,7 @@ def _list_item_texts(response: str) -> list[str]:
     箇条書き記号を落として本文だけを返す。リストと確信できなければ空リスト
     (:func:`count_list_items` と同じ判定を項目本文にも使う)。
     """
-    body = _SYSTEM_NOTE_TAIL_RE.sub("", response or "").strip()
+    body = SYSTEM_NOTE_TAIL_RE.sub("", response or "").strip()
     if not body:
         return []
     lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
@@ -1581,7 +1597,7 @@ def count_response_lines(response: str) -> int:
     開示注記も除く — 数えた結果を開示に使うので、注記を数えると自分の注記で
     行数が増える。
     """
-    body = _SYSTEM_NOTE_TAIL_RE.sub("", response or "")
+    body = SYSTEM_NOTE_TAIL_RE.sub("", response or "")
     return len([ln for ln in body.splitlines() if ln.strip()])
 
 
@@ -1707,10 +1723,6 @@ def has_verifiable_output_constraint(query: str) -> bool:
     )
 
 
-#: システムが後付けした開示注記 (文末の ``(注: …)``)。計量から除く。
-_SYSTEM_NOTE_TAIL_RE = re.compile(r"\n*\s*[（(]注[:：][^）)]*[）)]\s*$")
-
-
 def length_disclosure_note(query: str, response: str) -> str:
     """文字数指定を満たせなかったときに末尾へ足す開示文 (純粋関数)。
 
@@ -1802,7 +1814,7 @@ def length_disclosure_note(query: str, response: str) -> str:
     # (2026-08-28 ライブ監査 T18-10 は文字数の 1 件しか挙げなかった)。
     banned_words, banned_scripts = match_banned_content(query or "")
     if banned_words or banned_scripts:
-        body = _SYSTEM_NOTE_TAIL_RE.sub("", response or "").strip()
+        body = SYSTEM_NOTE_TAIL_RE.sub("", response or "").strip()
         broken = [w for w in banned_words if w and w in body]
         broken += [
             name for name in banned_scripts

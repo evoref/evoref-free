@@ -35,12 +35,17 @@ class Level1ResultEntry(BaseModel):
 
 
 class PolicyEvolverDomainStatus(BaseModel):
-    """ポリシー進化ドメインの状態（Pro）"""
+    """ポリシー進化ドメインの状態 (PolicyParamEvolver は Free でも配線される)"""
     current_fitness: float | None = None
     best_fitness: float = 0.0
     decline_count: int = 0
     sigma: float = 0.0
     phase: str = ""
+    #: 恒真ガードで凍結中か (直近窓の fitness が動いていない = 乱歩防止で skip)。
+    degenerate: bool = False
+    fitness_history_len: int = 0
+    #: 評価窓の起点 (この timestamp より新しい経験だけで次を評価する)。
+    last_evolved_at: str | None = None
 
 
 class FitnessPoint(BaseModel):
@@ -161,7 +166,7 @@ class SchedulerStatusModel(BaseModel):
     last_level1_results: dict[str, Level1ResultEntry] = Field(default_factory=dict)
     executed_phases: list[str] = Field(default_factory=list)
     fitness_history: dict[str, list[FitnessPoint]] = Field(default_factory=dict)
-    # 探索/活用フェーズ（Pro のみ値が入る）
+    # 探索/活用フェーズ (PolicyParamEvolver 注入時に値が入る。Free / Pro 共通)
     policy_evolver_status: dict[str, PolicyEvolverDomainStatus] = Field(
         default_factory=dict,
     )

@@ -1,12 +1,15 @@
-"""Self-RAG quality_judge のセッション / クエリ単位カウンタ
+"""補助タスク判定 (content gate 等) のセッション / クエリ単位カウンタ
 
-ルールベース Self-RAG の marginal 判定 (既定 quality="medium") 時に
-補助タスク LLM による品質再判定を発火させる際、
-セッション内累計とクエリ単位の発火回数を抑制するためのトラッカー。
+チャット応答パスで補助タスク LLM を発火させる箇所が、セッション内累計と
+クエリ単位の発火回数を抑制するためのトラッカー。
 
-``AppState.judge_tracker`` に 1 個保持し、``search_pipeline``
-が ``session_id`` と config (``rag.self_rag.quality_judge``) を渡して
-許容可否を問い合わせる。
+``AppState.judge_tracker`` に 1 個保持し、呼出元 (現在は
+``ChunkContentGate``、namespace ``"content_gate"``) が ``session_id`` と
+**自前で組んだ quota dict** (``enabled`` / ``max_per_session`` /
+``max_per_query`` / ``only_when_quality``) を渡して許容可否を問い合わせる。
+かつて想定していた ``rag.self_rag.quality_judge`` セクションは config
+スキーマ (``SelfRagConfig``) が拒否するため存在しない — 補助タスクによる
+品質再判定そのものが撤去済みで、Self-RAG の品質判定は純ルールのみ。
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ logger = get_logger("rag.judge_tracker")
 
 @dataclass(frozen=True)
 class AuxJudgeDecision:
-    """quality_judge 発火許可判定の結果。
+    """補助タスク判定の発火許可判定の結果。
 
     Attributes:
         allowed: True なら発火可、False なら skip すべき。
@@ -40,7 +43,7 @@ class AuxJudgeDecision:
 
 
 class JudgeUsageTracker:
-    """セッション単位の quality_judge 発火回数をカウントする。
+    """セッション単位の補助タスク判定の発火回数をカウントする。
 
     スレッドセーフに実装し、複数並列リクエストから同じ session_id に
     対する許可判定が衝突しても確定した数値で判定する。セッション
@@ -76,14 +79,14 @@ class JudgeUsageTracker:
             namespace: 呼出元 purpose を識別する文字列 (``"necessity"`` /
                 ``"quality"`` / ``"content_gate"`` 等)。予算はこの単位で
                 独立に管理される。
-            quality: ルールベース Self-RAG の判定結果 ("high"/"medium"/"low")。
-                ``only_when_quality`` に含まれない場合は ``disabled``
-                相当の skip にする。
-            query_count: 現在のクエリ内で既に発火した回数。
-                ``_maybe_aux_judge_quality`` 側で整備する。
-            config: ``rag.self_rag.quality_judge`` セクションの dict。
-                ``None`` / 欠落時はデフォルト値 (enabled=True, session=5,
-                query=1, only=["medium"]) を適用する。
+            quality: 呼出元が ``only_when_quality`` と突き合わせる値。
+                content gate は ``"content_gate"`` 固定で渡す。含まれない
+                場合は ``quality_not_applicable`` で skip。
+            query_count: 現在のクエリ内で既に発火した回数 (呼出元が管理)。
+            config: 呼出元が組む quota dict (``enabled`` / ``max_per_session``
+                / ``max_per_query`` / ``only_when_quality``)。``None`` /
+                欠落時はデフォルト値 (enabled=True, session=5, query=1,
+                only=["medium"]) を適用する。
         """
         cfg = config or {}
         if not cfg.get("enabled", True):

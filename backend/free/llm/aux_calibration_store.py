@@ -33,11 +33,15 @@ class AuxCalibrationStore:
         {
           "<base_model_filename>": {
             "timeouts": {"<purpose>": <float seconds>, ...},
+            "samples": {"<purpose>": [<float seconds>, ...], ...},
             "calibrated_at": "<ISO8601 Z>",
             "source": "reactive"
           },
           ...
         }
+
+    ``samples`` (purpose 別の直近成功所要秒、p95 較正の母集団) は後から足した
+    任意キー。無い旧ファイルもそのまま読める (空 dict 扱い)。
 
     全メソッドが static で、ファイル I/O 以外の副作用を持たない。
     """
@@ -83,24 +87,61 @@ class AuxCalibrationStore:
         return result
 
     @staticmethod
+    def load_samples(path: str | Path, model_filename: str) -> dict[str, list[float]]:
+        """指定モデルの purpose 別成功所要秒サンプルを返す (無ければ空 dict)。"""
+        if not model_filename:
+            return {}
+        entry = AuxCalibrationStore.load_all(path).get(model_filename)
+        if not isinstance(entry, dict):
+            return {}
+        raw = entry.get("samples")
+        if not isinstance(raw, dict):
+            return {}
+        result: dict[str, list[float]] = {}
+        for purpose, values in raw.items():
+            if not isinstance(values, list):
+                continue
+            cleaned: list[float] = []
+            for v in values:
+                try:
+                    cleaned.append(float(v))
+                except (TypeError, ValueError):
+                    continue
+            if cleaned:
+                result[str(purpose)] = cleaned
+        return result
+
+    @staticmethod
     def save_timeouts(
-        path: str | Path, model_filename: str, timeouts: dict[str, float],
+        path: str | Path,
+        model_filename: str,
+        timeouts: dict[str, float],
+        *,
+        samples: dict[str, list[float]] | None = None,
     ) -> None:
         """指定モデルの purpose 別 timeout 較正値を書き出す。
 
         他モデルの entry は保持したまま当該モデルの entry のみ差し替える。親
         ディレクトリは自動作成。書き込みは ``atomic_write_text`` (tmp +
-        ``os.replace``) で部分書き込みを防止する。
+        ``os.replace``) で部分書き込みを防止する。``samples`` を渡すと p95 較正の
+        母集団も併せて保存する (省略時は既存の samples を保持)。
         """
         if not model_filename:
             return
         p = Path(path)
         data = AuxCalibrationStore.load_all(p)
+        previous = data.get(model_filename)
+        if samples is None and isinstance(previous, dict):
+            samples = previous.get("samples") if isinstance(previous.get("samples"), dict) else None
         data[model_filename] = {
             "timeouts": {str(k): float(v) for k, v in timeouts.items()},
             "calibrated_at": utc_now(),
             "source": "reactive",
         }
+        if samples:
+            data[model_filename]["samples"] = {
+                str(k): [float(x) for x in v] for k, v in samples.items()
+            }
         atomic_write_text(
             p,
             json.dumps(data, ensure_ascii=False, indent=2),

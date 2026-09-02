@@ -111,8 +111,10 @@ def try_parse_tool_dict(text: str) -> dict | None:
     パース失敗・dict 以外・'tool' キー欠落のいずれも None を返す。
     meta_cognitive の _parse_tool_call から共有される。
     """
+    from backend.free.llm.json_extract import escape_windows_path_backslashes
+
     try:
-        data = json.loads(text)
+        data = json.loads(escape_windows_path_backslashes(text))
     except json.JSONDecodeError:
         return None
     if isinstance(data, dict) and "tool" in data:

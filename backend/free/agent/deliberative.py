@@ -44,8 +44,9 @@ from backend.free.core.intent_vocab import (
     unused_tool_question,
     unverified_claim_numbers,
 )
-from backend.free.core.turn_text import append_to_last_user
+from backend.free.core.turn_text import TOOL_RESULT_HEADER, append_to_last_user
 from backend.config import resolve_context_size_for_mode
+from backend.i18n_helper import prompt_locale
 from backend.free.api.chat.chat_constants import (
     CONTENT_MAX_TOKENS_MIN, CONTENT_SYSTEM_RESERVE,
     TOOL_EXECUTION_TIMEOUT_SEC, TOOL_GROUNDED_TEMPERATURE,
@@ -56,6 +57,16 @@ from backend.free.api.chat.chat_types import GenerationParams, StepCallback
 from backend.log_config import get_logger
 
 logger = get_logger("agent.deliberative")
+
+
+def _localized(table: dict[str, str]) -> str:
+    """``i18n.prompt_locale`` 別の固定文を引く (未知 locale は ja)。
+
+    注記の文言は ``_X_GUIDANCE`` (ja、既存名) と ``_X_GUIDANCES`` (locale 辞書)
+    の対で持つ。ja は既存の文字列と同一 (既定出力は不変)。
+    """
+    return table.get(prompt_locale(), table["ja"])
+
 
 #: ツール実行の既定の最大ホップ数。
 #:
@@ -78,6 +89,13 @@ no explanations, no markdown fences, no JSON, no surrounding text.
 # 空振りと確定したツール結果の代わりに渡すプレースホルダ。無関係な内容を
 # 「唯一の事実根拠」として base に読ませないための安全な代替文言。
 _NO_RELEVANT_INFO_MESSAGE = "（ツールを実行しましたが、今回の質問に関連する情報は見つかりませんでした）"
+_NO_RELEVANT_INFO_MESSAGES: dict[str, str] = {
+    "ja": _NO_RELEVANT_INFO_MESSAGE,
+    "en": (
+        "(The tool was run, but no information relevant to this question "
+        "was found)"
+    ),
+}
 
 # 環境依存の事実を尋ねられたのにツールが 1 つも走らなかったときの注記。
 # 「この PC の〜を調べて」型のクエリは router が executable_query と分類する
@@ -105,6 +123,20 @@ _UNMEASURED_FACT_GUIDANCE = (
     "実行していないツールについて、実行した / 実行を試みたと述べない。"
     "推測値を断定形で述べない。"
 )
+_UNMEASURED_FACT_GUIDANCES: dict[str, str] = {
+    "ja": _UNMEASURED_FACT_GUIDANCE,
+    "en": (
+        "\n\nThis question can only be answered by actually inspecting this "
+        "execution environment, but no tool that inspects the environment was "
+        "run this turn, so no measured value exists. Therefore do not state a "
+        "specific number, model number, version, or capacity. If the user has "
+        "already given a value in the conversation or memory, you may state it "
+        "with its source; otherwise say honestly that it was not checked this "
+        "time and give one way the user can check it themselves. Do not say a "
+        "tool was run or attempted when it was not. Do not state guesses as "
+        "facts."
+    ),
+}
 
 #: 過去の会話について訊かれたが、履歴検索を 1 度も実行しなかった場合の文言。
 #:
@@ -121,6 +153,19 @@ _HISTORY_NOT_SEARCHED_GUIDANCE = (
     "いま会話に残っている範囲から答えられることは、その旨を明示して答えてよい。"
     "残っていないなら「確認できていない」と正直に伝えること。"
 )
+_HISTORY_NOT_SEARCHED_GUIDANCES: dict[str, str] = {
+    "ja": _HISTORY_NOT_SEARCHED_GUIDANCE,
+    "en": (
+        "\n\nEstablished fact: no tool that searches past conversations was "
+        "run this turn. Therefore do not speak as if you had looked something "
+        "up (\"I searched\", \"I checked the records\"). The dates and times "
+        "of past conversations exist only in search results, so do not state "
+        "a specific date (a guessed date is always wrong). Whatever can be "
+        "answered from what remains in this conversation may be answered, "
+        "saying so explicitly. If it is not there, say honestly that it has "
+        "not been confirmed."
+    ),
+}
 
 #: 状態を変える依頼だったが、実行できるツールが 1 つも無かった場合の文言。
 #:
@@ -151,6 +196,17 @@ _WRITE_TARGET_UNKNOWN_GUIDANCE = (
     "分からないことだけである。保存先の完全なパス (例: E:\\tmp\\メモ.txt) を"
     "1 文で尋ねること。"
 )
+_WRITE_TARGET_UNKNOWN_GUIDANCES: dict[str, str] = {
+    "ja": _WRITE_TARGET_UNKNOWN_GUIDANCE,
+    "en": (
+        "\n\nThis request asks to save to a file, but the destination path could "
+        "not be determined and **nothing was executed**. Do not report "
+        "completion (\"saved\"). Also **do not say that saving is unavailable or "
+        "unsupported** - saving can be performed in this mode; the only reason "
+        "nothing ran is that the destination is unknown. Ask for the full "
+        "destination path (e.g. E:\\tmp\\notes.txt) in one sentence."
+    ),
+}
 
 #: 直前の保存依頼に引数だけを与えたターンで、ツールが 1 度も実行されなかった
 #: 場合の注記。``_UNPERFORMED_ACTION_GUIDANCE`` (ツールが無い) とも
@@ -165,6 +221,16 @@ _PENDING_WRITE_NOT_EXECUTED_GUIDANCE = (
     "指定されたファイル名でよいかを 1 文で確認し、"
     "改めて保存の指示を求めること。"
 )
+_PENDING_WRITE_NOT_EXECUTED_GUIDANCES: dict[str, str] = {
+    "ja": _PENDING_WRITE_NOT_EXECUTED_GUIDANCE,
+    "en": (
+        "\n\nNo write tool was executed this turn - **not once**. Therefore do "
+        "not report completion (\"saved\", \"written\", \"created\") and do not "
+        "present the destination path as an existing file. The previous save "
+        "request is still pending. Confirm in one sentence whether the given "
+        "file name is acceptable and ask for the save instruction again."
+    ),
+}
 
 _UNPERFORMED_ACTION_GUIDANCE = (
     "\n\nこの依頼はファイルやシステムの状態を変える操作を含むが、"
@@ -181,6 +247,21 @@ _UNPERFORMED_ACTION_GUIDANCE = (
     "削除依頼に「ファイルの削除には権限が必要です。完全なパスを指定して削除を"
     "依頼してください」と、誤った理由と成立しない代替を提示した)。"
 )
+_UNPERFORMED_ACTION_GUIDANCES: dict[str, str] = {
+    "ja": _UNPERFORMED_ACTION_GUIDANCE,
+    "en": (
+        "\n\nThis request includes an operation that changes files or system "
+        "state, but no tool able to perform it was available this turn and "
+        "**nothing was executed**. Therefore do not report completion "
+        "(\"written\", \"appended\", \"created\", \"deleted\", \"does not exist\"), "
+        "and do not present a guessed post-change content or state. State "
+        "plainly that it could not be performed and offer one alternative "
+        "(do it in create mode / re-request with the full path if the path was "
+        "ambiguous, etc.). The reason is fixed as stated above - no tool can "
+        "perform this operation. Do not invent other reasons (permissions, a "
+        "missing path, ...) that are not written here."
+    ),
+}
 
 # search_history が空振りした場合専用のグラウンディング文言。通常ツールの
 # 「唯一の事実根拠として扱う」枠をそのまま付けると、直前ターンで述べられた
@@ -197,6 +278,19 @@ _SEARCH_HISTORY_NO_INFO_GUIDANCE = (
     "会話履歴に該当情報があれば、検索結果とは関係なくそれを使って具体的に"
     "回答すること。会話履歴にも本当に無い場合のみ「わからない」と答えてよい。"
 )
+_SEARCH_HISTORY_NO_INFO_GUIDANCES: dict[str, str] = {
+    "ja": _SEARCH_HISTORY_NO_INFO_GUIDANCE,
+    "en": (
+        "search_history is a tool that searches the records of past, separate "
+        "sessions. The \"no relevant information was found\" above only means "
+        "nothing was found in past sessions; it does not negate information "
+        "already stated in this ongoing conversation (including the user's "
+        "most recent message). If the conversation history contains the "
+        "information, answer concretely from it regardless of the search "
+        "result. Only when it is truly absent from the conversation history "
+        "as well may you answer \"I don't know\"."
+    ),
+}
 
 # search_history が「ヒットした」場合のグラウンディング文言。通常ツールの
 # 「唯一の事実根拠として扱う」枠を付けると、過去の別セッション (別の話題・
@@ -218,6 +312,24 @@ _SEARCH_HISTORY_RESULT_GUIDANCE = (
     "「ブラウズできない」「取得できない」とは言わないこと。"
     "結果にも会話履歴にも無い数値・事実は創作しないこと。"
 )
+_SEARCH_HISTORY_RESULT_GUIDANCES: dict[str, str] = {
+    "ja": _SEARCH_HISTORY_RESULT_GUIDANCE,
+    "en": (
+        "The ## ツール実行結果 above is real data the system actually retrieved "
+        "with the search_history tool. However, it is a record of a past "
+        "session separate from this ongoing conversation; the names, topics "
+        "and plans in it belong to that earlier, different conversation. The "
+        "current user is not necessarily the same person, so do not address "
+        "the user by a name found in the results or assert it as the user's "
+        "attribute. Information already stated in this ongoing conversation "
+        "(including the user's most recent message) takes precedence; the "
+        "search results do not negate or overwrite it. If the conversation "
+        "history has the answer, use it, and treat the search results only as "
+        "supplementary context about past events. Do not say you cannot "
+        "browse or cannot retrieve. Do not invent numbers or facts absent "
+        "from both the results and the conversation history."
+    ),
+}
 
 # calculate 専用のグラウンディング文言。calculate の結果は裸の数値であり、
 # 何をどの単位で計算したかの情報を持たない。汎用の「唯一の事実根拠」枠だけを
@@ -242,6 +354,26 @@ _CALCULATE_RESULT_GUIDANCE = (
     "式に現れていない係数・比重・補正 (例:「比重 1.3 を掛けた」) を"
     "計算の根拠として述べないこと。実際に評価されたのは上記の式だけである。"
 )
+_CALCULATE_RESULT_GUIDANCES: dict[str, str] = {
+    "ja": _CALCULATE_RESULT_GUIDANCE,
+    "en": (
+        "The ## ツール実行結果 above is the expression the system actually "
+        "evaluated with the calculate tool and its exact result. Use the "
+        "number as is. The unit of the result follows the units of the "
+        "numbers entered into the expression (e.g. a volume obtained by "
+        "multiplying lengths measured in cm is in cm³, not litres). Division "
+        "divides the units too (e.g. km ÷ (km/h) = hours, yen ÷ items = "
+        "yen/item). In the answer, always attach the unit to the number "
+        "(e.g. the answer to \"how many hours\" is written \"it takes 5 "
+        "hours\", unit included). If the user asked in a different unit and "
+        "the expression contains no conversion, none was performed: either "
+        "do and show the necessary conversion yourself or state that the "
+        "unit differs. Do not cite coefficients, densities or corrections "
+        "that do not appear in the expression (e.g. \"multiplied by a "
+        "density of 1.3\") as the basis of the calculation; only the "
+        "expression above was evaluated."
+    ),
+}
 
 
 def _previous_user_text(
@@ -275,16 +407,233 @@ def _unexplained_numbers_note(numbers: tuple[str, ...]) -> str:
     のコメント参照)。
     """
     listed = "、".join(numbers)
-    return (
-        f"ただし式中の {listed} は、ユーザーの依頼文にもここまでの会話にも"
-        f"現れていない値である。この値が何を指すのか (単位・1件あたりの量・"
-        f"換算率など) を答えの中で明示すること。根拠を示せない場合は、"
-        f"その値を仮定として断ったうえで、正しい値をユーザーに確認すること。"
-    )
+    return _localized(_UNEXPLAINED_NUMBERS_NOTES).format(listed=listed)
+
+
+_UNEXPLAINED_NUMBERS_NOTES: dict[str, str] = {
+    "ja": (
+        "ただし式中の {listed} は、ユーザーの依頼文にもここまでの会話にも"
+        "現れていない値である。この値が何を指すのか (単位・1件あたりの量・"
+        "換算率など) を答えの中で明示すること。根拠を示せない場合は、"
+        "その値を仮定として断ったうえで、正しい値をユーザーに確認すること。"
+    ),
+    "en": (
+        "However, {listed} in the expression does not appear in the user's "
+        "request or anywhere in the conversation so far. State explicitly in "
+        "the answer what this value stands for (unit, amount per item, "
+        "conversion rate, etc.). If you cannot justify it, present it as an "
+        "assumption and ask the user to confirm the correct value."
+    ),
+}
+
+#: read_file 結果に併記する決定論の実測値 (文字数 / 行数)。
+_FILE_MEASUREMENT_NOTES: dict[str, str] = {
+    "ja": "[この結果の実測値: {chars} 文字 / {lines} 行]",
+    "en": "[Measured size of this result: {chars} characters / {lines} lines]",
+}
+
+# --- 決定論の事実注記 (``_append_*_fact``) の locale 別文言 -------------------
+# ja は従来の文字列と同一 (既定出力は不変)。``_localized`` で引く。
+
+#: 押し出し後でも WM が保持するセッション先頭から ``first`` を確定した注記。
+_SESSION_HEAD_PINNED_FACTS: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: この会話でユーザーが最初に送ったメッセージは"
+        "「{head}」である。これは会話の並び順から機械的に確定した値"
+        "なので、この値をそのまま答えること。"
+        "(この会話の冒頭 {evicted_turns} 件は文脈の上限を超えて"
+        "表示できていないが、最初の発言はこの値で確定している。"
+        "上の値を答えとして述べること)"
+    ),
+    "en": (
+        "\n\nEstablished fact: the first message the user sent in this "
+        "conversation is \"{head}\". This value was determined mechanically "
+        "from the order of the conversation, so answer with it as is. (The "
+        "first {evicted_turns} message(s) of this conversation exceed the "
+        "context limit and are not shown, but the first message is fixed to "
+        "this value. State the value above as the answer.)"
+    ),
+}
+#: 押し出しがあり、先頭も保持されていないため ``first`` を確定できない注記。
+_SESSION_HEAD_UNKNOWN_NOTES: dict[str, str] = {
+    "ja": (
+        "\n\n注記: この会話の冒頭 {evicted_turns} 件は文脈の上限を超えて"
+        "参照できない。したがって「会話で最初に送ったメッセージ」は"
+        "確定できない。見えている範囲の先頭を会話の先頭として断定せず、"
+        "参照できる範囲が限られていることを述べたうえで、"
+        "見えている中で最も古い発言を『確認できる範囲での最古』として"
+        "示すこと。"
+    ),
+    "en": (
+        "\n\nNote: the first {evicted_turns} message(s) of this conversation "
+        "exceed the context limit and cannot be referenced. Therefore \"the "
+        "first message sent in the conversation\" cannot be determined. Do "
+        "not assert the head of the visible range as the start of the "
+        "conversation; state that the referenceable range is limited, and "
+        "present the oldest visible message as \"the oldest within the "
+        "confirmable range\"."
+    ),
+}
+#: 窓内で確定した位置 (first / last) の注記。``label`` は下の辞書から引く。
+_SESSION_POSITION_FACTS: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: この会話でユーザーが{label}に送ったメッセージは"
+        "「{target}」である。これは会話の並び順から機械的に確定した値なので、"
+        "この値をそのまま答えること。"
+    ),
+    "en": (
+        "\n\nEstablished fact: the {label} message the user sent in this "
+        "conversation is \"{target}\". This value was determined mechanically "
+        "from the order of the conversation, so answer with it as is."
+    ),
+}
+_SESSION_POSITION_LABEL_FIRST: dict[str, str] = {"ja": "最初", "en": "first"}
+_SESSION_POSITION_LABEL_LAST: dict[str, str] = {"ja": "直近", "en": "most recent"}
+
+#: 「過去に書いたコードをそのまま見せろ」に実物を渡す注記 (末尾にコード)。
+_PRIOR_CODE_BLOCK_FACTS: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: ユーザーが指しているのは以下のコードである。"
+        "これは会話履歴から機械的に取り出した実物なので、"
+        "**一字一句そのまま** 出力すること。書き直さないこと。\n"
+    ),
+    "en": (
+        "\n\nEstablished fact: the user is referring to the code below. It "
+        "was extracted mechanically from the conversation history, so output "
+        "it **verbatim, character for character**. Do not rewrite it.\n"
+    ),
+}
+
+#: 自己評価の問いへ渡す不首尾台帳 (記録あり)。``issues`` / ``corrections``。
+_ISSUE_LEDGER_FACTS: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: この会話でシステムが観測した不首尾は以下がすべて"
+        "である。これは発生時に機械的に記録した値なので、この記録に"
+        "基づいて答えること。ここにある項目を「無かった」と述べては"
+        "ならない。\n{issues}"
+        "\n(うちユーザーによる訂正は {corrections} 回)"
+        "\nなお、この記録はシステムが観測できた範囲であり、"
+        "回答内容そのものの誤り (計算違い等) は含まれない。"
+        "「記録上は以上」と断ったうえで答えること。"
+    ),
+    "en": (
+        "\n\nEstablished fact: the following is the complete list of failures "
+        "the system observed in this conversation. It was recorded "
+        "mechanically as they happened, so answer based on this record. Do "
+        "not say that any item here \"did not happen\".\n{issues}"
+        "\n(of which {corrections} were corrections by the user)"
+        "\nNote that this record covers only what the system could observe; "
+        "errors in the content of answers themselves (miscalculations etc.) "
+        "are not included. Answer with the caveat \"as far as the record "
+        "shows\"."
+    ),
+}
+#: 自己評価の問いへ渡す不首尾台帳 (記録なし)。
+_ISSUE_LEDGER_EMPTY_FACTS: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: この会話でシステムが観測した不首尾は 1 件も無い"
+        "(ツールの失敗・空振り・制約違反・訂正のいずれも記録が空)。"
+        "ただしこれは観測できた範囲であり、回答内容そのものの誤りは"
+        "含まれない。断定するなら「記録上は」と限定すること。"
+    ),
+    "en": (
+        "\n\nEstablished fact: the system observed no failures in this "
+        "conversation (no tool failures, empty results, constraint "
+        "violations or corrections are on record). However, this covers "
+        "only what could be observed and does not include errors in the "
+        "content of answers themselves. If you assert this, qualify it with "
+        "\"as far as the record shows\"."
+    ),
+}
+
+#: 確認形で持ち込まれた「会話に無い数値」への注記。``listed``。
+_UNVERIFIED_CLAIM_NOTES: dict[str, str] = {
+    "ja": (
+        "\n\nこの発言に含まれる数値 {listed} は、ここまでの会話に一度も"
+        "現れていない。会話に実際にある値を確認し、食い違うならその値を"
+        "示して訂正すること。会話に無い値であれば、そのまま同意せず"
+        "「その値は出ていない」と伝えて確認を求めること。"
+    ),
+    "en": (
+        "\n\nThe number(s) {listed} in this message have never appeared in "
+        "the conversation so far. Check the values that actually occur in "
+        "the conversation and, if they differ, show those values and "
+        "correct it. If the value is not in the conversation, do not simply "
+        "agree; say that the value has not come up and ask for confirmation."
+    ),
+}
 
 
 # 引用したユーザー発言に一人称が含まれるかの判定 (帰属注記の出し分け用)。
 _FIRST_PERSON_RE = re.compile(r"(?:私|僕|俺|自分|わたし|ぼく)")
+
+#: ツール実行結果ブロックの本体 (見出し ``TOOL_RESULT_HEADER`` の直後)。
+_TOOL_RESULT_BODY_TEMPLATES: dict[str, str] = {
+    "ja": "ツール: {tool_name}\n結果:\n{result}\n\n",
+    "en": "Tool: {tool_name}\nResult:\n{result}\n\n",
+}
+
+#: 話題再フォーカス (今回の質問を明示し、前ターンの話題を無視させる)。
+_REFOCUS_TEMPLATES: dict[str, str] = {
+    "ja": (
+        "今回ユーザーが答えてほしい質問は『{query}』である。{person_note}"
+        "会話履歴の前の話題は無関係なので無視し、この質問にのみ答えること。\n"
+    ),
+    "en": (
+        "The question the user wants answered now is \"{query}\". {person_note}"
+        "Earlier topics in the conversation history are unrelated; ignore them "
+        "and answer only this question.\n"
+    ),
+}
+#: 引用文に一人称があるときの帰属注記 (``_REFOCUS_TEMPLATES`` に埋める)。
+_REFOCUS_PERSON_NOTES: dict[str, str] = {
+    "ja": (
+        "引用文中の一人称 (私 / 僕 / 自分) はユーザーを指す。"
+        "回答では一人称を使わず、必ず二人称で述べること "
+        "(誤:「私の誕生日は3月14日です」/ "
+        "正:「小川さんの誕生日は3月14日ですね」「あなたの誕生日は…」)。"
+    ),
+    "en": (
+        "First-person pronouns in the quoted text (I / me / my) refer to the "
+        "user. Do not use the first person in your answer; always speak in the "
+        "second person (wrong: \"My birthday is March 14\" / right: \"Your "
+        "birthday is March 14\"). "
+    ),
+}
+
+#: ツール別の文言が無いツールに付ける汎用の接地指示 (capability assertion)。
+_DEFAULT_TOOL_GROUNDINGS: dict[str, str] = {
+    "ja": (
+        "上記の ## ツール実行結果 は、システムが {tool_name} ツールで実際にアクセスして"
+        "取得した本物のデータである。あなたにはこのツールがあり、取得は既に成功している。"
+        "この結果を唯一の事実根拠として、内容 (数値・名称・日付・条件など) を読み取り、"
+        "それに基づいて具体的に回答すること。"
+        "「ブラウズできない」「取得できない」「アクセスできない」とは言わないこと。"
+        "「取得できない」「データがない」と答えてよいのは、結果が空かエラーの場合のみ。"
+        "結果に該当が無い場合のみ、システムプロンプトの参考コンテキスト (カートリッジ・記憶等) も併用してよい。"
+        "結果に無い数値・事実は創作しないこと。"
+        # 内部足場の語彙がそのまま本文に出る (実測 2026-07-27:
+        # 「ご提示いただいたツール実行結果に基づき、作成した買い物リストは
+        # 以下の通りです。」)。ユーザーにはツール実行は見えているが、
+        # 「提示された」という受け身の言い回しは主体を取り違えさせる。
+        "ただし回答本文では「ツール実行結果」「ご提示いただいた結果」等の内部的な言い回しを使わず、"
+        "自分で調べて分かったこととして自然に述べること。"
+    ),
+    "en": (
+        "The ## ツール実行結果 block above is real data that the system actually "
+        "retrieved with the {tool_name} tool. You have this tool and the "
+        "retrieval has already succeeded. Treat this result as the sole factual "
+        "basis: read its content (numbers, names, dates, conditions) and answer "
+        "concretely from it. Do not say you cannot browse, retrieve, or access. "
+        "Answering \"unavailable\" or \"no data\" is allowed only when the "
+        "result is empty or an error. Only when the result has nothing relevant "
+        "may you also use the reference context in the system prompt "
+        "(cartridges, memory, etc.). Do not invent numbers or facts that are "
+        "not in the result. In the answer body, do not use internal phrasing "
+        "such as \"tool result\" or \"the result you provided\"; present it "
+        "naturally as something you looked up yourself."
+    ),
+}
 
 # run_command / run_command_readonly 専用のグラウンディング。calculate と同じく
 # 出力は裸の値で、「何を求めたコマンドか」の情報を持たない。汎用枠だけを付けると
@@ -305,6 +654,21 @@ _COMMAND_RESULT_GUIDANCE = (
     "回答本文では「ツール実行結果」「コマンド」等の内部的な言い回しを使わず、"
     "自分で調べて分かったこととして自然に述べること。"
 )
+_COMMAND_RESULT_GUIDANCES: dict[str, str] = {
+    "ja": _COMMAND_RESULT_GUIDANCE,
+    "en": (
+        "The ## ツール実行結果 above is the command the system actually ran and "
+        "its standard output. The output is the **finished result** the "
+        "command computed, not an intermediate step or a base value. If the "
+        "command already adds days, takes a difference or reformats, that "
+        "computation is done; do not apply the same operation to the output "
+        "again. Use the numbers and dates from this output as is and do not "
+        "recompute them in your head. Do not say you cannot run or cannot "
+        "retrieve. Do not invent numbers or facts absent from the output. In "
+        "the answer, avoid internal phrasing such as \"tool result\" or "
+        "\"command\" and present it naturally as something you looked up."
+    ),
+}
 
 # 生成系ツール (draft_document / summarize / translate) 専用のグラウンディング。
 # これらの結果は外部から取得した事実データではなく LLM が書いた下書きなので、
@@ -321,6 +685,20 @@ _GENERATED_DRAFT_GUIDANCE = (
     "回答本文では「ツール実行結果」「ご提示いただいた結果」等の内部的な言い回しを使わず、"
     "自分が書いた文章として自然に提示すること。"
 )
+_GENERATED_DRAFT_GUIDANCES: dict[str, str] = {
+    "ja": _GENERATED_DRAFT_GUIDANCE,
+    "en": (
+        "The ## ツール実行結果 above is a draft you yourself generated, not "
+        "factual data retrieved from outside. You may use it as a basis for "
+        "style and structure, but wherever it conflicts with facts already "
+        "established in the conversation (dates, weekdays, places, "
+        "quantities), rewrite it with the conversation as the source of "
+        "truth. Do not treat facts appearing in the draft as new evidence. "
+        "In the answer, avoid internal phrasing such as \"tool result\" or "
+        "\"the result you provided\" and present it naturally as text you "
+        "wrote."
+    ),
+}
 
 
 # read_file 専用のグラウンディング。汎用文言は「結果に無い事実を創作しない」と
@@ -341,6 +719,14 @@ _ENUMERATION_RESULT_GUIDANCE = (
     "項目名はこの結果に現れる綴りのまま引用すること。"
     "一般的な構成から類推した項目名を補わないこと。"
 )
+_ENUMERATION_RESULT_GUIDANCES: dict[str, str] = {
+    "ja": _ENUMERATION_RESULT_GUIDANCE,
+    "en": (
+        "The ## ツール実行結果 above is the exact set of items the system "
+        "actually enumerated. Quote item names with the spelling that appears "
+        "in this result. Do not add item names inferred from typical layouts."
+    ),
+}
 #: 列挙結果が切り詰められていたときに追加する文言。省略があることを明示しないと
 #: base は手元の部分集合を全体として提示する。
 _TRUNCATED_ENUMERATION_NOTE = (
@@ -355,6 +741,17 @@ _TRUNCATED_ENUMERATION_NOTE = (
     "見つからない場合は省略部分に含まれる可能性があるため"
     "「この範囲では確認できない」と答えること。"
 )
+_TRUNCATED_ENUMERATION_NOTES: dict[str, str] = {
+    "ja": _TRUNCATED_ENUMERATION_NOTE,
+    "en": (
+        "This result is a partial listing with its middle omitted. Do not say "
+        "\"that is everything\"; make clear in the answer that the listing is "
+        "partial. When asked whether a specific item exists, do not conclude "
+        "\"it does not exist\" from its absence in this partial listing. "
+        "Answer \"yes\" only if it is found; if not, it may be in the omitted "
+        "part, so answer \"it cannot be confirmed within this range\"."
+    ),
+}
 
 _FILE_CONTENT_TOOLS = frozenset({"read_file"})
 _FILE_CONTENT_RESULT_GUIDANCE = (
@@ -369,6 +766,22 @@ _FILE_CONTENT_RESULT_GUIDANCE = (
     "回答本文では「ツール実行結果」等の内部的な言い回しを使わず、"
     "自分で読んで分かったこととして自然に述べること。"
 )
+_FILE_CONTENT_RESULT_GUIDANCES: dict[str, str] = {
+    "ja": _FILE_CONTENT_RESULT_GUIDANCE,
+    "en": (
+        "The ## ツール実行結果 above is the exact content actually stored in "
+        "that file. When showing the file's contents, quote the string from "
+        "this result verbatim. If it differs from what the conversation said "
+        "\"should have been written\", show the actual file content and also "
+        "point out that it differs from what was expected. Do not rewrite the "
+        "content to match the expected wording, and do not summarise or "
+        "reformat it. When asked for character or line counts, use the "
+        "numbers in the accompanying [Measured size of this result] note as "
+        "is (do not state a count of your own). Do not say you cannot read "
+        "or cannot access it. In the answer, avoid internal phrasing such as "
+        "\"tool result\" and present it naturally as something you read."
+    ),
+}
 
 
 #: 「そのまま / 一字一句 / 全文」でファイル内容の提示を求める言い回し。
@@ -586,6 +999,82 @@ class DeliberativeResponse:
 #: 記憶構成の確定事実。実装 (EvorefMem) に基づく。
 #:
 #: 「何種類あるか」に数を答えられるよう、層を明示的に数え上げる。
+#: ``_append_tool_inventory_fact`` の本文 (locale 別)。
+_TOOL_INVENTORY_FACTS: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: このモード ({mode}) で実際に実行できるツールは"
+        "以下がすべてである。これは実装の登録内容から機械的に取得した値なので、"
+        "{instruction}\n{summary}"
+    ),
+    "en": (
+        "\n\nEstablished fact: the tools that can actually be executed in this "
+        "mode ({mode}) are exactly the following. This list was taken "
+        "mechanically from the implementation's registry, so {instruction}\n"
+        "{summary}"
+    ),
+}
+# 「使っていないツールは？」は目録そのものではなく、目録と実行台帳の差を
+# 答える問い。「一覧をそのまま答えること」と書くと差集合を作らない。
+_TOOL_INVENTORY_DIFF_INSTRUCTIONS: dict[str, str] = {
+    "ja": (
+        "この一覧と、上の実行記録に無いものの差を取って答えること。"
+        "ここに無いツール名を挙げてはならない。"
+    ),
+    "en": (
+        "answer with the difference between this list and the execution "
+        "record above. Do not name any tool that is not in this list."
+    ),
+}
+_TOOL_INVENTORY_LIST_INSTRUCTIONS: dict[str, str] = {
+    "ja": (
+        "この一覧をそのまま答えること。ここに無いものを挙げず、"
+        "「ツールは無い」とも述べないこと。"
+    ),
+    "en": (
+        "answer with this list as it is. Do not add anything that is not in "
+        "it, and do not say that you have no tools."
+    ),
+}
+
+#: ``_append_tool_ledger_fact`` の本文 (locale 別)。``{ledger}`` に実記録が入る。
+_TOOL_LEDGER_FACTS: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: この会話でシステムが実際に実行したツールは以下が"
+        "すべてである。これは実行時に機械的に記録した値なので、"
+        "この記録に基づいて答えること。ここに無い実行を述べず、"
+        "記録にある実行を「していない」とも述べないこと。"
+        "一覧に無いターンではツールを実行していない。\n{ledger}"
+        "\nしたがって、この一覧に載っていない依頼は"
+        "**ツールを使わずに答えた (暗算・記憶で答えた)** ものである。"
+        "記録に無いことを「ツールを使った」の根拠にしてはならない。"
+        "一覧に無い依頼が 1 件でもあるなら"
+        "「すべてツールで計算した」は偽になる。"
+    ),
+    "en": (
+        "\n\nEstablished fact: the tools the system actually executed in this "
+        "conversation are exactly the following. This was recorded mechanically "
+        "at execution time, so answer from this record. Do not mention "
+        "executions that are not here, and do not deny executions that are. "
+        "No tool was executed in turns that are not listed.\n{ledger}"
+        "\nTherefore, any request not in this list was **answered without a "
+        "tool (by mental arithmetic or from memory)**. The absence of a record "
+        "must never be used as evidence that a tool was used. If even one "
+        "request is missing from the list, \"everything was calculated with a "
+        "tool\" is false."
+    ),
+}
+_TOOL_LEDGER_EMPTY_FACTS: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: この会話でシステムが実行したツールは 1 件も無い"
+        "(実行記録が空)。ツールを実行したとは述べないこと。"
+    ),
+    "en": (
+        "\n\nEstablished fact: the system executed no tool at all in this "
+        "conversation (the execution record is empty). Do not say a tool was "
+        "executed."
+    ),
+}
+
 _MEMORY_ARCHITECTURE_FACT = (
     "\n\n確定事実: このアシスタントの記憶は次の 4 層で構成される。"
     "これは実装そのものなので、この内容で答えること。ここに無い層を述べない。\n"
@@ -757,7 +1246,9 @@ class DeliberativeAgent:
             chars, lines = read_file_body_counts(tool_result_text)
             truncated = (
                 f"{truncated}\n\n"
-                f"[この結果の実測値: {chars} 文字 / {lines} 行]"
+                + _localized(_FILE_MEASUREMENT_NOTES).format(
+                    chars=chars, lines=lines,
+                )
             )
         # 話題再フォーカス: 弱いモデルは前ターンの話題に引きずられ、今回の質問
         # (例: ニュース) を取り違える (実機確認: 前ターンが天気だとニュース質問に
@@ -771,65 +1262,55 @@ class DeliberativeAgent:
             # 今日からあと 229 日です。」と、アシスタント自身の誕生日として
             # 回答した)。一人称を含むときだけ帰属を明示する。
             person_note = (
-                "引用文中の一人称 (私 / 僕 / 自分) はユーザーを指す。"
-                "回答では一人称を使わず、必ず二人称で述べること "
-                "(誤:「私の誕生日は3月14日です」/ "
-                "正:「小川さんの誕生日は3月14日ですね」「あなたの誕生日は…」)。"
+                _localized(_REFOCUS_PERSON_NOTES)
                 if _FIRST_PERSON_RE.search(q) else ""
             )
-            refocus = (
-                f"今回ユーザーが答えてほしい質問は『{q}』である。{person_note}"
-                f"会話履歴の前の話題は無関係なので無視し、この質問にのみ答えること。\n"
+            refocus = _localized(_REFOCUS_TEMPLATES).format(
+                query=q, person_note=person_note,
             )
-        if tool_name == "search_history" and tool_result_text == _NO_RELEVANT_INFO_MESSAGE:
+        if (
+            tool_name == "search_history"
+            and tool_result_text == _localized(_NO_RELEVANT_INFO_MESSAGES)
+        ):
             # 空振りに「唯一の事実根拠」枠を付けると直前ターンの内容まで
             # 無視されるため、search_history 空振り専用の文言に差し替える
             # (通常ツールの capability assertion は付けない)。
-            grounding = _SEARCH_HISTORY_NO_INFO_GUIDANCE
+            grounding = _localized(_SEARCH_HISTORY_NO_INFO_GUIDANCES)
         elif tool_name == "search_history":
             # ヒットした場合も「唯一の事実根拠」枠は付けない。過去の別セッション
             # の内容を今回の事実として断定させないため専用文言を使う。
-            grounding = _SEARCH_HISTORY_RESULT_GUIDANCE
+            grounding = _localized(_SEARCH_HISTORY_RESULT_GUIDANCES)
         elif tool_name == "calculate":
-            grounding = _CALCULATE_RESULT_GUIDANCE
+            grounding = _localized(_CALCULATE_RESULT_GUIDANCES)
             if unexplained_numbers:
                 grounding += _unexplained_numbers_note(unexplained_numbers)
         elif tool_name in _COMMAND_TOOLS:
-            grounding = _COMMAND_RESULT_GUIDANCE
+            grounding = _localized(_COMMAND_RESULT_GUIDANCES)
         elif tool_name in _ENUMERATIVE_TOOLS:
-            grounding = _ENUMERATION_RESULT_GUIDANCE
+            grounding = _localized(_ENUMERATION_RESULT_GUIDANCES)
             if len(truncated) < len(tool_result_text):
-                grounding += _TRUNCATED_ENUMERATION_NOTE
+                grounding += _localized(_TRUNCATED_ENUMERATION_NOTES)
         elif tool_name in _FILE_CONTENT_TOOLS:
-            grounding = _FILE_CONTENT_RESULT_GUIDANCE
+            grounding = _localized(_FILE_CONTENT_RESULT_GUIDANCES)
         elif tool_name in _GENERATED_DRAFT_TOOLS:
-            grounding = _GENERATED_DRAFT_GUIDANCE
+            grounding = _localized(_GENERATED_DRAFT_GUIDANCES)
         else:
             # capability assertion: 弱いモデルは「自分はブラウズ/取得できない」という
             # 思い込みでツール結果を無視し拒否することがある (実機確認)。結果が
             # 実際に取得された本物データであると明示して上書きする。
-            grounding = (
-                f"上記の ## ツール実行結果 は、システムが {tool_name} ツールで実際にアクセスして"
-                f"取得した本物のデータである。あなたにはこのツールがあり、取得は既に成功している。"
-                f"この結果を唯一の事実根拠として、内容 (数値・名称・日付・条件など) を読み取り、"
-                f"それに基づいて具体的に回答すること。"
-                f"「ブラウズできない」「取得できない」「アクセスできない」とは言わないこと。"
-                f"「取得できない」「データがない」と答えてよいのは、結果が空かエラーの場合のみ。"
-                f"結果に該当が無い場合のみ、システムプロンプトの参考コンテキスト (カートリッジ・記憶等) も併用してよい。"
-                f"結果に無い数値・事実は創作しないこと。"
-                # 内部足場の語彙がそのまま本文に出る (実測 2026-07-27:
-                # 「ご提示いただいたツール実行結果に基づき、作成した買い物リストは
-                # 以下の通りです。」)。ユーザーにはツール実行は見えているが、
-                # 「提示された」という受け身の言い回しは主体を取り違えさせる。
-                f"ただし回答本文では「ツール実行結果」「ご提示いただいた結果」等の内部的な言い回しを使わず、"
-                f"自分で調べて分かったこととして自然に述べること。"
+            grounding = _localized(_DEFAULT_TOOL_GROUNDINGS).format(
+                tool_name=tool_name,
             )
+        # 見出しは ``turn_text.TOOL_RESULT_HEADER`` (送信時ガードが同じ境界で
+        # 切り詰める)。接地指示が「上記の ## ツール実行結果 は…」と名指しする
+        # ので locale で変えない。「ツール:」「結果:」の行だけ locale 追従。
         tool_msg = (
-            f"\n\n## ツール実行結果\n"
-            f"ツール: {tool_name}\n"
-            f"結果:\n{truncated}\n\n"
-            f"{refocus}"
-            f"{grounding}"
+            TOOL_RESULT_HEADER
+            + _localized(_TOOL_RESULT_BODY_TEMPLATES).format(
+                tool_name=tool_name, result=truncated,
+            )
+            + f"{refocus}"
+            + f"{grounding}"
         )
         append_to_last_user(messages, tool_msg, separator="")
 
@@ -887,12 +1368,9 @@ class DeliberativeAgent:
                 )
                 append_to_last_user(
                     messages,
-                    f"\n\n確定事実: この会話でユーザーが最初に送ったメッセージは"
-                    f"「{head}」である。これは会話の並び順から機械的に確定した値"
-                    f"なので、この値をそのまま答えること。"
-                    f"(この会話の冒頭 {evicted_turns} 件は文脈の上限を超えて"
-                    f"表示できていないが、最初の発言はこの値で確定している。"
-                    f"上の値を答えとして述べること)",
+                    _localized(_SESSION_HEAD_PINNED_FACTS).format(
+                        head=head, evicted_turns=evicted_turns,
+                    ),
                     separator="",
                 )
                 return "first"
@@ -909,24 +1387,22 @@ class DeliberativeAgent:
             # 先に伝えて、推測での断定を止める。
             append_to_last_user(
                 messages,
-                f"\n\n注記: この会話の冒頭 {evicted_turns} 件は文脈の上限を超えて"
-                "参照できない。したがって「会話で最初に送ったメッセージ」は"
-                "確定できない。見えている範囲の先頭を会話の先頭として断定せず、"
-                "参照できる範囲が限られていることを述べたうえで、"
-                "見えている中で最も古い発言を『確認できる範囲での最古』として"
-                "示すこと。",
+                _localized(_SESSION_HEAD_UNKNOWN_NOTES).format(
+                    evicted_turns=evicted_turns,
+                ),
                 separator="",
             )
             return None
         target = resolve_session_position_message(conversation, query, position)
         if not target:
             return None
-        label = "最初" if position == "first" else "直近"
+        label = _localized(
+            _SESSION_POSITION_LABEL_FIRST if position == "first"
+            else _SESSION_POSITION_LABEL_LAST,
+        )
         append_to_last_user(
             messages,
-            f"\n\n確定事実: この会話でユーザーが{label}に送ったメッセージは"
-            f"「{target}」である。これは会話の並び順から機械的に確定した値なので、"
-            f"この値をそのまま答えること。",
+            _localized(_SESSION_POSITION_FACTS).format(label=label, target=target),
             separator="",
         )
         logger.info(
@@ -967,10 +1443,7 @@ class DeliberativeAgent:
             return False
         append_to_last_user(
             messages,
-            "\n\n確定事実: ユーザーが指しているのは以下のコードである。"
-            "これは会話履歴から機械的に取り出した実物なので、"
-            "**一字一句そのまま** 出力すること。書き直さないこと。\n"
-            "```\n" + target + "\n```",
+            _localized(_PRIOR_CODE_BLOCK_FACTS) + "```\n" + target + "\n```",
             separator="",
         )
         logger.info(
@@ -1065,21 +1538,15 @@ class DeliberativeAgent:
             return False
         # 「使っていないツールは？」は目録そのものではなく、目録と実行台帳の差を
         # 答える問い。「一覧をそのまま答えること」と書くと差集合を作らない。
-        if unused_tool_question(query):
-            instruction = (
-                "この一覧と、上の実行記録に無いものの差を取って答えること。"
-                "ここに無いツール名を挙げてはならない。"
-            )
-        else:
-            instruction = (
-                "この一覧をそのまま答えること。ここに無いものを挙げず、"
-                "「ツールは無い」とも述べないこと。"
-            )
+        instruction = _localized(
+            _TOOL_INVENTORY_DIFF_INSTRUCTIONS if unused_tool_question(query)
+            else _TOOL_INVENTORY_LIST_INSTRUCTIONS,
+        )
         append_to_last_user(
             messages,
-            f"\n\n確定事実: このモード ({mode}) で実際に実行できるツールは"
-            f"以下がすべてである。これは実装の登録内容から機械的に取得した値なので、"
-            f"{instruction}\n{summary}",
+            _localized(_TOOL_INVENTORY_FACTS).format(
+                mode=mode, instruction=instruction, summary=summary,
+            ),
             separator="",
         )
         logger.info("Tool inventory fact pinned (mode=%s)", mode)
@@ -1158,23 +1625,11 @@ class DeliberativeAgent:
         issues = format_issues(session_id)
         corrections = count_kind(session_id, "user_correction")
         if issues:
-            body = (
-                "\n\n確定事実: この会話でシステムが観測した不首尾は以下がすべて"
-                "である。これは発生時に機械的に記録した値なので、この記録に"
-                "基づいて答えること。ここにある項目を「無かった」と述べては"
-                "ならない。\n" + issues
-                + f"\n(うちユーザーによる訂正は {corrections} 回)"
-                + "\nなお、この記録はシステムが観測できた範囲であり、"
-                "回答内容そのものの誤り (計算違い等) は含まれない。"
-                "「記録上は以上」と断ったうえで答えること。"
+            body = _localized(_ISSUE_LEDGER_FACTS).format(
+                issues=issues, corrections=corrections,
             )
         else:
-            body = (
-                "\n\n確定事実: この会話でシステムが観測した不首尾は 1 件も無い"
-                "(ツールの失敗・空振り・制約違反・訂正のいずれも記録が空)。"
-                "ただしこれは観測できた範囲であり、回答内容そのものの誤りは"
-                "含まれない。断定するなら「記録上は」と限定すること。"
-            )
+            body = _localized(_ISSUE_LEDGER_EMPTY_FACTS)
         append_to_last_user(messages, body, separator="")
         logger.info(
             "Issue ledger fact pinned (session=%s, entries=%d)",
@@ -1202,32 +1657,18 @@ class DeliberativeAgent:
             return False
         ledger = format_ledger(session_id)
         if ledger:
-            body = (
-                "\n\n確定事実: この会話でシステムが実際に実行したツールは以下が"
-                "すべてである。これは実行時に機械的に記録した値なので、"
-                "この記録に基づいて答えること。ここに無い実行を述べず、"
-                "記録にある実行を「していない」とも述べないこと。"
-                "一覧に無いターンではツールを実行していない。\n" + ledger
-                # 「不在」からの推論を **明示的な結論として** 渡す。一覧を出す
-                # だけでは、記録が無い = 実行していない = 暗算、という向きを
-                # 取り違える。実インシデント (2026-08-29 ライブ監査 T27#7):
-                # 「ツールを使わず暗算したものはありますか」に対し、実測では
-                # 4 ターンが no_tool だったのに「いいえ、ありません。すべて
-                # ツールを使用して算出しています」と回答し、さらに
-                # 「ツール実行履歴に該当する計算依頼が含まれていないため、
-                # ツールを使用していない計算は存在しません」と **論理を反転**
-                # させた (履歴に無いことは、まさに暗算だった証拠である)。
-                + "\nしたがって、この一覧に載っていない依頼は"
-                "**ツールを使わずに答えた (暗算・記憶で答えた)** ものである。"
-                "記録に無いことを「ツールを使った」の根拠にしてはならない。"
-                "一覧に無い依頼が 1 件でもあるなら"
-                "「すべてツールで計算した」は偽になる。"
-            )
+            # 「不在」からの推論を **明示的な結論として** 渡す。一覧を出す
+            # だけでは、記録が無い = 実行していない = 暗算、という向きを
+            # 取り違える。実インシデント (2026-08-29 ライブ監査 T27#7):
+            # 「ツールを使わず暗算したものはありますか」に対し、実測では
+            # 4 ターンが no_tool だったのに「いいえ、ありません。すべて
+            # ツールを使用して算出しています」と回答し、さらに
+            # 「ツール実行履歴に該当する計算依頼が含まれていないため、
+            # ツールを使用していない計算は存在しません」と **論理を反転**
+            # させた (履歴に無いことは、まさに暗算だった証拠である)。
+            body = _localized(_TOOL_LEDGER_FACTS).format(ledger=ledger)
         else:
-            body = (
-                "\n\n確定事実: この会話でシステムが実行したツールは 1 件も無い"
-                "(実行記録が空)。ツールを実行したとは述べないこと。"
-            )
+            body = _localized(_TOOL_LEDGER_EMPTY_FACTS)
         append_to_last_user(messages, body, separator="")
         logger.info("Tool ledger fact pinned (session=%s)", session_id[:12])
         return True
@@ -1235,7 +1676,9 @@ class DeliberativeAgent:
     @staticmethod
     def _append_unmeasured_fact_note(messages: list[dict]) -> None:
         """最後の user メッセージへ「実測できなかった」注記を追記する。"""
-        append_to_last_user(messages, _UNMEASURED_FACT_GUIDANCE, separator="")
+        append_to_last_user(
+            messages, _localized(_UNMEASURED_FACT_GUIDANCES), separator="",
+        )
 
     @staticmethod
     def _append_history_not_searched_note(
@@ -1272,7 +1715,7 @@ class DeliberativeAgent:
         if not asks_about_past_conversation(query or ""):
             return False
         append_to_last_user(
-            messages, _HISTORY_NOT_SEARCHED_GUIDANCE, separator="",
+            messages, _localized(_HISTORY_NOT_SEARCHED_GUIDANCES), separator="",
         )
         return True
 
@@ -1288,7 +1731,7 @@ class DeliberativeAgent:
         if not persist_request(query):
             return False
         append_to_last_user(
-            messages, _WRITE_TARGET_UNKNOWN_GUIDANCE, separator="",
+            messages, _localized(_WRITE_TARGET_UNKNOWN_GUIDANCES), separator="",
         )
         logger.info("Write-target-unknown note pinned: %s", query[:50])
         return True
@@ -1323,7 +1766,8 @@ class DeliberativeAgent:
         if not previous or not persist_request(previous):
             return False
         append_to_last_user(
-            messages, _PENDING_WRITE_NOT_EXECUTED_GUIDANCE, separator="",
+            messages, _localized(_PENDING_WRITE_NOT_EXECUTED_GUIDANCES),
+            separator="",
         )
         logger.info("Pending-write note pinned (no tool ran): %s", query[:50])
         return True
@@ -1331,7 +1775,9 @@ class DeliberativeAgent:
     @staticmethod
     def _append_unperformed_action_note(messages: list[dict]) -> None:
         """最後の user メッセージへ「操作を実行できなかった」注記を追記する。"""
-        append_to_last_user(messages, _UNPERFORMED_ACTION_GUIDANCE, separator="")
+        append_to_last_user(
+            messages, _localized(_UNPERFORMED_ACTION_GUIDANCES), separator="",
+        )
 
     def _append_unperformed_action_note_if_blocked(
         self, messages: list[dict], judgement: "ToolJudgement | None" = None,
@@ -1376,10 +1822,7 @@ class DeliberativeAgent:
         listed = "、".join(numbers)
         append_to_last_user(
             messages,
-            f"\n\nこの発言に含まれる数値 {listed} は、ここまでの会話に一度も"
-            f"現れていない。会話に実際にある値を確認し、食い違うならその値を"
-            f"示して訂正すること。会話に無い値であれば、そのまま同意せず"
-            f"「その値は出ていない」と伝えて確認を求めること。",
+            _localized(_UNVERIFIED_CLAIM_NOTES).format(listed=listed),
             separator="",
         )
         logger.info(
@@ -1438,8 +1881,13 @@ class DeliberativeAgent:
         # 目録だけ渡すと差を base が作話する (2026-08-28 ライブ監査 T06-19:
         # 未登録の delete_file / move_file を挙げた)。目録の短絡より前に台帳を
         # 足しておく。
+        # 一度足したら下の own_process_question の短絡でもう一度足さない
+        # (同じ台帳が 2 回並んでいた — 2026-09-02 監査 P-A5)。
+        ledger_pinned = False
         if unused_tool_question(query):
-            self._append_tool_ledger_fact(messages, query, session_id)
+            ledger_pinned = self._append_tool_ledger_fact(
+                messages, query, session_id,
+            )
 
         # 「どんなツールが使えるか」も決定論で答えが出る事実 (ToolsRegistry が
         # SSOT)。ツールを撃つ意味は無いので、位置事実と同様に注記だけ足して
@@ -1465,7 +1913,9 @@ class DeliberativeAgent:
 
         # 「実際にツールを使ったか」も同じ — 答えは tool_ledger にあり、
         # 新たにツールを撃っても増えるのは記録だけで根拠にはならない。
-        if self._append_tool_ledger_fact(messages, query, session_id):
+        if ledger_pinned or self._append_tool_ledger_fact(
+            messages, query, session_id,
+        ):
             if tool_judge_task is not None and not tool_judge_task.done():
                 tool_judge_task.cancel()
             return None, None, None, None, None
@@ -1512,14 +1962,18 @@ class DeliberativeAgent:
             # 危険。丸投げすると自分が計算した値を捨てて追認する
             # (_append_unverified_claim_note の docstring 参照)。
             self._append_unverified_claim_note(messages, query, conversation)
-            # 保存依頼で宛先が解決できなかった場合は「能力が無い」ではなく
-            # 「宛先が分からない」— 理由を取り違えると同じ会話で成功している
-            # write_file を「利用できない」と説明してしまう。
-            self._append_write_target_unknown_note(messages, query)
             # 直前の保存依頼に引数だけを与えたターン。宛先は今まさに与えられて
             # いるので「保存先を教えて」ではなく「まだ実行していない」を伝える
             # (_append_pending_write_note の docstring 参照)。
             self._append_pending_write_note(messages, query, conversation)
+            # 保存依頼で宛先が解決できなかった場合は「能力が無い」ではなく
+            # 「宛先が分からない」— 理由を取り違えると同じ会話で成功している
+            # write_file を「利用できない」と説明してしまう。
+            # クエリがファイル名 / パスを名指ししているなら宛先は分かっている
+            # ので付けない (pending 側が勝つ。両方付くと「保存先を尋ねよ」と
+            # 「ファイル名を確認せよ」が並んで矛盾する — 2026-09-02 監査 P-A5)。
+            if not names_file_target(query):
+                self._append_write_target_unknown_note(messages, query)
             # 過去会話を訊かれたのに検索を撃てなかったターン。丸投げすると
             # 「確認しましたが」と調べた体で語り、日付まで捏造する
             # (_HISTORY_NOT_SEARCHED_GUIDANCE 参照)。
@@ -1555,7 +2009,7 @@ class DeliberativeAgent:
         # 「唯一の事実根拠」枠で base に渡すと進行中の会話履歴まで否定させて
         # しまうため、明示的な「関連情報なし」文言へ差し替える。
         if _is_search_history_empty(judgement.tool_name, tool_result_text):
-            prompt_result_text = _NO_RELEVANT_INFO_MESSAGE
+            prompt_result_text = _localized(_NO_RELEVANT_INFO_MESSAGES)
             self._append_tool_result_to_last_user(
                 messages, judgement.tool_name, prompt_result_text, query=query,
             )

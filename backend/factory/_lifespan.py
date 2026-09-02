@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from backend.free.learning.scheduler import LearningScheduler
     from backend.free.memory.scheduler import SleepTimeScheduler
     from backend.free.memory.stores.short_term import ShortTermMemory
-    from backend.free.memory.stores.working import WorkingMemory
+    from backend.free.memory.stores.working import WorkingMemoryRegistry
 
 logger = get_logger("factory.lifespan")
 
@@ -84,22 +84,27 @@ async def _shutdown_learning_cancel(learning_scheduler: "LearningScheduler") -> 
         logger.warning("Learning scheduler cancel failed: %s", e)
 
 
-def _shutdown_wm_flush(wm: "WorkingMemory", stm: "ShortTermMemory") -> None:
-    """WorkingMemory の残存ターンを STM にフラッシュ
+def _shutdown_wm_flush(
+    registry: "WorkingMemoryRegistry", stm: "ShortTermMemory",
+) -> None:
+    """全セッションの WorkingMemory の残存ターンを STM にフラッシュ
 
-    吸収は ``chat_recorder.drain_evicted_to_stm`` に任せる — 応答パスと同じ
-    エコー落とし (直前の質問を逐語コピーしただけの応答を捨てる) を通す。
-    ここだけ ``stm.absorb`` を直に呼ぶと、終了時に流れたターンだけが
-    フィルタを迂回して汚染ノートになる。
+    吸収は台帳に注入済みの ``chat_recorder.release_session_turns``
+    (→ ``drain_evicted_to_stm``) が担う — 応答パスと同じエコー落とし (直前の
+    質問を逐語コピーしただけの応答を捨てる) を通す。ここだけ ``stm.absorb``
+    を直に呼ぶと、終了時に流れたターンだけがフィルタを迂回して汚染ノートになる。
     """
-    from backend.free.api.chat.chat_recorder import drain_evicted_to_stm
-
     try:
-        pending = len(wm.turns)
-        wm.clear()  # 全ターンを _evicted に移動
-        drain_evicted_to_stm(wm, stm, wm.session_id)
+        pending = sum(
+            len(getattr(registry.peek(sid), "turns", ()) or ())
+            for sid in registry.active_sessions()
+        )
+        dropped = registry.drain_all(stm)
         if pending:
-            logger.info("Flushed %d remaining turns to STM on shutdown", pending)
+            logger.info(
+                "Flushed %d remaining turns from %d session(s) to STM on shutdown",
+                pending, dropped,
+            )
     except Exception as e:
         logger.warning("WM flush to STM failed: %s", e)
 
@@ -282,7 +287,10 @@ async def _run_lifespan_shutdown(
     with _timed(shutdown_timings, "semmem_index_flush"):
         _shutdown_semmem_index_flush(state)
     with _timed(shutdown_timings, "experience_save"):
-        _shutdown_experience_save(ctx.exp_buf, ctx.exp_file)
+        # rebind 後は ExperienceBuffer が新パーティションのパスを持つ (起動時パスは fallback)
+        _shutdown_experience_save(
+            ctx.exp_buf, getattr(ctx.exp_buf, "bound_path", None) or ctx.exp_file,
+        )
     with _timed(shutdown_timings, "patterns_save"):
         _shutdown_patterns_save(ctx.learned_patterns_store, ctx.patterns_file)
     with _timed(shutdown_timings, "loop_run_cancel"):

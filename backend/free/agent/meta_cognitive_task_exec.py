@@ -17,6 +17,7 @@ from backend.free.agent.meta_cognitive_tools import (
     normalize_write_file_args,
 )
 from backend.free.agent.output_format import resolve_dir_output_path
+from backend.free.agent.meta_cognitive_content import note_stream_truncation
 from backend.free.agent.meta_cognitive_utils import (
     call_callback,
     is_tool_error,
@@ -306,6 +307,7 @@ class _TaskExecutionMixin:
         *,
         max_tokens: int,
         id_slot: int = -1,
+        step: str = "tool_loop",
         **sampling,
     ) -> tuple[str, bool]:
         """ストリーミング生成をトークン間アイドルタイムアウトで読み取り ``(text, timed_out)`` を返す。
@@ -314,7 +316,8 @@ class _TaskExecutionMixin:
         ``content_gen_idle_timeout`` で待ち、総上限 ``content_gen_timeout`` まで継続する。
         総ウォールクロックでは一律に打ち切らない (進行中の生成を殺さない)。無出力で停止した
         時だけ ``timed_out=True``。後処理はしない (生テキストを返す)。``_call_llm_in_loop`` /
-        ``_fallback_plain_llm`` が共有する。
+        ``_fallback_plain_llm`` が共有する。``step`` は ``finish_reason=length`` を
+        記録するときのラベル (``MetaCognitiveResponse.truncated_steps``)。
         """
         try:
             stream = await llm_client.generate(
@@ -353,6 +356,7 @@ class _TaskExecutionMixin:
                     await aclose()
                 except Exception:
                     pass
+        note_stream_truncation(self, stream, step)
         return "".join(chunks), False
 
     @staticmethod

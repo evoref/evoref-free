@@ -178,17 +178,36 @@ def sanitize_subject_part(value: str, *, fallback: str = "x") -> str:
     return sanitized
 
 
-def make_runtime_observed_subject(decision_point: str, chosen: str) -> str:
-    """``learn.policy.runtime_observed.<decision_point>.<chosen>`` を構築する。
+def make_runtime_observed_subject(
+    decision_point: str,
+    chosen: str,
+    *,
+    base_model_id: str = "",
+    mode: str = "create",
+) -> str:
+    """runtime_observed policy の subject を構築する。
 
-    PolicyParamEvolver の ``learn.policy.<mode>.<domain>.<param>`` とは
-    namespace が物理的に分離されているため、二重書き込み判定が必要ない。
+    partition 有効 (``base_model_id`` 非空) 時は
+    ``learn.policy.<model>.<mode>.runtime_observed.<decision_point>.<chosen>``。
+    ``PolicyInterpreter._apply_semmem_overrides`` は ``learn.policy.<model>.``
+    prefix でしか policy を読まないため、<model>.<mode> を欠いた旧形は一度も
+    読まれていなかった (2026-09-02 監査 R-F1)。空のときはレガシー
+    ``learn.policy.runtime_observed.<decision_point>.<chosen>`` へ縮退する。
+
+    PolicyParamEvolver の ``learn.policy.<model>.<mode>.<domain>.<param>`` とは
+    domain セグメント (``runtime_observed``) で分離されるため二重書き込み
+    判定は要らない。
     """
-    return ".".join([
-        LEARN_POLICY_RUNTIME_OBSERVED_PREFIX,
+    tail = [
         sanitize_subject_part(decision_point, fallback="dp"),
         sanitize_subject_part(chosen, fallback="ch"),
-    ])
+    ]
+    if base_model_id:
+        return ".".join([
+            "learn.policy", base_model_id, mode or "create",
+            "runtime_observed", *tail,
+        ])
+    return ".".join([LEARN_POLICY_RUNTIME_OBSERVED_PREFIX, *tail])
 
 
 def make_failure_pattern_subject(decision_point: str, chosen: str) -> str:
@@ -254,6 +273,8 @@ class PolicyAdjuster:
         self.success_rate_threshold = success_rate_threshold
         self.decay_factor = decay_factor
         self.scope = scope
+        # base 学習パーティションの active モデルスラグ。空 = レガシー subject。
+        self._base_model_id: str = ""
 
         # (decision_point, chosen) -> _Bucket
         self._buckets: dict[tuple[str, str], _Bucket] = {}
@@ -272,6 +293,14 @@ class PolicyAdjuster:
 
     def stats(self) -> dict[str, int]:
         return dict(self._stats)
+
+    def set_base_model_id(self, base_model_id: str) -> None:
+        """base 学習パーティションの active モデルスラグを差し替える。
+
+        以後の policy 書き戻し subject に ``<model>.<mode>`` を埋め込む
+        (PolicyEvolver / FewShotPool と同じ契約)。空文字でレガシー縮退。
+        """
+        self._base_model_id = base_model_id or ""
 
     def buckets(self) -> dict[tuple[str, str], _Bucket]:
         """**テスト用** バケット参照 (read-only)。"""
@@ -411,7 +440,11 @@ class PolicyAdjuster:
         self._stats["failure_pattern_emitted"] += 1
 
     async def _emit_policy(self, bucket: _Bucket) -> None:
-        subject = make_runtime_observed_subject(bucket.decision_point, bucket.chosen)
+        subject = make_runtime_observed_subject(
+            bucket.decision_point, bucket.chosen,
+            base_model_id=self._base_model_id,
+            mode=normalize_session_mode(bucket.last_mode),
+        )
         payload = self._build_payload(bucket, kind="success")
         try:
             existing = self.learn_view.find_active_policy_by_subject(subject)

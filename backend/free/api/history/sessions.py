@@ -3,6 +3,7 @@
 from fastapi import APIRouter, Depends
 
 from backend.app_state import AppState, get_app_state
+from backend.free.api.chat.chat_recorder import end_session
 from backend.free.api.history._session_helpers import (
     build_session_list_response,
     session_already_registered_error,
@@ -44,6 +45,10 @@ async def unregister(session_id: str, state: AppState = Depends(get_app_state)):
     # FeedbackCollector 内ガードで no-op。
     if state.feedback_collector is not None:
         state.feedback_collector.mark_conversation_ended()
+    # セッション別 WM を STM へ流して台帳から外す (f_02 §1.2 経路 (b))。
+    # WM がセッション別になったので、旧セッションの後始末はここが担う。
+    if end_session(state, session_id):
+        logger.debug("Working memory released for session %s", session_id)
     ok = state.unregister_session(session_id)
     if not ok:
         logger.debug("Session not found for unregister: %s", session_id)

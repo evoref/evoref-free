@@ -97,8 +97,9 @@ class SleepTimeScheduler:
         #: True の間は :meth:`on_user_input` が worker も待機タスクも止めない
         #: (:meth:`_schedule_full` の説明を参照)。
         self._full_forced_run: bool = False
-        # Trigger C: Level 1 のアイドル閾値（独立常駐ループから参照）
-        self.level1_idle_minutes: float = learning.get("level1_idle_minutes", 30)
+        # Trigger C: Level 1 のアイドル閾値の config 値。実効値は
+        # :attr:`level1_idle_minutes` (LearningScheduler のポリシー解決値を優先)。
+        self._level1_idle_minutes_cfg: float = learning.get("level1_idle_minutes", 30)
         # Trigger C: Level 1 ループの再評価間隔（秒）
         self.level1_recheck_interval_sec: float = float(
             learning.get("level1_recheck_interval_sec", 60)
@@ -207,6 +208,21 @@ class SleepTimeScheduler:
         return AuxClient(
             local, config=self._config, debug_logger=self._debug_logger,
         )
+
+    @property
+    def level1_idle_minutes(self) -> float:
+        """Level 1 アイドル閾値 (分)。
+
+        ``LearningScheduler.level1_idle_minutes`` はポリシー
+        (``learning.level1_idle_minutes``) で解決された値なので、注入済みなら
+        そちらを使う。両スケジューラが config を別々に読むと、ポリシー進化で
+        値が動いても実際の起動ゲート (本クラス) には一切効かなかった (L-C1)。
+        """
+        ls = self._learning_scheduler
+        value = getattr(ls, "level1_idle_minutes", None) if ls is not None else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        return float(self._level1_idle_minutes_cfg)
 
     def set_learning_scheduler(self, scheduler) -> None:
         """Level 1/2 学習スケジューラを設定"""
@@ -618,6 +634,20 @@ class SleepTimeScheduler:
                 skipped_reason = "no_worker"
                 return
 
+            # Level 1 が同じ background_slot で走っている間は Full を走らせない
+            # (KV とスロットを奪い合い両方が遅くなる)。Level 2 ループと同じ
+            # ゲート。次の応答でタイマーが張り直されるのを待たず、同じ待ち時間で
+            # 自分を再スケジュールして繰り延べる (L-A5)。
+            l1_running = getattr(self._learning_scheduler, "running", False)
+            if isinstance(l1_running, bool) and l1_running:
+                logger.info(
+                    "Trigger B: deferred, Level 1 is running on the background slot",
+                )
+                success = True
+                skipped_reason = "level1_running"
+                self._full_task = asyncio.create_task(self._schedule_full())
+                return
+
             # 生成中は割り込まない (同一 llama-server 上でスロットとバッチを
             # 奪い合う)。ただし **期限切れ / 前倒し要求済み** の Full は、
             # スキップして次の応答を待つのではなく **生成が終わるまで待って**
@@ -802,8 +832,8 @@ class SleepTimeScheduler:
 
         bg_task wrapper として最外殻に trace_id を発行し
         ループ停止 (cancel) 時に outcome.jsonl へ結末記録する。
-        ループ内部の Level 1 cycle ごとの outcome は ``_run_level1`` /
-        ``run_or_resume_level1`` 側で別 trace_id を発行して emit される。
+        ループ内部の Level 1 cycle ごとの outcome は ``run_or_resume_level1``
+        側で別 trace_id を発行して emit される。
         """
         token = trace_id_var.set(generate_trace_id())
         t_start = time.monotonic()

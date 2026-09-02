@@ -6,17 +6,14 @@ import asyncio
 import re
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 
 from backend.app_state import AppState
 from backend.free.api.chat.chat_constants import DEFAULT_WORKING_MAX_TOKENS
-from backend.free.api.chat.chat_recorder import (
-    accumulate_user_turn,
-    clear_session_data,
-    drain_evicted_to_stm,
-)
+from backend.free.api.chat.chat_recorder import accumulate_user_turn
 from backend.free.api.chat.chat_types import ChatMessage, FileContextDict
 from backend.free.api.schemas import ChatRequest
 from backend.free.core.intent_vocab import (
@@ -49,9 +46,6 @@ if TYPE_CHECKING:
     )
 
 logger = get_logger("api.chat.service")
-
-# セッション切替の排他制御ロック（並列リクエストでの WM 不整合を防止）
-_session_switch_lock = asyncio.Lock()
 
 
 def make_token_info(
@@ -100,22 +94,21 @@ async def ensure_llm_client(state: AppState, cfg: dict) -> LLMClient | None:
 async def prepare_memory_context(
     req: ChatRequest, state: AppState,
 ) -> tuple[list[ChatMessage], str]:
-    """メモリからコンテキストを取得し、セッション切替を処理する
+    """メモリからコンテキストを取得する (セッション別 WM)
 
-    セッション切替ブロックは asyncio.Lock で排他制御し、
-    並列リクエストでの WorkingMemory 不整合を防止する。
+    WM はセッション別 (``WorkingMemoryRegistry``) なので「切替」は無い —
+    要求されたセッションの窓を引いて user 発話を積むだけ。旧セッションの
+    後始末 (drain / カウンタ reset) は明示のセッション終了
+    (``chat_recorder.end_session``) か台帳の LRU 押し出しが担う。
 
     Returns:
         (history, session_id) のタプル
     """
-    mem_sys = state.get_memory_system()
-    if not mem_sys:
+    if not state.get_memory_system():
         logger.debug("Memory not initialized, using single-turn context")
         session_id = req.session_id or "default"
         accumulate_user_turn(session_id, req.message, private=req.private)
         return [{"role": "user", "content": req.message}], session_id
-
-    wm, stm, ltm = mem_sys
 
     # ``session_id`` 未指定は **新規セッションの要求** として扱う。
     #
@@ -135,88 +128,54 @@ async def prepare_memory_context(
             requested_session,
         )
 
-    # セッション切替検出: フロントエンドの session_id が変わったら WM をリセット
-    # asyncio.Lock で排他制御し、並列リクエストでの競合を防止
-    async with _session_switch_lock:
-        if requested_session and wm.session_id != requested_session:
-            old_session_id = wm.session_id
-            logger.info(
-                "Session switch detected: %s -> %s, clearing WorkingMemory",
-                old_session_id, requested_session,
-            )
-            # ``clear()`` を **先に** 実行してから drain する (f_02 §1.2 経路 (b))。
-            # 逆順だと drain が拾えるのは「窓超過で既に押し出された分」だけで、
-            # ``clear()`` が積んだ会話本体は次ターンの
-            # ``drain_evicted_to_stm`` まで滞留する。そちらは現在の
-            # ``session_id`` を渡すため、旧セッションのターンが **新しい**
-            # セッション ID で STM に吸収され帰属がずれていた。
-            # 先に clear すれば、窓超過分と会話本体を 1 回の drain で、
-            # かつ正しい旧セッション ID で吸収できる。
-            # プロセス終了時の flush (factory/_lifespan.py `_shutdown_wm_flush`)
-            # も clear → flush の順で、これで両経路が揃う。
-            wm.clear()
-            drain_evicted_to_stm(wm, stm, old_session_id)
-            wm.session_id = requested_session
-            # 旧セッションの蓄積データをクリーンアップ（メモリ解放）
-            clear_session_data(old_session_id)
-            # quality_judge のセッション単位カウンタもリセット
-            # 旧セッションの残存カウントで新セッションが session_cap に
-            # 張り付くのを防ぐ。
-            if state.judge_tracker is not None:
-                state.judge_tracker.reset_session(old_session_id)
-            # conflict_chat_judge のセッション内発火カウンタも同様にリセット。
-            if state.conflict_judge_tracker is not None:
-                state.conflict_judge_tracker.reset_session(old_session_id)
-            # 旧会話の経験に conversation_ended を反映 (Level 2 base=C positive 抽出用)。
-            # disabled 時は FeedbackCollector 内ガードで no-op。
-            if state.feedback_collector is not None:
-                state.feedback_collector.mark_conversation_ended()
+    # このセッションの窓 (無ければ台帳が作る)。別セッションの窓には触らない。
+    wm, _stm, _ltm = state.get_memory_system(requested_session)
 
-        # 値の言い直しの印。ここで立てておくと (a) 抽出器が直前の名前付き属性を
-        # 継承して訂正が対象と同じスロットへ入り、(b) sleep-time の競合解決が
-        # 「同一セッションだから微妙ケース」として pending へ落とすのを免除する。
-        # アシスタントの誤りの指摘だけでなく、ユーザー自身の申告訂正
-        # (「すみません、登山ではなく写真の間違いでした」) も含む — 記憶側は
-        # 「現在値が何か」を持つので、後者も正当な値更新として扱う
-        # (restates_a_value / SemanticFact.from_correction 参照)。
-        # 判定は純粋関数で、失敗しても訂正の印が付かないだけなので握って続ける。
-        try:
-            from backend.free.agent.feedback import restates_a_value
+    # 値の言い直しの印。ここで立てておくと (a) 抽出器が直前の名前付き属性を
+    # 継承して訂正が対象と同じスロットへ入り、(b) sleep-time の競合解決が
+    # 「同一セッションだから微妙ケース」として pending へ落とすのを免除する。
+    # アシスタントの誤りの指摘だけでなく、ユーザー自身の申告訂正
+    # (「すみません、登山ではなく写真の間違いでした」) も含む — 記憶側は
+    # 「現在値が何か」を持つので、後者も正当な値更新として扱う
+    # (restates_a_value / SemanticFact.from_correction 参照)。
+    # 判定は純粋関数で、失敗しても訂正の印が付かないだけなので握って続ける。
+    try:
+        from backend.free.agent.feedback import restates_a_value
 
-            correction = restates_a_value(req.message)
-        except Exception as exc:
-            logger.warning("correction detection failed (continuing): %s", exc)
-            correction = False
-        if correction:
-            # 「この会話で私が訂正した回数は何回ですか。」に答える材料。
-            # 監査では「1回です」(実際は 4 回) と答え、しかも挙げた 1 件は
-            # **モデルがユーザーを訂正した** ケースで主体が逆だった。
-            from backend.free.agent.issue_ledger import record_correction
+        correction = restates_a_value(req.message)
+    except Exception as exc:
+        logger.warning("correction detection failed (continuing): %s", exc)
+        correction = False
+    if correction:
+        # 「この会話で私が訂正した回数は何回ですか。」に答える材料。
+        # 監査では「1回です」(実際は 4 回) と答え、しかも挙げた 1 件は
+        # **モデルがユーザーを訂正した** ケースで主体が逆だった。
+        from backend.free.agent.issue_ledger import record_correction
 
-            record_correction(requested_session, req.message)
-        wm.add_turn(
-            "user",
-            req.message,
-            private=req.private,
-            mode=req.mode,
-            source="user",
-            correction=correction,
-        )
-        # 履歴の蓄積バッファにも **ここで** 積む。record_* の末尾だけだと、
-        # 生成が失敗 / タイムアウトしたターンは WM に居るのに履歴には無い。
-        # 冪等なので record_* 側の保険と二重には数えない。
-        accumulate_user_turn(requested_session, req.message, private=req.private)
-        history = wm.get_messages()
+        record_correction(requested_session, req.message)
+    wm.add_turn(
+        "user",
+        req.message,
+        private=req.private,
+        mode=req.mode,
+        source="user",
+        correction=correction,
+    )
+    # 履歴の蓄積バッファにも **ここで** 積む。record_* の末尾だけだと、
+    # 生成が失敗 / タイムアウトしたターンは WM に居るのに履歴には無い。
+    # 冪等なので record_* 側の保険と二重には数えない。
+    accumulate_user_turn(requested_session, req.message, private=req.private)
+    history = wm.get_messages()
 
     # 単位はメッセージ数 (user/assistant を各 1 と数える)。往復数ではない —
     # 「N history turns」と書いていたため、上限 30 を 30 往復と読み違えやすく
     # なっていた (実際は 15 往復)。
     logger.debug(
-        "Memory context: %d history messages from WorkingMemory", len(history),
+        "Memory context: %d history messages from WorkingMemory (session=%s)",
+        len(history), requested_session,
     )
 
-    session_id = requested_session or wm.session_id
-    return history, session_id
+    return history, requested_session
 
 
 def convert_file_contexts(req: ChatRequest) -> list[FileContextDict] | None:
@@ -308,19 +267,23 @@ def _collect_semmem_stats(state: AppState) -> dict | None:
 
 async def run_search_pipeline(
     query: str, state: AppState, cfg: dict, mode: str = "chat",
-    timer: StageTimer | None = None,
+    timer: StageTimer | None = None, *, session_id: str | None = None,
 ) -> SearchPipelineResult:
     """統合検索パイプライン: 3層メモリ + Self-RAG
+
+    ``session_id`` はこのターンのセッション。WM (窓の完全性判定 / セッション
+    自己参照枝) と content gate のセッション上限はその窓で判定する。
 
     Returns:
         SearchPipelineResult — チャンクリスト + エラー情報。
         BUG-9 対策: 失敗時はエラー情報を保持し、呼び出し元で
         フロントエンドに通知可能にする。
     """
-    mem_sys = state.get_memory_system()
+    mem_sys = state.get_memory_system(session_id)
     if not mem_sys or state.embedder is None:
         return SearchPipelineResult()
 
+    query_vec = None
     try:
         if timer:
             timer.start("embedding_ms")
@@ -330,10 +293,9 @@ async def run_search_pipeline(
             timer.stop("embedding_ms")
 
         wm, stm, ltm = mem_sys
-        # content gate のセッション上限判定に使う session_id は
-        # WorkingMemory 側で常に同期されている (セッション切替時に
-        # prepare_memory_context が wm.session_id を更新する)。
-        session_id = getattr(wm, "session_id", None) or "default"
+        # content gate のセッション上限判定に使う session_id。呼出側が渡さない
+        # legacy 経路では WM の session_id で代用する。
+        session_id = session_id or getattr(wm, "session_id", None) or "default"
         search_result = await unified_search(
             query=query,
             query_vec=query_vec,
@@ -372,11 +334,15 @@ async def run_search_pipeline(
             )
     except Exception as e:
         logger.warning("Search pipeline failed, continuing without RAG: %s", e)
-        return SearchPipelineResult(error=str(e))
+        # 埋め込みまでは済んでいるなら関連度ゲート用に返す。ここで落とすと
+        # ``build_semmem_injection`` が「埋め込み失敗」と判定して SemMem の
+        # 注入ごと見送り、RAG の失敗 1 件でそのターンの記憶が全部消える
+        # (2026-09-02 監査 S-A1: 次元不一致のカートリッジ 1 つで再現)。
+        return SearchPipelineResult(error=str(e), query_vec=query_vec)
 
     # necessity judge が retrieve を skip した経路。チャンクは無いが
     # query_vec は算出済みなので、関連度ゲート用に返す。
-    return SearchPipelineResult(query_vec=locals().get("query_vec"))
+    return SearchPipelineResult(query_vec=query_vec)
 
 
 @dataclass
@@ -509,13 +475,25 @@ def _attribute_slots(text: str) -> frozenset[tuple[str, str]]:
     return frozenset(slots)
 
 
-def _session_user_texts(state: AppState) -> list[str]:
+def _session_wm(state: AppState, session_id: str | None):
+    """``session_id`` の WorkingMemory を安全に取る (pillar 未構築なら ``None``)。"""
+    get = getattr(state, "get_memory_system", None)
+    if not callable(get):
+        return None
+    try:
+        mem_sys = get(session_id)
+    except Exception:
+        return None
+    return mem_sys[0] if mem_sys else None
+
+
+def _session_user_texts(state: AppState, session_id: str | None) -> list[str]:
     """今回の会話でユーザーが述べた本文を返す (属性スロットの述べ直し検出用)。
 
     窓に残っているものだけで足りる — 押し出された発話は「今回の会話の方が
     新しい」という主張の根拠として使えるほど近くない。
     """
-    working = getattr(getattr(state, "mem", None), "working_memory", None)
+    working = _session_wm(state, session_id)
     if working is None:
         return []
     try:
@@ -573,9 +551,13 @@ def _collect_retired_note_ids(state, project_id: str | None) -> set[str]:
 
 
 #: ``_collect_retired_note_ids`` のストア別キャッシュ。
-#: ``id(store) -> (revision, {note_id: そのノート由来のファクトが全部 supersede 済みか})``
-#: ストアはプロセス常駐なので ``id()`` は寿命の間安定する。
-_RETIRED_NOTE_CACHE: dict[int, tuple[int, dict[str, bool]]] = {}
+#: ``store -> (revision, {note_id: そのノート由来のファクトが全部 supersede 済みか})``
+#: 弱参照キー — ストアが差し替わったら (再ロード / テストの使い捨て) 古い
+#: エントリは一緒に消える。``id(store)`` をキーにすると、解放されたアドレスを
+#: 新しいストアが再利用したときに **別ストアの結果を返す** うえ、寿命が無い。
+_RETIRED_NOTE_CACHE: "weakref.WeakKeyDictionary[Any, tuple[int, dict[str, bool]]]" = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def _retired_note_ids_for_store(store) -> dict[str, bool] | None:
@@ -584,8 +566,12 @@ def _retired_note_ids_for_store(store) -> dict[str, bool] | None:
         revision = int(store.revision)
     except Exception:
         revision = -1
-    key = id(store)
-    hit = _RETIRED_NOTE_CACHE.get(key)
+    try:
+        hit = _RETIRED_NOTE_CACHE.get(store)
+    except TypeError:
+        # 弱参照できない型 (テストの部分モック等) はキャッシュしない。
+        hit = None
+        revision = -1
     if hit is not None and hit[0] == revision and revision >= 0:
         return hit[1]
     try:
@@ -602,7 +588,7 @@ def _retired_note_ids_for_store(store) -> dict[str, bool] | None:
             # live が 1 つでもあれば False で確定させる。
             computed[note_id] = computed.get(note_id, True) and is_retired
     if revision >= 0:
-        _RETIRED_NOTE_CACHE[key] = (revision, computed)
+        _RETIRED_NOTE_CACHE[store] = (revision, computed)
     return computed
 
 
@@ -629,6 +615,7 @@ def build_semmem_injection(
     query_vec=None,
     query_text: str = "",
     covered_attributes: set[str] | None = None,
+    session_id: str | None = None,
 ) -> str | None:
     """SemMem facts + STM notes を MemoryInjector で tier 整形し、
     プロンプト注入用テキストを返す。
@@ -683,15 +670,20 @@ def build_semmem_injection(
             "Run 'reembed-facts --apply' (or POST /api/model/reembed-facts).",
         )
         return None
+    # このターンの MemoryInjector は 1 個。競合セクションのゲートも同じ
+    # インスタンス・同じ事前計算スコアで判定する (別インスタンスで
+    # スコア無しに判定し直すと、埋め込み無しのファクトが素通りしていた)。
+    injector = None
+    fact_scores: dict[str, float] = {}
     try:
         from backend.free.memory.pipeline.injector import MemoryInjector
 
+        injector = MemoryInjector(cfg)
         _, stm, _ = mem_sys
         facts: list = []
         # 関連度スコアは埋め込み行列を持つストア側で 1 回の積として求める。
         # 候補ごとに正規化し直すと N=10000 で 52.5ms、常駐行列なら 1.5ms
         # (MemoryInjector._relevance_scores の実測)。
-        fact_scores: dict[str, float] = {}
         pid = state.current_project_id
         for scope in ("global", f"project:{pid}" if pid else None):
             if scope is None:
@@ -710,14 +702,14 @@ def build_semmem_injection(
         stm_notes = list(getattr(stm, "notes", {}).values())
         retired_note_ids = _collect_retired_note_ids(state, pid)
         if facts or stm_notes:
-            plan = MemoryInjector(cfg).inject(
+            plan = injector.inject(
                 mode=inj_mode,
                 facts=facts,
                 stm_notes=stm_notes,
                 current_project_id=pid,
                 failure_signatures=(),
                 query_embedding=query_vec,
-                session_user_texts=_session_user_texts(state),
+                session_user_texts=_session_user_texts(state, session_id),
                 query_text=query_text,
                 retired_note_ids=retired_note_ids,
                 fact_relevance_scores=fact_scores or None,
@@ -731,6 +723,7 @@ def build_semmem_injection(
 
     conflict_block = _render_conflict_section(
         cfg, conflict_ctx, query_vec=query_vec,
+        fact_scores=fact_scores or None, injector=injector,
     )
     if conflict_block:
         rendered = f"{rendered}\n\n{conflict_block}" if rendered else conflict_block
@@ -739,6 +732,8 @@ def build_semmem_injection(
 
 def _gate_groups_by_relevance(
     cfg: dict, groups: list, query_vec,
+    fact_scores: dict[str, float] | None = None,
+    injector=None,
 ) -> list:
     """競合グループをクエリとの関連度で絞る (ゲート無効なら素通し)。
 
@@ -754,14 +749,24 @@ def _gate_groups_by_relevance(
     (:meth:`MemoryInjector.relevant_fact_ids`)。グループは member の
     いずれかが棒を越えれば残す — 競合は「同じスロットの複数の値」なので、
     片方だけがクエリに近いのが普通。
+
+    ``fact_scores`` は注入本体が使った事前計算スコア (``embedding_scores``)、
+    ``injector`` は同ターンの ``MemoryInjector`` インスタンス。どちらも
+    省略可 (テスト経路 / 旧呼出) だが、本番では両方渡す。埋め込みもスコアも
+    無いファクトは **落とす** (``require_embedding=True``) — 予算の外で毎ターン
+    連結される枠で「判定不能なので通す」を許すと、無関係な矛盾が全ターンに載る。
     """
     if not groups:
         return groups
     try:
-        from backend.free.memory.pipeline.injector import MemoryInjector
+        if injector is None:
+            from backend.free.memory.pipeline.injector import MemoryInjector
 
+            injector = MemoryInjector(cfg)
         facts = [f for g in groups for f in g.facts]
-        relevant = MemoryInjector(cfg).relevant_fact_ids(facts, query_vec)
+        relevant = injector.relevant_fact_ids(
+            facts, query_vec, fact_scores, require_embedding=True,
+        )
     except Exception as exc:
         logger.warning("conflict relevance gate failed (passing through): %s", exc)
         return groups
@@ -778,12 +783,14 @@ def _gate_groups_by_relevance(
 
 def _render_conflict_section(
     cfg: dict, conflict_ctx: ConflictTurnContext | None, *, query_vec=None,
+    fact_scores: dict[str, float] | None = None, injector=None,
 ) -> str | None:
     """pending 競合セクションを組み立てる。失敗時 / 該当なしは None。
 
     ``query_vec`` を渡すと関連度ゲートが掛かる
     (:func:`_gate_groups_by_relevance`)。``None`` はゲート無効 = 素通しで、
-    embedder 自体が無い構成のための後方互換。
+    embedder 自体が無い構成のための後方互換。``fact_scores`` / ``injector``
+    は注入本体と同じ判定材料をゲートへ渡す。
     """
     if conflict_ctx is None or not conflict_ctx.pending_groups:
         return None
@@ -794,6 +801,7 @@ def _render_conflict_section(
 
         groups = _gate_groups_by_relevance(
             cfg, conflict_ctx.pending_groups, query_vec,
+            fact_scores, injector,
         )
         if not groups:
             return None
@@ -808,17 +816,22 @@ def _render_conflict_section(
         return None
 
 
-def session_evicted_turns(state: AppState) -> int:
-    """現在セッションでワーキングメモリから押し出したターン数を安全に取る。
+def session_evicted_turns(state: AppState, session_id: str | None = None) -> int:
+    """``session_id`` のセッションでワーキングメモリから押し出したターン数を安全に取る。
 
     pillar 未構築 (degraded / テストの部分モック) では 0 を返す。
     """
-    working = getattr(getattr(state, "mem", None), "working_memory", None)
-    return int(getattr(working, "session_evicted_turns", 0) or 0)
+    working = _session_wm(state, session_id)
+    try:
+        return int(getattr(working, "session_evicted_turns", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
-def session_first_user_message(state: AppState) -> str:
-    """現在セッションで最初に届いた user 発話を安全に取る。
+def session_first_user_message(
+    state: AppState, session_id: str | None = None,
+) -> str:
+    """``session_id`` のセッションで最初に届いた user 発話を安全に取る。
 
     窓から押し出されても ``WorkingMemory`` が 1 件だけ保持している
     (``session_first_user_turn``)。「この会話で最初に何を言ったか」を
@@ -826,8 +839,9 @@ def session_first_user_message(state: AppState) -> str:
 
     pillar 未構築 (degraded / テストの部分モック) では空文字列を返す。
     """
-    working = getattr(getattr(state, "mem", None), "working_memory", None)
-    return str(getattr(working, "session_first_user_turn", "") or "")
+    working = _session_wm(state, session_id)
+    head = getattr(working, "session_first_user_turn", "")
+    return head if isinstance(head, str) else ""
 
 
 def build_chat_messages(
@@ -844,6 +858,7 @@ def build_chat_messages(
     evicted_turns: int = 0,
     artifact_block: str | None = None,
     session_id: str = "",
+    post_append_reserve_tokens: int = 0,
 ) -> list[ChatMessage]:
     """messages 組み立て（build_messages で few-shot・file・メモリ・RAG・履歴を統合）。
 
@@ -854,6 +869,9 @@ def build_chat_messages(
         evicted_turns: 現在セッションでワーキングメモリから押し出したターン数
             (``WorkingMemory.session_evicted_turns``)。0 より大きい場合、会話
             全体を走査しないと答えられない質問には切り詰め注記を付ける。
+        post_append_reserve_tokens: 組み立て後に最後の user へ積まれる分
+            (接地注記 / deliberative のツール結果) の予約。主経路は
+            :func:`deliberative_post_append_reserve_tokens`、軽量 / 継続パスは 0。
     """
     messages = build_messages(
         system_prompt, history,
@@ -869,10 +887,31 @@ def build_chat_messages(
         working_max_tokens=working_max_tokens,
         slot_resolver=_attribute_slots,
         artifact_block=artifact_block,
+        post_append_reserve_tokens=post_append_reserve_tokens,
     )
     apply_grounding_notes(messages, history, evicted_turns, session_id)
     logger.debug("Messages assembled: %d messages for LLM", len(messages))
     return messages
+
+
+#: 組み立て後に積まれる接地注記 (``apply_grounding_notes`` 4 種 + deliberative の
+#: 決定論注記) の見込み (トークン)。1 ターンに載るのは高々数種で、各 100〜200
+#: トークン。
+_POST_APPEND_NOTES_ALLOWANCE_TOKENS = 256
+
+
+def deliberative_post_append_reserve_tokens() -> int:
+    """deliberative 経路が組み立て後に最後の user へ積む分の見込み (トークン)。
+
+    ツール結果は ``TOOL_RESULT_MAX_CHARS`` で切り詰められる。トークン換算は
+    本文の構成で 4 倍違う (ASCII 4 文字 ≒ 1 tok / CJK 1 文字 ≒ 1 tok) ため、
+    その中間 (文字数の 1/2) を取り、接地指示・話題再フォーカスと各種注記の
+    定額を足す。実際の残予算に対する上限は ``build_messages`` 側
+    (``_POST_APPEND_MAX_SHARE``) が掛ける。
+    """
+    from backend.free.api.chat.chat_constants import TOOL_RESULT_MAX_CHARS
+
+    return TOOL_RESULT_MAX_CHARS // 2 + _POST_APPEND_NOTES_ALLOWANCE_TOKENS
 
 
 # ── 注記のロケール辞書 (i18n.prompt_locale 追従) ─────────────────────
@@ -885,14 +924,10 @@ def build_chat_messages(
 
 
 def _prompt_locale() -> str:
-    """``i18n.prompt_locale`` を返す (未知 / 取得失敗は ja)。"""
-    try:
-        from backend.config import get_config
+    """``i18n.prompt_locale`` を返す (``backend.i18n_helper.prompt_locale`` に委譲)。"""
+    from backend.i18n_helper import prompt_locale
 
-        locale = get_config().get("i18n", {}).get("prompt_locale", "ja")
-    except Exception:
-        locale = "ja"
-    return locale if locale in ("ja", "en") else "ja"
+    return prompt_locale()
 
 
 def _localized(table: dict[str, str]) -> str:
@@ -944,9 +979,13 @@ def _append_quantity_grounding(
     quantity = referenced_quantity(query)
     if not quantity:
         return
-    claims = conversational_numeric_claims(
-        [(str(m.get("role") or ""), str(m.get("content") or "")) for m in history],
-    )
+    # ``build_messages`` が supersede 判定のために同じ値を計算済み
+    # (``BuiltMessages.numeric_claims``)。素の list なら再計算する。
+    claims = getattr(messages, "numeric_claims", None)
+    if claims is None:
+        claims = conversational_numeric_claims(
+            [(str(m.get("role") or ""), str(m.get("content") or "")) for m in history],
+        )
     # ラベルは「東京駅と横浜駅の直線距離」のように修飾が付く。参照側は裸の
     # 「距離」なので、**ラベルが参照語を含む** ものを拾う。
     matched = {

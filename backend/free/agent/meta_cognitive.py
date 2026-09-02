@@ -212,6 +212,7 @@ class MetaCognitiveAgent(
         session_id: str = "",
         mode: str = "create",
         output_target: str = "file",
+        private: bool = False,
     ) -> MetaCognitiveResponse:
         """Meta-Cognitive 層で計画立案 → タスク実行ループ
 
@@ -220,7 +221,46 @@ class MetaCognitiveAgent(
         ``output_target`` は生成コードの出力先 (create モードのみ意味を持つ):
         ``"file"`` (既定、明示パスへ write_file) / ``"editor"`` (ディスク書込せず
         ``editor_artifacts`` へ) / ``"chat"`` (コードフェンスで ``content`` に返す)。
+
+        ``private`` はリクエストの private フラグ。MDP エピソードの begin
+        イベントに刻み、エピソード記憶への昇格を止める (``AgentTracer``)。
+
+        内部の生成が 1 つでも ``finish_reason=length`` で切れていれば、
+        どの経路 (通常 / 救出 / フォールバック) の応答にも ``truncated`` を刻む。
         """
+        self._truncated_steps: list[str] = []
+        self._truncated_tokens = 0
+        self._truncated_max_tokens: int | None = None
+        resp = await self._process_or_fallback(
+            query, system_prompt, conversation, llm_client, tools_registry,
+            on_step, generation_params=generation_params,
+            session_id=session_id, mode=mode, output_target=output_target,
+            private=private,
+        )
+        if self._truncated_steps:
+            resp.truncated = True
+            resp.truncated_steps = list(self._truncated_steps)
+            resp.truncated_tokens = self._truncated_tokens
+            resp.truncated_max_tokens = self._truncated_max_tokens
+        return resp
+
+    async def _process_or_fallback(
+        self,
+        query: str,
+        system_prompt: str,
+        conversation: list[dict],
+        llm_client,
+        tools_registry=None,
+        on_step=None,
+        *,
+        generation_params: dict | None = None,
+        session_id: str = "",
+        mode: str = "create",
+        output_target: str = "file",
+        private: bool = False,
+    ) -> MetaCognitiveResponse:
+        """``_process_impl`` を総タイムアウトで保護し、失敗時は救出 / フォールバック。"""
+        self._private_request = private
         try:
             return await asyncio.wait_for(
                 self._process_impl(
@@ -373,7 +413,9 @@ class MetaCognitiveAgent(
         tracer = self._agent_tracer
         episode_id = ""
         if tracer is not None:
-            episode_id = tracer.begin_episode(session_id, mode)
+            episode_id = tracer.begin_episode(
+                session_id, mode, private=getattr(self, "_private_request", False),
+            )
 
         # @self 仮想カートリッジ展開
         # constants キャッシュは process 呼び出しごとにリセット
@@ -1126,6 +1168,7 @@ class MetaCognitiveAgent(
                 llm_client, messages,
                 max_tokens=1024,
                 id_slot=getattr(llm_client, "background_slot", -1),
+                step="fallback",
             )
             content = text.strip()
             if timed_out or not content:

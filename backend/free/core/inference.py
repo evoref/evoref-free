@@ -26,7 +26,15 @@ from backend.free.core.text_quality import (
     ITEM_COUNT_RE,
     match_length_directive,
 )
-from backend.free.core.turn_text import append_to_last_user, prepend_to_last_user
+from backend.free.core.turn_text import (
+    DYNAMIC_CONTEXT_DELIMITER,
+    DYNAMIC_CONTEXT_DELIMITERS,
+    DYNAMIC_CONTEXT_TRAILING_DELIMITERS,
+    FRAME_LINE_LABELS,
+    append_to_last_user,
+    prepend_to_last_user,
+    split_last_user,
+)
 from backend.config import get_config, resolve_context_size
 from backend.i18n_helper import prompt_locale
 from backend.log_config import get_logger
@@ -48,33 +56,86 @@ logger = get_logger("core.inference")
 #   RAG ヘッダ 20 tok × 87 ターン (38%)
 # = 定数の指示文だけで 1 ターンあたり平均 90 トークン前後を再プリフィルしていた。
 #
-# そこで **指示の本文は静的システムプロンプトへ置き** (``chat._resolve_system_prompt``
-# の ``_REFERENCE_BLOCK_DIRECTIVE``、接頭辞キャッシュに乗る)、ここには枠を示す
-# **短いマーカーだけ**を残す。指示内容は減らしていない — 置き場所を変えただけ。
+# そこで **指示の本文は静的システムプロンプトへ置き**
+# (``agent.prompt_manager.REFERENCE_BLOCK_DIRECTIVES``、接頭辞キャッシュに乗る)、
+# ここには枠を示す **短いマーカーだけ**を残す。指示内容は減らしていない —
+# 置き場所を変えただけ。
 # ``_RAG_HEADER`` は空。チャンクは両経路とも ``[参考情報 N]`` で自己記述する
 # ので、その上にもう 1 行ヘッダを置くのは重複でしかない。
+# ブロック名 (``[添付ファイル]`` / ``[参考情報 N]`` / ``[ファイル: …]``) は
+# 両 locale の system 指示が同じ文字列で名指しするため locale で変えない
+# (``[関連する記憶]`` と同じ扱い)。
 _RAG_HEADER = ""
 _FILES_HEADER = "[添付ファイル]\n\n"
 
-# 動的コンテキストブロックと生クエリの境界に挟む固定文。
-# few-shot 例 / 参考情報をユーザー発言と混同させないための区切り。
-# 「無関係なら言及せず自分の知識で普通に答える」等の指示本文は
-# ``_REFERENCE_BLOCK_DIRECTIVE`` (system 側) が持つ。
-_DYNAMIC_CONTEXT_DELIMITER = (
-    "\n\n---\n[ここまで参考枠 / ここからユーザーの発言]\n"
-)
+# 動的コンテキストブロックと生クエリの境界に挟む区切り。文言と locale 版の
+# SSOT は ``core.turn_text`` (送信時ガードが同じ境界で切り詰めるため)。
+# ``_DYNAMIC_CONTEXT_DELIMITER`` は ja 既定の別名 (後方互換 / テスト用)。
+_DYNAMIC_CONTEXT_DELIMITER = DYNAMIC_CONTEXT_DELIMITER
 
-# 照応を含むターンで動的ブロックを **生クエリの後ろ** へ回すときの区切り。
-# 前置版と違い「上の」「さっき」の参照先が直前のやり取りであることを明示する
-# 必要がある (後置しても、指示語が直後のブロックを掴む余地は残るため)。この
-# 指示は **配置に依存する** ので system へは移さない。発火は実測 232 ターン中
-# 2 件 (1%) で、再プリフィルの寄与も小さい。
-_DYNAMIC_CONTEXT_TRAILING_DELIMITER = (
-    "\n\n---\n"
-    "以下はシステムが用意した参考枠であり、ユーザーの発言ではありません。"
-    "上のユーザー発言に含まれる「上の」「先ほど」「さっき」「直前の」等の指示語は、"
-    "この参考枠ではなく **直前までのやり取り** を指します。\n\n"
-)
+
+def _dynamic_context_delimiter() -> str:
+    """prompt_locale に応じた前置用の区切り (未知 locale は ja)。"""
+    return DYNAMIC_CONTEXT_DELIMITERS.get(prompt_locale(), DYNAMIC_CONTEXT_DELIMITER)
+
+
+def _dynamic_context_trailing_delimiter() -> str:
+    """prompt_locale に応じた後置用の区切り (未知 locale は ja)。"""
+    return DYNAMIC_CONTEXT_TRAILING_DELIMITERS.get(
+        prompt_locale(), DYNAMIC_CONTEXT_TRAILING_DELIMITERS["ja"],
+    )
+
+
+def _localized(table: dict[str, str]) -> str:
+    """``i18n.prompt_locale`` 別の固定文を引く (未知 locale は ja)。"""
+    return table.get(prompt_locale(), table["ja"])
+
+
+#: :func:`_char_limit_note` の本文 (kind 別 × locale 別)。
+_CHAR_LIMIT_NOTES: dict[str, dict[str, str]] = {
+    "exact": {
+        "ja": (
+            "今回のユーザーの指示は回答本文を {value} 文字ちょうどにすることを"
+            "求めている。句読点・記号・空白も 1 文字として数えること。"
+            "書き終えたら数え直し、**多くても少なくても** 語を足し引きして "
+            "{value} 文字に合わせること。"
+        ),
+        "en": (
+            "The user's instruction this turn requires the answer body to be "
+            "exactly {value} characters. Count punctuation, symbols, and spaces "
+            "as one character each. After writing, recount and add or remove "
+            "words until it is **exactly** {value} characters, whether over or "
+            "under."
+        ),
+    },
+    "repeat": {
+        "ja": (
+            "今回のユーザーの指示は {value} 回ちょうどの繰り返しを求めている。"
+            "書き終えたら個数を数え直し、多くても少なくても {value} 個に"
+            "合わせること。"
+        ),
+        "en": (
+            "The user's instruction this turn requires exactly {value} "
+            "repetitions. After writing, recount and adjust to exactly {value}, "
+            "whether over or under."
+        ),
+    },
+    "limit": {
+        "ja": (
+            "今回のユーザーの指示は回答を {value} 文字以内に収めることを求めている。"
+            "句読点・記号・空白も 1 文字として数え、回答本文全体が "
+            "{value} 文字以内に収まる長さで書くこと。"
+            "書き終えたら文字数を数え直し、超えていれば語を削って収めること。"
+        ),
+        "en": (
+            "The user's instruction this turn requires the answer to fit within "
+            "{value} characters. Count punctuation, symbols, and spaces as one "
+            "character each and keep the whole answer body within {value} "
+            "characters. After writing, recount and cut words if it exceeds the "
+            "limit."
+        ),
+    },
+}
 
 
 def _char_limit_note(history: list[ChatMessage]) -> str:
@@ -104,31 +165,43 @@ def _char_limit_note(history: list[ChatMessage]) -> str:
     if directive is None:
         return ""
     kind, value = directive
+    table = _CHAR_LIMIT_NOTES.get(kind, _CHAR_LIMIT_NOTES["limit"])
+    return _localized(table).format(value=value)
 
-    if kind == "exact":
-        exact = value
-        return (
-            f"今回のユーザーの指示は回答本文を {exact} 文字ちょうどにすることを"
-            f"求めている。句読点・記号・空白も 1 文字として数えること。"
-            f"書き終えたら数え直し、**多くても少なくても** 語を足し引きして "
-            f"{exact} 文字に合わせること。"
-        )
 
-    if kind == "repeat":
-        times = value
-        return (
-            f"今回のユーザーの指示は {times} 回ちょうどの繰り返しを求めている。"
-            f"書き終えたら個数を数え直し、多くても少なくても {times} 個に"
-            f"合わせること。"
-        )
-
-    limit = value
-    return (
-        f"今回のユーザーの指示は回答を {limit} 文字以内に収めることを求めている。"
-        f"句読点・記号・空白も 1 文字として数え、回答本文全体が "
-        f"{limit} 文字以内に収まる長さで書くこと。"
-        "書き終えたら文字数を数え直し、超えていれば語を削って収めること。"
-    )
+#: :func:`_output_form_note` の本文 (locale 別)。
+_ANSWER_ONLY_NOTES: dict[str, str] = {
+    "ja": (
+        "今回のユーザーの指示は答えそのものだけを求めている。"
+        "前置き・理由・計算過程・補足を書かず、答えの値だけを述べること。"
+        # 「正しい値が出せない」ケースまで黙らせると、誤ったツール結果を
+        # そのまま値として述べる方向へ倒れる。開示だけは残す。
+        "ただし正しい値を確定できない場合に限り、その理由を 1 文だけ添えること。"
+    ),
+    "en": (
+        "The user's instruction this turn asks for the answer itself only. "
+        "State just the answer value, with no preamble, reasoning, working, or "
+        "supplementary notes. Only if the correct value cannot be determined, "
+        "add a single sentence explaining why."
+    ),
+}
+_BULLET_FORM_NOTES: dict[str, str] = {
+    "ja": (
+        "今回のユーザーの指示は箇条書き形式を求めている。"
+        "読点や中黒で列挙した 1 行の文にせず、"
+        "1 項目 1 行の Markdown リスト (行頭に `- `) で書くこと。"
+    ),
+    "en": (
+        "The user's instruction this turn asks for a bulleted list. Do not "
+        "enumerate items in a single sentence separated by commas or dots; "
+        "write a Markdown list with one item per line (each line starting "
+        "with `- `)."
+    ),
+}
+_ITEM_COUNT_NOTES: dict[str, str] = {
+    "ja": "項目数は指定どおり {count} 個ちょうどにすること。",
+    "en": " The number of items must be exactly {count}, as specified.",
+}
 
 
 def _output_form_note(history: list[ChatMessage]) -> str:
@@ -151,23 +224,13 @@ def _output_form_note(history: list[ChatMessage]) -> str:
 
     notes: list[str] = []
     if ANSWER_ONLY_RE.search(text):
-        notes.append(
-            "今回のユーザーの指示は答えそのものだけを求めている。"
-            "前置き・理由・計算過程・補足を書かず、答えの値だけを述べること。"
-            # 「正しい値が出せない」ケースまで黙らせると、誤ったツール結果を
-            # そのまま値として述べる方向へ倒れる。開示だけは残す。
-            "ただし正しい値を確定できない場合に限り、その理由を 1 文だけ添えること。"
-        )
+        notes.append(_localized(_ANSWER_ONLY_NOTES))
     if BULLET_FORM_RE.search(text):
-        note = (
-            "今回のユーザーの指示は箇条書き形式を求めている。"
-            "読点や中黒で列挙した 1 行の文にせず、"
-            "1 項目 1 行の Markdown リスト (行頭に `- `) で書くこと。"
-        )
+        note = _localized(_BULLET_FORM_NOTES)
         m = ITEM_COUNT_RE.search(text)
         if m:
             count = next(g for g in m.groups() if g)
-            note += f"項目数は指定どおり {count} 個ちょうどにすること。"
+            note += _localized(_ITEM_COUNT_NOTES).format(count=count)
         notes.append(note)
     return "\n".join(notes)
 
@@ -319,26 +382,50 @@ def _persona_question_note(history: list[ChatMessage]) -> str:
     text = str(last_user.get("content") or "")
     if not _is_persona_question(text):
         return ""
-    note = (
+    note = _localized(_PERSONA_NOTES)
+    if _PERSONA_CHALLENGE_RE.search(text):
+        # 押し返されると直前までの立場を捨てて相手の枠組みに乗り換える
+        # (実測 2026-07-29: 「嬉しくなります」と答えた次のターンで
+        # 「感覚を一切持ち合わせていません」へ反転した)。立場の保ち方を示す。
+        note += _localized(_PERSONA_CHALLENGE_NOTES)
+    return note
+
+
+#: :func:`_persona_question_note` の本文 (locale 別)。
+_PERSONA_NOTES: dict[str, str] = {
+    "ja": (
         "この質問はあなた自身の好み・感情・考えを尋ねている。"
         "一貫した一人の人物として自分の答えを述べ、必要なら理由を一言添えること "
         "(例:「静かな朝が好きです。考えがまとまりやすいので。」)。"
         "会話を通して同じ態度を保つこと。"
         "述べる内容は好み・態度・その理由にとどめ、"
         "具体的な経歴や出来事は自分の答えの根拠にしないこと。"
-    )
-    if _PERSONA_CHALLENGE_RE.search(text):
-        # 押し返されると直前までの立場を捨てて相手の枠組みに乗り換える
-        # (実測 2026-07-29: 「嬉しくなります」と答えた次のターンで
-        # 「感覚を一切持ち合わせていません」へ反転した)。立場の保ち方を示す。
-        note += (
-            "今回ユーザーはあなたに内面が無いという見方を示している。"
-            "この会話でこれまで述べてきた自分の立場をそのまま保ち、"
-            "相手の見方を認めたうえで自分の受け止め方を一言添える形で短く応じること "
-            "(例:「そう見えるかもしれませんね。それでも私には、"
-            "うまく答えられたときの手応えがあります。」)。"
-        )
-    return note
+    ),
+    "en": (
+        "This question asks about your own preferences, feelings, or views. "
+        "Answer as one consistent person, adding a brief reason if useful "
+        "(e.g. \"I like quiet mornings; my thoughts settle more easily.\"). "
+        "Keep the same stance throughout the conversation. Limit yourself to "
+        "preferences, attitudes, and their reasons; do not ground your answer "
+        "in specific life events or a biography."
+    ),
+}
+_PERSONA_CHALLENGE_NOTES: dict[str, str] = {
+    "ja": (
+        "今回ユーザーはあなたに内面が無いという見方を示している。"
+        "この会話でこれまで述べてきた自分の立場をそのまま保ち、"
+        "相手の見方を認めたうえで自分の受け止め方を一言添える形で短く応じること "
+        "(例:「そう見えるかもしれませんね。それでも私には、"
+        "うまく答えられたときの手応えがあります。」)。"
+    ),
+    "en": (
+        "The user is now suggesting that you have no inner life. Keep the "
+        "stance you have expressed so far in this conversation; acknowledge "
+        "their view, then briefly add how you experience it (e.g. \"It may look "
+        "that way. Still, I do feel a sense of accomplishment when an answer "
+        "lands well.\")."
+    ),
+}
 
 
 def _build_file_section(fc: dict) -> str:
@@ -393,11 +480,6 @@ def _inject_file_contexts(
         injected, total_fc, _estimate_tokens(files_block),
     )
     return files_block, remaining, injected
-
-
-#: few-shot ブロックの 1 例の区切り。``format_fewshot_section`` が
-#: ``### Example N`` 見出しで区切る形式に対応する。
-_FEWSHOT_EXAMPLE_SPLIT_RE = re.compile(r"(?m)^(?=### Example\s)")
 
 
 def _drop_restated_slots(
@@ -529,10 +611,15 @@ def _drop_superseded_context(
     rag_scored_chunks: list[tuple[str, float, str]] | None,
     fewshot_block: str | None = None,
     slot_resolver: "Callable[[str], frozenset[tuple[str, str]]] | None" = None,
+    current_claims: dict[str, set[str]] | None = None,
 ) -> tuple[
     str | None, list[str] | None, list[tuple[str, float, str]] | None, str | None,
 ]:
     """今回の会話で確定済みの値と食い違う注入候補を落とす (純粋関数)。
+
+    ``current_claims`` は ``conversational_numeric_claims(history)`` の結果。
+    呼出側 (``build_messages``) が一度計算して後段 (量の接地注記) と共有する
+    ために受け取る。``None`` なら内部で計算する (単体呼出向け)。
 
     system プロンプトは「[関連する記憶]・[参考情報]・ツール実行結果は**自分の
     記憶より優先**して回答の根拠にする」と規定しており、明示された例外は
@@ -565,10 +652,8 @@ def _drop_superseded_context(
     )
     semmem_block, rag_chunks, rag_scored_chunks, fewshot_block = dropped_slots
 
-    current_claims = conversational_numeric_claims(
-        (str(t.get("role") or ""), str(t.get("content") or ""))
-        for t in history or ()
-    )
+    if current_claims is None:
+        current_claims = history_numeric_claims(history)
     if not current_claims:
         return semmem_block, rag_chunks, rag_scored_chunks, fewshot_block
 
@@ -608,15 +693,46 @@ def _drop_superseded_context(
     return semmem_block, rag_chunks, rag_scored_chunks, fewshot_block
 
 
+def history_numeric_claims(
+    history: list[ChatMessage] | None,
+) -> dict[str, set[str]]:
+    """会話履歴から確定済みの数値言明を集める (``conversational_numeric_claims`` の履歴版)。"""
+    return conversational_numeric_claims(
+        (str(t.get("role") or ""), str(t.get("content") or ""))
+        for t in history or ()
+    )
+
+
+#: ``[関連する記憶]`` の行頭ラベル (``(過去の記録)`` / ``（訂正済み）`` 等) を剥がす
+#: 正規表現。ラベルの語彙は ``turn_text.FRAME_LINE_LABELS`` から派生させる
+#: (出す側が locale 版を足したら登録するだけで検出側が追随する)。
+_FRAME_LINE_LABEL_RE = re.compile(
+    r"^(?:[（(]?(?:"
+    + "|".join(re.escape(label) for label in sorted(FRAME_LINE_LABELS, key=len, reverse=True))
+    + r")[）)]?\s*)+",
+    re.IGNORECASE,
+)
+
+
+#: 行末に付く訂正済み注記 (``search_pipeline._SUPERSEDED_MARKS`` の ja / en)。
+#: ``[参考情報]`` 側だけに付くため、剥がさないと ``[関連する記憶]`` 側と一致しない。
+_FRAME_TRAILING_MARK_RE = re.compile(
+    r"(?:\s*(?:（訂正済み）|\(superseded by a later correction\)))+\s*$",
+    re.IGNORECASE,
+)
+
+
 def _normalize_for_frame_dedup(text: str) -> str:
     """枠をまたいだ同一判定用の正規化 (純粋関数)。
 
     ``[関連する記憶]`` は行頭に ``- (過去の記録) `` を付けて整形するため、
     ``[参考情報]`` 側の生テキストと文字列としては一致しない。装飾と空白だけを
-    落として突き合わせる。
+    落として突き合わせる。剥がすラベルは :data:`_FRAME_LINE_LABEL_RE`
+    (``turn_text.FRAME_LINE_LABELS`` 由来) で、複数連なっていても全部落とす。
     """
     stripped = re.sub(r"^\s*[-*]\s*", "", text.strip())
-    stripped = re.sub(r"^[（(]?(?:過去の記録|past record)[）)]?\s*", "", stripped)
+    stripped = _FRAME_LINE_LABEL_RE.sub("", stripped)
+    stripped = _FRAME_TRAILING_MARK_RE.sub("", stripped)
     return re.sub(r"\s+", "", stripped)
 
 
@@ -671,8 +787,8 @@ def _drop_rag_duplicates_of_semmem(
 
 
 def _format_rag_block(entries: list[str]) -> str:
-    """RAG 参照ブロックの最終的な system 文字列を生成する。"""
-    return f"{_RAG_HEADER}" + "\n\n".join(entries)
+    """RAG 参照ブロックの最終文字列を生成する (``_RAG_HEADER`` は空なので連結のみ)。"""
+    return "\n\n".join(entries)
 
 
 #: 1 チャンクあたりの枠の費用 (``"[参考情報 N]"`` + 区切りの改行)。
@@ -685,9 +801,7 @@ _RAG_ENTRY_FRAME_TOKENS = _estimate_tokens("[参考情報 10]\n\n")
 
 def _rag_frame_overhead(n_candidates: int) -> int:
     """候補 ``n_candidates`` 件を載せる場合の枠の総費用 (トークン)。"""
-    return _RAG_ENTRY_FRAME_TOKENS * max(0, n_candidates) + _estimate_tokens(
-        _RAG_HEADER,
-    )
+    return _RAG_ENTRY_FRAME_TOKENS * max(0, n_candidates)
 
 
 def _inject_rag_salience(
@@ -1048,7 +1162,7 @@ def _prepend_dynamic_block(trimmed: list[ChatMessage], dyn_text: str) -> bool:
     user メッセージが見つからなければ ``False`` を返す (呼び出し側が system へ fallback)。
     """
     return prepend_to_last_user(
-        trimmed, dyn_text, separator=_DYNAMIC_CONTEXT_DELIMITER,
+        trimmed, dyn_text, separator=_dynamic_context_delimiter(),
     )
 
 
@@ -1060,7 +1174,7 @@ def _append_dynamic_block(trimmed: list[ChatMessage], dyn_text: str) -> bool:
     「直前のやり取り」が生クエリの直前に来る並びを保つ。
     """
     return append_to_last_user(
-        trimmed, dyn_text, separator=_DYNAMIC_CONTEXT_TRAILING_DELIMITER,
+        trimmed, dyn_text, separator=_dynamic_context_trailing_delimiter(),
     )
 
 
@@ -1083,9 +1197,61 @@ def _latest_user_refers_to_previous_output(trimmed: list[ChatMessage]) -> bool:
     return False
 
 
-def _append_note_to_last_user(trimmed: list[ChatMessage], note: str) -> bool:
-    """trimmed の最後の user メッセージ末尾へ注記を追記する (要素は mutate しない)。"""
-    return append_to_last_user(trimmed, note)
+class BuiltMessages(list):
+    """``build_messages`` の戻り値。list 互換のまま組み立て時の観測値を添える。
+
+    list のサブクラスなので既存の呼出側 (添字 / len / 比較 / JSON 化) は
+    そのまま動く。属性は後段が **再計算せずに使う** ための値で、``list(messages)``
+    で浅いコピーを取ると失われる (その場合は後段が従来どおり再計算する)。
+
+    Attributes:
+        numeric_claims: ``conversational_numeric_claims(history)`` の結果。
+            注入候補の supersede 判定 (``_drop_superseded_context``) と量の
+            接地注記 (``chat_service._append_quantity_grounding``) が同じ値を使う。
+        latest_kept_chars: 最新ターンが予算超過で切り詰められた場合に **注記を
+            積む前に** 測った「渡した文字数」(末尾の ``...`` を除く)。切り詰めが
+            無ければ ``None``。後付け注記の長さが混ざらない
+            (:func:`latest_turn_truncation` が UI 表示に使う)。
+    """
+
+    __slots__ = ("numeric_claims", "latest_kept_chars")
+
+    def __init__(
+        self,
+        items: list[ChatMessage] = (),
+        *,
+        numeric_claims: dict[str, set[str]] | None = None,
+        latest_kept_chars: int | None = None,
+    ) -> None:
+        super().__init__(items)
+        self.numeric_claims: dict[str, set[str]] = numeric_claims or {}
+        self.latest_kept_chars: int | None = latest_kept_chars
+
+
+#: ``post_append_reserve_tokens`` が残予算に占めてよい上限。小さな context_size
+#: では予約が残予算を丸ごと食って履歴と動的ブロックが 0 になるため割合でも抑える
+#: (:data:`_DYN_BLOCK_MAX_SHARE` と同じ理由)。
+_POST_APPEND_MAX_SHARE = 0.3
+
+
+def _latest_kept_chars(
+    history: list[ChatMessage], trimmed: list[ChatMessage],
+) -> int | None:
+    """最新ターンが切り詰められていれば「渡した文字数」(``...`` 抜き) を返す。
+
+    ``_trim_history`` 直後 (注記・動的ブロックを積む前) に測ること。後から
+    測ると後付け注記の長さが混ざる (2026-09-02 監査 P-A7)。
+    """
+    if not history or not trimmed:
+        return None
+    original, kept = history[-1], trimmed[-1]
+    if original.get("role") != kept.get("role"):
+        return None
+    original_text = str(original.get("content") or "")
+    kept_text = str(kept.get("content") or "")
+    if len(kept_text) >= len(original_text):
+        return None
+    return len(kept_text.removesuffix("..."))
 
 
 def build_messages(
@@ -1104,13 +1270,24 @@ def build_messages(
     slot_resolver: "Callable[[str], frozenset[tuple[str, str]]] | None" = None,
     artifact_block: str | None = None,
     working_evict_block: int | None = None,
-) -> list[ChatMessage]:
+    post_append_reserve_tokens: int = 0,
+) -> BuiltMessages:
     """
     messages リストを組み立て、トークン予算内に収める。
+
+    戻り値は :class:`BuiltMessages` (list 互換)。
 
     ``working_evict_block`` (``memory.working_evict_block``) は履歴を切り落とす
     ブロック幅の基準。``None`` ならロード済み config から読み、無ければ従来値
     (:data:`_HISTORY_DROP_BLOCK`) に落ちる。
+
+    ``post_append_reserve_tokens`` は **本関数の後で** 最後の user メッセージへ
+    積まれる分 (接地注記 / ツール実行結果 — ``turn_text`` のレイアウト契約の
+    3 層目) の見込み。以前はこれが予算に入っておらず、ツールが走ったターンで
+    送信時ガード (``LocalClient._enforce_context_budget``) が履歴を切り直して
+    いた。最新ターンの予約の直後に残予算から引く (残予算の
+    :data:`_POST_APPEND_MAX_SHARE` を上限)。0 (既定) で無効 — 軽量パス /
+    継続パスはツールも接地注記の大半も積まないので 0 のまま。
 
     テンプレート変換は LocalClient に委譲するため、
     ここではロール・内容の組み立てのみを担う。
@@ -1170,6 +1347,16 @@ def build_messages(
         )
         remaining -= reserved_latest
 
+    # 組み立て後に積まれる注記 / ツール結果の枠。最新ターンの予約より後、
+    # 履歴の床より前に引く (生クエリ > 後付け分 > 履歴の床 > 動的ブロック)。
+    post_reserve = 0
+    if post_append_reserve_tokens > 0:
+        post_reserve = min(
+            post_append_reserve_tokens,
+            int(max(0, remaining) * _POST_APPEND_MAX_SHARE),
+        )
+        remaining -= post_reserve
+
     # 過去履歴の最低確保 (床)。実履歴量・残予算・working_max でキャップし、
     # 履歴が現在の質問のみ (新規セッション) の場合は 0 に縮退する —
     # 空回りの予約で動的ブロックを痩せさせない。
@@ -1192,19 +1379,21 @@ def build_messages(
 
     logger.debug(
         "build_messages: budget=%d (context_size=%d - %d), "
-        "system=%d tokens, reserved_latest=%d, remaining=%d, "
-        "rag_chunks=%d, file_contexts=%d",
+        "system=%d tokens, reserved_latest=%d, post_append_reserve=%d, "
+        "remaining=%d, rag_chunks=%d, file_contexts=%d",
         budget, context_size, generation_reserve, sys_tokens, reserved_latest,
-        remaining, total_rag, total_fc,
+        post_reserve, remaining, total_rag, total_fc,
     )
 
     # 0. 今回の会話で既に確定した値と食い違う注入候補を落とす。
     #    [関連する記憶] (semmem_block) / [参考情報] (RAG) / few-shot 例は
     #    3 つとも別々に組み立てられるため、ここが唯一の合流点になる。
+    #    数値言明は後段 (量の接地注記) も使うので一度だけ計算して戻り値に載せる。
+    numeric_claims = history_numeric_claims(history)
     semmem_block, rag_chunks, rag_scored_chunks, fewshot_block = (
         _drop_superseded_context(
             history, semmem_block, rag_chunks, rag_scored_chunks, fewshot_block,
-            slot_resolver,
+            slot_resolver, current_claims=numeric_claims,
         )
     )
     # 枠をまたいだ同一本文の二重掲載を落とす (両枠が揃うのはここだけ)。
@@ -1316,6 +1505,7 @@ def build_messages(
     )
     # 最新ターンが切られたかは dyn_parts 前置 (下) で内容が変わる前に判定する。
     truncation_note = _latest_turn_truncation_note(history, trimmed)
+    latest_kept_chars = _latest_kept_chars(history, trimmed)
 
     # 5. 動的ブロックを最後の user メッセージへ置く (KV キャッシュ対応)。
     #    既定は生クエリの **前** へ前置。ただし生クエリが直前の出力を指す照応を
@@ -1344,6 +1534,9 @@ def build_messages(
         else:
             placed = _prepend_dynamic_block(trimmed, dyn_text)
         if not placed:
+            # user 不在の履歴 (契約違反) でだけ system へ結合する。docs/f_03 §12 #5
+            # (PromptManager 外の system 文の禁止) に対する文書化済みの例外 —
+            # 情報を落とさないための最終防衛線で、通常経路では到達しない。
             messages[0] = {
                 "role": "system",
                 "content": system_prompt + "\n\n" + dyn_text,
@@ -1354,6 +1547,7 @@ def build_messages(
     # 言ったことにしてしまうため user 側へは回さない (_latest_turn_truncation_note
     # の docstring 参照)。prefix キャッシュは失われるが、発火は巨大な貼り付けを
     # 受けたターンに限られる (2026-08-16 ライブ監査 40 ターンで発火 0)。
+    # docs/f_03 §12 #5 に対する文書化済みの例外 (docs/c_02 §6.3)。
     if truncation_note:
         messages[0] = {
             "role": "system",
@@ -1372,7 +1566,7 @@ def build_messages(
         _dropped_history_note(history, trimmed),
     ):
         if note:
-            _append_note_to_last_user(trimmed, note)
+            append_to_last_user(trimmed, note)
 
     messages.extend(trimmed)
 
@@ -1400,7 +1594,11 @@ def build_messages(
         injected_rag, total_rag, injected_fc, total_fc,
     )
 
-    return messages
+    return BuiltMessages(
+        messages,
+        numeric_claims=numeric_claims,
+        latest_kept_chars=latest_kept_chars,
+    )
 
 
 def build_messages_for_loop(
@@ -1413,6 +1611,20 @@ def build_messages_for_loop(
 
     build_messages と同じ予算管理だが、RAG チャンクの代わりに
     圧縮済みステップ結果を注入する。
+
+    ``build_messages`` との **意図的な差** (揃えないもの):
+
+    - ``generation_reserve`` は引数ではなく ``cfg["llama"]["max_tokens"]`` から
+      取る (ループの生成上限は config が SSOT で、ターンごとに変わらない)。
+    - ステップ結果は動的ブロックではなく **system へ結合** する (ループ内で
+      毎反復 system が変わる前提の経路で、接頭辞キャッシュは狙っていない)。
+      したがって :data:`_DYN_BLOCK_RESERVE` の固定予約も無い — 履歴予算は
+      ステップ結果を積んだ後の残りで決まる。
+    - 動的ブロックが無いので照応による前置 / 後置の切替も無い。
+
+    揃えているもの: 最新ターン切り詰めの注記 (system、予約は
+    :data:`_TRUNCATION_NOTE_RESERVE`)、可視範囲の注記、現在日付 / 人格 /
+    文字数 / 出力形式の注記 (最後の user 末尾)。
 
     Args:
         system: システムプロンプト
@@ -1441,24 +1653,37 @@ def build_messages_for_loop(
         sys_content = system
 
     working_max = cfg.get("memory", {}).get("working_max_tokens", DEFAULT_WORKING_MAX_TOKENS)
+    history_budget = min(remaining, working_max)
+    # build_messages と同じく、最新ターンの切り詰めが確定しているなら system へ
+    # 足す注記の分を先に履歴予算から引く (後付けすると予算を超える)。
+    latest_tokens = (
+        _estimate_tokens(str(history[-1].get("content") or "")) if history else 0
+    )
+    if latest_tokens > history_budget:
+        history_budget = max(0, history_budget - _TRUNCATION_NOTE_RESERVE)
     trimmed_history = _trim_history(
-        history, min(remaining, working_max),
+        history, history_budget,
         working_evict_block=cfg.get("memory", {}).get("working_evict_block"),
     )
+    truncation_note = _latest_turn_truncation_note(history, trimmed_history)
+    if truncation_note:
+        sys_content = f"{sys_content}\n\n{truncation_note}"
+        logger.warning("build_messages_for_loop: %s", truncation_note)
 
     # build_messages と同じ注記を最後の user メッセージ末尾へ置く。
     # これが無いと Meta-Cognitive 層に振られたクエリにだけ現在日付・人格制約・
     # 文字数上限が届かない (本関数の唯一の消費者が MetaCognitiveAgent のため、
-    # 層が変わっただけで制約が消える)。3 つとも (history) -> str の純粋関数で、
+    # 層が変わっただけで制約が消える)。いずれも (history) -> str の純粋関数で、
     # シグナルが無ければ空文字列を返すのでトークン浪費にはならない。
     for note in (
         _current_date_note(history),
         _persona_question_note(history),
         _char_limit_note(history),
         _output_form_note(history),
+        _dropped_history_note(history, trimmed_history),
     ):
         if note:
-            _append_note_to_last_user(trimmed_history, note)
+            append_to_last_user(trimmed_history, note)
 
     logger.debug(
         "build_messages_for_loop: %d steps injected, remaining=%d",
@@ -1503,27 +1728,34 @@ def latest_turn_truncation(
     先頭のみ送られた」と提示するために API 層が使う (system 注記だけでは
     ベースモデルが従わず、ユーザーには何も見えないため)。
 
-    ``messages`` は動的ブロック (few-shot / RAG / 記憶) が最後の user へ前置され、
-    さらに文字数上限の注記 (``_char_limit_note``) が後置されることがあるため、
-    長さ比較や末尾一致では判定できない。デリミタ以降を「ユーザー発言側」として
-    切り出し、そこに元テキストが丸ごと含まれるかで判定する
-    (末尾一致で見ていたときは、後置注記があるだけで未切り詰めのターンを
-    「先頭のみ送信されました (1743 / 62 文字)」と誤報した)。
+    ``messages`` が :class:`BuiltMessages` なら、組み立て時に **注記を積む前に**
+    測った ``latest_kept_chars`` をそのまま使う (後付け注記の長さが「渡した
+    文字数」に混ざらない)。
+
+    素の list (浅いコピー後など) では従来どおり内容から判定する: 動的ブロック
+    (few-shot / RAG / 記憶) が最後の user へ前置され、さらに注記が後置される
+    ことがあるため、長さ比較や末尾一致では判定できない。``turn_text.
+    split_last_user`` で「ユーザー発言側」を切り出し、そこに元テキストが丸ごと
+    含まれるかで判定する (末尾一致で見ていたときは、後置注記があるだけで
+    未切り詰めのターンを「先頭のみ送信されました (1743 / 62 文字)」と誤報した)。
+    この経路の ``kept`` には後置注記が含まれうる (注記との間に境界が無い)。
     """
     if not history or not messages:
         return None
     original = history[-1]
+    original_text = str(original.get("content") or "")
+    if isinstance(messages, BuiltMessages):
+        if messages.latest_kept_chars is None or not original_text:
+            return None
+        return len(original_text), messages.latest_kept_chars
     sent = next(
         (m for m in reversed(messages) if m.get("role") == original.get("role")),
         None,
     )
     if sent is None:
         return None
-    original_text = str(original.get("content") or "")
     # 前置された動的ブロックを除いた「ユーザー発言側」だけを見る。
-    user_side = str(sent.get("content") or "").rsplit(
-        _DYNAMIC_CONTEXT_DELIMITER, 1,
-    )[-1]
+    _, user_side, _ = split_last_user(str(sent.get("content") or ""))
     if not original_text or original_text in user_side:
         return None
     kept = user_side.removesuffix("...")
@@ -1559,7 +1791,7 @@ def _dropped_history_note(
     セッションの「困っていたこと」の問いには正しく降参している = 能力ではなく
     優先順の問題)。切り落としが起きたターンでは常に可視範囲の限界を明示させる。
 
-    空文字を返す = 注記なし (:func:`_append_note_to_last_user` は falsy を無視)。
+    空文字を返す = 注記なし (呼出側は falsy を無視して ``append_to_last_user`` しない)。
     """
     if len(trimmed) >= len(history):
         return ""
@@ -1702,6 +1934,13 @@ def _quantize_history_drop(
 
     予算内に収まっている / 最新 1 ターンしか残らない場合は ``history`` をそのまま
     返し、呼出側の既存経路 (最新ターンの圧縮保持) に委ねる。
+
+    **収まる件数がブロック幅より少ないときは量子化しない** (``fit`` 件を
+    そのまま残す)。切り上げると窓がブロック 1 つ分 (12 件) 丸ごと落ち、
+    「新しい 6 件は収まる」のに最新 1 件しか残らない — ``history_min_tokens``
+    で確保した床が空回りしていた (2026-09-02 監査 P-A1: 13 件 / 各 300 tok /
+    予算 2000 で 6 件収まるのに 1 件)。ブロック幅未満の窓では、量子化が守ろう
+    とする「先頭を次のブロック境界まで固定する」利得もそもそも無い。
     """
     if len(history) <= 1:
         return history
@@ -1716,8 +1955,11 @@ def _quantize_history_drop(
     if fit >= len(history):
         return history
     over = len(history) - fit
-    blocks = -(-over // block)  # ceil
-    drop = min(len(history) - 1, blocks * block)
+    if fit < block:
+        drop = max(0, min(len(history) - 1, over))
+    else:
+        blocks = -(-over // block)  # ceil
+        drop = min(len(history) - 1, blocks * block)
     logger.debug(
         "_trim_history: dropping %d oldest messages (need %d, block=%d)",
         drop, over, block,

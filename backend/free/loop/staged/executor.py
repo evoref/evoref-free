@@ -26,7 +26,7 @@ import re
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1035,6 +1035,10 @@ class StagedCreateExecutor:
     event_bus: "LoopEventBus | None" = None
     debug_logger: "DebugLogger | None" = None
     name: str = "staged_create"
+    # 成果物に **切れたまま採用された** LLM 生成のラベル (``spec:<task_id>``)。
+    # 棄却・再生成で回復した切断は含めない。呼出側 (chat_stream_staged) が
+    # ``finish_reason=length`` の開示フレームと経験記録の ``truncated`` に使う。
+    truncated_steps: list[str] = field(default_factory=list)
 
     def _emit(self, stage: str, detail: str, status: str, task_id: str) -> None:
         """工程内サブステップ進捗を event_bus へ発行する (null-safe)。"""
@@ -1085,7 +1089,11 @@ class StagedCreateExecutor:
         self._emit("spec", "設計仕様を生成中", "running", task.task_id)
         module_list = _extract_module_list(task.description)
         module_paths = module_paths_from_list(module_list)
+        self._spec_doc_truncated = False
         spec_text = await self._generate_spec_doc(task.description)
+        # 採用した spec が max_tokens で切れたまま (再生成でも回復せず) か。
+        # ``_generate_spec_doc`` は戻り値の型を変えずサイドチャネルで知らせる。
+        spec_truncated = bool(getattr(self, "_spec_doc_truncated", False))
 
         # アンカー遵守リトライ: `## Module:` 見出しを 1 つも守れなかった自由記述
         # はプレースホルダ補完だけでは詳細が全損するため、必須見出しを列挙した
@@ -1100,6 +1108,7 @@ class StagedCreateExecutor:
             )
             self._emit("spec", "設計仕様を再生成中 (見出し規約違反)",
                        "running", task.task_id)
+            self._spec_doc_truncated = False
             retry = await self._generate_spec_doc(
                 task.description,
                 extra_constraint=_anchor_constraint(module_paths),
@@ -1109,6 +1118,9 @@ class StagedCreateExecutor:
             ):
                 spec_text = retry
                 anchor_retry = True
+                spec_truncated = bool(getattr(self, "_spec_doc_truncated", False))
+        if spec_truncated:
+            self.truncated_steps.append(f"spec:{task.task_id}")
         # 深化パスは LLM 由来の spec に対してのみ意味を持つ (description
         # フォールバック時は aux 劣化中の可能性が高く、深化 N 呼出は
         # ウォールクロックを無成果に消費するだけ)。
@@ -1274,6 +1286,8 @@ class StagedCreateExecutor:
             notes["spec_foreign_merged"] = str(foreign_merged)
         if anchor_retry:
             notes["spec_anchor_retry"] = "true"
+        if spec_truncated:
+            notes["spec_truncated"] = "true"
         if deepen_applied or deepen_rejected:
             notes["spec_deepen"] = (
                 f"{deepen_applied}/{deepen_applied + deepen_rejected}"
@@ -1301,7 +1315,12 @@ class StagedCreateExecutor:
         遅い iGPU を考慮し再生成は切断時のみ・明示 timeout 付きに限定する。
         ``None`` (degraded) / 失敗時は空文字を返し、呼出側が description に倒す。
         ``extra_constraint`` はアンカー遵守リトライの矯正制約 (末尾追記)。
+
+        戻り値の spec が **切れたまま** (再生成しても回復しなかった) なら
+        ``self._spec_doc_truncated = True`` を立てる (戻り値の型は変えない)。
+        呼出側 (``_run_spec``) はこれを ``truncated_steps`` へ集約し、開示に使う。
         """
+        self._spec_doc_truncated = False
         if self.aux_client is None:
             return ""
         msgs = [{"role": "user", "content":
@@ -1320,6 +1339,7 @@ class StagedCreateExecutor:
             return spec_text
         retry_tokens = min(self.spec_max_tokens * 2, _SPEC_MAX_TOKENS_CEILING)
         if retry_tokens <= self.spec_max_tokens:
+            self._spec_doc_truncated = bool(spec_text)
             return spec_text  # 既に上限。再生成しても伸びない
         logger.warning(
             "spec doc truncated at max_tokens=%d; regenerating at %d",
@@ -1332,13 +1352,16 @@ class StagedCreateExecutor:
             )
         except Exception as exc:
             logger.warning("spec doc regeneration failed: %s", exc)
+            self._spec_doc_truncated = bool(spec_text)
             return spec_text
         retry_text = _content(resp2).strip()
         # 非切断 or より長い結果のみ採用 (再切断でも初回より短くはしない)。
         if retry_text and (
             _finish_reason(resp2) != "length" or len(retry_text) > len(spec_text)
         ):
+            self._spec_doc_truncated = _finish_reason(resp2) == "length"
             return retry_text
+        self._spec_doc_truncated = bool(spec_text)
         return spec_text
 
     async def _deepen_module_section(

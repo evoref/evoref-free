@@ -59,11 +59,25 @@ class LearnedPatternRepository:
         return patterns
 
     @staticmethod
-    def save(patterns: dict[str, LearnedPattern], path: str | Path) -> None:
-        """`patterns` を JSON ファイルに書き出す。親ディレクトリは自動作成。"""
+    def save(
+        patterns: dict[str, LearnedPattern],
+        path: str | Path,
+        *,
+        last_decay_at: float | None = None,
+    ) -> None:
+        """`patterns` を JSON ファイルに書き出す。親ディレクトリは自動作成。
+
+        ``last_decay_at`` を渡すとエンベロープ形式
+        ``{"patterns": [...], "last_decay_at": <epoch>}`` で書き、6h 減衰間隔の
+        基準時刻を再起動越しに残す。省略時は従来のフラットな list (旧形式)。
+        """
         path = Path(path)
         data = LearnedPatternRepository.serialize(patterns)
-        atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+        payload: list | dict = (
+            data if last_decay_at is None
+            else {"patterns": data, "last_decay_at": last_decay_at}
+        )
+        atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
         logger.info("Saved %d learned patterns to %s", len(data), path)
 
     @staticmethod
@@ -74,6 +88,17 @@ class LearnedPatternRepository:
         `None` を返す (空辞書とは区別する)。呼び出し側は `None` を
         「ファイル未存在 / 破損 = 既存状態を保持」と解釈できる。
         """
+        loaded = LearnedPatternRepository.load_with_meta(path)
+        return None if loaded is None else loaded[0]
+
+    @staticmethod
+    def load_with_meta(
+        path: str | Path,
+    ) -> tuple[dict[str, LearnedPattern], dict] | None:
+        """`load` に加えてエンベロープのメタ (``last_decay_at`` 等) も返す。
+
+        旧形式 (フラット list) はメタ空 ``{}`` として読む。
+        """
         path = Path(path)
         if not path.exists():
             return None
@@ -83,12 +108,16 @@ class LearnedPatternRepository:
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to load learned patterns from %s: %s", path, exc)
             return None
+        meta: dict = {}
+        if isinstance(data, dict):
+            meta = {k: v for k, v in data.items() if k != "patterns"}
+            data = data.get("patterns")
         if not isinstance(data, list):
             logger.warning("Invalid learned patterns format (expected list) in %s", path)
             return None
         patterns = LearnedPatternRepository.deserialize(data)
         logger.info("Loaded %d learned patterns from %s", len(patterns), path)
-        return patterns
+        return patterns, meta
 
 
 # ──────────────────────────────────────────────────────────────────────────

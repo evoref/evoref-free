@@ -8,16 +8,19 @@ Level 2: 夜間 SPSA による LoRA 微調整（Pro 専用、Level2Runner で注
 from __future__ import annotations
 
 import asyncio
-import random
 import time
 from dataclasses import asdict
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from backend.i18n_helper import msg
+from backend.io import atomic_write_text
 from backend.log_config import get_logger
 from backend.policy_helpers import get_policy_value
 from backend.utils import utc_now
 from backend.free.core.session_mode import is_chat_mode, is_create_mode
+from backend.free.learning.fitness import defect_rate_fitness
 from backend.free.learning.learning_state_store import (
     LearningState,
     LearningStateStore,
@@ -31,7 +34,10 @@ from backend.free.learning.level1_session import (
     load_active_session,
     save_active_session,
 )
-from backend.free.optimizer.prompt_evolver import PromptEvolver
+from backend.free.optimizer.prompt_evolver import (
+    PROMPT_DEFECT_WEIGHTS,
+    PromptEvolver,
+)
 from backend.free.agent.prompt_manager import SystemPromptManager
 from backend.free.agent.prompt_utils import (
     restore_protected_sections,
@@ -51,12 +57,21 @@ logger = get_logger("learning.scheduler")
 # 一方、変異は成功したが改善が無い「健全な収束」は success=True を維持する)。
 _MUTATION_DEGRADED_RATE = 0.5
 
+#: 1 つの Level1Session が yield できる上限。これを超えたら session を破棄して
+#: 経験カーソルを進める (同じ snapshot を何日も抱えたまま resume を繰り返さない)。
+MAX_SESSION_YIELDS = 5
+
+#: 採用したプロンプトを事後監視する Level 1 窓の数と、rollback を発火させる
+#: 欠陥率 fitness の悪化幅 (採用時基準との差)。
+PROMPT_ROLLBACK_WINDOWS = 2
+PROMPT_ROLLBACK_EPSILON = 0.02
+
 
 def _aggregate_mutation_health(results: dict) -> tuple[int, int]:
     """Level 1 結果集合から変異 (mutation) の総試行/総失敗回数を集計する。
 
-    ``results`` の値は ``EvolutionResult`` (run_or_resume_level1) か結果 dict
-    (_run_level1 の phase 別 dict) のいずれか。変異統計を持たない phase
+    ``results`` の値は ``EvolutionResult`` (prompt 進化) か結果 dict
+    (extra phase 別 dict) のいずれか。変異統計を持たない phase
     (aux/embed/extra) は 0 として扱う。``(attempts, failures)`` を返す。
     """
     attempts = 0
@@ -129,10 +144,9 @@ class LearningScheduler:
         self.level1_idle_minutes: float = self._lp(
             "level1_idle_minutes", learning.get("level1_idle_minutes", 30),
         )
-        # 常駐ループ化される際に使用されるパラメータ
-        self.level1_recheck_interval_sec: int = learning.get(
-            "level1_recheck_interval_sec", 60,
-        )
+        # level1_recheck_interval_sec は常駐ループ (SleepTimeScheduler) 側だけが
+        # 読むので本クラスには持たない。level1_idle_minutes はポリシー解決値を
+        # SleepTimeScheduler が本インスタンス経由で参照する (L-C1)。
         self.priority_threshold_ratio: float = learning.get(
             "priority_threshold_ratio", 0.5,
         )
@@ -231,7 +245,14 @@ class LearningScheduler:
         )
 
     def _init_phase4_and_mutator_config(self, learning: dict) -> None:
-        """トークン予算進化の設定"""
+        """トークン予算進化 (phase4) の設定。
+
+        **現状これらのノブは inert。** phase4 は候補比率ごとに異なる outcome
+        シグナルが経験に残っていない (生成時の比率が記録されない) ため候補を
+        識別できず、``no_outcome_signal`` で skip する (L-A1)。config スキーマ
+        (``backend/schemas/learning.py``) のキーは互換のため残す。per-candidate
+        の outcome が配線されたら再び読む。
+        """
         self.budget_generations: int = learning.get("budget_generations", 5)
         self.budget_sigma: float = learning.get("budget_sigma", 0.05)
         self.budget_max_total_ratio: float = learning.get(
@@ -288,16 +309,34 @@ class LearningScheduler:
         self._fitness_history: dict[str, list[dict]] = {}
         self._prev_correction_rate: float | None = None
         self._prev_rag_usage_rate: float | None = None
-        self._state_file: Path = prompt_manager.prompt_dir / "learning_state.json"
+        # mode → 採用直後プロンプトの事後監視レコード (L-A7、learning_state に永続化)
+        self._prompt_adoptions: dict[str, dict] = {}
+        # _get_filtered_experiences のメモ化 (バッファ長 / 末尾 timestamp /
+        # ロード済みカートリッジ集合が変わらない限り再変換しない、L-D1)
+        self._exp_cache_key: tuple | None = None
+        self._exp_cache: list[dict] = []
+        # 学習コンポーネントが束ねられている base モデル stem (起動時 = resolver の
+        # active stem、rebind_learning_partition で更新)。ModelState と食い違えば
+        # ランタイム切替が起きている (L-A10、_base_model_changed)。
+        self._model_stem_at_init: str | None = (
+            getattr(self._resolver, "active_model_stem", None)
+            if self._resolver is not None else None
+        )
+        self._model_change_warned = False
+        # ランタイム切替を検知したときの自己修復 (新モデル GGUF 名 → rebind 結果)。
+        # ``_learning_rebind.install_rebind_hook`` が注入。None なら従来どおり
+        # Level 1 を止めるだけ。
+        self._partition_rebind_hook: Callable[[str], dict] | None = None
         # Level1Session / 優先キュー / 協調 yield 用の状態
         self._priority_queue: list[PriorityRequest] = []
         self._yield_event: asyncio.Event = asyncio.Event()
-        self._active_session_file: Path = (
-            prompt_manager.prompt_dir / "level1_session_active.json"
-        )
-        self._level1_history_dir: Path = (
-            prompt_manager.prompt_dir / "level1_history"
-        )
+        self._bind_partition_paths(prompt_manager.prompt_dir)
+
+    def _bind_partition_paths(self, prompt_dir: Path) -> None:
+        """パーティション (prompt_dir) 依存の状態ファイルパスを導出する。"""
+        self._state_file: Path = prompt_dir / "learning_state.json"
+        self._active_session_file: Path = prompt_dir / "level1_session_active.json"
+        self._level1_history_dir: Path = prompt_dir / "level1_history"
 
     def __init__(
         self,
@@ -376,6 +415,7 @@ class LearningScheduler:
         self._fitness_history = state.fitness_history
         self._prev_correction_rate = state.prev_correction_rate
         self._prev_rag_usage_rate = state.prev_rag_usage_rate
+        self._prompt_adoptions = dict(state.prompt_adoptions)
         # 優先キューを復元
         self._priority_queue = state.priority_queue
         logger.info(
@@ -398,6 +438,7 @@ class LearningScheduler:
                     prev_correction_rate=self._prev_correction_rate,
                     prev_rag_usage_rate=self._prev_rag_usage_rate,
                     priority_queue=list(self._priority_queue),
+                    prompt_adoptions=dict(self._prompt_adoptions),
                 ),
                 self._state_file,
             )
@@ -425,6 +466,94 @@ class LearningScheduler:
             )
         except Exception as e:
             logger.warning("Failed to save policy evolver state: %s", e)
+
+    def set_partition_rebind_hook(self, hook: Callable[[str], dict] | None) -> None:
+        """ランタイム base 切替検知時の自己修復フック (新 GGUF 名 → rebind 結果) を注入する。"""
+        self._partition_rebind_hook = hook
+
+    def save_partition_state(self) -> None:
+        """現在のパーティションへ学習状態を書き出す (rebind 前の退避)。
+
+        learning_state / policy_evolver_state / exploration_state / (yaml モードの)
+        fewshot_pool を ``prompt_manager.prompt_dir`` 配下へ保存する。prompt_dir を
+        差し替えた後では旧パスが分からなくなるため、rebind は「退避 → prompt_dir
+        差替え → :meth:`rebind_learning_partition`」の順で呼ぶ。
+        """
+        self._save_state()
+        self._save_policy_evolver_state()
+        pool = self._fewshot_pool
+        if pool is not None and not pool.is_semmem_writeback_active():
+            pool.save(self.prompt_manager.prompt_dir / "fewshot_pool.json")
+
+    def rebind_learning_partition(
+        self,
+        *,
+        model_stem: str | None,
+        base_model_id: str,
+        generation_deltas_file: Path | None = None,
+    ) -> None:
+        """ランタイム base 切替後、学習状態を新パーティションへ向け直す。
+
+        前提: 呼出側が :meth:`save_partition_state` で旧パーティションへ退避し、
+        ``prompt_manager.rebind_prompt_dir`` で prompt_dir を新パーティションへ
+        差し替え済であること。ここでは prompt_dir から状態パスを再導出し、
+        learning_state / PolicyParamEvolver (+ExplorationController) /
+        FewShotPool / FeedbackPipe / GenerationParamEvolver を新モデルへ再スコープ
+        して再ロードする。新パーティションが空なら各状態は初期値 (ゼロから学習)。
+        Level 1 実行中は呼ばない (``running`` を呼出側で確認する)。
+        """
+        prompt_dir = self.prompt_manager.prompt_dir
+        self._bind_partition_paths(prompt_dir)
+
+        # learning_state: 永続化対象フィールドを初期値へ戻してから新パスを読む
+        self._last_run = 0.0
+        self._last_level2_run = {}
+        self._level2_no_improve_streak = {}
+        self._level1_run_count = 0
+        self._last_level1_results = {}
+        self._fitness_history = {}
+        self._prev_correction_rate = None
+        self._prev_rag_usage_rate = None
+        self._prompt_adoptions = {}
+        self._priority_queue = []
+        self._exp_cache_key = None
+        self._exp_cache = []
+        self._load_state()
+
+        evolver = self._policy_param_evolver
+        if evolver is not None:
+            evolver.set_base_model_id(base_model_id)
+            evolver.reset_evaluation_state()
+            evolver.load(prompt_dir / "policy_evolver_state.json")
+            exploration = getattr(evolver, "_exploration", None)
+            if exploration is not None:
+                exploration.reset()
+                exploration.load(prompt_dir / "exploration_state.json")
+
+        pool = self._fewshot_pool
+        if pool is not None:
+            pool.set_base_model_id(base_model_id)
+            pool.reset()
+            if pool.is_semmem_writeback_active():
+                pool.bootstrap_from_semmem()
+            else:
+                pool.load(prompt_dir / "fewshot_pool.json")
+
+        if self._feedback_pipe is not None:
+            self._feedback_pipe.set_base_model_id(base_model_id)
+
+        if (
+            self._generation_param_evolver is not None
+            and generation_deltas_file is not None
+        ):
+            self._generation_param_evolver.rebind_delta_file(generation_deltas_file)
+
+        self._model_stem_at_init = model_stem
+        self._model_change_warned = False
+        logger.info(
+            "Learning scheduler rebound to partition: stem=%s slug=%s dir=%s",
+            model_stem, base_model_id, prompt_dir,
+        )
 
     def record_level2_run(
         self, target: str = "base", *, improved: bool | None = None,
@@ -888,6 +1017,7 @@ class LearningScheduler:
         *,
         extra_results: dict[str, dict] | None = None,
         experiences: list[dict] | None = None,
+        skipped_phases: list[str] | None = None,
     ) -> str:
         """全モード完了時の後処理: 最良 prompt 保存 + state 更新 + session archive.
 
@@ -895,10 +1025,15 @@ class LearningScheduler:
         無改善 (final <= initial) で採用すると、目的関数を改善しないまま version を
         bump し続ける (embed_instruction 系の採用パスと挙動を揃える)。
 
-        統計永続化 (`_last_level1_results` / `_fitness_history` / レート
-        スナップショット) は `_level1_finalize` に委譲し、手動トリガー経路
-        (`_run_level1`) と同じ状態が `/api/learning/status` から見えるようにする。
+        採用したプロンプトは ``_prompt_adoptions`` に基準 (採用時の欠陥率 fitness と
+        rollback 先 version) を記録し、以後の Level 1 完了時に
+        :meth:`_check_prompt_adoptions` が事後監視する (L-A7)。
+
+        ``skipped_phases`` (cancel で飛ばした extra phase) が残っていれば
+        ``_last_run`` を進めない — 同じ経験でもう一度 phase を回す機会を残す (L-A15)。
         """
+        experiences = experiences or []
+        rolled_back = self._check_prompt_adoptions(experiences)
         for mode, result in results.items():
             if result.final_fitness <= result.initial_fitness:
                 logger.info(
@@ -906,35 +1041,124 @@ class LearningScheduler:
                     mode, result.initial_fitness, result.final_fitness,
                 )
                 continue
+            if mode in rolled_back:
+                # 直前に rollback した mode の候補は rollback 対象から派生した
+                # ものなので、このサイクルでは採用しない。
+                logger.info(
+                    "Level 1 %s: adoption skipped (prompt rolled back this cycle)",
+                    mode,
+                )
+                continue
             try:
+                rollback_to = self.prompt_manager.get_meta(mode).version
                 self.prompt_manager.update_evolved(
                     mode,
                     result.best_candidate.text,
                     result.final_fitness,
                 )
+                self._record_prompt_adoption(mode, rollback_to, experiences)
                 logger.info(
                     "Level 1 %s: adopted evolved prompt (fitness %.4f → %.4f)",
                     mode, result.initial_fitness, result.final_fitness,
                 )
             except Exception as e:
-                logger.warning("Failed to save prompt for %s: %s", mode, e)
+                logger.warning("Failed to save prompt for %s: %s", mode, e, exc_info=True)
 
         stats: dict[str, dict] = {
             mode: {
                 "improved": result.final_fitness > result.initial_fitness,
                 "fitness_before": result.initial_fitness,
                 "fitness_after": result.final_fitness,
+                "mutation_attempts": getattr(result, "mutation_attempts", 0),
+                "mutation_failures": getattr(result, "mutation_failures", 0),
             }
             for mode, result in results.items()
         }
         if extra_results:
             stats.update(extra_results)
-        self._level1_finalize(experiences or [], stats)
+        self._level1_finalize(
+            experiences, stats,
+            advance_cursor=not skipped_phases,
+            skipped_phases=skipped_phases,
+        )
         archived_path = self.archive_active_session(session)
         logger.info(
             "Level 1 session completed and archived: %s", archived_path,
         )
         return archived_path
+
+    # ── 採用プロンプトの事後監視 (L-A7) ──
+
+    def _record_prompt_adoption(
+        self, mode: str, rollback_to: int, experiences: list[dict],
+    ) -> None:
+        """採用直後の基準を記録する (欠陥率 fitness と rollback 先 version)。"""
+        mode_exp = [e for e in experiences if e.get("mode") == mode]
+        baseline = defect_rate_fitness(mode_exp, weights=PROMPT_DEFECT_WEIGHTS)
+        now = utc_now()
+        self._prompt_adoptions[mode] = {
+            "rollback_to": int(rollback_to),
+            "baseline": round(baseline, 4) if baseline is not None else None,
+            "adopted_at": now,
+            "window_since": now,
+            "windows": [],
+        }
+
+    def _check_prompt_adoptions(self, experiences: list[dict]) -> set[str]:
+        """採用済みプロンプトの事後監視。悪化していれば rollback する。
+
+        採用後に記録された経験 (``window_since`` より新しい) が
+        ``min_experiences // 2`` 件以上溜まった Level 1 完了を 1 窓と数え、
+        :data:`PROMPT_ROLLBACK_WINDOWS` 窓の欠陥率 fitness 平均が採用時基準を
+        :data:`PROMPT_ROLLBACK_EPSILON` 超悪化していたら
+        ``prompt_manager.rollback(mode, rollback_to)`` を呼ぶ。
+
+        Returns:
+            このサイクルで rollback した mode の集合。
+        """
+        rolled_back: set[str] = set()
+        min_samples = max(1, self.min_experiences // 2)
+        for mode, rec in list(self._prompt_adoptions.items()):
+            since = str(rec.get("window_since") or "")
+            new_exp = [
+                e for e in experiences
+                if e.get("mode") == mode and str(e.get("timestamp") or "") > since
+            ]
+            if len(new_exp) < min_samples:
+                continue
+            fitness = defect_rate_fitness(new_exp, weights=PROMPT_DEFECT_WEIGHTS)
+            if fitness is None:
+                continue
+            windows = list(rec.get("windows") or [])
+            windows.append(round(fitness, 4))
+            rec["windows"] = windows
+            rec["window_since"] = max(str(e.get("timestamp") or "") for e in new_exp)
+            if len(windows) < PROMPT_ROLLBACK_WINDOWS:
+                continue
+            baseline = rec.get("baseline")
+            mean = sum(windows) / len(windows)
+            if baseline is not None and mean < baseline - PROMPT_ROLLBACK_EPSILON:
+                try:
+                    self.prompt_manager.rollback(mode, int(rec["rollback_to"]))
+                    rolled_back.add(mode)
+                    logger.warning(
+                        "Level 1 %s: evolved prompt rolled back to v%03d "
+                        "(post-adoption fitness %.4f < baseline %.4f - %.2f)",
+                        mode, int(rec["rollback_to"]), mean, baseline,
+                        PROMPT_ROLLBACK_EPSILON,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Level 1 %s: prompt rollback failed: %s", mode, e, exc_info=True,
+                    )
+            else:
+                logger.info(
+                    "Level 1 %s: adopted prompt passed post-adoption check "
+                    "(fitness %.4f vs baseline %s)",
+                    mode, mean, baseline,
+                )
+            del self._prompt_adoptions[mode]
+        return rolled_back
 
     async def _run_extra_optimizations(
         self,
@@ -942,33 +1166,51 @@ class LearningScheduler:
         llm_client,
         results: dict[str, dict],
         phase_durations: dict[str, float],
-    ) -> None:
+    ) -> list[str]:
         """Level 1 追加最適化 (f_04 §4): prompt 進化以外の evolver 群を一括実行する
 
-        `_run_level1` (手動トリガー) と `run_or_resume_level1` (常駐ループ) の
-        両経路から共有される。各 phase は未注入コンポーネント・経験不足・
-        cancel を自身でガードして no-op する。
+        各 phase は未注入コンポーネント・経験不足を自身でガードして no-op する。
+        cancel (``_cancelled``) が立った以降の phase は実行せず名前を返す —
+        呼出側は ``_last_run`` を進めない (同じ経験でやり直せる、L-A15)。
+
+        Returns:
+            cancel で飛ばした phase 名のリスト (空 = 全 phase 実行)。
         """
-        await self._level1_phase3_embed_instruction(
+        skipped: list[str] = []
+
+        async def _phase(name: str, fn) -> None:
+            if self._cancelled:
+                skipped.append(name)
+                return
+            out = fn()
+            if asyncio.iscoroutine(out):
+                await out
+
+        await _phase("phase3_embed_instruction", lambda: self._level1_phase3_embed_instruction(
             experiences, llm_client, results, phase_durations,
-        )
-        await self._level1_phase4_token_budget(
+        ))
+        await _phase("phase4_token_budget", lambda: self._level1_phase4_token_budget(
             experiences, results, phase_durations,
-        )
-        self._level1_phase6_generation_params(
+        ))
+        await _phase("phase6_generation_params", lambda: self._level1_phase6_generation_params(
             experiences, results, phase_durations,
-        )
-        self._level1_phase7_tool_routing(
+        ))
+        await _phase("phase7_tool_routing", lambda: self._level1_phase7_tool_routing(
             experiences, results, phase_durations,
-        )
+        ))
         # Step 12 — PolicyEvolver 評価/書き戻し
-        self._step12_policy_evolver(
+        await _phase("step12_policy_evolver", lambda: self._step12_policy_evolver(
             experiences, results, phase_durations,
-        )
+        ))
         # Step 14 — Few-shot プール GC
         # finalize() 前に実行することで、yaml モードでは保存される
         # fewshot_pool.json が GC 後の状態で書き出される。
-        self._step14_fewshot_gc(results, phase_durations)
+        await _phase("step14_fewshot_gc", lambda: self._step14_fewshot_gc(
+            results, phase_durations,
+        ))
+        if skipped:
+            logger.info("Level 1 extra optimizations skipped (cancelled): %s", skipped)
+        return skipped
 
     async def run_or_resume_level1(
         self,
@@ -1006,6 +1248,8 @@ class LearningScheduler:
             return {"skipped": True, "reason": "no_llm_client"}
         if self._running:
             return {"skipped": True, "reason": "already_running"}
+        if self._base_model_changed():
+            return {"skipped": True, "reason": "base_model_changed"}
 
         session_or_skip = self._load_or_create_level1_session(reason, relax_threshold)
         if isinstance(session_or_skip, dict):
@@ -1015,76 +1259,98 @@ class LearningScheduler:
         # 1 cycle = 1 trace_id を発行 (bg_task wrapper の trace_id を退避)
         from backend.trace_context import generate_trace_id, trace_id_var
         trace_token = trace_id_var.set(generate_trace_id())
+        started_at = utc_now()
         t0 = time.monotonic()
         success = False
         any_yielded = False
         results: dict = {}
         extra_results: dict[str, dict] = {}
+        phase_durations: dict[str, float] = {}
         try:
             self.reset_yield_event()
             self._running = True
+            # per-run の critique キャッシュを毎回リセット
+            self._last_critique_result = None
             try:
                 # Level 1 tick 冒頭で feedback_pipe を実行し、品質ゲート結果を
                 # FewShotPool / 失敗クリティーク / policy fitness プロバイダへ還流する
                 await self._run_feedback_pipe()
-                # 進化前に経験から few-shot プールを補充する (f_04 §3)。
-                # resume 時は同一スナップショットの再投入になるが
-                # FewShotPool 側の多様性チェックが重複を弾く。
+                # 進化前に経験から few-shot プールを補充する (f_04 §3)。session
+                # snapshot は応答本文を持たない圧縮射影 (L-D3) なので live バッファ
+                # から読む。resume 時は同一データの再投入になるが FewShotPool 側の
+                # 多様性チェックが重複を弾く。
                 await self._update_fewshot_pool_from_experiences(
-                    session.experience_snapshot, llm_client,
+                    self._get_filtered_experiences(), llm_client,
+                )
+                # Step 11 — Critique-Synthesis を base prompt 進化より前に 1 回だけ
+                # 実行し、_CachedCritiqueProxy 経由で PromptEvolver に渡す
+                # (モードごとの二重 critique を防ぐ)。
+                await self._step11_critique_synthesis(
+                    session.experience_snapshot, extra_results, phase_durations,
                 )
                 # 進化対象は名前プレフィックス無しの raw 本文。get_prompt() の
                 # 出力 (プレフィックス付き) を渡すと進化後本文へ名前が焼き込まれ、
-                # ランタイムの二重付与で設定名が反映されなくなる (_collect_mode_prompt_texts と同じ契約)。
-                prompt_texts = {
-                    mode: self.prompt_manager.get_raw_prompt(mode)
-                    for mode in self.MODES
-                }
+                # ランタイムの二重付与で設定名が反映されなくなる。
+                prompt_texts = self._collect_mode_prompt_texts()
+                if not prompt_texts:
+                    logger.warning("No prompts available for evolution")
+                tp = time.monotonic()
                 results = await self._evolver.evolve_all_modes(
                     experiences=session.experience_snapshot,
                     prompt_texts=prompt_texts,
                     llm_client=llm_client,
                     generations=self.generations,
                     population_size=self.population_size,
-                    critique_synthesizer=self._critique_synthesizer,
+                    critique_synthesizer=self._select_critique_for_phase1(),
                     session=session,
                     yield_check=self.should_yield,
                     save_session=self.save_active_session,
                 )
+                phase_durations["phase1_base_prompt"] = round(time.monotonic() - tp, 3)
 
                 any_yielded = any(r.yielded for r in results.values())
                 if any_yielded:
                     # session は save_session 経由で最新状態が保存済み
                     logger.info(
-                        "Level 1 session yielded: id=%s completed_phases=%s",
+                        "Level 1 session yielded: id=%s completed_phases=%s "
+                        "yield_count=%d",
                         session.session_id, session.completed_phases,
+                        session.yield_count,
                     )
                     success = True
+                    discarded = self._discard_if_yield_cap_hit(session)
                     return {
                         "session_id": session.session_id,
                         "yielded": True,
+                        "discarded": discarded,
                         "completed_phases": list(session.completed_phases),
                         "modes": self._format_modes_summary(results),
                     }
 
                 # 追加最適化 (f_04 §4)。prompt 進化の採用結果と session archive
                 # を失わないため、失敗しても警告のみで finalize へ進む。
-                phase_durations: dict[str, float] = {}
+                skipped_phases: list[str] = []
                 try:
-                    await self._run_extra_optimizations(
+                    skipped_phases = await self._run_extra_optimizations(
                         session.experience_snapshot, llm_client,
                         extra_results, phase_durations,
                     )
                 except Exception as exc:
                     logger.warning(
                         "Level 1 extra optimizations failed: %s: %s",
-                        type(exc).__name__, exc,
+                        type(exc).__name__, exc, exc_info=True,
                     )
 
                 self._finalize_completed_level1(
                     session, results,
                     extra_results=extra_results,
                     experiences=session.experience_snapshot,
+                    skipped_phases=skipped_phases,
+                )
+                elapsed = round(time.monotonic() - t0, 3)
+                self._level1_log_debug(
+                    started_at, elapsed, phase_durations,
+                    session.experience_snapshot, self._last_level1_results,
                 )
                 success = True
                 return {
@@ -1093,6 +1359,7 @@ class LearningScheduler:
                     "completed_phases": list(session.completed_phases),
                     "modes": self._format_modes_summary(results),
                     "extra_phases": sorted(extra_results.keys()),
+                    "skipped_phases": skipped_phases,
                 }
             finally:
                 self._running = False
@@ -1126,6 +1393,80 @@ class LearningScheduler:
                     },
                 )
             trace_id_var.reset(trace_token)
+
+    def _discard_if_yield_cap_hit(self, session: Level1Session) -> bool:
+        """yield 回数が :data:`MAX_SESSION_YIELDS` に達した session を破棄する。
+
+        破棄時は ``_last_run`` を現在時刻へ進めて経験カーソルを更新する (同じ
+        snapshot で永久に resume を繰り返さない)。次の Level 1 は新規経験が
+        ``min_experiences`` 溜まってから新しい session で始まる (L-A6)。
+        """
+        if session.yield_count < MAX_SESSION_YIELDS:
+            return False
+        logger.warning(
+            "Level 1 session %s discarded after %d yields (cap=%d); "
+            "advancing experience cursor",
+            session.session_id, session.yield_count, MAX_SESSION_YIELDS,
+        )
+        self.discard_active_session()
+        self._last_run = time.time()
+        self._save_state()
+        return True
+
+    def _base_model_changed(self) -> bool:
+        """base モデルが学習コンポーネントの束ね先と食い違っていないかを検知する (L-A10)。
+
+        学習コンポーネント (experience / prompts / PolicyParamEvolver の subject)
+        は ``_model_stem_at_init`` の stem で束ねられている。``ModelState.
+        current_filename`` の stem がこれと食い違っていたら、ランタイム切替が
+        ``_learning_rebind.rebind_base_learning`` を経由せずに起きている
+        (/api/model/reload を踏まずに llama-server だけ差し替えた等)。
+        自己修復フック (``set_partition_rebind_hook``) があればその場で rebind
+        して続行し、無ければ WARNING を 1 回出して Level 1 を止める
+        (旧パーティションへ新モデルの経験で書き込まないため)。
+        """
+        if self._resolver is None or not self._model_stem_at_init:
+            return False
+        try:
+            from backend.free.core.model_migration import ModelState
+
+            current = ModelState(
+                self._resolver.resolve_local("model_state_file"),
+            ).current_filename
+        except Exception as e:
+            logger.debug("base model change check skipped: %s", e)
+            return False
+        if not current:
+            return False
+        current_stem = Path(current).stem
+        if current_stem == self._model_stem_at_init:
+            return False
+        if self._partition_rebind_hook is not None:
+            try:
+                result = self._partition_rebind_hook(Path(current).name)
+            except Exception as e:
+                logger.warning(
+                    "Base model changed at runtime (%s -> %s) but self-heal "
+                    "rebind failed: %s; Level 1 suspended",
+                    self._model_stem_at_init, current_stem, e,
+                )
+                return True
+            if result.get("rebound"):
+                logger.info(
+                    "Base model changed at runtime (%s -> %s); learning "
+                    "partition rebound in place",
+                    result.get("old_stem"), result.get("new_stem"),
+                )
+                return False
+        if not self._model_change_warned:
+            self._model_change_warned = True
+            logger.warning(
+                "Base model changed at runtime (%s -> %s); Level 1 is suspended "
+                "until the learning partition is rebound (/api/model/reload) "
+                "so the old learning partition is not written to",
+                self._model_stem_at_init, current_stem,
+            )
+        return True
 
     async def _run_feedback_pipe(self) -> None:
         """品質ゲート 還流パイプを実行する
@@ -1178,7 +1519,21 @@ class LearningScheduler:
         return filtered
 
     def _get_filtered_experiences(self) -> list[dict]:
-        """経験バッファを dict リストに変換しカートリッジフィルタを適用"""
+        """経験バッファを dict リストに変換しカートリッジフィルタを適用
+
+        1 tick に 3〜4 回呼ばれ、毎回 1000 件規模の dataclass → dict 変換を
+        繰り返していた (L-D1)。バッファ長 / 末尾 timestamp / ロード済み
+        カートリッジ集合をキーにメモ化する (ExperienceBuffer は世代カウンタを
+        持たないため、この 3 つ組を安価な代替キーとする)。
+        """
+        entries = self.experience_buf.entries
+        cart_ids = (
+            frozenset(self.cartridge_mgr.loaded.keys())
+            if self.cartridge_mgr is not None else None
+        )
+        key = (len(entries), entries[-1].timestamp if entries else None, cart_ids)
+        if key == self._exp_cache_key:
+            return list(self._exp_cache)
         raw_experiences = [
             {
                 "timestamp": e.timestamp,
@@ -1190,9 +1545,12 @@ class LearningScheduler:
                 "cartridge_ids": e.cartridge_ids,
                 "signals": asdict(e.signals),
             }
-            for e in self.experience_buf.entries
+            for e in entries
         ]
-        return self._filter_experiences(raw_experiences)
+        filtered = self._filter_experiences(raw_experiences)
+        self._exp_cache_key = key
+        self._exp_cache = filtered
+        return list(filtered)
 
     def _get_new_experience_count(self) -> int:
         """前回 Level 1 実行以降の新規経験数を返す"""
@@ -1379,142 +1737,46 @@ class LearningScheduler:
         self._prev_rag_usage_rate = round(rag_used / total, 3)
 
     def trigger_level1(self, llm_client) -> tuple[bool, str]:
-        """Level 1 を手動トリガー（時間条件バイパス）
+        """Level 1 を手動トリガー (時間条件バイパス) — 優先キューへ ``manual`` を積む。
+
+        以前はここから ``_run_level1`` (Level1Session / yield を持たない第 2 の
+        Level 1 実装) を直接 create_task していた。常駐ループと同じ
+        :meth:`run_or_resume_level1` に一本化し、本メソッドは要求を enqueue する
+        薄いラッパにする (L-C3)。
 
         Returns:
-            (triggered, message)
+            (triggered, message) — message は i18n 済み。
         """
         if self._disabled:
             # --no-learning 中は手動トリガーでも副作用 (プロンプト書戻し等) を起こさない。
-            return False, "learning disabled"
+            return False, msg("api.learning_disabled")
 
         if self._running:
-            return False, "Learning cycle already running"
+            return False, msg("api.learning_cycle_running")
 
         if llm_client is None:
-            return False, "LLM client not available"
+            return False, msg("api.learning_llm_unavailable")
 
-        safe_exp = self._get_filtered_experiences()
-
-        if len(safe_exp) < self.min_experiences:
-            return False, (
-                f"Not enough experiences: {len(safe_exp)} < {self.min_experiences}"
+        available = len(self._get_filtered_experiences())
+        if available < self.min_experiences:
+            return False, msg(
+                "api.learning_not_enough_experiences",
+                available=available, required=self.min_experiences,
             )
 
-        # create_task 直後ではなくタスク実行開始 (_run_level1 内) まで _running が
-        # False のままになる TOCTOU レースを防ぐため、起動確定と同時に同期的に
-        # セットする (_run_level1 内の再設定は冪等で、直接呼出経路の安全のため残す)。
-        self._running = True
-        self._task = asyncio.create_task(
-            self._run_level1(safe_exp, llm_client)
+        position = self.push_priority_request(PriorityRequest(
+            reason="manual",
+            requested_at=time.time(),
+            relax_ratio=1.0,
+            payload={"level": "level1"},
+        ))
+        logger.info(
+            "Level 1 manually triggered: queued (%d experiences, position=%d)",
+            available, position,
         )
-        logger.info("Level 1 manually triggered (%d experiences)", len(safe_exp))
-        return True, f"Level 1 triggered with {len(safe_exp)} experiences"
-
-    async def _run_level1(
-        self,
-        experiences: list[dict],
-        llm_client,
-    ) -> dict[str, dict]:
-        """Level 1 プロンプト進化を実行
-
-        ベースモデルのモード別プロンプト進化
-        補助タスクのタスク別プロンプト進化（Pro 以上, §7.1.2）
-        エンベッド検索指示プロンプト進化（f_04 §4.2）
-        トークン予算比率進化（f_04 §4）
-        パターン重み進化
-        生成パラメータ進化
-        ツール誘導パターン重み進化
-        ポリシーパラメータ進化
-
-        Returns:
-            モード/タスク名 → {"improved": bool, "fitness_before": float, "fitness_after": float}
-        """
-        # 1 cycle = 1 trace_id を発行 (bg_task wrapper の trace_id を退避)
-        from backend.trace_context import generate_trace_id, trace_id_var
-        trace_token = trace_id_var.set(generate_trace_id())
-        self._cancelled = False
-        self._running = True
-        # per-run の critique キャッシュを毎回リセット
-        self._last_critique_result = None
-        started_at = utc_now()
-        t0 = time.monotonic()
-        phase_durations: dict[str, float] = {}
-        results: dict[str, dict] = {}
-        success = False
-        cancelled = False
-
-        try:
-            logger.info(
-                "Level 1 evolution started (%d experiences, %d generations)",
-                len(experiences), self.generations,
-            )
-            await self._update_fewshot_pool_from_experiences(experiences, llm_client)
-
-            # Step 11 — Critique-Synthesis
-            # 失敗パターン批評を base prompt 進化より前に明示的に実行し、結果を
-            # キャッシュして以降の PromptEvolver 呼び出しに渡す
-            # (二重 critique を防ぐ)。
-            await self._step11_critique_synthesis(
-                experiences, results, phase_durations,
-            )
-
-            phase1_continue = await self._level1_phase1_base_prompt(
-                experiences, llm_client, results, phase_durations,
-            )
-            if not phase1_continue or self._cancelled:
-                if self._cancelled:
-                    logger.info("Level 1 evolution was cancelled")
-                return results
-
-            await self._run_extra_optimizations(
-                experiences, llm_client, results, phase_durations,
-            )
-
-            self._level1_finalize(experiences, results)
-            elapsed = round(time.monotonic() - t0, 3)
-            logger.info("Level 1 evolution completed in %.3fs: %s", elapsed, results)
-            self._level1_log_debug(started_at, elapsed, phase_durations, experiences, results)
-            success = True
-
-        except asyncio.CancelledError:
-            logger.info("Level 1 evolution cancelled")
-            cancelled = True
-        except Exception as e:
-            logger.error("Level 1 evolution failed: %s", e)
-        finally:
-            self._running = False
-            # outcome.jsonl への結末記録 (evolve 限定)
-            dl = self._debug_logger
-            if dl is not None:
-                duration_ms = (time.monotonic() - t0) * 1000
-                # results は phase_name -> {"improved": bool, ...} 形式。
-                # 改善 (improved=True) があった phase を成功シグナルとする。
-                improved_count = sum(
-                    1 for r in results.values()
-                    if isinstance(r, dict) and r.get("improved") is True
-                )
-                # 変異が systemic に失敗して実質何も学習できていない場合は
-                # success を True と偽らない (健全な収束 = 改善なしとは区別する)。
-                mutations_degraded, mutation_signals = _mutation_health_signals(
-                    results, improved_count,
-                )
-                dl.log_outcome(
-                    kind="learning_cycle_l1",
-                    success=success and not cancelled and not mutations_degraded,
-                    duration_ms=duration_ms,
-                    quality_signals={
-                        "entry": "_run_level1",
-                        "experiences_count": len(experiences),
-                        "phases_completed": len(results),
-                        "phases_improved": improved_count,
-                        "cancelled": cancelled,
-                        **mutation_signals,
-                    },
-                )
-            trace_id_var.reset(trace_token)
-
-        return results
+        return True, msg(
+            "api.learning_level1_queued", count=available, position=position,
+        )
 
     # ── Level 1 ヘルパー: 各サブステップの実装 ──
 
@@ -1545,79 +1807,6 @@ class LearningScheduler:
             except ValueError:
                 continue
         return prompt_texts
-
-    async def _level1_phase1_base_prompt(
-        self,
-        experiences: list[dict],
-        llm_client,
-        results: dict[str, dict],
-        phase_durations: dict[str, float],
-    ) -> bool:
-        """ベースモデルのモード別プロンプト進化
-
-        Returns:
-            True なら次フェーズに進める。False の場合は即座に Level 1 全体を終了。
-        """
-        prompt_texts = self._collect_mode_prompt_texts()
-        if not prompt_texts:
-            logger.warning("No prompts available for evolution")
-            return False
-
-        base_mutator = llm_client
-
-        tp = time.monotonic()
-        # Step 11 で先行実行済みなら結果を再利用する
-        # (二重 critique 防止)。未生成 (Step 11 が skip) なら従来通り
-        # PromptEvolver 内で synthesizer を直接呼ばせる。
-        critique_for_phase1 = self._select_critique_for_phase1()
-        evolution_results = await self._evolver.evolve_all_modes(
-            experiences=experiences,
-            prompt_texts=prompt_texts,
-            llm_client=base_mutator,
-            generations=self.generations,
-            population_size=self.population_size,
-            critique_synthesizer=critique_for_phase1,
-        )
-        phase_durations["phase1_base_prompt"] = round(time.monotonic() - tp, 3)
-
-        if self._cancelled:
-            return True  # finalize 側で cancel ログを出す
-
-        for mode, evo_result in evolution_results.items():
-            if self._cancelled:
-                break
-            self._apply_phase1_mode_result(mode, evo_result, results)
-        return True
-
-    def _apply_phase1_mode_result(self, mode: str, evo_result, results: dict[str, dict]) -> None:
-        """base prompt 進化の単一モード結果を SystemPromptManager に反映"""
-        improved = evo_result.final_fitness > evo_result.initial_fitness
-        results[mode] = {
-            "improved": improved,
-            "fitness_before": evo_result.initial_fitness,
-            "fitness_after": evo_result.final_fitness,
-            "mutation_attempts": getattr(evo_result, "mutation_attempts", 0),
-            "mutation_failures": getattr(evo_result, "mutation_failures", 0),
-        }
-
-        if not improved:
-            logger.info(
-                "Mode %s: no improvement (fitness %.4f → %.4f), keeping current",
-                mode, evo_result.initial_fitness, evo_result.final_fitness,
-            )
-            return
-
-        # instruction-only 進化: few-shot は推論時に select_top_k が動的選択するため
-        # candidates への焼き込みはしない (co-evolution 廃止)。
-        self.prompt_manager.update_evolved(
-            mode=mode,
-            content=evo_result.best_candidate.text,
-            fitness=evo_result.final_fitness,
-        )
-        logger.info(
-            "Mode %s prompt evolved: fitness %.4f → %.4f",
-            mode, evo_result.initial_fitness, evo_result.final_fitness,
-        )
 
     async def _level1_phase3_embed_instruction(
         self,
@@ -1695,15 +1884,21 @@ class LearningScheduler:
         results: dict[str, dict],
         phase_durations: dict[str, float],
     ) -> None:
-        """トークン予算比率進化（f_04 §4）"""
+        """トークン予算比率進化（f_04 §4）— 現状は評価不能として skip する。
+
+        旧実装は比率テーブルを摂動して ``_calc_budget_fitness(ratios, exp)`` で
+        採点していたが、この関数は ``ratios`` を一切読まず (経験に「その応答を
+        生成したときの比率」が残っていない)、候補と現行が常に同点で採用ゲートは
+        構造的に閉じていた。候補生成だけが走る無駄を止め、per-candidate の
+        outcome シグナルが配線されるまで ``no_outcome_signal`` を返す (L-A1)。
+        ``budget_*`` config ノブは inert (``_init_phase4_and_mutator_config``)。
+        """
         if self._cancelled:
             return
-
         lf_exp = [
             e for e in experiences
             if e.get("signals", {}).get("long_form_used")
         ]
-        # phase3 と同じ理由で部分集合閾値を min_experiences // 2 に緩和。
         threshold = max(1, self.min_experiences // 2)
         if len(lf_exp) < threshold:
             logger.debug(
@@ -1711,16 +1906,17 @@ class LearningScheduler:
                 len(lf_exp), threshold,
             )
             return
-
-        logger.info(
-            "Level 1 token budget evolution (%d long-form experiences)",
-            len(lf_exp),
-        )
         tp = time.monotonic()
-        budget_result = await self._evolve_token_budget(lf_exp)
+        logger.info(
+            "Level 1 token budget: no_outcome_signal (candidate evaluation "
+            "disabled; %d long-form experiences)", len(lf_exp),
+        )
+        results["token_budget"] = {
+            "improved": False,
+            "skipped": True,
+            "reason": "no_outcome_signal",
+        }
         phase_durations["phase4_token_budget"] = round(time.monotonic() - tp, 3)
-        if budget_result:
-            results["token_budget"] = budget_result
 
     # 旧 phase5 (correction パターン重み進化) は 2026-07-21 に learned
     # correction 機構ごと廃止した (feedback._detect_correction docstring 参照)。
@@ -1790,7 +1986,7 @@ class LearningScheduler:
     # ── sleep-time Step 11 / 12 / 14 統合 ─────────
 
     def _select_critique_for_phase1(self):
-        """base prompt 進化 (`_level1_phase1_base_prompt`) に渡す critique を選ぶ
+        """base prompt 進化 (`run_or_resume_level1` の evolve_all_modes) に渡す critique を選ぶ
 
         Step 11 が ``CritiqueResult`` を生成済みであればキャッシュ化した
         プロキシを返し、PromptEvolver 内での再 critique を防ぐ。Step 11
@@ -1927,16 +2123,27 @@ class LearningScheduler:
         results["fewshot_gc"] = gc_summary
 
     def _level1_finalize(
-        self, experiences: list[dict], results: dict[str, dict],
+        self,
+        experiences: list[dict],
+        results: dict[str, dict],
+        *,
+        advance_cursor: bool = True,
+        skipped_phases: list[str] | None = None,
     ) -> None:
         """Level 1 後処理: 統計更新 + 状態保存
 
         Few-shot プールの GC + 永続化は ``_step14_fewshot_gc``
         に移管したため、本メソッドでは扱わない。
+
+        ``advance_cursor=False`` (cancel で extra phase を飛ばした) のときは
+        ``_last_run`` を進めない — 次の idle tick が同じ経験で残りの phase を
+        回せるようにする (L-A15)。
         """
-        self._last_run = time.time()
+        if advance_cursor:
+            self._last_run = time.time()
         self._level1_run_count += 1
         self._last_level1_results = self._summarize_level1_results(results)
+        self._last_level1_results["_skipped_phases"] = list(skipped_phases or [])
         self._append_fitness_history(results)
         self._snapshot_rates(experiences)
         self._save_state()
@@ -2073,9 +2280,9 @@ class LearningScheduler:
             existing = list(history_dir.glob("embed_instruction_v*.md"))
             version = len(existing) + 1
             dst = history_dir / f"embed_instruction_v{version:03d}.md"
-            dst.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+            atomic_write_text(dst, path.read_text(encoding="utf-8"), encoding="utf-8")
 
-        path.write_text(content, encoding="utf-8")
+        atomic_write_text(path, content, encoding="utf-8")
         logger.info("Embed instruction updated: %s", path)
 
 
@@ -2226,108 +2433,6 @@ class LearningScheduler:
             "total": store.count,
         }
 
-    # ── トークン予算比率進化（f_04 §4）──
-
-    async def _evolve_token_budget(
-        self, experiences: list[dict],
-    ) -> dict | None:
-        """トークン予算比率の進化（数値摂動ベース）
-
-        Returns:
-            {"improved": bool, "fitness_before": float, "fitness_after": float}
-            or None if cancelled
-        """
-        from backend.free.generation.token_budget import (
-            load_ratios,
-            save_ratios,
-        )
-
-        # ratios は base プロンプトと同じ partition dir に置く。prompt_manager の
-        # prompt_dir (resolve_learning 済 = partition) を SSOT とし、config 直読みの
-        # flat prompts_dir とのデシンクを避ける。
-        if self.prompt_manager is not None:
-            prompts_dir = Path(self.prompt_manager.prompt_dir)
-        else:
-            prompts_dir = Path(
-                self._config.get("local_paths", {}).get("prompts_dir", "local/prompts/")
-            )
-        current_ratios = load_ratios(prompts_dir)
-        best_ratios = current_ratios
-        best_fitness = self._calc_budget_fitness(current_ratios, experiences)
-        initial_fitness = best_fitness
-
-        for gen in range(self.budget_generations):
-            if self._cancelled:
-                return None
-
-            candidate = _perturb_ratios(best_ratios, sigma=self.budget_sigma)
-            candidate = _normalize_ratios(
-                candidate, max_total=self.budget_max_total_ratio,
-            )
-            fitness = self._calc_budget_fitness(candidate, experiences)
-
-            if fitness > best_fitness:
-                best_fitness = fitness
-                best_ratios = candidate
-                logger.debug(
-                    "Budget gen %d: fitness improved %.4f → %.4f",
-                    gen, initial_fitness, best_fitness,
-                )
-
-        improved = best_fitness > initial_fitness
-        if improved:
-            save_ratios(best_ratios, prompts_dir)
-            logger.info(
-                "Token budget evolved: fitness %.4f → %.4f",
-                initial_fitness, best_fitness,
-            )
-
-        return {
-            "improved": improved,
-            "fitness_before": initial_fitness,
-            "fitness_after": best_fitness,
-        }
-
-    def _calc_budget_fitness(
-        self, ratios: dict, experiences: list[dict],  # noqa: ARG002
-    ) -> float:
-        """品質 × 効率のフィットネス（f_04 §4）"""
-        if not experiences:
-            return 0.5
-
-        score = 0.0
-        for exp in experiences:
-            signals = exp.get("signals", {})
-
-            # 品質シグナル（重み: 1.0）
-            if signals.get("conversation_ended"):
-                score += 1.0
-            if signals.get("rephrased_query"):
-                score -= 0.5
-            if signals.get("user_correction"):
-                score -= 0.8
-
-            # 長文生成固有シグナル（重み: 0.3）
-            validation_errors = signals.get("long_form_validation_errors", 0)
-            if validation_errors > 0:
-                score -= 0.3 * validation_errors
-            completed = signals.get("long_form_units_completed", 0)
-            total = signals.get("long_form_units_total", 0)
-            if total > 0:
-                completion_rate = completed / total
-                score += 0.2 * completion_rate
-
-            # 効率シグナル（重み: 0.1）。budget_used_pct は 0-100 パーセント
-            # (producer orchestrator.py が *100 で出力) なので閾値もパーセントで判定する。
-            budget_pct = signals.get("long_form_budget_used_pct")
-            if budget_pct is not None:
-                if 50.0 <= budget_pct <= 90.0:
-                    score += 0.1  # 適切な使用率
-                elif budget_pct > 95.0:
-                    score -= 0.1  # 予算超過
-
-        return max(0.0, min(1.0, (score / len(experiences) + 1) / 2))
-
     # ── Level 2: Pro プラグインに委譲 ──
 
     def check_level2(
@@ -2367,43 +2472,3 @@ class LearningScheduler:
             base_model_path=base_model_path,
             force=force,
         )
-
-
-# ── トークン予算比率の数値進化ユーティリティ ──
-
-
-def _perturb_ratios(
-    ratios: dict[str, dict[str, list]],
-    sigma: float = 0.05,
-) -> dict[str, dict[str, list]]:
-    """比率テーブルに ±sigma の摂動を加える"""
-    perturbed: dict[str, dict[str, list]] = {}
-    for strategy_key, slots in ratios.items():
-        perturbed[strategy_key] = {}
-        for slot_name, (ratio, minimum) in slots.items():
-            # 比率に正規分布のノイズを加える（0 以上を保証）
-            new_ratio = max(0.0, ratio + random.gauss(0, sigma * ratio))
-            perturbed[strategy_key][slot_name] = [new_ratio, minimum]
-    return perturbed
-
-
-def _normalize_ratios(
-    ratios: dict[str, dict[str, list]],
-    max_total: float = 0.7,
-) -> dict[str, dict[str, list]]:
-    """各戦略の比率合計が ``max_total`` 以下に収まるよう正規化（generation 余地を確保）"""
-    normalized: dict[str, dict[str, list]] = {}
-    for strategy_key, slots in ratios.items():
-        total = sum(slot[0] for slot in slots.values())
-        if total > max_total and total > 0:
-            scale = max_total / total
-            normalized[strategy_key] = {
-                name: [ratio * scale, minimum]
-                for name, (ratio, minimum) in slots.items()
-            }
-        else:
-            normalized[strategy_key] = {
-                name: [ratio, minimum]
-                for name, (ratio, minimum) in slots.items()
-            }
-    return normalized
