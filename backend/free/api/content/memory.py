@@ -23,6 +23,10 @@ from backend.free.api.schemas import (
     WorkingMemoryStats,
 )
 from backend.config import get_config
+from backend.free.api.chat.chat_constants import (
+    DEFAULT_WORKING_MAX_TOKENS,
+    DEFAULT_WORKING_MAX_TURNS,
+)
 from backend.free.core.session_mode import is_valid_session_mode
 from backend.free.memory.semantic.pin_manager import (
     PinLockedError,
@@ -155,8 +159,10 @@ async def get_memory_stats(state: AppState = Depends(get_app_state)):
     if mem_sys is None:
         return MemoryDetailedStats(
             working=WorkingMemoryStats(
-                turns=0, max_turns=mem_cfg.get("working_max_turns", 30),
-                tokens_used=0, max_tokens=mem_cfg.get("working_max_tokens", 2048),
+                turns=0,
+                max_turns=mem_cfg.get("working_max_turns", DEFAULT_WORKING_MAX_TURNS),
+                tokens_used=0,
+                max_tokens=mem_cfg.get("working_max_tokens", DEFAULT_WORKING_MAX_TOKENS),
                 session_id="",
             ),
             short_term=ShortTermMemoryStats(

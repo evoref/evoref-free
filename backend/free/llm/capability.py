@@ -18,7 +18,11 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from backend.free.llm._base_client import async_retry_http_call, make_retry_logger
+from backend.free.llm._base_client import (
+    GENERATION_RETRYABLE_EXCEPTIONS,
+    async_retry_http_call,
+    make_retry_logger,
+)
 from backend.free.llm.model_metadata import TemplateFamily
 from backend.log_config import get_logger
 from backend.utils import utc_now
@@ -333,6 +337,7 @@ def make_llama_chat_fn(
             _post,
             request_label="llama-server /v1/chat/completions (probe)",
             retry_logger=retry_logger,
+            retryable_exceptions=GENERATION_RETRYABLE_EXCEPTIONS,
         )
 
     return _chat

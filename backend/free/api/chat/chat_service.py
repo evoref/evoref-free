@@ -871,7 +871,8 @@ def build_chat_messages(
             全体を走査しないと答えられない質問には切り詰め注記を付ける。
         post_append_reserve_tokens: 組み立て後に最後の user へ積まれる分
             (接地注記 / deliberative のツール結果) の予約。主経路は
-            :func:`deliberative_post_append_reserve_tokens`、軽量 / 継続パスは 0。
+            :func:`deliberative_post_append_reserve_tokens`、ツール結果を持たない
+            軽量 / 継続パスは :func:`notes_post_append_reserve_tokens`。
     """
     messages = build_messages(
         system_prompt, history,
@@ -898,6 +899,15 @@ def build_chat_messages(
 #: 決定論注記) の見込み (トークン)。1 ターンに載るのは高々数種で、各 100〜200
 #: トークン。
 _POST_APPEND_NOTES_ALLOWANCE_TOKENS = 256
+
+
+def notes_post_append_reserve_tokens() -> int:
+    """ツール結果を持たない経路 (軽量 / 継続) の予約 (トークン)。
+
+    ``apply_grounding_notes`` は **全経路** で最後の user へ注記を積むので、
+    ツール結果の分だけを落とした定額を予約する。
+    """
+    return _POST_APPEND_NOTES_ALLOWANCE_TOKENS
 
 
 def deliberative_post_append_reserve_tokens() -> int:

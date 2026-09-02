@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from backend.io import atomic_write_text
 from backend.log_config import get_logger
 
 logger = get_logger("learning.generation_delta_store")
@@ -73,7 +74,8 @@ class GenerationDeltaStore:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = GenerationDeltaStore.serialize(deltas)
-        path.write_text(
+        atomic_write_text(
+            path,
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )

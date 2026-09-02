@@ -346,6 +346,7 @@ local_paths:
   vectors_dir: local/vectors/                # RAG ベクトルインデックス
   knowledge_dir: local/knowledge/            # RAG 用ソースドキュメント
   memory_dir: local/memory/                  # メモリシステム永続化
+  agent_trace_dir: local/memory/agent_trace/ # MDP トレース常設ストア (エピソード記憶の入力、30 日で自動削除)
   prompts_dir: local/prompts/                # モード別システムプロンプト
   cartridges_dir: local/cartridges/          # カートリッジ（パッケージ + 埋め込み）
   history_dir: local/history/                # 会話履歴アーカイブ

@@ -25,6 +25,10 @@ DEFAULT_GENERATION_RESERVE: int = 512
 #: (backend/schemas/memory.py の既定値と同期させること)
 DEFAULT_WORKING_MAX_TOKENS: int = 4096
 
+#: memory.working_max_turns のフォールバック値
+#: (backend/schemas/memory.py / WorkingMemory の既定値と同期させること)
+DEFAULT_WORKING_MAX_TURNS: int = 256
+
 #: config.yaml memory.history_min_tokens のフォールバック値
 #: (backend/schemas/memory.py の既定値と同期させること)
 DEFAULT_HISTORY_MIN_TOKENS: int = 1024

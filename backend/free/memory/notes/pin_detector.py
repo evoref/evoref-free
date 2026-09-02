@@ -36,10 +36,10 @@ EvorefMem 統合仕様 の自動 Pin 検出を実装する
         memory:
           pin:
             auto_detect: true            # 自動検出の有効化
-            auto_detect_confirm: false   # 検出時に確認を必須化するか
-            unlimited: true              # pin 数上限無し
 
-    トリガ辞書のパスは config では指定しない (convention-based 解決)。
+    ``auto_detect_confirm`` (確認フロー) / ``unlimited`` (pin 数上限。もともと
+    上限自体が未実装) は値を読むコードが無く撤去済み (:data:`REMOVED_MEMORY_KEYS`
+    参照)。トリガ辞書のパスは config では指定しない (convention-based 解決)。
 """
 
 from __future__ import annotations

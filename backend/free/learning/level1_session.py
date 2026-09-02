@@ -98,6 +98,11 @@ class Level1Session:
     phase_state: dict[str, dict] = field(default_factory=dict)
     reason: str = "idle"
     yield_count: int = 0
+    #: session 開始時点の ``LearningScheduler._last_run`` (epoch 秒)。phase7 が
+    #: 「前回実行以降の新規経験だけ」を選ぶための固定カットオフ。yield 後の
+    #: 再開でも開始時の値を使う (完了して進んだ ``_last_run`` を使うと全件が
+    #: 除外される)。0.0 = 初回扱いで全件対象。
+    experience_cutoff: float = 0.0
 
     @classmethod
     def new(
@@ -105,6 +110,7 @@ class Level1Session:
         cartridge_ids: list[str] | set[str] | frozenset[str],
         experiences: list[dict],
         reason: str = "idle",
+        experience_cutoff: float = 0.0,
     ) -> "Level1Session":
         return cls(
             session_id=str(uuid.uuid4()),
@@ -115,6 +121,7 @@ class Level1Session:
             phase_state={},
             reason=reason,
             yield_count=0,
+            experience_cutoff=experience_cutoff,
         )
 
     def to_dict(self) -> dict:
@@ -131,6 +138,7 @@ class Level1Session:
             phase_state=dict(data.get("phase_state", {})),
             reason=str(data.get("reason", "idle")),
             yield_count=int(data.get("yield_count", 0)),
+            experience_cutoff=float(data.get("experience_cutoff", 0.0)),
         )
 
 

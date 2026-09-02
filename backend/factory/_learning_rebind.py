@@ -160,6 +160,8 @@ def rebind_base_learning(
         if pool is not None:
             fewshot_total = pool.total_count
 
+    _rebind_lora_partition(state, resolver, scheduler)
+
     learn = getattr(state, "learn", None)
     adjuster = getattr(learn, "policy_adjuster", None) if learn is not None else None
     if adjuster is not None:
@@ -179,6 +181,41 @@ def rebind_base_learning(
         "experience_file": str(exp_file),
         "fewshot_total": fewshot_total,
     }
+
+
+def _rebind_lora_partition(
+    state: "AppState", resolver: "PathResolver", scheduler: Any,
+) -> None:
+    """base LoRA のパスをキャッシュしている保持者を新パーティションへ向け直す。
+
+    起動時は ``_pillar_wirer._wire_sleep_scheduler_llm`` が resolve_learning の
+    値を SleepTimeScheduler と Level 2 の version_manager に焼き込むため、
+    切替後に呼び直さないと旧モデルのアダプタを指したままになる。Pro が保持する
+    :class:`LoRAVersionManager` (CartridgeChangeHandler / ProLearnComponents 経由)
+    は Free から import できないので、Pro が登録したハンドラへ委譲する。
+    """
+    from backend.edition import get_pro_handler
+
+    lora_path = resolver.resolve_learning("lora_adapter")
+    versions_dir = resolver.resolve_learning("lora_versions_dir")
+
+    sleep_scheduler = getattr(state, "sleep_scheduler", None)
+    if sleep_scheduler is not None:
+        sleep_scheduler.set_lora_path(lora_path)
+
+    vm_cls = get_pro_handler("lora_version_manager")
+    if vm_cls is not None and scheduler is not None:
+        try:
+            scheduler.set_version_manager(vm_cls(versions_dir, lora_path))
+        except Exception as exc:
+            logger.warning("Base LoRA version_manager rebind skipped: %s", exc)
+
+    rebind_pro_vm = get_pro_handler("rebind_lora_version_manager")
+    if rebind_pro_vm is not None:
+        try:
+            rebind_pro_vm(state, versions_dir, lora_path)
+        except Exception as exc:
+            logger.warning("Pro LoRA version_manager rebind skipped: %s", exc)
 
 
 def install_rebind_hook(state: "AppState") -> None:

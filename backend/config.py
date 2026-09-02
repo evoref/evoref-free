@@ -70,6 +70,8 @@ class PathResolver:
         # EvorefMem ローカル状態
         "local_state_file": "local/state.json",
         "memory_dir": "local/memory/",
+        # AgentTracer の MDP トレース常設ストア (episodic LTM の入力)。
+        "agent_trace_dir": "local/memory/agent_trace/",
         "prompts_dir": "local/prompts/",
         "cartridges_dir": "local/cartridges/",
         "history_dir": "local/history/",

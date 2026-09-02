@@ -16,7 +16,6 @@ import httpx
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
-    from backend.debug_logger import DebugLogger
     from backend.free.llm.aux_client import AuxClient
 
 logger = get_logger("rag.contextual_prefix")
@@ -48,10 +47,8 @@ class ContextualPrefixGenerator:
         self,
         aux_client: AuxClient,
         config: dict,
-        debug_logger: "DebugLogger | None" = None,
     ):
         self.aux_client = aux_client
-        self._debug_logger = debug_logger
         rag_cfg = config.get("rag", {})
         # 設定は rag.contextual_prefix 配下のネスト構造
         cp_cfg = rag_cfg.get("contextual_prefix", {}) or {}

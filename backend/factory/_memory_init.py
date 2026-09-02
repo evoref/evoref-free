@@ -347,7 +347,6 @@ def _init_memory(
             vectors_dir,
             memmap_threshold=memmap_threshold,
             quantization=str(rag_cfg.get("quantization", "int8")),
-            debug_logger=state.debug_logger,
         )
         if vs.index_path.exists():
             vs.load()

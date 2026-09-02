@@ -1,20 +1,21 @@
 """
 
-``local/logs/debug/agent_trace*.jsonl`` をエピソード単位で読み出し、エピソード
-記憶 (LongTermMemory / 通常 RAG ベクトル DB) に取り込むためのアダプタ。
+``local/memory/agent_trace/agent_trace*.jsonl`` (``AgentTraceStore``) を
+エピソード単位で読み出し、エピソード記憶 (LongTermMemory / 通常 RAG ベクトル
+DB) に取り込むためのアダプタ。
 
 設計の主旨
 
-- **入力**: ``debug_logger.log_dir`` 配下の ``agent_trace*.jsonl``
-  (debug_logger は日付ベースのファイル名 ``agent_trace_YYYY-MM-DD.jsonl`` を
-  使うため、グロブで横断する)。
+- **入力**: ``local_paths.agent_trace_dir`` 配下の ``agent_trace*.jsonl``
+  (日付ベースのファイル名 ``agent_trace_YYYY-MM-DD.jsonl`` なのでグロブで
+  横断する)。develop フラグには依存しない (以前は DebugLogger の evolve 限定
+  JSONL を読んでいたため通常運用ではエピソード記憶が生成されなかった)。
 - **粒度**: 1 エピソード = 1 ``MemoryNote``。``begin``/``step``/``end`` 3 種の
   イベントをグルーピングし、``end`` まで揃ったエピソードのみエピソード記憶に
   昇格させる。``end`` がまだ来ていないエピソードはステートに保留して次回呼び
   出しでマージする (``begin`` だけ先行して書き込まれた場合のロールフォワード)。
-- **trace_id 連結**: agent_tracer 由来の各 JSONL 行には ``DebugLogger`` 経由の
-  ``DebugLogSink`` が ``_trace_id_processor`` で ``contextvars``
-  の ``trace_id`` を自動付与する。本アダプタは行から
+- **trace_id 連結**: agent_tracer 由来の各 JSONL 行には ``AgentTraceStore`` が
+  ``contextvars`` の ``trace_id`` を自動付与する。本アダプタは行から
   ``trace_id`` を読み出し、``MemoryNote.trace_id`` にそのまま伝播させる。これに
   より B-1 の ``MDPTraceExtractor`` / Step 8 の Chat/Create extractor が同じ
   ``trace_id`` を ``SemanticFact.trace_id`` / ``Provenance.trace_id`` として
@@ -261,7 +262,7 @@ class MDPIngester:
     に変換するアダプタ。
 
     Args:
-        log_dir: ``debug_logger.log_dir`` (``local/logs/debug/`` 想定)。
+        log_dir: ``AgentTraceStore`` の常設ディレクトリ (``local_paths.agent_trace_dir``)。
             ``None`` の場合 ``collect_episodes`` は常に空リストを返す。
         state_path: オフセット永続化先 (``local/memory/mdp_ingest_state.json``)
         file_pattern: グロブパターン。デフォルトで日付ファイルを含む
@@ -284,6 +285,11 @@ class MDPIngester:
         self.max_processed_ids = max_processed_ids
         self.max_pending_episodes = max_pending_episodes
         self._state = self._load_state()
+
+    @property
+    def processed_count(self) -> int:
+        """処理済み (昇格 / 除外を問わず読み終えた) episode_id の数。"""
+        return len(self._state.processed_episode_ids)
 
     # ─── state I/O ────────────────────────────────────────────────────────
 
@@ -453,7 +459,13 @@ class MDPIngester:
                 with path.open("rb") as f:
                     f.seek(offset)
                     raw = f.read(size - offset)
-                self._state.file_offsets[path.name] = size
+                # 書きかけの末尾行 (改行なし) は次回に回す。offset を size まで
+                # 進めると、その行は warning 1 回で恒久に失われる。
+                cut = raw.rfind(b"\n")
+                if cut < 0:
+                    continue
+                raw = raw[: cut + 1]
+                self._state.file_offsets[path.name] = offset + len(raw)
             except OSError as exc:
                 logger.warning("MDPIngester: failed to read %s: %s", path, exc)
                 continue

@@ -125,7 +125,7 @@ class SleepTimeWorker:
         #: 0.0 は「まだ一度も走っていない」= 全ノートを保護する側に倒す。
         self._last_extraction_at: float = 0.0
         # ── MDPIngester (agent_trace*.jsonl → episodic LTM) ──
-        # log_dir は debug_logger の出力先を流用 (agent_trace_dir そのもの)。
+        # log_dir は AgentTraceStore の常設ディレクトリ (local_paths.agent_trace_dir)。
         # state ファイルはメモリディレクトリ配下に置く想定だが、テスト容易性
         # のため lazy 初期化する。
         self._mdp_ingester = None

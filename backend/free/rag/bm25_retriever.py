@@ -5,14 +5,9 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
-
 from rank_bm25 import BM25Plus
 
 from backend.log_config import get_logger
-
-if TYPE_CHECKING:
-    from backend.debug_logger import DebugLogger
 
 logger = get_logger("rag.bm25_retriever")
 
@@ -140,9 +135,7 @@ class BM25Retriever:
         use_trigrams: bool = False,
         split_ascii: bool = True,
         stopwords: Iterable[str] | None = None,
-        debug_logger: "DebugLogger | None" = None,
     ):
-        self._debug_logger = debug_logger
         self._bm25: BM25Plus | None = None
         self._chunk_ids: list[str] = []
         self._chunks: list[str] = []

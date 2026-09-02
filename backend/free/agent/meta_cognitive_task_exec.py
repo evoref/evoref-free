@@ -80,7 +80,8 @@ async def execute_tool_with_timeout(
     timeout は ``ToolsRegistry.timeout_for`` (ツール宣言 > 既定 30 秒)。
     超過時は ``Error:`` 文字列を返し、``tool_result_succeeded`` が失敗と
     扱えるようにする。timeout 以外の例外は呼出側で扱う (経路ごとに
-    state / ログの処理が異なるため)。
+    state / ログの処理が異なるため)。ツール台帳への失敗記録は
+    ``ToolsRegistry.execute`` (キャンセルが配送される合流点) が行う。
     """
     timeout_sec = tools_registry.timeout_for(tool_name, TOOL_EXECUTION_TIMEOUT_SEC)
     try:

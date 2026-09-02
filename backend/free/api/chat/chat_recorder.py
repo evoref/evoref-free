@@ -615,8 +615,8 @@ def _schedule_sleep_time(
     ``restates_a_value`` の結果。``None`` ならここで判定する。
 
     訂正ターンでは Full を **前倒し** する。ファクト抽出 (Step 8) と競合解決
-    (Step 6B) は Full にしか無く (``memory.facts.trigger: idle_full_only``)、
-    Light は Step 1-5.5 (埋め込み / タグ / スコア / eviction) だけ。そのため
+    (Step 6B) は Full にしか無く、Light は Step 1-5.5
+    (埋め込み / タグ / スコア / eviction) だけ。そのため
     既定 (アイドル 10 分 / 繰り延べ上限 30 分) では、ユーザーが訂正しても
     SemMem に反映されるまで最大 30 分かかる。訂正は反映が遅れると意味が薄れる
     ので、そのターンだけ待ち時間を下限まで縮める。

@@ -231,12 +231,19 @@ class MetaCognitiveAgent(
         self._truncated_steps: list[str] = []
         self._truncated_tokens = 0
         self._truncated_max_tokens: int | None = None
-        resp = await self._process_or_fallback(
-            query, system_prompt, conversation, llm_client, tools_registry,
-            on_step, generation_params=generation_params,
-            session_id=session_id, mode=mode, output_target=output_target,
-            private=private,
-        )
+        try:
+            resp = await self._process_or_fallback(
+                query, system_prompt, conversation, llm_client, tools_registry,
+                on_step, generation_params=generation_params,
+                session_id=session_id, mode=mode, output_target=output_target,
+                private=private,
+            )
+        finally:
+            # 例外 / 総タイムアウト / 切断で ``_process_impl`` の end_episode に
+            # 届かなかったエピソードを閉じる (正常終了後は no-op)。
+            tracer = getattr(self, "_agent_tracer", None)
+            if tracer is not None and session_id:
+                tracer.abort_open_episodes(session_id)
         if self._truncated_steps:
             resp.truncated = True
             resp.truncated_steps = list(self._truncated_steps)

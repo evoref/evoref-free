@@ -62,7 +62,8 @@ class ExtractionContext:
             CreateExtractor / MDPTraceExtractor は no-op (project スコープ
             必須のため)。
         agent_trace_dir: ``agent_trace*.jsonl`` を格納するディレクトリ
-            (通常は ``debug_logger.log_dir``)。``MDPTraceExtractor`` は
+            (``local_paths.agent_trace_dir``、``AgentTraceStore`` の常設
+            出力先)。``MDPTraceExtractor`` は
             このディレクトリ配下の日付付きファイル
             (``agent_trace_YYYY-MM-DD.jsonl``) をグロブで横断する。
             ``None`` または存在しない場合は no-op。

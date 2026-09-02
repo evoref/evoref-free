@@ -234,6 +234,21 @@ def collect_live_attribute_values(
     return {key: tuple(vals) for key, vals in values.items()}
 
 
+def _mdp_extract_state_path(agent_trace_dir: Path | None) -> Path | None:
+    """Step 8 の処理済み episode_id 永続先 (``local/memory/mdp_extract_state.json``)。
+
+    ``ensure_mdp_ingester`` と同じく ``memory_dir`` を優先し、resolver が使えない
+    場合は ``agent_trace_dir`` 配下へフォールバックする。
+    """
+    try:
+        from backend.config import get_path_resolver
+        return Path(get_path_resolver().resolve_local("memory_dir")) / "mdp_extract_state.json"
+    except Exception:
+        if agent_trace_dir is None:
+            return None
+        return Path(agent_trace_dir) / "mdp_extract_state.json"
+
+
 def _drop_facts_with_existing_subject(
     store: "SemanticFactStore",
     result: "ExtractionResult",
@@ -436,7 +451,9 @@ def extract_semantic_facts(
             if mdp_trace_extractor_factory is not None:
                 mdp_trace_extractor = mdp_trace_extractor_factory()
             else:
-                mdp_trace_extractor = MDPTraceExtractor()
+                mdp_trace_extractor = MDPTraceExtractor(
+                    state_path=_mdp_extract_state_path(agent_trace_dir),
+                )
         mdp_result = mdp_trace_extractor.extract(notes, ctx)
         # failure_pattern は loop 所有なので LoopFactView 経由で書く (ownership
         # 準拠 + signature 単位の in-place occurrences 加算)。decision は mem の
