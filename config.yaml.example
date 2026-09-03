@@ -989,6 +989,19 @@ learning:
 streaming:
   keepalive_interval_sec: 15.0    # Meta-Cognitive 層のキープアライブ送信間隔（秒）
 
+# ===== system プロンプトと文脈予算 (f_03 §7.1 / c_02 §6.3) =====
+# 予算は 1 つの関数 (core.prompt_budget.resolve_budgets) が配る。ここは各「上限」の宣言。
+prompt:
+  system_max_share: 0.30           # モードの context_size に対する静的 system の上限比 (現行台帳が収まる値。刈り込み後に下げる)
+  fewshot_core_max_tokens: 300     # 静的接頭辞末尾の few-shot コア集合の上限 (キャッシュに乗る)
+  fewshot_dynamic_max: 1           # query 依存 few-shot の最大例数 (最後の user へ前置)
+  fewshot_dynamic_max_tokens: 600  # 同ブロックのトークン上限
+  semmem_max_tokens: 800           # [関連する記憶] ブロックの上限
+  rag_max_tokens: 200              # [参考情報] ブロックの上限
+  fact_slate_max_tokens: 200       # 押し出したターンの事実スレート (0 で無効)
+  rule_stats_min_turns: 200        # 規則の削除 / 降格に要する最小観測ターン数
+  max_deletes_per_run: 1           # Level 1 の 1 ランで許す規則 delete 件数
+
 # ===== エージェント設定 =====
 agent:
   step_compaction_enabled: true          # ステップ結果圧縮の有効/無効

@@ -30,6 +30,7 @@ from collections import OrderedDict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass
 
+from backend.free.core.verifier_events import record_verifier_hit
 from backend.log_config import get_logger
 
 logger = get_logger("agent.issue_ledger")
@@ -62,6 +63,11 @@ KIND_LABELS: dict[str, str] = {
     "action_blocked": "依頼された操作を実行できなかった",
     "output_truncated": "出力が上限で切れた",
     "user_correction": "ユーザーが値を訂正した",
+    # 補助判定 (記憶想起・要約・競合解決など) が時間切れで縮退した。
+    # 本文は返せているのでユーザーには失敗に見えないが、**根拠が薄いまま
+    # 答えている**ので自己申告では正直に挙げる (2026-09-03 監査: 14 件の aux
+    # タイムアウトがあったターン群で「すべて正確」と自己申告していた)。
+    "aux_degraded": "補助的な判定が時間内に終わらず、簡略化して答えた",
 }
 
 
@@ -133,6 +139,8 @@ def record_correction(session_id: str, query: str) -> None:
     ケースだった (主体が逆)。
     """
     record_issue(session_id, "user_correction", (query or "")[:120], query)
+    # 陳腐値を答えた = 「今回の会話を採用する」規則の harmful (f_03 §3.5.1)
+    record_verifier_hit("user_correction")
 
 
 def format_issues(session_id: str) -> str:

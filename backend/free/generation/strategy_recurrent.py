@@ -379,6 +379,10 @@ class RecurrentStrategy:
                 max_tokens=budget.skeleton_or_summary,
                 temperature=0.3,
                 purpose="summarize",
+                # 長文生成の途中要約はユーザーが待っている前景処理。purpose 既定
+                # (sleep-time の要約) の「チャットのアイドルを待つ」に巻き込まれると
+                # 自分のターンの完了を待つことになる。
+                deferrable=False,
             )
             return extract_content(result).strip()
         except Exception as e:

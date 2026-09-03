@@ -3,10 +3,72 @@
 import time
 from uuid import uuid4
 
+from backend.free.memory.stores.fact_slate import SessionFactSlate
 from backend.log_config import get_logger
 from backend.utils import estimate_tokens as _estimate_tokens
 
 logger = get_logger("memory.working")
+
+#: 既に一度警告した (context_size, 設定値) の組。毎ターン同じ WARNING を
+#: 出さないためのデデュープ (WorkingMemory はセッションごとに作られる)。
+_reconcile_warned: set[tuple[int, int]] = set()
+
+
+def _reconcile_working_max_tokens(config: dict, mem: dict) -> int:
+    """WM の窓を、プロンプト側が実際に載せられる上限へ丸める。
+
+    **窓を決める主体を 1 つにする。** WM は ``working_max_tokens`` まで溜める
+    一方、``build_messages`` は ``context_size`` から生成予約・system・動的
+    ブロック予約を引いた残りしか載せられない。設定値が構造的に達成不能だと、
+    WM のブロック押し出しと ``_trim_history`` の切り落としが別々のタイミングで
+    先頭を動かし、接頭辞 KV キャッシュが崩れる回数が倍になる。
+
+    実測 (2026-09-03 ライブ監査、11:00 以降に 12 回):
+    ``working_max_tokens=4352 exceeds the prompt history budget=2486
+    (context_size=8192, generation_reserve=1024, system=2279, dyn_reserve=1600)``
+    — 設定値は context_size=8192 の下でどうやっても満たせない。従来は WARNING で
+    「config を下げろ」と促すだけで、実際には毎ターン二重に切られていた。
+
+    元の設定値が達成可能ならそのまま返す (縮めない)。
+
+    **context_size が分からないときは丸めない。** 素の dict で作る呼出
+    (テスト / 部分 config) では ``resolve_context_size`` が既定値を返すが、
+    それは推測であって実機の窓ではない。推測で窓を縮めると、設定と無関係に
+    挙動が変わる。``llama`` セクションを持つ config だけを対象にする。
+    """
+    configured = int(mem.get("working_max_tokens", 4096) or 4096)
+    if not (config.get("llama") or {}):
+        return configured
+    try:
+        from backend.config import resolve_context_size
+        from backend.free.core.prompt_budget import resolve_budgets
+    except Exception:
+        return configured
+    try:
+        context_size = int(resolve_context_size(config, "base") or 0)
+    except Exception:
+        context_size = 0
+    if context_size <= 0:
+        return configured
+    # 予算関数は 1 つ (c_02 §6.3)。system はレンダラが守る上限
+    # (``prompt.system_max_share``) で見積もる — WM はレンダ前に作られる。
+    budgets = resolve_budgets(config, context_size)
+    ceiling = budgets.working_max_tokens
+    if configured <= ceiling:
+        return configured
+    key = (context_size, configured)
+    if key not in _reconcile_warned:
+        _reconcile_warned.add(key)
+        logger.warning(
+            "memory.working_max_tokens=%d cannot fit the prompt budget "
+            "(context_size=%d, generation_reserve=%d, system_max=%d, "
+            "dyn_reserve=%d, fact_slate=%d); clamping the working-memory window "
+            "to %d so a single component decides it",
+            configured, context_size, budgets.generation_reserve,
+            budgets.system_max_tokens, budgets.dyn_reserve,
+            budgets.fact_slate_tokens, ceiling,
+        )
+    return ceiling
 
 #: トークン上限を超えたときに落とす下限水位 (``max_tokens`` に対する比)。
 #: 上限ちょうどで止めると次ターンで即また超えて毎ターン先頭が動く。
@@ -46,7 +108,7 @@ class WorkingMemory:
         # validate_config は既定値を実体化するので本番では常にキーがあるが、
         # 素の dict で作るテストが別の窓で走らないよう揃える。
         self.max_turns: int = mem.get("working_max_turns", 256)
-        self.max_tokens: int = mem.get("working_max_tokens", 4096)
+        self.max_tokens: int = _reconcile_working_max_tokens(config, mem)
         #: 上限に達したときに **まとめて** 押し出すターン数 (ヒステリシス)。
         #:
         #: 1 ターンずつ押し出すと、窓の先頭が毎ターン 1 つずれる。プロンプトは
@@ -71,6 +133,8 @@ class WorkingMemory:
         self.turns: list[dict] = []
         self.session_id: str = uuid4().hex[:8]
         self._evicted: list[dict] = []  # Layer 2 転送用バッファ
+        #: 押し出したターンの要点表 (f_02 §1.2)。窓の補助であって記憶層ではない。
+        self.fact_slate = SessionFactSlate()
         #: 現在のセッションで押し出したターン数 (``clear()`` でリセット)。
         #: ``_evicted`` は ``drain_evicted()`` で吸い出されるため残高を見ても
         #: 「このセッションで会話の前半が視界から落ちたか」は分からない。
@@ -306,6 +370,11 @@ class WorkingMemory:
             # 窓から落ちた事実は変わらないのでカウンタは通常どおり進める。
             if not evicted.get(_ABSORBED_KEY):
                 self._evicted.append(evicted)
+            # 要点表は STM 転送とは別 (f_02 §1.2): snapshot 済みでも窓から
+            # 消える事実は同じなので、転送バッファを経由せずここで渡す。
+            # 実機 (2026-09-03): 全ターンが snapshot 済みで転送バッファが空の
+            # まま押し出され、スレートが一度も埋まらなかった。
+            self.fact_slate.absorb([evicted])
             self.session_evicted_turns += 1
         while len(self.turns) > 1 and self.turns[0].get("role") == "assistant":
             orphan = self.turns.pop(0)

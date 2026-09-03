@@ -1230,7 +1230,7 @@ class ComplexityClassifier:
         実体は ``core.intent_vocab.has_history_recall_keyword``
         (tool_call_judge の強制発火判定と同じ照合)。
         """
-        return has_history_recall_keyword(query, locale_aware=False)
+        return has_history_recall_keyword(query)
 
     def _has_meta_keywords(self, query: str) -> bool:
         """Meta-Cognitive 層へのエスカレーションキーワードを検出"""

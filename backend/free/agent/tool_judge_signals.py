@@ -19,6 +19,7 @@ from backend.free.core.intent_vocab import (
     DATETIME_SIGNAL_TERMS_EN,
     EXECUTABLE_QUERY_PATTERNS_EN,
     EXECUTABLE_QUERY_PATTERNS_JA,
+    EXECUTABLE_QUERY_RE_ALL,
     EXECUTABLE_QUERY_RE_EN,
     EXECUTABLE_QUERY_RE_JA,
     RUNTIME_INFO_QUERY_RE,
@@ -29,7 +30,6 @@ from backend.free.core.intent_vocab import (
     looks_like_numeric_question,
     session_self_reference_pattern_ja,
 )
-from backend.free.core.locale_patterns import select_locale_variant
 
 #: 「直下だけ」を指す表現。再帰的な列挙を明示する語 (再帰 / 全部 / 配下すべて)
 #: が同居する依頼は対象外にして、意図が割れる文には手を入れない。
@@ -186,10 +186,9 @@ _TOOL_PATTERNS = [
     _DATETIME_SIGNAL_RE_EN,
 ]
 
-# _TOOL_PATTERNS の英語版。GUI 左下の言語設定が 'en' の場合のみ使う
-# (_TOOL_PATTERNS とは locale で完全に排他利用される)。既に ASCII/日英混在で
-# 機能するエントリ (コード検索/URL/計算/日時/OS/env 等) は locale='en' でも
-# 引き続き評価できるようそのまま複製する。
+# _TOOL_PATTERNS の英語版。既に ASCII/日英混在で機能するエントリ
+# (コード検索/URL/計算/日時/OS/env 等) は同じオブジェクトを共有する
+# (``_TOOL_PATTERNS_ALL`` の重複除去がそれを前提にしている)。
 _TOOL_PATTERNS_EN = [
     # 「ファイル + 読み書き動詞」。旧定義は read/open の **後に** write 系動詞を
     # 必須にしており、"read the file config.yaml" のような単一操作に一度も
@@ -218,6 +217,18 @@ _TOOL_PATTERNS_EN = [
     _DATETIME_SIGNAL_RE_EN,
 ]
 
+#: JA / EN 双方を **locale に関わらず** 評価する union。ツール要否シグナルの
+#: 消費側 (``_query_has_tool_signal`` / ``ToolCallJudge`` のルール層) はこちらを
+#: 使う — GUI locale は UI の言語であって入力の言語ではないので、片側だけ見ると
+#: 既定 'ja' のまま英語で打った "read the file config.yaml" にツールシグナルが
+#: 立たず、knowledge query として base の想像に落ちる。
+#:
+#: 両言語のリストは共通エントリ (コード検索 / URL / 計算 / 日時) を **同じ
+#: オブジェクトで** 共有しているので、``dict.fromkeys`` の同一性重複除去で
+#: 二重評価を避けられる。片方にしか無いエントリは他言語の文へ誤爆しない —
+#: JA 側は日本語の動詞・助詞との共起を要求し、EN 側は全て ``\b`` 付き。
+_TOOL_PATTERNS_ALL = list(dict.fromkeys((*_TOOL_PATTERNS, *_TOOL_PATTERNS_EN)))
+
 # _infer_tool() の実行可能クエリ判定ゲート (システム情報・数値処理・
 # データ処理・変換)。語彙は _TOOL_PATTERNS と同じ SSOT を 1 本の alternation に
 # 畳んだもの。以前は独立に保持されており、bare「変換」/ 無ガードの「日付」/
@@ -228,6 +239,12 @@ _INFER_TOOL_EXEC_QUERY_RE = EXECUTABLE_QUERY_RE_JA
 # 境界無しだと program/framework/diagram が RAM 等に、summary/resume/assume が
 # sum/mean 等に部分マッチする。2026-07-22 監査で判明)。
 _INFER_TOOL_EXEC_QUERY_RE_EN = EXECUTABLE_QUERY_RE_EN
+
+#: 実行可能クエリゲートの union (``_infer_tool`` が使う)。``_TOOL_PATTERNS_ALL``
+#: と同じ理由で locale に依存させない — ここを片側にすると、シグナルは
+#: ``_TOOL_PATTERNS_ALL`` で立つのにツール解決側が当たらず、判定が層をまたいで
+#: 食い違う。
+_INFER_TOOL_EXEC_QUERY_RE_ALL = EXECUTABLE_QUERY_RE_ALL
 #: 搭載メモリ量を尋ねるクエリ。専用ツール ``system_hardware_info`` へ振る。
 #:
 #: 2026-07-27 に ``メモリ`` / ``RAM`` を spec コマンド (``_build_spec_command``)
@@ -338,12 +355,15 @@ _READ_PATH_TOOLS: frozenset[str] = frozenset({
 # クラスの使い分けは？」で search_history が "No results found" を返す —
 # どちらも履歴参照の意図が皆無な純粋な知識質問で、小型 aux モデルが
 # tool_needed=True と誤判定した。
+# 旧 5 番目の ``(?:what is|tell me|explain|describe)\b`` は削除した。JA 側だけが
+# 評価される時代に英語を最低限拾うための出張エントリで、union 化 (下記
+# ``_KNOWLEDGE_PATTERNS_ALL``) 後は EN 側の同義エントリと二重になる。先頭の
+# 境界が無いぶん EN 側より弱く、残す理由が無い。
 _KNOWLEDGE_PATTERNS = [
     re.compile(r"(?:教えて|おしえて|とは|って何|ですか|でしょうか|ありますか)", re.IGNORECASE),
     re.compile(r"(?:について|に関して|に関する)", re.IGNORECASE),
     re.compile(r"(?:知りたい|確認したい|調べたい)", re.IGNORECASE),
     re.compile(r"(?:説明して|使い分け)", re.IGNORECASE),
-    re.compile(r"(?:what is|tell me|explain|describe)\b", re.IGNORECASE),
 ]
 
 # _KNOWLEDGE_PATTERNS の英語版。「about」は汎用前置詞のため直訳せず、
@@ -354,6 +374,12 @@ _KNOWLEDGE_PATTERNS_EN = [
     re.compile(r"\b(?:i\s+want\s+to\s+know|curious\s+about|wondering\s+about)\b", re.IGNORECASE),
     re.compile(r"\bdifference\s+between\b|\bwhen\s+(?:should|do)\s+i\s+use\b", re.IGNORECASE),
 ]
+
+#: 知識質問の union (locale 非依存)。片側だけ見ると、既定 'ja' のまま打った
+#: 英語の純粋な知識質問 ("what is the difference between a mutex and a
+#: semaphore?") が知識質問と認識されず、aux の誤判定 (tool_needed=True) を
+#: 打ち消せないまま search_history が空振りする。
+_KNOWLEDGE_PATTERNS_ALL = [*_KNOWLEDGE_PATTERNS, *_KNOWLEDGE_PATTERNS_EN]
 
 # セッション自己参照パターン — 「この会話で」等、現在のセッション自体を参照
 # する発話。会話履歴は working memory の予算を超えると古いターンからコンテキ
@@ -481,10 +507,12 @@ def _query_targets_local_file_only(query: str) -> bool:
 
 
 def _query_has_tool_signal(query: str, context: str = "") -> bool:
-    """クエリにツール操作シグナル (ツールパターン / Windows・Unix パス / URL) を含むか。"""
-    patterns = select_locale_variant(_TOOL_PATTERNS, _TOOL_PATTERNS_EN)
+    """クエリにツール操作シグナル (ツールパターン / Windows・Unix パス / URL) を含むか。
+
+    パターンは locale に依らず JA / EN 両方を見る (``_TOOL_PATTERNS_ALL``)。
+    """
     return (
-        any(p.search(query) for p in patterns)
+        any(p.search(query) for p in _TOOL_PATTERNS_ALL)
         or bool(_PATH_OR_URL_SIGNAL_RE.search(query))
         # ディレクトリ列挙は _TOOL_PATTERNS のどれにも当たらず、knowledge query
         # として落ちて捏造回答になっていた (2026-08-03 ライブ監査)。

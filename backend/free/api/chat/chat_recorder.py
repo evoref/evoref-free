@@ -56,8 +56,21 @@ def read_llama_prompt_tokens(state: AppState) -> tuple[int | None, int | None]:
     うる。既存の timing 畳み込みが元から持っていた制約と同じで、個々のターンの
     厳密値ではなく統計量としての利用を前提とする。
     """
-    client = getattr(getattr(state, "gen", None), "llm_client", None)
-    timings = getattr(getattr(client, "local", client), "_last_timings", None)
+    # **実際にストリームしたクライアント**から読む。チャットは
+    # ``ensure_llm_client`` が返す ``state.llm_client`` で生成しており、
+    # ``state.gen.llm_client`` は配線時の参照で lazy-connect / モード切替後に
+    # 別オブジェクトになりうる。2026-09-03 監査: KV 行 (op=kv_cache) は 101 件
+    # あるのに timing 側の prompt_n は 0/102 ターンで、プロンプト側コストが
+    # timing から一切追えなかった (c_07 §3.2.1)。
+    timings = None
+    for client in (
+        getattr(state, "llm_client", None),
+        getattr(getattr(state, "gen", None), "llm_client", None),
+    ):
+        candidate = getattr(getattr(client, "local", client), "_last_timings", None)
+        if isinstance(candidate, dict):
+            timings = candidate
+            break
     if not isinstance(timings, dict):
         return None, None
     prompt_n = timings.get("prompt_n")

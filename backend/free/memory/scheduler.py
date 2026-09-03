@@ -13,6 +13,7 @@ from datetime import timedelta, timezone, tzinfo
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from backend.aux_telemetry import aux_failure_scope, aux_failure_signals
 from backend.log_config import get_logger
 from backend.trace_context import generate_trace_id, trace_id_var
 from backend.utils import utc_now_dt
@@ -39,6 +40,7 @@ def _emit_bg_task_outcome(
     success: bool,
     duration_ms: float,
     extra: dict | None = None,
+    aux_failures: list[dict] | None = None,
 ) -> None:
     """bg_task wrapper の終了 outcome を ``outcome.jsonl`` に記録する
 
@@ -51,9 +53,17 @@ def _emit_bg_task_outcome(
     signals: dict = {"task_name": task_name}
     if extra:
         signals.update(extra)
+    # ステージ内で握られた aux 失敗を結末へ持ち上げる。これが無いと
+    # 「要約も競合解決も全滅したのにサイクルは success=true」になり、
+    # 学習へ流れる報酬信号が定数化する (2026-09-03 監査: outcome 456/456 が
+    # success=true)。1 件でも縮退したサイクルは **成功ではなく degraded**。
+    failures = aux_failures if aux_failures is not None else []
+    signals.update(aux_failure_signals(failures))
+    if failures:
+        signals["degraded"] = True
     debug_logger.log_outcome(
         kind="bg_task",
-        success=success,
+        success=success and not failures,
         duration_ms=duration_ms,
         quality_signals=signals,
     )
@@ -452,6 +462,7 @@ class SleepTimeScheduler:
         t_start = time.monotonic()
         success = False
         cancelled = False
+        aux_failures: list[dict] = []
         try:
             if self._worker is None:
                 success = True  # no-op は成功扱い
@@ -459,7 +470,8 @@ class SleepTimeScheduler:
 
             logger.info("Trigger A: starting Light sleep-time update (on_llm_start)")
             self._running = True
-            await self._worker.run_light()
+            with aux_failure_scope() as aux_failures:
+                await self._worker.run_light()
             success = True
         except asyncio.CancelledError:
             logger.debug("Light task cancelled")
@@ -476,6 +488,7 @@ class SleepTimeScheduler:
                 success=success,
                 duration_ms=elapsed_ms,
                 extra={"cancelled": cancelled},
+                aux_failures=aux_failures,
             )
             trace_id_var.reset(token)
 
@@ -626,6 +639,7 @@ class SleepTimeScheduler:
         executed = False
         waiting_for_generation = False
         skipped_reason: str | None = None
+        aux_failures: list[dict] = []
         try:
             await asyncio.sleep(self._full_wait_seconds())
 
@@ -710,7 +724,8 @@ class SleepTimeScheduler:
             # 不変則 (CLAUDE.md §6 #1 / docs/c_14 §1.1) を満たす。未接続なら
             # None を渡し、run_full が Step 5.8-10 をクリーンスキップする。
             llm_for_sleep = self.resolve_sleep_client()
-            await self._worker.run_full(llm_for_sleep)
+            with aux_failure_scope() as aux_failures:
+                await self._worker.run_full(llm_for_sleep)
             success = True
 
         except asyncio.CancelledError:
@@ -754,6 +769,7 @@ class SleepTimeScheduler:
                 success=success,
                 duration_ms=elapsed_ms,
                 extra=extra,
+                aux_failures=aux_failures,
             )
             trace_id_var.reset(token)
 

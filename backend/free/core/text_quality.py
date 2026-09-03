@@ -1243,6 +1243,26 @@ def match_banned_content(query: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return tuple(dict.fromkeys(words)), tuple(dict.fromkeys(scripts))
 
 
+#: 引用符として扱う開き / 閉じの対。禁止語がこの内側にあるだけなら「言及」。
+_MENTION_QUOTE_PAIRS = (("「", "」"), ("『", "』"), ('"', '"'), ("'", "'"), ("“", "”"))
+
+
+def _strip_quoted_mentions(body: str, words: tuple[str, ...] | list[str]) -> str:
+    """禁止語の **引用された出現** を本文から除いたコピーを返す (純粋関数)。
+
+    「『散乱』の代わりに」のように鉤括弧で括られた出現は、その語を *使って*
+    いるのではなく *指して* いる。括弧の外に 1 つでも出ていれば違反のままなので、
+    「引用しつつ本文でも使う」応答は従来どおり検出される。
+    """
+    out = body
+    for w in words:
+        if not w:
+            continue
+        for open_q, close_q in _MENTION_QUOTE_PAIRS:
+            out = out.replace(f"{open_q}{w}{close_q}", "")
+    return out
+
+
 def violates_banned_content(query: str, response: str) -> str | None:
     """禁止語・禁止文字種の指定を破っていれば理由を返す (純粋関数)。
 
@@ -1261,8 +1281,15 @@ def violates_banned_content(query: str, response: str) -> str | None:
     body = SYSTEM_NOTE_TAIL_RE.sub("", response or "").strip()
     if not body:
         return None
+    # **言及と使用を区別する。** 「『散乱』の代わりに『バウンド』と言えます」は
+    # 禁止語を *使って* いない — 引用して「これを避ける」と述べている。素の
+    # 部分文字列判定はこれを違反と数え、指示に正しく従った応答へ
+    # ``(注: 散乱 を使わない指定に対し、上の回答は使っています)`` という
+    # 偽の注記を付けていた (2026-09-03 ライブ監査 T9#2)。
+    # 鉤括弧などで囲まれた出現はメタ的な言及とみなして除外する。
+    body_used = _strip_quoted_mentions(body, words)
     hits: list[str] = []
-    hits.extend(f"the banned word {w!r}" for w in words if w and w in body)
+    hits.extend(f"the banned word {w!r}" for w in words if w and w in body_used)
     for name in scripts:
         pattern = _SCRIPT_PATTERNS.get(name)
         if pattern is not None and pattern.search(body):
@@ -1517,6 +1544,24 @@ _LINE_COUNT_REFERENCE_HEAD = (
     "その", "この", "あの", "先ほどの", "さっきの", "上の", "上記の", "先の",
 )
 
+#: **配分**を示す直前語。「結末を2案、**それぞれ**1行で」は *1 項目あたり* 1 行
+#: であって、応答全体を 1 行にしろという指定ではない。ここを拾っていたため、
+#: 2 案を正しく 2 行で返した応答に
+#: ``(注: 1 行の指定に対し、上の回答は 2 行です)`` という **偽の違反注記**が付き、
+#: さらに ``constraint_repair`` が修復再生成を 1 往復むだに回していた
+#: (2026-09-03 ライブ監査 T4#9)。
+#:
+#: 文字数側には既に per-item 判定 (:func:`match_per_item_char_limit` /
+#: :func:`violates_per_item_length`) がある。行数側だけ非対称に欠けていた。
+_LINE_COUNT_DISTRIBUTIVE_HEAD = (
+    "それぞれ", "各", "夫々", "1つずつ", "一つずつ", "ひとつずつ", "1件ずつ",
+)
+#: 上記の語が「N 行」の **直前の短い窓** に現れるか。「2案、それぞれ 1行で」の
+#: ように読点や空白を挟む形が普通なので、末尾一致では拾えない。
+_LINE_COUNT_DISTRIBUTIVE_RE = re.compile(
+    "(?:" + "|".join(re.escape(w) for w in _LINE_COUNT_DISTRIBUTIVE_HEAD) + r")[\s、,]{0,3}$",
+)
+
 #: 「<X>の行数を N 行以内」の <X>。ここが応答を指す語なら今回の出力への指定、
 #: そうでなければ **別の対象についての規約** を述べているだけ。
 _COUNT_SUBJECT_RE = re.compile(
@@ -1581,6 +1626,10 @@ def match_line_count(text: str) -> int:
             continue
         head = src[: m.start()]
         if head.endswith(_LINE_COUNT_REFERENCE_HEAD):
+            continue
+        # 「それぞれ1行で」「各1行で」= 1 項目あたりの指定。区切り記号や助詞を
+        # 挟む形 (「2案、それぞれ 1行で」) も拾うため、直前の短い窓で見る。
+        if _LINE_COUNT_DISTRIBUTIVE_RE.search(head):
             continue
         if count_belongs_to_another_subject(head):
             continue
@@ -1836,8 +1885,34 @@ def _record_constraint_issue(detail: str) -> None:
     import は関数内に閉じる。台帳が無い経路 (単体テスト等) では no-op。
     """
     try:
+        from backend.free.core.verifier_events import record_verifier_hit
+
+        record_verifier_hit(classify_constraint_verifier(detail))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         from backend.free.agent.issue_ledger import record_current_issue
 
         record_current_issue("constraint_violated", detail)
     except Exception:  # noqa: BLE001 - 記録の失敗で開示自体を止めない
         pass
+
+
+def classify_constraint_verifier(detail: str) -> str:
+    """開示注記の文面から検証器 id (``constraint.*``) を決める (純粋関数)。
+
+    規則台帳の計数 (f_03 §3.5.1) 用。文面は ``length_disclosure_note`` /
+    ``violation_reason`` が作るもので、種別ごとに固有の語を含む。
+    """
+    text = detail or ""
+    if "使わない指定" in text or "banned" in text:
+        return "constraint.banned"
+    if "行" in text or "lines" in text:
+        return "constraint.lines"
+    if "項目" in text or "個" in text or "items" in text or "enumerate" in text:
+        return "constraint.items"
+    if "語" in text or "words" in text:
+        return "constraint.words"
+    if "箇条" in text or "形式" in text or "format" in text:
+        return "constraint.form"
+    return "constraint.length"

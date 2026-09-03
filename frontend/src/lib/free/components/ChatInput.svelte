@@ -146,7 +146,15 @@
 						pushGeneratedEditorCode(event.editor_code);
 					}
 				} else if (event.type === 'error') {
-					appendToLastAssistant(`\n\n**Error:** ${event.error}`);
+					// 内部コードをそのまま画面に出さない。`stream_timeout` は
+					// 実際にユーザーが目にした唯一のケースで、生文字列
+					// `Error: stream_timeout` が本文の代わりに表示されていた
+					// (2026-09-03 ライブ監査)。訳のあるコードは訳を出す。
+					const detail =
+						event.error === 'stream_timeout'
+							? $t('chat.stream_timeout')
+							: event.error;
+					appendToLastAssistant(`\n\n**${$t('common.error')}:** ${detail}`);
 				}
 			}
 			// クリエイトモードでエディタへコードを出力したターンの完了通知

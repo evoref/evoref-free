@@ -36,7 +36,13 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from backend.aux_telemetry import record_aux_failure
 from backend.exceptions import LLMTimeoutError
+from backend.free.llm.generation_gate import (
+    activity_token,
+    wait_for_idle,
+    was_contended_since,
+)
 from backend.free.llm.json_extract import extract_json_object
 from backend.free.llm.json_schemas import (
     make_response_format,
@@ -143,6 +149,35 @@ CHAT_PATH_PURPOSES: frozenset[str] = frozenset({
     "tool_translate",
     "tool_draft_document",
 })
+
+#: **チャットがアイドルになるまで dispatch を待つ** purpose (sleep-time / 学習)。
+#: スロットを分けても GPU 演算は分かれないため、これらが走っている間ユーザー
+#: 応答の decode は実測で 2 倍以上遅くなる (2026-09-03 監査: 200-218 →
+#: 416-445 ms/tok)。CLAUDE.md §6 #1 の「**アイドル窓の** sleep-time / 学習」を
+#: 実際に強制する集合。
+#:
+#: **ここに入れてよいのは「ユーザーが待っていない」purpose だけ**。ユーザー起点の
+#: 前景処理 (long_form_* / create_* / code_spec_* / ralph_loop / tool_*) を入れると
+#: 自分のターンの完了を待つことになり、上限まで無駄に待ってから走る。
+#: 同じ purpose でも呼出側によって前景/背景が分かれる場合 (``summarize`` は
+#: sleep-time と長文生成の両方から呼ばれる) は、前景側が
+#: ``deferrable=False`` を明示する。
+DEFERRABLE_AUX_PURPOSES: frozenset[str] = frozenset({
+    # sleep-time / メモリ
+    "conflict_resolution",
+    "note_evolution",
+    "summarize",
+    "contextual_prefix",
+    "url_relevance_score",
+    "assertion_naming",
+    # 学習サイクル
+    "critique_synthesis",
+    "fewshot_quality_score",
+})
+
+#: チャットのアイドル窓を待つ上限。超えたら競合覚悟で走らせる。
+#: 無期限に待たせると、会話が続く限り記憶の統合と学習が永久に走らない。
+_CHAT_YIELD_MAX_WAIT_SEC = 120.0
 
 
 class AuxClient:
@@ -264,6 +299,16 @@ class AuxClient:
                 return classifier
         return background
 
+    @staticmethod
+    def _is_deferrable(purpose: str, override: bool | None) -> bool:
+        """この呼び出しがチャットのアイドル窓を待つべきか。
+
+        呼出側の明示 (``deferrable=``) が最優先。省略時のみ purpose の既定を見る。
+        """
+        if override is not None:
+            return override
+        return purpose in DEFERRABLE_AUX_PURPOSES
+
     def _lock_for(self, slot: int) -> asyncio.Lock:
         lock = self._slot_locks.get(slot)
         if lock is None:
@@ -351,6 +396,7 @@ class AuxClient:
         cache_prompt: bool = False,  # noqa: ARG002 - LocalClient 側で常時 ON
         response_format: dict | None = None,
         response_schema: type[BaseModel] | None = None,
+        deferrable: bool | None = None,
     ) -> dict:
         """ベースモデルで非ストリーミング生成し、OAI 互換 dict を返す。
 
@@ -374,6 +420,11 @@ class AuxClient:
             timeout if timeout is not None else self.resolve_effective_timeout(purpose)
         )
         queued_at = time.monotonic()
+        if self._is_deferrable(purpose, deferrable):
+            # ロックの **外** で待つ。ロックを持ったまま待つと、同じスロットの
+            # 他の背景タスクまで道連れに直列化される。
+            await wait_for_idle(_CHAT_YIELD_MAX_WAIT_SEC, purpose=purpose)
+        gate_token = activity_token()
         async with self._lock_for(slot):
             started = time.monotonic()
             queue_wait = started - queued_at
@@ -415,7 +466,24 @@ class AuxClient:
                         )
                         result = {"choices": [{"message": {"content": ""}}]}
             except (httpx.TimeoutException, LLMTimeoutError, TimeoutError) as e:
-                self._bump_calibrated_timeout(purpose)
+                # 競合由来の遅さを較正へ食わせない。チャットと重なると decode は
+                # 実測で 2 倍以上遅くなるので、その所要時間を「この purpose に
+                # 必要な予算」として学習すると、混雑が去っても膨れたままになる
+                # (2026-09-03 監査: summarize が 54.6→81.9→122.9→59.0→88.5s と振動)。
+                contended = was_contended_since(gate_token)
+                if contended:
+                    logger.info(
+                        "Aux timeout for purpose=%s overlapped chat generation; "
+                        "not calibrating (contention, not a budget shortfall)",
+                        purpose or "<unspecified>",
+                    )
+                else:
+                    self._bump_calibrated_timeout(purpose)
+                # 呼出側はこの例外を握って縮退するので、ここで記録しないと
+                # 「サイクルは成功、中身は全滅」が結末に残らない。
+                record_aux_failure(
+                    purpose, "timeout_contended" if contended else "timeout",
+                )
                 self._log_request(
                     messages, {}, time.monotonic() - started,
                     purpose=purpose, effective_timeout=effective_timeout,
@@ -428,7 +496,9 @@ class AuxClient:
                 ) from e
 
         elapsed = time.monotonic() - started
-        self._record_success(purpose, elapsed)
+        # 成功側も同じ理由で競合サンプルを弾く (p95 が競合時の遅さで押し上がる)。
+        if not was_contended_since(gate_token):
+            self._record_success(purpose, elapsed)
         self._log_request(
             messages, result, elapsed,
             purpose=purpose, effective_timeout=effective_timeout,
@@ -449,6 +519,7 @@ class AuxClient:
         response_format: dict | None = None,
         response_schema: type[BaseModel] | None = None,
         telemetry: dict | None = None,
+        deferrable: bool | None = None,
     ) -> dict:
         """JSON 出力を生成してパースする。パース不能時は空 dict を返す。
 
@@ -466,6 +537,7 @@ class AuxClient:
             purpose=purpose,
             response_format=response_format,
             response_schema=response_schema,
+            deferrable=deferrable,
         )
         content = _content_of(result)
         if not content.strip():

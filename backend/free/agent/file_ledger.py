@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections import OrderedDict, deque
 from contextvars import ContextVar
@@ -44,6 +45,8 @@ __all__ = [
     "record_current_file",
     "record_file",
     "references_recent_file",
+    "resolve_against_recent_dir",
+    "resolve_current_against_recent_dir",
     "reset",
 ]
 
@@ -133,6 +136,51 @@ def last_file_path(session_id: str) -> str:
     """このセッションで最後に触れたファイルのパス (無ければ空文字)。"""
     bucket = _ledger.get(session_id)
     return bucket[-1] if bucket else ""
+
+
+def resolve_against_recent_dir(session_id: str, path: str) -> str:
+    """裸のファイル名を「この会話で使っているディレクトリ」へ寄せる。
+
+    ``note2.md`` のようにディレクトリを伴わない名前は、そのまま渡すと
+    バックエンドプロセスの cwd (= リポジトリ直下) に落ちる。会話の文脈では
+    「直前に扱ったファイルと同じ場所」を指しているので、台帳の最新エントリの
+    親ディレクトリへ寄せる。
+
+    実インシデント 2026-09-03 ライブ監査 T06#7:
+    「note1.txt の内容を…別ファイル note2.md に保存して」で
+    ``E:\\tmp\\audit_20260903\\note1.txt`` を読んだ直後の書込みが
+    **リポジトリ直下の note2.md** になり、ユーザーの作業ツリーを汚した。
+    さらに次ターンは存在しない ``E:\\tmp\\audit_20260903\\note2.md`` を
+    読んだと答えた (台帳に相対パスのまま入るため突合もできない)。
+
+    寄せるのは **区切りを 1 つも含まない名前だけ**。``sub/a.txt`` のような
+    相対パスはユーザーが構造を書いているので触らない。
+    """
+    cleaned = (path or "").strip().strip("\"'")
+    if not cleaned or not session_id:
+        return path
+    if os.path.isabs(cleaned) or "/" in cleaned or "\\" in cleaned:
+        return path
+    recent = last_file_path(session_id)
+    if not recent:
+        return path
+    parent = os.path.dirname(recent)
+    if not parent:
+        return path
+    resolved = os.path.join(parent, cleaned)
+    logger.info(
+        "Resolved bare filename against the conversation's directory: "
+        "%s -> %s", cleaned, resolved,
+    )
+    return resolved
+
+
+def resolve_current_against_recent_dir(path: str) -> str:
+    """現在のリクエストの宛先で :func:`resolve_against_recent_dir` を掛ける。"""
+    session_id = _current_session.get()
+    if not session_id:
+        return path
+    return resolve_against_recent_dir(session_id, path)
 
 
 def reset(session_id: str | None = None) -> None:

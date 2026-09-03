@@ -279,14 +279,28 @@ async def _emit_verified_output(
     body = state.filtered_output
     if not body.strip():
         return
-    final_text, unresolved = await repair_if_violated(
+    # 修復は **もう 1 本のフル生成**。素の await にすると、その間 SSE フレームが
+    # 1 つも流れずフロントの chunk timeout に掛かる。実インシデント
+    # (2026-09-03 ライブ監査 T9#5「レイリー散乱を…3行で」): バックエンドは
+    # `tokens=96, elapsed=138.08s` で完走していたのに、検証・修復のあいだ無音に
+    # なり `Error: stream_timeout` で**完成した応答が捨てられた**。
+    # 生成ループ側は既に keepalive を撃っているので、残っていた無音区間はここだけ。
+    repair_task = asyncio.create_task(repair_if_violated(
         query=query,
         response=body,
         messages=messages,
         client=client,
         max_tokens=max_tokens,
         generation_params=generation_params,
-    )
+    ))
+    while True:
+        done, _ = await asyncio.wait(
+            {repair_task}, timeout=DEFAULT_KEEPALIVE_INTERVAL_SEC,
+        )
+        if repair_task in done:
+            break
+        yield sse.keepalive()
+    final_text, unresolved = repair_task.result()
     if unresolved is not None:
         final_text += length_disclosure_note(query, final_text)
     state.emitted_chars += len(final_text)

@@ -91,6 +91,26 @@ _FILE_PATH_ARGS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _resolve_bare_filename(name: str, kwargs: dict) -> None:
+    """裸のファイル名を、この会話で使っているディレクトリへ寄せる。
+
+    ``kwargs`` は **その場で書き換える** ので、実行にも台帳の記録にも
+    解決後のパスが載る (台帳が相対パスのままだと、次ターンの突合が
+    できず存在しないパスを「読んだ」と答える)。詳細は
+    ``file_ledger.resolve_against_recent_dir``。
+    """
+    arg_names = _FILE_PATH_ARGS.get(name)
+    if not arg_names:
+        return
+    from backend.free.agent.file_ledger import resolve_current_against_recent_dir
+
+    for arg in arg_names:
+        value = kwargs.get(arg)
+        if isinstance(value, str) and value.strip():
+            kwargs[arg] = resolve_current_against_recent_dir(value)
+            return
+
+
 def _record_touched_file(name: str, succeeded: bool, kwargs: dict) -> None:
     """ファイル操作のパスを file 台帳へ落とす。"""
     if not succeeded:
@@ -350,6 +370,10 @@ class ToolsRegistry:
             record_current(name, False, reason="invalid_args")
             _record_tool_issue(name, False, validation_error)
             return f"Error: {validation_error}"
+
+        # 裸のファイル名はプロセスの cwd ではなく「この会話のディレクトリ」へ。
+        # ログにも解決後のパスが出るよう、要約の前に掛ける。
+        _resolve_bare_filename(name, kwargs)
 
         logger.info("Executing tool: %s(%s)", name, _summarize_args_for_log(kwargs))
 

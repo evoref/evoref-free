@@ -22,6 +22,7 @@ from backend.free.llm._base_client import (
     make_retry_logger,
 )
 from backend.free.core.turn_text import split_last_user
+from backend.free.llm.generation_gate import chat_generation, gate_stream
 from backend.free.llm.model_metadata import ModelMetadata
 from backend.free.llm.utils import extract_content
 from backend.log_config import get_logger
@@ -159,6 +160,28 @@ STREAM_TOTAL_DEADLINE_MARGIN = 30.0
 #: ``context_size`` も不明で残量へクランプできなかった) ときに総壁時計の計算へ
 #: 使う仮の上限トークン数。
 STREAM_DEADLINE_FALLBACK_MAX_TOKENS = 4096
+
+
+def sync_request_timeout(
+    max_tokens: int | None, prompt_tokens: int | None = None, *, floor: float = 120.0,
+) -> float:
+    """非ストリーミング呼び出しの per-request 壁時計締め切り (秒)。
+
+    ストリーム経路の総壁時計締め切り (``max_tokens / STREAM_MIN_DECODE_TPS +
+    STREAM_TOTAL_DEADLINE_MARGIN``、prefill 分は ``STREAM_PREFILL_TOKENS_PER_SEC``)
+    と **同じ式** で組む。以前は非ストリームだけ共通クライアントの既定 read
+    (120 秒) で切れており、実機 (2026-09-03、Qwen3.8-27B) では 400 文字の回答が
+    120.8 秒 / 121.3 秒で 503 になった。健全な低速生成は切らず、ハングだけを
+    捕まえる上限であって所要時間の見積もりではない。``floor`` (既定 120 秒) を
+    下回らない。
+    """
+    tokens = int(max_tokens or 0) or STREAM_DEADLINE_FALLBACK_MAX_TOKENS
+    budget = tokens / STREAM_MIN_DECODE_TPS + STREAM_TOTAL_DEADLINE_MARGIN
+    if prompt_tokens:
+        budget += prompt_tokens / STREAM_PREFILL_TOKENS_PER_SEC
+    return max(float(floor), budget)
+
+
 #: ``context_size`` が不明なときに無制限要求へ被せる ``max_tokens`` の上限。
 #: 上限なしで投げると llama-server は n_ctx を使い切るまで生成する。
 UNBOUNDED_MAX_TOKENS_CAP = 4096
@@ -952,9 +975,9 @@ class LocalClient(BaseHTTPClient):
                      None または -1 で自動割当。
             request_timeout: 非ストリーミング呼び出し (``stream=False``) 専用の
                      per-request タイムアウト上書き (秒)。既定 (None) は
-                     ``self._http_timeout`` (120s)。大きな max_tokens を同期
-                     生成する呼出側 (例: staged クリエイトの単発ファイル生成)
-                     が、iGPU 等の低速環境で総生成時間が既定を超える場合に使う。
+                     :func:`sync_request_timeout` でペイロードの ``max_tokens`` と
+                     プロンプト長から導出する (ストリーム経路の総壁時計締め切りと
+                     同じ式、下限 ``self._http_timeout`` = 120s)。
                      ストリーミング (``stream=True``) には影響しない。
         """
         payload = self._build_payload(
@@ -974,9 +997,34 @@ class LocalClient(BaseHTTPClient):
             # TokenStream は str のイテレータのまま (既存の消費側は無改変)。
             # 切断を扱う消費側だけがループ後に ``.outcome`` を見る。
             outcome = StreamOutcome()
-            return TokenStream(self._generate_stream(payload, outcome), outcome)
-        else:
-            return await self._generate_sync(payload, request_timeout=request_timeout)
+            agen = self._generate_stream(payload, outcome)
+            if self._is_chat_slot(id_slot):
+                agen = gate_stream(agen)
+            return TokenStream(agen, outcome)
+        if request_timeout is None:
+            prompt_tokens = sum(
+                estimate_tokens(str(m.get("content") or ""))
+                for m in payload.get("messages") or []
+            )
+            request_timeout = sync_request_timeout(
+                payload.get("max_tokens"), prompt_tokens, floor=self._http_timeout,
+            )
+        if self._is_chat_slot(id_slot):
+            async with chat_generation():
+                return await self._generate_sync(payload, request_timeout=request_timeout)
+        return await self._generate_sync(payload, request_timeout=request_timeout)
+
+    def _is_chat_slot(self, id_slot: int | None) -> bool:
+        """この要求がユーザー応答パス (チャットスロット) かどうか。
+
+        スロットで判定するのは、``chat_slot`` を渡す呼出側が deliberative /
+        staged / long-form / 制約修復と広く散らばっていて、面ごとに宣言させると
+        必ず取りこぼすため。スロット指定は既に全経路で徹底されている。
+
+        ``_slots < 2`` の構成では ``chat_slot`` が -1 (自動割当) になり背景と
+        区別できない。その場合はゲートを立てない — 立てると背景が永久に待つ。
+        """
+        return self._slots >= 2 and id_slot == SLOT_CHAT
 
     async def count_tokens(self, text: str) -> int | None:
         """llama-server /tokenize でテキストの実トークン数を取得。
@@ -1526,12 +1574,21 @@ class LocalClient(BaseHTTPClient):
             return resp.json()
 
         try:
-            data = await async_retry_http_call(
-                _do_post,
-                request_label="LocalClient /v1/chat/completions (json_schema)",
-                retry_logger=retry_logger,
-                retryable_exceptions=GENERATION_RETRYABLE_EXCEPTIONS,
-            )
+            if self._is_chat_slot(id_slot):
+                async with chat_generation():
+                    data = await async_retry_http_call(
+                        _do_post,
+                        request_label="LocalClient /v1/chat/completions (json_schema)",
+                        retry_logger=retry_logger,
+                        retryable_exceptions=GENERATION_RETRYABLE_EXCEPTIONS,
+                    )
+            else:
+                data = await async_retry_http_call(
+                    _do_post,
+                    request_label="LocalClient /v1/chat/completions (json_schema)",
+                    retry_logger=retry_logger,
+                    retryable_exceptions=GENERATION_RETRYABLE_EXCEPTIONS,
+                )
         except Exception as e:
             raise _map_llama_error(e, host=self.url, label="json_schema") from e
         choices = data.get("choices") or [{}]

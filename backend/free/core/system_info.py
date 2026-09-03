@@ -290,7 +290,16 @@ def format_runtime_facts(cfg: dict, metadata: object | None = None) -> str:
 
     n_ctx = int(getattr(metadata, "n_ctx", 0) or 0)
     if n_ctx:
-        ctx_line = f"Context size (n_ctx, served): {n_ctx}"
+        # **モデルカードの公称最大で上書きさせない。** 実測 (2026-09-03 ライブ監査):
+        # ここが正しく 8192 を返しているターンで「コンテキスト長は 131072
+        # トークンです」と答えた (Qwen3 の公称最大)。served 値が唯一の実効値で
+        # あることを値のとなりに書く — 数字だけ置くと、モデルは自分の事前知識の
+        # ほうを信用する。
+        ctx_line = (
+            f"Context size (n_ctx, served): {n_ctx}  "
+            f"[this is the effective limit in use; the model architecture's "
+            f"advertised maximum is NOT what this deployment runs]"
+        )
     else:
         ctx_line = (
             f"Context size (n_ctx, configured): {llama.get('context_size', 'unknown')}"

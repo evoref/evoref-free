@@ -358,8 +358,68 @@ def _boundary_turns_answer(
     return "\n".join(lines)
 
 
+def _resolve_history_tz(get_config):
+    """``schedule.local_tz`` を tzinfo へ。解決できなければ UTC。
+
+    ``SleepTimeScheduler`` と同じ設定キーを見る (表示 tz を 2 系統に分けない)。
+    """
+    from datetime import timezone
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        name = ((get_config().get("schedule", {}) or {}).get("local_tz")
+                or "Asia/Tokyo")
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, Exception):
+        return timezone.utc
+
+
+def _local_session_stamp(started_at: str, tz) -> str:
+    """セッション開始時刻を **ローカル時刻 + 相対日ラベル** で描く。
+
+    保存値は UTC (``...T02:00:04+00:00``)。一方でモデルへ注入する現在時刻は
+    ローカル (JST)。この 2 つを並べると、モデルは日付の引き算を自分でやる羽目に
+    なり、実測では失敗する — 2026-09-03 のライブ監査では、**同じ日の 3.5 時間前**
+    のセッション群を「今日ではなく過去の別セッション」と断定した。しかも
+    JST 00:00-09:00 のセッションは UTC 日付が前日になるので、**引き算が正しくても
+    答えは間違う**。
+
+    相対ラベル (今日 / 昨日 / N日前) を添えて、算術そのものを不要にする。
+    パースできない値はそのまま返す (表示が壊れるより素の値のほうがまし)。
+    """
+    from datetime import datetime, timezone
+
+    from backend.utils import utc_now_dt
+
+    raw = str(started_at or "")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    if parsed.tzinfo is None:
+        # 履歴の保存値は UTC。naive を素で ``astimezone`` すると Python は
+        # **システムローカル** と解釈するため、表示 tz と組み合わせて日付が
+        # 1 日ずれる。内部時刻不変則 (UTC 固定) に合わせて明示的に付ける。
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    local = parsed.astimezone(tz)
+    today = utc_now_dt().astimezone(tz).date()
+    delta = (today - local.date()).days
+    if delta == 0:
+        label = "今日"
+    elif delta == 1:
+        label = "昨日"
+    elif delta > 1:
+        label = f"{delta}日前"
+    else:
+        label = "未来日付"
+    return f"{local.strftime('%Y-%m-%d %H:%M')} {label}"
+
+
 def _make_search_history(manager: HistoryManager):
     """search_history ツールハンドラを生成（HistoryManager をクロージャでバインド）"""
+    from backend.config import get_config
+
+    local_tz = _resolve_history_tz(get_config)
 
     def search_history(query: str, mode: str | None = None, limit: int = 10,
                        date_from: str | None = None, date_to: str | None = None,
@@ -437,7 +497,10 @@ def _make_search_history(manager: HistoryManager):
             elif session_id:
                 lines.append(SEARCH_HISTORY_CURRENT_SESSION_HEADER)
             for r in results:
-                header = f"[{r['started_at']}] mode={r['mode']} score={r['relevance_score']:.1f}"
+                header = (
+                    f"[{_local_session_stamp(r['started_at'], local_tz)}] "
+                    f"mode={r['mode']} score={r['relevance_score']:.1f}"
+                )
                 if r.get("summary"):
                     # summary はそのセッションの「最初のユーザ発話」そのもの。
                     # 同じ会話の後半で訂正されていてもここには反映されないため、
