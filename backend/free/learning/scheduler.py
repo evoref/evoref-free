@@ -288,6 +288,14 @@ class LearningScheduler:
         self._user_active_checker = None  # callable: () -> bool
         self._level2_runner = None  # Pro: Level2Runner インスタンス
 
+    def _prompt_rule_delete_gate(self, line: str) -> bool:
+        """Level 1 の delete を台帳の計数で裁く (f_04 §4.5.2)。"""
+        can = getattr(self.prompt_manager, "can_delete_rule_text", None)
+        if can is None:
+            return False
+        min_turns = int((self._config.get("prompt") or {}).get("rule_stats_min_turns", 200))
+        return bool(can(line, min_turns=min_turns))
+
     def _init_runtime_state(self, prompt_manager: SystemPromptManager) -> None:
         """ランタイム mutable state + パス + Level1Session 関連の初期化。"""
         self._cancelled = False
@@ -372,6 +380,9 @@ class LearningScheduler:
         self.eval_core_manager = eval_core_manager
         self._debug_logger = debug_logger
         self._evolver = PromptEvolver()
+        prompt_cfg = config.get("prompt") or {}
+        self._evolver.max_deletes_per_run = int(prompt_cfg.get("max_deletes_per_run", 1))
+        self._evolver.delete_gate = self._prompt_rule_delete_gate
 
         # 自己学習無効化フラグ (--no-learning 経由)。True の場合 Level 1/2 サイクルは
         # 全て早期 return し副作用なし。get_status は ``is_disabled: True`` を返す

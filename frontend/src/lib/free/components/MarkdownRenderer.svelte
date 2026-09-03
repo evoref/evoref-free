@@ -10,6 +10,7 @@
 	 *
 	 * Free 専用。Pro の CodeMirrorEditor とは依存独立 (Pro/Free 共通 import なし)。
 	 */
+	import { untrack } from 'svelte';
 	import { marked, type Token } from 'marked';
 	import DOMPurify from 'dompurify';
 	import CodeViewer from './CodeViewer.svelte';
@@ -61,7 +62,58 @@
 	// コードブロックを「エディタに出力」プレースホルダに置換する。
 	let { content, suppressCode = false }: { content: string; suppressCode?: boolean } = $props();
 
-	let tokens = $derived(marked.lexer(content ?? ''));
+	/**
+	 * 描画をフレームへ合流させる。
+	 *
+	 * ブロック単位キャッシュ (上記) は **確定したブロック** の再描画を消すが、
+	 * 伸び続ける末尾ブロックは毎回 raw が変わるのでキャッシュに乗らず、
+	 * `marked.lexer` も毎回全文を舐める。SSE トークンが来るたびに描画すると
+	 * この 2 つが 1 トークンごとに走る。
+	 *
+	 * 実測 (2026-09-03 ライブ監査、ストリーミング中): 200ms タイマーの遅延が
+	 * 700-840ms、完了直後は 0-1ms。メインスレッドの約 8 割がここで潰れており、
+	 * 12 秒の sleep を挟む CDP evaluate が 45 秒の上限を超えた。投機デコードは
+	 * トークンをまとめて吐く (draft acceptance 2.5 前後) ので、山は実際に立つ。
+	 *
+	 * 1 フレームに 1 回へ丸めれば、描画回数はトークン数ではなく経過時間に比例する。
+	 * 表示は人間の知覚上変わらない (60fps を超える更新は見えない)。
+	 */
+	// 初回は **同期** に描く。遅らせてよいのは「伸びている途中の再描画」だけで、
+	// 最初の 1 枚まで 1 フレーム遅らせると、確定済みの過去メッセージまで一瞬
+	// 空になる (テストのように同期で内容を読む経路も壊れる)。
+	// `untrack` は「初期値だけを取る」意図の明示 (以降の更新は下の $effect が拾う)。
+	let renderSource = $state(untrack(() => content) ?? '');
+	let pendingFrame = 0;
+
+	const schedule =
+		typeof requestAnimationFrame === 'function'
+			? requestAnimationFrame
+			: (cb: FrameRequestCallback) => setTimeout(() => cb(0), 16) as unknown as number;
+	const unschedule =
+		typeof cancelAnimationFrame === 'function'
+			? cancelAnimationFrame
+			: (id: number) => clearTimeout(id);
+
+	$effect(() => {
+		const next = content ?? '';
+		if (next === renderSource) return;
+		// 既にフレームを予約済みなら、そのフレームが **最新の** content を拾う。
+		// ここで cancel/再予約すると、連続更新中に永久に発火しない危険がある。
+		if (pendingFrame !== 0) return;
+		pendingFrame = schedule(() => {
+			pendingFrame = 0;
+			renderSource = content ?? '';
+		});
+	});
+
+	$effect(() => () => {
+		if (pendingFrame !== 0) {
+			unschedule(pendingFrame);
+			pendingFrame = 0;
+		}
+	});
+
+	let tokens = $derived(marked.lexer(renderSource));
 
 	function renderNonCode(token: Token): string {
 		// 1 トークンずつ HTML 化。リンク参照定義 ([id]: url) は通常チャット応答では稀。

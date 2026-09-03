@@ -21,7 +21,10 @@ from backend.free.core.intent_vocab import (
     NUMBER_LITERAL_RE,
     REFERENTIAL_WRITE_TARGET_RE,
 )
-from backend.free.core.locale_patterns import is_en_locale, select_locale_variant
+from backend.free.core.locale_patterns import (
+    has_japanese_script,
+    matches_either,
+)
 from backend.free.core.session_mode import is_create_mode
 from backend.free.core.response_arithmetic import find_arithmetic_contradictions
 from backend.free.core.text_quality import (
@@ -166,6 +169,12 @@ _CREATE_FAILURE_REPORT_EXCLUDE_RE_EN = re.compile(
     r"|^\s*please\b",
     re.IGNORECASE,
 )
+
+#: JA / EN 双方を **locale に関わらず** 評価する union
+#: (``_detect_correction_lexical`` の 1b。除外ガードも同時に union する)。
+CREATE_FAILURE_REPORT_PATTERNS_ALL = [
+    *CREATE_FAILURE_REPORT_PATTERNS, *CREATE_FAILURE_REPORT_PATTERNS_EN,
+]
 
 # アシスタント自身による前ターンの撤回。ユーザーの字句ではなく**自分の出力**を
 # 見るため、CORRECTION_PATTERNS が抱えていた偽陽性 (話題語の学習・一般語法との
@@ -312,7 +321,7 @@ def classify_correction_target(query: str) -> str:
     # 除外しない。編集依頼の体裁でも中身は訂正であり、除外すると本物の訂正を
     # 取りこぼす (既存テスト test_same_target_weak_pattern_detected の実例)。
     if REFERENTIAL_WRITE_TARGET_RE.search(query) and not any(
-        p.search(query) for p in WEAK_CORRECTION_PATTERNS
+        p.search(query) for p in WEAK_CORRECTION_PATTERNS_ALL
     ):
         return "not_correction"
     return "assistant"
@@ -329,6 +338,14 @@ WEAK_CORRECTION_PATTERNS = [
 WEAK_CORRECTION_PATTERNS_EN = [
     re.compile(r"\bnot\s+\w+\s+but\b|\binstead\s+of\b", re.IGNORECASE),
     re.compile(r"\bit'?s\s+.{0,15}\bagain\b", re.IGNORECASE),
+]
+
+#: JA / EN 双方を **locale に関わらず** 評価する union。消費側は 2 つあり、
+#: 以前は ``classify_correction_target`` が JA 固定・``_detect_correction_lexical``
+#: が locale 選択という **食い違った参照** をしていた。同じ弱訂正語彙で
+#: 「訂正ではない」の打ち消しと「訂正である」の確定が別々の集合を見ていたことになる。
+WEAK_CORRECTION_PATTERNS_ALL = [
+    *WEAK_CORRECTION_PATTERNS, *WEAK_CORRECTION_PATTERNS_EN,
 ]
 
 # ── 記録との食い違いの指摘 (2 条件の AND) ────────────────────────────
@@ -466,12 +483,18 @@ def cites_record_divergence(query: str) -> bool:
 
     誤りを名指す語を含まない訂正を拾うための 2 条件 AND
     (:data:`_USER_STATED_REF_RE` / :data:`_RECORD_DIVERGENCE_RE` の説明を参照)。
+
+    JA / EN は locale で切り替えず両方見るが、union は **AND の外側** で取る —
+    片側ずつ or にすると「日本語の (a) + 英語の (b)」のような跨ぎ一致が成立し、
+    2 条件 AND で誤検出を抑えている設計 (同上) が緩む。
     """
-    stated = select_locale_variant(_USER_STATED_REF_RE, _USER_STATED_REF_RE_EN)
-    diverge = select_locale_variant(
-        _RECORD_DIVERGENCE_RE, _RECORD_DIVERGENCE_RE_EN,
+    return bool(
+        (_USER_STATED_REF_RE.search(query) and _RECORD_DIVERGENCE_RE.search(query))
+        or (
+            _USER_STATED_REF_RE_EN.search(query)
+            and _RECORD_DIVERGENCE_RE_EN.search(query)
+        ),
     )
-    return bool(stated.search(query) and diverge.search(query))
 
 # 応答の失敗マーカー (meta_cognitive の最終応答フォーマット "- [failed] ...")
 _FAILED_MARKER_RE = re.compile(r"(?:^|\n)\s*-\s*\[failed\]", re.IGNORECASE)
@@ -1095,9 +1118,15 @@ class FeedbackCollector:
             )
             return False
 
-        if is_en_locale():
-            return bigram_cosine(prev, curr) >= REPHRASE_THRESHOLD_EN
-        return content_bigram_cosine(prev, curr) >= REPHRASE_THRESHOLD
+        # 指標と閾値は **比べる発話そのものの字種** で選ぶ (GUI locale ではない)。
+        # 内容語の抽出はひらがなを機能語として落とす実装なので、英語には効かず
+        # スケールが変わる = 閾値も別物になる。locale で選ぶと、既定 'ja' のまま
+        # 英語で打った 2 発話に日本語用の 0.70 が掛かり、逆に locale='en' の
+        # まま日本語で打つと内容語抽出が効かず生コサインの 0.5 で測られる —
+        # どちらも言い直し判定 (= Level 1 の選択圧) を静かに歪める。
+        if has_japanese_script(prev) or has_japanese_script(curr):
+            return content_bigram_cosine(prev, curr) >= REPHRASE_THRESHOLD
+        return bigram_cosine(prev, curr) >= REPHRASE_THRESHOLD_EN
 
     def _apply_self_retraction(self, signals, response: str) -> None:
         """アシスタント自身の撤回を検出し、**直前ターン**を failed へ落とす。
@@ -1264,18 +1293,23 @@ class FeedbackCollector:
         # 1b. create モードの実行結果報告。訂正対象 (直前ターン) が無い最初の
         # ターンでは新規の質問/依頼である可能性が高く、文末が新規依頼の完結形
         # なら報告ではなく仕様/質問の可能性が高いため、いずれも除外する。
-        exclude_re = select_locale_variant(
-            _CREATE_FAILURE_REPORT_EXCLUDE_RE, _CREATE_FAILURE_REPORT_EXCLUDE_RE_EN,
-        )
-        failure_patterns = select_locale_variant(
-            CREATE_FAILURE_REPORT_PATTERNS, CREATE_FAILURE_REPORT_PATTERNS_EN,
-        )
+        # 報告語彙も除外ガードも JA / EN 両方を locale に依らず見る。片側だけだと
+        # 「locale='en' のまま日本語で "動かない" と報告した」ターンが訂正として
+        # 数えられず、create の経験に訂正シグナルがほぼ発生しない状態
+        # (2026-07-18 に本語彙を足した動機そのもの) へ逆戻りする。
+        # 除外ガードを同時に union するのが要点 — 語彙だけ広げると、反対言語の
+        # 新規依頼 ("Please make the button not work when hovered") が
+        # 文頭アンカーに掛からないまま報告として拾われる。
         if (
             is_create_mode(mode)
             and self._prev_query is not None
-            and not exclude_re.search(query.strip())
+            and not matches_either(
+                query.strip(),
+                _CREATE_FAILURE_REPORT_EXCLUDE_RE,
+                _CREATE_FAILURE_REPORT_EXCLUDE_RE_EN,
+            )
         ):
-            for pattern in failure_patterns:
+            for pattern in CREATE_FAILURE_REPORT_PATTERNS_ALL:
                 if pattern.search(query):
                     return query, "hardcoded"
 
@@ -1290,9 +1324,8 @@ class FeedbackCollector:
             return query, "prev_failed"
 
         # 3. 同一出力先パスの再指定 + 弱い訂正語 (「〜ではなく」等)
-        weak_patterns = select_locale_variant(WEAK_CORRECTION_PATTERNS, WEAK_CORRECTION_PATTERNS_EN)
         if self._same_target_path(query) and any(
-            p.search(query) for p in weak_patterns
+            p.search(query) for p in WEAK_CORRECTION_PATTERNS_ALL
         ):
             return query, "same_target"
 

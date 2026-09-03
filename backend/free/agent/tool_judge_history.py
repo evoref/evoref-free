@@ -11,13 +11,12 @@ import re
 
 from backend.free.agent.tool_judge_args import quoted_spans
 from backend.free.core.intent_vocab import (
-    HISTORY_KEYWORDS,
-    HISTORY_KEYWORDS_EN,
     PAST_RECALL_TAIL_RE,
     PROXIMAL_RECALL_KEYWORDS,
     has_history_recall_keyword,
+    matched_history_keywords,
 )
-from backend.free.core.locale_patterns import is_en_locale, select_locale_variant
+from backend.free.core.locale_patterns import has_japanese_script
 
 # 時系列順序指定を含む履歴クエリの検出 (「一番最初に」「最後に」等)。
 # aux が合成する小さい limit (例: limit=1) は字句スコア最上位への
@@ -40,7 +39,14 @@ _ORDER_QUERY_SCAFFOLD_RE = re.compile(
     r"今までの(?:会話|やり取り)|今日の(?:追加分の)?会話|今回の(?:追加分の)?会話"
     r"|前回の会話|この会話|このやり取り|その会話"
     r"|過去の(?:会話|やり取り)|以前の会話|会話履歴"
-    r"|一番最初|一番最後|何番目|何回目",
+    r"|一番最初|一番最後|何番目|何回目"
+    # 「何 + 助数詞」は数量を問う骨組みであって話題語ではない。ラン抽出の前に
+    # 落とさないと、``何`` だけがストップワードとして剥がれて助数詞が後続の
+    # 動詞語幹と融合し、実在しない語が検索クエリに載る (実インシデント
+    # 2026-09-03 ライブ監査 T01#6: 「猫は何匹飼っているか覚えていますか？」が
+    # ``匹飼`` になり ``No results found for: 匹飼``。話題語の ``猫`` は
+    # 1 文字のため落ちており、残ったのは融合語だけだった)。
+    r"|何[匹個枚本台人回冊杯件歳番度種文字行]",
 )
 # 内容ラン (漢字 / カタカナ / ラテン / 数字。ひらがなの助詞・活用語尾は自然に
 # 脱落する)。
@@ -67,6 +73,11 @@ _ORDER_QUERY_CONTENT_RE = re.compile(
     r"(?:(?![がはをにへとでのもやかねよたてだん])[ぁ-ん][一-鿿゠-ヿ々〆]+)*",
 )
 
+#: 格助詞。1 文字ランの直後に来れば、そのランは動詞語幹ではなく名詞
+#: (話題語) と見なす。``_reduce_ordered_history_query`` の 1 文字語
+#: フォールバックで、どれを採るかの決定に使う。
+_CASE_PARTICLES = frozenset("はがをにへとのも")
+
 #: 1 文字の内容ランは検索語として意味を持たない (良 / 久 / 泣 / 人 / 勧)。
 #: 照合側が 2 文字未満を捨てるため効きもしないのに、クエリ文字列だけを膨らませる
 #: (実インシデント 2026-08-16 ライブ監査 ターン5:
@@ -80,6 +91,10 @@ _ORDER_QUERY_STOPWORD_RUNS = frozenset({
     "昨日", "明日", "昨夜", "今朝", "先日", "最近", "先週", "先月",
     "問題", "質問", "内容", "話題", "話", "何", "誰", "私", "貴方", "君", "僕",
     "俺", "覚", "番目", "回目", "先",
+    # 位置の骨組み。``先`` / ``前回`` / ``以前`` は登録済みだったが裸の ``前``
+    # (「前の会話で車の話をしましたか？」) だけが漏れており、1 文字語の
+    # フォールバックで話題語 ``車`` より先に選ばれてしまう。
+    "前", "後",
     # 明示的な履歴検索依頼の骨組み (「過去の会話で〜を探して/調べて」)
     "過去", "履歴", "探", "検索", "調", "教", "知",
     # 「もう一度」「〜させた」等の依頼骨組み (2026-08-05 追加)。
@@ -89,6 +104,10 @@ _ORDER_QUERY_STOPWORD_RUNS = frozenset({
     # (2026-08-30 ライブ監査: ``箇条書 推測`` / ``デプロイ 説明`` /
     # ``周辺 観光地 3つ挙`` の 3 例が揃って 0 件だった)。
     "説明", "箇条書", "推測", "挙", "列挙", "復唱",
+    # 同じく出力の指図。「これまでの会話を要約してください。」が ``要約`` を
+    # 検索語にして空振りしていた (2026-09-03 ライブ監査 T07#9)。``説明`` と
+    # 同じ扱いで、話題語ではなく指図として落とす。
+    "要約", "整理",
 })
 
 #: 「3つ」「5個」のような **個数だけ** の語。指図の一部であって話題語ではない。
@@ -213,7 +232,13 @@ def _reduce_ordered_history_query(query: str) -> str:
     quoted = quoted_search_terms(query)
     if quoted:
         return " ".join(quoted)
-    en = is_en_locale()
+    # 縮約アルゴリズムは **クエリ自身の字種** で選ぶ (GUI locale ではない)。
+    # 日本語版は「漢字/カタカナのランを切り出し、ひらがなの助詞・活用語尾を
+    # 落とす」文字クラス方式、英語版は「空白トークン + ストップワード」方式で、
+    # 前提が言語ごとに違うため union できない (両方走らせても意味を成さない)。
+    # locale で選ぶと、既定 'ja' のまま英語で打ったクエリに日本語の文字クラス
+    # 抽出が掛かり、"the" / "what" が内容語として search_history へ載る。
+    en = not has_japanese_script(query)
     if en:
         scaffold_re, content_re, stopwords = (
             _ORDER_QUERY_SCAFFOLD_RE_EN, _ORDER_QUERY_CONTENT_RE_EN,
@@ -226,7 +251,9 @@ def _reduce_ordered_history_query(query: str) -> str:
         )
     stripped = scaffold_re.sub(" ", query)
     terms: list[str] = []
-    for run in content_re.findall(stripped):
+    noun_singles: list[str] = []
+    for m in content_re.finditer(stripped):
+        run = m.group(0)
         # 日本語はランの融合を解いてから照合する (英語は空白で切れており不要)。
         term = run if en else _strip_stopword_affixes(run)
         if not term or term.lower() in stopwords:
@@ -235,22 +262,47 @@ def _reduce_ordered_history_query(query: str) -> str:
         # (:data:`_ORDER_QUERY_MIN_TERM_LEN`)。英語側は元から空白区切りで
         # 1 文字語がほぼ出ないため、日本語だけに掛ける。
         if not en and len(term) < _ORDER_QUERY_MIN_TERM_LEN:
+            # 直後が格助詞なら名詞、活用語尾なら動詞語幹と見なす。辞書を使わずに
+            # 話題語だけを拾うための識別 (「飼っている猫について」で ``飼`` では
+            # なく ``猫``)。動詞語幹しか無いクエリ (「一番最後に聞いた質問は？」)
+            # は話題語ゼロなので、従来どおり生クエリへフォールバックさせる。
+            if stripped[m.end():m.end() + 1] in _CASE_PARTICLES:
+                noun_singles.append(term)
             continue
         if not en and _ORDER_QUERY_COUNT_ONLY_RE.match(term):
             continue
         terms.append(term)
+    # 2 文字以上の内容語が 1 つも残らなかった場合に限り、名詞と判定した
+    # 1 文字語の **先頭 1 つ** を検索語に採る。日本語の話題語には 1 文字漢字が多く
+    # (猫 / 犬 / 車 / 本 / 父 / 色 / 山)、これを落とすと内容語ゼロになり
+    # **生クエリ全文へのフォールバック** が起きる — この関数が防ぐために
+    # 存在する当の失敗である (実インシデント 2026-09-03 ライブ監査:
+    # 「前の会話で車の話をしましたか？」が発話文まるごとで 0 件)。
+    # 複数を並べず 1 つに絞るのは、照合側で 1 文字語が効くのが
+    # ``query in text`` の完全部分文字列一致 (単一語) 経路だけだから
+    # (``history.history_manager._text_matches_query``)。空白区切りの
+    # 複数語にすると語彙重なり経路へ入り、そこは 2 文字未満を捨てるため
+    # 全語が消えて必ず不一致になる。
+    if not terms and noun_singles:
+        terms = noun_singles[:1]
     reduced = " ".join(terms).strip()
-    return reduced if len(reduced) >= 2 else query
+    return reduced if reduced else query
 #: 進行中の会話を指す近接リコール語。これらは「今のセッションの中」を指すので、
 #: 現在セッションを除外した search_history では構造的に当たらない。
 def _only_proximal_recall_keywords(query: str) -> bool:
     """履歴参照語が近接リコール語だけか (純粋関数)。
 
     長距離リコール語 (「以前」「最初に」「覚えて」等) が 1 つでもあれば False。
+
+    語彙は JA / EN 双方を locale に関わらず見る。片側だけだと "just now" が
+    近接語と認識されず、現在セッションを除外した検索が抑止されないまま撃たれる
+    (:data:`PROXIMAL_RECALL_KEYWORDS` は元から日英まとめて持っており、
+    照合側だけが locale で片寄っていた)。照合は
+    ``intent_vocab.matched_history_keywords`` に寄せる — ここは素の
+    ``kw in q_lower`` で、``_keyword_union`` が ASCII に付ける英字境界を
+    持たない食い違った複製だった (``before`` が "beforehand" に当たる)。
     """
-    q_lower = query.lower()
-    keywords = select_locale_variant(HISTORY_KEYWORDS, HISTORY_KEYWORDS_EN)
-    matched = [kw for kw in keywords if kw in q_lower]
+    matched = matched_history_keywords(query)
     if not matched:
         return False
     return all(kw in PROXIMAL_RECALL_KEYWORDS for kw in matched)
@@ -307,12 +359,14 @@ def asks_about_past_conversation(query: str) -> bool:
 
 
 def _has_history_recall_keywords(query: str) -> bool:
-    """明示的な履歴参照キーワード (``HISTORY_KEYWORDS``) を locale に従って含むか。
+    """明示的な履歴参照キーワード (``HISTORY_KEYWORDS``) を含むか。
 
     実体は ``core.intent_vocab.has_history_recall_keyword`` (router の層分類と
-    同じ照合)。こちらは locale で JA / EN の片方だけを見る。
+    同じ照合)。**router と同じく JA / EN 両方を見る** — 以前はこちらだけ locale
+    で片寄っており、同じ語彙・同じ関数を通しながら層分類と強制発火の判定が
+    食い違っていた。
     """
-    return has_history_recall_keyword(query, locale_aware=True)
+    return has_history_recall_keyword(query)
 #: 会話に既出の対象を指す連体詞 + 名詞。「今日」「現在」のような直示語は
 #: 含めない (それらは実測して答えるのが正しい)。
 _ANAPHORIC_REFERENCE_RE = re.compile(

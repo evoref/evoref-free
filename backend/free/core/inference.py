@@ -736,6 +736,64 @@ def _normalize_for_frame_dedup(text: str) -> str:
     return re.sub(r"\s+", "", stripped)
 
 
+def _drop_frames_already_in_window(
+    history: list[dict] | None,
+    semmem_block: str | None,
+    rag_chunks: list[str] | None,
+    rag_scored_chunks: list[tuple[str, float, str]] | None,
+) -> tuple[str | None, list[str] | None, list[tuple[str, float, str]] | None]:
+    """窓 (履歴) にまだ載っている発話と同じ本文を参考枠から落とす (c_02 §6.3)。
+
+    STM は窓から押し出される前のターンも吸収するため、ユーザーがさっき言った
+    文がそのまま ``[関連する記憶]`` / ``[参考情報]`` に戻ってくる。窓に本文が
+    あるなら枠に再掲しても根拠は増えない。短い行 (挨拶・相槌) は偶然一致
+    しやすいので対象にしない。
+    """
+    if not history or not (semmem_block or rag_chunks or rag_scored_chunks):
+        return semmem_block, rag_chunks, rag_scored_chunks
+    seen: set[str] = set()
+    for msg in history:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, str):
+            continue
+        for line in content.splitlines():
+            key = _normalize_for_frame_dedup(line)
+            if len(key) >= _WINDOW_DEDUP_MIN_CHARS:
+                seen.add(key)
+    if not seen:
+        return semmem_block, rag_chunks, rag_scored_chunks
+    dropped = 0
+
+    def _is_dup(text: str) -> bool:
+        nonlocal dropped
+        if _normalize_for_frame_dedup(text) in seen:
+            dropped += 1
+            return True
+        return False
+
+    if semmem_block:
+        lines = semmem_block.splitlines()
+        kept = [ln for ln in lines if not (ln.lstrip().startswith("-") and _is_dup(ln))]
+        if not any(ln.lstrip().startswith("-") for ln in kept):
+            semmem_block = None
+        elif len(kept) != len(lines):
+            semmem_block = "\n".join(kept)
+    if rag_chunks:
+        rag_chunks = [c for c in rag_chunks if not _is_dup(c)] or None
+    if rag_scored_chunks:
+        rag_scored_chunks = [e for e in rag_scored_chunks if not _is_dup(e[2])] or None
+    if dropped:
+        logger.info(
+            "build_messages: dropped %d reference line(s) still present in the "
+            "conversation window", dropped,
+        )
+    return semmem_block, rag_chunks, rag_scored_chunks
+
+
+#: 窓との重複判定にかける最短長 (正規化後の文字数)。
+_WINDOW_DEDUP_MIN_CHARS = 12
+
+
 def _drop_rag_duplicates_of_semmem(
     semmem_block: str | None,
     rag_chunks: list[str] | None,
@@ -1061,6 +1119,31 @@ _DYN_BLOCK_RESERVE = 1600
 #: 残予算を丸ごと食って履歴が 0 になるため、割合でも抑える。
 _DYN_BLOCK_MAX_SHARE = 0.4
 
+
+def _dyn_block_reserve() -> int:
+    """動的ブロックの固定予約。config があれば **各ブロック上限の合計** から導く。
+
+    予算関数の一本化 (c_02 §6.3): 固定値 :data:`_DYN_BLOCK_RESERVE` は config が
+    読めない経路のフォールバックに残す。値そのものではなく「上限の合計」を
+    予約する点が要点で、few-shot コアが静的接頭辞へ移ると
+    ``prompt.fewshot_dynamic_max_tokens`` を下げるだけで履歴予算が広がる。
+    """
+    try:
+        from backend.free.core.prompt_budget import dynamic_reserve
+
+        return int(dynamic_reserve(get_config()))
+    except Exception:
+        return _DYN_BLOCK_RESERVE
+
+
+def _fewshot_token_cap() -> int:
+    """query 依存 few-shot ブロックの上限 (``prompt.fewshot_dynamic_max_tokens``)。"""
+    try:
+        value = (get_config().get("prompt") or {}).get("fewshot_dynamic_max_tokens")
+    except Exception:
+        return _FEWSHOT_TOKEN_CAP
+    return int(value) if isinstance(value, int) and value >= 0 else _FEWSHOT_TOKEN_CAP
+
 #: few-shot ブロックの token 上限。無上限だとセッション中に数千 token へ膨張し
 #: (2026-07-15: 2739 tokens → 3 回全ドロップ = 学習効果ゼロ、通常時も履歴予算を
 #: 圧迫)、all-or-nothing ドロップで無意味化する。上限内へ例単位で切り詰める。
@@ -1132,7 +1215,7 @@ def _select_fewshot_block(
     block = fewshot_block.lstrip("\n")
     if not block:
         return None, remaining
-    budget = min(remaining, _FEWSHOT_TOKEN_CAP)
+    budget = min(remaining, _fewshot_token_cap())
     cost = _estimate_tokens(block)
     if cost > budget:
         truncated = _truncate_fewshot_to_budget(block, budget)
@@ -1397,6 +1480,9 @@ def build_messages(
         )
     )
     # 枠をまたいだ同一本文の二重掲載を落とす (両枠が揃うのはここだけ)。
+    semmem_block, rag_chunks, rag_scored_chunks = _drop_frames_already_in_window(
+        history, semmem_block, rag_chunks, rag_scored_chunks,
+    )
     rag_chunks, rag_scored_chunks = _drop_rag_duplicates_of_semmem(
         semmem_block, rag_chunks, rag_scored_chunks,
     )
@@ -1419,8 +1505,9 @@ def build_messages(
     #      ときに予約が空回りして動的ブロックを痩せさせないため。
     # 動的ブロックは確定後の残りを受け取る。これで RAG が 0 件でも 5 件でも
     # 履歴の切り落とし位置は変わらない。
+    dyn_reserve = _dyn_block_reserve()
     dyn_floor = min(
-        _DYN_BLOCK_RESERVE, int(max(0, remaining) * _DYN_BLOCK_MAX_SHARE),
+        dyn_reserve, int(max(0, remaining) * _DYN_BLOCK_MAX_SHARE),
     )
     history_budget = min(
         working_max_tokens,
@@ -1478,7 +1565,7 @@ def build_messages(
             "dyn_reserve=%d) — history is trimmed twice; consider lowering "
             "memory.working_max_tokens to %d or less",
             working_max_tokens, history_budget, context_size, generation_reserve,
-            sys_tokens, _DYN_BLOCK_RESERVE, history_budget,
+            sys_tokens, dyn_reserve, history_budget,
         )
     if len(history) > 1 and history_budget <= reserved_latest:
         logger.warning(

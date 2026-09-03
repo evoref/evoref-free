@@ -132,15 +132,55 @@ def _redact_string(value: str) -> str:
 redact_string = _redact_string
 
 
+#: プライベートセッションでのみ伏せる、**ユーザー発話そのもの** を運ぶキー。
+#:
+#: ``private=True`` の契約は「LTM/SemMem/履歴ディスク永続化に書き込まない」
+#: (``api.schemas.ChatRequest.private``) だが、ログはその経路に入っていない
+#: ため素通りしていた。実インシデント (2026-09-03 ライブ監査 T16):
+#: private セッションで話した口座番号とパスワードのヒントが
+#: ``local/logs/backend.log`` と ``local/logs/debug/rag_*.jsonl`` に平文で
+#: 残った。記憶ストアには 1 件も入っていない (契約は守られている) のに、
+#: ログにだけ残るという食い違いだった。
+#:
+#: 平常時に伏せると調査ができなくなるので、**private のときだけ** 効かせる。
+_PRIVATE_CONTENT_KEYS_LOWER: frozenset[str] = frozenset(
+    {
+        "query",
+        "message",
+        "user_message",
+        "prompt",
+        "content",
+        "text",
+        "preview",
+        "statement",
+        "response_preview",
+    }
+)
+
+#: private セッションでユーザー発話を伏せたことを示す印。``[REDACTED]`` と
+#: 区別できるようにして、「秘密が混ざっていた」ではなく「private だから
+#: 伏せた」ことがログから読めるようにする。
+_PRIVATE_MASK = "[PRIVATE]"
+
+
 def _redact_value(key: str, value: Any) -> Any:
     """key / value の組に対して redaction を適用する。
 
     ``key`` が ``_REDACT_KEYS_LOWER`` にマッチする場合は値全体を ``[REDACTED]``
     に置換、それ以外は文字列内の Bearer / API キー / メールパターンのみ
     マスクする。dict / list はキー単位で再帰的に走査する。
+
+    プライベートセッション (``trace_context.is_private()``) では、ユーザー
+    発話を運ぶキー (``_PRIVATE_CONTENT_KEYS_LOWER``) も ``[PRIVATE]`` へ
+    伏せる。
     """
     if key.lower() in _REDACT_KEYS_LOWER and value is not None:
         return _REDACTED
+    if key.lower() in _PRIVATE_CONTENT_KEYS_LOWER and value is not None:
+        from backend.trace_context import is_private
+
+        if is_private():
+            return _PRIVATE_MASK
     if isinstance(value, str):
         return _redact_string(value)
     if isinstance(value, Mapping):

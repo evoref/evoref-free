@@ -72,6 +72,12 @@ def _make_rotating_handler(
         )
         return None
     handler.setFormatter(formatter)
+    # private セッションの発話は **出力の直前** で伏せる。発話を書く logger
+    # 呼び出しは router / tool_call_judge / search_pipeline / self_rag_judge /
+    # bm25_retriever / injector / deliberative など十数箇所に散っており、
+    # 個別修正は必ず漏れる。子ロガーから伝播した record も必ず通る handler
+    # 側に付ける (logger の filter は伝播 record を通らない)。
+    handler.addFilter(PrivateContentFilter())
     if level is not None:
         handler.setLevel(level)
     return handler
@@ -115,6 +121,86 @@ def _log_max_bytes(develop_level: DevelopLevel) -> int:
     if develop_level == "off":
         return _LOG_MAX_BYTES_DEFAULT
     return _LOG_MAX_BYTES_DEVELOP
+
+
+#: private セッションの発話をログ行から伏せるときの印。
+PRIVATE_MASK = "[PRIVATE]"
+
+#: 伏せる対象とみなす最短の断片長。
+#:
+#: ログ側は 3 通りの形で発話を書く: そのまま / ``query[:80]`` のように切り詰め /
+#: **発話から抽出した値だけ** (``Quantity grounding injected: 口座番号 =
+#: 5551234509876``)。接頭辞照合では 3 つ目が漏れるため、発話との **共通部分
+#: 文字列** で照合する。短すぎる断片まで消すと無関係な行を壊すので下限を置く。
+#: private ターンの間だけ効くので、多少過剰に伏せる方が安全側。
+_PRIVATE_MIN_FRAGMENT = 8
+
+
+class PrivateContentFilter(logging.Filter):
+    """private セッションのユーザー発話を、出力の直前で ``[PRIVATE]`` へ伏せる。
+
+    ``ChatRequest.private`` の契約は「LTM/SemMem/履歴ディスク永続化に書き込ま
+    ない」だが、**ログはその経路に入っていない**ため素通りしていた。実測
+    (2026-09-03 ライブ監査 T16): private セッションで話した口座番号が
+    ``local/logs/backend.log`` に平文で残り、うち 2 行は ``[INFO]``
+    (develop モード無しの通常運用でも出る)。
+
+    発話を書く logger 呼び出しは router / tool_call_judge / search_pipeline /
+    self_rag_judge / bm25_retriever / injector / deliberative など十数箇所に
+    散っており、個別に直すと必ず漏れる。**出力の合流点** (handler の filter)
+    で、そのターンの発話文字列を含む行を一括して伏せる。
+
+    ログ側は切り詰めて書くので、完全一致ではなく **長い方から接頭辞** を
+    探して置換する (``query[:80]`` / ``query[:60]`` / ``query[:40]`` の
+    いずれにも当たる)。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        from backend.trace_context import get_private_texts, is_private
+
+        if not is_private():
+            return True
+        secrets = [t for t in get_private_texts() if len(t) >= _PRIVATE_MIN_FRAGMENT]
+        if not secrets:
+            return True
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - 整形不能な record は触らない
+            return True
+        masked = message
+        for secret in secrets:
+            masked = _mask_private(masked, secret)
+        if masked != message:
+            record.msg = masked
+            record.args = ()
+        return True
+
+
+def _mask_private(message: str, secret: str) -> str:
+    """``message`` のうち ``secret`` と共通する部分文字列を伏せる。
+
+    接頭辞ではなく共通部分文字列で見るのは、ログが発話から **抽出した値だけ**
+    を書くことがあるため (``Quantity grounding injected: 口座番号 = 5551234509876``
+    は発話の接頭辞ではない)。左から貪欲に最長一致を取り、``[PRIVATE]`` へ置く。
+    """
+    out: list[str] = []
+    i = 0
+    n = len(message)
+    while i < n:
+        best = 0
+        # i から始まる最長の共通部分文字列を探す (下限に満たなければ採らない)
+        limit = min(n - i, len(secret))
+        for length in range(limit, _PRIVATE_MIN_FRAGMENT - 1, -1):
+            if message[i:i + length] in secret:
+                best = length
+                break
+        if best:
+            out.append(PRIVATE_MASK)
+            i += best
+        else:
+            out.append(message[i])
+            i += 1
+    return "".join(out)
 
 
 def setup_logging(
@@ -172,6 +258,7 @@ def setup_logging(
     if console_enabled and not _has_plain_stream_handler(root):
         console = logging.StreamHandler(stream=_make_utf8_stream())
         console.setFormatter(formatter)
+        console.addFilter(PrivateContentFilter())
         console.setLevel(level)
         root.addHandler(console)
 
@@ -262,6 +349,7 @@ def setup_cli_logging(
     if debug and not _has_plain_stream_handler(cli_logger):
         console = logging.StreamHandler(stream=_make_utf8_stream())
         console.setFormatter(formatter)
+        console.addFilter(PrivateContentFilter())
         console.setLevel(logging.DEBUG)
         cli_logger.addHandler(console)
 

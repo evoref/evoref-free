@@ -13,8 +13,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from backend.free.core.intent_vocab import session_self_reference_pattern_ja
-from backend.free.core.locale_patterns import is_en_locale
+from backend.free.core.intent_vocab import (
+    ascii_boundary,
+    session_self_reference_pattern_ja,
+)
+from backend.free.core.locale_patterns import matches_either
 from backend.free.document_nouns import (
     DOCUMENT_NOUNS_NEEDS_SUFFIX,
     DOCUMENT_NOUNS_NEEDS_SUFFIX_EN,
@@ -32,8 +35,17 @@ logger = get_logger("rag.self_rag_judge")
 VALID_QUALITIES = {"high", "medium", "low"}
 
 # 検索スキップパターン
+#
+# ``OK`` は英字境界で囲む。素の部分一致だと "look" / "broken" / "token" の
+# 内側に当たり、20 文字未満の英語クエリを挨拶とみなして RAG を skip する。
+# JA / EN のパターンは locale に関わらず両方評価される (`_judge_rule` 参照) ので、
+# 境界の無い ASCII 語が 1 つあるだけで英語入力の判定が壊れる。``\b`` ではなく
+# ``ascii_boundary`` を使うのは、``OK\b`` だと後続が和文字のとき境界が立たず
+# 「OKです」を落とすため (和文字は Unicode の ``\w``)。
 SKIP_PATTERNS = re.compile(
-    r"(こんにちは|こんばんは|おはよう|ありがとう|了解|OK|はい|いいえ|さようなら)",
+    r"(こんにちは|こんばんは|おはよう|ありがとう|了解"
+    rf"|{ascii_boundary('OK')}"
+    r"|はい|いいえ|さようなら)",
     re.IGNORECASE,
 )
 
@@ -51,12 +63,18 @@ SKIP_PATTERNS_EN = re.compile(
 # URL を含む / 明示的 fetch 動詞は 100% fetch 意図とみなし RAG をスキップ。
 # リアルタイムキーワード (ニュース / 株価 / 天気 等) は固定キーワードリストの
 # 陳腐化を避けるため採らない (取りこぼしは安全側の retrieve に倒れる)。
+# 英単語 (fetch / browse / download) は英字境界で囲む。素の部分一致では
+# "prefetch" / "browser" / "downloads" に当たり、「ブラウザのキャッシュはどう
+# 効きますか」に相当する英語の技術質問が rule 2 の fetch 確定へ落ちて RAG を
+# 丸ごと skip する。日本語文に混じる形 ("fetch して") を残すため ``\b`` では
+# なく ``ascii_boundary`` を使う (SKIP_PATTERNS のコメント参照)。
 FETCH_INTENT_PATTERNS = re.compile(
     r"(https?://"
-    r"|フェッチ|fetch"
+    rf"|フェッチ|{ascii_boundary('fetch')}"
     r"|アクセスして|アクセスし"
     r"|取得して|取得しなおして|取り直して|再取得"
-    r"|ブラウズ|browse|ダウンロード|download)",
+    rf"|ブラウズ|{ascii_boundary('browse')}"
+    rf"|ダウンロード|{ascii_boundary('download')})",
     re.IGNORECASE,
 )
 
@@ -444,6 +462,15 @@ class RetrievalNecessityJudge:
 
         Returns: "retrieve" | "fetch" | "skip" | "uncertain"
 
+        **JA / EN のパターンは GUI locale に関わらず両方評価する** (union)。
+        以前は ``is_en_locale()`` で片側だけを選んでいたが、GUI locale は UI の
+        言語であって入力の言語ではない — 既定 'ja' のまま英語で打つと英語の
+        質問マーカーも後方参照も一切効かず、全部ルール 6 の skip に落ちていた
+        (router が 2026-07-22 に同じ理由で union へ倒したのと同型の穴)。
+        union で誤検出が増えるのは片方が **境界無しの短い ASCII 語** を持つ
+        ときだけなので、そちらは ``ascii_boundary`` で囲って直してある
+        (:data:`SKIP_PATTERNS` / :data:`FETCH_INTENT_PATTERNS`)。
+
         判定順 (上から先勝ち):
             0. ``window_complete=False`` かつセッション自己参照 → uncertain
                (下の「窓の完全性」を参照)
@@ -484,22 +511,15 @@ class RetrievalNecessityJudge:
         の実測を参照)。
         """
         query_stripped = query.strip()
-        en = is_en_locale()
-        skip_pat = SKIP_PATTERNS_EN if en else SKIP_PATTERNS
-        fetch_pat = FETCH_INTENT_PATTERNS_EN if en else FETCH_INTENT_PATTERNS
-        trivial_pat = TRIVIAL_QUESTION_PATTERNS_EN if en else TRIVIAL_QUESTION_PATTERNS
-        codegen_pat = CODE_DOC_GEN_INTENT_PATTERNS_EN if en else CODE_DOC_GEN_INTENT_PATTERNS
-        howto_pat = _HOWTO_QUESTION_RE_EN if en else _HOWTO_QUESTION_RE
-        question_pat = QUESTION_PATTERNS_EN if en else QUESTION_PATTERNS
-        past_ref_pat = _PAST_REFERENCE_RE_EN if en else _PAST_REFERENCE_RE
-        session_ref_pat = (
-            SESSION_SELF_REFERENCE_PATTERNS_EN if en
-            else SESSION_SELF_REFERENCE_PATTERNS
-        )
+
+        def either(ja: re.Pattern[str], en: re.Pattern[str]) -> bool:
+            return matches_either(query_stripped, ja, en)
 
         # 0. 窓が不完全なセッション自己参照は「窓の中で完結する」前提が崩れている
         #    (docstring の「窓の完全性」を参照)。TRIVIAL より先に評価する。
-        if not window_complete and session_ref_pat.search(query_stripped):
+        if not window_complete and either(
+            SESSION_SELF_REFERENCE_PATTERNS, SESSION_SELF_REFERENCE_PATTERNS_EN,
+        ):
             logger.debug(
                 "Necessity: uncertain (session self-reference with an "
                 "incomplete window: %r)", query_stripped[:50],
@@ -512,7 +532,7 @@ class RetrievalNecessityJudge:
             return "skip"
 
         # 2. 外部 fetch 意図 (確定): URL を含む or 明示的 fetch 動詞
-        if fetch_pat.search(query_stripped):
+        if either(FETCH_INTENT_PATTERNS, FETCH_INTENT_PATTERNS_EN):
             logger.debug(
                 "Necessity: fetch (fetch intent pattern matched: %r)",
                 query_stripped[:50],
@@ -520,7 +540,7 @@ class RetrievalNecessityJudge:
             return "fetch"
 
         # 3. 自明な質問 (時刻 / 日付 / 自己同一性 / 雑談): 即 skip 確定
-        if trivial_pat.search(query_stripped):
+        if either(TRIVIAL_QUESTION_PATTERNS, TRIVIAL_QUESTION_PATTERNS_EN):
             logger.debug(
                 "Necessity: skip (trivial question pattern matched: %r)",
                 query_stripped[:50],
@@ -538,8 +558,10 @@ class RetrievalNecessityJudge:
         # ただし how-to 質問 (「作成する方法を教えて」) は除外する。
         if (
             FILE_PATH_PATTERN.search(query_stripped)
-            and codegen_pat.search(query_stripped)
-            and not howto_pat.search(query_stripped)
+            and either(
+                CODE_DOC_GEN_INTENT_PATTERNS, CODE_DOC_GEN_INTENT_PATTERNS_EN,
+            )
+            and not either(_HOWTO_QUESTION_RE, _HOWTO_QUESTION_RE_EN)
         ):
             logger.debug(
                 "Necessity: skip (file path + code/doc-gen intent: %r)",
@@ -550,7 +572,7 @@ class RetrievalNecessityJudge:
         # 4. 質問マーカー (SKIP より優先)
         # 「発売日はいつ」が SKIP の "はい" substring にヒットして誤って
         # skip されないよう、QUESTION を SKIP より先に評価する。
-        if question_pat.search(query_stripped):
+        if either(QUESTION_PATTERNS, QUESTION_PATTERNS_EN):
             if len(query_stripped) < _UNCERTAIN_QUERY_MAX_CHARS:
                 logger.debug(
                     "Necessity: uncertain (short question marker: %r)",
@@ -564,7 +586,7 @@ class RetrievalNecessityJudge:
             return "retrieve"
 
         # 5. スキップパターン (挨拶/相槌) — 短文のみ
-        if skip_pat.search(query_stripped) and len(query_stripped) < 20:
+        if either(SKIP_PATTERNS, SKIP_PATTERNS_EN) and len(query_stripped) < 20:
             logger.debug("Necessity: skip (greeting/simple pattern matched: %r)", query_stripped[:30])
             return "skip"
 
@@ -573,7 +595,7 @@ class RetrievalNecessityJudge:
         # ただし会話の前を指す後方参照があるターンは降ろす
         # (:data:`_PAST_REFERENCE_RE` の説明を参照)。
         if context_count >= 3 and window_complete:
-            if past_ref_pat.search(query_stripped):
+            if either(_PAST_REFERENCE_RE, _PAST_REFERENCE_RE_EN):
                 logger.debug(
                     "Necessity: uncertain (back-reference to an earlier turn "
                     "overrides the sufficient-context skip: %r)",

@@ -27,7 +27,7 @@ from backend.free.api.chat.chat_constants import (
     DEFAULT_WORKING_MAX_TOKENS,
     DEFAULT_WORKING_MAX_TURNS,
 )
-from backend.free.core.session_mode import is_valid_session_mode
+from backend.free.core.session_mode import canonicalize_session_mode
 from backend.free.memory.semantic.pin_manager import (
     PinLockedError,
     list_pinned,
@@ -305,10 +305,14 @@ async def pin_memory(
                 "the memory API can only create mem-owned facts"
             ),
         )
-    if not is_valid_session_mode(req.mode_origin):
+    # 旧名 ("coding") は現行名へ正規化する (chat 入口と同じ理由。
+    # canonicalize_session_mode の docstring が定める入口互換)。
+    canonical_origin = canonicalize_session_mode(req.mode_origin)
+    if canonical_origin is None:
         raise HTTPException(
             status_code=400, detail=f"unknown mode_origin: {req.mode_origin}",
         )
+    req.mode_origin = canonical_origin
 
     if req.fact_id:
         try:

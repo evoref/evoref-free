@@ -48,4 +48,19 @@ def current_datetime_block(guidance: str) -> str:
 
     now = utc_now_dt().astimezone()
     weekday = "月火水木金土日"[now.weekday()]
-    return f"{CURRENT_DATETIME_LABEL} {now:%Y-%m-%d} ({weekday}曜)。{guidance}"
+    return (
+        f"{CURRENT_DATETIME_LABEL} {now:%Y-%m-%d} ({weekday}曜)。{guidance}"
+        f"{_EXPLICIT_DATE_PRECEDENCE}"
+    )
+
+
+#: **ユーザーが明示した日付を、この基準日で上書きしない。** 実インシデント
+#: (2026-09-03 ライブ監査 T8#10): 「**11月の3連休**に金沢へ2泊3日」と指定した
+#: 行程が、最終出力で「2026年9月4日(金)〜9月6日(日)」= 注入した基準日の翌日から
+#: 採番された日付に化けた (しかも 3 連休ですらない)。基準日は相対表現を解くための
+#: ものであって、明示された月日を置き換える権限は無い。ラベルと同じ 1 箇所で
+#: 全経路 (チャット応答 / 成果物生成) に効かせる。
+_EXPLICIT_DATE_PRECEDENCE = (
+    "ユーザーが月や日付を明示している場合は、その指定を最優先で使い、"
+    "この基準日で置き換えないこと。"
+)

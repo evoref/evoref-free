@@ -12,7 +12,9 @@ import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncIterator
 from backend.app_state import AppState
+from backend.aux_telemetry import aux_failure_signals, current_aux_failures
 from backend.exceptions import EvorefError
+from backend.free.agent.issue_ledger import record_current_issue
 from backend.free.api.chat.chat_constants import MAX_STEP_QUEUE_SIZE
 from backend.free.api.chat.chat_recorder import (
     read_llama_prompt_tokens,
@@ -322,6 +324,25 @@ def _log_chat_outcome(
         return
     if cancelled:
         signals = {**signals, "cancelled": True}
+    # ターン中に縮退した補助判定を結末へ持ち上げる。``success`` は「SSE を
+    # 最後まで届けられたか」= 配送の成否なので、**中身が縮退したターンも
+    # success=true になる**。この信号が無いと、記憶想起もツール判定も落ちた
+    # ターンと健全なターンが事後に区別できない (2026-09-03 監査:
+    # chat_response 105/105 が success=true)。
+    failures = current_aux_failures()
+    signals = {**signals, **aux_failure_signals(failures)}
+    if failures:
+        signals["degraded"] = True
+        # 自己申告 (「今日の回答で自信が持てなかったものは?」) の材料にもする。
+        # 結末 JSONL にだけ残しても、モデルはそれを読めない。
+        record_current_issue(
+            "aux_degraded",
+            ", ".join(sorted({f["purpose"] for f in failures})),
+        )
+    # 規則台帳の計数 (f_03 §3.5.1): このターンで発火した検証器を、対応する
+    # 規則の harmful に、発火しなかった規則の helpful に写す。これが
+    # 「削ってよい規則」の唯一の根拠。計数の失敗で結末記録を止めない。
+    signals = {**signals, **_account_rule_outcomes(state)}
     dl.log_outcome(
         kind="chat_response",
         success=success,
@@ -329,6 +350,31 @@ def _log_chat_outcome(
         tokens_out=tokens_out,
         quality_signals=signals,
     )
+
+
+def _account_rule_outcomes(state: AppState) -> dict:
+    """検証器の発火 → 規則 id の計数へ (純粋でない: 台帳を更新し保存する)。"""
+    try:
+        from backend.free.agent.prompt_ledger import record_rule_outcome, rule_ids_for_verifiers
+        from backend.free.core.verifier_events import current_verifier_hits, current_verifier_mode
+        from backend.utils import utc_now
+
+        mode = current_verifier_mode()
+        pm = getattr(state, "prompt_manager", None)
+        if mode is None or pm is None or not hasattr(pm, "get_ledger"):
+            return {}
+        hits = set(current_verifier_hits())
+        ledger = pm.get_ledger(mode)
+        violated = rule_ids_for_verifiers(ledger, hits)
+        record_rule_outcome(ledger, violated, fired_at=utc_now())
+        pm.save_ledger_counts(mode)
+        out: dict = {"verifier_hits": sorted(hits)}
+        if violated:
+            out["rule_violations"] = sorted(violated)
+        return out
+    except Exception:  # noqa: BLE001 - 計数は結末記録の付随物
+        logger.debug("rule outcome accounting skipped", exc_info=True)
+        return {}
 
 
 def _sync_chat_response(

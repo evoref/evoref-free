@@ -27,10 +27,13 @@ frozenset()``)、loop → gen 方向は許可されているが非対称にな�
 新規に語彙拡張する場合は router.py 冒頭のコメントに従い
 ``docs/f_03_agent_engine.md`` §1.2 のテーブルも同時更新すること。
 
-英語版 (``_EN`` サフィックス) は GUI 左下の言語設定 (``get_locale()``) が
-``"en"`` の場合にのみ使われる (``backend/free/core/locale_patterns.py`` 経由)。
-日本語版と英語版は locale で完全に排他利用されるため、必ずしも1対1の逐語訳
-である必要はなく、各言語で自然な語彙を選ぶ。
+英語版 (``_EN`` サフィックス) は日本語版と **同時に** 評価される
+(``backend/free/core/locale_patterns.py`` の union ヘルパ経由)。GUI 左下の
+言語設定は UI の言語であって入力の言語ではないため、locale で片方だけを選ぶと
+その言語の文書依頼が丸ごと落ちる (2026-09-03 に排他から union へ変更)。
+必ずしも1対1の逐語訳である必要はなく各言語で自然な語彙を選ぶが、**概念が
+重複するエントリは片方に寄せる** こと — ``content_detector`` は
+一致した本数を ``text_score`` として数えるため、二重定義はスコアの水増しになる。
 """
 
 from __future__ import annotations

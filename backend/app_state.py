@@ -18,7 +18,9 @@ from fastapi import Request
 # ``"evolve"`` は Pro 限定。``EVOREF_DEVELOP_LEVEL`` 環境変数で
 # サブプロセス (FastAPI バックエンド) へ伝搬する。型本体は
 # ``backend.log_config`` で定義 (循環 import 回避)。
-from backend.log_config import DevelopLevel
+from backend.log_config import DevelopLevel, get_logger
+
+logger = get_logger("app_state")
 
 if TYPE_CHECKING:
     import asyncio
@@ -356,13 +358,21 @@ class AppState:
         # ``rebind`` は較正値のモデルキーも再解決する (差し替えた base が別
         # モデルなら旧モデルの timeout 較正を引き継がない)。config が読めない
         # 経路 (テスト) では local の差し替えだけ行う。
+        try:
+            from backend.config import get_config
+            cfg = get_config()
+        except Exception:
+            cfg = None
         if self.aux_client is not None:
-            try:
-                from backend.config import get_config
-                cfg = get_config()
-            except Exception:
-                cfg = None
             self.aux_client.rebind(client, cfg)
+        else:
+            # **未配線からの復帰**。起動時に llama-server がまだモデルをロード
+            # 中だと ``_init_aux_client`` は ``None`` を配って終わり、以降
+            # lazy-connect でチャットが復活しても補助タスクだけが縮退したまま
+            # プロセス寿命を終える (2026-09-03 ライブ監査: 3.5 時間ぶん
+            # MetaCognitive の計画生成と CritiqueSynthesizer が死んでいた)。
+            # ここで作り直し、``None`` を掴んだ長命の保持者へ配り直す。
+            self._wire_aux_client_late(client, cfg)
 
         # SleepTimeScheduler にも追随させる。Level 1 常駐ループは
         # ``_llm_client is None`` の tick を毎回 skip するため、起動時に
@@ -372,6 +382,32 @@ class AppState:
         # 問題も同じ経路で塞がる。
         if self.sleep_scheduler is not None:
             self.sleep_scheduler.set_llm_client(self.llm_client)
+
+    def _wire_aux_client_late(self, client: LocalClient, cfg: dict | None) -> None:
+        """起動時に作れなかった AuxClient を後から作って配り直す。
+
+        ``state.aux_client`` を毎リクエスト読む保持者 (MetaCognitive / long-form /
+        staged) は代入だけで復帰する。**構築時に一度だけ受け取る保持者**
+        (CritiqueSynthesizer) は個別に差し替えないと ``None`` のまま残る。
+        """
+        if not hasattr(client, "generate_constrained"):
+            return
+        try:
+            from backend.free.llm.aux_client import AuxClient
+
+            self.aux_client = AuxClient(
+                client, config=cfg, debug_logger=self.debug_logger,
+            )
+        except Exception as e:
+            logger.warning("Late aux client wiring failed: %s", e)
+            return
+        logger.info("Aux client wired late after llama-server became reachable")
+
+        scheduler = self.learning_scheduler
+        synthesizer = getattr(scheduler, "_critique_synthesizer", None) if scheduler else None
+        if synthesizer is not None and getattr(synthesizer, "_llm_client", None) is None:
+            synthesizer._llm_client = self.aux_client
+            logger.info("CritiqueSynthesizer re-bound to the late aux client")
 
     # ── セッション管理 ──
 

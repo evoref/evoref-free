@@ -83,11 +83,29 @@ async def _timed_task(timings: dict[str, float], name: str, coro):
 # ──────────────────────────────────────────────────────────────────────────
 
 
+def _base_model_path_or_none(cfg: dict[str, Any]) -> "Path | None":
+    """base モデルの実ファイルパス。解決できなければ ``None``。
+
+    起動プローブ予算の算出専用。ここで失敗しても起動は続けたいので、
+    PathResolver の例外は握って ``None`` へ倒す (既定予算が使われる)。
+    """
+    try:
+        from backend.config import PathResolver
+
+        path = PathResolver(cfg).resolve_model("base_model")
+    except Exception:
+        return None
+    return path if path.exists() else None
+
+
 async def _init_llama_server(
     state: AppState, cfg: dict[str, Any], debug_logger: "DebugLogger",
 ) -> "LocalClient | None":
     """5. llama-server 接続"""
-    from backend.free.llm._base_client import wait_for_server_ready
+    from backend.free.llm._base_client import (
+        resolve_startup_probe_timeout,
+        wait_for_server_ready,
+    )
     from backend.free.llm.local_client import LocalClient
     from backend.free.llm.model_metadata import fetch_model_metadata
 
@@ -98,9 +116,14 @@ async def _init_llama_server(
 
     try:
         # 起動レース対策: llama-server プロセスが listen するまで /health を
-        # ポーリング。失敗しても続行 → 既存の degraded mode に倒れる
+        # ポーリング。失敗しても続行 → 既存の degraded mode に倒れる。
+        # 予算はモデルサイズに追随させる (固定 30 秒では 16GB クラスのロードに
+        # 負け、AuxClient が恒久 unwired になる — 2026-09-03 ライブ監査)。
         await wait_for_server_ready(
             f"{llama_url}/health", label="llama-server (base)",
+            timeout=resolve_startup_probe_timeout(
+                _base_model_path_or_none(cfg), label="llama-server (base)",
+            ),
         )
         metadata = await fetch_model_metadata(llama_url, debug_logger=debug_logger)
         from backend.config import (

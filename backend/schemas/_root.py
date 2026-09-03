@@ -33,6 +33,7 @@ from backend.schemas.llm import LlamaConfig
 from backend.schemas.loop import LoopConfig
 from backend.schemas.memory import MemoryConfig
 from backend.schemas.paths import LocalPathsConfig, ModelPathsConfig
+from backend.schemas.prompt import PromptConfig
 from backend.schemas.rag import EmbeddingConfig, RAGConfig
 
 logger = get_logger("schemas")
@@ -89,6 +90,7 @@ class EvorefConfig(BaseModel):
     learning: LearningConfig = Field(default_factory=LearningConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     streaming: StreamingConfig = Field(default_factory=StreamingConfig)
+    prompt: PromptConfig = Field(default_factory=PromptConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     widget_proxy: WidgetProxyConfig = Field(default_factory=WidgetProxyConfig)

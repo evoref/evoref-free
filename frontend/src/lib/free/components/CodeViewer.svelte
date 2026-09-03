@@ -116,13 +116,25 @@
 		view?.destroy();
 	});
 
-	// content 変更時はストリーミング応答更新を想定して view へ dispatch
+	// content 変更時はストリーミング応答更新を想定して view へ dispatch。
+	//
+	// **全文置換ではなく差分だけ流す。** 以前は `from: 0, to: doc.length` で毎回
+	// 文書全体を差し替えていたため、コードブロックが伸びている間、トークンが
+	// 届くたびに CodeMirror が全文を再パース・再ハイライトしていた。実測
+	// (2026-09-03 動作検証): 本文だけの応答はメインスレッド遅延 p95 11ms、
+	// コードブロック付きの応答は p95 802ms / 最大 923ms。ストリーミングは
+	// 末尾追記が本質なので、共通接頭辞を除いた差分 (通常は追記分だけ) を
+	// dispatch すれば、CodeMirror は増分パースで済む。
 	$effect(() => {
 		const c = content;
 		untrack(() => {
-			if (view && c !== view.state.doc.toString()) {
-				view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: c } });
-			}
+			if (!view) return;
+			const cur = view.state.doc.toString();
+			if (c === cur) return;
+			let from = 0;
+			const max = Math.min(cur.length, c.length);
+			while (from < max && cur.charCodeAt(from) === c.charCodeAt(from)) from++;
+			view.dispatch({ changes: { from, to: cur.length, insert: c.slice(from) } });
 		});
 	});
 

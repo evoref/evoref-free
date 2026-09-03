@@ -422,7 +422,15 @@ def _walk_tree(path: Path, lines: list[str], prefix: str, depth: int, max_depth:
     if depth >= max_depth:
         return
     try:
-        entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name))
+        # **ファイルを先、ディレクトリを後** に並べる。逆にするとディレクトリを
+        # 深さ優先で降りきってから自分自身のファイルへ戻るため、行数上限で
+        # 打ち切られたときに真っ先に消えるのが「そのディレクトリ直下の
+        # ファイル」になる (実インシデント 2026-09-03 ライブ監査 T05#4:
+        # リポジトリ直下の ``list_directory(.)`` が 201 行中 **直下ファイル 0 件**
+        # で打ち切られ、「README ファイルは存在しますか？」に
+        # 「この範囲では確認できません」と答えた。README.md は実在する)。
+        # この順序なら、各階層で「自分の持ち物」が部分木の展開より先に出る。
+        entries = sorted(path.iterdir(), key=lambda p: (p.is_dir(), p.name))
     except PermissionError:
         lines.append(f"{prefix}└── (permission denied)")
         return

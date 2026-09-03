@@ -25,8 +25,20 @@ from backend.free.agent.prompt_utils import (
     restore_protected_sections,
     validate_protected_sections,
 )
+from backend.free.agent.prompt_ledger import (
+    Ledger,
+    apply_default_verifiers,
+    load_ledger,
+    normalize_text,
+    parse_markdown,
+    render_markdown,
+    save_ledger,
+    shared_bullet_ids,
+    sync_protected,
+)
 from backend.i18n_helper import prompt_locale
 from backend.log_config import get_logger
+from backend.utils import estimate_tokens
 from backend.utils import utc_now as _now
 
 logger = get_logger("agent.prompt_manager")
@@ -402,6 +414,9 @@ class SystemPromptManager:
         self.instance_name = instance_name
         self.contents: dict[str, str] = {}
         self.metas: dict[str, PromptMeta] = {}
+        #: 規則台帳 (f_03 §7.1.1)。``contents`` はこれのレンダ結果 (raw layout)。
+        self.ledgers: dict[str, Ledger] = {}
+        self._budget_warned: set[str] = set()
         # 推論時 query 依存 few-shot 選択器 (FewShotSelector)。wire_pillars で後注入。
         # None の場合は従来の meta.candidates (進化凍結) を使う。
         self._fewshot_selector: FewShotSelector | None = None
@@ -443,9 +458,114 @@ class SystemPromptManager:
                 else:
                     self.metas[mode] = PromptMeta(mode=mode)
                     self._save_meta(mode)
-                self.contents[mode] = self._resync_protected(mode, body)
+                self._load_ledger_for(mode, self._resync_protected(mode, body))
             else:
                 self._create_default(mode)
+
+    # ── 規則台帳 (f_03 §7.1.1) ──
+
+    def _default_ledger(self, mode: str, locale: str | None = None) -> Ledger:
+        """現行コードの DEFAULT_PROMPTS を台帳として読む (protected の SSOT)。"""
+        loc = locale or self._get_prompt_locale(mode)
+        body = DEFAULT_PROMPTS.get(loc, DEFAULT_PROMPTS["ja"]).get(mode, "")
+        ledger = parse_markdown(body, mode=mode, locale=loc)
+        apply_default_verifiers(ledger)
+        return ledger
+
+    def _load_ledger_for(self, mode: str, body: str) -> None:
+        """ロード時: 台帳ファイルがあればそれを、無ければ本文から移行して持つ。
+
+        ``body`` は protected 同期済みの本文。台帳ファイル側の非 protected 規則と
+        本文が食い違う場合 (手編集 / 旧世代の進化) は **本文を正とし**、id と
+        計数は本文一致で引き継ぐ。ディスクの ``.md`` はここでは書き換えない
+        (`test_load_resync_does_not_rewrite_disk`)。台帳ファイルが無い初回だけ
+        移行結果を保存する。
+        """
+        locale = self._get_prompt_locale(mode)
+        existing = load_ledger(self.prompt_dir, mode)
+        ledger = parse_markdown(body, mode=mode, locale=locale, existing=existing)
+        apply_default_verifiers(ledger)
+        self.ledgers[mode] = ledger
+        self.contents[mode] = self._render_like(ledger, body)
+        if existing is None:
+            save_ledger(self.prompt_dir, ledger)
+            logger.info(
+                "Rules ledger created from prompt body: mode=%s rules=%d",
+                mode, len(ledger.rules),
+            )
+
+    def _adopt_content(self, mode: str, content: str) -> None:
+        """本文の採用点を 1 つにする: 台帳へ分解 → レンダ → .md と台帳を保存。"""
+        locale = self._get_prompt_locale(mode)
+        ledger = parse_markdown(
+            content, mode=mode, locale=locale, existing=self.ledgers.get(mode),
+        )
+        apply_default_verifiers(ledger)
+        self.ledgers[mode] = ledger
+        rendered = self._render_like(ledger, content)
+        self.contents[mode] = rendered
+        write_body(self.prompt_dir, mode, rendered)
+        save_ledger(self.prompt_dir, ledger)
+
+    @staticmethod
+    def _render_like(ledger: Ledger, source: str) -> str:
+        """raw layout でレンダし、元本文の末尾改行の有無だけを引き継ぐ。
+
+        レンダは並べ替え (protected を先頭へ) を伴うが、末尾改行は手編集や
+        テストが本文をそのまま突き合わせるので元のまま保つ。
+        """
+        rendered, _ = render_markdown(ledger)
+        if source.endswith("\n") and not rendered.endswith("\n"):
+            rendered += "\n"
+        return rendered
+
+    def get_ledger(self, mode: str) -> Ledger:
+        if mode not in self.ledgers:
+            raise ValueError(f"Unknown mode: {mode}")
+        return self.ledgers[mode]
+
+    def save_ledger_counts(self, mode: str) -> None:
+        """計数の更新だけを永続化する (レンダ結果は変わらないので .md は触らない)。"""
+        if mode in self.ledgers:
+            save_ledger(self.prompt_dir, self.ledgers[mode])
+
+    def can_delete_rule_text(self, line: str, *, min_turns: int) -> bool:
+        """規則 1 行の削除を台帳の計数が正当化するか (f_04 §4.5.2)。
+
+        条件: どこかの台帳に同じ箇条があり、その全てで protected でなく、
+        観測ターン数 (helpful + harmful) が ``min_turns`` 以上、かつ harmful が 0
+        (= 検証器が一度も違反を捕まえていない規則は、無くても質が落ちない見込み)。
+        台帳に無い行は消せない。
+        """
+        # 進化側の行は箇条書き記号付きで来る。台帳の text は記号なし。
+        key = normalize_text(line.strip().lstrip("-*+ ").strip())
+        if not key:
+            return False
+        found = False
+        for ledger in self.ledgers.values():
+            for rule in ledger.rules:
+                if rule.kind != "bullet" or normalize_text(rule.text) != key:
+                    continue
+                found = True
+                if rule.protected or rule.harmful > 0:
+                    return False
+                if rule.helpful + rule.harmful < min_turns:
+                    return False
+        return found
+
+    def _system_budget_tokens(self, mode: str, prefix_len: int) -> int | None:
+        """モードの context_size に対する静的 system の上限 (本文に使える分)。"""
+        try:
+            from backend.config import get_config, resolve_context_size_for_mode
+            from backend.free.core.prompt_budget import system_max_tokens
+
+            cfg = get_config()
+            ctx = int(resolve_context_size_for_mode(cfg, mode) or 0)
+            if ctx <= 0:
+                return None
+            return max(0, system_max_tokens(cfg, ctx) - prefix_len)
+        except Exception:
+            return None
 
     def _resync_protected(self, mode: str, body: str) -> str:
         """PROTECTED セクションを現行コードの DEFAULT_PROMPTS へ強制同期する
@@ -484,9 +604,40 @@ class SystemPromptManager:
         locale = self._get_prompt_locale(mode)
         template = _PREFIX_TEMPLATES.get(locale, _PREFIX_TEMPLATES["ja"])
         prefix = template.format(name=self.instance_name)
+        suffix = static_directives_suffix()
+        body = self.contents[mode]
+        ledger = self.ledgers.get(mode)
+        if ledger is not None:
+            # static layout (f_03 §7.1.1): モード間で本文が一致する箇条を
+            # タイトルより前へ寄せ、chat⇄create 切替の再 prefill を差分に限定する。
+            # 予算 (§7.1.2) を超えるときは priority の低い非 protected から落とす。
+            other = next((m for m in self.MODES if m != mode and m in self.ledgers), None)
+            shared = shared_bullet_ids(ledger, self.ledgers[other]) if other else set()
+            budget = self._system_budget_tokens(
+                mode, estimate_tokens(prefix) + estimate_tokens(suffix),
+            )
+            try:
+                body, dropped = render_markdown(
+                    ledger, max_tokens=budget, hoist_shared=shared or None,
+                )
+            except ValueError as e:
+                # protected だけで予算を超える = 構成エラーだが、チャットを
+                # 止めない。予算無しでレンダして警告する (1 回だけ)。
+                if mode not in self._budget_warned:
+                    self._budget_warned.add(mode)
+                    logger.warning(
+                        "System prompt budget is unsatisfiable for mode=%s (%s); "
+                        "rendering without the budget", mode, e,
+                    )
+                body, dropped = render_markdown(ledger, hoist_shared=shared or None)
+            if dropped:
+                logger.warning(
+                    "System prompt for mode=%s exceeds its budget; dropped %d "
+                    "low-priority rule(s): %s", mode, len(dropped), dropped,
+                )
         # 末尾の固定指示は prefix と同じ「進化しない枠」。本文 (``contents``) には
         # 含めないので Level 1 の変異 / 保存対象 (``get_raw_prompt``) に乗らない。
-        return prefix + self.contents[mode] + static_directives_suffix()
+        return prefix + body + suffix
 
     def get_fewshot_block(
         self, mode: str, query: str | None = None, query_vec=None,
@@ -566,8 +717,7 @@ class SystemPromptManager:
         if mode not in self.MODES:
             raise ValueError(f"Unknown mode: {mode}")
         self._archive_current(mode)
-        write_body(self.prompt_dir, mode, content)
-        self.contents[mode] = content
+        self._adopt_content(mode, content)
         meta = self.metas[mode]
         meta.version += 1
         meta.updated_at = _now()
@@ -627,8 +777,7 @@ class SystemPromptManager:
             return
 
         self._archive_current(mode)
-        write_body(self.prompt_dir, mode, content)
-        self.contents[mode] = content
+        self._adopt_content(mode, content)
         meta = self.metas[mode]
         meta.version += 1
         meta.updated_at = _now()
@@ -647,7 +796,7 @@ class SystemPromptManager:
             raise FileNotFoundError(
                 f"Prompt file not found: {self.prompt_dir / f'{mode}.md'}",
             )
-        self.contents[mode] = read_body(self.prompt_dir, mode)
+        self._adopt_content(mode, _strip_name_prefix(read_body(self.prompt_dir, mode)))
         meta = self.metas[mode]
         meta.updated_at = _now()
         meta.source = "manual"
@@ -666,8 +815,7 @@ class SystemPromptManager:
             raise ValueError(f"Unknown mode: {mode}")
         content = read_history_version(self.prompt_dir, mode, version)
         self._archive_current(mode)
-        write_body(self.prompt_dir, mode, content)
-        self.contents[mode] = content
+        self._adopt_content(mode, content)
         meta = self.metas[mode]
         meta.version += 1
         meta.updated_at = _now()
@@ -701,9 +849,8 @@ class SystemPromptManager:
             # 新言語のデフォルトで上書き
             prompts = DEFAULT_PROMPTS[new_locale]
             content = prompts.get(mode, f"# {mode} mode\nDefault system prompt.\n")
-            write_body(self.prompt_dir, mode, content)
-            self.contents[mode] = content
-
+            # メタ (locale) を先に更新してから採用する — 台帳の locale と
+            # レンダの優先規則文は ``_get_prompt_locale`` で引くため。
             # メタ情報更新
             old_version = meta.version if meta else 0
             new_meta = PromptMeta(
@@ -717,6 +864,7 @@ class SystemPromptManager:
             )
             self.metas[mode] = new_meta
             self._save_meta(mode)
+            self._adopt_content(mode, content)
             result[mode] = new_meta.version
 
             logger.info(
@@ -742,8 +890,7 @@ class SystemPromptManager:
         loc = locale or self._current_locale()
         prompts = DEFAULT_PROMPTS.get(loc, DEFAULT_PROMPTS["ja"])
         content = prompts.get(mode, f"# {mode} mode\nDefault system prompt.\n")
-        write_body(self.prompt_dir, mode, content)
-        self.contents[mode] = content
+        self._adopt_content(mode, content)
         self.metas[mode] = PromptMeta(
             mode=mode, version=1, updated_at=_now(), source="default",
             locale_calibrated_for=loc,

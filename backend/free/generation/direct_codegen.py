@@ -37,25 +37,6 @@ _MAX_TOKENS_CEILING = 16384
 
 # 非ストリーミング呼び出しの per-request タイムアウト算出パラメータ。
 # LocalClient の既定タイムアウト (120s) は decode 速度の速い環境向けで、iGPU 等
-# 低速環境では max_tokens=4096 の同期生成 1 回すら終わらず必ず timeout する
-# (実測: iGPU decode ~7-13 tok/s で 4096 トークンに 300-580 秒必要)。
-# 保守的な下限 tok/s で必要時間を見積もり、prefill 等のオーバーヘッド分の
-# マージンを足す。無制限に伸びないよう上限でキャップする。
-_MIN_TOKENS_PER_SEC = 5.0
-_TIMEOUT_MARGIN_SEC = 60.0
-_TIMEOUT_CEILING_SEC = 1800.0
-
-
-def _estimate_timeout(max_tokens: int) -> float:
-    """``max_tokens`` から非ストリーミング呼び出しの per-request タイムアウトを見積もる。
-
-    ``LocalClient`` の既定 (120s) を下回らないようにしつつ、低速環境でも
-    生成が完了しうる時間を確保する。
-    """
-    estimated = max_tokens / _MIN_TOKENS_PER_SEC + _TIMEOUT_MARGIN_SEC
-    return min(_TIMEOUT_CEILING_SEC, max(120.0, estimated))
-
-
 def _finish_reason(resp: dict) -> str:
     """base client generate() 応答の finish_reason ('length' は max_tokens 切断)。"""
     try:
@@ -159,7 +140,7 @@ async def generate_single_file(
     try:
         resp = await client.generate(
             messages, stream=False, max_tokens=max_tokens, temperature=temperature,
-            id_slot=client.chat_slot, request_timeout=_estimate_timeout(max_tokens),
+            id_slot=client.chat_slot,
         )
     except Exception as exc:
         logger.warning("direct codegen failed for %s: %s", file_path, exc)
@@ -184,7 +165,6 @@ async def generate_single_file(
                 resp2 = await client.generate(
                     messages, stream=False, max_tokens=retry_tokens,
                     temperature=temperature, id_slot=client.chat_slot,
-                    request_timeout=_estimate_timeout(retry_tokens),
                 )
                 retry_code, retry_from_salvage = _extract_code(resp2, file_path)
                 if _finish_reason(resp2) == "length" and not retry_from_salvage:

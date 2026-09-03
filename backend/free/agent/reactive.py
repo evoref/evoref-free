@@ -61,8 +61,12 @@ class ResponseCache:
 
 # 定型応答パターン: (regex, i18n キー)。応答文はユーザーに見える UI テキストなので
 # backend/i18n/<locale>.json の ``agent.reactive.greeting.*`` から ``msg()`` で引く
-# (CLAUDE.md §6 #6)。locale の選択は select_locale_variant (パターン側) と msg()
-# (文面側) が同じ ``i18n_helper.get_locale()`` を見るので食い違わない。
+# (CLAUDE.md §6 #6)。
+#
+# **照合は両リスト、文面は locale** (``_pattern_match`` 参照)。パターンは入力の
+# 言語に、``msg()`` は UI の言語に従う。両方を locale で切り替えていた頃は、
+# locale='en' のまま「こんにちは」と打つと reactive 層が応答せず LLM へ
+# エスカレートしていた。
 _GREETING_KEY = "agent.reactive.greeting."
 GREETING_RESPONSES: list[tuple[re.Pattern, str]] = [
     (re.compile(exact_greeting_pattern(r"こんにち[はわ]", punctuation=GREETING_PUNCTUATION_JA), re.IGNORECASE), _GREETING_KEY + "hello"),
@@ -130,10 +134,24 @@ class ReactiveAgent:
         self.cache.put(self._cache_key(query), response)
 
     def _pattern_match(self, query: str) -> str | None:
-        """定型応答パターンで照合"""
+        """定型応答パターンで照合
+
+        **照合は JA / EN 両方**、**文面は GUI locale** で決める。パターンは入力の
+        言語に、``msg()`` は UI の言語に従うべきもので、両方を locale で切り替えて
+        いたため locale='en' のまま「こんにちは」と打つと reactive 層が応答せず
+        LLM へエスカレートしていた (0.1 秒で返せる挨拶に往復が乗る)。
+
+        locale 側のリストを **先に** 見るのは、両リストが hi / hello / thanks /
+        bye を別々の i18n キーで持つため — 順序を入れ替えると locale='en' の
+        "hello" が JA 側の ``casual`` キーに当たって文面が変わる。
+        locale が優先順位を、union が網羅を決める。
+        """
         stripped = query.strip()
-        responses = select_locale_variant(GREETING_RESPONSES, GREETING_RESPONSES_EN)
-        for pattern, key in responses:
+        primary, secondary = select_locale_variant(
+            (GREETING_RESPONSES, GREETING_RESPONSES_EN),
+            (GREETING_RESPONSES_EN, GREETING_RESPONSES),
+        )
+        for pattern, key in (*primary, *secondary):
             if pattern.match(stripped):
                 return msg(key)
         return None

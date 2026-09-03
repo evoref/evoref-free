@@ -12,6 +12,7 @@ StreamPipeline でチェーン適用できる。
 
 import re
 
+from backend.free.core.verifier_events import record_verifier_hit
 from backend.log_config import get_logger
 
 logger = get_logger("core.stream_filter")
@@ -139,6 +140,7 @@ class StreamThinkingFilter:
             self._line_buffer = ""
             return result
         if self._suppressed_chars > 0:
+            record_verifier_hit("thinking")
             logger.info(
                 "StreamThinkingFilter: suppressed %d chars of thinking blocks",
                 self._suppressed_chars,
@@ -388,6 +390,7 @@ class RepetitionGuardFilter:
                 else self._MAX_DUPLICATE_LINES
             )
             if self._duplicate_count >= limit:
+                record_verifier_hit("repetition")
                 logger.warning(
                     "RepetitionGuardFilter: truncated output after %d duplicated "
                     "lines (line=%.40s)",
@@ -412,6 +415,7 @@ class RepetitionGuardFilter:
                 self._tripped = True
                 self._buffer = ""
                 self._emitted_in_line = 0
+                record_verifier_hit("repetition")
                 logger.warning(
                     "RepetitionGuardFilter: truncated output after %d identical "
                     "lines (line=%.40s)",
@@ -508,6 +512,8 @@ class QueryEchoFilter:
         if not self._lead_resolved and not self._resolve_lead():
             return ""
         stripped = self._strip_leading_echoes(self._buffer)
+        if stripped != self._buffer:
+            record_verifier_hit("query_echo")
         if not stripped:
             # 復唱を消費し切った状態。続きが更なる復唱か本文かはまだ
             # 分からないので、判定を続ける。
@@ -613,6 +619,8 @@ class HeadBufferFilter:
             return text
         leading = text[:len(text) - len(stripped)]
         cleaned = _DECORATED_RESPONSE_LABEL.sub("", stripped)
+        if cleaned != stripped:
+            record_verifier_hit("head_label")
         return leading + cleaned
 
 
@@ -759,6 +767,7 @@ class InternalFrameMentionFilter:
         cleaned = strip_internal_frame_mentions(self._buffer)
         if cleaned != self._buffer:
             # 表記が閉じた。除去後を出して、続きは素通しに戻す。
+            record_verifier_hit("internal_frame")
             logger.info(
                 "InternalFrameMentionFilter: removed a mention of the internal "
                 "evidence frame from the visible answer",
@@ -823,6 +832,7 @@ class LengthDisclosureFilter:
         reason = violates_length_constraint(self._query, response)
         if reason is None:
             return ""
+        record_verifier_hit("constraint.length")
         logger.info("Length constraint violated (%s)", reason)
         # 文言は修復経路と共有する (2 箇所に書くと片方だけ直る)。
         from backend.free.core.text_quality import length_disclosure_note
@@ -889,5 +899,6 @@ class UnwrittenFileClaimFilter:
             return ""
         if not missing:
             return ""
+        record_verifier_hit("unwritten_file")
         logger.info("Claimed file write with no file on disk: %s", missing)
         return unwritten_file_disclosure_note(missing)

@@ -1607,7 +1607,8 @@ def unused_tool_question(query: str) -> bool:
 #: 決定論の事実注記も無いまま base の作話に倒れる。
 RUNTIME_INFO_QUERY_RE = re.compile(
     r"(?:ベースモデル|(?<![A-Za-z])base\s*model(?![A-Za-z])"
-    r"|埋め込みモデル|(?<![A-Za-z])embedding\s*model(?![A-Za-z])"
+    r"|埋め込みモデル|エンベディングモデル"
+    r"|(?<![A-Za-z])embedding\s*model(?![A-Za-z])"
     r"|(?<![A-Za-z_])n_ctx(?![A-Za-z_])"
     r"|コンテキスト\s*(?:サイズ|長|ウィンドウ)"
     r"|(?<![A-Za-z])context\s*(?:size|window|length)(?![A-Za-z])"
@@ -1780,9 +1781,35 @@ def memory_architecture_question(query: str) -> bool:
     return bool(_MEMORY_ARCHITECTURE_RE.search(query))
 
 
+#: **ベース以外の** モデルを名指しする問い。``_MODEL_IDENTITY_RE`` の
+#: 「モデル…何」は語の種類を見ないため、埋め込みモデルの問いまで
+#: ベースモデルの識別質問として掴んでしまう。
+#:
+#: 実インシデント (2026-09-03 ライブ監査 T11#8):
+#: 「埋め込みモデルは何を使っていますか？」に
+#: ``nomic-embed-text-v1.5`` と回答した (実際は ``bge-m3-q8_0``)。
+#: backend.log には ``Model identity fact pinned: Qwen3.8-27B-Q4_K_M.gguf``
+#: が出ている — **問いは埋め込みなのにベースモデルが確定事実として注入され**、
+#: しかも ``_append_self_description_fact`` が ``True`` で短絡するため、
+#: 正しい行 (``Embedding model: bge-m3-q8_0``) を持つ ``evoref_runtime_info``
+#: へ到達しなかった。除外して runtime_info 経路へ委ねる。
+_NON_BASE_MODEL_RE = re.compile(
+    r"埋め込み|エンベディング|(?<![A-Za-z])embedding(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
 def model_identity_question(query: str) -> bool:
-    """今動いているモデルの識別を訊いているか (純粋関数)。"""
-    return bool(query) and bool(_MODEL_IDENTITY_RE.search(query))
+    """今動いている **ベース** モデルの識別を訊いているか (純粋関数)。
+
+    埋め込みモデルの問い (``_NON_BASE_MODEL_RE``) は対象外
+    (``_HARDWARE_MEMORY_RE`` と同じ立て付け)。
+    """
+    if not query:
+        return False
+    if _NON_BASE_MODEL_RE.search(query):
+        return False
+    return bool(_MODEL_IDENTITY_RE.search(query))
 
 
 def tool_inventory_question(query: str) -> bool:
@@ -1921,24 +1948,37 @@ def _contains_any_keyword(query: str, keyword_re: "re.Pattern[str]") -> bool:
     return bool(keyword_re.search(query or ""))
 
 
-def has_history_recall_keyword(query: str, *, locale_aware: bool = True) -> bool:
+def has_history_recall_keyword(query: str) -> bool:
     """明示的な履歴参照キーワード (:data:`HISTORY_KEYWORDS`) を含むか (純粋関数)。
 
-    ``locale_aware=True`` (既定) は GUI の言語設定に従って JA / EN の片方だけを
-    見る (``tool_judge_history`` の強制発火判定)。``False`` は両方を見る
-    (``agent.router`` の層分類 — locale に関係なく英語の履歴参照を拾う)。
-    以前は 3 箇所 (router / tool_judge_history / ここの長距離版) に同じ
-    小文字化 + 部分一致が書き写されていた。
+    JA / EN 両方の語彙を **locale に関わらず** 見る。以前は呼出側が
+    ``locale_aware`` で片側評価を選べたが、GUI locale が既定 'ja' のまま英語で
+    打つと ``tool_judge_history`` の強制発火が english の "earlier" /
+    "remember" を一切拾わなかった (router 側は 2026-07-22 に両側評価へ倒して
+    おり、同じ語彙で判定が食い違っていた)。
+    ASCII 語は ``_keyword_union`` が英字境界を付けるので、union にしても
+    ``before`` が "beforehand" に当たるような誤検出は増えない。
     """
-    if not locale_aware:
-        return _contains_any_keyword(query, _HISTORY_KEYWORD_RE) or _contains_any_keyword(
-            query, _HISTORY_KEYWORD_RE_EN,
-        )
-    from backend.free.core.locale_patterns import select_locale_variant
-
-    return _contains_any_keyword(
-        query, select_locale_variant(_HISTORY_KEYWORD_RE, _HISTORY_KEYWORD_RE_EN),
+    return _contains_any_keyword(query, _HISTORY_KEYWORD_RE) or _contains_any_keyword(
+        query, _HISTORY_KEYWORD_RE_EN,
     )
+
+
+#: 履歴参照語 1 語ごとの境界付きパターン。どの語に当たったか (= 近接か長距離か)
+#: を知りたい呼出側 (``tool_judge_history._only_proximal_recall_keywords``) 用。
+#: 以前あちらは ``kw in query.lower()`` の素の部分一致で、``_keyword_union`` が
+#: ASCII に付けている境界を持たない **食い違った複製** だった。
+_HISTORY_KEYWORD_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = tuple(
+    (kw, _keyword_union([kw])) for kw in (*HISTORY_KEYWORDS, *HISTORY_KEYWORDS_EN)
+)
+
+
+def matched_history_keywords(query: str) -> list[str]:
+    """``query`` に現れる履歴参照語を JA / EN 双方から集めて返す (純粋関数)。"""
+    text = query or ""
+    if not text:
+        return []
+    return [kw for kw, pattern in _HISTORY_KEYWORD_PATTERNS if pattern.search(text)]
 
 
 #: 「(過去に述べられた事実) は何日でしたか？」型の **想起の文末**。
@@ -2138,3 +2178,20 @@ EXECUTABLE_QUERY_PATTERNS_EN: list[re.Pattern] = _compile_groups(
 #: 1 本に畳んだゲート (``_infer_tool`` 用)。
 EXECUTABLE_QUERY_RE_JA = _union_pattern(EXECUTABLE_QUERY_TERM_GROUPS_JA)
 EXECUTABLE_QUERY_RE_EN = _union_pattern(EXECUTABLE_QUERY_TERM_GROUPS_EN)
+
+#: JA / EN 双方を **locale に関わらず** 評価する union。消費側 (``_TOOL_PATTERNS``
+#: / ``_infer_tool`` のゲート) はこちらを使う — GUI locale は UI の言語であって
+#: 入力の言語ではなく、片側だけ評価するとその言語の実行可能クエリが丸ごと
+#: 落ちる。9 グループ中 6 つ (ハードウェア / 日時 / ネットワーク / OS /
+#: Python / 環境変数) は元から日英共通なので、重複を除いて畳む。
+#: 言語固有の 3 グループはどちらも他言語文へ誤爆しない — JA 側は和文字のみ
+#: (例外の ``Base64`` は両言語で同じ語)、EN 側は全語が ``ascii_boundary`` 付き。
+EXECUTABLE_QUERY_TERM_GROUPS_ALL: tuple = tuple(
+    dict.fromkeys(
+        (*EXECUTABLE_QUERY_TERM_GROUPS_JA, *EXECUTABLE_QUERY_TERM_GROUPS_EN),
+    ),
+)
+EXECUTABLE_QUERY_PATTERNS_ALL: list[re.Pattern] = _compile_groups(
+    EXECUTABLE_QUERY_TERM_GROUPS_ALL,
+)
+EXECUTABLE_QUERY_RE_ALL = _union_pattern(EXECUTABLE_QUERY_TERM_GROUPS_ALL)

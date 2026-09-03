@@ -64,8 +64,10 @@ PROMPT_DEFECT_WEIGHTS: dict[str, float] = {
 #: 文字の大きい方を超えた候補は fitness 0.0 で棄却する。旧実装は 2000 文字超で
 #: -0.02 の軟ペナルティしか無く、失敗語カバー率ボーナス (+0.1) が常にそれを
 #: 上回るため「失敗クエリの語を詰め込んで伸びる」方向が選択的優位だった (L-A3)。
-LENGTH_GATE_RATIO = 1.2
-LENGTH_GATE_SLACK_CHARS = 400
+#: 2026-09-03 (f_04 §4.5.2): 規則単位の delete が入ったので伸びる側を締める
+#: (ラチェット)。現行長を超えて伸びるのは slack 分だけ。
+LENGTH_GATE_RATIO = 1.0
+LENGTH_GATE_SLACK_CHARS = 200
 
 #: 失敗クエリ語カバー率のボーナス上限。候補間のタイブレークにだけ使い、欠陥率
 #: (base) を覆さない。
@@ -138,7 +140,9 @@ _EDIT_SYSTEM_PROMPT = (
     '- "anchor": copy ONE existing line from the prompt verbatim. '
     "It only locates the edit.\n"
     '- "op": "insert_after" adds a new line below the anchor, '
-    '"replace" rewrites the anchor line.\n'
+    '"replace" rewrites the anchor line, '
+    '"delete" removes the anchor line (only when it is redundant or harmful; '
+    'text may then be empty).\n'
     '- "text": the new line. Max 30 words, in the same language as the prompt.\n'
     "Never restructure the prompt and never output the whole prompt."
 )
@@ -152,7 +156,7 @@ _EDIT_RESPONSE_FORMAT = {
         "schema": {
             "type": "object",
             "properties": {
-                "op": {"type": "string", "enum": ["insert_after", "replace"]},
+                "op": {"type": "string", "enum": ["insert_after", "replace", "delete"]},
                 "anchor": {"type": "string"},
                 "text": {"type": "string"},
             },
@@ -237,13 +241,26 @@ def _apply_prompt_edit(current: str, op: str, anchor: str, text: str) -> str | N
     if index is None:
         return None
 
+    lines = current.split("\n")
+    if op == "delete":
+        # 消せるのは箇条だけ (タイトル / 前文 / 見出しは構造)。
+        if not _BULLET_RE.match(lines[index]):
+            return None
+        del lines[index]
+        mutated = "\n".join(lines)
+        return mutated if mutated.strip() != current.strip() else None
+
     new_text = text.strip()
     if not new_text or len(new_text) > _EDIT_MAX_TEXT_CHARS:
         return None
 
-    lines = current.split("\n")
     match op:
         case "insert_after":
+            # 追加は必ず箇条として書く。段落 (intro) として入ると台帳で計数も
+            # delete もされない行になり、進化が計数外で伸びる (実機 2026-09-03:
+            # 段落アンカーへの insert_after が 5 件、全て intro 扱いだった)。
+            if not _BULLET_RE.match(new_text) and not _HEADING_RE.match(new_text):
+                new_text = "- " + new_text
             lines.insert(index + 1, new_text)
         case "replace":
             lines[index] = new_text
@@ -369,6 +386,12 @@ class PromptEvolver:
     #: ``_darwinian_evolve`` が現行プロンプト長をセットする (長さゲートの基準)。
     #: ``None`` ならゲート無し (単体テスト / 直接呼出)。
     _reference_len: int | None = None
+    #: 規則の削除ゲート (f_04 §4.5.2)。行テキストを受け「台帳の計数が削除を
+    #: 許すか」を返す。未注入なら delete は常に棄却 (証拠なしに規則を消さない)。
+    delete_gate: Callable[[str], bool] | None = None
+    #: 1 回の進化で許す delete の上限 (``prompt.max_deletes_per_run``)。
+    max_deletes_per_run: int = 1
+    _deletes_this_run: int = 0
 
     def _calc_fitness(
         self,
@@ -517,6 +540,8 @@ class PromptEvolver:
             logger.warning("Prompt edit missing op/anchor/text; rejecting")
             return None
 
+        if op == "delete" and not self._delete_allowed(current, anchor):
+            return None
         mutated = _apply_prompt_edit(current, op, anchor, text)
         if mutated is None:
             logger.info(
@@ -526,6 +551,31 @@ class PromptEvolver:
             return None
         logger.info("Prompt edit applied: op=%s anchor=%.40r", op, anchor)
         return mutated
+
+    def _delete_allowed(self, current: str, anchor: str) -> bool:
+        """delete は台帳の証拠と回あたり上限の両方を通ったときだけ許す。"""
+        if self._deletes_this_run >= self.max_deletes_per_run:
+            logger.info("Prompt edit rejected: delete budget for this run is spent")
+            return False
+        gate = self.delete_gate
+        if gate is None:
+            logger.info("Prompt edit rejected: delete has no evidence gate")
+            return False
+        _, editable = _editable_view(current)
+        index = _resolve_anchor(editable, anchor)
+        if index is None:
+            return False
+        line = current.split("\n")[index]
+        try:
+            allowed = bool(gate(line))
+        except Exception as e:
+            logger.warning("delete gate failed: %s: %s", type(e).__name__, e)
+            return False
+        if not allowed:
+            logger.info("Prompt edit rejected: ledger counts do not justify deleting %.40r", line)
+            return False
+        self._deletes_this_run += 1
+        return True
 
     async def _mutate_prompt(
         self,
@@ -1036,6 +1086,7 @@ class PromptEvolver:
         cb = _CircuitBreaker()
         # 長さゲートの基準 = 現行プロンプト長 (このモードの進化中だけ有効)。
         self._reference_len = len(current)
+        self._deletes_this_run = 0
         try:
             resumed = self._restore_population(resume_state)
             if resumed is not None:

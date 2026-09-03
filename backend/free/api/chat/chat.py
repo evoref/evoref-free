@@ -8,6 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from backend.app_state import AppState, get_app_state
+from backend.aux_telemetry import open_aux_failure_ledger
+from backend.free.core.verifier_events import open_verifier_scope
 from backend.config import (
     get_config,
     get_mode_generation_params,
@@ -67,7 +69,7 @@ from backend.free.core.inference import latest_turn_truncation
 from backend.free.core.intent_vocab import is_whole_session_scope_query
 from backend.free.core.session_mode import (
     is_create_mode,
-    is_valid_session_mode,
+    canonicalize_session_mode,
     normalize_session_mode,
 )
 from backend.free.core.sse import SSEFrameBuilder
@@ -87,7 +89,12 @@ from backend.free.generation.direct_codegen import generate_single_file
 from backend.free.generation.models import ContentType
 from backend.free.agent.meta_cognitive_tasks import EditorArtifact
 from backend.log_config import get_logger
-from backend.trace_context import generate_trace_id, set_trace_id
+from backend.trace_context import (
+    generate_trace_id,
+    set_private,
+    set_private_text,
+    set_trace_id,
+)
 
 logger = get_logger("api.chat")
 
@@ -160,8 +167,17 @@ def _validate_chat_request(req: ChatRequest) -> None:
             detail=f"Message too long: {len(req.message)} chars (max {MAX_MESSAGE_LENGTH})",
         )
 
-    if not is_valid_session_mode(req.mode):
+    # 旧名 ("coding") は現行名へ正規化してから通す。``canonicalize_session_mode``
+    # の docstring が「API 受信など入口で使う」と定めている互換で、
+    # ``LEGACY_SESSION_MODES`` も「旧クライアントからの受信を読めるように
+    # するための入口互換」と書いているのに、**どの入口でも呼ばれていなかった**
+    # (2026-09-03 ライブ監査: mode="coding" が 10 ターンすべて
+    # ``HTTP 400 Invalid mode: coding``)。req.mode を現行名へ書き換えるので
+    # 下流の ``is_create_mode`` 等はそのまま効く。
+    canonical_mode = canonicalize_session_mode(req.mode)
+    if canonical_mode is None:
         raise HTTPException(status_code=400, detail=f"Invalid mode: {req.mode}")
+    req.mode = canonical_mode
 
     if req.session_id is not None and not _SESSION_ID_RE.match(req.session_id):
         raise HTTPException(
@@ -223,6 +239,31 @@ def _resolve_system_prompt(
     return ensure_static_directives(
         f"You are {instance_name}, a helpful AI assistant.",
     )
+
+
+def _append_fact_slate(state: AppState, session_id: str | None, system_prompt: str) -> str:
+    """押し出したターンの要点表 (f_02 §1.2) を静的 system の末尾に足す。
+
+    スレートは押し出しのあったターンでしか変わらないので、system は同一
+    セッション内で押し出しの間隔だけ安定し、接頭辞 KV は静的部分まで共通のまま。
+    予算は ``prompt.fact_slate_max_tokens`` (0 で無効)。
+    """
+    get = getattr(state, "get_memory_system", None)
+    if get is None:
+        return system_prompt
+    try:
+        mem_sys = get(session_id)
+    except Exception:
+        return system_prompt
+    slate = getattr(mem_sys[0], "fact_slate", None) if mem_sys else None
+    if slate is None or not len(slate):
+        return system_prompt
+    cfg = getattr(state, "config", None) or {}
+    budget = int((cfg.get("prompt") or {}).get("fact_slate_max_tokens", 200))
+    from backend.i18n_helper import prompt_locale
+
+    text = slate.render(budget, prompt_locale())
+    return f"{system_prompt}\n\n{text}" if text else system_prompt
 
 
 def _resolve_fewshot_block(
@@ -484,7 +525,9 @@ async def _dispatch_continuation(
       「続けて」をキーに入れると、後日の無関係な「続けて」へ 5 分以内に
       同じ続きが再生される。
     """
-    system_prompt = _resolve_system_prompt(state, req.mode, instance_name)
+    system_prompt = _append_fact_slate(
+        state, session_id, _resolve_system_prompt(state, req.mode, instance_name),
+    )
     # 履歴の最後 (= 今回の「続けて」) を継続指示へ差し替える。WM 側は
     # ユーザーの実発話のまま残すので、記録と表示は「続けて」で一貫する。
     cont_history = list(history)
@@ -592,7 +635,9 @@ async def _dispatch_reactive_light(
     軽量さは「RAG / SemMem / few-shot / ツール判定を通さない」ことと
     ``max_tokens`` の上限で担保しており、履歴を削ることではない。
     """
-    system_prompt = _resolve_system_prompt(state, req.mode, instance_name)
+    system_prompt = _append_fact_slate(
+        state, session_id, _resolve_system_prompt(state, req.mode, instance_name),
+    )
     semmem_block = await _light_semmem_block(req, state, cfg, timer, session_id)
     light_messages = build_chat_messages(
         system_prompt, history,
@@ -1541,6 +1586,13 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     """SSE ストリーミングチャット応答（3層エージェントディスパッチ）"""
     trace_id = generate_trace_id()
     set_trace_id(trace_id)
+    # private セッションではユーザー発話をログへ書かない。書く地点は多数
+    # あるので contextvar で伝播し、redaction processor 側で伏せる
+    # (structlog_config._PRIVATE_CONTENT_KEYS_LOWER)。
+    set_private(req.private)
+    set_private_text(
+        req.message if req.private else "", req.session_id or "",
+    )
 
     logger.debug(
         "POST /api/chat: mode=%s, stream=%s, message_len=%d, session=%s, trace_id=%s",
@@ -1572,11 +1624,18 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     # 不首尾の台帳も同じ宛先に向ける (tool_ledger と対)。自己申告の問いに
     # 「システムが観測した不首尾」を決定論的に渡すための材料。
     issue_ledger_scope(session_id, req.message)
+    # 補助判定の縮退もこのターンに紐づけて数える。結末 (outcome) と自己申告の
+    # 両方が「中身が縮退したターン」を見分けられるようにするための台帳。
+    open_aux_failure_ledger()
+    # 検証器の発火をこのターンに紐づける (規則台帳の計数、f_03 §3.5.1)。
+    open_verifier_scope(req.mode)
     # ファイル台帳も同じ宛先へ (「保存したファイルを読んで」の解決材料)。
     file_ledger_scope(session_id)
     # system は静的 (query 非依存) に保ち KV キャッシュを効かせる。query 依存の
     # few-shot は動的ブロックとして最後の user メッセージへ前置する (build_messages)。
-    system_prompt = _resolve_system_prompt(state, req.mode, instance_name)
+    system_prompt = _append_fact_slate(
+        state, session_id, _resolve_system_prompt(state, req.mode, instance_name),
+    )
 
     # 直前の応答が max_tokens で切れていて、今回の発話が「続けて」だけなら
     # 分類器を通さず継続生成へ。分類器を通すと必ず short_query →
@@ -1616,7 +1675,8 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     )
     logger.info(
         "Agent layer: %s (mode=%s) for query: %s",
-        agent_layer, req.mode, req.message[:80],
+        agent_layer, req.mode,
+        "[PRIVATE]" if req.private else req.message[:80],
     )
     # primary routing を decision.jsonl に記録 (evolve 限定)。後続の reactive→
     # light/deliberative escalation (_log_layer_escalation) は別 decision_point。

@@ -1150,6 +1150,22 @@ _MODEL_IDENTITY_FACT = (
 )
 
 
+#: モデル識別の問いに **同居する** 実行構成の語。識別の 1 行だけでは答え
+#: られない問い (「モデル名とコンテキスト長」) を検出し、``format_runtime_facts``
+#: の該当行を一緒に渡すために使う (:meth:`DeliberativeAgent._runtime_extra_facts`)。
+_RUNTIME_EXTRA_FACT_RE = re.compile(
+    r"(?<![A-Za-z_])n_ctx(?![A-Za-z_])"
+    r"|コンテキスト\s*(?:サイズ|長|ウィンドウ)"
+    r"|(?<![A-Za-z])context\s*(?:size|window|length)(?![A-Za-z])"
+    r"|スロット(?:数)?|(?<![A-Za-z])slots?(?![A-Za-z])"
+    r"|ポート(?:番号)?|(?<![A-Za-z])ports?(?![A-Za-z])"
+    r"|llama[-_]?server"
+    r"|埋め込みモデル|エンベディングモデル|(?<![A-Za-z])embedding\s*model(?![A-Za-z])"
+    r"|稼働時間|(?<![A-Za-z])uptime(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
 class DeliberativeAgent:
     """Deliberative 層: LLM 推論 + 補助タスクによるツール判定
 
@@ -1487,14 +1503,48 @@ class DeliberativeAgent:
             served = self._served_model_name(llm_client)
             if not served:
                 return False
-            append_to_last_user(
-                messages,
-                _MODEL_IDENTITY_FACT.format(model=served),
-                separator="",
+            fact = _MODEL_IDENTITY_FACT.format(model=served)
+            # 同じ問いで **識別以外の実行構成** (コンテキスト長 / スロット /
+            # ポート / 稼働時間) も訊かれているなら、その行も一緒に渡す。
+            # この注記は判定経路を短絡させる (ツール判定を cancel する) ので、
+            # 識別の 1 行だけ渡すと ``evoref_runtime_info`` が撃たれず、
+            # 残りの問いに答える材料が無くなる。実測 (2026-09-03 動作検証 T7):
+            # 「今どのモデルで動いていますか。コンテキスト長も」→ モデル名は
+            # 正答、コンテキスト長は「確認できていません」。
+            # 1 行目 (Instance name) は渡さない — それを掴んで「私は Alice です」
+            # と答えた事象 (T06-3) がこの関数の存在理由なので。
+            extra = self._runtime_extra_facts(query, llm_client)
+            append_to_last_user(messages, fact + extra, separator="")
+            logger.info(
+                "Model identity fact pinned: %s%s", served,
+                " (+runtime facts)" if extra else "",
             )
-            logger.info("Model identity fact pinned: %s", served)
             return True
         return False
+
+    @staticmethod
+    def _runtime_extra_facts(query: str, llm_client=None) -> str:
+        """識別以外の実行構成が訊かれていれば、その確定事実行を返す (無ければ空)。"""
+        if not _RUNTIME_EXTRA_FACT_RE.search(query or ""):
+            return ""
+        try:
+            from backend.config import get_config
+            from backend.free.core.system_info import format_runtime_facts
+
+            rendered = format_runtime_facts(
+                get_config(), getattr(llm_client, "metadata", None),
+            )
+        except Exception:
+            return ""
+        lines = [
+            ln for ln in rendered.splitlines()
+            if ln.strip()
+            and not ln.startswith("Instance name:")
+            and not ln.startswith("Base model")
+        ]
+        if not lines:
+            return ""
+        return "\n確定事実 (実行構成):\n" + "\n".join(lines)
 
     @staticmethod
     def _served_model_name(llm_client=None) -> str:

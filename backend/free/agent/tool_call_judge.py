@@ -25,7 +25,7 @@ from backend.free.core.intent_vocab import (
     is_plain_statement,
     looks_like_numeric_question,
 )
-from backend.free.core.locale_patterns import is_en_locale, select_locale_variant
+from backend.free.core.locale_patterns import select_locale_variant
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.safety_patterns import (
     extract_command_literal,
@@ -74,10 +74,8 @@ from backend.free.agent.tool_judge_signals import (
     _HARDWARE_MEMORY_QUERY_RE,
     _RUNTIME_INFO_QUERY_RE,
     _IMMEDIATE_CHILDREN_RE,
-    _INFER_TOOL_EXEC_QUERY_RE,
-    _INFER_TOOL_EXEC_QUERY_RE_EN,
-    _KNOWLEDGE_PATTERNS,
-    _KNOWLEDGE_PATTERNS_EN,
+    _INFER_TOOL_EXEC_QUERY_RE_ALL,
+    _KNOWLEDGE_PATTERNS_ALL,
     _LOCAL_FILE_REFERENCE_RE,
     _PATH_OR_URL_SIGNAL_RE,
     _READ_PATH_TOOLS,
@@ -88,8 +86,7 @@ from backend.free.agent.tool_judge_signals import (
     _SESSION_REFLECTIVE_VOCAB_BROAD_JA,
     _SESSION_REFLECTIVE_VOCAB_LEADING_EN,
     _SESSION_TOPIC_BREAK_LEAD_RE_EN,
-    _TOOL_PATTERNS,
-    _TOOL_PATTERNS_EN,
+    _TOOL_PATTERNS_ALL,
     _VERIFY_SYNTAX_INTENT_RE,
     _WEB_REFERENCE_RE,
     _code_usage_location_pattern,
@@ -1653,15 +1650,21 @@ class ToolCallJudge:
             return
         if not session_id:
             return
-        if is_en_locale():
-            patterns = _SELF_SESSION_REFERENCE_PATTERNS_EN
-            self_reference = (
-                not _SESSION_TOPIC_BREAK_LEAD_RE_EN.search(query)
-                and any(p.search(query) for p in patterns)
-            )
-        else:
-            patterns = _SELF_SESSION_REFERENCE_PATTERNS
-            self_reference = any(p.search(query) for p in patterns)
+        # JA / EN の自己参照パターンは GUI locale に関わらず両方評価する
+        # (union)。locale は UI の言語であって入力の言語ではないので、片側だけ
+        # 見ると「既定 'ja' のまま英語で打つ」使い方で自己参照が一切拾えず、
+        # 逆に exclude_session_id を注入して **答えのあるセッションを避けて**
+        # 検索する (2026-07-17/18 の実インシデントと同じ結末)。
+        # 話題切断のガードは言語ごとに形が違うため各言語に添えたまま union する
+        # — 日本語は「この会話**とは別**」と後置なのでパターン内の negative
+        # lookahead で足り、英語は "Aside from this conversation" と前置なので
+        # 別の前置きガードが要る (_SESSION_TOPIC_BREAK_LEAD_RE_EN)。
+        self_reference = any(
+            p.search(query) for p in _SELF_SESSION_REFERENCE_PATTERNS
+        ) or (
+            not _SESSION_TOPIC_BREAK_LEAD_RE_EN.search(query)
+            and any(p.search(query) for p in _SELF_SESSION_REFERENCE_PATTERNS_EN)
+        )
         if result.tool_args is None:
             result.tool_args = {}
         if self_reference:
@@ -2276,8 +2279,9 @@ class ToolCallJudge:
         has_tool_signal = (
             call.has_tool_signal if call is not None else _query_has_tool_signal(query)
         )
-        knowledge_patterns = select_locale_variant(_KNOWLEDGE_PATTERNS, _KNOWLEDGE_PATTERNS_EN)
-        if not has_tool_signal and any(p.search(query) for p in knowledge_patterns):
+        if not has_tool_signal and any(
+            p.search(query) for p in _KNOWLEDGE_PATTERNS_ALL
+        ):
             logger.debug("Rule-based: knowledge query detected, skipping tool: %s", query[:50])
             return ToolJudgement(tool_needed=False, source="rule")
 
@@ -2306,8 +2310,7 @@ class ToolCallJudge:
                     source="rule",
                 )
 
-        tool_patterns = select_locale_variant(_TOOL_PATTERNS, _TOOL_PATTERNS_EN)
-        if not any(p.search(query) for p in tool_patterns):
+        if not any(p.search(query) for p in _TOOL_PATTERNS_ALL):
             return ToolJudgement(tool_needed=False, source="rule")
 
         logger.debug("Rule-based: tool pattern matched for query: %s", query[:50])
@@ -2566,9 +2569,8 @@ class ToolCallJudge:
         # これらのクエリは Python コード生成 → run_command で正確に回答できる。
         # ツール名は mode から解決する (chat は run_command_readonly)。
         exec_tool = _executable_tool_for_mode(tools_registry, mode)
-        exec_query_re = select_locale_variant(_INFER_TOOL_EXEC_QUERY_RE, _INFER_TOOL_EXEC_QUERY_RE_EN)
         if (
-            exec_query_re.search(q)
+            _INFER_TOOL_EXEC_QUERY_RE_ALL.search(q)
             and exec_tool
             and not asks_about_prior_conversation_entity(query)
         ):

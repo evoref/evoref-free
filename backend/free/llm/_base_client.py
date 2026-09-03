@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import TypeVar
 
 import httpx
@@ -329,6 +330,16 @@ def make_retry_logger(
 STARTUP_PROBE_TIMEOUT_SEC = 30.0
 STARTUP_PROBE_INTERVAL_SEC = 1.0
 
+#: 一度も TCP 接続が成立しない場合の打ち切り。サーバが起動していない構成で
+#: 起動を長時間ブロックしないための別予算 (モデルサイズとは無関係)。
+STARTUP_PROBE_NO_LISTEN_SEC = 30.0
+
+#: GGUF 1GB あたりに見込むロード秒数。コールドキャッシュ + 低速ディスクでも
+#: 待ち切れる値を採る (上限は ``STARTUP_PROBE_MAX_SEC``)。実測は 16.3GB / 33.2s
+#: (約 2s/GB) だが、これは page cache が温まっていた測定なので余裕を持たせる。
+STARTUP_PROBE_SEC_PER_GB = 15.0
+STARTUP_PROBE_MAX_SEC = 600.0
+
 
 async def wait_for_server_ready(
     health_url: str,
@@ -356,18 +367,25 @@ async def wait_for_server_ready(
     Returns:
         200 OK を受信できれば ``True``、タイムアウトすれば ``False``。
     """
-    deadline = asyncio.get_event_loop().time() + timeout
+    loop = asyncio.get_event_loop()
+    started = loop.time()
     attempt = 0
+    # 一度でも TCP が繋がったか。繋がったうえで 503 が返るのは「モデルをロード
+    # 中」で、待てば必ず開く。一度も繋がらないのは「そもそも起動していない」で、
+    # いくら待っても開かない。両者を同じ上限で扱うと、モデルが大きい構成では
+    # 起動レースに負け、サーバ不在の構成では起動が無駄に長時間ブロックされる。
+    connected = False
     async with httpx.AsyncClient(timeout=2.0) as client:
         while True:
             attempt += 1
             try:
                 resp = await client.get(health_url)
+                connected = True
                 if resp.status_code == 200:
                     if attempt > 1:
                         logger.info(
-                            "%s ready after %d probe(s): %s",
-                            label, attempt, health_url,
+                            "%s ready after %d probe(s), %.1fs: %s",
+                            label, attempt, loop.time() - started, health_url,
                         )
                     return True
             except (
@@ -376,10 +394,49 @@ async def wait_for_server_ready(
                 httpx.RemoteProtocolError,
             ):
                 pass
-            if asyncio.get_event_loop().time() >= deadline:
+            budget = timeout if connected else min(timeout, STARTUP_PROBE_NO_LISTEN_SEC)
+            if loop.time() - started >= budget:
                 logger.warning(
-                    "%s not ready within %.1fs (%d probes): %s",
-                    label, timeout, attempt, health_url,
+                    "%s not ready within %.1fs (%d probes, %s): %s",
+                    label, budget, attempt,
+                    "still loading" if connected else "never accepted a connection",
+                    health_url,
                 )
                 return False
             await asyncio.sleep(interval)
+
+
+def resolve_startup_probe_timeout(
+    model_path: "str | Path | None", *, label: str = "llama-server",
+) -> float:
+    """モデルファイルサイズから起動プローブの上限を導く (純粋関数に近い I/O)。
+
+    **固定 30 秒はモデルサイズに追随しない。** 実測 (2026-09-03 ライブ監査):
+    16.3GB の Qwen3.8-27B Q4_K_M のロードに 33.2 秒かかり、30 秒の予算を
+    2 桁パーセント超過した。その結果 ``fetch_model_metadata`` が 503 を掴んで
+    ``local_client=None`` となり、**AuxClient がプロセス寿命の間ずっと
+    未配線**になった (MetaCognitive の計画生成と CritiqueSynthesizer が丸ごと縮退)。
+
+    上限を伸ばしても **正常系のコストはゼロ** — ``/health`` が 200 を返した
+    瞬間に戻るので、待つのは実際にロード中の間だけ。サーバ不在で無駄に待つ
+    ケースは ``STARTUP_PROBE_NO_LISTEN_SEC`` (接続が一度も成立しない場合の
+    別予算) が抑える。
+
+    サイズが読めない場合 (パス未解決 / 未ダウンロード) は既定へ倒す。
+    """
+    if not model_path:
+        return STARTUP_PROBE_TIMEOUT_SEC
+    try:
+        size_bytes = Path(model_path).stat().st_size
+    except OSError:
+        return STARTUP_PROBE_TIMEOUT_SEC
+    size_gb = size_bytes / (1024 ** 3)
+    budget = max(
+        STARTUP_PROBE_TIMEOUT_SEC,
+        min(size_gb * STARTUP_PROBE_SEC_PER_GB, STARTUP_PROBE_MAX_SEC),
+    )
+    if budget > STARTUP_PROBE_TIMEOUT_SEC:
+        logger.info(
+            "%s startup probe budget %.0fs (model %.1f GB)", label, budget, size_gb,
+        )
+    return budget

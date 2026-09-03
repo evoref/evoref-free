@@ -6,7 +6,7 @@ from backend.app_state import AppState, get_app_state
 from backend.config import get_path_resolver
 from backend.edition import get_pro_handler, is_pro
 from backend.free.api._error_responses import api_error
-from backend.free.core.session_mode import is_valid_session_mode
+from backend.free.core.session_mode import canonicalize_session_mode
 from backend.i18n_helper import msg
 from backend.free.api.learning._optimize_collectors import (
     collect_aux_prompt_history,
@@ -151,11 +151,15 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
             "api.optimize_invalid_level",
         )
 
-    if req.mode is not None and not is_valid_session_mode(req.mode):
-        raise api_error(
-            400, "E0400", "mode must be 'create' or 'chat'",
-            "api.optimize_invalid_mode",
-        )
+    if req.mode is not None:
+        # 旧名 ("coding") は現行名へ正規化する (chat 入口と同じ理由)。
+        canonical_mode = canonicalize_session_mode(req.mode)
+        if canonical_mode is None:
+            raise api_error(
+                400, "E0400", "mode must be 'create' or 'chat'",
+                "api.optimize_invalid_mode",
+            )
+        req.mode = canonical_mode
 
     scheduler = state.learning_scheduler
     if scheduler is None:
