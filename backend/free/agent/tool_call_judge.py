@@ -1874,7 +1874,10 @@ class ToolCallJudge:
         try:
             embedding = await self._embedder.embed_query(query, mode=mode)
         except Exception as exc:
-            logger.warning("URL recall: embed failed: %s", exc)
+            # 型も書く (引数なしのタイムアウト例外は str() が空になるため)。
+            logger.warning(
+                "URL recall: embed failed: %s: %s", type(exc).__name__, exc,
+            )
             return None
         if embedding is None or len(embedding) == 0:
             return None

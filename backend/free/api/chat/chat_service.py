@@ -333,7 +333,15 @@ async def run_search_pipeline(
                 rag_top_score=search_result.top_raw_score,
             )
     except Exception as e:
-        logger.warning("Search pipeline failed, continuing without RAG: %s", e)
+        # 例外の型も書く。``httpx.ReadTimeout()`` / ``asyncio.TimeoutError()``
+        # のような引数なしの例外は ``str(e)`` が空で、ログに
+        # ``Search pipeline failed, continuing without RAG:`` という **中身の
+        # 無い行** だけが残る (2026-09-04 ライブ監査で実際に観測)。そのターンは
+        # RAG 無しで進むので、何が落ちたか分からないと原因に辿り着けない。
+        logger.warning(
+            "Search pipeline failed, continuing without RAG: %s: %s",
+            type(e).__name__, e,
+        )
         # 埋め込みまでは済んでいるなら関連度ゲート用に返す。ここで落とすと
         # ``build_semmem_injection`` が「埋め込み失敗」と判定して SemMem の
         # 注入ごと見送り、RAG の失敗 1 件でそのターンの記憶が全部消える

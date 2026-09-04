@@ -517,6 +517,35 @@ _DISCOURSE_RECALL_EN_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 体言止めの問い (「〜は？」/「〜は。」/ 句読点なしの「〜は」)。
+#
+# ``_PERSONAL_RECALL_RE`` は同じ末尾形を持つが **一人称を必須** にしている。
+# 日本語は主語を落とすのが常態で、話題が前のターンで確立していれば一人称は
+# まず現れない。よって一人称を条件にした時点でこの形は必ず漏れる。
+#
+# 実インシデント (2026-09-04 ライブ監査): 直前のターンで
+# 「Rust 7 割 / C++ 3 割」を伝え、SemMem にも保持していたにもかかわらず、
+# 「**業務での言語比率は？**」(11 文字) が一人称を含まないため
+# personal_recall を外れ、``short_query -> reactive`` に落ちて記憶を一度も
+# 引かないまま「C++ が約 60%、Rust が約 40% です」と **比率を逆に捏造**した。
+# 同じ会話の「業務で使う言語の比率はどうなっていましたか？」は
+# discourse_recall に乗って正答している。
+#
+# 値の言明は ``は`` の後ろに必ず語が続く (「住まいは横浜です」) ので、
+# **末尾の ``は``** だけで問いと言明を分離できる (``_PERSONAL_RECALL_RE`` /
+# ``text_quality._QUESTION_ENDING_RE`` と同じ判別)。日本語の平叙文は
+# ``は`` で終わらない。
+#
+# 例外は挨拶だけ (「こんにちは」「こんばんは」) — 日本語で ``は`` で終わる
+# 定型句はこの閉じた集合しかない。
+_TOPIC_STOP_QUESTION_RE = re.compile(
+    r"(?:^|[。！!？?\n])\s*[^。！!？?\n]{2,40}は[？?。．.]?\s*$",
+)
+_GREETING_TOPIC_RE = re.compile(
+    r"(?:^|[。！!？?\n])\s*(?:こんにち|こんばん|今日|今晩|おはよう?ござい)"
+    r"は[？?。．.]?\s*$",
+)
+
 # 前提の同意を求める確認形。「〜ですよね？」「〜で合っていますか」など。
 #
 # knowledge_query の strict パターンは ``ですか|でしょうか|とは|教えて`` を持つが、
@@ -995,6 +1024,14 @@ _CLASSIFY_RULES: tuple[_ClassifyRule, ...] = (
         "continuation_request", "deliberative",
         lambda c, x: continuation_request(x.query),
     ),
+    # 体言止めの問い (「〜は？」) も short_query の手前に置く
+    # (_TOPIC_STOP_QUESTION_RE 参照)。上の個別ルール (numeric_question /
+    # knowledge_query / personal_recall …) を先に通してから受けるので、
+    # それらの matched-rule 識別子は変わらない。
+    _ClassifyRule(
+        "topic_stop_question", "deliberative",
+        lambda c, x: c._is_topic_stop_question(x.query),
+    ),
     _ClassifyRule(
         "short_query", "reactive",
         lambda c, x: x.is_short,
@@ -1406,6 +1443,14 @@ class ComplexityClassifier:
         return bool(
             _DISCOURSE_RECALL_RE.search(stripped)
             or _DISCOURSE_RECALL_EN_RE.search(stripped),
+        )
+
+    def _is_topic_stop_question(self, query: str) -> bool:
+        """体言止めの問いかを判定する (_TOPIC_STOP_QUESTION_RE 参照)。"""
+        stripped = query.strip()
+        return bool(
+            _TOPIC_STOP_QUESTION_RE.search(stripped)
+            and not _GREETING_TOPIC_RE.search(stripped),
         )
 
     def _is_premise_confirmation_query(self, query: str) -> bool:

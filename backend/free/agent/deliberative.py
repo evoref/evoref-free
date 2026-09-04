@@ -37,6 +37,7 @@ from backend.free.core.intent_vocab import (
     model_identity_question,
     own_process_question,
     self_assessment_question,
+    PREMISE_CONFIRMATION_RE,
     persist_request,
     resolve_session_position_message,
     session_position_kind,
@@ -547,6 +548,37 @@ _ISSUE_LEDGER_EMPTY_FACTS: dict[str, str] = {
 }
 
 #: 確認形で持ち込まれた「会話に無い数値」への注記。``listed``。
+#: 前提の同意を求める形なのに、根拠を取りに行けなかったターンへの注記。
+#:
+#: ルーター側の ``premise_confirmation`` は「確認形をを reactive に落とさない」
+#: までしかやらない。deliberative に乗せてもツールが撃てず RAG も弱いターンでは、
+#: モデルは **前提をそのまま追認する**。
+#:
+#: 実インシデント (2026-09-04 ライブ監査、実機で再現): 「evoref は RAG に
+#: LangChain を使っていますよね？」に **「はい、evoref は RAG に LangChain を
+#: 使用しています。」** と回答した。リポジトリの不変則 (LangChain / LlamaIndex /
+#: ChromaDB / FAISS を使わない) と真逆。**同じ会話の次のターン**
+#: 「evoref のベクトル検索は FAISS でしたよね。確認してください。」は
+#: ``確認してください`` がツール判定を撃って ``search_code`` が走り、正しく
+#: 否定できている。**分けていたのは知識ではなく根拠の有無**だった
+#: (2026-08-08 の同型インシデントと同じ結論)。
+#:
+#: 数値版 (:data:`_UNVERIFIED_CLAIM_NOTES`) と役割は同じで、そちらが
+#: 発火したターンでは付けない (注記が 2 つ並ぶと焦点がぼける)。
+_UNCONFIRMED_PREMISE_NOTES: dict[str, str] = {
+    "ja": (
+        "\n\nこの発言は前提への同意を求める形になっている。前提が正しいかは、"
+        "確認できた根拠 (この会話・注記・ツールの結果) だけで判断すること。"
+        "根拠が無ければ同意も否定もせず、確認できていない旨を述べること。"
+    ),
+    "en": (
+        "\n\nThis message asks you to agree with a premise. Judge whether the "
+        "premise holds only from evidence you can confirm (this conversation, "
+        "the notes, tool results). Without evidence, neither agree nor deny — "
+        "say that you cannot confirm it."
+    ),
+}
+
 _UNVERIFIED_CLAIM_NOTES: dict[str, str] = {
     "ja": (
         "\n\nこの発言に含まれる数値 {listed} は、ここまでの会話に一度も"
@@ -1882,6 +1914,26 @@ class DeliberativeAgent:
         )
         return True
 
+    @staticmethod
+    def _append_unconfirmed_premise_note(messages: list[dict], query: str) -> bool:
+        """根拠を取りに行けなかった確認形クエリへの注記を追記する。
+
+        詳細は :data:`_UNCONFIRMED_PREMISE_NOTES` を参照。
+
+        Returns:
+            注記を足したか。
+        """
+        if not PREMISE_CONFIRMATION_RE.search(query.strip()):
+            return False
+        append_to_last_user(
+            messages, _localized(_UNCONFIRMED_PREMISE_NOTES), separator="",
+        )
+        logger.info(
+            "Confirmation-form query with no tool evidence; "
+            "asked the model to answer from evidence instead of agreeing",
+        )
+        return True
+
     async def _judge_and_execute_tool(
         self,
         query: str,
@@ -2011,7 +2063,14 @@ class DeliberativeAgent:
             # 確認形で持ち込まれた未検証の数値は、ツールが撃てないターンほど
             # 危険。丸投げすると自分が計算した値を捨てて追認する
             # (_append_unverified_claim_note の docstring 参照)。
-            self._append_unverified_claim_note(messages, query, conversation)
+            # 数値が無い確認形 (「〜を使っていますよね？」) も同じ構造で、
+            # 既定の失敗は **前提をそのまま追認すること**
+            # (_UNCONFIRMED_PREMISE_NOTES 参照)。数値版が付いたターンでは
+            # 付けない — 注記が 2 つ並ぶと焦点がぼける。
+            if not self._append_unverified_claim_note(
+                messages, query, conversation,
+            ):
+                self._append_unconfirmed_premise_note(messages, query)
             # 直前の保存依頼に引数だけを与えたターン。宛先は今まさに与えられて
             # いるので「保存先を教えて」ではなく「まだ実行していない」を伝える
             # (_append_pending_write_note の docstring 参照)。
