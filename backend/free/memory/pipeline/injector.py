@@ -533,7 +533,10 @@ class MemoryInjector:
         決めるのと同じ辞書なので、注入側だけ別基準になることがない。
         LLM 呼び出しは無い。
         """
-        from backend.free.memory.notes.note_builder import resolve_fact_attribute
+        from backend.free.memory.notes.note_builder import (
+            MAX_ASKED_ATTRIBUTES,
+            resolve_fact_attribute_matches,
+        )
 
         slots: set[tuple[str, str]] = set()
         for text in session_user_texts or ():
@@ -583,10 +586,22 @@ class MemoryInjector:
                 continue
             if states_no_user_value(text) or carries_no_assertion(text):
                 continue
+            # **複数形の解決を使う。** 単数版は YAML 記載順で最初の 1 件を
+            # 返して打ち切るため、1 発話で複数の属性を述べると **先頭以外の
+            # スロットは抑止されず、古い値が並ぶ**。日本語の自己紹介は
+            # 1 発話に複数属性を詰めるのが普通なので、単数版では常に漏れる。
+            # 抽出側は同じ理由で 2026-08-25 に、``_asked_attributes`` は
+            # 2026-08-30 に複数形へ移行済みで、抑止側だけ単数のまま残っていた。
+            #
+            # 実測 (2026-09-04): 「私は小川です。横浜に住んでいます。仕事は
+            # バックエンドエンジニアです。」→ 単数版は ``location`` だけ、
+            # 複数版は ``location`` + ``occupation``。単数版のままだと前
+            # セッションの ``mem.personal.occupation`` が抑止されずに並ぶ。
             for fact_type in _USER_ATTRIBUTE_FACT_TYPES:
-                attr = resolve_fact_attribute(text, fact_type, mode=mode)
-                if attr:
-                    slots.add((fact_type, attr))
+                for slug, _ in resolve_fact_attribute_matches(
+                    text, fact_type, mode=mode, limit=MAX_ASKED_ATTRIBUTES,
+                ):
+                    slots.add((fact_type, slug))
         return slots
 
     @staticmethod
@@ -773,9 +788,48 @@ class MemoryInjector:
         attr_exempt = 0
         anchors = query_anchors(query_text)
         anchor_exempt = 0
+        # **話題を持たない継続指示には記憶を注入しない。**
+        #
+        # 「表にしてください。」「もう一度お願いします。」のように内容語を
+        # 1 つも持たない指示は、直前のターンを指す照応でしかない。ところが
+        # 埋め込みは中身の無い文にも何らかのベクトルを与えるので、関連度ゲート
+        # だけでは **無関係なファクトが通る**。しかも注入された行は会話履歴より
+        # プロンプトの近くに置かれるため、モデルの話題ごと持っていかれる。
+        #
+        # 実インシデント (2026-09-04 ライブ監査 T05#1): pytest のテストケースを
+        # 3 つ挙げた直後の「表にしてください。」に対し、注入は
+        # ``anchors=- asked_attrs=- items=7`` (名古屋 / Rust / 好きな色は緑 …)
+        # となり、実機はテストケースではなく **ユーザープロフィールの表** を
+        # 出した。
+        #
+        # 判定は既存の決定論ヘルパだけで組む (語彙を新しく列挙しない):
+        # 属性を 1 つも尋ねておらず (``asked_attrs``)、内容語アンカーも無く
+        # (``anchors``)、かつ本文が値を述べていない (``states_no_user_value``)
+        # ときに限る。「私の趣味は？」は ``asked_attrs`` が、「インデックスの話
+        # を 3 行で。」は ``anchors`` が立つので影響を受けない。
+        #
+        # **``pinned`` も免除しない。** pin は「優先度」の宣言であって話題との
+        # 関連の証拠ではない。しかも pin 検出は「覚えて」「重要」等の語で
+        # 発火するので、**訂正文や依頼文がそのまま自動 pin される** (同ファイル
+        # の ``carries_no_assertion`` / ``states_no_user_value`` が pin を
+        # 例外にしないのと同じ理由)。実測 (2026-09-04 修正後の再現): pin を
+        # 免除したところ ``topicless=228`` で 228 件落としてなお 5 件
+        # (「好きな色は緑」「会社は名古屋」…) が残り、話題の無い指示に
+        # 陳腐なプロフィールが並び続けた。次の内容のあるターンで戻る。
+        topicless_directive = bool(
+            query_text
+            and not asked_attrs
+            and not anchors
+            and states_no_user_value(query_text)
+        )
+        topicless_dropped = 0
 
         for fact in facts:
             if fact.superseded_by:
+                continue
+            if topicless_directive:
+                filtered_out += 1
+                topicless_dropped += 1
                 continue
             # 今回の会話で同じ属性スロットを述べ直しているファクトは注入しない。
             # ラベルには「今回の会話と食い違えば今回が優先」と書いてあるが、
@@ -890,6 +944,10 @@ class MemoryInjector:
         note_scores: dict[int, float] = {}
         for note in stm_notes:
             pinned = bool(getattr(note, "pin_flag", False))
+            if topicless_directive:
+                filtered_out += 1
+                topicless_dropped += 1
+                continue
             # ファクト側で却下した世代が、同じ本文のままノート経由で戻るのを塞ぐ
             # (``_is_stale_duplicate`` 参照)。pin も例外にしない — 判断済みの
             # 内容の再提示に優先度を与える理由が無い。
@@ -1056,13 +1114,13 @@ class MemoryInjector:
             "MemoryInjector.inject: mode=%s budget=%d used=%d items=%d "
             "dropped=%d project=%s sigs=%d relevance=%s filtered=%d "
             "near_dup=%d asked_attrs=%s attr_exempt=%d anchors=%s "
-            "anchor_exempt=%d retired=%d",
+            "anchor_exempt=%d retired=%d topicless=%d",
             mode, budget, plan.used_tokens, len(plan.items),
             len(plan.dropped), current_project_id, len(sigs),
             "on" if query_vec is not None else "off", filtered_out,
             dedup_dropped, sorted(asked_attrs) or "-", attr_exempt,
             sorted(anchors) or "-", anchor_exempt,
-            retired_dropped,
+            retired_dropped, topicless_dropped,
         )
         if retired_dropped:
             # 訂正が効いているかを実機で追えるようにする (沈黙で落とさない)。

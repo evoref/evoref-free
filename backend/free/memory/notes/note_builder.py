@@ -449,6 +449,33 @@ def _trigger_variants(word: str) -> tuple[str, ...]:
     return (word, *(stem + c for c in _ENUMERATION_CONNECTORS))
 
 
+@lru_cache(maxsize=4096)
+def _genitive_variants(word: str) -> tuple[str, ...]:
+    """助詞終わりの trigger の **属格形** (「名前は」→「名前の」)。
+
+    並列形 (:func:`_trigger_variants`) と同じ構造の穴。属性を尋ねる日本語は
+    助詞ではなく「の」で名詞を続けることが多い::
+
+        「私の名前は？」        → 名前は  … 一致
+        「名前の表記は？」      → 名前の  … **どの trigger にも一致しない**
+
+    実インシデント (2026-09-04 ライブ監査 T06#3): 「名前の表記も確認させて
+    ください。漢字ではどう書きますか。」で ``asked_attrs`` が空になり、
+    ``mem.personal.name states: 小川と申します`` が **live のまま**
+    コサインのゲートで落ちた。実機は「読み音『おがわ ひろゆき』のみが記載
+    されており、漢字表記は不明です」と答えた。
+
+    **``requires_self_possessor`` を宣言したスロットにしか導かない。**
+    属格は所有者を明示する形なので、所有者ガードのあるスロットでは
+    「猫の名前の読み」が本人スロットへ落ちない。ガードの無いスロットに
+    広げると「仕事**の**合間に山に行きます」が単値の ``occupation`` へ入り、
+    **正しい職種を supersede して消す**。
+    """
+    if len(word) < 2 or word[-1] not in _TOPIC_PARTICLES:
+        return ()
+    return (word[:-1] + _GENITIVE_PARTICLE,)
+
+
 #: 属性 trigger の末尾に付く話題・格助詞。語幹を切り出す判定に使う。
 _TOPIC_PARTICLES: frozenset[str] = frozenset({"は", "が", "を"})
 #: 属性を並べるときに助詞の代わりに入る連結詞
@@ -457,10 +484,27 @@ _ENUMERATION_CONNECTORS: tuple[str, ...] = ("と", "や", "、", ",", "・")
 #: 「<役割>です」形の trigger の語尾。
 _COPULA_SUFFIX = "です"
 #: ``<役割>です`` と同じ属性を指す「〜している」系の言い回し。
+#:
+#: **て形 (連用中止) を落とさない。** 日本語の自己紹介は属性を te 形で連ねるのが
+#: 普通で (「都内でバックエンドエンジニア**をしていて**、普段は Python と Go を
+#: 書いています。」)、``をしています`` だけだと文末形のときしか当たらない。
+#:
+#: 実インシデント (2026-09-04 ライブ監査 T01): 上の自己紹介から
+#: ``mem.personal.occupation`` が 1 件も作られず、3 ターン後の
+#: 「私の職業と、普段使っているプログラミング言語は何と言いましたか？」に
+#: 前セッションの陳腐値 (「名古屋で自動車向けの制御ソフト / 業務の 7 割が
+#: Rust」) がそのまま返った。50 ターン後の再確認でも同じ値のまま。
+#: 書き込み側でファクトが生まれないので、読み出し側の抑止
+#: (:meth:`MemoryInjector._restated_slots`) もスロットを解決できず二重に効かない。
 _COPULA_ACTIVITY_FORMS: tuple[str, ...] = (
-    "をしています", "をしている", "をやっています", "をやっている",
+    "をしています", "をしている", "をしていて",
+    "をやっています", "をやっている", "をやっていて",
     "として働", "を務めて",
 )
+
+#: 属格の助詞。``requires_self_possessor`` を宣言したスロットに限り、
+#: 助詞終わりの trigger からこの形も導く (:meth:`AttributeSpec._variants`)。
+_GENITIVE_PARTICLE = "の"
 
 
 @dataclass(frozen=True, slots=True)
@@ -542,7 +586,10 @@ class AttributeSpec:
         **trigger の構造** から並列形を導く: 助詞で終わる trigger は、その語幹 +
         連結詞も同じ属性を指す。
         """
-        return _trigger_variants(word)
+        base = _trigger_variants(word)
+        if not self.requires_self_possessor:
+            return base
+        return base + _genitive_variants(word)
 
     def match(self, haystack: str) -> tuple[str, ...]:
         """``haystack`` に **実際に現れた** trigger 語形を返す (無ければ空タプル)。

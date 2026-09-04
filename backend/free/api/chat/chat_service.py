@@ -470,16 +470,24 @@ def _attribute_slots(text: str) -> frozenset[tuple[str, str]]:
     使う。``core.inference`` から EvorefMem を直接引かせないため、解決器は
     呼出側 (ここ) から渡す。LLM 呼び出しは無い。
     """
-    from backend.free.memory.notes.note_builder import resolve_fact_attribute
+    from backend.free.memory.notes.note_builder import (
+        MAX_ASKED_ATTRIBUTES,
+        resolve_fact_attribute_matches,
+    )
     from backend.free.memory.pipeline.injector import _USER_ATTRIBUTE_FACT_TYPES
 
     if not text:
         return frozenset()
     slots: set[tuple[str, str]] = set()
+    # **複数形の解決を使う。** 単数版は最初の 1 件で打ち切るため、1 発話で
+    # 複数の属性を述べると先頭以外のスロットが抑止されない。抑止経路は 2 本
+    # あり (``MemoryInjector._restated_slots`` とここ)、片方だけ直しても
+    # もう片方が同じ判定を掛け直すので、両方を複数形に揃える。
     for fact_type in _USER_ATTRIBUTE_FACT_TYPES:
-        attr = resolve_fact_attribute(text, fact_type, mode="chat")
-        if attr:
-            slots.add((fact_type, attr))
+        for slug, _ in resolve_fact_attribute_matches(
+            text, fact_type, mode="chat", limit=MAX_ASKED_ATTRIBUTES,
+        ):
+            slots.add((fact_type, slug))
     return frozenset(slots)
 
 
