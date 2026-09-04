@@ -1154,14 +1154,31 @@ class ChatExtractor(BaseExtractor):
                         triggers_dir=self._builder.triggers_dir,
                     )
                     if not matches:
-                        # 属性語を落とした訂正は直前の言明からスロットを継ぐ
-                        # (resolve_inherited_attributes の説明を参照)。
-                        # 継承も効かないときは、訂正文が名指した既存スロットの
-                        # 現在値から決める (value_anchored)。継承より後に置くのは
-                        # 「直前の言明」の方が近い文脈だから。
+                        # 属性語を落とした訂正の宛先は 2 通りで決める。
+                        #
+                        # 1. ``value_anchored`` — 訂正文が **既存スロットの
+                        #    現在値を名指している** (証拠)
+                        # 2. ``inherited`` — 直前に属性を解決した言明のスロット
+                        #    を継ぐ (隣接に基づく推測)
+                        #
+                        # **証拠を推測より先に採る。** 逆順にしていたため、
+                        # 直前の発話と無関係な訂正が隣のスロットを乗っ取り、
+                        # ``from_correction`` でそのスロットの live を全部
+                        # supersede した。実インシデント (2026-09-04 ライブ監査、
+                        # 実ストアで確認)::
+                        #
+                        #     直前: 補足すると、住まいは横浜で、休日は…
+                        #     訂正: 訂正します。C++ より Rust の比率のほうが…
+                        #     → inherited=location で「横浜」を supersede
+                        #       (value_anchored は Rust を手掛かりに
+                        #        occupation を正しく指していた)
+                        #
+                        # 「直前の言明の方が近い文脈だから」という理由で継承を
+                        # 優先していたが、近さは **何を訂正しているか** を
+                        # 決めない。名指された現在値の方が強い根拠になる。
                         destination = (
-                            inherited.get((note.id, tag))
-                            or value_anchored.get((note.id, tag))
+                            value_anchored.get((note.id, tag))
+                            or inherited.get((note.id, tag))
                         )
                         if destination is None and _resolves_a_concrete_attribute(
                             content, tags, self.SUPPORTED_TAGS,

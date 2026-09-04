@@ -107,6 +107,17 @@ class SleepTimeScheduler:
         #: True の間は :meth:`on_user_input` が worker も待機タスクも止めない
         #: (:meth:`_schedule_full` の説明を参照)。
         self._full_forced_run: bool = False
+        #: Level 1 による繰り延べが **始まった** 時刻 (monotonic)。繰り延べて
+        #: いない間は ``None``。ログを「状態」ではなく「遷移」で出すために持つ
+        #: (:meth:`_schedule_full` の Level 1 ゲートを参照)。
+        #:
+        #: **待機タスクのキャンセルでは消さない。** 繰り延べ中の
+        #: ``_full_task`` はユーザー入力のたびにデバウンスで消えるので、
+        #: そこで消すと次の応答で張り直されたタスクが再び INFO を出し、
+        #: 応答ごとの氾濫に戻る。繰り延べは Level 1 が走っている限り続いて
+        #: いる一続きの事象なので、解ける瞬間 (:meth:`_note_level1_defer_ended`)
+        #: まで持ち越す。
+        self._level1_defer_since: float | None = None
         # Trigger C: Level 1 のアイドル閾値の config 値。実効値は
         # :attr:`level1_idle_minutes` (LearningScheduler のポリシー解決値を優先)。
         self._level1_idle_minutes_cfg: float = learning.get("level1_idle_minutes", 30)
@@ -614,6 +625,22 @@ class SleepTimeScheduler:
         await self._worker.run_full(client)
         return True
 
+    def _note_level1_defer_ended(self) -> None:
+        """Level 1 による繰り延べが解けたことを 1 行だけ記録する。
+
+        繰り延べ中は DEBUG に落としているので、**解けた瞬間の 1 行** が
+        「どれだけ待たされたか」の唯一の手掛かりになる。繰り延べていなければ
+        何もしない。
+        """
+        started = self._level1_defer_since
+        if started is None:
+            return
+        self._level1_defer_since = None
+        logger.info(
+            "Trigger B: resumed after %.1f min deferred by Level 1",
+            (time.monotonic() - started) / 60,
+        )
+
     async def _schedule_full(self) -> None:
         """Trigger B: full_idle_minutes 後に Full 版を実行する。
 
@@ -654,13 +681,27 @@ class SleepTimeScheduler:
             # 自分を再スケジュールして繰り延べる (L-A5)。
             l1_running = getattr(self._learning_scheduler, "running", False)
             if isinstance(l1_running, bool) and l1_running:
-                logger.info(
-                    "Trigger B: deferred, Level 1 is running on the background slot",
-                )
+                # ログは **状態ではなく遷移** で出す。この分岐は 30 秒ごとに
+                # 自分を再スケジュールするので、毎回 INFO を出すと同じ 1 行が
+                # 延々と積まれるだけで「どれだけ繰り延べたか」が読めない
+                # (2026-09-04 ライブ監査: 1 日 82 行、全て同一文言)。ターンに
+                # 紐づかず時間だけで増える INFO はこの行だけだった。
+                if self._level1_defer_since is None:
+                    self._level1_defer_since = time.monotonic()
+                    logger.info(
+                        "Trigger B: deferred, "
+                        "Level 1 is running on the background slot",
+                    )
+                else:
+                    logger.debug(
+                        "Trigger B: still deferred by Level 1 (%.1f min)",
+                        (time.monotonic() - self._level1_defer_since) / 60,
+                    )
                 success = True
                 skipped_reason = "level1_running"
                 self._full_task = asyncio.create_task(self._schedule_full())
                 return
+            self._note_level1_defer_ended()
 
             # 生成中は割り込まない (同一 llama-server 上でスロットとバッチを
             # 奪い合う)。ただし **期限切れ / 前倒し要求済み** の Full は、

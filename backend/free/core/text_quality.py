@@ -24,6 +24,30 @@ from collections.abc import Callable, Iterable, Sequence
 #: の貪欲法でも再現した — サンプリングではなく出力分布そのものの性質。
 _JA_INTERWORD_SPACE_RE = re.compile(r"[ぁ-んァ-ヶ一-龥][ 　]+[ぁ-んァ-ヶ一-龥]")
 
+#: 語間空白を数える単位 (文 / 行)。
+#:
+#: 「1 箇所でも見つかれば崩れ」としていたため、**レイアウトの空白**を崩れと
+#: 誤判定していた。実インシデント (2026-09-04 ライブ監査、Qwen3.8-27B の実応答
+#: 451 件を再走査): 検出 4 件は **すべて誤検出**で、真の崩れは 0 件だった::
+#:
+#:     承知しました。お名前はおがわ ひろゆきさんですね。   ← 姓名の分かち書き
+#:     塩・こしょう 適量                                   ← 材料表の項目と分量
+#:     …195 文字です。散乱 を使わない指定に対し…          ← 引用語と助詞の間
+#:
+#: 誤検出のたびに :class:`FeedbackCollector` が正しいターンを
+#: ``Turn marked failed`` として Level 0 経験に刻み、``fewshot_pool`` は
+#: その手本を捨てる。名前を復唱するたびに学習信号が汚れる。
+#:
+#: 崩れは **出力分布の性質** なので 1 文の中で連続して現れる
+#: (「私 は 東京 に 住んで います」)。対してレイアウトの空白は 1 文 (1 行) に
+#: 高々 1 つしか現れない — 姓と名の間、項目と分量の間、引用語と助詞の間の
+#: いずれも文中で 1 回きり。よって **数ではなく密度**、それも文単位の密度で
+#: 分離する。上記 451 件で誤検出 4→0、gemma 型の合成例は引き続き検出。
+_JA_SEGMENT_SPLIT_RE = re.compile(r"[。！？!?\n]+")
+
+#: 1 文の中でこれ以上語間空白が並んだら崩れとみなす。
+_JA_INTERWORD_SPACE_MIN_PER_SENTENCE = 2
+
 #: コードブロック。整形済みコードやログ引用では半角空白が正常に現れる。
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 
@@ -40,9 +64,24 @@ def has_broken_ja_spacing(text: str) -> bool:
 
     コードブロック内は対象外。整形済みコードやログの引用で半角空白が現れるのは
     正常なため、fence で囲まれた領域を除いてから判定する。
+
+    判定単位は **1 文 (1 行)** で、その中に語間空白が
+    :data:`_JA_INTERWORD_SPACE_MIN_PER_SENTENCE` 箇所以上並んだときだけ崩れと
+    みなす。1 文に 1 箇所しかない空白はレイアウト
+    (姓名の分かち書き / 項目と分量 / 引用語と助詞) であって崩れではない
+    (:data:`_JA_SEGMENT_SPLIT_RE` の実測を参照)。
     """
     outside = _CODE_FENCE_RE.sub("\n", text)
-    return bool(_JA_INTERWORD_SPACE_RE.search(outside))
+    for segment in _JA_SEGMENT_SPLIT_RE.split(outside):
+        # 「あ い う」は 2 箇所と数える (マッチは 1 文字重なる)。
+        found = 0
+        pos = 0
+        while (match := _JA_INTERWORD_SPACE_RE.search(segment, pos)) is not None:
+            found += 1
+            if found >= _JA_INTERWORD_SPACE_MIN_PER_SENTENCE:
+                return True
+            pos = match.start() + 1
+    return False
 
 
 def is_japanese_text(text: str) -> bool:
@@ -782,6 +821,27 @@ _REQUEST_ENDING_RE = re.compile(
     r"|もう一度|もう1度|もういちど|再度"
     r"|(?:教え|挙げ|見せ|出し|作っ|書い|説明し|列挙し|示し)て)"
     r"[。．.、,！!\s\"'」』）)]*\s*$"
+    # **動詞が落ちた依頼** の 2 つめの形。``もう一度`` を語彙で足したのと同じ
+    # 穴がまた開いた。実インシデント (2026-09-04 ライブ監査、実ストアで確認):
+    # 「私の名前と住んでいる場所を**一言で**。」が
+    # ``mem.personal.location states`` として live になり、単値スロットゆえに
+    # 直前の正しい値を supersede して消した::
+    #
+    #     LIVE  mem.personal.location | 私の名前と住んでいる場所を一言で。
+    #     SUPER mem.personal.location | 実は先月引っ越して、今は川崎に住んでいます。
+    #
+    # またしても **問いがその答えを破壊した**。``一言で`` を語彙に足すのでは
+    # なく形で取る: ``を`` で目的語を示したまま **述語を持たずに副詞句で終わる**
+    # 文は日本語では依頼 (「〜を一言で (言ってください)」「〜を簡潔に」
+    # 「〜を 3 行で」)。値の言明は ``を`` の後に必ず述語が続く
+    # (「猫を 2 匹飼っています」)。
+    #
+    # ``を`` と副詞句の間に **ひらがなを許さない** のは、活用語を挟む接続
+    # (「〜を読むことが多い**ので**。」「〜を撮るのが好き**で**。」) を
+    # 巻き込まないため。依頼の副詞句は体言 (一言 / 簡潔 / 3 行 / 日本語) で、
+    # 活用語を挟まない。
+    r"|(?<=を)[一-龥ァ-ヶーA-Za-z0-9０-９々〆ヵヶ・ー]{1,12}[でに]"
+    r"[。．.！!\s\"'」』）)]*\s*$"
     # ``べ`` は ``すべて`` (副詞) と衝突するので、その 1 語だけ手前で外す。
     r"|(?:[いえきぎしちにびみりっん]|(?<!す)べ)[てで]"
     r"[。．.！!\s\"'」』）)]*\s*$",
@@ -906,6 +966,7 @@ __all__ = [
     "find_superseded_claim",
     "count_response_lines",
     "match_enumeration_count",
+    "match_enumeration_count_strict",
     "match_line_count",
     "violates_line_count",
     "count_list_items",
@@ -1469,6 +1530,69 @@ _ENUM_ITEM_MAX_CHARS = 40
 _ENUM_SHORT_LINE_RATIO = 0.8
 
 
+#: 数量の一致が **既出の出力・別の対象への参照** であることを示す後続語。
+#: 「その3行**のうち**」「3行**目**」「4つ**目**」は今回の出力への指定ではない。
+#: 行数と個数で同じ語が効くので **共有する** (行数側だけに入れていたため、
+#: 個数側は同じ形で誤検知していた — 下記 :func:`_count_is_reference` の説明)。
+_COUNT_REFERENCE_TAIL = ("のうち", "の中", "目")
+#: 同じく直前語。「**その**3行」「**先ほどの**3点」。
+_COUNT_REFERENCE_HEAD = (
+    "その", "この", "あの", "先ほどの", "さっきの", "上の", "上記の", "先の",
+)
+
+#: **配分**を示す直前語。「結末を2案、**それぞれ**1行で」は *1 項目あたり* 1 行
+#: であって、応答全体を 1 行にしろという指定ではない。ここを拾っていたため、
+#: 2 案を正しく 2 行で返した応答に
+#: ``(注: 1 行の指定に対し、上の回答は 2 行です)`` という **偽の違反注記**が付き、
+#: さらに ``constraint_repair`` が修復再生成を 1 往復むだに回していた
+#: (2026-09-03 ライブ監査 T4#9)。
+#:
+#: 文字数側には既に per-item 判定 (:func:`match_per_item_char_limit` /
+#: :func:`violates_per_item_length`) がある。行数側だけ非対称に欠けていた。
+_COUNT_DISTRIBUTIVE_HEAD = (
+    "それぞれ", "各", "夫々", "1つずつ", "一つずつ", "ひとつずつ", "1件ずつ",
+)
+#: 上記の語が数量の **直前の短い窓** に現れるか。「2案、それぞれ 1行で」の
+#: ように読点や空白を挟む形が普通なので、末尾一致では拾えない。
+_COUNT_DISTRIBUTIVE_RE = re.compile(
+    "(?:" + "|".join(re.escape(w) for w in _COUNT_DISTRIBUTIVE_HEAD) + r")[\s、,]{0,3}$",
+)
+
+
+def _count_is_reference(src: str, match: re.Match[str]) -> bool:
+    """数量の一致が **今回の出力への指定ではない** 文脈か (純粋関数)。
+
+    行数 (:func:`match_line_count`) と個数 (:func:`match_enumeration_count`) で
+    共有する。序数・部分指示・配分はどちらの単位でも「指定ではない」形で、
+    行数側だけがガードを持っていたため個数側が同じ形で誤検知していた。
+
+    実測 (2026-09-04): 「4つ目の観点をもう少し詳しく説明してください。」に
+    3 項目の箇条書きで答えると ``asked to enumerate 4 items but the answer
+    lists 3`` が立ち、**偽の開示注記** が付いたうえ ``constraint_repair`` が
+    修復生成を 1 往復むだに回していた (行数側で 2026-09-03 T4#9 として
+    潰したのと同じ形)。
+    """
+    tail = src[match.end():match.end() + 12]
+    if tail.startswith(_COUNT_REFERENCE_TAIL):
+        return True
+    head = src[: match.start()]
+    if head.endswith(_COUNT_REFERENCE_HEAD):
+        return True
+    return bool(_COUNT_DISTRIBUTIVE_RE.search(head))
+
+
+#: 個数の直後に来ると **ぴったり N を求める指定ではなくなる** 語。
+#:
+#: - 上限 (``以内`` / ``以下`` / ``まで``): 下回っても違反ではない
+#: - 概数 (``程度`` / ``くらい`` / ``ぐらい`` / ``ほど`` / ``前後``): 同上
+#:
+#: 実測 (2026-09-04): 「持ち物リストを箇条書きで10項目以内でまとめて
+#: ください。」に 9 項目で答えると ``asked to enumerate 10 items but the
+#: answer lists 9`` が立っていた。緩い側 (:data:`_ITEM_COUNT_IN_REQUEST_RE`)
+#: だけがこの除外を持ち、strict 側の :data:`_ITEM_COUNT_BARE_RE` が持って
+#: いなかったため、**箇条書き指定が付くと上限指定でも違反が立つ**。
+_ITEM_COUNT_NOT_EXACT_TAIL = r"(?!\s*(?:以内|以下|まで|程度|くらい|ぐらい|ほど|前後))"
+
 #: 「7 項目」のように **個数だけ** の形。:data:`ITEM_COUNT_RE` は後続の動詞
 #: (``挙げ`` / ``書`` / ``列挙`` …) を要求するため、個数の直後で文が区切れると
 #: 拾えない。箇条書き指定が別に立っているときだけ使う (単独で使うと
@@ -1478,12 +1602,51 @@ _ENUM_SHORT_LINE_RATIO = 0.8
 #: 「箇条書きでちょうど7項目、各項目20文字以内で書いてください。」の ``7項目``
 #: の直後が読点で、個数指定として認識されず 5 項目の回答が違反にならなかった。
 _ITEM_COUNT_BARE_RE = re.compile(
-    r"(?:ちょうど|丁度|きっかり|正確に)?\s*(\d{1,2})\s*(?:つ|個|点|項目)",
+    r"(?:ちょうど|丁度|きっかり|正確に)?\s*(\d{1,2})\s*(?:つ|個|点|項目)"
+    + _ITEM_COUNT_NOT_EXACT_TAIL,
+)
+
+#: **依頼文の中の個数** を形で取る規則。
+#:
+#: :data:`ITEM_COUNT_RE` は個数と列挙動詞が **隣接** し、かつ動詞が固定リスト
+#: (``挙げ`` / ``書`` / ``列挙`` / ``箇条書き`` / ``リスト``) にあることを要求する。
+#: 日本語の依頼はどちらの条件も普通に破るので、この形は必ず漏れる:
+#:
+#: - 「あなたにできないことを 3 つ**、具体的に**挙げてください。」
+#:   → 読点と副詞が挟まって不一致
+#: - 「記事全体のタイトル案を 5 つ**出して**ください。」
+#:   → ``出し`` が語彙表に無い
+#:
+#: 実測 (2026-09-04 ライブ監査、実発話 23 件): 現行の判定が拾えたのは **8 件**
+#: だけだった。拾えないと ``violates_enumeration_count`` も
+#: ``match_output_form_directive`` の ``items`` も動かず、個数の指定は
+#: **検証の対象にすらならない**。
+#:
+#: 語彙表を伸ばす代わりに **形** で取る: 個数の助数詞を含む文が
+#: :data:`_REQUEST_ENDING_RE` の依頼形なら個数指定と読む。動詞の語彙に
+#: 依存しないので、上の 2 型はどちらも同じ規則で拾える (実測 22/23)。
+#:
+#: 判定は **文単位**。「3 つの案があります。要点を教えてください。」のように、
+#: 個数と依頼が別の文にあるものを結び付けないため。
+#:
+#: 上限・概数の指定 (「10 項目**以内**で」「3 つ**ほど**」) は除く
+#: (:data:`_ITEM_COUNT_NOT_EXACT_TAIL`)。序数・部分指示・配分
+#: (「4 つ**目**」「3 つ**のうち**」「**それぞれ** 3 つ」) は
+#: :func:`_count_is_reference` で落とす。
+_ITEM_COUNT_IN_REQUEST_RE = re.compile(
+    r"(?<!\d)(\d{1,2})\s*(?:つ|個|点|項目)" + _ITEM_COUNT_NOT_EXACT_TAIL,
 )
 
 
-def match_enumeration_count(text: str) -> int:
-    """発話中の列挙個数指定を返す (純粋関数)。無ければ ``0``。"""
+def match_enumeration_count_strict(text: str) -> int:
+    """列挙個数指定のうち、**個数の指定だと確信できる形** だけを返す。
+
+    ``ITEM_COUNT_RE`` 等、列挙動詞や箇条書き指定を伴う形に限る。
+    :func:`has_verifiable_output_constraint` はこちらを使う — あの述語は
+    「応答をバッファして検証するか」を決めており、真になったターンは
+    **本文が 1 文字も流れない**。緩い判定で真を増やすと、検証の利得が無い
+    ターンからストリーミングを奪う (下記の実測を参照)。
+    """
     m = ENUMERATION_COUNT_RE.search(text or "")
     if m:
         return int(m.group(1))
@@ -1491,10 +1654,42 @@ def match_enumeration_count(text: str) -> int:
     if m2:
         return int(next(g for g in m2.groups() if g))
     # 箇条書き / リスト形式の指定が立っているなら、個数だけの形も個数指定と読む。
-    if BULLET_FORM_RE.search(text or ""):
-        m3 = _ITEM_COUNT_BARE_RE.search(text or "")
-        if m3:
+    src = text or ""
+    if BULLET_FORM_RE.search(src):
+        for m3 in _ITEM_COUNT_BARE_RE.finditer(src):
+            if _count_is_reference(src, m3):
+                continue
             return int(m3.group(1))
+    return 0
+
+
+def match_enumeration_count(text: str) -> int:
+    """発話中の列挙個数指定を返す (純粋関数)。無ければ ``0``。
+
+    :func:`match_enumeration_count_strict` に、依頼形の文の中の助数詞
+    (:data:`_ITEM_COUNT_IN_REQUEST_RE`) を足した広い判定。**検証・開示** の
+    側で使う。
+
+    バッファ判定 (:func:`has_verifiable_output_constraint`) には使わない。
+    実測 (2026-09-04 ライブ監査、実発話 359 件): こちらをバッファ判定に
+    使うとバッファ対象が 29 → 44 件へ増える一方、増えた 15 件で実際に
+    違反が立つものは **0 件** だった。得るものが無いまま 15 件から
+    ストリーミングを奪う (本 PC の実測で 1 ターン 30〜160 秒の無表示)。
+    """
+    strict = match_enumeration_count_strict(text)
+    if strict:
+        return strict
+    # 依頼形の文に助数詞付きの個数があれば個数指定
+    # (_ITEM_COUNT_IN_REQUEST_RE 参照)。上の規則の置き換えではなく **足す** —
+    # 「3 日分の候補を 1 つずつ。」のような依頼形に当たらない形は上で拾う。
+    for sentence in _SENTENCE_RE.findall(text or ""):
+        if not _REQUEST_ENDING_RE.search(sentence):
+            continue
+        for m4 in _ITEM_COUNT_IN_REQUEST_RE.finditer(sentence):
+            # 序数・部分指示・配分は指定ではない (_count_is_reference 参照)。
+            if _count_is_reference(sentence, m4):
+                continue
+            return int(m4.group(1))
     return 0
 
 
@@ -1535,32 +1730,6 @@ LINE_COUNT_RE = re.compile(
     r"(?![^。]{0,6}(?:以内|まで)\s*[^。]{0,4}(?:文字|字))",
 )
 
-
-#: 行数が **既出の出力への参照** であることを示す後続語。
-#: 「その3行**のうち**」「3行**目**」は今回の出力への指定ではない。
-_LINE_COUNT_REFERENCE_TAIL = ("のうち", "の中", "目")
-#: 同じく直前語。「**その**3行」「**先ほどの**3行」。
-_LINE_COUNT_REFERENCE_HEAD = (
-    "その", "この", "あの", "先ほどの", "さっきの", "上の", "上記の", "先の",
-)
-
-#: **配分**を示す直前語。「結末を2案、**それぞれ**1行で」は *1 項目あたり* 1 行
-#: であって、応答全体を 1 行にしろという指定ではない。ここを拾っていたため、
-#: 2 案を正しく 2 行で返した応答に
-#: ``(注: 1 行の指定に対し、上の回答は 2 行です)`` という **偽の違反注記**が付き、
-#: さらに ``constraint_repair`` が修復再生成を 1 往復むだに回していた
-#: (2026-09-03 ライブ監査 T4#9)。
-#:
-#: 文字数側には既に per-item 判定 (:func:`match_per_item_char_limit` /
-#: :func:`violates_per_item_length`) がある。行数側だけ非対称に欠けていた。
-_LINE_COUNT_DISTRIBUTIVE_HEAD = (
-    "それぞれ", "各", "夫々", "1つずつ", "一つずつ", "ひとつずつ", "1件ずつ",
-)
-#: 上記の語が「N 行」の **直前の短い窓** に現れるか。「2案、それぞれ 1行で」の
-#: ように読点や空白を挟む形が普通なので、末尾一致では拾えない。
-_LINE_COUNT_DISTRIBUTIVE_RE = re.compile(
-    "(?:" + "|".join(re.escape(w) for w in _LINE_COUNT_DISTRIBUTIVE_HEAD) + r")[\s、,]{0,3}$",
-)
 
 #: 「<X>の行数を N 行以内」の <X>。ここが応答を指す語なら今回の出力への指定、
 #: そうでなければ **別の対象についての規約** を述べているだけ。
@@ -1622,15 +1791,11 @@ def match_line_count(text: str) -> int:
         tail = src[m.end():m.end() + 12]
         if tail.startswith(("は", "あたり", "当たり", "につき")):
             continue
-        if tail.startswith(_LINE_COUNT_REFERENCE_TAIL):
+        # 参照 (「その3行」「3行目」) と配分 (「2案、それぞれ 1行で」) は
+        # 指定ではない。個数側と共有の判定 (_count_is_reference 参照)。
+        if _count_is_reference(src, m):
             continue
         head = src[: m.start()]
-        if head.endswith(_LINE_COUNT_REFERENCE_HEAD):
-            continue
-        # 「それぞれ1行で」「各1行で」= 1 項目あたりの指定。区切り記号や助詞を
-        # 挟む形 (「2案、それぞれ 1行で」) も拾うため、直前の短い窓で見る。
-        if _LINE_COUNT_DISTRIBUTIVE_RE.search(head):
-            continue
         if count_belongs_to_another_subject(head):
             continue
         raw = m.group(1).translate(_FULLWIDTH_DIGITS)
@@ -1672,7 +1837,15 @@ def violates_enumeration_count(query: str, response: str) -> str | None:
     超過は見ない — 「各 3 つずつ」のようにグループ化された正当な出力を
     違反と誤判定するため (:func:`violates_output_form` が同じ理由で剰余判定に
     している)。足りない側だけが実インシデント (46/47) の形。
+
+    **箇条書き指定が個数を伴うターンは見ない。** その形は
+    :func:`violates_output_form` の剰余判定が過不足の両方を見ており、こちらも
+    立つと ``violation_reason`` が同じ違反を 2 回並べる (修復指示にもそのまま
+    載る)。個数の抽出は共通化したので、どちらが立つかは指定の形だけで決まる。
     """
+    directive = match_output_form_directive(query)
+    if directive is not None and directive["bullet"] and directive["items"]:
+        return None
     wanted = match_enumeration_count(query)
     if wanted <= 0:
         return None
@@ -1703,11 +1876,14 @@ def match_output_form_directive(text: str) -> dict[str, int | bool] | None:
     bullet = bool(BULLET_FORM_RE.search(t))
     if not (answer_only or bullet):
         return None
-    items = 0
-    if bullet:
-        m = ITEM_COUNT_RE.search(t)
-        if m:
-            items = int(next(g for g in m.groups() if g))
+    # 個数の抽出は :func:`match_enumeration_count_strict` に寄せる。ここが
+    # ``ITEM_COUNT_RE`` を直接引いていたため、**同じ個数を 3 箇所が別々の
+    # 規則で取っていた** (この関数 / strict / 緩い側)。実害は超過の取りこぼし:
+    # 「箇条書きでちょうど7項目、各項目20文字以内で書いてください。」に
+    # 9 項目で答えても ``items`` が 0 のまま剰余判定が走らず、
+    # ``violates_enumeration_count`` は不足しか見ないので誰も報告しなかった
+    # (2026-09-04 実測)。
+    items = match_enumeration_count_strict(t) if bullet else 0
     return {"answer_only": answer_only, "bullet": bullet, "items": items}
 
 
@@ -1759,7 +1935,11 @@ def has_verifiable_output_constraint(query: str) -> bool:
         # 「47 都道府県を全部列挙して」型。箇条書き指定が無いので
         # match_output_form_directive では拾えないが、数値は本文にあり
         # 返ってきた行は数えられる (2026-08-27 ライブ監査: 46/47 を見逃した)。
-        or match_enumeration_count(q) > 0
+        #
+        # **strict 版を使う。** この述語が真のターンは本文が 1 文字も流れない
+        # ので、緩い判定で真を増やすと検証の利得が無いターンから
+        # ストリーミングを奪う (match_enumeration_count の説明の実測を参照)。
+        or match_enumeration_count_strict(q) > 0
         or match_line_count(q) > 0
         # 「「AI」という単語を使わずに」「カタカナを使わずに」も数えれば分かる
         # (2026-08-28 ライブ監査 T18-3)。
