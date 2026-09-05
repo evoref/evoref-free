@@ -990,10 +990,15 @@ class PromptEvolver:
         on_generation_complete: Callable[[int, PromptCandidate], None] | None,
         yield_check: Callable[[], bool] | None,
         start_gen: int = 1,
+        checkpoint: Callable[[int, list[PromptCandidate]], None] | None = None,
     ) -> tuple[int, bool]:
         """世代ループを実行する。`(generations_run, yielded)` を返す
 
         ``start_gen`` は yield からの再開位置 (``phase_state`` の generation + 1)。
+        ``checkpoint`` は各世代の完了直後に ``(gen, population)`` で呼ばれる
+        進捗保存フック。yield 時だけでなく毎世代保存することで、プロセス再起動
+        (uvicorn reload 等) で失う進捗を直前 1 世代に抑える (2026-09-04 監査:
+        1 日 9 回の再起動で resume のたびに前回 yield 点まで巻き戻っていた)。
         """
         generations_run = max(0, start_gen - 1)
         yielded = False
@@ -1018,6 +1023,11 @@ class PromptEvolver:
                 cb=cb,
             )
             generations_run = gen
+            if checkpoint is not None:
+                try:
+                    checkpoint(gen, population)
+                except Exception as e:
+                    logger.warning("generation checkpoint raised: %s", e)
 
             if self._after_generation_callbacks(
                 gen, generations, population, on_generation_complete, yield_check,
@@ -1032,8 +1042,18 @@ class PromptEvolver:
         current: str,
         has_protected: bool,
     ) -> PromptCandidate:
-        """最良候補に最終安全検証 (重複除去 + 保護セクション復元) を適用する"""
-        best = max(population, key=lambda c: c.fitness)
+        """最良候補に最終安全検証 (重複除去 + 保護セクション復元) を適用する
+
+        同点なら **現行と異なる候補** を優先する。欠陥率 fitness は候補に無反応
+        で同点が常態なので、``max`` の先頭 (= 現行) を返すと採用ゲートが測る
+        候補が永久に無い。採否はゲートの実測が決めるため、ここでの選好は
+        「測る対象を出す」だけで安全側を崩さない (f_04 §4.5)。
+        """
+        top = max(c.fitness for c in population)
+        tied = [c for c in population if c.fitness == top]
+        best = next(
+            (c for c in tied if c.text.strip() != current.strip()), tied[0],
+        )
         # 最終安全検証 - 段落レベルの重複を正規化
         best.text = dedupe_paragraphs(best.text)
         # 保護セクションの有無に関わらず孤児マーカーを必ず除去
@@ -1057,6 +1077,7 @@ class PromptEvolver:
         yield_check: Callable[[], bool] | None = None,
         on_generation_complete: Callable[[int, PromptCandidate], None] | None = None,
         resume_state: dict | None = None,
+        checkpoint: Callable[[int, list[PromptCandidate], float], None] | None = None,
     ) -> EvolutionResult:
         """進化ループ (instruction-only)
 
@@ -1068,10 +1089,12 @@ class PromptEvolver:
             population_size: 集団サイズ
             seed: 乱数シード
             critique_synthesizer: 批評合成器。指定時は変異前に批評を実行
-            resume_state: yield 時に :meth:`_handle_mode_yield` が
+            resume_state: yield 時 / 各世代のチェックポイントで
                 ``Level1Session.phase_state[mode]`` へ保存した進捗
                 (``population`` / ``generation`` / ``initial_fitness``)。
                 指定時は初期集団の構築を飛ばし、その世代の次から再開する。
+            checkpoint: 各世代完了時に ``(gen, population, initial_fitness)`` で
+                呼ぶ進捗保存フック (``evolve_all_modes`` が session へ書く)。
 
         Returns:
             進化結果
@@ -1131,6 +1154,10 @@ class PromptEvolver:
                 on_generation_complete=on_generation_complete,
                 yield_check=yield_check,
                 start_gen=start_gen,
+                checkpoint=(
+                    (lambda gen, pop: checkpoint(gen, pop, initial_fitness))
+                    if checkpoint is not None else None
+                ),
             )
 
             best = self._finalize_best_candidate(population, current, has_protected)
@@ -1179,8 +1206,27 @@ class PromptEvolver:
         return population, initial_fitness, start_gen
 
     @staticmethod
+    def _snapshot_population(
+        generation: int, initial_fitness: float, population: list[PromptCandidate],
+    ) -> dict:
+        """``phase_state[mode]`` へ書く進捗 (再開に必要な最小集合)。"""
+        ordered = sorted(population, key=lambda c: -c.fitness)
+        return {
+            "generation": generation,
+            "initial_fitness": initial_fitness,
+            "best": ordered[0].text if ordered else "",
+            "population": [
+                {"text": c.text, "fitness": c.fitness, "generation": c.generation}
+                for c in ordered
+            ],
+        }
+
+    @staticmethod
     def _snapshot_progress(result: EvolutionResult) -> dict:
-        """yield 時に ``phase_state[mode]`` へ書く進捗 (再開に必要な最小集合)。"""
+        """yield 時に ``phase_state[mode]`` へ書く進捗 (再開に必要な最小集合)。
+
+        ``all_candidates`` の並びをそのまま保存する (呼出側で整列済み)。
+        """
         return {
             "generation": result.generations_run,
             "initial_fitness": result.initial_fitness,
@@ -1355,6 +1401,18 @@ class PromptEvolver:
                 mode, len(mode_exp), generations,
             )
 
+            def _checkpoint(
+                gen: int, population: list[PromptCandidate], initial_fitness: float,
+                _mode: str = mode,
+            ) -> None:
+                # 毎世代 session へ進捗を書く (yield を待たない)。
+                if session is None:
+                    return
+                session.phase_state[_mode] = self._snapshot_population(
+                    gen, initial_fitness, population,
+                )
+                self._persist_session_safely(session, save_session)
+
             result = await self._darwinian_evolve(
                 current=prompt_text,
                 experiences=mode_exp,
@@ -1367,6 +1425,7 @@ class PromptEvolver:
                 resume_state=(
                     session.phase_state.get(mode) if session is not None else None
                 ),
+                checkpoint=_checkpoint if session is not None else None,
             )
             results[mode] = result
 

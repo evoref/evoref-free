@@ -1001,6 +1001,8 @@ prompt:
   fact_slate_max_tokens: 200       # 押し出したターンの事実スレート (0 で無効)
   rule_stats_min_turns: 200        # 規則の削除 / 降格に要する最小観測ターン数
   max_deletes_per_run: 1           # Level 1 の 1 ランで許す規則 delete 件数
+  adoption_eval_cases: 6           # base prompt 採用ゲートの実測ケース数 (0 = 実測しない = 採用しない)
+  adoption_min_gain: 0.05          # 採用に要する実測スコアの最小上昇幅 (候補平均 - 現行平均)
 
 # ===== エージェント設定 =====
 agent:

@@ -20,6 +20,7 @@ from backend.free.core.intent_vocab import (
     EXPLICIT_WINDOWS_PATH_RE,
     NUMBER_LITERAL_RE,
     REFERENTIAL_WRITE_TARGET_RE,
+    is_plain_statement,
 )
 from backend.free.core.locale_patterns import (
     has_japanese_script,
@@ -244,6 +245,16 @@ _ASKS_ABOUT_CORRECTION_RE = re.compile(
     r"(?:答え|挙げ|教え|列挙|示し|説明し|何回|何件|いくつ|どこ|点を|箇所)",
 )
 
+#: 記憶の想起を **尋ねる** 疑問文 (「確認ですが、私の職業は何と言いましたか？」)。
+#: 「確認」「言いましたか」が訂正語彙と並ぶが、直前の応答が誤っていたとは
+#: 言っていない。2026-09-05 の失敗 32 件のうち 2 件がこの形で、正答した
+#: 自己紹介ターンが Level 2 の学習データに失敗として入っていた。
+_RECALL_QUESTION_RE = re.compile(
+    r"(?:何と|なんと|どう)(?:言い|いい|申し|答え)ました(?:か|っけ)"
+    r"|と(?:言い|いい)ましたか[？?]?\s*$"
+    r"|でしたっけ[？?]?\s*$",
+)
+
 #: 2 つの物事の相違点を **尋ねる** 疑問文。訂正ではない。
 #:
 #: ``CORRECTION_PATTERNS`` の先頭 ``違[うわえおっく]`` は「それは違う」を拾う
@@ -275,12 +286,23 @@ _REFORMAT_REQUEST_RE = re.compile(
     r"|(?:日本語|英語)で(?:説明し直|書き直|言い直)",
 )
 
+#: 前提を変えての再計算 / 再作成の依頼。「〜(なので|ので|から)、…し直して」は
+#: ユーザーが **新しい条件** を持ち込んでやり直しを頼んでいるのであって、直前の
+#: 応答が誤っていたとは言っていない。「うちの社内規定では税率 8% で計算するので、
+#: 37 個の税込合計を計算し直して」が ``(?:し|やり|作り)直して`` に掛かり、正答した
+#: 論理パズルのターンが失敗として Level 2 の学習データに入っていた
+#: (2026-09-05 ライブ監査 T14)。
+_PREMISE_CHANGE_REDO_RE = re.compile(
+    r"(?:なので|ので|から|場合は|場合で|として|に変えて|に変更して|にして)[、,\s]*"
+    r"[^。！？\n]{0,40}?(?:し|やり|作り|組み|計算し|書き)直して",
+)
+
 #: ユーザー自身の申告訂正。謝罪 / 自己の過去発言への言及 + 事実の言い換え。
 _SELF_CORRECTION_RE = re.compile(
     r"(?:すみません|すいません|ごめん|失礼しました)[、,。\s]*"
     r".{0,30}?(?:ではなく|じゃなく|の間違い|間違えました)"
     r"|(?:先ほど|さっき|前に)\s*[「『]?.{0,20}?[」』]?\s*と(?:言|申)"
-    r"|^訂正です"
+    r"|^訂正(?:です|します)"
     r"|あ[、,]?\s*間違えました"
     r"|実はこれは",
 )
@@ -309,9 +331,13 @@ def classify_correction_target(query: str) -> str:
         return "self"
     if _ASKS_ABOUT_CORRECTION_RE.search(query):
         return "not_correction"
+    if _RECALL_QUESTION_RE.search(query):
+        return "not_correction"
     if _ASKS_ABOUT_DIFFERENCE_RE.search(query):
         return "not_correction"
     if _REFORMAT_REQUEST_RE.search(query):
+        return "not_correction"
+    if _PREMISE_CHANGE_REDO_RE.search(query):
         return "not_correction"
     # 既存ファイルへの再保存を伴う依頼は編集であって訂正ではない。
     # 「3 番目を『ヘッドランプ』に直して、同じファイルに保存し直して」の
@@ -1104,6 +1130,19 @@ class FeedbackCollector:
 
         prev, curr = self._prev_query.strip(), query.strip()
         if not prev or not curr:
+            return False
+
+        # 一字一句同じ再送は言い直しではない。応答が届かなかった / 誤送信の
+        # 再試行で、モデルの応答が通じなかった証拠にはならない。2026-09-05 の
+        # 失敗 32 件のうち 8 件がこれ (Level 2 の学習データを薄めていた)。
+        if prev == curr:
+            return False
+        # 「私の出身大学は北海道大学です。」→「私の出身大学はどこでしたか？」は
+        # 申告の直後に想起を試す **質問** で、内容語はほぼ同じでも言い直しではない
+        # (同じ 32 件のうち 3 件)。平叙の申告 → 問いの並びは除外する。
+        if is_plain_statement(prev) and not is_plain_statement(curr) and (
+            curr.rstrip().endswith(("?", "？", "か", "か。", "っけ", "っけ。"))
+        ):
             return False
 
         # 深掘り: 前の発話がほぼそのまま残り、そこへ制約が足されている。

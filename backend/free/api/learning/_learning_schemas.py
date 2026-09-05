@@ -28,10 +28,20 @@ class ExperienceByModeModel(BaseModel):
 
 
 class Level1ResultEntry(BaseModel):
-    """Level 1 各フェーズの結果"""
+    """Level 1 各フェーズの結果
+
+    ``skipped`` は「対象が無く実行していない」(経験不足 / 選択圧なし /
+    outcome シグナル未配線)。``improved=False`` だけでは「実行して改善なし」と
+    区別できないため分ける。``measured_*`` は base prompt 採用ゲートの実測値
+    (現行 / 候補の judge 平均、f_04 §4.5)。
+    """
     improved: bool = False
     fitness_before: float | None = None
     fitness_after: float | None = None
+    skipped: bool = False
+    reason: str | None = None
+    measured_before: float | None = None
+    measured_after: float | None = None
 
 
 class PolicyEvolverDomainStatus(BaseModel):

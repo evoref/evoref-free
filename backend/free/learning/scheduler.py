@@ -51,6 +51,11 @@ if TYPE_CHECKING:
 logger = get_logger("learning.scheduler")
 
 
+def _fmt_measured(value: float | None) -> str:
+    """採用ゲートの実測値をログ用に整形する (None は "-")。"""
+    return "-" if value is None else f"{value:.3f}"
+
+
 # 変異 (prompt mutation) が systemic に失敗したと判定する失敗率閾値。
 # この比率以上の変異が失敗し、かつ採用改善が 0 の場合、learning_cycle_l1 の
 # success を True と偽らない (ReadTimeout 等で実質何も学習できていないため。
@@ -267,6 +272,8 @@ class LearningScheduler:
         # 候補 instruction の実測評価器 (EmbedEvalProtocol)。後注入され、
         # set_embedder 順に依存しないよう scheduler 側にも保持する。
         self._embed_eval = None
+        # base prompt 候補の実測評価器 (PromptEvalProtocol、採用ゲート f_04 §4.5)
+        self._prompt_eval = None
         # パターン重み進化
         self._learned_patterns = None
         # 生成パラメータ進化
@@ -312,6 +319,8 @@ class LearningScheduler:
         # target 別の「連続で改善が採用されなかった回数」。`is_level2_overdue`
         # が延長クールダウンへ落とす判断に使う (採用成功で 0 へリセット)。
         self._level2_no_improve_streak: dict[str, int] = {}
+        # 環境不調時の短い見送り (defer_level2)。target -> 再試行可能 epoch 秒。
+        self._level2_not_before: dict[str, float] = {}
         self._level1_run_count: int = 0
         self._last_level1_results: dict = {}
         self._fitness_history: dict[str, list[dict]] = {}
@@ -588,6 +597,21 @@ class LearningScheduler:
             )
         self._save_state()
 
+    def defer_level2(self, target: str = "base", *, seconds: float = 3600.0) -> None:
+        """target の Level 2 を ``seconds`` 後まで見送る (環境不調の短い再試行間隔)。
+
+        候補サーバが起動できない等の **環境不調** は探索の結論ではないので
+        ``record_level2_run`` (= 24h クールダウン) を打たない。ただし 5 分間隔の
+        常駐ループがそのまま再試行すると毎 tick 候補サーバ起動 (health timeout
+        120s) を空回しするため、短い見送りだけ置く。永続化しない — 再起動は
+        stale プロセスが片付く契機なので、起動直後は即再試行してよい。
+        """
+        self._level2_not_before[target] = time.time() + max(0.0, seconds)
+        logger.info(
+            "Level 2 (%s) deferred for %.0f s (environment unavailable)",
+            target, seconds,
+        )
+
     def level2_no_improve_streak(self, target: str = "base") -> int:
         """target の連続無改善回数 (採用に成功すると 0 に戻る)。"""
         return self._level2_no_improve_streak.get(target, 0)
@@ -615,6 +639,8 @@ class LearningScheduler:
         開きっぱなしになっていた (実機で Level 2 が 10 時間連続稼働)。判定を
         実行 target と同じ軸へ揃えるのが本メソッドの存在理由。
         """
+        if time.time() < self._level2_not_before.get(target, 0.0):
+            return False
         return self.seconds_since_level2_run(target) >= (
             self.level2_cooldown_hours(target) * 3600.0
         )
@@ -662,10 +688,9 @@ class LearningScheduler:
             self._embed_instruction_evolver = EmbedInstructionEvolver(
                 embed_eval=self._embed_eval,
             )
-            logger.info(
-                "embed instruction evolver enabled (real_eval=%s)",
-                self._embed_eval is not None,
-            )
+            # real_eval の有無は set_embed_eval (後注入) が確定させる。ここで
+            # 出すと wiring 順により常に False と出る (2026-09-04 監査)。
+            logger.info("embed instruction evolver enabled")
             # 起動時反映: 過去に進化採用された embed_instruction.md が存在すれば
             # runtime embedder へ適用する (再起動後も進化結果を runtime に乗せる)。
             # ファイル不在時は何もしない (config 既定 instruction を尊重し、
@@ -695,6 +720,19 @@ class LearningScheduler:
         self._embed_eval = embed_eval
         if self._embed_instruction_evolver is not None:
             self._embed_instruction_evolver.set_embed_eval(embed_eval)
+        logger.info(
+            "embed instruction real eval %s",
+            "wired" if embed_eval is not None else "cleared",
+        )
+
+    def set_prompt_eval(self, prompt_eval) -> None:
+        """base prompt 候補の実測評価器を注入する (wire_pillars から)。
+
+        未注入なら phase1 は候補を採用しない (欠陥率 fitness は候補に無反応で、
+        実測無しの採用は f_04 §8 禁則 7 に当たる)。
+        """
+        self._prompt_eval = prompt_eval
+        logger.info("Prompt adoption gate enabled (measured eval=%s)", prompt_eval is not None)
 
     def set_learned_patterns(self, learned_patterns) -> None:
         """学習済みパターンストアを設定（lifespan から注入）"""
@@ -1030,12 +1068,17 @@ class LearningScheduler:
         extra_results: dict[str, dict] | None = None,
         experiences: list[dict] | None = None,
         skipped_phases: list[str] | None = None,
+        adoption_verdicts: dict[str, dict] | None = None,
+        skipped_modes: dict[str, dict] | None = None,
     ) -> str:
         """全モード完了時の後処理: 最良 prompt 保存 + state 更新 + session archive.
 
-        採用ゲート: fitness が initial を上回った mode のみ update_evolved する。
-        無改善 (final <= initial) で採用すると、目的関数を改善しないまま version を
-        bump し続ける (embed_instruction 系の採用パスと挙動を揃える)。
+        採用ゲート: :meth:`_measure_prompt_adoptions` の実測 verdict が
+        ``adopt=True`` の mode だけ update_evolved する (f_04 §4.5)。欠陥率 fitness
+        (``initial`` / ``final``) は候補に無反応なので採用判定には使わない —
+        ``final > initial`` はキーワードカバー率のタイブレーク (≤ 0.01) が動いた
+        だけで、それで version を bump し続けると本文が単調に膨らむ (2026-09-04
+        監査: v1→v6 で 5633→6890 字、実測品質は下降)。
 
         採用したプロンプトは ``_prompt_adoptions`` に基準 (採用時の欠陥率 fitness と
         rollback 先 version) を記録し、以後の Level 1 完了時に
@@ -1045,12 +1088,18 @@ class LearningScheduler:
         ``_last_run`` を進めない — 同じ経験でもう一度 phase を回す機会を残す (L-A15)。
         """
         experiences = experiences or []
+        verdicts = adoption_verdicts or {}
         rolled_back = self._check_prompt_adoptions(experiences)
         for mode, result in results.items():
-            if result.final_fitness <= result.initial_fitness:
+            verdict = verdicts.get(mode) or {}
+            if not verdict.get("adopt"):
                 logger.info(
-                    "Level 1 %s: no adoption (fitness %.4f → %.4f, no improvement)",
-                    mode, result.initial_fitness, result.final_fitness,
+                    "Level 1 %s: no adoption (%s; measured %s → %s, "
+                    "heuristic %.4f → %.4f)",
+                    mode, verdict.get("reason", "not_measured"),
+                    _fmt_measured(verdict.get("measured_before")),
+                    _fmt_measured(verdict.get("measured_after")),
+                    result.initial_fitness, result.final_fitness,
                 )
                 continue
             if mode in rolled_back:
@@ -1070,22 +1119,32 @@ class LearningScheduler:
                 )
                 self._record_prompt_adoption(mode, rollback_to, experiences)
                 logger.info(
-                    "Level 1 %s: adopted evolved prompt (fitness %.4f → %.4f)",
-                    mode, result.initial_fitness, result.final_fitness,
+                    "Level 1 %s: adopted evolved prompt (measured %.3f → %.3f "
+                    "on %d cases; heuristic %.4f → %.4f)",
+                    mode, verdict["measured_before"], verdict["measured_after"],
+                    verdict.get("cases", 0),
+                    result.initial_fitness, result.final_fitness,
                 )
             except Exception as e:
                 logger.warning("Failed to save prompt for %s: %s", mode, e, exc_info=True)
 
-        stats: dict[str, dict] = {
-            mode: {
-                "improved": result.final_fitness > result.initial_fitness,
+        stats: dict[str, dict] = {}
+        for mode, result in results.items():
+            verdict = verdicts.get(mode) or {}
+            stats[mode] = {
+                # 「改善」= 実測ゲートを通って採用したこと。欠陥率の差ではない。
+                "improved": bool(verdict.get("adopt")),
                 "fitness_before": result.initial_fitness,
                 "fitness_after": result.final_fitness,
+                "measured_before": verdict.get("measured_before"),
+                "measured_after": verdict.get("measured_after"),
+                "reason": verdict.get("reason"),
                 "mutation_attempts": getattr(result, "mutation_attempts", 0),
                 "mutation_failures": getattr(result, "mutation_failures", 0),
             }
-            for mode, result in results.items()
-        }
+        if skipped_modes:
+            # 選択圧なし / 経験不足で進化を走らせなかったモード (skipped=True)
+            stats.update(skipped_modes)
         if extra_results:
             stats.update(extra_results)
         self._level1_finalize(
@@ -1098,6 +1157,155 @@ class LearningScheduler:
             "Level 1 session completed and archived: %s", archived_path,
         )
         return archived_path
+
+    # ── 採用ゲート (実測、f_04 §4.5) ──
+
+    def _prompt_gate_config(self) -> tuple[int, float]:
+        prompt_cfg = self._config.get("prompt") or {}
+        cases = int(prompt_cfg.get("adoption_eval_cases", 6))
+        gain = float(prompt_cfg.get("adoption_min_gain", 0.05))
+        return max(0, cases), max(0.0, gain)
+
+    def _drop_modes_without_selection_pressure(
+        self,
+        prompt_texts: dict[str, str],
+        session: Level1Session,
+    ) -> tuple[dict[str, str], dict[str, dict]]:
+        """選択圧の無いモードを進化対象から外し、``(残す, skipped 記録)`` を返す。
+
+        失敗ターンが無いモードは欠陥率 fitness が全候補同値 (1.0) で、失敗クエリ
+        語も無いのでタイブレークも 0 — 変異を何世代回しても現行と同値の候補
+        しか出ず、採用ゲートの評価ケースも作れない (f_04 §8 禁則 7)。経験数が
+        ``min_experiences // 2`` 未満のモードも同様に外す。resume で既に完了した
+        モードは evolver 側の skip に任せる。
+        """
+        from backend.free.optimizer.prompt_eval import select_prompt_eval_cases
+
+        threshold = max(1, self.min_experiences // 2)
+        kept: dict[str, str] = {}
+        skipped: dict[str, dict] = {}
+        for mode, text in prompt_texts.items():
+            if mode in session.completed_phases:
+                kept[mode] = text
+                continue
+            mode_exp = [
+                e for e in session.experience_snapshot if e.get("mode") == mode
+            ]
+            if len(mode_exp) < threshold:
+                reason = "insufficient_experiences"
+            elif not select_prompt_eval_cases(mode_exp, mode, 1):
+                reason = "no_selection_pressure"
+            else:
+                kept[mode] = text
+                continue
+            logger.info(
+                "Level 1 %s: prompt evolution skipped (%s, %d experiences)",
+                mode, reason, len(mode_exp),
+            )
+            skipped[mode] = {
+                "improved": False, "skipped": True, "reason": reason,
+            }
+        return kept, skipped
+
+    async def _measure_prompt_adoptions(
+        self,
+        results: dict,
+        prompt_texts: dict[str, str],
+        experiences: list[dict],
+    ) -> dict[str, dict]:
+        """モードごとに現行と最良候補を失敗ケースで実測し、採用 verdict を返す。
+
+        Returns:
+            ``{mode: {"adopt": bool, "reason": str, "measured_before": float|None,
+            "measured_after": float|None, "cases": int}}``
+
+        採用条件: 現行・候補の両方で採点できたケースが選定数の半数以上あり、
+        その平均の差が ``prompt.adoption_min_gain`` 以上 (0 なら正の差)。評価器
+        未注入 / ケース 0 件 / 採点不足 / 候補が現行と同文 は全て不採用
+        (実測できないものは採用しない — f_04 §8 禁則 7)。
+        """
+        from backend.free.optimizer.prompt_eval import select_prompt_eval_cases
+
+        max_cases, min_gain = self._prompt_gate_config()
+        verdicts: dict[str, dict] = {}
+        for mode, result in results.items():
+            candidate = result.best_candidate.text
+            current = prompt_texts.get(mode, "")
+            verdict: dict = {
+                "adopt": False, "reason": "", "measured_before": None,
+                "measured_after": None, "cases": 0,
+            }
+            verdicts[mode] = verdict
+            if candidate.strip() == current.strip():
+                verdict["reason"] = "candidate_identical"
+                continue
+            if self._prompt_eval is None:
+                verdict["reason"] = "no_prompt_eval"
+                continue
+            if max_cases <= 0:
+                verdict["reason"] = "gate_disabled"
+                continue
+            cases = select_prompt_eval_cases(experiences, mode, max_cases)
+            if not cases:
+                verdict["reason"] = "no_eval_cases"
+                continue
+            if self._cancelled or self.should_yield():
+                verdict["reason"] = "gate_interrupted"
+                continue
+            try:
+                before = await self._prompt_eval.score_prompt(current, cases)
+                after = await self._prompt_eval.score_prompt(candidate, cases)
+            except Exception as exc:  # noqa: BLE001 - 実測失敗は不採用で継続
+                logger.warning(
+                    "Level 1 %s: adoption gate failed: %r", mode, exc, exc_info=True,
+                )
+                verdict["reason"] = "gate_error"
+                continue
+            common = sorted(set(before) & set(after))
+            # 選んだケースの半数以上が両側で採点できていなければ判定しない
+            # (1 件の judge 採点だけで採用が決まるのを防ぐ。yield 中断 / 欠測)。
+            if len(common) < max(1, (len(cases) + 1) // 2):
+                verdict["reason"] = "insufficient_measured_cases"
+                verdict["cases"] = len(common)
+                continue
+            mb = sum(before[c] for c in common) / len(common)
+            ma = sum(after[c] for c in common) / len(common)
+            verdict.update({
+                "measured_before": mb, "measured_after": ma, "cases": len(common),
+            })
+            gain = ma - mb
+            if (gain >= min_gain) if min_gain > 0.0 else (gain > 0.0):
+                verdict["adopt"] = True
+                verdict["reason"] = "measured_gain"
+            else:
+                verdict["reason"] = "no_measured_gain"
+            logger.info(
+                "Level 1 %s: adoption gate measured %.3f → %.3f on %d/%d cases (%s)",
+                mode, mb, ma, len(common), len(cases), verdict["reason"],
+            )
+            dl = self._debug_logger
+            if dl is not None:
+                dl.log_learning_cycle(cycle_num=1, data={
+                    "level": 1, "phase": 2, "component": "prompt_adoption_gate",
+                    "mode": mode, "cases_selected": len(cases),
+                    "cases_measured": len(common),
+                    "measured_before": round(mb, 4), "measured_after": round(ma, 4),
+                    "min_gain": min_gain, "adopt": verdict["adopt"],
+                    "reason": verdict["reason"],
+                    # ケース別の内訳。平均だけだと「どの失敗ケースで候補が
+                    # 負けたか」が追えず、ゲートの妥当性を後から検証できない
+                    # (2026-09-05 実機: 0.400 → 0.350 の内訳が読めなかった)。
+                    "cases": [
+                        {
+                            "case_id": c.case_id, "kind": c.kind,
+                            "query": c.query[:80],
+                            "before": round(before[c.case_id], 3),
+                            "after": round(after[c.case_id], 3),
+                        }
+                        for c in cases if c.case_id in common
+                    ],
+                })
+        return verdicts
 
     # ── 採用プロンプトの事後監視 (L-A7) ──
 
@@ -1307,6 +1515,13 @@ class LearningScheduler:
                 prompt_texts = self._collect_mode_prompt_texts()
                 if not prompt_texts:
                     logger.warning("No prompts available for evolution")
+                # 選択圧の無いモードは変異生成の前に落とす (f_04 §8 禁則 7)。
+                # 失敗ターンが 1 件も無いモードは欠陥率が 1.0 で全候補同値、
+                # 失敗クエリ語も無いのでタイブレークも 0 — 10 世代回しても
+                # 現行と同値の候補しか出ず、採用ゲートの評価ケースも作れない。
+                prompt_texts, skipped_modes = (
+                    self._drop_modes_without_selection_pressure(prompt_texts, session)
+                )
                 tp = time.monotonic()
                 results = await self._evolver.evolve_all_modes(
                     experiences=session.experience_snapshot,
@@ -1340,6 +1555,15 @@ class LearningScheduler:
                         "modes": self._format_modes_summary(results),
                     }
 
+                # 採用ゲート: 現行と最良候補を同じ失敗ケースで実生成・採点する
+                # (f_04 §4.5)。欠陥率 fitness は候補に無反応なので、採用の可否は
+                # ここで測った差だけで決める。
+                tg = time.monotonic()
+                verdicts = await self._measure_prompt_adoptions(
+                    results, prompt_texts, session.experience_snapshot,
+                )
+                phase_durations["phase2_adoption_gate"] = round(time.monotonic() - tg, 3)
+
                 # 追加最適化 (f_04 §4)。prompt 進化の採用結果と session archive
                 # を失わないため、失敗しても警告のみで finalize へ進む。
                 skipped_phases: list[str] = []
@@ -1360,6 +1584,8 @@ class LearningScheduler:
                     extra_results=extra_results,
                     experiences=session.experience_snapshot,
                     skipped_phases=skipped_phases,
+                    adoption_verdicts=verdicts,
+                    skipped_modes=skipped_modes,
                 )
                 elapsed = round(time.monotonic() - t0, 3)
                 self._level1_log_debug(
@@ -1374,6 +1600,7 @@ class LearningScheduler:
                     "modes": self._format_modes_summary(results),
                     "extra_phases": sorted(extra_results.keys()),
                     "skipped_phases": skipped_phases,
+                    "noop_modes": sorted(skipped_modes.keys()),
                 }
             finally:
                 self._running = False
@@ -1713,17 +1940,33 @@ class LearningScheduler:
         """Level 1 結果を永続化用にサマリ化する"""
         summary: dict = {}
         executed_phases: list[str] = []
+        noop_phases: list[str] = []
         for key, val in results.items():
             improved = val.get("improved", False)
             fb = val.get("fitness_before")
             fa = val.get("fitness_after")
-            summary[key] = {
+            skipped = bool(val.get("skipped", False))
+            entry: dict = {
                 "improved": improved,
                 "fitness_before": round(fb, 4) if fb is not None else None,
                 "fitness_after": round(fa, 4) if fa is not None else None,
             }
-            executed_phases.append(key)
+            # 「実行したが改善なし」と「対象が無くて何もしていない」を区別する
+            # (2026-09-04 監査: create は経験 1 件で毎回 improved=False と記録され、
+            # 走っていないことが状態からは読めなかった)。
+            if skipped:
+                entry["skipped"] = True
+            reason = val.get("reason")
+            if reason:
+                entry["reason"] = str(reason)
+            for mk in ("measured_before", "measured_after"):
+                mv = val.get(mk)
+                if mv is not None:
+                    entry[mk] = round(float(mv), 4)
+            summary[key] = entry
+            (noop_phases if skipped else executed_phases).append(key)
         summary["_executed_phases"] = executed_phases
+        summary["_noop_phases"] = noop_phases
         return summary
 
     def _append_fitness_history(self, results: dict[str, dict]) -> None:
@@ -1822,6 +2065,15 @@ class LearningScheduler:
         added = self._fewshot_pool.add_from_experiences(experiences)
         if added:
             logger.info("Fewshot pool updated: %d new examples added", added)
+        # 訂正で確定した「元の問い → 訂正後の回答」も手本に流す。失敗経験の
+        # 唯一の受け皿 (Level 2 の重み学習は on-device では動かない、2026-09-05)。
+        from backend.free.learning.corrected_pairs import build_corrected_pairs
+
+        corrected = self._fewshot_pool.add_corrected_pairs(
+            build_corrected_pairs(experiences),
+        )
+        if corrected:
+            logger.info("Fewshot pool updated: %d corrected-pair examples added", corrected)
         await self._fewshot_pool.score_pending_quality(
             self.resolve_idle_task_client(llm_client),
         )
@@ -1862,6 +2114,26 @@ class LearningScheduler:
                 "Level 1 embed instruction skipped: %d RAG experiences < %d",
                 len(rag_exp), threshold,
             )
+            return
+        # 実測評価が無い (未配線) か、embedder が instruction を受け付けない
+        # (bge-m3 等、query_template が空) なら候補の fitness は経験の
+        # rag_top1_score 平均 = 候補に無反応な定数になる。選択圧ゼロで 10 世代の
+        # 変異生成 (LLM 往復) を回しても採用されることは無い (§8 禁則 7)。
+        # 2026-09-05 実機: 初期集団 5 件とも 0.6260、履歴 10 回すべて同値。
+        embed_eval = self._embed_eval
+        if embed_eval is None or not getattr(embed_eval, "can_measure", True):
+            reason = (
+                "no_real_eval" if embed_eval is None
+                else "embedder_not_instruction_aware"
+            )
+            logger.info(
+                "Level 1 embed instruction skipped (%s; fitness would not "
+                "respond to candidates)", reason,
+            )
+            results["embed_instruction"] = {
+                "improved": False, "fitness_before": None,
+                "fitness_after": None, "skipped": True, "reason": reason,
+            }
             return
 
         logger.info(

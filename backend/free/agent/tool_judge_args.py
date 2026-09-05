@@ -505,6 +505,8 @@ _ARITH_NORMALIZE = str.maketrans({
 })
 # 算術式になりうる文字だけからなる連続領域
 _ARITH_RUN_RE = re.compile(r"[0-9.+\-*/%^()\s]+")
+# 桁区切り入りの数字 (``1,280`` / ``1,234,567.5``)。
+_ARITH_GROUPED_DIGITS_RE = re.compile(r"(?<![\d.])\d{1,3}(?:,\d{3})+(?:\.\d+)?(?![\d,])")
 # 日付・バージョン番号の誤検出除け (2026-07-27 は BinOp として parse できてしまう)
 _ARITH_DATE_LIKE_RE = re.compile(
     r"^(?:\d{4}\s*-\s*\d{1,2}\s*-\s*\d{1,2}"
@@ -562,7 +564,13 @@ def _extract_arithmetic_expression(query: str) -> str:
     Returns:
         正規化済みの式。抽出できなければ空文字列。
     """
-    normalized = query.translate(_ARITH_NORMALIZE)
+    # 桁区切り (``1,280``) は先に落とす。``_ARITH_RUN_RE`` はカンマを式の文字と
+    # 見ないので、残したままだと「1,280 × 37 × 1.08」の run が「280 × 37 × 1.08」
+    # から始まり、正しく計算された嘘 (11188.8) が回答の根拠に載る
+    # (2026-09-05 ライブ監査 T15)。
+    normalized = _ARITH_GROUPED_DIGITS_RE.sub(
+        lambda m: m.group(0).replace(",", ""), query.translate(_ARITH_NORMALIZE),
+    )
     for match in _ARITH_RUN_RE.finditer(normalized):
         candidate = match.group(0).strip()
         if not candidate or _ARITH_DATE_LIKE_RE.match(candidate):
