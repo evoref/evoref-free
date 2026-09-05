@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import json
+from dataclasses import MISSING
+from dataclasses import fields as dc_fields
 from pathlib import Path
 
 import numpy as np
@@ -147,53 +149,26 @@ def _peek_note_count(path: Path) -> int:
 
 
 def _note_to_dict(note: MemoryNote) -> dict:
-    return {
-        "id": note.id,
-        "content": note.content,
-        "keywords": note.keywords,
-        "tags": note.tags,
-        "embedding": note.embedding.tolist() if note.embedding is not None else None,
-        "embed_failures": note.embed_failures,
-        "lightmem_score": note.lightmem_score,
-        "created_at": note.created_at,
-        "accessed_at": note.accessed_at,
-        "access_count": note.access_count,
-        "session_id": note.session_id,
-        "context_description": note.context_description,
-        "evolution_pending": note.evolution_pending,
-        "conflict_candidate": note.conflict_candidate,
-        "conflict_partner_id": note.conflict_partner_id,
-        # EvorefMem 拡張
-        "source": note.source,
-        "confidence": note.confidence,
-        "pin_flag": note.pin_flag,
-        "pin_reason": note.pin_reason,
-        "is_correction": note.is_correction,
-        "extracted_fact_ids": list(note.extracted_fact_ids),
-        "private": note.private,
-        "mode": note.mode,
-        "project_id": note.project_id,
-        "is_tool_output": note.is_tool_output,
-        "is_code_block": note.is_code_block,
-        "extraction_skipped": note.extraction_skipped,
-        "extraction_skip_reason": note.extraction_skip_reason,
-        # executable command 学習用
-        "tool_command": note.tool_command,
-        "tool_command_name": note.tool_command_name,
-        "tool_command_success": note.tool_command_success,
-        "tool_command_source": note.tool_command_source,
-        "tool_command_query": note.tool_command_query,
-        "extraction_deferred": note.extraction_deferred,
-        "trace_id": note.trace_id,
-        "links": list(note.links),
-        "cluster_id": note.cluster_id,
-        "url_curated_at": note.url_curated_at,
-        "command_curated_at": note.command_curated_at,
-        "assertion_curated_at": note.assertion_curated_at,
-        "assertion_slug": note.assertion_slug,
-        "conflict_fail_count": note.conflict_fail_count,
-        "conflict_cooldown_until": note.conflict_cooldown_until,
-    }
+    """``MemoryNote`` を dict にする (**フィールド列挙は dataclass 由来**)。
+
+    手書きのキー列だと新しいフィールドを足したときに書き漏れ、値が静かに
+    失われる (実際 ``episode_id`` 追加まで気付けない形だった)。``fields()``
+    から機械的に組み、``_extra`` の未知キーはトップレベルへ復元する。
+    """
+    out: dict = {}
+    for f in dc_fields(note):
+        if f.name == "_extra":
+            continue
+        value = getattr(note, f.name)
+        if f.name == "embedding":
+            out[f.name] = value.tolist() if value is not None else None
+        elif isinstance(value, (list, set, tuple)):
+            out[f.name] = list(value)
+        else:
+            out[f.name] = value
+    for key, value in (note._extra or {}).items():
+        out.setdefault(key, value)
+    return out
 
 
 def _sanitize_tags(tags: list[str], source: str) -> list[str]:
@@ -217,55 +192,30 @@ def _sanitize_tags(tags: list[str], source: str) -> list[str]:
 
 
 def _note_from_dict(d: dict) -> MemoryNote:
-    emb = d.get("embedding")
+    """dict から ``MemoryNote`` を復元する。
+
+    既知フィールドは ``fields()`` から機械的に読み、**未知キーは ``_extra``
+    へ退避** して次の保存で原形のまま書き戻す (新しい版が書いた値を旧版が
+    黙って捨てないため)。
+    """
+    known = {f.name: f for f in dc_fields(MemoryNote) if f.name != "_extra"}
     source = d.get("source", "user")
-    return MemoryNote(
-        id=d["id"],
-        content=d["content"],
-        keywords=d.get("keywords", []),
-        tags=_sanitize_tags(d.get("tags", []), source),
-        embedding=np.array(emb, dtype=np.float32) if emb is not None else None,
-        embed_failures=int(d.get("embed_failures", 0) or 0),
-        lightmem_score=d.get("lightmem_score", 0.5),
-        created_at=d.get("created_at", 0.0),
-        accessed_at=d.get("accessed_at", 0.0),
-        access_count=d.get("access_count", 0),
-        session_id=d.get("session_id", ""),
-        context_description=d.get("context_description", ""),
-        evolution_pending=d.get("evolution_pending", True),
-        conflict_candidate=d.get("conflict_candidate", False),
-        conflict_partner_id=d.get("conflict_partner_id"),
-        # EvorefMem 拡張
-        source=source,
-        confidence=d.get("confidence", 1.0),
-        pin_flag=d.get("pin_flag", False),
-        pin_reason=d.get("pin_reason"),
-        is_correction=d.get("is_correction", False),
-        extracted_fact_ids=list(d.get("extracted_fact_ids", [])),
-        private=d.get("private", False),
-        mode=d.get("mode", "chat"),
-        project_id=d.get("project_id"),
-        is_tool_output=d.get("is_tool_output", False),
-        is_code_block=d.get("is_code_block", False),
-        extraction_skipped=d.get("extraction_skipped", False),
-        extraction_skip_reason=d.get("extraction_skip_reason"),
-        # executable command 学習用
-        tool_command=d.get("tool_command"),
-        tool_command_name=d.get("tool_command_name"),
-        tool_command_success=d.get("tool_command_success"),
-        tool_command_source=d.get("tool_command_source"),
-        tool_command_query=d.get("tool_command_query"),
-        extraction_deferred=bool(d.get("extraction_deferred", False)),
-        trace_id=d.get("trace_id"),
-        # 他フィールドと同じく防御的に読む。links / cluster_id だけ直アクセスだと
-        # 1 ノートで両キーを欠くスナップショットが KeyError で deserialize 全体を
-        # 失敗させ、起動時ロードが STM を空で開始して前回の全ノートを失う。
-        links=list(d.get("links", [])),
-        cluster_id=d.get("cluster_id"),
-        url_curated_at=d.get("url_curated_at"),
-        command_curated_at=d.get("command_curated_at"),
-        assertion_curated_at=d.get("assertion_curated_at"),
-        assertion_slug=d.get("assertion_slug"),
-        conflict_fail_count=d.get("conflict_fail_count", 0),
-        conflict_cooldown_until=d.get("conflict_cooldown_until"),
-    )
+    kwargs: dict = {}
+    for name, f in known.items():
+        if name not in d:
+            continue
+        value = d[name]
+        if name == "embedding":
+            kwargs[name] = (
+                np.array(value, dtype=np.float32) if value is not None else None
+            )
+        elif name == "tags":
+            kwargs[name] = _sanitize_tags(list(value or []), source)
+        elif f.default_factory is not MISSING:  # type: ignore[misc]
+            kwargs[name] = f.default_factory(value or ())  # type: ignore[misc]
+        else:
+            kwargs[name] = value
+    kwargs.setdefault("id", d.get("id", ""))
+    kwargs.setdefault("content", d.get("content", ""))
+    extra = {k: v for k, v in d.items() if k not in known}
+    return MemoryNote(**kwargs, _extra=extra)

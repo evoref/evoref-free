@@ -268,7 +268,7 @@ def _get_pro_learning_info() -> dict:
     result["lora_version"] = vmgr.get_latest_version()
     result["lora_adapter_exists"] = adapter_path.exists()
 
-    eval_path = resolver.resolve_local("eval_core_file")
+    eval_path = resolver.resolve_learning("eval_core_file")
     emgr = EvalCoreManager(eval_path)
     eval_set = emgr.load()
     result["eval_cases_count"] = len(eval_set.cases)

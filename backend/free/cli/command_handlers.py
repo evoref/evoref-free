@@ -24,6 +24,7 @@ from backend.free.cli.session_persistence import (
 )
 from backend.free.history.utils import parse_iso
 from backend.i18n_helper import msg
+from backend.io import atomic_write_text
 from backend.log_config import get_logger
 from backend.utils import utc_now_dt
 
@@ -143,7 +144,9 @@ def _cmd_save(args: str, state: SessionState, console) -> CommandResult:
         "source": "manual",
         "instance_name": state.instance_name,
         "turns": state.turns,
-        "active_note_ids": [],
+        # ``active_note_ids`` は常に空配列を書いていた死にフィールドなので落とす。
+        # セッション ↔ STM ノートの対応は ``MemoryNote.session_id`` が持つ
+        # (逆引きが必要ならそちらを走査する)。
         "context_files": list(state.context_files),
         "token_info": {
             "used": state.token_used,
@@ -154,9 +157,8 @@ def _cmd_save(args: str, state: SessionState, console) -> CommandResult:
 
     path = state.sessions_dir / f"{name}.json"
     try:
-        path.write_text(
-            json.dumps(session_data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        atomic_write_text(
+            path, json.dumps(session_data, ensure_ascii=False, indent=2),
         )
         logger.debug("/save: wrote %s (%d turns)", path, len(state.turns))
         state.manually_saved = True

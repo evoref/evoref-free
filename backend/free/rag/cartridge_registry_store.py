@@ -16,8 +16,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import fields as dc_fields
 from pathlib import Path
 
+from backend.io.atomic import atomic_write_text
 from backend.free.rag.cartridge_manager import CartridgeInfo
 from backend.log_config import get_logger
 
@@ -77,9 +79,10 @@ class CartridgeRegistryStore:
         path = CartridgeRegistryStore.registry_path(cartridges_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
         data = CartridgeRegistryStore.serialize(registry)
-        path.write_text(
+        atomic_write_text(
+            path,
             json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+            fsync=True,
         )
         logger.info("Saved cartridge registry (%d entries) to %s", len(data), path)
 
@@ -110,25 +113,11 @@ class CartridgeRegistryStore:
 
 
 def _info_to_dict(info: CartridgeInfo) -> dict:
-    """`CartridgeInfo` を JSON-serializable な dict に変換する (純粋関数)。"""
-    return {
-        "id": info.id,
-        "name": info.name,
-        "version": info.version,
-        "author": info.author,
-        "description": info.description,
-        "tags": info.tags,
-        "language": info.language,
-        "status": info.status,
-        "doc_count": info.doc_count,
-        "chunks": info.chunks,
-        "size_mb": info.size_mb,
-        "priority": info.priority,
-        "installed_at": info.installed_at,
-        "compatibility": info.compatibility,
-        "needs_rebuild": info.needs_rebuild,
-        "tool_hints": info.tool_hints,
-        "embedding_model": info.embedding_model,
-        "embedding_backend": info.embedding_backend,
-        "embedding_dim": info.embedding_dim,
-    }
+    """`CartridgeInfo` を JSON-serializable な dict に変換する (純粋関数)。
+
+    **フィールド列挙は dataclass 由来**。手書きだと新フィールドの書き漏れで
+    値が黙って落ちる (``docs_digest`` 追加時に実際に起きうる形だった)。
+    """
+    return {f.name: getattr(info, f.name) for f in dc_fields(info)}
+
+

@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from backend.free.core.text_quality import detect_lang
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -117,6 +118,11 @@ async def summarize_unsummarized_sessions(
 
             emb = await embedder.embed([session.summary], is_query=False)
             session.summary_embedding = emb[0].tolist()
+            # ベクトルにモデル名を添える。無記名だと埋め込みモデルを替えた後、
+            # 新旧のベクトルが次元一致だけで見分けられず類似度が黙って壊れる。
+            session.summary_embedding_model = embedder.model_name()
+            if not session.lang:
+                session.lang = detect_lang(session.summary)
 
             mgr.save_session(session)
 

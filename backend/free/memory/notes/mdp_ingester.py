@@ -419,7 +419,8 @@ class MDPIngester:
             tags=["mdp_trace"],
             created_at=ts,
             accessed_at=ts,
-            session_id=episode.episode_id,
+            session_id=episode.conversation_id() or "",
+            episode_id=episode.episode_id,
             source="system",
             confidence=0.6,
             mode=normalize_session_mode(episode.mode(), default="create"),  # type: ignore[arg-type]

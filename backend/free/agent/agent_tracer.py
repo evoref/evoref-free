@@ -54,6 +54,10 @@ class AgentTracer:
         #: episode_id → conversation_id。例外 / キャンセルで ``end_episode`` に
         #: 到達しなかったエピソードを ``abort_open_episodes`` で閉じるための索引。
         self._conversation_of: dict[str, str] = {}
+        #: private エピソードの ID 集合。private 判定はリクエスト単位の
+        #: contextvar で executor 境界を越えると落ちるため、エピソード単位で
+        #: 保持し **全イベントに印を打つ** (2026-09-05 監査)。
+        self._private_episodes: set[str] = set()
 
     def begin_episode(
         self, conversation_id: str, mode: str, *, private: bool = False,
@@ -76,6 +80,7 @@ class AgentTracer:
             "timestamp": time.time(),
         }
         if private:
+            self._private_episodes.add(episode_id)
             event["private"] = True
         self._log(event)
 
@@ -124,6 +129,7 @@ class AgentTracer:
         """エピソードのインメモリデータを破棄"""
         self._episodes.pop(episode_id, None)
         self._conversation_of.pop(episode_id, None)
+        self._private_episodes.discard(episode_id)
 
     def abort_open_episodes(
         self, conversation_id: str, outcome: str = "failure: aborted",
@@ -150,6 +156,9 @@ class AgentTracer:
 
     def _log(self, data: dict) -> None:
         """常設ストアと (develop 時は) DebugLogger の両方へ書き込み"""
+        episode_id = data.get("episode_id")
+        if episode_id in self._private_episodes:
+            data = {**data, "private": True}
         store = self._trace_store
         if store is not None:
             store.append(data)

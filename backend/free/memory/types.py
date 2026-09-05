@@ -101,21 +101,44 @@ class Provenance:
 
     note_id: str | None = None
     session_id: str | None = None
+    turn_id: str | None = None
+    """元になった WM ターンの ID。セッション内の順序と、そのターンの
+    ログ / experience への連結点 (c_05 §0.6)。"""
+
     trace_id: str | None = None
     mode: MemoryMode | None = None
     project_id: str | None = None
     source: NoteSource | None = None
     captured_at: float = 0.0
 
+    extractor: str | None = None
+    """このファクトを作った抽出器 / キュレータのクラス名。
+
+    ファクトの生産者は 4 系統以上 (ChatExtractor / CreateExtractor /
+    MDPTraceExtractor と LLM キュレータ 3 種) あるのに、どれが作ったかを
+    記録していなかった。抽出ロジックを変えた後、既存ファクトを「どの版が
+    作ったか」で選り分けて再導出できない (2026-09-05 監査)。
+    """
+
+    extractor_version: int | None = None
+    """抽出器の版。抽出規則を変えたら上げる。"""
+
+    model: str | None = None
+    """LLM を使って作られた場合の生成モデル名 (決定論抽出は ``None``)。"""
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "note_id": self.note_id,
             "session_id": self.session_id,
+            "turn_id": self.turn_id,
             "trace_id": self.trace_id,
             "mode": self.mode,
             "project_id": self.project_id,
             "source": self.source,
             "captured_at": self.captured_at,
+            "extractor": self.extractor,
+            "extractor_version": self.extractor_version,
+            "model": self.model,
         }
 
     @classmethod
@@ -123,11 +146,15 @@ class Provenance:
         return cls(
             note_id=d.get("note_id"),
             session_id=d.get("session_id"),
+            turn_id=d.get("turn_id"),
             trace_id=d.get("trace_id"),
             mode=d.get("mode"),
             project_id=d.get("project_id"),
             source=d.get("source"),
             captured_at=float(d.get("captured_at", 0.0)),
+            extractor=d.get("extractor"),
+            extractor_version=d.get("extractor_version"),
+            model=d.get("model"),
         )
 
 
@@ -185,6 +212,13 @@ class SemanticFact:
     subject_aliases: list[str] = field(default_factory=list)
     scope_locked: bool = False
     mode_origin: MemoryMode = "chat"
+    lang: str = ""
+    """本文の言語 (``ja`` / ``en`` / 未判定は空)。決定論判定で埋める。
+
+    横断検索の順位付けで **同点時のタイブレークと重み付け** にだけ使う。
+    フィルタには使わない — GUI ロケールで入力照合を排他にすると片方の言語が
+    死ぬ前例がある (2026-09-03)。
+    """
     provenances: list[Provenance] = field(default_factory=list)
     confidence: float = 0.5
     pinned: bool = False
@@ -307,6 +341,7 @@ _KNOWN_FACT_KEYS: frozenset[str] = frozenset({
     "scope",
     "scope_locked",
     "mode_origin",
+    "lang",
     "provenances",
     "confidence",
     "pinned",
@@ -368,6 +403,7 @@ def serialize_fact(
         "scope": fact.scope,
         "scope_locked": fact.scope_locked,
         "mode_origin": fact.mode_origin,
+        "lang": fact.lang,
         "provenances": [p.to_dict() for p in fact.provenances],
         "confidence": fact.confidence,
         "pinned": fact.pinned,
@@ -430,6 +466,7 @@ def deserialize_fact(d: dict[str, Any]) -> SemanticFact:
         scope=d["scope"],
         scope_locked=bool(d.get("scope_locked", False)),
         mode_origin=d.get("mode_origin", "chat"),
+        lang=d.get("lang", ""),
         provenances=[Provenance.from_dict(p) for p in provenances_raw],
         confidence=float(d.get("confidence", 0.5)),
         pinned=bool(d.get("pinned", False)),

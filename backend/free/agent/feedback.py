@@ -50,9 +50,11 @@ from backend.free.learning.level0_instant import (
     ExperienceBuffer,
     ExperienceEntry,
     FeedbackSignals,
+    GenerationConfigRef,
     truncate_at_boundary,
 )
 from backend.log_config import get_logger
+from backend.trace_context import get_trace_id
 from backend.utils import utc_now
 
 if TYPE_CHECKING:
@@ -757,6 +759,8 @@ class FeedbackCollector:
         truncated: bool = False,
         generation_failed: bool = False,
         session_id: str = "",
+        turn_id: str = "",
+        gen_config: "GenerationConfigRef | None" = None,
     ) -> ExperienceEntry:
         """シグナル収集 → ExperienceBuffer に記録
 
@@ -765,12 +769,24 @@ class FeedbackCollector:
         (どちらも :class:`FeedbackSignals` へそのまま刻む。後者は
         ``turn_outcome="failed"`` に倒す)。``session_id`` は直前ターンとの
         突き合わせ (訂正 / 言い直し / 保留) をセッション単位に閉じる鍵。
+
+        ``turn_id`` / ``gen_config`` は fitness の帰属先を **記録** するための
+        もの (c_05 §0.6)。以前は「その応答を生んだプロンプト版 / few-shot /
+        ポリシー / LoRA」をどこにも残しておらず、Level 1 / Level 2 の帰属は
+        時刻からの推測でしかなかった (2026-09-05 監査)。
         """
+        from backend.free.core.text_quality import detect_lang
+
+        lang = detect_lang(response)
         if self._disabled:
             # 学習無効化中: シグナル検出 / パターン学習 / バッファ書込を全てスキップ。
             # 呼出側 (chat_recorder) は戻り値を直接参照しないが、署名互換のため
             # 最小限のダミーエントリを返す
             return ExperienceEntry(
+                id=ExperienceEntry.new_id(),
+                session_id=session_id,
+                turn_id=turn_id,
+                trace_id=get_trace_id() or "",
                 timestamp=utc_now(),
                 mode=mode,
                 query=query,
@@ -779,6 +795,8 @@ class FeedbackCollector:
                 base_model=base_model or self._resolve_base_model_name(mode),
                 embedding_model=embedding_model or self._embedding_model_name,
                 cartridge_ids=cartridge_ids or [],
+                lang=lang,
+                gen_config=gen_config or GenerationConfigRef(),
                 signals=FeedbackSignals(),
             )
         self._load_session_state(session_id)
@@ -839,6 +857,10 @@ class FeedbackCollector:
         )
 
         entry = ExperienceEntry(
+            id=ExperienceEntry.new_id(),
+            session_id=session_id,
+            turn_id=turn_id,
+            trace_id=get_trace_id() or "",
             timestamp=utc_now(),
             mode=mode,
             query=query,
@@ -847,6 +869,8 @@ class FeedbackCollector:
             base_model=base_model or self._resolve_base_model_name(mode),
             embedding_model=embedding_model or self._embedding_model_name,
             cartridge_ids=cartridge_ids or [],
+            lang=lang,
+            gen_config=gen_config or GenerationConfigRef(),
             signals=signals,
         )
 

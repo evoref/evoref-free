@@ -648,7 +648,7 @@ def _load_learned_patterns(
     from backend.free.agent.learned_patterns import LearnedPatternStore
 
     learned_patterns_store = LearnedPatternStore(cfg, policy=policy_interpreter)
-    patterns_file = resolver.resolve_local("learned_patterns_file")
+    patterns_file = resolver.resolve_learning("learned_patterns_file")
     if patterns_file.exists():
         try:
             learned_patterns_store.load(patterns_file)
@@ -1514,7 +1514,7 @@ def _wire_sleep_scheduler_models(
     ecm_cls = get_pro_handler("eval_core_manager")
     if ecm_cls is not None:
         try:
-            eval_core_path = resolver.resolve_local("eval_core_file")
+            eval_core_path = resolver.resolve_learning("eval_core_file")
             learning_scheduler.set_eval_core_manager(ecm_cls(eval_core_path))
         except Exception as e:
             logger.debug("eval_core_manager injection skipped: %s", e)
@@ -2084,7 +2084,7 @@ def _auto_migrate_base_model(
     EvalCoreManager = get_pro_handler("eval_core_manager")
     if EvalCoreManager is not None:
         try:
-            eval_core_path = resolver.resolve_local("eval_core_file")
+            eval_core_path = resolver.resolve_learning("eval_core_file")
             eval_core_mgr = EvalCoreManager(eval_core_path)
         except Exception as exc:
             logger.debug("eval_core_manager unavailable during auto-migrate: %s", exc)

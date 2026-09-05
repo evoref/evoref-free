@@ -24,6 +24,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from backend.io.atomic import atomic_write_text
 from backend.log_config import get_logger
 from backend.utils import utc_now
 
@@ -44,12 +45,16 @@ ADAPTER_MODE_MARKER_NAME = ".adapter_mode_migrated_v1"
 _BASE_PROMPT_FILES = (
     "chat.md", "chat.meta.json",
     "create.md", "create.meta.json",
+    # 規則台帳。移行対象から漏れていると helpful/harmful が本文からの再パースで
+    # ゼロに戻り、Level 1 の delete 証拠ゲートが根拠を失う (2026-09-05 監査)。
+    "chat.rules.json", "create.rules.json",
     "learning_state.json",
     "level1_session_active.json",
     "exploration_state.json",
     "policy_evolver_state.json",
     "fewshot_pool.json",
     "generation_param_ratios.json",
+    "token_budget.json",
 )
 # 同じく移すサブディレクトリ。
 _BASE_PROMPT_SUBDIRS = ("level1_history",)
@@ -89,9 +94,10 @@ class LearningPartitionMigrator:
             "counts": counts,
             "develop_level": self._develop_level or "off",
         }
-        marker.write_text(
+        atomic_write_text(
+            marker,
             json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+            fsync=True,
         )
 
     # ── メイン ───────────────────────────────────────────
@@ -167,6 +173,9 @@ class LearningPartitionMigrator:
         except (OSError, ValueError) as exc:
             logger.warning("experience migration: unreadable %s: %s", src, exc)
             return 0
+        # 永続化エンベロープ (c_05 §0.5) と旧形式の両方を受ける。
+        if isinstance(payload, dict) and "payload" in payload:
+            payload = payload["payload"]
         entries = payload.get("entries") if isinstance(payload, dict) else None
         if not isinstance(entries, list):
             return 0
@@ -179,15 +188,19 @@ class LearningPartitionMigrator:
             stem = Path(tag).stem if tag else current_stem
             buckets.setdefault(stem or current_stem, []).append(entry)
 
+        # 部分完了で終わると、次回は `dst.exists()` の冪等スキップが「完了済」と
+        # 誤認して残りのバケツを永久に落とす。全バケツを書き切れなければ例外を
+        # 投げ、呼び出し側にマーカーを書かせない (次回まるごと再試行させる)。
         written = 0
         for stem, items in buckets.items():
             dst = self._resolver.learning_path_for("experience_file", stem)
             if dst.exists():
                 continue  # 既にパーティションに存在 = 冪等スキップ
             dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_text(
+            atomic_write_text(
+                dst,
                 json.dumps({"entries": items}, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+                fsync=True,
             )
             written += len(items)
         return written
@@ -250,6 +263,10 @@ class LearningPartitionMigrator:
             "control_vector_adapter",
             "control_vector_versions_dir",
             "cvector_work_dir",
+            # 2026-09-05 にパーティション対象へ加えた 2 件。flat 原本を
+            # そのモデルのパーティションへ引き継ぐ (原本は残置)。
+            "learned_patterns_file",
+            "eval_core_file",
         ):
             src = self._resolver.resolve_local(key)
             dst = self._resolver.learning_path_for(key, stem)
@@ -328,7 +345,8 @@ class LearningPartitionMigrator:
             "target_mode": "chat",
             "copied": copied,
         }
-        marker.write_text(
+        atomic_write_text(
+            marker,
             json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+            fsync=True,
         )

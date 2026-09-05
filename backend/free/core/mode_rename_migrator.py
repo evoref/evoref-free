@@ -27,6 +27,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from backend.io.atomic import atomic_write_text
 from backend.log_config import get_logger
 from backend.utils import utc_now
 
@@ -171,7 +172,8 @@ class ModeRenameMigrator:
 
         marker = self._marker_path()
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(
+        atomic_write_text(
+            marker,
             json.dumps(
                 {
                     "version": 1,
@@ -182,7 +184,7 @@ class ModeRenameMigrator:
                 },
                 ensure_ascii=False, indent=2,
             ),
-            encoding="utf-8",
+            fsync=True,
         )
         if renamed or rewritten:
             logger.info(
@@ -261,9 +263,13 @@ class ModeRenameMigrator:
         data = json.loads(path.read_text(encoding="utf-8"))
         migrated, count = migrate_node(data)
         if count:
-            path.write_text(
+            # 他 pillar の live ストアを上書きするので atomic 必須。truncate 書きだと
+            # 途中クラッシュで memory / history / policy が壊れ、マーカー未書込みの
+            # まま次回起動が半端なデータへ再実行される (2026-09-05 監査)。
+            atomic_write_text(
+                path,
                 json.dumps(migrated, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+                fsync=True,
             )
         return count
 
@@ -276,11 +282,20 @@ class ModeRenameMigrator:
             if not stripped:
                 out.append(line)
                 continue
-            migrated, count = migrate_node(json.loads(stripped))
+            try:
+                node = json.loads(stripped)
+            except json.JSONDecodeError:
+                # パース不能な 1 行で移行全体を止めない / その行を捨てない。
+                logger.warning(
+                    "mode rename: keeping unparsable JSONL line as-is in %s", path,
+                )
+                out.append(line)
+                continue
+            migrated, count = migrate_node(node)
             total += count
             out.append(json.dumps(migrated, ensure_ascii=False) if count else line)
         if total:
-            path.write_text("\n".join(out) + "\n", encoding="utf-8")
+            atomic_write_text(path, "\n".join(out) + "\n", fsync=True)
         return total
 
 

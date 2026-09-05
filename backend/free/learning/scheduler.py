@@ -392,6 +392,12 @@ class LearningScheduler:
         prompt_cfg = config.get("prompt") or {}
         self._evolver.max_deletes_per_run = int(prompt_cfg.get("max_deletes_per_run", 1))
         self._evolver.delete_gate = self._prompt_rule_delete_gate
+        # 候補アーカイブ。プロンプト版と同じパーティション配下に置く
+        # (base モデルが変われば候補の意味も変わる)。
+        if prompt_manager is not None:
+            self._evolver.candidates_archive = (
+                Path(prompt_manager.prompt_dir) / "candidates.jsonl"
+            )
 
         # 自己学習無効化フラグ (--no-learning 経由)。True の場合 Level 1/2 サイクルは
         # 全て早期 return し副作用なし。get_status は ``is_disabled: True`` を返す
@@ -464,6 +470,17 @@ class LearningScheduler:
             )
         except OSError as e:
             logger.warning("Failed to save learning state: %s (path=%s)", e, self._state_file)
+
+    def _eval_set_version(self) -> str:
+        """採用判定に使った eval セットの ``updated_at`` (取れなければ空)。"""
+        manager = getattr(self, "eval_core_manager", None)
+        if manager is None:
+            return ""
+        try:
+            return str(manager.load().updated_at or "")
+        except Exception as exc:
+            logger.debug("eval set version unavailable: %s", exc)
+            return ""
 
     def _save_policy_evolver_state(self) -> None:
         """PolicyEvolver + ExplorationController の状態を永続化する。
@@ -1116,6 +1133,7 @@ class LearningScheduler:
                     mode,
                     result.best_candidate.text,
                     result.final_fitness,
+                    eval_set_version=self._eval_set_version(),
                 )
                 self._record_prompt_adoption(mode, rollback_to, experiences)
                 logger.info(
@@ -2655,7 +2673,7 @@ class LearningScheduler:
         try:
             from backend.config import get_path_resolver
             resolver = get_path_resolver()
-            patterns_file = resolver.resolve_local("learned_patterns_file")
+            patterns_file = resolver.resolve_learning("learned_patterns_file")
             store.save(patterns_file)
         except Exception:
             logger.warning("tool routing pattern persistence failed")
@@ -2725,7 +2743,7 @@ class LearningScheduler:
         try:
             from backend.config import get_path_resolver
             resolver = get_path_resolver()
-            patterns_file = resolver.resolve_local("learned_patterns_file")
+            patterns_file = resolver.resolve_learning("learned_patterns_file")
             store.save(patterns_file)
         except Exception:
             logger.warning("long_form pattern persistence failed")

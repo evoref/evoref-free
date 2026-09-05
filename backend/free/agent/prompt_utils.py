@@ -51,6 +51,15 @@ class FewShotExample:
     #: 算術を「正確」と評価するため (実測 2026-07-31)、内容の正誤は
     #: ``response_arithmetic`` の決定論検算が担当する。
     quality_score: float | None = None
+    #: ``quality_score`` を付けた採点器の版。採点規則を変えても既存スコアが
+    #: そのまま残り、古い規則の点と新しい規則の点が混ざっていた。
+    quality_scorer_version: int | None = None
+    #: この例の出所となった経験エントリの ID (``ExperienceEntry.id``)。
+    #: 後でその応答が誤りと分かったとき、由来を辿って無効化するための鍵。
+    #: 以前はどこにも残しておらず、例から会話へ戻る道が無かった (2026-09-05 監査)。
+    source_experience_id: str = ""
+    #: 例の言語 (``ja`` / ``en`` / 未判定は空)。
+    lang: str = ""
     #: ``query`` の埋め込み (list 化、JSON 永続化のため)。未生成なら ``None``。
     #:
     #: few-shot の選択は長らく文字 bi-gram コサインだけで、**記憶検索 (密ベクトル)

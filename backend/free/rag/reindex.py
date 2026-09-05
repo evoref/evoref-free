@@ -188,14 +188,26 @@ async def _reindex_rag_store(
 
     # 既存メタデータと本文を回収
     items: list[tuple[dict, str]] = []
+    missing: list[str] = []
     for meta in store.metadata:
         chunk_id = meta.get("id", "")
         text = store.load_chunk(chunk_id)
         if text:
             items.append((meta, text))
+        else:
+            missing.append(str(chunk_id))
 
     if not items:
         return 0
+
+    if missing:
+        # 本文の無いチャンクは再埋め込みできない。metadata に残したままだと
+        # 新ベクトル (len(items) 行) と metadata (元の行数) がずれ、以後の検索が
+        # 別チャンクの本文を返す (2026-09-05 監査)。metadata 側も落として揃える。
+        logger.warning(
+            "reindex: dropping %d chunk(s) with no stored text: %s",
+            len(missing), ", ".join(missing[:10]),
+        )
 
     texts = [t for _, t in items]
     try:
@@ -237,10 +249,11 @@ async def _reindex_rag_store(
     store._ensure_writable()
     store.vectors_q8 = q8
     store.scales = scales
-    # 既存メタデータの embedding_model/backend を更新
+    # 既存メタデータの embedding_model/backend を更新し、行数を新ベクトルに揃える
     for meta, _ in items:
         meta["embedding_model"] = embedder.model_name()
         meta["embedding_backend"] = embedder.backend_type()
+    store.metadata = [meta for meta, _ in items]
 
     store.mark_reindexed(
         embedding_model=embedder.model_name(),

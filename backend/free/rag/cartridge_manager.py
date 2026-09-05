@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import time
@@ -15,6 +16,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from backend.io import CheckpointEntry, CheckpointStore
+from backend.io.atomic import atomic_write_text
 from backend.log_config import get_logger
 from backend.trace_context import get_trace_id
 from backend.free.rag.chunker import SemanticChunker
@@ -110,6 +112,37 @@ def resolve_cartridge_gate_threshold(gate_cfg: dict | None) -> float:
     return DEFAULT_CARTRIDGE_GATE_THRESHOLD
 
 
+def compute_docs_digest(docs_dir: Path) -> str:
+    """``docs/`` の内容ダイジェスト (相対パス + サイズ + mtime の sha256 16 桁)。
+
+    全文を読まずに「差し替わったか」を判定するための指紋。空 / 不在なら
+    空文字を返す (「未計算」と「空」を区別しない — どちらも比較対象外)。
+    """
+    if not docs_dir.is_dir():
+        return ""
+    parts: list[str] = []
+    for path in sorted(docs_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        rel = path.relative_to(docs_dir).as_posix()
+        parts.append(f"{rel}:{stat.st_size}:{int(stat.st_mtime)}")
+    if not parts:
+        return ""
+    joined = "\n".join(parts)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def docs_changed(info: "CartridgeInfo", cart_dir: Path) -> bool:
+    """カートリッジの docs が記録時から変わったか (未記録なら ``False``)。"""
+    if not info.docs_digest:
+        return False
+    return compute_docs_digest(cart_dir / "docs") != info.docs_digest
+
+
 @dataclass
 class CartridgeInfo:
     """カートリッジメタ情報"""
@@ -133,6 +166,12 @@ class CartridgeInfo:
     embedding_model: str = ""
     embedding_backend: str = ""
     embedding_dim: int = 0
+    #: ``docs/`` の内容ダイジェスト (ファイル名 + サイズ + mtime の sha256)。
+    #: ``needs_rebuild`` は手で立てるフラグでしかなく、ドキュメントを
+    #: 差し替えても検出できなかった (2026-09-05 監査)。
+    docs_digest: str = ""
+    #: レコード版。
+    schema_version: int = 1
 
 
 @dataclass
@@ -352,8 +391,10 @@ class CartridgeManager:
                 doc_count += 1
 
             # cartridge.json 保存
-            (cart_dir / "cartridge.json").write_text(
-                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+            atomic_write_text(
+                cart_dir / "cartridge.json",
+                json.dumps(meta, ensure_ascii=False, indent=2),
+                fsync=True,
             )
 
             # eval.json 展開（存在する場合）
@@ -395,6 +436,7 @@ class CartridgeManager:
             embedding_model=str(store.store_info.get("embedding_model", "")),
             embedding_backend=str(store.store_info.get("embedding_backend", "")),
             embedding_dim=int(store.store_info.get("embedding_dim", 0) or 0),
+            docs_digest=compute_docs_digest(cart_dir / "docs"),
         )
 
         self._registry[cart_id] = info
@@ -562,6 +604,9 @@ class CartridgeManager:
         info.embedding_backend = str(store.store_info.get("embedding_backend", ""))
         info.embedding_dim = int(store.store_info.get("embedding_dim", 0) or 0)
         info.needs_rebuild = False
+        # 実際に取り込んだ docs のダイジェストを刻む。次回の起動で
+        # ``docs_changed`` が「ドキュメントが差し替わったか」を判定できる。
+        info.docs_digest = compute_docs_digest(cart_dir / "docs")
 
         # centroid を再計算・保存
         centroid = _save_centroid(cart_dir, store)
@@ -673,10 +718,13 @@ class CartridgeManager:
                         store.save_source_text(doc_path.name, source_text)
 
                     vecs = await embedder.embed(chunks, is_query=False)
+                    # 再構築時に旧チャンクを残さない (同名 doc の重複ヒット)。
+                    store.prune_stale_source_chunks(doc_path.name, chunks)
                     store.add_vectors(
                         vecs, chunks, source=doc_path.name, category="cartridge",
                         embedding_model=embedder.model_name(),
                         embedding_backend=embedder.backend_type(),
+                        source_path=str(doc_path),
                     )
                     total_chunks += len(chunks)
                 doc_count += 1
@@ -932,6 +980,18 @@ class CartridgeManager:
         mismatched: list[str] = []
         registry_changed = False
         for cart_id, info in self._registry.items():
+            # ドキュメントが差し替わっていたら再構築対象にする (検索からは
+            # 外さない — 内容が古いだけで次元は合っており、検索自体は動く)。
+            if not info.needs_rebuild and docs_changed(
+                info, self.cartridges_dir / cart_id,
+            ):
+                info.needs_rebuild = True
+                registry_changed = True
+                logger.warning(
+                    "Cartridge '%s' documents changed since last build; "
+                    "marked needs_rebuild. Run 'evoref reindex --cartridge %s'.",
+                    cart_id, cart_id,
+                )
             cart_dim = info.embedding_dim
             if cart_dim and cart_dim != embedder_dim:
                 if not info.needs_rebuild:

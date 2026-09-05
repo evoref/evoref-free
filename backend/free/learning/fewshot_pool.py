@@ -587,6 +587,12 @@ def _calc_experience_fitness(signals: dict) -> float:
     return max(0.0, min(1.0, (score - _FITNESS_LO) / (_FITNESS_HI - _FITNESS_LO)))
 
 
+#: 手本品質の採点規則の版。プロンプト / 判定基準を変えたら上げる。
+#: ``FewShotExample.quality_scorer_version`` に刻み、古い規則の点と
+#: 新しい規則の点を後から見分けられるようにする (c_05 §0.6)。
+QUALITY_SCORER_VERSION = 1
+
+
 class FewShotPool(JsonStateStore):
     """Few-shot 候補プール
 
@@ -704,10 +710,18 @@ class FewShotPool(JsonStateStore):
         self._base_model_id = base_model_id or ""
 
     def reset(self) -> None:
-        """in-memory プールを空にする (パーティション切替で新モデル分を読み直す前に呼ぶ)。"""
+        """in-memory プールを空にする (パーティション切替で新モデル分を読み直す前に呼ぶ)。
+
+        追い出し / 棄却の tombstone も落とす。**残すと前モデルの判定が新モデルの
+        候補を抑止し続ける** — `evolve_writeback="semmem"` 構成の再バインドは
+        `reset()` + `bootstrap_from_semmem()` だけで `load()` を通らないため、
+        tombstone を初期化する経路が他に無い (2026-09-05 監査)。
+        """
         self._pools = {}
         self._bigram_cache = {}
         self._seen_hashes = {}
+        self._evicted_hashes = {}
+        self._rejected_hashes = {}
 
     @staticmethod
     def _build_subject(base_model_id: str, mode: str, example_id: str) -> str:
@@ -734,6 +748,9 @@ class FewShotPool(JsonStateStore):
                 "fitness": float(example.fitness),
                 "added_at": example.added_at,
                 "quality_score": example.quality_score,
+                "quality_scorer_version": example.quality_scorer_version,
+                "source_experience_id": example.source_experience_id,
+                "lang": example.lang,
             },
             ensure_ascii=False,
         )
@@ -780,6 +797,9 @@ class FewShotPool(JsonStateStore):
             fitness=float(payload.get("fitness", 0.0)),
             added_at=str(payload.get("added_at", "")),
             quality_score=quality_score,
+            quality_scorer_version=payload.get("quality_scorer_version"),
+            source_experience_id=str(payload.get("source_experience_id", "")),
+            lang=str(payload.get("lang", "")),
         )
 
     def _writeback_example_fact(
@@ -937,6 +957,9 @@ class FewShotPool(JsonStateStore):
             if score is None:
                 continue
             ex.quality_score = score
+            # 採点器の版を添える。付けないと、規則を変えた後も古い規則の点が
+            # そのまま残り、新旧が混ざったまま GC の下限判定に使われる。
+            ex.quality_scorer_version = QUALITY_SCORER_VERSION
             scored += 1
 
         if scored:
@@ -1200,6 +1223,10 @@ class FewShotPool(JsonStateStore):
                 mode=mode,
                 fitness=fitness,
                 added_at=exp.get("timestamp", ""),
+                # 出所を残す。後でその応答が誤りと分かったとき、由来を辿って
+                # 無効化するための鍵 (c_05 §0.6)。
+                source_experience_id=str(exp.get("id") or ""),
+                lang=str(exp.get("lang") or ""),
             )
 
             if self._try_accept(example) is not None:
@@ -1265,6 +1292,7 @@ class FewShotPool(JsonStateStore):
                 mode=pair.mode,
                 fitness=self._CORRECTED_PAIR_FITNESS,
                 added_at=pair.timestamp,
+                source_experience_id=getattr(pair, "experience_id", "") or "",
             )
             if self._try_accept(example) is not None:
                 added += 1

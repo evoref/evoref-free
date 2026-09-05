@@ -163,7 +163,7 @@ _PRIVATE_CONTENT_KEYS_LOWER: frozenset[str] = frozenset(
 _PRIVATE_MASK = "[PRIVATE]"
 
 
-def _redact_value(key: str, value: Any) -> Any:
+def _redact_value(key: str, value: Any, *, force_private: bool = False) -> Any:
     """key / value の組に対して redaction を適用する。
 
     ``key`` が ``_REDACT_KEYS_LOWER`` にマッチする場合は値全体を ``[REDACTED]``
@@ -179,14 +179,19 @@ def _redact_value(key: str, value: Any) -> Any:
     if key.lower() in _PRIVATE_CONTENT_KEYS_LOWER and value is not None:
         from backend.trace_context import is_private
 
-        if is_private():
+        if force_private or is_private():
             return _PRIVATE_MASK
     if isinstance(value, str):
         return _redact_string(value)
     if isinstance(value, Mapping):
-        return {k: _redact_value(k, v) for k, v in value.items()}
+        return {
+            k: _redact_value(k, v, force_private=force_private)
+            for k, v in value.items()
+        }
     if isinstance(value, list):
-        return [_redact_value(key, item) for item in value]
+        return [
+            _redact_value(key, item, force_private=force_private) for item in value
+        ]
     return value
 
 
@@ -197,9 +202,22 @@ def _redaction_processor(
     return {k: _redact_value(k, v) for k, v in event_dict.items()}
 
 
-def redact_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """structlog を通さない書き手 (常設ストア等) 向けに同じ redaction を掛ける。"""
-    return {k: _redact_value(k, v) for k, v in payload.items()}
+def redact_payload(
+    payload: Mapping[str, Any], *, force_private: bool = False,
+) -> dict[str, Any]:
+    """structlog を通さない書き手 (常設ストア等) 向けに同じ redaction を掛ける。
+
+    ``force_private`` は contextvar (``trace_context.is_private``) に依らず
+    private 扱いを強制する。private 判定は **リクエスト単位の contextvar** で、
+    executor / バックグラウンドタスク境界を越えると落ちる。レコード自身が
+    private だと分かっている書き手 (AgentTraceStore) はこちらで宣言する
+    (2026-09-05 監査: private エピソードの step が unmasked で永続化され、
+    そのまま episodic LTM へ取り込まれていた)。
+    """
+    return {
+        k: _redact_value(k, v, force_private=force_private)
+        for k, v in payload.items()
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
+import json
 import re
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -359,6 +363,21 @@ class PromptCandidate:
     fitness: float = 0.0
     generation: int = 0
 
+    id: str = field(default_factory=lambda: f"pc_{uuid.uuid4().hex[:12]}")
+    """候補 ID。系譜を辿るための鍵 (c_05 §0.6)。"""
+
+    parent_ids: list[str] = field(default_factory=list)
+    """親候補の ID。``mutate`` は 1 つ、``crossover`` は 2 つ。"""
+
+    op: str = "seed"
+    """この候補を作った操作 (``seed`` / ``mutate`` / ``crossover``)。"""
+
+    scores: dict[str, float] = field(default_factory=dict)
+    """評価軸ごとの値 (``fitness`` / ``tokens`` / ``uncached_per_turn`` 等)。
+
+    Pareto 選択へ進むときの入力。今は fitness だけを入れる。
+    """
+
 
 @dataclass
 class EvolutionResult:
@@ -392,6 +411,43 @@ class PromptEvolver:
     #: 1 回の進化で許す delete の上限 (``prompt.max_deletes_per_run``)。
     max_deletes_per_run: int = 1
     _deletes_this_run: int = 0
+    #: 候補アーカイブの出力先 (``candidates.jsonl``)。``None`` なら記録しない。
+    #: 各世代の候補を **全件** 追記し、系譜 (id / parent_ids / op / scores) を
+    #: 後から辿れるようにする。以前は世代ごとの population しか持たず、
+    #: 単調な山登りの途中経過がどこにも残らなかった (2026-09-05 監査)。
+    #:
+    #: アーカイブからの親選択 (Pareto 前線) へ進むのは、**欠陥率が実際に動いて
+    #: いること** を確認してから (f_04 §4.4 の有効化条件)。選択圧が無い状態で
+    #: アーカイブを増やしても「保存されるが選ばれない」集合が育つだけ。
+    candidates_archive: "Path | None" = None
+
+    def _archive_candidate(self, candidate: PromptCandidate) -> None:
+        """候補 1 件を ``candidates.jsonl`` へ追記する (失敗しても進化は止めない)。"""
+        path = self.candidates_archive
+        if path is None:
+            return
+        try:
+            from backend.utils import utc_now
+
+            record = {
+                "schema_version": 1,
+                "written_at": utc_now(),
+                "id": candidate.id,
+                "parent_ids": list(candidate.parent_ids),
+                "op": candidate.op,
+                "generation": candidate.generation,
+                "fitness": candidate.fitness,
+                "scores": dict(candidate.scores),
+                "text_len": len(candidate.text),
+                "text_sha": hashlib.sha256(
+                    candidate.text.encode("utf-8"),
+                ).hexdigest()[:16],
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            logger.warning("Failed to archive prompt candidate: %s", exc)
 
     def _calc_fitness(
         self,
@@ -856,9 +912,11 @@ class PromptEvolver:
         `(population, initial_fitness)` を返す。サーキットブレーカー発火時は
         `cb.tripped = True` をセットして部分集団を返す。
         """
-        population = [PromptCandidate(text=current, generation=0)]
+        population = [PromptCandidate(text=current, generation=0, op="seed")]
         initial_fitness = await self._score_candidate(current, experiences)
         population[0].fitness = initial_fitness
+        population[0].scores["fitness"] = initial_fitness
+        self._archive_candidate(population[0])
 
         for member in range(population_size - 1):
             if cb.should_stop():
@@ -884,8 +942,14 @@ class PromptEvolver:
             if has_protected:
                 mutated_text = restore_protected_sections(current, mutated_text)
 
-            candidate = PromptCandidate(text=mutated_text, generation=0)
+            candidate = PromptCandidate(
+                text=mutated_text, generation=0,
+                parent_ids=[population[0].id],
+                op="mutate" if mutation_succeeded else "rule_variation",
+            )
             candidate.fitness = await self._score_candidate(mutated_text, experiences)
+            candidate.scores["fitness"] = candidate.fitness
+            self._archive_candidate(candidate)
             population.append(candidate)
 
         return population, initial_fitness
@@ -927,8 +991,14 @@ class PromptEvolver:
         if has_protected:
             child_text = restore_protected_sections(current, child_text)
 
-        child = PromptCandidate(text=child_text, generation=gen)
+        child = PromptCandidate(
+            text=child_text, generation=gen,
+            parent_ids=[parents[0].id, parents[1].id],
+            op="crossover+mutate" if failure_hints else "crossover",
+        )
         child.fitness = await self._score_candidate(child_text, experiences)
+        child.scores["fitness"] = child.fitness
+        self._archive_candidate(child)
 
         # 最弱を置換
         population.sort(key=lambda c: c.fitness)

@@ -23,8 +23,8 @@ from backend.free.history.history_manager import (
 from backend.free.history.utils import parse_iso
 from backend.free.core.text_quality import extract_measured_values
 from backend.log_config import get_logger
-from backend.trace_context import run_in_executor_with_context
-from backend.utils import utc_now_dt
+from backend.trace_context import get_trace_id, run_in_executor_with_context
+from backend.utils import format_utc, utc_now_dt
 
 if TYPE_CHECKING:
     from backend.free.memory.stores.working import (
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
         WorkingMemoryRegistry,
     )
     from backend.free.memory.stores.short_term import ShortTermMemory
+    from backend.free.learning.level0_instant import GenerationConfigRef
 
 logger = get_logger("api.chat.recorder")
 
@@ -165,6 +166,7 @@ def _recorded_body(response: str) -> str:
 
 def _accumulate_turn(
     session_id: str, role: str, content: str, *, private: bool = False,
+    turn_id: str = "", meta: dict | None = None,
 ) -> None:
     """セッションのターンを蓄積
 
@@ -173,6 +175,11 @@ def _accumulate_turn(
 
     ``private=True`` のターンはディスク永続化対象から
     除外する (memory_only)。蓄積バッファ自体に追加しない。
+
+    ``turn_id`` は ``WorkingMemory.add_turn`` が発行した ID。``meta`` は
+    そのターンで確定した付帯情報 (訂正フラグ / ツール実行の結果 / 根拠に
+    使ったチャンク・ファクト等)。以前はここが role / content / timestamp の
+    3 キーだけで、**履歴から回帰タスクを組み直せなかった** (2026-09-05 監査)。
     """
     if private:
         _session_had_private.add(session_id)
@@ -183,15 +190,23 @@ def _accumulate_turn(
         return
     if session_id not in _session_turns:
         _session_turns[session_id] = []
-    _session_turns[session_id].append({
+    entry: dict = {
         "role": role,
         "content": content,
         "timestamp": time.time(),
-    })
+    }
+    if turn_id:
+        entry["turn_id"] = turn_id
+    if trace_id := get_trace_id():
+        entry["trace_id"] = trace_id
+    if meta:
+        entry["meta"] = {k: v for k, v in meta.items() if v not in (None, "", [], {})}
+    _session_turns[session_id].append(entry)
 
 
 def accumulate_user_turn(
     session_id: str, user_query: str, *, private: bool = False,
+    turn_id: str = "", meta: dict | None = None,
 ) -> None:
     """user 発話を蓄積バッファへ積む (**冪等**)。
 
@@ -212,7 +227,9 @@ def accumulate_user_turn(
     turns = _session_turns.get(session_id)
     if turns and turns[-1].get("role") == "user" and turns[-1].get("content") == user_query:
         return
-    _accumulate_turn(session_id, "user", user_query)
+    _accumulate_turn(
+        session_id, "user", user_query, turn_id=turn_id, meta=meta,
+    )
 
 
 def _ensure_session_restored(session_id: str, mgr=None) -> None:
@@ -254,6 +271,12 @@ def _ensure_session_restored(session_id: str, mgr=None) -> None:
         entry = {"role": t.get("role", "user"), "content": t.get("content", "")}
         ts = parse_iso(str(t.get("timestamp") or ""))
         entry["timestamp"] = ts.timestamp() if ts else 0.0
+        # 復元でも turn_id / trace_id / meta を落とさない。落とすと、圧縮済みの
+        # 印 (``compressed`` / ``original_length``) ごと消えて次の保存で
+        # 「切り詰められているのに印の無いターン」になり、二重に切られる。
+        for key in ("turn_id", "trace_id", "meta", "compressed", "original_length"):
+            if (value := t.get(key)) not in (None, ""):
+                entry[key] = value
         restored.append(entry)
     _session_turns[session_id] = restored + list(_session_turns.get(session_id) or [])
     logger.info(
@@ -310,6 +333,27 @@ def _loaded_cartridge_ids(state: AppState) -> list[str]:
     return list(mgr.loaded)
 
 
+def _existing_session(mgr, session_id: str) -> "SessionData | None":
+    """保存済みセッションを読む (無ければ ``None``)。
+
+    自動保存は毎ターン走る。以前は ``SessionData`` を 9 / 19 フィールドで
+    作り直しており、sleep-time が書いた ``summary_embedding`` /
+    ``summary_turn_count`` / ``promoted_to_semmem`` と ``project_id`` /
+    ``cartridge_ids`` / ``token_info`` / ``duration_sec`` / ``archived_at`` が
+    **次のターンで消えていた** (2026-09-05 監査)。既存レコードを土台にして
+    このターンで確定する値だけ差し替える。
+    """
+    try:
+        # 索引に無いセッション (初回ターン) はファイルも無いので読みに行かない。
+        if not mgr.get_session_started_at(session_id):
+            return None
+        session = mgr.get_session(session_id)
+    except Exception as exc:
+        logger.debug("history load failed for %s: %s", session_id, exc)
+        return None
+    return session if isinstance(session, SessionData) else None
+
+
 def _existing_summary(mgr, session_id: str) -> str | None:
     """既に生成済みのセッション要約を引き継ぐ (未生成なら ``None``)。
 
@@ -360,7 +404,7 @@ def _submit_history_save(mgr, session: SessionData) -> None:
 
 
 def _save_session_to_history(
-    state: AppState, session_id: str, mode: str,  # noqa: ARG001
+    state: AppState, session_id: str, mode: str,
 ) -> None:
     """蓄積した全ターンを HistoryManager で保存する
 
@@ -373,11 +417,13 @@ def _save_session_to_history(
     イベントループ側で変わる)、ファイル I/O だけを ``_submit_history_save``
     でワーカースレッドへ逃がす。
 
-    ``state`` は使っていないが、呼出面 (テスト含む) の互換のため残している。
+    ``state`` からは ``current_project_id`` だけを読む (create モードの
+    プロジェクト紐付け。以前は書かれておらず全セッションが ``None`` だった)。
     """
     turns = _session_turns.get(session_id, [])
     if not turns:
         return
+    project_id = getattr(state, "current_project_id", None)
 
     try:
         from backend.config import get_config
@@ -424,9 +470,12 @@ def _save_session_to_history(
             entry = {"role": t["role"], "content": t["content"]}
             ts = t.get("timestamp")
             if ts:
-                entry["timestamp"] = datetime.fromtimestamp(
-                    ts, tz=timezone.utc,
-                ).isoformat()
+                entry["timestamp"] = format_utc(
+                    datetime.fromtimestamp(ts, tz=timezone.utc),
+                )
+            for key in ("turn_id", "trace_id", "meta", "compressed", "original_length"):
+                if (value := t.get(key)) not in (None, ""):
+                    entry[key] = value
             history_turns.append(entry)
 
         instance_name = cfg.get("instance", {}).get("name", "evoref")
@@ -445,21 +494,26 @@ def _save_session_to_history(
         # summary を空にしても search_history のヒット率は落ちない。一覧見出しは
         # index の ``first_user_preview`` (最初のユーザ発話) で代替される。
         # 既に要約が付いているセッションは上書きせず引き継ぐ。
-        summary = _existing_summary(mgr, session_id)
+        # 既存レコードを土台にし、このターンで確定する値だけ差し替える
+        # (作り直すと sleep-time の書き込みが毎ターン消える)。
+        session = _existing_session(mgr, session_id) or SessionData()
+        modes_used = list(session.modes_used or [])
+        if mode not in modes_used:
+            modes_used.append(mode)
 
-        session = SessionData(
-            session_id=session_id,
-            started_at=started_at,
-            ended_at=now_iso,
-            mode=mode,
-            modes_used=[mode],
-            instance_name=instance_name,
-            base_model=active_base_model_name(cfg),
-            source="auto",
-            turns=history_turns,
-            turn_count=len(history_turns),
-            summary=summary,
-        )
+        session.session_id = session_id
+        session.started_at = started_at
+        session.ended_at = now_iso
+        session.mode = mode
+        session.modes_used = modes_used
+        session.instance_name = instance_name
+        session.base_model = active_base_model_name(cfg)
+        session.source = "auto"
+        session.turns = history_turns
+        session.turn_count = len(history_turns)
+        session.summary = _existing_summary(mgr, session_id) or session.summary
+        if project_id and not session.project_id:
+            session.project_id = project_id
 
         _submit_history_save(mgr, session)
     except Exception as e:
@@ -787,7 +841,7 @@ def _record_assistant_turn_to_memory(
     tool_command_name: str | None = None,
     tool_command_success: bool | None = None,
     tool_command_source: str | None = None,
-) -> None:
+) -> str:
     """assistant 応答を WM → STM へ記録する (record_* 3 経路の共通処理)。
 
     - ``full_response`` が空でも **押し出し済みターンの STM 転送は行う**
@@ -835,18 +889,19 @@ def _record_assistant_turn_to_memory(
                 "record: session %s has no working memory (ended/evicted); "
                 "absorbed late assistant turn directly into STM", session_id[:8],
             )
-        return
+        return ""
     mem_sys = state.get_memory_system(session_id)
     if not mem_sys:
-        return
+        return ""
     wm, stm, _ltm = mem_sys
+    turn_id = ""
     if full_response:
         body = _recorded_body(full_response)
         # 発火元のクエリを note に確定させる。curator が STM を走査して
         # 「直前で最も近い user note」から推測すると、当該ターンの user note が
         # 吸収されていない場合に別ターンのクエリと結び付く。
         tool_command_query = user_query if tool_command else None
-        wm.add_turn(
+        turn_id = wm.add_turn(
             "assistant", body,
             private=private, mode=mode, source="assistant",
             tool_command=tool_command,
@@ -856,13 +911,84 @@ def _record_assistant_turn_to_memory(
             tool_command_query=tool_command_query,
         )
     drain_evicted_to_stm(wm, stm, session_id)
+    return turn_id
+
+
+def _active_gen_config(state: AppState, mode: str) -> "GenerationConfigRef":
+    """このターンで有効だった構成 (プロンプト版 / few-shot / ポリシー / LoRA)。
+
+    fitness の帰属先を **推測せず記録** するための素性 (c_05 §0.6)。取得
+    できない要素は ``None`` / 空のままにする (0 で埋めると「未設定」と
+    「値が 0」が区別できない)。
+    """
+    from backend.free.learning.level0_instant import GenerationConfigRef
+
+    ref = GenerationConfigRef()
+    try:
+        from backend.i18n_helper import get_locale
+
+        ref.locale = get_locale() or ""
+    except Exception:
+        pass
+    pm = getattr(state, "prompt_manager", None) or getattr(
+        getattr(state, "loop", None), "prompt_manager", None,
+    )
+    if pm is not None:
+        try:
+            ref.prompt_version = int(pm.get_meta(mode).version)
+        except Exception:
+            pass
+    sched = getattr(state, "learning_scheduler", None)
+    if sched is not None:
+        pool = getattr(sched, "_fewshot_pool", None)
+        if pool is not None:
+            try:
+                ref.fewshot_ids = [e.id for e in pool.get_pool(mode)]
+            except Exception:
+                pass
+        evolver = getattr(sched, "_policy_param_evolver", None)
+        generation = getattr(evolver, "generation", None)
+        if isinstance(generation, int):
+            ref.policy_generation = generation
+    lora_version = getattr(state, "active_lora_version", None)
+    if isinstance(lora_version, int):
+        ref.lora_version = lora_version
+    return ref
+
+
+#: 履歴ターンの ``meta`` に載せる WM ターンのキー。``content`` と重複する
+#: 大きな値 (tool_command 本文) は載せない。
+_TURN_META_KEYS = (
+    "mode", "source", "is_correction",
+    "tool_command_name", "tool_command_success", "tool_command_source",
+)
+
+
+def _turn_meta_from_wm(state: AppState, session_id: str, turn_id: str) -> dict | None:
+    """WM から ``turn_id`` のターンを引き、履歴に残すメタを組む。"""
+    mem_sys = state.get_memory_system(session_id)
+    if not mem_sys:
+        return None
+    wm = mem_sys[0]
+    for turn in reversed(getattr(wm, "turns", [])):
+        if turn.get("turn_id") != turn_id:
+            continue
+        return {k: turn.get(k) for k in _TURN_META_KEYS if turn.get(k) is not None}
+    return None
 
 
 def _finish_turn_bookkeeping(
     state: AppState, full_response: str, session_id: str, user_query: str,
     mode: str, *, private: bool,
+    turn_id: str = "", turn_meta: dict | None = None,
 ) -> None:
-    """record_* 3 経路の末尾処理: sleep-time スケジュール / 蓄積 / 履歴保存。"""
+    """record_* 3 経路の末尾処理: sleep-time スケジュール / 蓄積 / 履歴保存。
+
+    ``turn_meta`` 未指定なら WM のターン本体から組み立てる (呼出元 3 経路で
+    引数を並べ直すより、既に確定している 1 か所から読む方が食い違わない)。
+    """
+    if turn_meta is None and turn_id:
+        turn_meta = _turn_meta_from_wm(state, session_id, turn_id)
     # sleep-time update をスケジュール (訂正ターンは Full を前倒し)。判定は
     # 入口で済んでいるので WM の印を読む (無ければ判定にフォールバック)。
     _schedule_sleep_time(
@@ -874,7 +1000,13 @@ def _finish_turn_bookkeeping(
     # 積まれているのが通常で、ここは冪等な保険。
     accumulate_user_turn(session_id, user_query, private=private)
     if full_response:
-        _accumulate_turn(session_id, "assistant", full_response, private=private)
+        # 履歴へ積む本文は記憶 / 経験と同じ (開示注記を落としたもの)。
+        # 生の full_response を積むと、同じターンについて履歴と記憶が別々の
+        # 「真実」を持つ (2026-09-05 監査)。
+        _accumulate_turn(
+            session_id, "assistant", _recorded_body(full_response),
+            private=private, turn_id=turn_id, meta=turn_meta,
+        )
 
     # 会話履歴をディスクに保存 (private なら蓄積されていないので no-op)
     if not private:
@@ -925,7 +1057,7 @@ def record_response(
     sleep-time の executable_command_curator が参照する (それ以外は None)。
     """
     # メモリに応答を記録
-    _record_assistant_turn_to_memory(
+    assistant_turn_id = _record_assistant_turn_to_memory(
         state, full_response, session_id, user_query, mode,
         private=private,
         tool_command=tool_command,
@@ -982,6 +1114,8 @@ def record_response(
                 truncated=truncated,
                 generation_failed=generation_failed or not body.strip(),
                 session_id=session_id,
+                turn_id=assistant_turn_id,
+                gen_config=_active_gen_config(state, mode),
             )
         except Exception as e:
             # 経験記録の失敗でチャットを壊さない方針は維持するが、**握り潰さない**。
@@ -994,6 +1128,7 @@ def record_response(
 
     _finish_turn_bookkeeping(
         state, full_response, session_id, user_query, mode, private=private,
+        turn_id=assistant_turn_id,
     )
 
 
@@ -1033,7 +1168,7 @@ def record_meta_cognitive_response(
     導けなければ ``None`` のまま = 矛盾検出のこの入力は使わない。
     """
     # メモリに応答を記録
-    _record_assistant_turn_to_memory(
+    assistant_turn_id = _record_assistant_turn_to_memory(
         state, full_response, session_id, user_query, mode,
         private=private,
         tool_command=tool_command,
@@ -1099,6 +1234,7 @@ def record_meta_cognitive_response(
 
     _finish_turn_bookkeeping(
         state, full_response, session_id, user_query, mode, private=private,
+        turn_id=assistant_turn_id,
     )
 
 
@@ -1131,7 +1267,7 @@ def record_long_form_response(
     渡さない = 矛盾検出のこの入力は使わない。
     """
     # メモリに応答を記録
-    _record_assistant_turn_to_memory(
+    assistant_turn_id = _record_assistant_turn_to_memory(
         state, full_response, session_id, user_query, mode,
         private=private,
         tool_command=tool_command,
@@ -1220,4 +1356,5 @@ def record_long_form_response(
 
     _finish_turn_bookkeeping(
         state, full_response, session_id, user_query, mode, private=private,
+        turn_id=assistant_turn_id,
     )

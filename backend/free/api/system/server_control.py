@@ -143,7 +143,28 @@ def _open_stderr_log(project_root: Path, name: ServerName):
     """
     log_dir = project_root / "local" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    return open(log_dir / f"llama-{name}.stderr.log", "ab")
+    path = log_dir / f"llama-{name}.stderr.log"
+    # 追記モードなので、上限を超えたら 1 世代だけ退避してから開き直す。
+    # ローテーションが無く、UI から起動するたびに無制限に伸びていた。
+    _rotate_if_large(path)
+    return open(path, "ab")
+
+
+#: llama stderr ログのローテーション閾値 (bytes)。develop JSONL の
+#: ``max_log_mb`` と同じ 5MB を既定に合わせる。
+_STDERR_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _rotate_if_large(path: Path) -> None:
+    """``path`` が閾値を超えていたら ``.1`` へ退避する (1 世代のみ保持)。"""
+    try:
+        if not path.exists() or path.stat().st_size < _STDERR_LOG_MAX_BYTES:
+            return
+        backup = path.with_suffix(path.suffix + ".1")
+        backup.unlink(missing_ok=True)
+        path.rename(backup)
+    except OSError as exc:
+        logger.warning("Failed to rotate %s: %s", path, exc)
 
 
 def _spawn_server(name: ServerName, cfg: dict) -> ManagedProcess | None:
