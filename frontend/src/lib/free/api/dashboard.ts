@@ -16,6 +16,12 @@ export interface Level1ResultEntry {
 	improved: boolean;
 	fitness_before: number | null;
 	fitness_after: number | null;
+	/** 対象が無く実行していない (経験不足 / 選択圧なし / シグナル未配線) */
+	skipped?: boolean;
+	reason?: string | null;
+	/** base prompt 採用ゲートの実測値 (現行 / 候補の judge 平均) */
+	measured_before?: number | null;
+	measured_after?: number | null;
 }
 
 /** ポリシー進化ドメインの状態（Pro） */

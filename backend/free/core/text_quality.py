@@ -1810,6 +1810,27 @@ def match_line_count(text: str) -> int:
     return 0
 
 
+#: 行数の指定が **上限** である形 (「12 行以内で」「3 行までで」)。
+_LINE_LIMIT_TAIL_RE = re.compile(r"行\s*(?:以内|まで|以下)")
+
+
+def line_count_is_limit(text: str) -> bool:
+    """行数の指定が「N 行以内」型の上限かどうか (純粋関数)。
+
+    「3 行で」はぴったりを求める指定 (``violates_line_count`` は過不足の両方を
+    見る) だが、「12 行以内で」は上限であって、11 行の応答は指定どおり。
+    同じ regex (``LINE_COUNT_RE``) が ``以内`` を吸い込んで数だけ返すため、
+    12 行の指定に 11 行と **偽の違反注記** が付いていた (2026-09-05 ライブ監査:
+    「except* を使った最小コード例を 12 行以内で。」への 11 行のコードに
+    ``(注: 上の回答は 271 文字です。12 行の指定に対し、上の回答は 11 行です)``)。
+    """
+    src = text or ""
+    for m in LINE_COUNT_RE.finditer(src):
+        if _LINE_LIMIT_TAIL_RE.search(src[m.start(): m.end() + 4]):
+            return True
+    return False
+
+
 def count_response_lines(response: str) -> int:
     """応答の行数を数える (純粋関数)。
 
@@ -1833,6 +1854,9 @@ def violates_line_count(query: str, response: str) -> str | None:
         return None
     got = count_response_lines(response)
     if got <= 0 or got == wanted:
+        return None
+    # 「N 行以内」は上限。少ない分には指定どおり (line_count_is_limit 参照)。
+    if got < wanted and line_count_is_limit(query):
         return None
     return f"asked for {wanted} lines but the answer has {got}"
 
@@ -2012,9 +2036,11 @@ def length_disclosure_note(query: str, response: str) -> str:
     wanted_lines = match_line_count(query or "")
     if wanted_lines > 0:
         got_lines = count_response_lines(response)
-        if got_lines != wanted_lines:
+        is_limit = line_count_is_limit(query or "")
+        if got_lines != wanted_lines and not (is_limit and got_lines < wanted_lines):
+            unit = "行以内" if is_limit else "行"
             parts.append(
-                f"{wanted_lines} 行の指定に対し、上の回答は {got_lines} 行です",
+                f"{wanted_lines} {unit}の指定に対し、上の回答は {got_lines} 行です",
             )
             _record_constraint_issue(
                 f"{wanted_lines} 行の指定に対し {got_lines} 行",

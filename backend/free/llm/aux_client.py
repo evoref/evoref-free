@@ -77,6 +77,7 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # ── 学習サイクル ─────────────────────────────────────────────────
     "critique_synthesis": 120.0,
     "fewshot_quality_score": 45.0,
+    "prompt_candidate_judge": 60.0,
     # ── 長文生成 ─────────────────────────────────────────────────────
     "long_form_planning": 180.0,
     "long_form_code_review": 180.0,
@@ -173,6 +174,7 @@ DEFERRABLE_AUX_PURPOSES: frozenset[str] = frozenset({
     # 学習サイクル
     "critique_synthesis",
     "fewshot_quality_score",
+    "prompt_candidate_judge",
 })
 
 #: チャットのアイドル窓を待つ上限。超えたら競合覚悟で走らせる。

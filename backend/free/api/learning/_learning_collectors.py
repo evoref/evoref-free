@@ -80,7 +80,8 @@ def map_level1_results(raw_l1: dict | None) -> dict[str, Level1ResultEntry]:
         return {}
     result: dict[str, Level1ResultEntry] = {}
     for key, val in raw_l1.items():
-        if key == "_executed_phases":
+        if key.startswith("_"):
+            # ``_executed_phases`` / ``_noop_phases`` / ``_skipped_phases`` はメタ
             continue
         if not isinstance(val, dict):
             continue
@@ -88,6 +89,10 @@ def map_level1_results(raw_l1: dict | None) -> dict[str, Level1ResultEntry]:
             improved=val.get("improved", False),
             fitness_before=val.get("fitness_before"),
             fitness_after=val.get("fitness_after"),
+            skipped=bool(val.get("skipped", False)),
+            reason=val.get("reason"),
+            measured_before=val.get("measured_before"),
+            measured_after=val.get("measured_after"),
         )
     return result
 

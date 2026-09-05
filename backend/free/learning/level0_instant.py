@@ -223,6 +223,10 @@ class ExperienceBuffer(JsonStateStore):
 
     # ── 永続化 (JsonStateStore) ──
 
+    def as_dicts(self) -> list[dict]:
+        """全エントリを dict 化して返す (時系列順)。学習側の純粋関数の入力用。"""
+        return list(self._to_payload())
+
     def _to_payload(self) -> JsonPayload:
         return [
             {

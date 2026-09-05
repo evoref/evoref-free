@@ -30,6 +30,10 @@ from backend.free.agent.prompt_utils import (
 )
 from backend.free.core.session_mode import is_valid_session_mode, normalize_session_mode
 from backend.free.core.intent_vocab import own_process_question
+from backend.free.learning.corrected_pairs import (
+    CorrectedPair,
+    refers_to_previous_turn,
+)
 from backend.free.core.text_quality import (
     SYSTEM_MEASUREMENT_MARKER,
     SYSTEM_NOTE_TAIL_RE,
@@ -409,6 +413,12 @@ def find_content_rejection(query: str, response: str) -> str | None:
     # 別の質問にも本文の貼り付けを誘発する (2026-08-16 動作検証 T9)。
     if asks_verbatim_excerpt(query):
         return "response is a verbatim excerpt, not a style example"
+    # 直前ターンを前提にした問い (「修正版にジェネレータを渡すと？」「2 案を採用。
+    # 本文に…を入れて書き直して」) は、単独の手本にすると **何を指しているか
+    # 分からない問いに具体的に答える** 型を教える。2026-09-05 のプール 47 件の
+    # 先頭 4 件がこの形だった。文脈依存の判定は訂正ペアと共有する。
+    if refers_to_previous_turn(query):
+        return "query depends on the previous turn (anaphora / continuation)"
     # 内部足場の語彙を含む応答は PROTECTED 違反の実例なので手本にしない
     if _response_leaks_internal_scaffold(response):
         return "leaks internal scaffold vocabulary"
@@ -473,6 +483,11 @@ _QUALITY_SYSTEM_PROMPT = (
     "(3) 内部的な言い回しや進捗ノートが混ざっていないか。"
     "その場限りの固有値だけを述べた回答や、質問と噛み合っていない回答は低く評価してください。"
 )
+
+#: fewshot_pool.json 上で追い出し済み hash (墓標) を持つ予約キー。
+_EVICTED_KEY = "_evicted"
+#: 墓標の上限 (モード別、FIFO)。16 byte hex × 2000 で数十 KB。
+_EVICTED_CAP = 2000
 
 # SemMem 書き戻し時の subject prefix
 # ``harness.fewshot.*`` から ``learn.fewshot.*`` に移行済。owner は EvorefLearn。
@@ -635,6 +650,17 @@ class FewShotPool(JsonStateStore):
         # 明示 dedup 用: mode → {content_hash}。プール内の example と 1:1 で同期する
         # (採用で add、eviction で discard)。diversity_threshold と独立に厳密重複を排除。
         self._seen_hashes: dict[str, set[str]] = {}
+        # 追い出した例の content hash (墓標)。プール上限 / GC で追い出した例は
+        # ``_seen_hashes`` からも外れるため、次 tick の add_from_experiences で
+        # 同じ経験が新規候補として復活し別の例を追い出していた — 数百件を毎回
+        # 採否判定しながらプールは上限に張り付いたまま正味は縮む (2026-09-04
+        # 監査: added 160→305/tick、GC 後 46→41→39)。一度追い出した例は
+        # 再採用しない。挿入順 dict = FIFO で上限 ``_EVICTED_CAP`` 件/モード。
+        self._evicted_hashes: dict[str, dict[str, None]] = {}
+        # 内容判定で却下した候補 (プロセス内のみ、永続化しない)。却下理由は
+        # 内容から決まる純粋判定なので、同じ (query, response) を再判定する
+        # 意味は無い。
+        self._rejected_hashes: dict[str, set[str]] = {}
 
     # ── SemMem 書き戻しヘルパ ───────────────────────────
 
@@ -1081,6 +1107,8 @@ class FewShotPool(JsonStateStore):
         h = self._content_hash(example.query, example.response)
         if h in seen:
             return None
+        if h in self._evicted_hashes.get(example.mode, ()):
+            return None
         if not self._is_diverse(example, pool):
             return None
 
@@ -1093,9 +1121,18 @@ class FewShotPool(JsonStateStore):
         if len(pool) > self.pool_size and not self.is_semmem_writeback_active():
             pool.sort(key=_effective_fitness)
             removed = pool.pop(0)
-            self._bigram_cache.pop(removed.id, None)
-            seen.discard(self._content_hash(removed.query, removed.response))
+            self._forget_evicted(example.mode, removed)
         return example
+
+    def _forget_evicted(self, mode: str, removed: FewShotExample) -> None:
+        """追い出した例のキャッシュ / seen を外し、墓標に積む (再採用しない)。"""
+        self._bigram_cache.pop(removed.id, None)
+        h = self._content_hash(removed.query, removed.response)
+        self._seen_hashes.setdefault(mode, set()).discard(h)
+        tomb = self._evicted_hashes.setdefault(mode, {})
+        tomb[h] = None
+        while len(tomb) > _EVICTED_CAP:
+            del tomb[next(iter(tomb))]
 
     def add_from_experiences(self, experiences: list[dict]) -> int:
         """経験バッファから高品質な例を候補プールに追加する
@@ -1137,12 +1174,24 @@ class FewShotPool(JsonStateStore):
             if not query or not response:
                 continue
 
+            # 既にプール内 / 墓標 / 却下済みの候補は内容判定に回さない。毎 tick
+            # 全経験を再投入するので、ここを通すと同じ却下を毎回 INFO で書き続ける
+            # (2026-09-05 実測: 1 tick で 135 行、累計 1878 行、同一 query 76 回)。
+            h = self._content_hash(query, response)
+            if (
+                h in self._seen_hashes.get(mode, ())
+                or h in self._evicted_hashes.get(mode, ())
+                or h in self._rejected_hashes.get(mode, ())
+            ):
+                continue
+
             reject = find_content_rejection(query, response)
             if reject is not None:
                 logger.info(
                     "Rejecting fewshot candidate (%s): query=%s",
                     reject, query[:50],
                 )
+                self._rejected_hashes.setdefault(mode, set()).add(h)
                 continue
 
             example = FewShotExample(
@@ -1170,6 +1219,64 @@ class FewShotPool(JsonStateStore):
                     "input_count": len(experiences),
                     "added": added,
                     "pool_counts": pool_counts,
+                })
+        return added
+
+    #: 訂正ペア由来の手本に与える fitness。ユーザーが誤りを指摘し、訂正後の
+    #: 回答が訂正の期待語を含んだ (= 受け入れられた) 事実は、成功経験の
+    #: 「訂正されなかった」より強い正例なので上位に置く。
+    _CORRECTED_PAIR_FITNESS = 1.0
+
+    def add_corrected_pairs(self, pairs: list[CorrectedPair]) -> int:
+        """訂正で確定した「元の問い → 訂正後の回答」を手本として投入する。
+
+        :func:`backend.free.learning.corrected_pairs.build_corrected_pairs` の
+        出力を受ける。訂正ターンは ``add_from_experiences`` が丸ごと除外するため、
+        ここが訂正後の正しい回答が手本になる唯一の経路 (2026-09-05 監査: それまで
+        一度も手本になっていなかった)。内容ゲート (``find_content_rejection``) と
+        採否 (``_try_accept``) は既存経路と共有する。
+
+        Returns:
+            採用した件数。
+        """
+        added = 0
+        for pair in pairs:
+            query, response = pair.query.strip(), pair.response.strip()
+            if not query or not response:
+                continue
+            h = self._content_hash(query, response)
+            if (
+                h in self._seen_hashes.get(pair.mode, ())
+                or h in self._evicted_hashes.get(pair.mode, ())
+                or h in self._rejected_hashes.get(pair.mode, ())
+            ):
+                continue
+            reject = find_content_rejection(query, response)
+            if reject is not None:
+                logger.info(
+                    "Rejecting corrected-pair fewshot candidate (%s): query=%s",
+                    reject, query[:50],
+                )
+                self._rejected_hashes.setdefault(pair.mode, set()).add(h)
+                continue
+            example = FewShotExample(
+                query=query,
+                response=response,
+                mode=pair.mode,
+                fitness=self._CORRECTED_PAIR_FITNESS,
+                added_at=pair.timestamp,
+            )
+            if self._try_accept(example) is not None:
+                added += 1
+        if added:
+            logger.info("Added %d corrected-pair examples to fewshot pool", added)
+            dl = self._debug_logger
+            if dl:
+                dl.log_learning_cycle(cycle_num=0, data={
+                    "component": "fewshot_pool",
+                    "op": "add_corrected_pairs",
+                    "input_count": len(pairs),
+                    "added": added,
                 })
         return added
 
@@ -1482,7 +1589,6 @@ class FewShotPool(JsonStateStore):
 
         removed_per_mode: dict[str, int] = {}
         for mode, pool in self._pools.items():
-            seen = self._seen_hashes.setdefault(mode, set())
             removed_count = 0
 
             # 1) 品質の絶対下限。サイズに空きがあっても残さない
@@ -1495,8 +1601,7 @@ class FewShotPool(JsonStateStore):
             ]
             for ex in low_quality:
                 pool.remove(ex)
-                self._bigram_cache.pop(ex.id, None)
-                seen.discard(self._content_hash(ex.query, ex.response))
+                self._forget_evicted(mode, ex)
             removed_count += len(low_quality)
 
             # 2) サイズ超過分を実効 fitness の低い順に落とす
@@ -1505,8 +1610,7 @@ class FewShotPool(JsonStateStore):
                 excess = len(pool) - self.pool_size
                 for _ in range(excess):
                     removed = pool.pop(0)
-                    self._bigram_cache.pop(removed.id, None)
-                    seen.discard(self._content_hash(removed.query, removed.response))
+                    self._forget_evicted(mode, removed)
                 removed_count += excess
 
             if removed_count:
@@ -1549,13 +1653,17 @@ class FewShotPool(JsonStateStore):
         # ベクトル** が復元されて黙って類似度 0 になる (=「手本が 1 件も
         # 選ばれない」という気づきにくい壊れ方)。プールは高々 pool_size 件
         # なので、起動後の背景タスクと sleep-time で張り直す方が安全。
-        return {
+        payload: dict = {
             mode: [
                 {k: v for k, v in asdict(ex).items() if k != "embedding"}
                 for ex in pool
             ]
             for mode, pool in self._pools.items()
         }
+        evicted = {m: list(t) for m, t in self._evicted_hashes.items() if t}
+        if evicted:
+            payload[_EVICTED_KEY] = evicted
+        return payload
 
     def _from_payload(self, payload: JsonPayload) -> None:
         if not isinstance(payload, dict):
@@ -1571,7 +1679,10 @@ class FewShotPool(JsonStateStore):
         new_hashes: dict[str, set[str]] = {}
         dropped: Counter[str] = Counter()
         malformed = 0
+        raw_evicted = payload.get(_EVICTED_KEY)
         for mode, entries in payload.items():
+            if mode == _EVICTED_KEY:
+                continue
             pool: list[FewShotExample] = []
             seen: set[str] = set()
             for entry in entries if isinstance(entries, list) else []:
@@ -1607,6 +1718,13 @@ class FewShotPool(JsonStateStore):
         self._pools = new_pools
         self._seen_hashes = new_hashes
         self._bigram_cache.clear()
+        self._evicted_hashes = {}
+        if isinstance(raw_evicted, dict):
+            for mode, hashes in raw_evicted.items():
+                if isinstance(hashes, list):
+                    self._evicted_hashes[str(mode)] = {
+                        str(h): None for h in hashes[-_EVICTED_CAP:]
+                    }
         if malformed:
             logger.warning(
                 "Skipped %d malformed fewshot example(s) on load", malformed,

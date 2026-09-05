@@ -145,6 +145,10 @@ class SPSAOptimizer:
 
         patience = int(early_stop_patience or 0)
         stagnant = 0
+        # 進捗ログの間隔。no-op eval (500 反復規模) は 100 ごとで足りるが、
+        # 実 eval (30 反復、1 反復 ≈ 3 分) では完走まで 90 分無音になり、
+        # 生きているのか止まっているのか外から読めない (2026-09-05 実機)。
+        log_every = 1 if iterations <= 50 else 100
 
         for k in range(1, iterations + 1):
             a_k, c_k = self._decay_schedule(k)
@@ -185,7 +189,7 @@ class SPSAOptimizer:
             if callback:
                 callback(k, params, cb_loss)
 
-            if k % 100 == 0 or k == iterations:
+            if k % log_every == 0 or k == iterations:
                 logger.info(
                     "SPSA iter %d/%d: loss=%.6f, best=%.6f, a_k=%.6f, c_k=%.6f",
                     k, iterations, cb_loss, best_loss, a_k, c_k,

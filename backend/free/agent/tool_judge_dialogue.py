@@ -128,6 +128,25 @@ def query_needs_dialogue(query: str) -> bool:
     )
 
 
+#: 桁区切り入りの数字 (``1,280`` / ``1,234,567.5``)。
+_GROUPED_DIGITS_RE = re.compile(r"(?<![\d.])\d{1,3}(?:,\d{3})+(?:\.\d+)?(?![\d,])")
+
+
+def ungroup_thousands(text: str) -> str:
+    """桁区切りのカンマを落とす (純粋関数)。``1,280`` → ``1280``。
+
+    文法制約分類器 / 式合成へ渡す発話に桁区切りが残っていると、モデルは
+    カンマの後ろだけを数として拾う。実インシデント (2026-09-05 ライブ監査
+    T14 / T15): 「単価 1,280 円 … 37 個」の会話で分類器が ``480 * 37 * 1.08`` と
+    ``280 * 37 * 1.08`` を出し、正しく計算された嘘が回答の根拠に載った。
+    接地判定 (``_ungrounded_numbers``) は桁区切りを既に正規化しているので、
+    入力側だけが揃っていなかった。
+    """
+    if not text or "," not in text:
+        return text
+    return _GROUPED_DIGITS_RE.sub(lambda m: m.group(0).replace(",", ""), text)
+
+
 def _recent_dialogue_messages(
     conversation: list[dict] | None,
     turns: int = _CALCULATE_CONTEXT_TURNS,
@@ -136,7 +155,8 @@ def _recent_dialogue_messages(
 
     ネイティブ tool calling へ渡す最小の文脈。「そのファイルを読んで」のような
     照応をモデルが解けるように直近だけ載せ、prefill を膨らませない
-    (1 メッセージ ``_JUDGE_CONTEXT_CHARS`` 文字で切り詰め)。
+    (1 メッセージ ``_JUDGE_CONTEXT_CHARS`` 文字で切り詰め)。桁区切りは落として
+    渡す (:func:`ungroup_thousands`)。
     """
     if not conversation:
         return []
@@ -146,5 +166,8 @@ def _recent_dialogue_messages(
         content = turn.get("content")
         if role not in ("user", "assistant") or not isinstance(content, str):
             continue
-        messages.append({"role": role, "content": content[:_JUDGE_CONTEXT_CHARS]})
+        messages.append({
+            "role": role,
+            "content": ungroup_thousands(content[:_JUDGE_CONTEXT_CHARS]),
+        })
     return messages

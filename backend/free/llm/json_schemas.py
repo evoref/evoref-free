@@ -371,6 +371,23 @@ class FewShotQualityJudgement(_StrictModel):
     reason: str = Field(max_length=200)
 
 
+# ── base prompt 候補の採用ゲート採点 (prompt_candidate_judge) ──
+
+
+class PromptCandidateJudgement(_StrictModel):
+    """`backend/free/llm/prompt_candidate_eval.py` の候補 prompt 採点。
+
+    「失敗した実ターンの query に対し、候補 system prompt で再生成した応答は
+    期待された振る舞い (ヒント) にどれだけ沿うか」を 0..1 で採点する。現行と
+    候補を **同じケース・同じ judge** で採点し、差だけを採用判定に使う
+    (f_04 §4.5)。絶対値には意味を持たせない。``score`` を先頭に置く (出力が
+    ``max_tokens`` で切れても採点だけは取れる)。
+    """
+
+    score: float = Field(ge=0.0, le=1.0)
+    reason: str = Field(max_length=80)
+
+
 # ── purpose -> schema 自動解決マップ ──
 #
 # 呼出側が ``response_schema`` を明示しない場合、AuxClient が purpose
@@ -392,6 +409,7 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "url_relevance_score": UrlRelevanceJudgement,
     "assertion_naming": AssertionNaming,
     "fewshot_quality_score": FewShotQualityJudgement,
+    "prompt_candidate_judge": PromptCandidateJudgement,
 }
 
 
@@ -524,6 +542,7 @@ def resolve_response_format_for_purpose(purpose: str) -> dict[str, Any] | None:
 
 
 __all__ = [
+    "PromptCandidateJudgement",
     "RetrievalQualityJudgement",
     "RetrievalNecessityJudgement",
     "ChunkGateRelevance",

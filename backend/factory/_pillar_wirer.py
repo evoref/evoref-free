@@ -1269,6 +1269,19 @@ def _init_learning_scheduler(
                 ),
             ))
 
+    # 7f-1b'. base prompt 採用ゲートの実測評価器 (Level 1 phase1、f_04 §4.5)
+    # 欠陥率 fitness は候補に無反応なので、採用は「現行 vs 最良候補を失敗ケースで
+    # 再生成・採点した差」で決める。ベース未接続時は未注入 = 採用しない。
+    # Learn→Gen は PromptEvalProtocol の duck-typing 注入で境界を保つ。
+    if state.llm_client is not None:
+        from backend.free.llm.prompt_candidate_eval import PromptCandidateEval
+        learning_scheduler.set_prompt_eval(PromptCandidateEval(
+            state.llm_client,
+            config=cfg,
+            debug_logger=debug_logger,
+            should_abort=learning_scheduler.should_yield,
+        ))
+
     # 7f-1c. GenerationParamEvolver (Level 1 phase6)
     # 進化したデルタは config.get_generation_params() が読む
     # ``local_paths.generation_deltas_file`` (base モデルパーティション配下) に

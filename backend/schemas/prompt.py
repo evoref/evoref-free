@@ -35,3 +35,9 @@ class PromptConfig(BaseModel):
     rule_stats_min_turns: int = Field(default=200, ge=1)
     #: Level 1 の 1 ランで許す規則 delete 件数 (f_04 §4.5.2)。
     max_deletes_per_run: int = Field(default=1, ge=0)
+    #: base prompt 採用ゲートの実測ケース数 (失敗ターンから新しい順、f_04 §4.5)。
+    #: 0 なら実測しない = 採用しない (欠陥率 fitness は候補に無反応なので、
+    #: 実測無しの採用は禁則 7 に当たる)。
+    adoption_eval_cases: int = Field(default=6, ge=0)
+    #: 採用に要する実測スコアの最小上昇幅 (候補平均 - 現行平均)。
+    adoption_min_gain: float = Field(default=0.05, ge=0.0, le=1.0)

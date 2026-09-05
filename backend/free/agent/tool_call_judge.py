@@ -60,6 +60,7 @@ from backend.free.agent.tool_judge_dialogue import (
     _recent_dialogue_messages,
     _recent_dialogue_text,
     query_needs_dialogue,
+    ungroup_thousands,
 )
 from backend.free.agent.tool_judge_signals import (
     _CALCULATE_RE,
@@ -1036,7 +1037,7 @@ class ToolCallJudge:
         messages = _recent_dialogue_messages(
             conversation, _SYNTHESIS_CONTEXT_TURNS,
         )
-        messages.append({"role": "user", "content": query})
+        messages.append({"role": "user", "content": ungroup_thousands(query)})
         messages.insert(0, {
             "role": "system",
             "content": select_locale_variant(
@@ -1229,7 +1230,7 @@ class ToolCallJudge:
             messages = _recent_dialogue_messages(conversation)
         else:
             messages = []
-        messages.append({"role": "user", "content": query})
+        messages.append({"role": "user", "content": ungroup_thousands(query)})
         # 役割を宣言しないと、モデルは判定ではなく **回答本文** を書き始める
         # (詳細は _NATIVE_JUDGE_SYSTEM のコメント)。文法制約は形式を保証するが
         # 「何を選ぶか」の質は役割宣言に依存する。

@@ -794,6 +794,40 @@ def _drop_frames_already_in_window(
 _WINDOW_DEDUP_MIN_CHARS = 12
 
 
+#: 競合セクションの見出し行 (``conflict_review._CONFLICT_LABELS`` の header)。
+_CONFLICT_HEADER_RE = re.compile(
+    r"^\s*\[(?:記憶の競合 — 未解決|Memory conflicts — unresolved)\]\s*$",
+)
+#: 競合グループ行 (``[C1] (type) subject ...``)。
+_CONFLICT_GROUP_LINE_RE = re.compile(r"^\s*\[C\d+\]")
+
+
+def _strip_empty_conflict_section(semmem_block: str | None) -> str | None:
+    """グループ行を失った競合セクション (見出し + 導入文だけ) を落とす (純粋関数)。
+
+    競合セクションは ``[関連する記憶]`` の末尾に連結されてから、上の 3 つの
+    行単位フィルタ (述べ直し / 上書き / 窓との重複) を一緒に通る。フィルタは
+    ``[C1]`` の行だけを落とし、見出しと「以下の記憶は内容が矛盾しています」は
+    残るので、**中身の無い競合セクション** がプロンプトに載っていた
+    (2026-09-05 ライブ監査 T1: 自己紹介ターンで occupation の競合行だけが
+    述べ直し抑止で落ち、見出しと導入文が ``[参考情報 1]`` の直前に浮いていた)。
+    """
+    if not semmem_block:
+        return semmem_block
+    lines = semmem_block.splitlines()
+    header_at = next(
+        (i for i, ln in enumerate(lines) if _CONFLICT_HEADER_RE.match(ln)), None,
+    )
+    if header_at is None:
+        return semmem_block
+    if any(_CONFLICT_GROUP_LINE_RE.match(ln) for ln in lines[header_at:]):
+        return semmem_block
+    kept = lines[:header_at]
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return "\n".join(kept) if any(ln.strip().startswith("-") for ln in kept) else None
+
+
 def _drop_rag_duplicates_of_semmem(
     semmem_block: str | None,
     rag_chunks: list[str] | None,
@@ -1486,6 +1520,7 @@ def build_messages(
     rag_chunks, rag_scored_chunks = _drop_rag_duplicates_of_semmem(
         semmem_block, rag_chunks, rag_scored_chunks,
     )
+    semmem_block = _strip_empty_conflict_section(semmem_block)
     total_rag = len(rag_chunks) if rag_chunks else total_rag
 
     # 動的ブロック (query 依存) を優先順に積む。system には含めない。

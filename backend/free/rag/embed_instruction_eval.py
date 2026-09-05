@@ -40,6 +40,18 @@ class EmbedInstructionEval:
         self._query_template = query_template
         self._top_k = max(1, top_k)
 
+    @property
+    def can_measure(self) -> bool:
+        """候補 instruction を埋め込みに差し込めるか (instruction-aware モデルか)。
+
+        bge-m3 のような非 instruction-aware モデルは ``query_template`` が空で、
+        :meth:`score_candidate` は常に ``None`` を返す。その場合 evolver は候補に
+        無関係な定数 fitness へ degrade し、10 世代の変異生成 (LLM 呼出) が
+        選択圧ゼロで空回りする (2026-09-05 実機: 初期集団 5 件とも 0.6260、
+        履歴 10 回すべて before == after)。呼出側はこれで phase ごと skip する。
+        """
+        return "{task}" in self._query_template and "{query}" in self._query_template
+
     async def score_candidate(
         self, candidate: str, queries: list[str],
     ) -> float | None:
