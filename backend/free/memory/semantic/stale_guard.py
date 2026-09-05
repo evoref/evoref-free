@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from backend.io.atomic import atomic_write_text
 from backend.log_config import get_logger
 from backend.utils import utc_now
 
@@ -76,11 +77,12 @@ def set_semmem_reembed_required(
         return
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(
+        atomic_write_text(
+            p,
             json.dumps(
                 {"new_model": new_model, "at": utc_now()}, ensure_ascii=False,
             ),
-            encoding="utf-8",
+            fsync=True,
         )
         logger.info(
             "SemMem reembed marker set (embed model -> %s); fact vectors are "

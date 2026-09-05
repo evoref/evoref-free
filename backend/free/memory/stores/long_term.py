@@ -41,9 +41,26 @@ DEFAULT_RRF_K: int = 60
 class LongTermMemory:
     """Layer 3: RAG ベクトル DB + タグ検索（LLM ゼロ）"""
 
+    #: ``note_meta`` の論理キー → チャンク metadata 上のキー。metadata 側は
+    #: ``source`` (= ``memory:<session>``) を既に使っているので名前空間を分ける。
+    _NOTE_META_KEYS = {
+        "note_id": "note_id",
+        "tags": "note_tags",
+        "keywords": "note_keywords",
+        "session_id": "note_session_id",
+        "trace_id": "note_trace_id",
+        "source": "speaker",
+        "private": "private",
+    }
+
     def __init__(self, vector_store: VectorStore):
         self.vectors = vector_store
-        self.note_meta: dict[str, dict] = {}  # {note_id: meta_dict}
+        #: ``chunk_id -> meta_dict``。**実体はチャンク metadata (metadata.json)**
+        #: で、これはそこから組み直すキャッシュ。以前はプロセス内 dict だけに
+        #: 持っており、再起動後は tags フィルタが常に空振りし、ファクト↔episodic
+        #: の ``trace_id`` 連結も切れていた (2026-09-05 監査)。
+        self._note_meta_cache: dict[str, dict] | None = None
+        self._note_meta_count: int = -1
         #: 語彙チャネル。``set_bm25_retriever`` で注入され、``search_hybrid``
         #: が使う。``None`` ならベクトル単独 (従来動作) に縮退する。
         self._bm25: "BM25Retriever | None" = None
@@ -53,6 +70,32 @@ class LongTermMemory:
         #: になる。構築時の件数を添え、件数が変わったら作り直す。
         self._speaker_by_id: dict[str, str | None] | None = None
         self._speaker_cache_count: int = -1
+
+    @property
+    def note_meta(self) -> dict[str, dict]:
+        """``chunk_id -> {note_id, tags, keywords, session_id, trace_id, source}``。
+
+        チャンク metadata から組み直す (件数が変わるまで再利用)。永続化されて
+        いるので再起動を跨いで読める。
+        """
+        metadata = getattr(self.vectors, "metadata", []) or []
+        if self._note_meta_cache is None or self._note_meta_count != len(metadata):
+            cache: dict[str, dict] = {}
+            for entry in metadata:
+                chunk_id = entry.get("id")
+                if not chunk_id or not entry.get("note_id"):
+                    continue
+                cache[chunk_id] = {
+                    logical: entry.get(stored)
+                    for logical, stored in self._NOTE_META_KEYS.items()
+                }
+            self._note_meta_cache = cache
+            self._note_meta_count = len(metadata)
+        return self._note_meta_cache
+
+    def _invalidate_note_meta(self) -> None:
+        self._note_meta_cache = None
+        self._note_meta_count = -1
 
     def set_bm25_retriever(
         self, bm25: "BM25Retriever | None", *, rrf_k: int = DEFAULT_RRF_K,
@@ -316,21 +359,6 @@ class LongTermMemory:
             source=f"memory:{note.session_id}",
             category="memory",
             has_context=True,
-            # 発話者は下の note_meta にも入れるが、あちらはプロセス内メモリのみで
-            # 永続化されない。再起動後に読めるよう metadata.json 側にも残す。
-            speaker=getattr(note, "source", None),
-        )
-
-        chunk_id = chunk_ids[0]
-        self._invalidate_speaker_index()
-        # EvorefMem: trace_id を note_meta に保存し
-        # ファクトと episodic LTM チャンクを ``trace_id`` で連結可能にする。
-        self.note_meta[chunk_id] = {
-            "note_id": note.id,
-            "tags": note.tags,
-            "keywords": note.keywords,
-            "session_id": note.session_id,
-            "trace_id": getattr(note, "trace_id", None),
             # 発話者 (user / assistant / rag / system)。STM ノートは全件持って
             # いるのに LTM へ移す時に落ちており、検索結果では「ユーザーが述べた
             # 事実」と「アシスタント自身が過去に答えた内容」が区別できなかった。
@@ -338,9 +366,24 @@ class LongTermMemory:
             # 実測 (2026-08-09): STM 99 件の内訳は user 49 / assistant 50 で、
             # **半分が自分の出力**。「私の趣味は？」の LTM 上位には自分の過去の
             # 回答が並び、古い値 (0.444) が新しい値 (0.438) を上回っていた。
-            # まず素性を残す — 検索側でどう扱うかは、これが観測できるように
-            # なってから実測で決める。
-            "source": getattr(note, "source", None),
-        }
+            speaker=getattr(note, "source", None),
+            # note 由来メタは metadata.json 側に永続化する。``trace_id`` は
+            # ファクトと episodic LTM チャンクを連結する鍵。``private`` は
+            # 「昇格させない」上流ガードだけに頼らず、ディスク上で監査できる
+            # ようレコードにも残す (2026-09-05 監査)。
+            extra_meta={
+                "note_id": note.id,
+                "note_tags": list(note.tags or []),
+                "note_keywords": list(note.keywords or []),
+                "note_session_id": note.session_id,
+                "note_trace_id": getattr(note, "trace_id", None),
+                "private": True if getattr(note, "private", False) else None,
+                "lang": getattr(note, "lang", "") or None,
+            },
+        )
+
+        chunk_id = chunk_ids[0]
+        self._invalidate_speaker_index()
+        self._invalidate_note_meta()
         logger.info("Absorbed note %s to LTM as chunk %s", note.id, chunk_id)
         return chunk_id

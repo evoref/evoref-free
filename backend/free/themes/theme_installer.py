@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import socket
 import tempfile
 import zipfile
@@ -139,20 +140,33 @@ def install_theme(zip_path: Path, themes_dir: Path) -> ThemeInstallResult:
         if not _find_file_in_zip(names, dark_css):
             raise ValueError(f"{dark_css} not found in ZIP")
 
-        # 展開
-        target_dir.mkdir(parents=True, exist_ok=True)
+        # 展開は一時ディレクトリへ行い、全ファイル書き終えてから rename する。
+        # 直接 target_dir へ書くと途中で落ちたとき半端なテーマが残り、しかも
+        # 上の重複チェック (target_dir.exists()) が以後の再インストールを
+        # 永久に拒否する (2026-09-05 監査)。
+        staging_dir = themes_dir / f".{theme_id}.installing"
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        staging_dir.mkdir(parents=True, exist_ok=True)
         prefix = _detect_zip_prefix(names)
 
-        for name in names:
-            if name.endswith("/"):
-                continue
-            # ZIP 内のプレフィックスを除去して展開
-            rel_path = name[len(prefix):] if prefix and name.startswith(prefix) else name
-            if not rel_path:
-                continue
-            out_path = target_dir / rel_path
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_bytes(zf.read(name))
+        try:
+            for name in names:
+                if name.endswith("/"):
+                    continue
+                # ZIP 内のプレフィックスを除去して展開
+                rel_path = (
+                    name[len(prefix):] if prefix and name.startswith(prefix) else name
+                )
+                if not rel_path:
+                    continue
+                out_path = staging_dir / rel_path
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_bytes(zf.read(name))
+            staging_dir.rename(target_dir)
+        except Exception:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
 
     # widget-manifest.json のパース
     widget_manifest = None

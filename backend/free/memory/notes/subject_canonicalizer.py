@@ -83,6 +83,7 @@ from pathlib import Path
 from typing import Pattern
 
 from backend.free.memory.semantic.subject_key import SubjectKey
+from backend.io.atomic import atomic_write_text
 from backend.log_config import get_logger
 
 logger = get_logger("memory.subject_canonicalizer")
@@ -223,9 +224,9 @@ def write_subject_dictionary(
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"version": version, "entries": dict(entries)}
-    path.write_text(
+    atomic_write_text(
+        path,
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False) + "\n",
-        encoding="utf-8",
     )
     logger.info("Wrote subject dictionary: %s (entries=%d)", path, len(entries))
     return path

@@ -18,6 +18,7 @@ from backend.free.memory.notes.pin_detector import (
     detect_pin,
     get_pin_triggers_for,
 )
+from backend.free.core.text_quality import detect_lang
 from backend.free.memory.types import MemoryMode, NoteSource
 from backend.trace_context import get_trace_id
 
@@ -33,7 +34,13 @@ _PIN_RETRIEVAL_BOOST: float = 0.15
 
 @dataclass
 class MemoryNote:
-    """A-MEM Zettelkasten 式ノート"""
+    """A-MEM Zettelkasten 式ノート
+
+    ``_extra`` は **未知キーの退避先**。新しい版が書いたフィールドを旧版が
+    読んでも落とさず往復させる (SemMem の ``SemanticFact._extra`` と同じ扱い)。
+    以前はスナップショットの読み書きが固定のキー列挙だったため、知らない
+    キーは次の保存で黙って消えていた (2026-09-05 監査)。
+    """
     id: str
     content: str
     keywords: list[str] = field(default_factory=list)
@@ -100,6 +107,25 @@ class MemoryNote:
 
     project_id: str | None = None
     """create モード時のプロジェクト ID"""
+
+    lang: str = ""
+    """本文の言語 (``ja`` / ``en`` / 未判定は空)。決定論判定で埋める。"""
+
+    turn_id: str = ""
+    """このノートの元になった WM ターンの ID (``WorkingMemory.add_turn`` 発行)。
+
+    セッション → ターン → ノート → ファクト / LTM チャンクを 1 本の鍵で
+    辿るための連結点 (c_05 §0.6)。位置 (添字) は private スキップと圧縮で
+    ずれるので識別子にならない。
+    """
+
+    episode_id: str | None = None
+    """MDP エピソード ID (``ep_<hex8>``)。agent_trace 由来のノートのみ。
+
+    以前は ``session_id`` にエピソード ID を入れており、``session_id`` で
+    絞る消費側から見ると会話 ID と区別できず、本当の会話 ID は content の
+    ``conversation=`` 文字列を読むしか無かった (2026-09-05 監査)。
+    """
 
     is_tool_output: bool = False
     """ツール出力か (WM までのみ保持、STM 以降は除外)"""
@@ -189,6 +215,9 @@ class MemoryNote:
     conflict_cooldown_until: float | None = None
     """conflict 検出を再開してよい時刻 (float epoch)。``None`` または現在時刻
     超過で検出対象に戻る。``url_curated_at`` 等と同じ float epoch マーカー。"""
+
+    _extra: dict = field(default_factory=dict)
+    """未知キーの退避先 (round-trip 保全用)。EvorefMem 内部限定。"""
 
 
 class ShortTermMemory:
@@ -376,6 +405,8 @@ class ShortTermMemory:
             tool_command_query=turn.get("tool_command_query"),
             is_correction=is_correction,
             trace_id=get_trace_id() or None,
+            turn_id=turn.get("turn_id", ""),
+            lang=detect_lang(content),
         )
         self.notes[note.id] = note
         self.mark_dirty()

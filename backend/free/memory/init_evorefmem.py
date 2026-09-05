@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from backend.io.atomic import atomic_write_text
 from backend.log_config import get_logger
 
 logger = get_logger("memory.init_evorefmem")
@@ -199,7 +200,7 @@ def write_schema_marker(memory_dir: Path, version: int = SCHEMA_VERSION) -> Path
     root = _semantic_root(memory_dir)
     root.mkdir(parents=True, exist_ok=True)
     marker = root / SCHEMA_MARKER_FILENAME
-    marker.write_text(f"{version}\n", encoding="utf-8")
+    atomic_write_text(marker, f"{version}\n", fsync=True)
     logger.info("Wrote schema marker: %s = %s", marker, version)
     return marker
 

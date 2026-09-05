@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from backend.io.atomic import atomic_write_text
 from backend.log_config import get_logger
 from backend.utils import utc_now
 
@@ -56,9 +57,9 @@ def set_embed_reindex_required(new_model: str) -> None:
         return
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(
+        atomic_write_text(
+            p,
             json.dumps({"new_model": new_model, "at": utc_now()}, ensure_ascii=False),
-            encoding="utf-8",
         )
         logger.info(
             "Embed reindex marker set (model changed to %s); search results are "

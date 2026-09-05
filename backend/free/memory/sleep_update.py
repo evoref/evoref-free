@@ -874,7 +874,7 @@ class SleepTimeWorker:
             try:
                 from backend.config import get_path_resolver
                 resolver = get_path_resolver()
-                patterns_file = resolver.resolve_local("learned_patterns_file")
+                patterns_file = resolver.resolve_learning("learned_patterns_file")
                 self.learned_patterns.save(patterns_file)
             except Exception as e:
                 logger.warning("Failed to save learned patterns: %s", e)

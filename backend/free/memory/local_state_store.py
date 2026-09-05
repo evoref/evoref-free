@@ -54,6 +54,10 @@ DEFAULT_INACTIVE_DAYS = 180
 MemoryMode = Literal["chat", "create"]
 
 
+class LocalStateVersionError(RuntimeError):
+    """state.json が対応版より新しい (旧版で書き戻すと壊す)。"""
+
+
 @dataclass
 class ProjectMeta:
     """1 プロジェクトのメタ情報"""
@@ -75,6 +79,9 @@ class LocalState:
     mode: MemoryMode = DEFAULT_MODE
     project_aliases: dict[str, str] = field(default_factory=dict)
     projects: dict[str, ProjectMeta] = field(default_factory=dict)
+    #: ディスク上のファイルが未対応の新しい版で、書き戻すと壊す状態。
+    #: :meth:`LocalStateStore.save` はこの印が立っていたら書き込まない。
+    readonly: bool = False
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -104,6 +111,14 @@ def deserialize(data: dict[str, Any] | None) -> LocalState:
 
     raw_version = data.get("schema_version")
     version = raw_version if isinstance(raw_version, int) else SCHEMA_VERSION
+    if version > SCHEMA_VERSION:
+        # 新しい版のファイルを旧版として読むと、知らないフィールドを落としたまま
+        # ``save`` が旧版で書き戻して新版の内容を破壊する (2026-09-05 監査)。
+        # 読まずに既定へ倒し、ファイルはそのまま残す (次の save は別途ガードする)。
+        raise LocalStateVersionError(
+            f"local state schema_version {version} is newer than supported "
+            f"{SCHEMA_VERSION}; refusing to downgrade the file",
+        )
     if version != SCHEMA_VERSION:
         logger.warning(
             "local state schema_version mismatch: expected=%s actual=%s. "
@@ -174,7 +189,14 @@ class LocalStateStore:
                 path, exc,
             )
             return LocalState()
-        return deserialize(raw)
+        try:
+            return deserialize(raw)
+        except LocalStateVersionError as exc:
+            logger.error(
+                "Refusing to load %s: %s. Running with defaults; "
+                "the file is left untouched.", path, exc,
+            )
+            return LocalState(readonly=True)
 
     @staticmethod
     def save(path: Path, state: LocalState) -> None:
@@ -184,6 +206,12 @@ class LocalStateStore:
         (詳細は :mod:`backend.io.atomic` 参照)。Windows ``PermissionError``
         は :mod:`backend.io._retry` の retry ポリシーで吸収される。
         """
+        if state.readonly:
+            logger.warning(
+                "Skipping local state save: on-disk file is a newer schema "
+                "version and would be downgraded (%s)", path,
+            )
+            return
         payload = json.dumps(
             serialize(state), ensure_ascii=False, indent=2, sort_keys=True,
         )

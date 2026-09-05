@@ -15,6 +15,7 @@ import json
 from enum import IntEnum
 from pathlib import Path
 
+from backend.io.atomic import atomic_write_text
 from backend.log_config import get_logger
 
 logger = get_logger("edition")
@@ -241,9 +242,9 @@ def check_downgrade(local_dir: Path) -> None:
     # 前回エディションを保存（次回起動時の比較用）
     try:
         state_file.parent.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(
+        atomic_write_text(
+            state_file,
             json.dumps({"edition": cur.name}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
         )
     except Exception as e:
         logger.debug("Failed to save edition state: %s", e)

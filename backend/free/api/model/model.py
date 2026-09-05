@@ -96,7 +96,7 @@ def _get_migrator(state: AppState):
     eval_core_mgr = None
     EvalCoreManager = get_pro_handler("eval_core_manager")
     if EvalCoreManager is not None:
-        eval_core_path = resolver.resolve_local("eval_core_file")
+        eval_core_path = resolver.resolve_learning("eval_core_file")
         eval_core_mgr = EvalCoreManager(eval_core_path)
 
     # ShortTermMemory

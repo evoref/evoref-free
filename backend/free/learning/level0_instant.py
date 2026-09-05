@@ -1,5 +1,6 @@
 """Level 0 即時学習: 経験バッファ"""
 
+import uuid
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -122,8 +123,51 @@ _SIGNAL_FIELD_NAMES = frozenset(f.name for f in fields(FeedbackSignals))
 
 
 @dataclass
+class GenerationConfigRef:
+    """その応答を生んだ構成の参照 (c_05 §0.6 ID 連鎖)。
+
+    Level 1 / Level 2 は経験の fitness を候補 (プロンプト版 / few-shot /
+    ポリシー / LoRA) へ帰属させるが、以前は **何が有効だったかを記録して
+    いなかった** ため、帰属は時刻からの推測でしかなかった (2026-09-05 監査)。
+    """
+
+    prompt_version: int | None = None
+    """このターンで使ったシステムプロンプトの版 (``PromptMeta.version``)。"""
+
+    fewshot_ids: list[str] = field(default_factory=list)
+    """注入した few-shot 例の ID (``FewShotExample.id``)。"""
+
+    policy_generation: int | None = None
+    """ポリシーパラメータの世代 (``PolicyParamEvolver`` の generation)。"""
+
+    lora_version: int | None = None
+    """有効だった base LoRA のスナップショット版 (未適用なら ``None``)。"""
+
+    locale: str = ""
+    """UI ロケール。プロンプト本文と few-shot の言語を決める軸。"""
+
+    sampling: dict[str, float] = field(default_factory=dict)
+    """temperature / top_p / max_tokens 等、生成時に効いたパラメータ。"""
+
+
+@dataclass
 class ExperienceEntry:
     """経験バッファの1エントリ"""
+
+    id: str = ""
+    """このエントリの ID (``exp_<hex12>``)。**同じターンの二重記録を検出できる
+    唯一の手段**。以前は秒精度の timestamp しか無く、同一秒の 2 ターンが
+    区別できず、再送・再取り込みの重複も検出できなかった。"""
+
+    session_id: str = ""
+    """発生した会話のセッション ID。"""
+
+    turn_id: str = ""
+    """発生したターンの ID (``WorkingMemory.add_turn`` が発行)。"""
+
+    trace_id: str = ""
+    """リクエストの trace_id。JSONL 側のログと突き合わせる鍵。"""
+
     timestamp: str = ""
     mode: str = "chat"
     query: str = ""
@@ -135,7 +179,22 @@ class ExperienceEntry:
     base_model: str = ""
     embedding_model: str = ""
     cartridge_ids: list[str] = field(default_factory=list)
+    lang: str = ""
+    """応答本文の言語 (``ja`` / ``en`` / 未判定は空)。決定論判定で埋める。"""
+
+    gen_config: GenerationConfigRef = field(default_factory=GenerationConfigRef)
+    """この応答を生んだ構成 (fitness の帰属先)。"""
+
     signals: FeedbackSignals = field(default_factory=FeedbackSignals)
+
+    @staticmethod
+    def new_id() -> str:
+        """``exp_<hex12>`` 形式の ID を発行する。"""
+        return f"exp_{uuid.uuid4().hex[:12]}"
+
+
+#: ``_entry_from_dict`` で復元する ``GenerationConfigRef`` のキー集合。
+_GEN_CONFIG_FIELD_NAMES = frozenset(f.name for f in fields(GenerationConfigRef))
 
 
 class ExperienceBuffer(JsonStateStore):
@@ -176,9 +235,21 @@ class ExperienceBuffer(JsonStateStore):
         )
 
     def record(self, entry: ExperienceEntry) -> None:
-        """エントリを追加"""
+        """エントリを追加 (同じターンの二重記録は無視する)"""
         if not entry.timestamp:
             entry.timestamp = utc_now()
+        if not entry.id:
+            entry.id = ExperienceEntry.new_id()
+
+        # 同一 turn_id が既にあるなら再送・再取り込み。timestamp は秒精度で
+        # 同一秒の別ターンと区別できないため、ID で判定する。
+        if entry.turn_id and any(
+            e.turn_id == entry.turn_id for e in reversed(self.entries[-32:])
+        ):
+            logger.debug(
+                "Skipping duplicate experience for turn %s", entry.turn_id,
+            )
+            return
 
         self.entries.append(entry)
 
@@ -230,6 +301,10 @@ class ExperienceBuffer(JsonStateStore):
     def _to_payload(self) -> JsonPayload:
         return [
             {
+                "id": entry.id,
+                "session_id": entry.session_id,
+                "turn_id": entry.turn_id,
+                "trace_id": entry.trace_id,
                 "timestamp": entry.timestamp,
                 "mode": entry.mode,
                 "query": entry.query,
@@ -238,6 +313,8 @@ class ExperienceBuffer(JsonStateStore):
                 "base_model": entry.base_model,
                 "embedding_model": entry.embedding_model,
                 "cartridge_ids": entry.cartridge_ids,
+                "lang": entry.lang,
+                "gen_config": asdict(entry.gen_config),
                 "signals": asdict(entry.signals),
             }
             for entry in self.entries
@@ -278,7 +355,17 @@ class ExperienceBuffer(JsonStateStore):
         signals_data = d.get("signals", {})
         if not isinstance(signals_data, dict):
             raise TypeError("signals must be a dict")
+        gen_data = d.get("gen_config") or {}
+        if not isinstance(gen_data, dict):
+            gen_data = {}
         return ExperienceEntry(
+            # 旧レコードは id を持たない。**ここで採番しない** — 読むたびに別 ID に
+            # なると重複検出の役に立たないので、空のままにして「ID 以前のレコード」
+            # と分かるようにする。
+            id=d.get("id", ""),
+            session_id=d.get("session_id", ""),
+            turn_id=d.get("turn_id", ""),
+            trace_id=d.get("trace_id", ""),
             timestamp=d.get("timestamp", ""),
             mode=d.get("mode", "chat"),
             query=d.get("query", ""),
@@ -287,6 +374,10 @@ class ExperienceBuffer(JsonStateStore):
             base_model=d.get("base_model") or "",
             embedding_model=d.get("embedding_model", ""),
             cartridge_ids=d.get("cartridge_ids", []),
+            lang=d.get("lang", ""),
+            gen_config=GenerationConfigRef(**{
+                k: gen_data[k] for k in _GEN_CONFIG_FIELD_NAMES if k in gen_data
+            }),
             # JSON に存在するキーのみ採用 (欠損キーは FeedbackSignals の
             # 既定値に委ねる)。新シグナル追加時もここの編集は不要。
             signals=FeedbackSignals(**{

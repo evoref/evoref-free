@@ -4,6 +4,7 @@ import time
 from uuid import uuid4
 
 from backend.free.memory.stores.fact_slate import SessionFactSlate
+from backend.trace_context import get_trace_id
 from backend.log_config import get_logger
 from backend.utils import estimate_tokens as _estimate_tokens
 
@@ -177,8 +178,8 @@ class WorkingMemory:
         tool_command_source: str | None = None,
         tool_command_query: str | None = None,
         correction: bool = False,
-    ) -> None:
-        """ターンを追加し、トークン上限を超えたら圧縮・押し出し
+    ) -> str:
+        """ターンを追加し、トークン上限を超えたら圧縮・押し出し。**turn_id を返す**
 
         EvorefMem 拡張:
         ``private=True`` のターンは ``MemoryNote.private=True`` で吸収され、
@@ -199,6 +200,7 @@ class WorkingMemory:
         pending へ落とすのを免除する。訂正は会話中に起きるので、この印が無いと
         **いちばん確度の高い訂正がいちばん自動解決されない**。
         """
+        turn_id = f"t_{uuid4().hex[:12]}"
         est_tokens = _estimate_tokens(content)
         logger.debug(
             "add_turn: role=%s, content_len=%d, est_tokens=%d, "
@@ -207,10 +209,17 @@ class WorkingMemory:
             private,
         )
         turn: dict = {
+            # ターン ID。**位置は識別子にならない** — private ターンは蓄積
+            # バッファに積まれず、圧縮・押し出しでも添字がずれる。履歴 /
+            # STM ノート / experience / agent_trace をこの ID で連結する
+            # (c_05 §0.6 ID 連鎖)。
+            "turn_id": turn_id,
             "role": role,
             "content": content,
             "timestamp": time.time(),
         }
+        if trace_id := get_trace_id():
+            turn["trace_id"] = trace_id
         if private:
             turn["private"] = True
         if mode is not None:
@@ -235,6 +244,7 @@ class WorkingMemory:
             self.session_first_user_turn = content
         self.turns.append(turn)
         self._enforce_limits()
+        return turn_id
 
     def get_context(self) -> list[dict]:
         """推論時のコンテキスト取得（0ms: 配列参照のみ）"""

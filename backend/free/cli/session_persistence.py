@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from backend.free.cli.command_parser import CommandResult, SessionState
+from backend.free.history.utils import parse_iso
 from backend.free.cli.renderer import render_error, render_info
 from backend.i18n_helper import msg
 from backend.io import atomic_write_text
@@ -264,8 +265,12 @@ def recover_checkpoints(history_dir: Path) -> int:
 
             month_dir = history_dir / month_str
 
-            # ファイル名を生成
-            ts = utc_now_dt().strftime("%Y%m%d_%H%M%S")
+            # ファイル名の時刻は **セッション開始時刻**。復旧時刻を使うと
+            # 1 月開始のセッションが history/2026-01/20260315_... となり、
+            # 月ディレクトリ順 → ファイル名降順で並べる一覧で、実際には
+            # 古いセッションが新しいものより上位に居座る (2026-09-05 監査)。
+            stamp = parse_iso(started_at) if started_at else None
+            ts = (stamp or utc_now_dt()).strftime("%Y%m%d_%H%M%S")
             dest = month_dir / f"{ts}_{session_id}.json"
 
             # アーカイブとして移動（source を維持）

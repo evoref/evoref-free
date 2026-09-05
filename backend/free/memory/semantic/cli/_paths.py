@@ -8,9 +8,14 @@ prompts_dir / migration_archive_dir を取得し、scope (``global`` /
 
 from __future__ import annotations
 
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from backend.log_config import get_logger
+
+logger = get_logger("memory.semantic.cli.paths")
 
 
 @dataclass(frozen=True)
@@ -122,7 +127,37 @@ def cli_backup_root(
     timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(t))
     root = Path(migration_archive_dir) / f"cli_{timestamp}" / subcommand
     root.mkdir(parents=True, exist_ok=True)
+    _prune_backup_roots(Path(migration_archive_dir))
     return root
+
+
+#: 残す ``cli_*`` バックアップ世代数。1 世代が SemMem 埋め込み全量のコピーに
+#: なりうるため (再埋め込みのたびに丸ごと複製)、無制限だとコーパス規模 ×
+#: 実行回数でディスクを食い潰す (2026-09-05 監査)。
+BACKUP_KEEP_GENERATIONS = 5
+
+
+def _prune_backup_roots(migration_archive_dir: Path, *, keep: int | None = None) -> int:
+    """``cli_*`` バックアップを新しい順に ``keep`` 世代残して削除する。"""
+    limit = BACKUP_KEEP_GENERATIONS if keep is None else keep
+    try:
+        roots = sorted(
+            (p for p in migration_archive_dir.glob("cli_*") if p.is_dir()),
+            key=lambda p: p.name,
+            reverse=True,
+        )
+    except OSError:
+        return 0
+    removed = 0
+    for stale in roots[limit:]:
+        try:
+            shutil.rmtree(stale)
+            removed += 1
+        except OSError as exc:
+            logger.warning("Failed to prune backup %s: %s", stale, exc)
+    if removed:
+        logger.info("Pruned %d old migration backup(s)", removed)
+    return removed
 
 
 __all__ = [

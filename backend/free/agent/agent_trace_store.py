@@ -65,7 +65,13 @@ class AgentTraceStore:
             trace_id = get_trace_id()
             if trace_id:
                 payload["trace_id"] = trace_id
-        line = json.dumps(redact_payload(payload), ensure_ascii=False)
+        # private はレコード自身の印を優先する。contextvar はリクエスト単位で、
+        # executor / バックグラウンド境界を越えると落ちるため、そこで書かれた
+        # step が unmasked のまま永続化され episodic LTM へ入っていた。
+        line = json.dumps(
+            redact_payload(payload, force_private=bool(payload.get("private"))),
+            ensure_ascii=False,
+        )
         with self._lock:
             try:
                 handle = self._open_for_today()

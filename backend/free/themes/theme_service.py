@@ -11,6 +11,7 @@ from typing import Literal, TypedDict
 
 from backend.config import get_path_resolver
 from backend.free.themes.theme_installer import ThemeInstallResult
+from backend.io.atomic import atomic_write_text
 from backend.log_config import get_logger
 
 logger = get_logger("themes.service")
@@ -479,8 +480,14 @@ class ThemeManager:
         updater(data)
 
         try:
-            with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            atomic_write_text(
+                config_path,
+                yaml.dump(
+                    data, default_flow_style=False,
+                    allow_unicode=True, sort_keys=False,
+                ),
+                fsync=True,
+            )
         except Exception as e:
             logger.error("Failed to write config.yaml: %s", e)
             raise RuntimeError(f"Failed to persist theme settings: {e}") from e

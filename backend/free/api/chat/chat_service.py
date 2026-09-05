@@ -153,7 +153,7 @@ async def prepare_memory_context(
         from backend.free.agent.issue_ledger import record_correction
 
         record_correction(requested_session, req.message)
-    wm.add_turn(
+    user_turn_id = wm.add_turn(
         "user",
         req.message,
         private=req.private,
@@ -164,7 +164,11 @@ async def prepare_memory_context(
     # 履歴の蓄積バッファにも **ここで** 積む。record_* の末尾だけだと、
     # 生成が失敗 / タイムアウトしたターンは WM に居るのに履歴には無い。
     # 冪等なので record_* 側の保険と二重には数えない。
-    accumulate_user_turn(requested_session, req.message, private=req.private)
+    accumulate_user_turn(
+        requested_session, req.message, private=req.private,
+        turn_id=user_turn_id,
+        meta={"mode": req.mode, "source": "user", "is_correction": correction or None},
+    )
     history = wm.get_messages()
 
     # 単位はメッセージ数 (user/assistant を各 1 と数える)。往復数ではない —

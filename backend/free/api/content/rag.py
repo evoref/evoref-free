@@ -3,6 +3,8 @@
 import os
 import time
 
+import numpy as np
+
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 
 from backend.app_state import AppState, get_app_state
@@ -19,6 +21,7 @@ from backend.free.api.content._rag_helpers import (
 )
 from backend.free.api.schemas import RagIngestResponse, RagStatsResponse, RagSourceInfo
 from backend.config import get_config
+from backend.free.rag.vector_store import content_hash
 from backend.log_config import get_logger
 from backend.free.rag.chunker import SemanticChunker
 from backend.free.rag.text_extractor import (
@@ -100,12 +103,26 @@ async def ingest_document(
         embedding_dim=embedder.dim(),
     )
 
-    store.add_vectors(
-        vectors, chunks, source=file.filename, category=category,
-        embedding_model=embedder.model_name(),
-        embedding_backend=embedder.backend_type(),
+    # 同名 source の再取り込みは **差し替え**。以前は旧チャンクを残したまま
+    # 追記しており、同じ文が二重にヒットしていた (2026-09-05 監査)。
+    removed = store.prune_stale_source_chunks(file.filename, chunks)
+    unchanged = store.unchanged_chunk_hashes(file.filename, chunks)
+    fresh = [c for c in chunks if content_hash(c) not in unchanged]
+    fresh_vectors = np.asarray([
+        v for c, v in zip(chunks, vectors) if content_hash(c) not in unchanged
+    ], dtype=np.float32) if fresh else None
+    if fresh:
+        store.add_vectors(
+            fresh_vectors, fresh, source=file.filename, category=category,
+            embedding_model=embedder.model_name(),
+            embedding_backend=embedder.backend_type(),
+        )
+    if removed or fresh:
+        store.save()
+    logger.info(
+        "Ingest %s: %d chunk(s) new, %d unchanged, %d removed",
+        file.filename, len(fresh), len(unchanged), removed,
     )
-    store.save()
 
     tokens_total = sum(max(1, len(c) // 2) for c in chunks)
     elapsed = time.time() - start

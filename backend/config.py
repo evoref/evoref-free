@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from backend.io.atomic import atomic_write_text
 from backend.log_config import get_logger
 
 logger = get_logger("config")
@@ -109,6 +110,12 @@ class PathResolver:
         "control_vector_versions_dir": "models/control_vector_versions",
         "cvector_work_dir": "cvector",
         "generation_deltas_file": "generation_deltas.json",
+        # 訂正パターン辞書。ベースモデル自身の出力の癖から学習するため、
+        # モデルを替えたら持ち越してはいけない (2026-09-05 監査で漏れを検出)。
+        "learned_patterns_file": "learned_patterns.json",
+        # Level 1 採用ゲート / Level 2 目的関数の合格基準。auto ケースは
+        # そのモデルの訂正から作られるので base 軸で分離する。
+        "eval_core_file": "eval_core.json",
     }
 
     # ``_LEARNING_SUBPATH`` のうち、``learning.level2_adapter_partition=="model_mode"``
@@ -461,8 +468,12 @@ def save_config_section(section: str, data: dict) -> dict:
     validated = validate_config(merged)
 
     # config.yaml に書き込み（Pro マージ前の raw を保存）
-    with open(config_path, "w", encoding="utf-8") as f:
-        yaml.dump(raw, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    # config.yaml が truncate 途中で壊れると起動不能になる。atomic + fsync。
+    atomic_write_text(
+        config_path,
+        yaml.dump(raw, default_flow_style=False, allow_unicode=True, sort_keys=False),
+        fsync=True,
+    )
 
     logger.info("Config section '%s' saved to %s", section, config_path)
 

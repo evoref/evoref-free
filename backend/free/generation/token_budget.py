@@ -116,6 +116,8 @@ def load_ratios(
 def save_ratios(
     ratios: dict[str, dict[str, list[float | int]]],
     prompts_dir: Path,
+    *,
+    source: str = "learned",
 ) -> None:
     """local/prompts/token_budget.json に比率テーブルを保存"""
     from backend.utils import utc_now
@@ -125,7 +127,9 @@ def save_ratios(
     data = {
         "version": 1,
         "updated_at": utc_now(),
-        "source": "learned" if path.exists() else "default",
+        # 呼び手が何を書いているかを記録する。以前は path.exists() から
+        # 決めており、2 回目以降は既定値を書き戻しても "learned" になった。
+        "source": source,
         "ratios": ratios,
     }
     atomic_write_text(

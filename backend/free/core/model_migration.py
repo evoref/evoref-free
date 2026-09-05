@@ -1043,13 +1043,17 @@ class ModelMigrator:
             self._apply_routed(cfg, routed)
             if emb_params:
                 cfg.setdefault("embedding", {}).update(emb_params)
-        with open(config_path, "w", encoding="utf-8") as f:
+        # config.yaml が truncate 途中で壊れると起動不能になる。atomic + fsync。
+        atomic_write_text(
+            config_path,
             yaml.dump(
-                cfg, f,
+                cfg,
                 default_flow_style=False,
                 allow_unicode=True,
                 sort_keys=False,
-            )
+            ),
+            fsync=True,
+        )
         # in-memory config も同期 (restart+rebind が同じ singleton を再読する)
         self.config.setdefault("model_paths", {})[
             COMPONENT_CONFIG_KEY[component]
@@ -1252,12 +1256,23 @@ class ModelMigrator:
                 entry.base_model = old_model_name
             entry.signals.perplexity = None
 
-        # 永続化
-        exp_file = self._resolve_path(
-            self.config.get("local_paths", {}).get(
-                "experience_file", "local/experience.json"
+        # 永続化。in-memory バッファは **active パーティション** の内容なので、
+        # flat パス (local/experience.json) へ書くとパーティション側が古いまま
+        # 残り、shutdown で上書きされて移行結果が消える (2026-09-05 監査)。
+        # active パーティションへ書く。flat パス (local/experience.json) へ書くと
+        # パーティション側が古いまま残り、shutdown で上書きされて移行結果が
+        # 消える (2026-09-05 監査)。グローバル resolver 未初期化 (単体テスト等)
+        # では従来の flat パスへ倒す。
+        try:
+            from backend.config import get_path_resolver
+
+            exp_file = get_path_resolver().resolve_learning("experience_file")
+        except RuntimeError:
+            exp_file = self._resolve_path(
+                self.config.get("local_paths", {}).get(
+                    "experience_file", "local/experience.json",
+                ),
             )
-        )
         self.experience_buf.save(exp_file)
 
         logger.info(
@@ -1308,13 +1323,17 @@ class ModelMigrator:
 
         cfg.setdefault("model_paths", {})["base_model"] = new_model_path
 
-        with open(config_path, "w", encoding="utf-8") as f:
+        # config.yaml が truncate 途中で壊れると起動不能になる。atomic + fsync。
+        atomic_write_text(
+            config_path,
             yaml.dump(
-                cfg, f,
+                cfg,
                 default_flow_style=False,
                 allow_unicode=True,
                 sort_keys=False,
-            )
+            ),
+            fsync=True,
+        )
 
         # in-memory config も同期 (_update_component_config と対称)。
         # 未同期だと移行後 restart 前に get_config() が旧 base_model を返し、

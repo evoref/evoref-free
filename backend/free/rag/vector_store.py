@@ -1,5 +1,6 @@
 """numpy ベースのベクトルインデックス（int8 量子化 + memmap 対応）"""
 
+import hashlib
 import json
 from collections.abc import Iterable
 from pathlib import Path
@@ -44,6 +45,15 @@ def _coarse_scores(
         block = np.asarray(q8[start:stop]).astype(np.float32)
         out[start:stop] = (block @ query_f32) * sc[start:stop]
     return out
+
+
+def content_hash(text: str) -> str:
+    """チャンク本文の内容ハッシュ (sha256 先頭 16 桁)。
+
+    埋め込みキャッシュ (:mod:`backend.free.rag.embedding_cache`) と同じ桁数で、
+    再取り込み時に「変わっていないチャンク」を特定するために使う。
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 def quantize_int8(
@@ -219,6 +229,7 @@ class VectorStore:
             self.scales = None
             self._is_memmap = False
 
+        self._verify_alignment()
         self._load_cluster_index()
 
     def _load_cluster_index(self) -> None:
@@ -332,6 +343,7 @@ class VectorStore:
 
         # memmap 中のファイルへの書き込みを防ぐため通常配列に変換
         self._ensure_writable()
+        self._verify_alignment()
         self._save_vectors()
 
         # _store_info をヘッダーとして metadata.json の先頭に書き出す
@@ -375,6 +387,66 @@ class VectorStore:
         else:
             self.metadata = list(raw)
             self.store_info = {}
+
+    # ── chunk id 採番 ──────────────────────────────────
+
+    def _next_chunk_seq(self) -> int:
+        """次に発行する chunk id の連番を返す。
+
+        **`len(self.metadata)` を使ってはいけない。** delete でメタデータを
+        詰めた後に採番すると既存 id を再発行し、``chunks/<id>.txt`` を別本文で
+        上書きしたうえで BM25 索引 / ``access_count`` / 引用がすべて別チャンクを
+        指す (2026-09-05 監査)。採番は単調増加のカウンタで行い、削除済み id は
+        **二度と再利用しない**。
+
+        カウンタは ``store_info["next_chunk_seq"]`` に永続化する。旧ストア
+        (キーなし) は既存 id の最大値 + 1 から再開する。
+        """
+        seq = self.store_info.get("next_chunk_seq") if self.store_info else None
+        if isinstance(seq, int) and seq >= 0:
+            return seq
+        max_seq = -1
+        for meta in self.metadata:
+            try:
+                max_seq = max(max_seq, int(str(meta.get("id", ""))))
+            except (TypeError, ValueError):
+                continue
+        return max_seq + 1
+
+    def _bump_chunk_seq(self, value: int) -> None:
+        """採番カウンタを ``value`` まで進める (後退させない)。"""
+        if not self.store_info:
+            self.store_info = {"created_at": utc_now_dt().isoformat()}
+        current = self.store_info.get("next_chunk_seq")
+        if not isinstance(current, int) or value > current:
+            self.store_info["next_chunk_seq"] = int(value)
+
+    def _verify_alignment(self) -> None:
+        """metadata 行数とベクトル行数の一致を検証する。
+
+        両者の対応は **純粋に位置** なので、ずれたままだと検索が別チャンクの
+        本文を返す (誤りが例外ではなく「それらしい誤答」として出る)。save は
+        ``np.save`` 2 回 + metadata の 3 段階で、途中でクラッシュするとずれる。
+        ずれを検出したら短い方へ切り詰めて ERROR を出す (誤ラベルより欠落を
+        選ぶ)。復旧は ``evoref reindex``。
+        """
+        if self.vectors_q8 is None:
+            return
+        n_vec = len(self.vectors_q8)
+        n_meta = len(self.metadata)
+        if n_vec == n_meta:
+            return
+        logger.error(
+            "Vector store misalignment: %d vectors vs %d metadata entries. "
+            "Truncating to %d. Run 'evoref reindex' to rebuild.",
+            n_vec, n_meta, min(n_vec, n_meta),
+        )
+        keep = min(n_vec, n_meta)
+        self.metadata = self.metadata[:keep]
+        self.vectors_q8 = np.array(self.vectors_q8[:keep])
+        if self.scales is not None:
+            self.scales = np.array(self.scales[:keep])
+        self._is_memmap = False
 
     def stored_dim(self) -> int | None:
         """保存済みベクトルの次元数を返す（インデックスが空なら None）
@@ -470,6 +542,8 @@ class VectorStore:
         embedding_backend: str = "",
         has_context: bool = False,
         speaker: str | None = None,
+        extra_meta: dict | None = None,
+        source_path: str = "",
     ) -> list[str]:
         """ベクトル（float32）を受け取り、int8 量子化して追加
 
@@ -510,7 +584,7 @@ class VectorStore:
         # float32 → int8 量子化
         new_q8, new_scales = quantize_int8(vectors)
 
-        start_id = len(self.metadata)
+        start_id = self._next_chunk_seq()
         chunk_ids = []
         now = utc_now_dt().isoformat()
 
@@ -525,7 +599,14 @@ class VectorStore:
                 "created_at": now,
                 "category": category,
                 "tokens": max(1, len(chunk) // 2),
+                # 本文のハッシュ。同じ source を取り込み直したとき、変わった
+                # チャンクだけを差し替えるための判定材料 (``replace_source``)。
+                "content_hash": content_hash(chunk),
             }
+            if source_path:
+                # ``source`` はファイル名だけなので、別ディレクトリの同名
+                # ファイルが 1 つの source に潰れる。実体の相対パスを併記する。
+                meta_entry["source_path"] = source_path
             if has_context:
                 meta_entry["has_context"] = True
             if speaker:
@@ -534,10 +615,17 @@ class VectorStore:
                 meta_entry["embedding_model"] = embedding_model
             if embedding_backend:
                 meta_entry["embedding_backend"] = embedding_backend
+            if extra_meta:
+                # None 値は載せない (「未設定」と「明示的に None」を区別しない)。
+                meta_entry.update(
+                    {k: v for k, v in extra_meta.items() if v is not None},
+                )
             self.metadata.append(meta_entry)
 
             chunk_path = self.chunks_dir / f"{chunk_id}.txt"
             chunk_path.write_text(chunk, encoding="utf-8")
+
+        self._bump_chunk_seq(start_id + len(chunks))
 
         # int8 ベクトルを追加
         if self.vectors_q8 is None or len(self.vectors_q8) == 0:
@@ -715,10 +803,52 @@ class VectorStore:
             for gi, sim in zip(idxs, sims)
         }
 
+    def prune_stale_source_chunks(self, source: str, chunks: list[str]) -> int:
+        """``source`` の既存チャンクのうち、新しい本文集合に無いものを削除する。
+
+        同じファイルを取り込み直したとき、以前は旧チャンクが残ったまま新しい
+        チャンクが **追記** され、同じ文が二重にヒットしていた (2026-09-05
+        監査)。内容ハッシュで突き合わせ、消えたものだけ落とす。
+
+        Returns:
+            削除したチャンク数。
+        """
+        existing = self.source_content_hashes(source)
+        if not existing:
+            # 旧レコード (content_hash なし) は突き合わせられない。source 単位で
+            # 丸ごと入れ替える (追記して重複させるよりは安全)。
+            stale = self.chunk_ids_for_source(source)
+            return self.delete(stale) if stale else 0
+        incoming = {content_hash(c) for c in chunks}
+        stale = [cid for cid, h in existing.items() if h not in incoming]
+        return self.delete(stale) if stale else 0
+
+    def unchanged_chunk_hashes(self, source: str, chunks: list[str]) -> set[str]:
+        """``source`` に既にあり、本文が変わっていないチャンクのハッシュ集合。"""
+        existing = set(self.source_content_hashes(source).values())
+        return {h for c in chunks if (h := content_hash(c)) in existing}
+
+    def chunk_ids_for_source(self, source: str) -> list[str]:
+        """``source`` に属するチャンク ID を返す。"""
+        return [
+            str(m["id"]) for m in self.metadata
+            if m.get("source") == source and m.get("id")
+        ]
+
+    def source_content_hashes(self, source: str) -> dict[str, str]:
+        """``source`` の ``chunk_id -> content_hash`` を返す (旧レコードは除く)。"""
+        return {
+            str(m["id"]): str(m["content_hash"])
+            for m in self.metadata
+            if m.get("source") == source and m.get("id") and m.get("content_hash")
+        }
+
     def delete(self, chunk_ids: list[str]) -> int:
         """指定されたチャンクを削除"""
         self._ensure_writable()
         logger.debug("delete: removing %d chunk IDs", len(chunk_ids))
+        # 削除で最大 id が消えても採番が後戻りしないよう、削除前に確定させる。
+        self._bump_chunk_seq(self._next_chunk_seq())
         ids_to_remove = set(chunk_ids)
         keep_indices = []
 

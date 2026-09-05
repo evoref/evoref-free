@@ -95,6 +95,33 @@ def is_japanese_text(text: str) -> bool:
     return len(_JA_CHAR_RE.findall(outside)) >= _JA_MIN_CHARS
 
 
+#: 言語タグ判定でラテン文字とみなす範囲。
+_LATIN_CHAR_RE = re.compile(r"[A-Za-z]")
+
+
+def detect_lang(text: str) -> str:
+    """レコードに刻む言語タグを返す (``"ja"`` / ``"en"`` / 未判定は ``""``)。
+
+    **:func:`is_japanese_text` を流用しない。** あちらは「語間空白チェックの
+    母数に含めてよいか」を決める品質ゲートで、和文 20 文字未満を False に
+    落とす。短い和文 (「私の趣味は登山です。」) まで英語と誤ラベルするので、
+    タグ付けには使えない (2026-09-05)。
+
+    判定は決定論のみ。和文文字が 1 つでもあれば ``ja``、無くてラテン文字が
+    あれば ``en``、どちらも無ければ ``""`` (数字・記号だけ / 空)。混在は
+    ``ja`` に倒す (和文にラテン語の固有名詞が混じるのが普通の形なので)。
+
+    用途は横断検索の **重み付けとタイブレーク** に限る。フィルタに使うと
+    片方の言語が死ぬ (2026-09-03 の GUI locale の前例)。
+    """
+    outside = _CODE_FENCE_RE.sub("\n", text)
+    if _JA_CHAR_RE.search(outside):
+        return "ja"
+    if _LATIN_CHAR_RE.search(outside):
+        return "en"
+    return ""
+
+
 #: 日本語文に混じる簡体字。日本の常用漢字・人名用漢字には存在しない字形だけを
 #: 挙げる (旧字体・異体字として日本語文に現れうる字は入れない)。
 _SIMPLIFIED_ONLY_CHARS = "们这说认从个时么没很吗呢东车门问间语谁际现实发对开关书长风"

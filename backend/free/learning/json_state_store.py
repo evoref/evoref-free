@@ -49,16 +49,77 @@ JsonPayload = Union[dict[str, Any], list[Any]]
 
 _default_logger = get_logger("learning.json_state_store")
 
+#: 「読むことを拒否した」を表す番兵 (``None`` は正当なペイロードなので使えない)。
+_REFUSED = object()
+
+
+def read_payload(path: str | Path) -> Any:
+    """永続化ファイルから **ペイロードだけ** を読む (エンベロープを剥がす)。
+
+    エンベロープ以前の素のペイロードもそのまま返す。ストアを経由せずに中身を
+    見たい移行スクリプト / テスト用。
+    """
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and "payload" in raw and "schema_version" in raw:
+        return raw["payload"]
+    return raw
+
+
+def write_payload(
+    path: str | Path, payload: JsonPayload, *, schema_version: int = 1,
+    component: str = "",
+) -> None:
+    """ペイロードをエンベロープで包んで書き出す (テスト / 移行スクリプト用)。"""
+    from backend.utils import utc_now
+
+    envelope = {
+        "schema_version": schema_version,
+        "written_at": utc_now(),
+        "producer": {"component": component, "app_version": _app_version()},
+        "payload": payload,
+    }
+    atomic_write_text(
+        Path(path), json.dumps(envelope, ensure_ascii=False, indent=2),
+    )
+
+
+def _app_version() -> str:
+    """アプリ版数 (取得できなければ空文字)。producer 記録用。"""
+    try:
+        from backend.version import get_runtime_version
+
+        return str(get_runtime_version())
+    except Exception:
+        return ""
+
 
 class JsonStateStore:
     """JSON ファイルへの save/load を共通化する template-method 基底クラス。
 
     サブクラスは :meth:`_to_payload` と :meth:`_from_payload` を実装すること。
     継承時は `__init__` をそのまま使ってよい (本クラスは状態を持たない)。
+
+    書き出しは **永続化エンベロープ** (c_05 §0.5) で包む::
+
+        {"schema_version": 1, "written_at": "...Z",
+         "producer": {"component": "...", "app_version": "..."},
+         "payload": <_to_payload() の返り値>}
+
+    読み込みはエンベロープと素のペイロード (旧形式) の両方を受け付ける。
+    ``schema_version`` が :attr:`SCHEMA_VERSION` より **新しい** ファイルは
+    読まず、以後の ``save`` も拒否する — 知らないフィールドを落としたまま
+    旧版で書き戻すと新版の内容を破壊するため (2026-09-05 監査)。
     """
 
     #: サブクラスが上書き可能なロガー (デフォルトはモジュール logger)。
     _state_logger: logging.Logger | None = None
+
+    #: このストアのレコード版。フィールドの意味を変える / 必須キーを増やす
+    #: 変更で上げ、対応する migrator を用意する。
+    SCHEMA_VERSION: int = 1
+
+    #: ディスク上のファイルが未対応の新しい版で、書き戻すと壊す状態。
+    _downgrade_blocked: bool = False
 
     # ── public API (template methods) ──
 
@@ -71,9 +132,18 @@ class JsonStateStore:
         return する。
         """
         path = Path(path)
+        if self._downgrade_blocked:
+            self._store_logger().warning(
+                "Skipping save of %s to %s: on-disk file is a newer schema "
+                "version and would be downgraded",
+                type(self).__name__, path,
+            )
+            return
         try:
             payload = self._to_payload()
-            text = json.dumps(payload, ensure_ascii=False, indent=2)
+            text = json.dumps(
+                self._wrap_payload(payload), ensure_ascii=False, indent=2,
+            )
             atomic_write_text(path, text)
         except (OSError, TypeError, ValueError) as e:
             self._store_logger().warning(
@@ -95,12 +165,15 @@ class JsonStateStore:
             return
         try:
             text = path.read_text(encoding="utf-8")
-            payload = json.loads(text)
+            raw = json.loads(text)
         except (OSError, json.JSONDecodeError) as e:
             self._store_logger().warning(
                 "Failed to read %s from %s: %s",
                 type(self).__name__, path, e,
             )
+            return
+        payload = self._unwrap_payload(raw, path)
+        if payload is _REFUSED:
             return
         try:
             self._from_payload(payload)
@@ -115,6 +188,42 @@ class JsonStateStore:
             )
             return
         self._on_load_success(path)
+
+    # ── 永続化エンベロープ ──
+
+    def _wrap_payload(self, payload: JsonPayload) -> dict[str, Any]:
+        """ペイロードを永続化エンベロープで包む。"""
+        from backend.utils import utc_now
+
+        return {
+            "schema_version": self.SCHEMA_VERSION,
+            "written_at": utc_now(),
+            "producer": {
+                "component": type(self).__name__,
+                "app_version": _app_version(),
+            },
+            "payload": payload,
+        }
+
+    def _unwrap_payload(self, raw: Any, path: Path) -> Any:
+        """エンベロープを剥がす。旧形式 (素のペイロード) はそのまま返す。
+
+        未対応の新しい版なら :data:`_REFUSED` を返し、以後の ``save`` も
+        止める (旧版で書き戻して壊さないため)。
+        """
+        if not (isinstance(raw, dict) and "payload" in raw and "schema_version" in raw):
+            return raw  # 旧形式 (エンベロープ以前)
+        version = raw.get("schema_version")
+        if isinstance(version, int) and version > self.SCHEMA_VERSION:
+            self._downgrade_blocked = True
+            self._store_logger().error(
+                "Refusing to load %s from %s: schema_version %s is newer than "
+                "supported %s. Running with current state; the file is left "
+                "untouched.",
+                type(self).__name__, path, version, self.SCHEMA_VERSION,
+            )
+            return _REFUSED
+        return raw["payload"]
 
     # ── 抽象メソッド (subclass MUST override) ──
 

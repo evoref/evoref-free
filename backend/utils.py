@@ -144,13 +144,57 @@ def split_by_scope(text: str, budget: int) -> list[str]:
 
 
 def utc_now() -> str:
-    """UTC タイムスタンプ (ISO 8601, 末尾 ``Z``)
+    """UTC タイムスタンプ (ISO 8601, マイクロ秒, 末尾 ``Z``)
 
-    永続化・ログ・ファイル名で共通利用する文字列表現。内部処理で
-    計算用の tz-aware :class:`datetime` が必要な場合は :func:`utc_now_dt`
-    を使用すること
+    **ディスク上の時刻はこの 1 形式に揃える** (c_05 §0.5)。以前は秒精度で、
+    同じ 1 ターンの中の出来事が同一値になり順序が付かなかった。さらに
+    ``utc_now_dt().isoformat()`` (``+00:00`` オフセット + マイクロ秒) と
+    float epoch が混在し、ストアを跨いだ時刻比較に 3 種のパーサが要った
+    (2026-09-05 監査)。
+
+    読み戻しは :func:`parse_utc` を使う。**文字列のまま辞書順で比較しない**
+    — 形式が 1 つでも混ざると順序が壊れる。
     """
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return format_utc(utc_now_dt())
+
+
+def format_utc(dt: datetime) -> str:
+    """tz-aware ``datetime`` を永続化用 ISO 8601 (μs, ``Z``) 文字列にする。"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (
+        dt.astimezone(timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%S.%f")
+        + "Z"
+    )
+
+
+def parse_utc(value: str | float | int | None) -> datetime | None:
+    """永続化された時刻を tz-aware ``datetime`` へ戻す (解釈できなければ ``None``)。
+
+    受け付ける形: ``...Z`` / ``+00:00`` オフセット付き ISO 8601 (秒・μs
+    いずれも) と float epoch。過去に書かれた 3 形式をすべて読めるようにし、
+    比較は必ず ``datetime`` 同士で行う。
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        try:  # float epoch を文字列で書いた古いレコード
+            return datetime.fromtimestamp(float(text), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def utc_now_dt() -> datetime:

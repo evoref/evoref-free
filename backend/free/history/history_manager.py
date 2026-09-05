@@ -147,6 +147,13 @@ class SessionData:
     # SemMem への昇格済フラグ
     promoted_to_semmem: bool = False
     project_id: str | None = None
+    #: 会話の主言語 (``ja`` / ``en`` / 未判定は空)。横断検索の重み付け用。
+    lang: str = ""
+    #: ``summary_embedding`` を作った埋め込みモデル。無記名だとモデル切替後に
+    #: 新旧のベクトルを区別できず、類似度が黙って壊れる (2026-09-05 監査)。
+    summary_embedding_model: str = ""
+    #: レコード版 (c_05 §0.5)。
+    schema_version: int = 1
 
     @classmethod
     def from_dict(cls, data: dict) -> SessionData:
@@ -172,6 +179,9 @@ class SessionData:
             archived_at=data.get("archived_at", ""),
             promoted_to_semmem=bool(data.get("promoted_to_semmem", False)),
             project_id=data.get("project_id"),
+            lang=data.get("lang", ""),
+            summary_embedding_model=data.get("summary_embedding_model", ""),
+            schema_version=int(data.get("schema_version", 1) or 1),
         )
 
 
@@ -385,6 +395,8 @@ class HistoryManager:
 
         self._checkpoint_dir = history_dir / ".checkpoint"
         self._index: HistoryIndex | None = None
+        #: ``_index`` を読んだ時点の ``index.json`` の mtime (ns)。
+        self._index_mtime: int | None = None
 
     # ── 保存 ──
 
@@ -438,6 +450,30 @@ class HistoryManager:
             promoted_to_semmem=session.promoted_to_semmem,
             project_id=session.project_id,
         )
+
+    def _refresh_index_entry(self, entry: IndexEntry, filepath: Path) -> None:
+        """圧縮 / 要約化でファイルを書き換えた後、索引側を実ファイルへ揃える。
+
+        揃えないと索引が「削除済みの本文」を持ち続け、検索がヒットするのに
+        開くと無い状態になる。さらに保持ポリシーで消したはずの発話が
+        ``index.json`` に原文のまま残る (2026-09-05 監査)。
+        """
+        try:
+            with open(filepath, encoding="utf-8") as f:
+                data = json.load(f)
+            session = SessionData.from_dict(data)
+        except (OSError, ValueError) as exc:
+            logger.warning("Failed to refresh index entry for %s: %s", filepath, exc)
+            return
+        entry.turn_count = session.turn_count or len(session.turns)
+        entry.search_text = _build_search_text(session)
+        entry.first_user_preview = _build_first_user_preview(session)
+        entry.summary = session.summary
+        entry.summary_turn_count = session.summary_turn_count
+        try:
+            entry.size_bytes = filepath.stat().st_size
+        except OSError:
+            pass
 
     def mark_promoted_to_semmem(self, session_id: str) -> bool:
         """セッションを SemMem 昇格済としてマーク
@@ -752,13 +788,16 @@ class HistoryManager:
                 if freed > 0:
                     result["summarized"] += 1
                     result["freed_mb"] += freed
+                    self._refresh_index_entry(entry, filepath)
             elif started < compress_cutoff:
                 freed = _compress_session_file(filepath, self.compress_preview_chars)
                 if freed > 0:
                     result["compressed"] += 1
                     result["freed_mb"] += freed
+                    self._refresh_index_entry(entry, filepath)
 
         result["deleted"] += self._enforce_storage_limit(index)
+        self._save_index(index)
         logger.info("Compact completed: %s", result)
         return result
 
@@ -783,17 +822,31 @@ class HistoryManager:
     # ── インデックス管理 ──
 
     def _load_index(self) -> HistoryIndex:
-        """インデックスを読込み（キャッシュ）"""
-        if self._index is not None:
+        """インデックスを読込み（mtime が変わっていたら読み直す）。
+
+        以前はプロセス内キャッシュを一度読んだら二度と更新しなかった。
+        サーバと CLI が同時に動く構成では両者が全体を書き戻すため、
+        **後に書いた側が相手のセッションを黙って消していた**
+        (2026-09-05 監査)。atomic 書き込みは壊れたファイルを防ぐだけで、
+        ロストアップデートは防がない。mtime を見て読み直す。
+        """
+        index_path = self.history_dir / "index.json"
+        try:
+            mtime = index_path.stat().st_mtime_ns
+        except OSError:
+            mtime = None
+
+        if self._index is not None and mtime == self._index_mtime:
             return self._index
 
-        index_path = self.history_dir / "index.json"
-        if not index_path.exists():
+        if mtime is None:
             self._index = HistoryIndex()
+            self._index_mtime = None
             return self._index
 
         with open(index_path, encoding="utf-8") as f:
             data = json.load(f)
+        self._index_mtime = mtime
 
         sessions = [
             IndexEntry(
@@ -832,16 +885,19 @@ class HistoryManager:
             e for e in index.sessions if e.session_id != entry.session_id
         ]
         index.sessions.append(entry)
-
-        # 統計更新
-        index.total_sessions = len(index.sessions)
-        index.total_turns = sum(e.turn_count for e in index.sessions)
-        index.total_size_mb = sum(e.size_bytes for e in index.sessions) / (1024 * 1024)
-
         self._save_index(index)
 
     def _save_index(self, index: HistoryIndex) -> None:
-        """インデックスを保存"""
+        """インデックスを保存
+
+        集計は **保存のたびに引き直す**。以前は ``_update_index`` でしか
+        更新しておらず、``delete_session`` / ``delete_sessions_batch`` /
+        ``_delete_oldest`` の 3 経路が総数・総ターン・総容量を陳腐化させ、
+        ``get_stats`` がそれをそのまま返していた (2026-09-05 監査)。
+        """
+        index.total_sessions = len(index.sessions)
+        index.total_turns = sum(e.turn_count for e in index.sessions)
+        index.total_size_mb = sum(e.size_bytes for e in index.sessions) / (1024 * 1024)
         index.updated_at = _now_iso()
 
         data = {
@@ -856,6 +912,12 @@ class HistoryManager:
         _atomic_write_json(index_path, data)
 
         self._index = index
+        # 自分が書いた版を「読み済み」として覚える (次の _load_index で
+        # 無駄に読み直さない)。他プロセスが書けば mtime が変わって読み直す。
+        try:
+            self._index_mtime = index_path.stat().st_mtime_ns
+        except OSError:
+            self._index_mtime = None
 
     def ensure_search_text(self) -> int:
         """search_text が未設定のエントリにターン本文を補完

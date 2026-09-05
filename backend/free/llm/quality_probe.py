@@ -33,6 +33,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from backend.io.atomic import atomic_write_text
 from backend.free.core.text_quality import has_broken_ja_spacing, is_japanese_text
 from backend.log_config import get_logger
 from backend.utils import utc_now
@@ -580,9 +581,9 @@ class QualityProbeStore:
                 role: res.to_dict() for role, res in self._records.items()
             },
         }
-        self.path.write_text(
+        atomic_write_text(
+            self.path,
             json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
         )
 
     def summary(self) -> list[dict]:

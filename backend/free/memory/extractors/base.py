@@ -32,6 +32,7 @@ from backend.free.memory.types import (
     Provenance,
     SemanticFact,
 )
+from backend.free.core.text_quality import detect_lang
 from backend.log_config import get_logger
 
 logger = get_logger("memory.extractors.base")
@@ -131,6 +132,10 @@ class BaseExtractor:
 
     mode: MemoryMode = "chat"
 
+    #: 抽出規則の版。``Provenance.extractor_version`` に刻む。抽出の意味を
+    #: 変えたら上げる (どの版が作ったファクトかで選り分けて再導出するため)。
+    EXTRACTOR_VERSION: int = 1
+
     #: subject の最大長 (object と区別するため短めに)
     MAX_SUBJECT_LEN: int = 64
 
@@ -224,11 +229,14 @@ class BaseExtractor:
         prov = Provenance(
             note_id=getattr(note, "id", None),
             session_id=getattr(note, "session_id", None) or None,
+            turn_id=getattr(note, "turn_id", "") or None,
             trace_id=effective_trace_id,
             mode=getattr(note, "mode", self.mode) or self.mode,
             project_id=getattr(note, "project_id", None) or ctx.project_id,
             source=getattr(note, "source", None),
             captured_at=now,
+            extractor=type(self).__name__,
+            extractor_version=self.EXTRACTOR_VERSION,
         )
 
         fact = SemanticFact(
@@ -259,6 +267,8 @@ class BaseExtractor:
             ),
             private=False,  # private ノートはここに来ない
             trace_id=effective_trace_id,
+            # 言語はノートから継ぐ (無ければ本文から決定論判定)。
+            lang=getattr(note, "lang", "") or detect_lang(clipped_obj),
         )
         for key, value in overrides.items():
             setattr(fact, key, value)

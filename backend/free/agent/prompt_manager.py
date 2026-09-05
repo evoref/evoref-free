@@ -142,6 +142,16 @@ class PromptMeta:
     model_calibrated_for: str = ""
     locale_calibrated_for: str = ""  # "ja" | "en"
     candidates: list[dict] = field(default_factory=list)
+    #: この版の親 (直前の版番号)。系譜を辿るための鍵。
+    parent_version: int | None = None
+    #: この版を作った操作 ("manual" / "mutate" / "crossover" / "rollback")。
+    op: str = ""
+    #: 採用時の fitness。以前は ``update_evolved`` が受け取ってログに出すだけで
+    #: **どこにも残っていなかった** ため、版と評価値を突き合わせられなかった
+    #: (2026-09-05 監査)。
+    fitness: float | None = None
+    #: 採用判定に使った eval セットの ``updated_at`` (再現性の鍵)。
+    eval_set_version: str = ""
 
 
 # インスタンス名プレフィックス（言語別）
@@ -719,9 +729,12 @@ class SystemPromptManager:
         self._archive_current(mode)
         self._adopt_content(mode, content)
         meta = self.metas[mode]
+        meta.parent_version = meta.version
         meta.version += 1
         meta.updated_at = _now()
         meta.source = "manual"
+        meta.op = "manual"
+        meta.fitness = None
         meta.candidates = []
         self._save_meta(mode)
         logger.info("Manual update: mode=%s, version=%d", mode, meta.version)
@@ -731,6 +744,8 @@ class SystemPromptManager:
         mode: str,
         content: str,
         fitness: float,
+        *,
+        eval_set_version: str = "",
     ) -> None:
         """Level 1 進化: 最良候補 (instruction) を本番に採用
 
@@ -779,9 +794,17 @@ class SystemPromptManager:
         self._archive_current(mode)
         self._adopt_content(mode, content)
         meta = self.metas[mode]
+        # 系譜を残す。以前は fitness を受け取ってログに出すだけで、版と評価値も
+        # 親子関係もどこにも残らなかった (2026-09-05 監査)。
+        meta.parent_version = meta.version
         meta.version += 1
         meta.updated_at = _now()
         meta.source = "evolution"
+        meta.op = "evolution"
+        meta.fitness = float(fitness)
+        # 採用判定に使った eval セットの版。無いと採用時の評価値が
+        # 後から再現できない (eval セットは in-place で書き換わる)。
+        meta.eval_set_version = eval_set_version or meta.eval_set_version
         self._save_meta(mode)
         logger.info(
             "Evolved update: mode=%s, version=%d, fitness=%.3f",
@@ -817,9 +840,12 @@ class SystemPromptManager:
         self._archive_current(mode)
         self._adopt_content(mode, content)
         meta = self.metas[mode]
+        meta.parent_version = version
         meta.version += 1
         meta.updated_at = _now()
         meta.source = "manual"
+        meta.op = "rollback"
+        meta.fitness = None
         meta.candidates = []
         self._save_meta(mode)
         logger.info("Rollback: mode=%s to v%03d, new version=%d",
@@ -913,5 +939,9 @@ class SystemPromptManager:
             model_calibrated_for=data.get("model_calibrated_for", ""),
             locale_calibrated_for=data.get("locale_calibrated_for", ""),
             candidates=data.get("candidates", []),
+            parent_version=data.get("parent_version"),
+            op=data.get("op", ""),
+            fitness=data.get("fitness"),
+            eval_set_version=data.get("eval_set_version", ""),
         )
 

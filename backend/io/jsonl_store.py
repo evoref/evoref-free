@@ -37,6 +37,8 @@ __all__ = [
     "JSONLAppendStore",
     "TOMBSTONE_KEY_FIELD",
     "TOMBSTONE_MARKER",
+    "TOMBSTONE_REASON_FIELD",
+    "TOMBSTONE_TS_FIELD",
 ]
 
 T = TypeVar("T")
@@ -46,6 +48,11 @@ T = TypeVar("T")
 #: serialize 関数の出力にこれらの予約フィールドを含めないこと (検知時 ValueError)。
 TOMBSTONE_MARKER = "_tombstone"
 TOMBSTONE_KEY_FIELD = "_key"
+#: tombstone を書いた時刻 (ISO 8601 μs, ``Z``) と理由。以前は印とキーだけで、
+#: compaction 後は削除の事実ごと消え「いつ / なぜ消えたか」を後から辿れなかった
+#: (2026-09-05 監査)。
+TOMBSTONE_TS_FIELD = "_deleted_at"
+TOMBSTONE_REASON_FIELD = "_reason"
 
 
 class JSONLAppendStore(Generic[T]):
@@ -159,11 +166,18 @@ class JSONLAppendStore(Generic[T]):
             obj = json.loads(line)
         except json.JSONDecodeError as e:
             raise ValueError(f"serialize() did not produce valid JSON: {e}") from e
-        if isinstance(obj, dict) and obj.get(TOMBSTONE_MARKER):
-            raise ValueError(
-                f"serialize() output contains reserved tombstone marker "
-                f"{TOMBSTONE_MARKER!r}",
-            )
+        if isinstance(obj, dict):
+            for reserved in (
+                TOMBSTONE_MARKER,
+                TOMBSTONE_KEY_FIELD,
+                TOMBSTONE_TS_FIELD,
+                TOMBSTONE_REASON_FIELD,
+            ):
+                if reserved in obj:
+                    raise ValueError(
+                        f"serialize() output contains reserved tombstone field "
+                        f"{reserved!r}",
+                    )
         key = self._key_of(item)
         with self._lock:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -172,16 +186,25 @@ class JSONLAppendStore(Generic[T]):
             self._total_lines += 1
             self._live_keys.add(key)
 
-    def tombstone(self, key: str) -> None:
+    def tombstone(self, key: str, *, reason: str | None = None) -> None:
         """指定キーの削除マーカーを append する。
 
         既に tombstone 済 / 未存在のキーに対しても安全 (no-op 相当の追記)。
         物理削除は :meth:`maybe_compact` 時に行われる。
+
+        ``reason`` は削除理由の短いラベル (GC / supersede / user 等)。時刻と
+        併せて記録し、監査に答えられるようにする。
         """
-        marker = json.dumps(
-            {TOMBSTONE_MARKER: True, TOMBSTONE_KEY_FIELD: key},
-            ensure_ascii=False,
-        )
+        from backend.utils import utc_now
+
+        record: dict[str, object] = {
+            TOMBSTONE_MARKER: True,
+            TOMBSTONE_KEY_FIELD: key,
+            TOMBSTONE_TS_FIELD: utc_now(),
+        }
+        if reason:
+            record[TOMBSTONE_REASON_FIELD] = reason
+        marker = json.dumps(record, ensure_ascii=False)
         with self._lock:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with self._path.open("a", encoding="utf-8") as f:
