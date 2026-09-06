@@ -25,6 +25,7 @@ from backend.free.agent.meta_cognitive_utils import (
     tool_result_succeeded,
 )
 from backend.free.agent.step_compactor import StepResult
+from backend.free.agent.tools_registry import FILESYSTEM_TOOL_NAMES
 from backend.free.api.chat.chat_constants import (
     TOOL_EXECUTION_TIMEOUT_SEC,
     TOOL_RESULT_HEAD_RATIO,
@@ -32,6 +33,7 @@ from backend.free.api.chat.chat_constants import (
     TOOL_RESULT_OMISSION_CHARS,
 )
 from backend.free.core.inference import build_messages_for_loop
+from backend.free.core.intent_vocab import mentions_filesystem
 from backend.utils import estimate_tokens as _estimate_tokens
 
 from backend.free.agent.meta_cognitive_defs import (
@@ -213,18 +215,29 @@ class _TaskExecutionMixin:
         task: TaskItem,
         context_parts: list[str],
         tools_registry,
+        original_query: str = "",
     ) -> str:
         """ツールループ用 system プロンプトを構築する。
 
         コンテキストは 3000 文字で truncate し、ツール記述は registry から取得。
+        ユーザーの質問がファイル / ディレクトリに一切触れていなければ、
+        ファイル系ツールはメニューに載せない (無関係な ``list_directory()`` で
+        リポジトリ一覧がコンテキストへ混入した 2026-09-05 F-08 の対策)。
         """
         tool_descriptions = ""
         if tools_registry is not None:
-            # 1 回の process() 内でタスク/反復ごとに再構築されていたので mode 別に cache
+            exclude = (
+                frozenset() if mentions_filesystem(original_query) or not original_query
+                else FILESYSTEM_TOOL_NAMES
+            )
+            # 1 回の process() 内でタスク/反復ごとに再構築されていたので (mode, 除外) 別に cache
             cache = self._tool_descriptions_cache
-            if self._mode not in cache:
-                cache[self._mode] = tools_registry.get_descriptions_text(mode=self._mode)
-            tool_descriptions = cache[self._mode]
+            key = (self._mode, exclude)
+            if key not in cache:
+                cache[key] = tools_registry.get_descriptions_text(
+                    mode=self._mode, exclude=exclude,
+                )
+            tool_descriptions = cache[key]
         context_text = "\n".join(context_parts) if context_parts else "(none)"
         if len(context_text) > 3000:
             context_text = context_text[:3000] + "\n... (truncated)"
@@ -426,7 +439,9 @@ class _TaskExecutionMixin:
     ) -> tuple[str, list[dict]]:
         """ツールループ本体: LLM 推論 → ツール実行を繰り返す"""
         tool_calls: list[dict] = []
-        prompt = self._build_loop_system_prompt(task, context_parts, tools_registry)
+        prompt = self._build_loop_system_prompt(
+            task, context_parts, tools_registry, original_query=original_query,
+        )
 
         state = AgentState(
             agent_layer="meta_cognitive",

@@ -15,6 +15,7 @@ from backend.app_state import AppState
 from backend.aux_telemetry import aux_failure_signals, current_aux_failures
 from backend.exceptions import EvorefError
 from backend.free.agent.issue_ledger import record_current_issue
+from backend.free.core.verifier_events import current_turn_outcome
 from backend.free.api.chat.chat_constants import MAX_STEP_QUEUE_SIZE
 from backend.free.api.chat.chat_recorder import (
     read_llama_prompt_tokens,
@@ -343,6 +344,16 @@ def _log_chat_outcome(
     # 規則の harmful に、発火しなかった規則の helpful に写す。これが
     # 「削ってよい規則」の唯一の根拠。計数の失敗で結末記録を止めない。
     signals = {**signals, **_account_rule_outcomes(state)}
+    # 経験記録が導出した成否 (本文の決定論的な破綻) を結末へ反映する。
+    # ``success`` が配送の成否だけだと、計算の破綻や自己矛盾のターンが
+    # 100/100 success で evolve の fitness に入る (2026-09-05 監査 F-11)。
+    turn_outcome, outcome_reason = current_turn_outcome()
+    if turn_outcome:
+        signals["turn_outcome"] = turn_outcome
+        if outcome_reason:
+            signals["turn_outcome_reason"] = outcome_reason
+        if turn_outcome == "failed" and not cancelled:
+            success = False
     dl.log_outcome(
         kind="chat_response",
         success=success,

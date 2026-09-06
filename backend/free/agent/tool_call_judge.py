@@ -23,6 +23,7 @@ from backend.free.core.intent_vocab import (
     ANAPHORIC_OPERAND_RE,
     NUMBER_LITERAL_RE,
     is_plain_statement,
+    is_practice_advice_query,
     looks_like_numeric_question,
 )
 from backend.free.core.locale_patterns import select_locale_variant
@@ -2577,6 +2578,7 @@ class ToolCallJudge:
             _INFER_TOOL_EXEC_QUERY_RE_ALL.search(q)
             and exec_tool
             and not asks_about_prior_conversation_entity(query)
+            and not is_practice_advice_query(query)
         ):
             # システム情報クエリは具体的なコマンドを生成
             command = _infer_executable_command(query)

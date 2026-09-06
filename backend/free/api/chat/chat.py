@@ -66,7 +66,7 @@ from backend.free.api.chat._continuation import (
 )
 from backend.edition import is_pro
 from backend.free.core.inference import latest_turn_truncation
-from backend.free.core.intent_vocab import is_whole_session_scope_query
+from backend.free.core.intent_vocab import is_today_scope_query, is_whole_session_scope_query
 from backend.free.core.session_mode import (
     is_create_mode,
     canonicalize_session_mode,
@@ -395,6 +395,10 @@ async def _gate_reactive_light(
     # なく **記憶と検索の有無** になった。それでも上げる価値はある — 窓外へ
     # 押し出されたターンは STM/search_history からしか辿れない。閾値は
     # 「会話が単発でない」ことを見るだけの目安。
+    # 「今日の会話」は現在セッションの長さと無関係に他セッションを要する
+    # (2026-09-05 F-12)。閾値ゲートを通さない。
+    if is_today_scope_query(req.message):
+        return "deliberative", judge_task, "today_scope"
     if (
         len(history) > REACTIVE_LIGHT_HISTORY_TURNS
         and is_whole_session_scope_query(req.message)

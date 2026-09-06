@@ -194,6 +194,14 @@ def _summarize_args_for_log(kwargs: dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
+
+#: ファイルシステムに触れるツール。タスク計画層のメニューから、質問がファイル系の
+#: 語彙を持たないときに外す (``intent_vocab.mentions_filesystem``)。
+FILESYSTEM_TOOL_NAMES: frozenset[str] = frozenset({
+    "read_file", "write_file", "search_code", "list_directory", "apply_diff",
+    "verify_syntax",
+})
+
 class ToolsRegistry:
     """ツールの登録・取得・実行を管理"""
 
@@ -297,18 +305,23 @@ class ToolsRegistry:
         tool = self._tools.get(name)
         return self._required_param_names(tool) if tool is not None else set()
 
-    def get_descriptions_text(self, mode: str | None = None) -> str:
+    def get_descriptions_text(
+        self, mode: str | None = None, *, exclude: frozenset[str] = frozenset(),
+    ) -> str:
         """ツール説明をテキスト形式で返す（プロンプト注入用）
 
         各ツールについて、シグネチャ行に続けて parameter ごとに required/optional
         と description を 1 行ずつ展開する。LLM が optional 引数を省略する判断や、
-        ISO 日付などの例示を読めるようにするため。
+        ISO 日付などの例示を読めるようにするため。``exclude`` に入れた名前は
+        メニューから外す (質問と無関係なツール群の抑止)。
         """
         lines = []
         for tool in self._tools.values():
             if tool.hidden:
                 continue
             if mode and mode not in tool.modes:
+                continue
+            if tool.name in exclude:
                 continue
             required = self._required_param_names(tool)
             sig_parts = []

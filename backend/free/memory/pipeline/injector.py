@@ -47,7 +47,7 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Literal, Sequence
 
-from backend.free.core.intent_vocab import is_plain_statement
+from backend.free.core.intent_vocab import asks_user_profile_summary, is_plain_statement
 from backend.free.core.text_quality import (
     carries_no_assertion,
     is_payload_dump,
@@ -823,6 +823,11 @@ class MemoryInjector:
             and states_no_user_value(query_text)
         )
         topicless_dropped = 0
+        # 「私について把握している事実を全部」型: ユーザー属性ファクトを全て
+        # 「尋ねられた属性」と扱い、コサインの棒と述べ直し抑止の両方を免除する。
+        # 訂正直後に「訂正後の内容で改めて箇条書きに」と頼まれると、訂正した
+        # スロットこそが答えなのに述べ直し抑止が落としていた (F-05)。
+        profile_request = bool(query_text) and asks_user_profile_summary(query_text)
 
         for fact in facts:
             if fact.superseded_by:
@@ -831,6 +836,9 @@ class MemoryInjector:
                 filtered_out += 1
                 topicless_dropped += 1
                 continue
+            profile_fact = profile_request and (
+                str(getattr(fact, "type", "") or "") in _USER_ATTRIBUTE_FACT_TYPES
+            )
             # 今回の会話で同じ属性スロットを述べ直しているファクトは注入しない。
             # ラベルには「今回の会話と食い違えば今回が優先」と書いてあるが、
             # 規範文では勝てない — 実インシデント (2026-08-23 ライブ監査
@@ -840,7 +848,7 @@ class MemoryInjector:
             # 勝って「武蔵野市です」と答えた。数値ラベル版の同じ対処
             # (``core.inference._drop_superseded_context``) を属性スロットへ
             # 一般化したもの。
-            if self._slot_restated_in_session(fact, restated):
+            if not profile_fact and self._slot_restated_in_session(fact, restated):
                 filtered_out += 1
                 continue
             # 問いだけのファクトは主張を含まないのに「(personal_fact)
@@ -892,7 +900,7 @@ class MemoryInjector:
             gate_reached += 1
             # 尋ねられている属性と subject の属性が一致するファクトは、
             # コサインの棒を免除する (:meth:`_asked_attributes` の実測を参照)。
-            asked_this = bool(
+            asked_this = profile_fact or bool(
                 asked_attrs and self._fact_attribute(fact) in asked_attrs
             )
             # 語彙アンカー: クエリの内容語がファクト本文にそのまま出ていれば、

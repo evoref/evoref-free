@@ -263,7 +263,10 @@ def _make_run_command_readonly(config: dict):
             return f"Error: readonly violation: {reject}"
         # chat の環境問い合わせに居残るプロセスは無い。タイムアウトしたら kill
         # して communicate() のスレッドも回収する (shell.run_command 参照)。
-        return await run_command(command, timeout, config, kill_on_timeout=True)
+        # 秘密らしい環境変数は子プロセスへ渡さない (読み出しによる漏洩の遮断)。
+        return await run_command(
+            command, timeout, config, kill_on_timeout=True, scrub_secrets=True,
+        )
 
     return wrapped
 

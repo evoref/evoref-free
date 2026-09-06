@@ -925,6 +925,30 @@ _NAMES_FILE_TARGET_RE = re.compile(
 )
 
 
+#: ファイルシステムに触れる語彙 (名指しのパス / 拡張子は :data:`_NAMES_FILE_TARGET_RE`)。
+_FILESYSTEM_VOCAB_RE = re.compile(
+    r"ファイル|ふぁいる|ディレクトリ|フォルダ|パス|リポジトリ|ソース(?:コード|ツリー)?|"
+    r"コード(?:ベース)?|プロジェクト(?:構成|構造|ルート)|構成を|一覧|"
+    r"(?<![A-Za-z])(?:files?|director(?:y|ies)|folders?|paths?|repo(?:sitory)?|"
+    r"codebase|source|tree|ls|dir)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def mentions_filesystem(query: str) -> bool:
+    """クエリがファイル / ディレクトリ / コードベースに触れているか (純粋関数)。
+
+    タスク計画層 (meta_cognitive) のツールメニューは mode に登録された全ツールを
+    毎タスク並べるため、統計の質問でモデルが ``list_directory()`` を撃ち、
+    リポジトリのルート一覧 (``.coverage`` / ``CLAUDE.md`` / ``LICENSE-PRO`` …) が
+    回答の材料に混入した (2026-09-05 ライブ監査 F-08)。質問がファイル系の語彙を
+    **一つも持たない** ならファイル系ツールをメニューから外す、その判定に使う。
+    """
+    if not query:
+        return False
+    return bool(_FILESYSTEM_VOCAB_RE.search(query)) or names_file_target(query)
+
+
 def names_file_target(query: str) -> bool:
     """クエリがファイル名 / パスを名指ししているか (純粋関数)。
 
@@ -1917,6 +1941,80 @@ _STATEMENT_TAIL_RE = re.compile(
 )
 
 
+#: 「私について把握している事実を箇条書きに」「私に関する情報を整理して」—
+#: 特定の属性ではなく **ユーザーのプロフィール全体** の列挙を求める形。
+_USER_PROFILE_SUMMARY_RE = re.compile(
+    r"(?:私|わたし|僕|ぼく|俺|おれ|自分)"
+    r"(?:について|に関する|に関して|のこと|の(?:情報|プロフィール|事実|データ))"
+    r"[^。！？!?\n]{0,30}?"
+    r"(?:事実|把握|覚えて|知って|記録|整理|まとめ|列挙|箇条書き|一覧|教えて|全部|すべて|全て)"
+    r"|(?<![A-Za-z])(?:what (?:do you|have you) (?:know|learned|remember(?:ed)?) about me"
+    r"|(?:facts|everything|things) (?:you know )?about me"
+    r"|(?:list|summarize|summarise) (?:what you know about me|my (?:profile|facts|details)))(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def asks_user_profile_summary(query: str) -> bool:
+    """ユーザー自身についての **事実の列挙** を求めているか (純粋関数)。
+
+    属性辞書 (``fact_attributes.yaml``) は「名前」「住んで」のような話題ごとの
+    語彙なので、「私に関する事実を箇条書きに」はどの属性にも当たらず、
+    personal / preference のファクトが全てコサインの棒に掛かって落ちる
+    (2026-09-05 ライブ監査 F-05: live な名前・職業・居住地・家族・趣味が
+    揃っていたのに 1 件も注入されず、直前テーマの world_fact が入った)。
+    この形では **ユーザー属性ファクト全部** を「尋ねられた属性」と扱う。
+    """
+    return bool(query) and bool(_USER_PROFILE_SUMMARY_RE.search(query))
+
+
+#: 「今日の会話」「本日のやり取り」— 日付で区切った会話全体。現在セッション
+#: ではなく **同じ日の全セッション** を指す。
+_TODAY_SCOPE_RE = re.compile(
+    r"(?:今日|本日)の(?:ここまでの|これまでの|全体の)?(?:会話|やり取り|対話|セッション)"
+    r"|(?<![A-Za-z])today'?s\s+(?:conversations?|sessions?|chats?)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def is_today_scope_query(query: str) -> bool:
+    """「今日の会話全体」のように **日付で区切った** 会話を指しているか (純粋関数)。
+
+    「この会話」と同じアンカー集合に入れていたため、日付スコープが現在
+    セッションに縮められていた (2026-09-05 ライブ監査 F-12: 20 セッション
+    100 ターンの日に「今日のここまでの会話全体を、テーマごとに 1 行ずつで」
+    と頼み、現セッションの 4 ターンだけを 1 行で返した)。
+    """
+    return bool(query) and bool(_TODAY_SCOPE_RE.search(query))
+
+
+#: 「一般論としてどうすべきか」を尋ねる語形。環境の事実 (今の値) を **確認して**
+#: ほしいのではなく、やり方・置き場所・是非を聞いている。
+_PRACTICE_ADVICE_RE = re.compile(
+    r"どこに(?:置|保管|保存|入れ)|どう(?:管理|保管|扱|運用)|"
+    r"(?:で|は|が)?(?:十分|安全|妥当|適切|問題ない|大丈夫)(?:です|でしょう)?か|"
+    r"べき(?:です|でしょう)?か|べきか|方が(?:いい|良い|よい)|"
+    r"おすすめ|お勧め|推奨|ベストプラクティス|best\s*practice|一般的に|通常は|"
+    r"\bshould\b|\bis it (?:safe|enough|ok|okay)\b|\bwhere (?:should|to) (?:put|store|keep)\b",
+    re.IGNORECASE,
+)
+
+
+def is_practice_advice_query(query: str) -> bool:
+    """やり方・置き場所・是非を尋ねる **一般論の問い** か (純粋関数)。
+
+    executable query の語彙 (「環境変数」「OS」…) は一般論の問いにも当たる。
+    実インシデント (2026-09-05 ライブ監査 F-16): 「API キーを社内スクリプトから
+    使う場合、どこに置くのが現実的に安全ですか。環境変数で十分ですか。」に
+    ``環境変数`` が当たり、ホストの環境変数 30 件がダンプされてプロンプトと
+    debug JSONL に平文で載った。「今の値を見せて」ではなく「どうすべきか」を
+    聞いている文は、環境の事実問い合わせから外す。
+    """
+    if not query:
+        return False
+    return bool(_PRACTICE_ADVICE_RE.search(query))
+
+
 def is_plain_statement(query: str) -> bool:
     """問い・依頼のマーカーが無く、平叙の文末で終わる **自己申告** か (純粋関数)。
 
@@ -2126,6 +2224,16 @@ ENCODING_CONVERSION_TERMS_EN = (
 #: 日本語 (「計算して」は空白を挟まない) で **一度も一致しなかった**。
 #: ``_infer_tool`` 側 (``\s`` 無し) と揃え、ASCII 側だけ境界を付ける。
 CALCULATE_TERM = r"計算|" + ascii_boundary("calculate")
+
+#: 層の振り分け (meta_cognitive 行き) 用の「計算」。「計算過程も示して」
+#: 「計算方法は」「計算式を教えて」は **やり方の説明** を求めており、ツールで
+#: 数値を出してほしい依頼ではない。bare「計算」でタスク計画層へ振ると、無関係な
+#: ``list_directory`` が走ってリポジトリ一覧がコンテキストに載る
+#: (2026-09-05 ライブ監査 F-08: A/B テストの p 値の質問)。
+CALCULATE_TOOL_TERM = (
+    r"計算(?!過程|方法|式|の仕方|手順|根拠|量|機|論|科学|資源|環境|ミス|違い|間違)|"
+    + ascii_boundary("calculate")
+)
 
 
 def _compile_groups(groups) -> list[re.Pattern]:

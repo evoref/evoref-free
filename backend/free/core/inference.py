@@ -12,6 +12,7 @@ from backend.free.api.chat.chat_constants import (
 )
 from backend.free.api.chat.chat_types import ChatMessage
 from backend.free.core.intent_vocab import (
+    asks_user_profile_summary,
     is_plain_statement,
     refers_to_previous_output,
 )
@@ -510,6 +511,15 @@ def _drop_restated_slots(
     EvorefMem の辞書を直接引かないため)。``None`` なら何もしない。
     """
     if slot_resolver is None or not history:
+        return semmem_block, rag_chunks, rag_scored_chunks, fewshot_block
+    # 「私に関する事実を (訂正後の内容で) 箇条書きに」は、述べ直したスロットの
+    # 値こそを列挙してほしい依頼。抑止すると答えの行が消える (2026-09-05 F-05)。
+    # 注入側 (``MemoryInjector``) の免除と対で、ここでも落とさない。
+    latest = history[-1]
+    if (
+        str(latest.get("role") or "") == "user"
+        and asks_user_profile_summary(str(latest.get("content") or ""))
+    ):
         return semmem_block, rag_chunks, rag_scored_chunks, fewshot_block
 
     restated: set[tuple[str, str]] = set()

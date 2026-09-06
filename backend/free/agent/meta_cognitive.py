@@ -155,7 +155,7 @@ class MetaCognitiveAgent(
         # process() でも同値を再設定する (呼出側が同じ req.mode を渡す契約)。
         self._mode = mode
         # ツールループ system 用のツール説明文 (mode 別)。process() 毎にリセット。
-        self._tool_descriptions_cache: dict[str, str] = {}
+        self._tool_descriptions_cache: dict[tuple[str, frozenset[str]], str] = {}
         self.compactor = StepCompactor(cfg, policy=policy)
         self.reminder_system = EventReminderSystem(cfg)
         self._tool_judge = tool_judge
@@ -1232,6 +1232,11 @@ class MetaCognitiveAgent(
                 reason = MetaCognitiveAgent._write_failure_reason(task.result or "")
                 parts.append(f"    (書き込みが実行されませんでした{reason})")
             elif task.result:
-                parts.append(f"    {task.result[:500]}")
+                # 本文はここから取り出される (chat_stream_meta._meta_cognitive_body_text)。
+                # 500 文字で切ると回答が計算の途中で終わり、finish_reason=length では
+                # ないので切断の開示も出ない (2026-09-05 ライブ監査 F-09: p 値の
+                # 導出が「= √[ 0.04645 × 0.9」で終わった)。UI の step 見出し側の
+                # 切り詰めは chat_stream_meta に残す。
+                parts.append(f"    {task.result}")
 
         return "\n".join(parts)

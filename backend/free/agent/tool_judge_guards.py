@@ -30,7 +30,10 @@ from backend.free.agent.tool_judge_dialogue import (
     _dialogue_text,
     _recent_dialogue_text,
 )
-from backend.free.agent.tool_judge_grounding import _ungrounded_numbers
+from backend.free.agent.tool_judge_grounding import (
+    _ungrounded_numbers,
+    expression_sanity_issues,
+)
 from backend.free.agent.tool_judge_history import (
     _has_history_recall_keywords,
     _only_proximal_recall_keywords,
@@ -698,6 +701,32 @@ def _suppress_ungrounded_calculate(
     )
     return replace(result, unexplained_numbers=unexplained)
 
+def _flag_suspicious_calculate(
+    result: ToolJudgement, ctx: GuardContext,
+) -> ToolJudgement:
+    """式の組み方が対話の表記と食い違う ``calculate`` に、疑いを **印付け** する.
+
+    接地 (数値の出所) が全て通っていても、年率を 12 倍するような **式の構造の
+    誤り** はツールの結果を「正しく計算された嘘」にする (2026-09-05 ライブ監査
+    F-03)。決定論で拾える食い違い (``expression_sanity_issues``) を
+    ``expression_issues`` に載せ、回答側で検算と開示を求める。格下げしないのは
+    ``_suppress_ungrounded_calculate`` と同じ理由 (落ち先が暗算になる)。
+    """
+    if not result.tool_needed or result.tool_name != "calculate":
+        return result
+    expression = str((result.tool_args or {}).get("expression") or "")
+    if not expression:
+        return result
+    issues = expression_sanity_issues(expression, ctx.query, ctx.dialogue_text)
+    if not issues:
+        return result
+    logger.info(
+        "Keeping calculate with suspicious expression %r: %s",
+        expression[:80], "; ".join(issues),
+    )
+    return replace(result, expression_issues=issues)
+
+
 def _suppress_ungrounded_read_path(
     result: ToolJudgement, ctx: GuardContext,
 ) -> ToolJudgement:
@@ -807,6 +836,7 @@ GUARD_PIPELINE: tuple[GuardSpec, ...] = (
     ),
     GuardSpec("truncated_text_operand", _restore_truncated_text_operand, _aux_only),
     GuardSpec("ungrounded_calculate", _suppress_ungrounded_calculate, _aux_only),
+    GuardSpec("suspicious_calculate", _flag_suspicious_calculate),
     GuardSpec("ungrounded_read_path", _suppress_ungrounded_read_path, _aux_only),
     GuardSpec(
         "hidden_tool_from_aux",

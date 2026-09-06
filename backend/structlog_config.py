@@ -117,13 +117,40 @@ _API_KEY_PREFIX_RE = re.compile(
 )
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
 
+# 「秘密らしい名前 = 値」の代入形 (環境変数ダンプ / .env / シェル出力)。
+# ``HF_TOKEN=hf_…`` / ``CLAUDE_CODE_MESSAGING_TOKEN = 83e7…`` / ``DB_PASSWORD: x``
+# のように、値がどのプロバイダ接頭辞にも当たらない 32 桁 hex 等でも名前から
+# 秘密と判る。実インシデント 2026-09-05 ライブ監査 F-16: ``*_TOKEN = <hex>``
+# 形式が ``observation`` / ``messages_full[].content`` の自由文に載り、
+# 接頭辞ベースの検出を全て素通りした。
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSW(?:OR)?D|PASSPHRASE|API_?KEY|ACCESS_?KEY"
+    r"|PRIVATE_?KEY|CREDENTIAL|NONCE|CLIENT_SECRET)[A-Z0-9_]*)"
+    # 値は 8 文字以上で英字を含むもの (``token_count = 12345678`` のような数値は除外)
+    r"(\s*[=:]\s*)((?=[^\s,;'\"]*[A-Za-z])[^\s,;'\"]{8,})"
+)
+# プロバイダ固有の接頭辞 (Hugging Face / Slack / Google API / Stripe live) と
+# URL 埋め込みの認証情報 (``postgres://user:pass@host``)。
+_SECRET_TOKEN_RE = re.compile(
+    r"\b("
+    r"hf_[A-Za-z0-9]{20,}"
+    r"|xox[abprs]-[A-Za-z0-9\-]{10,}"
+    r"|AIza[0-9A-Za-z_\-]{35}"
+    r"|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"
+    r")\b"
+)
+_URL_CREDENTIAL_RE = re.compile(r"(\b[a-z][a-z0-9+.\-]*://[^\s/:@]+:)([^\s/@]+)(@)")
+
 _REDACTED = "[REDACTED]"
 
 
 def _redact_string(value: str) -> str:
-    """文字列内の Bearer トークン / API キー / メールアドレスを置換する。"""
+    """文字列内の Bearer トークン / API キー / メールアドレス / 秘密の代入を置換する。"""
     redacted = _BEARER_RE.sub(f"Bearer {_REDACTED}", value)
     redacted = _API_KEY_PREFIX_RE.sub(_REDACTED, redacted)
+    redacted = _SECRET_TOKEN_RE.sub(_REDACTED, redacted)
+    redacted = _URL_CREDENTIAL_RE.sub(rf"\g<1>{_REDACTED}\g<3>", redacted)
+    redacted = _SECRET_ASSIGNMENT_RE.sub(rf"\g<1>\g<2>{_REDACTED}", redacted)
     redacted = _EMAIL_RE.sub(_REDACTED, redacted)
     return redacted
 

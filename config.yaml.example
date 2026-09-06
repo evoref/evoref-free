@@ -914,6 +914,7 @@ learning:
   level2_stale_streak: 2          # 連続でこの回数だけ改善を採用できなければ延長クールダウンへ
   level2_stale_backoff_hours: 72.0  # 延長クールダウン時間（探索が空振りし続ける局面の天井）
   level2_min_improvement_ratio: 0.001  # 採用に必要な最小改善幅（baseline 比。0.1%未満は過適合として棄却）
+  level2_min_improvement_sigma: 1.0  # 反復間 loss の標準偏差 × この値も改善幅の下限に重ねる (0 で無効)
   level2_early_stop_patience: 10  # SPSA の best がこの反復数だけ停滞したら打ち切り（0 で無効、実 eval 経路のみ）
   level2_bootstrap_enabled: false # 初回 full-train（初期 LoRA 生成）。実 llama-server ロード検証後に true 推奨
   level2_bootstrap_rank: 8        # bootstrap LoRA の rank

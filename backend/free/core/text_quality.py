@@ -1142,7 +1142,141 @@ def retracts_own_conclusion(text: str) -> bool:
     """応答が自分の結論を途中で撤回しているか (純粋関数)。"""
     if _SELF_RETRACTION_RE.search(text or ""):
         return True
-    return degenerate_correction(text) is not None
+    if degenerate_correction(text) is not None:
+        return True
+    return denies_own_enumeration(text) is not None
+
+
+#: 「X は以下の通りです」で列挙を始めた見出し語 X。
+_ENUMERATION_HEAD_RE = re.compile(
+    r"(?P<head>[^。．\n、,]{2,24}?)(?:は|が)?(?:以下|次)の(?:通り|とおり)(?:です|になります)?[。：:]",
+)
+#: 列挙の項目行。
+_ENUMERATION_ITEM_RE = re.compile(r"^\s*(?:[-・*•]|\d+[.)]|[①-⑳])\s*\S", re.MULTILINE)
+#: 同じ見出し語の **存在否定**。
+_EXISTENCE_DENIAL_TAIL = (
+    r"[^。．\n]{0,16}?(?:は|も)?(?:存在しません|存在しない|ありません|ございません"
+    r"|該当(?:は|が)?(?:ありません|ない)|ない(?:です|と(?:判断|考え)))"
+)
+
+
+def denies_own_enumeration(text: str) -> str | None:
+    """「X は以下の通り」と列挙してから「X は存在しない」と否定する矛盾 (純粋関数)。
+
+    謝罪語も「正しくは」も数値も無いので ``_SELF_RETRACTION_RE`` と
+    ``degenerate_correction`` は素通りする。実インシデント (2026-09-05 ライブ
+    監査 F-14): 「推測で補った部分は以下の通りです。- 居住地… - 学年…
+    これらは推測ではなく事実として扱っています。したがって、推測で補った
+    事実は存在しません。」— 列挙の見出し語「推測で補った」を末尾で否定した。
+
+    構造だけで決まる: 見出し語 → 1 行以上の項目 → 同じ見出し語の存在否定。
+
+    Returns:
+        否定された見出し語。該当しなければ ``None``。
+    """
+    body = text or ""
+    for m in _ENUMERATION_HEAD_RE.finditer(body):
+        head = m.group("head").strip("　 ")
+        if len(head) < 2:
+            continue
+        rest = body[m.end():]
+        if not _ENUMERATION_ITEM_RE.search(rest):
+            continue
+        # 見出し語のうち意味を担う末尾 (「推測で補った部分」→「推測で補った」を
+        # 含む語) で否定文を探す。名詞末尾 (部分 / 箇所 / 点 / 項目) は落ちて
+        # よい。
+        core = re.sub(r"(?:部分|箇所|点|項目|内容|事項|もの|こと)$", "", head) or head
+        denial = re.compile(re.escape(core) + _EXISTENCE_DENIAL_TAIL)
+        if denial.search(rest):
+            return head
+    return None
+
+
+#: プロンプトへ注入した calculate の結果 (``deliberative`` の
+#: ``## ツール実行結果`` ブロック)。式と結果は ``<expr> = <value>`` か値だけ。
+_CALCULATE_BLOCK_RE = re.compile(
+    r"## ツール実行結果\s*\n(?:ツール|Tool):\s*calculate\s*\n(?:結果|Result):\s*\n(?P<body>.*?)(?:\n\s*\n|$)",
+    re.DOTALL,
+)
+_CALC_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+
+
+def extract_calculate_result(prompt_text: str) -> float | None:
+    """注入済みの calculate 結果ブロックから数値を取り出す (純粋関数)。
+
+    ブロックが無い / 結果が数値でない (エラー文) なら ``None``。
+    """
+    m = _CALCULATE_BLOCK_RE.search(prompt_text or "")
+    if not m:
+        return None
+    body = m.group("body").strip()
+    if not body or body.startswith("Error"):
+        return None
+    # ``expr = value`` なら右辺、値だけならそれ。
+    tail = body.rsplit("=", 1)[-1].strip()
+    nums = _CALC_NUMBER_RE.findall(tail)
+    if not nums:
+        return None
+    try:
+        return float(nums[-1])
+    except ValueError:
+        return None
+
+
+#: 応答本文の数値 (桁区切り / 万進 / 全角)。
+_RESPONSE_NUMBER_RE = re.compile(
+    r"(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?P<unit>兆|億|千万|百万|万|千)?",
+)
+_MYRIAD_SCALE = {"兆": 1e12, "億": 1e8, "千万": 1e7, "百万": 1e6, "万": 1e4, "千": 1e3}
+#: 単位換算で正当に現れうる倍率 (分↔時↔日、%、万単位)。増やすほど偶然の
+#: 一致で見逃す (月割 1/12 を入れると T03 の「約140万円」が結果/12 に 2.9% で
+#: 当たり、誤答が成功のままになった)。
+_RESULT_SCALES = (1.0, 60.0, 1 / 60.0, 24.0, 1 / 24.0, 100.0, 0.01, 1e4, 1e-4)
+
+
+def _response_numbers(text: str) -> list[float]:
+    out: list[float] = []
+    for m in _RESPONSE_NUMBER_RE.finditer(
+        (text or "").translate(str.maketrans("０１２３４５６７８９．，", "0123456789.,")),
+    ):
+        try:
+            value = float(m.group("num").replace(",", ""))
+        except ValueError:
+            continue
+        unit = m.group("unit")
+        if unit:
+            value *= _MYRIAD_SCALE[unit]
+        out.append(value)
+    return out
+
+
+def ignores_calculate_result(response: str, result: float | None) -> str | None:
+    """calculate の結果を回答が 1 つも使っていないか (純粋関数)。
+
+    ツールは「確かめた事実」として最優先で渡されるのに、モデルが暗算で
+    別の数を述べたターンが ``tool_success=true`` / ``reward=1.0`` の成功経験に
+    なっていた (2026-09-05 ライブ監査 F-03: 結果 17,305,634 に対し本文は
+    4,480 万 / 627 万 / 140 万で、しかも手数料を 10 倍に誤って結論の符号が
+    反転)。本文の数値のどれも、結果 (単位換算の倍率と丸めを許して 5%) に
+    一致しなければ「使っていない」。本文に数値が無いターンは判定しない
+    (使ったかどうかを数で確かめられない)。
+
+    Returns:
+        失敗理由。使っている / 判定不能なら ``None``。
+    """
+    if result is None or result != result:
+        return None
+    numbers = _response_numbers(response)
+    if not numbers:
+        return None
+    magnitude = abs(result)
+    for value in numbers:
+        for scale in _RESULT_SCALES:
+            expected = result * scale
+            tolerance = max(abs(expected) * 0.05, 0.5 if magnitude >= 1 else 0.005)
+            if abs(value - expected) <= tolerance:
+                return None
+    return f"calculate result {result:g} does not appear in the answer"
 
 
 def degenerate_correction(text: str) -> str | None:

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ast
+import os
 import re
 import shlex
+from collections.abc import Mapping
 from pathlib import Path
 
 # バッククォートで囲まれた区間。ユーザーは「コマンド `dir E:\tmp\x` を実行して」の
@@ -164,6 +166,32 @@ def _reject_unsafe_python_payload(payload: str) -> str | None:
                     if isinstance(sub, (ast.Attribute, ast.Subscript)):
                         return "attribute/subscript assignment not allowed in readonly mode"
     return None
+
+
+# --- run_command_readonly の子プロセスへ渡す環境変数の秘匿 -------------------
+#
+# readonly ガードは「副作用が無いこと」(integrity) だけを検証する allow-list で、
+# **読み出しによる漏洩** (confidentiality) は守備範囲外だった。子プロセスは
+# backend の環境をそのまま継承するため、``import os; os.environ`` の 1 行で
+# ホストのトークンが LLM プロンプトと debug JSONL に平文で載る
+# (実インシデント 2026-09-05 ライブ監査 F-16: 「API キーはどこに置くのが安全か」
+# という一般論の質問で ``環境変数`` 語が executable query を撃ち、
+# ``*_TOKEN`` 30 件がダンプされて ``requests_*.jsonl`` に永続化された)。
+# 名前が秘密らしい変数は子プロセスへ渡さない。PATH / SystemRoot 等の動作に
+# 必要な変数はそのまま。
+_SECRET_ENV_NAME_RE = re.compile(
+    r"(?i)(?:TOKEN|SECRET|PASSW(?:OR)?D|PASSPHRASE|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY"
+    r"|CREDENTIAL|NONCE|_AUTH|AUTH_|COOKIE|SESSION|CLIENT_ID|CLIENT_SECRET|_KEY$)",
+)
+
+
+def scrubbed_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """秘密らしい名前の環境変数を落とした複製を返す (純粋関数)。
+
+    ``run_command_readonly`` の子プロセス用。``environ`` 省略時は ``os.environ``。
+    """
+    source = os.environ if environ is None else environ
+    return {k: v for k, v in source.items() if not _SECRET_ENV_NAME_RE.search(k)}
 
 
 def reject_readonly_violation(command: str) -> str | None:
