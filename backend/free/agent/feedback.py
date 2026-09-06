@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import re
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -27,7 +27,14 @@ from backend.free.core.locale_patterns import (
     matches_either,
 )
 from backend.free.core.session_mode import is_create_mode
-from backend.free.core.response_arithmetic import find_arithmetic_contradictions
+from backend.free.core.correction_target import (
+    DEFAULT_LOOKBACK as CORRECTION_LOOKBACK,
+    resolve_correction_target,
+)
+from backend.free.core.response_arithmetic import (
+    find_arithmetic_contradictions,
+    find_conclusion_contradiction,
+)
 from backend.free.core.verifier_events import record_turn_outcome, record_verifier_hit
 from backend.free.agent.issue_ledger import record_current_issue
 from backend.free.core.text_quality import (
@@ -277,12 +284,19 @@ _RECALL_QUESTION_RE = re.compile(
 #: 伴わないので影響を受けない。「〜の違いを教えて」は ``違い`` の後に
 #: ``ます/ません/まし`` が続かないため、そもそも先頭パターンに一致しない。
 #: アシスタント出力への言及 (``_ASSISTANT_OUTPUT_REF_RE``) は本関数の先頭で
-#: ``assistant`` を返すため、この除外より先に確定する。丁寧形の「どう違います
-#: か」はその ``違います`` に先に一致するのでここには到達しない — 判別できない
-#: ものは ``assistant`` に倒すという本モジュールの方針どおり、順序は変えない。
+#: ``assistant`` を返すため、この除外より先に確定する。
+#:
+#: **丁寧形・テ形も同じ扱いにする (2026-09-06、F-07)**。以前は ``違う`` の
+#: 終止形だけを見ており、「BBR は損失ベースの輻輳制御と何が根本的に
+#: **違いますか**。」という純粋な比較質問が訂正として記録されていた
+#: (実機検証で再現)。字句側の ``違います`` に先に一致するので帰属判定へ来る
+#: のは想定どおりで、来た上で **代用形を伴う比較質問だと判別できる**。
+#: 判別できないものを ``assistant`` に倒す方針は変えないが、判別できる形を
+#: 倒し続ける理由は無い — 訂正は Level 1 の欠陥として数えられ、
+#: ``corrected_entry_id`` 経由で正答ターンを「誤り」として訂正ペアに載せる。
 _ASKS_ABOUT_DIFFERENCE_RE = re.compile(
     r"(?:どう|どの(?:よう|ように)|どこ(?:が|に)|何(?:が|は)|なに(?:が|は))"
-    r"[^。！？\n]{0,12}?違う",
+    r"[^。！？\n]{0,12}?違(?:う|い(?:ます|ました)|って)",
 )
 
 #: 出力形式・言語の変更依頼。内容の誤りを指していない。
@@ -313,13 +327,35 @@ _SELF_CORRECTION_RE = re.compile(
 )
 
 #: アシスタントの出力を指す参照。これがあれば自己訂正ではない。
+#:
+#: **裸の「違います」「誤りです」は入れない (2026-09-06、F-07)**。これらは
+#: 「何かが誤っている」という断定であって *アシスタントの出力を指す参照* では
+#: なく、名前と役割に反する。本パターンは ``classify_correction_target`` の
+#: 最優先で ``assistant`` を返すため、ここに字句を置くと **後段の除外規則が
+#: 一切到達しなくなる**。実機検証で「BBR は損失ベースの輻輳制御と何が根本的に
+#: 違いますか。」という純粋な比較質問が訂正として記録され、`corrected_entry_id`
+#: 経由で正答ターンを「誤り」として訂正ペアに載せかけた。
+#:
+#: 外しても本物の指摘は落ちない — 「計算が違います。」「それは違います。」は
+#: どの除外規則にも当たらず、末尾の既定で ``assistant`` に落ちる。
+#: 裸の字句を外した分、**参照そのもの** を明示的に持つ。二人称の所有格・
+#: 連体修飾 (「あなたの回答」「あなたが示した実装」) と「先ほどの回答」型は、
+#: アシスタントの出力を指す最も直接的な表現でありながら、以前は 1 つも
+#: 入っていなかった (「違います」が代用として機能していたため気付けない)。
 _ASSISTANT_OUTPUT_REF_RE = re.compile(
     r"その(?:計算|答え|回答|結果|数字|値)"
+    r"|あなた(?:の|が)"
+    r"|(?:先ほど|さきほど|さっき|上|今)の"
+    r"(?:回答|答え|説明|計算|コード|実装|出力|結果)"
     r"|(?:最後|最初)の.{0,6}(?:行|文|項目).{0,10}(?:なって|です)"
-    r"|取り違え|間違っていませんか|違います|誤りです"
+    r"|取り違え|間違っていませんか"
     r"|のはずです|ではありませんか|ませんでしたか"
     r"|(?:計算|回答|答え)しましたよね",
 )
+
+
+#: 正しい値を **述べている** 印。振り返りの問いと本物の訂正を分ける。
+_ASSERTS_CORRECT_VALUE_RE = re.compile(r"正しくは|ではなく|じゃなく|が正しい")
 
 
 def classify_correction_target(query: str) -> str:
@@ -328,14 +364,19 @@ def classify_correction_target(query: str) -> str:
     純粋関数。``assistant`` のみが「直前のアシスタント応答が誤っていた」を
     意味する。判別できないものは ``assistant`` に倒す (現行挙動を維持)。
     """
-    # アシスタント出力への言及が最優先。「すみません、その計算は違います」の
-    # ように謝罪語と併存しうるため、自己訂正判定より先に見る。
+    # 「過去の誤りを **尋ねる**」形は、誰の出力を指していようと訂正ではない。
+    # 出力参照より先に見る — 「私があなたの回答を訂正させたのは何回で…」は
+    # アシスタント出力への言及を含むが、振り返りの問いであって指摘ではない。
+    # ただし正しい値を併せて述べている場合は本物の訂正なので除外しない
+    # (「あなたの回答は間違いです。正しくは 2027-01-06 です」)。
+    if _ASKS_ABOUT_CORRECTION_RE.search(query) and not _ASSERTS_CORRECT_VALUE_RE.search(query):
+        return "not_correction"
+    # アシスタント出力への言及。「すみません、その計算は違います」のように
+    # 謝罪語と併存しうるため、自己訂正判定より先に見る。
     if _ASSISTANT_OUTPUT_REF_RE.search(query):
         return "assistant"
     if _SELF_CORRECTION_RE.search(query):
         return "self"
-    if _ASKS_ABOUT_CORRECTION_RE.search(query):
-        return "not_correction"
     if _RECALL_QUESTION_RE.search(query):
         return "not_correction"
     if _ASKS_ABOUT_DIFFERENCE_RE.search(query):
@@ -618,6 +659,12 @@ def is_short_negative_feedback(query: str) -> bool:
 #: 高々数本なので tool_ledger と同じ 16 で足りる。
 _SESSION_STATE_CAP = 16
 
+#: セッションごとに覚えておく直近ターン数 (訂正の宛先解決の探索窓)。
+#: ``core.correction_target.DEFAULT_LOOKBACK`` と揃える — 窓の方が狭いと
+#: 解決側が遡れる範囲を実質的にここが決めてしまい、両方を読まないと挙動が
+#: 分からなくなる。
+_RECENT_TURN_WINDOW = CORRECTION_LOOKBACK
+
 
 @dataclass
 class _SessionTurnState:
@@ -635,12 +682,18 @@ class _SessionTurnState:
     prev_turn_failed: bool = False
     pending_correction: dict | None = None
     prev_response: str = ""
+    #: このセッションの直近ターン ``(entry_id, response_text)`` を古い順に持つ。
+    #: 訂正が **どのターンを指すか** を証拠 (本文の重なり) で決めるのに要る。
+    #: ``prev_entry`` 1 件だけでは「直前ターンを訂正している」以外を表現できず、
+    #: 数ターン前への訂正が必ず取り違えられる (2026-09-06 監査 F-01)。
+    recent_turns: list[tuple[str, str]] = field(default_factory=list)
 
 
 #: 失敗理由の接頭辞 → (検証器 id, 台帳の種別)。理由文字列は
 #: ``_derive_turn_outcome_with_reason`` が組む。
 _OUTCOME_REASON_CHANNELS: tuple[tuple[str, str, str], ...] = (
     ("arithmetic contradiction", "content.arithmetic", "content_contradiction"),
+    ("conclusion contradiction", "content.conclusion", "content_contradiction"),
     ("broken JA spacing", "content.broken_text", "output_broken"),
     ("Chinese token leaked", "content.broken_text", "output_broken"),
     ("response retracts", "content.self_retraction", "content_contradiction"),
@@ -703,6 +756,9 @@ class FeedbackCollector:
         self._pending_correction: dict | None = None
         # 直前ターンのアシスタント応答 (保留判定の材料)。
         self._prev_response: str = ""
+        # このセッションの直近ターン ``(entry_id, response_text)`` (古い順)。
+        # 訂正が指すターンを本文の重なりで同定するのに使う。
+        self._recent_turns: list[tuple[str, str]] = []
         # 上記 ``_prev_*`` / ``_pending_correction`` は「いま record 中の
         # セッション」の作業コピー。record() の入口でセッションの状態を載せ、
         # 出口で書き戻す (``_load_session_state`` / ``_store_session_state``)。
@@ -864,10 +920,18 @@ class FeedbackCollector:
         rephrased = (
             correction_text is None and self._detect_rephrase(query)
         )
+        # 訂正が **どのターンを指すか** をここで確定する。記録時点でしか
+        # セッションと直近ターンの本文が揃わないため、後段に再導出させると
+        # 位置頼みになり別会話のターンと組まれる (F-01 の再発防止)。
+        corrected_entry_id = (
+            resolve_correction_target(correction_text, self._recent_turns)
+            if correction_text is not None else None
+        ) or None
 
         signals = FeedbackSignals(
             turn_outcome=turn_outcome,
             rephrased_query=rephrased,
+            corrected_entry_id=corrected_entry_id,
             rag_used=rag_used,
             rag_source=rag_source,
             rag_top1_score=rag_top1_score,
@@ -971,6 +1035,14 @@ class FeedbackCollector:
         self._prev_query = query
         self._prev_response = response or ""
         self._prev_entry = entry
+        # 訂正の宛先解決に使う窓。応答本文は response_full (文境界で切った
+        # 全文) を優先する — 200 字の要約だと、後半でしか触れていない値を
+        # 引用した訂正が対象ターンに結び付かない。
+        self._recent_turns.append(
+            (entry.id, entry.response_full or entry.response_summary or ""),
+        )
+        if len(self._recent_turns) > _RECENT_TURN_WINDOW:
+            del self._recent_turns[:-_RECENT_TURN_WINDOW]
         self._prev_routed_tool = current_routed_tool
         self._prev_used_long_form = long_form_used
         self._prev_turn_failed = turn_outcome == "failed"
@@ -1010,6 +1082,10 @@ class FeedbackCollector:
             return
         for entry in self._session_entries:
             entry.signals.conversation_ended = True
+        # entry 群を書き換えたので永続化する。record 経由の自動保存が
+        # 掛からない唯一の変更点 (次の record まで待つと会話終了フラグが
+        # 落ちる)。
+        self.buffer.flush()
         self._session_entries.clear()
         self._prev_query = None
         self._prev_entry = None
@@ -1018,6 +1094,7 @@ class FeedbackCollector:
         self._prev_turn_failed = False
         self._pending_correction = None
         self._prev_response = ""
+        self._recent_turns = []
         self._sessions.clear()
 
     # ── セッション別の直前ターン状態 ──
@@ -1036,6 +1113,7 @@ class FeedbackCollector:
         self._prev_turn_failed = state.prev_turn_failed
         self._pending_correction = state.pending_correction
         self._prev_response = state.prev_response
+        self._recent_turns = list(state.recent_turns)
 
     def _store_session_state(self, session_id: str) -> None:
         """作業コピーを ``session_id`` の枠へ書き戻す (LRU 上限 16)。"""
@@ -1047,6 +1125,7 @@ class FeedbackCollector:
             prev_turn_failed=self._prev_turn_failed,
             pending_correction=self._pending_correction,
             prev_response=self._prev_response,
+            recent_turns=list(self._recent_turns),
         )
         self._sessions.move_to_end(session_id)
         while len(self._sessions) > _SESSION_STATE_CAP:
@@ -1184,6 +1263,12 @@ class FeedbackCollector:
         contradictions = find_arithmetic_contradictions(text)
         if contradictions:
             return f"arithmetic contradiction: {contradictions[0]}"
+        # 式ごとには正しいのに **冒頭の結論だけ** が本文の計算と別の数、という
+        # 形は上の判定では捕まらない。読み手が最初に受け取る値なので実害は
+        # 大きい (2026-09-06 監査 F-03)。
+        conclusion = find_conclusion_contradiction(text)
+        if conclusion is not None:
+            return f"conclusion contradiction: {conclusion}"
         if has_broken_ja_spacing(text):
             return "broken JA spacing"
         if has_chinese_token_leak(text):

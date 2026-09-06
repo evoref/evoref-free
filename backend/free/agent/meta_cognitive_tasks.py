@@ -88,12 +88,24 @@ def task_expects_write(description: str) -> bool:
 
 def determine_task_status(
     task: TaskItem, result: str, tool_calls: list[dict],
+    *, destination_known: bool = True,
 ) -> str:
-    """タスク実行結果からステータスを決定する"""
+    """タスク実行結果からステータスを決定する。
+
+    ``destination_known`` が False (書込み先がタスク文にも会話にも無い) のとき
+    「書込みが期待されたのに実行されていない」判定を **行わない**。書込み先が
+    無いタスクは write_file を撃ちようがなく、この判定を掛けると **原理的に
+    達成不可能なタスク** になる。実インシデント (2026-09-06 監査 F-02) では
+    パス指定の無い依頼が毎回この分岐で failed になり、生成済みの成果物 3 本を
+    捨てて「(書き込みが実行されませんでした)」だけを返していた (26.6 分)。
+
+    書込み先の有無は呼出側が解決する — タスク文だけでは「同じファイルに」型の
+    参照解決ができず、ここで判定すると会話から解決できるケースまで落とす。
+    """
     if is_tool_error(result) or "Step limit reached" in result:
         return "failed"
 
-    if task_expects_write(task.description) and not any(
+    if destination_known and task_expects_write(task.description) and not any(
         tc.get("tool") == "write_file" and tc.get("success")
         for tc in tool_calls
     ):

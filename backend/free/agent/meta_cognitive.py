@@ -742,7 +742,10 @@ class MetaCognitiveAgent(
                     generation_params=generation_params,
                 )
                 task.result = result
-                task.status = determine_task_status(task, result, tool_calls)
+                task.status = determine_task_status(
+                    task, result, tool_calls,
+                    destination_known=self._task_destination_known(task),
+                )
 
             all_tool_calls.extend(tool_calls)
             context_parts.append(f"[{task.description}]: {result[:200]}")
@@ -980,7 +983,10 @@ class MetaCognitiveAgent(
                 generation_params=generation_params,
             )
             task.result = result
-            task.status = determine_task_status(task, result, tool_calls)
+            task.status = determine_task_status(
+                task, result, tool_calls,
+                destination_known=self._task_destination_known(task),
+            )
             all_tool_calls.extend(tool_calls)
             steps += 1
 
@@ -992,6 +998,18 @@ class MetaCognitiveAgent(
                 })
 
         return steps
+
+    def _task_destination_known(self, task: TaskItem) -> bool:
+        """このタスクの書込み先が (タスク文 or 会話から) 決まるか。
+
+        ``determine_task_status`` の「書込み未実行 → failed」判定を、
+        **書けるはずのタスク** にだけ掛けるための述語。
+        """
+        from backend.free.agent.tool_judge_args import extract_write_target_path
+
+        if extract_write_target_path(task.description):
+            return True
+        return bool(self._referential_write_path(None))
 
     def _referential_write_path(self, query_path: str | None = None) -> str:
         """書込み先を直近会話から解決する (解決できなければ空文字列)。
@@ -1231,6 +1249,18 @@ class MetaCognitiveAgent(
                 # _WRITE_REJECTION_REASON_JA のコメント参照)。
                 reason = MetaCognitiveAgent._write_failure_reason(task.result or "")
                 parts.append(f"    (書き込みが実行されませんでした{reason})")
+                # ここで ``task.result`` を出してはいけない。中身は
+                # 「このタスクが生成した成果物」とは限らず、ハイジャックされた
+                # 別ツールの出力 (fetch_url の webpage 抽出等) でありうる —
+                # 本文かどうかをテキストから見分ける手段は無い
+                # (test_unknown_failure_keeps_the_bare_message)。
+                #
+                # 2026-09-06 監査 F-02 の「生成済みの成果物が捨てられる」形は、
+                # **ここではなく上流** で断つ: 書込み先が特定できない依頼は
+                # ``output_target`` の段階で ``chat`` / ``editor`` へ振られ
+                # (chat.py の ``indicates_write_destination``)、
+                # ``_execute_editor_task`` が本文として返す。書込み先が
+                # 分かっているのに書けなかったターンだけがここへ来る。
             elif task.result:
                 # 本文はここから取り出される (chat_stream_meta._meta_cognitive_body_text)。
                 # 500 文字で切ると回答が計算の途中で終わり、finish_reason=length では

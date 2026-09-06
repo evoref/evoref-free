@@ -632,6 +632,8 @@ def _load_experience_buffer(resolver: Any) -> tuple["ExperienceBuffer", Path]:
     # base 経験は (model×mode) partition 配下 (resolve_learning)。partition 無効時は
     # resolve_local 同等 (flat)。
     exp_file = resolver.resolve_learning("experience_file")
+    # 保存先は存在有無に依らず先に束ねる (record 時の自動保存が初回起動から効く)。
+    exp_buf.bind(exp_file)
     if exp_file.exists():
         try:
             exp_buf.load(exp_file)

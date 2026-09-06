@@ -47,7 +47,10 @@ from backend.free.core.text_quality import (
 )
 from backend.free.learning.fitness import defect_rate_fitness
 from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
-from backend.free.core.response_arithmetic import find_arithmetic_contradictions
+from backend.free.core.response_arithmetic import (
+    find_arithmetic_contradictions,
+    find_conclusion_contradiction,
+)
 from backend.free.llm.json_schemas import FewShotQualityJudgement
 from backend.free.memory.types import make_fact
 from backend.log_config import get_logger
@@ -454,6 +457,11 @@ def find_content_rejection(query: str, response: str) -> str | None:
     contradictions = find_arithmetic_contradictions(response)
     if contradictions:
         return f"arithmetic contradiction: {contradictions[0]}"
+    # 冒頭の結論と本文の計算結果の食い違い。ターン成否と同じ判定器を使う
+    # (片方だけ直る状態を作らない)。
+    conclusion = find_conclusion_contradiction(response)
+    if conclusion is not None:
+        return f"conclusion contradiction: {conclusion}"
     # 途中で結論を撤回した応答は、正しい結論に辿り着いていても手本にしない
     # (_SELF_RETRACTION_RE 参照)。
     if retracts_own_conclusion(response):
