@@ -26,6 +26,8 @@ __all__ = [
     "record_verifier_hit",
     "current_verifier_hits",
     "current_verifier_mode",
+    "record_turn_outcome",
+    "current_turn_outcome",
 ]
 
 #: 既知の検証器 id。規則台帳の ``verifier`` はこの集合の値を取る。
@@ -43,6 +45,17 @@ VERIFIER_IDS: frozenset[str] = frozenset({
     "constraint.banned", # 禁止語 / 禁止文字種の違反
     "constraint.form",   # 出力形式 (箇条書き等) の違反
     "user_correction",   # ユーザーが値を訂正した (陳腐値を答えた)
+    # 本文の決定論的な破綻 (FeedbackCollector._derive_turn_outcome)。これらが
+    # 無いと、成否の判定は経験 (turn_outcome) にしか残らず、outcome JSONL の
+    # verifier_hits は表面の検証器しか映さない (2026-09-05 ライブ監査 F-11:
+    # 100 ターン中 3 件しか失敗と記録されず、Level 2 が恒久的にデータ不足)。
+    "content.arithmetic",       # 本文の式の検算が合わない
+    "content.broken_text",      # 語間空白 / 中国語混入
+    "content.self_retraction",  # 1 つの応答に結論が 2 つ (撤回 / 列挙して否定)
+    "content.measured",         # 注入した実測値と別の数を述べた
+    "content.tool_result",      # calculate の結果を回答に使わなかった
+    "content.claimed_change",   # 撃てなかったのに完了を述べた
+    "content.user_echo",        # ユーザー発話のオウム返し
 })
 
 
@@ -50,6 +63,12 @@ VERIFIER_IDS: frozenset[str] = frozenset({
 class _Scope:
     mode: str = "chat"
     hits: list[str] = field(default_factory=list)
+    #: 経験記録が導出したターン成否 ("success" / "partial" / "failed") と理由。
+    #: 結末 JSONL の ``success`` が「SSE を届けられたか」だけを見て、中身の
+    #: 破綻を成功として記録していたのを、同じリクエスト内で持ち上げるための
+    #: 通路 (2026-09-05 ライブ監査 F-11)。
+    turn_outcome: str | None = None
+    turn_outcome_reason: str | None = None
 
 
 _scope: ContextVar[_Scope | None] = ContextVar("verifier_scope", default=None)
@@ -76,3 +95,20 @@ def current_verifier_hits() -> list[str]:
 def current_verifier_mode() -> str | None:
     scope = _scope.get()
     return scope.mode if scope else None
+
+
+def record_turn_outcome(outcome: str, reason: str | None = None) -> None:
+    """経験記録が導出したターン成否をこのリクエストの台帳へ置く。"""
+    scope = _scope.get()
+    if scope is None or not outcome:
+        return
+    scope.turn_outcome = outcome
+    scope.turn_outcome_reason = reason or None
+
+
+def current_turn_outcome() -> tuple[str | None, str | None]:
+    """``(outcome, reason)``。スコープが無いか未記録なら ``(None, None)``。"""
+    scope = _scope.get()
+    if scope is None:
+        return None, None
+    return scope.turn_outcome, scope.turn_outcome_reason

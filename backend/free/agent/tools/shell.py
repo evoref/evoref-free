@@ -30,6 +30,7 @@ async def run_command(
     config: dict | None = None,
     *,
     kill_on_timeout: bool = False,
+    scrub_secrets: bool = False,
 ) -> str:
     """シェルコマンドを非同期で実行する（危険コマンドガード + 対話的コマンドガード付き）
 
@@ -44,6 +45,10 @@ async def run_command(
     継続させる。``True`` (chat の ``run_command_readonly``) ではタイムアウト時に
     プロセスを kill する — 読み取り専用の環境問い合わせに居残るプロセスは
     無く、放置すると ``communicate()`` のワーカースレッドも一緒に残る。
+
+    ``scrub_secrets=True`` (chat の ``run_command_readonly``) では、名前が秘密
+    らしい環境変数 (``*_TOKEN`` / ``*_SECRET`` / ``*API_KEY`` 等) を子プロセスへ
+    渡さない (``safety_patterns.scrubbed_environment``)。
     """
     cfg = config or {}
     if cfg.get("agent", {}).get("dangerous_command_block", True):
@@ -67,8 +72,13 @@ async def run_command(
     if mkdir_match:
         return _mkdir_safe(mkdir_match.group(1).strip().strip('"').strip("'"))
 
+    env: dict[str, str] | None = None
+    if scrub_secrets:
+        from backend.free.agent.safety_patterns import scrubbed_environment
+
+        env = scrubbed_environment()
     return await _run_command_async_impl(
-        command, timeout, kill_on_timeout=kill_on_timeout,
+        command, timeout, kill_on_timeout=kill_on_timeout, env=env,
     )
 
 
@@ -114,6 +124,7 @@ def _decode_subprocess_output(raw: bytes) -> str:
 
 async def _run_command_async_impl(
     cmd: str, timeout: int = 30, *, kill_on_timeout: bool = False,
+    env: dict[str, str] | None = None,
 ) -> str:
     """シェルコマンドの非同期実行本体
 
@@ -135,6 +146,7 @@ async def _run_command_async_impl(
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
         )
 
         try:

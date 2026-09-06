@@ -193,6 +193,10 @@ class LearningScheduler:
         self.level2_min_improvement_ratio: float = max(
             0.0, float(learning.get("level2_min_improvement_ratio", 0.001)),
         )
+        # 反復間の loss 標準偏差 × sigma も改善幅の下限に重ねる (0 で無効)。
+        self.level2_min_improvement_sigma: float = max(
+            0.0, float(learning.get("level2_min_improvement_sigma", 1.0)),
+        )
         # SPSA の best が更新されないまま何反復続いたら打ち切るか (0 で無効)。
         # 実推論 eval は 1 反復 = 候補サーバ 2 起動と高価なため、空振りが確定
         # している探索を最後まで回さない。

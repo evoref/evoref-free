@@ -30,6 +30,7 @@ from backend.free.agent.issue_ledger import count_kind, format_issues
 from backend.free.agent.tool_ledger import format_ledger
 from backend.free.core.intent_vocab import (
     assistant_code_blocks,
+    is_today_scope_query,
     prior_code_block_request,
     names_file_target,
     memory_architecture_question,
@@ -411,6 +412,33 @@ def _unexplained_numbers_note(numbers: tuple[str, ...]) -> str:
     return _localized(_UNEXPLAINED_NUMBERS_NOTES).format(listed=listed)
 
 
+def _expression_issues_note(issues: tuple[str, ...]) -> str:
+    """式の組み方への疑いを名指しし、検算と開示を求める注記 (純粋関数)。
+
+    数値が全て接地していても式の構造が誤ることがある (年率 × 12 で月返済額の
+    144 倍を「厳密な計算結果」として提示した 2026-09-05 F-03)。
+    """
+    listed = "。".join(issues)
+    return _localized(_EXPRESSION_ISSUES_NOTES).format(listed=listed)
+
+
+_EXPRESSION_ISSUES_NOTES: dict[str, str] = {
+    "ja": (
+        "ただし上記の式には次の疑いがある: {listed}。"
+        "この結果をそのまま答えにせず、式が問題文の単位・期間と整合しているかを"
+        "検算し、誤りがあれば正しい式と計算過程を示したうえで、上の結果は誤った式に"
+        "よるものだと明示すること。"
+    ),
+    "en": (
+        "However, the expression above is suspect: {listed}. Do not use the "
+        "result as-is; re-check that the expression matches the units and "
+        "periods in the question, and if it is wrong, show the corrected "
+        "expression and working, stating explicitly that the result above came "
+        "from an incorrect expression."
+    ),
+}
+
+
 _UNEXPLAINED_NUMBERS_NOTES: dict[str, str] = {
     "ja": (
         "ただし式中の {listed} は、ユーザーの依頼文にもここまでの会話にも"
@@ -598,6 +626,24 @@ _UNVERIFIED_CLAIM_NOTES: dict[str, str] = {
 
 # 引用したユーザー発言に一人称が含まれるかの判定 (帰属注記の出し分け用)。
 _FIRST_PERSON_RE = re.compile(r"(?:私|僕|俺|自分|わたし|ぼく)")
+
+#: 「今日の会話全体」に足す、同じ日の他セッション一覧。
+_TODAY_SESSIONS_FACTS: dict[str, str] = {
+    "ja": (
+        "\n\n[今日の他の会話 — システムが履歴索引から確定した事実]\n"
+        "今日はこの会話のほかに {count} 件の会話があった (開始時刻順、各行は"
+        "その会話の要約または最初の発話):\n{rows}\n"
+        "「今日の会話全体」を振り返る・要約する・数える場合は、この一覧と"
+        "現在の会話の両方を対象にすること。一覧に無い会話を作らないこと。\n"
+    ),
+    "en": (
+        "\n\n[Other conversations today — established by the system from the history index]\n"
+        "Besides this conversation there were {count} conversation(s) today "
+        "(in start order; each line is that conversation's summary or first message):\n{rows}\n"
+        "When reviewing, summarizing or counting \"today's conversations\", cover both "
+        "this list and the current conversation. Do not invent conversations not listed.\n"
+    ),
+}
 
 #: ツール実行結果ブロックの本体 (見出し ``TOOL_RESULT_HEADER`` の直後)。
 _TOOL_RESULT_BODY_TEMPLATES: dict[str, str] = {
@@ -1262,6 +1308,7 @@ class DeliberativeAgent:
         query: str | None = None,
         tool_args: dict | None = None,
         unexplained_numbers: tuple[str, ...] = (),
+        expression_issues: tuple[str, ...] = (),
     ) -> None:
         """最後の user メッセージにツール実行結果を追記する。
 
@@ -1332,6 +1379,8 @@ class DeliberativeAgent:
             grounding = _localized(_CALCULATE_RESULT_GUIDANCES)
             if unexplained_numbers:
                 grounding += _unexplained_numbers_note(unexplained_numbers)
+            if expression_issues:
+                grounding += _expression_issues_note(expression_issues)
         elif tool_name in _COMMAND_TOOLS:
             grounding = _localized(_COMMAND_RESULT_GUIDANCES)
         elif tool_name in _ENUMERATIVE_TOOLS:
@@ -1591,6 +1640,63 @@ class DeliberativeAgent:
         metadata = getattr(llm_client, "metadata", None) if llm_client else None
         model_id = getattr(metadata, "model_id", "") or ""
         return Path(model_id).name if model_id else ""
+
+    @staticmethod
+    def _append_today_sessions_fact(
+        messages: list[dict], query: str, session_id: str,
+    ) -> bool:
+        """「今日の会話全体」に、同じ日の他セッションの見出しを根拠として渡す。
+
+        「今日の会話」は「この会話」のアンカーに吸われて現在セッションだけを
+        見ていた (2026-09-05 ライブ監査 F-12: 20 セッションの日に現セッションの
+        4 ターンだけを 1 行で振り返った)。索引 (``HistoryManager``) には
+        セッションごとの要約 / 最初の発話が入っているので、日付で絞って
+        列挙するだけで材料が揃う。進行中の現在セッションは会話窓に全文が
+        載っているので列挙から外す。
+
+        Returns:
+            注記したか (索引に他セッションが無ければ False)。
+        """
+        if not is_today_scope_query(query):
+            return False
+        try:
+            from backend.config import get_config
+            from backend.free.agent.tools.builtin import _resolve_history_tz
+            from backend.free.history.history_manager import get_history_manager
+            from backend.utils import format_utc, parse_utc, utc_now_dt
+
+            tz = _resolve_history_tz(get_config)
+            local_now = utc_now_dt().astimezone(tz)
+            day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            entries, _ = get_history_manager().list_sessions(
+                limit=200, date_from=format_utc(day_start),
+            )
+        except Exception:  # noqa: BLE001 - 索引が読めなければ注記しないだけ
+            logger.debug("today's sessions fact skipped", exc_info=True)
+            return False
+        rows: list[str] = []
+        for e in sorted(entries, key=lambda e: e.started_at):
+            if session_id and e.session_id == session_id:
+                continue
+            heading = (e.summary or e.first_user_preview or "").strip().replace("\n", " ")
+            if not heading:
+                continue
+            try:
+                stamp = parse_utc(e.started_at).astimezone(tz).strftime("%H:%M")
+            except Exception:  # noqa: BLE001
+                stamp = "--:--"
+            rows.append(f"- {stamp} ({e.turn_count} ターン) {heading[:120]}")
+        if not rows:
+            return False
+        append_to_last_user(
+            messages,
+            _localized(_TODAY_SESSIONS_FACTS).format(
+                count=len(rows), rows="\n".join(rows),
+            ),
+            separator="",
+        )
+        logger.info("Today's sessions fact pinned (%d other sessions)", len(rows))
+        return True
 
     def _append_tool_inventory_fact(
         self, messages: list[dict], query: str, mode: str,
@@ -1979,6 +2085,14 @@ class DeliberativeAgent:
                 tool_judge_task.cancel()
             return None, None, None, None, None
 
+        # 「今日の会話全体」は現在セッション + 同じ日の他セッション。索引から
+        # 決定論で列挙できるので、search_history (自己参照で現在セッションに
+        # 縮められる) は撃たない。
+        if self._append_today_sessions_fact(messages, query, session_id):
+            if tool_judge_task is not None and not tool_judge_task.done():
+                tool_judge_task.cancel()
+            return None, None, None, None, None
+
         # 「一度も使っていないツールは？」は目録と実行台帳の **差集合** なので、
         # 目録だけ渡すと差を base が作話する (2026-08-28 ライブ監査 T06-19:
         # 未登録の delete_file / move_file を挙げた)。目録の短絡より前に台帳を
@@ -2148,6 +2262,7 @@ class DeliberativeAgent:
             messages, judgement.tool_name, prompt_result_text, query=query,
             tool_args=judgement.tool_args,
             unexplained_numbers=getattr(judgement, "unexplained_numbers", ()),
+            expression_issues=getattr(judgement, "expression_issues", ()),
         )
         # ツールがエラー文字列を返したなら、それは「測れなかった」という事実で
         # あって観測結果ではない。``_append_tool_result_to_last_user`` は結果を

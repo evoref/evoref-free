@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Iterable
+from typing import Any
 
 from backend.free.core.intent_vocab import is_plain_statement
 from backend.free.core.text_quality import (
@@ -39,6 +40,7 @@ from backend.free.memory.extractors.base import (
     ExtractionResult,
 )
 from backend.free.memory.notes.note_builder import (
+    CORRECTION_FORM_TRIGGERS,
     ChatNoteBuilder,
     _CONFIRMATION_SEEKING_RE,
     _normalize_trigger,
@@ -626,6 +628,63 @@ def _collapse_equivalent_candidates(
     return kept, collapsed
 
 
+#: 汎用スロット ``user`` へ落ちた行を重ねるとき、残す方の優先順。preference /
+#: emotion / opinion は「好き」「嫌い」等の内容語で立ったタグで、``私の`` だけで
+#: 立つ personal_fact より発話の意味を担っている。
+_GENERIC_ROW_PRIORITY: dict[str, int] = {
+    "preference": 0, "emotion": 1, "opinion": 2, "personal_fact": 3,
+}
+
+
+def _collapse_generic_shadow_rows(
+    candidates: list[tuple[MemoryNote, SemanticFact]],
+) -> tuple[list[tuple[MemoryNote, SemanticFact]], int]:
+    """同じ発話から **複数の汎用 ``user`` 行** が起きたら 1 本に畳む (純粋関数)。
+
+    ``私の好きな曲はスピッツの「空も飛べるはず」です`` は ``私の`` で
+    personal_fact、``好き`` で preference が立ち、どちらも属性語彙に当たらないと
+    ``mem.personal.user`` と ``mem.preference.user`` の 2 本が同じ本文で live に
+    なる (2026-09-05 ライブ監査 F-18)。既存の抑止 (``_resolves_a_concrete_attribute``)
+    は「他のタグが具体スロットに着地した」ときしか働かない。語彙の穴は
+    必ずまた開くので、汎用行そのものを発話につき 1 本に限る。
+
+    Returns:
+        ``(畳んだ後の候補, 落とした件数)``。
+    """
+    best: dict[tuple[str, str], int] = {}
+    for idx, (note, fact) in enumerate(candidates):
+        if not (fact.subject or "").endswith(".user"):
+            continue
+        key = (note.id, (fact.statement or fact.object or "").strip())
+        if not key[1]:
+            continue
+        prev = best.get(key)
+        if prev is None or (
+            _GENERIC_ROW_PRIORITY.get(str(fact.type), 9)
+            < _GENERIC_ROW_PRIORITY.get(str(candidates[prev][1].type), 9)
+        ):
+            best[key] = idx
+    winners = set(best.values())
+    kept: list[tuple[MemoryNote, SemanticFact]] = []
+    dropped = 0
+    for idx, (note, fact) in enumerate(candidates):
+        key = (note.id, (fact.statement or fact.object or "").strip())
+        if (
+            (fact.subject or "").endswith(".user")
+            and key in best
+            and idx not in winners
+        ):
+            dropped += 1
+            continue
+        kept.append((note, fact))
+    if dropped:
+        logger.debug(
+            "ChatExtractor: collapsed %d generic-slot shadow row(s) "
+            "(same note/text under another fact type)", dropped,
+        )
+    return kept, dropped
+
+
 def _relevant_sentences(
     text: str, trigger_words: tuple[str, ...],
 ) -> list[str]:
@@ -650,7 +709,14 @@ def _relevant_sentences(
     for sentence in sentences:
         if any(t in sentence.lower() for t in trigger_words):
             kept.append(sentence)
-            awaiting_value = not _states_attribute_value(sentence, trigger_words)
+            # 訂正文は「A は X ではなく Y です。Z は W でした。」のように、
+            # 差し替えの直後に **補完する新値** を続けることが多い。差し替え
+            # 文だけ残すと後半の新値 (去年 = 白馬岳) が statement から消える
+            # (2026-09-05 ライブ監査 F-10)。
+            awaiting_value = (
+                not _states_attribute_value(sentence, trigger_words)
+                or has_correction_form(sentence)
+            )
             continue
         if awaiting_value and not _carries_no_value(sentence):
             kept.append(sentence)
@@ -873,6 +939,12 @@ def _value_anchors(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(anchors))
 
 
+def has_correction_form(text: str) -> bool:
+    """発話が訂正の形 (「ではなく」「正しくは」「変わりました」…) を含むか (純粋関数)。"""
+    haystack = _normalize_trigger(text or "")
+    return any(_normalize_trigger(t) in haystack for t in CORRECTION_FORM_TRIGGERS)
+
+
 def resolve_value_anchored_attributes(
     notes: Iterable[MemoryNote],
     live_values: dict[tuple[str, str], tuple[str, ...]],
@@ -910,8 +982,19 @@ def resolve_value_anchored_attributes(
     自属性が解決できる発話・継承で解決できる発話には手を出さない
     (呼出側が最後の手段として使う)。
 
+    ``is_correction`` は属性語彙に依存する判定 (``restates_attribute_value``)
+    なので、属性語を落とした訂正では **定義上立たない**。それに閉じると、
+    語彙非依存であるはずのこの経路が語彙依存の門の内側に置かれる
+    (2026-09-05 ライブ監査 F-10: 「槍ヶ岳に登ったのは去年ではなく一昨年です。
+    去年は白馬岳でした。」は ``趣味`` も ``登山`` も含まず is_correction=False、
+    値アンカー (槍ヶ岳 / 去年) は hobby を正しく指せたのに見られなかった。
+    Full sleep-time 完走後も「白馬」を含むファクトは 0 件)。訂正の形
+    (:data:`CORRECTION_FORM_TRIGGERS`) を含む文も見る — 宛先が既存の live 値に
+    限られるので誤爆は閉じたまま。
+
     Args:
-        notes: 走査対象のノート。``is_correction`` が立っているものだけ見る。
+        notes: 走査対象のノート。``is_correction`` が立っているか、訂正の形を
+            含むものだけ見る。
         live_values: ``{(tag, attr): (現在値, ...)}``。ストアの live ファクトの
             ``text`` から呼出側が組む。
 
@@ -922,7 +1005,10 @@ def resolve_value_anchored_attributes(
         return {}
     resolved: dict[tuple[str, str], str] = {}
     for note in notes:
-        if not getattr(note, "is_correction", False):
+        if not (
+            getattr(note, "is_correction", False)
+            or has_correction_form(note.content or "")
+        ):
             continue
         content = note.content or ""
         if not content:
@@ -1249,6 +1335,15 @@ class ChatExtractor(BaseExtractor):
                     object_text = _assertive_evidence(evidence)
                     if not object_text:
                         continue
+                    # 値アンカーで宛先が決まった訂正は、ノートの is_correction
+                    # (属性語彙に依存) が立っていなくても訂正として書く。
+                    # from_correction が無いと supersede が走らず、旧値と新値が
+                    # 両方 live で並ぶ (F-10)。
+                    overrides: dict[str, Any] = {}
+                    if (note.id, tag) in value_anchored and not getattr(
+                        note, "is_correction", False,
+                    ):
+                        overrides["from_correction"] = True
                     fact = self.make_fact(
                         subject=subject,
                         predicate=_PREDICATE_BY_TAG.get(tag, "states"),
@@ -1271,10 +1366,13 @@ class ChatExtractor(BaseExtractor):
                         scope=SemanticFact.make_global_scope(),
                         note=note,
                         ctx=ctx,
+                        **overrides,
                     )
                     candidates.append((note, fact))
 
         candidates, collapsed = _collapse_equivalent_candidates(candidates)
+        candidates, generic_dropped = _collapse_generic_shadow_rows(candidates)
+        collapsed += generic_dropped
         kept, dropped = self.apply_session_caps(candidates, ctx)
         result.cap_dropped = dropped
         result.facts = [fact for _, fact in kept]

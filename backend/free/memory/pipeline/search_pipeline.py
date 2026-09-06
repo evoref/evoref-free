@@ -763,6 +763,17 @@ _RELATIVE_FLOOR_ABSOLUTE_MIN = 0.24
 #: 0.0 で無効化。
 _RELATIVE_KEEP_RATIO = 0.75
 
+#: **弱い結果集合** (top1 が較正済み ``confidence`` = 真の一致の中央値に届かない)
+#: に対して、絶対の棒を ``relevance`` から ``confidence`` へこの割合だけ寄せる。
+#: 絶対の棒は背景 p95 なので、ストアが育つと定義上ノイズの 5% が毎ターン
+#: 通り、**関連する内容が 1 つも無いクエリ** でも「最良のノイズ」が
+#: ``[参考情報]`` に載る (2026-09-05 ライブ監査 F-17: API キーの保管場所の
+#: 質問に勤怠管理の日付設計とビーフシチューの煮込み時間が参考情報として
+#: 入った)。強い一致があるターン (top1 ≥ confidence) には掛けない —
+#: そこでは相対の棒 (0.75 × top1) が弱い兄弟を既に落としている。
+#: 0.0 で無効化。
+_WEAK_SET_MARGIN = 0.35
+
 
 def _resolve_relative_keep_ratio(rag_cfg: dict) -> float:
     """``relative_keep_ratio`` を [0, 1] にクランプして返す。"""
@@ -794,6 +805,11 @@ def _resolve_keep_floor(
     最終的な floor は 1 と 2 の **高い方**。top1 は定義上 2 を越えるため、
     相対の棒で結果集合が空になることはない。config が ``0.0`` (= 従来どおり
     クエリ単位の全件破棄) を明示している場合は較正より優先して尊重する。
+
+    3. **弱い結果集合の上乗せ** — 較正が効いていて top1 が ``confidence``
+       に届かないときだけ、絶対の棒を ``relevance`` と ``confidence`` の間
+       (:data:`_WEAK_SET_MARGIN`) へ上げる。これは top1 も越えられない
+       ことがあり、その場合は結果集合が空になる (= 何も載せない方が正しい)。
     """
     self_rag = rag_cfg.get("self_rag") or {}
     configured = float(self_rag.get("low_quality_keep_floor", 0.0))
@@ -807,6 +823,13 @@ def _resolve_keep_floor(
     )
     if calibrated:
         absolute = float(thresholds.relevance)
+        confidence = float(thresholds.confidence)
+        if (
+            _WEAK_SET_MARGIN > 0.0
+            and confidence > absolute
+            and 0.0 < top_raw_score < confidence
+        ):
+            absolute = absolute + (confidence - absolute) * _WEAK_SET_MARGIN
     elif top_raw_score > 0.0:
         relaxed = min(configured, top_raw_score * _RELATIVE_FLOOR_RATIO)
         absolute = max(relaxed, min(configured, _RELATIVE_FLOOR_ABSOLUTE_MIN))

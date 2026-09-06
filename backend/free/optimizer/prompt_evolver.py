@@ -395,6 +395,11 @@ class EvolutionResult:
     mutation_failures: int = 0
 
 
+
+#: 停滞打ち切りの世代数 (0 で無効) と、改善とみなす最小差。
+_STAGNATION_PATIENCE = 3
+_FITNESS_EPS = 1e-6
+
 class PromptEvolver:
     """Darwinian 進化によるモード別システムプロンプト自動最適化
 
@@ -1072,6 +1077,13 @@ class PromptEvolver:
         """
         generations_run = max(0, start_gen - 1)
         yielded = False
+        # 停滞打ち切り: best が _STAGNATION_PATIENCE 世代動かなければ止める。
+        # ヒューリスティック fitness は候補に無反応なことが多く、10 世代の
+        # 変異が best を 1 度も動かさないまま 4 分回っていた (2026-09-05 ライブ
+        # 監査 F-19: 初期集団の最大 0.9497 が第 5 世代も第 10 世代も同値)。
+        # 採否は下流の実測ゲートが決めるので、ここで止めても安全側は崩れない。
+        best_seen = max((c.fitness for c in population), default=float("-inf"))
+        stagnant = 0
         for gen in range(start_gen, generations + 1):
             if cb.tripped or cb.should_stop():
                 cb.tripped = True
@@ -1103,6 +1115,23 @@ class PromptEvolver:
                 gen, generations, population, on_generation_complete, yield_check,
             ):
                 yielded = True
+                break
+
+            best_now = max(c.fitness for c in population)
+            if best_now > best_seen + _FITNESS_EPS:
+                best_seen = best_now
+                stagnant = 0
+            else:
+                stagnant += 1
+            if _STAGNATION_PATIENCE and stagnant >= _STAGNATION_PATIENCE:
+                spread = best_now - min(c.fitness for c in population)
+                logger.info(
+                    "Stopping at generation %d/%d: best fitness %.4f unchanged "
+                    "for %d generations (population spread %.4f — the heuristic "
+                    "fitness is not discriminating between candidates; the "
+                    "measured adoption gate decides)",
+                    gen, generations, best_now, stagnant, spread,
+                )
                 break
         return generations_run, yielded
 

@@ -21,7 +21,7 @@ from backend.free.history.history_manager import (
     get_history_manager,
 )
 from backend.free.history.utils import parse_iso
-from backend.free.core.text_quality import extract_measured_values
+from backend.free.core.text_quality import extract_calculate_result, extract_measured_values
 from backend.log_config import get_logger
 from backend.trace_context import get_trace_id, run_in_executor_with_context
 from backend.utils import format_utc, utc_now_dt
@@ -728,6 +728,17 @@ def _schedule_sleep_time(
     scheduler.on_response_sent()
 
 
+def _calculate_result_in_prompt(messages: list[ChatMessage]) -> float | None:
+    """最後の user メッセージへ注入済みの calculate 結果 (無ければ ``None``)。
+
+    ``_turn_contradiction_inputs`` の実測値と同じく、注入したのはこのプロセス
+    なのでプロンプトから読み戻す。
+    """
+    if not messages:
+        return None
+    return extract_calculate_result(str(messages[-1].get("content") or ""))
+
+
 def _turn_contradiction_inputs(
     state: AppState,  # noqa: ARG001 - 呼出面の互換 (判定器を後から覗く経路は撤去)
     messages: list[ChatMessage],
@@ -1111,6 +1122,7 @@ def record_response(
                 cached_prompt_tokens=cached_tokens,
                 action_blocked=blocked,
                 measured_values=measured,
+                calculate_result=_calculate_result_in_prompt(messages),
                 truncated=truncated,
                 generation_failed=generation_failed or not body.strip(),
                 session_id=session_id,
@@ -1212,6 +1224,7 @@ def record_meta_cognitive_response(
                 mode=mode,
                 action_blocked=blocked,
                 measured_values=measured,
+                calculate_result=_calculate_result_in_prompt(messages),
                 agent_loops=agent_loops,
                 rag_used=rag_used,
                 rag_top1_score=rag_top1_score,
@@ -1322,6 +1335,7 @@ def record_long_form_response(
                 mode=mode,
                 action_blocked=blocked,
                 measured_values=measured,
+                calculate_result=_calculate_result_in_prompt(messages),
                 long_form_used=True,
                 long_form_content_type=metrics.get("content_type"),
                 long_form_strategy=metrics.get("strategy"),

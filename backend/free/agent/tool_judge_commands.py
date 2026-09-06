@@ -25,6 +25,7 @@ from backend.free.core.intent_vocab import (
     PYTHON_VERSION_TERMS,
     STORAGE_SPEC_TERMS,
     is_plain_statement,
+    is_practice_advice_query,
 )
 from backend.log_config import get_logger
 
@@ -722,13 +723,15 @@ _EXECUTABLE_QUERY_COMMANDS: list[tuple[re.Pattern, "str | Callable[[str], str]"]
         f"(?:{PYTHON_VERSION_TERMS})",
         re.IGNORECASE,
     ), "python --version"),
-    # 環境変数
+    # 環境変数 — 名前だけを列挙する。値を出すと ``*_TOKEN`` 等がプロンプトと
+    # debug JSONL に平文で載る (2026-09-05 ライブ監査 F-16)。値が要るなら
+    # ユーザーが変数名を指定して個別に聞く形に倒す。
     (re.compile(
         f"(?:{ENV_VAR_TERMS})",
         re.IGNORECASE,
     ), "python -c \""
        "import os;"
-       " [print(k,'=',v[:80]) for k,v in sorted(os.environ.items())[:30]]"
+       " print(', '.join(sorted(os.environ)))"
        "\""),
 ]
 def recalled_command_fits_query(
@@ -821,6 +824,9 @@ def _infer_executable_command(query: str) -> str:
     """
     if is_plain_statement(query):
         logger.debug("Plain statement, no executable command: %s", query[:50])
+        return ""
+    if is_practice_advice_query(query):
+        logger.debug("Practice/advice question, no executable command: %s", query[:50])
         return ""
     for pattern, command in _EXECUTABLE_QUERY_COMMANDS:
         if pattern.search(query):

@@ -320,8 +320,19 @@ _PERSONAL_ATTRIBUTION_RE = re.compile(
 #: 安全側 (手本が 1 件減るだけ) で、採用の方向は嘘の手本を数週間常駐させる。
 #: 実データでの較正 (experience 313 件): 現行ゲート 22 件 + 本ゲート 62 件を
 #: 棄却し、**229 件が残る**。
+#:
+#: 「自分」「うち」は指示対象がユーザーとは限らない (「モデルが自分の知識を
+#: 無視する」「Rust は自分自身のメモリ安全性を」「候補のうちの一つ」)。主語が
+#: システム / 技術対象の質問はもっとも良い手本材料なので、この 2 語は
+#: **想起の動詞を伴うとき** (「自分の名前を覚えていますか」) だけ一人称と扱う
+#: (2026-09-05 ライブ監査 F-15: 100 件中 2 件がこの誤判定で棄却されていた)。
 _USER_SELF_REFERENCE_RE = re.compile(
-    r"(?:私|わたし|僕|ぼく|俺|おれ|自分|うち)\s*(?:の|は|が|に|も|自身)",
+    r"(?:私|わたし|僕|ぼく|俺|おれ)\s*(?:の|は|が|に|も|自身)",
+)
+_SELF_WORD_WITH_RECALL_RE = re.compile(
+    r"(?:自分|うち)\s*(?:の|は|が|に|も|自身)"
+    r"[^。！？!?\n]{0,40}?"
+    r"(?:覚えて|記録|把握|知って|言った|話した|伝えた|申し上げた)",
 )
 
 
@@ -353,7 +364,7 @@ def _find_volatile_reason(query: str, response: str) -> str | None:
         and _PERSONAL_ATTRIBUTION_RE.search(response)
     ):
         return "user-dependent answer (asserts the user's personal attributes)"
-    if _USER_SELF_REFERENCE_RE.search(query):
+    if _USER_SELF_REFERENCE_RE.search(query) or _SELF_WORD_WITH_RECALL_RE.search(query):
         return "user-dependent answer (the question is about the user themselves)"
     return None
 

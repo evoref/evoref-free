@@ -38,8 +38,13 @@ _NUMBER_LITERAL_RE = NUMBER_LITERAL_RE
 #: 知識として思い出す換算率ではない。52 が無いために「週に3冊なら年間何冊か」で
 #: ネイティブ層が正しく合成した ``3 * 52`` が ungrounded で棄却され、base の
 #: 暗算に落ちていた (実インシデント 2026-08-10 ライブ監査)。
+#: ``1`` は乗法の単位元で、``(1 + r)`` / ``1 - x`` のように式の構造そのものが
+#: 要求する値。知識由来の定数ではない。無いと「1 が対話に書かれているか」が
+#: クエリにたまたま ``1,000`` があるかで揺れる (実インシデント 2026-09-05
+#: ライブ監査 T03/1: 年金現価式の ``(1 - (1 + r)**-n)`` の 1 が ungrounded に
+#: 数えられ、根拠を示せという注記がプロンプトに載った)。
 _UNIT_SYSTEM_CONSTANTS = frozenset({
-    "7", "10", "12", "24", "52", "60", "100", "365", "366",
+    "1", "7", "10", "12", "24", "52", "60", "100", "365", "366",
     "1000", "1440", "3600", "86400",
     "0.1", "0.01", "0.001",
     # SI 接頭辞 (10 の冪) — 1000 は上にある
@@ -106,6 +111,22 @@ _INTERVAL_M_RE = re.compile(r"(\d+(?:\.\d+)?)\s*分\s*(?:刻み|単位|ごと|�
 #: (月〜金 → 5) が、クエリに数字としては現れない。上の刻み幅と同じ回で必要に
 #: なった (2026-08-10 ライブ監査の総スロット数は ``8 * 5 * (18 - 9) * 2`` で、
 #: ``5`` も ``2`` も書かれていなかった)。
+#: 日本語の万進表記 (``2,850万`` / ``3千万`` / ``1億2000万`` / ``2.5億``)。式に
+#: 現れるのは展開した整数 (``28500000``) で、クエリには ``2,850`` と ``万`` しか
+#: 書かれていない。桁区切りと同じく **表記から一意に導ける**値。
+#: 実インシデント 2026-09-05 ライブ監査 T03/1: 「残債が2,850万円」に対し
+#: ネイティブ層が正しく ``28500000`` を使ったのに ungrounded と判定され、
+#: 「この値の根拠を示せ」という無意味な注記がプロンプトに載った。
+_MYRIAD_UNITS: dict[str, int] = {
+    "兆": 10**12, "億": 10**8, "千万": 10**7, "百万": 10**6, "万": 10**4, "千": 10**3,
+}
+_MYRIAD_GROUP_RE = re.compile(
+    r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(兆|億|千万|百万|万|千)",
+)
+_MYRIAD_SEQUENCE_RE = re.compile(
+    r"(?:(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:兆|億|千万|百万|万|千)\s*)+",
+)
+
 _WEEKDAY_ORDER = "月火水木金土日"
 _WEEKDAY_RANGE_RE = re.compile(
     r"([月火水木金土日])\s*(?:曜日?)?\s*(?:〜|～|-|–|から)\s*([月火水木金土日])\s*(?:曜日?)?",
@@ -137,7 +158,36 @@ def _known_numbers(text: str) -> set[str]:
             known.add(f"{value:g}")
             known.add(f"{value:.2f}")
     known.update(_duration_derived_numbers(text))
+    known.update(_myriad_derived_numbers(text))
     return known
+
+
+def _myriad_derived_numbers(text: str) -> set[str]:
+    """万進表記から導ける数値を集める (純粋関数)。
+
+    ``2,850万`` → ``28500000`` (展開値) と ``2850`` (万単位の係数)。モデルは
+    万単位のまま式を組むこともある (``2850 * 0.0135``) ので両方を登録する。
+    ``1億2000万`` のような連結は各項の和 (``120000000``)。
+    """
+    derived: set[str] = set()
+
+    def add(value: float) -> None:
+        if value == int(value):
+            derived.add(str(int(value)))
+        else:
+            derived.add(f"{value:g}")
+
+    for seq in _MYRIAD_SEQUENCE_RE.findall(text):
+        total = 0.0
+        for num, unit in _MYRIAD_GROUP_RE.findall(seq):
+            try:
+                coefficient = float(num.replace(",", ""))
+            except ValueError:
+                continue
+            add(coefficient)
+            total += coefficient * _MYRIAD_UNITS[unit]
+        add(total)
+    return derived
 
 
 def _duration_derived_numbers(text: str) -> set[str]:
@@ -190,6 +240,108 @@ def _duration_derived_numbers(text: str) -> set[str]:
         span = (_WEEKDAY_ORDER.index(end) - _WEEKDAY_ORDER.index(start)) % 7 + 1
         add(float(span))
     return derived
+# ── 式の妥当性 (接地とは別の軸) ──────────────────────────────────────
+#
+# 接地判定は「式の数値が対話に書かれているか」しか見ない。数値が全て正しく
+# 接地していても **式の組み方** が誤ることがあり、ツールは「正しく計算された嘘」
+# を返す (実インシデント 2026-09-05 ライブ監査 T03/1: 年 1.35% のローンで
+# ``28500000 * 0.0135 * 12 / (1 - (1 + 0.0135/12)**(-23*12))`` と **年利を
+# 12 倍** した式が合成され、月返済額の 144 倍 = 17,305,634 が「厳密な計算結果」
+# として提示された)。意味解析はできないが、**対話の表記と式の構造の食い違い**
+# は決定論で拾える。接地の注記と同じく、式は捨てずに疑いを名指しして検算を
+# 求める (``_suppress_ungrounded_calculate`` の方針)。
+
+#: 「年 1.35%」「年利 1.35 %」「年率1.35%」 — 年あたりの率。
+_ANNUAL_RATE_RE = re.compile(r"年(?:利|率|利率)?\s*(\d+(?:\.\d+)?)\s*(?:%|％|パーセント)")
+#: 「月 0.5%」「月利 0.5%」 — 月あたりの率。
+_MONTHLY_RATE_RE = re.compile(r"月(?:利|率|利率)?\s*(\d+(?:\.\d+)?)\s*(?:%|％|パーセント)")
+
+
+def _rate_forms(pct: str) -> list[str]:
+    """百分率 ``1.35`` が式に現れうる表記 (``0.0135`` / ``1.35/100`` / ``1.35 / 100``)。"""
+    try:
+        rate = float(pct) / 100.0
+    except ValueError:
+        return []
+    forms = {f"{rate:g}", f"{rate:.4f}".rstrip("0").rstrip("."), f"{pct}/100", f"{pct} / 100"}
+    return [re.escape(f) for f in forms if f]
+
+
+def expression_sanity_issues(
+    expression: str, query: str, context: str = "",
+) -> tuple[str, ...]:
+    """式の組み方が対話の表記と食い違う疑いを返す (純粋関数)。
+
+    返すのは **疑いの説明文** (回答側の注記にそのまま使う)。空タプルなら疑い無し。
+    検出するのは構造だけで決まる 3 種:
+
+    1. 年率を 12 倍 / 月率を 12 で割る (期間単位の取り違え)
+    2. 百分率を 2 回割る (``1.35/100/100`` / ``0.0135/100``)
+    3. 万円の係数と円の展開値の混在 (``2850 * 0.0135 + 627000``)
+    """
+    expr = expression or ""
+    text = f"{query or ''}\n{context or ''}"
+    issues: list[str] = []
+
+    for pct in _ANNUAL_RATE_RE.findall(text):
+        for form in _rate_forms(pct):
+            if re.search(rf"(?:{form})\s*\*\s*12\b|\b12\s*\*\s*(?:{form})", expr):
+                issues.append(
+                    f"年率 {pct}% を 12 倍している (年率を月率にするのは ÷12、"
+                    "年額はそのまま年率を掛ける)"
+                )
+                break
+    for pct in _MONTHLY_RATE_RE.findall(text):
+        for form in [*_rate_forms(pct), re.escape(pct)]:
+            if re.search(rf"(?:{form})\s*/\s*12\b", expr):
+                issues.append(f"月率 {pct}% を 12 で割っている (月率はそのまま月に掛ける)")
+                break
+
+    for pct in _PERCENT_LITERAL_RE.findall(text):
+        # 小数形 (0.0135) の直後に /100、または pct/100/100 — 百分率を 2 回割っている
+        decimal_forms = [f for f in _rate_forms(pct) if "/" not in f]
+        double = any(
+            re.search(rf"(?<![\d.])(?:{form})\s*/\s*100\b", expr) for form in decimal_forms
+        ) or re.search(rf"(?<![\d.]){re.escape(pct)}\s*/\s*100\s*/\s*100\b", expr)
+        if double:
+            try:
+                issues.append(
+                    f"{pct}% を百分率として 2 回割っている ({pct}% は {float(pct) / 100:g})"
+                )
+            except ValueError:
+                pass
+
+    pairs = _myriad_pairs(text)
+    if len(pairs) >= 1:
+        used_coefficient = any(
+            re.search(rf"(?<![\d.]){re.escape(c)}(?![\d.])", expr) for c, _ in pairs
+        )
+        # 展開値そのもの、または万単位では現れない大きな円の値 (10 万以上)
+        used_expanded = any(
+            re.search(rf"(?<![\d.]){re.escape(e)}(?![\d.])", expr) for _, e in pairs
+        ) or any(
+            float(n) >= 100000 and n not in {c for c, _ in pairs}
+            for n in _NUMERIC_LITERAL_RE.findall(expr)
+        )
+        if used_coefficient and used_expanded:
+            issues.append("万円の係数 (万単位) と円の展開値が同じ式に混在している (単位を揃える)")
+    return tuple(issues)
+
+
+def _myriad_pairs(text: str) -> list[tuple[str, str]]:
+    """万進表記の (係数, 展開値) 対。``2,850万`` → ``("2850", "28500000")``。"""
+    out: list[tuple[str, str]] = []
+    for num, unit in _MYRIAD_GROUP_RE.findall(text):
+        try:
+            coefficient = float(num.replace(",", ""))
+        except ValueError:
+            continue
+        expanded = coefficient * _MYRIAD_UNITS[unit]
+        if expanded == int(expanded) and coefficient == int(coefficient):
+            out.append((str(int(coefficient)), str(int(expanded))))
+    return out
+
+
 #: 数値リテラル抽出用。小数と整数を拾う (単位や記号は含めない)。
 _NUMERIC_LITERAL_RE = re.compile(r"\d+(?:\.\d+)?")
 #: 全角数字を半角に寄せる変換表 (日本語入力のクエリ対策)。

@@ -264,7 +264,12 @@ class ExperienceBuffer(JsonStateStore):
         return self.entries[-n:]
 
     def get_failures(self, mode: str | None = None) -> list[ExperienceEntry]:
-        """失敗エントリ抽出（rephrased_query=True or user_correction 非 None）
+        """失敗エントリ抽出 (言い直し / ユーザー訂正 / 決定論の失敗判定)。
+
+        ``turn_outcome == "failed"`` を含めないと、Level 2 の失敗プールは
+        「ユーザーが言い直した or 訂正した」ターンだけになり、算術の破綻・
+        ツール結果の不使用・自己矛盾のような **システムが自分で検出した失敗** が
+        1 件も入らない (2026-09-05 ライブ監査 F-11: 100 ターンで 3 件)。
 
         Args:
             mode: 指定時はそのモード ("chat"/"create") のエントリのみに絞る。
@@ -272,7 +277,9 @@ class ExperienceBuffer(JsonStateStore):
         """
         result = [
             e for e in self.entries
-            if e.signals.rephrased_query or e.signals.user_correction is not None
+            if e.signals.rephrased_query
+            or e.signals.user_correction is not None
+            or e.signals.turn_outcome == "failed"
         ]
         if mode is not None:
             result = [e for e in result if e.mode == mode]

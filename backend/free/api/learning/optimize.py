@@ -77,6 +77,18 @@ def _level2_methods(scheduler) -> dict:
     }
 
 
+def _effective_spsa_iterations(scheduler, params: dict) -> int:
+    """実際に回る SPSA 反復数。
+
+    ``spsa-real-eval`` は実 eval 用の低反復数 (``base_realeval_spsa_iterations``、
+    既定 30) を使うのに、status は常に ``spsa_iterations`` (500) を返していた
+    (2026-09-05 ライブ監査 F-21: ダッシュボードの進捗の分母が 16 倍ずれる)。
+    """
+    if scheduler is not None and _level2_methods(scheduler)["active_method"] == "spsa-real-eval":
+        return int(getattr(scheduler, "base_realeval_spsa_iterations", params["spsa_iterations"]))
+    return int(params["spsa_iterations"])
+
+
 # ── エンドポイント ──
 
 
@@ -131,7 +143,7 @@ async def optimize_status(state: AppState = Depends(get_app_state)):
             min_experiences=params["min_experiences"],
         ),
         level2=Level2Status(
-            spsa_iterations=params["spsa_iterations"],
+            spsa_iterations=_effective_spsa_iterations(scheduler, params),
             sparse_params=params["sparse_params"],
             min_failures=params["min_failures"],
             lora_adapter_exists=lora_adapter_exists,

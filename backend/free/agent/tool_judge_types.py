@@ -24,6 +24,9 @@ class ToolJudgement:
     #: 実行したときだけ入り、回答側でその値の出所を開示させるために使う
     #: (``_suppress_ungrounded_calculate`` 参照)。
     unexplained_numbers: tuple[str, ...] = ()
+    #: calculate の式の組み方が対話の表記と食い違う疑い (``expression_sanity_issues``)。
+    #: 接地と同じく式は捨てず、回答側で検算と開示を求める。
+    expression_issues: tuple[str, ...] = ()
     #: このターンで「状態を変える操作を選んだが実行できなかった」か。
     #:
     #: 以前は ``ToolCallJudge`` のインスタンス属性 (``_action_blocked``) に置き、

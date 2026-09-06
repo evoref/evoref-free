@@ -28,11 +28,14 @@ from backend.free.core.locale_patterns import (
 )
 from backend.free.core.session_mode import is_create_mode
 from backend.free.core.response_arithmetic import find_arithmetic_contradictions
+from backend.free.core.verifier_events import record_turn_outcome, record_verifier_hit
+from backend.free.agent.issue_ledger import record_current_issue
 from backend.free.core.text_quality import (
     claims_completed_state_change,
     contradicts_measured_values,
     has_broken_ja_spacing,
     has_chinese_token_leak,
+    ignores_calculate_result,
     retracts_own_conclusion,
     value_was_adopted,
     VALUE_REJECTION_RE,
@@ -634,6 +637,36 @@ class _SessionTurnState:
     prev_response: str = ""
 
 
+#: 失敗理由の接頭辞 → (検証器 id, 台帳の種別)。理由文字列は
+#: ``_derive_turn_outcome_with_reason`` が組む。
+_OUTCOME_REASON_CHANNELS: tuple[tuple[str, str, str], ...] = (
+    ("arithmetic contradiction", "content.arithmetic", "content_contradiction"),
+    ("broken JA spacing", "content.broken_text", "output_broken"),
+    ("Chinese token leaked", "content.broken_text", "output_broken"),
+    ("response retracts", "content.self_retraction", "content_contradiction"),
+    ("measured value contradiction", "content.measured", "content_contradiction"),
+    ("tool result ignored", "content.tool_result", "tool_result_ignored"),
+    ("claimed completion while blocked", "content.claimed_change", "content_contradiction"),
+    ("user echo", "content.user_echo", ""),
+)
+
+
+def _publish_turn_outcome(outcome: str, reason: str | None) -> None:
+    """導出した成否を結末 JSONL (verifier scope) と自己申告の台帳へ流す。
+
+    長さ / 形式の違反は ``text_quality`` 側が既に記録している (二重計上しない)。
+    """
+    record_turn_outcome(outcome, reason)
+    if outcome != "failed" or not reason:
+        return
+    for prefix, verifier_id, kind in _OUTCOME_REASON_CHANNELS:
+        if reason.startswith(prefix):
+            record_verifier_hit(verifier_id)
+            if kind:
+                record_current_issue(kind, reason)
+            return
+
+
 class FeedbackCollector:
     """暗黙的フィードバックシグナルを収集し経験バッファに記録
 
@@ -756,6 +789,7 @@ class FeedbackCollector:
         cached_prompt_tokens: int | None = None,
         action_blocked: bool = False,
         measured_values: dict[str, set[int]] | None = None,
+        calculate_result: float | None = None,
         truncated: bool = False,
         generation_failed: bool = False,
         session_id: str = "",
@@ -800,18 +834,23 @@ class FeedbackCollector:
                 signals=FeedbackSignals(),
             )
         self._load_session_state(session_id)
-        turn_outcome = self._derive_turn_outcome(
+        turn_outcome, outcome_reason = self._derive_turn_outcome_with_reason(
             response, step_credits,
             query=query,
             tool_routing_false_positive=tool_routing_false_positive,
             long_form_false_positive=long_form_false_positive,
             action_blocked=action_blocked,
             measured_values=measured_values,
+            calculate_result=calculate_result,
         )
         if generation_failed:
             # 本文が届かなかった / error フレームで終わったターン。
             # 推定ではなく観測なので無条件に failed。
-            turn_outcome = "failed"
+            turn_outcome, outcome_reason = "failed", "generation failed"
+        # 結末 JSONL (``success`` / ``quality_signals``) と自己申告の台帳へ、
+        # ここで決めた成否を持ち上げる。以前は経験にしか残らず、結末は
+        # 「SSE を届けられたか」だけで success=true だった (F-11)。
+        _publish_turn_outcome(turn_outcome, outcome_reason)
         if turn_outcome == "failed":
             # 失敗ターンの成功シグナルは矛盾なので failed 側に倒す
             # (偽成功が learned_patterns の正例学習 / Level 1 fitness に
@@ -1023,8 +1062,33 @@ class FeedbackCollector:
         long_form_false_positive: bool = False,
         action_blocked: bool = False,
         measured_values: dict[str, set[int]] | None = None,
+        calculate_result: float | None = None,
     ) -> str:
-        """ターン成否 ("success" | "partial" | "failed") を決定論導出する。
+        """ターン成否だけを返す (:meth:`_derive_turn_outcome_with_reason` の薄い皮)。"""
+        outcome, _ = FeedbackCollector._derive_turn_outcome_with_reason(
+            response, step_credits,
+            query=query,
+            tool_routing_false_positive=tool_routing_false_positive,
+            long_form_false_positive=long_form_false_positive,
+            action_blocked=action_blocked,
+            measured_values=measured_values,
+            calculate_result=calculate_result,
+        )
+        return outcome
+
+    @staticmethod
+    def _derive_turn_outcome_with_reason(
+        response: str,
+        step_credits: list[dict] | None,
+        *,
+        query: str = "",
+        tool_routing_false_positive: bool = False,
+        long_form_false_positive: bool = False,
+        action_blocked: bool = False,
+        measured_values: dict[str, set[int]] | None = None,
+        calculate_result: float | None = None,
+    ) -> tuple[str, str | None]:
+        """ターン成否 ("success" | "partial" | "failed") と理由を決定論導出する。
 
         SSE 完走 = 成功ではなく、応答本文の [failed] マーカー・step_credits
         全 0・ルーティング false_positive・ユーザー発話のオウム返し、および
@@ -1054,19 +1118,21 @@ class FeedbackCollector:
         """
         text = response or ""
         if _FAILED_MARKER_RE.search(text):
-            return "partial" if _DONE_MARKER_RE.search(text) else "failed"
+            if _DONE_MARKER_RE.search(text):
+                return "partial", "some tasks failed"
+            return "failed", "all tasks failed"
         if step_credits and all(
             not (c.get("credit") or 0) for c in step_credits
         ):
-            return "failed"
+            return "failed", "no step credit"
         if tool_routing_false_positive or long_form_false_positive:
-            return "failed"
+            return "failed", "routing false positive"
         if _is_user_echo(query, text):
-            return "failed"
+            return "failed", "user echo"
         broken = FeedbackCollector._find_broken_output_reason(text)
         if broken is not None:
             logger.info("Turn marked failed (%s)", broken)
-            return "failed"
+            return "failed", broken
         # システムが「撃てなかった」と知っているのに本文が完了を述べている =
         # 真偽の推定ではなく **矛盾**。2026-08-22 ライブ監査で 2 ターン続けて
         # 起きた形 (Action blocked が出ているのに「削除しました。」、ファイルは残存)。
@@ -1077,28 +1143,36 @@ class FeedbackCollector:
                     "Turn marked failed (claimed %r while the action was "
                     "blocked)", claim,
                 )
-                return "failed"
+                return "failed", f"claimed completion while blocked: {claim}"
         # 実測値を注入したのに別の数を述べている = 同じく矛盾。
         # 2026-08-22 ライブ監査: 実測 86 文字を注入済みで「100文字です」。
         mismatch = contradicts_measured_values(text, measured_values or {})
         if mismatch is not None:
             logger.info("Turn marked failed (%s)", mismatch)
-            return "failed"
+            return "failed", f"measured value contradiction: {mismatch}"
+        # calculate の結果を渡したのに本文がそれを使っていない = 暗算で別の数を
+        # 述べた。ツール結果は「確かめた事実」なので、これも推定ではなく矛盾
+        # (2026-09-05 ライブ監査 F-03: 結果 17,305,634 が本文に 1 つも現れず、
+        # 手数料を 10 倍に誤った結論が reward=1.0 で成功経験になっていた)。
+        ignored = ignores_calculate_result(text, calculate_result)
+        if ignored is not None:
+            logger.info("Turn marked failed (%s)", ignored)
+            return "failed", f"tool result ignored: {ignored}"
         # 明示された文字数指定を破っている = 指定は本文にあり長さは数えるだけ
         # なので、これも推定ではなく矛盾。2026-08-22 ライブ監査の
         # 「ちょうど100文字で」→ 86 文字は success として学習に入っていた。
         broken_length = violates_length_constraint(query, text)
         if broken_length is not None:
             logger.info("Turn marked failed (%s)", broken_length)
-            return "failed"
+            return "failed", f"length constraint: {broken_length}"
         # 形式指定 (箇条書き / 項目数 / 数値だけ) も同じ扱い。数えるだけで
         # 決まるので推定を含まない。文字数だけ見て形式を見ないと、
         # 「3つ箇条書きで」に 1 行で答えたターンが success として学習に入る。
         broken_form = violates_output_form(query, text)
         if broken_form is not None:
             logger.info("Turn marked failed (%s)", broken_form)
-            return "failed"
-        return "success"
+            return "failed", f"output form: {broken_form}"
+        return "success", None
 
     @staticmethod
     def _find_broken_output_reason(text: str) -> str | None:

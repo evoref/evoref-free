@@ -146,6 +146,11 @@ class LearningConfig(BaseModel):
     # 決定論なので微小差も実差だが、少数の held-out ケースに対する 0.0x% の
     # 改善は汎化ではなく過適合で、LoRA の版だけが増える。既定 0.1%。
     level2_min_improvement_ratio: float = Field(default=0.001, ge=0.0, le=1.0)
+    # 採用に必要な改善幅の下限を、反復間の loss 標準偏差 × この値でも重ねる
+    # (比率と併用、大きい方が効く)。best は多数のノイズ標本の最小値で選択
+    # バイアスを持ち、3 件評価では 0.1% の比率をノイズが軽々と越える
+    # (2026-09-05 実機: 差分 0.17% に対し反復レンジ 1.2%)。0 で無効。
+    level2_min_improvement_sigma: float = Field(default=1.0, ge=0.0)
     # SPSA の best が更新されないまま連続でこの反復数を超えたら打ち切る (0 で無効)。
     # 実推論 eval 経路のみ有効 (1 反復 = 候補サーバ 2 起動)。
     level2_early_stop_patience: int = Field(default=10, ge=0)

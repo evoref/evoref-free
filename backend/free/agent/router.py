@@ -11,7 +11,7 @@ from backend.free.agent.context_budget import resolve_meta_cognitive_loop_budget
 from backend.free.agent.meta_cognitive_text import assigns_file_content
 from backend.free.agent.safety_patterns import strip_command_literals
 from backend.free.core.intent_vocab import (
-    CALCULATE_TERM,
+    CALCULATE_TOOL_TERM,
     CODE_SEARCH_PATTERNS,
     EXECUTABLE_QUERY_PATTERNS_EN,
     EXECUTABLE_QUERY_PATTERNS_JA,
@@ -26,6 +26,7 @@ from backend.free.core.intent_vocab import (
     URL_LITERAL_RE,
     ascii_boundary_alternation,
     exact_greeting_pattern,
+    is_practice_advice_query,
     looks_like_numeric_question,
     PREMISE_CONFIRMATION_RE,
 )
@@ -601,7 +602,7 @@ _TOOL_PATTERNS_SHARED = [
     # meta_cognitive へ振られるため、層の振り分けでは明示 URL に限定する
     # (意図的分岐、f_03 §12.1)。
     URL_LITERAL_RE,
-    re.compile(CALCULATE_TERM, re.IGNORECASE),
+    re.compile(CALCULATE_TOOL_TERM, re.IGNORECASE),
 ]
 
 TOOL_PATTERNS = [
@@ -707,6 +708,8 @@ def is_environment_fact_query(query: str) -> bool:
     更新されて「測定要求なのに注記が付かない / 測定要求でないのに付く」の
     どちらかがずれる (純粋関数)。
     """
+    if is_practice_advice_query(query):
+        return False
     return _matches_any(_EXECUTABLE_QUERY_PATTERNS, query) or _matches_any(
         _EXECUTABLE_QUERY_PATTERNS_EN, query,
     )
