@@ -18,6 +18,7 @@ from backend.free.core.intent_vocab import (
     continuation_request,
     has_history_recall_keyword,
     persist_request,
+    request_clauses,
     runtime_info_question,
     tool_inventory_question,
     GREETING_PUNCTUATION_JA,
@@ -1307,9 +1308,15 @@ class ComplexityClassifier:
             return False
         if _HOWTO_QUERY_RE.search(query):
             return False
+        # **依頼している文だけ** を見る。状況説明やバグの描写に現れる書込み語
+        # (「tail を追い越してデータを上書きします」) から書込み動詞と書込み先の
+        # 双方を拾い、成立しないファイル出力タスクを組んでいた
+        # (2026-09-06 監査 F-02。26.6 分かけて生成した成果物を捨てて
+        # 「(書き込みが実行されませんでした)」だけを返した)。
+        probe = request_clauses(query)
         # コマンドリテラル (`dir E:\tmp\x`) 内のパスは実行対象の引数であって
         # 書込み先ではない。書込み動詞・パスの双方をこれを除いた本文で判定する。
-        probe = strip_command_literals(query)
+        probe = strip_command_literals(probe)
         # 「いま書いたそのファイル」のような既出成果物への言及は、依頼された
         # 動作ではなく対象の説明。書込み動詞判定から除外する。
         probe = _DESCRIPTIVE_WRITE_CLAUSE_RE.sub(" ", probe)
@@ -1500,3 +1507,24 @@ def _can_use_meta_cognitive(
     )
 
     return loop_budget >= min_budget
+
+
+def indicates_write_destination(query: str) -> bool:
+    """発話が **書込み先** を指しているか (純粋関数)。
+
+    明示パス / 裸のファイル名 / 参照表現 (「同じファイルに」) のいずれか。
+    ``_is_local_write_intent`` が書込み動詞と組で見ている「宛先の証拠」だけを
+    切り出したもので、判定は同じパターンを共有する。
+
+    出力先の決定 (``chat.py`` の ``output_target``) がこれを見る。宛先が
+    無いのに ``file`` を選ぶと、write_file を撃ちようがないタスクが組まれ、
+    生成した成果物が「書き込みが実行されませんでした」で捨てられる
+    (2026-09-06 監査 F-02)。
+    """
+    probe = strip_command_literals(request_clauses(query))
+    probe = _DESCRIPTIVE_WRITE_CLAUSE_RE.sub(" ", probe)
+    return bool(
+        _LOCAL_PATH_RE.search(probe)
+        or _BARE_FILENAME_TARGET_RE.search(probe)
+        or _REFERENTIAL_WRITE_TARGET_RE.search(probe),
+    )

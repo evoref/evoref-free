@@ -58,6 +58,20 @@ class FeedbackSignals:
     # "hardcoded" | "prev_failed" | "same_target" | None。旧 "learned"
     # (学習パターン照合) は 2026-07-21 廃止 — 過去データには残存しうる
     correction_detected_by: str | None = None
+    # この訂正が指す **誤っていたターン** の ``ExperienceEntry.id``。
+    #
+    # 訂正ペア (「元の問い → 訂正後の正しい回答」) を組むのに要る対応関係で、
+    # **記録時にしか確定できない** (セッションが分かっていて、直近ターンの
+    # 応答本文が手元にある)。以前はこれを残さず、後段の
+    # ``learning.corrected_pairs`` がバッファの直前エントリを元の問いとみなして
+    # 再導出していた。バッファは全セッション横断の 1 本なので、別会話の訂正が
+    # 隣り合うと問いと訂正が食い違う (2026-09-06 ライブ監査 F-01: 訂正 7 件が
+    # few-shot にも eval_core にも 1 件も入らなかった)。
+    #
+    # 同定は ``core.correction_target.resolve_correction_target`` (訂正文が
+    # 引用する値・識別子と応答本文の重なり) で行う。旧データには無いので
+    # ``None`` を許容し、消費側はセッション単位のフォールバックを持つ。
+    corrected_entry_id: str | None = None
     # アシスタント自身が応答冒頭で前ターンの誤りを撤回したか
     # (「失礼いたしました」「訂正します」等)。ユーザーの字句に依らない
     # 高確度シグナルで、**誤っていたのは 1 つ前のターン**。検出時は
@@ -198,15 +212,31 @@ _GEN_CONFIG_FIELD_NAMES = frozenset(f.name for f in fields(GenerationConfigRef))
 
 
 class ExperienceBuffer(JsonStateStore):
-    """経験バッファ: 毎応答時にエントリを記録"""
+    """経験バッファ: 毎応答時にエントリを記録し、その場で永続化する。
+
+    **耐久性はこのストア自身の責務**。以前は ``save()`` の呼出元が
+    ``memory.sleep_update`` と ``core.model_migration`` しか無く、記録された
+    エントリはアイドル窓の sleep-time サイクルが回るまでディスクに存在しな
+    かった。``FeedbackCollector`` は記録のたびに "Recorded experience" を
+    ログへ出すため、**ログ上は記録済みに見えて実体が無い** 窓が常時開いて
+    いる (2026-09-06 監査 F-04: 50 ターン完走直後、メモリ 50 件に対しファイル
+    49 件)。Level 2 の発火判定はこのバッファの失敗件数を見るので、再起動や
+    クラッシュの時刻次第で学習データが目減りする。
+
+    c_05 §0.5 は「各ストアは保持方針を宣言する」と定めており、保持を他の
+    サブシステムのスケジュールに預ける形はその趣旨から外れる。
+    """
 
     _state_logger = logger
 
-    def __init__(self, max_entries: int = MAX_ENTRIES):
+    def __init__(self, max_entries: int = MAX_ENTRIES, *, autosave: bool = True):
         self.max_entries = max_entries
         self.entries: list[ExperienceEntry] = []
         # 直近に load / save したパーティションのファイル (rebind 時の退避先)。
         self.bound_path: Path | None = None
+        #: ``record`` / ``flush`` で :attr:`bound_path` へ自動保存するか。
+        #: 単体テストが一時ディレクトリを汚さないよう無効化できる。
+        self.autosave = autosave
 
     def save(self, path: str | Path) -> None:
         super().save(path)
@@ -214,6 +244,16 @@ class ExperienceBuffer(JsonStateStore):
 
     def load(self, path: str | Path) -> None:
         super().load(path)
+        self.bound_path = Path(path)
+
+    def bind(self, path: str | Path) -> None:
+        """保存先だけを設定する (読み込みはしない)。
+
+        ファイルが未作成の初回起動でも :meth:`flush` が働くようにするための
+        入口。``load`` は「ファイルがあるときだけ」呼ばれるため、これが無いと
+        **初回セッションのあいだ自動保存が無効** になり、F-04 が新規環境で
+        そのまま再現する。
+        """
         self.bound_path = Path(path)
 
     def rebind(self, path: str | Path, *, previous: str | Path | None = None) -> None:
@@ -258,6 +298,20 @@ class ExperienceBuffer(JsonStateStore):
             overflow = len(self.entries) - self.max_entries
             self.entries = self.entries[overflow:]
             logger.info("Rotated %d old entries", overflow)
+
+        self.flush()
+
+    def flush(self) -> None:
+        """バインド済みパーティションへ書き出す (未バインド / 無効時は no-op)。
+
+        ``record`` から毎ターン呼ぶ。書き込みは ``AtomicWriter`` 経由で、
+        失敗しても ``JsonStateStore.save`` が WARNING を出して縮退するため
+        チャット応答は止まらない。まとめ書き (デバウンス) はしない —
+        「直近の 1 ターンだけ落ちる」窓を残すと、それが F-04 そのものになる。
+        """
+        if not self.autosave or self.bound_path is None:
+            return
+        super().save(self.bound_path)
 
     def get_recent(self, n: int = 10) -> list[ExperienceEntry]:
         """直近 n 件取得"""

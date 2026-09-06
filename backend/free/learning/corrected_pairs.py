@@ -29,6 +29,13 @@ import hashlib
 import re
 from dataclasses import dataclass
 
+from backend.free.core.correction_target import (
+    IDENTIFIER_RE,
+    NUMBER_LITERAL_RE,
+    QUOTED_RE,
+    STOP_IDENTIFIERS,
+)
+
 #: 訂正後の回答の先頭に付く謝罪・受諾の前置き。1 文単位で繰り返し剥がす。
 _PREAMBLE_SENTENCE_RE = re.compile(
     r"^\s*(?:"
@@ -46,8 +53,16 @@ _ACK_ONLY_RE = re.compile(
 )
 
 #: 直前ターンへの照応・継続 (「修正版に」「2 案を採用」「その」「続けて」)。
+#:
+#: ``その他`` / ``それぞれ`` は **照応ではない** — 前者は「その他大勢」の
+#: 一語、後者は複数対象への配分を表す副詞で、どちらも直前ターンを指さない。
+#: 素の ``その`` / ``それ`` で拾うと、文脈非依存の問いまで文脈依存に倒れる。
+#: 実測 (2026-09-06): 正しく組めた訂正ペア 4 件のうち 2 件がこの 2 語だけで
+#: 棄却され、eval_core / few-shot への追加が 0 件のままだった (F-01 の宛先を
+#: 直しても受け皿に届かない)。
 _ANAPHORA_RE = re.compile(
-    r"それ|その|これ|この|あれ|あの|さっき|先(?:ほど|程)|直前|(?<![名以事手])前の"
+    r"それ(?!ぞれ)|その(?!他)|これ|この|あれ|あの|さっき|先(?:ほど|程)|直前"
+    r"|(?<![名以事手])前の"
     r"|(?<!の)上の|上記|同じ|同様|続き|続けて|もう一度|再度|最初の|ここまで|今の"
     r"|修正版|最終版|改訂版|案を採用|を採用",
 )
@@ -57,20 +72,18 @@ _MEMORY_OR_TOOL_RE = re.compile(
     r"|ファイル|保存|読んで|読み|実行|検索|コマンド|ディレクトリ|フォルダ",
 )
 
-#: 訂正文から期待キーワードを拾う: 数値 (桁区切り・小数付き)、識別子/英単語
-#: (3 文字以上)、鉤括弧で囲まれた語。
-_NUMBER_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?")
-_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.*]{2,}")
-_QUOTED_RE = re.compile(r"[「『]([^」』]{1,40})[」』]")
+#: 訂正文から期待キーワードを拾う正規表現。**``core.correction_target`` が
+#: SSOT**。同じトークン抽出を 2 箇所に書くと、片方だけ直したときに
+#: 「訂正の宛先を決めた根拠」と「期待キーワード」が別基準になる。
+_NUMBER_RE = NUMBER_LITERAL_RE
+_IDENTIFIER_RE = IDENTIFIER_RE
+_QUOTED_RE = QUOTED_RE
 #: 「X ではなく Y」の境界。X 側 (誤りだった値) は期待値ではない。「それは
 #: 間違いです」型の全体否定は境界にしない (回答全体を指すだけで値を挟まない)。
 _NEGATED_VALUE_RE = re.compile(r"(?:ではなく|じゃなく)")
 #: 「… = 51,148.8 円」の右辺。訂正が式で示されたら、答えの値は必須の期待語。
 _EQUATION_RHS_RE = re.compile(r"[=＝]\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)")
-_STOP_IDENTIFIERS = frozenset({
-    "the", "and", "for", "not", "but", "with", "from", "import", "def", "class",
-    "return", "print",
-})
+_STOP_IDENTIFIERS = STOP_IDENTIFIERS
 #: 短い継続指示 (「表にしてください。」「箇条書きで。」「続けて。」): 対象を
 #: 言わない依頼形の文末で、この長さ以下。「べき等性とは何ですか。」のような
 #: 短い問いは対象を含むので拾わない。
@@ -209,6 +222,49 @@ def response_honors_correction(response: str, correction: str) -> bool:
     return hits * 2 >= len(keywords)
 
 
+def resolve_corrected_turn(
+    experiences: list[dict], index: int,
+) -> dict | None:
+    """``experiences[index]`` の訂正が指す **誤っていたターン** を返す (純粋関数)。
+
+    優先順:
+
+    1. ``signals.corrected_entry_id`` — 記録時に
+       ``core.correction_target.resolve_correction_target`` が本文の重なりで
+       確定した宛先。**これが唯一の正しい情報源**。
+    2. 同一 ``session_id`` の直前ターン — 旧データ (宛先未記録) 向け。
+       会話をまたがないので、少なくとも別の会話のターンとは組まれない。
+    3. 双方に ``session_id`` が無い場合のみ、バッファ上の直前ターン。
+       セッションの概念が無かった時期のデータを取りこぼさないための最終手段。
+
+    2 と 3 を分けているのは、``session_id`` を持つデータで 3 に落ちると
+    **本モジュールが直そうとしている欠陥そのもの** (別会話のターンと組む) が
+    再現するため。
+    """
+    exp = experiences[index]
+    target_id = (exp.get("signals") or {}).get("corrected_entry_id")
+    if target_id:
+        for cand in reversed(experiences[:index]):
+            if cand.get("id") == target_id:
+                return cand
+        # ID はあるが対象がバッファから溢れている = 学習に使える素材が無い。
+        # 位置で代用すると誤ったペアになるので諦める。
+        return None
+
+    session = str(exp.get("session_id") or "")
+    if session:
+        for cand in reversed(experiences[:index]):
+            if str(cand.get("session_id") or "") == session:
+                return cand
+        return None
+
+    prev = experiences[index - 1] if index > 0 else None
+    if prev is not None and str(prev.get("session_id") or ""):
+        # 訂正側にセッションが無く直前ターンにはある = 別会話の可能性が高い。
+        return None
+    return prev
+
+
 def build_corrected_pairs(
     experiences: list[dict], mode: str | None = None,
 ) -> list[CorrectedPair]:
@@ -216,36 +272,53 @@ def build_corrected_pairs(
 
     ``mode`` を渡すとそのモードのターンだけを見る。同一 (query, response) は
     最新 1 件に畳む。
+
+    対応付けは :func:`resolve_corrected_turn` に委ねる。以前はここが
+    **バッファ上の直前エントリ** を無条件に元の問いとみなしており、会話を
+    またいで訂正が並ぶと問いと訂正が食い違った (2026-09-06 監査 F-01)。
+
+    訂正後の回答が **自身の検証に失敗している** ターン
+    (``turn_outcome == "failed"``: 算術矛盾 / 出力破損 / 制約違反) は手本にも
+    評価ケースにもしない。訂正で 1 つ直しても別の欠陥を持ち込んだ回答を
+    「正しい回答」として再生産すると、few-shot が壊れた形を増幅する
+    (2026-09-06 監査 F-05)。
     """
     pairs: dict[str, CorrectedPair] = {}
-    prev: dict | None = None
-    for exp in experiences:
-        if mode is not None and exp.get("mode") != mode:
-            continue
+    scoped = [
+        e for e in experiences
+        if mode is None or e.get("mode") == mode
+    ]
+    for i, exp in enumerate(scoped):
         signals = exp.get("signals") or {}
         correction = signals.get("user_correction")
-        if correction and prev is not None:
-            query = str(prev.get("query") or "").strip()
-            fixed = strip_correction_preamble(
-                str(exp.get("response_full") or exp.get("response_summary") or ""),
-            )
-            if (
-                query and fixed
-                and not signals.get("truncated", False)
-                and response_honors_correction(fixed, str(correction))
-            ):
-                pair = CorrectedPair(
-                    query=query,
-                    response=fixed,
-                    correction=str(correction).strip(),
-                    mode=str(exp.get("mode") or "chat"),
-                    timestamp=str(exp.get("timestamp") or ""),
-                    wrong_response=str(
-                        prev.get("response_full") or prev.get("response_summary") or ""
-                    ),
-                )
-                pairs[pair.pair_id] = pair
-        prev = exp
+        if not correction:
+            continue
+        if signals.get("truncated", False):
+            continue
+        if signals.get("turn_outcome") == "failed":
+            continue
+        prev = resolve_corrected_turn(scoped, i)
+        if prev is None:
+            continue
+        query = str(prev.get("query") or "").strip()
+        fixed = strip_correction_preamble(
+            str(exp.get("response_full") or exp.get("response_summary") or ""),
+        )
+        if not (query and fixed):
+            continue
+        if not response_honors_correction(fixed, str(correction)):
+            continue
+        pair = CorrectedPair(
+            query=query,
+            response=fixed,
+            correction=str(correction).strip(),
+            mode=str(exp.get("mode") or "chat"),
+            timestamp=str(exp.get("timestamp") or ""),
+            wrong_response=str(
+                prev.get("response_full") or prev.get("response_summary") or ""
+            ),
+        )
+        pairs[pair.pair_id] = pair
     return list(pairs.values())
 
 
@@ -255,6 +328,7 @@ __all__ = [
     "depends_on_context",
     "expected_keywords_from_correction",
     "refers_to_previous_turn",
+    "resolve_corrected_turn",
     "response_honors_correction",
     "strip_correction_preamble",
 ]

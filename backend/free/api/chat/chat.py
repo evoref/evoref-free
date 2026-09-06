@@ -29,6 +29,7 @@ from backend.free.api.schemas import (
     CancelRequest, CancelResponse, ChatRequest, ChatResponse, TokenInfo,
 )
 from backend.free.api.chat._editor_routing import detect_editor_route
+from backend.free.agent.router import indicates_write_destination
 from backend.free.agent.tool_call_judge import (
     _extract_file_path,
     _recent_dialogue_text,
@@ -1832,7 +1833,20 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 output_target = "editor"
             editor_route = "editor" if output_target == "editor" else "chat"
         else:
-            output_target = "file"
+            # chat モードも **書込み先が特定できるときだけ** file にする。
+            #
+            # 従来は無条件に "file" だったため、パスを一切含まない依頼でも
+            # 「書き込む」プランが組まれ、write_file を撃ちようがないまま
+            # ``write expected but not executed`` で failed になり、生成済みの
+            # 成果物が捨てられていた (2026-09-06 監査 F-02: 26.6 分かけて
+            # draft_document が正しい回答を 3 本生成したのに、届いたのは
+            # 「(書き込みが実行されませんでした)」の 17 文字だけ)。
+            #
+            # 「パス未指定なら書かずに本文へ返す」経路 (``_execute_editor_task``)
+            # は元から実装されていたのに、create モードにしか繋がっていなかった。
+            output_target = (
+                "file" if indicates_write_destination(req.message) else "chat"
+            )
             editor_route = None
 
         # 実際に注入されたファクトの属性スロット。「この属性の現在値はもう

@@ -137,6 +137,25 @@ _CALIB_P95_HEADROOM = 1.3
 _CALIB_SAMPLE_WINDOW = 20
 _CALIB_MIN_SAMPLES = 3
 
+#: 背景 purpose のタイムアウト下限を **モデルの decode 速度に追随** させる。
+#:
+#: ``PURPOSE_TIMEOUT_DEFAULTS`` は絶対秒の定数で、どのモデルで測ったのかを
+#: 表現できない。27B では 45 秒の purpose が実測 48.5 秒に届かず落ちた
+#: (2026-09-06 監査 F-06: ``fewshot_quality_score`` / ``assertion_naming``)。
+#: 較正は **失敗か成功を観測してから** しか効かないので、低頻度の purpose は
+#: 毎回 1 回目を捨てることになる。同じ轍は c_15 のプローブでも踏んでおり、
+#: そちらは ``capability.probe_timeout_sec`` (base + tokens / decode_tps) で
+#: 解いた。ここでも同じ式を使う。
+#:
+#: **チャット応答パスの purpose には掛けない**。あちらの短い予算は
+#: 「ユーザーを待たせない」ための意図的な打ち切りで、伸ばすと目的が壊れる。
+#: 背景 purpose は伸ばしても失うのはアイドル時間だけで、落ちると学習データを
+#: 丸ごと失う — 非対称なので下限を厚く取る側が正しい。
+_BACKGROUND_TIMEOUT_BASE_SEC = 30.0
+#: 下限の見積りに使う生成トークン数。実際の ``max_tokens`` は呼出ごとに違うが、
+#: 下限は「この purpose なら最低これだけは待つ」という床なので固定で足りる。
+_BACKGROUND_TIMEOUT_TOKENS = 512
+
 #: **チャット応答パスで同期発火する** purpose。背景スロットは sleep-time /
 #: 学習と共有で、そちらが走っていると per-slot ロック待ちでユーザー応答が
 #: 遅れる。``llama.slots >= 3`` なら分類器スロット (``classifier_slot``、
@@ -270,12 +289,35 @@ class AuxClient:
         """ベースモデルの有効 context_size (サイズガードが参照する)。"""
         return int(getattr(self.local, "context_size", 8192) or 8192)
 
+    def _background_timeout_floor(self) -> float:
+        """背景 purpose のタイムアウト下限 (モデルの decode 速度由来)。
+
+        取得できない構成 (メタデータ未解決) では 0.0 を返し、床を掛けない。
+        """
+        from backend.free.llm.capability import probe_timeout_sec
+
+        try:
+            params_b = float(self.metadata.params_b)
+        except Exception:
+            return 0.0
+        if params_b <= 0:
+            return 0.0
+        return probe_timeout_sec(params_b, _BACKGROUND_TIMEOUT_TOKENS)
+
     def resolve_effective_timeout(self, purpose: str) -> float:
-        """purpose に適用されるタイムアウト秒を返す (較正値込み)。"""
+        """purpose に適用されるタイムアウト秒を返す (較正値込み)。
+
+        較正値が無い背景 purpose には **モデルサイズ由来の下限** を掛ける。
+        既定の絶対秒はどのモデルで測ったのかを表現できず、大型モデルでは
+        1 回目が必ず落ちる (``_BACKGROUND_TIMEOUT_BASE_SEC`` の説明を参照)。
+        """
         calibrated = self._calibrated.get(purpose)
         if calibrated is not None:
             return calibrated
-        return PURPOSE_TIMEOUT_DEFAULTS.get(purpose, _DEFAULT_TIMEOUT)
+        base = PURPOSE_TIMEOUT_DEFAULTS.get(purpose, _DEFAULT_TIMEOUT)
+        if purpose in CHAT_PATH_PURPOSES:
+            return base
+        return max(base, self._background_timeout_floor())
 
     def _resolve_response_format(
         self,
