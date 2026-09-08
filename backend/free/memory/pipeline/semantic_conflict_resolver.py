@@ -1,14 +1,30 @@
 """
 
 EvorefMem 統合仕様 における sleep-time **Step 6** の SemMem 対応分
-``backend/free/memory/pipeline/conflict_resolver.py`` は ShortTermMemory (FadeMem)
-向けで、本モジュールは ``SemanticFactStore`` 上で同 ``(subject, predicate)``
+``backend/free/memory/pipeline/conflict_resolver.py`` は短期ノート
+向けで、本モジュールは ``SemanticStore`` 上で同 ``(subject, predicate)``
 を持つ複数ファクトの競合を解消する。
+
+競合の状態は **レコードのフィールド** が持つ (c_16 §4.2):
+
+- 未解決 = ``veracity="disputed"`` + 相互 ``contradicts``
+- 解決   = 敗者に ``superseded_by``、勝者は ``veracity="stated"`` へ戻す
+
+勝ち方は **namespace ごとに違う**
+(:mod:`~backend.free.memory.semantic.namespaces`):
+
+- ``mem.*``  … ``origin=user`` かつ ``as_of`` が新しい方
+- ``know.*`` … ``as_of`` が新しく ``confidence`` が高い方
+- ``idx.*``  … 上書き (常に新しい方)
+- ``loop.*`` / ``learn.*`` … pillar 所有。現行どおり newest-wins + 手動タグ
+
+**namespace が違うレコードは競合させない** — 規則が違うもの同士で勝者を
+決められないため (c_16 §4.2)。
 
 設計仕様:
 
 1. ``project_tag_always_manual: true`` を基本とする。
-   ``project`` / ``policy`` タグの競合は ``review_status="pending"`` に
+   ``project`` / ``policy`` タグの競合は ``veracity="disputed"`` に
    振り分け、チャット確認フロー (``conflict_review`` /
    ``conflict_chat_judge``) で人手解決する (専用 UI は PR #106 で撤去済)
 2. 例外として、``auto_for_evolved_policies: true`` かつ winner が
@@ -19,7 +35,7 @@ EvorefMem 統合仕様 における sleep-time **Step 6** の SemMem 対応分
    以内) は pending に振り分ける。
 4. ``default_mode: manual`` では全件 pending。
 5. pinned ファクトを含む競合は常に pending (誤って自動消失するのを防ぐ)。
-6. ``pending_auto_resolve_days`` (既定 3 日) 超過の滞留 pending は
+6. ``pending_auto_resolve_days`` (既定 3 日) 超過の滞留 disputed は
    ``resolve()`` 冒頭の TTL pre-pass (``_resolve_expired_pending``) が
    keep_new で自動解消する (``conflicts_resolved.jsonl`` に
    ``decision="ttl_auto"``)。**pinned / project / policy も対象**
@@ -57,8 +73,9 @@ from typing import Any, Iterable, Literal
 
 import numpy as np
 
-from backend.free.memory.semantic.store import SemanticFactStore
 from backend.free.memory.attribute_key import attribute_key
+from backend.free.memory.protocols import SemanticFactStoreProtocol
+from backend.free.memory.semantic.namespaces import namespace_of, policy_for
 from backend.free.memory.types import SemanticFact
 from backend.log_config import get_logger
 
@@ -245,7 +262,7 @@ def _newest_of(facts: list[SemanticFact]) -> SemanticFact:
 
     ``MemoryInjector._supersedes`` と同じ意味論:
 
-    - ``created_at`` が新しい方を残す。
+    - ``created_at`` (= 永続形の ``as_of``) が新しい方を残す。
     - **同着を落とさない** — 1 回の sleep-time バッチで抽出されたファクトは
       秒未満の差しか持たず、実測では ``created_at`` が完全に一致する。訂正は
       同じセッションで起きるのでまさにその同着に当たる。ファクトは会話順に
@@ -261,6 +278,28 @@ def _newest_of(facts: list[SemanticFact]) -> SemanticFact:
             winner = fact
     return winner
 
+def winner_by_namespace(facts: list[SemanticFact]) -> SemanticFact:
+    """namespace の競合規則で勝者を選ぶ (c_16 §4.2)。``facts`` は as_of 昇順。
+
+    - ``user_stated_wins`` (``mem.*``): ``origin=user`` のものだけで
+      :func:`_newest_of` を取る。ユーザーの言明が 1 件も無ければ全体で取る
+      (ツール由来同士の新旧は素直に新しい方)。
+    - ``newest_confident_wins`` (``know.*``): ``as_of`` の新しさを主鍵、
+      ``confidence`` を副鍵にする。同じ時点なら確度の高い出所を採る。
+    - ``overwrite`` (``idx.*``): 常に最新 (索引は上書き)。
+    - ``pillar_owned`` (``loop.*`` / ``learn.*``): 現行どおり :func:`_newest_of`。
+    """
+    if not facts:
+        raise ValueError("winner_by_namespace needs at least one fact")
+    rule = policy_for(facts[0].subject).competition
+    if rule == "user_stated_wins":
+        stated = [f for f in facts if f.origin == "user"]
+        return _newest_of(stated or facts)
+    if rule == "newest_confident_wins":
+        return max(facts, key=lambda f: (f.created_at, float(f.confidence)))
+    return _newest_of(facts)
+
+
 Decision = Literal["auto", "pending"]
 
 
@@ -275,7 +314,7 @@ class ConflictDecision:
 
 
 class SemanticConflictResolver:
-    """1 ``SemanticFactStore`` 内のファクト競合を検出し解消するリゾルバ。
+    """1 スコープ内のファクト競合を検出し解消するリゾルバ。
 
     インスタンスは 1 sleep-time サイクル内で使い捨てる前提とし、内部状態は
     持たない。``resolve()`` を呼び出すと検出 → 判定 → 適用 → ファイル記録
@@ -284,7 +323,7 @@ class SemanticConflictResolver:
 
     def __init__(
         self,
-        store: SemanticFactStore,
+        store: SemanticFactStoreProtocol,
         config: dict | None = None,
         *,
         now_provider=None,
@@ -339,6 +378,7 @@ class SemanticConflictResolver:
             "ttl_auto_resolved": 0,
             "cross_slot_collapsed": 0,
         }
+        self._hydrate_embeddings()
         self._resolve_expired_pending(result)
         self._collapse_cross_slot_generations(result)
         groups = self._detect_groups()
@@ -357,6 +397,23 @@ class SemanticConflictResolver:
                 self._infer_scope(),
             )
         return result
+
+    def _hydrate_embeddings(self) -> None:
+        """作業用ベクトルを snapshot から載せる (c_16 §6.1)。
+
+        :func:`split_by_attribute_similarity` は ``fact.embedding`` で「同じ
+        属性について語っているか」を割る。ベクトルはレコードに持たなくなった
+        ので、ここで 1 度だけ復元する。**載せないと判定不能扱いで全部が 1 塊に
+        なり**、飲み物と食べ物が同じ矛盾として提示される (2026-08-16 の症状に
+        戻る)。
+        """
+        hydrate = getattr(self.store, "hydrate_embeddings", None)
+        if not callable(hydrate):
+            return
+        try:
+            hydrate(self.store.all_facts(include_superseded=False))
+        except Exception as exc:  # noqa: BLE001 — 版が無ければ判定不能で続行
+            logger.debug("conflict: embedding hydration skipped: %s", exc)
 
     # ── 属性またぎの世代畳み込み (pre-pass) ──────────────────────────
 
@@ -520,8 +577,8 @@ class SemanticConflictResolver:
     def _detect_groups(self) -> list[list[SemanticFact]]:
         """同 ``(subject, predicate)`` で異なる ``object`` を持つ active ファクト群を抽出する。
 
-        ``review_status == "pending"`` のファクトは前サイクルで既に pending
-        と判定済みなので再処理しない (二重通知防止)。
+        ``veracity == "disputed"`` のファクトは前サイクルで既に未解決と判定
+        済みなので再処理しない (二重通知防止)。
 
         スロットは属性単位に分かれている **はず** だが、トリガ辞書に無い属性は
         ``mem.personal.user`` へフォールバックするため、無関係な事実が同居する。
@@ -529,11 +586,13 @@ class SemanticConflictResolver:
         (:func:`split_by_attribute_similarity`)。
         """
         active = self.store.all_facts(include_superseded=False)
-        buckets: dict[tuple[str, str], list[SemanticFact]] = {}
+        buckets: dict[tuple[str, str, str], list[SemanticFact]] = {}
         for f in active:
-            if f.review_status == "pending":
+            if f.veracity == "disputed":
                 continue
-            buckets.setdefault((f.subject, f.predicate), []).append(f)
+            buckets.setdefault(
+                (namespace_of(f.subject), f.subject, f.predicate), [],
+            ).append(f)
         groups: list[list[SemanticFact]] = []
         for facts in buckets.values():
             if len(facts) < 2:
@@ -552,10 +611,20 @@ class SemanticConflictResolver:
     # ── 判定 ─────────────────────────────────────────────────────────
 
     def _decide(self, facts: list[SemanticFact]) -> ConflictDecision:
-        """1 グループの自動/手動判定を返す。``facts`` は created_at 昇順。"""
-        winner = facts[-1]
-        losers = tuple(facts[:-1])
+        """1 グループの自動/手動判定を返す。``facts`` は created_at 昇順。
+
+        勝者は namespace の規則で選ぶ (:func:`winner_by_namespace`)。
+        """
+        winner = winner_by_namespace(facts)
+        losers = tuple(f for f in facts if f.id != winner.id)
         types_in_group = {f.type for f in facts}
+
+        # ``idx.*`` は **上書き** (c_16 §4.2)。URL / コマンドのリコール索引は
+        # ユーザーに提示されない内部記録なので、確認を挟む意味が無い。
+        # disputed のまま残すと同じ索引行が 2 世代並び、リコールの top-k を
+        # 食い合う。pinned / default_mode より先に判定する。
+        if namespace_of(winner.subject) == "idx":
+            return ConflictDecision("auto", "index_overwrite", winner, losers)
 
         # ユーザーが明示的に訂正したターン由来の値は、確認を挟まず即採用する。
         #
@@ -653,26 +722,19 @@ class SemanticConflictResolver:
                     loser.id, winner.id, exc,
                 )
                 continue
-        # 解決 mark を winner にも残す
-        try:
-            self.store.update_fact(
-                winner.id,
-                review_status="resolved_keep_new",
-            )
-        except KeyError:
-            pass
+        # 競合が解けたので winner の disputed を畳む (c_16 §4.2)。
+        self.store.clear_dispute(winner.id)
         self._write_jsonl(CONFLICTS_RESOLVED_FILENAME, decision)
 
     def _apply_pending(self, decision: ConflictDecision) -> None:
-        for fact in (decision.winner, *decision.losers):
-            try:
-                self.store.update_fact(
-                    fact.id,
-                    requires_user_review=True,
-                    review_status="pending",
-                )
-            except KeyError:
-                continue
+        """未解決を ``veracity=disputed`` + 相互 ``contradicts`` で表す。
+
+        ``superseded_by`` はまだ立てない — 勝者が決まっていないので、どちらも
+        live のまま残す (c_16 §4.2)。
+        """
+        self.store.mark_disputed(
+            [decision.winner.id, *(f.id for f in decision.losers)],
+        )
         self._write_jsonl(CONFLICTS_PENDING_FILENAME, decision)
 
     # ── 永続化 ────────────────────────────────────────────────────────
@@ -695,17 +757,16 @@ class SemanticConflictResolver:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     def _infer_scope(self) -> str:
-        """ストアの ``root_dir`` 構造から scope 文字列を推定する。
+        """ストアの scope 文字列。
 
-        ``<semantic_root>/global`` or ``<semantic_root>/projects/<id>``
-        を仮定する。それ以外はディレクトリ名をそのまま返す。
+        スコープは **フィールド** になったので、ビューが持っている値をそのまま
+        使う (c_16 §4.2)。旧実装は ``root_dir`` のディレクトリ名から推定して
+        いたが、ディレクトリはもう scope を表していない。
         """
-        root = self.store.root_dir
-        if root.name == "global":
-            return "global"
-        if root.parent.name == "projects":
-            return f"project:{root.name}"
-        return root.name
+        scope = getattr(self.store, "scope", None)
+        if isinstance(scope, str) and scope:
+            return scope
+        return "global"
 
 
 def _provenance_keys(
@@ -723,7 +784,7 @@ def _provenance_keys(
 
 
 def resolve_semmem_conflicts(
-    stores: Iterable[SemanticFactStore],
+    stores: Iterable[SemanticFactStoreProtocol],
     config: dict | None = None,
 ) -> dict[str, int]:
     """複数ストアに対して :class:`SemanticConflictResolver` を順次適用する。

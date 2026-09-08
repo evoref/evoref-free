@@ -21,10 +21,10 @@ privacy を継承するようにしたが、**それは今後書かれるファ�
 ======================================  ==========================================
 subject 接頭辞                           使える手掛かり
 ======================================  ==========================================
-``mem.world.assertion.*``               ``_extra.source_note_id`` → STM ノート →
+``mem.world.assertion.*``               ``_extra.source_note_id`` → ノート →
                                         ``private`` (**厳密**)
-``mem.world.executable_command.*``      無し (``last_query`` / ``mode`` のみ)
-``mem.world.url.*``                     無し (``url`` / ``last_query`` のみ)
+``idx.command.*``                       無し (``last_query`` / ``mode`` のみ)
+``idx.url.*``                           無し (``url`` / ``last_query`` のみ)
 ======================================  ==========================================
 
 したがって:
@@ -49,8 +49,9 @@ subject 接頭辞                           使える手掛かり
 破壊的なので:
 
 - 既定で dry-run (``--apply`` 必須)
-- ``--apply`` 時は ``facts.jsonl`` と ``short_term_notes.json`` を
-  ``migration_archive/cli_<utc_ts>/purge_private/`` へ退避してから書き換える
+- ``--apply`` 時は SemMem の事象ログを
+  ``migration_archive/cli_<utc_ts>/purge_private/`` へ退避してから取り下げる
+  (レコードは物理削除ではなく ``veracity=retracted``、c_16 §3)
 """
 
 from __future__ import annotations
@@ -61,32 +62,39 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from backend.free.memory.episodic.note import MemoryNote
+from backend.free.memory.episodic.store import EpisodicStore
 from backend.free.memory.semantic.cli._paths import (
-    ScopeInfo,
     cli_backup_root,
-    enumerate_scopes,
+    open_semantic_store,
+    scope_names,
 )
-from backend.free.memory.semantic.store import FACTS_FILENAME, SemanticFactStore
+from backend.free.memory.sleep._curator_common import (
+    EXECUTABLE_COMMAND_SUBJECT_PREFIX,
+    URL_SUBJECT_PREFIX,
+)
+from backend.free.memory.semantic.store import SemanticStore
 from backend.log_config import get_logger
 
 logger = get_logger("memory.semantic.cli.purge_private")
 
-#: キュレーター由来の world_fact の subject 接頭辞 (再生成可能な索引)。
+#: キュレーター由来のファクトの subject 接頭辞 (再生成可能な索引)。
+#: URL / コマンドは ``idx.*`` namespace (c_16 §4.2)、assertion は言明なので
+#: ``mem.world.*`` のまま。接頭辞の SSOT は ``sleep._curator_common``。
+ASSERTION_SUBJECT_PREFIX = "mem.world.assertion."
+
 CURATED_SUBJECT_PREFIXES: tuple[str, ...] = (
-    "mem.world.assertion.",
-    "mem.world.executable_command.",
-    "mem.world.url.",
+    ASSERTION_SUBJECT_PREFIX,
+    EXECUTABLE_COMMAND_SUBJECT_PREFIX,
+    URL_SUBJECT_PREFIX,
 )
 
 #: 接頭辞 → その系統を作るキュレーターの冪等マーカー (MemoryNote の属性名)。
 _MARKER_BY_PREFIX: dict[str, str] = {
-    "mem.world.assertion.": "assertion_curated_at",
-    "mem.world.executable_command.": "command_curated_at",
-    "mem.world.url.": "url_curated_at",
+    ASSERTION_SUBJECT_PREFIX: "assertion_curated_at",
+    EXECUTABLE_COMMAND_SUBJECT_PREFIX: "command_curated_at",
+    URL_SUBJECT_PREFIX: "url_curated_at",
 }
-
-#: STM ノートの永続化ファイル名 (``local/memory/`` 直下)。
-NOTES_FILENAME = "short_term_notes.json"
 
 
 @dataclass
@@ -120,7 +128,7 @@ class PurgeReport:
     """再生成のためにマーカーを戻した (非 private の) ノート数。"""
 
     notes_available: bool = True
-    """STM ノートを読めたか。``False`` なら厳密照合は成立しない。"""
+    """エピソード記憶を読めたか。``False`` なら厳密照合は成立しない。"""
 
     backup_path: str | None = None
 
@@ -148,28 +156,33 @@ class PurgeReport:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _notes_path(memory_dir: Path) -> Path:
-    return Path(memory_dir) / NOTES_FILENAME
-
-
-def _load_notes(memory_dir: Path) -> tuple[dict[str, dict], bool]:
-    """``{note_id: note_dict}`` と読み込み成否を返す。"""
-    path = _notes_path(memory_dir)
-    if not path.exists():
-        return {}, False
+def _open_episodic(memory_dir: Path) -> "EpisodicStore | None":
+    """エピソード記憶を読み取り専用で開く (失敗は ``None``)。"""
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("purge-private: failed to read %s: %s", path, exc)
+        store = EpisodicStore(Path(memory_dir))
+        store.load()
+    except Exception as exc:  # noqa: BLE001 — 読めなくても strict 判定を諦めるだけ
+        logger.warning("purge-private: failed to open the episodic store: %s", exc)
+        return None
+    return store
+
+
+def _load_notes(
+    episodic: "EpisodicStore | None",
+) -> tuple[dict[str, MemoryNote], bool]:
+    """``{note_id: MemoryNote}`` と読み込み成否を返す。
+
+    ノートの永続形は ``Evidence`` 1 本になったので、旧
+    ``short_term_notes.json`` は読まない (c_16 §4.1)。private ノートも
+    含めて引く — private かどうかがまさに判定材料。
+    """
+    if episodic is None:
         return {}, False
-    notes = raw.get("notes", raw) if isinstance(raw, dict) else raw
-    if isinstance(notes, dict):
-        entries = list(notes.values())
-    elif isinstance(notes, list):
-        entries = notes
-    else:
-        return {}, False
-    return {n.get("id"): n for n in entries if isinstance(n, dict) and n.get("id")}, True
+    notes = {
+        note.id: note
+        for note in episodic.iter_notes(include_private=True)
+    }
+    return notes, True
 
 
 def _is_curated(subject: str) -> bool:
@@ -184,9 +197,9 @@ def _marker_for(subject: str) -> str | None:
 
 
 def _select(
-    store: SemanticFactStore,
+    store: SemanticStore,
     scope: str,
-    notes: dict[str, dict],
+    notes: dict[str, MemoryNote],
     *,
     all_curated: bool,
     since: float | None,
@@ -195,7 +208,7 @@ def _select(
 ) -> list[PurgeCandidate]:
     """1 scope 分の削除候補を選ぶ (副作用なし)。"""
     out: list[PurgeCandidate] = []
-    for fact in store.all_facts(include_superseded=True):
+    for fact in store.all_facts(include_superseded=True, scope=scope):
         subject = fact.subject or ""
         if not _is_curated(subject):
             continue
@@ -209,7 +222,8 @@ def _select(
                 if prov.note_id:
                     note_id = prov.note_id
                     break
-        if note_id and notes.get(note_id, {}).get("private"):
+        note = notes.get(note_id) if note_id else None
+        if note is not None and note.private:
             reason = "private_note"
 
         # (2) セッション指定。
@@ -248,7 +262,8 @@ def _select(
 
 
 def _unmark_notes(
-    memory_dir: Path,
+    episodic: "EpisodicStore | None",
+    notes: dict[str, MemoryNote],
     purged_subjects: set[str],
     *,
     apply: bool,
@@ -258,55 +273,52 @@ def _unmark_notes(
     private ノートは対象外 — マーカーを戻すと次の Full で同じものが再生成
     されうる (現在は ``public_notes`` が入口で落とすが、二重防御として
     ここでも明示的に除外する)。
+
+    書き込みは ``patch`` 事象 1 件ずつ (c_16 §5.2)。snapshot は sleep-time が
+    作るので、ここでは版を積まない。
     """
     markers = {
-        _marker_for(subject) for subject in purged_subjects
-    } - {None}
-    if not markers:
+        marker for marker in (_marker_for(s) for s in purged_subjects)
+        if marker is not None
+    }
+    if not markers or episodic is None:
         return 0
-    path = _notes_path(memory_dir)
-    if not path.exists():
-        return 0
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return 0
-
-    container = raw.get("notes", raw) if isinstance(raw, dict) else raw
-    entries = (
-        list(container.values()) if isinstance(container, dict)
-        else container if isinstance(container, list) else []
-    )
     changed = 0
-    for note in entries:
-        if not isinstance(note, dict) or note.get("private"):
+    for note in notes.values():
+        if note.private:
             continue
-        for marker in markers:
-            if note.get(marker) is not None:
-                note[marker] = None
-                changed += 1
-                break
-    if changed and apply:
-        from backend.io import atomic_write_text
-
-        atomic_write_text(path, json.dumps(raw, ensure_ascii=False, indent=2))
+        hit = next(
+            (m for m in markers if getattr(note, m, None) is not None), None,
+        )
+        if hit is None:
+            continue
+        changed += 1
+        if apply:
+            episodic.patch_note(note.id, attrs={**_note_attrs(note, hit)})
     return changed
 
 
-def _backup(
-    scopes: list[ScopeInfo], memory_dir: Path, archive_root: Path,
-) -> Path:
+def _note_attrs(note: MemoryNote, marker: str) -> dict[str, Any]:
+    """``marker`` を ``None`` へ戻した ``attrs`` を組む (他のキーはそのまま)。
+
+    ``patch`` の ``attrs`` は **マージ** される (``snapshot.apply_patch``) ので、
+    キーを ``pop`` しても消えない。既定値 (``None``) を明示的に書くこと —
+    ``evidence_to_note`` はそれをそのまま属性へ写すので、次の Full で
+    キュレーターが再生成できる状態に戻る。
+    """
+    from backend.free.memory.episodic.note import note_to_evidence
+
+    attrs = dict(note_to_evidence(note).attrs)
+    attrs[marker] = None
+    return attrs
+
+
+def _backup(memory_dir: Path, archive_root: Path) -> Path:
+    """SemMem の事象ログを退避先へコピーする。"""
     dest = cli_backup_root(archive_root, "purge_private")
-    for scope in scopes:
-        facts = scope.root_dir / FACTS_FILENAME
-        if facts.exists():
-            target = dest / scope.name.replace(":", "_") / FACTS_FILENAME
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(facts, target)
-    notes = _notes_path(memory_dir)
-    if notes.exists():
-        dest.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(notes, dest / NOTES_FILENAME)
+    events = Path(memory_dir) / "semantic" / "events"
+    if events.exists():
+        shutil.copytree(events, dest / "events", dirs_exist_ok=True)
     return dest
 
 
@@ -346,28 +358,18 @@ def run_purge_private(
         applied=apply,
         mode="all_curated" if all_curated else "strict",
     )
-    notes, ok = _load_notes(memory_dir)
+    episodic = _open_episodic(memory_dir)
+    notes, ok = _load_notes(episodic)
     report.notes_available = ok
 
-    scopes = [
-        s for s in enumerate_scopes(memory_dir)
-        if scope_filter is None or s.name == scope_filter
-    ]
+    store = open_semantic_store(memory_dir)
     session_ids = set(sessions or ())
-
-    stores: dict[str, SemanticFactStore] = {}
-    for scope in scopes:
-        try:
-            store = SemanticFactStore(scope.root_dir)
-        except Exception as exc:
-            logger.warning(
-                "purge-private: failed to open %s: %s", scope.name, exc,
-            )
+    for scope in scope_names(store):
+        if scope_filter is not None and scope != scope_filter:
             continue
-        stores[scope.name] = store
         report.candidates.extend(
             _select(
-                store, scope.name, notes,
+                store, scope, notes,
                 all_curated=all_curated,
                 since=since, until=until, session_ids=session_ids,
             ),
@@ -375,32 +377,27 @@ def run_purge_private(
 
     purged_subjects = {c.subject for c in report.candidates}
     if apply and report.candidates:
-        report.backup_path = str(_backup(scopes, memory_dir, archive_root))
-        by_scope: dict[str, list[str]] = {}
-        for c in report.candidates:
-            by_scope.setdefault(c.scope, []).append(c.fact_id)
-        for scope_name, ids in by_scope.items():
-            store = stores.get(scope_name)
-            if store is None:
-                continue
-            try:
-                report.deleted += store.delete_facts(ids)
-            except Exception as exc:
-                logger.warning(
-                    "purge-private: delete failed in %s: %s", scope_name, exc,
-                )
+        report.backup_path = str(_backup(memory_dir, archive_root))
+        try:
+            report.deleted += store.delete_facts(
+                [c.fact_id for c in report.candidates],
+            )
+        except Exception as exc:  # noqa: BLE001 — 1 件の失敗で全体を止めない
+            logger.warning("purge-private: retract failed: %s", exc)
     report.notes_unmarked = _unmark_notes(
-        memory_dir, purged_subjects, apply=apply,
+        episodic, notes, purged_subjects, apply=apply,
     )
+    store.close()
     if apply:
         logger.info(
-            "purge-private: deleted %d fact(s), unmarked %d note(s)",
+            "purge-private: retracted %d fact(s), unmarked %d note(s)",
             report.deleted, report.notes_unmarked,
         )
     return report
 
 
 __all__ = [
+    "ASSERTION_SUBJECT_PREFIX",
     "CURATED_SUBJECT_PREFIXES",
     "PurgeCandidate",
     "PurgeReport",

@@ -20,18 +20,24 @@ from typing import TYPE_CHECKING, Any
 from backend.structlog_config import redact_string
 
 if TYPE_CHECKING:
-    from backend.free.memory.stores.short_term import MemoryNote
+    from backend.free.memory.episodic.note import MemoryNote
 
 #: プロンプトへ載せる質問の最大文字数。
 QUERY_PROMPT_LIMIT = 1000
 #: プロンプトへ載せる応答の最大文字数。
 ANSWER_PROMPT_LIMIT = 2000
 
-#: URL リコール索引の subject 接頭辞 (``mem.world.url.<host>.<digest>``)。
-URL_SUBJECT_PREFIX = "mem.world.url."
+#: URL リコール索引の subject 接頭辞 (``idx.url.<host>.<digest>``)。
+#:
+#: ``idx.*`` は c_16 §4.2 の内部索引 namespace。**注入されない** (規則は
+#: :mod:`~backend.free.memory.semantic.namespaces` が持つ) / 競合は上書き /
+#: 件数上限は ``memory.evidence.retention.idx_max_records``。以前は
+#: ``world_fact`` を流用していたため、``object`` に入る「過去のユーザーの
+#: 質問文」が世界の事実として ``[関連する記憶]`` へ出ていた (2026-09-02 監査 M21)。
+URL_SUBJECT_PREFIX = "idx.url."
 #: executable command リコール索引の subject 接頭辞
-#: (``mem.world.executable_command.<mode>.<digest>``)。
-EXECUTABLE_COMMAND_SUBJECT_PREFIX = "mem.world.executable_command."
+#: (``idx.command.<mode>.<digest>``)。
+EXECUTABLE_COMMAND_SUBJECT_PREFIX = "idx.command."
 
 #: 内部索引ファクトの **埋め込み側** (``is_query``) の SSOT。
 #:
@@ -42,6 +48,11 @@ EXECUTABLE_COMMAND_SUBJECT_PREFIX = "mem.world.executable_command."
 #: 以前は curator が ``is_query=True`` で書き、``reembed-facts`` /
 #: Step 8.8 が ``is_query=False`` で書き直しており、再埋め込みのたびに側が
 #: 反転していた (2026-09-02 監査 M19)。
+#:
+#: c_16 移行後、実際に埋め込むのは **snapshot 生成** (``EvidenceStore``) だけに
+#: なった。curator が自分でベクトルを作っても ``Evidence`` へは写らないので、
+#: ここで決めた側は :func:`index_embed_fields` でファクトの
+#: ``embed_as_query`` / ``embed_mode`` に載せて持ち回る (c_16 §3.5 / §6.1)。
 #:
 #: - executable command: 読み手が ``embed_query(query, mode=mode)`` なので
 #:   query 側 + subject の ``<mode>`` セグメント。
@@ -59,7 +70,7 @@ def embed_kwargs_for_subject(subject: str) -> dict[str, Any] | None:
 
     内部索引でなければ ``None`` (呼出側は document 側の既定で埋め込む)。
     executable command 索引は ``mode`` を subject の 3 番目のセグメントから
-    取る (``mem.world.executable_command.<mode>.<digest>``)。
+    取る (``idx.command.<mode>.<digest>``)。
     """
     for prefix, is_query in INDEX_EMBED_IS_QUERY.items():
         if not subject.startswith(prefix):
@@ -70,6 +81,26 @@ def embed_kwargs_for_subject(subject: str) -> dict[str, Any] | None:
             kwargs["mode"] = rest[0] if rest and rest[0] else "chat"
         return kwargs
     return None
+
+
+def index_embed_fields(subject: str) -> dict[str, Any]:
+    """``subject`` の埋め込み側を ``SemanticFact`` のフィールドへ落とす。
+
+    :func:`embed_kwargs_for_subject` と **同じ表** を読む (側の SSOT は
+    :data:`INDEX_EMBED_IS_QUERY` 1 箇所)。返した dict はそのまま
+    ``fact_from_note(**index_embed_fields(subject))`` へ渡せる。永続形では
+    ``attrs.embed_as_query`` / ``attrs.embed_mode`` になり、snapshot 生成の
+    :func:`backend.free.rag.evidence.store.embed_side_of` が読む。
+
+    内部索引でない subject には空 dict を返す (既定の document 側)。
+    """
+    kwargs = embed_kwargs_for_subject(subject)
+    if kwargs is None:
+        return {}
+    fields: dict[str, Any] = {"embed_as_query": bool(kwargs["is_query"])}
+    if kwargs.get("mode"):
+        fields["embed_mode"] = str(kwargs["mode"])
+    return fields
 
 
 def redact_for_store(text: str | None) -> str:
@@ -102,7 +133,7 @@ def public_notes(notes: list["MemoryNote"]) -> list["MemoryNote"]:
     ``short_term.notes.values()`` を受け取りながら同じガードを持っていなかった**。
 
     実害 (2026-09-01 監査で再現): private ターンで実行した
-    ``run_command_readonly`` が ``mem.world.executable_command.chat.<digest>`` の
+    ``run_command_readonly`` が ``idx.command.chat.<digest>`` の
     ``world_fact`` として書き込まれ、しかも生成側が ``private`` を引き継がない
     ため ``fact.private=False`` になる。``MemoryInjector._classify_fact`` の
     ``if fact.private: return None`` にも掛からず、``ToolCallJudge`` の

@@ -47,7 +47,7 @@ from backend.free.memory.notes.note_builder import (
     resolve_fact_attribute_match,
     resolve_fact_attribute_matches,
 )
-from backend.free.memory.stores.short_term import MemoryNote
+from backend.free.memory.episodic.note import MemoryNote
 from backend.free.memory.notes.subject_ns import make_mem_subject
 from backend.free.memory.types import FactType, SemanticFact
 from backend.log_config import get_logger
@@ -112,8 +112,8 @@ _WORLD_KEYWORD_STOPWORDS: frozenset[str] = frozenset({
 #: (2026-07-26 実測: 「0.8% と 2.3%」→ ``mem.world.0-8----2-3``)。
 _HAS_ASCII_LETTER_RE = re.compile(r"[A-Za-z]")
 
-#: subject に付ける内容ハッシュの長さ。curator 系 (``mem.world.url.<host>.<sha1_12>``
-#: / ``mem.world.executable_command.<mode>.<sha1_12>``) と同じ規約に合わせる。
+#: subject に付ける内容ハッシュの長さ。curator 系 (``idx.url.<host>.<sha1_12>``
+#: / ``idx.command.<mode>.<sha1_12>``) と同じ規約に合わせる。
 _WORLD_SUBJECT_HASH_LEN = 8
 
 #: 明示的なローカルパス (ファイル出力依頼の指示文検出用)
@@ -871,7 +871,7 @@ def _world_fact_subject_parts(keyword: str, content: str) -> tuple[str, str]:
     でグルーピングするため「同一事実の別版」と誤判定される
     (2026-07-26 実測: 自転車通勤の走行距離がスペイン語の ``mem.world.ser`` に
     同居していた)。curator 系が既に採っている
-    ``mem.world.url.<host>.<sha1_12>`` / ``mem.world.executable_command.<mode>.
+    ``idx.url.<host>.<sha1_12>`` / ``idx.command.<mode>.
     <sha1_12>`` と同じ規約で、内容ハッシュを 1 セグメント足して一意にする。
     """
     normalized = " ".join((content or "").split())

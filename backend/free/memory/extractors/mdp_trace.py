@@ -58,7 +58,7 @@ from backend.free.memory.extractors.base import (
     ExtractionContext,
     ExtractionResult,
 )
-from backend.free.memory.stores.short_term import MemoryNote
+from backend.free.memory.episodic.note import MemoryNote
 from backend.free.memory.types import SemanticFact
 from backend.log_config import get_logger
 
@@ -360,6 +360,8 @@ class MDPTraceExtractor(BaseExtractor):
             confidence=0.6,
             trace_id=trace_id,
             failure_signature=signature,
+            # MDP トレースは **アシスタント自身の行動記録** (c_16 §3)。
+            origin="assistant",
         )
 
     def _build_decision_fact(
@@ -400,4 +402,6 @@ class MDPTraceExtractor(BaseExtractor):
             ctx=ctx,
             confidence=0.6,
             trace_id=trace_id,
+            # MDP トレースは **アシスタント自身の行動記録** (c_16 §3)。
+            origin="assistant",
         )

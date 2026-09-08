@@ -385,7 +385,7 @@ class ModelMigrator:
         prompt_manager=None,
         eval_core_manager=None,
         learning_scheduler=None,
-        short_term_memory=None,
+        episodic_memory=None,
         vector_store=None,
         cartridge_manager=None,
     ):
@@ -396,7 +396,7 @@ class ModelMigrator:
         self.prompt_manager = prompt_manager
         self.eval_core_manager = eval_core_manager
         self.learning_scheduler = learning_scheduler
-        self.short_term_memory = short_term_memory
+        self.episodic_memory = episodic_memory
         self._vector_store = vector_store
         self._cartridge_manager = cartridge_manager
 
@@ -1162,10 +1162,8 @@ class ModelMigrator:
         if self.prompt_manager and not partitioned:
             summary["prompts_modes"] = list(self.prompt_manager.MODES)
 
-        if self.short_term_memory:
-            summary["memory_notes"] = len(
-                getattr(self.short_term_memory, "notes", [])
-            )
+        if self.episodic_memory is not None:
+            summary["memory_notes"] = len(self.episodic_memory)
 
         # RAG / カートリッジは非依存データのため集計のみ
         if self._vector_store:
@@ -1347,14 +1345,22 @@ class ModelMigrator:
         )
 
     def _mark_context_regeneration(self) -> None:
-        """Step 8: メモリノートの context_description 再生成マーク"""
-        if self.short_term_memory is None:
+        """Step 8: ノートの ``context_description`` 再生成マークを立てる。
+
+        ``context_description`` はモデルが書いた要約なので、ベースモデルを
+        替えたら作り直す。印は ``attrs.evolution_pending`` への ``patch`` で、
+        次の sleep-time Step 7 が拾う。
+        """
+        episodic = self.episodic_memory
+        if episodic is None:
             return
 
         count = 0
-        for note in getattr(self.short_term_memory, "notes", []):
-            if getattr(note, "context_description", ""):
-                note.evolution_pending = True
+        for note in episodic.iter_notes(tier="short"):
+            if not note.context_description:
+                continue
+            attrs = {"evolution_pending": True}
+            if episodic.patch_note(note.id, attrs=attrs) is not None:
                 count += 1
 
         if count > 0:

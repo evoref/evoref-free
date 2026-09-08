@@ -69,16 +69,6 @@ export function deepNestedFieldUpdater(
 
 // ── ビジネスロジックヘルパー ──
 
-/** FadeMem の重み合計を検証する */
-export function validateFadeWeights(
-	alpha: number,
-	beta: number,
-	gamma: number
-): { sum: number; valid: boolean } {
-	const sum = alpha + beta + gamma;
-	return { sum, valid: Math.abs(sum - 1.0) < 0.01 };
-}
-
 /** 配列の要素をトグルする（イミュータブル） */
 export function toggleArrayItem<T>(array: T[], item: T, include: boolean): T[] {
 	const result = [...array];

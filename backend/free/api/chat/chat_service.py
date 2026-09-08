@@ -6,7 +6,6 @@ import asyncio
 import re
 import time
 import uuid
-import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -129,7 +128,7 @@ async def prepare_memory_context(
         )
 
     # このセッションの窓 (無ければ台帳が作る)。別セッションの窓には触らない。
-    wm, _stm, _ltm = state.get_memory_system(requested_session)
+    wm, _episodic = state.get_memory_system(requested_session)
 
     # 値の言い直しの印。ここで立てておくと (a) 抽出器が直前の名前付き属性を
     # 継承して訂正が対象と同じスロットへ入り、(b) sleep-time の競合解決が
@@ -197,7 +196,10 @@ def convert_file_contexts(req: ChatRequest) -> list[FileContextDict] | None:
 class SearchPipelineResult:
     """検索パイプラインの結果（BUG-9: 成功/失敗/スキップの区別を明確化）"""
 
-    __slots__ = ("chunks", "scored_chunks", "error", "query_vec", "rag_top_score")
+    __slots__ = (
+        "chunks", "error", "evidence_ids", "query_vec", "rag_top_score",
+        "scored_chunks",
+    )
 
     def __init__(
         self,
@@ -206,10 +208,14 @@ class SearchPipelineResult:
         error: str | None = None,
         query_vec=None,
         rag_top_score: float | None = None,
+        evidence_ids: list[str] | None = None,
     ):
         self.chunks = chunks
         self.scored_chunks = scored_chunks
         self.error = error
+        # [参考情報] 枠へ実際に載せた Evidence の ``<store>:<id>`` (c_16 §5.5)。
+        # 学習帰属 (``GenerationConfigRef.evidence_ids``) の corpus / episodic 側。
+        self.evidence_ids = list(evidence_ids or [])
         # 採用チャンクの生スコア (cosine) 最大値。``scored_chunks`` 側のスコアは
         # 正規化後で Level 0 シグナルには使えない (SearchResult.top_raw_score 参照)。
         self.rag_top_score = rag_top_score
@@ -296,7 +302,7 @@ async def run_search_pipeline(
         if timer:
             timer.stop("embedding_ms")
 
-        wm, stm, ltm = mem_sys
+        wm, episodic = mem_sys
         # content gate のセッション上限判定に使う session_id。呼出側が渡さない
         # legacy 経路では WM の session_id で代用する。
         session_id = session_id or getattr(wm, "session_id", None) or "default"
@@ -304,8 +310,7 @@ async def run_search_pipeline(
             query=query,
             query_vec=query_vec,
             working_mem=wm,
-            short_term=stm,
-            long_term=ltm,
+            episodic=episodic,
             cartridge_mgr=state.cartridge_manager,
             config=cfg,
             aux_client=state.aux_client,
@@ -317,12 +322,6 @@ async def run_search_pipeline(
             lazy_contextual=state.lazy_contextual,
             session_id=session_id,
             judge_tracker=state.judge_tracker,
-            # STM は [関連する記憶] と [参考情報] の 2 経路で注入される。
-            # 訂正で退役した値は **両方**で止める (片方だけだともう片方から
-            # 訂正前の値が返る — 2026-08-27 実機検証)。
-            retired_note_ids=_collect_retired_note_ids(
-                state, state.current_project_id,
-            ),
         )
         if not search_result.skipped and search_result.sources:
             rag_chunks = [content for _, _, content in search_result.sources]
@@ -335,6 +334,7 @@ async def run_search_pipeline(
                 scored_chunks=search_result.sources,
                 query_vec=query_vec,
                 rag_top_score=search_result.top_raw_score,
+                evidence_ids=search_result.evidence_ids,
             )
     except Exception as e:
         # 例外の型も書く。``httpx.ReadTimeout()`` / ``asyncio.TimeoutError()``
@@ -526,109 +526,6 @@ def _session_user_texts(state: AppState, session_id: str | None) -> list[str]:
         return []
 
 
-def _collect_retired_note_ids(state, project_id: str | None) -> set[str]:
-    """値が supersede された発話ノートの ID を集める。
-
-    SemMem 側で世代を閉じても (``sleep/extraction._supersede_corrected_slots``)、
-    その値を述べた **STM ノートの原文** はそのまま残る。STM は
-    ``[関連する記憶]`` の Tier 2 として注入されるので、訂正前の発話が
-    「現在値」として読まれ続ける。
-
-    実機検証 (2026-08-27、クリーンなストア):
-    ``mem.personal.occupation`` は「データベース管理者」が supersede され
-    「ネットワークエンジニア」が live になっていたにもかかわらず、新規
-    セッションの「私の職業と住んでいる場所を教えてください。」が
-    **「データベース管理者」** を返した。供給元は STM に残った
-    「職業はデータベース管理者で、名古屋に住んでいます。」のノートだった。
-
-    ノート単位で見て、そこから生まれたファクトが **すべて** supersede
-    済みのときだけ落とす。1 つでも live が残っていれば、そのノートは
-    まだ現在値を運んでいる。
-
-    履歴そのものは消さない — ``search_history`` や会話履歴ファイルからは
-    従来どおり辿れる。ここで止めるのは「現在値として黙って提示する」経路
-    だけ。
-
-    **ストアの世代番号でキャッシュする。** この走査は全ファクト × 全
-    provenance で、チャット 1 ターンごとに scope の数だけ走る。ストアは
-    プロセス常駐なので、書込 (= sleep-time) が無い間は結果が変わらない。
-    ``SemanticFactStore.revision`` が動いたときだけ作り直す。
-    """
-    retired: dict[str, bool] = {}
-    for scope in ("global", f"project:{project_id}" if project_id else None):
-        if scope is None:
-            continue
-        try:
-            store = state.get_semantic_store(scope)
-        except Exception:
-            continue
-        cached = _retired_note_ids_for_store(store)
-        if cached is None:
-            continue
-        for note_id, only_retired in cached.items():
-            retired[note_id] = retired.get(note_id, True) and only_retired
-    return {note_id for note_id, only_retired in retired.items() if only_retired}
-
-
-#: ``_collect_retired_note_ids`` のストア別キャッシュ。
-#: ``store -> (revision, {note_id: そのノート由来のファクトが全部 supersede 済みか})``
-#: 弱参照キー — ストアが差し替わったら (再ロード / テストの使い捨て) 古い
-#: エントリは一緒に消える。``id(store)`` をキーにすると、解放されたアドレスを
-#: 新しいストアが再利用したときに **別ストアの結果を返す** うえ、寿命が無い。
-_RETIRED_NOTE_CACHE: "weakref.WeakKeyDictionary[Any, tuple[int, dict[str, bool]]]" = (
-    weakref.WeakKeyDictionary()
-)
-
-
-def _retired_note_ids_for_store(store) -> dict[str, bool] | None:
-    """1 ストア分の ``{note_id: 全部 supersede 済みか}`` を返す (revision キャッシュ)。"""
-    try:
-        revision = int(store.revision)
-    except Exception:
-        revision = -1
-    try:
-        hit = _RETIRED_NOTE_CACHE.get(store)
-    except TypeError:
-        # 弱参照できない型 (テストの部分モック等) はキャッシュしない。
-        hit = None
-        revision = -1
-    if hit is not None and hit[0] == revision and revision >= 0:
-        return hit[1]
-    try:
-        all_facts = store.all_facts(include_superseded=True)
-    except Exception:
-        return None
-    computed: dict[str, bool] = {}
-    for fact in all_facts:
-        is_retired = bool(getattr(fact, "superseded_by", None))
-        for prov in getattr(fact, "provenances", ()) or ():
-            note_id = getattr(prov, "note_id", None)
-            if not note_id:
-                continue
-            # live が 1 つでもあれば False で確定させる。
-            computed[note_id] = computed.get(note_id, True) and is_retired
-    if revision >= 0:
-        _RETIRED_NOTE_CACHE[store] = (revision, computed)
-    return computed
-
-
-def _semmem_embeddings_are_stale() -> bool:
-    """SemMem ファクトの埋め込みが embed モデル切替で stale になっているか。
-
-    ``stale_guard`` のマーカー (``.reembed_facts_required``) を見る。判定に
-    失敗したら ``False`` (= 従来どおり注入する) — マーカーの読み取り失敗で
-    記憶を止める方が害が大きい。
-    """
-    try:
-        from backend.free.memory.semantic.stale_guard import (
-            is_semmem_reembed_required,
-        )
-
-        return is_semmem_reembed_required() is not None
-    except Exception:
-        return False
-
-
 def build_semmem_injection(
     state: AppState, cfg: dict, mode: str = "chat",
     conflict_ctx: ConflictTurnContext | None = None,
@@ -636,6 +533,7 @@ def build_semmem_injection(
     query_text: str = "",
     covered_attributes: set[str] | None = None,
     session_id: str | None = None,
+    evidence_ids: list[str] | None = None,
 ) -> str | None:
     """SemMem facts + STM notes を MemoryInjector で tier 整形し、
     プロンプト注入用テキストを返す。
@@ -662,6 +560,11 @@ def build_semmem_injection(
     その場で書き込む (``InjectionPlan.covered_attributes``)。呼出側が
     「この属性の現在値はもうプロンプトに載っている」を判定するための出力で、
     ``search_history`` の抑止に使う。``dropped`` になった候補は含めない。
+
+    ``evidence_ids`` を渡すと、**実際に注入された** Evidence の
+    ``<store>:<evidence_id>`` (``semantic:`` / ``episodic:``) をその場で追記する
+    (c_16 §5.5)。学習帰属 (``GenerationConfigRef.evidence_ids``) の材料で、
+    corpus 側は ``[参考情報]`` 枠 (``SearchPipelineResult.evidence_ids``) が担う。
     """
     mem_sys = state.get_memory_system()
     if not mem_sys:
@@ -676,30 +579,17 @@ def build_semmem_injection(
         # 競合セクションも同じ理由で見送る。ゲートを掛けられないターンに
         # 出すと、クエリと無関係な矛盾がプロンプトへ入る。
         return None
-    if _semmem_embeddings_are_stale():
-        # embed モデルを替えた直後、ファクトのベクトルは旧モデル空間のまま
-        # 残る。関連度ゲートはこれを 2 通りに壊す — 次元が違えば形の不一致で
-        # 素通し (= 全店注入)、次元が同じで空間だけ違えばコサインが雑音に
-        # なって全件却下 (実測 2026-09-01: 通過率 0.00%)。閾値の較正
-        # (threshold_mode: auto) はスケールずれしか救えず、空間のずれには
-        # 効かない。どちらへ倒れるか予測できない以上、再 embed が済むまでは
-        # **注入しない** のが唯一の安全側 (履歴検索や RAG は従来どおり動く)。
-        logger.warning(
-            "semmem injection skipped: fact embeddings are stale after an "
-            "embed model change; the relevance gate cannot be trusted. "
-            "Run 'reembed-facts --apply' (or POST /api/model/reembed-facts).",
-        )
-        return None
     # このターンの MemoryInjector は 1 個。競合セクションのゲートも同じ
     # インスタンス・同じ事前計算スコアで判定する (別インスタンスで
     # スコア無しに判定し直すと、埋め込み無しのファクトが素通りしていた)。
     injector = None
     fact_scores: dict[str, float] = {}
+    fact_ranks: dict[str, float] = {}
     try:
         from backend.free.memory.pipeline.injector import MemoryInjector
 
         injector = MemoryInjector(cfg)
-        _, stm, _ = mem_sys
+        _, episodic = mem_sys
         facts: list = []
         # 関連度スコアは埋め込み行列を持つストア側で 1 回の積として求める。
         # 候補ごとに正規化し直すと N=10000 で 52.5ms、常駐行列なら 1.5ms
@@ -719,8 +609,37 @@ def build_semmem_injection(
                 except Exception:
                     # スコアが取れなければ候補ごとの判定へ縮退するだけ。
                     pass
-        stm_notes = list(getattr(stm, "notes", {}).values())
-        retired_note_ids = _collect_retired_note_ids(state, pid)
+                try:
+                    # 並びは 3 ストア共通の 1 本の順位式 (c_16 §7.2)。ゲート用の
+                    # 素の cosine (``embedding_scores``) とは別物で、混ぜない。
+                    fact_ranks.update(store.ranking_scores(query_vec))
+                except Exception:
+                    # 順位が取れなければ confidence + recency へ縮退する。
+                    pass
+        # 注入候補は ``short`` tier のノート。``retracted`` / ``superseded``
+        # (訂正で畳まれた / 要約に吸収された) はストアのアクティブマスクが
+        # 落とすので、退役 id を呼出側で集める必要は無い (c_16 §8)。
+        # **このモデルのベクトルが 1 本も無いターンは注入しない (fail-closed)。**
+        #
+        # 埋め込みは ``embeddings/<model_id>/`` にモデル別で置かれる (c_16 §6.1)
+        # ので、embed モデルを替えても旧モデルの行を読み違えることは無い。
+        # 代わりに **次の snapshot まで 1 件もスコアが引けない** 状態が生まれ、
+        # ``MemoryInjector._passes_gate`` は候補ごとの判定 (``fact.embedding``
+        # は ``None``) へ落ちて **全候補を通す** — ゲートが最も要る場面で
+        # 全店注入になる。旧 ``stale_guard`` のマーカー
+        # (``.reembed_facts_required``) はこれを検知するためのものだったが、
+        # マーカーは model-migrate API を通した切替でしか立たなかった。
+        # ここは観測 (「候補はあるがスコアが 0 件」) で判定するので、config を
+        # 直接書き替えた切替でも効く。
+        if query_vec is not None and facts and not fact_scores:
+            logger.warning(
+                "semmem injection skipped: %d fact(s) but no embedding for the "
+                "current embed model; the relevance gate would pass everything. "
+                "Vectors are rebuilt on the next sleep-time snapshot.",
+                len(facts),
+            )
+            facts = []
+        stm_notes = list(episodic.short_notes()) if episodic is not None else []
         if facts or stm_notes:
             plan = injector.inject(
                 mode=inj_mode,
@@ -731,12 +650,14 @@ def build_semmem_injection(
                 query_embedding=query_vec,
                 session_user_texts=_session_user_texts(state, session_id),
                 query_text=query_text,
-                retired_note_ids=retired_note_ids,
                 fact_relevance_scores=fact_scores or None,
+                fact_rank_scores=fact_ranks or None,
             )
             rendered = plan.render() or None
             if covered_attributes is not None:
                 covered_attributes.update(plan.covered_attributes)
+            if evidence_ids is not None:
+                evidence_ids.extend(plan.evidence_ids())
     except Exception as e:
         logger.warning("semmem injection skipped: %s", e)
         rendered = None

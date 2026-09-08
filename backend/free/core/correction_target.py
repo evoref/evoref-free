@@ -60,6 +60,31 @@ QUOTED_RE = re.compile(r"[「『]([^」』]{1,40})[」』]")
 #: 落としていた。漢字列 2 文字以上とカタカナ列 3 文字以上を内容語とみなす。
 KANJI_RUN_RE = re.compile(r"[一-龥々]{2,}")
 KATAKANA_RUN_RE = re.compile(r"[ァ-ヴ][ァ-ヴー]{2,}")
+#: 英字 1〜2 文字 + 数字の短い記号 (``D7`` / ``E7`` / ``v2`` / ``T01``)。
+#: ``IDENTIFIER_RE`` は 3 文字以上を要求するので、コードネームや版番号のような
+#: 2 文字の答えが証拠から漏れていた (2026-09-07 ライブ監査: 「先ほどの D7 という
+#: 回答は間違いです」の D7 が拾えず、応答が「D7」だけのターンを同定できなかった)。
+CODE_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]{1,2}\d{1,3}(?![A-Za-z0-9_])")
+
+#: 「誤りだった側」を示す語。この語より **前** に置かれた値・引用は、訂正が
+#: 「アシスタントが述べた誤り」として引いているものとみなす。
+#:
+#: 「X ではなく Y」の ``ではなく`` だけを境界にしていた頃は、日本語で誤りを指す
+#: 最も普通の形 — 「…は間違いです」「…に掛けるものではありません」「「…」という
+#: 注記は間違いです」 — がどれも境界にならず、誤りの側の値が **期待キーワード**
+#: として eval_core に載った (2026-09-07 ライブ監査: 追加 5 件中 4 件が訂正された
+#: 誤りを期待値にしていた。ユーザーが「消せ」と言った注記の文言が、その問いの
+#: 正解条件になった)。
+WRONG_MARKER_RE = re.compile(
+    r"間違[いっえ]|誤[りっ]|違います|違う|ではなく|じゃなく"
+    r"|ではありません|ではない|正しくありません|あり得ません|ありえません|おかしい"
+    # 「「5 件のタスクをすべて完了しました」の一行 **だけで**、…返ってきていません」
+    # — 引用が「それしか返っていない」誤りの側。
+    r"|(?:だけ|のみ)(?:で|です|だ)",
+)
+#: 「正しい側」を示す語。この語より後ろは訂正後の値。
+RIGHT_MARKER_RE = re.compile(r"正しくは|正解は|本当は|実際は|が正しい")
+_SENTENCE_SPLIT_RE = re.compile(r"[。！？!?\n]")
 
 #: どんな文にも現れる語。証拠にならない。
 STOP_IDENTIFIERS = frozenset({
@@ -69,6 +94,23 @@ STOP_IDENTIFIERS = frozenset({
 
 #: 1 桁の数はどんな応答にも現れる (「8%」「37 個」の 8)。証拠にしない。
 _MIN_NUMBER_CHARS = 2
+
+#: 誤りの側の語 (:func:`wrong_side_tokens`) に掛ける重み。応答本文にその語が
+#: あれば、それだけで通常の証拠 3 つ分に相当する。文書頻度で割らない —
+#: 誤った値は後続ターンへ引き継がれて複数の応答に現れるのが普通で
+#: (「56,417 件」が 4 ターンに残っていた)、割ると引き継いだ側と同じ重みまで
+#: 薄まって、24,814 を述べただけの隣のターンに負ける。
+WRONG_SIDE_WEIGHT = 3.0
+#: 応答本文が誤りの値 **そのもの** (「41168%」「D7」) のときの加点。短い答えは
+#: 他に証拠を持てないので、値の一致がほぼ確定の証拠になる。
+WRONG_VALUE_ONLY_BONUS = 3.0
+_WRONG_VALUE_ONLY_SLACK = 8
+#: 「先ほどの **回答** は間違い」の回答 / 計算 / 数字 — 応答を指す語であって
+#: 応答の内容ではない。誤りの側として重くするとどの候補にも付いて回る。
+WRONG_SIDE_META_WORDS = frozenset({
+    "回答", "答え", "計算", "数字", "数値", "説明", "結果", "出力", "注記", "末尾",
+    "冒頭", "最後", "最初", "実装", "コード", "表現", "記述", "内容", "部分",
+})
 
 #: 遡って探す上限。これより前のターンを訂正するのは実運用でほぼ無く、
 #: 広げるほど無関係なターンとの偶然の重なりを拾いやすくなる。
@@ -102,6 +144,8 @@ def correction_evidence_tokens(correction: str) -> list[str]:
         _add(m.group(1))
     for m in IDENTIFIER_RE.finditer(text):
         _add(m.group(0))
+    for m in CODE_TOKEN_RE.finditer(text):
+        _add(m.group(0))
     for m in KATAKANA_RUN_RE.finditer(text):
         _add(m.group(0))
     for m in KANJI_RUN_RE.finditer(text):
@@ -110,6 +154,65 @@ def correction_evidence_tokens(correction: str) -> list[str]:
         num = m.group(0).replace(",", "")
         if len(num) >= _MIN_NUMBER_CHARS:
             _add(num)
+    return out
+
+
+def wrong_side_spans(correction: str) -> list[str]:
+    """訂正文のうち「誤りだった側」を述べている区間を返す (純粋関数)。
+
+    文ごとに見て、:data:`WRONG_MARKER_RE` より前の部分を誤りの側とみなす。
+    同じ文に :data:`RIGHT_MARKER_RE` があれば、そこから後ろは正しい側なので
+    誤りの側から外す (「D7 は間違いで、正しくは E7」)。
+    """
+    spans: list[str] = []
+    for sent in _SENTENCE_SPLIT_RE.split(correction or ""):
+        if not sent.strip():
+            continue
+        right = RIGHT_MARKER_RE.search(sent)
+        head = sent[:right.start()] if right else sent
+        wrong = WRONG_MARKER_RE.search(head)
+        if wrong is None:
+            continue
+        spans.append(head[:wrong.start()])
+    return spans
+
+
+def wrong_side_tokens(correction: str) -> list[str]:
+    """訂正文が「誤り」として引いている値・識別子・引用 (順序保持・重複なし)。
+
+    誤りの側こそ **訂正対象の応答にだけ現れる最強の手掛かり** なので、
+    宛先の同定ではこれを重く見る。逆に期待キーワード (訂正後の正しい回答に
+    含まれるべき語) からは必ず外す。
+
+    **値だけ** を採る (数値 / 識別子 / 短い記号 / 鉤括弧の引用)。漢字・カタカナの
+    内容語は採らない — 否定語より前の区間は「10 年後の売却価格が購入価格の何 %
+    を下回ると購入が不利になるかを聞いており」のように **問いの言い直し** で
+    埋まっていて、そこから拾った語 (売却価格 / 購入価格 / テーブル) を重くすると
+    同じ話題を長く述べた隣のターンが勝つ。内容語は通常の重みで数える。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(token: str) -> None:
+        norm = _normalize(token)
+        if not norm or norm in STOP_IDENTIFIERS or norm in seen:
+            return
+        if norm in WRONG_SIDE_META_WORDS:
+            return
+        seen.add(norm)
+        out.append(norm)
+
+    for span in wrong_side_spans(correction):
+        for m in QUOTED_RE.finditer(span):
+            _add(m.group(1))
+        for m in IDENTIFIER_RE.finditer(span):
+            _add(m.group(0))
+        for m in CODE_TOKEN_RE.finditer(span):
+            _add(m.group(0))
+        for m in NUMBER_LITERAL_RE.finditer(span):
+            num = m.group(0).replace(",", "")
+            if len(num) >= _MIN_NUMBER_CHARS:
+                _add(num)
     return out
 
 
@@ -143,10 +246,25 @@ def resolve_correction_target(
     ハンドシェイク解説) に吸われていた。1 つの候補にしか出ない語を重く、
     全候補に出る語を軽く扱う。
 
+    証拠は 3 層で見る (2026-09-07 ライブ監査で 13 件中 2 件しか当たらなかった
+    ことへの対処):
+
+    1. **誤りの側の語** (:func:`wrong_side_tokens`) — 「先ほどの D7 という回答は
+       間違いです」の D7。訂正対象の応答にしか無いはずの最強の手掛かりなので
+       :data:`WRONG_SIDE_WEIGHT` 倍で数える。
+    2. 応答本文との重なり (従来)。
+    3. **元の問いとの重なり** — 訂正は「コードネームだけで答え直して」「総学習
+       時間の見積もりを数値だけで」のように **依頼の形を言い直す** ことが多い。
+       応答が「D7」「確認できていません」のように短いと本文からは証拠が取れず、
+       同じ話題の長い応答に必ず負けていた (実測の失敗はまさにその短い最終
+       ターンに集中する)。問い側の重なりは応答側と同じ重みで足す。
+
     Args:
         correction: 訂正発話の本文。
-        candidates: **同一セッション** の ``(entry_id, response_text)`` を
-            古い順に並べたもの。呼出側がセッションで絞る責務を持つ —
+        candidates: **同一セッション** の ``(entry_id, response_text)`` または
+            ``(entry_id, response_text, query_text)`` を古い順に並べたもの。
+            呼出側がセッションで絞り、**ユーザーの訂正ターン自身は候補に
+            入れない** 責務を持つ (入れると訂正が 1 つ前の訂正を宛先に選ぶ)。
             ここでセッションを跨いだ候補を渡すと、本モジュールが直そうと
             している欠陥をそのまま再現する。
         lookback: 遡る上限ターン数。
@@ -156,18 +274,30 @@ def resolve_correction_target(
         (訂正は直前ターンに向くという従来の前提へ倒す)。候補が空なら
         空文字列。
     """
-    window = [c for c in candidates[-lookback:] if c[0]]
+    window = [c for c in candidates[-lookback:] if c and c[0]]
     if not window:
         return ""
 
     tokens = correction_evidence_tokens(correction)
     if not tokens:
         return window[-1][0]
+    wrong = set(wrong_side_tokens(correction))
 
-    bodies = [(entry_id, _normalize(text or "")) for entry_id, text in window]
+    rows = [
+        (
+            c[0],
+            _normalize(c[1] or ""),
+            _normalize(c[2] or "") if len(c) > 2 else "",
+        )
+        for c in window
+    ]
     # 文書頻度 (この語を含む候補数)。0 件の語は誰の得点にもならないので無視。
-    doc_freq = {
-        token: sum(1 for _, body in bodies if token in body)
+    body_freq = {
+        token: sum(1 for _, body, _q in rows if token in body)
+        for token in tokens
+    }
+    query_freq = {
+        token: sum(1 for _, _b, query in rows if query and token in query)
         for token in tokens
     }
 
@@ -175,12 +305,18 @@ def resolve_correction_target(
     best_score = 0.0
     # 新しい順に見る。同点なら新しい方を採る (同じ値を複数ターンが述べている
     # ときは直近を訂正しているとみなすのが自然)。
-    for entry_id, body in reversed(bodies):
-        score = sum(
-            1.0 / doc_freq[token]
-            for token in tokens
-            if doc_freq[token] and token in body
-        )
+    for entry_id, body, query in reversed(rows):
+        score = 0.0
+        for token in tokens:
+            if body_freq[token] and token in body:
+                if token in wrong:
+                    score += WRONG_SIDE_WEIGHT
+                    if len(body) <= len(token) + _WRONG_VALUE_ONLY_SLACK:
+                        score += WRONG_VALUE_ONLY_BONUS
+                else:
+                    score += 1.0 / body_freq[token]
+            if query_freq[token] and token in query:
+                score += 1.0 / query_freq[token]
         if score > best_score:
             best_id, best_score = entry_id, score
 
@@ -197,7 +333,15 @@ __all__ = [
     "NUMBER_LITERAL_RE",
     "QUOTED_RE",
     "STOP_IDENTIFIERS",
+    "CODE_TOKEN_RE",
+    "RIGHT_MARKER_RE",
+    "WRONG_MARKER_RE",
+    "WRONG_SIDE_META_WORDS",
+    "WRONG_SIDE_WEIGHT",
+    "WRONG_VALUE_ONLY_BONUS",
     "correction_evidence_tokens",
     "resolve_correction_target",
     "score_correction_match",
+    "wrong_side_spans",
+    "wrong_side_tokens",
 ]

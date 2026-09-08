@@ -63,6 +63,10 @@
 				<span class="value">v{detail.version}</span>
 			</div>
 			<div class="info-row">
+				<span class="label">{$t('cartridge.active_version')}</span>
+				<span class="value">v{detail.active_version || detail.version}</span>
+			</div>
+			<div class="info-row">
 				<span class="label">{$t('cartridge.author')}</span>
 				<span class="value">{detail.author || '—'}</span>
 			</div>
@@ -83,8 +87,16 @@
 				<span class="value">{formatSize(detail.size_mb)}</span>
 			</div>
 			<div class="info-row">
-				<span class="label">{$t('cartridge.priority')}</span>
-				<span class="value">{detail.priority}</span>
+				<span class="label">{$t('cartridge.license')}</span>
+				<span class="value">{detail.license || '—'}</span>
+			</div>
+			<div class="info-row">
+				<span class="label">{$t('cartridge.embedding_model')}</span>
+				<span class="value">{detail.embedding_model_id || '—'}</span>
+			</div>
+			<div class="info-row">
+				<span class="label">{$t('cartridge.content_digest')}</span>
+				<span class="value digest">{detail.content_digest.slice(0, 16) || '—'}</span>
 			</div>
 			<div class="info-row">
 				<span class="label">{$t('cartridge.compatibility')}</span>

@@ -514,7 +514,7 @@ class LoopFactView(FactViewBase):
         """``personal_fact`` / ``preference`` を全ストアから収集する (superseded 除外)。
 
         readers に ``"loop"`` を追加済 (``personal_fact`` / ``preference``)。
-        並び順: pinned 優先 → access_count 降順 → accessed_at 降順 → id 昇順。
+        並び順: pinned 優先 → accessed_at 降順 → id 昇順。
         ``limit<=0`` なら全件。
         """
         for ftype in _USER_PROFILE_TYPES:
@@ -533,7 +533,6 @@ class LoopFactView(FactViewBase):
         out.sort(
             key=lambda f: (
                 0 if f.pinned else 1,
-                -f.access_count,
                 -f.accessed_at,
                 f.id,
             ),

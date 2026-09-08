@@ -343,7 +343,7 @@ async def stream_staged_create(
         run_entry_smoke,
         run_import_smoke,
     )
-    from backend.free.memory.semantic.store import SemanticFactStore
+    from backend.free.memory.semantic.store import SemanticStore
     from backend.free.memory.views.loop import LoopFactView
 
     t_start = time.monotonic()
@@ -360,7 +360,11 @@ async def stream_staged_create(
         project_id=_STAGED_PROJECT_ID, goal=query, debug_logger=state.debug_logger,
     )
     # 隔離 SemMem ストア (workspace 内 .semmem)。永続 project ストアには触れない。
-    staged_store = SemanticFactStore.for_project(ws.root / ".semmem", _STAGED_PROJECT_ID)
+    # スコープはフィールドなので (c_16 §4.2)、隔離は **別ディレクトリの
+    # ストアを 1 つ立てる** ことで実現する。
+    _staged_semmem = SemanticStore(ws.root / ".semmem")
+    _staged_semmem.load()
+    staged_store = _staged_semmem.scoped(f"project:{_STAGED_PROJECT_ID}")
 
     def _staged_view(_pid: str) -> LoopFactView:
         return LoopFactView(stores=[staged_store], writeback_store=staged_store)

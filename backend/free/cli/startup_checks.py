@@ -295,15 +295,35 @@ def _check_lora_adapter(project_root: Path, config: dict) -> CheckResult:
     )
 
 
+def _episodic_index_file(project_root: Path, config: dict) -> Path | None:
+    """エピソード記憶のベクトル索引 (``index_q8.npy``) を探す。
+
+    索引はモデル別 (``<memory_dir>/episodic/embeddings/<model_id>/``) に置かれる
+    (c_16 §2.1)。埋め込みモデル名は起動時点で確定していないので、ディレクトリを
+    1 段なめて最初に見つかったものを見る (存在確認と次元照合が目的で、どの
+    モデルの索引かはここでは問わない)。
+    """
+    local_paths = config.get("local_paths", {})
+    memory_dir = _resolve_path(project_root, local_paths.get("memory_dir", "local/memory/"))
+    embeddings_dir = memory_dir / "episodic" / "embeddings"
+    if not embeddings_dir.is_dir():
+        return None
+    for child in sorted(embeddings_dir.iterdir()):
+        candidate = child / "index_q8.npy"
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _check_vector_index(project_root: Path, config: dict) -> CheckResult:
     """ベクトルインデックスの存在確認"""
-    local_paths = config.get("local_paths", {})
-    vectors_dir_str = local_paths.get("vectors_dir", "local/vectors/")
-    vectors_dir = _resolve_path(project_root, vectors_dir_str)
-    index_file = vectors_dir / "index_q8.npy"
+    index_file = _episodic_index_file(project_root, config)
 
-    if not index_file.exists():
-        logger.info("Vector index not found: %s (will be created on first use)", index_file)
+    if index_file is None or not index_file.exists():
+        logger.info(
+            "Episodic vector index not found (it is built on the first "
+            "sleep-time snapshot)",
+        )
         return CheckResult(
             level=CheckLevel.INFO,
             status=CheckStatus.WARN,
@@ -329,14 +349,10 @@ def _check_vector_dim_consistency(
     shape[1]）を読み、`embedding.dim` と比較する。
     インデックスが空のときは None を返してチェック自体を省略する。
     """
-    local_paths = config.get("local_paths", {})
-    vectors_dir_str = local_paths.get("vectors_dir", "local/vectors/")
-    vectors_dir = _resolve_path(project_root, vectors_dir_str)
-    metadata_file = vectors_dir / "metadata.json"
-    index_file = vectors_dir / "index_q8.npy"
-
-    if not index_file.exists():
+    index_file = _episodic_index_file(project_root, config)
+    if index_file is None or not index_file.exists():
         return None
+    metadata_file = index_file.parent / "metadata.json"
 
     embedding_cfg = config.get("embedding", {})
     config_dim = int(embedding_cfg.get("dim", 1024))

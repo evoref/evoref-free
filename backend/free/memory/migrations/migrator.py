@@ -198,21 +198,6 @@ class SchemaMigrator:
         # ランナーが集中管理する。rollback 時は書き換えていないため戻す必要はない。
         write_schema_marker(memory_dir, to_version)
 
-        # manifest の監査タイムスタンプ last_migrated_at を更新する
-        # (manifest が存在する場合のみ。compact_cmd の last_compacted_at と同様)。
-        from backend.free.memory.semantic.manifest import (
-            load_manifest,
-            update_manifest,
-        )
-
-        if load_manifest(memory_dir) is not None:
-            update_manifest(
-                memory_dir,
-                last_migrated_at=time.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(),
-                ),
-            )
-
         logger.info(
             "SchemaMigrator.upgrade completed: %d -> %d, "
             "steps=%d total_elapsed=%.1fms",
@@ -344,7 +329,8 @@ def run_migrations(
 
     `backend.factory._memory_init._init_memory` からワンショットで呼び出しやすい形に
     整えたもの。マイグレーション登録表は将来的にこのモジュール内の
-    `DEFAULT_MIGRATIONS` として集約する (現状は index v1→v2 の 1 件、bump 待ちの休眠)。
+    `DEFAULT_MIGRATIONS` として集約する (現状は 0 件。旧 index v1→v2 は
+    facts.jsonl / index.jsonl ごと廃止された、c_16 §4.2)。
     """
     migrator = SchemaMigrator(
         migrations=migrations,
@@ -362,11 +348,7 @@ def run_migrations(
 # 登録済 Migration の集約点。
 # v1 → v2 は M5-d で導入: SemMem 索引を旧 4 ファイル形式から fact_id 正規化形の
 # 統合 ``index.jsonl`` に変換する。
-from backend.free.memory.migrations.index_v1_to_v2 import (
-    IndexV1ToV2Migration,
-)
-
-DEFAULT_MIGRATIONS: list[Migration] = [IndexV1ToV2Migration()]
+DEFAULT_MIGRATIONS: list[Migration] = []
 
 
 __all__ = [

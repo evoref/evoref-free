@@ -13,19 +13,21 @@ CLI 本体 (``scripts/evorefmem_cli.py``) は argparse の薄いラッパに留�
 | サブコマンド | 用途 | 実装 |
 |---|---|---|
 | ``init`` | EvorefMem 初期化 (``init_evorefmem`` 委譲) | エントリ側 |
-| ``inspect`` | fact 数 / 型別分布 / index size / orphan 検出 / manifest 表示 | :mod:`.inspect_cmd` |
+| ``inspect`` | fact 数 / 型別 / namespace 別 / scope 別の分布と snapshot 状態 | :mod:`.inspect_cmd` |
 | ``migrate`` | SchemaMigrator 実行 / Migration 一覧表示 | :mod:`.migrate_cmd` |
-| ``compact`` | facts.jsonl の last-write-wins 圧縮 | :mod:`.compact_cmd` |
-| ``rebuild-indices`` | .idx 群を facts.jsonl から決定論的に再生成 | :mod:`.rebuild_indices_cmd` |
-| ``verify`` | .idx ↔ facts.jsonl 整合性 + manifest 検証 + orphan 検出 | :mod:`.verify_cmd` |
+| ``verify`` | supersession / 競合 / 埋め込み被覆 / claim の出所検査 | :mod:`.verify_cmd` |
+| ``purge-private`` | private 由来のキュレーターファクトを取り下げる | :mod:`.purge_private_cmd` |
 | ``export`` | semantic/ 全体を tar.gz バックアップ | :mod:`.export_import_cmd` |
 | ``import`` | export からのリストア (既存データは退避) | :mod:`.export_import_cmd` |
-| ``migrate-embedding`` | swap_active_model_id を人手で駆動 | :mod:`.migrate_embedding_cmd` |
+
+``compact`` / ``rebuild-indices`` / ``migrate-embedding`` / ``reembed-facts``
+は撤去した — 事象ログの畳み込み・転置索引・埋め込みはすべて sleep-time の
+snapshot 生成が担う (c_16 §5.3 / §6)。
 
 ## 安全性
 
-破壊的操作 (``migrate`` / ``compact`` / ``import`` / ``migrate-embedding``)
-はデフォルトで dry-run。``--apply`` フラグで実行する。
+破壊的操作 (``migrate`` / ``import`` / ``purge-private``) はデフォルトで
+dry-run。``--apply`` フラグで実行する。
 
 多重起動防止のために :func:`acquire_cli_lock` / :func:`release_cli_lock` が
 PID ベースの :data:`CLI_LOCK_PATH` を使う。

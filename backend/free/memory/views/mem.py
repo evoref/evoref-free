@@ -154,7 +154,7 @@ class MemFactView(FactViewBase):
         Args:
             subject_prefix: 与えると ``subject`` がこの接頭辞で始まるファクト
                 だけを候補にする。``ToolCallJudge`` の URL / コマンドリコールは
-                ``mem.world.url.`` / ``mem.world.executable_command.`` を渡す
+                ``idx.url.`` / ``idx.command.`` を渡す
                 こと — グローバル top-k を引いてから接頭辞で絞ると、ストアが
                 育った時点で索引行が top-k に入らなくなる (2026-09-02 監査 H3)。
                 ``None`` は従来どおり全件。

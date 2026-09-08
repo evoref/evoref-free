@@ -18,12 +18,13 @@ import numpy as np
 
 from backend.log_config import get_logger
 from backend.free.llm.model_metadata import DEFAULT_PARAMS_B
-from backend.free.memory.stores.short_term import MemoryNote, ShortTermMemory
-from backend.free.memory.stores.long_term import LongTermMemory
+from backend.free.memory.episodic.note import MemoryNote
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
     from backend.free.agent.aux_prompt_manager import AuxPromptManager
+    from backend.free.memory.episodic.store import EpisodicStore
+    from backend.free.memory.episodic.workspace import EpisodicWorkspace
 
 logger = get_logger("memory.note_evolver")
 
@@ -128,8 +129,8 @@ class NoteEvolver:
 
     async def evolve_notes(
         self,
-        short_term: ShortTermMemory,
-        long_term: LongTermMemory,
+        short_term: "EpisodicWorkspace",
+        long_term: "EpisodicStore | None",
         llm_client,
         should_pause: Callable[[], bool] | None = None,
     ) -> int:
@@ -316,8 +317,8 @@ class NoteEvolver:
     def _gather_context(
         self,
         note,
-        short_term: ShortTermMemory,
-        long_term: LongTermMemory,
+        short_term: "EpisodicWorkspace",
+        long_term: "EpisodicStore | None",
     ) -> list[str]:
         """ノートの文脈となる関連テキストを収集
 
@@ -346,16 +347,16 @@ class NoteEvolver:
             if related_note.id != note.id and related_note.content not in contexts:
                 contexts.append(related_note.content)
 
-        # LTM からも取得
-        ltm_results = long_term.search(note.embedding, top_k=self.context_k)
-        for chunk_id, score, text in ltm_results:
-            if text not in contexts:
-                contexts.append(text)
+        # long tier からも取得 (語彙索引は使わないのでクエリ文字列は空)。
+        if long_term is not None:
+            for hit in long_term.search("", note.embedding, top_k=self.context_k):
+                if hit.text not in contexts:
+                    contexts.append(hit.text)
 
         return contexts[:self.context_k]
 
     def rebuild_links_and_clusters(
-        self, short_term: ShortTermMemory,
+        self, short_term: "EpisodicWorkspace",
     ) -> dict[str, int]:
         """STM 全体に対してリンク張り直し + クラスタリングを行う (LLM 不使用)。
 
@@ -491,7 +492,7 @@ class NoteEvolver:
         stats["links"] = link_total
         # クラスタ数 = 有効ノートの連結成分数 + 孤立ノート数
         stats["clusters"] = len(component_members) + stats["skipped"]
-        # キャッシュ無効化 (lightmem_score は変えていないが links / cluster_id を反映)
+        # links / cluster_id を書き換えたので、作業領域に変更を知らせる
         mark = getattr(short_term, "mark_dirty", None)
         if callable(mark):
             mark()

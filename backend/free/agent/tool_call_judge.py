@@ -299,7 +299,7 @@ class ToolCallJudge:
             cartridge_manager: CartridgeManager インスタンス（None でカートリッジ hints 無効）
             learned_patterns: LearnedPatternStore インスタンス（None で学習済みパターン無効）
             mem_view: MemFactView インスタンス（None で URL リコール無効）。
-                URL なしの fetch 意図クエリで過去 ``mem.world.url.*`` を
+                URL なしの fetch 意図クエリで過去 ``idx.url.*`` を
                 引き当てるために使う。
             embedder: EmbeddingBackend インスタンス（None で URL リコール無効）。
                 ユーザクエリの embedding を生成して類似 URL fact を引く。
@@ -1581,7 +1581,7 @@ class ToolCallJudge:
         )
 
     def has_url_recall_candidates(self) -> bool:
-        """``mem.world.url.*`` ファクトが 1 件でも索引にあるか。
+        """``idx.url.*`` ファクトが 1 件でも索引にあるか。
 
         ``recall_url_judgement`` はクエリの埋め込み (HTTP 往復) を伴う。URL
         ファクトが 0 件なら何を埋め込んでも当たらないので、呼び元 (chat の
@@ -1609,7 +1609,7 @@ class ToolCallJudge:
         self, result: "ToolJudgement", query: str, mode: str = "create",
     ) -> None:
         """rule / learned 層が ``fetch_url`` を返したが URL が空の場合、
-        過去質問で正しく fetch できた URL (``mem.world.url.*``) を引き当てる。
+        過去質問で正しく fetch できた URL (``idx.url.*``) を引き当てる。
 
         引き当てが成立すると ``result.tool_args["url"]`` に補完して
         in-place で更新する。失敗 / 引き当てなしの場合は何もしない。
@@ -1851,7 +1851,7 @@ class ToolCallJudge:
         条件:
           - ``mem_view`` / ``embedder`` が両方提供されている
           - ``tools.url_recall_enabled`` が True
-          - ``mem.world.url.`` 接頭辞で **絞ってから** 引いた top-K 候補のうち
+          - ``idx.url.`` 接頭辞で **絞ってから** 引いた top-K 候補のうち
             ``world_fact`` のもの (グローバル top-K を引いてから接頭辞で絞ると、
             ストアが育った時点で索引行が top-K に入らなくなる — 2026-09-02 監査 H3)
           - 類似度 >= ``url_recall_min_score``
@@ -1911,7 +1911,7 @@ class ToolCallJudge:
         now = _time.time()
 
         # recall miss の理由を後から追えるよう、最良 (= 最高 sim) の
-        # ``mem.world.url.*`` 候補を記録しておく (candidates は score 降順想定)。
+        # ``idx.url.*`` 候補を記録しておく (candidates は score 降順想定)。
         best_subject: str | None = None
         best_sim: float | None = None
         best_reason = "no_url_candidate"
@@ -1975,7 +1975,7 @@ class ToolCallJudge:
         # 引き当て無し: なぜ外れたかを DEBUG で可視化する (閾値チューニングの根拠)。
         if best_subject is None:
             logger.debug(
-                "URL recall: no mem.world.url candidate in top-%d for query=%r",
+                "URL recall: no idx.url candidate in top-%d for query=%r",
                 top_k, query[:50],
             )
         else:
@@ -2005,7 +2005,7 @@ class ToolCallJudge:
         引き当てが成立すれば aux 呼出 (5 層目 / chat early-return) より
         先に確定するため、学習済みクエリでは LLM コストがゼロになる。
 
-        recall は subject の mode (`mem.world.executable_command.<mode>.*`) を
+        recall は subject の mode (`idx.command.<mode>.*`) を
         フィルタしないため、chat では create 学習由来の任意コマンド (書込系
         等) が引き当たり得る。chat (readonly) のときは
         ``reject_readonly_violation`` で再検証し、違反コマンドは引き当てを
@@ -2055,7 +2055,7 @@ class ToolCallJudge:
         ``_try_recall_url`` と対称。条件:
           - ``mem_view`` / ``embedder`` が両方提供されている
           - ``tools.executable_command_recall_enabled`` が True
-          - ``mem.world.executable_command.`` 接頭辞で **絞ってから** 引いた
+          - ``idx.command.`` 接頭辞で **絞ってから** 引いた
             top-K 候補のうち ``world_fact`` のもの (H3、URL リコールと同じ)
           - 類似度 >= ``executable_command_recall_min_score``
           - 過去成功率 (``_extra.success_avg``) >=

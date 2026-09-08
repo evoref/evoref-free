@@ -58,14 +58,6 @@
 			<dd>{stats.chunkingStrategy}</dd>
 		</div>
 		<div class="info-row">
-			<dt>{$t('dashboard.hybrid_search')}</dt>
-			<dd>{stats.hybridSearch ? $t('dashboard.enabled') : $t('dashboard.disabled')}</dd>
-		</div>
-		<div class="info-row">
-			<dt>{$t('dashboard.fusion_method')}</dt>
-			<dd>{stats.fusionMethod}</dd>
-		</div>
-		<div class="info-row">
 			<dt>{$t('dashboard.embedding_dim')}</dt>
 			<dd>{dimDisplay}</dd>
 		</div>

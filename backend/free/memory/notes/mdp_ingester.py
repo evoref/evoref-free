@@ -1,7 +1,7 @@
 """
 
 ``local/memory/agent_trace/agent_trace*.jsonl`` (``AgentTraceStore``) を
-エピソード単位で読み出し、エピソード記憶 (LongTermMemory / 通常 RAG ベクトル
+エピソード単位で読み出し、エピソード記憶 (EpisodicStore の long tier / RAG ベクトル
 DB) に取り込むためのアダプタ。
 
 設計の主旨
@@ -31,7 +31,7 @@ DB) に取り込むためのアダプタ。
 - **副作用ゼロ (基本)**: 本クラスはストレージ書き込みを行わない。
   呼び出し側 (``SleepTimeWorker._step7_5_ingest_mdp_traces``) が
   ``MemoryNote`` を受け取り、埋め込み計算と
-  ``LongTermMemory.absorb_from_short_term`` を実行する。これにより本クラスは
+  ``EpisodicStore.put_note(tier="long")`` を実行する。これにより本クラスは
   embedder / vector store に依存せず、ユニットテストで完結する。
 
 設計原則 (CLAUDE.md / .claude/rules/backend.md):
@@ -57,7 +57,7 @@ from backend.free.memory.extractors.mdp_trace import (
     episode_task_and_result,
     strip_volatile_measurements,
 )
-from backend.free.memory.stores.short_term import MemoryNote
+from backend.free.memory.episodic.note import MemoryNote
 from backend.io import atomic_write_text
 from backend.log_config import get_logger
 

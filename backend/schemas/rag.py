@@ -34,8 +34,6 @@ class ClusterIndexConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
-    # この件数以上の VectorStore で cluster index を構築
-    threshold: int = Field(default=5000, ge=100)
     # K = max(16, sqrt(N)) のうち n_probe_ratio × K 個のクラスタを探索
     n_probe_ratio: float = Field(default=0.125, gt=0.0, le=1.0)
 
@@ -200,26 +198,18 @@ class RAGConfig(BaseModel):
     # top_k*N*2 となり、上限 5 を超えると N>=5000+IVF 環境で recall ガード経由の
     # 全件走査フォールバックに倒れやすくなるため le=5 で制限する。
     fetch_multiplier: int = Field(default=1, ge=1, le=5)
-    # クロスレイヤ・スコア正規化方式。STM (cosine*0.6+lightmem*0.4)
-    # / LTM (raw cosine) / cartridge (cosine*priority, priority 無上限) という異種スケールを
-    # 層内正規化で [0,1] に揃えてから融合し、最終順位付けの歪みを抑える。
-    # none (既定) = 従来 (生スコア降順)。minmax = 層内 min-max。rank = 層内ランク減衰。
-    score_normalization: str = Field(default="none", pattern=r"^(none|minmax|rank)$")
-    hybrid_search: bool = True
-    bm25_weight: float = Field(default=0.3, ge=0.0, le=1.0)
-    vector_weight: float = Field(default=0.7, ge=0.0, le=1.0)
-    fusion_method: str = Field(default="rrf", pattern=r"^(rrf|weighted)$")
-    rrf_k: int = Field(default=60, ge=1)
-    # --- BM25 チューニング ---
-    bm25_k1: float = Field(default=1.5, ge=0.0, le=5.0)
-    bm25_b: float = Field(default=0.75, ge=0.0, le=1.0)
-    bm25_delta: float = Field(default=1.0, ge=0.0, le=5.0)
-    bm25_use_trigrams: bool = False
-    bm25_split_ascii: bool = True
-    # None → 既定ストップワード (DEFAULT_STOPWORD_BIGRAMS) を使用
-    # []   → ストップワード無効
-    # list → 指定リストを使用
-    bm25_stopword_bigrams: list[str] | None = None
+    # --- 順位付け (c_16 §7.2) ---
+    #
+    # 順位式は 3 ストア共通の 1 本 (``cos × freshness × confidence ×
+    # store_prior``) で、係数は ``memory.evidence.ranking.store_prior``。
+    # 廃止したキー (c_16 §8): ``score_normalization`` (層内正規化) /
+    # ``rrf_k`` / ``fusion_method`` / ``hybrid_search`` / ``bm25_weight`` /
+    # ``vector_weight`` / ``bm25_k1`` / ``bm25_b`` / ``bm25_delta`` /
+    # ``bm25_use_trigrams`` / ``bm25_split_ascii`` / ``bm25_stopword_bigrams``。
+    # BM25 (``rank-bm25``) は ``backend/free/rag/evidence/lexical_index.py`` の
+    # numpy CSR 転置索引に置き換わり、走査上限は
+    # ``memory.evidence.lexical`` が持つ。転置索引は候補生成器であって
+    # スコアを持ち込まないので (c_16 §6.3)、重み付け融合のキーは意味を失った。
     # --- Contextual Retrieval ---
     contextual_prefix: ContextualPrefixConfig = Field(
         default_factory=ContextualPrefixConfig,
@@ -265,13 +255,6 @@ class RAGConfig(BaseModel):
                 f"semantic_min_chunk ({self.semantic_min_chunk}) は "
                 f"semantic_max_chunk ({self.semantic_max_chunk}) 以下である必要があります"
             )
-        if self.fusion_method == "weighted":
-            total = self.bm25_weight + self.vector_weight
-            if abs(total - 1.0) > 0.01:
-                raise ValueError(
-                    f"fusion_method='weighted' の場合、"
-                    f"bm25_weight + vector_weight = 1.0 である必要があります（現在: {total}）"
-                )
         return self
 
 

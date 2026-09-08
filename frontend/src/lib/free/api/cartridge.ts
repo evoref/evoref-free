@@ -25,12 +25,20 @@ export interface Cartridge {
 	size_mb: number;
 }
 
-/** カートリッジ詳細情報（全フィールド） */
+/** カートリッジ詳細情報（全フィールド）
+ *
+ * `priority` は廃止 (docs/c_16_evidence_store.md §8)。順位付けの
+ * `store_prior` へ置き換わり、PC 固有の上書きはバックエンドの
+ * `corpus/manifest.json` が持つので UI からは触らない。
+ */
 export interface CartridgeDetail {
 	id: string;
 	name: string;
 	version: string;
+	/** 現在有効なパッケージ版 (`version` と同じ値) */
+	active_version: string;
 	author: string;
+	license: string;
 	description: string;
 	tags: string[];
 	language: string;
@@ -38,18 +46,23 @@ export interface CartridgeDetail {
 	doc_count: number;
 	size_mb: number;
 	status: string;
-	priority: number;
 	installed_at: string;
 	compatibility: string;
+	/** docs/ の内容ダイジェスト (再現性の鍵) */
+	content_digest: string;
+	embedding_model_id: string;
+	embedding_dim: number;
 }
 
 /** カートリッジ再構築結果 */
 export interface CartridgeRebuildResult {
 	id: string;
 	name: string;
+	version: string;
 	chunks: number;
 	status: string;
 	size_mb: number;
+	embedding_model_id: string;
 	rebuild_time_sec: number;
 	embedder_used: string;
 }

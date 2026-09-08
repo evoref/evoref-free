@@ -33,7 +33,7 @@ from backend.free.memory.extractors.base import (
     ExtractionResult,
 )
 from backend.free.memory.notes.note_builder import CreateNoteBuilder
-from backend.free.memory.stores.short_term import MemoryNote
+from backend.free.memory.episodic.note import MemoryNote
 from backend.free.memory.notes.subject_ns import make_mem_subject
 from backend.free.memory.types import FactType, SemanticFact
 from backend.log_config import get_logger

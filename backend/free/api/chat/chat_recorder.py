@@ -13,7 +13,6 @@ from backend.app_state import AppState
 from backend.free.core.text_quality import strip_system_notes
 from backend.free.api.chat._artifact import remember_artifact
 from backend.free.api.chat.chat_types import ChatMessage
-from backend.free.core.text_quality import is_query_echo, strip_echoed_query
 from backend.free.history import history_manager as _history_manager_module
 from backend.free.history.history_manager import (
     SessionData,
@@ -27,11 +26,7 @@ from backend.trace_context import get_trace_id, run_in_executor_with_context
 from backend.utils import format_utc, utc_now_dt
 
 if TYPE_CHECKING:
-    from backend.free.memory.stores.working import (
-        WorkingMemory,
-        WorkingMemoryRegistry,
-    )
-    from backend.free.memory.stores.short_term import ShortTermMemory
+    from backend.free.memory.stores.working import WorkingMemory
     from backend.free.learning.level0_instant import GenerationConfigRef
 
 logger = get_logger("api.chat.recorder")
@@ -220,6 +215,8 @@ def accumulate_user_turn(
     1 回しか数えない。同じ文面を連続 2 回送って 1 回目が失敗したケースは
     1 回に畳まれる (許容)。
     """
+    # 新しいターンの入口。前ターンの注入 id を必ず落とす (c_16 §5.5)。
+    _turn_evidence_ids.pop(session_id, None)
     if private:
         _accumulate_turn(session_id, "user", user_query, private=True)
         return
@@ -319,18 +316,29 @@ def clear_session_data(session_id: str) -> None:
     _session_started.pop(session_id, None)
     _session_turns.pop(session_id, None)
     _session_had_private.discard(session_id)
+    _turn_evidence_ids.pop(session_id, None)
 
 
-def _loaded_cartridge_ids(state: AppState) -> list[str]:
-    """現在ロード中のカートリッジ ID を返す (degraded 時は空)。
+#: セッション → **今のターンで実際に注入した** Evidence の ``<store>:<id>``
+#: (c_16 §5.5)。プロンプト組み立て側 (``chat._build_messages_with_search`` /
+#: 軽量パス) が :func:`set_turn_evidence_ids` で置き、``record_*`` が
+#: :func:`_active_gen_config` 経由で経験へ刻む。
+#:
+#: kwarg で 10 箇所の ``record_*`` 呼出へ通さないのは、注入の決まる場所
+#: (プロンプト組み立て) と記録の場所 (応答完了後) の間に、経路ごとに違う
+#: 5 種類のディスパッチが挟まるため。``accumulate_user_turn`` (ターンの入口)
+#: で必ず消えるので、注入しなかったターンが前のターンの id を引き継がない。
+_turn_evidence_ids: dict[str, list[str]] = {}
 
-    Level 0 経験に刻み、Level 2 のカートリッジ汚染フィルタ / 依存度メタ /
-    get_cartridge_impact (自動ロールバック) が参照する。
-    """
-    mgr = getattr(state, "cartridge_manager", None)
-    if mgr is None:
-        return []
-    return list(mgr.loaded)
+
+def set_turn_evidence_ids(session_id: str, evidence_ids: list[str]) -> None:
+    """このターンで注入した Evidence id を置く (c_16 §5.5)。"""
+    _turn_evidence_ids[session_id] = list(evidence_ids)
+
+
+def turn_evidence_ids(session_id: str) -> list[str]:
+    """このターンで注入した Evidence id (未設定は空)。"""
+    return list(_turn_evidence_ids.get(session_id) or ())
 
 
 def _existing_session(mgr, session_id: str) -> "SessionData | None":
@@ -520,74 +528,27 @@ def _save_session_to_history(
         logger.warning("Failed to save session to history: %s", e)
 
 
-def drain_evicted_to_stm(
-    wm: WorkingMemory, stm: ShortTermMemory, session_id: str,
-) -> None:
-    """WorkingMemory から押し出されたターンを ShortTermMemory に吸収
+def release_session_turns(session_id: str) -> None:
+    """セッション終了時の後始末 (蓄積バッファの掃除)。
 
-    直前のユーザー発言を逐語コピーしただけの assistant 応答は、記憶として
-    保存しない。保存すると同じ問いで想起されて再生産され、繰り返し回数が
-    増えていく自己増幅ループになる (実インシデント 2026-08-04 ライブ監査:
-    「今日は何曜日ですか。」が 5 回繰り返され答えが出ない状態まで悪化。
-    汚染ノートを除去したら 5/5 で解消した)。エコー部分を落として中身が
-    残ればその中身だけを吸収し、何も残らなければ丸ごと捨てる。
+    ノートの生成は会話履歴を入力にする sleep-time の仕事になったので
+    (c_16 §4.1)、ここで記憶層へ流すものは無い。窓は呼出側が落とす。
     """
-    _absorb_turns_to_stm(wm.drain_evicted(), stm, session_id, origin="evicted")
-
-
-def snapshot_wm_to_stm(
-    wm: WorkingMemory, stm: ShortTermMemory, session_id: str,
-) -> None:
-    """WorkingMemory の未転送ターンを **非破壊で** ShortTermMemory へ写す。
-
-    f_02 §1.2 経路 (c)。sleep-time Full の直前に呼ばれ、押し出しが起きていない
-    進行中セッションでも Step 8 抽出の入力を用意する。WM のターンは残るので
-    会話 context は壊れない。エコー落としは押し出し経路と同じ規則を使う。
-    """
-    _absorb_turns_to_stm(
-        wm.snapshot_unabsorbed(), stm, session_id, origin="snapshot",
-    )
-
-
-def snapshot_all_wm_to_stm(
-    registry: WorkingMemoryRegistry, stm: ShortTermMemory,
-) -> None:
-    """**全セッション** の WM 未転送ターンを非破壊で STM へ写す (Full 直前)。
-
-    ``SleepTimeScheduler.set_pre_full_flush`` に注入される。単一 WM 時代は
-    現行セッションだけを写していたが、WM はセッション別なので、Full の入力から
-    抜けるセッションが出ないよう台帳を全部なめる。
-    """
-    for session_id, turns in registry.snapshot_all_unabsorbed():
-        _absorb_turns_to_stm(turns, stm, session_id, origin="snapshot")
-
-
-def release_session_turns(
-    wm: WorkingMemory, stm: ShortTermMemory, session_id: str,
-) -> None:
-    """セッション終了時の WM → STM 転送 + セッション蓄積の掃除 (f_02 §1.2 経路 (b))。
-
-    ``WorkingMemoryRegistry`` の drain ハンドラとして注入され、LRU 押し出し /
-    明示のセッション終了 / shutdown の 3 経路すべてがここを通る。台帳側が
-    ``clear()`` を先に済ませているので、ここでは押し出しバッファを **その
-    セッション ID で** 吸収する (エコー落とし規則込み) だけでよい。
-    """
-    drain_evicted_to_stm(wm, stm, session_id)
     clear_session_data(session_id)
 
 
 def end_session(state: AppState, session_id: str) -> bool:
-    """明示のセッション終了: WM を drain して台帳から外し、セッション別カウンタを畳む。
+    """明示のセッション終了: 窓を台帳から外し、セッション別カウンタを畳む。
 
-    セッション解除 API (``DELETE /api/sessions/{id}``) から呼ぶ。以前は
-    ``prepare_memory_context`` がセッション切替を検知して行っていた後始末
-    (WM drain / judge_tracker の reset) を、WM がセッション別になったことで
-    ここへ移した。台帳に無ければ ``False``。
+    セッション解除 API (``DELETE /api/sessions/{id}``) から呼ぶ。台帳に
+    無ければ ``False``。会話は履歴に残っているので、まだノート化されて
+    いないターンは次の sleep-time が拾う (c_16 §4.1)。
     """
     registry = getattr(state, "working_memory_registry", None)
     dropped = False
     if registry is not None:
         dropped = registry.drop(session_id) is not None
+    release_session_turns(session_id)
     for tracker in (
         getattr(state, "judge_tracker", None),
         getattr(state, "conflict_judge_tracker", None),
@@ -595,51 +556,6 @@ def end_session(state: AppState, session_id: str) -> bool:
         if tracker is not None:
             tracker.reset_session(session_id)
     return dropped
-
-
-def _absorb_turns_to_stm(
-    turns: list[dict], stm: ShortTermMemory, session_id: str, *, origin: str,
-    preceding_user: str = "",
-) -> None:
-    """ターン列を STM へ吸収する共通処理 (押し出し / スナップショット共用)。
-
-    直前のユーザー発言を逐語コピーしただけの assistant 応答は、記憶として
-    保存しない。保存すると同じ問いで想起されて再生産され、繰り返し回数が
-    増えていく自己増幅ループになる (実インシデント 2026-08-04 ライブ監査:
-    「今日は何曜日ですか。」が 5 回繰り返され答えが出ない状態まで悪化。
-    汚染ノートを除去したら 5/5 で解消した)。エコー部分を落として中身が
-    残ればその中身だけを吸収し、何も残らなければ丸ごと捨てる。
-
-    ``preceding_user`` は ``turns`` の先頭より前にあった user 発話。assistant
-    ターン単独を吸収する経路 (WM を迂回する直接吸収) でもエコー判定が
-    効くように、比較対象の初期値として使う。
-    """
-    last_user = preceding_user
-    dropped = 0
-    for turn in turns:
-        content = turn.get("content") or ""
-        if turn.get("role") == "user" or turn.get("source") == "user":
-            last_user = content
-        elif last_user and content:
-            if is_query_echo(content, last_user):
-                dropped += 1
-                continue
-            cleaned = strip_echoed_query(content, last_user)
-            if cleaned != content:
-                turn = {**turn, "content": cleaned}
-        stm.absorb(turn, session_id)
-    if dropped:
-        logger.info(
-            "Dropped %d echo-only assistant turn(s) before STM absorb (session=%s)",
-            dropped, session_id,
-        )
-    if turns:
-        total_chars = sum(len(t.get("content", "")) for t in turns)
-        logger.debug(
-            "Absorbed %d %s turns to STM: total_chars=%d, session=%s",
-            len(turns), origin, total_chars, session_id,
-        )
-        logger.info("Absorbed %d %s turns to STM", len(turns), origin)
 
 
 def _wm_correction_flag(
@@ -853,15 +769,12 @@ def _record_assistant_turn_to_memory(
     tool_command_success: bool | None = None,
     tool_command_source: str | None = None,
 ) -> str:
-    """assistant 応答を WM → STM へ記録する (record_* 3 経路の共通処理)。
+    """assistant 応答をワーキングメモリへ積む (record_* 3 経路の共通処理)。
 
-    - ``full_response`` が空でも **押し出し済みターンの STM 転送は行う**
-      (空応答のターンで転送を飛ばすと、押し出されたターンが次の応答まで
-      転送バッファに滞留する)。
-    - WM は ``session_id`` のもの (``get_memory_system(session_id)``)。WM が
-      セッション別になる前は、生成中に別セッションへ切り替わった WM を迂回して
-      STM へ直接吸収するガードが要ったが、今は台帳が常に正しいセッションの窓を
-      返すので不要。
+    - 記憶層への書き込みはここでは起きない (c_16 §2.1: エピソード記憶の
+      書き手は sleep-time だけ)。窓へ積むのと、蓄積バッファ → 会話履歴に
+      残すのが応答パスの仕事。
+    - WM は ``session_id`` のもの (``get_memory_system(session_id)``)。
     - ``tool_command*`` は run_command 実行ターンの learning メタ。3 経路とも
       同じ kwargs を受けるので、meta-cognitive 経路の run_command も
       sleep-time Step 8.6 (executable_command_curator) に届く。
@@ -873,44 +786,24 @@ def _record_assistant_turn_to_memory(
         and registry.peek(session_id) is None
         and full_response
     ):
-        # 台帳から落ちたセッション (LRU 押し出し / 明示終了) に遅れて応答が返った。
-        # 新しい空の窓を作って assistant ターンだけを積むと、次の drain で
-        # 「user 不在の応答」が STM に落ちる。窓は再生せず、直前の user 発話と
-        # 対にして STM へ直接吸収する (エコー落としは _absorb_turns_to_stm 側)。
-        stm = getattr(state, "short_term_memory", None)
-        if stm is not None:
-            turn: dict = {
-                "role": "assistant", "content": _recorded_body(full_response),
-                "timestamp": time.time(), "source": "assistant", "mode": mode,
-            }
-            if private:
-                turn["private"] = True
-            if tool_command is not None:
-                turn.update(
-                    tool_command=tool_command, tool_command_name=tool_command_name,
-                    tool_command_success=tool_command_success,
-                    tool_command_source=tool_command_source,
-                    tool_command_query=user_query,
-                )
-            _absorb_turns_to_stm(
-                [turn], stm, session_id, origin="late_response",
-                preceding_user=user_query,
-            )
-            logger.info(
-                "record: session %s has no working memory (ended/evicted); "
-                "absorbed late assistant turn directly into STM", session_id[:8],
-            )
+        # 台帳から落ちたセッション (LRU 押し出し / 明示終了) に遅れて応答が
+        # 返った。窓を作り直しても次のターンは来ないので積まない。応答本文は
+        # 蓄積バッファ経由で会話履歴に残り、sleep-time がそこからノートにする。
+        logger.info(
+            "record: session %s has no working memory (ended/evicted); "
+            "the late assistant turn is kept in history only", session_id[:8],
+        )
         return ""
     mem_sys = state.get_memory_system(session_id)
     if not mem_sys:
         return ""
-    wm, stm, _ltm = mem_sys
+    wm, _episodic = mem_sys
     turn_id = ""
     if full_response:
         body = _recorded_body(full_response)
-        # 発火元のクエリを note に確定させる。curator が STM を走査して
-        # 「直前で最も近い user note」から推測すると、当該ターンの user note が
-        # 吸収されていない場合に別ターンのクエリと結び付く。
+        # 発火元のクエリをターンに確定させる。curator がノートを走査して
+        # 「直前で最も近い user ノート」から推測すると、当該ターンの user
+        # ノートが無い場合に別ターンのクエリと結び付く。
         tool_command_query = user_query if tool_command else None
         turn_id = wm.add_turn(
             "assistant", body,
@@ -921,11 +814,12 @@ def _record_assistant_turn_to_memory(
             tool_command_source=tool_command_source,
             tool_command_query=tool_command_query,
         )
-    drain_evicted_to_stm(wm, stm, session_id)
     return turn_id
 
 
-def _active_gen_config(state: AppState, mode: str) -> "GenerationConfigRef":
+def _active_gen_config(
+    state: AppState, mode: str, session_id: str = "",
+) -> "GenerationConfigRef":
     """このターンで有効だった構成 (プロンプト版 / few-shot / ポリシー / LoRA)。
 
     fitness の帰属先を **推測せず記録** するための素性 (c_05 §0.6)。取得
@@ -964,14 +858,21 @@ def _active_gen_config(state: AppState, mode: str) -> "GenerationConfigRef":
     lora_version = getattr(state, "active_lora_version", None)
     if isinstance(lora_version, int):
         ref.lora_version = lora_version
+    ref.evidence_ids = turn_evidence_ids(session_id) if session_id else []
     return ref
 
 
-#: 履歴ターンの ``meta`` に載せる WM ターンのキー。``content`` と重複する
-#: 大きな値 (tool_command 本文) は載せない。
+#: 履歴ターンの ``meta`` に載せる WM ターンのキー。
+#:
+#: ノート生成が会話履歴を入力にするようになったので (c_16 §4.1)、ノートの
+#: フィールドを埋めるのに要るものはここを通すしかない。``tool_command`` /
+#: ``tool_command_query`` は sleep-time Step 8.6
+#: (``executable_command_curator``) の入力で、以前は WM ターン →
+#: ``MemoryNote`` へ直に渡っていた。
 _TURN_META_KEYS = (
     "mode", "source", "is_correction",
-    "tool_command_name", "tool_command_success", "tool_command_source",
+    "tool_command", "tool_command_name", "tool_command_success",
+    "tool_command_source", "tool_command_query",
 )
 
 
@@ -1115,7 +1016,6 @@ def record_response(
                 query=user_query, response=body, mode=mode,
                 tool_routing_success=tool_routing_success,
                 tool_routing_false_positive=tool_fp,
-                cartridge_ids=_loaded_cartridge_ids(state),
                 rag_used=rag_used, rag_top1_score=rag_top1_score,
                 completion_tokens=tokens_generated,
                 prompt_tokens=prompt_tokens,
@@ -1127,7 +1027,7 @@ def record_response(
                 generation_failed=generation_failed or not body.strip(),
                 session_id=session_id,
                 turn_id=assistant_turn_id,
-                gen_config=_active_gen_config(state, mode),
+                gen_config=_active_gen_config(state, mode, session_id),
             )
         except Exception as e:
             # 経験記録の失敗でチャットを壊さない方針は維持するが、**握り潰さない**。
@@ -1230,7 +1130,6 @@ def record_meta_cognitive_response(
                 rag_top1_score=rag_top1_score,
                 tool_routing_success=tool_routing_success,
                 tool_routing_false_positive=tool_routing_false_positive,
-                cartridge_ids=_loaded_cartridge_ids(state),
                 step_credits=credits_dicts,
                 completion_tokens=tokens_generated,
                 prompt_tokens=prompt_tokens,
@@ -1238,6 +1137,7 @@ def record_meta_cognitive_response(
                 truncated=truncated,
                 generation_failed=generation_failed or not body.strip(),
                 session_id=session_id,
+                gen_config=_active_gen_config(state, mode, session_id),
             )
         except Exception as e:
             logger.error(
@@ -1352,7 +1252,6 @@ def record_long_form_response(
                     units_completed == 0
                     or is_content_type_mismatch(metrics, user_query)
                 ),
-                cartridge_ids=_loaded_cartridge_ids(state),
                 rag_used=rag_used,
                 rag_top1_score=rag_top1_score,
                 completion_tokens=tokens_generated,
@@ -1361,6 +1260,7 @@ def record_long_form_response(
                 truncated=truncated,
                 generation_failed=generation_failed or not body.strip(),
                 session_id=session_id,
+                gen_config=_active_gen_config(state, mode, session_id),
             )
         except Exception as e:
             logger.error(

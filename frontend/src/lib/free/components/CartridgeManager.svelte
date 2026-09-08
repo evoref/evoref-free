@@ -233,7 +233,7 @@
 		<input
 			bind:this={fileInput}
 			type="file"
-			accept=".zip"
+			accept=".evocart,.zip"
 			class="hidden"
 			onchange={handleInstall}
 		/>

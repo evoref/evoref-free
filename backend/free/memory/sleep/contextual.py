@@ -5,10 +5,10 @@
 
 VectorStore と CartridgeManager 内の ``has_context=false`` チャンクに対し、
 補助タスクでコンテキストプレフィックスを生成し、プレフィックス付き
-テキストで再埋め込み → BM25 再構築を行う。
+テキストで再埋め込みを行う。
 
 本 module は EvorefMem pillar 内部扱いだが、実質は EvorefGen pillar の
-VectorStore / BM25Retriever / EmbeddingBackend / ContextualPrefixGenerator を
+VectorStore / EmbeddingBackend / ContextualPrefixGenerator を
 ほぼ直接操作するオーケストレーション層。
 """
 
@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING, Any
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
-    from backend.free.rag.bm25_retriever import BM25Retriever
     from backend.free.rag.cartridge_manager import CartridgeManager
     from backend.free.rag.contextual_prefix import ContextualPrefixGenerator
     from backend.free.rag.embedding_backend import EmbeddingBackend
@@ -36,16 +35,10 @@ async def generate_prefixes_for_store(
     batch_size: int,
     label: str,
     *,
-    main_store: "VectorStore | None" = None,
-    bm25_retriever: "BM25Retriever | None" = None,
     is_cancelled: Callable[[], bool] | None = None,
     min_chunk_tokens: int = 0,
 ) -> int:
     """1 つの VectorStore 内のプレフィックス未生成チャンクを処理する。
-
-    ``store is main_store`` かつ ``bm25_retriever`` が指定されていれば、
-    プレフィックス生成後にメイン BM25 を再構築する (カートリッジは
-    独自の BM25 インデックスを持たないため再構築しない)。
 
     ``min_chunk_tokens`` が 1 以上のときは、metadata の ``tokens`` が
     その値未満の chunk をスキップする。短文 chunk は
@@ -141,17 +134,6 @@ async def generate_prefixes_for_store(
     if generated > 0 or backfilled > 0:
         store.save()
 
-        if store is main_store and bm25_retriever is not None:
-            from backend.free.rag.bm25_retriever import (
-                build_index_from_vector_store,
-            )
-
-            n = build_index_from_vector_store(bm25_retriever, store)
-            logger.info(
-                "Step 5.8 [%s]: rebuilt BM25 index with %d contextual texts",
-                label, n,
-            )
-
     return generated
 
 
@@ -162,7 +144,6 @@ async def generate_contextual_prefixes(
     embedder: "EmbeddingBackend",
     vector_store: "VectorStore | None",
     cartridge_manager: "CartridgeManager | None",
-    bm25_retriever: "BM25Retriever | None",
     is_cancelled: Callable[[], bool] | None = None,
 ) -> int:
     """Step 5.8 本体 — メイン VectorStore + 全カートリッジを順次処理する。
@@ -182,7 +163,6 @@ async def generate_contextual_prefixes(
             :class:`~backend.free.rag.embedding_backend.EmbeddingBackend`。
         vector_store: メイン VectorStore。
         cartridge_manager: 任意の CartridgeManager。
-        bm25_retriever: メイン BM25 を再構築するために渡す BM25Retriever。
         is_cancelled: キャンセル判定コールバック。
 
     Returns:
@@ -214,8 +194,6 @@ async def generate_contextual_prefixes(
         embedder,
         batch_size,
         "main",
-        main_store=vector_store,
-        bm25_retriever=bm25_retriever,
         is_cancelled=is_cancelled,
         min_chunk_tokens=min_chunk_tokens,
     )
@@ -230,8 +208,6 @@ async def generate_contextual_prefixes(
                 embedder,
                 batch_size,
                 f"cartridge:{cart_id}",
-                main_store=vector_store,
-                bm25_retriever=bm25_retriever,
                 is_cancelled=is_cancelled,
                 min_chunk_tokens=min_chunk_tokens,
             )

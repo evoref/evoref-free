@@ -6,7 +6,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from backend.app_state import AppState, get_app_state
 from backend.free.api.schemas import (
-    FadeMemStats,
     LongTermMemoryStats,
     MemoryDetailedStats,
     MemoryNotesResponse,
@@ -34,7 +33,7 @@ from backend.free.memory.semantic.pin_manager import (
     pin_fact,
     unpin_fact,
 )
-from backend.free.memory.semantic.store import SemanticFactStore
+from backend.free.memory.semantic.store import ScopedSemanticStore
 from backend.free.memory.pipeline.stats_calculator import (
     compute_ltm_stats,
     compute_stm_stats,
@@ -75,8 +74,8 @@ _ALLOWED_FACT_TYPES: frozenset[str] = frozenset(
 )
 
 
-def _resolve_store(state: AppState, scope: str) -> SemanticFactStore:
-    """scope 文字列を検証し、対応する SemanticFactStore を返す"""
+def _resolve_store(state: AppState, scope: str) -> ScopedSemanticStore:
+    """scope 文字列を検証し、スコープ束縛の SemMem ビューを返す"""
     if not scope or (scope != "global" and not scope.startswith("project:")):
         raise HTTPException(
             status_code=400,
@@ -88,6 +87,8 @@ def _resolve_store(state: AppState, scope: str) -> SemanticFactStore:
         return state.get_semantic_store(scope)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 def _to_pinned_info(fact: SemanticFact) -> PinnedFactInfo:
@@ -104,16 +105,14 @@ def _to_pinned_info(fact: SemanticFact) -> PinnedFactInfo:
         mode_origin=fact.mode_origin,
         created_at=fact.created_at,
         accessed_at=fact.accessed_at,
-        access_count=fact.access_count,
     )
 
 
 def _compute_semantic_stats(state: AppState) -> SemanticMemoryStats:
-    """ロード済みの SemanticFactStore を集計する
+    """スコープ別に SemMem を集計する。
 
-    `AppState._semantic_stores` は lazy 初期化されるため、まだ参照されていない
-    プロジェクトはここに含まれない (= "現在ロード中のもののみ" の集計)。
-    Pin API / facts API がアクセスされたタイミングで自動的にロードされる。
+    実体は 1 ストアなので (c_16 §4.2)、ここに現れるのは **これまでに参照された
+    スコープ** のビューだけ。Pin API / facts API がアクセスした時点で増える。
     """
     scopes: list[SemanticMemoryScopeStats] = []
     total_facts = 0
@@ -167,29 +166,28 @@ async def get_memory_stats(state: AppState = Depends(get_app_state)):
             ),
             short_term=ShortTermMemoryStats(
                 notes=0, max_notes=mem_cfg.get("short_term_max_notes", 100),
-                pending_embeddings=0, pending_evolution=0, avg_lightmem_score=0.0,
+                pending_embeddings=0, pending_evolution=0,
             ),
             long_term=LongTermMemoryStats(chunks=0, index_size_mb=0.0, sources=0),
-            fadem=FadeMemStats(
-                alpha=mem_cfg.get("fade_alpha", 0.4),
-                beta=mem_cfg.get("fade_beta", 0.3),
-                gamma=mem_cfg.get("fade_gamma", 0.3),
-                threshold=mem_cfg.get("fade_threshold", 0.15),
-            ),
             semantic=semantic_stats,
             current_mode=current_mode,
         )
 
-    wm, stm, ltm = mem_sys
+    wm, episodic = mem_sys
 
-    # STM 統計 (純粋関数に委譲)
-    stm_stats = compute_stm_stats(stm.notes.values())
-
-    # LTM 統計 (純粋関数に委譲)
+    # ``short`` / ``long`` は同じストアの tier (c_16 §4.1)。レスポンスの形は
+    # 既存 UI と揃えたまま、件数の出所だけをエピソード記憶へ移した。
+    short_notes = episodic.short_notes() if episodic is not None else []
+    long_notes = episodic.iter_notes(tier="long") if episodic is not None else []
+    stm_stats = compute_stm_stats(short_notes)
+    index_path = None
+    if episodic is not None:
+        vectors = episodic.evidence.vector_store()
+        index_path = getattr(vectors, "index_path", None)
     ltm_stats = compute_ltm_stats(
-        chunks=ltm.vectors.count if ltm else 0,
-        index_path=ltm.vectors.index_path if ltm else None,
-        metadata=ltm.vectors.metadata if ltm else None,
+        chunks=len(long_notes),
+        index_path=index_path,
+        sources=len({n.session_id for n in long_notes if n.session_id}),
     )
 
     return MemoryDetailedStats(
@@ -201,17 +199,11 @@ async def get_memory_stats(state: AppState = Depends(get_app_state)):
             session_id=wm.session_id,
         ),
         short_term=ShortTermMemoryStats(
-            notes=len(stm.notes),
-            max_notes=stm.max_notes,
+            notes=len(short_notes),
+            max_notes=mem_cfg.get("short_term_max_notes", 100),
             **stm_stats,
         ),
         long_term=LongTermMemoryStats(**ltm_stats),
-        fadem=FadeMemStats(
-            alpha=mem_cfg.get("fade_alpha", 0.4),
-            beta=mem_cfg.get("fade_beta", 0.3),
-            gamma=mem_cfg.get("fade_gamma", 0.3),
-            threshold=mem_cfg.get("fade_threshold", 0.15),
-        ),
         semantic=semantic_stats,
         current_mode=current_mode,
     )
@@ -234,17 +226,17 @@ async def get_memory_notes(
     if mem_sys is None:
         return MemoryNotesResponse(total=0, notes=[])
 
-    _, stm, _ = mem_sys
-    notes = list(stm.notes.values())
+    _, episodic = mem_sys
+    if episodic is None:
+        return MemoryNotesResponse(total=0, notes=[])
+    notes = list(episodic.short_notes())
 
     # タグフィルタ
     if tag:
         notes = [n for n in notes if tag in n.tags]
 
-    # ソート
-    if sort == "score":
-        notes.sort(key=lambda n: -n.lightmem_score)
-    elif sort == "created":
+    # ソート (``score`` は廃止した LightMem スコアの名残なので新しい順に倒す)
+    if sort in ("score", "created"):
         notes.sort(key=lambda n: -n.created_at)
     elif sort == "accessed":
         notes.sort(key=lambda n: -n.accessed_at)
@@ -260,10 +252,8 @@ async def get_memory_notes(
                 content=n.content,
                 keywords=n.keywords,
                 tags=n.tags,
-                lightmem_score=n.lightmem_score,
                 created_at=n.created_at,
                 accessed_at=n.accessed_at,
-                access_count=n.access_count,
                 session_id=n.session_id,
                 context_description=n.context_description,
                 evolution_pending=n.evolution_pending,

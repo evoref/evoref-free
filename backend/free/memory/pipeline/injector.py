@@ -42,6 +42,7 @@ from __future__ import annotations
 import re
 import math
 import time
+from datetime import UTC, datetime
 
 import numpy as np
 from dataclasses import dataclass, field
@@ -64,7 +65,8 @@ from backend.free.memory.attribute_key import (
     attribute_key,
 )
 from backend.free.memory.notes.subject_ns import is_session_summary_subject
-from backend.free.memory.stores.short_term import MemoryNote
+from backend.free.memory.semantic.namespaces import is_injectable, namespace_of
+from backend.free.memory.episodic.note import MemoryNote
 from backend.free.memory.types import MemoryMode, SemanticFact
 from backend.i18n_helper import prompt_locale
 from backend.log_config import get_logger
@@ -81,12 +83,20 @@ _RENDER_LABELS: dict[str, dict[str, str]] = {
         "corrected_aged": " (訂正後の記録・{age}日前)",
         "aged": " ({age}日前の記録)",
         "note": "- (過去の記録) {content}",
+        "as_of": "{date} 時点",
+        "source": "{name}",
+        "corroboration": "裏取り {n} 件",
+        "unverified": "未確認",
     },
     "en": {
         "corrected": " (corrected record)",
         "corrected_aged": " (corrected record, {age} days ago)",
         "aged": " (recorded {age} days ago)",
         "note": "- (past record) {content}",
+        "as_of": "as of {date}",
+        "source": "{name}",
+        "corroboration": "{n} corroborating sources",
+        "unverified": "unverified",
     },
 }
 
@@ -213,56 +223,30 @@ PINNED_RELEVANCE_RATIO = 0.5
 #: (``mem.decision.<project_id>``) は正当なユーザーファクト。
 _EPISODE_TRACE_SUBJECT_PREFIX = "mem.decision.ep_"
 
-#: executable command リコール索引の subject 接頭辞
-#: (``memory.sleep.executable_command_curator``)。``world_fact`` を流用して
-#: いるが中身は「このクエリはこのコマンドで答えた」という **索引** で、
-#: ``object`` には過去のユーザーの質問文がそのまま入る。読み手は
-#: ``ToolCallJudge`` だけ (``agent.tool_call_judge`` が同じ接頭辞で引く)。
-#:
-#: [関連する記憶] に並べると、過去の質問文が「世界の事実」として提示される。
-#: 実データ (2026-08-16 監査時点):
-#:   (world_fact) mem.world.executable_command.chat.0e480f56 answers_query:
-#:   今日は8月16日ですよね。今日から100日後は何月何日になりますか？
-#: セッション要約 / エピソードトレースと同じ「内部索引」の類。
-_EXECUTABLE_COMMAND_SUBJECT_PREFIX = "mem.world.executable_command."
-
-#: URL リコール索引の subject 接頭辞 (``memory.sleep.url_curator``)。
-#: executable command 索引と同型で、``object`` は過去のユーザーの質問文
-#: (``answers_topic``)。読み手は ``ToolCallJudge`` の URL リコールだけ。
-#: 接頭辞リストから漏れていたため ``world_fact`` として [関連する記憶] へ
-#: 出ていた (2026-09-02 監査 M21)。
-_URL_INDEX_SUBJECT_PREFIX = "mem.world.url."
-
-#: 内部索引の subject 接頭辞。いずれも「アシスタント側の記録」であって
-#: ユーザーについての事実ではないため、ユーザーに見える枠へ出さない。
-#:
-#: 消費側は 2 つ: ``[関連する記憶]`` (本モジュールの :meth:`MemoryInjector.inject`)
-#: と ``[記憶の競合]`` (``conflict_review.collect_review_groups``)。片方だけに
-#: 掛けると同じ内容が別の窓から出る — 実際 2026-08-19 時点の pending は全 2 件が
-#: セッション要約で、競合セクション側から素通しになっていた。
-INTERNAL_INDEX_SUBJECT_PREFIXES: tuple[str, ...] = (
-    _EPISODE_TRACE_SUBJECT_PREFIX,
-    _EXECUTABLE_COMMAND_SUBJECT_PREFIX,
-    _URL_INDEX_SUBJECT_PREFIX,
-)
-
-
 def is_internal_index_subject(subject: str) -> bool:
     """``subject`` が内部索引 (ユーザー向けに出さない記録) のものか。
 
-    セッション要約は型が可変なので接頭辞ではなく形で判定する
-    (:func:`~backend.free.memory.notes.subject_ns.is_session_summary_subject`)。
-    エピソードトレースと executable command 索引は subject が固定接頭辞。
+    3 種類ある:
+
+    1. ``idx.*`` namespace — URL / コマンドのリコール索引 (c_16 §4.2)。
+       ``object`` に入るのは過去のユーザーの質問文で、読み手は
+       ``ToolCallJudge`` だけ。注入可否の SSOT は
+       :func:`~backend.free.memory.semantic.namespaces.is_injectable`。
+    2. セッション要約 — 型が可変なので接頭辞ではなく形で判定する
+       (:func:`~backend.free.memory.notes.subject_ns.is_session_summary_subject`)。
+    3. MDP エピソードトレース — subject が固定接頭辞
+       (:data:`_EPISODE_TRACE_SUBJECT_PREFIX`)。
 
     **両方の消費側 (注入 / 競合レビュー) は必ずこの関数を通す** — 片方だけに
-    掛けると同じ内容が別の窓から出る (:data:`INTERNAL_INDEX_SUBJECT_PREFIXES`
-    のコメント参照)。
+    掛けると同じ内容が別の窓から出る。実際 2026-08-19 時点の pending は全 2 件が
+    セッション要約で、競合セクション側から素通しになっていた。
     """
     if not subject:
         return False
     return (
-        is_session_summary_subject(subject)
-        or subject.startswith(INTERNAL_INDEX_SUBJECT_PREFIXES)
+        not is_injectable(subject)
+        or is_session_summary_subject(subject)
+        or subject.startswith(_EPISODE_TRACE_SUBJECT_PREFIX)
     )
 
 
@@ -274,6 +258,52 @@ _USER_ATTRIBUTE_FACT_TYPES: tuple[str, ...] = (
     "emotion",
     "opinion",
 )
+
+
+def provenance_header(fact: SemanticFact) -> str:
+    """``origin != user`` の項目に添える 1 行ヘッダ (c_16 §7.4)。
+
+    ``(2026-09-05 時点 / 日本経済新聞 / 裏取り 3 件 / 未確認)`` の形。省略規則:
+
+    - ``as_of`` (= ``created_at``) が無ければ「時点」を省く
+    - 裏取りが 1 件なら省く (「裏取り 1 件」は情報を足さない)
+    - ``veracity`` が ``unverified`` のときだけ「未確認」を出す
+    - 出所名は ``know.*`` の claim が ``attrs.source_name`` で持つ。無ければ
+      ``origin`` をそのまま出す (``tool`` / ``document`` / ``assistant``)
+
+    ``origin == "user"`` は空文字を返す — ユーザー自身の言明に出所を書いても
+    冗長なだけで、行が長くなるぶん本文が予算に押し出される。
+    """
+    if str(fact.origin) == "user":
+        return ""
+    labels = _render_labels()
+    parts: list[str] = []
+    if fact.created_at:
+        stamp = datetime.fromtimestamp(float(fact.created_at), tz=UTC)
+        parts.append(labels["as_of"].format(date=stamp.strftime("%Y-%m-%d")))
+    source = str((fact._extra or {}).get("source_name") or "").strip()
+    parts.append(labels["source"].format(name=source or str(fact.origin)))
+    corroboration = _corroboration_count(fact)
+    if corroboration >= 2:
+        parts.append(labels["corroboration"].format(n=corroboration))
+    if fact.veracity == "unverified":
+        parts.append(labels["unverified"])
+    return "(" + " / ".join(parts) + ")"
+
+
+def _corroboration_count(fact: SemanticFact) -> int:
+    """独立出所数 (裏取り件数) を provenance から数える (c_16 §3.1)。
+
+    保存しない値なので毎回数える。``source_id`` があればそれを、無ければ
+    ``session_id`` を出所とみなす。どちらも無いエントリは数えない
+    (出所が特定できない = 裏取りにならない)。
+    """
+    sources: set[str] = set()
+    for prov in fact.provenances or ():
+        key = prov.source_id or prov.session_id
+        if key:
+            sources.add(key)
+    return len(sources)
 
 
 def _normalize_for_dup(text: str) -> str:
@@ -328,6 +358,23 @@ class InjectionPlan:
         """注入対象を 1 つのテキストに連結する (改行区切り)。"""
         return "\n".join(it.text for it in self.items)
 
+    def evidence_ids(self) -> list[str]:
+        """実際に注入した Evidence を ``<store>:<id>`` で返す (c_16 §5.5)。
+
+        ファクトは ``semantic:``、STM ノートは ``episodic:``。学習帰属
+        (``GenerationConfigRef.evidence_ids``) が「そのターンに何を見せたか」
+        を辿るための出力なので、``dropped`` は含めない。
+        """
+        prefix = {"fact": "semantic", "note": "episodic"}
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in self.items:
+            tagged = f"{prefix.get(item.source, item.source)}:{item.item_id}"
+            if tagged not in seen:
+                seen.add(tagged)
+                out.append(tagged)
+        return out
+
     def by_tier(self, tier: int) -> list[InjectedItem]:
         return [it for it in self.items if it.tier == tier]
 
@@ -349,7 +396,7 @@ NEAR_DUPLICATE_JACCARD: float = 0.85
 
 #: 「尋ねられている属性」に一致するファクトへ足すスコア。
 #:
-#: 他の加点 (confidence 最大 1.0 + access_count の対数 + recency 最大 1.0 +
+#: 他の加点 (confidence 最大 1.0 + recency 最大 1.0 +
 #: pinned/correction ボーナス) の合計を確実に上回る量にする。属性一致は
 #: 埋め込みのスケールに依存しない決定論の根拠なので、確率的なスコアと
 #: 競わせる意味が無い (競わせると実測で飲み物が趣味に勝つ)。
@@ -467,6 +514,16 @@ class MemoryInjector:
         )
         self.relevance_enabled: bool = bool(
             cfg.get("relevance_enabled", True),
+        )
+        # ``origin=assistant`` のファクトは既定で注入しない (c_16 §1 / §7.3)。
+        # アシスタント自身の発話が「過去の記録」として恒久再注入され、誤答が
+        # 自己増幅する経路を出所で止める (2026-08-15 ライブ監査)。
+        ranking_cfg = (
+            ((cfg_root.get("memory") or {}).get("evidence") or {}).get("ranking")
+            or {}
+        )
+        self.allow_assistant_origin: bool = bool(
+            ranking_cfg.get("allow_assistant_origin_injection", False),
         )
         (
             self.relevance_min_score,
@@ -694,6 +751,7 @@ class MemoryInjector:
         query_text: str = "",
         retired_note_ids: "set[str] | None" = None,
         fact_relevance_scores: "dict[str, float] | None" = None,
+        fact_rank_scores: "dict[str, float] | None" = None,
     ) -> InjectionPlan:
         """注入計画を構築する。
 
@@ -719,6 +777,11 @@ class MemoryInjector:
             query_text: 現在のユーザー発話の本文。**どの属性を尋ねているか**を
                 決定論辞書 (:func:`resolve_fact_attribute`) で解決し、一致する
                 ファクトを関連度ゲートから免除する (:meth:`_asked_attributes`)。
+            fact_rank_scores: ``{fact_id: score}`` — 3 ストア共通の順位式
+                (``cos × freshness × confidence × store_prior``、c_16 §7.2) の
+                値。``SemanticStore.ranking_scores(query_vec)`` の出力を渡す。
+                Tier 内の並びに使う (ゲートには使わない — ゲートは素の cosine
+                だけ、c_16 §7.1)。``None`` なら ``confidence`` + recency へ縮退。
             fact_relevance_scores: ``{fact_id: cosine}`` の事前計算済みスコア。
                 ``SemanticFactStore.embedding_scores(query_vec)`` の出力を
                 そのまま渡す。埋め込み行列を持っているストア側で 1 回の積を
@@ -783,6 +846,7 @@ class MemoryInjector:
         fact_scores = self._relevance_scores(
             query_vec, facts, fact_relevance_scores,
         )
+        rank_scores = dict(fact_rank_scores or {})
         restated = self._restated_slots(session_user_texts, mode)
         asked_attrs = self._asked_attributes(query_text, mode)
         attr_exempt = 0
@@ -893,7 +957,7 @@ class MemoryInjector:
             # 大きく食っていた (想起クエリで 582 → 219 文字)。
             # 「前回何を話したか」は search_history ツールの担当。
             # MDP エピソードトレース / executable command 索引も同じ理由で落とす
-            # (:data:`INTERNAL_INDEX_SUBJECT_PREFIXES` の各説明を参照)。
+            # (:func:`is_internal_index_subject` の説明を参照)。
             if is_internal_index_subject(fact.subject):
                 filtered_out += 1
                 continue
@@ -923,7 +987,7 @@ class MemoryInjector:
             )
             if tier is None:
                 continue
-            score = self._score_fact(fact)
+            score = self._score_fact(fact, rank_scores)
             if anchored:
                 score += _ANCHOR_BONUS
             if asked_this:
@@ -1379,6 +1443,10 @@ class MemoryInjector:
         if fact.private:
             # private ファクトは注入対象外
             return None
+        if str(fact.origin) == "assistant" and not self.allow_assistant_origin:
+            # アシスタント由来は既定で注入しない (c_16 §7.3-4)。pin も免除
+            # しない — pin は「優先度」の宣言であって出所の保証ではない。
+            return None
         if fact.pinned:
             # pinned は常に Tier 1 に強制配置
             return 1
@@ -1463,15 +1531,32 @@ class MemoryInjector:
 
     # ── スコアリング ─────────────────────────────────────────────────
 
-    def _score_fact(self, fact: SemanticFact) -> float:
+    def _score_fact(
+        self, fact: SemanticFact, rank_scores: "dict[str, float] | None" = None,
+    ) -> float:
         """ファクトのスコア (高いほど優先)。
 
-        ``confidence`` を基準とし、``access_count`` の対数増分と recency
-        による減衰を加える。Tier 1 配置時に pinned ボーナスを足す。
+        ``rank_scores`` (= :meth:`SemanticStore.ranking_scores` の
+        ``cos × freshness × confidence × store_prior``、c_16 §7.2) があれば
+        それを土台にする。**3 ストア共通の 1 本の順位式** を使うのが c_16 の
+        趣旨で、ここで ``confidence`` と減衰を独自の式に組み直すと「同じ役割の
+        順位付けが 4 種類ある」状態へ戻る。
+
+        ``rank_scores`` が無い構成 (埋め込みが取れないターン / 旧呼出 /
+        テスト) では従来どおり ``confidence`` + 最終利用の recency へ縮退する。
+        アクセス回数の項は無い — 回数はレコードに持たなくなり、
+        「最後に使った時刻」(``last_used_at`` → ``accessed_at``) だけが残る
+        (c_16 §3 / §5.4)。
+
+        pinned / 訂正の加点は **順位式とは別の軸** なので残す (f_02 §8.3 が
+        意図として明記している)。順位式は「クエリとの近さ × 新しさ × 確度」で、
+        「ユーザーが明示的に留めた」「これは訂正だ」はそのどれでもない。
         """
-        base = float(fact.confidence)
-        base += 0.2 * math.log1p(max(0, fact.access_count))
-        base += self._recency_term(fact.accessed_at)
+        if rank_scores is not None and fact.id in rank_scores:
+            base = float(rank_scores[fact.id])
+        else:
+            base = float(fact.confidence)
+            base += self._recency_term(fact.accessed_at)
         if fact.pinned:
             base += PINNED_BONUS
         if getattr(fact, "from_correction", False):
@@ -1479,8 +1564,14 @@ class MemoryInjector:
         return base
 
     def _score_note(self, note: MemoryNote) -> float:
+        """ノートのスコア (高いほど優先)。
+
+        ``confidence`` (origin から決定論導出) + 最終利用の recency。
+        アクセス回数の項は無い — 回数はレコードに持たなくなり、
+        「最後に使った時刻」(``last_used_at`` → ``accessed_at``) だけが残る
+        (c_16 §3 / §5.4)。
+        """
         base = float(note.confidence)
-        base += 0.2 * math.log1p(max(0, note.access_count))
         base += self._recency_term(note.accessed_at)
         if note.pin_flag:
             base += PINNED_BONUS
@@ -1507,19 +1598,27 @@ class MemoryInjector:
         age = self._fact_age_days(fact)
         corrected = bool(getattr(fact, "from_correction", False))
         labels = _render_labels()
+        # ``origin != user`` は 1 行ヘッダで出所と時点を示す (c_16 §7.4)。
+        # ユーザー自身の言明と、ツール / 文書 / 世の中の情報を、読み手が行の
+        # 上で区別できるようにするため。
+        header = provenance_header(fact)
+        head = f"{header} " if header else ""
         if age is None or age < _FACT_STALE_LABEL_DAYS:
             if corrected:
                 # 同じ日に古い値と並ぶと、下の「N日前の記録」も付かないため
                 # どちらが現在値かを示す手掛かりが行に無くなる。
                 return (
-                    f"- ({fact.type}) {fact.subject} {fact.predicate}:"
+                    f"- {head}({fact.type}) {fact.subject} {fact.predicate}:"
                     f" {fact.text}{labels['corrected']}"
                 )
-            return f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.text}"
+            return (
+                f"- {head}({fact.type}) {fact.subject} {fact.predicate}: "
+                f"{fact.text}"
+            )
         if corrected:
             return (
-                f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.text}"
-                f"{labels['corrected_aged'].format(age=int(age))}"
+                f"- {head}({fact.type}) {fact.subject} {fact.predicate}: "
+                f"{fact.text}{labels['corrected_aged'].format(age=int(age))}"
             )
         # 何日前の記録かを行ごとに書く。ノート側 (_render_note の (過去の記録))
         # と同じ理由で、ブロック先頭の注意書きは数百トークン離れると効かない。
@@ -1530,8 +1629,8 @@ class MemoryInjector:
         # 「趣味は自転車と写真」が検索で 1.000 の最上位に立った。**どちらが今の
         # 話かを示す情報が行に無かった**ため、古い方がそのまま回答になった。
         return (
-            f"- ({fact.type}) {fact.subject} {fact.predicate}: {fact.text}"
-            f"{labels['aged'].format(age=int(age))}"
+            f"- {head}({fact.type}) {fact.subject} {fact.predicate}: "
+            f"{fact.text}{labels['aged'].format(age=int(age))}"
         )
 
     def _fact_age_days(self, fact: SemanticFact) -> float | None:
@@ -1605,7 +1704,7 @@ class MemoryInjector:
         2. **古い世代** — 同じ ``(subject, predicate)`` に異なる値が並ぶ場合、
            ``created_at`` が最新のものだけ残す。
 
-        ``subject`` は ``mem.personal.name`` / ``mem.world.url.<hash>`` のように
+        ``subject`` は ``mem.personal.name`` / ``idx.url.<hash>`` のように
         名前空間化されており、``(subject, predicate)`` が**そのファクトのスロット
         識別子**である (競合検出 ``semantic_conflict_resolver._group_conflicts``
         も同じキーでグループ化する)。したがって同一スロットに live な値が複数
@@ -1800,7 +1899,7 @@ class MemoryInjector:
         if len(order) <= 1 or len(order) > _NEAR_DUP_MAX_ITEMS:
             return 0
         try:
-            from backend.free.rag.bm25_retriever import tokenize_ja
+            from backend.free.rag.evidence.tokenize import tokenize_ja
         except Exception:  # 語彙トークナイザが無い構成では抑止しない
             return 0
 

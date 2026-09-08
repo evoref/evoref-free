@@ -26,8 +26,9 @@ _DEFAULT_BACKEND = "http://localhost:8000"
 _TIMEOUT = 60.0
 _DOWNLOAD_TIMEOUT = 300.0
 
-ALL_CATEGORIES = ["memory", "experience", "rag", "prompts", "lora", "cartridges", "history"]
-DEFAULT_CATEGORIES = ["memory", "experience", "rag", "prompts", "lora", "cartridges"]
+# ``cartridges`` は廃止 (c_16 §8) — corpus パッケージは ``memory`` に含まれる。
+ALL_CATEGORIES = ["memory", "experience", "rag", "prompts", "lora", "history"]
+DEFAULT_CATEGORIES = ["memory", "experience", "rag", "prompts", "lora"]
 
 
 # ────────────────────────────────────────────

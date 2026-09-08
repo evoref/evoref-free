@@ -38,7 +38,6 @@ if TYPE_CHECKING:
     from backend.free.learning.level0_instant import ExperienceBuffer
     from backend.free.learning.scheduler import LearningScheduler
     from backend.free.memory.scheduler import SleepTimeScheduler
-    from backend.free.memory.stores.short_term import ShortTermMemory
     from backend.free.memory.stores.working import WorkingMemoryRegistry
 
 logger = get_logger("factory.lifespan")
@@ -84,71 +83,66 @@ async def _shutdown_learning_cancel(learning_scheduler: "LearningScheduler") -> 
         logger.warning("Learning scheduler cancel failed: %s", e)
 
 
-def _shutdown_wm_flush(
-    registry: "WorkingMemoryRegistry", stm: "ShortTermMemory",
-) -> None:
-    """全セッションの WorkingMemory の残存ターンを STM にフラッシュ
+def _shutdown_wm_drop(registry: "WorkingMemoryRegistry") -> None:
+    """全セッションのワーキングメモリを落とす。
 
-    吸収は台帳に注入済みの ``chat_recorder.release_session_turns``
-    (→ ``drain_evicted_to_stm``) が担う — 応答パスと同じエコー落とし (直前の
-    質問を逐語コピーしただけの応答を捨てる) を通す。ここだけ ``stm.absorb``
-    を直に呼ぶと、終了時に流れたターンだけがフィルタを迂回して汚染ノートになる。
+    **記憶層への転送はもう無い** (c_16 §4.1)。ノート化は会話履歴を入力にする
+    sleep-time の仕事なので、窓に残っていたターンは次のサイクルでノートになる。
+    ここで落とすのは窓そのものだけ。
     """
     try:
         pending = sum(
             len(getattr(registry.peek(sid), "turns", ()) or ())
             for sid in registry.active_sessions()
         )
-        dropped = registry.drain_all(stm)
+        dropped = registry.drop_all()
         if pending:
             logger.info(
-                "Flushed %d remaining turns from %d session(s) to STM on shutdown",
-                pending, dropped,
+                "Dropped %d session window(s) holding %d turn(s) on shutdown",
+                dropped, pending,
             )
     except Exception as e:
-        logger.warning("WM flush to STM failed: %s", e)
+        logger.warning("Working memory drop on shutdown failed: %s", e)
 
 
-def _shutdown_stm_save(stm: "ShortTermMemory", resolver: Any) -> None:
-    """STM を永続化"""
-    try:
-        memory_dir = resolver.resolve_local("memory_dir")
-        stm.save(memory_dir / "short_term_notes.json")
-        logger.info("STM saved on shutdown: %d notes", len(stm.notes))
-    except Exception as e:
-        logger.warning("STM save on shutdown failed: %s", e)
+def _shutdown_episodic_save(state: AppState) -> None:
+    """エピソード記憶の進捗を永続化する。
 
-
-def _shutdown_vector_store_save(state: AppState) -> None:
-    """LTM ベクトルインデックスを永続化 (sleep-time が走らずに終了した場合の保険)"""
-    vs = getattr(state, "vector_store", None)
-    if vs is None or vs.count == 0:
+    レコード自体は ``put`` した時点で事象ログへ追記済み (c_16 §5.2) なので、
+    終了時に書き出すものは「どのターンまでノート化したか」だけ。snapshot は
+    sleep-time が作る。
+    """
+    episodic = getattr(state, "episodic_memory", None)
+    if episodic is None:
         return
     try:
-        vs.save()
-        logger.info("Vector store (LTM) saved on shutdown: %d vectors", vs.count)
+        episodic.save_progress()
+        episodic.evidence.save_manifest()
+        logger.info(
+            "Episodic store saved on shutdown: %d record(s)", len(episodic),
+        )
     except Exception as e:
-        logger.warning("Vector store save on shutdown failed: %s", e)
+        logger.warning("Episodic save on shutdown failed: %s", e)
 
 
 def _shutdown_semmem_index_flush(state: AppState) -> None:
-    """SemMem 各スコープの index.jsonl pending dual-write を flush する。
+    """SemMem の manifest を書き出して索引の memmap を手放す。
 
-    IncrementalIndexUpdater は flush 閾値未満の pending op を in-memory に
-    保持するため、明示 flush しないとプロセス終了で消失する。次回起動の
-    ``_reconcile_index`` が facts.jsonl から復元するが、ここで flush して
-    おけば余分な再構築 I/O を避けられる。
+    レコード自体は ``put`` した時点で事象ログへ追記済み (c_16 §5.2) なので、
+    終了時に書くのは ``events_since_snapshot`` だけ。memmap を掴んだままだと
+    Windows で版ディレクトリを消せなくなるので :meth:`close` も呼ぶ。
     """
-    stores = getattr(state, "_semantic_stores", None)
-    if not stores:
+    semantic = getattr(state, "semantic_memory", None)
+    if semantic is None:
         return
-    for scope, store in list(stores.items()):
-        try:
-            store.flush_index()
-        except Exception as e:
-            logger.warning(
-                "SemMem index flush on shutdown failed (%s): %s", scope, e,
-            )
+    try:
+        semantic.save_manifest()
+        semantic.close()
+        logger.info(
+            "Semantic store saved on shutdown: %d fact(s)", len(semantic),
+        )
+    except Exception as e:
+        logger.warning("SemMem save on shutdown failed: %s", e)
 
 
 def _shutdown_experience_save(exp_buf: "ExperienceBuffer", exp_file: Path) -> None:
@@ -278,12 +272,10 @@ async def _run_lifespan_shutdown(
         await _shutdown_level1_loop(ctx.sleep_scheduler)
     with _timed(shutdown_timings, "learning_cancel"):
         await _shutdown_learning_cancel(ctx.learning_scheduler)
-    with _timed(shutdown_timings, "wm_flush"):
-        _shutdown_wm_flush(ctx.wm, ctx.stm)
-    with _timed(shutdown_timings, "stm_save"):
-        _shutdown_stm_save(ctx.stm, ctx.resolver)
-    with _timed(shutdown_timings, "vector_store_save"):
-        _shutdown_vector_store_save(state)
+    with _timed(shutdown_timings, "wm_drop"):
+        _shutdown_wm_drop(ctx.wm)
+    with _timed(shutdown_timings, "episodic_save"):
+        _shutdown_episodic_save(state)
     with _timed(shutdown_timings, "semmem_index_flush"):
         _shutdown_semmem_index_flush(state)
     with _timed(shutdown_timings, "experience_save"):

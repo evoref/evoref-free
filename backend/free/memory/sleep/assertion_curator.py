@@ -55,7 +55,7 @@ from backend.log_config import get_logger
 
 if TYPE_CHECKING:
     from backend.free.memory.semantic.store import SemanticFactStore
-    from backend.free.memory.stores.short_term import MemoryNote
+    from backend.free.memory.episodic.note import MemoryNote
     from backend.free.rag.embedding_backend import EmbeddingBackend
 
 logger = get_logger("memory.sleep.assertion_curator")
@@ -278,7 +278,7 @@ async def curate_assertion_facts(
     """型付けできなかった言明を ``world_fact`` として sleep-time で書き込む。
 
     Args:
-        notes: 直近の MemoryNote 群 (通常 ``ShortTermMemory.notes.values()``)。
+        notes: 直近の MemoryNote 群 (通常 ``EpisodicWorkspace.notes.values()``)。
         store_provider: ``scope -> SemanticFactStore | None`` のコールバック。
         aux_client: 命名に使う補助タスククライアント。``None`` なら no-op。
         embedder: fact embedding 生成用。``None`` なら no-op。

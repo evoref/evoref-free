@@ -1,35 +1,38 @@
 """EvorefMem 共通型
 
-EvorefMem 統合仕様 に基づく共通型・データクラスを定義する
-
 含まれるもの:
-- 型 Literal: `NoteSource` / `MemoryMode` / `FactType` / `Scope` / `TaskStatus` /
-  `ReviewStatus`
+- 型 Literal: `NoteSource` / `MemoryMode` / `FactType` / `TaskStatus`
 - `Provenance` データクラス — SemanticFact の出処トレース
-- `SemanticFact` データクラス — 意味記憶の最小単位
-- `serialize_fact` / `deserialize_fact` — JSONL 行レベルのシリアライザ
+- `SemanticFact` データクラス — 意味記憶の **作業用** 表現
+
+永続形は `Evidence` (kind=`fact`) 1 本で、対応は
+`backend.free.memory.semantic.fact` が持つ (c_16 §3 / §4.2)。本モジュールは
+JSONL シリアライザを持たない — レコードの読み書きは `EvidenceStore` の
+事象ログと snapshot に閉じる。
 
 設計原則 (CLAUDE.md / .claude/rules/backend.md):
 - Python 3.12+ の型表現 (`X | None`, `Literal[...]`)
 - フレームワーク非依存 (pydantic 不使用、純粋 dataclass)
 - 後方互換不要
-- ベクトル列は numpy のみで扱い、JSONL では list 化する
+- ベクトル列は numpy のみで扱い、**永続化しない**
 
-`MemoryNote` は履歴的な事情で `backend.free.memory.stores.short_term` に置く。
-本モジュールは `MemoryNote` を再エクスポートしない (循環依存防止)。
+`MemoryNote` は `backend.free.memory.episodic.note` に置く (エピソード記憶の
+永続形 `Evidence` と対で読む方が分かりやすいため)。本モジュールは
+`MemoryNote` を再エクスポートしない (循環依存防止)。
 ただし `MemoryNote` 用の型 Literal (`NoteSource` / `MemoryMode` /
 `TaskStatus`) は本モジュールで一元管理する。
 """
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
-from uuid import uuid4
 
 import numpy as np
+
+from backend.free.rag.evidence import new_evidence_id
+from backend.free.rag.evidence.types import Origin, Veracity
 
 # ──────────────────────────────────────────────────────────────────────────
 # 型 Literal
@@ -64,26 +67,21 @@ FactType = Literal[
     "artifact",        # ラルフループの編集成果物トレース
     "create",
     "model",
+    "claim",           # know.* の取得単位由来の主張 (c_16 §3.5 / §4.2)
 ]
-"""SemanticFact の type タグ。`policy` / `failure_pattern` / `progress_marker`
-は統合済。`artifact` はラルフループの成果物 (ファイルパス / diff SHA1 /
-行数) を追跡する。`create_task` と `fewshot` は: 前者は Extractor 由来と
-LoopDriver 由来の構造差を明示、後者は policy subtype から意味的に独立した
-FactType に昇格。`learned_failure_pattern` は LogIngestor + PolicyAdjuster
-で追加: develop=evolve で出力される decision/outcome JSONL を集約した結果、
-失敗率閾値を超えた
-(decision_point, chosen) パターンを EvorefLearn pillar が SemMem に書き戻す。
-loop owned の `failure_pattern` (quality_gate 由来) と origin / namespace を分離して
-共存させる。"""
+"""SemanticFact の type タグ (永続形では ``Evidence.attrs.fact_type``)。
 
-ReviewStatus = Literal[
-    "none",
-    "pending",
-    "resolved_keep_old",
-    "resolved_keep_new",
-    "resolved_merged",
-]
-"""コンフリクト解消ワークフローの状態"""
+`policy` / `failure_pattern` / `progress_marker` は統合済。`artifact` は
+ラルフループの成果物 (ファイルパス / diff SHA1 / 行数) を追跡する。
+`create_task` と `fewshot` は: 前者は Extractor 由来と LoopDriver 由来の
+構造差を明示、後者は policy subtype から意味的に独立した FactType に昇格。
+`learned_failure_pattern` は LogIngestor + PolicyAdjuster で追加:
+develop=evolve で出力される decision/outcome JSONL を集約した結果、失敗率
+閾値を超えた (decision_point, chosen) パターンを EvorefLearn pillar が
+SemMem に書き戻す。loop owned の `failure_pattern` (quality_gate 由来) と
+origin / namespace を分離して共存させる。`claim` は `know.<domain>.<topic>`
+の世界知識で、取得単位 (`items.jsonl`) を provenance に持つ。
+"""
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -96,7 +94,8 @@ class Provenance:
     """SemanticFact の出処メタデータ。
 
     1 つのファクトは複数 Provenance を持ちうる (同一事実が複数セッションで
-    観測された場合など)。
+    観測された場合など)。独立出所数 (裏取り件数) は保存せず、読み込み時に
+    `source_id` / `session_id` のユニーク数として数える (c_16 §3.1)。
     """
 
     note_id: str | None = None
@@ -126,6 +125,13 @@ class Provenance:
     model: str | None = None
     """LLM を使って作られた場合の生成モデル名 (決定論抽出は ``None``)。"""
 
+    source_id: str | None = None
+    """文書 / 取得単位の識別子 (``doc:<package>/<doc>`` / ``item:ki_…``)。
+
+    `know.*` の claim は取得単位を必ずここに持つ (c_16 §3.1 / §4.2)。裏取り
+    件数はこの値のユニーク数で数える。
+    """
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "note_id": self.note_id,
@@ -139,6 +145,7 @@ class Provenance:
             "extractor": self.extractor,
             "extractor_version": self.extractor_version,
             "model": self.model,
+            "source_id": self.source_id,
         }
 
     @classmethod
@@ -155,6 +162,7 @@ class Provenance:
             extractor=d.get("extractor"),
             extractor_version=d.get("extractor_version"),
             model=d.get("model"),
+            source_id=d.get("source_id"),
         )
 
 
@@ -165,12 +173,11 @@ class Provenance:
 
 @dataclass(eq=False)
 class SemanticFact:
-    """
+    """意味記憶 1 件の **作業用** 表現 (永続形は ``Evidence``)。
 
     `subject` / `predicate` / `object` の 3 つ組で意味を表現し、`scope`
-    (`global` / `project:<id>`) と `type` で物理分離・優先度制御する。
-    `policy` / `failure_pattern` / `progress_marker` は統合された
-    永続化先として用いられる。
+    (`global` / `project:<id>`) と `type` で優先度を制御する。**スコープは
+    フィールドであってディレクトリではない** — ストアは 1 つ (c_16 §4.2)。
 
     ``eq=False`` (同一性比較) — ファクトは ``id`` で識別する設計なので値比較に
     意味が無く、しかも ``embedding: np.ndarray`` を持つため生成される
@@ -206,11 +213,11 @@ class SemanticFact:
     残す。上書きしないのは、正規化が誤ったときに復旧できるようにするため
     (未検証の生成物が権威ある事実として永続化される事故を、このリポジトリは
     繰り返し踏んでいる)。消費側は ``fact.text`` を使う。
+
+    永続形では ``Evidence.text`` がこの値 (無ければ ``object``)。
     """
 
     # ── メタ ────────────────────────────────────────────────────────────
-    subject_aliases: list[str] = field(default_factory=list)
-    scope_locked: bool = False
     mode_origin: MemoryMode = "chat"
     lang: str = ""
     """本文の言語 (``ja`` / ``en`` / 未判定は空)。決定論判定で埋める。
@@ -225,28 +232,61 @@ class SemanticFact:
     pin_locked_until: float | None = None
     profile_id: str = "default"
 
+    origin: Origin = "user"
+    """誰が述べたか (c_16 §3 / §4.2)。
+
+    ``user`` = ユーザーの言明、``tool`` = ツール出力から導いた事実、
+    ``assistant`` = アシスタントの発話由来、``document`` / ``web`` =
+    取り込んだ文書・取得器。``mem.*`` の競合は「``origin=user`` かつ
+    ``as_of`` が新しい方が勝つ」で解く (c_16 §4.2)。``assistant`` 由来は
+    既定で注入しない (``memory.evidence.ranking.allow_assistant_origin_injection``)。
+    """
+
+    veracity: Veracity = "stated"
+    """真偽状態 (c_16 §3)。競合中は ``disputed``、取り下げは ``retracted``。"""
+
+    contradicts: list[str] = field(default_factory=list)
+    """矛盾する相手のファクト id (c_16 §3 / §4.2)。競合解決が結ぶ。"""
+
     # ── supersession ────────────────────────────────────────────────────
     superseded_by: str | None = None
-    supersedes: list[str] = field(default_factory=list)
-
-    # ── レビュー ────────────────────────────────────────────────────────
-    requires_user_review: bool = False
-    review_status: ReviewStatus = "none"
 
     # ── 検索・観測 ──────────────────────────────────────────────────────
     embedding: np.ndarray | None = None
+    """**永続化しない** 作業用ベクトル。
+
+    ベクトルの正は ``embeddings/<model_id>/`` (c_16 §6.1)。注入の関連度ゲート
+    と sleep-time の競合検出が使うぶんは
+    :meth:`SemanticStore.vectors_for` が snapshot から復元して載せる。
+    """
+
+    embed_as_query: bool = False
+    """このファクトを **query 側** で埋め込むか (永続形は ``attrs.embed_as_query``)。
+
+    既定は document 側。``idx.command.*`` のような内部索引は「過去の質問文」を
+    溜めて読み手 (``ToolCallJudge``) が ``embed_query`` で引くので、書く側も
+    query 側で揃えないと instruction-aware なモデルでは自己類似度が 0.78 程度
+    まで落ちる。側の決定は
+    :func:`~backend.free.memory.sleep._curator_common.index_embed_fields` が
+    SSOT で、実際に埋め込むのは snapshot 生成 (c_16 §6.1)。"""
+
+    embed_mode: str = "chat"
+    """``embed_as_query`` のときの ``mode`` (``embedding.instructions`` の鍵)。
+
+    読み手の ``embed_query(query, mode=mode)`` と揃える。document 側では無視。"""
+
     created_at: float = 0.0
+    """**発話時刻** (抽出時刻ではない)。永続形の ``as_of`` (c_16 §3)。"""
+
     accessed_at: float = 0.0
-    access_count: int = 0
+    """最後に使われた時刻。永続形の ``last_used_at``。"""
+
     session_ids: set[str] = field(default_factory=set)
     private: bool = False
 
     # ── 統合追加フィールド ────────────────────────────────────────
     trace_id: str | None = None
-    """MDP トレース連結用 (agent_tracer 由来)"""
-
-    credit_score: float | None = None
-    """credit_assigner 由来の貢献度スコア"""
+    """MDP トレース連結用 (agent_tracer 由来)。永続形は ``provenance[0].trace_id``。"""
 
     auto_evolved: bool = False
     """PolicyEvolver により自動進化したファクトか
@@ -260,9 +300,9 @@ class SemanticFact:
     ``MemoryNote.is_correction`` → 抽出器、と伝播する。
 
     ``SemanticConflictResolver._decide`` がこれを見て、同一スロットの旧値との
-    競合を **pending にせず即 supersede** する。``_is_borderline`` は
+    競合を **disputed にせず即 supersede** する。``_is_borderline`` は
     「同 ``session_id``」または「``confirm_window_hours`` 以内」を微妙ケース
-    として pending にするが、**会話中の訂正はその両方を必ず満たす**ため、
+    として disputed にするが、**会話中の訂正はその両方を必ず満たす**ため、
     印が無いといちばん確度の高い訂正がいちばん自動解決されなかった。"""
 
     failure_signature: str | None = None
@@ -273,20 +313,10 @@ class SemanticFact:
     """policy ファクトの評価値 (fitness / accuracy / latency 等)"""
 
     # ── 前方互換 round-trip ───────────────────────────
-    _version: int = 1
-    """fact record のバージョン。`manifest.component_versions.fact` と一致させる。
-    schema_version=1 の現状では常に 1。将来 fact record レイアウトを変更した際に
-    SchemaMigrator が in-place rewrite で書き換える。省略時は 1 とみなす。"""
-
     _extra: dict[str, Any] = field(default_factory=dict)
-    """JSONL round-trip 時に未知フィールドを保持するバッファ。
-    v1 バックエンドが未知のキーを受け取ったとき、dataclass には吸収できない
-    トップレベルキーをここに退避し、serializer が再度トップレベルに復元する。
-    ステップ移行中の Free / Pro 混在や SchemaMigrator の in-place rewrite で
-    データ欠損を起こさないための土台
-    既知フィールドと同名キーを持つ場合は serializer で既知フィールド優先で
-    上書きする (決定論)。利用者は EvorefMem 内部に限定し、pillar 境界を越えて
-    直接参照しないこと。"""
+    """未知キーの退避先 (``Evidence._extra`` と往復する)。
+
+    利用者は EvorefMem 内部に限定し、pillar 境界を越えて直接参照しないこと。"""
 
     # ── ヘルパ ──────────────────────────────────────────────────────────
 
@@ -295,15 +325,18 @@ class SemanticFact:
         """提示・比較・埋め込みに使う本文。
 
         正規化済みの :attr:`statement` があればそれを、無ければ ``object``
-        (発話原文) を返す。正規化が入っていない環境・古いファクトでも従来と
-        同じ値になるので、消費側はこれを使えば分岐が要らない。
+        (発話原文) を返す。永続形の ``Evidence.text`` と同じ値。
         """
         return self.statement or self.object
 
     @staticmethod
     def new_id() -> str:
-        """新規ファクト用の短縮 ID を生成する"""
-        return f"sf_{uuid4().hex[:12]}"
+        """新規ファクト用の ID を発番する。
+
+        ``Evidence.id`` と同一の体系 (``ev_`` + hex12) — ファクトの永続形は
+        ``Evidence`` なので、別体系の id を持つと 1 レコード 2 名前になる。
+        """
+        return new_evidence_id()
 
     @staticmethod
     def make_global_scope() -> str:
@@ -320,203 +353,6 @@ class SemanticFact:
         if self.is_project_scoped():
             return self.scope.split(":", 1)[1]
         return None
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# シリアライザ (JSONL 行レベル)
-# ──────────────────────────────────────────────────────────────────────────
-
-
-# serialize / deserialize で "既知" として扱うトップレベル JSON キー集合。
-# ここに含まれないキーは `_extra` に退避され、次回 serialize で原形のまま
-# トップレベルに復元される
-_KNOWN_FACT_KEYS: frozenset[str] = frozenset({
-    "id",
-    "subject",
-    "subject_aliases",
-    "predicate",
-    "object",
-    "statement",
-    "type",
-    "scope",
-    "scope_locked",
-    "mode_origin",
-    "lang",
-    "provenances",
-    "confidence",
-    "pinned",
-    "pin_locked_until",
-    "profile_id",
-    "superseded_by",
-    "supersedes",
-    "requires_user_review",
-    "review_status",
-    "embedding",
-    "created_at",
-    "accessed_at",
-    "access_count",
-    "session_ids",
-    "private",
-    "trace_id",
-    "credit_score",
-    "auto_evolved",
-    "from_correction",
-    "failure_signature",
-    "eval_metric",
-    "_version",
-})
-
-
-def serialize_fact(
-    fact: SemanticFact, *, include_embedding: bool = True,
-) -> dict[str, Any]:
-    """`SemanticFact` を JSON-serializable な dict に変換する。
-
-    embedding は `tolist()` で list 化する。`session_ids` は set のため
-    sorted list 化して決定的にする。ストレージ層から呼ばれる想定だが、
-    ユニットテスト・デバッグ用途でも使う。
-
-    `_extra` に保持された未知フィールドはトップレベルに復元する。
-    既知フィールドと同名キーを持つ場合は既知フィールド側を優先する
-
-    Args:
-        include_embedding: ``embedding`` をペイロードに含めるか。永続化
-            (``facts.jsonl``) では ``False`` を渡す — ベクトルの正は
-            ``embeddings/<model_id>/vectors.npy`` 側で、JSON へ二重に持つと
-            **実測でファイルの 92% がベクトルのテキスト表現** になる
-            (94 ファクトで 3.03MB、同じ 90 本の npy は 0.37MB)。しかも
-            ``facts.jsonl`` は追記式なので ``update_fact`` のたびに 1024 個の
-            float をもう 1 行足す。既定を ``True`` のままにしてあるのは、
-            export / デバッグダンプが従来どおり自己完結した dict を得られる
-            ようにするため。
-    """
-    # _extra を先に展開し、既知フィールドで上書きする (既知フィールド優先)。
-    out: dict[str, Any] = dict(fact._extra)
-    out.update({
-        "id": fact.id,
-        "subject": fact.subject,
-        "subject_aliases": list(fact.subject_aliases),
-        "predicate": fact.predicate,
-        "object": fact.object,
-        "statement": fact.statement,
-        "type": fact.type,
-        "scope": fact.scope,
-        "scope_locked": fact.scope_locked,
-        "mode_origin": fact.mode_origin,
-        "lang": fact.lang,
-        "provenances": [p.to_dict() for p in fact.provenances],
-        "confidence": fact.confidence,
-        "pinned": fact.pinned,
-        "pin_locked_until": fact.pin_locked_until,
-        "profile_id": fact.profile_id,
-        "superseded_by": fact.superseded_by,
-        "supersedes": list(fact.supersedes),
-        "requires_user_review": fact.requires_user_review,
-        "review_status": fact.review_status,
-        "embedding": (
-            fact.embedding.tolist()
-            if include_embedding and fact.embedding is not None
-            else None
-        ),
-        "created_at": fact.created_at,
-        "accessed_at": fact.accessed_at,
-        "access_count": fact.access_count,
-        "session_ids": sorted(fact.session_ids),
-        "private": fact.private,
-        # 統合追加
-        "trace_id": fact.trace_id,
-        "credit_score": fact.credit_score,
-        "auto_evolved": fact.auto_evolved,
-        "from_correction": fact.from_correction,
-        "failure_signature": fact.failure_signature,
-        "eval_metric": dict(fact.eval_metric) if fact.eval_metric is not None else None,
-        "_version": int(fact._version),
-    })
-    return out
-
-
-def deserialize_fact(d: dict[str, Any]) -> SemanticFact:
-    """dict から `SemanticFact` を再構築する。
-
-    後方互換は提供しないが、追加した統合フィールドが欠損して
-    いてもデフォルト値で復元できる (内部で書き込んだファイルを
-    内部で読み戻すケース等のため)
-
-    `_KNOWN_FACT_KEYS` に含まれないトップレベルキーは `_extra` に退避し、
-    次回 `serialize_fact` で原形のまま復元される
-    `_version` 省略時は 1 として扱う (現行 schema_version=1 デフォルト)。
-    """
-    emb = d.get("embedding")
-    eval_metric_raw = d.get("eval_metric")
-    eval_metric = (
-        {k: float(v) for k, v in eval_metric_raw.items()}
-        if isinstance(eval_metric_raw, dict)
-        else None
-    )
-    provenances_raw = d.get("provenances", [])
-    extra = {k: v for k, v in d.items() if k not in _KNOWN_FACT_KEYS}
-    return SemanticFact(
-        id=d["id"],
-        subject=d["subject"],
-        subject_aliases=list(d.get("subject_aliases", [])),
-        predicate=d["predicate"],
-        object=d["object"],
-        statement=d.get("statement"),
-        type=d["type"],
-        scope=d["scope"],
-        scope_locked=bool(d.get("scope_locked", False)),
-        mode_origin=d.get("mode_origin", "chat"),
-        lang=d.get("lang", ""),
-        provenances=[Provenance.from_dict(p) for p in provenances_raw],
-        confidence=float(d.get("confidence", 0.5)),
-        pinned=bool(d.get("pinned", False)),
-        pin_locked_until=d.get("pin_locked_until"),
-        profile_id=d.get("profile_id", "default"),
-        superseded_by=d.get("superseded_by"),
-        supersedes=list(d.get("supersedes", [])),
-        requires_user_review=bool(d.get("requires_user_review", False)),
-        review_status=d.get("review_status", "none"),
-        embedding=np.array(emb, dtype=np.float32) if emb is not None else None,
-        created_at=float(d.get("created_at", 0.0)),
-        accessed_at=float(d.get("accessed_at", 0.0)),
-        access_count=int(d.get("access_count", 0)),
-        session_ids=set(d.get("session_ids", [])),
-        private=bool(d.get("private", False)),
-        trace_id=d.get("trace_id"),
-        credit_score=d.get("credit_score"),
-        auto_evolved=bool(d.get("auto_evolved", False)),
-        from_correction=bool(d.get("from_correction", False)),
-        failure_signature=d.get("failure_signature"),
-        eval_metric=eval_metric,
-        _version=int(d.get("_version", 1)),
-        _extra=extra,
-    )
-
-
-def serialize_fact_jsonl(
-    fact: SemanticFact, *, include_embedding: bool = False,
-) -> str:
-    """1 ファクトを JSONL 1 行 (改行無し) にエンコードする
-
-    **既定で ``embedding`` を書かない。** ベクトルの正は
-    ``embeddings/<model_id>/vectors.npy`` で、``facts.jsonl`` へ二重に持つ
-    意味は無い。読み戻しは ``SemanticFactStore._load`` が EmbeddingStore から
-    hydrate する。旧形式 (embedding 入り) の行はそのまま読めるので、移行は
-    「読めるが書かない」で足りる — 既存行は次の compact / rewrite で落ちる。
-    """
-    return json.dumps(
-        serialize_fact(fact, include_embedding=include_embedding),
-        ensure_ascii=False,
-    )
-
-
-def deserialize_fact_jsonl(line: str) -> SemanticFact:
-    """JSONL 1 行から `SemanticFact` を復元する
-
-    旧形式 (``embedding`` を含む行) も読める。新形式では ``embedding`` は
-    ``None`` になり、``SemanticFactStore._load`` が EmbeddingStore から埋める。
-    """
-    return deserialize_fact(json.loads(line))
 
 
 def make_fact(
@@ -553,3 +389,14 @@ def make_fact(
     for key, value in overrides.items():
         setattr(fact, key, value)
     return fact
+
+
+__all__ = [
+    "FactType",
+    "MemoryMode",
+    "NoteSource",
+    "Provenance",
+    "SemanticFact",
+    "TaskStatus",
+    "make_fact",
+]

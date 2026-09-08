@@ -11,11 +11,12 @@ import numpy as np
 from backend.log_config import get_logger
 from backend.free.llm.model_metadata import DEFAULT_PARAMS_B
 from backend.free.memory.notes.note_evolver import compute_llm_call_interval
-from backend.free.memory.stores.short_term import ShortTermMemory, MemoryNote
+from backend.free.memory.episodic.note import MemoryNote
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
     from backend.free.core.policy_interpreter import PolicyInterpreter
+    from backend.free.memory.episodic.workspace import EpisodicWorkspace
 
 logger = get_logger("memory.conflict_resolver")
 
@@ -47,7 +48,7 @@ def _is_user_utterance(note: object) -> bool:
 
 
 def _mark_dirty(short_term: object) -> None:
-    """``ShortTermMemory.mark_dirty`` を呼ぶ (テスト用の簡易 STM は持たないことがある)。"""
+    """``EpisodicWorkspace.mark_dirty`` を呼ぶ (簡易スタブは持たないことがある)。"""
     mark = getattr(short_term, "mark_dirty", None)
     if callable(mark):
         mark()
@@ -115,7 +116,7 @@ class ConflictResolver:
         until = note.conflict_cooldown_until
         return until is not None and until > now
 
-    def detect_conflicts(self, short_term: ShortTermMemory) -> list[tuple[str, str]]:
+    def detect_conflicts(self, short_term: "EpisodicWorkspace") -> list[tuple[str, str]]:
         """コサイン類似度で類似ノートペアを検出
 
         quarantine cooldown 中のノートを含むペアは除外する (livelock 防止)。
@@ -173,7 +174,7 @@ class ConflictResolver:
 
     async def resolve_conflicts(
         self,
-        short_term: ShortTermMemory,
+        short_term: "EpisodicWorkspace",
         llm_client,
     ) -> int:
         """類似ノートを LLM で統合

@@ -32,7 +32,7 @@ def compact_experience(exp: dict) -> dict:
     """session へ保存する経験の圧縮射影。
 
     Level 1 が session snapshot から読むのは timestamp / mode / signals / query
-    (失敗語抽出) / cartridge_ids / base_model だけ。``response_full`` (応答全文)
+    (失敗語抽出) / gen_config / base_model だけ。``response_full`` (応答全文)
     を 1000 件 × 全モード分そのまま JSON へ書くと active session が数 MB になり
     yield ごとの保存が重くなる (L-D3)。few-shot プール補充は live バッファから
     行うので、応答本文は snapshot に要らない。
@@ -43,7 +43,9 @@ def compact_experience(exp: dict) -> dict:
         "mode": exp.get("mode", ""),
         "query": query[:SNAPSHOT_QUERY_CHARS],
         "base_model": exp.get("base_model", ""),
-        "cartridge_ids": list(exp.get("cartridge_ids", []) or []),
+        # ``rag_usage_rate`` (c_16 §5.5) が ``evidence_ids`` の ``corpus:``
+        # を数えるので、gen_config も snapshot に残す。
+        "gen_config": dict(exp.get("gen_config", {}) or {}),
         "signals": dict(exp.get("signals", {}) or {}),
     }
 

@@ -18,13 +18,17 @@ import numpy as np
 from backend.log_config import get_logger
 from backend.trace_context import run_in_executor_with_context
 from backend.utils import utc_now
-from backend.free.memory.stores.short_term import ShortTermMemory
-from backend.free.memory.stores.long_term import LongTermMemory
-from backend.free.memory.pipeline.lightmem_scorer import FadeMemScorer, MemoryEviction
-from backend.free.rag.bm25_retriever import BM25Retriever
+from backend.free.memory.episodic.ingest import ingest_new_turns
+from backend.free.memory.episodic.store import EpisodicStore
+from backend.free.memory.episodic.turn_source import (
+    DEFAULT_SESSION_LIMIT,
+    HistoryTurnSource,
+    TurnSource,
+)
 
 if TYPE_CHECKING:
     from backend.free.agent.aux_prompt_manager import AuxPromptManager
+    from backend.free.memory.episodic.workspace import EpisodicWorkspace
     from backend.free.memory.semantic.store import SemanticFactStore
     from backend.free.memory.notes.subject_canonicalizer import SubjectCanonicalizer
     from backend.free.rag.embedding_backend import EmbeddingBackend
@@ -44,9 +48,18 @@ logger = get_logger("memory.sleep_update")
 
 #: ``_save_state`` 用の 1 スレッド executor。保存を直列化して順序を保つ
 #: (:meth:`SleepTimeWorker._save_state_async`)。
-_SAVE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stm-save")
+_SAVE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="episodic-save")
 
-# STM ノートを埋め込む際の本文上限 (文字数)。llama-server の embed インスタンスは
+#: Light サイクルで snapshot を作る事象数の下限。
+#:
+#: snapshot 生成は畳み込み + 索引再構築 + 増分埋め込みで、Light は応答のたびに
+#: 走る。1 ターン (= 2 ノート) ごとに版を積むと、会話中ずっと索引を作り直す
+#: ことになる。**新しいノートが検索に出るのは次の snapshot から** だが、直近の
+#: 会話はワーキングメモリの窓がそのままプロンプトに載るので、そこは失われない
+#: (c_16 §2.1 の割り切りと同じ)。Full は溜まった事象があれば必ず版を作る。
+_SNAPSHOT_MIN_EVENTS_LIGHT = 16
+
+# ノートを埋め込む際の本文上限 (文字数)。llama-server の embed インスタンスは
 # n_ctx_slot が 2048〜4096 程度で運用されるため、超過すると
 # `input (N tokens) is larger than the max context size` で **400** が返り、
 # バッチ全体が失敗する (2026-07-25 の恒久デッドロックの起点)。
@@ -72,10 +85,8 @@ class SleepTimeWorker:
 
     def __init__(
         self,
-        short_term: ShortTermMemory,
-        long_term: LongTermMemory,
+        episodic: EpisodicStore,
         embedder: EmbeddingBackend,
-        scorer: FadeMemScorer,
         config: dict,
         experience_buf=None,
         debug_logger=None,
@@ -90,11 +101,12 @@ class SleepTimeWorker:
         subject_canonicalizer: SubjectCanonicalizer | None = None,
         semantic_store_invalidator: SemanticStoreInvalidator | None = None,
         profile_id: str = "default",
+        turn_source: TurnSource | None = None,
+        triggers_dir: Path | str | None = None,
+        private_trace_ids_provider: Callable[[], set[str]] | None = None,
     ):
-        self.short_term = short_term
-        self.long_term = long_term
+        self.episodic = episodic
         self.embedder = embedder
-        self.scorer = scorer
         self.config = config
         self.experience_buf = experience_buf
         self._policy = policy
@@ -103,7 +115,6 @@ class SleepTimeWorker:
         self.vector_store = vector_store
         self.cartridge_manager = cartridge_manager
         self._aux_prompt_manager = aux_prompt_manager
-        self._bm25_retriever: BM25Retriever | None = None
         self._fewshot_pool = None
         self._cancelled = False
         # ── Step 8 (Extractor) 用 ──
@@ -119,22 +130,26 @@ class SleepTimeWorker:
         # MDPTraceExtractor はプロセス内で episode の二重抽出を防ぐため
         # ワーカー側で 1 インスタンスを保持する。
         self._mdp_trace_extractor = None
-        #: 最後に Step 8 (ファクト抽出) が走った時刻。Step 4 の eviction が
-        #: 「まだ抽出器が見ていないノート」を落とさないための基準
-        #: (:meth:`MemoryEviction.evict` の ``unextracted_cutoff``)。
-        #: 0.0 は「まだ一度も走っていない」= 全ノートを保護する側に倒す。
+        #: 最後に Step 8 (ファクト抽出) が走った時刻 (観測用)。tier 遷移と
+        #: 保持方針はストア側 (c_16 §4.1 / §5.4) が持つので、eviction の保護
+        #: 基準としては使わなくなった。
         self._last_extraction_at: float = 0.0
-        # ── MDPIngester (agent_trace*.jsonl → episodic LTM) ──
+        # ── MDPIngester (agent_trace*.jsonl → エピソード記憶) ──
         # log_dir は AgentTraceStore の常設ディレクトリ (local_paths.agent_trace_dir)。
         # state ファイルはメモリディレクトリ配下に置く想定だが、テスト容易性
         # のため lazy 初期化する。
         self._mdp_ingester = None
         #: 「今チャット生成が走っているか」の判定 (scheduler が注入)。
         self._chat_in_flight_probe = None
-
-    def set_bm25_retriever(self, bm25: BM25Retriever) -> None:
-        """BM25Retriever を設定（プレフィックス生成後の再構築に使用）"""
-        self._bm25_retriever = bm25
+        #: ノート化していないターンの供給元 (既定は会話履歴)。
+        self._turn_source: TurnSource = turn_source or HistoryTurnSource()
+        #: pin トリガ辞書の user override ディレクトリ。
+        self._triggers_dir = triggers_dir
+        #: private セッションの trace_id (MDP 昇格の除外に使う)。ターン自体は
+        #: 履歴にもストアにも残らないので、窓を持つ側から貰う。
+        self._private_trace_ids_provider = private_trace_ids_provider
+        #: 現在のサイクルで開いている作業領域 (Full の間だけ生きる)。
+        self._workspace: "EpisodicWorkspace | None" = None
 
     def set_fewshot_pool(self, pool) -> None:
         """FewShotPool を設定 (手本の埋め込み backfill に使用)。"""
@@ -171,7 +186,16 @@ class SleepTimeWorker:
         return False
 
     async def run_light(self) -> dict:
-        """Light 版: LLM なし、Steps 1-5
+        """Light 版: LLM なし。ノート生成 → touch flush → (必要なら) snapshot。
+
+        旧 Light の Step 1-4 (埋め込み / タグ補完 / LightMem スコア再計算 /
+        eviction) は無くなった:
+
+        - 埋め込みは snapshot 生成時に **増分で** 作られる (c_16 §6.1)
+        - タグ / キーワードはノート生成時に確定する (``NoteBuilder``)
+        - LightMem スコアは廃止 (順位式は c_16 §7.2 の 1 本)
+        - eviction は tier 遷移と保持方針 (:meth:`_step_e_lifecycle`) が担う。
+          ストア間のコピーは無くなったので、ここで「落とす」ものは無い
 
         Returns:
             実行結果サマリ dict
@@ -180,63 +204,36 @@ class SleepTimeWorker:
         started_at = utc_now()
         t0 = time.monotonic()
         step_durations: dict[str, float] = {}
-        result = {
-            "embedded": 0,
-            "tags_refined": 0,
-            "scores_updated": 0,
-            "evicted": 0,
-        }
+        result: dict = {"notes_created": 0, "touched": 0, "snapshot": ""}
 
-        logger.info("Sleep-time Light started (%d notes)", len(self.short_term.notes))
-
-        # Step 1 が例外で抜けると Step 2-5.5 と _save_state() がまるごと飛び、
-        # 経験バッファ / STM / LTM / learned_patterns が一切永続化されないまま
-        # 次サイクルも同じ理由で落ち続ける (2026-07-25: 過大ノート 1 件の
-        # embed 400 で 26 分間・17 回連続失敗し、未埋め込みノートが 2→84 件へ
-        # 単調増加した。除去できるのは Step 4 eviction だが Step 1 で落ちるため
-        # 永久に到達しないデッドロック)。
-        # 各 step を独立させ、`_save_state()` は finally で必ず走らせる。
+        logger.info(
+            "Sleep-time Light started (%d episodic record(s))", len(self.episodic),
+        )
         try:
-            # Step 1: 未埋め込みノートの埋め込み生成
             ts = time.monotonic()
-            result["embedded"] = await self._step1_embed_notes()
-            step_durations["step1_embedding"] = round(time.monotonic() - ts, 3)
+            result["notes_created"] = self._step_e1_build_notes()
+            step_durations["step_e1_note_build"] = round(time.monotonic() - ts, 3)
             if self._check_cancelled():
                 return result
 
-            # Step 2: タグ補完（ルールベース）
             ts = time.monotonic()
-            result["tags_refined"] = self._step2_refine_tags()
-            step_durations["step2_tagging"] = round(time.monotonic() - ts, 3)
-            if self._check_cancelled():
-                return result
+            result["touched"] = self.episodic.flush_touch()
+            step_durations["step_e4_touch_flush"] = round(time.monotonic() - ts, 3)
 
-            # Step 3: LightMem スコア再計算
-            ts = time.monotonic()
-            result["scores_updated"] = self._step3_recalc_scores()
-            step_durations["step3_scoring"] = round(time.monotonic() - ts, 3)
-            if self._check_cancelled():
-                return result
-
-            # Step 4: FadeMem eviction 判定
-            ts = time.monotonic()
-            result["evicted"] = self._step4_eviction()
-            step_durations["step4_eviction"] = round(time.monotonic() - ts, 3)
-            if self._check_cancelled():
-                return result
-
-            # Step 5.5: 学習済みパターンの減衰と永続化
             ts = time.monotonic()
             result["patterns_decayed"] = self._step5_5_decay_patterns()
             step_durations["step5_5_patterns"] = round(time.monotonic() - ts, 3)
         finally:
-            # 永続化 (途中で落ちても、それまでの進捗は必ず書き出す)
+            ts = time.monotonic()
+            result["snapshot"] = await self._maybe_snapshot(
+                min_events=_SNAPSHOT_MIN_EVENTS_LIGHT,
+            )
+            step_durations["step_e5_snapshot"] = round(time.monotonic() - ts, 3)
             await self._save_state_async()
 
         elapsed = round(time.monotonic() - t0, 3)
         logger.info("Sleep-time Light completed in %.3fs: %s", elapsed, result)
 
-        # DebugLogger に Level 0.5 Light を記録
         dl = self._debug_logger
         if dl:
             dl.log_learning_cycle(cycle_num=0, data={
@@ -244,7 +241,7 @@ class SleepTimeWorker:
                 "started_at": started_at,
                 "elapsed_sec": elapsed,
                 "step_durations_sec": step_durations,
-                "notes_count": len(self.short_term.notes),
+                "notes_count": len(self.episodic),
                 **result,
             })
             dl.log_outcome(
@@ -253,20 +250,180 @@ class SleepTimeWorker:
                 duration_ms=elapsed * 1000,
                 quality_signals={
                     "level": "0.5-light",
-                    "notes_count": len(self.short_term.notes),
-                    **{k: v for k, v in result.items() if isinstance(v, (int, float, bool))},
+                    "notes_count": len(self.episodic),
+                    **{
+                        k: v for k, v in result.items()
+                        if isinstance(v, (int, float, bool))
+                    },
                 },
             )
 
         return result
 
+    # ── エピソード記憶のライフサイクル (c_16 §4.1) ──────────
+
+    def _step_e1_build_notes(self) -> int:
+        """会話履歴のうち、まだノートにしていないターンをノート化する。
+
+        応答パスは ``WorkingMemory`` に積むだけになったので (c_16 §2.1: 書き手
+        は sleep-time だけ)、ノートの入力はターン ID の発行元である会話履歴。
+        どこまでノート化したかは ``episodic/progress.json`` が持つ。
+        """
+        try:
+            created = ingest_new_turns(
+                self.episodic,
+                self._turn_source,
+                session_limit=DEFAULT_SESSION_LIMIT,
+                triggers_dir=self._triggers_dir,
+                config=self.config,
+            )
+        except Exception as e:  # noqa: BLE001 — 1 セッションの失敗で止めない
+            logger.warning("Note build from conversation turns failed: %s", e)
+            return 0
+        if created:
+            logger.info("Sleep-time: built %d episodic note(s)", created)
+        return created
+
+    def _retention_value(self, key: str, default: float) -> float:
+        """``memory.evidence.retention.<key>`` (無ければ manifest の宣言値)。"""
+        cfg = ((self.config.get("memory") or {}).get("evidence") or {})
+        raw = (cfg.get("retention") or {}).get(key)
+        if raw is None:
+            raw = self.episodic.evidence.manifest.retention_value(key)
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return default
+
+    def _step_e2_promote_tiers(self) -> int:
+        """``short_days`` を超えたノートを ``long`` へ (``patch`` のみ)。"""
+        return self.episodic.promote_aged_notes(
+            short_days=self._retention_value("short_days", 14.0),
+        )
+
+    def _step_e3_summarize_sessions(self) -> int:
+        """要約が出来ているセッションのノートを要約 1 件へ畳む (c_16 §4.1)。
+
+        要約本文は履歴側 (Step 8-9) が LLM で作ったもの。ここで作り直さない
+        のは、同じ会話の要約を 2 か所で持つと必ず食い違うため。元ノートは
+        ``superseded_by`` で要約を指し、消えはしない。
+        """
+        summarized = 0
+        try:
+            sessions = self._turn_source.recent_sessions(limit=DEFAULT_SESSION_LIMIT)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Episodic summary: failed to list sessions: %s", e)
+            return 0
+        by_session: dict[str, list[str]] = {}
+        #: 既に書いた要約の本文 (同じ文面を二度書かない)。会話が伸びると
+        #: 後から昇格したノートで再度この工程に入るが、履歴側の要約が
+        #: 作り直されていなければ畳む意味が無い。
+        existing: dict[str, set[str]] = {}
+        for note in self.episodic.iter_notes(tier="long"):
+            if note.summary_of:
+                existing.setdefault(note.session_id, set()).add(note.content.strip())
+                continue
+            if note.superseded_by:
+                continue
+            by_session.setdefault(note.session_id, []).append(note.id)
+        for session in sessions:
+            summary = (session.summary or "").strip()
+            note_ids = by_session.get(session.session_id) or []
+            if not summary or len(note_ids) < 2:
+                continue
+            if summary in existing.get(session.session_id, ()):
+                continue
+            if self.episodic.write_summary_note(
+                session_id=session.session_id,
+                text=summary,
+                note_ids=note_ids,
+                mode=session.mode if session.mode in ("chat", "create") else "chat",
+                lang=session.lang,
+                project_id=session.project_id,
+            ):
+                summarized += 1
+        return summarized
+
+    def _step_e_lifecycle(self, result: dict) -> None:
+        """tier 昇格 → 要約 → 保持方針 の 3 つをまとめて回す。"""
+        result["notes_promoted"] = self._step_e2_promote_tiers()
+        result["notes_summarized"] = self._step_e3_summarize_sessions()
+        result["notes_retracted"] = self.episodic.enforce_retention(
+            long_max_records=int(self._retention_value("long_max_records", 50000)),
+        )
+
+    async def _maybe_snapshot(self, *, min_events: int = 1) -> str:
+        """未畳み込み事象が ``min_events`` 以上あれば版を作る。
+
+        episodic と semantic の 2 ストアを同じ条件で畳む。版を作った時点で
+        埋め込みとクラスタ索引・転置索引がまとめて更新される (c_16 §6.1)。
+
+        Returns:
+            作った episodic の版名。作らなければ空文字。
+        """
+        version = ""
+        pending = int(self.episodic.evidence.manifest.events_since_snapshot)
+        if pending < max(1, min_events):
+            self.episodic.save_progress()
+        else:
+            try:
+                version = await self.episodic.create_snapshot() or ""
+            except Exception as e:  # noqa: BLE001 — 版が作れなくても事象は残る
+                logger.warning("Episodic snapshot failed: %s", e)
+        await self._maybe_snapshot_semantic(min_events=min_events)
+        return version
+
+    async def _maybe_snapshot_semantic(self, *, min_events: int = 1) -> str:
+        """SemMem 側の保持方針を適用してから版を作る (c_16 §5.4 / §6.1)。"""
+        store = self._semantic_store()
+        if store is None:
+            return ""
+        try:
+            store.enforce_retention()
+        except Exception as e:  # noqa: BLE001 — 保持で落ちても版は作る
+            logger.warning("Semantic retention failed: %s", e)
+        try:
+            store.flush_touch()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Semantic touch flush failed: %s", e)
+        pending = int(store.evidence.manifest.events_since_snapshot)
+        if pending < max(1, min_events):
+            store.save_manifest()
+            return ""
+        try:
+            return await store.create_snapshot() or ""
+        except Exception as e:  # noqa: BLE001 — 版が作れなくても事象は残る
+            logger.warning("Semantic snapshot failed: %s", e)
+            return ""
+
+    def _semantic_store(self):
+        """SemMem 本体 (スコープ束縛ビューではない)。未配線なら ``None``。
+
+        ``semantic_store_provider`` は 1 スコープに束縛したビューを返すので、
+        版の生成・保持方針のようなストア全体の操作はここで本体を取り出す。
+        """
+        provider = self._semantic_store_provider
+        if provider is None:
+            return None
+        try:
+            return provider("global").store
+        except Exception as e:  # noqa: BLE001 — 未初期化なら黙って諦める
+            logger.debug("Semantic store unavailable for snapshot: %s", e)
+            return None
+
+    def _workspace_or_open(self) -> "EpisodicWorkspace":
+        """現サイクルの作業領域 (無ければ開く)。"""
+        if self._workspace is None:
+            self._workspace = self.episodic.open_workspace()
+        return self._workspace
+
     async def _step6_resolve_conflicts(
         self, llm_client, params_b: float, result: dict,
     ) -> None:
-        """Step 6: ConflictResolver による短期記憶のコンフリクト解決。
+        """Step 6: ConflictResolver による短期ノートのコンフリクト解決。
 
-        ShortTermMemory (FadeMem) の競合解決後に SemanticFactStore 上の
-        コンフリクト解消 を続けて実行する
+        作業領域 (``short`` tier のノート) の競合解決後に SemanticFactStore
+        上のコンフリクト解消を続けて実行する。
         """
         from backend.free.memory.pipeline.conflict_resolver import ConflictResolver
         resolver = ConflictResolver(
@@ -275,7 +432,7 @@ class SleepTimeWorker:
             debug_logger=self._debug_logger,
         )
         result["conflicts_resolved"] = await resolver.resolve_conflicts(
-            self.short_term, llm_client,
+            self._workspace_or_open(), llm_client,
         )
         # ── SemMem 競合解消 ──
         sem_summary = self._step6b_resolve_semmem_conflicts()
@@ -331,12 +488,13 @@ class SleepTimeWorker:
             aux_prompt_manager=self._aux_prompt_manager,
             debug_logger=self._debug_logger,
         )
+        workspace = self._workspace_or_open()
         # リンク張り直し + クラスタリング (LLM 不要)
-        link_stats = evolver.rebuild_links_and_clusters(self.short_term)
+        link_stats = evolver.rebuild_links_and_clusters(workspace)
         result["notes_links_rebuilt"] = link_stats.get("links", 0)
         result["notes_clusters"] = link_stats.get("clusters", 0)
         result["notes_evolved"] = await evolver.evolve_notes(
-            self.short_term, self.long_term, llm_client,
+            workspace, self.episodic, llm_client,
             should_pause=self._chat_in_flight,
         )
 
@@ -344,7 +502,7 @@ class SleepTimeWorker:
         self, result: dict,
     ) -> None:
         """Step 6.5: コンフリクト解決で embedding=None になったノートを再埋め込み。"""
-        re_embedded = await self._step1_embed_notes()
+        re_embedded = await self._embed_workspace_notes()
         if re_embedded:
             result["re_embedded"] = re_embedded
             logger.info(
@@ -367,7 +525,7 @@ class SleepTimeWorker:
                 "started_at": started_at,
                 "elapsed_sec": elapsed,
                 "step_durations_sec": step_durations,
-                "notes_count": len(self.short_term.notes),
+                "notes_count": len(self.episodic),
                 **result,
             })
             dl.log_outcome(
@@ -376,7 +534,7 @@ class SleepTimeWorker:
                 duration_ms=elapsed * 1000,
                 quality_signals={
                     "level": "0.5-full",
-                    "notes_count": len(self.short_term.notes),
+                    "notes_count": len(self.episodic),
                     **{k: v for k, v in result.items() if isinstance(v, (int, float, bool))},
                 },
             )
@@ -395,6 +553,9 @@ class SleepTimeWorker:
         started_at = utc_now()
         t0 = time.monotonic()
         step_durations: dict[str, float] = {}
+        # 前サイクルが途中で打ち切られていると作業領域が残る。ノートは
+        # そのあいだに Light が増やしているので、必ず開き直す。
+        self._workspace = None
 
         # まず Light 版を実行
         ts = time.monotonic()
@@ -419,6 +580,14 @@ class SleepTimeWorker:
 
         params_b = getattr(getattr(llm_client, "metadata", None), "params_b", 7.0)
 
+        # Step E0: 作業領域を開いて、ベクトルの無いノートを埋め込む。
+        # Step 6 (競合検出) / Step 7 (ノート進化) はノート同士の類似度を要る。
+        ts = time.monotonic()
+        result["workspace_embedded"] = await self._embed_workspace_notes()
+        step_durations["step_e0_workspace_embed"] = round(time.monotonic() - ts, 3)
+        if self._check_cancelled():
+            return result
+
         # Step 6: コンフリクト解決
         ts = time.monotonic()
         await self._step6_resolve_conflicts(llm_client, params_b, result)
@@ -440,10 +609,10 @@ class SleepTimeWorker:
         if self._check_cancelled():
             return result
 
-        # Step 7.5: MDP トレース → episodic LTM 投入
-        # B-1 の Step 8 (extractor) よりも前に行うことで、当該 trace_id の
-        # MemoryNote が STM/LTM に存在する状態でファクト抽出が走り、
-        # ``trace_id`` がエピソード記憶 / 意味記憶の双方に伝播する。
+        # Step 7.5: MDP トレース → エピソード記憶 (long tier) 投入。
+        # Step 8 (extractor) よりも前に行うことで、当該 trace_id のノートが
+        # ストアに存在する状態でファクト抽出が走り、``trace_id`` が
+        # エピソード記憶 / 意味記憶の双方に伝播する。
         ts = time.monotonic()
         result["mdp_traces_ingested"] = await self._step7_5_ingest_mdp_traces()
         step_durations["step7_5_mdp_ingest"] = round(time.monotonic() - ts, 3)
@@ -491,6 +660,14 @@ class SleepTimeWorker:
         if self._check_cancelled():
             return result
 
+        # Step 8.7: know.* 取得器 (Pro)。Free には origin=web の書き手が無い
+        # ので、登録が無ければ 0 で通過する。
+        ts = time.monotonic()
+        result["knowledge_claims"] = await self._step8_7_fetch_knowledge()
+        step_durations["step8_7_knowledge_fetch"] = round(time.monotonic() - ts, 3)
+        if self._check_cancelled():
+            return result
+
         # Step 13: failure_pattern 統合
         # Step 8 の直後に呼ぶことで、当該イテレーションで新たに抽出された
         # failure_pattern と、既に loop.write_failure_note で即時書き込みされた
@@ -519,23 +696,9 @@ class SleepTimeWorker:
         if self._check_cancelled():
             return result
 
-        # Step 8.8: 埋め込みが無いファクトの遡及生成
-        # Step 8 (extractor) / 8.4-8.6 (curator) / Step 9 (history 昇格) は
-        # いずれも同期関数で embedder を持てないため、生成した直後にここで埋める。
-        #
-        # **Step 9 promotion より後**に置くこと。以前は 8.6 の直後にあり、
-        # Step 9 が作った decision / commitment は embedding=None のまま
-        # 次サイクルまで残っていた。その間 MemoryInjector._is_relevant の
-        # 「埋め込みが無い候補は判定不能として通す」に該当し、関連度ゲートを
-        # 素通りする (セッション要約は is_internal_index_subject が落とすが、
-        # commitment とプロジェクト系 decision は落ちない)。
-        ts = time.monotonic()
-        result["fact_embeddings_backfilled"] = (
-            await self._step8_8_backfill_fact_embeddings()
-        )
-        step_durations["step8_8_fact_embedding"] = round(time.monotonic() - ts, 3)
-        if self._check_cancelled():
-            return result
+        # 旧 Step 8.8 (ファクト埋め込みの遡及生成) は無くなった。埋め込みは
+        # SemMem の snapshot 生成時に **増分で** 作られる (c_16 §6.1)。
+        # 「版に載るまで密ベクトル検索の対象にならない」契約は episodic と同じ。
 
         # Step 9 GC: semmem_limits 超過時に lowest_score 戦略で削除
         ts = time.monotonic()
@@ -558,27 +721,36 @@ class SleepTimeWorker:
 
         # Step 10b-2: 手本 (few-shot) の埋め込みを遡って生成する。
         # 埋め込みが載るまでその手本は密ベクトル選択の候補にならない
-        # (STM ノートが embed 工程を通るまで注入対象にならないのと同じ契約)。
+        # (ノートが snapshot に載るまで注入対象にならないのと同じ契約)。
         ts = time.monotonic()
         result["fewshot_embeddings_backfilled"] = (
             await self._step10b2_backfill_fewshot_embeddings()
         )
         step_durations["step10b2_fewshot_embedding"] = round(time.monotonic() - ts, 3)
 
-        # Step 10c: 語彙索引 (BM25) をベクトルストアと同期させる。
-        # チャット応答経路の LTM がこの索引を引くようになったため、昇格した
-        # ばかりのチャンクが語彙検索から漏れたままになるのを防ぐ。
-        # 以前の再構築点は contextual prefix 生成 (Step 5.8) の中だけで、
-        # ``contextual_prefix.enabled=false`` の構成では **一度も更新されなかった**。
+        # Step 10c (語彙索引の再構築) は廃止した (c_16 §6.2 / §8)。3 ストアとも
+        # ``EvidenceStore`` が snapshot 生成のたびに転置索引を作り直すので、
+        # 別立てで張り直す索引がもう無い。
+
+        # Step E2-E5: tier 昇格 → 要約 → 保持方針 → touch flush → snapshot。
+        # 作業領域の変更を先に事象へ落とす (畳み込みの入力に載せるため)。
         ts = time.monotonic()
-        result["lexical_index_rebuilt"] = self._step10c_refresh_lexical_index()
-        step_durations["step10c_lexical_index"] = round(time.monotonic() - ts, 3)
+        if self._workspace is not None:
+            result["workspace_flushed"] = self._workspace.flush()
+            self._workspace = None
+        self._step_e_lifecycle(result)
+        result["touched"] = self.episodic.flush_touch()
+        step_durations["step_e_lifecycle"] = round(time.monotonic() - ts, 3)
+
+        ts = time.monotonic()
+        result["snapshot"] = await self._maybe_snapshot(min_events=1)
+        step_durations["step_e5_snapshot"] = round(time.monotonic() - ts, 3)
 
         # Step 10d: 起動時に条件を満たさず見送られた閾値較正を拾い直す。
         # 較正は起動時 1 回きりだったため、ノートが少ない状態で起動すると
         # プロセスの生涯にわたり config の静的閾値 (別モデル前提で到達不能)
-        # が使われ続けていた。ここまでで Step 1-8 がノートを増やしているので、
-        # 同じサイクル内で増えた分をそのまま使える。
+        # が使われ続けていた。**版を作った後**に置くこと — 較正はノートの
+        # ベクトルを読むので、同じサイクルで増えた分を使うには索引が要る。
         ts = time.monotonic()
         result["threshold_calibrated"] = await self._step10d_retry_calibration()
         step_durations["step10d_threshold_calibration"] = round(
@@ -624,78 +796,43 @@ class SleepTimeWorker:
             logger.warning("Step 10b-2: fewshot embedding backfill failed: %s", e)
             return 0
 
-    def _step10c_refresh_lexical_index(self) -> int:
-        """BM25 索引をベクトルストアの現在のチャンク集合へ張り直す。
+    async def _embed_workspace_notes(self) -> int:
+        """作業領域のノートのうち、ベクトルを持たないものを埋め込む。
 
-        件数が一致していれば no-op。再構築は O(N) のトークナイズなので、
-        チャット応答をブロックしない sleep-time にだけ置く。
-
-        Returns:
-            張り直した場合はチャンク数、no-op なら 0。
-        """
-        bm25 = self._bm25_retriever
-        vs = self.vector_store
-        if bm25 is None or vs is None:
-            return 0
-        try:
-            if bm25.count == vs.count:
-                return 0
-            from backend.free.rag.bm25_retriever import (
-                build_index_from_vector_store,
-            )
-
-            n = build_index_from_vector_store(bm25, vs)
-            logger.info(
-                "Step 10c: lexical index rebuilt (%d -> %d chunks)",
-                bm25.count if n == 0 else n, vs.count,
-            )
-            return n
-        except Exception as e:
-            logger.warning("Step 10c: lexical index rebuild failed: %s", e)
-            return 0
-
-    async def _step1_embed_notes(self) -> int:
-        """Step 1: 未埋め込みノートの埋め込み生成
+        **永続化しない一時値** (:attr:`MemoryNote.embedding`)。競合検出
+        (Step 6) とノート進化 (Step 7) がノート同士の類似度を要るためだけに
+        載せる。ストアの索引は snapshot 生成時に増分で作られる (c_16 §6.1)。
 
         1 件でも embed サーバの context を超えるノートがあるとバッチ全体が
-        400 で落ち、Step 2 以降と永続化がすべて飛ぶ (2026-07-25 のデッドロック)。
-        対策は 3 段:
-
-        1. ``_EMBED_MAX_CHARS`` でノート本文を切り詰めてから投げる (根本対策)
-        2. バッチ失敗時はノート単位へフォールバックし、健全なノートを救う
-        3. 連続失敗したノートは ``embed_failures`` を加算し、上限に達したら
-           以降スキップする (同じノートで永久に再試行しない)
+        400 で落ちるので、(a) 本文を切り詰め、(b) バッチ失敗時はノート単位へ
+        フォールバックする (2026-07-25 のデッドロックの対策をそのまま踏襲)。
         """
-        unembedded = [
-            note for note in self.short_term.notes.values()
-            if note.embedding is None
-            and note.embed_failures < _EMBED_MAX_FAILURES
-        ]
-        if not unembedded:
-            logger.debug("Step 1: no unembedded notes, skipping")
+        if self.embedder is None:
+            return 0
+        workspace = self._workspace_or_open()
+        pending = workspace.unembedded()
+        if not pending:
+            logger.debug("Embedding: no unembedded notes in the workspace")
             return 0
 
-        logger.info("Step 1: embedding %d notes...", len(unembedded))
+        logger.info("Embedding %d workspace note(s)...", len(pending))
         embedded = 0
-        for start in range(0, len(unembedded), _EMBED_BATCH_SIZE):
-            batch = unembedded[start:start + _EMBED_BATCH_SIZE]
+        for start_at in range(0, len(pending), _EMBED_BATCH_SIZE):
+            batch = pending[start_at:start_at + _EMBED_BATCH_SIZE]
             texts = [_truncate_for_embedding(n.content) for n in batch]
             try:
                 embeddings = await self.embedder.embed(texts, is_query=False)
             except Exception as exc:
                 logger.warning(
-                    "Step 1: batch embed failed (%d notes), "
-                    "falling back to per-note: %s", len(batch), exc,
+                    "Batch embed failed (%d notes), falling back to per-note: %s",
+                    len(batch), exc,
                 )
                 embedded += await self._embed_notes_individually(batch)
                 continue
             for note, emb in zip(batch, embeddings):
                 note.embedding = emb.astype(np.float32)
-                note.embed_failures = 0
                 embedded += 1
-
-        self.short_term.mark_dirty()
-        logger.info("Step 1: embedded %d notes", embedded)
+        logger.info("Embedded %d workspace note(s)", embedded)
         return embedded
 
     async def _embed_notes_individually(self, notes: list) -> int:
@@ -707,154 +844,15 @@ class SleepTimeWorker:
                     [_truncate_for_embedding(note.content)], is_query=False,
                 )
             except Exception as exc:
-                note.embed_failures += 1
                 logger.warning(
-                    "Step 1: note embed failed (%d/%d, len=%d): %s",
-                    note.embed_failures, _EMBED_MAX_FAILURES,
-                    len(note.content), exc,
+                    "Note embed failed (len=%d): %s", len(note.content), exc,
                 )
                 continue
             if emb is None or len(emb) == 0:
-                note.embed_failures += 1
                 continue
             note.embedding = emb[0].astype(np.float32)
-            note.embed_failures = 0
             embedded += 1
         return embedded
-
-    def _step2_refine_tags(self) -> int:
-        """Step 2: タグ補完（ルールベース）
-
-        埋め込みが生成されたノートについて、キーワードとタグを再抽出。
-        """
-        from backend.free.memory.notes.note_builder import NoteBuilder
-
-        refined = 0
-        for note in self.short_term.notes.values():
-            if not note.tags:
-                # 生成時と同じ source を渡す。渡さないと assistant ノートに
-                # ``fact`` が付き直し、生成側の抑止 (ASSISTANT_EXCLUDED_TAGS) が
-                # sleep-time で無効化されてしまう。
-                note.tags = NoteBuilder.auto_tag(
-                    note.content, getattr(note, "source", "user"),
-                )
-                if note.tags:
-                    refined += 1
-            if not note.keywords:
-                note.keywords = NoteBuilder.extract_keywords(note.content)
-                if note.keywords:
-                    refined += 1
-
-        if refined > 0:
-            logger.info("Refined tags/keywords for %d notes", refined)
-        return refined
-
-    def _step3_recalc_scores(self) -> int:
-        """Step 3: LightMem スコア再計算"""
-        updated = 0
-        for note in self.short_term.notes.values():
-            new_score = self.scorer.compute(note)
-            if abs(new_score - note.lightmem_score) > 0.01:
-                note.lightmem_score = new_score
-                updated += 1
-
-        if updated > 0:
-            self.short_term.mark_dirty()
-            logger.info("Updated scores for %d notes", updated)
-        return updated
-
-    def _extract_before_overflow(self) -> int:
-        """未抽出ノートを **捨てる前に** Step 8 を前倒しする (背圧)。
-
-        なぜ要るか: SemMem の唯一の入力は STM のノートで、抽出 (Step 8) は
-        idle Full にしか載っていない (``memory.facts.trigger =
-        idle_full_only``)。会話が続く限り Full は来ないので STM は伸び続け、
-        ``UNEXTRACTED_PROTECTION_CEILING`` に当たった時点で保護が **丸ごと**
-        外れ、下位 20% が古い順に降格される。落ちるのは「まだ抽出器が見て
-        いない最も古いノート」— つまり **SemMem の入力そのもの**。
-
-        実インシデント (2026-08-28 ライブ監査、20 テーマ 200 ターン):
-
-        - Full は会話中ずっと保留された (``deferred=57.3 min``)
-        - STM が 200 件に達するたび 40 件が降格され、これが 6 回起きた
-          (08:41 / 08:46 / 08:51 / 08:59 / 09:05 / 09:12、計 237 件)
-        - 降格された中にテーマ 1 の「私の名前は佐倉レンです。」があり、
-          ``mem.personal.name`` のファクトは **最後まで 1 件も作られなかった**
-          (居住地 / 職業 / 猫 / 飲み物 / 誕生日 / 会員番号 は全て作られている)
-        - 結果「あなたの名前は確認できていません」と「佐倉レンさんですね」が
-          問いの言い回し次第で入れ替わる (LTM / 履歴検索へのフォールバックは
-          語順に依存するため)
-
-        天井の意味を「抽出を諦める」から「抽出が遅れている — 今すぐ走らせる」
-        へ反転させる。Step 8 は LLM 非依存の同期処理で、実測 590 秒の Full の
-        中でも計上されない (< 0.5 秒) ため、この前倒しはほぼ無償。抽出済みの
-        ノートは ``extracted_fact_ids`` で弾かれるので二重抽出も起きない。
-
-        書き込みは sleep-time の内側 (SleepTimeWorker) に閉じたままなので、
-        「SemMem はチャット応答パスから読むだけ」の不変則は保たれる。
-
-        Returns:
-            前倒しで抽出したファクト数 (前倒し不要なら ``0``)。
-        """
-        mem_cfg = (self.config.get("memory") or {})
-        if not ((mem_cfg.get("facts") or {}).get("enable_extraction", True)):
-            return 0
-        max_notes = int(mem_cfg.get("short_term_max_notes", 100))
-        ceiling = max_notes * MemoryEviction.UNEXTRACTED_PROTECTION_CEILING
-        if len(self.short_term.notes) < ceiling:
-            return 0
-        cutoff = self._last_extraction_at
-        if not any(
-            float(getattr(n, "created_at", 0.0) or 0.0) > cutoff
-            or getattr(n, "extraction_deferred", False)
-            for n in self.short_term.notes.values()
-        ):
-            return 0
-        extracted = self._step8_extract_facts()
-        logger.info(
-            "Step 4: extraction pulled forward before eviction "
-            "(%d notes at ceiling %d, %d facts extracted)",
-            len(self.short_term.notes), int(ceiling), extracted,
-        )
-        return extracted
-
-    def _step4_eviction(self) -> int:
-        """Step 4: FadeMem eviction 判定"""
-        logger.info("Step 4: running eviction check on %d notes", len(self.short_term.notes))
-        # 捨てる前に抽出する (:meth:`_extract_before_overflow`)。
-        self._extract_before_overflow()
-        eviction = MemoryEviction(policy=getattr(self, "_policy", None))
-        exp_dict = None
-        if self.experience_buf is not None:
-            exp_dict = {
-                "source_memory_ids": self.experience_buf.source_memory_ids,
-                "pending_memory_ids": self.experience_buf.pending_memory_ids,
-            }
-        evicted = eviction.evict(
-            self.short_term,
-            self.long_term,
-            exp_dict,
-            self.scorer,
-            self.config,
-            unextracted_cutoff=self._extraction_cutoff(),
-        )
-        if evicted:
-            logger.info("Step 4: evicted %d notes", evicted)
-        else:
-            logger.debug("Step 4: no notes evicted")
-        return evicted
-
-
-    def _extraction_cutoff(self) -> float | None:
-        """eviction へ渡す「Step 8 が最後に走った時刻」。
-
-        抽出が無効な構成では ``None`` を返して保護を掛けない — 走らない工程の
-        入力を守り続けると STM が伸びるだけになる。
-        """
-        facts_cfg = (self.config.get("memory") or {}).get("facts") or {}
-        if not facts_cfg.get("enable_extraction", True):
-            return None
-        return self._last_extraction_at
 
     def _step5_5_decay_patterns(self) -> int:
         """Step 5.5: 学習済みパターンの重み減衰と永続化
@@ -888,7 +886,7 @@ class SleepTimeWorker:
 
         実ロジックは
         :mod:`backend.free.memory.sleep.contextual` に分離された。
-        本メソッドはメイン VectorStore / カートリッジ / BM25 を
+        本メソッドはメイン VectorStore / カートリッジを
         引数に詰め替える薄いラッパ。
         """
         from backend.free.memory.sleep.contextual import (
@@ -901,7 +899,6 @@ class SleepTimeWorker:
             embedder=self.embedder,
             vector_store=self.vector_store,
             cartridge_manager=self.cartridge_manager,
-            bm25_retriever=self._bm25_retriever,
             is_cancelled=self._check_cancelled,
         )
 
@@ -926,21 +923,27 @@ class SleepTimeWorker:
     # ── Step 7.5 (MDP トレース → episodic LTM) ─────────
 
     async def _step7_5_ingest_mdp_traces(self) -> int:
-        """Step 7.5: ``agent_trace*.jsonl`` を episodic LTM に取り込む。
+        """Step 7.5: ``agent_trace*.jsonl`` をエピソード記憶に取り込む。
 
         実ロジックは :mod:`backend.free.memory.sleep.mdp_ingest`
         に分離された。本メソッドは state を詰め替えて委譲する薄いラッパ。
         """
         from backend.free.memory.sleep.mdp_ingest import ingest_mdp_traces
 
-        ingested, self._mdp_ingester = await ingest_mdp_traces(
-            self.short_term,
-            self.long_term,
-            self.embedder,
+        provider = self._private_trace_ids_provider
+        private_trace_ids: set[str] = set()
+        if provider is not None:
+            try:
+                private_trace_ids = set(provider() or ())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Step 7.5: private trace id lookup failed: %s", exc)
+        ingested, self._mdp_ingester = ingest_mdp_traces(
+            self.episodic,
             config=self.config,
             agent_trace_dir=self._agent_trace_dir,
             current_project_id=self._current_project_id,
             cached_ingester=self._mdp_ingester,
+            private_trace_ids=private_trace_ids,
         )
         return ingested
 
@@ -955,7 +958,7 @@ class SleepTimeWorker:
         """
         from backend.free.memory.sleep.extraction import extract_semantic_facts
 
-        notes = list(self.short_term.notes.values())
+        notes = list(self._workspace_or_open().notes.values())
         # 抽出を「走らせた」時刻。次サイクル以降の eviction は、これより後に
         # 作られたノートだけを保護する (未消費の入力を落とさないため)。
         self._last_extraction_at = time.time()
@@ -971,7 +974,7 @@ class SleepTimeWorker:
         return total
 
     def _curatable_notes(self) -> list:
-        """キュレーター (Step 8.4 / 8.5 / 8.6) へ渡す STM ノート。
+        """キュレーター (Step 8.4 / 8.5 / 8.6) へ渡す ``short`` ノート。
 
         private セッション由来を落とす。キュレーター側も入口で
         :func:`~backend.free.memory.sleep._curator_common.public_notes` を
@@ -981,7 +984,7 @@ class SleepTimeWorker:
         """
         from backend.free.memory.sleep._curator_common import public_notes
 
-        return public_notes(list(self.short_term.notes.values()))
+        return public_notes(list(self._workspace_or_open().notes.values()))
 
     # ── Step 8.4 (assertion curator) ───────────────────
 
@@ -1051,26 +1054,33 @@ class SleepTimeWorker:
             debug_logger=self._debug_logger,
         )
 
-    # ── Step 13 (failure_pattern 統合) ─────────────────
+    async def _step8_7_fetch_knowledge(self) -> int:
+        """Step 8.7: ``know.*`` 取得器を回す (Pro 限定)。
 
-    async def _step8_8_backfill_fact_embeddings(self) -> int:
-        """Step 8.8: 埋め込みが無い SemanticFact へ遡及的に埋め込みを生成する。
+        取得器は ``backend.pro.knowledge.KnowledgeFetcher`` で、Pro 起動時に
+        ``register_pro_handler("knowledge_fetcher", …)`` で登録される。Free
+        では未登録なので 0 を返して素通りする (Edition Gate の Handler 経路、
+        e_02 §3.3)。
 
-        実ロジックは :mod:`backend.free.memory.sleep.fact_embedding` に分離。
-        本メソッドは provider / embedder / cancel を詰め替える薄いラッパ。
+        ここに置くのは **版を作る前** だから — 取得した claim を同じサイクルの
+        snapshot に載せる。取得器自身は ``create_snapshot`` を呼ばない
+        (稼働中の索引を書き換えない、c_16 §2.1)。
+
+        Returns:
+            書き込んだ claim 件数。取得器が無い / 失敗した場合は 0。
         """
-        from backend.free.memory.sleep.fact_embedding import (
-            backfill_fact_embeddings,
-        )
+        from backend.edition import get_pro_handler
 
-        if self._semantic_store_provider is None:
+        fetcher = get_pro_handler("knowledge_fetcher")
+        if fetcher is None:
             return 0
-        return await backfill_fact_embeddings(
-            self._semantic_store_provider,
-            self.embedder,
-            current_project_id=self._current_project_id,
-            is_cancelled=self._check_cancelled,
-        )
+        try:
+            return await fetcher.run_once()
+        except Exception as e:  # noqa: BLE001 — 取得失敗でサイクルを落とさない
+            logger.warning("Knowledge fetch failed: %s", e)
+            return 0
+
+    # ── Step 13 (failure_pattern 統合) ─────────────────
 
     def _step13_consolidate_failure_patterns(self) -> dict[str, int]:
         """Step 13: 同一 ``failure_signature`` の failure_pattern を統合する。
@@ -1161,10 +1171,15 @@ class SleepTimeWorker:
         )
 
     def _step10_archive_inactive_projects(self) -> list[str]:
-        """Step 10: 180 日無アクセスのプロジェクトを semantic/archive/ に移動
+        """Step 10: 180 日無アクセスのプロジェクトのファクトを退役させる
 
         実ロジックは :mod:`backend.free.memory.sleep.archive`
-        に分離された。本メソッドは invalidator コールバックを詰め替える薄いラッパ。
+        に分離された。本メソッドはコールバックを詰め替える薄いラッパ。
+
+        ``store_provider`` を渡すのは、アーカイブが **ディレクトリ移動から
+        scope 単位の ``retract(reason="project_archived")`` へ変わった** ため
+        (c_16 §8)。渡さないと退役が一切走らず、アーカイブ済みプロジェクトの
+        ファクトが live のまま残る。
 
         Returns:
             アーカイブ対象となったプロジェクト ID のリスト (state フラグ更新済)。
@@ -1174,14 +1189,15 @@ class SleepTimeWorker:
         return archive_inactive_projects(
             config=self.config,
             store_invalidator=self._semantic_store_invalidator,
+            store_provider=self._semantic_store_provider,
         )
 
     async def _save_state_async(self) -> None:
         """:meth:`_save_state` をワーカースレッドで走らせる。
 
-        STM の JSON (実測 1.5MB、95% が埋め込み) と LTM ベクトルの書き出しは
-        同期 I/O で、Light はチャットのストリーミング中にも走る。イベントループ
-        上で書くとその間トークンが 1 つも流れない。``run_in_executor_with_context``
+        進捗ファイルと経験バッファの書き出しは同期 I/O で、Light はチャットの
+        ストリーミング中にも走る。イベントループ上で書くとその間トークンが
+        1 つも流れない。``run_in_executor_with_context``
         で trace_id を保ったままスレッドへ逃がす。専用の 1 スレッド executor
         なので保存同士は直列化され、順序が入れ替わらない。
         """
@@ -1189,19 +1205,13 @@ class SleepTimeWorker:
         await run_in_executor_with_context(loop, _SAVE_EXECUTOR, self._save_state)
 
     def _save_state(self) -> None:
-        """メモリ状態を永続化 (STM は前回保存以降に変更があるときだけ)"""
+        """メモリ状態を永続化 (ノート化の進捗 + 経験バッファ)。"""
         from backend.config import get_path_resolver
 
         try:
-            if getattr(self.short_term, "dirty", True):
-                resolver = get_path_resolver()
-                memory_dir = resolver.resolve_local("memory_dir")
-                self.short_term.save(memory_dir / "short_term_notes.json")
-                logger.info("State saved to disk")
-            else:
-                logger.debug("STM unchanged since last save, skipping")
+            self.episodic.save_progress()
         except Exception as e:
-            logger.warning("Failed to save state: %s", e)
+            logger.warning("Failed to save episodic progress: %s", e)
 
         # 経験バッファを永続化 (起動時ロードと同じ resolve_learning でパーティション先に揃える)
         if self.experience_buf is not None:
@@ -1212,13 +1222,5 @@ class SleepTimeWorker:
             except Exception as e:
                 logger.warning("Failed to save experience buffer: %s", e)
 
-        # LTM ベクトルインデックスを永続化 (absorb_from_short_term は in-memory
-        # 追加のみで save しないため、ここでまとめてディスクへ書き戻す)
-        if self.vector_store is not None and self.vector_store.count > 0:
-            try:
-                self.vector_store.save()
-                logger.info(
-                    "Vector store (LTM) saved: %d vectors", self.vector_store.count,
-                )
-            except Exception as e:
-                logger.warning("Vector store save on sleep failed: %s", e)
+        # エピソード記憶のベクトル索引は snapshot 生成時に書かれるので、
+        # ここで save するものは無い (c_16 §5.3)。

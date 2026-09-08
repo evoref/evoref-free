@@ -209,6 +209,7 @@ class EvorefConfig(BaseModel):
 
         - ``widget_proxy.enabled = True``  (Pro Widget Proxy / 汎用 Web API プロキシ)
         - ``pro.terminal.enabled = True``  (Pro Web ターミナル)
+        - ``pro.knowledge.enabled = True`` (Pro ``know.*`` 取得器)
         - ``learning.optimizer == "full-cma-es"`` (Pro CMA-ES オプティマイザ)
         - ``create.pipeline == "staged"`` (Pro staged クリエイトパイプライン)
         - 未定義トップレベルキー ``mode_models`` (Pro ローカルモデル切替)
@@ -239,6 +240,8 @@ class EvorefConfig(BaseModel):
                 "pro.url_recall.team_profile_ids",
                 bool(self.pro.url_recall.team_profile_ids),
             ),
+            # know.* 取得器は Pro 限定 (Free には origin=web の書き手が無い)。
+            ("pro.knowledge.enabled", bool(self.pro.knowledge.enabled)),
             # staged クリエイトパイプラインは Pro 限定 (_staged_create_enabled が
             # is_pro() でゲート)。Free で pipeline=staged を設定しても longform の
             # まま無効なので警告する。staged_enabled は intra-staged のキルスイッチ

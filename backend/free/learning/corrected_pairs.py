@@ -34,6 +34,7 @@ from backend.free.core.correction_target import (
     NUMBER_LITERAL_RE,
     QUOTED_RE,
     STOP_IDENTIFIERS,
+    wrong_side_tokens,
 )
 
 #: 訂正後の回答の先頭に付く謝罪・受諾の前置き。1 文単位で繰り返し剥がす。
@@ -176,14 +177,23 @@ def expected_keywords_from_correction(correction: str) -> list[str]:
     for neg in _NEGATED_VALUE_RE.finditer(text):
         pass
     quoted_scope = text[neg.end():] if neg else text
+    # 誤りの側の語 (「56,417 件という数字は間違いです」の 56417、「「会話の前半は
+    # 参照できない」という注記は間違いです」の引用) は期待語にしない。
+    # ``ではなく`` だけを境界にしていた頃はこれらが素通りし、eval_core に
+    # 「訂正された誤りを含むこと」が正解条件として載った (2026-09-07 ライブ
+    # 監査: 追加 5 件中 4 件)。判定は ``core.correction_target`` が SSOT。
+    wrong = {_normalize_for_match(t) for t in wrong_side_tokens(text)}
     out: list[str] = []
     seen: set[str] = set()
 
     def _add(tok: str) -> None:
         tok = tok.strip()
-        if tok and tok.lower() not in _STOP_IDENTIFIERS and tok not in seen:
-            seen.add(tok)
-            out.append(tok)
+        if not tok or tok.lower() in _STOP_IDENTIFIERS or tok in seen:
+            return
+        if _normalize_for_match(tok) in wrong:
+            return
+        seen.add(tok)
+        out.append(tok)
 
     for m in _QUOTED_RE.finditer(quoted_scope):
         _add(m.group(1))
@@ -242,13 +252,21 @@ def resolve_corrected_turn(
     再現するため。
     """
     exp = experiences[index]
-    target_id = (exp.get("signals") or {}).get("corrected_entry_id")
+    signals = exp.get("signals") or {}
+    target_id = signals.get("corrected_entry_id")
     if target_id:
         for cand in reversed(experiences[:index]):
             if cand.get("id") == target_id:
                 return cand
         # ID はあるが対象がバッファから溢れている = 学習に使える素材が無い。
         # 位置で代用すると誤ったペアになるので諦める。
+        return None
+    if "corrected_entry_id" in signals:
+        # 記録時に宛先を解決した世代のデータで、それでも None = 同一セッションに
+        # 候補が 1 つも無かった。位置で代用しない — 訂正が会話の最後に来ると
+        # 「そのセッションの最終ターン」が拾われ、「Q: サビで転調させたい… /
+        # A: E7」のような別の問いへの手本ができる (2026-09-07 ライブ監査:
+        # 組まれた 10 ペアのうち 7 件が Q/A 不一致で、内容ゲートは止められない)。
         return None
 
     session = str(exp.get("session_id") or "")

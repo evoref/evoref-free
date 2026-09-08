@@ -42,14 +42,20 @@ def cartridge_summary_dict(info: CartridgeInfo) -> dict[str, Any]:
 def cartridge_detail_dict(info: CartridgeInfo) -> dict[str, Any]:
     """カートリッジ詳細用の dict (`get_cartridge` 用)。
 
-    一覧用フィールドに author / tags / language / doc_count / priority /
-    installed_at / compatibility を加えた完全形。
+    一覧用フィールドに author / license / tags / language / doc_count /
+    installed_at / compatibility / active_version / content_digest /
+    embedding_model_id / embedding_dim を加えた完全形。
+
+    ``priority`` は無い — 順位式の ``store_prior`` へ置き換わり、PC 固有の
+    上書きは ``corpus/manifest.json`` が持つ (c_16 §4.3 / §8)。
     """
     return {
         "id": info.id,
         "name": info.name,
         "version": info.version,
+        "active_version": info.active_version,
         "author": info.author,
+        "license": info.license,
         "description": info.description,
         "tags": info.tags,
         "language": info.language,
@@ -57,9 +63,11 @@ def cartridge_detail_dict(info: CartridgeInfo) -> dict[str, Any]:
         "doc_count": info.doc_count,
         "size_mb": info.size_mb,
         "status": info.status,
-        "priority": info.priority,
         "installed_at": info.installed_at,
         "compatibility": info.compatibility,
+        "content_digest": info.content_digest,
+        "embedding_model_id": info.embedding_model_id,
+        "embedding_dim": info.embedding_dim,
     }
 
 
@@ -75,8 +83,11 @@ def cartridge_install_response(
         "id": info.id,
         "name": info.name,
         "version": info.version,
+        "active_version": info.active_version,
         "chunks": info.chunks,
         "status": info.status,
+        "content_digest": info.content_digest,
+        "embedding_model_id": info.embedding_model_id,
         "install_time_sec": round(install_time_sec, 3),
     }
 
@@ -93,9 +104,11 @@ def cartridge_rebuild_response(
     return {
         "id": info.id,
         "name": info.name,
+        "version": info.version,
         "chunks": info.chunks,
         "status": info.status,
         "size_mb": info.size_mb,
+        "embedding_model_id": info.embedding_model_id,
         "rebuild_time_sec": round(rebuild_time_sec, 3),
         "embedder_used": embedder_backend_name,
     }

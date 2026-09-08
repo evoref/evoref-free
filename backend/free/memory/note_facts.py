@@ -52,9 +52,39 @@ from backend.free.memory.types import (
 )
 
 if TYPE_CHECKING:
-    from backend.free.memory.stores.short_term import MemoryNote
+    from backend.free.memory.episodic.note import MemoryNote
 
-__all__ = ["fact_from_note", "privacy_of", "provenance_of"]
+__all__ = ["fact_from_note", "origin_of", "privacy_of", "provenance_of"]
+
+
+#: ``MemoryNote.source`` → ``Evidence.origin`` (c_16 §3)。``rag`` は
+#: 「取り込んだ文書由来」なので ``document``。
+_SOURCE_TO_ORIGIN: dict[str, str] = {
+    "user": "user",
+    "assistant": "assistant",
+    "system": "system",
+    "rag": "document",
+}
+
+
+def origin_of(note: "MemoryNote | None") -> str:
+    """ファクトの ``origin`` をノートから決める (c_16 §3 / §7.3)。
+
+    **誰が述べたか** をレコードに刻む。``origin=assistant`` は既定で注入しない
+    ので (``memory.evidence.ranking.allow_assistant_origin_injection``)、ここで
+    間違えるとアシスタント自身の出力が「過去の記録」として恒久再注入される
+    (2026-08-15 ライブ監査の症状)。
+
+    - ツール出力から導いた事実 (``is_tool_output`` / ``tool_command``) → ``tool``
+    - それ以外は ``source`` をそのまま写す
+    - ノート不明は ``user`` (由来が辿れないものを assistant 扱いすると、
+      既存の正当なファクトが読み出しから消える方へ倒れる)
+    """
+    if note is None:
+        return "user"
+    if getattr(note, "is_tool_output", False) or getattr(note, "tool_command", None):
+        return "tool"
+    return _SOURCE_TO_ORIGIN.get(str(getattr(note, "source", "user")), "user")
 
 
 def privacy_of(note: "MemoryNote | None") -> bool:
@@ -149,6 +179,8 @@ def fact_from_note(
         fact.trace_id = trace_id
     # **private はノートから継承する** — これが本モジュールの存在理由。
     fact.private = privacy_of(note)
+    # 誰が述べたか (c_16 §3)。注入可否と競合の勝ち方がここで決まる。
+    fact.origin = origin_of(note)  # type: ignore[assignment]
     for key, value in overrides.items():
         setattr(fact, key, value)
     return fact

@@ -4,8 +4,8 @@
 あちらは **ツール出力そのもの** から時間で変わる値を落とし、こちらは
 **それを言い直したアシスタント発話** を判定する。
 
-``stores/short_term.py`` から使うため独立させてある (``extractors`` パッケージは
-``stores.short_term`` を import するので循環する)。指標の集合は
+``episodic/ingest.py`` から使うため独立させてある (``extractors`` パッケージは
+``episodic.note`` を import するので循環する)。指標の集合は
 ``mdp_trace._VOLATILE_FIELD_SUBS`` と同じ 4 種類 (CPU 使用率 / GPU 使用率 /
 空きメモリ / 空きディスク) に閉じておくこと — 片方だけ増やさない。
 """

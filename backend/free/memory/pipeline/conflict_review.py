@@ -1,8 +1,9 @@
 """SemMem pending 競合の集約・提示・解決ヘルパ (EvorefMem 内部)
 
-``semantic_conflict_resolver.py`` (sleep-time Step 6B) が ``review_status=
-"pending"`` に振り分けた競合を、(a) チャットへ **情報として** 提示する形に
-整形し、(b) sleep-time / TTL 側から解決するための共通ロジックを提供する。
+``semantic_conflict_resolver.py`` (sleep-time Step 6B) が
+``veracity="disputed"`` + 相互 ``contradicts`` に振り分けた競合を、
+(a) チャットへ **情報として** 提示する形に整形し、(b) sleep-time / TTL 側から
+解決するための共通ロジックを提供する (c_16 §4.2)。
 
 提供する操作:
 
@@ -47,7 +48,7 @@ from backend.free.memory.pipeline.semantic_conflict_resolver import (
     distinct_conflict_objects,
     split_by_attribute_similarity,
 )
-from backend.free.memory.semantic.store import SemanticFactStore
+from backend.free.memory.protocols import SemanticFactStoreProtocol
 from backend.i18n_helper import prompt_locale
 from backend.utils import estimate_tokens
 from backend.free.memory.types import Provenance, SemanticFact, make_fact
@@ -56,11 +57,12 @@ from backend.log_config import get_logger
 logger = get_logger("memory.semantic.conflict_review")
 
 
-_RESOLVED_ACTION_TO_STATUS: dict[str, str] = {
-    "keep_old": "resolved_keep_old",
-    "keep_new": "resolved_keep_new",
-    "merge": "resolved_merged",
-}
+#: 受け付ける解決アクション。以前は ``review_status`` の値へ写していたが、
+#: 競合の状態は ``veracity`` / ``contradicts`` / ``superseded_by`` が持つように
+#: なったので (c_16 §4.2)、ここは **監査ログの reason** にだけ使う。
+_RESOLVED_ACTIONS: frozenset[str] = frozenset(
+    {"keep_old", "keep_new", "merge"},
+)
 
 
 class AlreadyResolvedError(ValueError):
@@ -107,12 +109,12 @@ class ResolutionResult:
 
 
 def collect_pending_groups(
-    store: SemanticFactStore, scope: str,
+    store: SemanticFactStoreProtocol, scope: str,
     similarity_threshold: float = DEFAULT_ATTRIBUTE_SIMILARITY_THRESHOLD,
     *,
     active_facts: "list[SemanticFact] | None" = None,
 ) -> list[PendingConflictGroup]:
-    """``review_status="pending"`` の active ファクトを (subject, predicate)
+    """``veracity="disputed"`` の active ファクトを (subject, predicate)
     でグルーピングして返す。
 
     グルーピングキーは producer ``SemanticConflictResolver._detect_groups``
@@ -135,7 +137,7 @@ def collect_pending_groups(
         store.all_facts(include_superseded=False)
         if active_facts is None else active_facts
     )
-    pending = [f for f in facts if f.review_status == "pending"]
+    pending = [f for f in facts if f.veracity == "disputed"]
     buckets: dict[tuple[str, str], list[SemanticFact]] = {}
     for f in pending:
         buckets.setdefault((f.subject, f.predicate), []).append(f)
@@ -174,7 +176,7 @@ def collect_pending_groups(
 
 
 def collect_review_groups(
-    store: SemanticFactStore, scope: str,
+    store: SemanticFactStoreProtocol, scope: str,
     similarity_threshold: float = DEFAULT_ATTRIBUTE_SIMILARITY_THRESHOLD,
 ) -> list[PendingConflictGroup]:
     """**表示用**の競合グループ。スロットの現在値まで含めて返す。
@@ -192,7 +194,7 @@ def collect_review_groups(
        実インシデント (2026-08-09): ``mem.personal.name`` の表示が
        ``旧「好きな季節は秋」(08-05) / 新「趣味は自転車と写真」(08-08 06:38)``
        となり、実際の最新値「趣味は登山と写真」(08-08 12:58、
-       ``review_status=none``) が含まれていなかった。競合は 08-08 07:48 に
+       ``veracity=stated``) が含まれていなかった。競合は 08-08 07:48 に
        検出され ``pinned_present`` で pending のまま滞留していたため、5 時間後に
        現れた正しい値は永久に合流できない。**この「新」ラベルはプロンプト中で
        最も強い現在値の信号**で、記憶注入 / few-shot / RAG をすべて正しくしても
@@ -283,7 +285,7 @@ def collect_review_groups(
 
 
 def append_resolution_log(
-    store: SemanticFactStore,
+    store: SemanticFactStoreProtocol,
     *,
     scope: str,
     winner: SemanticFact,
@@ -325,7 +327,7 @@ def append_resolution_log(
 
 
 def remove_pending_lines(
-    store: SemanticFactStore, *, fact_ids: set[str],
+    store: SemanticFactStoreProtocol, *, fact_ids: set[str],
 ) -> None:
     """``conflicts.jsonl`` から ``fact_ids`` を含むエントリを削除する。
 
@@ -360,7 +362,7 @@ def remove_pending_lines(
 
 
 def apply_resolution(
-    store: SemanticFactStore,
+    store: SemanticFactStoreProtocol,
     *,
     scope: str,
     action: str,
@@ -372,9 +374,9 @@ def apply_resolution(
 ) -> ResolutionResult:
     """pending 競合に keep_old / keep_new / merge を適用する。
 
-    supersede 反映 → ``review_status`` 更新 → ``conflicts.jsonl`` の
+    supersede 反映 → 勝者の ``disputed`` 解除 → ``conflicts.jsonl`` の
     pending 行掃除 → ``conflicts_resolved.jsonl`` への audit 追記までを
-    一体で実行する。
+    一体で実行する (c_16 §4.2)。
 
     Raises:
         ValueError: action 不正 / winner_id が loser_ids に含まれる /
@@ -382,7 +384,7 @@ def apply_resolution(
         KeyError: winner / loser ファクトが存在しない。
         AlreadyResolvedError: 対象ファクトが既に supersede 済み。
     """
-    if action not in _RESOLVED_ACTION_TO_STATUS:
+    if action not in _RESOLVED_ACTIONS:
         raise ValueError(f"unknown action: {action}")
 
     winner = store.get_fact(winner_id)
@@ -407,17 +409,10 @@ def apply_resolution(
 
     superseded_ids: list[str] = []
     new_fact_id: str | None = None
-    review_status = _RESOLVED_ACTION_TO_STATUS[action]
 
     if action == "merge":
         if not merged_object:
             raise ValueError("merged_object is required for action=merge")
-        # winner / losers の supersedes チェーンを集約しつつ新ファクトを作成
-        merged_supersedes: list[str] = []
-        for f in (winner, *losers):
-            for sid in f.supersedes:
-                if sid not in merged_supersedes:
-                    merged_supersedes.append(sid)
         # 由来と privacy は入力ファクトから引き継ぐ。以前はどちらも落として
         # おり、**private なファクトを含む merge が public なファクトを生む**
         # 経路になっていた (2026-09-01 監査、make_fact 直呼びの静的検査で発見)。
@@ -452,12 +447,7 @@ def apply_resolution(
                 superseded_ids.append(f.id)
             except (KeyError, ValueError) as exc:
                 logger.warning("merge supersede failed for %s: %s", f.id, exc)
-        store.update_fact(
-            new_fact_id,
-            requires_user_review=False,
-            review_status=review_status,
-            supersedes=list({*merged_supersedes, *(f.id for f in (winner, *losers))}),
-        )
+        store.clear_dispute(new_fact_id)
     else:
         # keep_old / keep_new: losers のみ supersede
         for loser in losers:
@@ -469,11 +459,7 @@ def apply_resolution(
                     "supersede failed for %s -> %s: %s",
                     loser.id, winner.id, exc,
                 )
-        store.update_fact(
-            winner.id,
-            requires_user_review=False,
-            review_status=review_status,
-        )
+        store.clear_dispute(winner.id)
 
     # pending エントリも掃除し、audit trail を残す
     remove_pending_lines(store, fact_ids={winner_id, *loser_ids})

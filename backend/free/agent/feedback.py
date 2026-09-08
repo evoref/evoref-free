@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import re
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -311,9 +311,34 @@ _REFORMAT_REQUEST_RE = re.compile(
 #: 37 個の税込合計を計算し直して」が ``(?:し|やり|作り)直して`` に掛かり、正答した
 #: 論理パズルのターンが失敗として Level 2 の学習データに入っていた
 #: (2026-09-05 ライブ監査 T14)。
+#:
+#: 前提の変更が **1 つ前の文** で述べられる形も同じ (「藤堂さんは水曜と金曜が
+#: 固定で不可、宇野さんは土曜のみ勤務可能という制約が加わりました。割当を
+#: 作り直してください。」2026-09-07 ライブ監査 T04/2。正答したシフト案が
+#: 訂正ペアの誤り側に載った)。
 _PREMISE_CHANGE_REDO_RE = re.compile(
     r"(?:なので|ので|から|場合は|場合で|として|に変えて|に変更して|にして)[、,\s]*"
+    r"[^。！？\n]{0,40}?(?:し|やり|作り|組み|計算し|書き)直して"
+    r"|(?:加わ|追加|変更|変わ|変え|増え|減っ|決まっ|判明し)[^。！？\n]{0,12}[。！？]\s*"
     r"[^。！？\n]{0,40}?(?:し|やり|作り|組み|計算し|書き)直して",
+)
+
+#: 「違う」が **複合動詞の一部** (取り違える / 食い違う / すれ違う / 勘違い /
+#: 行き違い / 入れ違い) の形。字句パターンの先頭 ``違[うわえおっく]`` が部分一致
+#: するが、誰かの出力が誤っているとは言っていない (2026-09-07 ライブ監査 T18/5
+#: 「ID トークンとアクセストークンを取り違える実装ミスをよく見ます」が訂正として
+#: 記録された)。アシスタントへの問い (「取り違えていませんか」) は除かない。
+_COMPOUND_DIFFERENCE_RE = re.compile(
+    r"(?:取り|食い|すれ|勘|行き|入れ)違[いえう](?!て(?:い)?(?:ます|ません|ないか))",
+)
+
+#: 「違う」を **伝聞・疑問** で使う形 (「挙動が違うと聞きました」「違うそうですね」
+#: 「どこが違うのでしょうか」)。比較質問と同じく訂正ではない
+#: (2026-09-07 ライブ監査 T12/1 「CPU とメモリで挙動が違うと聞きましたが」)。
+_HEARSAY_DIFFERENCE_RE = re.compile(
+    r"違(?:う|い(?:ます)?)"
+    r"(?:と(?:聞|きい|言われ|いわれ|いう|いい|のこと)|そう|らしい|のか|のでしょう|んでしょう"
+    r"|のです|んです|んですか|のですか)",
 )
 
 #: ユーザー自身の申告訂正。謝罪 / 自己の過去発言への言及 + 事実の言い換え。
@@ -348,7 +373,7 @@ _ASSISTANT_OUTPUT_REF_RE = re.compile(
     r"|(?:先ほど|さきほど|さっき|上|今)の"
     r"(?:回答|答え|説明|計算|コード|実装|出力|結果)"
     r"|(?:最後|最初)の.{0,6}(?:行|文|項目).{0,10}(?:なって|です)"
-    r"|取り違え|間違っていませんか"
+    r"|取り違えて(?:い)?(?:ます|ません|ないか)|間違っていませんか"
     r"|のはずです|ではありませんか|ませんでしたか"
     r"|(?:計算|回答|答え)しましたよね",
 )
@@ -380,6 +405,14 @@ def classify_correction_target(query: str) -> str:
     if _RECALL_QUESTION_RE.search(query):
         return "not_correction"
     if _ASKS_ABOUT_DIFFERENCE_RE.search(query):
+        return "not_correction"
+    # 正しい値を併せて述べていれば本物の訂正 (「違うのです。正しくは 10.95 度です」)。
+    if _HEARSAY_DIFFERENCE_RE.search(query) and not _ASSERTS_CORRECT_VALUE_RE.search(query):
+        return "not_correction"
+    # 複合動詞の「違」を除いた残りに訂正語彙が無ければ、字句一致は複合動詞
+    # だけだったということ。
+    stripped = _COMPOUND_DIFFERENCE_RE.sub("", query)
+    if stripped != query and not any(p.search(stripped) for p in CORRECTION_PATTERNS):
         return "not_correction"
     if _REFORMAT_REQUEST_RE.search(query):
         return "not_correction"
@@ -659,10 +692,19 @@ def is_short_negative_feedback(query: str) -> bool:
 #: 高々数本なので tool_ledger と同じ 16 で足りる。
 _SESSION_STATE_CAP = 16
 
-#: セッションごとに覚えておく直近ターン数 (訂正の宛先解決の探索窓)。
+#: 訂正の宛先解決で遡る同一セッションのターン数。
 #: ``core.correction_target.DEFAULT_LOOKBACK`` と揃える — 窓の方が狭いと
 #: 解決側が遡れる範囲を実質的にここが決めてしまい、両方を読まないと挙動が
 #: 分からなくなる。
+#:
+#: 候補は **経験バッファから** 引く (``_correction_candidates``)。以前は
+#: ``_SessionTurnState.recent_turns`` に持たせていたが、それは
+#: ``_SESSION_STATE_CAP`` (16) の LRU に乗るので、17 本目の会話が来た時点で
+#: 古い会話の窓が丸ごと消え、訂正の宛先が解決できなくなった
+#: (2026-09-07 ライブ監査: 20 会話を回した後の訂正 13 件のうち 7 件が候補ゼロ。
+#: しかも訂正を送る行為自体が LRU を押し出すので、追い出し順が実測と一致した)。
+#: バッファは全セッション横断で 1000 件持ち session_id を各エントリが持つので、
+#: LRU に依存せず同一セッションの直近ターンを引ける。
 _RECENT_TURN_WINDOW = CORRECTION_LOOKBACK
 
 
@@ -682,11 +724,6 @@ class _SessionTurnState:
     prev_turn_failed: bool = False
     pending_correction: dict | None = None
     prev_response: str = ""
-    #: このセッションの直近ターン ``(entry_id, response_text)`` を古い順に持つ。
-    #: 訂正が **どのターンを指すか** を証拠 (本文の重なり) で決めるのに要る。
-    #: ``prev_entry`` 1 件だけでは「直前ターンを訂正している」以外を表現できず、
-    #: 数ターン前への訂正が必ず取り違えられる (2026-09-06 監査 F-01)。
-    recent_turns: list[tuple[str, str]] = field(default_factory=list)
 
 
 #: 失敗理由の接頭辞 → (検証器 id, 台帳の種別)。理由文字列は
@@ -756,9 +793,6 @@ class FeedbackCollector:
         self._pending_correction: dict | None = None
         # 直前ターンのアシスタント応答 (保留判定の材料)。
         self._prev_response: str = ""
-        # このセッションの直近ターン ``(entry_id, response_text)`` (古い順)。
-        # 訂正が指すターンを本文の重なりで同定するのに使う。
-        self._recent_turns: list[tuple[str, str]] = []
         # 上記 ``_prev_*`` / ``_pending_correction`` は「いま record 中の
         # セッション」の作業コピー。record() の入口でセッションの状態を載せ、
         # 出口で書き戻す (``_load_session_state`` / ``_store_session_state``)。
@@ -820,10 +854,8 @@ class FeedbackCollector:
         response: str,
         mode: str = "chat",
         rag_used: bool = False,
-        rag_source: str | None = None,
         rag_top1_score: float | None = None,
         agent_loops: int = 0,
-        cartridge_ids: list[str] | None = None,
         base_model: str = "",
         embedding_model: str = "",
         long_form_used: bool = False,
@@ -884,7 +916,6 @@ class FeedbackCollector:
                 response_full=truncate_at_boundary(response, RESPONSE_FULL_CAP),
                 base_model=base_model or self._resolve_base_model_name(mode),
                 embedding_model=embedding_model or self._embedding_model_name,
-                cartridge_ids=cartridge_ids or [],
                 lang=lang,
                 gen_config=gen_config or GenerationConfigRef(),
                 signals=FeedbackSignals(),
@@ -924,7 +955,9 @@ class FeedbackCollector:
         # セッションと直近ターンの本文が揃わないため、後段に再導出させると
         # 位置頼みになり別会話のターンと組まれる (F-01 の再発防止)。
         corrected_entry_id = (
-            resolve_correction_target(correction_text, self._recent_turns)
+            resolve_correction_target(
+                correction_text, self._correction_candidates(session_id),
+            )
             if correction_text is not None else None
         ) or None
 
@@ -933,7 +966,6 @@ class FeedbackCollector:
             rephrased_query=rephrased,
             corrected_entry_id=corrected_entry_id,
             rag_used=rag_used,
-            rag_source=rag_source,
             rag_top1_score=rag_top1_score,
             agent_loops=agent_loops,
             user_correction=correction_text,
@@ -971,7 +1003,6 @@ class FeedbackCollector:
             response_full=truncate_at_boundary(response, RESPONSE_FULL_CAP),
             base_model=base_model or self._resolve_base_model_name(mode),
             embedding_model=embedding_model or self._embedding_model_name,
-            cartridge_ids=cartridge_ids or [],
             lang=lang,
             gen_config=gen_config or GenerationConfigRef(),
             signals=signals,
@@ -1035,14 +1066,6 @@ class FeedbackCollector:
         self._prev_query = query
         self._prev_response = response or ""
         self._prev_entry = entry
-        # 訂正の宛先解決に使う窓。応答本文は response_full (文境界で切った
-        # 全文) を優先する — 200 字の要約だと、後半でしか触れていない値を
-        # 引用した訂正が対象ターンに結び付かない。
-        self._recent_turns.append(
-            (entry.id, entry.response_full or entry.response_summary or ""),
-        )
-        if len(self._recent_turns) > _RECENT_TURN_WINDOW:
-            del self._recent_turns[:-_RECENT_TURN_WINDOW]
         self._prev_routed_tool = current_routed_tool
         self._prev_used_long_form = long_form_used
         self._prev_turn_failed = turn_outcome == "failed"
@@ -1094,7 +1117,6 @@ class FeedbackCollector:
         self._prev_turn_failed = False
         self._pending_correction = None
         self._prev_response = ""
-        self._recent_turns = []
         self._sessions.clear()
 
     # ── セッション別の直前ターン状態 ──
@@ -1113,7 +1135,6 @@ class FeedbackCollector:
         self._prev_turn_failed = state.prev_turn_failed
         self._pending_correction = state.pending_correction
         self._prev_response = state.prev_response
-        self._recent_turns = list(state.recent_turns)
 
     def _store_session_state(self, session_id: str) -> None:
         """作業コピーを ``session_id`` の枠へ書き戻す (LRU 上限 16)。"""
@@ -1125,11 +1146,40 @@ class FeedbackCollector:
             prev_turn_failed=self._prev_turn_failed,
             pending_correction=self._pending_correction,
             prev_response=self._prev_response,
-            recent_turns=list(self._recent_turns),
         )
         self._sessions.move_to_end(session_id)
         while len(self._sessions) > _SESSION_STATE_CAP:
             self._sessions.popitem(last=False)
+
+    def _correction_candidates(
+        self, session_id: str,
+    ) -> list[tuple[str, str, str]]:
+        """訂正の宛先候補 ``(entry_id, response_full, query)`` を古い順に返す。
+
+        経験バッファの **同一セッション** のエントリから直近
+        ``_RECENT_TURN_WINDOW`` 件。**ユーザーの訂正ターン自身は除く** —
+        入れると「先ほどの回答の家族構成が間違いです」が 1 つ前の訂正発話
+        「先ほどの 7 項目の列挙は間違いです」を宛先に選ぶ (2026-09-07 実測)。
+        応答本文は response_full (文境界で切った全文) を優先する — 200 字の
+        要約だと、後半でしか触れていない値を引用した訂正が結び付かない。
+        """
+        entries = getattr(self.buffer, "entries", None) or []
+        out: list[tuple[str, str, str]] = []
+        for e in reversed(entries):
+            if getattr(e, "session_id", "") != session_id:
+                continue
+            sig = getattr(e, "signals", None)
+            if sig is not None and getattr(sig, "user_correction", None) is not None:
+                continue
+            out.append((
+                e.id,
+                e.response_full or e.response_summary or "",
+                e.query or "",
+            ))
+            if len(out) >= _RECENT_TURN_WINDOW:
+                break
+        out.reverse()
+        return out
 
     @staticmethod
     def _derive_turn_outcome(

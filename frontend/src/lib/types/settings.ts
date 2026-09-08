@@ -62,7 +62,6 @@ export interface LocalPathsConfig {
 	lora_archive_dir: string;
 	embed_lora_adapter: string;
 	embed_lora_versions_dir: string;
-	vectors_dir: string;
 	knowledge_dir: string;
 	experience_file: string;
 	eval_core_file: string;
@@ -95,11 +94,6 @@ export interface RAGConfig {
 	semantic_min_chunk: number;
 	semantic_max_chunk: number;
 	top_k: number;
-	hybrid_search: boolean;
-	bm25_weight: number;
-	vector_weight: number;
-	fusion_method: 'rrf' | 'weighted';
-	rrf_k: number;
 	embedding_dim: number;
 	contextual_retrieval: boolean;
 	contextual_prefix_max_tokens: number;
@@ -112,7 +106,6 @@ export interface RAGConfig {
 	support_threshold: number;
 	confidence_threshold: number;
 	hysteresis_band: number;
-	score_normalization: string;
 	self_rag: {
 		quality_judge: {
 			enabled: boolean;
@@ -141,11 +134,6 @@ export interface MemoryConfig {
 	working_max_turns: number;
 	working_max_tokens: number;
 	short_term_max_notes: number;
-	lightmem_decay_days: number;
-	fade_alpha: number;
-	fade_beta: number;
-	fade_gamma: number;
-	fade_threshold: number;
 	conflict_similarity_threshold: number;
 	conflict_batch_size: number;
 	note_evolution_enabled: boolean;

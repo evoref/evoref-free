@@ -42,10 +42,12 @@ if TYPE_CHECKING:
     from backend.free.llm.aux_client import AuxClient
     from backend.free.llm.llm_client import LLMClient
     from backend.free.llm.local_client import LocalClient
-    from backend.free.memory.stores.long_term import LongTermMemory
+    from backend.free.memory.episodic.store import EpisodicStore
     from backend.free.memory.scheduler import SleepTimeScheduler
-    from backend.free.memory.semantic.store import SemanticFactStore
-    from backend.free.memory.stores.short_term import ShortTermMemory
+    from backend.free.memory.semantic.store import (
+        ScopedSemanticStore,
+        SemanticStore,
+    )
     from backend.free.memory.stores.working import (
         WorkingMemory,
         WorkingMemoryRegistry,
@@ -121,16 +123,23 @@ class AppState:
     working_memory: WorkingMemory | None = None
     # セッション別 WM の台帳 (``memory.working_max_sessions`` で LRU 上限)。
     working_memory_registry: WorkingMemoryRegistry | None = None
-    short_term_memory: ShortTermMemory | None = None
-    long_term_memory: LongTermMemory | None = None
-    # SemanticFactStore: scope ("global" or "project:<id>") -> store
-    _semantic_stores: dict[str, "SemanticFactStore"] = field(default_factory=dict)
+    # エピソード記憶 (会話由来ノート)。WM→STM→LTM の 3 ストアを畳んだ
+    # 1 本のストア (c_16 §4.1)。書き手は sleep-time だけ。
+    episodic_memory: "EpisodicStore | None" = None
+    # 構造化事実 (SemMem)。スコープはフィールドなのでストアは 1 本
+    # (c_16 §4.2)。書き手は sleep-time だけ (例外は artifact の即時書込)。
+    semantic_memory: "SemanticStore | None" = None
+    # scope ("global" / "project:<id>") -> スコープ束縛ビュー (軽量キャッシュ)
+    _semantic_stores: dict[str, "ScopedSemanticStore"] = field(default_factory=dict)
     # 現在のプロジェクト ID: startup 時に project_resolver で
     # 解決し、`@self` 仮想カートリッジや SemMem ルックアップから参照する。
     # chat モードや解決失敗時は None。
     current_project_id: str | None = None
 
     # ── RAG ──
+    # 会話由来ノートのベクトルは ``episodic_memory`` (``EvidenceStore``) が
+    # 自前で持つ (c_16 §6.1)。ここに残っているのは文書取り込み側の索引で、
+    # corpus ストアへ移るまでの間は ``None`` (縮退) になる。
     vector_store: VectorStore | None = None
     embedder: EmbeddingBackend | None = None
     cartridge_manager: CartridgeManager | None = None
@@ -262,8 +271,8 @@ class AppState:
 
     def get_memory_system(
         self, session_id: str | None = None,
-    ) -> tuple[WorkingMemory, ShortTermMemory, LongTermMemory] | None:
-        """メモリシステム 3 層を返す（未初期化時は None）
+    ) -> tuple[WorkingMemory, "EpisodicStore | None"] | None:
+        """``(ワーキングメモリ, エピソード記憶)`` を返す (未初期化時は None)。
 
         ``session_id`` を渡すとそのセッションの WM (無ければ作る) を返す。
         応答パスの読み書きはこちら。省略時は legacy 動作で、最後に触った
@@ -273,57 +282,42 @@ class AppState:
         registry = self.working_memory_registry
         if registry is not None:
             wm = registry.get(session_id) if session_id else registry.current()
-            return wm, self.short_term_memory, self.long_term_memory
+            return wm, self.episodic_memory
         if self.working_memory is None:
             return None
-        return self.working_memory, self.short_term_memory, self.long_term_memory
+        return self.working_memory, self.episodic_memory
 
-    def get_semantic_store(self, scope: str = "global") -> "SemanticFactStore":
-        """SemanticFactStore を scope ごとに lazy 取得する
+    def get_semantic_store(self, scope: str = "global") -> "ScopedSemanticStore":
+        """SemMem を scope に束縛したビューとして返す。
 
-        scope は ``"global"`` または ``"project:<id>"`` を受け付ける。
-        初回呼び出し時にディスク (`<memory_dir>/semantic/...`) からロードし、
-        以後同じインスタンスを返す。
+        scope は ``"global"`` または ``"project:<id>"``。**実体は 1 つの
+        :class:`~backend.free.memory.semantic.store.SemanticStore`** で
+        (c_16 §4.2)、ここが返すのは読み書きを ``scope`` で絞る薄いビュー。
+        ``[global_store, project_store]`` の 2 本を渡す呼出側がそのまま動き、
+        しかも同じレコードを 2 度数えない。
 
-        を読み込んで Store に注入し、``embeddings/<model_id>/vectors.npy``
-        の次元と ``manifest.embedding.dim`` の照合を有効化する。manifest
-        未作成 (=古い環境を事前初期化なしで読み込んだケース) では照合は
-        自動的にスキップされる。
+        Raises:
+            RuntimeError: メモリシステム未初期化 (``_init_memory`` 前)。
+            ValueError: scope の形式が不正。
         """
         cached = self._semantic_stores.get(scope)
         if cached is not None:
             return cached
-        from backend.config import get_path_resolver
-        from backend.free.memory.semantic.manifest import load_manifest
-        from backend.free.memory.semantic.store import SemanticFactStore
-
-        memory_dir = get_path_resolver().resolve_local("memory_dir")
-        semantic_root = memory_dir / "semantic"
-        manifest = load_manifest(memory_dir)
-        if scope == "global":
-            store = SemanticFactStore.for_global(semantic_root, manifest=manifest)
-        elif scope.startswith("project:"):
-            project_id = scope.split(":", 1)[1]
-            if not project_id:
-                raise ValueError(f"invalid scope: {scope}")
-            store = SemanticFactStore.for_project(
-                semantic_root, project_id, manifest=manifest,
+        store = self.semantic_memory
+        if store is None:
+            raise RuntimeError(
+                "semantic memory is not initialized (call _init_memory first)",
             )
-        else:
-            raise ValueError(
-                f"unknown scope: {scope!r} (expected 'global' or 'project:<id>')",
-            )
-        self._semantic_stores[scope] = store
-        return store
+        view = store.scoped(scope)
+        self._semantic_stores[scope] = view
+        return view
 
     def invalidate_semantic_stores(self) -> None:
-        """キャッシュ済み SemanticFactStore を全て破棄する.
+        """スコープ束縛ビューのキャッシュを捨てる。
 
-        embed モデルの cross-model 切替 (manifest の active model_id swap) 後に
-        呼び、次回 :meth:`get_semantic_store` で新 manifest からロードし直させる。
-        なお既に配線済みの Fact View (MemFactView / LearnFactView) は wire 時に
-        掴んだ旧 store 参照を保持するため、chat リコール等の live 反映には別途
-        backend 再起動が必要 (本メソッドはキャッシュ層のみ無効化する)。
+        ストア本体は 1 本なので、ここで捨てるのは ``scope`` ごとの薄い
+        ラッパだけ。アーカイブ等でスコープが消えた後に古いビューを掴んだ
+        ままにしないためのもの。
         """
         self._semantic_stores.clear()
 
