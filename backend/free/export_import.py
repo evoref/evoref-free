@@ -17,8 +17,11 @@ from backend.utils import utc_compact_stamp, utc_now_dt
 
 logger = get_logger("export_import")
 
-# Free 版で利用可能な 5 カテゴリ
-FREE_CATEGORIES = ["memory", "experience", "rag", "prompts", "cartridges"]
+# Free 版で利用可能な 4 カテゴリ。
+# ``cartridges`` は廃止 — corpus パッケージは ``local_paths.memory_dir`` 配下の
+# ``corpus/`` へ移り (c_16 §8)、``memory`` カテゴリがそのまま含む。別カテゴリの
+# まま残すと memory と二重にアーカイブされる。
+FREE_CATEGORIES = ["memory", "experience", "rag", "prompts"]
 
 # カテゴリ → ローカルパスキーのマッピング（全エディション共通）
 CATEGORY_PATHS: dict[str, list[str]] = {
@@ -26,12 +29,11 @@ CATEGORY_PATHS: dict[str, list[str]] = {
     "experience": [
         "experience_file", "eval_core_file",
     ],
-    "rag": ["vectors_dir", "knowledge_dir"],
+    "rag": ["knowledge_dir"],
     "prompts": ["prompts_dir"],
     "lora": [
         "lora_adapter", "lora_versions_dir",
     ],
-    "cartridges": ["cartridges_dir"],
     "history": ["history_dir"],
 }
 

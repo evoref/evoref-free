@@ -69,14 +69,14 @@ _ORDERED_PARAM_PAIRS: tuple[tuple[str, str, str], ...] = (
 
 #: 合計が 1 になるべきパラメータ群: ``(domain, (key, ...))``。
 #:
-#: 進化は 1 キーずつ独立に摂動するので、``bm25_weight`` だけ上がって
-#: ``vector_weight`` が据え置かれると RRF 融合の重みが 1 を超え、スコアの
-#: 尺度が tick ごとに変わる。fade_* も同様 (減衰式の係数和)。摂動後に群内で
-#: 正規化して不変則を守る (非負・合計 > 0 のときのみ)。
-_SUM_TO_ONE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("search", ("bm25_weight", "vector_weight")),
-    ("memory", ("fade_alpha", "fade_beta", "fade_gamma")),
-)
+#: 進化は 1 キーずつ独立に摂動するので、群の片方だけが上がると合計が 1 を
+#: 超え、スコアの尺度が tick ごとに変わる。摂動後に群内で正規化して不変則を
+#: 守る (非負・合計 > 0 のときのみ)。
+#:
+#: 現在は空。唯一の登録だった ``search`` の ``(bm25_weight, vector_weight)``
+#: は、順位式が 3 ストア共通の 1 本になり融合重みそのものが無くなったため
+#: 廃止した (c_16 §7.2 / §8)。仕組みは他の群が現れたときのために残す。
+_SUM_TO_ONE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 def _repair_ordered_pairs(domain: str, mode_params: dict) -> list[str]:
@@ -143,34 +143,21 @@ def _default_policies() -> dict[str, dict]:
             "version": 1,
             "domain": "memory",
             "params": {
+                # LightMem / FadeMem の係数 (``fade_*`` / ``decay_days`` /
+                # ``eviction_ratio``) は廃止。順位式は
+                # ``cos × freshness × confidence × store_prior`` の 1 本になり
+                # (c_16 §7.2)、eviction は tier 遷移と保持方針が担う (§5.4)。
+                # 進化させる意味のある knob だけを残す。
                 "chat": {
-                    "fade_alpha": 0.4,
-                    "fade_beta": 0.3,
-                    "fade_gamma": 0.3,
-                    "fade_threshold": 0.15,
-                    "decay_days": 7,
-                    "eviction_ratio": 0.2,
                     "conflict_similarity_threshold": 0.85,
                     "conflict_batch_size": 5,
                 },
                 "create": {
-                    "fade_alpha": 0.4,
-                    "fade_beta": 0.3,
-                    "fade_gamma": 0.3,
-                    "fade_threshold": 0.15,
-                    "decay_days": 7,
-                    "eviction_ratio": 0.2,
                     "conflict_similarity_threshold": 0.85,
                     "conflict_batch_size": 5,
                 },
             },
             "constraints": {
-                "fade_alpha": {"min": 0.0, "max": 1.0, "type": "float"},
-                "fade_beta": {"min": 0.0, "max": 1.0, "type": "float"},
-                "fade_gamma": {"min": 0.0, "max": 1.0, "type": "float"},
-                "fade_threshold": {"min": 0.0, "max": 1.0, "type": "float"},
-                "decay_days": {"min": 1, "max": 365, "type": "int"},
-                "eviction_ratio": {"min": 0.01, "max": 0.5, "type": "float"},
                 "conflict_similarity_threshold": {"min": 0.0, "max": 1.0, "type": "float"},
                 "conflict_batch_size": {"min": 1, "max": 50, "type": "int"},
             },
@@ -182,13 +169,9 @@ def _default_policies() -> dict[str, dict]:
                 "chat": {
                     "stm_top_k": 3,
                     "noise_sigma": 0.05,
-                    "bm25_weight": 0.3,
-                    "vector_weight": 0.7,
-                    "rrf_k": 60,
                     "top_k": 5,
                     "candidates_multiplier": 3,
                     "rescore_candidates": 50,
-                    "hybrid_search": True,
                     "salience_w_query_relevance": 0.35,
                     "salience_w_tfidf": 0.20,
                     "salience_w_entity_density": 0.15,
@@ -198,13 +181,9 @@ def _default_policies() -> dict[str, dict]:
                 "create": {
                     "stm_top_k": 5,
                     "noise_sigma": 0.03,
-                    "bm25_weight": 0.4,
-                    "vector_weight": 0.6,
-                    "rrf_k": 60,
                     "top_k": 5,
                     "candidates_multiplier": 3,
                     "rescore_candidates": 50,
-                    "hybrid_search": True,
                     "salience_w_query_relevance": 0.35,
                     "salience_w_tfidf": 0.20,
                     "salience_w_entity_density": 0.15,
@@ -215,16 +194,12 @@ def _default_policies() -> dict[str, dict]:
             "constraints": {
                 "stm_top_k": {"min": 1, "max": 20, "type": "int"},
                 "noise_sigma": {"min": 0.0, "max": 0.5, "type": "float"},
-                "bm25_weight": {"min": 0.0, "max": 1.0, "type": "float"},
-                "vector_weight": {"min": 0.0, "max": 1.0, "type": "float"},
-                "rrf_k": {"min": 1, "max": 200, "type": "int"},
                 # max=50 だと L1 進化が品質向上なしに取得件数だけ膨張させる
                 # (2026-07-15: top_k=13 まで学習しコンテキストを圧迫)。
                 # iGPU の prefill 速度とコンテキスト予算に対し 10 を上限とする。
                 "top_k": {"min": 1, "max": 10, "type": "int"},
                 "candidates_multiplier": {"min": 1, "max": 10, "type": "int"},
                 "rescore_candidates": {"min": 0, "max": 200, "type": "int"},
-                "hybrid_search": {"type": "bool"},
                 "salience_w_query_relevance": {"min": 0.0, "max": 1.0, "type": "float"},
                 "salience_w_tfidf": {"min": 0.0, "max": 1.0, "type": "float"},
                 "salience_w_entity_density": {"min": 0.0, "max": 1.0, "type": "float"},

@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from backend.free.core.session_mode import is_create_mode
-from backend.free.rag.bm25_retriever import tokenize_ja
+from backend.free.rag.evidence.tokenize import tokenize_ja
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:

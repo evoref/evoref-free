@@ -46,8 +46,14 @@ LEGACY_PROMPT_FILES: tuple[str, ...] = (
     "fewshot_pool.json",
 )
 
-# 新スキーマで作成する semantic サブディレクトリ (memory_dir/semantic/ 配下)
-SEMANTIC_SUBDIRS: tuple[str, ...] = ("global", "projects", "archive")
+# semantic/ 配下に作るサブディレクトリ。
+#
+# **スコープ別ディレクトリは無くなった** — scope は ``Evidence.scope`` の
+# フィールドで、ストアは 1 つ (c_16 §4.2)。``global`` / ``projects`` /
+# ``archive`` を作ると export に空ディレクトリが混ざるだけなので作らない。
+# ``events`` / ``snapshot`` / ``embeddings`` は ``EvidenceStore`` が要るときに
+# 自分で作る。
+SEMANTIC_SUBDIRS: tuple[str, ...] = ()
 
 
 @dataclass
@@ -180,7 +186,7 @@ def delete_legacy_memory(memory_dir: Path) -> list[Path]:
 
 
 def create_semantic_dirs(memory_dir: Path) -> list[Path]:
-    """semantic/{global,projects,archive}/ を作成する"""
+    """``semantic/`` を作成する (サブディレクトリは :data:`SEMANTIC_SUBDIRS`)。"""
     created: list[Path] = []
     root = _semantic_root(memory_dir)
     root.mkdir(parents=True, exist_ok=True)

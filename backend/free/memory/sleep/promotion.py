@@ -313,6 +313,12 @@ def promote_history_to_semmem(
             scope=scope_str,
             mode_origin=normalize_session_mode(entry.mode),
             confidence=0.5,
+            # セッション要約は **アシスタントが会話を要約したもの** で、
+            # ユーザーの言明ではない (c_16 §3)。``origin=assistant`` は既定で
+            # 注入しないので、自分の過去の回答が事実として並ぶ経路が
+            # subject の形 (``is_session_summary_subject``) だけでなく
+            # 出所でも塞がる。
+            origin="assistant",
         )
         fact.provenances = [
             Provenance(

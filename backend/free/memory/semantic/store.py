@@ -1,596 +1,439 @@
-"""
+"""`SemanticStore` — 構造化事実の唯一の永続層 (c_16 §4.2)。
 
-EvorefMem 統合仕様 における意味記憶 (SemMem) の永続化層を提供する
-1 ストアインスタンス = 1 スコープ (`global` または `project:<id>`) で物理分離する。
+``local/memory/semantic/`` に :class:`~backend.free.rag.evidence.EvidenceStore`
+を **1 つだけ** 持ち、旧 ``SemanticFactStore`` のスコープ別ディレクトリ
+(``global/`` / ``projects/<id>/``) を ``Evidence.scope`` フィールドへ畳む。
 
-ファイルレイアウト::
+```
+<memory_dir>/semantic/
+├── manifest.json                 EvidenceManifest (§5.1)
+├── events/<yyyy-mm>.jsonl        追記のみ (§5.2)
+├── snapshot/v<N>/                records / offsets / columns / lexical (§5.3)
+├── embeddings/<model_id>/        VectorStore (§6.1)
+├── sources.jsonl                 know.* の取得元 (ks_、§4.2)
+└── items.jsonl                   know.* の取得単位 (ki_、§4.2)
+```
 
-    <root>/
-    ├── facts.jsonl                         # 追記式の生ログ (last-write-wins on id)
-    ├── index.jsonl                         # fact_id 正規化形の統合索引 (subject/type/pillar/pinned)
-    └── embeddings/
-        └── <model_id>/
-            ├── vectors.npy                 # numpy 2D float32 (N, dim)
-            └── row_to_id.json              # JSON: {"row_to_id": [fact_id, ...]}
+シャードは **namespace** (``mem`` / ``know`` / ``idx`` / ``loop`` / ``learn``、
+c_16 §6.2)。競合の勝ち方・減衰・注入先も namespace で決まる
+(:mod:`~backend.free.memory.semantic.namespaces`)。
 
-設計方針:
-- `facts.jsonl` は追記式とし、同一 ID の複数行が存在し得る。読み込み時は
-  最後に書かれた行で上書きされる (last-write-wins)。
-- `index.jsonl` は :class:`backend.io.IncrementalIndexUpdater` 上に
-  ``{fact_id: {subject, type, pillar, pinned}}`` を持つ正規化形の統合索引。
-  add / update / delete のたびに差分 1 行を append し、閾値超過で tombstone を
-  畳んで compact する。旧 4 索引 (``facts_by_subject.idx`` /
-  ``facts_by_type.idx`` / ``facts_by_pillar.idx`` / ``pinned.idx``) を統合した形。
-  ``index.jsonl`` は起動時 :meth:`_reconcile_index` が facts.jsonl
-  (source of truth) と突合して自己修復する (未生成なら生成、欠落分は backfill)
-  ため、SCHEMA_VERSION の bump 無しに常に facts.jsonl と整合する。
-  ``IndexV1ToV2Migration`` (from=1/to=2) は将来の bump 用に休眠登録のまま。
-- supersession は `superseded_by` / `supersedes` フィールドで表現する。
-  検索系 API はデフォルトで `superseded_by` が立っているファクトを除外する。
-- 後方互換は提供しない
+## 誰が書くか
 
-## pillar 索引
+書き手は sleep-time (``SleepTimeWorker``) だけ (CLAUDE.md §6 #2)。例外は
+``artifact`` ファクト (ラルフループの即時書込) の 1 つで、
+:meth:`add_fact` がそのまま ``put`` 事象を追記する — snapshot は作らないので、
+次の sleep-time までは :meth:`get_fact` / :meth:`all_facts` からは見えるが
+ベクトル検索には出ない (c_16 §2.1 の「稼働中の索引は書き換えない」の帰結)。
 
-統合 ``index.jsonl`` の ``pillar`` 属性は 3 pillar namespace
-(`loop.*` / `learn.*` / `mem.*`) の subject 前方一致検索を高速化する。
+## 在メモリの写し
 
-索引キーは **pillar (3 値まで)** とし、必ず 3 バケット以内に収まる。
-prefix 検索はヒットした pillar バケットを走査し、``fact.subject.startswith``
-で最終フィルタする (pillar 内のファクト数は高々数千〜数万オーダーなので
-線形フィルタで十分)。索引キーの分類は :class:`SubjectKey` に一本化。
-
-API:
-- `add_fact` / `get_fact` / `update_fact`
-- `search_by_subject` / `search_by_type` / `search_by_pillar_prefix`
-- `search_by_embedding` (cosine similarity, top_k)
-- `supersede(old_id, new_id)`
-- `for_global(root)` / `for_project(root, project_id)` 補助コンストラクタ
+``all_facts`` / ``search_by_type`` / 競合検出 / GC は **全件を列挙する**
+消費者なので、事象と snapshot から畳んだ現在状態を
+:class:`SemanticFact` の dict として在メモリに持つ (旧ストアと同じ形)。
+ノート (数万件) と違ってファクトは数百〜数千件で、しかも消費者が
+「全部を見る」前提で書かれている。行を選んでから本文を読む episodic の
+やり方 (c_16 §5.3) はここでは費用が合わない。
 """
 
 from __future__ import annotations
 
-import json
-import time
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from backend.io import AtomicWriter, IncrementalIndexUpdater
-from backend.free.memory.semantic.embedding_store import (
-    EmbeddingStore,
-    register_new_model,
-    reset_model_store,
+from backend.free.memory.semantic.fact import (
+    FactRecordError,
+    evidence_to_fact,
+    fact_to_evidence,
 )
-from backend.free.memory.semantic.manifest import Manifest
-from backend.free.memory.semantic.subject_key import (
-    SubjectKey,
-    is_generic_subject,
+from backend.free.memory.semantic.namespaces import (
+    know_half_life_days,
+    namespace_of,
+    policy_for,
 )
-from backend.free.memory.types import (
-    FactType,
-    SemanticFact,
-    deserialize_fact_jsonl,
-    serialize_fact_jsonl,
+from backend.free.memory.semantic.subject_key import is_generic_subject
+from backend.free.memory.semantic.sources import (
+    ITEMS_FILENAME,
+    SOURCES_FILENAME,
+    ItemRegistry,
+    SourceRegistry,
 )
+from backend.free.memory.types import FactType, SemanticFact
+from backend.free.rag.evidence import (
+    Evidence,
+    EvidenceStore,
+    UsageBuffer,
+    list_versions,
+    read_snapshot,
+)
+from backend.free.rag.evidence.ranking import RankColumns, score_rows
+from backend.free.rag.vector_store import dequantize_int8
 from backend.log_config import get_logger
+from backend.utils import parse_utc, utc_now_dt
+
+if TYPE_CHECKING:
+    from backend.free.rag.embedding_backend import EmbeddingBackend
 
 logger = get_logger("memory.semantic.store")
 
+#: ``store_prior`` を ``semantic_know`` で引く namespace (c_16 §7.2)。
+KNOW_NAMESPACE = "know"
 
-# ──────────────────────────────────────────────────────────────────────────
-# ファイル名定数
-# ──────────────────────────────────────────────────────────────────────────
-
-FACTS_FILENAME = "facts.jsonl"
-SUBJECT_IDX_FILENAME = "facts_by_subject.idx"
-TYPE_IDX_FILENAME = "facts_by_type.idx"
-PILLAR_IDX_FILENAME = "facts_by_pillar.idx"
-PINNED_IDX_FILENAME = "pinned.idx"
-
-#: M5-c1: fact_id 正規化形の統合索引ファイル名。
-#: 1 行 = 1 fact 属性レコード ``{"fact_id":..., "subject":..., "type":...,
-#: "pillar":..., "pinned":...}``。dual write 期間中は旧 4 索引と並存し、
-#: M5-d の lazy migration 完了後は **唯一の永続索引** となる。
-INDEX_JSONL_FILENAME = "index.jsonl"
-
-PILLAR_SUBJECT_PREFIXES: tuple[str, ...] = ("loop.", "learn.", "mem.")
-"""3 pillar namespace の subject 前方一致索引対象 prefix
-
-`facts_by_pillar.idx` はこの 3 prefix を共通索引する。旧
-`HARNESS_SUBJECT_PREFIX = "harness."` は 全廃済み
-"""
+#: ``memory.evidence.ranking.store_prior`` が読めないときの既定 (c_16 §9)。
+DEFAULT_SEMANTIC_MEM_PRIOR = 1.0
+DEFAULT_SEMANTIC_KNOW_PRIOR = 0.9
 
 
-def _matches_pillar_prefix(subject: str) -> bool:
-    """``subject`` が 3 pillar namespace のいずれかに前方一致するか。"""
-    return any(subject.startswith(p) for p in PILLAR_SUBJECT_PREFIXES)
+def _resolve_store_priors(rag_config: Any) -> tuple[float, float]:
+    """``(semantic_mem, semantic_know)`` を設定から解決する。
 
-
-# ──────────────────────────────────────────────────────────────────────────
-# 統合索引 (index.jsonl) のシリアライザ / 属性抽出
-# ──────────────────────────────────────────────────────────────────────────
-
-
-def _fact_to_index_attrs(fact: SemanticFact) -> dict[str, Any]:
-    """SemanticFact から index.jsonl 用の属性 dict を抽出する。
-
-    pillar は ``SubjectKey.try_parse(subject).pillar`` で導出する (subject から
-    決定論的に決まるため厳密には保存不要だが、外部 inspect ツールでの再計算
-    コストを避けるため明示的に保存する)。
+    ``rag_config`` は ``merge_rag_evidence_config`` が ``rag`` に
+    ``memory.evidence.ranking`` を重ねた dict (または属性アクセスできる
+    オブジェクト)。読めなければ c_16 §9 の既定へ落ちる。
     """
-    key = SubjectKey.try_parse(fact.subject)
-    return {
-        "subject": fact.subject,
-        "type": str(fact.type),
-        "pillar": key.pillar if key is not None else None,
-        "pinned": bool(fact.pinned),
-    }
+    def _get(section: Any, key: str) -> Any:
+        if section is None:
+            return None
+        return (
+            section.get(key) if isinstance(section, dict)
+            else getattr(section, key, None)
+        )
+
+    priors = _get(_get(rag_config, "ranking"), "store_prior")
+    out: list[float] = []
+    for key, default in (
+        ("semantic_mem", DEFAULT_SEMANTIC_MEM_PRIOR),
+        ("semantic_know", DEFAULT_SEMANTIC_KNOW_PRIOR),
+    ):
+        value = _get(priors, key)
+        try:
+            out.append(float(value) if value is not None else default)
+        except (TypeError, ValueError):
+            out.append(default)
+    return out[0], out[1]
+
+#: ストアのディレクトリ名 (``local/memory/semantic``)。
+STORE_DIRNAME = "semantic"
+
+#: 事象ログの ``by`` (書き手コンポーネント)。
+WRITER = "sleep_time.semantic"
+
+#: 3 pillar namespace の subject 前方一致索引対象 prefix。
+PILLAR_SUBJECT_PREFIXES: tuple[str, ...] = ("loop.", "learn.", "mem.")
+
+#: ``know.*`` の失効判定に使う鮮度の下限 (c_16 §5.4)。
+KNOW_FRESHNESS_FLOOR = 0.05
+
+#: superseded / retracted を物理 GC してよくなるまでの版数 (c_16 §5.4)。
+SUPERSEDED_GC_SNAPSHOTS = 3
 
 
-def _serialize_index_entry(fact_id: str, attrs: dict[str, Any]) -> str:
-    """index.jsonl 用の 1 行 JSON 文字列を作る (改行を含めない)。"""
-    payload = {"fact_id": fact_id, **attrs}
-    return json.dumps(payload, ensure_ascii=False)
+def semantic_shard_key(record: Evidence) -> str:
+    """``Evidence`` → 転置索引のシャード名 = namespace (c_16 §6.2)。"""
+    structured = record.structured if isinstance(record.structured, dict) else {}
+    return namespace_of(str(structured.get("subject") or ""))
 
 
-def _deserialize_index_entry(line: str) -> tuple[str, dict[str, Any]]:
-    """index.jsonl の 1 行から ``(fact_id, attrs)`` を復元する。"""
-    obj = json.loads(line)
-    fact_id = obj["fact_id"]
-    attrs = {k: v for k, v in obj.items() if k != "fact_id"}
-    return fact_id, attrs
+class SemanticHit:
+    """検索 1 件 (ファクト / 素の cosine / 順位式スコア)。
+
+    ``cosine`` はゲート用 (c_16 §7.1 「ゲートは素の cosine のみ」)、``score``
+    は順位用 (``cos × freshness × confidence × store_prior``)。2 つを分けて
+    持つのは、閾値が cosine スケール前提で決まっているため。
+    """
+
+    __slots__ = ("cosine", "fact", "score")
+
+    def __init__(self, fact: SemanticFact, cosine: float, score: float) -> None:
+        self.fact = fact
+        self.cosine = float(cosine)
+        self.score = float(score)
+
+    @property
+    def id(self) -> str:
+        return self.fact.id
 
 
-class SemanticFactStore:
-    """1 スコープ (global または project:<id>) の SemanticFact を管理する永続ストア。
+class SemanticStore:
+    """構造化事実 (kind=``fact`` / ``claim``) のストア。
 
-    ルートディレクトリは呼び出し側で指定する。`for_global` / `for_project`
-    で標準レイアウト (`local/memory/semantic/{global,projects/<id>}/`) に
-    沿ったコンストラクタが利用できる。
+    Args:
+        memory_dir: ``local_paths.memory_dir``。実体は ``<memory_dir>/semantic``。
+        embedding_backend: 埋め込みバックエンド。``None`` なら snapshot 生成時に
+            ベクトル索引を作らない (語彙索引だけの縮退動作)。
+        rag_config: ``config.yaml`` の ``rag`` セクション (量子化 / memmap /
+            クラスタ索引 / ``lexical``)。
+        retention: ``memory.evidence.retention`` (c_16 §9)。manifest へ宣言する。
+        know_half_life: ``memory.evidence.know_half_life_days`` (c_16 §9)。
+        debug_logger: JSONL 観測用 (memory カテゴリ)。
     """
 
     def __init__(
-        self, root_dir: Path, *, manifest: Manifest | None = None,
+        self,
+        memory_dir: Path | str,
+        embedding_backend: "EmbeddingBackend | None" = None,
+        rag_config: Any = None,
+        *,
+        retention: dict[str, Any] | None = None,
+        know_half_life: dict[str, Any] | None = None,
+        debug_logger: Any = None,
     ) -> None:
-        """Store を初期化する.
+        self.store_dir = Path(memory_dir) / STORE_DIRNAME
+        self.evidence = EvidenceStore(
+            self.store_dir,
+            store_name="semantic",
+            embedding_backend=embedding_backend,
+            rag_config=rag_config,
+            by=WRITER,
+            shard_key_for=semantic_shard_key,
+            gc_filter=self._keep_in_snapshot,
+        )
+        self.sources = SourceRegistry(self.store_dir / SOURCES_FILENAME)
+        self.items = ItemRegistry(self.store_dir / ITEMS_FILENAME)
+        self._debug_logger = debug_logger
+        self._retention_override = dict(retention or {})
+        self._know_half_life = dict(know_half_life or {})
+        # 順位式の store_prior (c_16 §7.2)。namespace で mem / know を分ける
+        # ため、スカラではなく **行ごとの配列** を作って渡す (§7.2 の
+        # ``semantic_mem`` / ``semantic_know``)。
+        self._prior_mem, self._prior_know = _resolve_store_priors(rag_config)
+        #: ``(active_snapshot, len)`` → 行ごとの store_prior。
+        self._prior_cache_key: tuple[str, int] | None = None
+        self._prior_cache: np.ndarray | None = None
 
-        Args:
-            root_dir: スコープ別ルートディレクトリ
-                (``<semantic_root>/global`` or ``<semantic_root>/projects/<id>``)
-                場合は ``embeddings/<model_id>/vectors.npy`` の次元と
-                ``manifest.embedding.dim`` を照合し、不一致なら WARN ログを
-                出す
-                None の場合は照合をスキップ (テスト fixture 等での直接
-                instantiation 互換)。
-        """
-        self.root_dir = Path(root_dir)
-        self._manifest = manifest
+        #: 畳み込み済みの現在状態 (id → ファクト)。
         self._facts: dict[str, SemanticFact] = {}
         self._by_subject: dict[str, set[str]] = {}
         self._by_type: dict[str, set[str]] = {}
-        self._by_pillar: dict[str, set[str]] = {}
+        self._by_namespace: dict[str, set[str]] = {}
         self._pinned: set[str] = set()
-        #: ``_break_supersede_cycles`` が在メモリで live へ戻した fact id。
-        #: ``_load`` 完了後に :meth:`_persist_cycle_repairs` がディスクへ落とす。
-        self._pending_cycle_repairs: list[str] = []
         #: 書込のたびに +1 する世代番号。呼出側が派生物 (live リスト /
-        #: note_id の写像 / ベクトル行列) をキャッシュしてよいかの判定に使う。
-        #: ストアはプロセス常駐で、チャット 1 ターンあたり ``all_facts()`` が
-        #: scope ごとに 4〜6 回呼ばれる (注入 / 競合表示 / 競合検出 / retired
-        #: 判定)。sleep-time の書込で自然に無効化される。
+        #: ベクトル行列) をキャッシュしてよいかの判定に使う。
         self._revision: int = 0
-        # model_id 別ディレクトリで管理する。
-        self._embedding_store: EmbeddingStore = self._init_embedding_store()
-        # M5-c1: 統合索引 index.jsonl の dual write 用 updater。
-        # `_load()` 中の rebuild 時には dual write をスキップするため、
-        # 初期化フラグを False にしておく。`_load()` 完了後に True に切り替え、
-        # 以降の add/update/delete で旧 4 索引と並行して書き込まれる。
-        self._index_updater: IncrementalIndexUpdater[dict[str, Any]] = (
-            IncrementalIndexUpdater(
-                self.root_dir / INDEX_JSONL_FILENAME,
-                serialize_entry=_serialize_index_entry,
-                deserialize_entry=_deserialize_index_entry,
-                flush_interval_writes=50,
-            )
-        )
-        self._index_dual_write_enabled = False
-        self._load()
-        self._index_dual_write_enabled = True
-        # 起動時に在メモリで解いた閉路をディスクへも落とす。dual write が
-        # 有効になってから (= _load 完了後) でないと index.jsonl に載らない。
-        self._persist_cycle_repairs()
-        # index.jsonl を facts.jsonl (source of truth) と突合して自己修復する。
-        # 新規ストア (index.jsonl 未生成) や前回 shutdown での pending 喪失を、
-        # SCHEMA_VERSION の bump 無しに毎起動で埋める。
-        self._reconcile_index()
-        self._verify_embedding_dim_against_manifest()
+        #: cosine 行列のキャッシュ鍵 (active snapshot 版, 未畳み込み事象数)。
+        self._vector_cache_key: tuple[str, int] | None = None
+        self._vector_cache: dict[str, np.ndarray] | None = None
+        #: 物理 GC の対象 id (版の生成 1 回につき 1 度だけ計算する)。
+        self._gc_ids: set[str] | None = None
+        self._gc_ids_key: str | None = None
 
-    def _init_embedding_store(self) -> EmbeddingStore:
-        """アクティブ model_id を manifest から解決して EmbeddingStore を構築する.
+    # ── ライフサイクル ──────────────────────────────────────────────
 
-        優先順:
-        1. manifest.embedding.model_id が与えられていればそれを採用
-        2. 与えられていない場合は ``embeddings/`` 配下を走査して自動判定
-        3. どちらも解決できなければ ``DEFAULT_MODEL_ID`` (test fixture 用)
-        """
-        manifest_model_id: str | None = None
-        if self._manifest is not None:
-            manifest_model_id = self._manifest.embedding.model_id
-        return EmbeddingStore.active(
-            self.root_dir, manifest_model_id=manifest_model_id,
+    def load(self) -> None:
+        """manifest / snapshot / 事象 / sources / items を読む。"""
+        self.evidence.load()
+        if self._retention_override:
+            self.evidence.manifest.retention.update(self._retention_override)
+        self.sources.load()
+        self.items.load()
+        self._rebuild_from_evidence()
+        logger.info(
+            "Semantic store loaded: %d fact(s), snapshot=%s, %d event(s) pending",
+            len(self._facts),
+            self.evidence.manifest.active_snapshot or "(none)",
+            self.evidence.manifest.events_since_snapshot,
         )
 
-    # ── 補助コンストラクタ ────────────────────────────────────────────
+    def _rebuild_from_evidence(self) -> None:
+        """``EvidenceStore`` の現在状態から在メモリの写しを作り直す。
 
-    @classmethod
-    def for_global(
-        cls, semantic_root: Path, *, manifest: Manifest | None = None,
-    ) -> SemanticFactStore:
-        """`<semantic_root>/global/` を root とするストアを作る"""
-        return cls(Path(semantic_root) / "global", manifest=manifest)
-
-    @classmethod
-    def for_project(
-        cls,
-        semantic_root: Path,
-        project_id: str,
-        *,
-        manifest: Manifest | None = None,
-    ) -> SemanticFactStore:
-        """`<semantic_root>/projects/<project_id>/` を root とするストアを作る"""
-        if not project_id:
-            raise ValueError("project_id must be non-empty")
-        return cls(
-            Path(semantic_root) / "projects" / project_id, manifest=manifest,
-        )
-
-    # ── manifest 照合 ────────────────────────────────────────────────
-
-    def _verify_embedding_dim_against_manifest(self) -> None:
-        """``manifest.embedding.dim`` と実 EmbeddingStore の次元を照合する.
-
-        不一致時は WARN ログのみ。model_id
-        別ディレクトリに格納されているため、manifest で指定された
-        model_id の vectors.npy との次元整合を見る形に変わっている。
+        読めないレコード (``attrs.fact_type`` 欠損等) は **そのレコードだけ**
+        飛ばして件数を WARNING に出す (c_05 §0.5.2)。
         """
-        if self._manifest is None:
-            return
-        actual_dim = self._embedding_store.dim
-        if actual_dim is None:
-            return
-        expected_dim = self._manifest.embedding.dim
-        if expected_dim != actual_dim:
-            logger.warning(
-                "semantic embeddings dim mismatch at %s: manifest=%d (%s) "
-                "vs vectors.npy=%d. atomic swap will reconcile this.",
-                self.root_dir, expected_dim,
-                self._manifest.embedding.model_id, actual_dim,
-            )
-
-    # ── パス ──────────────────────────────────────────────────────────
-
-    def _facts_path(self) -> Path:
-        return self.root_dir / FACTS_FILENAME
-
-    # ── ロード ────────────────────────────────────────────────────────
-
-    def _load(self) -> None:
-        self.root_dir.mkdir(parents=True, exist_ok=True)
-        path = self._facts_path()
-        if path.exists():
-            with path.open("r", encoding="utf-8") as f:
-                for raw in f:
-                    line = raw.strip()
-                    if not line:
-                        continue
-                    try:
-                        fact = deserialize_fact_jsonl(line)
-                    except (ValueError, KeyError) as exc:
-                        logger.warning(
-                            "Skipping malformed fact line in %s: %s", path, exc,
-                        )
-                        continue
-                    # last-write-wins on id
-                    self._facts[fact.id] = fact
-        self._break_supersede_cycles()
-        self._hydrate_embeddings()
-        self._rebuild_indexes()
-
-    def _hydrate_embeddings(self) -> int:
-        """``fact.embedding`` を EmbeddingStore (vectors.npy) から埋める。
-
-        ベクトルの正は ``embeddings/<model_id>/vectors.npy``。``facts.jsonl``
-        へ JSON 配列として二重に書くのをやめた
-        (:func:`~backend.free.memory.types.serialize_fact_jsonl`) ため、
-        読み戻し側でここから戻す。消費側 (``MemoryInjector._is_relevant`` /
-        ``split_by_attribute_similarity``) は ``fact.embedding`` を見るので、
-        この 1 箇所で hydrate すれば上位は無改造で動く。
-
-        旧形式の行 (embedding 入り) を読んだ場合は既に値が入っているので
-        触らない — npy 側が正だが、両者は書き込み時点で同じ値になっている
-        (実測: only_inline=0 / only_npy=0 / value_diff=0)。
-
-        Returns:
-            埋め込みを復元したファクト数。
-        """
-        restored = 0
-        for fact in self._facts.values():
-            if fact.embedding is not None:
+        self._facts = {}
+        self._by_subject = {}
+        self._by_type = {}
+        self._by_namespace = {}
+        self._pinned = set()
+        skipped = 0
+        for record in self.evidence.iter_records():
+            if record.kind not in ("fact", "claim"):
                 continue
-            vec = self._embedding_store.get(fact.id)
-            if vec is not None:
-                fact.embedding = vec
-                restored += 1
-        if restored:
-            logger.debug(
-                "hydrated %d fact embedding(s) from %s at %s",
-                restored, self._embedding_store.model_id, self.root_dir,
+            if record.veracity == "retracted":
+                continue
+            try:
+                fact = evidence_to_fact(record)
+            except FactRecordError as e:
+                skipped += 1
+                logger.debug("skipping unreadable semantic record: %s", e)
+                continue
+            self._facts[fact.id] = fact
+            self._add_to_indexes(fact)
+        if skipped:
+            logger.warning(
+                "Semantic store: skipped %d unreadable record(s)", skipped,
             )
-        return restored
+        self._break_supersede_cycles()
+        self._invalidate_vectors()
+        self._invalidate_gc_cache()
 
     def _break_supersede_cycles(self) -> int:
-        """``superseded_by`` の閉路を解いて live を 1 件戻す (起動時の自己修復)。
+        """``superseded_by`` の閉路を解いて最新世代を live へ戻す。
 
-        :meth:`supersede` の閉路ガードは **これから作る** 閉路を防ぐだけで、
-        既に書かれたストアは直らない。閉路に入ったスロットは live が 0 件に
-        なり、想起が静かに 1 世代前の生テキストへ落ちる (:meth:`supersede` の
-        docstring の実データを参照)。
+        :meth:`supersede` が閉路を作らせないので、ここに来るのは事象ログが
+        壊れたときだけ。それでも見張るのは、閉路の壊れ方が **値が消えるのでは
+        なく「そのスロットの live が 0 件になる」** 形だからで、想起は静かに
+        1 世代前の生テキストへ落ちる (2026-08-30 監査で ``mem.personal.birthday``
+        の 4 件が 2-閉路を含む鎖で全滅した)。
 
-        解き方は「閉路の中で **最も新しい** ファクトを live に戻す」。訂正は
-        後から来るので、最新を現在値とみなすのが訂正の意味論と一致する。
-        戻すのは ``superseded_by`` のみで ``supersedes`` は触らない — 由来の
-        記録であって現在値の判定には使われない。
-
-        Returns:
-            live に戻したファクト数。
+        解き方は「閉路の中で ``created_at`` が最新のものの ``superseded_by`` を
+        外す」— 現在値として最も妥当な 1 件を live に戻す。修復は ``patch``
+        事象として書くので、次の版に畳まれて永続化される。
         """
-        repaired = 0
-        # ``superseded_by`` は 1 ノード 1 出辺の関数グラフなので、経路を辿って
-        # **その経路上に** 戻った地点から先が閉路そのもの。訪問済みを持ち回して
-        # 各ノードを 1 度だけ見る。
-        settled: set[str] = set()
-        for start in list(self._facts):
-            if start in settled:
+        nexts = {
+            f.id: f.superseded_by for f in self._facts.values() if f.superseded_by
+        }
+        # **閉路ごとに** 1 件ずつ live へ戻す。全部を 1 つの集合にまとめて
+        # ``max`` を取ると、独立した 2 つの閉路のうち片方しか直らない。
+        cycles: list[list[str]] = []
+        visited: set[str] = set()
+        for start in list(nexts):
+            if start in visited:
                 continue
-            path: list[str] = []
-            index: dict[str, int] = {}
+            seen: list[str] = []
             cur: str | None = start
-            while cur is not None and cur not in settled and cur not in index:
-                index[cur] = len(path)
-                path.append(cur)
-                node = self._facts.get(cur)
-                cur = node.superseded_by if node else None
-            settled.update(path)
-            if cur is None or cur not in index:
-                continue  # 閉路ではなく終端 / 既知の経路へ合流しただけ
-            ring = path[index[cur]:]
-            if len(ring) < 2:
-                continue  # 自己ループは supersede() が既に弾いている
-            newest = max(
-                ring,
-                key=lambda fid: float(
-                    getattr(self._facts[fid], "created_at", 0.0) or 0.0,
-                ),
-            )
-            # ロード中は在メモリだけ直し (``update_fact`` は追記を伴う)、
-            # ``__init__`` の :meth:`_persist_cycle_repairs` でディスクへ落とす。
-            self._facts[newest].superseded_by = None
-            self._pending_cycle_repairs.append(newest)
-            repaired += 1
-            logger.warning(
-                "Repaired supersede cycle %s: restored %s as the live value",
-                " -> ".join(ring), newest,
-            )
-        return repaired
-
-    def _persist_cycle_repairs(self) -> int:
-        """:meth:`_break_supersede_cycles` の修復をディスクへ書き戻す。
-
-        以前は「次にこのファクトが更新されたときにディスクへも落ちる」として
-        在メモリだけ直していたが、**訂正が終わった属性は普通もう更新されない**。
-        結果、毎起動で同じ WARNING が出続け、``facts.jsonl`` は壊れたまま残る。
-
-        実運用で効くのは、外部ツール (``evorefmem_cli inspect`` / ``verify``、
-        export したバックアップ) が見るのが **ディスク上の壊れた状態** だと
-        いう点。復旧手順を書く側と実行時の挙動が食い違う。
-
-        ``touch=False`` で ``accessed_at`` を汚さない — 自己修復はアクセス
-        ではない (``sleep.fact_embedding`` の遡及生成と同じ判断)。
-        """
-        if not self._pending_cycle_repairs:
+            while cur is not None and cur in nexts and cur not in seen:
+                seen.append(cur)
+                cur = nexts[cur]
+            visited.update(seen)
+            if cur is not None and cur in seen:
+                cycles.append(seen[seen.index(cur):])
+        if not cycles:
             return 0
         repaired = 0
-        for fact_id in self._pending_cycle_repairs:
-            try:
-                self.update_fact(fact_id, touch=False, superseded_by=None)
-                repaired += 1
-            except (KeyError, ValueError, OSError) as exc:
-                # 書き戻せなくても在メモリの修復は生きている (縮退)。
-                logger.warning(
-                    "Failed to persist supersede cycle repair for %s: %s",
-                    fact_id, exc,
-                )
-        self._pending_cycle_repairs.clear()
-        if repaired:
-            logger.info(
-                "Persisted %d supersede cycle repair(s) at %s",
-                repaired, self.root_dir,
+        for cycle in cycles:
+            members = [self._facts[fid] for fid in cycle if fid in self._facts]
+            if not members:
+                continue
+            newest = max(members, key=lambda f: (f.created_at, f.id))
+            self.update_fact(newest.id, touch=False, superseded_by=None)
+            repaired += 1
+            logger.warning(
+                "Semantic store: broke a supersede cycle of %d record(s); "
+                "restored %s (%s) as live",
+                len(cycle), newest.id, newest.subject,
             )
         return repaired
 
-    def _rebuild_indexes(self) -> None:
-        self._by_subject.clear()
-        self._by_type.clear()
-        self._by_pillar.clear()
-        self._pinned.clear()
-        for fact in self._facts.values():
-            self._add_to_indexes(fact)
+    def close(self) -> None:
+        """memmap を握った索引を手放す (Windows で削除できるように)。"""
+        self.evidence.close()
+
+    @property
+    def usage(self) -> UsageBuffer:
+        """チャット経路が「使った」id を溜めるバッファ (c_16 §2.1)。"""
+        return self.evidence.usage
+
+    @property
+    def revision(self) -> int:
+        """書込世代番号。add / update / supersede / retract のたびに増える。
+
+        値そのものに意味は無く、**変わったかどうか** だけを見る。
+        """
+        return self._revision
+
+    def __len__(self) -> int:
+        return len(self._facts)
+
+    # ── スコープ束縛 ────────────────────────────────────────────────
+
+    def scoped(self, scope: str = "global") -> "ScopedSemanticStore":
+        """1 スコープに束縛したビューを返す (``global`` / ``project:<id>``)。
+
+        スコープは **フィールド** であってディレクトリではない (c_16 §4.2)。
+        呼出側 (``AppState.get_semantic_store`` / sleep-time の
+        ``store_provider``) は従来どおり「1 スコープ 1 ストア」の面で使える。
+        """
+        if scope != "global" and not scope.startswith("project:"):
+            raise ValueError(
+                f"unknown scope: {scope!r} (expected 'global' or 'project:<id>')",
+            )
+        if scope.startswith("project:") and not scope.split(":", 1)[1]:
+            raise ValueError(f"invalid scope: {scope}")
+        return ScopedSemanticStore(self, scope)
+
+    # ── 索引 ────────────────────────────────────────────────────────
 
     def _add_to_indexes(self, fact: SemanticFact) -> None:
         self._by_subject.setdefault(fact.subject, set()).add(fact.id)
-        self._by_type.setdefault(fact.type, set()).add(fact.id)
-        # 索引キーは SubjectKey.pillar に一本化
-        # (subject 全文ではなく "loop" / "learn" / "mem" の 3 値まで)
-        key = SubjectKey.try_parse(fact.subject)
-        if key is not None:
-            self._by_pillar.setdefault(key.pillar, set()).add(fact.id)
+        self._by_type.setdefault(str(fact.type), set()).add(fact.id)
+        self._by_namespace.setdefault(namespace_of(fact.subject), set()).add(fact.id)
         if fact.pinned:
             self._pinned.add(fact.id)
-        # M5-c1: 統合索引 index.jsonl への dual write
-        # (起動時の rebuild 中は False で skip、起動完了後の add/update で True)
-        if self._index_dual_write_enabled:
-            self._index_updater.upsert(fact.id, _fact_to_index_attrs(fact))
 
     def _remove_from_indexes(self, fact: SemanticFact) -> None:
-        self._discard(self._by_subject, fact.subject, fact.id)
-        self._discard(self._by_type, fact.type, fact.id)
-        key = SubjectKey.try_parse(fact.subject)
-        if key is not None:
-            self._discard(self._by_pillar, key.pillar, fact.id)
+        _discard(self._by_subject, fact.subject, fact.id)
+        _discard(self._by_type, str(fact.type), fact.id)
+        _discard(self._by_namespace, namespace_of(fact.subject), fact.id)
         self._pinned.discard(fact.id)
-        # M5-c1: 統合索引 index.jsonl への dual write
-        if self._index_dual_write_enabled:
-            self._index_updater.remove(fact.id)
 
-    @staticmethod
-    def _discard(idx: dict[str, set[str]], key: str, fact_id: str) -> None:
-        bucket = idx.get(key)
-        if not bucket:
-            return
-        bucket.discard(fact_id)
-        if not bucket:
-            del idx[key]
+    def _invalidate_vectors(self) -> None:
+        self._vector_cache = None
+        self._vector_cache_key = None
 
-    # ── 永続化 ────────────────────────────────────────────────────────
-
-    def _append_fact_line(self, fact: SemanticFact) -> None:
-        line = serialize_fact_jsonl(fact)
-        with self._facts_path().open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-
-    def flush_index(self) -> None:
-        """``index.jsonl`` の pending dual-write を永続化する (lifespan shutdown 用)。
-
-        :class:`IncrementalIndexUpdater` は ``flush_interval_writes`` 未満の
-        pending op を in-memory buffer に保持するため、明示 flush しないと
-        プロセス終了で最大 ``flush_interval-1`` 件が失われる。次回起動の
-        :meth:`_reconcile_index` が facts.jsonl から復元するが、shutdown で
-        flush しておけば余分な再構築 I/O を避けられる。
-        """
-        self._index_updater.flush()
-
-    def _reconcile_index(self) -> None:
-        """``index.jsonl`` を facts.jsonl (source of truth) と突合して自己修復する。
-
-        起動時、index.jsonl の pending 喪失 / 未生成 (新規ストア) で facts.jsonl と
-        乖離している分を upsert / remove で埋め、差分があるときだけ flush する
-        (clean 起動では I/O ゼロ)。``_index_dual_write_enabled=True`` の状態で
-        呼ぶこと (upsert/remove が index.jsonl に反映される)。
-        """
-        indexed = self._index_updater.load()
-        changed = False
-        for fact_id, fact in self._facts.items():
-            attrs = _fact_to_index_attrs(fact)
-            if indexed.get(fact_id) != attrs:
-                self._index_updater.upsert(fact_id, attrs)
-                changed = True
-        for stale_id in indexed.keys() - self._facts.keys():
-            self._index_updater.remove(stale_id)
-            changed = True
-        if changed:
-            self._index_updater.flush()
-            logger.debug(
-                "index.jsonl reconciled against facts.jsonl at %s "
-                "(facts=%d)", self.root_dir, len(self._facts),
-            )
-
-    def _upsert_embedding(
-        self, fact_id: str, vec: np.ndarray, *, flush: bool = True,
-    ) -> None:
-        """EmbeddingStore に委譲する薄いラッパ (内部 API の見掛け互換用)."""
-        self._embedding_store.upsert(fact_id, vec, flush=flush)
-
-    def flush_embeddings(self) -> None:
-        """``defer_embedding_writes`` で溜めたベクトルを永続化する。"""
-        self._embedding_store.flush()
-
-    @property
-    def embedding_model_id(self) -> str:
-        """アクティブな埋め込みストアの model_id。"""
-        return self._embedding_store.model_id
-
-    @property
-    def embedding_dim(self) -> int | None:
-        """アクティブな埋め込みストアの次元 (空なら ``None``)。"""
-        return self._embedding_store.dim
-
-    def switch_embedding_model(self, new_model_id: str) -> None:
-        """アクティブな埋め込みストアを ``new_model_id`` の **空ストア** へ切り替える。
-
-        埋め込みモデルが別次元のものへ替わった後の遡及再埋め込み (Step 8.8)
-        が使う。旧 model_id のディレクトリは残す (retention GC の担当)。
-        在メモリの ``fact.embedding`` は触らないので、呼出側が
-        :meth:`update_fact` で順に書き直す。manifest の swap は呼出側の責務
-        (:func:`~backend.free.memory.semantic.embedding_store.swap_active_model_id`)。
-        """
-        if not new_model_id:
-            raise ValueError("new_model_id must be non-empty")
-        if new_model_id == self._embedding_store.model_id:
-            return
-        reset_model_store(self.root_dir, new_model_id)
-        self._embedding_store = register_new_model(self.root_dir, new_model_id)
-        logger.info(
-            "switched active embedding store at %s -> %s",
-            self.root_dir, new_model_id,
-        )
-
-    def embedding_scores(self, query: np.ndarray) -> dict[str, float]:
-        """クエリに対する全ファクトの cosine similarity を返す。
-
-        注入の関連度ゲート用。ゲートは順位ではなく閾値しか見ないので、
-        :meth:`search_by_embedding` のような並べ替えは要らない。行列は
-        ``EmbeddingStore`` に常駐しているため、候補ごとに正規化し直すより
-        桁で速い (:meth:`EmbeddingStore.score_all` の実測を参照)。
-
-        埋め込みを持たないファクトはキーに現れない (呼出側は従来どおり
-        「判定不能なので通す」の分岐へ落ちる)。
-        """
-        return self._embedding_store.score_all(query)
-
-    # ── CRUD ──────────────────────────────────────────────────────────
+    # ── 書き込み ────────────────────────────────────────────────────
 
     def add_fact(self, fact: SemanticFact) -> SemanticFact:
-        """新規ファクトを追加する。
+        """新規ファクトを ``put`` する。
 
-        - `id` が未設定なら新規発番する
-        - 既存 ID と衝突したら `ValueError`
-        - `created_at` / `accessed_at` が 0 なら現在時刻で埋める
-        - `embedding` が設定されていれば EmbeddingStore にも追記する
+        - ``id`` が未設定なら発番する (``ev_`` + hex12)
+        - 既存 ID と衝突したら ``ValueError``
+        - ``created_at`` / ``accessed_at`` が 0 なら現在時刻で埋める
+        - ``know.<domain>`` は namespace 既定の半減期を載せる (c_16 §4.2)
         """
         if not fact.id:
             fact.id = SemanticFact.new_id()
         if fact.id in self._facts:
             raise ValueError(f"fact id already exists: {fact.id}")
-        now = time.time()
+        now = utc_now_dt().timestamp()
         if fact.created_at == 0.0:
             fact.created_at = now
         if fact.accessed_at == 0.0:
             fact.accessed_at = fact.created_at
+        record = fact_to_evidence(
+            fact,
+            half_life_days=know_half_life_days(fact.subject, self._know_half_life),
+        )
+        self.evidence.put(record)
         self._facts[fact.id] = fact
         self._add_to_indexes(fact)
-        self._append_fact_line(fact)
         self._revision += 1
-        if fact.embedding is not None:
-            self._upsert_embedding(fact.id, fact.embedding)
+        self._invalidate_vectors()
         logger.debug(
             "add_fact: id=%s subject=%s type=%s scope=%s",
             fact.id, fact.subject, fact.type, fact.scope,
         )
         return fact
 
+    def add_fact_bulk(self, facts: Sequence[SemanticFact]) -> list[SemanticFact]:
+        """複数ファクトを ``put`` する (アトミックではない)。"""
+        return [self.add_fact(fact) for fact in facts]
+
+    def put_record(self, record: Evidence) -> SemanticFact:
+        """組み立て済みの ``Evidence`` をそのまま ``put`` する。
+
+        ``know.*`` の claim (:class:`~backend.free.memory.semantic.sources.KnowledgeIngest`)
+        のように、``SemanticFact`` では表せないコアフィールド (``valid_until`` /
+        ``origin=web``) を持つレコード用の入口。
+        """
+        self.evidence.put(record)
+        fact = evidence_to_fact(record)
+        self._facts[fact.id] = fact
+        self._add_to_indexes(fact)
+        self._revision += 1
+        self._invalidate_vectors()
+        return fact
+
+    @property
+    def know_half_life(self) -> dict[str, Any]:
+        """``memory.evidence.know_half_life_days`` の上書き表 (c_16 §9)。"""
+        return dict(self._know_half_life)
+
     def get_fact(self, fact_id: str) -> SemanticFact | None:
-        """ID でファクトを取得する。存在しなければ None"""
+        """ID でファクトを取得する。存在しなければ ``None``。"""
         return self._facts.get(fact_id)
 
     def update_fact(
@@ -598,25 +441,17 @@ class SemanticFactStore:
         fact_id: str,
         *,
         touch: bool = True,
-        flush_embedding: bool = True,
+        flush_embedding: bool = True,  # noqa: ARG002 — 呼出側互換 (版で一括保存)
         **changes: Any,
     ) -> SemanticFact:
-        """既存ファクトのフィールドを差分更新する。
-
-        指定可能なフィールドは `SemanticFact` の dataclass フィールドのみ。
-        `id` の変更は許可しない。インデックスに影響するフィールド
-        (`subject` / `type` / `pinned`) を変更した場合は索引を再構築する。
-        `embedding` を含めると EmbeddingStore にも反映する。
+        """既存ファクトのフィールドを差分更新する (``patch`` 事象)。
 
         Args:
             touch: ``accessed_at`` を現在時刻へ更新するか。既定 True。
                 埋め込みの遡及生成のような **保守処理はアクセスではない** ため、
-                False を渡して recency スコアと GC 判定を歪めないようにする。
-            flush_embedding: ``embedding`` を含む更新で ``vectors.npy`` を
-                即座に書き出すか。バッチで埋める呼出側 (Step 8.8 は 1 サイクル
-                最大 200 件) は ``False`` を渡し、末尾で
-                :meth:`flush_embeddings` を 1 回呼ぶ。1 件ごとに保存すると
-                **全配列を毎回ディスクへ書き出す**。
+                False を渡して保持順を歪めないようにする。
+            flush_embedding: 旧 API 互換のため受け取るだけ。ベクトルは snapshot
+                生成時に増分で作られる (c_16 §6.1)。
         """
         fact = self._facts.get(fact_id)
         if fact is None:
@@ -631,123 +466,73 @@ class SemanticFactStore:
         for key, val in changes.items():
             setattr(fact, key, val)
         if touch:
-            fact.accessed_at = time.time()
+            fact.accessed_at = utc_now_dt().timestamp()
         self._add_to_indexes(fact)
-        self._append_fact_line(fact)
+        # ``patch`` 事象は差分だけを書く。``subject`` / ``object`` /
+        # ``fact_type`` のようなコア側の変更はレコード全体を組み直す必要が
+        # あるので ``put`` で置き換える (同じ id への put は全置換)。
+        record = fact_to_evidence(
+            fact,
+            half_life_days=know_half_life_days(fact.subject, self._know_half_life),
+        )
+        self.evidence.put(record)
         self._revision += 1
-        if "embedding" in changes:
-            # embedding を明示的に None へクリアした場合は EmbeddingStore からも
-            # 除去する。さもないと vectors.npy に stale ベクトルが残り、
-            # search_by_embedding が更新後も古いベクトルでヒットし続ける。
-            if fact.embedding is not None:
-                self._upsert_embedding(
-                    fact.id, fact.embedding, flush=flush_embedding,
-                )
-            else:
-                self._remove_embedding(fact.id)
+        self._invalidate_vectors()
         logger.debug("update_fact: id=%s changes=%s", fact_id, sorted(changes.keys()))
         return fact
 
-    def delete_fact(self, fact_id: str) -> bool:
-        """ファクトを物理削除する
+    def retract_fact(self, fact_id: str, reason: str) -> bool:
+        """``veracity=retracted`` にする (物理削除はしない、c_16 §3)。
 
-        - in-memory 状態 / 索引 / pinned 集合 / 埋め込み行列から取り除く
-        - **消えたファクトを指す supersession 参照を解消する** (下記)
-        - ``facts.jsonl`` を残存ファクトのみで書き換える (rewrite)
-        - 索引 / 埋め込みファイルも持続化を更新する
-
-        削除したファクトを ``superseded_by`` に持つファクトは、そのままだと
-        **存在しない世代に置き換えられた** 状態で残る。読み出し系は既定で
-        supersede 済を除外するので、そのスロットは live 0 件になり、閉路のとき
-        と同じ「現在値が引けない」壊れ方をする。参照を外して live へ戻す。
-
-        複数件を消すときは :meth:`delete_facts` を使うこと (rewrite と
-        npy 書き出しが件数分走らない)。
-
-        Returns:
-            実際に削除された場合 ``True``、未存在の場合 ``False``。
+        取り下げたファクトは読み出し系から消えるが、事象ログと snapshot には
+        残るので監査で追える。物理削除は snapshot 3 版後の GC が担う
+        (:meth:`pending_physical_gc`)。
         """
-        return self.delete_facts([fact_id]) == 1
+        fact = self._facts.pop(fact_id, None)
+        if fact is None:
+            return False
+        self._remove_from_indexes(fact)
+        self.evidence.retract(fact_id, reason)
+        self._clear_dangling_supersession({fact_id})
+        self._revision += 1
+        self._invalidate_vectors()
+        return True
+
+    def delete_fact(self, fact_id: str) -> bool:
+        """ファクトを取り下げる (旧 API 名。実体は :meth:`retract_fact`)。"""
+        return self.retract_fact(fact_id, "deleted")
 
     def delete_facts(self, fact_ids: Iterable[str]) -> int:
-        """複数ファクトをまとめて物理削除する。
-
-        :meth:`delete_fact` を件数分回すと、1 件ごとに
-
-        - ``facts.jsonl`` 全行の rewrite (実測 58.8ms / 94 件・3.03MB のストア)
-        - ``vectors.npy`` の全書き出しと ``_id_to_row`` の全再構築
-        - dangling supersession 解決の全ファクト走査
-
-        が走る (M 件で O(N*M) + M 回の全書き出し)。Step 9 GC は候補を
-        1 件ずつ ``delete_fact`` していたため、100 件削除で約 6 秒・数百 MB の
-        書き込みになっていた。しかも ``_step9_run_semmem_gc`` は同期関数で
-        ``run_full`` から直接呼ばれる = **イベントループを占有する**。
-
-        ここでは 3 つの後始末をそれぞれ 1 回にまとめる。
+        """複数ファクトをまとめて取り下げる。
 
         Returns:
-            実際に削除された件数 (未存在の id は数えない)。
+            実際に取り下げた件数 (未存在の id は数えない)。
         """
-        removed: list[SemanticFact] = []
-        for fact_id in fact_ids:
-            fact = self._facts.pop(fact_id, None)
-            if fact is None:
-                continue
-            removed.append(fact)
-            self._remove_from_indexes(fact)
-        if not removed:
-            return 0
-        removed_ids = {f.id for f in removed}
-        self._embedding_store.delete_many(removed_ids)
-        self._clear_dangling_supersession(removed_ids)
-        self._rewrite_facts_log()
-        self._revision += 1
-        logger.debug(
-            "delete_facts: removed %d fact(s) (first=%s)",
-            len(removed), removed[0].id,
-        )
-        return len(removed)
+        return sum(1 for fid in fact_ids if self.retract_fact(fid, "deleted"))
 
     def _clear_dangling_supersession(self, removed_ids: set[str]) -> None:
-        """削除された ``removed_ids`` を指す supersession 参照を取り除く。
+        """取り下げた ``removed_ids`` を指す ``superseded_by`` を外す。
 
-        残ったファクトを 1 度だけ走査する (削除 1 件ごとに全走査しない)。
+        そのままだと **存在しない世代に置き換えられた** 状態で残り、読み出し系
+        は既定で supersede 済を除外するのでスロットの live が 0 件になる。値が
+        消えるのではなく「現在値が引けない」形で壊れる (2026-08-30 監査)。
         """
-        for other in self._facts.values():
+        for other in list(self._facts.values()):
             if other.superseded_by in removed_ids:
                 logger.info(
-                    "delete_facts: restored %s as live (its superseder %s was "
-                    "deleted)", other.id, other.superseded_by,
+                    "retract: restored %s as live (its superseder %s is gone)",
+                    other.id, other.superseded_by,
                 )
-                other.superseded_by = None
-            if any(s in removed_ids for s in other.supersedes):
-                other.supersedes = [
-                    s for s in other.supersedes if s not in removed_ids
-                ]
+                self.update_fact(other.id, touch=False, superseded_by=None)
 
-    def _remove_embedding(self, fact_id: str) -> None:
-        """EmbeddingStore からの削除に委譲する."""
-        self._embedding_store.delete(fact_id)
+    # ── supersession / 競合 ─────────────────────────────────────────
 
-    def _rewrite_facts_log(self) -> None:
-        """``facts.jsonl`` を現在の in-memory ファクトのみで書き直す。
-
-        delete_fact 後に追記式 jsonl から削除済みファクトの行が消えないと、
-        次回ロード時に last-write-wins で復活してしまうため、削除時には
-        全行を書き直す必要がある。書き込みは :class:`AtomicWriter` 経由
-        (Windows ``PermissionError`` retry 込み)。
-        """
-        path = self._facts_path()
-        with AtomicWriter(path) as f:
-            for fact in self._facts.values():
-                f.write(serialize_fact_jsonl(fact) + "\n")
-
-    def count_by_type(self, fact_type: FactType, *, include_superseded: bool = False) -> int:
-        """``type`` に該当するファクト数を返す"""
-        ids = self._by_type.get(fact_type, set())
-        if include_superseded:
-            return len(ids)
-        return sum(1 for fid in ids if not self._facts[fid].superseded_by)
+    def supersedes_of(self, fact_id: str) -> list[str]:
+        """``fact_id`` が置き換えたファクトの id (``superseded_by`` の逆写像)。"""
+        return sorted(
+            other.id for other in self._facts.values()
+            if other.superseded_by == fact_id
+        )
 
     def _supersede_chain_reaches(self, start_id: str, target_id: str) -> bool:
         """``start_id`` から ``superseded_by`` を辿って ``target_id`` に届くか。"""
@@ -762,24 +547,19 @@ class SemanticFactStore:
         return False
 
     def supersede(self, old_id: str, new_id: str) -> None:
-        """`old_id` を `new_id` で置き換える supersession チェーンを構築する。
-
-        `old.superseded_by = new_id` と `new.supersedes += [old_id]` を更新。
-        既に supersede 済の old を再 supersede しようとすると `ValueError`。
+        """``old_id`` を ``new_id`` で置き換える (敗者に ``superseded_by``)。
 
         **閉路は作らせない。** ``A -> B`` の後に ``B -> A`` を通すと両方の
-        ``superseded_by`` が埋まり、``live_facts`` / ``search_*`` が既定で
-        supersede 済を除外するため **そのスロットの live が 0 件になる**。
-        値が消えるのではなく「現在値が引けない」形で壊れるので、想起は静かに
-        1 世代前の生テキスト (LTM) へ落ちる。
+        ``superseded_by`` が埋まり、読み出し系が既定で supersede 済を除外する
+        ため **そのスロットの live が 0 件になる**。値が消えるのではなく
+        「現在値が引けない」形で壊れるので、想起は静かに 1 世代前の生テキスト
+        へ落ちる。
 
         実データ (2026-08-30 ライブ監査): ``mem.personal.birthday`` の 4 件が
-        ``sf_17c4c4ac9939 <-> sf_9f97d02bb6b0`` の 2-閉路を含む鎖で全滅し、
-        「私の誕生日はいつですか？」に **訂正前の 3月14日** が返った。訂正後の
-        値は SemMem に正しく入っていたのに 1 件も注入されていない。閉路は
-        バッチを跨いで作られるため、抽出側のバッチ内ガード
-        (``sleep.extraction`` の ``winners``) では防ぎ切れない。ここが
-        supersession の SSOT なので、不変則はここで守る。
+        2-閉路を含む鎖で全滅し、「私の誕生日はいつですか？」に **訂正前の
+        3月14日** が返った。閉路はバッチを跨いで作られるため、抽出側のバッチ内
+        ガードでは防ぎ切れない。ここが supersession の SSOT なので、不変則は
+        ここで守る。
         """
         old = self._facts.get(old_id)
         new = self._facts.get(new_id)
@@ -798,11 +578,19 @@ class SemanticFactStore:
                 f"superseding {old_id} by {new_id} would create a cycle "
                 f"({new_id} is already superseded by {old_id} transitively)",
             )
-        self.update_fact(old_id, superseded_by=new_id)
-        merged: list[str] = list(new.supersedes)
-        if old_id not in merged:
-            merged.append(old_id)
-        self.update_fact(new_id, supersedes=merged)
+        # 競合が解けたので ``disputed`` は畳む (c_16 §4.2)。
+        #
+        # 敗者は ``touch=True`` — ``accessed_at`` が「置き換えられた時刻」に
+        # なる。supersede 済みの保持期間 (``superseded_retention_days``) は
+        # この時刻から数えるので、ここを ``touch=False`` にすると発話時刻から
+        # 数えることになり、古い会話の訂正が即座に GC 対象になる。
+        self.update_fact(
+            old_id,
+            superseded_by=new_id,
+            veracity="retracted" if old.veracity == "disputed" else old.veracity,
+        )
+        if new.veracity == "disputed":
+            self.update_fact(new_id, touch=False, veracity="stated", contradicts=[])
         logger.info("supersede: %s -> %s", old_id, new_id)
         self._supersede_generic_shadows(old_id, new_id)
 
@@ -832,9 +620,7 @@ class SemanticFactStore:
         old = self._facts.get(old_id)
         if old is None:
             return 0
-        note_ids = {
-            p.note_id for p in (old.provenances or []) if p.note_id
-        }
+        note_ids = {p.note_id for p in (old.provenances or []) if p.note_id}
         if not note_ids:
             # セッション要約 (mem.decision.history.*) は note_id を持たない。
             # ここを通すと「note_id なし」同士が 1 つの主張として束ねられる。
@@ -865,57 +651,85 @@ class SemanticFactStore:
             )
         return done
 
-    # ── 検索 ──────────────────────────────────────────────────────────
+    def mark_disputed(self, fact_ids: Sequence[str]) -> int:
+        """グループを ``veracity=disputed`` + 相互 ``contradicts`` にする。
+
+        競合が未解決のあいだの状態 (c_16 §4.2)。``superseded_by`` はまだ立て
+        ない — 勝者が決まっていないので、どちらも live のまま残す。
+        """
+        live = [fid for fid in fact_ids if fid in self._facts]
+        if len(live) < 2:
+            return 0
+        for fact_id in live:
+            others = [fid for fid in live if fid != fact_id]
+            self.update_fact(
+                fact_id, touch=False, veracity="disputed", contradicts=others,
+            )
+        return len(live)
+
+    def clear_dispute(self, fact_id: str) -> None:
+        """``disputed`` を解いて ``stated`` に戻す (競合解決後)。"""
+        fact = self._facts.get(fact_id)
+        if fact is None or fact.veracity != "disputed":
+            return
+        self.update_fact(fact_id, touch=False, veracity="stated", contradicts=[])
+
+    def disputed_facts(self, scope: str | None = None) -> list[SemanticFact]:
+        """``veracity=disputed`` の live ファクト。"""
+        return [
+            f for f in self._facts.values()
+            if f.veracity == "disputed" and not f.superseded_by
+            and (scope is None or f.scope == scope)
+        ]
+
+    # ── 検索 ────────────────────────────────────────────────────────
 
     def search_by_subject(
         self,
         subject: str,
         *,
         include_superseded: bool = False,
+        scope: str | None = None,
     ) -> list[SemanticFact]:
-        """`subject` に完全一致するファクトを返す"""
-        return self._collect(self._by_subject.get(subject, set()), include_superseded)
+        """``subject`` に完全一致するファクトを返す。"""
+        return self._collect(
+            self._by_subject.get(subject, set()), include_superseded, scope,
+        )
 
     def search_by_type(
         self,
         fact_type: FactType,
         *,
         include_superseded: bool = False,
+        scope: str | None = None,
     ) -> list[SemanticFact]:
-        """`type` に完全一致するファクトを返す"""
-        return self._collect(self._by_type.get(fact_type, set()), include_superseded)
+        """``type`` に完全一致するファクトを返す。"""
+        return self._collect(
+            self._by_type.get(str(fact_type), set()), include_superseded, scope,
+        )
 
     def search_by_pillar_prefix(
         self,
         prefix: str,
         *,
         include_superseded: bool = False,
+        scope: str | None = None,
     ) -> list[SemanticFact]:
-        """3 pillar namespace (``loop.`` / ``learn.`` / ``mem.``) の subject
-        前方一致でファクトを返す
+        """3 pillar namespace の subject 前方一致でファクトを返す。
 
         ``prefix`` は ``loop.`` / ``learn.`` / ``mem.`` のいずれかで始まる
         完全な前方一致パターンを期待する (例: ``learn.policy.create.``)。
-        索引 ``facts_by_pillar.idx`` を参照して高速化する。
         """
-        if not _matches_pillar_prefix(prefix):
+        if not prefix.startswith(PILLAR_SUBJECT_PREFIXES):
             raise ValueError(
                 "pillar prefix must start with one of "
                 f"{PILLAR_SUBJECT_PREFIXES!r}, got {prefix!r}",
             )
-        # _by_pillar は pillar 名 ("loop"/"learn"/"mem")
-        # をキーとし、値はそのバケット内の全 fact_id。prefix から pillar を
-        # 取り出して該当バケットを走査し、subject.startswith で最終フィルタ。
-        pillar = prefix.split(".", 1)[0]
-        bucket = self._by_pillar.get(pillar)
-        if not bucket:
-            return []
-        ids: set[str] = set()
-        for fact_id in bucket:
-            fact = self._facts.get(fact_id)
-            if fact is not None and fact.subject.startswith(prefix):
-                ids.add(fact_id)
-        return self._collect(ids, include_superseded)
+        return self._collect(
+            self._ids_by_subject_prefix(prefix, include_superseded=include_superseded),
+            include_superseded,
+            scope,
+        )
 
     def _ids_by_subject_prefix(
         self,
@@ -923,19 +737,16 @@ class SemanticFactStore:
         *,
         include_superseded: bool,
     ) -> set[str]:
-        """``subject`` が ``prefix`` で始まる fact id 集合 (索引経由)。
+        """``subject`` が ``prefix`` で始まる fact id 集合 (namespace 索引経由)。
 
-        pillar namespace (``mem.`` 等) で始まる prefix は ``_by_pillar``
-        バケットだけを走査する。それ以外は全件走査。
+        候補を **cosine の前に** 絞るので、ストアが育っても走査は該当
+        namespace の大きさにしか比例しない (2026-09-02 監査 H3)。
         """
         prefixes = (prefix,) if isinstance(prefix, str) else tuple(prefix)
-        pillars = {pf.split(".", 1)[0] for pf in prefixes}
-        if all(_matches_pillar_prefix(pf) for pf in prefixes):
-            candidates: Iterable[str] = set().union(
-                *(self._by_pillar.get(pl, set()) for pl in pillars),
-            )
-        else:
-            candidates = self._facts.keys()
+        namespaces = {namespace_of(pf) for pf in prefixes}
+        candidates: set[str] = set()
+        for ns in namespaces:
+            candidates |= self._by_namespace.get(ns, set())
         out: set[str] = set()
         for fid in candidates:
             fact = self._facts.get(fid)
@@ -952,13 +763,560 @@ class SemanticFactStore:
         *,
         include_superseded: bool = False,
     ) -> int:
-        """``subject`` が ``prefix`` で始まるファクト数を返す。
-
-        索引リコール (URL / executable command) の呼出側が「候補プールが
-        小さいときの margin 判定」を **その索引の件数** で行うためのもの。
-        """
+        """``subject`` が ``prefix`` で始まるファクト数を返す。"""
         return len(
             self._ids_by_subject_prefix(prefix, include_superseded=include_superseded),
+        )
+
+    def count_by_type(
+        self, fact_type: FactType, *, include_superseded: bool = False,
+    ) -> int:
+        """``type`` に該当するファクト数を返す。"""
+        ids = self._by_type.get(str(fact_type), set())
+        if include_superseded:
+            return len(ids)
+        return sum(
+            1 for fid in ids
+            if (f := self._facts.get(fid)) is not None and not f.superseded_by
+        )
+
+    def all_facts(
+        self, *, include_superseded: bool = True, scope: str | None = None,
+    ) -> list[SemanticFact]:
+        """全ファクト (取り下げ済みは含まない)。"""
+        return [
+            f for f in self._facts.values()
+            if (include_superseded or not f.superseded_by)
+            and (scope is None or f.scope == scope)
+        ]
+
+    def pinned_facts(self, scope: str | None = None) -> list[SemanticFact]:
+        """pinned ファクトを返す。"""
+        return [
+            f for fid in self._pinned
+            if (f := self._facts.get(fid)) is not None
+            and (scope is None or f.scope == scope)
+        ]
+
+    def iter_facts(self) -> Iterator[SemanticFact]:
+        return iter(list(self._facts.values()))
+
+    def _collect(
+        self,
+        ids: Iterable[str],
+        include_superseded: bool,
+        scope: str | None = None,
+    ) -> list[SemanticFact]:
+        out: list[SemanticFact] = []
+        for fid in ids:
+            fact = self._facts.get(fid)
+            if fact is None:
+                continue
+            if not include_superseded and fact.superseded_by:
+                continue
+            if scope is not None and fact.scope != scope:
+                continue
+            out.append(fact)
+        return out
+
+    # ── ベクトル (c_16 §6.1) ────────────────────────────────────────
+
+    def vectors_for(self, fact_ids: Sequence[str]) -> dict[str, np.ndarray]:
+        """snapshot の埋め込みから float32 ベクトルを復元する。
+
+        まだ snapshot に載っていないファクトは返らない (呼出側が落とす) —
+        「版に載るまで密ベクトル検索の対象にならない」契約は episodic と同じ。
+        """
+        wanted = set(fact_ids)
+        if not wanted:
+            return {}
+        store = self.evidence.vector_store()
+        if store is None or store.vectors_q8 is None or store.scales is None:
+            return {}
+        rows: list[int] = []
+        ids: list[str] = []
+        for row, meta in enumerate(store.metadata):
+            record_id = str(meta.get("id") or "")
+            if record_id in wanted:
+                rows.append(row)
+                ids.append(record_id)
+        if not rows:
+            return {}
+        index = np.asarray(rows, dtype=np.int64)
+        restored = dequantize_int8(
+            np.asarray(store.vectors_q8)[index], np.asarray(store.scales)[index],
+        )
+        return {
+            record_id: np.asarray(restored[i], dtype=np.float32)
+            for i, record_id in enumerate(ids)
+        }
+
+    def hydrate_embeddings(self, facts: Sequence[SemanticFact]) -> int:
+        """``fact.embedding`` を snapshot のベクトルで埋める (作業用)。"""
+        vectors = self.vectors_for([f.id for f in facts])
+        filled = 0
+        for fact in facts:
+            vector = vectors.get(fact.id)
+            if vector is not None:
+                fact.embedding = vector
+                filled += 1
+        return filled
+
+    def embedding_scores(self, query: np.ndarray) -> dict[str, float]:
+        """クエリに対する全ファクトの **素の cosine** を返す。
+
+        注入の関連度ゲート用。ゲートは順位ではなく閾値しか見ないので並べ替え
+        は要らない。行列は snapshot の ``embeddings/`` に常駐しているため、
+        候補ごとに正規化し直すより桁で速い。
+
+        埋め込みを持たないファクトはキーに現れない (呼出側は従来どおり
+        「判定不能なので通す」の分岐へ落ちる)。
+        """
+        snapshot = self.evidence.snapshot
+        if snapshot is None or len(snapshot) == 0:
+            return {}
+        rows = np.arange(len(snapshot), dtype=np.int64)
+        cosines = self.evidence.cosines_for_rows(query, rows)
+        out: dict[str, float] = {}
+        for row in range(len(snapshot)):
+            value = cosines[row]
+            if not np.isfinite(value):
+                continue
+            record_id = snapshot.id_at(row)
+            if record_id in self._facts:
+                out[record_id] = float(value)
+        return out
+
+    def store_prior_per_row(self) -> np.ndarray:
+        """snapshot の行ごとの ``store_prior`` (c_16 §7.2)。
+
+        ``namespace_id`` (columns.npz) と ``columns.namespaces`` の対応表から
+        ``know`` の行だけ ``semantic_know`` に、それ以外を ``semantic_mem``
+        にする。namespace を持たない行 (``UNKNOWN_I16``) は ``semantic_mem``。
+
+        snapshot 版と行数が変わらない限り値は変わらないのでキャッシュする
+        (1 ターンに ``search`` と ``ranking_scores`` の両方から呼ばれる)。
+        """
+        snapshot = self.evidence.snapshot
+        if snapshot is None or len(snapshot) == 0:
+            return np.empty(0, dtype=np.float64)
+        key = (self.evidence.manifest.active_snapshot or "", len(snapshot))
+        if key == self._prior_cache_key and self._prior_cache is not None:
+            return self._prior_cache
+        columns = snapshot.columns
+        table = np.array(
+            [
+                self._prior_know if str(ns) == KNOW_NAMESPACE else self._prior_mem
+                for ns in columns.namespaces
+            ],
+            dtype=np.float64,
+        )
+        ns_id = np.asarray(columns.namespace_id, dtype=np.int64)
+        known = (ns_id >= 0) & (ns_id < table.shape[0])
+        prior = np.full(ns_id.shape[0], self._prior_mem, dtype=np.float64)
+        if table.shape[0] and np.any(known):
+            prior[known] = table[ns_id[known]]
+        self._prior_cache_key = key
+        self._prior_cache = prior
+        return prior
+
+    def ranking_scores(self, query: np.ndarray) -> dict[str, float]:
+        """全ファクトの **順位式スコア** を返す (c_16 §7.2)。
+
+        ``score = cos × freshness × confidence × store_prior``。
+        :meth:`embedding_scores` (素の cosine、ゲート用) と対になる出力で、
+        ``MemoryInjector`` が ``[関連する記憶]`` の Tier 内の並びに使う。
+        ゲートと順位で **同じ値を使わない** のが c_16 §7.1 の要点なので、
+        2 つを別メソッドに分けている。
+
+        埋め込みを持たないファクトはキーに現れない。
+        """
+        snapshot = self.evidence.snapshot
+        if snapshot is None or len(snapshot) == 0:
+            return {}
+        rows = np.arange(len(snapshot), dtype=np.int64)
+        cosines = self.evidence.cosines_for_rows(query, rows)
+        finite = np.isfinite(cosines)
+        if not np.any(finite):
+            return {}
+        columns = RankColumns.from_columns(snapshot.columns)
+        now_epoch = utc_now_dt().timestamp()
+        target = rows[finite]
+        scores = score_rows(
+            np.nan_to_num(cosines[finite]), target, columns, now_epoch,
+            self.store_prior_per_row(),
+        )
+        out: dict[str, float] = {}
+        for i, row in enumerate(target):
+            record_id = snapshot.id_at(int(row))
+            if record_id in self._facts:
+                out[record_id] = float(scores[i])
+        return out
+
+    def search_by_embedding(
+        self,
+        query: np.ndarray,
+        top_k: int = 10,
+        *,
+        include_superseded: bool = False,
+        subject_prefix: str | tuple[str, ...] | None = None,
+        scope: str | None = None,
+    ) -> list[tuple[SemanticFact, float]]:
+        """埋め込みベクトルで cosine similarity 検索する。
+
+        Args:
+            subject_prefix: 与えると ``subject`` がこの接頭辞で始まるファクト
+                だけを候補にして順位付けする。索引リコール (``idx.url.`` /
+                ``idx.command.``) は必ずこれを渡すこと — グローバル top-k を
+                引いてから接頭辞で絞ると、ストアが育った時点で索引行が top-k に
+                入らなくなる (2026-09-02 監査 H3)。
+
+        Returns:
+            ``(fact, cosine)`` のリスト (cosine 降順、最大 ``top_k`` 件)。
+        """
+        if top_k <= 0:
+            return []
+        if subject_prefix is not None:
+            ids = self._ids_by_subject_prefix(
+                subject_prefix, include_superseded=include_superseded,
+            )
+        else:
+            ids = {
+                fid for fid, fact in self._facts.items()
+                if include_superseded or not fact.superseded_by
+            }
+        if scope is not None:
+            ids = {
+                fid for fid in ids
+                if (f := self._facts.get(fid)) is not None and f.scope == scope
+            }
+        if not ids:
+            return []
+        scores = self._cosines_for_ids(query, ids)
+        ranked = sorted(scores.items(), key=lambda kv: -kv[1])[:top_k]
+        return [
+            (fact, score) for fid, score in ranked
+            if (fact := self._facts.get(fid)) is not None
+        ]
+
+    def _cosines_for_ids(
+        self, query: np.ndarray, ids: set[str],
+    ) -> dict[str, float]:
+        """``ids`` に限った素の cosine (snapshot 行から引く)。"""
+        snapshot = self.evidence.snapshot
+        if snapshot is None:
+            return {}
+        rows: list[int] = []
+        row_ids: list[str] = []
+        for fact_id in ids:
+            row = snapshot.row_of(fact_id)
+            if row is None:
+                continue
+            rows.append(row)
+            row_ids.append(fact_id)
+        if not rows:
+            return {}
+        cosines = self.evidence.cosines_for_rows(query, np.asarray(rows, dtype=np.int64))
+        return {
+            row_ids[i]: float(cosines[i])
+            for i in range(len(row_ids))
+            if np.isfinite(cosines[i])
+        }
+
+    def search(
+        self,
+        query_text: str,
+        query_vec: np.ndarray,
+        top_k: int = 10,
+        *,
+        threshold: float = 0.0,
+        namespaces: Iterable[str] | None = None,
+        scope: str | None = None,
+        include_private: bool = False,
+        now: float | None = None,
+        store_prior: float | np.ndarray | None = None,
+    ) -> list[SemanticHit]:
+        """候補生成 → ゲート → 順位 → 畳み込みの 1 本 (c_16 §6.3 / §7.1〜7.3)。
+
+        ゲートは素の cosine (``threshold``)、順位は
+        ``cos × freshness × confidence × store_prior``。``namespaces`` は
+        転置索引のシャード名そのもの (``mem`` / ``know`` / ``idx`` …) で、
+        ``idx.*`` を注入に出さない側の門はここではなく
+        :mod:`~backend.free.memory.semantic.namespaces` の ``injectable``。
+
+        ``store_prior`` を省略すると **行ごとの値** を使う
+        (:meth:`store_prior_per_row`): ``mem.*`` は
+        ``memory.evidence.ranking.store_prior.semantic_mem``、``know.*`` は
+        ``semantic_know``。1 つのストアに 2 つの規則が同居するので、
+        c_16 §7.2 の係数はスカラでは表せない。
+        """
+        if top_k <= 0:
+            return []
+        prior: float | np.ndarray = (
+            self.store_prior_per_row() if store_prior is None else store_prior
+        )
+        raw = self.evidence.search(
+            query_text, query_vec, top_k,
+            threshold=threshold,
+            now=now,
+            include_private=include_private,
+            shards=namespaces,
+            store_prior=prior,
+        )
+        snapshot = self.evidence.snapshot
+        if snapshot is None:
+            return []
+        hits: list[SemanticHit] = []
+        for row, cosine, score in raw:
+            fact = self._facts.get(snapshot.id_at(row))
+            if fact is None or fact.superseded_by:
+                continue
+            if scope is not None and fact.scope != scope:
+                continue
+            hits.append(SemanticHit(fact, cosine, score))
+        return hits
+
+    # ── 保持方針 (c_16 §5.4) ────────────────────────────────────────
+
+    def enforce_retention(self, *, now: float | None = None) -> dict[str, int]:
+        """``know.*`` の失効と ``idx.*`` の件数上限を適用する。
+
+        - ``know.*``: ``valid_until`` 到来、または
+          ``0.5 ** (age / half_life) < 0.05`` で ``retract("expired")``
+        - ``idx.*``: ``idx_max_records`` を超えたぶんを ``last_used_at`` の
+          古い順に ``retract("retention:idx_max_records")``
+        - ``mem.*``: 上限なし (superseded は snapshot 3 版後に物理 GC)
+
+        Returns:
+            ``{"know_expired", "idx_evicted"}``。
+        """
+        reference = utc_now_dt().timestamp() if now is None else float(now)
+        result = {"know_expired": 0, "idx_evicted": 0}
+
+        for fact in list(self._facts.values()):
+            if namespace_of(fact.subject) != "know":
+                continue
+            if self._is_expired(fact, reference):
+                if self.retract_fact(fact.id, "expired"):
+                    result["know_expired"] += 1
+
+        limit = int(self.evidence.manifest.retention_value("idx_max_records") or 0)
+        if limit > 0:
+            idx_facts = [
+                f for f in self._facts.values()
+                if namespace_of(f.subject) == "idx" and not f.pinned
+            ]
+            overflow = len(idx_facts) - limit
+            if overflow > 0:
+                idx_facts.sort(key=lambda f: (f.accessed_at or f.created_at, f.id))
+                for fact in idx_facts[:overflow]:
+                    if self.retract_fact(fact.id, "retention:idx_max_records"):
+                        result["idx_evicted"] += 1
+
+        if result["know_expired"] or result["idx_evicted"]:
+            logger.info(
+                "Semantic retention: %d know fact(s) expired, %d idx fact(s) evicted",
+                result["know_expired"], result["idx_evicted"],
+            )
+        return result
+
+    def _is_expired(self, fact: SemanticFact, now: float) -> bool:
+        """``know.*`` の失効判定 (c_16 §5.4)。"""
+        record = self.evidence.get(fact.id)
+        if record is None:
+            return False
+        valid_until = parse_utc(record.valid_until) if record.valid_until else None
+        if valid_until is not None and valid_until.timestamp() <= now:
+            return True
+        half_life = record.half_life_days
+        if half_life is None or half_life <= 0:
+            return False
+        age_days = max(0.0, (now - fact.created_at) / 86400.0)
+        freshness = 0.5 ** (age_days / float(half_life))
+        return freshness < KNOW_FRESHNESS_FLOOR
+
+    def pending_physical_gc(self) -> list[str]:
+        """物理 GC の対象になっている (superseded / retracted で 3 版経過) id。
+
+        c_16 §5.4 は「superseded は snapshot 3 版後に物理 GC」と定める。
+        判定に別の状態ファイルは要らない — 保持している版は
+        ``retention.snapshots_keep`` (既定 3) 本なので、**いちばん古い保持版で
+        既に死んでいたレコード** がちょうど「3 版経過した死者」になる。
+
+        これは **公開の問い合わせ** (「今この瞬間、何件が対象か」)。実際に
+        落とすのは :meth:`_keep_in_snapshot` — :meth:`create_snapshot` が
+        ``EvidenceStore`` の ``gc_filter`` として渡すので、ここが返した id は
+        次の版の ``records.jsonl`` に書かれず、ディスクから消える。
+
+        pinned は落とさない (他の GC 経路と同じ扱い。
+        :mod:`~backend.free.memory.semantic.gc`)。
+        """
+        versions = list_versions(self.store_dir)
+        keep = int(
+            self.evidence.manifest.retention_value("snapshots_keep")
+            or SUPERSEDED_GC_SNAPSHOTS,
+        )
+        if len(versions) < keep:
+            return []
+        try:
+            oldest = read_snapshot(self.store_dir, versions[0])
+        except (OSError, ValueError) as e:
+            logger.debug("pending_physical_gc: cannot read %s: %s", versions[0], e)
+            return []
+        out: list[str] = []
+        for record in oldest.iter_records():
+            if record.kind not in ("fact", "claim"):
+                continue
+            if record.veracity != "retracted" and not record.superseded_by:
+                continue
+            current = self.evidence.get(record.id)
+            if current is None or current.pinned:
+                continue
+            if current.veracity == "retracted" or current.superseded_by:
+                out.append(record.id)
+        return out
+
+    def _physical_gc_ids(self) -> set[str]:
+        """物理 GC の対象 id (版の生成 1 回につき 1 度だけ計算する)。
+
+        ``gc_filter`` はレコードごとに呼ばれるので、そのたびに最古版を読み直す
+        と 1 版の生成で N 回 ``records.jsonl`` をなめることになる。鍵は active
+        版名 — 版が切り替わるまで対象集合は動かない (書き手は sleep-time だけ)。
+        """
+        key = self.evidence.manifest.active_snapshot
+        if self._gc_ids is None or self._gc_ids_key != key:
+            self._gc_ids = set(self.pending_physical_gc())
+            self._gc_ids_key = key
+        return self._gc_ids
+
+    def _keep_in_snapshot(self, record: Evidence) -> bool:
+        """``EvidenceStore`` の ``gc_filter``。``False`` で新しい版から落とす。"""
+        return record.id not in self._physical_gc_ids()
+
+    def _invalidate_gc_cache(self) -> None:
+        """物理 GC 対象のキャッシュを落とす。"""
+        self._gc_ids = None
+        self._gc_ids_key = None
+
+    # ── snapshot ────────────────────────────────────────────────────
+
+    def flush_touch(self) -> int:
+        """:attr:`usage` を 1 つの ``touch`` 事象へ畳む (c_16 §2.1)。"""
+        return self.evidence.flush_touch()
+
+    async def create_snapshot(self) -> str | None:
+        """未畳み込みの事象があるときだけ版を作る。
+
+        畳み込みの結果には :meth:`_keep_in_snapshot` が掛かるので、この版で
+        「3 版経過した死者」(:meth:`pending_physical_gc`) は物理的に消える。
+
+        Returns:
+            新しい版名。事象が無ければ ``None`` (無駄な版を積まない)。
+        """
+        if self.evidence.manifest.events_since_snapshot <= 0:
+            logger.debug("Semantic: no events since the last snapshot, skipping")
+            return None
+        # 対象集合は畳み込みの直前に取り直す (前の版で数えたものを持ち越さない)。
+        self._invalidate_gc_cache()
+        version = await self.evidence.create_snapshot()
+        # 版から行が消えたぶんを在メモリの写し / 索引へ反映する。
+        self._rebuild_from_evidence()
+        return version
+
+    def save_manifest(self) -> None:
+        """manifest を書き出す (``events_since_snapshot`` の永続化)。"""
+        self.evidence.save_manifest()
+
+
+class ScopedSemanticStore:
+    """1 スコープに束縛した :class:`SemanticStore` のビュー。
+
+    旧 ``SemanticFactStore`` (1 インスタンス = 1 スコープ) の面をそのまま保つ
+    ためのもので、実体は共有の 1 ストア (c_16 §4.2)。読み出しは
+    ``scope`` で絞り、書き込みは ``fact.scope`` を束縛値へ揃える。
+
+    ``[global_store, project_store]`` の 2 本を渡す既存の呼出側 (Fact View /
+    sleep-time) がそのまま動き、しかも同じレコードを 2 度数えない。
+    """
+
+    __slots__ = ("scope", "store")
+
+    def __init__(self, store: SemanticStore, scope: str) -> None:
+        self.store = store
+        self.scope = scope
+
+    # ── 観測 ──
+
+    @property
+    def revision(self) -> int:
+        return self.store.revision
+
+    @property
+    def root_dir(self) -> Path:
+        """スコープ別ファイル (競合ログ等) の置き場。"""
+        if self.scope == "global":
+            return self.store.store_dir / "global"
+        return self.store.store_dir / "projects" / self.scope.split(":", 1)[1]
+
+    def __len__(self) -> int:
+        return len(self.store.all_facts(scope=self.scope))
+
+    # ── CRUD ──
+
+    def add_fact(self, fact: SemanticFact) -> SemanticFact:
+        fact.scope = self.scope
+        return self.store.add_fact(fact)
+
+    def get_fact(self, fact_id: str) -> SemanticFact | None:
+        # id 引きはスコープで絞らない — supersede / 競合解決は global と
+        # project にまたがった id を辿る。
+        return self.store.get_fact(fact_id)
+
+    def update_fact(self, fact_id: str, **changes: Any) -> SemanticFact:
+        return self.store.update_fact(fact_id, **changes)
+
+    def delete_fact(self, fact_id: str) -> bool:
+        return self.store.delete_fact(fact_id)
+
+    def delete_facts(self, fact_ids: Iterable[str]) -> int:
+        return self.store.delete_facts(fact_ids)
+
+    def supersede(self, old_id: str, new_id: str) -> None:
+        self.store.supersede(old_id, new_id)
+
+    def mark_disputed(self, fact_ids: Sequence[str]) -> int:
+        return self.store.mark_disputed(fact_ids)
+
+    def clear_dispute(self, fact_id: str) -> None:
+        self.store.clear_dispute(fact_id)
+
+    def disputed_facts(self) -> list[SemanticFact]:
+        return self.store.disputed_facts(scope=self.scope)
+
+    def supersedes_of(self, fact_id: str) -> list[str]:
+        return self.store.supersedes_of(fact_id)
+
+    # ── 検索 ──
+
+    def search_by_subject(
+        self, subject: str, *, include_superseded: bool = False,
+    ) -> list[SemanticFact]:
+        return self.store.search_by_subject(
+            subject, include_superseded=include_superseded, scope=self.scope,
+        )
+
+    def search_by_type(
+        self, fact_type: FactType, *, include_superseded: bool = False,
+    ) -> list[SemanticFact]:
+        return self.store.search_by_type(
+            fact_type, include_superseded=include_superseded, scope=self.scope,
+        )
+
+    def search_by_pillar_prefix(
+        self, prefix: str, *, include_superseded: bool = False,
+    ) -> list[SemanticFact]:
+        return self.store.search_by_pillar_prefix(
+            prefix, include_superseded=include_superseded, scope=self.scope,
         )
 
     def search_by_embedding(
@@ -969,100 +1327,81 @@ class SemanticFactStore:
         include_superseded: bool = False,
         subject_prefix: str | tuple[str, ...] | None = None,
     ) -> list[tuple[SemanticFact, float]]:
-        """埋め込みベクトルで cosine similarity 検索する。
+        return self.store.search_by_embedding(
+            query, top_k=top_k, include_superseded=include_superseded,
+            subject_prefix=subject_prefix, scope=self.scope,
+        )
 
-        Args:
-            subject_prefix: 与えると ``subject`` がこの接頭辞で始まる
-                ファクトだけを候補にして順位付けする。索引リコール
-                (``mem.world.url.`` / ``mem.world.executable_command.``) は
-                以前グローバル top-k を引いてから接頭辞で絞っていたため、
-                ストアが育つと索引行が top-k に入らなくなっていた
-                (2026-09-02 監査 H3)。候補を **cosine の前に** 絞るので、
-                件数が増えてもコストは索引の大きさにしか比例しない。
-
-        Returns:
-            (fact, score) のリスト。score は cosine similarity (-1.0〜1.0)。
-        """
-        store_count = self._embedding_store.count
-        if store_count == 0:
-            return []
-        if subject_prefix is not None:
-            ids = self._ids_by_subject_prefix(
-                subject_prefix, include_superseded=include_superseded,
-            )
-            if not ids:
-                return []
-            raw = self._embedding_store.search(query, top_k=top_k, fact_ids=ids)
-            return [
-                (fact, score) for fid, score in raw
-                if (fact := self._facts.get(fid)) is not None
-            ]
-        # EmbeddingStore は fact filter を知らないため、superseded 除外 /
-        # 存在チェックで落ちる分だけ多めに引く。以前は無条件に **全件**
-        # (``top_k=store_count``) を要求しており、``search`` が常に全件
-        # ``argsort`` を払っていた。落ちうる件数は数えられるので、その分だけ
-        # 上乗せすれば足りる (足りなければ全件へフォールバック)。
-        skippable = 0
-        if not include_superseded:
-            skippable = sum(
-                1 for fid in self._embedding_store.row_to_id
-                if (f := self._facts.get(fid)) is None or f.superseded_by
-            )
-        else:
-            skippable = sum(
-                1 for fid in self._embedding_store.row_to_id
-                if fid not in self._facts
-            )
-        fetch_k = min(store_count, max(1, top_k) + skippable)
-        raw = self._embedding_store.search(query, top_k=fetch_k)
-        results: list[tuple[SemanticFact, float]] = []
-        for fid, score in raw:
-            fact = self._facts.get(fid)
-            if fact is None:
-                continue
-            if not include_superseded and fact.superseded_by:
-                continue
-            results.append((fact, score))
-            if len(results) >= top_k:
-                break
-        return results
-
-    # ── 内部ヘルパ ────────────────────────────────────────────────────
-
-    def _collect(
+    def search(
         self,
-        ids: Iterable[str],
-        include_superseded: bool,
-    ) -> list[SemanticFact]:
-        out: list[SemanticFact] = []
-        for fid in ids:
-            fact = self._facts.get(fid)
-            if fact is None:
-                continue
-            if not include_superseded and fact.superseded_by:
-                continue
-            out.append(fact)
-        return out
+        query_text: str,
+        query_vec: np.ndarray,
+        top_k: int = 10,
+        **kwargs: Any,
+    ) -> list[SemanticHit]:
+        return self.store.search(
+            query_text, query_vec, top_k, scope=self.scope, **kwargs,
+        )
 
-    # ── 観測ヘルパ (テスト・統計用) ───────────────────────────────────
+    def count_by_subject_prefix(
+        self,
+        prefix: str | tuple[str, ...],
+        *,
+        include_superseded: bool = False,
+    ) -> int:
+        return self.store.count_by_subject_prefix(
+            prefix, include_superseded=include_superseded,
+        )
 
-    @property
-    def revision(self) -> int:
-        """書込世代番号。add / update / delete のたびに増える。
-
-        値そのものに意味は無く、**変わったかどうか** だけを見る。同じ
-        revision の間は ``all_facts()`` の結果と、そこから作った派生物が
-        変わらないことを保証する。
-        """
-        return self._revision
-
-    def __len__(self) -> int:
-        return len(self._facts)
+    def count_by_type(
+        self, fact_type: FactType, *, include_superseded: bool = False,
+    ) -> int:
+        return len(
+            self.search_by_type(fact_type, include_superseded=include_superseded),
+        )
 
     def all_facts(self, *, include_superseded: bool = True) -> list[SemanticFact]:
-        if include_superseded:
-            return list(self._facts.values())
-        return [f for f in self._facts.values() if not f.superseded_by]
+        return self.store.all_facts(
+            include_superseded=include_superseded, scope=self.scope,
+        )
 
     def pinned_facts(self) -> list[SemanticFact]:
-        return [self._facts[fid] for fid in self._pinned if fid in self._facts]
+        return self.store.pinned_facts(scope=self.scope)
+
+    def embedding_scores(self, query: np.ndarray) -> dict[str, float]:
+        return self.store.embedding_scores(query)
+
+    def ranking_scores(self, query: np.ndarray) -> dict[str, float]:
+        return self.store.ranking_scores(query)
+
+    def vectors_for(self, fact_ids: Sequence[str]) -> dict[str, np.ndarray]:
+        return self.store.vectors_for(fact_ids)
+
+    def hydrate_embeddings(self, facts: Sequence[SemanticFact]) -> int:
+        return self.store.hydrate_embeddings(facts)
+
+
+def _discard(index: dict[str, set[str]], key: str, fact_id: str) -> None:
+    """索引バケットから id を外し、空になったバケットを畳む。"""
+    bucket = index.get(key)
+    if bucket is None:
+        return
+    bucket.discard(fact_id)
+    if not bucket:
+        index.pop(key, None)
+
+
+__all__ = [
+    "DEFAULT_SEMANTIC_KNOW_PRIOR",
+    "DEFAULT_SEMANTIC_MEM_PRIOR",
+    "KNOW_FRESHNESS_FLOOR",
+    "KNOW_NAMESPACE",
+    "PILLAR_SUBJECT_PREFIXES",
+    "STORE_DIRNAME",
+    "SUPERSEDED_GC_SNAPSHOTS",
+    "WRITER",
+    "ScopedSemanticStore",
+    "SemanticHit",
+    "SemanticStore",
+    "semantic_shard_key",
+]

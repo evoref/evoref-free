@@ -51,7 +51,6 @@ class FeedbackSignals:
     turn_outcome: str = "success"
     rephrased_query: bool = False
     rag_used: bool = False
-    rag_source: str | None = None
     rag_top1_score: float | None = None
     agent_loops: int = 0
     user_correction: str | None = None
@@ -163,6 +162,18 @@ class GenerationConfigRef:
     sampling: dict[str, float] = field(default_factory=dict)
     """temperature / top_p / max_tokens 等、生成時に効いたパラメータ。"""
 
+    evidence_ids: list[str] = field(default_factory=list)
+    """このターンで **実際に注入した** Evidence の id (c_16 §5.5)。
+
+    形式は ``"<store>:<evidence_id>"`` で、``store`` は ``episodic`` /
+    ``semantic`` / ``corpus``。``[参考情報]`` 枠 (統合検索) と
+    ``[関連する記憶]`` 枠 (``MemoryInjector``) の両方を含む。
+
+    廃止した ``ExperienceEntry.cartridge_ids`` は「そのとき **ロードされて
+    いた** カートリッジ一覧」で、実際に見せた材料とは無関係だった。Level 1 の
+    ``rag_usage_rate`` はここに ``corpus:`` があるかで数える。
+    """
+
 
 @dataclass
 class ExperienceEntry:
@@ -192,7 +203,6 @@ class ExperienceEntry:
     response_full: str = ""
     base_model: str = ""
     embedding_model: str = ""
-    cartridge_ids: list[str] = field(default_factory=list)
     lang: str = ""
     """応答本文の言語 (``ja`` / ``en`` / 未判定は空)。決定論判定で埋める。"""
 
@@ -331,9 +341,17 @@ class ExperienceBuffer(JsonStateStore):
         """
         result = [
             e for e in self.entries
-            if e.signals.rephrased_query
-            or e.signals.user_correction is not None
-            or e.signals.turn_outcome == "failed"
+            if (
+                e.signals.rephrased_query
+                or e.signals.user_correction is not None
+                or e.signals.turn_outcome == "failed"
+            )
+            # max_tokens で切れた応答は「モデルの失敗」ではなく設定由来の
+            # 打ち切りで、正しい答えも持たない。2026-09-07 ライブ監査では
+            # 失敗プール 6 件中 5 件がこれで、Level 2 の目的関数がほぼ打ち切りで
+            # 埋まった。few-shot (add_from_experiences) と訂正ペアも同じ理由で
+            # 除外している。
+            and not e.signals.truncated
         ]
         if mode is not None:
             result = [e for e in result if e.mode == mode]
@@ -373,7 +391,6 @@ class ExperienceBuffer(JsonStateStore):
                 "response_full": entry.response_full,
                 "base_model": entry.base_model,
                 "embedding_model": entry.embedding_model,
-                "cartridge_ids": entry.cartridge_ids,
                 "lang": entry.lang,
                 "gen_config": asdict(entry.gen_config),
                 "signals": asdict(entry.signals),
@@ -434,7 +451,6 @@ class ExperienceBuffer(JsonStateStore):
             response_full=d.get("response_full", ""),
             base_model=d.get("base_model") or "",
             embedding_model=d.get("embedding_model", ""),
-            cartridge_ids=d.get("cartridge_ids", []),
             lang=d.get("lang", ""),
             gen_config=GenerationConfigRef(**{
                 k: gen_data[k] for k in _GEN_CONFIG_FIELD_NAMES if k in gen_data

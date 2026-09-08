@@ -9,15 +9,17 @@
     python scripts/evorefmem_cli.py inspect [--scope SCOPE] [--json] # 統計表示
     python scripts/evorefmem_cli.py verify  [--scope SCOPE] [--json] # 整合性検査
     python scripts/evorefmem_cli.py purge-private [--all-curated] [--apply]  # private 由来の索引を掃除
-    python scripts/evorefmem_cli.py compact [--apply] [--scope S]    # facts.jsonl 圧縮
-    python scripts/evorefmem_cli.py rebuild-indices [--apply]        # .idx 再生成
     python scripts/evorefmem_cli.py migrate [--to V] [--apply] [--list]
-    python scripts/evorefmem_cli.py migrate-embedding --to MODEL_ID --dim N [--apply]
     python scripts/evorefmem_cli.py export PATH                       # tar.gz バックアップ
     python scripts/evorefmem_cli.py import PATH [--apply]             # リストア
 
-破壊的操作 (``migrate`` / ``compact`` / ``rebuild-indices`` / ``import`` /
-``migrate-embedding`` / ``purge-private``) はデフォルトで dry-run。``--apply`` で実行する。
+破壊的操作 (``migrate`` / ``import`` / ``purge-private``) はデフォルトで
+dry-run。``--apply`` で実行する。
+
+``compact`` / ``rebuild-indices`` / ``migrate-embedding`` / ``reembed-facts``
+は撤去した — 事象ログの畳み込み・転置索引・埋め込みはすべて sleep-time の
+snapshot 生成が担うようになったため (c_16 §5.3 / §6)。埋め込みモデルを替えた
+ときは次の版で全件が作り直される。
 
 多重起動防止のため ``local/.evorefmem_cli.lock`` を PID で占有する。
 """
@@ -46,10 +48,6 @@ from backend.free.memory.semantic.cli import (  # noqa: E402
 from backend.free.memory.semantic.cli._paths import (  # noqa: E402
     resolve_cli_paths,
 )
-from backend.free.memory.semantic.cli.compact_cmd import (  # noqa: E402
-    format_report_text as _compact_fmt,
-    run_compact,
-)
 from backend.free.memory.semantic.cli.export_import_cmd import (  # noqa: E402
     format_export_report_text,
     format_import_report_text,
@@ -65,27 +63,12 @@ from backend.free.memory.semantic.cli.migrate_cmd import (  # noqa: E402
     list_registered_migrations,
     run_migrate,
 )
-from backend.free.memory.semantic.cli.migrate_embedding_cmd import (  # noqa: E402
-    format_report_text as _migrate_emb_fmt,
-    run_migrate_embedding,
-)
-from backend.free.memory.semantic.cli.reembed_facts_cmd import (  # noqa: E402
-    format_report_text as _reembed_fmt,
-    run_reembed_facts,
-)
 from backend.free.memory.semantic.cli.purge_private_cmd import (  # noqa: E402
     run_purge_private,
-)
-from backend.free.memory.semantic.cli.rebuild_indices_cmd import (  # noqa: E402
-    format_report_text as _rebuild_fmt,
-    run_rebuild_indices,
 )
 from backend.free.memory.semantic.cli.verify_cmd import (  # noqa: E402
     format_report_text as _verify_fmt,
     run_verify,
-)
-from backend.free.memory.semantic.manifest import (  # noqa: E402
-    normalize_embedding_model_id,
 )
 
 
@@ -160,7 +143,7 @@ def _purge_private_fmt(report) -> str:
     lines = [
         f"memory_dir: {report.memory_dir}",
         f"mode      : {report.mode}"
-        + ("" if report.notes_available else "  (STM ノート未読込: 厳密照合は無効)"),
+        + ("" if report.notes_available else "  (ノート未読込: 厳密照合は無効)"),
         f"candidates: {len(report.candidates)}",
     ]
     by_reason: dict[str, int] = {}
@@ -173,7 +156,7 @@ def _purge_private_fmt(report) -> str:
     if len(report.candidates) > 20:
         lines.append(f"    ... (他 {len(report.candidates) - 20} 件)")
     if report.applied:
-        lines.append(f"deleted   : {report.deleted}")
+        lines.append(f"retracted : {report.deleted}")
         lines.append(f"notes 再生成待ちへ戻した: {report.notes_unmarked}")
         lines.append(f"backup    : {report.backup_path}")
     else:
@@ -181,34 +164,6 @@ def _purge_private_fmt(report) -> str:
     return "\n".join(lines)
 
 
-def _cmd_compact(args: argparse.Namespace) -> int:
-    paths = resolve_cli_paths()
-    report = run_compact(
-        paths.memory_dir,
-        paths.migration_archive_dir,
-        apply=args.apply,
-        scope_filter=args.scope,
-    )
-    if args.json:
-        print(report.to_json())
-    else:
-        print(_compact_fmt(report))
-    return 0
-
-
-def _cmd_rebuild_indices(args: argparse.Namespace) -> int:
-    paths = resolve_cli_paths()
-    report = run_rebuild_indices(
-        paths.memory_dir,
-        paths.migration_archive_dir,
-        apply=args.apply,
-        scope_filter=args.scope,
-    )
-    if args.json:
-        print(report.to_json())
-    else:
-        print(_rebuild_fmt(report))
-    return 0
 
 
 def _cmd_migrate(args: argparse.Namespace) -> int:
@@ -251,104 +206,7 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
     return 1 if report.error else 0
 
 
-def _cmd_migrate_embedding(args: argparse.Namespace) -> int:
-    paths = resolve_cli_paths()
-    report = run_migrate_embedding(
-        paths.memory_dir,
-        paths.migration_archive_dir,
-        new_model_id=args.to,
-        new_dim=args.dim,
-        normalized=not args.not_normalized,
-        apply=args.apply,
-        create_dirs=not args.no_create_dirs,
-    )
-    if args.json:
-        print(report.to_json())
-    else:
-        print(_migrate_emb_fmt(report))
-    return 1 if report.error else 0
 
-
-def _build_http_embed_fn(
-    host: str,
-    port: int,
-    doc_template: str,
-    *,
-    batch: int = 32,
-    timeout: int = 60,
-):
-    """live llama-embed サーバ (OAI ``/v1/embeddings``) へ問い合わせる embed_fn.
-
-    生の object テキストに ``doc_template`` (``document: {query}`` 等) を適用し、
-    L2 正規化したベクトル列を返す (保存ベクトルは単位長のため正規化を合わせる)。
-    ``doc_template`` が空文字列 (Qwen3-Embedding 等の doc 側 prefix なしモデル)
-    なら素のテキストをそのまま埋め込む — ``LlamaCppEmbedder`` の fast-path と
-    同じ扱い。空テンプレに ``.format()`` を適用すると全文書が空文字列に潰れ、
-    embed サーバはエラーを返さないため silent corruption になる。
-    """
-    import json as _json
-    import math
-    import urllib.request
-
-    url = f"http://{host}:{port}/v1/embeddings"
-
-    def _embed(texts: list[str]) -> list[list[float]]:
-        out: list[list[float]] = []
-        for start in range(0, len(texts), batch):
-            chunk = texts[start:start + batch]
-            inputs = [
-                doc_template.format(query=t) if doc_template else t
-                for t in chunk
-            ]
-            body = _json.dumps({"input": inputs}).encode("utf-8")
-            req = urllib.request.Request(
-                url, data=body, headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                payload = _json.loads(resp.read().decode("utf-8"))
-            data = sorted(payload["data"], key=lambda e: e.get("index", 0))
-            for entry in data:
-                vec = entry["embedding"]
-                norm = math.sqrt(sum(x * x for x in vec)) or 1.0
-                out.append([x / norm for x in vec])
-        return out
-
-    return _embed
-
-
-def _cmd_reembed_facts(args: argparse.Namespace) -> int:
-    from backend.config import load_config
-
-    paths = resolve_cli_paths()
-    cfg = load_config()
-    emb = cfg.get("embedding", {}) or {}
-    host = args.embed_host or emb.get("llama_host", "localhost")
-    port = args.embed_port or int(emb.get("llama_port", 8082))
-    doc_template = args.doc_template or emb.get("doc_template", "")
-    dim = args.dim if args.dim is not None else int(emb.get("dim", 1024))
-    model_name = emb.get("model_name") or "embedding"
-    # model_id は API 側 (/api/model/reembed-facts の 409 ガード) と同じ
-    # normalize_embedding_model_id で導出する。単純な lower() だと拡張子付き
-    # model_name で manifest とガードの期待値が乖離し 409 が解消しない。
-    model_id = args.model_id or normalize_embedding_model_id(str(model_name))
-
-    embed_fn = None
-    if args.apply:
-        embed_fn = _build_http_embed_fn(host, int(port), doc_template)
-    report = run_reembed_facts(
-        paths.memory_dir,
-        paths.migration_archive_dir,
-        new_model_id=model_id,
-        new_dim=dim,
-        embed_fn=embed_fn,
-        normalized=not args.not_normalized,
-        apply=args.apply,
-    )
-    if args.json:
-        print(report.to_json())
-    else:
-        print(_reembed_fmt(report))
-    return 1 if report.error else 0
 
 
 def _cmd_export(args: argparse.Namespace) -> int:
@@ -440,7 +298,6 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--scope", default=None, help="特定 scope に限定")
     sp.set_defaults(func=_cmd_verify)
 
-    # compact
     # purge-private
     sp = sub.add_parser(
         "purge-private",
@@ -453,7 +310,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--all-curated", action="store_true",
         help=(
-            "mem.world.{assertion,executable_command,url}.* を丸ごと候補にする。"
+            "mem.world.assertion.* / idx.{url,command}.* を丸ごと候補にする。"
             "取りこぼしゼロだが正当な索引も一度消える (ノートのマーカーを戻すので"
             "次の Full で再生成される。失うのは exec_count 等の統計のみ)"
         ),
@@ -476,30 +333,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp.set_defaults(func=_cmd_purge_private)
 
-    # compact
-    sp = sub.add_parser(
-        "compact",
-        help="facts.jsonl の last-write-wins 圧縮 (デフォルト dry-run)",
-    )
-    sp.add_argument("--scope", default=None, help="特定 scope に限定")
-    sp.add_argument(
-        "--apply", action="store_true",
-        help="実際に書き換える (未指定時は dry-run)",
-    )
-    sp.set_defaults(func=_cmd_compact)
-
-    # rebuild-indices
-    sp = sub.add_parser(
-        "rebuild-indices",
-        help=".idx 群を facts.jsonl から再生成する (デフォルト dry-run)",
-    )
-    sp.add_argument("--scope", default=None, help="特定 scope に限定")
-    sp.add_argument(
-        "--apply", action="store_true",
-        help="実際に書き換える (未指定時は dry-run)",
-    )
-    sp.set_defaults(func=_cmd_rebuild_indices)
-
     # migrate
     sp = sub.add_parser(
         "migrate",
@@ -518,63 +351,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="登録 Migration を列挙するだけ (memory_dir には触れない)",
     )
     sp.set_defaults(func=_cmd_migrate)
-
-    # migrate-embedding
-    sp = sub.add_parser(
-        "migrate-embedding",
-        help="埋め込み active model を swap する (デフォルト dry-run)",
-    )
-    sp.add_argument("--to", required=True, help="新 model_id (例: qwen3-embedding)")
-    sp.add_argument("--dim", type=int, required=True, help="新モデルの次元数")
-    sp.add_argument(
-        "--not-normalized", action="store_true",
-        help="埋め込みが L2 正規化されていない場合に付与",
-    )
-    sp.add_argument(
-        "--no-create-dirs", action="store_true",
-        help="apply 時に新 model_id 用の subdir を自動作成しない",
-    )
-    sp.add_argument(
-        "--apply", action="store_true",
-        help="実際に manifest を書き換える",
-    )
-    sp.set_defaults(func=_cmd_migrate_embedding)
-
-    # reembed-facts
-    sp = sub.add_parser(
-        "reembed-facts",
-        help="semantic fact の embedding を新モデルで再生成 + manifest swap "
-        "(デフォルト dry-run)",
-    )
-    sp.add_argument(
-        "--model-id", default=None,
-        help="新 model_id (省略時は config embedding.model_name を小文字化)",
-    )
-    sp.add_argument(
-        "--dim", type=int, default=None,
-        help="新モデルの次元数 (省略時は config embedding.dim)",
-    )
-    sp.add_argument(
-        "--not-normalized", action="store_true",
-        help="埋め込みが L2 正規化されていない場合に付与",
-    )
-    sp.add_argument(
-        "--embed-host", default=None,
-        help="llama-embed ホスト (省略時 config embedding.llama_host)",
-    )
-    sp.add_argument(
-        "--embed-port", type=int, default=None,
-        help="llama-embed ポート (省略時 config embedding.llama_port)",
-    )
-    sp.add_argument(
-        "--doc-template", default=None,
-        help="doc 側テンプレ (省略時 config embedding.doc_template)",
-    )
-    sp.add_argument(
-        "--apply", action="store_true",
-        help="実際に再 embed + manifest swap する (未指定時は dry-run)",
-    )
-    sp.set_defaults(func=_cmd_reembed_facts)
 
     # export
     sp = sub.add_parser(

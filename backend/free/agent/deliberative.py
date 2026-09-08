@@ -1154,14 +1154,13 @@ _TOOL_LEDGER_EMPTY_FACTS: dict[str, str] = {
 }
 
 _MEMORY_ARCHITECTURE_FACT = (
-    "\n\n確定事実: このアシスタントの記憶は次の 4 層で構成される。"
+    "\n\n確定事実: このアシスタントの記憶は次の 3 つで構成される。"
     "これは実装そのものなので、この内容で答えること。ここに無い層を述べない。\n"
-    "- WorkingMemory (WM): 現在の会話の窓。直近のターンを保持し、"
-    "窓を超えた分は ShortTermMemory へ押し出される。\n"
-    "- ShortTermMemory (STM): 会話から作ったノート。埋め込みを持ち、"
+    "- WorkingMemory (WM): 現在の会話の窓。直近のターンを保持する。"
+    "窓を超えた分は会話履歴に残り、記憶への取り込みは後から行われる。\n"
+    "- EpisodicStore (エピソード記憶): 会話から作ったノート。"
+    "short (直近) と long (古いもの) の 2 段階を 1 つのストアで持ち、"
     "関連度で検索される。\n"
-    "- LongTermMemory (LTM): 会話をチャンク化したベクトルストア。"
-    "過去の会話の断片を意味検索で引く。\n"
     "- SemanticMemory (SemMem): 属性ごとの「現在値」を持つファクトストア。"
     "訂正されると旧世代は supersede され、セッションを跨いで参照される。"
 )

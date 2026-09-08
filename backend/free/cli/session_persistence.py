@@ -73,7 +73,6 @@ def _build_history_data(state: SessionState) -> dict:
         "turns": list(state.turns),
         "turn_count": len(state.turns),
         "context_files": list(state.context_files),
-        "cartridge_ids": [],
         "token_info": {
             "used": state.token_used,
             "limit": state.token_limit,
@@ -130,7 +129,6 @@ def auto_save_session(state: SessionState) -> bool:
             turns=data["turns"],
             turn_count=data["turn_count"],
             context_files=data["context_files"],
-            cartridge_ids=data["cartridge_ids"],
             token_info=data["token_info"],
             summary=data.get("summary"),
             archived_at=data["archived_at"],

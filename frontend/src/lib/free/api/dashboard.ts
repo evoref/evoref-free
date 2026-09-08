@@ -199,9 +199,7 @@ export interface DashboardRagStats {
 	/** チャンク分割戦略（semantic 等） */
 	chunkingStrategy: string;
 	/** BM25 + ベクトルのハイブリッド検索が有効か */
-	hybridSearch: boolean;
 	/** スコア融合手法（rrf 等） */
-	fusionMethod: string;
 	/** 埋め込み次元と保存済みストアの次元が不一致 */
 	embeddingDimMismatch: boolean;
 	embeddingDimStored: number | null;

@@ -99,11 +99,11 @@ def _get_migrator(state: AppState):
         eval_core_path = resolver.resolve_learning("eval_core_file")
         eval_core_mgr = EvalCoreManager(eval_core_path)
 
-    # ShortTermMemory
-    stm = None
+    # エピソード記憶 (移行時に context_description の再生成印を立てる)
+    episodic = None
     mem = state.get_memory_system()
     if mem:
-        _, stm, _ = mem
+        _, episodic = mem
 
     return ModelMigrator(
         config=cfg,
@@ -113,7 +113,7 @@ def _get_migrator(state: AppState):
         prompt_manager=prompt_manager,
         eval_core_manager=eval_core_mgr,
         learning_scheduler=learning_scheduler,
-        short_term_memory=stm,
+        episodic_memory=episodic,
     )
 
 
@@ -308,15 +308,13 @@ async def migrate_component(
         and not req.dry_run
         and result.old_model != result.new_model
     ):
-        from backend.free.memory.semantic.stale_guard import (
-            set_semmem_reembed_required,
-        )
         from backend.free.rag.dimension_check import set_embed_reindex_required
 
         set_embed_reindex_required(result.new_model)
-        # SemMem fact 埋め込み (URL/コマンドリコール) も同 dim swap で stale になる。
-        # 起動時 WARN で reembed-facts を案内するためのマーカーを立てる。
-        set_semmem_reembed_required(result.new_model)
+        # SemMem 側の stale マーカーは不要 (c_16 §6.1 / §8)。ファクトの埋め込みは
+        # ``embeddings/<model_id>/`` にモデル別で置かれ、旧モデルの行を読み違える
+        # ことがない。索引の作り直しは ``POST /api/model/reembed-facts`` か次の
+        # sleep-time の snapshot 生成が担う。
 
     restarted = False
     if (
@@ -597,30 +595,18 @@ async def reembed_facts(
     state: AppState = Depends(get_app_state),
     dry_run: bool = False,
 ):
-    """SemMem fact (URL/コマンドリコール) の埋め込みを現在の Embedder で再構築する。
+    """SemMem の埋め込みを現在の Embedder で作り直す (c_16 §6.1)。
 
-    埋め込みモデル切替後、SemMem fact ベクトルは旧モデル空間に取り残され
-    ``search_by_embedding`` (URL/コマンドリコール) が空振りする。RAG reindex
-    (``/api/rag/reindex``) は SemMem fact を対象外とするため本エンドポイントが
-    補完する。2 経路:
+    埋め込みは **snapshot 生成のときにしか作られない**。``embeddings/<model_id>/``
+    はモデル別ディレクトリなので、埋め込みモデルを替えると次の版で全件が
+    自動的に新モデルで作り直される (前の版から流用できる行が無いため)。
+    したがってこのエンドポイントがやることは 1 つ:
 
-    - **同一モデルでの再埋め込み**: 稼働中の live global store を in-place 更新
-      するので mem_view も同一オブジェクトを参照しており **再起動不要**。
-    - **モデル変更を伴う切替** (model_id 変化 or dim 変化): CLI ``reembed-facts
-      --apply`` と同一の cross-model swap (``apply_reembed_swap``) を実行する。
-      全 scope に新 model_id ディレクトリを作成 → manifest を atomic swap → 全
-      scope の fact を新モデルで再埋め込み → stale マーカー解除。RAG Reindex
-      ボタンがモデル変更込みで自己回復するのと対称。ただし稼働中バックエンドの
-      Fact View は旧 store 参照を保持するため、**live リコールの反映には backend
-      再起動が必須** で ``restart_required: True`` を返す (キャッシュ層は
-      ``invalidate_semantic_stores`` で破棄するが View 再バインドは行わない)。
-      なお再起動までの間に SemMem 書込み (SleepTimeWorker auto-merge / artifact
-      fact / conflict resolution) が発生すると旧 model_id dir へ書かれ再起動後に
-      孤立し得るため、cross-model 切替後は速やかに再起動すること (live View 再
-      バインドによる完全な再起動レス化は今後の課題)。
+    1. 現在の model_id の索引ディレクトリを消す (同一モデルでの強制やり直し)
+    2. 版を 1 つ積む (``create_snapshot``) — その中で全件が埋め込み直される
 
-    いずれの経路でも、embed サーバが新モデルへ未切替 (config と不一致) の場合は
-    409 で拒否する (旧モデル空間で再embedしてマーカーまで消す順序依存の罠を防ぐ)。
+    embed サーバが新モデルへ未切替 (config と不一致) の場合は 409 で拒否する
+    — 旧モデル空間で再埋め込みして stale マーカーまで消す順序依存の罠を防ぐ。
 
     Query params:
         dry_run: True なら対象 fact 数だけ返して実行しない。
@@ -628,146 +614,34 @@ async def reembed_facts(
     import shutil
     import time
 
-    import numpy as np
-
-    from backend.free.memory.semantic.cli._paths import cli_backup_root
-    from backend.free.memory.semantic.cli.reembed_facts_cmd import (
-        ReembedTarget,
-        apply_reembed_swap,
-        collect_reembed_targets,
-        embed_targets_async,
-    )
-    from backend.free.memory.sleep._curator_common import embed_kwargs_for_subject
-    from backend.free.memory.semantic.manifest import (
-        load_manifest,
-        normalize_embedding_model_id,
-        update_manifest,
-    )
-    from backend.free.memory.semantic.stale_guard import (
-        clear_semmem_reembed_required,
-    )
     from backend.free.rag.dimension_check import embedder_config_mismatch
-    from backend.utils import utc_now
 
     if state.embedder is None:
         raise HTTPException(status_code=503, detail="Embedder not initialized")
-
-    resolver = get_path_resolver()
-    memory_dir = resolver.resolve_local("memory_dir")
-    manifest = load_manifest(memory_dir)
-    manifest_model_id = manifest.embedding.model_id if manifest else ""
-    manifest_dim = manifest.embedding.dim if manifest else None
-
-    try:
-        expected_model_id = normalize_embedding_model_id(
-            str(state.embedder.model_name() or ""),
+    store = getattr(state, "semantic_memory", None)
+    if store is None:
+        raise HTTPException(
+            status_code=503, detail="Semantic memory is not initialized",
         )
-    except Exception:
-        expected_model_id = ""
-    try:
-        embedder_dim = int(state.embedder.dim())
-    except Exception:
-        embedder_dim = manifest_dim or 0
 
-    # モデル変更 (model_id 変化 or dim 変化) を検知。どちらかが変われば
-    # cross-model swap (新 model_id dir + manifest swap) が必要。
-    model_id_changed = bool(
+    manifest = store.evidence.manifest
+    manifest_model_id = manifest.embedding_model_id or ""
+    current_model_id = store.evidence.embedding_model_id
+    model_changed = bool(
         manifest_model_id
-        and expected_model_id
-        and manifest_model_id != expected_model_id
+        and current_model_id
+        and manifest_model_id != current_model_id
     )
-    dim_changed = (
-        manifest_dim is not None
-        and embedder_dim > 0
-        and manifest_dim != embedder_dim
-    )
+    fact_count = len(store)
 
-    if model_id_changed or dim_changed:
-        # ── cross-model: 全 scope を新モデルで再embed + manifest swap ──
-        targets = collect_reembed_targets(memory_dir, manifest)
-        if dry_run:
-            return {
-                "dry_run": True,
-                "fact_count": len(targets),
-                "model_changed": True,
-                "new_model_id": expected_model_id or None,
-            }
-        # embed サーバが新モデルへ未切替なら拒否 (順序依存の罠)。
-        stale = embedder_config_mismatch(state)
-        if stale is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=msg(
-                    "error.rag.stale_embedder",
-                    current=stale[0], expected=stale[1],
-                ),
-            )
-        if not expected_model_id:
-            raise HTTPException(
-                status_code=500,
-                detail="cannot resolve new embedding model_id from embedder",
-            )
-        t0 = time.monotonic()
-        # 内部索引ファクト (URL / コマンド) は query 側で埋め込む。全件を doc 側で
-        # ``embed(objs, is_query=False)`` すると索引の側が反転し、リコールの
-        # 類似度が崩れる (2026-09-02 監査 M19)。側は target ごとに持たせてある。
-        vectors = (
-            await embed_targets_async(state.embedder, targets) if targets else []
-        )
-        elapsed = time.monotonic() - t0
-        # LlamaCppEmbedder.embed は常に L2 正規化して返すため normalized=True。
-        # (旧 manifest の normalized を引き継ぐと、新モデルの実挙動とラベルが
-        # 乖離しうる。CLI 側も normalized=True 既定。)
-        try:
-            reembedded, _backup = apply_reembed_swap(
-                memory_dir,
-                resolver.resolve_local("migration_archive_dir"),
-                targets, vectors,
-                new_model_id=expected_model_id, new_dim=embedder_dim,
-                normalized=True,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
-        # 稼働中バックエンドのキャッシュ store を破棄 (次回 get で新 manifest 再ロード)。
-        state.invalidate_semantic_stores()
-        logger.info(
-            "reembed-facts (cross-model): manifest %s -> %s, reembedded %d "
-            "in %.2fs (backend restart REQUIRED for live recall)",
-            manifest_model_id or "?", expected_model_id, reembedded, elapsed,
-        )
+    if dry_run:
         return {
-            "dry_run": False,
-            "reembedded": reembedded,
-            "fact_count": reembedded,
-            "elapsed_sec": round(elapsed, 2),
-            "model_changed": True,
-            "new_model_id": expected_model_id,
-            "restart_required": True,
+            "dry_run": True,
+            "fact_count": fact_count,
+            "model_changed": model_changed,
+            "new_model_id": current_model_id or None,
         }
 
-    # ── same-model: live global store を in-place 更新 (再起動不要) ──
-    store = state.get_semantic_store("global")
-    live_facts = store.all_facts(include_superseded=False)
-    # 本文は Step 8.8 と同じ ``fact.text`` (= statement or object)。``object``
-    # を使うと再埋め込み済みと未処理で本文が食い違う (split-brain)。
-    # 側 (is_query / mode) は subject から決める (cross-model 経路と同じ規則)。
-    targets_g = [
-        ReembedTarget(
-            "global", memory_dir, f.id, (f.text or "").strip(),
-            embed_kwargs_for_subject(f.subject),
-        )
-        for f in live_facts
-        if f.embedding is not None and (f.text or "").strip()
-    ]
-    if dry_run:
-        return {"dry_run": True, "fact_count": len(targets_g)}
-
-    if not targets_g:
-        return {"dry_run": False, "reembedded": 0, "fact_count": 0}
-
-    # migrate 直後で embedder が旧モデルのまま実行すると、旧モデル空間で
-    # 再埋め込みしてマーカーまでクリアしてしまう (順序依存の罠)。embed
-    # サーバ再起動 + embedder reload が済むまで実行を拒否する。
     stale = embedder_config_mismatch(state)
     if stale is not None:
         raise HTTPException(
@@ -777,50 +651,38 @@ async def reembed_facts(
             ),
         )
 
-    # 上書き前に現在の埋め込みベクトルを backup する (rollback 用)。
-    try:
-        backup_root = cli_backup_root(
-            resolver.resolve_local("migration_archive_dir"), "reembed_facts_api",
-        )
-        emb_dir = store.root_dir / "embeddings"
-        if emb_dir.exists():
-            shutil.copytree(
-                emb_dir, backup_root / "embeddings", dirs_exist_ok=True,
-            )
-    except Exception as exc:
-        logger.warning("reembed-facts: backup skipped: %s", exc)
-
     t0 = time.monotonic()
+    # 同一モデルでのやり直しは索引を消してからでないと増分再利用が効いて
+    # 何も再計算されない (本文が変わっていない行はそのまま流用される)。
+    embeddings_dir = store.evidence.embeddings_dir(current_model_id)
+    store.evidence.close()
+    if embeddings_dir.exists():
+        try:
+            shutil.rmtree(embeddings_dir)
+        except OSError as exc:
+            logger.warning("reembed-facts: failed to drop %s: %s", embeddings_dir, exc)
+    store.load()
+    # 版を積む前に 1 事象も無いと ``create_snapshot`` は何もしないので、
+    # 索引の作り直しだけを目的に直接呼ぶ。
     try:
-        vectors = await embed_targets_async(state.embedder, targets_g)
-    except ValueError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    for target, vec in zip(targets_g, vectors):
-        fid = target.fact_id
-        arr = np.asarray(vec, dtype=np.float32).reshape(-1)
-        if arr.shape[0] != embedder_dim:
-            raise HTTPException(
-                status_code=500,
-                detail=f"embedder vector dim {arr.shape[0]} != {embedder_dim}",
-            )
-        store.update_fact(fid, embedding=arr)
+        version = await store.evidence.create_snapshot()
+    except Exception as exc:  # noqa: BLE001 — 失敗しても事象は残る
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    store.load()
     elapsed = time.monotonic() - t0
 
-    try:
-        update_manifest(memory_dir, last_migrated_at=utc_now())
-    except Exception as exc:
-        logger.warning("reembed-facts: manifest stamp skipped: %s", exc)
-    clear_semmem_reembed_required(memory_dir=memory_dir)
-
     logger.info(
-        "reembed-facts: reembedded %d SemMem facts in %.2fs",
-        len(targets_g), elapsed,
+        "reembed-facts: rebuilt the semantic index as %s (%d fact(s), %.2fs)",
+        version, fact_count, elapsed,
     )
     return {
         "dry_run": False,
-        "reembedded": len(targets_g),
-        "fact_count": len(targets_g),
+        "reembedded": fact_count,
+        "fact_count": fact_count,
         "elapsed_sec": round(elapsed, 2),
+        "model_changed": model_changed,
+        "new_model_id": current_model_id or None,
+        "snapshot": version,
     }
 
 

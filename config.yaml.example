@@ -343,12 +343,10 @@ local_paths:
   embed_lora_adapter: local/models/embed_adapter.gguf              # 埋め込み LoRA アダプタ
   embed_lora_versions_dir: local/models/embed_lora_versions/       # 埋め込み LoRA スナップショット
   # RAG / メモリ
-  vectors_dir: local/vectors/                # RAG ベクトルインデックス
   knowledge_dir: local/knowledge/            # RAG 用ソースドキュメント
-  memory_dir: local/memory/                  # メモリシステム永続化
+  memory_dir: local/memory/                  # メモリシステム永続化 (episodic / semantic / corpus)
   agent_trace_dir: local/memory/agent_trace/ # MDP トレース常設ストア (エピソード記憶の入力、30 日で自動削除)
   prompts_dir: local/prompts/                # モード別システムプロンプト
-  cartridges_dir: local/cartridges/          # カートリッジ（パッケージ + 埋め込み）
   history_dir: local/history/                # 会話履歴アーカイブ
   triggers_dir: local/triggers/              # EvorefMem トリガ辞書の user override 先 (任意、空ディレクトリで可)
   create_workspace_dir: local/create/        # staged クリエイトの一時ワークスペース (spec/code/test 中間成果物 + manifest)
@@ -390,42 +388,21 @@ rag:
   # 「広く取って絞る」第1段として候補プールを広げる。LTM は内部で更に *2 する。
   # 目安: LTM 主体なら 2-3 / カートリッジ多装着環境は 1-2。
   fetch_multiplier: 1
-  # クロスレイヤ・スコア正規化方式: none / minmax / rank。
-  # none (既定) は 3 層とも **素の cosine** で降順に並べる。以前は STM だけ
-  # combined (cosine*0.6+lightmem*0.4+pin 加点) を順位付けに使っており、LightMem 項の
-  # ぶん STM が LTM / カートリッジより系統的に上へ来ていた (層をまたいだ top_k の
-  # 切り口が歪む)。LightMem は STM 内部でどのノートを候補にするかを決める役割に戻した。
-  # minmax / rank は cartridge(cosine*priority、priority 無上限) 等のスケール差を
-  # 層内正規化で吸収したい場合に使う。
-  # 品質判定は常に生スコアで行うため閾値の意味は変わらない。
-  score_normalization: none
-  # hybrid_search / rrf_k は **チャット応答経路の LTM でも効く**。
-  # LTM 検索はベクトル + BM25 の RRF になり、語彙チャネルは
-  # 「クエリ中の希少語 (df がコーパスの 1% 未満) を実際に含むチャンク」だけを足す
-  # (型番・パス・エラーコード・固有名詞のような、密ベクトルが原理的に苦手な
-  #  literal の引き当てが役割。一般語だけのクエリでは何も足さない)。
-  # 返るスコアは常に素のコサインなので、下の Self-RAG 閾値の意味は変わらない。
-  # NOTE: fusion_method / bm25_weight / vector_weight は依然 HybridRetriever 経路
-  # (ベンチ評価 / 長文生成の unit 検索) 専用。チャット経路の融合は常に RRF。
-  hybrid_search: true             # BM25+Vector ハイブリッド検索（false でベクトルのみ）
-  # NOTE: 以下の重み (0.3 / 0.7) は Qwen3-Embedding の vector 品質を前提に
-  # 調整した既定値。BGE-M3 / nomic-embed-text 等に切替えた場合は BM25 と
-  # vector の相対品質が変化するため、ベンチで再測定して再調整すること。
-  bm25_weight: 0.3                # RRF 不使用時の BM25 スコア重み（vector_weight と合計 1.0）
-  vector_weight: 0.7              # RRF 不使用時の Vector スコア重み
-  fusion_method: rrf              # スコア融合方式: rrf（推奨）/ weighted
-  rrf_k: 60                       # RRF 平滑化定数（論文推奨値: 60）。チャット経路の LTM 融合にも使う
-  # --- BM25 チューニング ---
-  bm25_k1: 1.5                    # BM25 の TF 飽和度パラメータ（短チャンクなら 1.0〜1.2）
-  bm25_b: 0.75                    # BM25 の長さ正規化係数（チャンク長が均一なら 0.5 前後）
-  bm25_delta: 1.0                 # BM25Plus の delta 項
-  bm25_use_trigrams: false        # true にすると文字 3-gram も併用（index サイズ増）
-  bm25_split_ascii: true          # camelCase / snake_case を分割して部分一致向上
-  # bm25_stopword_bigrams:
-  #   null → 既定ストップワード（日本語助詞中心の bi-gram 集）を使用
-  #   []   → ストップワード無効
-  #   list → 指定リストで上書き
-  bm25_stopword_bigrams: null
+  # --- 順位付け (c_16 §7.2) ---
+  # 順位式は 3 ストア (episodic / semantic / corpus) 共通の 1 本:
+  #   score = cos × freshness × confidence × store_prior
+  # 係数は memory.evidence.ranking.store_prior、corpus のパッケージ別上書きは
+  # local/memory/corpus/manifest.json の store_prior_overrides。
+  # ゲートは **素の cosine のみ** (合成スコアを閾値に流すと store_prior が閾値を
+  # 偽装する)。語彙側は numpy CSR の転置索引 (memory.evidence.lexical) が
+  # **候補生成器としてだけ** 働き、スコアを持ち込まない。
+  #
+  # 廃止 (c_16 §8): score_normalization / hybrid_search / fusion_method / rrf_k /
+  # bm25_weight / vector_weight / bm25_k1 / bm25_b / bm25_delta /
+  # bm25_use_trigrams / bm25_split_ascii / bm25_stopword_bigrams。
+  # 層内正規化も RRF も、層ごとにスケールの違うスコアを持っていたから要った
+  # 装置で、順位式が 1 本になった今は指定しても意味が無い (未知キーとして
+  # 起動時にエラーになる)。
   # --- Contextual Retrieval ---
   # チャンク登録時に補助タスクでドキュメント文脈プレフィックスを生成し、
   # 埋め込み・BM25 の両方で検索精度を向上させる。
@@ -465,7 +442,7 @@ rag:
   cartridge_gate:
     enabled: true                     # 有効化。centroid 未構築 cart は常に通過するため既存環境でも安全
     # null = 有効な埋め込みプロファイル (models/profiles/<arch>.yaml の
-    # embedding.rag.cartridge_gate_threshold: qwen3 0.49 / bert 0.53 / lfm2 0.17) に
+    # embedding.rag.cartridge_gate_threshold: qwen3 0.49 / bert 0.45 / lfm2 0.17) に
     # 追随。プロファイルに無ければ 0.3。数値を書くとプロファイルより優先される。
     threshold: null                   # cosine 類似度閾値。未満の cart はスキップ
     max_cartridges: 10                # gate 通過上限 (0 で無制限)
@@ -475,15 +452,14 @@ rag:
     #                RAG chunk が混入するのを防ぐ。STM/LTM 検索は影響なし。
     #   true       : 旧挙動 (全件フォールバック = recall 重視)。
     fallback_when_empty: false
-  # Cluster Index: 巨大カートリッジ (> threshold 件) を IVF-KMeans で高速化。numpy のみで実装
+  # Cluster Index: VectorStore を IVF-KMeans で高速化。numpy のみで実装
   cluster_index:
-    enabled: true                     # 有効化。閾値未満の cart はブルートフォースのまま
-    threshold: 5000                   # この件数以上の VectorStore で IVF インデックスを構築
+    enabled: true                     # 有効化。false で全ストアがブルートフォースのまま
     n_probe_ratio: 0.125              # K = max(16, sqrt(N)) のうち n_probe_ratio × K 個のクラスタを探索
   # --- Self-RAG 品質判定閾値 ---
   # NOTE: 以下 3 閾値はチャット応答経路 (unified_search) の Self-RAG 品質判定に適用される。
-  # 判定入力は STM(cosine*0.6+lightmem*0.4) / LTM(raw cosine) / cartridge(cosine*priority) を
-  # 無正規化マージした merged スコア。embedding family を切替えた場合は
+  # 判定入力は 3 ストア共通の 1 式 (cos × freshness × confidence × store_prior、c_16 §7.2) で
+  # 並べた merged スコア。層内正規化も RRF も掛からない。embedding family を切替えた場合は
   # cosine 分布が変わるので、全 low / 全 high に倒れないようベンチで分布を観察して再調整すること。
   relevance_threshold: 0.65      # 関連性判定の閾値（0.0〜1.0）
   support_threshold: 0.50        # 根拠支持判定の閾値（0.0〜1.0）
@@ -509,8 +485,8 @@ rag:
     # NOTE: この値は Level 1 進化の対象外 (policy_interpreter の search ドメインに
     # 登録していない)。ゲートはモデルが何を見るかを決めるので、モデル自身の出力
     # 由来の turn_outcome で自動調整すると閉ループになる。一方 **フロアがまたぐ
-    # スコア分布のほうは進化する** (search ポリシーの stm_top_k / top_k / rrf_k /
-    # bm25_weight / vector_weight / salience_w_* / noise_sigma)。embedding family
+    # スコア分布のほうは進化する** (search ポリシーの stm_top_k / top_k /
+    # salience_w_* / noise_sigma)。embedding family
     # を替えたときと同様、`Search results below quality floor` の
     # `N/M chunks passed` をログで見て、通過率が常時 0 / 常時全件へ寄っていないか
     # 確認すること。
@@ -783,27 +759,6 @@ memory:
   # 下限 512: これ以下だと毎ターン圧縮が発動し会話が成立しない
   history_min_tokens: 1024        # 過去履歴の最低確保トークン数 (床)。RAG 等の動的ブロックより優先して確保。0 で無効
   short_term_max_notes: 100       # 短期メモリの最大ノート数
-  lightmem_decay_days: 7          # LightMem スコアの減衰日数 (デフォルト半減期)
-  # --- タグ別半減期 (日)。未指定タグは lightmem_decay_days を使用 ---
-  # `policy` / `progress_marker` / `project` は実質無限 (9999)、
-  # `failure_pattern` は中期 (60)、`belief` は長期 (180)。
-  half_life_days_by_tag:
-    personal_fact: 90
-    world_fact: 14
-    preference: 60
-    emotion: 30
-    opinion: 21
-    belief: 180
-    decision: 60
-    commitment: 30
-    project: 9999
-    create: 60
-    task: 14
-    create_task: 14
-    policy: 9999
-    fewshot: 9999        # policy subtype から独立
-    failure_pattern: 60
-    progress_marker: 9999
   # --- SemMem 容量上限 + GC ---
   # sleep-time Step 9 内で type 別に上限超過分を gc_strategy に従って削除する。
   # pinned ファクトと supersede 済ファクトは対象外。スコアは
@@ -828,6 +783,7 @@ memory:
     progress_marker: 5000
     artifact: 10000               # ラルフループの成果物ファクト
     model: 1000                   # モデル能力プローブ由来のファクト
+    claim: 20000                  # know.<domain>.<topic> の世界知識 (c_16 §4.2)
     enforcement: hard             # hard | soft (soft は削除しない計測専用)
     gc_strategy: lowest_score     # 削除戦略 (現在は lowest_score のみ)
     # supersede 済みファクトの保持日数 (0 で無効 = 従来どおり永久保持)。
@@ -840,16 +796,10 @@ memory:
     # supersedes から参照されているものは対象外 (鎖を切らない)。
     superseded_retention_days: 90
   # --- プロジェクトアーカイブ ---
-  # 指定日数アクセスのないプロジェクトを semantic/archive/ に物理移動する
-  # (自動削除はしない)。0 で無効化。
+  # 指定日数アクセスのないプロジェクトの scope のファクトを retract で退役
+  # させる (物理削除はしない)。0 で無効化。
   project:
     auto_archive_inactive_days: 180
-    archive_dir: local/memory/semantic/archive
-  # --- FadeMem 適応的忘却 (arXiv:2601.18642) ---
-  fade_alpha: 0.4                 # 関連性の重み（コーディング用途は 0.5 推奨）
-  fade_beta: 0.3                  # アクセス頻度の重み（alpha + beta + gamma = 1.0）
-  fade_gamma: 0.3                 # 時間減衰の重み
-  fade_threshold: 0.15            # これ以下のスコアを削除候補に
   conflict_similarity_threshold: 0.85  # これ以上の類似ノートをコンフリクト候補に
   conflict_batch_size: 5          # コンフリクト解決のバッチサイズ
   # --- A-MEM ノート進化 (arXiv:2502.12110) ---
@@ -875,6 +825,35 @@ memory:
     min_merge_similarity: 0.85
     # 1 サイクルあたり LLM 統合呼び出しの上限 (conflict_batch_size と小さい方を採用)
     max_per_cycle: 5
+
+  # ===== Evidence Store (c_16 §9) =====
+  # episodic / semantic / corpus の 3 ストアに共通する保持・順位・索引の設定。
+  # ベクトル量子化 / memmap / クラスタ索引は rag.* の現行キーを全ストアで使う。
+  evidence:
+    retention:            # 保持方針 (各ストアの manifest.json に宣言として書き出す)
+      short_days: 14              # episodic tier=short の保持日数
+      long_max_records: 50000     # episodic tier=long の上限件数 (超過は pinned 除外 → last_used_at 最古から retract)
+      idx_max_records: 20000      # semantic idx.* の上限件数
+      events_keep_months: 3       # 畳み込み済み事象ファイルを残す月数
+      snapshots_keep: 3           # snapshot の保持版数
+    ranking:              # score = cos × freshness × confidence × store_prior
+      store_prior:
+        episodic: 1.0
+        semantic_mem: 1.0
+        semantic_know: 0.9
+        corpus: 0.9               # corpus/manifest.json の store_prior_overrides で PC 固有に上書き可 (旧 cartridge priority の置換)
+      allow_assistant_origin_injection: false  # origin=assistant を [参考情報] に出すか (既定 false: 自分の出力の再注入を塞ぐ)
+    lexical:              # 転置索引。走査量 <= q_terms × m_postings でレコード数に依存しない
+      q_terms: 32                 # クエリ語のうち IDF 上位 Q 語だけ使う
+      m_postings: 2000            # 各語の posting 先頭 M 件だけ読む
+      max_df_ratio: 0.10          # df > N × 比率 の語は索引から除外 (相対値)
+      budget_ms: 20               # 超過時は lexical をスキップしベクトル候補のみで続行
+    # know.<domain> の減衰既定 (日)。null = 減衰なし。レコード側の half_life_days が優先。
+    know_half_life_days:
+      news: 7
+      economy: 1
+      local: 30
+      howto: null
 
 # ===== スケジューラ tz 設定 =====
 # 内部時刻は全て UTC で扱うが、「夜間 N 時に学習を実行」のような
@@ -1265,3 +1244,12 @@ pro:
     # Pro 限定: ToolCallJudge の URL リコールに team プロファイルを追加で
     # 引き当て対象に含める。Free build では設定しても効果なし (起動時に WARNING)。
     team_profile_ids: []               # 例: ["team:default"] で team profile の URL fact も読込候補に
+  knowledge:
+    # Pro 限定: know.* 取得器。sources.jsonl に登録した取得元を sleep-time の
+    # アイドル窓で回し、本文から claim を抜いて know.<domain>.<topic> へ書く。
+    # Free build では設定しても効果なし (起動時に WARNING)。
+    enabled: false                     # 既定無効
+    fetch_timeout_sec: 20              # 1 URL あたりの取得タイムアウト (秒)
+    max_items_per_run: 20              # 1 サイクルで新規に取り込む item の上限
+    max_claims_per_item: 8             # 1 item から抜く claim の上限
+    user_agent: evoref-knowledge/1.0   # 取得時に名乗る User-Agent

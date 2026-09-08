@@ -110,6 +110,9 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "tool_draft_document": 180.0,
     # ── Pro ──────────────────────────────────────────────────────────
     "cartridge_eval_generation": 120.0,
+    # know.* 取得器 (Pro) が 1 item の本文から claim を抜く。sleep-time の
+    # アイドル窓でしか走らないので、他の背景 purpose と同じ尺で置く。
+    "knowledge_claim_extract": 90.0,
 }
 
 _DEFAULT_TIMEOUT = 60.0

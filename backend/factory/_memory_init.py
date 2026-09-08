@@ -2,8 +2,8 @@
 
 含まれる関数:
 
-- :func:`_init_memory` : ``WorkingMemoryRegistry`` / ``ShortTermMemory`` /
-  ``LongTermMemory`` / ``VectorStore`` の初期化と SchemaMigrator 連鎖。
+- :func:`_init_memory` : ``WorkingMemoryRegistry`` / ``EpisodicStore`` の
+  初期化と SchemaMigrator 連鎖。
   EvorefMem スキーマバージョン検査 → in-place migration → destructive init
   fallback の判定を行う。
 - :func:`bootstrap_loop_context_at_startup` : 起動時クリーンコンテキスト
@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from backend.app_state import AppState
@@ -24,9 +25,9 @@ from backend.log_config import get_logger
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
-    from backend.free.memory.stores.short_term import ShortTermMemory
+    from backend.free.memory.episodic.store import EpisodicStore
+    from backend.free.memory.semantic.store import SemanticStore
     from backend.free.memory.stores.working import WorkingMemoryRegistry
-    from backend.free.rag.vector_store import VectorStore
 
 logger = get_logger("factory.memory_init")
 
@@ -167,18 +168,39 @@ def apply_semmem_policy_overrides(
         )
 
 
+def _evidence_store_config(cfg: dict[str, Any]) -> SimpleNamespace:
+    """``EvidenceStore`` が読む設定を 1 つのオブジェクトにまとめる。
+
+    ベクトル側 (量子化 / memmap / クラスタ索引) は ``rag.*`` の現行キー、
+    語彙索引の走査上限は ``memory.evidence.lexical`` (c_16 §9) と、出所が
+    分かれている。ストアは属性アクセスで読むので、ここで 1 つの面に畳む。
+    """
+    rag_cfg = cfg.get("rag") or {}
+    cluster = rag_cfg.get("cluster_index") or {}
+    lexical = ((cfg.get("memory") or {}).get("evidence") or {}).get("lexical") or {}
+    return SimpleNamespace(
+        quantization=str(rag_cfg.get("quantization", "int8")),
+        memmap_threshold=int(rag_cfg.get("memmap_threshold", 10000) or 10000),
+        cluster_index=SimpleNamespace(
+            enabled=bool(cluster.get("enabled", True)),
+            n_probe_ratio=float(cluster.get("n_probe_ratio", 0.125) or 0.125),
+        ),
+        lexical=dict(lexical),
+    )
+
+
 def _init_memory(
     state: AppState, cfg: dict[str, Any], resolver: Any,
-) -> tuple["WorkingMemoryRegistry", "ShortTermMemory", Any, "VectorStore | None"]:
+) -> tuple["WorkingMemoryRegistry", "EpisodicStore"]:
     """6. メモリシステム初期化
 
-    WM はセッション別 (:class:`WorkingMemoryRegistry`)。LRU 押し出し / 明示の
-    セッション終了 / shutdown の転送は api 層の ``release_session_turns``
-    (エコー落とし規則 + セッション蓄積の掃除) を注入して行う。
+    WM はセッション別 (:class:`WorkingMemoryRegistry`) で、**プロセス内の窓**
+    に閉じる (c_16 §4.1)。ノートの永続化は :class:`EpisodicStore`、構造化事実は
+    :class:`SemanticStore` の各 1 本で、書き手は sleep-time だけ。
     """
+    from backend.free.memory.episodic.store import EpisodicStore
+    from backend.free.memory.semantic.store import SemanticStore
     from backend.free.memory.stores.working import WorkingMemoryRegistry
-    from backend.free.memory.stores.short_term import ShortTermMemory
-    from backend.free.memory.stores.long_term import LongTermMemory
     from backend.free.memory.init_evorefmem import (
         SCHEMA_VERSION as EVOREFMEM_SCHEMA_VERSION,
         initialize_evorefmem,
@@ -191,12 +213,6 @@ def _init_memory(
         MigrationError,
         SchemaMigrator,
     )
-    from backend.free.memory.semantic.manifest import (
-        ensure_manifest,
-        normalize_embedding_model_id,
-    )
-    from backend.free.rag.vector_store import VectorStore
-
     # EvorefMem スキーマバージョン検査 & 自動初期化
     # - code 側の SCHEMA_VERSION を source of truth とする (cfg 値は参考情報)
     # - SchemaMigrator で in-place migration を試行 (v1 のみの現状は no-op)
@@ -273,33 +289,6 @@ def _init_memory(
                 "run `python scripts/init_evorefmem.py` manually", e,
             )
 
-    # semantic/manifest.json を冪等に用意する
-    # - destructive init 後 / legacy marker migration 後 / 通常起動の
-    #   全経路で同じ呼び出しを通るよう、ここで無条件に ensure する
-    # - model_id / dim は config.yaml::embedding から取得し、manifest
-    #   未作成時のみ反映される (既存 manifest は優先されて上書きされない)
-    try:
-        emb_cfg = cfg.get("embedding", {}) or {}
-        emb_model_name = emb_cfg.get("model_name")
-        emb_dim = emb_cfg.get("dim")
-        if emb_model_name and isinstance(emb_dim, int) and emb_dim >= 1:
-            ensure_manifest(
-                memory_dir,
-                embedding_model_id=normalize_embedding_model_id(emb_model_name),
-                embedding_dim=emb_dim,
-            )
-        else:
-            logger.info(
-                "semantic manifest ensure skipped: embedding config "
-                "incomplete (model_name=%s, dim=%s)",
-                emb_model_name, emb_dim,
-            )
-    except Exception as e:
-        logger.warning(
-            "semantic manifest ensure failed: %s — "
-            "store will run without manifest-backed dim verification", e,
-        )
-
     # EvorefMem トリガ辞書 (pin / fact / classify) の user override 配置先。
     # 同梱 default は ``backend/free/memory/_defaults/triggers/`` 配下。
     triggers_dir = resolver.resolve_local("triggers_dir")
@@ -308,59 +297,69 @@ def _init_memory(
     # extractors が fresh 構築するインスタンス) が同じ user override を拾うようにする。
     from backend.free.memory.notes.note_builder import set_default_triggers_dir
     set_default_triggers_dir(triggers_dir)
-    stm = ShortTermMemory(cfg, triggers_dir=triggers_dir)
-    from backend.free.api.chat.chat_recorder import release_session_turns
+    wm = WorkingMemoryRegistry(cfg)
 
-    wm = WorkingMemoryRegistry(
-        cfg, drain_to=stm, drain_handler=release_session_turns,
+    # エピソード記憶 (c_16 §4.1)。実体は ``<memory_dir>/episodic``。
+    # 埋め込みバックエンドは EvorefGen 側の構築後に注入される
+    # (:func:`attach_episodic_embedder`) — snapshot 生成時にしか使わないので、
+    # 起動順の制約にしない。
+    evidence_cfg = (cfg.get("memory") or {}).get("evidence") or {}
+    retention = evidence_cfg.get("retention")
+    episodic = EpisodicStore(
+        memory_dir,
+        rag_config=_evidence_store_config(cfg),
+        retention=retention if isinstance(retention, dict) else None,
+        debug_logger=getattr(state, "debug_logger", None),
     )
-
-    # 他の永続ストア (vector store / experience / learned patterns) と同様、
-    # 前回終了時のスナップショット (_lifespan._shutdown_stm_save が保存) を
-    # 起動時に復元する。これが無いと restart 跨ぎでノートを失い、sleep-time の
-    # URL/コマンド curation や fact 抽出が再起動前のノートを取りこぼす。
-    # stm.load() はファイル未存在なら no-op。save とパスは完全一致させる。
     try:
-        stm_path = resolver.resolve_local("memory_dir") / "short_term_notes.json"
-        stm.load(stm_path)
-        if stm.notes:
-            logger.info("STM loaded on startup: %d notes", len(stm.notes))
-        elif stm_path.exists():
-            # 「ファイルはあるのに 0 件」は異常系。ここを黙って通すと STM 検索・
-            # 閾値較正・記憶注入が揃って無言で死ぬ (2026-08-16 ライブ監査:
-            # 40 ターン中 37 ターンで注入 0 件)。成功時しかログが無かったため
-            # 起動ログからは正常と区別が付かなかった。
-            logger.warning(
-                "STM snapshot %s exists but yielded 0 notes; memory retrieval "
-                "and threshold calibration will be inert this run", stm_path,
-            )
-    except Exception as e:
-        logger.warning("STM load on startup skipped: %s", e)
+        episodic.load()
+    except Exception as e:  # noqa: BLE001 — 記憶が読めなくても起動は続ける
+        logger.warning("Episodic store load skipped: %s", e)
 
-    # ベクトルストア初期化（LTM 用）
-    vs = None
+    # 構造化事実 (c_16 §4.2)。実体は ``<memory_dir>/semantic``。episodic と
+    # 同じく埋め込みバックエンドは後から注入する (:func:`attach_semantic_embedder`)。
+    semantic = SemanticStore(
+        memory_dir,
+        rag_config=_evidence_store_config(cfg),
+        retention=retention if isinstance(retention, dict) else None,
+        know_half_life=evidence_cfg.get("know_half_life_days"),
+        debug_logger=getattr(state, "debug_logger", None),
+    )
     try:
-        vectors_dir = resolver.resolve_local("vectors_dir")
-        rag_cfg = cfg.get("rag", {})
-        memmap_threshold = rag_cfg.get("memmap_threshold", 10000)
-        vs = VectorStore(
-            vectors_dir,
-            memmap_threshold=memmap_threshold,
-            quantization=str(rag_cfg.get("quantization", "int8")),
-        )
-        if vs.index_path.exists():
-            vs.load()
-            logger.info("Vector store loaded: %d vectors", vs.count)
-        else:
-            logger.info("Vector store initialized: empty (no existing index)")
-        state.vector_store = vs
-    except Exception as e:
-        logger.warning("Vector store init skipped: %s", e)
-
-    ltm = LongTermMemory(vs) if vs else None
+        semantic.load()
+    except Exception as e:  # noqa: BLE001 — 記憶が読めなくても起動は続ける
+        logger.warning("Semantic store load skipped: %s", e)
 
     state.working_memory_registry = wm
-    state.short_term_memory = stm
-    state.long_term_memory = ltm
-    logger.info("Memory system initialized")
-    return wm, stm, ltm, vs
+    state.episodic_memory = episodic
+    state.semantic_memory = semantic
+    state._semantic_stores.clear()
+    logger.info(
+        "Memory system initialized (%d episodic record(s), %d fact(s))",
+        len(episodic), len(semantic),
+    )
+    return wm, episodic
+
+
+def attach_episodic_embedder(episodic: "EpisodicStore", embedder: Any) -> None:
+    """埋め込みバックエンドを後から差し込む (EvorefGen 構築後に呼ぶ)。
+
+    ``EpisodicStore`` は snapshot 生成時にしか埋め込みを呼ばないので、起動順を
+    「Gen より先に Mem」に保ったまま後付けできる。``None`` のままだと索引は
+    語彙側だけになる (縮退動作)。
+    """
+    if episodic is None or embedder is None:
+        return
+    episodic.evidence.embedding_backend = embedder
+
+
+def attach_semantic_embedder(semantic: Any, embedder: Any) -> None:
+    """埋め込みバックエンドを SemMem 側へ後から差し込む (EvorefGen 構築後)。
+
+    ``SemanticStore`` も snapshot 生成時にしか埋め込みを呼ばないので、起動順を
+    「Gen より先に Mem」に保ったまま後付けできる。``None`` のままだと索引は
+    語彙側だけになる (縮退動作)。
+    """
+    if semantic is None or embedder is None:
+        return
+    semantic.evidence.embedding_backend = embedder

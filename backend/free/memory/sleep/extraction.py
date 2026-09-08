@@ -34,7 +34,7 @@ if TYPE_CHECKING:
         MDPTraceExtractor,
     )
     from backend.free.memory.semantic.store import SemanticFactStore
-    from backend.free.memory.stores.short_term import MemoryNote
+    from backend.free.memory.episodic.note import MemoryNote
     from backend.free.memory.notes.subject_canonicalizer import SubjectCanonicalizer
 
 logger = get_logger("memory.sleep.extraction")
@@ -369,7 +369,7 @@ def extract_semantic_facts(
     - ``current_project_id`` 未設定 / project store 取得失敗 → Create / MDP skip
 
     Args:
-        notes: 対象ノート群 (通常は ``ShortTermMemory.notes.values()`` のリスト)。
+        notes: 対象ノート群 (通常は ``EpisodicWorkspace.notes.values()`` のリスト)。
         config: ``memory.facts`` 配下の設定を含む設定 dict。
         store_provider: ``scope`` → ``SemanticFactStore`` を返すコールバック。
         current_project_id: 現在のプロジェクト ID。

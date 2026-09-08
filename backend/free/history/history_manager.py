@@ -14,7 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from backend.free.history.utils import parse_iso, snippet_around
-from backend.free.rag.bm25_retriever import tokenize_ja
+from backend.free.rag.evidence.tokenize import tokenize_ja
 from backend.io import atomic_write_text
 from backend.log_config import get_logger
 from backend.utils import utc_now_dt
@@ -135,7 +135,6 @@ class SessionData:
     turns: list[dict] = field(default_factory=list)
     turn_count: int = 0
     context_files: list[str] = field(default_factory=list)
-    cartridge_ids: list[str] = field(default_factory=list)
     token_info: dict = field(default_factory=dict)
     summary: str | None = None
     summary_embedding: list[float] | None = None
@@ -171,7 +170,6 @@ class SessionData:
             turns=data.get("turns", []),
             turn_count=data.get("turn_count", 0),
             context_files=data.get("context_files", []),
-            cartridge_ids=data.get("cartridge_ids", []),
             token_info=data.get("token_info", {}),
             summary=data.get("summary"),
             summary_embedding=data.get("summary_embedding"),

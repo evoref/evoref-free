@@ -4,10 +4,10 @@ EvorefMem (memory pillar) が他 pillar (EvorefLoop / EvorefLearn) に公開す�
 契約を型として固定する。具象クラスへの直接結合を避け、Fact View 層 や
 wire_pillars での DI を Protocol 境界に乗せる
 
-現状の Free 実装は `backend.free.memory.semantic.store.SemanticFactStore` が
-本 Protocol を **自然に満たす**。Pro 版でも共有クラスを再利用するため、
-Protocol は duck typing で十分機能する (別実装を差し込む必要が生じたら
-将来的に実装差替を行う)
+現状の Free 実装は
+`backend.free.memory.semantic.store.ScopedSemanticStore` (1 スコープに束縛した
+`SemanticStore` のビュー) が本 Protocol を **自然に満たす**。Pro 版でも共有
+クラスを再利用するため、Protocol は duck typing で十分機能する
 
 設計原則 (CLAUDE.md §3 / `docs/f_02_memory_system.md` §6):
 - 最小 API 原則: 実装が実際に呼び出している API だけを宣言する
@@ -26,15 +26,17 @@ from backend.free.memory.types import FactType, SemanticFact
 
 @runtime_checkable
 class SemanticFactStoreProtocol(Protocol):
-    """SemanticFact の永続化抽象。
+    """SemanticFact の永続化抽象 (1 スコープ束縛)。
 
-    1 スコープ (`global` または `project:<id>`) に対応する単一ストアが
-    本 Protocol を満たす。Fact View 層はこの Protocol 経由で
-    永続化層にアクセスし、`SemanticFactStore` 実装への直接結合を避ける。
+    `global` または `project:<id>` に束縛したビューが本 Protocol を満たす。
+    Fact View 層はこの Protocol 経由で永続化層にアクセスし、`SemanticStore`
+    実装への直接結合を避ける。**スコープはフィールドであってディレクトリでは
+    ない** (c_16 §4.2) — 実体は 1 ストアで、ビューが `scope` で絞る。
 
     最小 API セット:
     - CRUD: ``add_fact`` / ``get_fact`` / ``update_fact`` / ``delete_fact``
-    - 置換: ``supersede``
+    - 置換 / 競合: ``supersede`` / ``mark_disputed`` / ``clear_dispute`` /
+      ``disputed_facts``
     - 検索: ``search_by_subject`` / ``search_by_type`` /
       ``search_by_pillar_prefix`` / ``search_by_embedding``
     - 集合: ``all_facts`` / ``pinned_facts`` / ``count_by_type``
@@ -127,6 +129,27 @@ class SemanticFactStoreProtocol(Protocol):
         include_superseded: bool = False,
     ) -> int:
         """``type`` に該当するファクト数を返す。"""
+        ...
+
+    def mark_disputed(self, fact_ids: list[str]) -> int:
+        """競合中のグループを ``veracity=disputed`` + 相互 ``contradicts`` にする。"""
+        ...
+
+    def clear_dispute(self, fact_id: str) -> None:
+        """``disputed`` を解いて ``stated`` に戻す。"""
+        ...
+
+    def disputed_facts(self) -> list[SemanticFact]:
+        """``veracity=disputed`` の live ファクトを返す。"""
+        ...
+
+    def embedding_scores(self, query: np.ndarray) -> dict[str, float]:
+        """クエリに対する全ファクトの素の cosine (注入の関連度ゲート用)。"""
+        ...
+
+    @property
+    def revision(self) -> int:
+        """書込世代番号 (派生物キャッシュの無効化判定に使う)。"""
         ...
 
     def __len__(self) -> int:  # pragma: no cover - trivial

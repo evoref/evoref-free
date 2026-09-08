@@ -6,10 +6,10 @@ EvorefMem 統合仕様 における自律ループの **クリーンコンテキ
 
 提供する API:
 
-1. ``estimate_episodic_tokens(wm, stm)`` — 現在の episodic 層 (Working Memory +
-   Short-Term Memory) の推定トークン量を返す純粋関数
-2. ``reset_episodic_context(wm, stm, ...)`` — episodic 層 (WM/STM) を破棄する
-   (SemMem には触らない)
+1. ``estimate_episodic_tokens(wm, episodic)`` — 窓 + ``short`` ノートの推定
+   トークン量を返す純粋関数
+2. ``reset_episodic_context(wm, ...)`` — ワーキングメモリの窓を破棄する
+   (エピソード記憶 / SemMem には触らない)
 3. ``bootstrap_project_context(view, project_id, ...)`` — LoopFactView 経由で
    SemMem の active ``policy`` / ``pinned`` / ``failure_pattern`` を収集する
    純粋関数
@@ -27,9 +27,8 @@ EvorefMem 統合仕様 における自律ループの **クリーンコンテキ
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
-from backend.free.memory.stores.short_term import ShortTermMemory
 from backend.free.memory.types import SemanticFact
 from backend.free.memory.views.loop import LoopFactView
 from backend.free.memory.stores.working import WorkingMemory
@@ -127,16 +126,16 @@ class BootstrapResult:
 
 def estimate_episodic_tokens(
     wm: WorkingMemory | None,
-    stm: ShortTermMemory | None,
+    episodic: Any | None = None,
 ) -> int:
-    """Working Memory + Short-Term Memory の推定トークン数を返す。"""
+    """ワーキングメモリ + ``short`` ノートの推定トークン数を返す。"""
     total = 0
     if wm is not None:
         for turn in wm.turns:
             content = turn.get("content") or ""
             total += estimate_tokens(content)
-    if stm is not None:
-        for note in stm.notes.values():
+    if episodic is not None:
+        for note in episodic.short_notes():
             total += estimate_tokens(note.content or "")
     return total
 
@@ -153,27 +152,25 @@ def should_reset_episodic(
 
 def reset_episodic_context(
     wm: WorkingMemory | None,
-    stm: ShortTermMemory | None,
+    episodic: Any | None = None,  # noqa: ARG001 — 面の互換 (レコードは消さない)
     *,
     triggered_by: ResetTrigger = "manual",
     threshold_tokens: int | None = None,
     observed_tokens: int | None = None,
 ) -> ResetReport:
-    """episodic context (WM + STM) を破棄する。"""
+    """ワーキングメモリの窓を破棄する。
+
+    **エピソード記憶は消さない。** 書き手は sleep-time だけで (c_16 §2.1)、
+    ここはループの窓を畳むためのリセットなので、永続レコードには触らない。
+    ``stm_notes_dropped`` は報告の互換のため 0 を返す。
+    """
     wm_turns_dropped = 0
-    wm_evicted_dropped = 0
     if wm is not None:
         wm_turns_dropped = len(wm.turns)
-        wm_evicted_dropped = len(wm._evicted)
         wm.turns.clear()
-        wm._evicted.clear()
 
+    wm_evicted_dropped = 0
     stm_notes_dropped = 0
-    if stm is not None:
-        stm_notes_dropped = len(stm.notes)
-        stm.notes.clear()
-        stm._cache.clear()
-        stm._cache_dirty = True
 
     report = ResetReport(
         triggered_by=triggered_by,
@@ -285,7 +282,7 @@ def maybe_reset_and_bootstrap(
     view: LoopFactView,
     *,
     wm: WorkingMemory | None,
-    stm: ShortTermMemory | None,
+    episodic: Any | None,
     project_id: str,
     threshold_tokens: int,
     policy_activation_min_confidence: float = 0.7,
@@ -297,7 +294,7 @@ def maybe_reset_and_bootstrap(
         view: ``stores=[global, project]`` + ``writeback_store=project`` 構成の
             :class:`LoopFactView`。
         wm: 対象 WorkingMemory
-        stm: 対象 ShortTermMemory
+        episodic: 対象 :class:`EpisodicStore` (トークン推定にのみ使う)
         project_id: bootstrap 対象プロジェクト ID
         threshold_tokens: ``config.loop.context_reset_threshold_tokens``
         policy_activation_min_confidence: active 判定の最小 confidence
@@ -310,7 +307,7 @@ def maybe_reset_and_bootstrap(
     if not project_id:
         raise ValueError("project_id must be non-empty")
 
-    observed = estimate_episodic_tokens(wm, stm)
+    observed = estimate_episodic_tokens(wm, episodic)
     triggered = force or should_reset_episodic(observed, threshold_tokens)
     if not triggered:
         return MaybeResetReport(
@@ -324,7 +321,7 @@ def maybe_reset_and_bootstrap(
     trigger: ResetTrigger = "startup" if force else "threshold"
     reset = reset_episodic_context(
         wm,
-        stm,
+        episodic,
         triggered_by=trigger,
         threshold_tokens=threshold_tokens,
         observed_tokens=observed,

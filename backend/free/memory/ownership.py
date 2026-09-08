@@ -138,6 +138,10 @@ def _ow(owner: Pillar, readers: set[Pillar]) -> FactOwnership:
     return FactOwnership(owner=owner, readers=frozenset(readers))
 
 
+#: :data:`FACT_OWNERSHIP` の鍵は永続形では ``Evidence.attrs.fact_type``
+#: (c_16 §4.2)。``SemanticFact.type`` は同じ値の作業用の面で、レコードから
+#: ``fact_type`` が欠けたら ownership を引けないため、
+#: :func:`~backend.free.memory.semantic.fact.evidence_to_fact` はその行を落とす。
 FACT_OWNERSHIP: dict[FactType, FactOwnership] = {
     # ── EvorefMem owned ──────────────────────────────────────────────────
     # personal_fact / preference の readers に "loop" を追加
@@ -145,7 +149,7 @@ FACT_OWNERSHIP: dict[FactType, FactOwnership] = {
     # ユーザープロファイルを読み取るため (EvorefLoop pillar からの読取を許可)。
     "personal_fact":   _ow("mem",   {"mem", "loop"}),
     # readers に "loop" を追加: ToolCallJudge (Loop pillar) が
-    # ``mem.world.url.*`` を URL リコール (Phase 1) で読み取るため。
+    # ``idx.url.*`` を URL リコール (Phase 1) で読み取るため。
     "world_fact":      _ow("mem",   {"mem", "loop"}),
     "preference":      _ow("mem",   {"mem", "loop"}),
     "emotion":         _ow("mem",   {"mem"}),
@@ -157,6 +161,9 @@ FACT_OWNERSHIP: dict[FactType, FactOwnership] = {
     "create":          _ow("mem",   {"mem", "loop", "learn"}),
     "create_task":     _ow("mem",   {"mem", "loop", "learn"}),  # D4: CreateExtractor 由来
     "model":           _ow("mem",   {"mem"}),  # 将来対応
+    # know.<domain>.<topic> の世界知識 (c_16 §4.2)。取得器は Pro 限定だが
+    # レコードは Mem 所有 (注入は [参考情報] 枠)。
+    "claim":           _ow("mem",   {"mem", "loop"}),
 
     # ── EvorefLoop owned ─────────────────────────────────────────────────
     "task":            _ow("loop",  {"loop", "learn"}),
@@ -174,7 +181,7 @@ FACT_OWNERSHIP: dict[FactType, FactOwnership] = {
 }
 """全 :class:`FactType` についての owner / readers 宣言。
 
-11 mem 所有 + 4 loop 所有 + 3 learn 所有 + 1 将来対応 ``model``)。新規 FactType
+12 mem 所有 + 4 loop 所有 + 3 learn 所有 + 1 将来対応 ``model``)。新規 FactType
 を追加した場合は本定数にも対応するエントリを追加すること
 (``assert_fact_ownership_complete`` が網羅性違反をテストで検出する)。
 """

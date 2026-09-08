@@ -1,4 +1,4 @@
-"""統合検索パイプライン: 3層メモリ + Self-RAG（asyncio.gather 並列検索）"""
+"""統合検索パイプライン: エピソード記憶 + カートリッジ + Self-RAG（asyncio.gather 並列検索）"""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from backend.free.constants import (
     SEARCH_HISTORY_OTHER_SESSIONS_HEADER,
 )
 from backend.free.rag.chunk_content_gate import ChunkContentGate, GateConfig
+from backend.free.rag.evidence.types import compute_claim_key
 from backend.free.rag.self_rag_judge import (
     QualityThresholds,
     RetrievalNecessityJudge,
@@ -63,6 +64,31 @@ def _spawn_background(coro, *, name: str) -> asyncio.Task:
     return task
 
 
+#: ストア横断の共通レコード ``(id, cosine, score, text)`` (c_16 §6.3 / §7.2)。
+#:
+#: 3 ストア (episodic / semantic / corpus) の ``search()`` はすべて **素の
+#: cosine** (ゲート用) と **順位式のスコア** (``cos × freshness × confidence ×
+#: store_prior``、ストアの中で計算済み) を分けて返す。層ごとに違う式で並べる
+#: / 層内正規化で揃える / RRF で混ぜる、はすべて廃止した (c_16 §7.2)。
+type StoreEntry = tuple[str, float, float, str]
+
+
+def gate_view(entries: list[StoreEntry]) -> list[tuple[str, float, str]]:
+    """ゲート用の射影 ``(id, cosine, text)`` を cosine 降順で返す。
+
+    品質判定 / content gate / relevance floor は cosine スケール前提で閾値が
+    決まっている (c_16 §7.1「ゲートは素の cosine のみ」)。
+    """
+    view = [(cid, cos, text) for cid, cos, _score, text in entries]
+    view.sort(key=lambda item: -item[1])
+    return view
+
+
+def rank_view(entries: list[StoreEntry]) -> list[tuple[str, float, str]]:
+    """順位付け用の射影 ``(id, score, text)`` (入力の並びを保つ)。"""
+    return [(cid, score, text) for cid, _cos, score, text in entries]
+
+
 @dataclass
 class SearchResult:
     """統合検索の結果"""
@@ -71,21 +97,24 @@ class SearchResult:
     from_memory: bool = False
     skipped: bool = False
     #: ``sources`` に採用されたチャンクの **生スコア** (cosine スケール) の最大値。
-    #: ``sources`` 側のスコアは ``score_normalization`` 適用後で、``minmax`` では
-    #: 層内 max が定義上 1.0 に張り付くため、検索品質の観測値としては使えない
-    #: (Level 0 の ``rag_top1_score`` が 21 ターン全てで厳密に 1.0 になり、
-    #: それを目的関数にする embed_instruction / policy `search` ドメインの
-    #: fitness が定数化していた)。品質判定・gate と同じ「判定は生スコア」の
-    #: 不変則 (docs/f_01 §8.3) に合わせるための観測用フィールド。
+    #: ``sources`` 側のスコアは順位式 (``cos × freshness × confidence ×
+    #: store_prior``) の値で、cosine スケールではないため検索品質の観測値には
+    #: 使えない。品質判定・gate と同じ「判定は生スコア」の不変則
+    #: (docs/f_01 §8.3 / c_16 §7.1) に合わせるための観測用フィールド。
     top_raw_score: float | None = None
+
+    #: このターンで実際に注入した Evidence の id (``<store>:<evidence_id>``、
+    #: c_16 §5.5)。``corpus:`` は corpus パッケージ由来、``episodic:`` は
+    #: 会話ノート由来。学習帰属 (``GenerationConfigRef.evidence_ids``) の材料。
+    evidence_ids: list[str] = field(default_factory=list)
 
 
 def _resolve_fetch_multiplier(cfg: dict) -> int:
     """候補拡張倍率を解決する。
 
-    ``rag.fetch_multiplier`` (既定 1 = 拡張なし) を用いて LTM / カートリッジの
-    取得件数を ``top_k * N`` へ広げ、「広く取って絞る」第1段として候補プールを
-    確保する (STM は ``stm_top_k`` 固定で拡張対象外)。値は [1, 5] にクランプする。
+    ``rag.fetch_multiplier`` (既定 1 = 拡張なし) を用いて各層の取得件数を
+    ``top_k * N`` へ広げ、「広く取って絞る」第1段として候補プールを確保する。
+    値は [1, 5] にクランプする。
     """
     rag_cfg = cfg.get("rag") or {}
     multiplier = rag_cfg.get("fetch_multiplier", 1)
@@ -180,18 +209,18 @@ def _is_repeat_of_a_stored_turn(query: str, notes: list) -> bool:
     return False
 
 
-def query_repeats_a_stored_turn(short_term, query: str) -> bool:
-    """STM 全体を走査して「前にも同じことを聞いたか」を判定する。
+def query_repeats_a_stored_turn(episodic, query: str) -> bool:
+    """短期ノートを走査して「前にも同じことを聞いたか」を判定する。
 
-    層検索は ``asyncio.gather`` で並列に走るため、STM の検索結果を待ってから
-    LTM の扱いを決めることはできない。判定に必要なのはベクトル検索ではなく
-    保存済みノートの文字列一致だけなので、層を起動する **前** に同期で済ませる
-    (ノートは上限 100 件程度、実測 1ms 未満)。
+    層検索は ``asyncio.gather`` で並列に走るため、検索結果を待ってから扱いを
+    決めることはできない。判定に必要なのはベクトル検索ではなく保存済みノートの
+    文字列一致だけなので、層を起動する **前** に同期で済ませる
+    (``short`` tier のノートは snapshot 単位でキャッシュされる)。
     """
-    if short_term is None or not query:
+    if episodic is None or not query:
         return False
     try:
-        notes = list(getattr(short_term, "notes", {}).values())
+        notes = episodic.short_notes()
     except Exception:
         return False
     return _is_repeat_of_a_stored_turn(query, notes)
@@ -216,7 +245,7 @@ def _superseded_mark() -> str:
 
 
 def attach_superseding_corrections(
-    short_term, sources: list[tuple[str, float, str]],
+    episodic, sources: list[tuple[str, float, str]],
 ) -> list[tuple[str, float, str]]:
     """採用済みチャンクのうち訂正されたものに注記を付け、訂正本文を随伴させる。
 
@@ -233,10 +262,10 @@ def attach_superseding_corrections(
     被訂正ノートを落とすのではなく **両方残す**。訂正は話題語を落としている
     ため単独では「何の締切か」が失われる。
     """
-    if short_term is None or not sources:
+    if episodic is None or not sources:
         return sources
     try:
-        notes = list(getattr(short_term, "notes", {}).values())
+        notes = episodic.short_notes()
     except Exception:
         return sources
     kept_ids = {cid for cid, _, _ in sources}
@@ -269,74 +298,86 @@ def attach_superseding_corrections(
     )
     return out
 
-async def _search_stm_layer(
-    short_term, query_vec: np.ndarray, stm_top_k: int,
+async def _search_episodic_layer(
+    episodic, query: str, query_vec: np.ndarray, top_k: int,
     drop_past_answers: bool = False,
-    retired_note_ids: set[str] | None = None,
-) -> tuple[list[tuple[str, float, str]], list[tuple[str, float, str]]]:
-    """Layer 2 短期記憶検索 (< 1ms)。``(順位付け用, ゲート用)`` を返す。
+    threshold: float = 0.0,
+) -> list[StoreEntry]:
+    """エピソード記憶 (``short`` → ``long``) を 1 回で引く。
 
-    STM のスコアは ``類似度 × 0.6 + LightMem × 0.4`` (+ pin 加点) で、これは
-    順位付けには有用だがゲート判定には使えない。品質判定 / floor / content gate
-    は **cosine スケール前提**で閾値が決まっており、LTM は素の cosine を返す。
-    STM だけ別スケールを流すと閾値が層ごとに違う意味になるため、ゲート用には
-    素の cosine を載せた同順の別リストを返す (docs/f_02 §品質ゲート)。
+    旧 STM 層 + LTM 層の置き換え (c_16 §4.1)。``EpisodicStore.search`` が
+    ``short`` シャードを先に、続いて直近 12 か月の ``long`` シャードを引き、
+    順位式 (``cos × freshness × confidence × store_prior``) で並べる。
 
-    失敗時は両方とも空リスト。
+    Args:
+        threshold: **素の cosine** のゲート (c_16 §7.1)。較正が効いている
+            ときだけ呼出側が較正済み ``relevance`` を渡す。較正が無い構成で
+            静的閾値を渡すと、埋め込みモデル次第で到達不能になり黙って全件
+            落とすため 0.0 のままにする (呼出側 :func:`_store_cosine_gate`)。
+
+    Returns:
+        ``(id, cosine, score, text)`` のリスト。``cosine`` はゲート用の素の
+        値、``score`` は順位式の値。品質判定 / floor / content gate は
+        cosine スケール前提で閾値が決まっている (c_16 §7.1)。
+
+    ``retracted`` / ``superseded`` (訂正で畳まれたノート、要約に吸収された
+    ノート) はストア側のアクティブマスクが落とすので、呼出側で退役 id を
+    集める必要は無くなった (c_16 §8: ``_collect_retired_note_ids`` の廃止)。
     """
+    if episodic is None:
+        return []
     loop = asyncio.get_running_loop()
     try:
         hits = await run_in_executor_with_context(
             loop, _search_executor,
-            short_term.retrieve_top_k_detailed, query_vec, stm_top_k,
+            lambda: episodic.search(
+                query, query_vec, top_k, threshold=threshold,
+            ),
         )
-        # private ノートは [参考情報] 経路にも出さない (MemoryInjector 側の
-        # 除外と対。``retrieve_top_k_detailed`` の既定 ``include_private=False``
-        # が本命で、ここは簡易 STM 実装 / 旧シグネチャに対する二重ガード)。
-        hits = [h for h in hits if not getattr(h[0], "private", False)]
-        # 同じ質問を前にもしていた場合だけ、assistant ノート (= その質問への
-        # 前回の回答) を落とす。詳細は _is_repeat_of_a_stored_turn を参照。
-        if drop_past_answers:
-            before = len(hits)
-            hits = [
-                h for h in hits
-                if getattr(h[0], "source", "user") == "user"
-            ]
-            if len(hits) != before:
-                logger.info(
-                    "Step 2 STM: this query repeats an earlier turn; dropped "
-                    "%d assistant note(s) so the previous answer is not "
-                    "handed back as reference material",
-                    before - len(hits),
-                )
-        # 値が supersede された発話は現在値として参照させない。
-        # MemoryInjector 側 ([関連する記憶]) は別途落としているが、STM は
-        # **2 経路で注入される** — ここを塞がないと同じノートが [参考情報]
-        # として出る (2026-08-27 の実機検証: injector が 3 件落とした同じ
-        # ターンで「データベース管理者」が返り続けた)。
-        if retired_note_ids:
-            before = len(hits)
-            hits = [h for h in hits if h[0].id not in retired_note_ids]
-            if len(hits) != before:
-                logger.info(
-                    "Step 2 STM: dropped %d note(s) whose value was "
-                    "superseded by a later correction",
-                    before - len(hits),
-                )
-        ranked = [(note.id, combined, note.content) for note, combined, _ in hits]
-        gated = [(note.id, relevance, note.content) for note, _, relevance in hits]
-        logger.debug(
-            "Step 2 STM: %d hits, combined=[%s], relevance=[%s]",
-            len(ranked),
-            ", ".join(f"{s:.3f}" for _, s, _ in ranked),
-            ", ".join(f"{s:.3f}" for _, s, _ in gated),
-        )
-        return ranked, gated
     except asyncio.CancelledError:
         raise
-    except (RuntimeError, ValueError, TypeError) as e:
-        logger.warning("STM search failed: %s", e)
-        return [], []
+    except (RuntimeError, ValueError, TypeError, OSError) as e:
+        logger.warning("Episodic search failed: %s", e)
+        return []
+
+    if drop_past_answers:
+        before = len(hits)
+        hits = [h for h in hits if h.record.origin == "user"]
+        if len(hits) != before:
+            logger.info(
+                "Episodic: this query repeats an earlier turn; dropped %d "
+                "assistant note(s) so the previous answer is not handed back "
+                "as reference material", before - len(hits),
+            )
+
+    entries: list[StoreEntry] = []
+    n_dropped = n_cleaned = 0
+    for hit in hits:
+        text = hit.text
+        if _is_injected_output(text):
+            n_dropped += 1
+            continue
+        trimmed = _trim_file_payload(text)
+        cleaned = _sanitize_episode_chunk(trimmed)
+        if cleaned is None:
+            n_dropped += 1
+            continue
+        if cleaned != text:
+            n_cleaned += 1
+        entries.append((hit.id, hit.cosine, hit.score, cleaned))
+    if n_cleaned or n_dropped:
+        logger.info(
+            "Episodic: stripped internal ids from %d note(s), dropped %d "
+            "that carried nothing but ids or our own injected output",
+            n_cleaned, n_dropped,
+        )
+    logger.debug(
+        "Episodic layer: %d hit(s), score=[%s] cosine=[%s]",
+        len(entries),
+        ", ".join(f"{e[2]:.3f}" for e in entries),
+        ", ".join(f"{e[1]:.3f}" for e in entries),
+    )
+    return entries
 
 
 #: 「注入するために組み立てたテキスト」だけに現れるマーカー。これを含む LTM
@@ -460,145 +501,32 @@ def _sanitize_episode_chunk(text: str) -> str | None:
     return "; ".join(kept)
 
 
-def _drop_past_answers(
-    long_term, results: list[tuple[str, float, str]],
-) -> list[tuple[str, float, str]]:
-    """assistant 由来のチャンクを落とす (繰り返し質問のときだけ呼ぶ)。
-
-    発話者は ``absorb_from_short_term`` が ``note_meta`` に残しているので、
-    ``LongTermMemory.chunk_source`` で読める。素性は 2026-08-09 に「検索側で
-    どう扱うかは観測できるようになってから実測で決める」として保存され、
-    読み側では使われていなかった。
-
-    実測 (2026-08-16): STM 84 件のうち assistant 39 件 (46%)。技術質問では上位
-    5 件中 3〜4 件が過去の回答で、それらは **有用な参照** だった (asyncio の
-    コード例など)。したがって一律には落とさず、「前にも同じことを聞いていた」
-    ターンに限る — その場合に返るのは同じ質問への前回の回答であり、モデルは
-    それを丸写しする。
-    """
-    kept: list[tuple[str, float, str]] = []
-    for cid, score, text in results:
-        if long_term.chunk_source(cid) == "assistant":
-            continue
-        kept.append((cid, score, text))
-    if len(kept) != len(results):
-        logger.info(
-            "Step 3 LTM: this query repeats an earlier turn; dropped %d "
-            "assistant chunk(s) so the previous answer is not handed back "
-            "as reference material",
-            len(results) - len(kept),
-        )
-    return kept
-
-
-async def _search_ltm_layer(
-    long_term, query_vec: np.ndarray, top_k: int,
-    drop_past_answers: bool = False,
-    query_text: str = "",
-    rescore_candidates: int = 0,
-) -> tuple[list[tuple[str, float, str]], frozenset[str]]:
-    """Layer 3 長期記憶検索 (< 5ms)。LTM 未設定 / 失敗時は空リスト。
-
-    ``search_hybrid`` があれば **ベクトル + BM25 の RRF** で候補を集める。
-    スコアは常に素のコサインなので、後段の品質判定 / フロアの閾値は不変。
-
-    ``rescore_candidates`` (``rag.rescore_candidates``) が正なら
-    ``VectorStore.search`` の float32 rescore 候補数として渡す。0 は
-    渡さない (ストア側の既定 ``max(50, top_k*3)``、旧シグネチャの
-    ダブルとも互換)。
-
-    注入用に組み立てた文字列が回り込んだチャンクはここで落とす
-    (:data:`_INJECTED_OUTPUT_MARKERS`)。
-
-    Returns:
-        ``(結果リスト, 語彙アンカーの chunk_id 集合)``。
-    """
-    if long_term is None:
-        return [], frozenset()
-    loop = asyncio.get_running_loop()
-    anchors: frozenset[str] = frozenset()
-    try:
-        hybrid = getattr(long_term, "search_hybrid", None)
-        extra = {"rescore_candidates": rescore_candidates} if rescore_candidates > 0 else {}
-        if hybrid is not None and query_text:
-            results, anchors = await run_in_executor_with_context(
-                loop, _search_executor,
-                lambda: hybrid(query_vec, query_text, top_k, **extra),
-            )
-        else:
-            results = await run_in_executor_with_context(
-                loop, _search_executor,
-                lambda: long_term.search(query_vec, top_k, **extra),
-            )
-        if drop_past_answers:
-            results = _drop_past_answers(long_term, results)
-        kept = [r for r in results if not _is_injected_output(r[2])]
-        if len(kept) != len(results):
-            logger.info(
-                "Step 3 LTM: dropped %d chunk(s) that are our own injected "
-                "output (search_history render) from episodic memory",
-                len(results) - len(kept),
-            )
-        trimmed = [(cid, score, _trim_file_payload(text)) for cid, score, text in kept]
-        n_trimmed = sum(1 for a, b in zip(kept, trimmed) if a[2] != b[2])
-        if n_trimmed:
-            logger.info(
-                "Step 3 LTM: trimmed file payload from %d legacy episodic "
-                "chunk(s) (ingested before the summariser)", n_trimmed,
-            )
-        # エピソード記憶の内部識別子 (episode / conversation / outcome) を落とす。
-        # 識別子だけで情報が残らないチャンクは丸ごと捨てる。
-        sanitized: list[tuple[str, float, str]] = []
-        n_dropped = n_cleaned = 0
-        for cid, score, text in trimmed:
-            cleaned = _sanitize_episode_chunk(text)
-            if cleaned is None:
-                n_dropped += 1
-                continue
-            if cleaned != text:
-                n_cleaned += 1
-            sanitized.append((cid, score, cleaned))
-        if n_cleaned or n_dropped:
-            logger.info(
-                "Step 3 LTM: stripped internal ids from %d episodic chunk(s), "
-                "dropped %d that carried nothing but ids",
-                n_cleaned, n_dropped,
-            )
-        results = sanitized
-        kept_ids = {cid for cid, _, _ in results}
-        logger.debug("Step 3 LTM: %d results", len(results))
-        return results, frozenset(anchors & kept_ids)
-    except asyncio.CancelledError:
-        raise
-    except (RuntimeError, ValueError, TypeError, OSError) as e:
-        logger.warning("LTM search failed: %s", e)
-        return [], frozenset()
-
-
-async def _search_cartridge_layer(
+async def _search_corpus_layer(
     cartridge_mgr, query_vec: np.ndarray, top_k: int,
     timeout_ms: int = 0,
     rescore_candidates: int = 0,
-) -> tuple[list[tuple[str, float, str]], list[tuple[str, float, str]]]:
-    """カートリッジ検索。``(順位付け用, ゲート用)`` を返す。
+) -> list[StoreEntry]:
+    """corpus (旧カートリッジ) 検索。``(id, cosine, score, text)`` を返す。
 
-    STM 層と同じ 2 系統。順位付け用は ``cosine × priority`` (カートリッジの
-    ``priority`` を層内・層間の並びに効かせる)、ゲート用は **素の cosine**。
-    品質判定 / floor / content gate は cosine スケール前提で閾値が決まって
-    いるので、priority を掛けた値を流すと **priority が閾値を偽装する**
-    (priority 2.0 のカートリッジは cosine 0.15 でも floor 0.3 を越える)。
+    ``score`` は ``CorpusStore.search`` が **ストアの中で** 計算した順位式
+    (``cos × freshness × confidence × store_prior``、c_16 §7.2) の値。
+    ``store_prior`` は ``memory.evidence.ranking.store_prior.corpus`` と
+    ``corpus/manifest.json`` の ``store_prior_overrides`` から解決される。
+    ゲート用の ``cosine`` を分けて持つのは、品質判定 / floor / content gate が
+    cosine スケール前提で閾値を決めているため — 合成スコアを閾値に流すと
+    **``store_prior`` が閾値を偽装する** (c_16 §7.1)。
 
-    ``search_detailed`` (cosine と priority を分けて返す) があればそれを使い、
-    無ければ ``search`` の戻りを両方に使う (旧ダブル互換)。
+    ``search_detailed`` (cosine と score を分けて返す) があればそれを使い、
+    無ければ ``search`` の戻り (score のみ) を両方に使う。
 
     ``timeout_ms`` が 1 以上の場合、検索全体にタイムアウトを適用する。
     タイムアウト時は空を返し、チャット応答を止めないようにする。
     マネージャ未設定 / 失敗時 (:class:`~backend.exceptions.RAGError` を含む —
-    次元不一致のカートリッジが 1 つあるだけで ``asyncio.gather`` ごと落ち、
+    次元不一致のパッケージが 1 つあるだけで ``asyncio.gather`` ごと落ち、
     そのターンの記憶が全部消えていた) も空。
     """
     if cartridge_mgr is None or not hasattr(cartridge_mgr, "search"):
-        return [], []
+        return []
     loop = asyncio.get_running_loop()
     detailed = getattr(cartridge_mgr, "search_detailed", None)
     extra = {"rescore_candidates": rescore_candidates} if rescore_candidates > 0 else {}
@@ -617,56 +545,57 @@ async def _search_cartridge_layer(
             raw = await asyncio.wait_for(coro, timeout=timeout_ms / 1000.0)
         else:
             raw = await coro
-        ranked: list[tuple[str, float, str]] = []
-        gated: list[tuple[str, float, str]] = []
+        entries: list[StoreEntry] = []
         for entry in raw:
             if len(entry) >= 4:
-                cid, cosine, text, priority = entry[0], entry[1], entry[2], entry[3]
-                ranked.append((cid, float(cosine) * float(priority), text))
-                gated.append((cid, float(cosine), text))
+                cid, cosine, score, text = entry[0], entry[1], entry[2], entry[3]
+                entries.append((cid, float(cosine), float(score), text))
             else:
                 cid, score, text = entry[0], entry[1], entry[2]
-                ranked.append((cid, score, text))
-                gated.append((cid, score, text))
-        logger.debug("Step 3b cartridge: %d results", len(ranked))
-        return ranked, gated
+                entries.append((cid, float(score), float(score), text))
+        logger.debug("Step 3b corpus: %d results", len(entries))
+        return entries
     except asyncio.TimeoutError:
         logger.warning(
-            "Cartridge search timed out after %d ms (L3); "
+            "Corpus search timed out after %d ms (L3); "
             "returning empty results to keep chat responsive",
             timeout_ms,
         )
-        return [], []
+        return []
     except asyncio.CancelledError:
         raise
     except (RAGError, RuntimeError, ValueError, TypeError, OSError) as e:
-        logger.warning("Cartridge search failed: %s", e)
-        return [], []
+        logger.warning("Corpus search failed: %s", e)
+        return []
 
 
 async def _try_quality_expansion(
     quality: str,
-    merged: list[tuple[str, float, str]],
+    merged: list[StoreEntry],
     quality_judge: RetrievalQualityJudge,
     query: str,
     query_vec: np.ndarray,
     working_mem,
-    long_term,
+    episodic,
     top_k: int,
     noise_sigma: float,
-) -> tuple[list[tuple[str, float, str]], str]:
-    """品質不足 (low) 時にクエリ拡張で再検索を試みる。`(merged, quality)` を返す。"""
+) -> tuple[list[StoreEntry], str]:
+    """品質不足 (low) 時にクエリ拡張で再検索を試みる。`(merged, quality)` を返す。
+
+    品質判定は **素の cosine** に対して行う (c_16 §7.1) ので、判定へ渡すのは
+    :func:`gate_view` の射影。
+    """
     if quality != "low" or not merged:
         return merged, quality
     logger.debug("Quality low — attempting query expansion")
     expanded_results = await _expand_and_research(
-        query, query_vec, working_mem, long_term, top_k,
+        query, query_vec, working_mem, episodic, top_k,
         noise_sigma=noise_sigma,
     )
     if not expanded_results:
         return merged, quality
-    merged = _merge_results(merged, expanded_results, [])
-    quality = quality_judge.judge(merged)
+    merged = _merge_results(merged, expanded_results)
+    quality = quality_judge.judge(gate_view(merged))
     logger.debug("After expansion: %d results, quality=%s", len(merged), quality)
     return merged, quality
 
@@ -674,8 +603,7 @@ async def _try_quality_expansion(
 def _log_memory_search_state(
     debug_logger,
     context_count: int,
-    stm_results: list,
-    ltm_results: list,
+    episodic_results: list,
     semmem_stats: dict | None = None,
 ) -> None:
     """DebugLogger 設定時のみメモリ検索状態を記録する。
@@ -689,8 +617,7 @@ def _log_memory_search_state(
         session_id="unified_search",
         memory_dump={
             "working_turns": context_count,
-            "stm_notes": len(stm_results),
-            "ltm_vectors": len(ltm_results),
+            "episodic_notes": len(episodic_results),
         },
         semmem_stats=semmem_stats,
     )
@@ -844,12 +771,38 @@ def _resolve_keep_floor(
     return absolute
 
 
+def _store_cosine_gate(
+    rag_cfg: dict, thresholds: QualityThresholds,
+) -> float:
+    """各ストアの ``search(threshold=…)`` へ渡す **素の cosine** の棒。
+
+    c_16 §7.1 は「ゲートは素の cosine のみ、ストア別閾値はモデルプロファイル
+    同期」と定める。同期の実体は
+    :mod:`backend.free.rag.memory_threshold_calibration` (実ストアの
+    クエリ↔レコード分布から ``relevance`` を導く) で、これが効いているときだけ
+    棒を渡す。
+
+    較正が無い構成で config の静的値 (既定 0.65) を渡してはいけない。静的な
+    絶対閾値は埋め込みモデルを替えると到達不能になり **黙って全件落とす** —
+    本リポジトリは既に 2 度同じ壊れ方をしている
+    (:data:`_RELATIVE_FLOOR_RATIO` の説明を参照)。較正が無いターンは 0.0 を
+    返し、到達性の保険を持つ :func:`_resolve_keep_floor` に一本化する。
+    """
+    self_rag = rag_cfg.get("self_rag") or {}
+    if str(self_rag.get("threshold_mode", "auto")) != "auto":
+        return 0.0
+    from backend.free.rag.memory_threshold_calibration import get_active_calibration
+
+    if get_active_calibration() is None:
+        return 0.0
+    return max(0.0, float(thresholds.relevance))
+
+
 async def unified_search(
     query: str,
     query_vec: np.ndarray,
     working_mem,
-    short_term,
-    long_term,
+    episodic,
     cartridge_mgr=None,
     config: dict | None = None,
     aux_client=None,
@@ -862,27 +815,35 @@ async def unified_search(
     *,
     session_id: str = "default",
     judge_tracker: "JudgeUsageTracker | None" = None,
-    retired_note_ids: set[str] | None = None,
 ) -> SearchResult:
-    """統合検索パイプライン: Self-RAG + 3層メモリ
+    """統合検索パイプライン: Self-RAG + エピソード記憶 + corpus
 
-    **SemMem はここでは検索しない。** 融合するのは STM / LTM / カートリッジの
-    3 層だけで、``semmem_stats`` はログ用の受け渡しにすぎない。SemMem が
-    プロンプトへ載る経路は ``chat_service.build_semmem_injection`` →
+    **SemMem (semantic) はここでは検索しない。** 融合するのはエピソード記憶と
+    corpus の 2 ストアだけで、``semmem_stats`` はログ用の受け渡しにすぎない。
+    semantic がプロンプトへ載る経路は ``chat_service.build_semmem_injection`` →
     :class:`~backend.free.memory.pipeline.injector.MemoryInjector` の **完全に
-    別系統** (全件 + 関連度ゲート + Tier パッキング) で、RRF も top_k 融合も
-    通らない。2 系統に分かれているのは、SemMem が「属性スロットの現在値」を
-    扱うのに対し RAG は「チャンクの関連度」を扱うからで、順位付けとして混ぜる
-    対象ではない (2026-09-01 監査 F12 で設計書 §8 の記述を実装へ合わせた)。
+    別系統** (全件 + 関連度ゲート + Tier パッキング) で、top_k 融合を通らない。
+    2 系統に分かれているのは、semantic が「属性スロットの現在値」を扱うのに対し
+    RAG は「チャンクの関連度」を扱うからで、注入枠 (``[関連する記憶]`` /
+    ``[参考情報]``) そのものが別だからでもある (2026-09-01 監査 F12)。
+    **順位式は 3 ストアで共通の 1 本** (c_16 §7.2) で、semantic 側も
+    ``SemanticStore.search()`` の同じスコアで並べる。
 
-    層をまたぐ融合 (``_merge_results``) は **RRF ではない** — スコア降順の
-    マージ + 先勝ち dedup (``score_normalization`` を指定した場合は層内正規化を
-    挟む)。RRF は LTM 層の **内部** (``search_hybrid``) にのみある。
+    ストアをまたぐ融合 (:func:`_merge_results`) は RRF でも層内正規化でもない
+    — 各ストアの ``search()`` が返す ``score`` (= ``cos × freshness ×
+    confidence × store_prior``) をそのまま降順に並べ、``claim_key`` が同じ
+    言明を 1 件へ畳む。``rag.score_normalization`` / ``rag.rrf_k`` /
+    カートリッジ ``priority`` は廃止した (c_16 §7.2 / §8)。
+
+    ゲートは **素の cosine のみ** (c_16 §7.1)。較正 (``threshold_mode: auto`` +
+    ``memory_threshold_calibration``) が効いているときは各ストアの
+    ``search(threshold=…)`` に較正済み ``relevance`` を渡し、効いていない構成
+    では 0.0 のまま後段の :func:`_resolve_keep_floor` に任せる
+    (:func:`_store_cosine_gate`)。
 
     判定はルールベース + ベクトル演算で完結する (LLM 呼び出しゼロ)。
-    STM / LTM / カートリッジ検索を asyncio.gather で並列実行する。
-    ``rag.fetch_multiplier`` が 2 以上の場合、LTM / カートリッジの取得件数を
-    `top_k * N` に拡張する (STM は `stm_top_k` 固定)。
+    エピソード記憶 / corpus 検索を asyncio.gather で並列実行する。
+    ``rag.fetch_multiplier`` が 2 以上の場合、取得件数を `top_k * N` に拡張する。
 
     Args:
         session_id: content gate の発火カウンタキー。
@@ -942,7 +903,7 @@ async def unified_search(
         )
         return SearchResult(skipped=True, from_memory=True)
 
-    # Step 2-3: STM / LTM / カートリッジを asyncio.gather で並列実行（設計書 4.10.1）
+    # Step 2-3: エピソード記憶 / corpus を asyncio.gather で並列実行
     # fetch_multiplier >= 2 のときは fetch_k 件を取得し、後段で top_k に絞る
     cart_timeout_ms = int(rag_cfg.get("cartridge_search_timeout_ms", 3000))
     # 取得そのものの所要。necessity ゲートの費用対効果を測るために分けて計る
@@ -952,85 +913,48 @@ async def unified_search(
     # 「前にも同じことを聞いたか」は層検索の結果ではなく保存済みノートの文字列
     # 一致で決まるので、gather の前に同期で確定させる (層は並列に走るため、
     # STM の結果を待ってから LTM の扱いを決めることはできない)。
-    drop_past_answers = query_repeats_a_stored_turn(short_term, query)
+    drop_past_answers = query_repeats_a_stored_turn(episodic, query)
     if drop_past_answers:
         logger.info(
             "This query repeats an earlier turn; past answers will be kept out "
             "of the reference block (query=%r)", query[:50],
         )
-    stm_pair, ltm_pair, cart_pair = await asyncio.gather(
-        _search_stm_layer(
-            short_term, query_vec, stm_top_k, drop_past_answers,
-            retired_note_ids=retired_note_ids,
+    # ゲートは **素の cosine** を全ストア共通の較正済みの棒で掛ける (c_16 §7.1)。
+    thresholds = QualityThresholds.from_config(rag_cfg)
+    store_gate = _store_cosine_gate(rag_cfg, thresholds)
+    epi_entries, corpus_entries = await asyncio.gather(
+        _search_episodic_layer(
+            episodic, query, query_vec, fetch_k, drop_past_answers,
+            threshold=store_gate,
         ),
-        _search_ltm_layer(
-            long_term, query_vec, fetch_k, drop_past_answers, query,
-            rescore_candidates=rescore_candidates,
-        ),
-        _search_cartridge_layer(
+        _search_corpus_layer(
             cartridge_mgr, query_vec, fetch_k, timeout_ms=cart_timeout_ms,
             rescore_candidates=rescore_candidates,
         ),
     )
-    # STM は順位付け用 (combined) とゲート用 (素の cosine) の 2 系統を返す。
-    stm_results, stm_gate_results = stm_pair
-    # LTM は結果と「語彙アンカー」(クエリの希少語を実際に含む chunk_id) を返す。
-    ltm_results, lexical_anchors = ltm_pair
-    # カートリッジも順位付け用 (cosine × priority) とゲート用 (素の cosine)。
-    cart_results, cart_gate_results = cart_pair
     if timer is not None:
         timer.stop("retrieval_ms")
 
-    # Lazy Contextual Retrieval — LTM hit について on-demand で
+    # Lazy Contextual Retrieval — エピソード記憶の hit について on-demand で
     # プレフィックス生成を非同期タスクとして起動する。fire-and-forget なので
     # 本 retrieval のレイテンシには影響せず、次回以降の同一 chunk ヒット時に
     # contextual_text が使えるようになる。
-    if lazy_contextual is not None and lazy_contextual.is_active and ltm_results:
-        ltm_chunk_ids = [cid for cid, _, _ in ltm_results]
+    if lazy_contextual is not None and lazy_contextual.is_active and epi_entries:
+        hit_ids = [entry[0] for entry in epi_entries]
         _spawn_background(
-            lazy_contextual.on_retrieval_hits(ltm_chunk_ids),
-            name=f"lazy_contextual_hits[{len(ltm_chunk_ids)}]",
+            lazy_contextual.on_retrieval_hits(hit_ids),
+            name=f"lazy_contextual_hits[{len(hit_ids)}]",
         )
 
-    # Step 4: 結果マージ。merged_raw は生スコア (品質判定 / gate / クエリ拡張用)、
-    # merged は最終順位付け用。score_normalization でクロスレイヤ正規化を適用し、
-    # STM/LTM/cartridge の異種スコアスケールの歪みを吸収する。
-    # merged_raw は STM / cartridge のゲート用スコア (素の cosine) を使う。LTM は
-    # 元から cosine なので、これで 3 層すべてが同じスケールに揃う。merged 側は
-    # STM の combined (LightMem / pin 込み) と cartridge の cosine × priority で
-    # 順位付けする。
-    norm = rag_cfg.get("score_normalization", "none")
-    merged_raw = _merge_results(stm_gate_results, ltm_results, cart_gate_results)
-    if norm == "none":
-        # 正規化なしのときは **3 層とも素の cosine** で並べる。
-        #
-        # 以前は STM だけ combined (cosine*0.6 + LightMem*0.4 + pin 加点) を
-        # 順位付けに使っていた。層ごとにスケールが違う値を 1 本の降順ソートへ
-        # 混ぜると、LightMem 項のぶん STM が LTM / カートリッジより系統的に
-        # 上へ来る。``merged[:top_k]`` は層をまたいだ順位で切るので、これは
-        # 「新しい会話ノートが、より関連する長期記憶を押しのける」形で効く。
-        #
-        # LightMem の役割は失われない。STM の内部で **どのノートを候補に
-        # するか** (``retrieve_top_k_detailed`` が combined 順に stm_top_k 件)
-        # を決めるのが本来の仕事で、層をまたいだ関連性の比較は素の cosine の
-        # 担当。ゲート (品質判定 / floor / content gate) が既に素の cosine を
-        # 使っているのと同じ理由。
-        #
-        # カートリッジの priority だけは順位付けに残す (ゲートには掛けない)。
-        # priority が既定 1.0 なら merged_raw と同一なので、そのときは
-        # マージを 2 度計算しない。
-        if cart_results == cart_gate_results:
-            merged = list(merged_raw)
-        else:
-            merged = _merge_results(stm_gate_results, ltm_results, cart_results)
-    else:
-        merged = _merge_results(
-            stm_results, ltm_results, cart_results, normalization=norm,
-        )
-    logger.debug(
-        "Step 4 merge: %d unique results after dedup (normalization=%s)",
-        len(merged_raw), norm,
-    )
+    # Step 4: ストア横断のマージ。順位式は 1 本 (c_16 §7.2) なので、層内正規化
+    # (``rag.score_normalization``) も RRF も要らない。``merged`` は順位付け用
+    # (score 降順)、``merged_raw`` は同じ集合を **素の cosine** で見た射影
+    # (品質判定 / gate / floor 用)。2 つは同じ id 集合を指すので、片方で落とした
+    # ものをもう片方へ射影する下流の手順が id で完全に揃う。
+    merged_entries = _merge_results(epi_entries, corpus_entries)
+    merged = rank_view(merged_entries)
+    merged_raw = gate_view(merged_entries)
+    logger.debug("Step 4 merge: %d unique results after dedup", len(merged_raw))
 
     # Step 4.5: 取得直後の内容精査ゲート — 低価値 chunk を pruning し、後続の
     # 品質判定 / クエリ拡張の候補数を縮小する。
@@ -1055,31 +979,28 @@ async def unified_search(
             if timer is not None:
                 timer.stop("content_gate_ms")
         kept = {cid for cid, _, _ in merged_raw}
-        merged = [t for t in merged if t[0] in kept]
-        # 公平性保証 (Step 7.5) は cart_results から強制注入するので、gate で
-        # 落としたチャンクが裏口から戻らないよう同じ集合に揃える。
-        cart_gate_results = [c for c in cart_gate_results if c[0] in kept]
+        merged_entries = [e for e in merged_entries if e[0] in kept]
+        merged = rank_view(merged_entries)
+        merged_raw = gate_view(merged_entries)
         logger.debug("Step 4.5 content gate: %d results after prune", len(merged_raw))
 
     # Step 5: Self-RAG 品質判定 (ベクトル閾値、< 0.1ms)
     # 判定は常に生スコア (merged_raw) に対して行う。品質3閾値は cosine 分布前提の
-    # ため、正規化スコアを渡すと閾値の意味が崩れる。
-    thresholds = QualityThresholds.from_config(rag_cfg)
+    # ため、順位式のスコアを渡すと閾値の意味が崩れる (c_16 §7.1)。
     # decision.jsonl に記録 (decision_point=``self_rag_judge_path``)
     quality_judge = RetrievalQualityJudge(thresholds, debug_logger=debug_logger)
     quality = quality_judge.judge(merged_raw)
     logger.debug("Step 5 quality: %s", quality)
 
     # Step 6: 品質不足時のクエリ拡張フォールバック (生スコアで再検索)。
-    # 拡張が発火した場合 (quality=="low" の稀ケース) は結果集合が変わるため、
-    # 正規化側 merged も生順 (拡張結果込み) にフォールバックして確実に届ける。
     expanded, quality = await _try_quality_expansion(
-        quality, merged_raw, quality_judge, query, query_vec,
-        working_mem, long_term, top_k, noise_sigma,
+        quality, merged_entries, quality_judge, query, query_vec,
+        working_mem, episodic, top_k, noise_sigma,
     )
-    if expanded is not merged_raw:
-        merged_raw = expanded
-        merged = expanded
+    if expanded is not merged_entries:
+        merged_entries = expanded
+        merged = rank_view(merged_entries)
+        merged_raw = gate_view(merged_entries)
 
     # Step 6.5: 品質 low の結果はそのままでは添付しない。クエリ拡張 (Step 6) を
     # 経ても low のままなら、無関連チャンクをコンテキストへ注入する害の方が大きい
@@ -1130,27 +1051,6 @@ async def unified_search(
     )
     if floor > 0.0:
         kept_ids = {cid for cid, score, _ in merged_raw if score >= floor}
-        # 語彙アンカーの免除。
-        #
-        # フロアはコサインの棒なので、**密ベクトルが原理的に苦手なもの**
-        # (型番・パス・エラーコード・固有名詞のような literal) は、ユーザーが
-        # 名指ししていても低いコサインのまま落ちる。BM25 側の df から
-        # 「コーパスの 1% 未満にしか現れないトークン」を希少語と定義し、
-        # そのトークンを **実際に含む** チャンクだけをフロアから免除する。
-        #
-        # 相対バーではなく df を使うのは、相対バーだと top1 が定義上必ず越えて
-        # しまうため (注入側で同じ理由から相対フロアを採らなかった。
-        # ``MemoryInjector._resolve_relevance_thresholds`` のコメント参照)。
-        # df 比はコーパス規模にも埋め込みモデルにも依存しないので、静的な絶対
-        # 閾値が差し替えで到達不能になる事故を繰り返さない。
-        anchored = {cid for cid in lexical_anchors if cid not in kept_ids}
-        if anchored:
-            kept_ids |= anchored
-            logger.info(
-                "Relevance floor: %d chunk(s) exempted as lexical anchors "
-                "(query names a rare literal they contain) for query: %s",
-                len(anchored), query[:50],
-            )
         passed = [t for t in merged if t[0] in kept_ids]
         if len(passed) != len(merged):
             logger.info(
@@ -1169,10 +1069,6 @@ async def unified_search(
                 ],
             )
         merged = passed
-        # 公平性保証 (Step 7.5) は cart_results から未代表カートリッジを
-        # 強制注入するため、フロアを通していないチャンクが裏口から戻る。
-        # カートリッジ側にも同じ棒を掛ける (関連性の棒は経路で変わらない)。
-        cart_gate_results = [c for c in cart_gate_results if c[0] in kept_ids]
     elif quality == "low":
         # フロア無効 (0.0) の構成では従来どおり「low はクエリ単位で全件破棄」。
         logger.info(
@@ -1183,86 +1079,71 @@ async def unified_search(
 
     if not merged:
         _log_memory_search_state(
-            debug_logger, context_count, stm_results, ltm_results,
+            debug_logger, context_count, epi_entries,
             semmem_stats=semmem_stats,
         )
         return SearchResult(
             sources=[],
             quality=quality,
-            from_memory=bool(stm_results),
+            from_memory=bool(epi_entries),
         )
 
-    # Step 7: 最終順位付け (merged はスコア降順) から top_k 件を採用
+    # Step 7: 最終順位付け (merged は順位式のスコア降順) から top_k 件を採用。
+    # カートリッジ公平性保証 (旧 Step 7.5) と語彙アンカーの随伴 (旧 Step 7.55) は
+    # 廃止した (c_16 §7)。前者は ``priority`` 由来の席の奪い合いを補正するための
+    # 装置で、順位式が 1 本になり ``store_prior`` が明示の係数になった今は、
+    # 「席を取れなかった」= 「順位式で負けた」であって補正する理由が無い。後者は
+    # 候補生成が転置索引を ``EvidenceStore`` の内部へ取り込んだ結果 (c_16 §6.3:
+    # lexical はスコアを持ち込まない)、どの候補が語彙由来かが外へ出てこなくなった。
     final_sources = merged[:top_k]
-
-    # Step 7.5: カートリッジ公平性保証
-    # ロード済みカートリッジが上位選別で完全に欠落するのを防ぐ
-    final_sources = _ensure_cartridge_fairness(
-        final_sources, cart_gate_results, top_k,
-    )
-
-    # Step 7.55: 語彙アンカーは席を争わせない。
-    #
-    # ``_merge_results`` は最終的にスコア (= cosine) 降順で並べ直すため、LTM 側の
-    # RRF 順は「候補集合に入る/入らない」にしか効かない。密ベクトルが苦手な
-    # literal (型番・パス・エラーコード) は cosine が低いままなので、フロアを
-    # 免除しても ``merged[:top_k]`` で切られて結局届かない。訂正の随伴注入
-    # (Step 7.6) と同じ形で、**top_k を切った後に**足す。
-    final_sources = _attach_lexical_anchors(
-        final_sources, merged, lexical_anchors,
-    )
 
     # Step 7.6: 採用ノートが後続の訂正で上書きされているなら、訂正も一緒に出す。
     # top_k で切った **後** に足す — 訂正は席を争う候補ではなく随伴情報であり、
     # floor / top_k のどちらで落ちても「訂正前の値だけが残る」状態になる。
-    final_sources = attach_superseding_corrections(short_term, final_sources)
+    final_sources = attach_superseding_corrections(episodic, final_sources)
+
+    # Step 7.7: 実際に注入した id を「使った」バッファへ入れる (c_16 §2.1)。
+    # ``last_used_at`` をここでディスクへ書くと応答パスが書き手になってしまう
+    # ので、書くのは sleep-time の ``flush_touch`` (1 事象に畳む)。
+    _record_episodic_usage(episodic, final_sources)
 
     logger.info(
         "Search completed: %d results, quality=%s, from_memory=%s",
-        len(final_sources), quality, bool(stm_results),
+        len(final_sources), quality, bool(epi_entries),
     )
     _log_memory_search_state(
-        debug_logger, context_count, stm_results, ltm_results,
+        debug_logger, context_count, epi_entries,
         semmem_stats=semmem_stats,
     )
 
     return SearchResult(
         sources=final_sources,
         quality=quality,
-        from_memory=bool(stm_results),
+        from_memory=bool(epi_entries),
         top_raw_score=_top_raw_score(final_sources, merged_raw),
+        evidence_ids=evidence_ids_of(final_sources),
     )
 
 
-#: ``_attach_lexical_anchors`` が随伴注入する上限。コンテキストを膨らませない
-#: ための保守的な値 (context rot: 意味的に近いが無関係な文脈ほど有害)。
-MAX_LEXICAL_ANCHOR_ATTACHMENTS: int = 2
+def _record_episodic_usage(
+    episodic, sources: list[tuple[str, float, str]],
+) -> None:
+    """注入したエピソード記憶の id をプロセス内バッファへ溜める。
 
-
-def _attach_lexical_anchors(
-    final_sources: list[tuple[str, float, str]],
-    merged: list[tuple[str, float, str]],
-    lexical_anchors: frozenset[str],
-    limit: int = MAX_LEXICAL_ANCHOR_ATTACHMENTS,
-) -> list[tuple[str, float, str]]:
-    """語彙アンカーのうち top_k から漏れたものを末尾へ足す (純粋関数)。
-
-    ユーザーが希少な literal を名指ししているのに、それを含むチャンクが
-    cosine 順位だけで落ちる状態を防ぐ。上限付きなので注入量は増えすぎない。
+    ディスクには触らない (書き込みは sleep-time)。カートリッジ由来の id は
+    ストアに無いので黙って落ちる。
     """
-    if not lexical_anchors:
-        return final_sources
-    present = {cid for cid, _, _ in final_sources}
-    extra = [
-        entry for entry in merged
-        if entry[0] in lexical_anchors and entry[0] not in present
-    ][:limit]
-    if not extra:
-        return final_sources
-    logger.info(
-        "Attached %d lexical anchor chunk(s) that fell outside top_k", len(extra),
-    )
-    return final_sources + extra
+    if episodic is None or not sources:
+        return
+    usage = getattr(episodic, "usage", None)
+    if usage is None:
+        return
+    try:
+        usage.add_many([
+            cid for cid, _, _ in sources if episodic.get(cid) is not None
+        ])
+    except Exception as e:  # noqa: BLE001 — 観測のための記録で応答を止めない
+        logger.warning("Failed to record episodic usage: %s", e)
 
 
 def _top_raw_score(
@@ -1271,10 +1152,10 @@ def _top_raw_score(
 ) -> float | None:
     """採用チャンクの生スコア (cosine スケール) の最大値を返す。
 
-    `final_sources` のスコアは `score_normalization` 適用後なので観測値に使えない
-    (`minmax` では先頭が定義上 1.0)。`merged_raw` 側の生スコアを chunk_id で
-    引き直す。gate/拡張で `merged_raw` から落ちた chunk (カートリッジ公平性で
-    裏口から戻った等) は引けないので単に除外する。1 件も引けなければ `None`。
+    `final_sources` のスコアは順位式 (``cos × freshness × confidence ×
+    store_prior``) なので観測値には使えない。`merged_raw` 側の素の cosine を
+    chunk_id で引き直す。gate/拡張で `merged_raw` から落ちた chunk は引けない
+    ので単に除外する。1 件も引けなければ `None`。
     """
     if not final_sources:
         return None
@@ -1283,195 +1164,82 @@ def _top_raw_score(
     return max(scores) if scores else None
 
 
-def _cartridge_id_of(chunk_id: str) -> str | None:
-    """カートリッジ由来のチャンク ID から cart_id 部分を抽出する。
+def _store_of(chunk_id: str) -> str:
+    """id からストア名を判定する (c_16 §5.5 の ``<store>:`` 接頭辞用)。
 
-    `cartridge_manager.search` は ``"<cart_id>:<original_chunk_id>"`` 形式で
-    chunk_id を返す。STM/LTM 由来の chunk_id は通常 ":" を含まないため、
-    プレフィックス分離で十分判別可能。
+    corpus のチャンク id は ``CartridgeManager.search_detailed`` が
+    ``"<package_id>:<evidence_id>"`` 形式で返す。episodic のノート id は
+    ``ev_…`` で ``":"`` を含まない。
     """
-    if ":" not in chunk_id:
-        return None
-    return chunk_id.split(":", 1)[0]
+    return "corpus" if ":" in chunk_id else "episodic"
 
 
-def _ensure_cartridge_fairness(
-    final: list[tuple[str, float, str]],
-    cart_results: list[tuple[str, float, str]],
-    top_k: int,
-) -> list[tuple[str, float, str]]:
-    """ロード済みカートリッジの公平な代表を保証する
+def evidence_ids_of(sources: list[tuple[str, float, str]]) -> list[str]:
+    """注入した ``sources`` を ``<store>:<evidence_id>`` へ写す (c_16 §5.5)。
 
-    `cart_results` (cartridge_manager.search の生出力) に含まれる各
-    カートリッジのうち、最終結果 `final` から完全に欠落しているものがあれば、
-    その入力チャンクの先頭 (= ラウンドロビン優先順位の最高) を最終結果に
-    強制的に含める。
-
-    グローバルスコアソートが特定カートリッジを完全に除外する
-    挙動を補正することが目的。複数カートリッジが存在しないケースでは
-    `final` をそのまま返す (no-op)。
-
-    既に `final` の長さが `top_k` 未満なら末尾追加し、満杯の場合は最低
-    スコアの非カートリッジ要素または別カートリッジで重複代表されている
-    要素を差し替える。
-
-    注入エントリのスコアは `final` 内の最低スコアへ揃える。`final` は
-    score_normalization 適用済み [0,1] であり、
-    `cart_results` の生スコア (cosine*priority、無上限) を持ち込むと下流の
-    SalienceRanker min-max が歪むため。強制注入 = 最下位相当の意味付け。
+    corpus の chunk id は ``<package_id>:<evidence_id>`` なので、後ろ半分を
+    evidence_id として採る (パッケージ id は package 側の台帳から引ける)。
     """
-    if not cart_results or not final:
-        return final
-
-    floor_score = min(s for _, s, _ in final)
-
-    input_carts: list[str] = []
-    seen_input: set[str] = set()
-    cart_top_chunk: dict[str, tuple[str, float, str]] = {}
-    for entry in cart_results:
-        cid = _cartridge_id_of(entry[0])
-        if cid is None:
-            continue
-        if cid not in seen_input:
-            seen_input.add(cid)
-            input_carts.append(cid)
-            cart_top_chunk[cid] = entry
-
-    if len(input_carts) < 2:
-        # カートリッジが 1 つ以下なら公平性問題は起きない
-        return final
-
-    output_carts = {
-        c
-        for cid, _, _ in final
-        for c in (_cartridge_id_of(cid),)
-        if c is not None
-    }
-
-    missing = [c for c in input_carts if c not in output_carts]
-    if not missing:
-        return final
-
-    # 既存の chunk_id 集合 (重複混入防止)
-    existing_ids = {cid for cid, _, _ in final}
-    result = list(final)
-
-    for cart_id in missing:
-        raw = cart_top_chunk[cart_id]
-        if raw[0] in existing_ids:
-            continue
-        chunk = (raw[0], floor_score, raw[2])
-        if len(result) < top_k:
-            result.append(chunk)
-            existing_ids.add(chunk[0])
-            output_carts.add(cart_id)
-            continue
-        # 満杯: 差し替え対象を選ぶ
-        # 優先度1: 非カートリッジ (STM/LTM) のうち最低スコア
-        # 優先度2: 既に他で代表されているカートリッジの最低スコア
-        replace_idx = _find_replaceable_index(result)
-        if replace_idx is None:
-            continue
-        result[replace_idx] = chunk
-        existing_ids.add(chunk[0])
-        output_carts.add(cart_id)
-
-    logger.debug(
-        "cartridge fairness: input_carts=%s, missing=%s, applied=%d",
-        input_carts, missing, len(missing),
-    )
-    return result
-
-
-def _find_replaceable_index(
-    final: list[tuple[str, float, str]],
-) -> int | None:
-    """差し替え可能な要素のインデックスを返す
-
-    優先度:
-        1. 非カートリッジ要素 (STM/LTM 由来) のうち最終位置 (≒最低スコア)
-        2. 複数カートリッジが代表されている場合の重複代表側の最終位置
-
-    どれも該当しない場合 (1 カートリッジしかなく満杯) は None。
-    """
-    # 優先度 1: 非カートリッジ要素を末尾から探す
-    for i in range(len(final) - 1, -1, -1):
-        if _cartridge_id_of(final[i][0]) is None:
-            return i
-
-    # 優先度 2: 同じカートリッジが複数回代表されているケースで末尾を差し替え
-    cart_counts: dict[str, int] = {}
-    for cid, _, _ in final:
-        c = _cartridge_id_of(cid)
-        if c is not None:
-            cart_counts[c] = cart_counts.get(c, 0) + 1
-
-    for i in range(len(final) - 1, -1, -1):
-        c = _cartridge_id_of(final[i][0])
-        if c is not None and cart_counts.get(c, 0) > 1:
-            cart_counts[c] -= 1
-            return i
-
-    return None
-
-
-def _normalize_layer(
-    layer: list[tuple[str, float, str]],
-    method: str,
-) -> list[tuple[str, float, str]]:
-    """1 層 (STM/LTM/cartridge) 内でスコアを正規化する。
-
-    ``minmax``: 層内 min-max で [0, 1] へ写像。レンジ 0 (1 件 / 全同値) は
-        0 に潰さず一律 1.0 とする (単独層を層間で不利にしないため)。
-    ``rank``: 1 位=1.0 … 最下位=1/n の線形ランク減衰。n=1 は 1.0。
-    ``none`` / 未知: 入力をそのまま返す (no-op)。空層は空リスト。
-
-    combined スコアをスカラとして正規化するため、STM の blended
-    (cosine*0.6+lightmem*0.4) や cartridge の cosine*priority の内訳は壊さない
-    (層内相対順位は不変、層間スケールのみ揃う)。cartridge priority は無上限だが
-    層内 min-max が層内相対順位を保ったまま [0,1] に収めるため歪みを吸収する。
-    """
-    n = len(layer)
-    if n == 0:
-        return []
-    if method == "minmax":
-        scores = [s for _, s, _ in layer]
-        lo = min(scores)
-        hi = max(scores)
-        rng = hi - lo
-        if rng <= 1e-12:
-            return [(cid, 1.0, text) for cid, _, text in layer]
-        return [(cid, (s - lo) / rng, text) for cid, s, text in layer]
-    if method == "rank":
-        order = sorted(range(n), key=lambda i: -layer[i][1])
-        norm = [0.0] * n
-        for rank, idx in enumerate(order):
-            norm[idx] = (n - rank) / n
-        return [(layer[i][0], norm[i], layer[i][2]) for i in range(n)]
-    return layer
-
-
-def _merge_results(
-    *result_lists: list[tuple[str, float, str]],
-    normalization: str = "none",
-) -> list[tuple[str, float, str]]:
-    """結果をマージしてスコア降順でソート（重複排除）。
-
-    ``normalization`` が ``minmax`` / ``rank`` のとき、各 result_list を 1 層と
-    みなして層内でスコアを正規化してからマージし、STM/LTM/cartridge の異種
-    スコアスケールを吸収する。``none`` (既定) は従来どおり生スコアでマージする。
-    重複は最初に出現した層の要素を採用する (先勝ち、スコアに非依存=現状一致)。
-    """
+    out: list[str] = []
     seen: set[str] = set()
-    merged: list[tuple[str, float, str]] = []
+    for chunk_id, _score, _text in sources:
+        store = _store_of(chunk_id)
+        evidence_id = chunk_id.split(":", 1)[1] if store == "corpus" else chunk_id
+        tagged = f"{store}:{evidence_id}"
+        if tagged not in seen:
+            seen.add(tagged)
+            out.append(tagged)
+    return out
 
+
+def _claim_key_of(text: str) -> str:
+    """本文から ``claim_key`` を作る (c_16 §3.4)。
+
+    レコード側の ``claim_key`` はストアの中にあり、``search()`` の戻りには
+    載らない (載せると層ごとに別の鍵の作り方が生まれる)。ここは注入直前の
+    畳み込みなので、**同じ正規化関数** を本文へ掛けて鍵を作り直す。
+    """
+    return compute_claim_key(text)
+
+
+def _merge_results(*result_lists: list[StoreEntry]) -> list[StoreEntry]:
+    """ストア横断でスコア降順にマージし、id と ``claim_key`` で 1 件へ畳む。
+
+    c_16 §7.2 のとおり **1 本の順位式** (``cos × freshness × confidence ×
+    store_prior``、各ストアの ``search()`` が計算済み) をそのまま降順に並べる。
+    層内正規化 (``rag.score_normalization``) も RRF も使わない — 層ごとに違う
+    スケールを揃える必要がそもそも無くなった。
+
+    畳み込みは c_16 §7.3 の意味で **ストアをまたぐ**: 同じ言明が episodic の
+    ノートと corpus のチャンクの両方に載っていれば、スコアの高い方だけを残す。
+    ストア内の ``claim_key`` 畳み込み (``ranking.collapse``) は同じストアの中
+    でしか効かないため、ここが横断の唯一の関所になる。
+    """
+    ordered: list[StoreEntry] = []
     for results in result_lists:
-        for chunk_id, score, text in _normalize_layer(results, normalization):
-            if chunk_id not in seen:
-                seen.add(chunk_id)
-                merged.append((chunk_id, score, text))
+        ordered.extend(results)
+    ordered.sort(key=lambda item: -item[2])
 
-    merged.sort(key=lambda x: -x[1])
+    seen_ids: set[str] = set()
+    seen_claims: set[str] = set()
+    merged: list[StoreEntry] = []
+    collapsed = 0
+    for entry in ordered:
+        chunk_id, _cosine, _score, text = entry
+        if chunk_id in seen_ids:
+            continue
+        claim = _claim_key_of(text) if text else ""
+        if claim and claim in seen_claims:
+            collapsed += 1
+            continue
+        seen_ids.add(chunk_id)
+        if claim:
+            seen_claims.add(claim)
+        merged.append(entry)
+    if collapsed:
+        logger.info(
+            "Merge: collapsed %d duplicate claim(s) across stores", collapsed,
+        )
     return merged
 
 
@@ -1484,10 +1252,10 @@ async def _expand_and_research(
     query: str,
     query_vec: np.ndarray,
     working_mem,
-    long_term,
+    episodic,
     top_k: int,
     noise_sigma: float = 0.05,
-) -> list[tuple[str, float, str]]:
+) -> list[StoreEntry]:
     """クエリベクトル摂動による簡易再検索（LLM なし）。
 
     直近の会話コンテキストがある場合に限り、クエリベクトルを微小ノイズで
@@ -1504,7 +1272,7 @@ async def _expand_and_research(
         (turn.get("content", "") or "").strip()
         for turn in working_mem.get_context()[-3:]
     )
-    if not has_context or long_term is None:
+    if not has_context or episodic is None:
         return []
 
     # クエリベクトルを少し摂動させて再検索（簡易的な拡張、決定論）
@@ -1517,11 +1285,13 @@ async def _expand_and_research(
 
     loop = asyncio.get_running_loop()
     try:
-        return await run_in_executor_with_context(
-            loop, _search_executor, long_term.search, expanded_vec, top_k,
+        hits = await run_in_executor_with_context(
+            loop, _search_executor,
+            lambda: episodic.search(query, expanded_vec, top_k),
         )
     except asyncio.CancelledError:
         raise
     except (RuntimeError, ValueError, TypeError, OSError) as e:
         logger.warning("Expanded search failed: %s", e)
         return []
+    return [(hit.id, hit.cosine, hit.score, hit.text) for hit in hits]

@@ -61,9 +61,17 @@ logger = get_logger("learning.policy_evolver")
 #: 恒久凍結だけで全滅するドメインは進化対象に置かない
 #: (``test_no_domain_is_frozen_forever`` の不変則) ため、
 #: :data:`PERMANENTLY_FROZEN_PARAMS` ではなくここで外す。
+#:
+#: ``search`` も **意図的に含めない** (2026-09-07、c_16 §7.2 / §10)。順位式が
+#: 3 ストア共通の ``cos × freshness × confidence × store_prior`` 1 本になり、
+#: 以前ここに残っていた ``bm25_weight`` / ``vector_weight`` / ``rrf_k`` は消費側
+#: (``HybridRetriever``) ごと削除された。残るキーは取得幅 (品質項
+#: ``rag_top1_score`` は top-1 なので取得件数に無反応) と、スコア確定後に走る
+#: SalienceRanker の重みで、どちらも fitness に届かない。順位式の係数
+#: (``store_prior`` / 半減期) は c_16 §10 のとおり **実機の交互撃ち A/B で
+#: 調整する**対象で、自動進化には載せない。
 EVOLVABLE_DOMAINS: list[str] = [
     "memory",
-    "search",
     "agent",
     "long_form",
 ]
@@ -149,11 +157,12 @@ COST_WEIGHT: float = 0.15
 #: プロンプト側コストで評価するドメイン。
 #:
 #: **コスト項は :data:`MONOTONE_PARAMS` を解除するために入れる**ので、解除対象を
-#: 持つドメインにだけ適用する。持たないドメイン (``router`` / ``search``) では、
+#: 持つドメインにだけ適用する。持たないドメイン (:data:`EVOLVABLE_DOMAINS` から
+#: 外した ``router`` / ``search`` を含む) では、
 #: 残る進化キー (重み・閾値の類) がプロンプト量に影響しないため、コスト項は
 #: **相関のないノイズ**として fitness に乗るだけで摂動の判別力を落とす。
 #: 両集合の一致はテストで固定する。
-_PROMPT_COST_DOMAINS: frozenset[str] = frozenset({"memory", "agent"})
+_PROMPT_COST_DOMAINS: frozenset[str] = frozenset({"agent"})
 
 #: 生成側コストで評価するドメイン。凍結キーが生成トークン量を増やす方向のもの。
 _COMPLETION_COST_DOMAINS: frozenset[str] = frozenset({"long_form"})
@@ -167,30 +176,6 @@ _COMPLETION_COST_DOMAINS: frozenset[str] = frozenset({"long_form"})
 #:
 #: 値は「なぜ恒久凍結か」の根拠。テストが policy 側のキー実在を検証する。
 PERMANENTLY_FROZEN_PARAMS: dict[str, dict[str, str]] = {
-    "search": {
-        # 品質項 mean(rag_top1_score) は **top-1 の類似度** なので、取得件数を
-        # 増やしても減らしても動かない。コスト項だけ入れると「最大へ膨張」が
-        # 「最小へ縮退」に変わるだけ。解除には取得幅に反応する品質指標が要る。
-        "top_k": "品質項 mean(rag_top1_score) が取得件数に無反応",
-        "stm_top_k": "品質項 mean(rag_top1_score) が取得件数に無反応",
-        # int8 粗検索 → float32 rescore の候補数 (vector_store.search)。返す
-        # チャンク数は top_k が決めるので、増やしてもプロンプトは 1 トークンも
-        # 増えない。代償は CPU 時間だけで、配線済みのどのシグナルにも出ない。
-        "rescore_candidates": "コストが CPU 時間にのみ出てトークン数に現れない",
-        # _default_policies() 以外に参照が無い (2026-08-18 時点)。摂動しても
-        # 何も起きないので進化スロットの無駄。キー自体の存廃は別途判断する。
-        "candidates_multiplier": "消費側が存在しない dead key",
-        # 品質項 mean(rag_top1_score) は **検索器の top-1 cosine** で、後段の
-        # SalienceRanker (salience_w_*) やノイズ注入 (noise_sigma) はスコアが
-        # 確定した後に走る。消費側は fitness 信号に一切影響しないので、摂動して
-        # も選択圧ゼロの乱歩になる (2026-09-02 監査 L-A8)。
-        "salience_w_query_relevance": "consumer does not affect the fitness signal",
-        "salience_w_tfidf": "consumer does not affect the fitness signal",
-        "salience_w_entity_density": "consumer does not affect the fitness signal",
-        "salience_w_info_density": "consumer does not affect the fitness signal",
-        "salience_w_position_bias": "consumer does not affect the fitness signal",
-        "noise_sigma": "consumer does not affect the fitness signal",
-    },
     "agent": {
         # 「残コンテキストがこの値以上なら meta-cognitive を許可」という**ゲート
         # 閾値** (router._can_use_meta_cognitive)。上げるほど meta-cognitive が
@@ -242,12 +227,11 @@ MONOTONE_PARAMS: dict[str, frozenset[str]] = {
         # 予算消費率 (コスト項) も上がる。双方が反応する最も素直なケース。
         "unit_max_tokens", "unit_target_tokens", "max_extend_rounds",
     }),
-    "memory": frozenset({
-        # 保持期間を延ばすほど想起は増え (欠陥率が下がる)、代償は想起注入による
-        # プロンプト増。
-        "decay_days",
-    }),
 }
+# ``memory`` の単調キー (``decay_days``) は無くなった — 保持は tier 遷移と
+# 保持方針が担い、順位式は ``cos × freshness × confidence × store_prior`` の
+# 1 本になった (c_16 §5.4 / §7.2)。残る memory の knob (競合の類似度閾値 /
+# バッチ幅) はプロンプト量と単調に効かないので凍結の対象外。
 
 #: コスト未観測時に **全パラメータ** が凍結されるドメイン。その tick の進化
 #: ステップは常に ``skipped`` になる。
@@ -258,6 +242,10 @@ MONOTONE_PARAMS: dict[str, frozenset[str]] = {
 #: 1 つも残らない。ドメインごと凍結されるのは事故ではなく意図した状態なので
 #: 明示しておく (テストが両者の一致を検証する)。プロンプト側コストが観測できる
 #: tick では前 3 者が解除される。
+#:
+#: ``search`` はここには入らない — c_16 §7.2 で順位式が 3 ストア共通の 1 本に
+#: なり、進化できるキーが 1 つも残らなくなったので **ドメインごと
+#: :data:`EVOLVABLE_DOMAINS` から外した** (2026-09-07)。
 FULLY_FROZEN_DOMAINS: frozenset[str] = frozenset({"agent"})
 
 # SemMem 書き戻し時の subject prefix と初期値。owner pillar は EvorefLearn。

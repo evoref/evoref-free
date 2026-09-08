@@ -1,9 +1,9 @@
-"""evorefmem CLI の path 解決ヘルパ
+"""evorefmem CLI の path / ストア解決ヘルパ
 
-各 subcommand が ``<memory_dir>/semantic/`` 配下の全 scope を列挙する
-共通ロジック。``backend.config.get_path_resolver`` 経由で memory_dir /
-prompts_dir / migration_archive_dir を取得し、scope (``global`` /
-``projects/<id>``) を順に enumerate する。
+``<memory_dir>/semantic/`` は **1 ストア** になり (c_16 §4.2)、スコープは
+ディレクトリではなくレコードのフィールドになった。したがって CLI の共通処理も
+「scope ディレクトリを列挙する」から「ストアを 1 つ開いて scope を数える」へ
+変わっている。
 """
 
 from __future__ import annotations
@@ -12,8 +12,12 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from backend.log_config import get_logger
+
+if TYPE_CHECKING:
+    from backend.free.memory.semantic.store import SemanticStore
 
 logger = get_logger("memory.semantic.cli.paths")
 
@@ -35,25 +39,6 @@ class CliPaths:
     def semantic_dir(self) -> Path:
         """``<memory_dir>/semantic/``。"""
         return self.memory_dir / "semantic"
-
-
-@dataclass(frozen=True)
-class ScopeInfo:
-    """semantic ストア 1 scope 分のメタ情報."""
-
-    name: str
-    """``"global"`` または ``"project:<id>"`` 形式 (SemanticFact.scope と同型)。"""
-
-    root_dir: Path
-    """``<semantic_dir>/global/`` または ``<semantic_dir>/projects/<id>/``。"""
-
-    @property
-    def is_global(self) -> bool:
-        return self.name == "global"
-
-    @property
-    def is_project(self) -> bool:
-        return self.name.startswith("project:")
 
 
 def resolve_cli_paths() -> CliPaths:
@@ -80,35 +65,24 @@ def resolve_cli_paths() -> CliPaths:
     )
 
 
-def enumerate_scopes(memory_dir: Path) -> list[ScopeInfo]:
-    """``<memory_dir>/semantic/`` 配下の全 scope を列挙する.
+def open_semantic_store(memory_dir: Path) -> "SemanticStore":
+    """``<memory_dir>/semantic`` のストアを開いて読み込む (埋め込みなし)。
 
-    - ``semantic/global/`` が存在すれば ``ScopeInfo(name="global", ...)``
-    - ``semantic/projects/<id>/`` の各 subdir を ``project:<id>`` として追加
-    - ``archive/`` は管理外 (列挙しない)
-
-    semantic/ 自体が無い (=未初期化) 環境では空リストを返す。
+    CLI は検索をしないので ``embedding_backend`` は渡さない。ベクトル索引は
+    snapshot 側にあるものをそのまま読む (書き換えない)。
     """
-    semantic_dir = Path(memory_dir) / "semantic"
-    out: list[ScopeInfo] = []
-    if not semantic_dir.exists():
-        return out
+    from backend.free.memory.semantic.store import SemanticStore
 
-    global_dir = semantic_dir / "global"
-    if global_dir.exists() and global_dir.is_dir():
-        out.append(ScopeInfo(name="global", root_dir=global_dir))
+    store = SemanticStore(Path(memory_dir))
+    store.load()
+    return store
 
-    projects_dir = semantic_dir / "projects"
-    if projects_dir.exists() and projects_dir.is_dir():
-        for entry in sorted(projects_dir.iterdir()):
-            if entry.is_dir():
-                out.append(
-                    ScopeInfo(
-                        name=f"project:{entry.name}",
-                        root_dir=entry,
-                    ),
-                )
-    return out
+
+def scope_names(store: "SemanticStore") -> list[str]:
+    """ストアに実在する scope 名を昇順で返す (``global`` が先頭)。"""
+    scopes = {f.scope or "global" for f in store.all_facts(include_superseded=True)}
+    scopes.add("global")
+    return sorted(scopes, key=lambda s: (s != "global", s))
 
 
 def cli_backup_root(
@@ -161,9 +135,10 @@ def _prune_backup_roots(migration_archive_dir: Path, *, keep: int | None = None)
 
 
 __all__ = [
+    "BACKUP_KEEP_GENERATIONS",
     "CliPaths",
-    "ScopeInfo",
     "cli_backup_root",
-    "enumerate_scopes",
+    "open_semantic_store",
     "resolve_cli_paths",
+    "scope_names",
 ]

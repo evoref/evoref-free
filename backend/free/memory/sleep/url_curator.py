@@ -2,7 +2,7 @@
 
 ユーザの直近セッションで参照された URL について、補助タスクが
 「その URL が回答に正しく寄与したか」を 0..1 で自己採点し、
-score >= 閾値の URL を ``world_fact`` (subject = ``mem.world.url.*``) として
+score >= 閾値の URL を ``world_fact`` (subject = ``idx.url.*``) として
 SemMem に永続化する。
 
 CLAUDE.md §6 不変則 #2 より、SemMem への書込は sleep-time に限定される。
@@ -13,7 +13,7 @@ CLAUDE.md §6 不変則 #2 より、SemMem への書込は sleep-time に限定�
 設計ポリシー:
 
 - 新 FactType を追加せず ``world_fact`` を流用する (CLAUDE.md §3 / §6 #2)。
-- subject = ``mem.world.url.<host>.<sha1_12(url_normalized)>``。同一 URL の
+- subject = ``idx.url.<host>.<sha1_12(url_normalized)>``。同一 URL の
   決定論的キーで既存 fact を引き当て可能。
 - ``_extra`` に URL 専用メタ (url / fetch_count / score_history /
   score_avg / last_query 等) を載せる。SemanticFact の round-trip 機能で
@@ -29,13 +29,11 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse, urlunparse
 
-import numpy as np
-
 from backend.free.memory.sleep._curator_common import (
     URL_SUBJECT_PREFIX,
     build_scoring_prompt,
     coerce_bare_score,
-    embed_kwargs_for_subject,
+    index_embed_fields,
     public_notes,
     redact_for_store,
     subject_digest,
@@ -48,7 +46,7 @@ from backend.log_config import get_logger
 
 if TYPE_CHECKING:
     from backend.free.memory.semantic.store import SemanticFactStore
-    from backend.free.memory.stores.short_term import MemoryNote
+    from backend.free.memory.episodic.note import MemoryNote
     from backend.free.rag.embedding_backend import EmbeddingBackend
 
 logger = get_logger("memory.sleep.url_curator")
@@ -269,7 +267,7 @@ async def curate_url_facts(
     """URL リコール用の world_fact を sleep-time で書き込む。
 
     Args:
-        notes: 直近の MemoryNote 群 (通常 ``ShortTermMemory.notes.values()``)。
+        notes: 直近の MemoryNote 群 (通常 ``EpisodicWorkspace.notes.values()``)。
         config: 全体 config。``tools.url_recall_*`` を参照する。
         store_provider: ``scope -> SemanticFactStore | None`` のコールバック。
         scorer_client: 採点に使う LLM クライアント (sleep-time のベース
@@ -396,18 +394,6 @@ async def curate_url_facts(
                     )
                     written += 1
                 else:
-                    embedding = None
-                    try:
-                        # 側の定義は _curator_common.INDEX_EMBED_IS_QUERY が
-                        # SSOT (再埋め込み側もそこを読む)。
-                        emb = await embedder.embed(
-                            [topic], **(embed_kwargs_for_subject(subject) or {}),
-                        )
-                        if emb is not None and len(emb) > 0:
-                            embedding = np.asarray(emb[0], dtype=np.float32)
-                    except Exception as exc:
-                        logger.warning("url_curator: embed failed: %s", exc)
-
                     extra = {
                         "url": redact_for_store(raw_url),
                         "url_normalized": redact_for_store(normalized),
@@ -431,8 +417,11 @@ async def curate_url_facts(
                         confidence=float(score),
                         now=now,
                         profile_id=profile_id,
-                        embedding=embedding,
                         _extra=extra,
+                        # ベクトルを作るのは snapshot 生成 (c_16 §6.1)。
+                        # curator は側を宣言するだけで、側の定義は
+                        # _curator_common.INDEX_EMBED_IS_QUERY が SSOT。
+                        **index_embed_fields(subject),
                     )
                     store.add_fact(fact)
                     written += 1

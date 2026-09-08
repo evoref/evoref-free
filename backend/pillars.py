@@ -40,18 +40,14 @@ if TYPE_CHECKING:
     from backend.free.llm.local_client import LocalClient
     from backend.free.loop.driver import LoopDriver
     from backend.free.loop.log_ingestor import LogIngestor
-    from backend.free.memory.stores.long_term import LongTermMemory
     from backend.free.memory.scheduler import SleepTimeScheduler
-    from backend.free.memory.stores.short_term import ShortTermMemory
+    from backend.free.memory.episodic.store import EpisodicStore
     from backend.free.memory.stores.working import (
         WorkingMemory,
         WorkingMemoryRegistry,
     )
     from backend.free.rag.cartridge_manager import CartridgeManager
     from backend.free.rag.embedding_backend import EmbeddingBackend
-    from backend.free.rag.bm25_retriever import BM25Retriever
-    from backend.free.rag.retriever import HybridRetriever
-    from backend.free.rag.vector_store import VectorStore
     from backend.pro.learn_components import ProLearnComponents
 
 
@@ -64,19 +60,16 @@ class GenPillar:
         llm_client: LocalClient を束ねたファサード (chat_in_flight / is_serving_user を提供)。
         aux_client: 補助タスク LLM クライアント。未設定時は ``None``。
         embedder: 埋め込みバックエンド (llama-cpp server 経由)。未初期化時は ``None``。
-        bm25_retriever: BM25 語彙検索索引。**全経路で共有する 1 インスタンス**
-            (チャット応答経路の LTM ハイブリッド / sleep-time の索引更新 /
-            hybrid_retriever)。
-        hybrid_retriever: BM25 + Vector ハイブリッド検索器
-            (ベンチマーク・長文生成の unit 検索)。
+
+    語彙索引は pillar に持たない。3 ストアとも ``EvidenceStore`` が snapshot
+    ごとに numpy CSR の転置索引を作る (c_16 §6.2) ので、共有の
+    ``BM25Retriever`` は廃止した (c_16 §8)。
     """
 
     local_client: "LocalClient | None" = None
     llm_client: "LLMClient | None" = None
     aux_client: "AuxClient | None" = None
     embedder: "EmbeddingBackend | None" = None
-    bm25_retriever: "BM25Retriever | None" = None
-    hybrid_retriever: "HybridRetriever | None" = None
 
 
 @dataclass
@@ -92,9 +85,7 @@ class MemPillar:
     """
 
     working_memory: "WorkingMemory | None"
-    short_term_memory: "ShortTermMemory"
-    long_term_memory: "LongTermMemory | None"
-    vector_store: "VectorStore | None"
+    episodic_memory: "EpisodicStore"
     cartridge_manager: "CartridgeManager | None"
     sleep_scheduler: "SleepTimeScheduler"
     current_project_id: str | None = None

@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 logger = get_logger("rag.dimension_check")
 
 #: embed モデル切替により既存ベクトルが stale になったことを示すマーカー名。
-#: vectors_dir 直下に置く (RAG ベクトルの再構築要否フラグ)。
+#: ``memory_dir`` 直下に置く (旧 ``vectors_dir`` は廃止、c_16 §8)。
 _EMBED_REINDEX_MARKER = ".embed_reindex_required"
 
 
@@ -39,7 +39,7 @@ def _embed_reindex_marker_path() -> Path | None:
     try:
         from backend.config import get_path_resolver
 
-        return get_path_resolver().resolve_local("vectors_dir") / _EMBED_REINDEX_MARKER
+        return get_path_resolver().resolve_local("memory_dir") / _EMBED_REINDEX_MARKER
     except Exception:
         return None
 

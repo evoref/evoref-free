@@ -8,10 +8,10 @@ EvorefMem 統合仕様 における Pin 機能の実装
 - ``pin_locked_until`` で「期限まで unpin 不可」のロックを表現できる
   (デフォルトは ``None`` で常時 unpin 可)
 - Tier +1.0 ボーナスは MemoryInjector 側 で計上する
-- 永続 store への書き込みは `SemanticFactStore.update_fact` 経由で
+- 永続 store への書き込みは `SemanticStore.update_fact` 経由で
   (索引・JSONL の整合を維持)
 
-本モジュールは純粋関数の集合であり、I/O は ``SemanticFactStore`` に
+本モジュールは純粋関数の集合であり、I/O は ``SemanticStore`` に
 委譲する。API / CLI / sleep-time から共通に呼ばれる。
 """
 
@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import time
 
-from backend.free.memory.semantic.store import SemanticFactStore
+from backend.free.memory.protocols import SemanticFactStoreProtocol
 from backend.free.memory.types import SemanticFact
 from backend.log_config import get_logger
 
@@ -38,7 +38,7 @@ class PinLockedError(RuntimeError):
 
 
 def pin_fact(
-    store: SemanticFactStore,
+    store: SemanticFactStoreProtocol,
     fact_id: str,
     *,
     lock_duration_s: float | None = None,
@@ -78,7 +78,7 @@ def pin_fact(
 
 
 def unpin_fact(
-    store: SemanticFactStore,
+    store: SemanticFactStoreProtocol,
     fact_id: str,
     *,
     force: bool = False,
@@ -104,7 +104,7 @@ def unpin_fact(
     return updated
 
 
-def list_pinned(store: SemanticFactStore) -> list[SemanticFact]:
+def list_pinned(store: SemanticFactStoreProtocol) -> list[SemanticFact]:
     """ストア内の pinned ファクトを accessed_at 降順で返す"""
     facts = store.pinned_facts()
     facts.sort(key=lambda f: f.accessed_at, reverse=True)

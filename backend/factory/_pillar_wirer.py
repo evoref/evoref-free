@@ -44,10 +44,8 @@ if TYPE_CHECKING:
     from backend.free.llm.aux_client import AuxClient
     from backend.free.llm.local_client import LocalClient
     from backend.free.memory.scheduler import SleepTimeScheduler
-    from backend.free.memory.stores.short_term import ShortTermMemory
+    from backend.free.memory.episodic.store import EpisodicStore
     from backend.free.rag.embedding_backend import EmbeddingBackend
-    from backend.free.rag.bm25_retriever import BM25Retriever
-    from backend.free.rag.retriever import HybridRetriever
     from backend.free.rag.vector_store import VectorStore
     from backend.pillars import GenPillar, LearnPillar, LoopPillar, MemPillar
 
@@ -606,22 +604,34 @@ def _make_probe_embed_fn(embedder: Any) -> Any:
 
 
 def _init_cartridge_manager(state: AppState, cfg: dict[str, Any], resolver: Any) -> None:
-    """6b. カートリッジマネージャ初期化"""
-    from backend.free.rag.cartridge_manager import CartridgeManager
+    """6b. corpus パッケージストア初期化 (c_16 §4.3)
+
+    パッケージは ``local_paths.memory_dir`` 配下の ``corpus/`` にある
+    (旧 ``local_paths.cartridges_dir`` は廃止)。``rag`` セクションには
+    c_16 §9 の ``memory.evidence.*`` を重ねて渡す — ``EvidenceStore`` が
+    量子化 / memmap / クラスタ索引 (``rag.*``) と語彙索引 / 順位
+    (``memory.evidence.*``) を同じオブジェクトから読むため。
+    """
+    from backend.free.rag.cartridge_manager import (
+        CartridgeManager,
+        merge_rag_evidence_config,
+    )
 
     try:
-        cartridges_dir = resolver.resolve_local("cartridges_dir")
-        rag_cfg = cfg.get("rag", {})
+        corpus_dir = resolver.resolve_corpus_dir()
         cart_mgr = CartridgeManager(
-            cartridges_dir, rag_config=rag_cfg, debug_logger=state.debug_logger,
+            corpus_dir,
+            rag_config=merge_rag_evidence_config(cfg),
+            debug_logger=state.debug_logger,
+            embedder=state.embedder,
         )
         state.cartridge_manager = cart_mgr
         logger.info(
-            "CartridgeManager initialized: dir=%s, installed=%d",
-            cartridges_dir, len(cart_mgr.list_cartridges()),
+            "CorpusStore initialized: dir=%s, installed=%d, loaded=%d",
+            corpus_dir, len(cart_mgr.list_cartridges()), cart_mgr.loaded_count,
         )
     except Exception as e:
-        logger.warning("CartridgeManager init skipped: %s", e)
+        logger.warning("CorpusStore init skipped: %s", e)
 
 
 def _load_experience_buffer(resolver: Any) -> tuple["ExperienceBuffer", Path]:
@@ -779,16 +789,13 @@ async def _check_embedding_dim(state: AppState, cfg: dict[str, Any]) -> None:
         logger.warning("Embedding dimension check failed: %s", e)
         return
 
-    # SemMem fact 埋め込みの stale 検知 (RAG とは別ストア)。embed swap 後の
-    # 取り残しを reembed-facts へ誘導する。recall miss のみで誤結果は出ないため
-    # ブロックはせず WARNING のみ。
-    try:
-        from backend.free.memory.semantic.stale_guard import (
-            warn_if_semmem_reembed_required,
-        )
-        warn_if_semmem_reembed_required()
-    except Exception as e:
-        logger.debug("SemMem stale guard check skipped: %s", e)
+    # SemMem fact 埋め込みの stale 検知マーカー (``.reembed_facts_required``)
+    # は廃止した (c_16 §6.1 / §8)。埋め込みは ``embeddings/<model_id>/`` に
+    # モデル別で置かれるので、モデルを替えても旧空間のベクトルを読み違える
+    # ことが構造上ない。「新モデルのベクトルがまだ無い」状態は
+    # ``chat_service.build_semmem_injection`` が **観測** (候補はあるがスコア
+    # 0 件) で検出して注入を見送る — マーカーと違い、config を直接書き替えた
+    # 切替でも効く。
 
     if not mismatch:
         return
@@ -821,97 +828,6 @@ async def _check_embedding_dim(state: AppState, cfg: dict[str, Any]) -> None:
             "Auto reindex failed: %s. RAG remains in degraded state. "
             "Run 'evoref reindex' manually.", e,
         )
-
-
-def _build_bm25_index(
-    vs: "VectorStore | None",
-    cfg: dict[str, Any] | None = None,
-) -> "BM25Retriever | None":
-    """メインベクトルストアの BM25 索引を構築する。
-
-    **1 インスタンスを全経路で共有する。** チャット応答経路の LTM
-    ハイブリッド検索・sleep-time のプレフィックス再構築・``HybridRetriever``
-    (ベンチ / 長文生成) が同じ索引を見ないと、片方だけ新しいチャンクを
-    知っている状態が生まれる。
-
-    BM25 パラメータ (k1/b/delta/trigram/ASCII split/stopword) を config から反映。
-    ストアが空でもインスタンスは返す (後で sleep-time が張り直す)。
-    """
-    if vs is None:
-        return None
-    try:
-        from backend.free.rag.bm25_retriever import (
-            BM25Retriever,
-            DEFAULT_STOPWORD_BIGRAMS,
-            build_index_from_vector_store,
-        )
-
-        rag_cfg = (cfg or {}).get("rag", {}) if cfg else {}
-        stop_cfg = rag_cfg.get("bm25_stopword_bigrams", None)
-        if stop_cfg is None:
-            stopwords: list[str] | None = list(DEFAULT_STOPWORD_BIGRAMS)
-        else:
-            # 明示空リストはストップワード無効化、非空なら指定リストを使用
-            stopwords = list(stop_cfg)
-
-        bm25 = BM25Retriever(
-            k1=float(rag_cfg.get("bm25_k1", 1.5)),
-            b=float(rag_cfg.get("bm25_b", 0.75)),
-            delta=float(rag_cfg.get("bm25_delta", 1.0)),
-            use_trigrams=bool(rag_cfg.get("bm25_use_trigrams", False)),
-            split_ascii=bool(rag_cfg.get("bm25_split_ascii", True)),
-            stopwords=stopwords,
-        )
-        n = build_index_from_vector_store(bm25, vs)
-        logger.info("BM25 index initialized: %d chunks", n)
-        return bm25
-    except Exception as e:
-        logger.warning("BM25 index init skipped: %s", e)
-        return None
-
-
-def _build_hybrid_retriever(
-    vs: "VectorStore | None",
-    embedder: "EmbeddingBackend | None",
-    debug_logger: "DebugLogger",
-    policy_interpreter: "PolicyInterpreter",
-    cfg: dict[str, Any] | None = None,
-    bm25: "BM25Retriever | None" = None,
-) -> "HybridRetriever | None":
-    """7d-2. HybridRetriever 構築（ベンチマーク・長文生成の unit 検索で使用）
-
-    融合パラメータ (fusion_method/rrf_k/bm25_weight/vector_weight) を config から
-    反映する。BM25 索引は :func:`_build_bm25_index` が作った共有インスタンスを
-    受け取る (無ければ本関数内で作る)。
-    """
-    if not (vs and embedder):
-        return None
-    try:
-        from backend.free.rag.retriever import HybridRetriever
-
-        rag_cfg = (cfg or {}).get("rag", {}) if cfg else {}
-        if bm25 is None:
-            bm25 = _build_bm25_index(vs, cfg)
-        if bm25 is None:
-            return None
-
-        hybrid_retriever = HybridRetriever(
-            vector_store=vs,
-            bm25_retriever=bm25,
-            embedder=embedder,
-            fusion_method=str(rag_cfg.get("fusion_method", "rrf")),
-            rrf_k=int(rag_cfg.get("rrf_k", 60)),
-            bm25_weight=float(rag_cfg.get("bm25_weight", 0.3)),
-            vector_weight=float(rag_cfg.get("vector_weight", 0.7)),
-            debug_logger=debug_logger,
-            policy=policy_interpreter,
-            config=cfg,
-        )
-        logger.info("HybridRetriever initialized for benchmark")
-        return hybrid_retriever
-    except Exception as e:
-        logger.warning("HybridRetriever init skipped: %s", e)
-        return None
 
 
 def _init_lazy_contextual(
@@ -969,7 +885,7 @@ def _init_lazy_contextual(
 
 
 def _init_memory_threshold_calibration(
-    resolver, cfg: dict[str, Any], short_term, embedder,
+    resolver, cfg: dict[str, Any], episodic, embedder,
 ) -> None:
     """記憶検索の品質 3 閾値を、埋め込みモデルに合わせた較正値へ差し替える。
 
@@ -990,10 +906,10 @@ def _init_memory_threshold_calibration(
         set_active_calibration(None)
         logger.info("Memory threshold calibration disabled (threshold_mode=manual)")
         return
-    if embedder is None or short_term is None:
+    if embedder is None or episodic is None:
         logger.info(
-            "Memory threshold calibration skipped: embedder=%s short_term=%s",
-            embedder is not None, short_term is not None,
+            "Memory threshold calibration skipped: embedder=%s episodic=%s",
+            embedder is not None, episodic is not None,
         )
         return
 
@@ -1026,14 +942,14 @@ def _init_memory_threshold_calibration(
 
     set_pending_recalibration(
         lambda: _run_memory_threshold_calibration(
-            memory_dir, fingerprint, short_term, embedder,
+            memory_dir, fingerprint, episodic, embedder,
         ),
     )
 
     try:
         asyncio.create_task(
             _run_memory_threshold_calibration(
-                memory_dir, fingerprint, short_term, embedder,
+                memory_dir, fingerprint, episodic, embedder,
             ),
             name="memory_threshold_calibration",
         )
@@ -1042,7 +958,7 @@ def _init_memory_threshold_calibration(
 
 
 async def _run_memory_threshold_calibration(
-    memory_dir, fingerprint: str, short_term, embedder,
+    memory_dir, fingerprint: str, episodic, embedder,
 ) -> None:
     """代理クエリを再埋め込みして閾値を較正し、キャッシュへ保存する。
 
@@ -1060,7 +976,9 @@ async def _run_memory_threshold_calibration(
     )
 
     try:
-        notes = [n for n in short_term.notes.values() if n.embedding is not None]
+        notes = [
+            n for n in episodic.notes_with_vectors() if n.embedding is not None
+        ]
         if len(notes) < MIN_NOTES:
             logger.info(
                 "Memory threshold calibration skipped: only %d notes with "
@@ -1125,8 +1043,8 @@ def _init_sleep_time_worker(
     state: AppState,
     cfg: dict[str, Any],
     sleep_scheduler: "SleepTimeScheduler",
-    stm: "ShortTermMemory",
-    ltm: Any,
+    episodic: "EpisodicStore",
+    working_memory_registry: Any,
     embedder: "EmbeddingBackend | None",
     vs: "VectorStore | None",
     exp_buf: "ExperienceBuffer",
@@ -1134,18 +1052,18 @@ def _init_sleep_time_worker(
     learned_patterns_store: "LearnedPatternStore",
     policy_interpreter: "PolicyInterpreter",
     aux_prompt_mgr: "AuxPromptManager",
-    bm25_retriever: "BM25Retriever | None" = None,
 ) -> None:
-    """7e. SleepTimeWorker（EmbeddingBackend + FadeMemScorer が必要）"""
+    """7e. SleepTimeWorker (EmbeddingBackend が必要)。
+
+    ノート生成 / tier 遷移 / 要約 / 保持方針 / snapshot はすべてこのワーカーに
+    閉じる (c_16 §2.1: エピソード記憶の書き手は sleep-time だけ)。
+    """
     try:
-        from backend.free.memory.pipeline.lightmem_scorer import FadeMemScorer
         from backend.free.memory.sleep_update import SleepTimeWorker
 
         if embedder is None:
             logger.warning("SleepTimeWorker init skipped: no embedder available")
             return
-
-        scorer = FadeMemScorer(cfg, policy=policy_interpreter)
 
         # ── Step 8 Extractor 用配線 ──
         # ``state.get_semantic_store`` をプロバイダとして渡し、抽出器が
@@ -1192,12 +1110,35 @@ def _init_sleep_time_worker(
         # フラグ非依存)。ディレクトリそのものを Step 8 / MDPIngester に渡す。
         agent_trace_dir = _agent_trace_dir()
 
-        # Step 10 でアーカイブ後にキャッシュ済 SemanticFactStore を破棄
+        # Step 10 でアーカイブ後にキャッシュ済のスコープ束縛ビューを破棄
         def _semantic_invalidator(scope: str) -> None:
             state._semantic_stores.pop(scope, None)
 
+        # 埋め込みは snapshot 生成でしか使わないので、ここで初めて差し込む。
+        from backend.factory._memory_init import (
+            attach_episodic_embedder,
+            attach_semantic_embedder,
+        )
+
+        attach_episodic_embedder(episodic, embedder)
+        attach_semantic_embedder(getattr(state, "semantic_memory", None), embedder)
+
+        triggers_dir = None
+        try:
+            from backend.config import get_path_resolver
+
+            triggers_dir = get_path_resolver().resolve_local("triggers_dir")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Sleep-time wiring: triggers_dir resolution failed: %s", exc)
+
+        def _private_trace_ids() -> set[str]:
+            """窓に残っている private ターンの trace_id (MDP 昇格の除外)。"""
+            registry = working_memory_registry
+            getter = getattr(registry, "private_trace_ids", None)
+            return set(getter()) if getter is not None else set()
+
         worker = SleepTimeWorker(
-            stm, ltm, embedder, scorer, cfg,
+            episodic, embedder, cfg,
             experience_buf=exp_buf,
             debug_logger=debug_logger,
             learned_patterns=learned_patterns_store,
@@ -1210,11 +1151,9 @@ def _init_sleep_time_worker(
             agent_trace_dir=agent_trace_dir,
             subject_canonicalizer=subject_canonicalizer,
             semantic_store_invalidator=_semantic_invalidator,
+            triggers_dir=triggers_dir,
+            private_trace_ids_provider=_private_trace_ids,
         )
-        # 新しく昇格したチャンクを語彙検索でも引けるよう、共有 BM25
-        # インスタンスを worker に渡す (sleep-time が索引を張り直す)。
-        if bm25_retriever is not None:
-            worker.set_bm25_retriever(bm25_retriever)
         sleep_scheduler.set_worker(worker)
         logger.info(
             "SleepTimeWorker initialized (project_id=%s, agent_trace_dir=%s)",
@@ -1632,7 +1571,7 @@ def _init_tools(
     logger.info("ToolsRegistry initialized: %d tools", tools_reg.count)
 
     # URL リコール用 MemFactView (global scope) — チャット応答時に
-    # ``mem.world.url.*`` を読み取って fetch_url 補完するために使う。
+    # ``idx.url.*`` を読み取って fetch_url 補完するために使う。
     # global store が取得できない (early init / disabled) 場合は None。
     mem_view = None
     try:
@@ -2066,7 +2005,7 @@ def _auto_migrate_base_model(
     """起動時 auto-migrate
 
     `_validate_model_state` から呼ばれる。既に初期化済みの AppState から
-    prompt_manager / experience_buf / learning_scheduler / stm を取り出して
+    prompt_manager / experience_buf / learning_scheduler / エピソード記憶を取り出して
     `ModelMigrator.migrate()` を実行する。
     """
     from backend.edition import get_pro_handler
@@ -2091,12 +2030,12 @@ def _auto_migrate_base_model(
         except Exception as exc:
             logger.debug("eval_core_manager unavailable during auto-migrate: %s", exc)
 
-    stm = None
+    episodic = None
     get_memory_system = getattr(state, "get_memory_system", None)
     if callable(get_memory_system):
         mem = get_memory_system()
         if mem:
-            _, stm, _ = mem
+            _, episodic = mem
 
     logger.warning(
         "Auto-migrate on startup: %s -> %s. "
@@ -2111,7 +2050,7 @@ def _auto_migrate_base_model(
         prompt_manager=prompt_manager,
         eval_core_manager=eval_core_mgr,
         learning_scheduler=learning_scheduler,
-        short_term_memory=stm,
+        episodic_memory=episodic,
     )
     result = migrator.migrate(
         new_model_path=new_model_path,
@@ -2146,8 +2085,7 @@ class _LifespanContext:
 
     sleep_scheduler: Any
     learning_scheduler: Any
-    wm: Any  # WorkingMemoryRegistry (全セッションを shutdown で drain する)
-    stm: Any
+    wm: Any  # WorkingMemoryRegistry (shutdown で全セッションの窓を落とす)
     resolver: Any
     exp_buf: Any
     exp_file: Any
@@ -2297,7 +2235,7 @@ async def _build_gen_pillar(
 
     Returns:
         (gen_pillar, pro_shutdown_hook, develop_shutdown_hook) — retrieval
-        (HybridRetriever 等) は :func:`_build_gen_pillar_retrieval` で後追いで
+        (語彙索引 等) は :func:`_build_gen_pillar_retrieval` で後追いで
         追加する。
     """
     cfg = base.cfg
@@ -2377,7 +2315,7 @@ async def _build_mem_pillar(
     resolver = base.resolver
 
     with _timed(timings, "memory"):
-        wm, stm, ltm, vs = _init_memory(state, cfg, resolver)
+        wm, episodic = _init_memory(state, cfg, resolver)
     await _timed_task(
         timings, "embedding_dim_check",
         _check_embedding_dim(state, cfg),
@@ -2412,23 +2350,14 @@ async def _build_mem_pillar(
         # bg_task wrapper の outcome.jsonl 記録のため debug_logger を注入
         sleep_scheduler = SleepTimeScheduler(cfg, debug_logger=debug_logger)
         state.sleep_scheduler = sleep_scheduler
-        # Full 実行の直前に **全セッション** の WM → STM スナップショットを
-        # 走らせる (f_02 §1.2 経路 (c) / §4.3)。押し出しが起きていない進行中
-        # セッションでは、これが Step 8 抽出への唯一の供給経路になる。吸収処理
-        # (エコー落とし) は api 層にあるため、mem pillar からは注入で受ける。
-        from backend.free.api.chat.chat_recorder import snapshot_all_wm_to_stm
-
-        sleep_scheduler.set_pre_full_flush(
-            lambda: snapshot_all_wm_to_stm(wm, stm),
-        )
+        # WM → STM の事前フラッシュは不要になった (c_16 §4.1)。ノート生成は
+        # 会話履歴を入力にする sleep-time の Step E1 で、窓の状態に依存しない。
 
     from backend.pillars import MemPillar
     return MemPillar(
         working_memory=None,
         working_memory_registry=wm,
-        short_term_memory=stm,
-        long_term_memory=ltm,
-        vector_store=vs,
+        episodic_memory=episodic,
         cartridge_manager=state.cartridge_manager,
         sleep_scheduler=sleep_scheduler,
         current_project_id=project_id_for_policy,
@@ -2442,42 +2371,23 @@ def _build_gen_pillar_retrieval(
     mem: "MemPillar",
     timings: dict[str, float],
 ) -> None:
-    """Gen pillar の retrieval 層 (HybridRetriever)。
+    """Gen pillar の retrieval 層 (lazy contextual / 閾値較正)。
 
     Mem pillar の ``vector_store`` / ``cartridge_manager`` に依存するため、
-    Mem 構築後に呼び出す。Gen pillar に ``hybrid_retriever`` を事後付与する。
+    Mem 構築後に呼び出す。
+
+    語彙索引はここで作らない。3 ストアとも ``EvidenceStore`` が snapshot ごと
+    に numpy CSR の転置索引を自前で作る (c_16 §6.2) ので、``rank-bm25`` 由来の
+    共有 ``BM25Retriever`` は廃止した (c_16 §8)。
     """
     cfg = base.cfg
-    debug_logger = base.debug_logger
-    policy_interpreter = base.policy_interpreter
 
-    rag_cfg = (cfg or {}).get("rag", {}) or {}
-    with _timed(timings, "bm25_index"):
-        bm25 = _build_bm25_index(mem.vector_store, cfg)
-        gen.bm25_retriever = bm25
-        # チャット応答経路の LTM をハイブリッド (ベクトル + BM25 RRF) にする。
-        # ``rag.hybrid_search`` は長らくチャット経路では no-op だったが、
-        # ここで実際に効くようになった (config.yaml.example の NOTE も更新済)。
-        if (
-            bm25 is not None
-            and mem.long_term_memory is not None
-            and bool(rag_cfg.get("hybrid_search", True))
-        ):
-            mem.long_term_memory.set_bm25_retriever(
-                bm25, rrf_k=int(rag_cfg.get("rrf_k", 60)),
-            )
-            logger.info("LTM hybrid retrieval enabled (vector + BM25 RRF)")
-    with _timed(timings, "hybrid_retriever"):
-        hybrid_retriever = _build_hybrid_retriever(
-            mem.vector_store, gen.embedder,
-            debug_logger, policy_interpreter, cfg, bm25=bm25,
-        )
-        gen.hybrid_retriever = hybrid_retriever
+    vector_store = state.vector_store
     with _timed(timings, "lazy_contextual"):
-        _init_lazy_contextual(state, cfg, mem.vector_store, gen.embedder)
+        _init_lazy_contextual(state, cfg, vector_store, gen.embedder)
     with _timed(timings, "memory_threshold_calibration"):
         _init_memory_threshold_calibration(
-            base.resolver, cfg, mem.short_term_memory, gen.embedder,
+            base.resolver, cfg, mem.episodic_memory, gen.embedder,
         )
     with _timed(timings, "judge_tracker"):
         _init_judge_tracker(state)
@@ -2544,11 +2454,10 @@ async def _build_learn_pillar(
     if not learning_disabled:
         with _timed(timings, "sleep_time_worker"):
             _init_sleep_time_worker(
-                state, cfg, mem.sleep_scheduler, mem.short_term_memory,
-                mem.long_term_memory, gen.embedder, mem.vector_store,
+                state, cfg, mem.sleep_scheduler, mem.episodic_memory,
+                mem.working_memory_registry, gen.embedder, state.vector_store,
                 exp_buf, debug_logger, learned_patterns_store,
                 policy_interpreter, aux_prompt_mgr,
-                bm25_retriever=gen.bm25_retriever,
             )
     else:
         logger.info("SleepTimeWorker setup skipped (learning disabled)")
@@ -2883,8 +2792,8 @@ async def wire_pillars(
         ``EvorefGen → EvorefMem ← EvorefLoop ← EvorefLearn``
 
     実際の構築順は Gen core → Mem → Gen retrieval → Learn → Loop で、
-    retrieval (HybridRetriever) のみ Mem (vector_store) への依存のため
-    Mem 構築後に Gen pillar へ事後付与する。
+    retrieval (語彙索引 / lazy contextual) のみ Mem (vector_store) への
+    依存のため Mem 構築後に Gen pillar へ事後付与する。
 
     各フェーズの所要時間は ``timings`` dict に記録し、pillar 単位のサマリ
     (``pillar_gen`` / ``pillar_mem`` / ``pillar_loop`` / ``pillar_learn``) と
@@ -2928,7 +2837,7 @@ async def wire_pillars(
     )
     state.mem = mem
 
-    # Gen retrieval (Mem 依存): HybridRetriever
+    # Gen retrieval (Mem 依存): 語彙索引 / lazy contextual / 閾値較正
     with _timed(timings, "pillar_gen_retrieval"):
         _build_gen_pillar_retrieval(state, base, gen, mem, timings)
 
@@ -2970,7 +2879,6 @@ async def wire_pillars(
         sleep_scheduler=mem.sleep_scheduler,
         learning_scheduler=learn.scheduler,
         wm=mem.working_memory_registry,
-        stm=mem.short_term_memory,
         resolver=base.resolver,
         exp_buf=learn.experience_buffer,
         exp_file=exp_file,

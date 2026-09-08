@@ -269,11 +269,17 @@ async def get_status(state: AppState = Depends(get_app_state)):
     mem_sys = state.get_memory_system()
     memory = MemoryStats()
     if mem_sys:
-        wm, stm, ltm = mem_sys
+        wm, episodic = mem_sys
+        # ``short`` / ``long`` は同じストアの tier (c_16 §4.1)。レスポンスの
+        # 形は既存 UI と揃えたまま、件数の出所だけを移した。
         memory = MemoryStats(
             working_turns=len(wm.turns),
-            short_term_notes=len(stm.notes),
-            long_term_chunks=ltm.vectors.count if ltm else 0,
+            short_term_notes=(
+                len(episodic.short_notes()) if episodic is not None else 0
+            ),
+            long_term_chunks=(
+                len(episodic.iter_notes(tier="long")) if episodic is not None else 0
+            ),
         )
 
     status = "ok" if connected else "degraded"

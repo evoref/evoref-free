@@ -388,6 +388,48 @@ class PromptCandidateJudgement(_StrictModel):
     reason: str = Field(max_length=80)
 
 
+# ── know.* claim 抽出 (knowledge_claim_extract) ──
+
+
+class KnowledgeClaimValue(_StrictModel):
+    """claim の値 (数量なら ``number`` + ``unit``、それ以外は ``kind="text"``)。
+
+    ``Evidence.structured.value`` と同じ 3 つ組。数量を文字列のまま持つと
+    比較も換算もできないので、抜けるものは抜かせる。
+    """
+
+    kind: Literal["text", "number"]
+    number: float | None
+    unit: str | None
+
+
+class KnowledgeClaim(_StrictModel):
+    """取得した 1 item の本文から抜いた claim 1 件。
+
+    ``predicate`` は **誰が言ったか** の 4 段で、確度そのものではない
+    (確度は ``derive_confidence`` が出所の ``reliability`` から決める、
+    c_16 §3.3)。噂を ``rumors`` と名乗らせておくと、後段の競合解決で
+    ``states`` と同列に扱わずに済む。
+    """
+
+    statement: str = Field(max_length=300)
+    subject_topic: str = Field(max_length=40)
+    predicate: Literal["states", "reports", "rumors", "measures"]
+    value: KnowledgeClaimValue | None
+    published_at: str | None
+    region: list[str]
+
+
+class KnowledgeClaimList(_StrictModel):
+    """`backend/pro/knowledge/claim_extractor.py` の claim 抽出結果。
+
+    top-level に object が要るので ``claims`` キーで配列を包む
+    (``MetaCognitivePlan`` / ``CartridgeEvalQAList`` と同方針)。
+    """
+
+    claims: list[KnowledgeClaim]
+
+
 # ── purpose -> schema 自動解決マップ ──
 #
 # 呼出側が ``response_schema`` を明示しない場合、AuxClient が purpose
@@ -410,6 +452,7 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "assertion_naming": AssertionNaming,
     "fewshot_quality_score": FewShotQualityJudgement,
     "prompt_candidate_judge": PromptCandidateJudgement,
+    "knowledge_claim_extract": KnowledgeClaimList,
 }
 
 
@@ -557,6 +600,9 @@ __all__ = [
     "CartridgeEvalQAItem",
     "CartridgeEvalQAList",
     "UrlRelevanceJudgement",
+    "KnowledgeClaim",
+    "KnowledgeClaimList",
+    "KnowledgeClaimValue",
     "SpecRevisionJudgement",
     "PURPOSE_SCHEMAS",
     "make_response_format",

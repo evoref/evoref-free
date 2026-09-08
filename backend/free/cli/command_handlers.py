@@ -353,10 +353,12 @@ async def _cmd_status(args: str, state: SessionState, console) -> CommandResult:
     m, s = divmod(rem, 60)
     uptime_str = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
 
+    # ``short_term_notes`` / ``long_term_chunks`` はエピソード記憶の
+    # ``short`` / ``long`` tier の件数 (c_16 §4.1)。ストアは 1 つ。
     memory = status_data.get("memory", {})
     wm = memory.get("working_turns", 0)
-    stm = memory.get("short_term_notes", 0)
-    ltm = memory.get("long_term_chunks", 0)
+    short_notes = memory.get("short_term_notes", 0)
+    long_notes = memory.get("long_term_chunks", 0)
 
     # コンポーネント情報（CLI 側で直接ヘルスチェック）
     project_root = _find_project_root()
@@ -372,7 +374,8 @@ async def _cmd_status(args: str, state: SessionState, console) -> CommandResult:
     render_model_info(console, models, context_size)
     render_info(
         console,
-        f"  {msg('cli.status_memory')}: WM={wm}, STM={stm}, LTM={ltm}",
+        f"  {msg('cli.status_memory')}: "
+        f"WM={wm}, short={short_notes}, long={long_notes}",
     )
 
     # デバッグ情報の詳細表示（debug モード有効時のみ）

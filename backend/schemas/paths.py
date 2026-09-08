@@ -75,6 +75,18 @@ _REMOVED_LOCAL_PATH_KEYS: dict[str, str] = {
         "prompt had no experience producer, so evolution never ran); aux "
         "prompts are edited manually via /api/aux-prompts"
     ),
+    "vectors_dir": (
+        "the episodic store keeps its own vectors under "
+        "local_paths.memory_dir/episodic/embeddings/<model_id>/ "
+        "(see docs/c_16_evidence_store.md §2.1). There is no separate "
+        "vector directory any more"
+    ),
+    "cartridges_dir": (
+        "knowledge cartridges became corpus packages and moved under "
+        "local_paths.memory_dir (see docs/c_16_evidence_store.md). The three "
+        "evidence stores (episodic / semantic / corpus) all live under one "
+        "memory_dir; resolve them with PathResolver.resolve_corpus_dir()"
+    ),
 }
 
 
@@ -141,7 +153,6 @@ class LocalPathsConfig(BaseModel):
         default="local/models/embed_lora_versions/",
         description="embed LoRA のバージョン履歴保存先。",
     )
-    vectors_dir: str = "local/vectors/"
     knowledge_dir: str = "local/knowledge/"
     experience_file: str = "local/experience.json"
     eval_core_file: str = "local/eval_core.json"
@@ -160,7 +171,6 @@ class LocalPathsConfig(BaseModel):
     # develop フラグに依らず書かれ、sleep-time の MDP ingest (episodic LTM) が読む。
     agent_trace_dir: str = "local/memory/agent_trace/"
     prompts_dir: str = "local/prompts/"
-    cartridges_dir: str = "local/cartridges/"
     history_dir: str = "local/history/"
     learned_patterns_file: str = "local/learned_patterns.json"
     themes_dir: str = "local/themes/"

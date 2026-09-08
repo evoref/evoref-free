@@ -219,8 +219,18 @@ def _cartridge_show(backend_url: str, console, cartridge_id: str) -> int:
     render_info(console, f"  {msg('cli.cartridge_col_chunks')}: {c.get('chunks', 0)}")
     render_info(console, f"  {msg('cli.cartridge_detail_docs')}: {c.get('doc_count', 0)}")
     render_info(console, f"  {msg('cli.cartridge_col_size')}: {_fmt_size(c.get('size_mb', 0))}")
-    if c.get("priority") is not None:
-        render_info(console, f"  {msg('cli.cartridge_detail_priority')}: {c['priority']}")
+    if c.get("license"):
+        render_info(console, f"  {msg('cli.cartridge_detail_license')}: {c['license']}")
+    if c.get("active_version"):
+        render_info(
+            console,
+            f"  {msg('cli.cartridge_detail_active_version')}: {c['active_version']}",
+        )
+    if c.get("embedding_model_id"):
+        render_info(
+            console,
+            f"  {msg('cli.cartridge_detail_embedding_model')}: {c['embedding_model_id']}",
+        )
     if c.get("installed_at"):
         render_info(console, f"  {msg('cli.cartridge_detail_installed_at')}: {_fmt_time_jst(c['installed_at'])}")
     if c.get("compatibility"):

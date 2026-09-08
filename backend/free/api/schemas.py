@@ -182,8 +182,6 @@ class RagStatsResponse(BaseModel):
     embedding_dim_stored: int | None = None
     embedding_dim_mismatch: bool = False
     chunking_strategy: str
-    hybrid_search: bool
-    fusion_method: str
     created_at: str | None = None
     last_reindex_at: str | None = None
     embedding_model: str | None = None
@@ -202,28 +200,24 @@ class WorkingMemoryStats(BaseModel):
 
 
 class ShortTermMemoryStats(BaseModel):
+    """``short`` tier のノート統計 (c_16 §4.1)。"""
+
     notes: int
     max_notes: int
     pending_embeddings: int
     pending_evolution: int
-    avg_lightmem_score: float
 
 
 class LongTermMemoryStats(BaseModel):
+    """``long`` tier のノート統計 (c_16 §4.1)。"""
+
     chunks: int
     index_size_mb: float
     sources: int
 
 
-class FadeMemStats(BaseModel):
-    alpha: float
-    beta: float
-    gamma: float
-    threshold: float
-
-
 class SemanticMemoryScopeStats(BaseModel):
-    """SemanticFactStore 1 スコープあたりの集計"""
+    """SemMem 1 スコープあたりの集計"""
     scope: str
     total: int = 0
     active: int = 0
@@ -236,7 +230,7 @@ class SemanticMemoryScopeStats(BaseModel):
 class SemanticMemoryStats(BaseModel):
     """SemMem 全体サマリ
 
-    現在ロード済みの SemanticFactStore (global + 既知の project) を集計する。
+    これまでに参照されたスコープ (global + 既知の project) を集計する。
     未ロードのプロジェクトは含まれない (lazy 設計)。
     """
     scopes: list[SemanticMemoryScopeStats] = Field(default_factory=list)
@@ -248,7 +242,6 @@ class MemoryDetailedStats(BaseModel):
     working: WorkingMemoryStats
     short_term: ShortTermMemoryStats
     long_term: LongTermMemoryStats
-    fadem: FadeMemStats
     semantic: SemanticMemoryStats = Field(default_factory=SemanticMemoryStats)
     current_mode: str = "chat"
 
@@ -258,10 +251,8 @@ class NoteInfo(BaseModel):
     content: str
     keywords: list[str]
     tags: list[str]
-    lightmem_score: float
     created_at: float
     accessed_at: float
-    access_count: int
     session_id: str
     context_description: str
     evolution_pending: bool
@@ -311,7 +302,6 @@ class PinnedFactInfo(BaseModel):
     mode_origin: str
     created_at: float
     accessed_at: float
-    access_count: int
 
 
 class PinFactResponse(BaseModel):
@@ -615,7 +605,6 @@ class SessionData(BaseModel):
     turns: list[SessionTurn] = Field(default_factory=list)
     turn_count: int = 0
     context_files: list[str] = Field(default_factory=list)
-    cartridge_ids: list[str] = Field(default_factory=list)
     token_info: SessionTokenInfo = Field(default_factory=SessionTokenInfo)
     summary: str | None = None
     summary_embedding: list[float] | None = None

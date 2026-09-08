@@ -26,7 +26,7 @@ EvorefMem 統合仕様 の自動 Pin 検出を実装する
       起動時コピー等のマイグレーションは行わない。
 
 呼び出し側:
-    ``ShortTermMemory.absorb()`` から本検出器を呼び、生成した ``MemoryNote``
+    ``episodic.ingest.build_note_from_turn`` から本検出器を呼び、``MemoryNote``
     の ``pin_flag`` / ``pin_reason`` を設定する。SemanticFact への昇格は
     sleep-time Step 8 Extractor 以降で扱う
 

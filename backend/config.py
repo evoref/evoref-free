@@ -62,7 +62,6 @@ class PathResolver:
         "lora_archive_dir": "local/lora_archive/",
         "embed_lora_adapter": "local/models/embed_adapter.gguf",
         "embed_lora_versions_dir": "local/models/embed_lora_versions/",
-        "vectors_dir": "local/vectors/",
         "knowledge_dir": "local/knowledge/",
         "experience_file": "local/experience.json",
         "eval_core_file": "local/eval_core.json",
@@ -71,10 +70,9 @@ class PathResolver:
         # EvorefMem ローカル状態
         "local_state_file": "local/state.json",
         "memory_dir": "local/memory/",
-        # AgentTracer の MDP トレース常設ストア (episodic LTM の入力)。
+        # AgentTracer の MDP トレース常設ストア (エピソード記憶の入力)。
         "agent_trace_dir": "local/memory/agent_trace/",
         "prompts_dir": "local/prompts/",
-        "cartridges_dir": "local/cartridges/",
         "history_dir": "local/history/",
         "learned_patterns_file": "local/learned_patterns.json",
         "themes_dir": "local/themes/",
@@ -232,6 +230,20 @@ class PathResolver:
         作り直す。partition 無効時は ``local/aux_prompts/`` (flat) を返す。
         """
         return self.resolve_learning("aux_prompts_dir")
+
+    def resolve_corpus_dir(self) -> Path:
+        """corpus ストア (文書由来チャンク) の置き場を解決する。
+
+        c_16 §2 で 3 ストア (episodic / semantic / corpus) は
+        ``local_paths.memory_dir`` 配下へ統合された。旧
+        ``local_paths.cartridges_dir`` は廃止 (c_16 §8) で、パッケージは
+        ``<memory_dir>/corpus/packages/<id>/<version>/`` に置く。
+
+        独立した ``local_paths`` キーを持たないのは、3 ストアが 1 つの
+        ``memory_dir`` の下に揃っていること自体が不変則だから — 別キーにすると
+        「片方だけ別ドライブへ移した」状態が作れてしまう。
+        """
+        return self.resolve_local("memory_dir") / "corpus"
 
     @property
     def active_mode(self) -> str:

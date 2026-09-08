@@ -43,7 +43,6 @@ from backend.free.loop.executor import (
     ExecutionOutcome,
     TaskExecutor,
 )
-from backend.free.memory.stores.short_term import ShortTermMemory
 from backend.free.memory.types import SemanticFact, TaskStatus, make_fact
 from backend.free.memory.views.loop import (
     TASK_PREDICATE as _LOOP_TASK_PREDICATE,
@@ -788,8 +787,8 @@ class LoopDriver:
         self,
         *,
         wm: WorkingMemory | None,
-        stm: ShortTermMemory | None,
-        threshold_tokens: int,
+        episodic: Any | None = None,
+        threshold_tokens: int = 0,
         project_id: str | None = None,
         force: bool = False,
     ) -> MaybeResetReport:
@@ -803,7 +802,7 @@ class LoopDriver:
         report = maybe_reset_and_bootstrap(
             view,
             wm=wm,
-            stm=stm,
+            episodic=episodic,
             project_id=target,
             threshold_tokens=threshold_tokens,
             policy_activation_min_confidence=(

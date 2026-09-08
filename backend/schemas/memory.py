@@ -52,6 +52,7 @@ VALID_FACT_TYPES: frozenset[str] = frozenset(
         "artifact",
         "create",
         "model",
+        "claim",            # know.<domain>.<topic> の世界知識 (c_16 §4.2)
     }
 )
 
@@ -111,7 +112,7 @@ class FactsConfig(BaseModel):
     """``agent_trace*.jsonl`` を episodic LTM に取り込むか
 
     Step 7.5 (``_step7_5_ingest_mdp_traces``) で MDPIngester を起動し、
-    エピソード単位で ``MemoryNote`` を生成 → ``LongTermMemory`` に投入する。
+    エピソード単位で ``MemoryNote`` を生成 → エピソード記憶の long tier に投入する。
     ``trace_id`` が contextvars 経由で MemoryNote / SemanticFact に伝播し、
     ファクトとエピソード記憶を相互参照可能にする。"""
 
@@ -167,7 +168,7 @@ class ConflictResolverConfig(BaseModel):
 class ConflictChatReviewConfig(BaseModel):
     """pending 競合のチャット確認フロー設定
 
-    ``review_status="pending"`` の競合をチャットの SemMem 注入で提示し、
+    ``veracity="disputed"`` の競合をチャットの SemMem 注入で提示し、
     ユーザー回答を LLM (``conflict_chat_judge``) で判定して即時解決する
     フローを制御する。
     """
@@ -199,7 +200,7 @@ class SemMemConflictConfig(BaseModel):
     - ``confirm_window_hours``: 同 source / N 時間以内の対は微妙ケースとして
       確認モードに振り分ける。
     - ``default_mode``: ``auto`` で例外を除き自動マージ、``manual`` で全件を
-      ``review_status="pending"`` に振り分ける。
+      ``veracity="disputed"`` に振り分ける。
     - ``chat_review``: pending をチャットで確認・解決するフローの制御。
     """
 
@@ -363,7 +364,7 @@ class SemMemLimitsConfig(BaseModel):
     スコア計算順位:
     1. ``eval_metric.fitness`` が存在すればこれを使用 (policy 用)
     2. それ以外は ``confidence``
-    タイブレーカ: ``access_count``、``accessed_at`` (古い順)。
+    タイブレーカ: ``accessed_at`` (= ``last_used_at``、古い順)。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -387,6 +388,7 @@ class SemMemLimitsConfig(BaseModel):
     progress_marker: int = Field(default=5000, ge=0)
     artifact: int = Field(default=10000, ge=0)
     model: int = Field(default=1000, ge=0)
+    claim: int = Field(default=20000, ge=0)  # know.* の世界知識 (c_16 §4.2)
     enforcement: Literal["hard", "soft"] = "hard"
     gc_strategy: Literal["lowest_score"] = "lowest_score"
     superseded_retention_days: float = Field(default=90.0, ge=0.0)
@@ -415,15 +417,17 @@ class SemMemLimitsConfig(BaseModel):
 class SemMemProjectConfig(BaseModel):
     """プロジェクトアーカイブ設定
 
-    sleep-time Step 10 がアクセスのないプロジェクトを ``archive_dir``
-    へ移動する閾値とパスを指定する。``auto_archive_inactive_days=0``
-    でアーカイブを無効化できる (検証用)。
+    sleep-time Step 10 がアクセスのないプロジェクトを退役させる閾値。
+    ``auto_archive_inactive_days=0`` でアーカイブを無効化できる (検証用)。
+
+    c_16 でスコープが ``Evidence.scope`` フィールドになり、ディレクトリの
+    物理移動は起きなくなった (退役は ``retract(reason="project_archived")``)。
+    移動先を指す ``archive_dir`` は死んだキーなので撤去した。
     """
 
     model_config = ConfigDict(extra="forbid")
 
     auto_archive_inactive_days: int = Field(default=180, ge=0)
-    archive_dir: str = "local/memory/semantic/archive"
 
 
 #: 宣言だけがあって値を読むコードが 1 つも無かった config キー (2026-09-02 監査
@@ -437,7 +441,105 @@ REMOVED_MEMORY_KEYS: tuple[tuple[str, str], ...] = (
     ("facts", "trigger"),
     ("subject_dictionary", "auto_expand"),
     ("conflict.chat_review", "max_judge_per_session"),
+    # c_16 でスコープが Evidence.scope になり、semantic/projects/<id>/ という
+    # 実体が無くなった。移動先ディレクトリを指す設定は読み手が消えた。
+    ("project", "archive_dir"),
 )
+
+
+class EvidenceRetentionConfig(BaseModel):
+    """Evidence Store の保持方針 (c_16 §5.4)。
+
+    各ストアの ``manifest.json`` に宣言として書き出される (無宣言は監査で
+    落とす)。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # episodic: tier=short の保持日数
+    short_days: int = Field(default=14, ge=1)
+    # episodic: tier=long の上限件数。超過は pinned 除外 → last_used_at 最古から retract
+    long_max_records: int = Field(default=50000, ge=100)
+    # semantic idx.* の上限件数
+    idx_max_records: int = Field(default=20000, ge=100)
+    # 畳み込み済み事象ファイルを残す月数
+    events_keep_months: int = Field(default=3, ge=1)
+    # snapshot の保持版数
+    snapshots_keep: int = Field(default=3, ge=1)
+
+
+class EvidenceStorePriorConfig(BaseModel):
+    """順位式の ``store_prior`` (c_16 §7.2)。
+
+    ``score = cos × freshness × confidence × store_prior``。corpus は
+    ``corpus/manifest.json`` の ``store_prior_overrides`` で PC 固有に上書き
+    できる (旧カートリッジ ``priority`` の置き換え)。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    episodic: float = Field(default=1.0, ge=0.0, le=2.0)
+    semantic_mem: float = Field(default=1.0, ge=0.0, le=2.0)
+    semantic_know: float = Field(default=0.9, ge=0.0, le=2.0)
+    corpus: float = Field(default=0.9, ge=0.0, le=2.0)
+
+
+class EvidenceRankingConfig(BaseModel):
+    """順位付けの係数と origin 方針 (c_16 §7)。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    store_prior: EvidenceStorePriorConfig = Field(
+        default_factory=EvidenceStorePriorConfig,
+    )
+    # origin=assistant のレコードを [参考情報] に出すか。既定 False —
+    # 自分の出力が「過去の記録」として恒久再注入される事故 (2026-08-15 監査)
+    # を origin 規則で塞ぐのが c_16 §1 の眼目。
+    allow_assistant_origin_injection: bool = False
+
+
+class EvidenceLexicalConfig(BaseModel):
+    """転置索引の走査上限 (c_16 §6.2)。
+
+    走査量 ≤ ``q_terms × m_postings`` で **レコード数 N に依存しない**。
+    実測を前提にせず構造で上限を持つ、が設計の要点なので、既定から動かす
+    ときは上限が壊れていないか確かめること。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # クエリ語のうち IDF 上位 Q 語だけ使う
+    q_terms: int = Field(default=32, ge=1, le=256)
+    # 各語の posting 先頭 M 件だけ読む
+    m_postings: int = Field(default=2000, ge=1)
+    # df > N × 比率 の語は索引から除外 (相対値なので N に追随する)
+    max_df_ratio: float = Field(default=0.10, gt=0.0, le=1.0)
+    # 超過時は lexical をスキップしベクトル候補のみで続行 (ms)
+    budget_ms: float = Field(default=20.0, ge=0.0)
+
+
+class EvidenceConfig(BaseModel):
+    """Evidence Store (c_16 §9)。
+
+    episodic / semantic / corpus の 3 ストアに共通する保持・順位・索引の設定。
+    ``rag.cluster_index`` / ``rag.quantization`` / ``rag.memmap_threshold`` は
+    現行キーをそのまま全ストアで使う。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    retention: EvidenceRetentionConfig = Field(
+        default_factory=EvidenceRetentionConfig,
+    )
+    ranking: EvidenceRankingConfig = Field(default_factory=EvidenceRankingConfig)
+    lexical: EvidenceLexicalConfig = Field(default_factory=EvidenceLexicalConfig)
+    # know.<domain> の減衰既定 (日)。null = 減衰なし。
+    # レコード側の half_life_days が指定されていればそちらが優先。
+    know_half_life_days: dict[str, float | None] = Field(
+        default_factory=lambda: {
+            "news": 7.0, "economy": 1.0, "local": 30.0, "howto": None,
+        },
+    )
 
 
 class MemoryConfig(BaseModel):
@@ -502,6 +604,8 @@ class MemoryConfig(BaseModel):
     semmem_limits: SemMemLimitsConfig = Field(default_factory=SemMemLimitsConfig)
     # プロジェクトアーカイブ
     project: SemMemProjectConfig = Field(default_factory=SemMemProjectConfig)
+    # Evidence Store (episodic / semantic / corpus の共通基盤、c_16 §9)
+    evidence: EvidenceConfig = Field(default_factory=EvidenceConfig)
     # ターン数はトークン上限より先に効かせない。ターン数超過は無圧縮の
     # ハード eviction (古い発言が丸ごと消える) だが、トークン超過は
     # compress_turn による段階的縮退なので、後者を主たる制約にする。
@@ -547,15 +651,12 @@ class MemoryConfig(BaseModel):
     # フォールバック定数は chat_constants.DEFAULT_HISTORY_MIN_TOKENS と同期させること。
     history_min_tokens: int = Field(default=1024, ge=0)
     short_term_max_notes: int = Field(default=100, ge=1)
-    lightmem_decay_days: int = Field(default=7, ge=1)
-    # FadeMem タグ別半減期 (日)
-    # キーは VALID_FACT_TYPES (FactType と同期) のいずれか。値は正の整数 (日)。
-    # 未指定タグは lightmem_decay_days (デフォルト半減期) を使用。
-    half_life_days_by_tag: dict[str, int] = Field(default_factory=dict)
-    fade_alpha: float = Field(default=0.4, ge=0.0, le=1.0)
-    fade_beta: float = Field(default=0.3, ge=0.0, le=1.0)
-    fade_gamma: float = Field(default=0.3, ge=0.0, le=1.0)
-    fade_threshold: float = Field(default=0.15, ge=0.0, le=1.0)
+    # LightMem スコアと FadeMem の重み (``lightmem_decay_days`` /
+    # ``half_life_days_by_tag`` / ``fade_alpha`` / ``fade_beta`` /
+    # ``fade_gamma`` / ``fade_threshold``) は廃止。順位式は
+    # ``cos × freshness × confidence × store_prior`` の 1 本になり (c_16 §7.2)、
+    # 減衰は ``memory.evidence.know_half_life_days`` とレコードの
+    # ``half_life_days`` が持つ。保持順は ``last_used_at`` (c_16 §5.4)。
     conflict_similarity_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
     conflict_batch_size: int = Field(default=5, ge=1)
     note_evolution_enabled: bool = True
@@ -572,42 +673,6 @@ class MemoryConfig(BaseModel):
     conflict_resolver: ConflictResolverConfig = Field(
         default_factory=ConflictResolverConfig,
     )
-
-    @model_validator(mode="after")
-    def validate_fade_weights(self) -> "MemoryConfig":
-        """FadeMem の重み合計が 1.0 であることを検証"""
-        total = self.fade_alpha + self.fade_beta + self.fade_gamma
-        if abs(total - 1.0) > 0.01:
-            raise ValueError(
-                f"fade_alpha + fade_beta + fade_gamma = 1.0 である必要があります"
-                f"（現在: {self.fade_alpha} + {self.fade_beta} + {self.fade_gamma} = {total}）"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def validate_half_life_days_by_tag(self) -> "MemoryConfig":
-        """half_life_days_by_tag のキーは FactType、値は正の整数であることを検証"""
-        invalid_keys: list[str] = []
-        invalid_values: list[str] = []
-        for key, value in self.half_life_days_by_tag.items():
-            if key not in VALID_FACT_TYPES:
-                invalid_keys.append(key)
-            if not isinstance(value, int) or value <= 0:
-                invalid_values.append(f"{key}={value!r}")
-        errors: list[str] = []
-        if invalid_keys:
-            errors.append(
-                "half_life_days_by_tag に未知のタグがあります "
-                f"(FactType 以外): {sorted(invalid_keys)}"
-            )
-        if invalid_values:
-            errors.append(
-                "half_life_days_by_tag の値は正の整数 (日) である必要があります: "
-                f"{invalid_values}"
-            )
-        if errors:
-            raise ValueError("; ".join(errors))
-        return self
 
     @model_validator(mode="after")
     def warn_turn_cap_binds_before_token_cap(self) -> "MemoryConfig":

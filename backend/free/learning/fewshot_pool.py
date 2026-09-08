@@ -1186,6 +1186,17 @@ class FewShotPool(JsonStateStore):
             追加された候補数
         """
         added = 0
+        # ユーザーに訂正された側のターン。訂正ターン自身 (user_correction 付き)
+        # は下で除外されるが、**訂正された応答** には何の印も無いので、そのまま
+        # だと成功経験として手本に採られる。2026-09-07 ライブ監査: 「会話の前半は
+        # 参照できないため…」という注記込みの応答をユーザーが「その注記は間違い」
+        # と訂正したのに、その応答が正例としてプールに残り、訂正後の正解は GC で
+        # 消えていた。宛先は記録時に ``corrected_entry_id`` で確定している。
+        corrected_ids = {
+            (exp.get("signals") or {}).get("corrected_entry_id")
+            for exp in experiences
+        }
+        corrected_ids.discard(None)
         for exp in experiences:
             signals = exp.get("signals", {})
             fitness = _calc_experience_fitness(signals)
@@ -1196,6 +1207,8 @@ class FewShotPool(JsonStateStore):
 
             # 成功例のみ（訂正・言い直し・失敗ターンがない）
             if signals.get("user_correction") is not None:
+                continue
+            if exp.get("id") in corrected_ids:
                 continue
             if signals.get("rephrased_query", False):
                 continue

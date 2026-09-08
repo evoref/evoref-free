@@ -42,7 +42,6 @@ class SessionDetailResponse(BaseModel):
     turns: list[dict] = Field(default_factory=list)
     turn_count: int
     context_files: list[str] = Field(default_factory=list)
-    cartridge_ids: list[str] = Field(default_factory=list)
     summary: str | None = None
 
 

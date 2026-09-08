@@ -16,25 +16,20 @@ class _NoteLike(Protocol):
 
     embedding: Any
     evolution_pending: bool
-    lightmem_score: float
 
 
 def count_pending_embeddings(notes: Iterable[_NoteLike]) -> int:
-    """埋め込み未計算のノート数を数える"""
-    return sum(1 for n in notes if n.embedding is None)
+    """ベクトル未取得のノート数を数える。
+
+    ノートのベクトルは snapshot 生成時に索引へ入る (c_16 §6.1) ので、これは
+    「まだ snapshot に載っていないノート」の数になる。
+    """
+    return sum(1 for n in notes if getattr(n, "embedding", None) is None)
 
 
 def count_pending_evolution(notes: Iterable[_NoteLike]) -> int:
     """進化待ちフラグが立っているノート数を数える"""
-    return sum(1 for n in notes if n.evolution_pending)
-
-
-def average_lightmem_score(notes: Iterable[_NoteLike]) -> float:
-    """LightMem スコアの平均を算出する (ノートが空なら 0.0)"""
-    scores = [n.lightmem_score for n in notes]
-    if not scores:
-        return 0.0
-    return sum(scores) / len(scores)
+    return sum(1 for n in notes if getattr(n, "evolution_pending", False))
 
 
 def index_size_mb(index_path: Path | None) -> float:
@@ -61,18 +56,16 @@ def compute_stm_stats(notes: Iterable[_NoteLike]) -> dict[str, Any]:
     return {
         "pending_embeddings": count_pending_embeddings(notes_list),
         "pending_evolution": count_pending_evolution(notes_list),
-        "avg_lightmem_score": round(average_lightmem_score(notes_list), 3),
     }
 
 
 def compute_ltm_stats(
     chunks: int,
     index_path: Path | None,
-    metadata: Iterable[dict[str, Any]] | None,
+    sources: int = 0,
 ) -> dict[str, Any]:
-    """LTM 統計 (chunks / index_size_mb / sources) をまとめて計算する"""
+    """``long`` tier の統計 (件数 / 索引サイズ / 出所数) をまとめる。"""
     size_mb = index_size_mb(index_path)
-    sources = count_unique_sources(metadata) if metadata is not None else 0
     return {
         "chunks": chunks,
         "index_size_mb": round(size_mb, 3),

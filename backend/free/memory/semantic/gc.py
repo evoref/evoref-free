@@ -11,7 +11,7 @@ sleep-time Step 9 (`SleepTimeWorker._step9_run_semmem_gc`) が行う。
 - スコア順位:
     1. ``eval_metric.fitness`` が存在すればこれを使用 (policy ファクト)
     2. それ以外は ``confidence``
-- タイブレーカ: ``access_count`` (少ない順) → ``accessed_at`` (古い順) → ``id``
+- タイブレーカ: ``accessed_at`` (= ``last_used_at``、古い順) → ``id``
 """
 
 from __future__ import annotations
@@ -31,10 +31,14 @@ def _gc_score(fact: SemanticFact) -> float:
     return float(fact.confidence)
 
 
-def _gc_sort_key(fact: SemanticFact) -> tuple[float, int, float, str]:
+def _gc_sort_key(fact: SemanticFact) -> tuple[float, float, str]:
+    """削除候補の並び (小さいほど先に消す)。
+
+    アクセス回数は持たなくなったので (c_16 §3)、保持順は ``accessed_at``
+    (= ``last_used_at``) だけ。同着は ``id`` で決定論にする。
+    """
     return (
         _gc_score(fact),
-        fact.access_count,
         fact.accessed_at,
         fact.id,
     )

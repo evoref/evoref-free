@@ -595,6 +595,23 @@ class ProUrlRecallConfig(BaseModel):
     team_profile_ids: list[str] = Field(default_factory=list)
 
 
+class ProKnowledgeConfig(BaseModel):
+    """Pro ``know.*`` 取得器の設定 (c_16 §4.2)。
+
+    ``sources.jsonl`` に登録された取得元を sleep-time のアイドル窓で回し、
+    本文から claim を抜いて ``know.<domain>.<topic>`` へ書く。Free には
+    取得器が無いので、有効化しても効果はない (起動時に WARNING)。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    fetch_timeout_sec: int = Field(default=20, ge=1)
+    max_items_per_run: int = Field(default=20, ge=1)
+    max_claims_per_item: int = Field(default=8, ge=1)
+    user_agent: str = "evoref-knowledge/1.0"
+
+
 class ProConfig(BaseModel):
     """Pro 専用機能の設定ルート
 
@@ -607,6 +624,7 @@ class ProConfig(BaseModel):
 
     terminal: TerminalConfig = Field(default_factory=TerminalConfig)
     url_recall: ProUrlRecallConfig = Field(default_factory=ProUrlRecallConfig)
+    knowledge: ProKnowledgeConfig = Field(default_factory=ProKnowledgeConfig)
 
 
 class ModelMigrationConfig(BaseModel):

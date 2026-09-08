@@ -81,6 +81,5 @@ def to_session_detail_response(session: SessionData) -> SessionDetailResponse:
         turns=session.turns,
         turn_count=session.turn_count,
         context_files=session.context_files,
-        cartridge_ids=session.cartridge_ids,
         summary=session.summary,
     )

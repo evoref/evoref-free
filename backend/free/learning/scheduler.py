@@ -51,6 +51,23 @@ if TYPE_CHECKING:
 logger = get_logger("learning.scheduler")
 
 
+def _used_corpus_evidence(experience: dict) -> bool:
+    """そのターンに corpus 由来の材料を **注入したか** (c_16 §5.5)。
+
+    ``gen_config.evidence_ids`` は ``"<store>:<evidence_id>"`` 形式で、
+    ``corpus:`` が 1 件でもあれば ``[参考情報]`` 枠に文書チャンクが載っている。
+    旧 ``signals.rag_used`` は「検索が何か返したか」でしかなく、フロア / gate /
+    top_k で全部落ちたターンも 1 と数えていた。
+    """
+    gen_config = experience.get("gen_config")
+    if not isinstance(gen_config, dict):
+        return False
+    return any(
+        isinstance(eid, str) and eid.startswith("corpus:")
+        for eid in (gen_config.get("evidence_ids") or ())
+    )
+
+
 def _fmt_measured(value: float | None) -> str:
     """採用ゲートの実測値をログ用に整形する (None は "-")。"""
     return "-" if value is None else f"{value:.3f}"
@@ -1746,19 +1763,6 @@ class LearningScheduler:
         except Exception as exc:
             logger.warning("feedback_pipe.run failed: %s", exc)
 
-    def _filter_experiences(self, experiences: list[dict]) -> list[dict]:
-        """カートリッジ依存の経験を除外"""
-        if self.cartridge_mgr is None:
-            return experiences
-
-        current_ids = set(self.cartridge_mgr.loaded.keys())
-        filtered = []
-        for exp in experiences:
-            exp_ids = set(exp.get("cartridge_ids", []))
-            if exp_ids <= current_ids or not exp_ids:
-                filtered.append(exp)
-        return filtered
-
     def _filter_experiences_for_level2(
         self,
         experiences: list[dict],
@@ -1772,9 +1776,8 @@ class LearningScheduler:
         さらにそのモード ("chat"/"create") の経験のみに絞る (省略時は全モード
         横断、後方互換)。
         """
-        filtered = self._filter_experiences(experiences)
         filtered = [
-            e for e in filtered
+            e for e in experiences
             if e.get("base_model", current_model) == current_model
         ]
         if mode is not None:
@@ -1782,19 +1785,20 @@ class LearningScheduler:
         return filtered
 
     def _get_filtered_experiences(self) -> list[dict]:
-        """経験バッファを dict リストに変換しカートリッジフィルタを適用
+        """経験バッファを dict リストに変換する。
 
         1 tick に 3〜4 回呼ばれ、毎回 1000 件規模の dataclass → dict 変換を
-        繰り返していた (L-D1)。バッファ長 / 末尾 timestamp / ロード済み
-        カートリッジ集合をキーにメモ化する (ExperienceBuffer は世代カウンタを
-        持たないため、この 3 つ組を安価な代替キーとする)。
+        繰り返していた (L-D1)。バッファ長 / 末尾 timestamp をキーにメモ化する
+        (ExperienceBuffer は世代カウンタを持たないため、この 2 つ組を安価な
+        代替キーとする)。
+
+        カートリッジ依存の経験を落とすフィルタは廃止した (c_16 §5.5)。判定に
+        使っていた ``ExperienceEntry.cartridge_ids`` は「そのとき **ロードされて
+        いた** 一覧」で、実際に材料として見せたかどうかとは無関係だった。
+        「何を見せたか」は ``gen_config.evidence_ids`` が持つ。
         """
         entries = self.experience_buf.entries
-        cart_ids = (
-            frozenset(self.cartridge_mgr.loaded.keys())
-            if self.cartridge_mgr is not None else None
-        )
-        key = (len(entries), entries[-1].timestamp if entries else None, cart_ids)
+        key = (len(entries), entries[-1].timestamp if entries else None)
         if key == self._exp_cache_key:
             return list(self._exp_cache)
         raw_experiences = [
@@ -1805,12 +1809,12 @@ class LearningScheduler:
                 "response_summary": e.response_summary,
                 "response_full": e.response_full,
                 "base_model": e.base_model,
-                "cartridge_ids": e.cartridge_ids,
+                "gen_config": asdict(e.gen_config),
                 "signals": asdict(e.signals),
             }
             for e in entries
         ]
-        filtered = self._filter_experiences(raw_experiences)
+        filtered = raw_experiences
         self._exp_cache_key = key
         self._exp_cache = filtered
         return list(filtered)
@@ -1861,11 +1865,10 @@ class LearningScheduler:
         )
         correction_rate = corrections / total if total > 0 else 0.0
 
-        # RAG 利用率
-        rag_used = sum(
-            1 for e in safe_exp
-            if e.get("signals", {}).get("rag_used")
-        )
+        # RAG 利用率 — **corpus 由来の材料を実際に注入したターンの割合** で数える
+        # (c_16 §5.5)。``signals.rag_used`` は「検索が何か返したか」で、注入まで
+        # 届いたかを表していなかった。
+        rag_used = sum(1 for e in safe_exp if _used_corpus_evidence(e))
         rag_usage_rate = rag_used / total if total > 0 else 0.0
 
         # phase3 (embed_instruction) / phase4 (token_budget) が実際に判定する

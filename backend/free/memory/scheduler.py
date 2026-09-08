@@ -151,8 +151,7 @@ class SleepTimeScheduler:
         self._level1_loop_task: asyncio.Task | None = None
         self._level2_loop_task: asyncio.Task | None = None
         self._worker = None  # SleepTimeWorker, set via set_worker()
-        #: Full 実行の直前に WM → STM のスナップショットを行うコールバック
-        #: (f_02 §1.2 経路 (c))。api 層が注入する。未設定なら no-op。
+        #: Full 実行の直前に走らせる前処理 (任意)。未設定なら no-op。
         self._pre_full_flush = None
         self._llm_client = None  # LocalClient for Full mode
         self._learning_scheduler = None  # LearningScheduler for Level 1/2
@@ -252,16 +251,12 @@ class SleepTimeScheduler:
             scheduler.set_user_active_checker(self.is_user_active)
 
     def set_pre_full_flush(self, callback) -> None:
-        """Full 実行の直前に走らせる WM → STM スナップショットを登録する。
+        """Full 実行の直前に走らせる前処理を登録する (任意)。
 
-        f_02 §1.2 経路 (c) / §4.3。sleep-time Step 8 の入力は STM ノートだが、
-        窓に収まる長さの会話は押し出しが起きず、セッションが終わるまで STM
-        ノートを 1 件も生まない。その状態で Full が走ると入力が空のまま
-        ``facts_extracted=0`` になる。
-
-        WM は mem pillar のものだがエコー落とし規則を持つ吸収処理は api 層に
-        あるため、``set_user_active_checker`` と同じく **注入** で受け取り、
-        mem pillar から api 層へ依存しない。
+        以前はここに WM → STM スナップショットを注入していた。ノート生成が
+        会話履歴を入力にする sleep-time の Step E1 になった (c_16 §4.1) ので、
+        Full の入力は窓の状態に依存しなくなり、既定では何も登録されない。
+        フックそのものは「Full の前にやること」の口として残す。
         """
         self._pre_full_flush = callback
 
@@ -577,38 +572,28 @@ class SleepTimeScheduler:
             return False
 
     def _run_pre_full_flush(self) -> None:
-        """``set_pre_full_flush`` で注入された WM → STM 転送を実行する。
+        """``set_pre_full_flush`` で注入された前処理を実行する。
 
-        未設定なら no-op。例外は握って警告に留める — スナップショットは Full の
-        入力を増やすための最適化であり、失敗しても既存 STM ノートに対する
-        Full は成立するため、ここで中断すると縮退幅が広がりすぎる。
+        未設定なら no-op。例外は握って警告に留める — 前処理は Full の入力を
+        増やすための補助であり、失敗しても Full 自体は成立する。
         """
         if self._pre_full_flush is None:
             return
         try:
             self._pre_full_flush()
         except Exception as exc:
-            logger.warning(
-                "Pre-full WM snapshot failed (continuing with existing "
-                "STM notes): %s", exc,
-            )
+            logger.warning("Pre-full hook failed (continuing): %s", exc)
 
     async def run_full_now(self) -> bool:
         """Full sleep-time を即座に 1 回走らせる (手動トリガー用)。
 
         自動 Trigger B (:meth:`_schedule_full`) と **同じ前処理** を通すための
-        入口。``_worker.run_full()`` を直接呼ぶと ``_run_pre_full_flush()``
-        (WM → STM スナップショット) を飛ばしてしまい、押し出しが起きていない
-        進行中セッションのターンが Step 8 の入力から丸ごと抜ける。
-        :func:`~backend.free.api.chat.chat_recorder.snapshot_wm_to_stm` の
-        docstring が言うとおり、それが「Step 8 抽出への唯一の供給経路」。
+        入口。``_worker.run_full()`` を直接呼ぶと ``_run_pre_full_flush()`` を
+        飛ばしてしまう。
 
-        実測 (2026-08-27 ライブ監査): ``snapshot_unabsorbed`` のログは自動
-        Trigger B の 3 回だけで、手動トリガー 2 回では 1 行も出ていなかった。
-        新セッションで 3 ターン話してから手動 Full を叩くと STM ノート 0 件 /
-        ファクト 0 件で、その後セッション切替 (WM ドレインが走る経路) を挟むと
-        同じ 3 ターンが正しく吸収された。**「今の会話を覚えさせたい」ときに
-        押すボタンで、今の会話だけが入力から抜けていた。**
+        ノート生成は Full の Step E1 (会話履歴からの取り込み) が行うので、
+        「今の会話を覚えさせたい」ときに押すボタンで今の会話が入力から抜ける、
+        という 2026-08-27 ライブ監査の事故は構造的に起きなくなった。
 
         ``_last_full_run`` は更新しない — 手動実行は自動スケジュールの
         デバウンス状態とは独立に扱う (従来挙動を変えない)。
@@ -756,9 +741,7 @@ class SleepTimeScheduler:
             )
             self._full_requested = False
             self._last_full_run = time.time()
-            # Step 8 の入力 (STM ノート) を用意してから走らせる。押し出しが
-            # 起きていない進行中セッションでは、これが唯一の供給経路になる
-            # (f_02 §1.2 経路 (c))。失敗しても Full 本体は止めない。
+            # 登録されていれば前処理を走らせる (失敗しても Full は止めない)。
             self._run_pre_full_flush()
             # sleep-time の LLM ステージを回すクライアント。ベースを
             # AuxClient 越しに使う。アイドル窓かつ専有スロットなので

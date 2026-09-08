@@ -5,7 +5,7 @@
 
 設計の核となる考え方:
 
-- **入力**: ``ShortTermMemory`` の ``MemoryNote`` 群 (chat/create 抽出器) または
+- **入力**: エピソード記憶の ``MemoryNote`` 群 (chat/create 抽出器) または
   ``agent_trace*.jsonl`` ファイル群 (MDPTraceExtractor、日付付きファイル含む)。
 - **出力**: ``SemanticFact`` のリスト + 統計 (``ExtractionResult``)。
   ``ExtractionResult`` には skip 件数や cap 当たり件数も含め、
@@ -24,8 +24,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from backend.free.memory.stores.short_term import MemoryNote
+from backend.free.memory.episodic.note import MemoryNote
 from backend.free.memory.notes.subject_canonicalizer import SubjectCanonicalizer
+from backend.free.memory.note_facts import origin_of
 from backend.free.memory.types import (
     FactType,
     MemoryMode,
@@ -247,6 +248,9 @@ class BaseExtractor:
             type=fact_type,
             scope=scope,
             mode_origin=self.mode,
+            # 誰が述べたか (c_16 §3)。``note_facts.origin_of`` と同じ規則
+            # — 片方だけ変えると経路によって注入可否が食い違う。
+            origin=origin_of(note),  # type: ignore[arg-type]
             provenances=[prov],
             confidence=confidence,
             pinned=bool(getattr(note, "pin_flag", False)),

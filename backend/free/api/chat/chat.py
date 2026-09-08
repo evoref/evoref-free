@@ -34,7 +34,10 @@ from backend.free.agent.tool_call_judge import (
     _extract_file_path,
     _recent_dialogue_text,
 )
-from backend.free.api.chat.chat_recorder import record_response
+from backend.free.api.chat.chat_recorder import (
+    record_response,
+    set_turn_evidence_ids,
+)
 from backend.free.api.chat.chat_types import ChatMessage
 from backend.free.api.chat.chat_service import (
     ConflictTurnContext,
@@ -341,7 +344,7 @@ async def _url_recall_hit(req: ChatRequest, state: AppState) -> bool:
     """過去に fetch 済みの URL ファクトがクエリに意味的に当たるか (reactive 昇格用)。
 
     判定本体は ``ToolCallJudge.recall_url_judgement`` (閾値 / TTL / profile まで
-    見る)。埋め込みの HTTP 往復を伴うので、``mem.world.url.*`` が索引に 0 件なら
+    見る)。埋め込みの HTTP 往復を伴うので、``idx.url.*`` が索引に 0 件なら
     埋め込まずに False を返す。判定器が未配線 / 例外時も False (reactive のまま)。
     """
     judge = state.tool_call_judge
@@ -483,16 +486,21 @@ async def _light_semmem_block(
     finally:
         timer.stop("light_embedding_ms")
     timer.start("semmem_ms")
+    injected_evidence_ids: list[str] = []
     try:
         return build_semmem_injection(
             state, cfg, mode=req.mode, query_vec=query_vec,
             query_text=req.message, session_id=session_id,
+            evidence_ids=injected_evidence_ids,
         )
     except Exception as exc:
         logger.warning("reactive-light semmem injection failed: %s", exc)
         return None
     finally:
         timer.stop("semmem_ms")
+        # 軽量パスは検索を落とすので corpus 由来は出ない (c_16 §5.5)。
+        if session_id:
+            set_turn_evidence_ids(session_id, injected_evidence_ids)
 
 
 async def _dispatch_continuation(
@@ -864,6 +872,10 @@ async def _build_messages_with_search(
     # (2026-08-18 の requests.jsonl に区間が無い)。ストアが育ったときに
     # 最初に効いてくる場所なので、先に見えるようにしておく。
     timer.start("semmem_ms")
+    # このターンで実際に注入した Evidence の id (c_16 §5.5)。``[参考情報]`` 枠
+    # (corpus / episodic) は検索側が、``[関連する記憶]`` 枠 (semantic /
+    # episodic) は注入側が埋める。学習帰属 (``GenerationConfigRef``) の材料。
+    injected_evidence_ids: list[str] = list(search_result.evidence_ids)
     try:
         semmem_block = build_semmem_injection(
             state, cfg, mode=req.mode, conflict_ctx=conflict_ctx,
@@ -872,9 +884,12 @@ async def _build_messages_with_search(
             query_text=req.message,
             covered_attributes=covered_attributes,
             session_id=session_id,
+            evidence_ids=injected_evidence_ids,
         )
     finally:
         timer.stop("semmem_ms")
+    if session_id:
+        set_turn_evidence_ids(session_id, injected_evidence_ids)
 
     # 直前ターンで作った長文成果物が、この発話の対象になっているか。
     # 長文は履歴予算に入らず次ターンで消えるため、これが無いとモデルは

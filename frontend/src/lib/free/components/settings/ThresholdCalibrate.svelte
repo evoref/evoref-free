@@ -2,10 +2,12 @@
 	/**
 	 * 検索閾値の調整ツール (埋め込みモデル切替後)
 	 *
-	 * - 安全調整 (A): rag.score_normalization を minmax に切替。埋め込みモデル差による
-	 *   絶対スコアのズレを層内正規化で緩和する (可逆・低リスク)。
-	 * - 推定 (B): 再構築済みベクトルのスコア分布から rag.* 閾値の推奨値を算出して提示。
-	 *   レビューして「適用」で書き込む。**正解ラベル不在のため助言値** (自動適用しない)。
+	 * 再構築済みベクトルのスコア分布から rag.* 閾値の推奨値を算出して提示する。
+	 * レビューして「適用」で書き込む。**正解ラベル不在のため助言値** (自動適用しない)。
+	 *
+	 * 層内正規化 (旧 rag.score_normalization) による安全調整は廃止した
+	 * (docs/c_16_evidence_store.md §7.2: 順位式が 3 ストア共通の 1 本になり、
+	 * スケールを揃える正規化そのものが不要になった)。
 	 *
 	 * いずれも reindex 後に実行するのが前提 (新しいインデックスに対してのみ意味を持つ)。
 	 */
@@ -18,13 +20,6 @@
 		type CalibrateThresholdsResponse
 	} from '$lib/free/api';
 
-	type Props = {
-		/** 現在の rag.score_normalization 値 (A の状態表示用) */
-		scoreNormalization?: string;
-	};
-
-	let { scoreNormalization = 'none' }: Props = $props();
-
 	let busy = $state(false);
 	let calib = $state<CalibrateThresholdsResponse | null>(null);
 	let message = $state<string | null>(null);
@@ -34,22 +29,6 @@
 		if (e instanceof ApiError) return e.message;
 		if (e instanceof Error) return e.message;
 		return String(e);
-	}
-
-	async function enableNormalization() {
-		if (busy) return;
-		busy = true;
-		error = null;
-		message = null;
-		try {
-			await updateConfigSection('rag', { score_normalization: 'minmax' });
-			await loadConfig();
-			message = $t('settings.threshold.normalization_enabled');
-		} catch (e) {
-			error = toError(e);
-		} finally {
-			busy = false;
-		}
 	}
 
 	async function runCalibrate() {
@@ -86,15 +65,6 @@
 
 <div class="threshold-calibrate">
 	<div class="hint">{$t('settings.threshold.hint')}</div>
-
-	<div class="row">
-		<button type="button" disabled={busy} onclick={enableNormalization}>
-			{$t('settings.threshold.enable_normalization')}
-		</button>
-		<span class="state">
-			{$t('settings.threshold.normalization_state', { value: scoreNormalization })}
-		</span>
-	</div>
 
 	<div class="row">
 		<button type="button" class="calib-btn" disabled={busy} onclick={runCalibrate}>

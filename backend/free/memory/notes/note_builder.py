@@ -6,7 +6,7 @@
 
 クラス階層:
 - :class:`NoteBuilder` — 共通基底。``extract_keywords`` / ``auto_tag`` /
-  ``initial_score`` の汎用ヘルパを提供する。``build()`` は EvorefMem の
+  ``source_confidence`` の汎用ヘルパを提供する。``build()`` は EvorefMem の
   ``MemoryNote`` 拡張フィールド (mode / project_id / source / is_tool_output /
   is_code_block / extraction_skipped) を含む dict を返す。
 - :class:`ChatNoteBuilder` — チャットモード用レンズ。``personal_fact`` /
@@ -1004,8 +1004,29 @@ def _nearest_owning_slug(
 
 
 #: 一人称の所有格が直接付いた「名前」。これがあれば本人の名前と読む。
+#: アシスタントの出力について述べている発話。「日曜と祝日だけを除くと書きま
+#: したが、**あなたの回答は** 土曜日も除外して…」「バッファなし channel の
+#: デッドロック条件は最初のターンで説明済みで、**私は 1 文だけを求めました**」
+#: は一人称を含むので personal_fact の候補になり、属性が解決できないため
+#: ``mem.personal.user`` に **会話への注文が事実として** live で残った
+#: (2026-09-07 ライブ監査、訂正 13 件のうち 2 件)。出力への言及を含む発話は
+#: 自己開示ではないので候補タグを付けない。「違います。住んでいるのも福岡です」
+#: のような **自分の事実の訂正** はアシスタントの出力を参照しないので通る。
+_ASSISTANT_OUTPUT_META_RE = re.compile(
+    r"あなた(?:の|が)(?:回答|答え|説明|計算|列挙|出力|結果|示し|書い|述べ)"
+    r"|(?:先ほど|さきほど|さっき|上|今回)の(?:回答|答え|説明|計算|列挙|出力|結果|注記)"
+    r"|(?:回答|答え|説明|計算|列挙|注記)(?:は|が)(?:間違|誤|違い|抜け|不要|余計)"
+    r"|(?:を|だけを)(?:求め|頼み|お願いし)(?:ました|た)"
+    r"|(?:言い|書き|答え|計算し)直して",
+)
+
+#: 「私が名乗った氏名」「私の氏名」も本人の名前。想起側の語形 (氏名 / 名乗った)
+#: を name の trigger に足したので、所有格の判定も同じ語形を見る。見ないと
+#: 「私が名乗った氏名と、夫と娘の 3 人家族」が family へ併合され、name が
+#: 注入候補から消える (2026-09-07 ライブ監査 F-07)。
 _SELF_POSSESSED_NAME_RE = re.compile(
-    r"(?:私|僕|俺|自分|わたし|ぼく|おれ|あたし|わたくし|うち)\s*の\s*名前",
+    r"(?:私|僕|俺|自分|わたし|ぼく|おれ|あたし|わたくし|うち)\s*"
+    r"(?:の\s*(?:名前|氏名|姓名|フルネーム)|が\s*名乗っ)",
 )
 
 
@@ -1166,12 +1187,9 @@ class NoteBuilder:
             "content": content,
             "keywords": keywords,
             "tags": merged_tags,
-            "embedding": None,
-            "lightmem_score": self.initial_score(content, role),
             "confidence": self.source_confidence(effective_source),
             "created_at": now,
             "accessed_at": now,
-            "access_count": 0,
             "session_id": session_id,
             "context_description": "",
             "evolution_pending": True,
@@ -1222,16 +1240,6 @@ class NoteBuilder:
             if any(w in content_lower for w in trigger_words):
                 tags.append(tag)
         return tags
-
-    @staticmethod
-    def initial_score(content: str, role: str = "user") -> float:
-        """初期 LightMem スコア（ルールベース）"""
-        score = 0.5
-        if len(content) > 200:
-            score += 0.1
-        if role == "user":
-            score += 0.1
-        return min(1.0, score)
 
     # 発生源別の初期 confidence。NoteEvolver はこの値が
     # ``memory.note_evolver.confidence_threshold`` (既定 0.7) 未満のノートのみ
@@ -1345,6 +1353,8 @@ class _ModeAwareNoteBuilder(NoteBuilder):
         話題語を落とした訂正は curator に委ねる」と宣言している。ここはその
         宣言をコードで満たす (従来は宣言だけで、実際は全訂正形を採っていた)。
         """
+        if _ASSISTANT_OUTPUT_META_RE.search(content):
+            return []
         text = content.lower()
         results: list[str] = []
         for tag, triggers in self.fact_triggers.items():

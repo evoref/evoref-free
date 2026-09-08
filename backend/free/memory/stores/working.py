@@ -93,13 +93,6 @@ def _reconcile_working_max_tokens(config: dict, mem: dict) -> int:
 #: 保持メッセージ数の平均は 15.2 → 14.1 とわずかに下がるだけで、割に合う。
 _TOKEN_EVICT_KEEP_RATIO = 0.6
 
-#: turn dict に立てる「STM へ転送済み」の印。``snapshot_unabsorbed`` が立て、
-#: ``_evict_oldest`` / ``clear`` が転送バッファへの二重積みを抑止するのに使う。
-#: turn dict はそのまま ``ShortTermMemory.absorb`` へ渡るが、absorb は必要な
-#: キーだけを読むため未知キーが増えても影響しない。
-_ABSORBED_KEY = "absorbed"
-
-
 class WorkingMemory:
     """Layer 1: ゼロレイテンシの会話コンテキスト"""
 
@@ -133,12 +126,9 @@ class WorkingMemory:
         )
         self.turns: list[dict] = []
         self.session_id: str = uuid4().hex[:8]
-        self._evicted: list[dict] = []  # Layer 2 転送用バッファ
         #: 押し出したターンの要点表 (f_02 §1.2)。窓の補助であって記憶層ではない。
         self.fact_slate = SessionFactSlate()
         #: 現在のセッションで押し出したターン数 (``clear()`` でリセット)。
-        #: ``_evicted`` は ``drain_evicted()`` で吸い出されるため残高を見ても
-        #: 「このセッションで会話の前半が視界から落ちたか」は分からない。
         #: 会話全体を走査しないと答えられない質問 (「この会話で依頼した
         #: ファイル操作を全部」等) で、見えていない範囲を「無い」と断定させない
         #: ための注記を出すかどうかの判定に使う (2026-08-05 ライブ監査:
@@ -150,7 +140,7 @@ class WorkingMemory:
         #:
         #: 「この会話で最初に何を言ったか」は並び順で決まる事実なので、検索にも
         #: モデルの読解にも委ねる理由が無い。ところが窓から押し出されると
-        #: ``turns`` からも ``_evicted`` からも消えるため、押し出し後は
+        #: ``turns`` から消えるため、押し出し後は
         #: **注記を出して降りる** しかなかった (``agent.deliberative.
         #: _append_session_position_fact``)。
         #:
@@ -184,7 +174,7 @@ class WorkingMemory:
         EvorefMem 拡張:
         ``private=True`` のターンは ``MemoryNote.private=True`` で吸収され、
         STM 以降 (LTM / SemMem) には伝播しない。``mode`` / ``project_id`` /
-        ``source`` も任意で turn dict に格納し、``ShortTermMemory.absorb``
+        ``source`` も任意で turn dict に格納し、sleep-time のノート生成
         が読み取る。``tool_command`` / ``tool_command_name`` /
         ``tool_command_success`` は run_command 実行ターンの learning 用メタで、
         sleep-time の executable_command_curator が参照する (それ以外は None)。
@@ -254,54 +244,31 @@ class WorkingMemory:
         """LLM用 messages 形式で返す（role + content のみ）"""
         return [{"role": t["role"], "content": t["content"]} for t in self.turns]
 
-    def snapshot_unabsorbed(self) -> list[dict]:
-        """まだ STM へ渡していないターンを **非破壊で** 返し、転送済みに印を付ける。
-
-        f_02 §1.2 経路 (c)。窓 (``working_max_turns`` / ``working_max_tokens``)
-        に収まる長さの会話は押し出しが起きず、セッションが終わるまで STM
-        ノートを 1 件も生まない。sleep-time Step 8 の入力は STM ノートなので、
-        その間に走った Full は入力が空のまま ``facts_extracted=0`` になる
-        (2026-08-18 ライブ監査: 21 ターンの会話が再起動まで 1 件も
-        ファクト化されなかった)。Full の直前にここを呼び、WM を保ったまま
-        STM 側だけ先に埋める。
-
-        WM からは取り除かない (会話 context を壊さない)。後で同じターンが
-        押し出されても二重に吸収しないよう ``absorbed`` フラグを立て、
-        :meth:`_evict_oldest` / :meth:`clear` が転送バッファへ積むのを抑止する。
-        """
-        pending = [t for t in self.turns if not t.get(_ABSORBED_KEY)]
-        for turn in pending:
-            turn[_ABSORBED_KEY] = True
-        if pending:
-            logger.debug(
-                "snapshot_unabsorbed: %d/%d turns handed to Layer 2 (WM retained)",
-                len(pending), len(self.turns),
-            )
-        return pending
-
     def clear(self) -> None:
-        """コンテキストクリア"""
-        # 既に snapshot で STM へ渡したターンは転送バッファへ積まない
-        # (二重ノートになる)。
-        pending = [t for t in self.turns if not t.get(_ABSORBED_KEY)]
-        logger.debug(
-            "clear: evicting %d/%d turns to transfer buffer",
-            len(pending), len(self.turns),
-        )
-        self._evicted.extend(pending)
+        """コンテキストクリア (セッション切替 / 終了)。
+
+        ノート化は会話履歴を入力にする sleep-time の仕事になったので
+        (c_16 §4.1)、ここで記憶層へ転送するものは無い。窓を空にするだけ。
+        """
+        logger.debug("clear: dropping %d turn(s) from the window", len(self.turns))
         self.turns.clear()
         # clear() はセッション切替時に呼ばれる。新しいセッションでは「前半が
         # 落ちている」状態ではないのでカウンタも畳む。
         self.session_evicted_turns = 0
         self.session_first_user_turn = ""
 
-    def drain_evicted(self) -> list[dict]:
-        """Layer 2 への転送用: 押し出されたターンを取得してバッファをクリア"""
-        evicted = self._evicted[:]
-        self._evicted.clear()
-        if evicted:
-            logger.debug("drain_evicted: %d turns transferred to Layer 2", len(evicted))
-        return evicted
+    def private_trace_ids(self) -> set[str]:
+        """窓に残っている private ターンの ``trace_id``。
+
+        private ターンは会話履歴にもエピソード記憶にも残らない (揮発する契約)
+        ので、「このトレースは private だった」と言えるのは窓だけ。sleep-time の
+        MDP 昇格がこれを除外に使う。
+        """
+        return {
+            str(t.get("trace_id") or "")
+            for t in self.turns
+            if t.get("private") and t.get("trace_id")
+        }
 
     def _enforce_limits(self) -> None:
         """ターン数・トークン上限を強制
@@ -343,12 +310,10 @@ class WorkingMemory:
         # も 23 回 = 生き残りゼロ)、保持量は 1 件も増えないまま副作用だけが残る:
         #   1. 窓の先頭 (system 直後) を書き換えるので llama-server の接頭辞
         #      KV キャッシュが押し出しとは別に無効化される。
-        #   2. 同じターンが原文と ``[要約]`` の 2 回 ``_evicted`` へ積まれ、
-        #      STM に同一発話のノートが 2 本できる。そこから起こしたファクトは
-        #      statement が完全一致するため「未解決の競合」として恒久 pending 化し、
-        #      無関係な質問のプロンプトにまで注入される (実データ:
-        #      sf_127618cb29fb 原文 / sf_852c5461ce09 ``[要約]``、同一秒・同一 subject)。
-        # 押し出しのみにすると窓の先頭は単調に前進し、転送も 1 ターン 1 回になる。
+        #   2. 同じターンが原文と ``[要約]`` の 2 通り残り、要点表にも記憶にも
+        #      同一発話が二重に入る。そこから起こしたファクトは statement が
+        #      完全一致するため「未解決の競合」として恒久 pending 化していた。
+        # 押し出しのみにすると窓の先頭は単調に前進する。
         while self._total_tokens() > token_target and len(self.turns) > 1:
             logger.debug(
                 "_enforce_limits: evicting oldest turn (role=%s, %d chars)",
@@ -376,30 +341,16 @@ class WorkingMemory:
         """
         if self.turns:
             evicted = self.turns.pop(0)
-            # snapshot 済みのターンは転送バッファへ積まない (二重ノート防止)。
-            # 窓から落ちた事実は変わらないのでカウンタは通常どおり進める。
-            if not evicted.get(_ABSORBED_KEY):
-                self._evicted.append(evicted)
-            # 要点表は STM 転送とは別 (f_02 §1.2): snapshot 済みでも窓から
-            # 消える事実は同じなので、転送バッファを経由せずここで渡す。
-            # 実機 (2026-09-03): 全ターンが snapshot 済みで転送バッファが空の
-            # まま押し出され、スレートが一度も埋まらなかった。
+            # 要点表は窓の補助 (f_02 §1.2)。押し出したターンの要点だけを残す。
             self.fact_slate.absorb([evicted])
             self.session_evicted_turns += 1
         while len(self.turns) > 1 and self.turns[0].get("role") == "assistant":
-            orphan = self.turns.pop(0)
-            if not orphan.get(_ABSORBED_KEY):
-                self._evicted.append(orphan)
+            self.turns.pop(0)
             self.session_evicted_turns += 1
 
     def _total_tokens(self) -> int:
         """全ターンの推定トークン数"""
         return sum(_estimate_tokens(t["content"]) for t in self.turns)
-
-
-#: ``WorkingMemoryRegistry.drop`` の ``drain_to`` 既定値 (コンストラクタで
-#: 渡した STM を使う) を表す番兵。``None`` は「転送せず捨てる」の意味で使う。
-_DRAIN_DEFAULT = object()
 
 
 class WorkingMemoryRegistry:
@@ -412,33 +363,21 @@ class WorkingMemoryRegistry:
     概念そのものを無くす。
 
     - :meth:`get` は無ければ作る。触ったセッションを LRU の末尾へ動かし、
-      ``memory.working_max_sessions`` を超えたら最古のセッションを
-      **セッション終了と同じ経路** (``clear()`` → drain ハンドラ) で STM へ
-      流してから落とす (f_02 §1.2 経路 (b))。
-    - drain ハンドラは api 層のエコー落とし規則 (``chat_recorder.
-      drain_evicted_to_stm``) を持つため **注入** で受ける
-      (``SleepTimeScheduler.set_pre_full_flush`` と同じ配線パターン)。未注入
-      なら ``stm.absorb`` を直に呼ぶ縮退動作。
-    - :class:`WorkingMemory` 自体の意味 (窓 / 押し出しブロック / ``absorbed`` /
+      ``memory.working_max_sessions`` を超えたら最古のセッションを落とす。
+    - **記憶層への転送はもう無い** (c_16 §4.1)。ノート化は会話履歴を入力に
+      した sleep-time の仕事なので、窓から落ちたターンが失われることはない。
+    - :class:`WorkingMemory` 自体の意味 (窓 / 押し出しブロック /
       ``session_first_user_turn`` / ``session_evicted_turns``) は変えない。
     """
 
-    def __init__(
-        self,
-        config: dict,
-        *,
-        drain_to=None,
-        drain_handler=None,
-    ) -> None:
+    def __init__(self, config: dict) -> None:
         mem = config.get("memory", {})
         # フォールバックはスキーマ既定 (backend/schemas/memory.py) と同じ値。
         self.max_sessions: int = max(1, int(mem.get("working_max_sessions", 8)))
         self._config = config
-        self._drain_to = drain_to
-        self._drain_handler = drain_handler
         self._sessions: dict[str, WorkingMemory] = {}
         # legacy 読み手 (session_id を持たない統計 API 等) が 1 件も無いときに
-        # 見る空の窓。台帳には載せないので drain / snapshot の対象にならない。
+        # 見る空の窓。台帳には載せないので drop の対象にならない。
         self._scratch: WorkingMemory | None = None
 
     # ── 取得 ────────────────────────────────────────────────────────
@@ -483,49 +422,31 @@ class WorkingMemoryRegistry:
 
     # ── 終了 / 転送 ────────────────────────────────────────────────
 
-    def drop(self, session_id: str, *, drain_to=_DRAIN_DEFAULT) -> WorkingMemory | None:
-        """セッションの WM を台帳から外す。
-
-        ``drain_to`` に STM を渡すと (既定はコンストラクタの ``drain_to``)、
-        まだ STM へ渡していないターンを **そのセッション ID で** 吸収してから
-        落とす (f_02 §1.2 経路 (b): ``clear()`` → drain)。``None`` なら捨てる。
-        無ければ ``None`` を返す。
-        """
+    def drop(self, session_id: str) -> WorkingMemory | None:
+        """セッションの WM を台帳から外す (無ければ ``None``)。"""
         wm = self._sessions.pop(session_id, None)
         if wm is None:
             return None
-        target = self._drain_to if drain_to is _DRAIN_DEFAULT else drain_to
         pending = len(wm.turns)
-        # ``clear()`` を先に実行してから drain する。逆順だと窓超過で既に押し
-        # 出された分しか拾えず、会話本体は転送バッファに滞留する。
         wm.clear()
-        if target is not None:
-            self._drain(wm, target, session_id)
         logger.debug(
-            "registry: dropped session %s (%d turns pending, drained=%s, active=%d)",
-            session_id, pending, target is not None, len(self._sessions),
+            "registry: dropped session %s (%d turn(s) in the window, active=%d)",
+            session_id, pending, len(self._sessions),
         )
         return wm
 
-    def drain_all(self, drain_to=_DRAIN_DEFAULT) -> int:
+    def drop_all(self) -> int:
         """全セッションを :meth:`drop` する (プロセス終了時)。落とした件数を返す。"""
         sids = self.active_sessions()
         for sid in sids:
-            self.drop(sid, drain_to=drain_to)
+            self.drop(sid)
         return len(sids)
 
-    def snapshot_all_unabsorbed(self) -> list[tuple[str, list[dict]]]:
-        """全セッションの未転送ターンを **非破壊で** 返す (Full 直前の経路 (c))。
-
-        ``[(session_id, turns), ...]`` を古いセッション順で返す。ターンには
-        ``absorbed`` の印が立つので、後で押し出されても二重吸収されない。
-        未転送が無いセッションは含めない。
-        """
-        out: list[tuple[str, list[dict]]] = []
-        for sid, wm in self._sessions.items():
-            pending = wm.snapshot_unabsorbed()
-            if pending:
-                out.append((sid, pending))
+    def private_trace_ids(self) -> set[str]:
+        """台帳上の全セッションの private ``trace_id`` (sleep-time が使う)。"""
+        out: set[str] = set()
+        for wm in self._sessions.values():
+            out |= wm.private_trace_ids()
         return out
 
     # ── 内部 ────────────────────────────────────────────────────────
@@ -537,14 +458,7 @@ class WorkingMemoryRegistry:
                 # 上限 1 で自分しか居ない、等。取ったばかりの窓は落とさない。
                 break
             logger.info(
-                "registry: session cap %d reached, draining LRU session %s to STM",
+                "registry: session cap %d reached, dropping LRU session %s",
                 self.max_sessions, oldest,
             )
             self.drop(oldest)
-
-    def _drain(self, wm: WorkingMemory, stm, session_id: str) -> None:
-        if self._drain_handler is not None:
-            self._drain_handler(wm, stm, session_id)
-            return
-        for turn in wm.drain_evicted():
-            stm.absorb(turn, session_id)

@@ -213,17 +213,23 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
 
     # #3a: base=lora は no-op 経路でトリガ段階 skip されるため、
     # 実メソッドが無効なら「データ不足」ではなく「メソッド未有効」を明示する。
+    #
+    # ただし **bootstrap (初回アダプタ生成) は base=lora でも走る** —
+    # 自動 tick (`_check_and_run_base_for_mode`) は base_method 判定より前に
+    # `_maybe_bootstrap_base` を呼ぶので、手動トリガだけが bootstrap にすら
+    # 到達しないのは到達範囲の食い違い (2026-09-07 ライブ監査 F-08:
+    # 手動は拒否、直後の自動 tick で adapter v1 が生成された)。アダプタが
+    # 無く bootstrap が有効なら trainer に委譲し、生成できたら「bootstrap
+    # のみ」と明示して返す。
     methods = _level2_methods(scheduler)
-    if not methods["will_run"]:
+    bootstrap_enabled = bool(getattr(scheduler, "bootstrap_enabled", False))
+    if not methods["will_run"] and not bootstrap_enabled:
         return OptimizeTriggerResponse(
             triggered=False,
             level="level2",
             message=msg("api.optimize_level2_method_not_enabled"),
         )
 
-    # 実メソッド有効: 全パス集合を渡して trainer に委譲 (SleepTimeWorker と同形)。
-    # cvector は LoRA 不要、bootstrap は adapter 不在時に走るため、
-    # adapter 存在を入口で要求しない (パス未解決は None で degraded に倒す)。
     resolver = get_path_resolver()
 
     def _safe(resolve, key):
@@ -232,14 +238,30 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
         except Exception:
             return None
 
+    # 学習データは (モデル×モード) パーティション配下にあるため
+    # resolve_learning で引く。resolve_local (flat) のままだと存在しない
+    # パスを渡してしまい、bootstrap 済みのアダプタが「無い」と判定される
+    # (SleepTimeScheduler 経路とも食い違う)。
+    lora_path = _safe(resolver.resolve_learning, "lora_adapter")
+    bootstrap_only = (
+        not methods["will_run"]
+        and (lora_path is None or not lora_path.exists())
+    )
+    if not methods["will_run"] and not bootstrap_only:
+        return OptimizeTriggerResponse(
+            triggered=False,
+            level="level2",
+            message=msg("api.optimize_level2_method_not_enabled"),
+        )
+
+    # 実メソッド有効 (または bootstrap のみ): 全パス集合を渡して trainer に
+    # 委譲 (SleepTimeWorker と同形)。cvector は LoRA 不要、bootstrap は adapter
+    # 不在時に走るため、adapter 存在を入口で要求しない (パス未解決は None で
+    # degraded に倒す)。
     base_model_path = _safe(resolver.resolve_model, "base_model")
     started = scheduler.check_level2(
         is_user_active=False,
-        # 学習データは (モデル×モード) パーティション配下にあるため
-        # resolve_learning で引く。resolve_local (flat)
-        # のままだと存在しないパスを渡してしまい、bootstrap 済みのアダプタが
-        # 「無い」と判定される (SleepTimeScheduler 経路とも食い違う)。
-        lora_path=_safe(resolver.resolve_learning, "lora_adapter"),
+        lora_path=lora_path,
         current_model=base_model_path.name if base_model_path else "",
         base_model_path=base_model_path,
         # 手動トリガは「今すぐ試す」意図なので overdue クールダウンは迂回する。
@@ -247,10 +269,12 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
         force=True,
     )
 
-    message = (
-        msg("api.optimize_level2_triggered") if started
-        else msg("api.optimize_level2_not_triggered")
-    )
+    if started and bootstrap_only:
+        message = msg("api.optimize_level2_bootstrap_only")
+    elif started:
+        message = msg("api.optimize_level2_triggered")
+    else:
+        message = msg("api.optimize_level2_not_triggered")
     return OptimizeTriggerResponse(
         triggered=started,
         level="level2",
