@@ -37,6 +37,26 @@ EventOp = Literal["put", "patch", "retract", "touch"]
 #: 月次ファイル名 (``2026-09.jsonl``) の stem 形式。
 _MONTH_FORMAT = "%Y-%m"
 
+#: 月の順序比較に使う番兵 (読めない stem を最古に寄せる)。
+_UNPARSED_MONTH = (-1, -1)
+
+
+def month_key(month: str) -> tuple[int, int]:
+    """月 stem (``2026-09``) → 比較用の ``(year, month)``。
+
+    **文字列の辞書順で比べない** (c_05 §0.5 / CLAUDE.md §6-11)。``2026-9``
+    のように 0 詰めを欠いた stem や 5 桁年が 1 つ混じるだけで順序が壊れ、
+    畳み込み位置と保持方針が別の月を指す。読めない stem は最古扱いにして
+    「未畳み込みの事象を消す」側へ倒さない。
+    """
+    parts = str(month).split("-")
+    if len(parts) != 2:
+        return _UNPARSED_MONTH
+    try:
+        return (int(parts[0]), int(parts[1]))
+    except ValueError:
+        return _UNPARSED_MONTH
+
 
 @dataclass(frozen=True, slots=True)
 class EventPosition:
@@ -64,8 +84,9 @@ class EventPosition:
             line=int(line) if isinstance(line, int) and line >= 0 else 0,
         )
 
-    def _sort_key(self) -> tuple[str, int]:
-        return (self.month, self.line)
+    def _sort_key(self) -> tuple[tuple[int, int], int]:
+        """位置の順序比較キー (月は ``(year, month)`` に解いてから比べる)。"""
+        return (month_key(self.month), self.line)
 
 
 class EvidenceEventLog:
@@ -146,7 +167,9 @@ class EvidenceEventLog:
         """存在する月次ファイルの stem を昇順で返す。"""
         if not self.events_dir.exists():
             return []
-        return sorted(p.stem for p in self.events_dir.glob("*.jsonl"))
+        return sorted(
+            (p.stem for p in self.events_dir.glob("*.jsonl")), key=month_key,
+        )
 
     def current_position(self) -> EventPosition:
         """現在の末尾位置 (次回の畳み込み開始点)。
@@ -172,10 +195,13 @@ class EvidenceEventLog:
         """
         start = marker or EventPosition()
         stop = until
+        start_key = month_key(start.month) if start.month else None
+        stop_key = month_key(stop.month) if stop is not None and stop.month else None
         for month in self.months():
-            if month < start.month:
+            key = month_key(month)
+            if start_key is not None and key < start_key:
                 continue
-            if stop is not None and stop.month and month > stop.month:
+            if stop_key is not None and key > stop_key:
                 break
             skip = start.line if month == start.month else 0
             limit: int | None = None
@@ -227,13 +253,15 @@ class EvidenceEventLog:
         months = self.months()
         if len(months) <= keep_months:
             return []
-        boundary = months[-keep_months]
+        boundary = month_key(months[-keep_months])
         folded_month = (folded_through or EventPosition()).month
+        folded_key = month_key(folded_month) if folded_month else None
         removed: list[str] = []
         for month in months[:-keep_months]:
-            if month >= boundary:
+            key = month_key(month)
+            if key >= boundary:
                 continue
-            if folded_month and month >= folded_month:
+            if folded_key is not None and key >= folded_key:
                 continue  # 未畳み込みの事象を落とさない
             try:
                 self._path(month).unlink()
@@ -289,4 +317,10 @@ class EvidenceEventLog:
             return sum(1 for _ in f)
 
 
-__all__ = ["EVENT_VERSION", "EventOp", "EventPosition", "EvidenceEventLog"]
+__all__ = [
+    "EVENT_VERSION",
+    "EventOp",
+    "EventPosition",
+    "EvidenceEventLog",
+    "month_key",
+]

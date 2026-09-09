@@ -12,6 +12,8 @@ snapshot 生成 = 前 snapshot + 事象を畳んで ``records.jsonl`` を **新�
 from __future__ import annotations
 
 import json
+import re
+import shutil
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -29,6 +31,7 @@ from backend.free.rag.evidence.types import (
     PATCHABLE_FIELDS,
     Evidence,
     EvidenceRecordError,
+    EvidenceVersionError,
     from_record,
 )
 from backend.io import AtomicWriter
@@ -44,10 +47,23 @@ SNAPSHOT_DIR = "snapshot"
 #: 版ディレクトリ名 (``v0007``)。
 _VERSION_FORMAT = "v{:04d}"
 
+#: :func:`version_seq` が読む版ディレクトリ名。
+_VERSION_RE = re.compile(r"v(\d+)")
+
+#: 削除途中の版に付ける接頭辞 (c_16 §5.4)。``list_versions`` から外れ、
+#: 次の prune が掃く。
+TRASH_PREFIX = ".trash-"
+
 
 def version_name(seq: int) -> str:
     """版番号 → ディレクトリ名 (``v0007``)。"""
     return _VERSION_FORMAT.format(int(seq))
+
+
+def version_seq(name: str) -> int | None:
+    """ディレクトリ名 → 版番号 (``v0007`` → 7)。読めなければ ``None``。"""
+    match = _VERSION_RE.fullmatch(str(name).strip())
+    return int(match.group(1)) if match else None
 
 
 def list_versions(store_dir: Path | str) -> list[str]:
@@ -55,10 +71,13 @@ def list_versions(store_dir: Path | str) -> list[str]:
     root = Path(store_dir) / SNAPSHOT_DIR
     if not root.exists():
         return []
-    return sorted(
+    names = [
         p.name for p in root.iterdir()
-        if p.is_dir() and (p / RECORDS_FILE).exists()
-    )
+        if p.is_dir()
+        and not p.name.startswith(TRASH_PREFIX)
+        and (p / RECORDS_FILE).exists()
+    ]
+    return sorted(names, key=lambda name: (version_seq(name) or 0, name))
 
 
 def snapshot_dir(store_dir: Path | str, version: str) -> Path:
@@ -100,6 +119,10 @@ class SnapshotWriter:
                     continue
                 try:
                     record = from_record(raw)
+                except EvidenceVersionError:
+                    # 版が新しいレコードは飛ばさない — 飛ばして畳むと、次の
+                    # 版で「知らないフィールドを落としたレコード」が正になる。
+                    raise
                 except EvidenceRecordError as e:
                     logger.warning("skipping malformed put event %s: %s", record_id, e)
                     broken += 1
@@ -197,6 +220,10 @@ class SnapshotReader:
         else:
             self.offsets = np.zeros(0, dtype=np.int64)
         self._id_index: dict[str, int] = self.columns.id_index()
+        #: 読んだ行に :data:`RECORD_VERSION` より新しいものがあった (§5.1)。
+        #: 立った版は畳んで書き戻してはいけないので、``EvidenceStore`` は
+        #: これを見て readonly に落ちる。
+        self.unsupported_version: bool = False
         if len(self.offsets) != len(self.columns):
             logger.error(
                 "Snapshot misalignment at %s: %d offsets vs %d columns. "
@@ -251,6 +278,13 @@ class SnapshotReader:
             return None
         try:
             return from_record(raw)
+        except EvidenceVersionError as e:
+            self.unsupported_version = True
+            logger.error(
+                "Snapshot %s row %d is a newer record version: %s",
+                self.directory, row, e,
+            )
+            return None
         except EvidenceRecordError as e:
             logger.warning("skipping unreadable record at row %d: %s", row, e)
             return None
@@ -271,6 +305,13 @@ class SnapshotReader:
                     continue
                 try:
                     yield from_record(json.loads(text))
+                except EvidenceVersionError as e:
+                    self.unsupported_version = True
+                    logger.error(
+                        "Snapshot %s holds a newer record version: %s",
+                        self.records_path, e,
+                    )
+                    raise
                 except (json.JSONDecodeError, EvidenceRecordError):
                     skipped += 1
         if skipped:
@@ -322,6 +363,32 @@ def apply_patch(
     return replace(record, **updates)
 
 
+def sweep_trashed_versions(store_dir: Path | str) -> int:
+    """前回の prune が消し残した ``.trash-*`` を掃く (c_16 §5.4)。
+
+    削除は「まず改名 → 中身を消す」の 2 段で行う。改名は原子的なので、
+    途中で落ちても **``records.jsonl`` を失った版ディレクトリが残らない**
+    (残ると :func:`list_versions` から永久に見えず、誰も再試行しない)。
+    掃き残しはここで次回に回収する。
+
+    Returns:
+        消せたディレクトリ数。
+    """
+    root = Path(store_dir) / SNAPSHOT_DIR
+    if not root.exists():
+        return 0
+    swept = 0
+    for path in sorted(root.iterdir()):
+        if not path.is_dir() or not path.name.startswith(TRASH_PREFIX):
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        if path.exists():
+            logger.warning("failed to sweep trashed snapshot %s", path)
+            continue
+        swept += 1
+    return swept
+
+
 def prune_snapshots(
     store_dir: Path | str, keep: int, *, protect: Iterable[str] = (),
 ) -> list[str]:
@@ -329,11 +396,18 @@ def prune_snapshots(
 
     ``protect`` の版は件数に関わらず残す (active 版を消して起動不能にしない)。
 
+    削除は **``.trash-v000N`` へ改名してから中身を消す**。ファイル単位で
+    消していくと、``records.jsonl`` だけ消えた版ディレクトリが残り、
+    :func:`list_versions` の対象から外れて二度と再試行されない (Windows では
+    memmap を掴んだままの索引が消せず、実際にこの形で残る)。改名は原子的
+    なので、どこで落ちても「生きた版」か「trash」かのどちらかに落ち着く。
+
     Returns:
-        削除した版名。
+        削除した (= trash へ移した) 版名。
     """
     if keep < 1:
         return []
+    sweep_trashed_versions(store_dir)
     versions = list_versions(store_dir)
     protected = {v for v in protect if v}
     removable = [v for v in versions if v not in protected]
@@ -343,17 +417,21 @@ def prune_snapshots(
     removed: list[str] = []
     for version in removable[:surplus]:
         directory = snapshot_dir(store_dir, version)
+        trash = directory.parent / f"{TRASH_PREFIX}{version}"
         try:
-            for path in sorted(directory.rglob("*"), reverse=True):
-                if path.is_file():
-                    path.unlink()
-                else:
-                    path.rmdir()
-            directory.rmdir()
+            if trash.exists():
+                shutil.rmtree(trash, ignore_errors=True)
+            directory.rename(trash)
         except OSError as e:
             logger.warning("failed to prune snapshot %s: %s", version, e)
             continue
         removed.append(version)
+        shutil.rmtree(trash, ignore_errors=True)
+        if trash.exists():
+            logger.warning(
+                "snapshot %s was moved to %s but could not be deleted; "
+                "the next prune will sweep it", version, trash.name,
+            )
     if removed:
         logger.info("Pruned %d old snapshot(s): %s", len(removed), ", ".join(removed))
     return removed
@@ -363,6 +441,7 @@ __all__ = [
     "OFFSETS_FILE",
     "RECORDS_FILE",
     "SNAPSHOT_DIR",
+    "TRASH_PREFIX",
     "SnapshotReader",
     "SnapshotWriter",
     "apply_patch",
@@ -370,5 +449,7 @@ __all__ = [
     "prune_snapshots",
     "read_snapshot",
     "snapshot_dir",
+    "sweep_trashed_versions",
     "version_name",
+    "version_seq",
 ]

@@ -144,7 +144,7 @@ class EvorefConfig(BaseModel):
         """``reranker:`` セクションを起動時に明示的に拒否する
 
         リランカー機能は削除され、検索フローは fetch_multiplier 拡張 +
-        score_normalization に一本化された。``EvorefConfig`` は
+        3 ストア共通の 1 本の順位式 (c_16 §7.2) に一本化された。``EvorefConfig`` は
         ``extra="allow"`` のため残存セクションは黙って透過してしまうが、
         過去設定の残存に気付かせるため明示的に ``ValueError`` を上げる。
         """
@@ -152,7 +152,9 @@ class EvorefConfig(BaseModel):
             raise ValueError(
                 "config.yaml must not contain a 'reranker:' section anymore. "
                 "The reranker feature has been removed; retrieval now uses "
-                "rag.fetch_multiplier and rag.score_normalization instead. "
+                "rag.fetch_multiplier plus the single ranking formula "
+                "(cos x freshness x confidence x "
+                "memory.evidence.ranking.store_prior) instead. "
                 "Remove the 'reranker:' section (and the "
                 "'model_paths.reranker_model' line if present) from "
                 "config.yaml.",

@@ -33,6 +33,9 @@ from backend.free.memory.types import (
     Provenance,
     SemanticFact,
 )
+from backend.free.core.correction_verdict import (
+    POINTING_TARGETS as _POINTING_TARGETS,
+)
 from backend.free.core.text_quality import detect_lang
 from backend.log_config import get_logger
 
@@ -42,6 +45,41 @@ logger = get_logger("memory.extractors.base")
 # ──────────────────────────────────────────────────────────────────────────
 # 入出力データクラス
 # ──────────────────────────────────────────────────────────────────────────
+
+
+def note_is_verified_correction(note: object) -> bool:
+    """ノートが **検証済みの訂正** か (純粋関数)。
+
+    ``MemoryNote.is_correction`` は字句で立てた **候補** に過ぎない。訂正の力
+    (``from_correction`` による時刻を跨いだ supersede / 値アンカーでのスロット
+    決定 / 直前スロットの継承) を持たせてよいのは、
+    ``sleep.correction_curator`` (Step 8.0) が「過去の発言の誤りを指している」
+    と判定した (``correction_verdict`` が ``assistant`` / ``self``) ものだけ。
+
+    実インシデント (2026-09-08 夜のライブ監査): 物理の計算に対する訂正
+    「違います。最初の答えを計算し直してください。…」が
+    ``mem.personal.family`` として書かれ、``from_correction`` の力で本物の
+    家族ファクト 4 件を supersede した (G-01)。9 時間前のノートが引用中の
+    「色が違う」で訂正候補になり、より新しい occupation を supersede した
+    例もある (G-04)。
+
+    aux が使えず検証できなかった (``correction_verified_at is None``) ノートは
+    False — 訂正でないと決めつけるのではなく、**通常の再言明として扱う**
+    (単値スロットなら発話時刻順の置換だけが働く)。
+    """
+    return str(getattr(note, "correction_verdict", "") or "") in _POINTING_TARGETS
+
+
+def note_verification_rejected(note: object) -> bool:
+    """検証済みで **訂正ではないと判定された** ノートか (純粋関数)。
+
+    ``same_value`` / ``premise_change`` / ``none`` / ``third_party`` /
+    ``no_context`` … が入る。未検証 (``correction_verified_at is None``) は
+    False — まだ判定していないだけなので、フォールバック経路には乗せる。
+    """
+    if getattr(note, "correction_verified_at", None) is None:
+        return False
+    return not note_is_verified_correction(note)
 
 
 def _utterance_time(note: object, fallback: float) -> float:
@@ -213,7 +251,8 @@ class BaseExtractor:
         - subject は ``ctx.canonicalizer`` で正規化 (バイパスは尊重)
         - provenance を 1 件付与 (note 由来 or trace 由来)
         - pinned はノートの ``pin_flag`` を継承
-        - ``from_correction`` はノートの ``is_correction`` を継承
+        - ``from_correction`` は **検証済みの訂正** から継承
+          (:func:`note_is_verified_correction`)
         - confidence はデフォルト 0.5
         """
         canonical = subject.strip()
@@ -254,10 +293,11 @@ class BaseExtractor:
             provenances=[prov],
             confidence=confidence,
             pinned=bool(getattr(note, "pin_flag", False)),
-            # 訂正ターン由来か。ノートから引き継ぎ、競合解決が「同一セッション
+            # 訂正ターン由来か。**検証済み** (Step 8.0 が assistant / self と
+            # 判定した) ノートからだけ引き継ぎ、競合解決が「同一セッション
             # だから微妙ケース」として pending へ落とすのを免除する
-            # (SemanticFact.from_correction の説明を参照)。
-            from_correction=bool(getattr(note, "is_correction", False)),
+            # (:func:`note_is_verified_correction` / SemanticFact.from_correction)。
+            from_correction=note_is_verified_correction(note),
             # **発話時刻**を継ぐ (抽出時刻ではない)。sleep-time は 1 回の
             # バッチで会話全体を抽出するため ``now`` を入れると全ファクトの
             # ``created_at`` が同一秒になり、「新しい方を採る」判定が原理的に

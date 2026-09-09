@@ -35,6 +35,7 @@ async def summarize_unsummarized_sessions(
     *,
     batch_size: int = 5,
     is_cancelled: Callable[[], bool] | None = None,
+    should_pause: Callable[[], bool] | None = None,
 ) -> int:
     """未要約セッションに LLM 要約 + 埋め込みベクトルを生成する。
 
@@ -60,6 +61,9 @@ async def summarize_unsummarized_sessions(
         batch_size: 1 サイクルで要約する最大セッション数
             (config ``history.summary_batch_size``)。``0`` 以下は無制限。
         is_cancelled: キャンセル判定コールバック (``True`` で途中中断)。
+        should_pause: ``True`` を返したらセッション境界でループを打ち切る
+            協調 yield。未要約のセッションは ``summary`` が付かないままなので
+            次サイクルが拾う。
 
     Returns:
         実際に要約を生成できたセッション数。
@@ -74,9 +78,25 @@ async def summarize_unsummarized_sessions(
 
     index = mgr._load_index()
     summarized = 0
+    #: should_pause 発火時に「まだ要約が必要な件数」を報告するための分母。
+    pending_total = sum(
+        1 for e in index.sessions
+        if e.summary is None or e.turn_count > e.summary_turn_count
+    )
+    attempted = 0
 
     for entry in index.sessions:
         if is_cancelled is not None and is_cancelled():
+            break
+        # 協調 yield: チャット生成が走っている間はセッション境界で手を止める
+        # (note_evolver と同じ実測。CLAUDE.md 不変則 #1)。
+        if should_pause is not None and should_pause():
+            remaining = pending_total - attempted
+            if remaining > 0:
+                logger.info(
+                    "Step 8-9 summarization paused for the user turn: "
+                    "%d session(s) left pending for the next cycle", remaining,
+                )
             break
         if batch_size > 0 and summarized >= batch_size:
             break
@@ -91,6 +111,8 @@ async def summarize_unsummarized_sessions(
         session = mgr.get_session(entry.session_id)
         if session is None or not session.turns:
             continue
+
+        attempted += 1
 
         # 入力は **末尾** の 20 ターン。先頭 20 ターン固定だと、再要約の条件
         # (会話が伸びた) を満たしても入力が変わらず、20 ターン目以降の訂正は

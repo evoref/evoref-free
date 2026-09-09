@@ -12,7 +12,10 @@ from pathlib import Path
 from backend.app_state import AppState
 from backend.free.agent.meta_cognitive_utils import is_tool_error
 from backend.free.agent.tool_call_judge import _extract_file_path
-from backend.free.agent.output_format import infer_output_extension
+from backend.free.agent.output_format import (
+    anchor_relative_output_path,
+    infer_output_extension,
+)
 from backend.free.generation.document_gate import is_document_format
 from backend.free.generation.validators import remove_code_fences
 from backend.utils import utc_compact_stamp
@@ -221,6 +224,9 @@ def _resolve_long_form_target_path(file_path: str, query: str = "") -> str:
       他は既定 ``.txt``)。
     - 既存 *ファイル* + READ 参照意図 → ``{stem}_generated_<UTC>{suffix}``
       にシフトしてユーザ指定の参照ファイルを保護する
+    - 錨の無い相対パス (``notes.md`` 等) → ``local_paths.outputs_dir`` 配下
+      (``anchor_relative_output_path``)。素で ``write_file`` へ渡すと
+      プロセスの CWD = リポジトリ直下に着地する (2026-09-08 監査 F-05)
     - それ以外は原文のまま返し、``write_file`` 側のファイル作成挙動に委ねる
 
     ``Desktop\\test`` のように配下出力意図でディレクトリを指定された場合、
@@ -257,7 +263,8 @@ def _resolve_long_form_target_path(file_path: str, query: str = "") -> str:
         logger.debug(
             "Long-form path resolution skipped (%s): %r", e, file_path,
         )
-    return file_path
+        return file_path
+    return anchor_relative_output_path(file_path)
 
 
 # SPLIT モード: file_name → 安全なファイル名 (英数字 + アンダースコア) への変換

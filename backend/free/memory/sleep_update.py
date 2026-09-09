@@ -104,6 +104,7 @@ class SleepTimeWorker:
         turn_source: TurnSource | None = None,
         triggers_dir: Path | str | None = None,
         private_trace_ids_provider: Callable[[], set[str]] | None = None,
+        learning_disabled: bool = False,
     ):
         self.episodic = episodic
         self.embedder = embedder
@@ -117,6 +118,10 @@ class SleepTimeWorker:
         self._aux_prompt_manager = aux_prompt_manager
         self._fewshot_pool = None
         self._cancelled = False
+        #: サイクル (Light / Full) の排他。3 ストアの書き手は sleep-time だけ
+        #: という不変則 (c_16 §2.1) を **慣習ではなくロックで** 守る。Full は
+        #: 待って直列化し、Light は取れなければ飛ばす (:meth:`run_light`)。
+        self._cycle_lock = asyncio.Lock()
         # ── Step 8 (Extractor) 用 ──
         self._semantic_store_provider = semantic_store_provider
         self._current_project_id = current_project_id
@@ -150,6 +155,11 @@ class SleepTimeWorker:
         self._private_trace_ids_provider = private_trace_ids_provider
         #: 現在のサイクルで開いている作業領域 (Full の間だけ生きる)。
         self._workspace: "EpisodicWorkspace | None" = None
+        #: ``--no-learning``。**学習に属するステップだけ** no-op にする。
+        #: ノート化 / 抽出 / 保持方針 / snapshot は記憶側の仕事なので走らせる
+        #: (c_16 §2.1: 3 ストアの書き手は sleep-time だけ — ここを止めると
+        #: 記憶が一切書かれなくなる)。
+        self.learning_disabled = bool(learning_disabled)
 
     def set_fewshot_pool(self, pool) -> None:
         """FewShotPool を設定 (手本の埋め込み backfill に使用)。"""
@@ -186,7 +196,32 @@ class SleepTimeWorker:
         return False
 
     async def run_light(self) -> dict:
+        """Light 版のサイクルロックを取って :meth:`_run_light_locked` を回す。
+
+        既に別のサイクル (Light / Full) が走っている場合は **待たずに飛ばす**。
+        Light は応答のたびに走る軽い版で、飛ばしても次の応答で同じ入力から
+        やり直せる。待たせると in-flight の Full の裏で Light が積み上がる。
+
+        Returns:
+            実行結果サマリ dict。飛ばした場合は ``skipped="cycle_in_progress"``。
+        """
+        if self._cycle_lock.locked():
+            logger.info(
+                "Sleep-time Light skipped: another sleep-time cycle is in progress",
+            )
+            return {
+                "notes_created": 0, "touched": 0, "snapshot": "",
+                "knowledge_claims": 0, "skipped": "cycle_in_progress",
+            }
+        async with self._cycle_lock:
+            self._cancelled = False
+            return await self._run_light_locked()
+
+    async def _run_light_locked(self) -> dict:
         """Light 版: LLM なし。ノート生成 → touch flush → (必要なら) snapshot。
+
+        **サイクルロック保持中に呼ぶこと** (:meth:`run_light` /
+        :meth:`run_full` が入口)。``_cancelled`` のリセットも入口側が持つ。
 
         旧 Light の Step 1-4 (埋め込み / タグ補完 / LightMem スコア再計算 /
         eviction) は無くなった:
@@ -200,11 +235,12 @@ class SleepTimeWorker:
         Returns:
             実行結果サマリ dict
         """
-        self._cancelled = False
         started_at = utc_now()
         t0 = time.monotonic()
         step_durations: dict[str, float] = {}
-        result: dict = {"notes_created": 0, "touched": 0, "snapshot": ""}
+        result: dict = {
+            "notes_created": 0, "touched": 0, "snapshot": "", "knowledge_claims": 0,
+        }
 
         logger.info(
             "Sleep-time Light started (%d episodic record(s))", len(self.episodic),
@@ -223,6 +259,15 @@ class SleepTimeWorker:
             ts = time.monotonic()
             result["patterns_decayed"] = self._step5_5_decay_patterns()
             step_durations["step5_5_patterns"] = round(time.monotonic() - ts, 3)
+
+            # 手動予約 (POST /api/pro/knowledge/fetch) が立っていれば取得器を
+            # 回す。定期取得は Full のアイドル窓のまま — 予約された 1 回だけ
+            # Light でも拾い、API が SemMem を直接書かなくて済むようにする。
+            ts = time.monotonic()
+            result["knowledge_claims"] = await self._step8_7_fetch_knowledge(
+                only_if_requested=True,
+            )
+            step_durations["step8_7_knowledge_fetch"] = round(time.monotonic() - ts, 3)
         finally:
             ts = time.monotonic()
             result["snapshot"] = await self._maybe_snapshot(
@@ -433,6 +478,7 @@ class SleepTimeWorker:
         )
         result["conflicts_resolved"] = await resolver.resolve_conflicts(
             self._workspace_or_open(), llm_client,
+            should_pause=self._chat_in_flight,
         )
         # ── SemMem 競合解消 ──
         sem_summary = self._step6b_resolve_semmem_conflicts()
@@ -540,12 +586,34 @@ class SleepTimeWorker:
             )
 
     async def run_full(self, llm_client=None) -> dict:
-        """Full 版: LLM あり、Steps 1-10
+        """Full 版のサイクルロックを取って :meth:`_run_full_locked` を回す。
+
+        Full は **待つ** (Light と違って飛ばせない — ファクト抽出 / 競合解決 /
+        保持方針は Full にしか無い)。2 本目が 1 本目の作業領域
+        (``_workspace``) とキャンセル要求を消す事故を構造的に止める
+        (2026-09-08 ライブ監査: 手動 Full と Trigger B が 523 秒並走)。
 
         Args:
             llm_client: LLM クライアント（Steps 6-10 で使用）。
                         AuxClient（推奨）または LocalClient。
                         設計書 §5.5.2 に基づき、補助タスクの使用を推奨。
+
+        Returns:
+            実行結果サマリ dict
+        """
+        if self._cycle_lock.locked():
+            logger.info(
+                "Sleep-time Full is waiting for the in-progress cycle to finish",
+            )
+        async with self._cycle_lock:
+            self._cancelled = False
+            return await self._run_full_locked(llm_client)
+
+    async def _run_full_locked(self, llm_client=None) -> dict:
+        """Full 版: LLM あり、Steps 1-10 (サイクルロック保持中に呼ぶこと)。
+
+        Args:
+            llm_client: LLM クライアント（Steps 6-10 で使用）。
 
         Returns:
             実行結果サマリ dict
@@ -557,9 +625,9 @@ class SleepTimeWorker:
         # そのあいだに Light が増やしているので、必ず開き直す。
         self._workspace = None
 
-        # まず Light 版を実行
+        # まず Light 版を実行 (ロック保持者として本体を直接呼ぶ)
         ts = time.monotonic()
-        result = await self.run_light()
+        result = await self._run_light_locked()
         step_durations["light_total"] = round(time.monotonic() - ts, 3)
         if self._check_cancelled():
             return result
@@ -619,12 +687,35 @@ class SleepTimeWorker:
         if self._check_cancelled():
             return result
 
+        # Step 8.0: 訂正候補の検証。Step 8 が ``from_correction`` / 値アンカー /
+        # 継承で **訂正の力** を使う前に、「本当に過去の発言の誤りを指して
+        # いるか」を判定してノートへ刻む (2026-09-08 夜の監査 G-01 / G-04)。
+        ts = time.monotonic()
+        result["corrections_verified"] = await self._step8_0_verify_corrections(
+            llm_client,
+        )
+        step_durations["step8_0_correction_verify"] = round(time.monotonic() - ts, 3)
+        if self._check_cancelled():
+            return result
+
         # Step 8: SemanticFact Extractor
         # 既存 _step8_9_summarize_sessions は Step 9 に再配置される想定。
         # メソッド名を変えずに前段に Step 8 を挿入する形で共存させる。
         ts = time.monotonic()
         result["facts_extracted"] = self._step8_extract_facts()
         step_durations["step8_extract_facts"] = round(time.monotonic() - ts, 3)
+        if self._check_cancelled():
+            return result
+
+        # Step 8.3: Step 8 (regex) が「私は〜」発話から属性を取りこぼした /
+        # 複数節を 1 属性に飲み込んだときだけ、補助タスクで逐語 span に分ける。
+        # 語形 1 つの欠落で 0 件になる事故 (2026-08-31 / 09-04 / 09-08 F-01) の
+        # 受け皿。値は発話の部分文字列であることをコード側で検証する。
+        ts = time.monotonic()
+        result["personal_facts_split"] = await self._step8_3_split_personal_facts(
+            llm_client,
+        )
+        step_durations["step8_3_personal_fact_split"] = round(time.monotonic() - ts, 3)
         if self._check_cancelled():
             return result
 
@@ -784,6 +875,8 @@ class SleepTimeWorker:
         Returns:
             埋め込みを新たに付与した手本の数。
         """
+        if self._skip_for_learning("Step 10b-2 (few-shot embedding backfill)"):
+            return 0
         pool = self._fewshot_pool
         if pool is None or self.embedder is None:
             return 0
@@ -854,8 +947,18 @@ class SleepTimeWorker:
             embedded += 1
         return embedded
 
+    def _skip_for_learning(self, step: str) -> bool:
+        """``--no-learning`` で飛ばす学習ステップか (飛ばすなら DEBUG を 1 行)。"""
+        if not self.learning_disabled:
+            return False
+        logger.debug("%s skipped (learning disabled)", step)
+        return True
+
     def _step5_5_decay_patterns(self) -> int:
         """Step 5.5: 学習済みパターンの重み減衰と永続化
+
+        ``--no-learning`` では走らない (学習済みパターンは EvorefLearn の
+        資産で、記憶の書き戻しではない)。
 
         sleep-time Light で毎回呼ばれるが、減衰そのものは
         ``LearnedPatternStore.maybe_decay_all`` が壁時計で間引く
@@ -863,6 +966,8 @@ class SleepTimeWorker:
         毎回減衰すると学習した語が数ターンで消えていた。永続化は追加 /
         重み変更 / 削除があった時 (``dirty``) だけ行う。LLM 不要。
         """
+        if self._skip_for_learning("Step 5.5 (pattern decay)"):
+            return 0
         if self.learned_patterns is None:
             return 0
 
@@ -900,6 +1005,7 @@ class SleepTimeWorker:
             vector_store=self.vector_store,
             cartridge_manager=self.cartridge_manager,
             is_cancelled=self._check_cancelled,
+            should_pause=self._chat_in_flight,
         )
 
     async def _step8_9_summarize_sessions(self, llm_client) -> int:
@@ -918,6 +1024,7 @@ class SleepTimeWorker:
             self.embedder,
             batch_size=int(history_cfg.get("summary_batch_size", 20)),
             is_cancelled=self._check_cancelled,
+            should_pause=self._chat_in_flight,
         )
 
     # ── Step 7.5 (MDP トレース → episodic LTM) ─────────
@@ -946,6 +1053,20 @@ class SleepTimeWorker:
             private_trace_ids=private_trace_ids,
         )
         return ingested
+
+    # ── Step 8.0 (correction curator) ──────────────────
+
+    async def _step8_0_verify_corrections(self, llm_client=None) -> int:
+        """Step 8.0: 字句で立てた訂正候補を検証してノートへ帰属を刻む。
+
+        実ロジックは :mod:`backend.free.memory.sleep.correction_curator`
+        に分離されている。本メソッドは state を詰め替える薄いラッパ。
+        """
+        from backend.free.memory.sleep.correction_curator import curate_corrections
+
+        return await curate_corrections(
+            self._curatable_notes(), aux_client=llm_client,
+        )
 
     # ── Step 8 (Chat/Create/MDP Extractor) ─────────────
 
@@ -986,6 +1107,28 @@ class SleepTimeWorker:
 
         return public_notes(list(self._workspace_or_open().notes.values()))
 
+    # ── Step 8.3 (personal fact split) ─────────────────
+
+    async def _step8_3_split_personal_facts(self, llm_client=None) -> int:
+        """Step 8.3: regex が取りこぼした自己開示発話を属性ごとに分けて書く。
+
+        実ロジックは :mod:`backend.free.memory.sleep.personal_fact_curator`
+        に分離されている。本メソッドは state を詰め替える薄いラッパ。
+        """
+        from backend.free.memory.sleep.personal_fact_curator import (
+            curate_personal_facts,
+        )
+
+        notes = self._curatable_notes()
+        return await curate_personal_facts(
+            notes,
+            store_provider=self._semantic_store_provider,
+            aux_client=llm_client,
+            embedder=self.embedder,
+            profile_id=self._profile_id,
+            should_pause=self._chat_in_flight,
+        )
+
     # ── Step 8.4 (assertion curator) ───────────────────
 
     async def _step8_4_curate_assertions(self, llm_client=None) -> int:
@@ -1005,6 +1148,7 @@ class SleepTimeWorker:
             aux_client=llm_client,
             embedder=self.embedder,
             profile_id=self._profile_id,
+            should_pause=self._chat_in_flight,
         )
 
     # ── Step 8.5 (URL curator) ─────────────────────────
@@ -1029,6 +1173,7 @@ class SleepTimeWorker:
             embedder=self.embedder,
             profile_id=self._profile_id,
             debug_logger=self._debug_logger,
+            should_pause=self._chat_in_flight,
         )
 
     async def _step8_6_curate_commands(self) -> int:
@@ -1054,7 +1199,7 @@ class SleepTimeWorker:
             debug_logger=self._debug_logger,
         )
 
-    async def _step8_7_fetch_knowledge(self) -> int:
+    async def _step8_7_fetch_knowledge(self, *, only_if_requested: bool = False) -> int:
         """Step 8.7: ``know.*`` 取得器を回す (Pro 限定)。
 
         取得器は ``backend.pro.knowledge.KnowledgeFetcher`` で、Pro 起動時に
@@ -1066,6 +1211,12 @@ class SleepTimeWorker:
         snapshot に載せる。取得器自身は ``create_snapshot`` を呼ばない
         (稼働中の索引を書き換えない、c_16 §2.1)。
 
+        Args:
+            only_if_requested: 手動予約 (``POST /api/pro/knowledge/fetch``)
+                が立っているときだけ回す。Light サイクルはこれで呼ぶ —
+                定期取得は Full のアイドル窓に閉じたまま、手で頼んだ 1 回
+                だけ次の Light で拾えるようにする。
+
         Returns:
             書き込んだ claim 件数。取得器が無い / 失敗した場合は 0。
         """
@@ -1073,6 +1224,8 @@ class SleepTimeWorker:
 
         fetcher = get_pro_handler("knowledge_fetcher")
         if fetcher is None:
+            return 0
+        if only_if_requested and not getattr(fetcher, "fetch_requested", False):
             return 0
         try:
             return await fetcher.run_once()
@@ -1093,6 +1246,9 @@ class SleepTimeWorker:
             ``ConsolidationSummary.as_dict()`` 互換の dict。no-op 時は
             空 dict。
         """
+        if self._skip_for_learning("Step 13 (failure pattern consolidation)"):
+            return {}
+
         from backend.free.memory.sleep.failure_consolidator import (
             consolidate_failure_patterns_for_project,
         )
@@ -1214,7 +1370,8 @@ class SleepTimeWorker:
             logger.warning("Failed to save episodic progress: %s", e)
 
         # 経験バッファを永続化 (起動時ロードと同じ resolve_learning でパーティション先に揃える)
-        if self.experience_buf is not None:
+        # ``--no-learning`` では経験の書き戻し自体を行わない。
+        if self.experience_buf is not None and not self.learning_disabled:
             try:
                 resolver = get_path_resolver()
                 exp_file = resolver.resolve_learning("experience_file")

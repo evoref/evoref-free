@@ -13,6 +13,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from backend.free.core.date_math_cue import (
+    DATE_MATH_CUE_RE,
+    query_has_date_math_cue,
+)
 from backend.free.agent.safety_patterns import reject_readonly_violation
 from backend.free.agent.tool_judge_grounding import _numeric_literals
 from backend.free.core.intent_vocab import (
@@ -635,6 +639,459 @@ def _build_datetime_command(query: str) -> str:
         )
     return _REL_PREFIX + body + base_echo + _REL_SUFFIX
 
+
+# ===========================================================================
+# 日付演算の意図 (date_intent) — パラメータだけ取り、コマンドはコードが組む
+# ===========================================================================
+#
+# 上のカスケード (``_day_count`` → ``_week_of_weekday`` → ``_RELATIVE_OFFSET_RE``
+# → ``_absolute_weekday``) は語形ごとの正規表現で、**新しい言い回しが来るたびに
+# now-only コマンドへ落ちて日付演算がモデルの暗算に戻る**。このファイルのコメント
+# 自身が 2026-08-19 / 08-22 / 08-25 / 08-26 の同型インシデントを記録しており、
+# 語形を 1 つずつ足す方針では次の語形で必ずまた漏れる。
+#
+# 実インシデント (2026-09-08 ライブ監査 T19、5/5 誤答):
+# 「2026 年 9 月 8 日（火）から数えて、土日を除いた 30 営業日目は何月何日ですか。」
+# → 単位 ``営業日`` も接尾 ``目`` もカスケードに無く now-only コマンドだけが
+#    実行され、回答「10月14日」は暗算 (正しくは 10/19)。
+#
+# 対処は語形の追加ではなく **層を 1 つ足すこと**: 日付演算の手掛かりがあるのに
+# カスケードが now-only へ落ちたときだけ、文法制約 JSON (``date_intent``、
+# CLAUDE.md §6 #1 の許容範囲) で **パラメータだけ** を取り、コマンド文字列は
+# 本モジュールが決定論的に組む。**LLM にコードは書かせない** (シェルへ渡るのは
+# 常にここで組んだテンプレート)。
+
+#: 日付演算をしている手掛かり。SSOT は :mod:`backend.free.core.date_math_cue`
+#: (few-shot の採用拒否とも共有する)。**カスケードが now-only へ落ちたときだけ**
+#: 見るので、「今日は何日ですか」のような現在日時の問いは巻き込まない。
+_DATE_MATH_CUE_RE = DATE_MATH_CUE_RE
+
+#: 起点より **過去側** を尋ねている印。``DateIntent.direction`` を LLM が
+#: 返すようになった後も、値域を守らない場面 (forward を誤って返す) の
+#: **コード側の安全弁**として残す (``_effective_direction`` 参照、
+#: 2026-09-09 監査 G-06: 「逆算して」に forward のコマンドが組まれ、
+#: モデルが暗算で答えを捨てた)。
+_DATE_BACKWARD_RE = re.compile(
+    r"日前|週間前|[かヶケヵ箇]月前|年前|逆算|遡"
+    r"|(?<![A-Za-z])(?:before|earlier|ago)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+#: ``date_intent`` が受け付ける演算の種別 (``none`` は日付演算でない)。
+_DATE_INTENT_KINDS = frozenset({
+    "business_days_from", "days_from", "days_between", "weekday_of",
+})
+
+#: ``n`` の上限。スキーマ側は 100000 まで許すが、コマンドは候補日を列挙する
+#: 内包表記なので、実行時間が読める範囲へコード側で絞る。
+_MAX_DATE_INTENT_N = 2000
+
+#: 祝日リストの上限 (スキーマと同じ)。
+_MAX_DATE_INTENT_HOLIDAYS = 32
+
+#: ``date_intent`` のシステムプロンプト。**判断ではなくパラメータの抽出だけ**を
+#: 命じる (層 5.95 の式合成と同じ立て付け)。コードを書かせないことが要点。
+DATE_INTENT_SYSTEM = (
+    "あなたは日付計算のパラメータ抽出器です。ユーザーの最後の質問に答えるために"
+    "必要な日付演算のパラメータだけを JSON で返してください。"
+    "回答本文・説明・プログラムは書かないこと。\n"
+    "kind の選び方:\n"
+    "- business_days_from: 起点から N 営業日 (土日・祝日を除く) 後の日付\n"
+    "- days_from: 起点から N 日後 (暦日)\n"
+    "- days_between: 2 つの日付の間の日数\n"
+    "- weekday_of: ある日付の曜日\n"
+    "- none: 日付の計算が不要\n"
+    "規則:\n"
+    "- start / end は YYYY-MM-DD 形式、または今日なら today と書くこと。\n"
+    "- 質問と直前の会話に書かれていない日付・日数を発明しないこと。追い質問"
+    "(「その日から」「〜だとすると」) の起点日や日数は直前の会話から取ること。\n"
+    "- skip_weekends は土日を数えないときだけ true。\n"
+    "- holidays には質問文に明示された休日だけを YYYY-MM-DD で入れること。休日の"
+    "日付を自分で発明しないこと。\n"
+    "- count_start_day は起点の日を 1 日目と数えるときだけ true。\n"
+    "- direction は起点より後 (通常) なら forward、起点より前・逆算・遡るなら"
+    " backward。\n"
+    "- excluded_weekdays には、質問が特定の曜日を作業日・営業日から除外すると"
+    "言っているとき (例: 「毎週水曜日は定例会議で作業できない」) だけ、その曜日を"
+    "0=月曜〜6=日曜の数字で入れること。言及が無ければ空配列。\n"
+    "- 使わない項目は start/end に today、n に 0、holidays / excluded_weekdays に"
+    "空配列、direction に forward を入れること。"
+)
+DATE_INTENT_SYSTEM_EN = (
+    "You are a date-arithmetic parameter extractor. Return only the parameters "
+    "needed to answer the user's last question as JSON. Do not write the reply, "
+    "an explanation, or any code.\n"
+    "Choosing kind:\n"
+    "- business_days_from: the date N business days (weekends/holidays skipped) "
+    "from the start date\n"
+    "- days_from: the date N calendar days from the start date\n"
+    "- days_between: the number of days between two dates\n"
+    "- weekday_of: the day of the week of one date\n"
+    "- none: no date arithmetic is needed\n"
+    "Rules:\n"
+    "- start / end must be YYYY-MM-DD, or the literal today.\n"
+    "- Never invent a date or count that is neither in the question nor in the "
+    "preceding conversation; a follow-up question takes its start date and "
+    "count from the previous turns.\n"
+    "- Set skip_weekends only when Saturdays and Sundays must not be counted.\n"
+    "- Put in holidays only the dates the question states, as YYYY-MM-DD. Never "
+    "invent a holiday date.\n"
+    "- Set count_start_day only when the start date itself counts as day 1.\n"
+    "- direction is forward when counting after the start date (the usual case), "
+    "backward when the question counts back from it (e.g. \"working backward\", "
+    "\"before\", \"ago\").\n"
+    "- excluded_weekdays: only when the question says a specific weekday is not a "
+    "working/business day (e.g. \"Wednesdays are a standing meeting, no work "
+    "then\"), list it as 0=Monday .. 6=Sunday. Empty if not mentioned.\n"
+    "- For unused fields use today for start/end, 0 for n, an empty list for "
+    "holidays and excluded_weekdays, and forward for direction."
+)
+
+
+@dataclass(frozen=True, slots=True)
+class DateIntentParams:
+    """検証済みの日付演算パラメータ。
+
+    ``start`` / ``end`` が ``None`` は「今日」(コマンド実行時に解決する)。
+    ビルド時に今日の日付を焼き込むと、``idx.command`` として学習された
+    コマンドが翌日以降に誤答する (:class:`_QueryDate` と同じ理由)。
+    """
+
+    kind: str
+    start: datetime.date | None
+    end: datetime.date | None
+    n: int
+    skip_weekends: bool
+    holidays: tuple[datetime.date, ...]
+    count_start_day: bool
+    #: ``"forward"`` (起点より後) か ``"backward"`` (起点より前 / 逆算)。
+    #: ``_effective_direction`` が ``_DATE_BACKWARD_RE`` で上書きしうる
+    #: (2026-09-09 監査 G-06)。
+    direction: str = "forward"
+    #: 作業日・営業日から除外する曜日 (0=月曜〜6=日曜)。``skip_weekends`` とは
+    #: 独立 — 両者は :func:`_business_day_candidates` で合算する。
+    excluded_weekdays: tuple[int, ...] = ()
+
+
+def command_lacks_date_arithmetic(command: str) -> bool:
+    """コマンドが日付演算を **していない** か (純粋関数)。
+
+    ``_DATE_ARITHMETIC_RE`` に当たらないコマンド (現在日時の print だけ等) は、
+    日付演算クエリに対して「答えを含まない出力」しか返さない。
+    """
+    return not _DATE_ARITHMETIC_RE.search(command or "")
+
+
+def _parse_intent_date(value: object) -> "datetime.date | None | str":
+    """``start`` / ``end`` の 1 項目を解釈する。
+
+    Returns:
+        ``datetime.date`` (確定日) / ``None`` (今日) / ``"invalid"`` (棄却)。
+    """
+    if not isinstance(value, str):
+        return "invalid"
+    text = value.strip().lower()
+    if text in ("", "today", "now", "現在", "今日"):
+        return None
+    try:
+        return datetime.date.fromisoformat(text)
+    except ValueError:
+        return "invalid"
+
+
+def parse_date_intent(payload: object) -> DateIntentParams | None:
+    """``date_intent`` の応答を検証して :class:`DateIntentParams` にする。
+
+    **コード側の検証がこの層の安全弁**。文法制約 JSON は形は守らせるが値域は
+    守らないため (``json_schema`` は enum と型までしか強制しない)、日付が ISO
+    として読めること・``n`` が現実的な範囲にあること・祝日がすべて読めること・
+    ``excluded_weekdays`` が 0-6 の整数であることをここで確かめる。1 つでも
+    欠ければ ``None`` を返し、呼出側は now-only のままにして「ツールで検証
+    していない」印 (``unexplained_date_math``) を立てる。``direction`` /
+    ``excluded_weekdays`` は省略可 (未指定時は forward / 空)。
+    """
+    if not isinstance(payload, dict):
+        return None
+    kind = payload.get("kind")
+    if not isinstance(kind, str) or kind not in _DATE_INTENT_KINDS:
+        return None
+    start = _parse_intent_date(payload.get("start"))
+    end = _parse_intent_date(payload.get("end"))
+    if start == "invalid" or end == "invalid":
+        return None
+    raw_n = payload.get("n")
+    n = raw_n if isinstance(raw_n, int) and not isinstance(raw_n, bool) else 0
+    if kind in ("business_days_from", "days_from") and not 1 <= n <= _MAX_DATE_INTENT_N:
+        return None
+    raw_holidays = payload.get("holidays")
+    holidays: list[datetime.date] = []
+    if raw_holidays is not None:
+        if not isinstance(raw_holidays, list):
+            return None
+        if len(raw_holidays) > _MAX_DATE_INTENT_HOLIDAYS:
+            return None
+        for item in raw_holidays:
+            parsed = _parse_intent_date(item)
+            if not isinstance(parsed, datetime.date):
+                return None
+            holidays.append(parsed)
+    skip_weekends = bool(payload.get("skip_weekends"))
+    if kind == "business_days_from":
+        # 種別自体が「営業日で数える」なので、モデルが false を返しても従う
+        # 理由が無い (false なら days_from と区別が付かない)。
+        skip_weekends = True
+    raw_direction = payload.get("direction")
+    direction = raw_direction if raw_direction in ("forward", "backward") else "forward"
+    raw_excluded = payload.get("excluded_weekdays")
+    excluded_weekdays: list[int] = []
+    if raw_excluded is not None:
+        if not isinstance(raw_excluded, list):
+            return None
+        if len(raw_excluded) > 7:
+            return None
+        for item in raw_excluded:
+            if (
+                not isinstance(item, int)
+                or isinstance(item, bool)
+                or not 0 <= item <= 6
+            ):
+                return None
+            excluded_weekdays.append(item)
+    return DateIntentParams(
+        kind=kind,
+        start=start if isinstance(start, datetime.date) else None,
+        end=end if isinstance(end, datetime.date) else None,
+        n=n,
+        skip_weekends=skip_weekends,
+        holidays=tuple(holidays),
+        count_start_day=bool(payload.get("count_start_day")),
+        direction=direction,
+        excluded_weekdays=tuple(sorted(set(excluded_weekdays))),
+    )
+
+
+def _business_day_candidates(
+    start: datetime.date,
+    span: int,
+    *,
+    skip_weekends: bool,
+    holidays: tuple[datetime.date, ...],
+    excluded_weekdays: tuple[int, ...] = (),
+    direction: str = "forward",
+) -> list[datetime.date]:
+    """``start`` から ``span`` 日分のうち、数える対象になる日を並べる。
+
+    ``direction == "backward"`` なら ``start`` より前へ辿る (2026-09-09 監査
+    G-06: 「逆算」で前向きコマンドが組まれ、モデルが暗算で捨てた)。
+    ``skip_weekends`` (土日) と ``excluded_weekdays`` (任意の曜日、例:
+    毎週水曜が定例会議で作業不可) は独立指定で、除外対象は合算する。
+    """
+    step = -1 if direction == "backward" else 1
+    days = [start + datetime.timedelta(days=step * i) for i in range(span)]
+    excluded = set(excluded_weekdays)
+    if skip_weekends:
+        excluded |= {5, 6}
+    return [d for d in days if d.weekday() not in excluded and d not in holidays]
+
+
+def _candidate_span(n: int, holidays: tuple[datetime.date, ...]) -> int:
+    """``n`` 営業日を確実に含む候補日数 (土日で 5/7 に減るので 2n + 余裕)。"""
+    return n * 2 + len(holidays) * 3 + 14
+
+
+def business_day_target(
+    start: datetime.date,
+    n: int,
+    *,
+    skip_weekends: bool = True,
+    holidays: tuple[datetime.date, ...] = (),
+    count_start_day: bool = True,
+    excluded_weekdays: tuple[int, ...] = (),
+    direction: str = "forward",
+) -> datetime.date:
+    """``start`` から数えて ``n`` 営業日目の日付 (純粋関数)。
+
+    ``count_start_day`` が真なら ``start`` を 1 日目と数える (``start`` が
+    休みなら次の営業日が 1 日目)。偽なら ``start`` の翌営業日が 1 日目。
+    ``direction == "backward"`` なら ``start`` より前へ ``n`` 営業日辿る
+    (「その日から逆算して」、2026-09-09 監査 G-06)。生成コマンドのテンプレート
+    と **同じ数え方** を実装しており、``test_date_intent_command.py`` が
+    両者の一致を検証する。
+    """
+    candidates = _business_day_candidates(
+        start, _candidate_span(n, holidays),
+        skip_weekends=skip_weekends, holidays=holidays,
+        excluded_weekdays=excluded_weekdays, direction=direction,
+    )
+    index = n - 1 if count_start_day else n
+    return candidates[index]
+
+
+def business_days_between(
+    start: datetime.date,
+    end: datetime.date,
+    *,
+    skip_weekends: bool = True,
+    holidays: tuple[datetime.date, ...] = (),
+    count_start_day: bool = True,
+) -> int:
+    """``start``〜``end`` の間の営業日数 (純粋関数、両端を含む数え方)。"""
+    lo, hi = (start, end) if start <= end else (end, start)
+    candidates = _business_day_candidates(
+        lo, (hi - lo).days + 1, skip_weekends=skip_weekends, holidays=holidays,
+    )
+    return len(candidates) - (0 if count_start_day else 1)
+
+
+def _date_literal(value: datetime.date | None) -> str:
+    """コマンドへ埋める日付式 (``None`` は実行時の今日)。"""
+    if value is None:
+        return "n.date()"
+    return f"datetime.date({value.year},{value.month},{value.day})"
+
+
+def _holiday_set_literal(holidays: tuple[datetime.date, ...]) -> str:
+    """祝日集合のリテラル (空集合は ``set()``)。"""
+    if not holidays:
+        return "set()"
+    return "{" + ",".join(_date_literal(d) for d in holidays) + "}"
+
+
+def _weekday_set_literal(weekdays: "set[int]") -> str:
+    """除外曜日集合のリテラル (空集合は ``set()``)。"""
+    if not weekdays:
+        return "set()"
+    return "{" + ",".join(str(w) for w in sorted(weekdays)) + "}"
+
+
+def _effective_direction(direction: str, query: str) -> str:
+    """規則側の逆算手掛かりを、LLM の forward 宣言より優先する。
+
+    文法制約 JSON は値域までは守らない (CLAUDE.md の既知の落とし穴) ため、
+    ``direction`` が forward でもクエリに逆算の手掛かり (``_DATE_BACKWARD_RE``)
+    があれば backward を採る。LLM が既に backward を返しているときはそのまま
+    (手掛かり語を持たない逆算表現も拾える、2026-09-09 監査 G-06)。
+    """
+    if direction == "backward":
+        return "backward"
+    if _DATE_BACKWARD_RE.search(query or ""):
+        return "backward"
+    return "forward"
+
+
+#: 生成コマンドの共通前置き。
+_DATE_INTENT_PREFIX = 'python -c "import datetime; n=datetime.datetime.now().astimezone();'
+
+
+def build_date_intent_command(params: DateIntentParams, query: str = "") -> str:
+    """検証済みパラメータから **決定論的に** コマンドを組む。
+
+    出力には結果の日付だけでなく **数え方の前提** (向き / 起点を 1 日目と
+    数えたか / 土日・除外曜日を除いたか / 除いた祝日の件数) も print する。
+    起点日の数え方は自然言語では曖昧で、前提を書かない回答は検算できない
+    (2026-09-08 F-06)。
+
+    Args:
+        params: :func:`parse_date_intent` が返した検証済みパラメータ。
+        query: 元のクエリ。``business_days_from`` / ``days_from`` の向き
+            (前 / 後) の LLM 宣言に対する **コード側の上書き判定**
+            (:func:`_effective_direction`) にだけ使う。
+
+    Returns:
+        ``python -c "..."`` 形式のコマンド。組めない場合は空文字列。
+    """
+    start = _date_literal(params.start)
+    if params.kind == "business_days_from":
+        span = _candidate_span(params.n, params.holidays)
+        index = params.n - 1 if params.count_start_day else params.n
+        direction = _effective_direction(params.direction, query)
+        step = -1 if direction == "backward" else 1
+        excluded = set(params.excluded_weekdays)
+        if params.skip_weekends:
+            excluded |= {5, 6}
+        return (
+            _DATE_INTENT_PREFIX
+            + f" s={start};"
+            f" hs={_holiday_set_literal(params.holidays)};"
+            f" ws={_weekday_set_literal(excluded)};"
+            f" c=[s+datetime.timedelta(days={step}*i) for i in range({span})];"
+            " b=[d for d in c if d.weekday() not in ws and d not in hs];"
+            f" t=b[{index}];"
+            " print('now:',n); print('start:',s.strftime('%Y-%m-%d (%A)'));"
+            f" print('direction:',{direction!r});"
+            f" print('skip_weekends:',{params.skip_weekends});"
+            f" print('excluded_weekdays:',{sorted(excluded)!r});"
+            f" print('holidays_excluded:',{len(params.holidays)});"
+            f" print('start_counted_as_day1:',{params.count_start_day});"
+            f" print('business_day_number:',{params.n});"
+            " print('target:',t.strftime('%Y-%m-%d (%A)'))\""
+        )
+    if params.kind == "days_from":
+        direction = _effective_direction(params.direction, query)
+        signed = -params.n if direction == "backward" else params.n
+        return (
+            _DATE_INTENT_PREFIX
+            + f" s={start};"
+            f" t=s+datetime.timedelta(days={signed});"
+            " print('now:',n); print('start:',s.strftime('%Y-%m-%d (%A)'));"
+            f" print('direction:',{direction!r});"
+            f" print('offset_days:',{signed});"
+            " print('target:',t.strftime('%Y-%m-%d (%A)'))\""
+        )
+    if params.kind == "days_between":
+        if params.skip_weekends or params.holidays:
+            adjust = 0 if params.count_start_day else 1
+            weekday_filter = " if d.weekday()<5 and d not in hs" \
+                if params.skip_weekends else " if d not in hs"
+            return (
+                _DATE_INTENT_PREFIX
+                + f" a={start}; z={_date_literal(params.end)};"
+                f" hs={_holiday_set_literal(params.holidays)};"
+                " lo=min(a,z); hi=max(a,z);"
+                " c=[lo+datetime.timedelta(days=i) for i in range((hi-lo).days+1)];"
+                f" b=[d for d in c{weekday_filter}];"
+                " print('now:',n); print('from:',lo.strftime('%Y-%m-%d (%A)'));"
+                " print('to:',hi.strftime('%Y-%m-%d (%A)'));"
+                f" print('skip_weekends:',{params.skip_weekends});"
+                f" print('holidays_excluded:',{len(params.holidays)});"
+                f" print('start_counted_as_day1:',{params.count_start_day});"
+                f" print('business_days:',len(b)-{adjust})\""
+            )
+        return (
+            _DATE_INTENT_PREFIX
+            + f" a={start}; z={_date_literal(params.end)};"
+            " lo=min(a,z); hi=max(a,z);"
+            " print('now:',n); print('from:',lo.strftime('%Y-%m-%d (%A)'));"
+            " print('to:',hi.strftime('%Y-%m-%d (%A)'));"
+            " print('days:',(hi-lo).days)\""
+        )
+    if params.kind == "weekday_of":
+        return (
+            _DATE_INTENT_PREFIX
+            + f" s={start};"
+            " print('now:',n);"
+            " print('target:',s.strftime('%Y-%m-%d (%A)'))\""
+        )
+    return ""
+
+
+def date_intent_command_from_payload(payload: object, query: str = "") -> str:
+    """``date_intent`` の生応答からコマンドを組む (検証込み、純粋関数)。
+
+    ``kind == "none"`` / 検証失敗 / readonly 違反はすべて空文字列を返し、
+    呼出側は now-only のまま「未検証」の印を立てる。
+    """
+    params = parse_date_intent(payload)
+    if params is None:
+        return ""
+    command = build_date_intent_command(params, query)
+    if not command:
+        return ""
+    if _readonly_command_rejected("run_command_readonly", command):
+        return ""
+    return command
+
+
 # Python 実行で正確に答えられるシステム情報クエリのコマンドマッピング
 # パターンにマッチしたクエリに対して、具体的な Python コマンドを生成する。
 # コマンドは Windows cmd.exe / Unix sh の両方で動作するよう、
@@ -777,6 +1234,14 @@ def recalled_command_fits_query(
     # 回答は 134 日 (正 131)。相対日付ガードは ``_RELATIVE_OFFSET_RE`` を
     # 見るので、オフセット表現の無いこの形には掛からなかった。
     if _day_count_command(query) and not _DATE_ARITHMETIC_RE.search(command):
+        return False
+    # 日付演算の手掛かり (「30 営業日目」「三日後」) があるクエリも同じ。
+    # リコール層はビルダを通らないので、過去ターンの now-only コマンドを
+    # 引き当てると ``date_intent`` 層 (日付演算の唯一の受け皿) の前に確定して
+    # しまい、暗算に戻る。日付演算を含むコマンドは従来どおり通す。
+    if _DATE_MATH_CUE_RE.search(query or "") and not _DATE_ARITHMETIC_RE.search(
+        command,
+    ):
         return False
     # 過去に述べられた日付の想起 (「私の誕生日は何年何月何日でしたか？」) には
     # 現在日時コマンドを撃たない。``_build_datetime_command`` 側は抑止済みだが、

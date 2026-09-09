@@ -154,6 +154,14 @@ class LocalPathsConfig(BaseModel):
         description="embed LoRA のバージョン履歴保存先。",
     )
     knowledge_dir: str = "local/knowledge/"
+    # チャット / long_form が生成した成果物の既定の書込み先。ユーザーが
+    # ディレクトリを指定しなかった裸のファイル名 (``compose.yaml``) はここへ
+    # 落とす。指定しないとプロセスの CWD (= リポジトリ直下) に書かれる
+    # (2026-09-08 監査 F-05)。明示パスを与えられた書込みはこの外へ出る。
+    outputs_dir: str = Field(
+        default="local/outputs/",
+        description="ディレクトリ指定の無い生成物の既定の書込み先。",
+    )
     experience_file: str = "local/experience.json"
     eval_core_file: str = "local/eval_core.json"
     model_state_file: str = "local/model_state.json"

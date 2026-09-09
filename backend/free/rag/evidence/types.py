@@ -95,6 +95,17 @@ class EvidenceRecordError(ValueError):
     """
 
 
+class EvidenceVersionError(EvidenceRecordError):
+    """レコードの ``_version`` がコードの :data:`RECORD_VERSION` より新しい。
+
+    「1 レコードだけ飛ばす」で済ませてはいけない唯一の読み取り失敗
+    (c_05 §0.5.1)。新しい版を旧いコードで畳んで書き戻すと、知らない
+    フィールドを落とした版が正になる。読み手はストアごと readonly に落とし
+    (``EvidenceStore.readonly``)、``put`` / ``create_snapshot`` / prune を
+    拒否すること。
+    """
+
+
 # ── レコード本体 ────────────────────────────────────────────────────────
 
 
@@ -193,6 +204,13 @@ def from_record(data: dict[str, Any]) -> Evidence:
     """
     if not isinstance(data, dict):
         raise EvidenceRecordError(f"record must be a dict, got {type(data).__name__}")
+
+    version = data.get("_version")
+    if isinstance(version, int) and version > RECORD_VERSION:
+        raise EvidenceVersionError(
+            f"record {data.get('id')!r} has _version {version}, newer than the "
+            f"supported {RECORD_VERSION}",
+        )
 
     missing = sorted(key for key in REQUIRED_KEYS if data.get(key) is None)
     if missing:
@@ -543,6 +561,7 @@ __all__ = [
     "Confidentiality",
     "Evidence",
     "EvidenceRecordError",
+    "EvidenceVersionError",
     "Kind",
     "Origin",
     "StoreName",

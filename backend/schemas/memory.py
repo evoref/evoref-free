@@ -447,6 +447,43 @@ REMOVED_MEMORY_KEYS: tuple[tuple[str, str], ...] = (
 )
 
 
+#: c_16 (2026-09-07) の永続層全面置換で **機能ごと** 消えた ``memory`` 直下の
+#: キーと、その理由。:data:`REMOVED_MEMORY_KEYS` (宣言だけで読み手が無かった
+#: キー) と違い、これらは実際に順位付けを動かしていた値なので黙って捨てると
+#: 「設定したのに効かない」状態になる。``_REMOVED_LOCAL_PATH_KEYS`` と同じく
+#: 起動時に理由付きで拒否する。
+_REMOVED_MEMORY_KEYS_REJECTED: dict[str, str] = {
+    "fade_alpha": (
+        "the FadeMem score was removed with the LightMem/FadeMem ranking "
+        "(c_16 §8.2); ranking is now the single formula "
+        "cos x freshness x confidence x store_prior (c_16 §7.2)"
+    ),
+    "fade_beta": (
+        "the FadeMem score was removed with the LightMem/FadeMem ranking "
+        "(c_16 §8.2); ranking is now the single formula "
+        "cos x freshness x confidence x store_prior (c_16 §7.2)"
+    ),
+    "fade_gamma": (
+        "the FadeMem score was removed with the LightMem/FadeMem ranking "
+        "(c_16 §8.2); ranking is now the single formula "
+        "cos x freshness x confidence x store_prior (c_16 §7.2)"
+    ),
+    "fade_threshold": (
+        "the FadeMem score was removed with the LightMem/FadeMem ranking "
+        "(c_16 §8.2); ranking is now the single formula "
+        "cos x freshness x confidence x store_prior (c_16 §7.2)"
+    ),
+    "lightmem_decay_days": (
+        "time decay moved to memory.evidence.know_half_life_days and the "
+        "per-record half_life_days field (c_16 §8.2)"
+    ),
+    "half_life_days_by_tag": (
+        "per-tag decay moved to memory.evidence.know_half_life_days and the "
+        "per-record half_life_days field (c_16 §8.2)"
+    ),
+}
+
+
 class EvidenceRetentionConfig(BaseModel):
     """Evidence Store の保持方針 (c_16 §5.4)。
 
@@ -478,10 +515,10 @@ class EvidenceStorePriorConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    episodic: float = Field(default=1.0, ge=0.0, le=2.0)
+    episodic: float = Field(default=0.9, ge=0.0, le=2.0)
     semantic_mem: float = Field(default=1.0, ge=0.0, le=2.0)
     semantic_know: float = Field(default=0.9, ge=0.0, le=2.0)
-    corpus: float = Field(default=0.9, ge=0.0, le=2.0)
+    corpus: float = Field(default=1.0, ge=0.0, le=2.0)
 
 
 class EvidenceRankingConfig(BaseModel):
@@ -580,6 +617,25 @@ class MemoryConfig(BaseModel):
             )
         return cleaned
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_removed_keys(cls, data):
+        """c_16 で機能ごと消えた ``memory`` 直下のキーを理由付きで拒否する。
+
+        ``extra="forbid"`` の素のエラーだと「どのキーをなぜ消すのか」が
+        伝わらないため、``LocalPathsConfig.reject_removed_keys`` と同じ形で
+        キー名と c_16 の該当節を示す。
+        """
+        if isinstance(data, dict):
+            for key, reason in _REMOVED_MEMORY_KEYS_REJECTED.items():
+                if key in data:
+                    raise ValueError(
+                        f"memory.{key} was removed: {reason}. "
+                        "Remove the line from config.yaml "
+                        "(see docs/c_16_evidence_store.md §8.2).",
+                    )
+        return data
+
     # EvorefMem スキーマバージョン
     # 不一致時は scripts/init_evorefmem.py による初期化を促す。
     # code 側の backend.free.memory.init_evorefmem.SCHEMA_VERSION が最終的な
@@ -653,7 +709,8 @@ class MemoryConfig(BaseModel):
     short_term_max_notes: int = Field(default=100, ge=1)
     # LightMem スコアと FadeMem の重み (``lightmem_decay_days`` /
     # ``half_life_days_by_tag`` / ``fade_alpha`` / ``fade_beta`` /
-    # ``fade_gamma`` / ``fade_threshold``) は廃止。順位式は
+    # ``fade_gamma`` / ``fade_threshold``) は廃止 (残存キーは
+    # :data:`_REMOVED_MEMORY_KEYS_REJECTED` が起動時に拒否する)。順位式は
     # ``cos × freshness × confidence × store_prior`` の 1 本になり (c_16 §7.2)、
     # 減衰は ``memory.evidence.know_half_life_days`` とレコードの
     # ``half_life_days`` が持つ。保持順は ``last_used_at`` (c_16 §5.4)。

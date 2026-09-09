@@ -33,6 +33,7 @@ from uuid import uuid4
 
 import yaml
 
+from backend.free.core.correction_verdict import mask_quoted_speech
 from backend.free.core.intent_vocab import is_plain_statement
 from backend.free.core.session_mode import is_create_mode
 from backend.free.core.text_quality import states_no_user_value
@@ -151,7 +152,14 @@ def restates_attribute_value(
         # 「〜でしたよね」は記憶の問い合わせ。値は確定していないので
         # スロットを書き換えない (:data:`_CONFIRMATION_SEEKING_RE` 参照)。
         return False
-    haystack = _normalize_trigger(text)
+    # **鉤括弧の内側は本人の主張ではない** (伝聞・引用)。訂正語彙の照合だけ
+    # 引用を落とした写しに当てる — 属性の解決は原文のまま行う。
+    #
+    # 実インシデント (2026-09-08 夜の監査 G-04): 「仕事で ICC プロファイルを
+    # 扱うのですが、営業から「モニタと印刷で色が違う」というクレームが…」が
+    # 訂正候補として立ち、``from_correction`` の力で **より新しい** occupation
+    # ファクトを supersede した (発話は 9 時間前のもの)。
+    haystack = _normalize_trigger(mask_quoted_speech(text))
     if not any(t in haystack for t in CORRECTION_FORM_TRIGGERS):
         return False
     return any(
@@ -386,6 +394,92 @@ _SELF_NOUNS: frozenset[str] = frozenset({
 #: 話題マーカー。直前の名詞がその文の話題を握る。
 _TOPIC_MARKERS = "はがを"
 
+#: 括弧の対応表 (NFKC 後の形)。全角括弧は ``_normalize_trigger`` の NFKC で
+#: ASCII に潰れるが、鉤括弧・二重鉤は残るのでそのまま列挙する。
+_BRACKET_PAIRS: tuple[tuple[str, str], ...] = (
+    ("(", ")"),
+    # 正規化前のテキストを直接渡す呼出 (テスト / 将来の利用) でも効くように
+    # 全角も並べる。NFKC 済みなら単に一致しないだけ。
+    ("（", "）"),
+    ("［", "］"),
+    ("「", "」"),
+    ("『", "』"),
+    ("[", "]"),
+    ("【", "】"),
+    ("〈", "〉"),
+    ("《", "》"),
+)
+
+
+def _mask_bracketed(text: str) -> str:
+    """括弧の中身を同じ長さの空白に潰す (純粋関数)。
+
+    **読み仮名は助詞ではない。** 話題判定 (:func:`_last_topic_noun`) と
+    所有格判定 (:func:`_has_explicit_possessor`) は文字の並びだけを見るので、
+    括弧内に助詞と同じ字が入っていると文の構造を読み違える。
+
+    実インシデント (2026-09-08 ライブ監査 T01#1): 「私は久我山蒼真
+    **（くがやま そうま）** といいます。」から ``mem.personal.name`` が
+    1 件も作られなかった。読み仮名の「く**が**やま」の ``が`` を主題マーカーと
+    読み、「話題は『くが』であって一人称ではない」と判断して
+    ``requires_self_possessor`` が ``といいます`` の一致を捨てていた。
+    括弧を外した同じ文 (「私は久我山蒼真といいます。」) では取れる。
+
+    前セッションの人物名が live のまま残り、ユーザーには **別人の名前** が
+    復唱された。日本語の自己紹介で読み仮名を添えるのは普通の形なので、
+    語彙ではなく **構造** で落とす。
+
+    長さを保つのは、``_possessor_is_self`` が ``haystack`` 上の位置を使って
+    ``before`` を切り出しているため (位置がずれると別の場所を見る)。
+    閉じ括弧が無い場合は末尾まで括弧内とみなす (安全側 — 助詞を拾わない)。
+    """
+    if not text:
+        return text
+    out = list(text)
+    i = 0
+    n = len(out)
+    while i < n:
+        ch = out[i]
+        closing = next((c for o, c in _BRACKET_PAIRS if o == ch), None)
+        if closing is None:
+            i += 1
+            continue
+        end = text.find(closing, i + 1)
+        stop = n if end < 0 else end + 1
+        for j in range(i, stop):
+            out[j] = " "
+        i = stop
+    return "".join(out)
+
+
+def strip_bracketed(text: str) -> str:
+    """括弧とその中身を **取り除いて** 前後を繋ぐ (純粋関数)。
+
+    :func:`_mask_bracketed` は長さを保つために空白へ潰すが、それだと
+    **trigger 語の連結** は戻らない。「猫（サビ猫）の名前は」は
+    ``猫の名前`` にも ``名前は`` (所有者ガードで却下) にも一致せず、
+    2026-09-08 の実測で **どのスロットにも解決しなかった**。
+
+    括弧は語の連結を切らない、という不変を作るために
+    :meth:`AttributeSpec.match` が「通常の照合が空振りしたとき」だけ
+    この形で再試行する。閉じ括弧が無い場合は末尾までを括弧内とみなす。
+    """
+    if not text:
+        return text
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        closing = next((c for o, c in _BRACKET_PAIRS if o == ch), None)
+        if closing is None:
+            out.append(ch)
+            i += 1
+            continue
+        end = text.find(closing, i + 1)
+        i = n if end < 0 else end + 1
+    return "".join(out)
+
 
 def _last_topic_noun(before: str) -> str | None:
     """``before`` の **同じ文の中** で最後に話題マーカーを取った名詞を返す。
@@ -420,8 +514,12 @@ def _possessor_is_self(haystack: str, start: int) -> bool:
     「趣味は登山です。名前は小川です。」は従来どおり本人の名前として通る。
 
     漏れたときの着地は ``mem.personal.user`` で、**本人のスロットは汚れない**。
+
+    どちらの段も **括弧の中身を見ない** (:func:`_mask_bracketed`)。読み仮名の
+    「くが やま」の ``が`` を主題マーカーと読むと、自己紹介の名前が丸ごと
+    落ちる。
     """
-    before = haystack[:start]
+    before = _mask_bracketed(haystack[:start])
     if _has_explicit_possessor(before):
         return bool(_SELF_POSSESSOR_RE.search(before))
     topic = _last_topic_noun(before)
@@ -443,6 +541,19 @@ def _trigger_variants(word: str) -> tuple[str, ...]:
         # 「私の職業は？」に答えられなかった (trigger は ``エンジニアです`` のみ)。
         stem = word[: -len(_COPULA_SUFFIX)]
         return (word, *(stem + v for v in _COPULA_ACTIVITY_FORMS))
+    if word.endswith(_ACTIVITY_SUFFIX) and len(word) > len(_ACTIVITY_SUFFIX):
+        # 「<職務>している」は「<職務>**を**している」とも言う。実インシデント
+        # (2026-09-08 ライブ監査 T01#1): 「印刷会社で色管理と製版ワークフローの
+        # ソフト**開発をしています**。」が occupation のどの trigger にも当たらず
+        # (``開発してい`` は ``開発をしてい`` に一致しない)、職業のファクトが
+        # 1 件も作られなかった。
+        #
+        # ここも語彙ではなく **構造** から導く。``をしています`` を単独の
+        # trigger にすると「毎朝ジョギングをしています」まで occupation になり、
+        # occupation は単値なので **正しい職種を supersede して消す**。
+        # 語幹 (開発 / 設計 / 担当) を残した派生形なら錨が効く。
+        stem = word[: -len(_ACTIVITY_SUFFIX)]
+        return (word, *(stem + v for v in _ACTIVITY_OBJECT_FORMS))
     if len(word) < 2 or word[-1] not in _TOPIC_PARTICLES:
         return (word,)
     stem = word[:-1]
@@ -497,9 +608,18 @@ _COPULA_SUFFIX = "です"
 #: 書き込み側でファクトが生まれないので、読み出し側の抑止
 #: (:meth:`MemoryInjector._restated_slots`) もスロットを解決できず二重に効かない。
 _COPULA_ACTIVITY_FORMS: tuple[str, ...] = (
-    "をしています", "をしている", "をしていて",
-    "をやっています", "をやっている", "をやっていて",
+    "をしています", "をしている", "をしていて", "をしており",
+    "をやっています", "をやっている", "をやっていて", "をやっており",
     "として働", "を務めて",
+)
+
+#: 「<職務>している」形の trigger の語尾 (``開発してい`` / ``担当してい``)。
+_ACTIVITY_SUFFIX = "してい"
+#: その語幹に付く **目的語を取った** 言い回し。``をしてい`` の 1 語で
+#: ``をしています`` / ``をしていて`` / ``をしています。`` をすべて覆う
+#: (照合は部分一致なので活用形を列挙しない)。
+_ACTIVITY_OBJECT_FORMS: tuple[str, ...] = (
+    "をしてい", "をしており", "をやってい", "をやっており",
 )
 
 #: 属格の助詞。``requires_self_possessor`` を宣言したスロットに限り、
@@ -606,7 +726,23 @@ class AttributeSpec:
         ``mem.personal.occupation`` の object が **発話全文** になった。
         occupation が一致したのは派生形 ``エンジニアをしています`` なのに、
         返していたのは原語 ``エンジニアです`` で、本文のどの文にも含まれない。
+
+        **空振りしたら括弧を外して 1 度だけ再試行する。** 括弧は語の連結を
+        切らない (:func:`strip_bracketed`) — 「猫（サビ猫）の名前はモナカです。」
+        は ``猫の名前`` にも当たらず、``名前は`` は所有者ガードで却下されて
+        **どのスロットにも解決しなかった** (2026-09-08 実測)。再試行で
+        括弧なしの文と同じ結果に揃う。このとき返る語形は本文に無いので
+        根拠文の絞り込みは空振りし、呼出側は従来どおり全文を object にする
+        (安全側 — 値を落とさない)。
         """
+        hit = self._match_in(haystack)
+        if hit:
+            return hit
+        stripped = strip_bracketed(haystack)
+        return self._match_in(stripped) if stripped != haystack else ()
+
+    def _match_in(self, haystack: str) -> tuple[str, ...]:
+        """``haystack`` に対する 1 回分の照合 (:meth:`match` の本体)。"""
         hit: list[str] = []
         for word in self.triggers:
             if not word:
@@ -1356,12 +1492,17 @@ class _ModeAwareNoteBuilder(NoteBuilder):
         if _ASSISTANT_OUTPUT_META_RE.search(content):
             return []
         text = content.lower()
+        masked = mask_quoted_speech(content).lower()
         results: list[str] = []
         for tag, triggers in self.fact_triggers.items():
             hits = [t for t in triggers if t in text]
             if not hits:
                 continue
             if all(h in CORRECTION_FORM_TRIGGERS for h in hits):
+                # 訂正語が **引用の中にしか無い** なら本人の主張ではない
+                # (「営業から『前任ではなく私が担当』と言われました」)。
+                if not any(h in masked for h in hits):
+                    continue
                 own_attribute = resolve_fact_attribute(
                     content, tag,
                     mode=self.mode,

@@ -6,6 +6,7 @@ import asyncio
 import re
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -526,6 +527,68 @@ def _session_user_texts(state: AppState, session_id: str | None) -> list[str]:
         return []
 
 
+#: supersede 済みファクトの provenance から求めた retired note id を
+#: ストアごとにキャッシュする (f_02 §8.3)。``all_facts(include_superseded=True)``
+#: の全件走査は 1 チャットターンに複数回発生しうるが、ストアはプロセス常駐で
+#: 書込 (= sleep-time) が無い間は結果が変わらないため、
+#: ``SemanticStore.revision`` が変わらない限り再計算しない。
+#:
+#: ``ScopedSemanticStore`` は ``__slots__`` (``__weakref__`` 無し) で弱参照
+#: できないため、弱参照可能な実体側 ``ScopedSemanticStore.store``
+#: (:class:`~backend.free.memory.semantic.store.SemanticStore`、scope 非依存で
+#: プロセス常駐) をキーにする。1 つの実体ストアが複数 scope
+#: (``global`` / ``project:<id>``) のビューを持つため、値は scope ごとの
+#: ``{scope: (revision, {note_id: True})}`` にする。
+_RETIRED_NOTE_CACHE: "weakref.WeakKeyDictionary[Any, dict[str, tuple[int, dict[str, bool]]]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _retired_note_ids_for_store(store: Any) -> dict[str, bool]:
+    """``store`` (scope 束縛ビュー) 上で supersede 済みのファクトが指すノート id を集める。
+
+    supersede 済みファクトの ``provenances[].note_id`` がその値の根拠になった
+    発話ノートを指す。episodic は不変 (c_16) なのでノート原文はそのまま残る
+    — ここで集めた id を :meth:`MemoryInjector.inject` の
+    ``retired_note_ids`` へ渡すことで、「(過去の記録)」欄への再注入だけを
+    止める (履歴検索ツールでは訂正前の値を引ける、f_02 §8.3)。
+
+    弱参照 / ``revision`` が取れない構成 (テストの簡易 mock 等) では
+    キャッシュせず毎回計算する (縮退のみで壊れない)。
+    """
+    scope = getattr(store, "scope", None)
+    backing = getattr(store, "store", None) or store
+    try:
+        revision = store.revision
+    except Exception:
+        revision = None
+    if revision is not None:
+        try:
+            per_scope = _RETIRED_NOTE_CACHE.get(backing)
+        except TypeError:
+            per_scope = None
+        if per_scope is not None:
+            cached = per_scope.get(scope)
+            if cached is not None and cached[0] == revision:
+                return cached[1]
+    retired: dict[str, bool] = {}
+    for fact in store.all_facts(include_superseded=True):
+        # 勝者が継承した id (敗者が物理 GC された後も残る、c_16 §5.4)。
+        for note_id in getattr(fact, "retired_note_ids", None) or ():
+            retired[str(note_id)] = True
+        if not fact.superseded_by:
+            continue
+        for p in fact.provenances:
+            if p.note_id:
+                retired[p.note_id] = True
+    if revision is not None:
+        try:
+            _RETIRED_NOTE_CACHE.setdefault(backing, {})[scope] = (revision, retired)
+        except TypeError:
+            pass
+    return retired
+
+
 def build_semmem_injection(
     state: AppState, cfg: dict, mode: str = "chat",
     conflict_ctx: ConflictTurnContext | None = None,
@@ -565,6 +628,11 @@ def build_semmem_injection(
     ``<store>:<evidence_id>`` (``semantic:`` / ``episodic:``) をその場で追記する
     (c_16 §5.5)。学習帰属 (``GenerationConfigRef.evidence_ids``) の材料で、
     corpus 側は ``[参考情報]`` 枠 (``SearchPipelineResult.evidence_ids``) が担う。
+
+    supersede 済みファクトの provenance が指す発話ノートは
+    ``MemoryInjector.inject(retired_note_ids=...)`` へ渡して除外する。
+    episodic 本体は不変のまま (履歴検索ツールでは訂正前の値を引ける) で、
+    ``[関連する記憶]`` への「(過去の記録)」再注入だけを止める (f_02 §8.3)。
     """
     mem_sys = state.get_memory_system()
     if not mem_sys:
@@ -591,6 +659,19 @@ def build_semmem_injection(
         injector = MemoryInjector(cfg)
         _, episodic = mem_sys
         facts: list = []
+        # supersede 済みファクトの provenance から、その値の根拠になった
+        # 発話ノートの ID を集める。episodic 自身の retracted/superseded
+        # (訂正で畳まれた / 要約に吸収された) はストアのアクティブマスクが
+        # 落とすので別枠だが、**semantic 側で supersede されただけの
+        # ノートは episodic に原文のまま残る** (episodic は不変、c_16
+        # 「episodic は不変」)。ここを集めないと ``MemoryInjector`` の
+        # ``retired_note_ids`` (2026-08-27 に用意されたパラメータ) が常に
+        # 空集合になり、supersede 済みの値が「(過去の記録)」として毎ターン
+        # 再注入され続ける (2026-09-08 実機監査: 訂正済みの旧住所「横浜市」が
+        # 現住所「金沢市」と並んで注入され、モデルが「確認できていません」と
+        # 答えた)。計算は :func:`_retired_note_ids_for_store` (revision
+        # キャッシュ付き、f_02 §8.3) に委譲する。
+        retired_note_ids: set[str] = set()
         # 関連度スコアは埋め込み行列を持つストア側で 1 回の積として求める。
         # 候補ごとに正規化し直すと N=10000 で 52.5ms、常駐行列なら 1.5ms
         # (MemoryInjector._relevance_scores の実測)。
@@ -603,6 +684,13 @@ def build_semmem_injection(
                 facts.extend(store.all_facts(include_superseded=False))
             except Exception:
                 continue
+            try:
+                retired_note_ids.update(_retired_note_ids_for_store(store))
+            except Exception:
+                # retired 判定が壊れても injection 自体は続ける (fail-open は
+                # ここだけ許容 — 訂正前の値がまた出るだけで、注入全体を止める
+                # ほどの重大度ではない)。
+                pass
             if query_vec is not None:
                 try:
                     fact_scores.update(store.embedding_scores(query_vec))
@@ -616,9 +704,6 @@ def build_semmem_injection(
                 except Exception:
                     # 順位が取れなければ confidence + recency へ縮退する。
                     pass
-        # 注入候補は ``short`` tier のノート。``retracted`` / ``superseded``
-        # (訂正で畳まれた / 要約に吸収された) はストアのアクティブマスクが
-        # 落とすので、退役 id を呼出側で集める必要は無い (c_16 §8)。
         # **このモデルのベクトルが 1 本も無いターンは注入しない (fail-closed)。**
         #
         # 埋め込みは ``embeddings/<model_id>/`` にモデル別で置かれる (c_16 §6.1)
@@ -650,6 +735,7 @@ def build_semmem_injection(
                 query_embedding=query_vec,
                 session_user_texts=_session_user_texts(state, session_id),
                 query_text=query_text,
+                retired_note_ids=retired_note_ids or None,
                 fact_relevance_scores=fact_scores or None,
                 fact_rank_scores=fact_ranks or None,
             )

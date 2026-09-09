@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from backend.app_state import AppState
@@ -168,27 +167,6 @@ def apply_semmem_policy_overrides(
         )
 
 
-def _evidence_store_config(cfg: dict[str, Any]) -> SimpleNamespace:
-    """``EvidenceStore`` が読む設定を 1 つのオブジェクトにまとめる。
-
-    ベクトル側 (量子化 / memmap / クラスタ索引) は ``rag.*`` の現行キー、
-    語彙索引の走査上限は ``memory.evidence.lexical`` (c_16 §9) と、出所が
-    分かれている。ストアは属性アクセスで読むので、ここで 1 つの面に畳む。
-    """
-    rag_cfg = cfg.get("rag") or {}
-    cluster = rag_cfg.get("cluster_index") or {}
-    lexical = ((cfg.get("memory") or {}).get("evidence") or {}).get("lexical") or {}
-    return SimpleNamespace(
-        quantization=str(rag_cfg.get("quantization", "int8")),
-        memmap_threshold=int(rag_cfg.get("memmap_threshold", 10000) or 10000),
-        cluster_index=SimpleNamespace(
-            enabled=bool(cluster.get("enabled", True)),
-            n_probe_ratio=float(cluster.get("n_probe_ratio", 0.125) or 0.125),
-        ),
-        lexical=dict(lexical),
-    )
-
-
 def _init_memory(
     state: AppState, cfg: dict[str, Any], resolver: Any,
 ) -> tuple["WorkingMemoryRegistry", "EpisodicStore"]:
@@ -201,6 +179,7 @@ def _init_memory(
     from backend.free.memory.episodic.store import EpisodicStore
     from backend.free.memory.semantic.store import SemanticStore
     from backend.free.memory.stores.working import WorkingMemoryRegistry
+    from backend.free.rag.evidence.config import merge_rag_evidence_config
     from backend.free.memory.init_evorefmem import (
         SCHEMA_VERSION as EVOREFMEM_SCHEMA_VERSION,
         initialize_evorefmem,
@@ -305,9 +284,14 @@ def _init_memory(
     # 起動順の制約にしない。
     evidence_cfg = (cfg.get("memory") or {}).get("evidence") or {}
     retention = evidence_cfg.get("retention")
+    # 3 ストア (episodic / semantic / corpus) は **同じ面** を読む。
+    # ここで ``ranking`` を落とすと ``memory.evidence.ranking.store_prior`` /
+    # ``allow_assistant_origin_injection`` / 半減期が記憶側の順位式に一切
+    # 届かない (2026-09-08 監査。corpus だけが merge を通っていた)。
+    evidence_face = merge_rag_evidence_config(cfg)
     episodic = EpisodicStore(
         memory_dir,
-        rag_config=_evidence_store_config(cfg),
+        rag_config=evidence_face,
         retention=retention if isinstance(retention, dict) else None,
         debug_logger=getattr(state, "debug_logger", None),
     )
@@ -320,7 +304,7 @@ def _init_memory(
     # 同じく埋め込みバックエンドは後から注入する (:func:`attach_semantic_embedder`)。
     semantic = SemanticStore(
         memory_dir,
-        rag_config=_evidence_store_config(cfg),
+        rag_config=evidence_face,
         retention=retention if isinstance(retention, dict) else None,
         know_half_life=evidence_cfg.get("know_half_life_days"),
         debug_logger=getattr(state, "debug_logger", None),

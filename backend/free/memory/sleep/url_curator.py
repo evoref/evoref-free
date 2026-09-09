@@ -41,6 +41,11 @@ from backend.free.memory.sleep._curator_common import (
 )
 from backend.free.llm.json_schemas import UrlRelevanceJudgement
 from backend.free.memory.note_facts import fact_from_note
+from backend.free.memory.sleep.curation_backoff import (
+    clear_failure,
+    in_cooldown,
+    record_transient_failure,
+)
 from backend.free.memory.types import SemanticFact
 from backend.log_config import get_logger
 
@@ -56,6 +61,9 @@ logger = get_logger("memory.sleep.url_curator")
 _URL_RE = re.compile(r"(?i:https?)://[^\s\]\)」』、,\u0080-\U0010ffff]+")
 #: 接頭辞は _curator_common が SSOT (埋め込み側の定義と同じ場所に置く)。
 _SUBJECT_PREFIX = URL_SUBJECT_PREFIX
+
+#: ``curation_backoff`` の失敗カウンタキー (aux purpose 名と同じ)。
+_FAILURE_KEY = "url_relevance_score"
 
 # fetch_url が失敗した時にユーザ応答に残る代表的なシグナル文字列。
 # 1 つでもマッチすれば「URL は今回有効でなかった」とみなし、
@@ -213,23 +221,25 @@ async def _score_url(
     answer: str,
     url: str,
 ) -> float | None:
-    """sleep-time の LLM で URL 関連性を採点する。失敗時は ``None``。"""
-    try:
-        result = await scorer_client.generate(
-            messages=[
-                {"role": "system", "content": _PROMPT_SYSTEM},
-                {"role": "user", "content": _build_user_prompt(query, answer, url)},
-            ],
-            # 128 だと score/relevant の後ろで reason(最大200字) を出力中に
-            # finish_reason=length で頻繁に切れ json_repair 依存になるため 256。
-            max_tokens=256,
-            temperature=0.1,
-            purpose="url_relevance_score",
-            response_schema=UrlRelevanceJudgement,
-        )
-    except Exception as exc:
-        logger.warning("url_curator: relevance scoring failed: %s", exc)
-        return None
+    """sleep-time の LLM で URL 関連性を採点する。
+
+    パース不能な応答は「答えたが使えない」ので ``None``。**例外は呼出側へ
+    伝播する** — ここで握り潰すと一過性の aux timeout も「LLM が答えた」と
+    同じ扱いになり、``curate_url_facts`` が ``url_curated_at`` を立てて
+    二度と再試行しなくなる (2026-09-08 監査 G-03)。
+    """
+    result = await scorer_client.generate(
+        messages=[
+            {"role": "system", "content": _PROMPT_SYSTEM},
+            {"role": "user", "content": _build_user_prompt(query, answer, url)},
+        ],
+        # 128 だと score/relevant の後ろで reason(最大200字) を出力中に
+        # finish_reason=length で頻繁に切れ json_repair 依存になるため 256。
+        max_tokens=256,
+        temperature=0.1,
+        purpose="url_relevance_score",
+        response_schema=UrlRelevanceJudgement,
+    )
     from backend.free.llm.json_extract import extract_json_object
     from backend.free.llm.utils import extract_content
 
@@ -263,6 +273,7 @@ async def curate_url_facts(
     profile_id: str = "default",
     debug_logger=None,
     now_provider: Callable[[], float] | None = None,
+    should_pause: Callable[[], bool] | None = None,
 ) -> int:
     """URL リコール用の world_fact を sleep-time で書き込む。
 
@@ -276,6 +287,9 @@ async def curate_url_facts(
         profile_id: 書込先 fact の profile_id。
         debug_logger: 任意の DebugLogger。
         now_provider: 時刻供給。テスト用。
+        should_pause: ``True`` を返したら QA ペア境界でループを打ち切る協調
+            yield。残りのペアは ``url_curated_at`` が立たないままなので
+            次サイクルが拾う。
 
     Returns:
         新規に書き込まれた / 更新された URL fact 件数。
@@ -309,13 +323,28 @@ async def curate_url_facts(
 
     now_fn = now_provider or time.time
     written = 0
-    for user_note, assistant_note, urls in pairs:
+    for idx, (user_note, assistant_note, urls) in enumerate(pairs):
+        # 協調 yield: チャット生成が走っている間は QA ペア境界で手を止める
+        # (note_evolver と同じ実測。CLAUDE.md 不変則 #1)。
+        if should_pause is not None and should_pause():
+            remaining = len(pairs) - idx
+            logger.info(
+                "url_curator paused for the user turn: %d pair(s) left "
+                "pending for the next cycle", remaining,
+            )
+            break
         # 処理済みアンカー (user note) はスキップ。STM に残り続ける同一 QA ペアを
         # Full サイクルごとに再採点 / fetch_count 水増しするのを防ぐ。
         if user_note.url_curated_at is not None:
             continue
+        if in_cooldown(user_note, _FAILURE_KEY, now_fn()):
+            continue
         seen_urls: set[str] = set()
         fetch_failed = _has_fetch_failure(assistant_note.content)
+        #: このペアで補助タスクが例外を投げたか。1 件でもあれば、次サイクルで
+        #: 再試行できるよう ``url_curated_at`` を立てない (2026-09-08 監査 G-03)。
+        had_aux_failure = False
+        last_aux_exc: Exception | None = None
         for raw_url in urls:
             host, normalized = _normalize_url(raw_url)
             if not host or not normalized:
@@ -361,12 +390,20 @@ async def curate_url_facts(
                     )
                 continue
 
-            score = await _score_url(
-                scorer_client,
-                query=user_note.content,
-                answer=assistant_note.content,
-                url=raw_url,
-            )
+            try:
+                score = await _score_url(
+                    scorer_client,
+                    query=user_note.content,
+                    answer=assistant_note.content,
+                    url=raw_url,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "url_curator: relevance scoring failed for %s: %s", host, exc,
+                )
+                had_aux_failure = True
+                last_aux_exc = exc
+                continue
             if score is None:
                 continue
             if score < min_record:
@@ -428,9 +465,19 @@ async def curate_url_facts(
             except Exception as exc:
                 logger.warning("url_curator: persist failed for %s: %s", host, exc)
 
-        # ペア処理完了 — score < min_record / fetch 失敗を含む全分岐で必ず
-        # マークし、次サイクルで同じペアを再採点させない。
-        user_note.url_curated_at = now_fn()
+        # ペア処理完了 — score < min_record / fetch 失敗シグナル (deterministic
+        # な penalize) を含む分岐は「補助タスクが答えた」なのでマークして
+        # 次サイクルで同じペアを再採点させない。**補助タスクが例外を投げた
+        # 場合だけ** マークせず、一過性失敗としてバックオフに積む
+        # (2026-09-08 監査 G-03)。
+        if had_aux_failure:
+            record_transient_failure(
+                user_note, _FAILURE_KEY, now_fn(),
+                counts=not getattr(last_aux_exc, "contended", False),
+            )
+        else:
+            clear_failure(user_note, _FAILURE_KEY)
+            user_note.url_curated_at = now_fn()
 
     if written and debug_logger is not None:
         try:

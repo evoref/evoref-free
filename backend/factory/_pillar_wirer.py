@@ -1052,11 +1052,19 @@ def _init_sleep_time_worker(
     learned_patterns_store: "LearnedPatternStore",
     policy_interpreter: "PolicyInterpreter",
     aux_prompt_mgr: "AuxPromptManager",
+    *,
+    learning_disabled: bool = False,
 ) -> None:
     """7e. SleepTimeWorker (EmbeddingBackend が必要)。
 
     ノート生成 / tier 遷移 / 要約 / 保持方針 / snapshot はすべてこのワーカーに
     閉じる (c_16 §2.1: エピソード記憶の書き手は sleep-time だけ)。
+
+    ``--no-learning`` でも **構築する**。ここを丸ごと飛ばすと、記憶の抽出・
+    ノート化・``flush_touch``・``create_snapshot`` まで止まり「記憶は通常
+    どおり動く」という設計 (CLAUDE.md §1 / .claude/rules/config.md) と食い違う。
+    学習に属するステップ (経験の書き戻し / パターン減衰 / 手本の埋め込み /
+    failure_pattern 統合) だけをワーカー側で no-op にする。
     """
     try:
         from backend.free.memory.sleep_update import SleepTimeWorker
@@ -1153,11 +1161,13 @@ def _init_sleep_time_worker(
             semantic_store_invalidator=_semantic_invalidator,
             triggers_dir=triggers_dir,
             private_trace_ids_provider=_private_trace_ids,
+            learning_disabled=learning_disabled,
         )
         sleep_scheduler.set_worker(worker)
         logger.info(
-            "SleepTimeWorker initialized (project_id=%s, agent_trace_dir=%s)",
-            current_project_id, agent_trace_dir,
+            "SleepTimeWorker initialized (project_id=%s, agent_trace_dir=%s, "
+            "learning_disabled=%s)",
+            current_project_id, agent_trace_dir, learning_disabled,
         )
     except Exception as e:
         logger.warning("SleepTimeWorker init skipped: %s", e)
@@ -2451,16 +2461,17 @@ async def _build_learn_pillar(
     # --no-learning 時は SleepTimeWorker / Level1 loop / Level2 runner /
     # Pro 学習コンポーネント注入をスキップする (LearningScheduler 本体は構築維持)
     learning_disabled = state.learning_disabled
-    if not learning_disabled:
-        with _timed(timings, "sleep_time_worker"):
-            _init_sleep_time_worker(
-                state, cfg, mem.sleep_scheduler, mem.episodic_memory,
-                mem.working_memory_registry, gen.embedder, state.vector_store,
-                exp_buf, debug_logger, learned_patterns_store,
-                policy_interpreter, aux_prompt_mgr,
-            )
-    else:
-        logger.info("SleepTimeWorker setup skipped (learning disabled)")
+    # SleepTimeWorker は --no-learning でも構築する (記憶の書き手は sleep-time
+    # だけなので、飛ばすと記憶抽出 / ノート化 / snapshot まで止まる)。学習に
+    # 属するステップはワーカー内で no-op になる。
+    with _timed(timings, "sleep_time_worker"):
+        _init_sleep_time_worker(
+            state, cfg, mem.sleep_scheduler, mem.episodic_memory,
+            mem.working_memory_registry, gen.embedder, state.vector_store,
+            exp_buf, debug_logger, learned_patterns_store,
+            policy_interpreter, aux_prompt_mgr,
+            learning_disabled=learning_disabled,
+        )
 
     with _timed(timings, "learning_scheduler"):
         learning_scheduler = _init_learning_scheduler(
@@ -2473,7 +2484,10 @@ async def _build_learn_pillar(
     # sleep-time で張るのに使う — 埋め込みが載るまでその手本は密ベクトル選択の
     # 候補にならない (STM ノートが embed 工程を通るまで注入対象にならないのと
     # 同じ契約)。
-    _wire_fewshot_pool_to_sleep_worker(state, learning_scheduler, mem)
+    if not learning_disabled:
+        _wire_fewshot_pool_to_sleep_worker(state, learning_scheduler, mem)
+    else:
+        logger.info("FewShotPool wiring skipped (learning disabled)")
 
     with _timed(timings, "component_wiring"):
         _wire_sleep_scheduler_models(
@@ -2783,6 +2797,25 @@ def _finalize_base(
         _check_edition_downgrade(resolver)
 
 
+async def _setup_pro_knowledge(state: AppState, cfg: dict) -> None:
+    """Pro の ``know.*`` 取得器セットアップフックを呼ぶ (c_16 §4.2)。
+
+    Free では ``knowledge`` フックが未登録なので no-op。**``--no-learning``
+    でも止めない** — 取得器は学習ではなく、判定は ``pro.knowledge.enabled``
+    だけ (かつて ``setup_pro_learn`` の中で組んでいたため、``--no-learning``
+    で黙って無効になっていた)。
+    """
+    from backend.edition import get_pro_pillar_setup
+
+    setup = get_pro_pillar_setup("knowledge")
+    if setup is None:
+        return
+    try:
+        await setup(cfg, state)
+    except Exception as e:  # noqa: BLE001 — 取得器が組めなくても起動は続ける
+        logger.warning("Pro knowledge setup failed: %s", e)
+
+
 async def wire_pillars(
     state: AppState, project_root: Path,
 ) -> tuple[_LifespanContext, dict[str, float]]:
@@ -2840,6 +2873,11 @@ async def wire_pillars(
     # Gen retrieval (Mem 依存): 語彙索引 / lazy contextual / 閾値較正
     with _timed(timings, "pillar_gen_retrieval"):
         _build_gen_pillar_retrieval(state, base, gen, mem, timings)
+
+    # Pro know.* 取得器 (Mem + Gen が揃った時点)。学習ではないので Learn
+    # フェーズ (--no-learning で丸ごと飛ぶ) に相乗りさせない。
+    with _timed(timings, "pro_knowledge_setup"):
+        await _setup_pro_knowledge(state, base.cfg)
 
     # Learn pillar: experience / LearningScheduler / Evolver + Pro Learn 拡張
     with _timed(timings, "pillar_learn"):

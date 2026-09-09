@@ -24,6 +24,7 @@ import numpy as np
 # (agent) 所属の純粋 util に移動済。Learn 側はここから import する。
 # format_fewshot_section は他モジュール (tests / 一部呼出元) が本モジュール経由で
 # import するため re-export として保持する。
+from backend.free.core.date_math_cue import query_has_date_math_cue
 from backend.free.agent.prompt_utils import (
     FewShotExample,
     format_fewshot_section,  # noqa: F401  (re-export for tests)
@@ -360,6 +361,13 @@ def _find_volatile_reason(query: str, response: str) -> str | None:
     """
     if _PRESENT_TIME_RE.search(query) and _ABSOLUTE_DATETIME_RE.search(response):
         return "time-dependent answer (asserts a date/weekday valid only that day)"
+    # 日付演算の答えは **その問いの数値** であって文体の手本ではない。手本に
+    # なると、同じ問いに対しツールの計算結果より手本の日付が優先される
+    # (2026-09-08 検証: 誤答「10月14日」が手本に昇格し、ツールが 10/20 を
+    # 出した後の回答でも 10月14日 を復唱した)。計算はツールが行う前提なので、
+    # 正誤に関わらず手本から外す。
+    if query_has_date_math_cue(query) and _ABSOLUTE_DATETIME_RE.search(response):
+        return "computational answer (date arithmetic must come from a tool, not an exemplar)"
     if _LOCAL_ABS_PATH_RE.search(query) or _LOCAL_ABS_PATH_RE.search(response):
         return "environment-dependent answer (describes local filesystem state)"
     if (
@@ -1205,8 +1213,13 @@ class FewShotPool(JsonStateStore):
             if fitness < self.min_fitness:
                 continue
 
-            # 成功例のみ（訂正・言い直し・失敗ターンがない）
-            if signals.get("user_correction") is not None:
+            # 成功例のみ（訂正・言い直し・失敗ターンがない）。
+            # 訂正 **候補** の段階で除く — 検証で昇格しなかった発話も、
+            # 「直前応答を否定する形の入力」であって手本にはならない。
+            if (
+                signals.get("user_correction") is not None
+                or signals.get("correction_candidate") is not None
+            ):
                 continue
             if exp.get("id") in corrected_ids:
                 continue
@@ -1650,6 +1663,22 @@ class FewShotPool(JsonStateStore):
         removed_per_mode: dict[str, int] = {}
         for mode, pool in self._pools.items():
             removed_count = 0
+
+            # 0) 内容ゲートの再適用。ゲートは後から増える (2026-09-08: 日付演算の
+            #    答え) ので、採用時に通った手本も現行のゲートで落とす。読込時の
+            #    浄化 (``_from_payload``) と同じ判定で、再起動を待たずに効かせる。
+            stale = [
+                ex for ex in pool
+                if find_content_rejection(ex.query, ex.response) is not None
+            ]
+            for ex in stale:
+                pool.remove(ex)
+                self._forget_evicted(mode, ex)
+                logger.info(
+                    "Step 14 fewshot GC: evicted by content gate (%s): query=%s",
+                    find_content_rejection(ex.query, ex.response), ex.query[:50],
+                )
+            removed_count += len(stale)
 
             # 1) 品質の絶対下限。サイズに空きがあっても残さない
             #    (:data:`DEFAULT_MIN_QUALITY_SCORE` 参照)。未採点 (None) は

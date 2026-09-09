@@ -300,26 +300,21 @@ def archive_project(
     state: LocalState,
     project_id: str,
     *,
-    semantic_root: Path,
-    archive_dir: Path,
     now: float | None = None,  # noqa: ARG001
-) -> Path | None:
-    """指定プロジェクトを物理アーカイブする
+) -> None:
+    """指定プロジェクトを ``archived=True`` にする。
 
-    `semantic_root/projects/<project_id>/` 以下を `archive_dir/<project_id>/`
-    へ移動し、`state.projects[project_id].archived = True` を設定する。
-    実体ディレクトリが存在しない場合は state のフラグだけ更新する
-    (履歴のみのプロジェクトを許容)。
+    c_16 (2026-09-07) でスコープはディレクトリではなく ``Evidence.scope``
+    フィールドになったため (§4.2)、``semantic/projects/<id>/`` という実体は
+    存在しない。かつてここにあったディレクトリ移動は新規インストールでは
+    src が一度も存在せず **到達しない分岐** だったので落とした。ファクトの
+    退役は呼出側 (``sleep/archive.py`` の ``retire_project_facts``) が
+    ``retract(reason="project_archived")`` で行う (c_16 §3)。
 
-    既に archive_dir 側に同名ディレクトリが存在する場合は、移動せず
-    state フラグだけ更新する (再アーカイブ抑止 / 上書き防止)。
-
-    Returns:
-        実際にファイルを移動した場合は移動先パス、移動しなかった場合は None。
-        プロジェクトが state に存在しない場合は KeyError。
+    Raises:
+        KeyError: ``project_id`` が state に無い。
+        ValueError: 現在アクティブなプロジェクトを指定した。
     """
-    import shutil
-
     meta = state.projects.get(project_id)
     if meta is None:
         raise KeyError(f"unknown project_id: {project_id}")
@@ -328,23 +323,7 @@ def archive_project(
             f"cannot archive currently active project: {project_id}",
         )
 
-    src = Path(semantic_root) / "projects" / project_id
-    dst = Path(archive_dir) / project_id
-    moved_to: Path | None = None
-    if src.exists() and src.is_dir():
-        if dst.exists():
-            logger.warning(
-                "Archive destination already exists, leaving source intact: %s",
-                dst,
-            )
-        else:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dst))
-            moved_to = dst
-            logger.info("Archived project semantic dir: %s -> %s", src, dst)
-
     meta.archived = True
-    return moved_to
 
 
 def propose_archives(

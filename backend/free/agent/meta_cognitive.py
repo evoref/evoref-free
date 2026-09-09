@@ -31,6 +31,8 @@ from backend.free.agent.meta_cognitive_tasks import (
     task_expects_write,
 )
 from backend.free.agent.meta_cognitive_tools import infer_tool_from_task
+from backend.free.agent.output_format import WRITTEN_PATH_RE
+from backend.i18n_helper import msg
 from backend.free.agent.meta_cognitive_utils import (
     contains_code_indicator,
     iter_balanced_brace_substrings,
@@ -96,6 +98,28 @@ __all__ = [
     "MetaCognitiveResponse",
     "TaskItem",
 ]
+
+#: 書き込んだ本文を最終応答に **全文** 載せる上限 (バイト)。超えたら先頭のみ。
+_WRITTEN_PREVIEW_FULL_BYTES = 2048
+#: 全文を載せないときに見せる先頭行数。
+_WRITTEN_PREVIEW_HEAD_LINES = 40
+#: 先頭のみ見せるときの文字数上限 (1 行が極端に長いファイル向けの二重の蓋)。
+_WRITTEN_PREVIEW_MAX_CHARS = 4000
+#: 本文提示のためにディスクから読む上限 (バイト)。巨大ファイルを丸ごと載せない。
+_WRITTEN_PREVIEW_READ_BYTES = 64 * 1024
+#: 提示ブロックのフェンス言語 (拡張子 → 言語)。未登録は拡張子をそのまま使う。
+_PREVIEW_FENCE_LANGUAGES: dict[str, str] = {
+    ".py": "python",
+    ".js": "javascript",
+    ".ts": "typescript",
+    ".md": "markdown",
+    ".markdown": "markdown",
+    ".yml": "yaml",
+    ".sh": "bash",
+    ".ps1": "powershell",
+    ".txt": "",
+    ".log": "",
+}
 
 
 class MetaCognitiveAgent(
@@ -1221,6 +1245,62 @@ class MetaCognitiveAgent(
             )
 
     @staticmethod
+    def _written_content_block(result: str) -> str:
+        """書き込んだ本文の提示ブロックを組む (書込み結果テキストから)。
+
+        書込みで完結したターンは「<path> に書き込みました。」の 1 行だけが
+        ユーザーへ届き、**何を書いたのかが本文に出ない** (実インシデント
+        2026-09-08 監査 F-05: 660 バイトの compose.yaml を書いた応答が
+        「compose.yaml に書き込みました。」の 1 行だけだった)。
+
+        申告 (生成した文字列) ではなく **実ファイルを読み戻して** 見せる。
+        2KB 以下は全文、超えたら先頭 ``_WRITTEN_PREVIEW_HEAD_LINES`` 行 +
+        省略の断り。リッチ文書 (xlsx/docx 等) はテキストで見せられないので
+        対象外 (空文字列を返す)。書込み結果でない / 読み戻せない場合も
+        空文字列。
+        """
+        from backend.free.agent.tools.builtin import _EXPORT_DOC_EXTS
+
+        match = WRITTEN_PATH_RE.search(result or "")
+        if match is None:
+            return ""
+        path = Path(match.group(1).strip())
+        if path.suffix.lower() in _EXPORT_DOC_EXTS:
+            return ""
+        try:
+            data = path.read_bytes()[:_WRITTEN_PREVIEW_READ_BYTES]
+        except OSError as e:
+            logger.warning("Written content preview unavailable (%s): %s", path, e)
+            return ""
+        text = data.decode("utf-8", errors="replace")
+        if not text.strip():
+            return ""
+        lines = text.splitlines()
+        body = text
+        note = ""
+        if len(data) > _WRITTEN_PREVIEW_FULL_BYTES:
+            body = "\n".join(lines[:_WRITTEN_PREVIEW_HEAD_LINES])
+            body = body[:_WRITTEN_PREVIEW_MAX_CHARS]
+            if body != text:
+                note = msg(
+                    "agent.written_content_truncated",
+                    lines=len(body.splitlines()),
+                    total=len(lines),
+                )
+        lang = _PREVIEW_FENCE_LANGUAGES.get(
+            path.suffix.lower(), path.suffix.lower().lstrip("."),
+        )
+        parts = [
+            msg("agent.written_content_header", path=str(path)),
+            f"```{lang}",
+            body,
+            "```",
+        ]
+        if note:
+            parts.append(note)
+        return "\n".join(parts)
+
+    @staticmethod
     def _write_failure_reason(result: str) -> str:
         """書込み失敗の理由を短い日本語で返す (未知なら空文字列。純粋関数)。"""
         m = _WRITE_REJECTION_RE.search(result or "")
@@ -1268,5 +1348,12 @@ class MetaCognitiveAgent(
                 # 導出が「= √[ 0.04645 × 0.9」で終わった)。UI の step 見出し側の
                 # 切り詰めは chat_stream_meta に残す。
                 parts.append(f"    {task.result}")
+                # 書込みタスクは「Written N bytes to …」だけでは中身が分から
+                # ない。実ファイルを読み戻して本文も見せる (2026-09-08 F-05)。
+                # 進捗ノート行と違って字下げしない — フェンスを崩さず、
+                # ``strip_task_log_scaffold`` の後に本文として残るため。
+                written = MetaCognitiveAgent._written_content_block(task.result)
+                if written:
+                    parts.append(written)
 
         return "\n".join(parts)

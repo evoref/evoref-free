@@ -293,6 +293,17 @@ class SemanticFact:
     (`conflict.auto_for_evolved_policies` の判定に使用)"""
 
     from_correction: bool = False
+
+    retired_note_ids: list[str] = field(default_factory=list)
+    """このファクトが置き換えた世代の **元発話ノート id** (継承つき)。
+
+    supersede のたびに敗者の ``provenances[].note_id`` と敗者自身の
+    ``retired_note_ids`` を勝者へ写す。敗者は snapshot 3 版後に物理 GC される
+    (c_16 §5.4) が、episodic のノートは不変で残るため、敗者の provenance から
+    「もう現在値でない発話」を引く経路は GC で切れる (2026-09-08 検証:
+    横浜→金沢の supersede 後、横浜ファクトの GC と同時に横浜の発話ノートが
+    (過去の記録) に戻った)。live の勝者が持てば版を跨いで生き続ける。
+    読み手は ``chat_service._retired_note_ids_for_store``。"""
     """ユーザーが自分の値を言い直したターン由来か。
 
     判定は :func:`backend.free.agent.feedback.restates_a_value` で、

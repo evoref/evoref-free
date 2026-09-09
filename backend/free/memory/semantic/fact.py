@@ -116,6 +116,7 @@ FACT_ATTR_FIELDS: tuple[str, ...] = (
     "session_ids",
     "embed_as_query",
     "embed_mode",
+    "retired_note_ids",
 )
 
 #: 既定値と同じなら ``attrs`` へ書かない (レコードを太らせない)。
@@ -131,6 +132,7 @@ _ATTR_DEFAULTS: dict[str, Any] = {
     "session_ids": [],
     "embed_as_query": False,
     "embed_mode": "chat",
+    "retired_note_ids": [],
 }
 
 #: ``provenance[].extractor_version`` の既定 (抽出器が明示しない場合)。

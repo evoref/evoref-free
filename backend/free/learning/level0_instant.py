@@ -54,9 +54,39 @@ class FeedbackSignals:
     rag_top1_score: float | None = None
     agent_loops: int = 0
     user_correction: str | None = None
+    """**検証済み** の訂正発話本文 (学習側の唯一の入口)。
+
+    記録時には立たない。字句検出は ``correction_candidate`` に入り、
+    ``learning.correction_verifier`` が「直前のアシスタント応答の誤りを
+    指しているか」を補助タスクで判定して初めてここへ昇格する
+    (2026-09-08 監査 F-03: 100 ターンで立った 2 件がどちらも偽陽性で、
+    その 2 件だけが Level 1 採用ゲートの評価ケースになった)。
+    """
     # "hardcoded" | "prev_failed" | "same_target" | None。旧 "learned"
     # (学習パターン照合) は 2026-07-21 廃止 — 過去データには残存しうる
     correction_detected_by: str | None = None
+    correction_candidate: str | None = None
+    """字句検出が拾った訂正 **候補** の発話本文 (recall 側)。
+
+    除外規則を通した後の候補で、精度の責任は負わない。チャット応答パスの
+    軽い用途 (遡及 false_negative マーク / 数値の保留判定 / few-shot の
+    除外) はこちらを見る。学習の目的関数は ``user_correction`` だけを見る。
+    """
+    correction_verified_at: str | None = None
+    """``correction_candidate`` を検証した時刻 (ISO 8601 UTC)。冪等性の鍵。"""
+    correction_verdict: str | None = None
+    """検証結果。``assistant`` / ``self`` / ``third_party`` / ``premise_change``
+    / ``none`` (LLM の判定) と、コード側で付ける ``no_context`` (直前応答を
+    解決できない) / ``invalid_span`` (逐語検証に落ちた) / ``no_verdict``
+    (補助タスクが空を返した)。``assistant`` のみが昇格する。"""
+    correction_wrong_claim: str | None = None
+    """直前応答のうち誤っていた逐語 span (検証済み)。"""
+    correction_correct_value: str | None = None
+    """訂正発話が示した正しい値の逐語 span (検証済み)。
+
+    eval_core / 訂正ペアの期待語はここを優先する。字句の否定境界
+    (``ではなく`` / ``じゃなく``) だけに頼ると **誤り側** が期待語に載る
+    (2026-09-07 監査 F-01)。"""
     # この訂正が指す **誤っていたターン** の ``ExperienceEntry.id``。
     #
     # 訂正ペア (「元の問い → 訂正後の正しい回答」) を組むのに要る対応関係で、
@@ -329,6 +359,9 @@ class ExperienceBuffer(JsonStateStore):
 
     def get_failures(self, mode: str | None = None) -> list[ExperienceEntry]:
         """失敗エントリ抽出 (言い直し / ユーザー訂正 / 決定論の失敗判定)。
+
+        訂正は ``user_correction`` = **検証済みのものだけ** を数える
+        (``correction_candidate`` 止まりの字句候補は含めない、F-03)。
 
         ``turn_outcome == "failed"`` を含めないと、Level 2 の失敗プールは
         「ユーザーが言い直した or 訂正した」ターンだけになり、算術の破綻・

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 
 from typing import (
@@ -22,6 +21,7 @@ from backend.free.api.schemas import (
     TokenInfo,
 )
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
+from backend.free.agent.output_format import WRITTEN_PATH_RE
 from backend.free.agent.meta_cognitive_utils import (
     looks_like_task_log_residue,
     strip_task_log_scaffold,
@@ -201,7 +201,10 @@ def _meta_cognitive_body_text(resp) -> str:
 
 
 #: ``write_file`` の戻り値 (``Written 158 bytes to E:\tmp\a.txt``) から書込み先を拾う。
-_WRITTEN_PATH_RE = re.compile(r"Written\s+\d+\s+bytes?\s+to\s+(.+?)\s*$", re.MULTILINE)
+#: パターンは agent 層 (``output_format.WRITTEN_PATH_RE``) が SSOT — 最終応答の
+#: 本文提示 (``_written_content_block``) も同じ形式を読むため、書き写すと
+#: 片方だけが形式追随に失敗する。
+_WRITTEN_PATH_RE = WRITTEN_PATH_RE
 
 #: task_result ステップ見出しに載せるタスク記述の最大長。
 _STEP_DESCRIPTION_MAX_CHARS = 48

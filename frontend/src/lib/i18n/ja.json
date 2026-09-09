@@ -477,7 +477,6 @@
 			"model_state_file": "モデル状態ファイル",
 			"memory_dir": "メモリディレクトリ",
 			"prompts_dir": "プロンプトディレクトリ",
-			"cartridges_dir": "カートリッジディレクトリ",
 			"history_dir": "履歴ディレクトリ",
 			"learned_patterns_file": "学習パターンファイル",
 			"themes_dir": "テーマディレクトリ"
@@ -813,8 +812,6 @@
 		"performance": "パフォーマンス",
 		"learning": "学習",
 		"wm_turns": "WM ターン",
-		"stm_notes": "STM ノート",
-		"ltm_vectors": "LTM ベクトル",
 		"ttft": "TTFT",
 		"tok_per_sec": "tok/s",
 		"cache_hit_rate": "キャッシュヒット率",
@@ -842,6 +839,26 @@
 	"landing": {
 		"free_tagline": "Agentic RAG で動くローカル個人ナレッジアシスタント",
 		"pro_tagline": "Agentic RAG + クリエイトモードを備えた進化型ローカル LLM アシスタント"
+	},
+	"knowledge": {
+		"title": "知識取得元 (Pro)",
+		"hint": "登録した取得元をアイドル時の sleep-time で巡回し、本文から know.* の claim を書きます。この画面は台帳の編集だけを行います。",
+		"url": "URL",
+		"name": "名前",
+		"topic": "トピック",
+		"fetch_kind": "取得方式",
+		"kind_page": "ページ",
+		"kind_rss": "RSS",
+		"add": "追加",
+		"enable": "有効化",
+		"disable": "無効化",
+		"delete": "削除",
+		"fetch_now": "今すぐ取得",
+		"fetch_done": "取得完了 (新規 {added} 件)",
+		"fetch_requested": "取得を受け付けました (バックグラウンドで実行中)",
+		"sources_empty": "取得元が登録されていません",
+		"recent_items": "最近の取得単位",
+		"items_empty": "まだ取得したものがありません"
 	},
 	"loop": {
 		"console": {

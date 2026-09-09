@@ -884,6 +884,41 @@ class LearningScheduler:
             local, config=self._config, debug_logger=self._debug_logger,
         )
 
+    async def verify_correction_candidates(self, llm_client=None) -> dict:
+        """未検証の訂正候補を検証し、``user_correction`` へ昇格させる (F-03)。
+
+        **全ての消費側より前** に呼ぶ。記録時の字句検出は候補
+        (``signals.correction_candidate``) 止まりで、Level 1 の採用ゲート /
+        few-shot / 訂正ペア / eval_core / Level 2 の失敗プールが読む
+        ``user_correction`` はここでしか立たない。
+
+        ``--no-learning`` 中と補助クライアント不在時は no-op (候補は候補の
+        まま残り、次サイクルで再試行される)。
+        """
+        from backend.free.learning.correction_verifier import (
+            has_pending_candidates,
+            verify_pending_corrections,
+        )
+
+        if self._disabled or not has_pending_candidates(self.experience_buf):
+            # 候補が無いなら補助クライアントを組み立てない (ほぼ全 tick がここ)。
+            return {
+                "checked": 0, "promoted": 0, "rejected": 0, "pending": 0,
+                "skipped": "learning_disabled" if self._disabled else None,
+            }
+        result = await verify_pending_corrections(
+            self.experience_buf,
+            self.resolve_idle_task_client(llm_client),
+            learning_disabled=self._disabled,
+        )
+        # 検証は signals を **その場で** 書き換える (件数も末尾 timestamp も
+        # 変わらない) ので、``_get_filtered_experiences`` のメモ化キーでは
+        # 検知できない。昇格を Level 1 の snapshot に届かせるため明示的に落とす
+        # (2026-09-08 検証: 昇格後も snapshot が検証前の signals のままだった)。
+        if result.get("checked") or result.get("pending"):
+            self._exp_cache_key = None
+        return result
+
     def cancel(self, *, graceful: bool = True) -> None:
         """学習を中断する（f_04 §7.1）
 
@@ -1199,11 +1234,18 @@ class LearningScheduler:
 
     # ── 採用ゲート (実測、f_04 §4.5) ──
 
-    def _prompt_gate_config(self) -> tuple[int, float]:
+    def _prompt_gate_config(self) -> tuple[int, float, int]:
+        """``(評価ケース数, 最小上昇幅, 最小ケース数)`` を返す。
+
+        最小ケース数は「これ未満なら進化も採用もしない」下限。2026-09-08 の
+        実機では検証前の訂正 2 件 (どちらも偽陽性) が唯一の評価ケースになり、
+        15 分のプロンプト進化がそのために走った (F-03)。
+        """
         prompt_cfg = self._config.get("prompt") or {}
         cases = int(prompt_cfg.get("adoption_eval_cases", 6))
         gain = float(prompt_cfg.get("adoption_min_gain", 0.05))
-        return max(0, cases), max(0.0, gain)
+        min_cases = int(prompt_cfg.get("adoption_min_cases", 3))
+        return max(0, cases), max(0.0, gain), max(0, min_cases)
 
     def _drop_modes_without_selection_pressure(
         self,
@@ -1217,10 +1259,16 @@ class LearningScheduler:
         しか出ず、採用ゲートの評価ケースも作れない (f_04 §8 禁則 7)。経験数が
         ``min_experiences // 2`` 未満のモードも同様に外す。resume で既に完了した
         モードは evolver 側の skip に任せる。
+
+        評価ケースが ``prompt.adoption_min_cases`` 未満のモードも外す
+        (``insufficient_cases``)。採用ゲートは同じ下限で不採用にするので、
+        走らせても採用され得ない — 実機ではケース 2 件のために 15 分の進化が
+        走った (2026-09-08 監査 F-03)。
         """
         from backend.free.optimizer.prompt_eval import select_prompt_eval_cases
 
         threshold = max(1, self.min_experiences // 2)
+        _, _, min_cases = self._prompt_gate_config()
         kept: dict[str, str] = {}
         skipped: dict[str, dict] = {}
         for mode, text in prompt_texts.items():
@@ -1230,10 +1278,15 @@ class LearningScheduler:
             mode_exp = [
                 e for e in session.experience_snapshot if e.get("mode") == mode
             ]
+            cases = select_prompt_eval_cases(
+                mode_exp, mode, max(1, min_cases),
+            )
             if len(mode_exp) < threshold:
                 reason = "insufficient_experiences"
-            elif not select_prompt_eval_cases(mode_exp, mode, 1):
+            elif not cases:
                 reason = "no_selection_pressure"
+            elif len(cases) < min_cases:
+                reason = "insufficient_cases"
             else:
                 kept[mode] = text
                 continue
@@ -1258,14 +1311,15 @@ class LearningScheduler:
             ``{mode: {"adopt": bool, "reason": str, "measured_before": float|None,
             "measured_after": float|None, "cases": int}}``
 
-        採用条件: 現行・候補の両方で採点できたケースが選定数の半数以上あり、
-        その平均の差が ``prompt.adoption_min_gain`` 以上 (0 なら正の差)。評価器
-        未注入 / ケース 0 件 / 採点不足 / 候補が現行と同文 は全て不採用
+        採用条件: 評価ケースが ``prompt.adoption_min_cases`` 以上あり、現行・
+        候補の両方で採点できたケースが選定数の半数以上あり、その平均の差が
+        ``prompt.adoption_min_gain`` 以上 (0 なら正の差)。評価器未注入 /
+        ケース 0 件 / ケース不足 / 採点不足 / 候補が現行と同文 は全て不採用
         (実測できないものは採用しない — f_04 §8 禁則 7)。
         """
         from backend.free.optimizer.prompt_eval import select_prompt_eval_cases
 
-        max_cases, min_gain = self._prompt_gate_config()
+        max_cases, min_gain, min_cases = self._prompt_gate_config()
         verdicts: dict[str, dict] = {}
         for mode, result in results.items():
             candidate = result.best_candidate.text
@@ -1287,6 +1341,13 @@ class LearningScheduler:
             cases = select_prompt_eval_cases(experiences, mode, max_cases)
             if not cases:
                 verdict["reason"] = "no_eval_cases"
+                continue
+            if len(cases) < min_cases:
+                # 少数ケースの平均は 1 件の judge 採点で符号が反転する。
+                # ``insufficient_cases`` は「測れなかった」ではなく
+                # 「測るに足りない」— 進化側も同じ下限で走らせない。
+                verdict["reason"] = "insufficient_cases"
+                verdict["cases"] = len(cases)
                 continue
             if self._cancelled or self.should_yield():
                 verdict["reason"] = "gate_interrupted"
@@ -1510,6 +1571,16 @@ class LearningScheduler:
             return {"skipped": True, "reason": "already_running"}
         if self._base_model_changed():
             return {"skipped": True, "reason": "base_model_changed"}
+
+        # 訂正候補の検証は **session snapshot を取る前** に走らせる。
+        # snapshot は experiences のコピーなので、後から昇格させても
+        # 今回の進化・採用ゲートには届かない (F-03)。
+        try:
+            await self.verify_correction_candidates(llm_client)
+        except Exception as exc:  # noqa: BLE001 - 検証失敗で学習を止めない
+            logger.warning(
+                "Correction verification failed before Level 1: %r", exc,
+            )
 
         session_or_skip = self._load_or_create_level1_session(reason, relax_threshold)
         if isinstance(session_or_skip, dict):
@@ -1801,19 +1872,12 @@ class LearningScheduler:
         key = (len(entries), entries[-1].timestamp if entries else None)
         if key == self._exp_cache_key:
             return list(self._exp_cache)
-        raw_experiences = [
-            {
-                "timestamp": e.timestamp,
-                "mode": e.mode,
-                "query": e.query,
-                "response_summary": e.response_summary,
-                "response_full": e.response_full,
-                "base_model": e.base_model,
-                "gen_config": asdict(e.gen_config),
-                "signals": asdict(e.signals),
-            }
-            for e in entries
-        ]
+        # **キーを手で列挙しない** (c_05 §0.5 / .claude/rules/backend.md)。以前は
+        # ``id`` / ``session_id`` / ``turn_id`` を落としていたため、session
+        # snapshot (``compact_experience``) にも id が届かず、採用ゲートの
+        # ``corrected_entry_id`` 解決が **実運用では常に失敗** していた
+        # (2026-09-08 検証: 検証済み訂正 1 件が no_selection_pressure に化けた)。
+        raw_experiences = [asdict(e) for e in entries]
         filtered = raw_experiences
         self._exp_cache_key = key
         self._exp_cache = filtered

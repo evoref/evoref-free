@@ -41,3 +41,8 @@ class PromptConfig(BaseModel):
     adoption_eval_cases: int = Field(default=6, ge=0)
     #: 採用に要する実測スコアの最小上昇幅 (候補平均 - 現行平均)。
     adoption_min_gain: float = Field(default=0.05, ge=0.0, le=1.0)
+    #: 進化・採用に要する評価ケースの最小数。これ未満のモードは進化自体を
+    #: スキップし (``insufficient_cases``)、採用もしない。少数ケースの平均は
+    #: 1 件の採点で符号が反転する — 2026-09-08 の実機では偽陽性の訂正 2 件が
+    #: 唯一の評価ケースになり、15 分のプロンプト進化がそのために走った。
+    adoption_min_cases: int = Field(default=3, ge=0)

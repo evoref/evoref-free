@@ -7,7 +7,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -26,6 +28,7 @@ from backend.free.core.intent_vocab import (
     is_practice_advice_query,
     looks_like_numeric_question,
 )
+from backend.free.core.date_math_cue import conversation_has_date_math_cue
 from backend.free.core.locale_patterns import select_locale_variant
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.safety_patterns import (
@@ -43,7 +46,11 @@ from backend.free.agent.grammar_tool_classifier import (
     parse_classifier_response,
     parse_expression_response,
 )
+from backend.free.llm.aux_client import PURPOSE_TIMEOUT_DEFAULTS
+from backend.free.llm.json_extract import extract_json_object
+from backend.free.llm.json_schemas import resolve_response_format_for_purpose
 from backend.log_config import get_logger
+from backend.utils import utc_now_dt
 
 # --- 責務別モジュール ---------------------------------------------------------
 # 判定に使う正規表現・純粋関数は責務ごとに分割してある。本モジュールは判定フロー
@@ -127,11 +134,16 @@ from backend.free.agent.tool_judge_commands import (
     _REL_PREFIX,
     _REL_SUFFIX,
     _RELATIVE_OFFSET_RE,
+    DATE_INTENT_SYSTEM,
+    DATE_INTENT_SYSTEM_EN,
     _build_datetime_command,
     _build_spec_command,
     _command_is_readonly_inspection,
     _infer_executable_command,
     _readonly_command_rejected,
+    command_lacks_date_arithmetic,
+    date_intent_command_from_payload,
+    query_has_date_math_cue,
     recalled_command_fits_query,
 )
 from backend.free.agent.tool_judge_args import (
@@ -240,6 +252,27 @@ def _looks_like_sentence(candidate: str, raw_query: str) -> bool:
     if c == (raw_query or "").strip():
         return True
     return bool(_SENTENCE_SHAPE_RE.search(c))
+
+
+#: 日付意図の抽出に渡す直近の会話 (ユーザー / アシスタント) の件数と 1 件の上限。
+#: 追い質問は起点日や日数を前のターンに置く (「その日から」「30 営業日目は
+#: どう変わりますか」) ので、質問文だけでは kind=none に落ちる。
+_DATE_INTENT_CONTEXT_TURNS = 2
+#: ツール無し exit から日付意図を撃つための「数量がある」条件。
+_DATE_INTENT_QUANTITY_RE = re.compile(r"\d|[一二三四五六七八九十百千]")
+_DATE_INTENT_CONTEXT_CHARS = 300
+
+
+def _date_intent_context_messages(conversation: list[dict] | None) -> list[dict]:
+    """``date_intent`` へ渡す直近の会話 (末尾 N 件、各 M 文字に切る)。"""
+    out: list[dict] = []
+    for msg in (conversation or [])[-_DATE_INTENT_CONTEXT_TURNS:]:
+        role = str(msg.get("role") or "")
+        content = str(msg.get("content") or "").strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        out.append({"role": role, "content": content[:_DATE_INTENT_CONTEXT_CHARS]})
+    return out
 
 
 def _executable_tool_for_mode(tools_registry: ToolsRegistry, mode: str) -> str:
@@ -473,6 +506,7 @@ class ToolCallJudge:
         session_id: str = "",
         *,
         allow_classifier: bool = True,
+        allow_date_intent: bool | None = None,
     ) -> ToolJudgement:
         """ツール呼び出しの要否を判定し、**ターン固有の値を結果に載せて** 返す。
 
@@ -494,6 +528,11 @@ class ToolCallJudge:
                 ``tool_args["session_id"]`` へ注入し、検索を現在セッションに
                 限定する (未指定時は従来どおり cross-session 検索のまま)。
             allow_classifier: 層 5.9 (文法制約分類) / 5.95 (式合成) を許すか。
+            allow_date_intent: 層 5.97 (日付演算の意図取り) を許すか。既定
+                (``None``) は ``allow_classifier`` に従う。2 手目のように分類器を
+                外したい一方で、1 手目が日付演算を接地できなかったときだけこの層
+                だけを許したい経路のために分けてある
+                (``deliberative._maybe_follow_up_tool``)。
         """
         call = JudgeCall(
             tools_registry=tools_registry,
@@ -502,12 +541,141 @@ class ToolCallJudge:
             conversation=conversation,
             session_id=session_id,
         )
-        result = await self._judge_inner(call, allow_classifier=allow_classifier)
+        result = await self._judge_layers(
+            call,
+            allow_classifier=allow_classifier,
+            allow_date_intent=allow_date_intent,
+        )
         # ここに await を入れないこと (結果へ写す前に他の judge() が走っても
-        # call はこの呼出専用なので壊れないが、規約として単純に保つ)。
+        # call はこの呼出専用なので壊れないが、規約として単純に保つ。
+        # ``test_chat_path_audit_20260823`` が AST で固定している)。
         result.action_blocked = call.action_blocked
         result.measurement_blocked = call.measurement_blocked
         return result
+
+    async def _judge_layers(
+        self,
+        call: JudgeCall,
+        *,
+        allow_classifier: bool,
+        allow_date_intent: bool | None,
+    ) -> ToolJudgement:
+        """判定層 (``_judge_inner``) と、その後処理 (層 5.97 / 日付の接地印)。
+
+        ``judge()`` の await を 1 本に保つためのまとめ役。後処理を ``judge()`` に
+        直接書くと「結果へ写す前に await を挟まない」規約に反する。
+        """
+        result = await self._judge_inner(call, allow_classifier=allow_classifier)
+        # 5.97. 日付演算の意図取り。**判定層ではなく後処理** — どの層が
+        # now-only コマンドを確定させたか (ルール / リコール / 分類器) に依らず
+        # 同じ穴が空くため、全 exit の後で 1 度だけ掛ける。
+        if allow_date_intent if allow_date_intent is not None else allow_classifier:
+            result = await self._upgrade_date_command_via_intent(result, call)
+        # 日付演算が接地できたかの印は **差し替えの後** に立てる (guards の
+        # ``_flag_ungrounded_date_math`` を GUARD_PIPELINE に載せない理由)。
+        return guards._flag_ungrounded_date_math(result, call)
+
+    async def _upgrade_date_command_via_intent(
+        self, result: ToolJudgement, call: JudgeCall,
+    ) -> ToolJudgement:
+        """now-only コマンドに落ちた日付演算クエリを、**パラメトリックに** 直す。
+
+        正規表現カスケード (``_build_datetime_command``) は語形ごとの分岐で、
+        新しい言い回しが来るたびに now-only コマンドへ落ちて日付演算がモデルの
+        暗算に戻る (実インシデント 2026-09-08 T19「30 営業日目」5/5 誤答)。
+        語形を足し続ける代わりに、**カスケードが落ちたときだけ** 文法制約 JSON
+        (``date_intent``) でパラメータを取り、コマンドは
+        :func:`date_intent_command_from_payload` が決定論的に組む。
+
+        - **LLM にコードは書かせない**。シェルへ渡るのは常にコード側の
+          テンプレートで、値も ISO 日付 / 整数として検証済み。
+        - 往復 1 回 (40 秒上限、``PURPOSE_TIMEOUT_DEFAULTS["date_intent"]``) を
+          無関係なターンへ足さないよう、発火条件は
+          「日付演算の手掛かりがある」かつ「確定したコマンドが日付演算を
+          していない」に閉じる。
+        - 失敗 (aux 不達 / タイムアウト / ``kind == "none"`` / 検証落ち) は
+          now-only のまま返し、``_flag_ungrounded_date_math`` が未検証の印を
+          立てる (格下げはしない — 落ち先が暗算になるため)。
+        """
+        if not self.enabled:
+            return result
+        # 手掛かり語は直前のユーザー発話からも継ぐ (条件だけを変える追い質問)。
+        if not conversation_has_date_math_cue(call.query, call.conversation):
+            return result
+        # 2 つの入口: (a) now-only コマンドが確定している、(b) どの層もツールを
+        # 選ばなかった (追い質問「祝日だとすると 30 営業日目はどう変わりますか」は
+        # 分類器が none を返し、日付演算が丸ごと暗算に残った — 2026-09-08 検証)。
+        # (b) は executable ツールが mode で使えるときだけ組み立てる。
+        tool_name = ""
+        if result.tool_needed:
+            if result.tool_name not in _COMMAND_TOOL_NAMES:
+                return result
+            command = str((result.tool_args or {}).get("command") or "")
+            if not command or not command_lacks_date_arithmetic(command):
+                return result
+            tool_name = result.tool_name
+        else:
+            # ツール無しの exit は手掛かり語だけでは撃たない (「祝日の由来」で
+            # 40 秒の往復を払わない)。数量 (数字 / 漢数字) を伴うときだけ。
+            if not _DATE_INTENT_QUANTITY_RE.search(call.query or ""):
+                return result
+            tool_name = _executable_tool_for_mode(call.tools_registry, call.mode)
+            if not tool_name:
+                return result
+        client = self._llm_client
+        if client is None or not hasattr(client, "generate_constrained"):
+            return result
+        response_format = resolve_response_format_for_purpose("date_intent")
+        if response_format is None:
+            return result
+        today = utc_now_dt().date().isoformat()
+        messages = [
+            {
+                "role": "system",
+                "content": select_locale_variant(
+                    DATE_INTENT_SYSTEM, DATE_INTENT_SYSTEM_EN,
+                ),
+            },
+            *_date_intent_context_messages(call.conversation),
+            {"role": "user", "content": f"[today: {today}]\n{call.query}"},
+        ]
+        try:
+            content = await client.generate_constrained(
+                messages,
+                response_format=response_format,
+                max_tokens=CLASSIFY_MAX_TOKENS,
+                # 分類器と同じ専有スロット (CLAUDE.md §6 #1 / c_14 §7 の
+                # CHAT_PATH_PURPOSES)。
+                id_slot=getattr(
+                    client, "classifier_slot",
+                    getattr(client, "background_slot", -1),
+                ),
+                timeout=PURPOSE_TIMEOUT_DEFAULTS.get("date_intent", 20.0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info("date intent extraction failed: %s", exc)
+            return result
+        try:
+            payload = json.loads(content or "")
+        except (TypeError, ValueError):
+            # スキーマを強制しない build では非 JSON が返り得る (分類器と同じ救済)。
+            payload = extract_json_object(content or "")
+        upgraded = date_intent_command_from_payload(payload, call.query)
+        if not upgraded:
+            logger.info(
+                "date intent did not yield a command for %r (payload=%r)",
+                (call.query or "")[:60], str(payload)[:120],
+            )
+            return result
+        logger.info("Date command upgraded via date_intent: %s", upgraded[:120])
+        args = dict(result.tool_args or {})
+        args["command"] = upgraded
+        if result.tool_needed:
+            return replace(result, tool_args=args)
+        return replace(
+            result, tool_needed=True, tool_name=tool_name, tool_args=args,
+            source="rule",
+        )
 
     async def _judge_inner(
         self, call: JudgeCall, *, allow_classifier: bool = True,

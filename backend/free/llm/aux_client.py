@@ -59,6 +59,31 @@ if TYPE_CHECKING:
 logger = get_logger("llm.aux_client")
 
 
+class AuxTimeoutError(TimeoutError):
+    """補助タスクのタイムアウト (purpose / 競合有無 / 予算秒を保持する)。
+
+    ``TimeoutError`` のサブクラスなので既存の ``except TimeoutError`` はそのまま
+    捕まえられる (メッセージ文言も変えていないので文字列照合のテストも壊れない)。
+    呼出側 (``sleep.curation_backoff`` 等) は ``contended`` を見て「予算不足」と
+    「チャットとの GPU 併走で一時的に遅かっただけ」を区別する — 後者は
+    一過性失敗としてカウントしない (``AuxClient._record_success`` が競合
+    サンプルを較正から弾くのと同じ理由)。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        purpose: str | None = None,
+        contended: bool = False,
+        timeout_sec: float = 0.0,
+    ) -> None:
+        super().__init__(message)
+        self.purpose = purpose
+        self.contended = contended
+        self.timeout_sec = timeout_sec
+
+
 # purpose 文字列 → タイムアウト秒の既定マップ。
 #
 # 明示指定 (呼出側の ``timeout=``) > 較正値 > 本マップ > ``_DEFAULT_TIMEOUT``。
@@ -74,10 +99,12 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "contextual_prefix": 120.0,
     "url_relevance_score": 45.0,
     "assertion_naming": 45.0,
+    "personal_fact_split": 60.0,
     # ── 学習サイクル ─────────────────────────────────────────────────
     "critique_synthesis": 120.0,
     "fewshot_quality_score": 45.0,
     "prompt_candidate_judge": 60.0,
+    "correction_verify": 60.0,
     # ── 長文生成 ─────────────────────────────────────────────────────
     "long_form_planning": 180.0,
     "long_form_code_review": 180.0,
@@ -89,6 +116,8 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # 取得直後 content gate の marginal band 関連性判定。チャット応答パスで
     # 同期発火するため短く打ち切る (timeout 時は prune せず全件通す)。
     "retrieval_chunk_gate": 15.0,
+    # 日付演算の意図 (パラメータのみ)。チャット応答パスで同期発火するので短い。
+    "date_intent": 40.0,
     # 計画 (タスク分解) は create モードの応答パスで発火する。長すぎると
     # ユーザ体感を阻害するため、失敗時は単一タスクへ倒して先へ進む。
     "meta_cognitive_plan": 90.0,
@@ -167,6 +196,7 @@ _BACKGROUND_TIMEOUT_TOKENS = 512
 #: 判定基準は docs/c_14 §7 の「チャット応答パスで発火」の注記。
 CHAT_PATH_PURPOSES: frozenset[str] = frozenset({
     "retrieval_chunk_gate",   # rag/chunk_content_gate (取得直後の関連性判定)
+    "date_intent",            # agent/tool_judge_commands (日付演算の意図)
     "meta_cognitive_plan",    # agent/meta_cognitive (create 応答パスの計画)
     "tool_summarize",         # agent/tools/builtin (deliberative のツール実行)
     "tool_translate",
@@ -193,10 +223,12 @@ DEFERRABLE_AUX_PURPOSES: frozenset[str] = frozenset({
     "contextual_prefix",
     "url_relevance_score",
     "assertion_naming",
+    "personal_fact_split",
     # 学習サイクル
     "critique_synthesis",
     "fewshot_quality_score",
     "prompt_candidate_judge",
+    "correction_verify",
 })
 
 #: チャットのアイドル窓を待つ上限。超えたら競合覚悟で走らせる。
@@ -310,17 +342,27 @@ class AuxClient:
     def resolve_effective_timeout(self, purpose: str) -> float:
         """purpose に適用されるタイムアウト秒を返す (較正値込み)。
 
-        較正値が無い背景 purpose には **モデルサイズ由来の下限** を掛ける。
-        既定の絶対秒はどのモデルで測ったのかを表現できず、大型モデルでは
-        1 回目が必ず落ちる (``_BACKGROUND_TIMEOUT_BASE_SEC`` の説明を参照)。
+        背景 purpose では **較正値にもモデルサイズ由来の下限を掛ける**。反応的
+        較正 (``_record_success`` の p95) はサンプルが少ない/速い間は
+        ``_CALIB_MIN_SCALE`` (0.5) まで既定を縮められるが、その縮んだ値は
+        大型モデルの decode 実測に届かないことがある。既定の絶対秒はどの
+        モデルで測ったのかを表現できず、大型モデルでは 1 回目が必ず落ちる
+        (``_BACKGROUND_TIMEOUT_BASE_SEC`` の説明を参照) のと同じ理由で、
+        較正値だけを無条件に信用すると同じ轍を踏む (2026-09-08 監査 G-03:
+        ``personal_fact_split`` が 60→30s に縮み、27B のチャット併走で
+        毎回 timeout するようになった)。
+
+        **チャット応答パスの purpose には掛けない** — あちらの短い予算は
+        「ユーザーを待たせない」ための意図的な打ち切りで、伸ばすと目的が壊れる。
         """
         calibrated = self._calibrated.get(purpose)
-        if calibrated is not None:
-            return calibrated
         base = PURPOSE_TIMEOUT_DEFAULTS.get(purpose, _DEFAULT_TIMEOUT)
         if purpose in CHAT_PATH_PURPOSES:
-            return base
-        return max(base, self._background_timeout_floor())
+            return calibrated if calibrated is not None else base
+        floor = self._background_timeout_floor()
+        if calibrated is not None:
+            return max(calibrated, floor)
+        return max(base, floor)
 
     def _resolve_response_format(
         self,
@@ -454,10 +496,12 @@ class AuxClient:
         (``"length"`` = 切断)。
 
         Raises:
-            TimeoutError: 予算超過。下位が投げる ``httpx.TimeoutException`` /
-                ``LLMTimeoutError`` は本例外へ正規化する — 呼出側は経路
-                (制約あり / なし) を意識せず 1 つの degraded 分岐で受けられる。
-                予算はスロットのロック取得後 (dispatch) から数える。
+            AuxTimeoutError: 予算超過 (``TimeoutError`` のサブクラス)。下位が
+                投げる ``httpx.TimeoutException`` / ``LLMTimeoutError`` は
+                本例外へ正規化する — 呼出側は経路 (制約あり / なし) を意識せず
+                1 つの degraded 分岐で受けられる。``purpose`` / ``contended``
+                属性を持つので、一過性 (チャット併走由来) の失敗を予算不足と
+                区別できる。予算はスロットのロック取得後 (dispatch) から数える。
         """
         resolved = self._resolve_response_format(
             purpose, response_format, response_schema,
@@ -537,9 +581,12 @@ class AuxClient:
                     constrained=resolved is not None, finish_reason="timeout",
                     queue_wait=queue_wait, slot=slot,
                 )
-                raise TimeoutError(
+                raise AuxTimeoutError(
                     f"Aux generation timed out after {effective_timeout:.1f}s "
                     f"(purpose={purpose or '<unspecified>'})",
+                    purpose=purpose or None,
+                    contended=contended,
+                    timeout_sec=effective_timeout,
                 ) from e
 
         elapsed = time.monotonic() - started
@@ -709,6 +756,7 @@ def _resolve_base_model_filename(config: dict) -> str:
 
 __all__ = [
     "AuxClient",
+    "AuxTimeoutError",
     "CHAT_PATH_PURPOSES",
     "PURPOSE_TIMEOUT_CALIBRATION_EXEMPT",
     "PURPOSE_TIMEOUT_DEFAULTS",

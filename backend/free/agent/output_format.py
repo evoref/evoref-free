@@ -114,6 +114,45 @@ def resolve_dir_output_path(file_path: str, query: str) -> str:
     return file_path
 
 
+#: ``write_file`` の戻り値 (``Written 158 bytes to E:\tmp\a.txt``) から書込み先を
+#: 拾うパターン。書いた事実を読み直す側 (最終応答の本文提示 / SSE の書込み先
+#: 表示) が共有する SSOT — 各所で書き写すと片方だけ形式追随に失敗する。
+WRITTEN_PATH_RE = re.compile(r"Written\s+\d+\s+bytes?\s+to\s+(.+?)\s*$", re.MULTILINE)
+
+
+def anchor_relative_output_path(file_path: str) -> str:
+    """錨の無い相対パスを既定の出力先 (``local_paths.outputs_dir``) へ寄せる。
+
+    規則 (書込み経路すべてで共通):
+
+    - 絶対パス (``E:\\tmp\\a.md`` / ``/home/u/a.md``) → そのまま
+    - ``./`` ``../`` ``~`` 始まり → **明示的な相対指定** なのでそのまま
+      (``..`` は ``write_file`` の traversal ガードが別途拒否する)
+    - それ以外の相対パス (``compose.yaml`` / ``deploy/compose.yaml``) →
+      ``<outputs_dir>/<相対パス>``
+
+    最後の 1 行が本題。裸の名前をそのまま ``write_file`` へ渡すとプロセスの
+    CWD (= リポジトリ直下) に着地し、ユーザーが指してもいない場所へゴミが
+    残る (実インシデント 2026-09-08 監査 F-05: リポジトリ直下に
+    ``compose.yaml`` が作られた)。純粋関数ではない (config を読む) が、
+    config 未ロードでも既定値へ解決する。
+    """
+    if not file_path:
+        return file_path
+    normalized = file_path.replace("\\", "/")
+    if normalized.startswith(("./", "../", "~")):
+        return file_path
+    p = Path(file_path)
+    # ドライブ文字付き (``E:\tmp``) は POSIX 上で is_absolute() が False に
+    # なるため、明示的に見る (Windows で書かれたパスがテストで寄せられない)。
+    if p.is_absolute() or (len(file_path) > 1 and file_path[1] == ":"):
+        return file_path
+
+    from backend.config import resolve_outputs_dir
+
+    return str(resolve_outputs_dir() / p)
+
+
 def is_table_output(file_path: str) -> bool:
     """``file_path`` の拡張子がスプレッドシート/表形式か判定する。"""
     return Path(file_path).suffix.lower() in TABLE_OUTPUT_EXTS

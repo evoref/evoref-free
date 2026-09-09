@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 
 from backend.free.learning.corrected_pairs import (
+    resolve_corrected_turn,
     response_honors_correction,
     strip_correction_preamble,
 )
@@ -81,38 +82,61 @@ def select_prompt_eval_cases(
 
     失敗の証拠がある実ターンだけを使う:
 
-    - ``user_correction`` が立っているエントリは **訂正発話そのもの** なので
-      ケースにせず、その **直前の同モードのターン** (訂正された側) をケースに
-      し、訂正文をヒントにする。
+    - ``user_correction`` (= ``learning.correction_verifier`` が検証済みに
+      昇格させた訂正だけが入る) が立っているエントリは **訂正発話そのもの**
+      なのでケースにせず、**訂正が指すターン** (訂正された側) をケースにし、
+      訂正文をヒントにする。字句止まりの ``correction_candidate`` はケースの
+      根拠にしない (2026-09-08 監査 F-03: 偽陽性 2 件が唯一の評価ケースに
+      なった)。
     - ``rephrased_query`` / ``turn_outcome == "failed"`` はそのターン自身。
+
+    宛先の同定は :func:`~backend.free.learning.corrected_pairs.resolve_corrected_turn`
+    (``signals.corrected_entry_id`` → 同一セッションの直前ターン → 双方に
+    セッションが無い最古データのみ位置) に委ねる。経験バッファは **全セッション
+    横断の 1 本** なので、以前のように「リスト上の直前エントリ」を無条件に
+    訂正された側とみなすと、別会話のターンが評価ケースになる (訂正ペア側は
+    2026-09-06 監査 F-01 で直したが、ここだけ位置頼みのまま残っていた)。
+    宛先を解決できない訂正はケースを作らない — 誤ったケースは採用ゲートの
+    測定そのものを狂わせるので、無いほうがましである。
 
     同一 query は最新 1 件に畳む。``limit <= 0`` なら空。
     """
     if limit <= 0 or not experiences:
         return []
+    # モードで先に絞る。宛先解決もこの中だけを見るので、chat のゲートに
+    # create のターンが混ざることはない。
     mode_exp = [e for e in experiences if e.get("mode") == mode]
     # 訂正された側を引くため、時系列順 (snapshot は append 順 = 時系列) を保つ
     picked: dict[str, PromptEvalCase] = {}
-    prev: dict | None = None
-    for exp in mode_exp:
+    for index, exp in enumerate(mode_exp):
         signals = exp.get("signals") or {}
         query = str(exp.get("query") or "").strip()
         correction = signals.get("user_correction")
         if correction:
-            if prev is not None:
-                pq = str(prev.get("query") or "").strip()
-                if pq:
-                    fixed = strip_correction_preamble(
-                        str(exp.get("response_full") or exp.get("response_summary") or ""),
-                    )
-                    if not response_honors_correction(fixed, str(correction)):
-                        fixed = ""
-                    picked[_case_id(pq)] = PromptEvalCase(
-                        case_id=_case_id(pq), query=pq,
-                        kind=CASE_KIND_CORRECTION, hint=str(correction).strip(),
-                        reference=fixed,
-                    )
-            prev = exp
+            corrected = resolve_corrected_turn(mode_exp, index)
+            pq = str((corrected or {}).get("query") or "").strip()
+            if pq:
+                correct_value = str(
+                    signals.get("correction_correct_value") or "",
+                ).strip()
+                fixed = strip_correction_preamble(
+                    str(exp.get("response_full") or exp.get("response_summary") or ""),
+                )
+                if not response_honors_correction(
+                    fixed, str(correction), correct_value=correct_value,
+                ):
+                    fixed = ""
+                # 採用ゲートはセッション snapshot (``compact_experience``、
+                # 応答本文を持たない) から読むので ``fixed`` は実運用では常に
+                # 空になる。検証器が逐語で取った ``correct_value`` は signals に
+                # 残るため、応答本文が無いときはそれを参照値にする —
+                # 「訂正後に受け入れられた値」として judge に渡す意味は同じ
+                # (2026-09-08 監査 F-03 の追補)。
+                picked[_case_id(pq)] = PromptEvalCase(
+                    case_id=_case_id(pq), query=pq,
+                    kind=CASE_KIND_CORRECTION, hint=str(correction).strip(),
+                    reference=fixed or correct_value,
+                )
             continue
         if query:
             if signals.get("turn_outcome") == "failed":
@@ -123,7 +147,6 @@ def select_prompt_eval_cases(
                 picked[_case_id(query)] = PromptEvalCase(
                     case_id=_case_id(query), query=query, kind=CASE_KIND_REPHRASE,
                 )
-        prev = exp
     # dict は挿入順 = 古い順。最新側から limit 件
     cases = list(picked.values())
     return cases[-limit:] if len(cases) > limit else cases

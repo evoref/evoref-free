@@ -27,7 +27,7 @@ snapshot は 1 版だけ持つ。corpus は事象ログを持たない — 版�
 ゲートは 2 段。まずパッケージ centroid との素の cosine (旧カートリッジゲートの
 規則をそのまま引き継ぐ)、通ったパッケージの中で ``EvidenceStore.search`` が
 ``score = cos × freshness × confidence × store_prior`` (c_16 §7.2) を計算する。
-``store_prior`` は既定 0.9 で、``manifest.store_prior_overrides`` が PC 固有に
+``store_prior`` は既定 1.0 (2026-09-08 A/B) で、``manifest.store_prior_overrides`` が PC 固有に
 上書きできる。旧 ``priority`` は廃止 — 掛けた値を閾値に流すと閾値を偽装する
 (2026-09-02 監査 S-A4) ので、返り値では cosine と store_prior を分けて渡す。
 """
@@ -63,6 +63,7 @@ from backend.free.rag.corpus.package import (
     write_prebuilt_chunks,
 )
 from backend.free.rag.evidence._json_state import JsonStateFile
+from backend.free.rag.evidence.config import merge_rag_evidence_config
 from backend.free.rag.evidence.store import EvidenceStore
 from backend.free.rag.evidence.types import (
     Evidence,
@@ -86,7 +87,7 @@ CENTROID_FILE = "centroid.npy"
 EMBEDDINGS_DIR = "embeddings"
 
 #: 順位式の ``store_prior`` — corpus の既定 (c_16 §7.2)。
-DEFAULT_CORPUS_STORE_PRIOR = 0.9
+DEFAULT_CORPUS_STORE_PRIOR = 1.0
 
 #: ``rag.cartridge_gate.threshold`` が未指定でプロファイルにも無いときの既定。
 DEFAULT_CARTRIDGE_GATE_THRESHOLD = 0.3
@@ -599,6 +600,21 @@ class CorpusStore:
         )
         self._notify("load", package_id)
         return package
+
+    def close(self) -> None:
+        """開いている全パッケージの :class:`EvidenceStore` を手放す。
+
+        パッケージ 1 版 = 1 EvidenceStore で、それぞれが memmap を握る。
+        Windows は掴んだままのファイルを消せないので、閉じないと版の GC
+        (``versions_keep``) が黙って失敗する (CLAUDE.md §10)。
+        """
+        for package in self._packages.values():
+            try:
+                _release_store(package.store)
+            except Exception as e:  # noqa: BLE001 — shutdown を止めない
+                logger.warning(
+                    "Failed to release corpus package %s: %s", package.meta.id, e,
+                )
 
     def unload(self, package_id: str) -> CorpusPackage:
         """パッケージを検索対象から外す (ディスクには残す)。"""
@@ -1270,23 +1286,6 @@ def _clean_derived(directory: Path) -> None:
                 target.unlink()
             except OSError as e:
                 logger.warning("failed to remove %s: %s", target, e)
-
-
-def merge_rag_evidence_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    """``rag`` セクションに c_16 §9 の ``memory.evidence.*`` を重ねた dict を作る。
-
-    :class:`EvidenceStore` は ``rag.quantization`` / ``memmap_threshold`` /
-    ``cluster_index`` と、``memory.evidence.lexical`` / ``ranking`` を **同じ
-    オブジェクトから** 読む (c_16 §9 の「``rag.*`` は現行キーを全ストアで
-    使う」)。設定の 2 セクションをここで 1 枚に畳んでから渡す。
-    """
-    merged: dict[str, Any] = dict(cfg.get("rag") or {})
-    evidence = (cfg.get("memory") or {}).get("evidence") or {}
-    for key in ("lexical", "ranking", "retention", "know_half_life_days"):
-        value = evidence.get(key)
-        if value is not None:
-            merged[key] = value
-    return merged
 
 
 __all__ = [

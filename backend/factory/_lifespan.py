@@ -118,11 +118,32 @@ def _shutdown_episodic_save(state: AppState) -> None:
     try:
         episodic.save_progress()
         episodic.evidence.save_manifest()
-        logger.info(
-            "Episodic store saved on shutdown: %d record(s)", len(episodic),
-        )
+        count = len(episodic)
+        # memmap を握ったままだと旧版の GC が Windows で黙って失敗する。
+        episodic.close()
+        logger.info("Episodic store saved on shutdown: %d record(s)", count)
     except Exception as e:
         logger.warning("Episodic save on shutdown failed: %s", e)
+
+
+def _shutdown_corpus_release(state: AppState) -> None:
+    """corpus パッケージの :class:`EvidenceStore` を閉じる。
+
+    パッケージ 1 版 = 1 EvidenceStore で、検索のたびに開いたものがそのまま
+    memmap を掴む。閉じないと Windows で版ディレクトリを消せず、
+    ``versions_keep`` の GC が黙って失敗する (CLAUDE.md §10)。
+    """
+    manager = getattr(state, "cartridge_manager", None)
+    if manager is None:
+        return
+    closer = getattr(manager, "close", None)
+    if closer is None:
+        return
+    try:
+        closer()
+        logger.info("Corpus package stores released on shutdown")
+    except Exception as e:
+        logger.warning("Corpus release on shutdown failed: %s", e)
 
 
 def _shutdown_semmem_index_flush(state: AppState) -> None:
@@ -278,6 +299,8 @@ async def _run_lifespan_shutdown(
         _shutdown_episodic_save(state)
     with _timed(shutdown_timings, "semmem_index_flush"):
         _shutdown_semmem_index_flush(state)
+    with _timed(shutdown_timings, "corpus_release"):
+        _shutdown_corpus_release(state)
     with _timed(shutdown_timings, "experience_save"):
         # rebind 後は ExperienceBuffer が新パーティションのパスを持つ (起動時パスは fallback)
         _shutdown_experience_save(

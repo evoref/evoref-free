@@ -298,19 +298,19 @@ def _check_lora_adapter(project_root: Path, config: dict) -> CheckResult:
 def _episodic_index_file(project_root: Path, config: dict) -> Path | None:
     """エピソード記憶のベクトル索引 (``index_q8.npy``) を探す。
 
-    索引はモデル別 (``<memory_dir>/episodic/embeddings/<model_id>/``) に置かれる
-    (c_16 §2.1)。埋め込みモデル名は起動時点で確定していないので、ディレクトリを
-    1 段なめて最初に見つかったものを見る (存在確認と次元照合が目的で、どの
-    モデルの索引かはここでは問わない)。
+    索引はモデル別 + 版別
+    (``<memory_dir>/episodic/embeddings/<model_id>/v<N>/``) に置かれる
+    (c_16 §2.1 / §6.1)。埋め込みモデル名も版も起動時点では確定していないので、
+    ``index_q8.npy`` を再帰で探して最初に見つかったものを見る (存在確認と
+    次元照合が目的で、どのモデル・どの版かはここでは問わない)。
     """
     local_paths = config.get("local_paths", {})
     memory_dir = _resolve_path(project_root, local_paths.get("memory_dir", "local/memory/"))
     embeddings_dir = memory_dir / "episodic" / "embeddings"
     if not embeddings_dir.is_dir():
         return None
-    for child in sorted(embeddings_dir.iterdir()):
-        candidate = child / "index_q8.npy"
-        if candidate.exists():
+    for candidate in sorted(embeddings_dir.rglob("index_q8.npy")):
+        if candidate.is_file():
             return candidate
     return None
 
