@@ -42,6 +42,7 @@ from backend.free.agent.tool_judge_history import (
     _has_history_recall_keywords,
     _only_proximal_recall_keywords,
     asks_about_past_conversation,
+    day_scope_recall,
 )
 from backend.free.agent.tool_judge_signals import (
     _IMMEDIATE_CHILDREN_RE,
@@ -55,6 +56,7 @@ from backend.free.core.intent_vocab import (
     excludes_current_conversation,
     has_long_range_recall_keyword,
     looks_like_numeric_question,
+    only_session_ordinal_recall,
 )
 from backend.log_config import get_logger
 
@@ -230,6 +232,50 @@ def _suppress_proximal_recall_cross_session(
     return ToolJudgement(tool_needed=False, source=result.source)
 
 
+#: 「最初に言った」を進行中の会話の位置とみなすのに要る先行ユーザーターン数。
+#: 1 ターン目 (先行ターン無し) では過去セッションを指しうるので従来どおり撃つ。
+_ORDINAL_RECALL_MIN_PRIOR_USER_TURNS = 2
+
+
+def _suppress_ordinal_recall_within_session(
+    result: ToolJudgement, ctx: GuardContext,
+) -> ToolJudgement:
+    """会話内の位置 (「最初に言った」) だけを根拠にした除外検索を撃たせない。
+
+    :func:`_suppress_proximal_recall_cross_session` と同じ構造。「さっき」が
+    進行中の会話を指すのと同じく、先行ターンのあるセッションでの「最初に私が
+    言った X」は **この会話の最初** を指し、対象は窓の中にある。現在セッションを
+    除外した検索は構造的に当たらず、別会話の記録を「別の (過去の) 会話」として
+    注入するだけになる。
+
+    実測 (2026-09-09 ライブ監査 H-03): 5 ターン目の「最初に私がまとめたいと
+    言ったコミット数は」「最初に私が聞いた契約の種類は」等 4 件で毎回
+    search_history が撃たれ (各 30〜75 秒)、答えは全て窓内から出ていた。
+    「以前」「前回」「昨日話した」のような過去セッションを指す語があれば
+    従来どおり撃つ (:func:`only_session_ordinal_recall`)。
+    """
+    if result.tool_name != "search_history" or not result.tool_needed:
+        return result
+    if not (result.tool_args or {}).get("exclude_session_id"):
+        return result
+    if not only_session_ordinal_recall(ctx.query):
+        return result
+    if excludes_current_conversation(ctx.query):
+        return result
+    prior_user_turns = sum(
+        1 for m in (ctx.conversation or [])
+        if str(m.get("role") or "") == "user"
+    )
+    if prior_user_turns < _ORDINAL_RECALL_MIN_PRIOR_USER_TURNS:
+        return result
+    logger.debug(
+        "Suppressing search_history: ordinal recall refers to the ongoing "
+        "session (%d prior user turns), which is excluded from the search: %s",
+        prior_user_turns, ctx.query[:50],
+    )
+    return ToolJudgement(tool_needed=False, source=result.source)
+
+
 def _suppress_unjustified_cross_session_search(
     result: ToolJudgement, ctx: GuardContext,
 ) -> ToolJudgement:
@@ -266,6 +312,9 @@ def _suppress_unjustified_cross_session_search(
     if has_long_range_recall_keyword(ctx.query):
         return result
     if asks_about_past_conversation(ctx.query):
+        return result
+    if day_scope_recall(ctx.query) is not None:
+        # 「今日 / 昨日話したこと」はその日の他セッションに答えがある。
         return result
     if excludes_current_conversation(ctx.query):
         # 「この会話とは別に」は探す先が外だと明示している。
@@ -865,6 +914,9 @@ GUARD_PIPELINE: tuple[GuardSpec, ...] = (
     GuardSpec("read_file_line_range", _scope_read_file_line_range),
     GuardSpec(
         "proximal_recall_excluded_session", _suppress_proximal_recall_cross_session,
+    ),
+    GuardSpec(
+        "ordinal_recall_excluded_session", _suppress_ordinal_recall_within_session,
     ),
     GuardSpec(
         "computable_recall_excluded_session",

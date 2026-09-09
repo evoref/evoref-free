@@ -866,6 +866,31 @@ class PolicyParamEvolver(JsonStateStore):
                 "cost_observed": cost_observed,
             }
 
+        # 2.7. 天井ガード。fitness が上限 (1.0 = 欠陥ゼロ) に居るとき、摂動は
+        # 改善し得ず劣化だけを起こす。恒真ガード (2.5) は窓が埋まる
+        # DEGENERATE_WINDOW tick までは保留するので、初期化直後の数 tick は
+        # 選択圧ゼロのまま動いてしまう — 実機 (2026-09-09 ライブ監査 B-04、
+        # local/ 全リセット後の初回 Level 1): 経験 25 件で欠陥ゼロ = fitness 1.0
+        # の memory:chat が explore の 1 手で conflict_similarity_threshold を
+        # 0.85 → 0.881 へ動かした。ロールバックの基準 (prev_best) も 1.0 で
+        # 固定されるため、この 1 手は後から「劣化」として検出されない。
+        if fitness >= 1.0 - FITNESS_EPSILON:
+            logger.info(
+                "Policy evolution held (fitness at ceiling, nothing to improve): "
+                "domain=%s, mode=%s, fitness=%.4f",
+                domain, mode, fitness,
+            )
+            self._log_evolution(
+                domain, mode, "hold", fitness, sigma, phase,
+                cost_observed=cost_observed,
+            )
+            return {
+                "action": "hold", "fitness": fitness,
+                "reason": "at_ceiling",
+                "sigma": sigma, "phase": phase,
+                "cost_observed": cost_observed,
+            }
+
         # 3. 連続低下判定 → 自動ロールバック
         prev_best = self._best_fitness.get(key, 0.0)
         rollback_result = self._maybe_rollback(

@@ -343,6 +343,51 @@ _PAST_CONVERSATION_ASK_RE = re.compile(
 )
 
 
+#: 「今日 / 昨日 / 一昨日 + (私が) + 発話動詞の過去形」— **その日の会話** を
+#: 尋ねる形。日の語は単独では暦の語 (「今日は何日ですか」「昨日見た映画」) なので
+#: 履歴参照語には入れず、発話動詞と組で構造として取る。
+#:
+#: 実インシデント (2026-09-09 ライブ監査 H-08): 「今日私が相談した技術的な
+#: 話題を 3 つ挙げてください。」がどの層でも履歴検索にならず、episodic 想起は
+#: 今日と昨日のノートを日付ラベル無しで混在注入したため、「今日の会話履歴には
+#: 技術的な話題が記録されていません」と昨日の話題 3 つを答えた。
+_DAY_SCOPE_RECALL_RE = re.compile(
+    r"(?P<day>今日|本日|昨日|一昨日)(?:は|に|も|の)?[^。！？!?\n]{0,16}?"
+    r"(?:(?:相談|話|聞|言|質問|依頼|頼|尋ね|伝え|教え)(?:を?[しっいん]|ね|え)?"
+    r"(?:た|て|ました|まし)|話題|会話|やり取り)",
+)
+
+_DAY_SCOPE_OFFSETS: dict[str, int] = {
+    "今日": 0, "本日": 0, "昨日": 1, "一昨日": 2,
+}
+
+
+def day_scope_recall(query: str) -> int | None:
+    """その日の会話を尋ねているなら、今日から何日前か (0 / 1 / 2) を返す (純粋関数)。"""
+    m = _DAY_SCOPE_RECALL_RE.search(query or "")
+    if m is None:
+        return None
+    return _DAY_SCOPE_OFFSETS.get(m.group("day"))
+
+
+def history_day_window(days_ago: int, now_local) -> tuple[str, str]:
+    """ローカル日の [開始, 終了] を、履歴索引の ``started_at`` と同じ形
+    (UTC、``+00:00``) で返す (純粋関数)。
+
+    索引側は文字列比較 (``started_at >= date_from``) なので、同じ書式で渡す。
+    """
+    from datetime import datetime, timedelta, timezone
+
+    day = (now_local - timedelta(days=days_ago)).date()
+    start = datetime(day.year, day.month, day.day, tzinfo=now_local.tzinfo)
+    end = start + timedelta(days=1)
+    fmt = "%Y-%m-%dT%H:%M:%S.%f+00:00"
+    return (
+        start.astimezone(timezone.utc).strftime(fmt),
+        end.astimezone(timezone.utc).strftime(fmt),
+    )
+
+
 def asks_about_past_conversation(query: str) -> bool:
     """過去の会話そのものについて尋ねているか (純粋関数)。
 

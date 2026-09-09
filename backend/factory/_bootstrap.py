@@ -180,6 +180,7 @@ def _init_local_dirs(
         policy_source=policy_source,
         policy_activation_min_confidence=min_conf,
         debug_logger=state.debug_logger,
+        config=cfg,
     )
     state.policy_interpreter = policy_interpreter
     logger.info(

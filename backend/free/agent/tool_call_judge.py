@@ -28,7 +28,10 @@ from backend.free.core.intent_vocab import (
     is_practice_advice_query,
     looks_like_numeric_question,
 )
-from backend.free.core.date_math_cue import conversation_has_date_math_cue
+from backend.free.core.date_math_cue import (
+    conversation_has_date_math_cue,
+    last_user_query,
+)
 from backend.free.core.locale_patterns import select_locale_variant
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.safety_patterns import (
@@ -141,9 +144,16 @@ from backend.free.agent.tool_judge_commands import (
     _command_is_readonly_inspection,
     _infer_executable_command,
     _readonly_command_rejected,
+    DateIntentParams,
     command_lacks_date_arithmetic,
-    date_intent_command_from_payload,
+    date_intent_command_from_params,
+    follow_up_excluded_weekdays_from_query,
+    follow_up_holidays_from_query,
+    inherit_date_intent,
+    parse_date_intent,
+    parse_date_intent_exclusions,
     query_has_date_math_cue,
+    resolve_date_intent_target,
     recalled_command_fits_query,
 )
 from backend.free.agent.tool_judge_args import (
@@ -195,6 +205,8 @@ from backend.free.agent.tool_judge_history import (
     _strip_stopword_affixes,
     asks_about_past_conversation,
     asks_about_prior_conversation_entity,
+    day_scope_recall,
+    history_day_window,
 )
 from backend.free.agent import tool_judge_guards as guards
 from backend.free.agent.tool_judge_guards import (
@@ -306,6 +318,10 @@ def _first_quoted_span(query: str) -> str | None:
     return next((s for s in quoted_spans(query) if len(s) >= 2), None)
 
 
+#: 「今日の会話」を日付窓で引くときの件数上限 (1 日のセッション数に足りる数)。
+_HISTORY_DAY_SCOPE_LIMIT = 30
+
+
 class ToolCallJudge:
     """補助タスクによるツール呼び出し判定
 
@@ -348,6 +364,10 @@ class ToolCallJudge:
         self._cartridge_manager = cartridge_manager
         self._learned_patterns = learned_patterns
         self._debug_logger = debug_logger
+        #: セッションごとの直前の日付演算パラメータ (層 5.97 が組んだもの)。
+        #: 条件だけを変える追い質問がこれを継ぐ (B-03)。ターン固有の値では
+        #: なくセッション単位の記憶なので JudgeCall には載せない。上限付き。
+        self._date_intent_memory: dict[str, DateIntentParams] = {}
         self._mem_view = mem_view
         self._embedder = embedder
         self._profile_id = profile_id
@@ -575,6 +595,16 @@ class ToolCallJudge:
         # ``_flag_ungrounded_date_math`` を GUARD_PIPELINE に載せない理由)。
         return guards._flag_ungrounded_date_math(result, call)
 
+    _DATE_INTENT_MEMORY_LIMIT = 64
+
+    def _remember_date_intent(self, session_id: str, params: DateIntentParams) -> None:
+        """セッションの直前の日付演算パラメータを上書き保存する (上限付き)。"""
+        memory = self._date_intent_memory
+        memory.pop(session_id, None)
+        memory[session_id] = params
+        while len(memory) > self._DATE_INTENT_MEMORY_LIMIT:
+            memory.pop(next(iter(memory)))
+
     async def _upgrade_date_command_via_intent(
         self, result: ToolJudgement, call: JudgeCall,
     ) -> ToolJudgement:
@@ -607,17 +637,38 @@ class ToolCallJudge:
         # 分類器が none を返し、日付演算が丸ごと暗算に残った — 2026-09-08 検証)。
         # (b) は executable ツールが mode で使えるときだけ組み立てる。
         tool_name = ""
-        if result.tool_needed:
+        # (c) 分類器が日付演算を ``calculate`` に流した (「11 月 6 日の 12 営業日前」
+        # → ``calculate('2026-11-06 - 12')`` → 構文エラー → 暗算、2026-09-09
+        # ライブ監査 C-02)。四則演算ツールは営業日を数えられないので、手掛かり語
+        # がある限り (b) と同じく演算コマンドへ差し替える。
+        misrouted_to_calculate = (
+            result.tool_needed and result.tool_name == "calculate"
+        )
+        if result.tool_needed and not misrouted_to_calculate:
             if result.tool_name not in _COMMAND_TOOL_NAMES:
                 return result
             command = str((result.tool_args or {}).get("command") or "")
             if not command or not command_lacks_date_arithmetic(command):
                 return result
             tool_name = result.tool_name
+        elif misrouted_to_calculate:
+            tool_name = _executable_tool_for_mode(call.tools_registry, call.mode)
+            if not tool_name:
+                return result
         else:
             # ツール無しの exit は手掛かり語だけでは撃たない (「祝日の由来」で
             # 40 秒の往復を払わない)。数量 (数字 / 漢数字) を伴うときだけ。
-            if not _DATE_INTENT_QUANTITY_RE.search(call.query or ""):
+            # 手掛かり語を直前のユーザー発話から継いだ追い質問は、数量も
+            # そこから継ぐ。「その週の水曜日が休みだとしたら、着手日はどう
+            # なりますか」自身には数字が無く、ここで落ちて暗算に残った
+            # (2026-09-09 ライブ監査 H-06: 答えは偶然合ったが説明の曜日が
+            # 誤り)。直前の「8 営業日前に着手する」が数量を持っている。
+            quantity_source = call.query or ""
+            if not query_has_date_math_cue(quantity_source):
+                quantity_source += " " + last_user_query(
+                    call.conversation, before=call.query or "",
+                )
+            if not _DATE_INTENT_QUANTITY_RE.search(quantity_source):
                 return result
             tool_name = _executable_tool_for_mode(call.tools_registry, call.mode)
             if not tool_name:
@@ -660,18 +711,71 @@ class ToolCallJudge:
         except (TypeError, ValueError):
             # スキーマを強制しない build では非 JSON が返り得る (分類器と同じ救済)。
             payload = extract_json_object(content or "")
-        upgraded = date_intent_command_from_payload(payload, call.query)
+        params = parse_date_intent(payload)
+        # 条件だけを変える追い質問 (自分では手掛かり語を持たない) は、直前の
+        # 演算パラメータを継いで除外条件だけ足す。抽出器に同じ会話を読み直させると
+        # 起点の数え方が振れる (B-03、``inherit_date_intent`` の docstring)。
+        # 同じ追い質問で抽出器が ``kind: none`` を返す回もある (2026-09-09 検証
+        # V02/4) — 除外条件さえ入っていれば直前の演算に継ぐ。
+        previous = self._date_intent_memory.get(call.session_id or "")
+        follow_up = previous is not None and not query_has_date_math_cue(call.query or "")
+        if follow_up and params is None:
+            exclusions = parse_date_intent_exclusions(payload)
+            if exclusions is not None and any(exclusions):
+                params = replace(
+                    previous, holidays=exclusions[0], excluded_weekdays=exclusions[1],
+                )
+        if follow_up:
+            # 「その週の火曜日が休み」のように直前の結果に相対して置く休日は
+            # コード側で解決する (抽出器は日付に直せない — 実測 3/3 で空)。
+            derived = follow_up_holidays_from_query(
+                call.query or "",
+                resolve_date_intent_target(previous, utc_now_dt().astimezone().date()),
+            )
+            derived_weekdays = follow_up_excluded_weekdays_from_query(call.query or "")
+            if derived or derived_weekdays:
+                base = params if params is not None else previous
+                params = replace(
+                    base,
+                    holidays=tuple(sorted(set(base.holidays) | set(derived))),
+                    excluded_weekdays=tuple(sorted(
+                        set(base.excluded_weekdays) | set(derived_weekdays),
+                    )),
+                )
+        if follow_up and params is not None:
+            params = inherit_date_intent(previous, params)
+            logger.info(
+                "date intent inherited the previous turn's parameters "
+                "(kind=%s n=%d count_start_day=%s direction=%s); added "
+                "holidays=%s excluded_weekdays=%s",
+                params.kind, params.n, params.count_start_day, params.direction,
+                [d.isoformat() for d in params.holidays], list(params.excluded_weekdays),
+            )
+        upgraded = (
+            date_intent_command_from_params(params, call.query) if params else ""
+        )
         if not upgraded:
             logger.info(
                 "date intent did not yield a command for %r (payload=%r)",
-                (call.query or "")[:60], str(payload)[:120],
+                (call.query or "")[:60], str(payload)[:240],
             )
             return result
-        logger.info("Date command upgraded via date_intent: %s", upgraded[:120])
+        logger.info(
+            "Date command upgraded via date_intent (payload=%s): %s",
+            str(payload)[:200], upgraded[:120],
+        )
+        if call.session_id:
+            self._remember_date_intent(call.session_id, params)
         args = dict(result.tool_args or {})
         args["command"] = upgraded
-        if result.tool_needed:
+        if result.tool_needed and not misrouted_to_calculate:
             return replace(result, tool_args=args)
+        if misrouted_to_calculate:
+            args = {"command": upgraded}
+            logger.info(
+                "date intent replaced calculate(%r) with a date command",
+                str((result.tool_args or {}).get("expression") or "")[:60],
+            )
         return replace(
             result, tool_needed=True, tool_name=tool_name, tool_args=args,
             source="rule",
@@ -1015,9 +1119,15 @@ class ToolCallJudge:
         # 捏造する** ことが実測で出た (2026-08-30 ライブ監査 T06: 10 ターン
         # すべてが no_match_in_any_layer で、「いつ、どんな話をしましたか。」に
         # 「2025年6月15日（日）の午後4時20分頃に」と断定した。実際は同日 20 分前)。
+        # 「今日 / 昨日 + 発話動詞」は **その日の会話** を尋ねる形。日付窓で
+        # 引く (語彙では拾えない — 「今日私が相談した」は主語が割り込む)。
+        # 実インシデント (2026-09-09 ライブ監査 H-08): 「今日私が相談した
+        # 技術的な話題を 3 つ挙げてください」がどの層でも検索にならず、
+        # 「今日の会話履歴には記録されていません」と昨日の話題を答えた。
+        day_scope = day_scope_recall(query)
         if (
             tools_registry.has("search_history")
-            and asks_about_past_conversation(query)
+            and (asks_about_past_conversation(query) or day_scope is not None)
         ):
             search_query = _reduce_ordered_history_query(query)
             forced_result = ToolJudgement(
@@ -1027,6 +1137,8 @@ class ToolCallJudge:
                 source="rule",
             )
             self._maybe_scope_session_search(forced_result, query, session_id)
+            if day_scope is not None:
+                self._scope_day_window(forced_result, day_scope)
             forced_result = self._finalize(forced_result, call=call)
             # 「近接リコール語だけ + 現在セッション除外」の組合せは
             # _finalize の proximal_recall_excluded_session ガードが
@@ -1794,6 +1906,33 @@ class ToolCallJudge:
             result.tool_args = {}
         result.tool_args["url"] = recalled
         logger.debug("URL recall: matched url=%s for query=%s", recalled, query[:50])
+
+    def _scope_day_window(self, result: "ToolJudgement", days_ago: int) -> None:
+        """「今日 / 昨日の会話」を尋ねる検索を **その日** に絞る (in-place)。
+
+        キーワードは外す — 「今日相談した技術的な話題」の語で索引を引くと
+        当たらず、その日のセッション一覧 (各セッションの最初の発言 + 相対日
+        ラベル) が答えそのものになる。件数上限は 1 日分に足りる数へ広げる。
+        """
+        if result.tool_name != "search_history":
+            return
+        from backend.free.agent.tools.builtin import _resolve_history_tz
+        from backend.config import get_config
+
+        tz = _resolve_history_tz(get_config)
+        date_from, date_to = history_day_window(days_ago, utc_now_dt().astimezone(tz))
+        if result.tool_args is None:
+            result.tool_args = {}
+        result.tool_args.update({
+            "query": "",
+            "date_from": date_from,
+            "date_to": date_to,
+            "limit": _HISTORY_DAY_SCOPE_LIMIT,
+        })
+        logger.debug(
+            "search_history scoped to a day window (%d day(s) ago): %s..%s",
+            days_ago, date_from[:10], date_to[:10],
+        )
 
     def _maybe_scope_session_search(
         self, result: "ToolJudgement", query: str, session_id: str,

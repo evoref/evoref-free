@@ -774,6 +774,28 @@ def _repeats_first_invocation(
     return not command or command == (first_command or "").strip()
 
 
+def _regresses_to_now_only(
+    judgement: "ToolJudgement", first_tool: str, first_command: str,
+) -> bool:
+    """2 手目が「日付演算済みの 1 手目」を **現在日時だけ** に戻すか (純粋関数)。
+
+    1 手目が ``date_intent`` で組んだ演算コマンド (目標日まで出ている) の後に、
+    2 手目の判定が規則カスケードの now-only コマンドへ落ちると、コマンド文字列が
+    違うので「同じ呼び出し」には当たらず実行される。now-only の結果には
+    「質問の日付計算はツールで検証していない」の注記が付くため、正しい 1 手目の
+    出力と矛盾する指示が同じ user メッセージに並び、モデルは後者に従って
+    「ツールで検証していない」と述べ曜日も暗算で誤った (2026-09-09 ライブ監査
+    B-02: 9/25 (金) を「木曜日」)。1 手目が演算済みなら now-only への後退は
+    情報を増やさないので撃たない。
+    """
+    if first_tool not in _COMMAND_TOOLS or judgement.tool_name not in _COMMAND_TOOLS:
+        return False
+    if command_lacks_date_arithmetic(first_command):
+        return False
+    command = str((judgement.tool_args or {}).get("command") or "")
+    return command_lacks_date_arithmetic(command)
+
+
 _COMMAND_RESULT_GUIDANCE = (
     "上記の ## ツール実行結果 は、システムが実際に実行したコマンドとその標準出力である。"
     "出力はコマンドが計算し終えた**結果そのもの**であり、途中経過や基準値ではない。"
@@ -2455,6 +2477,12 @@ class DeliberativeAgent:
             )
             return None, None
         if not judgement.tool_args:
+            return None, None
+        if _regresses_to_now_only(judgement, first_tool, first_command):
+            logger.info(
+                "Follow-up hop skipped: the first command already did the date "
+                "arithmetic; a now-only command would only contradict it",
+            )
             return None, None
 
         logger.info(

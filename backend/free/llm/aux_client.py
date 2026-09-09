@@ -28,6 +28,7 @@ json_schema が解決できる purpose は文法制約経路 (``generate_constra
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import time
 from collections import deque
@@ -40,6 +41,8 @@ from backend.aux_telemetry import record_aux_failure
 from backend.exceptions import LLMTimeoutError
 from backend.free.llm.generation_gate import (
     activity_token,
+    request_token,
+    wait_for_chat_request,
     wait_for_idle,
     was_contended_since,
 )
@@ -57,6 +60,10 @@ if TYPE_CHECKING:
     from backend.free.llm.local_client import LocalClient
 
 logger = get_logger("llm.aux_client")
+
+
+class _PreemptedByChat(Exception):
+    """背景生成がチャット要求の到着で打ち切られた (内部シグナル)。"""
 
 
 class AuxTimeoutError(TimeoutError):
@@ -398,6 +405,41 @@ class AuxClient:
             return override
         return purpose in DEFERRABLE_AUX_PURPOSES
 
+    @staticmethod
+    async def _run_preemptible(call, purpose: str) -> dict:
+        """背景の 1 生成を、チャット要求の到着で打ち切れる形で走らせる。
+
+        スロットを分けても GPU 演算は分かれないので、dispatch 後に届いた
+        チャットは背景の生成が終わるまで (実測で最長 260 秒) 分類器 / 日付意図の
+        抽出 (40 秒予算) と初トークン (116 秒予算) がタイムアウトして誤答・
+        空応答になった (2026-09-09 検証 V04/2-4, V05/4-5)。要求の到着で HTTP
+        要求ごと打ち切る (llama-server は切断でそのスロットの生成を止める)。
+        """
+        since = request_token()
+        gen = asyncio.ensure_future(call())
+        waiter = asyncio.ensure_future(wait_for_chat_request(since))
+        try:
+            done, _pending = await asyncio.wait(
+                {gen, waiter}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if gen in done:
+                return gen.result()
+            if waiter.done() and waiter.exception() is not None:
+                # 待ち手側の事故 (ループ不一致等) は到着ではない。生成を待ち切る。
+                logger.warning(
+                    "chat-request waiter failed (%r); running purpose=%s to completion",
+                    waiter.exception(), purpose or "<unspecified>",
+                )
+                return await gen
+            gen.cancel()
+            with contextlib.suppress(BaseException):
+                await gen
+            raise _PreemptedByChat(purpose)
+        finally:
+            for task in (gen, waiter):
+                if not task.done():
+                    task.cancel()
+
     def _lock_for(self, slot: int) -> asyncio.Lock:
         lock = self._slot_locks.get(slot)
         if lock is None:
@@ -516,6 +558,7 @@ class AuxClient:
             # 他の背景タスクまで道連れに直列化される。
             await wait_for_idle(_CHAT_YIELD_MAX_WAIT_SEC, purpose=purpose)
         gate_token = activity_token()
+        preemptible = self._is_deferrable(purpose, deferrable)
         async with self._lock_for(slot):
             started = time.monotonic()
             queue_wait = started - queued_at
@@ -525,7 +568,8 @@ class AuxClient:
                     queue_wait, slot, purpose or "<unspecified>",
                 )
             meta: dict = {}
-            try:
+
+            async def _call() -> dict:
                 if resolved is not None:
                     content = await self.local.generate_constrained(
                         messages,
@@ -536,26 +580,54 @@ class AuxClient:
                         timeout=effective_timeout,
                         result_meta=meta,
                     )
-                    result = {"choices": [{
+                    return {"choices": [{
                         "message": {"content": content or ""},
                         "finish_reason": meta.get("finish_reason"),
                     }]}
-                else:
-                    result = await self.local.generate(
-                        messages=messages,
-                        stream=False,
-                        temperature=0.3 if temperature is None else temperature,
-                        max_tokens=max_tokens,
-                        id_slot=slot,
-                        request_timeout=effective_timeout,
+                out = await self.local.generate(
+                    messages=messages,
+                    stream=False,
+                    temperature=0.3 if temperature is None else temperature,
+                    max_tokens=max_tokens,
+                    id_slot=slot,
+                    request_timeout=effective_timeout,
+                )
+                if not isinstance(out, dict):
+                    # stream=False なので dict のはずだが、差し替え実装の事故は握り潰さない
+                    logger.warning(
+                        "Base generate returned %s for purpose=%s; treating as empty",
+                        type(out).__name__, purpose or "<unspecified>",
                     )
-                    if not isinstance(result, dict):
-                        # stream=False なので dict のはずだが、差し替え実装の事故は握り潰さない
-                        logger.warning(
-                            "Base generate returned %s for purpose=%s; treating as empty",
-                            type(result).__name__, purpose or "<unspecified>",
-                        )
-                        result = {"choices": [{"message": {"content": ""}}]}
+                    out = {"choices": [{"message": {"content": ""}}]}
+                return out
+
+            try:
+                if preemptible:
+                    result = await self._run_preemptible(_call, purpose)
+                else:
+                    result = await _call()
+            except _PreemptedByChat:
+                # チャット要求が届いたので生成を打ち切った。予算不足ではなく
+                # 一過性 (contended) として返し、呼出側は次サイクルで再試行する。
+                record_aux_failure(purpose, "preempted_by_chat")
+                self._log_request(
+                    messages, {}, time.monotonic() - started,
+                    purpose=purpose, effective_timeout=effective_timeout,
+                    constrained=resolved is not None, finish_reason="preempted",
+                    queue_wait=queue_wait, slot=slot,
+                )
+                logger.info(
+                    "Aux generation preempted by a chat request after %.1fs "
+                    "(purpose=%s); it will be retried in a later cycle",
+                    time.monotonic() - started, purpose or "<unspecified>",
+                )
+                raise AuxTimeoutError(
+                    f"Aux generation preempted by a chat request "
+                    f"(purpose={purpose or '<unspecified>'})",
+                    purpose=purpose or None,
+                    contended=True,
+                    timeout_sec=effective_timeout,
+                ) from None
             except (httpx.TimeoutException, LLMTimeoutError, TimeoutError) as e:
                 # 競合由来の遅さを較正へ食わせない。チャットと重なると decode は
                 # 実測で 2 倍以上遅くなるので、その所要時間を「この purpose に

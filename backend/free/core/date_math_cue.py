@@ -60,17 +60,30 @@ def query_inherits_date_math(query: str, previous_user_query: str) -> bool:
     return bool(_ASKS_FOR_DATE_RE.search(query or ""))
 
 
-def last_user_query(conversation: list[dict] | None) -> str:
-    """会話履歴の末尾から **直前のユーザー発話** を返す (無ければ空)。"""
+def last_user_query(conversation: list[dict] | None, *, before: str = "") -> str:
+    """会話履歴の末尾から **直前のユーザー発話** を返す (無ければ空)。
+
+    ``before`` に今回の発話を渡すと、履歴の末尾がその発話自身であれば飛ばす。
+    チャット API は今回の user ターンを積んでから履歴を取るので、末尾は
+    今回の発話になっている — それを「直前」と読むと継承は決して成立しない
+    (2026-09-09 検証 V05/5, V06/2: 「その週の月曜日が休みだとしたら、着手日は
+    どうなりますか」が層 5.97 に一度も届かず暗算に落ちた)。
+    """
+    skipped_self = False
     for msg in reversed(conversation or []):
-        if str(msg.get("role") or "") == "user":
-            return str(msg.get("content") or "")
+        if str(msg.get("role") or "") != "user":
+            continue
+        content = str(msg.get("content") or "")
+        if before and not skipped_self and content.strip() == before.strip():
+            skipped_self = True
+            continue
+        return content
     return ""
 
 
 def conversation_has_date_math_cue(query: str, conversation: list[dict] | None) -> bool:
     """今回の発話、または継いだ直前のユーザー発話に日付演算の手掛かりがあるか。"""
-    return query_inherits_date_math(query, last_user_query(conversation))
+    return query_inherits_date_math(query, last_user_query(conversation, before=query))
 
 
 __all__ = [

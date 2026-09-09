@@ -360,9 +360,60 @@ def build_corrected_pairs(
     return list(pairs.values())
 
 
+def build_demoted_pairs(experiences: list[dict], mode: str | None = None) -> list[CorrectedPair]:
+    """検証で **却下 / 格下げ** された訂正候補が組んでいたはずのペアを返す (純粋関数)。
+
+    :func:`build_corrected_pairs` の裏返し。``correction_candidate`` があり、
+    検証済み (``correction_verdict`` が立っている) なのに ``user_correction`` が
+    無いエントリ — 検証器が最初から却下したもの、または
+    :func:`~backend.free.learning.correction_verifier.recheck_promoted` が後から
+    候補へ戻したもの — について、同じ (元の問い, 訂正後の回答) を組む。
+
+    用途は **取り消し**。few-shot プールと eval_core は昇格時にペアを受け取る
+    だけで、格下げを伝える経路が無かった。門を足しても既存の偽陽性
+    (100 → 100 m) が fitness 1.0 の手本と評価ケースに残り続けた (2026-09-09
+    ライブ監査 P-1: recheck は 11:31 に格下げしたが、どちらにも残ったまま)。
+
+    受け皿側の内容ゲート (``response_honors_correction`` 等) は掛けない —
+    取り消すべきものを取りこぼす方が害が大きい。
+    """
+    pairs: dict[str, CorrectedPair] = {}
+    scoped = [
+        e for e in experiences
+        if mode is None or e.get("mode") == mode
+    ]
+    for i, exp in enumerate(scoped):
+        signals = exp.get("signals") or {}
+        if signals.get("user_correction"):
+            continue
+        candidate = signals.get("correction_candidate")
+        if not candidate or not signals.get("correction_verdict"):
+            continue
+        prev = resolve_corrected_turn(scoped, i)
+        if prev is None:
+            continue
+        query = str(prev.get("query") or "").strip()
+        fixed = strip_correction_preamble(
+            str(exp.get("response_full") or exp.get("response_summary") or ""),
+        )
+        if not (query and fixed):
+            continue
+        pair = CorrectedPair(
+            query=query,
+            response=fixed,
+            correction=str(candidate).strip(),
+            mode=str(exp.get("mode") or "chat"),
+            timestamp=str(exp.get("timestamp") or ""),
+            correct_value=str(signals.get("correction_correct_value") or "").strip(),
+        )
+        pairs[pair.pair_id] = pair
+    return list(pairs.values())
+
+
 __all__ = [
     "CorrectedPair",
     "build_corrected_pairs",
+    "build_demoted_pairs",
     "depends_on_context",
     "expected_keywords_from_correction",
     "refers_to_previous_turn",

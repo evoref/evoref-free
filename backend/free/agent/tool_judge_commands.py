@@ -714,6 +714,10 @@ DATE_INTENT_SYSTEM = (
     "- excluded_weekdays には、質問が特定の曜日を作業日・営業日から除外すると"
     "言っているとき (例: 「毎週水曜日は定例会議で作業できない」) だけ、その曜日を"
     "0=月曜〜6=日曜の数字で入れること。言及が無ければ空配列。\n"
+    "- 休日や除外条件だけを付け足す追い質問 (「その週の火曜日が休みだとしたら」"
+    "「その日が祝日なら」) は none ではなく、直前の演算と同じ kind・起点・日数・"
+    "向き・起点の数え方を返し、追加の休日を holidays に (直前の回答の週から日付を"
+    "求めて YYYY-MM-DD で) 入れること。\n"
     "- 使わない項目は start/end に today、n に 0、holidays / excluded_weekdays に"
     "空配列、direction に forward を入れること。"
 )
@@ -743,6 +747,11 @@ DATE_INTENT_SYSTEM_EN = (
     "- excluded_weekdays: only when the question says a specific weekday is not a "
     "working/business day (e.g. \"Wednesdays are a standing meeting, no work "
     "then\"), list it as 0=Monday .. 6=Sunday. Empty if not mentioned.\n"
+    "- A follow-up that only adds a holiday or an exclusion (\"what if that "
+    "Tuesday is a holiday\") is not none: return the same kind, start, n, "
+    "direction and counting as the previous computation, and add the extra "
+    "holiday to holidays as YYYY-MM-DD (derive it from the week of the previous "
+    "answer).\n"
     "- For unused fields use today for start/end, 0 for n, an empty list for "
     "holidays and excluded_weekdays, and forward for direction."
 )
@@ -823,6 +832,41 @@ def parse_date_intent(payload: object) -> DateIntentParams | None:
     n = raw_n if isinstance(raw_n, int) and not isinstance(raw_n, bool) else 0
     if kind in ("business_days_from", "days_from") and not 1 <= n <= _MAX_DATE_INTENT_N:
         return None
+    exclusions = parse_date_intent_exclusions(payload)
+    if exclusions is None:
+        return None
+    holidays, excluded_weekdays = exclusions
+    skip_weekends = bool(payload.get("skip_weekends"))
+    if kind == "business_days_from":
+        # 種別自体が「営業日で数える」なので、モデルが false を返しても従う
+        # 理由が無い (false なら days_from と区別が付かない)。
+        skip_weekends = True
+    raw_direction = payload.get("direction")
+    direction = raw_direction if raw_direction in ("forward", "backward") else "forward"
+    return DateIntentParams(
+        kind=kind,
+        start=start if isinstance(start, datetime.date) else None,
+        end=end if isinstance(end, datetime.date) else None,
+        n=n,
+        skip_weekends=skip_weekends,
+        holidays=holidays,
+        count_start_day=bool(payload.get("count_start_day")),
+        direction=direction,
+        excluded_weekdays=excluded_weekdays,
+    )
+
+
+def parse_date_intent_exclusions(
+    payload: object,
+) -> tuple[tuple[datetime.date, ...], tuple[int, ...]] | None:
+    """``date_intent`` 応答の除外条件 (``holidays`` / ``excluded_weekdays``) だけを検証する。
+
+    ``kind`` に関わらず読める — 条件だけを足す追い質問で抽出器が ``kind: none`` を
+    返しても、除外条件が入っていれば直前の演算に継げる (B-03 の続き)。
+    形式違反は ``None``。
+    """
+    if not isinstance(payload, dict):
+        return None
     raw_holidays = payload.get("holidays")
     holidays: list[datetime.date] = []
     if raw_holidays is not None:
@@ -835,13 +879,6 @@ def parse_date_intent(payload: object) -> DateIntentParams | None:
             if not isinstance(parsed, datetime.date):
                 return None
             holidays.append(parsed)
-    skip_weekends = bool(payload.get("skip_weekends"))
-    if kind == "business_days_from":
-        # 種別自体が「営業日で数える」なので、モデルが false を返しても従う
-        # 理由が無い (false なら days_from と区別が付かない)。
-        skip_weekends = True
-    raw_direction = payload.get("direction")
-    direction = raw_direction if raw_direction in ("forward", "backward") else "forward"
     raw_excluded = payload.get("excluded_weekdays")
     excluded_weekdays: list[int] = []
     if raw_excluded is not None:
@@ -857,17 +894,7 @@ def parse_date_intent(payload: object) -> DateIntentParams | None:
             ):
                 return None
             excluded_weekdays.append(item)
-    return DateIntentParams(
-        kind=kind,
-        start=start if isinstance(start, datetime.date) else None,
-        end=end if isinstance(end, datetime.date) else None,
-        n=n,
-        skip_weekends=skip_weekends,
-        holidays=tuple(holidays),
-        count_start_day=bool(payload.get("count_start_day")),
-        direction=direction,
-        excluded_weekdays=tuple(sorted(set(excluded_weekdays))),
-    )
+    return tuple(holidays), tuple(sorted(set(excluded_weekdays)))
 
 
 def _business_day_candidates(
@@ -1075,6 +1102,122 @@ def build_date_intent_command(params: DateIntentParams, query: str = "") -> str:
     return ""
 
 
+def inherit_date_intent(
+    previous: DateIntentParams, current: DateIntentParams,
+) -> DateIntentParams:
+    """条件だけを変える追い質問で、直前の演算パラメータを **継ぐ** (純粋関数)。
+
+    「その週の火曜日が休みだとしたら、着手日はどうなりますか」は自分では
+    起点・日数・向き・起点の数え方を言わない。抽出器はそれらを直前の会話から
+    読み直すが、同じ会話を 2 度読んでも同じ値になる保証は無い — 実機では
+    直前の「6 営業日前に着手」で ``count_start_day=False`` (10/12) だったものが
+    追い質問で ``True`` に振れ、休日 10/13 を除いても 10/12 のまま「変わり
+    ません」と答えた (正 10/9、2026-09-09 ライブ監査 B-03)。
+
+    追い質問が持ち込めるのは **除外条件だけ** (祝日 / 除外曜日) なので、
+    それ以外は直前の値を採り、除外条件は和を取る。継ぐかどうか (今回の発話が
+    手掛かり語を持たない追い質問か) は呼出側が決める。
+    """
+    return DateIntentParams(
+        kind=previous.kind,
+        start=previous.start,
+        end=previous.end,
+        n=previous.n,
+        skip_weekends=previous.skip_weekends or current.skip_weekends,
+        holidays=tuple(sorted(set(previous.holidays) | set(current.holidays))),
+        count_start_day=previous.count_start_day,
+        direction=previous.direction,
+        excluded_weekdays=tuple(sorted(
+            set(previous.excluded_weekdays) | set(current.excluded_weekdays),
+        )),
+    )
+
+
+#: 追い質問が直前の結果に対して相対に置く休日。「その週の火曜日が休み」は
+#: 直前の目標日と同じ週の火曜日、「その日が祝日」は目標日そのもの。曜日名は
+#: 閉じた集合なので語形の網ではなく **構造の解決** として持つ (抽出器は
+#: 「直前の回答の週から日付を求めよ」と指示しても 3 回中 3 回 ``holidays`` を
+#: 空で返した — 2026-09-09 ライブ監査 B-03 / 検証 V02/4・V03/2)。
+_FOLLOW_UP_WEEK_HOLIDAY_RE = re.compile(
+    r"(?:その|同じ|当該)週の([月火水木金土日])曜"
+)
+_FOLLOW_UP_SAME_DAY_HOLIDAY_RE = re.compile(
+    r"(?:その日|当日|着手日|納品日|完了日|目標日)(?:自体|そのもの)?が(?:休み|休日|祝日|休業)"
+)
+_WEEKDAY_INDEX = {c: i for i, c in enumerate("月火水木金土日")}
+
+
+def resolve_date_intent_target(
+    params: DateIntentParams, today: datetime.date,
+) -> datetime.date | None:
+    """検証済みパラメータの **目標日** をコード側で求める (純粋関数)。
+
+    生成コマンドと同じ数え方 (:func:`business_day_target`)。``days_between`` /
+    ``weekday_of`` は目標日を持たないので ``None``。
+    """
+    start = params.start or today
+    if params.kind == "business_days_from":
+        return business_day_target(
+            start, params.n, skip_weekends=params.skip_weekends,
+            holidays=params.holidays, count_start_day=params.count_start_day,
+            excluded_weekdays=params.excluded_weekdays, direction=params.direction,
+        )
+    if params.kind == "days_from":
+        step = -1 if params.direction == "backward" else 1
+        return start + datetime.timedelta(days=step * params.n)
+    return None
+
+
+#: 「毎週水曜日は作業できない」— 曜日の除外。曜日名は閉じた集合。
+_FOLLOW_UP_WEEKDAY_EXCLUSION_RE = re.compile(
+    r"毎週([月火水木金土日])曜"
+)
+
+
+def follow_up_excluded_weekdays_from_query(query: str) -> tuple[int, ...]:
+    """追い質問が除外する曜日 (0=月曜〜6=日曜) を解決する (純粋関数)。
+
+    「毎週水曜日は編集会議で作業できないとすると」→ ``(2,)``。抽出器は同じ
+    追い質問で ``kind: none`` を返す回がある (2026-09-09 ライブ監査 C-02 の
+    続き) ので、除外曜日もコード側で確定させる。
+    """
+    if not query:
+        return ()
+    return tuple(sorted({
+        _WEEKDAY_INDEX[m.group(1)]
+        for m in _FOLLOW_UP_WEEKDAY_EXCLUSION_RE.finditer(query)
+    }))
+
+
+def follow_up_holidays_from_query(
+    query: str, previous_target: datetime.date | None,
+) -> tuple[datetime.date, ...]:
+    """追い質問が直前の目標日に相対して置く休日を解決する (純粋関数)。
+
+    「その週の火曜日が休みだとしたら」→ 目標日と同じ週 (月曜始まり) の火曜日。
+    「その日が祝日なら」→ 目標日。解決できなければ空。
+    """
+    if previous_target is None or not query:
+        return ()
+    found: list[datetime.date] = []
+    for m in _FOLLOW_UP_WEEK_HOLIDAY_RE.finditer(query):
+        monday = previous_target - datetime.timedelta(days=previous_target.weekday())
+        found.append(monday + datetime.timedelta(days=_WEEKDAY_INDEX[m.group(1)]))
+    if _FOLLOW_UP_SAME_DAY_HOLIDAY_RE.search(query):
+        found.append(previous_target)
+    return tuple(sorted(set(found)))
+
+
+def date_intent_command_from_params(params: DateIntentParams, query: str = "") -> str:
+    """検証済みパラメータからコマンドを組む (readonly 検査込み、純粋関数)。"""
+    command = build_date_intent_command(params, query)
+    if not command:
+        return ""
+    if _readonly_command_rejected("run_command_readonly", command):
+        return ""
+    return command
+
+
 def date_intent_command_from_payload(payload: object, query: str = "") -> str:
     """``date_intent`` の生応答からコマンドを組む (検証込み、純粋関数)。
 
@@ -1084,12 +1227,7 @@ def date_intent_command_from_payload(payload: object, query: str = "") -> str:
     params = parse_date_intent(payload)
     if params is None:
         return ""
-    command = build_date_intent_command(params, query)
-    if not command:
-        return ""
-    if _readonly_command_rejected("run_command_readonly", command):
-        return ""
-    return command
+    return date_intent_command_from_params(params, query)
 
 
 # Python 実行で正確に答えられるシステム情報クエリのコマンドマッピング

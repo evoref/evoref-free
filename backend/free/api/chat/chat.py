@@ -92,6 +92,7 @@ from backend.free.generation.content_detector import detect_content_type
 from backend.free.generation.direct_codegen import generate_single_file
 from backend.free.generation.models import ContentType
 from backend.free.agent.meta_cognitive_tasks import EditorArtifact
+from backend.free.llm.generation_gate import chat_request_started
 from backend.log_config import get_logger
 from backend.trace_context import (
     generate_trace_id,
@@ -1634,6 +1635,10 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
 
     if state.sleep_scheduler:
         state.sleep_scheduler.on_user_input()
+    # 背景 aux の実行中の生成へ「チャット要求が届いた」を伝える (打ち切り)。
+    # 生成の開始 (gate_stream) より前の分類器 / 日付意図の抽出から GPU を
+    # 要するので、要求の到着で知らせる (generation_gate の docstring)。
+    chat_request_started()
 
     history, session_id = await prepare_memory_context(req, state)
     file_contexts = convert_file_contexts(req)

@@ -174,8 +174,29 @@ _HISTORY_KEYWORD_DISTANCE: tuple[tuple[str, str], ...] = (
     ("前に伝え", "long_range"),
     ("前に教え", "long_range"),
     ("以前", "long_range"),
-    ("先週", "long_range"),
-    ("先月", "long_range"),
+    # 「先週」「先月」単独は暦の期間を指す日常語で、「昨日」と同じ罠。
+    # 実インシデント (2026-09-09 ライブ監査 H-02): 「先月の電気使用量が
+    # 420 kWh で…」「先月の電気使用量を数値だけで答えてください」の 3 ターンで
+    # search_history が強制発火し、想起 3 文字の回答に 70 秒掛かった
+    # (答え自体は会話窓から出ている)。発話動詞を伴う形だけを採る。
+    ("先週言", "long_range"),
+    ("先週話", "long_range"),
+    ("先週聞", "long_range"),
+    ("先週伝え", "long_range"),
+    ("先週教え", "long_range"),
+    ("先週質問", "long_range"),
+    ("先週相談", "long_range"),
+    ("先週の会話", "long_range"),
+    ("先週のやり取り", "long_range"),
+    ("先月言", "long_range"),
+    ("先月話", "long_range"),
+    ("先月聞", "long_range"),
+    ("先月伝え", "long_range"),
+    ("先月教え", "long_range"),
+    ("先月質問", "long_range"),
+    ("先月相談", "long_range"),
+    ("先月の会話", "long_range"),
+    ("先月のやり取り", "long_range"),
     ("この間", "long_range"),
     ("前回", "long_range"),
     ("前の会話", "long_range"),
@@ -204,17 +225,26 @@ _HISTORY_KEYWORD_DISTANCE: tuple[tuple[str, str], ...] = (
     ("先ほど", "proximal"),
     # 「一番最初 / 一番最後」は会話の順序を指す複合語で、日常文には出にくい。
     # 単独の「最初に」と違って誤発火の余地がほぼ無いので、動詞を問わず採る。
-    ("一番最初", "long_range"),
-    ("一番最後", "long_range"),
-    ("最初に言", "long_range"),
-    ("最初に話", "long_range"),
-    ("最初に聞", "long_range"),
-    ("最初に送", "long_range"),
-    ("最初に頼", "long_range"),
-    ("最初に依頼", "long_range"),
-    ("最初に質問", "long_range"),
-    ("最初に読ま", "long_range"),
-    ("最初に教え", "long_range"),
+    #
+    # 距離は ``session_ordinal`` — **会話の中の位置** を指す語で、進行中の
+    # セッションに複数ターンがあれば、その対象は窓の中にある。過去セッションを
+    # 指す ``long_range`` (以前 / 前回 / 昨日話) とは違い、現在セッションを
+    # 除外した検索は構造的に当たらず、別会話の記録を「別の (過去の) 会話」として
+    # 注入するだけになる (2026-09-09 ライブ監査 H-03: 5 ターン目の
+    # 「最初に私が言った X は」4 件で毎回 search_history を撃ち、各 30〜75 秒。
+    # 答えは全て窓内から出ていた)。セッションの 1 ターン目 (先行ターンが無い)
+    # では従来どおり過去セッションを探す。
+    ("一番最初", "session_ordinal"),
+    ("一番最後", "session_ordinal"),
+    ("最初に言", "session_ordinal"),
+    ("最初に話", "session_ordinal"),
+    ("最初に聞", "session_ordinal"),
+    ("最初に送", "session_ordinal"),
+    ("最初に頼", "session_ordinal"),
+    ("最初に依頼", "session_ordinal"),
+    ("最初に質問", "session_ordinal"),
+    ("最初に読ま", "session_ordinal"),
+    ("最初に教え", "session_ordinal"),
     # 「覚えて」単独は「前に」と同じ部分文字列の罠。**保存指示**の
     # 「覚えておいて(ください)」「覚えといて」にも当たってしまう。実インシデント
     # (2026-08-12 ライブ監査 ターン3): 「私の名前は小川博之です。覚えておいて
@@ -252,8 +282,8 @@ _HISTORY_KEYWORD_DISTANCE_EN: tuple[tuple[str, str], ...] = (
     ("just now", "proximal"),
     ("a moment ago", "proximal"),
     ("a while back", "long_range"),
-    ("at first", "long_range"),
-    ("in the beginning", "long_range"),
+    ("at first", "session_ordinal"),
+    ("in the beginning", "session_ordinal"),
     ("past conversation", "long_range"),
     ("previous conversation", "long_range"),
     ("conversation history", "long_range"),
@@ -278,7 +308,18 @@ PROXIMAL_RECALL_KEYWORDS: frozenset[str] = frozenset(
 LONG_RANGE_RECALL_KEYWORDS: frozenset[str] = frozenset(
     kw
     for kw, distance in (*_HISTORY_KEYWORD_DISTANCE, *_HISTORY_KEYWORD_DISTANCE_EN)
-    if distance == "long_range"
+    if distance in ("long_range", "session_ordinal")
+)
+
+#: 会話の中の **位置** を指す語 (「最初に言った」「一番最初」)。
+#: :data:`LONG_RANGE_RECALL_KEYWORDS` にも含める (先行ターンの無い新セッション
+#: では過去セッションを指すので、検索の根拠にはなる) が、進行中のセッションに
+#: 先行ターンがあれば対象は窓の中にある
+#: (``tool_judge_guards._suppress_ordinal_recall_within_session``)。
+SESSION_ORDINAL_RECALL_KEYWORDS: frozenset[str] = frozenset(
+    kw
+    for kw, distance in (*_HISTORY_KEYWORD_DISTANCE, *_HISTORY_KEYWORD_DISTANCE_EN)
+    if distance == "session_ordinal"
 )
 
 
@@ -305,6 +346,34 @@ _LONG_RANGE_RECALL_KEYWORD_RE = _keyword_union(LONG_RANGE_RECALL_KEYWORDS)
 def has_long_range_recall_keyword(query: str) -> bool:
     """過去のセッションを指す語を含むか (純粋関数)。"""
     return bool(_LONG_RANGE_RECALL_KEYWORD_RE.search(query or ""))
+
+
+#: 会話の中の位置を指す言い回し。発火 (履歴検索を **撃つ** 根拠) には使わず、
+#: 撃つと決まった検索を **絞る** 側だけで使うので、単独の「最初に」を含めても
+#: 誤爆の余地は無い (「最初に私が聞いた営業日数は」は ``最初に聞`` に当たらない
+#: — 主語が割り込む形が実データの大半だった)。
+_SESSION_ORDINAL_CUE_RE = re.compile(
+    r"一番最初|一番最後|最初に|最後に"
+    r"|(?:最初|最後|冒頭)の(?:質問|問い|発言|依頼|メッセージ|お願い|相談|話題)"
+    r"|[0-9０-９一二三四五六七八九十]+\s*(?:番目|つ目)の(?:質問|問い|発言|依頼|メッセージ)"
+    r"|(?<![A-Za-z])(?:at first|in the beginning|the (?:first|last) (?:question|message|thing|request))(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_TRUE_LONG_RANGE_RECALL_KEYWORD_RE = _keyword_union(
+    LONG_RANGE_RECALL_KEYWORDS - SESSION_ORDINAL_RECALL_KEYWORDS,
+)
+
+
+def only_session_ordinal_recall(query: str) -> bool:
+    """過去を指す手掛かりが **会話内の位置** (「最初に言った」) だけか (純粋関数)。
+
+    「以前」「前回」「昨日話した」のような過去セッションを指す語が 1 つでも
+    あれば False。
+    """
+    text = query or ""
+    if not _SESSION_ORDINAL_CUE_RE.search(text):
+        return False
+    return not _TRUE_LONG_RANGE_RECALL_KEYWORD_RE.search(text)
 
 
 #: 「この会話は **別として**」— 現在の会話を明示的に脇へ置く言い回し。
@@ -689,11 +758,18 @@ WEB_REFERENCE_RE = re.compile(
     re.IGNORECASE,
 )
 
-#: 明示 URL リテラル (URL / http(s)://)。router の ``TOOL_PATTERNS`` はこちらを
-#: 使う — ``WEB_REFERENCE_RE`` の一般語 (サイト / ページ / 記事) まで含めると
-#: 知識質問が meta_cognitive へ振られる (意図的分岐)。
+#: 明示 URL リテラル (``http(s)://`` / ``www.``)。router の ``TOOL_PATTERNS`` は
+#: こちらを使う — ``WEB_REFERENCE_RE`` の一般語 (サイト / ページ / 記事) まで
+#: 含めると知識質問が meta_cognitive へ振られる (意図的分岐)。
+#:
+#: 語としての ``URL`` は含めない。「失敗した URL だけをまとめて返すには」の
+#: ような **URL を扱うコードの相談** が ``tool_patterns`` で meta_cognitive
+#: (非ストリーム + プレフィクスキャッシュ全損) へ振られていた (2026-09-09
+#: ライブ監査 H-01: 107s、直前の deliberative ターンは 64s)。取得できる
+#: リテラルが無ければ fetch 経路は何もできないので、層の振り分けの証拠に
+#: なるのはリテラルだけ。
 URL_LITERAL_RE = re.compile(
-    r"https?://|" + ascii_boundary_alternation("URL", "url"),
+    r"https?://|(?<![A-Za-z0-9])www\.[A-Za-z0-9-]+\.",
     re.IGNORECASE,
 )
 

@@ -408,12 +408,30 @@ async def curate_assertion_facts(
                 )
                 slug = inherited
         note.assertion_slug = slug
+        subject = f"mem.world.{_SUBJECT_PREFIX}.{slug}"
+        # 同じ命題が既に live なら積まない。命名は補助タスクが「何についての
+        # 言明か」を答えるので、言い直し・別セッションの再言明が同じ
+        # (subject, object) に収束する。読出しは claim_key で畳むが、書き手が
+        # 積み続けると 1 文が 5 件並ぶ (2026-09-09 ライブ監査 P-3:
+        # holiday_exclusion ×5、同一セッション内でも copyright_clause ×2)。
+        # 訂正は畳む対象 (旧値) を持つので除外しない。
+        if not getattr(note, "is_correction", False) and _same_claim_is_live(
+            store, subject, obj,
+        ):
+            note.extracted_fact_ids = list(
+                getattr(note, "extracted_fact_ids", None) or [],
+            )
+            logger.debug(
+                "assertion_curator: %s already holds the same claim; note %s not re-added",
+                subject, note.id,
+            )
+            continue
         try:
             embedding = await embedder.embed([obj], is_query=False)
             vec = embedding[0] if len(embedding) else None
             fact = fact_from_note(
                 note,
-                subject=f"mem.world.{_SUBJECT_PREFIX}.{slug}",
+                subject=subject,
                 predicate="is",
                 object_=obj,
                 type="world_fact",
@@ -436,6 +454,20 @@ async def curate_assertion_facts(
                 "assertion_curator: persist failed for slug=%s: %s", slug, exc,
             )
     return written
+
+
+def _same_claim_is_live(store: "SemanticFactStore", subject: str, obj: str) -> bool:
+    """同じ (subject, object) の live なファクトが既にあるか (純粋関数に近い)。"""
+    try:
+        siblings = store.search_by_subject(subject, include_superseded=False)
+    except Exception:  # ストアの状態に依存しない (取れなければ無い扱い)
+        return False
+    wanted = (obj or "").strip()
+    return any(
+        (getattr(f, "object", "") or "").strip() == wanted
+        and getattr(f, "predicate", "is") == "is"
+        for f in siblings
+    )
 
 
 def _supersede_same_slug(store: "SemanticFactStore", correction: object) -> int:

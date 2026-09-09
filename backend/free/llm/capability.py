@@ -96,13 +96,21 @@ class CapabilitySnapshot:
 # ─────────────────────────────────────────────────────────────────────────
 
 
-def interpret_json_probe(content: str) -> bool:
+def interpret_json_probe(content: str, finish_reason: str | None = None) -> bool | None:
     """P3: json_schema grammar が強制されているかを raw content から判定する。
 
     grammar 強制下では必ず JSON オブジェクト (``{"score": ...}``) になる。
     裸スカラ (``"0.7"``) / 非オブジェクト / パース不能なら非強制とみなす。
+
+    **本文が空で ``finish_reason == "length"`` なら観測不能 (``None``)** — 生成が
+    予算で切れただけで、grammar の有無は何も言えない。同じ llama-server に
+    対して起動ごとに ``json_enforced`` が True / False と振れた実例
+    (2026-09-09 ライブ監査 P-4): 推論トークンが 64 の予算をほぼ食い、本文が
+    空になった起動だけ「非強制」と判定され、lenient parsing へ倒れていた。
     """
     text = (content or "").strip()
+    if not text and finish_reason == "length":
+        return None
     if not text.startswith("{"):
         return False
     try:
@@ -174,6 +182,14 @@ def resolve_effective_reasoning_mode(
 # ─────────────────────────────────────────────────────────────────────────
 
 
+def _finish_reason_of(resp: dict) -> str | None:
+    """OAI 応答 JSON から ``choices[0].finish_reason`` を安全に取り出す。"""
+    try:
+        return resp["choices"][0].get("finish_reason")
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
 def _message_of(resp: dict) -> dict:
     """OAI 応答 JSON から ``choices[0].message`` を安全に取り出す。"""
     try:
@@ -222,6 +238,11 @@ async def probe_model_capabilities(
     # P3: json_schema grammar 強制 (補助タスクの json purpose 用)
     if probe_json:
         try:
+            # 消費側 (``generate_constrained``) と同じ形で送る — 判定 JSON では
+            # toggle 型 reasoning を必ず切る (local_client 参照)。P3 だけ thinking を
+            # 残すと、推論が 64 トークンの予算を食って本文が空になり「grammar
+            # 非強制」と誤判定する (P-4)。P1/P2 は thinking の挙動そのものを
+            # 測るので触らない。
             resp = await chat_fn(
                 {
                     "messages": [{"role": "user", "content": _JSON_PROBE_PROMPT}],
@@ -229,10 +250,11 @@ async def probe_model_capabilities(
                     "temperature": 0.0,
                     "max_tokens": 64,
                     "response_format": _JSON_PROBE_SCHEMA,
+                    "chat_template_kwargs": {"enable_thinking": False},
                 },
             )
             content = _message_of(resp).get("content") or ""
-            json_enforced = interpret_json_probe(content)
+            json_enforced = interpret_json_probe(content, _finish_reason_of(resp))
         except Exception as exc:
             logger.warning("capability probe P3 failed (prior fallback): %s", exc)
 

@@ -30,7 +30,7 @@ from backend.free.agent.prompt_utils import (
     format_fewshot_section,  # noqa: F401  (re-export for tests)
 )
 from backend.free.core.session_mode import is_valid_session_mode, normalize_session_mode
-from backend.free.core.intent_vocab import own_process_question
+from backend.free.core.intent_vocab import is_plain_statement, own_process_question
 from backend.free.learning.corrected_pairs import (
     CorrectedPair,
     refers_to_previous_turn,
@@ -490,6 +490,16 @@ def find_content_rejection(query: str, response: str) -> str | None:
     # 欠陥が手本に昇格して自己増幅する経路。
     if own_process_question(query):
         return "self-report about this session's own tool use (not transferable)"
+    # 問い・依頼のマーカーが無い自己申告 (「家族は夫と猫のレオの 2 人と 1 匹
+    # です。」) への応答は「復唱して確認する」型で、他の問いの手本にならない。
+    # しかも本人の属性値 (旧ペット名 / 旧住所) を手本経由で毎ターン注入する
+    # 第 5 の陳腐値経路になる (2026-09-09 ライブ監査 P-2: 訂正前の値を含む
+    # 自己申告が fitness 0.73〜0.83 で常駐していた)。個人属性の語形ゲート
+    # (``_PERSONAL_ATTRIBUTE_ASSERTION_RE``) は名前 / 趣味 / 好き… の列挙で、
+    # 家族・住所・訂正の申告を素通りした。判定はツール判定層と同じ
+    # ``is_plain_statement`` (問い・依頼のマーカーが無く平叙の文末で終わる)。
+    if is_plain_statement(query):
+        return "plain statement (a self-report is not a transferable Q/A example)"
     return _find_volatile_reason(query, response)
 
 
@@ -1352,6 +1362,38 @@ class FewShotPool(JsonStateStore):
                     "added": added,
                 })
         return added
+
+    def retract_corrected_pairs(self, pairs: list[CorrectedPair]) -> int:
+        """検証で却下 / 格下げされた訂正ペアの手本をプールから外す。
+
+        :func:`backend.free.learning.corrected_pairs.build_demoted_pairs` の
+        出力を受ける。``add_corrected_pairs`` の逆で、内容ハッシュが一致する例を
+        追い出し、墓標 (``_evicted_hashes``) に積んで再採用させない。門を後から
+        足しても、既に手本になった偽陽性 (100 → 100 m、fitness 1.0) は
+        この経路が無い限り残り続けた (2026-09-09 ライブ監査 P-1)。
+
+        Returns:
+            外した件数。
+        """
+        removed = 0
+        for pair in pairs:
+            h = self._content_hash(pair.query.strip(), pair.response.strip())
+            pool = self._pools.get(pair.mode)
+            if not pool:
+                continue
+            keep: list[FewShotExample] = []
+            for ex in pool:
+                if self._content_hash(ex.query, ex.response) == h:
+                    self._forget_evicted(pair.mode, ex)
+                    removed += 1
+                    logger.info(
+                        "Retracting corrected-pair fewshot example (verification "
+                        "demoted the correction): query=%s", ex.query[:50],
+                    )
+                    continue
+                keep.append(ex)
+            self._pools[pair.mode] = keep
+        return removed
 
     def accept_from_artifact(
         self,

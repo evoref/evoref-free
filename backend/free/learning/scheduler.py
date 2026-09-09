@@ -2156,13 +2156,24 @@ class LearningScheduler:
             logger.info("Fewshot pool updated: %d new examples added", added)
         # 訂正で確定した「元の問い → 訂正後の回答」も手本に流す。失敗経験の
         # 唯一の受け皿 (Level 2 の重み学習は on-device では動かない、2026-09-05)。
-        from backend.free.learning.corrected_pairs import build_corrected_pairs
+        from backend.free.learning.corrected_pairs import (
+            build_corrected_pairs,
+            build_demoted_pairs,
+        )
 
         corrected = self._fewshot_pool.add_corrected_pairs(
             build_corrected_pairs(experiences),
         )
         if corrected:
             logger.info("Fewshot pool updated: %d corrected-pair examples added", corrected)
+        # 検証で却下 / 格下げされた訂正の手本は外す (昇格の逆経路)。
+        retracted = self._fewshot_pool.retract_corrected_pairs(
+            build_demoted_pairs(experiences),
+        )
+        if retracted:
+            logger.info(
+                "Fewshot pool updated: %d corrected-pair examples retracted", retracted,
+            )
         await self._fewshot_pool.score_pending_quality(
             self.resolve_idle_task_client(llm_client),
         )
