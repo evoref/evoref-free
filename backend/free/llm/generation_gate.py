@@ -19,8 +19,16 @@ CLAUDE.md §6 #1 は「**アイドル窓の** sleep-time / 学習はベースモ
 掛かって**完走した応答が捨てられた**。
 
 **チャット側は何も待たない。** 待つのは背景側だけで、ゲートは
-「チャットが走っている間、背景の *新規* dispatch を止める」だけの片方向。
-実行中の背景タスクを中断はしない (中断すると部分状態の書き戻しが要る)。
+「チャットが走っている間、背景の *新規* dispatch を止める」片方向。
+
+加えて **チャット要求の到着** (``chat_request_started``) を背景側へ伝える。
+dispatch 後に始まったチャットは、背景の 1 生成 (実測で最長 260 秒:
+2026-09-09 検証、conflict_resolution) が終わるまで GPU を分け合い、その間の
+チャット側の分類器 / 日付意図の抽出 (40 秒予算) と初トークン (116 秒予算) が
+タイムアウトして誤答・空応答になった。deferrable な purpose は
+:func:`preempted_by_chat` で要求の到着を待ち受け、生成を打ち切って
+「一過性 (contended)」として呼出側に返す — 呼出側は次サイクルで再試行する
+(部分状態は書き戻さない: 生成結果を受け取らないだけ)。
 """
 
 from collections.abc import AsyncIterator
@@ -34,9 +42,11 @@ logger = get_logger("llm.generation_gate")
 __all__ = [
     "chat_generation",
     "chat_is_active",
+    "chat_request_started",
     "activity_token",
     "was_contended_since",
     "wait_for_idle",
+    "wait_for_chat_request",
     "gate_stream",
 ]
 
@@ -51,6 +61,53 @@ _activations: int = 0
 
 #: ``_active == 0`` の間セットされているイベント。初期状態はアイドル。
 _idle_event: asyncio.Event | None = None
+
+#: チャット要求の到着回数 (単調増加)。``wait_for_chat_request`` は自分の
+#: 開始時点より後の到着だけを待つ。
+_requests: int = 0
+#: 到着ごとに set → 即 clear するイベント (待ち手を起こすためだけのもの)。
+#: イベントは最初に待った走行ループに束縛されるので、ループごとに作り直す
+#: (テストのようにループが替わる環境で、別ループの待ち手が RuntimeError で
+#: 落ちて「到着」と誤認しないため)。
+_request_event: asyncio.Event | None = None
+_request_event_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _request_signal() -> asyncio.Event:
+    global _request_event, _request_event_loop
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if _request_event is None or (loop is not None and _request_event_loop is not loop):
+        _request_event = asyncio.Event()
+        _request_event_loop = loop
+    return _request_event
+
+
+def chat_request_started() -> None:
+    """チャット要求が届いたことを背景側へ知らせる (API の入口で呼ぶ)。
+
+    生成の開始 (``chat_generation``) より前 — 分類器 / 日付意図の抽出 /
+    検索 — から GPU を要するので、要求の到着で知らせる。
+    """
+    global _requests
+    _requests += 1
+    signal = _request_signal()
+    signal.set()
+    signal.clear()
+
+
+async def wait_for_chat_request(since: int | None = None) -> None:
+    """``since`` (省略時は今) より後にチャット要求が届くまで待つ。"""
+    seen = _requests if since is None else since
+    while _requests == seen:
+        await _request_signal().wait()
+
+
+def request_token() -> int:
+    """``wait_for_chat_request`` に渡す開始時点のスナップショット。"""
+    return _requests
 
 
 def _event() -> asyncio.Event:

@@ -559,6 +559,23 @@ def _correction_attribution(query: str) -> str | None:
     return classify_correction_target(masked)
 
 
+def points_at_assistant_error(query: str) -> bool:
+    """この発話が **アシスタントの誤りの指摘** か (純粋関数)。
+
+    **応答パス** (``core.inference._correction_target_note``) が使う述語。
+    「[訂正の対象]」の注記は、訂正が指す過去の回答を検証し直させるものなので、
+    帰属が ``assistant`` の候補にだけ付ける。以前は注記側が
+    :data:`~backend.free.core.correction_target.WRONG_MARKER_RE` (誤りの側の
+    span を切るための印) を候補判定に流用しており、「数字だけで」の
+    ``だけで`` に当たった想起の問い「最初に私が挙げたドル建ての請求額は
+    いくらでしたか。数字だけで。」に「2 つ前の回答を検証し直せ」が付いて、
+    ドル額 (2,400) ではなく円額 (348,000) を返した (2026-09-09 ライブ監査
+    B-01)。記録側 (``_detect_correction``) はこの発話を候補にしていない —
+    同じ判定を 2 箇所で別々に実装していたのが原因なので、芯を共有する。
+    """
+    return _correction_attribution(query) == "assistant"
+
+
 def restates_a_value(query: str) -> bool:
     """この発話が **ユーザー自身の値の言い直し** か (純粋関数)。
 

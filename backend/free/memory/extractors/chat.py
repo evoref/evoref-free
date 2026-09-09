@@ -163,6 +163,8 @@ _QUESTION_ENDING_RE = re.compile(
 
 #: 文区切り (。！？!?) の直後で分割する。
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?])\s*")
+#: 文末の区切りで終わっているか (節の途中でないことの印)。
+_SENTENCE_BREAK_TAIL_RE = re.compile(r"[。．.！!？?]\s*$")
 
 #: 節区切り (読点を含む) の直後で分割する。文単位で属性を分けられないときの
 #: 第 2 段。日本語は 1 文へ複数属性を読点で並べるのが常態で、文単位だけでは
@@ -254,11 +256,26 @@ def _states_attribute_value(sentence: str, attr_words: tuple[str, ...]) -> bool:
 
     値なしと判定した文だけが後続文を引き継ぐので、**誤って「値あり」と
     出るのは安全側** (従来どおり絞り込むだけ)。
+
+    訂正の前置き (「すみません、住まいを間違えました。」) は謝罪と誤りの印
+    しか持たず値を述べていない。属性語を除いた残りから談話標識
+    (:func:`strip_discourse_prefix`、謝罪を含む) と誤りの印
+    (:data:`~backend.free.core.correction_target.WRONG_MARKER_RE`、記録側と同じ
+    SSOT) を落として内容語が残らなければ値なし — 後続の「中央区ではなく北区
+    です。」が値として引き継がれる。以前は「すみません」「間違」が内容語に
+    数えられ、前置きだけが ``mem.personal.location`` の object になっていた
+    (2026-09-09 ライブ監査 P-5、2 分後に Step 8.3 が「北区」で畳むまで
+    陳腐値として live だった)。
     """
     stripped = sentence
     for word in attr_words:
         stripped = stripped.replace(word, " ")
-    return bool(_CONTENT_RUN_RE.search(stripped))
+    if not _CONTENT_RUN_RE.search(stripped):
+        return False
+    from backend.free.core.correction_target import WRONG_MARKER_RE
+
+    meta_free = WRONG_MARKER_RE.sub(" ", strip_discourse_prefix(stripped.strip()))
+    return bool(_CONTENT_RUN_RE.search(meta_free))
 
 
 #: **常体 (だ・である体) の言明** の文末。用言で終わる形を採る。
@@ -314,8 +331,35 @@ def _states_a_value(content: str, attr_words: tuple[str, ...] = ()) -> bool:
     return bool(attr_words) and _states_attribute_value(content, attr_words)
 
 
-def _assertive_evidence(evidence: str) -> str:
+def _is_clause_fragment(content: str, evidence: str) -> bool:
+    """``evidence`` が発話の **節の途中** を切り出したものか (純粋関数)。
+
+    節単位で絞った根拠は ``_strip_clause_tail`` が末尾の読点を落とすため、
+    「福岡市の早良区に住んでいて」のように **て形で終わる**。日本語の平叙文は
+    て形で終わらない (必ず後続節へ繋がる) ので、``_REQUEST_ENDING_RE`` の
+    て形の規則はそれを依頼と見なす — 規則側は「読点を含めない」ことで
+    節の途中を除外しているが、読点を先に落とした根拠には効かない。
+    発話の中でその根拠の直後に読点が続いていれば節の途中。
+    """
+    text = (evidence or "").strip()
+    if not text or _SENTENCE_BREAK_TAIL_RE.search(text):
+        return False
+    index = (content or "").find(text)
+    if index < 0:
+        return False
+    rest = content[index + len(text):].lstrip()
+    return bool(rest) and rest[0] in "、，,"
+
+
+def _assertive_evidence(evidence: str, *, clause_fragment: bool = False) -> str:
     """証拠テキストから **言明の文だけ** を残す (純粋関数)。
+
+    ``clause_fragment`` は根拠が節の途中 (:func:`_is_clause_fragment`) で
+    あることを示す。その場合、末尾の文は読点を補って判定する — て形の
+    継続を依頼と誤認して、自己紹介の居住地が丸ごと落ちていた (2026-09-09
+    ライブ監査 H-09: 「福岡市の早良区に住んでいて、医療機器メーカーで…」の
+    location が regex で解決できているのに 1 件も書かれず、cross-session の
+    想起が前 persona の値になった)。
 
     ``strip_interrogative_sentences`` は問いだけを落としていたので、依頼の文
     (「〜してください。」) が object に残っていた。属性が解決できない発話は
@@ -332,11 +376,14 @@ def _assertive_evidence(evidence: str) -> str:
     と同じ規則。依頼節より前に本人の言明がある複合文
     (「私は〜なので、〜してください。」) は残る。
     """
-    kept = [
-        sentence
-        for raw in _SENTENCE_SPLIT_RE.split(evidence or "")
-        if (sentence := raw.strip()) and not _carries_no_value(sentence)
-    ]
+    sentences = [s for raw in _SENTENCE_SPLIT_RE.split(evidence or "") if (s := raw.strip())]
+    kept = []
+    for i, sentence in enumerate(sentences):
+        probe = sentence
+        if clause_fragment and i == len(sentences) - 1:
+            probe = sentence + "、"
+        if not _carries_no_value(probe):
+            kept.append(sentence)
     return "".join(kept)
 
 
@@ -1301,8 +1348,20 @@ def resolve_inherited_attributes(
     #: は personal_fact / preference の双方が beverage) は両方を継ぐ — 先行発話の
     #: スロット構成をそのまま写すだけなので、無関係なスロットは混ざらない。
     last_resolved: dict[str, dict[str, str]] = {}
+    #: 継承元の発話本文 (訂正がその発話を指している証拠の照合先)。
+    last_content: dict[str, str] = {}
     inherited: dict[tuple[str, str], str] = {}
     for note in ordered:
+        # **継ぐ元も継ぐ先も user 発話に限る。** ``extract`` 本体は assistant
+        # ノートを素材にしないロールガードを持つが、この走査には無く、
+        # アシスタントの説明文が「直前に属性を解決した言明」になっていた。
+        # 実インシデント (2026-09-09 ライブ監査 H-07): 統計の例え話
+        # 「ある部署の月給が…」が occupation (トリガ 部署) を立て、続く
+        # ユーザーの自己訂正「標準偏差は 10 ではなく 15」(検証済み self、
+        # 属性語なし) がそれを継いで ``mem.personal.occupation`` = '15' を書き、
+        # 正しい職業を supersede した。
+        if getattr(note, "source", "user") != "user":
+            continue
         content = note.content or ""
         session = note.session_id or ""
         resolved: dict[str, str] = {}
@@ -1314,6 +1373,7 @@ def resolve_inherited_attributes(
                 resolved[tag] = attr
         if resolved:
             last_resolved[session] = resolved
+            last_content[session] = content
             continue
         # **継承は検証済みの訂正にだけ許す。** 隣接は「何を訂正しているか」を
         # 決めない推測でしかないので、字句で立てただけの候補にスロットを丸ごと
@@ -1322,9 +1382,30 @@ def resolve_inherited_attributes(
         # 再言明として扱う。
         if not note_is_verified_correction(note):
             continue
+        # **継承元がその訂正の対象であることを、検証器の逐語 span で裏取りする。**
+        # 「隣接」は何を訂正しているかを決めない。自己紹介 (3 属性) の直後の
+        # 統計の自己訂正 (10→15) が occupation を継いで職業を '15' にした
+        # (2026-09-09 ライブ監査 H-07 の再発、継承元は user 発話)。誤りの側
+        # (wrong_claim) か正しい側 (correct_value) が継承元の本文に現れて
+        # いなければ、その発話への訂正ではない。W02 (陶芸→木工教室) は
+        # 「陶芸教室に通い始めました」に '陶芸' がある。
+        if not _correction_points_at(note, last_content.get(session, "")):
+            continue
         for tag, attr in (last_resolved.get(session) or {}).items():
             inherited[(note.id, tag)] = attr
     return inherited
+
+
+def _correction_points_at(note: MemoryNote, statement: str) -> bool:
+    """検証済み訂正の逐語 span が ``statement`` に現れるか (純粋関数)。"""
+    haystack = norm_span(statement or "")
+    if not haystack:
+        return False
+    for attr in ("correction_wrong_claim", "correction_correct_value"):
+        span = norm_span(str(getattr(note, attr, "") or ""))
+        if span and span in haystack:
+            return True
+    return False
 
 
 class ChatExtractor(BaseExtractor):
@@ -1592,7 +1673,10 @@ class ChatExtractor(BaseExtractor):
                     # ファクトになり、以後 [関連する記憶] に依頼文が並んだ。
                     # 属性が解決できない発話はフォールバック subject へ落ちる
                     # ので、**依頼だけの発話ほどこのスロットに溜まる**)。
-                    object_text = _assertive_evidence(evidence)
+                    object_text = _assertive_evidence(
+                        evidence,
+                        clause_fragment=_is_clause_fragment(content, evidence),
+                    )
                     if not object_text:
                         continue
                     # ``from_correction`` は :func:`note_is_verified_correction`

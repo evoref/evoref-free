@@ -273,22 +273,47 @@ def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
 
     trigger が 1 つも無ければ ``None`` (呼出側がスキップする)。
     """
+    patterns: tuple[re.Pattern[str], ...] = ()
     if isinstance(raw, dict):
         words = _coerce_triggers(raw.get("triggers"))
         requires_self = bool(raw.get("requires_self_possessor", False))
         single_valued = bool(raw.get("single_valued", False))
+        patterns = _coerce_patterns(slug, raw.get("patterns"))
     else:
         words = _coerce_triggers(raw)
         requires_self = False
         single_valued = False
-    if not words:
+    if not words and not patterns:
         return None
     return AttributeSpec(
         slug=slug,
         triggers=words,
         requires_self_possessor=requires_self,
         single_valued=single_valued,
+        patterns=patterns,
     )
+
+
+def _coerce_patterns(slug: str, items: Any) -> tuple[re.Pattern[str], ...]:
+    """YAML の ``patterns`` (正規表現の列) をコンパイルする。
+
+    壊れた正規表現は **そのパターンだけ** 落として WARNING (辞書全体を
+    無効にしない — 部分文字列 trigger は従来どおり効く)。
+    """
+    if not isinstance(items, list):
+        return ()
+    out: list[re.Pattern[str]] = []
+    for it in items:
+        if not isinstance(it, str) or not it.strip():
+            continue
+        try:
+            out.append(re.compile(it))
+        except re.error as exc:
+            logger.warning(
+                "fact_attributes: invalid pattern for %s skipped (%s): %r",
+                slug, exc, it,
+            )
+    return tuple(out)
 
 
 def load_fact_triggers(path: str | Path) -> FactTriggerMap:
@@ -652,6 +677,19 @@ class AttributeSpec:
     slug: str
     triggers: tuple[str, ...]
     requires_self_possessor: bool = False
+    #: 部分文字列では書けない **構造** の trigger (コンパイル済み正規表現)。
+    #:
+    #: 一致したとき抽出側へ返す語形は、named group ``anchor`` があればその
+    #: span、無ければ一致全体。抽出側はこの語を本文に ``in`` で当てて根拠文を
+    #: 絞り、属性語として除いた残りで「値を述べているか」を見るため、
+    #: ``anchor`` は **文の中の短い目印** (値そのものではない) にすること。
+    #:
+    #: 実インシデント (2026-09-09 ライブ監査 (c) P-7): 「私は岡田真司
+    #: （おかだ しんじ）です。」から name が 1 件も抽出されなかった。trigger は
+    #: 「といいます / と申します / 名前は」系の部分文字列しか無く、日本語の
+    #: 自己紹介で普通の「私は<氏名>（ふりがな）です」は **ふりがな括弧という
+    #: 構造** でしか同定できない (「私は会社員です」と語形が同じ)。
+    patterns: tuple[re.Pattern[str], ...] = ()
     #: 1 人につき値が 1 つしか成立しないスロットか。
     #:
     #: 真のとき、Step 8 は同じスロットの旧ファクトを **訂正でなくても**
@@ -765,6 +803,16 @@ class AttributeSpec:
                     start = haystack.find(variant, start + 1)
                 if matched:
                     break
+        for pattern in self.patterns:
+            for m in pattern.finditer(haystack):
+                if self.requires_self_possessor and not _possessor_is_self(
+                    haystack, m.start(),
+                ):
+                    continue
+                anchor = m.groupdict().get("anchor") or m.group(0)
+                if anchor and anchor not in hit:
+                    hit.append(anchor)
+                break
         return tuple(hit)
 
 

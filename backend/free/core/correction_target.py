@@ -301,6 +301,23 @@ def resolve_correction_target(
         for token in tokens
     }
 
+    # 誤りの側の語 (最強の手掛かり) を **直近ターンも持っている** とき、古い
+    # ターンは応答本文の固有の証拠でしか勝てない (問い側の重なりは数えない)。
+    # 同じ誤値を複数ターンが述べている場面で、訂正が依頼を言い直す語
+    # (「印刷費」「計算」) は古い問いにも現れ、それだけで 2 つ前の印刷費だけの
+    # 回答が宛先になり「直前の回答の話題には触れないこと」の注記が製本費込みの
+    # 合計を抑えかねなかった (2026-09-09 ライブ監査 C-01)。一方、誤値が後続へ
+    # 引き継がれたときに **計算したターン** を指す訂正 (「1日1,900件…実施日数を
+    # 計算し直して」) は本文の固有の値 (1,900) で古いターンが勝てるので壊れない。
+    latest_body, latest_query = rows[-1][1], rows[-1][2]
+    present_wrong = {
+        t for t in wrong
+        if any(t in body or t in query for _, body, query in rows)
+    }
+    latest_holds_wrong = bool(present_wrong) and all(
+        t in latest_body or t in latest_query for t in present_wrong
+    )
+
     best_id = ""
     best_score = 0.0
     # 新しい順に見る。同点なら新しい方を採る (同じ値を複数ターンが述べている
@@ -315,7 +332,9 @@ def resolve_correction_target(
                         score += WRONG_VALUE_ONLY_BONUS
                 else:
                     score += 1.0 / body_freq[token]
-            if query_freq[token] and token in query:
+            if query_freq[token] and token in query and not (
+                latest_holds_wrong and entry_id != rows[-1][0]
+            ):
                 score += 1.0 / query_freq[token]
         if score > best_score:
             best_id, best_score = entry_id, score

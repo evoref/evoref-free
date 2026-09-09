@@ -112,6 +112,34 @@ def _normalize_sum_to_one_groups(domain: str, mode_params: dict) -> list[str]:
     return repaired
 
 
+#: config.yaml の値を **初回生成時の seed** にするポリシーキー。
+#: ``(domain, key) -> (config セクション, config キー)``。
+#:
+#: ``memory.conflict_similarity_threshold`` は埋め込みモデルのプロファイル同期
+#: (``model_migration._EMBEDDING_SCALED_THRESHOLDS``) が config.yaml へ書く
+#: 較正値だが、消費側 (``ConflictResolver``) はポリシー優先で読むため、
+#: ポリシー既定 0.85 が config の 0.83 を黙って覆っていた (2026-09-09 ライブ
+#: 監査 P-3: 「設定したのに効かない」)。既存ファイルの値は進化の結果なので
+#: 上書きしない — 生成時だけ config から取る。
+_CONFIG_SEEDED_KEYS: dict[tuple[str, str], tuple[str, str]] = {
+    ("memory", "conflict_similarity_threshold"): ("memory", "conflict_similarity_threshold"),
+    ("memory", "conflict_batch_size"): ("memory", "conflict_batch_size"),
+}
+
+
+def _seed_defaults_from_config(defaults: dict[str, dict], config: dict | None) -> None:
+    """``_CONFIG_SEEDED_KEYS`` の値を config から既定へ写す (in place、純粋な写し)。"""
+    if not config:
+        return
+    for (domain, key), (section, cfg_key) in _CONFIG_SEEDED_KEYS.items():
+        value = (config.get(section) or {}).get(cfg_key)
+        if value is None:
+            continue
+        for mode_params in (defaults.get(domain) or {}).get("params", {}).values():
+            if key in mode_params:
+                mode_params[key] = type(mode_params[key])(value)
+
+
 def _default_policies() -> dict[str, dict]:
     """全ドメインのデフォルトポリシー定義を返す"""
     return {
@@ -312,10 +340,13 @@ class PolicyInterpreter:
         policy_activation_min_confidence: float = 0.7,
         debug_logger: "DebugLogger | None" = None,
         base_model_id: str = "",
+        config: dict | None = None,
     ):
         """
         Args:
             policies_dir: ``local/policies/*.json`` のディレクトリ
+            config: config.yaml 全体。``_CONFIG_SEEDED_KEYS`` の初回生成 seed と、
+                既存ファイルが config と食い違うときの INFO ログに使う
             policy_source: ``yaml`` (従来動作) / ``hybrid`` (YAML seed +
                 SemMem 上書き) / ``semmem`` (導入予定。現状は
                 ``hybrid`` と同等動作)。デフォルトは ``yaml`` で、既存テスト
@@ -353,6 +384,7 @@ class PolicyInterpreter:
         # (``learn.policy.<mode>.*`` レガシー subject を適用)。set_base_model_id で
         # 切替時に更新し、当該モデルの policy ファクトのみを適用する。
         self._base_model_id: str = base_model_id
+        self._config: dict = config or {}
 
         self._load_all()
         if self._policy_source != "yaml":
@@ -796,6 +828,7 @@ class PolicyInterpreter:
     def _load_all(self) -> None:
         """全ポリシーファイルを読み込む（存在しない場合はデフォルト生成）"""
         defaults = _default_policies()
+        _seed_defaults_from_config(defaults, self._config)
         self._policies_dir.mkdir(parents=True, exist_ok=True)
 
         for filename, domain in _POLICY_FILES.items():
@@ -822,6 +855,7 @@ class PolicyInterpreter:
                                 {k: mode_params[k] for k in fixed},
                             )
                     logger.debug("Loaded policy: %s", path)
+                    self._log_config_divergence(domain, defaults.get(domain, {}))
                 except (json.JSONDecodeError, OSError) as e:
                     logger.warning(
                         "Failed to load %s, using defaults: %s", path, e,
@@ -838,6 +872,29 @@ class PolicyInterpreter:
                     logger.info("Created default policy: %s", path)
                 except OSError as e:
                     logger.warning("Failed to write default policy %s: %s", path, e)
+
+    def _log_config_divergence(self, domain: str, seeded_defaults: dict) -> None:
+        """既存ポリシーの値が config の seed 値と違うとき、キーごとに 1 行 INFO。
+
+        ポリシーが config を覆うのは仕様 (進化の結果を優先) だが、config を
+        書き換えても効かない状態を **黙って** 作らないための可視化。
+        """
+        if not self._config:
+            return
+        for (d, key), (section, cfg_key) in _CONFIG_SEEDED_KEYS.items():
+            if d != domain:
+                continue
+            if (self._config.get(section) or {}).get(cfg_key) is None:
+                continue
+            for mode, mode_params in (self._data[domain].get("params") or {}).items():
+                seeded = (seeded_defaults.get("params") or {}).get(mode, {}).get(key)
+                current = mode_params.get(key)
+                if seeded is not None and current != seeded:
+                    logger.info(
+                        "Policy %s/%s %s=%s overrides config %s.%s=%s "
+                        "(policy values win; edit local/policies to change)",
+                        domain, mode, key, current, section, cfg_key, seeded,
+                    )
 
     @staticmethod
     def _merge_with_defaults(loaded: dict, defaults: dict) -> dict:

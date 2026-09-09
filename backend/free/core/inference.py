@@ -278,6 +278,81 @@ def _current_date_note(history: list[ChatMessage]) -> str:
     )
 
 
+#: 訂正対象の注記 (H-05)。直前ターン以外を指す訂正で付ける。
+_CORRECTION_TARGET_NOTES: dict[str, str] = {
+    "ja": (
+        "[訂正の対象] ユーザーが指しているのは直前の回答ではなく、{ago} つ前の"
+        "問い「{query}」への回答「{answer}」である。その回答を検証し直して答え、"
+        "直前の回答の話題には触れないこと。"
+    ),
+    "en": (
+        "[Correction target] The user is pointing at the answer to the question "
+        "\"{query}\" ({ago} turns back: \"{answer}\"), not at the latest reply. "
+        "Re-examine that answer; do not discuss the latest reply's topic."
+    ),
+}
+_CORRECTION_TARGET_EXCERPT = 60
+
+
+def _correction_target_note(history: list[ChatMessage]) -> str:
+    """訂正が **直前ターン以外** を指すとき、対象を注記する (純粋関数)。
+
+    「違います。最初の答えを計算し直してください。時速 72 km は秒速 20 m
+    なので…」に対し、モデルは直前ターン (富士山頂の気圧) の弁明を返した
+    (2026-09-09 ライブ監査 H-05)。宛先の同定 (本文の重なり) は記録側と記憶側が
+    使う ``core.correction_target`` の SSOT にあり、応答パスだけが対象を
+    教えていなかった。証拠が直前ターンを指す / 無い場合は何も付けない
+    (従来どおり直前ターンへの訂正として振る舞う)。
+
+    候補かどうかは記録側と同じ芯 (``agent.feedback.points_at_assistant_error``)
+    で見る。``WRONG_MARKER_RE`` は誤りの側の span を切る印で候補判定には
+    広すぎ、「数字だけで」の ``だけで`` で想起の問いに注記が付いた
+    (2026-09-09 ライブ監査 B-01)。
+    """
+    from backend.free.agent.feedback import points_at_assistant_error
+    from backend.free.core.correction_target import (
+        resolve_correction_target,
+        score_correction_match,
+    )
+
+    if len(history) < 3 or history[-1].get("role") != "user":
+        return ""
+    correction = str(history[-1].get("content") or "")
+    if not points_at_assistant_error(correction):
+        return ""
+    # (id, 応答, 問い) を古い順に。id は履歴内の位置。
+    candidates: list[tuple[str, str, str]] = []
+    pending_query = ""
+    for i, turn in enumerate(history[:-1]):
+        role = turn.get("role")
+        text = str(turn.get("content") or "")
+        if role == "user":
+            pending_query = text
+        elif role == "assistant":
+            candidates.append((str(i), text, pending_query))
+    if len(candidates) < 2:
+        return ""
+    target_id = resolve_correction_target(correction, candidates)
+    if not target_id or target_id == candidates[-1][0]:
+        return ""
+    target = next(c for c in candidates if c[0] == target_id)
+    if score_correction_match(correction, target[1]) <= 0 and score_correction_match(
+        correction, target[2],
+    ) <= 0:
+        return ""
+    ago = len(candidates) - candidates.index(target)
+    return _localized(_CORRECTION_TARGET_NOTES).format(
+        ago=ago,
+        query=_excerpt(target[2]),
+        answer=_excerpt(target[1]),
+    )
+
+
+def _excerpt(text: str, limit: int = _CORRECTION_TARGET_EXCERPT) -> str:
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[:limit] + "…"
+
+
 #: アシスタント自身の好み・感情・体験を尋ねる質問のシグナル。
 #: 主語が相手 (あなた / 君 / you) であることと、感情・嗜好語の共起を要求する。
 _PERSONA_SUBJECT_RE = re.compile(
@@ -1693,6 +1768,7 @@ def build_messages(
     for note in (
         _current_date_note(history),
         _persona_question_note(history),
+        _correction_target_note(history),
         _char_limit_note(history),
         _output_form_note(history),
         _dropped_history_note(history, trimmed),

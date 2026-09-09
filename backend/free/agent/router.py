@@ -328,6 +328,14 @@ def write_intent_probe(query: str) -> str:
     **同じ本文** を見なければならない (片方だけが書込みだと判断すると、
     ``output_target`` と層の振り分けが食い違う)。
     """
+    # 書込みの禁止は依頼節に限らず発話全体で見る。「E:\tmp\out.md には
+    # 書き込まなくていいです。本文で。」の禁止は依頼形でないので
+    # ``request_clauses`` が落とし、残った「本文で。」だけを見ると禁止が
+    # 消える (2026-09-09 監査 H-04)。禁止があれば空の本文を返し、動詞も
+    # 宛先も無い依頼として両方の読み手 (層の振り分け / output_target) を
+    # 同時に本文提示へ倒す。
+    if write_prohibited(query):
+        return ""
     probe = strip_command_literals(request_clauses(query))
     return _DESCRIPTIVE_WRITE_CLAUSE_RE.sub(" ", probe)
 
@@ -360,6 +368,56 @@ def _filename_target_is_destination(probe: str) -> bool:
     return False
 
 
+#: ファイルへの書込みを **明示的に断っている** 節。
+#:
+#: 「compose.yaml を書いてください。ファイルには書き込まず、本文で示して
+#: ください。」の「書き込まず」が ``_SAVE_VERB_RE`` (書き込) に当たり、
+#: 禁止された書込みがそのまま実行された (2026-09-09 ライブ監査 H-04:
+#: ``local/outputs/docker-compose.yaml`` が書かれ、応答は「…に書き込んだ
+#: 内容:」)。否定接尾を伴う保存動詞は宛先の証拠ではなく **禁止の証拠**。
+#:
+#: 一般動詞 (出力 / 作成 / 生成 / 書か) は「本文には出力せず」のような別の
+#: 禁止にも現れるので、ファイル語 (ファイル / file / ディスク) が直前にある
+#: 形だけを採る。ファイル専用の保存動詞 (保存 / 書き込 / セーブ / …) は
+#: 単独でも書込みの禁止とみなす。「書かないといけない」のような否定条件は
+#: 禁止ではないので除く (``(?!と)``)。
+_WRITE_PROHIBITION_RE = re.compile(
+    r"(?:"
+    # 保存動詞 (連用形) + 否定
+    r"(?:保存|セーブ|エクスポート|上書き|追記|書き出し|書出し|書き足し|書き込み|書込み)"
+    r"(?:は|も|を)?\s*(?:せず|しない|しなくて|されず|されない|不要|無用)(?!と)"
+    # 書き込む の活用 + 否定
+    r"|(?:書き込|書込)ま(?:ず|ない|なくて)(?!と)"
+    # ファイル語 + 一般動詞 + 否定
+    r"|(?:ファイル|file|ディスク)(?:には|に|へは|へ|としては|として)?\s*"
+    r"(?:(?:出力|作成|生成|書き込み|書込み)(?:は|も)?\s*(?:せず|しない|しなくて|不要|無用)"
+    r"|書か(?:ず|ない|なくて))(?!と)"
+    # 宛先の格助詞 + 一般動詞 + 否定 (「E:\tmp\out.md には書かないで」)
+    r"|(?<!本文)(?<!画面)(?<!チャット)(?<!回答)(?<!ここ)(?<!応答)"
+    r"(?:には|へは|にも|に|へ)\s*(?:書か(?:ず|ない|なくて)"
+    r"|(?:出力|作成|生成|書き込み|書込み)(?:は|も)?\s*(?:せず|しない|しなくて))(?!と)"
+    # 英語
+    r"|(?<![A-Za-z])(?:don'?t|do\s+not|never|without|no\s+need\s+to)\s+"
+    r"(?:sav(?:e|ing)|writ(?:e|ing)|export(?:ing)?|persist(?:ing)?|creat(?:e|ing))"
+    r"(?:\s+(?:it|this|them|anything|the\s+result))?"
+    r"(?:\s+(?:to|into|on|as)\s+(?:a\s+|the\s+|any\s+)?(?:file|disk))"
+    r"|(?<![A-Za-z])(?:don'?t|do\s+not|no\s+need\s+to)\s+sav(?:e|ing)(?![A-Za-z])"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def write_prohibited(query: str) -> bool:
+    """発話がファイルへの書込みを **明示的に断っている** か (純粋関数)。
+
+    依頼節に絞る前の発話全体を渡す (禁止の節は依頼形でないことが多い)。
+    禁止は他のどの宛先の証拠 (明示パス / 保存動詞 + ファイル名) にも勝つ —
+    「ファイルには書き込まず」と言われた依頼で write_file を撃つ根拠は
+    存在しない。
+    """
+    return bool(_WRITE_PROHIBITION_RE.search(query or ""))
+
+
 def write_destination_evidence(probe: str) -> bool:
     """正規化済みの依頼文が **書込み先** を示しているか (SSOT、純粋関数)。
 
@@ -371,8 +429,13 @@ def write_destination_evidence(probe: str) -> bool:
        保存動詞 + ファイル名
     3. 参照表現 (「同じファイルに保存し直して」) — 保存先は会話から解決する
 
+    書込みの **禁止** (:func:`write_prohibited`) が明示されていれば、上の
+    どれがあっても宛先とはみなさない (2026-09-09 監査 H-04)。
+
     ルータ (層の振り分け) と ``output_target`` の双方がこの 1 本を使う。
     """
+    if write_prohibited(probe):
+        return False
     if _LOCAL_PATH_RE.search(probe) or _EXPLICIT_RELATIVE_PATH_RE.search(probe):
         return True
     if _REFERENTIAL_WRITE_TARGET_RE.search(probe):

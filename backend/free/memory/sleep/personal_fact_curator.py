@@ -202,6 +202,15 @@ def _existing_attribute_facts(
 
     ``{subject: fact}``。regex 経路 (Step 8) が同じサイクルで書いたものを
     引き当てるために ``extracted_fact_ids`` を辿る (ID 連鎖 / c_05 §0.6)。
+
+    **supersede 済みのファクトも返す。** 粗い object (「札幌市の中央区に住んで
+    いて、出版社で雑誌の編集をしています」) が、split の前に後続の訂正
+    (「中央区ではなく北区です」) で畳まれると、live だけ見る判定では
+    「2 節に跨る object」が見えなくなり split が走らず、隣の属性
+    (occupation) が **永久に落ちる** (2026-09-09 ライブ監査 C-03)。分割の要否は
+    そのノートの regex が何を掴んだかで決まり、その後に畳まれたかは無関係。
+    再分割で書く古い location は ``persist_facts`` が発話時刻順で新しい live
+    (北区) に負けさせるので、陳腐値が復活することはない。
     """
     out: dict[str, Any] = {}
     for fact_id in getattr(note, "extracted_fact_ids", None) or []:
@@ -209,7 +218,7 @@ def _existing_attribute_facts(
             fact = store.get_fact(fact_id)
         except Exception:  # ストアの状態に依存しない (取れなければ無い扱い)
             fact = None
-        if fact is None or getattr(fact, "superseded_by", None):
+        if fact is None:
             continue
         parts = (fact.subject or "").split(".")
         if len(parts) == 3 and parts[0] == "mem" and parts[1] in (
