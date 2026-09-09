@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -176,11 +177,17 @@ class ConflictResolver:
         self,
         short_term: "EpisodicWorkspace",
         llm_client,
+        should_pause: Callable[[], bool] | None = None,
     ) -> int:
         """類似ノートを LLM で統合
 
         サーキットブレーカーと事前ヘルスチェックにより、
         補助タスクがビジー/停止時の長時間ブロッキングを防止する。
+
+        Args:
+            should_pause: ``True`` を返したらループを打ち切る協調 yield。
+                残りのペアは検出フラグ (``conflict_candidate``) が立ったまま
+                なので次サイクルが :meth:`detect_conflicts` で再び拾う。
 
         Returns:
             統合されたペア数
@@ -249,7 +256,20 @@ class ConflictResolver:
         total_attempts = 0
         low_sim_skipped = 0
 
-        for id_a, id_b in batch:
+        for idx, (id_a, id_b) in enumerate(batch):
+            # 協調 yield: チャット生成が走っている間はペアの境界で手を止める。
+            # background_slot は KV を分離するだけで GPU 演算は分離しない
+            # (note_evolver と同じ実測、CLAUDE.md 不変則 #1)。残りのペアは
+            # conflict_candidate フラグが立ったままなので次サイクルの
+            # detect_conflicts が拾う。
+            if should_pause is not None and should_pause():
+                remaining = len(batch) - idx
+                logger.info(
+                    "Step 6 conflict resolution paused for the user turn: "
+                    "%d pair(s) left pending for the next cycle", remaining,
+                )
+                break
+
             # サーキットブレーカー: 連続失敗で残りをスキップ
             if consecutive_failures >= self._CB_MAX_CONSECUTIVE:
                 remaining = len(batch) - total_attempts

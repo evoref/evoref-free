@@ -24,8 +24,11 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Iterable
-from typing import Any
 
+from backend.free.core.correction_verdict import (
+    mask_quoted_speech,
+    norm_span,
+)
 from backend.free.core.intent_vocab import is_plain_statement
 from backend.free.core.text_quality import (
     _asserts_before_request,
@@ -38,6 +41,8 @@ from backend.free.memory.extractors.base import (
     BaseExtractor,
     ExtractionContext,
     ExtractionResult,
+    note_is_verified_correction,
+    note_verification_rejected,
 )
 from backend.free.memory.notes.note_builder import (
     CORRECTION_FORM_TRIGGERS,
@@ -168,6 +173,10 @@ _CLAUSE_SPLIT_RE = re.compile(r"(?<=[。！？!?、，,])\s*")
 #: 断定辞 ``で`` (「職業はデータベース管理者で、」) を落として命題にする。
 #: ``て`` (「住んでいて、」) は動詞の一部なので対象外。
 _CLAUSE_TAIL_RE = re.compile(r"(?<![ていしっ])で?[、，,]\s*$")
+
+def _strip_clause_tail(text: str) -> str:
+    """節を根拠に採ったときに末尾へ残る接続と読点を落とす (純粋関数)。"""
+    return _CLAUSE_TAIL_RE.sub("", text).rstrip("、，, ")
 
 
 def _tag_evidence_is_question_only(content: str, trigger_words: tuple[str, ...]) -> bool:
@@ -413,12 +422,26 @@ def _attribute_evidence_text(
     # (「職業はデータベース管理者で、名古屋に住んでいます。」) は節単位なら
     # 分離できる。**他属性のトリガ語が渡っているときだけ** 試す — 単一属性の
     # 発話を節へ刻むと、値を運ぶ節が落ちて命題が壊れる。
+    #
+    # **単一属性のときに節で刻んではいけない。** 連用中止 (「〜で、」「〜ていて、」)
+    # の後ろが *別の属性* なのか *同じ属性の敷衍* なのかは、他の属性が解決して
+    # いない限り区別できない。実インシデント (2026-09-05 監査 F-10):
+    # 「趣味は登山で、去年は北アルプスの槍ヶ岳に登りました。」を
+    # 「趣味は登山」へ刻むと、次ターンの訂正
+    # 「槍ヶ岳に登ったのは去年ではなく一昨年です。去年は白馬岳でした。」が
+    # **既存スロットの現在値を名指せなくなり** (値アンカーの手掛かりが消える)、
+    # 訂正が hobby に届かない。
+    #
+    # 取りこぼしで object が粗くなった場合の受け皿は Step 8.3
+    # (:mod:`~backend.free.memory.sleep.personal_fact_curator`) — 節が 2 つ
+    # 以上あるのにスロットが 1 個以下のノートを補助タスクへ回す。**分割の
+    # 証拠が取れたときだけ** 狭めるので、敷衍を切り落とさない。
     if not _has_other_attribute_words(attr_words, all_attr_words):
         return ""
     narrowed = _narrow_by_units(
         content, _CLAUSE_SPLIT_RE, attr_words, all_attr_words,
     )
-    return _CLAUSE_TAIL_RE.sub("", narrowed) if narrowed else ""
+    return _strip_clause_tail(narrowed) if narrowed else ""
 
 
 def _narrow_further_by_clause(
@@ -439,8 +462,66 @@ def _narrow_further_by_clause(
     )
     if not tighter:
         return narrowed
-    tighter = _CLAUSE_TAIL_RE.sub("", tighter)
+    tighter = _strip_clause_tail(tighter)
     return tighter or narrowed
+
+
+def _verified_correct_value(note: MemoryNote) -> str:
+    """検証済み訂正の「正しい値」を、発話の逐語 span である場合だけ返す。
+
+    ``sleep.correction_curator`` は ``check_verdict`` で span を検証済みだが、
+    ノートは永続化を跨ぐので **消費側でも確かめる** (幻覚した値がユーザーの
+    属性として残るのが最悪の失敗)。空白の違いは無視する
+    (``personal_fact_curator.is_verbatim_span`` と同じ規則)。
+    """
+    if not note_is_verified_correction(note):
+        return ""
+    value = str(getattr(note, "correction_correct_value", "") or "").strip()
+    if len(value) < _VALUE_ANCHOR_MIN_CHARS:
+        return ""
+    return value if norm_span(value) in norm_span(note.content or "") else ""
+
+
+def _anchorless_evidence_text(
+    content: str, *, anchor: str = "", correct_value: str = "",
+) -> str:
+    """属性語を持たないスロットの根拠本文を絞る (絞れなければ空文字列)。
+
+    値アンカー / 継承で決まったスロットは ``attr_words`` が空なので
+    :func:`_attribute_evidence_text` が入口で ``""`` を返し、呼出側の
+    ``or content`` が **発話全文** を object に戻していた。訂正でも自己開示でも
+    ないもう半分の文がそのスロットの現在値として残る。
+
+    実インシデント (2026-09-08 夜のライブ監査 G-05): 「住んでいるのは金沢市の
+    野々市寄りです。境川は以前よく自転車で走っていた場所です。」が
+    ``mem.preference.hobby`` の値として live になり、居住地が hobby スロットに
+    残留した (retire は location スロットにしか効かない)。
+
+    絞る手掛かりは順に (1) 検証済みの正しい値、(2) 一致した値アンカー。
+    その文が訂正形なら **次の値を運ぶ文** も連れて行く — 日本語の訂正は
+    「A ではなく B です。C は D でした。」と続けるのが普通で、そこで切ると
+    新しい値の側が落ちる (2026-09-05 監査 F-10)。
+    """
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(content or "") if s.strip()]
+    if len(sentences) < 2:
+        return ""
+    for marker in (correct_value, anchor):
+        needle = norm_span(marker or "")
+        if not needle:
+            continue
+        kept: list[str] = []
+        awaiting_value = False
+        for sentence in sentences:
+            if needle in norm_span(sentence):
+                kept.append(sentence)
+                awaiting_value = has_correction_form(sentence)
+                continue
+            if awaiting_value and not _carries_no_value(sentence):
+                kept.append(sentence)
+                awaiting_value = False
+        if kept and len(kept) < len(sentences):
+            return "".join(kept)
+    return ""
 
 
 def _resolves_a_concrete_attribute(
@@ -907,6 +988,22 @@ _CORRECTION_MARKER_ANCHORS = frozenset({
 })
 
 
+#: 漢字だけの内容語アンカーに要求する最短長。2 文字の漢字連は日本語では
+#: 一般語 (「最初」「興味」「言語」「今日」) になりやすく、値ではなく
+#: **どんな発話にも現れる語** をスロットの決め手にしてしまう。
+#:
+#: 実インシデント (2026-09-08 夜のライブ監査 G-01): ``mem.personal.family`` の
+#: 現在値が質問文まで飲み込んだ過長値
+#: 「家族は妻と中学2年の息子の3人です。息子が最近プログラミングに興味を持ち
+#: 始めたのですが、**最初**の言語として何を勧めるべきか」だったため、
+#: アンカーに ``最初`` が生まれ、物理の訂正「違います。**最初**の答えを計算し
+#: 直してください。…」が family スロットへ着地して家族 4 件を supersede した。
+_VALUE_ANCHOR_MIN_KANJI_CHARS = 3
+
+#: 漢字だけで構成された内容語か。
+_KANJI_ONLY_RUN_RE = re.compile(r"^[一-鿿]+$")
+
+
 def _value_anchors(value: str) -> tuple[str, ...]:
     """スロットの現在値から、照合に使う文字列を取り出す (純粋関数)。
 
@@ -926,22 +1023,42 @@ def _value_anchors(value: str) -> tuple[str, ...]:
     除く。命題そのものも候補に残す (値がひらがなだけの場合の保険) が、
     それが訂正の言い回しで始まる場合は他の訂正へ当たらないので害は無い
     (全文一致は事実上起きない)。
+
+    内容語を採るのは **値の最初の 1 文** だけにする。``object`` は発話原文
+    なので、後続の文 (質問・敷衍) まで含めるとその文の一般語がアンカーに
+    なり、無関係な訂正を吸い寄せる (:data:`_VALUE_ANCHOR_MIN_KANJI_CHARS`
+    の G-01)。節 (読点) で切らないのは、日本語の値がふつう連用中止で続く
+    ためで、そこまで刻むと「趣味は登山で、去年は…槍ヶ岳に登りました」の
+    ``槍ヶ岳`` が消えて訂正が宛先を失う (2026-09-05 監査 F-10)。
     """
     text = (value or "").strip()
     if len(text) < _VALUE_ANCHOR_MIN_CHARS:
         return ()
-    anchors = [text]
-    anchors.extend(
-        run for run in _CONTENT_RUN_RE.findall(text)
-        if len(run) >= _VALUE_ANCHOR_MIN_CHARS
-        and run not in _CORRECTION_MARKER_ANCHORS
+    head = next(
+        (s for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()), text,
     )
+    anchors = [text]
+    for run in _CONTENT_RUN_RE.findall(head):
+        if len(run) < _VALUE_ANCHOR_MIN_CHARS:
+            continue
+        if (
+            _KANJI_ONLY_RUN_RE.match(run)
+            and len(run) < _VALUE_ANCHOR_MIN_KANJI_CHARS
+        ):
+            continue
+        if run in _CORRECTION_MARKER_ANCHORS:
+            continue
+        anchors.append(run)
     return tuple(dict.fromkeys(anchors))
 
 
 def has_correction_form(text: str) -> bool:
-    """発話が訂正の形 (「ではなく」「正しくは」「変わりました」…) を含むか (純粋関数)。"""
-    haystack = _normalize_trigger(text or "")
+    """発話が訂正の形 (「ではなく」「正しくは」「変わりました」…) を含むか (純粋関数)。
+
+    **鉤括弧の内側は本人の主張ではない** ので照合前に落とす (伝聞・引用)。
+    「営業から『前任ではなく私が担当』と言われました」は訂正ではない。
+    """
+    haystack = _normalize_trigger(mask_quoted_speech(text or ""))
     return any(_normalize_trigger(t) in haystack for t in CORRECTION_FORM_TRIGGERS)
 
 
@@ -1001,33 +1118,140 @@ def resolve_value_anchored_attributes(
     Returns:
         ``(note_id, tag) -> attr``。解決できなかったノートは含まない。
     """
+    return {
+        key: attr
+        for key, (attr, _anchor) in resolve_value_anchored_matches(
+            notes, live_values,
+        ).items()
+    }
+
+
+def _slot_anchor_index(
+    live_values: dict[tuple[str, str], tuple[str, ...]],
+) -> dict[tuple[str, str], tuple[tuple[str, ...], tuple[str, ...]]]:
+    """``{(tag, attr): (現在値, アンカー)}`` を組む (純粋関数)。
+
+    **複数スロットの現在値に現れるアンカーは落とす。** 2 つ以上のスロットが
+    同じ語を含むなら、その語は「どのスロットの話か」を決められない — 訂正の
+    宛先を 1 つに絞るという値アンカーの前提そのものが崩れる。文書頻度で
+    落とすので、語彙表 (「一般語リスト」) の保守が要らない。
+    """
+    per_slot: dict[tuple[str, str], tuple[tuple[str, ...], list[str]]] = {}
+    document_freq: dict[str, set[tuple[str, str]]] = {}
+    for slot, values in live_values.items():
+        anchors: list[str] = []
+        for value in values:
+            for anchor in _value_anchors(value):
+                if anchor not in anchors:
+                    anchors.append(anchor)
+                document_freq.setdefault(anchor, set()).add(slot)
+        per_slot[slot] = (tuple(values), anchors)
+    return {
+        slot: (
+            values,
+            tuple(a for a in anchors if len(document_freq.get(a, ())) <= 1),
+        )
+        for slot, (values, anchors) in per_slot.items()
+    }
+
+
+def _anchor_hit_length(anchors: tuple[str, ...], haystack: str) -> tuple[int, str]:
+    """``haystack`` に現れる最長のアンカーを ``(長さ, アンカー)`` で返す。"""
+    best = (0, "")
+    for anchor in anchors:
+        if _normalize_trigger(anchor) in haystack and len(anchor) > best[0]:
+            best = (len(anchor), anchor)
+    return best
+
+
+def _span_hit_length(
+    values: tuple[str, ...], anchors: tuple[str, ...], span: str,
+) -> tuple[int, str]:
+    """検証済みの逐語 span がスロットを指しているかを測る (純粋関数)。
+
+    2 方向で見る — span が現在値の一部か (「100」⊂ 応答)、現在値のアンカーが
+    span の一部か (「名古屋」⊂「さっき名古屋と言いました」)。長い一致ほど
+    偶然でない。
+    """
+    needle = norm_span(span)
+    if not needle:
+        return (0, "")
+    best = (0, "")
+    for value in values:
+        if needle in norm_span(value) and len(needle) > best[0]:
+            best = (len(needle), span)
+    for anchor in anchors:
+        normalized = norm_span(anchor)
+        if normalized and normalized in needle and len(anchor) > best[0]:
+            best = (len(anchor), anchor)
+    return best
+
+
+def resolve_value_anchored_matches(
+    notes: Iterable[MemoryNote],
+    live_values: dict[tuple[str, str], tuple[str, ...]],
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """:func:`resolve_value_anchored_attributes` の本体 (アンカー付きで返す)。
+
+    ``(note_id, tag) -> (attr, 一致したアンカー)``。アンカーは根拠本文を
+    絞るのに使う (:func:`_anchorless_evidence_text`)。
+
+    経路は 2 本ある:
+
+    1. **検証済み** (``sleep.correction_curator`` が ``assistant`` / ``self``
+       と判定した) — LLM が抜いた逐語 span (``correction_wrong_claim`` /
+       ``correction_correct_value``) を live 値へ突き合わせる。「何を誤りと
+       言っているか」が分かっているので、発話全文を投機的に照合しない。
+    2. **未検証** (aux 不在で ``correction_verified_at`` が立たなかった) —
+       従来どおり発話全文へアンカーを当てる。ただしアンカー側を
+       :func:`_value_anchors` / :func:`_slot_anchor_index` で締めてあるので、
+       一般語や他スロット共有語では当たらない。
+
+    検証済みで **却下された** ノート (``same_value`` / ``premise_change`` /
+    ``none`` …) はどちらの経路にも入らない — 訂正ではないと判定済みだからで、
+    そこを通すと検証そのものが無意味になる。
+    """
     if not live_values:
         return {}
-    resolved: dict[tuple[str, str], str] = {}
+    index = _slot_anchor_index(live_values)
+    resolved: dict[tuple[str, str], tuple[str, str]] = {}
     for note in notes:
-        if not (
-            getattr(note, "is_correction", False)
-            or has_correction_form(note.content or "")
-        ):
+        if note_verification_rejected(note):
             continue
         content = note.content or ""
         if not content:
             continue
-        haystack = _normalize_trigger(content)
+        verified = note_is_verified_correction(note)
+        if not verified and not (
+            getattr(note, "is_correction", False)
+            or has_correction_form(content)
+        ):
+            continue
+        spans = [
+            span for span in (
+                str(getattr(note, "correction_wrong_claim", "") or "").strip(),
+                str(getattr(note, "correction_correct_value", "") or "").strip(),
+            ) if span
+        ]
         #: 同じ発話が複数スロットの値を含むことがある (「職業はデータベース
         #: 管理者ではなく…」は occupation の値と pet の「猫」を同時に含みうる)。
         #: **より長く一致した方** を採る — 短い値ほど偶然の混入になりやすい。
-        best: dict[str, tuple[int, str]] = {}
-        for (tag, attr), values in live_values.items():
-            for value in values:
-                for anchor in _value_anchors(value):
-                    if _normalize_trigger(anchor) not in haystack:
-                        continue
-                    current = best.get(tag)
-                    if current is None or len(anchor) > current[0]:
-                        best[tag] = (len(anchor), attr)
-        for tag, (_length, attr) in best.items():
-            resolved[(note.id, tag)] = attr
+        best: dict[str, tuple[int, str, str]] = {}
+        haystack = _normalize_trigger(content)
+        for (tag, attr), (values, anchors) in index.items():
+            if verified and spans:
+                length, anchor = _span_hit_length(values, anchors, spans[0])
+                if not length and len(spans) > 1:
+                    length, anchor = _span_hit_length(values, anchors, spans[1])
+            else:
+                length, anchor = _anchor_hit_length(anchors, haystack)
+            if not length:
+                continue
+            current = best.get(tag)
+            if current is None or length > current[0]:
+                best[tag] = (length, attr, anchor)
+        for tag, (_length, attr, anchor) in best.items():
+            resolved[(note.id, tag)] = (attr, anchor)
     return resolved
 
 
@@ -1091,7 +1315,12 @@ def resolve_inherited_attributes(
         if resolved:
             last_resolved[session] = resolved
             continue
-        if not getattr(note, "is_correction", False):
+        # **継承は検証済みの訂正にだけ許す。** 隣接は「何を訂正しているか」を
+        # 決めない推測でしかないので、字句で立てただけの候補にスロットを丸ごと
+        # 譲ると、訂正でない発話が直前のスロットを乗っ取る (2026-09-08 夜の
+        # 監査 G-01 / G-04)。検証できない (aux 不在) ときは継承せず、通常の
+        # 再言明として扱う。
+        if not note_is_verified_correction(note):
             continue
         for tag, attr in (last_resolved.get(session) or {}).items():
             inherited[(note.id, tag)] = attr
@@ -1130,9 +1359,12 @@ class ChatExtractor(BaseExtractor):
         # 「さっき名古屋と言いましたが、正しくは横浜です。」は location の
         # トリガ語を 1 つも含まず、候補タグ 0 件で入口に到達しなかった
         # (resolve_value_anchored_attributes の説明を参照)。
-        value_anchored = resolve_value_anchored_attributes(
+        value_anchored_matches = resolve_value_anchored_matches(
             note_list, ctx.live_attribute_values,
         )
+        value_anchored = {
+            key: attr for key, (attr, _anchor) in value_anchored_matches.items()
+        }
         for note in note_list:
             if not self.is_eligible(note, self.mode):
                 result.notes_skipped += 1
@@ -1171,6 +1403,16 @@ class ChatExtractor(BaseExtractor):
             # 値アンカーで宛先が決まったタグは、トリガ語が無くても候補にする。
             tags = tags + [
                 tag for (note_id, tag) in value_anchored
+                if note_id == note.id and tag not in tags
+            ]
+            # 検証済みの訂正は「何についての訂正か」を検証器が答えている
+            # (wrong_claim / correct_value) ので、属性語の裏取りが無くても直前の
+            # 言明からスロットを継げるタグを候補にする。実インシデント
+            # (2026-09-09 検証 W02): 「先ほどの話ですが、陶芸ではなく木工教室の
+            # 間違いでした」は verdict=self なのに候補タグ 0 件で抽出対象に
+            # ならず、hobby は訂正前の値のまま残った。
+            tags = tags + [
+                tag for (note_id, tag) in inherited
                 if note_id == note.id and tag not in tags
             ]
             for tag in tags:
@@ -1288,12 +1530,30 @@ class ChatExtractor(BaseExtractor):
                     all_attr_words = tuple({
                         word for _, words in matches for word in words
                     })
+                    # **検証済み訂正の値は逐語 span をそのまま採る。** 発話全文
+                    # を object にすると「すみません、住んでいるのは泉区です」
+                    # がそのままスロットの現在値になる (2026-09-08 監査 G-03)。
+                    # 1 発話が複数スロットを述べているときは、どのスロットの
+                    # 値か決められないので使わない。
+                    correct_value = (
+                        _verified_correct_value(note) if len(matches) == 1 else ""
+                    )
+                    # 属性語を持たないスロット (値アンカー / 継承) は
+                    # ``_attribute_evidence_text`` が絞れないので、アンカーで
+                    # 絞り直す。それでも絞れなければ従来どおり全文
+                    # (:func:`_anchorless_evidence_text` の docstring)。
+                    _anchor = value_anchored_matches.get((note.id, tag), ("", ""))[1]
                     attr_specs = [
                         (
                             make_mem_subject(kind, attr or "user"),
-                            _attribute_evidence_text(
+                            correct_value
+                            or _attribute_evidence_text(
                                 content, attr_words, all_attr_words,
-                            ) or content,
+                            )
+                            or _anchorless_evidence_text(
+                                content, anchor=_anchor,
+                            )
+                            or content,
                             attr_words,
                         )
                         for attr, attr_words in matches
@@ -1335,15 +1595,11 @@ class ChatExtractor(BaseExtractor):
                     object_text = _assertive_evidence(evidence)
                     if not object_text:
                         continue
-                    # 値アンカーで宛先が決まった訂正は、ノートの is_correction
-                    # (属性語彙に依存) が立っていなくても訂正として書く。
-                    # from_correction が無いと supersede が走らず、旧値と新値が
-                    # 両方 live で並ぶ (F-10)。
-                    overrides: dict[str, Any] = {}
-                    if (note.id, tag) in value_anchored and not getattr(
-                        note, "is_correction", False,
-                    ):
-                        overrides["from_correction"] = True
+                    # ``from_correction`` は :func:`note_is_verified_correction`
+                    # だけが決める (``make_fact``)。値アンカーが当たったことを
+                    # 根拠に立てていた上書きは撤去した — 「訂正の形をしている」
+                    # と「実際に過去の発言の誤りを指している」は別で、後者は
+                    # Step 8.0 (``sleep.correction_curator``) が判定する。
                     fact = self.make_fact(
                         subject=subject,
                         predicate=_PREDICATE_BY_TAG.get(tag, "states"),
@@ -1366,7 +1622,6 @@ class ChatExtractor(BaseExtractor):
                         scope=SemanticFact.make_global_scope(),
                         note=note,
                         ctx=ctx,
-                        **overrides,
                     )
                     candidates.append((note, fact))
 

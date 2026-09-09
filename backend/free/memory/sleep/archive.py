@@ -10,13 +10,11 @@ archived = True`` を立てて再提案を防いだうえで、**そのプロジ
 ## ディレクトリの物理移動はもう起きない
 
 スコープはディレクトリではなく ``Evidence.scope`` フィールドになったため
-(c_16 §4.2)、``semantic/projects/<id>/`` は存在しない。``archive_project``
-呼び出しは残してあるが、これは **c_16 以前に作られた残骸を掃く経路**でしか
-発火しない (実体が無ければ state のフラグだけ更新して ``None`` を返す)。
-移動先を指していた ``memory.project.archive_dir`` は読み手が消えたので撤去し
-(c_16 §8)、掃き先は ``<memory_dir>/semantic/archive/`` 固定にした。実際に
-アーカイブされた中身は semantic ストアの事象ログ + snapshot に
-``veracity=retracted`` として残る。
+(c_16 §4.2)、``semantic/projects/<id>/`` は存在しない。``archive_project`` は
+``archived=True`` を立てるだけになり、移動先を指していた
+``memory.project.archive_dir`` も読み手ごと撤去した (c_16 §8)。アーカイブ
+された中身は semantic ストアの事象ログ + snapshot に ``veracity=retracted``
+として残る。
 
 物理削除ではなく retract にするのは c_16 §3 の状態遷移規則 — 消すと監査で
 辿れなくなる。物理 GC は snapshot 3 版後の保持方針の仕事。
@@ -114,7 +112,7 @@ def archive_inactive_projects(
 
     1. ``memory.project.auto_archive_inactive_days`` を読む。``<= 0`` の
        場合はアーカイブ無効として ``[]`` を返す。
-    2. ``path_resolver`` から ``local_state_file`` / ``memory_dir`` を解決する。
+    2. ``path_resolver`` から ``local_state_file`` を解決する。
     3. ``LocalStateStore.load`` / ``propose_archives`` で候補を取得する。
     4. 候補ごとに ``archive_project`` で ``archived=True`` を立てる
        (c_16 以前の ``semantic/projects/<id>/`` が残っていれば移動もする)。
@@ -158,14 +156,9 @@ def archive_inactive_projects(
     try:
         resolver = get_path_resolver()
         state_path = Path(resolver.resolve_local("local_state_file"))
-        memory_dir = Path(resolver.resolve_local("memory_dir"))
     except Exception as exc:
         logger.warning("Step 10: failed to resolve paths: %s", exc)
         return []
-
-    semantic_root = memory_dir / "semantic"
-    # c_16 以前の残骸の掃き先。新規インストールでは src が存在しないので使われない。
-    archive_dir = semantic_root / "archive"
 
     state = LocalStateStore.load(state_path)
     candidates = propose_archives(state, threshold_days=threshold)
@@ -175,11 +168,7 @@ def archive_inactive_projects(
     retired_total = 0
     for pid in candidates:
         try:
-            archive_project(
-                state, pid,
-                semantic_root=semantic_root,
-                archive_dir=archive_dir,
-            )
+            archive_project(state, pid)
         except Exception as exc:
             logger.warning("Step 10: failed to archive %s: %s", pid, exc)
             continue

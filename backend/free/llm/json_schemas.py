@@ -430,6 +430,82 @@ class KnowledgeClaimList(_StrictModel):
     claims: list[KnowledgeClaim]
 
 
+# ── 一人称発話の属性分割 (personal_fact_split) ──
+
+
+class PersonalFactSplitItem(_StrictModel):
+    """1 属性 = 1 件。``slot`` は ``fact_attributes.yaml`` のキー (呼出側が検証)。"""
+
+    slot: str = Field(max_length=40)
+    value: str = Field(max_length=200)
+
+
+class PersonalFactSplit(_StrictModel):
+    """`backend/free/memory/sleep/personal_fact_curator.py` の属性分割。
+
+    regex 抽出 (Step 8) が「私は〜」発話から属性を取りこぼした / 複数節を
+    1 属性に飲み込んだときだけ、sleep-time で発話を属性ごとの逐語 span に
+    分ける。``value`` は **発話の部分文字列であることを呼出側が検証** し、
+    含まれない値は捨てる (幻覚防止)。``slot`` も yaml のキー集合で検証する。
+    (2026-09-08 監査 F-01)
+    """
+
+    facts: list[PersonalFactSplitItem] = Field(max_length=8)
+
+
+# ── 訂正候補の検証 (correction_verify) ──
+
+
+class CorrectionVerdict(_StrictModel):
+    """`backend/free/learning/correction_verifier.py` の訂正候補検証。
+
+    記録時の字句検出 (``FeedbackCollector``) は候補に過ぎず、学習側が消費
+    する前に「直前のアシスタント応答の誤りを指す発話か」を sleep-time /
+    学習開始時に判定する。``wrong_claim`` は直前応答の逐語 span、
+    ``correct_value`` は訂正発話の逐語 span で、呼出側が部分文字列検証する。
+    (2026-09-08 監査 F-03 / 2026-09-07 監査 F-01)
+    """
+
+    is_correction: bool
+    target: Literal["assistant", "self", "third_party", "premise_change", "none"]
+    wrong_claim: str = Field(max_length=200)
+    correct_value: str = Field(max_length=200)
+
+
+# ── 日付演算の意図 (date_intent) ──
+
+
+class DateIntent(_StrictModel):
+    """`backend/free/agent/tool_judge_commands.py` の日付演算意図。
+
+    正規表現カスケードが now-only コマンドに落ちた日付演算クエリから
+    **パラメータだけ** を取る。コマンド文字列はコード側が決定論的に組む
+    (LLM にコードは書かせない)。``kind == "none"`` は日付演算でない。
+    (2026-09-08 監査 F-06)
+
+    ``direction`` / ``excluded_weekdays`` は 2026-09-09 監査 G-06 で追加。
+    「その日から逆算して」のような向きと、「毎週水曜日は作業できない」のような
+    曜日除外はどちらもパラメータ空間に無く、ツールが前向きのコマンドしか
+    組めなかった (モデルは結果を捨てて暗算し誤答した)。値域はコード側
+    (``parse_date_intent``) が検証する — この schema は形だけを強制する。
+    """
+
+    kind: Literal[
+        "business_days_from", "days_from", "days_between", "weekday_of", "none",
+    ]
+    start: str = Field(max_length=10)
+    end: str = Field(max_length=10)
+    n: int = Field(ge=0, le=100000)
+    skip_weekends: bool
+    holidays: list[str] = Field(max_length=32)
+    count_start_day: bool
+    #: 起点より後 (forward、通常) か前 (backward、逆算・遡る) か。
+    direction: Literal["forward", "backward"]
+    #: 作業日・営業日から除外する曜日 (0=月曜〜6=日曜)。``skip_weekends``
+    #: (土日) とは独立 — 両方指定されたら合算する。
+    excluded_weekdays: list[int] = Field(max_length=7)
+
+
 # ── purpose -> schema 自動解決マップ ──
 #
 # 呼出側が ``response_schema`` を明示しない場合、AuxClient が purpose
@@ -453,6 +529,9 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "fewshot_quality_score": FewShotQualityJudgement,
     "prompt_candidate_judge": PromptCandidateJudgement,
     "knowledge_claim_extract": KnowledgeClaimList,
+    "personal_fact_split": PersonalFactSplit,
+    "correction_verify": CorrectionVerdict,
+    "date_intent": DateIntent,
 }
 
 

@@ -823,7 +823,7 @@ async def _build_messages_with_search(
     long_form 経路が orchestrator に再利用注入するために返す (非 long_form 経路は
     ``messages`` 側で消費するため未使用)。最後の要素は Level 0 の
     ``rag_top1_score`` 用で、``scored_chunks`` 側のスコアが
-    ``rag.score_normalization`` 適用後 (minmax なら先頭は定義上 1.0) なのに対し、
+    順位式 (c_16 §7.2) 適用後の salience なのに対し、
     こちらは cosine スケールの生スコア (``SearchResult.top_raw_score``)。
 
     ``search_task`` が渡された場合は chat() が先行起動した検索タスクを await して
@@ -1887,8 +1887,8 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
 
         # Level 0 経験記録用 RAG シグナル。long_form 経路は prefetched_rag から
         # 自前で導出するため、ここでは meta_cognitive / deliberative へ伝播する。
-        # スコアは正規化前の生スコア (rag_top_raw) を渡す — scored_chunks 側は
-        # score_normalization 適用後で minmax なら先頭が定義上 1.0 になる。
+        # スコアは cosine スケールの生スコア (rag_top_raw) を渡す — scored_chunks 側は
+        # 順位式 (c_16 §7.2) 適用後の salience で cosine と比較できない。
         rag_used, rag_top1_score = rag_signals_from_chunks(scored_chunks, rag_top_raw)
 
         match agent_layer:

@@ -602,7 +602,7 @@ async def reembed_facts(
     自動的に新モデルで作り直される (前の版から流用できる行が無いため)。
     したがってこのエンドポイントがやることは 1 つ:
 
-    1. 現在の model_id の索引ディレクトリを消す (同一モデルでの強制やり直し)
+    1. 現在の model_id の索引ディレクトリ (全版) を消す (同一モデルでの強制やり直し)
     2. 版を 1 つ積む (``create_snapshot``) — その中で全件が埋め込み直される
 
     embed サーバが新モデルへ未切替 (config と不一致) の場合は 409 で拒否する
@@ -654,7 +654,9 @@ async def reembed_facts(
     t0 = time.monotonic()
     # 同一モデルでのやり直しは索引を消してからでないと増分再利用が効いて
     # 何も再計算されない (本文が変わっていない行はそのまま流用される)。
-    embeddings_dir = store.evidence.embeddings_dir(current_model_id)
+    # 版ディレクトリではなくモデルディレクトリごと落とす — 版を 1 つ残すと
+    # ``text_hash`` が一致した行がそのまま流用され、何も再計算されない。
+    embeddings_dir = store.evidence.embeddings_model_dir(current_model_id)
     store.evidence.close()
     if embeddings_dir.exists():
         try:

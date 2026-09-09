@@ -71,8 +71,10 @@ async def trigger_learning(req: TriggerRequest, state: AppState = Depends(get_ap
 
     `level=level1`: 優先キューに `manual` 要求を 1 件積む。LLM 接続を待たず
         永続化されるため、未接続でも次回のループ tick で実行される。
-    `level=full`: Full sleep-time update を即座にキックし、追加で `manual`
-        要求を優先キューに積む。
+    `level=full`: Full sleep-time update を **Trigger B と同じ 1 本の経路で**
+        予約し、完了を待ってから `manual` 要求を優先キューに積む
+        (Level 1 が「書き終えた記憶」を見る保証)。既に Full が走っていれば
+        2 本目は起こさず、その 1 本の完了を待つ。
     """
     logger.debug("POST /api/learning/trigger: level=%s", req.level)
     if req.level not in ("level1", "full"):
@@ -88,7 +90,7 @@ async def trigger_learning(req: TriggerRequest, state: AppState = Depends(get_ap
             "api.learning_scheduler_not_initialized",
         )
 
-    # Full モード: まず sleep-time update を実行する。
+    # Full モード: まず sleep-time update を通す。
     #
     # **``_worker.run_full()`` を直接呼ばない**。スケジューラの
     # ``run_full_now()`` を通すと WM → STM スナップショット
@@ -98,20 +100,22 @@ async def trigger_learning(req: TriggerRequest, state: AppState = Depends(get_ap
     # 進行中セッションのターンが Step 8 の入力から丸ごと抜ける
     # (2026-08-27 ライブ監査で実測。詳細は ``run_full_now`` の docstring)。
     #
-    # LLM 未接続なら False が返り、Step 5.8-10 はスキップされる (c_14 §6)。
+    # ``run_full_now()`` は **予約して Trigger B の 1 本に合流する** だけで、
+    # 自分では worker を叩かない。手動と Trigger B が別経路で走り、523 秒の
+    # Full が 2 本並走した事故 (2026-09-08 ライブ監査) を構造的に止める。
+    full_outcome: str | None = None
     if req.level == "full":
         sleep_sched = state.sleep_scheduler
         if sleep_sched is not None:
             try:
-                logger.info("Manual trigger: running Full sleep-time update first")
-                ran = await sleep_sched.run_full_now()
-                if not ran:
-                    logger.info(
-                        "Manual trigger: Full sleep-time skipped "
-                        "(worker or sleep client unavailable)",
-                    )
+                logger.info("Manual trigger: requesting a Full sleep-time update first")
+                full_outcome = await sleep_sched.run_full_now()
+                logger.info(
+                    "Manual trigger: Full sleep-time outcome=%s", full_outcome,
+                )
             except Exception as e:
                 logger.error("Full sleep-time update failed during manual trigger: %s", e)
+                full_outcome = "failed"
                 # Full が失敗しても Level 1 は要求として積む
 
     # 優先キューに manual 要求を push（LLM 未接続でも OK）
@@ -127,6 +131,16 @@ async def trigger_learning(req: TriggerRequest, state: AppState = Depends(get_ap
     message = msg(
         "api.learning_request_queued", level=req.level, position=queue_length,
     )
+    if full_outcome is not None:
+        # Full の結末を先頭に添える。「押したのに何も起きていない」ように
+        # 見える 3 つの状態 (走行中に合流 / 待ち切れず予約のまま / 縮退) を
+        # UI 側で区別できるようにする。
+        note_key = {
+            "completed": "api.learning_full_completed",
+            "already_running": "api.learning_full_already_running",
+            "deferred": "api.learning_full_deferred",
+        }.get(full_outcome, "api.learning_full_skipped")
+        message = f"{msg(note_key)} {message}"
 
     return TriggerResponse(
         triggered=True,

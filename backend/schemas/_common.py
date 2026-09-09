@@ -609,6 +609,10 @@ class ProKnowledgeConfig(BaseModel):
     fetch_timeout_sec: int = Field(default=20, ge=1)
     max_items_per_run: int = Field(default=20, ge=1)
     max_claims_per_item: int = Field(default=8, ge=1)
+    #: ``expired`` / ``retracted`` になった取得単位を ``items.jsonl`` から
+    #: 落とすまでの日数 (c_05 §0.5.6)。0 で GC しない。``active`` は claim の
+    #: ``provenance`` が指しているので対象外。
+    items_keep_days: int = Field(default=30, ge=0)
     user_agent: str = "evoref-knowledge/1.0"
 
 

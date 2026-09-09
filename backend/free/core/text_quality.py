@@ -978,12 +978,26 @@ def states_no_user_value(text: str) -> bool:
     依頼節より前の節に本人の言明がある複合文 (「私は〜なので、〜して
     ください。」) は事実表明を兼ねるので落とさない
     (:func:`_asserts_before_request`)。
+
+    依頼/疑問の文に **述語を持たない短い体言止め** が続く場合も、その体言止めを
+    依頼の一部 (箇条書きの指定など) として扱う (:func:`_looks_like_bare_noun_fragment`)。
+    実インシデント (2026-09-08 ライブ監査): 「件名も付けてください。簡潔な
+    ものを 3 案。」が、第 2 文の体言止めだけを理由に「言明あり」と誤判定され、
+    依頼文まるごとが ``[関連する記憶]`` へ (過去の記録) として再注入された。
     """
     sentences = [s.strip() for s in _SENTENCE_RE.findall(text or "")]
     sentences = [s for s in sentences if s]
     if not sentences:
         return True
-    return all(_is_non_assertive_sentence(s) for s in sentences)
+    flags = [_is_non_assertive_sentence(s) for s in sentences]
+    if all(flags):
+        return True
+    if not any(flags):
+        return False
+    return all(
+        flag or _looks_like_bare_noun_fragment(s)
+        for s, flag in zip(sentences, flags)
+    )
 
 
 def _is_non_assertive_sentence(sentence: str) -> bool:
@@ -993,6 +1007,31 @@ def _is_non_assertive_sentence(sentence: str) -> bool:
     if not _REQUEST_ENDING_RE.search(sentence):
         return False
     return not _asserts_before_request(sentence)
+
+
+#: 述語 (動詞 / 形容詞 / 助動詞) の典型的な文末活用語尾。平叙文はこのいずれかで
+#: 終わる。体言止め (述語を持たない名詞句で終わる文) はどれにも当たらない。
+_PREDICATE_TAIL_RE = re.compile(
+    r"(?:です|ます|でした|ました|ません|だ|である|ない|なかった|たい"
+    r"|よう|れる|られる|せる|させる"
+    r"|[うくぐすつぬぶむる])"
+    r"[。．.！!？?]?\s*$",
+)
+
+
+def _looks_like_bare_noun_fragment(sentence: str, *, max_len: int = 20) -> bool:
+    """述語を持たない短い体言止めか (:func:`states_no_user_value` 専用の補助)。
+
+    単独では「体言止めの平叙文」と区別できないため、**他の文が依頼/疑問で
+    あることが確認できた場面** (:func:`states_no_user_value`) でのみ呼ぶ。
+    疑問形・依頼形はここでは非対象 (呼出元の ``flags`` が既に拾っている)。
+    """
+    body = sentence.strip()
+    if not body or len(body) > max_len:
+        return False
+    if _INTERROGATIVE_TAIL_RE.search(body) or _REQUEST_ENDING_RE.search(body):
+        return False
+    return not _PREDICATE_TAIL_RE.search(body)
 
 
 __all__ = [

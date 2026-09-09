@@ -66,7 +66,7 @@ export async function throwIfNotOk(res: Response): Promise<void> {
 }
 
 /** サポートする HTTP メソッド */
-type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
 /** 共通リクエストの追加オプション */
 export interface RequestOptions {

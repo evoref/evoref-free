@@ -58,6 +58,12 @@ attrs キー          消費者
 ``url_curated_at``      ``sleep.url_curator`` (Step 8.5) の冪等マーカー
 ``command_curated_at``  ``sleep.executable_command_curator`` (Step 8.6)
 ``assertion_curated_at`` / ``assertion_slug`` ``sleep.assertion_curator``
+``personal_fact_curated_at`` ``sleep.personal_fact_curator`` (Step 8.3)
+``correction_verified_at`` / ``correction_verdict`` /
+``correction_wrong_claim`` / ``correction_correct_value``
+                        ``sleep.correction_curator`` (Step 8.0)
+``curation_failures``   ``sleep.curation_backoff`` (Step 8.3〜8.5 共用の
+                        一過性失敗バックオフ)
 ``pin_reason``          pin の理由 (可視化 / デバッグ)
 ``episode_id``          ``notes.mdp_ingester`` 由来のノート
 ================== ==================================================
@@ -134,10 +140,16 @@ NOTE_ATTR_FIELDS: tuple[str, ...] = (
     "command_curated_at",
     "assertion_curated_at",
     "assertion_slug",
+    "personal_fact_curated_at",
+    "correction_verified_at",
+    "correction_verdict",
+    "correction_wrong_claim",
+    "correction_correct_value",
     "pin_reason",
     "episode_id",
     "turn_index",
     "summary_of",
+    "curation_failures",
 )
 
 #: ``attrs`` に既定値と同じ値しか入っていないときは書かない (レコードを太らせない)。
@@ -168,10 +180,16 @@ _ATTR_DEFAULTS: dict[str, Any] = {
     "command_curated_at": None,
     "assertion_curated_at": None,
     "assertion_slug": None,
+    "personal_fact_curated_at": None,
+    "correction_verified_at": None,
+    "correction_verdict": None,
+    "correction_wrong_claim": "",
+    "correction_correct_value": "",
     "pin_reason": None,
     "episode_id": None,
     "turn_index": 0,
     "summary_of": [],
+    "curation_failures": {},
 }
 
 
@@ -241,9 +259,49 @@ class MemoryNote:
     command_curated_at: float | None = None
     assertion_curated_at: float | None = None
     assertion_slug: str | None = None
+    personal_fact_curated_at: float | None = None
+    """``sleep.personal_fact_curator`` (Step 8.3) の冪等マーカー。
+
+    既定値と同じ ``None`` は ``attrs`` に書かれないので、既存レコードは
+    読み戻しでそのまま ``None`` になる (封筒の追加キーなので版は上げない)。
+    """
+
+    correction_verified_at: float | None = None
+    """``sleep.correction_curator`` (Step 8.0) の冪等マーカー。
+
+    ``is_correction`` は **字句で立てた候補** に過ぎない。``None`` の間は
+    「まだ検証していない」であって「訂正ではない」ではないので、消費側は
+    ``correction_verdict`` と併せて読む (:func:`~backend.free.memory.
+    extractors.base.note_is_verified_correction`)。
+    """
+
+    correction_verdict: str | None = None
+    """検証の帰属 (``assistant`` / ``self``) または却下理由。
+
+    ``assistant`` / ``self`` だけが「誤りの指摘」。それ以外
+    (``premise_change`` / ``none`` / ``third_party`` / ``same_value`` /
+    ``already_stated`` / ``invalid_span`` / ``no_context`` …) は **訂正では
+    なかった** という記録で、消費側は通常の再言明として扱う。
+    """
+
+    correction_wrong_claim: str = ""
+    """訂正が指した誤りの逐語 span (帰属先の本文から抜いたもの)。"""
+
+    correction_correct_value: str = ""
+    """訂正が示した正しい値の逐語 span (訂正発話から抜いたもの)。"""
 
     conflict_fail_count: int = 0
     conflict_cooldown_until: float | None = None
+
+    curation_failures: dict = field(default_factory=dict)
+    """``sleep.curation_backoff`` の一過性失敗カウンタ (curator 名 → 状態)。
+
+    ``{"<purpose>": {"count": int, "cooldown_until": float | None}}``。
+    ``personal_fact_curator`` / ``assertion_curator`` / ``url_curator`` が
+    共用する — 補助タスクの例外 (aux timeout 等) は ``*_curated_at`` を立てず
+    ここへ積む。閾値到達で cooldown に入り、それまでは次サイクルで再試行する
+    (``conflict_fail_count`` / ``conflict_cooldown_until`` と同じ形の汎化)。
+    """
 
     tier: str = "short"
     """``working`` / ``short`` / ``long`` (c_16 §4.1)。遷移は ``patch`` のみ。"""

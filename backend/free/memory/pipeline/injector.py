@@ -138,6 +138,13 @@ DEFAULT_POLICY_ACTIVATION_MIN_CONFIDENCE = 0.7
 #: スコア計算で用いる recency 半減期 (日)
 _RECENCY_HALF_LIFE_DAYS = 14.0
 
+#: ノートの派生ファクトが全件 live かつ同ターンで注入済みのときに掛ける減衰。
+#:
+#: ファクトが正典で、ノートは同じ主張の原文再掲でしかない。ゼロにして除外は
+#: しない — ノートには抽出で落ちた文脈 (経緯・言い回し) が残ることがあるため、
+#: 予算に余裕があれば低い優先度のまま載る余地を残す (F-02, 2026-09-08)。
+_DUPLICATE_FACT_NOTE_PENALTY = 0.4
+
 #: この日数以上前に記録されたファクトは、行に「N日前の記録」と書き添える。
 #: 当日のもの (= 今の会話で書かれた可能性がある) には付けない。
 _FACT_STALE_LABEL_DAYS = 1.0
@@ -304,6 +311,16 @@ def _corroboration_count(fact: SemanticFact) -> int:
         if key:
             sources.add(key)
     return len(sources)
+
+
+def _add_provenance_note_ids(sink: "set[str] | None", fact: SemanticFact) -> None:
+    """畳み込みで負けたファクトの provenance ``note_id`` を ``sink`` へ足す。"""
+    if sink is None:
+        return
+    for prov in getattr(fact, "provenances", None) or ():
+        note_id = getattr(prov, "note_id", None)
+        if note_id:
+            sink.add(str(note_id))
 
 
 def _normalize_for_dup(text: str) -> str:
@@ -837,9 +854,16 @@ class MemoryInjector:
                 fact, mode, current_project_id, sigs,
             ) is not None
 
+        # 畳み込みで負けた世代の元発話ノートも ``retired`` と同じ扱いにする。
+        # ストア側で supersede されない多値スロット (name 等) は、ここが唯一の
+        # 「旧値」判定になる (2026-09-08 監査 F-01/F-02)。
+        stale_note_ids: set[str] = set()
         facts, collapsed, stale_texts = self._collapse_to_current_values(
             facts, collapsible=_collapsible, no_value_cache=no_value,
+            stale_note_ids=stale_note_ids,
         )
+        if stale_note_ids:
+            retired = set(retired) | stale_note_ids
         filtered_out += collapsed
         # 関連度スコアは候補ごとの numpy 演算ではなく 1 回の行列積で求める
         # (:meth:`_relevance_scores`)。判定の意味は変わらない。
@@ -1010,9 +1034,22 @@ class MemoryInjector:
                 ),
             )
 
+        # このターンで実際に注入 (Tier 配置) されたファクトの id。ノートの
+        # ``extracted_fact_ids`` 全件がここに含まれるなら、そのノートは
+        # 既に注入済みのファクトの原文再掲でしかない (:meth:`_score_note` の
+        # ``duplicate_of_live_fact`` を参照)。
+        injected_fact_ids = {
+            item.item_id
+            for tier_items in buckets.values()
+            for item in tier_items
+            if item.source == "fact"
+        }
+
         stm_notes = list(stm_notes)
         # STM ノートは埋め込み行列を持つストアが無いので事前計算できない。
         # 候補ごとの判定のまま (件数は ``memory.max_notes`` で抑えられている)。
+        # ゲートで計算したコサインは :meth:`_passes_gate` がここへ書き戻す
+        # (:meth:`_score_note` が並びへ反映する)。
         note_scores: dict[int, float] = {}
         for note in stm_notes:
             pinned = bool(getattr(note, "pin_flag", False))
@@ -1124,7 +1161,12 @@ class MemoryInjector:
             tier = self._classify_note(note, mode, current_project_id)
             if tier is None:
                 continue
-            score = self._score_note(note)
+            duplicate_of_live_fact = bool(note.extracted_fact_ids) and all(
+                fid in injected_fact_ids for fid in note.extracted_fact_ids
+            )
+            score = self._score_note(
+                note, note_scores.get(id(note)), duplicate_of_live_fact,
+            )
             text = self._render_note(note)
             tokens = estimate_tokens(text)
             buckets[tier].append(
@@ -1327,6 +1369,7 @@ class MemoryInjector:
             return self._is_relevant(
                 query_vec, getattr(item, "embedding", None),
                 pinned=pinned, require_embedding=require_embedding,
+                item_id=id(item), score_out=scores,
             )
         if pinned:
             return score >= self.pinned_relevance_min_score
@@ -1339,6 +1382,8 @@ class MemoryInjector:
         *,
         pinned: bool,
         require_embedding: bool = False,
+        item_id: int | None = None,
+        score_out: "dict[int, float] | None" = None,
     ) -> bool:
         """関連度ゲートを通すか判定する。
 
@@ -1382,6 +1427,11 @@ class MemoryInjector:
         の歯科予約・会議進行の話が注入され、この会話に存在しない予定を捏造した)。
         ノート本文は素の会話テキストで一人称・時制をそのまま含むため誤読の害が
         大きい。関連性を確認できないノートは注入しない方が安全側になる。
+
+        ``item_id`` / ``score_out`` は :meth:`_passes_gate` からの委譲専用。
+        ノート側は事前計算した cosine 行列を持たないため、ここで計算した値を
+        ``score_out`` (呼出元の ``note_scores``) へ書き戻し、:meth:`_score_note`
+        が並び順にも同じ値を使えるようにする (二重計算しない)。
         """
         if query_vec is None:
             return True
@@ -1410,6 +1460,8 @@ class MemoryInjector:
         if not norm or not np.isfinite(norm):
             return True
         score = float(query_vec @ (w / norm))
+        if score_out is not None and item_id is not None:
+            score_out[item_id] = score
         if pinned:
             return score >= self.pinned_relevance_min_score
         return score >= self.relevance_min_score
@@ -1563,16 +1615,35 @@ class MemoryInjector:
             base += CORRECTION_BONUS
         return base
 
-    def _score_note(self, note: MemoryNote) -> float:
+    def _score_note(
+        self,
+        note: MemoryNote,
+        cosine: float | None = None,
+        duplicate_of_live_fact: bool = False,
+    ) -> float:
         """ノートのスコア (高いほど優先)。
 
         ``confidence`` (origin から決定論導出) + 最終利用の recency。
         アクセス回数の項は無い — 回数はレコードに持たなくなり、
         「最後に使った時刻」(``last_used_at`` → ``accessed_at``) だけが残る
         (c_16 §3 / §5.4)。
+
+        ``cosine`` は :meth:`_passes_gate` (経由の :meth:`_is_relevant`) が
+        既に計算済みの類似度。ファクト側と違い、ノートには
+        ``confidence + recency`` にクエリとの近さを反映する項が無く、
+        関連度で無関係でも新しい/確度が高いノートが上位に出ていた。
+        pinned 加点には掛けない — :meth:`_score_fact` の pinned/訂正加点と
+        同じ理由で、優先度は関連度とは別の軸 (F-02, 2026-09-08)。
+
+        ``duplicate_of_live_fact`` は :data:`_DUPLICATE_FACT_NOTE_PENALTY` を
+        参照。
         """
         base = float(note.confidence)
         base += self._recency_term(note.accessed_at)
+        if cosine is not None:
+            base *= max(cosine, 0.0)
+        if duplicate_of_live_fact:
+            base *= _DUPLICATE_FACT_NOTE_PENALTY
         if note.pin_flag:
             base += PINNED_BONUS
         return base
@@ -1690,8 +1761,16 @@ class MemoryInjector:
         *,
         collapsible: "Callable[[SemanticFact], bool] | None" = None,
         no_value_cache: "dict[int, bool] | None" = None,
+        stale_note_ids: "set[str] | None" = None,
     ) -> tuple[list[SemanticFact], int, set[str]]:
         """1 スロット 1 値へ畳む (純粋関数的。入力は変更しない)。
+
+        ``stale_note_ids`` を渡すと、畳み込みで **負けた世代** の provenance
+        ``note_id`` をそこへ書き足す。多値スロット (``mem.personal.name`` 等)
+        はストア側で supersede されないため、読み出し側の畳み込みが唯一の
+        「旧値」判定になる — 負けたファクトの元発話ノートを
+        ``retired_note_ids`` と同じ扱いで (過去の記録) から外すために使う
+        (2026-09-08 監査 F-01/F-02: 旧名の発話ノートが名前の質問へ再注入)。
 
         ``collapsible`` は属性またぎの畳み込み (:meth:`_collapse_by_attribute`)
         に参加させるファクトの述語。``None`` なら全件 (旧挙動、テスト互換)。
@@ -1776,10 +1855,12 @@ class MemoryInjector:
             dropped += 1
             if self._supersedes(fact, current):
                 stale_texts.add(_normalize_for_dup(current.object))
+                _add_provenance_note_ids(stale_note_ids, current)
                 out[slot_pos[slot]] = fact
                 by_slot[slot] = fact
             else:
                 stale_texts.add(_normalize_for_dup(fact.object))
+                _add_provenance_note_ids(stale_note_ids, fact)
         # ここまでは ``(subject, predicate)`` 単位。**同じ属性が別スロットへ
         # 分散する** ケースはこれでは畳めない。実測 (2026-08-22 ライブ監査
         # 2 回目、実ファクトストア): 「好きな飲み物」が
@@ -1792,6 +1873,7 @@ class MemoryInjector:
         # もう一段畳んで最新 1 値に寄せる。
         out, attr_dropped = self._collapse_by_attribute(
             out, stale_texts, collapsible=collapsible, no_value_cache=no_value_cache,
+            stale_note_ids=stale_note_ids,
         )
         dropped += attr_dropped
         if dropped:
@@ -1807,6 +1889,7 @@ class MemoryInjector:
         *,
         collapsible: "Callable[[SemanticFact], bool] | None" = None,
         no_value_cache: "dict[int, bool] | None" = None,
+        stale_note_ids: "set[str] | None" = None,
     ) -> tuple[list[SemanticFact], int]:
         """属性名 (subject 末尾) をまたいだ世代を 1 値へ畳む。
 
@@ -1845,10 +1928,12 @@ class MemoryInjector:
             dropped += 1
             if self._supersedes(fact, current):
                 stale_texts.add(_normalize_for_dup(current.object))
+                _add_provenance_note_ids(stale_note_ids, current)
                 out[attr_pos[key]] = fact
                 by_attr[key] = fact
             else:
                 stale_texts.add(_normalize_for_dup(fact.object))
+                _add_provenance_note_ids(stale_note_ids, fact)
         return out, dropped
 
     @staticmethod

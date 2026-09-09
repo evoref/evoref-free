@@ -26,6 +26,10 @@ from backend.free.agent.tool_judge_args import (
     _extract_head_line_count,
     _normalize_path_text,
 )
+from backend.free.agent.tool_judge_commands import (
+    command_lacks_date_arithmetic,
+    query_has_date_math_cue,
+)
 from backend.free.agent.tool_judge_dialogue import (
     _dialogue_text,
     _recent_dialogue_text,
@@ -46,6 +50,7 @@ from backend.free.agent.tool_judge_signals import (
 )
 from backend.free.agent.tool_judge_types import ToolJudgement
 from backend.free.agent.tools_registry import ToolDefinition, ToolsRegistry
+from backend.free.core.date_math_cue import conversation_has_date_math_cue
 from backend.free.core.intent_vocab import (
     excludes_current_conversation,
     has_long_range_recall_keyword,
@@ -725,6 +730,41 @@ def _flag_suspicious_calculate(
         expression[:80], "; ".join(issues),
     )
     return replace(result, expression_issues=issues)
+
+
+def _flag_ungrounded_date_math(
+    result: ToolJudgement, ctx: GuardContext,
+) -> ToolJudgement:
+    """日付演算を求められたのに現在日時しか測らないコマンドへ、印を **立てる**。
+
+    PR#407 の方針 (「暗算へ格下げせず、接地していないことを開示させる」) の
+    日付版。``calculate`` の式には ``unexplained_numbers`` /
+    ``expression_issues`` が付くのに、日付演算には同じ印が無く、now-only コマンド
+    を撃ったターンは「ツールを使った」外観だけを持って暗算の答えを出していた
+    (2026-09-08 ライブ監査 F-06: 「30 営業日目」5/5 誤答)。
+
+    格下げしないのは ``_suppress_ungrounded_calculate`` と同じ理由 — 落ち先は
+    base の暗算で、現在日時すら渡らないぶん誤りやすくなる。
+
+    **この関数は** :data:`GUARD_PIPELINE` **に載せない**。判定層の内側 (``_finalize``)
+    で掛けると、その後に走る ``date_intent`` 層 (コマンドを日付演算へ差し替える)
+    の結果を先取りして誤った印が残る。``judge()`` が差し替えの **後** に 1 度だけ
+    掛ける。
+    """
+    if not result.tool_needed or result.tool_name not in _COMMAND_TOOL_NAMES:
+        return result
+    command = str((result.tool_args or {}).get("command") or "")
+    if not command:
+        return result
+    if not conversation_has_date_math_cue(ctx.query, ctx.conversation):
+        return result
+    if not command_lacks_date_arithmetic(command):
+        return result
+    logger.info(
+        "Date arithmetic is not tool-verified for %r; the answer must disclose it",
+        (ctx.query or "")[:80],
+    )
+    return replace(result, unexplained_date_math=True)
 
 
 def _suppress_ungrounded_read_path(

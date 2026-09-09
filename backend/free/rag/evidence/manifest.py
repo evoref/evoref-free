@@ -9,6 +9,7 @@ payload:
 ```jsonc
 { "store": "episodic", "record_version": 1, "active_snapshot": "v0007",
   "embedding_model_id": "bge-m3", "embedding_dim": 1024,
+  "embedding_version": "v0003",
   "chunker_version": 1, "lexical_version": 1,
   "retention": { ... §5.4 ... },
   "events_since_snapshot": 128,
@@ -59,6 +60,7 @@ _KNOWN_PAYLOAD_KEYS = frozenset({
     "active_snapshot",
     "embedding_model_id",
     "embedding_dim",
+    "embedding_version",
     "chunker_version",
     "lexical_version",
     "retention",
@@ -80,6 +82,9 @@ class EvidenceManifest(JsonStateFile):
         self.active_snapshot: str = ""
         self.embedding_model_id: str = ""
         self.embedding_dim: int = 0
+        #: 読むべき埋め込み索引の版 (``embeddings/<model_id>/v0003/``、c_16 §6.1)。
+        #: snapshot と同じく **版を積んで指す**。空文字なら未生成。
+        self.embedding_version: str = ""
         self.chunker_version: int = 1
         self.lexical_version: int = 1
         self.retention: dict[str, Any] = dict(DEFAULT_RETENTION)
@@ -119,6 +124,7 @@ class EvidenceManifest(JsonStateFile):
             "active_snapshot": self.active_snapshot,
             "embedding_model_id": self.embedding_model_id,
             "embedding_dim": int(self.embedding_dim),
+            "embedding_version": self.embedding_version,
             "chunker_version": int(self.chunker_version),
             "lexical_version": int(self.lexical_version),
             "retention": dict(self.retention),
@@ -136,6 +142,7 @@ class EvidenceManifest(JsonStateFile):
         self.active_snapshot = str(payload.get("active_snapshot") or "")
         self.embedding_model_id = str(payload.get("embedding_model_id") or "")
         self.embedding_dim = int(payload.get("embedding_dim") or 0)
+        self.embedding_version = str(payload.get("embedding_version") or "")
         self.chunker_version = int(payload.get("chunker_version") or 1)
         self.lexical_version = int(payload.get("lexical_version") or 1)
         retention = payload.get("retention")

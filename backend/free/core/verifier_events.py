@@ -54,6 +54,7 @@ VERIFIER_IDS: frozenset[str] = frozenset({
     "content.self_retraction",  # 1 つの応答に結論が 2 つ (撤回 / 列挙して否定)
     "content.measured",         # 注入した実測値と別の数を述べた
     "content.tool_result",      # calculate の結果を回答に使わなかった
+    "content.date_result",      # date_intent ツールの target 日付を回答に使わなかった
     "content.claimed_change",   # 撃てなかったのに完了を述べた
     "content.user_echo",        # ユーザー発話のオウム返し
 })

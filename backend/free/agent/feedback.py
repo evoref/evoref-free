@@ -31,10 +31,12 @@ from backend.free.core.correction_target import (
     DEFAULT_LOOKBACK as CORRECTION_LOOKBACK,
     resolve_correction_target,
 )
+from backend.free.core.correction_verdict import mask_quoted_speech
 from backend.free.core.response_arithmetic import (
     find_arithmetic_contradictions,
     find_conclusion_contradiction,
 )
+from backend.free.core.response_dates import ignores_date_result
 from backend.free.core.verifier_events import record_turn_outcome, record_verifier_hit
 from backend.free.agent.issue_ledger import record_current_issue
 from backend.free.core.text_quality import (
@@ -316,10 +318,17 @@ _REFORMAT_REQUEST_RE = re.compile(
 #: 固定で不可、宇野さんは土曜のみ勤務可能という制約が加わりました。割当を
 #: 作り直してください。」2026-09-07 ライブ監査 T04/2。正答したシフト案が
 #: 訂正ペアの誤り側に載った)。
+#:
+#: 前提動詞は **自動詞・完了形に偏っていた**。「4 人分に増やしたいです。分量を
+#: 計算し直してください。」(2026-09-08 ライブ監査 T07/2) は他動詞 + 意向形
+#: (``増やしたい``) で 1 つも当たらず、接続詞分岐も ``[^。！？\n]`` で文を
+#: 跨げなかったため訂正として記録された。他動詞・意向形を足し、接続詞分岐は
+#: 文境界を跨げるようにする (字数上限 40 はそのまま)。
 _PREMISE_CHANGE_REDO_RE = re.compile(
     r"(?:なので|ので|から|場合は|場合で|として|に変えて|に変更して|にして)[、,\s]*"
-    r"[^。！？\n]{0,40}?(?:し|やり|作り|組み|計算し|書き)直して"
-    r"|(?:加わ|追加|変更|変わ|変え|増え|減っ|決まっ|判明し)[^。！？\n]{0,12}[。！？]\s*"
+    r"[^\n]{0,40}?(?:し|やり|作り|組み|計算し|書き)直して"
+    r"|(?:加わ|追加|変更|変わ|変え|増え|増やし|減っ|減らし|決まっ|判明し|したい)"
+    r"[^。！？\n]{0,12}[。！？]\s*"
     r"[^。！？\n]{0,40}?(?:し|やり|作り|組み|計算し|書き)直して",
 )
 
@@ -335,8 +344,11 @@ _COMPOUND_DIFFERENCE_RE = re.compile(
 #: 「違う」を **伝聞・疑問** で使う形 (「挙動が違うと聞きました」「違うそうですね」
 #: 「どこが違うのでしょうか」)。比較質問と同じく訂正ではない
 #: (2026-09-07 ライブ監査 T12/1 「CPU とメモリで挙動が違うと聞きましたが」)。
+#: 引用の **閉じ括弧を挟む** 形も同じ (2026-09-08 ライブ監査 T01/2
+#: 「「モニタと印刷で色が違う」というクレームが定期的に来ます」)。括弧が
+#: 入ると ``違う`` の直後が ``と`` でなくなり、伝聞と判定できていなかった。
 _HEARSAY_DIFFERENCE_RE = re.compile(
-    r"違(?:う|い(?:ます)?)"
+    r"違(?:う|い(?:ます)?)[」』）\)”’\"']*"
     r"(?:と(?:聞|きい|言われ|いわれ|いう|いい|のこと)|そう|らしい|のか|のでしょう|んでしょう"
     r"|のです|んです|んですか|のですか)",
 )
@@ -531,15 +543,20 @@ def _correction_attribution(query: str) -> str | None:
 
     戻り値は :func:`classify_correction_target` と同じ ``assistant`` /
     ``self`` / ``not_correction``。
+
+    引用 (鉤括弧) の内側は本人の主張ではないので、字句照合の前に
+    :func:`mask_quoted_speech` で落とす — 「営業から『色が違う』という
+    クレーム」の「違う」で候補を立てない (2026-09-09 監査 G-01 系)。
     """
     if not query:
         return None
-    lexical = any(p.search(query) for p in CORRECTION_PATTERNS) or (
-        cites_record_divergence(query)
+    masked = mask_quoted_speech(query)
+    lexical = any(p.search(masked) for p in CORRECTION_PATTERNS) or (
+        cites_record_divergence(masked)
     )
     if not lexical:
         return None
-    return classify_correction_target(query)
+    return classify_correction_target(masked)
 
 
 def restates_a_value(query: str) -> bool:
@@ -577,10 +594,13 @@ def restates_a_value(query: str) -> bool:
     """
     if _correction_attribution(query) in ("assistant", "self"):
         return True
-    if not query or not _CONTRASTIVE_RESTATEMENT_RE.search(query):
+    if not query:
+        return False
+    masked = mask_quoted_speech(query)
+    if not _CONTRASTIVE_RESTATEMENT_RE.search(masked):
         return False
     # 帰属の判定 (質問 / 比較 / 書式変更依頼を落とす) は共有経路と同じものを通す。
-    return classify_correction_target(query) in ("assistant", "self")
+    return classify_correction_target(masked) in ("assistant", "self")
 
 
 def cites_record_divergence(query: str) -> bool:
@@ -736,6 +756,7 @@ _OUTCOME_REASON_CHANNELS: tuple[tuple[str, str, str], ...] = (
     ("response retracts", "content.self_retraction", "content_contradiction"),
     ("measured value contradiction", "content.measured", "content_contradiction"),
     ("tool result ignored", "content.tool_result", "tool_result_ignored"),
+    ("date result ignored", "content.date_result", "tool_result_ignored"),
     ("claimed completion while blocked", "content.claimed_change", "content_contradiction"),
     ("user echo", "content.user_echo", ""),
 )
@@ -878,6 +899,7 @@ class FeedbackCollector:
         action_blocked: bool = False,
         measured_values: dict[str, set[int]] | None = None,
         calculate_result: float | None = None,
+        tool_result_text: str = "",
         truncated: bool = False,
         generation_failed: bool = False,
         session_id: str = "",
@@ -896,6 +918,13 @@ class FeedbackCollector:
         もの (c_05 §0.6)。以前は「その応答を生んだプロンプト版 / few-shot /
         ポリシー / LoRA」をどこにも残しておらず、Level 1 / Level 2 の帰属は
         時刻からの推測でしかなかった (2026-09-05 監査)。
+
+        ``tool_result_text`` はプロンプトへ注入済みのツール実行結果ブロック
+        (``## ツール実行結果`` 以降) で、``date_intent`` が組んだコマンドの
+        ``target:`` 行と本文の日付の食い違いを見るのに使う
+        (:func:`backend.free.core.response_dates.ignores_date_result`、
+        2026-09-09 監査 G-06)。``calculate_result`` と同じく呼出側がプロンプト
+        から読み戻して渡す。
         """
         from backend.free.core.text_quality import detect_lang
 
@@ -929,6 +958,7 @@ class FeedbackCollector:
             action_blocked=action_blocked,
             measured_values=measured_values,
             calculate_result=calculate_result,
+            tool_result_text=tool_result_text,
         )
         if generation_failed:
             # 本文が届かなかった / error フレームで終わったターン。
@@ -945,6 +975,10 @@ class FeedbackCollector:
             tool_routing_success = False
             long_form_success = False
 
+        # 字句検出が返すのは **候補** であって確定した訂正ではない。学習側が
+        # 消費する ``user_correction`` へは、``learning.correction_verifier``
+        # が直前応答との突き合わせで検証してから昇格させる (F-03)。除外正規表現は
+        # 事故のたびに 1 分岐ずつ増えており、次の語形で必ずまた漏れる。
         correction_text, detected_by = self._detect_correction(query, mode=mode)
         # 訂正と言い直しは排他: 訂正が検出されたターンを rephrase として
         # 二重学習しない
@@ -968,7 +1002,8 @@ class FeedbackCollector:
             rag_used=rag_used,
             rag_top1_score=rag_top1_score,
             agent_loops=agent_loops,
-            user_correction=correction_text,
+            # user_correction は検証後にしか立たない (correction_verifier)。
+            correction_candidate=correction_text,
             correction_detected_by=detected_by,
             long_form_used=long_form_used,
             long_form_content_type=long_form_content_type,
@@ -1072,9 +1107,10 @@ class FeedbackCollector:
         self._store_session_state(session_id)
 
         logger.info(
-            "Recorded experience: mode=%s, rephrase=%s, correction=%s (by=%s)",
+            "Recorded experience: mode=%s, rephrase=%s, correction_candidate=%s "
+            "(by=%s)",
             mode, signals.rephrased_query,
-            signals.user_correction is not None, detected_by,
+            signals.correction_candidate is not None, detected_by,
         )
 
         # DebugLogger に Level 0 学習サイクルを記録
@@ -1085,7 +1121,7 @@ class FeedbackCollector:
                 "mode": mode,
                 "buffer_size": self.buffer.count,
                 "rephrase": signals.rephrased_query,
-                "correction": signals.user_correction is not None,
+                "correction_candidate": signals.correction_candidate is not None,
                 "correction_detected_by": detected_by,
                 "rag_used": signals.rag_used,
             })
@@ -1169,7 +1205,12 @@ class FeedbackCollector:
             if getattr(e, "session_id", "") != session_id:
                 continue
             sig = getattr(e, "signals", None)
-            if sig is not None and getattr(sig, "user_correction", None) is not None:
+            # 候補 (未検証) の段階で除く。検証は後から走るので、ここで
+            # ``user_correction`` だけを見ると訂正発話自身が宛先候補に残る。
+            if sig is not None and (
+                getattr(sig, "correction_candidate", None) is not None
+                or getattr(sig, "user_correction", None) is not None
+            ):
                 continue
             out.append((
                 e.id,
@@ -1192,6 +1233,7 @@ class FeedbackCollector:
         action_blocked: bool = False,
         measured_values: dict[str, set[int]] | None = None,
         calculate_result: float | None = None,
+        tool_result_text: str = "",
     ) -> str:
         """ターン成否だけを返す (:meth:`_derive_turn_outcome_with_reason` の薄い皮)。"""
         outcome, _ = FeedbackCollector._derive_turn_outcome_with_reason(
@@ -1202,6 +1244,7 @@ class FeedbackCollector:
             action_blocked=action_blocked,
             measured_values=measured_values,
             calculate_result=calculate_result,
+            tool_result_text=tool_result_text,
         )
         return outcome
 
@@ -1216,6 +1259,7 @@ class FeedbackCollector:
         action_blocked: bool = False,
         measured_values: dict[str, set[int]] | None = None,
         calculate_result: float | None = None,
+        tool_result_text: str = "",
     ) -> tuple[str, str | None]:
         """ターン成否 ("success" | "partial" | "failed") と理由を決定論導出する。
 
@@ -1287,6 +1331,14 @@ class FeedbackCollector:
         if ignored is not None:
             logger.info("Turn marked failed (%s)", ignored)
             return "failed", f"tool result ignored: {ignored}"
+        # date_intent が組んだツール結果 (``target:`` 行) を渡したのに本文が
+        # 別の日付を述べている = calculate と同じ構造の矛盾。ツールが向きの
+        # 補正 (逆算) を正しく踏んでも、モデルが結果を暗算で差し替える経路は
+        # 別に残る (2026-09-08 T19/3: target=2026-11-02 に対し本文は暗算の
+        # 10月14日、正しくは向きの修正込みで 10/9)。
+        if ignores_date_result(tool_result_text, text):
+            logger.info("Turn marked failed (date result ignored)")
+            return "failed", "date result ignored: response date does not match target"
         # 明示された文字数指定を破っている = 指定は本文にあり長さは数えるだけ
         # なので、これも推定ではなく矛盾。2026-08-22 ライブ監査の
         # 「ちょうど100文字で」→ 86 文字は success として学習に入っていた。
@@ -1498,6 +1550,7 @@ class FeedbackCollector:
         if self._values_adopted(response, pending["corrected"]):
             return
         entry = pending["entry"]
+        entry.signals.correction_candidate = None
         entry.signals.user_correction = None
         entry.signals.correction_detected_by = "retracted_not_accepted"
         logger.info(
@@ -1524,7 +1577,7 @@ class FeedbackCollector:
         raw, detected_by = self._detect_correction_lexical(query, mode=mode)
         if raw is None or self._prev_turn_failed:
             return raw, detected_by
-        target = classify_correction_target(query)
+        target = classify_correction_target(mask_quoted_speech(query))
         if target != "assistant":
             logger.debug(
                 "Correction candidate reclassified as %s (not an assistant "
@@ -1551,15 +1604,20 @@ class FeedbackCollector:
             detected_by: "hardcoded" | "record_divergence" | "prev_failed"
             | "same_target" | None。``prev_failed`` は直前ターンの失敗 **かつ**
             同一成果物の再指定 / 短い否定だけの発話 (状況証拠単独では立てない)。
+
+        引用 (鉤括弧) の内側は本人の主張ではないので、字句照合には
+        :func:`mask_quoted_speech` を通したコピーを使う。返す ``correction_text``
+        は記録用に原文の ``query`` を保つ (2026-09-09 監査 G-01 系)。
         """
+        masked = mask_quoted_speech(query)
         # 1. ハードコードパターン（高確度、優先）
         for pattern in CORRECTION_PATTERNS:
-            if pattern.search(query):
+            if pattern.search(masked):
                 return query, "hardcoded"
 
         # 1a. 記録との食い違いの指摘。誤りを名指す語を一つも含まない訂正を
         # 2 条件 AND で拾う (``cites_record_divergence`` の説明を参照)。
-        if cites_record_divergence(query):
+        if cites_record_divergence(masked):
             return query, "record_divergence"
 
         # 1b. create モードの実行結果報告。訂正対象 (直前ターン) が無い最初の
@@ -1576,13 +1634,13 @@ class FeedbackCollector:
             is_create_mode(mode)
             and self._prev_query is not None
             and not matches_either(
-                query.strip(),
+                masked.strip(),
                 _CREATE_FAILURE_REPORT_EXCLUDE_RE,
                 _CREATE_FAILURE_REPORT_EXCLUDE_RE_EN,
             )
         ):
             for pattern in CREATE_FAILURE_REPORT_PATTERNS_ALL:
-                if pattern.search(query):
+                if pattern.search(masked):
                     return query, "hardcoded"
 
         # 2. 直前ターンが失敗 ([failed] 応答等) → 次ターンは訂正候補。ただし
@@ -1597,7 +1655,7 @@ class FeedbackCollector:
 
         # 3. 同一出力先パスの再指定 + 弱い訂正語 (「〜ではなく」等)
         if self._same_target_path(query) and any(
-            p.search(query) for p in WEAK_CORRECTION_PATTERNS_ALL
+            p.search(masked) for p in WEAK_CORRECTION_PATTERNS_ALL
         ):
             return query, "same_target"
 

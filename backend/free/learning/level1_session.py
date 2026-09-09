@@ -31,14 +31,22 @@ SNAPSHOT_QUERY_CHARS = 200
 def compact_experience(exp: dict) -> dict:
     """session へ保存する経験の圧縮射影。
 
-    Level 1 が session snapshot から読むのは timestamp / mode / signals / query
-    (失敗語抽出) / gen_config / base_model だけ。``response_full`` (応答全文)
-    を 1000 件 × 全モード分そのまま JSON へ書くと active session が数 MB になり
-    yield ごとの保存が重くなる (L-D3)。few-shot プール補充は live バッファから
-    行うので、応答本文は snapshot に要らない。
+    Level 1 が session snapshot から読むのは id / session_id / timestamp / mode /
+    signals / query (失敗語抽出) / gen_config / base_model だけ。``response_full``
+    (応答全文) を 1000 件 × 全モード分そのまま JSON へ書くと active session が
+    数 MB になり yield ごとの保存が重くなる (L-D3)。few-shot プール補充は live
+    バッファから行うので、応答本文は snapshot に要らない。
+
+    ``id`` / ``session_id`` は落とさない (2026-09-08、F-03 追補)。採用ゲートの
+    ケース選定は訂正の宛先を ``signals.corrected_entry_id`` から引くが、
+    **参照先の ``id`` が snapshot に無いと解決が丸ごと無効化** され、位置での
+    代用 = 別会話のターンとのペアに戻る。2 つとも短い文字列なので L-D3 の
+    サイズ懸念には当たらない。
     """
     query = str(exp.get("query", "") or "")
     return {
+        "id": exp.get("id", ""),
+        "session_id": exp.get("session_id", ""),
         "timestamp": exp.get("timestamp", ""),
         "mode": exp.get("mode", ""),
         "query": query[:SNAPSHOT_QUERY_CHARS],

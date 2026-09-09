@@ -12,8 +12,10 @@
 
 判定の要点:
 
-- ``user_correction`` は記録時点で **アシスタントの誤りに対する訂正** に絞られて
-  いる (``classify_correction_target``)。ここでは帰属を再判定しない。
+- ``user_correction`` は **検証済み** の訂正だけが入る
+  (``learning.correction_verifier`` が直前応答と突き合わせて帰属を判定し、
+  ``assistant`` のものだけを昇格させる)。ここでは帰属を再判定しない。
+  期待語は検証器が抜いた ``signals.correction_correct_value`` を優先する。
 - 訂正後の回答から謝罪・受諾の前置き (「おっしゃる通りです。訂正いたします。」)
   を剥がす。前置きが手本に残ると、few-shot が「まず謝る」型を再生産する。
 - 剥がした後が受諾だけ (「承知しました。住まいは福岡ですね。」) なら回答では
@@ -111,6 +113,9 @@ class CorrectedPair:
     timestamp: str = ""
     #: 訂正前の (誤った) 回答。判定・ログ用で、手本には使わない。
     wrong_response: str = ""
+    #: 検証器 (``learning.correction_verifier``) が確定した「正しい値」の逐語
+    #: span。空でなければ期待語はここから採る (字句の否定境界に頼らない)。
+    correct_value: str = ""
 
     @property
     def pair_id(self) -> str:
@@ -163,15 +168,22 @@ def depends_on_context(query: str) -> bool:
     return bool(_MEMORY_OR_TOOL_RE.search(q) or _PERSONAL_ATTR_RE.search(q))
 
 
-def expected_keywords_from_correction(correction: str) -> list[str]:
+def expected_keywords_from_correction(
+    correction: str, *, correct_value: str = "",
+) -> list[str]:
     """訂正文から「正しい回答に含まれるべき語」を拾う (純粋関数、順序保持・重複なし)。
 
     「正しくは 1,280 × 37 × 1.08 = 51,148.8 円です」→ ``["1280", "37", "1.08", "51148.8"]``。
     「BaseExceptionGroup は「単一の例外の場合」ではなく、KeyboardInterrupt など…」
     → 「ではなく」の **前** にある値は誤りだった側なので落とし、
     ``["KeyboardInterrupt", ...]`` のように訂正後の側だけを残す。
+
+    ``correct_value`` (検証器が訂正発話から逐語で抜いた正しい値) があれば
+    **そちらだけ** を語源にする。字句の否定境界は ``ではなく`` /
+    ``じゃなく`` の 2 語しか無く、それ以外の言い回しでは誤り側が期待語に
+    載っていた (2026-09-07 監査 F-01: eval_core 追加 5 件中 4 件)。
     """
-    text = correction or ""
+    text = (correct_value or "").strip() or (correction or "")
     # 「X ではなく Y」の X 側 (誤り) を落とす: 否定語より前の鉤括弧語は捨てる。
     neg = None
     for neg in _NEGATED_VALUE_RE.finditer(text):
@@ -211,14 +223,18 @@ def _normalize_for_match(text: str) -> str:
     return (text or "").replace(",", "").lower()
 
 
-def response_honors_correction(response: str, correction: str) -> bool:
+def response_honors_correction(
+    response: str, correction: str, *, correct_value: str = "",
+) -> bool:
     """訂正後の回答が、訂正文から拾える期待語を実際に含んでいるか (純粋関数)。
 
     訂正されても同じ誤りを繰り返す回答 (2026-09-05 実機: 「正しくは 51,148.8
     円です」への「1,280円 × 37個 × 1.08 = 50,688円です」) を手本にしない。
     期待語が 1 つも拾えない訂正 (「違います」だけ等) は判定できないので通す。
     """
-    keywords = expected_keywords_from_correction(correction)
+    keywords = expected_keywords_from_correction(
+        correction, correct_value=correct_value,
+    )
     if not keywords:
         return True
     body = _normalize_for_match(response)
@@ -324,7 +340,10 @@ def build_corrected_pairs(
         )
         if not (query and fixed):
             continue
-        if not response_honors_correction(fixed, str(correction)):
+        correct_value = str(signals.get("correction_correct_value") or "").strip()
+        if not response_honors_correction(
+            fixed, str(correction), correct_value=correct_value,
+        ):
             continue
         pair = CorrectedPair(
             query=query,
@@ -335,6 +354,7 @@ def build_corrected_pairs(
             wrong_response=str(
                 prev.get("response_full") or prev.get("response_summary") or ""
             ),
+            correct_value=correct_value,
         )
         pairs[pair.pair_id] = pair
     return list(pairs.values())

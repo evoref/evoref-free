@@ -129,10 +129,10 @@ def rag_signals_from_chunks(
     空 / None なら ``(False, None)`` (RAG 未使用)。
 
     ``raw_top_score`` は ``SearchResult.top_raw_score`` (採用チャンクの **生スコア**
-    最大値、cosine スケール)。``scored`` 側のスコアは ``rag.score_normalization``
-    適用後で、``minmax`` では先頭が定義上 1.0 に固定されるため、記録される
-    ``rag_top1_score`` が観測値として死ぬ (実機 2026-08-13: RAG 使用 7 ターン全てが
-    厳密に 1.0、embed_instruction の初期集団 5 候補も全て fitness 1.0000)。
+    最大値、cosine スケール)。``scored`` 側のスコアは順位式 (c_16 §7.2)
+    適用後の salience で cosine スケールではない (旧 ``rag.score_normalization`` の
+    minmax 時代は先頭が定義上 1.0 に固定され、記録される ``rag_top1_score`` が
+    観測値として死んでいた — 実機 2026-08-13: RAG 使用 7 ターン全てが厳密に 1.0)。
     渡された場合はそちらを採用する。``None`` (検索結果を持ち回れない経路 / 旧
     呼出) は従来どおり正規化スコアへフォールバックする。
     """

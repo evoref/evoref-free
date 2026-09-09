@@ -244,14 +244,37 @@ _DESCRIPTIVE_WRITE_CLAUSE_RE = re.compile(
 # 指定がルータを外れ、ツール 0 回のまま「書き直します」と応答した)。
 # パス区切り・語構成文字だけを除外すれば、``E:\tmp\a.txt`` の末尾要素を
 # 裸名として二重に拾うことも防げる。
+#: 書込み先として認めるファイル拡張子。裸名 / 相対パスの双方で同じ集合を使う
+#: (別々に列挙すると片方だけ拡張子を足して挙動が割れる)。
+_TARGET_FILE_EXTS = (
+    r"txt|md|markdown|csv|tsv|json|jsonl|ya?ml|log|ini|cfg|conf|toml"
+    r"|xlsx|xls|ods|docx|doc|pptx|ppt|pdf|html?|xml"
+    r"|py|js|ts|tsx|jsx|sh|ps1|bat|sql|rs|go|java|rb|c|cpp|h"
+)
 _BARE_FILENAME_TARGET_RE = re.compile(
     r"(?<![\w./\\-])"
     r"[\w-]+(?:\.[\w-]+)*\."
-    r"(?:txt|md|markdown|csv|tsv|json|jsonl|ya?ml|log|ini|cfg|conf|toml"
-    r"|xlsx|xls|ods|docx|doc|pptx|ppt|pdf|html?|xml"
-    r"|py|js|ts|tsx|jsx|sh|ps1|bat|sql|rs|go|java|rb|c|cpp|h)"
+    r"(?:" + _TARGET_FILE_EXTS + r")"
     r"(?![A-Za-z0-9])",
     re.IGNORECASE,
+)
+# ディレクトリを伴う **相対** パス (``deploy/compose.yaml``)。``_LOCAL_PATH_RE``
+# はドライブ接頭辞か Unix の 2 階層以上しか認めず、裸名の正規表現は直前の
+# ``/`` で弾かれるため、この形だけが両方の網を抜けていた。裸名と同じ条件
+# (宛先の格標識 or 保存動詞) を満たしたときに宛先として認める。
+# 先頭境界に ``:`` を含めるのは URL / ドライブパスの一部を二重に拾わないため。
+_RELATIVE_PATH_TARGET_RE = re.compile(
+    r"(?<![\w:./\\-])"
+    r"[\w.-]+(?:[\\/][\w.-]+)+\."
+    r"(?:" + _TARGET_FILE_EXTS + r")"
+    r"(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+# **明示的な** 相対指定 (``./out/x.md`` / ``../out/x.md`` / ``~/notes.md``)。
+# 基準をユーザーが書いているので ``_LOCAL_PATH_RE`` と同じ「明示パス」扱いに
+# する (書込み先の解決でも CWD 相対のまま尊重する。f_03 §1.4)。
+_EXPLICIT_RELATIVE_PATH_RE = re.compile(
+    r"(?:^|[\s　\"'(（「])(?:\.{1,2}[\\/]|~[\\/])[^\s　\"'）)」]*[\w/\\]",
 )
 # 保存先を直前の文脈に委ねる参照表現。「同じファイルに保存し直して」のような
 # 追記・修正依頼はパスを本文に持たないため _LOCAL_PATH_RE に掛からず、
@@ -265,6 +288,97 @@ _REFERENTIAL_WRITE_TARGET_RE = REFERENTIAL_WRITE_TARGET_RE
 _TABULAR_TARGET_RE = re.compile(
     r"\.(?:csv|tsv|xlsx|ods)(?![A-Za-z])", re.IGNORECASE,
 )
+# **ディスクへの永続化** を明示する動詞。裸のファイル名を書込み先として認める
+# 条件のひとつ (``_WRITE_VERB_RE`` の部分集合ではなく別の軸)。
+#
+# ``_WRITE_VERB_RE`` は「作る」動詞まで含むため、これだけで裸名を宛先に採ると
+# 「compose.yaml を書いてください」= **中身を見せてほしい** 依頼が
+# ファイル書込みに化ける (実インシデント 2026-09-08 監査 F-05: リポジトリ
+# 直下に 660 バイトの compose.yaml が作られ、応答は「compose.yaml に
+# 書き込みました。」の 1 行だけで本文が出なかった)。保存動詞は「既にある
+# 内容をファイルへ落とす」意味に限る。
+#
+# ``書[きい]`` を入れないこと (それが上の事故の入口)。``書き直`` /
+# ``書き出`` / ``書き込`` のように **保存を意味する複合語** だけを列挙する。
+_SAVE_VERB_RE = re.compile(
+    r"(?:保存|書き出|書出|書き込|書込|上書き|追記|書き足|書き直"
+    r"|セーブ|エクスポート|ファイルに出力|ファイルとして出力|ディスクに"
+    r"|" + ascii_boundary_alternation(
+        "save", "export", "overwrite", "append", "persist",
+    ) + r")",
+    re.IGNORECASE,
+)
+# ファイル名の **直後** に来る宛先の格助詞。「notes.txt に追記して」の ``に`` は
+# 宛先を、「compose.yaml を書いて」の ``を`` は生成対象を指す。閉じ括弧・
+# 引用符を挟む形 (「（club_plan.txt）に追記して」) も同じ宛先。
+_DESTINATION_PARTICLE_RE = re.compile(r"^[)）」』】\]\"'\s　]*(?:に|へ)")
+# 英語で宛先を示す前置詞 (ファイル名の直前)。"save it to notes.txt" /
+# "write this into out.md"。
+_DESTINATION_PREPOSITION_RE = re.compile(
+    r"(?:^|[\s(\[])(?:to|into|in|onto)\s+$", re.IGNORECASE,
+)
+
+
+def write_intent_probe(query: str) -> str:
+    """書込み判定に掛ける本文を正規化する (SSOT)。
+
+    依頼している節だけを取り、コマンドリテラル内の引数パスと、既出成果物を
+    指す連体修飾 (「いま書いたそのファイル」) を落とす。ルータの
+    ``_is_local_write_intent`` と ``indicates_write_destination`` は
+    **同じ本文** を見なければならない (片方だけが書込みだと判断すると、
+    ``output_target`` と層の振り分けが食い違う)。
+    """
+    probe = strip_command_literals(request_clauses(query))
+    return _DESCRIPTIVE_WRITE_CLAUSE_RE.sub(" ", probe)
+
+
+def _filename_target_is_destination(probe: str) -> bool:
+    """ファイル名 (裸名 / 相対パス) が **宛先** として書かれているか (純粋関数)。
+
+    名前だけでは宛先の証拠にならない。次のどちらかを要求する:
+
+    - ファイル名が宛先として格標識されている (``notes.txt に`` / ``へ``、
+      英語の ``to notes.txt``)
+    - 依頼文に保存動詞がある (``保存して`` / ``書き出して`` / ``追記して``)
+
+    「compose.yaml を書いてください」はどちらも満たさない = 中身を見せて
+    ほしい依頼であり、ファイル書込みではない (2026-09-08 監査 F-05)。
+    """
+    matches = [
+        *_BARE_FILENAME_TARGET_RE.finditer(probe),
+        *_RELATIVE_PATH_TARGET_RE.finditer(probe),
+    ]
+    if not matches:
+        return False
+    if _SAVE_VERB_RE.search(probe):
+        return True
+    for m in matches:
+        if _DESTINATION_PARTICLE_RE.match(probe[m.end():]):
+            return True
+        if _DESTINATION_PREPOSITION_RE.search(probe[max(0, m.start() - 16):m.start()]):
+            return True
+    return False
+
+
+def write_destination_evidence(probe: str) -> bool:
+    """正規化済みの依頼文が **書込み先** を示しているか (SSOT、純粋関数)。
+
+    ``write_intent_probe`` の出力を渡す。宛先の証拠は 3 種類:
+
+    1. 明示パス — ``_LOCAL_PATH_RE`` (ドライブ接頭辞 / Unix の 2 階層以上) と
+       ``_EXPLICIT_RELATIVE_PATH_RE`` (``./`` ``../`` ``~/`` 始まり)
+    2. 宛先として格標識されたファイル名 (裸名 / 相対パス)、または
+       保存動詞 + ファイル名
+    3. 参照表現 (「同じファイルに保存し直して」) — 保存先は会話から解決する
+
+    ルータ (層の振り分け) と ``output_target`` の双方がこの 1 本を使う。
+    """
+    if _LOCAL_PATH_RE.search(probe) or _EXPLICIT_RELATIVE_PATH_RE.search(probe):
+        return True
+    if _REFERENTIAL_WRITE_TARGET_RE.search(probe):
+        return True
+    return _filename_target_is_destination(probe)
+
 
 # 学習済み long_form パターン単独発火の抑止床。閾値以上の一致が 1 語のみの
 # 場合、その重み合計がこの値以上でなければ long_form に分類しない。
@@ -1313,28 +1427,18 @@ class ComplexityClassifier:
         # 双方を拾い、成立しないファイル出力タスクを組んでいた
         # (2026-09-06 監査 F-02。26.6 分かけて生成した成果物を捨てて
         # 「(書き込みが実行されませんでした)」だけを返した)。
-        probe = request_clauses(query)
-        # コマンドリテラル (`dir E:\tmp\x`) 内のパスは実行対象の引数であって
-        # 書込み先ではない。書込み動詞・パスの双方をこれを除いた本文で判定する。
-        probe = strip_command_literals(probe)
-        # 「いま書いたそのファイル」のような既出成果物への言及は、依頼された
-        # 動作ではなく対象の説明。書込み動詞判定から除外する。
-        probe = _DESCRIPTIVE_WRITE_CLAUSE_RE.sub(" ", probe)
+        # コマンドリテラル内のパス・既出成果物への言及を落とした本文で判定する
+        # (正規化は ``write_intent_probe`` が SSOT)。
+        probe = write_intent_probe(query)
         # 書込み動詞の列挙に加えて **本文代入** の構文も受ける。「内容を『X』に
         # してください」は書込み依頼だが動詞を 1 つも含まないため、動詞だけの
         # 判定では読取へ落ちる (assigns_file_content の docstring 参照)。
         if not _WRITE_VERB_RE.search(probe) and not assigns_file_content(probe):
             return False
-        if _LOCAL_PATH_RE.search(probe):
-            return True
-        # ディレクトリを伴わない裸のファイル名 (「notes.txt に追記して」)。
-        # 直前に作ったファイルを名前だけで指す言い方で、書込み先としては
-        # 参照依頼と同じ扱い (保存先は write-fast 経路が会話から解決する)。
-        if _BARE_FILENAME_TARGET_RE.search(probe):
-            return True
-        # パスは直前ターンにしか無い参照依頼 (「同じファイルに保存し直して」)。
-        # 保存先は write-fast 経路が会話から解決する。
-        return bool(_REFERENTIAL_WRITE_TARGET_RE.search(probe))
+        # 宛先の証拠は ``indicates_write_destination`` (= output_target) と
+        # **同じ 1 本** を使う。片方だけが書込みと判断すると、層は書込み
+        # プランを組むのに output_target は chat、あるいはその逆になる。
+        return write_destination_evidence(probe)
 
     def _is_tabular_write_intent(self, query: str, mode: str = "chat") -> bool:
         """表形式データ (.csv/.tsv/.xlsx/.ods) のローカル書出し意図を検出する。
@@ -1512,19 +1616,15 @@ def _can_use_meta_cognitive(
 def indicates_write_destination(query: str) -> bool:
     """発話が **書込み先** を指しているか (純粋関数)。
 
-    明示パス / 裸のファイル名 / 参照表現 (「同じファイルに」) のいずれか。
-    ``_is_local_write_intent`` が書込み動詞と組で見ている「宛先の証拠」だけを
-    切り出したもので、判定は同じパターンを共有する。
+    明示パス / 宛先として書かれた裸のファイル名 / 参照表現 (「同じファイルに」)
+    のいずれか。``_is_local_write_intent`` が書込み動詞と組で見ている「宛先の
+    証拠」そのもので、判定は ``write_destination_evidence`` の 1 本を共有する。
 
     出力先の決定 (``chat.py`` の ``output_target``) がこれを見る。宛先が
     無いのに ``file`` を選ぶと、write_file を撃ちようがないタスクが組まれ、
     生成した成果物が「書き込みが実行されませんでした」で捨てられる
-    (2026-09-06 監査 F-02)。
+    (2026-09-06 監査 F-02)。逆に「compose.yaml を書いて」のような **中身を
+    見せてほしい** 依頼を書込みに倒すと、本文が出ずファイルだけが残る
+    (2026-09-08 監査 F-05)。
     """
-    probe = strip_command_literals(request_clauses(query))
-    probe = _DESCRIPTIVE_WRITE_CLAUSE_RE.sub(" ", probe)
-    return bool(
-        _LOCAL_PATH_RE.search(probe)
-        or _BARE_FILENAME_TARGET_RE.search(probe)
-        or _REFERENTIAL_WRITE_TARGET_RE.search(probe),
-    )
+    return write_destination_evidence(write_intent_probe(query))

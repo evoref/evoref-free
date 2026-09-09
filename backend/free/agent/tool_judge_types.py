@@ -27,6 +27,11 @@ class ToolJudgement:
     #: calculate の式の組み方が対話の表記と食い違う疑い (``expression_sanity_issues``)。
     #: 接地と同じく式は捨てず、回答側で検算と開示を求める。
     expression_issues: tuple[str, ...] = ()
+    #: 日付演算を求められたのに、実行するコマンドが日付演算をしていない
+    #: (現在日時だけを返す) か。``unexplained_numbers`` と同じく **格下げはせず**
+    #: 印だけ立て、回答側で「ツールで検証していない」ことと数え方の前提を
+    #: 開示させる (``_flag_ungrounded_date_math`` / 2026-09-08 監査 F-06)。
+    unexplained_date_math: bool = False
     #: このターンで「状態を変える操作を選んだが実行できなかった」か。
     #:
     #: 以前は ``ToolCallJudge`` のインスタンス属性 (``_action_blocked``) に置き、

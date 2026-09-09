@@ -51,6 +51,11 @@ from backend.free.llm.json_schemas import AssertionNaming
 from backend.free.memory.corrections import correction_target
 from backend.free.memory.note_facts import fact_from_note
 from backend.free.memory.sleep._curator_common import public_notes
+from backend.free.memory.sleep.curation_backoff import (
+    clear_failure,
+    in_cooldown,
+    record_transient_failure,
+)
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -74,6 +79,9 @@ _MAX_PER_CYCLE = 8
 
 #: slug に許す文字 (``subject_ns._SAFE_PART_RE`` と同じ規約)。
 _SLUG_MAX_LEN = 40
+
+#: ``curation_backoff`` の失敗カウンタキー (aux purpose 名と同じ)。
+_FAILURE_KEY = "assertion_naming"
 
 
 def _sanitize_slug(raw: str) -> str | None:
@@ -200,6 +208,15 @@ def _is_curatable(note: "MemoryNote", builder) -> bool:
 
     Step 8 が型付けできたノートは対象外 — 本 curator は **取りこぼしだけ**を
     拾う純粋な追加であり、既存経路の判断を上書きしない。
+
+    **ユーザー自身の属性の取りこぼしはここでは拾わない。** 「私は…」で
+    ``personal_fact`` タグが付いた発話は ``candidate_fact_tags`` が非空になる
+    ので下の分岐で落ちるが、それは正しい — 属性の取りこぼし (スロットが
+    足りない / object が粗い) は Step 8.3
+    (:mod:`~backend.free.memory.sleep.personal_fact_curator`) の担当で、
+    そちらは ``mem.personal.<slot>`` へ属性単位で書くため訂正で supersede
+    できる。ここで拾うと ``mem.world.assertion.<slug>`` の別 subject に
+    落ちて、同じ属性の言い直しと対にならない。
     """
     from backend.free.memory.extractors.chat import _looks_like_code_fragment
 
@@ -240,18 +257,20 @@ def _build_prompt(content: str) -> str:
 
 
 async def _name_assertion(aux_client, content: str) -> tuple[str, str] | None:
-    """補助タスクに ``(slug, object)`` を付けさせる。失敗時は ``None``。"""
-    try:
-        parsed = await aux_client.generate_json(
-            _build_prompt(content),
-            purpose="assertion_naming",
-            max_tokens=256,
-            temperature=0.1,
-            response_schema=AssertionNaming,
-        )
-    except Exception as exc:
-        logger.warning("assertion_curator: naming failed: %s", exc)
-        return None
+    """補助タスクに ``(slug, object)`` を付けさせる。
+
+    ``None`` は「答えたが言明でない / slug が使えない」場合。**例外は呼出側へ
+    伝播する** — ここで握り潰すと一過性の aux timeout も「LLM が答えた」と
+    同じ扱いになり、``curate_assertion_facts`` が冪等マーカーを立てて二度と
+    再試行しなくなる (2026-09-08 監査 G-03)。
+    """
+    parsed = await aux_client.generate_json(
+        _build_prompt(content),
+        purpose="assertion_naming",
+        max_tokens=256,
+        temperature=0.1,
+        response_schema=AssertionNaming,
+    )
     if not isinstance(parsed, dict):
         logger.debug("assertion_curator: unexpected payload type: %r", type(parsed))
         return None
@@ -274,6 +293,7 @@ async def curate_assertion_facts(
     builder=None,
     profile_id: str = "default",
     now_provider: Callable[[], float] | None = None,
+    should_pause: Callable[[], bool] | None = None,
 ) -> int:
     """型付けできなかった言明を ``world_fact`` として sleep-time で書き込む。
 
@@ -285,6 +305,9 @@ async def curate_assertion_facts(
         builder: ``ChatNoteBuilder`` (候補タグ判定用)。省略時は既定を作る。
         profile_id: 書込先 fact の profile_id。
         now_provider: 時刻供給。テスト用。
+        should_pause: ``True`` を返したらノート境界でループを打ち切る協調
+            yield。残りのノートは ``assertion_curated_at`` が立たないままなので
+            次サイクルが拾う。
 
     Returns:
         新規に書き込まれた fact 件数。
@@ -308,6 +331,9 @@ async def curate_assertion_facts(
 
         builder = ChatNoteBuilder()
 
+    now_fn = now_provider or time.time
+    now = now_fn()
+
     # private セッション由来のノートは SemMem へ昇格させない。
     # (``_curator_common.public_notes`` の docstring に実害と経緯)
     notes = public_notes(notes)
@@ -318,6 +344,7 @@ async def curate_assertion_facts(
         # アシスタントが採らなかった主張は永続化しない
         # (_assistant_rejected_the_claim の docstring 参照)。
         and not _assistant_rejected_the_claim(n, notes)
+        and not in_cooldown(n, _FAILURE_KEY, now)
     ]
     if not candidates:
         return 0
@@ -329,19 +356,41 @@ async def curate_assertion_facts(
         )
         candidates = candidates[:_MAX_PER_CYCLE]
 
-    now_fn = now_provider or time.time
     written = 0
     all_notes = list(notes)
-    for note in candidates:
+    for idx, note in enumerate(candidates):
+        # 協調 yield: チャット生成が走っている間はノート境界で手を止める
+        # (note_evolver と同じ実測。CLAUDE.md 不変則 #1)。
+        if should_pause is not None and should_pause():
+            remaining = len(candidates) - idx
+            logger.info(
+                "assertion_curator paused for the user turn: %d note(s) "
+                "left pending for the next cycle", remaining,
+            )
+            break
         content = (note.content or "").strip()
         # 命名には言明の文だけを渡す。「忘れないでください」等の依頼節が
         # 混ざると補助タスクが is_assertion=false に倒れる。
         body = assertive_body(content) or content
-        named = await _name_assertion(aux_client, body)
+        try:
+            named = await _name_assertion(aux_client, body)
+        except Exception as exc:
+            # 一過性失敗 (aux timeout 等) はマーカーを立てず、次サイクルで
+            # 再試行させる (2026-09-08 監査 G-03)。
+            logger.warning(
+                "assertion_curator: naming failed for note %s: %s", note.id, exc,
+            )
+            record_transient_failure(
+                note, _FAILURE_KEY, now_fn(),
+                counts=not getattr(exc, "contended", False),
+            )
+            continue
         # 命名できなかった / 言明でないと判定された場合もマークする。同じ
         # ノートを毎サイクル補助タスクへ出し続けないため (url_curator が
-        # 全分岐で url_curated_at を立てるのと同じ理由)。
+        # 全分岐で url_curated_at を立てるのと同じ理由)。これは「補助タスクが
+        # 答えた」場合であって、失敗ではない。
         note.assertion_curated_at = now_fn()
+        clear_failure(note, _FAILURE_KEY)
         if named is None:
             continue
         slug, obj = named

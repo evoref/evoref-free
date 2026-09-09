@@ -32,6 +32,11 @@ _FULL_MIN_WAIT_SEC = 30.0
 #: これを超えても生成中なら諦めて次の応答で再試行する (生成に割り込まない)。
 _FULL_INFLIGHT_WAIT_SEC = 180.0
 
+#: 手動 Full (:meth:`SleepTimeScheduler.run_full_now`) が完了を待つ上限 (秒)。
+#: これを超えたら「予約は生きているが待たない」(``deferred``) として返す。
+#: 予約自体は残るので、Trigger B の 1 本がそのまま走り切る。
+_MANUAL_FULL_WAIT_SEC = 900.0
+
 
 def _emit_bg_task_outcome(
     debug_logger: "DebugLogger | None",
@@ -107,6 +112,22 @@ class SleepTimeScheduler:
         #: True の間は :meth:`on_user_input` が worker も待機タスクも止めない
         #: (:meth:`_schedule_full` の説明を参照)。
         self._full_forced_run: bool = False
+        #: Full サイクルが **実行フェーズに入っている** 間 True。Light も含む
+        #: :attr:`_running` と違い Full だけを指す。2 本目の Full を弾く
+        #: (:meth:`_schedule_full`) / Level 1 常駐ループを繰り延べる
+        #: (:meth:`_schedule_level1_loop`) ためのゲート。
+        self._full_running: bool = False
+        #: 「次のアイドル待ちを飛ばす」一度きりの要求 (手動 Full)。待ちに
+        #: 入った時点で消費する — 消さないと繰り延べの再スケジュールが
+        #: 0 秒待ちの繰り返しになる。
+        self._full_immediate: bool = False
+        #: 既にアイドル待ちに入っている ``_full_task`` を叩き起こすイベント。
+        self._full_wake: asyncio.Event = asyncio.Event()
+        #: 手動 Full の完了通知 (:meth:`run_full_now` が待つ)。決着した
+        #: ``_schedule_full`` が結果文字列で解決する。
+        self._full_completion: "asyncio.Future[str] | None" = None
+        #: Level 1 常駐ループが Full で繰り延べを **始めた** 時刻 (monotonic)。
+        self._level1_loop_defer_since: float | None = None
         #: Level 1 による繰り延べが **始まった** 時刻 (monotonic)。繰り延べて
         #: いない間は ``None``。ログを「状態」ではなく「遷移」で出すために持つ
         #: (:meth:`_schedule_full` の Level 1 ゲートを参照)。
@@ -544,7 +565,13 @@ class SleepTimeScheduler:
         再試行できないため (実質デッドロック)。下限は **残り時間の側にだけ**
         掛ける — 設定された ``full_idle_minutes`` より長く待つことは無い
         (テストや極小構成が 0.6 秒指定で 30 秒待たされないように)。
+
+        手動 Full (:meth:`run_full_now`) が立てた ``_full_immediate`` の間は
+        0 を返す — 押されたボタンに 30 秒の下限を課す理由が無い (生成中の
+        割り込みは下の in-flight 待ちが引き受ける)。
         """
+        if self._full_immediate:
+            return 0.0
         if self._full_requested:
             # 前倒し要求時は下限だけ待つ (0 秒で起きると生成が in-flight のまま
             # chat_in_flight で弾かれ、次の応答まで再試行できない)。
@@ -584,31 +611,101 @@ class SleepTimeScheduler:
         except Exception as exc:
             logger.warning("Pre-full hook failed (continuing): %s", exc)
 
-    async def run_full_now(self) -> bool:
-        """Full sleep-time を即座に 1 回走らせる (手動トリガー用)。
+    async def _wait_full_idle(self) -> None:
+        """Trigger B のアイドル待ち (手動 Full で叩き起こせる)。
 
-        自動 Trigger B (:meth:`_schedule_full`) と **同じ前処理** を通すための
-        入口。``_worker.run_full()`` を直接呼ぶと ``_run_pre_full_flush()`` を
-        飛ばしてしまう。
+        素の ``asyncio.sleep`` だと、待っている最中に手動 Full が来ても
+        起こせず、**2 本目の実行経路を作る** しかなくなる。待ちをイベントで
+        打ち切れるようにして、実行経路を :meth:`_schedule_full` の 1 本に
+        保つ。
+        """
+        self._full_wake.clear()
+        timeout = self._full_wait_seconds()
+        # 一度きりの前倒し要求はここで消費する。残すと繰り延べの再スケジュール
+        # が 0 秒待ちのビジーループになる。
+        self._full_immediate = False
+        if timeout <= 0:
+            await asyncio.sleep(0)
+            return
+        try:
+            await asyncio.wait_for(self._full_wake.wait(), timeout=timeout)
+        except TimeoutError:
+            return
+        logger.debug("Trigger B: idle wait interrupted by a manual full request")
+
+    def _ensure_full_completion(self) -> "asyncio.Future[str]":
+        """手動 Full の完了通知 future を用意する (既存が生きていれば再利用)。"""
+        fut = self._full_completion
+        if fut is None or fut.done():
+            fut = asyncio.get_running_loop().create_future()
+            self._full_completion = fut
+        return fut
+
+    def _resolve_full_completion(self, outcome: str) -> None:
+        """待っている手動 Full に結末を渡す (誰も待っていなければ no-op)。"""
+        fut = self._full_completion
+        if fut is None or fut.done():
+            return
+        self._full_completion = None
+        fut.set_result(outcome)
+
+    async def run_full_now(self) -> str:
+        """Full sleep-time を **予約して** Trigger B の 1 本に合流する (手動用)。
+
+        以前はここから ``_worker.run_full()`` を直接叩いていたため、Trigger B
+        と **2 本目の実行経路** ができていた。両者はロックも running フラグも
+        共有していないので、手動トリガーの 6 秒後に Trigger B が起きると
+        ``run_full`` が 2 本同時に走り、1 本目の作業領域 (``_workspace``) と
+        キャンセル要求が消える (2026-09-08 ライブ監査: 523 秒 × 2 本が並走)。
+
+        現在は「前倒し要求 (``_full_requested``) を立てて待機を叩き起こす」
+        だけで、Level 1 ゲート / in-flight 生成待ち / ``_run_pre_full_flush``
+        / outcome 記録はすべて :meth:`_schedule_full` が持つ 1 本を通る。
+
+        ``level=full`` の意味 (「Full を通してから Level 1 を積む」) を保つため
+        **完了まで待つ**。既に Full が走っている場合は 2 本目を起こさず、その
+        1 本の完了を待つ。
 
         ノート生成は Full の Step E1 (会話履歴からの取り込み) が行うので、
         「今の会話を覚えさせたい」ときに押すボタンで今の会話が入力から抜ける、
-        という 2026-08-27 ライブ監査の事故は構造的に起きなくなった。
-
-        ``_last_full_run`` は更新しない — 手動実行は自動スケジュールの
-        デバウンス状態とは独立に扱う (従来挙動を変えない)。
+        という 2026-08-27 ライブ監査の事故は構造的に起きない。
 
         Returns:
-            実際に走ったか。ワーカー未設定 / LLM 未接続なら ``False``。
+            ``"completed"`` (走り切った) / ``"already_running"`` (走行中の 1 本に
+            合流して待った) / ``"unavailable"`` (ワーカー未設定) /
+            ``"deferred"`` (``_MANUAL_FULL_WAIT_SEC`` 以内に決着せず、予約だけ
+            残した) / それ以外は :meth:`_schedule_full` のスキップ理由
+            (``"chat_in_flight"`` など)。
         """
         if self._worker is None:
-            return False
-        self._run_pre_full_flush()
-        client = self.resolve_sleep_client()
-        if client is None:
-            return False
-        await self._worker.run_full(client)
-        return True
+            return "unavailable"
+        fut = self._ensure_full_completion()
+        already_running = self._full_running
+        if already_running:
+            logger.info(
+                "Manual trigger: a full sleep-time cycle is already running; "
+                "joining it instead of starting a second one",
+            )
+        else:
+            self._full_requested = True
+            self._full_immediate = True
+            task = self._full_task
+            if task is None or task.done():
+                self._full_task = asyncio.create_task(self._schedule_full())
+            else:
+                # 既にアイドル待ち中のタスクを起こす (2 本目を作らない)。
+                self._full_wake.set()
+        try:
+            outcome = await asyncio.wait_for(
+                asyncio.shield(fut), _MANUAL_FULL_WAIT_SEC,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Manual trigger: the full sleep-time cycle did not settle within "
+                "%.0fs; leaving the request queued", _MANUAL_FULL_WAIT_SEC,
+            )
+            return "deferred"
+        return "already_running" if already_running else outcome
 
     def _note_level1_defer_ended(self) -> None:
         """Level 1 による繰り延べが解けたことを 1 行だけ記録する。
@@ -652,12 +749,28 @@ class SleepTimeScheduler:
         waiting_for_generation = False
         skipped_reason: str | None = None
         aux_failures: list[dict] = []
+        #: 後続タスクへ引き継いだか (引き継いだ側が完了通知を解決する)。
+        handed_off = False
         try:
-            await asyncio.sleep(self._full_wait_seconds())
+            await self._wait_full_idle()
 
             if self._worker is None:
                 success = True
                 skipped_reason = "no_worker"
+                return
+
+            # 既に Full が走っているなら 2 本目を起こさない。ワーカー側の
+            # サイクルロックが最後の砦だが、ここで弾かないと「ロック待ちの
+            # Full」がタスクとして積み上がる。同じ待ち時間で自分を再スケジュール
+            # して繰り延べる (Level 1 ゲートと同じ形)。
+            if self._full_running:
+                logger.info(
+                    "Trigger B: deferred, a full sleep-time cycle is already running",
+                )
+                success = True
+                skipped_reason = "already_running"
+                self._full_task = asyncio.create_task(self._schedule_full())
+                handed_off = True
                 return
 
             # Level 1 が同じ background_slot で走っている間は Full を走らせない
@@ -685,6 +798,7 @@ class SleepTimeScheduler:
                 success = True
                 skipped_reason = "level1_running"
                 self._full_task = asyncio.create_task(self._schedule_full())
+                handed_off = True
                 return
             self._note_level1_defer_ended()
 
@@ -729,8 +843,22 @@ class SleepTimeScheduler:
                 skipped_reason = "user_active"
                 return
 
+            # 上の in-flight 待ち / アイドル待ちには await があるので、ここまでに
+            # 別のタスクが走り出している可能性がある。フラグを立てる直前に
+            # **await を挟まずに** 見直して初めて排他になる。
+            if self._full_running:
+                logger.info(
+                    "Trigger B: deferred, another full cycle started while waiting",
+                )
+                success = True
+                skipped_reason = "already_running"
+                self._full_task = asyncio.create_task(self._schedule_full())
+                handed_off = True
+                return
+
             logger.info("Trigger B: starting Full sleep-time update")
             self._running = True
+            self._full_running = True
             executed = True
             # 「待たされ続けた末に強制で走らせた回」かどうかを、状態を潰す前に
             # 確定させる。この後 ``_full_requested`` / ``_last_full_run`` を
@@ -778,15 +906,29 @@ class SleepTimeScheduler:
         except Exception as e:
             logger.error("Full sleep-time update failed: %s", e, exc_info=True)
         finally:
-            self._running = False
-            forced = self._full_forced_run
-            self._full_forced_run = False
+            # 実行フェーズに入ったタスクだけがフラグを下ろす。スキップした
+            # タスクが下ろすと、走行中の Full のゲートを外してしまう。
+            if executed:
+                self._running = False
+                self._full_running = False
+            forced = self._full_forced_run and executed
+            if executed:
+                self._full_forced_run = False
             elapsed_ms = (time.monotonic() - t_start) * 1000
             extra: dict = {
                 "cancelled": cancelled, "executed": executed, "forced": forced,
             }
             if skipped_reason is not None:
                 extra["skipped_reason"] = skipped_reason
+            if not handed_off:
+                # 繰り延べ以外は結末が確定した = 手動 Full の待ちを解く。
+                if executed and not cancelled:
+                    outcome = "completed"
+                elif cancelled:
+                    outcome = "cancelled"
+                else:
+                    outcome = skipped_reason or "failed"
+                self._resolve_full_completion(outcome)
             _emit_bg_task_outcome(
                 self._debug_logger,
                 task_name="full",
@@ -867,6 +1009,22 @@ class SleepTimeScheduler:
             "seconds_until_idle": seconds_until_idle,
         }
 
+    def _note_level1_loop_defer_ended(self) -> None:
+        """Level 1 ループの Full 待ちが解けたことを 1 行だけ記録する。
+
+        繰り延べ中は DEBUG に落としているので、解けた瞬間の 1 行が
+        「どれだけ待たされたか」の唯一の手掛かりになる
+        (:meth:`_note_level1_defer_ended` と同じ方針)。
+        """
+        started = self._level1_loop_defer_since
+        if started is None:
+            return
+        self._level1_loop_defer_since = None
+        logger.info(
+            "Level 1 loop: resumed after %.1f min deferred by the full cycle",
+            (time.monotonic() - started) / 60,
+        )
+
     async def _schedule_level1_loop(self) -> None:
         """常駐ループ。f_04 §5.3 の判定順序に従って Level 1 を起動する。
 
@@ -891,6 +1049,27 @@ class SleepTimeScheduler:
                 if llm_for_level1 is None:
                     # LLM 未接続。次 tick で再評価
                     continue
+
+                # (0) Full sleep-time が走っている間は起こさない。両者は同じ
+                # background_slot を奪い合ううえ、Level 1 の入力 (経験 /
+                # few-shot / SemMem) は Full が書き終えるまで途中の状態になる
+                # (Trigger B 側の Level 1 ゲートと対称。Level 2 ループの
+                # ``ls.running`` チェックと同じ形)。
+                if self._full_running:
+                    if self._level1_loop_defer_since is None:
+                        self._level1_loop_defer_since = time.monotonic()
+                        logger.info(
+                            "Level 1 loop: deferred, "
+                            "a full sleep-time cycle is running",
+                        )
+                    else:
+                        logger.debug(
+                            "Level 1 loop: still deferred by the full cycle "
+                            "(%.1f min)",
+                            (time.monotonic() - self._level1_loop_defer_since) / 60,
+                        )
+                    continue
+                self._note_level1_loop_defer_ended()
 
                 # (1) SUSPENDED session を最優先で resume
                 if ls.has_active_session():
@@ -1026,6 +1205,15 @@ class SleepTimeScheduler:
                     # 学習継続中。次 tick で再評価する。
                     continue
 
+                # Level 2 の発火判定 (get_failures) と eval_core 追記は
+                # ``signals.user_correction`` を読む。記録時は候補どまりなので、
+                # 判定より前に検証を通す (2026-09-08 監査 F-03)。
+                # ``check_level2`` は同期なのでここが唯一の await 可能点。
+                try:
+                    await ls.verify_correction_candidates(self._llm_client)
+                except Exception as e:
+                    logger.warning("Correction verification failed: %s", e)
+
                 triggered = False
                 try:
                     triggered = bool(ls.check_level2(
@@ -1090,4 +1278,15 @@ class SleepTimeScheduler:
 
     @property
     def running(self) -> bool:
-        return self._running
+        """Light / Full のどちらかが走っているか。
+
+        ``_running`` は Light と Full が共有するため、Full の実行中に Light が
+        (ロックで飛ばされて) 終わると ``finally`` で False へ落ちる。Full の
+        実行中は必ず True を返すよう ``_full_running`` を OR で見る。
+        """
+        return self._running or self._full_running
+
+    @property
+    def full_running(self) -> bool:
+        """Full サイクルが実行フェーズにあるか (Light は含まない)。"""
+        return self._full_running

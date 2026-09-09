@@ -477,7 +477,6 @@
 			"model_state_file": "Model State File",
 			"memory_dir": "Memory Directory",
 			"prompts_dir": "Prompts Directory",
-			"cartridges_dir": "Cartridges Directory",
 			"history_dir": "History Directory",
 			"learned_patterns_file": "Learned Patterns File",
 			"themes_dir": "Themes Directory"
@@ -813,8 +812,6 @@
 		"performance": "Performance",
 		"learning": "Learning",
 		"wm_turns": "WM Turns",
-		"stm_notes": "STM Notes",
-		"ltm_vectors": "LTM Vectors",
 		"ttft": "TTFT",
 		"tok_per_sec": "tok/s",
 		"cache_hit_rate": "Cache Hit Rate",
@@ -842,6 +839,26 @@
 	"landing": {
 		"free_tagline": "Local personal knowledge assistant powered by Agentic RAG",
 		"pro_tagline": "Self-evolving local LLM assistant with Agentic RAG plus create mode"
+	},
+	"knowledge": {
+		"title": "Knowledge Sources (Pro)",
+		"hint": "Registered sources are fetched during idle sleep-time and turned into know.* claims. This screen only edits the ledger.",
+		"url": "URL",
+		"name": "Name",
+		"topic": "Topic",
+		"fetch_kind": "Fetch Kind",
+		"kind_page": "Page",
+		"kind_rss": "RSS",
+		"add": "Add",
+		"enable": "Enable",
+		"disable": "Disable",
+		"delete": "Remove",
+		"fetch_now": "Fetch Now",
+		"fetch_done": "Fetch complete ({added} new item(s))",
+		"fetch_requested": "Fetch requested (running in the background)",
+		"sources_empty": "No sources registered",
+		"recent_items": "Recent Items",
+		"items_empty": "No items fetched yet"
 	},
 	"loop": {
 		"console": {

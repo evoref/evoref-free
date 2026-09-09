@@ -589,8 +589,15 @@ class SemanticStore:
             superseded_by=new_id,
             veracity="retracted" if old.veracity == "disputed" else old.veracity,
         )
+        # 敗者の元発話ノート id を勝者へ継承する (敗者は 3 版後に物理 GC され、
+        # provenance から「現在値でない発話」を引く経路が切れるため)。
+        inherited = set(new.retired_note_ids or ())
+        inherited.update(old.retired_note_ids or ())
+        inherited.update(p.note_id for p in (old.provenances or []) if p.note_id)
+        changes: dict[str, Any] = {"retired_note_ids": sorted(inherited)}
         if new.veracity == "disputed":
-            self.update_fact(new_id, touch=False, veracity="stated", contradicts=[])
+            changes.update(veracity="stated", contradicts=[])
+        self.update_fact(new_id, touch=False, **changes)
         logger.info("supersede: %s -> %s", old_id, new_id)
         self._supersede_generic_shadows(old_id, new_id)
 
@@ -789,6 +796,18 @@ class SemanticStore:
             if (include_superseded or not f.superseded_by)
             and (scope is None or f.scope == scope)
         ]
+
+    def know_facts(
+        self, *, include_superseded: bool = False, scope: str | None = None,
+    ) -> list[SemanticFact]:
+        """``know.*`` の claim を namespace 索引経由で返す (c_16 §4.2)。
+
+        取得器が「期限切れになった取得単位を指す claim」を引くのに使う。
+        全件走査に落とすと、``mem.*`` が育つほど 1 サイクルが重くなる。
+        """
+        return self._collect(
+            self._by_namespace.get("know", set()), include_superseded, scope,
+        )
 
     def pinned_facts(self, scope: str | None = None) -> list[SemanticFact]:
         """pinned ファクトを返す。"""

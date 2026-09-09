@@ -543,18 +543,22 @@ def register_builtin_tools(
         func=calculate,
         description=(
             "Evaluate a Python-syntax arithmetic expression safely (numeric "
-            "literals + - * / % ** // and parentheses only)"
+            "literals + - * / % ** // parentheses, and the allow-listed "
+            "functions and constants below)"
         ),
         parameters={
             "expression": {
                 "type": "string",
+                # 一覧は _SAFE_NAMES から生成する。直書きしていた頃は許可リスト
+                # と食い違い、実際には使える gcd() / sqrt() / pi を「非対応」と
+                # 説明していた (2026-09-08 監査 F-06)。説明文が誤っていると
+                # モデルは使える関数を避けて暗算に落ちる。
                 "description": (
                     "Use ** for exponentiation, NOT ^ (which is bitwise XOR in "
-                    "this sandbox and will error). Function calls (e.g. gcd(), "
-                    "sqrt()) and symbolic constants (e.g. pi, e) are NOT "
-                    "supported -- inline the numeric value instead (e.g. 3.14159 "
-                    "instead of pi), and compute functions like gcd manually "
-                    "step-by-step rather than calling them."
+                    "this sandbox and will error). Only these names are "
+                    "available: " + " ".join(sorted(_SAFE_NAMES)) + ". Any "
+                    "other name (or any variable) will error, so inline the "
+                    "numeric value instead."
                 ),
             },
         },

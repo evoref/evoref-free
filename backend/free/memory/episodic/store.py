@@ -611,6 +611,15 @@ class EpisodicStore:
         """ノート化の進捗だけを書き出す (snapshot を作らないサイクル用)。"""
         self.progress.save()
 
+    def close(self) -> None:
+        """memmap を握った索引を手放す (Windows で削除できるように)。
+
+        Windows は memmap で開いたままのファイルを削除できず、旧版の GC が
+        黙って失敗する (CLAUDE.md §10)。SemMem と同じく shutdown で必ず呼ぶ。
+        """
+        self.evidence.close()
+        self._invalidate_cache()
+
     # ── ベクトル (sleep-time の競合検出 / ノート進化が使う) ──
 
     def vectors_for(self, record_ids: list[str]) -> dict[str, np.ndarray]:

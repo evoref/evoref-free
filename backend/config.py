@@ -63,6 +63,8 @@ class PathResolver:
         "embed_lora_adapter": "local/models/embed_adapter.gguf",
         "embed_lora_versions_dir": "local/models/embed_lora_versions/",
         "knowledge_dir": "local/knowledge/",
+        # ディレクトリ指定の無い生成物の既定の書込み先 (CWD へ書かないため)。
+        "outputs_dir": "local/outputs/",
         "experience_file": "local/experience.json",
         "eval_core_file": "local/eval_core.json",
         "model_state_file": "local/model_state.json",
@@ -244,6 +246,17 @@ class PathResolver:
         「片方だけ別ドライブへ移した」状態が作れてしまう。
         """
         return self.resolve_local("memory_dir") / "corpus"
+
+    def resolve_outputs_dir(self) -> Path:
+        """ディレクトリ指定の無い生成物の既定の書込み先を解決する。
+
+        「compose.yaml に保存して」のようにファイル名だけを指定された書込みは、
+        素で ``write_file`` へ渡すとプロセスの CWD (= リポジトリ直下) に着地
+        する (2026-09-08 監査 F-05: リポジトリ直下に ``compose.yaml`` が
+        作られた)。宛先の錨が無い相対パスはすべてここへ寄せる。明示パス
+        (絶対パス / ``./`` ``../`` 始まり) はユーザーの指定なのでそのまま。
+        """
+        return self.resolve_local("outputs_dir")
 
     @property
     def active_mode(self) -> str:
@@ -427,6 +440,19 @@ def get_path_resolver() -> PathResolver:
     if _path_resolver is None:
         raise RuntimeError("Config not loaded. Call load_config() first.")
     return _path_resolver
+
+
+def resolve_outputs_dir() -> Path:
+    """既定の成果物書込み先を返す (config 未ロードでも解決する)。
+
+    エージェントの書込み経路は config を持たない静的ヘルパから呼ばれるため、
+    ``get_path_resolver()`` の「未ロードなら RuntimeError」をここで吸収し、
+    未ロード時は既定値 (``<project_root>/local/outputs/``) を返す。書込み先の
+    解決が config のロード順に依存して CWD へ落ちることを防ぐ。
+    """
+    if _path_resolver is not None:
+        return _path_resolver.resolve_outputs_dir()
+    return get_project_root() / PathResolver.LOCAL_DEFAULTS["outputs_dir"]
 
 
 def get_project_root() -> Path:

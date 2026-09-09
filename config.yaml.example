@@ -344,6 +344,7 @@ local_paths:
   embed_lora_versions_dir: local/models/embed_lora_versions/       # 埋め込み LoRA スナップショット
   # RAG / メモリ
   knowledge_dir: local/knowledge/            # RAG 用ソースドキュメント
+  outputs_dir: local/outputs/                # ディレクトリ指定の無い生成物の既定の書込み先 (明示パス指定時はそちらが優先)
   memory_dir: local/memory/                  # メモリシステム永続化 (episodic / semantic / corpus)
   agent_trace_dir: local/memory/agent_trace/ # MDP トレース常設ストア (エピソード記憶の入力、30 日で自動削除)
   prompts_dir: local/prompts/                # モード別システムプロンプト
@@ -838,10 +839,10 @@ memory:
       snapshots_keep: 3           # snapshot の保持版数
     ranking:              # score = cos × freshness × confidence × store_prior
       store_prior:
-        episodic: 1.0
+        episodic: 0.9             # 2026-09-08 A/B: corpus/episodic 比 1.1 が最良 (文書は confidence base 0.8 で既に不利、比 1.25 以上で記憶質問へ corpus が混入)
         semantic_mem: 1.0
         semantic_know: 0.9
-        corpus: 0.9               # corpus/manifest.json の store_prior_overrides で PC 固有に上書き可 (旧 cartridge priority の置換)
+        corpus: 1.0               # corpus/manifest.json の store_prior_overrides で PC 固有に上書き可 (旧 cartridge priority の置換)
       allow_assistant_origin_injection: false  # origin=assistant を [参考情報] に出すか (既定 false: 自分の出力の再注入を塞ぐ)
     lexical:              # 転置索引。走査量 <= q_terms × m_postings でレコード数に依存しない
       q_terms: 32                 # クエリ語のうち IDF 上位 Q 語だけ使う
@@ -983,6 +984,7 @@ prompt:
   max_deletes_per_run: 1           # Level 1 の 1 ランで許す規則 delete 件数
   adoption_eval_cases: 6           # base prompt 採用ゲートの実測ケース数 (0 = 実測しない = 採用しない)
   adoption_min_gain: 0.05          # 採用に要する実測スコアの最小上昇幅 (候補平均 - 現行平均)
+  adoption_min_cases: 3            # 進化・採用に要する評価ケースの最小数 (未満なら進化自体をスキップ)
 
 # ===== エージェント設定 =====
 agent:
@@ -1252,4 +1254,5 @@ pro:
     fetch_timeout_sec: 20              # 1 URL あたりの取得タイムアウト (秒)
     max_items_per_run: 20              # 1 サイクルで新規に取り込む item の上限
     max_claims_per_item: 8             # 1 item から抜く claim の上限
+    items_keep_days: 30                # expired/retracted な取得単位を items.jsonl から落とすまでの日数 (0=消さない)
     user_agent: evoref-knowledge/1.0   # 取得時に名乗る User-Agent

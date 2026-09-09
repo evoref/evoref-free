@@ -69,7 +69,6 @@ export interface LocalPathsConfig {
 	local_state_file: string;
 	memory_dir: string;
 	prompts_dir: string;
-	cartridges_dir: string;
 	history_dir: string;
 	learned_patterns_file: string;
 	themes_dir: string;

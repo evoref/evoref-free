@@ -1369,29 +1369,6 @@ def _calc_fitness_memory(experiences: list[dict]) -> float | None:
     return _defect_rate_fitness(experiences)
 
 
-def _calc_fitness_search(experiences: list[dict]) -> float | None:
-    """search fitness: RAG チャンク使用率
-
-    rag_top1_score の平均値。RAG 未使用経験は除外。RAG 経験ゼロは評価不能 (None)。
-    """
-    rag_exps = [
-        e for e in experiences
-        if e.get("signals", {}).get("rag_used")
-    ]
-    if not rag_exps:
-        return None
-
-    scores = [
-        e["signals"]["rag_top1_score"]
-        for e in rag_exps
-        if e.get("signals", {}).get("rag_top1_score") is not None
-    ]
-    if len(scores) < MIN_FITNESS_SAMPLES:
-        return None
-
-    return max(0.0, min(1.0, sum(scores) / len(scores)))
-
-
 def _calc_fitness_agent(experiences: list[dict]) -> float | None:
     """agent fitness: ステップ効率 (ループ数が少ないほど高スコア)。
 
@@ -1469,7 +1446,6 @@ def _calc_fitness_default(experiences: list[dict]) -> float | None:
 _FITNESS_FUNCTIONS: dict[str, Callable[..., float | None]] = {
     "router": _calc_fitness_router,
     "memory": _calc_fitness_memory,
-    "search": _calc_fitness_search,
     "agent": _calc_fitness_agent,
     "long_form": _calc_fitness_long_form,
 }

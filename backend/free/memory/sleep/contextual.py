@@ -36,6 +36,7 @@ async def generate_prefixes_for_store(
     label: str,
     *,
     is_cancelled: Callable[[], bool] | None = None,
+    should_pause: Callable[[], bool] | None = None,
     min_chunk_tokens: int = 0,
 ) -> int:
     """1 つの VectorStore 内のプレフィックス未生成チャンクを処理する。
@@ -43,6 +44,11 @@ async def generate_prefixes_for_store(
     ``min_chunk_tokens`` が 1 以上のときは、metadata の ``tokens`` が
     その値未満の chunk をスキップする。短文 chunk は
     プレフィックスの retrieval 寄与が薄いため補助タスク呼び出しを節約する。
+
+    Args:
+        should_pause: ``True`` を返したらチャンク境界でループを打ち切る
+            協調 yield。残りのチャンクは ``has_context`` が立たないままなので
+            次サイクルが再スキャンで拾う。
     """
     if store is None:
         return 0
@@ -80,9 +86,14 @@ async def generate_prefixes_for_store(
         src = meta.get("source", "")
         by_source.setdefault(src, []).append(meta)
 
+    total_pending = len(pending)
+    handled = 0
     generated = 0
     backfilled = 0
+    paused = False
     for source, metas in by_source.items():
+        if paused:
+            break
         if is_cancelled is not None and is_cancelled():
             break
 
@@ -96,6 +107,7 @@ async def generate_prefixes_for_store(
                 for meta in metas:
                     store.mark_has_context(meta["id"])
                 backfilled += len(metas)
+                handled += len(metas)
                 logger.info(
                     "Step 5.8 [%s]: %s has no source text by design "
                     "(memory-sourced chunk); marked %d chunk(s) "
@@ -107,12 +119,25 @@ async def generate_prefixes_for_store(
                     "Step 5.8 [%s]: source text not found for %s, skipping",
                     label, source,
                 )
+                handled += len(metas)
             continue
 
         for meta in metas:
             if is_cancelled is not None and is_cancelled():
                 break
+            # 協調 yield: チャット生成が走っている間はチャンク境界で手を
+            # 止める (note_evolver と同じ実測。CLAUDE.md 不変則 #1)。残りは
+            # has_context が立たないままなので次サイクルの再スキャンが拾う。
+            if should_pause is not None and should_pause():
+                remaining = total_pending - handled
+                logger.info(
+                    "Step 5.8 [%s] paused for the user turn: %d chunk(s) "
+                    "left pending for the next cycle", label, remaining,
+                )
+                paused = True
+                break
 
+            handled += 1
             chunk_id = meta["id"]
             chunk_text = store.load_chunk(chunk_id)
             if not chunk_text:
@@ -131,6 +156,9 @@ async def generate_prefixes_for_store(
             )
             generated += 1
 
+        if paused:
+            break
+
     if generated > 0 or backfilled > 0:
         store.save()
 
@@ -145,6 +173,7 @@ async def generate_contextual_prefixes(
     vector_store: "VectorStore | None",
     cartridge_manager: "CartridgeManager | None",
     is_cancelled: Callable[[], bool] | None = None,
+    should_pause: Callable[[], bool] | None = None,
 ) -> int:
     """Step 5.8 本体 — メイン VectorStore + 全カートリッジを順次処理する。
 
@@ -164,6 +193,8 @@ async def generate_contextual_prefixes(
         vector_store: メイン VectorStore。
         cartridge_manager: 任意の CartridgeManager。
         is_cancelled: キャンセル判定コールバック。
+        should_pause: ``True`` を返したらチャンク境界でループを打ち切る
+            協調 yield (メイン / カートリッジ双方に伝播する)。
 
     Returns:
         生成したプレフィックス総数。
@@ -195,12 +226,15 @@ async def generate_contextual_prefixes(
         batch_size,
         "main",
         is_cancelled=is_cancelled,
+        should_pause=should_pause,
         min_chunk_tokens=min_chunk_tokens,
     )
 
     if cartridge_manager is not None:
         for cart_id, cart_store in cartridge_manager.get_loaded_stores().items():
             if is_cancelled is not None and is_cancelled():
+                break
+            if should_pause is not None and should_pause():
                 break
             total_generated += await generate_prefixes_for_store(
                 cart_store,
@@ -209,6 +243,7 @@ async def generate_contextual_prefixes(
                 batch_size,
                 f"cartridge:{cart_id}",
                 is_cancelled=is_cancelled,
+                should_pause=should_pause,
                 min_chunk_tokens=min_chunk_tokens,
             )
 

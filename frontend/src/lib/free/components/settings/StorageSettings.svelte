@@ -11,10 +11,10 @@
 	let history = $derived(configSection($configData, 'history'));
 
 	const localPathKeys = [
-		'lora_adapter', 'lora_versions_dir', 'aux_experience_file', 'lora_archive_dir',
+		'lora_adapter', 'lora_versions_dir', 'lora_archive_dir',
 		'embed_lora_adapter', 'embed_lora_versions_dir',
 		'knowledge_dir', 'experience_file', 'eval_core_file',
-		'model_state_file', 'memory_dir', 'prompts_dir', 'cartridges_dir',
+		'model_state_file', 'memory_dir', 'prompts_dir',
 		'history_dir', 'learned_patterns_file', 'themes_dir'
 	];
 </script>

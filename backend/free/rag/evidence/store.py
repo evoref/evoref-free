@@ -56,9 +56,12 @@ Qwen3 系の instruction-aware な埋め込みは query 側と document 側で p
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import json
 import re
+import shutil
 import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from pathlib import Path
@@ -67,7 +70,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from backend.free.rag.evidence.columns import active_mask as columns_active_mask
-from backend.free.rag.evidence.events import EvidenceEventLog
+from backend.free.rag.evidence.events import EventPosition, EvidenceEventLog
 from backend.free.rag.evidence.lexical_index import (
     LexicalIndex,
     LexicalIndexBuilder,
@@ -84,11 +87,17 @@ from backend.free.rag.evidence.ranking import (
 from backend.free.rag.evidence.snapshot import (
     SnapshotReader,
     SnapshotWriter,
+    list_versions,
     prune_snapshots,
     read_snapshot,
     snapshot_dir,
+    version_seq,
 )
-from backend.free.rag.evidence.types import Evidence
+from backend.free.rag.evidence.types import (
+    RECORD_VERSION,
+    Evidence,
+    EvidenceVersionError,
+)
 from backend.free.rag.vector_store import (
     DEFAULT_MEMMAP_THRESHOLD,
     VectorStore,
@@ -168,11 +177,43 @@ STORE_PRIOR_KEYS: dict[str, str] = {
 
 #: ``store_prior`` が読めないときの既定 (c_16 §9)。
 DEFAULT_STORE_PRIORS: dict[str, float] = {
-    "episodic": 1.0, "semantic": 1.0, "corpus": 0.9,
+    "episodic": 0.9, "semantic": 1.0, "corpus": 1.0,
 }
+
+#: 埋め込み索引の版ディレクトリ名 (``embeddings/<model_id>/v0003/``、c_16 §6.1)。
+_EMBED_VERSION_FORMAT = "v{:04d}"
+
+#: 埋め込み索引の版ディレクトリを読む正規表現。
+_EMBED_VERSION_RE = re.compile(r"v(\d+)")
+
+#: 埋め込み索引を何版残すか (snapshot と同じ理由 — 稼働中の読み手が memmap を
+#: 掴んでいる版を消さない)。
+EMBEDDING_VERSIONS_KEEP = 2
 
 #: シャード名をディレクトリ名へ落とすときに残す文字。
 _SAFE_SHARD_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+class EvidenceStoreReadonlyError(RuntimeError):
+    """ストアが readonly (書けば壊す状態) なのに書き込みが試みられた。
+
+    c_05 §0.5.1 の「新しい版のファイルは読まず書き戻しも拒否」を、
+    ``manifest.json`` が読めない / 版が新しい / レコードの ``_version`` が
+    新しい場合へ広げたもの (c_16 §5.1)。既定値のまま「空のストア」として
+    動き出すと、``create_snapshot`` が v0001 を上書きし、``prune_snapshots``
+    が本物の最新版を消す。
+    """
+
+
+def embedding_version_name(seq: int) -> str:
+    """埋め込み索引の版番号 → ディレクトリ名 (``v0003``)。"""
+    return _EMBED_VERSION_FORMAT.format(int(seq))
+
+
+def embedding_version_seq(name: str) -> int | None:
+    """埋め込み索引のディレクトリ名 → 版番号。読めなければ ``None``。"""
+    match = _EMBED_VERSION_RE.fullmatch(str(name).strip())
+    return int(match.group(1)) if match else None
 
 
 def shard_dirname(name: str) -> str:
@@ -329,12 +370,113 @@ class EvidenceStore:
         self._vector_rows: np.ndarray | None = None
         #: active snapshot の転置索引 (lazy load)。
         self._lexical: LexicalShardSet | None = None
+        #: :meth:`create_snapshot` の排他。版番号の発番 (``take_next_version``)
+        #: と overlay / tail のリセットを 2 本が交互に踏むと、書きかけの版を
+        #: 別内容で上書きしたり prune の保護対象が食い違ったりする。
+        self._snapshot_lock = asyncio.Lock()
+        #: 同期の書き込み API の再入検出。単一書き手 (sleep-time) という
+        #: 不変則 (c_16 §2.1) が破れたときに **沈黙の破損ではなく例外** に
+        #: するための番人で、直列化のためのロックではない (非ブロッキング)。
+        self._writer_guard = threading.Lock()
+        #: readonly に落ちた理由 (``None`` なら書ける)。
+        self._readonly_reason: str | None = None
+        #: readonly の警告を 1 度だけ出すためのフラグ。
+        self._readonly_warned: bool = False
+        #: 語彙索引パラメータの食い違い警告を 1 度だけ出すためのフラグ。
+        self._lexical_drift_warned: bool = False
+
+    # ── readonly (c_05 §0.5.1 / c_16 §5.1) ──
+
+    @property
+    def readonly(self) -> bool:
+        """書き込みを拒否する状態か。"""
+        return self._readonly_reason is not None
+
+    @property
+    def readonly_reason(self) -> str:
+        """readonly に落ちた理由 (書けるなら空文字)。"""
+        return self._readonly_reason or ""
+
+    def _enter_readonly(self, reason: str) -> None:
+        """ストアを readonly に落とす (WARNING は 1 度だけ)。"""
+        if self._readonly_reason is not None:
+            return
+        self._readonly_reason = reason
+        # manifest 側も封じる — 旧いコードで書き戻すとフィールドが落ちる。
+        self.manifest.readonly = True
+        logger.warning(
+            "Evidence store %s is read-only: %s. Writes (put / patch / "
+            "retract / create_snapshot / prune) are refused.",
+            self.store_name, reason,
+        )
+
+    def _refuse_write(self, operation: str) -> None:
+        """書き込み系 API の入口。readonly なら例外で止める。"""
+        if self._readonly_reason is None:
+            return
+        raise EvidenceStoreReadonlyError(
+            f"{self.store_name} store is read-only ({self._readonly_reason}); "
+            f"refusing {operation}",
+        )
+
+    @contextlib.contextmanager
+    def _exclusive_write(self, operation: str) -> Iterator[None]:
+        """同期の書き込み API を再入検出付きで囲む。
+
+        3 ストアの書き手は sleep-time 1 本 (c_16 §2.1) という不変則が破れると、
+        事象の追記とオーバーレイ更新の間に別の書き手が入り、``manifest`` の
+        計数と in-memory の状態が食い違う。ここでは **直列化しない** —
+        取れなければ即座に例外にして、沈黙の破損ではなく落ちるようにする。
+
+        Raises:
+            RuntimeError: 別の書き手が同じストアを書いている最中のとき。
+        """
+        if not self._writer_guard.acquire(blocking=False):
+            raise RuntimeError(
+                f"concurrent writer on the {self.store_name} evidence store "
+                f"({operation}); writes are single-writer (sleep-time only)",
+            )
+        try:
+            yield
+        finally:
+            self._writer_guard.release()
+
+    def _warn_readonly_skip(self, operation: str) -> None:
+        """壊れない no-op (touch 系) を飛ばしたことを 1 度だけ記録する。"""
+        if self._readonly_warned:
+            return
+        self._readonly_warned = True
+        logger.warning(
+            "Skipping %s on the read-only %s store (%s)",
+            operation, self.store_name, self._readonly_reason,
+        )
 
     # ── ロード ──
 
     def load(self) -> None:
-        """manifest → active snapshot → 未畳み込み事象の順に読む。"""
-        self.manifest.load()
+        """manifest → active snapshot → 未畳み込み事象の順に読む。
+
+        manifest が読めなかった場合は **既定値のまま動き出さない** —
+        ``active_snapshot=""`` / ``next_snapshot_seq=1`` のまま進むと、空の
+        ストアとして起動したうえで次の ``create_snapshot`` が v0001 を
+        上書きし、``prune_snapshots`` が本物の最新版を消す。版ディレクトリ
+        から復元できるならそこから復元し、できなければ readonly に落とす
+        (c_05 §0.5.1)。
+        """
+        self._readonly_reason = None
+        self._readonly_warned = False
+        # 前回のロードで立った封印は持ち越さない (直したファイルを読み直せる)。
+        self.manifest.readonly = False
+        manifest_existed = self.manifest.path.exists()
+        if not self.manifest.load():
+            self._recover_manifest(manifest_existed)
+        elif self.manifest.record_version > RECORD_VERSION:
+            self._enter_readonly(
+                f"the manifest declares record_version "
+                f"{self.manifest.record_version}, newer than the supported "
+                f"{RECORD_VERSION}",
+            )
+        self._apply_config_retention()
         version = self.manifest.active_snapshot
         self._snapshot = (
             read_snapshot(self.store_dir, version) if version else None
@@ -346,18 +488,94 @@ class EvidenceStore:
         self._vector_rows = None
         self._lexical = None
 
+    def _recover_manifest(self, manifest_existed: bool) -> None:
+        """manifest が読めなかったときに版ディレクトリから状態を復元する。
+
+        - 新しい ``schema_version`` (``JsonStateFile`` が拒否した) → readonly。
+          読むだけは続けられるよう active 版は最新の版ディレクトリを指す
+        - 破損 / 消失 → 版ディレクトリの最大版を active、``next_snapshot_seq``
+          はその +1、``folded_through`` は未定なので先頭へ戻す (事象は冪等に
+          畳み直せる)
+        - 版が 1 つも無く manifest も無い → 新規ストア (通常起動)
+        - 版はあるが版名が読めない → readonly
+        """
+        versions = list_versions(self.store_dir)
+        if self.manifest.readonly:
+            if versions:
+                self.manifest.active_snapshot = versions[-1]
+            self._enter_readonly(
+                f"{self.manifest.path.name} has a newer schema_version",
+            )
+            return
+        if not manifest_existed and not versions:
+            return  # 新規ストア
+        if not versions:
+            self._enter_readonly(
+                f"{self.manifest.path.name} is unreadable and there is no "
+                "snapshot version to recover from",
+            )
+            return
+        seqs = [seq for seq in (version_seq(v) for v in versions) if seq is not None]
+        if not seqs:
+            self._enter_readonly(
+                f"{self.manifest.path.name} is unreadable and the snapshot "
+                f"version names cannot be parsed: {', '.join(versions)}",
+            )
+            return
+        self.manifest.active_snapshot = versions[-1]
+        self.manifest.next_snapshot_seq = max(seqs) + 1
+        self.manifest.folded_through = EventPosition()
+        logger.warning(
+            "Recovered the %s manifest from snapshot versions: active=%s, "
+            "next_snapshot_seq=%d (events are replayed from the beginning)",
+            self.store_name, self.manifest.active_snapshot,
+            self.manifest.next_snapshot_seq,
+        )
+
+    def _apply_config_retention(self) -> None:
+        """``memory.evidence.retention`` を manifest の保持方針へ重ねる。
+
+        保持方針は manifest に宣言するのが c_16 §5.4 だが、**設定を変えても
+        効く先が無い** と config のキーが飾りになる (corpus で実際にそう
+        なっていた)。設定側を後勝ちにし、次の ``save`` で manifest へも降ろす。
+        """
+        retention = _section_value(self.rag_config, "retention")
+        if not isinstance(retention, dict) or not retention:
+            return
+        changed = {
+            key: value for key, value in retention.items()
+            if self.manifest.retention.get(key) != value
+        }
+        if not changed:
+            return
+        self.manifest.retention.update(retention)
+        logger.info(
+            "Retention for %s overridden by config: %s",
+            self.store_name,
+            ", ".join(f"{k}={v}" for k, v in sorted(changed.items())),
+        )
+
     def _replay_events(self) -> None:
         """snapshot 以降の事象をオーバーレイへ適用する。"""
         applied = 0
-        for event in self.events.iter_since(self.manifest.folded_through):
-            self._apply_event(event)
-            applied += 1
+        try:
+            for event in self.events.iter_since(self.manifest.folded_through):
+                self._apply_event(event)
+                applied += 1
+        except EvidenceVersionError as e:
+            self._enter_readonly(f"the event log holds a newer record version: {e}")
         if applied:
             logger.info(
                 "Replayed %d event(s) on top of snapshot %s (%s)",
                 applied, self.manifest.active_snapshot or "(none)", self.store_name,
             )
         self.manifest.events_since_snapshot = applied
+        snapshot = self._snapshot
+        if snapshot is not None and snapshot.unsupported_version:
+            self._enter_readonly(
+                f"snapshot {self.manifest.active_snapshot} holds a newer "
+                "record version",
+            )
 
     def _apply_event(self, event: dict[str, Any]) -> None:
         """1 事象をオーバーレイへ適用する (畳み込みと同じ意味論)。"""
@@ -463,47 +681,67 @@ class EvidenceStore:
     # ── 書き込み API (sleep-time 専用。事象を追記するだけ) ──
 
     def put(self, record: Evidence, *, by: str | None = None) -> Evidence:
-        """レコードを ``put`` する (追加 / 全置換)。"""
-        event = self.events.append_put(record.to_record(), by=by)
-        self._apply_event(event)
-        self.manifest.events_since_snapshot += 1
-        return self._overlay.get(record.id, record)
+        """レコードを ``put`` する (追加 / 全置換)。
+
+        Raises:
+            EvidenceStoreReadonlyError: ストアが readonly のとき (c_05 §0.5.1)。
+            RuntimeError: 別の書き手が同時に書いているとき。
+        """
+        self._refuse_write(f"put({record.id})")
+        with self._exclusive_write(f"put({record.id})"):
+            event = self.events.append_put(record.to_record(), by=by)
+            self._apply_event(event)
+            self.manifest.events_since_snapshot += 1
+            return self._overlay.get(record.id, record)
 
     def patch(
         self, record_id: str, *, by: str | None = None, **fields: Any,
     ) -> Evidence | None:
         """変更フィールドだけを ``patch`` する (c_16 §5.2)。"""
+        self._refuse_write(f"patch({record_id})")
         if self.get(record_id) is None:
             logger.warning("patch on unknown evidence id: %s", record_id)
             return None
-        event = self.events.append_patch(record_id, fields, by=by)
-        self._apply_event(event)
-        self.manifest.events_since_snapshot += 1
-        return self._overlay.get(record_id)
+        with self._exclusive_write(f"patch({record_id})"):
+            event = self.events.append_patch(record_id, fields, by=by)
+            self._apply_event(event)
+            self.manifest.events_since_snapshot += 1
+            return self._overlay.get(record_id)
 
     def retract(
         self, record_id: str, reason: str, *, by: str | None = None,
     ) -> Evidence | None:
         """``veracity=retracted`` にする。物理削除はしない (監査可能性)。"""
+        self._refuse_write(f"retract({record_id})")
         if self.get(record_id) is None:
             logger.warning("retract on unknown evidence id: %s", record_id)
             return None
-        event = self.events.append_retract(record_id, reason, by=by)
-        self._apply_event(event)
-        self.manifest.events_since_snapshot += 1
-        return self._overlay.get(record_id)
+        with self._exclusive_write(f"retract({record_id})"):
+            event = self.events.append_retract(record_id, reason, by=by)
+            self._apply_event(event)
+            self.manifest.events_since_snapshot += 1
+            return self._overlay.get(record_id)
 
     def touch(self, record_ids: Sequence[str], *, by: str | None = None) -> int:
-        """複数 id の ``last_used_at`` を 1 事象で更新する。"""
+        """複数 id の ``last_used_at`` を 1 事象で更新する。
+
+        readonly では **例外にせず 0 を返す** — ``last_used_at`` は落としても
+        失われるのは順位のヒントだけで、飛ばしても壊れない (呼び手は
+        sleep-time の ``flush_touch`` だけ)。
+        """
+        if self.readonly:
+            self._warn_readonly_skip("touch")
+            return 0
         known = [rid for rid in dict.fromkeys(record_ids) if self.get(rid) is not None]
         if not known:
             return 0
-        event = self.events.append_touch(known, by=by)
-        if event is None:
-            return 0
-        self._apply_event(event)
-        self.manifest.events_since_snapshot += 1
-        return len(known)
+        with self._exclusive_write("touch"):
+            event = self.events.append_touch(known, by=by)
+            if event is None:
+                return 0
+            self._apply_event(event)
+            self.manifest.events_since_snapshot += 1
+            return len(known)
 
     def flush_touch(self, *, by: str | None = None) -> int:
         """:class:`UsageBuffer` を drain して 1 つの ``touch`` 事象にする。"""
@@ -523,10 +761,115 @@ class EvidenceStore:
             return self.manifest.embedding_model_id or _UNKNOWN_MODEL
         return str(_backend_value(backend, "model_name", _UNKNOWN_MODEL))
 
-    def embeddings_dir(self, model_id: str | None = None) -> Path:
+    def embeddings_model_dir(self, model_id: str | None = None) -> Path:
+        """``embeddings/<model_id>/`` (版ディレクトリの親)。"""
         return self.store_dir / "embeddings" / (model_id or self.embedding_model_id)
 
-    async def embed_and_index_snapshot(self) -> int:
+    def embeddings_dir(
+        self, model_id: str | None = None, version: str | None = None,
+    ) -> Path:
+        """埋め込み索引の **版ディレクトリ** (``embeddings/<model_id>/v0003/``)。
+
+        版を切らずに 1 つのディレクトリへ ``np.save`` × 2 + ``metadata.json``
+        を書くと、(a) 3 ファイルの間に非原子な窓ができ、(b) 稼働中の読み手が
+        memmap で掴んでいるファイルを上書きすることになる (c_16 §2.1
+        「稼働中の索引は書き換えず版を積んで指す」/ c_05 §0.5)。書き手は必ず
+        新しい版へ書き、manifest の ``embedding_version`` を snapshot の
+        切り替えと **同時に** 進める。
+
+        Args:
+            model_id: 埋め込みモデル id。``None`` で現在のもの。
+            version: 版名。``None`` なら manifest が指す版 → 無ければ
+                ディスク上の最大版 → それも無ければ発番前の ``v0001``。
+        """
+        root = self.embeddings_model_dir(model_id)
+        return root / (version or self._resolve_embedding_version(root))
+
+    def _resolve_embedding_version(self, root: Path) -> str:
+        """読み出しに使う埋め込み版を決める (manifest → ディスク → 既定)。"""
+        declared = self.manifest.embedding_version
+        if declared and (root / declared).is_dir():
+            return declared
+        latest = self._latest_embedding_version(root)
+        if latest:
+            if declared:
+                logger.warning(
+                    "Embedding version %s declared by the %s manifest is "
+                    "missing; falling back to %s",
+                    declared, self.store_name, latest,
+                )
+            return latest
+        return declared or embedding_version_name(1)
+
+    @staticmethod
+    def _latest_embedding_version(root: Path) -> str:
+        """``embeddings/<model_id>/`` 配下の最大版名 (無ければ空文字)。"""
+        if not root.is_dir():
+            return ""
+        names = [
+            path.name for path in root.iterdir()
+            if path.is_dir() and embedding_version_seq(path.name) is not None
+        ]
+        if not names:
+            return ""
+        return max(names, key=lambda name: embedding_version_seq(name) or 0)
+
+    def _take_next_embedding_version(self, root: Path) -> str:
+        """次に書く埋め込み版を発番する (ディスク上の最大版 + 1)。
+
+        番号はディスクから引く — manifest だけを鍵にすると、manifest を
+        復元した直後に既存の版へ書き戻してしまう。
+        """
+        latest = self._latest_embedding_version(root)
+        seq = (embedding_version_seq(latest) or 0) if latest else 0
+        declared = embedding_version_seq(self.manifest.embedding_version or "") or 0
+        return embedding_version_name(max(seq, declared) + 1)
+
+    def prune_embedding_versions(
+        self, model_id: str | None = None, *, protect: Sequence[str] = (),
+    ) -> list[str]:
+        """古い埋め込み版を刈る (:data:`EMBEDDING_VERSIONS_KEEP` 版を残す)。
+
+        snapshot の GC と同じ保護を掛ける — ``protect`` (旧 active と新版) は
+        件数に関わらず残す。Windows では memmap を掴んだままの版が消せない
+        ので、消せなかったものは黙って次回へ回す。
+
+        Returns:
+            消せた版名。
+        """
+        root = self.embeddings_model_dir(model_id)
+        if not root.is_dir():
+            return []
+        protected = {v for v in protect if v}
+        versions = sorted(
+            (
+                path.name for path in root.iterdir()
+                if path.is_dir() and embedding_version_seq(path.name) is not None
+            ),
+            key=lambda name: embedding_version_seq(name) or 0,
+        )
+        surplus = len(versions) - EMBEDDING_VERSIONS_KEEP
+        if surplus <= 0:
+            return []
+        removed: list[str] = []
+        for version in [v for v in versions if v not in protected][:surplus]:
+            target = root / version
+            shutil.rmtree(target, ignore_errors=True)
+            if target.exists():
+                logger.warning(
+                    "failed to prune embedding version %s (%s); retrying next time",
+                    version, self.store_name,
+                )
+                continue
+            removed.append(version)
+        if removed:
+            logger.info(
+                "Pruned %d old embedding version(s) for %s: %s",
+                len(removed), self.store_name, ", ".join(removed),
+            )
+        return removed
+
+    async def embed_and_index_snapshot(self, *, defer_manifest: bool = False) -> int:
         """active snapshot の埋め込みを **増分で** 更新し、クラスタ索引を作る。
 
         c_16 §6.1: **全ストアで snapshot 生成時に構築**する (現行のカートリッジ
@@ -545,6 +888,15 @@ class EvidenceStore:
 
         埋め込みモデルが manifest の宣言と違う場合は流用せず全件やり直す。
 
+        書き先は **新しい版ディレクトリ** (``embeddings/<model_id>/v<N>/``)。
+        稼働中の索引を上書きしないための版付けで、manifest の
+        ``embedding_version`` が指す版だけが読まれる (c_16 §2.1 / §6.1)。
+
+        Args:
+            defer_manifest: ``True`` なら manifest を **保存しない** (版の
+                指し替えは呼出側が snapshot の切り替えと同時に行う)。
+                :meth:`create_snapshot` からの呼び出しだけが ``True``。
+
         Returns:
             索引に入れた件数 (埋め込みバックエンドが無ければ 0)。
         """
@@ -559,17 +911,25 @@ class EvidenceStore:
             embed_reuse_key(text, *side) for text, side in zip(texts, sides)
         ]
 
-        store = self._open_vector_store(self.embeddings_dir(model_id))
-        reusable = self._reusable_rows(store, model_id)
+        model_root = self.embeddings_model_dir(model_id)
+        previous_version = (
+            self._resolve_embedding_version(model_root) if model_root.is_dir() else ""
+        )
+        previous: VectorStore | None = None
+        if previous_version and (model_root / previous_version).is_dir():
+            previous = self._open_vector_store(model_root / previous_version)
+        reusable = (
+            self._reusable_rows(previous, model_id) if previous is not None else {}
+        )
 
         reuse_dst: list[int] = []
         reuse_src: list[int] = []
         pending: list[int] = []
         for row, (record_id, digest) in enumerate(zip(ids, hashes)):
-            previous = reusable.get(record_id)
-            if previous is not None and previous[1] == digest:
+            prior = reusable.get(record_id)
+            if prior is not None and prior[1] == digest:
                 reuse_dst.append(row)
-                reuse_src.append(previous[0])
+                reuse_src.append(prior[0])
             else:
                 pending.append(row)
 
@@ -578,13 +938,22 @@ class EvidenceStore:
         reused_q8: np.ndarray | None = None
         reused_scales: np.ndarray | None = None
         prev_dim = 0
-        if reuse_src and store.vectors_q8 is not None and store.scales is not None:
+        if (
+            reuse_src
+            and previous is not None
+            and previous.vectors_q8 is not None
+            and previous.scales is not None
+        ):
             src = np.asarray(reuse_src, dtype=np.int64)
-            reused_q8 = np.array(np.asarray(store.vectors_q8)[src], dtype=np.int8)
+            reused_q8 = np.array(np.asarray(previous.vectors_q8)[src], dtype=np.int8)
             reused_scales = np.array(
-                np.asarray(store.scales)[src], dtype=np.float32,
+                np.asarray(previous.scales)[src], dtype=np.float32,
             ).reshape(-1, 1)
             prev_dim = int(reused_q8.shape[1])
+        # 前の版の memmap はここで手放す (Windows は掴んだままだと消せない)。
+        if previous is not None:
+            previous.vectors_q8 = None
+            previous.scales = None
 
         new_q8: np.ndarray | None = None
         new_scales: np.ndarray | None = None
@@ -607,13 +976,30 @@ class EvidenceStore:
             q8[dst] = new_q8
             scales[dst] = new_scales
 
+        version = self._take_next_embedding_version(model_root)
         logger.info(
-            "Embedded %d row(s), reused %d of %d for %s (%s)",
-            len(pending), len(reuse_dst), len(ids), self.store_name, model_id,
+            "Embedded %d row(s), reused %d of %d for %s (%s, %s)",
+            len(pending), len(reuse_dst), len(ids), self.store_name,
+            model_id, version,
+        )
+        store = VectorStore(
+            model_root / version,
+            memmap_threshold=self._rag_int("memmap_threshold", DEFAULT_MEMMAP_THRESHOLD),
+            quantization=self._rag_str("quantization", "int8"),
         )
         self._write_vector_store(store, ids, hashes, sides, q8, scales)
         self._vector_store = store
         self._vector_rows = None
+        self.manifest.embedding_version = version
+        self.manifest.embedding_model_id = model_id
+        if not defer_manifest:
+            # 単発呼び出し (reindex / reembed) は自分で指し替えを永続化する。
+            # ``create_snapshot`` からの呼び出しでは snapshot の切り替えと
+            # **同じ save** で切り替わる。
+            self.manifest.save()
+        self.prune_embedding_versions(
+            model_id, protect=(previous_version, version),
+        )
         return len(ids)
 
     def _snapshot_id_texts(
@@ -789,15 +1175,20 @@ class EvidenceStore:
         self._vector_store = None
         self._vector_rows = None
         self._snapshot = None
+        self._lexical = None
 
     def vector_store(self) -> VectorStore | None:
-        """ベクトル索引 (無ければ ``None``)。初回アクセスで lazy load。"""
+        """ベクトル索引 (無ければ ``None``)。初回アクセスで lazy load。
+
+        読むのは manifest の ``embedding_version`` が指す版だけ。指し先が
+        無ければディスク上の最大版へ落とす (manifest を復元した直後)。
+        """
         if self._vector_store is not None:
             return self._vector_store
         directory = self.embeddings_dir(
             self.manifest.embedding_model_id or self.embedding_model_id,
         )
-        if not directory.exists():
+        if not directory.is_dir():
             return None
         self._vector_store = self._open_vector_store(directory)
         return self._vector_store
@@ -937,6 +1328,7 @@ class EvidenceStore:
                 logger.warning("failed to load lexical shard %s: %s", name, e)
                 skipped += 1
                 continue
+            self._warn_lexical_param_drift(str(name), index)
             shards[str(name)] = index
             rows[str(name)] = mapping.astype(np.int64, copy=False)
         if skipped:
@@ -1146,7 +1538,23 @@ class EvidenceStore:
 
         Returns:
             新しい版名 (``v0007``)。
+
+        Raises:
+            EvidenceStoreReadonlyError: ストアが readonly のとき。
         """
+        if self._snapshot_lock.locked():
+            # 並走は不変則違反 (書き手は sleep-time 1 本) だが、ここで落とすと
+            # 版が飛ぶ。直列化して 1 本ずつ通し、痕跡をログに残す。
+            logger.warning(
+                "create_snapshot on %s is waiting for an in-progress snapshot "
+                "(the store expects a single writer)", self.store_name,
+            )
+        async with self._snapshot_lock:
+            return await self._create_snapshot_locked(now)
+
+    async def _create_snapshot_locked(self, now: str | None = None) -> str:
+        """:meth:`create_snapshot` の本体 (スナップショットロック保持中に呼ぶ)。"""
+        self._refuse_write("create_snapshot")
         end = self.events.current_position()
         events = list(self.events.iter_since(self.manifest.folded_through, until=end))
         prev = list(self._snapshot.iter_records()) if self._snapshot is not None else []
@@ -1154,7 +1562,13 @@ class EvidenceStore:
         records, dropped_ids = self._apply_gc_filter(records)
 
         old_active = self.manifest.active_snapshot
+        folded = len(events)
         version = self.manifest.take_next_version()
+        # 版番号は **書き始める前に** 永続化する。ここで落ちると (taskkill /F)
+        # 次の起動が同じ番号を再発番し、書きかけの版を別内容で上書きする。
+        # active_snapshot はまだ旧版のままなので、途中で落ちても読み手は
+        # 生きた版を指したままになる。
+        self.manifest.save()
         SnapshotWriter.write_snapshot(self.store_dir, version, records)
         if dropped_ids:
             self._write_gc_log(version, dropped_ids)
@@ -1171,7 +1585,7 @@ class EvidenceStore:
         self._vector_store = None
         self._vector_rows = None
         self._lexical = None
-        indexed = await self.embed_and_index_snapshot()
+        indexed = await self.embed_and_index_snapshot(defer_manifest=True)
 
         prune_snapshots(
             self.store_dir,
@@ -1185,7 +1599,12 @@ class EvidenceStore:
 
         self.manifest.active_snapshot = version
         self.manifest.folded_through = end
-        self.manifest.events_since_snapshot = 0
+        # ``= 0`` にすると、埋め込みの await 窓で追記された事象 (次の版が
+        # 畳む分) まで「畳み済み」に数えてしまい、そのぶん次の snapshot が
+        # 積まれなくなる。畳んだ数だけ引く。
+        self.manifest.events_since_snapshot = max(
+            0, self.manifest.events_since_snapshot - folded,
+        )
         if self.embedding_backend is not None and indexed:
             self.manifest.embedding_model_id = self.embedding_model_id
             self.manifest.embedding_dim = int(
@@ -1268,24 +1687,25 @@ class EvidenceStore:
     # ── rag_config の読み出し (未設定でも動く) ──
 
     def _rag_int(self, key: str, default: int) -> int:
-        value = getattr(self.rag_config, key, None)
+        value = _section_value(self.rag_config, key)
         try:
             return int(value) if value is not None else default
         except (TypeError, ValueError):
             return default
 
     def _rag_str(self, key: str, default: str) -> str:
-        value = getattr(self.rag_config, key, None)
+        value = _section_value(self.rag_config, key)
         return str(value) if value else default
 
     def _cluster_enabled(self) -> bool:
-        cluster = getattr(self.rag_config, "cluster_index", None)
-        return bool(getattr(cluster, "enabled", True))
+        cluster = _section_value(self.rag_config, "cluster_index")
+        enabled = _section_value(cluster, "enabled")
+        return True if enabled is None else bool(enabled)
 
     def _cluster_n_probe_ratio(self) -> float:
-        cluster = getattr(self.rag_config, "cluster_index", None)
+        cluster = _section_value(self.rag_config, "cluster_index")
         try:
-            return float(getattr(cluster, "n_probe_ratio", 0.125) or 0.125)
+            return float(_section_value(cluster, "n_probe_ratio") or 0.125)
         except (TypeError, ValueError):
             return 0.125
 
@@ -1298,7 +1718,10 @@ class EvidenceStore:
         default = DEFAULT_STORE_PRIORS.get(self.store_name, 1.0)
         if key is None:
             return default
-        value = _section_value(self._ranking_section(), key)
+        # 設定の形は ``ranking.store_prior.<store>`` — ``ranking.<store>`` を
+        # 見ていたので、値を書いても既定のままだった (2026-09-08 監査)。
+        priors = _section_value(self._ranking_section(), "store_prior")
+        value = _section_value(priors, key)
         try:
             return float(value) if value is not None else default
         except (TypeError, ValueError):
@@ -1338,6 +1761,41 @@ class EvidenceStore:
             else getattr(section, key, None)
         )
         return default if value is None else value
+
+    def _warn_lexical_param_drift(self, name: str, index: LexicalIndex) -> None:
+        """索引に焼き付いたパラメータと現在の設定の食い違いを 1 度だけ警告する。
+
+        ``q_terms`` / ``m_postings`` / ``max_df_ratio`` は **索引を作った時点で
+        凍る** (c_16 §6.2)。``max_df_ratio`` は剪定そのもの、``m_postings`` は
+        posting の切り詰め位置に効くので、設定を変えても次の snapshot まで
+        検索の挙動は変わらない。「変えたのに効かない」を黙らせない。
+        """
+        if self._lexical_drift_warned:
+            return
+        stored = index.params
+        current = {
+            "q_terms": int(self._lexical_setting("q_terms")),
+            "m_postings": int(self._lexical_setting("m_postings")),
+            "max_df_ratio": float(self._lexical_setting("max_df_ratio")),
+        }
+        drift = {
+            key: (getattr(stored, key), value)
+            for key, value in current.items()
+            if getattr(stored, key) != value
+        }
+        if not drift:
+            return
+        self._lexical_drift_warned = True
+        logger.warning(
+            "Lexical index params for %s (shard %s) were frozen at build time "
+            "and differ from the config: %s. They take effect on the next "
+            "snapshot (c_16 6.2).",
+            self.store_name, name,
+            ", ".join(
+                f"{key}: index={was!r} config={now!r}"
+                for key, (was, now) in sorted(drift.items())
+            ),
+        )
 
     def _lexical_builder(self) -> LexicalIndexBuilder:
         """設定 (未設定なら c_16 §9 の既定) から索引ビルダを作る。"""
@@ -1393,6 +1851,7 @@ def is_active(record: Evidence, now_epoch: float, include_private: bool = False)
 
 __all__ = [
     "CANDIDATE_MULTIPLIER",
+    "EMBEDDING_VERSIONS_KEEP",
     "DEFAULT_EMBED_MODE",
     "DEFAULT_SHARD",
     "EMBED_AS_QUERY_ATTR",
@@ -1404,7 +1863,10 @@ __all__ = [
     "SHARDS_FILE",
     "SHARD_ROWS_FILE",
     "EvidenceStore",
+    "EvidenceStoreReadonlyError",
     "UsageBuffer",
+    "embedding_version_name",
+    "embedding_version_seq",
     "embed_reuse_key",
     "embed_side_key",
     "embed_side_of",

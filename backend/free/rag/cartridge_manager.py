@@ -211,6 +211,10 @@ class CartridgeManager:
         result = await self._corpus.rebuild(cartridge_id)
         return cartridge_info_of(result.package)
 
+    def close(self) -> None:
+        """開いているパッケージの索引を手放す (shutdown 用)。"""
+        self._corpus.close()
+
     def uninstall(self, cartridge_id: str) -> None:
         """全版をディスクから消す。"""
         self._corpus.uninstall(cartridge_id)

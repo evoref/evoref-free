@@ -15,6 +15,11 @@
    → ``project:<id>`` スコープに ``failure_pattern`` / ``decision`` を追記
    (config で disable 可)
 
+上記はすべて **regex / 決定論** の抽出で、語形が 1 つ外れるとその属性の
+ファクトが 0 件になる。取りこぼしを埋める第 2 段
+(:func:`extract_and_split_semantic_facts` → ``sleep.personal_fact_curator``)
+は sleep-time の補助タスクで発話を属性ごとの逐語 span に分ける。
+
 本 module は EvorefMem pillar 内部扱いのため SemanticFactStore を直接参照する。
 """
 
@@ -173,6 +178,33 @@ def _supersede_corrected_slots(
                 continue
             if old.superseded_by:
                 continue
+            # **発話時刻の順で畳む** (書込み順ではない)。古いノートを後から
+            # 読み直す経路 (Step 8.3 の属性分割 / 再抽出) が、新しい発話由来の
+            # live 値を古い証拠で上書きしてはならない。実データ (2026-09-08
+            # 検証): 午前の A/B ノート「境川サイクリングロードをよく走ります」
+            # を Step 8.3 が location に割り当て、直前の自己紹介の「金沢市」を
+            # supersede した。``created_at`` は発話時刻 (永続形の ``as_of``)。
+            #
+            # **訂正 (``from_correction``) も例外にしない** (2026-09-08 夜の
+            # 監査 G-04)。訂正が無効化できるのは *自分より前の発言* だけで、
+            # 後の発言まで消せてよい理由が無い。実データ: 午前 02:34Z の
+            # ノートが引用中の「色が違う」で訂正候補になり、11:51Z の
+            # occupation ファクトを supersede していた。
+            if getattr(old, "created_at", 0.0) > getattr(fact, "created_at", 0.0):
+                try:
+                    store.supersede(fact.id, old.id)
+                    superseded += 1
+                    logger.info(
+                        "Step 8 [%s]: newer live value kept for %s; older "
+                        "evidence %s superseded on arrival",
+                        label, fact.subject, fact.id,
+                    )
+                except (KeyError, ValueError) as exc:
+                    logger.warning(
+                        "Step 8 [%s]: failed to supersede %s -> %s: %s",
+                        label, fact.id, old.id, exc,
+                    )
+                break
             try:
                 store.supersede(old.id, fact.id)
                 superseded += 1
@@ -477,8 +509,57 @@ def extract_semantic_facts(
     return total_extracted, mdp_trace_extractor
 
 
+async def extract_and_split_semantic_facts(
+    notes: list["MemoryNote"],
+    *,
+    aux_client=None,
+    embedder=None,
+    profile_id: str = "default",
+    **extract_kwargs,
+) -> tuple[int, "MDPTraceExtractor | None"]:
+    """Step 8 (regex 抽出) → Step 8.3 (LLM 属性分割) を 1 本にした入口。
+
+    **regex が型付けし、LLM が分割・補完する** 二段構え。第 2 段は
+    :mod:`backend.free.memory.sleep.personal_fact_curator` が担う (発火条件・
+    検証規則・実インシデントはそちらの docstring)。
+
+    分割を Step 8 の直後に置くのは、regex が同じサイクルで書いたファクトを
+    ``note.extracted_fact_ids`` から引き当てて **粗い object を狭め直す**
+    ため。順序が逆だと、あとから走る regex が同じスロットへ粗い値を書き足す。
+
+    第 2 段は ``aux_client`` / ``embedder`` が無ければ何もしない (degraded)。
+    したがって既存の同期入口 :func:`extract_semantic_facts` と挙動は変わらず、
+    呼出側は補助タスクを渡せるようになったときだけ二段目を得る。
+
+    Args:
+        notes: 対象ノート群。
+        aux_client: 属性分割に使う補助タスククライアント。``None`` で第 2 段
+            を no-op にする。
+        embedder: 分割で作るファクトの埋め込み生成器。
+        profile_id: 書込先 fact の profile_id。
+        extract_kwargs: :func:`extract_semantic_facts` へそのまま渡す。
+
+    Returns:
+        ``(total_extracted, mdp_trace_extractor)``。件数は 2 段の合計。
+    """
+    from backend.free.memory.sleep.personal_fact_curator import (
+        curate_personal_facts,
+    )
+
+    total, mdp_trace_extractor = extract_semantic_facts(notes, **extract_kwargs)
+    total += await curate_personal_facts(
+        notes,
+        store_provider=extract_kwargs.get("store_provider"),
+        aux_client=aux_client,
+        embedder=embedder,
+        profile_id=profile_id,
+    )
+    return total, mdp_trace_extractor
+
+
 __all__ = [
     "collect_live_attribute_values",
+    "extract_and_split_semantic_facts",
     "extract_semantic_facts",
     "persist_facts",
 ]

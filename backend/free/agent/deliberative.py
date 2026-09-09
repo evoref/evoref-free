@@ -18,6 +18,10 @@ from backend.free.agent.meta_cognitive_utils import (
     tool_result_succeeded,
 )
 from backend.free.agent.tool_call_judge import ToolCallJudge, ToolJudgement
+from backend.free.agent.tool_judge_commands import (
+    command_lacks_date_arithmetic,
+    query_has_date_math_cue,
+)
 from backend.free.agent.tool_judge_guards import _STATE_CHANGING_TOOL_NAMES
 from backend.free.agent.tool_judge_history import asks_about_past_conversation
 from backend.free.agent.tools.builtin import (
@@ -25,6 +29,7 @@ from backend.free.agent.tools.builtin import (
     _check_path_traversal as check_builtin_path_traversal,
 )
 from backend.free.constants import READ_FILE_META_PREFIX
+from backend.free.core.date_math_cue import conversation_has_date_math_cue
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.issue_ledger import count_kind, format_issues
 from backend.free.agent.tool_ledger import format_ledger
@@ -412,6 +417,18 @@ def _unexplained_numbers_note(numbers: tuple[str, ...]) -> str:
     return _localized(_UNEXPLAINED_NUMBERS_NOTES).format(listed=listed)
 
 
+def _unexplained_date_math_note() -> str:
+    """日付演算がツールで裏取りされていないことの開示を求める注記 (純粋関数)。
+
+    ``calculate`` の式に付く ``unexplained_numbers`` / ``expression_issues`` の
+    日付版 (PR#407 の方針)。now-only コマンドの出力は「今日は何日か」しか語って
+    いないのに、ツール結果は「唯一の事実根拠」として枠付けされるため、注記が
+    無いとモデルは暗算の日付をツールで確かめた値のように書く
+    (2026-09-08 ライブ監査 F-06: 「30 営業日目」を 5/5 誤答)。
+    """
+    return _localized(_UNEXPLAINED_DATE_MATH_NOTES)
+
+
 def _expression_issues_note(issues: tuple[str, ...]) -> str:
     """式の組み方への疑いを名指しし、検算と開示を求める注記 (純粋関数)。
 
@@ -452,6 +469,23 @@ _UNEXPLAINED_NUMBERS_NOTES: dict[str, str] = {
         "the answer what this value stands for (unit, amount per item, "
         "conversion rate, etc.). If you cannot justify it, present it as an "
         "assumption and ask the user to confirm the correct value."
+    ),
+}
+
+_UNEXPLAINED_DATE_MATH_NOTES: dict[str, str] = {
+    "ja": (
+        "ただし上記のコマンドは現在日時を返しただけで、**質問が求めている日付の"
+        "計算はツールで検証していない**。日数・営業日数・目標日を答える場合は、"
+        "その値がツールで確かめたものではないことを明示し、数え方の前提"
+        "(起点の日を 1 日目と数えたか / 土日と祝日を除いたか) を必ず書くこと。"
+    ),
+    "en": (
+        "However, the command above only returned the current date and time: "
+        "**the date arithmetic the question asks for was not verified by any "
+        "tool**. If you state a number of days, business days, or a target "
+        "date, say explicitly that the value was not tool-verified and always "
+        "state the counting convention you used (whether the start day counts "
+        "as day 1, and whether weekends and holidays were excluded)."
     ),
 }
 
@@ -721,6 +755,25 @@ _DEFAULT_TOOL_GROUNDINGS: dict[str, str] = {
 # 回答は「2026 年 11 月 5 日から 100 日後は、2027 年 2 月 13 日です」となった)。
 # コマンドを併記したうえで、出力は既に求められた値であることを明示する。
 _COMMAND_TOOLS = frozenset({"run_command", "run_command_readonly"})
+
+
+def _repeats_first_invocation(
+    judgement: "ToolJudgement", first_tool: str, first_command: str,
+) -> bool:
+    """2 手目が 1 手目と **同じ呼び出し** になるか (純粋関数)。
+
+    コマンドを載せるツールはコマンド文字列まで見て判定する。「同じツールなら
+    捨てる」だけだと、1 手目が現在日時しか測れなかったターンで、別のコマンド
+    による日付演算のやり直しが構造的に不可能になる (2026-09-08 監査 F-06)。
+    コマンドを持たないツールは従来どおりツール名だけで判定する (同じ判定層が
+    同じ引数を返すため)。
+    """
+    if first_tool not in _COMMAND_TOOLS:
+        return True
+    command = str((judgement.tool_args or {}).get("command") or "").strip()
+    return not command or command == (first_command or "").strip()
+
+
 _COMMAND_RESULT_GUIDANCE = (
     "上記の ## ツール実行結果 は、システムが実際に実行したコマンドとその標準出力である。"
     "出力はコマンドが計算し終えた**結果そのもの**であり、途中経過や基準値ではない。"
@@ -1308,6 +1361,7 @@ class DeliberativeAgent:
         tool_args: dict | None = None,
         unexplained_numbers: tuple[str, ...] = (),
         expression_issues: tuple[str, ...] = (),
+        unexplained_date_math: bool = False,
     ) -> None:
         """最後の user メッセージにツール実行結果を追記する。
 
@@ -1382,6 +1436,8 @@ class DeliberativeAgent:
                 grounding += _expression_issues_note(expression_issues)
         elif tool_name in _COMMAND_TOOLS:
             grounding = _localized(_COMMAND_RESULT_GUIDANCES)
+            if unexplained_date_math:
+                grounding += _unexplained_date_math_note()
         elif tool_name in _ENUMERATIVE_TOOLS:
             grounding = _localized(_ENUMERATION_RESULT_GUIDANCES)
             if len(truncated) < len(tool_result_text):
@@ -2262,6 +2318,9 @@ class DeliberativeAgent:
             tool_args=judgement.tool_args,
             unexplained_numbers=getattr(judgement, "unexplained_numbers", ()),
             expression_issues=getattr(judgement, "expression_issues", ()),
+            unexplained_date_math=bool(
+                getattr(judgement, "unexplained_date_math", False),
+            ),
         )
         # ツールがエラー文字列を返したなら、それは「測れなかった」という事実で
         # あって観測結果ではない。``_append_tool_result_to_last_user`` は結果を
@@ -2301,6 +2360,7 @@ class DeliberativeAgent:
         first_tool: str,
         first_result: str,
         session_id: str,
+        first_command: str = "",
     ) -> tuple[str | None, str | None]:
         """1 手目の結果を見たうえで、**読み取り専用の 2 手目**を 1 回だけ許す。
 
@@ -2312,7 +2372,12 @@ class DeliberativeAgent:
         **判定が決定論で決まる 2 手目だけ** を拾うため、次の制約をすべて課す:
 
         - 2 手目は **状態を変えるツールを選べない** (書込みの連鎖はしない)。
-        - 1 手目と **同じツールは選べない** (同じ判定が繰り返し当たるため)。
+        - 1 手目と **同じツールかつ同じコマンド** は選べない (同じ判定が繰り返し
+          当たるため)。以前は「同じツール」だけで捨てていたが、それだと
+          ``run_command_readonly`` が 1 手目で現在日時しか測れなかったターンで、
+          日付演算を **別のコマンド** でやり直す道が構造的に無かった
+          (2026-09-08 監査 F-06)。コマンドを持たないツールは従来どおり
+          「同じツールなら捨てる」。
         - 判定へ渡す会話には「1 手目で何をしたか」だけを足し、**ツールの出力
           本文は渡さない**。出力本文を判定材料にすると、ファイルの中身に
           書かれたパスやコマンドがツール呼び出しに化ける (内容起因の実行)。
@@ -2332,6 +2397,16 @@ class DeliberativeAgent:
             "role": "assistant",
             "content": f"（{first_tool} を実行しました）",
         })
+        # 1 手目が「日付演算を求められたのに現在日時しか測れなかった」ターンだけ、
+        # 2 手目で日付意図の層 (5.97) を許す。分類器 (5.9) は外したまま — 同じ
+        # クエリに同じ答えを返すだけで、実測 34〜39 秒を払って何も増えない。
+        judge_kwargs: dict = {"allow_classifier": False}
+        if (
+            first_tool in _COMMAND_TOOLS
+            and conversation_has_date_math_cue(query, conversation)
+            and command_lacks_date_arithmetic(first_command)
+        ):
+            judge_kwargs["allow_date_intent"] = True
         try:
             # **層 5.9 (ベースモデルの分類器) は外す。** この判定系で唯一の推論
             # 往復で、実測 34〜39 秒かかる。同じクエリを 2 度渡すだけなので
@@ -2345,23 +2420,32 @@ class DeliberativeAgent:
             # 引く等) のケース。そこは分類器を使わない。
             judgement = await self._tool_judge.judge(
                 query, self._tools_registry, mode, follow_conversation,
-                session_id=session_id, allow_classifier=False,
+                session_id=session_id, **judge_kwargs,
             )
         except TypeError:
-            # allow_classifier を受けない実装 (テスト用 Mock 等) への後方互換
-            judgement = await self._tool_judge.judge(
-                query, self._tools_registry, mode, follow_conversation,
-                session_id=session_id,
-            )
+            # allow_classifier / allow_date_intent を受けない実装 (テスト用
+            # Mock 等) への後方互換
+            try:
+                judgement = await self._tool_judge.judge(
+                    query, self._tools_registry, mode, follow_conversation,
+                    session_id=session_id, allow_classifier=False,
+                )
+            except TypeError:
+                judgement = await self._tool_judge.judge(
+                    query, self._tools_registry, mode, follow_conversation,
+                    session_id=session_id,
+                )
         except Exception as exc:
             logger.warning("Follow-up tool judge failed: %r", exc)
             return None, None
 
         if not (judgement.tool_needed and judgement.tool_name):
             return None, None
-        if judgement.tool_name == first_tool:
+        if judgement.tool_name == first_tool and _repeats_first_invocation(
+            judgement, first_tool, first_command,
+        ):
             logger.debug(
-                "Follow-up hop skipped: %s would repeat the first tool",
+                "Follow-up hop skipped: %s would repeat the first invocation",
                 judgement.tool_name,
             )
             return None, None
@@ -2385,6 +2469,9 @@ class DeliberativeAgent:
         self._append_tool_result_to_last_user(
             messages, judgement.tool_name, result_text, query=query,
             tool_args=judgement.tool_args,
+            unexplained_date_math=bool(
+                getattr(judgement, "unexplained_date_math", False),
+            ),
         )
         if is_tool_error(result_text):
             self._append_unmeasured_fact_note(messages)
@@ -2476,6 +2563,7 @@ class DeliberativeAgent:
                 first_tool=tool_name_used,
                 first_result=tool_result_text or "",
                 session_id=session_id,
+                first_command=tool_command or "",
             )
             if follow_result is not None:
                 # 生成側の温度・接地判定は「ツール結果があるか」で決まるので、

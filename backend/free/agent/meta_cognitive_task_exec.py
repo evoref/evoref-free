@@ -16,7 +16,10 @@ from backend.free.agent.meta_cognitive_tools import (
     normalize_read_file_args,
     normalize_write_file_args,
 )
-from backend.free.agent.output_format import resolve_dir_output_path
+from backend.free.agent.output_format import (
+    anchor_relative_output_path,
+    resolve_dir_output_path,
+)
 from backend.free.agent.meta_cognitive_content import note_stream_truncation
 from backend.free.agent.meta_cognitive_utils import (
     call_callback,
@@ -605,7 +608,21 @@ class _TaskExecutionMixin:
         - ディレクトリ成分の無い bare ファイル名で、クエリが出力ディレクトリを
           指定している場合 → そのディレクトリ配下へ寄せる (planner が CWD 相対の
           名前を発明したとき、ユーザー指定の場所へ揃える)
+        - それでも錨の無い相対パスが残った場合 → ``local_paths.outputs_dir``
+          配下へ寄せる (``anchor_relative_output_path``)。``./`` ``../`` ``~``
+          始まりと絶対パスはユーザーの明示指定なので触らない。
+
+        最後の 1 段が無いと、``compose.yaml`` のような裸名がプロセスの CWD
+        (= リポジトリ直下) に着地する (2026-09-08 監査 F-05)。錨付けは
+        **この 1 箇所を出口** にする (前段の分岐が増えても漏れないため)。
         """
+        return anchor_relative_output_path(
+            _TaskExecutionMixin._resolve_write_path_from_query(file_path, query),
+        )
+
+    @staticmethod
+    def _resolve_write_path_from_query(file_path: str, query: str) -> str:
+        """クエリ・プレースホルダから出力先を解決する (錨付けの前段)。"""
         from backend.free.agent.tool_call_judge import _extract_file_path
 
         if _is_placeholder_write_path(file_path):

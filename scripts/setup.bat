@@ -169,13 +169,21 @@ rem --- 6. Local directories ---
 echo [6/6] Creating local directories...
 for %%d in (
     "local\models"
-    "local\vectors\chunks"
+    "local\models\embed_lora_versions"
     "local\knowledge"
+    "local\outputs"
     "local\memory"
     "local\memory\corpus\packages"
-    "local\prompts\history"
+    "local\memory\episodic"
+    "local\memory\semantic"
+    "local\prompts"
     "local\history"
+    "local\lora_archive"
     "local\lora_versions"
+    "local\migration_archive"
+    "local\profiles"
+    "local\themes"
+    "local\triggers"
     "local\logs\debug"
 ) do (
     if not exist %%d mkdir %%~d

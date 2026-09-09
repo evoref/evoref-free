@@ -19,10 +19,13 @@ claim の ``provenance[].source_id`` は ``item:ki_…``。**取得器 (``origin
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 from dataclasses import dataclass, field, fields
+from datetime import timedelta
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any, Literal
 
 from backend.free.memory.semantic.namespaces import know_half_life_days
@@ -33,9 +36,10 @@ from backend.free.rag.evidence import (
     derive_confidence,
     new_evidence_id,
 )
+from backend.free.rag.evidence.types import corroboration_count
 from backend.io import JSONLAppendStore
 from backend.log_config import get_logger
-from backend.utils import utc_now
+from backend.utils import parse_utc, utc_now, utc_now_dt
 
 logger = get_logger("memory.semantic.sources")
 
@@ -88,6 +92,8 @@ class FetchPolicy:
     #: 取得先はここで別に持つ (空なら ``url_pattern`` にワイルドカードが
     #: 無いときだけそれを使う)。
     url: str = ""
+    #: 未知キーの退避先 (c_05 §0.5)。入れ子の dataclass も往復で落とさない。
+    _extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -143,9 +149,35 @@ def _to_record(obj: Any) -> dict[str, Any]:
             continue
         value = getattr(obj, f.name)
         if isinstance(value, FetchPolicy):
-            value = {g.name: getattr(value, g.name) for g in fields(value)}
+            value = _policy_to_record(value)
         out[f.name] = value
     return out
+
+
+def _policy_to_record(policy: FetchPolicy) -> dict[str, Any]:
+    """``FetchPolicy`` → JSON レコード。``_extra`` を展開してから既知キーを載せる。"""
+    out: dict[str, Any] = dict(policy._extra or {})
+    for f in fields(policy):
+        if f.name == "_extra":
+            continue
+        out[f.name] = getattr(policy, f.name)
+    return out
+
+
+def _policy_from_record(data: dict[str, Any]) -> FetchPolicy:
+    """JSON レコード → ``FetchPolicy``。未知キーは ``_extra`` へ退避する。
+
+    キーは ``fields()`` から引く。手書きで列挙すると新フィールドを足したときに
+    読み落として黙って既定へ倒れる (c_05 §0.5)。入れ子だからといって未知キーを
+    捨ててよいわけではない — 捨てると往復で消える。
+    """
+    known = {f.name for f in fields(FetchPolicy)} - {"_extra"}
+    extra: dict[str, Any] = dict(data.get("_extra") or {})
+    kwargs = {k: v for k, v in data.items() if k in known}
+    for key, value in data.items():
+        if key not in known and key != "_extra":
+            extra[key] = value
+    return FetchPolicy(**kwargs, _extra=extra)
 
 
 def _from_record(cls: type, data: dict[str, Any]) -> Any:
@@ -160,12 +192,7 @@ def _from_record(cls: type, data: dict[str, Any]) -> Any:
             extra[key] = value
             continue
         if key == "fetch_policy" and isinstance(value, dict):
-            # キーは ``fields()`` から引く。手書きで列挙すると新フィールドを
-            # 足したときに読み落として黙って既定へ倒れる (c_05 §0.5)。
-            value = FetchPolicy(**{
-                f.name: value[f.name]
-                for f in fields(FetchPolicy) if f.name in value
-            })
+            value = _policy_from_record(value)
         kwargs[key] = value
     kwargs["_extra"] = extra
     return cls(**kwargs)
@@ -220,7 +247,11 @@ class SourceRegistry:
 
 
 class ItemRegistry:
-    """``items.jsonl`` (追記式・後勝ち)。"""
+    """``items.jsonl`` (追記式・後勝ち)。
+
+    ``url_hash`` の索引を持つ — 取得器は取得単位ごとに「同じ取得先の既存
+    item」を引くので、全件走査だと台帳が育つほど 1 サイクルが重くなる。
+    """
 
     def __init__(self, path: Path | str) -> None:
         self._store: JSONLAppendStore[KnowledgeItem] = JSONLAppendStore(
@@ -230,9 +261,24 @@ class ItemRegistry:
             key_of=lambda i: i.id,
         )
         self._items: dict[str, KnowledgeItem] = {}
+        self._by_url_hash: dict[str, set[str]] = {}
 
     def load(self) -> None:
         self._items = dict(self._store.load_all())
+        self._by_url_hash = {}
+        for item in self._items.values():
+            self._index(item)
+
+    def _index(self, item: KnowledgeItem) -> None:
+        if item.url_hash:
+            self._by_url_hash.setdefault(item.url_hash, set()).add(item.id)
+
+    def _unindex(self, item: KnowledgeItem) -> None:
+        ids = self._by_url_hash.get(item.url_hash)
+        if ids is not None:
+            ids.discard(item.id)
+            if not ids:
+                self._by_url_hash.pop(item.url_hash, None)
 
     def get(self, item_id: str) -> KnowledgeItem | None:
         return self._items.get(item_id)
@@ -240,12 +286,23 @@ class ItemRegistry:
     def all(self) -> list[KnowledgeItem]:
         return list(self._items.values())
 
+    def by_url_hash(self, url_hash: str) -> list[KnowledgeItem]:
+        """``url_hash`` が一致する取得単位 (索引経由、全件走査しない)。"""
+        return [
+            item for item_id in self._by_url_hash.get(url_hash, set())
+            if (item := self._items.get(item_id)) is not None
+        ]
+
     def put(self, item: KnowledgeItem) -> KnowledgeItem:
         if not item.id:
             item.id = new_item_id()
         if not item.fetched_at:
             item.fetched_at = utc_now()
+        previous = self._items.get(item.id)
+        if previous is not None:
+            self._unindex(previous)
         self._items[item.id] = item
+        self._index(item)
         self._store.append(item)
         self._store.maybe_compact()
         return item
@@ -257,6 +314,50 @@ class ItemRegistry:
         item.status = status
         self.put(item)
         return True
+
+    def delete(self, item_id: str, *, reason: str = "gc") -> bool:
+        """取得単位を台帳から落とす (tombstone、物理削除は compaction)。"""
+        item = self._items.pop(item_id, None)
+        if item is None:
+            return False
+        self._unindex(item)
+        self._store.tombstone(item_id, reason=reason)
+        self._store.maybe_compact()
+        return True
+
+    def gc(
+        self,
+        *,
+        keep_days: int,
+        statuses: tuple[str, ...] = ("expired", "retracted"),
+        now: Any | None = None,
+    ) -> int:
+        """役目を終えた取得単位を落とす (c_05 §0.5.6)。
+
+        対象は ``statuses`` の状態で、``fetched_at`` から ``keep_days`` 日を
+        過ぎたもの。``keep_days <= 0`` は「消さない」。``active`` は claim の
+        ``provenance`` が今も指しているので触らない。
+
+        Returns:
+            落とした件数。
+        """
+        if keep_days <= 0:
+            return 0
+        moment = now or utc_now_dt()
+        cutoff = moment - timedelta(days=keep_days)
+        removed = 0
+        for item in list(self._items.values()):
+            if item.status not in statuses:
+                continue
+            fetched = parse_utc(item.fetched_at)
+            # 時刻が読めないものは消さない (壊れた 1 行で履歴を失わない)。
+            if fetched is None or fetched >= cutoff:
+                continue
+            if self.delete(item.id, reason="item_retention"):
+                removed += 1
+        if removed:
+            logger.info("Knowledge items GC: removed=%d (keep_days=%d)", removed, keep_days)
+        return removed
 
 
 class KnowledgeIngest:
@@ -325,7 +426,7 @@ class KnowledgeIngest:
                 KnowledgeItem(
                     id=item_id or new_item_id(),
                     source_id=source.id,
-                    url_hash=_hash_url(url),
+                    url_hash=hash_url(url),
                     content_hash=content_hash,
                     status="active",
                 ),
@@ -389,11 +490,178 @@ class KnowledgeIngest:
         )
         return self._store.put_record(record)
 
+    # ── 再取得 / 期限切れ (c_16 §4.2) ──
 
-def _hash_url(url: str) -> str:
-    """URL のハッシュ (``url_hash``)。空文字は空のまま。"""
-    import hashlib
+    def claim_key_of(self, fact_id: str) -> str:
+        """レコード側の ``claim_key``。``SemanticFact`` は持っていない。"""
+        record = self._store.evidence.get(fact_id)
+        return record.claim_key if record is not None else ""
 
+    def find_live_claim(
+        self, *, subject: str, predicate: str, object_: str, scope: str = "global",
+    ) -> SemanticFact | None:
+        """同じ命題 (``claim_key``) の生きている claim を 1 件引く。
+
+        再取得のたびに同じ命題を新しいレコードで積むと、``claim_key`` が同じ
+        行がストアに溜まる。読み出し側は ``claim_key`` で畳むので表には出ない
+        が、確度 (裏取り件数) は分散したままになる。
+        """
+        wanted = compute_claim_key_structured(subject, predicate, object_)
+        for fact in self._store.search_by_subject(subject, scope=scope):
+            if fact.veracity == "retracted" or fact.superseded_by:
+                continue
+            if self.claim_key_of(fact.id) == wanted:
+                return fact
+        return None
+
+    def corroborate(
+        self,
+        fact_id: str,
+        *,
+        item_id: str,
+        published_at: str | None = None,
+    ) -> bool:
+        """既存 claim に取得単位を 1 件足して確度と時刻を更新する。
+
+        ``update_fact`` は通さない — ``SemanticFact`` 経由で往復すると
+        ``kind="claim"`` と ``attrs`` (source_kind / region / published_at) が
+        ``fact`` 側の形へ潰れる。レコードを直接組み替えて put し直す。
+        """
+        record = self._store.evidence.get(fact_id)
+        if record is None:
+            return False
+        marker = f"item:{item_id}"
+        now = utc_now()
+        provenance = [dict(p) for p in (record.provenance or [])]
+        if not any(p.get("source_id") == marker for p in provenance):
+            provenance.append({
+                "source_id": marker,
+                "extractor": "knowledge_ingest",
+                "extractor_version": 1,
+                "captured_at": now,
+            })
+        record.provenance = provenance
+        record.observed_at = now
+        record.updated_at = now
+        if published_at and _is_newer(published_at, record.as_of):
+            record.as_of = published_at
+            attrs = dict(record.attrs or {})
+            attrs["published_at"] = published_at
+            record.attrs = attrs
+        record.confidence = derive_confidence(
+            "web",
+            corroboration_count(provenance),
+            source_reliability=self._reliability_of(item_id),
+        )
+        self._store.put_record(record)
+        return True
+
+    def retire_item_claims(
+        self,
+        item_ids: Iterable[str],
+        *,
+        replacements: dict[str, str] | None = None,
+        reason: str = "item_expired",
+    ) -> dict[str, int]:
+        """期限切れになった取得単位を指す claim を畳む (c_16 §4.2)。
+
+        取得先の内容が入れ替わると、その本文から抜いた claim の根拠は消える。
+        ``items.jsonl`` 側を ``expired`` にするだけでは claim は生き続けるので、
+        ここで宛先まで畳む。
+
+        - 生きている取得単位が他にも残っている claim → 期限切れ分の
+          ``provenance`` だけ落とし、裏取り件数から確度を引き直す。
+        - 同じ ``<subject>|<predicate>`` の新しい claim がある → その新 claim
+          で **supersede** する (更新された言明として辿れるようにする)。
+        - どちらでもない → ``reason`` を付けて ``retract``。
+
+        Returns:
+            ``{"retracted", "superseded", "detached"}`` の件数。
+        """
+        expired = {i for i in item_ids if i}
+        out = {"retracted": 0, "superseded": 0, "detached": 0}
+        if not expired:
+            return out
+        replacements = replacements or {}
+        for fact in self._store.know_facts():
+            items = {
+                p.source_id[len("item:"):]
+                for p in fact.provenances
+                if p.source_id.startswith("item:")
+            }
+            if not items & expired:
+                continue
+            if items - expired:
+                if self._detach_items(fact.id, expired):
+                    out["detached"] += 1
+                continue
+            new_id = replacements.get(f"{fact.subject}|{fact.predicate}")
+            if new_id and new_id != fact.id and not fact.superseded_by:
+                self._mark_superseded(fact.id, new_id)
+                out["superseded"] += 1
+                continue
+            if self._store.retract_fact(fact.id, reason):
+                out["retracted"] += 1
+        return out
+
+    def _detach_items(self, fact_id: str, expired: set[str]) -> bool:
+        """``expired`` の取得単位を ``provenance`` から外し、確度を引き直す。"""
+        record = self._store.evidence.get(fact_id)
+        if record is None:
+            return False
+        original = list(record.provenance or [])
+        kept = [
+            p for p in original
+            if str(p.get("source_id", "")).removeprefix("item:") not in expired
+        ]
+        if not kept or len(kept) == len(original):
+            return False
+        record.provenance = kept
+        record.updated_at = utc_now()
+        record.confidence = derive_confidence(
+            "web",
+            corroboration_count(kept),
+            source_reliability=self._reliability_of(
+                str(kept[0].get("source_id", "")).removeprefix("item:"),
+            ),
+        )
+        self._store.put_record(record)
+        return True
+
+    def _mark_superseded(self, old_id: str, new_id: str) -> None:
+        """敗者の ``superseded_by`` をレコード側で立てる。
+
+        ``SemanticStore.supersede`` は ``update_fact`` 経由なので claim の
+        ``kind`` / ``attrs`` を潰す。claim は本文ではなくレコードが正なので、
+        ここで直接書く。
+        """
+        record = self._store.evidence.get(old_id)
+        if record is None or record.superseded_by:
+            return
+        record.superseded_by = new_id
+        record.updated_at = utc_now()
+        self._store.put_record(record)
+
+    def _reliability_of(self, item_id: str) -> float:
+        """取得単位 → 取得元 → ``reliability``。辿れなければ下端。"""
+        item = self._store.items.get(item_id)
+        source = self._store.sources.get(item.source_id) if item else None
+        if source is None:
+            return RELIABILITY_MIN
+        return source.clamped_reliability()
+
+
+def _is_newer(candidate: str, current: str | None) -> bool:
+    """``candidate`` が ``current`` より新しいか。文字列のまま比べない (c_05 §0.5)。"""
+    left = parse_utc(candidate)
+    if left is None:
+        return False
+    right = parse_utc(current or "")
+    return right is None or left > right
+
+
+def hash_url(url: str) -> str:
+    """URL のハッシュ (``url_hash``、sha256 先頭 32 hex)。空文字は空のまま。"""
     if not url:
         return ""
     return hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
@@ -415,6 +683,7 @@ __all__ = [
     "KnowledgeSource",
     "SourceKind",
     "SourceRegistry",
+    "hash_url",
     "new_item_id",
     "new_source_id",
 ]

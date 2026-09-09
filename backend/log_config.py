@@ -73,8 +73,8 @@ def _make_rotating_handler(
         return None
     handler.setFormatter(formatter)
     # private セッションの発話は **出力の直前** で伏せる。発話を書く logger
-    # 呼び出しは router / tool_call_judge / search_pipeline / self_rag_judge /
-    # bm25_retriever / injector / deliberative など十数箇所に散っており、
+    # 呼び出しは router / tool_call_judge / search_pipeline / injector /
+    # deliberative など十数箇所に散っており、
     # 個別修正は必ず漏れる。子ロガーから伝播した record も必ず通る handler
     # 側に付ける (logger の filter は伝播 record を通らない)。
     handler.addFilter(PrivateContentFilter())
@@ -146,8 +146,7 @@ class PrivateContentFilter(logging.Filter):
     (develop モード無しの通常運用でも出る)。
 
     発話を書く logger 呼び出しは router / tool_call_judge / search_pipeline /
-    self_rag_judge / bm25_retriever / injector / deliberative など十数箇所に
-    散っており、個別に直すと必ず漏れる。**出力の合流点** (handler の filter)
+    injector / deliberative など十数箇所に散っており、個別に直すと必ず漏れる。**出力の合流点** (handler の filter)
     で、そのターンの発話文字列を含む行を一括して伏せる。
 
     ログ側は切り詰めて書くので、完全一致ではなく **長い方から接頭辞** を

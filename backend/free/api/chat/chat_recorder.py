@@ -644,6 +644,18 @@ def _schedule_sleep_time(
     scheduler.on_response_sent()
 
 
+def _tool_result_text_in_prompt(messages: list[ChatMessage]) -> str:
+    """最後の user メッセージへ注入済みのツール実行結果ブロック (無ければ空)。
+
+    ``_calculate_result_in_prompt`` と同じ理由でプロンプトから読み戻す。
+    日付演算の ``target:`` と応答本文の日付を突き合わせる
+    (``core.response_dates.ignores_date_result``、2026-09-09 監査 G-06)。
+    """
+    if not messages:
+        return ""
+    return str(messages[-1].get("content") or "")
+
+
 def _calculate_result_in_prompt(messages: list[ChatMessage]) -> float | None:
     """最後の user メッセージへ注入済みの calculate 結果 (無ければ ``None``)。
 
@@ -1023,6 +1035,7 @@ def record_response(
                 action_blocked=blocked,
                 measured_values=measured,
                 calculate_result=_calculate_result_in_prompt(messages),
+                tool_result_text=_tool_result_text_in_prompt(messages),
                 truncated=truncated,
                 generation_failed=generation_failed or not body.strip(),
                 session_id=session_id,
@@ -1125,6 +1138,7 @@ def record_meta_cognitive_response(
                 action_blocked=blocked,
                 measured_values=measured,
                 calculate_result=_calculate_result_in_prompt(messages),
+                tool_result_text=_tool_result_text_in_prompt(messages),
                 agent_loops=agent_loops,
                 rag_used=rag_used,
                 rag_top1_score=rag_top1_score,
@@ -1236,6 +1250,7 @@ def record_long_form_response(
                 action_blocked=blocked,
                 measured_values=measured,
                 calculate_result=_calculate_result_in_prompt(messages),
+                tool_result_text=_tool_result_text_in_prompt(messages),
                 long_form_used=True,
                 long_form_content_type=metrics.get("content_type"),
                 long_form_strategy=metrics.get("strategy"),
