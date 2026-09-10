@@ -15,7 +15,11 @@ from backend.app_state import AppState
 from backend.aux_telemetry import aux_failure_signals, current_aux_failures
 from backend.exceptions import EvorefError
 from backend.free.agent.issue_ledger import record_current_issue
-from backend.free.core.verifier_events import current_turn_outcome
+from backend.free.core.verifier_events import (
+    current_grounding,
+    current_tool_uses,
+    current_turn_outcome,
+)
 from backend.free.api.chat.chat_constants import MAX_STEP_QUEUE_SIZE
 from backend.free.api.chat.chat_recorder import (
     read_llama_prompt_tokens,
@@ -354,6 +358,17 @@ def _log_chat_outcome(
             signals["turn_outcome_reason"] = outcome_reason
         if turn_outcome == "failed" and not cancelled:
             success = False
+    # 根拠台帳 (f_04 §2.2): 実行したツールと接地の疑義を結末へ写す。未判定は載せない。
+    tool_uses = current_tool_uses()
+    if tool_uses:
+        signals["tool_uses"] = [u["tool"] for u in tool_uses]
+    unexplained, issues, date_math = current_grounding()
+    if unexplained:
+        signals["unexplained_numbers"] = unexplained
+    if issues:
+        signals["expression_issues"] = issues
+    if date_math:
+        signals["unexplained_date_math"] = True
     dl.log_outcome(
         kind="chat_response",
         success=success,

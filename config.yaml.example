@@ -938,6 +938,8 @@ learning:
   fewshot_min_quality_score: 0.5
   fewshot_max_examples: 3             # プロンプトに埋め込む最大 Few-shot 数
   fewshot_diversity_threshold: 0.8    # 重複判定のコサイン類似度上限
+  fewshot_stale_after_days: 30        # 最終使用がこの日数より古い手本を stale (trim 順序のみ)
+  fewshot_harmful_min_uses: 10        # 有害判定 (harmful 率がプール平均の 2 倍超) の最小使用回数
   # トークン予算進化
   budget_generations: 5               # トークン予算進化の世代数
   budget_sigma: 0.05                  # トークン予算進化の摂動スケール

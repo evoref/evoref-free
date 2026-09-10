@@ -662,6 +662,16 @@ class SystemPromptManager:
         examples = self._resolve_fewshot(mode, query, query_vec)
         return format_fewshot_section(examples) if examples else ""
 
+    def get_fewshot_examples(
+        self, mode: str, query: str | None = None, query_vec=None,
+    ) -> list[FewShotExample]:
+        """``get_fewshot_block`` と同じ選択で例そのものを返す。
+
+        呼び出し側が注入した例の id を経験へ刻む (``gen_config.fewshot_ids``、
+        f_04 §3.2.2) ために、整形前の例が要る。
+        """
+        return self._resolve_fewshot(mode, query, query_vec)
+
     def get_prompt(self, mode: str, query: str | None = None) -> str:
         """推論時: 静的 system + Few-shot 例を結合して返す (後方互換 API)。
 

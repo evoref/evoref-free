@@ -1351,6 +1351,8 @@ def _init_learning_scheduler(
         max_examples=learning_cfg.get("fewshot_max_examples", 3),
         diversity_threshold=learning_cfg.get("fewshot_diversity_threshold", 0.8),
         debug_logger=debug_logger,
+        stale_after_days=learning_cfg.get("fewshot_stale_after_days", 30),
+        harmful_min_uses=learning_cfg.get("fewshot_harmful_min_uses", 10),
         learn_view=learn_view,
         semmem_writeback_scope=semmem_writeback_scope,
         evolve_writeback=evolve_writeback,

@@ -67,6 +67,18 @@ class FewShotExample:
     #: 選び方が違うだけで手本が外れる。埋め込みは sleep-time で遡って生成する
     #: (STM ノートが embed 工程を通るまで注入対象にならないのと同じ契約)。
     embedding: list[float] | None = None
+    #: 使用実績 (f_04 §3.2.2)。Step 14 の curate が経験 (``gen_config.fewshot_ids``
+    #: × ``turn_outcome``) から導出する。chat 経路では触らない。
+    use_count: int = 0
+    last_used_at: str = ""
+    helpful: int = 0
+    harmful: int = 0
+    #: 自動の遷移・trim・品質 floor・内容ゲート再適用をすべてバイパスする
+    #: (UI からのみ立つ)。検証で偽と判った訂正ペアの retraction だけは無視されない。
+    pinned: bool = False
+    #: "active" | "stale" | "archived"。stale は選択に効かないラベル。
+    state: str = "active"
+    state_since: str = ""
 
     def __post_init__(self) -> None:
         if not self.id:

@@ -47,6 +47,11 @@ from backend.free.core.correction_verdict import (
 )
 from backend.free.llm.json_schemas import CorrectionVerdict
 from backend.free.memory.sleep._curator_common import public_notes
+from backend.free.memory.sleep.curation_backoff import (
+    clear_failure,
+    in_cooldown,
+    record_transient_failure,
+)
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -66,6 +71,33 @@ _SELF_CONTEXT_TURNS = 3
 #: 直前のアシスタント応答が同一セッションに無かったときの verdict。
 #: 「検証した結果、訂正の相手が居なかった」= 訂正として消費しない。
 NO_CONTEXT = "no_context"
+
+
+#: ``MemoryNote.curation_failures`` のキー (curation_backoff)。
+VERIFY_FAILURE_KEY = "correction_verify"
+
+
+def verification_pending(note: object, now: float) -> bool:
+    """訂正候補で、まだ検証されておらず **次のサイクルで検証が見込める** か。
+
+    Step 8 (ChatExtractor) はこれが真のノートを据え置く。据え置かないと、
+    Step 8.0 の aux がチャットに横取りされたサイクルで訂正候補を通常の
+    再言明として消費し ``extracted_fact_ids`` を立ててしまい、次サイクルで
+    検証が通っても **二度と訂正の力で再抽出されない** (2026-09-10 (h) H-12)。
+    cooldown 中 (実失敗が閾値に達した) は見込めないので偽 — 永久に据え置かない。
+    """
+    if getattr(note, "correction_verified_at", None) is not None:
+        return False
+    content = getattr(note, "content", "") or ""
+    if not (getattr(note, "is_correction", False) or _has_correction_form(content)):
+        return False
+    return not in_cooldown(note, VERIFY_FAILURE_KEY, now)
+
+
+def _has_correction_form(text: str) -> bool:
+    from backend.free.memory.extractors.chat import has_correction_form
+
+    return has_correction_form(text)
 
 
 def _session_of(note: "MemoryNote") -> str:
@@ -217,7 +249,16 @@ async def curate_corrections(
                 "correction_curator: verification failed (note=%s): %r",
                 getattr(note, "id", "?"), exc,
             )
+            # Step 8 が「検証待ち」として据え置く根拠 (:func:`verification_pending`)。
+            # チャット併走の横取り (contended) は数えない — 静かなサイクルで
+            # そのまま再試行する。実失敗が閾値に達したら cooldown に入り、
+            # Step 8 は通常の再言明として消費する (永久に据え置かない)。
+            record_transient_failure(
+                note, VERIFY_FAILURE_KEY, now_fn(),
+                counts=not getattr(exc, "contended", False),
+            )
             continue
+        clear_failure(note, VERIFY_FAILURE_KEY)
         check = check_verdict(
             parsed,
             candidate=content,

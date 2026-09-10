@@ -49,6 +49,10 @@ class FeedbackSignals:
     # tool_routing_success / long_form_success と矛盾する場合は failed 側に
     # 倒し、偽成功が Level 1 の正例学習へ伝播しないようにする。
     turn_outcome: str = "success"
+    #: ``turn_outcome`` の導出理由 (``FeedbackCollector._derive_turn_outcome_with_reason``
+    #: の文字列)。few-shot の curate が「手本に帰属できる失敗か」を理由で
+    #: 選別する (f_04 §3.2.2)。旧レコードは None。
+    turn_outcome_reason: str | None = None
     rephrased_query: bool = False
     rag_used: bool = False
     rag_top1_score: float | None = None
@@ -156,6 +160,14 @@ class FeedbackSignals:
     #: 判定する (2026-09-10 ライブ監査 (f) F-09: calculate 由来の「45 km」が
     #: few-shot に採用された。tool_routing_* は run_command しか見ていない)。
     tool_grounded: bool = False
+    #: 根拠台帳 (f_04 §2.2、2026-09-10 (h))。``tool_uses`` は tool_ledger 由来の
+    #: 実行順 ``[{"tool", "success", "reason"}]``。3 つの疑義は ``None`` = ツール
+    #: 判定を通っていない (reactive 経路等)、``[]`` / ``False`` = 判定してクリーン。
+    #: 「未判定」と「クリーン」を混ぜない (c_05 §0.5)。
+    tool_uses: list[dict] = field(default_factory=list)
+    unexplained_numbers: list[str] | None = None
+    expression_issues: list[str] | None = None
+    unexplained_date_math: bool | None = None
     # 長文ルーティングシグナル (router._detect_long_form の学習用)
     # success: 長文分類が成功し generation 完了 → 該当キーワードを強化 + 学習
     # false_positive: long_form 分類されたが短文応答で十分だった → 該当キーワードを減衰

@@ -35,7 +35,11 @@ from pathlib import Path
 
 import numpy as np
 
-from backend.free.rag.evidence.tokenize import DEFAULT_STOPWORD_BIGRAMS, tokenize_ja
+from backend.free.rag.evidence.tokenize import (
+    DEFAULT_STOPWORD_BIGRAMS,
+    TOKENIZER_VERSION,
+    tokenize_ja,
+)
 from backend.io import atomic_write_bytes, atomic_write_text
 from backend.log_config import get_logger
 
@@ -77,6 +81,8 @@ class LexicalParams:
     use_trigrams: bool = False
     split_ascii: bool = True
     stopwords: frozenset[str] = DEFAULT_STOPWORD_BIGRAMS
+    #: 索引を切ったトークナイザの版 (``tokenize.TOKENIZER_VERSION``)。旧 meta は 1。
+    tokenizer_version: int = TOKENIZER_VERSION
 
     def to_json(self) -> dict[str, object]:
         """JSON 化 (``stopwords`` は決定論的に並べる)。"""
@@ -90,6 +96,7 @@ class LexicalParams:
             "use_trigrams": self.use_trigrams,
             "split_ascii": self.split_ascii,
             "stopwords": sorted(self.stopwords),
+            "tokenizer_version": self.tokenizer_version,
         }
 
     @classmethod
@@ -105,6 +112,7 @@ class LexicalParams:
             use_trigrams=bool(data.get("use_trigrams", False)),
             split_ascii=bool(data.get("split_ascii", True)),
             stopwords=frozenset(data.get("stopwords") or ()),  # type: ignore[arg-type]
+            tokenizer_version=int(data.get("tokenizer_version", 1)),  # type: ignore[arg-type]
         )
 
     def tokenize(self, text: str) -> list[str]:

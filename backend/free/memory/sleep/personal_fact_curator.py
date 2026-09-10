@@ -304,7 +304,7 @@ def build_prompt(content: str, allowed: dict[str, tuple[str, str]]) -> str:
         "ユーザー本人の属性でないもの (ペット・家族・同僚の値、依頼、質問、"
         "挨拶) は返さないでください。該当が無ければ facts を空にしてください。\n"
         "slot の意味: personal.location は **本人の居住地** (通勤先・旅行先・"
-        "趣味で行く場所は含めない)、personal.occupation は本人の職業・勤務先、"
+        "趣味で行く場所は含めない)、personal.occupation は本人の **職種** (勤務先・所属・入社年は personal.employer)、"
         "personal.name は本人の氏名。趣味の行き先は location にしないこと。\n"
         f"\n許可された slot:\n{slots}\n"
         f"\nUTTERANCE: {content}\n"

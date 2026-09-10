@@ -13,6 +13,8 @@
     "generation_cancelled": "生成を中断しました",
     "learning_invalid_level": "level は 'level1' または 'full' のいずれかを指定してください",
     "learning_scheduler_not_initialized": "学習スケジューラーが初期化されていません",
+    "fewshot_delegated_to_semmem": "few-shot プールは SemMem に委譲されています (evolve_writeback=semmem)",
+    "fewshot_not_found": "few-shot 手本が見つかりません: {example_id}",
     "learning_cycle_running": "学習サイクルが既に実行中です",
     "learning_llm_unavailable": "LLM クライアントが利用できません",
     "optimize_invalid_level": "level は 'level1' または 'level2' のいずれかを指定してください",

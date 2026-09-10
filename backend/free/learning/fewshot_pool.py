@@ -30,6 +30,7 @@ from backend.free.agent.prompt_utils import (
     format_fewshot_section,  # noqa: F401  (re-export for tests)
 )
 from backend.free.core.session_mode import is_valid_session_mode, normalize_session_mode
+from backend.utils import parse_utc, utc_now, utc_now_dt
 from backend.free.core.intent_vocab import (
     NUMBER_LITERAL_RE,
     is_plain_statement,
@@ -537,6 +538,36 @@ _QUALITY_SYSTEM_PROMPT = (
 _EVICTED_KEY = "_evicted"
 #: 墓標の上限 (モード別、FIFO)。16 byte hex × 2000 で数十 KB。
 _EVICTED_CAP = 2000
+#: 退避した例 (本文ごと保持、``restore`` で戻せる) の予約キーと上限 (モード別 FIFO)。
+#: 追い出しは削除ではない (f_04 §3.2.2)。墓標は従来どおり立てて自動再採用を防ぐ。
+_ARCHIVED_KEY = "_archived"
+_ARCHIVED_CAP = 500
+#: curate の集計位置 (最後に集計した経験の timestamp) を持つ予約キー。
+_CURATION_KEY = "_curation"
+_RESERVED_KEYS = frozenset({_EVICTED_KEY, _ARCHIVED_KEY, _CURATION_KEY})
+
+#: 使用実績からの遷移 (f_04 §3.2.2)。
+DEFAULT_STALE_AFTER_DAYS = 30
+DEFAULT_HARMFUL_MIN_USES = 10
+#: 有害判定: 例の harmful 率がプール全体の率の何倍を超えたら退避するか、とその床。
+#: 床が無いとプール全体の率 0 (他に失敗が無い) のとき 1 件の失敗で退避する。
+_HARMFUL_RATE_MULTIPLIER = 2.0
+_HARMFUL_RATE_FLOOR = 0.2
+#: ``turn_outcome_reason`` のうち **手本に帰属できる** 失敗 (前方一致)。出力の
+#: 破綻・形式違反・自己撤回は手本が教えた形の可能性がある。生成失敗 / 打ち切り /
+#: ルーティング誤り / ツール・日付結果の無視 / 計測値矛盾は例と無関係な失敗なので
+#: 帰属しない (良い例を殺さない)。
+FEWSHOT_ATTRIBUTABLE_REASONS: tuple[str, ...] = (
+    "arithmetic contradiction",
+    "conclusion contradiction",
+    "broken JA spacing",
+    "Chinese token leaked",
+    "response retracts",
+    "retracted by assistant",
+    "user echo",
+    "length constraint",
+    "output form",
+)
 
 # SemMem 書き戻し時の subject prefix
 # ``harness.fewshot.*`` から ``learn.fewshot.*`` に移行済。owner は EvorefLearn。
@@ -660,6 +691,8 @@ class FewShotPool(JsonStateStore):
         diversity_threshold: float = DEFAULT_DIVERSITY_THRESHOLD,
         debug_logger: DebugLogger | None = None,
         *,
+        stale_after_days: int = DEFAULT_STALE_AFTER_DAYS,
+        harmful_min_uses: int = DEFAULT_HARMFUL_MIN_USES,
         learn_view: LearnFactView | None = None,
         semmem_writeback_scope: str = "global",
         evolve_writeback: EvolveWriteback = "yaml",
@@ -688,6 +721,8 @@ class FewShotPool(JsonStateStore):
         self.min_quality_score = min_quality_score
         self.max_examples = max_examples
         self.diversity_threshold = diversity_threshold
+        self.stale_after_days = max(1, int(stale_after_days))
+        self.harmful_min_uses = max(1, int(harmful_min_uses))
         self._debug_logger = debug_logger
 
         # LearnFactView 経由の writeback に一本化
@@ -716,6 +751,10 @@ class FewShotPool(JsonStateStore):
         # 内容から決まる純粋判定なので、同じ (query, response) を再判定する
         # 意味は無い。
         self._rejected_hashes: dict[str, set[str]] = {}
+        # 退避した例 (mode → FIFO)。本文を残すので UI から restore できる。
+        self._archived: dict[str, list[FewShotExample]] = {}
+        # curate が最後に集計した経験の timestamp (ISO 8601 UTC)。空 = 未集計。
+        self._curation_watermark: str = ""
 
     # ── SemMem 書き戻しヘルパ ───────────────────────────
 
@@ -771,6 +810,8 @@ class FewShotPool(JsonStateStore):
         self._seen_hashes = {}
         self._evicted_hashes = {}
         self._rejected_hashes = {}
+        self._archived = {}
+        self._curation_watermark = ""
 
     @staticmethod
     def _build_subject(base_model_id: str, mode: str, example_id: str) -> str:
@@ -1184,6 +1225,8 @@ class FewShotPool(JsonStateStore):
         if not self._is_diverse(example, pool):
             return None
 
+        if not example.state_since:
+            example.state_since = utc_now()
         pool.append(example)
         seen.add(h)
         self._writeback_example_fact(example)
@@ -1191,9 +1234,7 @@ class FewShotPool(JsonStateStore):
         # プールサイズ制限: SemMem 書き戻しモードでは GC を SemMem 側
         # (semmem_limits.policy + gc_strategy=lowest_score) に委譲し局所 GC を停止。
         if len(pool) > self.pool_size and not self.is_semmem_writeback_active():
-            pool.sort(key=_effective_fitness)
-            removed = pool.pop(0)
-            self._forget_evicted(example.mode, removed)
+            self._trim_to_size(example.mode, pool, reason="size")
         return example
 
     def _forget_evicted(self, mode: str, removed: FewShotExample) -> None:
@@ -1205,6 +1246,44 @@ class FewShotPool(JsonStateStore):
         tomb[h] = None
         while len(tomb) > _EVICTED_CAP:
             del tomb[next(iter(tomb))]
+
+    def _archive(self, mode: str, ex: FewShotExample, reason: str) -> None:
+        """例をプールから退避する (削除ではない、f_04 §3.2.2)。
+
+        呼び出し側が ``pool`` からの除去を済ませていること。墓標は立てる
+        (自動再採用を防ぐ)。本文は ``_archived`` に残し ``restore`` で戻せる。
+        """
+        self._forget_evicted(mode, ex)
+        ex.state = "archived"
+        ex.state_since = utc_now()
+        bucket = self._archived.setdefault(mode, [])
+        bucket.append(ex)
+        while len(bucket) > _ARCHIVED_CAP:
+            bucket.pop(0)
+        logger.info(
+            "Fewshot example archived (%s): id=%s use=%d harmful=%d query=%s",
+            reason, ex.id, ex.use_count, ex.harmful, ex.query[:50],
+        )
+
+    @staticmethod
+    def _trim_key(ex: FewShotExample) -> tuple[int, float]:
+        """サイズ trim の順序: stale を先に、次いで実効 fitness の低い順。"""
+        return (0 if ex.state == "stale" else 1, _effective_fitness(ex))
+
+    def _trim_to_size(
+        self, mode: str, pool: list[FewShotExample], *, reason: str,
+    ) -> int:
+        """``pool_size`` 超過分を退避する。pinned は候補にしない。"""
+        excess = len(pool) - self.pool_size
+        if excess <= 0:
+            return 0
+        candidates = sorted(
+            (ex for ex in pool if not ex.pinned), key=self._trim_key,
+        )[:excess]
+        for ex in candidates:
+            pool.remove(ex)
+            self._archive(mode, ex, reason)
+        return len(candidates)
 
     def add_from_experiences(self, experiences: list[dict]) -> int:
         """経験バッファから高品質な例を候補プールに追加する
@@ -1403,7 +1482,8 @@ class FewShotPool(JsonStateStore):
             keep: list[FewShotExample] = []
             for ex in pool:
                 if self._content_hash(ex.query, ex.response) == h:
-                    self._forget_evicted(pair.mode, ex)
+                    # pin は無視する: 内容が誤りという証拠は保持の意思より強い。
+                    self._archive(pair.mode, ex, "retracted")
                     removed += 1
                     logger.info(
                         "Retracting corrected-pair fewshot example (verification "
@@ -1682,6 +1762,208 @@ class FewShotPool(JsonStateStore):
 
     # ── Step 14 — Few-shot プール GC ───────────────────
 
+    # ── 使用実績からの寿命 (f_04 §3.2.2) ──
+
+    @staticmethod
+    def _is_attributable_failure(signals: dict) -> bool:
+        """失敗ターンの理由が **手本に帰属できる** 種類か (前方一致)。"""
+        if signals.get("turn_outcome") != "failed":
+            return False
+        reason = str(signals.get("turn_outcome_reason") or "")
+        return any(reason.startswith(p) for p in FEWSHOT_ATTRIBUTABLE_REASONS)
+
+    def curate(self, experiences: list[dict], now: str | None = None) -> dict:
+        """経験から使用実績を導出し、stale / archived の遷移を掛ける (Step 14)。
+
+        chat 経路ではカウンタを触らない。``gen_config.fewshot_ids`` (そのターンに
+        **実際に注入した** id) × ``turn_outcome`` を、前回の集計位置
+        (``_curation_watermark``) より新しい経験だけ走査して積む。記録から導く
+        ので再計算可能で、クラッシュで失われず、``--no-learning`` (record が
+        no-op) で自動的に止まる。
+
+        遷移 (決定論、LLM は関与しない):
+
+        - ``active → stale``: anchor (``last_used_at``、無ければ ``state_since``)
+          が ``stale_after_days`` より古い。stale は選択に効かない。
+        - ``stale → active``: 再び注入された。
+        - ``→ archived`` (有害の証拠): ``use_count >= harmful_min_uses`` かつ
+          harmful 率がプール全体の率 × 2 (床 0.2) を超える。非活性だけでは
+          archive しない (稀な話題の手本が使われないまま消えて被覆が縮む)。
+        - ``pinned`` は全遷移をバイパスする。
+
+        Returns:
+            件数の dict (``scanned`` / ``attributed`` / ``marked_stale`` /
+            ``reactivated`` / ``archived_harmful`` / ``delegated_to_semmem``)。
+        """
+        counts = {
+            "scanned": 0, "attributed": 0, "marked_stale": 0,
+            "reactivated": 0, "archived_harmful": 0,
+            "delegated_to_semmem": False,
+        }
+        if self.is_semmem_writeback_active():
+            counts["delegated_to_semmem"] = True
+            return counts
+
+        by_id: dict[str, tuple[str, FewShotExample]] = {
+            ex.id: (mode, ex)
+            for mode, pool in self._pools.items() for ex in pool
+        }
+        watermark_dt = parse_utc(self._curation_watermark) if self._curation_watermark else None
+        latest_dt = watermark_dt
+        latest_raw = self._curation_watermark
+        exp_by_id = {
+            str(exp.get("id") or ""): exp for exp in experiences if exp.get("id")
+        }
+
+        def _attribute(exp: dict, *, verdict: str | None, ts: str) -> None:
+            """``verdict``: "helpful" / "harmful" / None (使用だけ数える)。"""
+            ids = (exp.get("gen_config") or {}).get("fewshot_ids") or []
+            # 旧レコードはプール全体 (50 件) を刻んでいた。注入数を超える列は
+            # 帰属できないので飛ばす (c_05 §5.2)。
+            if not ids or len(ids) > self.max_examples:
+                return
+            for eid in ids:
+                hit = by_id.get(str(eid))
+                if hit is None:
+                    continue
+                _, ex = hit
+                ex.use_count += 1
+                if not ex.last_used_at or (
+                    (a := parse_utc(ts)) is not None
+                    and (b := parse_utc(ex.last_used_at)) is not None
+                    and a > b
+                ):
+                    ex.last_used_at = ts
+                if verdict == "harmful":
+                    ex.harmful += 1
+                elif verdict == "helpful":
+                    ex.helpful += 1
+                counts["attributed"] += 1
+
+        for exp in experiences:
+            ts = str(exp.get("timestamp") or "")
+            ts_dt = parse_utc(ts)
+            if ts_dt is None:
+                continue
+            if watermark_dt is not None and ts_dt <= watermark_dt:
+                continue
+            counts["scanned"] += 1
+            if latest_dt is None or ts_dt > latest_dt:
+                latest_dt, latest_raw = ts_dt, ts
+            signals = exp.get("signals") or {}
+            outcome = signals.get("turn_outcome")
+            if outcome == "failed":
+                verdict = "harmful" if self._is_attributable_failure(signals) else None
+            elif outcome == "success":
+                verdict = "helpful"
+            else:
+                verdict = None
+            _attribute(exp, verdict=verdict, ts=ts)
+            # 検証済みの訂正は **訂正された側** のターンに帰属する (その手本が
+            # 誤りを教えた可能性)。宛先は記録時に確定している (corrected_entry_id)。
+            target_id = signals.get("corrected_entry_id")
+            if signals.get("user_correction") and target_id:
+                target = exp_by_id.get(str(target_id))
+                if target is not None:
+                    _attribute(target, verdict="harmful", ts=ts)
+
+        if latest_raw:
+            self._curation_watermark = latest_raw
+
+        # 遷移
+        now_dt = parse_utc(now) if now else utc_now_dt()
+        now_iso = now or utc_now()
+        cutoff = now_dt.timestamp() - self.stale_after_days * 86400
+        for mode, pool in list(self._pools.items()):
+            total_uses = sum(ex.use_count for ex in pool)
+            total_harmful = sum(ex.harmful for ex in pool)
+            for ex in list(pool):
+                if ex.pinned:
+                    continue
+                # 基準はその例を除いたプールの harmful 率 (leave-one-out)。含めると
+                # 小さなプールでは当該例自身が基準を押し上げて退避できない。
+                rest_uses = total_uses - ex.use_count
+                rest_rate = (total_harmful - ex.harmful) / rest_uses if rest_uses else 0.0
+                threshold = max(_HARMFUL_RATE_MULTIPLIER * rest_rate, _HARMFUL_RATE_FLOOR)
+                if (
+                    ex.use_count >= self.harmful_min_uses
+                    and ex.harmful / ex.use_count > threshold
+                ):
+                    pool.remove(ex)
+                    self._archive(mode, ex, "harmful")
+                    counts["archived_harmful"] += 1
+                    continue
+                anchor = parse_utc(ex.last_used_at or ex.state_since)
+                is_old = anchor is not None and anchor.timestamp() <= cutoff
+                if is_old and ex.state != "stale":
+                    ex.state, ex.state_since = "stale", now_iso
+                    counts["marked_stale"] += 1
+                elif not is_old and ex.state == "stale":
+                    ex.state, ex.state_since = "active", now_iso
+                    counts["reactivated"] += 1
+
+        logger.info("Step 14 fewshot curate: %s", counts)
+        dl = self._debug_logger
+        if dl:
+            dl.log_learning_cycle(cycle_num=0, data={
+                "component": "fewshot_pool", "op": "curate", **counts,
+            })
+        return counts
+
+    # ── UI 操作 (pin / archive / restore) ──
+
+    def _find(self, example_id: str) -> tuple[str, FewShotExample] | None:
+        for mode, pool in self._pools.items():
+            for ex in pool:
+                if ex.id == example_id:
+                    return mode, ex
+        return None
+
+    def list_examples(self, mode: str | None = None) -> list[FewShotExample]:
+        """プール内 (active / stale) の例。``mode`` 省略で全モード。"""
+        modes = [mode] if mode else list(self._pools)
+        return [ex for m in modes for ex in self._pools.get(m, [])]
+
+    def list_archived(self, mode: str | None = None) -> list[FewShotExample]:
+        modes = [mode] if mode else list(self._archived)
+        return [ex for m in modes for ex in self._archived.get(m, [])]
+
+    def set_pinned(self, example_id: str, pinned: bool) -> bool:
+        hit = self._find(example_id)
+        if hit is None:
+            return False
+        hit[1].pinned = bool(pinned)
+        return True
+
+    def archive_example(self, example_id: str) -> bool:
+        """UI からの明示退避 (pin は無視する: 明示操作なので)。"""
+        hit = self._find(example_id)
+        if hit is None:
+            return False
+        mode, ex = hit
+        self._pools[mode].remove(ex)
+        ex.pinned = False
+        self._archive(mode, ex, "manual")
+        return True
+
+    def restore_example(self, example_id: str) -> bool:
+        """退避した例を戻す。墓標を外し、上限超過は次の GC に委ねる。"""
+        for mode, bucket in self._archived.items():
+            for ex in bucket:
+                if ex.id != example_id:
+                    continue
+                bucket.remove(ex)
+                h = self._content_hash(ex.query, ex.response)
+                self._evicted_hashes.get(mode, {}).pop(h, None)
+                seen = self._seen_hashes.setdefault(mode, set())
+                if h in seen:
+                    return False
+                ex.state, ex.state_since = "active", utc_now()
+                self._pools.setdefault(mode, []).append(ex)
+                seen.add(h)
+                return True
+        return False
+
     def garbage_collect(self) -> dict:
         """Few-shot プール全体に対する明示的 GC を実行する。
 
@@ -1730,11 +2012,12 @@ class FewShotPool(JsonStateStore):
             #    浄化 (``_from_payload``) と同じ判定で、再起動を待たずに効かせる。
             stale = [
                 ex for ex in pool
-                if find_content_rejection(ex.query, ex.response) is not None
+                if not ex.pinned
+                and find_content_rejection(ex.query, ex.response) is not None
             ]
             for ex in stale:
                 pool.remove(ex)
-                self._forget_evicted(mode, ex)
+                self._archive(mode, ex, "content_gate")
                 logger.info(
                     "Step 14 fewshot GC: evicted by content gate (%s): query=%s",
                     find_content_rejection(ex.query, ex.response), ex.query[:50],
@@ -1746,22 +2029,17 @@ class FewShotPool(JsonStateStore):
             #    判定材料が無いので対象外。
             low_quality = [
                 ex for ex in pool
-                if ex.quality_score is not None
+                if not ex.pinned
+                and ex.quality_score is not None
                 and ex.quality_score < self.min_quality_score
             ]
             for ex in low_quality:
                 pool.remove(ex)
-                self._forget_evicted(mode, ex)
+                self._archive(mode, ex, "quality_floor")
             removed_count += len(low_quality)
 
-            # 2) サイズ超過分を実効 fitness の低い順に落とす
-            if len(pool) > self.pool_size:
-                pool.sort(key=_effective_fitness)
-                excess = len(pool) - self.pool_size
-                for _ in range(excess):
-                    removed = pool.pop(0)
-                    self._forget_evicted(mode, removed)
-                removed_count += excess
+            # 2) サイズ超過分を退避 (stale → 実効 fitness の低い順、pinned は除外)
+            removed_count += self._trim_to_size(mode, pool, reason="size")
 
             if removed_count:
                 removed_per_mode[mode] = removed_count
@@ -1813,6 +2091,17 @@ class FewShotPool(JsonStateStore):
         evicted = {m: list(t) for m, t in self._evicted_hashes.items() if t}
         if evicted:
             payload[_EVICTED_KEY] = evicted
+        archived = {
+            mode: [
+                {k: v for k, v in asdict(ex).items() if k != "embedding"}
+                for ex in bucket
+            ]
+            for mode, bucket in self._archived.items() if bucket
+        }
+        if archived:
+            payload[_ARCHIVED_KEY] = archived
+        if self._curation_watermark:
+            payload[_CURATION_KEY] = {"watermark": self._curation_watermark}
         return payload
 
     def _from_payload(self, payload: JsonPayload) -> None:
@@ -1830,8 +2119,11 @@ class FewShotPool(JsonStateStore):
         dropped: Counter[str] = Counter()
         malformed = 0
         raw_evicted = payload.get(_EVICTED_KEY)
+        # 初見の時計は now (f_04 §3.2.2): 旧ファイルの例は使用実績を持たないので、
+        # ``added_at`` を anchor にすると最初の tick で一斉に stale になる。
+        loaded_at = utc_now()
         for mode, entries in payload.items():
-            if mode == _EVICTED_KEY:
+            if mode in _RESERVED_KEYS:
                 continue
             pool: list[FewShotExample] = []
             seen: set[str] = set()
@@ -1856,10 +2148,16 @@ class FewShotPool(JsonStateStore):
                 # quality_score 0.9 で常駐していた)。ゲートを増やしたら過去分も
                 # 自然に消えるよう、採用時と同じ判定を通す。件数と理由を必ず
                 # ログへ出す (黙って削らない)。
-                reject = find_content_rejection(query, response)
+                reject = (
+                    None if ex.pinned else find_content_rejection(query, response)
+                )
                 if reject is not None:
                     dropped[reject.split(":")[0]] += 1
                     continue
+                if not ex.state_since:
+                    ex.state_since = loaded_at
+                if ex.state == "archived":
+                    ex.state = "active"
                 pool.append(ex)
                 seen.add(self._content_hash(query, response))
             new_pools[mode] = pool
@@ -1875,6 +2173,26 @@ class FewShotPool(JsonStateStore):
                     self._evicted_hashes[str(mode)] = {
                         str(h): None for h in hashes[-_EVICTED_CAP:]
                     }
+        self._archived = {}
+        raw_archived = payload.get(_ARCHIVED_KEY)
+        if isinstance(raw_archived, dict):
+            for mode, entries in raw_archived.items():
+                bucket: list[FewShotExample] = []
+                for entry in entries if isinstance(entries, list) else []:
+                    try:
+                        bucket.append(FewShotExample(**{
+                            k: v for k, v in entry.items()
+                            if k in _EXAMPLE_FIELD_NAMES
+                        }))
+                    except (AttributeError, TypeError, ValueError):
+                        malformed += 1
+                if bucket:
+                    self._archived[str(mode)] = bucket[-_ARCHIVED_CAP:]
+        raw_curation = payload.get(_CURATION_KEY)
+        self._curation_watermark = (
+            str(raw_curation.get("watermark") or "")
+            if isinstance(raw_curation, dict) else ""
+        )
         if malformed:
             logger.warning(
                 "Skipped %d malformed fewshot example(s) on load", malformed,

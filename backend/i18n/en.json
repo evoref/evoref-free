@@ -13,6 +13,8 @@
     "generation_cancelled": "Generation cancelled",
     "learning_invalid_level": "level must be 'level1' or 'full'",
     "learning_scheduler_not_initialized": "Learning scheduler not initialized",
+    "fewshot_delegated_to_semmem": "Few-shot pool is delegated to SemMem (evolve_writeback=semmem)",
+    "fewshot_not_found": "Few-shot example not found: {example_id}",
     "learning_cycle_running": "Learning cycle already running",
     "learning_llm_unavailable": "LLM client not available",
     "optimize_invalid_level": "level must be 'level1' or 'level2'",

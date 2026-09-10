@@ -86,6 +86,30 @@ def _ascii(text: str) -> str:
     return "".join(unicodedata.normalize("NFKC", text or "").split())
 
 
+#: 文末の断定・丁寧の語尾と句読点。値の span に付いて来やすい (「2015年です。」)。
+#: 動詞語尾 (``ます`` / ``だ``) は落とさない — 「住んでいます」「パンダ」を
+#: 切ってしまう。丁寧・断定の助動詞に限る。
+_COPULA_TAIL_RE = re.compile(
+    r"(?:(?:です|でした|でしょう|である|であった)?(?:ね|よ|か)?[。．.、,!！?？\s]*)+$",
+)
+
+
+def strip_copula(span: str) -> str:
+    """値の span から文末の語尾・句読点を落とす (純粋関数)。
+
+    LLM は「2015年です。」のように **文** を span として返すことがある。
+    逐語の門 (:func:`check_verdict`) は前応答が「2015年です。」なので通るが、
+    消費側はこの span を live 値 (「2015年から勤めています」) に当てるため、
+    語尾が付いたままだと宛先に当たらず訂正が迷子になる (2026-09-10 ライブ
+    監査 (h) H-11: 検証は通ったのに employer の値が畳まれず、訂正文が
+    ``mem.world.assertion.year_correction`` になった)。語尾だけの span は
+    空にしない (元のまま返す)。
+    """
+    text = (span or "").strip()
+    stripped = _COPULA_TAIL_RE.sub("", text).strip()
+    return stripped or text
+
+
 def norm_span(text: str) -> str:
     """逐語 span 照合用の正規化 (空白無視 / 全角半角同一視)。"""
     return _ascii(text).lower()
@@ -222,8 +246,8 @@ def check_verdict(
     if not isinstance(payload, dict):
         return VerdictCheck(False, "no_verdict", "", "", "")
     target = str(payload.get("target") or "")
-    wrong_claim = str(payload.get("wrong_claim") or "").strip()
-    correct_value = str(payload.get("correct_value") or "").strip()
+    wrong_claim = strip_copula(str(payload.get("wrong_claim") or ""))
+    correct_value = strip_copula(str(payload.get("correct_value") or ""))
     if target not in CORRECTION_TARGETS:
         return VerdictCheck(False, "invalid_target", target, wrong_claim, correct_value)
     if not payload.get("is_correction") or target not in POINTING_TARGETS:

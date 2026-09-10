@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +37,7 @@ from backend.free.memory.types import (
 from backend.free.core.correction_verdict import (
     POINTING_TARGETS as _POINTING_TARGETS,
 )
+from backend.free.core.relative_date import annotate_relative_dates
 from backend.free.core.text_quality import detect_lang
 from backend.log_config import get_logger
 
@@ -130,6 +132,9 @@ class ExtractionContext:
     live_attribute_values: dict[tuple[str, str], tuple[str, ...]] = field(
         default_factory=dict,
     )
+    #: 未検証の訂正候補を据え置くか (Step 8.0 の補助タスクが使える構成で真)。
+    #: 偽 (degraded) なら従来どおり通常の再言明として消費する。
+    defer_unverified_corrections: bool = False
 
     def current_time(self) -> float:
         return self.now if self.now is not None else time.time()
@@ -151,6 +156,8 @@ class ExtractionResult:
     facts: list[SemanticFact] = field(default_factory=list)
     notes_processed: int = 0
     notes_skipped: int = 0
+    #: 検証待ちで据え置いた訂正候補 (次サイクルで再検討する)。
+    notes_deferred: int = 0
     cap_dropped: int = 0
     already_extracted: int = 0
     episodes_seen: int = 0
@@ -259,8 +266,17 @@ class BaseExtractor:
         if ctx.canonicalizer is not None:
             canonical = ctx.canonicalizer(canonical)
         canonical = self.truncate(canonical, self.MAX_SUBJECT_LEN)
-        clipped_obj = self.truncate(object_text, self.MAX_OBJECT_LEN)
         now = ctx.current_time()
+        # 相対日付 (「来週の金曜日」「明後日」) は発話時刻と組で初めて意味を
+        # 持つ。絶対日付を併記して残す (core.relative_date、H-04)。
+        utterance_ts = _utterance_time(note, now)
+        clipped_obj = self.truncate(
+            annotate_relative_dates(
+                object_text,
+                datetime.fromtimestamp(utterance_ts, tz=timezone.utc).astimezone(),
+            ),
+            self.MAX_OBJECT_LEN,
+        )
 
         # ノート由来の trace_id を最優先で fact / provenance に伝播する
         #。明示的に渡された trace_id (MDPTraceExtractor の
@@ -304,7 +320,7 @@ class BaseExtractor:
             # 成立しない。実データ (2026-08-27 ライブ監査) では 12 件すべてが
             # ``1787814691.47〜.48`` に潰れており、訂正と初出の前後関係が
             # ストアから失われていた。``(N日前の記録)`` ラベルの根拠でもある。
-            created_at=_utterance_time(note, now),
+            created_at=utterance_ts,
             accessed_at=now,
             session_ids=(
                 {getattr(note, "session_id", "")} if note and note.session_id else set()
@@ -316,6 +332,15 @@ class BaseExtractor:
         )
         for key, value in overrides.items():
             setattr(fact, key, value)
+        # ``statement`` (規則で命題化した本文) は ``fact.text`` で object より
+        # 優先されるので、相対日付の併記もこちらに掛ける (A/B 2026-09-10 で
+        # ``mem.personal.schedule`` の「来週の水曜日」が併記されずに残った)。
+        statement = getattr(fact, "statement", None)
+        if statement:
+            fact.statement = annotate_relative_dates(
+                statement,
+                datetime.fromtimestamp(utterance_ts, tz=timezone.utc).astimezone(),
+            )
         return fact
 
     # ─── セッション別キャップ ──────────────────────────────────────────

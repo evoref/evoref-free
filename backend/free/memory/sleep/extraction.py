@@ -390,6 +390,7 @@ def extract_semantic_facts(
     subject_canonicalizer: "SubjectCanonicalizer | None",
     mdp_trace_extractor: "MDPTraceExtractor | None" = None,
     mdp_trace_extractor_factory: Callable[[], "MDPTraceExtractor"] | None = None,
+    verification_available: bool = False,
 ) -> tuple[int, "MDPTraceExtractor | None"]:
     """Step 8: ChatExtractor / CreateExtractor / MDPTraceExtractor を順次実行する。
 
@@ -459,7 +460,14 @@ def extract_semantic_facts(
         # 属性語を落とした訂正の宛先を決めるため、既存スロットの現在値を渡す
         # (chat.resolve_value_anchored_attributes の説明を参照)。
         ctx.live_attribute_values = collect_live_attribute_values(global_store)
+        # Step 8.0 が検証できる構成なら、未検証の訂正候補は据え置く (H-12)。
+        ctx.defer_unverified_corrections = bool(verification_available)
         chat_result = ChatExtractor().extract(notes, ctx)
+        if chat_result.notes_deferred:
+            logger.info(
+                "Step 8: %d correction candidate(s) deferred until verified",
+                chat_result.notes_deferred,
+            )
         total_extracted += persist_facts(global_store, chat_result, "chat")
 
     # ── 2. CreateExtractor → project ──

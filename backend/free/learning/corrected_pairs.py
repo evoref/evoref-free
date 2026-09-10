@@ -80,9 +80,17 @@ _ANAPHORA_RE = re.compile(
     r"|[しりきぎみびいえけせてねめれ]直(?:し|す|せ|さ)"
     r"|(?:ではなく|じゃなく)[^。！？!?\n]{0,24}?でした",
 )
-#: 記憶・ツール結果を前提にしている手掛かり (照応に加えて)。
+#: **既に述べられたことを思い出させる形** (「何でしたか」「いつでしたっけ」
+#: 「覚えていますか」)。照応語が無くても直前の文脈が無いと答えられないので
+#: 手本にならない。2026-09-10 ライブ監査 (h) H-09: 「娘の学年と習い事は何
+#: でしたか」「要約は何文字でしたか」が決定論ゲートを素通りし、LLM の品質
+#: floor に落ちるまでプールに滞留した。
+_RECALL_FORM_RE = re.compile(
+    r"覚え|記憶|言いました|言ったか|でしたか|でしたっけ|だったか|だっけ",
+)
+#: 記憶・ツール結果を前提にしている手掛かり (照応・想起形に加えて)。
 _MEMORY_OR_TOOL_RE = re.compile(
-    r"私|僕|自分|俺|覚え|記憶|言いました|言ったか|でしたか|でしたっけ"
+    r"私|僕|自分|俺"
     r"|ファイル|保存|読んで|読み|実行|検索|コマンド|ディレクトリ|フォルダ",
 )
 
@@ -127,6 +135,11 @@ class CorrectedPair:
     #: 検証器 (``learning.correction_verifier``) が確定した「正しい値」の逐語
     #: span。空でなければ期待語はここから採る (字句の否定境界に頼らない)。
     correct_value: str = ""
+    #: 訂正後の回答に **接地の疑義** がある (根拠台帳 f_04 §2.2: calculate の式に
+    #: 問い・文脈に無い数値 / 式の構造的疑義 / 根拠の無い日付演算)。手本には
+    #: 従来どおり流すが、eval_core (期待値) には採らない — 局所の検証を
+    #: 全体の正しさへ昇格させない。
+    grounding_suspect: bool = False
 
     @property
     def pair_id(self) -> str:
@@ -134,6 +147,15 @@ class CorrectedPair:
             f"{self.query.strip()}\x00{self.response.strip()}".encode("utf-8"),
             digest_size=6,
         ).hexdigest()
+
+
+def grounding_is_suspect(signals: dict) -> bool:
+    """根拠台帳 (``FeedbackSignals``) に接地の疑義があるか。未判定 (None) は疑わない。"""
+    return bool(
+        signals.get("unexplained_numbers")
+        or signals.get("expression_issues")
+        or signals.get("unexplained_date_math")
+    )
 
 
 def strip_correction_preamble(response: str) -> str:
@@ -163,7 +185,7 @@ def refers_to_previous_turn(query: str) -> bool:
     q = (query or "").strip()
     if len(q) <= _MAX_CONTINUATION_CHARS and _CONTINUATION_TAIL_RE.search(q):
         return True
-    return bool(_ANAPHORA_RE.search(q))
+    return bool(_ANAPHORA_RE.search(q) or _RECALL_FORM_RE.search(q))
 
 
 def depends_on_context(query: str) -> bool:
@@ -366,6 +388,7 @@ def build_corrected_pairs(
                 prev.get("response_full") or prev.get("response_summary") or ""
             ),
             correct_value=correct_value,
+            grounding_suspect=grounding_is_suspect(signals),
         )
         pairs[pair.pair_id] = pair
     return list(pairs.values())

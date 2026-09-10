@@ -37,7 +37,12 @@ from backend.free.core.response_arithmetic import (
     find_conclusion_contradiction,
 )
 from backend.free.core.response_dates import ignores_date_result
-from backend.free.core.verifier_events import record_turn_outcome, record_verifier_hit
+from backend.free.core.verifier_events import (
+    current_grounding,
+    current_tool_uses,
+    record_turn_outcome,
+    record_verifier_hit,
+)
 from backend.free.agent.issue_ledger import record_current_issue
 from backend.free.core.text_quality import (
     claims_completed_state_change,
@@ -985,6 +990,8 @@ class FeedbackCollector:
         # ここで決めた成否を持ち上げる。以前は経験にしか残らず、結末は
         # 「SSE を届けられたか」だけで success=true だった (F-11)。
         _publish_turn_outcome(turn_outcome, outcome_reason)
+        tool_uses = current_tool_uses()
+        unexplained_numbers, expression_issues, unexplained_date_math = current_grounding()
         if turn_outcome == "failed":
             # 失敗ターンの成功シグナルは矛盾なので failed 側に倒す
             # (偽成功が learned_patterns の正例学習 / Level 1 fitness に
@@ -1032,7 +1039,17 @@ class FeedbackCollector:
             tool_routing_success=tool_routing_success,
             tool_routing_false_positive=tool_routing_false_positive,
             tool_routing_false_negative=tool_routing_false_negative,
-            tool_grounded=bool(tool_result_text) or calculate_result is not None,
+            turn_outcome_reason=outcome_reason,
+            # 源は tool_ledger (実行の唯一の合流点)。プロンプト由来の
+            # tool_result_text / calculate_result は台帳を通らない経路の保険。
+            tool_grounded=(
+                bool(tool_uses) or bool(tool_result_text)
+                or calculate_result is not None
+            ),
+            tool_uses=tool_uses,
+            unexplained_numbers=unexplained_numbers,
+            expression_issues=expression_issues,
+            unexplained_date_math=unexplained_date_math,
             long_form_success=long_form_success,
             long_form_false_positive=long_form_false_positive,
             long_form_false_negative=long_form_false_negative,
@@ -1488,6 +1505,7 @@ class FeedbackCollector:
         if prev is None or prev.signals.turn_outcome != "success":
             return
         prev.signals.turn_outcome = "failed"
+        prev.signals.turn_outcome_reason = "retracted by assistant"
         logger.info(
             "Assistant retracted its previous answer; marking the previous "
             "turn as failed (prev_query=%s)", (self._prev_query or "")[:60],

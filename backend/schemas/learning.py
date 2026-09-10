@@ -223,6 +223,11 @@ class LearningConfig(BaseModel):
     fewshot_min_quality_score: float = Field(default=0.5, ge=0.0, le=1.0)
     fewshot_max_examples: int = Field(default=3, ge=1)
     fewshot_diversity_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
+    # 手本の寿命 (f_04 §3.2.2)。使用実績 (注入した経験の成否) から Step 14 が導く。
+    # stale = 最終使用がこの日数より古い (選択には効かない、trim の順序のみ)。
+    fewshot_stale_after_days: int = Field(default=30, ge=1)
+    # 有害判定の最小使用回数 (harmful 率がプール平均の 2 倍超で退避)。
+    fewshot_harmful_min_uses: int = Field(default=10, ge=1)
     # Level 2 補助タスク
     # Level 2 最適化器切替
     # "spsa" は Free 版にも実装あり (`backend/free/optimizer/spsa.py`)。

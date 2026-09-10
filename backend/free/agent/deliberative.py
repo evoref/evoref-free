@@ -34,6 +34,7 @@ from backend.free.core.date_math_cue import (
     last_user_query,
 )
 from backend.free.core.session_mode import is_create_mode
+from backend.free.core.verifier_events import record_grounding
 from backend.free.agent.issue_ledger import count_kind, format_issues
 from backend.free.agent.tool_ledger import format_ledger, latest_use
 from backend.free.core.intent_vocab import (
@@ -1409,6 +1410,13 @@ class DeliberativeAgent:
         system ロールを assistant の後に挿入すると Qwen3.5 等の ChatML
         テンプレートで 400 エラーになるため、必ず user に統合する。
         """
+        # 根拠台帳 (f_04 §2.2): 判定の結果を経験へ刻めるよう request scope へ積む。
+        # 応答は変えない (受動記録)。
+        record_grounding(
+            unexplained_numbers=unexplained_numbers,
+            expression_issues=expression_issues,
+            unexplained_date_math=unexplained_date_math,
+        )
         truncated = _truncate_tool_result(tool_result_text, TOOL_RESULT_MAX_CHARS)
         args = tool_args if isinstance(tool_args, dict) else {}
         if tool_name == "calculate":

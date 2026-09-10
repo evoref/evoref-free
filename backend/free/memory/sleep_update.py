@@ -702,7 +702,9 @@ class SleepTimeWorker:
         # 既存 _step8_9_summarize_sessions は Step 9 に再配置される想定。
         # メソッド名を変えずに前段に Step 8 を挿入する形で共存させる。
         ts = time.monotonic()
-        result["facts_extracted"] = self._step8_extract_facts()
+        result["facts_extracted"] = self._step8_extract_facts(
+            verification_available=llm_client is not None,
+        )
         step_durations["step8_extract_facts"] = round(time.monotonic() - ts, 3)
         if self._check_cancelled():
             return result
@@ -1070,7 +1072,7 @@ class SleepTimeWorker:
 
     # ── Step 8 (Chat/Create/MDP Extractor) ─────────────
 
-    def _step8_extract_facts(self) -> int:
+    def _step8_extract_facts(self, *, verification_available: bool = False) -> int:
         """Step 8: SemanticFact 抽出
 
         実ロジックは :mod:`backend.free.memory.sleep.extraction`
@@ -1091,6 +1093,7 @@ class SleepTimeWorker:
             agent_trace_dir=self._agent_trace_dir,
             subject_canonicalizer=self._subject_canonicalizer,
             mdp_trace_extractor=self._mdp_trace_extractor,
+            verification_available=verification_available,
         )
         return total
 

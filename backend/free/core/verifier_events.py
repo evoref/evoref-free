@@ -70,6 +70,14 @@ class _Scope:
     #: 通路 (2026-09-05 ライブ監査 F-11)。
     turn_outcome: str | None = None
     turn_outcome_reason: str | None = None
+    #: 根拠台帳 (f_04 §2.2、2026-09-10 (h))。ツール実行は ``tool_ledger.record_current``
+    #: (実行の唯一の合流点) が積み、接地の疑義はツール判定の結果を受け取る
+    #: ``deliberative._append_tool_result_to_last_user`` が積む。``None`` =
+    #: ツール判定を通っていない (reactive 経路等)。
+    tool_uses: list[dict] = field(default_factory=list)
+    unexplained_numbers: list[str] | None = None
+    expression_issues: list[str] | None = None
+    unexplained_date_math: bool | None = None
 
 
 _scope: ContextVar[_Scope | None] = ContextVar("verifier_scope", default=None)
@@ -105,6 +113,54 @@ def record_turn_outcome(outcome: str, reason: str | None = None) -> None:
         return
     scope.turn_outcome = outcome
     scope.turn_outcome_reason = reason or None
+
+
+def record_tool_use_event(tool_name: str, success: bool, reason: str = "") -> None:
+    """ツール実行 1 件をこのリクエストの根拠台帳へ積む。スコープ外は no-op。"""
+    scope = _scope.get()
+    if scope is None or not tool_name:
+        return
+    scope.tool_uses.append(
+        {"tool": str(tool_name), "success": bool(success), "reason": str(reason or "")},
+    )
+
+
+def record_grounding(
+    *,
+    unexplained_numbers: tuple[str, ...] | list[str] = (),
+    expression_issues: tuple[str, ...] | list[str] = (),
+    unexplained_date_math: bool = False,
+) -> None:
+    """ツール判定が出した接地の疑義を積む (同一ターンに複数回なら和を取る)。
+
+    呼ばれた時点で「判定を通った」ことになるので、疑義が無くても ``None`` から
+    ``[]`` / ``False`` へ変わる (未判定とクリーンを区別する、c_05 §0.5)。
+    """
+    scope = _scope.get()
+    if scope is None:
+        return
+    scope.unexplained_numbers = list(scope.unexplained_numbers or []) + [
+        str(n) for n in unexplained_numbers
+    ]
+    scope.expression_issues = list(scope.expression_issues or []) + [
+        str(i) for i in expression_issues
+    ]
+    scope.unexplained_date_math = bool(scope.unexplained_date_math) or bool(
+        unexplained_date_math,
+    )
+
+
+def current_tool_uses() -> list[dict]:
+    scope = _scope.get()
+    return [dict(u) for u in scope.tool_uses] if scope else []
+
+
+def current_grounding() -> tuple[list[str] | None, list[str] | None, bool | None]:
+    """``(unexplained_numbers, expression_issues, unexplained_date_math)``。未判定は None。"""
+    scope = _scope.get()
+    if scope is None:
+        return None, None, None
+    return scope.unexplained_numbers, scope.expression_issues, scope.unexplained_date_math
 
 
 def current_turn_outcome() -> tuple[str | None, str | None]:

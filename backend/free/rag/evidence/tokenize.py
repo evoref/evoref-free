@@ -56,6 +56,13 @@ def _split_ascii_token(raw: str) -> list[str]:
     return subs
 
 
+#: トークナイザの版。切り方を変えたら上げる。索引の ``LexicalParams`` に焼き付き、
+#: ロード時の drift 警告で「再構築まで旧い切り方の索引を引いている」ことが分かる。
+#: 2: 長さ 1 の run を unigram として出す / ストップワード除去で空なら除去前へ戻す
+#:    (c_16 §6.2「短い問いの取りこぼし」)。
+TOKENIZER_VERSION = 2
+
+
 def tokenize_ja(
     text: str,
     *,
@@ -96,10 +103,18 @@ def tokenize_ja(
     bigrams = [
         run[i : i + 2] for run in ja_runs for i in range(len(run) - 1)
     ]
+    # 長さ 1 の run (「猫」「猫、犬」「Python と Rust」の「と」) は bi-gram を
+    # 1 つも出さず、問いが語彙外と同じ空になっていた。1 文字をそのまま出す。
+    # 助詞は df が高く ``max_df_ratio`` の剪定で自然に落ちる。
+    unigrams = [run for run in ja_runs if len(run) == 1]
     if stop_set:
-        bigrams = [b for b in bigrams if b not in stop_set]
+        kept = [b for b in bigrams if b not in stop_set]
+        # ストップワードだけの問い (「これは？」) は除去で空になる。索引側にも
+        # 同じ語は無いが、空のまま返すと「使える語が無い」ことすら分からない。
+        if kept or ascii_tokens or unigrams:
+            bigrams = kept
 
-    tokens = ascii_tokens + bigrams
+    tokens = ascii_tokens + unigrams + bigrams
 
     if use_trigrams:
         trigrams = [

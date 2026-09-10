@@ -218,6 +218,7 @@ def accumulate_user_turn(
     """
     # 新しいターンの入口。前ターンの注入 id を必ず落とす (c_16 §5.5)。
     _turn_evidence_ids.pop(session_id, None)
+    _turn_fewshot_ids.pop(session_id, None)
     if private:
         _accumulate_turn(session_id, "user", user_query, private=True)
         return
@@ -318,6 +319,7 @@ def clear_session_data(session_id: str) -> None:
     _session_turns.pop(session_id, None)
     _session_had_private.discard(session_id)
     _turn_evidence_ids.pop(session_id, None)
+    _turn_fewshot_ids.pop(session_id, None)
 
 
 #: セッション → **今のターンで実際に注入した** Evidence の ``<store>:<id>``
@@ -340,6 +342,22 @@ def set_turn_evidence_ids(session_id: str, evidence_ids: list[str]) -> None:
 def turn_evidence_ids(session_id: str) -> list[str]:
     """このターンで注入した Evidence id (未設定は空)。"""
     return list(_turn_evidence_ids.get(session_id) or ())
+
+
+#: セッション → **今のターンで実際に注入した** few-shot 例の id (f_04 §3.2.2)。
+#: ``_turn_evidence_ids`` と同じ立て付け。以前の ``gen_config.fewshot_ids`` は
+#: プール全体 (50 件) を刻んでおり、手本へ成否を帰属する道が無かった。
+_turn_fewshot_ids: dict[str, list[str]] = {}
+
+
+def set_turn_fewshot_ids(session_id: str, example_ids: list[str]) -> None:
+    """このターンで注入した few-shot 例の id を置く。"""
+    _turn_fewshot_ids[session_id] = list(example_ids)
+
+
+def turn_fewshot_ids(session_id: str) -> list[str]:
+    """このターンで注入した few-shot 例の id (未設定は空)。"""
+    return list(_turn_fewshot_ids.get(session_id) or ())
 
 
 def _existing_session(mgr, session_id: str) -> "SessionData | None":
@@ -865,14 +883,10 @@ def _active_gen_config(
             ref.prompt_version = int(pm.get_meta(mode).version)
         except Exception:
             pass
+    # 実際に注入した例だけを刻む (以前はプール全体で、読み手は無かった)。
+    ref.fewshot_ids = turn_fewshot_ids(session_id) if session_id else []
     sched = getattr(state, "learning_scheduler", None)
     if sched is not None:
-        pool = getattr(sched, "_fewshot_pool", None)
-        if pool is not None:
-            try:
-                ref.fewshot_ids = [e.id for e in pool.get_pool(mode)]
-            except Exception:
-                pass
         evolver = getattr(sched, "_policy_param_evolver", None)
         generation = getattr(evolver, "generation", None)
         if isinstance(generation, int):
