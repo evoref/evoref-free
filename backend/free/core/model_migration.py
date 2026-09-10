@@ -868,6 +868,7 @@ class ModelMigrator:
         ),
         "rag": (
             "cartridge_gate_threshold",
+            "injection_relevance_min_score",
         ),
     }
 
@@ -973,6 +974,10 @@ class ModelMigrator:
     #: :class:`TestEmbeddingScaledThresholdSync` が実スキーマで検証する。
     _THRESHOLD_CONFIG_PATH: dict[str, tuple[str, ...]] = {
         "cartridge_gate_threshold": ("rag", "cartridge_gate", "threshold"),
+        # 注入ゲートは rag ではなく memory.injection が実体 (schemas/memory.py)。
+        "injection_relevance_min_score": (
+            "memory", "injection", "relevance_min_score",
+        ),
         "attribute_similarity_threshold": (
             "memory", "conflict", "attribute_similarity_threshold",
         ),
@@ -987,6 +992,7 @@ class ModelMigrator:
     #: 追随しなくなる。未記載 (キー自体が無い) は従来どおり転写する。
     _RUNTIME_PROFILE_RESOLVED: frozenset[str] = frozenset({
         "cartridge_gate_threshold",
+        "injection_relevance_min_score",
     })
 
     @classmethod

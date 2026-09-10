@@ -187,6 +187,11 @@ def ingest_session(
     for turn in session.turns[max(0, start - 1):start]:
         if str(turn.get("role") or "") == "user":
             last_user = str(turn.get("content") or "")
+    # 直前にノート化した user 発話。直後の assistant ノートと **問い ↔ 答え** で
+    # 結ぶ (``answered_by`` / ``answers``)。問いだけのノート (「発表の日付と
+    # テーマを確認させてください」) は注入時に捨てられるが、その答えこそが
+    # 別セッションから引きたい証拠 (2026-09-10 ライブ監査 (g) G-05)。
+    last_user_note: MemoryNote | None = None
     for index in range(start, len(session.turns)):
         turn = session.turns[index]
         content = str(turn.get("content") or "")
@@ -215,8 +220,15 @@ def ingest_session(
         )
         if note is None:
             continue
+        if note.source == "user":
+            last_user_note = note
+        elif last_user_note is not None and note.source == "assistant":
+            note.answers = last_user_note.id
         store.put_note(note, tier="short")
         created += 1
+        if note.answers and last_user_note is not None:
+            store.patch_note(last_user_note.id, attrs={"answered_by": note.id})
+            last_user_note = None
     if dropped_echo:
         logger.info(
             "Episodic ingest: dropped %d echo-only assistant turn(s) (session=%s)",

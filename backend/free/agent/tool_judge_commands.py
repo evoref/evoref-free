@@ -944,13 +944,21 @@ def business_day_target(
     (「その日から逆算して」、2026-09-09 監査 G-06)。生成コマンドのテンプレート
     と **同じ数え方** を実装しており、``test_date_intent_command.py`` が
     両者の一致を検証する。
+
+    候補列の先頭は ``start`` 自身が営業日のときだけ ``start`` になる。
+    ``start`` が休み (土日 / 祝日 / 除外曜日) のときは先頭が既に「翌営業日 =
+    1 日目」なので、``count_start_day`` に関わらず index は ``n - 1``。
+    ``n`` のままだと 1 日ずれる — 実インシデント (2026-09-09 ライブ監査 (d)
+    D-04): 「10/30 (金) 納品の 7 営業日前、毎週金曜は出荷不可」で起点の金曜が
+    候補から落ち、``b[7]`` が 8 営業日前の 10/19 (正: 10/20) になった。
     """
     candidates = _business_day_candidates(
         start, _candidate_span(n, holidays),
         skip_weekends=skip_weekends, holidays=holidays,
         excluded_weekdays=excluded_weekdays, direction=direction,
     )
-    index = n - 1 if count_start_day else n
+    start_is_business_day = bool(candidates) and candidates[0] == start
+    index = n - 1 if (count_start_day or not start_is_business_day) else n
     return candidates[index]
 
 
@@ -961,11 +969,18 @@ def business_days_between(
     skip_weekends: bool = True,
     holidays: tuple[datetime.date, ...] = (),
     count_start_day: bool = True,
+    excluded_weekdays: tuple[int, ...] = (),
 ) -> int:
-    """``start``〜``end`` の間の営業日数 (純粋関数、両端を含む数え方)。"""
+    """``start``〜``end`` の間の営業日数 (純粋関数、両端を含む数え方)。
+
+    ``excluded_weekdays`` (「毎週水曜日が定休日」) は ``business_day_target`` と
+    同じく土日と合算する (2026-09-10 ライブ監査 (f) F-03: 期間の数え上げだけ
+    曜日除外を持たず、追い質問が暗算に落ちていた)。
+    """
     lo, hi = (start, end) if start <= end else (end, start)
     candidates = _business_day_candidates(
         lo, (hi - lo).days + 1, skip_weekends=skip_weekends, holidays=holidays,
+        excluded_weekdays=excluded_weekdays,
     )
     return len(candidates) - (0 if count_start_day else 1)
 
@@ -1030,7 +1045,12 @@ def build_date_intent_command(params: DateIntentParams, query: str = "") -> str:
     start = _date_literal(params.start)
     if params.kind == "business_days_from":
         span = _candidate_span(params.n, params.holidays)
-        index = params.n - 1 if params.count_start_day else params.n
+        # index は実行時に決める: 起点が休みなら候補の先頭が既に 1 日目
+        # (:func:`business_day_target` と同じ数え方、D-04)。
+        index = (
+            f"{params.n}-1" if params.count_start_day
+            else f"{params.n}-(0 if b[0]==s else 1)"
+        )
         direction = _effective_direction(params.direction, query)
         step = -1 if direction == "backward" else 1
         excluded = set(params.excluded_weekdays)
@@ -1066,20 +1086,24 @@ def build_date_intent_command(params: DateIntentParams, query: str = "") -> str:
             " print('target:',t.strftime('%Y-%m-%d (%A)'))\""
         )
     if params.kind == "days_between":
-        if params.skip_weekends or params.holidays:
+        if params.skip_weekends or params.holidays or params.excluded_weekdays:
             adjust = 0 if params.count_start_day else 1
-            weekday_filter = " if d.weekday()<5 and d not in hs" \
-                if params.skip_weekends else " if d not in hs"
+            # 曜日除外は起点からの数え (business_days_from) と同じ合算 (F-03)。
+            excluded = set(params.excluded_weekdays)
+            if params.skip_weekends:
+                excluded |= {5, 6}
             return (
                 _DATE_INTENT_PREFIX
                 + f" a={start}; z={_date_literal(params.end)};"
                 f" hs={_holiday_set_literal(params.holidays)};"
+                f" ws={_weekday_set_literal(excluded)};"
                 " lo=min(a,z); hi=max(a,z);"
                 " c=[lo+datetime.timedelta(days=i) for i in range((hi-lo).days+1)];"
-                f" b=[d for d in c{weekday_filter}];"
+                " b=[d for d in c if d.weekday() not in ws and d not in hs];"
                 " print('now:',n); print('from:',lo.strftime('%Y-%m-%d (%A)'));"
                 " print('to:',hi.strftime('%Y-%m-%d (%A)'));"
                 f" print('skip_weekends:',{params.skip_weekends});"
+                f" print('excluded_weekdays:',{sorted(excluded)!r});"
                 f" print('holidays_excluded:',{len(params.holidays)});"
                 f" print('start_counted_as_day1:',{params.count_start_day});"
                 f" print('business_days:',len(b)-{adjust})\""
@@ -1206,6 +1230,182 @@ def follow_up_holidays_from_query(
     if _FOLLOW_UP_SAME_DAY_HOLIDAY_RE.search(query):
         found.append(previous_target)
     return tuple(sorted(set(found)))
+
+
+#: 起点を直前の結果に置く照応 (「その日から 5 営業日後」「そこから 3 日後」)。
+_ANAPHORIC_START_RE = re.compile(
+    r"(?:その日|同日|そこ|その日付|当日|上の日|上記の日)(?:を起点に|から|以降|の)"
+)
+#: 直前のアシスタント発話に現れる日付 (和暦表記 / ISO)。最後に現れたものを
+#: 「直前の結果」と読む (回答は結論の日付で終わることが多い)。
+_ANSWER_DATE_RE = re.compile(
+    r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日"
+    r"|(\d{4})-(\d{2})-(\d{2})"
+)
+
+
+#: 「<月>の営業日数」— 期間が月で閉じている数え上げ。月は閉じた集合なので
+#: 抽出器に任せず (実測: 「11 月の営業日数は…祝日 11/3・11/23 を除いて」で
+#: ``kind: none``、モデルの暗算は土日を 8 日と数えて 20 (正 19)。2026-09-10
+#: ライブ監査 (f) F-01) コード側で ``days_between`` を組む。
+_MONTH_BUSINESS_DAYS_RE = re.compile(
+    r"(?P<month>今月|来月|再来月|先月"
+    r"|(?P<year>\d{4})\s*年\s*(?P<ynum>\d{1,2})\s*月"
+    r"|(?P<num>\d{1,2})\s*月)"
+    r"(?:の|中の|における)?\s*(?:営業日|稼働日|平日)(?:数|は何日|はいくつ|の日数)"
+)
+#: 発話に明示された祝日 / 休業日 (「祝日の 10 月 12 日」「11 月 3 日、11 月 23 日」)。
+_EXPLICIT_MONTH_DAY_RE = re.compile(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*日")
+_RELATIVE_MONTH_OFFSET = {"今月": 0, "来月": 1, "再来月": 2, "先月": -1}
+
+
+def _resolve_month(
+    token: str, today: datetime.date, *, year: int | None, num: int | None,
+) -> tuple[int, int] | None:
+    """月の語 (今月 / 来月 / N 月 / YYYY 年 N 月) を (年, 月) に解決する。
+
+    裸の「N 月」は今日から見て **直近の同名月** (今月以降)。
+    """
+    offset = _RELATIVE_MONTH_OFFSET.get(token)
+    if offset is not None:
+        m = today.month - 1 + offset
+        return today.year + m // 12, m % 12 + 1
+    if num is None or not 1 <= num <= 12:
+        return None
+    if year is not None:
+        return year, num
+    if num >= today.month:
+        return today.year, num
+    return today.year + 1, num
+
+
+def month_business_days_from_query(
+    query: str, today: datetime.date,
+) -> DateIntentParams | None:
+    """「<月>の営業日数」を ``days_between`` のパラメータに解決する (純粋関数)。
+
+    土日は除き、発話に列挙された「M 月 D 日」のうち **その月のもの** を祝日として
+    除く。月の初日と末日が両端で、両端を含めて数える。
+    """
+    m = _MONTH_BUSINESS_DAYS_RE.search(query or "")
+    if m is None:
+        return None
+    token = m.group("month")
+    year = int(m.group("year")) if m.group("year") else None
+    raw_num = m.group("ynum") or m.group("num")
+    num = int(raw_num) if raw_num else None
+    resolved = _resolve_month(token, today, year=year, num=num)
+    if resolved is None:
+        return None
+    y, mo = resolved
+    first = datetime.date(y, mo, 1)
+    last = datetime.date(y + mo // 12, mo % 12 + 1, 1) - datetime.timedelta(days=1)
+    holidays: list[datetime.date] = []
+    for hm, hd in _EXPLICIT_MONTH_DAY_RE.findall(query or ""):
+        if int(hm) != mo:
+            continue
+        try:
+            holidays.append(datetime.date(y, mo, int(hd)))
+        except ValueError:
+            continue
+    return DateIntentParams(
+        kind="days_between", start=first, end=last, n=0, skip_weekends=True,
+        holidays=tuple(sorted(set(holidays))), count_start_day=True,
+        direction="forward", excluded_weekdays=(),
+    )
+
+
+#: 「<月>の第 N X 曜日」— 月と序数と曜日で閉じた日付。抽出器には kind が無く
+#: (``weekday_of`` は「ある日付の曜日」)、now-only に落ちてモデルの暗算 +
+#: 「ツールで検証していない」の開示になっていた (2026-09-10 (f) 検証 V05/2)。
+_NTH_WEEKDAY_OF_MONTH_RE = re.compile(
+    r"(?P<month>今月|来月|再来月|先月"
+    r"|(?P<year>\d{4})\s*年\s*(?P<ynum>\d{1,2})\s*月"
+    r"|(?P<num>\d{1,2})\s*月)"
+    r"(?:の)?\s*第\s*(?P<nth>[1-5１-５一二三四五])\s*(?P<wd>[月火水木金土日])曜"
+)
+_KANJI_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}
+
+
+def nth_weekday_of_month_from_query(
+    query: str, today: datetime.date,
+) -> DateIntentParams | None:
+    """「来月の第 2 月曜日」を ``weekday_of`` (日付確定) に解決する (純粋関数)。"""
+    m = _NTH_WEEKDAY_OF_MONTH_RE.search(query or "")
+    if m is None:
+        return None
+    year = int(m.group("year")) if m.group("year") else None
+    raw_num = m.group("ynum") or m.group("num")
+    resolved = _resolve_month(
+        m.group("month"), today, year=year, num=int(raw_num) if raw_num else None,
+    )
+    if resolved is None:
+        return None
+    y, mo = resolved
+    nth_raw = m.group("nth")
+    nth = _KANJI_DIGITS.get(nth_raw) or int(nth_raw.translate(
+        str.maketrans("１２３４５", "12345"),
+    ))
+    weekday = _WEEKDAY_INDEX[m.group("wd")]
+    first = datetime.date(y, mo, 1)
+    offset = (weekday - first.weekday()) % 7
+    target = first + datetime.timedelta(days=offset + 7 * (nth - 1))
+    if target.month != mo:
+        return None
+    return DateIntentParams(
+        kind="weekday_of", start=target, end=None, n=0, skip_weekends=False,
+        holidays=(), count_start_day=False, direction="forward",
+        excluded_weekdays=(),
+    )
+
+
+def query_has_anaphoric_start(query: str) -> bool:
+    """追い質問が起点を直前の結果 (「その日」) に置いているか (純粋関数)。"""
+    return bool(_ANAPHORIC_START_RE.search(query or ""))
+
+
+def last_date_in_text(text: str) -> datetime.date | None:
+    """本文の **最後** に現れる日付 (純粋関数)。無ければ ``None``。"""
+    found = None
+    for m in _ANSWER_DATE_RE.finditer(text or ""):
+        parts = [g for g in m.groups() if g is not None]
+        try:
+            found = datetime.date(int(parts[0]), int(parts[1]), int(parts[2]))
+        except ValueError:
+            continue
+    return found
+
+
+def previous_answer_date(conversation: list[dict] | None, *, before: str = "") -> datetime.date | None:
+    """直前のアシスタント発話が述べた日付 (純粋関数)。
+
+    「今日から 3 週間後は？」→「2026年9月30日（水曜日）です」の次の
+    「その日から 5 営業日後は？」は、起点が **直前の回答の日付** で、今日では
+    ない。抽出器は会話を添えても ``start: today`` を返し、9/9 起点で 9/16 と
+    答えた (2026-09-09 ライブ監査 (e) E-02、正 10/7)。照応の解決は抽出器に
+    任せず、直前のアシスタント発話の最後の日付をコード側で採る。
+    ``before`` に今回の発話を渡すと、末尾に積まれた今回の user ターンより前の
+    assistant 発話を探す。
+    """
+    turns = list(conversation or [])
+    seen_self = not before or not any(
+        str(m.get("role") or "") == "user"
+        and str(m.get("content") or "").strip() == before.strip()
+        for m in turns
+    )
+    for msg in reversed(turns):
+        role = str(msg.get("role") or "")
+        content = str(msg.get("content") or "")
+        if not seen_self:
+            if role == "user" and content.strip() == before.strip():
+                seen_self = True
+            continue
+        if role == "assistant":
+            found = last_date_in_text(content)
+            if found is not None:
+                return found
+            return None
+    return None
 
 
 def date_intent_command_from_params(params: DateIntentParams, query: str = "") -> str:

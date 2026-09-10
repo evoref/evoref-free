@@ -296,23 +296,29 @@ class InjectionConfig(BaseModel):
             "rag.self_rag.threshold_mode と同じ意味"
         ),
     )
-    relevance_min_score: float = Field(
-        default=0.35, ge=0.0, le=1.0,
+    relevance_min_score: float | None = Field(
+        default=None, ge=0.0, le=1.0,
         description=(
             "関連度ゲートのコサイン類似度閾値 (manual / 較正なしのときの静的値)。"
-            "実測 (LFM2.5-Embedding-350M) で真陽性 0.38〜0.44 / ノイズ中央値 0.12〜0.17"
+            "null = 有効な埋め込みプロファイル (models/profiles/<arch>.yaml の"
+            " embedding.rag.injection_relevance_min_score) に追随し、"
+            "プロファイルに無ければ 0.35 (LFM2.5-Embedding-350M 実測: 真陽性"
+            " 0.38〜0.44 / ノイズ中央値 0.12〜0.17)。数値を書くとプロファイルより優先。"
+            "絶対閾値は埋め込みモデルごとに到達域が違い、bge-m3 では 0.35 が"
+            "ノイズ床 (無関係ペア 0.29〜0.47) を下回る (2026-09-09 D-03)"
         ),
     )
-    pinned_relevance_min_score: float = Field(
-        default=0.10, ge=0.0, le=1.0,
+    pinned_relevance_min_score: float | None = Field(
+        default=None, ge=0.0, le=1.0,
         description=(
             "pinned ファクトに課す関連度の下限 (manual / 較正なしのときの静的値)。"
             "pin は優先度の指定であって「常に関連する」の宣言ではなく、しかも"
             "「覚えておいてください」等の語で自動 pin されるため、0 (完全迂回) だと"
             "無関係なターンにも毎回載り続ける。実測 2026-08-09: 0 → 0.10 で記憶不要"
             "ターンの注入が 297→81 token (約 2.2→0.6 秒) に減り、想起ターンは注入量・"
-            "正答とも無変化。0.35 で想起が壊れ始める。auto かつ較正ありのときは"
-            "較正 relevance の半分を使う (MemoryInjector の PINNED_RELEVANCE_RATIO)"
+            "正答とも無変化。0.35 で想起が壊れ始める。null = relevance が較正 /"
+            "プロファイル由来ならその半分 (MemoryInjector の PINNED_RELEVANCE_RATIO)、"
+            "既定 0.35 由来なら 0.10"
         ),
     )
 

@@ -1100,6 +1100,23 @@ def _eligible_rag_indices(
     keys: list[str] = []
     query_key = _dedup_key_for_rag(current_query) if current_query else ""
     n_question = n_dup = n_echo = 0
+    # 過去の会話そのもの (「私が相談した X の話題は何でしたか」) を尋ねて
+    # いるなら、過去の **問い** こそが答えの根拠なので落とさない。落とすと
+    # episodic 検索が cos 0.60 で当てた前セッションの相談 4 件が全部消え、
+    # 「該当する話題は見つかりません」に落ちた (2026-09-09 ライブ監査 (e) E-04)。
+    # 判定はツール判定ガードと同じ ``asks_about_past_conversation``。
+    # ただし「最初に私が聞いたのは」のように **会話内の位置** だけを指す想起は
+    # 答えが窓の中にあり、他セッションの問いは雑音でしかない (2026-09-10 ライブ
+    # 監査 (f) F-04: 無関係な過去の問いが 5 件並び、窓に答えがあるのに
+    # 「確認できていません」に落ちた)。
+    recalling_discourse = False
+    if current_query:
+        from backend.free.agent.tool_judge_history import asks_about_past_conversation
+        from backend.free.core.intent_vocab import only_session_ordinal_recall
+
+        recalling_discourse = asks_about_past_conversation(
+            current_query,
+        ) and not only_session_ordinal_recall(current_query)
     for i, text in enumerate(texts):
         # ``carries_no_assertion`` は「問いだけか」しか見ないので、
         # 「〜してください」型の **依頼** が素通りする。依頼は事実を含まないのに
@@ -1110,7 +1127,9 @@ def _eligible_rag_indices(
         # 確信度を付けて答えてください。」が ``[参考情報 1]`` として残っていた。
         # 本関数の docstring が自ら警告している「経路ごとに書くと片方だけ直る
         # 非対称」がそのまま起きていた形。
-        if carries_no_assertion(text) or states_no_user_value(text):
+        if not recalling_discourse and (
+            carries_no_assertion(text) or states_no_user_value(text)
+        ):
             n_question += 1
             continue
         key = _dedup_key_for_rag(text)

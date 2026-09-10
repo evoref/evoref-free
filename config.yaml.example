@@ -712,12 +712,18 @@ memory:
     # RAG 側は threshold_mode: auto で守られていたが、注入側のこの 1 本だけが
     # 静的なまま残っていたため揃えた。
     threshold_mode: auto
-    relevance_min_score: 0.35                                  # 関連度ゲートのコサイン類似度閾値 (manual / 較正なしのとき)
+    # 関連度ゲートのコサイン類似度閾値 (manual / 較正なしのとき)。
+    # null = 有効な埋め込みプロファイル (models/profiles/<arch>.yaml の
+    # embedding.rag.injection_relevance_min_score: bert 0.54) に追随。プロファイルに
+    # 無ければ 0.35 (LFM2.5 実測)。数値を書くとプロファイルより優先される。
+    # 絶対閾値は埋め込みモデルごとに到達域が違い、bge-m3 では 0.35 がノイズ床
+    # (無関係ペア 0.29〜0.47) を下回って全ファクトが全ターンに載る (2026-09-09 D-03)。
+    relevance_min_score: null
     # pinned に課す下限。0 にすると完全迂回し、無関係なターンにも毎回載る。
-    # auto かつ較正ありのときは較正 relevance の半分を使う (現行 embedder で 0.151)。
-    # 静的既定 0.10 は背景ノイズ分布 (p50 0.039 / p95 0.302) の内側で、pin が付いた
-    # 瞬間にほぼ全ターン載る位置にある。
-    pinned_relevance_min_score: 0.10
+    # null = relevance が較正 / プロファイル由来ならその半分 (bert 0.27)、
+    # 既定 0.35 由来なら 0.10。静的既定 0.10 は LFM2.5 の背景ノイズ分布
+    # (p50 0.039 / p95 0.302) の内側で、pin が付いた瞬間にほぼ全ターン載る位置にある。
+    pinned_relevance_min_score: null
     tier_ratios:
       chat: [0.40, 0.35, 0.15, 0.10]                           # Tier 1〜4 比率 (合計 1.0)
       create: [0.40, 0.35, 0.15, 0.10]                         # Tier 1〜4 比率 (合計 1.0)

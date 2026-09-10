@@ -780,7 +780,11 @@ _DISCOURSE_PREFIX_RE = re.compile(
     r"^\s*(?:ところで|そういえば|そう言えば|ちなみに|実は|じつは|あのー?|えっと"
     r"|なんか|ねえ|ねぇ|あっ|えっ|あ、|え、"
     r"|すみません|すいません|ごめんなさい|ごめん|失礼しました|申し訳ありません"
-    r"|申し訳ない)\s*[、,。]?\s*",
+    r"|申し訳ない"
+    # 挨拶も談話標識 (「はじめまして、小林翔太と申します」→ 値は名前だけ。
+    # 2026-09-10 ライブ監査 (f) F-08: 挨拶込みの文が name の値になっていた)
+    r"|はじめまして|初めまして|こんにちは|こんばんは|おはようございます|おはよう"
+    r"|お世話になっております|お疲れ様です|よろしくお願いします)\s*[、,。]?\s*",
 )
 
 #: 文頭の一人称主題。「私は担々麺が好き」→「担々麺が好き」。
@@ -895,6 +899,71 @@ _REQUEST_ENDING_RE = re.compile(
 #: :func:`_asserts_before_request` を参照。
 _SELF_REFERENCE_RE = re.compile(r"(?:私|僕|俺|自分|わたし|ぼく|うち)")
 
+#: 本人以外の人を指す名詞 (家族・続柄・関係者・三人称)。この語に主格 / 主題の
+#: 助詞が続く節は **その人についての** 述語で、本人の属性ではない。
+_OTHER_PERSON_NOUN_RE = re.compile(
+    r"(?:妹|弟|姉|兄|母|父|両親|祖父|祖母|夫|妻|主人|旦那|家内|息子|娘|子ども|子供|"
+    r"孫|叔父|叔母|甥|姪|いとこ|従兄弟|従姉妹|親戚|友人|友達|同僚|上司|部下|同期|"
+    r"先輩|後輩|恋人|彼氏|彼女|彼|パートナー|ルームメイト|隣人|知人|先生|社長)"
+    r"(?:さん|ちゃん|くん|君|たち|達)?"
+    r"(?:が|は|も)",
+)
+
+
+def attribute_belongs_to_another_person(
+    sentence: str, trigger_words: tuple[str, ...],
+) -> bool:
+    """属性のトリガ語を含む節の主語が本人以外の人か (純粋関数)。
+
+    「妹が近所に住んでいます」の「住んで」は本人の居住地のトリガだが、節の主語は
+    妹。これを本人の ``location`` にすると、単値スロットが後勝ちで本人の
+    「横浜市の港北区」を supersede し、次セッションで区名が答えられなくなった
+    (2026-09-10 ライブ監査 (f) F-07)。判定は語彙ではなく構造 — トリガ語の
+    **直近の主語** (本人以外の人 + が / は / も、または一人称) が本人以外の人で
+    あること。「私は妹と横浜に住んでいます」は一人称が主語なので本人の属性のまま。
+
+    2 つの補正 (2026-09-10 ライブ監査 (g) G-04):
+
+    - **主語はトリガ語に最も近いものを見る**。「夫は大阪にいて、私は名古屋に
+      住んでいます」は「私は」が直近なので本人。先頭の「夫は」だけ見て捨てない。
+    - **その人の語がこの属性のトリガ語なら主語ではなく値**。家族スロット
+      (「夫」「娘」) で「夫は大阪に単身赴任していて、保育園に通う娘と…」の
+      「娘」の前に「夫は」があっても、夫はこの属性 (家族) の値そのもの。
+      これを第三者と見ると家族ファクトが 1 件も生まれず、次セッションの
+      「家族構成は」が「確認できていません」に落ちた。
+
+    トリガ語が複数回現れるときは、**全ての** 出現が他者の節にあるときだけ
+    True (1 つでも本人の節にあれば本人の値を含む — 捨てると戻らない)。
+    """
+    text = sentence or ""
+    if not text:
+        return False
+    own_words = {w for w in trigger_words if w}
+    saw_trigger = False
+    for word in trigger_words:
+        if not word:
+            continue
+        search_from = 0
+        while (pos := text.find(word, search_from)) >= 0:
+            search_from = pos + len(word)
+            saw_trigger = True
+            head = text[:pos]
+            last_other = -1
+            for m in _OTHER_PERSON_NOUN_RE.finditer(head):
+                noun = re.sub(r"(?:さん|ちゃん|くん|君|たち|達)?(?:が|は|も)$", "", m.group(0))
+                if noun in own_words:
+                    continue
+                last_other = m.start()
+            if last_other < 0:
+                return False
+            last_self = -1
+            for m in _SELF_REFERENCE_RE.finditer(head):
+                last_self = m.start()
+            if last_self > last_other:
+                return False
+    return saw_trigger
+
+
 #: 従属節の切れ目 (接続助詞 + 読点)。依頼文の中で「言明の節」と「依頼の節」を
 #: 分ける境界として使う。読点を必須にするのは、体言の並列 (「AとB、Cを…」) を
 #: 節の切れ目と誤認しないため。
@@ -953,7 +1022,12 @@ def carries_no_assertion(text: str) -> bool:
     sentences = [s for s in sentences if s]
     if not sentences:
         return True
-    return all(_INTERROGATIVE_TAIL_RE.search(s) for s in sentences)
+    # 問いの前に本人の数量の前提を置いた疑問文は主張を兼ねる
+    # (:func:`_states_premise_before_question`、2026-09-09 (e) E-05)。
+    return all(
+        _INTERROGATIVE_TAIL_RE.search(s) and not _states_premise_before_question(s)
+        for s in sentences
+    )
 
 
 def states_no_user_value(text: str) -> bool:
@@ -1004,10 +1078,38 @@ def states_no_user_value(text: str) -> bool:
     )
 
 
+#: 疑問文の中で **前提として述べた数量** (「単価が 1,250 円で、36 個注文すると
+#: 合計はいくらですか」)。数量 (数字 + 単位) の後ろに条件・前提の接続
+#: (で、/ と / なら / たら / 場合 / とき) が続く形。「1 キロメートルは何メートル
+#: ですか」(数量の直後が主題の「は」) は一般知識の問いで、前提ではない。
+_QUANTITY_PREMISE_RE = re.compile(
+    r"\d[\d,]*(?:\.\d+)?\s*"
+    r"(?:円|個|台|人|本|枚|件|冊|部|kg|km|cm|mm|kb|mb|gb|g|m|l|トン|%|％|時間|分|秒|日|週間|"
+    r"か月|ヶ月|カ月|年|℃|度|回|名|社|ページ|行|字|文字|通|便)"
+    r"[^。！？!?\n]{0,24}?(?:で、|と、|と|なら|たら|れば|場合|とき|として|時に)",
+)
+
+
+def _states_premise_before_question(sentence: str) -> bool:
+    """疑問文が、問いの前に **本人が置いた数量の前提** を含むか (純粋関数)。
+
+    「商品 A の単価が 1,250 円で、36 個注文すると合計はいくらですか」は問いだが、
+    単価と個数は本人が述べた値で、後から「私が注文した個数は」と引かれる。
+    疑問形というだけで「値を述べていない」と扱うと、その発話は注入されず
+    (問いだけのノートとして落ちる)、次セッションの想起が「確認できません」に
+    落ちた (2026-09-09 ライブ監査 (e) E-05)。
+    """
+    return bool(_QUANTITY_PREMISE_RE.search(sentence))
+
+
 def _is_non_assertive_sentence(sentence: str) -> bool:
-    """1 文が「値の表明ではない」か (疑問形 または 純粋な依頼形)。"""
+    """1 文が「値の表明ではない」か (疑問形 または 純粋な依頼形)。
+
+    疑問形でも、問いの前に本人の数量の前提を置いていれば値の表明を兼ねる
+    (:func:`_states_premise_before_question`)。
+    """
     if _INTERROGATIVE_TAIL_RE.search(sentence):
-        return True
+        return not _states_premise_before_question(sentence)
     if not _REQUEST_ENDING_RE.search(sentence):
         return False
     return not _asserts_before_request(sentence)

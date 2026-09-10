@@ -16,6 +16,7 @@ from backend.i18n_helper import prompt_locale
 from backend.log_config import get_logger
 from backend.free.memory.corrections import corrections_by_target
 from backend.trace_context import run_in_executor_with_context
+from backend.utils import utc_now_dt
 from backend.free.constants import (
     SEARCH_HISTORY_CURRENT_SESSION_HEADER,
     SEARCH_HISTORY_NO_RESULTS_PREFIX,
@@ -349,6 +350,8 @@ async def _search_episodic_layer(
                 "assistant note(s) so the previous answer is not handed back "
                 "as reference material", before - len(hits),
             )
+    else:
+        hits = _answers_for_question_only_hits(episodic, hits)
 
     entries: list[StoreEntry] = []
     n_dropped = n_cleaned = 0
@@ -378,6 +381,68 @@ async def _search_episodic_layer(
         ", ".join(f"{e[1]:.3f}" for e in entries),
     )
     return entries
+
+
+def _answers_for_question_only_hits(episodic, hits: list) -> list:
+    """問いだけの user ノートが当たったら、その **答え** の assistant ノートを差し出す。
+
+    過去セッションのユーザーの問い (「発表の日付とテーマを確認させてください」)
+    は本文に事実を持たないので注入側 (``inference._eligible_rag_indices``) が
+    捨てる。しかしその問いが最類似で当たるということは、**問いに対して返した
+    答えこそ** が今回の問いの証拠。捨てるだけだと、答え (「発表日は 10 月 22 日、
+    テーマは『顧客オンボーディングの自動化』です」) が cos 0.78 の隣にあるのに
+    「テーマは確認できていません」に落ちた (2026-09-10 ライブ監査 (g) G-05、
+    「ここまで話した内容を 5 項目で」→ 家族構成の要約も同型)。
+
+    隣接は取り込み時に刻んだ ``answered_by`` (``episodic.ingest``) で引く
+    (走査しない)。答えのノートが無い / 退役済み / 自分が注入した出力なら
+    元の問いのまま (後段が従来どおり捨てる)。順位 (cosine / score) は問いの
+    ものを継ぐ — 当たったのは問いであり、答えはその付属。
+    """
+    if not hits or episodic is None:
+        return hits
+    from backend.free.core.text_quality import carries_no_assertion, states_no_user_value
+    from backend.free.memory.episodic.store import EpisodicHit
+    from backend.free.rag.evidence.store import is_active
+
+    now_epoch = utc_now_dt().timestamp()
+    out = []
+    swapped = 0
+    seen_ids = {h.id for h in hits}
+    for hit in hits:
+        record = hit.record
+        answer_id = (getattr(record, "attrs", None) or {}).get("answered_by")
+        if (
+            record.origin != "user"
+            or not answer_id
+            or answer_id in seen_ids
+            or not (carries_no_assertion(hit.text) or states_no_user_value(hit.text))
+        ):
+            out.append(hit)
+            continue
+        answer = episodic.get(str(answer_id))
+        if (
+            answer is None
+            or answer.origin != "assistant"
+            or not is_active(answer, now_epoch)
+            or not (answer.text or "").strip()
+            or _is_injected_output(answer.text)
+        ):
+            out.append(hit)
+            continue
+        question = hit.text.strip()
+        out.append(EpisodicHit(
+            answer, hit.cosine, hit.score,
+            f"「{question}」への回答: {answer.text.strip()}",
+        ))
+        seen_ids.add(answer.id)
+        swapped += 1
+    if swapped:
+        logger.info(
+            "Episodic: %d question-only hit(s) replaced by the answer they received",
+            swapped,
+        )
+    return out
 
 
 #: 「注入するために組み立てたテキスト」だけに現れるマーカー。これを含む LTM

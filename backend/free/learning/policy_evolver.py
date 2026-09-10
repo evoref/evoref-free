@@ -70,8 +70,22 @@ logger = get_logger("learning.policy_evolver")
 #: SalienceRanker の重みで、どちらも fitness に届かない。順位式の係数
 #: (``store_prior`` / 半減期) は c_16 §10 のとおり **実機の交互撃ち A/B で
 #: 調整する**対象で、自動進化には載せない。
+#:
+#: ``memory`` も **意図的に含めない** (2026-09-09 ライブ監査 (d) D-07)。残る
+#: キーは ``conflict_similarity_threshold`` (STM 競合検出のコサイン閾値) と
+#: ``conflict_batch_size`` (sleep-time の LLM 呼び出し回数) の 2 つだけ。前者は
+#: **埋め込みモデルの実測較正値** (``models/profiles/<arch>.yaml`` →
+#: ``memory.conflict_similarity_threshold``、bge-m3 0.83) を policy が seed する
+#: 測定量で、fitness (欠陥率) はチャットの turn_outcome 由来なので競合検出の
+#: 良し悪しに一切反応しない。無反応の fitness の下で σ=0.15 のガウス摂動を
+#: 打つと、制約範囲 [0, 1] の乱歩になり **上限 1.0 に張り付いて競合検出が
+#: 無効化される**。同じ事故が 3 度目 (2026-08-18 実測 / 2026-09-09 B-04 =
+#: 天井ガード / 2026-09-09 (d) = fitness 0.96 で天井ガードを抜け、初回 tick で
+#: 0.83 → 1.0)。恒真ガード (DEGENERATE_WINDOW) は窓が埋まるまで効かず、
+#: リセット直後の最初の 1 手を止められない。後者はコストが sleep-time にしか
+#: 出ず恒久凍結。恒久凍結だけで全滅するドメインは進化対象に置かない
+#: (router / search と同じ扱い)。
 EVOLVABLE_DOMAINS: list[str] = [
-    "memory",
     "agent",
     "long_form",
 ]
@@ -184,12 +198,11 @@ PERMANENTLY_FROZEN_PARAMS: dict[str, dict[str, str]] = {
         # 使えたことの価値を測るシグナルが要る。
         "meta_cognitive_min_budget": "上げるほど機能が停止し品質項・コスト項の両方が改善する",
     },
-    "memory": {
-        # sleep-time の LLM 呼び出し回数を食うだけで、チャットターンの
-        # プロンプト/生成トークンには一切現れない。
-        "conflict_batch_size": "コストが sleep-time の LLM 呼び出しにのみ出る",
-    },
 }
+# ``memory`` の ``conflict_batch_size`` (コストが sleep-time の LLM 呼び出しに
+# のみ出る) はここに載せていたが、``conflict_similarity_threshold`` が埋め込み
+# 較正値で進化に載せられないため、ドメインごと :data:`EVOLVABLE_DOMAINS` から
+# 外した (2026-09-09 D-07)。
 
 #: 品質項だけでは **単調** なパラメータ。増やす (または減らす) ほど品質指標が
 #: 改善する一方、その代償 (コンテキスト量・レイテンシ) が品質項には現れない。

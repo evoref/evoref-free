@@ -102,31 +102,14 @@ DEFAULT_VERSIONS_KEEP = 2
 def _profile_cartridge_gate_threshold() -> float | None:
     """有効な埋め込みモデルプロファイルの ``embedding.rag.cartridge_gate_threshold``。
 
-    ``models/profiles/<arch>.yaml`` (+ ``by-model/<stem>.yaml``) を
-    ``model_paths.embed_model`` から解決する (起動フラグ / モデル移行と同じ
-    ローダ)。config 未ロード / モデル未設定 / プロファイル不在 / 読取失敗は
-    ``None`` (呼出側が 0.3 に倒す)。
+    解決は :func:`backend.free.rag.memory_threshold_calibration.profile_embedding_threshold`
+    (注入ゲートと同じ読み手)。不在 / 失敗は ``None`` (呼出側が 0.3 に倒す)。
     """
-    try:
-        from backend.config import get_config, get_project_root
-        from scripts.launch_llama import load_model_profile_for
+    from backend.free.rag.memory_threshold_calibration import (
+        profile_embedding_threshold,
+    )
 
-        model_rel = (get_config().get("model_paths") or {}).get("embed_model")
-        if not model_rel:
-            return None
-        root = get_project_root()
-        model_path = Path(model_rel)
-        if not model_path.is_absolute():
-            model_path = root / model_path
-        profile = load_model_profile_for(model_path, root) or {}
-        value = (
-            ((profile.get("embedding") or {}).get("rag") or {})
-            .get("cartridge_gate_threshold")
-        )
-    except Exception as exc:
-        logger.debug("corpus gate profile threshold unavailable: %s", exc)
-        return None
-    return float(value) if isinstance(value, (int, float)) else None
+    return profile_embedding_threshold("rag", "cartridge_gate_threshold")
 
 
 def resolve_cartridge_gate_threshold(gate_cfg: dict | None) -> float:

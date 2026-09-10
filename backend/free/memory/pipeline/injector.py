@@ -69,6 +69,12 @@ from backend.free.memory.semantic.namespaces import is_injectable, namespace_of
 from backend.free.memory.episodic.note import MemoryNote
 from backend.free.memory.types import MemoryMode, SemanticFact
 from backend.i18n_helper import prompt_locale
+from backend.free.core.query_anchors import (
+    ANCHOR_SCAFFOLD,
+    QUERY_ANCHOR_RE,
+    has_anchor,
+    query_anchors,
+)
 from backend.log_config import get_logger
 from backend.utils import estimate_tokens
 
@@ -423,37 +429,14 @@ _ASKED_ATTRIBUTE_BONUS: float = 100.0
 #: コサインだけで並ぶ候補より上に出す。
 _ANCHOR_BONUS: float = 50.0
 
-#: クエリから取り出す **内容語**。2 文字以上の漢字 / カタカナ / 英数字の連なり。
-#: 1 文字を採らないのは助詞・接辞の断片が全文にマッチしてしまうため。
-_QUERY_ANCHOR_RE = re.compile(r"[一-鿿]{2,}|[ァ-ヴー]{2,}|[A-Za-z0-9]{2,}")
-
-#: 想起の **足場語**。どの想起クエリにも現れるので、これが一致しても
-#: 「その話題だ」とは言えない。アンカーから除く。
-_ANCHOR_SCAFFOLD: frozenset[str] = frozenset({
-    "自分", "今回", "会話", "記録", "情報", "内容", "以前", "過去", "確認",
-    "教えて", "何度", "全部", "一度", "本当", "具体", "詳細", "最初", "最後",
-    "さっき", "先ほど", "いま", "現在",
-})
-
-
-def query_anchors(query_text: str) -> tuple[str, ...]:
-    """クエリの内容語 (語彙アンカー) を返す (純粋関数)。
-
-    埋め込みのスケールに依存しない **決定論の根拠**。属性辞書に無い話題
-    (「蕎麦」「苦手」「約束」) はコサインでしか拾えず、実測ではその
-    コサインが背景と重なって届かない (下記 :meth:`_is_relevant` の測定)。
-    """
-    if not query_text:
-        return ()
-    return tuple({
-        w for w in _QUERY_ANCHOR_RE.findall(query_text)
-        if w not in _ANCHOR_SCAFFOLD
-    })
-
-
-def _has_anchor(text: str, anchors: tuple[str, ...]) -> bool:
-    """``text`` に語彙アンカーのいずれかがそのまま出現するか。"""
-    return bool(anchors) and any(a in text for a in anchors)
+#: クエリの内容語 (語彙アンカー)。SSOT は :mod:`backend.free.core.query_anchors`
+#: (ツール判定ガードと共用、2026-09-09 D-09)。埋め込みのスケールに依存しない
+#: **決定論の根拠**。属性辞書に無い話題 (「蕎麦」「苦手」「約束」) はコサインで
+#: しか拾えず、実測ではそのコサインが背景と重なって届かない (下記
+#: :meth:`_is_relevant` の測定)。
+_QUERY_ANCHOR_RE = QUERY_ANCHOR_RE
+_ANCHOR_SCAFFOLD = ANCHOR_SCAFFOLD
+_has_anchor = has_anchor
 
 #: 近似重複判定は O(n^2)。注入候補がこの件数を超えたら判定ごと見送る
 #: (実運用の候補数は数十件で、超えるのは異常系)。
@@ -568,21 +551,64 @@ class MemoryInjector:
         相対フロア (top × 0.6) は採らない。RAG のそれは「このクエリで検索して
         取れた結果集合」の top を基準にするので意味を持つが、注入側の候補は
         **ストア全件**で、大半はクエリと無関係。無関係な集合の top に対する相対で
-        緩めると、ノイズの中の最上位を「関連あり」に格上げしてしまう。到達不能を
-        防ぐ役割は較正が果たし、較正が効かない構成では静的値のまま
-        (:meth:`inject` が全件却下をログに出すので、沈黙はしない)。
+        緩めると、ノイズの中の最上位を「関連あり」に格上げしてしまう。
+
+        **較正が効く前の静的値は埋め込みプロファイルに追随させる。** 較正は
+        ノートが ``MIN_NOTES`` (30) 溜まるまで走らず、その間は静的値が使われる。
+        静的値が別モデル前提 (0.35 は LFM2.5 の実測) だと、到達不能の逆
+        (**ノイズが全部通る**) が起きる — 実インシデント (2026-09-09 ライブ監査
+        (d) D-03): リセット直後の bge-m3 (無関係ペア 0.29〜0.47) で Python の
+        質問に自己紹介・訂正発話が 7 件注入され、応答が「ご指摘ありがとう
+        ございます…訂正します」から始まった。``rag.cartridge_gate.threshold``
+        と同じ規約で、config が ``null`` ならプロファイル
+        (``embedding.rag.injection_relevance_min_score``) → 既定 0.35 の順に
+        倒す。数値を書けばそれが優先 (manual と同じ)。pinned は config 明示値が
+        無ければ relevance × ``PINNED_RELEVANCE_RATIO`` (較正時と同じ導出)。
         """
-        static_relevance = float(
-            cfg.get("relevance_min_score", DEFAULT_RELEVANCE_MIN_SCORE),
-        )
-        static_pinned = float(
-            cfg.get(
-                "pinned_relevance_min_score",
-                DEFAULT_PINNED_RELEVANCE_MIN_SCORE,
-            ),
-        )
+        explicit_relevance = cfg.get("relevance_min_score")
+        explicit_pinned = cfg.get("pinned_relevance_min_score")
+
+        def _static() -> tuple[float, float]:
+            if explicit_relevance is not None:
+                relevance = float(explicit_relevance)
+                pinned = (
+                    float(explicit_pinned)
+                    if explicit_pinned is not None
+                    else DEFAULT_PINNED_RELEVANCE_MIN_SCORE
+                )
+                return relevance, pinned
+            from backend.free.rag.memory_threshold_calibration import (
+                profile_embedding_threshold,
+            )
+
+            from_profile = profile_embedding_threshold(
+                "rag", "injection_relevance_min_score",
+            )
+            if from_profile is None:
+                return (
+                    DEFAULT_RELEVANCE_MIN_SCORE,
+                    (
+                        float(explicit_pinned)
+                        if explicit_pinned is not None
+                        else DEFAULT_PINNED_RELEVANCE_MIN_SCORE
+                    ),
+                )
+            logger.info(
+                "MemoryInjector relevance gate resolved from embedding profile: "
+                "%.2f (pinned %.3f)",
+                from_profile, from_profile * PINNED_RELEVANCE_RATIO,
+            )
+            return (
+                from_profile,
+                (
+                    float(explicit_pinned)
+                    if explicit_pinned is not None
+                    else from_profile * PINNED_RELEVANCE_RATIO
+                ),
+            )
+
         if str(cfg.get("threshold_mode", "auto")) != "auto":
-            return static_relevance, static_pinned
+            return _static()
 
         from backend.free.rag.memory_threshold_calibration import (
             get_active_calibration,
@@ -590,7 +616,8 @@ class MemoryInjector:
 
         calibration = get_active_calibration()
         if not calibration:
-            return static_relevance, static_pinned
+            return _static()
+        static_relevance, _ = _static()
         relevance = float(
             calibration.get("relevance_threshold", static_relevance),
         )
