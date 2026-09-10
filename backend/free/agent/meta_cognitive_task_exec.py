@@ -120,6 +120,15 @@ def truncate_tool_result(text: str, max_chars: int = TOOL_RESULT_MAX_CHARS) -> s
     )
 
 
+def _fast_path_miss_context(tool_name: str | None, text: str) -> str:
+    """空振りしたツール結果を、回答ではなく文脈として渡すための 1 行。"""
+    return (
+        f"[ツール実行結果] {tool_name or 'tool'} は情報を返さなかった "
+        f"({(text or '').strip()[:120]})。この結果は回答ではない。会話の内容から"
+        "答え、依頼が「覚えておいて」等の保存指示なら受け取った内容を言い換えて確認する。"
+    )
+
+
 class _TaskExecutionMixin:
     """タスク 1 件の実行 — ツールループ / LLM 呼び出し / ツール実行。
 
@@ -152,7 +161,24 @@ class _TaskExecutionMixin:
                 on_step, prefix,
             )
             if fast_result is not None:
-                return fast_result
+                text, entries = fast_result
+                # 読み取り系ツールが **情報を得られなかった** (0 件 / エラー) 結果は
+                # 回答ではない。そのまま返すと「No results found for: …」が
+                # ユーザーへの返答になる (2026-09-10 ライブ監査 (g) G-03:
+                # 「ポンドの計算結果を覚えておいてください」に search_history の
+                # 空振り文字列を返した)。deliberative は空振りを注記にして LLM に
+                # 答えさせる。こちらも同じく、空振りを文脈に添えて通常経路へ落とす。
+                if entries and not any(e.get("success") for e in entries):
+                    logger.info(
+                        "Tool fast path yielded no information; falling back to "
+                        "the LLM with the result as context: %s", text[:80],
+                    )
+                    context_parts = [
+                        *context_parts,
+                        _fast_path_miss_context(entries[0].get("tool"), text),
+                    ]
+                else:
+                    return fast_result
 
         # ── 通常パス（ツールループ） ──
         return await self._run_tool_loop(

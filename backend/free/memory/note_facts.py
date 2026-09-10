@@ -140,7 +140,14 @@ def fact_from_note(
         note: 由来の STM ノート。``None`` でも作れるが、その場合 provenance は
             空に近くなり private も継承されない (由来不明の経路は
             :func:`privacy_of` の説明どおり ``False``)。
-        now: ``created_at`` / ``accessed_at`` / ``captured_at`` に使う epoch 秒。
+        now: ``accessed_at`` / ``captured_at`` に使う epoch 秒 (キュレーション
+            時刻)。``created_at`` は **ノートの発話時刻** (``note.created_at``、
+            無ければ ``now``) — 規則抽出 (``BaseExtractor.make_fact``) と同じ。
+            キュレーション時刻を入れると、古いノートを後から分割した値が
+            「最新」になり、その間に書かれた訂正を supersede する。実インシデント
+            (2026-09-09 ライブ監査 (d) D-05): 自己紹介「倉庫の在庫管理」を
+            Step 8.3 が訂正「配送ルートの計画」の 4 分後に分割し、訂正後の
+            occupation が訂正前の値に畳まれた。
         mode_origin: 省略時はノートの ``mode``、それも無ければ ``"chat"``。
         overrides: ``SemanticFact`` の任意フィールドを上書きする
             (``_extra`` / ``subject_aliases`` 等)。**``private`` を明示指定
@@ -177,6 +184,11 @@ def fact_from_note(
     trace_id = getattr(note, "trace_id", None)
     if trace_id:
         fact.trace_id = trace_id
+    # 世代の前後は発話時刻で決める (``_supersede_corrected_slots`` が
+    # ``created_at`` を発話順として読む)。
+    utterance_at = float(getattr(note, "created_at", 0.0) or 0.0)
+    if utterance_at > 0:
+        fact.created_at = utterance_at
     # **private はノートから継承する** — これが本モジュールの存在理由。
     fact.private = privacy_of(note)
     # 誰が述べたか (c_16 §3)。注入可否と競合の勝ち方がここで決まる。

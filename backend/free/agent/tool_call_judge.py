@@ -148,6 +148,10 @@ from backend.free.agent.tool_judge_commands import (
     command_lacks_date_arithmetic,
     date_intent_command_from_params,
     follow_up_excluded_weekdays_from_query,
+    month_business_days_from_query,
+    nth_weekday_of_month_from_query,
+    previous_answer_date,
+    query_has_anaphoric_start,
     follow_up_holidays_from_query,
     inherit_date_intent,
     parse_date_intent,
@@ -368,6 +372,8 @@ class ToolCallJudge:
         #: 条件だけを変える追い質問がこれを継ぐ (B-03)。ターン固有の値では
         #: なくセッション単位の記憶なので JudgeCall には載せない。上限付き。
         self._date_intent_memory: dict[str, DateIntentParams] = {}
+        #: 各セッションの演算パラメータを生んだユーザー発話 (正規化済み)。
+        self._date_intent_origin: dict[str, str] = {}
         self._mem_view = mem_view
         self._embedder = embedder
         self._profile_id = profile_id
@@ -597,13 +603,48 @@ class ToolCallJudge:
 
     _DATE_INTENT_MEMORY_LIMIT = 64
 
-    def _remember_date_intent(self, session_id: str, params: DateIntentParams) -> None:
-        """セッションの直前の日付演算パラメータを上書き保存する (上限付き)。"""
+    def _remember_date_intent(
+        self, session_id: str, params: DateIntentParams, *, query: str = "",
+    ) -> None:
+        """セッションの直前の日付演算パラメータを上書き保存する (上限付き)。
+
+        どの発話が生んだパラメータかも一緒に刻む。追い質問が継げるのは
+        **直前のユーザー発話が生んだ演算** だけ (:meth:`_previous_date_intent`)。
+        """
         memory = self._date_intent_memory
         memory.pop(session_id, None)
         memory[session_id] = params
+        self._date_intent_origin[session_id] = " ".join((query or "").split())
         while len(memory) > self._DATE_INTENT_MEMORY_LIMIT:
-            memory.pop(next(iter(memory)))
+            dropped = next(iter(memory))
+            memory.pop(dropped)
+            self._date_intent_origin.pop(dropped, None)
+
+    def _previous_date_intent(self, call: JudgeCall) -> DateIntentParams | None:
+        """追い質問が継ぐ直前の演算パラメータ。直前のユーザー発話が生んだものだけ。
+
+        セッション単位の 1 スロットは「最後に成功した演算」を持つので、その後の
+        発話が演算を生めなかった (抽出器 ``kind: none`` 等) と、**2 ターン前の
+        演算** が「直前」として継がれる。実インシデント (2026-09-10 ライブ監査
+        (f) F-02): 「11 月の営業日数は」(抽出失敗) の次の「毎週水曜日が定休日
+        だとすると、11 月の営業日数は」が、さらに前の「10/12 の 3 営業日前」に
+        水曜除外を足した演算を継ぎ、無関係な日付を根拠に暗算した。
+        """
+        session_id = call.session_id or ""
+        previous = self._date_intent_memory.get(session_id)
+        if previous is None:
+            return None
+        origin = self._date_intent_origin.get(session_id, "")
+        preceding = " ".join(
+            last_user_query(call.conversation, before=call.query or "").split(),
+        )
+        if origin and preceding and origin != preceding:
+            logger.debug(
+                "date intent memory skipped: it belongs to %r, not the preceding turn %r",
+                origin[:40], preceding[:40],
+            )
+            return None
+        return previous
 
     async def _upgrade_date_command_via_intent(
         self, result: ToolJudgement, call: JudgeCall,
@@ -663,12 +704,24 @@ class ToolCallJudge:
             # なりますか」自身には数字が無く、ここで落ちて暗算に残った
             # (2026-09-09 ライブ監査 H-06: 答えは偶然合ったが説明の曜日が
             # 誤り)。直前の「8 営業日前に着手する」が数量を持っている。
+            # 手掛かり語を持つ追い質問も、数量は直前から継ぐ:「毎週火曜日は
+            # 工場が休みで営業日に数えないとすると」は「営業日」を含むが
+            # 数量が無く、ここで落ちて暗算 (10/16、正 10/19) に残った
+            # (2026-09-09 ライブ監査 (e) E-03)。
             quantity_source = call.query or ""
-            if not query_has_date_math_cue(quantity_source):
+            if not _DATE_INTENT_QUANTITY_RE.search(quantity_source):
                 quantity_source += " " + last_user_query(
                     call.conversation, before=call.query or "",
                 )
-            if not _DATE_INTENT_QUANTITY_RE.search(quantity_source):
+            # 「来月の営業日数は」は数字を持たないが月そのものが数量 (F-01)。
+            if not _DATE_INTENT_QUANTITY_RE.search(quantity_source) and (
+                month_business_days_from_query(
+                    call.query or "", utc_now_dt().astimezone().date(),
+                ) is None
+                and nth_weekday_of_month_from_query(
+                    call.query or "", utc_now_dt().astimezone().date(),
+                ) is None
+            ):
                 return result
             tool_name = _executable_tool_for_mode(call.tools_registry, call.mode)
             if not tool_name:
@@ -712,29 +765,96 @@ class ToolCallJudge:
             # スキーマを強制しない build では非 JSON が返り得る (分類器と同じ救済)。
             payload = extract_json_object(content or "")
         params = parse_date_intent(payload)
+        previous = self._previous_date_intent(call)
+        # 「<月>の営業日数」は月が閉じた集合なのでコード側で組む (F-01)。抽出器が
+        # 何か返していても、期間が月で閉じているならこちらが正。直前の演算が
+        # 同じ期間なら、そこで確定していた祝日・曜日除外を継ぐ (「毎週水曜日が
+        # 定休日だとすると、11 月の営業日数は」は月の語を持つので新しい演算に
+        # 見えるが、条件を 1 つ足しただけ)。
+        today_local = utc_now_dt().astimezone().date()
+        # 「来月の第 2 月曜日」も月・序数・曜日で閉じた日付 (F-14)。
+        nth_weekday = nth_weekday_of_month_from_query(call.query or "", today_local)
+        if nth_weekday is not None and (params is None or params.kind != "weekday_of"):
+            logger.info(
+                "date intent resolved an nth weekday by code: %s", nth_weekday.start,
+            )
+            params = nth_weekday
+        month_count = month_business_days_from_query(call.query or "", today_local)
+        if month_count is not None:
+            holidays = set(month_count.holidays)
+            weekdays: set[int] = set()
+            if params is not None:
+                # 抽出器が拾った祝日 (「11/3 と 11/23 を除いて」) は併合する
+                holidays |= set(params.holidays)
+                weekdays |= set(params.excluded_weekdays)
+            if (
+                previous is not None
+                and previous.kind == "days_between"
+                and (previous.start, previous.end) == (month_count.start, month_count.end)
+            ):
+                holidays |= set(previous.holidays)
+                weekdays |= set(previous.excluded_weekdays)
+            month_count = replace(
+                month_count,
+                holidays=tuple(sorted(holidays)),
+                excluded_weekdays=tuple(sorted(weekdays)),
+            )
+            logger.info(
+                "date intent resolved a month range by code: %s..%s holidays=%d "
+                "excluded_weekdays=%s",
+                month_count.start, month_count.end, len(month_count.holidays),
+                list(month_count.excluded_weekdays),
+            )
+            params = month_count
+        # 「その日から N 営業日後」の起点は直前の回答の日付 (E-02)。抽出器が
+        # ``today`` を返しても、照応があるなら直前のアシスタント発話の日付で
+        # 差し替える (直前が日付を述べていなければそのまま)。
+        if params is not None and query_has_anaphoric_start(call.query or ""):
+            anchor_date = previous_answer_date(
+                call.conversation, before=call.query or "",
+            )
+            if anchor_date is not None and params.start != anchor_date:
+                logger.info(
+                    "date intent start resolved from the previous answer: %s "
+                    "(extractor said %s)", anchor_date.isoformat(),
+                    params.start.isoformat() if params.start else "today",
+                )
+                params = replace(params, start=anchor_date)
         # 条件だけを変える追い質問 (自分では手掛かり語を持たない) は、直前の
         # 演算パラメータを継いで除外条件だけ足す。抽出器に同じ会話を読み直させると
         # 起点の数え方が振れる (B-03、``inherit_date_intent`` の docstring)。
         # 同じ追い質問で抽出器が ``kind: none`` を返す回もある (2026-09-09 検証
         # V02/4) — 除外条件さえ入っていれば直前の演算に継ぐ。
-        previous = self._date_intent_memory.get(call.session_id or "")
-        follow_up = previous is not None and not query_has_date_math_cue(call.query or "")
+        # 追い質問 = 自分では新しい演算を持ち込まない発話。「手掛かり語と数量の
+        # 両方」を持つ発話だけが新しい演算で、片方しか無ければ条件替えの追い
+        # 質問として直前を継ぐ。手掛かり語の有無だけで見ていたため、「毎週
+        # 火曜日は…営業日に数えないとすると」(手掛かり語あり / 数量なし) が
+        # 追い質問と認められず、曜日除外も継承も掛からなかった (2026-09-09
+        # ライブ監査 (e) E-03)。
+        query_text = call.query or ""
+        fresh_computation = bool(
+            query_has_date_math_cue(query_text)
+            and _DATE_INTENT_QUANTITY_RE.search(query_text)
+        )
+        follow_up = previous is not None and not fresh_computation
         if follow_up and params is None:
             exclusions = parse_date_intent_exclusions(payload)
             if exclusions is not None and any(exclusions):
                 params = replace(
                     previous, holidays=exclusions[0], excluded_weekdays=exclusions[1],
                 )
-        if follow_up:
-            # 「その週の火曜日が休み」のように直前の結果に相対して置く休日は
-            # コード側で解決する (抽出器は日付に直せない — 実測 3/3 で空)。
-            derived = follow_up_holidays_from_query(
-                call.query or "",
-                resolve_date_intent_target(previous, utc_now_dt().astimezone().date()),
-            )
-            derived_weekdays = follow_up_excluded_weekdays_from_query(call.query or "")
-            if derived or derived_weekdays:
-                base = params if params is not None else previous
+        # 「その週の火曜日が休み」「毎週火曜日は休み」のように直前の結果に
+        # 相対して置く休日 / 閉じた集合の曜日除外はコード側で解決する (抽出器は
+        # 日付に直せない — 実測 3/3 で空)。追い質問でなくても発話にあれば併合する。
+        derived = follow_up_holidays_from_query(
+            query_text,
+            resolve_date_intent_target(previous, utc_now_dt().astimezone().date())
+            if previous is not None else None,
+        )
+        derived_weekdays = follow_up_excluded_weekdays_from_query(query_text)
+        if derived or derived_weekdays:
+            base = params if params is not None else previous
+            if base is not None:
                 params = replace(
                     base,
                     holidays=tuple(sorted(set(base.holidays) | set(derived))),
@@ -765,7 +885,9 @@ class ToolCallJudge:
             str(payload)[:200], upgraded[:120],
         )
         if call.session_id:
-            self._remember_date_intent(call.session_id, params)
+            self._remember_date_intent(
+                call.session_id, params, query=call.query or "",
+            )
         args = dict(result.tool_args or {})
         args["command"] = upgraded
         if result.tool_needed and not misrouted_to_calculate:

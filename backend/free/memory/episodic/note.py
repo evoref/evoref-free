@@ -50,6 +50,11 @@ attrs キー          消費者
 ``tool_command_source`` /
 ``tool_command_query``  ``sleep.executable_command_curator`` (Step 8.6)
 ``links`` / ``cluster_id``  ``notes.note_evolver.rebuild_links_and_clusters``
+``answered_by`` /
+``answers``         ``episodic.ingest`` が刻む問い ↔ 答えの隣接 (user ノート →
+                    直後の assistant ノート)。``pipeline.search_pipeline`` が
+                    問いだけのノートを当てたとき、捨てる代わりに答えを差し出す
+                    (2026-09-10 ライブ監査 (g) G-05)
 ``evolution_pending``   ``notes.note_evolver`` (Step 7 の対象選別)
 ``conflict_candidate`` /
 ``conflict_partner_id`` /
@@ -131,6 +136,8 @@ NOTE_ATTR_FIELDS: tuple[str, ...] = (
     "tool_command_query",
     "links",
     "cluster_id",
+    "answered_by",
+    "answers",
     "evolution_pending",
     "conflict_candidate",
     "conflict_partner_id",
@@ -171,6 +178,8 @@ _ATTR_DEFAULTS: dict[str, Any] = {
     "tool_command_query": None,
     "links": [],
     "cluster_id": None,
+    "answered_by": None,
+    "answers": None,
     "evolution_pending": True,
     "conflict_candidate": False,
     "conflict_partner_id": None,
@@ -254,6 +263,11 @@ class MemoryNote:
 
     links: list[str] = field(default_factory=list)
     cluster_id: str | None = None
+
+    answered_by: str | None = None
+    """user ノートに答えた直後の assistant ノート id (``episodic.ingest`` が刻む)。"""
+    answers: str | None = None
+    """assistant ノートが答えた直前の user ノート id。"""
 
     url_curated_at: float | None = None
     command_curated_at: float | None = None

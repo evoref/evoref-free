@@ -149,6 +149,13 @@ class FeedbackSignals:
     tool_routing_success: bool = False
     tool_routing_false_positive: bool = False
     tool_routing_false_negative: bool = False
+    #: 応答がツール実行結果 (calculate / run_command / search_history …) を
+    #: 根拠にしたか。ツール由来の値は **その問いの数値** であって文体の手本では
+    #: なく、手本に載ると同じ形の問いにツールを撃たず手本の値を復唱する。
+    #: ツール種別に依らず「プロンプトにツール実行結果が注入されていた」で
+    #: 判定する (2026-09-10 ライブ監査 (f) F-09: calculate 由来の「45 km」が
+    #: few-shot に採用された。tool_routing_* は run_command しか見ていない)。
+    tool_grounded: bool = False
     # 長文ルーティングシグナル (router._detect_long_form の学習用)
     # success: 長文分類が成功し generation 完了 → 該当キーワードを強化 + 学習
     # false_positive: long_form 分類されたが短文応答で十分だった → 該当キーワードを減衰

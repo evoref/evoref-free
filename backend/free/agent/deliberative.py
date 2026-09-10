@@ -29,10 +29,13 @@ from backend.free.agent.tools.builtin import (
     _check_path_traversal as check_builtin_path_traversal,
 )
 from backend.free.constants import READ_FILE_META_PREFIX
-from backend.free.core.date_math_cue import conversation_has_date_math_cue
+from backend.free.core.date_math_cue import (
+    conversation_has_date_math_cue,
+    last_user_query,
+)
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.issue_ledger import count_kind, format_issues
-from backend.free.agent.tool_ledger import format_ledger
+from backend.free.agent.tool_ledger import format_ledger, latest_use
 from backend.free.core.intent_vocab import (
     assistant_code_blocks,
     is_today_scope_query,
@@ -46,6 +49,7 @@ from backend.free.core.intent_vocab import (
     PREMISE_CONFIRMATION_RE,
     persist_request,
     resolve_session_position_message,
+    only_session_ordinal_recall,
     session_position_kind,
     tool_inventory_question,
     unused_tool_question,
@@ -1190,6 +1194,21 @@ _TOOL_INVENTORY_LIST_INSTRUCTIONS: dict[str, str] = {
 }
 
 #: ``_append_tool_ledger_fact`` の本文 (locale 別)。``{ledger}`` に実記録が入る。
+#: 直前の依頼に対する結論 (台帳の最新エントリが直前の依頼のとき)。
+_TOOL_LEDGER_LATEST_FACTS: dict[str, str] = {
+    "ja": (
+        "→ 結論: 直前の依頼「{query}」はツール {tool} を実行して答えた"
+        " ({outcome})。「ツールを使っていない」「暗算で答えた」は誤り。"
+    ),
+    "en": (
+        "→ Conclusion: the previous request “{query}” was answered by running "
+        "the tool {tool} ({outcome}). Saying no tool was used or that it was "
+        "computed mentally would be false."
+    ),
+}
+_TOOL_LEDGER_SUCCESS: dict[str, str] = {"ja": "成功", "en": "succeeded"}
+_TOOL_LEDGER_FAILURE: dict[str, str] = {"ja": "失敗", "en": "failed"}
+
 _TOOL_LEDGER_FACTS: dict[str, str] = {
     "ja": (
         "\n\n確定事実: この会話でシステムが実際に実行したツールは以下が"
@@ -1520,7 +1539,16 @@ class DeliberativeAgent:
         Returns:
             注記した位置種別 ("first" / "last")。対象外なら None。
         """
-        position = session_position_kind(query)
+        # 「この会話で」と言わなくても、先行ターンのあるセッションで会話内の
+        # 位置だけを指す想起は進行中の会話を指す (ツール判定のガードと同じ
+        # 根拠。F-11)。今回の発言自身は先行ターンに数えない。
+        prior_user_turns = sum(
+            1 for m in (conversation or [])
+            if str(m.get("role") or "") == "user"
+            and " ".join(str(m.get("content") or "").split()) != " ".join(query.split())
+        )
+        anchored = prior_user_turns >= 1 and only_session_ordinal_recall(query)
+        position = session_position_kind(query, anchored=anchored)
         if position is None:
             return None
         if position == "first" and evicted_turns > 0:
@@ -1905,6 +1933,7 @@ class DeliberativeAgent:
     @staticmethod
     def _append_tool_ledger_fact(
         messages: list[dict], query: str, session_id: str,
+        conversation: list[dict] | None = None,
     ) -> bool:
         """「実際に何を実行したか」に ``tool_ledger`` の実記録を根拠として渡す。
 
@@ -1922,6 +1951,21 @@ class DeliberativeAgent:
             return False
         ledger = format_ledger(session_id)
         if ledger:
+            # 「いまの計算でツールを使ったか」— 台帳の **最新の実行が直前の
+            # 依頼** なら、一覧を読ませるだけでなく結論を明示する。不在側には
+            # 既に結論 (「一覧に無い依頼は暗算」) があるが、存在側が無く、
+            # 27B が run_command_readonly の記録を目の前にして「ツールは使って
+            # いません」と答えた (2026-09-10 ライブ監査 (f) F-12)。
+            last = latest_use(session_id)
+            previous = " ".join(last_user_query(conversation, before=query).split())
+            head = " ".join((last.query_head if last else "").split())
+            if last and previous and head and previous.startswith(head.rstrip("…")):
+                ledger += "\n" + _localized(_TOOL_LEDGER_LATEST_FACTS).format(
+                    tool=last.tool_name, query=last.query_head,
+                    outcome=_localized(
+                        _TOOL_LEDGER_SUCCESS if last.success else _TOOL_LEDGER_FAILURE,
+                    ),
+                )
             # 「不在」からの推論を **明示的な結論として** 渡す。一覧を出す
             # だけでは、記録が無い = 実行していない = 暗算、という向きを
             # 取り違える。実インシデント (2026-08-29 ライブ監査 T27#7):
@@ -2179,7 +2223,7 @@ class DeliberativeAgent:
         ledger_pinned = False
         if unused_tool_question(query):
             ledger_pinned = self._append_tool_ledger_fact(
-                messages, query, session_id,
+                messages, query, session_id, conversation,
             )
 
         # 「どんなツールが使えるか」も決定論で答えが出る事実 (ToolsRegistry が
@@ -2207,7 +2251,7 @@ class DeliberativeAgent:
         # 「実際にツールを使ったか」も同じ — 答えは tool_ledger にあり、
         # 新たにツールを撃っても増えるのは記録だけで根拠にはならない。
         if ledger_pinned or self._append_tool_ledger_fact(
-            messages, query, session_id,
+            messages, query, session_id, conversation,
         ):
             if tool_judge_task is not None and not tool_judge_task.done():
                 tool_judge_task.cancel()

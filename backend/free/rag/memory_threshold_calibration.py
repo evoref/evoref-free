@@ -110,6 +110,47 @@ async def retry_pending_calibration() -> bool:
     return _ACTIVE_CALIBRATION is not None
 
 
+def profile_embedding_threshold(section: str, key: str) -> float | None:
+    """有効な埋め込みモデルプロファイルの ``embedding.<section>.<key>`` を読む。
+
+    ``models/profiles/<arch>.yaml`` (+ ``by-model/<stem>.yaml``) を
+    ``model_paths.embed_model`` から解決する (起動フラグ / モデル移行と同じ
+    ローダ)。config 未ロード / モデル未設定 / プロファイル不在 / 読取失敗 /
+    キー不在は ``None`` (呼出側が既定値へ倒す)。
+
+    コサインを絶対値で比べる閾値は埋め込みモデルごとに到達域が違う
+    (無関係ペアの cos 中央値: LFM2.5 0.105 / Qwen3 0.273 / bge-m3 0.459、
+    2026-08-30 実測)。較正が効く前 (ノートが ``MIN_NOTES`` 未満) や較正の
+    無い構成で **モデル非依存の静的値** を使うと、別モデル前提の値がそのまま
+    残る — 実インシデント (2026-09-09 ライブ監査 (d) D-03): リセット直後の
+    bge-m3 で注入ゲート 0.35 (LFM2.5 実測由来) がノイズ床 (0.29〜0.47) を
+    下回り、Python の質問に自己紹介・訂正発話が 7 件注入されて応答が
+    「ご指摘ありがとうございます…訂正します」から始まった。
+    """
+    try:
+        from backend.config import get_config, get_project_root
+        from scripts.launch_llama import load_model_profile_for
+
+        model_rel = (get_config().get("model_paths") or {}).get("embed_model")
+        if not model_rel:
+            return None
+        root = get_project_root()
+        model_path = Path(model_rel)
+        if not model_path.is_absolute():
+            model_path = root / model_path
+        profile = load_model_profile_for(model_path, root) or {}
+        value = (
+            ((profile.get("embedding") or {}).get(section) or {}).get(key)
+        )
+    except Exception as exc:
+        logger.debug(
+            "embedding profile threshold unavailable (%s.%s): %s",
+            section, key, exc,
+        )
+        return None
+    return float(value) if isinstance(value, (int, float)) else None
+
+
 def embedder_fingerprint(model_id: str, dim: int) -> str:
     """埋め込みモデル指紋。これが変わったらキャッシュを捨てる。"""
     return f"{model_id}::{int(dim)}"

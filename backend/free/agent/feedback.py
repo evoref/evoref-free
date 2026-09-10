@@ -1032,6 +1032,7 @@ class FeedbackCollector:
             tool_routing_success=tool_routing_success,
             tool_routing_false_positive=tool_routing_false_positive,
             tool_routing_false_negative=tool_routing_false_negative,
+            tool_grounded=bool(tool_result_text) or calculate_result is not None,
             long_form_success=long_form_success,
             long_form_false_positive=long_form_false_positive,
             long_form_false_negative=long_form_false_negative,

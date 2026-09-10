@@ -33,6 +33,7 @@ from backend.free.core.intent_vocab import is_plain_statement
 from backend.free.core.text_quality import (
     _asserts_before_request,
     _REQUEST_ENDING_RE,
+    attribute_belongs_to_another_person,
     strip_discourse_prefix,
     strip_first_person_topic,
     strip_interrogative_sentences,
@@ -918,9 +919,60 @@ def normalize_statement(
         kept = corrected
     else:
         kept = _STATEMENT_TAIL_RE.sub("", kept).strip()
+    # 7. 文頭の属性ラベル (「(私の)名前は」「趣味は」)。主題のトリガ語は属性を
+    #    指す標識で値ではない — 残すと ``mem.personal.name`` の値が
+    #    「私の名前は松本由紀（まつもと ゆき）」になり、値アンカー / 同値判定が
+    #    ラベル込みで走る (2026-09-09 ライブ監査 (e) E-06)。剥がすのは
+    #    **その属性のトリガ語が文頭で主題 (は / も) に立つ** ときだけ。
+    kept = _strip_leading_attribute_label(kept, attr_words)
+    kept = _strip_trailing_attribute_predicate(kept, attr_words)
     if len(kept) < _STATEMENT_MIN_CHARS or kept == text:
         return None
     return kept
+
+
+_ATTRIBUTE_LABEL_POSSESSIVE_RE = r"(?:私の|わたしの|僕の|ぼくの|自分の|うちの)?"
+
+
+#: 値の **後ろ** に立つ述語形のトリガ (「小林翔太と申します」「田中といいます」)。
+#: 主題形 (「名前は」) と対になる形で、値はトリガの前にある。
+_TRAILING_PREDICATE_TRIGGER_RE = re.compile(
+    r"(?:と申します|と申しま|といいます|と言います|といい|と言い|と申す|といいま)$"
+)
+
+
+def _strip_trailing_attribute_predicate(statement: str, attr_words: tuple[str, ...]) -> str:
+    """文末の述語形トリガ (「と申します」) を剥がす (純粋関数)。
+
+    そのスロットのトリガ語が文末に立っているときだけ。「はじめまして、
+    小林翔太と申します」→「小林翔太」(2026-09-10 ライブ監査 (f) F-08)。
+    """
+    for word in attr_words:
+        if not _TRAILING_PREDICATE_TRIGGER_RE.search(word):
+            continue
+        if statement.endswith(word):
+            rest = statement[: -len(word)].rstrip("、, ")
+            if rest:
+                return rest
+    return statement
+
+
+def _strip_leading_attribute_label(statement: str, attr_words: tuple[str, ...]) -> str:
+    """文頭の「(私の)<属性>は」を剥がす (純粋関数)。
+
+    トリガ語が主題形 (「名前は」) でも、裸の属性名 (「趣味」) に主題の助詞が
+    続く形 (「趣味は」) でも同じ扱い。文頭に無い / 主題でない出現は触らない。
+    """
+    for word in attr_words:
+        pattern = _ATTRIBUTE_LABEL_POSSESSIVE_RE + re.escape(word)
+        if not word.endswith(("は", "も")):
+            pattern += "(?:は|も)"
+        m = re.match(pattern, statement)
+        if m:
+            rest = statement[m.end():].strip("、, ")
+            if rest:
+                return rest
+    return statement
 
 
 #: コード断片らしさの指標 (EvorefMem は EvorefLoop の utils を import できない
@@ -1285,18 +1337,31 @@ def resolve_value_anchored_matches(
         #: **より長く一致した方** を採る — 短い値ほど偶然の混入になりやすい。
         best: dict[str, tuple[int, str, str]] = {}
         haystack = _normalize_trigger(content)
-        for (tag, attr), (values, anchors) in index.items():
-            if verified and spans:
-                length, anchor = _span_hit_length(values, anchors, spans[0])
-                if not length and len(spans) > 1:
-                    length, anchor = _span_hit_length(values, anchors, spans[1])
-            else:
+        if verified and spans:
+            # 誤りの span (wrong_claim) で当たるスロットが **どの tag にも**
+            # 無いときだけ、正しい値の span で当てる。tag ごとに落とすと、
+            # 訂正が hobby に当たっているのに personal_fact 側で正しい値
+            # 「トレイルランニング」が schedule の「毎朝ランニング」に当たり、
+            # 無関係なスロットへ訂正値が書かれた (2026-09-10 ライブ監査 (f)
+            # F-13)。宛先は誤りの側で決まり、正しい値は最後の手段。
+            for span in spans:
+                for (tag, attr), (values, anchors) in index.items():
+                    length, anchor = _span_hit_length(values, anchors, span)
+                    if not length:
+                        continue
+                    current = best.get(tag)
+                    if current is None or length > current[0]:
+                        best[tag] = (length, attr, anchor)
+                if best:
+                    break
+        else:
+            for (tag, attr), (values, anchors) in index.items():
                 length, anchor = _anchor_hit_length(anchors, haystack)
-            if not length:
-                continue
-            current = best.get(tag)
-            if current is None or length > current[0]:
-                best[tag] = (length, attr, anchor)
+                if not length:
+                    continue
+                current = best.get(tag)
+                if current is None or length > current[0]:
+                    best[tag] = (length, attr, anchor)
         for tag, (_length, attr, anchor) in best.items():
             resolved[(note.id, tag)] = (attr, anchor)
     return resolved
@@ -1638,6 +1703,13 @@ class ChatExtractor(BaseExtractor):
                             attr_words,
                         )
                         for attr, attr_words in matches
+                    ]
+                    # 本人以外が主語の節 (「妹が近所に住んでいます」の「住んで」)
+                    # は本人の属性ではない。単値スロットに書くと本人の値を
+                    # 後勝ちで supersede する (2026-09-10 ライブ監査 (f) F-07)。
+                    attr_specs = [
+                        spec for spec in attr_specs
+                        if not attribute_belongs_to_another_person(spec[1], spec[2])
                     ]
                 else:
                     # world_fact もユーザーが断定した知識に限る。トリガ語

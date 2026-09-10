@@ -30,7 +30,12 @@ from backend.free.agent.prompt_utils import (
     format_fewshot_section,  # noqa: F401  (re-export for tests)
 )
 from backend.free.core.session_mode import is_valid_session_mode, normalize_session_mode
-from backend.free.core.intent_vocab import is_plain_statement, own_process_question
+from backend.free.core.intent_vocab import (
+    NUMBER_LITERAL_RE,
+    is_plain_statement,
+    looks_like_numeric_question,
+    own_process_question,
+)
 from backend.free.learning.corrected_pairs import (
     CorrectedPair,
     refers_to_previous_turn,
@@ -368,6 +373,13 @@ def _find_volatile_reason(query: str, response: str) -> str | None:
     # 正誤に関わらず手本から外す。
     if query_has_date_math_cue(query) and _ABSOLUTE_DATETIME_RE.search(response):
         return "computational answer (date arithmetic must come from a tool, not an exemplar)"
+    # 数値計算の答えも同じ理由で手本にしない。計算はツール (calculate) が行う
+    # 前提で、手本に載ると **同じ形の問いにツールを撃たず手本の数値を復唱する**
+    # 経路になる (2026-09-09 ライブ監査 (d) D-08: 「積載量 4.5 トン / 18 kg で
+    # 何個」の tool_call 由来の 250 個が fitness 0.80 で採用された)。判定は
+    # ルータ / ツール判定と同じ ``looks_like_numeric_question`` (core が SSOT)。
+    if looks_like_numeric_question(query) and NUMBER_LITERAL_RE.search(response):
+        return "computational answer (arithmetic must come from a tool, not an exemplar)"
     if _LOCAL_ABS_PATH_RE.search(query) or _LOCAL_ABS_PATH_RE.search(response):
         return "environment-dependent answer (describes local filesystem state)"
     if (
@@ -1240,6 +1252,13 @@ class FewShotPool(JsonStateStore):
             # max_tokens で文の途中で切れた応答は手本にしない (途中で終わるのが
             # 正解、というバイアスになる)。
             if signals.get("truncated", False):
+                continue
+            # ツール実行結果を根拠にした応答は手本にしない。値はその問いの
+            # ものであって文体ではなく、手本に載ると同じ形の問いにツールを
+            # 撃たず手本の値を復唱する (2026-09-10 (f) F-09: calculate 由来の
+            # 「45 km」が採用されていた。日付演算だけを問いの語形で弾いていた
+            # ``_find_volatile_reason`` を、ツール種別に依らない印で一般化)。
+            if signals.get("tool_grounded", False):
                 continue
 
             query = exp.get("query", "").strip()

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from backend.app_state import AppState
+from backend.free.core.turn_text import TOOL_RESULT_HEADER
 from backend.free.core.text_quality import strip_system_notes
 from backend.free.api.chat._artifact import remember_artifact
 from backend.free.api.chat.chat_types import ChatMessage
@@ -650,10 +651,19 @@ def _tool_result_text_in_prompt(messages: list[ChatMessage]) -> str:
     ``_calculate_result_in_prompt`` と同じ理由でプロンプトから読み戻す。
     日付演算の ``target:`` と応答本文の日付を突き合わせる
     (``core.response_dates.ignores_date_result``、2026-09-09 監査 G-06)。
+
+    返すのは ``TOOL_RESULT_HEADER`` 以降の **ブロックだけ**。以前は user
+    メッセージ全文を返しており、``target:`` を探す消費者には害が無かったが、
+    F-09 が足した ``tool_grounded = bool(tool_result_text)`` が **全ターンで
+    真** になり、few-shot プールが 50 ターンで 0 件になった (2026-09-10
+    ライブ監査 (g) G-06)。「ツール結果がプロンプトに有ったか」は見出しの
+    有無で決める (見出しは ``turn_text.split_last_user`` と同じ境界)。
     """
     if not messages:
         return ""
-    return str(messages[-1].get("content") or "")
+    content = str(messages[-1].get("content") or "")
+    idx = content.find(TOOL_RESULT_HEADER)
+    return content[idx:] if idx >= 0 else ""
 
 
 def _calculate_result_in_prompt(messages: list[ChatMessage]) -> float | None:

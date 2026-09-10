@@ -121,33 +121,51 @@ class AuxCalibrationStore:
     ) -> None:
         """指定モデルの purpose 別 timeout 較正値を書き出す。
 
-        他モデルの entry は保持したまま当該モデルの entry のみ差し替える。親
+        他モデルの entry は保持したまま当該モデルの entry を更新する。親
         ディレクトリは自動作成。書き込みは ``atomic_write_text`` (tmp +
         ``os.replace``) で部分書き込みを防止する。``samples`` を渡すと p95 較正の
         母集団も併せて保存する (省略時は既存の samples を保持)。
+
+        **purpose 単位で既存 entry に併合する** (差し替えない)。``AuxClient`` は
+        プロセス内に複数居て (pillar 配線 / 記憶スケジューラ / 学習スケジューラ
+        / 候補評価 …) それぞれが自分の観測した purpose だけを手元に持つ。丸ごと
+        差し替えると **最後に保存した 1 つが他の purpose を消す** — 実データ
+        (2026-09-09 ライブ監査 (d) D-06): ``correction_verify`` を 30.0s へ
+        較正して保存 (4 purposes) した 22 秒後に、別インスタンスの
+        ``note_evolution`` 保存 (3 purposes) がそれを消した。
         """
         if not model_filename:
             return
         p = Path(path)
         data = AuxCalibrationStore.load_all(p)
         previous = data.get(model_filename)
-        if samples is None and isinstance(previous, dict):
-            samples = previous.get("samples") if isinstance(previous.get("samples"), dict) else None
+        merged_timeouts: dict[str, float] = {}
+        merged_samples: dict[str, list[float]] = {}
+        if isinstance(previous, dict):
+            merged_timeouts.update(
+                AuxCalibrationStore.load_timeouts(p, model_filename),
+            )
+            merged_samples.update(
+                AuxCalibrationStore.load_samples(p, model_filename),
+            )
+        merged_timeouts.update({str(k): float(v) for k, v in timeouts.items()})
+        if samples:
+            merged_samples.update({
+                str(k): [float(x) for x in v] for k, v in samples.items()
+            })
         data[model_filename] = {
-            "timeouts": {str(k): float(v) for k, v in timeouts.items()},
+            "timeouts": merged_timeouts,
             "calibrated_at": utc_now(),
             "source": "reactive",
         }
-        if samples:
-            data[model_filename]["samples"] = {
-                str(k): [float(x) for x in v] for k, v in samples.items()
-            }
+        if merged_samples:
+            data[model_filename]["samples"] = merged_samples
         atomic_write_text(
             p,
             json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         logger.info(
-            "Saved aux calibration for model=%s (%d purposes) to %s",
-            model_filename, len(timeouts), p,
+            "Saved aux calibration for model=%s (%d purposes, %d updated) to %s",
+            model_filename, len(merged_timeouts), len(timeouts), p,
         )

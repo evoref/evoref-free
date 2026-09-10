@@ -618,10 +618,35 @@ async def _persist_split(
 def _supersede_coarser_siblings(
     store: "SemanticFactStore", refined: list[tuple[Any, Any]],
 ) -> int:
-    """同じノート・同じスロットの **粗い object** を新しい方で畳む。"""
+    """同じノート・同じスロットの **粗い object** を新しい方で畳む。
+
+    粗い object が **既に別の値 (訂正など) に畳まれている** なら、狭め直した
+    値も同じ後継に畳む。狭め直しは同じ発話の言い直しであって、無効化された
+    値を live に戻す根拠ではない。実データ (2026-09-10 ライブ監査 (f) F-10):
+    「休日は登山に行くことが多いです」の粗い hobby が訂正「登山ではなく
+    トレイルランニング」に畳まれた後、Step 8.3 の分割が「登山」を書き、多値
+    スロットなので ``persist_facts`` の畳み込みにも掛からず live に戻った。
+    """
     folded = 0
     for old, new in refined:
-        if getattr(old, "superseded_by", None) or old.id == new.id:
+        if old.id == new.id:
+            continue
+        successor = getattr(old, "superseded_by", None)
+        if successor and successor != new.id:
+            try:
+                store.supersede(new.id, successor)
+                folded += 1
+                logger.info(
+                    "personal_fact_curator: refinement %s inherits the supersession "
+                    "of %s -> %s", new.id, old.id, successor,
+                )
+            except (KeyError, ValueError) as exc:
+                logger.warning(
+                    "personal_fact_curator: failed to supersede %s -> %s: %s",
+                    new.id, successor, exc,
+                )
+            continue
+        if successor:
             continue
         try:
             store.supersede(old.id, new.id)

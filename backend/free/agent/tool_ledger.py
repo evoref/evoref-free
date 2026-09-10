@@ -197,6 +197,14 @@ def _status_key(entry: ToolUse) -> str:
     return _REASON_KEYS.get(entry.reason, "agent.tool_ledger.failure")
 
 
+def latest_use(session_id: str) -> ToolUse | None:
+    """セッションで最後に記録したツール実行 (無ければ ``None``)。"""
+    entries = _ledger.get(session_id)
+    if not entries:
+        return None
+    return entries[-1]
+
+
 def format_ledger(session_id: str) -> str:
     """台帳を「確定事実」ブロック向けのテキストへ整形する。
 

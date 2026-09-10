@@ -58,6 +58,7 @@ from backend.free.core.intent_vocab import (
     looks_like_numeric_question,
     only_session_ordinal_recall,
 )
+from backend.free.core.query_anchors import has_anchor, query_anchors
 from backend.log_config import get_logger
 
 logger = get_logger("agent.tool_call_judge")
@@ -276,6 +277,23 @@ def _suppress_ordinal_recall_within_session(
     return ToolJudgement(tool_needed=False, source=result.source)
 
 
+def _prior_dialogue_text(ctx: GuardContext) -> str:
+    """今回の発言を除いた進行中の会話の本文 (純粋関数)。
+
+    ``conversation`` には送信済みの user メッセージ (今回の発言) が入っている。
+    そのまま数えるとクエリの語が「会話にある」ことになるので除く
+    (``deliberative._append_unverified_claim_note`` と同じ扱い)。
+    """
+    normalized_query = " ".join((ctx.query or "").split())
+    return "\n".join(
+        str(m.get("content") or "")
+        for m in (ctx.conversation or [])
+        if isinstance(m, dict)
+        and m.get("role") in ("user", "assistant")
+        and " ".join(str(m.get("content") or "").split()) != normalized_query
+    )
+
+
 def _suppress_unjustified_cross_session_search(
     result: ToolJudgement, ctx: GuardContext,
 ) -> ToolJudgement:
@@ -303,6 +321,16 @@ def _suppress_unjustified_cross_session_search(
     尋ねている」場合。2026-08-29 / 08-30 の捏造インシデント
     (「いつ、どんな話をしましたか。」→ 実在しない日時を断定) はどちらもこの
     条件に当たるので、履歴検索は従来どおり撃たれる。
+
+    もう 1 つ抑止しないのは、**進行中の会話の窓にクエリの内容語が 1 つも無い**
+    場合。抑止の根拠は「答えは窓の中にある」だが、窓 (今回の発言を除く先行
+    ターン) がクエリの話題を一切含まないならその根拠は成り立たず、答えは
+    別セッションにしか無い。実インシデント (2026-09-09 ライブ監査 (d) D-09):
+    新規セッション 2 ターン目 (先行は名前と職業の想起だけ) の「私が相談した
+    プログラミング言語と、読み込んだファイルの形式を教えてください。」が
+    ここで抑止され、「確認できません」に落ちた (前セッションの CSV の相談は
+    search_history でしか届かない)。内容語の切り出しは注入ゲートと同じ
+    :func:`backend.free.core.query_anchors.query_anchors`。
     """
     if result.tool_name != "search_history" or not result.tool_needed:
         return result
@@ -318,6 +346,14 @@ def _suppress_unjustified_cross_session_search(
         return result
     if excludes_current_conversation(ctx.query):
         # 「この会話とは別に」は探す先が外だと明示している。
+        return result
+    anchors = query_anchors(ctx.query)
+    if anchors and not has_anchor(_prior_dialogue_text(ctx), anchors):
+        logger.debug(
+            "search_history kept: none of the query's content words %s appear "
+            "in the ongoing session, so the answer can only be elsewhere: %s",
+            sorted(anchors), ctx.query[:60],
+        )
         return result
     logger.debug(
         "Suppressing search_history: nothing in the query points at another "
