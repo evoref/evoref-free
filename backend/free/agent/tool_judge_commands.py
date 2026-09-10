@@ -17,6 +17,11 @@ from backend.free.core.date_math_cue import (
     DATE_MATH_CUE_RE,
     query_has_date_math_cue,
 )
+from backend.free.core.relative_date import (
+    WEEK_OF_WEEKDAY_RE,
+    WEEK_OFFSETS,
+    WEEKDAY_INDEX,
+)
 from backend.free.agent.safety_patterns import reject_readonly_violation
 from backend.free.agent.tool_judge_grounding import _numeric_literals
 from backend.free.core.intent_vocab import (
@@ -288,24 +293,11 @@ _DAY_COUNT_ASK_RE = re.compile(
 #:
 #: 週の起点は月曜 (ISO / 日本の慣行)。``今週`` はその週、``来週`` は +7 日、
 #: ``再来週`` は +14 日、``先週`` は -7 日、``先々週`` は -14 日。
-_WEEK_OFFSETS: dict[str, int] = {
-    "今週": 0, "こんしゅう": 0,
-    "来週": 7, "らいしゅう": 7,
-    "再来週": 14, "さらいしゅう": 14,
-    "先週": -7, "せんしゅう": -7,
-    "先々週": -14, "せんせんしゅう": -14,
-}
-
-#: 曜日名 → ``datetime.weekday()`` の値 (月曜 = 0)。
-_WEEKDAY_INDEX: dict[str, int] = {
-    "月": 0, "火": 1, "水": 2, "木": 3, "金": 4, "土": 5, "日": 6,
-}
-
-_WEEK_OF_WEEKDAY_RE = re.compile(
-    r"(先々週|再来週|今週|来週|先週|こんしゅう|らいしゅう|さらいしゅう"
-    r"|せんせんしゅう|せんしゅう)"
-    r"\s*の?\s*([月火水木金土日])曜",
-)
+#: 表と正規表現は記憶側の相対日付解決と共有する (``core.relative_date``、
+#: 2026-09-10 (h) H-04)。片方だけ直ると解釈が食い違う。
+_WEEK_OFFSETS = WEEK_OFFSETS
+_WEEKDAY_INDEX = WEEKDAY_INDEX
+_WEEK_OF_WEEKDAY_RE = WEEK_OF_WEEKDAY_RE
 
 
 def _week_of_weekday_command(query: str) -> str:

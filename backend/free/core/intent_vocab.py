@@ -348,6 +348,8 @@ def has_long_range_recall_keyword(query: str) -> bool:
     return bool(_LONG_RANGE_RECALL_KEYWORD_RE.search(query or ""))
 
 
+
+
 #: 会話の中の位置を指す言い回し。発火 (履歴検索を **撃つ** 根拠) には使わず、
 #: 撃つと決まった検索を **絞る** 側だけで使うので、単独の「最初に」を含めても
 #: 誤爆の余地は無い (「最初に私が聞いた営業日数は」は ``最初に聞`` に当たらない
@@ -362,6 +364,16 @@ _SESSION_ORDINAL_CUE_RE = re.compile(
 _TRUE_LONG_RANGE_RECALL_KEYWORD_RE = _keyword_union(
     LONG_RANGE_RECALL_KEYWORDS - SESSION_ORDINAL_RECALL_KEYWORDS,
 )
+
+
+def has_past_session_keyword(query: str) -> bool:
+    """**別の (過去の) セッション** を指す語を含むか (純粋関数)。
+
+    :func:`has_long_range_recall_keyword` は会話内の位置語 (「最初に」) も
+    含む。「この会話の最初」は進行中の会話を指すので、過去セッションの根拠
+    としては数えない側が要る (self-session の窓内想起の抑止、H-06)。
+    """
+    return bool(_TRUE_LONG_RANGE_RECALL_KEYWORD_RE.search(query or ""))
 
 
 def only_session_ordinal_recall(query: str) -> bool:
@@ -944,6 +956,8 @@ _MEASURE_USER_AUTHORED_RE = re.compile(
 _MEASURE_EXTERNAL_TARGET_RE = re.compile(
     r"https?://|[A-Za-z]:\\|/\w+/|\.\w{1,5}(?:\s|$|は|を|の|が)",
 )
+#: 「何文字 **でしたか**」型 — 既に出力されたものの計量を尋ねる過去形。
+_MEASURE_PAST_FORM_RE = re.compile(r"でしたか|でしたっけ|だったか|だったっけ|だっけ|でした[？?。]?\s*$")
 _MEASURE_KIND_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
     (
         "chars",
@@ -1438,11 +1452,21 @@ def self_output_measure_kinds(query: str) -> tuple[str, ...]:
     """
     if not query:
         return ()
-    if not _SELF_OUTPUT_REFERENCE_RE.search(query) and not (
-        _SELF_OUTPUT_REFERENCE_LOOSE_RE.search(query)
+    referenced = bool(_SELF_OUTPUT_REFERENCE_RE.search(query)) or (
+        bool(_SELF_OUTPUT_REFERENCE_LOOSE_RE.search(query))
         and not _MEASURE_USER_AUTHORED_RE.search(query)
-    ):
-        return ()
+    )
+    # 照応語も生成物の呼び名も無い **過去形の計量の問い** (「要約は何文字
+    # でしたか。」) は、その発話に測れる本文が無い以上、直前の自分の出力
+    # しか対象になり得ない。呼び名 (回答 / 要約 / キャッチコピー …) を
+    # 列挙し続ける方式は語彙漏れが構造的に再発する (2026-08-22 の 2 件と
+    # 同型。2026-09-10 ライブ監査 (h) H-05: 実測 189 文字に「215文字です」)。
+    # 引用・本文を伴う問い、ユーザー自身の文章、外部対象は従来どおり除外。
+    if not referenced:
+        if not _MEASURE_PAST_FORM_RE.search(query):
+            return ()
+        if _MEASURE_PAYLOAD_SPAN_RE.search(query) or _MEASURE_USER_AUTHORED_RE.search(query):
+            return ()
     if _MEASURE_EXTERNAL_TARGET_RE.search(query):
         return ()
     return tuple(

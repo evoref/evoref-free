@@ -152,9 +152,11 @@ def _known_numbers(text: str) -> set[str]:
             rate = float(pct) / 100.0
         except ValueError:
             continue
-        # 「10%」からは 0.1 (率) と 1.1 (加算後の倍率) が導ける。式側の表記ゆれ
-        # (1.1 / 1.10) を吸収するため両方を登録する。
-        for value in (rate, 1.0 + rate):
+        # 「10%」からは 0.1 (率) と 1.1 (加算後の倍率) と 0.9 (割引後の倍率) が
+        # 導ける。「15% 引き」の式は ``× 0.85`` になるのが普通で、0.85 を
+        # 「対話に無い数値」と記録していた (2026-09-10 ライブ監査 (h) H-07)。
+        # 式側の表記ゆれ (1.1 / 1.10) を吸収するため両方を登録する。
+        for value in (rate, 1.0 + rate, 1.0 - rate):
             known.add(f"{value:g}")
             known.add(f"{value:.2f}")
     known.update(_duration_derived_numbers(text))

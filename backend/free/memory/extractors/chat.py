@@ -25,6 +25,7 @@ import hashlib
 import re
 from collections.abc import Iterable
 
+from backend.free.memory.sleep.correction_curator import verification_pending
 from backend.free.core.correction_verdict import (
     mask_quoted_speech,
     norm_span,
@@ -528,6 +529,49 @@ def _verified_correct_value(note: MemoryNote) -> str:
     if len(value) < _VALUE_ANCHOR_MIN_CHARS:
         return ""
     return value if norm_span(value) in norm_span(note.content or "") else ""
+
+
+def restate_with_correction(
+    live_values: tuple[str, ...] | None, wrong_claim: str, correct_value: str,
+) -> str:
+    """訂正後の **言明** を再構成する (純粋関数)。絞れなければ空文字列。
+
+    検証済み訂正の object を「正しい値」の逐語 span だけにすると (G-03 対処)、
+    スロットの現在値が「2021年」のような裸の値になり、述語 (「今の会社には
+    …から勤めています」) が失われる。注入では ``occupation: 2021年
+    (訂正後の記録)`` と読まれ、「入社年は?」の想起では語が当たらない
+    (2026-09-10 ライブ監査 (h) H-01)。
+
+    宛先スロットの現在値 (retire される側) に誤りの span が逐語で含まれる
+    なら、その span を正しい値へ置換した文を object にする —
+    「今の会社には2019年から勤めています」→「今の会社には2021年から勤めています」。
+    現在値そのものが誤りの値 (「横浜」) なら再構成しても正しい値と同じ
+    なので空を返し、呼出側は従来どおり正しい値を採る。
+    """
+    wrong = (wrong_claim or "").strip()
+    correct = (correct_value or "").strip()
+    if not wrong or not correct or not live_values:
+        return ""
+    needle = norm_span(wrong)
+    for value in live_values:
+        text = (value or "").strip()
+        if not text or norm_span(text) == needle:
+            continue
+        if wrong in text:
+            return text.replace(wrong, correct, 1)
+        # 空白 / 全角半角の違いで逐語一致しない場合は、正規化した位置で切る
+        normalized = norm_span(text)
+        pos = normalized.find(needle)
+        if pos < 0:
+            continue
+        # 正規化後の位置を原文へ写像 (空白を落として 1 文字ずつ対応させる)
+        raw_positions = [i for i, ch in enumerate(text) if not ch.isspace()]
+        if len(raw_positions) != len(normalized):
+            continue
+        start = raw_positions[pos]
+        end = raw_positions[pos + len(needle) - 1] + 1
+        return text[:start] + correct + text[end:]
+    return ""
 
 
 def _anchorless_evidence_text(
@@ -1518,6 +1562,14 @@ class ChatExtractor(BaseExtractor):
             if note.extracted_fact_ids:
                 result.already_extracted += 1
                 continue
+            if ctx.defer_unverified_corrections and verification_pending(
+                note, ctx.current_time(),
+            ):
+                # 訂正候補は検証済みイベントとしてのみ消費する (不変則 #12)。
+                # ここで通常の再言明として抽出すると ``extracted_fact_ids`` が
+                # 立ち、検証後に訂正として再抽出されない (H-12)。
+                result.notes_deferred += 1
+                continue
             result.notes_processed += 1
             content = note.content or ""
             is_assistant_note = getattr(note, "source", "user") != "user"
@@ -1684,6 +1736,23 @@ class ChatExtractor(BaseExtractor):
                     correct_value = (
                         _verified_correct_value(note) if len(matches) == 1 else ""
                     )
+                    if correct_value:
+                        # 裸の値でなく訂正後の言明を残す (H-01、
+                        # :func:`restate_with_correction`)。retire される現在値は
+                        # ストアの live 値に加えて **同じバッチで先に組んだ候補**
+                        # にもある (言明と訂正が同じ Full で抽出されるのが普通で、
+                        # ストアにはまだ無い)。新しい方 (バッチ) を先に見る。
+                        _attr = matches[0][0] or "user"
+                        _subject = make_mem_subject(kind, _attr)
+                        _sources = tuple(
+                            f.object for _n, f in reversed(candidates)
+                            if f.subject == _subject
+                        ) + tuple(ctx.live_attribute_values.get((tag, _attr)) or ())
+                        correct_value = restate_with_correction(
+                            _sources,
+                            str(getattr(note, "correction_wrong_claim", "") or ""),
+                            correct_value,
+                        ) or correct_value
                     # 属性語を持たないスロット (値アンカー / 継承) は
                     # ``_attribute_evidence_text`` が絞れないので、アンカーで
                     # 絞り直す。それでも絞れなければ従来どおり全文

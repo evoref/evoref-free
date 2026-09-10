@@ -37,6 +37,7 @@ from backend.free.agent.tool_call_judge import (
 from backend.free.api.chat.chat_recorder import (
     record_response,
     set_turn_evidence_ids,
+    set_turn_fewshot_ids,
 )
 from backend.free.api.chat.chat_types import ChatMessage
 from backend.free.api.chat.chat_service import (
@@ -80,6 +81,7 @@ from backend.free.core.sse import SSEFrameBuilder
 from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
 from backend.free.agent.prompt_manager import ensure_static_directives
+from backend.free.agent.prompt_utils import format_fewshot_section
 from backend.free.agent.reactive import ReactiveAgent
 from backend.free.agent.router import ComplexityClassifier
 from backend.free.agent.issue_ledger import issue_ledger_scope
@@ -273,15 +275,26 @@ def _append_fact_slate(state: AppState, session_id: str | None, system_prompt: s
 
 def _resolve_fewshot_block(
     state: AppState, mode: str, query: str | None, query_vec=None,
+    session_id: str | None = None,
 ) -> str:
     """query 依存の few-shot ブロックを取得 ("" = 無し / PromptManager 未設定)。
 
     ``query_vec`` を渡すと手本の選択が密ベクトル (記憶検索と同じ尺度) になる。
     渡さない経路 (meta_cognitive の scaffold 用) は従来の文字 bi-gram のまま。
+    ``session_id`` があれば選択した例の id を ``set_turn_fewshot_ids`` へ置き、
+    経験の ``gen_config.fewshot_ids`` (f_04 §3.2.2) の源にする。
     """
     prompt_mgr = state.prompt_manager
     if prompt_mgr is None:
         return ""
+    get_examples = getattr(prompt_mgr, "get_fewshot_examples", None)
+    if get_examples is not None and session_id:
+        try:
+            examples = get_examples(mode, query, query_vec)
+        except TypeError:
+            examples = get_examples(mode, query)
+        set_turn_fewshot_ids(session_id, [ex.id for ex in examples])
+        return format_fewshot_section(examples) if examples else ""
     get_block = getattr(prompt_mgr, "get_fewshot_block", None)
     if get_block is None:
         return ""
@@ -855,6 +868,7 @@ async def _build_messages_with_search(
     if search_result.query_vec is not None:
         fewshot_block = _resolve_fewshot_block(
             state, req.mode, req.message, search_result.query_vec,
+            session_id=session_id,
         )
 
     salience_ranker = None
@@ -1680,7 +1694,9 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             session_id, instance_name, context_size, max_tokens, StageTimer(),
         )
 
-    fewshot_block = _resolve_fewshot_block(state, req.mode, req.message)
+    fewshot_block = _resolve_fewshot_block(
+        state, req.mode, req.message, session_id=session_id,
+    )
 
     # classify は conflict 結果に依存しない (req.message のみ) ため先に確定し、
     # 並列モードでの投機タスク (tool 判定 / 検索) 起動のゲートに使う。

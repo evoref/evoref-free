@@ -32,6 +32,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 
+from backend.free.core.verifier_events import record_tool_use_event
+
 #: 1 セッションあたり保持するツール実行の件数。長い監査会話 (100 ターン超) でも
 #: 「この会話で何を実行したか」に答えられる程度に取る。
 MAX_ENTRIES_PER_SESSION = 80
@@ -135,6 +137,10 @@ def record_current(tool_name: str | None, success: bool, reason: str = "") -> No
     ``reason`` は失敗時のみ意味を持つ (``timeout`` / ``error`` /
     ``invalid_args``)。
     """
+    # 根拠台帳 (経験の ``signals.tool_uses``) へも同じ合流点から積む。こちらは
+    # request scope なので、セッション台帳の宛先が無くても記録される。
+    if tool_name:
+        record_tool_use_event(tool_name, success, reason)
     target = _current_target.get()
     if target is None:
         return

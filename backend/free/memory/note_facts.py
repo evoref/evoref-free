@@ -41,7 +41,10 @@ SemMem の書込経路のうち **キュレーター系 (Step 8.4 / 8.5 / 8.6) �
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
+
+from backend.free.core.relative_date import annotate_relative_dates
 
 from backend.free.memory.types import (
     FactType,
@@ -160,6 +163,13 @@ def fact_from_note(
     resolved_mode: MemoryMode = (
         mode_origin or getattr(note, "mode", None) or "chat"
     )
+    # 相対日付 (「来週の月曜日」) は発話時刻で絶対日付を併記する
+    # (core.relative_date、H-04)。規則抽出 (BaseExtractor.make_fact) と同じ。
+    utterance_at = float(getattr(note, "created_at", 0.0) or 0.0)
+    if utterance_at > 0:
+        object_ = annotate_relative_dates(
+            object_, datetime.fromtimestamp(utterance_at, tz=timezone.utc).astimezone(),
+        )
     fact = make_fact(
         subject=subject,
         predicate=predicate,
@@ -186,7 +196,6 @@ def fact_from_note(
         fact.trace_id = trace_id
     # 世代の前後は発話時刻で決める (``_supersede_corrected_slots`` が
     # ``created_at`` を発話順として読む)。
-    utterance_at = float(getattr(note, "created_at", 0.0) or 0.0)
     if utterance_at > 0:
         fact.created_at = utterance_at
     # **private はノートから継承する** — これが本モジュールの存在理由。

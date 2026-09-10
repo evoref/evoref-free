@@ -1689,6 +1689,32 @@ class LearningScheduler:
                         type(exc).__name__, exc, exc_info=True,
                     )
 
+                if skipped_phases:
+                    # ユーザー入力で後半フェーズが協調停止した。以前はここで
+                    # 「完了」として session を archive し優先要求も消費して
+                    # いたため、Step 12 / 14 が飛んだまま次の idle トリガまで
+                    # 誰も再実行しなかった (2026-09-10 ライブ監査 (h) H-08:
+                    # 手動 Level 1 が会話と重なり 6 フェーズ skip で「完了」)。
+                    # phase 1 の yield と同じく **session を残して再開に回す** —
+                    # 完了済みモードは resume で飛ばされ、残りだけ走る。
+                    session.yield_count += 1
+                    self.save_active_session(session)
+                    logger.info(
+                        "Level 1 session yielded in extra phases: id=%s "
+                        "skipped=%s yield_count=%d",
+                        session.session_id, skipped_phases, session.yield_count,
+                    )
+                    success = True
+                    discarded = self._discard_if_yield_cap_hit(session)
+                    return {
+                        "session_id": session.session_id,
+                        "yielded": True,
+                        "discarded": discarded,
+                        "completed_phases": list(session.completed_phases),
+                        "modes": self._format_modes_summary(results),
+                        "skipped_phases": skipped_phases,
+                    }
+
                 self._finalize_completed_level1(
                     session, results,
                     extra_results=extra_results,
@@ -2514,7 +2540,11 @@ class LearningScheduler:
         if self._cancelled or self._fewshot_pool is None:
             return
         tp = time.monotonic()
+        # 使用実績の集計と stale / archived の遷移 (f_04 §3.2.2)。経験の
+        # ``gen_config.fewshot_ids`` から導くので live バッファを読む。
+        curate_summary = self._fewshot_pool.curate(self._get_filtered_experiences())
         gc_summary = self._fewshot_pool.garbage_collect()
+        gc_summary["curate"] = curate_summary
         # SemMem 書き戻しモードでは fewshot_pool.json への保存は廃止 (D-3)
         if not self._fewshot_pool.is_semmem_writeback_active():
             try:

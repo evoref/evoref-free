@@ -60,6 +60,7 @@
 					<a href="/loop" class="nav-item" class:active={isActive('/loop')}>{$t('sidebar.loop')}</a>
 				{/if}
 				<a href="/dashboard" class="nav-item" class:active={isActive('/dashboard')}>{$t('sidebar.dashboard')}</a>
+				<a href="/learning" class="nav-item" class:active={isActive('/learning')}>{$t('sidebar.fewshot')}</a>
 				{#if isPro}
 					<a href="/terminal" class="nav-item" class:active={isActive('/terminal')}>{$t('sidebar.terminal')}</a>
 				{/if}

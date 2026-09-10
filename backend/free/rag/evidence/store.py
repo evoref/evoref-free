@@ -77,6 +77,7 @@ from backend.free.rag.evidence.lexical_index import (
     LexicalShardSet,
 )
 from backend.free.rag.evidence.manifest import EvidenceManifest
+from backend.free.rag.evidence.tokenize import TOKENIZER_VERSION
 from backend.free.rag.evidence.ranking import (
     RankColumns,
     collapse,
@@ -1777,6 +1778,9 @@ class EvidenceStore:
             "q_terms": int(self._lexical_setting("q_terms")),
             "m_postings": int(self._lexical_setting("m_postings")),
             "max_df_ratio": float(self._lexical_setting("max_df_ratio")),
+            # トークナイザの切り方が変わった索引は再構築まで旧い語彙のまま
+            # (新しい unigram は乗らない)。偽陽性は出ないが、黙らせない。
+            "tokenizer_version": TOKENIZER_VERSION,
         }
         drift = {
             key: (getattr(stored, key), value)

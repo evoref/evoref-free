@@ -21,3 +21,4 @@ export * from './history';
 export * from './lora';
 export * from './model';
 export * from './develop';
+export * from './fewshot';

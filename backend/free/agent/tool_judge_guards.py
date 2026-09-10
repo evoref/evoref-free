@@ -55,6 +55,7 @@ from backend.free.core.date_math_cue import conversation_has_date_math_cue
 from backend.free.core.intent_vocab import (
     excludes_current_conversation,
     has_long_range_recall_keyword,
+    has_past_session_keyword,
     looks_like_numeric_question,
     only_session_ordinal_recall,
 )
@@ -273,6 +274,49 @@ def _suppress_ordinal_recall_within_session(
         "Suppressing search_history: ordinal recall refers to the ongoing "
         "session (%d prior user turns), which is excluded from the search: %s",
         prior_user_turns, ctx.query[:50],
+    )
+    return ToolJudgement(tool_needed=False, source=result.source)
+
+
+def _suppress_self_session_recall_in_window(
+    result: ToolJudgement, ctx: GuardContext,
+) -> ToolJudgement:
+    """「この会話で…」の想起で、答えが **既に窓の中にある** ときは検索しない。
+
+    自己参照 (「この会話で最初に言った好きな色は」) は
+    ``_maybe_scope_session_search`` が現在セッションに絞った検索にする。
+    索引は同じセッションの保存済みターンなので当たりはするが、**窓に本文が
+    ある限り検索は何も足さない** (毎回 15〜30 秒の往復と、要約経由の別の
+    言い回しを注入するだけ)。実測 (2026-09-10 ライブ監査 (h) H-06): 5 ターンの
+    会話で 2 回、答えが直前 2 ターンにあるのに search_history が走った。
+
+    根拠は「答えは窓の中にある」なので、クエリの内容語が **すべて** 先行ターン
+    (今回の発言を除く) に現れるときだけ抑止する。1 つでも欠ければ窓から
+    押し出された可能性があり、検索に委ねる (2026-08-23 の「窓の中」前提の
+    失敗と同じ罠を避ける)。過去セッションを指す語や日付スコープがあれば
+    従来どおり撃つ。
+    """
+    if result.tool_name != "search_history" or not result.tool_needed:
+        return result
+    if not (result.tool_args or {}).get("session_id"):
+        return result
+    if has_past_session_keyword(ctx.query) or day_scope_recall(ctx.query) is not None:
+        return result
+    # 検索に渡る語そのもの (``_reduce_ordered_history_query`` の縮約結果) で
+    # 見る — 索引が当てるのはこの語なので、窓に全部あるなら索引も同じ本文を
+    # 返すだけ。内容語アンカー (``query_anchors``) は 1 文字の語 (「色」) を
+    # 落とすため、想起の問いでは空になりやすい。
+    terms = [
+        t for t in str((result.tool_args or {}).get("query") or "").split() if t
+    ]
+    if not terms:
+        return result
+    window = _prior_dialogue_text(ctx)
+    if not window or not all(t in window for t in terms):
+        return result
+    logger.debug(
+        "Suppressing search_history: self-session recall whose search terms %s "
+        "are all in the ongoing window: %s", terms, ctx.query[:60],
     )
     return ToolJudgement(tool_needed=False, source=result.source)
 
@@ -953,6 +997,9 @@ GUARD_PIPELINE: tuple[GuardSpec, ...] = (
     ),
     GuardSpec(
         "ordinal_recall_excluded_session", _suppress_ordinal_recall_within_session,
+    ),
+    GuardSpec(
+        "self_session_recall_in_window", _suppress_self_session_recall_in_window,
     ),
     GuardSpec(
         "computable_recall_excluded_session",

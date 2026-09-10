@@ -49,6 +49,10 @@ from backend.free.core.text_quality import (
 )
 from backend.free.llm.json_schemas import AssertionNaming
 from backend.free.memory.corrections import correction_target
+from backend.free.memory.extractors.base import (
+    note_is_verified_correction,
+    note_verification_rejected,
+)
 from backend.free.memory.note_facts import fact_from_note
 from backend.free.memory.sleep._curator_common import public_notes
 from backend.free.memory.sleep.curation_backoff import (
@@ -369,6 +373,33 @@ async def curate_assertion_facts(
             )
             break
         content = (note.content or "").strip()
+        # 訂正候補は **検証済みイベントとしてのみ消費する** (CLAUDE.md §6 #12)。
+        # 未検証のまま命名すると「正しい年は2018年ではなく2020年です」が
+        # ``mem.world.assertion.year_correction`` になり、宛先 (employer の
+        # 現在値) を畳めず誤りの値まで世界の事実として残る (2026-09-10 (h)
+        # H-10、Step 8.0 の aux がチャットに横取りされた直後の Full で実測)。
+        # 未検証はマークせず次サイクルへ持ち越し、検証で訂正でないと判った
+        # ものは通常の言明として進む。検証済みでも宛先が言明でない (属性
+        # スロットの訂正) ものは Step 8 の値アンカーが受け持つのでここでは
+        # 書かない。
+        if getattr(note, "is_correction", False) or _has_correction_form(content):
+            if not note_is_verified_correction(note):
+                if not note_verification_rejected(note):
+                    logger.debug(
+                        "assertion_curator: correction candidate %s awaits "
+                        "verification (Step 8.0); carried over", note.id,
+                    )
+                    continue
+            elif _correction_targets_attribute(store, note):
+                # 誤りの span がユーザー属性の live 値に当たる訂正は Step 8 の
+                # 値アンカーが employer / location 等のスロットへ書く。ここで
+                # 世界の事実として二重に持たない。
+                note.assertion_curated_at = now_fn()
+                logger.debug(
+                    "assertion_curator: verified correction %s targets a user "
+                    "attribute; left to the attribute path", note.id,
+                )
+                continue
         # 命名には言明の文だけを渡す。「忘れないでください」等の依頼節が
         # 混ざると補助タスクが is_assertion=false に倒れる。
         body = assertive_body(content) or content
@@ -454,6 +485,33 @@ async def curate_assertion_facts(
                 "assertion_curator: persist failed for slug=%s: %s", slug, exc,
             )
     return written
+
+
+def _correction_targets_attribute(store: "SemanticFactStore", note: object) -> bool:
+    """検証済み訂正の ``wrong_claim`` がユーザー属性 (``mem.personal.*`` /
+    ``mem.preference.*``) の live 値に逐語で含まれるか。"""
+    from backend.free.core.correction_verdict import norm_span
+
+    wrong = norm_span(str(getattr(note, "correction_wrong_claim", "") or ""))
+    if not wrong:
+        return False
+    search = getattr(store, "search_by_pillar_prefix", None)
+    if search is None:
+        return False
+    for prefix in ("mem.personal.", "mem.preference."):
+        try:
+            facts = search(prefix, include_superseded=False)
+        except Exception:  # ストアの状態に依存しない (取れなければ無い扱い)
+            continue
+        if any(wrong in norm_span(getattr(f, "object", "") or "") for f in facts):
+            return True
+    return False
+
+
+def _has_correction_form(text: str) -> bool:
+    from backend.free.memory.extractors.chat import has_correction_form
+
+    return has_correction_form(text)
 
 
 def _same_claim_is_live(store: "SemanticFactStore", subject: str, obj: str) -> bool:
