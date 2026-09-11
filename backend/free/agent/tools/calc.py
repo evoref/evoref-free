@@ -50,6 +50,11 @@ _SAFE_NAMES: dict[str, object] = {
     "factorial": math.factorial, "gcd": math.gcd, "hypot": math.hypot,
     "degrees": math.degrees, "radians": math.radians,
     "pi": math.pi, "e": math.e, "tau": math.tau,
+    # 整数の基数変換は決定論で閉じる。無いと「2 の 20 乗を 16 進数で」が
+    # ``hex(2**20)`` → Unsafe expression (unknown name: hex) で失敗し、暗算
+    # フォールバックに落ちる (2026-09-10 ライブ監査 (i) I-07)。``int`` は
+    # ``int("ff", 16)`` の逆変換用 (文字列リテラルは Constant として許可済み)。
+    "hex": hex, "bin": bin, "oct": oct, "int": int,
 }
 
 # 非許可ノードごとの自己修正ヒント。LLM が同一ターン内でエラーを見て

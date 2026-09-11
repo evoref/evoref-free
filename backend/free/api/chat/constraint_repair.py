@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 
 from backend.free.core.stream_filter import strip_thinking_blocks
 from backend.free.core.text_quality import (
+    is_cut_off_answer,
     has_verifiable_output_constraint,
     length_disclosure_note,
     match_length_directive,
@@ -244,7 +245,25 @@ async def verify_and_repair_sync(
     発火するのは ``needs_verification(query)`` が真のターンだけなので、
     通常の会話にコストは乗らない。
     """
-    if not response.strip() or not needs_verification(query):
+    if not response.strip():
+        return response
+    # 語の途中で切れた断片 (「はい、あり」) は検証の対象ではなく **生成の失敗**。
+    # 同じプロンプトを greedy で 1 回だけ生成し直す (2026-09-11 (j) J-07)。
+    if is_cut_off_answer(response) and client is not None and hasattr(client, "generate"):
+        logger.info("Cut-off answer detected (%r); regenerating once", response)
+        try:
+            result = await client.generate(
+                list(messages), stream=False, temperature=0.0,
+                id_slot=getattr(client, "chat_slot", None),
+                max_tokens=max(max_tokens or 0, REPAIR_MIN_MAX_TOKENS),
+            )
+            regenerated = _extract_text(result)
+        except Exception as e:  # noqa: BLE001 - 再生成に失敗したら元を返す
+            logger.warning("Cut-off regeneration failed (keeping original): %s", e)
+            regenerated = ""
+        if regenerated and not is_cut_off_answer(regenerated):
+            response = regenerated
+    if not needs_verification(query):
         return response
     final_text, unresolved = await repair_if_violated(
         query=query,

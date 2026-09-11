@@ -1157,6 +1157,73 @@ def apply_grounding_notes(
     _append_self_output_measurement(messages, history)
     _append_quantity_grounding(messages, history)
     _append_conversation_measurement(messages, history, session_id)
+    _append_relative_date_grounding(messages, history)
+
+
+_RELATIVE_DATE_GUIDANCE: dict[str, str] = {
+    "ja": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " 今日は {today} で、"
+        "この発言の相対日付は次の日付を指す: {values}。"
+        "日付を述べるときはこの値をそのまま使い、自分で数え直さないこと。"
+    ),
+    "en": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " Today is {today}; the relative "
+        "dates in this message resolve to: {values}. Use these dates as they "
+        "are; do not recount them yourself."
+    ),
+}
+_WEEKDAY_LABELS: dict[str, tuple[str, ...]] = {
+    "ja": ("月", "火", "水", "木", "金", "土", "日"),
+    "en": ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"),
+}
+
+
+def _append_relative_date_grounding(
+    messages: list[ChatMessage], history: list[ChatMessage],
+) -> None:
+    """発話中の相対日付 (「再来週の月曜日」) の解決値を確定事実として渡す (in-place)。
+
+    問い (「来週の月曜日は何月何日」) は日付ツールで接地されるが、**平叙文**
+    (「送付は来週の木曜日ではなく、再来週の月曜日にします」) はツール判定が
+    「依頼ではない」と見て素通りし、確認の言い換えに入る絶対日付はモデルの
+    暗算になる。実インシデント (2026-09-10 ライブ監査 (i) I-12): 木曜日に
+    「再来週の月曜日」を 9/28 と言い換え (正 9/21)、以後の「変更後の送付日は」
+    「前日は」がその誤値を継ぎ、episodic 経由で別セッションにも残った。
+    記憶側 (``memory.extractors`` / ``note_facts``) は同じ ``core.relative_date``
+    で 9/21 を併記しており、二重実装ではなく **チャット側だけ接地が無かった**。
+    解決の SSOT は ``core.relative_date`` (週の起点は月曜)。「今日」単独は
+    注記しない (``DAY_OFFSETS`` の 0 は落とす)。
+    """
+    query = ""
+    for msg in reversed(history):
+        if msg.get("role") == "user":
+            query = str(msg.get("content") or "")
+            break
+    if not query:
+        return
+    from backend.free.core.relative_date import resolve_relative_dates
+    from backend.utils import utc_now_dt
+
+    today = utc_now_dt().astimezone().date()
+    labels = _WEEKDAY_LABELS.get(_prompt_locale(), _WEEKDAY_LABELS["ja"])
+    seen: set[str] = set()
+    parts: list[str] = []
+    for span, resolved in resolve_relative_dates(query, today):
+        if span in seen or resolved == today:
+            continue
+        seen.add(span)
+        parts.append(f"「{span}」= {resolved.isoformat()} ({labels[resolved.weekday()]})")
+    if not parts:
+        return
+    if append_to_last_user(
+        messages,
+        _localized(_RELATIVE_DATE_GUIDANCE).format(
+            today=f"{today.isoformat()} ({labels[today.weekday()]})",
+            values="、".join(parts) if _prompt_locale() == "ja" else "; ".join(parts),
+        ),
+        separator="",
+    ):
+        logger.debug("Relative date grounding injected: %s", parts)
 
 
 # 会話の前半がワーキングメモリから押し出された状態で、会話全体を走査しないと

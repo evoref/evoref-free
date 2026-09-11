@@ -40,6 +40,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from backend.free.core.correction_verdict import (
+    answer_disputes_value,
     build_correction_verify_prompt,
     check_verdict,
     claims_equivalent,
@@ -283,6 +284,23 @@ async def verify_pending_corrections(
             parsed, candidate=candidate, prev_response=prev_response,
             prev_user=prev_query,
         )
+        # 訂正への回答 (このエントリ自身の応答) が値を退けていれば昇格させない
+        # (:func:`answer_disputes_value`、2026-09-11 (j) J-04: 「302 は恒久的な
+        # 移転」という誤った訂正がアシスタントに退けられたのに assistant と
+        # 判定され、訂正ペアの素材になりかけた)。
+        if check.ok and answer_disputes_value(
+            entry.response_full or entry.response_summary or "", check.correct_value,
+        ):
+            logger.info(
+                "Correction verdict disputed by the reply (entry=%s, value=%r)",
+                entry.id, check.correct_value[:40],
+            )
+            _apply_verdict(
+                entry, "disputed",
+                wrong_claim=check.wrong_claim, correct_value=check.correct_value,
+            )
+            out["rejected"] += 1
+            continue
         if check.ok and check.target == _PROMOTED_TARGET:
             _apply_verdict(
                 entry, _PROMOTED_TARGET,

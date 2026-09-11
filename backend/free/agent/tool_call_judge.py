@@ -21,6 +21,7 @@ from backend.free.agent.router import (
     is_environment_fact_query,
 )
 from backend.free.core.intent_vocab import (
+    refers_to_ongoing_session,
     asks_to_restate_prior_report,
     ANAPHORIC_OPERAND_RE,
     NUMBER_LITERAL_RE,
@@ -533,6 +534,7 @@ class ToolCallJudge:
         *,
         allow_classifier: bool = True,
         allow_date_intent: bool | None = None,
+        window_complete: bool | None = None,
     ) -> ToolJudgement:
         """ツール呼び出しの要否を判定し、**ターン固有の値を結果に載せて** 返す。
 
@@ -559,6 +561,9 @@ class ToolCallJudge:
                 外したい一方で、1 手目が日付演算を接地できなかったときだけこの層
                 だけを許したい経路のために分けてある
                 (``deliberative._maybe_follow_up_tool``)。
+            window_complete: 進行中セッションの全ターンが ``conversation`` に
+                載っているか (``WorkingMemory.session_evicted_turns == 0``)。
+                同セッション限定の search_history を語に依らず抑止する根拠。
         """
         call = JudgeCall(
             tools_registry=tools_registry,
@@ -566,6 +571,7 @@ class ToolCallJudge:
             query=query,
             conversation=conversation,
             session_id=session_id,
+            window_complete=window_complete,
         )
         result = await self._judge_layers(
             call,
@@ -670,6 +676,16 @@ class ToolCallJudge:
         """
         if not self.enabled:
             return result
+        # 既に述べた日付の **再掲** (「先ほどの 10 営業日後の日付をもう一度」) は
+        # 演算し直さない。抽出器に読み直させると起点が振れ (前セッションの結果が
+        # 注入されていた 2026-09-11 (j) J-06 では前日の起点で 9/24 と再計算)、
+        # 「さっきと違う」一貫性の破れになる。値は会話にあるので no_tool。
+        if asks_to_restate_prior_report(call.query or ""):
+            logger.info(
+                "date intent skipped: the query asks to restate a prior report: %s",
+                (call.query or "")[:60],
+            )
+            return ToolJudgement(tool_needed=False, source=result.source)
         # 手掛かり語は直前のユーザー発話からも継ぐ (条件だけを変える追い質問)。
         if not conversation_has_date_math_cue(call.query, call.conversation):
             return result
@@ -734,12 +750,12 @@ class ToolCallJudge:
             return result
         today = utc_now_dt().date().isoformat()
         messages = [
-            {
-                "role": "system",
-                "content": select_locale_variant(
-                    DATE_INTENT_SYSTEM, DATE_INTENT_SYSTEM_EN,
-                ),
-            },
+            # 分類器スロットの共通 system + 日付抽出の指示 (user)
+            # (:meth:`_slot_shared_messages`)。
+            *self._slot_shared_messages(
+                call.tools_registry, call.mode,
+                select_locale_variant(DATE_INTENT_SYSTEM, DATE_INTENT_SYSTEM_EN),
+            ),
             *_date_intent_context_messages(call.conversation),
             {"role": "user", "content": f"[today: {today}]\n{call.query}"},
         ]
@@ -832,9 +848,17 @@ class ToolCallJudge:
         # 追い質問と認められず、曜日除外も継承も掛からなかった (2026-09-09
         # ライブ監査 (e) E-03)。
         query_text = call.query or ""
+        # 月の範囲 / 第 N 曜日はコードで閉じた **新しい演算** (月そのものが数量、
+        # F-01)。数量の正規表現だけで見ると「今月の残りの営業日は何日」が
+        # 追い質問扱いになり、直前の「来月の第 2 月曜日」を継承して 10/12 を
+        # 返した (2026-09-11 ライブ監査 (j) J-05)。
         fresh_computation = bool(
             query_has_date_math_cue(query_text)
-            and _DATE_INTENT_QUANTITY_RE.search(query_text)
+            and (
+                _DATE_INTENT_QUANTITY_RE.search(query_text)
+                or month_count is not None
+                or nth_weekday is not None
+            )
         )
         follow_up = previous is not None and not fresh_computation
         if follow_up and params is None:
@@ -1387,6 +1411,61 @@ class ToolCallJudge:
         self._log_tool_decision(no_tool_result, "no_match_in_any_layer", call)
         return no_tool_result
 
+    #: 分類器スロットで走る **別タスク** の system に、分類器の system を
+    #: 接頭辞として付けるときの区切り。上の一覧は参照情報でこの判定では使わない
+    #: と明示する。
+    _SLOT_PREFIX_SEPARATOR_JA = (
+        "[別の判定] 上のツール一覧は共有の前置き (参照情報) で、この判定では使わない。"
+        "以下の指示に従うこと。\n\n"
+    )
+    _SLOT_PREFIX_SEPARATOR_EN = (
+        "[Separate task] The tool list above is a shared preamble (reference only); "
+        "do not use it here. Follow the instructions below.\n\n"
+    )
+
+    def _classifier_slot_prefix(self, tools_registry: ToolsRegistry, mode: str) -> str:
+        """分類器スロット (``classifier_slot``) の **共通の静的接頭辞**。
+
+        llama-server の接頭辞キャッシュはスロットごとに「直前のプロンプト」との
+        最長共通接頭辞しか再利用しない。分類器・日付抽出器・式合成は同じ
+        スロットで走るのに system がそれぞれ違い、交互に走るたびに互いの
+        接頭辞を追い出していた (実測 2026-09-11: 分類器 3 回とも cache_n=0、
+        ~550 トークンをフルプリフィル。日付抽出器も 0)。専用スロットを設けた
+        狙い (メニュー約 390 トークンの再利用) が丸ごと失われる。
+
+        スロットを増やさずに再利用を保つ方法は 1 つ — **同じスロットの全
+        プロンプトを同じ接頭辞で始める**。分類器の system (役割 + ツール
+        メニュー) を接頭辞にし、他のタスクは区切りの後に自分の指示を続ける。
+        """
+        return select_locale_variant(
+            self._NATIVE_JUDGE_SYSTEM, self._NATIVE_JUDGE_SYSTEM_EN,
+        ) + build_tool_menu(tools_registry, mode)
+
+    def _slot_shared_messages(
+        self, tools_registry: ToolsRegistry | None, mode: str, task_system: str,
+    ) -> list[dict]:
+        """分類器スロットで走る別タスクの先頭メッセージ (共通 system + 指示の user)。
+
+        llama-server (hybrid モデル / ``--jinja``) の接頭辞キャッシュは **system
+        メッセージが前回と一致しないと 0** になり、メッセージ境界での分岐しか
+        再利用しない (実測 2026-09-11: system の末尾を延ばしただけの 2 プロンプトは
+        token LCP 438 でも cache_n=0、system を同一にして user を替えると 438 再利用)。
+        そこで system は分類器と **完全に同一** にし、タスクの指示は system 直後の
+        user メッセージで渡す。``tools_registry`` が無い経路は従来どおり system に
+        指示を置く。
+        """
+        if tools_registry is None:
+            return [{"role": "system", "content": task_system}]
+        return [
+            {"role": "system", "content": self._classifier_slot_prefix(tools_registry, mode)},
+            {
+                "role": "user",
+                "content": select_locale_variant(
+                    self._SLOT_PREFIX_SEPARATOR_JA, self._SLOT_PREFIX_SEPARATOR_EN,
+                ) + task_system,
+            },
+        ]
+
     async def _judge_with_expression_synthesis(
         self,
         query: str,
@@ -1424,10 +1503,20 @@ class ToolCallJudge:
                 tools_registry=tools_registry, mode=mode, query=query,
                 conversation=conversation,
             )
-        # 被演算子がクエリにあるなら層5.9 で足りる。ここは「会話にしかない」形専用。
-        if NUMBER_LITERAL_RE.search(query):
+        # 被演算子が **すべて** クエリにあるなら層5.9 で足りる。ここは被演算子の
+        # 少なくとも 1 つが会話にしかない形専用。
+        #
+        # 以前は「クエリに数値が 1 つでもあれば走らない」+ 照応語必須だった。
+        # 「来月の目標を今月比 8% 増にすると、目標額はいくらですか」は 8 だけが
+        # クエリにあり、基準値 (今月の売上) は直前ターンにしか無い。分類器は
+        # no_tool を返し、式合成も数値 1 つで止まって暗算に落ちた (正答したが
+        # tool_grounded 無し。2026-09-10 ライブ監査 (i) I-06)。数値が 2 つ
+        # 未満なら会話側の被演算子が要るので合成に回す。会話に無い数値は
+        # ``_ungrounded_numbers`` が捨てるので、範囲を広げても捏造は通らない。
+        query_numbers = NUMBER_LITERAL_RE.findall(query)
+        if len(query_numbers) >= 2:
             return None
-        if not ANAPHORIC_OPERAND_RE.search(query):
+        if not query_numbers and not ANAPHORIC_OPERAND_RE.search(query):
             return None
         if not looks_like_numeric_question(query, call.recent_dialogue_text):
             return None
@@ -1441,12 +1530,10 @@ class ToolCallJudge:
             conversation, _SYNTHESIS_CONTEXT_TURNS,
         )
         messages.append({"role": "user", "content": ungroup_thousands(query)})
-        messages.insert(0, {
-            "role": "system",
-            "content": select_locale_variant(
-                EXPRESSION_SYSTEM, EXPRESSION_SYSTEM_EN,
-            ),
-        })
+        messages[0:0] = self._slot_shared_messages(
+            tools_registry, mode,
+            select_locale_variant(EXPRESSION_SYSTEM, EXPRESSION_SYSTEM_EN),
+        )
         try:
             content = await client.generate_constrained(
                 messages,
@@ -1639,9 +1726,7 @@ class ToolCallJudge:
         # 「何を選ぶか」の質は役割宣言に依存する。
         messages.insert(0, {
             "role": "system",
-            "content": select_locale_variant(
-                self._NATIVE_JUDGE_SYSTEM, self._NATIVE_JUDGE_SYSTEM_EN,
-            ) + build_tool_menu(tools_registry, mode),
+            "content": self._classifier_slot_prefix(tools_registry, mode),
         })
 
         try:
@@ -2090,7 +2175,17 @@ class ToolCallJudge:
         # — 日本語は「この会話**とは別**」と後置なのでパターン内の negative
         # lookahead で足り、英語は "Aside from this conversation" と前置なので
         # 別の前置きガードが要る (_SESSION_TOPIC_BREAK_LEAD_RE_EN)。
-        self_reference = any(
+        # 検索の **範囲** を決めるだけなので、会話へのアンカー (「この会話で」
+        # 「ここまでの会話」+ 話題切断の否定先読み) があれば反省語が無くても
+        # 現在セッションに限定する。反省語の網 (BROAD) は語彙で、「これまでに
+        # この会話で私が伝えた事実を箇条書きに」の「伝えた」が無く、除外検索に
+        # 倒れて **別セッション** の「事実」を過去の記録として注入した
+        # (2026-09-10 ライブ監査 (i) I-03 の再検証)。この会話について尋ねて
+        # いる問いで現在セッションを除外する検索は構造的に誤り。
+        self_reference = (
+            not _SESSION_TOPIC_BREAK_LEAD_RE_EN.search(query)
+            and refers_to_ongoing_session(query)
+        ) or any(
             p.search(query) for p in _SELF_SESSION_REFERENCE_PATTERNS
         ) or (
             not _SESSION_TOPIC_BREAK_LEAD_RE_EN.search(query)
@@ -2710,8 +2805,14 @@ class ToolCallJudge:
         # 知識質問はツール不要（RAG パイプラインで処理）
         # ただしツールパターン・ファイルパス・URL にもマッチするクエリは
         # ツール操作の可能性が高いため知識質問判定を適用しない
+        # ゲート (``_tool_gate_verdict``) と同じ信号を見る。クエリ単独の正規表現
+        # だけだと「来月の目標を今月比 8% 増にすると、目標額はいくらですか」
+        # (被演算子の片方が直前ターン) が知識質問として no_tool に落ち、
+        # 暗算のまま tool_grounded 無しで返る (2026-09-10 ライブ監査 (i) I-06)。
         has_tool_signal = (
             call.has_tool_signal if call is not None else _query_has_tool_signal(query)
+        ) or looks_like_numeric_question(
+            query, call.recent_dialogue_text if call is not None else "",
         )
         if not has_tool_signal and any(
             p.search(query) for p in _KNOWLEDGE_PATTERNS_ALL

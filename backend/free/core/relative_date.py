@@ -102,3 +102,32 @@ def annotate_relative_dates(text: str, anchor: datetime | date | None) -> str:
         return f"{word} ({(anchor_date + timedelta(days=DAY_OFFSETS[word])).isoformat()})"
 
     return _DAY_RELATIVE_RE.sub(_sub_day, out)
+
+
+#: 併記済みの相対表現「来週の火曜日 (2026-09-15)」/「明日 (2026-09-11)」。
+_ANNOTATED_RELATIVE_RE = re.compile(
+    r"(?:(?:先々週|再来週|今週|来週|先週|こんしゅう|らいしゅう|さらいしゅう"
+    r"|せんせんしゅう|せんしゅう)\s*の?\s*[月火水木金土日]曜日?"
+    r"|一昨日|おととい|昨日|きのう|明日|あす|あした|明後日|あさって)"
+    r"\s*[(（](?P<date>\d{4}-\d{2}-\d{2})[)）]"
+)
+_WEEKDAY_JA = ("月", "火", "水", "木", "金", "土", "日")
+
+
+def absolutize_annotated_dates(text: str) -> str:
+    """併記済みの相対表現を絶対日付だけに置き換える (純粋関数)。
+
+    「来週の火曜日 (2026-09-15)」→「2026-09-15 (火)」。相対表現は発話時刻に
+    相対で、記憶を **別の日に読む** ときは起点が違う。注入で相対表現が残ると
+    モデルはそれを復唱し (実測 2026-09-11 (j) J-09: 「案内文を送る予定日は」に
+    「来週の火曜日です」)、読む日によって別の日を指す。
+    """
+    def _sub(m: re.Match[str]) -> str:
+        try:
+            d = date.fromisoformat(m.group("date"))
+        except ValueError:
+            return m.group(0)
+        return f"{d.isoformat()} ({_WEEKDAY_JA[d.weekday()]})"
+
+    return _ANNOTATED_RELATIVE_RE.sub(_sub, text or "")
+

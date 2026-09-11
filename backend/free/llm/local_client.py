@@ -621,6 +621,38 @@ class LocalClient(BaseHTTPClient):
             return SLOT_CLASSIFIER
         return self.background_slot
 
+    def _record_prompt_cache(self, data: dict, *, slot: int | None = None) -> None:
+        """応答 JSON から接頭辞キャッシュの再利用量を ``_last_timings`` へ畳む。
+
+        ``timings`` (llama-server 固有、``cache_n`` / ``prompt_n``) を優先し、
+        無ければ ``usage.prompt_tokens_details.cached_tokens`` から導く。
+        """
+        if not isinstance(data, dict):
+            return
+        timings = data.get("timings")
+        cache_n: int | None = None
+        prompt_total: int | None = None
+        if isinstance(timings, dict) and "cache_n" in timings:
+            cache_n = int(timings.get("cache_n") or 0)
+            prompt_total = cache_n + int(timings.get("prompt_n") or 0)
+        else:
+            usage = data.get("usage") or {}
+            details = usage.get("prompt_tokens_details") or {}
+            if details.get("cached_tokens") is not None:
+                cache_n = int(details.get("cached_tokens") or 0)
+                prompt_total = int(usage.get("prompt_tokens") or 0)
+        if cache_n is None or prompt_total is None:
+            return
+        self._last_timings = {
+            "prompt_n": max(0, prompt_total - cache_n),
+            "cache_n": cache_n,
+            "slot": slot,
+        }
+        if self._debug_logger is not None:
+            self._debug_logger.log_kv_cache(
+                tokens_prompt=prompt_total, tokens_cached=cache_n, slot=slot,
+            )
+
     def _apply_system_fallback(self, messages: list[dict]) -> list[dict]:
         """systemロール非対応モデル: systemをuserの先頭に結合"""
         if self.metadata.has_system_role:
@@ -1111,9 +1143,20 @@ class LocalClient(BaseHTTPClient):
                     "output is truncated (%d chars)",
                     payload.get("max_tokens"), len(content),
                 )
+            # 接頭辞 KV キャッシュの効きを非ストリーム経路でも記録する。
+            # 以前はストリームの usage チャンクだけを見ていたため、非ストリーム
+            # API と補助タスク (aux / 分類器 / sleep-time) の呼び出しは
+            # op=kv_cache が 1 行も出ず、実機監査で観測できなかった (2026-09-11)。
+            # llama-server は非ストリーム応答にも ``usage.prompt_tokens_details``
+            # と ``timings`` (cache_n / prompt_n) を載せる。
+            self._record_prompt_cache(data, slot=payload.get("id_slot"))
             logger.debug(
-                "Sync generate complete: response_length=%d chars",
+                "Sync generate complete: response_length=%d chars (prompt_n=%s "
+                "cache_n=%s slot=%s)",
                 len(content),
+                (self._last_timings or {}).get("prompt_n"),
+                (self._last_timings or {}).get("cache_n"),
+                payload.get("id_slot"),
             )
             return data
 
@@ -1380,6 +1423,7 @@ class LocalClient(BaseHTTPClient):
                                         self._debug_logger.log_kv_cache(
                                             tokens_prompt=prompt_tokens,
                                             tokens_cached=cached,
+                                            slot=payload.get("id_slot"),
                                         )
 
                             if data_line_count <= 3:
@@ -1571,7 +1615,11 @@ class LocalClient(BaseHTTPClient):
                 timeout=timeout if timeout is not None else self._http_timeout,
             )
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            # 分類器 / 補助タスクのスロットでも接頭辞キャッシュの効きを記録する
+            # (2026-08-25 の実測は llama-server の stderr を手で突き合わせていた)。
+            self._record_prompt_cache(data, slot=payload.get("id_slot"))
+            return data
 
         try:
             if self._is_chat_slot(id_slot):

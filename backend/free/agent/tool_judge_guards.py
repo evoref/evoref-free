@@ -112,6 +112,10 @@ class GuardContext:
     hidden_tools_offered: bool = False
     measurement_blocked: bool = False
     action_blocked: bool = False
+    #: 進行中セッションの全ターンが ``conversation`` (窓) に載っているか。
+    #: ``WorkingMemory.session_evicted_turns == 0`` を呼出側が写す。不明なら
+    #: ``None`` (単体のガードだけを掛ける経路)。
+    window_complete: bool | None = None
 
     # 会話本文の連結は 1 判定で最大 6 箇所 (ガード 3 つ / ゲート / 式合成 2 つ)
     # が同じ結果を再計算していた。会話は判定中に変わらないので 1 度だけ作る。
@@ -302,6 +306,17 @@ def _suppress_self_session_recall_in_window(
         return result
     if has_past_session_keyword(ctx.query) or day_scope_recall(ctx.query) is not None:
         return result
+    # 窓が **セッションの全ターン** を含むなら、語に依らず同セッション限定の
+    # 検索は何も足せない (索引にあるのは窓にある本文だけ)。語の照合だけだと
+    # 「これまでにこの会話で私が伝えた事実を箇条書きに」の検索語「事実」が
+    # 窓に無く、3 ターン目で search_history("事実") → No results を空費した
+    # (2026-09-10 ライブ監査 (i) I-03)。
+    if ctx.window_complete:
+        logger.debug(
+            "Suppressing search_history: self-session recall while the window "
+            "holds the whole session: %s", ctx.query[:60],
+        )
+        return ToolJudgement(tool_needed=False, source=result.source)
     # 検索に渡る語そのもの (``_reduce_ordered_history_query`` の縮約結果) で
     # 見る — 索引が当てるのはこの語なので、窓に全部あるなら索引も同じ本文を
     # 返すだけ。内容語アンカー (``query_anchors``) は 1 文字の語 (「色」) を
