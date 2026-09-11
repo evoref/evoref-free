@@ -3,7 +3,10 @@
 同一チャンクの再登録・再構築時に埋め込み計算をスキップする。
 キャッシュキーは ``model_name:text`` の SHA-256 ハッシュ (16 文字)。バックエンドが
 ``cache_identity()`` (doc_template 等、ドキュメント側のベクトルを変える設定) を
-持つ場合はその値も鍵に混ぜる (旧エントリは単にミスするだけ)。
+持つ場合はその値も鍵に混ぜる (旧エントリは単にミスするだけ)。さらにバックエンドが
+``mode_affects_documents()`` で True を返す (doc_template に ``{task}`` がある)
+場合だけ ``mode`` も鍵に混ぜる — 既定 (``doc_template=""``) の鍵は従来と
+バイト一致のまま。
 永続化層は ``diskcache.Cache`` (SQLite-backed, WAL モード) を用いる。
 
 dim / model_name 整合性メタは ``cache_dir/meta.json`` に保存し、diskcache の
@@ -57,6 +60,17 @@ def _backend_identity(inner: object) -> str:
         return str(fn() or "")
     except Exception:
         return ""
+
+
+def _mode_affects_documents(inner: object) -> bool:
+    """内部バックエンドの ``mode_affects_documents()`` (任意) を安全に読む。"""
+    fn = getattr(inner, "mode_affects_documents", None)
+    if fn is None:
+        return False
+    try:
+        return bool(fn())
+    except Exception:
+        return False
 
 
 def _read_meta(meta_path: Path) -> dict | None:
@@ -208,9 +222,12 @@ class CachedEmbeddingBackend:
         """テキストリストを埋め込みベクトルに変換（キャッシュ対応）
 
         ``is_query=True`` の場合はキャッシュを使用しない（クエリは内部 LRU で対応）。
-        ``mode`` (``chat``/``create``) は内部バックエンドへ素通り
-        ドキュメント側 (``is_query=False``) は Qwen3 仕様で prefix を付けないため、
-        永続キャッシュキーは ``(model_name, text)`` のままで mode 分離は不要。
+        ``mode`` (``chat``/``create``) は内部バックエンドへ素通り (ミス経路も含む)。
+        ドキュメント側 (``is_query=False``) は既定 (``doc_template=""``) では mode で
+        ベクトルが変わらないので鍵は ``(model_name, text)`` のまま。``doc_template``
+        に ``{task}`` がある構成だけ ``mode`` を鍵に混ぜる (旧実装はここを混ぜず、
+        かつミス経路で ``mode`` を落として常に chat として埋め込んでいた)。
+        同一バッチ内の同一本文は 1 回だけ内部バックエンドへ送る。
         """
         if not texts:
             return np.array([]).reshape(0, self._inner.dim())
@@ -222,12 +239,17 @@ class CachedEmbeddingBackend:
         model = self._inner.model_name()
         dim = self._inner.dim()
         identity = _backend_identity(self._inner)
+        if _mode_affects_documents(self._inner):
+            identity = f"{identity}|mode={mode}" if identity else f"mode={mode}"
 
         keys = [_cache_key(t, model, identity) for t in texts]
 
         result = np.empty((len(texts), dim), dtype=np.float32)
         miss_indices: list[int] = []
         miss_texts: list[str] = []
+        # 同一本文 → 最初のミス位置 (バッチ内重複を 1 回の埋め込みにまとめる)
+        first_miss_by_text: dict[str, int] = {}
+        dup_indices: list[tuple[int, int]] = []
 
         for i, key in enumerate(keys):
             data = self._cache.get(key)
@@ -236,27 +258,35 @@ class CachedEmbeddingBackend:
                 result[i] = vec
                 self._hits += 1
                 continue
+            self._misses += 1
+            first = first_miss_by_text.get(texts[i])
+            if first is not None:
+                dup_indices.append((i, first))
+                continue
+            first_miss_by_text[texts[i]] = i
             miss_indices.append(i)
             miss_texts.append(texts[i])
-            self._misses += 1
 
         if miss_texts:
-            computed = await self._inner.embed(miss_texts, is_query=False)
+            computed = await self._inner.embed(miss_texts, is_query=False, mode=mode)
             for j, idx in enumerate(miss_indices):
                 vec = computed[j].astype(np.float32, copy=False)
                 result[idx] = vec
                 self._cache.set(keys[idx], vec.tobytes())
+            for idx, first in dup_indices:
+                result[idx] = result[first]
 
+        n_hits = len(texts) - len(miss_texts) - len(dup_indices)
         logger.debug(
-            "embed: %d texts, %d hits, %d misses",
-            len(texts), len(texts) - len(miss_texts), len(miss_texts),
+            "embed: %d texts, %d hits, %d misses (%d batch duplicates)",
+            len(texts), n_hits, len(miss_texts), len(dup_indices),
         )
 
         # DebugLogger
         dl = self._debug_logger
-        if dl and (len(texts) - len(miss_texts)) > 0:
+        if dl and n_hits > 0:
             dl.log_embedding(
-                batch_size=len(texts) - len(miss_texts),
+                batch_size=n_hits,
                 backend="cache",
                 elapsed_sec=0.0,
                 is_query=False,

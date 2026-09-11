@@ -326,6 +326,15 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
         """
         return f"doc_template={self._doc_template}" if self._doc_template else ""
 
+    def mode_affects_documents(self) -> bool:
+        """ドキュメント側ベクトルが ``mode`` で変わるか (永続キャッシュの鍵分離用)。
+
+        ``doc_template`` に ``{task}`` があると ``format_with_instruction`` が
+        mode 別の instruction を埋めるので、同じ本文でも mode ごとに別ベクトル
+        になる。既定 (``doc_template=""``) は False で鍵は従来どおり。
+        """
+        return "{task}" in self._doc_template
+
     def supports_lora(self) -> bool:
         """llama-server は --lora オプションで LoRA 適用可能"""
         return True

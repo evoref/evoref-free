@@ -73,7 +73,6 @@ from backend.free.api.chat.chat_stream_deliberative import (
     _DeliberativeStreamState,
     _drain_deliberative_step_queue,
     _finalize_deliberative_stream,
-    _maybe_cache_reactive_response,
     _retry_zero_tokens_deliberative,
     stream_deliberative,
     _stream_filtered_token_pipeline,

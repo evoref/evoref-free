@@ -47,6 +47,7 @@ from backend.free.llm.generation_gate import (
     was_contended_since,
 )
 from backend.free.llm.json_extract import extract_json_object
+from backend.free.llm.slot_prefix import apply_shared_prefix
 from backend.free.llm.json_schemas import (
     make_response_format,
     resolve_response_format_for_purpose,
@@ -395,6 +396,25 @@ class AuxClient:
                 return classifier
         return background
 
+    def _with_slot_prefix(self, messages: list[dict], slot: int) -> list[dict]:
+        """分類器スロットへ送るプロンプトを、分類器と同じ system で始める形へ整形する。
+
+        分類器スロットは判定器 3 種 (分類 / 日付抽出 / 式合成) と
+        ``CHAT_PATH_PURPOSES`` が共有する。hybrid モデルの接頭辞キャッシュは
+        system が byte 一致しないと 0 になるため、purpose ごとに固有の system を
+        送るとツールメニュー (約 390 トークン) を毎回追い出していた (実測
+        2026-09-10: 分類器スロット 11 回のヒット率中央値 6%、573 トークン再計算)。
+        接頭辞は判定器が ``LocalClient.set_classifier_slot_prefix`` で公開する。
+        未公開 (判定器がまだ走っていない / slots < 3) なら整形しない。
+        """
+        classifier = getattr(self.local, "classifier_slot", None)
+        if slot != classifier or slot == int(self.local.background_slot):
+            return messages
+        prefix = getattr(self.local, "classifier_slot_prefix", None)
+        if not prefix:
+            return messages
+        return apply_shared_prefix(prefix, messages)
+
     @staticmethod
     def _is_deferrable(purpose: str, override: bool | None) -> bool:
         """この呼び出しがチャットのアイドル窓を待つべきか。
@@ -549,6 +569,7 @@ class AuxClient:
             purpose, response_format, response_schema,
         )
         slot = self._slot_for(purpose)
+        messages = self._with_slot_prefix(messages, slot)
         effective_timeout = (
             timeout if timeout is not None else self.resolve_effective_timeout(purpose)
         )

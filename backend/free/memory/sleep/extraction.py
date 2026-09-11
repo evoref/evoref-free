@@ -67,7 +67,21 @@ def persist_facts(
     """
     written = 0
     persisted: list = []
+    # 同じスロット名 (subject の末尾) と同じ本文を持つファクトが kind 違いで
+    # 並ぶことがある (color / beverage は personal_fact と preference の両節に
+    # あり、一人称の申告は両タグに当たる)。同じ値を 2 件 live にしない
+    # (2026-09-11 (k): mem.personal.color と mem.preference.color が二重)。
+    seen_values: set[tuple[str, str]] = set()
     for fact in result.facts:
+        slug = (getattr(fact, "subject", "") or "").rsplit(".", 1)[-1]
+        key = (slug, "".join(str(getattr(fact, "object", "") or "").split()))
+        if slug and key in seen_values:
+            logger.debug(
+                "Step 8 [%s]: skipped duplicate value for slot %s (%s)",
+                label, slug, fact.subject,
+            )
+            continue
+        seen_values.add(key)
         try:
             store.add_fact(fact)
             written += 1

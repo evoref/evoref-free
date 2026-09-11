@@ -150,6 +150,18 @@ class LlamaConfig(BaseModel):
     # full re-prefill するため **no-op** (フラグは無害に無視される)。非 SWA base
     # に差し替えた場合のみ有効。
     cache_reuse: int = Field(default=256, ge=0)
+    # コンテキスト checkpoint (上流 ``--ctx-checkpoints`` / ``--checkpoint-min-step``)。
+    # hybrid recurrent モデル (Qwen3.5/3.8 等) は KV の部分巻き戻しができず、
+    # llama-server は「最後の user メッセージ先頭」と、そこから min-step トークン
+    # 以上離れた過去の user 先頭にだけ checkpoint を置く。上流既定 8192 だと
+    # n_ctx=8192 では中間 checkpoint が一度も生まれず、prompt が前回の最終 user
+    # 位置より手前で分岐する (セッション切替 / WM ブロック退避) と system prompt
+    # ごと全量 re-prefill になる (実測 100 ターン中 4 回が 0% / ~35s)。
+    # 256 なら user ターンごとに 1 つ置かれ、分岐のコストは最後に一致した
+    # ターン以降の窓だけになる。メモリは checkpoint 1 つにつき recurrent 状態の
+    # スナップショット 1 つで、ctx_checkpoints が slot ごとの上限。
+    ctx_checkpoints: int = Field(default=8, ge=0)
+    checkpoint_min_step: int = Field(default=256, ge=1)
     # 0 = 上限を config で決めない。ただし **無制限では投げない** —
     # ``LocalClient._build_payload`` が context_size からプロンプト推定を引いた
     # 残量 (下限 256) へクランプして送る。

@@ -2273,9 +2273,25 @@ def _trim_history(
             result.insert(0, turn)
             total_tokens += estimated_tokens
 
+    result = _align_history_to_user(result)
     logger.debug(
         "_trim_history: %d/%d turns kept, %d estimated tokens (max=%d)",
         len(result), original_len, total_tokens, max_tokens,
     )
     return result
+
+
+def _align_history_to_user(history: list[ChatMessage]) -> list[ChatMessage]:
+    """窓の先頭が user になるまで先頭のメッセージを落とす。
+
+    llama-server (hybrid モデル) はコンテキスト checkpoint を user メッセージの
+    境界にしか置かないため、窓が assistant で始まると system 直後に checkpoint が
+    立たず、次ターンで窓が動いた瞬間に system ごと再計算になる (実測 2026-09-11:
+    分類器スロットで assistant 始まり cache_n=59 / user 始まり 446)。最新ターン
+    (末尾の user) は常に残る。
+    """
+    i = 0
+    while i < len(history) - 1 and str(history[i].get("role") or "") != "user":
+        i += 1
+    return history[i:] if i else history
 

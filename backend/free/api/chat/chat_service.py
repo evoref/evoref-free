@@ -704,26 +704,18 @@ def build_semmem_injection(
                 except Exception:
                     # 順位が取れなければ confidence + recency へ縮退する。
                     pass
-        # **このモデルのベクトルが 1 本も無いターンは注入しない (fail-closed)。**
-        #
-        # 埋め込みは ``embeddings/<model_id>/`` にモデル別で置かれる (c_16 §6.1)
-        # ので、embed モデルを替えても旧モデルの行を読み違えることは無い。
-        # 代わりに **次の snapshot まで 1 件もスコアが引けない** 状態が生まれ、
-        # ``MemoryInjector._passes_gate`` は候補ごとの判定 (``fact.embedding``
-        # は ``None``) へ落ちて **全候補を通す** — ゲートが最も要る場面で
-        # 全店注入になる。旧 ``stale_guard`` のマーカー
-        # (``.reembed_facts_required``) はこれを検知するためのものだったが、
-        # マーカーは model-migrate API を通した切替でしか立たなかった。
-        # ここは観測 (「候補はあるがスコアが 0 件」) で判定するので、config を
-        # 直接書き替えた切替でも効く。
+        # ベクトルを持たないファクト (Light 更新で書かれたばかり / embed モデル
+        # 切替直後) は、注入器側で「尋ねられた属性 / 語彙アンカーの決定論だけで
+        # 通し、コサインでは通さない」(``require_embedding=True``)。以前はここで
+        # 「スコア 0 件なら注入全体を skip」していたため、Light 更新直後の
+        # 別セッション想起が次の Full snapshot まで必ず空振りした (2026-09-11)。
         if query_vec is not None and facts and not fact_scores:
-            logger.warning(
-                "semmem injection skipped: %d fact(s) but no embedding for the "
-                "current embed model; the relevance gate would pass everything. "
-                "Vectors are rebuilt on the next sleep-time snapshot.",
+            logger.info(
+                "semmem: %d fact(s) have no embedding for the current embed model; "
+                "only attribute / anchor matches are injected until the next "
+                "sleep-time snapshot",
                 len(facts),
             )
-            facts = []
         stm_notes = list(episodic.short_notes()) if episodic is not None else []
         if facts or stm_notes:
             plan = injector.inject(

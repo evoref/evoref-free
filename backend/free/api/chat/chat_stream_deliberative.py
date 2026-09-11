@@ -382,33 +382,6 @@ async def _retry_zero_tokens_deliberative(
     )
 
 
-def _maybe_cache_reactive_response(
-    sess_state: AppState,
-    query: str,
-    response: str,
-    *,
-    private: bool,
-    tool_command: str | None,
-    session_id: str,
-) -> None:
-    """deliberative / 軽量パス応答を ReactiveAgent キャッシュへ蓄積する。
-
-    再訪クエリ (5 分以内・同一文) を reactive 層が即応答できるようにする。
-    除外: private ターン / ツール使用応答 (時刻・環境依存で再利用不可) /
-    キャンセル済み (部分テキスト) / 空応答。
-    """
-    agent = getattr(sess_state, "reactive_agent", None)
-    if agent is None:
-        return
-    if private or tool_command is not None:
-        return
-    if _cancel_flags.get(session_id):
-        return
-    if not response or not response.strip():
-        return
-    agent.cache_response(query, response)
-
-
 def _truncation_frame(
     sess_state: AppState,
     state: _DeliberativeStreamState,
@@ -502,10 +475,6 @@ async def _finalize_deliberative_stream(
         truncated=state.truncated,
     )
     state.recorded = True
-    _maybe_cache_reactive_response(
-        sess_state, query, state.full_response,
-        private=private, tool_command=state.tool_command, session_id=session_id,
-    )
     _emit_timing(sess_state, timer, "deliberative", state.tokens_generated, mode=mode)
     truncation = _truncation_frame(sess_state, state, session_id, mode)
     if truncation:
@@ -788,10 +757,6 @@ async def sync_deliberative(
             rag_top1_score=rag_top1_score,
             sent_messages=sent_messages,
         )
-        _maybe_cache_reactive_response(
-            state, query, content,
-            private=private, tool_command=resp.tool_command, session_id=session_id,
-        )
 
         # ストリーミング側と同じ形で結末を残す。``_log_chat_outcome`` の
         # docstring は「5 つの層 (meta_cognitive / long_form / deliberative /
@@ -863,13 +828,12 @@ async def stream_reactive_light(
     generation_params: "GenerationParams | None" = None,
     timer: "StageTimer | None" = None,
     private: bool = False,
-    cacheable: bool = True,
     continuation_tail: str = "",
 ):
     """Reactive 軽量パス: few-shot/RAG/semmem/tool なしの最小プロンプトで base 1 ターン。
 
     agent.process を介さず client.generate を直接叩き、deliberative のストリーミング
-    ヘルパー (フィルタ / 0トークンリトライ / timing / cache) を再利用する。
+    ヘルパー (フィルタ / 0トークンリトライ / timing) を再利用する。
     SSE 上の agent_layer は "reactive"。
     """
     async with cancel_scope(session_id):
@@ -926,11 +890,6 @@ async def stream_reactive_light(
                 truncated=stream_state.truncated,
             )
             stream_state.recorded = True
-            if cacheable:
-                _maybe_cache_reactive_response(
-                    state, query, stream_state.full_response,
-                    private=private, tool_command=None, session_id=session_id,
-                )
             _emit_timing(state, timer, "reactive", stream_state.tokens_generated, mode=mode)
             truncation = _truncation_frame(state, stream_state, session_id, mode)
             if truncation:
@@ -981,7 +940,6 @@ async def sync_reactive_light(
     generation_params: "GenerationParams | None" = None,
     timer: "StageTimer | None" = None,
     private: bool = False,
-    cacheable: bool = True,
     continuation_tail: str = "",
 ) -> ChatResponse:
     """Reactive 軽量パスの非ストリーミング応答。"""
@@ -1028,11 +986,6 @@ async def sync_reactive_light(
             private=private,
             rag_used=False,
         )
-        if cacheable:
-            _maybe_cache_reactive_response(
-                state, query, content,
-                private=private, tool_command=None, session_id=session_id,
-            )
         _log_chat_outcome(
             state,
             started_at=t_start,

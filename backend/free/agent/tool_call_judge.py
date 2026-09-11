@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import datetime
+import hashlib
 import json
 import re
 from dataclasses import replace
@@ -53,6 +55,7 @@ from backend.free.agent.grammar_tool_classifier import (
 from backend.free.llm.aux_client import PURPOSE_TIMEOUT_DEFAULTS
 from backend.free.llm.json_extract import extract_json_object
 from backend.free.llm.json_schemas import resolve_response_format_for_purpose
+from backend.free.llm.slot_prefix import shared_prefix_messages
 from backend.log_config import get_logger
 from backend.utils import utc_now_dt
 
@@ -71,6 +74,7 @@ from backend.free.agent.tool_judge_dialogue import (
     _SYNTHESIS_CONTEXT_TURNS,
     _recent_dialogue_messages,
     _recent_dialogue_text,
+    drop_leading_assistant,
     query_needs_dialogue,
     ungroup_thousands,
 )
@@ -152,6 +156,10 @@ from backend.free.agent.tool_judge_commands import (
     month_business_days_from_query,
     nth_weekday_of_month_from_query,
     previous_answer_date,
+    command_lacks_business_day_arithmetic,
+    offset_date_in_query,
+    query_anchors_on_prior_result,
+    query_has_business_day_cue,
     query_has_anaphoric_start,
     follow_up_holidays_from_query,
     inherit_date_intent,
@@ -289,7 +297,8 @@ def _date_intent_context_messages(conversation: list[dict] | None) -> list[dict]
         if role not in ("user", "assistant") or not content:
             continue
         out.append({"role": role, "content": content[:_DATE_INTENT_CONTEXT_CHARS]})
-    return out
+    # 窓は user で始める (checkpoint 境界。tool_judge_dialogue.drop_leading_assistant)
+    return drop_leading_assistant(out)
 
 
 def _executable_tool_for_mode(tools_registry: ToolsRegistry, mode: str) -> str:
@@ -705,7 +714,15 @@ class ToolCallJudge:
             if result.tool_name not in _COMMAND_TOOL_NAMES:
                 return result
             command = str((result.tool_args or {}).get("command") or "")
-            if not command or not command_lacks_date_arithmetic(command):
+            if not command:
+                return result
+            # 暦日演算だけのコマンドは、営業日の問いには答えを含まない
+            # (「締め切りは今日から 2 週間後です。締め切りの 3 営業日前は？」)。
+            partial = (
+                query_has_business_day_cue(call.query or "")
+                and command_lacks_business_day_arithmetic(command)
+            )
+            if not command_lacks_date_arithmetic(command) and not partial:
                 return result
             tool_name = result.tool_name
         elif misrouted_to_calculate:
@@ -825,10 +842,25 @@ class ToolCallJudge:
         # 「その日から N 営業日後」の起点は直前の回答の日付 (E-02)。抽出器が
         # ``today`` を返しても、照応があるなら直前のアシスタント発話の日付で
         # 差し替える (直前が日付を述べていなければそのまま)。
-        if params is not None and query_has_anaphoric_start(call.query or ""):
+        # 「締め切りの 3 営業日前」のように直前の回答で確定した名詞を起点に置く
+        # 発話も同じ扱い (``query_anchors_on_prior_result``)。
+        # 抽出器が **具体日付** を起点に返しているなら発話にその日付があった
+        # ということで、直前の回答で差し替えない (「納期が 10 月 5 日なら」)。
+        # 差し替えるのは起点が today (= 解決できず既定に落ちた) のときだけ。
+        if (
+            params is not None
+            and (params.start is None or params.start == utc_now_dt().astimezone().date())
+            and query_anchors_on_prior_result(call.query or "")
+        ):
             anchor_date = previous_answer_date(
                 call.conversation, before=call.query or "",
             )
+            if anchor_date is None:
+                # 起点の名詞が同じ発話で定義されている (「締め切りは今日から
+                # 2 週間後です。締め切りの 3 営業日前は？」)。
+                anchor_date = offset_date_in_query(
+                    call.query or "", utc_now_dt().astimezone().date(),
+                )
             if anchor_date is not None and params.start != anchor_date:
                 logger.info(
                     "date intent start resolved from the previous answer: %s "
@@ -895,6 +927,11 @@ class ToolCallJudge:
                 params.kind, params.n, params.count_start_day, params.direction,
                 [d.isoformat() for d in params.holidays], list(params.excluded_weekdays),
             )
+        # 暦の祝日 (config: agent.business_day_holidays) を土日と一緒に除く。
+        # 抽出器は質問文に明示された休日しか入れない (発明させない規則) ので、
+        # 国民の祝日はコードが供給する (2026-09-11 (k))。
+        if params is not None:
+            params = self._with_calendar_holidays(params)
         upgraded = (
             date_intent_command_from_params(params, call.query) if params else ""
         )
@@ -1411,18 +1448,6 @@ class ToolCallJudge:
         self._log_tool_decision(no_tool_result, "no_match_in_any_layer", call)
         return no_tool_result
 
-    #: 分類器スロットで走る **別タスク** の system に、分類器の system を
-    #: 接頭辞として付けるときの区切り。上の一覧は参照情報でこの判定では使わない
-    #: と明示する。
-    _SLOT_PREFIX_SEPARATOR_JA = (
-        "[別の判定] 上のツール一覧は共有の前置き (参照情報) で、この判定では使わない。"
-        "以下の指示に従うこと。\n\n"
-    )
-    _SLOT_PREFIX_SEPARATOR_EN = (
-        "[Separate task] The tool list above is a shared preamble (reference only); "
-        "do not use it here. Follow the instructions below.\n\n"
-    )
-
     def _classifier_slot_prefix(self, tools_registry: ToolsRegistry, mode: str) -> str:
         """分類器スロット (``classifier_slot``) の **共通の静的接頭辞**。
 
@@ -1437,9 +1462,53 @@ class ToolCallJudge:
         プロンプトを同じ接頭辞で始める**。分類器の system (役割 + ツール
         メニュー) を接頭辞にし、他のタスクは区切りの後に自分の指示を続ける。
         """
-        return select_locale_variant(
+        prefix = select_locale_variant(
             self._NATIVE_JUDGE_SYSTEM, self._NATIVE_JUDGE_SYSTEM_EN,
         ) + build_tool_menu(tools_registry, mode)
+        # 同じスロットへ送る補助タスク (AuxClient の CHAT_PATH_PURPOSES) にも
+        # 同じ接頭辞を使わせる。判定器は AuxClient を知らないので、両者が共有する
+        # LocalClient (facade 越し) へ公開する (backend/free/llm/slot_prefix.py)。
+        publish = getattr(self._llm_client, "set_classifier_slot_prefix", None)
+        if callable(publish):
+            publish(prefix)
+        # 接頭辞が呼び出しごとに変わると (メニューの増減 / locale) 同じスロットでも
+        # キャッシュが 0 に落ちる。実機で突き合わせられるよう指紋を残す。
+        logger.debug(
+            "classifier slot prefix: mode=%s chars=%d sha1=%s",
+            mode, len(prefix), hashlib.sha1(prefix.encode("utf-8")).hexdigest()[:10],
+        )
+        return prefix
+
+    def _with_calendar_holidays(self, params: DateIntentParams) -> DateIntentParams:
+        """営業日演算のパラメータに暦の祝日 (国民の祝日) を併合する (純粋)。
+
+        ``business_days_from`` で土日を除く演算だけが対象。候補日の範囲
+        (起点 ± 2n + 14 日) に入る祝日を ``holidays`` へ足す。
+        """
+        if params.kind != "business_days_from" or not params.skip_weekends:
+            return params
+        calendar = str(
+            (self._config.get("agent") or {}).get("business_day_holidays", "jp")
+            or "jp",
+        ).lower()
+        if calendar != "jp":
+            return params
+        from backend.free.core.jp_holidays import national_holidays_between
+
+        start = params.start or utc_now_dt().astimezone().date()
+        span = datetime.timedelta(days=2 * max(int(params.n), 1) + 14)
+        found = national_holidays_between(start - span, start + span)
+        if not found:
+            return params
+        merged = tuple(sorted(set(params.holidays) | set(found)))
+        if merged == params.holidays:
+            return params
+        logger.info(
+            "date intent: added %d national holiday(s) from the jp calendar: %s",
+            len(merged) - len(params.holidays),
+            [d.isoformat() for d in found],
+        )
+        return replace(params, holidays=merged)
 
     def _slot_shared_messages(
         self, tools_registry: ToolsRegistry | None, mode: str, task_system: str,
@@ -1456,15 +1525,9 @@ class ToolCallJudge:
         """
         if tools_registry is None:
             return [{"role": "system", "content": task_system}]
-        return [
-            {"role": "system", "content": self._classifier_slot_prefix(tools_registry, mode)},
-            {
-                "role": "user",
-                "content": select_locale_variant(
-                    self._SLOT_PREFIX_SEPARATOR_JA, self._SLOT_PREFIX_SEPARATOR_EN,
-                ) + task_system,
-            },
-        ]
+        return shared_prefix_messages(
+            self._classifier_slot_prefix(tools_registry, mode), task_system,
+        )
 
     async def _judge_with_expression_synthesis(
         self,

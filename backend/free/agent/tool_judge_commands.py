@@ -783,6 +783,40 @@ def command_lacks_date_arithmetic(command: str) -> bool:
     return not _DATE_ARITHMETIC_RE.search(command or "")
 
 
+_BUSINESS_DAY_CUE_RE = re.compile(r"営業日|稼働日|business\s*days?")
+
+
+def query_has_business_day_cue(query: str) -> bool:
+    """発話が営業日の数え上げを求めているか (純粋関数)。"""
+    return bool(_BUSINESS_DAY_CUE_RE.search(query or ""))
+
+
+def command_lacks_business_day_arithmetic(command: str) -> bool:
+    """コマンドが営業日を数えていないか (暦日オフセットだけか、純粋関数)。
+
+    規則カスケードは「今日から 2 週間後」を暦日で組めるが、同じ発話に続く
+    「締め切りの 3 営業日前」までは組めない。暦日演算だけのコマンドを
+    「日付演算済み」と見なすと後半が暗算に残る (2026-09-11 (k): 9/18、正 9/17)。
+    """
+    return "skip_weekends" not in (command or "")
+
+
+def offset_date_in_query(query: str, today: datetime.date) -> datetime.date | None:
+    """発話自身に含まれる **オフセット表現** (「今日から 2 週間後」) の解決日 (純粋関数)。
+
+    「締め切りは今日から 2 週間後です。締め切りの 3 営業日前は？」のように、
+    起点となる名詞の日付が同じ発話で定義されている場合の起点。裸の「今日」
+    「明日」は除き、オフセット表現が 1 つだけあるときに返す。
+    """
+    from backend.free.core.relative_date import DAY_OFFSETS, resolve_relative_dates
+
+    found = [
+        d for span, d in resolve_relative_dates(query or "", today)
+        if span not in DAY_OFFSETS
+    ]
+    return found[0] if len(found) == 1 else None
+
+
 def _parse_intent_date(value: object) -> "datetime.date | None | str":
     """``start`` / ``end`` の 1 項目を解釈する。
 
@@ -1366,6 +1400,39 @@ def nth_weekday_of_month_from_query(
 def query_has_anaphoric_start(query: str) -> bool:
     """追い質問が起点を直前の結果 (「その日」) に置いているか (純粋関数)。"""
     return bool(_ANAPHORIC_START_RE.search(query or ""))
+
+
+#: 「<起点>の N 営業日前」「<起点>から 2 週間後」— 起点となる名詞句と、その後ろの
+#: オフセット。起点が日付表現 (今日 / 来週の水曜日 / 9月25日 …) でなければ、
+#: それは直前の会話で日付が確定した **参照名詞** (締め切り / 納期 / 会議 …)。
+_OFFSET_FROM_REFERENT_RE = re.compile(
+    r"([^\s、。,！？!?]+?)(?:から|の)\s*\d+\s*"
+    r"(?:営業日|日|週間|か月|ヶ月|カ月|ヵ月|年)\s*(?:前|後|以内)"
+)
+#: 起点が「時間表現そのもの」なら参照ではない (抽出器が解決できる)。
+_TEMPORAL_ANCHOR_RE = re.compile(
+    r"今日|本日|明日|明後日|昨日|一昨日|今週|来週|再来週|先週|先々週|今月|来月|先月"
+    r"|今年|来年|去年|昨年|今|現在|\d+\s*年|\d+\s*月|\d+\s*日|[月火水木金土日]曜"
+    r"|[0-9]{4}-[0-9]{2}-[0-9]{2}"
+)
+
+
+def query_anchors_on_prior_result(query: str) -> bool:
+    """起点が直前の会話で確定した日付を指しているか (純粋関数)。
+
+    語形の照応 (「その日から」) に加えて、「締め切りの 3 営業日前」のように
+    **日付でない名詞** を起点に置く発話も含める。起点が今日や具体日付なら
+    抽出器が自分で解決できるので対象外。実機 (2026-09-11 ライブ監査): 直前の
+    回答で締め切り = 9/25 と確定した後の「締め切りの 3 営業日前」を抽出器が
+    ``start: today`` で返し、今日起点の 9/8 を計算しつつモデルは 9/18 と答えた。
+    """
+    if query_has_anaphoric_start(query):
+        return True
+    for m in _OFFSET_FROM_REFERENT_RE.finditer(query or ""):
+        anchor = m.group(1)
+        if not _TEMPORAL_ANCHOR_RE.search(anchor):
+            return True
+    return False
 
 
 def last_date_in_text(text: str) -> datetime.date | None:

@@ -163,6 +163,19 @@ def _normalize_ws(text: str) -> str:
     return "".join((text or "").split())
 
 
+#: 述語だけの値 (「走ります」「起きて」)。属性スロットの値は名詞句で、助詞も
+#: 読点も持たない短い動詞形は「何をするか」であって「何が値か」ではない
+#: (2026-09-11 (k): 分割が「走ります」を hobby に置いた)。
+_BARE_PREDICATE_RE = re.compile(
+    r"^[^\sはがをにでとのへも、。]{1,6}(?:ます|ました|ません|ています|ている|て|る)$"
+)
+
+
+def is_bare_predicate(value: str) -> bool:
+    """値が述語だけか (純粋関数)。"""
+    return bool(_BARE_PREDICATE_RE.match((value or "").strip()))
+
+
 def is_verbatim_span(value: str, content: str) -> bool:
     """``value`` が発話の **逐語 span** か (空白の違いは無視する / 純粋関数)。
 
@@ -373,6 +386,12 @@ def accept_items(
         if not _is_tight_value(value, content):
             logger.debug(
                 "personal_fact_curator: value is not a single span (dropped): %r",
+                value,
+            )
+            continue
+        if is_bare_predicate(value):
+            logger.debug(
+                "personal_fact_curator: value is a bare predicate (dropped): %r",
                 value,
             )
             continue
@@ -600,6 +619,26 @@ async def _persist_split(
 
     if not facts:
         return 0
+    # 同じ発話文が **別スロット** に粗い object として複製されていることがある
+    # (Step 8 の規則抽出が「毎朝 6 時に起きて、コーヒーを飲んでから走ります」を
+    # ``mem.personal.beverage`` と ``mem.preference.beverage`` の両方へ書いた、
+    # 2026-09-11 ライブ監査)。同じスロットの粗い object しか畳まないと、片方が
+    # live のまま残って分割後の値と二重に注入される。分割が確定したノートでは、
+    # 狭めた object と同じ文を持つ同一ノート由来のファクトも一緒に畳む。
+    if split_confirmed and refined:
+        coarse_texts = {_normalize_ws(old.object or "") for old, _ in refined}
+        refined_olds = {id(old) for old, _ in refined}
+        for existing_fact in existing.values():
+            if id(existing_fact) in refined_olds:
+                continue
+            if _normalize_ws(existing_fact.object or "") not in coarse_texts:
+                continue
+            slug = (existing_fact.subject or "").rsplit(".", 1)[-1]
+            target = next(
+                (new for _, new in refined if new.subject.endswith("." + slug)),
+                refined[0][1],
+            )
+            refined.append((existing_fact, target))
     written = persist_facts(
         store, ExtractionResult(facts=facts), "personal_fact_split",
     )

@@ -170,4 +170,20 @@ def _recent_dialogue_messages(
             "role": role,
             "content": ungroup_thousands(content[:_JUDGE_CONTEXT_CHARS]),
         })
-    return messages
+    return drop_leading_assistant(messages)
+
+
+def drop_leading_assistant(messages: list[dict]) -> list[dict]:
+    """窓の先頭が user になるまで assistant を落とす。
+
+    llama-server (hybrid モデル) はコンテキスト checkpoint を **user メッセージの
+    境界** にしか置かない。窓が assistant で始まると system 直後に checkpoint が
+    立たず、次の呼び出し (別の窓 / 窓なし) は共有 system を再利用できずに
+    ubatch オフソット位置 (50〜60 トークン) まで巻き戻る (実測 2026-09-11:
+    assistant 始まりで cache_n=59、user 始まりで 446)。先頭の孤立した assistant
+    発話は文脈としても価値が低い。
+    """
+    i = 0
+    while i < len(messages) and messages[i].get("role") != "user":
+        i += 1
+    return messages[i:]

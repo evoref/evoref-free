@@ -506,7 +506,7 @@ class _TaskExecutionMixin:
 
             self._update_context_usage(state, messages)
             injected_messages = self.reminder_system.inject(messages, state)
-            gen_kwargs = self._build_gen_kwargs(generation_params)
+            gen_kwargs = self._build_gen_kwargs(generation_params, llm_client)
 
             text, timed_out = await self._call_llm_in_loop(
                 llm_client, injected_messages, gen_kwargs, loop,
@@ -557,12 +557,17 @@ class _TaskExecutionMixin:
         )
 
     def _build_gen_kwargs(
-        self, generation_params: dict | None,
+        self, generation_params: dict | None, llm_client=None,
     ) -> dict:
-        """LLM 生成パラメータを組み立てる (stream は呼び出し側で指定)"""
+        """LLM 生成パラメータを組み立てる (stream は呼び出し側で指定)。
+
+        ``id_slot`` はチャットスロットに固定する。``-1`` (llama-server の
+        LCP / LRU 自動割当) だとタスクループがチャットスロットの接頭辞を追い出す
+        か分類器スロットに乗るため (2026-09-11)。
+        """
         gen_kwargs: dict = {
             "max_tokens": self._execute_max_tokens,
-            "id_slot": -1,
+            "id_slot": getattr(llm_client, "chat_slot", -1),
         }
         if generation_params:
             for k in ("temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "repetition_penalty"):
