@@ -387,8 +387,14 @@ class DebugLogger:
             **{k: v for k, v in (stats or {}).items() if k not in ("timestamp", "op")},
         })
 
-    def log_kv_cache(self, *, tokens_prompt: int, tokens_cached: int) -> None:
-        """KV キャッシュヒット状況を記録（llama-server usage.prompt_tokens_details から）"""
+    def log_kv_cache(
+        self, *, tokens_prompt: int, tokens_cached: int, slot: int | None = None,
+    ) -> None:
+        """KV キャッシュヒット状況を記録（llama-server usage.prompt_tokens_details から）
+
+        ``slot`` はどの並列スロット (chat=0 / background=1 / classifier=2) の
+        プレフィクスが再利用されたか。スロットごとの効きを分けて見るため。
+        """
         if not self.enabled or not self.log_requests:
             return
         self._emit("requests", {
@@ -396,6 +402,7 @@ class DebugLogger:
             "op": "kv_cache",
             "tokens_prompt": tokens_prompt,
             "tokens_cached": tokens_cached,
+            "slot": slot,
         })
 
     # ------------------------------------------------------------------

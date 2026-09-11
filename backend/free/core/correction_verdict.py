@@ -115,6 +115,42 @@ def norm_span(text: str) -> str:
     return _ascii(text).lower()
 
 
+#: 直後に続けば「その値を否定している」と読める標識 (訂正への回答側)。
+_DISPUTE_MARKER_RE = re.compile(
+    r"\s*[」』）)]?\s*(?:ではなく|ではありません|ではない|じゃなく|とは限らず"
+    r"|は誤り|は間違|というのは誤|は正しくあり|is\s+not|isn't|incorrect)",
+)
+_CONTENT_RUN_RE = re.compile(r"[一-龥ァ-ヶーA-Za-z0-9]{2,}")
+#: 値の内容語の直後 (この文字数以内) に否定標識があれば否定とみなす。
+_DISPUTE_WINDOW = 14
+
+
+def answer_disputes_value(answer: str, correct_value: str) -> bool:
+    """訂正への回答が、訂正で示された値そのものを否定しているか (純粋関数)。
+
+    検証器は (直前の応答, 訂正発話) だけを見て「アシスタントの誤りを指して
+    いる」と判定するが、**その訂正が正しいか** は判定しない。ユーザーが
+    誤った訂正 (「302 は恒久的な移転を示すコードです」) をし、アシスタントが
+    その場で退けた (「302 は恒久的な移転を示すコードではなく、一時的な…」)
+    場合、値は受け入れられていない。受け入れられなかった値を検証済み訂正
+    として記憶 (world assertion / 属性の supersede) や学習 (訂正ペア) に
+    流すと、**退けた誤りをシステムが採用する** (2026-09-11 ライブ監査 (j)
+    J-04)。値の内容語の直後に否定標識が続けば否定と読む — 「〜ではなく、
+    正しくは…」の形は回答の常態で、語彙ではなく構造で取れる。
+    """
+    body = answer or ""
+    if not body or not (correct_value or "").strip():
+        return False
+    for run in _CONTENT_RUN_RE.findall(correct_value):
+        start = 0
+        while (pos := body.find(run, start)) >= 0:
+            start = pos + len(run)
+            tail = body[start:start + _DISPUTE_WINDOW]
+            if _DISPUTE_MARKER_RE.match(tail):
+                return True
+    return False
+
+
 def claim_numbers(text: str) -> tuple[str, ...]:
     """主張に含まれる数値を正規化して返す (桁区切り除去 / 末尾ゼロ整理)。"""
     out: list[str] = []

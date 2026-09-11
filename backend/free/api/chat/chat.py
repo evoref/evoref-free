@@ -1766,6 +1766,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 state.tool_call_judge.judge(
                     req.message, state.tools_registry, req.mode, history,
                     session_id=session_id,
+                    window_complete=session_evicted_turns(state, session_id) == 0,
                 )
             )
         if agent_layer != "reactive":

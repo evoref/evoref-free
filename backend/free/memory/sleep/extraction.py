@@ -25,6 +25,8 @@
 
 from __future__ import annotations
 
+import re
+
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -76,9 +78,99 @@ def persist_facts(
                 label, fact.id, exc,
             )
     _supersede_corrected_slots(store, persisted, label)
+    _retire_assertions_contradicted_by_change(store, persisted, label)
     if written:
         logger.debug("Step 8 [%s]: persisted %d facts", label, written)
     return written
+
+
+#: 「<旧> ではなく <新>」の旧値 span。``ではなく`` の直前で、主題・目的語の
+#: 助詞か読点から後ろを旧値とみなす (助詞が無ければ文頭から)。
+_OLD_VALUE_BEFORE_NEGATION_RE = re.compile(
+    r"(?:^|[はがをもに、，,。．])\s*(?P<old>[^、，,。はがをも]{2,40}?)\s*(?:ではなく|じゃなく)",
+)
+_ASSERTION_SUBJECT_PREFIX = "mem.world.assertion."
+
+
+def _old_value_spans(fact: object) -> list[str]:
+    """変更 / 訂正ファクトが無効化する旧値の逐語 span (正規化済み)。"""
+    from backend.free.core.correction_verdict import norm_span
+
+    spans: list[str] = []
+    # ``statement`` は訂正形を新値だけに畳んである (``_reduce_correction_statement``)
+    # ので旧値は **object (原文)** にしか無い。両方を見る (実機再検証で
+    # statement だけを見て 0 件だった)。
+    for text in (
+        str(getattr(fact, "object", "") or ""),
+        str(getattr(fact, "statement", None) or ""),
+    ):
+        for m in _OLD_VALUE_BEFORE_NEGATION_RE.finditer(text):
+            old = norm_span(m.group("old"))
+            if len(old) >= 2 and old not in spans:
+                spans.append(old)
+    return spans
+
+
+def _retire_assertions_contradicted_by_change(
+    store: "SemanticFactStore", persisted: list, label: str,
+) -> int:
+    """属性スロットへ入った変更が、同じ旧値を持つ world assertion も畳む。
+
+    「来週の木曜日に顧客へ提案書を送る予定です」は Step 8 が型付けできず
+    assertion curator が ``mem.world.assertion.proposal_submission_plan``
+    に置く。次の「送付は来週の木曜日ではなく、再来週の月曜日にします」は
+    ``変わりました`` / ``ではなく`` で personal_fact (schedule) に型付け
+    されるので curator には届かず、assertion 側は旧日付のまま live で残り、
+    別セッションの「提案書を送る予定日は」に旧日付が注入された
+    (2026-09-10 ライブ監査 (i) I-15)。訂正の宛先を subject で結べないので
+    **旧値の逐語 span** で結ぶ (値アンカーと同じ根拠)。同じセッション由来の
+    assertion に限る (別会話の同じ言い回しまで消さない)。
+
+    Returns:
+        supersede した assertion 数。
+    """
+    from backend.free.core.correction_verdict import norm_span
+
+    superseded = 0
+    search = getattr(store, "search_by_pillar_prefix", None)
+    if search is None:
+        return 0
+    for fact in persisted:
+        subject = str(getattr(fact, "subject", "") or "")
+        if subject.startswith(_ASSERTION_SUBJECT_PREFIX):
+            continue
+        spans = _old_value_spans(fact)
+        if not spans:
+            continue
+        sessions = set(getattr(fact, "session_ids", None) or ())
+        try:
+            assertions = search(_ASSERTION_SUBJECT_PREFIX, include_superseded=False)
+        except Exception as exc:  # noqa: BLE001 - 読めなければ何も畳まない
+            logger.warning("Step 8 [%s]: failed to list assertions: %s", label, exc)
+            return superseded
+        for old in assertions:
+            if old.superseded_by or old.id == fact.id:
+                continue
+            if sessions and not (set(getattr(old, "session_ids", None) or ()) & sessions):
+                continue
+            if getattr(old, "created_at", 0.0) > getattr(fact, "created_at", 0.0):
+                continue
+            body = norm_span(str(getattr(old, "object", "") or ""))
+            if not any(span in body for span in spans):
+                continue
+            try:
+                store.supersede(old.id, fact.id)
+                superseded += 1
+                logger.info(
+                    "Step 8 [%s]: assertion %s superseded by change %s (%s)",
+                    label, old.subject, fact.id, fact.subject,
+                )
+            except (KeyError, ValueError) as exc:
+                logger.warning(
+                    "Step 8 [%s]: failed to supersede %s -> %s: %s",
+                    label, old.id, fact.id, exc,
+                )
+    return superseded
 
 
 def _supersede_corrected_slots(
@@ -145,19 +237,22 @@ def _supersede_corrected_slots(
     #: インスタンスタイプ訂正が同じ ``mem.personal.birthday`` (多値) に載り、
     #: ``sf_17c4c4ac9939 <-> sf_9f97d02bb6b0`` の 2-閉路になってスロットの live が
     #: 0 件になった。この関数の入口条件と勝者表の条件は同じでなければならない。
+    def _collapses(fact: object) -> bool:
+        # 検証済み訂正 / 単値スロット / 本人の値更新 (「本社ではなく名古屋支社」
+        # を旧値の言明へ置換した行、J-03) が旧世代を畳む側に回る。
+        return bool(
+            getattr(fact, "from_correction", False)
+            or getattr(fact, "value_update", False)
+            or is_single_valued_subject(getattr(fact, "subject", "") or "")
+        )
+
     winners: dict[tuple[str, str], object] = {}
     for fact in persisted:
-        if not (
-            getattr(fact, "from_correction", False)
-            or is_single_valued_subject(getattr(fact, "subject", "") or "")
-        ):
+        if not _collapses(fact):
             continue
         winners[(fact.subject, fact.predicate)] = fact
     for fact in persisted:
-        if not (
-            getattr(fact, "from_correction", False)
-            or is_single_valued_subject(getattr(fact, "subject", "") or "")
-        ):
+        if not _collapses(fact):
             continue
         # 単値スロットは勝者だけが畳む側に回る (敗者は何も supersede しない)。
         winner = winners.get((fact.subject, fact.predicate))
@@ -173,6 +268,17 @@ def _supersede_corrected_slots(
                 label, fact.subject, exc,
             )
             continue
+        # 本人の値更新は **旧値を含む世代だけ** を畳む。schedule のような並列多値
+        # スロットで全兄弟を畳むと、別の予定 (提案書の送付日) まで消える。
+        update_span = str(getattr(fact, "value_update", "") or "")
+        if update_span:
+            from backend.free.core.correction_verdict import norm_span
+
+            needle = norm_span(update_span)
+            siblings = [
+                o for o in siblings
+                if needle and needle in norm_span(str(getattr(o, "object", "") or ""))
+            ]
         for old in siblings:
             if old.id == fact.id or old.predicate != fact.predicate:
                 continue

@@ -951,14 +951,32 @@ class LearningScheduler:
         - _yield_event が立っている（cancel/ユーザー入力）
         - user_active_checker が True（in_flight_chat_count > 0 等）
         """
-        if self._yield_event.is_set():
-            return True
+        active: bool | None = None
         if self._user_active_checker is not None:
             try:
-                if self._user_active_checker():
-                    return True
+                active = bool(self._user_active_checker())
             except Exception as e:
                 logger.warning("user_active_checker raised: %s", e)
+        if active:
+            return True
+        if self._yield_event.is_set():
+            # yield 要求は **レベル信号** (ユーザーが活動中) であって、立てた
+            # 瞬間の出来事ではない。yield を見ないフェーズ (few-shot 採点 /
+            # critique、数分掛かる) の間に立った要求が、ユーザーが去った後の
+            # 最初の世代境界で消費され、進化を 1 世代で打ち切って resume
+            # (フェーズ全部やり直し) していた (2026-09-10 ライブ監査 (i) I-16:
+            # 最終チャット 21:21 → 世代 1 完了 21:28 で yield → 21:29 resume)。
+            # 活動判定が「もう居ない」と言うなら要求は失効させる。判定が
+            # 配線されていない経路 (単体テスト / 破壊的 cancel) は従来どおり
+            # sticky に扱う。
+            if active is False:
+                self._yield_event.clear()
+                self._cancelled = False
+                logger.info(
+                    "Learning yield request expired (user no longer active)",
+                )
+                return False
+            return True
         return False
 
     def reset_yield_event(self) -> None:
@@ -1500,7 +1518,9 @@ class LearningScheduler:
         skipped: list[str] = []
 
         async def _phase(name: str, fn) -> None:
-            if self._cancelled:
+            # ``should_yield`` を先に通す — 失効した要求 (ユーザーが去った後に
+            # 残った ``_cancelled``) を消してから sticky を見る。
+            if self.should_yield() or self._cancelled:
                 skipped.append(name)
                 return
             out = fn()

@@ -20,6 +20,7 @@ from backend.free.core.intent_vocab import (
     memorize_request,
     own_process_question,
     persist_request,
+    refers_to_ongoing_session,
     request_clauses,
     write_prohibited,
     runtime_info_question,
@@ -82,15 +83,24 @@ LONG_FORM_PATTERNS = [
     # (2026-09-02 監査 A2)。要約系の語 (要約 / 要点 / 読んで / 整理) と共起する
     # 「まとめ」、および指示詞 (この / その / あの) で既存の成果物を指した
     # 文書名詞に付く「まとめ」は採らない。書 / 作成 / 生成 / 出力 は従来どおり。
+    #
+    # 文書名詞と動詞の間に **2 つ目の「を」** があるなら、文書名詞はその動詞の
+    # 目的語ではない (別の動詞の目的語 = 話題)。「提案書を送る日と税込金額を
+    # まとめてください」は「提案書」が「送る」の目的語で、まとめる対象は
+    # 会話にある日付と金額。cogwriter のユニット分割に回ると、会話の値を
+    # 捨てて理由を捏造した文書を 104 秒かけて返した (2026-09-10 ライブ監査
+    # (i) I-04。前回の「見積書」は名詞リストに無く素通りしただけ)。
+    # 「提案書を来週までにまとめて」(を 1 つ) / 「README を参考に手順書を
+    # 作成して」(後ろの名詞で 1 つ) は従来どおり採る。
     re.compile(
         rf"({'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX + DOCUMENT_NOUNS_STANDALONE)})"
-        r".*((?<!箇条)(?<!横)(?<!縦)書|作成|生成|出力)",
+        r"(?:を)?[^を]*((?<!箇条)(?<!横)(?<!縦)書|作成|生成|出力)",
     ),
     re.compile(
         r"^(?!.*(?:要約|要点|読んで|整理))"
         r"(?<!この)(?<!その)(?<!あの)"
         rf"(?:{'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX + DOCUMENT_NOUNS_STANDALONE)})"
-        r".*まとめ",
+        r"(?:を)?[^を]*まとめ",
     ),
     # 「長文」「長編」の言及、または「長い」+ 創作文書系名詞 (物語/小説等、
     # pattern[1] の文書名詞リストには含まれない) の言及が、生成依頼のて形
@@ -117,6 +127,14 @@ LONG_FORM_PATTERNS = [
         r".*(?:して|しろ|(?:を)?お願い|書いて|作って|作成|生成|出力)",
     ),
 ]
+
+#: 学習済み long_form 語で発火するときの構造条件: 文書名詞が (2 つ目の「を」を
+#: 挟まずに) 生成系の動詞へ掛かること。``LONG_FORM_PATTERNS`` の 1・2 番目と
+#: 同じ形。
+_LEARNED_LONG_FORM_OBJECT_RE = re.compile(
+    rf"(?:{'|'.join(DOCUMENT_NOUN_LEARNABLE_JA)})"
+    r"(?:を)?[^を]*(?:(?<!箇条)(?<!横)(?<!縦)書|作成|生成|出力|まとめ)",
+)
 
 # LONG_FORM_PATTERNS の英語版。GUI locale に関わらず LONG_FORM_PATTERNS と
 # 常に両方評価する (2026-07-22 発見: GUI locale が既定 'ja' のまま英語で
@@ -1079,6 +1097,14 @@ _CLASSIFY_RULES: tuple[_ClassifyRule, ...] = (
         "history_ref", "deliberative",
         lambda c, x: c._has_history_keywords(x.query),
     ),
+    # 進行中の会話への自己参照 (「この会話の計算結果を表にして」) も履歴参照と
+    # 同じく窓から答える。``tool_patterns`` (計算 / ツール) に落ちると
+    # meta_cognitive が現在セッションを search_history で探し回る
+    # (:func:`refers_to_ongoing_session` のコメント参照)。
+    _ClassifyRule(
+        "session_self_reference", "deliberative",
+        lambda c, x: refers_to_ongoing_session(x.query),
+    ),
     _ClassifyRule(
         "complex_keywords", "deliberative",
         lambda c, x: c._has_complex_keywords(x.query),
@@ -1564,6 +1590,12 @@ class ComplexityClassifier:
         if not matches:
             return False
         if not any(noun in query for noun in DOCUMENT_NOUN_LEARNABLE_JA):
+            return False
+        # 文書名詞が **生成動詞の目的語** でなければ発火しない (ハードコード側
+        # と同じ構造条件)。誤ルートの 1 ターンで '提案書' が long_form として
+        # 学習され、以後「提案書を送る日をまとめて」型が学習語だけで
+        # meta_cognitive へ流れる自己増幅を止める (2026-09-10 (i) I-04)。
+        if not _LEARNED_LONG_FORM_OBJECT_RE.search(query):
             return False
         eligible = [w for _, w in matches if w >= self._long_form_threshold]
         if len(eligible) >= 2:

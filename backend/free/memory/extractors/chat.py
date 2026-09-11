@@ -40,6 +40,9 @@ from backend.free.core.text_quality import (
     strip_interrogative_sentences,
 )
 from backend.free.memory.extractors.base import (
+    date_shift_days,
+    shift_annotated_date,
+    value_update_spans,
     BaseExtractor,
     ExtractionContext,
     ExtractionResult,
@@ -493,6 +496,43 @@ def _attribute_evidence_text(
     return _strip_clause_tail(narrowed) if narrowed else ""
 
 
+#: 値を持たない「変更の告知」だけの文 (「会議の場所も変わりました。」)。
+_CHANGE_ANNOUNCEMENT_RE = re.compile(
+    r"(?:変わりました|変わった|変更(?:に)?なりました|変更しました|変更です"
+    r"|延期になりました|延期です|前倒しになりました)[。．.!！]*\s*$",
+)
+
+
+def _drop_shadowed_by_predicate_slot(
+    attr_specs: list[tuple[str, str, tuple[str, ...]]],
+) -> list[tuple[str, str, tuple[str, ...]]]:
+    """同じ本文が複数スロットに立つとき、述語に最も近いトリガのスロットだけ残す。
+
+    「先日誕生日を迎えたので39歳です」は ``誕生日`` (birthday) と ``歳です``
+    (age) の両方に当たり、節でも分けられないので同じ本文が 2 スロットに
+    入る。値を担うのは **述語** (文末に近いトリガ) で、``誕生日を迎えたので``
+    は理由節。同じ本文を 2 つ持つと birthday の現在値が年齢になる
+    (2026-09-10 ライブ監査 (i) I-13)。本文が異なるスロット (節で分けられた
+    もの) は触らない。純粋関数。
+    """
+    by_text: dict[str, list[tuple[str, str, tuple[str, ...]]]] = {}
+    for spec in attr_specs:
+        by_text.setdefault(spec[1], []).append(spec)
+    kept: list[tuple[str, str, tuple[str, ...]]] = []
+    for spec in attr_specs:
+        group = by_text[spec[1]]
+        if len(group) < 2 or not spec[2]:
+            kept.append(spec)
+            continue
+
+        def _last_pos(s: tuple[str, str, tuple[str, ...]]) -> int:
+            return max((s[1].rfind(w) for w in s[2] if w), default=-1)
+
+        if all(_last_pos(spec) >= _last_pos(o) for o in group if o[2]):
+            kept.append(spec)
+    return kept
+
+
 def _narrow_further_by_clause(
     narrowed: str, attr_words: tuple[str, ...], all_attr_words: tuple[str, ...],
 ) -> str:
@@ -663,8 +703,23 @@ def _narrow_by_units(
 
     kept: list[str] = []
     awaiting_value = False
+    # 節単位のときは、同じ文の先行節を主語の文脈として持ち回る
+    # (「妹は東京の品川に住んでいて、看護師をしています」の第 2 節は
+    # 単独では主語を持たない)。文が終わればリセット。
+    sentence_prefix = ""
     for unit in units:
+        probe = sentence_prefix + unit
+        sentence_prefix = "" if _SENTENCE_BREAK_TAIL_RE.search(unit) else probe
         if _mentions_any(unit, attr_words):
+            # 本人以外が主語の単位 (「妹は東京の品川に住んでいて」) は、
+            # 属性語を含んでいても本人の値ではない。発話全体で見る
+            # ``attribute_belongs_to_another_person`` は「1 つでも本人の
+            # 出現があれば本人」と答えるので、本人の文と妹の文が並ぶと
+            # 妹の文まで location の本文に連れて行っていた
+            # (2026-09-10 ライブ監査 (i) I-10)。
+            if attribute_belongs_to_another_person(probe, attr_words):
+                awaiting_value = False
+                continue
             kept.append(unit)
             # 値を述べていない属性文 (「職業も変わりました。」) だけが
             # 後続文を引き継ぐ。値がある文は従来どおり単独で完結させる。
@@ -1298,11 +1353,25 @@ def _slot_anchor_index(
     }
 
 
+def _contains_anchor(haystack: str, anchor: str) -> bool:
+    """``anchor`` が ``haystack`` に **語として** 現れるか (純粋関数)。
+
+    数字だけのアンカーは数字の境界で照合する。部分文字列だと、併記日付
+    「2026-09-30」由来の「30」が「302 は恒久的な移転」の 302 に当たり、
+    HTTP の訂正が schedule スロットへ書かれた (2026-09-11 (j) J-10)。
+    """
+    if not anchor:
+        return False
+    if anchor.isdigit():
+        return re.search(rf"(?<![0-9]){re.escape(anchor)}(?![0-9])", haystack) is not None
+    return anchor in haystack
+
+
 def _anchor_hit_length(anchors: tuple[str, ...], haystack: str) -> tuple[int, str]:
     """``haystack`` に現れる最長のアンカーを ``(長さ, アンカー)`` で返す。"""
     best = (0, "")
     for anchor in anchors:
-        if _normalize_trigger(anchor) in haystack and len(anchor) > best[0]:
+        if _contains_anchor(haystack, _normalize_trigger(anchor)) and len(anchor) > best[0]:
             best = (len(anchor), anchor)
     return best
 
@@ -1321,11 +1390,11 @@ def _span_hit_length(
         return (0, "")
     best = (0, "")
     for value in values:
-        if needle in norm_span(value) and len(needle) > best[0]:
+        if _contains_anchor(norm_span(value), needle) and len(needle) > best[0]:
             best = (len(needle), span)
     for anchor in anchors:
         normalized = norm_span(anchor)
-        if normalized and normalized in needle and len(anchor) > best[0]:
+        if normalized and _contains_anchor(needle, normalized) and len(anchor) > best[0]:
             best = (len(anchor), anchor)
     return best
 
@@ -1359,9 +1428,12 @@ def resolve_value_anchored_matches(
     index = _slot_anchor_index(live_values)
     resolved: dict[tuple[str, str], tuple[str, str]] = {}
     for note in notes:
-        if note_verification_rejected(note):
-            continue
         content = note.content or ""
+        # 検証で却下された候補でも、「X ではなく Y」の本人の値更新なら記憶の
+        # 宛先は旧値 X で決まる (:func:`value_update_spans`)。それ以外の却下は
+        # 従来どおり経路に乗せない。
+        if note_verification_rejected(note) and value_update_spans(content) is None:
+            continue
         if not content:
             continue
         verified = note_is_verified_correction(note)
@@ -1399,7 +1471,27 @@ def resolve_value_anchored_matches(
                 if best:
                     break
         else:
+            # 本人の値更新 (「本社ではなく名古屋支社です」) は旧値 X が明示されて
+            # いるので、アンカー索引 (短い漢字語は G-01 で除外) を通さず、X が
+            # live 値に逐語で在るスロットを直接当てる (J-03)。
+            update = value_update_spans(content)
+            explicit: set[str] = set()
+            if update is not None:
+                needle = norm_span(update[0])
+                for (tag, attr), (values, _anchors) in index.items():
+                    for value in values:
+                        if needle and needle in norm_span(value):
+                            current = best.get(tag)
+                            if current is None or len(needle) > current[0]:
+                                best[tag] = (len(needle), attr, update[0])
+                                explicit.add(tag)
+                            break
             for (tag, attr), (values, anchors) in index.items():
+                # 明示された旧値 (「本社ではなく」) が当たった tag は、一般の
+                # アンカー (live 値の全文 = 値なしの旧行「会議の場所も変わり
+                # ました」等、長い一致) に上書きさせない。
+                if tag in explicit:
+                    continue
                 length, anchor = _anchor_hit_length(anchors, haystack)
                 if not length:
                     continue
@@ -1572,6 +1664,7 @@ class ChatExtractor(BaseExtractor):
                 continue
             result.notes_processed += 1
             content = note.content or ""
+            value_update_restated = False
             is_assistant_note = getattr(note, "source", "user") != "user"
             # 生成物 (コード等) の断片は user/world ファクトの素材にならない
             # (2026-07-15: 誤ルート生成の Python コードが mem.world.from として
@@ -1736,7 +1829,55 @@ class ChatExtractor(BaseExtractor):
                     correct_value = (
                         _verified_correct_value(note) if len(matches) == 1 else ""
                     )
-                    if correct_value:
+                    wrong_claim = str(getattr(note, "correction_wrong_claim", "") or "")
+                    if not correct_value and len(matches) == 1:
+                        # 本人の値更新 (検証の verdict に依らない)。旧値が宛先
+                        # スロットの現在値に逐語で在るときだけ採る (J-03)。
+                        update = value_update_spans(content)
+                        _anchor_hit = value_anchored_matches.get((note.id, tag), ("", ""))[1]
+                        if update is not None and not _anchor_hit:
+                            # 旧値が **同じバッチで先に組んだ候補** にしか無い
+                            # (言明と更新が同じ Full で抽出される常態)。ストアの
+                            # live 値の索引には無いので候補側で当てる。
+                            _subject_u = make_mem_subject(kind, matches[0][0] or "user")
+                            _needle = norm_span(update[0])
+                            for _n, f in reversed(candidates):
+                                if f.subject == _subject_u and _needle in norm_span(f.object or ""):
+                                    _anchor_hit = update[0]
+                                    break
+                        if update is not None and _anchor_hit and (
+                            norm_span(update[0]) in norm_span(_anchor_hit)
+                            or norm_span(_anchor_hit) in norm_span(update[0])
+                        ):
+                            wrong_claim, correct_value = update
+                            value_update_restated = True
+                        elif update is None:
+                            # 「会議が 1 週間延期」— 既存の予定の日付をずらす申告。
+                            # 同じ事象の語 (会議) を共有する live 値の併記日付を
+                            # 決定論でずらした言明に置換する (J-02)。
+                            shift = date_shift_days(content)
+                            _attr0 = matches[0][0] or "user"
+                            if shift is not None and _attr0 != "user":
+                                _subject0 = make_mem_subject(kind, _attr0)
+                                pool = tuple(
+                                    f.object for _n, f in reversed(candidates)
+                                    if f.subject == _subject0
+                                ) + tuple(ctx.live_attribute_values.get((tag, _attr0)) or ())
+                                words = {
+                                    w for w in _CONTENT_RUN_RE.findall(content)
+                                    if len(w) >= 2 and not w.isdigit()
+                                }
+                                for value in pool:
+                                    if not any(w in value for w in words):
+                                        continue
+                                    shifted = shift_annotated_date(value, shift)
+                                    if shifted is None:
+                                        continue
+                                    wrong_claim, _new_span, restated = shifted
+                                    correct_value = restated
+                                    value_update_restated = True
+                                    break
+                    if correct_value and not value_update_restated:
                         # 裸の値でなく訂正後の言明を残す (H-01、
                         # :func:`restate_with_correction`)。retire される現在値は
                         # ストアの live 値に加えて **同じバッチで先に組んだ候補**
@@ -1749,10 +1890,35 @@ class ChatExtractor(BaseExtractor):
                             if f.subject == _subject
                         ) + tuple(ctx.live_attribute_values.get((tag, _attr)) or ())
                         correct_value = restate_with_correction(
-                            _sources,
-                            str(getattr(note, "correction_wrong_claim", "") or ""),
-                            correct_value,
+                            _sources, wrong_claim, correct_value,
                         ) or correct_value
+                    elif value_update_restated and value_update_spans(content) is not None:
+                        # 「X ではなく Y」の値更新は旧値の言明の X を Y に置換する
+                        _attr = matches[0][0] or "user"
+                        _subject = make_mem_subject(kind, _attr)
+                        _sources = tuple(
+                            f.object for _n, f in reversed(candidates)
+                            if f.subject == _subject
+                        ) + tuple(ctx.live_attribute_values.get((tag, _attr)) or ())
+                        correct_value = restate_with_correction(
+                            _sources, wrong_claim, correct_value,
+                        ) or correct_value
+                        # 更新の発話に **別の言明** が続くなら (「去年は白馬岳
+                        # でした」)、言い直した言明の後ろに残す。落とすと新しい
+                        # 値が記憶に入らない (F-10 の hobby)。変更の告知だけの文
+                        # (「会議の場所も変わりました」) は値を持たないので落とす。
+                        extra = [
+                            sent for sent in _SENTENCE_SPLIT_RE.split(content)
+                            if sent.strip()
+                            and "ではなく" not in sent and "じゃなく" not in sent
+                            and not _carries_no_value(sent)
+                            and not _CHANGE_ANNOUNCEMENT_RE.search(sent)
+                            # 謝罪と誤りの印だけの前置き (「すみません、住まいを
+                            # 間違えました」) は値を述べていない
+                            and _states_attribute_value(sent, tuple(matches[0][1]))
+                        ]
+                        if extra:
+                            correct_value = correct_value.rstrip("。．") + "。" + "".join(extra)
                     # 属性語を持たないスロット (値アンカー / 継承) は
                     # ``_attribute_evidence_text`` が絞れないので、アンカーで
                     # 絞り直す。それでも絞れなければ従来どおり全文
@@ -1780,6 +1946,7 @@ class ChatExtractor(BaseExtractor):
                         spec for spec in attr_specs
                         if not attribute_belongs_to_another_person(spec[1], spec[2])
                     ]
+                    attr_specs = _drop_shadowed_by_predicate_slot(attr_specs)
                 else:
                     # world_fact もユーザーが断定した知識に限る。トリガ語
                     # (「とは」「である」) を含む文が疑問形/依頼形しかない
@@ -1838,8 +2005,13 @@ class ChatExtractor(BaseExtractor):
                         # 証拠として残し、提示・比較・埋め込みは fact.text 経由で
                         # statement を優先する。切り出せなければ None のままで
                         # 従来と同じ挙動。
+                        # 言明の文だけに絞った ``object_text`` から命題化する。
+                        # 絞る前の ``evidence`` を渡すと、依頼の文 (「私と妹と
+                        # 父の職業をそれぞれ教えてください」) が statement
+                        # (= ``fact.text``、注入で優先される側) に残る
+                        # (2026-09-10 ライブ監査 (i) I-10)。
                         statement=normalize_statement(
-                            evidence,
+                            object_text,
                             tuple(self._builder.fact_triggers.get(tag, ())),
                             attr_words,
                         ),
@@ -1848,6 +2020,11 @@ class ChatExtractor(BaseExtractor):
                         note=note,
                         ctx=ctx,
                     )
+                    # 本人の値更新で言い直した行は、旧値を持つ live 値を畳む側に
+                    # 回る (``sleep.extraction._supersede_corrected_slots``)。
+                    # from_correction は「検証済みの訂正」の印なので流用しない。
+                    if value_update_restated:
+                        fact.value_update = wrong_claim  # type: ignore[attr-defined]
                     candidates.append((note, fact))
 
         candidates, collapsed = _collapse_equivalent_candidates(candidates)

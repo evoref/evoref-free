@@ -42,6 +42,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from backend.free.core.correction_verdict import (
+    answer_disputes_value,
     build_correction_verify_prompt,
     check_verdict,
 )
@@ -140,6 +141,30 @@ def previous_turn_context(
             if len(prev_users) >= _SELF_CONTEXT_TURNS:
                 break
     return prev_response, "\n".join(reversed(prev_users))
+
+
+def reply_to(ordered: list["MemoryNote"], note: "MemoryNote") -> str:
+    """同一セッションで ``note`` の **直後** のアシスタント応答 (純粋関数)。
+
+    訂正への回答。無ければ空文字列。
+    """
+    session = _session_of(note)
+    created_at = float(getattr(note, "created_at", 0.0) or 0.0)
+    for candidate in ordered:
+        if candidate is note or _session_of(candidate) != session:
+            continue
+        if float(getattr(candidate, "created_at", 0.0) or 0.0) <= created_at:
+            continue
+        if str(getattr(candidate, "source", "user") or "user") != "assistant":
+            continue
+        content = str(getattr(candidate, "content", "") or "")
+        if content.strip():
+            return content
+    return ""
+
+
+#: 訂正の形だが、アシスタントがその場で値を退けた (受け入れなかった)。
+DISPUTED = "disputed"
 
 
 def mark(
@@ -266,6 +291,17 @@ async def curate_corrections(
             prev_user=prev_user,
         )
         verdict = verdict_label(check)
+        # 訂正への回答が値を退けていれば、検証済み訂正として消費しない
+        # (:func:`answer_disputes_value` の docstring、J-04)。
+        if check.ok and answer_disputes_value(
+            reply_to(ordered, note), check.correct_value,
+        ):
+            logger.info(
+                "correction_curator: note=%s value %r was disputed by the reply; "
+                "not consumed as a correction", getattr(note, "id", "?"),
+                check.correct_value[:40],
+            )
+            verdict = DISPUTED
         mark(
             note, verdict,
             wrong_claim=check.wrong_claim,
@@ -284,7 +320,9 @@ async def curate_corrections(
 
 
 __all__ = [
+    "DISPUTED",
     "NO_CONTEXT",
+    "reply_to",
     "curate_corrections",
     "mark",
     "pending_notes",

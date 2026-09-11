@@ -39,6 +39,7 @@ from backend.free.core.intent_vocab import (
 )
 from backend.free.learning.corrected_pairs import (
     CorrectedPair,
+    depends_on_context,
     refers_to_previous_turn,
 )
 from backend.free.core.text_quality import (
@@ -346,6 +347,65 @@ _SELF_WORD_WITH_RECALL_RE = re.compile(
 )
 
 
+#: 応答中の絶対日付 (年月日 / 月日) と金額 (円 / 万円 / ドル)。
+_CONTEXT_DATE_RE = re.compile(
+    r"(?:\d{4}\s*[-/年]\s*)?\d{1,2}\s*[-/月]\s*\d{1,2}\s*日?",
+)
+_CONTEXT_AMOUNT_RE = re.compile(
+    r"\d[\d,.]*\s*(?:万|億)?\s*(?:円|ドル|ユーロ|元|USD|JPY|EUR)",
+)
+
+
+#: 「現在の周辺」とみなす年の幅 (前年〜2 年後)。予定・締切・送付日はこの幅に
+#: 収まり、史実 (1945 年) や記念日 (年無し) はここから外れる。
+_NEAR_YEAR_BACK = 1
+_NEAR_YEAR_AHEAD = 2
+
+
+def _context_bound_values(query: str, response: str) -> bool:
+    """応答が、問いに現れない **会話由来の** 絶対日付 / 金額を述べているか (純粋関数)。
+
+    数字の並びで照合する (「9月21日」と「2026-09-21」を同一視するため、
+    数字以外を落とした列で比べる)。問い側に同じ数字列があれば問いの復唱で
+    あって会話由来ではない。
+
+    日付は **年が現在の周辺** (前年〜2 年後) のものだけを会話由来とみなす。
+    史実 (「終戦記念日は 1945 年 8 月 15 日」) は年が遠く、記念日
+    (「憲法記念日は 5 月 3 日」) は年を持たない — どちらも毎日成立する知識で
+    手本に残してよい。年の無い日付は、問いが文脈依存 (``depends_on_context``:
+    照応 / 想起 / 本人の話) のときだけ会話由来とみなす。金額は知識として
+    持ち越せる場面がほぼ無い (物価は揮発する) ので、問いに無ければ落とす。
+    """
+    def _numbers(text: str) -> set[int]:
+        # 「09」と「9」、「1,375,000」と「1375000」を同一視する
+        return {int(n) for n in re.findall(r"\d+", (text or "").replace(",", ""))}
+
+    def _restated(span: str) -> bool:
+        nums = _numbers(span)
+        return bool(nums) and nums <= query_numbers
+
+    query_numbers = _numbers(query)
+    for m in _CONTEXT_AMOUNT_RE.finditer(response or ""):
+        if not _restated(m.group(0)):
+            return True
+    this_year = utc_now_dt().year
+    context_query: bool | None = None
+    for m in _CONTEXT_DATE_RE.finditer(response or ""):
+        if _restated(m.group(0)):
+            continue
+        year_match = re.match(r"\s*(\d{4})", m.group(0))
+        if year_match:
+            year = int(year_match.group(1))
+            if this_year - _NEAR_YEAR_BACK <= year <= this_year + _NEAR_YEAR_AHEAD:
+                return True
+            continue
+        if context_query is None:
+            context_query = depends_on_context(query)
+        if context_query:
+            return True
+    return False
+
+
 def _find_volatile_reason(query: str, response: str) -> str | None:
     """例が「その時点でしか成立しない」ものかを判定する (純粋関数)。
 
@@ -367,6 +427,12 @@ def _find_volatile_reason(query: str, response: str) -> str | None:
     """
     if _PRESENT_TIME_RE.search(query) and _ABSOLUTE_DATETIME_RE.search(response):
         return "time-dependent answer (asserts a date/weekday valid only that day)"
+    # 問いに無い **絶対日付 / 金額** を述べる応答は、その値を会話から取っている
+    # (「提案書を送る日と税込金額をまとめて」→「9月21日、88万円」)。手本に
+    # なると別の会話の同じ形の問いに **この会話の日付と金額** を提示する
+    # (2026-09-10 ライブ監査 (i) I-18: 検証セッションの 9/21 が手本に載り、
+    # 別セッションの想起がそれで「正答」していた)。日付・金額は会話固有の値の
+    # 典型で、知識定数 (音速 340 m/s) とは違い手本として持ち越せない。
     # 日付演算の答えは **その問いの数値** であって文体の手本ではない。手本に
     # なると、同じ問いに対しツールの計算結果より手本の日付が優先される
     # (2026-09-08 検証: 誤答「10月14日」が手本に昇格し、ツールが 10/20 を
@@ -390,6 +456,8 @@ def _find_volatile_reason(query: str, response: str) -> str | None:
         return "user-dependent answer (asserts the user's personal attributes)"
     if _USER_SELF_REFERENCE_RE.search(query) or _SELF_WORD_WITH_RECALL_RE.search(query):
         return "user-dependent answer (the question is about the user themselves)"
+    if _context_bound_values(query, response):
+        return "context-bound answer (states a date/amount not given in the question)"
     return None
 
 

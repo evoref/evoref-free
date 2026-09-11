@@ -50,6 +50,7 @@ from backend.free.core.text_quality import (
     has_broken_ja_spacing,
     has_chinese_token_leak,
     ignores_calculate_result,
+    is_cut_off_answer,
     retracts_own_conclusion,
     value_was_adopted,
     VALUE_REJECTION_RE,
@@ -1412,6 +1413,8 @@ class FeedbackCollector:
             return "Chinese token leaked into JA response"
         if retracts_own_conclusion(text):
             return "response retracts its own conclusion mid-answer"
+        if is_cut_off_answer(text):
+            return "answer cut off mid-word"
         return None
 
     def _same_target_path(self, query: str) -> bool:

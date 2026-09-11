@@ -729,6 +729,14 @@ class SleepTimeWorker:
         result["assertion_facts_curated"] = await self._step8_4_curate_assertions(
             llm_client,
         )
+        # curator が書いた assertion は、同じ発話より後の変更 (「X ではなく Y」が
+        # 属性スロットへ入ったもの) に置き去りにされる。Step 8 の書込み時の
+        # 照合 (``_retire_assertions_contradicted_by_change``) は「そのサイクルで
+        # 書いた属性ファクト」しか見ず、assertion 側が **後から** 生まれるこの
+        # 順序では対にならない (2026-09-10 ライブ監査 (i) I-15 再検証: 送付日の
+        # 変更が schedule に入った後も proposal_submission_plan (旧日付) が
+        # live)。curator の後に live な変更ファクト全体で掃く。
+        result["assertions_retired_by_change"] = self._sweep_assertions_by_changes()
         step_durations["step8_4_assertion_curator"] = round(time.monotonic() - ts, 3)
         if self._check_cancelled():
             return result
@@ -1153,6 +1161,33 @@ class SleepTimeWorker:
             profile_id=self._profile_id,
             should_pause=self._chat_in_flight,
         )
+
+    def _sweep_assertions_by_changes(self) -> int:
+        """live な属性ファクトの「旧値 span」で world assertion を畳む (Step 8.4 後)。"""
+        from backend.free.memory.sleep.extraction import (
+            _retire_assertions_contradicted_by_change,
+        )
+
+        provider = self._semantic_store_provider
+        if provider is None:
+            return 0
+        try:
+            store = provider("global")
+        except Exception as exc:  # noqa: BLE001 - 未配線なら何もしない
+            logger.debug("Step 8.4: semantic store unavailable for sweep: %s", exc)
+            return 0
+        search = getattr(store, "search_by_pillar_prefix", None)
+        if search is None:
+            return 0
+        try:
+            changes = [
+                f for prefix in ("mem.personal.", "mem.preference.")
+                for f in search(prefix, include_superseded=False)
+            ]
+        except Exception as exc:  # noqa: BLE001 - 読めなければ何もしない
+            logger.warning("Step 8.4: failed to list attribute facts: %s", exc)
+            return 0
+        return _retire_assertions_contradicted_by_change(store, changes, "sweep")
 
     # ── Step 8.5 (URL curator) ─────────────────────────
 

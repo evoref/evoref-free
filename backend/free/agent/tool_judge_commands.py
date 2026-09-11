@@ -1244,7 +1244,14 @@ _MONTH_BUSINESS_DAYS_RE = re.compile(
     r"(?P<month>今月|来月|再来月|先月"
     r"|(?P<year>\d{4})\s*年\s*(?P<ynum>\d{1,2})\s*月"
     r"|(?P<num>\d{1,2})\s*月)"
-    r"(?:の|中の|における)?\s*(?:営業日|稼働日|平日)(?:数|は何日|はいくつ|の日数)"
+    # 名詞の直後の括弧補足 (「営業日 (平日) は何日」) は読み飛ばす。密着を
+    # 要求していたため暗算 + 「ツールで検証していない」に落ちた (2026-09-10
+    # ライブ監査 (i) I-01)。
+    # 「今月の **残りの** 営業日」は今日起点で月末まで。無いと now-only に落ちて
+    # 暗算になり、「祝日を除く」と言いながら除いていない数を返した (2026-09-10
+    # ライブ監査 (j) J-01)。
+    r"(?:の|中の|における)?\s*(?P<rest>残り(?:の)?)?\s*(?:営業日|稼働日|平日)"
+    r"(?:\s*[（(][^（）()]*[）)])?\s*(?:数|は何日|はいくつ|の日数)"
 )
 #: 発話に明示された祝日 / 休業日 (「祝日の 10 月 12 日」「11 月 3 日、11 月 23 日」)。
 _EXPLICIT_MONTH_DAY_RE = re.compile(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*日")
@@ -1292,6 +1299,11 @@ def month_business_days_from_query(
     y, mo = resolved
     first = datetime.date(y, mo, 1)
     last = datetime.date(y + mo // 12, mo % 12 + 1, 1) - datetime.timedelta(days=1)
+    # 「残り」は今日を起点にする (今日を含めて数える — 期間の両端を含める
+    # 既存の規約と揃え、開示側が「当日を含む」と述べる)。今月以外の「残り」は
+    # 意味を持たないので月初のまま。
+    if m.group("rest") and first <= today <= last:
+        first = today
     holidays: list[datetime.date] = []
     for hm, hd in _EXPLICIT_MONTH_DAY_RE.findall(query or ""):
         if int(hm) != mo:

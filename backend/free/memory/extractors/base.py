@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import re
+
 import time
 from datetime import datetime, timezone
 from collections.abc import Iterable
@@ -82,6 +84,87 @@ def note_verification_rejected(note: object) -> bool:
     if getattr(note, "correction_verified_at", None) is None:
         return False
     return not note_is_verified_correction(note)
+
+
+#: 本人の値更新の言明 —「<旧> ではなく <新> です / にします / になりました」。
+#: 断定の述語で閉じる形だけを採る (「コーヒーではなく紅茶が好きな人もいます」の
+#: ような一般論や、疑問・依頼は含めない)。
+_VALUE_UPDATE_RE = re.compile(
+    r"(?P<old>[^、，,。．はがをもにで]{1,30}?)\s*(?:ではなく|じゃなく)[、，,]?\s*"
+    r"(?P<new>[^。．、，,]{1,40}?)\s*"
+    r"(?:です|でした|にします|にしました|になりました|に変わりました|に変更|へ変更|にした)",
+)
+
+
+def value_update_spans(content: str) -> tuple[str, str] | None:
+    """「X ではなく Y」型の本人の値更新から ``(旧値, 新値)`` を取る (純粋関数)。
+
+    学習側の検証 (``correction_verdict``) は「アシスタントの誤りを指しているか」
+    を判定する。前提の変更 (「会議の場所も変わりました。本社ではなく名古屋
+    支社です」) は ``none`` / ``premise_change`` と判定されて訂正の経路から
+    外れるが、**記憶にとっては本人の値の更新** で、旧値が本人の live 値に逐語で
+    在るなら宛先も一意に決まる (2026-09-11 ライブ監査 (j) J-03: 会議の場所が
+    「本社」のまま live に残った)。宛先の照合は呼出側 (値アンカー) が行う。
+    """
+    m = _VALUE_UPDATE_RE.search(content or "")
+    if m is None:
+        return None
+    old = m.group("old").strip()
+    new = m.group("new").strip()
+    if len(old) < 2 or len(new) < 1:
+        return None
+    return old, new
+
+
+#: 「N 日 / 週間 / か月 の延期・前倒し」— 既存の予定の日付をずらす申告。
+_DATE_SHIFT_RE = re.compile(
+    r"(?P<n>\d+|[一二三四五六七八九十]+)\s*(?P<unit>日|週間|週|か月|ヶ月|カ月|ヵ月|月)\s*"
+    r"(?P<dir>延期|後ろ倒し|繰り下げ|遅らせ|遅れ|前倒し|繰り上げ|早め)",
+)
+_KANJI_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+#: 言明の中の「<相対表現> (YYYY-MM-DD)」または裸の「(YYYY-MM-DD)」。
+_ANNOTATED_DATE_RE = re.compile(
+    r"(?:(?:先々週|再来週|今週|来週|先週)\s*の?\s*[月火水木金土日]曜日?\s*"
+    r"|(?:一昨日|昨日|今日|本日|明日|明後日)\s*)?"
+    r"[(（](?P<date>\d{4}-\d{2}-\d{2})[)）]",
+)
+_WEEKDAY_JA = ("月", "火", "水", "木", "金", "土", "日")
+
+
+def date_shift_days(content: str) -> int | None:
+    """「1 週間延期」「3 日前倒し」を日数 (符号付き) に解く (純粋関数)。月は 30 日。"""
+    m = _DATE_SHIFT_RE.search(content or "")
+    if m is None:
+        return None
+    raw = m.group("n")
+    n = int(raw) if raw.isdigit() else sum(_KANJI_NUM.get(ch, 0) for ch in raw)
+    if n <= 0:
+        return None
+    unit = m.group("unit")
+    days = n * (7 if unit in ("週間", "週") else 30 if unit in ("か月", "ヶ月", "カ月", "ヵ月", "月") else 1)
+    return -days if m.group("dir") in ("前倒し", "繰り上げ", "早め") else days
+
+
+def shift_annotated_date(value: str, days: int) -> tuple[str, str, str] | None:
+    """言明中の併記日付を ``days`` ずらす。``(旧 span, 新 span, 置換後の言明)``。
+
+    「再来週の水曜日 (2026-09-23)に本社で部長会議」+7 日 →
+    「2026-09-30 (水)に本社で部長会議」。相対表現は起点が変わるので落とし、
+    絶対日付と曜日だけを残す (2026-09-11 ライブ監査 (j) J-02: 「会議が 1 週間
+    延期」で予定の日付が 9/23 のまま live に残った)。
+    """
+    from datetime import date as _date, timedelta
+
+    m = _ANNOTATED_DATE_RE.search(value or "")
+    if m is None:
+        return None
+    try:
+        old = _date.fromisoformat(m.group("date"))
+    except ValueError:
+        return None
+    new = old + timedelta(days=days)
+    new_span = f"{new.isoformat()} ({_WEEKDAY_JA[new.weekday()]})"
+    return m.group(0), new_span, value[:m.start()] + new_span + value[m.end():]
 
 
 def _utterance_time(note: object, fallback: float) -> float:

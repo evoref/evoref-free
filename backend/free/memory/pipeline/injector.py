@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Literal, Sequence
 
 from backend.free.core.intent_vocab import asks_user_profile_summary, is_plain_statement
+from backend.free.core.relative_date import absolutize_annotated_dates, annotate_relative_dates
 from backend.free.core.text_quality import (
     carries_no_assertion,
     is_payload_dump,
@@ -64,6 +65,7 @@ from backend.free.memory.attribute_key import (
     NON_ATTRIBUTE_TAILS,
     attribute_key,
 )
+from backend.free.memory.notes.note_builder import is_multi_valued_subject
 from backend.free.memory.notes.subject_ns import is_session_summary_subject
 from backend.free.memory.semantic.namespaces import is_injectable, namespace_of
 from backend.free.memory.episodic.note import MemoryNote
@@ -327,6 +329,29 @@ def _add_provenance_note_ids(sink: "set[str] | None", fact: SemanticFact) -> Non
         note_id = getattr(prov, "note_id", None)
         if note_id:
             sink.add(str(note_id))
+
+
+#: 事象の同定に使わない暦の語 (曜日 / 相対週・月 / 単位)。これらを共有しても
+#: 同じ事象とは言えない (「来週の月曜日に会議」と「再来週の月曜日に送付」)。
+_EVENT_ANCHOR_STOPWORDS = frozenset({
+    "月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日",
+    "今週", "来週", "再来週", "先週", "今月", "来月", "先月", "月末", "月初",
+    "今日", "明日", "明後日", "昨日", "今年", "来年", "去年", "午前", "午後",
+    "予定", "変更", "延期",
+})
+
+
+def _event_anchors(text: str) -> set[str]:
+    """多値スロットの 1 行から事象の内容語 (漢字 / カタカナの連なり) を取る (純粋関数)。"""
+    return {
+        w for w in re.findall(r"[一-龥ァ-ヶー]{2,}", text or "")
+        if w not in _EVENT_ANCHOR_STOPWORDS and not re.fullmatch(r"[〇一二三四五六七八九十百千]+", w)
+    }
+
+
+def _absolute_dates(text: str) -> str:
+    """注入本文の併記済み相対表現を絶対日付にする (``core.relative_date``、J-09)。"""
+    return absolutize_annotated_dates(text or "")
 
 
 def _normalize_for_dup(text: str) -> str:
@@ -1707,16 +1732,16 @@ class MemoryInjector:
                 # どちらが現在値かを示す手掛かりが行に無くなる。
                 return (
                     f"- {head}({fact.type}) {fact.subject} {fact.predicate}:"
-                    f" {fact.text}{labels['corrected']}"
+                    f" {_absolute_dates(fact.text)}{labels['corrected']}"
                 )
             return (
                 f"- {head}({fact.type}) {fact.subject} {fact.predicate}: "
-                f"{fact.text}"
+                f"{_absolute_dates(fact.text)}"
             )
         if corrected:
             return (
                 f"- {head}({fact.type}) {fact.subject} {fact.predicate}: "
-                f"{fact.text}{labels['corrected_aged'].format(age=int(age))}"
+                f"{_absolute_dates(fact.text)}{labels['corrected_aged'].format(age=int(age))}"
             )
         # 何日前の記録かを行ごとに書く。ノート側 (_render_note の (過去の記録))
         # と同じ理由で、ブロック先頭の注意書きは数百トークン離れると効かない。
@@ -1728,7 +1753,7 @@ class MemoryInjector:
         # 話かを示す情報が行に無かった**ため、古い方がそのまま回答になった。
         return (
             f"- {head}({fact.type}) {fact.subject} {fact.predicate}: "
-            f"{fact.text}{labels['aged'].format(age=int(age))}"
+            f"{_absolute_dates(fact.text)}{labels['aged'].format(age=int(age))}"
         )
 
     def _fact_age_days(self, fact: SemanticFact) -> float | None:
@@ -1872,6 +1897,37 @@ class MemoryInjector:
                 dropped += 1
                 continue
             seen_exact.add(exact)
+            # 並列多値スロット (予定 / 家族 / 勤務先 …、``multi_valued: true``) の
+            # 値は世代ではなく別の事実。完全重複だけ落とし、値どうしは畳まない
+            # (2026-09-10 (i) I-19: 提案書の送付日が締切に畳まれて注入されず)。
+            if self._is_multi_valued(fact.subject):
+                # 同じ事象の世代 (「締切は10月末」→「締切を11月15日に延期」) は
+                # 内容語 (締切) を共有する。共有する行だけ世代として畳み、
+                # 共有しない行 (送付日 / 締切) は並列に残す。
+                anchors = _event_anchors(fact.object)
+                slot = (fact.subject, fact.predicate)
+                twin_key = None
+                for key, current in by_slot.items():
+                    if key[0] != slot or not (anchors & key[1]):
+                        continue
+                    twin_key = key
+                    break
+                if twin_key is None:
+                    by_slot[(slot, frozenset(anchors))] = fact
+                    slot_pos[(slot, frozenset(anchors))] = len(out)
+                    out.append(fact)
+                    continue
+                current = by_slot[twin_key]
+                dropped += 1
+                if self._supersedes(fact, current):
+                    stale_texts.add(_normalize_for_dup(current.object))
+                    _add_provenance_note_ids(stale_note_ids, current)
+                    out[slot_pos[twin_key]] = fact
+                    by_slot[twin_key] = fact
+                else:
+                    stale_texts.add(_normalize_for_dup(fact.object))
+                    _add_provenance_note_ids(stale_note_ids, fact)
+                continue
             slot = (fact.subject, fact.predicate)
             current = by_slot.get(slot)
             if current is None:
@@ -1942,6 +1998,9 @@ class MemoryInjector:
             if collapsible is not None and not collapsible(fact):
                 out.append(fact)
                 continue
+            if self._is_multi_valued(fact.subject):
+                out.append(fact)
+                continue
             key = _attribute_key(fact.subject)
             if key is None:
                 out.append(fact)
@@ -1962,6 +2021,14 @@ class MemoryInjector:
                 stale_texts.add(_normalize_for_dup(fact.object))
                 _add_provenance_note_ids(stale_note_ids, fact)
         return out, dropped
+
+    def _is_multi_valued(self, subject: str) -> bool:
+        """``subject`` が並列多値スロットか (辞書解決を subject 単位でメモ化)。"""
+        cache = self.__dict__.setdefault("_multi_valued_cache", {})
+        hit = cache.get(subject)
+        if hit is None:
+            hit = cache[subject] = is_multi_valued_subject(subject)
+        return hit
 
     @staticmethod
     def _is_stale_duplicate(content: str, stale_texts: set[str]) -> bool:
@@ -1987,7 +2054,20 @@ class MemoryInjector:
         する (実インシデント 2026-07-27 ライブ検証)。行ごとに過去の記録である
         ことを示す。
         """
-        return _render_labels()["note"].format(content=note.content)
+        # ノートは発話原文で相対表現 (「来週の火曜日」) を含む。発話時刻
+        # (``created_at``) で絶対日付を併記してから絶対化する (J-09 再検証:
+        # assertion ではなくノートが注入され「来週の火曜日です」と復唱した)。
+        content = note.content or ""
+        created = getattr(note, "created_at", None)
+        if created:
+            try:
+                content = annotate_relative_dates(
+                    content,
+                    datetime.fromtimestamp(float(created), tz=UTC).astimezone(),
+                )
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
+        return _render_labels()["note"].format(content=_absolute_dates(content))
 
     # ── パッキング ───────────────────────────────────────────────────
 

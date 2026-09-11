@@ -299,18 +299,24 @@ def session_turn_count(session_id: str) -> int:
 
 
 def count_term_in_session(session_id: str, term: str) -> int:
-    """このセッションの全ターン本文に ``term`` が現れた回数。**進行中の user 発話を含む**。
+    """このセッションの **これまでの** ターン本文に ``term`` が現れた回数。
 
     実インシデント (2026-08-27 ライブ監査 T08-7): 「これまでの会話に「横浜」は
     何回出てきましたか。」に「5回」と答えた (実際 4 回)。ツールを使わず数を
     断定していた。
+
+    進行中の user 発話 (問い自身) は **数えない**。問いは数える語を引用して
+    いるので、含めると「私が「ファイルに書かないで」と言ったのは何回ですか」が
+    一度も言っていない語で「1 回」になる (2026-09-10 ライブ監査 (i) I-05)。
+    蓄積バッファには問いが既に積まれている (:func:`session_turn_count` の契約)
+    ので、末尾の user ターンを外す。
     """
     if not term:
         return 0
-    return sum(
-        str(turn.get("content") or "").count(term)
-        for turn in (_session_turns.get(session_id) or ())
-    )
+    turns = list(_session_turns.get(session_id) or ())
+    if turns and str(turns[-1].get("role") or "") == "user":
+        turns = turns[:-1]
+    return sum(str(turn.get("content") or "").count(term) for turn in turns)
 
 
 def clear_session_data(session_id: str) -> None:

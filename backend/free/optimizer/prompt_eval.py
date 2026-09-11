@@ -17,12 +17,17 @@ from __future__ import annotations
 import hashlib
 
 from backend.free.learning.corrected_pairs import (
+    depends_on_context,
     resolve_corrected_turn,
     response_honors_correction,
     strip_correction_preamble,
 )
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
+
+from backend.log_config import get_logger
+
+logger = get_logger("optimizer.prompt_eval")
 
 #: 失敗ケースの種別。judge へ渡すヒント文の出し分けに使う。
 CASE_KIND_CORRECTION = "correction"
@@ -147,8 +152,20 @@ def select_prompt_eval_cases(
                 picked[_case_id(query)] = PromptEvalCase(
                     case_id=_case_id(query), query=query, kind=CASE_KIND_REPHRASE,
                 )
+    # 文脈 (直前ターン / 記憶 / ツール結果) を前提にした問いは、system prompt
+    # だけで再生成するゲートでは **どの候補でも同じ点** になり、何も測れない。
+    # 実測 (2026-09-10 ライブ監査 (i) I-17): 6/6 ケースが「私が今の会社に
+    # 入った年は」「私の出身地は」型で、現行・候補とも全ケース 0.0 (1 件だけ
+    # 「不明」と答えた候補が 0.9) → 0.150 → 0.150 で不採用。eval_core の
+    # 足切りと同じ ``depends_on_context`` で落とす。
+    cases = [c for c in picked.values() if not depends_on_context(c.query)]
+    dropped = len(picked) - len(cases)
+    if dropped:
+        logger.info(
+            "prompt eval: %d context-bound case(s) excluded from the adoption gate",
+            dropped,
+        )
     # dict は挿入順 = 古い順。最新側から limit 件
-    cases = list(picked.values())
     return cases[-limit:] if len(cases) > limit else cases
 
 

@@ -390,6 +390,15 @@ async def curate_assertion_facts(
                         "verification (Step 8.0); carried over", note.id,
                     )
                     continue
+                if str(getattr(note, "correction_verdict", "") or "") == "disputed":
+                    # アシスタントがその場で退けた値は世界の事実として書かない
+                    # (「302 は恒久的な移転」が assertion に残った、2026-09-11 (j) J-04)。
+                    note.assertion_curated_at = now_fn()
+                    logger.info(
+                        "assertion_curator: %s was disputed by the reply; not written",
+                        note.id,
+                    )
+                    continue
             elif _correction_targets_attribute(store, note):
                 # 誤りの span がユーザー属性の live 値に当たる訂正は Step 8 の
                 # 値アンカーが employer / location 等のスロットへ書く。ここで
@@ -460,6 +469,16 @@ async def curate_assertion_facts(
         try:
             embedding = await embedder.embed([obj], is_query=False)
             vec = embedding[0] if len(embedding) else None
+            # アシスタントの **知識の回答** に対するユーザーの訂正は、どちらが
+            # 正しいかをシステムが確かめられない主張。世界の事実として断定せず
+            # ``unverified`` (注入では「未確認」のラベル) で残す — アシスタントが
+            # 一度は折れて「おっしゃる通り」と答えた誤った訂正 (「302 は恒久的な
+            # 移転」) が (過去の記録) として素通りしていた (2026-09-11 (j) J-08)。
+            veracity = (
+                "unverified"
+                if str(getattr(note, "correction_verdict", "") or "") == "assistant"
+                else "stated"
+            )
             fact = fact_from_note(
                 note,
                 subject=subject,
@@ -470,6 +489,7 @@ async def curate_assertion_facts(
                 now=now_fn(),
                 profile_id=profile_id,
                 embedding=vec,
+                veracity=veracity,
                 _extra={"source_note_id": note.id, "raw_utterance": content},
             )
             store.add_fact(fact)

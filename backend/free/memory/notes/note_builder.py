@@ -278,11 +278,13 @@ def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
         words = _coerce_triggers(raw.get("triggers"))
         requires_self = bool(raw.get("requires_self_possessor", False))
         single_valued = bool(raw.get("single_valued", False))
+        multi_valued = bool(raw.get("multi_valued", False))
         patterns = _coerce_patterns(slug, raw.get("patterns"))
     else:
         words = _coerce_triggers(raw)
         requires_self = False
         single_valued = False
+        multi_valued = False
     if not words and not patterns:
         return None
     return AttributeSpec(
@@ -290,6 +292,7 @@ def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
         triggers=words,
         requires_self_possessor=requires_self,
         single_valued=single_valued,
+        multi_valued=multi_valued,
         patterns=patterns,
     )
 
@@ -720,6 +723,14 @@ class AttributeSpec:
     #: ``preference.editor`` の 4 つだけ
     #: (範囲は ``TestSingleValuedSlotDeclaration`` が固定している)。
     single_valued: bool = False
+    #: **並列の事実を複数持つ** スロット (予定 / 家族 / 勤務先 / ペット /
+    #: 連絡先)。``single_valued`` の否定ではない — name のように「単値だが
+    #: 他者の値が落ちうるので自動 supersede しない」スロットは、注入側では
+    #: 世代として最新 1 値に畳んでよい。こちらは値が **世代ではなく別の事実**
+    #: なので、注入側の「1 スロット 1 値」畳み込みから外す
+    #: (2026-09-10 (i) I-19: 提案書の送付日 9/21 が締切 11/15 に畳まれて
+    #: 注入されず、few-shot 手本の日付で偶然正答していた)。
+    multi_valued: bool = False
 
     def _variants(self, word: str) -> tuple[str, ...]:
         """``word`` と、その **並列形** を返す。
@@ -1034,6 +1045,33 @@ def is_single_valued_subject(
     for spec in (attrs.get(mode) or {}).get(fact_type) or ():
         if spec.slug == parts[2]:
             return spec.single_valued
+    return False
+
+
+def is_multi_valued_subject(
+    subject: str,
+    *,
+    mode: str = "chat",
+    triggers_dir: str | Path | None = None,
+) -> bool:
+    """``subject`` が **並列多値スロット** (``multi_valued: true``) か (純粋関数)。
+
+    :func:`is_single_valued_subject` と同じ解決。宣言が無ければ ``False``。
+    """
+    if not subject:
+        return False
+    parts = subject.split(".")
+    if len(parts) != 3 or parts[0] != "mem":
+        return False
+    fact_type = _ATTR_FACT_TYPE_BY_KIND.get(parts[1])
+    if fact_type is None:
+        return False
+    if triggers_dir is None:
+        triggers_dir = _DEFAULT_TRIGGERS_DIR
+    attrs = get_fact_attributes(resolve_fact_attributes_path(triggers_dir))
+    for spec in (attrs.get(mode) or {}).get(fact_type) or ():
+        if spec.slug == parts[2]:
+            return spec.multi_valued
     return False
 
 
