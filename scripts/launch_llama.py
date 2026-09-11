@@ -28,6 +28,10 @@ config.yaml の llama / embedding セクションから起動コマンドを組�
   (8192 MiB / true) を黙従する状態を解消する。``slots > 1`` かつ
   ``cache_ram_mib > 0`` の場合は idle slot offload が動作するよう
   ``--kv-unified`` を自動付与する (``kv_unified`` で明示 override 可)。
+  base ではコンテキスト checkpoint (``--ctx-checkpoints`` /
+  ``--checkpoint-min-step``) も ``ctx_checkpoints`` /
+  ``checkpoint_min_step`` から常に明示付与する (hybrid recurrent モデルで
+  prompt 分岐時の全量 re-prefill を避けるため、上流既定 8192 に黙従しない)。
 
   バイナリの ``-fitp on`` フラグを使い、device 別の使用 MiB (model /
   context / compute) を取得して VRAM 推定を 2 段構え化する。Tier 1 が
@@ -793,14 +797,27 @@ def build_llama_cmd(
     # KV を再 prefill せず再利用する。
     # 注: SWA モデル (gemma-4 等) と hybrid recurrent モデル (Qwen3.5/3.8 等) では
     # llama.cpp が cache_reuse を自動無効化するため no-op (フラグ付与は無害)。
+    # hybrid recurrent モデルでは上流が機構ごと無効化するので、フラグ自体を
+    # 付けない (warning は残す)。「config に値があるのに効いていない」状態を
+    # 起動コマンドの見た目で誤読させないため (2026-09-11)。
     cache_reuse = lc.get("cache_reuse", 0)
     if cache_reuse and int(cache_reuse) > 0:
-        cmd += ["--cache-reuse", str(int(cache_reuse))]
-        _warn_cache_reuse_inert(
+        inert = _warn_cache_reuse_inert(
             _read_gguf_metadata_cached(base_model_path),
             int(cache_reuse),
             warn=lambda msg: print(msg, file=sys.stderr),
         )
+        if not inert:
+            cmd += ["--cache-reuse", str(int(cache_reuse))]
+
+    # コンテキスト checkpoint。hybrid recurrent モデルは部分巻き戻し不可で、
+    # 上流既定 min-step 8192 だと n_ctx=8192 で中間 checkpoint が生まれず、
+    # 前回の最終 user 位置より手前で prompt が分岐すると system prompt ごと
+    # 全量 re-prefill になる。-np と同様に常に明示する (上流既定へ黙従しない)。
+    cmd += ["--ctx-checkpoints", str(int(lc.get("ctx_checkpoints", 8)))]
+    cmd += [
+        "--checkpoint-min-step", str(int(lc.get("checkpoint_min_step", 256))),
+    ]
 
     # idle slot offload。base は agentic ワークロード前提で
     # 既定 4096 MiB の RAM 退避バッファを確保する。slots>1 のときは

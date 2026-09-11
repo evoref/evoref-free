@@ -700,24 +700,13 @@ async def reload_model(state: AppState = Depends(get_app_state)):
     llama_url = f"http://{llama_host}:{llama_port}"
 
     try:
-        from backend.free.llm.local_client import LocalClient
+        from backend.free.llm.client_builder import build_local_client
         from backend.free.llm.model_metadata import fetch_model_metadata
 
         debug_logger = getattr(state, "debug_logger", None)
         metadata = await fetch_model_metadata(llama_url, debug_logger=debug_logger)
-        from backend.config import resolve_enable_thinking
-        base_enable_thinking = resolve_enable_thinking(
-            cfg, "base",
-            explicit=llama_cfg.get("enable_thinking"),
-            chat_template=getattr(metadata, "chat_template", None),
-        )
-        client = LocalClient(
-            llama_url,
-            metadata,
-            cache_prompt=llama_cfg.get("cache_prompt", True),
-            slots=llama_cfg.get("slots", 1),
-            enable_thinking=base_enable_thinking,
-            debug_logger=debug_logger,
+        client = build_local_client(
+            cfg, llama_url, metadata, debug_logger=debug_logger,
         )
         if not await client.health_check():
             raise model_health_check_failed_error()

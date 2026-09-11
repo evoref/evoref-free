@@ -104,7 +104,7 @@ async def _init_llama_server(
         resolve_startup_probe_timeout,
         wait_for_server_ready,
     )
-    from backend.free.llm.local_client import LocalClient
+    from backend.free.llm.client_builder import build_local_client
     from backend.free.llm.model_metadata import fetch_model_metadata
 
     llama_cfg = cfg.get("llama", {})
@@ -124,48 +124,8 @@ async def _init_llama_server(
             ),
         )
         metadata = await fetch_model_metadata(llama_url, debug_logger=debug_logger)
-        from backend.config import (
-            resolve_client_reasoning,
-            resolve_context_size,
-            resolve_enable_thinking,
-        )
-        base_enable_thinking = resolve_enable_thinking(
-            cfg, "base",
-            explicit=llama_cfg.get("enable_thinking"),
-            chat_template=getattr(metadata, "chat_template", None),
-        )
-        think_budget, on_runaway = resolve_client_reasoning(cfg, "base")
-        # config の slots は宣言値。llama-server が実際に確保したスロット数
-        # (``/props`` の total_slots) より多いと、``id_slot=2`` 等の要求が
-        # 存在しないスロットを指して 400 になる。少ない方へ丸めて警告する。
-        cfg_slots = int(llama_cfg.get("slots", 1) or 1)
-        total_slots = int(getattr(metadata, "total_slots", 0) or 0)
-        slots = cfg_slots
-        if total_slots > 0 and total_slots != cfg_slots:
-            slots = min(cfg_slots, total_slots)
-            logger.warning(
-                "llama.slots=%d does not match llama-server total_slots=%d; "
-                "using %d (restart llama-server after changing config.yaml)",
-                cfg_slots, total_slots, slots,
-            )
-        client = LocalClient(
-            llama_url,
-            metadata,
-            cache_prompt=llama_cfg.get("cache_prompt", True),
-            slots=slots,
-            enable_thinking=base_enable_thinking,
-            stream_first_token_timeout=llama_cfg.get(
-                "stream_first_token_timeout_sec", 60.0,
-            ),
-            debug_logger=debug_logger,
-            client_think_budget=think_budget,
-            on_runaway=on_runaway,
-            # 送信前コンテキスト超過ガード用 (slots>1 でも launch_llama が
-            # --kv-unified を自動付与するため per-slot でも full n_ctx)。
-            # ``llama.context_size`` の既定は None (プロファイル委譲) なので
-            # ``.get(..., 4096)`` では None が入ってガードが無効化されていた。
-            # 起動フラグ ``-c`` と同じ優先順位で解決する。
-            context_size=resolve_context_size(cfg, "base"),
+        client = build_local_client(
+            cfg, llama_url, metadata, debug_logger=debug_logger,
         )
         if await client.health_check():
             state.local_client = client
@@ -1618,8 +1578,7 @@ def _init_tools(
     except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
         logger.info("Tool gate warmup deferred: no running event loop")
 
-    # Reactive 層を常駐化 (リクエスト毎生成だと LRU キャッシュが温まらない)。
-    # 既定 cache (100 件 / TTL 300s) のまま。LLM 非依存なので構築コストはほぼゼロ。
+    # Reactive 層を常駐化 (挨拶パターンのみ。LLM 非依存なので構築コストはほぼゼロ)。
     state.reactive_agent = ReactiveAgent()
     logger.info("ReactiveAgent initialized (resident)")
 

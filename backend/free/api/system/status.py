@@ -83,7 +83,10 @@ async def _collect_component_statuses(
     return components
 
 
-async def _try_lazy_connect(state: AppState, llama_url: str, llama_cfg: dict) -> bool:
+async def _try_lazy_connect(
+    state: AppState, llama_url: str,
+    llama_cfg: dict,  # noqa: ARG001 - 呼出側 / テストの monkeypatch が署名に依存 (構築は client_builder)
+) -> bool:
     """local_client が未接続の場合、llama-server への遅延接続を試みる
 
     チャット生成中は試行しない。生成でビジーな llama-server への ``/props`` は
@@ -92,7 +95,7 @@ async def _try_lazy_connect(state: AppState, llama_url: str, llama_cfg: dict) ->
     ``/props`` リトライが 3 回発生。実体はモデルが応答生成中だっただけ)。
     生成中であることは接続済みの証拠でもある。
     """
-    from backend.free.llm.local_client import LocalClient
+    from backend.free.llm.client_builder import build_local_client
     from backend.free.llm.model_metadata import fetch_model_metadata
 
     llm_client = getattr(state, "llm_client", None)
@@ -106,22 +109,8 @@ async def _try_lazy_connect(state: AppState, llama_url: str, llama_cfg: dict) ->
             llama_url, debug_logger=debug_logger,
             purpose="lazy_reconnect/props",
         )
-        from backend.config import resolve_client_reasoning, resolve_enable_thinking
-        base_enable_thinking = resolve_enable_thinking(
-            get_config(), "base",
-            explicit=llama_cfg.get("enable_thinking"),
-            chat_template=getattr(metadata, "chat_template", None),
-        )
-        think_budget, on_runaway = resolve_client_reasoning(get_config(), "base")
-        client = LocalClient(
-            llama_url,
-            metadata,
-            cache_prompt=llama_cfg.get("cache_prompt", True),
-            slots=llama_cfg.get("slots", 1),
-            enable_thinking=base_enable_thinking,
-            debug_logger=debug_logger,
-            client_think_budget=think_budget,
-            on_runaway=on_runaway,
+        client = build_local_client(
+            get_config(), llama_url, metadata, debug_logger=debug_logger,
         )
         if await client.health_check():
             state.set_local_client(client)

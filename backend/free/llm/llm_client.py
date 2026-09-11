@@ -82,6 +82,15 @@ class LLMClient:
         return self.local.classifier_slot
 
     @property
+    def classifier_slot_prefix(self) -> str | None:
+        """分類器スロットの共有接頭辞 (LocalClient への委譲)。"""
+        return self.local.classifier_slot_prefix
+
+    def set_classifier_slot_prefix(self, prefix: str) -> None:
+        """分類器スロットの共有接頭辞を公開する (LocalClient への委譲)。"""
+        self.local.set_classifier_slot_prefix(prefix)
+
+    @property
     def metadata(self):
         """モデルメタデータ (ローカル LLM)"""
         return self.local.metadata

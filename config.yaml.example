@@ -149,8 +149,15 @@ llama:
                                   #   ※ K は V より量子化に敏感。K: q8_0 / V: q4_1 の非対称設定も有効
   cache_type_v: q8_0              # --cache-type-v / KV value 量子化（選択肢は cache_type_k と同一）
   cache_reuse: 256                # --cache-reuse / 共通 prefix 自動再利用（0=無効）。多ターン chat の prefill コスト削減。
+                                  # ⚠ hybrid recurrent (Qwen3.5/3.8) と SWA (gemma-4) では上流が機構ごと無効化するため、
+                                  #   launch_llama.py は recurrent メタデータを検出するとフラグを付けず warning だけ出す。
                                   #   ⚠️ SWA モデル（gemma-4 等）では llama.cpp が自動無効化し no-op（毎ターン full re-prefill）。非 SWA base のみ有効
-  max_tokens: 1024                # チャット応答の最大トークン数（0=無制限、暴走防止に設定推奨）
+  ctx_checkpoints: 8              # --ctx-checkpoints / slot ごとのコンテキスト checkpoint 上限（0=無効）。
+                                  #   hybrid recurrent モデル（Qwen3.5/3.8 等）は KV を部分巻き戻しできず checkpoint 単位でしか戻れない
+  checkpoint_min_step: 256        # --checkpoint-min-step / checkpoint 間の最小トークン間隔。上流既定 8192 だと context_size=8192 で
+                                  #   中間 checkpoint が生まれず、prompt が前回の最終 user 位置より手前で分岐すると system prompt ごと全量 re-prefill。
+                                  #   256 なら user ターンごとに 1 つ置かれ、分岐コストは最後に一致したターン以降の窓だけになる
+  max_tokens: 1024               # チャット応答の最大トークン数（0=無制限、暴走防止に設定推奨）
   lora_target: auto               # LoRA ターゲット自動判定: auto | "q_proj,v_proj" | "linear_proj" 等（Pro 専用）
   enable_thinking: false          # 思考トークン制御。true/false=明示（プロファイルを上書き）
                                   # 未設定/コメントアウト時は arch プロファイル (models/profiles/<arch>.yaml)
@@ -1008,6 +1015,7 @@ agent:
   max_tool_iterations: 5                 # Meta-Cognitive の 1 タスク内ツール実行ループ上限（タスク数の上限ではない）
   retry_failed_writes: true              # 失敗した書き込みタスクを 1 回だけリトライする（false でリトライしない）
   reactive_light_enabled: true           # reactive 分類かつルール即応に該当しないクエリを、tool 判定で tool 不要なら base 1 ターンの軽量パスで応答（false で常に deliberative）
+  business_day_holidays: jp             # 営業日の数え上げで除く祝日暦 (jp=日本の国民の祝日 / none=土日と明示された休日だけ)
   # 軽量パスでも [関連する記憶] を注入する (検索パイプラインは走らせない)。
   # 層の切り替えを「崖」にしないためのスイッチ。軽量パスは以前 RAG・SemMem・
   # few-shot・ツール判定を同時に全部落としていたため、short_query でここへ

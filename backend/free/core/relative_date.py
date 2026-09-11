@@ -49,6 +49,33 @@ _DAY_RELATIVE_RE = re.compile(
     "(" + "|".join(sorted(DAY_OFFSETS, key=len, reverse=True)) + ")",
 )
 
+#: 「今日から 2 週間後」「3 日後」「1 か月前」— 起点 (省略時は発話日) からの
+#: オフセット。月は暦月で進める (末日超過は末日へ丸める)。
+_OFFSET_RE = re.compile(
+    r"(?:(?P<base>" + "|".join(sorted(DAY_OFFSETS, key=len, reverse=True)) + r")\s*から\s*)?"
+    r"(?P<n>\d+)\s*(?P<unit>日|週間|か月|ヶ月|カ月|ヵ月|年)\s*(?P<dir>後|前)"
+)
+_UNIT_DAYS = {"日": 1, "週間": 7}
+
+
+def _shift_months(anchor: date, months: int) -> date:
+    y, m = divmod(anchor.month - 1 + months, 12)
+    year, month = anchor.year + y, m + 1
+    last = (date(year + (month // 12), month % 12 + 1, 1) - timedelta(days=1)).day
+    return date(year, month, min(anchor.day, last))
+
+
+def resolve_offset(anchor: date, m: re.Match[str]) -> date:
+    """オフセット表現 (``_OFFSET_RE`` の一致) を ``anchor`` から解く。"""
+    base = anchor + timedelta(days=DAY_OFFSETS.get(m.group("base") or "今日", 0))
+    n = int(m.group("n")) * (-1 if m.group("dir") == "前" else 1)
+    unit = m.group("unit")
+    if unit in _UNIT_DAYS:
+        return base + timedelta(days=n * _UNIT_DAYS[unit])
+    if unit == "年":
+        return _shift_months(base, 12 * n)
+    return _shift_months(base, n)
+
 #: 既に絶対日付が併記されている表現 (「来週の金曜日 (2026-09-18)」) を二重に
 #: 注記しないための検査。
 _ANNOTATED_RE = re.compile(r"\s*[(（]\d{4}-\d{2}-\d{2}[)）]")
@@ -71,6 +98,8 @@ def resolve_relative_dates(text: str, anchor: date) -> list[tuple[str, date]]:
         resolved = week_of_weekday(anchor, m.group(1), m.group(2))
         if resolved is not None:
             out.append((m.group(0), resolved))
+    for m in _OFFSET_RE.finditer(text or ""):
+        out.append((m.group(0), resolve_offset(anchor, m)))
     for m in _DAY_RELATIVE_RE.finditer(text or ""):
         out.append((m.group(0), anchor + timedelta(days=DAY_OFFSETS[m.group(1)])))
     return out
@@ -95,9 +124,19 @@ def annotate_relative_dates(text: str, anchor: datetime | date | None) -> str:
 
     out = WEEK_OF_WEEKDAY_RE.sub(_sub_week, text)
 
+    def _sub_offset(m: re.Match[str]) -> str:
+        if _ANNOTATED_RE.match(out[m.end():]):
+            return m.group(0)
+        return f"{m.group(0)} ({resolve_offset(anchor_date, m).isoformat()})"
+
+    out = _OFFSET_RE.sub(_sub_offset, out)
+
     def _sub_day(m: re.Match[str]) -> str:
         word = m.group(1)
-        if DAY_OFFSETS[word] == 0 or _ANNOTATED_RE.match(out[m.end():]):
+        # オフセットの起点 (「今日から 2 週間後」の「今日」) は上で解決済み。
+        if DAY_OFFSETS[word] == 0 or _ANNOTATED_RE.match(out[m.end():]) or (
+            out[m.end():].lstrip().startswith("から")
+        ):
             return word
         return f"{word} ({(anchor_date + timedelta(days=DAY_OFFSETS[word])).isoformat()})"
 

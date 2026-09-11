@@ -571,6 +571,19 @@ class LocalClient(BaseHTTPClient):
         #: 接頭辞 KV キャッシュの効きを測れる唯一の一次情報で、これが無いと
         #: llama-base.stderr.log の行とチャットターンを突き合わせるしかない。
         self._last_timings: dict | None = None
+        #: 分類器スロットの共有接頭辞 (backend/free/llm/slot_prefix.py)。
+        #: ツール分類器が公開し、同じスロットへ送る AuxClient が system を
+        #: byte 一致させるために読む。未公開なら None。
+        self._classifier_slot_prefix: str | None = None
+
+    @property
+    def classifier_slot_prefix(self) -> str | None:
+        """分類器スロットの共有接頭辞 (分類器の system)。未公開なら ``None``。"""
+        return self._classifier_slot_prefix
+
+    def set_classifier_slot_prefix(self, prefix: str) -> None:
+        """分類器スロットの共有接頭辞を公開する (ツール分類器が呼ぶ)。"""
+        self._classifier_slot_prefix = prefix or None
 
     @property
     def chat_slot(self) -> int:
@@ -621,14 +634,25 @@ class LocalClient(BaseHTTPClient):
             return SLOT_CLASSIFIER
         return self.background_slot
 
-    def _record_prompt_cache(self, data: dict, *, slot: int | None = None) -> None:
-        """応答 JSON から接頭辞キャッシュの再利用量を ``_last_timings`` へ畳む。
+    def _record_prompt_cache(
+        self, data: dict, *, slot: int | None = None,
+    ) -> dict | None:
+        """応答 JSON から接頭辞キャッシュの再利用量を記録する。
 
         ``timings`` (llama-server 固有、``cache_n`` / ``prompt_n``) を優先し、
         無ければ ``usage.prompt_tokens_details.cached_tokens`` から導く。
+        ``op=kv_cache`` の JSONL 行は **全スロット** について出すが、
+        ``_last_timings`` へ畳むのはチャットスロットの要求だけ
+        (:meth:`_owns_last_timings`)。読み手 (``chat_recorder.read_llama_prompt_tokens``)
+        はユーザーのターンの値を期待しており、チャットのストリーム中に完了した
+        aux / 分類器の要求が上書きすると別要求の prompt_n / cache_n が
+        そのターンに記録される (2026-09-11)。
+
+        Returns:
+            正規化した ``{"prompt_n", "cache_n", "slot"}``。記録できなければ ``None``。
         """
         if not isinstance(data, dict):
-            return
+            return None
         timings = data.get("timings")
         cache_n: int | None = None
         prompt_total: int | None = None
@@ -642,16 +666,28 @@ class LocalClient(BaseHTTPClient):
                 cache_n = int(details.get("cached_tokens") or 0)
                 prompt_total = int(usage.get("prompt_tokens") or 0)
         if cache_n is None or prompt_total is None:
-            return
-        self._last_timings = {
+            return None
+        record = {
             "prompt_n": max(0, prompt_total - cache_n),
             "cache_n": cache_n,
             "slot": slot,
         }
+        if self._owns_last_timings(slot):
+            self._last_timings = record
         if self._debug_logger is not None:
             self._debug_logger.log_kv_cache(
                 tokens_prompt=prompt_total, tokens_cached=cache_n, slot=slot,
             )
+        return record
+
+    def _owns_last_timings(self, id_slot: int | None) -> bool:
+        """この要求が ``_last_timings`` (ユーザーのターンの値) を書いてよいか。
+
+        ``_slots >= 2`` ならチャットスロット (:meth:`_is_chat_slot`) の要求だけ。
+        1 スロット構成では全要求が同じスロットを順番に通る (``id_slot`` は
+        None / -1) ので区別できず、従来どおり全要求が書く。
+        """
+        return self._slots < 2 or self._is_chat_slot(id_slot)
 
     def _apply_system_fallback(self, messages: list[dict]) -> list[dict]:
         """systemロール非対応モデル: systemをuserの先頭に結合"""
@@ -1149,13 +1185,11 @@ class LocalClient(BaseHTTPClient):
             # op=kv_cache が 1 行も出ず、実機監査で観測できなかった (2026-09-11)。
             # llama-server は非ストリーム応答にも ``usage.prompt_tokens_details``
             # と ``timings`` (cache_n / prompt_n) を載せる。
-            self._record_prompt_cache(data, slot=payload.get("id_slot"))
+            kv = self._record_prompt_cache(data, slot=payload.get("id_slot")) or {}
             logger.debug(
                 "Sync generate complete: response_length=%d chars (prompt_n=%s "
                 "cache_n=%s slot=%s)",
-                len(content),
-                (self._last_timings or {}).get("prompt_n"),
-                (self._last_timings or {}).get("cache_n"),
+                len(content), kv.get("prompt_n"), kv.get("cache_n"),
                 payload.get("id_slot"),
             )
             return data
@@ -1249,12 +1283,21 @@ class LocalClient(BaseHTTPClient):
         import time as _time
 
         # 直近 timings を捨ててから開始する。``_last_timings`` は「このクライアント
-        # が最後に観測した値」でしかないため、今回のリクエストが usage を伴わずに
-        # 終わると **前回のターンの値がそのまま読まれる**。実測 (2026-08-18): 連続
-        # 2 ターンが同一の prompt=2337 / cached=3 で記録され、2 ターン目は生成を
-        # 通っていなかった。未計測は None のまま残すのが正しい (消費側は「未計測」
-        # と「消費ゼロ」を区別する)。
-        self._last_timings = None
+        # がチャットスロットで最後に観測した値」でしかないため、今回のリクエストが
+        # usage を伴わずに終わると **前回のターンの値がそのまま読まれる**。実測
+        # (2026-08-18): 連続 2 ターンが同一の prompt=2337 / cached=3 で記録され、
+        # 2 ターン目は生成を通っていなかった。未計測は None のまま残すのが正しい
+        # (消費側は「未計測」と「消費ゼロ」を区別する)。
+        #
+        # 捨てるのも書くのもチャットスロットの要求だけ (``_owns_last_timings``)。
+        # 背景 / 分類器のストリームは kv_cache の JSONL 行だけを出し、ユーザーの
+        # ターンの値には触れない。
+        id_slot = payload.get("id_slot")
+        if self._owns_last_timings(id_slot):
+            self._last_timings = None
+        #: timings (finish チャンク) を記録済みなら usage チャンクでは二重に
+        #: 記録しない (llama-server は両方を別チャンクで送りうる)。
+        kv_recorded = False
 
         logger.debug("Stream generate: POST %s/v1/chat/completions", self.url)
         line_count = 0
@@ -1357,11 +1400,18 @@ class LocalClient(BaseHTTPClient):
                             if reason:
                                 last_finish_reason = reason
                                 outcome.finish_reason = reason
-                            # llama.cpp が timings を載せる構成なら、より正確なそちらを優先。
-                            # (既定では付かないので通常は下の usage 経路が使われる)
+                            # 接頭辞 KV キャッシュの効きを記録する。llama.cpp が timings
+                            # を載せる構成 (finish チャンク) ならより正確なそちらを優先し、
+                            # 無ければ usage チャンク (``stream_options.include_usage``) の
+                            # ``prompt_tokens_details.cached_tokens`` から導く。どちらも
+                            # ``_record_prompt_cache`` へ通し、形 (slot 付き) と JSONL 行を
+                            # 非ストリーム経路と揃える (以前は timings を生の dict のまま
+                            # 保持し、kv_cache 行も出していなかった)。
                             timings = chunk.get("timings")
-                            if isinstance(timings, dict) and "cache_n" in timings:
-                                self._last_timings = timings
+                            has_timings = isinstance(timings, dict) and "cache_n" in timings
+                            if has_timings or ("usage" in chunk and not kv_recorded):
+                                if self._record_prompt_cache(chunk, slot=id_slot) is not None:
+                                    kv_recorded = kv_recorded or has_timings
 
                             if content:
                                 _arm_total_deadline()
@@ -1404,27 +1454,6 @@ class LocalClient(BaseHTTPClient):
                                     )
                                     break
                                 continue
-
-                            # KV キャッシュヒット情報を usage チャンクから捕捉
-                            if "usage" in chunk:
-                                usage = chunk["usage"] or {}
-                                details = usage.get("prompt_tokens_details") or {}
-                                cached = details.get("cached_tokens")
-                                if cached is not None:
-                                    prompt_tokens = usage.get("prompt_tokens", 0)
-                                    # 再評価分 = プロンプト全体 - 再利用分。
-                                    # requests.jsonl の timing へ畳んで、ターン単位で
-                                    # 接頭辞キャッシュの効きを追えるようにする。
-                                    self._last_timings = {
-                                        "prompt_n": max(0, prompt_tokens - cached),
-                                        "cache_n": cached,
-                                    }
-                                    if self._debug_logger is not None:
-                                        self._debug_logger.log_kv_cache(
-                                            tokens_prompt=prompt_tokens,
-                                            tokens_cached=cached,
-                                            slot=payload.get("id_slot"),
-                                        )
 
                             if data_line_count <= 3:
                                 # usage チャンクは choices 空配列なので添字を引かない
@@ -1543,6 +1572,10 @@ class LocalClient(BaseHTTPClient):
             )
         except Exception as e:
             raise _map_llama_error(e, host=self.url, label="logprobs") from e
+
+        # 接頭辞 KV キャッシュの効きをこの経路でも記録する (以前は logprobs
+        # 経路だけ op=kv_cache が出ず、eval / probe の呼び出しが観測できなかった)。
+        self._record_prompt_cache(data, slot=payload.get("id_slot"))
 
         choice = data["choices"][0]
         content = choice["message"].get("content", "")

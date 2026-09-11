@@ -1054,6 +1054,13 @@ class MemoryInjector:
                 anchor_exempt += 1
             elif not self._passes_gate(
                 query_vec, fact, pinned=bool(fact.pinned), scores=fact_scores,
+                # ベクトルを持たないファクト (Light 更新で書かれたばかり / embed
+                # モデル切替直後) はコサインで関連を言えない。尋ねられた属性 /
+                # 語彙アンカーの決定論だけで通し、それ以外は落とす (ノートと同じ
+                # 扱い)。以前は chat_service が「スコア 0 件なら注入全体を skip」
+                # していたため、Light 更新直後の別セッション想起 (「私が住んで
+                # いるのは？」) が次の Full snapshot まで必ず空振りした (2026-09-11)。
+                require_embedding=True,
             ):
                 filtered_out += 1
                 gate_rejected += 1

@@ -214,6 +214,12 @@ class AgentConfig(BaseModel):
     # ツール判定で tool 不要と判定されたら base 1 ターンの軽量パスで応答する。
     # tool 必要なら deliberative へエスカレート。False で常に deliberative。
     reactive_light_enabled: bool = True
+    # 営業日の数え上げで土日と一緒に除く祝日暦。"jp" = 日本の国民の祝日
+    # (core.jp_holidays、振替休日・国民の休日込み) / "none" = 土日と質問文に
+    # 明示された休日だけ。抽出器には「休日を発明しない」規則があるので、暦の
+    # 祝日はコードが供給する (2026-09-11 (k): 「10 営業日後」が秋分の日を
+    # 数えて 9/25、正 9/28)。
+    business_day_holidays: Literal["jp", "none"] = "jp"
     # 軽量パスでも [関連する記憶] を注入するか (検索パイプラインは走らせない)。
     #
     # 層の切り替えを「崖」にしないためのスイッチ。軽量パスは長らく RAG・SemMem・

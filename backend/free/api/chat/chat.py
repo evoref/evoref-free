@@ -313,8 +313,7 @@ def _try_reactive_layer(
     context_size: int,
 ) -> StreamingResponse | ChatResponse | None:
     """Reactive 層でのパターンマッチ即応答。マッチしなければ None。"""
-    # 常駐インスタンスを使う (LRU キャッシュをセッション跨ぎで温める)。
-    # 未配線環境 (テスト等) では新規生成にフォールバック。
+    # 常駐インスタンス (未配線環境 = テスト等では新規生成にフォールバック)。
     reactive_agent = state.reactive_agent or ReactiveAgent()
     reactive_resp = reactive_agent.process(req.message)
     if reactive_resp is None:
@@ -548,9 +547,6 @@ async def _dispatch_continuation(
 
     - ``max_tokens`` は軽量パスの上限 (512) ではなく通常のチャット既定を使う。
       512 で切ったのがそもそもの原因なので、続きまで同じ幅で切らない。
-    - 応答を ReactiveAgent キャッシュへ入れない (``cacheable=False``)。
-      「続けて」をキーに入れると、後日の無関係な「続けて」へ 5 分以内に
-      同じ続きが再生される。
     """
     system_prompt = _append_fact_slate(
         state, session_id, _resolve_system_prompt(state, req.mode, instance_name),
@@ -612,7 +608,6 @@ async def _dispatch_continuation(
                 instance_name, context_size,
                 mode=req.mode, max_tokens=max_tokens,
                 generation_params=gen_params, timer=timer, private=req.private,
-                cacheable=False,
                 continuation_tail=pending.tail,
             )),
             media_type="text/event-stream",
@@ -623,7 +618,6 @@ async def _dispatch_continuation(
             instance_name, context_size,
             mode=req.mode, max_tokens=max_tokens,
             generation_params=gen_params, timer=timer, private=req.private,
-            cacheable=False,
             continuation_tail=pending.tail,
         )
 

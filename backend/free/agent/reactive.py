@@ -1,10 +1,16 @@
-"""Reactive エージェント: パターンマッチ + キャッシュで即応答（< 0.1秒）"""
+"""Reactive エージェント: パターンマッチで即応答（< 0.1秒）
+
+かつて deliberative / 軽量パスの応答を ``query.strip().lower()`` だけを鍵に
+5 分 LRU で保持し再訪クエリへ逐語再生する ``ResponseCache`` があったが、
+セッション / モード / 記憶状態 / モデルを鍵に含まないため「続けて」「はい」
+「私の名前は？」のような短文が別セッションや記憶更新後に陳腐な応答を
+再生していた (2026-09-11 撤去)。挨拶パターンだけを残す。
+"""
 
 from __future__ import annotations
 
 import re
 import time
-from collections import OrderedDict
 from dataclasses import dataclass
 
 from backend.free.core.intent_vocab import (
@@ -23,40 +29,8 @@ logger = get_logger("agent.reactive")
 class ReactiveResponse:
     """Reactive 層の応答"""
     content: str
-    source: str  # "pattern" | "cache"
+    source: str  # "pattern"
     elapsed_ms: float = 0.0
-
-
-class ResponseCache:
-    """LRU キャッシュ: 直近の応答を保持"""
-
-    def __init__(self, max_size: int = 100, ttl_sec: int = 300):
-        self._cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
-        self._max_size = max_size
-        self._ttl_sec = ttl_sec
-
-    def get(self, key: str) -> str | None:
-        """キャッシュから応答を取得（TTL チェック付き）"""
-        if key not in self._cache:
-            return None
-        value, ts = self._cache[key]
-        if time.time() - ts > self._ttl_sec:
-            del self._cache[key]
-            return None
-        self._cache.move_to_end(key)
-        return value
-
-    def put(self, key: str, value: str) -> None:
-        """キャッシュに応答を格納"""
-        if key in self._cache:
-            self._cache.move_to_end(key)
-        self._cache[key] = (value, time.time())
-        while len(self._cache) > self._max_size:
-            self._cache.popitem(last=False)
-
-    def clear(self) -> None:
-        """キャッシュをクリア"""
-        self._cache.clear()
 
 
 # 定型応答パターン: (regex, i18n キー)。応答文はユーザーに見える UI テキストなので
@@ -94,44 +68,29 @@ GREETING_RESPONSES_EN: list[tuple[re.Pattern, str]] = [
 
 
 class ReactiveAgent:
-    """Reactive 層: パターンマッチ + キャッシュで即応答
+    """Reactive 層: パターンマッチで即応答
 
     LLM を呼び出さず、ルールベースのみで応答する。
     目標応答時間: < 0.1秒
     """
 
-    def __init__(self, cache_max_size: int = 100, cache_ttl_sec: int = 300):
-        self.cache = ResponseCache(max_size=cache_max_size, ttl_sec=cache_ttl_sec)
-
     def process(self, query: str) -> ReactiveResponse | None:
-        """Reactive 層で応答を試みる (ルールベース + キャッシュのみ、LLM ゼロ)。
+        """Reactive 層で応答を試みる (ルールベースのみ、LLM ゼロ)。
 
         Returns:
-            ReactiveResponse: 応答できた場合 (挨拶パターン / キャッシュ命中)
+            ReactiveResponse: 応答できた場合 (挨拶パターン)
             None: 応答できない場合（上位層にエスカレーション）
         """
         start = time.perf_counter()
 
-        # 1. パターンマッチ（挨拶等）
         response = self._pattern_match(query)
         if response is not None:
             elapsed = (time.perf_counter() - start) * 1000
             logger.info("Pattern match hit: %.1fms", elapsed)
             return ReactiveResponse(content=response, source="pattern", elapsed_ms=elapsed)
 
-        # 2. キャッシュ検索 (上位層の応答を cache_response() で蓄積したもの)
-        cached = self.cache.get(self._cache_key(query))
-        if cached is not None:
-            elapsed = (time.perf_counter() - start) * 1000
-            logger.info("Cache hit: %.1fms", elapsed)
-            return ReactiveResponse(content=cached, source="cache", elapsed_ms=elapsed)
-
         # Reactive 層 (ルールベース) では対応不可 → 上位層へエスカレート
         return None
-
-    def cache_response(self, query: str, response: str) -> None:
-        """応答をキャッシュに保存（上位層の応答をキャッシュする用途）"""
-        self.cache.put(self._cache_key(query), response)
 
     def _pattern_match(self, query: str) -> str | None:
         """定型応答パターンで照合
@@ -155,7 +114,3 @@ class ReactiveAgent:
             if pattern.match(stripped):
                 return msg(key)
         return None
-
-    def _cache_key(self, query: str) -> str:
-        """クエリからキャッシュキーを生成（正規化）"""
-        return query.strip().lower()
