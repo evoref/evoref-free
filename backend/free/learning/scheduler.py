@@ -25,7 +25,7 @@ from backend.free.learning.learning_state_store import (
     LearningState,
     LearningStateStore,
 )
-from backend.free.learning.level0_instant import ExperienceBuffer
+from backend.free.learning.level0_instant import ExperienceBuffer, used_corpus_evidence
 from backend.free.learning.level1_session import (
     Level1Session,
     PriorityRequest,
@@ -51,21 +51,8 @@ if TYPE_CHECKING:
 logger = get_logger("learning.scheduler")
 
 
-def _used_corpus_evidence(experience: dict) -> bool:
-    """そのターンに corpus 由来の材料を **注入したか** (c_16 §5.5)。
-
-    ``gen_config.evidence_ids`` は ``"<store>:<evidence_id>"`` 形式で、
-    ``corpus:`` が 1 件でもあれば ``[参考情報]`` 枠に文書チャンクが載っている。
-    旧 ``signals.rag_used`` は「検索が何か返したか」でしかなく、フロア / gate /
-    top_k で全部落ちたターンも 1 と数えていた。
-    """
-    gen_config = experience.get("gen_config")
-    if not isinstance(gen_config, dict):
-        return False
-    return any(
-        isinstance(eid, str) and eid.startswith("corpus:")
-        for eid in (gen_config.get("evidence_ids") or ())
-    )
+#: 後方互換の別名 (実体は ``level0_instant.used_corpus_evidence``)。
+_used_corpus_evidence = used_corpus_evidence
 
 
 def _fmt_measured(value: float | None) -> str:
@@ -1980,6 +1967,25 @@ class LearningScheduler:
         # 届いたかを表していなかった。
         rag_used = sum(1 for e in safe_exp if _used_corpus_evidence(e))
         rag_usage_rate = rag_used / total if total > 0 else 0.0
+        # 「注入ゼロ」の理由 (f_01 §6.6): 疑似クエリのゲートで corpus を引かなかった
+        # turn の比率と、注入のうち疑似クエリ索引経由が 1 件以上あった turn の比率。
+        rag_gated = sum(
+            1 for e in safe_exp
+            if (e.get("gen_config") or {}).get("corpus_gated") is True
+        )
+        rag_pseudo_derived = sum(
+            1 for e in safe_exp
+            if int((e.get("gen_config") or {}).get("pseudo_derived_count") or 0) > 0
+        )
+        rag_gated_rate = rag_gated / total if total > 0 else 0.0
+        rag_pseudo_derived_rate = rag_pseudo_derived / rag_used if rag_used > 0 else 0.0
+        # 注入したのに「参考情報には記載が無い」と差し控えた turn の比率 (f_04 §3.2)。
+        # SSE 上は success なので、検索の取りこぼしはここでしか見えない。
+        rag_abstained = sum(
+            1 for e in safe_exp
+            if e.get("signals", {}).get("rag_abstained") is True
+        )
+        rag_abstain_rate = rag_abstained / rag_used if rag_used > 0 else 0.0
 
         # phase3 (embed_instruction) / phase4 (token_budget) が実際に判定する
         # 部分集合の経験数 (発火条件の可視化用。閾値は min_experiences // 2)。
@@ -2037,6 +2043,9 @@ class LearningScheduler:
             "experience_by_mode": {"chat": chat_count, "create": create_count},
             "correction_rate": round(correction_rate, 3),
             "rag_usage_rate": round(rag_usage_rate, 3),
+            "rag_gated_rate": round(rag_gated_rate, 3),
+            "rag_pseudo_derived_rate": round(rag_pseudo_derived_rate, 3),
+            "rag_abstain_rate": round(rag_abstain_rate, 3),
             # phase3/phase4 部分集合条件の可視化 (閾値は min_experiences // 2)
             "rag_score_experience_count": rag_score_experience_count,
             "long_form_experience_count": long_form_experience_count,

@@ -24,6 +24,7 @@ from backend.free.agent.router import (
 )
 from backend.free.core.intent_vocab import (
     refers_to_ongoing_session,
+    refers_to_previous_output,
     asks_to_restate_prior_report,
     ANAPHORIC_OPERAND_RE,
     NUMBER_LITERAL_RE,
@@ -151,6 +152,7 @@ from backend.free.agent.tool_judge_commands import (
     _readonly_command_rejected,
     DateIntentParams,
     command_lacks_date_arithmetic,
+    business_day_offset_from_query,
     date_intent_command_from_params,
     follow_up_excluded_weekdays_from_query,
     month_business_days_from_query,
@@ -798,6 +800,17 @@ class ToolCallJudge:
             # スキーマを強制しない build では非 JSON が返り得る (分類器と同じ救済)。
             payload = extract_json_object(content or "")
         params = parse_date_intent(payload)
+        if params is None:
+            # 「N 営業日 前 / 後」は手掛かり語 + 数量 + 向きで閉じているので、
+            # 抽出器が none を返してもコードで組む (2026-09-12 (b))。
+            offset = business_day_offset_from_query(call.query or "")
+            if offset is not None:
+                logger.info(
+                    "date intent resolved a business-day offset by code "
+                    "(extractor returned none): n=%d direction=%s",
+                    offset.n, offset.direction,
+                )
+                params = offset
         previous = self._previous_date_intent(call)
         # 「<月>の営業日数」は月が閉じた集合なのでコード側で組む (F-01)。抽出器が
         # 何か返していても、期間が月で閉じているならこちらが正。直前の演算が
@@ -854,6 +867,7 @@ class ToolCallJudge:
         ):
             anchor_date = previous_answer_date(
                 call.conversation, before=call.query or "",
+                today=utc_now_dt().astimezone().date(),
             )
             if anchor_date is None:
                 # 起点の名詞が同じ発話で定義されている (「締め切りは今日から
@@ -2245,10 +2259,12 @@ class ToolCallJudge:
         # 倒れて **別セッション** の「事実」を過去の記録として注入した
         # (2026-09-10 ライブ監査 (i) I-03 の再検証)。この会話について尋ねて
         # いる問いで現在セッションを除外する検索は構造的に誤り。
+        # 自分の直前の出力を指す指示語 (「今の 4 つの回答」「さっきの結果」) も
+        # 現在セッションにしか答えが無い (2026-09-12 (b))。
         self_reference = (
             not _SESSION_TOPIC_BREAK_LEAD_RE_EN.search(query)
             and refers_to_ongoing_session(query)
-        ) or any(
+        ) or refers_to_previous_output(query) or any(
             p.search(query) for p in _SELF_SESSION_REFERENCE_PATTERNS
         ) or (
             not _SESSION_TOPIC_BREAK_LEAD_RE_EN.search(query)

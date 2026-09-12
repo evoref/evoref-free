@@ -54,7 +54,6 @@ if TYPE_CHECKING:
     )
     from backend.free.rag.judge_usage_tracker import JudgeUsageTracker
     from backend.free.rag.embedding_backend import EmbeddingBackend
-    from backend.free.rag.lazy_contextual import LazyContextualPrefixService
     from backend.free.rag.cartridge_manager import CartridgeManager
     from backend.free.rag.vector_store import VectorStore
     from backend.free.themes.theme_service import ThemeManager
@@ -143,11 +142,6 @@ class AppState:
     vector_store: VectorStore | None = None
     embedder: EmbeddingBackend | None = None
     cartridge_manager: CartridgeManager | None = None
-    # Lazy Contextual Retrieval — retrieval 時に on-demand で
-    # プレフィックスを生成するサービス。``rag.contextual_prefix.mode=lazy``
-    # の時のみ wire_pillars で構築・注入される。``None`` または
-    # ``is_active=False`` の場合、search_pipeline 側は通知をスキップする。
-    lazy_contextual: "LazyContextualPrefixService | None" = None
     # 内容精査ゲート (``ChunkContentGate``、``rag.self_rag.content_gate.*``) の
     # セッション / クエリ単位の aux 発火カウンタ。``run_search_pipeline`` 経由で
     # ``session_id`` と共に参照し、``max_per_session`` / ``max_per_query`` の

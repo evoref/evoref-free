@@ -29,6 +29,24 @@ export interface RagDebugInfo {
 	search_time_ms: number;
 }
 
+/** 出典 1 件 (backend `sources` フレーム、c_06 §2.1) */
+export interface SourceItem {
+	/** `<store>:<evidence_id>` (SearchResult.evidence_ids と同じ) */
+	id: string;
+	store: 'corpus' | 'episodic';
+	package_id: string;
+	package_name: string;
+	doc_id: string;
+	heading: string;
+	score: number;
+	preview: string;
+}
+
+/** この応答の [参考情報] に注入した根拠。本文には出典を書かせないので UI が出す */
+export interface SourcesInfo {
+	items: SourceItem[];
+}
+
 /** 出力先パス未指定時にエディタペインへ直接流す生成コード片 */
 export interface EditorCodeArtifact {
 	content: string;
@@ -58,6 +76,7 @@ export interface ChatStreamEvent {
 		| 'error'
 		| 'step'
 		| 'rag_debug'
+		| 'sources'
 		| 'editor_route'
 		| 'editor_code'
 		| 'input_truncated'
@@ -67,6 +86,7 @@ export interface ChatStreamEvent {
 	error?: string;
 	step?: ChatStreamStep;
 	rag_debug?: RagDebugInfo;
+	sources?: SourcesInfo;
 	editor_route?: { target: 'editor' | 'chat' };
 	editor_code?: EditorCodeArtifact;
 	input_truncated?: InputTruncatedInfo;
@@ -185,6 +205,9 @@ export async function* chatStream(
 					if (parsed.rag_debug) {
 						if (IS_DEV) eventCounts.rag_debug++;
 						yield { type: 'rag_debug', rag_debug: parsed.rag_debug };
+					}
+					if (parsed.sources) {
+						yield { type: 'sources', sources: parsed.sources };
 					}
 					if (parsed.input_truncated) {
 						yield { type: 'input_truncated', input_truncated: parsed.input_truncated };

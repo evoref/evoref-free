@@ -918,6 +918,58 @@ _OTHER_PERSON_NOUN_RE = re.compile(
 )
 
 
+#: 人を指す語の直後の斜格の助詞。「息子と一緒に」「妻に」「娘を」— その人は
+#: 述語の主体でも「いる」対象でもなく、別の事柄の相手・目的である。
+_OBLIQUE_AFTER_PERSON_RE = re.compile(
+    r"^(?:さん|ちゃん|くん|君|たち|達)?(?:と一緒に|と共に|とともに|と|に|へ|を|から|より|まで)",
+)
+#: 家族・関係の **存在 / 同居** を述べる述語。これがあれば人の語は属性の値。
+_PERSON_EXISTENCE_RE = re.compile(
+    r"(?:います|いる|おります|居ます|暮らし|住んで|同居|一緒に住|人家族|家族で|がいて|もいて)",
+)
+#: 願望 / 評価 / 依頼で終わる述語。人の語が斜格で、これで終わる文は
+#: 「その人との予定・好み」であって家族構成の言明ではない。
+_WISH_OR_EVALUATION_RE = re.compile(
+    r"(?:がいい|が良い|がよい|たい|ほしい|欲しい|べき|でしょう|かな|かも|と思|みたい|ですね)"
+    r"(?:です|ます|ね|よ)?[。．.!！?？\s]*$",
+)
+
+
+def person_trigger_is_oblique(sentence: str, trigger_words: tuple[str, ...]) -> bool:
+    """人を指すトリガ語が **斜格の相手** としてしか現れないか (純粋関数)。
+
+    「息子と一緒に見られる作品がいいです」は家族スロットのトリガ語「息子」を
+    含むが、息子は「一緒に見る」相手で、文は作品への希望を述べている。
+    これを家族の値にすると「家族構成は」の想起が「息子との時間…」になる
+    (2026-09-12 ライブ監査 T08/4 → T10/2)。:func:`attribute_belongs_to_another_person`
+    は **主語** を見る (主語は「作品が」で人ではない) ので拾えない。
+
+    条件 (すべて構造):
+    - トリガ語の全出現の直後が斜格の助詞 (:data:`_OBLIQUE_AFTER_PERSON_RE`)
+    - 文に存在 / 同居の述語 (:data:`_PERSON_EXISTENCE_RE`) が無い
+    - 文末が願望 / 評価 (:data:`_WISH_OR_EVALUATION_RE`) で終わる
+
+    「妻と娘の 3 人家族です」(人家族) / 「息子と一緒に横浜に住んでいます」(住んで)
+    は存在述語があるので家族の値のまま。
+    """
+    text = (sentence or "").strip()
+    if not text or _PERSON_EXISTENCE_RE.search(text):
+        return False
+    if not _WISH_OR_EVALUATION_RE.search(text):
+        return False
+    saw = False
+    for word in trigger_words:
+        if not word:
+            continue
+        search_from = 0
+        while (pos := text.find(word, search_from)) >= 0:
+            search_from = pos + len(word)
+            saw = True
+            if not _OBLIQUE_AFTER_PERSON_RE.match(text[pos + len(word):]):
+                return False
+    return saw
+
+
 def attribute_belongs_to_another_person(
     sentence: str, trigger_words: tuple[str, ...],
 ) -> bool:
@@ -1149,6 +1201,7 @@ def _looks_like_bare_noun_fragment(sentence: str, *, max_len: int = 20) -> bool:
 
 
 __all__ = [
+    "abstains_on_reference_material",
     "asks_verbatim_excerpt",
     "is_payload_dump",
     "carries_no_assertion",
@@ -1352,6 +1405,44 @@ _EXISTENCE_DENIAL_TAIL = (
     r"[^。．\n]{0,16}?(?:は|も)?(?:存在しません|存在しない|ありません|ございません"
     r"|該当(?:は|が)?(?:ありません|ない)|ない(?:です|と(?:判断|考え)))"
 )
+
+
+#: 「提供された参考情報には…記載はありません」型の抑止。文書を注入した turn で
+#: これが立てば、答えが資料に無かったのではなく **検索が正解チャンクを引けなかった**
+#: (2026-09-12 (b) ライブ監査: T04/1・T04/3・V03 がこの形で SSE 上は success)。
+_REFERENCE_MATERIAL_RE = re.compile(
+    r"(?:提供|与え|注入|ご提示)(?:された|いただいた|られた)?(?:参考)?(?:情報|資料|文書|設計書|コンテキスト)"
+    r"|参考情報|参考資料"
+    r"|(?:the\s+)?(?:provided|given|supplied|available)\s+(?:reference\s+)?(?:material|information|context|documents?|sources?)",
+    re.IGNORECASE,
+)
+_ABSTAIN_PREDICATE_RE = re.compile(
+    r"(?:記載|記述|情報|内容|言及|定義|説明|該当)(?:は|が|も)?(?:ありません|ございません|見当たりません|含まれていません|含まれておりません|示されていません|無い|ない)"
+    r"|確認できません|確認できていません|確認できませんでした|判断できません|特定できません"
+    r"|(?:does|do|did)\s+not\s+(?:contain|include|mention|describe|specify|state)|(?:no|not)\s+(?:information|mention|description)",
+    re.IGNORECASE,
+)
+_ABSTAIN_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。．！？!?])\s*|\n+")
+
+
+def abstains_on_reference_material(text: str) -> bool:
+    """応答が「提供された参考情報には記載が無い」と述べて答えを差し控えているか (純粋関数)。
+
+    **先頭の文** だけを見る — 答えた後に「なお参考情報には無いが」と補足する形は
+    答えている。資料の語 (:data:`_REFERENCE_MATERIAL_RE`) と欠落の述語
+    (:data:`_ABSTAIN_PREDICATE_RE`) が同じ文にあり、述語の直後が譲歩の
+    「が」(「ありませんが、…」) でないときだけ真。
+    """
+    body = (text or "").strip()
+    if not body:
+        return False
+    first = next((s for s in _ABSTAIN_SENTENCE_SPLIT_RE.split(body) if s.strip()), "")
+    if not _REFERENCE_MATERIAL_RE.search(first):
+        return False
+    m = _ABSTAIN_PREDICATE_RE.search(first)
+    if m is None:
+        return False
+    return not first[m.end():].lstrip().startswith(("が", "けれど", "but"))
 
 
 def denies_own_enumeration(text: str) -> str | None:

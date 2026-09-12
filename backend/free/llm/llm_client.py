@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import math
+import time
 
 from backend.free.llm.local_client import LocalClient
 from backend.log_config import get_logger
@@ -35,6 +36,11 @@ class LLMClient:
         self.local = local
         # フォアグラウンドのチャット進行中数 (f_02 §4.3 の協調 yield 用)
         self._in_flight_chat_count: int = 0
+        #: 最後にチャット応答が終わった時刻 (monotonic)。``None`` = まだ無い。
+        #: 「今生成中か」だけでは、ターンの合間 (数秒) に背景の長い生成が
+        #: 割り込んで次のターンに横取りされる (2026-09-12 実測: Step 5.9 が
+        #: 13 回横取りされ TTFT 20 s → 55 s)。静穏窓の判定に使う。
+        self._last_chat_finished_at: float | None = None
 
     @property
     def in_flight_chat_count(self) -> int:
@@ -65,6 +71,19 @@ class LLMClient:
             yield
         finally:
             self._in_flight_chat_count -= 1
+            self._last_chat_finished_at = time.monotonic()
+
+    def seconds_since_last_chat(self) -> float | None:
+        """最後のチャット応答が終わってからの秒数 (一度も無ければ ``None``)。
+
+        生成中は ``0.0``。背景の LLM ステップが「静穏窓」を判定するための
+        観測点で、``in_flight_chat_count`` と同じくベース 1 つで足りる。
+        """
+        if self._in_flight_chat_count > 0:
+            return 0.0
+        if self._last_chat_finished_at is None:
+            return None
+        return max(0.0, time.monotonic() - self._last_chat_finished_at)
 
     @property
     def chat_slot(self) -> int:

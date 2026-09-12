@@ -23,7 +23,7 @@ score, text)``。``score`` は ``CorpusStore.search`` が計算した c_16 §7.2
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -277,6 +277,8 @@ class CartridgeManager:
         query_vec: np.ndarray,
         top_k: int = 5,
         rescore_candidates: int = 0,  # noqa: ARG002 — 呼出面の互換のため受ける
+        *,
+        query_text: str = "",
     ) -> list[tuple[str, float, float, str]]:
         """ロード済みパッケージ横断検索 (素の cosine と順位式スコアを分けて返す)。
 
@@ -295,12 +297,16 @@ class CartridgeManager:
             rescore_candidates: 受け取るが使わない。``EvidenceStore`` は
                 snapshot 生成時に作ったクラスタ索引と int8 → float32 の 2 段
                 検索を内部で持ち、候補数は c_16 §6.3 の構造上限で決まる。
+            query_text: 転置索引の候補生成に渡す生のクエリ (c_16 §6.3)。
+                空ならベクトル候補だけ。チャット経路は長らく空で呼んでいて、
+                固有語の問い (「Step 5.9」) が本体 cosine だけでは上位に来なかった
+                (2026-09-12 (b): golden で recall@5 0.550 → 0.640)。
         """
         loaded = self._corpus.loaded_ids
         if not loaded:
             return []
         hits = self._corpus.search(
-            "", query_vec, top_k=top_k * len(loaded), per_package_k=top_k,
+            query_text or "", query_vec, top_k=top_k * len(loaded), per_package_k=top_k,
         )
         return [
             (
@@ -311,6 +317,91 @@ class CartridgeManager:
             )
             for hit in hits
         ]
+
+    def search_detailed_pq(
+        self, query_vec: np.ndarray, top_k: int = 5,
+    ) -> list[tuple[str, float, float, str, bool]]:
+        """疑似クエリ索引の検索 (f_01 §6.3)。
+
+        戻りは :meth:`search_detailed` の 4 タプル + ``hinted`` (最良の問いが
+        取りこぼした問いの言い換えか)。並びは問い↔問いの cosine 順で、
+        ``cosine`` は問い↔問いの値 (ゲート用)、``score`` は対象チャンク本体の
+        順位式の値。
+        """
+        if not self._corpus.loaded_ids:
+            return []
+        hits = self._corpus.search_pseudo(query_vec, top_k=top_k)
+        return [
+            (
+                f"{hit.package_id}:{hit.evidence_id}", hit.cosine, hit.score, hit.text,
+                hit.hinted,
+            )
+            for hit in hits
+        ]
+
+    def search_detailed_lexical_seat(
+        self, query_vec: np.ndarray, query_text: str, exclude_ids: Sequence[str],
+        seats: int = 1,
+    ) -> list[tuple[str, float, float, str]]:
+        """転置索引の席 (f_01 §8.1 の 4.3)。:meth:`search_detailed` と同じ 4 タプル。"""
+        hits = self._corpus.lexical_seat(query_text, query_vec, exclude_ids, seats=seats)
+        return [
+            (f"{hit.package_id}:{hit.evidence_id}", hit.cosine, hit.score, hit.text)
+            for hit in hits
+        ]
+
+    def previous_chunk_context(
+        self, chunk_id: str, tail_chars: int,
+    ) -> tuple[str, str] | None:
+        """直前チャンク (同文書・同大節) の末尾 (f_01 §8.1 の 7.65)。"""
+        return self._corpus.previous_chunk_context(chunk_id, tail_chars)
+
+    def outdated_package_ids(self) -> list[str]:
+        """chunker 版が古いパッケージ id (f_01 §3.3 の 6)。"""
+        return self._corpus.outdated_package_ids()
+
+    async def rebuild_outdated(self, *, limit: int = 1) -> list[str]:
+        """chunker 版が古いパッケージを ``docs/`` から作り直す (最大 ``limit`` 件)。"""
+        rebuilt: list[str] = []
+        for package_id in self.outdated_package_ids()[: max(0, int(limit))]:
+            logger.warning(
+                "corpus package %s was chunked with an older chunker; rebuilding "
+                "from docs/ (f_01 §3.3)", package_id,
+            )
+            try:
+                await self._corpus.rebuild(package_id)
+            except Exception as e:  # noqa: BLE001 — 1 件の失敗で sleep-time を止めない
+                logger.warning("rebuild of corpus package %s failed: %s", package_id, e)
+                continue
+            rebuilt.append(package_id)
+        return rebuilt
+
+    def record_pq_misses(self, chunk_ids: Sequence[str], question: str) -> int:
+        """取りこぼした問いの語彙候補を misses へ積む (f_01 §6.4)。"""
+        return self._corpus.record_pq_misses(chunk_ids, question)
+
+    def record_pq_hits(self, chunk_ids: Sequence[str]) -> None:
+        """応答パスで採用した corpus チャンク id を疑似クエリの lazy 生成対象へ溜める。"""
+        self._corpus.record_pq_hits(chunk_ids)
+
+    def pq_coverage(self) -> float:
+        """ロード済みパッケージの疑似クエリ充足率 (0.0〜1.0)。"""
+        return self._corpus.pq_coverage()
+
+    def corpus_calibration(self) -> dict | None:
+        """corpus 側の較正済み閾値 (f_01 §6.6)。未較正なら ``None``。"""
+        return self._corpus.calibration()
+
+    async def recalibrate_corpus(self, *, force: bool = False) -> dict | None:
+        """corpus 側の棒を導き直す (sleep-time Step 5.9 の後 / 起動時)。"""
+        return await self._corpus.recalibrate(force=force)
+
+    def describe_chunk(self, chunk_id: str) -> dict | None:
+        """``"<package_id>:<evidence_id>"`` の所在 (文書名 / 見出し) を引く。"""
+        package_id, sep, evidence_id = chunk_id.partition(":")
+        if not sep or not evidence_id:
+            return None
+        return self._corpus.describe_chunk(package_id, evidence_id)
 
     def search(
         self, query_vec: np.ndarray, top_k: int = 5, rescore_candidates: int = 0,

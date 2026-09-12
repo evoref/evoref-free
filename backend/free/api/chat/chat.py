@@ -36,7 +36,9 @@ from backend.free.agent.tool_call_judge import (
 )
 from backend.free.api.chat.chat_recorder import (
     record_response,
+    record_turn_sources,
     set_turn_evidence_ids,
+    set_turn_rag_meta,
     set_turn_fewshot_ids,
 )
 from backend.free.api.chat.chat_types import ChatMessage
@@ -899,6 +901,13 @@ async def _build_messages_with_search(
         timer.stop("semmem_ms")
     if session_id:
         set_turn_evidence_ids(session_id, injected_evidence_ids)
+        set_turn_rag_meta(
+            session_id,
+            corpus_gated=search_result.corpus_gated,
+            pseudo_derived=search_result.pseudo_derived,
+            lexical_candidate_ids=search_result.lexical_candidate_ids,
+            corpus_starved=search_result.corpus_starved,
+        )
 
     # 直前ターンで作った長文成果物が、この発話の対象になっているか。
     # 長文は履歴予算に入らず次ターンで消えるため、これが無いとモデルは
@@ -935,6 +944,9 @@ async def _build_messages_with_search(
 
     sse_notify = SSEFrameBuilder()
     rag_debug_frame = _build_rag_debug_frame(state, scored_chunks, sse_notify, timer)
+    sources_frame = _build_sources_frame(
+        state, scored_chunks, sse_notify, session_id=session_id,
+    )
     # ユーザー発言が長さ制限で切られた場合は UI へも伝える。system 注記だけでは
     # ベースモデルが従わず全体を見た前提で断定する実測があるため、モデルの遵守に
     # 依存せずユーザー自身が気づけるようにする (2026-07-26)。
@@ -954,10 +966,63 @@ async def _build_messages_with_search(
             })
         if rag_debug_frame:
             yield rag_debug_frame
+        if sources_frame:
+            yield sources_frame
         async for frame in inner_gen:
             yield frame
 
     return messages, _wrapper, semmem_block, scored_chunks, rag_top_raw_score
+
+
+#: 出典フレームに載せる本文プレビューの長さ。
+_SOURCE_PREVIEW_CHARS = 160
+
+
+def _build_sources_frame(
+    state: AppState,
+    scored_chunks: list,
+    sse_notify: SSEFrameBuilder,
+    *,
+    session_id: str | None = None,
+) -> str | None:
+    """出典フレーム (c_06 §2.1 ``sources``) を組む。注入が無ければ ``None``。
+
+    本文には出典を書かせない (``InternalFrameMentionFilter``) ので、UI は
+    このフレームで根拠を出す。corpus チャンクは所在 (パッケージ / 文書 /
+    見出し) を ``CartridgeManager.describe_chunk`` で引き、会話ノートは
+    ``episodic`` として本文プレビューだけを付ける。
+    """
+    if not scored_chunks:
+        return None
+    manager = getattr(state, "cartridge_manager", None)
+    items: list[dict] = []
+    for chunk_id, score, content in scored_chunks:
+        is_corpus = ":" in chunk_id
+        evidence_id = chunk_id.split(":", 1)[1] if is_corpus else chunk_id
+        item: dict = {
+            "id": f"{'corpus' if is_corpus else 'episodic'}:{evidence_id}",
+            "store": "corpus" if is_corpus else "episodic",
+            "package_id": "",
+            "package_name": "",
+            "doc_id": "",
+            "heading": "",
+            "score": round(float(score), 4),
+            "preview": (content or "")[:_SOURCE_PREVIEW_CHARS],
+        }
+        if is_corpus and manager is not None and hasattr(manager, "describe_chunk"):
+            try:
+                described = manager.describe_chunk(chunk_id)
+            except Exception:  # noqa: BLE001 — 出典の装飾で応答を止めない
+                described = None
+            if described:
+                item.update({k: described.get(k, "") for k in (
+                    "package_id", "package_name", "doc_id", "heading",
+                )})
+        items.append(item)
+    if session_id:
+        # 「この会話で参照した資料は」に答える台帳 (chat_service の会話計量)。
+        record_turn_sources(session_id, items)
+    return sse_notify.sources(items)
 
 
 def _build_rag_debug_frame(

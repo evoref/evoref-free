@@ -174,6 +174,24 @@ class SleepTimeWorker:
         """
         self._chat_in_flight_probe = probe
 
+    def set_chat_recent(self, probe: "Callable[[float], bool] | None") -> None:
+        """「チャットが実行中、または終わってから N 秒未満か」を返す判定を注入する。
+
+        1 件が長い LLM 生成を繰り返すステップ (Step 5.9) が、ターンの合間に
+        割り込まないための静穏窓。未注入なら :meth:`_chat_in_flight` に倒す。
+        """
+        self._chat_recent_probe = probe
+
+    def _chat_recent(self, quiet_sec: float) -> bool:
+        """チャットが実行中、または終わってから ``quiet_sec`` 秒未満か。"""
+        probe = getattr(self, "_chat_recent_probe", None)
+        if probe is None:
+            return self._chat_in_flight()
+        try:
+            return bool(probe(quiet_sec))
+        except Exception:
+            return self._chat_in_flight()
+
     def _chat_in_flight(self) -> bool:
         """チャット生成が実行中か (未注入なら常に False = 従来どおり止まらない)。"""
         probe = getattr(self, "_chat_in_flight_probe", None)
@@ -639,10 +657,18 @@ class SleepTimeWorker:
             )
             return result
 
-        # Step 5.8: Contextual Retrieval プレフィックス生成
+        # Step 5.85: chunker 版が古い corpus パッケージの作り直し (f_01 §3.3 の 6)。
+        # 埋め込み 1000 チャンク級で数分 GPU を使うので静穏窓でだけ、1 サイクル 1 つ。
         ts = time.monotonic()
-        result["contextual_prefixes"] = await self._step5_8_contextual_prefixes(llm_client)
-        step_durations["step5_8_contextual"] = round(time.monotonic() - ts, 3)
+        result["corpus_rebuilt"] = await self._step5_85_rebuild_outdated_corpus()
+        step_durations["step5_85_corpus_rebuild"] = round(time.monotonic() - ts, 3)
+        if self._check_cancelled():
+            return result
+
+        # Step 5.9: corpus 疑似クエリ生成 (f_01 §6.4)
+        ts = time.monotonic()
+        result["pseudo_queries"] = await self._step5_9_pseudo_queries(llm_client)
+        step_durations["step5_9_pseudo_query"] = round(time.monotonic() - ts, 3)
         if self._check_cancelled():
             return result
 
@@ -996,26 +1022,50 @@ class SleepTimeWorker:
             logger.info("Step 5.5: decayed %d patterns", removed)
         return removed or 0
 
-    async def _step5_8_contextual_prefixes(self, llm_client) -> int:
-        """Step 5.8: Contextual Retrieval プレフィックス生成。
+    async def _step5_85_rebuild_outdated_corpus(self) -> int:
+        """Step 5.85: chunker 版が古い corpus パッケージを静穏窓で 1 つ作り直す。"""
+        manager = self.cartridge_manager
+        if manager is None or not hasattr(manager, "rebuild_outdated"):
+            return 0
+        try:
+            outdated = list(manager.outdated_package_ids())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Step 5.85: outdated corpus lookup failed: %s", e)
+            return 0
+        if not outdated:
+            return 0
+        from backend.free.memory.sleep.pseudo_query import quiet_seconds
 
-        実ロジックは
-        :mod:`backend.free.memory.sleep.contextual` に分離された。
-        本メソッドはメイン VectorStore / カートリッジを
-        引数に詰め替える薄いラッパ。
+        if self._chat_recent(quiet_seconds(self.config)):
+            logger.info(
+                "Step 5.85: %d outdated corpus package(s) wait for a quiet window",
+                len(outdated),
+            )
+            return 0
+        rebuilt = await manager.rebuild_outdated(limit=1)
+        if rebuilt:
+            logger.info("Step 5.85: rebuilt corpus package(s) %s", ", ".join(rebuilt))
+        return len(rebuilt)
+
+    async def _step5_9_pseudo_queries(self, llm_client) -> int:
+        """Step 5.9: corpus パッケージの疑似クエリ生成 (f_01 §6.4)。
+
+        実ロジックは :mod:`backend.free.memory.sleep.pseudo_query`。
         """
-        from backend.free.memory.sleep.contextual import (
-            generate_contextual_prefixes,
+        from backend.free.memory.sleep.pseudo_query import (
+            generate_pseudo_queries,
+            quiet_seconds,
         )
 
-        return await generate_contextual_prefixes(
+        quiet = quiet_seconds(self.config)
+        return await generate_pseudo_queries(
             llm_client,
             config=self.config,
-            embedder=self.embedder,
-            vector_store=self.vector_store,
             cartridge_manager=self.cartridge_manager,
             is_cancelled=self._check_cancelled,
-            should_pause=self._chat_in_flight,
+            # 「今生成中か」ではなく静穏窓 (f_01 §6.4)。ターンの合間に割り込むと
+            # 次のターンに横取りされ、その往復で TTFT を壊す。
+            should_pause=lambda: self._chat_recent(quiet),
         )
 
     async def _step8_9_summarize_sessions(self, llm_client) -> int:

@@ -61,6 +61,7 @@ from backend.free.core.response_arithmetic import (
 )
 from backend.free.llm.json_schemas import FewShotQualityJudgement
 from backend.free.memory.types import make_fact
+from backend.free.learning.level0_instant import used_corpus_evidence
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -1406,6 +1407,13 @@ class FewShotPool(JsonStateStore):
             # 「45 km」が採用されていた。日付演算だけを問いの語形で弾いていた
             # ``_find_volatile_reason`` を、ツール種別に依らない印で一般化)。
             if signals.get("tool_grounded", False):
+                continue
+            # 文書チャンク (corpus) を根拠にした応答も同じ理由で手本にしない。
+            # 資料の値・固有名はその問いのものであって文体ではなく、手本に
+            # 載ると同じ形の問いに資料を引かず手本の値を復唱する。疑似クエリ
+            # 索引 (f_01 §6) で注入率が 28% → 95% に上がったので実害が大きい。
+            # 印は ``gen_config.evidence_ids`` の ``corpus:`` (注入した材料の id)。
+            if used_corpus_evidence(exp):
                 continue
 
             query = exp.get("query", "").strip()

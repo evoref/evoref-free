@@ -1265,9 +1265,26 @@ _ANAPHORIC_START_RE = re.compile(
 #: 直前のアシスタント発話に現れる日付 (和暦表記 / ISO)。最後に現れたものを
 #: 「直前の結果」と読む (回答は結論の日付で終わることが多い)。
 _ANSWER_DATE_RE = re.compile(
-    r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日"
-    r"|(\d{4})-(\d{2})-(\d{2})"
+    r"(?:(?P<y1>\d{4})\s*年\s*)?(?P<m1>\d{1,2})\s*月\s*(?P<d1>\d{1,2})\s*日"
+    r"|(?P<y2>\d{4})-(?P<m2>\d{2})-(?P<d2>\d{2})"
 )
+
+#: 年なしの「M 月 D 日」に補う年の探索窓 (今日から前 90 日〜後 275 日)。
+_YEARLESS_PAST_DAYS = 90
+_YEARLESS_FUTURE_DAYS = 275
+
+
+def _resolve_yearless(month: int, day: int, today: datetime.date) -> datetime.date | None:
+    """年なしの月日を、今日に最も近い巡り (窓内) の日付にする (純粋関数)。"""
+    for year in (today.year - 1, today.year, today.year + 1):
+        try:
+            cand = datetime.date(year, month, day)
+        except ValueError:
+            continue
+        delta = (cand - today).days
+        if -_YEARLESS_PAST_DAYS <= delta <= _YEARLESS_FUTURE_DAYS:
+            return cand
+    return None
 
 
 #: 「<月>の営業日数」— 期間が月で閉じている数え上げ。月は閉じた集合なので
@@ -1360,9 +1377,55 @@ _NTH_WEEKDAY_OF_MONTH_RE = re.compile(
     r"(?P<month>今月|来月|再来月|先月"
     r"|(?P<year>\d{4})\s*年\s*(?P<ynum>\d{1,2})\s*月"
     r"|(?P<num>\d{1,2})\s*月)"
-    r"(?:の)?\s*第\s*(?P<nth>[1-5１-５一二三四五])\s*(?P<wd>[月火水木金土日])曜"
+    r"(?:の)?\s*(?:第\s*(?P<nth>[1-5１-５一二三四五])|(?P<last>最終|最後の))"
+    r"\s*(?P<wd>[月火水木金土日])曜"
 )
 _KANJI_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}
+
+#: 「N 営業日 前 / 後」— 手掛かり語 + 数量 + 向きで閉じた演算。抽出器が
+#: ``kind: none`` を返したときの決定論の下限 (2026-09-12 (b))。
+_BUSINESS_DAY_OFFSET_RE = re.compile(
+    r"(?P<n>\d+|[一二三四五六七八九十]+)\s*(?:営業日|稼働日)\s*(?P<dir>前|後|以内)",
+)
+_KANJI_NUMERALS = {c: i for i, c in enumerate("〇一二三四五六七八九十")}
+
+
+def _kanji_or_digit_to_int(token: str) -> int | None:
+    """「3」「三」「十二」を整数に (十の位まで、純粋関数)。"""
+    if token.isdigit():
+        return int(token)
+    if not token or any(c not in _KANJI_NUMERALS for c in token):
+        return None
+    if "十" not in token:
+        return _KANJI_NUMERALS[token] if len(token) == 1 else None
+    tens, _, ones = token.partition("十")
+    t = 1 if tens == "" else _KANJI_NUMERALS.get(tens)
+    o = 0 if ones == "" else _KANJI_NUMERALS.get(ones)
+    if t is None or o is None or t == 0:
+        return None
+    return t * 10 + o
+
+
+def business_day_offset_from_query(query: str) -> DateIntentParams | None:
+    """「N 営業日 前 / 後」を ``business_days_from`` に組む (純粋関数)。
+
+    起点は ``None`` (今日) のまま返す — 照応・参照名詞 (「その締め切りの 3
+    営業日前」) の起点は呼出側の規則 (``query_anchors_on_prior_result`` →
+    ``previous_answer_date``) が差し替え、国民の祝日は ``_with_calendar_holidays``
+    が供給する。抽出器が同じ発話に ``kind: none`` を返す回があり (2026-09-12 (b)
+    実測)、そのときモデルが暗算で祝日を落とした (9/24、正 9/22)。
+    """
+    m = _BUSINESS_DAY_OFFSET_RE.search(query or "")
+    if m is None:
+        return None
+    n = _kanji_or_digit_to_int(m.group("n"))
+    if n is None or not 1 <= n <= _MAX_DATE_INTENT_N:
+        return None
+    direction = "backward" if m.group("dir") == "前" else "forward"
+    return DateIntentParams(
+        kind="business_days_from", start=None, end=None, n=n, skip_weekends=True,
+        holidays=(), count_start_day=False, direction=direction, excluded_weekdays=(),
+    )
 
 
 def nth_weekday_of_month_from_query(
@@ -1380,14 +1443,19 @@ def nth_weekday_of_month_from_query(
     if resolved is None:
         return None
     y, mo = resolved
-    nth_raw = m.group("nth")
-    nth = _KANJI_DIGITS.get(nth_raw) or int(nth_raw.translate(
-        str.maketrans("１２３４５", "12345"),
-    ))
     weekday = _WEEKDAY_INDEX[m.group("wd")]
-    first = datetime.date(y, mo, 1)
-    offset = (weekday - first.weekday()) % 7
-    target = first + datetime.timedelta(days=offset + 7 * (nth - 1))
+    if m.group("last"):
+        # 最終 X 曜日: 月末から遡った最初の巡り
+        last_day = (datetime.date(y, mo, 1) + datetime.timedelta(days=31)).replace(day=1) - datetime.timedelta(days=1)
+        target = last_day - datetime.timedelta(days=(last_day.weekday() - weekday) % 7)
+    else:
+        nth_raw = m.group("nth")
+        nth = _KANJI_DIGITS.get(nth_raw) or int(nth_raw.translate(
+            str.maketrans("１２３４５", "12345"),
+        ))
+        first = datetime.date(y, mo, 1)
+        offset = (weekday - first.weekday()) % 7
+        target = first + datetime.timedelta(days=offset + 7 * (nth - 1))
     if target.month != mo:
         return None
     return DateIntentParams(
@@ -1435,19 +1503,37 @@ def query_anchors_on_prior_result(query: str) -> bool:
     return False
 
 
-def last_date_in_text(text: str) -> datetime.date | None:
-    """本文の **最後** に現れる日付 (純粋関数)。無ければ ``None``。"""
+def last_date_in_text(
+    text: str, today: datetime.date | None = None,
+) -> datetime.date | None:
+    """本文の **最後** に現れる日付 (純粋関数)。無ければ ``None``。
+
+    年なしの「M 月 D 日」も採る (``today`` を渡したときだけ。年は今日に最も
+    近い巡りで補う)。訂正確認の応答は「再来週の火曜日（9月22日）に変更された
+    のですね」のように年を省くのが普通で、年必須だと起点が今日に落ちて
+    「報告会の 2 営業日前」が今日起点になった (2026-09-12 (b) T07/4)。
+    """
     found = None
     for m in _ANSWER_DATE_RE.finditer(text or ""):
-        parts = [g for g in m.groups() if g is not None]
+        g = m.groupdict()
         try:
-            found = datetime.date(int(parts[0]), int(parts[1]), int(parts[2]))
+            if g.get("y2"):
+                found = datetime.date(int(g["y2"]), int(g["m2"]), int(g["d2"]))
+            elif g.get("y1"):
+                found = datetime.date(int(g["y1"]), int(g["m1"]), int(g["d1"]))
+            elif today is not None:
+                cand = _resolve_yearless(int(g["m1"]), int(g["d1"]), today)
+                if cand is not None:
+                    found = cand
         except ValueError:
             continue
     return found
 
 
-def previous_answer_date(conversation: list[dict] | None, *, before: str = "") -> datetime.date | None:
+def previous_answer_date(
+    conversation: list[dict] | None, *, before: str = "",
+    today: datetime.date | None = None,
+) -> datetime.date | None:
     """直前のアシスタント発話が述べた日付 (純粋関数)。
 
     「今日から 3 週間後は？」→「2026年9月30日（水曜日）です」の次の
@@ -1472,7 +1558,7 @@ def previous_answer_date(conversation: list[dict] | None, *, before: str = "") -
                 seen_self = True
             continue
         if role == "assistant":
-            found = last_date_in_text(content)
+            found = last_date_in_text(content, today)
             if found is not None:
                 return found
             return None

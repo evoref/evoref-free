@@ -7,6 +7,7 @@
 		addStepToLastAssistant,
 		addStepResultToLastAssistant,
 		setRagDebugToLastAssistant,
+		setSourcesToLastAssistant,
 		setEditorRouteToLastAssistant,
 		setLongFormProgressToLastAssistant,
 		pushGeneratedEditorCode,
@@ -130,6 +131,8 @@
 					markLastAssistantTruncated(event.output_truncated);
 				} else if (event.type === 'rag_debug' && event.rag_debug) {
 					setRagDebugToLastAssistant(event.rag_debug);
+				} else if (event.type === 'sources' && event.sources) {
+					setSourcesToLastAssistant(event.sources);
 				} else if (event.type === 'editor_route' && event.editor_route) {
 					setEditorRouteToLastAssistant(event.editor_route.target);
 				} else if (event.type === 'editor_code' && event.editor_code) {

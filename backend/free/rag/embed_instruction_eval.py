@@ -13,7 +13,7 @@ import すると依存方向 (Gen→Learn) を逆転させ pillar 境界を侵�
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from backend.exceptions import VectorDimensionMismatchError
 from backend.log_config import get_logger
@@ -86,3 +86,98 @@ class EmbedInstructionEval:
         if not scores:
             return None
         return sum(scores) / len(scores)
+
+
+#: 疑似クエリ評価で使う (問い, 正解チャンク) ペアの上限。候補ごとにこの件数を
+#: 再埋め込みするので、世代 × 集団のコストを抑える。
+PSEUDO_QUERY_EVAL_MAX_PAIRS = 64
+
+
+class PseudoQueryEmbedEval:
+    """疑似クエリ索引 (f_01 §6) を **ラベル付き** の実測評価に使う評価器。
+
+    :class:`EmbedInstructionEval` は記録済みクエリの top1 cosine 平均
+    (正解が何かを知らない指標) だったが、疑似クエリは「問い → 正解チャンク」
+    の対応を持つので、候補 instruction で問いを再埋め込みして正解チャンクが
+    top-k に入る率 (recall@k) を fitness にできる。ペアは疑似クエリ id で
+    決定論的にサンプリングし、同じランの候補間で同じ集合を使う。
+
+    ``EmbedEvalProtocol`` の ``queries`` 引数 (記録済みクエリ) は使わない —
+    ラベルを持つ疑似クエリの方が弁別力が高い。
+    """
+
+    def __init__(
+        self,
+        cartridge_manager: Any,
+        embedder: Any,
+        *,
+        query_template: str,
+        top_k: int = 5,
+        max_pairs: int = PSEUDO_QUERY_EVAL_MAX_PAIRS,
+    ) -> None:
+        self._manager = cartridge_manager
+        self._embedder = embedder
+        self._query_template = query_template
+        self._top_k = max(1, int(top_k))
+        self._max_pairs = max(1, int(max_pairs))
+
+    @property
+    def can_measure(self) -> bool:
+        return "{task}" in self._query_template and "{query}" in self._query_template
+
+    def _pairs(self) -> list[tuple[str, str, str]]:
+        """``(package_id, 問い, 正解チャンク id)`` を id 順で最大 ``max_pairs`` 件。"""
+        out: list[tuple[str, str, str]] = []
+        corpus = getattr(self._manager, "corpus", None)
+        if corpus is None:
+            return out
+        for package_id in corpus.loaded_ids:
+            package = corpus.get(package_id)
+            index = getattr(package, "pseudo_queries", None)
+            if package is None or index is None or len(index) == 0:
+                continue
+            snapshot = index.store.snapshot
+            if snapshot is None:
+                continue
+            for row in range(len(snapshot)):
+                raw = snapshot.raw_at(row) or {}
+                target = (raw.get("attrs") or {}).get("target_id")
+                text = str(raw.get("text") or "")
+                if isinstance(target, str) and target and text:
+                    out.append((package_id, text, target))
+        out.sort(key=lambda t: (t[0], t[2], t[1]))
+        if len(out) <= self._max_pairs:
+            return out
+        step = len(out) / self._max_pairs
+        return [out[int(i * step)] for i in range(self._max_pairs)]
+
+    async def score_candidate(
+        self, candidate: str, queries: list[str],  # noqa: ARG002 — Protocol の面
+    ) -> float | None:
+        """候補 instruction での recall@k (0.0〜1.0)。実測不能は ``None``。"""
+        if not self.can_measure:
+            return None
+        pairs = self._pairs()
+        if not pairs:
+            return None
+        corpus = self._manager.corpus
+        raw = getattr(self._embedder, "inner", self._embedder)
+        hits = 0
+        try:
+            for package_id, question, target in pairs:
+                package = corpus.get(package_id)
+                if package is None:
+                    continue
+                formatted = self._query_template.format(task=candidate, query=question)
+                vecs = await raw.embed([formatted], is_query=False)
+                rows = package.store.search("", vecs[0], top_k=self._top_k)
+                snapshot = package.store.snapshot
+                found = {
+                    snapshot.id_at(row) for row, _c, _s in rows
+                } if snapshot is not None else set()
+                if target in found:
+                    hits += 1
+        except (VectorDimensionMismatchError, Exception) as exc:  # noqa: BLE001
+            logger.warning("pseudo-query embed eval failed, degrading: %s", exc)
+            return None
+        return hits / len(pairs)

@@ -166,6 +166,12 @@ class SchedulerStatusModel(BaseModel):
     rag_usage_rate: float = 0.0
     prev_correction_rate: float | None = None
     prev_rag_usage_rate: float | None = None
+    # 注入ゼロの理由 (f_04 §3.2): 疑似クエリゲートで corpus を引かなかった率と、
+    # 注入ありのうち疑似クエリ索引経由が 1 件以上の率。
+    rag_gated_rate: float = 0.0
+    rag_pseudo_derived_rate: float = 0.0
+    # 注入ありのうち「参考情報には記載が無い」と差し控えた率 (検索の取りこぼしの観測)
+    rag_abstain_rate: float = 0.0
     # phase3 (embed_instruction) / phase4 (token_budget) 部分集合条件の可視化
     # (閾値は phase_subset_min_experiences)
     rag_score_experience_count: int = 0

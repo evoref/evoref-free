@@ -21,6 +21,24 @@ RESPONSE_SUMMARY_CAP = 200
 RESPONSE_FULL_CAP = 4000
 
 
+def used_corpus_evidence(experience: dict) -> bool:
+    """そのターンに corpus 由来の材料を **注入したか** (c_16 §5.5)。
+
+    ``gen_config.evidence_ids`` は ``"<store>:<evidence_id>"`` 形式で、
+    ``corpus:`` が 1 件でもあれば ``[参考情報]`` 枠に文書チャンクが載っている。
+    旧 ``signals.rag_used`` は「検索が何か返したか」でしかなく、フロア / gate /
+    top_k で全部落ちたターンも 1 と数えていた。読み手は Level 1 の
+    ``rag_usage_rate`` と few-shot の根拠ゲート。
+    """
+    gen_config = experience.get("gen_config")
+    if not isinstance(gen_config, dict):
+        return False
+    return any(
+        isinstance(eid, str) and eid.startswith("corpus:")
+        for eid in (gen_config.get("evidence_ids") or ())
+    )
+
+
 def truncate_at_boundary(text: str, cap: int) -> str:
     """``cap`` 字以内で文境界 (。．.!?改行) を優先して切り詰める。
 
@@ -160,6 +178,11 @@ class FeedbackSignals:
     #: 判定する (2026-09-10 ライブ監査 (f) F-09: calculate 由来の「45 km」が
     #: few-shot に採用された。tool_routing_* は run_command しか見ていない)。
     tool_grounded: bool = False
+    #: 文書を注入した turn で「参考情報には記載が無い」型の抑止応答をしたか
+    #: (f_04 §3.2、2026-09-12 (b))。``None`` = 文書を注入していない (判定外)、
+    #: ``False`` = 注入して答えた、``True`` = 注入したのに差し控えた =
+    #: 検索の取りこぼしの観測。プロンプト進化の圧には使わない。
+    rag_abstained: bool | None = None
     #: 根拠台帳 (f_04 §2.2、2026-09-10 (h))。``tool_uses`` は tool_ledger 由来の
     #: 実行順 ``[{"tool", "success", "reason"}]``。3 つの疑義は ``None`` = ツール
     #: 判定を通っていない (reactive 経路等)、``[]`` / ``False`` = 判定してクリーン。
@@ -207,6 +230,14 @@ class GenerationConfigRef:
 
     locale: str = ""
     """UI ロケール。プロンプト本文と few-shot の言語を決める軸。"""
+
+    corpus_gated: bool | None = None
+    """疑似クエリの関連性ゲート (f_01 §6.6) で corpus を引かなかった turn なら
+    ``True``。検索を通っていない turn (軽量パス等) は ``None`` (0 で埋めない)。
+    Level 1 の「注入ゼロ」を無関係 / 較正 / 未充足で区別する材料。"""
+
+    pseudo_derived_count: int = 0
+    """採用した corpus チャンクのうち疑似クエリ索引経由で拾った件数。"""
 
     sampling: dict[str, float] = field(default_factory=dict)
     """temperature / top_p / max_tokens 等、生成時に効いたパラメータ。"""

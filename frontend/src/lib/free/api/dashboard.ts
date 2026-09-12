@@ -136,6 +136,9 @@ export interface SchedulerStatus {
 	rag_usage_rate: number;
 	prev_correction_rate: number | null;
 	prev_rag_usage_rate: number | null;
+	rag_gated_rate?: number;
+	rag_pseudo_derived_rate?: number;
+	rag_abstain_rate?: number;
 	level1_run_count: number;
 	last_level1_results: Record<string, Level1ResultEntry>;
 	executed_phases: string[];
@@ -179,6 +182,9 @@ export interface DashboardLearningData {
 	rag_usage_rate: number;
 	prev_correction_rate: number | null;
 	prev_rag_usage_rate: number | null;
+	rag_gated_rate?: number;
+	rag_pseudo_derived_rate?: number;
+	rag_abstain_rate?: number;
 	level1_run_count: number;
 	last_level1_results: Record<string, Level1ResultEntry>;
 	executed_phases: string[];

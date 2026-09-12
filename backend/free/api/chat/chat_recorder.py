@@ -219,6 +219,7 @@ def accumulate_user_turn(
     # 新しいターンの入口。前ターンの注入 id を必ず落とす (c_16 §5.5)。
     _turn_evidence_ids.pop(session_id, None)
     _turn_fewshot_ids.pop(session_id, None)
+    _turn_rag_meta.pop(session_id, None)
     if private:
         _accumulate_turn(session_id, "user", user_query, private=True)
         return
@@ -326,6 +327,8 @@ def clear_session_data(session_id: str) -> None:
     _session_had_private.discard(session_id)
     _turn_evidence_ids.pop(session_id, None)
     _turn_fewshot_ids.pop(session_id, None)
+    _turn_rag_meta.pop(session_id, None)
+    _session_sources.pop(session_id, None)
 
 
 #: セッション → **今のターンで実際に注入した** Evidence の ``<store>:<id>``
@@ -348,6 +351,118 @@ def set_turn_evidence_ids(session_id: str, evidence_ids: list[str]) -> None:
 def turn_evidence_ids(session_id: str) -> list[str]:
     """このターンで注入した Evidence id (未設定は空)。"""
     return list(_turn_evidence_ids.get(session_id) or ())
+
+
+#: このターンの検索の副情報 (``corpus_gated`` / ``pseudo_derived``)。
+#: ``_turn_evidence_ids`` と同じ寿命で、ターンの入口で必ず消える。
+_turn_rag_meta: dict[str, dict] = {}
+
+
+def set_turn_rag_meta(
+    session_id: str, *, corpus_gated: bool, pseudo_derived: int,
+    lexical_candidate_ids: list[str] | None = None,
+    corpus_starved: bool = False,
+) -> None:
+    """このターンの検索の副情報を置く (``GenerationConfigRef`` へ写す)。
+
+    ``lexical_candidate_ids`` は抑止応答の turn で取りこぼした問いの種
+    (f_01 §6.4 の misses) に使う。
+    """
+    _turn_rag_meta[session_id] = {
+        "corpus_gated": bool(corpus_gated), "pseudo_derived": int(pseudo_derived),
+        "lexical_candidate_ids": list(lexical_candidate_ids or []),
+        "corpus_starved": bool(corpus_starved),
+    }
+
+
+def record_pq_misses_if_abstained(
+    state: AppState, entry: object, session_id: str, user_query: str,
+) -> int:
+    """抑止応答 (``signals.rag_abstained``) か、corpus の候補があったのに棒で
+    全部落ちた turn (``corpus_starved``) なら、取りこぼした問いを疑似クエリの
+    種にする (f_01 §6.4 の misses)。積んだチャンク数を返す。"""
+    signals = getattr(entry, "signals", None)
+    meta = turn_rag_meta(session_id) if session_id else None
+    abstained = bool(signals) and getattr(signals, "rag_abstained", None) is True
+    starved = bool((meta or {}).get("corpus_starved"))
+    if not (abstained or starved):
+        return 0
+    ids = list((meta or {}).get("lexical_candidate_ids") or [])
+    manager = getattr(state, "cartridge_manager", None)
+    if not ids or manager is None or not hasattr(manager, "record_pq_misses"):
+        return 0
+    try:
+        n = int(manager.record_pq_misses(ids, user_query))
+    except Exception as e:  # noqa: BLE001 — 観測のための記録で応答を止めない
+        logger.warning("Failed to record pseudo-query misses: %s", e)
+        return 0
+    if n:
+        logger.info(
+            "Retrieval miss: the answer abstained on injected material; queued %d "
+            "lexical candidate(s) for pseudo-query generation with the question as a hint",
+            n,
+        )
+    return n
+
+
+def turn_rag_meta(session_id: str) -> dict | None:
+    """このターンの検索の副情報 (検索を通っていなければ ``None``)。"""
+    meta = _turn_rag_meta.get(session_id)
+    return dict(meta) if meta else None
+
+
+#: 会話単位の根拠台帳: そのセッションで ``[参考情報]`` に注入した資料の所在
+#: (ターン番号 / ストア / パッケージ / 文書 / 見出し)。注入はモデルの履歴に
+#: 残らず UI の出典フレームにしか出ないため、「この会話で参照した資料は」に
+#: 答える材料はここにしか無い (2026-09-12 ライブ監査 T06/5: 0 件と回答)。
+#: セッション寿命 (``clear_session_data`` で消える)。
+_session_sources: dict[str, list[dict]] = {}
+#: 台帳の上限 (1 セッション)。古いものから落とす。
+_SESSION_SOURCES_CAP = 200
+
+
+def session_user_turn_count(session_id: str) -> int:
+    """このセッションの **ユーザー発話** の通し番号 (進行中の発話を含む)。
+
+    「今の 4 つの回答は…」のようにユーザーは質問で数える。user + assistant を
+    合わせた :func:`session_turn_count` (1, 3, 5, 7 …) を台帳に振ると、モデルが
+    「ターン 3」を 3 問目と読んで節を付け替えた (2026-09-12 (b) T04/5)。
+    """
+    return sum(
+        1 for e in (_session_turns.get(session_id) or ()) if e.get("role") == "user"
+    )
+
+
+def record_turn_sources(session_id: str, items: list[dict]) -> None:
+    """このターンで注入した資料を台帳へ積む (出典フレームと同じ item 形)。
+
+    ``turn`` はユーザー発話の通し番号 (:func:`session_user_turn_count`)。
+    """
+    if not session_id or not items:
+        return
+    turn = session_user_turn_count(session_id)
+    ledger = _session_sources.setdefault(session_id, [])
+    seen = {(e["turn"], e["id"]) for e in ledger}
+    for item in items:
+        key = (turn, str(item.get("id") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        ledger.append({
+            "turn": turn,
+            "id": str(item.get("id") or ""),
+            "store": str(item.get("store") or ""),
+            "package_name": str(item.get("package_name") or item.get("package_id") or ""),
+            "doc_id": str(item.get("doc_id") or ""),
+            "heading": str(item.get("heading") or ""),
+        })
+    if len(ledger) > _SESSION_SOURCES_CAP:
+        del ledger[: len(ledger) - _SESSION_SOURCES_CAP]
+
+
+def session_sources(session_id: str) -> list[dict]:
+    """このセッションで注入した資料の台帳 (ターン順)。"""
+    return [dict(e) for e in _session_sources.get(session_id) or ()]
 
 
 #: セッション → **今のターンで実際に注入した** few-shot 例の id (f_04 §3.2.2)。
@@ -901,6 +1016,10 @@ def _active_gen_config(
     if isinstance(lora_version, int):
         ref.lora_version = lora_version
     ref.evidence_ids = turn_evidence_ids(session_id) if session_id else []
+    rag_meta = turn_rag_meta(session_id) if session_id else None
+    if rag_meta is not None:
+        ref.corpus_gated = rag_meta["corpus_gated"]
+        ref.pseudo_derived_count = rag_meta["pseudo_derived"]
     return ref
 
 
@@ -1054,7 +1173,7 @@ def record_response(
             blocked, measured = _turn_contradiction_inputs(
                 state, messages, action_blocked,
             )
-            fc.record(
+            entry = fc.record(
                 query=user_query, response=body, mode=mode,
                 tool_routing_success=tool_routing_success,
                 tool_routing_false_positive=tool_fp,
@@ -1072,6 +1191,7 @@ def record_response(
                 turn_id=assistant_turn_id,
                 gen_config=_active_gen_config(state, mode, session_id),
             )
+            record_pq_misses_if_abstained(state, entry, session_id, user_query)
         except Exception as e:
             # 経験記録の失敗でチャットを壊さない方針は維持するが、**握り潰さない**。
             # 実インシデント (2026-08-23): 引数を 1 つ足し忘れた NameError が

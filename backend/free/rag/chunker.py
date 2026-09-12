@@ -19,6 +19,25 @@ SENTENCE_BOUNDARIES = [
     re.compile(r"\n"),                        # 改行
 ]
 
+#: 文の切れ目。全角の文末 (。！？) は無条件、ASCII の文末 (.!?) は **後ろが
+#: 空白か行末のときだけ**。空白の無いピリオドで切ると「Step 5.9」「§6.1」
+#: 「rag.pseudo_query.enabled」が「5. 9」「§6. 1」「rag. pseudo_query. enabled」に
+#: 壊れ、技術文書の固有語が転置索引でも埋め込みでも当たらなくなる
+#: (2026-09-12 (b) ライブ監査、f_01 §3.1.2)。
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？])\s*|(?<=[.!?])(?:\s+|$)")
+
+#: markdown の見出し行。チャンクの **硬い境界** (見出しの前で閉じる、f_01 §3.1.3)。
+_HEADING_LINE_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+\S", re.MULTILINE)
+
+
+def _split_on_headings(text: str) -> list[str]:
+    """見出し行の直前で本文を区切る (純粋関数)。見出しの無い本文はそのまま 1 区間。"""
+    positions = [m.start() for m in _HEADING_LINE_RE.finditer(text)]
+    if not positions:
+        return [text]
+    bounds = ([0] if positions[0] > 0 else []) + positions + [len(text)]
+    return [text[a:b] for a, b in zip(bounds, bounds[1:]) if text[a:b].strip()]
+
 
 class SemanticChunker:
     """セマンティック境界ベースのチャンク分割"""
@@ -51,7 +70,21 @@ class SemanticChunker:
         if self.strategy == "fixed":
             result = self._fixed_chunk(text)
         else:
-            result = self._semantic_chunk(text)
+            # 見出しの前でチャンクを閉じる (chunker v3、f_01 §3.1.3)。節の途中から
+            # 始まるチャンクが答えを主語抜きで持つのを避ける。
+            result = []
+            carry = ""
+            for section in _split_on_headings(text):
+                # 短い節 (min_chunk 未満) は次の節と併せる — 見出しごとに閉じると
+                # 細切れになり内容が薄くなる (実測: 1124 → 1666 チャンクで recall 低下)。
+                merged = carry + section
+                if self._estimate_tokens(merged) < self.min_chunk:
+                    carry = merged
+                    continue
+                carry = ""
+                result.extend(self._semantic_chunk(merged))
+            if carry.strip():
+                result.extend(self._semantic_chunk(carry))
 
         logger.debug(
             "chunk: produced %d chunks, sizes=[%s]",
@@ -149,8 +182,8 @@ class SemanticChunker:
         for para in paragraphs:
             if not para.strip():
                 continue
-            # 日本語・英語の文末で分割
-            parts = re.split(r"(?<=[。！？.!?])\s*", para)
+            # 日本語・英語の文末で分割 (ASCII の文末は空白 / 行末が続くときだけ)
+            parts = _SENTENCE_SPLIT_RE.split(para)
             for part in parts:
                 if part.strip():
                     sentences.append(part.strip() + " ")

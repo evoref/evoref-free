@@ -4,6 +4,7 @@
 	import type { ChatMessage } from '$lib/free/stores/chat';
 	import AgenticSteps from './AgenticSteps.svelte';
 	import RagDebugPanel from './RagDebugPanel.svelte';
+	import SourcesPanel from './SourcesPanel.svelte';
 	import MarkdownRenderer from './MarkdownRenderer.svelte';
 	import { formatTime } from '$lib/free/utils/format';
 
@@ -59,6 +60,10 @@
 		<p class="truncation-notice">
 			{$t('chat.output_truncated')}
 		</p>
+	{/if}
+
+	{#if !isUser && message.sources && message.sources.items.length > 0}
+		<SourcesPanel sources={message.sources} />
 	{/if}
 
 	{#if !isUser && message.rag_debug}

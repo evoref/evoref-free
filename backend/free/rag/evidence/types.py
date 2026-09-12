@@ -36,7 +36,7 @@ RECORD_VERSION = 1
 
 # ── 列挙 (Literal + カラム用の小さな int テーブル) ───────────────────────
 
-Kind = Literal["note", "fact", "claim", "doc_chunk"]
+Kind = Literal["note", "fact", "claim", "doc_chunk", "doc_pseudo_query"]
 StoreName = Literal["episodic", "semantic", "corpus"]
 Origin = Literal["user", "assistant", "tool", "document", "web", "system"]
 Veracity = Literal[
@@ -47,7 +47,9 @@ Tier = Literal["working", "short", "long"]
 
 #: ``columns.npz`` の uint8 カラムへ落とすための文字列↔id テーブル。
 #: **値は永続化されるので既存の割当を変えない** (追加は末尾へ)。
-KIND_IDS: dict[str, int] = {"note": 0, "fact": 1, "claim": 2, "doc_chunk": 3}
+KIND_IDS: dict[str, int] = {
+    "note": 0, "fact": 1, "claim": 2, "doc_chunk": 3, "doc_pseudo_query": 4,
+}
 STORE_IDS: dict[str, int] = {"episodic": 0, "semantic": 1, "corpus": 2}
 ORIGIN_IDS: dict[str, int] = {
     "user": 0, "assistant": 1, "tool": 2, "document": 3, "web": 4, "system": 5,
@@ -330,6 +332,11 @@ ATTRS_SPEC: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "doc_chunk": (
         frozenset({"package_id", "package_version", "doc_id", "position"}),
         frozenset({"heading"}) | EMBED_SIDE_ATTRS,
+    ),
+    # 疑似クエリ (f_01 §6): 対象チャンクの id を持ち、埋め込みは query 側。
+    "doc_pseudo_query": (
+        frozenset({"target_id", "package_id"}),
+        EMBED_SIDE_ATTRS,
     ),
 }
 

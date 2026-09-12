@@ -883,8 +883,13 @@ REFERENTIAL_WRITE_TARGET_RE = re.compile(
 #: 了解」「机の上の本」「previously unreleased album」「above average とは」が
 #: すべて照応扱いだった)。
 BACKREFERENCE_TO_OUTPUT_RE = re.compile(
-    r"(?:上の|上記の|前述の|先(?:ほど|程)の|さっきの|直前の)"
-    r"(?:内容|回答|返答|出力|文章|文|コード|話|答え|結果|説明|例|要約|一覧|リスト|表)"
+    # 指示語 (「今の」は直前の出力を指す: 「今の 4 つの回答」「今の結果」。
+    # 2026-09-12 (b) ライブ監査で「今の 4 つの回答は設計書のどの節を根拠に」が
+    # どの後方参照にも当たらず別セッションのノートを引いた) + 任意の数量修飾
+    # (「4 つの」「いくつかの」「全部の」) + 出力を指す名詞。
+    r"(?:今の|上の|上記の|前述の|先(?:ほど|程)の|さっきの|直前の)"
+    r"(?:\d+\s*(?:つ|件|個|点|本|行)の|[一二三四五六七八九十]+つの|いくつかの|全部の|すべての|各)?"
+    r"(?:内容|回答|返答|出力|文章|文|コード|話|答え|(?:計算|集計)?結果|説明|例|要約|一覧|リスト|表)"
     r"|(?:それ|これ|その内容|この内容|上記|前述)を"
     r"|(?<![A-Za-z])the\s+above(?![A-Za-z])"
     r"|(?<![A-Za-z])previous\s+(?:answer|output|response|message|reply)(?![A-Za-z])"
@@ -1289,6 +1294,26 @@ _OCCURRENCE_COUNT_RE = re.compile(
 def conversation_turn_count_question(query: str) -> bool:
     """会話全体のターン数を訊いているか (純粋関数)。"""
     return bool(query) and bool(_TURN_COUNT_QUESTION_RE.search(query))
+
+
+#: 「この会話で参照した資料名を列挙して」「今の回答は設計書のどの節を根拠に
+#: したか」型。注入した資料はモデルの履歴に残らず (``[参考情報]`` は user
+#: メッセージに一時的に付くだけ)、UI の出典フレームにしか出ない。過去形 /
+#: 根拠の語 + 資料の語を条件にし、「どの資料を読めばよいか」(助言) は拾わない。
+_REFERENCED_SOURCES_RE = re.compile(
+    r"(?:参照|参考|根拠|典拠|引用|利用|使用)(?:に)?(?:した|していた|された|しました|なさった)"
+    r"[^。]{0,12}?(?:資料|文書|設計書|ドキュメント|節|セクション|ソース|出典|ファイル)"
+    r"|(?:資料|文書|設計書|ドキュメント|節|セクション)[^。]{0,8}?を?(?:根拠|典拠)に"
+    r"|(?:出典|典拠|参考文献|参照元|情報源)(?:は|を|も)"
+    r"|(?:which|what)\s+(?:documents?|sections?|sources?|files?)\s+(?:did|were|have)\s+you"
+    r"|cite\s+your\s+sources?|what\s+sources?\s+did\s+you",
+    re.IGNORECASE,
+)
+
+
+def referenced_sources_question(query: str) -> bool:
+    """「この会話で参照した資料 / 根拠にした節はどれか」を訊いているか (純粋関数)。"""
+    return bool(query) and bool(_REFERENCED_SOURCES_RE.search(query))
 
 
 def occurrence_count_term(query: str) -> str | None:

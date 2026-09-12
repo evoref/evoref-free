@@ -31,7 +31,9 @@ from backend.free.core.correction_verdict import (
     norm_span,
 )
 from backend.free.core.intent_vocab import is_plain_statement
+from backend.free.core.relative_date import strip_date_annotation_after
 from backend.free.core.text_quality import (
+    person_trigger_is_oblique,
     _asserts_before_request,
     _REQUEST_ENDING_RE,
     attribute_belongs_to_another_person,
@@ -598,7 +600,10 @@ def restate_with_correction(
         if not text or norm_span(text) == needle:
             continue
         if wrong in text:
-            return text.replace(wrong, correct, 1)
+            start = text.index(wrong)
+            replaced = text[:start] + correct + text[start + len(wrong):]
+            # 置換した表現の直後に残る旧い日付注記は落とす (F-A、再注記に委ねる)。
+            return strip_date_annotation_after(replaced, start + len(correct))
         # 空白 / 全角半角の違いで逐語一致しない場合は、正規化した位置で切る
         normalized = norm_span(text)
         pos = normalized.find(needle)
@@ -610,7 +615,9 @@ def restate_with_correction(
             continue
         start = raw_positions[pos]
         end = raw_positions[pos + len(needle) - 1] + 1
-        return text[:start] + correct + text[end:]
+        return strip_date_annotation_after(
+            text[:start] + correct + text[end:], start + len(correct),
+        )
     return ""
 
 
@@ -717,7 +724,9 @@ def _narrow_by_units(
             # 出現があれば本人」と答えるので、本人の文と妹の文が並ぶと
             # 妹の文まで location の本文に連れて行っていた
             # (2026-09-10 ライブ監査 (i) I-10)。
-            if attribute_belongs_to_another_person(probe, attr_words):
+            if attribute_belongs_to_another_person(probe, attr_words) or (
+                person_trigger_is_oblique(unit, attr_words)
+            ):
                 awaiting_value = False
                 continue
             kept.append(unit)
@@ -1945,6 +1954,10 @@ class ChatExtractor(BaseExtractor):
                     attr_specs = [
                         spec for spec in attr_specs
                         if not attribute_belongs_to_another_person(spec[1], spec[2])
+                        # 人の語が斜格の相手としてしか現れない願望・評価文
+                        # (「息子と一緒に見られる作品がいい」) も本人の属性ではない
+                        # (2026-09-12 ライブ監査 T08/4)。
+                        and not person_trigger_is_oblique(spec[1], spec[2])
                     ]
                     attr_specs = _drop_shadowed_by_predicate_slot(attr_specs)
                 else:

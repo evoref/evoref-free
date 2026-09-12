@@ -32,6 +32,16 @@ class _StrictModel(BaseModel):
 
 # ── 取得直後 content gate の関連性判定 (retrieval_chunk_gate) ──
 
+class PseudoQueryQuestions(_StrictModel):
+    """`backend/free/rag/pseudo_query.py` の疑似クエリ生成 (f_01 §6.4)。
+
+    チャンクが答える問いの配列。``questions`` キーでラップする
+    (``list_key`` で裸配列も救済)。
+    """
+
+    questions: list[str]
+
+
 class ChunkGateRelevance(_StrictModel):
     """`backend/free/rag/chunk_content_gate.py` の marginal band 関連性判定。
 
@@ -513,6 +523,7 @@ class DateIntent(_StrictModel):
 # (``long_form_planning``) は本マップに含めず、呼出側が明示する。
 PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "retrieval_chunk_gate": ChunkGateRelevance,
+    "pseudo_query": PseudoQueryQuestions,
     "critique_synthesis": CritiqueSynthesisResult,
     "long_form_code_review": ReviewIssues,
     "long_form_text_review": ReviewIssues,

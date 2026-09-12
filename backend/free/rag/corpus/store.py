@@ -35,7 +35,9 @@ snapshot は 1 版だけ持つ。corpus は事象ログを持たない — 版�
 from __future__ import annotations
 
 import json
+import re
 import shutil
+import threading
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
@@ -62,9 +64,19 @@ from backend.free.rag.corpus.package import (
     write_prebuilt_build,
     write_prebuilt_chunks,
 )
+from backend.free.rag.corpus.calibration import (
+    CANARY_UTTERANCES,
+    calibration_signature,
+    compute_corpus_calibration,
+    load_corpus_calibration,
+    save_corpus_calibration,
+)
+from backend.free.rag.corpus.pseudo_queries import PSEUDO_QUERIES_DIR, PseudoQueryIndex
 from backend.free.rag.evidence._json_state import JsonStateFile
 from backend.free.rag.evidence.config import merge_rag_evidence_config
-from backend.free.rag.evidence.store import EvidenceStore
+from backend.free.rag.evidence.ranking import RankColumns, score_rows
+from backend.free.rag.evidence.store import EvidenceStore, UsageBuffer
+from backend.free.rag.vector_store import dequantize_int8
 from backend.free.rag.evidence.types import (
     Evidence,
     EvidenceRecordError,
@@ -79,6 +91,16 @@ if TYPE_CHECKING:
     from backend.free.rag.embedding_backend import EmbeddingBackend
 
 logger = get_logger("rag.corpus.store")
+
+#: 転置索引の上位から疑似クエリの lazy 生成対象へ積む件数 (パッケージごと、f_01 §6.4)。
+LEXICAL_SEED_K = 3
+#: 取りこぼした問いのヒント (f_01 §6.4 の misses) の上限。
+PQ_HINTS_PER_CHUNK = 3
+PQ_HINTS_MAX_CHUNKS = 500
+#: misses の候補 1 件あたり、同じ節の兄弟チャンクへ広げる件数 (f_01 §6.4)。
+PQ_MISS_SIBLINGS = 8
+#: 見出しの先頭の番号 (「6.3 検索」→ 6)。同じ大節の判定に使う。
+_HEADING_NUMBER_RE = re.compile(r"^\s*(\d+)")
 
 CORPUS_DIR_NAME = "corpus"
 CORPUS_MANIFEST_FILE = "manifest.json"
@@ -245,6 +267,8 @@ class CorpusPackage:
     size_mb: float = 0.0
     installed_at: str = ""
     loaded: bool = False
+    #: 疑似クエリ索引 (f_01 §6)。版ディレクトリ配下の独立した EvidenceStore。
+    pseudo_queries: PseudoQueryIndex | None = None
 
     @property
     def id(self) -> str:
@@ -278,6 +302,8 @@ class CorpusHit:
     text: str
     heading: str = ""
     doc_id: str = ""
+    #: 疑似クエリ由来のとき、最良の問いが取りこぼした問いの言い換えか (f_01 §6.3)。
+    hinted: bool = False
 
 
 @dataclass(slots=True)
@@ -376,8 +402,22 @@ class CorpusStore:
 
         #: id → パッケージ (active 版のみ)。OrderedDict の末尾 = 最近使用。
         self._packages: OrderedDict[str, CorpusPackage] = OrderedDict()
+        #: 原文の見出し階層 ``[(深さ, 題)]`` (``heading_path`` 用、文書ごと)。
+        self._outlines: dict[tuple[str, str], list[tuple[int, str]]] = {}
         self._on_change_callbacks: list[Callable[[str, str], None]] = []
+        #: 応答パスで採用した corpus チャンク id (``<pkg>:<ev>``) のプロセス内
+        #: バッファ。疑似クエリの lazy 生成対象 (f_01 §6.4)。書くのは sleep-time。
+        self.pq_hits = UsageBuffer()
+        #: 取りこぼした問い (f_01 §6.4 の misses) の対象チャンク。hits より先に
+        #: 処理し、既に問いを持つチャンクも対象にする。
+        self.pq_misses = UsageBuffer()
+        #: chunk id → ユーザーの問い (ヒント)。1 チャンク 3 件、全体 500 件で打ち切る。
+        self._pq_hints: dict[str, list[str]] = {}
+        self._pq_hints_lock = threading.Lock()
+        #: corpus 側の較正結果 (f_01 §6.6)。``None`` = 未較正 (記憶側の棒へ倒す)。
+        self._calibration: dict[str, Any] | None = None
         self._discover()
+        self._load_calibration_cache()
 
     # ── 設定の読み出し (dict / pydantic どちらでも) ──
 
@@ -430,6 +470,8 @@ class CorpusStore:
         self._embedding_backend = adapted
         for package in self._packages.values():
             package.store.embedding_backend = adapted
+            if package.pseudo_queries is not None:
+                package.pseudo_queries.set_embedding_backend(adapted)
 
     @property
     def embedding_model_id(self) -> str:
@@ -501,7 +543,36 @@ class CorpusStore:
             chunk_count=len(store),
             size_mb=_dir_size_mb(directory / EMBEDDINGS_DIR),
             installed_at=_installed_at(directory),
+            pseudo_queries=self._open_pseudo_queries(directory, meta.id, store),
         )
+
+    def _open_pseudo_queries(
+        self, directory: Path, package_id: str, store: EvidenceStore,
+    ) -> PseudoQueryIndex:
+        """版ディレクトリの疑似クエリ索引を開く (無ければ空のまま)。
+
+        本体 snapshot への生存判定を束ね、対応チャンクの無い問い (孤児) を
+        検索 / 充足率から外す (f_01 §6.2)。
+        """
+        index = PseudoQueryIndex(
+            directory, package_id,
+            embedding_backend=self._embedding_backend,
+            rag_config=self.rag_config,
+        )
+
+        def is_live(target_id: str) -> bool:
+            snapshot = store.snapshot
+            return snapshot is not None and snapshot.row_of(target_id) is not None
+
+        index.bind_targets(is_live)
+        try:
+            index.load()
+        except (OSError, ValueError) as e:
+            # 索引が壊れていてもパッケージ本体の検索は生かす。
+            logger.warning(
+                "Failed to open pseudo-query index for %s: %s", package_id, e,
+            )
+        return index
 
     def _make_store(self, directory: Path, package_id: str) -> EvidenceStore:
         """版ディレクトリ用の :class:`EvidenceStore` を作る。
@@ -593,7 +664,7 @@ class CorpusStore:
         """
         for package in self._packages.values():
             try:
-                _release_store(package.store)
+                _release_package(package)
             except Exception as e:  # noqa: BLE001 — shutdown を止めない
                 logger.warning(
                     "Failed to release corpus package %s: %s", package.meta.id, e,
@@ -792,6 +863,7 @@ class CorpusStore:
             chunk_count=len(store),
             size_mb=_dir_size_mb(directory / EMBEDDINGS_DIR),
             installed_at=utc_now(),
+            pseudo_queries=self._open_pseudo_queries(directory, meta.id, store),
         )
         return InstallResult(
             package=package,
@@ -883,11 +955,23 @@ class CorpusStore:
             raise PackageError(f"No documents found for corpus package '{package_id}'")
 
         was_loaded = package.loaded
+        try:
+            old_chunker = int(package.store.manifest.chunker_version)
+        except (AttributeError, TypeError, ValueError):
+            old_chunker = CHUNKER_VERSION
         # メモリ上の参照を先に落とす (Windows で memmap を握ったままだと
         # embeddings/ を消せない)。
         self._packages.pop(package_id, None)
-        _release_store(package.store)
+        _release_package(package)
         _clean_derived(directory)
+        if old_chunker != CHUNKER_VERSION:
+            # チャンク id が全部変わるので疑似クエリ索引は孤児になる。残すと
+            # 充足率を水増しし検索では読み飛ばされるだけ (f_01 §3.3 の 6)。
+            shutil.rmtree(str(directory / PSEUDO_QUERIES_DIR), ignore_errors=True)
+            logger.info(
+                "Dropped the pseudo-query index of %s (chunker v%d -> v%d changes "
+                "every chunk id)", package_id, old_chunker, CHUNKER_VERSION,
+            )
 
         meta = replace(
             package.meta, content_digest=compute_content_digest(docs_dir),
@@ -901,6 +985,15 @@ class CorpusStore:
         rebuilt.loaded = was_loaded
         self._packages[package_id] = rebuilt
         self._persist_loaded()
+        if rebuilt.pseudo_queries is not None and rebuilt.pseudo_queries.orphan_count():
+            # 本文が変わったチャンクは id も変わる → その問いは孤児。生まれた
+            # 時点で版から落とす (残すと充足率を水増しし、上位 k を押し出す)。
+            try:
+                await rebuilt.pseudo_queries.commit()
+            except (OSError, RuntimeError, ValueError) as e:
+                logger.warning(
+                    "Failed to drop orphaned pseudo queries of %s: %s", package_id, e,
+                )
         logger.info(
             "Rebuilt corpus package %s v%s: %d docs, %d chunks",
             package_id, meta.version, rebuilt.doc_count, rebuilt.chunk_count,
@@ -913,7 +1006,7 @@ class CorpusStore:
         if package is None and package_id not in self.manifest.active:
             raise KeyError(f"Corpus package '{package_id}' not found")
         if package is not None:
-            _release_store(package.store)
+            _release_package(package)
         self._packages.pop(package_id, None)
         root = self.packages_dir / package_id
         if root.exists():
@@ -1135,6 +1228,10 @@ class CorpusStore:
                 store_prior=prior,
             )
             snapshot = package.store.snapshot
+            if query_text and package.pseudo_queries is not None:
+                self._seed_lexical_pq_targets(
+                    package_id, package, query_text, now_epoch, include_private,
+                )
             for row, cosine, score in rows:
                 raw = snapshot.raw_at(row) if snapshot is not None else None
                 attrs = (raw or {}).get("attrs") or {}
@@ -1156,6 +1253,479 @@ class CorpusStore:
 
         hits.sort(key=lambda hit: -hit.score)
         return hits[:top_k]
+
+    def search_pseudo(
+        self,
+        query_vec: np.ndarray,
+        top_k: int = 5,
+        *,
+        now: float | None = None,
+        include_private: bool = False,
+    ) -> list[CorpusHit]:
+        """疑似クエリ索引を引き、対象チャンク本体の値で :class:`CorpusHit` にする。
+
+        並びは **問い↔問いの cosine 順** (呼出側が疑似クエリ側先頭で interleave
+        する)。``cosine`` は **問い↔問いの cosine** (ゲート / floor 用)、
+        ``score`` は対象チャンク本体の順位式の値。較正済みの棒はクエリ↔発話
+        (問い同士に近い) の分布から作られるので、問い同士の cosine の方が
+        本体 cosine より棒のスケールに合う (f_01 §6.3 の実測)。本体の行が無い
+        対象 (再構築で id が変わった等) は読み飛ばす。
+        """
+        if top_k <= 0:
+            return []
+        candidates = self.centroid_gate(query_vec, self.loaded_ids)
+        if not candidates:
+            return []
+        now_epoch = utc_now_dt().timestamp() if now is None else float(now)
+        ranked: list[tuple[float, CorpusHit]] = []
+        for package_id in candidates:
+            package = self._packages.get(package_id)
+            if package is None or package.pseudo_queries is None:
+                continue
+            index = package.pseudo_queries
+            if len(index) == 0:
+                continue
+            pairs = index.search(query_vec, top_k)
+            if not pairs:
+                continue
+            snapshot = package.store.snapshot
+            if snapshot is None:
+                continue
+            mask = package.store.active_mask(now_epoch, include_private)
+            rows: list[int] = []
+            kept: list[tuple[str, float, bool]] = []
+            for target_id, pq_cos, hinted in pairs:
+                row = snapshot.row_of(target_id)
+                if row is None or not bool(mask[row]):
+                    continue
+                rows.append(row)
+                kept.append((target_id, pq_cos, hinted))
+            if not rows:
+                continue
+            row_array = np.asarray(rows, dtype=np.int64)
+            cosines = package.store.cosines_for_rows(query_vec, row_array)
+            scores = score_rows(
+                np.nan_to_num(cosines, nan=0.0), row_array,
+                RankColumns.from_columns(snapshot.columns),
+                now_epoch, self.store_prior_for(package_id),
+            )
+            for (target_id, pq_cos, hinted), row, cosine, score in zip(
+                kept, rows, cosines, scores, strict=True,
+            ):
+                if not np.isfinite(cosine):
+                    continue
+                raw = snapshot.raw_at(row) or {}
+                attrs = raw.get("attrs") or {}
+                ranked.append((
+                    float(pq_cos),
+                    CorpusHit(
+                        package_id=package_id,
+                        evidence_id=target_id,
+                        cosine=float(pq_cos),
+                        score=float(score),
+                        hinted=hinted,
+                        text=str(raw.get("text") or ""),
+                        heading=str(attrs.get("heading") or ""),
+                        doc_id=str(attrs.get("doc_id") or ""),
+                    ),
+                ))
+        ranked.sort(key=lambda item: -item[0])
+        return [hit for _, hit in ranked[:top_k]]
+
+    def lexical_seat(
+        self,
+        query_text: str,
+        query_vec: np.ndarray,
+        exclude_ids: Iterable[str],
+        *,
+        seats: int = 1,
+        now: float | None = None,
+        include_private: bool = False,
+    ) -> list[CorpusHit]:
+        """転置索引の上位 ``seats`` 件で、``exclude_ids`` に無い行を返す (f_01 §8.1 の 4.3)。
+
+        ``cosine`` / ``score`` は本体の値 (:meth:`search` と同じスケール)。順位式
+        にもスコアにも触らず、呼出側が棒を掛けて位置で置く。転置索引は
+        パッケージごとに引き、語彙順のまま返す。
+        """
+        if seats <= 0 or not query_text:
+            return []
+        excluded = set(exclude_ids)
+        now_epoch = utc_now_dt().timestamp() if now is None else float(now)
+        out: list[CorpusHit] = []
+        for package_id in self.centroid_gate(query_vec, self.loaded_ids):
+            package = self._packages.get(package_id)
+            if package is None:
+                continue
+            store = package.store
+            snapshot = store.snapshot
+            if snapshot is None:
+                continue
+            try:
+                mask = store.active_mask(now_epoch, include_private)
+                rows, _scores = store.lexical_candidates(
+                    query_text, seats + len(excluded), row_mask=mask,
+                )
+            except Exception as e:  # noqa: BLE001 — 席の探索で検索を止めない
+                logger.debug("lexical seat skipped for %s: %s", package_id, e)
+                continue
+            picked: list[int] = []
+            for row in rows:
+                if f"{package_id}:{snapshot.id_at(int(row))}" in excluded:
+                    continue
+                picked.append(int(row))
+                if len(picked) >= seats:
+                    break
+            if not picked:
+                continue
+            row_array = np.asarray(picked, dtype=np.int64)
+            cosines = store.cosines_for_rows(query_vec, row_array)
+            scores = score_rows(
+                np.nan_to_num(cosines, nan=0.0), row_array,
+                RankColumns.from_columns(snapshot.columns),
+                now_epoch, self.store_prior_for(package_id),
+            )
+            for row, cosine, score in zip(picked, cosines, scores, strict=True):
+                if not np.isfinite(cosine):
+                    continue
+                raw = snapshot.raw_at(row) or {}
+                attrs = raw.get("attrs") or {}
+                out.append(CorpusHit(
+                    package_id=package_id,
+                    evidence_id=str(raw.get("id") or snapshot.id_at(row)),
+                    cosine=float(cosine),
+                    score=float(score),
+                    text=str(raw.get("text") or ""),
+                    heading=str(attrs.get("heading") or ""),
+                    doc_id=str(attrs.get("doc_id") or ""),
+                ))
+        return out
+
+    def heading_path(self, package_id: str, evidence_id: str) -> list[str]:
+        """チャンクの見出し階層 (親 → 自分) を原文から引く (f_01 §6.4)。
+
+        パッケージ同梱の原文の見出し行 (`#` の深さ) をたどり、チャンクの
+        ``attrs.heading`` に至る祖先を返す。原文が無い / 見出しが見つからない
+        ときは ``attrs.heading`` だけ (無ければ空)。
+        """
+        described = self.describe_chunk(package_id, evidence_id)
+        if described is None:
+            return []
+        heading = described["heading"]
+        doc_id = described["doc_id"]
+        if not heading or not doc_id:
+            return [heading] if heading else []
+        package = self._packages.get(package_id)
+        if package is None:
+            return [heading]
+        key = (package_id, doc_id)
+        outline = self._outlines.get(key)
+        if outline is None:
+            outline = _document_outline(package.directory / DOCS_DIR / doc_id)
+            self._outlines[key] = outline
+        stack: list[tuple[int, str]] = []
+        for level, title in outline:
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, title))
+            if title == heading:
+                return [t for _, t in stack]
+        return [heading]
+
+    def describe_chunk(self, package_id: str, evidence_id: str) -> dict[str, Any] | None:
+        """出典表示用にチャンクの所在 (文書名 / 見出し) を引く。無ければ ``None``。"""
+        package = self._packages.get(package_id)
+        if package is None:
+            return None
+        snapshot = package.store.snapshot
+        if snapshot is None:
+            return None
+        row = snapshot.row_of(evidence_id)
+        if row is None:
+            return None
+        attrs = ((snapshot.raw_at(row) or {}).get("attrs")) or {}
+        return {
+            "package_id": package_id,
+            "package_name": package.meta.name or package_id,
+            "doc_id": str(attrs.get("doc_id") or ""),
+            "heading": str(attrs.get("heading") or ""),
+        }
+
+    def _seed_lexical_pq_targets(
+        self, package_id: str, package, query_text: str, now_epoch: float,
+        include_private: bool,
+    ) -> None:
+        """転置索引の上位候補を疑似クエリの lazy 生成対象に積む (f_01 §6.4)。
+
+        順位は cosine 1 本なので、固有語で当たったチャンクは cosine が低いと
+        採用されず lazy の対象にも入らない。語彙一致は「ユーザーがその語で
+        訊く」証拠なので、採用に関わらず Step 5.9 の対象にする (2026-09-12 (b))。
+        """
+        try:
+            store = package.store
+            mask = store.active_mask(now_epoch, include_private)
+            rows, _scores = store.lexical_candidates(
+                query_text, LEXICAL_SEED_K, row_mask=mask,
+            )
+        except Exception as e:  # noqa: BLE001 — 種まきで検索を止めない
+            logger.debug("lexical pq seeding skipped for %s: %s", package_id, e)
+            return
+        snapshot = store.snapshot
+        if snapshot is None:
+            return
+        ids = [f"{package_id}:{snapshot.id_at(int(r))}" for r in rows[:LEXICAL_SEED_K]]
+        if ids:
+            self.pq_hits.add_many(ids)
+
+    def record_pq_misses(self, chunk_ids: Sequence[str], question: str) -> int:
+        """取りこぼした問いの語彙候補を misses に積み、問いをヒントとして添える (f_01 §6.4)。
+
+        Returns:
+            積んだチャンク数。
+        """
+        ids = [cid for cid in chunk_ids if cid]
+        q = (question or "").strip()
+        if not ids or not q:
+            return 0
+        # 同じ節の兄弟へ広げる: 答えのチャンクは候補の隣にいることが多い
+        # (語が節内に散る問い、f_01 §6.4)。
+        expanded: list[str] = []
+        seen: set[str] = set()
+        for cid in ids:
+            for sib in [cid, *self._section_siblings(cid, PQ_MISS_SIBLINGS)]:
+                if sib not in seen:
+                    seen.add(sib)
+                    expanded.append(sib)
+        ids = expanded
+        self.pq_misses.add_many(ids)
+        with self._pq_hints_lock:
+            for cid in ids:
+                hints = self._pq_hints.setdefault(cid, [])
+                if q not in hints and len(hints) < PQ_HINTS_PER_CHUNK:
+                    hints.append(q)
+            while len(self._pq_hints) > PQ_HINTS_MAX_CHUNKS:
+                self._pq_hints.pop(next(iter(self._pq_hints)))
+        return len(ids)
+
+    def _section_siblings(self, chunk_id: str, cap: int) -> list[str]:
+        """同じ文書・同じ大節のチャンク id (自分を除く、snapshot 行順、最大 ``cap``)。"""
+        package_id, sep, evidence_id = chunk_id.partition(":")
+        package = self._packages.get(package_id) if sep else None
+        if package is None or cap <= 0:
+            return []
+        snapshot = package.store.snapshot
+        if snapshot is None:
+            return []
+        row = snapshot.row_of(evidence_id)
+        if row is None:
+            return []
+        attrs = (snapshot.raw_at(row) or {}).get("attrs") or {}
+        doc_id = str(attrs.get("doc_id") or "")
+        heading = str(attrs.get("heading") or "")
+        m = _HEADING_NUMBER_RE.match(heading)
+        key = m.group(1) if m else heading
+        out: list[str] = []
+        for r in range(len(snapshot)):
+            if r == row:
+                continue
+            a = (snapshot.raw_at(r) or {}).get("attrs") or {}
+            if str(a.get("doc_id") or "") != doc_id:
+                continue
+            h = str(a.get("heading") or "")
+            hm = _HEADING_NUMBER_RE.match(h)
+            if (hm.group(1) if hm else h) != key:
+                continue
+            out.append(f"{package_id}:{snapshot.id_at(r)}")
+            if len(out) >= cap:
+                break
+        return out
+
+    def previous_chunk_context(
+        self, chunk_id: str, tail_chars: int,
+    ) -> tuple[str, str] | None:
+        """同じ文書・同じ大節の直前チャンクの末尾 ``tail_chars`` 文字 (f_01 §8.1 の 7.65)。
+
+        Returns:
+            ``("<pkg>:<ev>", text)``。直前が無い / 別文書 / 別の大節なら ``None``。
+        """
+        if tail_chars <= 0:
+            return None
+        package_id, sep, evidence_id = chunk_id.partition(":")
+        package = self._packages.get(package_id) if sep else None
+        if package is None:
+            return None
+        snapshot = package.store.snapshot
+        if snapshot is None:
+            return None
+        row = snapshot.row_of(evidence_id)
+        if row is None or row == 0:
+            return None
+        here = (snapshot.raw_at(row) or {}).get("attrs") or {}
+        prev = snapshot.raw_at(row - 1) or {}
+        before = prev.get("attrs") or {}
+        if str(before.get("doc_id") or "") != str(here.get("doc_id") or ""):
+            return None
+
+        def _key(h: str) -> str:
+            hm = _HEADING_NUMBER_RE.match(h or "")
+            return hm.group(1) if hm else (h or "")
+
+        if _key(str(before.get("heading") or "")) != _key(str(here.get("heading") or "")):
+            return None
+        text = str(prev.get("text") or "").strip()
+        if not text:
+            return None
+        return f"{package_id}:{snapshot.id_at(row - 1)}", text[-tail_chars:]
+
+    def outdated_package_ids(self) -> list[str]:
+        """chunker 版が現行より古いパッケージ id (f_01 §3.3 の 6)。"""
+        out: list[str] = []
+        for package_id, package in self._packages.items():
+            try:
+                version = int(package.store.manifest.chunker_version)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if version < CHUNKER_VERSION:
+                out.append(package_id)
+        return out
+
+    def take_pq_hints(self, chunk_id: str) -> list[str]:
+        """チャンクに添えられた問いを取り出して消す (Step 5.9 が消費する)。"""
+        with self._pq_hints_lock:
+            return list(self._pq_hints.pop(chunk_id, ()))
+
+    def record_pq_hits(self, chunk_ids: Sequence[str]) -> None:
+        """応答パスで採用した corpus チャンク id を lazy 生成の対象へ溜める。"""
+        self.pq_hits.add_many([cid for cid in chunk_ids if cid])
+
+    # ── corpus 較正 (f_01 §6.6) ──
+
+    def pq_coverage(self) -> float:
+        """ロード済みパッケージ全体の疑似クエリ充足率 (問いを持つチャンク / 全チャンク)。"""
+        total = 0
+        covered = 0
+        for package_id in self.loaded_ids:
+            package = self._packages.get(package_id)
+            if package is None:
+                continue
+            total += package.chunk_count
+            if package.pseudo_queries is not None:
+                covered += len(package.pseudo_queries.covered_target_ids())
+        return (covered / total) if total else 0.0
+
+    def calibration(self) -> dict[str, Any] | None:
+        """較正済み閾値 (``relevance_threshold`` … ``pq_gate``)。未較正なら ``None``。"""
+        if self._calibration is None:
+            return None
+        return dict(self._calibration.get("thresholds") or {})
+
+    def _pooled_vectors(self) -> tuple[np.ndarray, np.ndarray, list[int]] | None:
+        """ロード済みパッケージのチャンク本体 / 疑似クエリのベクトルを 1 つに束ねる。"""
+        chunk_blocks: list[np.ndarray] = []
+        pq_blocks: list[np.ndarray] = []
+        targets: list[int] = []
+        offset = 0
+        for package_id in self.loaded_ids:
+            package = self._packages.get(package_id)
+            if package is None:
+                continue
+            store = package.store.vector_store()
+            if store is None or store.vectors_q8 is None or store.scales is None:
+                continue
+            chunk_vecs = dequantize_int8(np.asarray(store.vectors_q8), np.asarray(store.scales))
+            if chunk_vecs.ndim != 2 or chunk_vecs.shape[0] == 0:
+                continue
+            row_of = {str(m.get("id")): i for i, m in enumerate(store.metadata)}
+            chunk_blocks.append(chunk_vecs)
+            index = package.pseudo_queries
+            if index is not None and len(index) > 0:
+                pq_store = index.store.vector_store()
+                snapshot = index.store.snapshot
+                if (
+                    pq_store is not None and pq_store.vectors_q8 is not None
+                    and pq_store.scales is not None and snapshot is not None
+                ):
+                    pq_vecs = dequantize_int8(
+                        np.asarray(pq_store.vectors_q8), np.asarray(pq_store.scales),
+                    )
+                    keep: list[int] = []
+                    for i, meta in enumerate(pq_store.metadata):
+                        row = snapshot.row_of(str(meta.get("id")))
+                        raw = snapshot.raw_at(row) if row is not None else None
+                        target = ((raw or {}).get("attrs") or {}).get("target_id")
+                        chunk_row = row_of.get(str(target)) if target else None
+                        if chunk_row is None or i >= pq_vecs.shape[0]:
+                            continue
+                        keep.append(i)
+                        targets.append(offset + chunk_row)
+                    if keep:
+                        pq_blocks.append(pq_vecs[keep])
+            offset += chunk_vecs.shape[0]
+        if not chunk_blocks:
+            return None
+        chunks = np.concatenate(chunk_blocks, axis=0)
+        pqs = (
+            np.concatenate(pq_blocks, axis=0)
+            if pq_blocks else np.zeros((0, chunks.shape[1]), dtype=np.float32)
+        )
+        return chunks, pqs, targets
+
+    def _calibration_signature(self, n_chunks: int, n_pq: int) -> str:
+        return calibration_signature(self.embedding_model_id, n_chunks, n_pq)
+
+    def _load_calibration_cache(self) -> None:
+        pooled = self._pooled_vectors()
+        if pooled is None:
+            return
+        chunks, pqs, _targets = pooled
+        cached = load_corpus_calibration(
+            self.corpus_dir, self._calibration_signature(chunks.shape[0], pqs.shape[0]),
+        )
+        if cached:
+            self._calibration = cached
+            logger.info("Corpus calibration loaded from cache: %s", cached.get("thresholds"))
+
+    async def recalibrate(self, *, force: bool = False) -> dict[str, Any] | None:
+        """疑似クエリとカナリア発話から corpus の棒を導き直す (sleep-time / 起動時)。
+
+        署名 (埋め込み指紋 + チャンク数 + 疑似クエリ数) が一致するキャッシュが
+        あれば再計算しない。``force`` で強制。
+        """
+        backend = self._embedding_backend
+        pooled = self._pooled_vectors()
+        if backend is None or pooled is None:
+            return self._calibration
+        chunks, pqs, targets = pooled
+        signature = self._calibration_signature(chunks.shape[0], pqs.shape[0])
+        if not force:
+            cached = load_corpus_calibration(self.corpus_dir, signature)
+            if cached:
+                self._calibration = cached
+                return cached
+        if pqs.shape[0] == 0:
+            return self._calibration
+        try:
+            canary = np.asarray(
+                await backend.embed(list(CANARY_UTTERANCES), is_query=True, mode="chat"),
+                dtype=np.float32,
+            )
+        except Exception as e:  # noqa: BLE001 — 較正の失敗で sleep-time を止めない
+            logger.warning("Corpus calibration skipped (canary embedding failed): %s", e)
+            return self._calibration
+        result = compute_corpus_calibration(chunks, pqs, targets, canary)
+        if not result.get("ok"):
+            logger.info("Corpus calibration not applied: %s", result.get("reason"))
+            return self._calibration
+        payload = {
+            "signature": signature,
+            "n_chunks": result["n_chunks"],
+            "n_pq": result["n_pq"],
+            "distribution": result["distribution"],
+            "thresholds": result["thresholds"],
+        }
+        self._calibration = payload
+        save_corpus_calibration(self.corpus_dir, signature, result)
+        return payload
 
     # ── 次元検査 ──
 
@@ -1254,6 +1824,40 @@ def _installed_at(directory: Path) -> str:
 def _release_store(store: EvidenceStore) -> None:
     """memmap を握った VectorStore を手放す (Windows で削除できなくなるため)。"""
     store.close()
+
+
+_OUTLINE_HEADING_RE = re.compile(r"^[ \t]{0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
+_FENCE_RE = re.compile(r"^[ \t]{0,3}(```|~~~)")
+
+
+def _document_outline(path: Path) -> list[tuple[int, str]]:
+    """原文の見出し行を ``[(深さ, 題)]`` で出現順に返す (読めなければ空)。
+
+    コードフェンスの中は読まない (yaml の ``# ---`` コメントが H1 に化ける)。
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out: list[tuple[int, str]] = []
+    in_fence = False
+    for line in text.splitlines():
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = _OUTLINE_HEADING_RE.match(line)
+        if m and m.group(2).strip():
+            out.append((len(m.group(1)), m.group(2).strip()))
+    return out
+
+
+def _release_package(package: CorpusPackage) -> None:
+    """本体と疑似クエリ索引の両方を手放す。"""
+    _release_store(package.store)
+    if package.pseudo_queries is not None:
+        package.pseudo_queries.close()
 
 
 def _clean_derived(directory: Path) -> None:

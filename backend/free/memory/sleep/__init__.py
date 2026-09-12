@@ -28,10 +28,6 @@ Step 11 (Critique-Synthesis) / Step 12 (Policy Evolver writeback) / Step 14
 from __future__ import annotations
 
 from backend.free.memory.sleep.archive import archive_inactive_projects
-from backend.free.memory.sleep.contextual import (
-    generate_contextual_prefixes,
-    generate_prefixes_for_store,
-)
 from backend.free.memory.sleep.extraction import (
     extract_semantic_facts,
     persist_facts,
@@ -56,8 +52,6 @@ __all__ = [
     "consolidate_failure_patterns_for_project",
     "ensure_mdp_ingester",
     "extract_semantic_facts",
-    "generate_contextual_prefixes",
-    "generate_prefixes_for_store",
     "ingest_mdp_traces",
     "persist_facts",
     "promote_history_to_semmem",

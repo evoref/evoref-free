@@ -45,6 +45,7 @@ from backend.free.core.verifier_events import (
 )
 from backend.free.agent.issue_ledger import record_current_issue
 from backend.free.core.text_quality import (
+    abstains_on_reference_material,
     claims_completed_state_change,
     contradicts_measured_values,
     has_broken_ja_spacing,
@@ -539,6 +540,17 @@ _CONTRASTIVE_RESTATEMENT_RE = re.compile(
     r"[。．.！!\s]*$",
 )
 
+#: 値の **変更の告知** (完了形)。「報告会の日が変わりました」「予定が変更に
+#: なりました」は誤りの指摘ではないが、その属性の現在値が入れ替わったという
+#: 宣言で、記憶層にとっては言い直しと同じ (2026-09-12 (b): 対比形が現在形
+#: 「ではなく…です」で past-only の網に掛からず、前倒しが立たないまま別セッション
+#: へ旧日付が注入された)。疑問形 (「変わりますか」「変わったら」) は除く。
+_VALUE_CHANGED_RE = re.compile(
+    r"(?:が|は)\s*(?:変わり|変更にな|変更され|延期にな|前倒しにな|延び|早ま|ずれ)"
+    r"(?:ました|りました|った|た)(?![らかの]|ら)",
+)
+_QUESTION_TAIL_RE = re.compile(r"(?:か|の|でしょう)?[?？]\s*$|(?:ますか|ですか|でしょうか)[。．]?\s*$")
+
 
 def _correction_attribution(query: str) -> str | None:
     """字句一致した訂正候補の **帰属** を返す。訂正でなければ ``None``。
@@ -620,6 +632,8 @@ def restates_a_value(query: str) -> bool:
     if not query:
         return False
     masked = mask_quoted_speech(query)
+    if _VALUE_CHANGED_RE.search(masked) and not _QUESTION_TAIL_RE.search(masked):
+        return True
     if not _CONTRASTIVE_RESTATEMENT_RE.search(masked):
         return False
     # 帰属の判定 (質問 / 比較 / 書式変更依頼を落とす) は共有経路と同じものを通す。
@@ -1046,6 +1060,13 @@ class FeedbackCollector:
             tool_grounded=(
                 bool(tool_uses) or bool(tool_result_text)
                 or calculate_result is not None
+            ),
+            # 文書を注入した turn の抑止応答 = 検索の取りこぼしの観測 (f_04 §3.2)。
+            rag_abstained=(
+                abstains_on_reference_material(response)
+                if gen_config is not None
+                and any(str(e).startswith("corpus:") for e in (gen_config.evidence_ids or []))
+                else None
             ),
             tool_uses=tool_uses,
             unexplained_numbers=unexplained_numbers,
