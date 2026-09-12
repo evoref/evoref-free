@@ -167,6 +167,18 @@ class SSEFrameBuilder:
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     @staticmethod
+    def sources(items: list[dict]) -> str:
+        """出典フレーム: この応答の ``[参考情報]`` に注入した根拠 (常時送信)。
+
+        Args:
+            items: [{"id": "<store>:<evidence_id>", "store": "corpus"|"episodic",
+                     "package_id", "package_name", "doc_id", "heading",
+                     "score": float, "preview": str}, ...]
+        """
+        payload = {"sources": {"items": items}}
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    @staticmethod
     def error(msg: str) -> str:
         """エラーフレーム
 

@@ -1,5 +1,5 @@
 import { writable, derived, get } from 'svelte/store';
-import type { TokenInfo, RagDebugInfo, EditorCodeArtifact } from '$lib/free/api';
+import type { TokenInfo, RagDebugInfo, SourcesInfo, EditorCodeArtifact } from '$lib/free/api';
 import { switchModeApi } from '$lib/free/api';
 import { MODE_RESTART_STATUS_TIMEOUT_MS } from '$lib/free/constants';
 
@@ -39,6 +39,8 @@ export interface ChatMessage {
 	agentic_steps?: AgenticStep[];
 	step_results?: StepResult[];
 	rag_debug?: RagDebugInfo;
+	/** この応答の [参考情報] に注入した根拠 (常時。develop 限定の rag_debug とは別) */
+	sources?: SourcesInfo;
 	/** クリエイトモードでの生成コード出力先 ('editor' 既定 / 'chat' 明示指示時) */
 	editor_route?: 'editor' | 'chat';
 	/** long_form 生成の進捗 (ユニット i/total)。生成中のみセットされ常時表示される */
@@ -115,6 +117,17 @@ export function addStepToLastAssistant(step: AgenticStep): void {
 		if (last?.role === 'assistant') {
 			const steps = [...(last.agentic_steps ?? []), step];
 			return [...msgs.slice(0, -1), { ...last, agentic_steps: steps }];
+		}
+		return msgs;
+	});
+}
+
+/** 最後のアシスタントメッセージに出典をセット */
+export function setSourcesToLastAssistant(sources: SourcesInfo): void {
+	messages.update((msgs) => {
+		const last = msgs[msgs.length - 1];
+		if (last?.role === 'assistant') {
+			return [...msgs.slice(0, -1), { ...last, sources }];
 		}
 		return msgs;
 	});

@@ -78,8 +78,8 @@ from backend.schemas.paths import LocalPathsConfig, ModelPathsConfig
 from backend.schemas.rag import (
     CartridgeGateConfig,
     ClusterIndexConfig,
-    ContextualPrefixConfig,
     EmbeddingConfig,
+    PseudoQueryConfig,
     RAGConfig,
     SelfRagConfig,
 )
@@ -96,7 +96,7 @@ __all__ = [
     "CreateModeConfig",
     "CreateStagedConfig",
     "ConflictResolverConfig",
-    "ContextualPrefixConfig",
+    "PseudoQueryConfig",
     "EditorSettingsConfig",
     "EmbeddingConfig",
     "EvorefConfig",

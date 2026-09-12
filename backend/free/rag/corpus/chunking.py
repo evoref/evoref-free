@@ -47,7 +47,7 @@ logger = get_logger("rag.corpus.chunking")
 #: チャンク生成規則の版。**分割の結果が変わる変更で上げる** (chunk_size の
 #: 既定変更 / 抽出器の差し替え / heading の付け方)。prebuilt はこの版が一致
 #: したときだけ採用される (c_16 §4.3)。
-CHUNKER_VERSION = 1
+CHUNKER_VERSION = 3
 
 #: ``provenance[].extractor``。
 EXTRACTOR_NAME = "corpus_chunker"

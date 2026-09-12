@@ -38,38 +38,37 @@ class ClusterIndexConfig(BaseModel):
     n_probe_ratio: float = Field(default=0.125, gt=0.0, le=1.0)
 
 
-class ContextualPrefixConfig(BaseModel):
-    """Contextual Retrieval プレフィックス生成設定
+class PseudoQueryConfig(BaseModel):
+    """corpus パッケージの疑似クエリ索引 (f_01 §6)。
 
-    Anthropic 方式の Contextual Retrieval プレフィックスを
-    チャンクに付与するための設定。eager (Sleep-time 一括生成) と
-    lazy (retrieval 時 on-demand) の 2 モードをサポートする。
+    チャンクごとに「このチャンクが答える問い」を sleep-time (Step 5.9) で
+    補助タスクに作らせ、その埋め込みを別リストとして検索し疑似クエリ側を
+    先頭に interleave する。応答パスに LLM は入らない。
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    # 機能自体の有効/無効。無効時はプレフィックス生成を完全スキップ。
+    # 生成と検索の両方を切る (既存の索引は残る)。
     enabled: bool = True
-    # 生成モード: "eager" (Sleep-time 一括) / "lazy" (retrieval 時 on-demand)
-    mode: str = Field(default="eager", pattern=r"^(eager|lazy)$")
-    # 補助タスクに要求する最大トークン数 (プレフィックス 1 件あたり)
-    max_tokens: int = Field(default=128, ge=1)
-    # プロンプトに埋め込むドキュメント本文の最大文字数 (超過時はトランケート)
-    max_doc_chars: int = Field(default=6000, ge=100)
-    # Sleep-time 1 サイクルで処理するチャンクの上限 (eager/lazy 両方で適用)
-    batch_size: int = Field(default=10, ge=1)
-    # 生成対象となる最小チャンクトークン数。この値未満はスキップする。
-    # metadata の `tokens` フィールド (tiktoken cl100k_base 概算) を基準とする。
-    min_chunk_tokens: int = Field(default=200, ge=0)
-    # lazy モード時のヒット閾値。retrieval でこの回数以上ヒットした chunk のみ
-    # プレフィックスを永続化する。1 回目のヒットでは生成せずカウントのみ更新。
-    lazy_hit_threshold: int = Field(default=2, ge=1)
-    # プレフィックス生成プロンプトのテンプレート。プレースホルダ
-    # ``{document}`` ``{chunk}`` をサポート。多言語対応や、英語専用 / 中国語
-    # 専用補助タスクに切替えた際にこのテンプレートを差し替えることで、
-    # 補助タスクの学習言語と一致させる。空文字列にすると default
-    # (日本語) が利用される。
-    prompt_template: str = ""
+    # 1 チャンクあたりの問いの本数。
+    questions_per_chunk: int = Field(default=2, ge=1, le=5)
+    # Full サイクル 1 回で生成するチャンク数の上限 (27B で 1 件 20 秒級)。静穏窓
+    # + 横取りでサイクルを畳む協調 yield があるので、上限を小さく保つ理由は
+    # 「Full を短く終える」だけ。20 では 1124 チャンクの充足 50% に 28 サイクル要る。
+    max_per_cycle: int = Field(default=50, ge=1)
+    # ヒットの無いチャンクも snapshot 行順に埋める件数 (27B で 1 サイクル約 17 分)。
+    # 疑似クエリの充足率が関連性ゲートの前提なので既定で埋める。0 で lazy のみ。
+    backfill_per_cycle: int = Field(default=50, ge=0)
+    # 生成プロンプトへ渡す本文の上限文字数。
+    max_chunk_chars: int = Field(default=1200, ge=100)
+    # 疑似クエリの関連性ゲート (Step 3d の拒否) を有効にする充足率 (問いを持つ
+    # チャンク / 全チャンク) の下限。較正済みの棒そのものは充足率に関わらず使う
+    # (棒の妥当性は標本数で決まる、f_01 §6.6)。
+    gate_min_coverage: float = Field(default=0.5, ge=0.0, le=1.0)
+    # 静穏窓 (秒)。チャットが終わってからこの秒数は Step 5.9 を始めない。
+    # 1 件 20 秒級の生成をターンの合間に始めると次のターンに横取りされ、
+    # その往復で TTFT を壊す (2026-09-12 実測 20 s → 55 s)。
+    quiet_seconds: float = Field(default=60.0, ge=0.0)
 
 
 class SelfRagContentGateConfig(BaseModel):
@@ -198,6 +197,14 @@ class RAGConfig(BaseModel):
     # top_k*N*2 となり、上限 5 を超えると N>=5000+IVF 環境で recall ガード経由の
     # 全件走査フォールバックに倒れやすくなるため le=5 で制限する。
     fetch_multiplier: int = Field(default=1, ge=1, le=5)
+    # 転置索引の上位に予約する corpus の席 (f_01 §8.1 の 4.3)。cosine 1 本の順位
+    # では固有語で当てた行が top-k に残らないため、棒を越える語彙 top-N を
+    # 疑似クエリ由来と同じ列 (先頭側) に置く。0 で無効。実測 (golden 111 件)
+    # 席 1 で recall@5 0.640 → 0.703、席 2 は 0.649 に下がる。
+    lexical_seats: int = Field(default=1, ge=0, le=2)
+    # 採用した corpus チャンクに随伴させる直前チャンク (同文書・同大節) の末尾文字数
+    # (f_01 §8.1 の 7.65)。0 で無効。実測 (v3、golden): 0.830 → 0.859 (+31% 文字)。
+    previous_context_chars: int = Field(default=300, ge=0, le=2000)
     # --- 順位付け (c_16 §7.2) ---
     #
     # 順位式は 3 ストア共通の 1 本 (``cos × freshness × confidence ×
@@ -210,10 +217,29 @@ class RAGConfig(BaseModel):
     # numpy CSR 転置索引に置き換わり、走査上限は
     # ``memory.evidence.lexical`` が持つ。転置索引は候補生成器であって
     # スコアを持ち込まないので (c_16 §6.3)、重み付け融合のキーは意味を失った。
-    # --- Contextual Retrieval ---
-    contextual_prefix: ContextualPrefixConfig = Field(
-        default_factory=ContextualPrefixConfig,
-    )
+    # --- 疑似クエリ索引 (f_01 §6) ---
+    pseudo_query: PseudoQueryConfig = Field(default_factory=PseudoQueryConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_removed_contextual_prefix(cls, data: object) -> object:
+        """撤去した ``rag.contextual_prefix`` を明示的に拒否する (c_16 §8.2)。
+
+        Contextual Retrieval (eager / lazy) は書き戻し先の旧 ``VectorStore`` が
+        無く毎 Full 0 件で死んでいたため 2026-09-12 に撤去した (f_01 §5)。
+        ``extra="forbid"`` の素のエラーだと理由が伝わらないので、他の撤去キーと
+        同じ形でキー名と行き先を示す。
+        """
+        if isinstance(data, dict) and "contextual_prefix" in data:
+            raise ValueError(
+                "rag.contextual_prefix was removed (2026-09-12): Contextual "
+                "Retrieval prefixes had no store to write to since the Evidence "
+                "Store rewrite (c_16 §8.2). Question-side context now comes from "
+                "the pseudo-query index (rag.pseudo_query) and exact-term recall "
+                "from the inverted-index seat (rag.lexical_seats). Remove the "
+                "rag.contextual_prefix section from config.yaml.",
+            )
+        return data
     # --- ベクトル量子化 ---
     quantization: str = Field(default="int8", pattern=r"^(none|int8)$")
     # int8 粗検索後に float32 で rescore する候補数。チャット応答経路の LTM /

@@ -81,6 +81,22 @@ def resolve_offset(anchor: date, m: re.Match[str]) -> date:
 _ANNOTATED_RE = re.compile(r"\s*[(（]\d{4}-\d{2}-\d{2}[)）]")
 
 
+def strip_date_annotation_after(text: str, position: int) -> str:
+    """``position`` 直後に ``(YYYY-MM-DD)`` の併記があれば落とす (純粋関数)。
+
+    訂正で相対表現を置換したとき (「来週の金曜日 (2026-09-18)」→「再来週の
+    月曜日 (2026-09-18)」)、旧い注記が残ると :func:`annotate_relative_dates` は
+    「併記済み」と見て再解決せず、**訂正後の表現に訂正前の日付** が付いたまま
+    記憶される (2026-09-12 ライブ監査)。置換した側が注記を外し、再注記に委ねる。
+    """
+    if not text or position < 0 or position > len(text):
+        return text
+    m = _ANNOTATED_RE.match(text[position:])
+    if m is None:
+        return text
+    return text[:position] + text[position + m.end():]
+
+
 def week_of_weekday(anchor: date, week_word: str, weekday_char: str) -> date | None:
     """「来週の金曜日」型を ``anchor`` の週を起点に解く。該当しなければ None。"""
     offset = WEEK_OFFSETS.get(week_word)

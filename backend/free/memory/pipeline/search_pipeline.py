@@ -14,6 +14,7 @@ import numpy as np
 from backend.exceptions import RAGError
 from backend.i18n_helper import prompt_locale
 from backend.log_config import get_logger
+from backend.free.core.intent_vocab import refers_to_previous_output
 from backend.free.memory.corrections import corrections_by_target
 from backend.trace_context import run_in_executor_with_context
 from backend.utils import utc_now_dt
@@ -36,7 +37,6 @@ if TYPE_CHECKING:
     from backend.free.core.policy_interpreter import PolicyInterpreter
     from backend.free.core.stage_timer import StageTimer
     from backend.free.rag.judge_usage_tracker import JudgeUsageTracker
-    from backend.free.rag.lazy_contextual import LazyContextualPrefixService
 
 logger = get_logger("memory.search_pipeline")
 
@@ -108,6 +108,18 @@ class SearchResult:
     #: c_16 §5.5)。``corpus:`` は corpus パッケージ由来、``episodic:`` は
     #: 会話ノート由来。学習帰属 (``GenerationConfigRef.evidence_ids``) の材料。
     evidence_ids: list[str] = field(default_factory=list)
+
+    #: 疑似クエリの関連性ゲート (f_01 §6.6) で corpus を引かなかった turn。
+    #: Level 0 の ``gen_config.corpus_gated`` へ (「注入ゼロ」の理由の区別)。
+    corpus_gated: bool = False
+    #: 採用した corpus チャンクのうち疑似クエリ索引経由で拾った件数。
+    pseudo_derived: int = 0
+    #: 転置索引の上位候補 (``<pkg>:<ev>``、採用の有無に関わらず)。抑止応答の
+    #: turn で取りこぼした問いの種 (f_01 §6.4 の misses) に使う。
+    lexical_candidate_ids: list[str] = field(default_factory=list)
+    #: corpus の候補はあったのに棒で全部落ち、1 件も注入できなかった turn
+    #: (f_01 §6.4 の misses の第 2 の引き金。作話の温床なので問いを種にする)。
+    corpus_starved: bool = False
 
 
 def _resolve_fetch_multiplier(cfg: dict) -> int:
@@ -245,6 +257,51 @@ def _superseded_mark() -> str:
     return _SUPERSEDED_MARKS.get(prompt_locale(), _SUPERSEDED_MARKS["ja"])
 
 
+#: 前チャンクの文脈の見出し語 (f_01 §8.1 の 7.65)。
+PREVIOUS_CONTEXT_MARK = "(前の文脈) "
+
+
+def attach_previous_chunk_context(
+    cartridge_mgr, sources: list[tuple[str, float, str]], *, tail_chars: int = 300,
+) -> list[tuple[str, float, str]]:
+    """採用した corpus チャンクごとに直前チャンクの末尾を随伴させる (f_01 §8.1 の 7.65)。
+
+    chunker v3 で節の途中から始まるチャンクは減ったが、文単位で詰めた長い節では
+    答えの主語が直前のチャンクに残る。実測 (v3、golden 135 件): 0.830 → 0.859。
+    随伴は **同じ文書・同じ大節** の直前だけ、既に採用済みなら足さない。
+    """
+    if tail_chars <= 0 or cartridge_mgr is None or not sources:
+        return sources
+    fn = getattr(cartridge_mgr, "previous_chunk_context", None)
+    if fn is None:
+        return sources
+    present = {cid for cid, _, _ in sources}
+    out = list(sources)
+    added = 0
+    for cid, score, _text in sources:
+        if _store_of(cid) != "corpus":
+            continue
+        try:
+            found = fn(cid, tail_chars)
+        except Exception as e:  # noqa: BLE001 — 随伴で応答を止めない
+            logger.debug("previous chunk context skipped for %s: %s", cid, e)
+            continue
+        if not found:
+            continue
+        prev_id, prev_text = found
+        if prev_id in present or not prev_text:
+            continue
+        present.add(prev_id)
+        out.append((prev_id, score, PREVIOUS_CONTEXT_MARK + prev_text))
+        added += 1
+    if added:
+        logger.info(
+            "Attached %d previous-chunk context(s) (tail %d chars) to corpus references",
+            added, tail_chars,
+        )
+    return out
+
+
 def attach_superseding_corrections(
     episodic, sources: list[tuple[str, float, str]],
 ) -> list[tuple[str, float, str]]:
@@ -303,8 +360,14 @@ async def _search_episodic_layer(
     episodic, query: str, query_vec: np.ndarray, top_k: int,
     drop_past_answers: bool = False,
     threshold: float = 0.0,
+    own_session: str | None = None,
 ) -> list[StoreEntry]:
     """エピソード記憶 (``short`` → ``long``) を 1 回で引く。
+
+    ``own_session`` が与えられたら、provenance の ``session_id`` が一致する
+    ノートだけ残す。自分の直前の出力を指す問い (「今の 4 つの回答は…」) は
+    それを出したセッションのノートしか根拠になり得ず、別セッションのヒットは
+    どれほど似ていても誤り (f_01 §8.1、2026-09-12 (b))。
 
     旧 STM 層 + LTM 層の置き換え (c_16 §4.1)。``EpisodicStore.search`` が
     ``short`` シャードを先に、続いて直近 12 か月の ``long`` シャードを引き、
@@ -341,6 +404,15 @@ async def _search_episodic_layer(
         logger.warning("Episodic search failed: %s", e)
         return []
 
+    if own_session is not None:
+        before = len(hits)
+        hits = [h for h in hits if _hit_session(h) == own_session]
+        if len(hits) != before:
+            logger.info(
+                "Episodic: the query refers to our own previous output; dropped "
+                "%d note(s) from other sessions (kept %d of session %s)",
+                before - len(hits), len(hits), own_session,
+            )
     if drop_past_answers:
         before = len(hits)
         hits = [h for h in hits if h.record.origin == "user"]
@@ -381,6 +453,13 @@ async def _search_episodic_layer(
         ", ".join(f"{e[1]:.3f}" for e in entries),
     )
     return entries
+
+
+def _hit_session(hit) -> str:
+    """ヒットのノートが書かれたセッション id (provenance[0].session_id、無ければ "")。"""
+    prov = getattr(hit.record, "provenance", None) or []
+    first = prov[0] if prov and isinstance(prov[0], dict) else {}
+    return str(first.get("session_id") or "")
 
 
 def _answers_for_question_only_hits(episodic, hits: list) -> list:
@@ -566,12 +645,184 @@ def _sanitize_episode_chunk(text: str) -> str | None:
     return "; ".join(kept)
 
 
+def _resolve_corpus_thresholds(
+    cartridge_mgr, cfg: dict, memory_thresholds: QualityThresholds,
+) -> tuple[QualityThresholds, float | None, bool, float | None]:
+    """corpus 層に使う棒と、疑似クエリの関連性ゲートを掛けるかを決める (f_01 §6.6)。
+
+    Returns:
+        ``(corpus の QualityThresholds, pq_gate, veto, on_topic_bar)``。
+        ``on_topic_bar`` は充足率が低い間の関連性ゲートで本体側に使う棒
+        (較正の ``match_top1_p25``、無ければ ``None`` = confidence に倒す)。
+
+    有効条件は 2 段 (2026-09-12 (b) で分離):
+
+    1. **棒** (``relevance`` / ``support`` / ``confidence`` と、疑似クエリ由来の
+       floor に使う ``pq_gate``) は ``threshold_mode: auto`` かつ corpus 側の
+       較正 (疑似クエリ + カナリア) が済んでいれば **充足率に関わらず** 使う。
+       棒の妥当性は標本数 (``compute_calibration`` の最小ノート / 最小クエリ)
+       で決まり、corpus 全体に対する割合には依存しない。
+    2. **関連性ゲート** (Step 3d の「pq_gate を越える疑似クエリが無ければ corpus
+       ごと引かない」という拒否) だけ充足率 ≥ ``rag.pseudo_query.gate_min_coverage``
+       を要る。疑似クエリを持たないチャンクへの問いは pq が無いのが当然で、
+       充足率が低い間に拒否すると正解を落とす。
+
+    以前は両方を充足率で縛っていたため、大きな corpus を入れ直すと充足 50% まで
+    (1070 チャンクで約 3 時間のアイドル) 記憶側の棒 0.64 に倒れ、その間 corpus の
+    注入がほぼゼロだった。未較正なら記憶側の棒 (従来動作) と ``None`` / ``False``。
+    """
+    rag_cfg = cfg.get("rag") or {}
+    if str((rag_cfg.get("self_rag") or {}).get("threshold_mode", "auto")) != "auto":
+        return memory_thresholds, None, False, None
+    if cartridge_mgr is None or not hasattr(cartridge_mgr, "corpus_calibration"):
+        return memory_thresholds, None, False, None
+    if not _pseudo_query_enabled(cfg):
+        return memory_thresholds, None, False, None
+    try:
+        calibration = cartridge_mgr.corpus_calibration()
+        coverage = float(cartridge_mgr.pq_coverage())
+    except Exception as e:  # noqa: BLE001 — 較正の読み出しで検索を止めない
+        logger.warning("Corpus calibration lookup failed: %s", e)
+        return memory_thresholds, None, False, None
+    if not calibration:
+        return memory_thresholds, None, False, None
+    min_coverage = float(
+        ((rag_cfg.get("pseudo_query") or {}).get("gate_min_coverage", 0.5)),
+    )
+    pq_gate = calibration.get("pq_gate")
+    thresholds = QualityThresholds.from_config(rag_cfg, calibration=calibration)
+    veto = pq_gate is not None and coverage >= min_coverage
+    on_topic = calibration.get("on_topic_threshold")
+    on_topic_bar = float(on_topic) if on_topic is not None else None
+    return thresholds, (float(pq_gate) if pq_gate is not None else None), veto, on_topic_bar
+
+
+def _pseudo_query_may_lead(cartridge_mgr, rag_cfg: dict) -> bool:
+    """疑似クエリ由来を先頭に置いてよいか = 充足率 ≥ ``gate_min_coverage`` (f_01 §6.3)。
+
+    充足率を持たないマネージャ (テストのスタブ等) は従来どおり先頭に置く。
+    """
+    probe = getattr(cartridge_mgr, "pq_coverage", None)
+    if probe is None:
+        return True
+    try:
+        coverage = float(probe())
+    except Exception:  # noqa: BLE001 — 観測の失敗で並びを変えない
+        return True
+    min_coverage = float(
+        ((rag_cfg.get("pseudo_query") or {}).get("gate_min_coverage", 0.5)),
+    )
+    return coverage >= min_coverage
+
+
+def _pseudo_query_enabled(cfg: dict) -> bool:
+    """``rag.pseudo_query.enabled`` (既定 True、f_01 §6.5)。"""
+    section = (cfg.get("rag") or {}).get("pseudo_query") or {}
+    return bool(section.get("enabled", True))
+
+
+#: 取りこぼしの種にする転置索引の上位件数 (f_01 §6.4 の misses)。
+LEXICAL_MISS_CANDIDATES = 5
+
+
+async def _search_lexical_seat_layer(
+    cartridge_mgr, query_text: str, query_vec: np.ndarray,
+    exclude_ids: list[str], seats: int, timeout_ms: int = 0,
+) -> list[StoreEntry]:
+    """転置索引の席 (f_01 §8.1 の 4.3)。corpus 層の結果に無い語彙上位を引く。"""
+    if seats <= 0 or not query_text or cartridge_mgr is None:
+        return []
+    fn = getattr(cartridge_mgr, "search_detailed_lexical_seat", None)
+    if fn is None:
+        return []
+    loop = asyncio.get_running_loop()
+    try:
+        coro = run_in_executor_with_context(
+            loop, _cartridge_executor,
+            lambda: fn(query_vec, query_text, exclude_ids, seats),
+        )
+        raw = await asyncio.wait_for(coro, timeout=timeout_ms / 1000.0) if timeout_ms > 0 else await coro
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 — 席の探索で応答を止めない
+        logger.warning("Lexical seat search failed: %s", e)
+        return []
+    return [(str(e[0]), float(e[1]), float(e[2]), e[3]) for e in raw if len(e) >= 4]
+
+
+async def _search_pseudo_query_layer(
+    cartridge_mgr, query_vec: np.ndarray, top_k: int, timeout_ms: int = 0,
+) -> tuple[list[StoreEntry], set[str]]:
+    """corpus の疑似クエリ索引 (f_01 §6.3)。``(id, cosine, score, text)`` の列と、
+    取りこぼした問いの言い換え (``from_hint``) が最良だった id の集合を返す。
+
+    並びは問い↔問いの cosine 順。``cosine`` は問い↔問いの値 (較正済みの棒は
+    クエリ↔発話の分布なのでこちらがスケールに合う)、``score`` は対象チャンク
+    本体の順位式の値。失敗 / タイムアウトは空 — 本体の corpus 層と同じく、
+    1 層の失敗で他層を巻き込まない。
+    """
+    if cartridge_mgr is None or not hasattr(cartridge_mgr, "search_detailed_pq"):
+        return [], set()
+    loop = asyncio.get_running_loop()
+    try:
+        coro = run_in_executor_with_context(
+            loop, _cartridge_executor,
+            lambda: cartridge_mgr.search_detailed_pq(query_vec, top_k),
+        )
+        if timeout_ms > 0:
+            raw = await asyncio.wait_for(coro, timeout=timeout_ms / 1000.0)
+        else:
+            raw = await coro
+        entries: list[StoreEntry] = []
+        hinted: set[str] = set()
+        for item in raw:
+            cid, cosine, score, text = item[0], item[1], item[2], item[3]
+            entries.append((cid, float(cosine), float(score), text))
+            if len(item) > 4 and item[4]:
+                hinted.add(cid)
+        logger.debug("Step 3c pseudo-query: %d results", len(entries))
+        return entries, hinted
+    except asyncio.TimeoutError:
+        logger.warning("Pseudo-query search timed out after %d ms", timeout_ms)
+        return [], set()
+    except asyncio.CancelledError:
+        raise
+    except (RAGError, RuntimeError, ValueError, TypeError, OSError) as e:
+        logger.warning("Pseudo-query search failed: %s", e)
+        return []
+
+
+def _interleave_pseudo(
+    pseudo_entries: list[StoreEntry], merged: list[StoreEntry],
+) -> list[StoreEntry]:
+    """疑似クエリ由来を先頭に、交互 1 件ずつ id で畳む (f_01 §6.3)。
+
+    順位式 1 本 (c_16 §7.2) の外側の **位置融合**。問い↔問いの cosine は
+    問い↔文書より高く、score へ流すと top-k を占有する (実測 0.605 vs 0.775)
+    ので、スケールの違う 2 列は位置で合わせる。
+    """
+    if not pseudo_entries:
+        return merged
+    out: list[StoreEntry] = []
+    seen: set[str] = set()
+    for rank in range(max(len(pseudo_entries), len(merged))):
+        for column in (pseudo_entries, merged):
+            if rank < len(column) and column[rank][0] not in seen:
+                seen.add(column[rank][0])
+                out.append(column[rank])
+    return out
+
+
 async def _search_corpus_layer(
     cartridge_mgr, query_vec: np.ndarray, top_k: int,
     timeout_ms: int = 0,
     rescore_candidates: int = 0,
+    query_text: str = "",
 ) -> list[StoreEntry]:
     """corpus (旧カートリッジ) 検索。``(id, cosine, score, text)`` を返す。
+
+    ``query_text`` は転置索引の候補生成 (c_16 §6.3) に渡す。空だとベクトル
+    候補だけになり、固有語の問いを取りこぼす (f_01 §8.1、2026-09-12 (b))。
 
     ``score`` は ``CorpusStore.search`` が **ストアの中で** 計算した順位式
     (``cos × freshness × confidence × store_prior``、c_16 §7.2) の値。
@@ -595,6 +846,8 @@ async def _search_corpus_layer(
     loop = asyncio.get_running_loop()
     detailed = getattr(cartridge_mgr, "search_detailed", None)
     extra = {"rescore_candidates": rescore_candidates} if rescore_candidates > 0 else {}
+    if query_text:
+        extra["query_text"] = query_text
     try:
         if detailed is not None:
             coro = run_in_executor_with_context(
@@ -876,7 +1129,6 @@ async def unified_search(
     policy: PolicyInterpreter | None = None,
     timer: "StageTimer | None" = None,
     semmem_stats: dict | None = None,
-    lazy_contextual: "LazyContextualPrefixService | None" = None,
     *,
     session_id: str = "default",
     judge_tracker: "JudgeUsageTracker | None" = None,
@@ -987,29 +1239,83 @@ async def unified_search(
     # ゲートは **素の cosine** を全ストア共通の較正済みの棒で掛ける (c_16 §7.1)。
     thresholds = QualityThresholds.from_config(rag_cfg)
     store_gate = _store_cosine_gate(rag_cfg, thresholds)
-    epi_entries, corpus_entries = await asyncio.gather(
+    pseudo_enabled = _pseudo_query_enabled(cfg)
+    corpus_thresholds, pq_gate, pq_veto, on_topic_bar = _resolve_corpus_thresholds(
+        cartridge_mgr, cfg, thresholds,
+    )
+    if on_topic_bar is None:
+        on_topic_bar = corpus_thresholds.confidence
+    # 自分の直前の出力を指す問いは、それを出したセッションの外に根拠を持たない。
+    own_session = session_id if refers_to_previous_output(query) else None
+    epi_entries, corpus_entries, (pseudo_entries, hinted_pq_ids) = await asyncio.gather(
         _search_episodic_layer(
             episodic, query, query_vec, fetch_k, drop_past_answers,
-            threshold=store_gate,
+            threshold=store_gate, own_session=own_session,
         ),
         _search_corpus_layer(
             cartridge_mgr, query_vec, fetch_k, timeout_ms=cart_timeout_ms,
-            rescore_candidates=rescore_candidates,
+            rescore_candidates=rescore_candidates, query_text=query,
         ),
+        _search_pseudo_query_layer(
+            cartridge_mgr, query_vec, fetch_k, timeout_ms=cart_timeout_ms,
+        ) if pseudo_enabled else _empty_pseudo_layer(),
     )
     if timer is not None:
         timer.stop("retrieval_ms")
 
-    # Lazy Contextual Retrieval — エピソード記憶の hit について on-demand で
-    # プレフィックス生成を非同期タスクとして起動する。fire-and-forget なので
-    # 本 retrieval のレイテンシには影響せず、次回以降の同一 chunk ヒット時に
-    # contextual_text が使えるようになる。
-    if lazy_contextual is not None and lazy_contextual.is_active and epi_entries:
-        hit_ids = [entry[0] for entry in epi_entries]
-        _spawn_background(
-            lazy_contextual.on_retrieval_hits(hit_ids),
-            name=f"lazy_contextual_hits[{len(hit_ids)}]",
+    # Step 3c-2: 転置索引の席 (f_01 §8.1 の 4.3)。corpus 層の結果に入らなかった
+    # 語彙上位で、本体 cosine が corpus の relevance の棒以上のものだけ。
+    seat_entries: list[StoreEntry] = []
+    lexical_candidate_ids: list[str] = []
+    seats = int(rag_cfg.get("lexical_seats", 1) or 0)
+    if seats > 0 and query and (corpus_entries or not cartridge_mgr is None):
+        # 走査は 1 回: 上位 LEXICAL_MISS_CANDIDATES 件を取り、採用済みを除いた
+        # 先頭 seats 件が席、全体は取りこぼしの種 (misses) の候補になる。
+        lexical_top = await _search_lexical_seat_layer(
+            cartridge_mgr, query, query_vec, [], LEXICAL_MISS_CANDIDATES,
+            timeout_ms=cart_timeout_ms,
         )
+        lexical_candidate_ids = [e[0] for e in lexical_top]
+        taken = {entry[0] for entry in corpus_entries}
+        candidates = [e for e in lexical_top if e[0] not in taken][:seats]
+        # 棒は他の corpus チャンクと同じ keep floor (絶対の棒 ∨ 本体 top1 の相対)。
+        seat_bar = _resolve_keep_floor(
+            rag_cfg, corpus_thresholds,
+            top_raw_score=max((e[1] for e in corpus_entries), default=0.0),
+        )
+        seat_entries = [e for e in candidates if e[1] >= seat_bar]
+        if seat_entries:
+            logger.info(
+                "Lexical seat: %d chunk(s) placed ahead by the inverted index (cosine %s >= bar %.3f)",
+                len(seat_entries), ", ".join(f"{e[1]:.3f}" for e in seat_entries), seat_bar,
+            )
+            corpus_entries = list(corpus_entries) + seat_entries
+
+    # Step 3d: 疑似クエリの関連性ゲート (f_01 §6.6)。この問いに棒を越える
+    # 疑似クエリが 1 本も無ければ、corpus は今回の話題と無関係と見て本体側の
+    # 候補ごと引かない。本体 cosine では無関係な問いと正解が重なるが
+    # (off-topic top1 max 0.575 / 正解 p25 0.56)、問い↔問いは分離する。
+    corpus_gated = False
+    if pq_gate is not None and (corpus_entries or pseudo_entries):
+        top_pq = max((entry[1] for entry in pseudo_entries), default=0.0)
+        passes = top_pq >= pq_gate
+        top_body = max((entry[1] for entry in corpus_entries), default=0.0)
+        if not passes and not pq_veto:
+            # 充足率が低い間は疑似クエリを持たないチャンクへの問いが pq を
+            # 持てないので、本体 top1 が正解 top1 の p50 (confidence) を越える
+            # ことも、転置索引の席が立ったこと (固有語の一致) も「話題が合う」
+            # 信号として認める (f_01 §6.6 / §8.1 の 4.3、2026-09-12 (b))。
+            passes = top_body >= on_topic_bar or bool(seat_entries)
+        if not passes:
+            logger.info(
+                "Pseudo-query gate: corpus skipped (top pq cosine %.3f < gate %.3f, "
+                "top body %.3f < on_topic %.3f, coverage veto=%s) for query: %s",
+                top_pq, pq_gate, top_body, on_topic_bar, pq_veto,
+                query[:50],
+            )
+            corpus_entries = []
+            pseudo_entries = []
+            corpus_gated = True
 
     # Step 4: ストア横断のマージ。順位式は 1 本 (c_16 §7.2) なので、層内正規化
     # (``rag.score_normalization``) も RRF も要らない。``merged`` は順位付け用
@@ -1017,6 +1323,28 @@ async def unified_search(
     # (品質判定 / gate / floor 用)。2 つは同じ id 集合を指すので、片方で落とした
     # ものをもう片方へ射影する下流の手順が id で完全に揃う。
     merged_entries = _merge_results(epi_entries, corpus_entries)
+    # Step 4.2 / 4.3: 疑似クエリ由来と転置索引の席を先頭に位置で interleave
+    # (f_01 §6.3 / §8.1 の 4.3)。席は疑似クエリの後ろ。
+    # 疑似クエリ由来を先頭に置くのは充足率 ≥ gate_min_coverage のときだけ —
+    # 充足が薄い間は正解チャンクに問いが無く、近くの別チャンクの問いが先頭を
+    # 取って recall@5 が 0.617 → 0.511 に落ちる (f_01 §6.3、2026-09-12 (b))。
+    # 未充足の間は本体の後ろに並べる (floor は従来どおり pq_gate)。
+    pq_lead = _pseudo_query_may_lead(cartridge_mgr, rag_cfg)
+    if not pq_lead and pseudo_entries:
+        # 本体の後ろに並べても品質 low の経路が cosine 降順で並べ直すため先頭へ
+        # 戻る。未充足の間は候補から外す (実測: 「後ろ」と「無し」は同値 0.617)。
+        # 例外は取りこぼした問いの言い換え (from_hint) が最良だったもの —
+        # その問いの答えのチャンクに、その問いから作った言い換えなので、近くの
+        # 別チャンクの問いが勝つ失敗形には当たらない (f_01 §6.3)。
+        kept = [e for e in pseudo_entries if e[0] in hinted_pq_ids]
+        logger.debug(
+            "Pseudo-query entries dropped from the candidates (%d of %d, coverage "
+            "below gate_min_coverage; %d hinted kept)",
+            len(pseudo_entries) - len(kept), len(pseudo_entries), len(kept),
+        )
+        pseudo_entries = kept
+    head = list(pseudo_entries) + [e for e in seat_entries if not corpus_gated]
+    merged_entries = _interleave_pseudo(head, merged_entries)
     merged = rank_view(merged_entries)
     merged_raw = gate_view(merged_entries)
     logger.debug("Step 4 merge: %d unique results after dedup", len(merged_raw))
@@ -1110,12 +1438,43 @@ async def unified_search(
     #
     # ``quality`` の役割は「フロアを掛けるか」ではなく「フロアを通ったものが
     # 1 件も無いときにどう扱うか」に限定する。
-    floor = _resolve_keep_floor(
+    # 疑似クエリ由来 (f_01 §6.3) は cosine が問い↔問いのスケールなので、
+    # (a) 相対の棒の top1 には数えない — 本体側の弱い兄弟を高い棒で消さない、
+    # (b) 自身は絶対の棒 (top1 を渡さない = 相対 0 / 弱い集合の上乗せ無し)
+    # だけを越えればよい。同じ棒に 2 つのスケールを流さないための分岐。
+    # 棒はストア別 (f_01 §6.6): episodic は記憶側の較正、corpus 本体は corpus 側の
+    # 較正 (未較正なら記憶側)。相対の棒の top1 も同じストアの候補から取る。
+    pseudo_ids = {entry[0] for entry in pseudo_entries}
+    corpus_ids = {
+        cid for cid, _, _ in merged_raw
+        if cid not in pseudo_ids and _store_of(cid) == "corpus"
+    }
+    floor_epi = _resolve_keep_floor(
         rag_cfg, thresholds,
-        top_raw_score=max((s for _, s, _ in merged_raw), default=0.0),
+        top_raw_score=max(
+            (s for cid, s, _ in merged_raw if cid not in pseudo_ids and cid not in corpus_ids),
+            default=0.0,
+        ),
     )
+    floor_corpus = _resolve_keep_floor(
+        rag_cfg, corpus_thresholds,
+        top_raw_score=max((s for cid, s, _ in merged_raw if cid in corpus_ids), default=0.0),
+    )
+    floor_pseudo = (
+        pq_gate if pq_gate is not None
+        else _resolve_keep_floor(rag_cfg, corpus_thresholds, top_raw_score=0.0)
+    )
+
+    def _floor_for(cid: str) -> float:
+        if cid in pseudo_ids:
+            return floor_pseudo
+        return floor_corpus if cid in corpus_ids else floor_epi
+
+    floor = max(floor_epi, floor_corpus)
     if floor > 0.0:
-        kept_ids = {cid for cid, score, _ in merged_raw if score >= floor}
+        kept_ids = {
+            cid for cid, score, _ in merged_raw if score >= _floor_for(cid)
+        }
         passed = [t for t in merged if t[0] in kept_ids]
         if len(passed) != len(merged):
             logger.info(
@@ -1151,6 +1510,11 @@ async def unified_search(
             sources=[],
             quality=quality,
             from_memory=bool(epi_entries),
+            corpus_gated=corpus_gated,
+            lexical_candidate_ids=lexical_candidate_ids,
+            # corpus の候補があったのに棒で全部落ちた (f_01 §6.4 の misses の引き金)。
+            # 較正済みでゲートを通った場合だけ (未較正では話題の判定が無い)。
+            corpus_starved=pq_gate is not None and bool(corpus_ids),
         )
 
     # Step 7: 最終順位付け (merged は順位式のスコア降順) から top_k 件を採用。
@@ -1161,16 +1525,36 @@ async def unified_search(
     # 候補生成が転置索引を ``EvidenceStore`` の内部へ取り込んだ結果 (c_16 §6.3:
     # lexical はスコアを持ち込まない)、どの候補が語彙由来かが外へ出てこなくなった。
     final_sources = merged[:top_k]
+    # 転置索引の席 (f_01 §8.1 の 4.3): 棒を越えて残った席が中間の並べ替えで
+    # top_k の外へ出ていたら、末尾の 1 席と入れ替える (席は位置の予約であって
+    # スコアではない)。
+    if seat_entries and not corpus_gated:
+        seat_ids = {entry[0] for entry in seat_entries}
+        chosen = {cid for cid, _, _ in final_sources}
+        for entry in merged[top_k:]:
+            if entry[0] in seat_ids and entry[0] not in chosen and final_sources:
+                final_sources = final_sources[:-1] + [entry]
+                chosen.add(entry[0])
+                if len(chosen & seat_ids) >= len(seat_ids):
+                    break
 
     # Step 7.6: 採用ノートが後続の訂正で上書きされているなら、訂正も一緒に出す。
     # top_k で切った **後** に足す — 訂正は席を争う候補ではなく随伴情報であり、
     # floor / top_k のどちらで落ちても「訂正前の値だけが残る」状態になる。
     final_sources = attach_superseding_corrections(episodic, final_sources)
+    # Step 7.65: 採用した corpus チャンクに直前チャンク (同文書・同大節) の末尾を
+    # 「(前の文脈)」として随伴させる (f_01 §8.1 の 7.65)。席を争わない随伴。
+    final_sources = attach_previous_chunk_context(
+        cartridge_mgr, final_sources,
+        tail_chars=int(rag_cfg.get("previous_context_chars", 300) or 0),
+    )
 
     # Step 7.7: 実際に注入した id を「使った」バッファへ入れる (c_16 §2.1)。
     # ``last_used_at`` をここでディスクへ書くと応答パスが書き手になってしまう
     # ので、書くのは sleep-time の ``flush_touch`` (1 事象に畳む)。
     _record_episodic_usage(episodic, final_sources)
+    if pseudo_enabled:
+        _record_corpus_hits(cartridge_mgr, final_sources)
 
     logger.info(
         "Search completed: %d results, quality=%s, from_memory=%s",
@@ -1185,9 +1569,46 @@ async def unified_search(
         sources=final_sources,
         quality=quality,
         from_memory=bool(epi_entries),
-        top_raw_score=_top_raw_score(final_sources, merged_raw),
+        top_raw_score=_top_raw_score(
+            final_sources, merged_raw,
+            body_entries=[*epi_entries, *corpus_entries], pseudo_ids=pseudo_ids,
+        ),
         evidence_ids=evidence_ids_of(final_sources),
+        corpus_gated=corpus_gated,
+        pseudo_derived=sum(1 for cid, _, _ in final_sources if cid in pseudo_ids),
+        lexical_candidate_ids=lexical_candidate_ids,
+        # 較正済みのゲートを通った (話題は合う) のに注入ゼロ。未較正の構成では
+        # 「話題が合う」の判定が無いので立てない (無関係な問いに注記を付けない)。
+        corpus_starved=pq_gate is not None and bool(corpus_ids) and not any(
+            cid in corpus_ids for cid, _, _ in final_sources
+        ),
     )
+
+
+async def _empty_layer() -> list[StoreEntry]:
+    return []
+
+
+async def _empty_pseudo_layer() -> tuple[list[StoreEntry], set[str]]:
+    return [], set()
+
+
+def _record_corpus_hits(
+    cartridge_mgr, sources: list[tuple[str, float, str]],
+) -> None:
+    """注入した corpus チャンク id を疑似クエリの lazy 生成対象へ溜める (f_01 §6.4)。
+
+    プロセス内バッファで、ディスクには sleep-time Step 5.9 が書く。
+    """
+    if cartridge_mgr is None or not hasattr(cartridge_mgr, "record_pq_hits"):
+        return
+    ids = [cid for cid, _, _ in sources if _store_of(cid) == "corpus"]
+    if not ids:
+        return
+    try:
+        cartridge_mgr.record_pq_hits(ids)
+    except Exception as e:  # noqa: BLE001 — 観測のための記録で応答を止めない
+        logger.warning("Failed to record corpus hits: %s", e)
 
 
 def _record_episodic_usage(
@@ -1214,6 +1635,9 @@ def _record_episodic_usage(
 def _top_raw_score(
     final_sources: list[tuple[str, float, str]],
     merged_raw: list[tuple[str, float, str]],
+    *,
+    body_entries: list[StoreEntry] | None = None,
+    pseudo_ids: set[str] | None = None,
 ) -> float | None:
     """採用チャンクの生スコア (cosine スケール) の最大値を返す。
 
@@ -1224,8 +1648,20 @@ def _top_raw_score(
     """
     if not final_sources:
         return None
-    raw_by_id = {cid: score for cid, score, _ in merged_raw}
-    scores = [raw_by_id[cid] for cid, _, _ in final_sources if cid in raw_by_id]
+    # 疑似クエリ由来 (f_01 §6.3) の ``merged_raw`` の値は問い↔問いの cosine で
+    # スケールが違う。``rag_top1_score`` は「検索器の top-1 cosine」(f_04) として
+    # Level 0 経験へ記録され few-shot の fitness / phase3 の入力になるので、
+    # 本体側の候補にも載っていればその cosine を採り、無ければ観測値から外す。
+    body_by_id = {cid: cosine for cid, cosine, _score, _text in (body_entries or [])}
+    excluded = pseudo_ids or set()
+    raw_by_id = {
+        cid: score for cid, score, _ in merged_raw if cid not in excluded
+    }
+    scores = [
+        body_by_id[cid] if cid in body_by_id else raw_by_id[cid]
+        for cid, _, _ in final_sources
+        if cid in body_by_id or cid in raw_by_id
+    ]
     return max(scores) if scores else None
 
 

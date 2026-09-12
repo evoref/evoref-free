@@ -396,6 +396,10 @@ rag:
   # 「広く取って絞る」第1段として候補プールを広げる。LTM は内部で更に *2 する。
   # 目安: LTM 主体なら 2-3 / カートリッジ多装着環境は 1-2。
   fetch_multiplier: 1
+  # 転置索引の上位に予約する corpus の席 (0 で無効、実測は席 1 が最良)
+  lexical_seats: 1
+  # 採用した corpus チャンクに直前チャンク (同節) の末尾 N 字を「(前の文脈)」として随伴 (0 で無効)
+  previous_context_chars: 300
   # --- 順位付け (c_16 §7.2) ---
   # 順位式は 3 ストア (episodic / semantic / corpus) 共通の 1 本:
   #   score = cos × freshness × confidence × store_prior
@@ -411,27 +415,18 @@ rag:
   # 層内正規化も RRF も、層ごとにスケールの違うスコアを持っていたから要った
   # 装置で、順位式が 1 本になった今は指定しても意味が無い (未知キーとして
   # 起動時にエラーになる)。
-  # --- Contextual Retrieval ---
-  # チャンク登録時に補助タスクでドキュメント文脈プレフィックスを生成し、
-  # 埋め込み・BM25 の両方で検索精度を向上させる。
-  # 参考: https://www.anthropic.com/news/contextual-retrieval
-  contextual_prefix:
-    enabled: true                # Contextual Retrieval の有効/無効（補助タスク必須）
-    # eager: Sleep-time Step 5.8 で未生成 chunk を一括生成 (従来動作)
-    # lazy : retrieval 時に hit した chunk のみ on-demand 生成 (大規模カートリッジ向け)
-    mode: eager
-    max_tokens: 128              # プレフィックス生成の最大トークン数
-    max_doc_chars: 6000          # プレフィックス生成時のドキュメント全文上限文字数（超過時はトランケート）。llama.context_size を超えないよう注意
-    batch_size: 10               # sleep-time で 1 回に処理するチャンク数上限
-    # 生成対象の最小チャンクトークン数。短文は prefix の retrieval 寄与が薄いためスキップ
-    min_chunk_tokens: 200
-    # lazy モード時: retrieval でこの回数以上 hit した chunk のみ prefix を永続化
-    lazy_hit_threshold: 2
-    # プレフィックス生成プロンプト。プレースホルダ {document} {chunk} 必須。
-    # 空 (既定) で日本語テンプレートを使用。英語専用 / 中国語専用補助タスク
-    # モデルに切替えた場合はここを補助タスクの学習言語のテンプレートに
-    # 差し替えること (品質低下を防ぐため)。
-    prompt_template: ""
+  # --- 疑似クエリ索引 (f_01 §6) ---
+  # チャンクごとに「このチャンクが答える問い」を sleep-time (Step 5.9) で補助タスクに
+  # 作らせ、その埋め込みを別リストとして検索する (問い↔問いの一致で言い換えに強くなる)。
+  # 応答パスに LLM は入らない。実測: recall@5 0.555 → 0.775 (+1.5ms)。
+  pseudo_query:
+    enabled: true                # 生成と検索の両方 (false で既存索引も引かない)
+    questions_per_chunk: 2       # 1 チャンクあたりの問いの本数
+    max_per_cycle: 50            # Full サイクル 1 回で生成するチャンク数 (27B で 1 件 20 秒級、静穏窓で yield するので大きめ)
+    backfill_per_cycle: 50       # ヒットの無いチャンクも埋める件数 (0 = ヒットしたチャンクだけ)
+    max_chunk_chars: 1200        # 生成プロンプトへ渡す本文の上限文字数
+    gate_min_coverage: 0.5       # 疑似クエリの関連性ゲート (拒否) を有効にする充足率 (較正済みの棒は充足率に依らず使う)
+    quiet_seconds: 60            # チャットが終わってからこの秒数は生成を始めない (静穏窓)
   # --- ベクトル量子化 ---
   # 保持形式は常に int8。本キーは検索時の挙動のみ変える:
   #   int8: 全件 int8 粗検索 (行スケール込み) → 候補のみ float32 rescore の 2 段

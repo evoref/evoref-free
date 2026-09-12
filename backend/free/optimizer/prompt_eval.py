@@ -25,6 +25,7 @@ from backend.free.learning.corrected_pairs import (
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+from backend.free.learning.level0_instant import used_corpus_evidence
 from backend.log_config import get_logger
 
 logger = get_logger("optimizer.prompt_eval")
@@ -113,6 +114,7 @@ def select_prompt_eval_cases(
     mode_exp = [e for e in experiences if e.get("mode") == mode]
     # 訂正された側を引くため、時系列順 (snapshot は append 順 = 時系列) を保つ
     picked: dict[str, PromptEvalCase] = {}
+    grounded_dropped = 0
     for index, exp in enumerate(mode_exp):
         signals = exp.get("signals") or {}
         query = str(exp.get("query") or "").strip()
@@ -120,6 +122,13 @@ def select_prompt_eval_cases(
         if correction:
             corrected = resolve_corrected_turn(mode_exp, index)
             pq = str((corrected or {}).get("query") or "").strip()
+            # 文書チャンク ([参考情報]) を根拠に答えたターンは、system prompt
+            # だけで再生成するゲートでは資料が無く、どの候補でも同じ点になる
+            # (記憶依存の問いと同じ、f_04 §4.5)。疑似クエリ索引で注入率が
+            # 上がったので、印 (gen_config.evidence_ids の corpus:) で外す。
+            if pq and used_corpus_evidence(corrected or {}):
+                grounded_dropped += 1
+                continue
             if pq:
                 correct_value = str(
                     signals.get("correction_correct_value") or "",
@@ -144,6 +153,9 @@ def select_prompt_eval_cases(
                 )
             continue
         if query:
+            if used_corpus_evidence(exp):
+                grounded_dropped += 1
+                continue
             if signals.get("turn_outcome") == "failed":
                 picked[_case_id(query)] = PromptEvalCase(
                     case_id=_case_id(query), query=query, kind=CASE_KIND_FAILED,
@@ -160,10 +172,11 @@ def select_prompt_eval_cases(
     # 足切りと同じ ``depends_on_context`` で落とす。
     cases = [c for c in picked.values() if not depends_on_context(c.query)]
     dropped = len(picked) - len(cases)
-    if dropped:
+    if dropped or grounded_dropped:
         logger.info(
-            "prompt eval: %d context-bound case(s) excluded from the adoption gate",
-            dropped,
+            "prompt eval: %d context-bound / %d corpus-grounded case(s) excluded "
+            "from the adoption gate",
+            dropped, grounded_dropped,
         )
     # dict は挿入順 = 古い順。最新側から limit 件
     return cases[-limit:] if len(cases) > limit else cases

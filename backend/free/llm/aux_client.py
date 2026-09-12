@@ -104,7 +104,8 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "conflict_resolution": 45.0,
     "note_evolution": 60.0,
     "summarize": 90.0,
-    "contextual_prefix": 120.0,
+    # corpus チャンクごとの疑似クエリ生成 (f_01 §6.4、Step 5.9)。
+    "pseudo_query": 60.0,
     "url_relevance_score": 45.0,
     "assertion_naming": 45.0,
     "personal_fact_split": 60.0,
@@ -228,7 +229,7 @@ DEFERRABLE_AUX_PURPOSES: frozenset[str] = frozenset({
     "conflict_resolution",
     "note_evolution",
     "summarize",
-    "contextual_prefix",
+    "pseudo_query",
     "url_relevance_score",
     "assertion_naming",
     "personal_fact_split",

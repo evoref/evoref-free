@@ -828,6 +828,12 @@
 		"not_met": "未充足",
 		"no_data": "データなし"
 	},
+	"sources": {
+		"title": "参考にした資料",
+		"corpus": "資料",
+		"memory": "会話の記憶",
+		"untitled": "(見出しなし)"
+	},
 	"rag_debug": {
 		"title": "RAG チャンク",
 		"search_time": "検索: {ms}ms",

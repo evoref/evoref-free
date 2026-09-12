@@ -223,6 +223,9 @@ class SleepTimeScheduler:
         setter = getattr(worker, "set_chat_in_flight", None)
         if callable(setter):
             setter(self._chat_in_flight)
+        recent = getattr(worker, "set_chat_recent", None)
+        if callable(recent):
+            recent(self._chat_recent)
 
     def set_llm_client(self, client) -> None:
         """Full 版で使用する LLM クライアントを設定（ベースモデル、フォールバック用）"""
@@ -582,6 +585,25 @@ class SleepTimeScheduler:
             return idle_s
         remaining = max(0.0, limit * 60 - self._full_deferred_seconds())
         return min(idle_s, max(_FULL_MIN_WAIT_SEC, remaining))
+
+    def _chat_recent(self, quiet_sec: float) -> bool:
+        """チャット生成が実行中、または終わってから ``quiet_sec`` 秒未満か。
+
+        1 件 20 秒級の生成を繰り返す背景ステップ (Step 5.9 等) は、ターンの
+        合間の数秒に割り込むと次のターンに横取りされ、その往復で GPU を
+        奪い合う (2026-09-12 実測)。「今生成中か」ではなく静穏窓で判定する。
+        """
+        if self._chat_in_flight():
+            return True
+        client = self._llm_client
+        probe = getattr(client, "seconds_since_last_chat", None)
+        if not callable(probe):
+            return False
+        try:
+            since = probe()
+        except Exception:
+            return False
+        return since is not None and since < float(quiet_sec)
 
     def _chat_in_flight(self) -> bool:
         """チャット生成が実行中か。

@@ -22,6 +22,7 @@ from backend.free.core.intent_vocab import (
     conversation_turn_count_question,
     is_whole_session_scope_query,
     referenced_quantity,
+    referenced_sources_question,
     occurrence_count_term,
     self_output_measure_kinds,
 )
@@ -198,7 +199,8 @@ class SearchPipelineResult:
     """検索パイプラインの結果（BUG-9: 成功/失敗/スキップの区別を明確化）"""
 
     __slots__ = (
-        "chunks", "error", "evidence_ids", "query_vec", "rag_top_score",
+        "chunks", "corpus_gated", "corpus_starved", "error", "evidence_ids",
+        "lexical_candidate_ids", "pseudo_derived", "query_vec", "rag_top_score",
         "scored_chunks",
     )
 
@@ -210,6 +212,10 @@ class SearchPipelineResult:
         query_vec=None,
         rag_top_score: float | None = None,
         evidence_ids: list[str] | None = None,
+        corpus_gated: bool = False,
+        pseudo_derived: int = 0,
+        lexical_candidate_ids: list[str] | None = None,
+        corpus_starved: bool = False,
     ):
         self.chunks = chunks
         self.scored_chunks = scored_chunks
@@ -217,6 +223,12 @@ class SearchPipelineResult:
         # [参考情報] 枠へ実際に載せた Evidence の ``<store>:<id>`` (c_16 §5.5)。
         # 学習帰属 (``GenerationConfigRef.evidence_ids``) の corpus / episodic 側。
         self.evidence_ids = list(evidence_ids or [])
+        self.corpus_gated = corpus_gated
+        self.pseudo_derived = pseudo_derived
+        # 転置索引の上位候補 (取りこぼした問いの種、f_01 §6.4 の misses)。
+        self.lexical_candidate_ids = list(lexical_candidate_ids or [])
+        # corpus の候補があったのに棒で全部落ちた turn (misses の第 2 の引き金)。
+        self.corpus_starved = bool(corpus_starved)
         # 採用チャンクの生スコア (cosine) 最大値。``scored_chunks`` 側のスコアは
         # 正規化後で Level 0 シグナルには使えない (SearchResult.top_raw_score 参照)。
         self.rag_top_score = rag_top_score
@@ -320,7 +332,6 @@ async def run_search_pipeline(
             policy=state.policy_interpreter,
             timer=timer,
             semmem_stats=_collect_semmem_stats(state),
-            lazy_contextual=state.lazy_contextual,
             session_id=session_id,
             judge_tracker=state.judge_tracker,
         )
@@ -336,6 +347,10 @@ async def run_search_pipeline(
                 query_vec=query_vec,
                 rag_top_score=search_result.top_raw_score,
                 evidence_ids=search_result.evidence_ids,
+                corpus_gated=search_result.corpus_gated,
+                pseudo_derived=search_result.pseudo_derived,
+                lexical_candidate_ids=search_result.lexical_candidate_ids,
+                corpus_starved=search_result.corpus_starved,
             )
     except Exception as e:
         # 例外の型も書く。``httpx.ReadTimeout()`` / ``asyncio.TimeoutError()``
@@ -353,9 +368,13 @@ async def run_search_pipeline(
         # (2026-09-02 監査 S-A1: 次元不一致のカートリッジ 1 つで再現)。
         return SearchPipelineResult(error=str(e), query_vec=query_vec)
 
-    # necessity judge が retrieve を skip した経路。チャンクは無いが
-    # query_vec は算出済みなので、関連度ゲート用に返す。
-    return SearchPipelineResult(query_vec=query_vec)
+    # necessity judge が retrieve を skip した / 全件落ちた経路。チャンクは
+    # 無いが query_vec は算出済みなので、関連度ゲート用に返す。
+    return SearchPipelineResult(
+        query_vec=query_vec, corpus_gated=search_result.corpus_gated,
+        lexical_candidate_ids=search_result.lexical_candidate_ids,
+        corpus_starved=search_result.corpus_starved,
+    )
 
 
 @dataclass
@@ -1062,6 +1081,75 @@ _CONVERSATION_TERM_COUNT_FACT: dict[str, str] = {
     "en": "\"{term}\" appears {n} time(s) across every turn of this conversation",
 }
 _MEASUREMENT_JOINER: dict[str, str] = {"ja": "、", "en": "; "}
+_CONVERSATION_SOURCES_GUIDANCE: dict[str, str] = {
+    "ja": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " この会話でこれまでに参考情報として"
+        "注入した資料の一覧: {items}。参照した資料や根拠を訊かれたらこの一覧から"
+        "答え、一覧に無い資料名や節を作らないこと。"
+    ),
+    "en": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " Reference material injected so far in "
+        "this conversation: {items}. When asked which sources you used, answer from "
+        "this list only; do not invent document names or sections."
+    ),
+}
+#: 資料の候補はあったのに関連度の棒に届かず 1 件も注入しなかった turn への注記
+#: (f_02 §8、2026-09-12 (b))。根拠なしのまま作話させない。
+_CORPUS_STARVED_GUIDANCE: dict[str, str] = {
+    "ja": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " この問いに対して参考資料の候補は見つかった"
+        "が、関連度が基準に届かず 1 件も注入していない。資料に基づく事実として断定せず、"
+        "資料で確認できていないことを明示すること。推測を事実の形で書かないこと。"
+    ),
+    "en": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " Reference material candidates were found "
+        "for this question but none cleared the relevance bar, so nothing was injected. "
+        "Do not state document facts as confirmed; say explicitly that the material "
+        "could not be verified, and do not present guesses as facts."
+    ),
+}
+_CONVERSATION_SOURCES_NONE: dict[str, str] = {
+    "ja": "資料は注入していない (この会話の回答は参考情報なしで生成した)",
+    "en": "none (no reference material was injected in this conversation)",
+}
+_CONVERSATION_SOURCES_MEMORY: dict[str, str] = {
+    "ja": "会話の記憶 {n} 件",
+    "en": "{n} conversation memory note(s)",
+}
+#: 台帳 1 行の先頭。N はユーザー発話の通し番号 (質問の番号)。
+_CONVERSATION_SOURCES_TURN: dict[str, str] = {
+    "ja": "質問{n}",
+    "en": "question {n}",
+}
+
+
+def _format_session_sources(ledger: list[dict]) -> str:
+    """台帳を「質問 N: パッケージ / 文書「見出し」」の並びに整形する (純粋関数)。
+
+    N はユーザー発話の通し番号 (``session_user_turn_count``)。
+    """
+    if not ledger:
+        return _localized(_CONVERSATION_SOURCES_NONE)
+    parts: list[str] = []
+    memory_notes = 0
+    seen: set[tuple] = set()
+    for entry in ledger:
+        if entry.get("store") != "corpus":
+            memory_notes += 1
+            continue
+        key = (entry.get("turn"), entry.get("doc_id"), entry.get("heading"))
+        if key in seen:
+            continue
+        seen.add(key)
+        label = " / ".join(
+            p for p in (entry.get("package_name"), entry.get("doc_id")) if p
+        ) or "corpus"
+        heading = entry.get("heading") or ""
+        turn_label = _localized(_CONVERSATION_SOURCES_TURN).format(n=entry.get("turn"))
+        parts.append(f"{turn_label}: {label}" + (f"「{heading}」" if heading else ""))
+    if memory_notes:
+        parts.append(_localized(_CONVERSATION_SOURCES_MEMORY).format(n=memory_notes))
+    return "; ".join(parts) if parts else _localized(_CONVERSATION_SOURCES_NONE)
 
 
 def _append_conversation_measurement(
@@ -1115,6 +1203,30 @@ def _append_conversation_measurement(
                 term=term, n=count_term_in_session(session_id, term),
             ),
         )
+    from backend.free.api.chat.chat_recorder import turn_rag_meta
+
+    rag_meta = turn_rag_meta(session_id) if session_id else None
+    if rag_meta and rag_meta.get("corpus_starved"):
+        # 資料の候補はあったのに注入ゼロ → 根拠なしのまま作話させない (f_02 §8)。
+        if append_to_last_user(messages, _localized(_CORPUS_STARVED_GUIDANCE)):
+            logger.info(
+                "Corpus starved: candidates existed but none cleared the bar; "
+                "grounding note appended so the answer does not fabricate",
+            )
+    if referenced_sources_question(query):
+        # 注入した資料は履歴に残らない (user メッセージへ一時的に付くだけ) ので、
+        # 「この会話で参照した資料は」はモデルには原理的に答えられない。
+        # 台帳 (chat_recorder.session_sources) から決定論で添える。
+        from backend.free.api.chat.chat_recorder import session_sources
+
+        if append_to_last_user(
+            messages,
+            _localized(_CONVERSATION_SOURCES_GUIDANCE).format(
+                items=_format_session_sources(session_sources(session_id)),
+            ),
+            separator="",
+        ):
+            logger.info("Conversation sources ledger injected (session=%s)", session_id)
     if not parts:
         return
     if append_to_last_user(

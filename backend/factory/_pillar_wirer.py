@@ -590,6 +590,20 @@ def _init_cartridge_manager(state: AppState, cfg: dict[str, Any], resolver: Any)
             "CorpusStore initialized: dir=%s, installed=%d, loaded=%d",
             corpus_dir, len(cart_mgr.list_cartridges()), cart_mgr.loaded_count,
         )
+        # corpus 側の較正 (f_01 §6.6): 署名一致のキャッシュは構築時に読んでいる。
+        # 無ければ (疑似クエリが増えた / モデル切替) バックグラウンドで導き直す。
+        # カナリア発話の埋め込みが要るので起動は待たせない。
+        if (
+            state.embedder is not None
+            and cart_mgr.loaded_count > 0
+            and cart_mgr.corpus_calibration() is None
+        ):
+            try:
+                asyncio.create_task(
+                    cart_mgr.recalibrate_corpus(), name="corpus_calibration",
+                )
+            except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
+                logger.info("Corpus calibration deferred: no running event loop")
     except Exception as e:
         logger.warning("CorpusStore init skipped: %s", e)
 
@@ -788,60 +802,6 @@ async def _check_embedding_dim(state: AppState, cfg: dict[str, Any]) -> None:
             "Auto reindex failed: %s. RAG remains in degraded state. "
             "Run 'evoref reindex' manually.", e,
         )
-
-
-def _init_lazy_contextual(
-    state: AppState,
-    cfg: dict[str, Any],
-    vector_store: "VectorStore | None",
-    embedder: "EmbeddingBackend | None",
-) -> None:
-    """LazyContextualPrefixService を初期化する
-
-    ``rag.contextual_prefix.enabled=true`` かつ ``mode=lazy`` のときのみ
-    構築する。それ以外はスキップし ``state.lazy_contextual`` は ``None``
-    のままで、search_pipeline 側の hook は自動的に no-op 化される。
-    ``aux_client`` / ``embedder`` / ``vector_store`` のいずれかが
-    欠落していても no-op。
-    """
-    rag_cfg = cfg.get("rag", {}) or {}
-    cp_cfg = rag_cfg.get("contextual_prefix", {}) or {}
-    enabled = bool(cp_cfg.get("enabled", True))
-    mode = str(cp_cfg.get("mode", "eager"))
-    if not (enabled and mode == "lazy"):
-        logger.info(
-            "LazyContextualPrefixService not initialized "
-            "(enabled=%s, mode=%s)", enabled, mode,
-        )
-        return
-    if not (state.aux_client and embedder and vector_store):
-        logger.info(
-            "LazyContextualPrefixService init skipped: "
-            "aux_client=%s, embedder=%s, vector_store=%s",
-            state.aux_client is not None,
-            embedder is not None,
-            vector_store is not None,
-        )
-        return
-    try:
-        from backend.free.rag.contextual_prefix import ContextualPrefixGenerator
-        from backend.free.rag.lazy_contextual import LazyContextualPrefixService
-
-        generator = ContextualPrefixGenerator(state.aux_client, cfg)
-        service = LazyContextualPrefixService(
-            generator=generator,
-            embedder=embedder,
-            vector_store=vector_store,
-            config=cfg,
-            debug_logger=state.debug_logger,
-        )
-        state.lazy_contextual = service
-        logger.info(
-            "LazyContextualPrefixService initialized (mode=%s, threshold=%d, min_tokens=%d)",
-            service.mode, service.lazy_hit_threshold, service.min_chunk_tokens,
-        )
-    except Exception as e:  # pragma: no cover
-        logger.warning("LazyContextualPrefixService init skipped: %s", e)
 
 
 def _init_memory_threshold_calibration(
@@ -1166,19 +1126,32 @@ def _init_learning_scheduler(
         # instruction-aware のときのみ有効。未注入時は記録済み rag_top1_score 平均へ
         # degrade する。
         if (
-            state.vector_store is not None
-            and hasattr(state.embedder, "supports_instructions")
+            hasattr(state.embedder, "supports_instructions")
             and state.embedder.supports_instructions()
         ):
-            from backend.free.rag.embed_instruction_eval import EmbedInstructionEval
+            from backend.free.rag.embed_instruction_eval import (
+                EmbedInstructionEval,
+                PseudoQueryEmbedEval,
+            )
             _emb_cfg = cfg.get("embedding", {}) or {}
-            learning_scheduler.set_embed_eval(EmbedInstructionEval(
-                embedder=state.embedder,
-                vector_store=state.vector_store,
-                query_template=_emb_cfg.get(
-                    "query_template", "Instruct: {task}\nQuery: {query}",
-                ),
-            ))
+            _template = _emb_cfg.get(
+                "query_template", "Instruct: {task}\nQuery: {query}",
+            )
+            cart_mgr = getattr(state, "cartridge_manager", None)
+            # 疑似クエリ索引 (問い → 正解チャンク) があればラベル付きの
+            # recall@k を fitness にする (f_01 §6 / f_04 §4)。無ければ従来の
+            # 単独 VectorStore での top1 平均。
+            if cart_mgr is not None and cart_mgr.pq_coverage() > 0.0:
+                learning_scheduler.set_embed_eval(PseudoQueryEmbedEval(
+                    cart_mgr, state.embedder, query_template=_template,
+                    top_k=int((cfg.get("rag") or {}).get("top_k", 5) or 5),
+                ))
+            elif state.vector_store is not None:
+                learning_scheduler.set_embed_eval(EmbedInstructionEval(
+                    embedder=state.embedder,
+                    vector_store=state.vector_store,
+                    query_template=_template,
+                ))
 
     # 7f-1b'. base prompt 採用ゲートの実測評価器 (Level 1 phase1、f_04 §4.5)
     # 欠陥率 fitness は候補に無反応なので、採用は「現行 vs 最良候補を失敗ケースで
@@ -2342,7 +2315,7 @@ def _build_gen_pillar_retrieval(
     mem: "MemPillar",
     timings: dict[str, float],
 ) -> None:
-    """Gen pillar の retrieval 層 (lazy contextual / 閾値較正)。
+    """Gen pillar の retrieval 層 (閾値較正)。
 
     Mem pillar の ``vector_store`` / ``cartridge_manager`` に依存するため、
     Mem 構築後に呼び出す。
@@ -2353,9 +2326,6 @@ def _build_gen_pillar_retrieval(
     """
     cfg = base.cfg
 
-    vector_store = state.vector_store
-    with _timed(timings, "lazy_contextual"):
-        _init_lazy_contextual(state, cfg, vector_store, gen.embedder)
     with _timed(timings, "memory_threshold_calibration"):
         _init_memory_threshold_calibration(
             base.resolver, cfg, mem.episodic_memory, gen.embedder,
@@ -2786,7 +2756,7 @@ async def wire_pillars(
         ``EvorefGen → EvorefMem ← EvorefLoop ← EvorefLearn``
 
     実際の構築順は Gen core → Mem → Gen retrieval → Learn → Loop で、
-    retrieval (語彙索引 / lazy contextual) のみ Mem (vector_store) への
+    retrieval (閾値較正) のみ Mem (vector_store) への
     依存のため Mem 構築後に Gen pillar へ事後付与する。
 
     各フェーズの所要時間は ``timings`` dict に記録し、pillar 単位のサマリ
@@ -2831,7 +2801,7 @@ async def wire_pillars(
     )
     state.mem = mem
 
-    # Gen retrieval (Mem 依存): 語彙索引 / lazy contextual / 閾値較正
+    # Gen retrieval (Mem 依存): 閾値較正
     with _timed(timings, "pillar_gen_retrieval"):
         _build_gen_pillar_retrieval(state, base, gen, mem, timings)
 
