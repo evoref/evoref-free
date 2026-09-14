@@ -95,6 +95,9 @@ _VALUE_UPDATE_RE = re.compile(
     r"(?:です|でした|にします|にしました|になりました|に変わりました|に変更|へ変更|にした)",
 )
 
+#: ひらがなだけの span。1 文字の旧値を採るかの判定に使う (下記参照)。
+_HIRAGANA_ONLY_RE = re.compile(r"^[ぁ-ゖー]+$")
+
 
 def value_update_spans(content: str) -> tuple[str, str] | None:
     """「X ではなく Y」型の本人の値更新から ``(旧値, 新値)`` を取る (純粋関数)。
@@ -111,7 +114,22 @@ def value_update_spans(content: str) -> tuple[str, str] | None:
         return None
     old = m.group("old").strip()
     new = m.group("new").strip()
-    if len(old) < 2 or len(new) < 1:
+    if not old or not new:
+        return None
+    # 1 文字の旧値を長さだけで落とさない。日本語の続柄・色・方角は 1 文字が
+    # 普通 (妻 / 夫 / 父 / 母 / 兄 / 姉 / 弟 / 妹 / 赤 / 青 / 北 / 南) で、
+    # ``len(old) < 2`` はそれを全部捨てていた。実インシデント (2026-09-14
+    # ライブ監査 F-02): 「妻ではなく夫です」で正規表現は ('妻', '夫') を
+    # 取れているのにガードが None を返し、``value_update`` が立たないまま
+    # Step 8 の「旧値を含む世代だけ畳む」フィルタが素通りして
+    # ``mem.personal.family`` の live 3 件 (息子の学年を含む) が
+    # 「夫です。私の書き間違い」1 件に畳まれ、息子の情報が消えた。
+    #
+    # 代わりに **ひらがな 1 文字だけ** を落とす — 「走るのではなく歩きます」
+    # の ``の`` のような機能語の断片がこの形になる。語彙を列挙して網目を
+    # 細かくする方向ではなく、字種で決める (実質名詞の 1 文字は漢字 /
+    # カタカナ / 英数で書かれる)。
+    if len(old) == 1 and _HIRAGANA_ONLY_RE.match(old):
         return None
     return old, new
 

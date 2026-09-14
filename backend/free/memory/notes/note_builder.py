@@ -1057,6 +1057,12 @@ def is_multi_valued_subject(
     """``subject`` が **並列多値スロット** (``multi_valued: true``) か (純粋関数)。
 
     :func:`is_single_valued_subject` と同じ解決。宣言が無ければ ``False``。
+
+    **フォールバックスロット (``mem.<kind>.user``) は宣言に依らず多値。**
+    属性を解決できなかった発話の寄せ場なので、並ぶ値は互いに無関係
+    (「朝型です」と「オンライン会議が好き」)。single / multi どちらの宣言も
+    無い = ``from_correction`` の訂正が来ると **全兄弟を畳む** 経路に入り、
+    無関係な値が巻き添えで消える (2026-09-14 監査 F-12、F-02 と同型)。
     """
     if not subject:
         return False
@@ -1066,6 +1072,10 @@ def is_multi_valued_subject(
     fact_type = _ATTR_FACT_TYPE_BY_KIND.get(parts[1])
     if fact_type is None:
         return False
+    from backend.free.memory.attribute_key import is_generic_slot
+
+    if is_generic_slot(subject):
+        return True
     if triggers_dir is None:
         triggers_dir = _DEFAULT_TRIGGERS_DIR
     attrs = get_fact_attributes(resolve_fact_attributes_path(triggers_dir))

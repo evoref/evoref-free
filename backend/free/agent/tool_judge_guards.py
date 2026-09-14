@@ -779,6 +779,10 @@ def _suppress_hidden_tool_from_aux(
     )
     return ToolJudgement(tool_needed=False, source=result.source)
 
+#: 分類器が式の代わりに返す占位語。式として評価できないので no_tool へ倒す。
+_EXPRESSION_PLACEHOLDERS = frozenset({"none", "null", "nil", "n/a", "na", "なし", "無し"})
+
+
 def _suppress_expressionless_calculate(
     result: ToolJudgement, ctx: GuardContext,
 ) -> ToolJudgement:
@@ -797,11 +801,14 @@ def _suppress_expressionless_calculate(
     """
     if not result.tool_needed or result.tool_name != "calculate":
         return result
-    if (result.tool_args or {}).get("expression"):
+    expression = str((result.tool_args or {}).get("expression") or "").strip()
+    # 分類器が式の代わりに占位語を返す (実機 2026-09-12: ``expression: "none"``
+    # → ``Unsafe expression (unknown name: none)`` でツール失敗)。
+    if expression and expression.lower() not in _EXPRESSION_PLACEHOLDERS:
         return result
     logger.info(
-        "Suppressing calculate with no expression argument; "
-        "downgrading to no_tool",
+        "Suppressing calculate with no usable expression argument (%r); "
+        "downgrading to no_tool", expression,
     )
     return ToolJudgement(
         tool_needed=False,

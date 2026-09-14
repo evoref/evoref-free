@@ -3,8 +3,10 @@
 Level 1 phase1 の採用ゲート (f_04 §4.5) の実体。候補 system prompt で失敗した
 実ターンの query を **ベースモデルの専有スロット** (``background_slot``) で再生成
 し、その応答を ``AuxClient`` (purpose=``prompt_candidate_judge``、文法制約 JSON)
-に採点させる。現行と候補を同じケース・同じ judge で採点し、呼出側は差だけを
-使う。
+に採点させる (絶対採点、``score_prompt``)。一対比較 (``compare_prompts`` /
+``compare_with_noise_floor``) は LLM judge を使わず、
+``core.text_quality.count_response_defects`` の決定論の欠陥数で勝敗を付ける
+(2026-09-14: judge は同一 prompt 同士で ±2 振れ、判別力が無かった)。
 
 本クラスは ``backend.free.optimizer.prompt_eval.PromptEvalProtocol`` を**明示
 継承しない** (構造的部分型で満たす)。Gen pillar が Learn pillar の Protocol を
@@ -20,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from backend.free.llm.aux_client import AuxClient
 from backend.free.llm.json_extract import extract_json_object
+from backend.free.core.text_quality import response_defect_total
 from backend.free.llm.json_schemas import PromptCandidateJudgement
 from backend.free.llm.utils import extract_content
 from backend.log_config import get_logger
@@ -58,6 +61,13 @@ _KIND_HINT_TEMPLATES: dict[str, str] = {
     "correction": "この応答の後、ユーザーは次のように訂正しました: {hint}",
     "rephrase": "ユーザーはこの後、同じ質問を言い直しました (最初の応答が噛み合っていなかった)。",
     "failed": "元の応答は途中で壊れる / 未完のまま終わりました。",
+    # 明示評価の 👎 (f_04 §3.2.3)。テンプレートが無いと ``_judge_one`` は
+    # ``tmpl`` が空なのでヒントを **丸ごと捨てて** いた。本人が失敗と言った
+    # という事実こそが情報なので、一言が無いときも枠だけは渡す
+    # (2026-09-14 監査 F-13)。
+    "user_negative": (
+        "ユーザーはこの応答を「良くない」と評価しました。{hint}"
+    ),
 }
 
 _BARE_SCORE_RE = re.compile(r"(?<![\d.])(?:0(?:\.\d+)?|1(?:\.0+)?)(?![\d.])")
@@ -131,6 +141,67 @@ class PromptCandidateEval:
                 scores[case.case_id] = score
         return scores
 
+    async def compare_prompts(
+        self, current_text: str, candidate_text: str, cases: list[Any],
+    ) -> dict[str, int]:
+        """各ケースを現行 / 候補で再生成し、**決定論の欠陥数** で勝敗を付ける。
+
+        ``{case_id: +1 (候補の欠陥が少ない) | -1 (多い) | 0 (同数 / 同文)}``。
+        生成に失敗したケースは含めない。
+
+        LLM judge (``prompt_pair_judge``) は 2026-09-14 に廃止した。実測で
+        判別力が無く、同一 prompt 同士でも net が ±2 (採用閾値と同じ) 振れ、
+        規則を 1 つ削った劣化版が勝った。欠陥計数は
+        :func:`~backend.free.core.text_quality.count_response_defects`
+        (復唱 / 末尾定型文 / 打ち切り / 参考情報への言及 / 崩れ / 内部ラベル …) で、
+        規則台帳が謳う性質と一対一に対応し、本文の分岐に影響されにくい。
+        """
+        if not cases or not current_text.strip() or not candidate_text.strip():
+            return {}
+        cur_outs = await self._regenerate_all(current_text, cases, "regenerate:current")
+        cand_outs = await self._regenerate_all(candidate_text, cases, "regenerate:candidate")
+        return self._verdicts(cases, cur_outs, cand_outs)
+
+    async def compare_with_noise_floor(
+        self, current_text: str, candidate_text: str, cases: list[Any],
+    ) -> tuple[dict[str, int], dict[str, int]]:
+        """候補の勝敗と、**現行 vs 現行** (カナリア) の勝敗を同じケースで返す。
+
+        長文の再生成は temperature=0 でも途中で分岐する (実測 2026-09-14:
+        683 字の応答が 77 文字目から分岐) ので、決定論の欠陥計数でも同一 prompt
+        同士で差が出うる。その差を雑音フロアとして呼出側に渡し、候補の差が
+        それを超えないかぎり採用しない。再生成は 3 バッチ (現行 A / 現行 B /
+        候補) で、現行 A を候補との比較にも使う。
+
+        Returns:
+            ``(候補の勝敗, カナリアの勝敗)``。どちらも ``compare_prompts`` と同じ形。
+        """
+        if not cases or not current_text.strip() or not candidate_text.strip():
+            return {}, {}
+        cur_a = await self._regenerate_all(current_text, cases, "regenerate:current")
+        cur_b = await self._regenerate_all(current_text, cases, "regenerate:canary")
+        cand = await self._regenerate_all(candidate_text, cases, "regenerate:candidate")
+        return self._verdicts(cases, cur_a, cand), self._verdicts(cases, cur_a, cur_b)
+
+    @staticmethod
+    def _verdicts(
+        cases: list[Any], base: dict[str, str | None], other: dict[str, str | None],
+    ) -> dict[str, int]:
+        """``other`` が ``base`` より欠陥が少なければ +1、多ければ -1、同数 / 同文なら 0。"""
+        verdicts: dict[str, int] = {}
+        for case in cases:
+            a = base.get(case.case_id)
+            b = other.get(case.case_id)
+            if a is None or b is None:
+                continue
+            if a.strip() == b.strip():
+                verdicts[case.case_id] = 0
+                continue
+            da = response_defect_total(a, case.query)
+            db = response_defect_total(b, case.query)
+            verdicts[case.case_id] = 1 if db < da else (-1 if db > da else 0)
+        return verdicts
+
     def _aborted(self, done: int, total: int, stage: str) -> bool:
         if self._should_abort is None or not self._should_abort():
             return False
@@ -139,6 +210,21 @@ class PromptCandidateEval:
             stage, done, total,
         )
         return True
+
+    async def _regenerate_all(
+        self, prompt_text: str, cases: list[Any], stage: str,
+    ) -> dict[str, str | None]:
+        """同じ system prompt で全ケースを続けて再生成する (接頭辞 KV を保つ)。
+
+        ケース間で ``should_abort`` を見て中断する。中断した残りは ``None``
+        (呼出側は両側が揃ったケースだけを judge に回す)。
+        """
+        outs: dict[str, str | None] = {}
+        for case in cases:
+            if self._aborted(len(outs), len(cases), stage):
+                break
+            outs[case.case_id] = await self._regenerate(prompt_text, case.query)
+        return outs
 
     async def _regenerate(self, prompt_text: str, query: str) -> str | None:
         """候補 system prompt で query を再生成する (greedy、背景スロット)。"""

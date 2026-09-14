@@ -80,7 +80,10 @@ from backend.free.core.session_mode import (
     normalize_session_mode,
 )
 from backend.free.core.sse import SSEFrameBuilder
-from backend.free.agent.deliberative import DeliberativeAgent
+from backend.free.agent.deliberative import (
+    DeliberativeAgent,
+    query_short_circuits_tool_judge,
+)
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
 from backend.free.agent.prompt_manager import ensure_static_directives
 from backend.free.agent.prompt_utils import format_fewshot_section
@@ -721,6 +724,7 @@ async def _run_search_timed(
         return await run_search_pipeline(
             req.message, state, cfg, mode=req.mode, timer=timer,
             session_id=session_id,
+            corpus_mode=getattr(req, "corpus_mode", "auto") or "auto",
         )
     finally:
         timer.stop("search_ms")
@@ -826,7 +830,7 @@ async def _build_messages_with_search(
     session_id: str = "",
 ) -> tuple[
     list, StreamWrapper, str | None,
-    list[tuple[str, float, str]] | None, float | None,
+    list[tuple[str, float, str]] | None, float | None, str,
 ]:
     """統合検索を実行し ``messages`` / SSE 通知ラッパ / semmem ブロック / 取得済み
     scored_chunks / 採用チャンクの生スコア最大値を構築する。``scored_chunks`` は
@@ -861,7 +865,7 @@ async def _build_messages_with_search(
     # 手本の選択も密ベクトルへ揃える。検索で算出済みのクエリ埋め込みを再利用
     # するので追加の埋め込み呼出は無い。記憶検索と手本選択で別々の「関連性」を
     # 使っていると、言い換えただけで手本が外れる (文字 bi-gram の弱点)。
-    if search_result.query_vec is not None:
+    if fewshot_block is None:
         fewshot_block = _resolve_fewshot_block(
             state, req.mode, req.message, search_result.query_vec,
             session_id=session_id,
@@ -971,7 +975,10 @@ async def _build_messages_with_search(
         async for frame in inner_gen:
             yield frame
 
-    return messages, _wrapper, semmem_block, scored_chunks, rag_top_raw_score
+    return (
+        messages, _wrapper, semmem_block, scored_chunks, rag_top_raw_score,
+        fewshot_block,
+    )
 
 
 #: 出典フレームに載せる本文プレビューの長さ。
@@ -1753,9 +1760,11 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             session_id, instance_name, context_size, max_tokens, StageTimer(),
         )
 
-    fewshot_block = _resolve_fewshot_block(
-        state, req.mode, req.message, session_id=session_id,
-    )
+    # few-shot は _build_messages_with_search が 1 度だけ選ぶ (検索のクエリ埋め込み
+    # を再利用)。以前はここで bi-gram 版を先に選んでいたが、deliberative では
+    # 密ベクトル版に置き換わって捨てられ、meta には古い方が渡り、軽量パスでは
+    # 注入していない手本の id が経験に刻まれていた (2026-09-14)。
+    fewshot_block: str | None = None
 
     # classify は conflict 結果に依存しない (req.message のみ) ため先に確定し、
     # 並列モードでの投機タスク (tool 判定 / 検索) 起動のゲートに使う。
@@ -1816,10 +1825,14 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         conflict_task = asyncio.create_task(
             _collect_conflicts_timed(state, cfg, req.mode, timer),
         )
+        # 発話だけで決定論の短絡 (自己構成 / ツール目録 / 台帳の問い等) に落ちる
+        # と分かるターンは投機判定を起動しない — 結果は使われず cancel されるだけ
+        # で、分類器往復 (10〜24 秒) を空撃ちしていた (2026-09-14)。
         if (
             agent_layer != "meta_cognitive"
             and state.tool_call_judge is not None
             and state.tools_registry is not None
+            and not query_short_circuits_tool_judge(req.message)
         ):
             judge_task = asyncio.create_task(
                 state.tool_call_judge.judge(
@@ -1949,7 +1962,10 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         # プロンプトに載っている」を判定して search_history を抑止する
         # (_dispatch_deliberative → process の answered_attributes)。
         covered_attributes: set[str] = set()
-        messages, search_error_wrapper, semmem_block, scored_chunks, rag_top_raw = (
+        (
+            messages, search_error_wrapper, semmem_block, scored_chunks,
+            rag_top_raw, fewshot_block,
+        ) = (
             await _build_messages_with_search(
                 req, state, cfg, system_prompt, history, file_contexts,
                 context_size, max_tokens, timer,

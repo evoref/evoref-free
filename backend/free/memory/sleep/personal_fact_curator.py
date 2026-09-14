@@ -281,8 +281,15 @@ def needs_split(
         resolve_fact_attribute_matches,
     )
 
+    # **スロット数は slug の異なる数で数える** (fact_type は数えない)。同じ
+    # 属性 (beverage) が personal_fact と preference の両節にあると 1 発話が
+    # 両タグに当たるが、それは属性の多様性ではない。``(fact_type, slug)`` で
+    # 数えていたため「コーヒーは苦手で、いつも緑茶を飲んでいます」が 2 と
+    # 数えられて「型付け十分」と誤判定され、分割に出ずに 1 スロットへ
+    # 主語ごと潰れた (2026-09-14 監査 C: 実データ 50 発話で発火 24 → 25 件、
+    # 増えるのはこの形だけ)。
     slots = {
-        (fact_type, slug)
+        slug
         for fact_type in _KIND_BY_FACT_TYPE
         for slug, _ in resolve_fact_attribute_matches(
             content, fact_type, mode="chat",
@@ -309,11 +316,14 @@ def build_prompt(content: str, allowed: dict[str, tuple[str, str]]) -> str:
     """
     slots = "\n".join(f"- {key}" for key in sorted(allowed))
     return (
-        "次の発話から、ユーザー自身の属性を **属性ごとに 1 件ずつ** 取り出して"
-        "ください。\n"
+        "次の発話から、ユーザー自身の属性を **値ごとに 1 件ずつ** 取り出して"
+        "ください。同じ slot の値が発話に複数あれば (嫌いな飲み物と普段飲む"
+        "飲み物、複数の勤務先など)、その数だけ別の件にしてください。\n"
         "slot は下のリストの語をそのまま使うこと (リストに無い slot は禁止)。\n"
         "value は **発話に現れる文字列をそのまま** 抜き出すこと "
-        "(要約・言い換え・補完は禁止)。属性 1 つ分の最小の範囲にすること。\n"
+        "(要約・言い換え・補完は禁止)。属性 1 つ分の **述語を含む最小の節** に"
+        "すること (「コーヒーは苦手」「いつも緑茶を飲んでいます」)。名詞だけ"
+        "(「コーヒー」) に切り詰めない — 好き/苦手・頻度の情報が落ちる。\n"
         "ユーザー本人の属性でないもの (ペット・家族・同僚の値、依頼、質問、"
         "挨拶) は返さないでください。該当が無ければ facts を空にしてください。\n"
         "slot の意味: personal.location は **本人の居住地** (通勤先・旅行先・"
@@ -364,10 +374,16 @@ def accept_items(
     - 表に無い slot (新スロットを生やさない)
     - 発話の逐語 span でない value (幻覚)
     - 文をまたぐ / 発話全体と同じ value (分割になっていない)
-    - 同じスロットの 2 件目 (先勝ち)
+    - 同じスロットの 2 件目 — ただし **単値スロットだけ** (先勝ち)。多値 /
+      未宣言のスロットは値ごとに別件として受ける (「コーヒーは苦手で、いつも
+      緑茶を飲んでいます」は beverage に 2 値。2026-09-14 監査 C: 1 件しか
+      返らないと F-10 の保護で粗い object が残り、主語ごと潰れたまま)
     """
+    from backend.free.memory.notes.note_builder import is_single_valued_subject
+    from backend.free.memory.notes.subject_ns import make_mem_subject
+
     accepted: list[tuple[str, str, str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for item in items:
         resolved = resolve_slot(str(item.get("slot") or ""), allowed)
         if resolved is None:
@@ -395,9 +411,11 @@ def accept_items(
                 value,
             )
             continue
-        if (kind, slug) in seen:
+        single = is_single_valued_subject(make_mem_subject(kind, slug))
+        key = (kind, slug, "" if single else _normalize_ws(value))
+        if key in seen:
             continue
-        seen.add((kind, slug))
+        seen.add(key)
         accepted.append((fact_type, kind, slug, value))
         if len(accepted) >= _MAX_FACTS_PER_NOTE:
             break
@@ -667,10 +685,18 @@ def _supersede_coarser_siblings(
     スロットなので ``persist_facts`` の畳み込みにも掛からず live に戻った。
     """
     folded = 0
+    # この分割で書いた値の id。粗い object を **兄弟の 1 件目** が畳んだ後、
+    # 2 件目が「粗い object は既に畳まれている」と見て兄弟へ畳まれてしまい、
+    # 同じスロットの 2 値 (「コーヒーは苦手」/「いつも緑茶を飲んでいます」) が
+    # live 1 件になっていた (2026-09-14 監査 C の検証)。兄弟は並列の値で
+    # あって世代ではないので、後継がこの分割の兄弟なら継がない。
+    siblings = {new.id for _old, new in refined}
     for old, new in refined:
         if old.id == new.id:
             continue
         successor = getattr(old, "superseded_by", None)
+        if successor and successor in siblings:
+            continue
         if successor and successor != new.id:
             try:
                 store.supersede(new.id, successor)

@@ -17,6 +17,10 @@ from backend.free.core.intent_vocab import (
     refers_to_previous_output,
 )
 from backend.free.core.prompt_blocks import current_datetime_block
+from backend.free.core.relative_date import (
+    DAY_OFFSETS as _DAY_OFFSETS,
+    WEEK_OFFSETS as _WEEK_OFFSETS,
+)
 from backend.free.core.text_quality import (
     carries_no_assertion,
     states_no_user_value,
@@ -237,12 +241,21 @@ def _output_form_note(history: list[ChatMessage]) -> str:
 
 
 #: 日付の解釈を要するクエリのシグナル。明示日付と相対表現の双方を拾う。
+#: 相対語彙は ``core.relative_date`` (解決の SSOT) から導く。手書きで複製して
+#: いたため「あさって」「らいしゅう」等のかな表記が漏れ、接地注記
+#: (``chat_service._append_relative_date_grounding``) とは別の集合になっていた。
+_RELATIVE_DATE_WORDS = "|".join(
+    re.escape(w) for w in sorted(
+        set(_DAY_OFFSETS) | set(_WEEK_OFFSETS), key=len, reverse=True,
+    )
+)
 _DATE_CONTEXT_RE = re.compile(
     r"\d{1,4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日"
     r"|\d{1,2}\s*月\s*\d{1,2}\s*日"
     r"|\d{4}-\d{1,2}-\d{1,2}"
-    r"|今日|本日|明日|明後日|昨日|一昨日|今週|来週|先週|今月|来月|先月"
-    r"|今年|来年|去年|昨年|何日後|何日前|日後|日前|何曜日"
+    r"|" + _RELATIVE_DATE_WORDS +
+    r"|今月|来月|先月|今年|来年|去年|昨年|何日後|何日前|日後|日前|何曜日"
+    r"|\d\s*(?:週間|か月|ヶ月|カ月|ヵ月|年)\s*(?:後|前)"
     r"|(?<![A-Za-z])(?:today|tomorrow|yesterday|this\s+(?:week|month|year))"
     r"(?![A-Za-z])",
 )
@@ -1154,6 +1167,10 @@ def _eligible_rag_indices(
     return kept
 
 
+
+#: 検索パイプライン (Step 4.9) が品質判定の前に同じ資格判定を掛ける入口。
+eligible_rag_indices = _eligible_rag_indices
+
 def _select_rag_block(
     rag_chunks: list[str] | None,
     rag_scored_chunks: list[tuple[str, float, str]] | None,
@@ -1750,6 +1767,13 @@ def build_messages(
     #    user メッセージが無い場合のみ従来どおり system へ結合して情報を落とさない。
     if dyn_parts:
         dyn_text = "\n\n".join(dyn_parts)
+        # 未キャッシュ prefill の内訳を測るため (2026-09-14: 未キャッシュ p50 753
+        # tok のうち semmem / few-shot で説明できるのは 1/3 未満だった)。
+        logger.debug(
+            "dynamic block total: %d tokens (parts=%d, rag=%d)",
+            _estimate_tokens(dyn_text), len(dyn_parts),
+            _estimate_tokens(rag_block) if rag_block else 0,
+        )
         place_after_query = _latest_user_refers_to_previous_output(trimmed)
         if place_after_query:
             logger.debug(

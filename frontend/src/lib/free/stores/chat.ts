@@ -1,5 +1,5 @@
 import { writable, derived, get } from 'svelte/store';
-import type { TokenInfo, RagDebugInfo, SourcesInfo, EditorCodeArtifact } from '$lib/free/api';
+import type { TokenInfo, RagDebugInfo, SourcesInfo, EditorCodeArtifact, CorpusMode } from '$lib/free/api';
 import { switchModeApi } from '$lib/free/api';
 import { MODE_RESTART_STATUS_TIMEOUT_MS } from '$lib/free/constants';
 
@@ -41,6 +41,8 @@ export interface ChatMessage {
 	rag_debug?: RagDebugInfo;
 	/** この応答の [参考情報] に注入した根拠 (常時。develop 限定の rag_debug とは別) */
 	sources?: SourcesInfo;
+	/** ユーザーの明示評価 (👎 / 👍)。UI の表示状態のみ (記録は /api/learning/feedback) */
+	feedback?: 'negative' | 'positive';
 	/** クリエイトモードでの生成コード出力先 ('editor' 既定 / 'chat' 明示指示時) */
 	editor_route?: 'editor' | 'chat';
 	/** long_form 生成の進捗 (ユニット i/total)。生成中のみセットされ常時表示される */
@@ -76,6 +78,25 @@ export const messages = writable<ChatMessage[]>([]);
 
 /** 現在のモード */
 export const currentMode = writable<string>('chat');
+
+/** 文書 (corpus) の参加モード。ロード状態はグローバルなので問い単位で切る (f_01 §8.1)。 */
+const CORPUS_MODE_KEY = 'evoref.corpus_mode';
+function loadCorpusMode(): CorpusMode {
+	try {
+		const v = typeof localStorage !== 'undefined' ? localStorage.getItem(CORPUS_MODE_KEY) : null;
+		return v === 'on' || v === 'off' ? v : 'auto';
+	} catch {
+		return 'auto';
+	}
+}
+export const corpusMode = writable<CorpusMode>(loadCorpusMode());
+corpusMode.subscribe((v) => {
+	try {
+		if (typeof localStorage !== 'undefined') localStorage.setItem(CORPUS_MODE_KEY, v);
+	} catch {
+		/* private window 等: 保持できなくても動作は変えない */
+	}
+});
 
 /** セッションID */
 export const sessionId = writable<string>(modeSessions.chat);

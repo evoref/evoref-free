@@ -291,6 +291,7 @@ def _collect_semmem_stats(state: AppState) -> dict | None:
 async def run_search_pipeline(
     query: str, state: AppState, cfg: dict, mode: str = "chat",
     timer: StageTimer | None = None, *, session_id: str | None = None,
+    corpus_mode: str = "auto",
 ) -> SearchPipelineResult:
     """統合検索パイプライン: 3層メモリ + Self-RAG
 
@@ -333,7 +334,9 @@ async def run_search_pipeline(
             timer=timer,
             semmem_stats=_collect_semmem_stats(state),
             session_id=session_id,
+            corpus_mode=corpus_mode,
             judge_tracker=state.judge_tracker,
+            correction_trail=_collect_correction_trail(state),
         )
         if not search_result.skipped and search_result.sources:
             rag_chunks = [content for _, _, content in search_result.sources]
@@ -608,6 +611,103 @@ def _retired_note_ids_for_store(store: Any) -> dict[str, bool]:
     return retired
 
 
+def _collect_correction_trail(state: AppState) -> dict[str, str]:
+    """全 scope の SemMem から訂正の宛先台帳を集める (失敗しても検索は続ける)。"""
+    trail: dict[str, str] = {}
+    pid = getattr(state, "current_project_id", None)
+    for scope in ("global", f"project:{pid}" if pid else None):
+        if scope is None:
+            continue
+        try:
+            trail.update(_correction_trail_for_store(state.get_semantic_store(scope)))
+        except Exception:
+            # 注記が付かないだけで検索自体は成立する (fail-open)。
+            continue
+    return trail
+
+
+def _previous_values_for_store(store: Any) -> dict[str, str]:
+    """``{訂正後 (最終世代) のファクト id: 訂正前の値}`` を SemMem の世代から引く。
+
+    ``MemoryInjector`` が ``(訂正後の記録)`` の行に「以前は「…」」を添える
+    ための材料 (2026-09-14 監査 B)。連鎖 A ← B ← C では C に **最古の A** の
+    値を添える (本人が最初に述べた値)。世代の辿り方は
+    :func:`_correction_trail_for_store` と同じ。
+    """
+    by_id = {f.id: f for f in store.all_facts(include_superseded=True)}
+    oldest: dict[str, tuple[float, str]] = {}
+    for fact in by_id.values():
+        if not fact.superseded_by:
+            continue
+        winner = by_id.get(fact.superseded_by)
+        seen: set[str] = {fact.id}
+        while winner is not None and winner.superseded_by and winner.id not in seen:
+            seen.add(winner.id)
+            winner = by_id.get(winner.superseded_by)
+        if winner is None or not getattr(winner, "from_correction", False):
+            continue
+        old = str(getattr(fact, "object", "") or "").strip()
+        if not old or old == str(getattr(winner, "object", "") or "").strip():
+            continue
+        at = float(getattr(fact, "created_at", 0.0) or 0.0)
+        prev = oldest.get(winner.id)
+        if prev is None or at < prev[0]:
+            oldest[winner.id] = (at, old)
+    return {wid: old for wid, (_at, old) in oldest.items()}
+
+
+def _correction_trail_for_store(store: Any) -> dict[str, str]:
+    """``被訂正ノート id -> その属性の現在値の言明`` を SemMem の世代から引く。
+
+    ``[参考情報]`` に載る episodic 参照へ ``（訂正済み）`` を付けるための宛先。
+    従来の宛先解決 (``corrections.corrections_by_target``) は **同一セッション
+    の user ノート同士** を語の重なりで結ぶので、セッションを跨いだ訂正は
+    1 件も解けない。記憶がセッションを跨いで持続する製品で、訂正だけ跨げない
+    のは構造的な穴だった。
+
+    実インシデント (2026-09-14 ライブ監査 F-01): 自己紹介 (セッション T01) で
+    「建設会社で施工管理」「妻と、小学4年の息子」と述べ、別セッション T07 で
+    「建設会社ではなく設備工事会社」「小学4年ではなく小学5年」と訂正した。
+    SemMem 側は正しく supersede していたのに、``[参考情報]`` には T01 の原文が
+    注記なしで載り、モデルが *「参考情報4では設備工事会社と記載されていますが、
+    参考情報1の建設会社を優先して記載しています」* と **明示的に訂正前を採用**
+    した。
+
+    SemMem の世代 (``superseded_by`` + ``from_correction``) はセッションに
+    依存せず、``correction_verdict`` の門を通った検証済みの訂正だけが立てる
+    (CLAUDE.md 不変則 #12)。既にある確かな証拠を注記へ流すだけで、新しい判定は
+    増やさない。
+
+    Returns:
+        ``{被訂正ノート id: 現在値の言明テキスト}``。現在値へ辿れないものは
+        含めない。
+    """
+    by_id = {f.id: f for f in store.all_facts(include_superseded=True)}
+    trail: dict[str, str] = {}
+    for fact in by_id.values():
+        if not fact.superseded_by:
+            continue
+        # 最終世代まで辿る (A ← B ← C では A も B も C に解決する)。
+        winner = by_id.get(fact.superseded_by)
+        seen: set[str] = {fact.id}
+        while winner is not None and winner.superseded_by and winner.id not in seen:
+            seen.add(winner.id)
+            winner = by_id.get(winner.superseded_by)
+        if winner is None or not getattr(winner, "from_correction", False):
+            # 訂正で畳まれたものだけを注記の対象にする。単なる値の再言明や
+            # 要約への吸収は「訂正済み」ではない。
+            continue
+        current = str(getattr(winner, "object", "") or "").strip()
+        if not current:
+            continue
+        for p in fact.provenances:
+            if p.note_id:
+                trail[p.note_id] = current
+        for note_id in getattr(fact, "retired_note_ids", None) or ():
+            trail[str(note_id)] = current
+    return trail
+
+
 def build_semmem_injection(
     state: AppState, cfg: dict, mode: str = "chat",
     conflict_ctx: ConflictTurnContext | None = None,
@@ -691,6 +791,7 @@ def build_semmem_injection(
         # 答えた)。計算は :func:`_retired_note_ids_for_store` (revision
         # キャッシュ付き、f_02 §8.3) に委譲する。
         retired_note_ids: set[str] = set()
+        previous_values: dict[str, str] = {}
         # 関連度スコアは埋め込み行列を持つストア側で 1 回の積として求める。
         # 候補ごとに正規化し直すと N=10000 で 52.5ms、常駐行列なら 1.5ms
         # (MemoryInjector._relevance_scores の実測)。
@@ -703,6 +804,11 @@ def build_semmem_injection(
                 facts.extend(store.all_facts(include_superseded=False))
             except Exception:
                 continue
+            try:
+                previous_values.update(_previous_values_for_store(store))
+            except Exception:
+                # 旧値が添えられないだけで注入自体は続ける。
+                pass
             try:
                 retired_note_ids.update(_retired_note_ids_for_store(store))
             except Exception:
@@ -749,6 +855,7 @@ def build_semmem_injection(
                 retired_note_ids=retired_note_ids or None,
                 fact_relevance_scores=fact_scores or None,
                 fact_rank_scores=fact_ranks or None,
+                previous_values=previous_values or None,
             )
             rendered = plan.render() or None
             if covered_attributes is not None:
@@ -1266,12 +1373,12 @@ def apply_grounding_notes(
 
 _RELATIVE_DATE_GUIDANCE: dict[str, str] = {
     "ja": (
-        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " 今日は {today} で、"
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " "
         "この発言の相対日付は次の日付を指す: {values}。"
         "日付を述べるときはこの値をそのまま使い、自分で数え直さないこと。"
     ),
     "en": (
-        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " Today is {today}; the relative "
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " The relative "
         "dates in this message resolve to: {values}. Use these dates as they "
         "are; do not recount them yourself."
     ),
@@ -1321,8 +1428,9 @@ def _append_relative_date_grounding(
         return
     if append_to_last_user(
         messages,
+        # 今日の日付は build_messages の ``[現在日時]`` 注記が担う (同じ語彙で
+        # 発火するので、ここで重ねて書かない — 2026-09-14 に二重化を解消)。
         _localized(_RELATIVE_DATE_GUIDANCE).format(
-            today=f"{today.isoformat()} ({labels[today.weekday()]})",
             values="、".join(parts) if _prompt_locale() == "ja" else "; ".join(parts),
         ),
         separator="",

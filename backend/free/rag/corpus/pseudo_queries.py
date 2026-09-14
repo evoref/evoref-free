@@ -75,6 +75,8 @@ class PseudoQueryIndex:
         self._loaded = False
         #: put 済みで未 commit の対象チャンク id (同じサイクル内の二重生成を防ぐ)。
         self._pending_targets: set[str] = set()
+        #: ``_snapshot_target_ids`` の版単位キャッシュ (commit で捨てる)。
+        self._target_ids_cache: dict[tuple, frozenset[str]] = {}
         #: 対象チャンクが本体 snapshot に生きているか (f_01 §6.2 の孤児 GC)。
         self._is_live: Callable[[str], bool] = lambda _target: True
 
@@ -133,11 +135,19 @@ class PseudoQueryIndex:
         out: set[str] = set()
         if snapshot is None:
             return out
+        # 版が変わるまで不変。チャット経路が毎ターン 2 回 (充足率 / 関連性ゲート)
+        # 呼び、全行を open→seek→json.loads で読んでいた (428 行 × 2 = 856 open/
+        # ターン、2026-09-14 監査)。版の同一性 (オブジェクト id + 行数) で持つ。
+        key = (id(snapshot), len(snapshot), bool(live_only))
+        cached = self._target_ids_cache.get(key)
+        if cached is not None:
+            return set(cached)
         for row in range(len(snapshot)):
             raw = snapshot.raw_at(row) or {}
             target = (raw.get("attrs") or {}).get("target_id")
             if isinstance(target, str) and target and (not live_only or self._is_live(target)):
                 out.add(target)
+        self._target_ids_cache = {key: frozenset(out)}
         return out
 
     def orphan_count(self) -> int:
@@ -223,6 +233,7 @@ class PseudoQueryIndex:
         self._store.manifest.events_since_snapshot = 0
         self._store.save_manifest()
         self._pending_targets.clear()
+        self._target_ids_cache = {}
         return len(self._store)
 
     # ── 検索 ──

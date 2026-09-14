@@ -1397,6 +1397,8 @@ class FewShotPool(JsonStateStore):
                 continue
             if signals.get("turn_outcome") == "failed":
                 continue
+            if signals.get("user_negative") is True:
+                continue
             # max_tokens で文の途中で切れた応答は手本にしない (途中で終わるのが
             # 正解、というバイアスになる)。
             if signals.get("truncated", False):

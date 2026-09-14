@@ -1464,8 +1464,10 @@ def load_model_profile_for(
     あいまい照合はしない。大文字小文字の区別はファイルシステム依存)。
     GGUF 読取に失敗しても (arch 不明でも) モデル別層は適用される。
     """
+    # ヘッダ解析はキャッシュ経由 (bge-m3 は語彙 25 万で 1 回 1 秒超。チャット
+    # 応答パスの注入ゲートが毎ターン呼ぶため、素の read では TTFT に乗る)。
     try:
-        arch = read_gguf_metadata(model_path).get("architecture")
+        arch = _read_gguf_metadata_cached(model_path).get("architecture")
     except Exception:  # noqa: BLE001
         arch = None
     profile = load_model_profile(arch, project_root)

@@ -17,6 +17,7 @@ from backend.exceptions import EvorefError
 from backend.free.agent.issue_ledger import record_current_issue
 from backend.free.core.verifier_events import (
     current_grounding,
+    current_rag_signals,
     current_tool_uses,
     current_turn_outcome,
 )
@@ -348,6 +349,8 @@ def _log_chat_outcome(
     # 規則の harmful に、発火しなかった規則の helpful に写す。これが
     # 「削ってよい規則」の唯一の根拠。計数の失敗で結末記録を止めない。
     signals = {**signals, **_account_rule_outcomes(state)}
+    # RAG の便益 (rag_used / rag_abstained / rag_cited、経験記録が導出)。
+    signals = {**signals, **current_rag_signals()}
     # 経験記録が導出した成否 (本文の決定論的な破綻) を結末へ反映する。
     # ``success`` が配送の成否だけだと、計算の破綻や自己矛盾のターンが
     # 100/100 success で evolve の fitness に入る (2026-09-05 監査 F-11)。

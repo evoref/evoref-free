@@ -40,12 +40,14 @@ from backend.free.core.response_dates import ignores_date_result
 from backend.free.core.verifier_events import (
     current_grounding,
     current_tool_uses,
+    record_rag_signals,
     record_turn_outcome,
     record_verifier_hit,
 )
 from backend.free.agent.issue_ledger import record_current_issue
 from backend.free.core.text_quality import (
     abstains_on_reference_material,
+    cites_reference_material,
     claims_completed_state_change,
     contradicts_measured_values,
     has_broken_ja_spacing,
@@ -1068,6 +1070,7 @@ class FeedbackCollector:
                 and any(str(e).startswith("corpus:") for e in (gen_config.evidence_ids or []))
                 else None
             ),
+            rag_cited=cites_reference_material(response) if rag_used else None,
             tool_uses=tool_uses,
             unexplained_numbers=unexplained_numbers,
             expression_issues=expression_issues,
@@ -1081,6 +1084,11 @@ class FeedbackCollector:
             cached_prompt_tokens=cached_prompt_tokens,
             truncated=truncated,
             generation_failed=generation_failed,
+        )
+        # RAG の便益を結末 JSONL へ (turn_outcome と同じ通路、2026-09-14)。
+        record_rag_signals(
+            rag_used=signals.rag_used, rag_abstained=signals.rag_abstained,
+            rag_cited=signals.rag_cited,
         )
 
         entry = ExperienceEntry(

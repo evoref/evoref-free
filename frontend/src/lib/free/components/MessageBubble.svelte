@@ -7,13 +7,46 @@
 	import SourcesPanel from './SourcesPanel.svelte';
 	import MarkdownRenderer from './MarkdownRenderer.svelte';
 	import { formatTime } from '$lib/free/utils/format';
+	import { sendTurnFeedback } from '$lib/free/api';
+	import { sessionId, messages } from '$lib/free/stores/chat';
+	import { get } from 'svelte/store';
 
 	let {
 		message,
 		instanceName = 'evoref',
 		streaming = false,
-		mode = 'chat'
-	}: { message: ChatMessage; instanceName?: string; streaming?: boolean; mode?: string } = $props();
+		mode = 'chat',
+		prevUserQuery = ''
+	}: {
+		message: ChatMessage;
+		instanceName?: string;
+		streaming?: boolean;
+		mode?: string;
+		prevUserQuery?: string;
+	} = $props();
+	// 明示評価 (f_04 §3.2.3): 👎 は本人が失敗と言った唯一の信号で、Level 1 の
+	// 採用ゲートのケースに最優先で使われる。👍 は記録のみ。
+	let noteOpen = $state(false);
+	let note = $state('');
+	let sending = $state(false);
+	let feedbackFailed = $state(false);
+
+	async function submitFeedback(verdict: 'negative' | 'positive') {
+		if (sending) return;
+		sending = true;
+		feedbackFailed = false;
+		const res = await sendTurnFeedback(get(sessionId), verdict, prevUserQuery || undefined, note);
+		sending = false;
+		if (!res.recorded) {
+			feedbackFailed = true;
+			return;
+		}
+		messages.update((list) =>
+			list.map((m) => (m.id === message.id ? { ...m, feedback: verdict } : m))
+		);
+		noteOpen = false;
+		note = '';
+	}
 	let isUser = $derived(message.role === 'user');
 	let isCreate = $derived(mode === 'create');
 	// クリエイトモードではコードをエディタへ流すため、チャット側は
@@ -70,9 +103,83 @@
 		<RagDebugPanel ragDebug={message.rag_debug} />
 	{/if}
 
+	{#if !isUser && !streaming && message.content}
+		<div class="feedback-row">
+			{#if message.feedback}
+				<span class="feedback-sent">{message.feedback === 'negative' ? $t('chat.feedback_sent_bad') : $t('chat.feedback_sent_good')}</span>
+			{:else}
+				<button
+					type="button"
+					class="feedback-btn"
+					title={$t('chat.feedback_good')}
+					aria-label={$t('chat.feedback_good')}
+					disabled={sending}
+					onclick={() => submitFeedback('positive')}
+				>👍</button>
+				<button
+					type="button"
+					class="feedback-btn feedback-bad"
+					title={$t('chat.feedback_bad')}
+					aria-label={$t('chat.feedback_bad')}
+					disabled={sending}
+					onclick={() => (noteOpen = !noteOpen)}
+				>👎</button>
+				{#if noteOpen}
+					<input
+						class="feedback-note"
+						type="text"
+						maxlength="400"
+						placeholder={$t('chat.feedback_note_placeholder')}
+						bind:value={note}
+						onkeydown={(e) => {
+							if (e.key === 'Enter') submitFeedback('negative');
+						}}
+					/>
+					<button
+						type="button"
+						class="feedback-btn feedback-send"
+						disabled={sending}
+						onclick={() => submitFeedback('negative')}
+					>{$t('chat.feedback_send')}</button>
+				{/if}
+				{#if feedbackFailed}
+					<span class="feedback-sent">{$t('chat.feedback_failed')}</span>
+				{/if}
+			{/if}
+		</div>
+	{/if}
+
 </div>
 
 <style>
+	.feedback-row {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		margin-top: 6px;
+		font-size: 0.8rem;
+		color: var(--text-secondary, #888);
+	}
+	.feedback-btn {
+		background: transparent;
+		border: 1px solid var(--border, #ccc);
+		border-radius: 4px;
+		padding: 1px 6px;
+		cursor: pointer;
+		opacity: 0.7;
+	}
+	.feedback-btn:hover:not(:disabled) {
+		opacity: 1;
+	}
+	.feedback-note {
+		flex: 1;
+		min-width: 120px;
+		padding: 2px 6px;
+		border: 1px solid var(--border, #ccc);
+		border-radius: 4px;
+		background: var(--bg-primary, transparent);
+		color: var(--text-primary);
+	}
 	.message-bubble {
 		max-width: 85%;
 		padding: 10px 14px;

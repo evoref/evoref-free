@@ -59,6 +59,7 @@ from backend.free.memory.notes.note_builder import (
     resolve_fact_attribute_match,
     resolve_fact_attribute_matches,
 )
+from backend.free.memory.attribute_key import GENERIC_ATTRIBUTE as _GENERIC_ATTRIBUTE
 from backend.free.memory.episodic.note import MemoryNote
 from backend.free.memory.notes.subject_ns import make_mem_subject
 from backend.free.memory.types import FactType, SemanticFact
@@ -601,9 +602,10 @@ def restate_with_correction(
             continue
         if wrong in text:
             start = text.index(wrong)
-            replaced = text[:start] + correct + text[start + len(wrong):]
+            fill = _trim_overlap(text[:start], correct, text[start + len(wrong):])
+            replaced = text[:start] + fill + text[start + len(wrong):]
             # 置換した表現の直後に残る旧い日付注記は落とす (F-A、再注記に委ねる)。
-            return strip_date_annotation_after(replaced, start + len(correct))
+            return strip_date_annotation_after(replaced, start + len(fill))
         # 空白 / 全角半角の違いで逐語一致しない場合は、正規化した位置で切る
         normalized = norm_span(text)
         pos = normalized.find(needle)
@@ -615,10 +617,38 @@ def restate_with_correction(
             continue
         start = raw_positions[pos]
         end = raw_positions[pos + len(needle) - 1] + 1
+        fill = _trim_overlap(text[:start], correct, text[end:])
         return strip_date_annotation_after(
-            text[:start] + correct + text[end:], start + len(correct),
+            text[:start] + fill + text[end:], start + len(fill),
         )
     return ""
+
+
+def _trim_overlap(before: str, fill: str, after: str) -> str:
+    """``before + fill + after`` で ``fill`` の端が隣と重なる分を落とす (純粋関数)。
+
+    「X ではなく Y です」の新値 Y は述語まで含むことがある (``value_update_spans``
+    の new は「対面のほうが好き」)。それを旧値 X (「オンライン」) の位置へそのまま
+    入れると、X の後ろに元からある「のほうが好き」と二重になる — 実機
+    (2026-09-14 監査 F-12 の検証) で ``mem.preference.user`` が
+    「打ち合わせは対面より対面のほうが好きのほうが好き」になった。
+
+    ``fill`` の **末尾** が ``after`` の先頭と一致する最長部分、``fill`` の
+    **先頭** が ``before`` の末尾と一致する最長部分を落とす。全部重なる (新値が
+    隣に丸ごと含まれる) 場合も落とし切ってよい — その時は置換位置の語だけが
+    残り、文としては成立する。
+    """
+    a = " ".join(after.split())
+    for n in range(min(len(fill), len(a)), 0, -1):
+        if a.startswith(fill[-n:]):
+            fill = fill[:-n]
+            break
+    b = " ".join(before.split())
+    for n in range(min(len(fill), len(b)), 0, -1):
+        if b.endswith(fill[:n]):
+            fill = fill[n:]
+            break
+    return fill
 
 
 def _anchorless_evidence_text(
@@ -1351,12 +1381,22 @@ def _slot_anchor_index(
             for anchor in _value_anchors(value):
                 if anchor not in anchors:
                     anchors.append(anchor)
-                document_freq.setdefault(anchor, set()).add(slot)
+                # 汎用スロット (``user``) は文書頻度に **数えない**。分類でき
+                # なかった発話の寄せ場なので固有スロットと同じ語を必ず含み、
+                # 数えると固有スロット側のアンカーまで「曖昧」として消える
+                # (「緑茶」が beverage と user の両方にあるだけで beverage が
+                # 宛先にならなくなる)。汎用側は最後の手段としてだけ当たる
+                # (下の filter、2026-09-14 監査 F-12)。
+                if slot[1] != _GENERIC_ATTRIBUTE:
+                    document_freq.setdefault(anchor, set()).add(slot)
         per_slot[slot] = (tuple(values), anchors)
     return {
         slot: (
             values,
-            tuple(a for a in anchors if len(document_freq.get(a, ())) <= 1),
+            tuple(
+                a for a in anchors
+                if len(document_freq.get(a, ())) <= (0 if slot[1] == _GENERIC_ATTRIBUTE else 1)
+            ),
         )
         for slot, (values, anchors) in per_slot.items()
     }
@@ -1474,8 +1514,7 @@ def resolve_value_anchored_matches(
                     length, anchor = _span_hit_length(values, anchors, span)
                     if not length:
                         continue
-                    current = best.get(tag)
-                    if current is None or length > current[0]:
+                    if _better_hit(best.get(tag), length, attr):
                         best[tag] = (length, attr, anchor)
                 if best:
                     break
@@ -1490,8 +1529,7 @@ def resolve_value_anchored_matches(
                 for (tag, attr), (values, _anchors) in index.items():
                     for value in values:
                         if needle and needle in norm_span(value):
-                            current = best.get(tag)
-                            if current is None or len(needle) > current[0]:
+                            if _better_hit(best.get(tag), len(needle), attr):
                                 best[tag] = (len(needle), attr, update[0])
                                 explicit.add(tag)
                             break
@@ -1504,12 +1542,27 @@ def resolve_value_anchored_matches(
                 length, anchor = _anchor_hit_length(anchors, haystack)
                 if not length:
                     continue
-                current = best.get(tag)
-                if current is None or length > current[0]:
+                if _better_hit(best.get(tag), length, attr):
                     best[tag] = (length, attr, anchor)
         for tag, (_length, attr, anchor) in best.items():
             resolved[(note.id, tag)] = (attr, anchor)
     return resolved
+
+
+def _better_hit(
+    current: tuple[int, str, str] | None, length: int, attr: str,
+) -> bool:
+    """``(length, attr)`` の一致を ``current`` より優先するか (純粋関数)。
+
+    長い一致が勝つ。同じ長さなら **固有スロットが汎用スロット (``user``) に
+    勝つ** — 汎用スロットは分類できなかった発話の寄せ場なので、固有スロットに
+    同じ値があるなら宛先はそちら (2026-09-14 監査 F-12)。
+    """
+    if current is None:
+        return True
+    if length != current[0]:
+        return length > current[0]
+    return current[1] == _GENERIC_ATTRIBUTE and attr != _GENERIC_ATTRIBUTE
 
 
 def resolve_inherited_attributes(
@@ -1674,6 +1727,10 @@ class ChatExtractor(BaseExtractor):
             result.notes_processed += 1
             content = note.content or ""
             value_update_restated = False
+            # 訂正が名指しした旧値の span。訂正を持たないノートでは空のまま
+            # (以前は訂正経路の中でしか束縛されず、後段で読むと
+            # UnboundLocalError になった)。
+            wrong_claim = ""
             is_assistant_note = getattr(note, "source", "user") != "user"
             # 生成物 (コード等) の断片は user/world ファクトの素材にならない
             # (2026-07-15: 誤ルート生成の Python コードが mem.world.from として
@@ -2033,10 +2090,17 @@ class ChatExtractor(BaseExtractor):
                         note=note,
                         ctx=ctx,
                     )
-                    # 本人の値更新で言い直した行は、旧値を持つ live 値を畳む側に
-                    # 回る (``sleep.extraction._supersede_corrected_slots``)。
-                    # from_correction は「検証済みの訂正」の印なので流用しない。
-                    if value_update_restated:
+                    # 旧値を名指しできた行は、その span を持つ live 値だけを
+                    # 畳む側に回る (``sleep.extraction._supersede_corrected_slots``)。
+                    # ``value_update`` は「この行が置き換える旧値の span」で、
+                    # from_correction (= 検証済みの訂正という印) とは別の情報。
+                    #
+                    # 検証済み訂正の経路 (``correct_value`` が取れた側) でも
+                    # ``wrong_claim`` はまさにその旧値なので載せる。以前は
+                    # ``value_update_restated`` の行にしか載らず、多値スロット
+                    # (employer / family) で「宛先は分かっているのに span が
+                    # 無い」状態になっていた (2026-09-14 監査 F-02 の追補)。
+                    if wrong_claim:
                         fact.value_update = wrong_claim  # type: ignore[attr-defined]
                     candidates.append((note, fact))
 

@@ -6,7 +6,7 @@
 	import { locale, availableLocales, switchLocale, promptLocaleSwitching } from '$lib/i18n';
 	import { isPro, isDevelop, edition } from '$lib/edition';
 	import { appVersion } from '$lib/free/stores/app';
-	import { currentMode, clearMessages, switchMode, modeRestartStatus } from '$lib/free/stores/chat';
+	import { currentMode, clearMessages, switchMode, modeRestartStatus, corpusMode } from '$lib/free/stores/chat';
 	import { addToast } from '$lib/free/stores/toast';
 	import { serverState } from '$lib/free/stores/server';
 
@@ -115,6 +115,25 @@
 							<option value={loc}>{loc.toUpperCase()}</option>
 						{/each}
 					</select>
+				</div>
+				<div class="footer-row">
+					<span class="footer-label">{$t('sidebar.documents')}</span>
+					<div class="corpus-mode-wrapper">
+						<select
+							class="footer-select corpus-mode-select"
+							value={$corpusMode}
+							aria-label={$t('sidebar.documents')}
+							title={$t('sidebar.documents_hint')}
+							onchange={(e) => {
+								const v = e.currentTarget.value;
+								corpusMode.set(v === 'on' || v === 'off' ? v : 'auto');
+							}}
+						>
+							<option value="auto">{$t('sidebar.documents_auto')}</option>
+							<option value="on">{$t('sidebar.documents_on')}</option>
+							<option value="off">{$t('sidebar.documents_off')}</option>
+						</select>
+					</div>
 				</div>
 				{#if isPro}
 					<div class="footer-row">
@@ -354,7 +373,8 @@
 	.toggle-switch.on .knob {
 		transform: translateX(15px);
 	}
-	.mode-select-wrapper {
+	.mode-select-wrapper,
+	.corpus-mode-wrapper {
 		display: flex;
 		align-items: center;
 		gap: 4px;

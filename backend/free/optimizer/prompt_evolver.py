@@ -58,10 +58,19 @@ _TEXT_LEN_DELTA = 5
 #: long_form 検証失敗は create モードの主要な失敗シグナル (2026-07-17 実データで
 #: rephrase/correction が 21 件中 0 件)。``conversation_ended`` は **主項に置かない**
 #: (読み込み時に全件へ立つため恒真、docs/f_04 §8 禁則 7)。
+#: ``user_negative`` (ユーザーの 👎、f_04 §3.2.3) は **本人が失敗と言った唯一の
+#: 信号** なので訂正と同じ 1.0。これを入れないと、明示評価はケース選定にしか
+#: 効かず、(a) 進化の fitness に選択圧を作れない、(b) 採用後のロールバック判定
+#: (``_check_prompt_adoptions`` は同じ欠陥率を見る) が「👎 が増えた」ことを
+#: 観測できない — つまり 👎 で悪化を訴えても採用済みプロンプトが戻らない
+#: (2026-09-14 監査 F-11)。policy / generation param 側の共有表
+#: (:data:`DEFECT_WEIGHTS`) には入れない (f_04 §3.2.3 の「policy 進化の圧には
+#: 使わない」を維持する)。
 PROMPT_DEFECT_WEIGHTS: dict[str, float] = {
     **DEFECT_WEIGHTS,
     "turn_outcome_failed": 0.8,
     "long_form_failed": 0.5,
+    "user_negative": 1.0,
 }
 
 #: 候補長のハードゲート: 現行の ``LENGTH_GATE_RATIO`` 倍か ``+LENGTH_GATE_SLACK_CHARS``
@@ -510,6 +519,7 @@ class PromptEvolver:
             if (
                 signals.get("rephrased_query")
                 or signals.get("user_correction")
+                or signals.get("user_negative") is True
                 or is_long_form_failure
             ):
                 failure_keywords.update(

@@ -286,6 +286,12 @@ def _looks_like_sentence(candidate: str, raw_query: str) -> bool:
 #: どう変わりますか」) ので、質問文だけでは kind=none に落ちる。
 _DATE_INTENT_CONTEXT_TURNS = 2
 #: ツール無し exit から日付意図を撃つための「数量がある」条件。
+#: 抽出器を撃てない (client / schema 不在) 印。``None`` (撃ったが取れず) と区別する。
+_DATE_INTENT_UNAVAILABLE = object()
+#: 発話に具体日付があるときは抽出器に起点 / 除外日を読ませる (規則先行の例外)。
+_DATE_INTENT_LITERAL_DATE_RE = re.compile(
+    r"\d{1,2}\s*月\s*\d{1,2}\s*日|(?<![\d/-])\d{1,2}/\d{1,2}(?![\d/-])|\d{4}-\d{2}-\d{2}",
+)
 _DATE_INTENT_QUANTITY_RE = re.compile(r"\d|[一二三四五六七八九十百千]")
 _DATE_INTENT_CONTEXT_CHARS = 300
 
@@ -384,6 +390,12 @@ class ToolCallJudge:
         #: 条件だけを変える追い質問がこれを継ぐ (B-03)。ターン固有の値では
         #: なくセッション単位の記憶なので JudgeCall には載せない。上限付き。
         self._date_intent_memory: dict[str, DateIntentParams] = {}
+        #: 抽出器の往復結果 ((session_id, 正規化した発話) → (params, payload))。
+        #: 同じ発話への 2 度目の往復 (2 手目 judge) を省く。上限 8 件。
+        self._date_intent_extract_cache: dict[
+            tuple[str, str], tuple["DateIntentParams | None", object],
+        ] = {}
+        self._last_date_intent_payload: object = None
         #: 各セッションの演算パラメータを生んだユーザー発話 (正規化済み)。
         self._date_intent_origin: dict[str, str] = {}
         self._mem_view = mem_view
@@ -663,6 +675,73 @@ class ToolCallJudge:
             return None
         return previous
 
+    async def _extract_date_intent_params(
+        self, call: JudgeCall,
+    ) -> "DateIntentParams | None | object":
+        """抽出器 (層 5.97 の文法制約 JSON) を 1 往復撃ち、パラメータを返す。
+
+        client / response_format が無ければ ``_DATE_INTENT_UNAVAILABLE``、
+        往復失敗 / ``kind: none`` / 検証落ちは ``None``。生の payload は
+        ``self._last_date_intent_payload`` に残す (追い質問の除外条件の読取用)。
+        """
+        self._last_date_intent_payload = None
+        # 同じターンの 2 手目 judge (``_maybe_follow_up_tool``、会話に 1 行足した
+        # だけ) が同じ発話で往復を撃ち直していた (2026-09-12 実機: 同じ
+        # ``kind: none`` を 16 秒かけて 2 度)。発話単位でメモ化する。
+        cache_key = (call.session_id or "", " ".join((call.query or "").split()))
+        cached = self._date_intent_extract_cache.get(cache_key)
+        if cached is not None:
+            params, payload = cached
+            self._last_date_intent_payload = payload
+            logger.info("date intent extraction reused for the same query this turn")
+            return params
+        client = self._llm_client
+        if client is None or not hasattr(client, "generate_constrained"):
+            return _DATE_INTENT_UNAVAILABLE
+        response_format = resolve_response_format_for_purpose("date_intent")
+        if response_format is None:
+            return _DATE_INTENT_UNAVAILABLE
+        today = utc_now_dt().date().isoformat()
+        messages = [
+            # 分類器スロットの共通 system + 日付抽出の指示 (user)
+            # (:meth:`_slot_shared_messages`)。
+            *self._slot_shared_messages(
+                call.tools_registry, call.mode,
+                select_locale_variant(DATE_INTENT_SYSTEM, DATE_INTENT_SYSTEM_EN),
+            ),
+            *_date_intent_context_messages(call.conversation),
+            {"role": "user", "content": f"[today: {today}]\n{call.query}"},
+        ]
+        try:
+            content = await client.generate_constrained(
+                messages,
+                response_format=response_format,
+                max_tokens=CLASSIFY_MAX_TOKENS,
+                # 分類器と同じ専有スロット (CLAUDE.md §6 #1 / c_14 §7 の
+                # CHAT_PATH_PURPOSES)。
+                id_slot=getattr(
+                    client, "classifier_slot",
+                    getattr(client, "background_slot", -1),
+                ),
+                timeout=PURPOSE_TIMEOUT_DEFAULTS.get("date_intent", 20.0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info("date intent extraction failed: %s", exc)
+            return None
+        try:
+            payload = json.loads(content or "")
+        except (TypeError, ValueError):
+            # スキーマを強制しない build では非 JSON が返り得る (分類器と同じ救済)。
+            payload = extract_json_object(content or "")
+        params = parse_date_intent(payload)
+        self._last_date_intent_payload = payload
+        if len(self._date_intent_extract_cache) >= 8:
+            self._date_intent_extract_cache.pop(
+                next(iter(self._date_intent_extract_cache)),
+            )
+        self._date_intent_extract_cache[cache_key] = (params, payload)
+        return params
+
     async def _upgrade_date_command_via_intent(
         self, result: ToolJudgement, call: JudgeCall,
     ) -> ToolJudgement:
@@ -761,71 +840,59 @@ class ToolCallJudge:
             tool_name = _executable_tool_for_mode(call.tools_registry, call.mode)
             if not tool_name:
                 return result
-        client = self._llm_client
-        if client is None or not hasattr(client, "generate_constrained"):
-            return result
-        response_format = resolve_response_format_for_purpose("date_intent")
-        if response_format is None:
-            return result
-        today = utc_now_dt().date().isoformat()
-        messages = [
-            # 分類器スロットの共通 system + 日付抽出の指示 (user)
-            # (:meth:`_slot_shared_messages`)。
-            *self._slot_shared_messages(
-                call.tools_registry, call.mode,
-                select_locale_variant(DATE_INTENT_SYSTEM, DATE_INTENT_SYSTEM_EN),
-            ),
-            *_date_intent_context_messages(call.conversation),
-            {"role": "user", "content": f"[today: {today}]\n{call.query}"},
-        ]
-        try:
-            content = await client.generate_constrained(
-                messages,
-                response_format=response_format,
-                max_tokens=CLASSIFY_MAX_TOKENS,
-                # 分類器と同じ専有スロット (CLAUDE.md §6 #1 / c_14 §7 の
-                # CHAT_PATH_PURPOSES)。
-                id_slot=getattr(
-                    client, "classifier_slot",
-                    getattr(client, "background_slot", -1),
-                ),
-                timeout=PURPOSE_TIMEOUT_DEFAULTS.get("date_intent", 20.0),
+        # --- 規則先行 (2026-09-14) ---
+        # 閉じた言い回し (「N 営業日 前 / 後」「来月の第 2 月曜日」「11 月の営業
+        # 日数」) はコードで確定するので、抽出器 (1 往復 10〜24 秒) を撃たない。
+        # 実測 (2026-09-12、8 往復): 抽出器が単独で正解を出した回は 0 で、
+        # kind: none 5 回はコード規則が救済、残りも start / holidays をコードが
+        # 上書きしていた。往復が要るのは発話に **具体日付** があるとき
+        # (「11 月 6 日の 12 営業日前」の起点、「11/3 と 11/23 を除いて」の除外)
+        # で、それだけは抽出器に読ませる。
+        query_text = call.query or ""
+        today_local = utc_now_dt().astimezone().date()
+        code_offset = business_day_offset_from_query(query_text)
+        nth_weekday = nth_weekday_of_month_from_query(query_text, today_local)
+        month_count = month_business_days_from_query(query_text, today_local)
+        code_resolved = (
+            (code_offset is not None or nth_weekday is not None or month_count is not None)
+            and not _DATE_INTENT_LITERAL_DATE_RE.search(query_text)
+        )
+        payload: object = None
+        params: DateIntentParams | None = None
+        if code_resolved:
+            logger.info(
+                "date intent resolved by code rules; skipping the extractor "
+                "(offset=%s nth_weekday=%s month=%s)",
+                code_offset is not None, nth_weekday is not None, month_count is not None,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.info("date intent extraction failed: %s", exc)
-            return result
-        try:
-            payload = json.loads(content or "")
-        except (TypeError, ValueError):
-            # スキーマを強制しない build では非 JSON が返り得る (分類器と同じ救済)。
-            payload = extract_json_object(content or "")
-        params = parse_date_intent(payload)
-        if params is None:
-            # 「N 営業日 前 / 後」は手掛かり語 + 数量 + 向きで閉じているので、
-            # 抽出器が none を返してもコードで組む (2026-09-12 (b))。
-            offset = business_day_offset_from_query(call.query or "")
-            if offset is not None:
-                logger.info(
-                    "date intent resolved a business-day offset by code "
-                    "(extractor returned none): n=%d direction=%s",
-                    offset.n, offset.direction,
-                )
-                params = offset
+            params = code_offset
+        else:
+            params = await self._extract_date_intent_params(call)
+            if params is _DATE_INTENT_UNAVAILABLE:
+                return result
+            payload = self._last_date_intent_payload
+            if params is None:
+                # 「N 営業日 前 / 後」は手掛かり語 + 数量 + 向きで閉じているので、
+                # 抽出器が none を返してもコードで組む (2026-09-12 (b))。
+                if code_offset is not None:
+                    logger.info(
+                        "date intent resolved a business-day offset by code "
+                        "(extractor returned none): n=%d direction=%s",
+                        code_offset.n, code_offset.direction,
+                    )
+                    params = code_offset
         previous = self._previous_date_intent(call)
         # 「<月>の営業日数」は月が閉じた集合なのでコード側で組む (F-01)。抽出器が
         # 何か返していても、期間が月で閉じているならこちらが正。直前の演算が
         # 同じ期間なら、そこで確定していた祝日・曜日除外を継ぐ (「毎週水曜日が
         # 定休日だとすると、11 月の営業日数は」は月の語を持つので新しい演算に
         # 見えるが、条件を 1 つ足しただけ)。
-        today_local = utc_now_dt().astimezone().date()
         # 「来月の第 2 月曜日」も月・序数・曜日で閉じた日付 (F-14)。
-        nth_weekday = nth_weekday_of_month_from_query(call.query or "", today_local)
         if nth_weekday is not None and (params is None or params.kind != "weekday_of"):
             logger.info(
                 "date intent resolved an nth weekday by code: %s", nth_weekday.start,
             )
             params = nth_weekday
-        month_count = month_business_days_from_query(call.query or "", today_local)
         if month_count is not None:
             holidays = set(month_count.holidays)
             weekdays: set[int] = set()
@@ -907,7 +974,7 @@ class ToolCallJudge:
             )
         )
         follow_up = previous is not None and not fresh_computation
-        if follow_up and params is None:
+        if follow_up and params is None and payload is not None:
             exclusions = parse_date_intent_exclusions(payload)
             if exclusions is not None and any(exclusions):
                 params = replace(

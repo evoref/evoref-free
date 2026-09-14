@@ -1,5 +1,7 @@
 """Pydantic リクエスト/レスポンスモデル"""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from backend.free.__version__ import (
@@ -25,6 +27,12 @@ class ChatRequest(BaseModel):
     # プライベートセッション。``True`` のターンは memory_only
     # で動作し、LTM/SemMem/履歴ディスク永続化に書き込まない。
     private: bool = False
+    # 文書 (corpus パッケージ) の参加モード (f_01 §8.1、2026-09-14)。
+    # ``auto`` = 問いの性質と較正の棒で決める (既定)、``on`` = 問い側の抑止
+    # (日付演算等) を掛けずに引く、``off`` = このターンは corpus / 疑似クエリ層を
+    # 引かない (記憶 = episodic / semantic は影響しない)。ロード状態はグローバル
+    # なので、雑談中に大きなコーパスへ毎ターン払わないための問い単位の制御。
+    corpus_mode: Literal["auto", "on", "off"] = "auto"
 
 
 class TokenInfo(BaseModel):

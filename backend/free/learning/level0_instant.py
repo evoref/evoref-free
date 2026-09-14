@@ -183,6 +183,16 @@ class FeedbackSignals:
     #: ``False`` = 注入して答えた、``True`` = 注入したのに差し控えた =
     #: 検索の取りこぼしの観測。プロンプト進化の圧には使わない。
     rag_abstained: bool | None = None
+    #: 注入した turn で応答が ``[参考情報]`` を明示的に引いたか (2026-09-14)。
+    #: ``None`` = 検索が何も注入していない。abstained と対で「注入が答えに
+    #: 使われたか」を測る材料 (09-12: 引用 19/94、差し控え 13/74)。
+    rag_cited: bool | None = None
+    #: ユーザーの明示評価 (2026-09-14、f_04 §3.2.3)。``None`` = 評価なし、
+    #: ``True`` = 👎 (本人が失敗と言った唯一の信号。採用ゲートのケースに最優先で
+    #: 使い、手本にはしない)、``False`` = 👍。``user_note`` は任意の一言で、
+    #: 訂正文と同じく judge のヒントになる。
+    user_negative: bool | None = None
+    user_note: str = ""
     #: 根拠台帳 (f_04 §2.2、2026-09-10 (h))。``tool_uses`` は tool_ledger 由来の
     #: 実行順 ``[{"tool", "success", "reason"}]``。3 つの疑義は ``None`` = ツール
     #: 判定を通っていない (reactive 経路等)、``[]`` / ``False`` = 判定してクリーン。
@@ -407,6 +417,27 @@ class ExperienceBuffer(JsonStateStore):
         """直近 n 件取得"""
         return self.entries[-n:]
 
+    def mark_user_feedback(
+        self, session_id: str, *, negative: bool | None, note: str = "",
+        query: str | None = None,
+    ) -> ExperienceEntry | None:
+        """セッションの最新 (または ``query`` が一致する最新) の経験に明示評価を刻む。
+
+        ``negative=None`` は評価の取り消し。見つからなければ ``None``
+        (private ターン等、経験が無い応答)。書き込みは flush する。
+        """
+        wanted = " ".join((query or "").split())
+        for entry in reversed(self.entries):
+            if entry.session_id != session_id:
+                continue
+            if wanted and " ".join(entry.query.split()) != wanted:
+                continue
+            entry.signals.user_negative = negative
+            entry.signals.user_note = (note or "").strip()[:400]
+            self.flush()
+            return entry
+        return None
+
     def get_failures(self, mode: str | None = None) -> list[ExperienceEntry]:
         """失敗エントリ抽出 (言い直し / ユーザー訂正 / 決定論の失敗判定)。
 
@@ -428,6 +459,10 @@ class ExperienceBuffer(JsonStateStore):
                 e.signals.rephrased_query
                 or e.signals.user_correction is not None
                 or e.signals.turn_outcome == "failed"
+                # 明示評価の 👎 (f_04 §3.2.3)。本人が失敗と言ったターンが
+                # Level 2 の失敗プールに入らないと、最も確かな失敗データが
+                # 学習の目的関数に一度も届かない (2026-09-14 監査 F-11)。
+                or e.signals.user_negative is True
             )
             # max_tokens で切れた応答は「モデルの失敗」ではなく設定由来の
             # 打ち切りで、正しい答えも持たない。2026-09-07 ライブ監査では

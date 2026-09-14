@@ -292,6 +292,21 @@ class SleepTimeWorker:
                 min_events=_SNAPSHOT_MIN_EVENTS_LIGHT,
             )
             step_durations["step_e5_snapshot"] = round(time.monotonic() - ts, 3)
+            # **較正を Full まで待たない。** 較正は起動時 (ノート < MIN_NOTES
+            # なら skip) と Full の末尾でしか確定しないので、``local/`` を
+            # 空にした直後は「最初の Full が終わるまで config の静的閾値」と
+            # いう長い窓ができる。実測 (2026-09-14 監査 F-06): 50 ターンの
+            # うち **最初の 35 ターン** がその窓に入り、棒が 0.584 ではなく
+            # 0.40 で回って無関係チャンクが ``[参考情報]`` に載り続けた。
+            # Light は応答のたびに走るので、ノートが閾値に達した直後の
+            # サイクルで確定できる。確定済みなら中で即 return する
+            # (未確定のあいだだけのコスト)。版を作った後に置くのは Full の
+            # Step 10d と同じ理由 — 較正はノートのベクトルを読む。
+            ts = time.monotonic()
+            result["threshold_calibrated"] = await self._step10d_retry_calibration()
+            step_durations["step10d_threshold_calibration"] = round(
+                time.monotonic() - ts, 3,
+            )
             await self._save_state_async()
 
         elapsed = round(time.monotonic() - t0, 3)
@@ -665,13 +680,6 @@ class SleepTimeWorker:
         if self._check_cancelled():
             return result
 
-        # Step 5.9: corpus 疑似クエリ生成 (f_01 §6.4)
-        ts = time.monotonic()
-        result["pseudo_queries"] = await self._step5_9_pseudo_queries(llm_client)
-        step_durations["step5_9_pseudo_query"] = round(time.monotonic() - ts, 3)
-        if self._check_cancelled():
-            return result
-
         params_b = getattr(getattr(llm_client, "metadata", None), "params_b", 7.0)
 
         # Step E0: 作業領域を開いて、ベクトルの無いノートを埋め込む。
@@ -885,6 +893,14 @@ class SleepTimeWorker:
         )
 
         # 永続化 + 完了ログ
+        # Step 5.9: corpus 疑似クエリ生成 (f_01 §6.4)。**Full の最後** に置く —
+        # 1 件 20 秒級の生成が記憶の整理 (Step 6〜9: 統合 / 事実抽出 / 訂正検証 /
+        # 要約) を 10〜20 分待たせていた (2026-09-12 実測: Full 時間の 77%)。
+        # 索引は corpus 側の別ストアなので、記憶の版 (E5) と順序の依存は無い。
+        ts = time.monotonic()
+        result["pseudo_queries"] = await self._step5_9_pseudo_queries(llm_client)
+        step_durations["step5_9_pseudo_query"] = round(time.monotonic() - ts, 3)
+
         await self._save_state_async()
         elapsed = round(time.monotonic() - t0, 3)
         self._log_full_completion(result, started_at, elapsed, step_durations)
