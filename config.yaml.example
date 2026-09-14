@@ -421,9 +421,10 @@ rag:
   # 応答パスに LLM は入らない。実測: recall@5 0.555 → 0.775 (+1.5ms)。
   pseudo_query:
     enabled: true                # 生成と検索の両方 (false で既存索引も引かない)
-    questions_per_chunk: 2       # 1 チャンクあたりの問いの本数
-    max_per_cycle: 50            # Full サイクル 1 回で生成するチャンク数 (27B で 1 件 20 秒級、静穏窓で yield するので大きめ)
-    backfill_per_cycle: 50       # ヒットの無いチャンクも埋める件数 (0 = ヒットしたチャンクだけ)
+    questions_per_chunk: 1       # 1 チャンクあたりの問いの本数 (decode は問い数に比例、misses は +1)
+    max_per_cycle: 20            # Full サイクル 1 回で生成するチャンク数の上限
+    backfill_per_cycle: 20       # ヒットの無いチャンクも埋める件数 (0 = ヒットしたチャンクだけ)
+    budget_seconds: 180          # 1 サイクルの生成に使う壁時計の予算 (秒、0 = 件数だけ)。Step 5.9 は Full の最後に走る
     max_chunk_chars: 1200        # 生成プロンプトへ渡す本文の上限文字数
     gate_min_coverage: 0.5       # 疑似クエリの関連性ゲート (拒否) を有効にする充足率 (較正済みの棒は充足率に依らず使う)
     quiet_seconds: 60            # チャットが終わってからこの秒数は生成を始めない (静穏窓)
@@ -827,7 +828,7 @@ memory:
     # 0.0 で全ノート LLM 進化 (現行挙動と同等)、1.0 で LLM 進化を完全停止
     confidence_threshold: 0.7
     # 1 サイクルあたり LLM 進化呼び出しの上限 (note_evolution_batch と小さい方を採用)
-    max_per_cycle: 10
+    max_per_cycle: 0             # 0 = LLM 進化なし (context_description はチャット経路に読み手が無い)
   conflict_resolver:
     # LLM 統合を実行する最小類似度。detect 閾値 (conflict_similarity_threshold)
     # 以上 / この値未満の中間帯は LLM 呼び出しをスキップし低優先度扱いにする
@@ -877,7 +878,7 @@ learning:
   partition_by_base_model: true   # true: local/learning/<base_model_stem>/ 配下へ分離しモデル切替で差し替え（未知モデルはゼロから学習）。false: レガシー flat（即ロールバック用）
   level2_adapter_partition: model_mode # LoRA限定(cvectorは常にモデル単位・対象外)。model_mode（既定=chat/createで別アダプタ・切替時にLoRAパスが変わればサーバ再起動、partition_by_base_model=true必須）/ model（レガシー=モデル単位でchat/create共有・mode切替で再起動なし）
   level1_min_experiences: 20      # Level 1 トリガーに必要な最小経験数
-  level1_generations: 10          # Level 1 の世代数
+  level1_generations: 5           # Level 1 の世代数 (停滞 3 世代で打ち切り。選択圧は採用ゲート側)
   level1_population_size: 5       # Level 1 の集団サイズ
   level2_min_failures: 50         # Level 2 トリガーに必要な最小失敗数
   # モード別の Level 2 発火閾値。未指定のモードは level2_min_failures を使う。
@@ -995,6 +996,8 @@ prompt:
   adoption_eval_cases: 6           # base prompt 採用ゲートの実測ケース数 (0 = 実測しない = 採用しない)
   adoption_min_gain: 0.05          # 採用に要する実測スコアの最小上昇幅 (候補平均 - 現行平均)
   adoption_min_cases: 3            # 進化・採用に要する評価ケースの最小数 (未満なら進化自体をスキップ)
+  adoption_sample_cases: 3         # 一対比較ゲートで成功ターンから足す標本ケース数 (0 = 失敗ケースだけ)
+  adoption_min_net_wins: 2         # 一対比較ゲートで採用に要する (候補の勝ち − 現行の勝ち) の最小値
 
 # ===== エージェント設定 =====
 agent:

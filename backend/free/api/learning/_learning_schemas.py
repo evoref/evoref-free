@@ -42,6 +42,14 @@ class Level1ResultEntry(BaseModel):
     reason: str | None = None
     measured_before: float | None = None
     measured_after: float | None = None
+    #: 一対比較ゲート (f_04 §4.5) の実測。``gate == "pairwise"`` のとき
+    #: ``measured_*`` は常に None なので、勝敗がこちらに載る。
+    gate: str | None = None
+    wins: int | None = None
+    losses: int | None = None
+    ties: int | None = None
+    #: 現行 vs 現行 (カナリア) の |純勝ち|。候補の純勝ちがこれを超えないと採用しない。
+    noise_floor: int | None = None
 
 
 class PolicyEvolverDomainStatus(BaseModel):
@@ -221,3 +229,19 @@ class ImprovementPoint(BaseModel):
 
 class ImprovementCurveResponse(BaseModel):
     lora_scores: list[ImprovementPoint] = Field(default_factory=list)
+
+
+class TurnFeedbackRequest(BaseModel):
+    """応答への明示評価 (👎 / 👍 / 取り消し)。``query`` はその応答を生んだユーザー
+    発話 (省略時はセッションの最新ターン)。"""
+
+    session_id: str
+    verdict: str = Field(pattern="^(negative|positive|clear)$")
+    query: str | None = None
+    note: str = ""
+
+
+class TurnFeedbackResponse(BaseModel):
+    recorded: bool
+    entry_id: str | None = None
+    message: str = ""

@@ -46,3 +46,10 @@ class PromptConfig(BaseModel):
     #: 1 件の採点で符号が反転する — 2026-09-08 の実機では偽陽性の訂正 2 件が
     #: 唯一の評価ケースになり、15 分のプロンプト進化がそのために走った。
     adoption_min_cases: int = Field(default=3, ge=0)
+    #: 一対比較ゲート (2026-09-14、f_04 §4.5): 失敗の証拠が無い成功ターンから
+    #: 標本ケースをこの件数まで足す (0 = 足さない = 従来どおり失敗ケースだけ)。
+    #: 評価器が一対比較 (``compare_prompts``) を持つときだけ使う。
+    adoption_sample_cases: int = Field(default=3, ge=0)
+    #: 一対比較ゲートで採用に要する「候補の勝ち − 現行の勝ち」の最小値
+    #: (tie は数えない)。1 だと 1 ケースの判定で反転するので 2。
+    adoption_min_net_wins: int = Field(default=2, ge=1)

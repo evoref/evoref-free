@@ -1202,6 +1202,8 @@ def _looks_like_bare_noun_fragment(sentence: str, *, max_len: int = 20) -> bool:
 
 __all__ = [
     "abstains_on_reference_material",
+    "count_response_defects",
+    "response_defect_total",
     "asks_verbatim_excerpt",
     "is_payload_dump",
     "carries_no_assertion",
@@ -1423,6 +1425,15 @@ _ABSTAIN_PREDICATE_RE = re.compile(
     re.IGNORECASE,
 )
 _ABSTAIN_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。．！？!?])\s*|\n+")
+
+
+#: ``[参考情報 N]`` の見出し (``inference._select_rag_block`` が付ける)。
+_REFERENCE_LABEL_RE = re.compile(r"\[参考情報\s*\d*\]|参考情報\s*\d+")
+
+
+def cites_reference_material(text: str) -> bool:
+    """応答が注入した ``[参考情報]`` を明示的に引いているか (純粋関数)。"""
+    return bool(_REFERENCE_LABEL_RE.search(text or ""))
 
 
 def abstains_on_reference_material(text: str) -> bool:
@@ -2577,3 +2588,48 @@ def classify_constraint_verifier(detail: str) -> str:
     if "箇条" in text or "形式" in text or "format" in text:
         return "constraint.form"
     return "constraint.length"
+
+
+# ── 応答の決定論的な欠陥計数 (採用ゲート、2026-09-14 監査 A) ──────────────
+
+def count_response_defects(response: str, query: str = "") -> dict[str, int]:
+    """応答に含まれる **検証可能な欠陥** を種類別に数える (純粋関数)。
+
+    base prompt 採用ゲート (f_04 §4.5) の勝敗判定に使う。LLM judge は
+    実測で判別力を持たなかった — 完全に同一の system prompt 同士の一対比較で
+    net が ±2 振れ (採用閾値と同じ大きさ)、規則を 1 つ削った劣化版が 2 回
+    とも勝ち、明らかに悪い規則を足した版も棄却できなかった (2026-09-14)。
+    原因は二重で、長文の再生成は temperature=0 でも途中で分岐し、judge が
+    その差に優劣を付ける。
+
+    ここで数えるのは規則台帳が謳う性質 (復唱しない / 末尾定型文を付けない /
+    参考情報の有無を話題にしない / 内部ラベルを出さない …) と一対一で対応する
+    **形の欠陥** で、本文が多少分岐しても判定が動きにくい。加点 (「良さ」) は
+    測らない — 測れるのは欠陥の有無だけで、それで十分に選択圧になる。
+    """
+    text = response or ""
+    return {
+        "query_echo": int(is_query_echo(text, query)) if query else 0,
+        "boilerplate_closing": int(has_boilerplate_closing(text)),
+        "cut_off": int(is_cut_off_answer(text)),
+        "cites_reference": int(cites_reference_material(text)),
+        "broken_ja_spacing": int(has_broken_ja_spacing(text)),
+        "chinese_leak": int(has_chinese_token_leak(text)),
+        "self_retraction": int(retracts_own_conclusion(text)),
+        "task_log_residue": int(looks_like_task_log_residue(text)),
+        "payload_dump": int(is_payload_dump(text)),
+        "internal_label": int(bool(_INTERNAL_LABEL_RE.search(text))),
+        "empty": int(not text.strip()),
+    }
+
+
+#: 出力形式の規則が禁じる内部ラベル (「[内部思考]・[分析]・[アクション]・[応答]
+#: 等のラベルを使わない」)。
+_INTERNAL_LABEL_RE = re.compile(
+    r"[\[［](?:内部思考|分析|アクション|応答|思考|推論|Thought|Analysis|Action|Response)[\]］]",
+)
+
+
+def response_defect_total(response: str, query: str = "") -> int:
+    """:func:`count_response_defects` の合計 (欠陥の件数)。"""
+    return sum(count_response_defects(response, query).values())

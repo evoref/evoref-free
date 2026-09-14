@@ -140,7 +140,10 @@ class NoteEvolverConfig(BaseModel):
     confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
     # 1 サイクルあたり LLM 進化呼び出しの上限。既存 ``note_evolution_batch`` と
     # 比較して小さい方が採用される。0 を設定すると LLM 進化を完全に停止する。
-    max_per_cycle: int = Field(default=10, ge=0)
+    # 既定 0 (2026-09-14): 生成される ``context_description`` はチャット経路に
+    # 読み手が無く (UI 一覧の表示のみ)、1 セッション 20 分の GPU が可視化専用
+    # だった。読み手が出来るまでルールベース進化のみ。
+    max_per_cycle: int = Field(default=0, ge=0)
 
 
 class ConflictResolverConfig(BaseModel):

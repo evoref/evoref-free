@@ -34,6 +34,10 @@ logger = get_logger("optimizer.prompt_eval")
 CASE_KIND_CORRECTION = "correction"
 CASE_KIND_REPHRASE = "rephrase"
 CASE_KIND_FAILED = "failed"
+#: ユーザーが 👎 を付けた実ターン (明示評価、2026-09-14)。任意の一言をヒントに。
+CASE_KIND_USER_NEGATIVE = "user_negative"
+#: 失敗の証拠が無い成功ターンからの標本 (一対比較ゲート専用、2026-09-14)。
+CASE_KIND_SAMPLE = "sample"
 
 
 @dataclass(frozen=True)
@@ -75,6 +79,27 @@ class PromptEvalProtocol(Protocol):
         ...
 
 
+@runtime_checkable
+class PromptPairEvalProtocol(Protocol):
+    """現行と候補を **同じケースで一対比較** する評価器 (2026-09-14、f_04 §4.5)。
+
+    絶対採点 (0〜1) は実データで 0.9 に張り付き、失敗ケースが無いと何も
+    測れなかった。一対比較は「どちらが良いか」だけを judge に問うので判別力が
+    高く、成功ターンの標本でも選択圧になる。
+    """
+
+    async def compare_prompts(
+        self, current_text: str, candidate_text: str, cases: list[PromptEvalCase],
+    ) -> dict[str, int]:
+        """各ケースを両 prompt で再生成し、judge に比較させる。
+
+        Returns:
+            ``{case_id: +1 (候補が良い) | -1 (現行が良い) | 0 (同等)}``。生成 /
+            判定に失敗したケースは **含めない**。
+        """
+        ...
+
+
 def _case_id(query: str) -> str:
     return hashlib.blake2b(
         query.strip().encode("utf-8"), digest_size=6,
@@ -82,7 +107,7 @@ def _case_id(query: str) -> str:
 
 
 def select_prompt_eval_cases(
-    experiences: list[dict], mode: str, limit: int,
+    experiences: list[dict], mode: str, limit: int, *, sample_cases: int = 0,
 ) -> list[PromptEvalCase]:
     """経験から採用ゲートの評価ケースを **新しい順に最大 ``limit`` 件** 選ぶ。
 
@@ -104,6 +129,13 @@ def select_prompt_eval_cases(
     2026-09-06 監査 F-01 で直したが、ここだけ位置頼みのまま残っていた)。
     宛先を解決できない訂正はケースを作らない — 誤ったケースは採用ゲートの
     測定そのものを狂わせるので、無いほうがましである。
+
+    - ``user_negative`` (ユーザーの 👎、2026-09-14) はそのターン自身。本人が
+      失敗と言った唯一の信号なので、失敗 / 言い直しより優先して残す。
+    - ``sample_cases`` が 1 以上なら、失敗の証拠が無い **成功ターン** からも
+      新しい順にその件数まで標本ケース (``CASE_KIND_SAMPLE``、ヒント無し) を
+      足す。絶対採点では意味を持たないが、一対比較 (現行 vs 候補) の
+      ゲートなら成功ターンでも選択圧になる (f_04 §4.5)。
 
     同一 query は最新 1 件に畳む。``limit <= 0`` なら空。
     """
@@ -156,7 +188,13 @@ def select_prompt_eval_cases(
             if used_corpus_evidence(exp):
                 grounded_dropped += 1
                 continue
-            if signals.get("turn_outcome") == "failed":
+            if signals.get("user_negative") is True:
+                picked[_case_id(query)] = PromptEvalCase(
+                    case_id=_case_id(query), query=query,
+                    kind=CASE_KIND_USER_NEGATIVE,
+                    hint=str(signals.get("user_note") or "").strip(),
+                )
+            elif signals.get("turn_outcome") == "failed":
                 picked[_case_id(query)] = PromptEvalCase(
                     case_id=_case_id(query), query=query, kind=CASE_KIND_FAILED,
                 )
@@ -172,6 +210,29 @@ def select_prompt_eval_cases(
     # 足切りと同じ ``depends_on_context`` で落とす。
     cases = [c for c in picked.values() if not depends_on_context(c.query)]
     dropped = len(picked) - len(cases)
+    if sample_cases > 0:
+        taken = {c.case_id for c in cases}
+        samples: list[PromptEvalCase] = []
+        for exp in reversed(mode_exp):
+            if len(samples) >= sample_cases:
+                break
+            signals = exp.get("signals") or {}
+            query = str(exp.get("query") or "").strip()
+            if (
+                not query or _case_id(query) in taken
+                or signals.get("user_negative") is True
+                or signals.get("user_correction")
+                or signals.get("correction_candidate")
+                or signals.get("turn_outcome") == "failed"
+                or used_corpus_evidence(exp) or depends_on_context(query)
+            ):
+                continue
+            taken.add(_case_id(query))
+            samples.append(PromptEvalCase(
+                case_id=_case_id(query), query=query, kind=CASE_KIND_SAMPLE,
+            ))
+        # 標本は古い側に置く (limit で切るとき失敗の証拠がある側を残す)
+        cases = list(reversed(samples)) + cases
     if dropped or grounded_dropped:
         logger.info(
             "prompt eval: %d context-bound / %d corpus-grounded case(s) excluded "
@@ -186,7 +247,10 @@ __all__ = [
     "CASE_KIND_CORRECTION",
     "CASE_KIND_FAILED",
     "CASE_KIND_REPHRASE",
+    "CASE_KIND_SAMPLE",
+    "CASE_KIND_USER_NEGATIVE",
     "PromptEvalCase",
     "PromptEvalProtocol",
+    "PromptPairEvalProtocol",
     "select_prompt_eval_cases",
 ]

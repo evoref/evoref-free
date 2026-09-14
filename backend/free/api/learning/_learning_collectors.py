@@ -93,6 +93,11 @@ def map_level1_results(raw_l1: dict | None) -> dict[str, Level1ResultEntry]:
             reason=val.get("reason"),
             measured_before=val.get("measured_before"),
             measured_after=val.get("measured_after"),
+            gate=val.get("gate"),
+            wins=val.get("wins"),
+            losses=val.get("losses"),
+            ties=val.get("ties"),
+            noise_floor=val.get("noise_floor"),
         )
     return result
 

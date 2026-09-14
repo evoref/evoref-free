@@ -1338,6 +1338,31 @@ _RUNTIME_EXTRA_FACT_RE = re.compile(
 )
 
 
+def query_short_circuits_tool_judge(query: str) -> bool:
+    """発話だけで「ツール判定を撃たずに決定論の事実で答える」と決まるか。
+
+    :meth:`DeliberativeAgent._judge_and_execute_tool` 冒頭の短絡 (会話位置 /
+    今日の会話 / ツール目録 / 自己構成 / 直前のコードブロック / 台帳の問い) と
+    同じ述語。``chat()`` は投機的にツール判定を起動するが、これらの問いでは
+    判定結果を使わずに cancel するだけなので、分類器往復 (1 回 10〜24 秒、
+    2026-09-12 実測) を空撃ちしないよう起動前に見る。述語が真でも短絡側の
+    追加条件 (履歴が無い等) で落ちた場合は、判定を **その場で直列に** 撃つ
+    (``tool_judge_task=None`` の経路) ので挙動は変わらない。
+    """
+    q = query or ""
+    return bool(
+        session_position_kind(q) is not None
+        or is_today_scope_query(q)
+        or tool_inventory_question(q)
+        or memory_architecture_question(q)
+        or self_learning_question(q)
+        or model_identity_question(q)
+        or prior_code_block_request(q) is not None
+        or own_process_question(q)
+        or self_assessment_question(q)
+    )
+
+
 class DeliberativeAgent:
     """Deliberative 層: LLM 推論 + 補助タスクによるツール判定
 

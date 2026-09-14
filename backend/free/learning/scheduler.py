@@ -60,6 +60,26 @@ def _fmt_measured(value: float | None) -> str:
     return "-" if value is None else f"{value:.3f}"
 
 
+def _fmt_adoption_measure(verdict: dict) -> str:
+    """採用ゲートの実測をログ 1 行に整形する (絶対採点 / 一対比較の両対応)。
+
+    一対比較 (f_04 §4.5) は ``measured_before/after`` を持たず勝敗だけを返す。
+    どちらのゲートで採用したかがログから読めないと、採用の妥当性を後から
+    検証できない (2026-09-14 監査 F-09 / F-10)。
+    """
+    cases = int(verdict.get("cases") or 0)
+    if verdict.get("wins") is not None:
+        return (
+            f"pairwise wins={verdict.get('wins')} losses={verdict.get('losses')} "
+            f"ties={verdict.get('ties')} noise_floor={verdict.get('noise_floor', 0)} "
+            f"on {cases} cases"
+        )
+    return (
+        f"measured {_fmt_measured(verdict.get('measured_before'))} → "
+        f"{_fmt_measured(verdict.get('measured_after'))} on {cases} cases"
+    )
+
+
 # 変異 (prompt mutation) が systemic に失敗したと判定する失敗率閾値。
 # この比率以上の変異が失敗し、かつ採用改善が 0 の場合、learning_cycle_l1 の
 # success を True と偽らない (ReadTimeout 等で実質何も学習できていないため。
@@ -1172,11 +1192,9 @@ class LearningScheduler:
             verdict = verdicts.get(mode) or {}
             if not verdict.get("adopt"):
                 logger.info(
-                    "Level 1 %s: no adoption (%s; measured %s → %s, "
-                    "heuristic %.4f → %.4f)",
+                    "Level 1 %s: no adoption (%s; %s, heuristic %.4f → %.4f)",
                     mode, verdict.get("reason", "not_measured"),
-                    _fmt_measured(verdict.get("measured_before")),
-                    _fmt_measured(verdict.get("measured_after")),
+                    _fmt_adoption_measure(verdict),
                     result.initial_fitness, result.final_fitness,
                 )
                 continue
@@ -1197,11 +1215,14 @@ class LearningScheduler:
                     eval_set_version=self._eval_set_version(),
                 )
                 self._record_prompt_adoption(mode, rollback_to, experiences)
+                # 一対比較ゲート (f_04 §4.5) は ``measured_before/after`` を
+                # 持たない (勝敗しか測らない)。以前はここが ``%.3f`` で
+                # ``None`` を整形しようとして TypeError を投げ、下の except が
+                # **採用に成功したターンを「Failed to save prompt」と記録** して
+                # いた (2026-09-14 監査 F-09: prompt は保存済み、ログだけが嘘)。
                 logger.info(
-                    "Level 1 %s: adopted evolved prompt (measured %.3f → %.3f "
-                    "on %d cases; heuristic %.4f → %.4f)",
-                    mode, verdict["measured_before"], verdict["measured_after"],
-                    verdict.get("cases", 0),
+                    "Level 1 %s: adopted evolved prompt (%s; heuristic %.4f → %.4f)",
+                    mode, _fmt_adoption_measure(verdict),
                     result.initial_fitness, result.final_fitness,
                 )
             except Exception as e:
@@ -1217,6 +1238,16 @@ class LearningScheduler:
                 "fitness_after": result.final_fitness,
                 "measured_before": verdict.get("measured_before"),
                 "measured_after": verdict.get("measured_after"),
+                # 一対比較ゲートの実測 (f_04 §4.5)。``measured_*`` は絶対採点
+                # 専用で、一対比較では常に None になる — これを載せないと
+                # ``/api/learning/status`` が「improved=true, 実測値なし」と
+                # いう読めない状態になり、新しいゲートが UI から不可視だった
+                # (2026-09-14 監査 F-10)。
+                "wins": verdict.get("wins"),
+                "losses": verdict.get("losses"),
+                "ties": verdict.get("ties"),
+                "noise_floor": verdict.get("noise_floor"),
+                "gate": "pairwise" if verdict.get("wins") is not None else "absolute",
                 "reason": verdict.get("reason"),
                 "mutation_attempts": getattr(result, "mutation_attempts", 0),
                 "mutation_failures": getattr(result, "mutation_failures", 0),
@@ -1252,6 +1283,83 @@ class LearningScheduler:
         min_cases = int(prompt_cfg.get("adoption_min_cases", 3))
         return max(0, cases), max(0.0, gain), max(0, min_cases)
 
+    def _pairwise_gate_available(self) -> bool:
+        """評価器が一対比較 (``compare_prompts``) を持つか (f_04 §4.5)。"""
+        return callable(getattr(self._prompt_eval, "compare_prompts", None))
+
+    def _sample_cases(self) -> int:
+        """一対比較ゲートで成功ターンから足す標本ケース数 (絶対採点なら 0)。"""
+        if not self._pairwise_gate_available():
+            return 0
+        prompt_cfg = self._config.get("prompt") or {}
+        return max(0, int(prompt_cfg.get("adoption_sample_cases", 3)))
+
+    def _min_net_wins(self) -> int:
+        prompt_cfg = self._config.get("prompt") or {}
+        return max(1, int(prompt_cfg.get("adoption_min_net_wins", 2)))
+
+    async def _skip_without_selection_pressure(
+        self, session: Level1Session, llm_client,
+    ) -> dict | None:
+        """どのモードにも選択圧が無ければ Level 1 を **始めない** (2026-09-14)。
+
+        以前は選択圧ゲートが session 作成の後にあり、全モードが落ちても
+        Step 11/12/14 と finalize が走って ``learning_state.json`` /
+        ``level1_history/<id>.json`` / ``fewshot_pool.json`` /
+        ``policy_evolver_state.json`` を書き換え、履歴上は「完走」に見えていた
+        (2026-09-12 実測: 12 run 全てが 0.1 秒の空回し)。成功経験を手本プールへ
+        流す分 (補充 + Step 14 GC) だけは行い、session は捨てて経験カーソルを
+        進める (同じ経験で毎 tick 再判定しない)。
+
+        Returns:
+            スキップした場合はその記録、選択圧のあるモードが 1 つでもあれば ``None``。
+        """
+        prompt_texts = self._collect_mode_prompt_texts()
+        if not prompt_texts:
+            return None
+        kept, skipped = self._drop_modes_without_selection_pressure(
+            prompt_texts, session,
+        )
+        if kept:
+            return None
+        # snapshot は応答本文を持たない (L-D3) ので、手本の補充と Step 12 は
+        # 通常経路と同じく live バッファから渡す。
+        live_experiences = self._get_filtered_experiences()
+        try:
+            await self._update_fewshot_pool_from_experiences(
+                live_experiences, llm_client,
+            )
+        except Exception as exc:  # noqa: BLE001 - 手本の補充失敗で skip 自体は止めない
+            logger.warning("Few-shot pool update failed (no-pressure skip): %r", exc)
+        side_results: dict[str, dict] = {}
+        durations: dict[str, float] = {}
+        # Step 12 (policy 進化) はプロンプト進化とは別の fitness (agent / long_form
+        # ドメイン) を持ち LLM も使わないので、プロンプト側の選択圧が無くても回す。
+        try:
+            self._step12_policy_evolver(live_experiences, side_results, durations)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Step 12 policy evolver failed (no-pressure skip): %r", exc)
+        try:
+            self._step14_fewshot_gc(side_results, durations)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Step 14 few-shot GC failed (no-pressure skip): %r", exc)
+        self.discard_active_session()
+        self._last_run = time.time()
+        self._last_level1_results = {
+            "skipped": True,
+            "reason": "no_selection_pressure",
+            "modes": skipped,
+            **{k: v for k, v in side_results.items() if k == "policy_params"},
+        }
+        self._save_state()
+        logger.info(
+            "Level 1 skipped: no selection pressure in any mode (%s); "
+            "%d experience(s) consumed, few-shot pool updated",
+            ", ".join(f"{m}={v.get('reason')}" for m, v in skipped.items()),
+            len(session.experience_snapshot),
+        )
+        return dict(self._last_level1_results)
+
     def _drop_modes_without_selection_pressure(
         self,
         prompt_texts: dict[str, str],
@@ -1284,7 +1392,7 @@ class LearningScheduler:
                 e for e in session.experience_snapshot if e.get("mode") == mode
             ]
             cases = select_prompt_eval_cases(
-                mode_exp, mode, max(1, min_cases),
+                mode_exp, mode, max(1, min_cases), sample_cases=self._sample_cases(),
             )
             if len(mode_exp) < threshold:
                 reason = "insufficient_experiences"
@@ -1303,6 +1411,74 @@ class LearningScheduler:
                 "improved": False, "skipped": True, "reason": reason,
             }
         return kept, skipped
+
+    async def _measure_pairwise(
+        self, mode: str, current: str, candidate: str, cases: list,
+        min_cases: int, verdict: dict,
+    ) -> None:
+        """一対比較ゲート (f_04 §4.5): 候補の純勝ちが下限 **かつ雑音フロア** を超えたら採用。
+
+        勝敗は評価器の決定論の欠陥数 (``compare_prompts``)。評価器が
+        ``compare_with_noise_floor`` を持てば、現行 vs 現行 (カナリア) の
+        |純勝ち| を雑音フロアとして受け取り、候補の純勝ちがそれを **超えない**
+        かぎり採用しない。長文の再生成は temperature=0 でも分岐するので、
+        同一 prompt でも差が出うる (2026-09-14 監査 A)。
+        """
+        min_net = self._min_net_wins()
+        noise = 0
+        try:
+            with_canary = getattr(self._prompt_eval, "compare_with_noise_floor", None)
+            if callable(with_canary):
+                outcomes, canary = await with_canary(current, candidate, cases)
+                noise = abs(
+                    sum(1 for v in canary.values() if v > 0)
+                    - sum(1 for v in canary.values() if v < 0)
+                )
+            else:
+                outcomes = await self._prompt_eval.compare_prompts(current, candidate, cases)
+        except Exception as exc:  # noqa: BLE001 - 実測失敗は不採用で継続
+            logger.warning(
+                "Level 1 %s: pairwise adoption gate failed: %r", mode, exc, exc_info=True,
+            )
+            verdict["reason"] = "gate_error"
+            return
+        measured = len(outcomes)
+        verdict["cases"] = measured
+        verdict["noise_floor"] = noise
+        if measured < max(1, (len(cases) + 1) // 2) or measured < min_cases:
+            verdict["reason"] = "insufficient_measured_cases"
+            return
+        wins = sum(1 for v in outcomes.values() if v > 0)
+        losses = sum(1 for v in outcomes.values() if v < 0)
+        ties = measured - wins - losses
+        verdict.update({"wins": wins, "losses": losses, "ties": ties})
+        net = wins - losses
+        if net >= min_net and net > noise:
+            verdict["adopt"] = True
+            verdict["reason"] = "pairwise_net_wins"
+        elif net >= min_net:
+            verdict["reason"] = "within_noise_floor"
+        else:
+            verdict["reason"] = "no_pairwise_gain"
+        logger.info(
+            "Level 1 %s: pairwise adoption gate wins=%d losses=%d ties=%d "
+            "noise_floor=%d on %d/%d cases (%s)",
+            mode, wins, losses, ties, noise, measured, len(cases), verdict["reason"],
+        )
+        dl = self._debug_logger
+        if dl is not None:
+            dl.log_learning_cycle(cycle_num=1, data={
+                "level": 1, "phase": 2, "component": "prompt_adoption_gate",
+                "mode": mode, "gate": "pairwise", "cases_selected": len(cases),
+                "cases_measured": measured, "wins": wins, "losses": losses,
+                "ties": ties, "noise_floor": noise, "min_net_wins": min_net,
+                "adopt": verdict["adopt"], "reason": verdict["reason"],
+                "cases": [
+                    {"case_id": c.case_id, "kind": c.kind, "query": c.query[:80],
+                     "verdict": outcomes.get(c.case_id)}
+                    for c in cases
+                ],
+            })
 
     async def _measure_prompt_adoptions(
         self,
@@ -1343,7 +1519,9 @@ class LearningScheduler:
             if max_cases <= 0:
                 verdict["reason"] = "gate_disabled"
                 continue
-            cases = select_prompt_eval_cases(experiences, mode, max_cases)
+            cases = select_prompt_eval_cases(
+                experiences, mode, max_cases, sample_cases=self._sample_cases(),
+            )
             if not cases:
                 verdict["reason"] = "no_eval_cases"
                 continue
@@ -1356,6 +1534,11 @@ class LearningScheduler:
                 continue
             if self._cancelled or self.should_yield():
                 verdict["reason"] = "gate_interrupted"
+                continue
+            if self._pairwise_gate_available():
+                await self._measure_pairwise(
+                    mode, current, candidate, cases, min_cases, verdict,
+                )
                 continue
             try:
                 before = await self._prompt_eval.score_prompt(current, cases)
@@ -1593,6 +1776,10 @@ class LearningScheduler:
         if isinstance(session_or_skip, dict):
             return session_or_skip
         session = session_or_skip
+        if not session.completed_phases and session.yield_count == 0:
+            no_pressure = await self._skip_without_selection_pressure(session, llm_client)
+            if no_pressure is not None:
+                return no_pressure
 
         # 1 cycle = 1 trace_id を発行 (bg_task wrapper の trace_id を退避)
         from backend.trace_context import generate_trace_id, trace_id_var
@@ -2107,6 +2294,14 @@ class LearningScheduler:
                 mv = val.get(mk)
                 if mv is not None:
                     entry[mk] = round(float(mv), 4)
+            # 一対比較ゲートの実測 (f_04 §4.5)。ここで落とすと
+            # ``last_level1_results`` / API に「improved と reason だけ」が残り、
+            # 何勝何敗・雑音フロアいくつで決まったかが追えない (2026-09-14
+            # 実機: stats には載せたのにサマリが白名単で捨てていた)。
+            for mk in ("gate", "wins", "losses", "ties", "noise_floor"):
+                mv = val.get(mk)
+                if mv is not None:
+                    entry[mk] = mv
             summary[key] = entry
             (noop_phases if skipped else executed_phases).append(key)
         summary["_executed_phases"] = executed_phases

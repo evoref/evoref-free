@@ -25,6 +25,9 @@ if TYPE_CHECKING:
 
 logger = get_logger("memory.sleep.summarize")
 
+#: 要約済みセッションを作り直す最小の追加ターン数。
+RESUMMARIZE_MIN_TURNS = 10
+
 #: 要約プロンプトへ載せるターン数 (末尾から)。
 _SUMMARY_TURN_WINDOW = 20
 
@@ -105,7 +108,11 @@ async def summarize_unsummarized_sessions(
         # 恒久化すると後半の訂正が要約に載らず、search_history 経由で訂正前の値が
         # 「独立した根拠」として再注入される (2026-07-26 ライブ検証: 火曜→水曜と
         # 訂正済みの予約が過去セッションの要約から火曜へ巻き戻った)。
-        if entry.summary is not None and entry.turn_count <= entry.summary_turn_count:
+        if entry.summary is not None and (
+            entry.turn_count - entry.summary_turn_count < RESUMMARIZE_MIN_TURNS
+        ):
+            # 1〜2 ターン伸びるたびに作り直さない — 同じセッションが 20 サイクルで
+            # 26 回要約されていた (2026-09-12 実測、入力は末尾 20 ターン固定)。
             continue
 
         session = mgr.get_session(entry.session_id)

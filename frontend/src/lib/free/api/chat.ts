@@ -93,13 +93,17 @@ export interface ChatStreamEvent {
 	output_truncated?: OutputTruncatedInfo;
 }
 
+/** 文書 (corpus パッケージ) の参加モード。auto = 問いと較正で決める / on = 問い側の抑止を掛けない / off = このターンは引かない */
+export type CorpusMode = 'auto' | 'on' | 'off';
+
 /** SSE ストリーミングチャット */
 export async function* chatStream(
 	message: string,
 	mode: string,
 	sessionId?: string,
 	files?: string[],
-	signal?: AbortSignal
+	signal?: AbortSignal,
+	corpusMode: CorpusMode = 'auto'
 ): AsyncGenerator<ChatStreamEvent> {
 	const streamStart = IS_DEV ? performance.now() : 0;
 	const eventCounts: Record<string, number> = IS_DEV
@@ -118,7 +122,8 @@ export async function* chatStream(
 				message,
 				mode,
 				session_id: sessionId,
-				files
+				files,
+				corpus_mode: corpusMode
 			}),
 			signal
 		});
@@ -251,6 +256,28 @@ export async function* chatStream(
 		}
 	} finally {
 		reader.releaseLock();
+	}
+}
+
+/** 応答への明示評価 (👎 / 👍 / 取り消し)。query はその応答を生んだユーザー発話 */
+export type TurnFeedbackVerdict = 'negative' | 'positive' | 'clear';
+
+export async function sendTurnFeedback(
+	sessionId: string,
+	verdict: TurnFeedbackVerdict,
+	query?: string,
+	note = ''
+): Promise<{ recorded: boolean; entry_id?: string | null }> {
+	try {
+		const res = await fetch(`${BASE_URL}/learning/feedback`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ session_id: sessionId, verdict, query, note })
+		});
+		if (!res.ok) return { recorded: false };
+		return (await res.json()) as { recorded: boolean; entry_id?: string | null };
+	} catch {
+		return { recorded: false };
 	}
 }
 

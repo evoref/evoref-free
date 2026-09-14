@@ -44,7 +44,14 @@
 		"send_blocked_while_streaming": "生成中は送信できません。応答の完了後に送信してください（入力内容は保持されます）。",
 		"code_in_editor": "→ エディタに出力しました（{lang}）",
 		"code_output_done": "完了しました",
-		"long_form_quality_issue": "生成 完了 ({total} ユニット) — 品質チェックで要確認"
+		"long_form_quality_issue": "生成 完了 ({total} ユニット) — 品質チェックで要確認",
+		"feedback_good": "この回答は良かった",
+		"feedback_bad": "この回答は良くなかった",
+		"feedback_note_placeholder": "何が良くなかったか (任意)",
+		"feedback_send": "送信",
+		"feedback_sent_bad": "評価を記録しました (良くなかった)",
+		"feedback_sent_good": "評価を記録しました (良かった)",
+		"feedback_failed": "評価を記録できませんでした"
 	},
 	"sidebar": {
 		"chat": "チャット",
@@ -74,7 +81,12 @@
 		"stop_failed": "停止に失敗しました",
 		"force_restart": "強制再起動（既存プロセスを終了して再起動）",
 		"restart": "再起動",
-		"debug_mode": "DEBUG モード"
+		"debug_mode": "DEBUG モード",
+		"documents": "文書",
+		"documents_auto": "自動",
+		"documents_on": "常に使う",
+		"documents_off": "使わない",
+		"documents_hint": "インストール済みの文書 (corpus) をこの会話の応答に使うか。自動 = 問いと関連度で決める"
 	},
 	"vram": {
 		"placement_cpu": "CPU"

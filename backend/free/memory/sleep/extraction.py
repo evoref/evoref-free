@@ -32,7 +32,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from backend.free.memory.notes.note_builder import is_single_valued_subject
+from backend.free.memory.notes.note_builder import (
+    is_multi_valued_subject,
+    is_single_valued_subject,
+)
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -293,6 +296,29 @@ def _supersede_corrected_slots(
                 o for o in siblings
                 if needle and needle in norm_span(str(getattr(o, "object", "") or ""))
             ]
+        elif is_multi_valued_subject(fact.subject):
+            # **並列多値スロットは、どの要素を置き換えるか特定できないなら
+            # 畳まない。** 単値スロットの全畳みは「単値」の定義そのものだが、
+            # 多値 (family / schedule) で同じことをすると、無関係な兄弟が
+            # 巻き添えで消える。旧値 span が取れたときは上の分岐が宛先を
+            # 絞るので、ここに来るのは「訂正だと分かるが宛先が分からない」
+            # 場合だけで、そのときは **並列に足す** のが多値の意味。
+            #
+            # 実インシデント (2026-09-14 ライブ監査 F-02): 「妻ではなく夫
+            # です」の旧値が 1 文字ガードで取れず ``value_update`` が空の
+            # まま ``from_correction`` で畳みに来て、``mem.personal.family``
+            # の live 3 件が「夫です。私の書き間違い」1 件になり、息子の
+            # 学年が永久に失われた (Full を回しても復旧しない)。
+            #
+            # ``multi_valued: true`` (fact_attributes.yaml) はこれまで
+            # 注入側 (MemoryInjector) しか読んでおらず、書き込み側に意味を
+            # 持っていなかった。ここが最初の読み手になる。
+            logger.info(
+                "Step 8 [%s]: multi-valued slot %s kept intact "
+                "(correction without an identifiable old value)",
+                label, fact.subject,
+            )
+            continue
         for old in siblings:
             if old.id == fact.id or old.predicate != fact.predicate:
                 continue
@@ -335,12 +361,80 @@ def _supersede_corrected_slots(
                     "Step 8 [%s]: failed to supersede %s -> %s: %s",
                     label, old.id, fact.id, exc,
                 )
+    superseded += _retire_stale_arrivals_into_corrected_slots(store, persisted, label)
     if superseded:
         logger.info(
             "Step 8 [%s]: superseded %d stale slot value(s) by corrections",
             label, superseded,
         )
     return superseded
+
+
+def _retire_stale_arrivals_into_corrected_slots(
+    store: "SemanticFactStore", persisted: list, label: str,
+) -> int:
+    """訂正済みスロットへ **後から届いた古い発話の値** を到着時に畳む。
+
+    多値スロットでは畳む条件が「旧値を名指せたか」なので、その条件を満たさない
+    ファクトは畳む側にも畳まれる側にも回らない。そこへ Step 8.3 (属性分割) が
+    **古い発話を後から読み直して** 値を書くと、訂正で確定したはずのスロットに
+    旧値が並ぶ。
+
+    実インシデント (2026-09-14 監査 F-14): V01 の「建設会社で施工管理をして
+    います」(09:53) が ``occupation`` に入り、V02 で「勤務先は建設会社ではなく
+    設備工事会社です」(09:54) と訂正されて ``employer`` = 設備工事会社
+    (``from_correction``) が立った。その **同じ Full の Step 8.3** が V01 の粗い
+    値を分割して ``employer`` = 建設会社 を後から書き、訂正の前後が両方 live に
+    なった。粗い値 (occupation) 自体は訂正されていないので
+    ``_supersede_coarser_siblings`` の後継も無い。
+
+    判定は時刻と印だけで、語彙に依存しない: **そのスロットに自分より新しい
+    ``from_correction`` の live 値があるなら、自分は既に無効化された世代**。
+    訂正は自分より前の発言しか無効化できない (G-04) という既存の原則の対偶で、
+    符号が逆になっただけ。
+    """
+    retired = 0
+    for fact in persisted:
+        if getattr(fact, "superseded_by", None):
+            continue
+        if getattr(fact, "from_correction", False):
+            continue
+        try:
+            siblings = store.search_by_subject(
+                fact.subject, include_superseded=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Step 8 [%s]: failed to list slot %s: %s", label, fact.subject, exc,
+            )
+            continue
+        winner = None
+        for other in siblings:
+            if other.id == fact.id or other.predicate != fact.predicate:
+                continue
+            if other.superseded_by or not getattr(other, "from_correction", False):
+                continue
+            if getattr(other, "created_at", 0.0) <= getattr(fact, "created_at", 0.0):
+                continue
+            if winner is None or other.created_at > winner.created_at:
+                winner = other
+        if winner is None:
+            continue
+        try:
+            store.supersede(fact.id, winner.id)
+        except (KeyError, ValueError) as exc:
+            logger.warning(
+                "Step 8 [%s]: failed to retire stale arrival %s -> %s: %s",
+                label, fact.id, winner.id, exc,
+            )
+            continue
+        retired += 1
+        logger.info(
+            "Step 8 [%s]: %s superseded on arrival — the slot was already "
+            "corrected by a later utterance (%s)",
+            label, fact.id, winner.id,
+        )
+    return retired
 
 
 #: ``mem.<kind>.<attr>`` の ``kind`` → ``FactType``。値アンカー用の逆引き。
@@ -378,8 +472,13 @@ def collect_live_attribute_values(
             continue
         fact_type = _FACT_TYPE_BY_KIND.get(parts[1])
         attr = parts[2]
-        if not fact_type or attr == "user":
+        if not fact_type:
             continue
+        # 汎用スロット (``user``) も宛先に含める (2026-09-14 監査 F-12)。以前は
+        # 「宛先を絞れない」として除外していたが、それでは汎用スロットに落ちた
+        # 値 (「朝型です」) を本人が訂正しても宛先が無く、訂正が迷子になる。
+        # 曖昧さの制御はアンカー索引側 (``_slot_anchor_index``: 汎用は固有
+        # スロットに無い語でしか当たらない、同長なら固有が勝つ) が持つ。
         text = (fact.text or "").strip()
         if text:
             values.setdefault((fact_type, attr), []).append(text)

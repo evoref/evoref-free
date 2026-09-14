@@ -22,7 +22,7 @@
 		currentMode,
 		modeRestartStatus,
 		attachedFiles,
-		clearFiles
+		clearFiles, corpusMode
 	} from '$lib/free/stores/chat';
 	import { chatStream, cancelChat } from '$lib/free/api';
 	import { get } from 'svelte/store';
@@ -92,7 +92,7 @@
 		});
 
 		try {
-			for await (const event of chatStream(text, get(currentMode), get(sessionId), files, abortController.signal)) {
+			for await (const event of chatStream(text, get(currentMode), get(sessionId), files, abortController.signal, get(corpusMode))) {
 				if (event.type === 'token' && event.token) {
 					appendToLastAssistant(event.token);
 				} else if (event.type === 'token_info' && event.token_info) {

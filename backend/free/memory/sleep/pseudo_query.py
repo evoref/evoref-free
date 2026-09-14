@@ -11,6 +11,7 @@ CartridgeManager / PseudoQueryGenerator を操作するオーケストレーシ�
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -159,9 +160,14 @@ async def generate_pseudo_queries(
 
     targets = collect_targets(
         cartridge_manager,
-        max_per_cycle=int(cfg.get("max_per_cycle", 50)),
+        max_per_cycle=int(cfg.get("max_per_cycle", 20)),
         backfill_per_cycle=int(cfg.get("backfill_per_cycle", 0)),
     )
+    try:
+        budget_seconds = float(cfg.get("budget_seconds", 180.0))
+    except (TypeError, ValueError):
+        budget_seconds = 180.0
+    deadline = (time.monotonic() + budget_seconds) if budget_seconds > 0 else None
     total = sum(len(v) for v in targets.values())
     if total == 0:
         return 0
@@ -169,7 +175,7 @@ async def generate_pseudo_queries(
 
     generator = PseudoQueryGenerator(
         aux_client,
-        questions_per_chunk=int(cfg.get("questions_per_chunk", 2)),
+        questions_per_chunk=int(cfg.get("questions_per_chunk", 1)),
         max_chunk_chars=int(cfg.get("max_chunk_chars", 1200)),
     )
     corpus = cartridge_manager.corpus
@@ -187,6 +193,13 @@ async def generate_pseudo_queries(
         for evidence_id in evidence_ids:
             if (is_cancelled and is_cancelled()) or (should_pause and should_pause()):
                 logger.info("Step 5.9: paused/cancelled after %d chunk(s)", written)
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.info(
+                    "Step 5.9: time budget (%.0fs) spent after %d chunk(s); "
+                    "remaining targets retry in a later cycle", budget_seconds, written,
+                )
+                preempted = True
                 break
             row = snapshot.row_of(evidence_id)
             if row is None:

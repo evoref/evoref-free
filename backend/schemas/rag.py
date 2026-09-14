@@ -50,15 +50,22 @@ class PseudoQueryConfig(BaseModel):
 
     # 生成と検索の両方を切る (既存の索引は残る)。
     enabled: bool = True
-    # 1 チャンクあたりの問いの本数。
-    questions_per_chunk: int = Field(default=2, ge=1, le=5)
+    # 1 チャンクあたりの問いの本数。decode は問いの数に比例する (27B で 1 問
+    # ≈ 7 秒) ので既定 1。取りこぼした問い (misses) のあるチャンクは言い換えを
+    # 1 つ足す (f_01 §6.4)。
+    questions_per_chunk: int = Field(default=1, ge=1, le=5)
     # Full サイクル 1 回で生成するチャンク数の上限 (27B で 1 件 20 秒級)。静穏窓
     # + 横取りでサイクルを畳む協調 yield があるので、上限を小さく保つ理由は
     # 「Full を短く終える」だけ。20 では 1124 チャンクの充足 50% に 28 サイクル要る。
-    max_per_cycle: int = Field(default=50, ge=1)
-    # ヒットの無いチャンクも snapshot 行順に埋める件数 (27B で 1 サイクル約 17 分)。
-    # 疑似クエリの充足率が関連性ゲートの前提なので既定で埋める。0 で lazy のみ。
-    backfill_per_cycle: int = Field(default=50, ge=0)
+    max_per_cycle: int = Field(default=20, ge=1)
+    # ヒットの無いチャンクも snapshot 行順に埋める件数。疑似クエリの充足率が
+    # 関連性ゲートの前提なので既定で埋める。0 で lazy のみ。
+    backfill_per_cycle: int = Field(default=20, ge=0)
+    # 1 サイクルの生成に使う壁時計の予算 (秒)。件数より先にこちらで畳む —
+    # 1 件 20 秒級なので件数上限だけでは Full が 20 分伸びる (2026-09-12 実測、
+    # 記憶の整理を待たせていた)。チャンク境界で判定し、書いた分は commit する。
+    # 0 で無効 (件数だけ)。
+    budget_seconds: float = Field(default=180.0, ge=0.0)
     # 生成プロンプトへ渡す本文の上限文字数。
     max_chunk_chars: int = Field(default=1200, ge=100)
     # 疑似クエリの関連性ゲート (Step 3d の拒否) を有効にする充足率 (問いを持つ

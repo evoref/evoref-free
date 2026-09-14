@@ -109,7 +109,10 @@ class LearningConfig(BaseModel):
     level2_adapter_partition: Literal["model", "model_mode"] = "model_mode"
 
     level1_min_experiences: int = Field(default=20, ge=1)
-    level1_generations: int = Field(default=10, ge=1)
+    #: 欠陥率 fitness が平坦なモードでは停滞 3 世代で打ち切られ、10 世代の
+    #: 予定が毎回 3 世代で終わっていた (2026-09-14 実測)。選択圧は採用ゲート
+    #: 側にあるので、変異生成は少数で足りる。
+    level1_generations: int = Field(default=5, ge=1)
     level1_population_size: int = Field(default=5, ge=1)
     level2_min_failures: int = Field(default=50, ge=1)
     # モード別の Level 2 発火閾値。未指定のモードは level2_min_failures に

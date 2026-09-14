@@ -14,6 +14,8 @@ import numpy as np
 from backend.exceptions import RAGError
 from backend.i18n_helper import prompt_locale
 from backend.log_config import get_logger
+from backend.free.core.date_math_cue import query_has_date_math_cue
+from backend.free.core.inference import eligible_rag_indices
 from backend.free.core.intent_vocab import refers_to_previous_output
 from backend.free.memory.corrections import corrections_by_target
 from backend.trace_context import run_in_executor_with_context
@@ -304,6 +306,7 @@ def attach_previous_chunk_context(
 
 def attach_superseding_corrections(
     episodic, sources: list[tuple[str, float, str]],
+    correction_trail: dict[str, str] | None = None,
 ) -> list[tuple[str, float, str]]:
     """採用済みチャンクのうち訂正されたものに注記を付け、訂正本文を随伴させる。
 
@@ -319,19 +322,42 @@ def attach_superseding_corrections(
 
     被訂正ノートを落とすのではなく **両方残す**。訂正は話題語を落としている
     ため単独では「何の締切か」が失われる。
+
+    宛先は 2 つの情報源の **和** で決める:
+
+    1. ``corrections.corrections_by_target`` — 同一セッションの user ノート
+       同士を語の重なりで結ぶ。短期シャードのノートだけを見る。
+    2. ``correction_trail`` — SemMem の世代 (``superseded_by`` +
+       ``from_correction``) から引いた ``{被訂正ノート id: 現在値}``。
+       **セッションにも短期 / 長期の別にも依存しない。**
+
+    1 だけだと、セッションを跨いだ訂正が 1 件も解けない。実インシデント
+    (2026-09-14 監査 F-01): 自己紹介 (T01) の「建設会社で施工管理」が別
+    セッション (T07) で訂正されたのに注記が付かず、``[参考情報]`` に原文が
+    素のまま載って、モデルが *「参考情報1の建設会社を優先して記載しています」*
+    と **明示的に訂正前を採用** した。記憶がセッションを跨いで持続する製品で、
+    訂正だけ跨げないのは構造的な穴だった。
     """
     if episodic is None or not sources:
         return sources
     try:
         notes = episodic.short_notes()
     except Exception:
-        return sources
+        notes = []
     kept_ids = {cid for cid, _, _ in sources}
     links = [
         (target_id, getattr(corr, "id", ""), getattr(corr, "content", "") or "")
         for target_id, corr in corrections_by_target(notes).items()
         if target_id in kept_ids
     ]
+    # SemMem 由来の宛先を足す (同一セッションで解けた分は上書きしない —
+    # そちらは訂正発話の本文を随伴でき、文脈が濃い)。
+    resolved = {target_id for target_id, _, _ in links}
+    for target_id, current in (correction_trail or {}).items():
+        if target_id in kept_ids and target_id not in resolved and current:
+            # 訂正ノート本体は手元に無いので、現在値の言明を随伴させる。
+            # id は注記用の合成キー (episodic のノート id と衝突しない)。
+            links.append((target_id, f"semmem:{target_id}", current))
     if not links:
         return sources
 
@@ -1042,7 +1068,9 @@ def _resolve_keep_floor(
     1. **絶対の棒** — ``auto`` かつ較正が効いていれば較正済み ``relevance``、
        ``manual`` / 較正なしでは config の静的値。静的値は埋め込みスケールが
        変わると到達不能になるので ``top_raw_score`` との相対で緩める
-       (:data:`_RELATIVE_FLOOR_RATIO`、**緩める方向**)。
+       (:data:`_RELATIVE_FLOOR_RATIO`、**緩める方向**)。緩和の定数は旧スケール
+       由来で、埋め込みを替えると逆に全通しになる — 未較正の窓を短くするのが
+       対処で、窓の中の挙動は変えない (2026-09-14 監査 F-04、下の枝を参照)。
     2. **相対の棒** — そのターンの ``top_raw_score`` の
        :data:`_RELATIVE_KEEP_RATIO` 倍 (**絞る方向**)。絶対の棒は
        「ノイズより上か」しか見ておらず、較正時は定義上ノイズの 5% が通る。
@@ -1076,6 +1104,20 @@ def _resolve_keep_floor(
         ):
             absolute = absolute + (confidence - absolute) * _WEAK_SET_MARGIN
     elif top_raw_score > 0.0:
+        # **この枝は「較正が未確定」= 棒がスケール非依存でない状態。** 緩和の
+        # 定数 (:data:`_RELATIVE_FLOOR_ABSOLUTE_MIN` = 0.24) は旧 STM combined
+        # スケールのノイズ p90 で、bge-m3 (ノイズ p50 0.365 / p95 0.584) では
+        # ノイズ帯の下にあり実質全通しになる。実測 (2026-09-14 監査 F-04/F-06):
+        # 較正確定前の 35 ターンで cosine 0.386 の無関係チャンクが 5 件
+        # ``[参考情報]`` に載り、その窓で「evoref の 4 つの pillar は？」が
+        # ``Evoref Core / UI / State / Utils`` と **完全に捏造** された
+        # (較正後の同型の問いは「記載はありません」と正答している)。
+        #
+        # ここを厳しくすると「静的値が到達不能で注入ゼロ」という逆の壊れ方
+        # (2026-08-16 で実測) に戻るので、**棒ではなく較正の遅れを直す** —
+        # ``SleepTimeWorker`` の Light にも較正リトライを置き、確定を Full 待ち
+        # にしない (``_run_light_locked``)。この枝が使われる窓を数ターンに
+        # 縮めるのが正しい対処で、窓の中の挙動は従来どおり「緩めて救う」。
         relaxed = min(configured, top_raw_score * _RELATIVE_FLOOR_RATIO)
         absolute = max(relaxed, min(configured, _RELATIVE_FLOOR_ABSOLUTE_MIN))
     else:
@@ -1132,6 +1174,8 @@ async def unified_search(
     *,
     session_id: str = "default",
     judge_tracker: "JudgeUsageTracker | None" = None,
+    corpus_mode: str = "auto",
+    correction_trail: dict[str, str] | None = None,
 ) -> SearchResult:
     """統合検索パイプライン: Self-RAG + エピソード記憶 + corpus
 
@@ -1168,6 +1212,11 @@ async def unified_search(
             フロントエンド指定 session_id を渡す。
         judge_tracker: content gate (create モード) のセッション単位
             カウンタ。``None`` なら上限を評価しない (テスト経路互換)。
+        correction_trail: SemMem の世代から引いた
+            ``{被訂正ノート id: 現在値の言明}``。``[参考情報]`` に載る訂正前の
+            参照へ ``（訂正済み）`` を付け、現在値を随伴させるために使う。
+            セッションを跨いだ訂正はこちらでしか解けない
+            (:func:`attach_superseding_corrections`、2026-09-14 監査 F-01)。
     """
     cfg = config or {}
     rag_cfg = cfg.get("rag", {})
@@ -1247,18 +1296,38 @@ async def unified_search(
         on_topic_bar = corpus_thresholds.confidence
     # 自分の直前の出力を指す問いは、それを出したセッションの外に根拠を持たない。
     own_session = session_id if refers_to_previous_output(query) else None
+    # 日付演算の問い (営業日 / 日目 / 週間後…) はツールが答える。文書側に根拠は
+    # 無く、設計書に同じ例文があると cosine では区別できない (2026-09-14: 09-12
+    # の corpus 誤射 8/46 のうち 6 件がこれで、1 ターン 1088 tok の prefill)。
+    # corpus 層と疑似クエリ層を引かず、episodic (直前の回答の日付) は残す。
+    # 参加モード (f_01 §8.1): off = このターンは文書を引かない、on = 問い側の
+    # 抑止を掛けない、auto = 問いの性質で決める。ロード状態はグローバルなので
+    # (`/load` `/unload`)、雑談中に大きなコーパスへ毎ターン払わない手段が
+    # これしかない。
+    if corpus_mode == "off":
+        skip_corpus = True
+        logger.info("Corpus layer skipped: corpus_mode=off for this turn")
+    elif corpus_mode == "on":
+        skip_corpus = False
+    else:
+        skip_corpus = corpus_layer_skipped_for_query(query)
+        if skip_corpus:
+            logger.info(
+                "Corpus layer skipped: the query is date arithmetic answered by a tool: %s",
+                query[:50],
+            )
     epi_entries, corpus_entries, (pseudo_entries, hinted_pq_ids) = await asyncio.gather(
         _search_episodic_layer(
             episodic, query, query_vec, fetch_k, drop_past_answers,
             threshold=store_gate, own_session=own_session,
         ),
-        _search_corpus_layer(
+        _empty_corpus_layer() if skip_corpus else _search_corpus_layer(
             cartridge_mgr, query_vec, fetch_k, timeout_ms=cart_timeout_ms,
             rescore_candidates=rescore_candidates, query_text=query,
         ),
         _search_pseudo_query_layer(
             cartridge_mgr, query_vec, fetch_k, timeout_ms=cart_timeout_ms,
-        ) if pseudo_enabled else _empty_pseudo_layer(),
+        ) if pseudo_enabled and not skip_corpus else _empty_pseudo_layer(),
     )
     if timer is not None:
         timer.stop("retrieval_ms")
@@ -1381,6 +1450,21 @@ async def unified_search(
     # 判定は常に生スコア (merged_raw) に対して行う。品質3閾値は cosine 分布前提の
     # ため、順位式のスコアを渡すと閾値の意味が崩れる (c_16 §7.1)。
     # decision.jsonl に記録 (decision_point=``self_rag_judge_path``)
+    # 品質は「載せられる候補」で判定する (2026-09-14)。問いだけのチャンク /
+    # 今回の問いの反復 / 原文と要約の重複は組立側 (``inference``) で落ちるのに、
+    # ここではそれらが top1 になって high を立て、低スコアの corpus を high 枠で
+    # 通していた (09-12: top1 は 53/68 が episodic で、多くは同じ問いのノート)。
+    eligible = set(
+        eligible_rag_indices([t for _, _, t in gate_view(merged_entries)], query),
+    )
+    if len(eligible) != len(merged_entries):
+        logger.debug(
+            "Step 4.9 eligibility: %d/%d candidates can be injected",
+            len(eligible), len(merged_entries),
+        )
+        merged_entries = [e for i, e in enumerate(merged_entries) if i in eligible]
+        merged = rank_view(merged_entries)
+        merged_raw = gate_view(merged_entries)
     quality_judge = RetrievalQualityJudge(thresholds, debug_logger=debug_logger)
     quality = quality_judge.judge(merged_raw)
     logger.debug("Step 5 quality: %s", quality)
@@ -1541,7 +1625,9 @@ async def unified_search(
     # Step 7.6: 採用ノートが後続の訂正で上書きされているなら、訂正も一緒に出す。
     # top_k で切った **後** に足す — 訂正は席を争う候補ではなく随伴情報であり、
     # floor / top_k のどちらで落ちても「訂正前の値だけが残る」状態になる。
-    final_sources = attach_superseding_corrections(episodic, final_sources)
+    final_sources = attach_superseding_corrections(
+        episodic, final_sources, correction_trail,
+    )
     # Step 7.65: 採用した corpus チャンクに直前チャンク (同文書・同大節) の末尾を
     # 「(前の文脈)」として随伴させる (f_01 §8.1 の 7.65)。席を争わない随伴。
     final_sources = attach_previous_chunk_context(
@@ -1591,6 +1677,27 @@ async def _empty_layer() -> list[StoreEntry]:
 
 async def _empty_pseudo_layer() -> tuple[list[StoreEntry], set[str]]:
     return [], set()
+
+
+#: 日付演算が閉じている印 (数字 / 漢数字)。agent 側の同名判定と同じ文字集合。
+_DATE_MATH_QUANTITY_RE = re.compile(r"\d|[一二三四五六七八九十百千]")
+
+
+async def _empty_corpus_layer() -> list[StoreEntry]:
+    return []
+
+
+def corpus_layer_skipped_for_query(query: str) -> bool:
+    """corpus (文書) 層を引かない問いか (純粋関数)。
+
+    日付演算の手掛かり (:func:`query_has_date_math_cue`) に **数量** (数字 /
+    漢数字) を伴う問いはツールが答える閉じた演算なので、文書に根拠を求めない。
+    照応 (「その日」) と組み合わさる形が典型で、設計書に同じ例文があると
+    較正済みの棒でも通ってしまう。手掛かり語だけの問い (「設計書では祝日の
+    扱いをどう決めていますか」) は文書への問いでありうるので切らない。
+    """
+    text = query or ""
+    return query_has_date_math_cue(text) and bool(_DATE_MATH_QUANTITY_RE.search(text))
 
 
 def _record_corpus_hits(

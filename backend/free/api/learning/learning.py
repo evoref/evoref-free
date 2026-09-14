@@ -38,6 +38,8 @@ from backend.free.api.learning._learning_schemas import (
     SchedulerStatusModel,
     TriggerRequest,
     TriggerResponse,
+    TurnFeedbackRequest,
+    TurnFeedbackResponse,
 )
 from backend.free.learning.level1_session import PriorityRequest
 from backend.log_config import get_logger
@@ -62,6 +64,8 @@ __all__ = [
     "SchedulerStatusModel",
     "TriggerRequest",
     "TriggerResponse",
+    "TurnFeedbackRequest",
+    "TurnFeedbackResponse",
 ]
 
 
@@ -356,3 +360,30 @@ def _build_scheduler_status(scheduler: object | None) -> SchedulerStatusModel:
         priority_queue=map_priority_queue(raw.get("priority_queue")),
         active_session=map_active_session(raw.get("active_session")),
     )
+
+
+@router.post("/feedback", response_model=TurnFeedbackResponse)
+async def record_turn_feedback(
+    req: TurnFeedbackRequest, state: AppState = Depends(get_app_state),
+):
+    """応答への明示評価を経験に刻む (2026-09-14、f_04 §3.2.3)。
+
+    👎 は「本人が失敗と言った」唯一の信号で、Level 1 の採用ゲートのケースに
+    最優先で使われ、手本プールには入らない。private ターンなど経験が無い
+    応答は ``recorded=False``。
+    """
+    learn = getattr(state, "learn", None)
+    buf = getattr(learn, "experience_buffer", None)
+    if buf is None or not hasattr(buf, "mark_user_feedback"):
+        return TurnFeedbackResponse(recorded=False, message="experience buffer unavailable")
+    negative = {"negative": True, "positive": False, "clear": None}[req.verdict]
+    entry = buf.mark_user_feedback(
+        req.session_id, negative=negative, note=req.note, query=req.query,
+    )
+    if entry is None:
+        return TurnFeedbackResponse(recorded=False, message="no experience for this turn")
+    logger.info(
+        "Turn feedback recorded: session=%s verdict=%s entry=%s",
+        req.session_id, req.verdict, entry.id,
+    )
+    return TurnFeedbackResponse(recorded=True, entry_id=entry.id)

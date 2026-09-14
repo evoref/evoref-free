@@ -28,14 +28,19 @@ logger = get_logger("rag.pseudo_query")
 PROMPT_TEMPLATE = (
     "次の技術文書の断片を読み、この断片だけで答えられる質問を日本語で "
     "{count} つ作ってください。開発者が実際に聞きそうな自然な言い回しで、"
-    "断片の語をそのまま写さず言い換えてください。\n\n---\n{text}\n---"
+    "断片の語をそのまま写さず言い換えてください。"
+    "出力は JSON を 1 行で (改行やインデントを入れない)。\n\n---\n{text}\n---"
 )
 
 #: 見出し経路 (文書名 › 節見出し) の前置き。断片が節の途中で主語を欠くとき、
 #: 問いに主語 (「疑似クエリ索引の書き手は…」) を持たせる (f_01 §6.4)。
+#: **本文の後** に置く。プロンプトの先頭は全チャンクで同じ文 (PROMPT_TEMPLATE の
+#: 指示) にし、背景スロットの接頭辞キャッシュに乗せる — 見出し経路を先頭に
+#: 置いていた間は共通接頭辞が 0 トークンで、呼出ごとに ~400 tok を再 prefill
+#: していた (2026-09-12 実測: 背景スロットの KV 再利用 6%)。
 CONTEXT_TEMPLATE = (
-    "この断片は節「{context}」の一部です。質問には節の主題が分かる語 (見出しの名詞) を"
-    "含め、文書名や節番号は書かないでください。\n\n"
+    "\n\nこの断片は節「{context}」の一部です。質問には節の主題が分かる語 (見出しの名詞) を"
+    "含め、文書名や節番号は書かないでください。"
 )
 
 #: 取りこぼした問い (f_01 §6.4 の misses) を添えるときの追記。断片が答えられる
@@ -63,7 +68,7 @@ class PseudoQueryGenerator:
         self,
         aux_client: "AuxClient",
         *,
-        questions_per_chunk: int = 2,
+        questions_per_chunk: int = 1,
         max_chunk_chars: int = 1200,
     ) -> None:
         self.aux_client = aux_client
@@ -86,7 +91,7 @@ class PseudoQueryGenerator:
         prompt = PROMPT_TEMPLATE.format(count=self.questions_per_chunk, text=text)
         ctx = (context or "").strip()
         if ctx:
-            prompt = CONTEXT_TEMPLATE.format(context=ctx[:160]) + prompt
+            prompt += CONTEXT_TEMPLATE.format(context=ctx[:160])
         hints = [h.strip() for h in hint_questions if h and h.strip()][:3]
         count = self.questions_per_chunk + (1 if hints else 0)
         if hints:

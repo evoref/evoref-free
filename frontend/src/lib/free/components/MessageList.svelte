@@ -28,13 +28,13 @@
 	aria-label={$t('chat.message_list')}
 	bind:this={container}
 >
-	{#each $messages as message (message.id)}
+	{#each $messages as message, index (message.id)}
 		<!-- message_prefix スロット -->
 		{#if $themeSlots.message_prefix}
 			{@const MessagePrefix = $themeSlots.message_prefix}
 			<MessagePrefix {message} />
 		{/if}
-		<MessageBubble {message} {instanceName} streaming={$isStreaming && message === $messages[$messages.length - 1]} mode={$currentMode} />
+		<MessageBubble {message} {instanceName} streaming={$isStreaming && message === $messages[$messages.length - 1]} mode={$currentMode} prevUserQuery={index > 0 && $messages[index - 1].role === 'user' ? $messages[index - 1].content : ''} />
 	{/each}
 </div>
 

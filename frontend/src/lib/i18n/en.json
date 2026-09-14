@@ -44,7 +44,14 @@
 		"send_blocked_while_streaming": "Cannot send while a response is streaming. Your text is kept - send it once the response finishes.",
 		"code_in_editor": "→ Sent to editor ({lang})",
 		"code_output_done": "Completed",
-		"long_form_quality_issue": "Generated ({total} units) — quality check flagged issues"
+		"long_form_quality_issue": "Generated ({total} units) — quality check flagged issues",
+		"feedback_good": "Good answer",
+		"feedback_bad": "Bad answer",
+		"feedback_note_placeholder": "What was wrong (optional)",
+		"feedback_send": "Send",
+		"feedback_sent_bad": "Feedback recorded (bad)",
+		"feedback_sent_good": "Feedback recorded (good)",
+		"feedback_failed": "Could not record feedback"
 	},
 	"sidebar": {
 		"chat": "Chat",
@@ -74,7 +81,12 @@
 		"stop_failed": "Failed to stop",
 		"force_restart": "Force restart (kill existing process)",
 		"restart": "Restart",
-		"debug_mode": "DEBUG Mode"
+		"debug_mode": "DEBUG Mode",
+		"documents": "Documents",
+		"documents_auto": "Auto",
+		"documents_on": "Always",
+		"documents_off": "Off",
+		"documents_hint": "Whether installed documents (corpus) are used for answers. Auto = decided per question by relevance"
 	},
 	"vram": {
 		"placement_cpu": "CPU"

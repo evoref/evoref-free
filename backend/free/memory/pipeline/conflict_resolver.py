@@ -173,6 +173,32 @@ class ConflictResolver:
         )
         return pairs
 
+    @staticmethod
+    def drop_truncated_notes(short_term: "EpisodicWorkspace") -> int:
+        """コードフェンスが閉じていない非 user ノートを作業領域から外す (純関数的)。
+
+        user 発話のノートは本人の書いたままなので触らない。統合 / 要約由来の
+        ノートで奇数個の ``\`\`\``` は生成の切断の印 (2026-09-12 実機で 2 件)。
+
+        Returns:
+            外したノート数。
+        """
+        notes = getattr(short_term, "notes", None)
+        if not isinstance(notes, dict):
+            return 0
+        doomed = [
+            note_id for note_id, note in notes.items()
+            if getattr(note, "source", "user") != "user"
+            and str(getattr(note, "content", "") or "").count("```") % 2 == 1
+        ]
+        for note_id in doomed:
+            del notes[note_id]
+            logger.warning(
+                "Dropped note %s: unbalanced code fence (truncated merge or summary)",
+                note_id,
+            )
+        return len(doomed)
+
     async def resolve_conflicts(
         self,
         short_term: "EpisodicWorkspace",
@@ -192,6 +218,11 @@ class ConflictResolver:
         Returns:
             統合されたペア数
         """
+        # 切断された統合ノート (コードフェンスが閉じていない assistant / tool 由来)
+        # を先に落とす。finish_reason=length の統合文をそのまま採用していた時期の
+        # 残骸で、live に 1 件残っていた (2026-09-14)。以後は _merge_with_llm が
+        # 切断を採用しないので、ここは既存データの掃き出し。
+        self.drop_truncated_notes(short_term)
         # まず conflict_candidate フラグが立っているペアを収集
         pairs = self.detect_conflicts(short_term)
         if not pairs:
@@ -432,7 +463,16 @@ class ConflictResolver:
             result = await llm_client.generate(
                 messages, purpose="conflict_resolution", **gen_kwargs,
             )
-            content = result["choices"][0]["message"]["content"]
+            choice = result["choices"][0]
+            if str(choice.get("finish_reason") or "") == "length":
+                # 512 tok で切れた統合文を採用すると、コードの途中で終わる
+                # ノートが記憶に残る (2026-09-12 実機で 2 件)。捨てて次サイクル。
+                logger.warning(
+                    "LLM merge for %s + %s was truncated (finish_reason=length); "
+                    "keeping both notes", note_a.id, note_b.id,
+                )
+                return None
+            content = choice["message"]["content"]
             return content.strip()
         except Exception as e:
             logger.warning(

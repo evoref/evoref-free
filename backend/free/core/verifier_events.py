@@ -78,6 +78,12 @@ class _Scope:
     unexplained_numbers: list[str] | None = None
     expression_issues: list[str] | None = None
     unexplained_date_math: bool | None = None
+    #: RAG の便益の観測 (2026-09-14)。``rag_used`` = 検索が何か注入したか、
+    #: ``rag_abstained`` = 注入したのに「参考情報には無い」と差し控えたか、
+    #: ``rag_cited`` = 応答が ``[参考情報]`` を引用したか。経験記録
+    #: (``FeedbackCollector.record``) が導出して持ち上げる。無ければ結末 JSONL
+    #: は chat_response 全件 success で、RAG の幅 / 棒に fitness が無い。
+    rag: dict[str, bool | None] = field(default_factory=dict)
 
 
 _scope: ContextVar[_Scope | None] = ContextVar("verifier_scope", default=None)
@@ -161,6 +167,22 @@ def current_grounding() -> tuple[list[str] | None, list[str] | None, bool | None
     if scope is None:
         return None, None, None
     return scope.unexplained_numbers, scope.expression_issues, scope.unexplained_date_math
+
+
+def record_rag_signals(**signals: bool | None) -> None:
+    """RAG の便益の観測 (``rag_used`` / ``rag_abstained`` / ``rag_cited``) を置く。"""
+    scope = _scope.get()
+    if scope is None:
+        return
+    for key, value in signals.items():
+        if value is not None:
+            scope.rag[str(key)] = bool(value)
+
+
+def current_rag_signals() -> dict[str, bool]:
+    """このターンの RAG 観測 (未記録は空)。"""
+    scope = _scope.get()
+    return dict(scope.rag) if scope else {}
 
 
 def current_turn_outcome() -> tuple[str | None, str | None]:

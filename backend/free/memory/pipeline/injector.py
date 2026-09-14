@@ -89,6 +89,10 @@ _RENDER_LABELS: dict[str, dict[str, str]] = {
     "ja": {
         "corrected": " (訂正後の記録)",
         "corrected_aged": " (訂正後の記録・{age}日前)",
+        # 旧値付き。「訂正した内容は?」に台帳を別枠で出さずに答えられる
+        # (2026-09-14 監査 B: 語彙判定なし・行を増やさない)。
+        "corrected_was": " (訂正後の記録、以前は「{was}」)",
+        "corrected_aged_was": " (訂正後の記録・{age}日前、以前は「{was}」)",
         "aged": " ({age}日前の記録)",
         "note": "- (過去の記録) {content}",
         "as_of": "{date} 時点",
@@ -99,6 +103,8 @@ _RENDER_LABELS: dict[str, dict[str, str]] = {
     "en": {
         "corrected": " (corrected record)",
         "corrected_aged": " (corrected record, {age} days ago)",
+        "corrected_was": " (corrected record, was 「{was}」)",
+        "corrected_aged_was": " (corrected record, {age} days ago, was 「{was}」)",
         "aged": " (recorded {age} days ago)",
         "note": "- (past record) {content}",
         "as_of": "as of {date}",
@@ -642,10 +648,12 @@ class MemoryInjector:
         calibration = get_active_calibration()
         if not calibration:
             return _static()
-        static_relevance, _ = _static()
-        relevance = float(
-            calibration.get("relevance_threshold", static_relevance),
-        )
+        calibrated = calibration.get("relevance_threshold")
+        if calibrated is None:
+            # 静的値はプロファイル (GGUF ヘッダ) の読取を伴うので、較正に
+            # 値が無いときだけ引く。
+            calibrated, _ = _static()
+        relevance = float(calibrated)
         return relevance, relevance * PINNED_RELEVANCE_RATIO
 
     @staticmethod
@@ -821,6 +829,7 @@ class MemoryInjector:
         retired_note_ids: "set[str] | None" = None,
         fact_relevance_scores: "dict[str, float] | None" = None,
         fact_rank_scores: "dict[str, float] | None" = None,
+        previous_values: "dict[str, str] | None" = None,
     ) -> InjectionPlan:
         """注入計画を構築する。
 
@@ -836,6 +845,10 @@ class MemoryInjector:
             session_user_texts: 今回の会話でユーザーが述べた本文の列。ここに
                 同じ属性スロットの言明があるファクトは注入しない
                 (:meth:`_restated_slots` を参照)。
+            previous_values: ``{訂正後ファクト id: 訂正前の値}``。
+                ``(訂正後の記録)`` の行に旧値を添え、「訂正した内容は?」に
+                台帳を別枠で出さずに答えられるようにする (2026-09-14 監査 B)。
+                行は増えず、増えるのは訂正件数 × 十数トークン。
             retired_note_ids: 値が supersede された発話ノートの ID 集合。
                 SemMem 側で世代を閉じても STM ノートの原文は残るため、
                 訂正前の発話が「現在値」として Tier 2 に載り続ける。
@@ -1079,7 +1092,9 @@ class MemoryInjector:
                 #  趣味 +0.228 を上回っていた)。属性一致は決定論の根拠なので、
                 #  スコアの下駄ではなく **確実に先頭へ** 出す量を足す。
                 score += _ASKED_ATTRIBUTE_BONUS
-            text = self._render_fact(fact)
+            text = self._render_fact(
+                fact, was=(previous_values or {}).get(fact.id),
+            )
             tokens = estimate_tokens(text)
             buckets[tier].append(
                 InjectedItem(
@@ -1716,7 +1731,7 @@ class MemoryInjector:
 
     # ── レンダリング ─────────────────────────────────────────────────
 
-    def _render_fact(self, fact: SemanticFact) -> str:
+    def _render_fact(self, fact: SemanticFact, *, was: str | None = None) -> str:
         """1 ファクトを [関連する記憶] の 1 行へ整形する。
 
         本文は **必ず ``fact.text``** (= ``statement or object``) を使う。
@@ -1728,6 +1743,8 @@ class MemoryInjector:
         age = self._fact_age_days(fact)
         corrected = bool(getattr(fact, "from_correction", False))
         labels = _render_labels()
+        # 旧値は 1 行 40 字までに切る (訂正前の値が発話全文のこともある)。
+        was = " ".join((was or "").split())[:40] or None
         # ``origin != user`` は 1 行ヘッダで出所と時点を示す (c_16 §7.4)。
         # ユーザー自身の言明と、ツール / 文書 / 世の中の情報を、読み手が行の
         # 上で区別できるようにするため。
@@ -1737,18 +1754,26 @@ class MemoryInjector:
             if corrected:
                 # 同じ日に古い値と並ぶと、下の「N日前の記録」も付かないため
                 # どちらが現在値かを示す手掛かりが行に無くなる。
+                mark = (
+                    labels["corrected_was"].format(was=was) if was
+                    else labels["corrected"]
+                )
                 return (
                     f"- {head}({fact.type}) {fact.subject} {fact.predicate}:"
-                    f" {_absolute_dates(fact.text)}{labels['corrected']}"
+                    f" {_absolute_dates(fact.text)}{mark}"
                 )
             return (
                 f"- {head}({fact.type}) {fact.subject} {fact.predicate}: "
                 f"{_absolute_dates(fact.text)}"
             )
         if corrected:
+            mark = (
+                labels["corrected_aged_was"].format(age=int(age), was=was) if was
+                else labels["corrected_aged"].format(age=int(age))
+            )
             return (
                 f"- {head}({fact.type}) {fact.subject} {fact.predicate}: "
-                f"{_absolute_dates(fact.text)}{labels['corrected_aged'].format(age=int(age))}"
+                f"{_absolute_dates(fact.text)}{mark}"
             )
         # 何日前の記録かを行ごとに書く。ノート側 (_render_note の (過去の記録))
         # と同じ理由で、ブロック先頭の注意書きは数百トークン離れると効かない。
