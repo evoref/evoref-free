@@ -1772,6 +1772,14 @@ class ChatExtractor(BaseExtractor):
                 tag for (note_id, tag) in inherited
                 if note_id == note.id and tag not in tags
             ]
+            if not tags:
+                # trigger 辞書が 1 語も当たらず、値アンカーも継承も効かなかった。
+                # このノートは抽出対象にならない (記憶が 1 件も残らない)。
+                result.notes_without_tags += 1
+                # 平叙文だけを別に数える — 生の件数は会話の形でほぼ決まり、
+                # 指標にならない (base.py の注記を参照)。
+                if is_plain_statement(content):
+                    result.notes_without_tags_stating += 1
             for tag in tags:
                 if tag not in self.SUPPORTED_TAGS:
                     continue
@@ -1880,6 +1888,11 @@ class ChatExtractor(BaseExtractor):
                             # ``mem.preference.tooling`` と
                             # ``mem.personal.user`` の **両方** に live で入った。
                             continue
+                        if destination is None and tag == "personal_fact":
+                            # trigger 語が 1 つも当たらなかった言明を、事例の
+                            # 近傍でスロットへ戻す (``AttributeSlotGate``)。
+                            # 提案が無ければ従来どおり汎用スロットへ落ちる。
+                            destination = ctx.attribute_hints.get(content) or None
                         matches = [(destination or "user", ())]
                     # 「属性語を含まない文は直前の属性文に属する」判定に、
                     # この発話で解決した全属性のトリガ語を渡す

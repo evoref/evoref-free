@@ -1,0 +1,45 @@
+{"_comment": "層振り分けの shadow 用事例。label は router.classify の戻り値 (reactive / deliberative / meta_cognitive)。shadow なので挙動は変えない — 規則との不一致を decision.jsonl に貯めて、切り替えるかどうかを人が判断するための材料。前方ルール (long_form / local_write_intent) の誤爆で層ごと奪われる形を meta_cognitive 側に、逆に軽い層へ落ちて暗算・作話になる形を deliberative 側に入れてある。"}
+{"text": "こんにちは。", "label": "reactive", "id": "r_hello"}
+{"text": "おはようございます。今日もよろしくお願いします。", "label": "reactive", "id": "r_morning"}
+{"text": "ありがとうございました。", "label": "reactive", "id": "r_thanks"}
+{"text": "了解です。", "label": "reactive", "id": "r_ack"}
+{"text": "お疲れさまです。", "label": "reactive", "id": "r_bye"}
+{"text": "はい。", "label": "reactive", "id": "r_yes"}
+{"text": "べき等性とは何ですか。", "label": "deliberative", "id": "d_definition"}
+{"text": "Rust と Go の違いを説明してください。", "label": "deliberative", "id": "d_compare"}
+{"text": "この設計のトレードオフを教えてください。", "label": "deliberative", "id": "d_tradeoff"}
+{"text": "私の名前を覚えていますか。", "label": "deliberative", "id": "d_recall_name"}
+{"text": "さきほど決めた締め切りはいつでしたか。", "label": "deliberative", "id": "d_recall_deadline"}
+{"text": "今日は何日ですか。曜日も教えてください。", "label": "deliberative", "id": "d_date"}
+{"text": "十日後の営業日はいつになりますか。", "label": "deliberative", "id": "d_bizdays"}
+{"text": "駅からの徒歩時間を往復にすると何分ですか。", "label": "deliberative", "id": "d_quantity"}
+{"text": "1280 円の商品を 3 つ買うと合計いくらですか。", "label": "deliberative", "id": "d_arith"}
+{"text": "その計算、桁が 1 つ違うのではないですか。", "label": "deliberative", "id": "d_arith_challenge"}
+{"text": "ここまでの計算結果を表にまとめてください。", "label": "deliberative", "id": "d_tabulate_prior"}
+{"text": "いま何時ですか。", "label": "deliberative", "id": "d_time"}
+{"text": "毎週火曜日の夜はジムに通っています。", "label": "deliberative", "id": "d_plain_schedule"}
+{"text": "妻は保育士で、子どもは二人います。", "label": "deliberative", "id": "d_plain_family"}
+{"text": "使えるツールの一覧を教えてください。", "label": "deliberative", "id": "d_tools"}
+{"text": "いまのメモリ使用量はどれくらいですか。", "label": "deliberative", "id": "d_hardware"}
+{"text": "さっきの答えをもう少し短くしてください。", "label": "deliberative", "id": "d_shorter"}
+{"text": "この文章を英語に訳してください。", "label": "deliberative", "id": "d_translate"}
+{"text": "E:\\tmp のファイル一覧を見せてください。", "label": "deliberative", "id": "d_list_dir"}
+{"text": "保存したファイルの中身を見せてください。", "label": "deliberative", "id": "d_read_file"}
+{"text": "設計書の保持方針の節を要約してください。", "label": "deliberative", "id": "d_doc_summary"}
+{"text": "テストが落ちる原因を調べてください。", "label": "deliberative", "id": "d_debug"}
+{"text": "この仕様の問題点を指摘してください。", "label": "deliberative", "id": "d_review"}
+{"text": "認証まわりの設計書を書いてください。", "label": "meta_cognitive", "id": "m_design_doc"}
+{"text": "API の仕様書を Markdown でまとめてください。", "label": "meta_cognitive", "id": "m_api_spec"}
+{"text": "運用手順書を章立てで作成してください。", "label": "meta_cognitive", "id": "m_runbook"}
+{"text": "年間イベントの一覧を CSV にして E:\\tmp へ保存してください。", "label": "meta_cognitive", "id": "m_csv_write"}
+{"text": "在庫メモ.txt を作って、中身は三行にしてください。", "label": "meta_cognitive", "id": "m_create_file"}
+{"text": "同じファイルに三行追記してください。", "label": "meta_cognitive", "id": "m_append"}
+{"text": "このページを取得して要約をファイルに保存してください。", "label": "meta_cognitive", "id": "m_fetch_save"}
+{"text": "集計するプログラムを作成して実行してください。", "label": "meta_cognitive", "id": "m_program"}
+{"text": "調査結果をレポートにまとめて出力してください。", "label": "meta_cognitive", "id": "m_report"}
+{"text": "複数のログを突き合わせて原因を特定し、手順書に残してください。", "label": "meta_cognitive", "id": "m_multistep"}
+{"text": "スライドの構成案を作って、各章の要点を書き出してください。", "label": "meta_cognitive", "id": "m_slides"}
+{"_comment": "── 2026-09-15 追加。LOO で meta_cognitive -> deliberative になった「取得して保存」型 (複数ツールの連鎖) を厚くする。"}
+{"text": "この URL を取得して要約をテキストに書き出してください。", "label": "meta_cognitive", "id": "m_fetch_write"}
+{"text": "ページを読み込んで結果をファイルに残してください。", "label": "meta_cognitive", "id": "m_read_persist"}
+{"text": "集めた内容を整形して保存までやってください。", "label": "meta_cognitive", "id": "m_collect_save"}

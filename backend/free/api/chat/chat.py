@@ -1801,6 +1801,22 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             scope="request",
         )
 
+    # 事例ゲートとの shadow 比較。**挙動は変えない** — 不一致だけを
+    # decision.jsonl に貯め、切り替えるかどうかは人が判断する
+    # (router は EVOLVABLE_DOMAINS から意図的に凍結されている)。
+    # 投げっぱなしにして TTFT を 1ms も増やさない。private ターンは渡さない。
+    layer_shadow = getattr(state, "layer_shadow", None)
+    if layer_shadow is not None and not req.private:
+        try:
+            _shadow_task = asyncio.create_task(
+                layer_shadow.observe(req.message, agent_layer),
+                name="layer_shadow",
+            )
+            # 参照を握らないと GC されうる。結果は見ないので握り潰す。
+            _shadow_task.add_done_callback(lambda t: t.exception())
+        except RuntimeError:  # イベントループ外 (同期テスト等)
+            pass
+
     timer = StageTimer()
     # pending 競合のユーザー回答判定 + 即時反映 (不変則例外 (b)、解決結果は
     # 同ターンの semmem 注入へ反映)。private ターンは SemMem へ書かない契約のため

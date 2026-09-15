@@ -57,7 +57,17 @@ _LEVEL_CONFIGS: dict[DevelopLevel, dict[str, Any]] = {
     },
     "investigate": {
         "enabled": True,
-        "categories": frozenset({"requests", "rag", "memory", "long_form"}),
+        # ``decision`` を含めるのは、判定点の記録が **較正と replay の唯一の
+        # 材料** だから。``evolve`` は Develop 限定 (Free/Pro の CLI は
+        # ``--develop=evolve`` を拒否する) なので、evolve 専用のままだと
+        # 実ユーザーの環境では判定の根拠が一切貯まらない。1 レコードは小さく
+        # (監査 1 回で decision 110 件 / requests 196 件)、``investigate`` の
+        # 用途「挙動把握」そのものでもある。
+        # ``outcome`` は evolve 限定のまま — decision と対で loop 自己進化の
+        # 因果ログを成すもので、挙動把握には要らない。
+        "categories": frozenset({
+            "requests", "rag", "memory", "long_form", "decision",
+        }),
         "max_log_mb": 200,
         "retention_days": 7,
     },

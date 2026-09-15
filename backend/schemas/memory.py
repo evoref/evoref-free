@@ -96,6 +96,21 @@ class FactsConfig(BaseModel):
     enable_extraction: bool = True
     """Step 8 Extractor 全体のオンオフ"""
 
+    attribute_gate_enabled: bool = True
+    """trigger が 1 つも当たらない言明を事例の近傍でスロットへ戻すか。
+
+    ``AttributeSlotGate`` (docs/c_17 §3.1)。実測 (2026-09-15 / bge-m3-q8_0 /
+    事例 125 件の LOO) で **正解率 1.000 / 判定 23 件 / 棄権 102 件**。
+    誤りのコストが非対称なので、被覆 (18%) より正解率を優先した設定にして
+    ある — 提案しなければファクトは汎用スロット (``mem.<kind>.user``) へ落ちて
+    ほぼ不活性なだけだが、**誤ったスロット**へ入るとそのスロットを尋ねられた
+    ときに誤った値が注入される (欠落より悪い)。
+
+    事例を触ったら ``python scripts/bench/predicate_gate/bench_predicate_gate.py
+    --gate fact_attribute --errors`` を回し、``正解率(判定分)`` が **0.95 以上**
+    であることを確かめる。下回るなら false に戻す。
+    """
+
     extraction_max_per_session: FactsExtractionMaxPerSession = Field(
         default_factory=FactsExtractionMaxPerSession,
     )

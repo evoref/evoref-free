@@ -736,6 +736,7 @@ class SleepTimeWorker:
         # 既存 _step8_9_summarize_sessions は Step 9 に再配置される想定。
         # メソッド名を変えずに前段に Step 8 を挿入する形で共存させる。
         ts = time.monotonic()
+        result["attribute_hints"] = await self._step8_prepare_attribute_hints()
         result["facts_extracted"] = self._step8_extract_facts(
             verification_available=llm_client is not None,
         )
@@ -1146,19 +1147,61 @@ class SleepTimeWorker:
 
     # ── Step 8 (Chat/Create/MDP Extractor) ─────────────
 
+    def set_attribute_slot_gate(self, gate) -> None:
+        """属性スロットの補完ゲートを注入する (未注入なら従来どおり動く)。
+
+        埋め込みを使うので構築は pillar 配線側で行い、ワーカーは受け取るだけ。
+        """
+        self._attribute_slot_gate = gate
+
+    async def _step8_prepare_attribute_hints(self) -> int:
+        """Step 8 の前段: trigger 語が当たらなかった言明のスロットを提案する。
+
+        抽出本体 (:meth:`_step8_extract_facts`) は同期のままにしたいので、
+        非同期が要る埋め込みだけをここで済ませ、結果をワーカーに預ける。
+        ゲート未注入 / 未 warmup / 失敗のいずれでも空のまま進み、Step 8 は
+        従来どおり汎用スロット (``mem.<kind>.user``) へ落とす。
+        """
+        self._pending_attribute_hints = {}
+        gate = getattr(self, "_attribute_slot_gate", None)
+        if gate is None or not gate.is_ready():
+            return 0
+        from backend.free.memory.sleep.extraction import (
+            collect_unresolved_attribute_texts,
+        )
+
+        notes = list(self._workspace_or_open().notes.values())
+        texts = collect_unresolved_attribute_texts(notes)
+        if not texts:
+            return 0
+        try:
+            self._pending_attribute_hints = await gate.propose(texts)
+        except Exception as e:  # pragma: no cover - 縮退で吸収する
+            logger.warning("Step 8: attribute slot gate failed: %s", e)
+            self._pending_attribute_hints = {}
+        return len(self._pending_attribute_hints)
+
     def _step8_extract_facts(self, *, verification_available: bool = False) -> int:
         """Step 8: SemanticFact 抽出
 
         実ロジックは :mod:`backend.free.memory.sleep.extraction`
         に分離された。本メソッドは state (短期記憶 / 設定 / provider / MDP
         キャッシュ) を引数に詰め替えて委譲する薄いラッパ。
+
+        抽出器は同期なので、非同期が要る属性スロットの提案だけを先に解決して
+        ``attribute_hints`` として渡す (``live_attribute_values`` と同じ形)。
         """
         from backend.free.memory.sleep.extraction import extract_semantic_facts
 
         notes = list(self._workspace_or_open().notes.values())
+        # 前段 (:meth:`_step8_prepare_attribute_hints`) が置いた提案を消費する。
+        # 同期の呼出 (テスト / 旧経路) では空のまま = 従来どおりの挙動。
+        attribute_hints = getattr(self, "_pending_attribute_hints", None) or {}
+        self._pending_attribute_hints = {}
         # 抽出を「走らせた」時刻。次サイクル以降の eviction は、これより後に
         # 作られたノートだけを保護する (未消費の入力を落とさないため)。
         self._last_extraction_at = time.time()
+        extraction_stats: dict = {}
         total, self._mdp_trace_extractor = extract_semantic_facts(
             notes,
             config=self.config,
@@ -1168,8 +1211,48 @@ class SleepTimeWorker:
             subject_canonicalizer=self._subject_canonicalizer,
             mdp_trace_extractor=self._mdp_trace_extractor,
             verification_available=verification_available,
+            attribute_hints=attribute_hints,
+            stats_out=extraction_stats,
         )
+        self._log_fact_tag_coverage(notes, total, extraction_stats)
         return total
+
+    def _log_fact_tag_coverage(
+        self, notes: list, extracted: int, stats: dict,
+    ) -> None:
+        """候補タグ 0 件のノート数を ``decision.jsonl`` に残す。
+
+        ``fact_triggers.yaml`` が 1 語も当たらないとそのノートは抽出対象に
+        すらならず、**記憶が 1 件も残らない** (在庫で 2 番目に脆い判定点)。
+        件数が cycle ごとに残っていれば、trigger の穴が広がったことを
+        後から検出できる。
+        """
+        dl = self._debug_logger
+        if dl is None:
+            return
+        without = stats.get("notes_without_tags")
+        if without is None:
+            return
+        # 取りこぼしの候補は **平叙文なのにタグが立たなかった** ものだけ。
+        # 生の件数は会話の形でほぼ決まる (2026-09-15 監査: 40 発話中 30 件が
+        # タグ 0 件だが全部が問い / 依頼 / 挨拶で、取りこぼしは 0 件)。
+        stating = int(stats.get("notes_without_tags_stating") or 0)
+        try:
+            dl.log_decision(
+                decision_point="fact_tag_coverage",
+                chosen="tagged" if stating == 0 else "stating_untagged",
+                candidates=["tagged", "stating_untagged"],
+                reason=f"{stating}_stating_of_{without}_untagged",
+                context={
+                    "notes": len(notes),
+                    "without_tags": without,
+                    "without_tags_stating": stating,
+                    "facts_extracted": extracted,
+                },
+                scope="sleep",
+            )
+        except Exception as e:  # pragma: no cover - ログで抽出を落とさない
+            logger.debug("fact tag coverage decision log failed: %s", e)
 
     def _curatable_notes(self) -> list:
         """キュレーター (Step 8.4 / 8.5 / 8.6) へ渡す ``short`` ノート。

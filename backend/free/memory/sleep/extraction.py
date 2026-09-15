@@ -610,6 +610,8 @@ def extract_semantic_facts(
     mdp_trace_extractor: "MDPTraceExtractor | None" = None,
     mdp_trace_extractor_factory: Callable[[], "MDPTraceExtractor"] | None = None,
     verification_available: bool = False,
+    attribute_hints: dict[str, str] | None = None,
+    stats_out: dict | None = None,
 ) -> tuple[int, "MDPTraceExtractor | None"]:
     """Step 8: ChatExtractor / CreateExtractor / MDPTraceExtractor を順次実行する。
 
@@ -632,6 +634,13 @@ def extract_semantic_facts(
         mdp_trace_extractor_factory: ``mdp_trace_extractor`` が ``None``
             の場合に新規生成するファクトリ。未指定時は
             :class:`MDPTraceExtractor` を直接 import して生成する。
+        attribute_hints: ``{ノート本文: 属性スロット}``。trigger 語が 1 つも
+            当たらなかった言明を事例の近傍でスロットへ戻すための提案
+            (:class:`~backend.free.memory.notes.attribute_gate.AttributeSlotGate`)。
+            ``None`` なら従来どおり汎用スロットへ落ちる。
+        stats_out: 呼出側へ返す計数の置き場 (任意)。``notes_without_tags``
+            (候補タグが 1 件も立たなかったノート数) を入れる。戻り値の形を
+            変えずに観測値を出すための口。
 
     Returns:
         ``(total_extracted, mdp_trace_extractor)`` のペア。
@@ -665,6 +674,7 @@ def extract_semantic_facts(
             cfg_facts.get("extraction_max_pinned_per_session", -1),
         ),
         canonicalizer=subject_canonicalizer,
+        attribute_hints=dict(attribute_hints or {}),
     )
 
     total_extracted = 0
@@ -682,6 +692,11 @@ def extract_semantic_facts(
         # Step 8.0 が検証できる構成なら、未検証の訂正候補は据え置く (H-12)。
         ctx.defer_unverified_corrections = bool(verification_available)
         chat_result = ChatExtractor().extract(notes, ctx)
+        if stats_out is not None:
+            stats_out["notes_without_tags"] = chat_result.notes_without_tags
+            stats_out["notes_without_tags_stating"] = (
+                chat_result.notes_without_tags_stating
+            )
         if chat_result.notes_deferred:
             logger.info(
                 "Step 8: %d correction candidate(s) deferred until verified",
@@ -736,6 +751,45 @@ def extract_semantic_facts(
     return total_extracted, mdp_trace_extractor
 
 
+def collect_unresolved_attribute_texts(
+    notes: list["MemoryNote"],
+    *,
+    triggers_dir: str | Path | None = None,
+    limit: int = 40,
+) -> list[str]:
+    """``personal_fact`` の trigger が **1 つも当たらなかった** ユーザー言明を集める。
+
+    事例ゲート (:class:`~backend.free.memory.notes.attribute_gate.AttributeSlotGate`)
+    へ渡す入力を絞るための前段。字句が当たったノートは触らない
+    (``CascadePolicy`` の ``complement``) ので、ここで候補を落としておけば
+    埋め込みの往復がそのぶん減る。
+
+    問いや依頼を弾く仕事はここではやらない — 事例側の陰性例 (``none``) と
+    棄権帯が担う。前段で字句の網をもう 1 枚足すと、結局同じ「語形の穴」を
+    作ることになる。
+    """
+    from backend.free.memory.notes.note_builder import resolve_fact_attribute_matches
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for note in notes:
+        if getattr(note, "source", "user") != "user" or getattr(note, "private", False):
+            continue
+        content = (getattr(note, "content", "") or "").strip()
+        if not content or content in seen:
+            continue
+        matches = resolve_fact_attribute_matches(
+            content, "personal_fact", mode="chat", triggers_dir=triggers_dir,
+        )
+        if any(slug and slug != "user" for slug, _ in matches):
+            continue
+        seen.add(content)
+        out.append(content)
+        if len(out) >= limit:
+            break
+    return out
+
+
 async def extract_and_split_semantic_facts(
     notes: list["MemoryNote"],
     *,
@@ -786,6 +840,7 @@ async def extract_and_split_semantic_facts(
 
 __all__ = [
     "collect_live_attribute_values",
+    "collect_unresolved_attribute_texts",
     "extract_and_split_semantic_facts",
     "extract_semantic_facts",
     "persist_facts",

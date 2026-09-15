@@ -645,6 +645,11 @@ memory:
   facts:
     extraction_skip_subject_canonicalize_regex: '^(loop|learn|mem)\.'   # pillar が機械的に命名した subject は辞書スキップ
     enable_extraction: true                                    # Step 8 Extractor 全体オンオフ
+    # trigger が 1 つも当たらない言明を事例の近傍でスロットへ戻す (docs/c_17 §3.1)。
+    # 実測 LOO 正解率 1.000 (判定 23 / 棄権 102、事例 125 件)。誤スロットは汎用スロット
+    # (mem.<kind>.user) へ落ちるより悪いので、被覆より正解率を優先した設定。事例を
+    # 触ったら scripts/bench/predicate_gate で 0.95 以上を確かめること。
+    attribute_gate_enabled: true
     extract_from_mdp_trace: true                               # agent_trace.jsonl から MDP 抽出
     ingest_mdp_trace_to_ltm: true                              # agent_trace.jsonl を episodic LTM に投入
     extraction_max_pinned_per_session: -1                      # pinned 由来の上限 (-1=無制限)

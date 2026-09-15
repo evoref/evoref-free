@@ -24,22 +24,36 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 
 def follow_embedder_rebind(state: "AppState") -> None:
-    """embedder の差し替えにツール判定器 (kNN ゲート) を追随させる。
+    """embedder の差し替えに事例ゲート (kNN) を追随させる。
 
     ``state.embedder`` を差し替える経路 (config API の再生成 / model migrate の
     rebind) は、``ToolCallJudge`` と ``ToolGateKNN`` が構築時の参照と旧モデル空間の
     exemplar ベクトルを握ったままにしていた (次元が同じなら縮退にも掛からず投票
     だけが狂う)。参照を差し替えて exemplar を捨て、再 warmup は背景で行う。
+
+    属性スロットの補完ゲート (:mod:`backend.free.memory.notes.attribute_gate`)
+    も同じ事情を持つ。較正で得た類似度の床は埋め込み空間に依存するので、
+    ベクトルと一緒に捨てて引き直す。
     """
-    judge = getattr(state, "tool_call_judge", None)
-    if judge is None:
-        return
-    judge.rebind_embedder(state.embedder)
-    if state.embedder is None:
-        return
     import asyncio
 
-    asyncio.create_task(judge.warmup_tool_gate(), name="tool_gate_rewarmup")
+    judge = getattr(state, "tool_call_judge", None)
+    if judge is not None:
+        judge.rebind_embedder(state.embedder)
+        if state.embedder is not None:
+            asyncio.create_task(judge.warmup_tool_gate(), name="tool_gate_rewarmup")
+
+    for attr, task_name in (
+        ("attribute_slot_gate", "attribute_gate_rewarmup"),
+        ("retrieval_skip_gate", "retrieval_skip_gate_rewarmup"),
+        ("layer_shadow", "layer_shadow_rewarmup"),
+    ):
+        gate = getattr(state, attr, None)
+        if gate is None:
+            continue
+        gate.reset(state.embedder)
+        if state.embedder is not None:
+            asyncio.create_task(gate.warmup(), name=task_name)
 
 
 def follow_base_model_rebind(state: "AppState", new_model_filename: str) -> dict:

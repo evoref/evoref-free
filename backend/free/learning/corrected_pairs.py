@@ -38,6 +38,10 @@ from backend.free.core.correction_target import (
     STOP_IDENTIFIERS,
     wrong_side_tokens,
 )
+from backend.free.core.intent_vocab import (
+    asks_quantity_without_operands,
+    is_plain_statement,
+)
 
 #: 訂正後の回答の先頭に付く謝罪・受諾の前置き。1 文単位で繰り返し剥がす。
 _PREAMBLE_SENTENCE_RE = re.compile(
@@ -197,6 +201,14 @@ def depends_on_context(query: str) -> bool:
     """
     q = (query or "").strip()
     if refers_to_previous_turn(q):
+        return True
+    # 平叙の自己申告 (「妻は保育士で、平日は 17 時まで仕事です。」) は
+    # system prompt に関わらず「復唱して確認する」応答になり、被演算子が
+    # 問いに無い数量の問い (「往復にすると何分ですか」) は文脈が無いと
+    # 答えが決まらない。どちらも単独再生成では現行・候補が必ず同点で、
+    # 採用ゲートの標本にすると測定の席を潰す (2026-09-14 ライブ監査: 標本
+    # 3 件が全てこの形で 3 引き分け)。判定は few-shot 入口と共有する。
+    if is_plain_statement(q) or asks_quantity_without_operands(q):
         return True
     return bool(_MEMORY_OR_TOOL_RE.search(q) or _PERSONAL_ATTR_RE.search(q))
 
