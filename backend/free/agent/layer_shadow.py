@@ -145,6 +145,10 @@ class LayerClassificationShadow:
     def calibration(self) -> dict[str, float | bool | int]:
         return self._exemplar.calibration
 
+    def self_check(self) -> dict[str, object]:
+        """warmup 時の LOO 自己診断 (正解率 / 被覆 / 閾値を満たしたか)。"""
+        return self._exemplar.self_check
+
     def leave_one_out(self, *, with_errors: bool = False) -> dict[str, object]:
         return self._exemplar.leave_one_out(with_errors=with_errors)
 

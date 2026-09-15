@@ -71,7 +71,11 @@ TARGET_FACT_TYPE = "personal_fact"
 #: しなかった**。LOO の正解率 0.944 はほぼ陰性クラス (28 件) だけを測っていた。
 #: ``ExemplarPredicate.unreachable_labels`` が warmup 時に警告する。
 #:
-#: 2026-09-15 / bge-m3-q8_0 / 事例 125 件 (全 19 ラベルが 4 件以上) の LOO::
+#: 2026-09-15 / bge-m3-q8_0 / 事例 140 件 (全 19 ラベルが 4 件以上) の LOO::
+#:
+#:     k=5 ratio=0.7  acc(判定)=1.000  棄権 107/140  被覆 24%   ← 現行
+#:
+#: 掃引 (事例 125 件時点。傾向は同じ)::
 #:
 #:     k=3 ratio=0.6  acc(判定)=0.772  棄権  46/125
 #:     k=3 ratio=0.8  acc(判定)=0.960  棄権 100/125
@@ -186,6 +190,10 @@ class AttributeSlotGate:
 
     def calibration(self) -> dict[str, float | bool | int]:
         return self._exemplar.calibration
+
+    def self_check(self) -> dict[str, object]:
+        """warmup 時の LOO 自己診断 (正解率 / 被覆 / 閾値を満たしたか)。"""
+        return self._exemplar.self_check
 
     def leave_one_out(self, *, with_errors: bool = False) -> dict[str, object]:
         """事例集合の LOO 精度 (事例を足したときに効果をその場で測る口)。"""

@@ -73,6 +73,31 @@ logger = get_logger("core.inference")
 _RAG_HEADER = ""
 _FILES_HEADER = "[添付ファイル]\n\n"
 
+#: ``[参考情報 N]`` の枠 (両 locale 共通)。2 経路 (salience / fallback) が
+#: 同じ綴りで書くので定数にする。``EVIDENCE_BLOCK_MARKERS`` の読み手が
+#: 「資料が注入されたか」を判定する鍵でもあるため、綴りがずれると黙って
+#: 判定が外れる。
+RAG_ENTRY_PREFIX = "[参考情報"
+#: 資料枠の目印。``messages_carry_evidence`` が「このターンに根拠が渡ったか」
+#: を決めるのに使う。``[関連する記憶]`` は ``MemoryInjector`` が、
+#: ``[参考情報 N]`` はここが書く。
+EVIDENCE_BLOCK_MARKERS: tuple[str, ...] = (RAG_ENTRY_PREFIX, "[関連する記憶]")
+
+
+def messages_carry_evidence(messages: list[dict] | None) -> bool:
+    """最後の user メッセージに資料枠が載っているか (純粋関数)。
+
+    「資料が無いのに断定した」を決定論で捕まえるための観測点。検索・注入の
+    結果は ``messages`` にしか現れない (エージェント層は検索の戻り値を
+    受け取らない) ので、枠の目印で判定する。
+    """
+    for message in reversed(messages or ()):
+        if message.get("role") != "user":
+            continue
+        text = str(message.get("content") or "")
+        return any(marker in text for marker in EVIDENCE_BLOCK_MARKERS)
+    return False
+
 # 動的コンテキストブロックと生クエリの境界に挟む区切り。文言と locale 版の
 # SSOT は ``core.turn_text`` (送信時ガードが同じ境界で切り詰めるため)。
 # ``_DYNAMIC_CONTEXT_DELIMITER`` は ja 既定の別名 (後方互換 / テスト用)。
@@ -1007,7 +1032,8 @@ def _inject_rag_salience(
         return None, remaining, 0
 
     selected_entries = [
-        f"[参考情報 {i + 1}]\n{text}" for i, text in enumerate(ranked_texts)
+        f"{RAG_ENTRY_PREFIX} {i + 1}]\n{text}"
+        for i, text in enumerate(ranked_texts)
     ]
     rag_block = _format_rag_block(selected_entries)
     rag_block_tokens = _estimate_tokens(rag_block)
@@ -1028,7 +1054,7 @@ def _inject_rag_fallback(
     """スコア降順 + 予算逐次選別で RAG block を構築する (フォールバック経路)。"""
     selected_entries: list[str] = []
     for i, chunk in enumerate(rag_chunks):
-        entry = f"[参考情報 {i + 1}]\n{chunk}"
+        entry = f"{RAG_ENTRY_PREFIX} {i + 1}]\n{chunk}"
         cost = _estimate_tokens(entry)
         if cost > remaining:
             logger.debug(

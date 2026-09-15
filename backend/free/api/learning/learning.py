@@ -226,6 +226,16 @@ def _annotate_level1_gate(
 
     ``LearningScheduler`` 側で分かる理由を先に見て、残りを
     ``SleepTimeScheduler.level1_gate_status()`` から補う。
+
+    **判定順は常駐ループ (``SleepTimeScheduler._schedule_level1_loop``) の
+    実体と同じ順にする。** SUSPENDED session の resume (判定 1) と優先キュー
+    (判定 2) は **アイドル待ちも経験件数も見ない** ので、どちらかが待って
+    いるときに ``waiting_for_idle`` / ``insufficient_experiences`` を返すのは
+    嘘になる。実測 (2026-09-15 ライブ監査): 手動トリガー直後に
+    ``waiting_for_idle`` (残り 1246 秒) と表示されたが実際は次 tick (60 秒)
+    で走り、2 回目は経験カーソルが進んだ状態で ``insufficient_experiences``
+    と表示されたがやはり走った。押したボタンの状態が API から読めないと、
+    「効いていない」と誤診してもう一度押すことになる。
     """
     if status.is_disabled:
         status.level1_blocked_reason = "learning_disabled"
@@ -233,21 +243,31 @@ def _annotate_level1_gate(
     if status.running:
         status.level1_blocked_reason = "already_running"
         return
-    if not status.conditions_met:
-        status.level1_blocked_reason = "insufficient_experiences"
-        return
 
     gate_fn = getattr(sleep_scheduler, "level1_gate_status", None)
     if gate_fn is None:
+        # ゲートが読めない構成では従来どおり経験件数だけで答える。
+        if not status.conditions_met:
+            status.level1_blocked_reason = "insufficient_experiences"
         return
     gate = gate_fn()
     status.level1_seconds_until_idle = gate.get("seconds_until_idle")
+    # 予約済みの仕事 (resume 待ちの session / 優先キュー) はアイドルと経験件数を
+    # 迂回する。ループの判定 1 / 2 と対応。
+    has_pending_work = bool(status.active_session) or bool(status.priority_queue)
     if not gate.get("llm_client_wired"):
         status.level1_blocked_reason = "no_llm_client"
     elif not gate.get("loop_running"):
         status.level1_blocked_reason = "loop_not_started"
+    elif gate.get("full_running"):
+        status.level1_blocked_reason = "deferred_by_full_cycle"
     elif gate.get("user_active"):
         status.level1_blocked_reason = "user_active"
+    elif has_pending_work:
+        # 次 tick で走る。止まってはいない。
+        status.level1_blocked_reason = None
+    elif not status.conditions_met:
+        status.level1_blocked_reason = "insufficient_experiences"
     elif not gate.get("idle"):
         status.level1_blocked_reason = "waiting_for_idle"
 

@@ -315,6 +315,8 @@ class LearningScheduler:
         self._last_critique_result = None
         # Few-shot Pool
         self._fewshot_pool = None
+        #: few-shot の「文脈依存」棄却を覆せる事例ゲート (任意、背景でのみ使う)。
+        self._context_bound_gate = None
         # 品質ゲート 還流パイプ
         self._feedback_pipe = None
         self._last_feedback_summary: dict = {}
@@ -798,6 +800,14 @@ class LearningScheduler:
         """Few-shot 候補プールを設定"""
         self._fewshot_pool = pool
         logger.info("Fewshot pool enabled (total: %d)", pool.total_count)
+
+    def set_context_bound_gate(self, gate) -> None:
+        """few-shot の「文脈依存」棄却を確認する事例ゲートを設定 (任意)。
+
+        未設定なら規則の棄却がそのまま通る (従来どおり)。
+        """
+        self._context_bound_gate = gate
+        logger.info("Context-bound gate enabled for the few-shot content gate")
 
     def set_policy_param_evolver(self, evolver) -> None:
         """ポリシーパラメータ進化器を設定"""
@@ -1377,6 +1387,19 @@ class LearningScheduler:
         (``insufficient_cases``)。採用ゲートは同じ下限で不採用にするので、
         走らせても採用され得ない — 実機ではケース 2 件のために 15 分の進化が
         走った (2026-09-08 監査 F-03)。
+
+        **選択圧は標本ケースで数えない** (2026-09-15 ライブ監査)。標本
+        (``CASE_KIND_SAMPLE``) は成功ターンなので、一対比較の比較器
+        (``compare_prompts`` = 決定論の欠陥数) では現行・候補とも欠陥 0 に
+        なり、**構造的に引き分けるか候補が負けるかのどちらか**しか起こらない
+        — 標本は退行の検出器であって上昇の測定器ではない。既定は
+        ``adoption_sample_cases == adoption_min_cases == 3`` なので、標本を
+        圧に数えると本ゲートは経験数の条件さえ満たせば**必ず**通り、
+        「全モードに選択圧が無ければ始めない」(:meth:`_skip_without_selection_pressure`)
+        が無効化されていた。実測: 失敗ゼロの 50 経験で変異 8 回・3 世代を
+        回した末に ``wins=0 losses=0 ties=3`` で不採用 (7.7 分の Level 1 の
+        うち 4.2 分)。標本は採用ゲート側には従来どおり渡す (退行の検出は
+        残す)。
         """
         from backend.free.optimizer.prompt_eval import select_prompt_eval_cases
 
@@ -1391,12 +1414,17 @@ class LearningScheduler:
             mode_exp = [
                 e for e in session.experience_snapshot if e.get("mode") == mode
             ]
+            # 圧の有無は失敗由来のケースだけで決める (標本は除く)。
+            pressure_cases = select_prompt_eval_cases(
+                mode_exp, mode, max(1, min_cases), sample_cases=0,
+            )
+            # 実際に採用ゲートへ渡る件数 (標本込み) は下限判定にだけ使う。
             cases = select_prompt_eval_cases(
                 mode_exp, mode, max(1, min_cases), sample_cases=self._sample_cases(),
             )
             if len(mode_exp) < threshold:
                 reason = "insufficient_experiences"
-            elif not cases:
+            elif not pressure_cases:
                 reason = "no_selection_pressure"
             elif len(cases) < min_cases:
                 reason = "insufficient_cases"
@@ -2390,6 +2418,23 @@ class LearningScheduler:
 
     # ── Level 1 ヘルパー: 各サブステップの実装 ──
 
+    async def _clear_context_bound(self, experiences: list[dict]) -> set[str]:
+        """規則の「文脈依存」棄却を事例が覆せる query の集合を返す。
+
+        ゲート未配線 / 未 warmup / 例外はすべて空集合 — 規則の挙動そのまま
+        (誤って開かない)。判定は埋め込みだけで LLM を呼ばない。
+        """
+        gate = self._context_bound_gate
+        if gate is None:
+            return set()
+        try:
+            return await gate.clear_queries(
+                str(e.get("query") or "") for e in experiences
+            )
+        except Exception as exc:  # noqa: BLE001 - 確認の失敗で補充を止めない
+            logger.warning("Context-bound confirmation failed: %r", exc)
+            return set()
+
     async def _update_fewshot_pool_from_experiences(
         self, experiences: list[dict], llm_client=None,
     ) -> None:
@@ -2401,7 +2446,10 @@ class LearningScheduler:
         """
         if self._fewshot_pool is None:
             return
-        added = self._fewshot_pool.add_from_experiences(experiences)
+        cleared = await self._clear_context_bound(experiences)
+        added = self._fewshot_pool.add_from_experiences(
+            experiences, context_bound_cleared=cleared,
+        )
         if added:
             logger.info("Fewshot pool updated: %d new examples added", added)
         # 訂正で確定した「元の問い → 訂正後の回答」も手本に流す。失敗経験の

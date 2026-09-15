@@ -3,7 +3,7 @@
 {"text": "四月から別の会社へ移りました。", "label": "employer", "id": "employer_betsu"}
 {"text": "前の職場を辞めて、いまは小さなスタートアップに拾ってもらっています。", "label": "employer", "id": "employer_hirotte"}
 {"text": "いまのところは老舗のメーカーに世話になっています。", "label": "employer", "id": "employer_oshinise"}
-{"text": "受託開発の会社に在籍しています。", "label": "employer", "id": "employer_zaiseki"}
+{"text": "いまのところは創業十年ほどの企業です。", "label": "employer", "id": "employer_sogyo"}
 {"text": "普段はバックエンドの開発をしていて、決済まわりを担当しています。", "label": "occupation", "id": "occupation_teform"}
 {"text": "十年ほどインフラを見てきました。", "label": "occupation", "id": "occupation_mite"}
 {"text": "肩書きとしてはテックリードということになっています。", "label": "occupation", "id": "occupation_katagaki"}
@@ -126,3 +126,19 @@
 {"text": "外食は週に一度くらいに抑えています。", "label": "food", "id": "food_gaishoku"}
 {"text": "服はほとんど黒で揃えてしまいます。", "label": "color", "id": "color_kuro"}
 {"text": "家で犬と猫を一匹ずつ世話しています。", "label": "pet", "id": "pet_inuneko"}
+{"_comment": "── 被覆を上げるための追加 (c_17 §8 #2)。k=5 x 0.7 = 4 票が要るので、実使用で出やすいスロットを厚くする。足すたびに bench_predicate_gate --errors で測り直し、正解率 0.95 を下回ったら外す。"}
+{"text": "現場でコードを書く側に立っています。", "label": "occupation", "id": "occupation_genba"}
+{"text": "人事の評価まわりを見ています。", "label": "occupation", "id": "occupation_jinji"}
+{"text": "教える側の仕事に就いています。", "label": "occupation", "id": "occupation_oshieru"}
+{"text": "いまは中堅どころの製造業にいます。", "label": "employer", "id": "employer_seizo"}
+{"text": "親会社ではなく子会社のほうに籍があります。", "label": "employer", "id": "employer_kogaisha"}
+{"text": "海沿いの街に腰を落ち着けています。", "label": "location", "id": "location_umizoi"}
+{"text": "いまは実家を離れて一人で暮らしています。", "label": "location", "id": "location_hitori"}
+{"text": "連れ合いは同じ歳で、子どもはまだいません。", "label": "family", "id": "family_onaji"}
+{"text": "きょうだいは三人で、私が真ん中です。", "label": "family", "id": "family_kyodai"}
+{"text": "隔週の金曜だけ早めに切り上げています。", "label": "schedule", "id": "schedule_kakushu"}
+{"text": "月初は決まって忙しくなります。", "label": "schedule", "id": "schedule_getsusho"}
+{"text": "インコを一羽そばに置いています。", "label": "pet", "id": "pet_inko"}
+{"text": "名乗るときは下の名前だけにしています。", "label": "name", "id": "name_shita"}
+{"text": "四捨五入すると五十に近いです。", "label": "age", "id": "age_shisha"}
+{"text": "生まれ育ちはどちらも北の方です。", "label": "origin", "id": "origin_kita"}

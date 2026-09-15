@@ -153,9 +153,15 @@ class SchedulerStatusModel(BaseModel):
     #: 止まっているかは ``level1_blocked_reason`` を見る。
     conditions_met: bool = False
     #: Level 1 が「今」走れない理由。走れる状態なら None。
-    #: ``learning_disabled`` / ``already_running`` / ``insufficient_experiences``
-    #: / ``no_llm_client`` / ``loop_not_started`` / ``user_active`` /
-    #: ``waiting_for_idle`` のいずれか。
+    #: ``learning_disabled`` / ``already_running`` / ``no_llm_client`` /
+    #: ``loop_not_started`` / ``deferred_by_full_cycle`` / ``user_active`` /
+    #: ``insufficient_experiences`` / ``waiting_for_idle`` のいずれか。
+    #:
+    #: 判定順は常駐ループ (``SleepTimeScheduler._schedule_level1_loop``) と
+    #: 同じ。**予約済みの仕事 (``active_session`` / ``priority_queue``) がある
+    #: ときは ``insufficient_experiences`` / ``waiting_for_idle`` を返さない**
+    #: — ループの resume / 優先キュー経路はどちらの条件も見ないため
+    #: (2026-09-15 ライブ監査)。
     level1_blocked_reason: str | None = None
     #: ``waiting_for_idle`` のとき、アイドル成立までの残り秒数。
     level1_seconds_until_idle: float | None = None

@@ -45,6 +45,7 @@ from backend.free.core.intent_vocab import (
     memory_architecture_question,
     self_learning_question,
     model_identity_question,
+    product_internals_question,
     own_process_question,
     self_assessment_question,
     PREMISE_CONFIRMATION_RE,
@@ -56,6 +57,7 @@ from backend.free.core.intent_vocab import (
     unused_tool_question,
     unverified_claim_numbers,
 )
+from backend.free.core.inference import messages_carry_evidence
 from backend.free.core.turn_text import TOOL_RESULT_HEADER, append_to_last_user
 from backend.config import resolve_context_size_for_mode
 from backend.i18n_helper import prompt_locale
@@ -1248,6 +1250,19 @@ _TOOL_LEDGER_EMPTY_FACTS: dict[str, str] = {
     ),
 }
 
+#: 資料の無い内部の問いへ渡す確定事実 + 開示要求
+#: (``_append_undocumented_internals_note``)。
+#:
+#: 「答えるな」ではなく「**推測だと言え**」にする。抑止すると落ち先は
+#: 「分かりません」だけの応答で、一般論としては妥当な見立てまで捨てることに
+#: なる (PR#407 の未接地 calculate と同じ判断)。
+_UNDOCUMENTED_INTERNALS_NOTE = (
+    "\n\n確定事実: この問いに対応する設計資料はこのインスタンスに導入されて"
+    "おらず、今回の回答には裏取りされた根拠が 1 件も無い。"
+    "一般論として答えてよいが、冒頭で推測であることを明示し、"
+    "内部の名称・構成・件数を確定した事実のように述べない。"
+)
+
 _MEMORY_ARCHITECTURE_FACT = (
     "\n\n確定事実: このアシスタントの記憶は次の 3 つで構成される。"
     "これは実装そのものなので、この内容で答えること。ここに無い層を述べない。\n"
@@ -1739,7 +1754,43 @@ class DeliberativeAgent:
                 " (+runtime facts)" if extra else "",
             )
             return True
+        # 決定論で確定する 3 点に当たらない内部の問い。答えは base が書くので
+        # **短絡しない** (ツール判定も従来どおり走る) が、資料が渡っていない
+        # ことだけは確定事実として告げる。
+        self._append_undocumented_internals_note(messages, query)
         return False
+
+    @staticmethod
+    def _append_undocumented_internals_note(
+        messages: list[dict], query: str,
+    ) -> bool:
+        """資料の無い内部の問いに「裏取りされていない」開示を求める (2026-09-15)。
+
+        ``_unexplained_date_math_note`` と同じ方針 (PR#407 の「格下げせず開示
+        させる」) の自己言及版。製品の内部設計を訊かれても、docs コーパスが
+        導入されていなければ根拠は 1 件も無く、``[参考情報]`` も
+        ``[関連する記憶]`` も枠ごと存在しない。**その状態はここで決定論に
+        分かる** ので、モデルの自己申告に任せずに告げる。
+
+        実インシデント (2026-09-15 ライブ監査): 資料ゼロのインストールで
+        「Evidence Store は 3 つのうちどれで構成されるか」に
+        「Raw / Processed / Metadata の 3 ストア」と断定し、
+        「sleep-time ワーカーが書き込みを独占する理由」も一般論で作話した。
+        同じ会話の別の 2 問には「推測です」と断っており、規則
+        (「不確かな内容は『未確認』か『推測』と明示する」) はあるのに
+        守るかどうかがターンごとに揺れていた。直後に「根拠にした設計書は」と
+        訊くと「参照していません」と認める — **知っていて書かなかった**。
+
+        資料が 1 件でも載っていれば注記しない (導入済みの環境では検索が
+        根拠を渡しており、この注記は雑音にしかならない)。
+        """
+        if not product_internals_question(query):
+            return False
+        if messages_carry_evidence(messages):
+            return False
+        append_to_last_user(messages, _UNDOCUMENTED_INTERNALS_NOTE, separator="")
+        logger.info("Undocumented-internals disclosure note pinned")
+        return True
 
     @staticmethod
     def _runtime_extra_facts(query: str, llm_client=None) -> str:
