@@ -1,0 +1,54 @@
+{"_comment": "RAG 要否の skip を確認する事例ゲート。self_rag_judge の規則が skip / fetch と言ったターンだけがここへ来る。label=skip は「検索しても足すものが無い」発話、label=none は「検索しないと答えられない」発話。規則の skip 誤爆は在庫の中で最も重い fail-closed (RAG が丸ごと飛び、記憶にしかない値を作話する) なので、none 側には監査で実害の出た形を優先して入れてある。"}
+{"text": "こんにちは。今日もよろしくお願いします。", "label": "skip", "id": "s_greeting"}
+{"text": "おはようございます。", "label": "skip", "id": "s_morning"}
+{"text": "ありがとうございます。助かりました。", "label": "skip", "id": "s_thanks"}
+{"text": "了解しました。", "label": "skip", "id": "s_ack"}
+{"text": "はい、それでお願いします。", "label": "skip", "id": "s_yes"}
+{"text": "いいえ、大丈夫です。", "label": "skip", "id": "s_no"}
+{"text": "お疲れさまでした。", "label": "skip", "id": "s_bye"}
+{"text": "今日は何日ですか。", "label": "skip", "id": "s_today"}
+{"text": "いまの時刻を教えてください。", "label": "skip", "id": "s_time"}
+{"text": "今日は何曜日ですか。", "label": "skip", "id": "s_weekday"}
+{"text": "あなたの名前は何ですか。", "label": "skip", "id": "s_self_name"}
+{"text": "あなたはどんなモデルで動いていますか。", "label": "skip", "id": "s_self_model"}
+{"text": "使えるツールの一覧を見せてください。", "label": "skip", "id": "s_tools"}
+{"text": "続けてください。", "label": "skip", "id": "s_continue"}
+{"text": "もう少し短くまとめ直してください。", "label": "skip", "id": "s_shorter"}
+{"text": "箇条書きにしてください。", "label": "skip", "id": "s_bullets"}
+{"text": "この表を CSV にして保存してください。", "label": "skip", "id": "s_write_csv"}
+{"text": "https://example.com/spec の内容を取得してください。", "label": "skip", "id": "s_fetch_url"}
+{"text": "十日後の営業日を計算してください。", "label": "skip", "id": "s_bizdays"}
+{"text": "1234 かける 5678 はいくつですか。", "label": "skip", "id": "s_arith"}
+{"_comment": "── 以下は none = 検索しないと答えられない。規則が skip と言ったら降ろす側。"}
+{"text": "私が来月出張する都市を、確信度を付けて答えてください。", "label": "none", "id": "n_trip_city"}
+{"text": "さきほど決めた締め切りはいつでしたか。", "label": "none", "id": "n_deadline"}
+{"text": "前に話したプロジェクトの名前をもう一度。", "label": "none", "id": "n_project"}
+{"text": "私の住んでいる場所を覚えていますか。", "label": "none", "id": "n_location"}
+{"text": "この会話でこれまでに出た数字をまとめてください。", "label": "none", "id": "n_numbers"}
+{"text": "先週相談した構成の結論はどうなりましたか。", "label": "none", "id": "n_last_week"}
+{"text": "あのとき採用した方針の理由を教えてください。", "label": "none", "id": "n_policy_reason"}
+{"text": "設計書に書いてある保持方針はどうなっていますか。", "label": "none", "id": "n_doc_retention"}
+{"text": "この仕様のスキーマ版数はいくつですか。", "label": "none", "id": "n_schema_version"}
+{"text": "評価セットの件数は何件でしたか。", "label": "none", "id": "n_evalset"}
+{"text": "エラーの原因として記録されていたものは何ですか。", "label": "none", "id": "n_error_cause"}
+{"text": "手順の三番目は何でしたか。", "label": "none", "id": "n_step3"}
+{"text": "私の好みに合う書き方はどちらでしたか。", "label": "none", "id": "n_preference"}
+{"text": "以前渡した資料の結論部分を引用してください。", "label": "none", "id": "n_quote"}
+{"text": "この用語の定義をこれまでの説明に合わせて答えてください。", "label": "none", "id": "n_term"}
+{"text": "担当者として登録したのは誰でしたか。", "label": "none", "id": "n_owner"}
+{"text": "決まっていた予算の上限はいくらですか。", "label": "none", "id": "n_budget"}
+{"text": "前回の計測で一番遅かった工程はどれですか。", "label": "none", "id": "n_slowest"}
+{"text": "設定のどの項目を変更したか思い出せますか。", "label": "none", "id": "n_config_change"}
+{"text": "約束していた次の作業は何でしたか。", "label": "none", "id": "n_next_task"}
+{"_comment": "── 2026-09-15 追加。LOO で none -> skip (見逃した反対 = ゲートの目的そのもの) になった 3 形を厚くする: 本人属性の想起 / 過去資料の引用 / これまでの説明との整合。"}
+{"text": "前に伝えた条件を覚えていますか。", "label": "none", "id": "n_recall_cond"}
+{"text": "さきほどの出力から該当箇所を抜き出してください。", "label": "none", "id": "n_extract_prior"}
+{"text": "前回の方針と矛盾しないように書いてください。", "label": "none", "id": "n_consistent_policy"}
+{"_comment": "── 2026-09-15 ライブ監査で誤った反対が出た形を厚くする。「使えるツールの一覧を教えてください。」が n_numbers (この会話で出た数字をまとめて) の近傍に落ちて uncertain へ降ろされた。自己構成・台帳の問いは決定論で事実が注入されるので検索しても足すものが無い。"}
+{"text": "あなたが持っているツールを列挙してください。", "label": "skip", "id": "s_tool_enum"}
+{"text": "いまのメモリ使用量はどれくらいですか。", "label": "skip", "id": "s_hardware"}
+{"text": "使っているモデルの名前を教えてください。", "label": "skip", "id": "s_model_name"}
+{"_comment": "── 本人の予定・経歴の想起。2026-08-23 の作話インシデント (「私が来月出張する都市を、確信度を付けて答えてください。」) は事例に入れてあったが、「確信度を付けて」を落とした素の形が skip 側に落ちていた。節が 1 つ違うだけで穴になるので、素の言い回しも入れる。"}
+{"text": "私が来月出張する都市を教えてください。", "label": "none", "id": "n_trip_plain"}
+{"text": "私が来週予定している作業を教えてください。", "label": "none", "id": "n_plan_plain"}
+{"text": "私が担当することになった案件を教えてください。", "label": "none", "id": "n_assignment"}

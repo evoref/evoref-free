@@ -1176,6 +1176,7 @@ async def unified_search(
     judge_tracker: "JudgeUsageTracker | None" = None,
     corpus_mode: str = "auto",
     correction_trail: dict[str, str] | None = None,
+    skip_gate=None,
 ) -> SearchResult:
     """統合検索パイプライン: Self-RAG + エピソード記憶 + corpus
 
@@ -1252,9 +1253,23 @@ async def unified_search(
     # (2026-08-01 プロファイリング)。
     if timer is not None:
         timer.start("necessity_ms")
-    necessity = necessity_judge.judge(
+    necessity = necessity_judge.judge_rule_only(
         query, context_count=context_count, window_complete=window_complete,
     )
+    # 規則が skip と言ったターンだけ事例の近傍に確認を取る。反対されたら
+    # ``uncertain`` へ降ろす — 検索を強制するのではなく、埋め込みリコールへ
+    # 回す安全側の値 (backend.free.rag.retrieval_skip_gate の説明を参照)。
+    # ``query_vec`` を渡すので埋め込みの往復は起きない。
+    if skip_gate is not None and necessity == "skip":
+        try:
+            necessity = await skip_gate.confirm(
+                query, necessity=necessity, query_vec=query_vec,
+            )
+        except Exception as e:  # pragma: no cover - 縮退で吸収する
+            logger.info("Retrieval skip gate failed: %s", e)
+    # 旧 ``judge()`` の 2 値へ正規化する (uncertain は安全側の retrieve)。
+    if necessity == "uncertain":
+        necessity = "retrieve"
     if timer is not None:
         timer.stop("necessity_ms")
     logger.debug(

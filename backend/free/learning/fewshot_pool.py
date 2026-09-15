@@ -33,6 +33,7 @@ from backend.free.core.session_mode import is_valid_session_mode, normalize_sess
 from backend.utils import parse_utc, utc_now, utc_now_dt
 from backend.free.core.intent_vocab import (
     NUMBER_LITERAL_RE,
+    asks_quantity_without_operands,
     is_plain_statement,
     looks_like_numeric_question,
     own_process_question,
@@ -523,6 +524,13 @@ def find_content_rejection(query: str, response: str) -> str | None:
     # 先頭 4 件がこの形だった。文脈依存の判定は訂正ペアと共有する。
     if refers_to_previous_turn(query):
         return "query depends on the previous turn (anaphora / continuation)"
+    # 数量を求めるのに数詞が無い問い (「駅からの徒歩時間を往復にすると
+    # 何分ですか？」→「24 分です」) は被演算子が直前ターンにしか無く、単独の
+    # 手本にすると「根拠の無い数値を即答する」型を教える。照応語を持たないので
+    # 上の判定を素通りし、品質採点 (LLM) で落ちるまで手本に載っていた
+    # (2026-09-14 ライブ監査)。判定は採用ゲートの標本選定と共有する。
+    if asks_quantity_without_operands(query):
+        return "query asks for a quantity whose operands are not in the question"
     # 内部足場の語彙を含む応答は PROTECTED 違反の実例なので手本にしない
     if _response_leaks_internal_scaffold(response):
         return "leaks internal scaffold vocabulary"
@@ -1042,6 +1050,7 @@ class FewShotPool(JsonStateStore):
             # 素通しだと、ゲートを増やしても過去分が手本として蘇る
             # (2026-09-02 監査 R-D3)。
             reject = find_content_rejection(example.query, example.response)
+            self._log_content_gate(example.query, reject, "semmem_restore")
             if reject is not None:
                 dropped[reject.split(":")[0]] += 1
                 continue
@@ -1354,6 +1363,40 @@ class FewShotPool(JsonStateStore):
             self._archive(mode, ex, reason)
         return len(candidates)
 
+    def _log_content_gate(
+        self, query: str, reject: str | None, entry_point: str,
+    ) -> None:
+        """few-shot 内容ゲートの採否を ``decision.jsonl`` に残す。
+
+        この判定は在庫で唯一 **fail-open で自己増幅する** 経路 — 欠陥のある
+        応答が手本へ昇格すると、それが次の応答を作り、また手本になる
+        (2026-07-15: タスク進捗ノート形式の例が毎ターン選ばれ、本文なしの極小
+        ファイル生成を誘発した)。したがって「何を通し、何を落としたか」を
+        記録しておく価値が最も高い。
+
+        入口は 4 つあり (``experience`` / ``corrected_pair`` / ``artifact`` /
+        ``semmem_restore``)、どれか 1 つが抜け道になる事故を過去に起こして
+        いるので、``entry_point`` を context に載せて入口別に数えられるように
+        する。
+        """
+        if self._debug_logger is None:
+            return
+        try:
+            self._debug_logger.log_decision(
+                decision_point="fewshot_content_gate",
+                chosen="reject" if reject else "accept",
+                candidates=["accept", "reject"],
+                reason=(reject or "clean").split(":")[0],
+                context={
+                    "entry_point": entry_point,
+                    "detail": reject or "",
+                    "query_len": len(query or ""),
+                },
+                scope="cycle",
+            )
+        except Exception as e:  # pragma: no cover - ログで採否を落とさない
+            logger.debug("fewshot content gate decision log failed: %s", e)
+
     def add_from_experiences(self, experiences: list[dict]) -> int:
         """経験バッファから高品質な例を候補プールに追加する
 
@@ -1440,6 +1483,7 @@ class FewShotPool(JsonStateStore):
                 continue
 
             reject = find_content_rejection(query, response)
+            self._log_content_gate(query, reject, "experience")
             if reject is not None:
                 logger.info(
                     "Rejecting fewshot candidate (%s): query=%s",
@@ -1510,6 +1554,7 @@ class FewShotPool(JsonStateStore):
             ):
                 continue
             reject = find_content_rejection(query, response)
+            self._log_content_gate(query, reject, "corrected_pair")
             if reject is not None:
                 logger.info(
                     "Rejecting corrected-pair fewshot candidate (%s): query=%s",
@@ -1600,6 +1645,7 @@ class FewShotPool(JsonStateStore):
         # 内容ゲートは経験経路と共有する。こちらだけ素通りにすると、同じ崩れが
         # ラルフループ経由でプールに入る抜け道になる (2026-08-07 監査で発見)。
         reject = find_content_rejection(query, response)
+        self._log_content_gate(query, reject, "artifact")
         if reject is not None:
             logger.info(
                 "Rejecting fewshot artifact candidate (%s): query=%s",

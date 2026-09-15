@@ -441,8 +441,16 @@ SESSION_ANCHOR_JA = (
     # 「ここまでの会話を要約して」がアンカー無し扱いになり、reactive 軽量パス
     # (直近 6 メッセージ・STM/SemMem 注入なし) で直近 3 往復だけを要約した
     # (2026-08-12 ライブ監査 ターン21)。
+    # 「ここまで」は談話指示 (ここまでに述べたこと) で、後ろに「会話」が無くても
+    # 進行中の会話を指す (「ここまでの計算結果を表に」「ここまでで私について
+    # 覚えたこと」)。「会話」名詞を要求していたため「ここまでの計算結果」が
+    # アンカー無し扱いになり、「計算」で tool_patterns → meta_cognitive が
+    # 現在セッションを search_history で探し回った (2026-09-14 ライブ監査、
+    # 192 秒)。「これまでの / 今までの」は「これまでの研究では」のように外部の
+    # 経緯も指すので、従来どおり会話名詞との組でだけアンカーにする。
     r"(?:この会話|このやり取り|このセッション|この対話"
     r"|(?:今|ここ|これ)までの(?:会話|やり取り|対話|セッション)"
+    r"|ここまで(?:の|で)"
     r"|今日の(?:追加分の)?会話|今回の(?:追加分の)?会話)"
 )
 
@@ -1861,6 +1869,38 @@ def looks_like_numeric_question(query: str, context: str = "") -> bool:
     return bool(NUMBER_LITERAL_RE.search(context))
 
 
+#: 数量の問いに現れる数詞 (算用数字 / 漢数字)。
+_QUANTITY_NUMERAL_RE = re.compile(r"\d|[一二三四五六七八九十百千万億]")
+
+#: 単位付きで量を問う形だけ (「何分」「いくら」「合計」)。:data:`CALCULATION_CUE_RE`
+#: の「何…です」型は後段の数値チェックが前提の広い網で、「べき等性とは何ですか」
+#: にも当たるため、数詞を持たない問いの判定には使えない。
+_QUANTITY_UNIT_CUE_RE = re.compile(
+    r"(?:いくつ|いくら|どれ(?:だけ|くらい|ほど)"
+    r"|何[個円分秒時間年枚人倍%％]|何キロ|何マイル|何時間"
+    r"|合計|総額|平均|割合)",
+)
+
+
+def asks_quantity_without_operands(query: str) -> bool:
+    """数量を求める問いなのに、問い自身に数詞が 1 つも無いか (純粋関数)。
+
+    「駅からの徒歩時間を往復にすると何分ですか？」のように、答えを出すための
+    被演算子 (片道 12 分) が **直前ターンか記憶にしか無い** 形。問いだけを
+    見ても答えは決まらないので、単独の再生成で評価する採用ゲートの標本や、
+    単独で提示する few-shot 手本には向かない (2026-09-14 ライブ監査: 手本に
+    載って品質採点で落ち、採用ゲートの標本 3 件が全て引き分けになった)。
+    手掛かり語は単位付きの量の問い (:data:`_QUANTITY_UNIT_CUE_RE`)、除外は
+    環境依存の問い (:data:`CALCULATION_EXCLUDE_RE`)。
+    """
+    q = query or ""
+    if not q or CALCULATION_EXCLUDE_RE.search(q):
+        return False
+    if not _QUANTITY_UNIT_CUE_RE.search(q):
+        return False
+    return not _QUANTITY_NUMERAL_RE.search(q)
+
+
 #: 「あなたは何のツールが使えるか」を尋ねる問い。ツール目録は決定論で答えられる
 #: 事実 (ToolsRegistry が SSOT) なのに、チャット応答パスの system プロンプトには
 #: 一覧が載っていない。ツール選択は別レイヤ (ToolCallJudge / grammar 分類器) が
@@ -2556,8 +2596,13 @@ CALCULATE_TERM = r"計算|" + ascii_boundary("calculate")
 #: 数値を出してほしい依頼ではない。bare「計算」でタスク計画層へ振ると、無関係な
 #: ``list_directory`` が走ってリポジトリ一覧がコンテキストに載る
 #: (2026-09-05 ライブ監査 F-08: A/B テストの p 値の質問)。
+#: 「計算結果」は **既に出た値** を指す名詞で、それを表にする / 覚える / 教える
+#: 依頼は新たに数値を出す依頼ではない (deliberative でも ToolCallJudge が
+#: 必要なら calculate を撃てるので、層の振り分けで meta_cognitive へ送る理由が
+#: 無い)。「ここまでの計算結果を表にまとめて」が meta_cognitive に落ち
+#: search_history + 引数欠落の draft_document で 192 秒 (2026-09-14 ライブ監査)。
 CALCULATE_TOOL_TERM = (
-    r"計算(?!過程|方法|式|の仕方|手順|根拠|量|機|論|科学|資源|環境|ミス|違い|間違)|"
+    r"計算(?!過程|方法|式|の仕方|手順|根拠|量|機|論|科学|資源|環境|ミス|違い|間違|結果)|"
     + ascii_boundary("calculate")
 )
 

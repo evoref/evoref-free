@@ -181,6 +181,15 @@ class AppState:
     learned_patterns_store: LearnedPatternStore | None = None
     tools_registry: ToolsRegistry | None = None
     tool_call_judge: ToolCallJudge | None = None
+    #: 属性スロットの補完ゲート (sleep-time 専用)。embedder 差し替え時に
+    #: exemplar ベクトルを捨てて再 warmup するため AppState から辿れるようにする。
+    attribute_slot_gate: Any = None
+    #: RAG 要否の ``skip`` を事例で確認するゲート。検索パイプラインが既に
+    #: 計算した ``query_vec`` を使うので追加の埋め込み往復は無い。
+    retrieval_skip_gate: Any = None
+    #: 層振り分けの shadow 評価。**挙動は変えず** 不一致だけを記録する
+    #: (router は EVOLVABLE_DOMAINS から意図的に凍結されているため)。
+    layer_shadow: Any = None
     # Reactive 層 (挨拶/日時/キャッシュ即応) の常駐インスタンス。リクエスト毎に
     # 生成すると LRU キャッシュが温まらないため AppState に保持する。
     reactive_agent: "ReactiveAgent | None" = None

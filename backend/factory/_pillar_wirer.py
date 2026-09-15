@@ -1551,9 +1551,63 @@ def _init_tools(
     except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
         logger.info("Tool gate warmup deferred: no running event loop")
 
+    _wire_retrieval_skip_gate(state, embedder, state.debug_logger)
+    _wire_layer_shadow(state, embedder, state.debug_logger)
+
     # Reactive 層を常駐化 (挨拶パターンのみ。LLM 非依存なので構築コストはほぼゼロ)。
     state.reactive_agent = ReactiveAgent()
     logger.info("ReactiveAgent initialized (resident)")
+
+
+def _wire_retrieval_skip_gate(
+    state: AppState, embedder: Any, debug_logger: Any,
+) -> None:
+    """RAG 要否の ``skip`` を確認する事例ゲートを構築する。
+
+    規則が ``skip`` と言ったターンだけ走り、検索パイプラインが既に計算した
+    ``query_vec`` を使うので **追加の埋め込み往復は無い**。未 warmup の間は
+    規則の判定がそのまま通る (従来どおり)。
+    """
+    if embedder is None:
+        logger.info("Retrieval skip gate skipped: no embedder")
+        return
+    from backend.free.rag.retrieval_skip_gate import RetrievalSkipGate
+
+    try:
+        gate = RetrievalSkipGate(embedder, debug_logger=debug_logger)
+    except Exception as e:  # pragma: no cover - 縮退で吸収する
+        logger.warning("Retrieval skip gate construction failed: %s", e)
+        return
+    state.retrieval_skip_gate = gate
+    try:
+        _track_background_task(
+            state, gate.warmup(), name="retrieval_skip_gate_warmup",
+        )
+    except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
+        logger.info("Retrieval skip gate warmup deferred: no running event loop")
+
+
+def _wire_layer_shadow(state: AppState, embedder: Any, debug_logger: Any) -> None:
+    """層振り分けの shadow 評価を構築する (挙動は変えない)。
+
+    規則との不一致を ``decision.jsonl`` に貯めるだけ。チャット経路からは
+    投げっぱなしで呼ばれるので TTFT には影響しない。
+    """
+    if embedder is None:
+        logger.info("Layer shadow skipped: no embedder")
+        return
+    from backend.free.agent.layer_shadow import LayerClassificationShadow
+
+    try:
+        shadow = LayerClassificationShadow(embedder, debug_logger=debug_logger)
+    except Exception as e:  # pragma: no cover - 縮退で吸収する
+        logger.warning("Layer shadow construction failed: %s", e)
+        return
+    state.layer_shadow = shadow
+    try:
+        _track_background_task(state, shadow.warmup(), name="layer_shadow_warmup")
+    except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
+        logger.info("Layer shadow warmup deferred: no running event loop")
 
 
 def _agent_trace_dir() -> Path | None:
@@ -2353,6 +2407,52 @@ def _wire_fewshot_pool_to_sleep_worker(
     logger.info("FewShotPool wired to SleepTimeWorker for embedding backfill")
 
 
+def _wire_attribute_slot_gate(
+    state: AppState,
+    mem: "MemPillar",
+    embedder: Any,
+    debug_logger: Any,
+    cfg: dict[str, Any] | None = None,
+) -> None:
+    """属性スロットの補完ゲートを構築し SleepTimeWorker へ渡す。
+
+    ``fact_attributes.yaml`` の trigger 語が 1 つも当たらなかった言明を、事例の
+    近傍でスロットへ戻す (:mod:`backend.free.memory.notes.attribute_gate`)。
+    埋め込みは起動を待たせないよう背景タスクで張り、完了までは従来どおり
+    汎用スロット (``mem.<kind>.user``) へ落ちる。
+    """
+    if embedder is None:
+        logger.info("Attribute slot gate skipped: no embedder")
+        return
+    facts_cfg = ((cfg or {}).get("memory", {}) or {}).get("facts", {}) or {}
+    if not facts_cfg.get("attribute_gate_enabled", False):
+        logger.info(
+            "Attribute slot gate disabled "
+            "(memory.facts.attribute_gate_enabled=false)",
+        )
+        return
+    scheduler = getattr(mem, "sleep_scheduler", None)
+    worker = getattr(scheduler, "_worker", None) if scheduler else None
+    setter = getattr(worker, "set_attribute_slot_gate", None)
+    if setter is None:
+        return
+    from backend.free.memory.notes.attribute_gate import AttributeSlotGate
+
+    try:
+        gate = AttributeSlotGate(embedder, debug_logger=debug_logger)
+    except Exception as e:  # pragma: no cover - 縮退で吸収する
+        logger.warning("Attribute slot gate construction failed: %s", e)
+        return
+    setter(gate)
+    state.attribute_slot_gate = gate
+    try:
+        _track_background_task(
+            state, gate.warmup(), name="attribute_slot_gate_warmup",
+        )
+    except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
+        logger.info("Attribute slot gate warmup deferred: no running event loop")
+
+
 async def _build_learn_pillar(
     state: AppState,
     base: _BaseContext,
@@ -2419,6 +2519,10 @@ async def _build_learn_pillar(
         _wire_fewshot_pool_to_sleep_worker(state, learning_scheduler, mem)
     else:
         logger.info("FewShotPool wiring skipped (learning disabled)")
+
+    # 属性スロットの補完ゲートは --no-learning でも配線する (記憶側の判定で
+    # あって学習ではない。SleepTimeWorker を構築するのと同じ理由)。
+    _wire_attribute_slot_gate(state, mem, gen.embedder, debug_logger, cfg)
 
     with _timed(timings, "component_wiring"):
         _wire_sleep_scheduler_models(

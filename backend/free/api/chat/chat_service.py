@@ -336,6 +336,8 @@ async def run_search_pipeline(
             session_id=session_id,
             corpus_mode=corpus_mode,
             judge_tracker=state.judge_tracker,
+            # 規則の skip に事例の確認を掛ける (未構築なら None = 従来どおり)。
+            skip_gate=getattr(state, "retrieval_skip_gate", None),
             correction_trail=_collect_correction_trail(state),
         )
         if not search_result.skipped and search_result.sources:

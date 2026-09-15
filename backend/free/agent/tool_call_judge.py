@@ -811,6 +811,20 @@ class ToolCallJudge:
             if not tool_name:
                 return result
         else:
+            # 平叙の自己申告 (「毎週火曜日の夜はジムに通っています。毎月第 1
+            # 土曜日は息子の試合があります。」「妻は平日 17 時まで仕事です。」)
+            # には答えるべき日付演算が無い。手掛かり語 (曜日 / 第 N / 平日) と
+            # 数量を持つので下の条件を通り、抽出器の往復 (23 秒) を払って
+            # kind: none が返っていた (2026-09-14 ライブ監査 T04/1・T04/4)。
+            # 判定は分類器ゲート (層 0.6b) と同じ ``is_plain_statement`` — 問い・
+            # 依頼のマーカーが無く平叙の文末で終わる発話だけを止めるので、
+            # 「〜とすると」「〜としたら、どうなりますか」型の追い質問は通す。
+            if is_plain_statement(call.query or ""):
+                logger.debug(
+                    "date intent skipped: plain statement, not a request: %s",
+                    (call.query or "")[:60],
+                )
+                return result
             # ツール無しの exit は手掛かり語だけでは撃たない (「祝日の由来」で
             # 40 秒の往復を払わない)。数量 (数字 / 漢数字) を伴うときだけ。
             # 手掛かり語を直前のユーザー発話から継いだ追い質問は、数量も

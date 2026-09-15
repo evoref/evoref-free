@@ -236,6 +236,13 @@ class ExtractionContext:
     #: 未検証の訂正候補を据え置くか (Step 8.0 の補助タスクが使える構成で真)。
     #: 偽 (degraded) なら従来どおり通常の再言明として消費する。
     defer_unverified_corrections: bool = False
+    #: ``{ノート本文: 属性スロット}``。``fact_attributes.yaml`` の trigger 語が
+    #: 1 つも当たらなかった言明を、事例の近傍でスロットへ戻すための提案
+    #: (:class:`~backend.free.memory.notes.attribute_gate.AttributeSlotGate`)。
+    #: 抽出器は同期なので、非同期の埋め込みは sleep-time 側で先に済ませて
+    #: ここへ載せる (``live_attribute_values`` と同じ扱い)。空なら従来どおり
+    #: 汎用スロット (``mem.<kind>.user``) へ落ちる。
+    attribute_hints: dict[str, str] = field(default_factory=dict)
 
     def current_time(self) -> float:
         return self.now if self.now is not None else time.time()
@@ -261,6 +268,23 @@ class ExtractionResult:
     notes_deferred: int = 0
     cap_dropped: int = 0
     already_extracted: int = 0
+    #: 候補ファクトタイプが **1 件も立たなかった** ユーザーノート数。
+    #:
+    #: タグ 0 件は fail-closed で、そのノートは抽出対象にすらならない
+    #: (記憶が 1 件も残らない)。在庫で 2 番目に脆い判定点なので、cycle ごとに
+    #: 数えて ``decision.jsonl`` に残す (docs/c_17 §5)。
+    notes_without_tags: int = 0
+    #: そのうち **平叙文** のもの = 取りこぼしの候補。
+    #:
+    #: 生の ``notes_without_tags`` は会話の形でほぼ決まり、指標にならない
+    #: (2026-09-15 監査: 40 発話中 30 件がタグ 0 件だったが、**全部が挨拶 /
+    #: 知識質問 / 計算 / ファイル操作 / メタ質問** で、ファクトにすべき発話は
+    #: 1 件も無かった)。問いや依頼を除いて数えると 5 件まで落ち、それも全部
+    #: 挨拶だった = 取りこぼし 0。
+    #:
+    #: **この数が増えたときだけトリガ辞書が地盤を失っている**。生の件数だけを
+    #: 見ていると、会話が知識質問に寄った日を「記憶が壊れた」と読み違える。
+    notes_without_tags_stating: int = 0
     episodes_seen: int = 0
 
 

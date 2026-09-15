@@ -1194,7 +1194,11 @@ _FOLLOW_UP_WEEK_HOLIDAY_RE = re.compile(
 _FOLLOW_UP_SAME_DAY_HOLIDAY_RE = re.compile(
     r"(?:その日|当日|着手日|納品日|完了日|目標日)(?:自体|そのもの)?が(?:休み|休日|祝日|休業)"
 )
-_WEEKDAY_INDEX = {c: i for i, c in enumerate("月火水木金土日")}
+# 曜日 → index の表は :data:`_WEEKDAY_INDEX` (= ``core.relative_date`` の SSOT)
+# を使う。ここに同じ内容のローカル literal を置いていたが、module-level の
+# 名前解決は最終束縛が勝つため **:299 の alias を上書きしていた** — 値が同じ
+# なので動作は変わらないが、SSOT を直しても反映されない状態だった
+# (:296-297 のコメントは共有していると書いている)。
 
 
 def resolve_date_intent_target(
