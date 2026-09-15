@@ -45,6 +45,8 @@ from backend.log_config import get_logger
 logger = get_logger("core.predicate")
 
 __all__ = [
+    "ABSTAIN_LABEL",
+    "DEFAULT_MIN_LOO_ACCURACY",
     "DISPUTED_EVIDENCE_PREFIX",
     "NEGATIVE_LABEL",
     "AuxPredicate",
@@ -71,6 +73,19 @@ __all__ = [
 #: 近傍投票が自然に扱い、較正の null 側分布もそこから取れる。corpus の
 #: ``CANARY_UTTERANCES`` のような外部リストを判定点ごとに用意する必要がない。
 NEGATIVE_LABEL = "none"
+
+#: 決定ログ (``decision.jsonl`` の ``chosen``) が **棄権** を表すのに使う番兵。
+#:
+#: ``str(verdict.value)`` をそのまま書いていた頃、棄権は ``"None"`` として
+#: 記録されていた。これは (a) ``candidates`` に無い値なので
+#: ``DebugLogger.log_decision`` の契約 (「採択された候補の文字列」) を破り、
+#: (b) 実ラベル :data:`NEGATIVE_LABEL` (``"none"``) と **大小文字しか違わない**。
+#: 「判定できなかった (abstain)」と「判定した結果どのラベルでもない (none)」を
+#: 分けるのが本設計の核心 (:data:`Band` の説明) なのに、記録の側でその 2 つが
+#: 潰れていた — 2026-09-15 のライブ監査では ``fact_attribute_slot`` の 50 件が
+#: ``"none"`` 27 / ``"None"`` 23 に割れており、集計すると区別が付かない。
+#: ラベルは snake_case 識別子なので、括弧を含むこの値とは衝突し得ない。
+ABSTAIN_LABEL = "(abstain)"
 
 #: 判定の帯域。``fire`` = 発火 / ``skip`` = 確信を持って不発 / ``abstain`` = 棄権。
 #:
@@ -262,6 +277,17 @@ def _l2_normalize(mat: np.ndarray) -> np.ndarray:
     return (mat / norms).astype(np.float32)
 
 
+#: warmup の自己診断が要求する LOO 正解率 (判定分)。
+#:
+#: **事例は足すと精度が下がることがある** (2026-09-15 に 3 回踏んだ: 自己構成の
+#: 問いで 0.951→0.895 / 層の事例 14 件で 1.000→0.895 / 属性の事例で 1.000→0.970)。
+#: 手でベンチを回している間は気づけるが、それは仕組みではない。warmup が毎回
+#: 測って下回ったら WARNING を出す。
+#:
+#: user override (``local/`` 側で事例を差し替える) を将来入れるなら、この
+#: 自己診断が前提になる — ユーザーには劣化に気づく手段が他に無い。
+DEFAULT_MIN_LOO_ACCURACY = 0.95
+
 #: 較正の正側分位。``corpus/calibration.py`` と同じ値 — 正解の下位 5% を切る。
 POSITIVE_QUANTILE = 0.05
 #: 較正の null 側分位。陰性例の上位 5% を棒にする。
@@ -398,6 +424,7 @@ class ExemplarPredicate:
         mode: str = "chat",
         fire_ratio: float = 0.6,
         sim_floor: float | None = None,
+        min_loo_accuracy: float = DEFAULT_MIN_LOO_ACCURACY,
     ) -> None:
         self.name = name
         self._embedder = embedder
@@ -406,6 +433,8 @@ class ExemplarPredicate:
         self._mode = mode
         self._fire_ratio = float(fire_ratio)
         self._sim_floor = sim_floor
+        self._min_loo_accuracy = float(min_loo_accuracy)
+        self._self_check: dict[str, Any] = {}
         self._vectors: np.ndarray | None = None
         self._labels: list[str] = []
         self._ids: list[str] = []
@@ -434,6 +463,7 @@ class ExemplarPredicate:
         self._labels = []
         self._ids = []
         self._calibration = {}
+        self._self_check = {}
         if embedder is not None:
             self._embedder = embedder
 
@@ -461,11 +491,63 @@ class ExemplarPredicate:
         if self._sim_floor is None and self._calibration.get("ok"):
             self._sim_floor = float(self._calibration["sim_floor"])
         self._warn_unreachable_labels()
+        self._self_check = self._run_self_check()
         logger.info(
-            "Exemplar predicate %s ready: %d exemplars, k=%d, sim_floor=%.4f, cal=%s",
-            self.name, len(self._labels), self._k, self.sim_floor, self._calibration,
+            "Exemplar predicate %s ready: %d exemplars, k=%d, sim_floor=%.4f, "
+            "loo_acc=%s coverage=%s cal=%s",
+            self.name, len(self._labels), self._k, self.sim_floor,
+            self._self_check.get("accuracy_decided"),
+            self._self_check.get("coverage"),
+            self._calibration,
         )
         return True
+
+    def _run_self_check(self) -> dict[str, Any]:
+        """warmup ごとに LOO を測り、閾値を下回ったら WARNING を出す。
+
+        **事例は足すと精度が下がることがある。** 手でベンチを回している間は
+        気づけるが、それは仕組みではない。同梱ファイルの退行も、将来の user
+        override による劣化も、ここで検出する。
+
+        ``ExemplarPredicate`` は有効のまま (無効化はしない) — 劣化していても
+        「何も判定しない」より「少し間違える」方がましな判定点があり、どちらが
+        ましかは呼出側の縮退先で決まる。判断材料をログに出すところまでが責務。
+        """
+        loo = self.leave_one_out()
+        if not loo.get("ok"):
+            return {}
+        n = int(loo.get("n") or 0)
+        decided = int(loo.get("decided") or 0)
+        acc = float(loo.get("accuracy_decided") or 0.0)
+        coverage = round(decided / n, 4) if n else 0.0
+        out = {
+            "accuracy_decided": acc,
+            "coverage": coverage,
+            "decided": decided,
+            "n": n,
+            "threshold": self._min_loo_accuracy,
+            "ok": bool(decided == 0 or acc >= self._min_loo_accuracy),
+        }
+        if decided == 0:
+            logger.warning(
+                "Exemplar predicate %s self-check: decides nothing "
+                "(%d exemplars, k=%d, fire_ratio=%.2f). Lower k or add exemplars.",
+                self.name, n, self._k, self._fire_ratio,
+            )
+        elif not out["ok"]:
+            logger.warning(
+                "Exemplar predicate %s self-check FAILED: LOO accuracy %.3f "
+                "< %.2f (decided %d/%d). The exemplar set likely regressed - "
+                "run scripts/bench/predicate_gate with --errors and remove the "
+                "records that overlap existing ones.",
+                self.name, acc, self._min_loo_accuracy, decided, n,
+            )
+        return out
+
+    @property
+    def self_check(self) -> dict[str, Any]:
+        """warmup 時の自己診断結果 (未 warmup なら空 dict)。"""
+        return dict(self._self_check)
 
     def _warn_unreachable_labels(self) -> None:
         """``k × fire_ratio`` 票に **構造的に届かない** ラベルを警告する。
@@ -719,6 +801,24 @@ class AuxPredicate:
 #: - ``shadow``: 常に両方を評価するが **返すのは必ず字句の結果**。不一致だけを
 #:   記録する。凍結領域 (``router`` は ``EVOLVABLE_DOMAINS`` から意図的に除外
 #:   されている) を測るための方針。
+#:
+#: .. warning::
+#:    **棄権が効くのは縮退先が強いときだけ。** 棄権すると呼出側は従来の答えへ
+#:    落ちるので、その「従来の答え」が弱ければ棄権は改善ではなく劣化になる。
+#:
+#:    実測 (2026-09-15、``tool_gate`` の 137 件)::
+#:
+#:        棄権なし (現行 ToolGateKNN)   recall 98.5%
+#:        k=7 ratio=0.8  acc 0.987  棄権 62/137 (45%)
+#:
+#:    一見 0.987 の方が良いが、``ToolGateKNN`` の縮退先は **正規表現ゲート
+#:    (recall 66.2%)** なので、45% を棄権に回すと全体の recall はむしろ落ちる。
+#:    だから ``tool_gate`` には棄権を入れない。
+#:
+#:    縮退先の強さは判定点ごとに違う: ``fact_attribute_slot`` は汎用スロット
+#:    (無害) なので棄権は安い / ``retrieval_skip`` は規則の skip (危険側) なので
+#:    棄権は高くつく / ``tool_gate`` は弱い正規表現なので棄権は劣化。**方針を
+#:    選ぶ前に縮退先を測ること。**
 CascadePolicy = Literal["complement", "confirm", "shadow"]
 
 
@@ -754,7 +854,13 @@ class CascadePredicate:
         self._exemplar = exemplar
         self._aux = aux
         self._debug_logger = debug_logger
-        self._candidates = list(candidates)
+        # 棄権はどの判定点でも起こりうる結末なので候補集合に含める。含めないと
+        # 決定ログの ``chosen`` が ``candidates`` の外の値を取り、読み手
+        # (scripts/analyze_predicates.py / 手集計) が「知らないラベル」として
+        # 落とすか ``none`` と取り違える (:data:`ABSTAIN_LABEL`)。
+        self._candidates = [*candidates]
+        if ABSTAIN_LABEL not in self._candidates:
+            self._candidates.append(ABSTAIN_LABEL)
         self._scope = scope
 
     @property
@@ -886,7 +992,7 @@ class CascadePredicate:
         try:
             self._debug_logger.log_decision(
                 decision_point=self.name,
-                chosen=str(verdict.value),
+                chosen=_chosen_label(verdict),
                 candidates=self._candidates,
                 reason=verdict.evidence,
                 context=context,
@@ -894,6 +1000,20 @@ class CascadePredicate:
             )
         except Exception as e:  # pragma: no cover - ログで判定を落とさない
             logger.debug("Predicate %s decision log failed: %s", self.name, e)
+
+
+def _chosen_label(verdict: Verdict) -> str:
+    """決定ログの ``chosen`` に書く文字列を返す (純粋関数)。
+
+    棄権は値を持たないので :data:`ABSTAIN_LABEL` を返す。``str(None)`` だと
+    ``"None"`` になり、実ラベル ``"none"`` と大小文字しか違わないまま
+    ``candidates`` にも無い値が記録される (:data:`ABSTAIN_LABEL` の説明)。
+    ``bool`` 値の判定点は ``"True"`` / ``"False"`` のままで、これは
+    ``candidates`` 側も同じ綴りを持つ。
+    """
+    if verdict.value is None:
+        return ABSTAIN_LABEL
+    return str(verdict.value)
 
 
 def _same_decision(a: Verdict, b: Verdict) -> bool:

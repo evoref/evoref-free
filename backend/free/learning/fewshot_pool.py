@@ -491,7 +491,14 @@ def _response_carries_system_note(response: str) -> bool:
     return bool(_SYSTEM_DISCLOSURE_RE.search(text))
 
 
-def find_content_rejection(query: str, response: str) -> str | None:
+#: 「直前ターンを前提にした問い」の棄却理由。事例ゲートが覆せる唯一の理由
+#: なので、文字列を各所に散らさず定数で持つ (綴り違いで静かに外れる)。
+REASON_CONTEXT_BOUND = "query depends on the previous turn (anaphora / continuation)"
+
+
+def find_content_rejection(
+    query: str, response: str, *, context_bound_cleared: bool = False,
+) -> str | None:
     """few-shot 手本として不適な内容を決定論で判定する (純粋関数)。
 
     採用経路は 2 つ (``add_from_experiences`` / ``accept_from_artifact``) あり、
@@ -501,6 +508,12 @@ def find_content_rejection(query: str, response: str) -> str | None:
     ``TestArtifactPathSharesContentGates`` /
     ``TestBrokenJaSpacingGate::test_load_applies_every_content_gate``
     (:mod:`backend.free.learning.tests.test_fewshot_pool`) が経路ごとに固定する。
+
+    Args:
+        context_bound_cleared: 事例ゲートが「規則は発火したが自立した問いだ」と
+            反対したか。``True`` なら :data:`REASON_CONTEXT_BOUND` だけを飛ばす
+            (他の判定は掛かる)。本関数は同期・純粋なまま保ちたいので、埋め込みを
+            要する確認は呼出側 (Level 1 tick) で済ませて結果だけ渡す。
 
     Returns:
         棄却理由 (ログ用の英語 1 行)。採用可なら ``None``。
@@ -522,8 +535,16 @@ def find_content_rejection(query: str, response: str) -> str | None:
     # 本文に…を入れて書き直して」) は、単独の手本にすると **何を指しているか
     # 分からない問いに具体的に答える** 型を教える。2026-09-05 のプール 47 件の
     # 先頭 4 件がこの形だった。文脈依存の判定は訂正ペアと共有する。
-    if refers_to_previous_turn(query):
-        return "query depends on the previous turn (anaphora / continuation)"
+    #
+    # ``context_bound_cleared`` は事例ゲート
+    # (:class:`~backend.free.learning.context_bound_gate.ContextBoundGate`) が
+    # 「規則は発火したが自立した問いだ」と反対したことを表す。規則の想起形
+    # (``_RECALL_FORM_RE``) には裸の名詞 ``記憶`` が入っており、
+    # 「あなたが記憶を書き込むのはいつですか。」のように **その語が問いの述語
+    # ではなく話題の名詞** のときに誤発火する (2026-09-15 ライブ監査)。
+    # 覆せるのはこの 1 行だけで、残りの内容ゲートと品質床は通常どおり掛かる。
+    if not context_bound_cleared and refers_to_previous_turn(query):
+        return REASON_CONTEXT_BOUND
     # 数量を求めるのに数詞が無い問い (「駅からの徒歩時間を往復にすると
     # 何分ですか？」→「24 分です」) は被演算子が直前ターンにしか無く、単独の
     # 手本にすると「根拠の無い数値を即答する」型を教える。照応語を持たないので
@@ -1397,15 +1418,26 @@ class FewShotPool(JsonStateStore):
         except Exception as e:  # pragma: no cover - ログで採否を落とさない
             logger.debug("fewshot content gate decision log failed: %s", e)
 
-    def add_from_experiences(self, experiences: list[dict]) -> int:
+    def add_from_experiences(
+        self,
+        experiences: list[dict],
+        *,
+        context_bound_cleared: set[str] | None = None,
+    ) -> int:
         """経験バッファから高品質な例を候補プールに追加する
 
         Args:
             experiences: 経験バッファのエントリリスト（dict 形式）
+            context_bound_cleared: 事例ゲートが「規則は発火したが自立した問い
+                だ」と反対した query の集合
+                (:meth:`~backend.free.learning.context_bound_gate.
+                ContextBoundGate.clear_queries` の戻り値)。``None`` なら従来
+                どおり規則の判定をそのまま使う。
 
         Returns:
             追加された候補数
         """
+        cleared = context_bound_cleared or set()
         added = 0
         # ユーザーに訂正された側のターン。訂正ターン自身 (user_correction 付き)
         # は下で除外されるが、**訂正された応答** には何の印も無いので、そのまま
@@ -1482,7 +1514,10 @@ class FewShotPool(JsonStateStore):
             ):
                 continue
 
-            reject = find_content_rejection(query, response)
+            reject = find_content_rejection(
+                query, response,
+                context_bound_cleared=query.strip() in cleared,
+            )
             self._log_content_gate(query, reject, "experience")
             if reject is not None:
                 logger.info(

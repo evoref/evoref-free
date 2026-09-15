@@ -1325,6 +1325,8 @@ def _init_learning_scheduler(
         except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
             logger.info("Fewshot embedding warmup deferred: no running event loop")
 
+    _wire_context_bound_gate(state, learning_scheduler, debug_logger)
+
     # 7f-5. FeedbackPipe — 品質ゲート結果 → 学習サイクル 還流
     from backend.free.learning.feedback_pipe import FeedbackPipe
 
@@ -1585,6 +1587,34 @@ def _wire_retrieval_skip_gate(
         )
     except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
         logger.info("Retrieval skip gate warmup deferred: no running event loop")
+
+
+def _wire_context_bound_gate(
+    state: AppState, learning_scheduler: Any, debug_logger: Any,
+) -> None:
+    """few-shot の「文脈依存」棄却を確認する事例ゲートを構築する。
+
+    Level 1 tick (背景) からしか呼ばれないのでレイテンシ予算は無い。未 warmup
+    の間は規則の棄却がそのまま通る (従来どおり)。
+    """
+    embedder = state.embedder
+    if embedder is None:
+        logger.info("Context-bound gate skipped: no embedder")
+        return
+    from backend.free.learning.context_bound_gate import ContextBoundGate
+
+    try:
+        gate = ContextBoundGate(embedder, debug_logger=debug_logger)
+    except Exception as e:  # pragma: no cover - 縮退で吸収する
+        logger.warning("Context-bound gate construction failed: %s", e)
+        return
+    learning_scheduler.set_context_bound_gate(gate)
+    try:
+        _track_background_task(
+            state, gate.warmup(), name="context_bound_gate_warmup",
+        )
+    except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
+        logger.info("Context-bound gate warmup deferred: no running event loop")
 
 
 def _wire_layer_shadow(state: AppState, embedder: Any, debug_logger: Any) -> None:

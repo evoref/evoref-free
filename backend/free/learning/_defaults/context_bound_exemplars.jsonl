@@ -1,0 +1,65 @@
+{"_comment": "few-shot 内容ゲートの「文脈依存」棄却を確認する事例。規則 (refers_to_previous_turn) が発火した問いだけがここへ来る。label=context_bound は本当に直前ターン/記憶/自分の履歴を前提にした問い、label=none は語だけ当たって実は自立している問い。none 側は「想起語・照応語が問いの述語ではなく話題の名詞として出る」形を優先して入れてある (2026-09-15 ライブ監査: 「あなたが記憶を書き込むのはいつですか。」が照応として棄却された)。"}
+{"text": "さっきの10営業日後の日付を、もう一度だけ教えてください。", "label": "context_bound", "id": "cb_sakki_date"}
+{"text": "今の説明に、コンフリクト解消の手順を3ステップで足してください。", "label": "context_bound", "id": "cb_ima_add"}
+{"text": "この文章の要点を箇条書き5つにまとめてください。", "label": "context_bound", "id": "cb_kono_bunshou"}
+{"text": "さっきの800字の説明は、誰向けに書いたものでしたか。", "label": "context_bound", "id": "cb_sakki_800"}
+{"text": "今の説明の根拠にした設計書のファイル名は何ですか。", "label": "context_bound", "id": "cb_ima_konkyo"}
+{"text": "ここまでの計算結果を表にまとめてください。", "label": "context_bound", "id": "cb_kokomade"}
+{"text": "その好みに合う一日のスケジュール案を出してください。", "label": "context_bound", "id": "cb_sono_konomi"}
+{"text": "最後に、この会話全体を3行で要約してください。", "label": "context_bound", "id": "cb_kono_kaiwa"}
+{"text": "この会話で答えに詰まった場面はありましたか。", "label": "context_bound", "id": "cb_kono_kaiwa_tsumari"}
+{"text": "この会話全体で、私はいくつの話題を振りましたか。", "label": "context_bound", "id": "cb_kono_kaiwa_wadai"}
+{"text": "今のセッションで、あなたが実行したツールを列挙してください。", "label": "context_bound", "id": "cb_ima_session_tools"}
+{"text": "私が最初に自己紹介したとき、勤務先として何と言いましたか。", "label": "context_bound", "id": "cb_iimashita"}
+{"text": "私の息子の学年を覚えていますか。", "label": "context_bound", "id": "cb_oboete_gakunen"}
+{"text": "私の実家はどこでしたか。", "label": "context_bound", "id": "cb_deshitaka_jikka"}
+{"text": "私の誕生日はいつだったか、まだ覚えていますか。", "label": "context_bound", "id": "cb_oboete_tanjobi"}
+{"text": "さっき言っていたライブラリの名前は何でしたっけ。", "label": "context_bound", "id": "cb_deshitakke_lib"}
+{"text": "前の回答をもう少し短くしてください。", "label": "context_bound", "id": "cb_mae_no_kaito"}
+{"text": "修正版にジェネレータを渡すとどうなりますか。", "label": "context_bound", "id": "cb_shuseiban"}
+{"text": "2 案を採用します。本文に注意書きを入れて書き直してください。", "label": "context_bound", "id": "cb_an_saiyou"}
+{"text": "同じ条件でもう一度やり直してください。", "label": "context_bound", "id": "cb_onaji_joken"}
+{"text": "上の表に列をもう 1 つ足してください。", "label": "context_bound", "id": "cb_ue_no_hyou"}
+{"text": "続きを書いてください。", "label": "context_bound", "id": "cb_tsuzuki"}
+{"text": "それを英語に訳してください。", "label": "context_bound", "id": "cb_sore_eigo"}
+{"text": "あれはどのファイルに保存しましたか。", "label": "context_bound", "id": "cb_are_file"}
+{"text": "直前に実行したコマンドをもう一度見せてください。", "label": "context_bound", "id": "cb_chokuzen_cmd"}
+{"text": "今の内容を Markdown の見出し付きで整えてください。", "label": "context_bound", "id": "cb_ima_markdown"}
+{"text": "あなたが記憶を書き込むのはいつですか。", "label": "none", "id": "nb_kioku_kakikomi"}
+{"text": "記憶を消す仕組みはどうなっていますか。", "label": "none", "id": "nb_kioku_kesu"}
+{"text": "長期記憶と短期記憶の違いを説明してください。", "label": "none", "id": "nb_kioku_chigai"}
+{"text": "記憶領域の断片化はなぜ起きますか。", "label": "none", "id": "nb_kioku_danpen"}
+{"text": "人間の記憶はどのくらいの期間保持されますか。", "label": "none", "id": "nb_kioku_ningen"}
+{"text": "覚えやすいパスワードを作る一般的な指針は何ですか。", "label": "none", "id": "nb_oboeyasui_pw"}
+{"text": "英単語を覚えるのに効果的な方法を教えてください。", "label": "none", "id": "nb_oboeru_eitango"}
+{"text": "Python で辞書のキーを覚えておく必要はありますか。", "label": "none", "id": "nb_oboete_oku_dict"}
+{"text": "先ほどの手順の 3 番目だけ詳しく説明してください。", "label": "context_bound", "id": "cb_sakihodo_tejun"}
+{"text": "その件はさっき答えていただいた通りでよいですか。", "label": "context_bound", "id": "cb_sono_ken"}
+{"text": "先程の見積もりに保守費用も含まれていましたか。", "label": "context_bound", "id": "cb_sakihodo_mitsumori"}
+{"text": "もう一度、同じ形式で出力してください。", "label": "context_bound", "id": "cb_mouichido_keishiki"}
+{"text": "記憶に残る広告のつくり方を教えてください。", "label": "none", "id": "nb_kioku_kokoku"}
+{"text": "記憶装置の種類にはどんなものがありますか。", "label": "none", "id": "nb_kioku_souchi"}
+{"text": "この用語は一般にどういう意味で使われますか。", "label": "none", "id": "nb_kono_yougo"}
+{"text": "同じ名前の関数を複数定義するとどうなりますか。", "label": "none", "id": "nb_onaji_namae_fn"}
+{"text": "続けて実行するとメモリ使用量はどう変化しますか。", "label": "none", "id": "nb_tsuzukete_mem"}
+{"text": "上の階層のディレクトリを参照する書き方は何ですか。", "label": "none", "id": "nb_ue_no_kaisou"}
+{"text": "議事録は誰が何を言ったかまで残すべきですか。", "label": "none", "id": "nb_gijiroku_dare"}
+{"text": "覚えておくべき Linux の基本コマンドを挙げてください。", "label": "none", "id": "nb_oboete_oku_linux"}
+{"text": "記憶を司る脳の部位はどこですか。", "label": "none", "id": "nb_kioku_nou"}
+{"text": "記憶の定着によい睡眠時間はどれくらいですか。", "label": "none", "id": "nb_kioku_suimin"}
+{"text": "記憶媒体の寿命はどのくらいですか。", "label": "none", "id": "nb_kioku_baitai"}
+{"text": "システムが記憶を保存するタイミングは設定できますか。", "label": "none", "id": "nb_kioku_timing"}
+{"text": "記憶の圧縮はいつ実行されますか。", "label": "none", "id": "nb_kioku_asshuku"}
+{"text": "記憶と記録はどう使い分けますか。", "label": "none", "id": "nb_kioku_kiroku"}
+{"text": "単語を覚える最適な時間帯はいつですか。", "label": "none", "id": "nb_oboeru_jikantai"}
+{"text": "何を覚えておくべきかを決める基準は何ですか。", "label": "none", "id": "nb_oboete_kijun"}
+{"text": "覚えるのが速い人に共通する習慣は何ですか。", "label": "none", "id": "nb_oboeru_hayai"}
+{"text": "続けて処理するときのバッチサイズはどう決めますか。", "label": "none", "id": "nb_tsuzukete_batch"}
+{"text": "同じ値が複数回現れるかを判定する方法は何ですか。", "label": "none", "id": "nb_onaji_atai"}
+{"text": "前のバージョンに戻す一般的な手順は何ですか。", "label": "none", "id": "nb_mae_version"}
+{"text": "上のレイヤーから下のレイヤーを呼ぶ設計は妥当ですか。", "label": "none", "id": "nb_ue_layer"}
+{"text": "私が前に話したプロジェクト名は何でしたか。", "label": "context_bound", "id": "cb_mae_project"}
+{"text": "私の妻の職業を覚えていますか。", "label": "context_bound", "id": "cb_oboete_tsuma"}
+{"text": "さっき私が挙げた条件は何個ありましたか。", "label": "context_bound", "id": "cb_sakki_jouken"}
+{"text": "私が最初に指定した期限はいつでしたか。", "label": "context_bound", "id": "cb_saisho_kigen"}
+{"text": "この会話で私が使った用語を覚えていますか。", "label": "context_bound", "id": "cb_kono_kaiwa_yougo"}

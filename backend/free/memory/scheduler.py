@@ -1016,6 +1016,11 @@ class SleepTimeScheduler:
         なのに一向に走らない」が正常状態として起こり、原因の切り分けに
         ログ読解が要った (2026-08-14 ライブ監査で実際に時間を要した)。
         ダッシュボード / API がゲートの実体を出せるようにする。
+
+        ``full_running`` は :meth:`_schedule_level1_loop` の判定 (0) — Full が
+        走っている間ループは毎 tick 繰り延べる。実測で 8 分連続した状態
+        (2026-09-15 ライブ監査) だが観測面に出ておらず、API からは
+        ``waiting_for_idle`` にしか見えなかった。
         """
         remaining = (
             self.level1_idle_minutes * 60
@@ -1025,6 +1030,7 @@ class SleepTimeScheduler:
         return {
             "llm_client_wired": self._llm_client is not None,
             "loop_running": self._level1_loop_task is not None,
+            "full_running": self._full_running,
             "idle": self.is_level1_idle(),
             "user_active": self.is_user_active(),
             "idle_minutes_required": self.level1_idle_minutes,

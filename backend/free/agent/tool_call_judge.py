@@ -2059,6 +2059,11 @@ class ToolCallJudge:
         # (return するか、降格して次の層へ進むかのどちらか) ので上書きでよい。
         call.aux_guards = aux_guards
         call.hidden_tools_offered = hidden_tools_offered
+        # 降格を decision.jsonl に残す (apply_guards が使う)。既存の単一
+        # DebugLogger をそのまま渡す — ガード側で新規生成はしない。
+        # ``__init__`` を通さずに組む経路 (``ToolCallJudge.__new__`` を使う
+        # 単体テスト) があるので getattr で読む。
+        call.debug_logger = getattr(self, "_debug_logger", None)
         return apply_guards(result, call)
 
     # --- ガードへの薄い委譲 -------------------------------------------------

@@ -657,6 +657,7 @@ async def _persist_split(
                 refined[0][1],
             )
             refined.append((existing_fact, target))
+    refined.extend(_generic_shadows_of(existing, facts, refined))
     written = persist_facts(
         store, ExtractionResult(facts=facts), "personal_fact_split",
     )
@@ -670,6 +671,50 @@ async def _persist_split(
             written, note.id, ", ".join(f.subject for f in facts),
         )
     return written
+
+
+def _generic_shadows_of(
+    existing: dict[str, Any],
+    facts: list[Any],
+    refined: list[tuple[Any, Any]],
+) -> list[tuple[Any, Any]]:
+    """同じノートの **汎用スロット** (``mem.<kind>.user``) を新しい値で畳む。
+
+    汎用スロットは「属性語彙に当たらなかった発話」の置き場で、固有の属性を
+    主張しない — 実質その発話の **影** である (``attribute_key.is_generic_slot``
+    の説明)。したがって同じノートから具体スロットが立った時点で、影は畳んで
+    よい。畳まないと同じ主張が 2 つの subject に live で残り、``claim_key`` は
+    subject 込みのハッシュなので注入時の畳み込みでも落ちず、**訂正の宛先が
+    分裂する** (片方だけ supersede され、もう片方が古い値を供給し続ける)。
+
+    実データ (2026-09-15 ライブ監査): 「私の好きな言語はPythonです。仕事でも
+    よく使います。」が Step 8 の規則で ``mem.preference.user`` に、Step 8.3 の
+    分割で ``mem.preference.language`` に書かれ、両方 live だった。
+
+    :func:`_supersede_coarser_siblings` の同一スロット版と違い、**1 スロット
+    しか返らなかった分割 (``split_confirmed`` が偽) でも畳む** — 影を畳むこと
+    で失われる属性は無いので、F-10 の「狭め直しを見送る」保護は要らない。
+    逆に具体スロット同士 (``family`` と ``schedule`` が同じ文を持つ等) は
+    **絶対に畳まない**。兄弟が巻き添えで消えるのは復旧できない失敗
+    (CLAUDE.md 不変則 #13)。
+    """
+    from backend.free.memory.attribute_key import is_generic_slot
+
+    already = {id(old) for old, _ in refined}
+    out: list[tuple[Any, Any]] = []
+    for subject, old in existing.items():
+        if id(old) in already or not is_generic_slot(subject):
+            continue
+        coarse = _normalize_ws(old.object or "")
+        if not coarse:
+            continue
+        winner = next(
+            (f for f in facts if _normalize_ws(f.object or "") in coarse),
+            None,
+        )
+        if winner is not None:
+            out.append((old, winner))
+    return out
 
 
 def _supersede_coarser_siblings(

@@ -2192,6 +2192,67 @@ def model_identity_question(query: str) -> bool:
     return bool(_MODEL_IDENTITY_RE.search(query))
 
 
+#: 製品名 / 自分自身を名指しして **内部の設計・実装** を訊く問い。
+#:
+#: ``memory_architecture_question`` / ``self_learning_question`` /
+#: ``model_identity_question`` は「答えが決定論で確定する」3 点だけを覆う。
+#: それ以外の内部の問い (「Evidence Store は 3 つのうちどれで構成されるか」
+#: 「pillar の依存の向き」「AuxClient の purpose を省くと何が起きるか」) は
+#: **資料 (docs コーパス) が導入されていなければ根拠が 1 つも無い**。
+#:
+#: 実インシデント (2026-09-15 ライブ監査): 資料ゼロの新規インストールで
+#: 上記 4 問に答えさせたところ、2 問は「一般的なアーキテクチャパターンに
+#: 基づく推測です」と断り、2 問は断定形で作話した (「Raw / Processed /
+#: Metadata の 3 ストア」)。直後に「根拠にした設計書は」と訊くと
+#: 「参照していません」と認める。system プロンプトの規則
+#: (「不確かな内容は『未確認』か『推測』と明示する」) はあるが、守るかどうかが
+#: モデル任せになっている。
+_PRODUCT_SELF_RE = re.compile(
+    r"evoref|あなた|君|きみ|お前|アシスタント|この(?:システム|アプリ|ツール|製品)"
+    r"|(?:you|your)\b|this\s+(?:system|app|tool|product|assistant)",
+    re.IGNORECASE,
+)
+#: 内部の設計・実装を訊いていることの手掛かり。
+_INTERNALS_TOPIC_RE = re.compile(
+    r"設計|実装|内部|アーキテクチャ|構成|仕組み|モジュール|コンポーネント"
+    r"|クラス|パッケージ|ストア|パイプライン|依存|レイヤ|階層|pillar|柱"
+    r"|design|implementation|internal|architecture|module|component|pipeline",
+    re.IGNORECASE,
+)
+#: 内部の問いを示す固有語。製品名も自称も伴わずに出てくる
+#: (「sleep-time ワーカーが書き込みを独占しているのはなぜですか」)。
+#: **コードの識別子そのもの** に限る — 一般語を入れると普通の技術質問を
+#: 巻き込む。
+#: ``pillar`` は英語としては一般語 (「3 つの柱」) なので、**数詞を伴う綴り**
+#: (「4 つの pillar」/ ``4 pillar``) と固有名だけを拾う。日本語の「柱」は
+#: 入れない — 「SRE の 3 つの柱」まで内部の問いに見える。
+_INTERNAL_IDENTIFIER_RE = re.compile(
+    r"evidence\s*store|sleep[-\s]?time|auxclient|aux\s*client|semmem"
+    r"|evorefmem|evorefgen|evorefloop|evoreflearn|evocart|llama-?server"
+    r"|\d\s*(?:つの)?\s*pillar",
+    re.IGNORECASE,
+)
+
+
+def product_internals_question(query: str) -> bool:
+    """この製品自身の内部設計・実装を訊いているか (純粋関数)。
+
+    (a) 内部の固有識別子を名指ししている、または (b) 製品名 / 自称 **かつ**
+    設計・実装の話題語が両方揃っている場合だけ True。一般的な技術質問
+    (「HTTP と HTTPS の違い」) や、自称だけの雑談は対象外。
+
+    決定論で答えが確定する 3 点 (記憶構成 / 自己学習 / モデル識別) は
+    それぞれの専用判定が先に短絡するので、ここへは来ない。
+    """
+    if not query:
+        return False
+    if _INTERNAL_IDENTIFIER_RE.search(query):
+        return True
+    return bool(
+        _PRODUCT_SELF_RE.search(query) and _INTERNALS_TOPIC_RE.search(query),
+    )
+
+
 def tool_inventory_question(query: str) -> bool:
     """クエリが「使えるツール / 機能の一覧」を尋ねているか (純粋関数)。
 

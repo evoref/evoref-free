@@ -116,6 +116,9 @@ class GuardContext:
     #: ``WorkingMemory.session_evicted_turns == 0`` を呼出側が写す。不明なら
     #: ``None`` (単体のガードだけを掛ける経路)。
     window_complete: bool | None = None
+    #: 降格を ``decision.jsonl`` に残すための単一 ``DebugLogger``。``None`` なら
+    #: 従来どおり ``logger.debug`` だけ (テスト / 単体適用の経路)。
+    debug_logger: Any = None
 
     # 会話本文の連結は 1 判定で最大 6 箇所 (ガード 3 つ / ゲート / 式合成 2 つ)
     # が同じ結果を再計算していた。会話は判定中に変わらないので 1 度だけ作る。
@@ -1048,16 +1051,49 @@ def apply_guards(result: ToolJudgement, ctx: GuardContext) -> ToolJudgement:
     """:data:`GUARD_PIPELINE` を順に掛け、確定した判定を返す。
 
     no_tool へ降格した時点で打ち切る (以降のガードは no_tool を素通しするだけ)。
-    どのガードが降格させたかは切り分けに効くのでログへ残す。
+
+    **降格は ``decision.jsonl`` に残す。** ここは在庫で 3 番目に脆い判定点で、
+    降格 = ツール消滅 = 暗算になる。どのガードがどのツールを落としたかが残って
+    いないと、監査で「なぜツールが撃たれなかったか」を追うのに backend.log の
+    DEBUG 行を探すしかなかった (develop=debug 以上でしか出ない)。
     """
     for spec in GUARD_PIPELINE:
         if not spec.applies(ctx):
             continue
         was_needed = result.tool_needed
+        before = result.tool_name
         result = spec.fn(result, ctx)
         if was_needed and not result.tool_needed:
             logger.debug(
                 "Judge guard %s downgraded the judgement to no_tool", spec.name,
             )
+            _log_guard_downgrade(ctx, spec.name, before)
             break
     return result
+
+
+def _log_guard_downgrade(
+    ctx: GuardContext, guard: str, tool_name: str,
+) -> None:
+    """ガードによる no_tool 降格を ``decision.jsonl`` へ記録する。"""
+    dl = getattr(ctx, "debug_logger", None)
+    if dl is None:
+        return
+    try:
+        dl.log_decision(
+            decision_point="tool_guard_downgrade",
+            chosen=guard,
+            candidates=[spec.name for spec in GUARD_PIPELINE],
+            reason=f"downgraded_{tool_name or 'unknown'}",
+            context={
+                "guard": guard,
+                "tool_name": tool_name,
+                "mode": ctx.mode,
+                "aux_guards": ctx.aux_guards,
+                "measurement_blocked": ctx.measurement_blocked,
+                "action_blocked": ctx.action_blocked,
+            },
+            scope="request",
+        )
+    except Exception as e:  # pragma: no cover - ログで判定を落とさない
+        logger.debug("guard downgrade decision log failed: %s", e)
