@@ -10,7 +10,7 @@ from backend.config import resolve_context_size_for_mode
 from backend.free.agent.context_budget import SEND_GUARD_RESERVE_TOKENS
 from backend.free.core.prompt_blocks import current_datetime_block
 from backend.free.agent.output_format import (
-    is_rich_table_output,
+    is_media_capable_output,
     is_table_output,
 )
 from backend.free.agent.meta_cognitive_utils import (
@@ -31,6 +31,7 @@ from backend.free.agent.meta_cognitive_defs import (
     CONTENT_GENERATION_PROMPT,
     CSV_CONTENT_INSTRUCTION,
     MARKDOWN_CONTENT_INSTRUCTION,
+    MEDIA_CONTENT_INSTRUCTION,
     RICH_DOC_CONTENT_INSTRUCTION,
     TABLE_CONTENT_INSTRUCTION,
     _PRIOR_CONTENT_REFERENCE_RE,
@@ -132,10 +133,17 @@ class _ContentGenerationMixin:
             system_content = f"{system_content}\n{CSV_CONTENT_INSTRUCTION}"
         elif is_table_output(file_path):
             system_content = f"{system_content}\n{TABLE_CONTENT_INSTRUCTION}"
-        elif is_rich_table_output(file_path):
+        elif is_media_capable_output(file_path):
+            # docx / pptx に加えて odt / odp も対象。ODF は以前この指示が
+            # 掛かっておらず、モデルが「スライドを表す JSON」を本文として
+            # 出していた (2026-09-16 実測: .odp が 1 ページの JSON になった)。
             system_content = f"{system_content}\n{RICH_DOC_CONTENT_INSTRUCTION}"
         elif file_path.lower().endswith((".md", ".markdown")):
             system_content = f"{system_content}\n{MARKDOWN_CONTENT_INSTRUCTION}"
+        # 画像・図形の記法を知らせる。無いと「青い四角形」が箇条書きになるだけで
+        # 図形へ到達できない (f_11 §4)。
+        if is_media_capable_output(file_path):
+            system_content = f"{system_content}\n{MEDIA_CONTENT_INSTRUCTION}"
         # 出力言語指示 (locale 追従)。ここは write 全経路 (ツールループ /
         # ファストパス / auto-recovery / editor タスク) の合流点なので、
         # この 1 箇所で全ファイル出力に効く。
@@ -275,16 +283,35 @@ class _ContentGenerationMixin:
 
     @staticmethod
     def _read_existing_file(file_path: str) -> str:
-        """既存ファイルの内容を読み込む（存在しなければ空文字列）"""
+        """既存ファイルの内容を読み込む（存在しなければ空文字列）
+
+        ``.docx`` 等のリッチ文書は extraction レジストリ経由で本文へ変換する。
+        ``read_text`` は OOXML / ODF / PDF で ``UnicodeDecodeError`` になり、
+        例外を握り潰して空文字を返すと ``_inject_existing_content`` が丸ごと
+        no-op になる。結果として「末尾に 1 節追加して、他はそのまま」の依頼で
+        **既存の全内容が別物に書き換わる** (2026-09-16 実測: 1〜5 章が消えて
+        まったく違う 1〜5 章になった)。成功報告は出るのでユーザーからは
+        気付けない。設計書 docs/f_11_file_export.md §5.1。
+        """
         if not file_path:
             return ""
         p = Path(file_path)
-        if p.exists() and p.is_file():
-            try:
-                return p.read_text(encoding="utf-8")
-            except Exception:
-                pass
-        return ""
+        if not (p.exists() and p.is_file()):
+            return ""
+        from backend.free.agent.tools.filesystem import (
+            extract_document_text,
+            is_extracted_document,
+        )
+
+        if is_extracted_document(p):
+            # 抽出に失敗したリッチ文書は「読めなかった」として扱う。素の
+            # デコードへ落とすと、壊れた .docx のバイト列がたまたま UTF-8 と
+            # して通り、コンテナの中身が本文として生成プロンプトへ入る。
+            return extract_document_text(p) or ""
+        try:
+            return p.read_text(encoding="utf-8")
+        except Exception:
+            return ""
 
     @staticmethod
     def _inject_existing_content(

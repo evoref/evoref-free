@@ -33,7 +33,9 @@ _RICH_DOC_FORMATS = frozenset({".docx", ".odt", ".odp", ".md"})
 _DOCUMENT_FORMATS = _TABLE_FORMATS | _SLIDE_FORMATS | _RICH_DOC_FORMATS
 
 # 見出し以外で「本文」とみなすブロック種別。
-_BODY_BLOCK_TYPES = frozenset({"paragraph", "table", "list", "quote", "code"})
+_BODY_BLOCK_TYPES = frozenset(
+    {"paragraph", "table", "list", "quote", "code", "image", "shapes"},
+)
 
 # 空とみなすプレースホルダ行 (句読点/装飾のみ、または TODO 等の未記入語)。
 # ``ここに...`` は任意トークン吸収を避け、明示的な記入指示語のみに限定する

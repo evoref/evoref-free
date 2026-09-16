@@ -10,6 +10,9 @@ from typing import override
 
 from backend.export._writer_base import BytesWriterBase
 from backend.export.base import ContentBlock, ExportContent
+from backend.log_config import get_logger
+
+logger = get_logger("export.writers.html")
 from backend.export.markdown_patterns import (
     RE_BOLD as _RE_BOLD,
     RE_INLINE_CODE as _RE_CODE,
@@ -84,6 +87,19 @@ def _blocks_to_html(blocks: list[ContentBlock], title: str) -> str:
 
         elif block.type == "hr":
             parts.append("<hr>")
+
+        elif block.type == "image":
+            # src はそのまま <img> に載せる (HTML は外部参照が自然)。
+            alt = html.escape(block.content or "")
+            parts.append(
+                f'<img src="{html.escape(block.src)}" alt="{alt}">',
+            )
+
+        elif block.type == "shapes":
+            logger.warning(
+                "shapes blocks are not drawn in .html; %d shape(s) skipped",
+                len(block.shapes),
+            )
 
     parts.append("</body>")
     parts.append("</html>")

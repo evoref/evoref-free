@@ -13,14 +13,23 @@ from typing import Any, Protocol
 
 @dataclass
 class ContentBlock:
-    """コンテンツの構成要素"""
-    type: str       # "heading", "paragraph", "code", "table", "list", "quote", "hr"
-    content: str    # テキスト内容
+    """コンテンツの構成要素
+
+    種別の語彙は docs/f_11_file_export.md §2 が SSOT。増やすときは §2.2 の
+    表にある場所を全部直す (未知 type はどの Writer でも例外にならず黙って
+    落ちるため、抜けをテストが検知できない)。
+    """
+    # "heading", "paragraph", "code", "table", "list", "quote", "hr",
+    # "image", "shapes"
+    type: str
+    content: str    # テキスト内容 (image では alt テキスト)
     level: int = 0  # heading レベル (1-6)
     language: str = ""  # code block の言語
     rows: list[list[str]] = field(default_factory=list)  # table の行データ
     ordered: bool = False  # list の順序付き/なし
     items: list[str] = field(default_factory=list)  # list の項目
+    src: str = ""  # image の所在 (絶対パス、または出力先からの相対パス)
+    shapes: list[dict[str, Any]] = field(default_factory=list)  # shapes の図形定義
 
 
 @dataclass
@@ -32,6 +41,25 @@ class ExportContent:
     # metadata 例: {"author": "evoref", "date": "2026-03-23", "language": "ja"}
     raw_markdown: str = ""  # 元の Markdown テキスト（フォールバック用）
     raw_data: Any = None    # 構造化データ（csv/xlsx/json 用: list[dict] 等）
+
+
+def coerce_cell_value(value: object) -> object:
+    """表セルの文字列を数値へ型推定する (xlsx / ods 共通)。
+
+    "1200" を文字列のままセルへ入れると表計算側で集計できない。数値に
+    見えないものはそのまま返す。
+    """
+    if not isinstance(value, str):
+        return value
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        pass
+    return value
 
 
 @dataclass

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import override
 
@@ -73,6 +74,17 @@ def _blocks_to_plaintext(blocks: list[ContentBlock]) -> str:
 
         elif block.type == "hr":
             parts.append("---")
+            parts.append("")
+
+        elif block.type == "image":
+            # .md 出力も兼ねるので Markdown 記法のまま残す。
+            parts.append(f"![{block.content}]({block.src})")
+            parts.append("")
+
+        elif block.type == "shapes":
+            parts.append("```shapes")
+            parts.append(json.dumps(block.shapes, ensure_ascii=False))
+            parts.append("```")
             parts.append("")
 
     return "\n".join(parts).rstrip() + "\n"

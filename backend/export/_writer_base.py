@@ -62,7 +62,14 @@ class BytesWriterBase(ABC):
 
     def write(self, content: ExportContent, path: Path) -> WriteResult:
         """ファイルに書き出す共通実装"""
+        from backend.export.media import BASE_DIR_METADATA_KEY
+
         ext = path.suffix.lower()
+        # 相対画像パスの基準は **出力先のディレクトリ** (プロセスの CWD ではない)。
+        # f_11 §4.1。write_to_bytes には出力先が無いので設定されない。
+        if content.metadata is None:
+            content.metadata = {}
+        content.metadata[BASE_DIR_METADATA_KEY] = str(path.parent)
         data = self._render_bytes(content, ext)
 
         try:

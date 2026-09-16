@@ -21,6 +21,16 @@ _RE_TABLE_SEP = re.compile(r"^\|[\s\-:|]+\|$")
 _RE_UL = re.compile(r"^(\s*)[-*+]\s+(.+)$")
 _RE_OL = re.compile(r"^(\s*)\d+[.)]\s+(.+)$")
 _RE_QUOTE = re.compile(r"^>\s?(.*)")
+#: 行全体が 1 個の画像記法だけのとき (f_11 §2.1)。段落の途中に混ざった
+#: インライン画像はブロック化せず paragraph の文字列として残す。
+_RE_IMAGE_ONLY = re.compile(r"^!\[([^\]]*)\]\(\s*<?([^)>]+?)>?\s*\)$")
+
+
+def _recover_shapes(text: str) -> list[dict] | None:
+    """言語指定を落とした図形 DSL を拾い直す。図形でなければ ``None``。"""
+    from backend.export.shapes import looks_like_shapes_payload
+
+    return looks_like_shapes_payload(text)
 
 
 class ContentConverter:
@@ -41,9 +51,22 @@ class ContentConverter:
             code_lines.append(lines[i])
             i += 1
         i += 1  # 閉じ ``` をスキップ
+        source = "\n".join(code_lines)
+        if lang.strip().lower() == "shapes":
+            # 図形 DSL (f_11 §4.2)。Markdown に図形の記法が無いため、
+            # 言語識別子 shapes のフェンスを図形ブロックとして扱う。
+            from backend.export.shapes import parse_shapes_source
+
+            return ContentBlock(
+                type="shapes", content="", shapes=parse_shapes_source(source),
+            ), i
+        # 言語指定を落として JSON だけ吐いた場合の拾い直し (f_11 §4.2)。
+        recovered = _recover_shapes(source)
+        if recovered is not None:
+            return ContentBlock(type="shapes", content="", shapes=recovered), i
         return ContentBlock(
             type="code",
-            content="\n".join(code_lines),
+            content=source,
             language=lang,
         ), i
 
@@ -147,6 +170,18 @@ class ContentConverter:
         ), i
 
     @staticmethod
+    def _parse_image(
+        lines: list[str], i: int,
+    ) -> tuple[ContentBlock | None, int]:
+        """行単独の ``![alt](src)`` をパース。マッチしなければ ``(None, i)``。"""
+        m = _RE_IMAGE_ONLY.match(lines[i].strip())
+        if not m:
+            return None, i
+        return ContentBlock(
+            type="image", content=m.group(1).strip(), src=m.group(2).strip(),
+        ), i + 1
+
+    @staticmethod
     def _is_block_start(line: str) -> bool:
         """段落終了判定: 次の構造要素の開始行か？"""
         return bool(
@@ -157,6 +192,7 @@ class ContentConverter:
             or _RE_QUOTE.match(line)
             or _RE_UL.match(line)
             or _RE_OL.match(line)
+            or _RE_IMAGE_ONLY.match(line.strip())
         )
 
     @classmethod
@@ -172,9 +208,12 @@ class ContentConverter:
             i += 1
         if not para_lines:
             return None, i
-        return ContentBlock(
-            type="paragraph", content="\n".join(para_lines),
-        ), i
+        text = "\n".join(para_lines)
+        # フェンスごと落ちた図形 DSL を拾い直す (f_11 §4.2)。
+        recovered = _recover_shapes(text)
+        if recovered is not None:
+            return ContentBlock(type="shapes", content="", shapes=recovered), i
+        return ContentBlock(type="paragraph", content=text), i
 
     def convert(self, markdown: str) -> list[ContentBlock]:
         """Markdown → ContentBlock リスト"""
@@ -186,6 +225,7 @@ class ContentConverter:
             self._parse_hr,
             self._parse_table,
             self._parse_quote,
+            self._parse_image,
             self._parse_unordered_list,
             self._parse_ordered_list,
         )

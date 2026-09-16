@@ -190,6 +190,8 @@ class AppState:
     #: 層振り分けの shadow 評価。**挙動は変えず** 不一致だけを記録する
     #: (router は EVOLVABLE_DOMAINS から意図的に凍結されているため)。
     layer_shadow: Any = None
+    #: 書込み意図の事例ゲート (c_17 / write_intent_gate)。
+    write_intent_gate: Any = None
     # Reactive 層 (挨拶/日時/キャッシュ即応) の常駐インスタンス。リクエスト毎に
     # 生成すると LRU キャッシュが温まらないため AppState に保持する。
     reactive_agent: "ReactiveAgent | None" = None

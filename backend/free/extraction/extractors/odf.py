@@ -1,7 +1,7 @@
 """ODF Extractor
 
 .odt, .ods, .odp (OpenDocument) ファイルからテキストを抽出する。
-odfpy を使用。
+odfdo を使用 (2026-09-16 に odfpy から移行、docs/f_11_file_export.md §7)。
 """
 
 from __future__ import annotations
@@ -26,12 +26,11 @@ class OdfExtractor(BinarySourceExtractorBase):
 
     @property
     def requires(self) -> list[str]:
-        return ["odfpy"]
+        return ["odfdo"]
 
     def is_available(self) -> bool:
         try:
-            from odf.opendocument import load  # noqa: F401
-            from odf import teletype  # noqa: F401
+            from odfdo import Document  # noqa: F401
             return True
         except ImportError:
             return False
@@ -41,54 +40,61 @@ class OdfExtractor(BinarySourceExtractorBase):
         source: Path | BinaryIO,
         source_name: str,
     ) -> tuple[str, dict[str, Any]]:
-        odf_load, odf_teletype = self._import_odfpy()
+        document_cls = self._import_odfdo()
         ext = Path(source_name).suffix.lower()
-        # odfpy の load() は str / file-like を受け付ける
+        # odfdo の Document() は str / Path / BytesIO を受け付ける
         arg = str(source) if isinstance(source, Path) else source
-        doc = odf_load(arg)
-        text = self._extract_text(doc, odf_teletype, ext)
+        doc = document_cls(arg)
+        text = self._extract_text(doc, ext)
         return text, {"format": ext}
 
     @staticmethod
-    def _import_odfpy():
+    def _import_odfdo():
         try:
-            from odf.opendocument import load
-            from odf import teletype
-            return load, teletype
+            from odfdo import Document
+            return Document
         except ImportError:
             raise ExtractionError(
                 "missing_library",
-                "odfpy is required for ODF extraction: pip install odfpy",
+                "odfdo is required for ODF extraction: pip install odfdo",
             )
 
     @staticmethod
-    def _extract_text(doc, teletype_mod, ext: str) -> str:
-        """ODF ドキュメントからテキストを抽出"""
-        from odf import text as odf_text
-        from odf import table as odf_table
+    def _cell_text(cell) -> str:
+        """セルの表示文字列。
 
+        ``Cell.value`` は ``office:value-type`` を持たないセルで ``None`` になる。
+        odfpy が書いた既存ファイルがまさにこれなので、``text_recursive`` へ落ちる
+        二段構えにする (f_11 §7.1)。
+        """
+        value = cell.value
+        if value is None:
+            return (cell.text_recursive or "").strip()
+        return str(value).strip()
+
+    @classmethod
+    def _extract_text(cls, doc, ext: str) -> str:
+        """ODF ドキュメントからテキストを抽出"""
+        body = doc.body
         parts: list[str] = []
 
-        if ext in (".odt", ".odp"):
-            # テキスト段落を抽出
-            for para in doc.getElementsByType(odf_text.P):
-                t = teletype_mod.extractText(para)
-                if t and t.strip():
-                    parts.append(t)
-
         if ext == ".ods":
-            # スプレッドシート: テーブル → 行 → セル
-            for table_elem in doc.getElementsByType(odf_table.Table):
-                table_name = table_elem.getAttribute("name") or "Sheet"
+            for table in body.get_tables():
+                table_name = table.name or "Sheet"
                 rows: list[str] = []
-                for row_elem in table_elem.getElementsByType(odf_table.TableRow):
-                    cells: list[str] = []
-                    for cell_elem in row_elem.getElementsByType(odf_table.TableCell):
-                        cell_text = teletype_mod.extractText(cell_elem)
-                        cells.append(cell_text if cell_text else "")
-                    if any(c.strip() for c in cells):
+                for row in table.get_rows():
+                    cells = [cls._cell_text(c) for c in row.get_cells()]
+                    if any(c for c in cells):
                         rows.append("\t".join(cells))
                 if rows:
                     parts.append(f"[Sheet: {table_name}]\n" + "\n".join(rows))
+            return "\n\n".join(parts)
 
+        # .odt / .odp: 見出しと段落を出現順に拾う。get_headers() /
+        # get_paragraphs() は種別ごとの取得なので、順序を保つために
+        # 要素の文書順で走査する。
+        for element in body.get_elements("//text:h | //text:p"):
+            text = (element.text_recursive or "").strip()
+            if text:
+                parts.append(text)
         return "\n\n".join(parts)

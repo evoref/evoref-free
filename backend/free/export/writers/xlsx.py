@@ -9,7 +9,7 @@ from __future__ import annotations
 import io
 
 from backend.export._writer_base import BytesWriterBase
-from backend.export.base import ExportContent, ExportError
+from backend.export.base import ExportContent, ExportError, coerce_cell_value
 
 
 def _extract_tables(content: ExportContent) -> list[tuple[str, list[list[str]]]]:
@@ -38,6 +38,10 @@ def _extract_tables(content: ExportContent) -> list[tuple[str, list[list[str]]]]
             sheet_idx += 1
 
     return tables
+
+
+#: セルの型推定は ODS writer と共有する (backend.export.base が SSOT)。
+_coerce_value = coerce_cell_value
 
 
 def _build_xlsx(content: ExportContent) -> bytes:
@@ -85,22 +89,6 @@ def _build_xlsx(content: ExportContent) -> bytes:
     wb.save(buf)
     return buf.getvalue()
 
-
-def _coerce_value(value: object) -> object:
-    """文字列を数値・日付に型推定"""
-    if not isinstance(value, str):
-        return value
-    # 整数
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        pass
-    # 浮動小数点数
-    try:
-        return float(value)
-    except (ValueError, TypeError):
-        pass
-    return value
 
 
 class XlsxWriter(BytesWriterBase):

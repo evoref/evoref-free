@@ -7,37 +7,49 @@ python-docx を使用。
 from __future__ import annotations
 
 import io
-import re
 
 from backend.export._writer_base import BytesWriterBase
 from backend.export.base import ExportContent
+from backend.export.media import (
+    export_base_dir,
+    resolve_image_path,
+    scaled_width_cm,
+)
+from backend.export.markdown_patterns import (
+    INLINE_BOLD_GROUPS,
+    INLINE_CODE_GROUP,
+    INLINE_ITALIC_GROUPS,
+    RE_INLINE,
+)
+from backend.log_config import get_logger
+
+logger = get_logger("export.writers.docx")
 
 
 def _add_inline_runs(paragraph, text: str) -> None:
-    """inline Markdown を解析して Word の Run に変換"""
-    # 簡易パース: bold, italic, code を検出
-    pattern = re.compile(
-        r"(\*\*(.+?)\*\*|__(.+?)__)"    # bold
-        r"|(\*(.+?)\*|_(.+?)_)"          # italic
-        r"|(`(.+?)`)"                     # code
-    )
+    """inline Markdown を解析して Word の Run に変換
+
+    パターンは ``backend.export.markdown_patterns`` が SSOT。以前はここに私有の
+    結合正規表現を持っており、``markdown_patterns`` 側と**同じ欠陥を二重に**
+    抱えていた (語中のアンダースコアを斜体と誤認して区切り文字を落とす)。
+    """
     last_end = 0
-    for m in pattern.finditer(text):
+    for m in RE_INLINE.finditer(text):
         # マッチ前の通常テキスト
         if m.start() > last_end:
             paragraph.add_run(text[last_end:m.start()])
 
-        if m.group(2) or m.group(3):
-            # bold
-            run = paragraph.add_run(m.group(2) or m.group(3))
+        bold = m.group(INLINE_BOLD_GROUPS[0]) or m.group(INLINE_BOLD_GROUPS[1])
+        italic = m.group(INLINE_ITALIC_GROUPS[0]) or m.group(INLINE_ITALIC_GROUPS[1])
+        code = m.group(INLINE_CODE_GROUP)
+        if bold is not None:
+            run = paragraph.add_run(bold)
             run.bold = True
-        elif m.group(5) or m.group(6):
-            # italic
-            run = paragraph.add_run(m.group(5) or m.group(6))
+        elif italic is not None:
+            run = paragraph.add_run(italic)
             run.italic = True
-        elif m.group(8):
-            # code
-            run = paragraph.add_run(m.group(8))
+        elif code is not None:
+            run = paragraph.add_run(code)
             run.font.name = "Consolas"
         last_end = m.end()
 
@@ -49,7 +61,7 @@ def _add_inline_runs(paragraph, text: str) -> None:
 def _build_docx(content: ExportContent) -> bytes:
     """ExportContent を DOCX バイトデータに変換"""
     from docx import Document
-    from docx.shared import Pt, RGBColor
+    from docx.shared import Cm, Pt, RGBColor
 
     doc = Document()
 
@@ -59,6 +71,7 @@ def _build_docx(content: ExportContent) -> bytes:
     font.name = "Arial"
     font.size = Pt(11)
 
+    base_dir = export_base_dir(content)
     blocks = content.blocks
     if not blocks and content.raw_markdown:
         from backend.export.content_converter import ContentConverter
@@ -111,6 +124,18 @@ def _build_docx(content: ExportContent) -> bytes:
 
         elif block.type == "hr":
             doc.add_paragraph("_" * 50)
+
+        elif block.type == "image":
+            path = resolve_image_path(block.src, base_dir)
+            if path is not None:
+                doc.add_picture(str(path), width=Cm(scaled_width_cm(path)))
+
+        elif block.type == "shapes":
+            # .docx に図形は描かない (f_11 §3.1)。黙って落とさず記録する。
+            logger.warning(
+                "shapes blocks are not drawn in .docx; %d shape(s) skipped",
+                len(block.shapes),
+            )
 
     buf = io.BytesIO()
     doc.save(buf)

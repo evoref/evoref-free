@@ -1,7 +1,7 @@
 """PPTX Writer
 
 .pptx: ContentBlock → PowerPoint スライド
-python-pptx を使用。
+python-pptx を使用。設計書: [docs/f_11_file_export.md](../../../../docs/f_11_file_export.md)
 """
 
 from __future__ import annotations
@@ -10,95 +10,163 @@ import io
 
 from backend.export._writer_base import BytesWriterBase
 from backend.export.base import ContentBlock, ExportContent
+from backend.export.media import (
+    export_base_dir,
+    resolve_image_path,
+    scaled_width_cm,
+)
+from backend.export.shapes import normalize_shapes, rgb_tuple
+from backend.export.slide_splitter import Slide, split_into_slides
+
+
+class _BodyText:
+    """本文プレースホルダへ段落を積む。最初の 1 段落は既存の空段落を使う。"""
+
+    def __init__(self, text_frame) -> None:
+        self._tf = text_frame
+        self._tf.clear()
+        self._used_first = False
+
+    def add(self, text: str, level: int = 0):
+        if self._used_first:
+            para = self._tf.add_paragraph()
+        else:
+            para = self._tf.paragraphs[0]
+            self._used_first = True
+        para.text = text
+        para.level = level
+        return para
+
+
+def _add_block_to_body(body: _BodyText, block: ContentBlock) -> None:
+    """テキストで表せるブロックを本文へ積む (table / image / shapes は対象外)。"""
+    from pptx.util import Pt
+
+    if block.type == "paragraph":
+        body.add(block.content)
+
+    elif block.type == "heading":
+        # level<=2 はスライド分割で消費済み。ここへ来るのは level>=3 の
+        # 小見出し。以前はどの分岐にも当たらず黙って消えていた。
+        para = body.add(block.content)
+        for run in para.runs:
+            run.font.bold = True
+
+    elif block.type == "list":
+        for item in block.items:
+            body.add(item, level=1)
+
+    elif block.type == "code":
+        para = body.add(block.content)
+        for run in para.runs:
+            run.font.name = "Consolas"
+            run.font.size = Pt(10)
+
+    elif block.type == "quote":
+        para = body.add(f'"{block.content}"')
+        para.font.italic = True
+
+    elif block.type == "hr":
+        # 区切り線。以前は落ちていた。
+        body.add("─" * 24)
+
+
+def _add_image(slide, block: ContentBlock, base_dir) -> None:
+    """``image`` ブロックをスライドへ貼る (f_11 §4.1)。"""
+    from pptx.util import Cm
+
+    path = resolve_image_path(block.src, base_dir)
+    if path is None:
+        return
+    slide.shapes.add_picture(
+        str(path), Cm(2.0), Cm(9.0), width=Cm(scaled_width_cm(path)),
+    )
+
+
+def _add_shapes(slide, block: ContentBlock) -> None:
+    """``shapes`` ブロックをスライドへ描く (f_11 §4.2)。"""
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE
+    from pptx.util import Cm, Pt
+
+    auto_shapes = {"rect": MSO_SHAPE.RECTANGLE, "oval": MSO_SHAPE.OVAL}
+
+    for shape in normalize_shapes(block.shapes):
+        if shape.kind == "line":
+            connector = slide.shapes.add_connector(
+                MSO_CONNECTOR.STRAIGHT,
+                Cm(shape.x), Cm(shape.y), Cm(shape.x2), Cm(shape.y2),
+            )
+            connector.line.color.rgb = RGBColor(*rgb_tuple(shape.line))
+            connector.line.width = Pt(shape.width_pt)
+            continue
+
+        drawn = slide.shapes.add_shape(
+            auto_shapes[shape.kind],
+            Cm(shape.x), Cm(shape.y), Cm(shape.w), Cm(shape.h),
+        )
+        if shape.fill is None:
+            drawn.fill.background()
+        else:
+            drawn.fill.solid()
+            drawn.fill.fore_color.rgb = RGBColor(*rgb_tuple(shape.fill))
+        drawn.line.color.rgb = RGBColor(*rgb_tuple(shape.line))
+        drawn.line.width = Pt(shape.width_pt)
+        if shape.text:
+            drawn.text_frame.text = shape.text
+
+
+def _render_slide(prs, layout, slide_data: Slide, base_dir=None) -> None:
+    """1 枚のスライドを描く。"""
+    from pptx.util import Inches
+
+    slide = prs.slides.add_slide(layout)
+    if slide.shapes.title is not None:
+        slide.shapes.title.text = slide_data.title
+
+    placeholder = slide.placeholders[1] if len(slide.placeholders) > 1 else None
+    body = _BodyText(placeholder.text_frame) if placeholder is not None else None
+
+    table_top = Inches(3.5)
+    for block in slide_data.blocks:
+        if block.type == "table":
+            if not block.rows:
+                continue
+            rows_count = len(block.rows)
+            cols_count = len(block.rows[0])
+            table = slide.shapes.add_table(
+                rows_count, cols_count,
+                Inches(0.5), table_top, Inches(9.0), Inches(0.3 * rows_count),
+            ).table
+            for r_idx, row_data in enumerate(block.rows):
+                for c_idx, cell_text in enumerate(row_data):
+                    table.cell(r_idx, c_idx).text = cell_text
+        elif block.type == "image":
+            _add_image(slide, block, base_dir)
+        elif block.type == "shapes":
+            _add_shapes(slide, block)
+        elif body is not None:
+            _add_block_to_body(body, block)
 
 
 def _build_pptx(content: ExportContent) -> bytes:
     """ExportContent を PPTX バイトデータに変換"""
     from pptx import Presentation
-    from pptx.util import Inches, Pt
 
     prs = Presentation()
-    slide_layout_title = prs.slide_layouts[0]   # タイトルスライド
-    slide_layout_content = prs.slide_layouts[1]  # タイトル + コンテンツ
+    layout_title = prs.slide_layouts[0]    # タイトルスライド
+    layout_content = prs.slide_layouts[1]  # タイトル + コンテンツ
 
-    blocks = content.blocks
-    if not blocks and content.raw_markdown:
-        from backend.export.content_converter import ContentConverter
-        blocks = ContentConverter().convert(content.raw_markdown)
+    deck = split_into_slides(content)
+    base_dir = export_base_dir(content)
 
-    # ブロックをスライド単位にグループ化
-    # heading (level 1-2) でスライド分割
-    slides_data: list[tuple[str, list[ContentBlock]]] = []
-    current_title = content.title or ""
-    current_blocks: list[ContentBlock] = []
+    if deck.cover_title:
+        cover = prs.slides.add_slide(layout_title)
+        if cover.shapes.title is not None:
+            cover.shapes.title.text = deck.cover_title
 
-    for block in blocks:
-        if block.type == "heading" and block.level <= 2:
-            if current_title or current_blocks:
-                slides_data.append((current_title, current_blocks))
-            current_title = block.content
-            current_blocks = []
-        else:
-            current_blocks.append(block)
-
-    if current_title or current_blocks:
-        slides_data.append((current_title, current_blocks))
-
-    # スライドが空の場合はタイトルスライドだけ作成
-    if not slides_data:
-        slide = prs.slides.add_slide(slide_layout_title)
-        slide.shapes.title.text = content.title or "Untitled"
-    else:
-        for title, slide_blocks in slides_data:
-            slide = prs.slides.add_slide(slide_layout_content)
-            slide.shapes.title.text = title
-
-            # コンテンツプレースホルダーにテキストを追加
-            body = slide.placeholders[1] if len(slide.placeholders) > 1 else None
-            if body is None:
-                continue
-
-            tf = body.text_frame
-            tf.clear()
-
-            for i, block in enumerate(slide_blocks):
-                if block.type == "paragraph":
-                    para = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                    para.text = block.content
-
-                elif block.type == "list":
-                    for item in block.items:
-                        para = tf.paragraphs[0] if (i == 0 and not tf.paragraphs[0].text) else tf.add_paragraph()
-                        para.text = item
-                        para.level = 1
-
-                elif block.type == "code":
-                    para = tf.paragraphs[0] if (i == 0 and not tf.paragraphs[0].text) else tf.add_paragraph()
-                    para.text = block.content
-                    for run in para.runs:
-                        run.font.name = "Consolas"
-                        run.font.size = Pt(10)
-
-                elif block.type == "table":
-                    # テーブルはプレースホルダー外に配置
-                    if block.rows:
-                        rows_count = len(block.rows)
-                        cols_count = len(block.rows[0])
-                        left = Inches(0.5)
-                        top = Inches(3.5)
-                        width = Inches(9.0)
-                        height = Inches(0.3 * rows_count)
-                        table = slide.shapes.add_table(
-                            rows_count, cols_count, left, top, width, height,
-                        ).table
-                        for r_idx, row_data in enumerate(block.rows):
-                            for c_idx, cell_text in enumerate(row_data):
-                                table.cell(r_idx, c_idx).text = cell_text
-
-                elif block.type == "quote":
-                    para = tf.paragraphs[0] if (i == 0 and not tf.paragraphs[0].text) else tf.add_paragraph()
-                    para.text = f'"{block.content}"'
-                    para.font.italic = True
+    for slide_data in deck.slides:
+        _render_slide(prs, layout_content, slide_data, base_dir)
 
     buf = io.BytesIO()
     prs.save(buf)
