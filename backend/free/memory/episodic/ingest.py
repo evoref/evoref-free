@@ -31,6 +31,7 @@ from backend.free.memory.notes.note_builder import (
     restates_attribute_value,
 )
 from backend.free.memory.notes.pin_detector import detect_pin, get_pin_triggers_for
+from backend.free.memory.notes.social_formula_gate import is_note_worthy
 from backend.free.memory.volatile_values import is_volatile_measurement_report
 from backend.free.rag.evidence import new_evidence_id
 from backend.log_config import get_logger
@@ -66,9 +67,17 @@ def build_note_from_turn(
     - ツール出力を **言い直しただけ** のアシスタント発話 — 1 ホップで上の
       除外を迂回し、揮発する計測値が焼き付く
     - 本文が空
+    - **社交の定型だけ** の発話 — 想起しても何も答えられないのに注入枠を
+      食う (:mod:`backend.free.memory.notes.social_formula_gate`)
     """
     content = str(turn.get("content") or "")
     if not content.strip():
+        return None
+    if not is_note_worthy(content):
+        logger.debug(
+            "Episodic ingest: skipped a contentless social formula (session=%s)",
+            session_id,
+        )
         return None
     meta = turn.get("meta") if isinstance(turn.get("meta"), dict) else {}
     role = str(turn.get("role") or "user")

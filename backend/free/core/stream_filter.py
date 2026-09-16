@@ -466,6 +466,20 @@ class QueryEchoFilter:
     本文の冒頭に限って落とす。途中に現れる引用 (「『〜』というご質問ですね」)
     は正当なので触らない。``query`` が空か短すぎる場合は素通しする。
 
+    **復唱が本文の全部だったとき** の扱いは、ユーザーの発話が答えを求めて
+    いたかで分かれる。問い・依頼なら「復唱しか作れなかった」= 崩れなので
+    従来どおり空にして呼出側のリトライへ渡す。問いでも依頼でもない発話
+    (挨拶・相槌・労い) では、同じ言い回しを返すのが **唯一の正しい応答**
+    なので落とさずに出す — このフィルタの前提「復唱のあとに答えが続く」が
+    そもそも成り立たない側だから。実インシデント (2026-09-16 ライブ監査
+    T01/4): 「お疲れさまです。」に同じ挨拶を返したのを本流と再試行の両方で
+    落とし切り、画面は空のまま ``No content generated after retry`` という
+    **実際には起きていない reasoning loop** を報告した。
+
+    問い / 依頼の判定は :func:`~backend.free.core.intent_vocab.is_plain_statement`
+    を共有する (層 0.6b のツール判定・few-shot の採否と同じ棒)。ここに専用の
+    語形表を作らない。
+
     StreamFilter プロトコルに準拠: process() / flush()
     """
 
@@ -480,11 +494,22 @@ class QueryEchoFilter:
     _MAX_LEAD_CHARS = 16
 
     def __init__(self, query: str | None = None) -> None:
+        from backend.free.core.intent_vocab import is_plain_statement
+
         self._query = (query or "").strip()
         self._active = len(self._query) >= self._MIN_QUERY_CHARS
         self._buffer = ""
         self._flushed = not self._active
         self._lead_resolved = not self._active
+        #: 復唱が本文の全部だったときに、それを落とさず出してよいターンか。
+        #: 問いでも依頼でもない発話 = 鏡写しの返答が正答になりうる側。
+        self._mirror_is_an_answer = is_plain_statement(self._query)
+        #: 一度でもユーザーへ出したか (flush の救済は「一文字も出ていない」
+        #: ときだけ掛ける — 途中まで出ている応答へ冒頭の復唱を足し戻さない)。
+        self._emitted_any = False
+        #: 通過した生テキスト全部。復唱は ``process`` の途中でバッファごと
+        #: 捨てられるので、救済するには別に持っておく必要がある。
+        self._all_text = ""
 
     def _strip_leading_echoes(self, text: str) -> str:
         out = text.lstrip()
@@ -522,6 +547,7 @@ class QueryEchoFilter:
         if not text or self._flushed:
             return text
         self._buffer += text
+        self._all_text += text
         if not self._lead_resolved and not self._resolve_lead():
             return ""
         stripped = self._strip_leading_echoes(self._buffer)
@@ -538,6 +564,7 @@ class QueryEchoFilter:
             return ""
         self._flushed = True
         self._buffer = ""
+        self._emitted_any = True
         return stripped
 
     def flush(self) -> str:
@@ -548,7 +575,24 @@ class QueryEchoFilter:
             self._resolve_lead()
         head = self._buffer.lstrip()
         self._buffer = ""
-        return self._strip_leading_echoes(head)
+        stripped = self._strip_leading_echoes(head)
+        if stripped != head:
+            # process() は前置きが確定するまで復唱を数えられない (短い応答は
+            # ``_resolve_lead`` が False のまま flush へ来る)。救済して本文を
+            # 出す場合も検証器のヒットは残す — 学習側の成否シグナルから
+            # 「復唱だった」事実を消さないため。
+            record_verifier_hit("query_echo")
+        if stripped:
+            self._emitted_any = True
+            return stripped
+        if not self._emitted_any and self._mirror_is_an_answer:
+            # 復唱が本文の全部、かつユーザーの発話は答えを求めていない。
+            # 落とすと画面が空になり、呼出側が「生成できなかった」と報告する。
+            original = self._all_text.strip()
+            if original:
+                self._emitted_any = True
+                return original
+        return stripped
 
 
 class HeadBufferFilter:

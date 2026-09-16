@@ -78,8 +78,22 @@ def map_level1_results(raw_l1: dict | None) -> dict[str, Level1ResultEntry]:
     """
     if not raw_l1:
         return {}
+    # 選択圧が無くて始めなかった回の記録は
+    # ``{"skipped": True, "reason": ..., "modes": {<mode>: {...}}}`` の形で、
+    # モード別の理由が 1 段深いところに入る。平らに展開しないと ``modes`` が
+    # **モード名のように** 見え、しかも中身が全部 null の行になる — 実測
+    # (2026-09-16 ライブ監査 F-15): ログには
+    # ``chat=unreachable_net_wins`` と出ているのに、API は
+    # ``{"modes": {"reason": null, ...}}`` しか返さず、なぜ何も起きなかったかが
+    # 消えていた。``skipped`` / ``reason`` はスカラなので下のループが無視する。
+    flat: dict = dict(raw_l1)
+    nested_modes = flat.pop("modes", None)
+    if isinstance(nested_modes, dict):
+        for mode, entry in nested_modes.items():
+            if isinstance(entry, dict):
+                flat.setdefault(mode, entry)
     result: dict[str, Level1ResultEntry] = {}
-    for key, val in raw_l1.items():
+    for key, val in flat.items():
         if key.startswith("_"):
             # ``_executed_phases`` / ``_noop_phases`` / ``_skipped_phases`` はメタ
             continue
