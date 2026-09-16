@@ -7,11 +7,17 @@ SSE フレームビルダー / セッション別キャンセルフラグ / 計�
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, AsyncIterator
+from fastapi import HTTPException
+
 from backend.app_state import AppState
+from backend.trace_context import get_trace_id
 from backend.aux_telemetry import aux_failure_signals, current_aux_failures
 from backend.exceptions import EvorefError
 from backend.free.agent.issue_ledger import record_current_issue
@@ -21,13 +27,15 @@ from backend.free.core.verifier_events import (
     current_tool_uses,
     current_turn_outcome,
 )
-from backend.free.api.chat.chat_constants import MAX_STEP_QUEUE_SIZE
+from backend.free.api.chat.chat_constants import (
+    DEFAULT_KEEPALIVE_INTERVAL_SEC,
+    MAX_STEP_QUEUE_SIZE,
+)
 from backend.free.api.chat.chat_recorder import (
     read_llama_prompt_tokens,
     record_response,
     tool_routing_signals,
 )
-from backend.free.api.chat.chat_service import make_token_info
 from backend.free.api.chat.chat_types import ChatMessage, StepCallback
 from backend.free.api.schemas import ChatResponse, TokenInfo
 from backend.free.core.sse import SSEFrameBuilder
@@ -42,6 +50,9 @@ logger = get_logger("api.chat.streaming")
 
 # SSE フレームビルダー（モジュールレベルの共有インスタンス）
 sse = SSEFrameBuilder()
+
+#: トークン待ちの間にキャンセル要求を見に行く間隔 (秒)。keepalive 間隔とは別。
+_CANCEL_POLL_SEC = 1.0
 
 
 def meta_tool_routing_success(resp) -> bool:
@@ -228,6 +239,106 @@ async def _close_token_stream(token_stream: Any) -> None:
         logger.debug("token stream aclose failed", exc_info=True)
 
 
+async def iter_tokens_with_keepalive(
+    token_stream: Any,
+    session_id: str,
+    *,
+    interval: float = DEFAULT_KEEPALIVE_INTERVAL_SEC,
+) -> AsyncIterator[str | None]:
+    """トークン列を ``interval`` 秒の無音ごとに ``None`` を挟んで yield する。
+
+    ``None`` は「keepalive を送る番」の合図で、呼出側が ``sse.keepalive()`` を
+    出す (トークンの有無に関わらずフロントの chunk timeout を防ぐ)。
+    セッションのキャンセルフラグが立てば止まる。
+
+    deliberative / long_form が同じ ``asyncio.wait`` ループを写経していたのを
+    1 本にする。ループを抜けるときは **必ず** 基底ストリームを閉じる — 従来は
+    キャンセルフラグの経路でしか閉じておらず、クライアント切断
+    (``yield`` に CancelledError が届く) では ``__anext__`` を待つタスクが
+    孤児になり、httpx のストリームは GC まで開いたまま llama-server 側の
+    生成が続いていた。閉じる順序も直す: 先に ``__anext__`` の完了を待ってから
+    ``aclose`` を呼ぶ (走行中の async generator へ ``aclose`` を投げると
+    ``RuntimeError: aclose(): asynchronous generator is already running`` で
+    握り潰されていた)。
+    """
+    aiter = token_stream.__aiter__()
+    pending: asyncio.Task | None = None
+    # キャンセルの判定は keepalive 間隔 (15 秒) より細かく回す。long_form の
+    # 計画段階のようにトークンが 60〜100 秒出ない区間では、フラグを見るのが
+    # この待ちのタイムアウト時だけなので、キャンセルの反映が最大 15 秒遅れて
+    # いた (2026-09-17 ライブ監査)。keepalive フレーム自体は従来どおり
+    # ``interval`` 秒の無音ごとに 1 回だけ出す。
+    poll = min(interval, _CANCEL_POLL_SEC)
+    silent_since = time.monotonic()
+    try:
+        while True:
+            if cancel_requested(session_id):
+                return
+            if pending is None:
+                pending = asyncio.create_task(aiter.__anext__())
+            # ``asyncio.wait`` はタイムアウト時にタスクをキャンセルしないため、
+            # keepalive 送出後も同じ ``__anext__()`` 呼び出しを継続できる。
+            done, _ = await asyncio.wait({pending}, timeout=poll)
+            if pending not in done:
+                now = time.monotonic()
+                if now - silent_since >= interval:
+                    silent_since = now
+                    yield None
+                continue
+            try:
+                token = pending.result()
+            except StopAsyncIteration:
+                pending = None
+                return
+            pending = None
+            silent_since = time.monotonic()
+            yield token
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        await _close_token_stream(token_stream)
+
+
+def _finish_stream_outcome(
+    state: AppState,
+    session_id: str,
+    *,
+    started_at: float,
+    completed: bool,
+    errored: bool,
+    tokens_out: int,
+    signals: dict,
+    success: bool | None = None,
+) -> None:
+    """ストリーム層の ``finally`` から結末を記録する (4 層共通)。
+
+    ユーザーキャンセル (``/api/chat/cancel`` のフラグ) は途中まで流した本文で
+    終端処理まで到達するので ``outcome_success`` が True になる。これをそのまま
+    書くと **キャンセルした部分応答が成功として evolve の fitness に入る**
+    (``record_response`` 側は ``cancelled=True`` で経験を落としているのに、結末
+    JSONL だけ success だった)。フラグは ``cancel_scope`` の後始末より先に
+    読めるので、ここで成否へ畳む。クライアント切断 (例外でも完走でもない) も
+    ``cancelled`` として区別する。
+
+    ``completed`` は「ストリームを終端まで届けたか」、``success`` は層が持つ
+    品質判定 (long_form の validation_errors / meta の failed_tasks)。2 つを
+    1 つの真偽に畳んで渡すと、完走したが品質で落ちたターンが「完走していない
+    = 切断」と誤分類される (2026-09-17 ライブ監査: validation_errors=1 の
+    long_form が cancelled=true になった)。
+    """
+    user_cancelled = cancel_requested(session_id)
+    quality_ok = True if success is None else bool(success)
+    _log_chat_outcome(
+        state,
+        started_at=started_at,
+        success=completed and quality_ok and not user_cancelled,
+        tokens_out=tokens_out,
+        signals=signals,
+        cancelled=user_cancelled or (not completed and not errored),
+    )
+
+
 async def _emit_stream_error(
     state: AppState,
     exc: BaseException,
@@ -245,7 +356,7 @@ async def _emit_stream_error(
     送り、ユーザー向け文言は i18n キーが解決できればそれを、できなければ
     例外メッセージ (英語) を使う。
     """
-    logger.error("%s stream error: %r", agent_layer, exc)
+    logger.error("%s stream error: %r", agent_layer, exc, exc_info=True)
     if timer:
         timer.stop("llm_total_ms")
     _emit_timing(state, timer, agent_layer, tokens_generated, mode=mode)
@@ -269,17 +380,94 @@ _cancel_flags: dict[str, bool] = {}
 # cancel_scope — finally ブロックのクリーンアップを共通化
 # ---------------------------------------------------------------------------
 
+#: セッション → そのセッションで進行中のリクエストのキャンセルキー。
+#: ``/api/chat/cancel`` が ``request_id`` を伴わないとき (旧クライアント /
+#: CLI) はセッションの全リクエストを止める。
+_session_requests: dict[str, set[str]] = {}
+
+#: このターンのキャンセルキー (``cancel_scope`` が置く)。リクエスト
+#: (trace_id) 単位で、trace の無い呼出 (テスト / 直接呼出) ではセッション id。
+_cancel_key_var: ContextVar[str | None] = ContextVar("chat_cancel_key", default=None)
+
+
+def _cancel_key(session_id: str) -> str:
+    return _cancel_key_var.get() or session_id
+
+
+def current_request_id() -> str | None:
+    """このターンの request_id (= trace_id)。フロントがキャンセルに使う。"""
+    return get_trace_id() or None
+
+
+def cancel_requested(session_id: str) -> bool:
+    """このターンにキャンセルが要求されたか。
+
+    リクエスト単位のキーを見る。``session_id`` 直指定のフラグも読む —
+    テスト / 直接呼出 (trace 無し) はセッション id をキーにするため。
+    """
+    key = _cancel_key(session_id)
+    return bool(_cancel_flags.get(key)) or (
+        key != session_id and bool(_cancel_flags.get(session_id))
+    )
+
+
+def request_cancel(session_id: str, request_id: str | None = None) -> bool:
+    """キャンセルを要求する (``/api/chat/cancel``)。止められたものがあれば True。
+
+    ``request_id`` があればそのリクエストだけ、無ければセッションの進行中
+    リクエスト全部。同一セッションで 2 本走っているとき (2 タブ / staged →
+    long_form の入れ子) にセッション id 1 本のフラグでは互いに干渉していた。
+    """
+    if request_id:
+        # 明示された id が既に終わっている / 別セッションのものなら何もしない
+        # (セッション全体へ倒すと、隣で走っている別リクエストを巻き込む)。
+        if request_id in _cancel_flags:
+            _cancel_flags[request_id] = True
+            return True
+        return False
+    keys = _session_requests.get(session_id) or set()
+    hit = False
+    for key in list(keys):
+        if key in _cancel_flags:
+            _cancel_flags[key] = True
+            hit = True
+    if not hit and session_id in _cancel_flags:
+        _cancel_flags[session_id] = True
+        hit = True
+    return hit
+
+
 @asynccontextmanager
 async def cancel_scope(session_id: str):
     """キャンセルフラグのスコープ管理
 
-    ストリーミング関数の try/finally パターンを統一する。
+    ストリーミング関数の try/finally パターンを統一する。キーはリクエスト
+    (trace_id) 単位。trace の無い呼出はセッション id をキーにする (従来互換)。
     """
-    _cancel_flags[session_id] = False
+    key = get_trace_id() or session_id
+    # 入れ子 (staged → long_form フォールバック) では外側のスコープが所有者。
+    # 内側で False に戻したり pop したりすると、その間に届いたキャンセルが消える。
+    nested = key in _cancel_flags
+    token = _cancel_key_var.set(key)
+    if not nested:
+        _cancel_flags[key] = False
+        _session_requests.setdefault(session_id, set()).add(key)
     try:
         yield
     finally:
-        _cancel_flags.pop(session_id, None)
+        if not nested:
+            _cancel_flags.pop(key, None)
+            keys = _session_requests.get(session_id)
+            if keys is not None:
+                keys.discard(key)
+                if not keys:
+                    _session_requests.pop(session_id, None)
+        _cancel_key_var.reset(token)
+
+
+def agent_layer_frame(layer: str) -> str:
+    """``agent_layer`` フレーム (このターンの ``request_id`` 付き)。"""
+    return sse.agent_layer(layer, request_id=current_request_id())
 
 
 def _make_step_queue_callback(
@@ -406,29 +594,80 @@ def _account_rule_outcomes(state: AppState) -> dict:
         return {}
 
 
-def _sync_chat_response(
-    state: AppState,
-    timer: StageTimer | None,
-    *,
-    agent_layer: str,
-    text: str,
-    tokens: int,
-    messages: list[ChatMessage],
-    session_id: str,
-    instance_name: str,
-    context_size: int,
-    mode: str = "",
+async def collect_chat_response(
+    frames: AsyncIterator[str], *, session_id: str,
 ) -> ChatResponse:
-    """同期応答の共通末尾: 計測の記録 → token_info の算出 → ``ChatResponse``。
+    """SSE フレーム列を飲み干して非ストリーミング応答 (``ChatResponse``) に畳む。
 
-    4 つの ``sync_*`` が同じ 3 手順を書き写していた。``agent_layer`` は timing の
-    ラベルと応答フィールドの双方に使うので、1 箇所で受けて食い違わせない。
+    非ストリーミング API (``stream=False``) の実装はこれ 1 つ。以前は層ごとに
+    ``sync_*`` を別実装しており、記録 / 結末 / 継続解除 / 失敗経験の有無が層に
+    よって揺れていた。ストリーム実装が唯一の経路になるので、非対称は構造的に
+    起きない。
+
+    写像規則:
+
+    - ``token`` の連結が本文。本文が空で ``task_result`` があれば最後の
+      ``detail`` を本文にする (long_form のファイル出力は本文を流さず
+      書込み結果だけを step で出す)
+    - ``editor_code`` (partial でない) はコードフェンスとして本文末尾に畳む
+      (非ストリームにはエディタチャネルが無い)
+    - ``error`` は 503 (``HTTPException``) に写す。ストリーム側で結末と
+      失敗経験は記録済み
+    - ``token_info`` / ``agent_layer`` はそのまま応答へ
     """
-    _emit_timing(state, timer, agent_layer, tokens, mode=mode)
-    token_info = make_token_info(messages, tokens, context_size, instance_name)
+    text_parts: list[str] = []
+    token_info: dict | None = None
+    agent_layer = "reactive"
+    error: str | None = None
+    last_result: str | None = None
+    editor_blocks: list[str] = []
+    async for frame in frames:
+        if not frame.startswith("data: "):
+            continue  # keepalive コメント
+        body = frame[len("data: "):].strip()
+        if body == "[DONE]":
+            continue
+        try:
+            obj = json.loads(body)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if "token" in obj:
+            text_parts.append(str(obj["token"]))
+        elif "token_info" in obj and isinstance(obj["token_info"], dict):
+            token_info = obj["token_info"]
+        elif "agent_layer" in obj:
+            agent_layer = str(obj["agent_layer"])
+        elif "error" in obj:
+            err = obj["error"]
+            if isinstance(err, dict):
+                error = str(err.get("message") or err.get("code") or err)
+            else:
+                error = str(err)
+        elif "step" in obj and isinstance(obj["step"], dict):
+            step = obj["step"]
+            if step.get("type") == "task_result" and step.get("detail"):
+                last_result = str(step["detail"])
+        elif "editor_code" in obj and isinstance(obj["editor_code"], dict):
+            ec = obj["editor_code"]
+            if not ec.get("partial"):
+                lang = ec.get("language") or ""
+                editor_blocks.append(
+                    "```" + lang + "\n" + str(ec.get("content") or "") + "\n```",
+                )
+    if error is not None:
+        raise HTTPException(status_code=503, detail=error)
+    text = "".join(text_parts)
+    if not text.strip() and last_result:
+        text = last_result
+    if editor_blocks:
+        blocks = "\n\n".join(editor_blocks)
+        text = (text + "\n\n" + blocks) if text else blocks
+    info = token_info or {"used": 0, "limit": 0, "pct": 0, "instance_name": ""}
     return ChatResponse(
         response=text,
-        token_info=TokenInfo(**token_info),
+        token_info=TokenInfo(**info),
         session_id=session_id,
         agent_layer=agent_layer,
     )

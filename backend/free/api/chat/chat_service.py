@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import re
 import time
 import uuid
@@ -80,16 +81,21 @@ async def ensure_llm_client(state: AppState, cfg: dict) -> LLMClient | None:
             state.llm_client = LLMClient(local=state.local_client)
         return state.llm_client
 
-    from backend.free.api.system.status import _try_lazy_connect
-    llama_cfg = cfg.get("llama", {})
-    llama_host = llama_cfg.get("host", "127.0.0.1")
-    llama_port = llama_cfg.get("port", 8080)
-    llama_url = f"http://{llama_host}:{llama_port}"
-    connected = await _try_lazy_connect(state, llama_url, llama_cfg)
-    if connected:
+    if await _try_lazy_connect_base(state, cfg):
         logger.info("llama-server lazy-connected via chat endpoint")
         return state.llm_client
     return None
+
+
+async def _try_lazy_connect_base(state: AppState, cfg: dict) -> bool:
+    """config の ``llama.host`` / ``llama.port`` へ遅延接続を試みる (2 経路共通)。"""
+    from backend.free.api.system.status import _try_lazy_connect
+
+    llama_cfg = cfg.get("llama", {})
+    llama_url = (
+        f"http://{llama_cfg.get('host', '127.0.0.1')}:{llama_cfg.get('port', 8080)}"
+    )
+    return await _try_lazy_connect(state, llama_url, llama_cfg)
 
 
 async def prepare_memory_context(
@@ -311,10 +317,14 @@ async def run_search_pipeline(
     try:
         if timer:
             timer.start("embedding_ms")
-        # mode 別 instruction を埋め込みへ伝搬
-        query_vec = await state.embedder.embed_query(query, mode=mode)
-        if timer:
-            timer.stop("embedding_ms")
+        try:
+            # mode 別 instruction を埋め込みへ伝搬
+            query_vec = await state.embedder.embed_query(query, mode=mode)
+        finally:
+            # 埋め込みの失敗でも区間を閉じる (開いたままだと requests JSONL の
+            # embedding_ms が欠ける)。
+            if timer:
+                timer.stop("embedding_ms")
 
         wm, episodic = mem_sys
         # content gate のセッション上限判定に使う session_id。呼出側が渡さない
@@ -401,7 +411,7 @@ class ConflictTurnContext:
 
 def _iter_scopes(state: AppState):
     """(scope 名, store) を global → project の順で yield する。"""
-    pid = state.current_project_id
+    pid = getattr(state, "current_project_id", None)
     for scope in ("global", f"project:{pid}" if pid else None):
         if scope is None:
             continue
@@ -492,12 +502,17 @@ async def collect_pending_conflicts(
     return ctx
 
 
+@functools.lru_cache(maxsize=4096)
 def _attribute_slots(text: str) -> frozenset[tuple[str, str]]:
     """本文が述べているユーザー属性スロット ``(fact_type, attribute)`` の集合。
 
     抽出側が subject を決めるのと同じ決定論辞書 (``fact_attributes.yaml``) を
     使う。``core.inference`` から EvorefMem を直接引かせないため、解決器は
     呼出側 (ここ) から渡す。LLM 呼び出しは無い。
+
+    ``build_messages`` は履歴の平叙文 / 注入行 / RAG チャンクごとにこれを
+    呼ぶので、同じ発話が毎ターン解決し直されていた。入力は文字列、出力は
+    不変集合なのでメモ化する (辞書は起動時に読む静的なもの)。
     """
     from backend.free.memory.notes.note_builder import (
         MAX_ASKED_ATTRIBUTES,
@@ -521,7 +536,16 @@ def _attribute_slots(text: str) -> frozenset[tuple[str, str]]:
 
 
 def _session_wm(state: AppState, session_id: str | None):
-    """``session_id`` の WorkingMemory を安全に取る (pillar 未構築なら ``None``)。"""
+    """``session_id`` の WorkingMemory を **読み出し用に** 安全に取る。
+
+    pillar 未構築なら ``None``。台帳 (``WorkingMemoryRegistry``) がある構成では
+    ``peek`` で引く — ``get`` は無ければ窓を作り LRU の末尾へ動かすので、
+    読み出しだけの呼出 (押し出し件数 / 最初の発話 / 計量) が終了済み
+    セッションの空の窓を再生したり、生きているセッションを押し出したりする。
+    """
+    registry = getattr(state, "working_memory_registry", None)
+    if registry is not None and session_id and hasattr(registry, "peek"):
+        return registry.peek(session_id)
     get = getattr(state, "get_memory_system", None)
     if not callable(get):
         return None
@@ -580,21 +604,10 @@ def _retired_note_ids_for_store(store: Any) -> dict[str, bool]:
     弱参照 / ``revision`` が取れない構成 (テストの簡易 mock 等) では
     キャッシュせず毎回計算する (縮退のみで壊れない)。
     """
-    scope = getattr(store, "scope", None)
-    backing = getattr(store, "store", None) or store
-    try:
-        revision = store.revision
-    except Exception:
-        revision = None
-    if revision is not None:
-        try:
-            per_scope = _RETIRED_NOTE_CACHE.get(backing)
-        except TypeError:
-            per_scope = None
-        if per_scope is not None:
-            cached = per_scope.get(scope)
-            if cached is not None and cached[0] == revision:
-                return cached[1]
+    return _cached_by_revision(store, _RETIRED_NOTE_CACHE, _compute_retired_note_ids)
+
+
+def _compute_retired_note_ids(store: Any) -> dict[str, bool]:
     retired: dict[str, bool] = {}
     for fact in store.all_facts(include_superseded=True):
         # 勝者が継承した id (敗者が物理 GC された後も残る、c_16 §5.4)。
@@ -605,27 +618,114 @@ def _retired_note_ids_for_store(store: Any) -> dict[str, bool]:
         for p in fact.provenances:
             if p.note_id:
                 retired[p.note_id] = True
+    return retired
+
+
+def _cached_by_revision(store: Any, cache: Any, compute: Any) -> Any:
+    """``store.revision`` が変わるまで ``compute(store)`` の結果を使い回す。
+
+    3 つの全件走査 (supersede 済みノート id / 訂正前の値 / 訂正の宛先) が
+    毎ターン ``all_facts(include_superseded=True)`` を舐めていた。キーは
+    ``(実体ストア, scope)`` で、弱参照 / ``revision`` が取れない構成では
+    キャッシュせず毎回計算する。
+    """
+    scope = getattr(store, "scope", None)
+    backing = getattr(store, "store", None) or store
+    try:
+        revision = store.revision
+    except Exception:
+        revision = None
     if revision is not None:
         try:
-            _RETIRED_NOTE_CACHE.setdefault(backing, {})[scope] = (revision, retired)
+            per_scope = cache.get(backing)
+        except TypeError:
+            per_scope = None
+        if per_scope is not None:
+            cached = per_scope.get(scope)
+            if cached is not None and cached[0] == revision:
+                return cached[1]
+    value = compute(store)
+    if revision is not None:
+        try:
+            cache.setdefault(backing, {})[scope] = (revision, value)
         except TypeError:
             pass
-    return retired
+    return value
 
 
 def _collect_correction_trail(state: AppState) -> dict[str, str]:
     """全 scope の SemMem から訂正の宛先台帳を集める (失敗しても検索は続ける)。"""
     trail: dict[str, str] = {}
-    pid = getattr(state, "current_project_id", None)
-    for scope in ("global", f"project:{pid}" if pid else None):
-        if scope is None:
-            continue
+    for _scope, store in _iter_scopes(state):
         try:
-            trail.update(_correction_trail_for_store(state.get_semantic_store(scope)))
+            trail.update(_correction_trail_for_store(store))
         except Exception:
             # 注記が付かないだけで検索自体は成立する (fail-open)。
             continue
     return trail
+
+
+_CORRECTION_GENERATION_CACHE: "weakref.WeakKeyDictionary[Any, dict[str, tuple[int, tuple[dict[str, str], dict[str, str]]]]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _final_correction_winner(by_id: dict[str, Any], fact: Any) -> Any | None:
+    """``fact`` を畳んだ最終世代を返す (訂正で畳まれたものだけ、それ以外は None)。
+
+    連鎖 A ← B ← C では A も B も C に解決する。単なる値の再言明や要約への
+    吸収 (``from_correction`` が立たない) は「訂正済み」ではない。
+    """
+    winner = by_id.get(fact.superseded_by)
+    seen: set[str] = {fact.id}
+    while winner is not None and winner.superseded_by and winner.id not in seen:
+        seen.add(winner.id)
+        winner = by_id.get(winner.superseded_by)
+    if winner is None or not getattr(winner, "from_correction", False):
+        return None
+    return winner
+
+
+def _compute_correction_generations(
+    store: Any,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """SemMem の世代を 1 回走査して ``(訂正前の値, 訂正の宛先)`` を組む。
+
+    以前は :func:`_previous_values_for_store` と
+    :func:`_correction_trail_for_store` が同じ連鎖歩きを別々に持ち、毎ターン
+    2 回全件を舐めていた。
+    """
+    by_id = {f.id: f for f in store.all_facts(include_superseded=True)}
+    oldest: dict[str, tuple[float, str]] = {}
+    trail: dict[str, str] = {}
+    for fact in by_id.values():
+        if not fact.superseded_by:
+            continue
+        winner = _final_correction_winner(by_id, fact)
+        if winner is None:
+            continue
+        current = str(getattr(winner, "object", "") or "").strip()
+        if current:
+            for p in fact.provenances:
+                if p.note_id:
+                    trail[p.note_id] = current
+            for note_id in getattr(fact, "retired_note_ids", None) or ():
+                trail[str(note_id)] = current
+        old = str(getattr(fact, "object", "") or "").strip()
+        if not old or old == current:
+            continue
+        at = float(getattr(fact, "created_at", 0.0) or 0.0)
+        prev = oldest.get(winner.id)
+        if prev is None or at < prev[0]:
+            oldest[winner.id] = (at, old)
+    previous = {wid: old for wid, (_at, old) in oldest.items()}
+    return previous, trail
+
+
+def _correction_generations(store: Any) -> tuple[dict[str, str], dict[str, str]]:
+    return _cached_by_revision(
+        store, _CORRECTION_GENERATION_CACHE, _compute_correction_generations,
+    )
 
 
 def _previous_values_for_store(store: Any) -> dict[str, str]:
@@ -634,28 +734,10 @@ def _previous_values_for_store(store: Any) -> dict[str, str]:
     ``MemoryInjector`` が ``(訂正後の記録)`` の行に「以前は「…」」を添える
     ための材料 (2026-09-14 監査 B)。連鎖 A ← B ← C では C に **最古の A** の
     値を添える (本人が最初に述べた値)。世代の辿り方は
-    :func:`_correction_trail_for_store` と同じ。
+    :func:`_correction_trail_for_store` と同じ (走査は 1 回、
+    :func:`_compute_correction_generations`)。
     """
-    by_id = {f.id: f for f in store.all_facts(include_superseded=True)}
-    oldest: dict[str, tuple[float, str]] = {}
-    for fact in by_id.values():
-        if not fact.superseded_by:
-            continue
-        winner = by_id.get(fact.superseded_by)
-        seen: set[str] = {fact.id}
-        while winner is not None and winner.superseded_by and winner.id not in seen:
-            seen.add(winner.id)
-            winner = by_id.get(winner.superseded_by)
-        if winner is None or not getattr(winner, "from_correction", False):
-            continue
-        old = str(getattr(fact, "object", "") or "").strip()
-        if not old or old == str(getattr(winner, "object", "") or "").strip():
-            continue
-        at = float(getattr(fact, "created_at", 0.0) or 0.0)
-        prev = oldest.get(winner.id)
-        if prev is None or at < prev[0]:
-            oldest[winner.id] = (at, old)
-    return {wid: old for wid, (_at, old) in oldest.items()}
+    return _correction_generations(store)[0]
 
 
 def _correction_trail_for_store(store: Any) -> dict[str, str]:
@@ -684,30 +766,7 @@ def _correction_trail_for_store(store: Any) -> dict[str, str]:
         ``{被訂正ノート id: 現在値の言明テキスト}``。現在値へ辿れないものは
         含めない。
     """
-    by_id = {f.id: f for f in store.all_facts(include_superseded=True)}
-    trail: dict[str, str] = {}
-    for fact in by_id.values():
-        if not fact.superseded_by:
-            continue
-        # 最終世代まで辿る (A ← B ← C では A も B も C に解決する)。
-        winner = by_id.get(fact.superseded_by)
-        seen: set[str] = {fact.id}
-        while winner is not None and winner.superseded_by and winner.id not in seen:
-            seen.add(winner.id)
-            winner = by_id.get(winner.superseded_by)
-        if winner is None or not getattr(winner, "from_correction", False):
-            # 訂正で畳まれたものだけを注記の対象にする。単なる値の再言明や
-            # 要約への吸収は「訂正済み」ではない。
-            continue
-        current = str(getattr(winner, "object", "") or "").strip()
-        if not current:
-            continue
-        for p in fact.provenances:
-            if p.note_id:
-                trail[p.note_id] = current
-        for note_id in getattr(fact, "retired_note_ids", None) or ():
-            trail[str(note_id)] = current
-    return trail
+    return _correction_generations(store)[1]
 
 
 def build_semmem_injection(
@@ -755,7 +814,10 @@ def build_semmem_injection(
     episodic 本体は不変のまま (履歴検索ツールでは訂正前の値を引ける) で、
     ``[関連する記憶]`` への「(過去の記録)」再注入だけを止める (f_02 §8.3)。
     """
-    mem_sys = state.get_memory_system()
+    # 要るのは episodic だけだが、session_id 無しの ``get_memory_system()`` は
+    # 「最後に触ったセッションの窓」を返す legacy 経路なので、このターンの
+    # セッションで引く (並行セッション下で他人の窓を LRU 末尾へ動かさない)。
+    mem_sys = state.get_memory_system(session_id)
     if not mem_sys:
         return None
     inj_mode = normalize_session_mode(mode)
@@ -1128,11 +1190,7 @@ def _append_quantity_grounding(
     目の前にあれば、直前の別の数値を掴む余地が減る。値が会話で確定して
     いなければ何もしない (**観測事実が無ければ注入しない**)。
     """
-    query = ""
-    for msg in reversed(history):
-        if msg.get("role") == "user":
-            query = str(msg.get("content") or "")
-            break
+    query = _last_user_text(history)
     quantity = referenced_quantity(query)
     if not quantity:
         return
@@ -1285,11 +1343,7 @@ def _append_conversation_measurement(
     """
     if not session_id:
         return
-    query = ""
-    for msg in reversed(history):
-        if msg.get("role") == "user":
-            query = str(msg.get("content") or "")
-            break
+    query = _last_user_text(history)
     if not query:
         return
 
@@ -1346,6 +1400,14 @@ def _append_conversation_measurement(
         separator="",
     ):
         logger.debug("Conversation measurement injected: %s", parts)
+
+
+def _last_user_text(history: list[ChatMessage]) -> str:
+    """履歴の最後の user 発話本文 (無ければ空文字列)。接地注記 5 本が共用する。"""
+    for msg in reversed(history):
+        if msg.get("role") == "user":
+            return str(msg.get("content") or "")
+    return ""
 
 
 def apply_grounding_notes(
@@ -1407,11 +1469,7 @@ def _append_relative_date_grounding(
     解決の SSOT は ``core.relative_date`` (週の起点は月曜)。「今日」単独は
     注記しない (``DAY_OFFSETS`` の 0 は落とす)。
     """
-    query = ""
-    for msg in reversed(history):
-        if msg.get("role") == "user":
-            query = str(msg.get("content") or "")
-            break
+    query = _last_user_text(history)
     if not query:
         return
     from backend.free.core.relative_date import resolve_relative_dates
@@ -1486,11 +1544,7 @@ def _append_truncated_history_note(
     """
     if evicted_turns <= 0:
         return
-    query = ""
-    for msg in reversed(history):
-        if msg.get("role") == "user":
-            query = str(msg.get("content") or "")
-            break
+    query = _last_user_text(history)
     if not is_whole_session_scope_query(query):
         return
     if append_to_last_user(
@@ -1613,11 +1667,7 @@ def _append_self_output_measurement(
     (2026-08-31 ライブ監査 t18#9): 1213 文字の入力に **「500文字です」**
     (入力は欠損なく届いており、単に数え違えていた)。
     """
-    query = ""
-    for msg in reversed(history):
-        if msg.get("role") == "user":
-            query = str(msg.get("content") or "")
-            break
+    query = _last_user_text(history)
     payload, payload_kinds = split_user_text_measurement(query)
     joiner = _localized(_MEASUREMENT_JOINER)
     if payload and payload_kinds:
@@ -1704,13 +1754,7 @@ async def ensure_base_model_health(
     if await _wait_base_model_loading(client, cfg):
         return True, client
 
-    from backend.free.api.system.status import _try_lazy_connect
-    llama_cfg = cfg.get("llama", {})
-    llama_host = llama_cfg.get("host", "127.0.0.1")
-    llama_port = llama_cfg.get("port", 8080)
-    llama_url = f"http://{llama_host}:{llama_port}"
-    reconnected = await _try_lazy_connect(state, llama_url, llama_cfg)
-    if reconnected:
+    if await _try_lazy_connect_base(state, cfg):
         logger.info("llama-server reconnected during long-form fallback")
         return True, state.llm_client
 

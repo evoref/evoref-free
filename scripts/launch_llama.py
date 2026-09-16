@@ -167,6 +167,99 @@ def _append_cache_ram_args(
         cmd += ["--no-cache-idle-slots"]
 
 
+# ── slots (auto) 解決 ─────────────────────────────────
+#: ``llama.slots: auto`` の床。0 = chat / 1 = background / 2 = classifier。
+SLOTS_BASE = 3
+#: 4 本目 = long_form のユニット生成専用 (``LocalClient.longform_slot``)。
+SLOTS_WITH_LONG_FORM = 4
+#: auto で 4 本目を切る最小 context_size。
+#:
+#: unified KV (slots>1 で自動付与) ではスロットは VRAM を分け合わず、**同じ n_ctx
+#: セル** を分け合う (KV 本体は n_ctx 総量で頭打ち、増えるのは hybrid arch の
+#: 再帰状態だけ)。llama-server はセルが尽きると idle スロットを id 順に 1 本ずつ
+#: purge する (server-context.cpp ``try_clear_idle_slots``) ので、最初に消えるのは
+#: チャット接頭辞 (slot 0)。4 本目が効くのは、チャットのプロンプト (working
+#: 4352 + system + 注入 ≈ 6〜7K)、ユニット 1 本 (prompt + unit_max_tokens 2000
+#: ≈ 3.5〜4K)、背景 / 分類器の残滓 (≈ 2〜3K) が同時に n_ctx に収まるときだけ。
+#: 8192 では収まらず (purge で今と同じ挙動になるだけ)、16384 以上で収まる。
+LONG_FORM_SLOT_MIN_CTX = 16384
+_RESOLVED_SLOTS_KEY = "__resolved_slots__"
+
+
+def _per_seq_state_mb(
+    cfg: dict, project_root: Path, n_ctx: int, model_override: str | None,
+) -> int:
+    """スロット 1 本ぶんの文脈メモリ増分 (MiB)。
+
+    unified KV では KV 本体は増えず、hybrid arch (Qwen3.5/3.8 等) の再帰状態
+    だけがシーケンス毎に確保される (純 attention モデルなら 0)。GGUF が無い /
+    メタデータ不足なら 0 (= 判定に効かせない)。
+    """
+    sp = cfg.get("model_paths", {}) or {}
+    path = Path(model_override or sp.get("base_model", ""))
+    if not str(path):
+        return 0
+    if not path.is_absolute():
+        path = project_root / path
+    if not path.exists():
+        return 0
+    lc = cfg.get("llama", {}) or {}
+    meta = _read_gguf_metadata_cached(path)
+    with_lf = estimate_kv_cache_mb(
+        meta, n_ctx, lc.get("cache_type_k"), lc.get("cache_type_v"),
+        n_seq=SLOTS_WITH_LONG_FORM,
+    )
+    base = estimate_kv_cache_mb(
+        meta, n_ctx, lc.get("cache_type_k"), lc.get("cache_type_v"),
+        n_seq=SLOTS_BASE,
+    )
+    if with_lf is None or base is None:
+        return 0
+    return max(0, int(with_lf) - int(base))
+
+
+def resolve_base_slots(
+    cfg: dict, project_root: Path | None = None, *, model_override: str | None = None,
+) -> int:
+    """``llama.slots`` を実数に解決する (``auto`` は 3 か 4)。
+
+    解決結果は ``cfg`` に 1 度だけキャッシュし、``-np`` / VRAM 推定 (再帰状態の
+    シーケンス数) / 予算超過時の降格 (:func:`check_vram_budget`) が同じ値を見る。
+    backend 側は config を解釈せず、llama-server ``/props`` の ``total_slots``
+    を実数として受け取る (``client_builder.build_local_client``)。
+    """
+    key = model_override or ""
+    cache = cfg.setdefault(_RESOLVED_SLOTS_KEY, {})
+    if key in cache:
+        return int(cache[key]["slots"])
+    lc = cfg.get("llama", {}) or {}
+    raw = lc.get("slots", "auto")
+    if raw != "auto":
+        slots = max(1, int(raw or 1))
+        cache[key] = {"slots": slots, "auto": False, "per_seq_mb": 0}
+        return slots
+    project_root = project_root or Path.cwd()
+    n_ctx = resolve_context_size_for(
+        cfg, "base", project_root, model_override=model_override,
+    )
+    per_seq_mb = _per_seq_state_mb(cfg, project_root, n_ctx, model_override)
+    if n_ctx < LONG_FORM_SLOT_MIN_CTX:
+        slots = SLOTS_BASE
+        reason = (
+            f"n_ctx {n_ctx} < {LONG_FORM_SLOT_MIN_CTX}: a long_form slot could not "
+            "keep the chat prefix resident (unified KV shares the cells)"
+        )
+    else:
+        slots = SLOTS_WITH_LONG_FORM
+        reason = (
+            f"n_ctx {n_ctx} >= {LONG_FORM_SLOT_MIN_CTX}: dedicated long_form slot "
+            f"(+{per_seq_mb} MiB per-sequence state)"
+        )
+    cache[key] = {"slots": slots, "auto": True, "per_seq_mb": per_seq_mb}
+    print(f"[launch] llama.slots=auto -> {slots} ({reason})")
+    return slots
+
+
 def _append_kv_unified_args(
     cmd: list[str], section_cfg: dict, *, slots: int,
 ) -> None:
@@ -782,7 +875,9 @@ def build_llama_cmd(
     # slots は常に ``-np`` で明示する。未指定だと新しい llama-server が
     # n_parallel=auto (=4) を選び、slots=1 (単一スロット = 省メモリ) の意図が
     # 効かなくなるため (slots レバーが slots=1 で no-op 化していた)。
-    slots = max(1, int(slots_override or lc.get("slots", 1) or 1))
+    slots = max(1, int(slots_override or resolve_base_slots(
+        cfg, project_root, model_override=model_override,
+    )))
     cmd += ["-np", str(slots)]
     if no_warmup:
         cmd += ["--no-warmup"]
@@ -1729,7 +1824,7 @@ def _estimate_via_gguf_size(
             lc.get("cache_type_v"),
             # hybrid arch の再帰状態はスロット毎に確保されるため slots を渡す
             # (KV 側は --kv-unified 前提で slots 倍しない)。
-            n_seq=int(lc.get("slots", 1) or 1),
+            n_seq=resolve_base_slots(cfg, project_root),
         )
         if base_kv_mb:
             base_vram += base_kv_mb
@@ -2408,6 +2503,26 @@ def check_vram_budget(
             )
         return True, total_vram_mb, None, estimates, "\n".join(lines)
 
+    # ``llama.slots: auto`` が 4 本目 (long_form 専用) を選んだせいで予算を
+    # 超えるなら、そのぶん (hybrid arch の再帰状態 1 シーケンス分) を諦めて 3 に
+    # 降格する。明示 ``slots: 4`` は降格しない (超過は従来どおり警告 / アボート)。
+    resolved = (cfg.get(_RESOLVED_SLOTS_KEY) or {}).get("")
+    if (
+        resolved is not None and resolved.get("auto")
+        and int(resolved.get("slots", 0)) == SLOTS_WITH_LONG_FORM
+        and total_vram_mb > int(budget_mb)
+        and total_vram_mb - int(resolved.get("per_seq_mb", 0)) <= int(budget_mb)
+    ):
+        per_seq_mb = int(resolved.get("per_seq_mb", 0))
+        resolved["slots"] = SLOTS_BASE
+        total_vram_mb -= per_seq_mb
+        if "base" in estimates:
+            estimates["base"]["vram_mb"] = int(estimates["base"].get("vram_mb", 0)) - per_seq_mb
+        lines.append(
+            f"[launch] llama.slots=auto: dropping the long_form slot (-{per_seq_mb} MB) "
+            f"to fit runtime.total_vram_budget_mb={budget_mb}; using {SLOTS_BASE} slots"
+        )
+
     if total_vram_mb > int(budget_mb):
         over = total_vram_mb - int(budget_mb)
         lines.append(
@@ -2628,6 +2743,15 @@ def wait_for_health(
     return False
 
 
+def _wait_health(ports: dict[str, int], timeout_sec: float) -> None:
+    """各サーバの ``/health`` が 200 を返すまで待つ (超過は WARNING を出して続行)。"""
+    for name, port in ports.items():
+        if wait_for_health("localhost", port, timeout=int(timeout_sec)):
+            print(f"[launch] {name} (port {port}) is healthy")
+        else:
+            print(f"[launch] WARNING: {name} (port {port}) health check timed out, proceeding anyway")
+
+
 def _resolve_learned_lora_args(
     cfg: dict, project_root: Path, component: str,
 ) -> tuple[Path | None, bool]:
@@ -2737,6 +2861,17 @@ if __name__ == "__main__":
             "出力して終了する。evoref-ctl が health 待ち対象を決めるのに使う"
         ),
     )
+    parser.add_argument(
+        "--wait-health",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "起動せず、--all で立ち上がるサーバの /health が 200 を返すまで待って終了する "
+            "(evoref-ctl の health 待ち。以前は powershell のループで、標準入力が"
+            "端末でない呼出元からは 'Input redirection is not supported' で落ちた)"
+        ),
+    )
     args = parser.parse_args()
 
     cfg_path = Path(args.config)
@@ -2746,11 +2881,18 @@ if __name__ == "__main__":
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     project_root = cfg_path.parent
 
+    health_ports: dict[str, int] = {"base": int(cfg.get("llama", {}).get("port", 8080))}
+    _emb = cfg.get("embedding", {}) or {}
+    if _emb.get("backend", "llama-cpp") == "llama-cpp":
+        health_ports["embed"] = int(_emb.get("llama_port", 8082))
+
     if args.print_health_ports:
-        print(f"base={cfg.get('llama', {}).get('port', 8080)}")
-        emb = cfg.get("embedding", {}) or {}
-        if emb.get("backend", "llama-cpp") == "llama-cpp":
-            print(f"embed={emb.get('llama_port', 8082)}")
+        for name, port in health_ports.items():
+            print(f"{name}={port}")
+        sys.exit(0)
+
+    if args.wait_health is not None:
+        _wait_health(health_ports, float(args.wait_health))
         sys.exit(0)
 
     procs: list[subprocess.Popen] = []

@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
+from backend.free.core.predicate import LexicalPredicate, Verdict
 from backend.utils import utc_now_dt
 
 if TYPE_CHECKING:
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
 __all__ = [
     "ARTIFACT_TTL",
     "LastArtifact",
+    "artifact_reference_verdict",
     "forget_artifact",
     "outline_of",
     "peek_artifact",
@@ -165,15 +167,23 @@ def split_sections(text: str) -> list[tuple[str, str]]:
 #: それは 2026-07 以降 4 回破れた属性語の列挙と同じ失敗の形になる。
 #: ここで見るのは **指示詞** という閉じた文法クラスだけで、「何を指すか」は
 #: 「直前のターンが長文成果物だった」という **観測事実** が決める。
+#:
+#: 部分一致の穴を塞ぐ (2026-09-16 監査): 「これまでの会話」「それから」の
+#: 指示詞は成果物を指さず、英語は語境界を切らないと "whatever" / "thistle" に
+#: 当たる。閉じたクラスなので、続きの語で除外する方が語彙を足すより安全。
 _DEMONSTRATIVE_RE = re.compile(
-    r"(?:その|それ|この|これ|these|this|that|いまの|今の|さっきの|先ほどの"
-    r"|上記の|前の)",
+    r"(?:(?:その|それ|この|これ)(?!まで|から|ぞれ|ら\b|ぞ)"
+    r"|いまの|今の|さっきの|先ほどの|上記の|前の"
+    r"|\b(?:these|this|that)\b)",
+    re.IGNORECASE,
 )
 
 #: 成果物そのものを対象にする操作。指示詞が無くても、直前が成果物なら
 #: これらは成果物に掛かっているとみなす (「全体を要約して」「何章ある?」)。
+#: 「何文字 / 何行」は入れない — 自己出力の計量 (``_append_self_output_measurement``)
+#: が実測値を注入する問いで、成果物ブロックを重ねると 2 つの根拠が競合する。
 _ARTIFACT_OPERATION_RE = re.compile(
-    r"(?:全体|全部|ぜんぶ|何章|何節|何ページ|何文字|何行|章立て|目次|見出し)",
+    r"(?:全体|全部|ぜんぶ|何章|何節|何ページ|章立て|目次|見出し)",
 )
 
 #: 「第2章」「2章」「セクション3」のような **節番号の指定**。
@@ -207,6 +217,36 @@ def references_artifact(query: str) -> bool:
         or _ARTIFACT_OPERATION_RE.search(query)
         or _SECTION_REF_RE.search(query),
     )
+
+
+def _reference_label(query: str, _ctx=None) -> str:
+    """どの根拠で成果物参照と判定したか (c_17 のラベル語彙)。
+
+    無ければ空文字列 (= ``skip``)。``None`` は ``abstain`` (判定できなかった)
+    なので返さない — 字句の不発は「参照していない」という判定結果。
+    """
+    if not query:
+        return ""
+    if _SECTION_REF_RE.search(query):
+        return "section_ref"
+    if _DEMONSTRATIVE_RE.search(query):
+        return "demonstrative"
+    if _ARTIFACT_OPERATION_RE.search(query):
+        return "artifact_operation"
+    return ""
+
+
+#: 判定点としての成果物参照 (c_17 / CLAUDE.md #14)。``references_artifact`` の
+#: bool を包み、``Verdict`` (score / band / evidence) で返す。呼出側
+#: (``chat._resolve_artifact_block``) が decision.jsonl に根拠を残す。
+artifact_reference_predicate = LexicalPredicate(
+    "artifact_reference", _reference_label, evidence="lexical", takes_ctx=True,
+)
+
+
+def artifact_reference_verdict(query: str) -> Verdict:
+    """``query`` が直前の成果物を指すかの判定 (``band`` と根拠付き)。"""
+    return artifact_reference_predicate.evaluate(query)
 
 
 def requested_section(query: str) -> int | None:

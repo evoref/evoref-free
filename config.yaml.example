@@ -128,8 +128,15 @@ llama:
   flash_attn: true                # -fa / Flash Attention の有効化
   mlock: false                    # --mlock / モデルを RAM に固定
   cache_prompt: true              # KVキャッシュ再利用（共通プレフィックスの再計算をスキップ）
-  slots: 3                        # -np / 並列スロット数（1=単一, 2=チャット+背景, 3=+ツール分類器）
-                                  # 3: 既定。slot0=チャット / slot1=背景 (sleep-time・学習) /
+  slots: auto                     # -np / 並列スロット数（auto | 1=単一, 2=チャット+背景, 3=+ツール分類器, 4=+長文）
+                                  # auto: 既定。起動時に 3 か 4 を決める (scripts/launch_llama.py)。
+                                  #    4 本目 (slot3) は long_form のユニット生成専用で、長文ターンの後も
+                                  #    チャット接頭辞の KV を残す。unified KV ではスロットは VRAM でなく
+                                  #    同じ n_ctx セルを分け合うので、context_size >= 16384 のときだけ 4
+                                  #    (8192 では llama-server がセル不足で slot0 から purge し効かない)。
+                                  #    VRAM 増分は hybrid arch の再帰状態 1 本分 (27B で ~150 MiB、純
+                                  #    attention なら 0)。runtime.total_vram_budget_mb を超えるなら 3。
+                                  # 3: slot0=チャット / slot1=背景 (sleep-time・学習) /
                                   #    slot2=ツール分類器 (層 5.9)。分類器のプロンプトは
                                   #    「ツールメニュー(385tok、毎回同一)+直近会話+クエリ」で、
                                   #    背景と同居させると合間に走る補助タスクが毎回プレフィクスを
@@ -140,7 +147,7 @@ llama:
                                   # 1: 単一スロット。チャットとバックグラウンド処理が直列化し、
                                   #    学習中のチャットが 1 呼出ぶん待たされる
                                   # kv_unified が slots>1 で自動付与されるので per-seq context は
-                                  # n_ctx のまま（スロットを増やしても VRAM は増えない）
+                                  # n_ctx のまま（スロットを増やしても KV の VRAM は増えない）
   cache_type_k: q8_0              # --cache-type-k / KV key 量子化
                                   #   f16: 基準（VRAM最大）, bf16: bf16学習モデル向け
                                   #   q8_0: 推奨（VRAM半減、品質劣化ほぼゼロ）

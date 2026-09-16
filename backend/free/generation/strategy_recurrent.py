@@ -336,7 +336,7 @@ class RecurrentStrategy:
                 "stream": True,
                 "temperature": self._generation_params.get("temperature", 0.7),
                 "max_tokens": unit_max_tokens,
-                "id_slot": self.main_client.chat_slot,
+                "id_slot": self.main_client.longform_slot,
             }
             for k in ("top_p", "top_k", "presence_penalty"):
                 if k in self._generation_params:

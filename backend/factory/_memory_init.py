@@ -277,6 +277,11 @@ def _init_memory(
     from backend.free.memory.notes.note_builder import set_default_triggers_dir
     set_default_triggers_dir(triggers_dir)
     wm = WorkingMemoryRegistry(cfg)
+    # 窓の寿命に合わせて応答パス側のセッション別台帳 (蓄積バッファ等) を畳む。
+    # 会話は毎ターン履歴ファイルへ保存済みなので、押し出されたセッションが
+    # 戻ってきても ``_ensure_session_restored`` が索引から引き直せる。
+    from backend.free.api.chat.chat_recorder import clear_session_data
+    wm.on_drop = clear_session_data
 
     # エピソード記憶 (c_16 §4.1)。実体は ``<memory_dir>/episodic``。
     # 埋め込みバックエンドは EvorefGen 側の構築後に注入される

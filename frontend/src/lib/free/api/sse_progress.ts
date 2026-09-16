@@ -14,6 +14,7 @@
 
 import { loggedFetch as fetch } from '$lib/devlog';
 import { BASE_URL } from './_client';
+import { readSseFrames } from './sse_frames';
 
 /** SSE 進捗イベントの型 */
 export interface SSEProgressEvent {
@@ -90,55 +91,43 @@ export async function* streamSSEFormData(
 		return;
 	}
 
-	const reader = res.body?.getReader();
-	if (!reader) {
+	if (!res.body) {
 		yield { type: 'error', error: { message: 'No response body' } };
 		return;
 	}
 
-	const decoder = new TextDecoder();
-	let buffer = '';
-
-	try {
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			buffer += decoder.decode(value, { stream: true });
-
-			const lines = buffer.split('\n');
-			buffer = lines.pop() ?? '';
-
-			for (const line of lines) {
-				if (!line.startsWith('data:')) continue;
-				const data = line.slice(5).trim();
-				if (data === '[DONE]') {
-					yield { type: 'done' };
-					return;
-				}
-				if (!data) continue;
-				try {
-					const parsed = JSON.parse(data);
-					if (parsed.step !== undefined) {
-						yield { type: 'step', step: parsed.step };
-					} else if (parsed.result !== undefined) {
-						yield { type: 'result', result: parsed.result };
-					} else if (parsed.error !== undefined) {
-						const err =
-							typeof parsed.error === 'string'
-								? { message: parsed.error }
-								: { code: parsed.error.code, message: parsed.error.message };
-						yield { type: 'error', error: err };
-					}
-				} catch {
-					// 1 フレームのパース失敗はスキップ
-				}
-			}
+	// フレームの切り出しは chat と共通 (`readSseFrames`)。ここは step / result /
+	// error の 3 種への写像だけ。1 フレームのパース失敗はスキップ (既定)。
+	for await (const frame of readSseFrames(res.body)) {
+		if (frame.done) {
+			yield { type: 'done' };
+			return;
 		}
-	} finally {
-		try {
-			reader.releaseLock();
-		} catch {
-			// 既に解放済み
+		const parsed = frame.data as {
+			type?: string;
+			step?: SSEProgressEvent['step'];
+			result?: unknown;
+			error?: string | { code?: string; message: string };
+		};
+		const kind =
+			parsed.type ??
+			(parsed.step !== undefined
+				? 'step'
+				: parsed.result !== undefined
+					? 'result'
+					: parsed.error !== undefined
+						? 'error'
+						: undefined);
+		if (kind === 'step' && parsed.step !== undefined) {
+			yield { type: 'step', step: parsed.step };
+		} else if (kind === 'result') {
+			yield { type: 'result', result: parsed.result };
+		} else if (kind === 'error' && parsed.error !== undefined) {
+			const err =
+				typeof parsed.error === 'string'
+					? { message: parsed.error }
+					: { code: parsed.error.code, message: parsed.error.message };
+			yield { type: 'error', error: err };
 		}
 	}
 }

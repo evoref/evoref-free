@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
 
 from dataclasses import dataclass
@@ -23,24 +22,21 @@ from backend.free.api.chat.chat_recorder import (
 )
 from backend.free.api.chat.chat_service import make_token_info
 from backend.free.api.chat.chat_types import ChatMessage
-from backend.free.api.schemas import ChatResponse
 from backend.free.agent.tool_call_judge import _extract_file_path
 from backend.free.llm.editor_filename import derive_editor_filename_stem
 from backend.free.generation.orchestrator import LongFormOrchestrator
 from backend.free.generation.validators import remove_code_fences
-from fastapi import HTTPException
 
 from backend.free.api.chat.chat_stream_common import (
-    _cancel_flags,
-    _capture_stream_outcome,
-    _close_token_stream,
+    agent_layer_frame,
+    cancel_requested,
     _emit_stream_error,
     _emit_timing,
-    _log_chat_outcome,
+    _finish_stream_outcome,
     _make_step_queue_callback,
     _record_failed_generation,
-    _sync_chat_response,
     cancel_scope,
+    iter_tokens_with_keepalive,
     logger,
     rag_signals_from_chunks,
     sse,
@@ -90,7 +86,7 @@ async def _emit_long_form_init_steps(
 
     `agent_layer` → (file_output_mode 時) `long_form_file_mode` → `long_form_plan`。
     """
-    yield sse.agent_layer("meta_cognitive")
+    yield agent_layer_frame("meta_cognitive")
     if file_output_mode:
         file_path = _extract_file_path(query)
         yield sse.step({
@@ -278,6 +274,7 @@ async def _finalize_long_form_stream(
         delivered = text_output
     else:
         delivered = state.full_response
+    cancelled = cancel_requested(session_id)
     record_long_form_response(
         sess_state, delivered, messages, session_id,
         query, mode, state.tokens_generated, metrics,
@@ -285,10 +282,26 @@ async def _finalize_long_form_stream(
         rag_used=rag_used,
         rag_top1_score=rag_top1_score,
         # キャンセルで途中まで流した本文は経験に採らない / 切断は経験へ刻む。
-        cancelled=bool(_cancel_flags.get(session_id)),
+        cancelled=cancelled,
         truncated=state.truncated,
     )
     state.recorded = True
+
+    if cancelled:
+        # ユーザーが止めた生成の **途中の本文** を成果物として扱わない:
+        # ディスクへ書かず、エディタへ送らず、MDP episode の reward にも
+        # 使わない (WM / 履歴には残る)。以前は部分本文をそのまま書き出し、
+        # 部分本文の reward で episode を記録していた。
+        logger.info(
+            "Long-form stream cancelled by the user; skipping write/episode "
+            "(tokens=%d, session=%s)", state.tokens_generated, session_id,
+        )
+        _emit_timing(sess_state, timer, "long_form", state.tokens_generated, mode=mode)
+        yield sse.token_info(make_token_info(
+            messages, state.tokens_generated, context_size, instance_name,
+        ))
+        yield sse.done()
+        return
 
     # 長文経路も MDP episode を残す (agent_trace 互換)。従来は agent_trace を
     # 経由しないため MDP ingest (decision/failure ファクト) から長文ターンが
@@ -379,8 +392,11 @@ async def _finalize_long_form_stream(
         )
     if write_result:
         logger.debug("Long-form file write result: %s", write_result[:120])
+        # 書込み失敗 (``long_form_write_file`` は ``"Error: …"`` を返す) を
+        # 「done」で見せない。本文は生成できているので配信は続ける。
         yield sse.step({
-            "type": "task_result", "detail": write_result, "status": "done",
+            "type": "task_result", "detail": write_result,
+            "status": "failed" if write_result.startswith("Error") else "done",
         })
     _emit_timing(sess_state, timer, "long_form", state.tokens_generated, mode=mode)
     if state.truncated:
@@ -418,6 +434,8 @@ async def stream_long_form(
         t_start = time.monotonic()
         stream_state = _LongFormStreamState()
         outcome_success = False
+        # genuine error (except Exception) と client cancel を区別する。
+        errored = False
 
         # ファイル出力モード判定
         file_output_mode = bool(
@@ -518,35 +536,19 @@ async def stream_long_form(
                     _infer_output_extension(query) if file_output_mode else ""
                 ),
             )
-            aiter = token_gen.__aiter__()
-            pending: asyncio.Task[str] | None = None
             last_frame_at = time.monotonic()
-            while True:
-                if _cancel_flags.get(session_id):
-                    if pending is not None and not pending.done():
-                        pending.cancel()
-                    # orchestrator の generator を閉じて下位の生成を止める
-                    await _close_token_stream(token_gen)
-                    break
-                if pending is None:
-                    pending = asyncio.create_task(aiter.__anext__())
-                done, _ = await asyncio.wait(
-                    {pending}, timeout=DEFAULT_KEEPALIVE_INTERVAL_SEC,
-                )
-                if pending not in done:
-                    # 同一 `pending` を維持したまま keepalive を送出。
+            # キャンセル / クライアント切断時に orchestrator の generator を
+            # 閉じて下位の生成を止めるのは iter_tokens_with_keepalive が担う。
+            async for token in iter_tokens_with_keepalive(
+                token_gen, session_id, interval=DEFAULT_KEEPALIVE_INTERVAL_SEC,
+            ):
+                if token is None:
                     # 蓄積中の step + editor 逐次更新も流して進行を可視化する。
                     async for frame in _flush_with_editor():
                         yield frame
                     yield sse.keepalive()
                     last_frame_at = time.monotonic()
                     continue
-                try:
-                    token = pending.result()
-                except StopAsyncIteration:
-                    pending = None
-                    break
-                pending = None
 
                 step_frame_yielded = False
                 async for frame in _flush_with_editor():
@@ -578,8 +580,17 @@ async def stream_long_form(
                     yield sse.keepalive()
                     last_frame_at = time.monotonic()
 
-            # ``finish_reason=length`` の観測 (outcome を公開するストリームのみ)。
-            _capture_stream_outcome(token_gen, stream_state)
+            # ``finish_reason=length`` の観測。orchestrator.generate は素の async
+            # generator で outcome を持たないので (以前の _capture_stream_outcome は
+            # 常に no-op だった)、戦略が数えた切断ユニットから引く。
+            truncated_units = getattr(orchestrator, "truncated_units", 0)
+            truncation = getattr(orchestrator, "last_truncation", None)
+            if isinstance(truncated_units, int) and truncated_units > 0 and truncation is not None:
+                stream_state.truncated = True
+                stream_state.truncated_tokens = int(
+                    getattr(truncation, "tokens_generated", 0) or 0,
+                )
+                stream_state.truncated_max_tokens = getattr(truncation, "max_tokens", None)
 
             async for frame in _flush():
                 yield frame
@@ -602,7 +613,7 @@ async def stream_long_form(
             outcome_success = True
 
         except Exception as e:
-            logger.debug("Long-form stream error traceback", exc_info=True)
+            errored = True
             async for frame in _emit_stream_error(
                 state, e, timer=timer, agent_layer="long_form", mode=mode,
                 tokens_generated=stream_state.tokens_generated,
@@ -621,10 +632,13 @@ async def stream_long_form(
             # (実インシデント 2026-08-01 ライブ監査: 目標 300 字に対し 530 字
             # で警告を出したターンが success=True で記録された)。
             # meta_cognitive 経路が failed_tasks を畳み込むのと同じ扱いに揃える。
-            _log_chat_outcome(
-                state,
+            _finish_stream_outcome(
+                state, session_id,
                 started_at=t_start,
-                success=outcome_success and not stream_state.validation_errors,
+                completed=outcome_success,
+                # 品質ゲートの結果は完走とは別の軸で渡す (切断と混同しない)
+                success=not stream_state.validation_errors,
+                errored=errored,
                 tokens_out=stream_state.tokens_generated,
                 signals={
                     "agent_layer": "long_form",
@@ -635,115 +649,3 @@ async def stream_long_form(
             )
 
 
-async def sync_long_form(
-    orchestrator: LongFormOrchestrator, query: str, session_id: str,
-    mode: str, state: AppState,
-    instance_name: str, context_size: int,
-    messages: list[ChatMessage],
-    existing_content: str = "",
-    *,
-    timer: StageTimer | None = None,
-    private: bool = False,
-    output_target: str = "file",
-    prefetched_rag: list[tuple[str, float, str]] | None = None,
-    prefetched_rag_top_score: float | None = None,
-    file_context_block: str | None = None,
-) -> ChatResponse:
-    """長文生成の同期応答
-
-    ``output_target == "editor"`` の場合はディスク書込みをスキップし、
-    生成本文をそのまま ``ChatResponse.response`` として返す (フロント側で
-    エディタペインに流す前提)。
-    """
-    try:
-        full_response = ""
-        tokens_generated = 0
-
-        # ストリーミングと同じ意図検出をかける (出力モード一貫性のため)
-        file_output_mode = bool(
-            _WRITE_HINT_RE.search(query) and _extract_file_path(query)
-        )
-        long_form_mode = detect_long_form_mode(
-            query,
-            has_existing_content=bool(existing_content),
-            file_output_mode=file_output_mode,
-        )
-
-        if timer:
-            timer.start("llm_total_ms")
-            timer.start("llm_first_token_ms")
-        first_token_recorded = False
-
-        async for token in orchestrator.generate(
-            instruction=query,
-            session_id=session_id,
-            mode=mode,
-            existing_content=existing_content,
-            long_form_mode=long_form_mode,
-            prefetched_rag=prefetched_rag,
-            file_context_block=file_context_block,
-            # ドキュメント品質ゲートは実ファイル出力時のみ適用 (非 file は "")。
-            target_format=(
-                _infer_output_extension(query) if file_output_mode else ""
-            ),
-        ):
-            if not first_token_recorded and timer:
-                timer.stop("llm_first_token_ms")
-                first_token_recorded = True
-            full_response += token
-            tokens_generated += 1
-
-        if timer:
-            timer.stop("llm_total_ms")
-
-        metrics = getattr(orchestrator, "last_metrics", {})
-        # create の editor/file 出力は検証・修正済み assembled (last_code_output)
-        # を配信する (生ストリームの revise 二重追記を解消)。
-        is_code = getattr(orchestrator, "last_content_type", None) == "code"
-        code_output = getattr(orchestrator, "last_code_output", None)
-        text_output = getattr(orchestrator, "last_text_output", None)
-        if is_code and isinstance(code_output, str) and code_output:
-            full_response = code_output
-        elif (not is_code) and isinstance(text_output, str) and text_output:
-            # document_quality モード: 改稿済み確定本文 (revise 二重追記の解消)。
-            full_response = text_output
-        _lf_rag_used, _lf_rag_top1 = rag_signals_from_chunks(
-            prefetched_rag, prefetched_rag_top_score,
-        )
-        record_long_form_response(
-            state, full_response, messages, session_id,
-            query, mode, tokens_generated, metrics,
-            private=private,
-            rag_used=_lf_rag_used,
-            rag_top1_score=_lf_rag_top1,
-        )
-
-        if getattr(orchestrator, "last_needed_clarification", False) is True:
-            # 主題不明で確認質問を返しただけの応答。full_response は確認質問文
-            # なので、そのまま file 書込みしてしまうと確認質問がドキュメントに
-            # なってしまう (2026-07-22 発見のトピック混入バグの対策で追加)。
-            write_result = None
-        elif output_target == "editor":
-            write_result = None
-            # コード生成時は editor 表示前に markdown コードフェンスを除去。
-            if is_code:
-                full_response = remove_code_fences(full_response)
-        else:
-            write_result = await long_form_write_file(
-                query, full_response, state,
-            )
-
-        return _sync_chat_response(
-            state, timer,
-            agent_layer="meta_cognitive",
-            text=write_result if write_result else full_response,
-            tokens=tokens_generated,
-            messages=messages,
-            session_id=session_id,
-            instance_name=instance_name,
-            context_size=context_size,
-            mode=mode,
-        )
-    except Exception as e:
-        logger.error("Long-form error: %s", e)
-        raise HTTPException(status_code=503, detail=str(e))

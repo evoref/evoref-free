@@ -107,6 +107,25 @@ export const tokenInfo = writable<TokenInfo>({ used: 0, limit: 4096, pct: 0, ins
 /** ストリーミング中フラグ */
 export const isStreaming = writable<boolean>(false);
 
+/**
+ * 進行中ストリームの中断関数。ChatInput が送信時に登録し、完了時に外す。
+ *
+ * AbortController は ChatInput のローカル変数なので、Sidebar の「新しい
+ * チャット」やモード切替からは止められなかった。`clearMessages` が生成中に
+ * 呼ばれると messages が空になり、その後届くトークンは無言で捨てられ、
+ * `isStreaming` はバックエンドが完走するまで true のまま送信をブロックする。
+ */
+let streamAbort: (() => void) | null = null;
+
+export function registerStreamAbort(abort: (() => void) | null): void {
+	streamAbort = abort;
+}
+
+/** 進行中のストリームがあれば中断する (無ければ no-op)。 */
+export function abortActiveStream(): void {
+	streamAbort?.();
+}
+
 /** 添付ファイル一覧 */
 export const attachedFiles = writable<File[]>([]);
 
@@ -293,6 +312,10 @@ export async function switchMode(newMode: string): Promise<void> {
 	const current = get(currentMode);
 	if (current === newMode) return;
 	if (get(modeRestartStatus) === 'restarting') return;
+	// 生成中の切替は messages を差し替えて残りのトークンを別モードのバッファへ
+	// 流し込む (Sidebar のセレクトは生成中 disabled にしているが、履歴からの
+	// 再開など他の入口もここを通る)。
+	if (get(isStreaming)) return;
 
 	// バックエンド API 呼び出し（UI更新前）
 	modeRestartStatus.set('restarting');
@@ -339,8 +362,10 @@ export async function switchMode(newMode: string): Promise<void> {
 	}
 }
 
-/** 会話履歴クリア（現在のモードのみ） */
+/** 会話履歴クリア（現在のモードのみ）。生成中なら先に中断する。 */
 export function clearMessages(): void {
+	// 中断は旧 session_id に対して送る必要があるので、ID を回す前に呼ぶ。
+	abortActiveStream();
 	const current = get(currentMode);
 	messages.set([]);
 	modeMessages[current] = [];
@@ -348,6 +373,22 @@ export function clearMessages(): void {
 	modeSessions[current] = newSessionId;
 	tokenInfo.set({ used: 0, limit: 4096, pct: 0, instance_name: 'evoref' });
 	sessionId.set(newSessionId);
+}
+
+/**
+ * 保存済みセッションを現在のモードへ復元する (履歴の「続きから再開」)。
+ *
+ * `messages` / `sessionId` だけを set すると、モード別バッファ
+ * (`modeMessages` / `modeSessions`) が古いままになり、次のモード往復で
+ * 復元前の session_id とメッセージが戻ってくる (復元した会話が黙って消える)。
+ * 4 つを一緒に更新する。
+ */
+export function restoreSession(sid: string, restored: ChatMessage[]): void {
+	const current = get(currentMode);
+	modeMessages[current] = restored;
+	modeSessions[current] = sid;
+	messages.set(restored);
+	sessionId.set(sid);
 }
 
 /** 添付ファイル追加 */

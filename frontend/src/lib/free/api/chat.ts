@@ -2,7 +2,8 @@
 
 import { STREAM_CHUNK_TIMEOUT_MS } from '$lib/free/constants';
 import { loggedFetch as fetch, devLog, IS_DEV } from '$lib/devlog';
-import { BASE_URL, parseApiError } from './_client';
+import { BASE_URL, cancelStreamingOperation, parseApiError } from './_client';
+import { readSseFrames, SSE_FRAME_TYPES, type SSEFrameType } from './sse_frames';
 
 export interface TokenInfo {
 	used: number;
@@ -75,6 +76,7 @@ export interface ChatStreamEvent {
 		| 'done'
 		| 'error'
 		| 'step'
+		| 'agent_layer'
 		| 'rag_debug'
 		| 'sources'
 		| 'editor_route'
@@ -84,6 +86,10 @@ export interface ChatStreamEvent {
 	token?: string;
 	token_info?: TokenInfo;
 	error?: string;
+	/** 応答元レイヤー (ストリーム冒頭で 1 度) */
+	agent_layer?: string;
+	/** このターンの識別子。`cancelChat` に添えてこのリクエストだけを止める */
+	request_id?: string;
 	step?: ChatStreamStep;
 	rag_debug?: RagDebugInfo;
 	sources?: SourcesInfo;
@@ -143,94 +149,44 @@ export async function* chatStream(
 		return;
 	}
 
-	const reader = res.body?.getReader();
-	if (!reader) {
+	if (!res.body) {
 		if (IS_DEV) eventCounts.error++;
 		yield { type: 'error', error: 'No response body' };
 		return;
 	}
 
-	const decoder = new TextDecoder();
-	let buffer = '';
 	let parseErrorCount = 0;
 
 	try {
-		while (true) {
-			const { done, value } = await Promise.race([
-				reader.read(),
-				new Promise<never>((_, reject) =>
-					setTimeout(() => reject(new Error('Stream chunk timeout')), STREAM_CHUNK_TIMEOUT_MS)
-				)
-			]);
-			if (done) break;
+		for await (const frame of readSseFrames(res.body!, {
+			chunkTimeoutMs: STREAM_CHUNK_TIMEOUT_MS,
+			onParseError: (raw, e) => {
+				parseErrorCount++;
+				console.warn(`[SSE Parse Error] count=${parseErrorCount} data="${raw.slice(0, 200)}"`, e);
+			}
+		})) {
 			if (IS_DEV && !firstByteRecorded) {
 				firstByteMs = performance.now() - streamStart;
 				firstByteRecorded = true;
 				devLog('SSE:first-byte', `/chat first byte in ${firstByteMs.toFixed(1)}ms`);
 			}
-
-			buffer += decoder.decode(value, { stream: true });
-			const lines = buffer.split('\n');
-			buffer = lines.pop() ?? '';
-
-			for (const line of lines) {
-				if (!line.startsWith('data: ')) continue;
-				const data = line.slice(6).trim();
-				if (data === '[DONE]') {
-					if (IS_DEV) {
-						eventCounts.done++;
-						const totalMs = performance.now() - streamStart;
-						devLog(
-							'SSE:done',
-							`/chat completed in ${totalMs.toFixed(1)}ms`,
-							{ connectMs, firstByteMs, totalMs, eventCounts, parseErrorCount }
-						);
-					}
-					yield { type: 'done' };
-					return;
+			if (frame.done) {
+				if (IS_DEV) {
+					eventCounts.done++;
+					const totalMs = performance.now() - streamStart;
+					devLog(
+						'SSE:done',
+						`/chat completed in ${totalMs.toFixed(1)}ms`,
+						{ connectMs, firstByteMs, totalMs, eventCounts, parseErrorCount }
+					);
 				}
-				try {
-					const parsed = JSON.parse(data);
-					if (parsed.token !== undefined) {
-						if (IS_DEV) eventCounts.token++;
-						yield { type: 'token', token: parsed.token };
-					}
-					if (parsed.token_info) {
-						if (IS_DEV) eventCounts.token_info++;
-						yield { type: 'token_info', token_info: parsed.token_info };
-					}
-					if (parsed.error) {
-						if (IS_DEV) eventCounts.error++;
-						yield { type: 'error', error: parsed.error };
-					}
-					if (parsed.step) {
-						if (IS_DEV) eventCounts.step++;
-						yield { type: 'step', step: parsed.step };
-					}
-					if (parsed.rag_debug) {
-						if (IS_DEV) eventCounts.rag_debug++;
-						yield { type: 'rag_debug', rag_debug: parsed.rag_debug };
-					}
-					if (parsed.sources) {
-						yield { type: 'sources', sources: parsed.sources };
-					}
-					if (parsed.input_truncated) {
-						yield { type: 'input_truncated', input_truncated: parsed.input_truncated };
-					}
-					if (parsed.output_truncated) {
-						yield { type: 'output_truncated', output_truncated: parsed.output_truncated };
-					}
-					if (parsed.editor_route) {
-						yield { type: 'editor_route', editor_route: parsed.editor_route };
-					}
-					if (parsed.editor_code) {
-						yield { type: 'editor_code', editor_code: parsed.editor_code };
-					}
-				} catch (e) {
-					parseErrorCount++;
-					console.warn(`[SSE Parse Error] count=${parseErrorCount} data="${data.slice(0, 200)}"`, e);
-				}
+				yield { type: 'done' };
+				return;
 			}
+			const event = toChatStreamEvent(frame.data);
+			if (!event) continue;
+			if (IS_DEV) eventCounts[event.type] = (eventCounts[event.type] ?? 0) + 1;
+			yield event;
 		}
 		if (IS_DEV) {
 			const totalMs = performance.now() - streamStart;
@@ -254,9 +210,66 @@ export async function* chatStream(
 		} else {
 			throw e;
 		}
-	} finally {
-		reader.releaseLock();
 	}
+}
+
+/**
+ * 1 フレームの JSON をチャットイベントへ写す。
+ *
+ * `type` (バックエンドが付ける) を優先し、無ければ本体キーで判定する (旧バックエンド互換)。
+ * 未知の `type` は無視する — フレームを足しても消費側が落ちない。
+ */
+export function toChatStreamEvent(parsed: Record<string, unknown>): ChatStreamEvent | null {
+	const kind = (typeof parsed.type === 'string' ? parsed.type : inferFrameKind(parsed)) as
+		| SSEFrameType
+		| undefined;
+	switch (kind) {
+		case 'token':
+			return { type: 'token', token: String(parsed.token ?? '') };
+		case 'token_info':
+			return { type: 'token_info', token_info: parsed.token_info as TokenInfo };
+		case 'agent_layer':
+			return {
+				type: 'agent_layer',
+				agent_layer: String(parsed.agent_layer ?? ''),
+				request_id: typeof parsed.request_id === 'string' ? parsed.request_id : undefined
+			};
+		case 'error': {
+			const err = parsed.error;
+			const message =
+				typeof err === 'string'
+					? err
+					: String((err as { message?: string } | undefined)?.message ?? 'error');
+			return { type: 'error', error: message };
+		}
+		case 'step':
+			return { type: 'step', step: parsed.step as ChatStreamStep };
+		case 'rag_debug':
+			return { type: 'rag_debug', rag_debug: parsed.rag_debug as RagDebugInfo };
+		case 'sources':
+			return { type: 'sources', sources: parsed.sources as SourcesInfo };
+		case 'input_truncated':
+			return { type: 'input_truncated', input_truncated: parsed.input_truncated as InputTruncatedInfo };
+		case 'output_truncated':
+			return {
+				type: 'output_truncated',
+				output_truncated: parsed.output_truncated as OutputTruncatedInfo
+			};
+		case 'editor_route':
+			return { type: 'editor_route', editor_route: parsed.editor_route as { target: 'editor' | 'chat' } };
+		case 'editor_code':
+			return { type: 'editor_code', editor_code: parsed.editor_code as EditorCodeArtifact };
+		default:
+			return null;
+	}
+}
+
+/** `type` を持たない旧フレームの種別を本体キーから推定する */
+function inferFrameKind(parsed: Record<string, unknown>): string | undefined {
+	for (const k of SSE_FRAME_TYPES) {
+		if (parsed[k] !== undefined) return k;
+	}
+	return undefined;
 }
 
 /** 応答への明示評価 (👎 / 👍 / 取り消し)。query はその応答を生んだユーザー発話 */
@@ -281,16 +294,19 @@ export async function sendTurnFeedback(
 	}
 }
 
-/** チャットストリーミングをキャンセル */
-export async function cancelChat(sessionId: string): Promise<boolean> {
+/**
+ * チャットストリーミングをキャンセル (best-effort。通信失敗も false)。
+ *
+ * `requestId` (`agent_layer` フレームの `request_id`) があればそのリクエストだけを止める。
+ * 無ければセッションの進行中リクエスト全部 (最初のフレームが届く前のキャンセル)。
+ */
+export async function cancelChat(sessionId: string, requestId?: string): Promise<boolean> {
 	try {
-		const res = await fetch(`${BASE_URL}/chat/cancel`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ session_id: sessionId })
-		});
-		if (!res.ok) return false;
-		const data = await res.json();
+		const data = await cancelStreamingOperation(
+			'/chat/cancel',
+			sessionId,
+			requestId ? { request_id: requestId } : undefined
+		);
 		return data.cancelled ?? false;
 	} catch {
 		return false;

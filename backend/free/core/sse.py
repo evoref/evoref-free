@@ -3,7 +3,11 @@
 各ストリーミング関数（reactive / deliberative / meta_cognitive / long_form）で
 個別に実装されていた SSE フレーム生成を統一する。
 
-フレーム形式は c_06_api_specification.md §3 に準拠。
+フレーム形式は c_06_api_specification.md §3 に準拠。全フレームはトップレベルに
+``type`` (フレーム種別 = ビルダーのメソッド名) を持つ。種別ごとの本体キー
+(``token`` / ``step`` / …) も従来どおり残す — 旧クライアント (CLI /
+Pro の EventSource 消費側) はキーの有無で識別しているため、``type`` は
+**追加のみ** で互換を壊さない。
 """
 
 import json
@@ -11,11 +15,19 @@ import json
 from backend.i18n_helper import msg as i18n_msg
 
 
+def _frame(kind: str, payload: dict) -> str:
+    """``data: <json>\\n\\n`` 1 行のフレームにする。``type`` を先頭に付ける。"""
+    body = {"type": kind, **payload}
+    return f"data: {json.dumps(body, ensure_ascii=False)}\n\n"
+
+
 class SSEFrameBuilder:
     """SSE フレーム生成の統一ビルダー
 
     全ストリーミング関数が共有するフレーム生成ロジックを一元管理する。
     フレーム種別ごとにメソッドを提供し、JSON 構造の不整合を防止する。
+    フレームの一覧は :data:`FRAME_TYPES` (フロントの union と契約テストで
+    突き合わせる)。
 
     Usage:
         sse = SSEFrameBuilder()
@@ -32,7 +44,7 @@ class SSEFrameBuilder:
         Args:
             text: 生成されたトークン（1〜数文字）
         """
-        return f"data: {json.dumps({'token': text}, ensure_ascii=False)}\n\n"
+        return _frame("token", {"token": text})
 
     @staticmethod
     def step(step_data: dict) -> str:
@@ -41,16 +53,22 @@ class SSEFrameBuilder:
         Args:
             step_data: {"type": str, "detail": str, "status": str, ...}
         """
-        return f"data: {json.dumps({'step': step_data}, ensure_ascii=False)}\n\n"
+        return _frame("step", {"step": step_data})
 
     @staticmethod
-    def agent_layer(layer: str) -> str:
-        """エージェント層フレーム: 応答元レイヤーの通知
+    def agent_layer(layer: str, request_id: str | None = None) -> str:
+        """エージェント層フレーム: 応答元レイヤーの通知 (ストリーム冒頭で 1 度)
 
         Args:
             layer: "reactive" | "deliberative" | "meta_cognitive"
+            request_id: このターンの識別子 (= trace_id)。フロントは
+                ``/api/chat/cancel`` にこれを添えて **このリクエストだけ** を
+                止める (同一セッションで 2 本走っても互いに干渉しない)。
         """
-        return f"data: {json.dumps({'agent_layer': layer}, ensure_ascii=False)}\n\n"
+        payload: dict = {"agent_layer": layer}
+        if request_id:
+            payload["request_id"] = request_id
+        return _frame("agent_layer", payload)
 
     @staticmethod
     def editor_route(target: str) -> str:
@@ -62,7 +80,7 @@ class SSEFrameBuilder:
         Args:
             target: "editor" (既定、エディタへ流す) | "chat" (チャットに表示)
         """
-        return f"data: {json.dumps({'editor_route': {'target': target}}, ensure_ascii=False)}\n\n"
+        return _frame("editor_route", {"editor_route": {"target": target}})
 
     @staticmethod
     def editor_code(
@@ -86,15 +104,14 @@ class SSEFrameBuilder:
             filename: 推定ファイル名（未指定時は ``None``）
             partial: 生成途中の逐次更新フレームか (既定 ``False`` = 確定本文)
         """
-        payload = {
+        return _frame("editor_code", {
             "editor_code": {
                 "content": content,
                 "language": language,
                 "filename": filename,
                 "partial": partial,
             }
-        }
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        })
 
     @staticmethod
     def token_info(info: dict) -> str:
@@ -103,7 +120,7 @@ class SSEFrameBuilder:
         Args:
             info: {"used": int, "limit": int, "pct": int, "instance_name"?: str}
         """
-        return f"data: {json.dumps({'token_info': info}, ensure_ascii=False)}\n\n"
+        return _frame("token_info", {"token_info": info})
 
     @staticmethod
     def input_truncated(original_chars: int, sent_chars: int) -> str:
@@ -120,13 +137,12 @@ class SSEFrameBuilder:
             original_chars: ユーザーが送った元の文字数
             sent_chars: 実際にモデルへ渡された文字数
         """
-        payload = {
+        return _frame("input_truncated", {
             "input_truncated": {
                 "original_chars": original_chars,
                 "sent_chars": sent_chars,
             },
-        }
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        })
 
     @staticmethod
     def output_truncated(tokens_generated: int, max_tokens: int | None) -> str:
@@ -142,13 +158,12 @@ class SSEFrameBuilder:
             tokens_generated: 切断されるまでに生成された生トークン数
             max_tokens: このリクエストで指定した上限 (未指定なら ``None``)
         """
-        payload = {
+        return _frame("output_truncated", {
             "output_truncated": {
                 "tokens_generated": tokens_generated,
                 "max_tokens": max_tokens,
             },
-        }
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        })
 
     @staticmethod
     def rag_debug(chunks: list[dict], search_time_ms: float) -> str:
@@ -158,13 +173,12 @@ class SSEFrameBuilder:
             chunks: [{"source": str, "score": float, "preview": str}, ...]
             search_time_ms: 検索パイプラインの所要時間（ミリ秒）
         """
-        payload = {
+        return _frame("rag_debug", {
             "rag_debug": {
                 "chunks": chunks,
                 "search_time_ms": round(search_time_ms, 1),
             }
-        }
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        })
 
     @staticmethod
     def sources(items: list[dict]) -> str:
@@ -175,8 +189,7 @@ class SSEFrameBuilder:
                      "package_id", "package_name", "doc_id", "heading",
                      "score": float, "preview": str}, ...]
         """
-        payload = {"sources": {"items": items}}
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        return _frame("sources", {"sources": {"items": items}})
 
     @staticmethod
     def error(msg: str) -> str:
@@ -193,7 +206,7 @@ class SSEFrameBuilder:
             msg: エラーメッセージ
         """
         text = (msg or "").strip() or i18n_msg("error.chat.stream_failed")
-        return f"data: {json.dumps({'error': text}, ensure_ascii=False)}\n\n"
+        return _frame("error", {"error": text})
 
     @staticmethod
     def error_with_code(code: str, message: str, **context) -> str:
@@ -204,8 +217,9 @@ class SSEFrameBuilder:
             message: エラーメッセージ
             **context: 追加のコンテキスト情報
         """
-        payload = {"error": {"code": code, "message": message, "context": context}}
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        return _frame("error", {
+            "error": {"code": code, "message": message, "context": context},
+        })
 
     @staticmethod
     def result(payload: dict) -> str:
@@ -217,7 +231,7 @@ class SSEFrameBuilder:
         Args:
             payload: API レスポンスと同等の辞書
         """
-        return f"data: {json.dumps({'result': payload}, ensure_ascii=False)}\n\n"
+        return _frame("result", {"result": payload})
 
     @staticmethod
     def done() -> str:
@@ -232,3 +246,12 @@ class SSEFrameBuilder:
         SSE 仕様のコメント行として送信する。
         """
         return ": keepalive\n\n"
+
+
+#: JSON フレームの ``type`` 一覧 (``done`` / ``keepalive`` は JSON ではない)。
+#: フロントの ``ChatStreamEvent['type']`` union と契約テストで突き合わせる。
+FRAME_TYPES: tuple[str, ...] = (
+    "token", "step", "agent_layer", "editor_route", "editor_code",
+    "token_info", "input_truncated", "output_truncated", "rag_debug",
+    "sources", "error", "result",
+)

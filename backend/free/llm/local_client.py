@@ -117,6 +117,11 @@ SLOT_CHAT = 0
 SLOT_BACKGROUND = 1
 #: ツール分類器 (層 5.9) 専用スロット。``llama.slots >= 3`` のときだけ使う。
 SLOT_CLASSIFIER = 2
+#: long_form のユニット生成専用スロット。``llama.slots >= 4`` のときだけ使い、
+#: 未満ならチャットスロットへ倒れる (:attr:`LocalClient.longform_slot`)。
+SLOT_LONG_FORM = 3
+#: ``llama.slots: auto`` で launcher が ``/props`` を返さないとき (遅延接続) の床。
+DEFAULT_SLOTS = 3
 
 __all__ = [
     "LocalClient",
@@ -126,6 +131,8 @@ __all__ = [
     "SLOT_CHAT",
     "SLOT_BACKGROUND",
     "SLOT_CLASSIFIER",
+    "SLOT_LONG_FORM",
+    "DEFAULT_SLOTS",
 ]
 
 # ストリーミング設定
@@ -634,6 +641,22 @@ class LocalClient(BaseHTTPClient):
             return SLOT_CLASSIFIER
         return self.background_slot
 
+    @property
+    def longform_slot(self) -> int:
+        """long_form のユニット生成用スロット ID。4 スロット未満ならチャットスロット。
+
+        ユニットのプロンプト (system 無し) をチャットスロットで回すと、スロット 0
+        の接頭辞キャッシュを上書きし、**長文ターンの直後のチャットターンが全再評価**
+        になる (2026-09-17 ライブ監査: prompt_n 3116 / cache 0% / TTFT 49 秒)。
+        背景スロットへは移せない — :meth:`_is_chat_slot` が「ユーザー応答進行中」
+        の門を掛ける唯一の判定で、背景に載せると sleep-time / aux と並んで
+        ユーザーが待たされる。4 本目を切るとチャット接頭辞が残る。
+        このスロットもユーザー応答パス (:meth:`_is_chat_slot` が真) として扱う。
+        """
+        if self._slots >= 4:
+            return SLOT_LONG_FORM
+        return self.chat_slot
+
     def _record_prompt_cache(
         self, data: dict, *, slot: int | None = None,
     ) -> dict | None:
@@ -1091,8 +1114,15 @@ class LocalClient(BaseHTTPClient):
 
         ``_slots < 2`` の構成では ``chat_slot`` が -1 (自動割当) になり背景と
         区別できない。その場合はゲートを立てない — 立てると背景が永久に待つ。
+
+        long_form 専用スロット (:attr:`longform_slot`、4 スロット以上) も
+        ユーザー応答なのでチャットスロットと同じ扱い。
         """
-        return self._slots >= 2 and id_slot == SLOT_CHAT
+        if self._slots < 2:
+            return False
+        if id_slot == SLOT_CHAT:
+            return True
+        return self._slots >= 4 and id_slot == SLOT_LONG_FORM
 
     async def count_tokens(self, text: str) -> int | None:
         """llama-server /tokenize でテキストの実トークン数を取得。

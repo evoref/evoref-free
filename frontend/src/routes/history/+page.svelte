@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { t } from '$lib/i18n';
 	import PageLayout from '$lib/free/components/PageLayout.svelte';
-	import { messages, sessionId, switchMode, nextMessageId } from '$lib/free/stores/chat';
+	import { restoreSession, switchMode, nextMessageId } from '$lib/free/stores/chat';
 	import type { ChatMessage } from '$lib/free/stores/chat';
 	import { isPro } from '$lib/edition';
 	import { groupByDate } from '$lib/free/utils/history';
@@ -97,10 +97,10 @@
 		}));
 		// Free では create セッションを chat に丸める (Sidebar の露出方針に合わせる)。
 		// switchMode は await 後にモード別バッファで messages/sessionId を上書き
-		// するため、復元値が勝つよう先に await してから set する。
+		// するため、復元値が勝つよう先に await してから復元する (モード別
+		// バッファも一緒に更新しないと次のモード往復で復元前の状態に戻る)。
 		await switchMode(isPro ? detail.mode : 'chat');
-		messages.set(restored);
-		sessionId.set(detail.session_id);
+		restoreSession(detail.session_id, restored);
 		goto('/');
 	}
 

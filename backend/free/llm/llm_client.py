@@ -101,6 +101,11 @@ class LLMClient:
         return self.local.classifier_slot
 
     @property
+    def longform_slot(self) -> int:
+        """long_form のユニット生成用スロット (LocalClient.longform_slot の委譲)。"""
+        return self.local.longform_slot
+
+    @property
     def classifier_slot_prefix(self) -> str | None:
         """分類器スロットの共有接頭辞 (LocalClient への委譲)。"""
         return self.local.classifier_slot_prefix

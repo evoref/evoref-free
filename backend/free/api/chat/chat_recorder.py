@@ -6,6 +6,8 @@ import asyncio
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -127,15 +129,37 @@ def judge_long_form_success(
     )
 
 
-# セッション別の開始時刻（初回リクエスト時に記録）
-_session_started: dict[str, str] = {}
+@dataclass
+class SessionLedger:
+    """セッション寿命の台帳 (応答パス側)。WM の窓とは独立に会話全体を持つ。
 
-# セッション別の全ターン蓄積（WM のエビクションに依存しない完全な履歴）
-_session_turns: dict[str, list[dict]] = {}
+    以前は開始時刻 / 全ターン / private 印 / 出典 の 4 つが別々のモジュール辞書で、
+    片付けの経路 (明示終了 / LRU 押し出し) ごとに漏れが出ていた。1 つの
+    レコードにまとめ、寿命は :func:`clear_session_data` (= WM 台帳の
+    ``on_drop``) だけが握る。
+    """
 
-# private ターンを 1 度でも含んだセッション ID
-# (``memory.private.history_storage: skip`` でセッションごと永続化を落とす判定に使う)
-_session_had_private: set[str] = set()
+    #: 初回リクエスト時の開始時刻 (ISO)。保存先ファイル名を決める。
+    started_at: str | None = None
+    #: 全ターンの蓄積 (WM のエビクションに依存しない完全な履歴)。
+    turns: list[dict] = field(default_factory=list)
+    #: private ターンを 1 度でも含んだか (``memory.private.history_storage: skip`` 用)。
+    had_private: bool = False
+    #: 会話単位の根拠台帳 (``[参考情報]`` に注入した資料の所在、ターン順)。
+    sources: list[dict] = field(default_factory=list)
+    #: 最後に保存した ``SessionData``。**履歴保存ワーカーだけが触る** —
+    #: 毎ターン保存前にファイルを読み直さないためのキャッシュ。
+    saved: "SessionData | None" = None
+
+
+_ledgers: dict[str, SessionLedger] = {}
+
+
+def _ledger(session_id: str, *, create: bool = True) -> SessionLedger | None:
+    led = _ledgers.get(session_id)
+    if led is None and create:
+        led = _ledgers[session_id] = SessionLedger()
+    return led
 
 #: 履歴ファイル書き出し用の 1 スレッド executor。``HistoryManager.save_session``
 #: はセッション JSON 全体 + index.json を毎ターン書き直す同期 I/O で、非同期
@@ -178,14 +202,12 @@ def _accumulate_turn(
     3 キーだけで、**履歴から回帰タスクを組み直せなかった** (2026-09-05 監査)。
     """
     if private:
-        _session_had_private.add(session_id)
+        _ledger(session_id).had_private = True
         logger.debug(
             "accumulate skipped (private turn): role=%s, session=%s, len=%d",
             role, session_id, len(content),
         )
         return
-    if session_id not in _session_turns:
-        _session_turns[session_id] = []
     entry: dict = {
         "role": role,
         "content": content,
@@ -197,7 +219,7 @@ def _accumulate_turn(
         entry["trace_id"] = trace_id
     if meta:
         entry["meta"] = {k: v for k, v in meta.items() if v not in (None, "", [], {})}
-    _session_turns[session_id].append(entry)
+    _ledger(session_id).turns.append(entry)
 
 
 def accumulate_user_turn(
@@ -208,7 +230,7 @@ def accumulate_user_turn(
 
     応答パスの入口 (``prepare_memory_context`` が WM へ積んだ直後) から呼ぶ。
     以前は ``record_*`` の末尾でしか積んでいなかったため、生成が失敗 /
-    タイムアウトしたターンは WM には居るのに履歴 (``_session_turns``) には
+    タイムアウトしたターンは WM には居るのに履歴 (台帳の ``turns``) には
     無い、という食い違いが起きていた。
 
     冪等性: 直前に積まれたターンが同じ user 発話なら二重に積まない。
@@ -217,14 +239,13 @@ def accumulate_user_turn(
     1 回に畳まれる (許容)。
     """
     # 新しいターンの入口。前ターンの注入 id を必ず落とす (c_16 §5.5)。
-    _turn_evidence_ids.pop(session_id, None)
-    _turn_fewshot_ids.pop(session_id, None)
-    _turn_rag_meta.pop(session_id, None)
+    open_turn(session_id)
     if private:
         _accumulate_turn(session_id, "user", user_query, private=True)
         return
     _ensure_session_restored(session_id)
-    turns = _session_turns.get(session_id)
+    led = _ledger(session_id, create=False)
+    turns = led.turns if led is not None else None
     if turns and turns[-1].get("role") == "user" and turns[-1].get("content") == user_query:
         return
     _accumulate_turn(
@@ -232,11 +253,11 @@ def accumulate_user_turn(
     )
 
 
-def _ensure_session_restored(session_id: str, mgr=None) -> None:
+def _ensure_session_restored(session_id: str, mgr=None) -> bool:
     """再起動を跨いだセッションの開始時刻とターン列を索引 / ファイルから戻す。
 
     保存先ファイル名は開始時刻から決まる (``HistoryManager._resolve_session_path``)。
-    プロセスが再起動すると ``_session_started`` / ``_session_turns`` は空になり、
+    プロセスが再起動すると 台帳 (``SessionLedger``) は空になり、
     同じ session_id の続きが **別ファイル** に書かれ、索引は session_id で置換
     されるため旧ファイルが孤児になっていた。既知のセッションなら開始時刻と
     既存ターンを引き継ぎ、同じファイルへ追記する形にする。
@@ -244,28 +265,39 @@ def _ensure_session_restored(session_id: str, mgr=None) -> None:
     ``mgr=None`` のときは **既に構築済みのシングルトンだけ** を使う
     (``get_history_manager`` の初回構築は checkpoint 昇格などの副作用を持つ
     ので、応答パスの入口からは起こさない)。保存側は自分の ``mgr`` を渡す。
+
+    Returns:
+        ``False`` = 索引には在るのにファイルが読めなかった (一過性の I/O 失敗
+        等)。このとき開始時刻は **記録しない** — 以前は先に記録していたため、
+        読めなかったターンは二度と復元を試みず、次の保存が同じファイルを
+        新しいターンだけで上書きして旧ターンを失っていた。呼出側 (保存) は
+        このターンの保存を見送り、次のターンで復元からやり直す。
     """
-    if session_id in _session_started:
-        return
+    led = _ledger(session_id)
+    if led.started_at:
+        return True
     if mgr is None:
         mgr = _history_manager_module._manager_cache
         if mgr is None:
-            return
+            return True
     try:
         started = mgr.get_session_started_at(session_id)
     except Exception as exc:
         logger.debug("history lookup failed for %s: %s", session_id, exc)
-        return
+        return True
     if not isinstance(started, str) or not started:
-        return
-    _session_started[session_id] = started
+        return True
     try:
         session = mgr.get_session(session_id)
     except Exception as exc:
-        logger.debug("history load failed for %s: %s", session_id, exc)
-        return
+        logger.warning(
+            "history load failed for %s (save deferred to the next turn): %s",
+            session_id, exc,
+        )
+        return False
+    led.started_at = started
     if session is None or not session.turns:
-        return
+        return True
     restored: list[dict] = []
     for t in session.turns:
         entry = {"role": t.get("role", "user"), "content": t.get("content", "")}
@@ -278,11 +310,12 @@ def _ensure_session_restored(session_id: str, mgr=None) -> None:
             if (value := t.get(key)) not in (None, ""):
                 entry[key] = value
         restored.append(entry)
-    _session_turns[session_id] = restored + list(_session_turns.get(session_id) or [])
+    led.turns = restored + list(led.turns)
     logger.info(
         "Restored %d turn(s) of session %s from history (started_at=%s)",
         len(restored), session_id, started,
     )
+    return True
 
 
 def session_turn_count(session_id: str) -> int:
@@ -296,7 +329,8 @@ def session_turn_count(session_id: str) -> int:
     応答パスから読むと「いまのターン」がすでに 1 と数えられている
     (:func:`count_term_in_session` と同じ契約)。
     """
-    return len(_session_turns.get(session_id) or ())
+    led = _ledger(session_id, create=False)
+    return len(led.turns) if led is not None else 0
 
 
 def count_term_in_session(session_id: str, term: str) -> int:
@@ -314,48 +348,70 @@ def count_term_in_session(session_id: str, term: str) -> int:
     """
     if not term:
         return 0
-    turns = list(_session_turns.get(session_id) or ())
+    led = _ledger(session_id, create=False)
+    turns = list(led.turns) if led is not None else []
     if turns and str(turns[-1].get("role") or "") == "user":
         turns = turns[:-1]
     return sum(str(turn.get("content") or "").count(term) for turn in turns)
 
 
 def clear_session_data(session_id: str) -> None:
-    """セッション切替時にセッション固有データをクリーンアップ"""
-    _session_started.pop(session_id, None)
-    _session_turns.pop(session_id, None)
-    _session_had_private.discard(session_id)
-    _turn_evidence_ids.pop(session_id, None)
-    _turn_fewshot_ids.pop(session_id, None)
-    _turn_rag_meta.pop(session_id, None)
-    _session_sources.pop(session_id, None)
+    """セッション終了 / 台帳の LRU 押し出し時にセッション固有データをクリーンアップ"""
+    _ledgers.pop(session_id, None)
+    rec = _turn_var.get()
+    if rec is not None and rec.session_id == session_id:
+        _turn_var.set(None)
 
 
-#: セッション → **今のターンで実際に注入した** Evidence の ``<store>:<id>``
-#: (c_16 §5.5)。プロンプト組み立て側 (``chat._build_messages_with_search`` /
-#: 軽量パス) が :func:`set_turn_evidence_ids` で置き、``record_*`` が
-#: :func:`_active_gen_config` 経由で経験へ刻む。
-#:
-#: kwarg で 10 箇所の ``record_*`` 呼出へ通さないのは、注入の決まる場所
-#: (プロンプト組み立て) と記録の場所 (応答完了後) の間に、経路ごとに違う
-#: 5 種類のディスパッチが挟まるため。``accumulate_user_turn`` (ターンの入口)
-#: で必ず消えるので、注入しなかったターンが前のターンの id を引き継がない。
-_turn_evidence_ids: dict[str, list[str]] = {}
+@dataclass
+class TurnRecord:
+    """このターン (= 1 リクエスト) の間だけ生きる観測の受け皿。
+
+    プロンプト組み立て側 (``chat._build_messages_with_search`` / 軽量パス) が
+    注入した Evidence id / 検索の副情報 / few-shot 例の id を置き、``record_*``
+    が :func:`_active_gen_config` 経由で経験へ刻む。kwarg で 10 箇所の
+    ``record_*`` 呼出へ通さないのは、注入の決まる場所と記録の場所の間に、
+    経路ごとに違う 5 種類のディスパッチが挟まるため。
+
+    以前はセッション id をキーにしたモジュール辞書で、同一セッションで
+    2 ターンが並走すると互いに上書きした。contextvar に置くことでリクエスト
+    (asyncio のタスク文脈) に閉じ、後始末も要らない。``session_id`` を持つのは
+    テストや直接呼出 (1 つの文脈で複数セッションを扱う) との互換のため —
+    別セッションの読み書きは別のレコードとして扱う。
+    """
+
+    session_id: str = ""
+    evidence_ids: list[str] = field(default_factory=list)
+    rag_meta: dict | None = None
+    fewshot_ids: list[str] = field(default_factory=list)
+
+
+_turn_var: ContextVar[TurnRecord | None] = ContextVar("chat_turn_record", default=None)
+
+
+def open_turn(session_id: str) -> TurnRecord:
+    """新しいターンの受け皿を置く (ターンの入口、``accumulate_user_turn``)。"""
+    rec = TurnRecord(session_id=session_id)
+    _turn_var.set(rec)
+    return rec
+
+
+def _turn(session_id: str, *, create: bool) -> TurnRecord | None:
+    rec = _turn_var.get()
+    if rec is not None and rec.session_id == session_id:
+        return rec
+    return open_turn(session_id) if create else None
 
 
 def set_turn_evidence_ids(session_id: str, evidence_ids: list[str]) -> None:
     """このターンで注入した Evidence id を置く (c_16 §5.5)。"""
-    _turn_evidence_ids[session_id] = list(evidence_ids)
+    _turn(session_id, create=True).evidence_ids = list(evidence_ids)
 
 
 def turn_evidence_ids(session_id: str) -> list[str]:
     """このターンで注入した Evidence id (未設定は空)。"""
-    return list(_turn_evidence_ids.get(session_id) or ())
-
-
-#: このターンの検索の副情報 (``corpus_gated`` / ``pseudo_derived``)。
-#: ``_turn_evidence_ids`` と同じ寿命で、ターンの入口で必ず消える。
-_turn_rag_meta: dict[str, dict] = {}
+    rec = _turn(session_id, create=False)
+    return list(rec.evidence_ids) if rec is not None else []
 
 
 def set_turn_rag_meta(
@@ -368,7 +424,7 @@ def set_turn_rag_meta(
     ``lexical_candidate_ids`` は抑止応答の turn で取りこぼした問いの種
     (f_01 §6.4 の misses) に使う。
     """
-    _turn_rag_meta[session_id] = {
+    _turn(session_id, create=True).rag_meta = {
         "corpus_gated": bool(corpus_gated), "pseudo_derived": int(pseudo_derived),
         "lexical_candidate_ids": list(lexical_candidate_ids or []),
         "corpus_starved": bool(corpus_starved),
@@ -407,17 +463,14 @@ def record_pq_misses_if_abstained(
 
 def turn_rag_meta(session_id: str) -> dict | None:
     """このターンの検索の副情報 (検索を通っていなければ ``None``)。"""
-    meta = _turn_rag_meta.get(session_id)
+    rec = _turn(session_id, create=False)
+    meta = rec.rag_meta if rec is not None else None
     return dict(meta) if meta else None
 
 
-#: 会話単位の根拠台帳: そのセッションで ``[参考情報]`` に注入した資料の所在
-#: (ターン番号 / ストア / パッケージ / 文書 / 見出し)。注入はモデルの履歴に
-#: 残らず UI の出典フレームにしか出ないため、「この会話で参照した資料は」に
-#: 答える材料はここにしか無い (2026-09-12 ライブ監査 T06/5: 0 件と回答)。
-#: セッション寿命 (``clear_session_data`` で消える)。
-_session_sources: dict[str, list[dict]] = {}
-#: 台帳の上限 (1 セッション)。古いものから落とす。
+#: 会話単位の根拠台帳 (``SessionLedger.sources``) の上限。古いものから落とす。
+#: 注入はモデルの履歴に残らず UI の出典フレームにしか出ないため、「この会話で
+#: 参照した資料は」に答える材料はここにしか無い (2026-09-12 ライブ監査 T06/5)。
 _SESSION_SOURCES_CAP = 200
 
 
@@ -428,9 +481,9 @@ def session_user_turn_count(session_id: str) -> int:
     合わせた :func:`session_turn_count` (1, 3, 5, 7 …) を台帳に振ると、モデルが
     「ターン 3」を 3 問目と読んで節を付け替えた (2026-09-12 (b) T04/5)。
     """
-    return sum(
-        1 for e in (_session_turns.get(session_id) or ()) if e.get("role") == "user"
-    )
+    led = _ledger(session_id, create=False)
+    turns = led.turns if led is not None else ()
+    return sum(1 for e in turns if e.get("role") == "user")
 
 
 def record_turn_sources(session_id: str, items: list[dict]) -> None:
@@ -441,7 +494,7 @@ def record_turn_sources(session_id: str, items: list[dict]) -> None:
     if not session_id or not items:
         return
     turn = session_user_turn_count(session_id)
-    ledger = _session_sources.setdefault(session_id, [])
+    ledger = _ledger(session_id).sources
     seen = {(e["turn"], e["id"]) for e in ledger}
     for item in items:
         key = (turn, str(item.get("id") or ""))
@@ -462,23 +515,23 @@ def record_turn_sources(session_id: str, items: list[dict]) -> None:
 
 def session_sources(session_id: str) -> list[dict]:
     """このセッションで注入した資料の台帳 (ターン順)。"""
-    return [dict(e) for e in _session_sources.get(session_id) or ()]
-
-
-#: セッション → **今のターンで実際に注入した** few-shot 例の id (f_04 §3.2.2)。
-#: ``_turn_evidence_ids`` と同じ立て付け。以前の ``gen_config.fewshot_ids`` は
-#: プール全体 (50 件) を刻んでおり、手本へ成否を帰属する道が無かった。
-_turn_fewshot_ids: dict[str, list[str]] = {}
+    led = _ledger(session_id, create=False)
+    return [dict(e) for e in (led.sources if led is not None else ())]
 
 
 def set_turn_fewshot_ids(session_id: str, example_ids: list[str]) -> None:
-    """このターンで注入した few-shot 例の id を置く。"""
-    _turn_fewshot_ids[session_id] = list(example_ids)
+    """このターンで注入した few-shot 例の id を置く (f_04 §3.2.2)。
+
+    以前の ``gen_config.fewshot_ids`` はプール全体 (50 件) を刻んでおり、
+    手本へ成否を帰属する道が無かった。
+    """
+    _turn(session_id, create=True).fewshot_ids = list(example_ids)
 
 
 def turn_fewshot_ids(session_id: str) -> list[str]:
     """このターンで注入した few-shot 例の id (未設定は空)。"""
-    return list(_turn_fewshot_ids.get(session_id) or ())
+    rec = _turn(session_id, create=False)
+    return list(rec.fewshot_ids) if rec is not None else []
 
 
 def _existing_session(mgr, session_id: str) -> "SessionData | None":
@@ -515,10 +568,12 @@ def _existing_summary(mgr, session_id: str) -> str | None:
     return summary if isinstance(summary, str) else None
 
 
-def _submit_history_save(mgr, session: SessionData) -> None:
-    """``mgr.save_session`` をワーカースレッドへ投げる (ループ外なら同期実行)。
+def _submit_history_persist(
+    mgr, ledger: SessionLedger, history_turns: list[dict], meta: dict,
+) -> None:
+    """:func:`_persist_session` をワーカースレッドへ投げる (ループ外なら同期実行)。
 
-    ファイル書き出しは ``_HISTORY_SAVE_EXECUTOR`` (1 スレッド) で直列に走る。
+    ファイル I/O は ``_HISTORY_SAVE_EXECUTOR`` (1 スレッド) で直列に走る。
     非同期ハンドラの外 (CLI / テスト) から呼ばれた場合はその場で書く。
     """
     def _log_result(fut) -> None:
@@ -530,7 +585,7 @@ def _submit_history_save(mgr, session: SessionData) -> None:
         if path:
             logger.debug(
                 "Session saved to history: %s (%d turns)",
-                session.session_id, session.turn_count,
+                meta["session_id"], len(history_turns),
             )
 
     try:
@@ -538,17 +593,59 @@ def _submit_history_save(mgr, session: SessionData) -> None:
     except RuntimeError:
         loop = None
     if loop is None:
-        path = mgr.save_session(session)
+        path = _persist_session(mgr, ledger, history_turns, meta)
         if path:
             logger.debug(
                 "Session saved to history: %s (%d turns)",
-                session.session_id, session.turn_count,
+                meta["session_id"], len(history_turns),
             )
         return
     fut = run_in_executor_with_context(
-        loop, _HISTORY_SAVE_EXECUTOR, mgr.save_session, session,
+        loop, _HISTORY_SAVE_EXECUTOR, _persist_session, mgr, ledger, history_turns, meta,
     )
     fut.add_done_callback(_log_result)
+
+
+def _persist_session(
+    mgr, ledger: SessionLedger, history_turns: list[dict], meta: dict,
+):
+    """履歴ファイルと索引の読み書き (**履歴保存ワーカーだけが走らせる**)。
+
+    以前は毎ターン、イベントループ側で既存セッション JSON を全読みして
+    ``SessionData`` を組み直し (会話 1 本で O(n²))、書込みだけをワーカーへ
+    逃がしていた。読み手 (ループ) と書き手 (ワーカー) が
+    ``HistoryManager._index`` を無同期で触るので、負けた側の 1 ターンで
+    sleep-time が書いた要約や昇格印が消えた。ここでは読みも書きもこのスレッド
+    に閉じ、既存レコードは ``ledger.saved`` に持って再読しない。要約だけは
+    sleep-time の要約器が索引へ書くので毎回引き直す。
+    """
+    session_id = meta["session_id"]
+    session = ledger.saved or _existing_session(mgr, session_id) or SessionData()
+    modes_used = list(session.modes_used or [])
+    if meta["mode"] not in modes_used:
+        modes_used.append(meta["mode"])
+
+    session.session_id = session_id
+    session.started_at = meta["started_at"]
+    session.ended_at = meta["ended_at"]
+    session.mode = meta["mode"]
+    session.modes_used = modes_used
+    session.instance_name = meta["instance_name"]
+    session.base_model = meta["base_model"]
+    session.source = "auto"
+    session.turns = history_turns
+    session.turn_count = len(history_turns)
+    # summary は書かない (None のまま残す)。sleep-time の LLM 要約器は
+    # ``summary is None`` のセッションだけを対象にするため、ここで最初の
+    # 発話などを書くと要約器が永久に発火しない (2026-07-26 実測)。既に要約が
+    # 付いているセッションは上書きせず引き継ぐ。
+    session.summary = _existing_summary(mgr, session_id) or session.summary
+    if meta.get("project_id") and not session.project_id:
+        session.project_id = meta["project_id"]
+
+    path = mgr.save_session(session)
+    ledger.saved = session
+    return path
 
 
 def _save_session_to_history(
@@ -557,19 +654,18 @@ def _save_session_to_history(
     """蓄積した全ターンを HistoryManager で保存する
 
     レスポンス完了後に呼ばれ、会話履歴をディスクに永続化する。
-    同一 session_id のファイルは上書きされるため冪等。
-    WorkingMemory ではなく _session_turns を使用し、
-    WM のエビクションで古いターンが失われる問題を回避する。
+    同一 session_id のファイルは上書きされるため冪等。WorkingMemory ではなく
+    台帳の全ターンを使い、WM のエビクションで古いターンが失われる問題を回避する。
 
-    ``SessionData`` の組み立てはこのスレッドで行い (蓄積バッファは
-    イベントループ側で変わる)、ファイル I/O だけを ``_submit_history_save``
-    でワーカースレッドへ逃がす。
+    このスレッド (イベントループ) では **ターン列のスナップショットと
+    メタ情報を組むだけ** にし、ファイル / 索引の読み書きは
+    :func:`_persist_session` (ワーカー 1 本) に閉じる。
 
     ``state`` からは ``current_project_id`` だけを読む (create モードの
     プロジェクト紐付け。以前は書かれておらず全セッションが ``None`` だった)。
     """
-    turns = _session_turns.get(session_id, [])
-    if not turns:
+    ledger = _ledger(session_id, create=False)
+    if ledger is None or not ledger.turns:
         return
     project_id = getattr(state, "current_project_id", None)
 
@@ -584,7 +680,7 @@ def _save_session_to_history(
         private_cfg = ((cfg.get("memory") or {}).get("private") or {})
         if (
             private_cfg.get("history_storage", "memory_only") == "skip"
-            and session_id in _session_had_private
+            and ledger.had_private
         ):
             logger.info(
                 "history save skipped (history_storage=skip, session had private turns): %s",
@@ -595,22 +691,24 @@ def _save_session_to_history(
         mgr = get_history_manager()
 
         # 再起動を跨いだ続きなら、索引の開始時刻と既存ターンを先に引き継ぐ
-        # (同じファイルへ追記する形にする)。
-        _ensure_session_restored(session_id, mgr)
-        turns = _session_turns.get(session_id, turns)
+        # (同じファイルへ追記する形にする)。読めなかったら今回は書かない —
+        # 旧ターン抜きで同じファイルを上書きしない。
+        if not _ensure_session_restored(session_id, mgr):
+            return
+        turns = list(ledger.turns)
 
         # 開始時刻を記録（初回のみ）
-        if session_id not in _session_started:
+        if not ledger.started_at:
             first_ts = turns[0].get("timestamp")
+            # c_05 §0.5 の 1 形式 (ISO 8601 UTC μs ``Z``)。以前は ``isoformat()``
+            # (``+00:00``) で、同じレコードの turns (``format_utc``) と形式が
+            # 割れていた。読み手は ``parse_iso`` なので旧形式も読める。
             if first_ts:
-                _session_started[session_id] = datetime.fromtimestamp(
-                    first_ts, tz=timezone.utc,
-                ).isoformat()
+                ledger.started_at = format_utc(
+                    datetime.fromtimestamp(first_ts, tz=timezone.utc),
+                )
             else:
-                _session_started[session_id] = utc_now_dt().isoformat()
-
-        started_at = _session_started[session_id]
-        now_iso = utc_now_dt().isoformat()
+                ledger.started_at = format_utc(utc_now_dt())
 
         # ターンを履歴用フォーマットに変換
         history_turns = []
@@ -626,44 +724,16 @@ def _save_session_to_history(
                     entry[key] = value
             history_turns.append(entry)
 
-        instance_name = cfg.get("instance", {}).get("name", "evoref")
-        # summary は書かない (None のまま残す)。
-        #
-        # 以前はユーザーの最初のメッセージを検索用 summary として毎ターン
-        # 書き込んでいたが、sleep-time の LLM 要約器
-        # (memory.sleep.summarize.summarize_unsummarized_sessions) は
-        # ``summary is None`` のセッションだけを対象にするため、summary が
-        # 一度も None にならず要約器が永久に発火しない状態になっていた
-        # (2026-07-26 実測: 31 セッション全件が「最初のユーザ発話そのまま」で、
-        # LLM 要約は 0 件)。さらに要約器が書いた要約も次ターンの自動保存で
-        # 最初の発話へ上書きされる構造だった。
-        #
-        # 検索は index の ``search_text`` (summary + 全ターン結合) が担うので、
-        # summary を空にしても search_history のヒット率は落ちない。一覧見出しは
-        # index の ``first_user_preview`` (最初のユーザ発話) で代替される。
-        # 既に要約が付いているセッションは上書きせず引き継ぐ。
-        # 既存レコードを土台にし、このターンで確定する値だけ差し替える
-        # (作り直すと sleep-time の書き込みが毎ターン消える)。
-        session = _existing_session(mgr, session_id) or SessionData()
-        modes_used = list(session.modes_used or [])
-        if mode not in modes_used:
-            modes_used.append(mode)
-
-        session.session_id = session_id
-        session.started_at = started_at
-        session.ended_at = now_iso
-        session.mode = mode
-        session.modes_used = modes_used
-        session.instance_name = instance_name
-        session.base_model = active_base_model_name(cfg)
-        session.source = "auto"
-        session.turns = history_turns
-        session.turn_count = len(history_turns)
-        session.summary = _existing_summary(mgr, session_id) or session.summary
-        if project_id and not session.project_id:
-            session.project_id = project_id
-
-        _submit_history_save(mgr, session)
+        meta = {
+            "session_id": session_id,
+            "started_at": ledger.started_at,
+            "ended_at": format_utc(utc_now_dt()),
+            "mode": mode,
+            "instance_name": cfg.get("instance", {}).get("name", "evoref"),
+            "base_model": active_base_model_name(cfg),
+            "project_id": project_id,
+        }
+        _submit_history_persist(mgr, ledger, history_turns, meta)
     except Exception as e:
         logger.warning("Failed to save session to history: %s", e)
 
@@ -1146,6 +1216,60 @@ def record_response(
     run_command 実行ターンの learning メタで、assistant note に載せて
     sleep-time の executable_command_curator が参照する (それ以外は None)。
     """
+    # 同一ターンの明確な失敗 = ツールをルーティングしたが失敗 → false_positive。
+    _, tool_fp = tool_routing_signals(
+        command_tool_calls(tool_command, tool_command_success),
+    )
+    _record_turn(
+        state, full_response, messages, session_id, user_query, mode,
+        tokens_generated,
+        layer="deliberative",
+        private=private,
+        tool_command=tool_command,
+        tool_command_name=tool_command_name,
+        tool_command_success=tool_command_success,
+        tool_command_source=tool_command_source,
+        action_blocked=action_blocked,
+        sent_messages=sent_messages,
+        cancelled=cancelled,
+        truncated=truncated,
+        generation_failed=generation_failed,
+        experience_kwargs={
+            "tool_routing_success": tool_routing_success,
+            "tool_routing_false_positive": tool_fp,
+            "rag_used": rag_used,
+            "rag_top1_score": rag_top1_score,
+        },
+    )
+
+
+def _record_turn(
+    state: AppState, full_response: str, messages: list[ChatMessage],
+    session_id: str, user_query: str, mode: str,
+    tokens_generated: int,
+    *,
+    layer: str,
+    private: bool,
+    tool_command: str | None,
+    tool_command_name: str | None,
+    tool_command_success: bool | None,
+    tool_command_source: str | None,
+    action_blocked: bool | None,
+    sent_messages: list[ChatMessage] | None,
+    cancelled: bool,
+    truncated: bool,
+    generation_failed: bool,
+    experience_kwargs: dict,
+    keep_artifact: bool = False,
+) -> None:
+    """``record_*`` 3 経路の共通本体 (WM → 成果物 → デバッグログ → 経験 → 帳簿)。
+
+    経路ごとの違いは ``experience_kwargs`` (経験レコードに足す層固有の信号) と
+    ``keep_artifact`` (長文経路は長さに関わらず成果物として保持) だけ。以前は
+    3 経路が同じ手順を写経しており、meta_cognitive / long_form だけ経験へ
+    ``turn_id`` (ID 連鎖、c_05 §0.6) を刻まず、抑止応答の疑似クエリ種
+    (:func:`record_pq_misses_if_abstained`) も積んでいなかった。
+    """
     # メモリに応答を記録
     assistant_turn_id = _record_assistant_turn_to_memory(
         state, full_response, session_id, user_query, mode,
@@ -1159,8 +1283,21 @@ def record_response(
     # 履歴予算に入らない長さの応答は成果物として保持する。
     # 実測 (2026-08-27 ライブ監査) の履歴予算は 1612 トークン。これを超える
     # 出力は次ターンで落ちるため、「いま書いたコードは何行ですか」に
-    # **「1行です」** (実際は 26 行) と答えていた。
-    _remember_if_artifact_sized(state, session_id, full_response, user_query, mode)
+    # **「1行です」** (実際は 26 行) と答えていた。長文経路は WM へ積んでも
+    # 次のターンには残らないので長さに関わらず保持する (同 T10: 6696 文字の
+    # 計画書の次のターンで「履歴に含まれていない」と答えた)。
+    if keep_artifact:
+        # キャンセルされた生成の途中本文は成果物にしない (次ターンの
+        # 「その計画書を保存して」が部分本文を掴む)。
+        if full_response and not cancelled:
+            remember_artifact(
+                state, session_id,
+                text=full_response, query=user_query, mode=mode,
+            )
+    else:
+        _remember_if_artifact_sized(
+            state, session_id, full_response, user_query, mode,
+        )
 
     # デバッグログ
     dl = state.debug_logger
@@ -1174,27 +1311,20 @@ def record_response(
     fc = state.feedback_collector
     if fc and cancelled and not private:
         logger.info(
-            "Skipping experience record for cancelled turn (session=%s)",
-            session_id,
+            "Skipping experience record for cancelled turn (%s, session=%s)",
+            layer, session_id,
         )
     elif fc and not private:
         try:
             # 記憶へ積む本文と同じもの (開示注記を落とした本文) を経験にも
             # 使う。生の full_response を渡すと注記込みの応答が手本に昇格する。
             body = _recorded_body(full_response)
-            # 同一ターンの明確な失敗 = ツールをルーティングしたが失敗 → false_positive。
-            _, tool_fp = tool_routing_signals(
-                command_tool_calls(tool_command, tool_command_success),
-            )
             prompt_tokens, cached_tokens = read_llama_prompt_tokens(state)
             blocked, measured = _turn_contradiction_inputs(
                 state, messages, action_blocked,
             )
             entry = fc.record(
                 query=user_query, response=body, mode=mode,
-                tool_routing_success=tool_routing_success,
-                tool_routing_false_positive=tool_fp,
-                rag_used=rag_used, rag_top1_score=rag_top1_score,
                 completion_tokens=tokens_generated,
                 prompt_tokens=prompt_tokens,
                 cached_prompt_tokens=cached_tokens,
@@ -1208,6 +1338,7 @@ def record_response(
                 session_id=session_id,
                 turn_id=assistant_turn_id,
                 gen_config=_active_gen_config(state, mode, session_id),
+                **experience_kwargs,
             )
             record_pq_misses_if_abstained(state, entry, session_id, user_query)
         except Exception as e:
@@ -1216,7 +1347,8 @@ def record_response(
             # WARNING 1 行に化け、meta_cognitive / long_form の経験記録が静かに
             # 全滅していた (テストで検出)。traceback 付き ERROR なら気づける。
             logger.error(
-                "FeedbackCollector.record failed: %s", e, exc_info=True,
+                "FeedbackCollector.record failed (%s): %s", layer, e,
+                exc_info=True,
             )
 
     _finish_turn_bookkeeping(
@@ -1260,77 +1392,32 @@ def record_meta_cognitive_response(
     から呼ばれ、「撃てるツールが無い」はタスク failed として現れる)。呼出側が
     導けなければ ``None`` のまま = 矛盾検出のこの入力は使わない。
     """
-    # メモリに応答を記録
-    assistant_turn_id = _record_assistant_turn_to_memory(
-        state, full_response, session_id, user_query, mode,
+    credits_dicts = [
+        {"step_index": c.step_index, "action": c.action, "credit": c.credit}
+        for c in step_credits
+    ] if step_credits else []
+    _record_turn(
+        state, full_response, messages, session_id, user_query, mode,
+        tokens_generated,
+        layer="meta-cognitive",
         private=private,
         tool_command=tool_command,
         tool_command_name=tool_command_name,
         tool_command_success=tool_command_success,
         tool_command_source=tool_command_source,
-    )
-
-    # 履歴予算に入らない長さの応答は成果物として保持する (deliberative と同じ)。
-    _remember_if_artifact_sized(state, session_id, full_response, user_query, mode)
-
-    # デバッグログ
-    dl = state.debug_logger
-    if dl:
-        _log_request_debug(
-            dl, tokens_generated, sent_messages or messages, full_response,
-            private=private,
-        )
-
-    # 経験バッファに記録 (Level 0) — ステップクレジット付き / private・キャンセルは対象外
-    fc = state.feedback_collector
-    if fc and cancelled and not private:
-        logger.info(
-            "Skipping experience record for cancelled turn (meta-cognitive, session=%s)",
-            session_id,
-        )
-    elif fc and not private:
-        try:
-            body = _recorded_body(full_response)
-            credits_dicts = [
-                {"step_index": c.step_index, "action": c.action, "credit": c.credit}
-                for c in step_credits
-            ] if step_credits else []
-            prompt_tokens, cached_tokens = read_llama_prompt_tokens(state)
-            blocked, measured = _turn_contradiction_inputs(
-                state, messages, action_blocked,
-            )
-            fc.record(
-                query=user_query,
-                response=body,
-                mode=mode,
-                action_blocked=blocked,
-                measured_values=measured,
-                stated_context=_stated_context(messages),
-                calculate_result=_calculate_result_in_prompt(messages),
-                tool_result_text=_tool_result_text_in_prompt(messages),
-                agent_loops=agent_loops,
-                rag_used=rag_used,
-                rag_top1_score=rag_top1_score,
-                tool_routing_success=tool_routing_success,
-                tool_routing_false_positive=tool_routing_false_positive,
-                step_credits=credits_dicts,
-                completion_tokens=tokens_generated,
-                prompt_tokens=prompt_tokens,
-                cached_prompt_tokens=cached_tokens,
-                truncated=truncated,
-                generation_failed=generation_failed or not body.strip(),
-                session_id=session_id,
-                gen_config=_active_gen_config(state, mode, session_id),
-            )
-        except Exception as e:
-            logger.error(
-                "FeedbackCollector.record failed (meta-cognitive): %s", e,
-                exc_info=True,
-            )
-
-    _finish_turn_bookkeeping(
-        state, full_response, session_id, user_query, mode, private=private,
-        turn_id=assistant_turn_id,
+        action_blocked=action_blocked,
+        sent_messages=sent_messages,
+        cancelled=cancelled,
+        truncated=truncated,
+        generation_failed=generation_failed,
+        experience_kwargs={
+            "agent_loops": agent_loops,
+            "rag_used": rag_used,
+            "rag_top1_score": rag_top1_score,
+            "tool_routing_success": tool_routing_success,
+            "tool_routing_false_positive": tool_routing_false_positive,
+            "step_credits": credits_dicts,
+        },
     )
 
 
@@ -1362,98 +1449,44 @@ def record_long_form_response(
     状態を変える操作はユニット生成の外で write_file が担う) ため、呼出側は
     渡さない = 矛盾検出のこの入力は使わない。
     """
-    # メモリに応答を記録
-    assistant_turn_id = _record_assistant_turn_to_memory(
-        state, full_response, session_id, user_query, mode,
+    units_completed = int(metrics.get("units_completed", 0) or 0)
+    validation_errors = int(metrics.get("validation_errors", 0) or 0)
+    long_form_success = judge_long_form_success(
+        metrics, user_query, _recorded_body(full_response),
+    )
+    _record_turn(
+        state, full_response, messages, session_id, user_query, mode,
+        tokens_generated,
+        layer="long-form",
         private=private,
         tool_command=tool_command,
         tool_command_name=tool_command_name,
         tool_command_success=tool_command_success,
         tool_command_source=tool_command_source,
-    )
-
-    # 成果物として保持する。WM へ積んでも **次のターンには残らない** —
-    # 実測 (2026-08-27 ライブ監査 T10) で 6696 文字の計画書を出した次のターンが
-    # ``_trim_history: 5/5 turns kept, 812 estimated tokens (max=1612)`` で、
-    # 履歴予算に入らず落ちていた。その結果「いまの計画書は何章?」に
-    # 「履歴に含まれていないので、計画書のテキストを共有いただければ」と
-    # 答えていた (ユーザーが 1 ターン前に受け取った本文を貼り直せ、という要求)。
-    if full_response:
-        remember_artifact(
-            state, session_id,
-            text=full_response, query=user_query, mode=mode,
-        )
-
-    # デバッグログ
-    dl = state.debug_logger
-    if dl:
-        _log_request_debug(
-            dl, tokens_generated, sent_messages or messages, full_response,
-            private=private,
-        )
-
-    # 経験バッファに記録 (Level 0) — 長文生成メトリクス付き / private・キャンセルは対象外
-    fc = state.feedback_collector
-    if fc and cancelled and not private:
-        logger.info(
-            "Skipping experience record for cancelled turn (long-form, session=%s)",
-            session_id,
-        )
-    elif fc and not private:
-        try:
-            body = _recorded_body(full_response)
-            units_completed = int(metrics.get("units_completed", 0) or 0)
-            validation_errors = int(metrics.get("validation_errors", 0) or 0)
-            long_form_success = judge_long_form_success(
-                metrics, user_query, body,
-            )
-            prompt_tokens, cached_tokens = read_llama_prompt_tokens(state)
-
-            blocked, measured = _turn_contradiction_inputs(
-                state, messages, action_blocked,
-            )
-            fc.record(
-                query=user_query,
-                response=body,
-                mode=mode,
-                action_blocked=blocked,
-                measured_values=measured,
-                stated_context=_stated_context(messages),
-                calculate_result=_calculate_result_in_prompt(messages),
-                tool_result_text=_tool_result_text_in_prompt(messages),
-                long_form_used=True,
-                long_form_content_type=metrics.get("content_type"),
-                long_form_strategy=metrics.get("strategy"),
-                long_form_units_total=metrics.get("units_total", 0),
-                long_form_units_completed=units_completed,
-                long_form_validation_errors=validation_errors,
-                long_form_budget_used_pct=metrics.get("budget_used_pct"),
-                long_form_success=long_form_success,
-                # 長文経路に入ったが 1 ユニットも生成できなかった、または要求
-                # 成果物と content_type が矛盾 = 長文分類の明確な誤検出
-                # → false_positive (パターン重み decay の対象)。units>0 で
-                # validation_errors のみのケースは長文ルーティング自体は妥当なので除外。
-                long_form_false_positive=(
-                    units_completed == 0
-                    or is_content_type_mismatch(metrics, user_query)
-                ),
-                rag_used=rag_used,
-                rag_top1_score=rag_top1_score,
-                completion_tokens=tokens_generated,
-                prompt_tokens=prompt_tokens,
-                cached_prompt_tokens=cached_tokens,
-                truncated=truncated,
-                generation_failed=generation_failed or not body.strip(),
-                session_id=session_id,
-                gen_config=_active_gen_config(state, mode, session_id),
-            )
-        except Exception as e:
-            logger.error(
-                "FeedbackCollector.record failed (long-form): %s", e,
-                exc_info=True,
-            )
-
-    _finish_turn_bookkeeping(
-        state, full_response, session_id, user_query, mode, private=private,
-        turn_id=assistant_turn_id,
+        action_blocked=action_blocked,
+        sent_messages=sent_messages,
+        cancelled=cancelled,
+        truncated=truncated,
+        generation_failed=generation_failed,
+        keep_artifact=True,
+        experience_kwargs={
+            "long_form_used": True,
+            "long_form_content_type": metrics.get("content_type"),
+            "long_form_strategy": metrics.get("strategy"),
+            "long_form_units_total": metrics.get("units_total", 0),
+            "long_form_units_completed": units_completed,
+            "long_form_validation_errors": validation_errors,
+            "long_form_budget_used_pct": metrics.get("budget_used_pct"),
+            "long_form_success": long_form_success,
+            # 長文経路に入ったが 1 ユニットも生成できなかった、または要求
+            # 成果物と content_type が矛盾 = 長文分類の明確な誤検出
+            # → false_positive (パターン重み decay の対象)。units>0 で
+            # validation_errors のみのケースは長文ルーティング自体は妥当なので除外。
+            "long_form_false_positive": (
+                units_completed == 0
+                or is_content_type_mismatch(metrics, user_query)
+            ),
+            "rag_used": rag_used,
+            "rag_top1_score": rag_top1_score,
+        },
     )
