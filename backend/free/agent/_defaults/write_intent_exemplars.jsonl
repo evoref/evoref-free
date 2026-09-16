@@ -1,0 +1,45 @@
+{"_comment": "ローカルファイル書込み意図の事例ゲート。_WRITE_VERB_RE が黙り、かつ宛先 (パス / に格のファイル名) が既に立っているターンだけがここへ来る。label=write は「そのファイルを書き換えてほしい」依頼、label=none は「ファイルが宛先として出てくるが書き換え依頼ではない」発話。規則は 追記 / 書き足 を持つが 追加 を持たない — 追加 は『機能を追加』『型ヒントを追加』でも多発する語で、語形として足すと実測で陰性 9 件中 4 件が誤発火した (2026-09-16)。判別しているのは語ではなく **モダリティ** (依頼か、可否/存在/所在の問いか) なので、陽性は一様に命令形の依頼、陰性は問い・相談で揃えてある。全事例が事例段へ到達することを test_write_intent_gate が固定する。"}
+{"text": "E:\\tmp\\work\\sales.xlsx に 10月 の行を1行だけ追加してください。", "label": "write", "id": "w_xlsx_row"}
+{"text": "C:\\data\\report.docx に「次の予定」という節を追加してください。", "label": "write", "id": "w_docx_section"}
+{"text": "E:\\tmp\\work\\deck.pptx に「リスクと対策」というスライドを1枚追加してください。", "label": "write", "id": "w_pptx_slide"}
+{"text": "C:\\work\\memo.md に3行追加して。", "label": "write", "id": "w_md_lines"}
+{"text": "./notes.txt に今日の日付を追加してください。", "label": "write", "id": "w_txt_date"}
+{"text": "E:\\tmp\\work\\list.csv に 1 行足してください。", "label": "write", "id": "w_csv_row"}
+{"text": "inventory.csv に在庫ゼロの品目を足してください。", "label": "write", "id": "w_csv_tail"}
+{"text": "E:\\tmp\\work\\schedule.xlsx に 11月 と 12月 の行も足してください。", "label": "write", "id": "w_xlsx_months"}
+{"text": "C:\\docs\\manual.docx に冒頭の注記を加えてください。", "label": "write", "id": "w_docx_notice"}
+{"text": "todo.md に項目を 5 個まで増やしてください。", "label": "write", "id": "w_md_items"}
+{"text": "E:\\tmp\\work\\config.yaml に timeout の行を加えてください。", "label": "write", "id": "w_yaml_change"}
+{"text": "C:\\work\\readme.md にタイトル行を足してください。", "label": "write", "id": "w_md_retitle"}
+{"text": "同じファイルに 3 行だけ足してください。", "label": "write", "id": "w_same_file"}
+{"text": "E:\\tmp\\work\\plan.docx に最新の3節を反映してください。", "label": "write", "id": "w_docx_update"}
+{"text": "E:\\tmp\\work\\budget.xlsx に合計行を足してほしいです。", "label": "write", "id": "w_xlsx_total"}
+{"text": "C:\\work\\log.csv に今日の実績を反映してください。", "label": "write", "id": "w_csv_reflect"}
+{"text": "E:\\tmp\\work\\slides.odp にまとめのページを1枚増やしてください。", "label": "write", "id": "w_odp_page"}
+{"text": "agenda.md に議題をもう 2 件だけ足しておいて。", "label": "write", "id": "w_md_agenda"}
+{"text": "E:\\tmp\\work\\report.docx に「備考」列を追加してください。", "label": "write", "id": "w_docx_column"}
+{"text": "C:\\work\\minutes.md に決定事項の行を足しておいてください。", "label": "write", "id": "w_md_minutes"}
+{"text": "E:\\tmp\\work\\main.py に再試行機能を追加したいのですが、どう直せばいいでしょうか。", "label": "none", "id": "n_code_advice"}
+{"text": "E:\\tmp\\work\\app.py に型ヒントを追加するべきでしょうか。", "label": "none", "id": "n_should_add"}
+{"text": "requirements.txt に依存を追加するとどうなりますか。", "label": "none", "id": "n_what_happens"}
+{"text": "E:\\tmp\\work\\setup.cfg に設定を足すのは妥当だと思いますか。", "label": "none", "id": "n_is_reasonable"}
+{"text": "todo.md に項目を追加するのは一般的にどういう手順ですか。", "label": "none", "id": "n_generic_procedure"}
+{"text": "E:\\tmp\\work\\pipeline.yaml にステージを足すのはどういう流れになりますか。", "label": "none", "id": "n_flow_question"}
+{"text": "E:\\tmp\\work\\schema.json にフィールドを増やすのは普通どうやりますか。", "label": "none", "id": "n_usually_how"}
+{"text": "E:\\tmp\\work\\schema.json にフィールドを増やす場合の注意点は何ですか。", "label": "none", "id": "n_caveats"}
+{"text": "main.py に追加されたテストはどこにありますか。", "label": "none", "id": "n_where_added"}
+{"text": "E:\\tmp\\work\\report.docx に前回足した節はどのあたりですか。", "label": "none", "id": "n_where_section"}
+{"text": "E:\\tmp\\work\\deck.pptx に前回追加したスライドはどれですか。", "label": "none", "id": "n_which_slide"}
+{"text": "C:\\work\\memo.md に足した行はいつのものですか。", "label": "none", "id": "n_when_added"}
+{"text": "C:\\work\\log.csv に昨日反映した行は何行目ですか。", "label": "none", "id": "n_which_line"}
+{"text": "E:\\tmp\\work\\config.yaml に timeout の設定はありますか。", "label": "none", "id": "n_has_setting"}
+{"text": "E:\\tmp\\work\\sales.xlsx に合計行はありますか。", "label": "none", "id": "n_has_total"}
+{"text": "C:\\data\\report.docx に図は何枚ありますか。", "label": "none", "id": "n_figure_count"}
+{"text": "E:\\tmp\\work\\deck.pptx に何枚のスライドがありますか。", "label": "none", "id": "n_slide_count"}
+{"text": "inventory.csv に在庫ゼロの品目は何件ありますか。", "label": "none", "id": "n_count_question"}
+{"text": "E:\\tmp\\work\\list.csv にどんな列がありますか。", "label": "none", "id": "n_columns"}
+{"text": "notes.txt に何が載っていますか。", "label": "none", "id": "n_line_content"}
+{"text": "E:\\tmp\\work\\budget.xlsx にどんな数式が使われていますか。", "label": "none", "id": "n_formula_question"}
+{"text": "manual.docx に readme.md と同じ内容が載っていますか。", "label": "none", "id": "n_diff_question"}
+{"text": "E:\\tmp\\work\\plan.docx にどの方針が採用されていますか。", "label": "none", "id": "n_reference_only"}
+{"text": "E:\\tmp\\work\\slides.odp に発表者ノートは残っていますか。", "label": "none", "id": "n_notes_question"}

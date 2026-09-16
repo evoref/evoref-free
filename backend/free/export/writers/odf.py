@@ -1,7 +1,12 @@
 """ODF Writer
 
 .odt, .ods, .odp: OpenDocument 形式で書出し
-odfpy を使用。1 Writer で 3 拡張子を処理（拡張子で分岐）。
+odfdo を使用。1 Writer で 3 拡張子を処理（拡張子で分岐）。
+
+設計書: [docs/f_11_file_export.md](../../../../docs/f_11_file_export.md)
+
+2026-09-16 に odfpy から odfdo へ移行した (f_11 §7)。odfpy は 1.4.1 (2020-01) で
+更新が止まっており、図形・画像の要素型を持たない。
 """
 
 from __future__ import annotations
@@ -9,79 +14,130 @@ from __future__ import annotations
 import io
 
 from backend.export._writer_base import BytesWriterBase
-from backend.export.base import ContentBlock, ExportContent, ExportError
+from backend.export.base import (
+    ContentBlock,
+    ExportContent,
+    ExportError,
+    coerce_cell_value,
+)
+from backend.export.media import (
+    export_base_dir,
+    resolve_image_path,
+    scaled_width_cm,
+)
+from backend.export.shapes import normalize_shapes
+from backend.export.slide_splitter import Slide, split_into_slides
+from backend.log_config import get_logger
+
+logger = get_logger("export.writers.odf")
+
+#: コードブロック用の段落スタイル名。
+_CODE_STYLE = "EvorefCodeBlock"
+
+
+def _image_frame(doc, block: ContentBlock, base_dir, **frame_kwargs):
+    """``image`` ブロックを ODF の Frame にする。解決できなければ ``None``。
+
+    画像の実体は ``Document.add_file`` でパッケージの ``Pictures/`` へ入る。
+    """
+    from odfdo import Frame
+
+    path = resolve_image_path(block.src, base_dir)
+    if path is None:
+        return None
+    uri = doc.add_file(str(path))
+    width_cm = scaled_width_cm(path)
+    size = frame_kwargs.pop("size", (f"{width_cm:.2f}cm", f"{width_cm * 0.75:.2f}cm"))
+    return Frame.image_frame(
+        uri, text=block.content or None, size=size, **frame_kwargs,
+    )
+
+
+def _resolve_blocks(content: ExportContent) -> list[ContentBlock]:
+    if content.blocks:
+        return content.blocks
+    if not content.raw_markdown:
+        return []
+    from backend.export.content_converter import ContentConverter
+
+    return ContentConverter().convert(content.raw_markdown)
+
+
+def _table_element(rows: list[list[str]], name: str = "Table"):
+    """``rows`` から odfdo の Table を組む。"""
+    from odfdo import Cell, Row, Table
+
+    table = Table(name)
+    for row_data in rows:
+        row = Row()
+        for cell_text in row_data:
+            row.append(Cell(value=coerce_cell_value(cell_text)))
+        table.append(row)
+    return table
 
 
 def _build_odt(content: ExportContent) -> bytes:
     """ExportContent を ODT バイトデータに変換"""
-    from odf.opendocument import OpenDocumentText
-    from odf import table as odf_table
-    from odf.style import Style, TextProperties
-    from odf.text import H, P, List, ListItem
+    from odfdo import Document, Header, List, ListItem, Paragraph, Style
 
-    doc = OpenDocumentText()
+    doc = Document("text")
+    doc.insert_style(
+        Style(
+            "paragraph", name=_CODE_STYLE, area="text",
+            font_name="Consolas", font_family="Consolas",
+        ),
+        automatic=True,
+    )
+    body = doc.body
+    body.clear()
+    base_dir = export_base_dir(content)
 
-    # コードブロック用スタイル
-    code_style = Style(name="CodeBlock", family="paragraph")
-    code_style.addElement(TextProperties(fontname="Consolas", fontsize="9pt"))
-    doc.automaticstyles.addElement(code_style)
-
-    blocks = content.blocks
-    if not blocks and content.raw_markdown:
-        from backend.export.content_converter import ContentConverter
-        blocks = ContentConverter().convert(content.raw_markdown)
-
-    for block in blocks:
+    for block in _resolve_blocks(content):
         if block.type == "heading":
-            h = H(outlinelevel=block.level, text=block.content)
-            doc.text.addElement(h)
+            body.append(Header(max(1, min(block.level, 6)), block.content))
 
         elif block.type == "paragraph":
-            p = P(text=block.content)
-            doc.text.addElement(p)
+            body.append(Paragraph(block.content))
 
         elif block.type == "code":
-            p = P(stylename=code_style, text=block.content)
-            doc.text.addElement(p)
+            for line in (block.content or "").split("\n"):
+                body.append(Paragraph(line, style=_CODE_STYLE))
 
         elif block.type == "table":
             if block.rows:
-                t = odf_table.Table(name="Table")
-                for row_data in block.rows:
-                    tr = odf_table.TableRow()
-                    for cell_text in row_data:
-                        tc = odf_table.TableCell()
-                        tc.addElement(P(text=cell_text))
-                        tr.addElement(tc)
-                    t.addElement(tr)
-                doc.text.addElement(t)
+                body.append(_table_element(block.rows))
 
         elif block.type == "list":
             lst = List()
             for item in block.items:
-                li = ListItem()
-                li.addElement(P(text=item))
-                lst.addElement(li)
-            doc.text.addElement(lst)
+                lst.append(ListItem(Paragraph(item)))
+            body.append(lst)
 
         elif block.type == "quote":
-            p = P(text=block.content)
-            doc.text.addElement(p)
+            body.append(Paragraph(f'"{block.content}"'))
+
+        elif block.type == "hr":
+            body.append(Paragraph("─" * 24))
+
+        elif block.type == "image":
+            frame = _image_frame(doc, block, base_dir, anchor_type="paragraph")
+            if frame is not None:
+                body.append(Paragraph(frame))
+
+        elif block.type == "shapes":
+            # ODT には図形を置かない (f_11 §3.1)。黙って落とさず記録する。
+            logger.warning(
+                "shapes blocks are not drawn in .odt; %d shape(s) skipped",
+                len(block.shapes),
+            )
 
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
 
 
-def _build_ods(content: ExportContent) -> bytes:
-    """ExportContent を ODS バイトデータに変換"""
-    from odf.opendocument import OpenDocumentSpreadsheet
-    from odf import table as odf_table
-    from odf.text import P
-
-    doc = OpenDocumentSpreadsheet()
-
-    # テーブルデータを抽出
+def _extract_ods_tables(content: ExportContent) -> list[tuple[str, list[list[str]]]]:
+    """ODS へ書くテーブルを集める。"""
     tables: list[tuple[str, list[list[str]]]] = []
     if content.raw_data is not None:
         if isinstance(content.raw_data, list) and content.raw_data:
@@ -93,103 +149,128 @@ def _build_ods(content: ExportContent) -> bytes:
                     rows.append([str(item.get(h, "")) for h in headers])
                 tables.append((content.title or "Sheet1", rows))
             elif isinstance(first, (list, tuple)):
-                tables.append(("Sheet1", [list(map(str, r)) for r in content.raw_data]))
-    else:
-        for block in content.blocks:
-            if block.type == "table" and block.rows:
-                tables.append(("Sheet1", block.rows))
-                break
+                tables.append(
+                    ("Sheet1", [list(map(str, r)) for r in content.raw_data]),
+                )
+        return tables
 
+    for block in content.blocks:
+        if block.type == "table" and block.rows:
+            tables.append(("Sheet1", block.rows))
+            break
+    return tables
+
+
+def _build_ods(content: ExportContent) -> bytes:
+    """ExportContent を ODS バイトデータに変換"""
+    from odfdo import Document
+
+    tables = _extract_ods_tables(content)
     if not tables:
         raise ExportError("no_table_data", "No table data for ODS export")
 
+    doc = Document("spreadsheet")
+    body = doc.body
+    body.clear()
     for sheet_name, rows in tables:
-        t = odf_table.Table(name=sheet_name)
-        for row_data in rows:
-            tr = odf_table.TableRow()
-            for cell_text in row_data:
-                tc = odf_table.TableCell(valuetype="string")
-                tc.addElement(P(text=str(cell_text)))
-                tr.addElement(tc)
-            t.addElement(tr)
-        doc.spreadsheet.addElement(t)
+        body.append(_table_element(rows, sheet_name))
 
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
 
 
+def _slide_body_paragraphs(slide: Slide) -> list:
+    """スライド本文をテキスト段落へ落とす (table / image / shapes を除く)。"""
+    from odfdo import Paragraph
+
+    paragraphs = []
+    for block in slide.blocks:
+        if block.type == "list":
+            paragraphs.extend(Paragraph(f"• {item}") for item in block.items)
+        elif block.type == "heading":
+            # level<=2 はスライド分割で消費済み。残るのは小見出し。
+            paragraphs.append(Paragraph(block.content))
+        elif block.type == "hr":
+            paragraphs.append(Paragraph("─" * 24))
+        elif block.type == "table":
+            # ODP のスライドに表要素を置く公開 API が odfdo に無いため、
+            # タブ区切りの段落へ落とす。以前は table 分岐が無く、表が
+            # 丸ごと消えていた。
+            paragraphs.extend(
+                Paragraph("\t".join(str(c) for c in row)) for row in block.rows
+            )
+        elif block.type in ("paragraph", "quote", "code"):
+            paragraphs.append(Paragraph(block.content))
+    return paragraphs
+
+
+def _append_shapes(page, block: ContentBlock) -> None:
+    """``shapes`` ブロックを ODP のページへ描く (f_11 §4.2)。"""
+    from odfdo import EllipseShape, LineShape, RectangleShape
+
+    for shape in normalize_shapes(block.shapes):
+        if shape.kind == "line":
+            page.append(
+                LineShape(
+                    p1=(f"{shape.x}cm", f"{shape.y}cm"),
+                    p2=(f"{shape.x2}cm", f"{shape.y2}cm"),
+                ),
+            )
+            continue
+        cls = RectangleShape if shape.kind == "rect" else EllipseShape
+        page.append(
+            cls(
+                size=(f"{shape.w}cm", f"{shape.h}cm"),
+                position=(f"{shape.x}cm", f"{shape.y}cm"),
+                text=shape.text or None,
+            ),
+        )
+
+
 def _build_odp(content: ExportContent) -> bytes:
     """ExportContent を ODP バイトデータに変換"""
-    from odf.opendocument import OpenDocumentPresentation
-    from odf import draw
-    from odf.style import MasterPage, PageLayout, PageLayoutProperties
-    from odf.text import P
+    from odfdo import Document, DrawPage, Frame, Paragraph
 
-    doc = OpenDocumentPresentation()
+    doc = Document("presentation")
+    body = doc.body
+    body.clear()
 
-    # ページレイアウト
-    pl = PageLayout(name="MyLayout")
-    pl.addElement(PageLayoutProperties(
-        margin="0cm", pagewidth="25.4cm", pageheight="19.05cm",
-        printorientation="landscape",
-    ))
-    doc.automaticstyles.addElement(pl)
+    deck = split_into_slides(content)
+    base_dir = export_base_dir(content)
+    pages: list[tuple[str, Slide | None]] = []
+    if deck.cover_title:
+        pages.append((deck.cover_title, None))
+    pages.extend((s.title, s) for s in deck.slides)
 
-    mp = MasterPage(name="MyMaster", pagelayoutname=pl)
-    doc.masterstyles.addElement(mp)
-
-    blocks = content.blocks
-    if not blocks and content.raw_markdown:
-        from backend.export.content_converter import ContentConverter
-        blocks = ContentConverter().convert(content.raw_markdown)
-
-    # スライド分割
-    slides_data: list[tuple[str, list[ContentBlock]]] = []
-    current_title = content.title or ""
-    current_blocks: list[ContentBlock] = []
-
-    for block in blocks:
-        if block.type == "heading" and block.level <= 2:
-            if current_title or current_blocks:
-                slides_data.append((current_title, current_blocks))
-            current_title = block.content
-            current_blocks = []
-        else:
-            current_blocks.append(block)
-    if current_title or current_blocks:
-        slides_data.append((current_title, current_blocks))
-
-    if not slides_data:
-        slides_data = [(content.title or "Untitled", [])]
-
-    for title, slide_blocks in slides_data:
-        page = draw.Page(stylename=None, masterpagename=mp)
-        doc.presentation.addElement(page)
-
-        # タイトルフレーム
-        title_frame = draw.Frame(
-            stylename=None, width="23cm", height="3cm", x="1cm", y="0.5cm",
+    for index, (title, slide) in enumerate(pages, 1):
+        page = DrawPage(f"page{index}", name=title or f"Slide {index}")
+        page.append(
+            Frame.text_frame(
+                Paragraph(title), size=("23cm", "3cm"), position=("1cm", "0.5cm"),
+                presentation_class="title",
+            ),
         )
-        tb = draw.TextBox()
-        tb.addElement(P(text=title))
-        title_frame.addElement(tb)
-        page.addElement(title_frame)
+        if slide is None:
+            body.append(page)
+            continue
 
-        # コンテンツフレーム
-        if slide_blocks:
-            content_frame = draw.Frame(
-                stylename=None, width="23cm", height="13cm", x="1cm", y="4cm",
+        paragraphs = _slide_body_paragraphs(slide)
+        if paragraphs:
+            page.append(
+                Frame.text_frame(
+                    paragraphs, size=("23cm", "13cm"), position=("1cm", "4cm"),
+                    presentation_class="outline",
+                ),
             )
-            cb = draw.TextBox()
-            for block in slide_blocks:
-                if block.type in ("paragraph", "quote", "code"):
-                    cb.addElement(P(text=block.content))
-                elif block.type == "list":
-                    for item in block.items:
-                        cb.addElement(P(text=f"• {item}"))
-            content_frame.addElement(cb)
-            page.addElement(content_frame)
+        for block in slide.blocks:
+            if block.type == "image":
+                frame = _image_frame(doc, block, base_dir, position=("2cm", "9cm"))
+                if frame is not None:
+                    page.append(frame)
+            elif block.type == "shapes":
+                _append_shapes(page, block)
+        body.append(page)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -205,11 +286,11 @@ class OdfWriter(BytesWriterBase):
 
     @property
     def requires(self) -> list[str]:
-        return ["odfpy"]
+        return ["odfdo"]
 
     def is_available(self) -> bool:
         try:
-            from odf.opendocument import OpenDocumentText  # noqa: F401
+            from odfdo import Document  # noqa: F401
             return True
         except ImportError:
             return False

@@ -28,6 +28,48 @@ _TOOL_MAX_FILE_READ_BYTES = 2_000_000
 #: utf-8-sig、Windows 既定のメモ帳 / 旧ツール出力は cp932。
 _READ_FILE_ENCODINGS = ("utf-8", "utf-8-sig", "cp932")
 
+#: バイト列をテキストとしてデコードせず extraction レジストリ経由で読む形式。
+#: OOXML / ODF は ZIP、PDF は独自バイナリなので、素のデコードは中身ではなく
+#: コンテナのゴミを返す (2026-09-16 実測: 37KB の .docx が「966 行 / 35,038 文字」
+#: の置換文字列になり、そのままプロンプトへ入っていた)。
+#: プレーンテキスト系 (.txt/.md/.csv/コード) は read_file 側の行範囲指定と
+#: エンコーディング報告が要るので **ここには入れない**。
+_EXTRACTED_READ_EXTS = frozenset(
+    {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".pdf", ".rtf", ".eml"},
+)
+
+
+def is_extracted_document(path: Path) -> bool:
+    """extraction レジストリ経由で読むべき形式か。
+
+    ``True`` の拡張子は **素のテキストデコードへ落としてはいけない**。壊れた
+    ``.docx`` に ``read_text`` を掛けると ZIP ではないバイト列がたまたま UTF-8 と
+    して通り、コンテナの中身が「文書の本文」として下流へ流れる。
+    """
+    return path.suffix.lower() in _EXTRACTED_READ_EXTS
+
+
+def extract_document_text(path: Path) -> str | None:
+    """リッチ文書 (OOXML / ODF / PDF / RTF / EML) を本文テキストへ変換する。
+
+    対象拡張子でない場合と、抽出器が使えない / 失敗した場合は ``None`` を返す。
+    両者の区別が要る呼び出し側は ``is_extracted_document`` を併用する。
+    設計書は [docs/f_11_file_export.md](../../../docs/f_11_file_export.md) §5.1。
+    """
+    if not is_extracted_document(path):
+        return None
+    try:
+        import backend.free.extraction  # noqa: F401  (レジストリへの登録副作用)
+        from backend.extraction import get_registry
+
+        return get_registry().extract(path).text
+    except Exception as e:
+        # 抽出できないこと自体は致命ではない。ただし「読めたつもりで空」は
+        # 呼び出し側が既存内容ゼロと解釈して全文を作り直す事故になるので、
+        # 握り潰さず必ず記録する。
+        logger.warning("Document extraction failed for %s: %r", path, e)
+        return None
+
 
 def _decode_text_file(raw: bytes) -> tuple[str, str]:
     """ファイルのバイト列をデコードし ``(本文, 使ったエンコーディング)`` を返す。
@@ -84,7 +126,16 @@ def read_file(
                 f"Error: file too large to read ({size} bytes, "
                 f"limit {_TOOL_MAX_FILE_READ_BYTES}): {file_path}"
             )
-        content, used_encoding = _decode_text_file(p.read_bytes())
+        extracted = extract_document_text(p)
+        if extracted is None and is_extracted_document(p):
+            return (
+                f"Error: cannot read '{p.suffix.lower()}' content from {file_path} "
+                "(extraction failed or the required library is missing)."
+            )
+        if extracted is not None:
+            content, used_encoding = extracted, "extracted"
+        else:
+            content, used_encoding = _decode_text_file(p.read_bytes())
         lines = content.splitlines()
         header = (
             f"{READ_FILE_META_PREFIX}{file_path}"
@@ -155,6 +206,10 @@ def _block_has_renderable_content(block) -> bool:
         return bool(block.rows)
     if block.type == "list":
         return bool(block.items)
+    if block.type == "image":
+        return bool(block.src)
+    if block.type == "shapes":
+        return bool(block.shapes)
     if block.type == "hr":
         return False
     return bool((block.content or "").strip())

@@ -88,7 +88,10 @@ from backend.free.agent.meta_cognitive import MetaCognitiveAgent
 from backend.free.agent.prompt_manager import ensure_static_directives
 from backend.free.agent.prompt_utils import format_fewshot_section
 from backend.free.agent.reactive import ReactiveAgent
-from backend.free.agent.router import ComplexityClassifier
+from backend.free.agent.router import (
+    ComplexityClassifier,
+    needs_write_intent_hint,
+)
 from backend.free.agent.issue_ledger import issue_ledger_scope
 from backend.free.agent.file_ledger import file_ledger_scope
 from backend.free.agent.tool_ledger import set_ledger_target
@@ -1778,9 +1781,25 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     # reactive に落ちてツール判定へ一度も到達しない (2026-08-10 ライブ監査)。
     # context は遅延評価 — 消費するのは numeric_question ルールだけで、
     # 大半のターンはそこへ到達する前に分類が確定する。
+    # 書込み意図の事例ゲート (c_17 / write_intent_gate)。**宛先は既に立って
+    # いるのに書込み動詞だけが無い** ターンだけ埋め込みを 1 回引く。
+    # `needs_write_intent_hint` が偽のターン (ファイル名を含まない通常の会話)
+    # では 1 度も呼ばれないので TTFT に載らない。棄権 / 未 warmup は None で、
+    # 規則の判定がそのまま通る。
+    write_intent_hint: bool | None = None
+    write_intent_gate = getattr(state, "write_intent_gate", None)
+    if write_intent_gate is not None and needs_write_intent_hint(
+        req.message, req.mode,
+    ):
+        try:
+            write_intent_hint = await write_intent_gate.decide(req.message)
+        except Exception as e:  # pragma: no cover - 縮退で吸収する
+            logger.warning("Write intent gate failed, falling back: %s", e)
+
     agent_layer = classifier.classify(
         req.message, mode=req.mode,
         context=lambda: _recent_dialogue_text(history),
+        write_intent_hint=write_intent_hint,
     )
     logger.info(
         "Agent layer: %s (mode=%s) for query: %s",

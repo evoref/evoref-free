@@ -24,8 +24,9 @@ def _build_export_data(content: ExportContent) -> object:
         result: dict = {}
         if content.title:
             result["title"] = content.title
-        if content.metadata:
-            result["metadata"] = content.metadata
+        public_metadata = _public_metadata(content)
+        if public_metadata:
+            result["metadata"] = public_metadata
         sections: list[dict] = []
         for block in content.blocks:
             section: dict = {"type": block.type}
@@ -40,6 +41,10 @@ def _build_export_data(content: ExportContent) -> object:
             elif block.type == "list":
                 section["ordered"] = block.ordered
                 section["items"] = block.items
+            elif block.type == "image":
+                section["src"] = block.src
+            elif block.type == "shapes":
+                section["shapes"] = block.shapes
             sections.append(section)
         result["content"] = sections
         return result
@@ -50,11 +55,24 @@ def _build_export_data(content: ExportContent) -> object:
         if content.title:
             result["title"] = content.title
         result["text"] = content.raw_markdown
-        if content.metadata:
-            result["metadata"] = content.metadata
+        public_metadata = _public_metadata(content)
+        if public_metadata:
+            result["metadata"] = public_metadata
         return result
 
     return {}
+
+
+def _public_metadata(content) -> dict:
+    """Writer への内部ヒント (``_`` 始まり) を除いた metadata。
+
+    ``_export_base_dir`` は相対画像パスの解決にだけ使う描画ヒントで、
+    ユーザーの文書内容ではないので書き出さない。
+    """
+    return {
+        k: v for k, v in (content.metadata or {}).items()
+        if not str(k).startswith("_")
+    }
 
 
 class JsonYamlWriter(BytesWriterBase):

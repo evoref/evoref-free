@@ -47,6 +47,7 @@ def follow_embedder_rebind(state: "AppState") -> None:
         ("attribute_slot_gate", "attribute_gate_rewarmup"),
         ("retrieval_skip_gate", "retrieval_skip_gate_rewarmup"),
         ("layer_shadow", "layer_shadow_rewarmup"),
+        ("write_intent_gate", "write_intent_gate_rewarmup"),
     ):
         gate = getattr(state, attr, None)
         if gate is None:

@@ -122,10 +122,35 @@ CSV_CONTENT_INSTRUCTION = (
 # 保険。export Writer が変換できる GFM を出させ、python-pptx/VBScript 等の「文書を
 # 作るコード」をテキスト出力する退行を明示的に禁じる。表は強制しない (散文文書も可)。
 RICH_DOC_CONTENT_INSTRUCTION = (
-    "The target is a Word/PowerPoint document. Output ONLY GitHub-flavored Markdown "
-    "(headings with #, paragraphs, bullet lists, and Markdown tables as appropriate). "
-    "Do NOT output python-pptx, python-docx, VBScript, openpyxl, or any program code. "
+    "The target is a rich document (Word / PowerPoint / OpenDocument). Output ONLY "
+    "GitHub-flavored Markdown (headings with #, paragraphs, bullet lists, and Markdown "
+    "tables as appropriate). Do NOT output python-pptx, python-docx, VBScript, openpyxl, "
+    "odfdo, JSON describing slides, or any program code. "
     "No code fences around the whole document."
+)
+
+# 画像と図形の書き方 (docs/f_11_file_export.md §4)。**この指示が無いと機能へ
+# 到達できない**: 画像は `![alt](path)` を行単独で置いたときだけ実体が埋め込まれ、
+# 図形は ```shapes フェンスでしか表現できないため、モデルが記法を知らないと
+# 「青い四角形」という箇条書きが出るだけになる (2026-09-16 実測)。
+# 図形は .pptx / .odp でのみ描かれる。
+MEDIA_CONTENT_INSTRUCTION = (
+    "Images: to embed a picture, put `![alt text](path/to/image.png)` on a line "
+    "of its own (not inside a sentence). Use the exact path the user gave you. "
+    "Never invent an image path, and never use a URL — only files that already "
+    "exist on disk are embedded.\n"
+    "Shapes (PowerPoint/.odp only): to draw shapes, emit a fenced block whose "
+    "language is `shapes` containing a JSON array. Units are centimetres; the "
+    "slide is 25.4cm x 19.05cm. Example:\n"
+    "```shapes\n"
+    '[{"kind": "rect", "x": 1, "y": 3, "w": 6, "h": 3, "fill": "#1E5AC8", '
+    '"text": "設計"},\n'
+    ' {"kind": "line", "x1": 1, "y1": 7, "x2": 12, "y2": 7, "line": "#D02020", '
+    '"width": 3},\n'
+    ' {"kind": "oval", "x": 14, "y": 3, "w": 4, "h": 4}]\n'
+    "```\n"
+    "`kind` is one of rect / oval / line. Only emit a shapes block when the user "
+    "actually asked for a drawing, diagram, or figure."
 )
 
 # .md は Markdown そのものが本文フォーマット。既定の CONTENT_GENERATION_PROMPT は

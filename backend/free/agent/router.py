@@ -414,6 +414,30 @@ def write_destination_evidence(probe: str) -> bool:
     return _filename_target_is_destination(probe)
 
 
+def needs_write_intent_hint(query: str, mode: str = "chat") -> bool:
+    """書込み意図の事例ゲートに聞く価値があるターンか (純粋関数)。
+
+    真になるのは **宛先は既に立っているのに書込み動詞だけが無い** ターン、
+    つまり規則が黙って ``deliberative`` へ落ちる形だけ。ここが偽のターンでは
+    埋め込みを 1 度も引かないので、ファイル名を含まない通常の会話に
+    レイテンシは足されない (c_17 §6 #1 / write_intent_gate の docstring)。
+
+    ``_is_local_write_intent`` の前段 (chat モード / URL 無し / how-to 除外 /
+    宛先の証拠) と **同じ条件を同じ順で** 見る。片方だけ直すと、ゲートに
+    聞いたのに規則側が別の理由で落とす (または逆) というズレになる。
+    """
+    if not is_chat_mode(mode):
+        return False
+    if _URL_HINT_RE.search(query):
+        return False
+    if _HOWTO_QUERY_RE.search(query):
+        return False
+    probe = write_intent_probe(query)
+    if _WRITE_VERB_RE.search(probe) or assigns_file_content(probe):
+        return False  # 規則が既に答えを出している
+    return write_destination_evidence(probe)
+
+
 # 学習済み long_form パターン単独発火の抑止床。閾値以上の一致が 1 語のみの
 # 場合、その重み合計がこの値以上でなければ long_form に分類しない。
 _LEARNED_LONG_FORM_MIN_WEIGHT_SUM = 0.8
@@ -1300,6 +1324,13 @@ class ComplexityClassifier:
     Deliberative 層にフォールバックする。
     """
 
+    #: 書込み意図の事例ゲートの判定 (``classify`` の引数で受ける)。
+    #: ``None`` = ヒント無し / 棄権で、``_is_local_write_intent`` は
+    #: **動詞の列挙が黙ったときだけ** これを参照する。クラス属性で既定を
+    #: 持たせるのは、判定メソッドを ``__new__`` で組み立てた素のインスタンス
+    #: から呼ぶテストがあるため (純粋関数に近い面を直接突く形)。
+    _write_intent_hint: bool | None = None
+
     def __init__(
         self,
         config: dict | None = None,
@@ -1322,6 +1353,7 @@ class ComplexityClassifier:
         query: str,
         mode: str = "chat",
         context: str | Callable[[], str] = "",
+        write_intent_hint: bool | None = None,
     ) -> str:
         """クエリの複雑度を分類する
 
@@ -1346,6 +1378,7 @@ class ComplexityClassifier:
         self.is_long_form = False
         self._classify_mode = mode
         self._last_classify_reason = "default"
+        self._write_intent_hint = write_intent_hint
 
         ctx = _ClassifyContext(self, query, mode, context)
         for rule in _CLASSIFY_RULES:
@@ -1492,7 +1525,12 @@ class ComplexityClassifier:
         # してください」は書込み依頼だが動詞を 1 つも含まないため、動詞だけの
         # 判定では読取へ落ちる (assigns_file_content の docstring 参照)。
         if not _WRITE_VERB_RE.search(probe) and not assigns_file_content(probe):
-            return False
+            # 動詞の列挙が黙ったターンは事例ゲートの判定があればそれを使う
+            # (c_17 / write_intent_gate)。`追加` のような、同じ語で目的語だけが
+            # 違う形は語形として足せない — 実測で陰性 9 件中 4 件が誤発火した。
+            # ヒントが無い / 棄権のときは従来どおり書込みではないと判定する。
+            if self._write_intent_hint is not True:
+                return False
         # 宛先の証拠は ``indicates_write_destination`` (= output_target) と
         # **同じ 1 本** を使う。片方だけが書込みと判断すると、層は書込み
         # プランを組むのに output_target は chat、あるいはその逆になる。

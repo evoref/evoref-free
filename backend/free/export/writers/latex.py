@@ -15,6 +15,9 @@ from backend.export.markdown_patterns import (
     RE_ITALIC as _RE_ITALIC,
     RE_LINK as _RE_LINK,
 )
+from backend.log_config import get_logger
+
+logger = get_logger("export.writers.latex")
 
 # LaTeX 特殊文字のエスケープ
 _LATEX_SPECIAL = {
@@ -142,6 +145,21 @@ def _blocks_to_latex(blocks: list[ContentBlock], title: str) -> str:
         elif block.type == "hr":
             parts.append(r"\bigskip\noindent\rule{\textwidth}{0.4pt}\bigskip")
             parts.append("")
+
+        elif block.type == "image":
+            parts.append(r"\begin{figure}[h]")
+            parts.append(r"\centering")
+            parts.append(rf"\includegraphics[width=0.8\textwidth]{{{block.src}}}")
+            if block.content:
+                parts.append(rf"\caption{{{_escape_latex(block.content)}}}")
+            parts.append(r"\end{figure}")
+            parts.append("")
+
+        elif block.type == "shapes":
+            logger.warning(
+                "shapes blocks are not drawn in .tex; %d shape(s) skipped",
+                len(block.shapes),
+            )
 
     parts.append(r"\end{CJK}")
     parts.append(r"\end{document}")

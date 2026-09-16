@@ -1555,6 +1555,7 @@ def _init_tools(
 
     _wire_retrieval_skip_gate(state, embedder, state.debug_logger)
     _wire_layer_shadow(state, embedder, state.debug_logger)
+    _wire_write_intent_gate(state, embedder, state.debug_logger)
 
     # Reactive 層を常駐化 (挨拶パターンのみ。LLM 非依存なので構築コストはほぼゼロ)。
     state.reactive_agent = ReactiveAgent()
@@ -1638,6 +1639,34 @@ def _wire_layer_shadow(state: AppState, embedder: Any, debug_logger: Any) -> Non
         _track_background_task(state, shadow.warmup(), name="layer_shadow_warmup")
     except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
         logger.info("Layer shadow warmup deferred: no running event loop")
+
+
+def _wire_write_intent_gate(
+    state: AppState, embedder: Any, debug_logger: Any,
+) -> None:
+    """書込み意図の事例ゲートを構築する (c_17 / write_intent_gate)。
+
+    規則 (``_WRITE_VERB_RE``) が黙ったターンだけ補うので、既存の書込み経路の
+    挙動は変わらない。埋め込みが無い / 構築に失敗したときはゲート無しで動き、
+    従来どおり規則の判定がそのまま通る。
+    """
+    if embedder is None:
+        logger.info("Write intent gate skipped: no embedder")
+        return
+    from backend.free.agent.write_intent_gate import WriteIntentGate
+
+    try:
+        gate = WriteIntentGate(embedder, debug_logger=debug_logger)
+    except Exception as e:  # pragma: no cover - 縮退で吸収する
+        logger.warning("Write intent gate construction failed: %s", e)
+        return
+    state.write_intent_gate = gate
+    try:
+        _track_background_task(
+            state, gate.warmup(), name="write_intent_gate_warmup",
+        )
+    except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
+        logger.info("Write intent gate warmup deferred: no running event loop")
 
 
 def _agent_trace_dir() -> Path | None:
