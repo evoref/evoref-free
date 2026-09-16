@@ -51,6 +51,9 @@ class ChatResponse(BaseModel):
 
 class CancelRequest(BaseModel):
     session_id: str
+    #: 止めるリクエスト (``agent_layer`` フレームの ``request_id``)。無ければ
+    #: セッションの進行中リクエスト全部を止める (旧クライアント / CLI 互換)。
+    request_id: str | None = None
 
 
 class CancelResponse(BaseModel):

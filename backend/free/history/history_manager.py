@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 from dataclasses import dataclass, field, asdict
 from datetime import timedelta
 from functools import lru_cache
@@ -393,6 +394,10 @@ class HistoryManager:
 
         self._checkpoint_dir = history_dir / ".checkpoint"
         self._index: HistoryIndex | None = None
+        # 索引の読み書きを直列化する (履歴保存ワーカー / sleep-time の要約器 /
+        # API のリスト取得が別スレッドから触る)。再入可 (save_session →
+        # _update_index → _load_index / _save_index)。
+        self._lock = threading.RLock()
         #: ``_index`` を読んだ時点の ``index.json`` の mtime (ns)。
         self._index_mtime: int | None = None
 
@@ -404,22 +409,23 @@ class HistoryManager:
         Returns:
             保存先パス（保存しなかった場合は None）
         """
-        skip_reason = _should_skip_session(session, self.auto_save)
-        if skip_reason:
-            logger.debug(skip_reason)
-            return None
+        with self._lock:
+            skip_reason = _should_skip_session(session, self.auto_save)
+            if skip_reason:
+                logger.debug(skip_reason)
+                return None
 
-        _complete_session_metadata(session)
-        filepath = self._resolve_session_path(session)
-        _atomic_write_json(filepath, asdict(session))
+            _complete_session_metadata(session)
+            filepath = self._resolve_session_path(session)
+            _atomic_write_json(filepath, asdict(session))
 
-        entry = self._build_index_entry(session, filepath)
-        self._update_index(entry)
-        self._clear_checkpoint(session.session_id)
+            entry = self._build_index_entry(session, filepath)
+            self._update_index(entry)
+            self._clear_checkpoint(session.session_id)
 
-        logger.info("Session saved: %s (%d turns, %d bytes)",
-                     session.session_id, session.turn_count, entry.size_bytes)
-        return filepath
+            logger.info("Session saved: %s (%d turns, %d bytes)",
+                         session.session_id, session.turn_count, entry.size_bytes)
+            return filepath
 
     def _resolve_session_path(self, session: SessionData) -> Path:
         """保存先パスの決定"""
@@ -600,8 +606,9 @@ class HistoryManager:
         毎ターンの自動保存が sleep-time の要約を消さないよう、保存側は
         これで既存要約を引き継ぐ (``_load_index`` を外から触らせない)。
         """
-        entry = self._find_entry(session_id)
-        return entry.summary if entry is not None else None
+        with self._lock:
+            entry = self._find_entry(session_id)
+            return entry.summary if entry is not None else None
 
     def get_session_started_at(self, session_id: str) -> str | None:
         """索引上の開始時刻 (ISO 8601) を返す。未登録なら ``None``。
@@ -610,8 +617,9 @@ class HistoryManager:
         セッションが続くと、in-process の開始時刻が失われて別ファイルが
         できる — 保存側はまずこれで既存の開始時刻を引き継ぐ。
         """
-        entry = self._find_entry(session_id)
-        return entry.started_at if entry is not None and entry.started_at else None
+        with self._lock:
+            entry = self._find_entry(session_id)
+            return entry.started_at if entry is not None and entry.started_at else None
 
     def _find_entry(self, session_id: str) -> IndexEntry | None:
         index = self._load_index()
@@ -621,18 +629,19 @@ class HistoryManager:
 
     def get_session(self, session_id: str) -> SessionData | None:
         """セッション詳細を取得"""
-        index = self._load_index()
-        entry = next((e for e in index.sessions if e.session_id == session_id), None)
-        if entry is None:
-            return None
+        with self._lock:
+            index = self._load_index()
+            entry = next((e for e in index.sessions if e.session_id == session_id), None)
+            if entry is None:
+                return None
 
-        filepath = self.history_dir / entry.file
-        if not filepath.exists():
-            return None
+            filepath = self.history_dir / entry.file
+            if not filepath.exists():
+                return None
 
-        with open(filepath, encoding="utf-8") as f:
-            data = json.load(f)
-        return SessionData.from_dict(data)
+            with open(filepath, encoding="utf-8") as f:
+                data = json.load(f)
+            return SessionData.from_dict(data)
 
     def search_sessions(
         self,
@@ -828,62 +837,64 @@ class HistoryManager:
         (2026-09-05 監査)。atomic 書き込みは壊れたファイルを防ぐだけで、
         ロストアップデートは防がない。mtime を見て読み直す。
         """
-        index_path = self.history_dir / "index.json"
-        try:
-            mtime = index_path.stat().st_mtime_ns
-        except OSError:
-            mtime = None
+        with self._lock:
+            index_path = self.history_dir / "index.json"
+            try:
+                mtime = index_path.stat().st_mtime_ns
+            except OSError:
+                mtime = None
 
-        if self._index is not None and mtime == self._index_mtime:
-            return self._index
+            if self._index is not None and mtime == self._index_mtime:
+                return self._index
 
-        if mtime is None:
-            self._index = HistoryIndex()
-            self._index_mtime = None
-            return self._index
+            if mtime is None:
+                self._index = HistoryIndex()
+                self._index_mtime = None
+                return self._index
 
-        with open(index_path, encoding="utf-8") as f:
-            data = json.load(f)
-        self._index_mtime = mtime
+            with open(index_path, encoding="utf-8") as f:
+                data = json.load(f)
+            self._index_mtime = mtime
 
-        sessions = [
-            IndexEntry(
-                session_id=s["session_id"],
-                file=s["file"],
-                started_at=s.get("started_at", ""),
-                duration_sec=s.get("duration_sec", 0),
-                mode=s.get("mode", "chat"),
-                turn_count=s.get("turn_count", 0),
-                summary=s.get("summary"),
-                summary_turn_count=int(s.get("summary_turn_count", 0) or 0),
-                first_user_preview=s.get("first_user_preview", ""),
-                size_bytes=s.get("size_bytes", 0),
-                search_text=s.get("search_text", ""),
-                promoted_to_semmem=bool(s.get("promoted_to_semmem", False)),
-                project_id=s.get("project_id"),
+            sessions = [
+                IndexEntry(
+                    session_id=s["session_id"],
+                    file=s["file"],
+                    started_at=s.get("started_at", ""),
+                    duration_sec=s.get("duration_sec", 0),
+                    mode=s.get("mode", "chat"),
+                    turn_count=s.get("turn_count", 0),
+                    summary=s.get("summary"),
+                    summary_turn_count=int(s.get("summary_turn_count", 0) or 0),
+                    first_user_preview=s.get("first_user_preview", ""),
+                    size_bytes=s.get("size_bytes", 0),
+                    search_text=s.get("search_text", ""),
+                    promoted_to_semmem=bool(s.get("promoted_to_semmem", False)),
+                    project_id=s.get("project_id"),
+                )
+                for s in data.get("sessions", [])
+            ]
+
+            self._index = HistoryIndex(
+                updated_at=data.get("updated_at", ""),
+                total_sessions=data.get("total_sessions", len(sessions)),
+                total_turns=data.get("total_turns", 0),
+                total_size_mb=data.get("total_size_mb", 0.0),
+                sessions=sessions,
             )
-            for s in data.get("sessions", [])
-        ]
-
-        self._index = HistoryIndex(
-            updated_at=data.get("updated_at", ""),
-            total_sessions=data.get("total_sessions", len(sessions)),
-            total_turns=data.get("total_turns", 0),
-            total_size_mb=data.get("total_size_mb", 0.0),
-            sessions=sessions,
-        )
-        return self._index
+            return self._index
 
     def _update_index(self, entry: IndexEntry) -> None:
         """インデックスにエントリを追加"""
-        index = self._load_index()
+        with self._lock:
+            index = self._load_index()
 
-        # 重複チェック
-        index.sessions = [
-            e for e in index.sessions if e.session_id != entry.session_id
-        ]
-        index.sessions.append(entry)
-        self._save_index(index)
+            # 重複チェック
+            index.sessions = [
+                e for e in index.sessions if e.session_id != entry.session_id
+            ]
+            index.sessions.append(entry)
+            self._save_index(index)
 
     def _save_index(self, index: HistoryIndex) -> None:
         """インデックスを保存
@@ -893,29 +904,30 @@ class HistoryManager:
         ``_delete_oldest`` の 3 経路が総数・総ターン・総容量を陳腐化させ、
         ``get_stats`` がそれをそのまま返していた (2026-09-05 監査)。
         """
-        index.total_sessions = len(index.sessions)
-        index.total_turns = sum(e.turn_count for e in index.sessions)
-        index.total_size_mb = sum(e.size_bytes for e in index.sessions) / (1024 * 1024)
-        index.updated_at = _now_iso()
+        with self._lock:
+            index.total_sessions = len(index.sessions)
+            index.total_turns = sum(e.turn_count for e in index.sessions)
+            index.total_size_mb = sum(e.size_bytes for e in index.sessions) / (1024 * 1024)
+            index.updated_at = _now_iso()
 
-        data = {
-            "updated_at": index.updated_at,
-            "total_sessions": index.total_sessions,
-            "total_turns": index.total_turns,
-            "total_size_mb": round(index.total_size_mb, 4),
-            "sessions": [asdict(s) for s in index.sessions],
-        }
+            data = {
+                "updated_at": index.updated_at,
+                "total_sessions": index.total_sessions,
+                "total_turns": index.total_turns,
+                "total_size_mb": round(index.total_size_mb, 4),
+                "sessions": [asdict(s) for s in index.sessions],
+            }
 
-        index_path = self.history_dir / "index.json"
-        _atomic_write_json(index_path, data)
+            index_path = self.history_dir / "index.json"
+            _atomic_write_json(index_path, data)
 
-        self._index = index
-        # 自分が書いた版を「読み済み」として覚える (次の _load_index で
-        # 無駄に読み直さない)。他プロセスが書けば mtime が変わって読み直す。
-        try:
-            self._index_mtime = index_path.stat().st_mtime_ns
-        except OSError:
-            self._index_mtime = None
+            self._index = index
+            # 自分が書いた版を「読み済み」として覚える (次の _load_index で
+            # 無駄に読み直さない)。他プロセスが書けば mtime が変わって読み直す。
+            try:
+                self._index_mtime = index_path.stat().st_mtime_ns
+            except OSError:
+                self._index_mtime = None
 
     def ensure_search_text(self) -> int:
         """search_text が未設定のエントリにターン本文を補完

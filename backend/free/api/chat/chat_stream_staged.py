@@ -21,6 +21,10 @@ from backend.free.generation.validators import remove_code_fences
 from backend.utils import estimate_tokens as _estimate_tokens
 
 from backend.free.api.chat.chat_stream_common import (
+    _emit_stream_error,
+    _finish_stream_outcome,
+    _record_failed_generation,
+    cancel_scope,
     logger,
     rag_signals_from_chunks,
     sse,
@@ -312,6 +316,78 @@ async def stream_staged_create(
     prefetched_rag_top_score: float | None = None,
     file_context_block: str | None = None,
 ) -> AsyncIterator[str]:
+    """staged クリエイトのストリーム (キャンセル / 例外 / 結末の枠)。
+
+    本体は :func:`_stream_staged_create_body`。以前は ``cancel_scope`` も
+    try/except も無く、``/api/chat/cancel`` は ``cancelled=false`` を返し
+    (staged は最長 ``total_timeout_sec`` まで止められない)、例外は ``error`` /
+    ``done`` フレーム無しで接続が切れ、結末 (outcome) も timing も記録されなかった。
+    タスクグラフが空で long_form へ委譲したときは long_form 側が結末を記録する
+    (二重に書かない)。
+    """
+    delegated: dict = {"fallback": False}
+    async with cancel_scope(session_id):
+        t_start = time.monotonic()
+        outcome_success = False
+        errored = False
+        try:
+            async for frame in _stream_staged_create_body(
+                query=query, session_id=session_id, state=state, cfg=cfg,
+                instance_name=instance_name, context_size=context_size,
+                messages=messages, output_target=output_target,
+                codegen=codegen, fallback_factory=fallback_factory,
+                part_codegen=part_codegen, timer=timer, private=private,
+                keepalive_interval=keepalive_interval,
+                prefetched_rag=prefetched_rag,
+                prefetched_rag_top_score=prefetched_rag_top_score,
+                file_context_block=file_context_block,
+                delegated=delegated,
+            ):
+                yield frame
+            outcome_success = True
+        except Exception as e:
+            errored = True
+            async for frame in _emit_stream_error(
+                state, e, timer=timer, agent_layer="staged_create", mode="create",
+            ):
+                yield frame
+            _record_failed_generation(
+                state, query=query, messages=messages, session_id=session_id,
+                mode="create", private=private, agent_layer="staged_create",
+            )
+        finally:
+            if not delegated["fallback"]:
+                _finish_stream_outcome(
+                    state, session_id,
+                    started_at=t_start,
+                    completed=outcome_success,
+                    errored=errored,
+                    tokens_out=0,
+                    signals={"agent_layer": "staged_create", "output_target": output_target},
+                )
+
+
+async def _stream_staged_create_body(
+    *,
+    query: str,
+    session_id: str,
+    state: AppState,
+    cfg: dict,
+    instance_name: str,
+    context_size: int,
+    messages: list[ChatMessage],
+    output_target: str,
+    codegen,
+    fallback_factory,
+    part_codegen=None,
+    timer: StageTimer | None = None,
+    private: bool = False,
+    keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL_SEC,
+    prefetched_rag: list[tuple[str, float, str]] | None = None,
+    prefetched_rag_top_score: float | None = None,
+    file_context_block: str | None = None,
+    delegated: dict | None = None,
+) -> AsyncIterator[str]:
     """専用 LoopDriver をインライン駆動し spec→code→test を実行してストリームする。
 
     タスクグラフ合成が空 (aux degraded 等) のときは ``fallback_factory`` が返す
@@ -385,6 +461,8 @@ async def stream_staged_create(
     )
     if not facts:
         logger.info("staged create: empty task graph; falling back to longform")
+        if delegated is not None:
+            delegated["fallback"] = True
         async for frame in fallback_factory():
             yield frame
         return
@@ -602,6 +680,13 @@ async def stream_staged_create(
     ):
         yield frame
 
+    # memmap を握った索引を先に手放す。閉じないと Windows では ``.semmem`` が
+    # 削除できず、``ws.cleanup()`` (rmtree, ignore_errors) が黙って残す
+    # (CLAUDE.md §10)。
+    try:
+        _staged_semmem.close()
+    except Exception as exc:  # noqa: BLE001 - 後始末の失敗で応答を壊さない
+        logger.debug("staged create: semmem close failed: %s", exc)
     # 隔離ワークスペース (含 .semmem) のクリーンアップ (config で任意)。
     if staged_cfg.get("cleanup_workspace", False):
         ws.cleanup()

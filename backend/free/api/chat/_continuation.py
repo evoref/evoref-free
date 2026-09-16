@@ -95,8 +95,14 @@ def arm_continuation(
 
 
 def disarm_continuation(state: AppState, session_id: str) -> None:
-    """継続待ちを解除する (切断せずに完結したターンの後始末)。"""
-    _pending(state).pop(session_id, None)
+    """継続待ちを解除する (切断せずに完結したターンの後始末)。
+
+    同期経路 / 通常ターンの入口からも呼ばれるので、レジストリを持たない
+    部分モックの state (テスト) では no-op にする。
+    """
+    registry = getattr(state, "truncated_responses", None)
+    if registry is not None:
+        registry.pop(session_id, None)
 
 
 def take_continuation(

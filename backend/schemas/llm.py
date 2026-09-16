@@ -128,14 +128,37 @@ class LlamaConfig(BaseModel):
     flash_attn: bool = True
     mlock: bool = False
     cache_prompt: bool = True
-    # 3 = チャット (0) / バックグラウンド (1: 学習 / sleep-time) / 分類器 (2:
-    # ツール分類器 + チャット応答パスの補助判定) をスロット分離する既定。
+    # "auto" (既定) = 3 か 4 を起動時に決める (scripts/launch_llama.py
+    # resolve_base_slots)。3 = チャット (0) / バックグラウンド (1: 学習 /
+    # sleep-time) / 分類器 (2: ツール分類器 + チャット応答パスの補助判定)。
+    # 4 本目 (3) は long_form のユニット生成専用で、チャット接頭辞の KV を
+    # 長文ターンの後も残すために切る。unified KV (slots>1 で自動付与) では
+    # スロットは VRAM ではなく同じ n_ctx セルを分け合うので、4 本目は
+    # context_size >= 16384 のときだけ意味がある (8192 では llama-server が
+    # セル不足で idle の slot 0 から purge し、今と同じ挙動になるだけ)。VRAM
+    # 増分は hybrid arch の再帰状態 1 シーケンス分 (27B で ~150 MiB、純
+    # attention なら 0) で、runtime.total_vram_budget_mb を超えるなら 3 へ降格。
     # 2 では分類器が背景と相乗りし、1 では全部が直列化して Level 1 変異 1 回ぶん
-    # (実測 16〜32 秒) チャットが待たされる。kv_unified が slots>1 で自動付与
-    # されるため per-seq context は n_ctx のままで、VRAM は増えない。
-    # 起動時に llama-server の実スロット数 (``/props`` の total_slots) と照合し、
-    # 少ない方へ丸める (backend/factory/_pillar_wirer.py::_init_llama_server)。
-    slots: int = Field(default=3, ge=1, le=16)
+    # (実測 16〜32 秒) チャットが待たされる。
+    # backend は config を解釈せず llama-server の実スロット数 (``/props`` の
+    # total_slots) を採る。明示 int が実数より多いときは少ない方へ丸める
+    # (backend/free/llm/client_builder.py)。
+    slots: int | Literal["auto"] = Field(default="auto")
+
+    @field_validator("slots", mode="before")
+    @classmethod
+    def _validate_slots(cls, v: object) -> int | str:
+        """整数値は 1..16、文字列は ``"auto"`` のみ許容。"""
+        if isinstance(v, str):
+            if v == "auto":
+                return v
+            raise ValueError(
+                f"slots must be an int (1..16) or 'auto', got string {v!r}"
+            )
+        iv = int(v)
+        if not 1 <= iv <= 16:
+            raise ValueError(f"slots must be within 1..16, got {iv}")
+        return iv
     cache_type_k: str = Field(
         default="q8_0", pattern=r"^(f16|bf16|q8_0|q5_1|q5_0|q4_1|q4_0)$"
     )

@@ -39,7 +39,7 @@ def build_local_client(
     """
     # 関数内 import: 既存テストが ``backend.free.llm.local_client.LocalClient`` を
     # monkeypatch する (呼出時に解決させないと差し替えが効かない)。
-    from backend.free.llm.local_client import LocalClient
+    from backend.free.llm.local_client import DEFAULT_SLOTS, LocalClient
 
     llama_cfg = cfg.get("llama", {})
     base_enable_thinking = resolve_enable_thinking(
@@ -51,16 +51,23 @@ def build_local_client(
     # config の slots は宣言値。llama-server が実際に確保したスロット数
     # (``/props`` の total_slots) より多いと、``id_slot=2`` 等の要求が
     # 存在しないスロットを指して 400 になる。少ない方へ丸めて警告する。
-    cfg_slots = int(llama_cfg.get("slots", 1) or 1)
+    # ``auto`` は launcher (scripts/launch_llama.py resolve_base_slots) が
+    # context_size / VRAM 予算から 3 か 4 に決めるので、ここでは解釈せず
+    # 実数をそのまま採る (/props が無い遅延接続では 3 に倒す)。
+    raw_slots = llama_cfg.get("slots", "auto")
     total_slots = int(getattr(metadata, "total_slots", 0) or 0)
-    slots = cfg_slots
-    if total_slots > 0 and total_slots != cfg_slots:
-        slots = min(cfg_slots, total_slots)
-        logger.warning(
-            "llama.slots=%d does not match llama-server total_slots=%d; "
-            "using %d (restart llama-server after changing config.yaml)",
-            cfg_slots, total_slots, slots,
-        )
+    if raw_slots == "auto":
+        slots = total_slots if total_slots > 0 else DEFAULT_SLOTS
+    else:
+        cfg_slots = int(raw_slots or 1)
+        slots = cfg_slots
+        if total_slots > 0 and total_slots != cfg_slots:
+            slots = min(cfg_slots, total_slots)
+            logger.warning(
+                "llama.slots=%d does not match llama-server total_slots=%d; "
+                "using %d (restart llama-server after changing config.yaml)",
+                cfg_slots, total_slots, slots,
+            )
     return LocalClient(
         llama_url,
         metadata,

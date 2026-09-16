@@ -743,9 +743,29 @@ async def _init_embedding(
             "EmbeddingBackend initialized: backend=%s, model=%s",
             embedder.backend_type(), embedder.model_name(),
         )
+        # 起動直後の最初の埋め込みは llama-server 側の初回計算で数秒かかり、
+        # チャット側の ``embedding.query_timeout`` (既定 3 秒) を超えて **最初の
+        # ターンだけ記憶検索が落ちる** (2026-09-17 ライブ監査: 冷スタートの
+        # 1 ターン目で embed_query が締切超過)。ユーザーの発話が来る前に 1 回
+        # 撃って温める。バッチ側 (``embed``) には締切が掛からない。
+        try:
+            _track_background_task(
+                state, _warm_embedder(embedder), name="embedding_warmup",
+            )
+        except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
+            logger.info("Embedding warmup deferred: no running event loop")
     except Exception as e:
         logger.warning("EmbeddingBackend init skipped: %s", e)
     return embedder
+
+
+async def _warm_embedder(embedder: "EmbeddingBackend") -> None:
+    """埋め込みサーバを 1 回叩いて初回計算のコストを起動時に払う (失敗は無視)。"""
+    try:
+        await embedder.embed(["起動直後のウォームアップ"], is_query=True, mode="chat")
+        logger.info("Embedding warmup done")
+    except Exception as e:  # noqa: BLE001 - 温めそこねても起動は続ける
+        logger.info("Embedding warmup skipped: %s", e)
 
 
 async def _check_embedding_dim(state: AppState, cfg: dict[str, Any]) -> None:

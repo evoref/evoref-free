@@ -6,7 +6,7 @@
 	import { locale, availableLocales, switchLocale, promptLocaleSwitching } from '$lib/i18n';
 	import { isPro, isDevelop, edition } from '$lib/edition';
 	import { appVersion } from '$lib/free/stores/app';
-	import { currentMode, clearMessages, switchMode, modeRestartStatus, corpusMode } from '$lib/free/stores/chat';
+	import { currentMode, clearMessages, switchMode, modeRestartStatus, corpusMode, isStreaming } from '$lib/free/stores/chat';
 	import { addToast } from '$lib/free/stores/toast';
 	import { serverState } from '$lib/free/stores/server';
 
@@ -142,7 +142,7 @@
 							<select
 								class="footer-select"
 								value={$currentMode}
-								disabled={$modeRestartStatus === 'restarting'}
+								disabled={$modeRestartStatus === 'restarting' || $isStreaming}
 								onchange={(e) => {
 								switchMode(e.currentTarget.value).catch((err: unknown) => {
 									addToast({ type: 'error', i18nKey: 'sidebar.mode_restart_failed' });

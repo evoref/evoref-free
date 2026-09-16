@@ -17,7 +17,6 @@ from backend.free.api.chat.chat_types import (
     GenerationParams,
 )
 from backend.free.api.schemas import (
-    ChatResponse,
     TokenInfo,
 )
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
@@ -29,15 +28,15 @@ from backend.free.agent.meta_cognitive_utils import (
 from backend.free.llm.local_client import LocalClient
 from backend.i18n_helper import msg
 from backend.utils import estimate_tokens as _estimate_tokens
-from fastapi import HTTPException
 
+from backend.free.api.chat.chat_constants import DEFAULT_KEEPALIVE_INTERVAL_SEC
 from backend.free.api.chat.chat_stream_common import (
-    _cancel_flags,
+    agent_layer_frame,
+    cancel_requested,
     _emit_stream_error,
     _emit_timing,
-    _log_chat_outcome,
+    _finish_stream_outcome,
     _record_failed_generation,
-    _sync_chat_response,
     cancel_scope,
     logger,
     meta_last_command_call,
@@ -58,7 +57,7 @@ async def stream_reactive(
     content: str, instance_name: str, context_size: int,
 ) -> AsyncIterator[str]:
     """Reactive 層の応答を SSE ストリーミングで返す"""
-    yield sse.agent_layer("reactive")
+    yield agent_layer_frame("reactive")
     yield sse.token(content)
     token_info = {"used": 0, "limit": context_size, "pct": 0, "instance_name": instance_name}
     yield sse.token_info(token_info)
@@ -136,7 +135,7 @@ async def _drain_meta_cognitive_steps(
                 step_queue.get(), timeout=keepalive_interval,
             )
         except asyncio.TimeoutError:
-            if _cancel_flags.get(session_id):
+            if cancel_requested(session_id):
                 _cancel_agent_task(agent_task, session_id)
                 return
             yield sse.keepalive()
@@ -145,7 +144,7 @@ async def _drain_meta_cognitive_steps(
         if step_data is None:
             return
 
-        if _cancel_flags.get(session_id):
+        if cancel_requested(session_id):
             _cancel_agent_task(agent_task, session_id)
             return
 
@@ -375,7 +374,7 @@ async def stream_meta_cognitive(
     session_id: str, instance_name: str, context_size: int,
     messages: list[ChatMessage], mode: str,
     *, generation_params: GenerationParams | None = None,
-    keepalive_interval: float = 15.0,
+    keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL_SEC,
     timer: StageTimer | None = None,
     private: bool = False,
     output_target: str = "file",
@@ -393,8 +392,13 @@ async def stream_meta_cognitive(
         step_queue: asyncio.Queue[dict | None] = asyncio.Queue()
         result_holder: dict = {"resp": None, "error": None}
         outcome_success = False
+        # genuine error (except Exception) と client cancel を区別する。
+        errored = False
         # 終端処理 (record) まで到達したか。例外経路の失敗記録と二重にしない。
         recorded = False
+        # finally が参照する (クライアント切断で generator が閉じられたときに
+        # エージェントを孤児にしない)。
+        agent_task: asyncio.Task | None = None
 
         run_agent = _build_meta_cognitive_agent_runner(
             agent,
@@ -408,7 +412,7 @@ async def stream_meta_cognitive(
         )
 
         try:
-            yield sse.agent_layer("meta_cognitive")
+            yield agent_layer_frame("meta_cognitive")
             # ``MetaCognitiveAgent._plan`` が同じ ``type="plan"`` を最初に
             # emit する。ここでも出すと UI のステップ一覧に英語と日本語の
             # plan が 2 行並ぶ (2026-08-09 ライブ監査で確認)。エージェント側の
@@ -428,7 +432,7 @@ async def stream_meta_cognitive(
             except asyncio.CancelledError:
                 # 自分が (ユーザーキャンセルで) 止めたタスクなら終端処理へ進む。
                 # 外側のタスク自体のキャンセル (クライアント切断) は伝播させる。
-                if not (agent_task.cancelled() and _cancel_flags.get(session_id)):
+                if not (agent_task.cancelled() and cancel_requested(session_id)):
                     raise
 
             if result_holder["error"] is not None:
@@ -436,7 +440,7 @@ async def stream_meta_cognitive(
 
             resp = result_holder["resp"]
 
-            if not _cancel_flags.get(session_id):
+            if not cancel_requested(session_id):
                 async for frame in _emit_meta_cognitive_result_frames(resp):
                     yield frame
 
@@ -448,17 +452,18 @@ async def stream_meta_cognitive(
                 private=private,
                 rag_used=rag_used,
                 rag_top1_score=rag_top1_score,
-                cancelled=bool(_cancel_flags.get(session_id)),
+                cancelled=bool(cancel_requested(session_id)),
             )
             recorded = True
             truncation = _meta_truncation_frame(resp)
-            if truncation and not _cancel_flags.get(session_id):
+            if truncation and not cancel_requested(session_id):
                 yield truncation
             yield sse.token_info(ti)
             yield sse.done()
             outcome_success = True
 
         except Exception as e:
+            errored = True
             async for frame in _emit_stream_error(
                 state, e, timer=timer, agent_layer="meta_cognitive", mode=mode,
             ):
@@ -470,9 +475,14 @@ async def stream_meta_cognitive(
                     agent_layer="meta_cognitive",
                 )
         finally:
+            # クライアント切断 (yield に CancelledError) でも計画 / ツールループ /
+            # LLM 生成を走らせ続けない。明示キャンセルは drain 側が既に止めている。
+            _cancel_agent_task(agent_task, session_id)
             resp_obj = result_holder.get("resp")
+            # ``MetaCognitiveResponse`` はトークン数を持たない (以前は存在しない
+            # 属性を読んで常に 0 だった)。記録側と同じ本文の見積りを使う。
             tokens_out = (
-                int(getattr(resp_obj, "tokens", 0) or 0)
+                max(1, _estimate_tokens(meta_cognitive_recorded_text(resp_obj)))
                 if resp_obj is not None else 0
             )
             # SSE 完走 = success ではなくタスク成否を反映する。ファイル未作成の
@@ -494,87 +504,15 @@ async def stream_meta_cognitive(
                     "failed_tasks": failed_tasks,
                     "writes": writes,
                 })
-                if failed_tasks:
-                    outcome_success = False
-            _log_chat_outcome(
-                state,
+            _finish_stream_outcome(
+                state, session_id,
                 started_at=t_start,
-                success=outcome_success,
+                completed=outcome_success,
+                # タスク成否は完走とは別の軸 (切断と混同しない)
+                success=not quality_signals.get("failed_tasks"),
+                errored=errored,
                 tokens_out=tokens_out,
                 signals=quality_signals,
             )
 
 
-async def sync_meta_cognitive(
-    agent: MetaCognitiveAgent, query: str, system_prompt: str,
-    conversation: list[ChatMessage], client: LocalClient, state: AppState,
-    session_id: str, instance_name: str, context_size: int,
-    messages: list[ChatMessage], mode: str,
-    *, generation_params: GenerationParams | None = None,
-    timer: StageTimer | None = None,
-    private: bool = False,
-    output_target: str = "file",
-    rag_used: bool = False,
-    rag_top1_score: float | None = None,
-) -> ChatResponse:
-    """Meta-Cognitive 層の同期応答"""
-    try:
-        if timer:
-            timer.start("llm_total_ms")
-        tools_registry = state.tools_registry
-        resp = await agent.process(
-            query=query,
-            system_prompt=system_prompt,
-            conversation=conversation,
-            llm_client=client,
-            tools_registry=tools_registry,
-            generation_params=generation_params,
-            session_id=session_id,
-            mode=mode,
-            output_target=output_target,
-            private=private,
-        )
-
-        if timer:
-            timer.stop("llm_total_ms")
-
-        # 非ストリームではエディタチャネルが無いため、エディタ経路の生成コードは
-        # コードブロックとして応答本文に畳み込む (CLI 等で内容を失わない)。
-        # 非ストリームでも本文はストリームと同じ浄化を通す
-        # (meta_cognitive_recorded_text の説明を参照)。
-        response_text = meta_cognitive_recorded_text(resp)
-        editor_artifacts = getattr(resp, "editor_artifacts", None)
-        if editor_artifacts:
-            blocks = "\n\n".join(
-                f"```{art.language}\n{art.content}\n```" for art in editor_artifacts
-            )
-            response_text = blocks if not response_text else f"{response_text}\n\n{blocks}"
-
-        estimated_tokens = max(1, _estimate_tokens(response_text))
-        record_meta_cognitive_response(
-            state, response_text, messages, session_id,
-            query, mode, estimated_tokens, resp.step_credits,
-            private=private,
-            agent_loops=resp.steps,
-            rag_used=rag_used,
-            rag_top1_score=rag_top1_score,
-            tool_routing_success=meta_tool_routing_success(resp),
-            tool_routing_false_positive=meta_tool_routing_false_positive(resp),
-            truncated=bool(getattr(resp, "truncated", False)),
-            **meta_last_command_call(resp),
-        )
-
-        return _sync_chat_response(
-            state, timer,
-            agent_layer="meta_cognitive",
-            text=response_text,
-            tokens=estimated_tokens,
-            messages=messages,
-            session_id=session_id,
-            instance_name=instance_name,
-            context_size=context_size,
-            mode=mode,
-        )
-    except Exception as e:
-        logger.error("MetaCognitive error: %s", e)
-        raise HTTPException(status_code=503, detail=str(e))

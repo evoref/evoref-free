@@ -300,15 +300,35 @@ class LongFormOrchestrator:
         """現在の戦略名を返す"""
         return "cogwriter" if isinstance(self.strategy, CogWriterStrategy) else "recurrent"
 
-    def _effective_context_size(self) -> int:
-        """スロットあたりの有効コンテキストサイズを返す
+    @property
+    def last_truncation(self):
+        """直近 generate() で ``finish_reason=length`` で切れた最後のユニットの
+        ``StreamOutcome`` (無ければ ``None``)。chat 側の開示 (``sse.output_truncated``)
+        と経験記録 (``truncated=``) に使う。"""
+        return getattr(self.strategy, "last_truncation", None)
 
-        llama-server は context_size を slots で等分するため、
-        1 リクエストが使える実効値は context_size // slots になる。
+    @property
+    def truncated_units(self) -> int:
+        return int(getattr(self.strategy, "truncated_units", 0) or 0)
+
+    def _effective_context_size(self) -> int:
+        """1 リクエストが使える実効コンテキストサイズを返す。
+
+        launcher は ``slots > 1`` で ``--kv-unified`` を自動付与する
+        (``llama.kv_unified`` で明示上書き可) ので、各スロットは full n_ctx を
+        使える。等分 (``n_ctx // slots``) するのは非 unified のときだけ。
+        以前は無条件に等分していて、3 スロット構成で long_form の予算が
+        8192 // 3 = 2730 に縮んでいた (2026-09-17)。
         """
-        llama_cfg = self.config.get("llama", {})
+        llama_cfg = self.config.get("llama", {}) or {}
         total_ctx = resolve_context_size_for_mode(self.config, self._mode)
-        slots = max(llama_cfg.get("slots", 1), 1)
+        raw_slots = llama_cfg.get("slots", "auto")
+        slots = 0 if raw_slots == "auto" else max(int(raw_slots or 1), 1)
+        unified = llama_cfg.get("kv_unified")
+        if unified is None:
+            unified = raw_slots == "auto" or slots > 1
+        if unified or slots <= 1:
+            return total_ctx
         return total_ctx // slots
 
     async def _build_plan_for_generation(
@@ -877,6 +897,9 @@ class LongFormOrchestrator:
         self._mode = mode
         # 出力先形式を保持 (document_quality ゲートの形式判定に参照)
         self._target_format = (target_format or "").lower()
+        reset = getattr(self.strategy, "reset_truncation", None)
+        if reset is not None:
+            reset()
         # 前回 generate() の確定本文が残ると finalize が古い本文を配信し得るため、
         # リクエスト冒頭で None に戻す (現状は per-request インスタンスだが防御的に)。
         self.last_text_output = None
@@ -1377,7 +1400,7 @@ class LongFormOrchestrator:
             "stream": True,
             "temperature": self._generation_params.get("temperature", 0.7),
             "max_tokens": max_tokens,
-            "id_slot": self.main_client.chat_slot,
+            "id_slot": self.main_client.longform_slot,
         }
         for k in ("top_p", "top_k", "presence_penalty"):
             if k in self._generation_params:

@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+from dataclasses import dataclass, field
 from collections.abc import AsyncIterator, Callable
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -53,21 +54,22 @@ from backend.free.api.chat.chat_service import (
     run_search_pipeline, session_evicted_turns, session_first_user_message,
 )
 from backend.free.api.chat.chat_streaming import (
-    _cancel_flags,
+    collect_chat_response,
+    request_cancel,
     rag_signals_from_chunks,
     read_existing_for_append,
     stream_deliberative, stream_long_form, stream_meta_cognitive, stream_reactive,
     stream_reactive_light, stream_staged_create,
-    sync_deliberative, sync_long_form, sync_meta_cognitive, sync_reactive_light,
 )
 from backend.free.api.chat._artifact import (
+    artifact_reference_verdict,
     peek_artifact,
-    references_artifact,
     render_artifact_block,
 )
 from backend.free.api.chat._continuation import (
     TruncatedResponse,
     build_continuation_query,
+    disarm_continuation,
     resume_from_last_response,
     take_continuation,
 )
@@ -227,6 +229,63 @@ def _llm_unavailable_response(stream: bool) -> StreamingResponse:  # noqa: ARG00
         yield sse.done()
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+def _llm_unavailable(req: ChatRequest) -> StreamingResponse:
+    """llama-server 未接続を要求の形式に合わせて返す (stream は error フレーム、同期は 503)。"""
+    if req.stream:
+        return _llm_unavailable_response(req.stream)
+    raise HTTPException(status_code=503, detail="llama-server not connected")
+
+
+def _history_budget(cfg: dict) -> tuple[int, int]:
+    """``build_chat_messages`` へ渡す履歴予算 ``(history_min_tokens, working_max_tokens)``。
+
+    3 つの組み立て経路 (主経路 / 軽量パス / 継続生成) が同じ値を使う。
+    軽量パスは「履歴を削らない」立て付けなので、履歴の床も主経路と同じ値にする
+    (0 のままだと動的ブロック (記憶) が履歴を押し出しうる)。
+    """
+    mem = cfg.get("memory") or {}
+    return (
+        int(mem.get("history_min_tokens", DEFAULT_HISTORY_MIN_TOKENS)),
+        int(mem.get("working_max_tokens", DEFAULT_WORKING_MAX_TOKENS)),
+    )
+
+
+async def _respond(
+    req: ChatRequest,
+    client,
+    session_id: str,
+    stream_factory: Callable[[], AsyncIterator[str]],
+    wrapper: StreamWrapper | None = None,
+    *,
+    state: AppState | None = None,
+) -> StreamingResponse | ChatResponse:
+    """層のストリーム実装を要求の形式で返す共通の出口。
+
+    実装はストリーム 1 本で、非ストリーミング要求はそのフレーム列を
+    ``collect_chat_response`` で ``ChatResponse`` に畳む (層ごとの ``sync_*``
+    実装は廃止)。どちらも ``chat_in_flight()`` の中で走らせる (LLMClient に
+    ユーザー応答進行中であることを通知し、背景処理が協調的に yield できる
+    ようにする)。``wrapper`` は検索エラー通知等をストリーム冒頭へ挿す中間関数。
+
+    Trigger A (sleep-time Light、f_02 §4.3) もここで 1 回だけ撃つ。Light は
+    LLM を呼ばず埋め込みサーバだけを使うので、どの層の生成とも並走できる。
+    以前は deliberative / 軽量パスのストリームだけが呼び、meta_cognitive /
+    long_form / staged の長い生成中は Light が走らなかった。
+    """
+    scheduler = getattr(state, "sleep_scheduler", None) if state is not None else None
+    if scheduler is not None:
+        scheduler.on_llm_start()
+    gen = stream_factory()
+    if wrapper is not None:
+        gen = wrapper(gen)
+    if req.stream:
+        return StreamingResponse(
+            _with_chat_in_flight(client, gen), media_type="text/event-stream",
+        )
+    async with client.chat_in_flight():
+        return await collect_chat_response(gen, session_id=session_id)
 
 
 def _resolve_system_prompt(
@@ -530,6 +589,7 @@ async def _dispatch_continuation(
     state: AppState,
     cfg: dict,
     gen_params: dict,
+    system_prompt: str,
     history: list,
     pending: TruncatedResponse,
     session_id: str,
@@ -556,9 +616,6 @@ async def _dispatch_continuation(
     - ``max_tokens`` は軽量パスの上限 (512) ではなく通常のチャット既定を使う。
       512 で切ったのがそもそもの原因なので、続きまで同じ幅で切らない。
     """
-    system_prompt = _append_fact_slate(
-        state, session_id, _resolve_system_prompt(state, req.mode, instance_name),
-    )
     # 履歴の最後 (= 今回の「続けて」) を継続指示へ差し替える。WM 側は
     # ユーザーの実発話のまま残すので、記録と表示は「続けて」で一貫する。
     cont_history = list(history)
@@ -567,22 +624,15 @@ async def _dispatch_continuation(
         cont_history[-1] = {**cont_history[-1], "content": instruction}
     else:
         cont_history.append({"role": "user", "content": instruction})
+    history_min_tokens, working_max_tokens = _history_budget(cfg)
     cont_messages = build_chat_messages(
         system_prompt, cont_history,
         rag_chunks=None, file_contexts=None,
         semmem_block=None,
         context_size=context_size, max_tokens=max_tokens,
         # 履歴の床は主経路と同じ (続きを書くには直前の文脈が要る)。
-        history_min_tokens=int(
-            (cfg.get("memory") or {}).get(
-                "history_min_tokens", DEFAULT_HISTORY_MIN_TOKENS,
-            ),
-        ),
-        working_max_tokens=int(
-            (cfg.get("memory") or {}).get(
-                "working_max_tokens", DEFAULT_WORKING_MAX_TOKENS,
-            ),
-        ),
+        history_min_tokens=history_min_tokens,
+        working_max_tokens=working_max_tokens,
         evicted_turns=session_evicted_turns(state, session_id),
         session_id=session_id,
         # ツール結果は積まれないが、接地注記は全経路で積まれる。
@@ -609,25 +659,20 @@ async def _dispatch_continuation(
             ),
             scope="request",
         )
-    if req.stream:
-        return StreamingResponse(
-            _with_chat_in_flight(client, stream_reactive_light(
-                req.message, cont_messages, client, state, session_id,
-                instance_name, context_size,
-                mode=req.mode, max_tokens=max_tokens,
-                generation_params=gen_params, timer=timer, private=req.private,
-                continuation_tail=pending.tail,
-            )),
-            media_type="text/event-stream",
-        )
-    async with client.chat_in_flight():
-        return await sync_reactive_light(
-            req.message, cont_messages, client, state, session_id,
-            instance_name, context_size,
-            mode=req.mode, max_tokens=max_tokens,
-            generation_params=gen_params, timer=timer, private=req.private,
-            continuation_tail=pending.tail,
-        )
+    args = (
+        req.message, cont_messages, client, state, session_id,
+        instance_name, context_size,
+    )
+    kwargs = dict(
+        mode=req.mode, max_tokens=max_tokens,
+        generation_params=gen_params, timer=timer, private=req.private,
+        continuation_tail=pending.tail,
+    )
+    return await _respond(
+        req, client, session_id,
+        lambda: stream_reactive_light(*args, **kwargs),
+        state=state,
+    )
 
 
 async def _dispatch_reactive_light(
@@ -636,6 +681,7 @@ async def _dispatch_reactive_light(
     state: AppState,
     cfg: dict,
     gen_params: dict,
+    system_prompt: str,
     history: list,
     session_id: str,
     instance_name: str,
@@ -664,27 +710,16 @@ async def _dispatch_reactive_light(
     軽量さは「RAG / SemMem / few-shot / ツール判定を通さない」ことと
     ``max_tokens`` の上限で担保しており、履歴を削ることではない。
     """
-    system_prompt = _append_fact_slate(
-        state, session_id, _resolve_system_prompt(state, req.mode, instance_name),
-    )
     semmem_block = await _light_semmem_block(req, state, cfg, timer, session_id)
+    history_min_tokens, working_max_tokens = _history_budget(cfg)
     light_messages = build_chat_messages(
         system_prompt, history,
         rag_chunks=None, file_contexts=None,
         semmem_block=semmem_block,
         context_size=context_size, max_tokens=max_tokens,
         # 「履歴を削らない」が軽量パスの立て付けなので、履歴の床も主経路と同じ値。
-        # 0 のままだと動的ブロック (記憶) が履歴を押し出しうる。
-        history_min_tokens=int(
-            (cfg.get("memory") or {}).get(
-                "history_min_tokens", DEFAULT_HISTORY_MIN_TOKENS,
-            ),
-        ),
-        working_max_tokens=int(
-            (cfg.get("memory") or {}).get(
-                "working_max_tokens", DEFAULT_WORKING_MAX_TOKENS,
-            ),
-        ),
+        history_min_tokens=history_min_tokens,
+        working_max_tokens=working_max_tokens,
         # 軽量パスも切り詰め注記 / 自己出力の計量を通す (build_chat_messages 内)。
         evicted_turns=session_evicted_turns(state, session_id),
         # 会話全体の計量 (「何ターン目?」) は session_id が無いと no-op になる。
@@ -693,23 +728,19 @@ async def _dispatch_reactive_light(
         post_append_reserve_tokens=notes_post_append_reserve_tokens(),
     )
     light_max = min(max_tokens or REACTIVE_LIGHT_MAX_TOKENS, REACTIVE_LIGHT_MAX_TOKENS)
-    if req.stream:
-        return StreamingResponse(
-            _with_chat_in_flight(client, stream_reactive_light(
-                req.message, light_messages, client, state, session_id,
-                instance_name, context_size,
-                mode=req.mode, max_tokens=light_max,
-                generation_params=gen_params, timer=timer, private=req.private,
-            )),
-            media_type="text/event-stream",
-        )
-    async with client.chat_in_flight():
-        return await sync_reactive_light(
-            req.message, light_messages, client, state, session_id,
-            instance_name, context_size,
-            mode=req.mode, max_tokens=light_max,
-            generation_params=gen_params, timer=timer, private=req.private,
-        )
+    args = (
+        req.message, light_messages, client, state, session_id,
+        instance_name, context_size,
+    )
+    kwargs = dict(
+        mode=req.mode, max_tokens=light_max,
+        generation_params=gen_params, timer=timer, private=req.private,
+    )
+    return await _respond(
+        req, client, session_id,
+        lambda: stream_reactive_light(*args, **kwargs),
+        state=state,
+    )
 
 
 async def _run_search_timed(
@@ -802,7 +833,19 @@ def _resolve_artifact_block(
     if not session_id:
         return None
     artifact = peek_artifact(state, session_id)
-    if artifact is None or not references_artifact(query):
+    if artifact is None:
+        return None
+    verdict = artifact_reference_verdict(query)
+    dl = getattr(state, "debug_logger", None)
+    if dl is not None:
+        dl.log_decision(
+            decision_point="artifact_reference",
+            chosen=str(verdict.value) if verdict.band == "fire" else "none",
+            candidates=["section_ref", "demonstrative", "artifact_operation", "none"],
+            reason=verdict.evidence,
+            scope="request",
+        )
+    if verdict.band != "fire":
         return None
     block = render_artifact_block(
         artifact, budget_chars=_ARTIFACT_BLOCK_MAX_CHARS, query=query,
@@ -813,6 +856,111 @@ def _resolve_artifact_block(
         len(artifact.text), len(block),
     )
     return block
+
+
+@dataclass
+class TurnContext:
+    """1 ターンで組み立てた文脈。層はここから必要な形を引く。
+
+    以前は ``_build_messages_with_search`` が 6 要素タプルを返し、層ごとに
+    別名 (``prefetched_rag`` / ``rag_block`` / ``file_context_block`` …) で
+    受け取っていた。同じ材料を層ごとに違う形で渡す構造が「軽量パスだけ記憶が
+    無い」型の崖 (2026-08 に 3 回) を生んだ。
+
+    **描画順の契約**: ``messages`` の中身 (静的 system → 履歴 → 最後の user に
+    前置する動的ブロックの順) は ``build_chat_messages`` が決める。ここは順序を
+    持たない — 順序を変えると接頭辞 KV キャッシュが 0 になる (2026-09-11 実測)。
+    """
+
+    #: deliberative が LLM に渡す messages 配列 (動的ブロック込み)。
+    messages: list
+    #: 検索エラー通知 / 出典 / 切り詰め通知をストリーム冒頭へ挿す中間関数。
+    wrapper: StreamWrapper
+    #: ``[関連する記憶]`` ブロック (meta が system へ再注入する)。
+    semmem_block: str | None
+    #: 検索で採用した ``(chunk_id, salience, content)`` (long_form / meta が再利用)。
+    scored_chunks: list[tuple[str, float, str]] | None
+    #: 採用チャンクの生スコア最大値 (cosine スケール、Level 0 の ``rag_top1_score``)。
+    rag_top_raw: float | None
+    #: query 依存の few-shot ブロック ("" = 無し)。
+    fewshot_block: str
+    #: 添付ファイルのブロック (meta / long_form は messages を LLM に渡さないため別途注入)。
+    file_block: str | None
+    #: 実際に注入されたファクトの属性スロット (``search_history`` の抑止に使う)。
+    covered_attributes: set[str] = field(default_factory=set)
+
+    @property
+    def rag_used(self) -> bool:
+        return rag_signals_from_chunks(self.scored_chunks, self.rag_top_raw)[0]
+
+    @property
+    def rag_top1_score(self) -> float | None:
+        return rag_signals_from_chunks(self.scored_chunks, self.rag_top_raw)[1]
+
+    @property
+    def rag_block_for_meta(self) -> str | None:
+        return _format_rag_block_for_meta(self.scored_chunks)
+
+
+@dataclass
+class RoutePlan:
+    """このターンをどの層で、何を投機し、どこへ出すか — 分岐の根拠を 1 箇所に持つ。
+
+    ``chat()`` は以前、分類結果を見て「judge を投機するか」「検索を投機するか」
+    「output_target をどう決めるか」を手書きで分岐していた。ここに畳むことで、
+    投機とディスパッチが同じ根拠から出て、``layer_escalation`` の理由も
+    1 系統になる。
+    """
+
+    layer: str
+    reason: str
+    is_long_form: bool = False
+    escalated_from: str | None = None
+    #: create: file / editor / chat、chat: file / chat。
+    output_target: str = "chat"
+    #: create モードで UI へ通知する出力先 (``editor_route`` フレーム)。
+    editor_route: str | None = None
+
+    @property
+    def speculate_judge(self) -> bool:
+        """query 単位のツール判定を先行起動するか (meta は task 単位で判定する)。"""
+        return self.layer != "meta_cognitive"
+
+    @property
+    def speculate_search(self) -> bool:
+        """検索パイプラインを先行起動するか (reactive 即応答は使わない)。"""
+        return self.layer != "reactive"
+
+    def escalate(self, state: AppState, layer: str, reason: str) -> None:
+        """reactive から上位層へ上げる (decision.jsonl に理由を残す)。"""
+        _log_layer_escalation(state, chosen=layer, reason=reason)
+        self.escalated_from = self.layer if self.layer == "reactive" else self.escalated_from
+        self.layer = layer
+        self.reason = reason
+
+
+def _plan_output_target(req: ChatRequest) -> tuple[str, str | None]:
+    """``(output_target, editor_route)`` を発話とモードから決める。
+
+    create モード:
+    - 出力先パス明示 → "file" (write_file でディスクへ)
+    - 否定指示 ("エディタに出さず…") → "chat" (チャット本文にコードブロック)
+    - 既定 → "editor" (ディスク書込せず editor_code チャネルでエディタペインへ)
+
+    chat モードは **書込み先が特定できるときだけ** file。従来は無条件に
+    "file" だったため、パスを一切含まない依頼でも「書き込む」プランが組まれ、
+    write_file を撃ちようがないまま failed になり成果物が捨てられていた
+    (2026-09-06 監査 F-02)。
+    """
+    if is_create_mode(req.mode):
+        if _extract_file_path(req.message):
+            target = "file"
+        elif detect_editor_route(req.message) == "chat":
+            target = "chat"
+        else:
+            target = "editor"
+        return target, ("editor" if target == "editor" else "chat")
+    return ("file" if indicates_write_destination(req.message) else "chat"), None
 
 
 async def _build_messages_with_search(
@@ -831,17 +979,14 @@ async def _build_messages_with_search(
     fewshot_block: str | None = None,
     covered_attributes: set[str] | None = None,
     session_id: str = "",
-) -> tuple[
-    list, StreamWrapper, str | None,
-    list[tuple[str, float, str]] | None, float | None, str,
-]:
-    """統合検索を実行し ``messages`` / SSE 通知ラッパ / semmem ブロック / 取得済み
-    scored_chunks / 採用チャンクの生スコア最大値を構築する。``scored_chunks`` は
-    long_form 経路が orchestrator に再利用注入するために返す (非 long_form 経路は
-    ``messages`` 側で消費するため未使用)。最後の要素は Level 0 の
-    ``rag_top1_score`` 用で、``scored_chunks`` 側のスコアが
-    順位式 (c_16 §7.2) 適用後の salience なのに対し、
-    こちらは cosine スケールの生スコア (``SearchResult.top_raw_score``)。
+) -> TurnContext:
+    """統合検索を実行し、このターンの文脈 (:class:`TurnContext`) を組む。
+
+    ``messages`` は deliberative が消費し、``scored_chunks`` / ``file_block`` /
+    ``semmem_block`` / ``fewshot_block`` は meta / long_form が messages を LLM に
+    渡さないため別形で消費する。``rag_top_raw`` は Level 0 の ``rag_top1_score``
+    用で、``scored_chunks`` 側のスコアが順位式 (c_16 §7.2) 適用後の salience
+    なのに対し、こちらは cosine スケールの生スコア (``SearchResult.top_raw_score``)。
 
     ``search_task`` が渡された場合は chat() が先行起動した検索タスクを await して
     回収する (conflict 判定 / tool 判定との並走)。None の場合はここで直列実行する。
@@ -921,6 +1066,7 @@ async def _build_messages_with_search(
     # 「履歴に含まれていない」としか言えない (_artifact の説明を参照)。
     artifact_block = _resolve_artifact_block(state, session_id, req.message)
 
+    history_min_tokens, working_max_tokens = _history_budget(cfg)
     messages = build_chat_messages(
         system_prompt, history, rag_chunks, file_contexts,
         context_size, max_tokens,
@@ -929,16 +1075,8 @@ async def _build_messages_with_search(
         salience_ranker=salience_ranker,
         semmem_block=semmem_block,
         fewshot_block=fewshot_block,
-        history_min_tokens=int(
-            (cfg.get("memory") or {}).get(
-                "history_min_tokens", DEFAULT_HISTORY_MIN_TOKENS,
-            ),
-        ),
-        working_max_tokens=int(
-            (cfg.get("memory") or {}).get(
-                "working_max_tokens", DEFAULT_WORKING_MAX_TOKENS,
-            ),
-        ),
+        history_min_tokens=history_min_tokens,
+        working_max_tokens=working_max_tokens,
         # 会話の前半が窓外へ落ちている状態を「全体を走査する質問」にだけ伝える。
         evicted_turns=session_evicted_turns(state, session_id),
         # 「何ターン目?」「「横浜」は何回?」は窓の中だけでは数えられない。
@@ -978,9 +1116,17 @@ async def _build_messages_with_search(
         async for frame in inner_gen:
             yield frame
 
-    return (
-        messages, _wrapper, semmem_block, scored_chunks, rag_top_raw_score,
-        fewshot_block,
+    return TurnContext(
+        messages=messages,
+        wrapper=_wrapper,
+        semmem_block=semmem_block,
+        scored_chunks=scored_chunks,
+        rag_top_raw=rag_top_raw_score,
+        fewshot_block=fewshot_block,
+        # 添付ファイルは deliberative 経路では messages 側で消費されるが、
+        # meta_cognitive / long_form 経路は messages を LLM に渡さないため別途注入する。
+        file_block=_format_file_block(file_contexts),
+        covered_attributes=covered_attributes if covered_attributes is not None else set(),
     )
 
 
@@ -1272,58 +1418,77 @@ async def _dispatch_long_form(
     session_id: str,
     instance_name: str,
     context_size: int,
-    messages: list,
-    search_error_wrapper: StreamWrapper,
+    ctx: TurnContext,
     timer: StageTimer,
     output_target: str = "file",
-    prefetched_rag: list[tuple[str, float, str]] | None = None,
-    prefetched_rag_top_score: float | None = None,
-    file_context_block: str | None = None,
+    staged: bool = False,
 ) -> StreamingResponse | ChatResponse:
     """Meta-Cognitive (long_form) 経路: 長文生成オーケストレータを起動する。
 
     ``output_target`` は create モード時の出力先 (``"file"`` / ``"editor"`` /
     ``"chat"``) を ``stream_long_form`` / ``sync_long_form`` に伝播する。
     既定 ``"file"`` (チャット応答パス互換)。
+
+    ``staged=True`` (create + ``pipeline=staged`` + Pro + aux 健全、
+    :func:`_staged_create_enabled`) はストリーミング要求のときだけ専用
+    LoopDriver をインライン駆動し spec→code→test を実行する。非ストリーミング
+    要求は従来 longform 経路へ、タスクグラフ合成が空 (aux degraded 等) のときは
+    stream 内で同じ longform ストリームへ委譲する。以前は staged 専用の
+    ディスパッチが longform の呼び出しを 3 回写経していた。
     """
     base_ok, client = await ensure_base_model_health(client, state, cfg)
     if not base_ok:
-        if req.stream:
-            return _llm_unavailable_response(req.stream)
-        raise HTTPException(status_code=503, detail="llama-server not connected")
+        return _llm_unavailable(req)
 
     orchestrator = _build_long_form_orchestrator(
         client, state, cfg, gen_params, session_id,
     )
     existing_content = await read_existing_for_append(req.message, state)
+    args = (
+        orchestrator, req.message, session_id,
+        req.mode, state, instance_name, context_size,
+        ctx.messages, existing_content,
+    )
+    kwargs = dict(
+        timer=timer,
+        private=req.private,
+        output_target=output_target,
+        prefetched_rag=ctx.scored_chunks,
+        prefetched_rag_top_score=ctx.rag_top_raw,
+        file_context_block=ctx.file_block,
+    )
 
-    if req.stream:
-        return StreamingResponse(
-            _with_chat_in_flight(client, search_error_wrapper(stream_long_form(
-                orchestrator, req.message, session_id,
-                req.mode, state, instance_name, context_size,
-                messages, existing_content,
-                timer=timer,
-                private=req.private,
-                output_target=output_target,
-                prefetched_rag=prefetched_rag,
-                prefetched_rag_top_score=prefetched_rag_top_score,
-                file_context_block=file_context_block,
-            ))),
-            media_type="text/event-stream",
+    def _long_form_stream():
+        return stream_long_form(*args, **kwargs)
+
+    if staged and req.stream:
+        codegen = make_staged_codegen_delegate(client, cfg)
+        staged_cfg = (cfg.get("create", {}) or {}).get("staged", {}) or {}
+        part_codegen = (
+            make_staged_codegen_delegate(
+                client, cfg, max_tokens=int(staged_cfg.get("part_max_tokens", 1536)),
+            )
+            if staged_cfg.get("part_generation_enabled", False) else None
         )
-    async with client.chat_in_flight():
-        return await sync_long_form(
-            orchestrator, req.message, session_id,
-            req.mode, state, instance_name, context_size,
-            messages, existing_content,
-            timer=timer,
-            private=req.private,
-            output_target=output_target,
-            prefetched_rag=prefetched_rag,
-            prefetched_rag_top_score=prefetched_rag_top_score,
-            file_context_block=file_context_block,
+        return await _respond(
+            req, client, session_id,
+            lambda: stream_staged_create(
+                query=req.message, session_id=session_id, state=state, cfg=cfg,
+                instance_name=instance_name, context_size=context_size,
+                messages=ctx.messages, output_target=output_target,
+                codegen=codegen, part_codegen=part_codegen,
+                # 合成失敗時のフォールバック (外側で ctx.wrapper 済みのため raw)
+                fallback_factory=_long_form_stream,
+                timer=timer, private=req.private,
+                prefetched_rag=ctx.scored_chunks,
+                prefetched_rag_top_score=ctx.rag_top_raw,
+                file_context_block=ctx.file_block,
+            ),
+            ctx.wrapper, state=state,
         )
+    return await _respond(
+        req, client, session_id, _long_form_stream, ctx.wrapper, state=state,
+    )
 
 
 def make_staged_codegen_delegate(client, cfg: dict, *, max_tokens: int | None = None):
@@ -1383,89 +1548,6 @@ def _staged_create_enabled(req: ChatRequest, cfg: dict, state: AppState) -> bool
     return True
 
 
-async def _dispatch_staged_create(
-    req: ChatRequest,
-    client,
-    state: AppState,
-    cfg: dict,
-    gen_params: dict,
-    session_id: str,
-    instance_name: str,
-    context_size: int,
-    messages: list,
-    search_error_wrapper: StreamWrapper,
-    timer: StageTimer,
-    output_target: str = "file",
-    prefetched_rag: list[tuple[str, float, str]] | None = None,
-    prefetched_rag_top_score: float | None = None,
-    file_context_block: str | None = None,
-) -> StreamingResponse | ChatResponse:
-    """staged クリエイト: 専用 LoopDriver をインライン駆動し spec→code→test を実行。
-
-    非ストリーミング要求 / base 不健全時は従来 longform 経路へフォールバックする。
-    タスクグラフ合成が空 (aux degraded 等) のときも stream 内で longform へ委譲。
-    """
-    base_ok, client = await ensure_base_model_health(client, state, cfg)
-    if not base_ok:
-        if req.stream:
-            return _llm_unavailable_response(req.stream)
-        raise HTTPException(status_code=503, detail="llama-server not connected")
-
-    orchestrator = _build_long_form_orchestrator(
-        client, state, cfg, gen_params, session_id,
-    )
-    existing_content = await read_existing_for_append(req.message, state)
-
-    # staged はストリーミング前提。非ストリーム要求は従来 longform に委譲する。
-    if not req.stream:
-        async with client.chat_in_flight():
-            return await sync_long_form(
-                orchestrator, req.message, session_id,
-                req.mode, state, instance_name, context_size,
-                messages, existing_content,
-                timer=timer, private=req.private, output_target=output_target,
-                prefetched_rag=prefetched_rag,
-                prefetched_rag_top_score=prefetched_rag_top_score,
-                file_context_block=file_context_block,
-            )
-
-    codegen = make_staged_codegen_delegate(client, cfg)
-    staged_cfg = (cfg.get("create", {}) or {}).get("staged", {}) or {}
-    part_codegen = (
-        make_staged_codegen_delegate(
-            client, cfg, max_tokens=int(staged_cfg.get("part_max_tokens", 1536)),
-        )
-        if staged_cfg.get("part_generation_enabled", False) else None
-    )
-
-    def _fallback_factory():
-        # 合成失敗時のフォールバック (外側で search_error_wrapper 済みのため raw)
-        return stream_long_form(
-            orchestrator, req.message, session_id,
-            req.mode, state, instance_name, context_size,
-            messages, existing_content,
-            timer=timer, private=req.private, output_target=output_target,
-            prefetched_rag=prefetched_rag,
-            prefetched_rag_top_score=prefetched_rag_top_score,
-            file_context_block=file_context_block,
-        )
-
-    return StreamingResponse(
-        _with_chat_in_flight(client, search_error_wrapper(stream_staged_create(
-            query=req.message, session_id=session_id, state=state, cfg=cfg,
-            instance_name=instance_name, context_size=context_size,
-            messages=messages, output_target=output_target,
-            codegen=codegen, part_codegen=part_codegen,
-            fallback_factory=_fallback_factory,
-            timer=timer, private=req.private,
-            prefetched_rag=prefetched_rag,
-            prefetched_rag_top_score=prefetched_rag_top_score,
-            file_context_block=file_context_block,
-        ))),
-        media_type="text/event-stream",
-    )
-
-
 def _with_artifact_material(
     state: AppState, session_id: str, history: list,
 ) -> list:
@@ -1510,18 +1592,16 @@ async def _dispatch_meta_cognitive(
     session_id: str,
     instance_name: str,
     context_size: int,
-    messages: list,
-    search_error_wrapper: StreamWrapper,
+    ctx: TurnContext,
     timer: StageTimer,
-    semmem_block: str | None = None,
-    rag_block: str | None = None,
-    file_block: str | None = None,
-    fewshot_block: str | None = None,
     output_target: str = "file",
-    rag_used: bool = False,
-    rag_top1_score: float | None = None,
 ) -> StreamingResponse | ChatResponse:
-    """Meta-Cognitive (通常) 経路: 計画 + ツールループ。"""
+    """Meta-Cognitive (通常) 経路: 計画 + ツールループ。
+
+    meta 経路は固定の PLAN/EXECUTE/CONTENT scaffold を使うため、few-shot は
+    system へ結合せず instance block として渡し、ツールループ / コンテンツ生成 /
+    fallback の system に [参考例] として注入する (Level 1 進化を create 生成へ反映)。
+    """
     # 「その計画書を保存して」型の依頼に、直前の成果物を **素材** として渡す。
     # ``_generate_content`` は既に「直近の会話」を素材にする仕組みを持つが、
     # 長文成果物は履歴予算に入らず落ちているので素材が空になり、**別物を
@@ -1555,13 +1635,13 @@ async def _dispatch_meta_cognitive(
         # に記録 (decision_point=``meta_cognitive_llm_route``)
         debug_logger=state.debug_logger,
         # ツールループ全反復で SemMem メモリを維持 (初回ターンと同じ block)
-        semmem_block=semmem_block,
+        semmem_block=ctx.semmem_block,
         # search pipeline 取得済み RAG を維持 (long_form の prefetched_rag と同型)
-        rag_block=rag_block,
+        rag_block=ctx.rag_block_for_meta,
         # 添付ファイル内容を維持 (deliberative の messages 注入と等価)
-        file_block=file_block,
+        file_block=ctx.file_block,
         # Level 1 進化 few-shot を維持 (固定 scaffold の [参考例] に注入)
-        fewshot_block=fewshot_block,
+        fewshot_block=ctx.fewshot_block,
         code_generator=code_generator,
         # 内部 loop/token 予算を create_model の実窓に合わせる
         mode=req.mode,
@@ -1569,34 +1649,26 @@ async def _dispatch_meta_cognitive(
     keepalive_sec = cfg.get("streaming", {}).get(
         "keepalive_interval_sec", DEFAULT_KEEPALIVE_INTERVAL_SEC,
     )
-    if req.stream:
-        return StreamingResponse(
-            _with_chat_in_flight(client, search_error_wrapper(stream_meta_cognitive(
-                meta_agent, req.message, system_prompt, history,
-                client, state, session_id, instance_name, context_size,
-                messages, req.mode,
-                generation_params=gen_params,
-                keepalive_interval=keepalive_sec,
-                timer=timer,
-                private=req.private,
-                output_target=output_target,
-                rag_used=rag_used,
-                rag_top1_score=rag_top1_score,
-            ))),
-            media_type="text/event-stream",
-        )
-    async with client.chat_in_flight():
-        return await sync_meta_cognitive(
-            meta_agent, req.message, system_prompt, history,
-            client, state, session_id, instance_name, context_size,
-            messages, req.mode,
-            generation_params=gen_params,
-            timer=timer,
-            private=req.private,
-            output_target=output_target,
-            rag_used=rag_used,
-            rag_top1_score=rag_top1_score,
-        )
+    args = (
+        meta_agent, req.message, system_prompt, history,
+        client, state, session_id, instance_name, context_size,
+        ctx.messages, req.mode,
+    )
+    kwargs = dict(
+        generation_params=gen_params,
+        timer=timer,
+        private=req.private,
+        output_target=output_target,
+        rag_used=ctx.rag_used,
+        rag_top1_score=ctx.rag_top1_score,
+    )
+    return await _respond(
+        req, client, session_id,
+        lambda: stream_meta_cognitive(
+            *args, keepalive_interval=keepalive_sec, **kwargs,
+        ),
+        ctx.wrapper, state=state,
+    )
 
 
 async def _dispatch_deliberative(
@@ -1610,14 +1682,10 @@ async def _dispatch_deliberative(
     instance_name: str,
     context_size: int,
     max_tokens: int | None,
-    messages: list,
-    search_error_wrapper: StreamWrapper,
+    ctx: TurnContext,
     timer: StageTimer,
-    rag_used: bool = False,
-    rag_top1_score: float | None = None,
     tool_judge_task: "asyncio.Task | None" = None,
     escalated_from: str | None = None,
-    answered_attributes: frozenset[str] = frozenset(),
 ) -> StreamingResponse | ChatResponse:
     """Deliberative 経路: ツール判定 + LLM 推論。
 
@@ -1627,6 +1695,7 @@ async def _dispatch_deliberative(
     # 参考情報が付いたターンは接地回答なので温度を下げる (ツール接地と同じ
     # 理屈、ただし記憶は実測値ではないので 0.2 まで下げない。
     # CONTEXT_GROUNDED_TEMPERATURE のコメント参照)。既に低ければ据え置く。
+    rag_used, rag_top1_score = ctx.rag_used, ctx.rag_top1_score
     if rag_used:
         gen_params = {
             **gen_params,
@@ -1643,46 +1712,35 @@ async def _dispatch_deliberative(
         # コンテンツ生成 max_tokens を create_model の実窓に合わせる
         mode=req.mode,
     )
-
-    if req.stream:
-        return StreamingResponse(
-            _with_chat_in_flight(client, search_error_wrapper(stream_deliberative(
-                delib_agent, req.message, messages, client, state,
-                session_id, instance_name, context_size,
-                mode=req.mode, max_tokens=max_tokens,
-                conversation=history,
-                generation_params=gen_params,
-                timer=timer,
-                private=req.private,
-                rag_used=rag_used,
-                rag_top1_score=rag_top1_score,
-                tool_judge_task=tool_judge_task,
-                escalated_from=escalated_from,
-                # 窓の先頭が会話の先頭かを deliberative 側で判定するために渡す
-                # (``_append_session_position_fact`` 参照)。
-                evicted_turns=session_evicted_turns(state, session_id),
-                session_head=session_first_user_message(state, session_id),
-                answered_attributes=answered_attributes,
-            ))),
-            media_type="text/event-stream",
-        )
-    async with client.chat_in_flight():
-        return await sync_deliberative(
-            delib_agent, req.message, messages, client, state,
-            session_id, instance_name, context_size,
-            mode=req.mode, max_tokens=max_tokens,
-            conversation=history,
-            generation_params=gen_params,
-            timer=timer,
-            private=req.private,
-            rag_used=rag_used,
-            rag_top1_score=rag_top1_score,
-            tool_judge_task=tool_judge_task,
-            escalated_from=escalated_from,
-            evicted_turns=session_evicted_turns(state, session_id),
-            session_head=session_first_user_message(state, session_id),
-            answered_attributes=answered_attributes,
-        )
+    args = (
+        delib_agent, req.message, ctx.messages, client, state,
+        session_id, instance_name, context_size,
+    )
+    kwargs = dict(
+        mode=req.mode, max_tokens=max_tokens,
+        conversation=history,
+        generation_params=gen_params,
+        timer=timer,
+        private=req.private,
+        rag_used=rag_used,
+        rag_top1_score=rag_top1_score,
+        tool_judge_task=tool_judge_task,
+        escalated_from=escalated_from,
+        # 窓の先頭が会話の先頭かを deliberative 側で判定するために渡す
+        # (``_append_session_position_fact`` 参照)。
+        evicted_turns=session_evicted_turns(state, session_id),
+        session_head=session_first_user_message(state, session_id),
+        # 実際に注入されたファクトの属性スロット。「この属性の現在値はもう
+        # プロンプトに載っている」を判定して search_history を抑止する。
+        answered_attributes=_answered_attributes(
+            req.message, req.mode, ctx.covered_attributes,
+        ),
+    )
+    return await _respond(
+        req, client, session_id,
+        lambda: stream_deliberative(*args, **kwargs),
+        ctx.wrapper, state=state,
+    )
 
 
 @router.post("/chat")
@@ -1707,9 +1765,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     cfg = get_config()
     client = await ensure_llm_client(state, cfg)
     if client is None:
-        if req.stream:
-            return _llm_unavailable_response(req.stream)
-        raise HTTPException(status_code=503, detail="llama-server not connected")
+        return _llm_unavailable(req)
 
     instance_name = cfg.get("instance", {}).get("name", "evoref")
     context_size = resolve_context_size_for_mode(cfg, req.mode)
@@ -1759,9 +1815,16 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     ) or resume_from_last_response(history, req.message, req.mode)
     if pending_continuation is not None:
         return await _dispatch_continuation(
-            req, client, state, cfg, gen_params, history, pending_continuation,
-            session_id, instance_name, context_size, max_tokens, StageTimer(),
+            req, client, state, cfg, gen_params, system_prompt, history,
+            pending_continuation, session_id, instance_name, context_size,
+            max_tokens, StageTimer(),
         )
+    # 「続けて」は **直前のターン** の続き。継続でない通常ターンが始まった
+    # 時点で古い切断待ちは意味を失うので、ここで解除する。deliberative 系の
+    # ストリームは終端で解除 / 再武装するが、meta_cognitive / long_form /
+    # 同期経路は解除しないため、切断 → 別経路のターン → 「続けて」で
+    # 1 時間 (TTL) は古い切断末尾を継ぎ足していた。
+    disarm_continuation(state, session_id)
 
     # few-shot は _build_messages_with_search が 1 度だけ選ぶ (検索のクエリ埋め込み
     # を再利用)。以前はここで bi-gram 版を先に選んでいたが、deliberative では
@@ -1796,14 +1859,21 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         except Exception as e:  # pragma: no cover - 縮退で吸収する
             logger.warning("Write intent gate failed, falling back: %s", e)
 
-    agent_layer = classifier.classify(
-        req.message, mode=req.mode,
-        context=lambda: _recent_dialogue_text(history),
-        write_intent_hint=write_intent_hint,
+    output_target, editor_route = _plan_output_target(req)
+    plan = RoutePlan(
+        layer=classifier.classify(
+            req.message, mode=req.mode,
+            context=lambda: _recent_dialogue_text(history),
+            write_intent_hint=write_intent_hint,
+        ),
+        reason=getattr(classifier, "_last_classify_reason", "default"),
+        is_long_form=bool(classifier.is_long_form),
+        output_target=output_target,
+        editor_route=editor_route,
     )
     logger.info(
         "Agent layer: %s (mode=%s) for query: %s",
-        agent_layer, req.mode,
+        plan.layer, req.mode,
         "[PRIVATE]" if req.private else req.message[:80],
     )
     # primary routing を decision.jsonl に記録 (evolve 限定)。後続の reactive→
@@ -1813,9 +1883,9 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     if dl is not None:
         dl.log_decision(
             decision_point="layer_classification",
-            chosen=agent_layer,
+            chosen=plan.layer,
             candidates=["reactive", "deliberative", "meta_cognitive"],
-            reason=getattr(classifier, "_last_classify_reason", "default"),
+            reason=plan.reason,
             context={"mode": req.mode},
             scope="request",
         )
@@ -1828,7 +1898,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
     if layer_shadow is not None and not req.private:
         try:
             _shadow_task = asyncio.create_task(
-                layer_shadow.observe(req.message, agent_layer),
+                layer_shadow.observe(req.message, plan.layer),
                 name="layer_shadow",
             )
             # 参照を握らないと GC されうる。結果は見ないので握り潰す。
@@ -1864,7 +1934,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         # と分かるターンは投機判定を起動しない — 結果は使われず cancel されるだけ
         # で、分類器往復 (10〜24 秒) を空撃ちしていた (2026-09-14)。
         if (
-            agent_layer != "meta_cognitive"
+            plan.speculate_judge
             and state.tool_call_judge is not None
             and state.tools_registry is not None
             and not query_short_circuits_tool_judge(req.message)
@@ -1876,7 +1946,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                     window_complete=session_evicted_turns(state, session_id) == 0,
                 )
             )
-        if agent_layer != "reactive":
+        if plan.speculate_search:
             search_task = asyncio.create_task(
                 _run_search_timed(req, state, cfg, timer, session_id),
             )
@@ -1885,9 +1955,6 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         except Exception as exc:
             logger.warning("Conflict review task failed (degrading): %s", exc)
             conflict_ctx = ConflictTurnContext()
-
-        # reactive→deliberative エスカレート時に Level 0 経験記録の出自を残す。
-        escalated_from: str | None = None
 
         # 競合セクションは reactive / reactive_light には載せない。この 2 経路は
         # 検索もクエリ埋め込みも走らせないため、注入本体と同じ関連度ゲートを
@@ -1907,7 +1974,7 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
         # rule-instant には到達しない (2026-08-21 に実機で確認)。影響を受ける
         # のは ``greeting`` / ``short_query`` で reactive に落ちたターン。
 
-        if agent_layer == "reactive":
+        if plan.layer == "reactive":
             reactive_response = _try_reactive_layer(
                 req, state, session_id, instance_name, context_size,
             )
@@ -1930,15 +1997,13 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             # 何を埋め込んでも当たらないので、件数で先に短絡する
             # (2026-09-02 監査 C1)。
             if await _url_recall_hit(req, state):
-                agent_layer = "deliberative"
-                escalated_from = "reactive"
-                _log_layer_escalation(state, chosen="deliberative", reason="url_recall_hit")
+                plan.escalate(state, "deliberative", "url_recall_hit")
                 logger.info(
                     "Reactive escalated to deliberative due to URL recall hit: %s",
                     req.message[:80],
                 )
 
-        if agent_layer == "reactive":
+        if plan.layer == "reactive":
             # ルールベース miss → 軽量パス gating。tool 判定 (judge) で tool 不要
             # なら base 1 ターンの軽量パス、tool 必要なら deliberative へエスカレート。
             decision, judge_task, gate_reason = await _gate_reactive_light(
@@ -1952,148 +2017,58 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                     state, chosen="reactive_light", reason=gate_reason,
                 )
                 return await _dispatch_reactive_light(
-                    req, client, state, cfg, gen_params, history,
+                    req, client, state, cfg, gen_params, system_prompt, history,
                     session_id, instance_name, context_size, max_tokens, timer,
                 )
             # deliberative へエスカレート (judge_task は tool 実行用に流用される)。
             # 競合は conflict_ctx 経由で build_semmem_injection が (関連度ゲート
             # を通ったときだけ) surface する。
-            agent_layer = "deliberative"
-            escalated_from = "reactive"
-            _log_layer_escalation(state, chosen="deliberative", reason=gate_reason)
+            plan.escalate(state, "deliberative", gate_reason)
             logger.info("Reactive escalated to deliberative (%s)", gate_reason)
 
-        # create モードのみ生成コードの出力先を決定する。
-        # - 出力先パス明示 → "file" (従来どおり write_file でディスクへ)
-        # - 否定指示 ("エディタに出さず…") → "chat" (チャット本文にコードブロック)
-        # - 既定 → "editor" (ディスク書込せず editor_code チャネルでエディタペインへ)
-        # editor_route SSE フレームはフロント表示制御 (suppressCode) 用に併せて通知する。
-        if is_create_mode(req.mode):
-            if _extract_file_path(req.message):
-                output_target = "file"
-            elif detect_editor_route(req.message) == "chat":
-                output_target = "chat"
-            else:
-                output_target = "editor"
-            editor_route = "editor" if output_target == "editor" else "chat"
-        else:
-            # chat モードも **書込み先が特定できるときだけ** file にする。
-            #
-            # 従来は無条件に "file" だったため、パスを一切含まない依頼でも
-            # 「書き込む」プランが組まれ、write_file を撃ちようがないまま
-            # ``write expected but not executed`` で failed になり、生成済みの
-            # 成果物が捨てられていた (2026-09-06 監査 F-02: 26.6 分かけて
-            # draft_document が正しい回答を 3 本生成したのに、届いたのは
-            # 「(書き込みが実行されませんでした)」の 17 文字だけ)。
-            #
-            # 「パス未指定なら書かずに本文へ返す」経路 (``_execute_editor_task``)
-            # は元から実装されていたのに、create モードにしか繋がっていなかった。
-            output_target = (
-                "file" if indicates_write_destination(req.message) else "chat"
-            )
-            editor_route = None
-
-        # 実際に注入されたファクトの属性スロット。「この属性の現在値はもう
-        # プロンプトに載っている」を判定して search_history を抑止する
-        # (_dispatch_deliberative → process の answered_attributes)。
-        covered_attributes: set[str] = set()
-        (
-            messages, search_error_wrapper, semmem_block, scored_chunks,
-            rag_top_raw, fewshot_block,
-        ) = (
-            await _build_messages_with_search(
-                req, state, cfg, system_prompt, history, file_contexts,
-                context_size, max_tokens, timer,
-                editor_route=editor_route,
-                conflict_ctx=conflict_ctx,
-                covered_attributes=covered_attributes,
-                search_task=search_task,
-                fewshot_block=fewshot_block,
-                session_id=session_id,
-            )
+        ctx = await _build_messages_with_search(
+            req, state, cfg, system_prompt, history, file_contexts,
+            context_size, max_tokens, timer,
+            editor_route=plan.editor_route,
+            conflict_ctx=conflict_ctx,
+            covered_attributes=set(),
+            search_task=search_task,
+            fewshot_block=fewshot_block,
+            session_id=session_id,
         )
 
-        # 添付ファイルは deliberative 経路では messages 側で消費されるが、
-        # meta_cognitive / long_form 経路は messages を LLM に渡さないため別途注入する。
-        file_block = _format_file_block(file_contexts)
-
-        # Level 0 経験記録用 RAG シグナル。long_form 経路は prefetched_rag から
-        # 自前で導出するため、ここでは meta_cognitive / deliberative へ伝播する。
-        # スコアは cosine スケールの生スコア (rag_top_raw) を渡す — scored_chunks 側は
-        # 順位式 (c_16 §7.2) 適用後の salience で cosine と比較できない。
-        rag_used, rag_top1_score = rag_signals_from_chunks(scored_chunks, rag_top_raw)
-
-        match agent_layer:
-            case "meta_cognitive" if classifier.is_long_form:
-                # long_form は precomputed tool 判定を使わない (judge_task は通常 None)。
+        match plan.layer:
+            case "meta_cognitive":
+                # meta / long_form は precomputed tool 判定を使わない (meta は
+                # task 記述単位で judge するため query 単位の流用不可、judge_task
+                # は通常 None)。念のため破棄する。
                 _cancel_pending_task(judge_task)
                 # create mode + pipeline=staged + Pro + aux 健全 のときは
                 # 仕様書→コード→テストの staged パイプライン (専用 LoopDriver) へ。
-                # それ以外は従来 longform 経路 (無改変フォールバック)。
-                if _staged_create_enabled(req, cfg, state):
-                    return await _dispatch_staged_create(
-                        req, client, state, cfg, gen_params, session_id,
-                        instance_name, context_size, messages,
-                        search_error_wrapper, timer,
-                        output_target=output_target,
-                        prefetched_rag=scored_chunks,
-                        prefetched_rag_top_score=rag_top_raw,
-                        file_context_block=file_block,
-                    )
-                return await _dispatch_long_form(
-                    req, client, state, cfg, gen_params, session_id,
-                    instance_name, context_size, messages, search_error_wrapper, timer,
-                    output_target=output_target,
-                    prefetched_rag=scored_chunks,
-                    prefetched_rag_top_score=rag_top_raw,
-                    file_context_block=file_block,
-                )
-            case "meta_cognitive":
-                # meta は task 記述単位で judge するため query 単位の precomputed は
-                # 流用不可 (judge_task は通常 None)。念のため破棄する。
-                # meta 経路は固定の PLAN/EXECUTE/CONTENT scaffold を使うため、
-                # few-shot は system へ結合せず instance block (fewshot_block) として
-                # 渡し、ツールループ / コンテンツ生成 / fallback の system に
-                # [参考例] として注入する (Level 1 進化を create 生成へ反映)。
-                _cancel_pending_task(judge_task)
-                # create mode + pipeline=staged + Pro + aux 健全 のときは、
                 # is_long_form でない create 要求 (「テトリスを作成して」級) も
-                # staged パイプラインへ。is_long_form ブランチと同一ゲート。
-                if _staged_create_enabled(req, cfg, state):
-                    return await _dispatch_staged_create(
+                # 同じゲートで staged へ流す。それ以外は is_long_form なら
+                # 従来 longform 経路、そうでなければ計画 + ツールループ。
+                staged = _staged_create_enabled(req, cfg, state)
+                if staged or plan.is_long_form:
+                    return await _dispatch_long_form(
                         req, client, state, cfg, gen_params, session_id,
-                        instance_name, context_size, messages,
-                        search_error_wrapper, timer,
-                        output_target=output_target,
-                        prefetched_rag=scored_chunks,
-                        prefetched_rag_top_score=rag_top_raw,
-                        file_context_block=file_block,
+                        instance_name, context_size, ctx, timer,
+                        output_target=plan.output_target,
+                        staged=staged,
                     )
                 return await _dispatch_meta_cognitive(
                     req, client, state, cfg, gen_params,
                     system_prompt, history,
-                    session_id, instance_name, context_size,
-                    messages, search_error_wrapper, timer,
-                    semmem_block=semmem_block,
-                    rag_block=_format_rag_block_for_meta(scored_chunks),
-                    file_block=file_block,
-                    fewshot_block=fewshot_block,
-                    output_target=output_target,
-                    rag_used=rag_used,
-                    rag_top1_score=rag_top1_score,
+                    session_id, instance_name, context_size, ctx, timer,
+                    output_target=plan.output_target,
                 )
             case _:
                 return await _dispatch_deliberative(
                     req, client, state, cfg, gen_params, history,
                     session_id, instance_name, context_size, max_tokens,
-                    messages, search_error_wrapper, timer,
-                    rag_used=rag_used,
-                    rag_top1_score=rag_top1_score,
+                    ctx, timer,
                     tool_judge_task=judge_task,
-                    escalated_from=escalated_from,
-                    answered_attributes=_answered_attributes(
-                        req.message, req.mode, covered_attributes,
-                    ),
+                    escalated_from=plan.escalated_from,
                 )
     except BaseException:
         # 例外が伝播する経路 (build/dispatch 等) で未消費の投機タスクが残らない
@@ -2107,9 +2082,11 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
 @router.post("/chat/cancel", response_model=CancelResponse)
 async def cancel_chat(req: CancelRequest):
     """ストリーミング生成を中断"""
-    logger.debug("POST /api/chat/cancel: session=%s", req.session_id)
-    if req.session_id in _cancel_flags:
-        _cancel_flags[req.session_id] = True
+    logger.debug(
+        "POST /api/chat/cancel: session=%s request=%s",
+        req.session_id, req.request_id,
+    )
+    if request_cancel(req.session_id, req.request_id):
         logger.debug("Cancel flag set for session %s", req.session_id)
         return CancelResponse(cancelled=True)
     return CancelResponse(cancelled=False, tokens_generated=0)

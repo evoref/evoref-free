@@ -515,6 +515,23 @@ class CogWriterStrategy:
         self._debug_logger = debug_logger
         self._lf_config = config.get("long_form", {})
         self._generation_params = generation_params or {}
+        #: 直近 generate() で ``finish_reason=length`` で切れたユニット生成の数と
+        #: 最後の切断メタ (``StreamOutcome``)。orchestrator が ``reset_truncation``
+        #: で世代ごとに戻し、chat 側が ``sse.output_truncated`` の開示に使う。
+        #: 以前は長文経路の切断が SSE にも経験にも一切出なかった
+        #: (``orchestrator.generate`` は素の async generator で outcome を持たない)。
+        self.truncated_units: int = 0
+        self.last_truncation = None
+
+    def reset_truncation(self) -> None:
+        self.truncated_units = 0
+        self.last_truncation = None
+
+    def _note_truncation(self, stream) -> None:
+        outcome = getattr(stream, "outcome", None)
+        if outcome is not None and getattr(outcome, "truncated", False):
+            self.truncated_units += 1
+            self.last_truncation = outcome
 
     async def create_plan(
         self,
@@ -831,7 +848,7 @@ class CogWriterStrategy:
                 "stream": True,
                 "temperature": self._generation_params.get("temperature", 0.7),
                 "max_tokens": unit_max_tokens,
-                "id_slot": self.main_client.chat_slot,
+                "id_slot": self.main_client.longform_slot,
             }
             for k in ("top_p", "top_k", "presence_penalty"):
                 if k in self._generation_params:
@@ -839,6 +856,7 @@ class CogWriterStrategy:
             stream = await self.main_client.generate(messages, **gen_kwargs)
             async for token in stream:
                 yield token
+            self._note_truncation(stream)
         except Exception as e:
             logger.error("Unit generation failed: %s", e)
             raise UnitGenerationError(
@@ -923,12 +941,13 @@ class CogWriterStrategy:
                 stream=True,
                 temperature=0.5,
                 max_tokens=unit_max_tokens,
-                id_slot=self.main_client.chat_slot,
+                id_slot=self.main_client.longform_slot,
             )
             revised_text = ""
             async for token in stream:
                 revised_text += token
                 yield token
+            self._note_truncation(stream)
 
             # generated_units を更新
             rolling.generated_units[issue.unit_idx] = revised_text

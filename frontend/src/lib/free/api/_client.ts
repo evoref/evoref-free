@@ -162,12 +162,13 @@ export async function requestFormDataVoid(
  */
 export async function cancelStreamingOperation(
 	endpoint: string,
-	sessionId: string
+	sessionId: string,
+	extra?: Record<string, unknown>
 ): Promise<{ cancelled: boolean }> {
 	const res = await fetch(`${BASE_URL}${endpoint}`, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ session_id: sessionId })
+		body: JSON.stringify({ session_id: sessionId, ...(extra ?? {}) })
 	});
 	if (!res.ok) {
 		return { cancelled: false };

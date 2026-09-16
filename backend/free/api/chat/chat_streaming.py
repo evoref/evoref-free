@@ -9,7 +9,12 @@ from __future__ import annotations
 
 from backend.free.api.chat.chat_stream_common import (
     _cancel_flags,
+    agent_layer_frame,
+    cancel_requested,
     cancel_scope,
+    collect_chat_response,
+    current_request_id,
+    request_cancel,
     _emit_timing,
     logger,
     _make_step_queue_callback,
@@ -53,7 +58,6 @@ from backend.free.api.chat.chat_stream_meta import (
     _STEP_DESCRIPTION_MAX_CHARS,
     stream_meta_cognitive,
     stream_reactive,
-    sync_meta_cognitive,
     _truncate_step_description,
     _WRITTEN_PATH_RE,
     _written_paths,
@@ -66,7 +70,6 @@ from backend.free.api.chat.chat_stream_long_form import (
     _flush_step_queue_to_sse,
     _LongFormStreamState,
     stream_long_form,
-    sync_long_form,
 )
 from backend.free.api.chat.chat_stream_deliberative import (
     _apply_generation_params,
@@ -77,8 +80,6 @@ from backend.free.api.chat.chat_stream_deliberative import (
     stream_deliberative,
     _stream_filtered_token_pipeline,
     stream_reactive_light,
-    sync_deliberative,
-    sync_reactive_light,
 )
 from backend.free.api.chat.chat_stream_staged import (
     _finalize_staged_stream,

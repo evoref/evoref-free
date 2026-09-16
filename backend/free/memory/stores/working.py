@@ -1,6 +1,7 @@
 """Layer 1: ワーキングメモリ（直近Nターンのインメモリ管理）"""
 
 import time
+from collections.abc import Callable
 from uuid import uuid4
 
 from backend.free.memory.stores.fact_slate import SessionFactSlate
@@ -379,6 +380,11 @@ class WorkingMemoryRegistry:
         # legacy 読み手 (session_id を持たない統計 API 等) が 1 件も無いときに
         # 見る空の窓。台帳には載せないので drop の対象にならない。
         self._scratch: WorkingMemory | None = None
+        #: 窓を台帳から外したときに呼ぶ (``session_id`` を受ける)。応答パス側の
+        #: セッション別台帳 (蓄積バッファ / 注入 id / 出典) は WM の寿命に
+        #: 合わせて畳む契約だが、LRU 押し出しからは誰も呼んでいなかった
+        #: (明示終了だけが畳み、押し出されたセッションの全文はプロセス寿命まで残る)。
+        self.on_drop: Callable[[str], None] | None = None
 
     # ── 取得 ────────────────────────────────────────────────────────
 
@@ -433,6 +439,14 @@ class WorkingMemoryRegistry:
             "registry: dropped session %s (%d turn(s) in the window, active=%d)",
             session_id, pending, len(self._sessions),
         )
+        if self.on_drop is not None:
+            try:
+                self.on_drop(session_id)
+            except Exception:  # noqa: BLE001 - 台帳の後始末で窓の管理を壊さない
+                logger.warning(
+                    "registry: on_drop hook failed for session %s", session_id,
+                    exc_info=True,
+                )
         return wm
 
     def drop_all(self) -> int:

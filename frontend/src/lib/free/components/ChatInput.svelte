@@ -17,6 +17,7 @@
 		markLastUserTruncated,
 		markLastAssistantTruncated,
 		nextMessageId,
+		registerStreamAbort,
 		tokenInfo,
 		sessionId,
 		currentMode,
@@ -35,6 +36,8 @@
 	let textarea: HTMLTextAreaElement | undefined = $state();
 	let abortController: AbortController | null = null;
 	let cancelled = false;
+	/** 進行中ターンの request_id (`agent_layer` フレームで届く)。キャンセルの宛先 */
+	let activeRequestId: string | undefined;
 	/** このターンで partial editor_code を受信したか (final を streaming タブへ確定するため) */
 	let sawPartialEditor = false;
 	/** このターンでエディタへコードを出力したか (editor_code 受信)。完了通知の発火条件 */
@@ -83,6 +86,13 @@
 		isStreaming.set(true);
 		cancelled = false;
 		abortController = new AbortController();
+		// 送信時のモード / セッションでターン全体を扱う (完了通知の判定を
+		// 完了時点のモードで行うと、生成中に切り替えた場合に食い違う)。
+		const mode = get(currentMode);
+		const turnSessionId = get(sessionId);
+		activeRequestId = undefined;
+		// 「新しいチャット」等の外部からの中断を受け付ける。
+		registerStreamAbort(handleCancel);
 
 		addMessage({
 			id: nextMessageId(),
@@ -92,9 +102,11 @@
 		});
 
 		try {
-			for await (const event of chatStream(text, get(currentMode), get(sessionId), files, abortController.signal, get(corpusMode))) {
+			for await (const event of chatStream(text, mode, turnSessionId, files, abortController.signal, get(corpusMode))) {
 				if (event.type === 'token' && event.token) {
 					appendToLastAssistant(event.token);
+				} else if (event.type === 'agent_layer') {
+					activeRequestId = event.request_id;
 				} else if (event.type === 'token_info' && event.token_info) {
 					tokenInfo.set(event.token_info);
 				} else if (event.type === 'step' && event.step) {
@@ -161,7 +173,7 @@
 				}
 			}
 			// クリエイトモードでエディタへコードを出力したターンの完了通知
-			if (!cancelled && get(currentMode) === 'create' && sawEditorCode) {
+			if (!cancelled && mode === 'create' && sawEditorCode) {
 				addStepResultToLastAssistant($t('chat.code_output_done'), 'done');
 			}
 		} catch (e) {
@@ -174,16 +186,22 @@
 			if (cancelled) {
 				appendToLastAssistant(`\n\n*${$t('chat.cancelled')}*`);
 			}
+			registerStreamAbort(null);
 			isStreaming.set(false);
 			abortController = null;
+			activeRequestId = undefined;
 		}
 	}
 
 	function handleCancel() {
 		if (!$isStreaming || cancelled) return;
 		cancelled = true;
+		// 中断はこのターンの session_id + request_id へ送る (「新しいチャット」が
+		// ID を回した後に呼ばれても、バックエンドで走っている生成は旧 ID に紐づく。
+		// request_id があれば同一セッションの別リクエストを巻き込まない)。
+		const sid = get(sessionId);
 		abortController?.abort();
-		cancelChat(get(sessionId));
+		cancelChat(sid, activeRequestId);
 	}
 
 	function handleKeydown(e: KeyboardEvent) {
