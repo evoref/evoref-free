@@ -1006,7 +1006,41 @@ _RELATIVE_FLOOR_RATIO = 0.6
 #:
 #: そこで宣言どおりノイズ分布の p90 に置く。関連ペア (0.467、実測の一致は
 #: 0.34 以上) は十分上に残る。
+#:
+#: ⚠ この値は **旧 STM combined スケール** のもの。実際に使う棒は
+#: :func:`_uncalibrated_absolute_min` が埋め込みプロファイルから引き、
+#: プロファイルに値が無いときだけこの定数へ倒れる。
 _RELATIVE_FLOOR_ABSOLUTE_MIN = 0.24
+
+
+def _uncalibrated_absolute_min() -> float:
+    """較正が効く前の絶対の棒 (アクティブな埋め込みプロファイル由来)。
+
+    ``MemoryInjector`` が既に同じことをしている
+    (:meth:`~backend.free.memory.pipeline.injector.MemoryInjector._resolve_relevance_thresholds`)
+    — 較正が ``MIN_NOTES`` 溜まるまで走らない窓で、静的値が別モデル前提だと
+    **ノイズが全部通る**。あちらはプロファイルの
+    ``rag.injection_relevance_min_score`` (bert = 0.54) へ追随させて直したが、
+    **エピソード検索側のこの棒だけが旧スケールの定数 (0.24) のまま残っていた**
+    — 同じ判定の読み手が 2 つあり、片方だけ直っていた形。
+
+    実測 (2026-09-16 ライブ監査): 全リセット直後の 13 ターンは実効フロアが
+    0.25〜0.32 で、bge-m3 のノイズ床 (無関係ペア 0.29〜0.47) の下にあり、
+    ``[参考情報]`` の 4〜5 枠が毎ターン無関係なノートで埋まった。
+
+    棒そのものは呼出側で ``min(configured, …)`` に掛けられるので、
+    **ユーザーが config で明示した値を超えて厳しくはならない**。
+    """
+    from backend.free.rag.memory_threshold_calibration import (
+        profile_embedding_threshold,
+    )
+
+    from_profile = profile_embedding_threshold(
+        "rag", "injection_relevance_min_score",
+    )
+    if from_profile is None:
+        return _RELATIVE_FLOOR_ABSOLUTE_MIN
+    return float(from_profile)
 
 #: 「そのターンの最良証拠」に対する相対の棒 (既定値)。
 #:
@@ -1118,8 +1152,14 @@ def _resolve_keep_floor(
         # ``SleepTimeWorker`` の Light にも較正リトライを置き、確定を Full 待ち
         # にしない (``_run_light_locked``)。この枝が使われる窓を数ターンに
         # 縮めるのが正しい対処で、窓の中の挙動は従来どおり「緩めて救う」。
+        #
+        # ただし **緩める下限は現行の埋め込みスケールで置く**
+        # (:func:`_uncalibrated_absolute_min`、2026-09-16 監査)。定数 0.24 の
+        # ままだと bge-m3 のノイズ床の下なので「緩めて救う」ではなく全通しに
+        # なる。``min(configured, …)`` で挟むので config の明示値より厳しくは
+        # ならず、到達不能側へは倒れない。
         relaxed = min(configured, top_raw_score * _RELATIVE_FLOOR_RATIO)
-        absolute = max(relaxed, min(configured, _RELATIVE_FLOOR_ABSOLUTE_MIN))
+        absolute = max(relaxed, min(configured, _uncalibrated_absolute_min()))
     else:
         absolute = configured
 
@@ -1569,7 +1609,20 @@ async def unified_search(
             return floor_pseudo
         return floor_corpus if cid in corpus_ids else floor_epi
 
+    # 記録する棒は **候補が居るストアのもの** だけにする。候補ゼロのストアの棒
+    # (``top_raw_score=0`` から導かれるので常に静的値) まで max() に入れると、
+    # 1 件も掛かっていない棒がログに載り、採用値がそれを割って見える
+    # (2026-09-16 ライブ監査 F-04)。判定そのものは従来どおり ``_floor_for``。
+    applied_floors: dict[str, float] = {}
+    for cid, _score, _ in merged_raw:
+        if cid in pseudo_ids:
+            applied_floors["pseudo"] = floor_pseudo
+        elif cid in corpus_ids:
+            applied_floors["corpus"] = floor_corpus
+        else:
+            applied_floors["episodic"] = floor_epi
     floor = max(floor_epi, floor_corpus)
+    logged_floor = max(applied_floors.values(), default=floor)
     if floor > 0.0:
         kept_ids = {
             cid for cid, score, _ in merged_raw if score >= _floor_for(cid)
@@ -1577,15 +1630,18 @@ async def unified_search(
         passed = [t for t in merged if t[0] in kept_ids]
         if len(passed) != len(merged):
             logger.info(
-                "Relevance floor: %d/%d chunks passed floor=%.2f "
+                "Relevance floor: %d/%d chunks passed floors=%s "
                 "(quality=%s) for query: %s",
-                len(passed), len(merged), floor, quality, query[:50],
+                len(passed), len(merged),
+                {k: round(v, 3) for k, v in applied_floors.items()},
+                quality, query[:50],
             )
         if debug_logger is not None:
             debug_logger.log_rag_selection(
                 query=query,
                 quality=quality,
-                floor=floor,
+                floor=logged_floor,
+                floors=applied_floors,
                 kept=[(cid, s) for cid, s, _ in merged_raw if cid in kept_ids],
                 rejected=[
                     (cid, s) for cid, s, _ in merged_raw if cid not in kept_ids

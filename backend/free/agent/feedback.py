@@ -50,6 +50,7 @@ from backend.free.core.text_quality import (
     cites_reference_material,
     claims_completed_state_change,
     contradicts_measured_values,
+    fabricated_household_count,
     has_broken_ja_spacing,
     has_chinese_token_leak,
     ignores_calculate_result,
@@ -798,6 +799,7 @@ _OUTCOME_REASON_CHANNELS: tuple[tuple[str, str, str], ...] = (
     ("date result ignored", "content.date_result", "tool_result_ignored"),
     ("claimed completion while blocked", "content.claimed_change", "content_contradiction"),
     ("user echo", "content.user_echo", ""),
+    ("fabricated count", "content.fabricated_count", "content_contradiction"),
 )
 
 
@@ -939,6 +941,7 @@ class FeedbackCollector:
         measured_values: dict[str, set[int]] | None = None,
         calculate_result: float | None = None,
         tool_result_text: str = "",
+        stated_context: str = "",
         truncated: bool = False,
         generation_failed: bool = False,
         session_id: str = "",
@@ -998,6 +1001,7 @@ class FeedbackCollector:
             measured_values=measured_values,
             calculate_result=calculate_result,
             tool_result_text=tool_result_text,
+            stated_context=stated_context,
         )
         if generation_failed:
             # 本文が届かなかった / error フレームで終わったターン。
@@ -1299,6 +1303,7 @@ class FeedbackCollector:
         measured_values: dict[str, set[int]] | None = None,
         calculate_result: float | None = None,
         tool_result_text: str = "",
+        stated_context: str = "",
     ) -> str:
         """ターン成否だけを返す (:meth:`_derive_turn_outcome_with_reason` の薄い皮)。"""
         outcome, _ = FeedbackCollector._derive_turn_outcome_with_reason(
@@ -1310,6 +1315,7 @@ class FeedbackCollector:
             measured_values=measured_values,
             calculate_result=calculate_result,
             tool_result_text=tool_result_text,
+            stated_context=stated_context,
         )
         return outcome
 
@@ -1325,6 +1331,7 @@ class FeedbackCollector:
         measured_values: dict[str, set[int]] | None = None,
         calculate_result: float | None = None,
         tool_result_text: str = "",
+        stated_context: str = "",
     ) -> tuple[str, str | None]:
         """ターン成否 ("success" | "partial" | "failed") と理由を決定論導出する。
 
@@ -1418,6 +1425,14 @@ class FeedbackCollector:
         if broken_form is not None:
             logger.info("Turn marked failed (%s)", broken_form)
             return "failed", f"output form: {broken_form}"
+        # 本人が言っていない世帯の人数を補って言い直した = 記憶の想起としても
+        # 誤り。system プロンプトの規則 (「『妻と娘と犬』を『ご家族 4 人』と
+        # 数え直さない」) は実機で守られず、2026-09-16 監査の **両ランで再現**
+        # した。数えるだけで決まるので推定を含まない。
+        fabricated = fabricated_household_count(text, stated_context, query=query)
+        if fabricated is not None:
+            logger.info("Turn marked failed (fabricated count: %s)", fabricated)
+            return "failed", f"fabricated count: {fabricated}"
         return "success", None
 
     @staticmethod

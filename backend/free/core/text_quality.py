@@ -1247,20 +1247,136 @@ __all__ = [
     "claimed_written_files",
     "unwritten_file_claims",
     "unwritten_file_disclosure_note",
+    "fabricated_household_count",
 ]
+
+#: 人数の表記に現れる漢数字 (1〜99 まで)。世帯の人数はこの範囲で足りる。
+_KANJI_DIGITS = {
+    "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9,
+}
+
+#: 「N 人」「N 名」の N。漢数字・全角・半角を受ける。
+_PERSON_COUNT_RE = re.compile(r"([0-9０-９一二三四五六七八九十]{1,4})\s*[人名]")
+
+#: 人数が **世帯の人数** として述べられていると見なす近接語。
+_HOUSEHOLD_WORD_RE = re.compile(r"家族|世帯|暮らし|ぐらし")
+
+#: 近接とみなす文字数 (前後)。
+_HOUSEHOLD_WINDOW_CHARS = 40
+
+
+def _person_count_to_int(token: str) -> int | None:
+    """「4」「４」「四」「十二」を int へ (1〜99、読めなければ ``None``)。"""
+    t = token.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    if t.isdigit():
+        return int(t)
+    if "十" in t:
+        head, _, tail = t.partition("十")
+        tens = _KANJI_DIGITS.get(head, 1) if head else 1
+        ones = _KANJI_DIGITS.get(tail, 0) if tail else 0
+        if (head and head not in _KANJI_DIGITS) or (tail and tail not in _KANJI_DIGITS):
+            return None
+        return tens * 10 + ones
+    return _KANJI_DIGITS.get(t)
+
+
+def _person_counts_in(text: str) -> set[int]:
+    """``text`` に現れる「N 人 / N 名」の N の集合 (純粋関数)。"""
+    out: set[int] = set()
+    for m in _PERSON_COUNT_RE.finditer(text or ""):
+        n = _person_count_to_int(m.group(1))
+        if n is not None:
+            out.add(n)
+    return out
+
+
+#: 人数そのものを尋ねる問い。**尋ねられて数えたのは数え直しではない**ので、
+#: この形のターンは判定しない (規則は「述べ返すときに補うな」であって
+#: 「数を答えるな」ではない)。
+_ASKS_PERSON_COUNT_RE = re.compile(
+    r"何人|何名|人数|幾人"
+    r"|\bhow\s+many\s+(?:people|members|persons)\b",
+    re.IGNORECASE,
+)
+
+
+def fabricated_household_count(
+    response: str, context: str, *, query: str = "",
+) -> str | None:
+    """本人が述べていない **世帯の人数** を応答が補っていれば理由を返す。
+
+    system プロンプトの規則「ユーザーの事実を述べ返すとき … 本人が言っていない
+    人数・件数・数量・順序を補って言い直さない (例:「妻と娘と犬」を「ご家族
+    4 人」と数え直さない)」に対応する決定論の検証器。規則だけでは守られず、
+    2026-09-16 ライブ監査の **両ランで再現** した (「家族は妻と娘が二人います」
+    → 「奥様、長女、次女の **4 人家族** ですね」)。数え直しは本人の言い方を
+    書き換えるので、記憶の想起としても誤りになる。
+
+    判定は 2 条件:
+
+    1. 応答の「N 人 / N 名」の近傍 (:data:`_HOUSEHOLD_WINDOW_CHARS` 文字) に
+       世帯を指す語 (家族 / 世帯 / 暮らし) がある — 「2 名 1 組で計数」のような
+       **世帯と無関係な人数** を巻き込まないための枠
+    2. その N が ``context`` (プロンプトに載ったユーザー発話・記憶・参考情報)
+       の「N 人 / N 名」に **1 つも現れない**
+
+    ``context`` 側も同じ「N 人 / N 名」の枠で数えるのが要点。「四年生」「4 月」
+    のような別単位の数字を根拠にすると、数え直しを見逃す (実測: 次女が
+    「小学四年生」なので、素の数字照合では 4 が根拠ありに見えてしまう)。
+    """
+    body = response or ""
+    if not body or not (context or "").strip():
+        # 文脈が渡らない経路 (呼出側が組み立てていない) は **判定不能**。
+        # 空集合として扱うと「本人は何も数を言っていない」と読めてしまい、
+        # あらゆる人数が捏造判定になる。判定できないときは判定しない。
+        return None
+    if _ASKS_PERSON_COUNT_RE.search(query or ""):
+        # 「家族は何人ですか」に「4 人です」と答えるのは数え直しではなく応答。
+        return None
+    stated = _person_counts_in(context)
+    for m in _PERSON_COUNT_RE.finditer(body):
+        n = _person_count_to_int(m.group(1))
+        if n is None or n in stated:
+            continue
+        lo = max(0, m.start() - _HOUSEHOLD_WINDOW_CHARS)
+        hi = m.end() + _HOUSEHOLD_WINDOW_CHARS
+        if not _HOUSEHOLD_WORD_RE.search(body[lo:hi]):
+            continue
+        return f"{m.group(0)} is not a count the user stated"
+    return None
 
 #: 「<パス> に書き込みました」型の主張。**実際に書けたか** は別途 file system で
 #: 確かめる (下記 :func:`unwritten_file_claims`)。
 #:
 #: 拡張子を持つトークンだけを対象にする。「メモに保存しました」のような対象が
 #: ファイルでない言い回しを拾わないための境界。
+#:
+#: 格助詞は ``を`` を含む。「<file> **に** 書き込みました」(場所格) だけを見て
+#: いたので、「<file> **を** 作成しました」(対格) が網から丸ごと漏れていた —
+#: 実インシデント (2026-09-16 ライブ監査 F-07): 「点検記録.txt を作って」に
+#: ``draft_document`` (書込みをしないツール) が選ばれ、下書きしか作っていない
+#: のに「点検記録.txt を作成しました。」と答え、開示注記は付かなかった。
+#: 次のターンの追記は行き先を解決できず別名の出力ファイルへ落ち、その次の
+#: 読み出しは ``File not found`` になった。格助詞は閉じた集合なので、ここは
+#: 語形を足す方向で塞いでよい (不変則 #12 / #14 の対象は開いた語彙)。
 _WRITE_CLAIM_RE = re.compile(
     r"(?P<path>(?:[A-Za-z]:[\\/])?[^\s、。「」『』（）()\[\]]*"
     r"[A-Za-z0-9_\-぀-ヿ一-鿿][.][A-Za-z0-9]{1,8})"
-    r"\s*(?:[へに]|に対して)\s*"
+    r"\s*(?:[をへに]|に対して)\s*"
     r"(?:[^\s、。]{0,8})?"
     r"(?:書き込|書き出|書きだ|保存|出力|作成|生成|エクスポート|セーブ)"
     r"(?:み|し|きま)?(?:ました|ます|た|できました)",
+)
+
+
+#: パス候補の先頭に紛れ込んだ格助詞。パス文字クラスは和文を許すので、
+#: 「<ディレクトリ> **に**点検記録.txt を作成しました」のように助詞が直前に
+#: 付くと、それごと名前として掴む (実測 2026-09-16: 開示注記が
+#: 「(注: に点検記録.txt は…)」になった)。名前が残ることを先読みで確かめてから
+#: 1〜2 文字だけ剥がす。
+_LEADING_PARTICLE_RE = re.compile(
+    r"^[にへをがはとでもやのから]{1,2}(?=[^\s]+\.[A-Za-z0-9]{1,8}$)",
 )
 
 
@@ -1268,7 +1384,7 @@ def claimed_written_files(response: str) -> list[str]:
     """応答が「書き込んだ」と述べているファイルパスを出現順に返す (純粋関数)。"""
     out: list[str] = []
     for m in _WRITE_CLAIM_RE.finditer(response or ""):
-        path = m.group("path").strip()
+        path = _LEADING_PARTICLE_RE.sub("", m.group("path").strip())
         if path and path not in out:
             out.append(path)
     return out

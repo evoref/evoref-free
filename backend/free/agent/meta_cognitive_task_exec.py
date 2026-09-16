@@ -18,6 +18,7 @@ from backend.free.agent.meta_cognitive_tools import (
 )
 from backend.free.agent.output_format import (
     anchor_relative_output_path,
+    redirect_unnamed_overwrite,
     resolve_dir_output_path,
 )
 from backend.free.agent.meta_cognitive_content import note_stream_truncation
@@ -579,6 +580,7 @@ class _TaskExecutionMixin:
     def _normalize_loop_tool_args(
         tool_name: str, tool_args: dict, original_query: str,
         conversation: list[dict] | None = None,
+        task_description: str = "",
     ) -> dict:
         """`write_file` / `read_file` の args を正規化する。それ以外は素通し。"""
         if tool_name == "write_file":
@@ -586,7 +588,7 @@ class _TaskExecutionMixin:
             fp = args.get("file_path", "")
             if fp:
                 args["file_path"] = _TaskExecutionMixin._resolve_write_path(
-                    fp, original_query,
+                    fp, original_query, task_description,
                 )
             return args
         if tool_name == "read_file":
@@ -629,7 +631,9 @@ class _TaskExecutionMixin:
         return file_path
 
     @staticmethod
-    def _resolve_write_path(file_path: str, query: str) -> str:
+    def _resolve_write_path(
+        file_path: str, query: str, task_description: str = "",
+    ) -> str:
         """write_file の出力先を確定する。
 
         - 引数名プレースホルダ (``file_path`` / ``<path>`` 等) → クエリ中の
@@ -646,9 +650,19 @@ class _TaskExecutionMixin:
         最後の 1 段が無いと、``compose.yaml`` のような裸名がプロセスの CWD
         (= リポジトリ直下) に着地する (2026-09-08 監査 F-05)。錨付けは
         **この 1 箇所を出口** にする (前段の分岐が増えても漏れないため)。
+
+        錨付けの直前に、**誰も名指ししていない既存ファイルへの上書き** を
+        名指しの対象へ戻す (``redirect_unnamed_overwrite``、2026-09-16 監査
+        F-13)。モデルは文脈に出ているだけのファイル名 (直前のターンの一覧等)
+        を書込み先に選ぶことがあり、書込みは成功するので失敗がどこにも出ない。
         """
         return anchor_relative_output_path(
-            _TaskExecutionMixin._resolve_write_path_from_query(file_path, query),
+            redirect_unnamed_overwrite(
+                _TaskExecutionMixin._resolve_write_path_from_query(
+                    file_path, query,
+                ),
+                task_description, query,
+            ),
         )
 
     @staticmethod
@@ -763,6 +777,7 @@ class _TaskExecutionMixin:
         tool_args = self._normalize_loop_tool_args(
             tool_name, tool_call.get("args", {}), original_query,
             getattr(self, "_conversation", None),
+            getattr(task, "description", "") or "",
         )
 
         # 取得専任タスク (collapse 済み) では write_file を実行しない。出力は後続の

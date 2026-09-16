@@ -57,6 +57,7 @@ VERIFIER_IDS: frozenset[str] = frozenset({
     "content.date_result",      # date_intent ツールの target 日付を回答に使わなかった
     "content.claimed_change",   # 撃てなかったのに完了を述べた
     "content.user_echo",        # ユーザー発話のオウム返し
+    "content.fabricated_count", # 本人が言っていない世帯の人数を補って言い直した
 })
 
 

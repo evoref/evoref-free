@@ -2554,6 +2554,12 @@ async def _build_learn_pillar(
     # あって学習ではない。SleepTimeWorker を構築するのと同じ理由)。
     _wire_attribute_slot_gate(state, mem, gen.embedder, debug_logger, cfg)
 
+    # 社交の定型ゲートは字句段だけで埋め込みが要らないので、構築ではなく
+    # 既存 DebugLogger の差し込みだけを行う (判定は決定ログへ出す)。
+    from backend.free.memory.notes import social_formula_gate
+
+    social_formula_gate.bind_debug_logger(debug_logger)
+
     with _timed(timings, "component_wiring"):
         _wire_sleep_scheduler_models(
             state, mem.sleep_scheduler, learning_scheduler, resolver,

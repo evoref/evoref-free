@@ -95,18 +95,120 @@ def infer_output_extension(query: str, default: str = ".txt") -> str:
     return default
 
 
-def resolve_dir_output_path(file_path: str, query: str) -> str:
-    """``file_path`` が既存ディレクトリなら ``dir/output_<UTC><ext>`` に解決する。
+#: 発話が **裸の名前で** 挙げているファイル。直前が区切り文字のものは除く
+#: (``E:\\out\\report.md`` の ``report.md`` を裸名と取ると、保存先が同じ
+#: ディレクトリのときに読み元を上書きしてしまう)。
+_BARE_FILENAME_RE = re.compile(
+    r"(?<![\\/\w])(?P<name>[^\s\\/、。「」『』（）()\[\]]+\.[A-Za-z0-9]{1,8})(?![\\/])",
+)
 
-    ファイル指定・空文字・解決不能パスは原文のまま返す。``<ext>`` は ``query`` から
-    ``infer_output_extension`` で推論する。``write_file`` がディレクトリ指定を
-    エラーにする問題を、書込み前にファイル名へ解決して回避する。
+
+def named_output_basename(query: str) -> str | None:
+    """発話が裸の名前で挙げている出力ファイル名 (曖昧なら ``None``)。
+
+    「点検記録.txt を作って」「Append two lines to 点検記録.txt」のように
+    **名前だけ** が書かれている場合に、その綴りを返す。候補が 2 つ以上あれば
+    どれが書込み先か決められないので ``None``。
+    """
+    names = {m.group("name") for m in _BARE_FILENAME_RE.finditer(query or "")}
+    return next(iter(names)) if len(names) == 1 else None
+
+
+#: 裸の名前が **書込み先として** 挙がっている形。日本語は格助詞 + 書込み動詞
+#: (「点検記録.txt を作って」「点検記録.txt に二行追記する」)、英語は後置の
+#: ``to`` / ``into`` (「Append two lines to 点検記録.txt」)。読み元
+#: (「report.md を読んで」) を拾わないために動詞まで見る。
+_BARE_WRITE_TARGET_JA_RE = re.compile(
+    r"(?<![\\/\w])(?P<name>[^\s\\/、。「」『』（）()\[\]]+\.[A-Za-z0-9]{1,8})(?![\\/])"
+    r"\s*(?:[をにへ]|に対して)\s*[^\s、。]{0,10}?"
+    # 活用形まで見る。終止形だけだと「点検記録.txt を作って」が外れる
+    # (語形が 1 つ外れると判定ごと落ちる、の典型)。``作業`` のような別語に
+    # 当たらないよう、語幹の直後の 1 文字まで固定する。
+    r"(?:書(?:き|い|く|込|出)|追記|保存|出力|作(?:成|っ|り|る)|生成|セーブ|上書き)",
+)
+_BARE_WRITE_TARGET_EN_RE = re.compile(
+    r"\b(?:to|into)\s+"
+    r"(?<![\\/])(?P<name>[^\s\\/、。「」『』（）()\[\]]+\.[A-Za-z0-9]{1,8})(?![\\/])",
+    re.IGNORECASE,
+)
+
+
+def named_write_target_basename(text: str) -> str | None:
+    """発話/タスクが **書込み先として** 名指ししている裸のファイル名。
+
+    :func:`named_output_basename` との違いは動詞を見ること。読み元として挙がって
+    いるだけの名前 (「report.md を読んで要約して」) を書込み先と取り違えると、
+    事故を防ぐつもりの補正が **読み元の上書き** を起こす。候補が 2 つ以上なら
+    どれとも決められないので ``None``。
+    """
+    body = text or ""
+    names = {
+        m.group("name")
+        for pattern in (_BARE_WRITE_TARGET_JA_RE, _BARE_WRITE_TARGET_EN_RE)
+        for m in pattern.finditer(body)
+    }
+    return next(iter(names)) if len(names) == 1 else None
+
+
+def redirect_unnamed_overwrite(file_path: str, *contexts: str) -> str:
+    """誰も名指ししていない **既存ファイル** への上書きを、名指しの対象へ戻す。
+
+    実インシデント (2026-09-16 ライブ監査 F-13): 「同じファイルに二行追記して
+    ください」(対象 ``点検記録.txt``) で、直前のターンの一覧に出ていただけの
+    ``drive.log`` が書込み先に選ばれ、**4,761 バイトで上書き**された。書込みは
+    成功するのでどこにも失敗が出ず、ユーザーには「追記しました」としか見えない。
+
+    条件は 3 つすべて。1 つでも欠けたら触らない (推測で書込み先を動かさない):
+
+    1. 書込み先が **既に存在するファイル** — 新規作成は壊すものが無い
+    2. その名前が task / query の **どこにも現れない** — 名指しされていれば
+       ユーザーの指示どおり
+    3. task / query が **書込み先として** ちょうど 1 つの名前を挙げている
+       (:func:`named_write_target_basename`)
+
+    振り替え先は「書込み先として挙がっている名前」を、モデルが選んだ
+    ディレクトリの下に置いたもの。
+    """
+    if not file_path:
+        return file_path
+    try:
+        p = Path(file_path)
+        if not p.is_file():
+            return file_path
+    except OSError:
+        return file_path
+    haystack = " ".join(c or "" for c in contexts)
+    if p.name and p.name in haystack:
+        return file_path
+    named = named_write_target_basename(haystack)
+    if not named or named == p.name:
+        return file_path
+    return str(p.parent / named)
+
+
+def resolve_dir_output_path(file_path: str, query: str) -> str:
+    """``file_path`` が既存ディレクトリならその下のファイル名へ解決する。
+
+    ファイル指定・空文字・解決不能パスは原文のまま返す。``write_file`` が
+    ディレクトリ指定をエラーにする問題を、書込み前にファイル名へ解決して回避
+    する。
+
+    名前は **発話が挙げていればその綴り**、無ければ ``output_<UTC><ext>``
+    (``<ext>`` は :func:`infer_output_extension` の推論)。発話の名前を優先
+    するのは、生成名にするとユーザーが指したファイルが別名で作られ、以後の
+    追記・読み出しが行方不明になるため — 実インシデント (2026-09-16 ライブ
+    監査 F-06): 「同じファイルに二行追記してください」(対象 ``点検記録.txt``)
+    が ``E:\\tmp\\live_audit_20260916\\output_20260916T010728Z.txt`` へ書かれ、
+    次のターンの読み出しは ``File not found: …\\点検記録.txt`` になった。
     """
     if not file_path:
         return file_path
     try:
         p = Path(file_path)
         if p.is_dir():
+            named = named_output_basename(query)
+            if named:
+                return str(p / named)
             ext = infer_output_extension(query)
             return str(p / f"output_{utc_compact_stamp()}{ext}")
     except OSError:

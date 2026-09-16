@@ -333,6 +333,12 @@ DEFAULT_RULE_VERIFIERS: dict[str, str] = {
     "自分自身の過去の発言をそのまま繰り返さない": "repetition",
     "Do not repeat your own past reply verbatim": "repetition",
     "今回の会話で述べられた方を採用する": "user_correction",
+    # 「本人が言っていない人数・件数・数量・順序を補って言い直さない」。
+    # 検証器は世帯の人数だけを見る (`fabricated_household_count`) — 規則の
+    # 射程より狭いが、狭い検証器は誤検知を出さないので計数の材料になる
+    # (2026-09-16 監査: 規則だけでは両ランで守られなかった)。
+    "補って言い直さない": "content.fabricated_count",
+    "Do not add counts the user did not state": "content.fabricated_count",
 }
 
 

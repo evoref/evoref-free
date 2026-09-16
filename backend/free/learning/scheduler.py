@@ -1400,11 +1400,25 @@ class LearningScheduler:
         回した末に ``wins=0 losses=0 ties=3`` で不採用 (7.7 分の Level 1 の
         うち 4.2 分)。標本は採用ゲート側には従来どおり渡す (退行の検出は
         残す)。
+
+        **「圧がある」と「採用に届きうる」は別**であることも数える
+        (2026-09-16 ライブ監査 F-12)。標本が勝てない以上、一対比較で得られる
+        純勝ちの **上限は失敗由来ケースの件数そのもの**。したがって
+        ``len(pressure_cases) < adoption_min_net_wins`` のモードは、何世代
+        回しても採用され得ない (``unreachable_net_wins``)。上の
+        ``insufficient_cases`` は標本込みの件数を ``adoption_min_cases`` と
+        比べるので、この不足を見逃す — 実測では訂正 1 件 + 標本 3 件 = 4 件が
+        下限 3 を満たして走り、``min_net_wins=2`` に対し上限 1 の勝負を
+        **10.3 分** かけて ``wins=0 losses=0 ties=4`` で終えた。到達可能性は
+        件数ではなく **採用条件そのもの** と比べる。
         """
         from backend.free.optimizer.prompt_eval import select_prompt_eval_cases
 
         threshold = max(1, self.min_experiences // 2)
-        _, _, min_cases = self._prompt_gate_config()
+        max_cases, _, min_cases = self._prompt_gate_config()
+        # 標本が勝てない一対比較でだけ、純勝ちの上限で到達可能性を見る。
+        # 絶対採点のゲート (compare_prompts 非対応) は net wins を使わない。
+        min_net_wins = self._min_net_wins() if self._pairwise_gate_available() else 0
         kept: dict[str, str] = {}
         skipped: dict[str, dict] = {}
         for mode, text in prompt_texts.items():
@@ -1414,18 +1428,22 @@ class LearningScheduler:
             mode_exp = [
                 e for e in session.experience_snapshot if e.get("mode") == mode
             ]
-            # 圧の有無は失敗由来のケースだけで決める (標本は除く)。
+            # 圧の有無は失敗由来のケースだけで決める (標本は除く)。件数の枠は
+            # 採用ゲートと同じ ``adoption_eval_cases`` にする — ここで狭い枠を
+            # 使うと、ゲートが実際に見る失敗ケース数を過小に数えてしまう。
             pressure_cases = select_prompt_eval_cases(
-                mode_exp, mode, max(1, min_cases), sample_cases=0,
+                mode_exp, mode, max(1, max_cases), sample_cases=0,
             )
             # 実際に採用ゲートへ渡る件数 (標本込み) は下限判定にだけ使う。
             cases = select_prompt_eval_cases(
-                mode_exp, mode, max(1, min_cases), sample_cases=self._sample_cases(),
+                mode_exp, mode, max(1, max_cases), sample_cases=self._sample_cases(),
             )
             if len(mode_exp) < threshold:
                 reason = "insufficient_experiences"
             elif not pressure_cases:
                 reason = "no_selection_pressure"
+            elif len(pressure_cases) < min_net_wins:
+                reason = "unreachable_net_wins"
             elif len(cases) < min_cases:
                 reason = "insufficient_cases"
             else:
@@ -1790,6 +1808,27 @@ class LearningScheduler:
         if self._base_model_changed():
             return {"skipped": True, "reason": "base_model_changed"}
 
+        # **走り出した印はここで立てる** (2026-09-16 監査)。以前は進化本体の
+        # 直前でしか立てておらず、その手前にある訂正検証・選択圧の判定・
+        # 圧が無いときの手本補充 (実測 5 分、aux を何本も撃つ) の間は
+        # ``running=False`` のままだった。API は「動いていない」と報告し、
+        # 再入ガード (``already_running``) も効かないので、次の tick が同じ
+        # 仕事を並走させ得た。
+        self._running = True
+        try:
+            return await self._run_or_resume_level1_locked(
+                reason, llm_client, relax_threshold,
+            )
+        finally:
+            self._running = False
+
+    async def _run_or_resume_level1_locked(
+        self,
+        reason: str,
+        llm_client,
+        relax_threshold: bool,
+    ) -> dict:
+        """``run_or_resume_level1`` の本体 (``_running`` を立てた状態で呼ぶ)。"""
         # 訂正候補の検証は **session snapshot を取る前** に走らせる。
         # snapshot は experiences のコピーなので、後から昇格させても
         # 今回の進化・採用ゲートには届かない (F-03)。
@@ -1821,147 +1860,143 @@ class LearningScheduler:
         phase_durations: dict[str, float] = {}
         try:
             self.reset_yield_event()
-            self._running = True
             # per-run の critique キャッシュを毎回リセット
             self._last_critique_result = None
-            try:
-                # Level 1 tick 冒頭で feedback_pipe を実行し、品質ゲート結果を
-                # FewShotPool / 失敗クリティーク / policy fitness プロバイダへ還流する
-                await self._run_feedback_pipe()
-                # 進化前に経験から few-shot プールを補充する (f_04 §3)。session
-                # snapshot は応答本文を持たない圧縮射影 (L-D3) なので live バッファ
-                # から読む。resume 時は同一データの再投入になるが FewShotPool 側の
-                # 多様性チェックが重複を弾く。
-                await self._update_fewshot_pool_from_experiences(
-                    self._get_filtered_experiences(), llm_client,
-                )
-                # Step 11 — Critique-Synthesis を base prompt 進化より前に 1 回だけ
-                # 実行し、_CachedCritiqueProxy 経由で PromptEvolver に渡す
-                # (モードごとの二重 critique を防ぐ)。
-                await self._step11_critique_synthesis(
-                    session.experience_snapshot, extra_results, phase_durations,
-                )
-                # 進化対象は名前プレフィックス無しの raw 本文。get_prompt() の
-                # 出力 (プレフィックス付き) を渡すと進化後本文へ名前が焼き込まれ、
-                # ランタイムの二重付与で設定名が反映されなくなる。
-                prompt_texts = self._collect_mode_prompt_texts()
-                if not prompt_texts:
-                    logger.warning("No prompts available for evolution")
-                # 選択圧の無いモードは変異生成の前に落とす (f_04 §8 禁則 7)。
-                # 失敗ターンが 1 件も無いモードは欠陥率が 1.0 で全候補同値、
-                # 失敗クエリ語も無いのでタイブレークも 0 — 10 世代回しても
-                # 現行と同値の候補しか出ず、採用ゲートの評価ケースも作れない。
-                prompt_texts, skipped_modes = (
-                    self._drop_modes_without_selection_pressure(prompt_texts, session)
-                )
-                tp = time.monotonic()
-                results = await self._evolver.evolve_all_modes(
-                    experiences=session.experience_snapshot,
-                    prompt_texts=prompt_texts,
-                    llm_client=llm_client,
-                    generations=self.generations,
-                    population_size=self.population_size,
-                    critique_synthesizer=self._select_critique_for_phase1(),
-                    session=session,
-                    yield_check=self.should_yield,
-                    save_session=self.save_active_session,
-                )
-                phase_durations["phase1_base_prompt"] = round(time.monotonic() - tp, 3)
+            # Level 1 tick 冒頭で feedback_pipe を実行し、品質ゲート結果を
+            # FewShotPool / 失敗クリティーク / policy fitness プロバイダへ還流する
+            await self._run_feedback_pipe()
+            # 進化前に経験から few-shot プールを補充する (f_04 §3)。session
+            # snapshot は応答本文を持たない圧縮射影 (L-D3) なので live バッファ
+            # から読む。resume 時は同一データの再投入になるが FewShotPool 側の
+            # 多様性チェックが重複を弾く。
+            await self._update_fewshot_pool_from_experiences(
+                self._get_filtered_experiences(), llm_client,
+            )
+            # Step 11 — Critique-Synthesis を base prompt 進化より前に 1 回だけ
+            # 実行し、_CachedCritiqueProxy 経由で PromptEvolver に渡す
+            # (モードごとの二重 critique を防ぐ)。
+            await self._step11_critique_synthesis(
+                session.experience_snapshot, extra_results, phase_durations,
+            )
+            # 進化対象は名前プレフィックス無しの raw 本文。get_prompt() の
+            # 出力 (プレフィックス付き) を渡すと進化後本文へ名前が焼き込まれ、
+            # ランタイムの二重付与で設定名が反映されなくなる。
+            prompt_texts = self._collect_mode_prompt_texts()
+            if not prompt_texts:
+                logger.warning("No prompts available for evolution")
+            # 選択圧の無いモードは変異生成の前に落とす (f_04 §8 禁則 7)。
+            # 失敗ターンが 1 件も無いモードは欠陥率が 1.0 で全候補同値、
+            # 失敗クエリ語も無いのでタイブレークも 0 — 10 世代回しても
+            # 現行と同値の候補しか出ず、採用ゲートの評価ケースも作れない。
+            prompt_texts, skipped_modes = (
+                self._drop_modes_without_selection_pressure(prompt_texts, session)
+            )
+            tp = time.monotonic()
+            results = await self._evolver.evolve_all_modes(
+                experiences=session.experience_snapshot,
+                prompt_texts=prompt_texts,
+                llm_client=llm_client,
+                generations=self.generations,
+                population_size=self.population_size,
+                critique_synthesizer=self._select_critique_for_phase1(),
+                session=session,
+                yield_check=self.should_yield,
+                save_session=self.save_active_session,
+            )
+            phase_durations["phase1_base_prompt"] = round(time.monotonic() - tp, 3)
 
-                any_yielded = any(r.yielded for r in results.values())
-                if any_yielded:
-                    # session は save_session 経由で最新状態が保存済み
-                    logger.info(
-                        "Level 1 session yielded: id=%s completed_phases=%s "
-                        "yield_count=%d",
-                        session.session_id, session.completed_phases,
-                        session.yield_count,
-                    )
-                    success = True
-                    discarded = self._discard_if_yield_cap_hit(session)
-                    return {
-                        "session_id": session.session_id,
-                        "yielded": True,
-                        "discarded": discarded,
-                        "completed_phases": list(session.completed_phases),
-                        "modes": self._format_modes_summary(results),
-                    }
-
-                # 採用ゲート: 現行と最良候補を同じ失敗ケースで実生成・採点する
-                # (f_04 §4.5)。欠陥率 fitness は候補に無反応なので、採用の可否は
-                # ここで測った差だけで決める。
-                tg = time.monotonic()
-                verdicts = await self._measure_prompt_adoptions(
-                    results, prompt_texts, session.experience_snapshot,
-                )
-                phase_durations["phase2_adoption_gate"] = round(time.monotonic() - tg, 3)
-
-                # 追加最適化 (f_04 §4)。prompt 進化の採用結果と session archive
-                # を失わないため、失敗しても警告のみで finalize へ進む。
-                skipped_phases: list[str] = []
-                try:
-                    skipped_phases = await self._run_extra_optimizations(
-                        session.experience_snapshot, llm_client,
-                        extra_results, phase_durations,
-                        session.experience_cutoff,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Level 1 extra optimizations failed: %s: %s",
-                        type(exc).__name__, exc, exc_info=True,
-                    )
-
-                if skipped_phases:
-                    # ユーザー入力で後半フェーズが協調停止した。以前はここで
-                    # 「完了」として session を archive し優先要求も消費して
-                    # いたため、Step 12 / 14 が飛んだまま次の idle トリガまで
-                    # 誰も再実行しなかった (2026-09-10 ライブ監査 (h) H-08:
-                    # 手動 Level 1 が会話と重なり 6 フェーズ skip で「完了」)。
-                    # phase 1 の yield と同じく **session を残して再開に回す** —
-                    # 完了済みモードは resume で飛ばされ、残りだけ走る。
-                    session.yield_count += 1
-                    self.save_active_session(session)
-                    logger.info(
-                        "Level 1 session yielded in extra phases: id=%s "
-                        "skipped=%s yield_count=%d",
-                        session.session_id, skipped_phases, session.yield_count,
-                    )
-                    success = True
-                    discarded = self._discard_if_yield_cap_hit(session)
-                    return {
-                        "session_id": session.session_id,
-                        "yielded": True,
-                        "discarded": discarded,
-                        "completed_phases": list(session.completed_phases),
-                        "modes": self._format_modes_summary(results),
-                        "skipped_phases": skipped_phases,
-                    }
-
-                self._finalize_completed_level1(
-                    session, results,
-                    extra_results=extra_results,
-                    experiences=session.experience_snapshot,
-                    skipped_phases=skipped_phases,
-                    adoption_verdicts=verdicts,
-                    skipped_modes=skipped_modes,
-                )
-                elapsed = round(time.monotonic() - t0, 3)
-                self._level1_log_debug(
-                    started_at, elapsed, phase_durations,
-                    session.experience_snapshot, self._last_level1_results,
+            any_yielded = any(r.yielded for r in results.values())
+            if any_yielded:
+                # session は save_session 経由で最新状態が保存済み
+                logger.info(
+                    "Level 1 session yielded: id=%s completed_phases=%s "
+                    "yield_count=%d",
+                    session.session_id, session.completed_phases,
+                    session.yield_count,
                 )
                 success = True
+                discarded = self._discard_if_yield_cap_hit(session)
                 return {
                     "session_id": session.session_id,
-                    "yielded": False,
+                    "yielded": True,
+                    "discarded": discarded,
                     "completed_phases": list(session.completed_phases),
                     "modes": self._format_modes_summary(results),
-                    "extra_phases": sorted(extra_results.keys()),
-                    "skipped_phases": skipped_phases,
-                    "noop_modes": sorted(skipped_modes.keys()),
                 }
-            finally:
-                self._running = False
+
+            # 採用ゲート: 現行と最良候補を同じ失敗ケースで実生成・採点する
+            # (f_04 §4.5)。欠陥率 fitness は候補に無反応なので、採用の可否は
+            # ここで測った差だけで決める。
+            tg = time.monotonic()
+            verdicts = await self._measure_prompt_adoptions(
+                results, prompt_texts, session.experience_snapshot,
+            )
+            phase_durations["phase2_adoption_gate"] = round(time.monotonic() - tg, 3)
+
+            # 追加最適化 (f_04 §4)。prompt 進化の採用結果と session archive
+            # を失わないため、失敗しても警告のみで finalize へ進む。
+            skipped_phases: list[str] = []
+            try:
+                skipped_phases = await self._run_extra_optimizations(
+                    session.experience_snapshot, llm_client,
+                    extra_results, phase_durations,
+                    session.experience_cutoff,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Level 1 extra optimizations failed: %s: %s",
+                    type(exc).__name__, exc, exc_info=True,
+                )
+
+            if skipped_phases:
+                # ユーザー入力で後半フェーズが協調停止した。以前はここで
+                # 「完了」として session を archive し優先要求も消費して
+                # いたため、Step 12 / 14 が飛んだまま次の idle トリガまで
+                # 誰も再実行しなかった (2026-09-10 ライブ監査 (h) H-08:
+                # 手動 Level 1 が会話と重なり 6 フェーズ skip で「完了」)。
+                # phase 1 の yield と同じく **session を残して再開に回す** —
+                # 完了済みモードは resume で飛ばされ、残りだけ走る。
+                session.yield_count += 1
+                self.save_active_session(session)
+                logger.info(
+                    "Level 1 session yielded in extra phases: id=%s "
+                    "skipped=%s yield_count=%d",
+                    session.session_id, skipped_phases, session.yield_count,
+                )
+                success = True
+                discarded = self._discard_if_yield_cap_hit(session)
+                return {
+                    "session_id": session.session_id,
+                    "yielded": True,
+                    "discarded": discarded,
+                    "completed_phases": list(session.completed_phases),
+                    "modes": self._format_modes_summary(results),
+                    "skipped_phases": skipped_phases,
+                }
+
+            self._finalize_completed_level1(
+                session, results,
+                extra_results=extra_results,
+                experiences=session.experience_snapshot,
+                skipped_phases=skipped_phases,
+                adoption_verdicts=verdicts,
+                skipped_modes=skipped_modes,
+            )
+            elapsed = round(time.monotonic() - t0, 3)
+            self._level1_log_debug(
+                started_at, elapsed, phase_durations,
+                session.experience_snapshot, self._last_level1_results,
+            )
+            success = True
+            return {
+                "session_id": session.session_id,
+                "yielded": False,
+                "completed_phases": list(session.completed_phases),
+                "modes": self._format_modes_summary(results),
+                "extra_phases": sorted(extra_results.keys()),
+                "skipped_phases": skipped_phases,
+                "noop_modes": sorted(skipped_modes.keys()),
+            }
         finally:
             # outcome.jsonl への結末記録 (evolve 限定)
             dl = self._debug_logger

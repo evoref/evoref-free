@@ -473,6 +473,7 @@ class DebugLogger:
         floor: float,
         kept: list[tuple[str, float]],
         rejected: list[tuple[str, float]],
+        floors: dict[str, float] | None = None,
     ) -> None:
         """関連性フロア通過後の採否を chunk 単位で ``rag.jsonl`` に記録
 
@@ -483,6 +484,14 @@ class DebugLogger:
         再較正には「どの chunk が何点で通ったか」が要るが、``rag.jsonl`` には
         ``embedding`` と ``fewshot_select`` しか出ておらず、prompt 本文の目視に
         頼るしかなかった。ここで採否とスコアを残す。
+
+        棒はストア別 (episodic / corpus / 疑似クエリ) なので ``floors`` で
+        **実際に掛かった棒だけ** を残す。以前は候補が 1 件も無いストアの棒まで
+        ``max()`` に入れて 1 本のスカラにしていたため、ログを読むと採用値が棒を
+        割って見えた — 実インシデント (2026-09-16 ライブ監査 F-04): corpus 不在
+        の環境で ``floor=0.4`` と記録されながら、実際に episodic へ掛かって
+        いたのは 0.31 で、0.36 / 0.38 のチャンクが採用されていた。棒が嘘を
+        つくと較正の読み直しが成立しない。
         """
         if not self.enabled or not self.log_rag:
             return
@@ -492,6 +501,7 @@ class DebugLogger:
             "query": query[:100],
             "quality": quality,
             "floor": round(floor, 4),
+            "floors": {k: round(v, 4) for k, v in (floors or {}).items()},
             "n_kept": len(kept),
             "n_rejected": len(rejected),
             "kept": [(cid, round(score, 4)) for cid, score in kept[:10]],

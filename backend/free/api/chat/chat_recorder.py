@@ -816,6 +816,23 @@ def _calculate_result_in_prompt(messages: list[ChatMessage]) -> float | None:
     return extract_calculate_result(str(messages[-1].get("content") or ""))
 
 
+def _stated_context(messages: list[ChatMessage]) -> str:
+    """応答の「数え直し」判定に渡す **ユーザー側の本文** をまとめる (純粋関数)。
+
+    プロンプトに載った user メッセージ (会話履歴 + ``[関連する記憶]`` /
+    ``[参考情報]`` / ツール結果のブロック) を連結する。ここに現れない人数を
+    応答が述べていれば、本人が言っていない数を補ったことになる
+    (:func:`~backend.free.core.text_quality.fabricated_household_count`)。
+    assistant メッセージは入れない — 自分の過去の数え直しを根拠にすると、
+    一度補った数がそのまま正当化されて固定する。
+    """
+    return "\n".join(
+        str(m.get("content") or "")
+        for m in (messages or [])
+        if str(m.get("role") or "") == "user"
+    )
+
+
 def _turn_contradiction_inputs(
     state: AppState,  # noqa: ARG001 - 呼出面の互換 (判定器を後から覗く経路は撤去)
     messages: list[ChatMessage],
@@ -1183,6 +1200,7 @@ def record_response(
                 cached_prompt_tokens=cached_tokens,
                 action_blocked=blocked,
                 measured_values=measured,
+                stated_context=_stated_context(messages),
                 calculate_result=_calculate_result_in_prompt(messages),
                 tool_result_text=_tool_result_text_in_prompt(messages),
                 truncated=truncated,
@@ -1287,6 +1305,7 @@ def record_meta_cognitive_response(
                 mode=mode,
                 action_blocked=blocked,
                 measured_values=measured,
+                stated_context=_stated_context(messages),
                 calculate_result=_calculate_result_in_prompt(messages),
                 tool_result_text=_tool_result_text_in_prompt(messages),
                 agent_loops=agent_loops,
@@ -1399,6 +1418,7 @@ def record_long_form_response(
                 mode=mode,
                 action_blocked=blocked,
                 measured_values=measured,
+                stated_context=_stated_context(messages),
                 calculate_result=_calculate_result_in_prompt(messages),
                 tool_result_text=_tool_result_text_in_prompt(messages),
                 long_form_used=True,

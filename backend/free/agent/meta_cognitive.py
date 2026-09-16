@@ -121,6 +121,51 @@ _PREVIEW_FENCE_LANGUAGES: dict[str, str] = {
     ".log": "",
 }
 
+#: 計画モデルの写しをユーザーの綴りへ戻すときの basename 類似度の下限。
+#: ``tanaoroshi.md`` ↔ ``anaoroshi.md`` は 0.96、``a.md`` ↔ ``b.md`` は 0.75。
+#: 1〜2 文字の写し損ねだけを拾い、別名のファイルには触らない高さに置く。
+_PLANNED_PATH_MIN_SIMILARITY = 0.8
+#: 同上、basename の長さの差の上限 (文字)。
+_PLANNED_PATH_MAX_LEN_DELTA = 2
+
+
+def _nearest_user_path(planned: str, user_paths: list[str]) -> str | None:
+    """``planned`` の写し元とみなせるユーザーのパスを返す (無ければ ``None``)。
+
+    条件は 3 つすべて: 親ディレクトリが一致 (大小文字と区切りを無視) /
+    拡張子が一致 / basename が近接 (:data:`_PLANNED_PATH_MIN_SIMILARITY` と
+    :data:`_PLANNED_PATH_MAX_LEN_DELTA`)。拡張子一致を要求するのは、読み元と
+    書き先が別形式という正当な計画 (``report.csv`` → ``report.md``) を
+    書き換えないため。候補が 2 つ以上並んだら **どれとも決められない** ので
+    触らない。
+    """
+    from difflib import SequenceMatcher
+    from ntpath import basename as nt_basename
+    from ntpath import dirname as nt_dirname
+    from ntpath import splitext as nt_splitext
+
+    norm = planned.replace("/", "\\")
+    p_dir = nt_dirname(norm).casefold()
+    p_base = nt_basename(norm)
+    p_stem, p_ext = nt_splitext(p_base)
+    if not p_stem:
+        return None
+    hits: list[str] = []
+    for candidate in user_paths:
+        c_norm = candidate.replace("/", "\\")
+        if nt_dirname(c_norm).casefold() != p_dir:
+            continue
+        c_base = nt_basename(c_norm)
+        c_stem, c_ext = nt_splitext(c_base)
+        if c_ext.casefold() != p_ext.casefold() or not c_stem:
+            continue
+        if abs(len(c_base) - len(p_base)) > _PLANNED_PATH_MAX_LEN_DELTA:
+            continue
+        ratio = SequenceMatcher(None, c_base.casefold(), p_base.casefold()).ratio()
+        if ratio >= _PLANNED_PATH_MIN_SIMILARITY:
+            hits.append(candidate)
+    return hits[0] if len(hits) == 1 else None
+
 
 class MetaCognitiveAgent(
     _TaskExecutionMixin,
@@ -656,23 +701,78 @@ class MetaCognitiveAgent(
         return [TaskItem(description="Generate the full program the user requested")]
 
     @staticmethod
+    def _user_paths(query: str) -> list[str]:
+        """クエリ中の明示的な絶対パスを出現順に返す (末尾の句読点は落とす)。"""
+        return [
+            m.group(0).rstrip("。、.,;:")
+            for m in _EXPLICIT_PATH_RE.finditer(query or "")
+        ]
+
+    @staticmethod
+    def _snap_paths_to_user_spelling(
+        user_paths: list[str], tasks: list[TaskItem],
+    ) -> int:
+        """タスク中の **書き写し損ね** たパスをユーザーの綴りへ戻す。
+
+        ユーザーの発話に現れたパスが正で、計画モデルの写しは正ではない。
+        JSON へ埋めるために ``\\`` を二重化する過程で 1 文字落ちることが実在
+        する — 実インシデント (2026-09-16 ライブ監査 F-05):
+        ``E:\\tmp\\live_audit_20260916\\tanaoroshi.md`` への保存依頼が
+        ``meta_cognitive_plan`` の応答で ``...\\anaoroshi.md`` になり、別名の
+        ファイルが作られた。以後のターンの一覧・読み出しも壊れた綴りで通るので
+        **どこにも失敗が出ない**。
+
+        判定は保守的に、「同じ親ディレクトリ・同じ拡張子で、basename が
+        近接」に限る。読み元と書き先が別ファイルという正当な計画
+        (``report.csv`` を読んで ``report.md`` を書く) を壊さないため、拡張子
+        違いは対象にしない。
+
+        Returns:
+            差し替えた箇所の数。
+        """
+        if not user_paths:
+            return 0
+        known = {p.replace("/", "\\").casefold() for p in user_paths}
+        replaced = 0
+        for t in tasks:
+            for planned in _EXPLICIT_PATH_RE.finditer(t.description or ""):
+                raw = planned.group(0).rstrip("。、.,;:")
+                if raw.replace("/", "\\").casefold() in known:
+                    continue
+                match = _nearest_user_path(raw, user_paths)
+                if match is None:
+                    continue
+                logger.warning(
+                    "Plan mis-transcribed the user's path; "
+                    "restoring %s (was %s)", match, raw,
+                )
+                t.description = t.description.replace(raw, match)
+                replaced += 1
+        return replaced
+
+    @staticmethod
     def _normalize_planned_paths(
         query: str, tasks: list[TaskItem],
     ) -> list[TaskItem]:
-        """ユーザー明示パスが plan タスクから脱落した場合に決定論で補完する。
+        """ユーザー明示パスが plan タスクから脱落 / 破損した場合に補完する。
 
         小型 aux は PLAN_SYSTEM_PROMPT の例文をエコーしてユーザー指定の
         出力パスを落とすことがある (2026-07-15: パス無し "Generate the full
         program..." が 2 ターンで write 不発 → 失敗)。クエリに明示的な
         絶対パスがあるのに、どのタスクにもパスが含まれない場合、最初の
         書込み期待タスクへユーザーのパスを付記して write 経路に載せる。
+
+        **落ちたときだけでなく、化けたときも直す** — 以前はタスクに何らかの
+        パスがあれば素通ししていたので、1 文字欠けた写しがそのまま write へ
+        流れていた (:meth:`_snap_paths_to_user_spelling`)。
         """
         if not tasks:
             return tasks
-        m = _EXPLICIT_PATH_RE.search(query)
-        if not m:
+        user_paths = MetaCognitiveAgent._user_paths(query)
+        if not user_paths:
             return tasks
-        user_path = m.group(0).rstrip("。、.,;:")
+        user_path = user_paths[0]
+        MetaCognitiveAgent._snap_paths_to_user_spelling(user_paths, tasks)
         if any(_EXPLICIT_PATH_RE.search(t.description) for t in tasks):
             return tasks
         for t in tasks:
