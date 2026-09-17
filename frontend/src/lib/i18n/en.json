@@ -64,12 +64,13 @@
 		"loop": "Loop Console",
 		"dashboard": "Dashboard",
 		"fewshot": "Learned Examples",
-		"terminal": "Terminal",
 		"toggle": "Toggle sidebar",
 		"nav_label": "Main navigation",
 		"mode": "Mode",
 		"mode_chat": "Chat",
 		"mode_create": "Create",
+		"mode_chat_desc": "Chat: the conversation is the deliverable. Read-only (documents can still be generated)",
+		"mode_create_desc": "Create: owns a workspace — edit existing files, run commands, build multi-file projects",
 		"mode_restarting": "Model restarting...",
 		"mode_restart_ready": "Restart complete",
 		"mode_restart_failed": "Restart failed",
@@ -952,33 +953,6 @@
 			"total": "{total} task(s)",
 			"load_failed": "Failed to load tasks: {detail}"
 		}
-	},
-	"terminal": {
-		"title": "Terminal",
-		"connecting": "Connecting...",
-		"connected": "Connected",
-		"disconnected": "Disconnected",
-		"reconnect": "Reconnect",
-		"unavailable_in_free": "Terminal is a Pro-only feature",
-		"agent": {
-			"connected": "Agent connected",
-			"disabled": "Agent disconnected",
-			"disconnect": "Disconnect agent"
-		},
-		"errors": {
-			"disabled": "Terminal feature is not enabled",
-			"token_expired": "Session token expired. Please reload the page.",
-			"session_limit": "Session limit reached",
-			"connect_failed": "Failed to connect WebSocket",
-			"agent_disabled": "Agent writes to the terminal are disabled (pro.terminal.agent_write_enabled=false)",
-			"no_active_session": "No active web terminal session was found",
-			"write_failed": "Failed to write to PTY"
-		}
-	},
-	"agent": {
-		"terminal_exec_dangerous": "terminal_exec rejected: dangerous command: {command}",
-		"terminal_exec_not_in_allowlist": "Command is not in the allowlist: {command}",
-		"terminal_exec_empty_command": "terminal_exec: command is empty"
 	},
 	"fewshot": {
 		"title": "Learned Examples",

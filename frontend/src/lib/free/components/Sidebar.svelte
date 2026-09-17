@@ -61,9 +61,6 @@
 				{/if}
 				<a href="/dashboard" class="nav-item" class:active={isActive('/dashboard')}>{$t('sidebar.dashboard')}</a>
 				<a href="/learning" class="nav-item" class:active={isActive('/learning')}>{$t('sidebar.fewshot')}</a>
-				{#if isPro}
-					<a href="/terminal" class="nav-item" class:active={isActive('/terminal')}>{$t('sidebar.terminal')}</a>
-				{/if}
 				<a href="/settings" class="nav-item" class:active={isActive('/settings')}>{$t('sidebar.settings')}</a>
 				{#if debugEnabled}
 					<span class="debug-badge">{$t('sidebar.debug_mode')}</span>
@@ -143,6 +140,7 @@
 								class="footer-select"
 								value={$currentMode}
 								disabled={$modeRestartStatus === 'restarting' || $isStreaming}
+								title={$currentMode === 'create' ? $t('sidebar.mode_create_desc') : $t('sidebar.mode_chat_desc')}
 								onchange={(e) => {
 								switchMode(e.currentTarget.value).catch((err: unknown) => {
 									addToast({ type: 'error', i18nKey: 'sidebar.mode_restart_failed' });
@@ -150,8 +148,8 @@
 								});
 							}}
 							>
-								<option value="chat">{$t('sidebar.mode_chat')}</option>
-								<option value="create">{$t('sidebar.mode_create')}</option>
+								<option value="chat" title={$t('sidebar.mode_chat_desc')}>{$t('sidebar.mode_chat')}</option>
+								<option value="create" title={$t('sidebar.mode_create_desc')}>{$t('sidebar.mode_create')}</option>
 							</select>
 						</div>
 					</div>

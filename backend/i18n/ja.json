@@ -430,9 +430,6 @@
     },
     "dangerous_command_blocked": "危険なコマンドのため実行を拒否しました: {command}",
     "interactive_command_blocked": "対話的コマンドのためバックエンド側では実行できません（TTY パススルーが必要）: {command}",
-    "terminal_exec_dangerous": "危険コマンドのため terminal_exec を拒否しました: {command}",
-    "terminal_exec_not_in_allowlist": "コマンドが許可リストに含まれていません: {command}",
-    "terminal_exec_empty_command": "terminal_exec: command が空です",
     "tasks_all_done": "{count} 件のタスクをすべて完了しました。",
     "task_done": "タスクを完了しました。",
     "files_written": "{paths} に書き込みました。",
@@ -464,15 +461,6 @@
       "first": "最初",
       "last": "最後",
       "header": "[この会話の{where}の user 発話 {count} 件 (全 {total} ターン中)]"
-    }
-  },
-  "terminal": {
-    "errors": {
-      "disabled": "ターミナル機能が有効になっていません",
-      "session_limit": "同時セッション数の上限に達しました",
-      "agent_disabled": "ターミナルへの Agent 書込は無効化されています (pro.terminal.agent_write_enabled=false)",
-      "no_active_session": "アクティブな Web ターミナルセッションが見つかりません",
-      "write_failed": "PTY への書込に失敗しました"
     }
   },
   "error": {

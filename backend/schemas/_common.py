@@ -9,6 +9,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.log_config import get_logger
+
+logger = get_logger("config")
+
 
 class InstanceConfig(BaseModel):
     """インスタンス設定"""
@@ -527,65 +531,6 @@ class AutoServeConfig(BaseModel):
     timeout_llama: int = Field(default=120, ge=10, le=1800)
 
 
-class TerminalConfig(BaseModel):
-    """Pro Web ターミナル設定
-
-    バックエンドで PTY (pseudo-terminal) を起動し、WebSocket 経由で xterm.js
-    とブリッジする。POSIX (``ptyprocess``) と Windows (``pywinpty``) の
-    両方に対応する。Free 版には実装しない (Free 観察手段はループ
-    イベント観察 UI が代替)。
-
-    セキュリティ 4 重ガード:
-        1. ``allowed_origins`` の Origin 検証
-        2. Host ヘッダ検証 (DNS rebinding 対策、127.0.0.1 / localhost のみ)
-        3. シングルユース token 検証 (60 秒以内、1 回限り)
-        4. ``server.host=0.0.0.0`` + ``enabled=true`` は起動時にエラー
-
-    ``shell`` の値:
-        - ``auto`` (推奨): POSIX は ``$SHELL`` → ``bash`` → ``zsh`` → ``sh``、
-          Windows は ``pwsh.exe`` → ``powershell.exe`` → ``cmd.exe``
-        - ``bash`` / ``zsh`` / ``sh``: POSIX 用 shell (Windows でも Git
-          Bash / WSL の同名バイナリが PATH にあれば利用可)
-        - ``pwsh`` / ``powershell`` / ``cmd``: Windows 用 shell
-
-    エージェント主導の PTY 書込
-        - ``agent_write_enabled`` (既定 ``False``): エージェント (Reactive /
-          Deliberative / Meta-Cognitive) からの ``terminal_exec`` ツール経由
-          の書込を有効化する。既定 OFF。LLM 生成文字列を shell に渡すため
-          攻撃面が大きい — 有効化時は allowlist + dangerous pattern + ログ
-          記録の 3 重ガードで保護する。
-        - ``agent_command_allowlist``: 正規表現の許可リスト。空リストの場合は
-          すべてのコマンドを許可 (dangerous pattern は別途常時ブロック)。
-          1 件以上のパターンが指定された場合は **少なくとも 1 件にマッチ**
-          したコマンドのみを実行する。
-        - ``agent_read_timeout_sec`` (既定 ``10``): ``terminal_exec`` の実行
-          結果を PTY から読み取る最大秒数。タイムアウトに達しても shell
-          プロセスは継続し、累積した出力を返す。
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False
-    shell: str = Field(
-        default="auto",
-        pattern=r"^(auto|bash|pwsh|powershell|zsh|sh|cmd)$",
-    )
-    allowed_origins: list[str] = Field(
-        default_factory=lambda: [
-            "http://127.0.0.1:5173",
-            "http://localhost:5173",
-        ],
-    )
-    max_sessions: int = Field(default=4, ge=1, le=64)
-    idle_timeout_sec: int = Field(default=1800, ge=60)
-    token_ttl_sec: int = Field(default=60, ge=10, le=600)
-
-    # agent → PTY 書込統合
-    agent_write_enabled: bool = False
-    agent_command_allowlist: list[str] = Field(default_factory=list)
-    agent_read_timeout_sec: int = Field(default=10, ge=1, le=300)
-
-
 class ProUrlRecallConfig(BaseModel):
     """Pro URL リコール拡張設定
 
@@ -625,14 +570,29 @@ class ProKnowledgeConfig(BaseModel):
 class ProConfig(BaseModel):
     """Pro 専用機能の設定ルート
 
-    Pro エディション固有の横断機能 (Web ターミナル等) をここに集約する。
-    各サブセクションは ``enabled=false`` をデフォルトとし、明示的に有効化
-    された場合のみ Pro 起動シーケンスでセットアップされる。
+    Pro エディション固有の横断機能 (URL リコール / ``know.*`` 取得器) を
+    ここに集約する。
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    terminal: TerminalConfig = Field(default_factory=TerminalConfig)
+    @model_validator(mode="before")
+    @classmethod
+    def drop_removed_terminal(cls, data):
+        """撤去済みの ``pro.terminal`` 節を検証前に取り除く。
+
+        Web ターミナルは機能ごと撤去した。旧 config.yaml.example 由来の節は
+        ほぼ全ての config.yaml に残っているため、``extra="forbid"`` で起動を
+        止めずに WARNING 1 行で削除を促す。
+        """
+        if not (isinstance(data, dict) and "terminal" in data):
+            return data
+        logger.warning(
+            "pro.terminal was removed with the web terminal feature and is "
+            "ignored; delete it from config.yaml",
+        )
+        return {k: v for k, v in data.items() if k != "terminal"}
+
     url_recall: ProUrlRecallConfig = Field(default_factory=ProUrlRecallConfig)
     knowledge: ProKnowledgeConfig = Field(default_factory=ProKnowledgeConfig)
 
