@@ -67,7 +67,6 @@ if TYPE_CHECKING:
     )
     from backend.pro.api.widgets import WidgetProxyManager
     from backend.pro.learning.cartridge_change_handler import CartridgeChangeHandler
-    from backend.pro.terminal.session_manager import SessionManager as TerminalSessionManager
 
 SESSION_TTL_SEC = 3600  # 異常終了セッションの自動クリーンアップ: 1時間
 
@@ -230,9 +229,6 @@ class AppState:
     # ── Pro ──
     widget_proxy_manager: WidgetProxyManager | None = None
     cartridge_change_handler: CartridgeChangeHandler | None = None
-    # Pro Web ターミナル (PTY + WebSocket) のセッションマネージャ
-    # `pro.terminal.enabled=true` のときのみ ``setup_pro_gen`` で構築される。
-    terminal_session_manager: TerminalSessionManager | None = None
 
     # ── 4 pillar エントリポイント ──
     # wire_pillars() が依存順 (Gen → Mem → Loop → Learn) に構築して格納する。

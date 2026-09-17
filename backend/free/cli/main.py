@@ -487,7 +487,10 @@ def _build_interactive_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode", choices=["chat", "create"], default=None,
-        help="Chat mode (default: chat in Free / create in Pro). "
+        help="Session mode (default: chat in Free / create in Pro). "
+             "'chat' is read-only: the conversation is the deliverable "
+             "(documents can still be generated). 'create' owns a workspace: "
+             "edit existing files, run commands, build multi-file projects. "
              "'create' is Pro-only and falls back to 'chat' with a warning in Free.",
     )
     parser.add_argument(

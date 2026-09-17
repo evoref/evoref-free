@@ -1241,33 +1241,7 @@ create:
 # ──────────────────────────────────────────────────────────────────────
 # Pro 専用機能
 # ──────────────────────────────────────────────────────────────────────
-# - terminal: Pro 限定 Web ターミナル (PTY + xterm.js)
-#   * enabled=true で /api/terminal/* + /terminal ページが利用可能
-#   * セキュリティ 4 重ガード (Origin / Host / token / 127.0.0.1 bind 強制)
-#   * server.host=0.0.0.0 + enabled=true は起動エラーで拒否される
-#   * POSIX / Windows 両対応:
-#     POSIX は ptyprocess、Windows は pywinpty (ConPTY) を OS 別に利用
-#   * shell=auto:
-#       POSIX → $SHELL → bash → zsh → sh
-#       Windows → pwsh.exe → powershell.exe → cmd.exe
-#   * agent_write_enabled=true でエージェント
-#     からの PTY 書込を有効化。LLM 生成文字列を shell に渡すため攻撃面が
-#     大きい — 既定は false、有効化時は allowlist + dangerous pattern + 監査
-#     ログの 3 重ガードで保護される
 pro:
-  terminal:
-    enabled: false                     # Pro 限定。既定無効
-    shell: auto                        # auto | bash | pwsh | powershell | zsh | sh | cmd
-    allowed_origins:
-      - http://127.0.0.1:5173
-      - http://localhost:5173
-    max_sessions: 4                    # 同時セッション数の上限
-    idle_timeout_sec: 1800             # idle 検出時 SIGTERM までの秒数
-    token_ttl_sec: 60                  # POST /session で発行する token の TTL
-    # エージェント主導の PTY 書込
-    agent_write_enabled: false         # 既定無効。有効化時は LLM が任意のコマンドを shell に渡せる
-    agent_command_allowlist: []        # 正規表現リスト。空=全許可、1 件以上指定でホワイトリスト方式
-    agent_read_timeout_sec: 10         # terminal_exec の結果読取り最大秒数
   url_recall:
     # Pro 限定: ToolCallJudge の URL リコールに team プロファイルを追加で
     # 引き当て対象に含める。Free build では設定しても効果なし (起動時に WARNING)。

@@ -64,12 +64,13 @@
 		"loop": "ループ管理",
 		"dashboard": "ダッシュボード",
 		"fewshot": "学習手本",
-		"terminal": "ターミナル",
 		"toggle": "サイドバーの開閉",
 		"nav_label": "メインナビゲーション",
 		"mode": "モード",
 		"mode_chat": "チャット",
 		"mode_create": "クリエイト",
+		"mode_chat_desc": "チャット: 会話が成果物。読み取り専用 (文書の生成はできる)",
+		"mode_create_desc": "クリエイト: 作業空間を持ち、既存ファイルの編集・コマンド実行・複数ファイルの生成ができる",
 		"mode_restarting": "モデル再起動中...",
 		"mode_restart_ready": "再起動完了",
 		"mode_restart_failed": "再起動に失敗しました",
@@ -952,33 +953,6 @@
 			"total": "{total} 件",
 			"load_failed": "タスク一覧の取得に失敗しました: {detail}"
 		}
-	},
-	"terminal": {
-		"title": "ターミナル",
-		"connecting": "接続中...",
-		"connected": "接続済",
-		"disconnected": "切断されました",
-		"reconnect": "再接続",
-		"unavailable_in_free": "ターミナルは Pro 限定機能です",
-		"agent": {
-			"connected": "Agent 接続中",
-			"disabled": "Agent 切断中",
-			"disconnect": "Agent を一時切断"
-		},
-		"errors": {
-			"disabled": "ターミナル機能が有効になっていません",
-			"token_expired": "セッショントークンの有効期限が切れました。ページを再読み込みしてください。",
-			"session_limit": "同時セッション数の上限に達しました",
-			"connect_failed": "WebSocket 接続に失敗しました",
-			"agent_disabled": "ターミナルへの Agent 書込は無効化されています (pro.terminal.agent_write_enabled=false)",
-			"no_active_session": "アクティブな Web ターミナルセッションが見つかりません",
-			"write_failed": "PTY への書込に失敗しました"
-		}
-	},
-	"agent": {
-		"terminal_exec_dangerous": "危険コマンドのため terminal_exec を拒否しました: {command}",
-		"terminal_exec_not_in_allowlist": "コマンドが許可リストに含まれていません: {command}",
-		"terminal_exec_empty_command": "terminal_exec: command が空です"
 	},
 	"fewshot": {
 		"title": "学習手本",

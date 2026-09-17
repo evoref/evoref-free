@@ -10,7 +10,7 @@
 - ``_root.py``  : ``EvorefConfig`` / ``validate_config``
 - ``_common.py``: 単発の細かい Config (Instance / Server / Runtime / Theme /
   CLI / History / Streaming / Agent / Tools / WidgetProxy / ExternalApi /
-  I18n / Debug / LongForm / Modes / Editor / ProcessManager / Terminal /
+  I18n / Debug / LongForm / Modes / Editor / ProcessManager /
   Pro / ModelMigration)
 - ``llm.py``    : ``LlamaConfig`` / ``LlamaSpeculativeConfig``
 - ``rag.py``    : RAG / Embedding / Self-RAG / Cartridge 系
@@ -38,7 +38,6 @@ from backend.schemas._common import (
     RuntimeConfig,
     ServerConfig,
     StreamingConfig,
-    TerminalConfig,
     ThemeConfig,
     ToolsConfig,
     WidgetApiConfig,
@@ -136,7 +135,6 @@ __all__ = [
     "ServerConfig",
     "StreamingConfig",
     "SubjectDictionaryConfig",
-    "TerminalConfig",
     "ThemeConfig",
     "ToolsConfig",
     "WidgetApiConfig",

@@ -430,9 +430,6 @@
     },
     "dangerous_command_blocked": "Execution refused due to dangerous command: {command}",
     "interactive_command_blocked": "Cannot execute interactive command on backend (TTY passthrough required): {command}",
-    "terminal_exec_dangerous": "terminal_exec rejected: dangerous command: {command}",
-    "terminal_exec_not_in_allowlist": "Command is not in the allowlist: {command}",
-    "terminal_exec_empty_command": "terminal_exec: command is empty",
     "tasks_all_done": "Completed all {count} tasks.",
     "task_done": "Task completed.",
     "files_written": "Wrote {paths}.",
@@ -464,15 +461,6 @@
       "first": "first",
       "last": "last",
       "header": "[{where} {count} user message(s) of this conversation (of {total} turns)]"
-    }
-  },
-  "terminal": {
-    "errors": {
-      "disabled": "Terminal feature is not enabled",
-      "session_limit": "Session limit reached",
-      "agent_disabled": "Agent writes to the terminal are disabled (pro.terminal.agent_write_enabled=false)",
-      "no_active_session": "No active web terminal session was found",
-      "write_failed": "Failed to write to PTY"
     }
   },
   "error": {

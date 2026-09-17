@@ -1523,17 +1523,6 @@ def _init_tools(
         aux_client=state.aux_client,
     )
 
-    # Pro 拡張ツール: ``register_pro_tools`` ハンドラが
-    # 登録されていれば呼び出してレジストリを拡張する。Free 版では未登録のため
-    # no-op。Pro 側 (backend/pro/__init__.py::setup_pro) から登録される。
-    from backend.edition import get_pro_handler
-    pro_register_tools = get_pro_handler("register_pro_tools")
-    if callable(pro_register_tools):
-        try:
-            pro_register_tools(tools_reg, state, cfg)
-        except Exception as e:
-            logger.warning("Pro tools registration failed: %s", e)
-
     state.tools_registry = tools_reg
     logger.info("ToolsRegistry initialized: %d tools", tools_reg.count)
 

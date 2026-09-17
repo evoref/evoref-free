@@ -210,7 +210,6 @@ class EvorefConfig(BaseModel):
         判定対象:
 
         - ``widget_proxy.enabled = True``  (Pro Widget Proxy / 汎用 Web API プロキシ)
-        - ``pro.terminal.enabled = True``  (Pro Web ターミナル)
         - ``pro.knowledge.enabled = True`` (Pro ``know.*`` 取得器)
         - ``learning.optimizer == "full-cma-es"`` (Pro CMA-ES オプティマイザ)
         - ``create.pipeline == "staged"`` (Pro staged クリエイトパイプライン)
@@ -229,7 +228,6 @@ class EvorefConfig(BaseModel):
 
         triggers: list[tuple[str, bool]] = [
             ("widget_proxy.enabled", bool(self.widget_proxy.enabled)),
-            ("pro.terminal.enabled", bool(self.pro.terminal.enabled)),
             (
                 "learning.optimizer",
                 self.learning.optimizer == "full-cma-es",
