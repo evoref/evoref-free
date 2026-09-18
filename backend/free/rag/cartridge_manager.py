@@ -230,7 +230,12 @@ class CartridgeManager:
     # ── 目録 ──
 
     def list_cartridges(self) -> list[CartridgeInfo]:
-        return [cartridge_info_of(p) for p in self._corpus.list_packages()]
+        # ProjectMap パッケージ (c_16 §4.4) は sleep-time が版を積む自動生成物で、
+        # UI の「文書」一覧に出すと ON/OFF や削除が自動更新と衝突する。
+        return [
+            cartridge_info_of(p) for p in self._corpus.list_packages()
+            if not p.is_project_map
+        ]
 
     def get_cartridge(self, cartridge_id: str) -> CartridgeInfo | None:
         package = self._corpus.get(cartridge_id)

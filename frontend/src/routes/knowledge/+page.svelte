@@ -5,6 +5,7 @@
 	import { goto } from '$app/navigation';
 	import { isPro } from '$lib/edition';
 	import { t } from '$lib/i18n';
+	import PageLayout from '$lib/free/components/PageLayout.svelte';
 
 	// Pro ガード: Free 版ではトップにリダイレクト (Pro 専用機能)。
 	// goto は SSR 中に呼ぶと 500 になるため browser ガード必須。
@@ -13,10 +14,10 @@
 	}
 
 	const proLoaders = import.meta.glob<{ default: Component }>(
-		'/src/lib/pro/components/Loop/LoopPage.svelte'
+		'/src/lib/pro/components/KnowledgeSources.svelte'
 	);
 
-	let LoopPageComponent: Component | null = $state(null);
+	let KnowledgeSources: Component | null = $state(null);
 
 	onMount(async () => {
 		if (!isPro) return;
@@ -26,15 +27,17 @@
 			return;
 		}
 		const mod = await entry();
-		LoopPageComponent = mod.default;
+		KnowledgeSources = mod.default;
 	});
 </script>
 
-{#if LoopPageComponent}
-	<LoopPageComponent />
-{:else if isPro}
-	<div class="loading">{$t('common.loading')}</div>
-{/if}
+<PageLayout title={$t('sidebar.knowledge_sources')}>
+	{#if KnowledgeSources}
+		<KnowledgeSources />
+	{:else if isPro}
+		<div class="loading">{$t('common.loading')}</div>
+	{/if}
+</PageLayout>
 
 <style>
 	.loading {

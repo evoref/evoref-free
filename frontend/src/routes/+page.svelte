@@ -1,7 +1,9 @@
 <script lang="ts">
 	import MessageList from '$lib/free/components/MessageList.svelte';
 	import ChatInput from '$lib/free/components/ChatInput.svelte';
-	import { messages, currentMode } from '$lib/free/stores/chat';
+	import { messages, currentMode, switchMode } from '$lib/free/stores/chat';
+	import { activeCreateRun } from '$lib/free/stores/createRun';
+	import { get } from 'svelte/store';
 	import { themeSlots, layout } from '$lib/free/stores/theme';
 	import { t } from '$lib/i18n';
 	import { instanceName } from '$lib/free/stores/app';
@@ -9,6 +11,7 @@
 	import PageLayout from '$lib/free/components/PageLayout.svelte';
 	import { onMount } from 'svelte';
 	import type { Component } from 'svelte';
+	import { reattachCreateRun } from '$lib/free/services/createReattach';
 
 	// エディション境界: Free 配下のコンポーネントは $lib/pro を参照できない。
 	// route 層 (ここ) が edition-aware composition 層として Pro 専用 CodeMirror UI を
@@ -21,6 +24,18 @@
 	let EditorPanel: Component | null = $state(null);
 
 	onMount(async () => {
+		// クリエイト run の再接続 (f_05 §4.5)。Pro の EditorPanel ロードとは独立
+		// (成果物は generatedEditorCode ストアへ流すだけで、Free ビルドでは no-op)。
+		// リロード後は既定の chat モードで開くので、保存された run があれば
+		// 先に create へ切り替える (バックエンドが既に create ならモデル入替は無い)。
+		if (get(activeCreateRun)) {
+			if (get(currentMode) !== 'create') {
+				await switchMode('create');
+			}
+			if (get(currentMode) === 'create') {
+				reattachCreateRun();
+			}
+		}
 		if (!isPro) return;
 		const entries = Object.entries(proLoaders);
 		for (const [path, loader] of entries) {

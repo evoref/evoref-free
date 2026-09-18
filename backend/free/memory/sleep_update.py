@@ -680,6 +680,31 @@ class SleepTimeWorker:
         if self._check_cancelled():
             return result
 
+        # Step 5.87: ProjectMap (既存プロジェクトの code グラフ) の更新 (c_16 §4.4)。
+        # LLM を使わない決定論抽出 (tree-sitter) なので、記憶の整理 (Step 6〜9) より
+        # 前に置ける — Step 5.9 (疑似クエリ、1 件 20 秒級の LLM 生成) と違い GPU 予算を
+        # 食い合わない。記憶側のステップなので ``--no-learning`` でも走る。
+        ts = time.monotonic()
+        result["project_map_updated"] = await self._step5_87_update_project_map()
+        step_durations["step5_87_project_map"] = round(time.monotonic() - ts, 3)
+        if self._check_cancelled():
+            return result
+
+        # 5.88: corpus パッケージの非 active 旧版を直近 2 版まで刈る (c_16 §4.3 / §5.4)。
+        # 5.85 / 5.87 が版を積んだ直後に置く — ProjectMap は構造変更のたびに 50 MB 級の
+        # 版を積むので、ここで刈らないと Full ごとに増え続ける (2026-09-18 実機: GC の
+        # 呼出元がどこにも無く 3 版 153 MB が残った)。
+        ts = time.monotonic()
+        result["corpus_versions_gc"] = self._step5_88_gc_corpus_versions()
+        step_durations["step5_88_corpus_gc"] = round(time.monotonic() - ts, 3)
+
+        # Step 5.89: staged クリエイトの run (run.json/events.jsonl + workspace)
+        # を create.runs_keep 件まで刈る (f_10 §7 / c_05 §0.5.6)。記憶側のステップ
+        # (書き手は sleep-time のみ) なので ``--no-learning`` でも走る。
+        ts = time.monotonic()
+        result["staged_runs_gc"] = self._step5_89_gc_staged_runs()
+        step_durations["step5_89_staged_runs_gc"] = round(time.monotonic() - ts, 3)
+
         params_b = getattr(getattr(llm_client, "metadata", None), "params_b", 7.0)
 
         # Step E0: 作業領域を開いて、ベクトルの無いノートを埋め込む。
@@ -1063,6 +1088,63 @@ class SleepTimeWorker:
         if rebuilt:
             logger.info("Step 5.85: rebuilt corpus package(s) %s", ", ".join(rebuilt))
         return len(rebuilt)
+
+    def _step5_88_gc_corpus_versions(self) -> int:
+        """Step 5.88: corpus パッケージの非 active 旧版を GC する (直近 2 版保持)。
+
+        掴まれている版 (Windows の memmap) は改名に失敗して次回へ回る。
+        """
+        manager = self.cartridge_manager
+        corpus = getattr(manager, "corpus", None)
+        if corpus is None or not hasattr(corpus, "gc_old_versions"):
+            return 0
+        try:
+            return len(corpus.gc_old_versions())
+        except Exception as e:  # noqa: BLE001 — GC の失敗で Full を止めない
+            logger.warning("Step 5.88: corpus version GC failed: %s", e)
+            return 0
+
+    def _step5_89_gc_staged_runs(self) -> int:
+        """Step 5.89: staged クリエイトの run を ``create.runs_keep`` 件まで刈る。
+
+        実ロジックは :mod:`backend.free.memory.sleep.create_runs`
+        (EvorefLoop の ``run_record.py`` を薄くラップ、Step 5.87 と同じ形)。
+        """
+        try:
+            from backend.config import get_path_resolver
+            resolver = get_path_resolver()
+        except Exception as e:
+            logger.warning("Step 5.89: path resolver unavailable: %s", e)
+            return 0
+        from backend.free.memory.sleep.create_runs import gc_staged_create_runs
+
+        return gc_staged_create_runs(config=self.config, resolver=resolver)
+
+    async def _step5_87_update_project_map(self) -> int:
+        """Step 5.87: ProjectMap (既存プロジェクトの code グラフ) の更新 (c_16 §4.4)。
+
+        実ロジックは :mod:`backend.free.memory.sleep.project_map`。記憶側の
+        ステップ (書き手は sleep-time のみ) なので ``_skip_for_learning`` は
+        呼ばない — ``--no-learning`` でも走る。
+        """
+        try:
+            from backend.config import get_path_resolver
+            resolver = get_path_resolver()
+        except Exception as e:
+            logger.warning("Step 5.87: path resolver unavailable: %s", e)
+            return 0
+        from backend.free.memory.sleep.project_map import (
+            quiet_seconds,
+            update_project_map,
+        )
+
+        quiet = quiet_seconds(self.config)
+        return await update_project_map(
+            config=self.config,
+            resolver=resolver,
+            is_cancelled=self._check_cancelled,
+            should_pause=lambda: self._chat_recent(quiet),
+        )
 
     async def _step5_9_pseudo_queries(self, llm_client) -> int:
         """Step 5.9: corpus パッケージの疑似クエリ生成 (f_01 §6.4)。

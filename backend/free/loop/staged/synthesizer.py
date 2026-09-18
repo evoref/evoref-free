@@ -409,23 +409,57 @@ async def synthesize_create_task_graph(
     aux_client: "AuxClient | None",
     include_tests: bool = True,
     debug_logger: "DebugLogger | None" = None,
+    brief: str = "",
+    timeout: float | None = None,
 ) -> list[SemanticFact]:
     """クリエイト要求を spec/code/test の task ファクト群へ分解する。
+
+    :func:`synthesize_create_task_graph_with_plan` の薄いラッパ (facts だけを
+    返す後方互換版)。引数は同関数と同じ。
+    """
+    facts, _module_deps = await synthesize_create_task_graph_with_plan(
+        request=request, project_id=project_id, aux_client=aux_client,
+        include_tests=include_tests, debug_logger=debug_logger, brief=brief,
+        timeout=timeout,
+    )
+    return facts
+
+
+async def synthesize_create_task_graph_with_plan(
+    *,
+    request: str,
+    project_id: str,
+    aux_client: "AuxClient | None",
+    include_tests: bool = True,
+    debug_logger: "DebugLogger | None" = None,
+    brief: str = "",
+    timeout: float | None = None,
+) -> tuple[list[SemanticFact], dict[str, list[str]]]:
+    """クリエイト要求を spec/code/test の task ファクト群 + planner の依存グラフへ分解する。
 
     Args:
         request: ユーザーのクリエイト指示。
         project_id: タスクを所属させる project_id。
-        aux_client: 補助タスク。``None`` (degraded) なら ``[]`` を返す。
+        aux_client: 補助タスク。``None`` (degraded) なら ``([], {})`` を返す。
         include_tests: ``False`` なら test 工程を生成しない (config の
             ``create.staged.test_stage_enabled=false`` 用)。
         debug_logger: chat モードの meta_cognitive_llm_route と同種の
             aux 利用可否判定を ``create_task_graph_synthesis_path`` として
             構造化記録する (任意)。
+        brief: ProductionBrief (f_08 §2.2)。空でなければプロンプト先頭に置く。
+        timeout: 呼出予算 (f_10 §3)。``None`` (既定) は purpose 既定
+            (``create_task_graph`` の反応的較正) に委ねる。呼出側 (staged
+            起動時のターン予算計算) が残りステージ予算を渡せる。
 
     Returns:
-        spec → code* → test* の順に並んだ ``task`` 型 SemanticFact リスト
-        (まだストアには追加されていない)。補助タスク未接続 / 解析失敗 /
-        モジュール 0 件 の場合は ``[]`` (= 呼出側で longform へフォールバック)。
+        ``(facts, module_deps)``。``facts`` は spec → code* → test* の順に
+        並んだ ``task`` 型 SemanticFact リスト (まだストアには追加されていない)。
+        補助タスク未接続 / 解析失敗 / モジュール 0 件 の場合は ``([], {})``
+        (= 呼出側で longform へフォールバック)。``module_deps`` は解決後の
+        ``{file_path: [depends_on file_path, ...]}`` — planner が意図した
+        モジュール依存グラフを構造のまま持つ (f_10 §2、§8.1 の設計↔実装
+        ドリフト検査で使う)。task fact の ``depends_on`` (spec→code→test の
+        3 層) とは別物。
     """
     _candidates = ["aux_synthesis", "aux_unavailable_fallback"]
     if aux_client is None:
@@ -438,7 +472,7 @@ async def synthesize_create_task_graph(
                 reason="aux_client_unavailable",
                 scope="loop_iter",
             )
-        return []
+        return [], {}
     if debug_logger is not None:
         debug_logger.log_decision(
             decision_point="create_task_graph_synthesis_path",
@@ -451,11 +485,13 @@ async def synthesize_create_task_graph(
         raise ValueError("project_id must be non-empty")
 
     prompt = (
-        _SYNTHESIS_PROMPT.format(request=request.strip())
+        (f"{brief}\n\n" if brief else "")
+        + _SYNTHESIS_PROMPT.format(request=request.strip())
         + os_constraint()
         + _graph_language_constraint()
     )
     graph_telemetry: dict = {}
+    timeout_kwargs = {"timeout": timeout} if timeout is not None else {}
     try:
         result = await aux_client.generate_json(
             prompt,
@@ -463,10 +499,11 @@ async def synthesize_create_task_graph(
             max_tokens=1536,
             temperature=0.3,
             telemetry=graph_telemetry,
+            **timeout_kwargs,
         )
     except Exception as exc:
         logger.warning("create_task_graph synthesis failed: %s", exc)
-        return []
+        return [], {}
     # coarse plan は通常 1024 に収まるが、切断時はモジュール欠落の可能性を可視化。
     if graph_telemetry.get("truncated"):
         logger.warning(
@@ -478,13 +515,14 @@ async def synthesize_create_task_graph(
     modules = _normalize_modules((result or {}).get("modules"))
     if not modules:
         logger.info("create_task_graph returned no modules — fallback to longform")
-        return []
+        return [], {}
     # stdlib と同名のファイルは import 解決不能な衝突を起こすため合成時に断つ。
     modules = _avoid_stdlib_collisions(modules)
     # OS 制約のプロンプト注入を planner が無視した場合の決定論バックストップ。
     summary, modules = annotate_os_unavailable_modules(summary, modules)
     # 実在しないモジュールへの依存 (planner の自己矛盾) を決定論解決する。
     modules = resolve_unknown_dependencies(modules)
+    module_deps = {m["file_path"]: list(m["depends_on"]) for m in modules}
 
     facts: list[SemanticFact] = []
     seen_ids: set[str] = {SPEC_TASK_ID}
@@ -548,4 +586,4 @@ async def synthesize_create_task_graph(
         "create_task_graph synthesized: %d modules -> %d tasks (project=%s)",
         len(modules), len(facts), project_id,
     )
-    return facts
+    return facts, module_deps

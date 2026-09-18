@@ -136,3 +136,13 @@
 {"query":"いや、富士山は 3000m ちょうどだよ。間違えてるよ。","label":"none"}
 {"query":"時間帯の重なりは、単純な UNIQUE 制約では防げないのではないですか。","label":"none"}
 {"query":"あなたが今使っている LLM のモデル名を教えて。","label":"none"}
+{"query":"backend/free/rag/corpus/chunking.py はどこから呼ばれていて、何を呼んでいますか。","label":"tool"}
+{"query":"このプロジェクトのコード構成 (ディレクトリと主要モジュール) を要約して。","label":"tool"}
+{"query":"CorpusStore クラスはどのファイルで定義されていて、誰が使っていますか。","label":"tool"}
+{"query":"chunk_documents を変更したら影響を受けるモジュールを教えて。","label":"tool"}
+{"query":"このリポジトリのエントリポイントはどのファイルですか。","label":"tool"}
+{"query":"SleepTimeWorker の依存関係 (import している側とされている側) を調べて。","label":"tool"}
+{"query":"Which modules import evidence/store.py, and what does it depend on?","label":"tool"}
+{"query":"Give me an overview of the codebase layout and the main entry points.","label":"tool"}
+{"query":"Where is the function project_map_package_id defined and who calls it?","label":"tool"}
+{"query":"コード構造グラフとは一般にどういうものですか。","label":"none"}

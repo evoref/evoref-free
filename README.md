@@ -71,7 +71,7 @@ evoref は **完全ローカル動作** の自己進化型 LLM アシスタン�
 ### 操作（Web UI / CLI）
 
 - **Web UI**: チャット / 会話履歴 / 資料パック管理 / メモリ閲覧 / 設定 / テーマの各画面。学習ダッシュボード (手本の一覧を含む)・RAG 統計・VRAM 使用量・ループ進捗のライブコンソールで状態を可視化します。
-- **CLI**: `evoref chat` でリッチなストリーミング対話。`/save` `/load` (セッション)・`/cartridge` (資料パック)・`/theme`・`/file` (添付)・`/export` (書出)・`/loop`・`/history`・`/pin` `/unpin` `/pinned`・`/private`・`/learn`・`/status`・`/tasks`・`/web`・`/page`・`/reindex` などのスラッシュコマンドを利用でき、進行中の応答は Ctrl+C で中断できます。
+- **CLI**: `evoref chat` でリッチなストリーミング対話。`/save` `/load` (セッション)・`/cartridge` (資料パック)・`/theme`・`/file` (添付)・`/export` (書出)・`/history`・`/pin` `/unpin` `/pinned`・`/private`・`/learn`・`/status`・`/web`・`/page`・`/reindex` などのスラッシュコマンドを利用でき、進行中の応答は Ctrl+C で中断できます。
 - 日本語 / 英語の言語切替とテーマ切替に対応 (Web UI と CLI で共通)。
 
 ### 会話履歴・ファイル・データ移行

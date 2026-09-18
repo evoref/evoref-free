@@ -111,11 +111,12 @@ async def generate_single_file(
     *,
     max_tokens: int = 4096,
     temperature: float = 0.3,
+    request_timeout: float | None = None,
 ) -> dict[str, str]:
     """instruction から単一ファイルのコードを base モデルへの 1 回の呼び出しで生成する。
 
     Args:
-        client: base LLM client (``LocalClient`` 互換、``generate()``/``chat_slot``
+        client: base LLM client (``LocalClient`` 互換、``generate()``/``longform_slot``
             を持つ)。
         instruction: 呼出側 (staged executor) が組み立てた完全な生成指示
             (spec.md 全文 + flowchart + 契約ブロックを含む)。加工・再合成せず
@@ -124,6 +125,10 @@ async def generate_single_file(
             (呼出側は常にこのキーで結果を取得できる)。
         max_tokens: 初回生成の最大トークン。
         temperature: 生成温度。
+        request_timeout: 呼出予算 (f_10 §3)。``LocalClient.generate`` の
+            ``request_timeout`` へそのまま渡す。``None`` (既定) は
+            ``sync_request_timeout`` (実質無制限) に委ねる。切断時の再生成
+            呼出にも同じ値を使う (再計算しない)。
 
     Returns:
         ``{file_path: code}``。生成失敗 / 空応答時は空 dict。再生成 (retry) 後も
@@ -140,7 +145,10 @@ async def generate_single_file(
     try:
         resp = await client.generate(
             messages, stream=False, max_tokens=max_tokens, temperature=temperature,
-            id_slot=client.chat_slot,
+            # chat_slot だとチャット接頭辞 KV を破壊する退行 (f_08 §2.2 実測、
+            # f_10 §0)。staged の codegen は long_form 専有スロットを使う。
+            id_slot=client.longform_slot,
+            request_timeout=request_timeout,
         )
     except Exception as exc:
         logger.warning("direct codegen failed for %s: %s", file_path, exc)
@@ -164,7 +172,8 @@ async def generate_single_file(
             try:
                 resp2 = await client.generate(
                     messages, stream=False, max_tokens=retry_tokens,
-                    temperature=temperature, id_slot=client.chat_slot,
+                    temperature=temperature, id_slot=client.longform_slot,
+                    request_timeout=request_timeout,
                 )
                 retry_code, retry_from_salvage = _extract_code(resp2, file_path)
                 if _finish_reason(resp2) == "length" and not retry_from_salvage:

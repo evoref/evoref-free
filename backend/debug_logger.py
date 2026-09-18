@@ -583,8 +583,8 @@ class DebugLogger:
         """メモリ状態をダンプ
 
         Args:
-            session_id: 呼び出しコンテキスト識別子 (例: ``"unified_search"``、
-                ``"startup_bootstrap"``)。**チャットのセッション ID ではない**
+            session_id: 呼び出しコンテキスト識別子 (例: ``"unified_search"``)。
+                **チャットのセッション ID ではない**
                 ため、JSONL には ``context`` として書き出す (引数名は既存呼出を
                 壊さないよう据え置く)。全レコードが ``session_id:
                 "unified_search"`` に見える状態は、セッション単位の切り分けが

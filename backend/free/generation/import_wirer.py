@@ -9,8 +9,8 @@
 - stdlib/3rd-party 伝播: 集合内のいずれかが import 済みの名前 → その import 文を伝播。
 
 LLM は使わない。``ast.parse`` 失敗ファイルは無変更で据え置く (防御的)。import 解決を
-直すのみで実行時ロジックの正否は対象外。フラットな兄弟タブ前提 (module 名 = ファイル
-stem)。
+直すのみで実行時ロジックの正否は対象外。module 名は論理パス由来 (flat なら stem、
+ネストなら dotted。``_module_name``)。
 
 ``needed`` 集合は「全 Load 参照 − **トップレベル**定義 − import 済 − builtins」で求める
 (``validators._extract_defined_names`` の全スコープ減算は使わない)。これにより関数内の
@@ -188,6 +188,20 @@ def _safe_parse(code: str) -> ast.Module | None:
         return None
 
 
+def _is_sibling_import_stmt(stmt: str, sibling_modules: set[str]) -> bool:
+    """``from <mod> import x`` / ``import <mod>`` の ``<mod>`` が兄弟モジュールか。"""
+    parts = stmt.split()
+    if len(parts) >= 2 and parts[0] in ("from", "import"):
+        return parts[1] in sibling_modules
+    return False
+
+
+def _module_name(path: str) -> str:
+    """論理パスを import 可能なモジュール名にする (``a/b.py`` → ``a.b``、``b.py`` → ``b``)。"""
+    pure = PurePosixPath(path.replace("\\", "/"))
+    return ".".join([*pure.parts[:-1], pure.stem])
+
+
 def wire_imports(files: dict[str, str]) -> dict[str, str]:
     """複数ファイル生成コードへ cross-file / stdlib import を補完する。
 
@@ -206,7 +220,11 @@ def wire_imports(files: dict[str, str]) -> dict[str, str]:
     parsed: dict[str, ast.Module | None] = {
         path: _safe_parse(code) for path, code in work.items()
     }
-    module_of = {path: PurePosixPath(path).stem for path in files}
+    # module 名は論理パス由来: flat な ``idgen.py`` は ``idgen``、staged の
+    # ``idtool/idgen.py`` は ``idtool.idgen`` (配信も smoke もネストを保つ)。stem
+    # 固定だと正しい ``from idtool.idgen import x`` を幻覚 import と誤認して
+    # ``from idgen import x`` へ書き換え、パッケージ構成を壊す (2026-09-18 実機)。
+    module_of = {path: _module_name(path) for path in files}
     sibling_modules = set(module_of.values())
 
     # name -> それを top-level 定義する module 集合 (import 可能な export)。
@@ -241,6 +259,11 @@ def wire_imports(files: dict[str, str]) -> dict[str, str]:
         if tree is None:
             continue
         for bound, stmt in _iter_top_level_imports(tree):
+            # 兄弟モジュール由来の import は伝播表に入れない。入れると、1 ファイルが
+            # 既に ``from grid import Grid`` を書いているだけで、他ファイルの Grid
+            # 参照が「import 済みの外部名」に見えて cross-file 配線されなかった。
+            if _is_sibling_import_stmt(stmt, sibling_modules):
+                continue
             import_map.setdefault(bound, stmt)
 
     out = dict(work)

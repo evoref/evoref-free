@@ -4,7 +4,7 @@
 
 - 計測ヘルパー : :func:`_timed` / :func:`_timed_task`
 - pillar 内の個別 ``_init_*`` ヘルパー (LLM / 埋め込み / リランカー /
-  カートリッジ / 学習サイクル / Pro Learn 注入 / loop driver / テーマ /
+  カートリッジ / 学習サイクル / Pro Learn 注入 / テーマ /
   model state / エディションダウングレード)
 - pillar build エントリポイント : :func:`_build_base_context` /
   :func:`_build_gen_pillar` / :func:`_build_mem_pillar` /
@@ -1500,12 +1500,55 @@ def _start_level1_loop(
     logger.info("Learning cycle initialized")
 
 
+def _make_project_map_reader_getter(
+    cfg: dict[str, Any], resolver: Any,
+) -> "Callable[[], Any]":
+    """ProjectMapReader を active 版が変わるまでキャッシュして返す getter (c_16 §4.4)。
+
+    版の変化は ``corpus/manifest.json`` の mtime で見る (専用の版 API が無いので
+    十分な近似として使う)。``rag.project_map.enabled`` が false / tree-sitter
+    不在 / パッケージ未構築なら常に ``None`` を返し、起動もチャットも壊さない。
+    """
+    pm_cfg = ((cfg.get("rag") or {}).get("project_map") or {})
+    if not bool(pm_cfg.get("enabled", True)):
+        return lambda: None
+    roots = [(resolver.root / r).resolve() for r in (pm_cfg.get("roots") or ["."])]
+    cache: dict[str, Any] = {"reader": None, "mtime": None}
+
+    def getter() -> Any:
+        try:
+            from backend.free.rag.projectmap import MultiProjectMapReader
+        except ImportError:
+            return None
+        corpus_dir = resolver.resolve_corpus_dir()
+        try:
+            mtime = (corpus_dir / "manifest.json").stat().st_mtime
+        except OSError:
+            mtime = None
+        if cache["reader"] is not None and cache["mtime"] == mtime:
+            return cache["reader"]
+        if cache["reader"] is not None:
+            cache["reader"].close()
+        try:
+            # 全 root を束ねる (root が 1 つなら単独 reader と同じ出力)
+            reader = MultiProjectMapReader.open(corpus_dir, roots)
+        except Exception as e:  # noqa: BLE001 — reader 障害でチャットを止めない
+            logger.warning("ProjectMap reader open failed: %s", e)
+            reader = None
+        cache["reader"] = reader
+        cache["mtime"] = mtime
+        return reader
+
+    return getter
+
+
 def _init_tools(
     state: AppState,
     cfg: dict[str, Any],
     client: "LocalClient | None",
     learned_patterns_store: "LearnedPatternStore",
     embedder: "EmbeddingBackend | None" = None,
+    resolver: Any = None,
 ) -> None:
     """7j. ToolsRegistry + ToolCallJudge + ReactiveAgent 初期化（3層エージェントディスパッチ用）"""
     from backend.free.agent.tools_registry import ToolsRegistry
@@ -1517,13 +1560,21 @@ def _init_tools(
     tools_reg = ToolsRegistry()
     # aux_client は Gen pillar 構築時 (_init_aux_client) に state へ載っている。
     # base 未接続なら None で、LLM 委譲ツールは LocalClient 直呼びへ縮退する。
+    project_map_reader_getter = (
+        _make_project_map_reader_getter(cfg, resolver) if resolver is not None
+        else None
+    )
     register_builtin_tools(
         tools_reg, cfg, client,
         history_manager=get_history_manager(),
         aux_client=state.aux_client,
+        project_map_reader_getter=project_map_reader_getter,
     )
 
     state.tools_registry = tools_reg
+    # ProductionBrief (f_08 §2.2) の Code map 節が同じ getter を使う
+    # (search_code / project_map ツールと別インスタンスを作らない)。
+    state.project_map_reader_getter = project_map_reader_getter
     logger.info("ToolsRegistry initialized: %d tools", tools_reg.count)
 
     # URL リコール用 MemFactView (global scope) — チャット応答時に
@@ -1698,161 +1749,6 @@ def _init_agent_tracer(state: AppState, debug_logger: "DebugLogger") -> None:
     agent_tracer = AgentTracer(debug_logger=debug_logger, trace_store=trace_store)
     state.agent_tracer = agent_tracer
     logger.info("AgentTracer initialized (trace_dir=%s)", trace_dir)
-
-
-def _init_loop_driver(
-    state: AppState,
-    cfg: dict[str, Any],
-    project_root: Path,
-    aux_client: "AuxClient | None",
-) -> None:
-    """7m. LoopDriver + TaskExecutor 初期化
-
-    - ``loop.enabled=False`` の場合は driver を作らずに終了
-    - ``loop.executor=noop`` なら ``NoOpExecutor``、``ralph`` なら
-      ``RalphExecutor`` を構築して DI する
-    - ``RalphExecutor`` には ``DefaultHarness`` + ``ActionRunner`` +
-      PolicyInterpreter.get_all を差し込む
-    - 起動 bootstrap は既存の ``bootstrap_loop_context_at_startup`` に任せる
-    """
-    loop_cfg = (cfg or {}).get("loop", {}) or {}
-    if not loop_cfg.get("enabled", True):
-        logger.info("LoopDriver: disabled by config (loop.enabled=false)")
-        return
-    from backend.free.harness.base import DefaultHarness
-    from backend.free.loop.action_runner import (
-        ActionRunnerError,
-        build_action_runner_config,
-        ActionRunner,
-    )
-    from backend.free.loop.driver import LoopDriver
-    from backend.free.loop.executor import NoOpExecutor
-    from backend.free.loop.quality_gate import build_default_gates
-    from backend.free.loop.ralph_executor import RalphExecutor
-    from backend.free.memory.views.harness import HarnessFactView
-    from backend.free.memory.views.loop import LoopFactView
-    from backend.schemas import LoopQualityGatesConfig
-
-    executor_kind = str(loop_cfg.get("executor", "ralph")).lower()
-
-    # ActionRunner / QualityGate は Ralph 構築時のみ必要
-    executor: object | None = None
-    if executor_kind == "noop":
-        executor = NoOpExecutor()
-    else:
-        try:
-            ar_cfg = build_action_runner_config(loop_cfg.get("sandbox") or {})
-            action_runner = ActionRunner(config=ar_cfg, repo_root=project_root)
-        except ActionRunnerError as exc:
-            logger.warning(
-                "LoopDriver: ActionRunner config invalid: %s — loop disabled",
-                exc,
-            )
-            return
-
-        gates_raw = loop_cfg.get("quality_gates") or {}
-        try:
-            gates_cfg = LoopQualityGatesConfig(**gates_raw)
-        except Exception as exc:
-            logger.warning(
-                "LoopDriver: quality_gates config invalid: %s (using defaults)",
-                exc,
-            )
-            gates_cfg = LoopQualityGatesConfig()
-        gates = build_default_gates(
-            gates_cfg, repo_root=project_root,
-        )
-
-        def _policy_provider(mode: str) -> dict[str, object] | None:
-            pi = state.policy_interpreter
-            if pi is None:
-                return None
-            try:
-                return pi.get_all(mode)
-            except Exception:
-                return None
-
-        # Harness は HarnessFactView (read-only) で SemMem を参照する
-        stores: list = [state.get_semantic_store("global")]
-        current_project = state.current_project_id
-        if current_project:
-            stores.append(state.get_semantic_store(f"project:{current_project}"))
-        harness_view = HarnessFactView(stores=stores)
-
-        harness = DefaultHarness(
-            harness_view=harness_view,
-            mode="create",
-            policy_provider=_policy_provider,
-        )
-        executor = RalphExecutor(
-            harness=harness,
-            action_runner=action_runner,
-            aux_client=aux_client,
-            quality_gates=gates,
-            max_actions_per_task=int(loop_cfg.get("max_actions_per_task", 10)),
-            policy_provider=_policy_provider,
-        )
-
-    def _view_provider(project_id: str) -> LoopFactView:
-        """project_id ごとに ``LoopFactView`` を生成する
-
-        ``stores=[global, project]`` + ``writeback_store=project`` の標準構成。
-        """
-        global_store = state.get_semantic_store("global")
-        project_store = state.get_semantic_store(f"project:{project_id}")
-        return LoopFactView(
-            stores=[global_store, project_store],
-            writeback_store=project_store,
-        )
-
-    # artifact_hook を結線 — ラルフループの成果物を SemMem の project
-    # スコープへ即時書き込み (冪等、重複スキップ)
-    from backend.free.loop.artifact_writer import make_loop_artifact_hook
-    artifact_hook = make_loop_artifact_hook(_view_provider)
-
-    from backend.free.loop.events import LoopEventBus
-    event_bus = LoopEventBus(
-        max_queue_size=int(loop_cfg.get("event_bus_max_queue", 128)),
-    )
-
-    def _build_sleep_time_hook(app_state: AppState):
-        """`loop.sleep_time_every_n` 反復ごとに sleep-time Light を回すフック。
-
-        ``sleep_scheduler`` が未構築 (degraded / ``--no-learning``) の場合は
-        ``None`` を返し、LoopDriver 側でフック無効として扱われる。
-        """
-        scheduler = getattr(app_state, "sleep_scheduler", None)
-        if scheduler is None:
-            return None
-
-        async def _hook() -> None:
-            await scheduler.run_light_now()
-
-        return _hook
-
-    driver = LoopDriver(
-        view_provider=_view_provider,
-        executor=executor,  # type: ignore[arg-type]
-        max_iterations=int(loop_cfg.get("max_iterations", 50)),
-        max_wall_time_sec=float(loop_cfg.get("max_wall_time_sec", 1800.0)),
-        max_consecutive_failures=int(
-            loop_cfg.get("max_consecutive_failures", 3),
-        ),
-        tick_interval_sec=float(loop_cfg.get("tick_interval_sec", 0.0)),
-        sleep_time_every_n=int(loop_cfg.get("sleep_time_every_n", 5)),
-        sleep_time_hook=_build_sleep_time_hook(state),
-        on_gate_fail=str(loop_cfg.get("on_gate_fail", "retry")),
-        retry_limit_per_task=int(loop_cfg.get("retry_limit_per_task", 2)),
-        artifact_hook=artifact_hook,
-        event_bus=event_bus,
-        # に記録 (decision_point=``loop_continue_or_abort`` / ``quality_gate_action``)
-        debug_logger=state.debug_logger,
-    )
-    state.loop_driver = driver  # type: ignore[attr-defined]
-    logger.info(
-        "LoopDriver initialized: executor=%s max_iter=%d",
-        executor_kind, driver._max_iterations,  # type: ignore[attr-defined]
-    )
 
 
 def _init_theme_manager(state: AppState, cfg: dict[str, Any], resolver: Any) -> None:
@@ -2373,7 +2269,6 @@ async def _build_mem_pillar(
     from backend.factory._memory_init import (
         _init_memory,
         apply_semmem_policy_overrides,
-        bootstrap_loop_context_at_startup,
     )
 
     cfg = base.cfg
@@ -2403,12 +2298,6 @@ async def _build_mem_pillar(
             project_id_for_policy = None
         state.current_project_id = project_id_for_policy
         apply_semmem_policy_overrides(state, cfg, project_id_for_policy)
-
-    # Loop startup bootstrap — Mem から Tier 1 素材を再構築する
-    with _timed(timings, "loop_startup_bootstrap"):
-        bootstrap_loop_context_at_startup(
-            state, cfg, project_id_for_policy, debug_logger=debug_logger,
-        )
 
     # Sleep-time 中核 (SleepTimeScheduler は Mem 所有、SleepTimeWorker の注入に必要)
     with _timed(timings, "sleep_scheduler"):
@@ -2598,6 +2487,18 @@ async def _build_learn_pillar(
 
     social_formula_gate.bind_debug_logger(debug_logger)
 
+    # 長文 unit の固有値の矛盾 / 捏造候補の判定点 (c_17 §3.7) も字句段だけ。
+    # 配線を忘れると log_decision が no-op になり decision.jsonl に 1 行も出ない
+    # (2026-09-18 実機で発覚)。
+    from backend.free.generation import text_fabrication
+
+    text_fabrication.bind_debug_logger(debug_logger)
+
+    # staged create の問い返し判定 (Phase 3b、f_03 §4.4) も字句段だけ。
+    from backend.free.agent import create_target_gate
+
+    create_target_gate.bind_debug_logger(debug_logger)
+
     with _timed(timings, "component_wiring"):
         _wire_sleep_scheduler_models(
             state, mem.sleep_scheduler, learning_scheduler, resolver,
@@ -2639,17 +2540,14 @@ async def _build_learn_pillar(
 def _build_loop_pillar(
     state: AppState,
     base: _BaseContext,
-    project_root: Path,
     gen: "GenPillar",
     mem: "MemPillar",  # noqa: ARG001
     learn: "LearnPillar",
     timings: dict[str, float],
 ) -> "LoopPillar":
-    """EvorefLoop pillar を構築する (ツール / エージェント / LoopDriver)。
+    """EvorefLoop pillar を構築する (ツール / エージェント)。
 
-    ``loop.enabled=false`` の場合は ``LoopDriver=None`` / ``enabled=False`` で
-    返す。tools / agent_tracer は loop driver の有無に関係なく常時初期化する
-    (チャット経由のエージェントレイヤーでも使うため)。
+    tools / agent_tracer はチャット経由のエージェントレイヤーで使う。
     """
     cfg = base.cfg
     debug_logger = base.debug_logger
@@ -2659,20 +2557,13 @@ def _build_loop_pillar(
             state, cfg, gen.local_client,
             learn.learned_patterns_store,
             embedder=gen.embedder,
+            resolver=base.resolver,
         )
     with _timed(timings, "agent_tracer"):
         _init_agent_tracer(state, debug_logger)
 
-    loop_cfg = (cfg or {}).get("loop", {}) or {}
-    enabled = bool(loop_cfg.get("enabled", True))
-
-    with _timed(timings, "loop_driver"):
-        if enabled:
-            _init_loop_driver(state, cfg, project_root, gen.aux_client)
-
     from backend.pillars import LoopPillar
-    driver = getattr(state, "loop_driver", None) if enabled else None
-    return LoopPillar(driver=driver, enabled=enabled)
+    return LoopPillar()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -2999,10 +2890,10 @@ async def wire_pillars(
 
         install_rebind_hook(state)
 
-    # Loop pillar: tools / agent tracer / LoopDriver
+    # Loop pillar: tools / agent tracer
     with _timed(timings, "pillar_loop"):
         loop_pillar = _build_loop_pillar(
-            state, base, project_root, gen, mem, learn, timings,
+            state, base, gen, mem, learn, timings,
         )
         state.loop = loop_pillar
 

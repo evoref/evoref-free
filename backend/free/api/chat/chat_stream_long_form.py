@@ -423,12 +423,16 @@ async def stream_long_form(
     prefetched_rag: list[tuple[str, float, str]] | None = None,
     prefetched_rag_top_score: float | None = None,
     file_context_block: str | None = None,
+    brief: str = "",
 ):
     """長文生成の SSE ストリーミング（long_form_* ステップフレーム付き）
 
     ``output_target`` は create モード時の出力先 (``"file"`` / ``"editor"`` /
     ``"chat"``)。``"editor"`` の場合はトークンの逐次送出を抑止して終端で
     `sse.editor_code` を送る (`_dispatch_meta_cognitive` 経路の挙動に揃える)。
+
+    ``brief`` は ProductionBrief (f_08 §2.2、create 限定。空文字 = 通常の
+    長文生成) — ``orchestrator.generate`` へそのまま転送する。
     """
     async with cancel_scope(session_id):
         t_start = time.monotonic()
@@ -535,6 +539,7 @@ async def stream_long_form(
                 target_format=(
                     _infer_output_extension(query) if file_output_mode else ""
                 ),
+                brief=brief,
             )
             last_frame_at = time.monotonic()
             # キャンセル / クライアント切断時に orchestrator の generator を

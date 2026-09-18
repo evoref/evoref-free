@@ -1,41 +1,104 @@
-"""Staged クリエイト (仕様書 → コード → テスト) のストリーミング"""
+"""run_staged_pipeline の置き場 (StagedCodeHarness が消費)
+
+staged クリエイト (仕様書 → コード → テスト) の「合成 → LoopDriver → finalize 検査」
+を構造化イベントで駆動する共有実体 (:func:`run_staged_pipeline`)。配信 (SSE 化 /
+ディスク書込) は持たない — 消費者は ``create.dispatch=meta`` の
+:class:`backend.free.loop.staged.harness.StagedCodeHarness` の 1 本 (3a-2、f_10 §1)。
+旧 legacy dispatch (``stream_staged_create`` が SSE を直接組み立てていた経路) は
+撤去済み。
+"""
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 
+from dataclasses import dataclass, field
 from typing import (
+    Any,
     AsyncIterator,
+    Callable,
     TYPE_CHECKING,
 )
-from pathlib import Path
 from backend.app_state import AppState
 from backend.free.api.chat.chat_constants import DEFAULT_KEEPALIVE_INTERVAL_SEC
-from backend.free.api.chat.chat_recorder import record_long_form_response
-from backend.free.api.chat.chat_service import make_token_info
-from backend.free.api.chat.chat_types import ChatMessage
-from backend.free.agent.tool_call_judge import _extract_file_path
 from backend.free.generation.key_coherence import find_unmatched_dict_keys
-from backend.free.generation.validators import remove_code_fences
+from backend.trace_context import get_trace_id
 from backend.utils import estimate_tokens as _estimate_tokens
 
 from backend.free.api.chat.chat_stream_common import (
-    _emit_stream_error,
-    _finish_stream_outcome,
-    _record_failed_generation,
-    cancel_scope,
+    cancel_requested,
     logger,
-    rag_signals_from_chunks,
-    sse,
-)
-
-from backend.free.api.chat.chat_stream_output import (
-    _editor_language_for_extension,
 )
 
 if TYPE_CHECKING:
-    from backend.free.core.stage_timer import StageTimer
+    from backend.free.loop.staged.run_record import RunEventLog, RunRecordStore
+
+
+def _supports_kwarg(target: Callable, name: str) -> bool:
+    """``target`` の呼出しが keyword ``name`` を受け取れるか (``**kwargs`` も可)。
+
+    ``StagedCreateExecutor``/``synthesize_create_task_graph`` へ渡す新設
+    キーワード (``deadline_monotonic``/``timeout``) は別エージェントが同時に
+    足すため、未着地の間に落ちないよう存在確認してから渡す
+    (f_10 §3 予算の 3 層)。
+    """
+    try:
+        sig = inspect.signature(target)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == name and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
+
+
+#: staged create の run 1 リクエストの壁時計上限の出荷既定
+#: (``create.turn_timeout_sec``、f_10 §3 予算の 3 層 — ターン予算)。
+_TURN_TIMEOUT_DEFAULT_SEC = 3600.0
+
+#: ステージ予算 (create.staged.total_timeout_sec) をターン予算から確保する下限。
+_STAGE_BUDGET_FLOOR_SEC = 300.0
+
+#: 呼出予算 (task グラフ合成 1 回) の既定上限。
+_GRAPH_SYNTHESIS_TIMEOUT_DEFAULT_SEC = 120.0
+
+
+def _emit_check(
+    event_log: "RunEventLog | None", kind: str, payload: dict,
+) -> tuple[str, dict]:
+    """finalize 検査用の内部 emit: ``events.jsonl`` へ永続化し ``(kind, payload)`` を返す。
+
+    :func:`_emit_step` と同じ永続化を行うが SSE 化はしない — 構造化イベント
+    (:func:`run_staged_pipeline`) と SSE (:func:`_finalize_staged_checks`) の
+    共有実体 (:func:`_finalize_staged_checks_events`) が使う。
+    """
+    if event_log is not None:
+        try:
+            event_log.append(kind, payload)
+        except Exception as exc:  # noqa: BLE001 - イベント記録の失敗で検査を止めない
+            logger.warning("staged run event log append failed (kind=%s): %s", kind, exc)
+    return kind, payload
+
+
+def _finish_run_safely(
+    run_store: "RunRecordStore | None",
+    event_log: "RunEventLog | None",
+    exit_kind: str,
+) -> None:
+    """run.json の終端書込み (失敗しても配信を止めない)。"""
+    if run_store is None:
+        return
+    try:
+        last_seq = event_log.last_seq if event_log is not None else -1
+        run_store.finish(exit_kind, last_event_seq=max(0, last_seq))
+    except Exception as exc:  # noqa: BLE001 - 後始末の失敗で応答を壊さない
+        logger.warning("staged run record finish(%s) failed: %s", exit_kind, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -55,10 +118,14 @@ def _stage_label_for_task(task_id: str) -> str:
     return "タスク"
 
 
-def _translate_loop_event(
+def _translate_loop_event_payload(
     evt, total_tasks: int = 0, task_indices: dict[str, int] | None = None,
-) -> str | None:
-    """LoopEvent を staged 進捗の SSE step フレームへ翻訳する (該当なしは None)。
+) -> dict | None:
+    """LoopEvent を staged 進捗の step payload (dict) へ翻訳する (該当なしは None)。
+
+    ``_translate_loop_event`` (SSE 文字列版) / :func:`run_staged_pipeline`
+    (構造化イベント版、meta dispatch) の共有実体 — 同じ翻訳ロジックを 2 本
+    書かないための単一の実装 (f_10 §1)。
 
     2 段階表示:
     - 上位 (工程タスク): ``task_picked`` → ``long_form_unit_start`` を
@@ -90,11 +157,11 @@ def _translate_loop_event(
         idx, is_retry = _unit_index()
         prefix = f"[{idx}/{total_tasks}] " if total_tasks else ""
         suffix = " (再試行)" if is_retry else ""
-        return sse.step({
+        return {
             "type": "long_form_unit_start",
             "detail": f"{prefix}{label}: {title}{suffix}".strip(),
             "status": "running",
-        })
+        }
     if evt.event == "iteration_ended":
         outcome = data.get("last_outcome") or {}
         status = str(outcome.get("status", ""))
@@ -104,21 +171,21 @@ def _translate_loop_event(
         else:
             idx = getattr(evt, "iteration", 0) or 0
         prefix = f"[{idx}/{total_tasks}] " if total_tasks else ""
-        return sse.step({
+        return {
             "type": "long_form_unit_done",
             "detail": f"{prefix}{label}: {'完了' if ok else (status or '終了')}",
             "status": "done" if ok else "failed",
-        })
+        }
     if evt.event == "stage_progress":
         detail = str(data.get("detail", "")).strip()
         status = str(data.get("status", "running"))
         if not detail:
             return None
-        return sse.step({
+        return {
             "type": "task_progress",
             "detail": detail,
             "status": status,
-        })
+        }
     if evt.event == "gate_result":
         ok = bool(data.get("ok"))
         # ゲートは工程タスク単位で走るため、同一工程に複数ユニットがあると
@@ -139,19 +206,19 @@ def _translate_loop_event(
             if ok else
             f"{prefix}{label}: 起動可能性チェック失敗 (起動不能の可能性)"
         )
-        return sse.step({
+        return {
             "type": "task_result",
             "detail": detail,
             "status": "done" if ok else "failed",
-        })
+        }
     return None
 
 
 # staged の task グラフは **リクエスト毎の隔離ストア** (workspace 内 .semmem) に持つ。
 # 共有 project ストア (state.current_project_id) を使うと ①継続ターンで stale な
-# done ファクトが新ターンの spec→code→test 依存ゲートを壊す ②自律ループ
-# (state.loop_driver / RalphExecutor) が stage 付きタスクを誤実行する、という不具合に
-# なるため、永続プロジェクトストアからは完全に切り離す。
+# done ファクトが新ターンの spec→code→test 依存ゲートを壊す ②永続ストアの ``task``
+# ファクトは create モードのプロンプトへ注入されるので、staged のタスクが次の会話へ
+# 漏れる、という不具合になるため、永続プロジェクトストアからは完全に切り離す。
 _STAGED_PROJECT_ID = "staged"
 
 #: staged クリエイト 1 リクエストの総時間上限の出荷既定
@@ -160,50 +227,15 @@ _STAGED_PROJECT_ID = "staged"
 _STAGED_TOTAL_TIMEOUT_DEFAULT_SEC = 2400.0
 
 
-def _staged_output_dir(query: str) -> str:
-    """staged 成果物の書き出し先ディレクトリをユーザークエリから解決する。
-
-    従来は logical path (``stats.py`` / ``SPEC.md``) をそのまま write_file に
-    渡していたため、バックエンドの CWD (= リポジトリルート) に書き出され、
-    ユーザーが指定したディレクトリが無視されていた (実インシデント
-    2026-07-27 ライブ検証: 「E:\\tmp\\evoref_test\\stats.py を作って」に対し
-    リポジトリ直下へ stats.py / SPEC.md / flowchart.md が生成された)。
-
-    Returns:
-        解決したディレクトリ。クエリにパス指定が無ければ空文字列
-        (従来どおり logical path をそのまま使う)。純粋関数。
-    """
-    referenced = _extract_file_path(query)
-    if not referenced:
-        return ""
-    path = Path(referenced)
-    parent = path.parent if path.suffix else path
-    resolved = str(parent)
-    return "" if resolved in ("", ".") else resolved
-
-
-def _staged_deliverable_path(out_dir: str, logical_path: str) -> str:
-    """logical path を出力先ディレクトリ配下へ寄せる (純粋関数)。"""
-    return str(Path(out_dir) / logical_path) if out_dir else logical_path
-
-
-async def _staged_write_file(
-    state: AppState, logical_path: str, content: str,
-) -> str | None:
-    """output_target=="file" 時に生成ファイルを registry.write_file で書き出す。"""
-    registry = state.tools_registry
-    if registry is None or not registry.has("write_file"):
-        return None
-    try:
-        # markdown (SPEC.md 等) は ```mermaid 等の正当なコードフェンスを含むため
-        # 除去しない。コードファイルのみ LLM が付ける外側フェンスを剥がす。
-        body = content if logical_path.endswith(".md") else remove_code_fences(content)
-        return str(await registry.execute(
-            "write_file", file_path=logical_path, content=body,
-        ))
-    except Exception as exc:
-        logger.warning("staged write_file failed for %s: %s", logical_path, exc)
-        return None
+def _staged_remaining_units(ws) -> int:
+    """manifest の progress から未完了タスクユニット数を出す (timed_out / cancelled 共有)。"""
+    progress = ws.read_manifest().get("progress") or {}
+    return max(
+        0,
+        int(progress.get("tasks_total") or 0)
+        - int(progress.get("tasks_done") or 0)
+        - int(progress.get("tasks_failed") or 0),
+    )
 
 
 def _staged_postprocess(
@@ -296,108 +328,51 @@ async def _staged_import_smoke(
     return [str(e) for e in (getattr(res, "errors", None) or [])]
 
 
-async def stream_staged_create(
+async def run_staged_pipeline(
     *,
     query: str,
     session_id: str,
     state: AppState,
     cfg: dict,
-    instance_name: str,
-    context_size: int,
-    messages: list[ChatMessage],
     output_target: str,
     codegen,
-    fallback_factory,
     part_codegen=None,
-    timer: StageTimer | None = None,
-    private: bool = False,
-    keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL_SEC,
     prefetched_rag: list[tuple[str, float, str]] | None = None,
-    prefetched_rag_top_score: float | None = None,
+    prefetched_rag_top_score: float | None = None,  # noqa: ARG001 - metrics 側は呼出元が使う
     file_context_block: str | None = None,
-) -> AsyncIterator[str]:
-    """staged クリエイトのストリーム (キャンセル / 例外 / 結末の枠)。
-
-    本体は :func:`_stream_staged_create_body`。以前は ``cancel_scope`` も
-    try/except も無く、``/api/chat/cancel`` は ``cancelled=false`` を返し
-    (staged は最長 ``total_timeout_sec`` まで止められない)、例外は ``error`` /
-    ``done`` フレーム無しで接続が切れ、結末 (outcome) も timing も記録されなかった。
-    タスクグラフが空で long_form へ委譲したときは long_form 側が結末を記録する
-    (二重に書かない)。
-    """
-    delegated: dict = {"fallback": False}
-    async with cancel_scope(session_id):
-        t_start = time.monotonic()
-        outcome_success = False
-        errored = False
-        try:
-            async for frame in _stream_staged_create_body(
-                query=query, session_id=session_id, state=state, cfg=cfg,
-                instance_name=instance_name, context_size=context_size,
-                messages=messages, output_target=output_target,
-                codegen=codegen, fallback_factory=fallback_factory,
-                part_codegen=part_codegen, timer=timer, private=private,
-                keepalive_interval=keepalive_interval,
-                prefetched_rag=prefetched_rag,
-                prefetched_rag_top_score=prefetched_rag_top_score,
-                file_context_block=file_context_block,
-                delegated=delegated,
-            ):
-                yield frame
-            outcome_success = True
-        except Exception as e:
-            errored = True
-            async for frame in _emit_stream_error(
-                state, e, timer=timer, agent_layer="staged_create", mode="create",
-            ):
-                yield frame
-            _record_failed_generation(
-                state, query=query, messages=messages, session_id=session_id,
-                mode="create", private=private, agent_layer="staged_create",
-            )
-        finally:
-            if not delegated["fallback"]:
-                _finish_stream_outcome(
-                    state, session_id,
-                    started_at=t_start,
-                    completed=outcome_success,
-                    errored=errored,
-                    tokens_out=0,
-                    signals={"agent_layer": "staged_create", "output_target": output_target},
-                )
-
-
-async def _stream_staged_create_body(
-    *,
-    query: str,
-    session_id: str,
-    state: AppState,
-    cfg: dict,
-    instance_name: str,
-    context_size: int,
-    messages: list[ChatMessage],
-    output_target: str,
-    codegen,
-    fallback_factory,
-    part_codegen=None,
-    timer: StageTimer | None = None,
-    private: bool = False,
+    brief: str = "",
     keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL_SEC,
-    prefetched_rag: list[tuple[str, float, str]] | None = None,
-    prefetched_rag_top_score: float | None = None,
-    file_context_block: str | None = None,
-    delegated: dict | None = None,
-) -> AsyncIterator[str]:
-    """専用 LoopDriver をインライン駆動し spec→code→test を実行してストリームする。
+    total_timeout_sec: float | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
+    resume_of: str | None = None,
+) -> AsyncIterator[dict]:
+    """staged クリエイトの「合成 → LoopDriver → finalize 検査」を構造化イベントで駆動する。
 
-    タスクグラフ合成が空 (aux degraded 等) のときは ``fallback_factory`` が返す
-    従来 longform ストリームへ委譲する。``part_codegen`` (部分ごと生成向けの別予算
-    delegate) が渡されたときのみ部分生成→決定論結合経路を有効化する。
+    ``create.dispatch=meta`` (:class:`backend.free.loop.staged.harness.StagedCodeHarness`)
+    が消費する共有実体 (f_10 §1)。**配信は行わない** — ``kind="step"`` (進捗) /
+    ``kind="keepalive"`` / 終端 ``kind="result"`` の dict を yield する。
 
-    ``prefetched_rag``/``file_context_block`` は spec/code 生成プロンプトへは
-    注入しない (f_10 §9 の非可逆な再合成 LLM パスを避ける方針)。Level 0 経験
-    記録の rag_used/rag_top1_score シグナルと staged_coherence ログの可観測性
-    のみに使う (longform 経路と record 粒度を揃える)。
+    finalize 検査ロジック (postprocess / smoke / coherence / design_drift) は
+    :func:`_finalize_staged_checks_events` — legacy (``_stream_staged_create_body``
+    → ``_finalize_staged_stream``) と実体を共有する。合成 / LoopDriver 駆動の
+    グルーコード自体は legacy 側 (``_stream_staged_create_body``) と別実装
+    (workspace/ストア構築・ポーリングループ・キャンセル/タイムアウト検知が
+    ``_finalize_staged_stream`` の直接呼出しテストと絡み合っており、検査を
+    二重実行せずに完全統合すると legacy の挙動保証が崩れるため、Phase 3a-1
+    ではここまでに留める) だが、呼び出す下位プリミティブ
+    (``WorkspaceManager`` / ``LoopDriver`` / ``synthesize_create_task_graph_with_plan`` /
+    ``_translate_loop_event_payload``) は同一。
+
+    ``total_timeout_sec`` 未指定時は legacy と同じ既定計算
+    (``create.staged.total_timeout_sec`` を ``create.turn_timeout_sec - 300`` に
+    クランプ) を使う。``is_cancelled`` 未指定時は ``cancel_requested(session_id)``。
+
+    タスクグラフ合成が空のときは ``exit_kind="error"`` + ``notes["fallback"] =
+    "empty_task_graph"`` の終端イベントのみ yield して返す — longform への
+    委譲は composition 層 (``chat.py::make_production_stage``) の責務。
+
+    ``resume_of`` (Phase 3b、f_10 §7) は問い返し (needs_input) から再開する
+    元 run_id。``run_store.start()`` の ``_extra`` へそのまま渡す。
     """
     from uuid import uuid4
 
@@ -406,8 +381,10 @@ async def _stream_staged_create_body(
     from backend.free.loop.driver import LoopDriver, decode_task_fact
     from backend.free.loop.events import LoopEventBus
     from backend.free.loop.staged import (
+        RunEventLog,
+        RunRecordStore,
         WorkspaceManager,
-        synthesize_create_task_graph,
+        synthesize_create_task_graph_with_plan,
     )
     from backend.free.loop.staged.executor import StagedCreateExecutor
     from backend.free.loop.staged.test_runner import StagedTestRunner
@@ -423,21 +400,35 @@ async def _stream_staged_create_body(
     from backend.free.memory.views.loop import LoopFactView
 
     t_start = time.monotonic()
-    staged_cfg = (cfg.get("create", {}) or {}).get("staged", {}) or {}
-    # editor_route は search_error_wrapper (chat.py) が冒頭で 1 度送出するため、
-    # ここでは送らない (二重送出回避)。
+    create_cfg = cfg.get("create", {}) or {}
+    staged_cfg = (create_cfg.get("staged", {}) or {})
+    _is_cancelled = is_cancelled or (lambda: cancel_requested(session_id))
 
-    # リクエスト毎に隔離されたワークスペース + SemMem ストアを使う (継続ターンの
-    # stale ファクト混入・自律ループとの干渉を構造的に排除する)。
+    if total_timeout_sec is None:
+        # 予算の 3 層 (f_10 §3): legacy と同じ既定計算。
+        turn_timeout_sec = float(create_cfg.get("turn_timeout_sec", _TURN_TIMEOUT_DEFAULT_SEC))
+        staged_total_timeout_sec = float(
+            staged_cfg.get("total_timeout_sec", _STAGED_TOTAL_TIMEOUT_DEFAULT_SEC),
+        )
+        _stage_budget_cap = max(_STAGE_BUDGET_FLOOR_SEC, turn_timeout_sec - 300.0)
+        if staged_total_timeout_sec > _stage_budget_cap:
+            logger.warning(
+                "staged create: create.staged.total_timeout_sec=%.0fs exceeds "
+                "turn budget cap %.0fs (create.turn_timeout_sec=%.0fs - 300s); "
+                "clamping (f_10 §3)",
+                staged_total_timeout_sec, _stage_budget_cap, turn_timeout_sec,
+            )
+            staged_total_timeout_sec = _stage_budget_cap
+    else:
+        staged_total_timeout_sec = float(total_timeout_sec)
+    deadline_monotonic = t_start + staged_total_timeout_sec
+
     run_id = uuid4().hex[:12]
     workspace_root = get_path_resolver().resolve_local("create_workspace_dir")
     ws = WorkspaceManager.open_or_create(
         workspace_root, workspace_id=run_id, session_id=session_id,
         project_id=_STAGED_PROJECT_ID, goal=query, debug_logger=state.debug_logger,
     )
-    # 隔離 SemMem ストア (workspace 内 .semmem)。永続 project ストアには触れない。
-    # スコープはフィールドなので (c_16 §4.2)、隔離は **別ディレクトリの
-    # ストアを 1 つ立てる** ことで実現する。
     _staged_semmem = SemanticStore(ws.root / ".semmem")
     _staged_semmem.load()
     staged_store = _staged_semmem.scoped(f"project:{_STAGED_PROJECT_ID}")
@@ -445,12 +436,30 @@ async def _stream_staged_create_body(
     def _staged_view(_pid: str) -> LoopFactView:
         return LoopFactView(stores=[staged_store], writeback_store=staged_store)
 
-    yield sse.step({
+    def _empty_result() -> dict:
+        # run_id/workspace_root は composition 層 (chat.py::_ProductionStageSelector)
+        # が問い返し (needs_input) を判定・永続化するために notes へ載せる (f_03 §4.4)。
+        # 実際の run.json はまだ書かれていない (facts が空なので下の run_store.start
+        # に到達しない) — 問い返しに倒すときだけ選択側が run.json を起こす。
+        return {
+            "exit_kind": "error",
+            "notes": {
+                "fallback": "empty_task_graph",
+                "run_id": run_id, "workspace_root": str(ws.root),
+            },
+            "code_map": {}, "spec_md": None, "flowchart_md": None,
+            "tasks_failed": 0, "runnability_issues": [],
+            "design_drift_counts": {"convergence": 0, "divergence": 0, "absence": 0},
+            "metrics": {}, "truncated_steps": [], "truncated_max_tokens": None,
+            "ws": ws, "event_log": None, "run_store": None, "total_tasks": 0,
+        }
+
+    yield {"kind": "step", "payload": {
         "type": "long_form_plan",
         "detail": "タスクグラフ (仕様書/コード/テスト) を合成中…",
         "status": "running",
-    })
-    facts = await synthesize_create_task_graph(
+    }}
+    _synth_kwargs: dict[str, Any] = dict(
         request=query, project_id=_STAGED_PROJECT_ID,
         aux_client=state.aux_client,
         include_tests=(
@@ -458,17 +467,46 @@ async def _stream_staged_create_body(
             or bool(staged_cfg.get("smoke_gate_enabled", True))
         ),
         debug_logger=state.debug_logger,
+        brief=brief,
     )
+    if _supports_kwarg(synthesize_create_task_graph_with_plan, "timeout"):
+        _remaining = max(0.0, deadline_monotonic - time.monotonic())
+        _synth_kwargs["timeout"] = min(_GRAPH_SYNTHESIS_TIMEOUT_DEFAULT_SEC, _remaining)
+    facts, module_deps = await synthesize_create_task_graph_with_plan(**_synth_kwargs)
     if not facts:
-        logger.info("staged create: empty task graph; falling back to longform")
-        if delegated is not None:
-            delegated["fallback"] = True
-        async for frame in fallback_factory():
-            yield frame
+        logger.info("staged create: empty task graph (pipeline)")
+        try:
+            _staged_semmem.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("staged create: semmem close failed: %s", exc)
+        yield {"kind": "result", "payload": _empty_result()}
         return
 
-    # 書込は LoopFactView 経由 (owner / namespace 検証を通す)。store 直呼びは
-    # 隔離ストアの生成 (上の for_project) だけに限る。
+    if module_deps:
+        try:
+            ws.write_plan(module_deps)
+        except Exception as exc:  # noqa: BLE001 - plan 保存の失敗で staged 実行は止めない
+            logger.warning("staged create: write_plan failed: %s", exc)
+
+    run_store: "RunRecordStore | None" = None
+    event_log: "RunEventLog | None" = None
+    try:
+        run_store = RunRecordStore(ws.root)
+        event_log = RunEventLog(ws.root, debug_logger=state.debug_logger)
+        run_store.start(
+            run_id=run_id, session_id=session_id, request_id=get_trace_id(),
+            mode="create", query=query, output_target=output_target,
+            brief_tokens=_estimate_tokens(brief) if brief else 0,
+            resume_of=resume_of,
+        )
+    except Exception as exc:  # noqa: BLE001 - run レコードの失敗で staged 実行は止めない
+        logger.warning("staged run record start failed: %s", exc)
+        run_store = None
+        event_log = None
+    # run_id の通知 (f_10 §7 / f_05 §4.5): StagedCodeHarness → meta_cognitive の
+    # on_event → create_run SSE フレームへ写る (chat_stream_meta.py)。
+    yield {"kind": "run_started", "payload": {"run_id": run_id, "session_id": session_id}}
+
     staged_view = _staged_view(_STAGED_PROJECT_ID)
     for f in facts:
         try:
@@ -480,11 +518,11 @@ async def _stream_staged_create_body(
             )
         except Exception as exc:
             logger.warning("staged create: failed to register task: %s", exc)
-    yield sse.step({
+    yield {"kind": "step", "payload": {
         "type": "long_form_plan",
         "detail": f"{len(facts)} タスクを生成 (仕様書→コード→テスト)",
         "status": "done",
-    })
+    }}
 
     test_runner = (
         StagedTestRunner(
@@ -500,13 +538,6 @@ async def _stream_staged_create_body(
     entry_exec_timeout = float(staged_cfg.get("entry_smoke_timeout_sec", 10.0))
 
     def _smoke(files: dict[str, str]) -> object:
-        # test 工程の決定論的ゲート。外部依存 (pygame 等) の ModuleNotFound は
-        # run_import_smoke 内で warning 扱い (=合格)、ただし stdlib の OS 非互換
-        # (Windows の curses 等) は error 化して有界リペア対象にする。import only では
-        # 拾えない静的整合 (重複定義 / 未定義名) を check_coherence、起動不能 (エントリが
-        # 未定義メソッドを呼ぶ) を check_entrypoint、生成物間 from-import の名前欠落
-        # (外部依存欠落で import スモークが盲目化しても拾える) を
-        # check_cross_module_imports で error に上乗せ。エントリ有界実行は advisory。
         result = run_import_smoke(
             files, timeout_sec=smoke_timeout,
             internal_names=_staged_internal_names(ws),
@@ -530,16 +561,13 @@ async def _stream_staged_create_body(
 
     part_assembler = None
     if part_codegen is not None:
-        # 部分結合 (EvorefGen 具象) は有効時のみ lazy import で注入する
-        # (smoke_runner / contract_checker と同じ loop→gen 越境回避パターン)。
         from backend.free.generation.part_assembler import assemble_file_parts
         part_assembler = assemble_file_parts
 
-    # spec 宣言契約と生成コードの照合 (EvorefGen 具象) も同パターンで注入。
     from backend.free.generation.spec_conformance import check_spec_conformance
     from backend.free.generation.test_value_repair import repair_literal_assertions
 
-    executor = StagedCreateExecutor(
+    _executor_kwargs: dict[str, Any] = dict(
         workspace=ws, aux_client=state.aux_client, codegen=codegen,
         smoke_runner=(_smoke if staged_cfg.get("smoke_gate_enabled", True) else None),
         test_runner=test_runner,
@@ -562,19 +590,18 @@ async def _stream_staged_create_body(
         part_max_parts=int(staged_cfg.get("part_max_parts", 4)),
         event_bus=event_bus,
         debug_logger=state.debug_logger,
+        brief=brief,
     )
+    if _supports_kwarg(StagedCreateExecutor, "deadline_monotonic"):
+        _executor_kwargs["deadline_monotonic"] = deadline_monotonic
+    executor = StagedCreateExecutor(**_executor_kwargs)
     artifact_hook = make_loop_artifact_hook(_staged_view)
     max_iter = int(staged_cfg.get("max_iterations", 60))
-    staged_total_timeout_sec = float(
-        staged_cfg.get("total_timeout_sec", _STAGED_TOTAL_TIMEOUT_DEFAULT_SEC),
-    )
     driver = LoopDriver(
         view_provider=_staged_view,
         executor=executor,
         max_iterations=max_iter,
         max_wall_time_sec=staged_total_timeout_sec,
-        # モジュールは互いに独立。1 モジュールの失敗で全体を打ち切らないよう
-        # 連続失敗での abort を実質無効化する (max_iterations / 総時間で有界)。
         max_consecutive_failures=max_iter,
         artifact_hook=artifact_hook,
         event_bus=event_bus,
@@ -582,27 +609,28 @@ async def _stream_staged_create_body(
     )
     driver.start(_STAGED_PROJECT_ID)
     total_tasks = len(facts)
-    task_indices: dict[str, int] = {}  # task_id 初出順の表示番号 (リトライで再利用)
+    task_indices: dict[str, int] = {}
     queue = event_bus.subscribe()
     run_task = asyncio.create_task(
-        driver.run(_STAGED_PROJECT_ID), name="staged_create.run",
+        driver.run(_STAGED_PROJECT_ID), name="staged_create_pipeline.run",
     )
     last_ka = time.monotonic()
     timed_out = False
+    cancelled = False
+    disconnected = False
     try:
         while True:
-            # LoopDriver.run() 自身の wall-time チェックはイテレーション間の協調的
-            # チェックのみで、実行中の単一タスク (await executor.execute(task)) を
-            # 打ち切れない。ここで run_task 自体をハード打ち切りすることで、
-            # meta_cognitive.py の asyncio.wait_for(total_timeout) 相当の強制締切を
-            # staged 側にも持たせる。
             if time.monotonic() - t_start >= staged_total_timeout_sec:
                 logger.warning(
                     "staged create: hard wall-time cutoff reached (%.0fs); "
-                    "cancelling run_task",
+                    "cancelling run_task (pipeline)",
                     staged_total_timeout_sec,
                 )
                 timed_out = True
+                break
+            if _is_cancelled():
+                logger.info("staged create: cancel requested; stopping run_task (pipeline)")
+                cancelled = True
                 break
             try:
                 evt = await asyncio.wait_for(queue.get(), timeout=1.0)
@@ -610,15 +638,25 @@ async def _stream_staged_create_body(
                 if run_task.done() and queue.empty():
                     break
                 if time.monotonic() - last_ka >= keepalive_interval:
-                    yield sse.keepalive()
+                    yield {"kind": "keepalive", "payload": {}}
                     last_ka = time.monotonic()
                 continue
-            frame = _translate_loop_event(
+            payload = _translate_loop_event_payload(
                 evt, total_tasks=total_tasks, task_indices=task_indices,
             )
-            if frame:
-                yield frame
+            if payload:
+                # legacy と同じく表示に写る LoopEvent だけ events.jsonl へ積む
+                # (fact_written / task_status 等の内部事象は積まない、f_10 §7)。
+                if event_log is not None:
+                    try:
+                        event_log.append(str(evt.event), dict(getattr(evt, "data", None) or {}))
+                    except Exception as exc:  # noqa: BLE001 - 記録失敗で配信を止めない
+                        logger.warning("staged run event log append failed: %s", exc)
+                yield {"kind": "step", "payload": payload}
                 last_ka = time.monotonic()
+    except asyncio.CancelledError:
+        disconnected = True
+        raise
     finally:
         event_bus.unsubscribe(queue)
         if not run_task.done():
@@ -628,21 +666,21 @@ async def _stream_staged_create_body(
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            logger.warning("staged create run task failed: %s", exc)
+            logger.warning("staged create run task failed (pipeline): %s", exc)
+        if disconnected:
+            try:
+                if event_log is not None:
+                    event_log.append("disconnect", {"tasks_total": total_tasks})
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("staged run event log append failed: %s", exc)
+            _finish_run_safely(run_store, event_log, "disconnected")
+            try:
+                _staged_semmem.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("staged create: semmem close failed: %s", exc)
 
     if timed_out:
-        # 打ち切りは「設定値が作業量に対して小さい」ことがほとんどなので、
-        # どこを変えればよいかまで書く。値だけ出しても利用者は次に何をすれば
-        # よいか分からない (実インシデント 2026-08-07 ライブ監査: config.yaml が
-        # 出荷既定の 2400 より低い 1800 を明示していたため 5 本中 3 本が打ち切られ、
-        # メッセージからはその関係が読み取れなかった)。
-        progress = ws.read_manifest().get("progress") or {}
-        remaining = max(
-            0,
-            int(progress.get("tasks_total") or 0)
-            - int(progress.get("tasks_done") or 0)
-            - int(progress.get("tasks_failed") or 0),
-        )
+        remaining = _staged_remaining_units(ws)
         suggested = max(
             _STAGED_TOTAL_TIMEOUT_DEFAULT_SEC,
             round(staged_total_timeout_sec * 1.5 / 300.0) * 300,
@@ -656,7 +694,7 @@ async def _stream_staged_create_body(
             f"引き上げてください (出荷既定 "
             f"{_STAGED_TOTAL_TIMEOUT_DEFAULT_SEC:.0f})。"
         )
-        yield sse.step({
+        _kind, payload = _emit_check(event_log, "timeout", {
             "type": "task_result",
             "detail": (
                 f"⏱ タイムアウト ({staged_total_timeout_sec:.0f}秒) のため打ち切りました。"
@@ -664,32 +702,87 @@ async def _stream_staged_create_body(
             ),
             "status": "failed",
         })
+        yield {"kind": "step", "payload": payload}
+    elif cancelled:
+        remaining = _staged_remaining_units(ws)
+        _kind, payload = _emit_check(event_log, "cancel", {
+            "type": "task_result",
+            "detail": (
+                f"⏹ キャンセルのため打ち切りました。生成済みの成果物のみ配信します。"
+                f"未完了 {remaining} ユニット。"
+            ),
+            "status": "failed",
+        })
+        yield {"kind": "step", "payload": payload}
 
-    async for frame in _finalize_staged_stream(
-        ws=ws, state=state, query=query, messages=messages,
-        session_id=session_id, instance_name=instance_name,
-        context_size=context_size, output_target=output_target,
-        timer=timer, t_start=t_start, private=private,
-        smoke_timeout=smoke_timeout,
-        prefetched_rag=prefetched_rag,
-        prefetched_rag_top_score=prefetched_rag_top_score,
-        file_context_block=file_context_block,
-        # テストの fake executor (SimpleNamespace) は属性を持たないので getattr。
-        truncated_steps=list(getattr(executor, "truncated_steps", ()) or ()),
-        truncated_max_tokens=getattr(executor, "spec_max_tokens", None),
-    ):
-        yield frame
+    code_map: dict[str, str] = {}
+    for wf in ws.list_files(kind="src"):
+        c = ws.read_file(wf.logical_path, kind="src")
+        if c:
+            code_map[wf.logical_path] = c
+    checks = _StagedFinalizeChecks(code_map=code_map)
+    exit_kind = "timeout" if timed_out else "cancelled" if cancelled else "done"
+    try:
+        if not cancelled:
+            async for kind, payload in _finalize_staged_checks_events(
+                ws=ws, state=state, event_log=event_log, smoke_timeout=smoke_timeout,
+                prefetched_rag=prefetched_rag, file_context_block=file_context_block,
+                out=checks,
+            ):
+                yield {"kind": "step", "payload": payload}
+    except Exception:
+        _finish_run_safely(run_store, event_log, "error")
+        raise
+    else:
+        # legacy と同じ終端書込み (無いと run.json が running のまま残り、
+        # Step 5.89 の GC 対象から外れ続ける — 2026-09-18 実機)。
+        _finish_run_safely(run_store, event_log, exit_kind)
 
-    # memmap を握った索引を先に手放す。閉じないと Windows では ``.semmem`` が
-    # 削除できず、``ws.cleanup()`` (rmtree, ignore_errors) が黙って残す
-    # (CLAUDE.md §10)。
+    spec_md = ws.read_spec()
+    flowchart_md = ws.read_flowchart() if spec_md else None
+    staged_metrics = {
+        "units_total": len(checks.code_map),
+        "units_completed": len(checks.code_map),
+        "validation_errors": checks.tasks_failed + len(checks.runnability_issues),
+        "content_type": "code",
+        "strategy": "staged",
+        "design_drift": (
+            checks.design_drift_counts["divergence"]
+            + checks.design_drift_counts["absence"]
+        ),
+    }
+
+    # memmap を握った索引を先に手放す (Windows は掴んだままだと ``.semmem`` を
+    # 削除できない、CLAUDE.md §10)。呼出側 (harness) は ``ws``/``ws.root`` を
+    # 参照専用 (パス文字列組立) にしか使わないため、close 後でも安全。
     try:
         _staged_semmem.close()
     except Exception as exc:  # noqa: BLE001 - 後始末の失敗で応答を壊さない
         logger.debug("staged create: semmem close failed: %s", exc)
-    # 隔離ワークスペース (含 .semmem) のクリーンアップ (config で任意)。
     if staged_cfg.get("cleanup_workspace", False):
         ws.cleanup()
+
+    yield {"kind": "result", "payload": {
+        "exit_kind": exit_kind,
+        # workspace_root: write_impact 分類 (f_10 §8.1) の呼出元 (meta の
+        # _execute_production_task) が RunEventLog を再構築するための鍵
+        # (3a-2、以前は legacy finalize がこの関数内で直接 append していた)。
+        "notes": {"run_id": run_id, "workspace_root": str(ws.root)},
+        "run_id": run_id,
+        "code_map": checks.code_map,
+        "spec_md": spec_md,
+        "flowchart_md": flowchart_md,
+        "tasks_failed": checks.tasks_failed,
+        "runnability_issues": checks.runnability_issues,
+        "design_drift_counts": checks.design_drift_counts,
+        "metrics": staged_metrics,
+        "truncated_steps": list(getattr(executor, "truncated_steps", ()) or ()),
+        "truncated_max_tokens": getattr(executor, "spec_max_tokens", None),
+        "ws": ws,
+        "event_log": event_log,
+        "run_store": run_store,
+        "total_tasks": total_tasks,
+    }}
 
 
 def _staged_pytest_counts(manifest: dict) -> tuple[int, int]:
@@ -709,44 +802,48 @@ def _staged_pytest_counts(manifest: dict) -> tuple[int, int]:
     return len(records) - unpassed, unpassed
 
 
-async def _finalize_staged_stream(
+@dataclass
+class _StagedFinalizeChecks:
+    """finalize 検査の結果 (:func:`_finalize_staged_checks_events` の出力先)。
+
+    async generator は値を ``return`` できない (PEP 525) ため、計算結果は
+    この可変な側チャネル経由で書き戻す。呼出側 (SSE / 構造化イベントの
+    どちらでも) が検査完了後に参照する。
+    """
+
+    code_map: dict[str, str]
+    tasks_failed: int = 0
+    pytest_passed: int = 0
+    pytest_unpassed: int = 0
+    runnability_issues: list[str] = field(default_factory=list)
+    design_drift_counts: dict[str, int] = field(
+        default_factory=lambda: {"convergence": 0, "divergence": 0, "absence": 0},
+    )
+    unmatched_keys: list[str] = field(default_factory=list)
+
+
+async def _finalize_staged_checks_events(
     *,
     ws,
     state: AppState,
-    query: str,
-    messages: list[ChatMessage],
-    session_id: str,
-    instance_name: str,
-    context_size: int,
-    output_target: str,
-    timer: StageTimer | None,
-    t_start: float,  # noqa: ARG001
-    private: bool,
-    smoke_timeout: float = 120.0,
-    prefetched_rag: list[tuple[str, float, str]] | None = None,
-    prefetched_rag_top_score: float | None = None,
-    file_context_block: str | None = None,
-    truncated_steps: list[str] | None = None,
-    truncated_max_tokens: int | None = None,
-) -> AsyncIterator[str]:
-    """staged 終端: 生成物を集約し output_target 別に配信 + token_info/done。
+    event_log: "RunEventLog | None",
+    smoke_timeout: float,
+    prefetched_rag: list[tuple[str, float, str]] | None,
+    file_context_block: str | None,
+    out: _StagedFinalizeChecks,
+) -> AsyncIterator[tuple[str, dict]]:
+    """終端検査 (postprocess / smoke / coherence / design_drift) の本体。
 
-    ``truncated_steps`` は executor が集約した「切れたまま採用された生成」の
-    ラベル (``StagedCreateExecutor.truncated_steps``)。1 件でもあれば
-    ``finish_reason=length`` の開示を deliberative と同じ SSE フレーム
-    (``sse.output_truncated``) で行い、経験記録に ``truncated=True`` を刻む。
+    :func:`run_staged_pipeline` (構造化イベント) から呼ばれる終端検査の実装
+    (f_10 §1)。``cancelled=True`` のときは呼出側がこの関数自体を呼ばない
+    (``if not cancelled:``)。``events.jsonl`` への永続はここで完結し、
+    ``(kind, payload)`` を yield する (ProductionEvent 化は呼出側)。
+    ``out.code_map`` は cross-file import 配線後の内容へ書き換わる。
     """
-    if timer:
-        timer.stop("llm_total_ms")
-    code_map: dict[str, str] = {}
-    for wf in ws.list_files(kind="src"):
-        c = ws.read_file(wf.logical_path, kind="src")
-        if c:
-            code_map[wf.logical_path] = c
     # 予算非依存の終端検証: cross-file import を決定論的に配線し (加算的 = 非劣化)、
     # 静的整合性 (重複定義 / 未定義名) を必ずチェックする。test 工程が wall-time で
     # starve されスモークゲートが走らなかった場合でも、配信前にここで担保される。
-    code_map, coherence_issues, wired_paths = _staged_postprocess(code_map)
+    code_map, coherence_issues, wired_paths = _staged_postprocess(out.code_map)
 
     # 終端の権威的な起動可能性判定: 静的整合 (coherence/entrypoint) に加え、配線後の
     # code_map へ import スモークを上乗せして cross-file ImportError も拾う。test 工程が
@@ -763,6 +860,66 @@ async def _finalize_staged_stream(
     progress = manifest.get("progress", {}) or {}
     tasks_failed = int(progress.get("tasks_failed", 0) or 0)
     pytest_passed, pytest_unpassed = _staged_pytest_counts(manifest)
+
+    # 設計↔実装ドリフト検査 (f_10 §8.1、Phase 2.5): planner が意図したグラフ
+    # (manifest["plan"]["module_deps"]、§2) と生成物の import 辺を突き合わせる
+    # 決定論の観測 (LLM 不使用)。validation_errors には数えない — 観測から始める。
+    design_drift_counts = {"convergence": 0, "divergence": 0, "absence": 0}
+    module_deps = ws.read_plan()
+    if module_deps:
+        drift = None
+        try:
+            from backend.free.loop.staged.design_drift import check_design_drift
+            drift = check_design_drift(code_map, module_deps)
+        except Exception as exc:  # noqa: BLE001 - 観測の失敗で配信を止めない
+            logger.warning("staged finalize design_drift check failed: %s", exc)
+        if drift is not None:
+            design_drift_counts = {
+                "convergence": len(drift.convergence),
+                "divergence": len(drift.divergence),
+                "absence": len(drift.absence),
+            }
+            if event_log is not None:
+                try:
+                    event_log.append("design_drift", {
+                        "convergence": [list(p) for p in drift.convergence],
+                        "divergence": [list(p) for p in drift.divergence],
+                        "absence": [list(p) for p in drift.absence],
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "staged run event log append failed (design_drift): %s", exc,
+                    )
+            detail = (
+                f"設計↔実装: 一致 {design_drift_counts['convergence']} / "
+                f"設計外 {design_drift_counts['divergence']} / "
+                f"未実装 {design_drift_counts['absence']}"
+            )
+            if drift.divergence or drift.absence:
+                extra: list[str] = []
+                if drift.divergence:
+                    head = "; ".join(f"{s}→{d}" for s, d in drift.divergence[:5])
+                    more = (
+                        f" ほか{len(drift.divergence) - 5}件"
+                        if len(drift.divergence) > 5 else ""
+                    )
+                    extra.append(f"設計外: {head}{more}")
+                if drift.absence:
+                    head = "; ".join(f"{s}→{d}" for s, d in drift.absence[:5])
+                    more = (
+                        f" ほか{len(drift.absence) - 5}件"
+                        if len(drift.absence) > 5 else ""
+                    )
+                    extra.append(f"未実装: {head}{more}")
+                detail += " (" + " / ".join(extra) + ")"
+            # 設計外/未実装があっても failed にはしない (観測なので UX を
+            # 赤くしない) — 一致していない件数は detail に列挙して示す。
+            yield _emit_check(event_log, "finalize_design_drift", {
+                "type": "task_result",
+                "detail": detail,
+                "status": "done",
+            })
+
     # 終端ゲート結果を long_form JSONL に記録し可測化する (develop=investigate/evolve
     # 時のみ出力)。SSE は表示専用で残らないため、配線件数/整合 issue を後から数値で追える。
     if state.debug_logger is not None:
@@ -779,17 +936,18 @@ async def _finalize_staged_stream(
                 "pytest_unpassed_count": pytest_unpassed,
                 "had_prefetched_rag": bool(prefetched_rag),
                 "had_file_context": bool(file_context_block),
+                "design_drift": design_drift_counts,
             })
         except Exception as exc:
             logger.debug("staged coherence long_form log failed: %s", exc)
     if tasks_failed:
-        yield sse.step({
+        yield _emit_check(event_log, "finalize_tasks_failed", {
             "type": "task_result",
             "detail": f"⚠ {tasks_failed} 件のタスクが失敗しました (workspace: {ws.root})",
             "status": "failed",
         })
     if pytest_unpassed:
-        yield sse.step({
+        yield _emit_check(event_log, "finalize_tests_unpassed", {
             "type": "task_result",
             "detail": f"⚠ テスト未合格: {pytest_unpassed} モジュール — 生成テストが"
                       f"失敗しています (成果物は配信します)",
@@ -800,13 +958,13 @@ async def _finalize_staged_stream(
     # だけが残り、テスト未実行と区別が付かなかった (実インシデント 2026-07-27
     # ライブ検証: pytest が 8 passed で完了したのに合格表示が無かった)。
     if pytest_passed:
-        yield sse.step({
+        yield _emit_check(event_log, "finalize_tests_passed", {
             "type": "task_result",
             "detail": f"生成ユニットテスト合格: {pytest_passed} モジュール (実行済み)",
             "status": "done",
         })
     elif not pytest_unpassed:
-        yield sse.step({
+        yield _emit_check(event_log, "finalize_tests_skipped", {
             "type": "task_result",
             "detail": "生成ユニットテストは未実行です (テスト未生成またはスキップ)",
             "status": "done",
@@ -817,7 +975,7 @@ async def _finalize_staged_stream(
             f" ほか{len(runnability_issues) - 5}件"
             if len(runnability_issues) > 5 else ""
         )
-        yield sse.step({
+        yield _emit_check(event_log, "finalize_runnability_issues", {
             "type": "task_result",
             "detail": f"⚠ 起動可能性チェック: {len(runnability_issues)} 件の問題 "
                       f"({head}{more})",
@@ -841,129 +999,18 @@ async def _finalize_staged_stream(
             f" ほか{len(unmatched_keys) - 5}件"
             if len(unmatched_keys) > 5 else ""
         )
-        yield sse.step({
+        yield _emit_check(event_log, "finalize_unmatched_keys", {
             "type": "task_result",
             "detail": f"⚠ 参照のみで生成されていない辞書キー: {shown}{more_k} "
                       f"— 実行時 KeyError の可能性 (外部入力由来なら無視可)",
             "status": "failed",
         })
 
-    assembled = "\n\n".join(
-        f"# === {p} ===\n{c}" for p, c in code_map.items()
-    )
-    # metrics は long_form router の success/false_positive 判定に使われる
-    # (success = units_completed>0 ∧ validation_errors==0、false_positive = units==0)。
-    # units_completed は生成ファイル数のまま (>0 → routing 自体は妥当で false_positive
-    # にしない) だが、validation_errors に失敗タスク + 起動可能性 issue を畳み込み、
-    # 非起動コードを long_form_success として学習記録しない (ゲートをブロッキング化)。
-    staged_metrics = {
-        "units_total": len(code_map),
-        "units_completed": len(code_map),
-        "validation_errors": tasks_failed + len(runnability_issues),
-        "content_type": "code",
-        "strategy": "staged",
-    }
-    try:
-        _staged_rag_used, _staged_rag_top1 = rag_signals_from_chunks(
-            prefetched_rag, prefetched_rag_top_score,
-        )
-        record_long_form_response(
-            state, assembled, messages, session_id, query, "create",
-            _estimate_tokens(assembled), staged_metrics, private=private,
-            rag_used=_staged_rag_used, rag_top1_score=_staged_rag_top1,
-            truncated=bool(truncated_steps),
-        )
-    except Exception as exc:
-        logger.warning("staged: record_long_form_response failed: %s", exc)
+    out.code_map = code_map
+    out.tasks_failed = tasks_failed
+    out.pytest_passed = pytest_passed
+    out.pytest_unpassed = pytest_unpassed
+    out.runnability_issues = runnability_issues
+    out.design_drift_counts = design_drift_counts
+    out.unmatched_keys = unmatched_keys
 
-    if truncated_steps:
-        # 切断の開示は **本文の外** (deliberative の ``_truncation_frame`` と
-        # 同じフレーム)。どのユニットが切れたかは step で併記する。生成物は
-        # 複数ユニットの結合なので tokens_generated は個別値を持たない (0)。
-        yield sse.step({
-            "type": "task_result",
-            "detail": (
-                f"⚠ 出力トークン上限で切れたまま採用した生成: "
-                f"{', '.join(truncated_steps)}"
-            ),
-            "status": "failed",
-        })
-        yield sse.output_truncated(0, truncated_max_tokens)
-
-    if not code_map:
-        yield sse.step({
-            "type": "task_result",
-            "detail": "コードが生成されませんでした",
-            "status": "failed",
-        })
-    elif output_target == "editor":
-        for p, c in code_map.items():
-            lang = _editor_language_for_extension(Path(p).suffix) or "python"
-            yield sse.editor_code(
-                remove_code_fences(c), language=lang, filename=p,
-            )
-    elif output_target == "chat":
-        for p, c in code_map.items():
-            lang = _editor_language_for_extension(Path(p).suffix) or ""
-            yield sse.token(f"\n\n**{p}**\n```{lang}\n{c}\n```\n")
-    else:  # file
-        out_dir = _staged_output_dir(query)
-        written = [
-            res for p, c in code_map.items()
-            if (res := await _staged_write_file(
-                state, _staged_deliverable_path(out_dir, p), c,
-            ))
-        ]
-        detail = (
-            f"{len(written)} ファイルを書き込みました"
-            + (f" ({out_dir})" if out_dir and written else "")
-            if written else f"生成物は workspace にあります: {ws.root}"
-        )
-        yield sse.step({
-            "type": "task_result", "detail": detail, "status": "done",
-        })
-
-    spec_md = ws.read_spec()
-    if spec_md:
-        # 設計フローチャートは UI 表示せず、ファイル成果物としてのみ出力する
-        # (ユーザー要望)。チャットへの mermaid 描画フレームは送らない。
-        flowchart = ws.read_flowchart()
-        # SPEC.md (flowchart は含まない。flowchart.md は下で別ファイルとして届ける)
-        # を output_target 別に成果物として届ける。
-        if output_target == "editor":
-            yield sse.editor_code(spec_md, language="markdown", filename="SPEC.md")
-        elif output_target == "file":
-            await _staged_write_file(
-                state, _staged_deliverable_path(_staged_output_dir(query), "SPEC.md"),
-                spec_md,
-            )
-        yield sse.step({
-            "type": "task_result",
-            "detail": f"設計仕様: {ws.path('spec.md')}",
-            "status": "done",
-        })
-
-        # フローチャートを独立した成果物ファイルとしても届ける (ユーザー要望)。
-        if flowchart and flowchart.strip():
-            fc_doc = f"# 設計フローチャート\n\n```mermaid\n{flowchart.strip()}\n```\n"
-            if output_target == "editor":
-                yield sse.editor_code(fc_doc, language="markdown", filename="flowchart.md")
-            elif output_target == "file":
-                await _staged_write_file(
-                    state,
-                    _staged_deliverable_path(
-                        _staged_output_dir(query), "flowchart.md",
-                    ),
-                    fc_doc,
-                )
-            yield sse.step({
-                "type": "task_result",
-                "detail": f"フローチャート: {ws.path('flowchart.md')}",
-                "status": "done",
-            })
-
-    ti = make_token_info(
-        messages, _estimate_tokens(assembled), context_size, instance_name,
-    )
-    yield sse.token_info(ti)
-    yield sse.done()

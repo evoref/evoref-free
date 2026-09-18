@@ -38,7 +38,6 @@ if TYPE_CHECKING:
     from backend.free.llm.aux_client import AuxClient
     from backend.free.llm.llm_client import LLMClient
     from backend.free.llm.local_client import LocalClient
-    from backend.free.loop.driver import LoopDriver
     from backend.free.loop.log_ingestor import LogIngestor
     from backend.free.memory.scheduler import SleepTimeScheduler
     from backend.free.memory.episodic.store import EpisodicStore
@@ -94,13 +93,8 @@ class MemPillar:
 
 @dataclass
 class LoopPillar:
-    """EvorefLoop pillar — 自律実行ループ / ハーネス / エージェント。
+    """EvorefLoop pillar — ハーネス / エージェント (クリエイトの staged パイプラインを含む)。"""
 
-    ``loop.enabled=false`` の場合は ``driver=None`` で構築される。
-    """
-
-    driver: "LoopDriver | None" = None
-    enabled: bool = True
     # develop=evolve 時のみ起動される decision/outcome JSONL の
     # tail-follow + JOIN コンポーネント。それ以外の develop_level では ``None``。
     log_ingestor: "LogIngestor | None" = None

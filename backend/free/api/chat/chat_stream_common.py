@@ -388,6 +388,31 @@ _session_requests: dict[str, set[str]] = {}
 #: このターンのキャンセルキー (``cancel_scope`` が置く)。リクエスト
 #: (trace_id) 単位で、trace の無い呼出 (テスト / 直接呼出) ではセッション id。
 _cancel_key_var: ContextVar[str | None] = ContextVar("chat_cancel_key", default=None)
+#: 切断後も制作を続ける (detached) タスクが握っているキャンセルキー。
+#: ``cancel_scope`` の finally はここにある鍵を pop しない (タスクの完了で解放)。
+_retained_cancel_keys: set[str] = set()
+
+
+def retain_cancel_scope(session_id: str, task: "asyncio.Task") -> None:
+    """detached タスクのためにこのターンのキャンセルキーを scope 終了後も残す。
+
+    クライアント切断で SSE の generator が閉じると ``cancel_scope`` が鍵を pop し、
+    走り続ける制作を ``/api/chat/cancel`` で止められなくなる (f_10 §3、Phase 3b)。
+    鍵はタスクの完了コールバックで解放する。
+    """
+    key = _cancel_key(session_id)
+    _retained_cancel_keys.add(key)
+
+    def _release(_task: "asyncio.Task") -> None:
+        _retained_cancel_keys.discard(key)
+        _cancel_flags.pop(key, None)
+        keys = _session_requests.get(session_id)
+        if keys is not None:
+            keys.discard(key)
+            if not keys:
+                _session_requests.pop(session_id, None)
+
+    task.add_done_callback(_release)
 
 
 def _cancel_key(session_id: str) -> str:
@@ -455,7 +480,7 @@ async def cancel_scope(session_id: str):
     try:
         yield
     finally:
-        if not nested:
+        if not nested and key not in _retained_cancel_keys:
             _cancel_flags.pop(key, None)
             keys = _session_requests.get(session_id)
             if keys is not None:
@@ -468,6 +493,11 @@ async def cancel_scope(session_id: str):
 def agent_layer_frame(layer: str) -> str:
     """``agent_layer`` フレーム (このターンの ``request_id`` 付き)。"""
     return sse.agent_layer(layer, request_id=current_request_id())
+
+
+def create_run_frame(run_id: str, session_id: str) -> str:
+    """``create_run`` フレーム (staged create run の再接続用 run_id 通知、f_10 §7)。"""
+    return sse.create_run(run_id, session_id)
 
 
 def _make_step_queue_callback(

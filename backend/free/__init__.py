@@ -20,11 +20,13 @@ logger = get_logger("free")
 def setup_free(app: FastAPI) -> None:
     """Free 機能を FastAPI アプリに登録する
 
-    Free API ルーター（23本）を登録し、Free エディションを有効化する。
+    Free API ルーター（24本）を登録し、Free エディションを有効化する。
     """
     from backend.free.api.system.status import router as status_router
     from backend.free.api.chat.chat import router as chat_router
     from backend.free.api.content.rag import router as rag_router
+    from backend.free.api.content.project_map import router as project_map_router
+    from backend.free.api.content.create_runs import router as create_runs_router
     from backend.free.api.content.memory import router as memory_router
     from backend.free.api.model.model import router as model_router
     from backend.free.api.config.config_api import router as config_router
@@ -44,12 +46,13 @@ def setup_free(app: FastAPI) -> None:
     from backend.free.api.system.diffs import router as diffs_router
     from backend.free.api.system.server_control import router as server_control_router
     from backend.free.api.config.mode import router as mode_router
-    from backend.free.api.system.loop import router as loop_router
     from backend.free.api.system.system import router as system_router
 
     app.include_router(status_router)
     app.include_router(chat_router)
     app.include_router(rag_router)
+    app.include_router(project_map_router)
+    app.include_router(create_runs_router)
     app.include_router(memory_router)
     app.include_router(model_router)
     app.include_router(config_router)
@@ -69,7 +72,6 @@ def setup_free(app: FastAPI) -> None:
     app.include_router(diffs_router)
     app.include_router(server_control_router)
     app.include_router(mode_router)
-    app.include_router(loop_router)
     app.include_router(system_router)
 
     # テキスト抽出 Extractor の登録（Free 11種）
@@ -79,4 +81,4 @@ def setup_free(app: FastAPI) -> None:
     import backend.free.export  # noqa: F401
 
     register_free()
-    logger.info("Free edition initialized: 24 routers registered")
+    logger.info("Free edition initialized: 25 routers registered")

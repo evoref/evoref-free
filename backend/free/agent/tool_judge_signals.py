@@ -124,11 +124,23 @@ def _code_usage_location_pattern(query: str) -> str:
 
     質問の骨組み (where / file / used ...) を除いた最初の ASCII 識別子。
     残らなければ空文字 (呼出側はルール発火を見送る)。
+
+    ファイルパス (``backend/free/rag/corpus/chunking.py``) を含む質問は、その
+    パス全体を対象にする — 識別子だけ拾うと先頭要素 ``backend`` になり、
+    search_code が ``backend`` 配下の全ファイルをシンボル一致で返していた
+    (2026-09-18 実機)。
     """
+    path_match = _CODE_PATH_TOKEN_RE.search(query)
+    if path_match:
+        return path_match.group(0)
     for token in _CODE_IDENTIFIER_RE.findall(query):
         if token.lower() not in _CODE_USAGE_STOPWORDS:
             return token
     return ""
+
+
+#: 所在質問に含まれる相対 / 絶対のファイルパス (区切りを 1 つ以上含み拡張子で終わる)。
+_CODE_PATH_TOKEN_RE = re.compile(r"(?:[A-Za-z]:)?[\w.\-]+(?:[/\\][\w.\-]+)+\.[A-Za-z0-9]{1,6}")
 #: web リソースを対象にしていることを示す語。**web 意図の唯一の定義** —
 #: ツール要否シグナル (``_TOOL_PATTERNS`` / ``_TOOL_PATTERNS_EN``)、
 #: ``_infer_tool`` の fetch_url 分岐、``_query_targets_local_file_only`` の

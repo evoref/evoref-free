@@ -6,7 +6,7 @@ EvorefLoop pillar が書き込む ``task`` / ``progress_marker`` /
 ``commitment`` / ``project`` / ``create`` / ``create_task`` の読取 API を提供する。
 
 追加した骨格に加えて、既存 ``LoopDriver`` /
-``DefaultHarness`` / ``bootstrap_project_context`` / ``make_loop_artifact_hook``
+``bootstrap_project_context`` / ``make_loop_artifact_hook``
 等が依存していたタスク管理 / 失敗パターン統計 / artifact 一覧 / orphan 回収 /
 user profile 収集 API を本 View に集約する。
 

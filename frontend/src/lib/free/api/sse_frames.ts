@@ -24,7 +24,8 @@ export const SSE_FRAME_TYPES = [
 	'rag_debug',
 	'sources',
 	'error',
-	'result'
+	'result',
+	'create_run'
 ] as const;
 
 export type SSEFrameType = (typeof SSE_FRAME_TYPES)[number];

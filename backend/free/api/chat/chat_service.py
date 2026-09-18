@@ -42,6 +42,7 @@ from backend.utils import estimate_tokens as _estimate_tokens
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
+    from backend.free.api.chat._artifact import LastArtifact
     from backend.free.core.stage_timer import StageTimer
     from backend.free.memory.pipeline.conflict_review import (
         PendingConflictGroup,
@@ -1068,6 +1069,7 @@ def build_chat_messages(
     artifact_block: str | None = None,
     session_id: str = "",
     post_append_reserve_tokens: int = 0,
+    referenced_artifact: "LastArtifact | None" = None,
 ) -> list[ChatMessage]:
     """messages 組み立て（build_messages で few-shot・file・メモリ・RAG・履歴を統合）。
 
@@ -1099,7 +1101,10 @@ def build_chat_messages(
         artifact_block=artifact_block,
         post_append_reserve_tokens=post_append_reserve_tokens,
     )
-    apply_grounding_notes(messages, history, evicted_turns, session_id)
+    apply_grounding_notes(
+        messages, history, evicted_turns, session_id,
+        referenced_artifact=referenced_artifact,
+    )
     logger.debug("Messages assembled: %d messages for LLM", len(messages))
     return messages
 
@@ -1239,9 +1244,19 @@ _CONVERSATION_MEASUREMENT_GUIDANCE: dict[str, str] = {
         "Use these numbers as they are; do not recount or estimate yourself."
     ),
 }
+#: ユーザーの言う「何ターン目」はほぼ **やり取りの往復** を指すので、ユーザー
+#: 発言の通し番号を主にして、発言の累計を併記する。累計だけを渡していた
+#: ときは 2 往復目の「この会話はいま何ターン目ですか。」に、渡された
+#: 「累計 3」をそのまま使って「3ターン目です」と答えた (2026-09-17 監査)。
 _CONVERSATION_TURN_COUNT_FACT: dict[str, str] = {
-    "ja": "この会話の累計ターン数 (user + assistant) は {n} です",
-    "en": "the total number of turns in this conversation (user + assistant) is {n}",
+    "ja": (
+        "今回のユーザーの発言はこの会話で {user} 回目 (やり取りとしては"
+        " {user} 往復目。user と assistant の発言の累計は {n})"
+    ),
+    "en": (
+        "this user message is number {user} in this conversation (exchange"
+        " {user}; user + assistant messages so far: {n})"
+    ),
 }
 _CONVERSATION_TERM_COUNT_FACT: dict[str, str] = {
     "ja": "この会話の全ターン本文に「{term}」が現れた回数は {n} 回です",
@@ -1350,6 +1365,7 @@ def _append_conversation_measurement(
     from backend.free.api.chat.chat_recorder import (
         count_term_in_session,
         session_turn_count,
+        session_user_turn_count,
     )
 
     parts: list[str] = []
@@ -1357,6 +1373,7 @@ def _append_conversation_measurement(
         parts.append(
             _localized(_CONVERSATION_TURN_COUNT_FACT).format(
                 n=session_turn_count(session_id),
+                user=session_user_turn_count(session_id),
             ),
         )
     term = occurrence_count_term(query)
@@ -1415,6 +1432,8 @@ def apply_grounding_notes(
     history: list[ChatMessage],
     evicted_turns: int,
     session_id: str = "",
+    *,
+    referenced_artifact: "LastArtifact | None" = None,
 ) -> None:
     """視界の欠落と自己出力の計量に関する注記をまとめて付ける (in-place)。
 
@@ -1429,7 +1448,9 @@ def apply_grounding_notes(
     発言は軽量パスの窓から外れていることがある。
     """
     _append_truncated_history_note(messages, history, evicted_turns)
-    _append_self_output_measurement(messages, history)
+    _append_self_output_measurement(
+        messages, history, referenced_artifact=referenced_artifact,
+    )
     _append_quantity_grounding(messages, history)
     _append_conversation_measurement(messages, history, session_id)
     _append_relative_date_grounding(messages, history)
@@ -1654,8 +1675,39 @@ _USER_TEXT_MEASUREMENT_GUIDANCE: dict[str, str] = {
 }
 
 
+#: 直前の返答と、発話が指している成果物の **両方** を測って渡す注記。
+#:
+#: 2026-09-17 監査: 長文の案内文 (651 文字) の後に「冒頭の一文をください」
+#: (18 文字の返答) を挟み、「この案内文は何文字くらいでしたか。」と聞くと、
+#: 直前の返答を「18 文字」と測って渡し、モデルは矛盾を避けて依頼時の目標
+#: 「約 800 文字」と答えた。どちらを指すかを語彙で決めると「今の回答は
+#: 何文字?」(同じ指示詞で直前の返答を指す) を壊すので、決定論の値を 2 つ
+#: 出所付きで渡して指示対象の解決はモデルに任せる。
+_ARTIFACT_MEASUREMENT_GUIDANCE: dict[str, str] = {
+    "ja": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " 機械的に数えた結果 — "
+        "直前のあなたの回答: {previous}。"
+        "「{request}」への依頼で作成した成果物: {artifact}。"
+        "質問が指している方の数値をそのまま使って答えること。"
+        "自分で数え直したり概算したり、依頼時の目標値で答えたりしないこと。"
+    ),
+    "en": (
+        "\n\n" + SYSTEM_MEASUREMENT_MARKER + " Counted mechanically — "
+        "your previous answer: {previous}. "
+        "The deliverable written for the request \"{request}\": {artifact}. "
+        "Use the numbers of whichever one the question refers to; do not recount, "
+        "estimate, or answer with the target length of the original request."
+    ),
+}
+
+#: 成果物の出所として注記に載せる依頼文の上限 (文字)。
+_ARTIFACT_REQUEST_MAX_CHARS = 60
+
+
 def _append_self_output_measurement(
     messages: list[ChatMessage], history: list[ChatMessage],
+    *,
+    referenced_artifact: "LastArtifact | None" = None,
 ) -> None:
     """「今の回答は何文字?」に実測値を添える (in-place)。
 
@@ -1683,6 +1735,30 @@ def _append_self_output_measurement(
     if not kinds:
         return
     previous = _measurement_target(history, query)
+    artifact_text = (
+        strip_system_notes(referenced_artifact.text).strip()
+        if referenced_artifact is not None else ""
+    )
+    if artifact_text and artifact_text != previous:
+        previous_values = (
+            joiner.join(_measure_text(previous, kinds)) if previous.strip() else "-"
+        )
+        artifact_values = joiner.join(_measure_text(artifact_text, kinds))
+        request = " ".join(referenced_artifact.query.split())
+        if len(request) > _ARTIFACT_REQUEST_MAX_CHARS:
+            request = request[:_ARTIFACT_REQUEST_MAX_CHARS] + "…"
+        if append_to_last_user(
+            messages,
+            _localized(_ARTIFACT_MEASUREMENT_GUIDANCE).format(
+                previous=previous_values, request=request, artifact=artifact_values,
+            ),
+            separator="",
+        ):
+            logger.debug(
+                "Self-output measurement injected: previous=%s artifact=%s",
+                previous_values, artifact_values,
+            )
+        return
     if not previous.strip():
         return
     values = joiner.join(_measure_text(previous, kinds))

@@ -139,7 +139,6 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "spec_revision_judge": 180.0,
     "flow_spec_synthesis": 240.0,
     "flow_spec_part_synthesis": 120.0,
-    "ralph_loop": 240.0,
     # ── LLM 委譲ツール (chat の summarize / translate / draft_document) ──
     # 自由文生成。ツール側の実行上限 (chat_constants.LLM_TOOL_EXECUTION_TIMEOUT_SEC
     # = 180 秒) と揃える。
@@ -151,6 +150,10 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # know.* 取得器 (Pro) が 1 item の本文から claim を抜く。sleep-time の
     # アイドル窓でしか走らないので、他の背景 purpose と同じ尺で置く。
     "knowledge_claim_extract": 90.0,
+    # 同じ取得器が、上限を超えた本文から事実抽出に渡す段落を選ぶ。出力は
+    # 番号の配列だけだが、入力 (段落一覧) が抽出と同じ程度に長く prefill が
+    # 支配的 (実測 4,400 token で 123 秒)。アイドル窓でしか走らないので長めに置く。
+    "knowledge_passage_select": 180.0,
 }
 
 _DEFAULT_TIMEOUT = 60.0
@@ -219,7 +222,7 @@ CHAT_PATH_PURPOSES: frozenset[str] = frozenset({
 #: 実際に強制する集合。
 #:
 #: **ここに入れてよいのは「ユーザーが待っていない」purpose だけ**。ユーザー起点の
-#: 前景処理 (long_form_* / create_* / code_spec_* / ralph_loop / tool_*) を入れると
+#: 前景処理 (long_form_* / create_* / code_spec_* / tool_*) を入れると
 #: 自分のターンの完了を待つことになり、上限まで無駄に待ってから走る。
 #: 同じ purpose でも呼出側によって前景/背景が分かれる場合 (``summarize`` は
 #: sleep-time と長文生成の両方から呼ばれる) は、前景側が

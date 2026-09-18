@@ -33,6 +33,7 @@ from backend.free.api.chat.chat_constants import DEFAULT_KEEPALIVE_INTERVAL_SEC
 from backend.free.api.chat.chat_stream_common import (
     agent_layer_frame,
     cancel_requested,
+    create_run_frame,
     _emit_stream_error,
     _emit_timing,
     _finish_stream_outcome,
@@ -42,6 +43,7 @@ from backend.free.api.chat.chat_stream_common import (
     meta_last_command_call,
     meta_tool_routing_false_positive,
     meta_tool_routing_success,
+    retain_cancel_scope,
     sse,
 )
 
@@ -148,7 +150,53 @@ async def _drain_meta_cognitive_steps(
             _cancel_agent_task(agent_task, session_id)
             return
 
+        if step_data.get("type") == "create_run":
+            yield create_run_frame(
+                str(step_data.get("run_id", "")), str(step_data.get("session_id", "")),
+            )
+            continue
+
         yield sse.step(step_data)
+
+
+#: detached で走らせている制作ターン (GC からの保護。完了で自動的に外れる)。
+_DETACHED_TASKS: set["asyncio.Task"] = set()
+
+
+def _should_detach_on_disconnect(
+    agent, agent_task: "asyncio.Task | None", session_id: str,
+) -> bool:
+    """切断時に agent_task を cancel せず完走させるか (create ∧ 制作ステージあり)。"""
+    return (
+        agent_task is not None
+        and not agent_task.done()
+        and getattr(agent, "_production_stage", None) is not None
+        and not cancel_requested(session_id)
+    )
+
+
+def _detach_agent_task(
+    agent_task: "asyncio.Task", session_id: str, on_done=None,
+) -> None:
+    """切断後も制作を続けるタスクを登録する。``on_done`` は完走時に 1 回呼ぶ
+    (履歴 / 経験の記録。SSE の終端処理は相手がいないので走らない、f_10 §3)。"""
+    _DETACHED_TASKS.add(agent_task)
+    agent_task.add_done_callback(_DETACHED_TASKS.discard)
+    retain_cancel_scope(session_id, agent_task)
+    if on_done is not None:
+        def _run_on_done(_task: "asyncio.Task") -> None:
+            try:
+                on_done()
+            except Exception as exc:  # noqa: BLE001 - 記録の失敗で例外を漏らさない
+                logger.warning(
+                    "MetaCognitive: detached turn finalize failed (session=%s): %s",
+                    session_id, exc,
+                )
+        agent_task.add_done_callback(_run_on_done)
+    logger.info(
+        "MetaCognitive: client disconnected; create turn continues detached "
+        "(session=%s)", session_id,
+    )
 
 
 def _cancel_agent_task(agent_task: "asyncio.Task | None", session_id: str) -> None:
@@ -477,7 +525,28 @@ async def stream_meta_cognitive(
         finally:
             # クライアント切断 (yield に CancelledError) でも計画 / ツールループ /
             # LLM 生成を走らせ続けない。明示キャンセルは drain 側が既に止めている。
-            _cancel_agent_task(agent_task, session_id)
+            # 例外は create の制作ステージ (production_stage) を持つターン —
+            # 切断で止めず detached で完走させる (f_10 §3、Phase 3b)。制作物は
+            # meta の write 経路 / /api/create/runs/<id>/artifacts から取れる。
+            if _should_detach_on_disconnect(agent, agent_task, session_id):
+                def _finalize_detached() -> None:
+                    # 完走した detached ターンの履歴 / 経験は、通常経路と同じ
+                    # 終端処理で記録する (token_info / done は相手がいないので出さない)。
+                    resp_done = result_holder.get("resp")
+                    if resp_done is None or result_holder.get("error") is not None:
+                        return
+                    _finalize_meta_cognitive_stream(
+                        resp_done,
+                        state=state, messages=messages, session_id=session_id,
+                        query=query, mode=mode, instance_name=instance_name,
+                        context_size=context_size, timer=timer, t_start=t_start,
+                        private=private, rag_used=rag_used,
+                        rag_top1_score=rag_top1_score,
+                        cancelled=bool(cancel_requested(session_id)),
+                    )
+                _detach_agent_task(agent_task, session_id, on_done=_finalize_detached)
+            else:
+                _cancel_agent_task(agent_task, session_id)
             resp_obj = result_holder.get("resp")
             # ``MetaCognitiveResponse`` はトークン数を持たない (以前は存在しない
             # 属性を読んで常に 0 だった)。記録側と同じ本文の見積りを使う。
@@ -504,6 +573,14 @@ async def stream_meta_cognitive(
                     "failed_tasks": failed_tasks,
                     "writes": writes,
                 })
+            # production_stage (staged/longform、f_03 §4.4) の metrics を
+            # Level 0 経験記録へ載せる (3a-2: 旧 staged 側の record_long_form_response
+            # 直接呼出しに代わる 1 本化した記録経路)。
+            production_metrics = dict(
+                getattr(resp_obj, "production_metrics", None) or {},
+            )
+            if production_metrics:
+                quality_signals["production_metrics"] = production_metrics
             _finish_stream_outcome(
                 state, session_id,
                 started_at=t_start,

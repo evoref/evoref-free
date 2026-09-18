@@ -628,8 +628,13 @@ _QUALITY_SYSTEM_PROMPT = (
     "提示された Q/A ペアを、他の質問に答えるときの手本としてモデルに見せた場合、"
     "モデルの振る舞いが良くなるかを 0.0〜1.0 で評価してください。"
     "評価軸: (1) 質問に正面から答えているか (2) 手本として一般化できるか "
-    "(3) 内部的な言い回しや進捗ノートが混ざっていないか。"
+    "(3) 内部的な言い回しや進捗ノートが混ざっていないか "
+    "(4) 質問だけを読んで何を尋ねているかが決まるか "
+    "(5) 質問に無い日時・場所・金額・名前などの具体値を回答が補っていないか。"
     "その場限りの固有値だけを述べた回答や、質問と噛み合っていない回答は低く評価してください。"
+    "(4) で、直前の会話が無いと対象が決まらない質問 (「具体例をひとつ挙げてください」"
+    "「計算量はどうなりますか」のように話題を省いた問い) は、回答が良くても 0.2 以下にしてください。"
+    "(5) で、案内文やメールに質問に無い具体的な日時・会場などを書き込んだ回答も 0.3 以下にしてください。"
 )
 
 #: fewshot_pool.json 上で追い出し済み hash (墓標) を持つ予約キー。
@@ -768,7 +773,12 @@ def _calc_experience_fitness(signals: dict) -> float:
 #: 手本品質の採点規則の版。プロンプト / 判定基準を変えたら上げる。
 #: ``FewShotExample.quality_scorer_version`` に刻み、古い規則の点と
 #: 新しい規則の点を後から見分けられるようにする (c_05 §0.6)。
-QUALITY_SCORER_VERSION = 1
+#:
+#: v2 (2026-09-17 監査): 話題を省いた追い質問 (「具体例をひとつ挙げてください。」
+#: → 直前のベイズ推定の話の硬貨の例) と、質問に無い日時・会場を補った案内文が
+#: 0.9 で採用された。軸 (4) 自立性 / (5) 具体値の補完 を足した。版が違う例は
+#: 再採点の対象になる (``score_pending_quality``)。
+QUALITY_SCORER_VERSION = 2
 
 
 class FewShotPool(JsonStateStore):
@@ -1136,6 +1146,7 @@ class FewShotPool(JsonStateStore):
             for mode, pool in self._pools.items()
             for ex in pool
             if ex.quality_score is None
+            or ex.quality_scorer_version != QUALITY_SCORER_VERSION
         ][:limit]
         if not pending:
             return 0
@@ -1157,6 +1168,7 @@ class FewShotPool(JsonStateStore):
                 scored, sum(
                     1 for pool in self._pools.values()
                     for e in pool if e.quality_score is None
+                    or e.quality_scorer_version != QUALITY_SCORER_VERSION
                 ),
             )
             dl = self._debug_logger

@@ -1240,35 +1240,6 @@ class LoopDriver:
                 exc,
             )
 
-    # ── LoopReport ─────────────────────────────────────
-
-    def generate_report(self, project_id: str | None = None):
-        """指定プロジェクトの ``LoopReport`` を生成する。"""
-        from backend.free.loop.report import generate_loop_report
-
-        target = project_id or self._state.project_id
-        if not target:
-            raise ValueError(
-                "project_id required when loop is not running",
-            )
-        view = self._resolve_view(target)
-        if target == self._state.project_id:
-            started_at = self._state.started_at
-            iterations = self._state.iteration or None
-            artifacts = list(self._state.artifacts) or None
-        else:
-            started_at = None
-            iterations = None
-            artifacts = None
-        return generate_loop_report(
-            view,
-            project_id=target,
-            started_at=started_at,
-            iterations=iterations,
-            artifacts=artifacts,
-        )
-
-
 # ──────────────────────────────────────────────────────────────────────────
 # 内部: LoopFactView の BootstrapResult を loop/bootstrap.py の
 # BootstrapResult (互換 dataclass 形式) に変換する (LoopDriverState 互換維持)

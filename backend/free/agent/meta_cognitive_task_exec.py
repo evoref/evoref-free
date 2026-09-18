@@ -698,6 +698,12 @@ class _TaskExecutionMixin:
                 qp = Path(qpath)
                 if qp.is_dir() or not qp.suffix:
                     return str(qp / p.name)
+                if p.name == qp.name:
+                    # bare 名がクエリの明示パスの basename と同じなら、それは
+                    # そのファイル自身 (production_stage の artifact は論理名
+                    # だけを持つ。2026-09-18 実機: `...\p3\idgen.py に保存して`
+                    # の idgen.py が outputs 直下へ落ちた)。
+                    return qpath
                 if p.name not in query:
                     # クエリが挙げているのは別のファイルで、この bare 名は
                     # planner の発明。そのまま書くとプロセスの CWD

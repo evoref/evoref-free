@@ -114,6 +114,20 @@ class SSEFrameBuilder:
         })
 
     @staticmethod
+    def create_run(run_id: str, session_id: str) -> str:
+        """run 開始通知フレーム: staged create の run_id を UI へ通知する
+        (再接続用、f_10 §7 / f_05 §4.5)。
+
+        他のフレームと異なり本体キーへ入れ子にせず、``run_id``/``session_id``
+        をトップレベルへ展開する (``c_06_api_specification.md`` の契約形式)。
+
+        Args:
+            run_id: staged create run の識別子 (workspace_id と同じ)。
+            session_id: このターンのセッション識別子。
+        """
+        return _frame("create_run", {"run_id": run_id, "session_id": session_id})
+
+    @staticmethod
     def token_info(info: dict) -> str:
         """終端情報フレーム: トークン使用状況
 
@@ -252,6 +266,6 @@ class SSEFrameBuilder:
 #: フロントの ``ChatStreamEvent['type']`` union と契約テストで突き合わせる。
 FRAME_TYPES: tuple[str, ...] = (
     "token", "step", "agent_layer", "editor_route", "editor_code",
-    "token_info", "input_truncated", "output_truncated", "rag_debug",
-    "sources", "error", "result",
+    "create_run", "token_info", "input_truncated", "output_truncated",
+    "rag_debug", "sources", "error", "result",
 )
