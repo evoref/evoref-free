@@ -82,6 +82,8 @@ from backend.free.loop.staged.workspace import WorkspaceManager, StageTestResult
 from backend.i18n_helper import prose_language_name
 from backend.log_config import get_logger
 
+from backend.free.llm.aux_client import PURPOSE_TIMEOUT_DEFAULTS
+
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
     from backend.free.llm.aux_client import AuxClient
@@ -92,7 +94,24 @@ logger = get_logger("loop.staged.executor")
 
 # (instruction, file_path) -> {logical_path: code}。base クリエイトモデル経由の
 # コード生成委譲。file_path は生成対象の論理パス (戻り値の主キー) を明示する。
+# ``request_timeout`` (kw-only, 既定 None) は呼出予算 (f_10 §3) — 残りステージ
+# 予算を渡す。``Callable`` の型注釈は位置引数のみ表現するため、実装は
+# ``request_timeout: float | None = None`` を追加のキーワード専用引数として持つ
+# (:func:`backend.free.api.chat.chat.make_staged_codegen_delegate` 参照)。
 CodegenDelegate = Callable[[str, str], Awaitable[dict[str, str]]]
+
+# 予算の 3 層 (f_10 §3、2026-09-18 Phase 1): 呼出予算 = 残りステージ予算。
+# 残りがこの床 (``sync_request_timeout`` の床と同じ 120 秒) を切ったら、
+# aux / codegen 呼出をそもそも行わずその工程を failure に畳む。
+_STAGE_BUDGET_FLOOR_SEC = 120.0
+
+
+class _StageBudgetExhausted(RuntimeError):
+    """残りステージ予算が床を切ったため呼出をスキップしたことを示す内部例外。
+
+    各呼出箇所の既存 ``except Exception`` に素通しで拾わせ、aux 劣化時と
+    同じ degrade パスを再利用する (呼ばずに畳む)。
+    """
 
 _SPEC_PROMPT = """\
 Write a detailed software design specification in Markdown for the program below.
@@ -976,11 +995,17 @@ class StagedCreateExecutor:
             ``None`` なら advisory テストは省略 (スモークゲートは別途実施)。
         max_repair_rounds: スモーク実エラー時のコード修正の最大回数。
         spec_max_tokens: spec.md 生成の最大トークン。
+        brief: ProductionBrief (f_08 §2.2)。空でなければ全 LLM 呼出のプロンプト
+            先頭に置く (spec/深化/フロー/code/部分生成/advisory test/smoke
+            修復/spec 見直し)。
     """
 
     workspace: WorkspaceManager
     aux_client: "AuxClient | None"
     codegen: CodegenDelegate
+    #: ProductionBrief (f_08 §2.2、create 限定)。全 LLM 呼出プロンプト先頭へ
+    #: :meth:`_brief_prefix` 経由で置く。空文字なら何も足さない。
+    brief: str = ""
     smoke_runner: "Callable[[dict[str, str]], object] | None" = None
     test_runner: StagedTestRunner | None = None
     # test↔src API 契約チェッカ (src_files, test_files) -> 違反メッセージ列。
@@ -1039,6 +1064,66 @@ class StagedCreateExecutor:
     # 棄却・再生成で回復した切断は含めない。呼出側 (chat_stream_staged) が
     # ``finish_reason=length`` の開示フレームと経験記録の ``truncated`` に使う。
     truncated_steps: list[str] = field(default_factory=list)
+    #: 予算の 3 層 (f_10 §3、2026-09-18 Phase 1) の「ステージ予算」の締切
+    #: (``time.monotonic()`` 基準の絶対時刻)。呼出側 (chat_stream_staged) が
+    #: ``t_start + stage_budget`` を渡す。``None`` (既定) なら無制限 — 従来通り
+    #: 各呼出は既定 timeout をそのまま使う。
+    deadline_monotonic: float | None = None
+    #: 直近の :meth:`execute` 呼出中に :class:`_StageBudgetExhausted` が
+    #: 発生したか (observability 用の内部フラグ、コンストラクタ引数ではない)。
+    #: ``execute()`` の先頭でタスクごとにリセットする。
+    _budget_exhausted: bool = field(default=False, init=False, repr=False)
+
+    def remaining_budget_sec(self) -> float | None:
+        """締切 (:attr:`deadline_monotonic`) までの残り秒数。
+
+        締切未設定 (``None``) なら無制限を意味する ``None`` を返す。
+        """
+        if self.deadline_monotonic is None:
+            return None
+        return self.deadline_monotonic - time.monotonic()
+
+    def _stage_timeout(self, default: float, what: str) -> float:
+        """aux 呼出の timeout を ``min(default, 残りステージ予算)`` に丸める。
+
+        締切未設定なら ``default`` をそのまま返す (従来動作)。残りが床
+        (:data:`_STAGE_BUDGET_FLOOR_SEC`) を切ったら :class:`_StageBudgetExhausted`
+        を送出し、呼出側に「呼ばずに畳む」ことを強制する。
+        """
+        remaining = self.remaining_budget_sec()
+        if remaining is None:
+            return default
+        if remaining < _STAGE_BUDGET_FLOOR_SEC:
+            self._budget_exhausted = True
+            raise _StageBudgetExhausted(
+                f"{what}: only {remaining:.1f}s left in stage budget "
+                f"(floor={_STAGE_BUDGET_FLOOR_SEC}s)",
+            )
+        return min(default, remaining)
+
+    def _codegen_timeout(self, what: str) -> float | None:
+        """codegen delegate の ``request_timeout``。
+
+        締切未設定なら ``None`` (delegate 自身の既定 ``sync_request_timeout``
+        に委ねる)。残りが床未満なら :class:`_StageBudgetExhausted` を送出する。
+        """
+        remaining = self.remaining_budget_sec()
+        if remaining is None:
+            return None
+        if remaining < _STAGE_BUDGET_FLOOR_SEC:
+            self._budget_exhausted = True
+            raise _StageBudgetExhausted(
+                f"{what}: only {remaining:.1f}s left in stage budget "
+                f"(floor={_STAGE_BUDGET_FLOOR_SEC}s)",
+            )
+        return remaining
+
+    def _brief_prefix(self) -> str:
+        """ProductionBrief (f_08 §2.2) を LLM プロンプトの先頭に置く前置き文字列。
+
+        ``self.brief`` が空なら ``""`` (何も足さない)。
+        """
+        return f"{self.brief}\n\n" if self.brief else ""
 
     def _emit(self, stage: str, detail: str, status: str, task_id: str) -> None:
         """工程内サブステップ進捗を event_bus へ発行する (null-safe)。"""
@@ -1066,6 +1151,7 @@ class StagedCreateExecutor:
             logger.debug("manifest fail upsert failed: %s", exc)
 
     async def execute(self, task: "TaskFactView") -> ExecutionOutcome:
+        self._budget_exhausted = False
         self.workspace.upsert_task(
             task_id=task.task_id, title=task.title,
             stage=task.stage or "code", status="in_progress",
@@ -1324,12 +1410,14 @@ class StagedCreateExecutor:
         if self.aux_client is None:
             return ""
         msgs = [{"role": "user", "content":
-                 _SPEC_PROMPT.format(description=description) + os_constraint()
+                 self._brief_prefix()
+                 + _SPEC_PROMPT.format(description=description) + os_constraint()
                  + _spec_language_constraint() + extra_constraint}]
         try:
+            timeout = self._stage_timeout(self.spec_timeout_sec, "create_spec_doc")
             resp = await self.aux_client.generate(
                 msgs, purpose="create_spec_doc", max_tokens=self.spec_max_tokens,
-                temperature=0.3, timeout=self.spec_timeout_sec,
+                temperature=0.3, timeout=timeout,
             )
         except Exception as exc:
             logger.warning("spec doc generation failed: %s", exc)
@@ -1346,9 +1434,12 @@ class StagedCreateExecutor:
             self.spec_max_tokens, retry_tokens,
         )
         try:
+            timeout = self._stage_timeout(
+                self.spec_timeout_sec * 1.5, "create_spec_doc_retry",
+            )
             resp2 = await self.aux_client.generate(
                 msgs, purpose="create_spec_doc", max_tokens=retry_tokens,
-                temperature=0.3, timeout=self.spec_timeout_sec * 1.5,
+                temperature=0.3, timeout=timeout,
             )
         except Exception as exc:
             logger.warning("spec doc regeneration failed: %s", exc)
@@ -1381,14 +1472,16 @@ class StagedCreateExecutor:
         if self.aux_client is None:
             return None, False
         msgs = [{"role": "user", "content":
-                 _SPEC_DEEPEN_PROMPT.format(
+                 self._brief_prefix()
+                 + _SPEC_DEEPEN_PROMPT.format(
                      file_path=module_path, context=context, section=section,
                  ) + os_constraint() + _deepen_language_constraint()}]
         try:
+            timeout = self._stage_timeout(self.spec_timeout_sec, "create_spec_deepen")
             resp = await self.aux_client.generate(
                 msgs, purpose="create_spec_deepen",
                 max_tokens=_SPEC_DEEPEN_MAX_TOKENS,
-                temperature=0.3, timeout=self.spec_timeout_sec,
+                temperature=0.3, timeout=timeout,
             )
         except Exception as exc:
             logger.warning(
@@ -1466,12 +1559,15 @@ class StagedCreateExecutor:
                 ) + base_prompt
             telemetry: dict = {}
             try:
+                timeout = self._stage_timeout(300.0, "flow_spec_synthesis")
                 data = await self.aux_client.generate_json(
-                    prompt, max_tokens=_FLOW_MAX_TOKENS, temperature=0.2,
+                    self._brief_prefix() + prompt,
+                    max_tokens=_FLOW_MAX_TOKENS, temperature=0.2,
                     purpose="flow_spec_synthesis", telemetry=telemetry,
                     # 出力予算 3072 tok は iGPU 実測 (7-13 t/s) で purpose 既定
-                    # 120s を超えうるため明示 timeout で上書きする。
-                    timeout=300.0,
+                    # 120s を超えうるため明示 timeout で上書きする
+                    # (残りステージ予算があればそちらを優先する)。
+                    timeout=timeout,
                 )
             except Exception as exc:
                 logger.warning("flow spec synthesis failed (%s): %s",
@@ -1536,7 +1632,7 @@ class StagedCreateExecutor:
 
         units: list[list[FlowStep]] = []
         for i, (module_path, unit_spec) in enumerate(units_specs, start=1):
-            prompt = _FLOW_PART_PROMPT.format(
+            prompt = self._brief_prefix() + _FLOW_PART_PROMPT.format(
                 module_path=module_path,
                 step_lo=_FLOW_PART_STEP_LO, step_hi=_FLOW_PART_STEP_HI,
                 spec=unit_spec,
@@ -1544,9 +1640,10 @@ class StagedCreateExecutor:
             steps: list[FlowStep] = []
             for _attempt in range(2):  # 初回 + 再試行 1 回
                 try:
+                    timeout = self._stage_timeout(60.0, "flow_spec_part_synthesis")
                     data = await self.aux_client.generate_json(
                         prompt, max_tokens=768, temperature=0.2,
-                        purpose="flow_spec_part_synthesis", timeout=60.0,
+                        purpose="flow_spec_part_synthesis", timeout=timeout,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -1613,6 +1710,7 @@ class StagedCreateExecutor:
             if flowchart.strip() else ""
         )
         return (
+            f"{self._brief_prefix()}"
             f"{description}\n\n"
             f"## Shared design specification\n{spec}\n\n"
             f"{flow_block}"
@@ -1691,7 +1789,22 @@ class StagedCreateExecutor:
                 task.description, source_path, spec, flowchart,
             )
             try:
-                files = await self.codegen(instruction, source_path)
+                request_timeout = self._codegen_timeout("code generation")
+                files = await self.codegen(
+                    instruction, source_path, request_timeout=request_timeout,
+                )
+            except _StageBudgetExhausted as exc:
+                logger.warning(
+                    "code generation skipped for %s: %s", source_path, exc,
+                )
+                self._fail_task(task, "stage budget exhausted")
+                return ExecutionOutcome(
+                    status="failure", error="stage budget exhausted",
+                    notes={
+                        "executor": self.name, "stage": "code",
+                        "budget_exhausted": True, **part_notes,
+                    },
+                )
             except Exception as exc:
                 logger.warning("code generation failed for %s: %s", source_path, exc)
                 self._fail_task(task, f"codegen error: {exc}")
@@ -1850,6 +1963,7 @@ class StagedCreateExecutor:
             prior_block = f"{prior_head}```python\n{joined}\n```\n\n"
         n = len(plan.groups)
         return (
+            f"{self._brief_prefix()}"
             f"{description}\n\n"
             f"## Design specification for `{source_path}` (this module) — "
             f"implement faithfully\n{plan.module_section.strip()}\n\n"
@@ -1916,7 +2030,10 @@ class StagedCreateExecutor:
             last_err = ""
             for _attempt in range(2):  # 初回 + 再試行 1 回
                 try:
-                    files = await self.part_codegen(instr, source_path)
+                    request_timeout = self._codegen_timeout("part code generation")
+                    files = await self.part_codegen(
+                        instr, source_path, request_timeout=request_timeout,
+                    )
                 except Exception as exc:
                     last_err = str(exc)
                     logger.warning(
@@ -2267,6 +2384,7 @@ class StagedCreateExecutor:
                 if api_block else ""
             )
             repair_instr = (
+                f"{self._brief_prefix()}"
                 f"The generated module(s) failed an import smoke test.\n\n"
                 f"## Smoke errors\n" + "\n".join(f"- {e}" for e in errors) + "\n\n"
                 f"{spec_block}"
@@ -2422,6 +2540,7 @@ class StagedCreateExecutor:
         self._emit("test", f"ユニットテスト生成 (参考): {test_logical}",
                    "running", task.task_id)
         gen_instr = (
+            f"{self._brief_prefix()}"
             f"## Shared design specification\n{spec}\n\n"
             f"{flow_block}"
             f"## Source file `{source_path}`\n```python\n{src_code}\n```\n\n"
@@ -2463,6 +2582,7 @@ class StagedCreateExecutor:
             self._emit("test", f"テスト整合性チェック: {len(violations)} 件 → "
                        f"再生成 (試行 {regen})", "running", task.task_id)
             fix_instr = (
+                f"{self._brief_prefix()}"
                 f"The generated tests do NOT match the ACTUAL public API of "
                 f"`{source_path}`.\n\n## Contract violations\n"
                 + "\n".join(f"- {v}" for v in violations) + "\n\n"
@@ -2715,7 +2835,7 @@ class StagedCreateExecutor:
         src_head = (
             self.workspace.read_file(source_path, kind="src") or ""
         )[:_REVISION_SRC_HEAD_CHARS]
-        prompt = _SPEC_REVISION_PROMPT.format(
+        prompt = self._brief_prefix() + _SPEC_REVISION_PROMPT.format(
             source_path=source_path,
             section=section.strip(),
             entry_section=extract_entry_point_section(spec).strip() or "(none)",
@@ -2728,10 +2848,21 @@ class StagedCreateExecutor:
         )
         judge_telemetry: dict = {}
         try:
+            timeout = self._stage_timeout(
+                PURPOSE_TIMEOUT_DEFAULTS.get("spec_revision_judge", 180.0),
+                "spec_revision_judge",
+            )
             data = await self.aux_client.generate_json(
                 prompt, purpose="spec_revision_judge",
                 max_tokens=1536, temperature=0.2, telemetry=judge_telemetry,
+                timeout=timeout,
             )
+        except _StageBudgetExhausted as exc:
+            logger.warning("spec revision judge skipped: %s", exc)
+            # 既存の "skipped_budget_exhausted" は改訂ラウンド数の上限 (別概念)
+            # で使用中のため、ステージのウォールクロック予算枯渇には別ラベルを使う。
+            self._record_revision(task, source_path, "skipped_stage_budget_exhausted")
+            return False
         except Exception as exc:
             logger.warning("spec revision judge failed: %s", exc)
             self._record_revision(task, source_path, "judge_unparseable")
@@ -2897,6 +3028,7 @@ class StagedCreateExecutor:
             src_code = self.workspace.read_file(source_path, kind="src") or ""
             stem = Path(source_path).stem
             fix_instr = (
+                f"{self._brief_prefix()}"
                 f"The tests no longer match the ACTUAL public API of "
                 f"`{source_path}` (the module was just regenerated from a revised "
                 f"spec).\n\n## Contract violations\n"
@@ -2998,7 +3130,11 @@ class StagedCreateExecutor:
         (意図通り) 空だった」ことを呼び出し側で区別する必要がある箇所で使う。
         """
         try:
-            return (await self.codegen(instruction, file_path) or {}), None
+            request_timeout = self._codegen_timeout("codegen (repair/advisory)")
+            result = await self.codegen(
+                instruction, file_path, request_timeout=request_timeout,
+            )
+            return (result or {}), None
         except Exception as exc:
             logger.warning("staged codegen failed: %s", exc)
             return {}, str(exc)

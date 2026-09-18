@@ -117,6 +117,15 @@ DEFAULT_CARTRIDGE_GATE_THRESHOLD = 0.3
 #: 保持するパッケージ版数 (c_16 §5.4)。
 DEFAULT_VERSIONS_KEEP = 2
 
+#: 版 GC の改名先の接頭辞 (c_16 §5.4)。``installed_versions`` はこれを版として数えない。
+TRASH_PREFIX = ".trash-"
+
+#: ``package.json._extra.kind`` が ProjectMap のパッケージ (c_16 §4.4)。
+#: SSOT は ``backend.free.rag.projectmap.ids.PROJECT_MAP_KIND`` — ここでは
+#: import しない (projectmap は corpus に依存する側なので、逆方向の import は
+#: 循環になる)。値を変えるときは両方を合わせて直す。
+PROJECT_MAP_PACKAGE_KIND = "project_map"
+
 
 # ── centroid ゲートの閾値解決 (旧 cartridge_manager から移設) ──────────
 
@@ -290,6 +299,17 @@ class CorpusPackage:
     def embedding_dim(self) -> int:
         return int(self.store.manifest.embedding_dim)
 
+    @property
+    def is_project_map(self) -> bool:
+        """ProjectMap パッケージ (c_16 §4.4) か。
+
+        検索 / 重心ゲート / ``get_tool_hints`` / 統合検索の候補から除外する
+        対象 — 構造ノードは ``[参考情報]`` の本文として意味を持たない。
+        一覧 (:meth:`CorpusStore.list_packages`) / ``manifest.active`` / GC
+        には引き続き載る。
+        """
+        return self.meta._extra.get("kind") == PROJECT_MAP_PACKAGE_KIND
+
 
 @dataclass(slots=True, frozen=True)
 class CorpusHit:
@@ -437,6 +457,10 @@ class CorpusStore:
     def _top(self, key: str, default: Any) -> Any:
         return self._get(self.rag_config, key, default)
 
+    def _is_project_map(self, package_id: str) -> bool:
+        package = self._packages.get(package_id)
+        return package is not None and package.is_project_map
+
     def store_prior_for(self, package_id: str) -> float:
         """パッケージの ``store_prior`` (override → 設定 → 0.9)。"""
         override = self.manifest.store_prior_overrides.get(package_id)
@@ -491,6 +515,8 @@ class CorpusStore:
         versions = [
             p.name for p in root.iterdir()
             if p.is_dir() and (p / PACKAGE_FILE).exists()
+            # GC が改名した ``.trash-<版>`` (掃き残し) は版ではない (c_16 §5.4)
+            and not p.name.startswith(TRASH_PREFIX)
         ]
         versions.sort(key=version_sort_key)
         return versions
@@ -611,10 +637,14 @@ class CorpusStore:
         return [pid for pid, pkg in self._packages.items() if pkg.loaded]
 
     def get_tool_hints(self) -> list[dict[str, Any]]:
-        """ロード済みパッケージの ``tool_hints`` を集約する。"""
+        """ロード済みパッケージの ``tool_hints`` を集約する。
+
+        ProjectMap パッケージ (c_16 §4.4) は除外する — 構造ノードにツール
+        ヒントは無い意味論で、混ぜても効果が無いだけだが念のため揃える。
+        """
         hints: list[dict[str, Any]] = []
         for package in self._packages.values():
-            if package.loaded:
+            if package.loaded and not package.is_project_map:
                 hints.extend(package.tool_hints)
         return hints
 
@@ -1027,8 +1057,13 @@ class CorpusStore:
         if keep < 1:
             return []
         removed: list[tuple[str, str]] = []
+        if not self.packages_dir.is_dir():
+            return removed
         for root in sorted(p for p in self.packages_dir.iterdir() if p.is_dir()):
             package_id = root.name
+            # 前回の掃き残し (改名はできたが中身を消せなかった版) を先に回収する
+            for leftover in root.glob(f"{TRASH_PREFIX}*"):
+                shutil.rmtree(str(leftover), ignore_errors=True)
             versions = self.installed_versions(package_id)
             active = self.manifest.active.get(package_id)
             keepers = set(versions[-keep:])
@@ -1037,7 +1072,21 @@ class CorpusStore:
             for version in versions:
                 if version in keepers:
                     continue
-                shutil.rmtree(str(root / version), ignore_errors=True)
+                # ``.trash-`` へ改名してから消す (c_16 §5.4)。ファイル単位で消すと
+                # Windows で memmap を掴まれた索引だけが残り、``records.jsonl`` の無い
+                # 版ディレクトリが「版」として二度と再試行されない。改名は原子的で、
+                # 掴まれていれば改名ごと失敗するので次回に回す
+                target = root / version
+                trash = root / f"{TRASH_PREFIX}{version}"
+                try:
+                    target.rename(trash)
+                except OSError as e:
+                    logger.warning(
+                        "corpus version GC deferred (in use?): %s@%s: %s",
+                        package_id, version, e,
+                    )
+                    continue
+                shutil.rmtree(str(trash), ignore_errors=True)
                 removed.append((package_id, version))
         if removed:
             logger.info(
@@ -1118,13 +1167,15 @@ class CorpusStore:
     ) -> list[str]:
         """パッケージ centroid との素の cosine で候補を絞る。
 
+        - ProjectMap パッケージ (c_16 §4.4) は常に除外する — 構造ノードは
+          チャット応答の ``[参考情報]`` に混ぜる対象ではない
         - centroid 未構築のパッケージは常に通す (段階移行のため)
         - 全件不通過時は ``fallback_when_empty`` で挙動を切替。既定 (False) は
           空を返して corpus 検索自体を skip する — 雑談・ファイル生成依頼など
           ロード中パッケージと無関係な発話で chunk が混入するのを防ぐ
         - 元の LRU 順を保って返す (ラウンドロビンの決定性維持)
         """
-        ids = list(package_ids)
+        ids = [pid for pid in package_ids if not self._is_project_map(pid)]
         if not self._gate_enabled or not ids:
             return ids
         query = np.asarray(query_vec, dtype=np.float32).ravel()

@@ -355,12 +355,21 @@ def make_llama_chat_fn(
                 resp.raise_for_status()
                 return resp.json()
 
-        return await async_retry_http_call(
-            _post,
-            request_label="llama-server /v1/chat/completions (probe)",
-            retry_logger=retry_logger,
-            retryable_exceptions=GENERATION_RETRYABLE_EXCEPTIONS,
-        )
+        async def _call() -> dict:
+            return await async_retry_http_call(
+                _post,
+                request_label="llama-server /v1/chat/completions (probe)",
+                retry_logger=retry_logger,
+                retryable_exceptions=GENERATION_RETRYABLE_EXCEPTIONS,
+            )
+
+        if id_slot is None:
+            return await _call()
+        # 背景スロットへ固定したプローブは背景処理。チャットのアイドル窓で出し、
+        # 要求が届いたら打ち切ってやり直す (GPU 演算はスロットで分かれない)。
+        from backend.free.llm.generation_gate import run_yielding_to_chat
+
+        return await run_yielding_to_chat(_call, label="probe")
 
     return _chat
 

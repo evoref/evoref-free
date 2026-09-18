@@ -308,16 +308,8 @@ async def _run_lifespan_shutdown(
         )
     with _timed(shutdown_timings, "patterns_save"):
         _shutdown_patterns_save(ctx.learned_patterns_store, ctx.patterns_file)
-    with _timed(shutdown_timings, "loop_run_cancel"):
-        task = getattr(state, "loop_run_task", None)
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
     # develop=evolve 時に起動した LogIngestor + PolicyAdjuster
-    # bridge を安全停止する (loop_run_cancel の直後で、LLM client close より
+    # bridge を安全停止する (LLM client close より
     # 前に走らせる: bridge は LLM を直接呼ばないが、shutdown 順序を
     # 「pillar 内 → 外部 I/O」に揃えるため)。
     with _timed(shutdown_timings, "evolve_pipeline_shutdown"):

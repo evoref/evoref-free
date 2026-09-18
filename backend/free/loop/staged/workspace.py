@@ -298,6 +298,34 @@ class WorkspaceManager:
             and (stage is None or f.stage == stage)
         ]
 
+    # ── plan (planner の依存グラフ、f_10 §2 / §8.1、Phase 2.5) ──────────
+    def write_plan(self, module_deps: dict[str, list[str]]) -> None:
+        """planner が意図したモジュール依存グラフを manifest へ atomic に書く。
+
+        spec タスク description の自由記述 (``(depends on: …)``) には従来
+        残っていたが、``module_paths_from_list`` は注釈を除去するため構造
+        として読み戻せなかった。finalize の設計↔実装ドリフト検査 (f_10 §8.1)
+        がこれを「意図したグラフ」として使う。
+        """
+        def _mut(m: dict) -> None:
+            m["plan"] = {
+                "module_deps": {k: list(v) for k, v in module_deps.items()},
+            }
+
+        self._update_manifest(_mut)
+
+    def read_plan(self) -> dict[str, list[str]]:
+        """``write_plan`` が書いた ``module_deps`` を読み戻す (無ければ空 dict)。"""
+        m = self.read_manifest()
+        plan = m.get("plan") or {}
+        deps = plan.get("module_deps") or {}
+        if not isinstance(deps, dict):
+            return {}
+        return {
+            str(k): [str(d) for d in (v or [])]
+            for k, v in deps.items()
+        }
+
     # ── manifest: tasks / notes / test 結果 ───────────────────────────
     def upsert_task(
         self, *, task_id: str, title: str, stage: Stage, status: str,

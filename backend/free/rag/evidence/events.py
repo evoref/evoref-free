@@ -94,7 +94,7 @@ class EvidenceEventLog:
 
     Args:
         events_dir: ``<store>/events/`` ディレクトリ。
-        by: 書き手 (``sleep_time`` / ``ralph_loop`` 等)。行の ``by`` に入る。
+        by: 書き手 (``sleep_time`` 等)。行の ``by`` に入る。
     """
 
     def __init__(self, events_dir: Path | str, *, by: str = "unknown") -> None:

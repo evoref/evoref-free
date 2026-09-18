@@ -12,12 +12,8 @@
 	const proLoaders = import.meta.glob<{ default: Component }>(
 		'/src/lib/pro/components/CartridgeCreateDialog.svelte'
 	);
-	const knowledgeLoaders = import.meta.glob<{ default: Component }>(
-		'/src/lib/pro/components/KnowledgeSources.svelte'
-	);
 
 	let CartridgeCreateDialog: Component | null = $state(null);
-	let KnowledgeSources: Component | null = $state(null);
 	let showCreateDialog = $state(false);
 
 	onMount(async () => {
@@ -26,11 +22,6 @@
 		if (entries.length > 0) {
 			const mod = await entries[0]();
 			CartridgeCreateDialog = mod.default;
-		}
-		const knowledgeEntries = Object.values(knowledgeLoaders);
-		if (knowledgeEntries.length > 0) {
-			const mod = await knowledgeEntries[0]();
-			KnowledgeSources = mod.default;
 		}
 	});
 </script>
@@ -52,11 +43,6 @@
 			{/if}
 		{/snippet}
 	</CartridgeManager>
-
-	{#if isPro && KnowledgeSources}
-		{@const Knowledge = KnowledgeSources}
-		<Knowledge />
-	{/if}
 </PageLayout>
 
 <style>

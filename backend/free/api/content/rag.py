@@ -200,7 +200,10 @@ async def get_rag_stats(state: AppState = Depends(get_app_state)):
     embedding_cfg = cfg.get("embedding", {})
 
     manager = state.cartridge_manager
-    packages = [] if manager is None else list(manager.corpus.list_packages())
+    # ProjectMap パッケージは文書ではない (埋め込みも持たない) ので統計から外す
+    packages = [] if manager is None else [
+        p for p in manager.corpus.list_packages() if not p.is_project_map
+    ]
 
     total_chunks = sum(int(p.chunk_count) for p in packages)
     index_size_mb = round(sum(float(p.size_mb) for p in packages), 3)

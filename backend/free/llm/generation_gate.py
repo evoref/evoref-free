@@ -31,15 +31,24 @@ dispatch 後に始まったチャットは、背景の 1 生成 (実測で最長
 (部分状態は書き戻さない: 生成結果を受け取らないだけ)。
 """
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from typing import TypeVar
 import asyncio
+import contextlib
 
 from backend.log_config import get_logger
 
 logger = get_logger("llm.generation_gate")
 
+_T = TypeVar("_T")
+
 __all__ = [
+    "ChatTurnLease",
+    "begin_chat_turn",
+    "current_turn_lease",
+    "run_yielding_to_chat",
     "chat_generation",
     "chat_is_active",
     "chat_request_started",
@@ -141,20 +150,29 @@ def was_contended_since(token: tuple[int, int]) -> bool:
     return was_active > 0 or _activations != seen
 
 
-@asynccontextmanager
-async def chat_generation() -> AsyncIterator[None]:
-    """チャット生成の在圏を宣言する。背景 aux はこの間 dispatch を待つ。"""
+def _acquire() -> None:
     global _active, _activations
     _active += 1
     _activations += 1
     _event().clear()
+
+
+def _release() -> None:
+    global _active
+    _active -= 1
+    if _active <= 0:
+        _active = 0
+        _event().set()
+
+
+@asynccontextmanager
+async def chat_generation() -> AsyncIterator[None]:
+    """チャット生成の在圏を宣言する。背景 aux はこの間 dispatch を待つ。"""
+    _acquire()
     try:
         yield
     finally:
-        _active -= 1
-        if _active <= 0:
-            _active = 0
-            _event().set()
+        _release()
 
 
 async def wait_for_idle(max_wait: float, *, purpose: str = "") -> float:
@@ -179,6 +197,138 @@ async def wait_for_idle(max_wait: float, *, purpose: str = "") -> float:
         )
         return waited
     return loop.time() - started
+
+
+#: 応答ストリームへ引き渡したリースを、ストリームが始まらないまま握り続けない
+#: 上限。StreamingResponse はハンドラの return 直後に反復を始めるので通常は
+#: ミリ秒で始まる。始まらない (応答前に切断) ときだけ効く。
+_HANDOVER_GRACE_SEC = 30.0
+
+
+class ChatTurnLease:
+    """1 チャットターン (要求の到着 → 応答の終わり) の在圏を宣言するリース。
+
+    ``chat_generation`` はトークン生成の間しか立たないため、要求の到着から
+    初回生成までの前処理 (分類器 / 検索 / ツール実行) は背景から見て
+    **アイドル** だった。その窓で dispatch した背景の生成は、到着の通知
+    (``chat_request_started``) を既に見逃しているので打ち切られず、ターンの
+    生成と最後まで GPU を分け合う (2026-09-17 監査: ``search_history`` を
+    撃った想起ターンの間に sleep-time の ``summarize`` が 34.8 秒走り、
+    261 トークンの追加 prefill で TTFT 23 秒)。
+
+    リースはターン全体で ``_active`` を立てる。ストリーミング応答では
+    ハンドラが先に return するので、:meth:`hand_over` でストリームへ解放の
+    責務を移し、ストリームが :meth:`stream_started` → :meth:`release` する。
+    ``release`` は冪等。
+    """
+
+    def __init__(self) -> None:
+        self._released = False
+        self._handed_over = False
+        self._expiry: asyncio.TimerHandle | None = None
+        _acquire()
+
+    @property
+    def handed_over(self) -> bool:
+        return self._handed_over
+
+    def hand_over(self, grace_sec: float = _HANDOVER_GRACE_SEC) -> None:
+        """解放の責務を応答ストリームへ移す (始まらなければ ``grace_sec`` で解放)。"""
+        if self._released or self._handed_over:
+            return
+        self._handed_over = True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._expiry = loop.call_later(grace_sec, self._expire)
+
+    def stream_started(self) -> None:
+        if self._expiry is not None:
+            self._expiry.cancel()
+            self._expiry = None
+
+    def _expire(self) -> None:
+        self._expiry = None
+        if not self._released:
+            logger.warning(
+                "Chat turn lease released: the response stream never started "
+                "within %.0fs", _HANDOVER_GRACE_SEC,
+            )
+            self.release()
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self.stream_started()
+        _release()
+
+
+_turn_lease: ContextVar[ChatTurnLease | None] = ContextVar(
+    "evoref_chat_turn_lease", default=None,
+)
+
+
+def begin_chat_turn() -> ChatTurnLease:
+    """チャット要求の到着を知らせ、ターン全体の在圏リースを取る (API の入口で呼ぶ)。"""
+    chat_request_started()
+    lease = ChatTurnLease()
+    _turn_lease.set(lease)
+    return lease
+
+
+def current_turn_lease() -> ChatTurnLease | None:
+    """このコンテキストのターンリース (入口を通っていなければ ``None``)。"""
+    return _turn_lease.get()
+
+
+#: :func:`run_yielding_to_chat` がアイドル窓を待つ上限と、打ち切り後に
+#: やり直す回数の上限。どちらも超えたら競合覚悟で最後まで走らせる
+#: (背景処理を無期限に飢えさせない、``wait_for_idle`` と同じ方針)。
+_YIELD_IDLE_MAX_WAIT_SEC = 120.0
+_YIELD_MAX_PREEMPTIONS = 5
+
+
+async def run_yielding_to_chat(
+    call: Callable[[], Awaitable[_T]], *, label: str,
+) -> _T:
+    """背景の 1 生成を「アイドル窓で出し、チャット要求が来たら打ち切ってやり直す」。
+
+    ``AuxClient`` を通らずに llama-server を直接叩く背景生成 (起動時の能力
+    プローブ / 出力品質プローブ) は、ゲートの外にあった。2026-09-17 監査:
+    リセット直後の検証ドライブで品質プローブがユーザーの応答と重なり、
+    新規トークン 26 の応答の初トークンが 32 秒になった。
+    """
+    for attempt in range(_YIELD_MAX_PREEMPTIONS + 1):
+        await wait_for_idle(_YIELD_IDLE_MAX_WAIT_SEC, purpose=label)
+        if attempt == _YIELD_MAX_PREEMPTIONS:
+            logger.info(
+                "Background generation %s ran to completion after %d preemptions",
+                label, attempt,
+            )
+            return await call()
+        since = request_token()
+        work = asyncio.ensure_future(call())
+        waiter = asyncio.ensure_future(wait_for_chat_request(since))
+        try:
+            done, _ = await asyncio.wait(
+                {work, waiter}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if work in done:
+                return work.result()
+            work.cancel()
+            with contextlib.suppress(BaseException):
+                await work
+            logger.info(
+                "Background generation %s preempted by a chat request; retrying "
+                "in the next idle window", label,
+            )
+        finally:
+            for task in (work, waiter):
+                if not task.done():
+                    task.cancel()
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def gate_stream(agen: AsyncIterator[str]) -> AsyncIterator[str]:

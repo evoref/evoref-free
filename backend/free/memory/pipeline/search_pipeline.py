@@ -1013,6 +1013,16 @@ _RELATIVE_FLOOR_RATIO = 0.6
 _RELATIVE_FLOOR_ABSOLUTE_MIN = 0.24
 
 
+def _profile_absolute_floor() -> float | None:
+    """アクティブな埋め込みプロファイルの絶対の棒 (値が無ければ ``None``)。"""
+    from backend.free.rag.memory_threshold_calibration import (
+        profile_embedding_threshold,
+    )
+
+    value = profile_embedding_threshold("rag", "injection_relevance_min_score")
+    return None if value is None else float(value)
+
+
 def _uncalibrated_absolute_min() -> float:
     """較正が効く前の絶対の棒 (アクティブな埋め込みプロファイル由来)。
 
@@ -1128,6 +1138,11 @@ def _resolve_keep_floor(
         str(self_rag.get("threshold_mode", "auto")) == "auto"
         and get_active_calibration() is not None
     )
+    profile_floor = (
+        _profile_absolute_floor()
+        if str(self_rag.get("threshold_mode", "auto")) == "auto" and not calibrated
+        else None
+    )
     if calibrated:
         absolute = float(thresholds.relevance)
         confidence = float(thresholds.confidence)
@@ -1137,6 +1152,17 @@ def _resolve_keep_floor(
             and 0.0 < top_raw_score < confidence
         ):
             absolute = absolute + (confidence - absolute) * _WEAK_SET_MARGIN
+    elif profile_floor is not None:
+        # ``auto`` で較正が未確定の窓は **埋め込みプロファイルの棒** をそのまま
+        # 使う (2026-09-17 監査)。以前は下の枝で ``min(configured, プロファイル)``
+        # に挟んでいたが、``configured`` はスキーマ既定の 0.40 (旧スケール) が
+        # ほぼ全環境に入っているため **プロファイルが一度も効いていなかった** —
+        # 全リセット後 20 ターンの較正未確定窓で、算術の追い質問に cosine
+        # 0.42〜0.47 の無関係なノート (訂正前の値を含む) が 5 件ずつ載り、
+        # 約 1,000 トークンの再 prefill で TTFT 40〜54 秒になった。プロファイル値は
+        # その埋め込みモデル用に置いた値なので「静的値が別スケールで到達不能」
+        # (2026-08-16) には当たらない。``manual`` は従来どおり config を尊重する。
+        absolute = profile_floor
     elif top_raw_score > 0.0:
         # **この枝は「較正が未確定」= 棒がスケール非依存でない状態。** 緩和の
         # 定数 (:data:`_RELATIVE_FLOOR_ABSOLUTE_MIN` = 0.24) は旧 STM combined

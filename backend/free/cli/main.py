@@ -58,7 +58,7 @@ logger = get_logger("cli.main")
 
 # サブコマンドとして認識する名前
 # - "create": 対話モード (Pro はクリエイト、Free は警告 + chat フォールバック)
-_SUBCOMMANDS = {"serve", "chat", "create", "gui", "export", "import", "reindex"}
+_SUBCOMMANDS = {"serve", "chat", "create", "gui", "export", "import", "reindex", "projectmap"}
 
 #: 旧サブコマンド名 → 現行名。``code`` はクリエイトモードへの改名に追随して
 #: ``create`` になった。既存のスクリプトや手癖を壊さないよう受理し続け、
@@ -417,6 +417,9 @@ def _get_subcommand_handler(name: str):
     if name == "reindex":
         from backend.free.cli.reindex_command import run_reindex
         return run_reindex
+    if name == "projectmap":
+        from backend.free.cli.projectmap_command import run_projectmap
+        return run_projectmap
     return None
 
 

@@ -6,9 +6,6 @@
   初期化と SchemaMigrator 連鎖。
   EvorefMem スキーマバージョン検査 → in-place migration → destructive init
   fallback の判定を行う。
-- :func:`bootstrap_loop_context_at_startup` : 起動時クリーンコンテキスト
-  bootstrap。SemMem の active policy / pinned から Tier 1 素材を組み立て
-  ``state.startup_bootstrap_result`` に保持する。
 - :func:`apply_semmem_policy_overrides` : SemMem active policy ファクト
   → ``PolicyInterpreter`` 反映。
 
@@ -23,115 +20,11 @@ from backend.app_state import AppState
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
-    from backend.debug_logger import DebugLogger
     from backend.free.memory.episodic.store import EpisodicStore
     from backend.free.memory.semantic.store import SemanticStore
     from backend.free.memory.stores.working import WorkingMemoryRegistry
 
 logger = get_logger("factory.memory_init")
-
-
-def bootstrap_loop_context_at_startup(
-    state: AppState,
-    cfg: dict[str, Any],
-    current_project_id: str | None,
-    debug_logger: "DebugLogger | None" = None,
-) -> None:
-    """起動時クリーンコンテキスト bootstrap
-
-    ``loop.enabled=True`` のとき、SemMem の active な ``policy`` ファクトと
-    ``pinned`` ファクトのみから Tier 1 素材を組み立てて ``state`` に保持する。
-    実際の注入は MemoryInjector / ループ本体接続後に行う。
-    ``loop.enabled=False`` の場合や project_id 未解決の場合は no-op。
-
-    起動時 (主導モード問わず — chat / create) に呼び出される。失敗しても
-    アプリ起動を止めず WARN ログのみで握りつぶす (リスク対応:
-    bootstrap が起動失敗の単一障害点にならないこと)。
-    """
-    loop_cfg = (cfg or {}).get("loop", {}) or {}
-    if not loop_cfg.get("enabled", True):
-        return
-    if not current_project_id:
-        logger.debug(
-            "bootstrap_loop_context_at_startup: project_id unresolved, skipping",
-        )
-        return
-    try:
-        from backend.free.loop.bootstrap import bootstrap_project_context
-        from backend.free.loop.driver import reopen_orphan_in_progress_tasks
-        from backend.free.memory.views.loop import LoopFactView
-
-        global_store = state.get_semantic_store("global")
-        project_store = state.get_semantic_store(
-            f"project:{current_project_id}",
-        )
-        learning_policy_cfg = ((cfg or {}).get("learning") or {}).get("policy") or {}
-        min_conf = float(
-            learning_policy_cfg.get("activation_min_confidence", 0.7),
-        )
-        # SemanticFactStore 直参照を廃止し LoopFactView 経由に統一
-        view = LoopFactView(
-            stores=[global_store, project_store],
-            writeback_store=project_store,
-        )
-        # 前プロセスの強制終了で残った in_progress orphan task を
-        # ``open`` に戻してから bootstrap する。
-        try:
-            reopened = reopen_orphan_in_progress_tasks(
-                view, current_project_id,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Loop startup orphan recovery failed for project=%s: %s",
-                current_project_id, exc,
-            )
-            reopened = []
-        if reopened:
-            logger.info(
-                "Loop startup orphan recovery: project=%s reopened=%d task_ids=%s",
-                current_project_id,
-                len(reopened),
-                [v.task_id for v in reopened],
-            )
-        state.startup_orphan_tasks_reopened = [  # type: ignore[attr-defined]
-            v.task_id for v in reopened
-        ]
-        result = bootstrap_project_context(
-            view,
-            project_id=current_project_id,
-            policy_activation_min_confidence=min_conf,
-        )
-        # AppState に直接 attribute として保持 (LoopDriver 接続時に拾う)。
-        state.startup_bootstrap_result = result  # type: ignore[attr-defined]
-        logger.info(
-            "Loop startup bootstrap: project=%s tier1=%d "
-            "(policies=%d pinned_global=%d pinned_project=%d "
-            "failure_candidates=%d skipped_below_confidence=%d)",
-            current_project_id,
-            result.total_tier1(),
-            len(result.active_policies),
-            len(result.pinned_global),
-            len(result.pinned_project),
-            len(result.candidate_failure_patterns),
-            result.skipped_below_confidence,
-        )
-        # bootstrap スナップショットを memory.jsonl にも記録
-        if debug_logger is not None:
-            try:
-                debug_logger.log_memory_state(
-                    session_id="startup_bootstrap",
-                    memory_dump={},
-                    semmem_stats=result.as_dict(),
-                )
-            except Exception as exc:
-                logger.debug(
-                    "log_memory_state(startup_bootstrap) failed: %s", exc,
-                )
-    except Exception as exc:
-        logger.warning(
-            "Loop startup bootstrap failed for project=%s: %s",
-            current_project_id, exc,
-        )
 
 
 def apply_semmem_policy_overrides(

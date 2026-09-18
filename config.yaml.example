@@ -435,6 +435,23 @@ rag:
     max_chunk_chars: 1200        # 生成プロンプトへ渡す本文の上限文字数
     gate_min_coverage: 0.5       # 疑似クエリの関連性ゲート (拒否) を有効にする充足率 (較正済みの棒は充足率に依らず使う)
     quiet_seconds: 60            # チャットが終わってからこの秒数は生成を始めない (静穏窓)
+  # --- code グラフ (c_16 §4.4) ---
+  # 既存プロジェクトの構造 (file/class/function ノードと contains/imports/calls/inherits 辺) を
+  # tree-sitter の決定論抽出で corpus の 1 パッケージとして持つ。書き手は sleep-time Full の
+  # Step 5.87 のみ。読み手はツール search_code (シンボル一致を先頭に出す) / project_map。
+  project_map:
+    enabled: true                        # false で構築・更新・ツール読み出し全て停止
+    roots: ["."]                         # 走査対象 (プロジェクトルート相対)
+    exclude_globs: []                    # 既定の除外ディレクトリ (.git/node_modules/... 等) への追加 glob。
+                                         # 例: 配布物のミラーを持つ開発リポジトリなら ["release/**"]
+    max_file_bytes: 1000000              # これを超えるファイルは走査対象外
+    neighborhood_depth: 2                # project_map ツール neighborhood の既定探索深さ
+    neighborhood_budget_tokens: 800      # neighborhood 描画のトークン予算
+    update:
+      architecture_threshold: 10         # 構造変更ファイル数がこれを超えると architecture 分類
+      full_threshold: 30                 # 構造変更ファイル数がこれを超えると full 分類
+      full_ratio: 0.5                    # または総ファイル数のこの比率を超えると full 分類
+      quiet_seconds: 120                 # 静穏窓 (秒)。5.9 と同じ判定を使う
   # --- ベクトル量子化 ---
   # 保持形式は常に int8。本キーは検索時の挙動のみ変える:
   #   int8: 全件 int8 粗検索 (行スケール込み) → 候補のみ float32 rescore の 2 段
@@ -1061,7 +1078,6 @@ agent:
   content_gen_timeout: 600               # ファイル内容生成の総上限秒数（低速 GPU でも完走できるよう緩和）
   llm_call_timeout: 90                   # 計画生成など単発 LLM 呼出のタイムアウト（秒）
   total_timeout: 1800                    # Meta-Cognitive 全体のタイムアウト（秒、content_gen_timeout / 長文 codegen を内包）。低速 GPU の長文生成を完走させるため余裕を持たせる
-  delegate_codegen_to_longform: true     # create: editor/chat のコード生成を LongForm 細粒度生成へ委譲(複数ファイル可)。false で単一ショット生成
 
 # ===== ツール設定 =====
 tools:
@@ -1154,41 +1170,6 @@ editor:
     - sql
     - php
 
-# ===== 自律ループ driver =====
-# driver 骨組み、品質ゲートアダプタ
-# (pytest / typecheck / lint) を実装済み。executor 接続 / failure_pattern /
-# bootstrap / progress_marker は別層で接続する
-loop:
-  enabled: true
-  driver: semmem_task                          # task ファクトを駆動源にする
-  executor: ralph                              # ralph | noop
-  max_iterations: 50                           # 1 セッションあたり最大イテレーション
-  max_actions_per_task: 10                     # 1 task あたりの Action 実行上限
-  max_wall_time_sec: 1800.0                    # started_at からの壁時間上限
-  max_consecutive_failures: 3                  # 連続失敗で停止する閾値
-  tick_interval_sec: 0.0                       # 各イテレーション後の sleep 秒 (0=即時)
-  context_reset_threshold_tokens: 24000        # クリーンコンテキスト再起動のしきい値
-  sleep_time_every_n: 5                        # N イテレーションごとに sleep-time partial run
-  on_gate_fail: retry                          # retry | skip | abort
-  retry_limit_per_task: 2                      # 失敗時の最大リトライ回数
-  event_bus_max_queue: 128                     # SSE 進捗配信のキュー上限 (subscriber 単位)
-  quality_gates:
-    # 実装済み (backend/free/loop/quality_gate.py)
-    # 失敗時はコミットせず、rollback_working_tree() で作業ツリーを破棄する。
-    pytest: true                               # python scripts/safe_pytest.py
-    typecheck: true                            # cd frontend && npm run check
-    lint: false                                # cd frontend && npm run lint
-  sandbox:
-    # ラルフループのサンドボックス (ActionRunner)
-    allowed_write_roots:                       # edit_file の書込先 allowlist
-      - local/loop_sandbox
-    allowed_commands:                          # run_command の先頭要素 allowlist
-      - python
-      - node
-      - npm
-      - git
-    command_timeout_sec: 120.0
-
 # ===== 長文生成設定 =====
 # 長文生成エンジン。詳細は docs/f_08_long_form_generation.md 参照。
 long_form:
@@ -1215,6 +1196,8 @@ long_form:
 create:
   pipeline: longform                  # staged | longform (既定 longform)
   staged_enabled: true                # staged のキルスイッチ (pipeline と独立。false で即無効化)
+  turn_timeout_sec: 3600.0            # create 1 ターン全体のウォールクロック上限 (予算の 3 層の最終防衛線、f_10 §3)。staged.total_timeout_sec はこの値-300秒にクランプされる
+  runs_keep: 20                       # staged クリエイトの run レコード (f_10 §7) の保持件数
   staged:
     test_stage_enabled: true          # test 工程のうち advisory ユニットテスト生成+pytest 実行。false で生成のみ
     smoke_gate_enabled: true          # test 工程のうち決定論的 import スモーク+spec/flowchart 注入リペア。test_stage_enabled とは独立
@@ -1237,6 +1220,16 @@ create:
     part_max_tokens: 1536            # 部分 1 個の生成 max_tokens。切断時のみ倍に広げ再生成
     part_max_parts: 4                # 1 ファイルの最大部分数 (超過 component は spec 順に決定論併合)
     max_spec_revision_rounds: 1      # test 不合格時の spec 見直しサイクル上限 (ワークスペース全体, 0 で無効)
+  brief:
+    # ProductionBrief (f_08 §2.2): create ターン入口で1回だけ組む不変ブリーフの予算。
+    # 全 LLM 呼出 (計画/spec/深化/フロー/code/test/修復/見直し/unit/レビュー) のプロンプト先頭に同じ bytes を置く
+    max_tokens: 2000                 # ブリーフ全体の総予算。超過時は code_map→attachments→references→prior_work→memory→facts の順で節ごと削る
+    facts: 200                       # Facts 節 (fact slate) の上限
+    memory: 600                      # Memory 節 (SemMem 注入) の上限
+    prior_work: 400                  # Prior work 節 (直前の長文成果物) の上限
+    references: 400                  # References 節 (RAG 採用チャンク) の上限
+    attachments: 400                 # Attachments 節 (添付ファイルブロック) の上限
+    code_map: 400                    # Code map 節 (ProjectMap 近傍) の上限
 
 # ──────────────────────────────────────────────────────────────────────
 # Pro 専用機能
@@ -1249,8 +1242,8 @@ pro:
   knowledge:
     # Pro 限定: know.* 取得器。sources.jsonl に登録した取得元を sleep-time の
     # アイドル窓で回し、本文から claim を抜いて know.<domain>.<topic> へ書く。
-    # Free build では設定しても効果なし (起動時に WARNING)。
-    enabled: false                     # 既定無効
+    # 取得元が 0 件なら何もしない。Free build では取得器が無いので効果なし。
+    enabled: true                      # 既定有効
     fetch_timeout_sec: 20              # 1 URL あたりの取得タイムアウト (秒)
     max_items_per_run: 20              # 1 サイクルで新規に取り込む item の上限
     max_claims_per_item: 8             # 1 item から抜く claim の上限

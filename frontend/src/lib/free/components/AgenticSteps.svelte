@@ -116,8 +116,16 @@
 			{#if expanded}
 				<ul class="steps-list">
 					{#each steps as step}
-						<li class="step-item">
-							<span class="step-marker">{step.status === 'done' ? $t('chat.step_marker_done') : $t('chat.step_marker_active')}</span>
+						<li class="step-item" class:needs-input={step.type === 'needs_input'}>
+							<span class="step-marker">
+								{#if step.type === 'needs_input'}
+									{$t('chat.step_marker_needs_input')}
+								{:else if step.status === 'done'}
+									{$t('chat.step_marker_done')}
+								{:else}
+									{$t('chat.step_marker_active')}
+								{/if}
+							</span>
 							<span class="step-type">{step.type}</span>
 							<span class="step-detail">{displayDetail(step.detail)}</span>
 							{#if step.elapsed_ms != null}
@@ -215,6 +223,11 @@
 		padding: 2px 0;
 		color: var(--text-secondary);
 		opacity: 0.55;
+	}
+	.step-item.needs-input {
+		color: var(--accent);
+		opacity: 1;
+		font-weight: 600;
 	}
 	.step-marker {
 		color: var(--accent);

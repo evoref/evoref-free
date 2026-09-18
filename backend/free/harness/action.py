@@ -2,9 +2,9 @@
 
 Harness レイヤーで生成・実行される行為の型安全な表現。
 
-LLM 出力 (:func:`backend.free.harness.parser.parse_actions`) からは ``kind``
-タグ付き JSON を経由してこのデータクラスへ復元される。実 executor は
-``isinstance`` ベースのディスパッチで処理する想定。
+``kind`` タグ付き JSON (:func:`action_from_dict`) からこのデータクラスへ
+復元できる。実行は :class:`backend.free.loop.action_runner.ActionRunner` が
+``isinstance`` ベースのディスパッチで行う。
 
 設計方針:
 

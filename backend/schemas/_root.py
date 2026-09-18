@@ -30,7 +30,6 @@ from backend.schemas._common import (
 from backend.schemas.create import CreateConfig
 from backend.schemas.learning import LearningConfig, ScheduleConfig
 from backend.schemas.llm import LlamaConfig
-from backend.schemas.loop import LoopConfig
 from backend.schemas.memory import MemoryConfig
 from backend.schemas.paths import LocalPathsConfig, ModelPathsConfig
 from backend.schemas.prompt import PromptConfig
@@ -101,7 +100,6 @@ class EvorefConfig(BaseModel):
     process_manager: ProcessManagerConfig = Field(default_factory=ProcessManagerConfig)
     auto_serve: AutoServeConfig = Field(default_factory=AutoServeConfig)
     long_form: LongFormConfig = Field(default_factory=LongFormConfig)
-    loop: LoopConfig = Field(default_factory=LoopConfig)
     create: CreateConfig = Field(default_factory=CreateConfig)
     pro: ProConfig = Field(default_factory=ProConfig)
 
@@ -114,6 +112,25 @@ class EvorefConfig(BaseModel):
                 if data[key] is None:
                     data[key] = {}
         return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def drop_removed_loop_section(cls, data: dict) -> dict:
+        """撤去済みの ``loop:`` セクションを検証前に取り除く。
+
+        常駐の自律ループ (ループ管理 / ``/api/loop``) は機能ごと撤去した。
+        旧 config.yaml.example 由来のセクションはほぼ全ての config.yaml に残って
+        いるので、``debug:`` / ``reranker:`` のように起動を止めず、WARNING を
+        1 行出して削除を促す。クリエイトの staged パイプラインは
+        ``create.staged.*`` だけを読み、このセクションを使わない。
+        """
+        if not (isinstance(data, dict) and "loop" in data):
+            return data
+        logger.warning(
+            "config.yaml 'loop:' section was removed with the autonomous loop "
+            "feature and is ignored; delete it from config.yaml",
+        )
+        return {k: v for k, v in data.items() if k != "loop"}
 
     @model_validator(mode="before")
     @classmethod
@@ -199,6 +216,33 @@ class EvorefConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def warn_create_stage_budget_vs_turn_budget(self) -> "EvorefConfig":
+        """予算の 3 層 (f_10 §3) のステージ予算がターン予算を圧迫していないか警告する。
+
+        ``create.turn_timeout_sec`` (ターン予算、最終防衛線) と
+        ``create.staged.total_timeout_sec`` (ステージ予算) は独立した設定値で、
+        以前は ``agent.total_timeout`` (実設定 1800 秒) と
+        ``create.staged.total_timeout_sec`` (実設定 7200 秒) の組で「内側が
+        外側より 4 倍大きい」逆転が起きていた。実行時は
+        ``_clamp_long_form_timeout`` / ``StagedCreateExecutor`` 側で
+        ``create.turn_timeout_sec - 300`` を上限にクランプするため機能は壊れ
+        ないが、設定した ``staged.total_timeout_sec`` が黙って縮められている
+        ことに気付けるよう起動時に 1 回 warning を出す。エラーにはしない。
+        """
+        turn_budget = float(self.create.turn_timeout_sec)
+        stage_budget = float(self.create.staged.total_timeout_sec)
+        ceiling = turn_budget - 300.0
+        if stage_budget > ceiling:
+            logger.warning(
+                "create.staged.total_timeout_sec=%.1f exceeds "
+                "create.turn_timeout_sec(%.1f) - 300; it will be clamped to "
+                "%.1f at runtime. Lower create.staged.total_timeout_sec or "
+                "raise create.turn_timeout_sec to match your intent.",
+                stage_budget, turn_budget, ceiling,
+            )
+        return self
+
+    @model_validator(mode="after")
     def warn_pro_only_keys_in_free(self) -> "EvorefConfig":
         """Free エディションで Pro 限定キーが設定された場合に warning を出す
 
@@ -210,7 +254,6 @@ class EvorefConfig(BaseModel):
         判定対象:
 
         - ``widget_proxy.enabled = True``  (Pro Widget Proxy / 汎用 Web API プロキシ)
-        - ``pro.knowledge.enabled = True`` (Pro ``know.*`` 取得器)
         - ``learning.optimizer == "full-cma-es"`` (Pro CMA-ES オプティマイザ)
         - ``create.pipeline == "staged"`` (Pro staged クリエイトパイプライン)
         - 未定義トップレベルキー ``mode_models`` (Pro ローカルモデル切替)
@@ -240,9 +283,7 @@ class EvorefConfig(BaseModel):
                 "pro.url_recall.team_profile_ids",
                 bool(self.pro.url_recall.team_profile_ids),
             ),
-            # know.* 取得器は Pro 限定 (Free には origin=web の書き手が無い)。
-            ("pro.knowledge.enabled", bool(self.pro.knowledge.enabled)),
-            # staged クリエイトパイプラインは Pro 限定 (_staged_create_enabled が
+            # staged クリエイトパイプラインは Pro 限定 (_staged_stage_base_enabled が
             # is_pro() でゲート)。Free で pipeline=staged を設定しても longform の
             # まま無効なので警告する。staged_enabled は intra-staged のキルスイッチ
             # (既定 True) で Pro signal ではないため対象にしない。

@@ -180,6 +180,10 @@ class AppState:
     learned_patterns_store: LearnedPatternStore | None = None
     tools_registry: ToolsRegistry | None = None
     tool_call_judge: ToolCallJudge | None = None
+    #: ProjectMap reader を返す getter (c_16 §4.4)。``tools_registry`` の配線と
+    #: 同じインスタンスを共有する (ProductionBrief の Code map 節が使う)。
+    #: ``None`` = ProjectMap 無効 / 未構築の環境 (呼出側は None 安全に扱う)。
+    project_map_reader_getter: Any = None
     #: 属性スロットの補完ゲート (sleep-time 専用)。embedder 差し替え時に
     #: exemplar ベクトルを捨てて再 warmup するため AppState から辿れるようにする。
     attribute_slot_gate: Any = None

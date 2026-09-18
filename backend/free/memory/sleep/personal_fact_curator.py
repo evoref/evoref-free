@@ -200,6 +200,12 @@ def _is_tight_value(value: str, content: str) -> bool:
         return False
     if _SENTENCE_BREAK_RE.search(body[:-1] if len(body) > 1 else body):
         return False
+    # 1 節だけの発話 (「週末はクロスカントリースキーをしています。」) は発話
+    # 全体が 1 属性の span そのもの。型付けされなかった言明 (``needs_split``
+    # の条件 3) はこの形が普通なので、全体一致を「分割になっていない」扱い
+    # しない。複数節の発話では従来どおり落とす。
+    if _clause_count(content) <= 1:
+        return True
     return _normalize_ws(body) != _normalize_ws(content)
 
 
@@ -246,12 +252,20 @@ def needs_split(
 ) -> bool:
     """このノートを補助タスクへ出すか (規則だけで判定 / 純粋関数に近い)。
 
-    出す条件は 2 つのどちらか:
+    出す条件は 3 つのどれか:
 
     1. **節が 2 つ以上あるのに、解決したスロットが 1 個以下** — 語形の
        取りこぼしで属性が丸ごと落ちている形。
     2. **抽出済みの object が 2 節以上に跨る** — 1 スロットが隣の属性まで
        飲み込んでいる形。
+    3. **候補タグが 1 つも立たなかった平叙の言明** (:func:`is_untyped_statement`)
+       — trigger 辞書の語形に 1 語も当たらず、Step 8 / 事例ゲート /
+       条件 1・2 のどれにも届かない形。2026-09-17 監査: 「食品商社で輸入担当の
+       仕事をしています。」「週末はクロスカントリースキーをしています。」から
+       occupation も hobby も作られず、別セッションの「私の趣味は何でしたか。」
+       に「読書と、娘と一緒に過ごす時間です」と捏造した。語形を足す代わりに、
+       この段 (語形に依存しない) へ届く道を作る。本人の属性でない言明は補助
+       タスクが空を返し、値は逐語 span と slot 表で検証される。
 
     どちらも「regex が仕事をしきれなかった」ことの観測可能な兆候で、
     発話の語彙には依存しない。型付けが十分なノート (自己紹介 1 属性など) は
@@ -275,7 +289,7 @@ def needs_split(
     # builder 側の ``is_plain_statement`` / ``states_no_user_value`` で落ちる。
     tags = builder.candidate_fact_tags(content)
     if not any(tag in _KIND_BY_FACT_TYPE for tag in tags):
-        return False
+        return not tags and is_untyped_statement(content)
 
     from backend.free.memory.notes.note_builder import (
         resolve_fact_attribute_matches,
@@ -305,6 +319,27 @@ def needs_split(
         _clause_count(fact.object or "") >= 2
         for fact in _existing_attribute_facts(store, note).values()
     )
+
+
+def is_untyped_statement(content: str) -> bool:
+    """候補タグの立たなかった発話が、属性を述べている **かもしれない** 平叙文か。
+
+    問い・依頼・値を述べない文・中身の無い定型句 (相槌 / 挨拶) は落とす。
+    ここは「補助タスクへ出す価値があるか」の前段で、属性かどうかは判定しない
+    (語彙で判定すると同じ穴を作る)。
+    """
+    from backend.free.core.intent_vocab import is_plain_statement
+    from backend.free.core.text_quality import (
+        carries_no_assertion,
+        states_no_user_value,
+    )
+    from backend.free.memory.notes.social_formula_gate import is_note_worthy
+
+    if not is_plain_statement(content):
+        return False
+    if carries_no_assertion(content) or states_no_user_value(content):
+        return False
+    return is_note_worthy(content)
 
 
 def build_prompt(content: str, allowed: dict[str, tuple[str, str]]) -> str:
@@ -488,7 +523,13 @@ async def curate_personal_facts(
     ]
     if not candidates:
         return 0
-    candidates.sort(key=lambda n: float(getattr(n, "created_at", 0.0) or 0.0))
+    # 型付け済みの発話 (条件 1・2: 取りこぼしが観測済み) を先に、型の無い
+    # 平叙文 (条件 3: 属性を含むかは未知) を後に回す。上限で切られた分は
+    # マーカーが立たないので次サイクルが拾う。
+    candidates.sort(key=lambda n: (
+        not builder.candidate_fact_tags((n.content or "").strip()),
+        float(getattr(n, "created_at", 0.0) or 0.0),
+    ))
     if len(candidates) > _MAX_PER_CYCLE:
         logger.info(
             "personal_fact_curator: %d candidate(s), splitting the oldest %d "

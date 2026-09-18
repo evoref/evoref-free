@@ -1,9 +1,8 @@
 """staged クリエイトの test 工程: 生成テストをサンドボックスで実行する。
 
-**安全上の不変則**: evoref 自身のテストスイートを起動しうる ``PytestGate`` /
-``scripts/safe_pytest.py`` / ``build_default_gates`` は **使わない**。これらは
-``repo_root`` 固定・``cwd=REPO_ROOT`` 固定で evoref の test を収集するため、
-誤って system/e2e (PC フリーズ/強制再起動リスク) に触れる。
+**安全上の不変則**: evoref 自身のテストスイートを起動しうる
+``scripts/safe_pytest.py`` は **使わない**。``cwd=REPO_ROOT`` 固定で evoref の
+test を収集するため、誤って system/e2e (PC フリーズ/強制再起動リスク) に触れる。
 
 代わりにワークスペースを ``repo_root``/``cwd``/``rootdir`` とした専用
 :class:`ActionRunner` で ``python -m pytest <単一テストファイル>`` を実行する。

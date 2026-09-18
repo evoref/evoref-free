@@ -36,7 +36,7 @@ RECORD_VERSION = 1
 
 # ── 列挙 (Literal + カラム用の小さな int テーブル) ───────────────────────
 
-Kind = Literal["note", "fact", "claim", "doc_chunk", "doc_pseudo_query"]
+Kind = Literal["note", "fact", "claim", "doc_chunk", "doc_pseudo_query", "code_node"]
 StoreName = Literal["episodic", "semantic", "corpus"]
 Origin = Literal["user", "assistant", "tool", "document", "web", "system"]
 Veracity = Literal[
@@ -49,6 +49,7 @@ Tier = Literal["working", "short", "long"]
 #: **値は永続化されるので既存の割当を変えない** (追加は末尾へ)。
 KIND_IDS: dict[str, int] = {
     "note": 0, "fact": 1, "claim": 2, "doc_chunk": 3, "doc_pseudo_query": 4,
+    "code_node": 5,
 }
 STORE_IDS: dict[str, int] = {"episodic": 0, "semantic": 1, "corpus": 2}
 ORIGIN_IDS: dict[str, int] = {
@@ -338,6 +339,14 @@ ATTRS_SPEC: dict[str, tuple[frozenset[str], frozenset[str]]] = {
         frozenset({"target_id", "package_id"}),
         EMBED_SIDE_ATTRS,
     ),
+    # ProjectMap の code グラフノード (c_16 §3.5 / §4.4)。埋め込みは持たない。
+    "code_node": (
+        frozenset({"package_id", "package_version", "node_type", "path"}),
+        frozenset({
+            "name", "qualname", "lang", "line_start", "line_end",
+            "parent_id", "signature", "external_imports", "fan_in", "fan_out",
+        }),
+    ),
 }
 
 #: claim の ``attrs.source_kind`` に許す値 (§3.5)。
@@ -347,6 +356,9 @@ CLAIM_SOURCE_KINDS: frozenset[str] = frozenset(
 
 #: note の ``attrs.mode``。
 NOTE_MODES: frozenset[str] = frozenset({"chat", "coding"})
+
+#: code_node の ``attrs.node_type`` に許す値 (c_16 §3.5)。
+CODE_NODE_TYPES: frozenset[str] = frozenset({"file", "class", "function", "method"})
 
 
 def validate_attrs(kind: str, attrs: dict[str, Any]) -> None:
@@ -398,6 +410,17 @@ def validate_attrs(kind: str, attrs: dict[str, Any]) -> None:
         position = attrs.get("position")
         if not isinstance(position, int):
             raise EvidenceRecordError("doc_chunk position must be an int")
+    elif kind == "code_node":
+        node_type = attrs.get("node_type")
+        if node_type not in CODE_NODE_TYPES:
+            raise EvidenceRecordError(f"invalid code_node node_type: {node_type!r}")
+        for key in ("line_start", "line_end", "fan_in", "fan_out"):
+            value = attrs.get(key)
+            if value is not None and not isinstance(value, int):
+                raise EvidenceRecordError(f"code_node {key} must be an int")
+        external_imports = attrs.get("external_imports")
+        if external_imports is not None and not isinstance(external_imports, list):
+            raise EvidenceRecordError("code_node external_imports must be a list")
 
 
 # ── claim_key (c_16 §3.4) ───────────────────────────────────────────────
@@ -547,6 +570,7 @@ def corroboration_count(provenance: list[dict[str, Any]] | None) -> int:
 __all__ = [
     "ATTRS_SPEC",
     "CLAIM_SOURCE_KINDS",
+    "CODE_NODE_TYPES",
     "EMBED_SIDE_ATTRS",
     "KIND_IDS",
     "KIND_NAMES",

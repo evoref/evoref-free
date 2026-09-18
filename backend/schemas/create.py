@@ -11,7 +11,19 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+#: c_16 の ``_REMOVED_MEMORY_KEYS_REJECTED`` と同じ作法 (CLAUDE.md §7):
+#: 機能ごと消えたキーは黙って捨てず、理由付きで起動時に拒否する。
+#: ``create.dispatch`` は 3a-2 (2026-09-19) で撤去 — create のディスパッチは
+#: meta の production_stage 経路の 1 本になった (f_03_agent_engine.md §4.4)。
+_REMOVED_CREATE_KEYS_REJECTED: dict[str, str] = {
+    "dispatch": (
+        "create dispatch is unified onto the meta production_stage path; "
+        "the legacy \"legacy\" dispatch (_dispatch_long_form / "
+        "stream_staged_create) was removed"
+    ),
+}
 
 
 class CreateStagedConfig(BaseModel):
@@ -133,10 +145,68 @@ class CreateStagedConfig(BaseModel):
     )
 
 
+class BriefConfig(BaseModel):
+    """ProductionBrief (f_08 §2.2) の予算設定。
+
+    create モードのターン入口で 1 回だけ決定論で組む不変ブリーフの、総予算と
+    節ごとの上限。ターン中の全 LLM 呼出 (計画/spec/深化/フロー/code/test/
+    修復/見直し/unit/レビュー) のプロンプト先頭に同じ bytes を置く。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_tokens: int = Field(
+        default=2000, ge=0, le=8192,
+        description="ブリーフ全体の総予算。超過時は code_map → attachments → "
+                    "references → prior_work → memory → facts の順で節ごと削る",
+    )
+    facts: int = Field(
+        default=200, ge=0, le=4096,
+        description="Facts 節 (fact slate、chat の _append_fact_slate と同じ材料) の上限",
+    )
+    memory: int = Field(
+        default=600, ge=0, le=4096,
+        description="Memory 節 (SemMem 注入ブロック) の上限",
+    )
+    prior_work: int = Field(
+        default=400, ge=0, le=4096,
+        description="Prior work 節 (直前の長文成果物) の上限",
+    )
+    references: int = Field(
+        default=400, ge=0, le=4096,
+        description="References 節 (RAG 採用チャンク) の上限",
+    )
+    attachments: int = Field(
+        default=400, ge=0, le=4096,
+        description="Attachments 節 (添付ファイルブロック) の上限",
+    )
+    code_map: int = Field(
+        default=400, ge=0, le=4096,
+        description="Code map 節 (ProjectMap 近傍) の上限",
+    )
+
+
 class CreateConfig(BaseModel):
     """``create:`` トップレベル設定。"""
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_removed_keys(cls, data):
+        """撤去済みキー (:data:`_REMOVED_CREATE_KEYS_REJECTED`) を理由付きで拒否する。
+
+        ``MemoryConfig.reject_removed_keys`` (backend/schemas/memory.py) と同じ作法。
+        """
+        if isinstance(data, dict):
+            for key, reason in _REMOVED_CREATE_KEYS_REJECTED.items():
+                if key in data:
+                    raise ValueError(
+                        f"create.{key} was removed: {reason}. "
+                        "Remove the line from config.yaml "
+                        "(see docs/f_03_agent_engine.md §4.4).",
+                    )
+        return data
 
     pipeline: Literal["staged", "longform"] = Field(
         default="longform",
@@ -146,4 +216,16 @@ class CreateConfig(BaseModel):
         default=True,
         description="staged パイプラインのキルスイッチ (pipeline と独立)",
     )
+    turn_timeout_sec: float = Field(
+        default=3600.0, gt=0.0,
+        description="create モードの 1 ターン (1 リクエスト) 全体のウォール"
+                    "クロック上限。予算の 3 層 (f_10 §3) の最終防衛線 — "
+                    "``create.staged.total_timeout_sec`` はこの値 − 300 秒を"
+                    "上限にクランプされる (超過設定は起動時 WARNING)",
+    )
+    runs_keep: int = Field(
+        default=20, ge=1,
+        description="staged クリエイトの run レコード (f_10 §7) の保持件数",
+    )
     staged: CreateStagedConfig = Field(default_factory=CreateStagedConfig)
+    brief: BriefConfig = Field(default_factory=BriefConfig)

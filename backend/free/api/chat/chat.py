@@ -2,7 +2,7 @@
 
 import asyncio
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from collections.abc import AsyncIterator, Callable
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -14,6 +14,7 @@ from backend.free.core.verifier_events import open_verifier_scope
 from backend.config import (
     get_config,
     get_mode_generation_params,
+    get_path_resolver,
     resolve_context_size_for_mode,
 )
 from backend.free.api.chat.chat_constants import (
@@ -59,9 +60,10 @@ from backend.free.api.chat.chat_streaming import (
     rag_signals_from_chunks,
     read_existing_for_append,
     stream_deliberative, stream_long_form, stream_meta_cognitive, stream_reactive,
-    stream_reactive_light, stream_staged_create,
+    stream_reactive_light,
 )
 from backend.free.api.chat._artifact import (
+    LastArtifact,
     artifact_reference_verdict,
     peek_artifact,
     render_artifact_block,
@@ -98,13 +100,22 @@ from backend.free.agent.issue_ledger import issue_ledger_scope
 from backend.free.agent.file_ledger import file_ledger_scope
 from backend.free.agent.tool_ledger import set_ledger_target
 from backend.free.core.stage_timer import StageTimer
+from backend.free.generation.harness import LongFormHarness
 from backend.free.generation.orchestrator import LongFormOrchestrator
 from backend.free.llm.aux_client import AuxClient
 from backend.free.generation.content_detector import detect_content_type
 from backend.free.generation.direct_codegen import generate_single_file
 from backend.free.generation.models import ContentType
-from backend.free.agent.meta_cognitive_tasks import EditorArtifact
-from backend.free.llm.generation_gate import chat_request_started
+from backend.free.loop.staged.harness import StagedCodeHarness
+from backend.free.loop.staged.run_recorder import StagedRunRecorder
+from backend.free.generation.production_brief import (
+    BriefLimits,
+    build_code_map_block,
+    build_production_brief,
+)
+from backend.free.agent.create_target_gate import names_creation_target
+from backend.utils import estimate_tokens
+from backend.free.llm.generation_gate import begin_chat_turn, current_turn_lease
 from backend.log_config import get_logger
 from backend.trace_context import (
     generate_trace_id,
@@ -122,16 +133,24 @@ router = APIRouter(prefix="/api", tags=["chat"])
 type StreamWrapper = Callable[[AsyncIterator[str]], AsyncIterator[str]]
 
 
-async def _with_chat_in_flight(client, inner_gen):
+async def _with_chat_in_flight(client, inner_gen, lease=None):
     """ストリーミングジェネレータを ``chat_in_flight()`` でラップする。
 
     LLMClient にユーザー応答進行中であることを通知し、バックグラウンド
     処理（Level 1 進化、sleep-time）が協調的に yield できるようにする
     （`is_user_active` の定義は f_02_memory_system.md §4.3）。
+    ``lease`` はハンドラから引き継いだターンの在圏リースで、ストリームの
+    終わり (切断を含む) で解放する (``generation_gate.ChatTurnLease``)。
     """
-    async with client.chat_in_flight():
-        async for frame in inner_gen:
-            yield frame
+    if lease is not None:
+        lease.stream_started()
+    try:
+        async with client.chat_in_flight():
+            async for frame in inner_gen:
+                yield frame
+    finally:
+        if lease is not None:
+            lease.release()
 
 
 # session_id のフォーマット: 英数字・ハイフンのみ、8-64文字
@@ -281,8 +300,11 @@ async def _respond(
     if wrapper is not None:
         gen = wrapper(gen)
     if req.stream:
+        lease = current_turn_lease()
+        if lease is not None:
+            lease.hand_over()
         return StreamingResponse(
-            _with_chat_in_flight(client, gen), media_type="text/event-stream",
+            _with_chat_in_flight(client, gen, lease), media_type="text/event-stream",
         )
     async with client.chat_in_flight():
         return await collect_chat_response(gen, session_id=session_id)
@@ -315,6 +337,27 @@ def _resolve_system_prompt(
     )
 
 
+def _fact_slate_text(state: AppState, session_id: str | None, budget: int) -> str:
+    """押し出したターンの要点表 (f_02 §1.2) を生テキストで返す (無ければ "")。
+
+    ``_append_fact_slate`` (静的 system 末尾への合成) と ProductionBrief
+    (f_08 §2.2) の Facts 節が、同じスレートを別々の予算で読む共通材料。
+    """
+    get = getattr(state, "get_memory_system", None)
+    if get is None:
+        return ""
+    try:
+        mem_sys = get(session_id)
+    except Exception:
+        return ""
+    slate = getattr(mem_sys[0], "fact_slate", None) if mem_sys else None
+    if slate is None or not len(slate):
+        return ""
+    from backend.i18n_helper import prompt_locale
+
+    return slate.render(budget, prompt_locale())
+
+
 def _append_fact_slate(state: AppState, session_id: str | None, system_prompt: str) -> str:
     """押し出したターンの要点表 (f_02 §1.2) を静的 system の末尾に足す。
 
@@ -322,21 +365,9 @@ def _append_fact_slate(state: AppState, session_id: str | None, system_prompt: s
     セッション内で押し出しの間隔だけ安定し、接頭辞 KV は静的部分まで共通のまま。
     予算は ``prompt.fact_slate_max_tokens`` (0 で無効)。
     """
-    get = getattr(state, "get_memory_system", None)
-    if get is None:
-        return system_prompt
-    try:
-        mem_sys = get(session_id)
-    except Exception:
-        return system_prompt
-    slate = getattr(mem_sys[0], "fact_slate", None) if mem_sys else None
-    if slate is None or not len(slate):
-        return system_prompt
     cfg = getattr(state, "config", None) or {}
     budget = int((cfg.get("prompt") or {}).get("fact_slate_max_tokens", 200))
-    from backend.i18n_helper import prompt_locale
-
-    text = slate.render(budget, prompt_locale())
+    text = _fact_slate_text(state, session_id, budget)
     return f"{system_prompt}\n\n{text}" if text else system_prompt
 
 
@@ -818,7 +849,17 @@ _ARTIFACT_BLOCK_MAX_CHARS = 6000
 def _resolve_artifact_block(
     state: AppState, session_id: str, query: str,
 ) -> str | None:
-    """この発話が直前の成果物を指していれば、その参照ブロックを返す。
+    """この発話が直前の成果物を指していれば、その参照ブロックを返す。"""
+    return _resolve_artifact_reference(state, session_id, query)[0]
+
+
+def _resolve_artifact_reference(
+    state: AppState, session_id: str, query: str,
+) -> "tuple[str | None, LastArtifact | None]":
+    """この発話が直前の成果物を指していれば ``(参照ブロック, 成果物)`` を返す。
+
+    成果物そのものも返すのは、計量の注記 (「この案内文は何文字?」) が
+    直前の返答ではなく成果物を測る材料にするため (2026-09-17 監査)。
 
     2 条件の AND:
 
@@ -831,10 +872,10 @@ def _resolve_artifact_block(
     列挙は 2026-07 以降 4 回破れている。
     """
     if not session_id:
-        return None
+        return None, None
     artifact = peek_artifact(state, session_id)
     if artifact is None:
-        return None
+        return None, None
     verdict = artifact_reference_verdict(query)
     dl = getattr(state, "debug_logger", None)
     if dl is not None:
@@ -846,7 +887,7 @@ def _resolve_artifact_block(
             scope="request",
         )
     if verdict.band != "fire":
-        return None
+        return None, None
     block = render_artifact_block(
         artifact, budget_chars=_ARTIFACT_BLOCK_MAX_CHARS, query=query,
     )
@@ -855,7 +896,7 @@ def _resolve_artifact_block(
         "(%d chars stored, %d chars injected)",
         len(artifact.text), len(block),
     )
-    return block
+    return block, artifact
 
 
 @dataclass
@@ -1064,13 +1105,16 @@ async def _build_messages_with_search(
     # 直前ターンで作った長文成果物が、この発話の対象になっているか。
     # 長文は履歴予算に入らず次ターンで消えるため、これが無いとモデルは
     # 「履歴に含まれていない」としか言えない (_artifact の説明を参照)。
-    artifact_block = _resolve_artifact_block(state, session_id, req.message)
+    artifact_block, referenced_artifact = _resolve_artifact_reference(
+        state, session_id, req.message,
+    )
 
     history_min_tokens, working_max_tokens = _history_budget(cfg)
     messages = build_chat_messages(
         system_prompt, history, rag_chunks, file_contexts,
         context_size, max_tokens,
         artifact_block=artifact_block,
+        referenced_artifact=referenced_artifact,
         rag_scored_chunks=scored_chunks,
         salience_ranker=salience_ranker,
         semmem_block=semmem_block,
@@ -1296,117 +1340,108 @@ def _build_long_form_orchestrator(
     )
 
 
-# editor タブ表示用の拡張子 → 言語ラベル (フロントのシンタックスハイライト向け)。
-_CODE_EXT_LANG: dict[str, str] = {
-    "py": "python", "pyi": "python",
-    "ts": "typescript", "tsx": "typescript",
-    "js": "javascript", "jsx": "javascript", "mjs": "javascript",
-    "svelte": "svelte", "vue": "vue",
-    "rs": "rust", "go": "go", "java": "java", "kt": "kotlin",
-    "c": "c", "h": "c", "cpp": "cpp", "cc": "cpp", "hpp": "cpp",
-    "rb": "ruby", "php": "php", "cs": "csharp", "swift": "swift",
-    "sh": "bash", "bash": "bash", "sql": "sql",
-    "css": "css", "scss": "scss", "html": "html",
-    "json": "json", "yaml": "yaml", "yml": "yaml", "md": "markdown",
-}
+def _clamp_long_form_timeout(cfg: dict, mode: str) -> dict:
+    """long_form 委譲時、orchestrator の total_timeout_sec をターン予算未満にする。
 
-
-def _artifact_from_file(path: str, code: str) -> EditorArtifact:
-    """orchestrator の last_code_files エントリを EditorArtifact に変換する。"""
-    from pathlib import PurePosixPath
-
-    pp = PurePosixPath(path) if path else None
-    name = pp.name if pp else ""
-    ext = pp.suffix.lstrip(".").lower() if pp else ""
-    return EditorArtifact(
-        content=code,
-        language=_CODE_EXT_LANG.get(ext, "python"),
-        filename=name or None,
-    )
-
-
-def _validation_issues_artifact(errors: list[str]) -> EditorArtifact:
-    """リペア後も残った検証エラーを提示する markdown artifact を生成する。
-
-    生成コードは best-effort で配信しつつ、未解決エラーをユーザーに明示し、
-    壊れたコードを無言で「成功」扱いしないための可視化。
+    予算の 3 層 (f_10 §3): 内側 (orchestrator の呼出予算) は常に外側 (ターン予算)
+    より小さくする。ターン予算は mode で分岐する — create は
+    ``create.turn_timeout_sec`` (既定 3600s)、chat は ``agent.total_timeout``
+    (既定 1800s、超過時に artifacts 破棄)。90s のマージンを引いた上限より短く
+    打ち切り、orchestrator 側でユニット境界の部分結果 + repair を確定させる
+    (artifacts 喪失回避)。
     """
-    lines = "\n".join(f"- {e}" for e in errors)
-    content = (
-        f"# ⚠️ 自動検証で未解決のエラーが {len(errors)} 件あります\n\n"
-        "生成されたコードには以下の検証エラーが残っています。"
-        "実行前に修正してください。\n\n"
-        f"{lines}\n"
-    )
-    return EditorArtifact(
-        content=content,
-        language="markdown",
-        filename="GENERATION_ISSUES.md",
-    )
-
-
-def _clamp_long_form_timeout(cfg: dict) -> dict:
-    """create 委譲時、orchestrator の total_timeout_sec を agent 上限未満にする。
-
-    agent (`_total_timeout` 既定 900s、超過時に artifacts 破棄) より短く打ち切り、
-    orchestrator 側でユニット境界の部分結果 + repair を確定させる (artifacts 喪失回避)。
-    """
-    agent_total = float((cfg.get("agent") or {}).get("total_timeout", 1800) or 1800)
-    clamped = max(300.0, agent_total - 90.0)
+    if is_create_mode(mode):
+        turn_budget = float((cfg.get("create") or {}).get("turn_timeout_sec", 3600.0) or 3600.0)
+    else:
+        turn_budget = float((cfg.get("agent") or {}).get("total_timeout", 1800) or 1800)
+    clamped = max(300.0, turn_budget - 90.0)
     lf_cfg = dict(cfg.get("long_form") or {})
     existing = float(lf_cfg.get("total_timeout_sec", 1800.0) or 0.0)
     lf_cfg["total_timeout_sec"] = clamped if existing <= 0 else min(existing, clamped)
     return {**cfg, "long_form": lf_cfg}
 
 
-def make_code_artifact_generator(
-    client, state: AppState, cfg: dict, gen_params: dict, session_id: str,
-):
-    """create の editor/chat 出力向け code_generator を返す (MetaCognitiveAgent に注入)。
+def _brief_limits_from_cfg(cfg: dict) -> BriefLimits:
+    """``create.brief`` (config.yaml) から :class:`BriefLimits` を組む。
 
-    指示文を LongFormOrchestrator の細粒度 CodeUnit 計画で生成し、ファイル別の
-    検証・修正済みコードを EditorArtifact 群 (複数ファイル可) として返す。テキスト
-    判定 / 生成失敗時は空リストを返し、agent の単一ショット生成にフォールバックさせる。
+    未設定キーは :class:`BriefLimits` の既定値に倒す (config.yaml.example の
+    値と揃えてある)。
     """
-    gen_cfg = _clamp_long_form_timeout(cfg)
-
-    async def _generate(instruction: str, on_step=None) -> list[EditorArtifact]:  # noqa: ARG001
-        if detect_content_type(instruction, "create") != ContentType.CODE:
-            return []
-        orchestrator = _build_long_form_orchestrator(
-            client, state, gen_cfg, gen_params, session_id,
+    brief_cfg = ((cfg.get("create") or {}).get("brief") or {})
+    return BriefLimits(**{
+        field: brief_cfg[field] for field in (
+            "max_tokens", "facts", "memory", "prior_work",
+            "references", "attachments", "code_map",
         )
-        try:
-            # orchestrator の _call_step は sync 呼出 (on_step(data)) だが、
-            # MetaCognitive ランナーの on_step は async。委譲時に転送すると
-            # 「coroutine never awaited」で進捗フレームを取りこぼすため転送しない
-            # (進捗は agent 側の task_progress が表示する)。
-            async for _token in orchestrator.generate(
-                instruction=instruction, session_id=session_id,
-                mode="create", on_step=None,
-            ):
-                pass
-        except Exception as e:
-            logger.warning("Delegated code generation failed: %s", e)
-            return []
-        files = orchestrator.last_code_files or (
-            {"output.py": orchestrator.last_code_output}
-            if orchestrator.last_code_output else {}
-        )
-        artifacts = [
-            _artifact_from_file(path, code)
-            for path, code in files.items()
-            if code and code.strip()
-        ]
-        # 「壊れたコードを成功として渡さない」: リペア後も残った検証エラーがあれば、
-        # 生成物は best-effort で返しつつ、未解決エラーを可視化する artifact を添える。
-        if artifacts and orchestrator.last_validation_errors:
-            artifacts.append(_validation_issues_artifact(
-                orchestrator.last_validation_errors,
-            ))
-        return artifacts
+        if field in brief_cfg
+    })
 
-    return _generate
+
+def _build_create_production_brief(
+    state: AppState, cfg: dict, session_id: str, query: str, ctx: TurnContext,
+) -> str:
+    """create 経路の入口で 1 回だけ組む ProductionBrief (f_08 §2.2)。
+
+    材料はこのターンで既に計算済みのもの (fact slate / SemMem 注入 / 直前
+    成果物 / RAG チャンク / 添付ブロック)。ProjectMap の neighborhood だけは
+    ここで決定論的に引く (新しい検索・LLM 呼出はしない、ms 級)。
+    """
+    limits = _brief_limits_from_cfg(cfg)
+    fact_slate = _fact_slate_text(state, session_id, limits.facts)
+    prior_work = _resolve_artifact_block(state, session_id, query) or ""
+    reader_getter = getattr(state, "project_map_reader_getter", None)
+    reader = reader_getter() if reader_getter is not None else None
+    code_map = build_code_map_block(query, reader)
+    brief = build_production_brief(
+        fact_slate=fact_slate,
+        semmem_block=ctx.semmem_block or "",
+        prior_work=prior_work,
+        rag_chunks=ctx.scored_chunks or [],
+        file_block=ctx.file_block or "",
+        code_map=code_map,
+        limits=limits,
+    )
+    dl = getattr(state, "debug_logger", None)
+    if dl is not None:
+        references_text = "\n\n".join(
+            c for _cid, _score, c in (ctx.scored_chunks or [])
+        )
+        dl.log_long_form_event({
+            "phase": "production_brief",
+            "facts_tokens": estimate_tokens(fact_slate),
+            "memory_tokens": estimate_tokens(ctx.semmem_block or ""),
+            "prior_work_tokens": estimate_tokens(prior_work),
+            "references_tokens": estimate_tokens(references_text),
+            "attachments_tokens": estimate_tokens(ctx.file_block or ""),
+            "code_map_tokens": estimate_tokens(code_map),
+            "total_tokens": estimate_tokens(brief),
+        })
+    return brief
+
+
+def _find_needs_input_run(session_id: str):
+    """このセッションの直前 staged create ターンが問い返し (``needs_input``、
+    Phase 3b) のまま終わっていれば、その run を返す (無ければ ``None``)。
+
+    ``list_runs`` は ``started_at`` 降順なので、最初に見つかったものが最新。
+    """
+    from backend.free.loop.staged.run_record import list_runs
+
+    try:
+        create_dir = get_path_resolver().resolve_local("create_workspace_dir")
+        runs = list_runs(create_dir, session_id=session_id)
+    except Exception as exc:  # noqa: BLE001 - 台帳が読めなければ「保留 run は無い」に倒す
+        logger.debug("needs_input lookup skipped (session=%s): %s", session_id, exc)
+        return None
+    for record, status in runs:
+        if status == "needs_input":
+            return record
+    return None
+
+
+def _resume_brief_prefix(question: str, answer: str) -> str:
+    """blocked run 再開時に ProductionBrief 先頭へ足す前回の問い/回答 (f_10 §7)。"""
+    return f"# Resume\n前回の問い: {question}\n回答: {answer}\n---\n"
 
 
 async def _dispatch_long_form(
@@ -1421,7 +1456,7 @@ async def _dispatch_long_form(
     ctx: TurnContext,
     timer: StageTimer,
     output_target: str = "file",
-    staged: bool = False,
+    brief: str = "",
 ) -> StreamingResponse | ChatResponse:
     """Meta-Cognitive (long_form) 経路: 長文生成オーケストレータを起動する。
 
@@ -1429,17 +1464,21 @@ async def _dispatch_long_form(
     ``"chat"``) を ``stream_long_form`` / ``sync_long_form`` に伝播する。
     既定 ``"file"`` (チャット応答パス互換)。
 
-    ``staged=True`` (create + ``pipeline=staged`` + Pro + aux 健全、
-    :func:`_staged_create_enabled`) はストリーミング要求のときだけ専用
-    LoopDriver をインライン駆動し spec→code→test を実行する。非ストリーミング
-    要求は従来 longform 経路へ、タスクグラフ合成が空 (aux degraded 等) のときは
-    stream 内で同じ longform ストリームへ委譲する。以前は staged 専用の
-    ディスパッチが longform の呼び出しを 3 回写経していた。
+    create の制作 (staged/longform) は 3a-2 でディスパッチが meta 経路の 1 本に
+    なったため (f_03 §4.4)、この関数は **chat モードの is_long_form** 専用
+    (「企画書を書いて」等、create ではない通常の長文生成) — chat は base を
+    動かさないため production_stage を経由しない。
+
+    ``brief`` は ProductionBrief (f_08 §2.2)。create モード限定で呼出側
+    (``_dispatch``) が組み、空文字なら create 以外 (通常の長文生成) を意味する。
     """
     base_ok, client = await ensure_base_model_health(client, state, cfg)
     if not base_ok:
         return _llm_unavailable(req)
 
+    # 予算の 3 層 (f_10 §3): orchestrator の total_timeout_sec をターン予算
+    # (create.turn_timeout_sec / agent.total_timeout) 未満にクランプする。
+    cfg = _clamp_long_form_timeout(cfg, req.mode)
     orchestrator = _build_long_form_orchestrator(
         client, state, cfg, gen_params, session_id,
     )
@@ -1456,38 +1495,12 @@ async def _dispatch_long_form(
         prefetched_rag=ctx.scored_chunks,
         prefetched_rag_top_score=ctx.rag_top_raw,
         file_context_block=ctx.file_block,
+        brief=brief,
     )
-
-    def _long_form_stream():
-        return stream_long_form(*args, **kwargs)
-
-    if staged and req.stream:
-        codegen = make_staged_codegen_delegate(client, cfg)
-        staged_cfg = (cfg.get("create", {}) or {}).get("staged", {}) or {}
-        part_codegen = (
-            make_staged_codegen_delegate(
-                client, cfg, max_tokens=int(staged_cfg.get("part_max_tokens", 1536)),
-            )
-            if staged_cfg.get("part_generation_enabled", False) else None
-        )
-        return await _respond(
-            req, client, session_id,
-            lambda: stream_staged_create(
-                query=req.message, session_id=session_id, state=state, cfg=cfg,
-                instance_name=instance_name, context_size=context_size,
-                messages=ctx.messages, output_target=output_target,
-                codegen=codegen, part_codegen=part_codegen,
-                # 合成失敗時のフォールバック (外側で ctx.wrapper 済みのため raw)
-                fallback_factory=_long_form_stream,
-                timer=timer, private=req.private,
-                prefetched_rag=ctx.scored_chunks,
-                prefetched_rag_top_score=ctx.rag_top_raw,
-                file_context_block=ctx.file_block,
-            ),
-            ctx.wrapper, state=state,
-        )
     return await _respond(
-        req, client, session_id, _long_form_stream, ctx.wrapper, state=state,
+        req, client, session_id,
+        lambda: stream_long_form(*args, **kwargs),
+        ctx.wrapper, state=state,
     )
 
 
@@ -1508,6 +1521,11 @@ def make_staged_codegen_delegate(client, cfg: dict, *, max_tokens: int | None = 
 
     ``max_tokens`` 指定時は config (``code_max_tokens``) より優先する
     (部分ごと生成向けの ``part_max_tokens`` 予算で別 delegate を作る用途)。
+
+    返す delegate は ``request_timeout`` (kw-only、既定 None) を受け取る —
+    呼出予算 (f_10 §3)。``StagedCreateExecutor`` が残りステージ予算を渡し、
+    未指定 (``None``) なら ``generate_single_file`` 自身の既定
+    (``sync_request_timeout``) に委ねる。
     """
     staged_cfg = (cfg.get("create", {}) or {}).get("staged", {}) or {}
     resolved_max_tokens = (
@@ -1515,20 +1533,24 @@ def make_staged_codegen_delegate(client, cfg: dict, *, max_tokens: int | None = 
         else int(staged_cfg.get("code_max_tokens", 4096))
     )
 
-    async def _generate(instruction: str, file_path: str) -> dict[str, str]:
+    async def _generate(
+        instruction: str, file_path: str, *, request_timeout: float | None = None,
+    ) -> dict[str, str]:
         return await generate_single_file(
             client, instruction, file_path, max_tokens=resolved_max_tokens,
+            request_timeout=request_timeout,
         )
 
     return _generate
 
 
-def _staged_create_enabled(req: ChatRequest, cfg: dict, state: AppState) -> bool:
-    """staged クリエイトパイプラインを起動すべきか判定する。
+def _staged_stage_base_enabled(mode: str, cfg: dict, state: AppState) -> bool:
+    """staged パイプラインを起動しうる、instruction 非依存の前提条件。
 
-    全条件を満たすときのみ True。いずれか欠ければ従来 longform 経路へ倒す。
+    ``make_production_stage`` (instruction の content_type 判定は ``run()`` 時に
+    遅延するため事前条件だけをここで判定する) が使う。
     """
-    if not is_create_mode(req.mode):
+    if not is_create_mode(mode):
         return False
     create_cfg = cfg.get("create", {}) or {}
     if create_cfg.get("pipeline") != "staged":
@@ -1538,14 +1560,208 @@ def _staged_create_enabled(req: ChatRequest, cfg: dict, state: AppState) -> bool
     # 補助クライアント未配線 (ベース llama-server 未接続) なら従来 longform へ倒す。
     if getattr(state, "aux_client", None) is None:
         return False
-    if not is_pro():
-        return False
-    try:
-        if detect_content_type(req.message, "create") != ContentType.CODE:
-            return False
-    except Exception:
-        return False
-    return True
+    return is_pro()
+
+
+class _ProductionStageSelector:
+    """``create.dispatch=meta`` の制作ステージ選択ハーネス (f_03 §4.4)。
+
+    instruction の content_type は ``run()`` 呼出し時にしか分からないため、
+    Staged/LongForm の選択自体を遅延する ``ProductionHarness``。staged が
+    タスクグラフ合成空 (``exit_kind="error"`` + ``notes["fallback"] ==
+    "empty_task_graph"``) を返したとき: 要求に作成対象 (パス/言語/成果物の
+    種類) が無く、かつ再開ターンでもなければ問い返し (``blocked``、Phase 3b)
+    へ倒す。対象がある / 再開ターンなら従来どおり longform へ委譲する
+    (legacy の ``fallback_factory`` と同じ役目)。
+    """
+
+    name = "production"
+
+    def __init__(
+        self, *, staged_factory, longform_factory, staged_base_enabled: bool,
+        resume_of: str | None = None,
+    ) -> None:
+        self._staged_factory = staged_factory
+        self._longform_factory = longform_factory
+        self._staged_base_enabled = staged_base_enabled
+        self._resume_of = resume_of
+        self._resume_finished = False
+
+    async def precheck(self, req):
+        """計画の前に決定論で問い返すか (f_03 §4.4、2026-09-19)。
+
+        対象 (パス / 言語 / 成果物名詞、``names_creation_target``) が無く再開でも
+        なければ、LLM を 1 回も呼ばずに ``blocked`` を返す。run は
+        ``project_id="needs_input"`` の workspace を起こしてそこに置く (f_10 §7)。
+        """
+        from pathlib import Path
+        from types import SimpleNamespace
+        from uuid import uuid4
+
+        from backend.free.loop.staged import WorkspaceManager
+
+        if req.resume_of or self._resume_of or names_creation_target(req.instruction):
+            return None
+        run_id = uuid4().hex[:12]
+        create_dir = Path(get_path_resolver().resolve_local("create_workspace_dir"))
+        ws = WorkspaceManager.open_or_create(
+            create_dir, workspace_id=run_id, session_id=req.session_id,
+            project_id="needs_input", goal=req.instruction,
+        )
+        placeholder = SimpleNamespace(
+            notes={"run_id": run_id, "workspace_root": str(ws.root)},
+        )
+        logger.info(
+            "Production stage: request names no creation target; asking before plan "
+            "(run=%s)", run_id,
+        )
+        return self._block_for_input(placeholder, req)
+
+    async def run(self, req, *, on_event, is_cancelled):
+        if self._resume_of and not req.resume_of:
+            req = replace(req, resume_of=self._resume_of)
+        if req.resume_of and not self._resume_finished:
+            # 制作ステージが走り出したら旧 (blocked) run を終端する (1 回だけ、f_10 §7)。
+            self._resume_finished = True
+            self._finish_resumed_run(req.resume_of)
+        use_staged = self._staged_base_enabled
+        if use_staged:
+            try:
+                use_staged = (
+                    detect_content_type(req.instruction, "create") == ContentType.CODE
+                )
+            except Exception:
+                use_staged = False
+        if use_staged:
+            result = await self._staged_factory().run(
+                req, on_event=on_event, is_cancelled=is_cancelled,
+            )
+            if not (
+                result.exit_kind == "error"
+                and result.notes.get("fallback") == "empty_task_graph"
+            ):
+                return result
+            if req.resume_of is None and not names_creation_target(req.instruction):
+                return self._block_for_input(result, req)
+            logger.info(
+                "Production stage: staged task graph empty; falling back to longform",
+            )
+        return await self._longform_factory().run(
+            req, on_event=on_event, is_cancelled=is_cancelled,
+        )
+
+    @staticmethod
+    def _block_for_input(result, req):
+        """作成対象が無い空タスクグラフを問い返し (``blocked``) へ倒す (Phase 3b)。
+
+        staged が既に起こしたワークスペース (``result.notes`` 経由) へ run.json
+        を新規に立て、即座に ``blocked`` にする (このターンでは staged 実行に
+        入らなかったため run.json はまだ無い、f_10 §7)。
+        """
+        from pathlib import Path
+
+        from backend.free.harness.production import ProductionResult
+        from backend.free.loop.staged.run_record import RunRecordStore
+        from backend.i18n_helper import msg
+        from backend.trace_context import get_trace_id
+
+        question = msg("create.needs_input_question")
+        run_id = str(result.notes.get("run_id") or "")
+        workspace_root = str(result.notes.get("workspace_root") or "")
+        if workspace_root:
+            try:
+                store = RunRecordStore(Path(workspace_root))
+                store.start(
+                    run_id=run_id, session_id=req.session_id,
+                    request_id=get_trace_id() or "", mode="create",
+                    query=req.instruction, output_target=req.output_target,
+                )
+                store.block(question)
+            except Exception as exc:  # noqa: BLE001 - 永続化の失敗で問い返し自体は止めない
+                logger.warning(
+                    "Production stage: failed to persist blocked run: %s", exc,
+                )
+        return ProductionResult(
+            exit_kind="blocked", question=question, artifacts=[], metrics={},
+            notes={"run_id": run_id, "workspace_root": workspace_root},
+        )
+
+    @staticmethod
+    def _finish_resumed_run(old_run_id: str) -> None:
+        from pathlib import Path
+
+        from backend.free.loop.staged.run_record import RunRecordStore
+
+        create_dir = Path(get_path_resolver().resolve_local("create_workspace_dir"))
+        try:
+            store = RunRecordStore(create_dir / old_run_id)
+            if store.load() and store.record is not None:
+                store.finish("resumed")
+        except Exception as exc:  # noqa: BLE001 - 後始末の失敗で再開自体は止めない
+            logger.warning(
+                "Production stage: failed to finish resumed run %s: %s",
+                old_run_id, exc,
+            )
+
+
+def make_production_stage(
+    client, state: AppState, cfg: dict, gen_params: dict, session_id: str,
+    *, brief: str, mode: str, output_target: str,  # noqa: ARG001 - 現状は ProductionRequest 側が持つため未使用 (署名は f_03 §4.4 と一致させる)
+    resume_of: str | None = None,
+) -> _ProductionStageSelector:
+    """create.dispatch=meta 用の制作ステージを組み立てる (composition 層、f_03 §4.4)。
+
+    Staged/LongForm の実選択は instruction の content_type に依存するため
+    ``run()`` 時まで遅延する (:class:`_ProductionStageSelector`)。両ハーネスの
+    構築 (codegen delegate / LongFormOrchestrator の DI) も呼出しの都度
+    factory 経由で遅延させ、使わない側のコストを払わない。
+
+    ``resume_of`` は問い返し (``needs_input``、Phase 3b) から再開する元
+    run_id — 呼出側 (``_dispatch``) が直前ターンの ``blocked`` run を見つけた
+    ときだけ渡す。
+    """
+    staged_base_enabled = _staged_stage_base_enabled(mode, cfg, state)
+
+    def _staged_factory() -> StagedCodeHarness:
+        codegen = make_staged_codegen_delegate(client, cfg)
+        staged_cfg = (cfg.get("create", {}) or {}).get("staged", {}) or {}
+        part_codegen = (
+            make_staged_codegen_delegate(
+                client, cfg, max_tokens=int(staged_cfg.get("part_max_tokens", 1536)),
+            )
+            if staged_cfg.get("part_generation_enabled", False) else None
+        )
+        return StagedCodeHarness(
+            state=state, cfg=cfg, codegen=codegen, part_codegen=part_codegen,
+        )
+
+    def _longform_factory() -> LongFormHarness:
+        gen_cfg = _clamp_long_form_timeout(cfg, mode)
+
+        def _run_recorder_factory(run_id: str) -> StagedRunRecorder:
+            # longform も staged と同じ run.json/events.jsonl/workspace を持つ
+            # (Phase 4、f_08 §2.3)。create_workspace_dir は staged と共有 — GC
+            # (sleep-time Step 5.89) / /api/create/runs* が run_id 単位で扱う。
+            create_dir = get_path_resolver().resolve_local("create_workspace_dir")
+            return StagedRunRecorder.open(
+                create_dir, run_id, session_id=session_id,
+                project_id="longform", debug_logger=state.debug_logger,
+            )
+
+        return LongFormHarness(
+            lambda: _build_long_form_orchestrator(
+                client, state, gen_cfg, gen_params, session_id,
+            ),
+            session_id=session_id,
+            # 追記 / 参照依頼の既存ファイル内容 (chat の長文と同じ解決器)。
+            existing_content_resolver=lambda q: read_existing_for_append(q, state),
+            run_recorder_factory=_run_recorder_factory,
+        )
+
+    return _ProductionStageSelector(
+        staged_factory=_staged_factory, longform_factory=_longform_factory,
+        staged_base_enabled=staged_base_enabled, resume_of=resume_of,
+    )
 
 
 def _with_artifact_material(
@@ -1581,6 +1797,30 @@ def _with_artifact_material(
     return [*history, {"role": "assistant", "content": body}]
 
 
+def _make_write_impact_classifier(
+    state: AppState,
+) -> "Callable[[list[str]], list[dict]] | None":
+    """meta の制作タスク file 出力向け write_impact 分類器を組む (f_10 §8.1)。
+
+    composition 層 (ここ) が ``state.project_map_reader_getter`` を束ね、
+    実体 (:func:`backend.free.loop.staged.write_impact.staged_write_impact_payload`)
+    は EvorefLoop 側の純粋関数。agent (EvorefLoop) から api.chat (composition) は
+    import できない (pillar 境界) ため、呼出可能オブジェクトとして注入する。
+    reader 未配線 (ProjectMap 無効) なら ``None`` (呼ばれない)。
+    """
+    reader_getter = getattr(state, "project_map_reader_getter", None)
+    if reader_getter is None:
+        return None
+
+    def _classify(written_paths: list[str]) -> list[dict]:
+        from backend.free.loop.staged.write_impact import staged_write_impact_payload
+
+        reader = reader_getter()
+        return staged_write_impact_payload(reader, written_paths)
+
+    return _classify
+
+
 async def _dispatch_meta_cognitive(
     req: ChatRequest,
     client,
@@ -1595,12 +1835,19 @@ async def _dispatch_meta_cognitive(
     ctx: TurnContext,
     timer: StageTimer,
     output_target: str = "file",
+    brief: str = "",
+    production_stage: "_ProductionStageSelector | None" = None,
 ) -> StreamingResponse | ChatResponse:
     """Meta-Cognitive (通常) 経路: 計画 + ツールループ。
 
     meta 経路は固定の PLAN/EXECUTE/CONTENT scaffold を使うため、few-shot は
     system へ結合せず instance block として渡し、ツールループ / コンテンツ生成 /
     fallback の system に [参考例] として注入する (Level 1 進化を create 生成へ反映)。
+
+    ``brief`` は ProductionBrief (f_08 §2.2、create 限定)。``production_stage``
+    (create 限定、f_03 §4.4) への委譲時に使う。``production_stage`` が None
+    (chat モード) のときは、単発ショット生成 (``_execute_editor_task`` の
+    フォールバック経路、3a-2 で legacy の code_generator 委譲を撤去) にそのまま落ちる。
     """
     # 「その計画書を保存して」型の依頼に、直前の成果物を **素材** として渡す。
     # ``_generate_content`` は既に「直近の会話」を素材にする仕組みを持つが、
@@ -1610,16 +1857,6 @@ async def _dispatch_meta_cognitive(
     history = _with_artifact_material(state, session_id, history)
     # @self 仮想カートリッジ用 LoopFactView 配線
     loop_view = _resolve_loop_view_for_agent(state)
-    # create モード: editor/chat 出力のコード生成を LongForm 細粒度生成へ委譲する
-    # generator を注入する (複数ファイル可)。非 create / 無効時は None。
-    code_generator = None
-    if (
-        is_create_mode(req.mode)
-        and cfg.get("agent", {}).get("delegate_codegen_to_longform", True)
-    ):
-        code_generator = make_code_artifact_generator(
-            client, state, cfg, gen_params, session_id,
-        )
     meta_agent = MetaCognitiveAgent(
         config=cfg,
         tool_judge=state.tool_call_judge,
@@ -1642,9 +1879,11 @@ async def _dispatch_meta_cognitive(
         file_block=ctx.file_block,
         # Level 1 進化 few-shot を維持 (固定 scaffold の [参考例] に注入)
         fewshot_block=ctx.fewshot_block,
-        code_generator=code_generator,
         # 内部 loop/token 予算を create_model の実窓に合わせる
         mode=req.mode,
+        production_stage=production_stage,
+        brief=brief,
+        write_impact_classifier=_make_write_impact_classifier(state),
     )
     keepalive_sec = cfg.get("streaming", {}).get(
         "keepalive_interval_sec", DEFAULT_KEEPALIVE_INTERVAL_SEC,
@@ -1745,7 +1984,22 @@ async def _dispatch_deliberative(
 
 @router.post("/chat")
 async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
-    """SSE ストリーミングチャット応答（3層エージェントディスパッチ）"""
+    """SSE ストリーミングチャット応答（3層エージェントディスパッチ）
+
+    要求の到着から応答の終わりまでをターンの在圏リースで包む。背景 aux は
+    この間 dispatch を待つ (前処理の窓も含む、``generation_gate.ChatTurnLease``)。
+    ストリーミング応答では解放の責務を ``_respond`` がストリームへ移す。
+    """
+    lease = begin_chat_turn()
+    try:
+        return await _chat_turn(req, state)
+    finally:
+        if not lease.handed_over:
+            lease.release()
+
+
+async def _chat_turn(req: ChatRequest, state: AppState):
+    """``chat`` の本体 (ターンリースの内側)。"""
     trace_id = generate_trace_id()
     set_trace_id(trace_id)
     # private セッションではユーザー発話をログへ書かない。書く地点は多数
@@ -1774,11 +2028,6 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
 
     if state.sleep_scheduler:
         state.sleep_scheduler.on_user_input()
-    # 背景 aux の実行中の生成へ「チャット要求が届いた」を伝える (打ち切り)。
-    # 生成の開始 (gate_stream) より前の分類器 / 日付意図の抽出から GPU を
-    # 要するので、要求の到着で知らせる (generation_gate の docstring)。
-    chat_request_started()
-
     history, session_id = await prepare_memory_context(req, state)
     file_contexts = convert_file_contexts(req)
     # このリクエストのツール実行の記録先を確定する。記録自体は実行の合流点
@@ -1860,13 +2109,24 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
             logger.warning("Write intent gate failed, falling back: %s", e)
 
     output_target, editor_route = _plan_output_target(req)
+    layer = classifier.classify(
+        req.message, mode=req.mode,
+        context=lambda: _recent_dialogue_text(history),
+        write_intent_hint=write_intent_hint,
+    )
+    reason = getattr(classifier, "_last_classify_reason", "default")
+    if (
+        is_create_mode(req.mode)
+        and layer != "meta_cognitive"
+        and _find_needs_input_run(session_id) is not None
+    ):
+        # 問い返し (needs_input) 中のセッションの次の発話は回答なので、router
+        # の層に関わらず meta (再開) へ回す。短い「…に保存して」が deliberative
+        # に振られて再開経路を通らず、旧 run が blocked のまま残った (2026-09-19)。
+        layer, reason = "meta_cognitive", "needs_input_resume"
     plan = RoutePlan(
-        layer=classifier.classify(
-            req.message, mode=req.mode,
-            context=lambda: _recent_dialogue_text(history),
-            write_intent_hint=write_intent_hint,
-        ),
-        reason=getattr(classifier, "_last_classify_reason", "default"),
+        layer=layer,
+        reason=reason,
         is_long_form=bool(classifier.is_long_form),
         output_target=output_target,
         editor_route=editor_route,
@@ -2043,24 +2303,52 @@ async def chat(req: ChatRequest, state: AppState = Depends(get_app_state)):
                 # task 記述単位で judge するため query 単位の流用不可、judge_task
                 # は通常 None)。念のため破棄する。
                 _cancel_pending_task(judge_task)
-                # create mode + pipeline=staged + Pro + aux 健全 のときは
-                # 仕様書→コード→テストの staged パイプライン (専用 LoopDriver) へ。
-                # is_long_form でない create 要求 (「テトリスを作成して」級) も
-                # 同じゲートで staged へ流す。それ以外は is_long_form なら
-                # 従来 longform 経路、そうでなければ計画 + ツールループ。
-                staged = _staged_create_enabled(req, cfg, state)
-                if staged or plan.is_long_form:
+                # ProductionBrief (f_08 §2.2): create モードのターン入口で
+                # 1 回だけ決定論で組み、全 LLM 呼出のプロンプト先頭へ同じ bytes
+                # を渡す (create 限定)。
+                brief = (
+                    _build_create_production_brief(
+                        state, cfg, session_id, req.message, ctx,
+                    )
+                    if is_create_mode(req.mode) else ""
+                )
+                # ディスパッチは 1 本 (3a-2、f_03 §4.4): create は常に meta の
+                # production_stage 経由 (staged/longform の選択は
+                # _ProductionStageSelector.run() が instruction の content_type
+                # から遅延判定する)。chat モードの is_long_form (「企画書を
+                # 書いて」等) だけが _dispatch_long_form を使う (chat = base を
+                # 動かさない)。
+                production_stage = None
+                if is_create_mode(req.mode):
+                    # 問い返し (needs_input、Phase 3b) からの再開: 直前ターンが
+                    # blocked のまま終わっていれば、その問いと今回の回答を
+                    # brief 先頭へ足し、resume_of として新 run へ引き継ぐ
+                    # (f_10 §7)。
+                    resume_of: str | None = None
+                    resume_run = _find_needs_input_run(session_id)
+                    if resume_run is not None:
+                        resume_of = resume_run.run_id
+                        question = str(resume_run.to_dict().get("question", ""))
+                        brief = _resume_brief_prefix(question, req.message) + brief
+                    production_stage = make_production_stage(
+                        client, state, cfg, gen_params, session_id,
+                        brief=brief, mode=req.mode, output_target=plan.output_target,
+                        resume_of=resume_of,
+                    )
+                elif plan.is_long_form:
                     return await _dispatch_long_form(
                         req, client, state, cfg, gen_params, session_id,
                         instance_name, context_size, ctx, timer,
                         output_target=plan.output_target,
-                        staged=staged,
+                        brief=brief,
                     )
                 return await _dispatch_meta_cognitive(
                     req, client, state, cfg, gen_params,
                     system_prompt, history,
                     session_id, instance_name, context_size, ctx, timer,
                     output_target=plan.output_target,
+                    brief=brief,
+                    production_stage=production_stage,
                 )
             case _:
                 return await _dispatch_deliberative(

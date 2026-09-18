@@ -188,10 +188,39 @@ class StreamingConfig(BaseModel):
     keepalive_interval_sec: float = Field(default=15.0, ge=1.0, le=120.0)
 
 
+#: 3a-2 (2026-09-19) で機能ごと撤去した ``agent`` 直下のキー。schemas/memory.py の
+#: ``_REMOVED_MEMORY_KEYS_REJECTED`` と同じ作法 (CLAUDE.md §7): 黙って捨てず
+#: 理由付きで起動時に拒否する。
+_REMOVED_AGENT_KEYS_REJECTED: dict[str, str] = {
+    "delegate_codegen_to_longform": (
+        "create's code generation delegation (code_generator) was removed; "
+        "create dispatch is unified onto the meta production_stage path "
+        "(f_03_agent_engine.md §4.4)"
+    ),
+}
+
+
 class AgentConfig(BaseModel):
     """エージェント設定"""
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_removed_keys(cls, data):
+        """撤去済みキー (:data:`_REMOVED_AGENT_KEYS_REJECTED`) を理由付きで拒否する。
+
+        ``MemoryConfig.reject_removed_keys`` (backend/schemas/memory.py) と同じ作法。
+        """
+        if isinstance(data, dict):
+            for key, reason in _REMOVED_AGENT_KEYS_REJECTED.items():
+                if key in data:
+                    raise ValueError(
+                        f"agent.{key} was removed: {reason}. "
+                        "Remove the line from config.yaml "
+                        "(see docs/f_03_agent_engine.md §4.4).",
+                    )
+        return data
 
     step_compaction_enabled: bool = True
     step_compaction_rag_lines: int = Field(default=2, ge=1)
@@ -278,10 +307,6 @@ class AgentConfig(BaseModel):
     content_gen_timeout: int = Field(default=600, ge=30)
     llm_call_timeout: int = Field(default=90, ge=10)
     total_timeout: int = Field(default=1800, ge=60)
-    # create モードで editor/chat 出力のコード生成を LongForm 細粒度生成
-    # (CodeUnit 計画 → ファイル別生成・検証・修正) へ委譲する。大規模実装は
-    # 複数ファイルへ分割出力可能。False で従来の単一ショット生成に戻す。
-    delegate_codegen_to_longform: bool = True
 
     @model_validator(mode="after")
     def _validate_content_gen_timeout_order(self) -> "AgentConfig":
@@ -550,13 +575,13 @@ class ProKnowledgeConfig(BaseModel):
     """Pro ``know.*`` 取得器の設定 (c_16 §4.2)。
 
     ``sources.jsonl`` に登録された取得元を sleep-time のアイドル窓で回し、
-    本文から claim を抜いて ``know.<domain>.<topic>`` へ書く。Free には
-    取得器が無いので、有効化しても効果はない (起動時に WARNING)。
+    本文から claim を抜いて ``know.<domain>.<topic>`` へ書く。既定で有効
+    (取得元が 0 件なら何もしない)。Free には取得器が無いので効果はない。
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = False
+    enabled: bool = True
     fetch_timeout_sec: int = Field(default=20, ge=1)
     max_items_per_run: int = Field(default=20, ge=1)
     max_claims_per_item: int = Field(default=8, ge=1)

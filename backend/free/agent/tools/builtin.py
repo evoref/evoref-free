@@ -19,9 +19,12 @@ from backend.i18n_helper import msg, prose_language_name
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from backend.free.history.history_manager import HistoryManager
     from backend.free.llm.aux_client import AuxClient
     from backend.free.llm.local_client import LocalClient
+    from backend.free.rag.projectmap import ProjectMapReader
 
 logger = get_logger("agent.tools.builtin")
 
@@ -267,6 +270,107 @@ def _make_run_command_readonly(config: dict):
         return await run_command(
             command, timeout, config, kill_on_timeout=True, scrub_secrets=True,
         )
+
+    return wrapped
+
+
+def _make_search_code(reader_getter: "Callable[[], ProjectMapReader | None]"):
+    """search_code ハンドラを生成 (ProjectMap reader をクロージャで捕捉)。
+
+    reader が使える場合はシンボル一致 (``lookup``) を正規表現走査の**前**に
+    出し (c_16 §4.4)、続けて従来の ``filesystem.search_code`` を連結する。
+    reader が ``None`` (未構築 / 無効 / tree-sitter 不在) なら従来どおり。
+    """
+
+    def wrapped(pattern: str, directory: str = ".", max_results: int = 20) -> str:
+        reader = reader_getter()
+        grep_result = search_code(pattern, directory, max_results)
+        if reader is None:
+            return grep_result
+        try:
+            nodes = reader.lookup(pattern)
+        except Exception as e:  # noqa: BLE001 — reader 障害で search_code 全体を止めない
+            logger.warning("ProjectMap lookup failed for %r: %s", pattern, e)
+            return grep_result
+        if not nodes:
+            return grep_result
+        symbol_lines = [
+            f"{n.path}:{n.line_start}  {n.signature or n.qualname or n.name}"
+            for n in nodes
+        ]
+        out = "[symbols]\n" + "\n".join(symbol_lines)
+        # 完全一致 (シンボル名 / qualname / file path) が先頭にあるときだけ、その
+        # 1 件の呼び出し関係を [structure] として足す。「どこから呼ばれ、何を呼ぶか」
+        # は規則層が search_code を選ぶ (project_map までは降りない) ので、grep の
+        # 前にグラフ側の答えを置く。前方一致しか無いときは足さない (雑音)。
+        top = nodes[0]
+        needle = pattern.strip()
+        exact = (
+            top.name == needle or top.qualname == needle or top.path == needle
+            or top.path.endswith("/" + needle)
+        )
+        if exact:
+            blocks: list[tuple[str, str]] = []
+            try:
+                if top.node_type == "file":
+                    blocks.append(("structure", reader.neighborhood(top.path, depth=1, budget_tokens=400)))
+                else:
+                    # シンボルの近傍 (呼ぶ / 呼ばれる / 含む) と、それを定義する
+                    # ファイルの import 関係の両方を出す — 「どのモジュールに依存
+                    # しているか」は file ノードの辺にしか無い (2026-09-18 実機)。
+                    blocks.append(("structure", reader.neighborhood(top.qualname, depth=1, budget_tokens=300)))
+                    blocks.append(("file structure", reader.neighborhood(top.path, depth=1, budget_tokens=300)))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("ProjectMap neighborhood failed for %r: %s", pattern, e)
+                blocks = []
+            for label, text in blocks:
+                if text:
+                    out += f"\n\n[{label}] (<- called/imported by, -> calls/imports)\n" + text
+        return out + "\n\n[grep]\n" + grep_result
+
+    return wrapped
+
+
+def _make_project_map_tool(reader_getter: "Callable[[], ProjectMapReader | None]"):
+    """project_map ツールハンドラを生成 (ProjectMap reader をクロージャで捕捉)。
+
+    ``op`` は ``lookup`` / ``neighborhood`` / ``overview`` の 3 操作 (c_16 §4.4)。
+    文法制約分類器 (層 5.9) は **主引数 1 つ** しか埋めないので、主引数は
+    ``target`` にし、``op`` は省略時 ``auto`` = target があれば neighborhood、
+    無ければ overview と決定論で決める (2026-09-18 実機: 主引数が ``op`` だと
+    ``target`` が欠けて引数欠落ガードで降格し、モデルが「呼んでエラーだった」と
+    捏造した)。reader が ``None`` (未構築 / 無効) なら「まだ構築されていない」を返す。
+    """
+
+    def wrapped(target: str = "", op: str = "auto", depth: int = 2) -> str:
+        reader = reader_getter()
+        if reader is None:
+            return "Error: project map is not built yet"
+        target = (target or "").strip()
+        op = (op or "auto").strip().lower()
+        if op == "auto":
+            op = "neighborhood" if target else "overview"
+        try:
+            if op == "lookup":
+                if not target:
+                    return "Error: lookup requires 'target' (symbol name)"
+                nodes = reader.lookup(target)
+                if not nodes:
+                    return f"No symbols found for: {target}"
+                return "\n".join(
+                    f"{n.path}:{n.line_start}  {n.signature or n.qualname or n.name}"
+                    for n in nodes
+                )
+            if op == "neighborhood":
+                if not target:
+                    return "Error: neighborhood requires 'target' (symbol name or path)"
+                return reader.neighborhood(target, depth=int(depth))
+            if op == "overview":
+                return reader.overview()
+            return f"Error: unknown op: {op} (expected lookup, neighborhood, or overview)"
+        except Exception as e:  # noqa: BLE001 — reader 障害でチャットを止めない
+            logger.warning("ProjectMap tool failed (op=%s): %s", op, e)
+            return f"Error: project map query failed: {e}"
 
     return wrapped
 
@@ -530,13 +634,17 @@ def register_builtin_tools(
     local_client: LocalClient | None = None,
     history_manager: HistoryManager | None = None,
     aux_client: AuxClient | None = None,
+    project_map_reader_getter: "Callable[[], ProjectMapReader | None] | None" = None,
 ) -> None:
     """ビルトインツールをレジストリに一括登録
 
     ``aux_client`` は LLM 委譲ツール (summarize / translate / draft_document)
     の生成経路。``None`` (degraded) なら ``local_client`` を直接使う。
+    ``project_map_reader_getter`` は ProjectMap reader を返すコールバック
+    (未指定なら常に ``None`` = 未構築として振る舞う、c_16 §4.4)。
     """
     cfg = config or {}
+    pm_reader_getter = project_map_reader_getter or (lambda: None)
 
     registry.register(
         name="calculate",
@@ -617,11 +725,44 @@ def register_builtin_tools(
     # grep 1 回で済む質問だった。
     registry.register(
         name="search_code",
-        func=search_code,
-        description="Search code files using a regex pattern",
+        func=_make_search_code(pm_reader_getter),
+        description=(
+            "Search code files using a regex pattern. If a project code map is "
+            "available, exact symbol name matches are listed first (under "
+            "[symbols]), followed by the regex line matches (under [grep])"
+        ),
         parameters={
             "pattern": {"type": "string", "description": "Regex pattern to search for"},
             "directory": {"type": "string", "description": "Directory to search in"},
+        },
+        modes=["chat", "create"],
+    )
+
+    registry.register(
+        name="project_map",
+        func=_make_project_map_tool(pm_reader_getter),
+        description=(
+            "Query the project's code structure graph (files/classes/functions "
+            "and how they call/import/inherit each other), built by static "
+            "analysis rather than reading files. Give a symbol name or file "
+            "path as target to see what it calls and is called by; give no "
+            "target for an overview of the codebase layout. Use this for "
+            "questions about code structure, callers/callees, dependencies, "
+            "or where something is defined"
+        ),
+        parameters={
+            "target": {
+                "type": "string",
+                "description": "Symbol name or file path to inspect (omit for a codebase overview)",
+            },
+            "op": {
+                "type": "string",
+                "description": "Optional: lookup | neighborhood | overview (default auto: neighborhood with target, overview without)",
+            },
+            "depth": {
+                "type": "integer",
+                "description": "Neighborhood traversal depth (neighborhood only, default 2)",
+            },
         },
         modes=["chat", "create"],
     )

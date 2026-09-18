@@ -36,3 +36,11 @@ class RollingContext:
 
     # 既存テキスト参照モード: 追記・修正・加筆など既存ファイルを踏まえた生成
     has_existing_context: bool = False
+
+    # ProductionBrief (f_08 §2.2): ターン入口で 1 回だけ組んだ byte 不変の文脈。
+    # 全 unit のプロンプト先頭に同じ bytes を置く (接頭辞 KV の再利用)。空なら省く。
+    brief: str = ""
+
+    # テキスト用: 固定サイズの文書状態 (f_08 §3.3.1、CodeSkeleton の TEXT 版)。
+    # 型は generation.text_skeleton.TextSkeleton (循環 import 回避のため Any)。
+    text_skeleton: object | None = None

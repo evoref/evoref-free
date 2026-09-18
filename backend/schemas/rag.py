@@ -78,6 +78,45 @@ class PseudoQueryConfig(BaseModel):
     quiet_seconds: float = Field(default=60.0, ge=0.0)
 
 
+class ProjectMapUpdateConfig(BaseModel):
+    """ProjectMap の fingerprint 差分更新の分類しきい値 (c_16 §4.4)。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 構造変更ファイル数がこれを超える (またはトップレベルディレクトリ集合が
+    # 変化する) と ``architecture`` 分類になる。
+    architecture_threshold: int = Field(default=10, ge=1)
+    # 構造変更ファイル数がこれを超える (または総ファイル数の full_ratio 以上)
+    # だと ``full`` 分類になる。
+    full_threshold: int = Field(default=30, ge=1)
+    full_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
+    # 静穏窓 (秒)。5.9 (疑似クエリ) と同じ「チャットが終わってから N 秒は
+    # 始めない」判定を使う。
+    quiet_seconds: float = Field(default=120.0, ge=0.0)
+
+
+class ProjectMapConfig(BaseModel):
+    """既存プロジェクトの code グラフ (ProjectMap、c_16 §4.4)。
+
+    tree-sitter による決定論抽出で file / class / function ノードと
+    contains / imports / calls / inherits 辺を corpus の 1 パッケージとして
+    持つ。書き手は sleep-time Full の Step 5.87 のみ (応答パスは読むだけ)。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    # 走査対象 (プロジェクトルート相対)。
+    roots: list[str] = Field(default_factory=lambda: ["."])
+    # 既定の除外ディレクトリ (.git / node_modules / __pycache__ / .venv / venv /
+    # models / local / dist / build / htmlcov / coverage) への追加 glob。
+    exclude_globs: list[str] = Field(default_factory=list)
+    max_file_bytes: int = Field(default=1_000_000, ge=1)
+    neighborhood_depth: int = Field(default=2, ge=1, le=5)
+    neighborhood_budget_tokens: int = Field(default=800, ge=1)
+    update: ProjectMapUpdateConfig = Field(default_factory=ProjectMapUpdateConfig)
+
+
 class SelfRagContentGateConfig(BaseModel):
     """取得直後の chunk 内容精査ゲート設定 (heuristics-first + 境界 LLM 判定)
 
@@ -226,6 +265,8 @@ class RAGConfig(BaseModel):
     # スコアを持ち込まないので (c_16 §6.3)、重み付け融合のキーは意味を失った。
     # --- 疑似クエリ索引 (f_01 §6) ---
     pseudo_query: PseudoQueryConfig = Field(default_factory=PseudoQueryConfig)
+    # --- code グラフ (c_16 §4.4) ---
+    project_map: ProjectMapConfig = Field(default_factory=ProjectMapConfig)
 
     @model_validator(mode="before")
     @classmethod

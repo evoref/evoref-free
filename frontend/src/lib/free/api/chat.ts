@@ -82,7 +82,8 @@ export interface ChatStreamEvent {
 		| 'editor_route'
 		| 'editor_code'
 		| 'input_truncated'
-		| 'output_truncated';
+		| 'output_truncated'
+		| 'create_run';
 	token?: string;
 	token_info?: TokenInfo;
 	error?: string;
@@ -97,6 +98,9 @@ export interface ChatStreamEvent {
 	editor_code?: EditorCodeArtifact;
 	input_truncated?: InputTruncatedInfo;
 	output_truncated?: OutputTruncatedInfo;
+	/** staged クリエイトの run 識別子 (再接続用、f_05 §4.5)。run 開始直後に 1 回 */
+	run_id?: string;
+	session_id?: string;
 }
 
 /** 文書 (corpus パッケージ) の参加モード。auto = 問いと較正で決める / on = 問い側の抑止を掛けない / off = このターンは引かない */
@@ -259,6 +263,12 @@ export function toChatStreamEvent(parsed: Record<string, unknown>): ChatStreamEv
 			return { type: 'editor_route', editor_route: parsed.editor_route as { target: 'editor' | 'chat' } };
 		case 'editor_code':
 			return { type: 'editor_code', editor_code: parsed.editor_code as EditorCodeArtifact };
+		case 'create_run':
+			return {
+				type: 'create_run',
+				run_id: typeof parsed.run_id === 'string' ? parsed.run_id : undefined,
+				session_id: typeof parsed.session_id === 'string' ? parsed.session_id : undefined
+			};
 		default:
 			return null;
 	}

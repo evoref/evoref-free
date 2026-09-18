@@ -16,7 +16,6 @@
 - ``rag.py``    : RAG / Embedding / Self-RAG / Cartridge 系
 - ``memory.py`` : EvorefMem 関連 + ``VALID_FACT_TYPES``
 - ``learning.py``: 学習サイクル + ``ScheduleConfig``
-- ``loop.py``   : 自律ループ driver
 - ``paths.py``  : ``ModelPathsConfig`` / ``LocalPathsConfig``
 """
 
@@ -52,11 +51,6 @@ from backend.schemas.learning import (
     ScheduleConfig,
 )
 from backend.schemas.llm import LlamaConfig, LlamaSpeculativeConfig
-from backend.schemas.loop import (
-    LoopConfig,
-    LoopQualityGatesConfig,
-    LoopSandboxConfig,
-)
 from backend.schemas.memory import (
     VALID_FACT_TYPES,
     ConflictResolverConfig,
@@ -78,6 +72,8 @@ from backend.schemas.rag import (
     CartridgeGateConfig,
     ClusterIndexConfig,
     EmbeddingConfig,
+    ProjectMapConfig,
+    ProjectMapUpdateConfig,
     PseudoQueryConfig,
     RAGConfig,
     SelfRagConfig,
@@ -95,6 +91,8 @@ __all__ = [
     "CreateModeConfig",
     "CreateStagedConfig",
     "ConflictResolverConfig",
+    "ProjectMapConfig",
+    "ProjectMapUpdateConfig",
     "PseudoQueryConfig",
     "EditorSettingsConfig",
     "EmbeddingConfig",
@@ -113,9 +111,6 @@ __all__ = [
     "LlamaSpeculativeConfig",
     "LocalPathsConfig",
     "LongFormConfig",
-    "LoopConfig",
-    "LoopQualityGatesConfig",
-    "LoopSandboxConfig",
     "MemoryConfig",
     "ModelMigrationConfig",
     "ModelPathsConfig",

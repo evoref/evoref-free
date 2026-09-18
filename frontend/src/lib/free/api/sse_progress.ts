@@ -131,3 +131,44 @@ export async function* streamSSEFormData(
 		}
 	}
 }
+
+/** staged クリエイト run の永続イベント → 表示用ステップの写像結果 (`AgenticStep` と構造互換) */
+export interface CreateRunStep {
+	type: string;
+	detail: string;
+	status?: string;
+}
+
+/**
+ * `events.jsonl` の 1 レコード (`kind` / `payload`) を表示用ステップへ写す。
+ *
+ * `kind` / `payload` はライブストリーミングの SSE `step` フレームと同じ材料
+ * (f_10 §7 の「永続 → 配信」) なので、写像はここに 1 本だけ持つ (2 本書かない)。
+ *
+ * - `stage_progress` (payload: `{stage, detail, status, task_id}`) → `task_progress` ステップ
+ * - `finalize_*` / `cancel` / `timeout` (payload が既に `{type, detail, status}` を持つ) →
+ *   そのまま写す
+ * - それ以外 (`task_picked` / `iteration_ended` / `gate_result` / `success` / `failure` /
+ *   `design_drift` / `disconnect` 等) は表示に写せないので `null`
+ */
+export function eventToStep(kind: string, payload: Record<string, unknown>): CreateRunStep | null {
+	if (kind === 'stage_progress') {
+		const detail = typeof payload.detail === 'string' ? payload.detail : '';
+		if (!detail) return null;
+		return {
+			type: 'task_progress',
+			detail,
+			status: typeof payload.status === 'string' ? payload.status : 'running'
+		};
+	}
+	if (kind.startsWith('finalize_') || kind === 'cancel' || kind === 'timeout') {
+		const detail = typeof payload.detail === 'string' ? payload.detail : '';
+		if (!detail) return null;
+		return {
+			type: typeof payload.type === 'string' ? payload.type : kind,
+			detail,
+			status: typeof payload.status === 'string' ? payload.status : 'done'
+		};
+	}
+	return null;
+}

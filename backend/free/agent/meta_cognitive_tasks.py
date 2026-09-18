@@ -60,6 +60,10 @@ class MetaCognitiveResponse:
     # 最後に切れた生成の生トークン数 / max_tokens (``sse.output_truncated`` 用)
     truncated_tokens: int = 0
     truncated_max_tokens: int | None = None
+    # production_stage (制作ステージ、f_03 §4.4) の ``ProductionResult.metrics``。
+    # 制作ステージを経由しなかった (production_stage 無し) ターンは空 dict のまま
+    # (Level 0 経験記録の quality_signals へ chat_stream_meta が載せる)。
+    production_metrics: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

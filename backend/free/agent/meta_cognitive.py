@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 from backend.config import resolve_context_size_for_mode
@@ -11,7 +13,6 @@ from backend.free.agent.context_budget import (
     resolve_meta_cognitive_loop_budget,
 )
 from backend.free.core.session_mode import is_create_mode
-from backend.free.agent.code_artifact_generator import CodeArtifactGenerator
 from backend.free.agent.event_reminder import EventReminderSystem
 from backend.free.agent.self_cartridge import (
     AgentConstants,
@@ -87,6 +88,7 @@ if TYPE_CHECKING:
     from backend.free.agent.agent_tracer import AgentTracer
     from backend.free.agent.tool_call_judge import ToolCallJudge
     from backend.free.core.policy_interpreter import PolicyInterpreter
+    from backend.free.harness.production import ProductionHarness, ProductionResult
     from backend.free.llm.aux_client import AuxClient
     from backend.free.memory.views.loop import LoopFactView
 
@@ -195,8 +197,10 @@ class MetaCognitiveAgent(
         rag_block: str | None = None,
         file_block: str | None = None,
         fewshot_block: str | None = None,
-        code_generator: CodeArtifactGenerator | None = None,
         mode: str = "create",
+        production_stage: "ProductionHarness | None" = None,
+        brief: str = "",
+        write_impact_classifier: Callable[[list[str]], list[dict]] | None = None,
     ) -> None:
         self.max_steps = max_steps
         cfg = config or {}
@@ -217,9 +221,25 @@ class MetaCognitiveAgent(
         # user メッセージへ前置できない。ツールループ / コンテンツ生成 / fallback
         # の system に [参考例] として注入し、進化を create 生成へ効かせる。
         self._fewshot_block = fewshot_block
-        # create モードで editor/chat 出力のコード生成を LongForm 細粒度生成へ
-        # 委譲する (composition が注入)。None なら従来の単一ショット生成。
-        self._code_generator = code_generator
+        # create の制作 (staged/longform) を meta の 1 タスクとして実行する
+        # ステージ (f_03 §4.4)。None (chat モード) なら従来の単一ショット生成
+        # (``_execute_editor_task`` の単発 ``_generate_content`` フォールバック)。
+        self._production_stage = production_stage
+        # ProductionBrief (f_08 §2.2)。production_stage.run() の
+        # ProductionRequest.brief にそのまま渡す。
+        self._brief = brief
+        # 書込み後の変更分類 (f_10 §8.1)。composition 層 (chat.py) が
+        # ProjectMap reader を束ねた呼出可能オブジェクトを注入する
+        # (agent → api の import は pillar 境界で禁止のため DI で受ける)。
+        self._write_impact_classifier = write_impact_classifier
+        # production_stage の実行結果キャッシュ (1 process() 呼出しにつき最大 1 回
+        # だけ回す — 二重生成防止、§4.4「以後の write タスクは書込み済みとして畳む」)。
+        # process() 冒頭でリセットする。
+        self._production_result: "ProductionResult | None" = None
+        # production_stage が問い返した (exit_kind="blocked") 質問文。最終応答は
+        # これがあればそのまま本文にする (Phase 3b、f_03 §4.4)。process() 冒頭で
+        # リセットする。
+        self._needs_input_question: str | None = None
         # 構築時モード (内部 loop/token 予算の context_size 解決に使う)。
         # process() でも同値を再設定する (呼出側が同じ req.mode を渡す契約)。
         self._mode = mode
@@ -253,7 +273,19 @@ class MetaCognitiveAgent(
         )
         self._content_gen_idle_timeout = agent_cfg.get("content_gen_idle_timeout", 30)
         self._llm_call_timeout = agent_cfg.get("llm_call_timeout", 90)
-        self._total_timeout = agent_cfg.get("total_timeout", 1800)
+        # ターン予算は mode 別 (f_03 §4.4、Phase 3a): create は
+        # ``create.turn_timeout_sec`` (既定 3600s)、chat は ``agent.total_timeout``
+        # (既定 1800s)。以前は mode 非依存で、create の内側予算 (staged
+        # total_timeout_sec 既定 2400s) が外側 (agent.total_timeout 既定 1800s)
+        # より大きい逆転が meta 経由 (create.dispatch=meta) に残っていた。
+        self._total_timeout = (
+            float((cfg.get("create") or {}).get("turn_timeout_sec", 3600.0) or 3600.0)
+            if is_create_mode(mode)
+            else agent_cfg.get("total_timeout", 1800)
+        )
+        # process() 開始時刻 (monotonic)。production_stage の deadline_monotonic
+        # 算出に使う (§4.4: ターン締切 − 90 秒)。_process_or_fallback で設定。
+        self._turn_started_monotonic: float = 0.0
 
         # ── EvorefMem: @self 仮想カートリッジ ──
         # SemanticFactStore 直参照を廃止し LoopFactView 経由に統一
@@ -337,6 +369,7 @@ class MetaCognitiveAgent(
     ) -> MetaCognitiveResponse:
         """``_process_impl`` を総タイムアウトで保護し、失敗時は救出 / フォールバック。"""
         self._private_request = private
+        self._turn_started_monotonic = time.monotonic()
         try:
             return await asyncio.wait_for(
                 self._process_impl(
@@ -474,9 +507,14 @@ class MetaCognitiveAgent(
         # process 呼び出しごとにリセット (meta_agent はリクエスト毎に生成される)。
         self._output_target = output_target
         self._mode = mode
+        self._session_id = session_id
         self._tool_descriptions_cache = {}
         self._editor_artifacts: list[EditorArtifact] = []
         self._chat_code_parts: list[str] = []
+        # production_stage の実行結果キャッシュ (process() 呼出しごとにリセット、
+        # §4.4「以後の write タスクは書込み済みとして畳む」)。
+        self._production_result = None
+        self._needs_input_question = None
         # データ取得系ツール (fetch_url / read_file 等) の生結果をタスク横断で蓄積。
         # 表/ファイル生成タスクが取得済み実データを直接参照し、転記ハルシネーションを防ぐ。
         self._fetched_tool_outputs: list[str] = []
@@ -498,61 +536,74 @@ class MetaCognitiveAgent(
         self._constants_cache = None
         query, system_prompt, _ = self._expand_self_in_inputs(query, system_prompt)
 
-        # Step 1: タスク計画を生成
-        tasks = await self._plan(query, conversation, llm_client, on_step)
-        if not tasks:
+        # Step 0: 対象の無い create 依頼は計画の前に問い返す (f_03 §4.4)。
+        blocked = await self._precheck_production_stage(query, on_step)
+        if blocked is not None:
             tasks = [TaskItem(description=query)]
+            tasks[0].status = "done"
+            tasks[0].result = blocked.question or ""
+            context_parts: list[str] = []
+            steps = 0
+        else:
+            # Step 1: タスク計画を生成
+            tasks = await self._plan(query, conversation, llm_client, on_step)
+            if not tasks:
+                tasks = [TaskItem(description=query)]
 
-        # 同一ファイル対象のタスクをマージ
-        tasks = merge_same_file_tasks(tasks)
-        # 単一 URL → 単一ファイル保存の過分割 (fetch/extract/generate/save) を
-        # fetch+write へ集約する。抽出/保存タスクでの小型モデル拒否を防ぐ。
-        if self._output_target == "file":
-            tasks = collapse_fetch_save_tasks(tasks, query)
-            # URL 無しの文書/データ出力で「スクリプト生成 → 実行」と誤分解された
-            # プランを単一 write タスクへ正規化する (内容を直接 write_file させ、
-            # 実体の無い生成スクリプトの実行や .xlsx へのコード書込みを防ぐ)。
-            tasks = collapse_document_generation_tasks(tasks, query)
-        # editor/chat 経路 (パス未指定) は merge_same_file_tasks がすり抜けるため、
-        # 過分割された書き込みタスクを 1 件へ集約する (1 リクエスト=1 タブ)。
-        if self._output_target in ("editor", "chat"):
-            tasks = collapse_editor_write_tasks(tasks)
-        logger.info(
-            "Plan generated: %d tasks (mode=%s, output=%s)",
-            len(tasks), self._mode, self._output_target,
-        )
-
-        if on_step:
-            task_names = " / ".join(t.description[:50] for t in tasks)
-            await call_callback(on_step, {
-                "type": "plan",
-                "detail": f"{len(tasks)} タスク: {task_names}",
-                "status": "done",
-            })
-
-        # Step 2: タスクを順番に実行
-        context_parts: list[str] = []
-        steps = await self._run_tasks(
-            tasks, query, system_prompt, conversation,
-            llm_client, tools_registry, context_parts,
-            all_tool_calls, on_step, generation_params,
-            episode_id=episode_id,
-        )
-
-        # Step 2.5: 失敗した書き込みタスクを1回リトライ
-        retry_enabled = self.config.get("agent", {}).get(
-            "retry_failed_writes", True,
-        )
-        if retry_enabled:
-            steps = await self._retry_failed_writes(
-                tasks, query, system_prompt, conversation,
-                llm_client, tools_registry, context_parts,
-                all_tool_calls, steps, len(tasks), on_step,
-                generation_params=generation_params,
+            # 同一ファイル対象のタスクをマージ
+            tasks = merge_same_file_tasks(tasks)
+            # 単一 URL → 単一ファイル保存の過分割 (fetch/extract/generate/save) を
+            # fetch+write へ集約する。抽出/保存タスクでの小型モデル拒否を防ぐ。
+            if self._output_target == "file":
+                tasks = collapse_fetch_save_tasks(tasks, query)
+                # URL 無しの文書/データ出力で「スクリプト生成 → 実行」と誤分解された
+                # プランを単一 write タスクへ正規化する (内容を直接 write_file させ、
+                # 実体の無い生成スクリプトの実行や .xlsx へのコード書込みを防ぐ)。
+                tasks = collapse_document_generation_tasks(tasks, query)
+            # editor/chat 経路 (パス未指定) は merge_same_file_tasks がすり抜けるため、
+            # 過分割された書き込みタスクを 1 件へ集約する (1 リクエスト=1 タブ)。
+            if self._output_target in ("editor", "chat"):
+                tasks = collapse_editor_write_tasks(tasks)
+            logger.info(
+                "Plan generated: %d tasks (mode=%s, output=%s)",
+                len(tasks), self._mode, self._output_target,
             )
 
+            if on_step:
+                task_names = " / ".join(t.description[:50] for t in tasks)
+                await call_callback(on_step, {
+                    "type": "plan",
+                    "detail": f"{len(tasks)} タスク: {task_names}",
+                    "status": "done",
+                })
+
+            # Step 2: タスクを順番に実行
+            context_parts: list[str] = []
+            steps = await self._run_tasks(
+                tasks, query, system_prompt, conversation,
+                llm_client, tools_registry, context_parts,
+                all_tool_calls, on_step, generation_params,
+                episode_id=episode_id,
+            )
+
+            # Step 2.5: 失敗した書き込みタスクを1回リトライ
+            retry_enabled = self.config.get("agent", {}).get(
+                "retry_failed_writes", True,
+            )
+            if retry_enabled:
+                steps = await self._retry_failed_writes(
+                    tasks, query, system_prompt, conversation,
+                    llm_client, tools_registry, context_parts,
+                    all_tool_calls, steps, len(tasks), on_step,
+                    generation_params=generation_params,
+                )
+
         # Step 3: 最終応答を組み立て
-        if output_target == "chat" and self._chat_code_parts:
+        if self._needs_input_question:
+            # 制作ステージが問い返した (Phase 3b): 質問だけを本文にする。
+            # write/editor 配信は無い (self._editor_artifacts は空のまま)。
+            content = self._needs_input_question
+        elif output_target == "chat" and self._chat_code_parts:
             # チャット経路: 生成コードをコードフェンス付きで本文に返す
             content = "\n\n".join(self._chat_code_parts)
         else:
@@ -586,6 +637,10 @@ class MetaCognitiveAgent(
             episode_id=episode_id,
             step_credits=step_credits,
             editor_artifacts=self._editor_artifacts,
+            production_metrics=(
+                dict(self._production_result.metrics)
+                if self._production_result is not None else {}
+            ),
         )
 
     async def _plan(
@@ -846,13 +901,19 @@ class MetaCognitiveAgent(
                 })
 
             if (
-                self._output_target in ("editor", "chat")
+                (
+                    self._output_target in ("editor", "chat")
+                    or (self._output_target == "file" and self._production_stage is not None)
+                )
                 and task_expects_write(task.description)
             ):
-                # 出力先パス未指定: ディスク書込せずコードを生成しエディタ/チャットへ
+                # 出力先パス未指定 (editor/chat): ディスク書込せずコードを生成し
+                # エディタ/チャットへ。production_stage 設定時は file 出力も同じ
+                # 入口を通り (§4.4)、書込みは既存 write 経路で行う。
                 result, tool_calls = await self._execute_editor_task(
                     task, query, llm_client, on_step,
                     task_index=i + 1, total_tasks=total_tasks,
+                    tools_registry=tools_registry,
                 )
                 task.result = result
                 task.status = "failed" if is_tool_error(result) else "done"
@@ -911,17 +972,263 @@ class MetaCognitiveAgent(
 
         return steps
 
-    async def _delegate_code_generation(
-        self, original_query: str, on_step,
-    ) -> list[EditorArtifact]:
-        """code_generator へ委譲。失敗時は空リストでフォールバックさせる。"""
-        if self._code_generator is None:
-            return []
+    async def _precheck_production_stage(
+        self, query: str, on_step,
+    ) -> "ProductionResult | None":
+        """制作ステージの ``precheck`` (計画前の決定論の問い返し) を呼ぶ (f_03 §4.4)。
+
+        ``blocked`` なら ``create_run`` (UI が再開用に保存する) と ``needs_input``
+        の step を出し、結果をキャッシュして以後の制作 / write を畳む。
+        """
+        from backend.free.generation.content_detector import detect_content_type
+        from backend.free.harness.production import ProductionRequest
+
+        stage = self._production_stage
+        if stage is None or not is_create_mode(self._mode):
+            return None
+        # 先行する assistant 発話がある = 「さきほどの内容で仕様書を」型で会話を
+        # 指し得る。中身が空に見えても問い返さない (f_03 §4.4 改訂 2)。
+        if any(
+            (m.get("role") if isinstance(m, dict) else getattr(m, "role", None)) == "assistant"
+            for m in self._conversation
+        ):
+            return None
+        precheck = getattr(stage, "precheck", None)
+        if precheck is None:
+            return None
         try:
-            return await self._code_generator(original_query, on_step)
-        except Exception as e:
-            logger.warning("Code generation delegation failed: %s", e)
-            return []
+            content_type = (
+                "text" if detect_content_type(query, "create").value == "text" else "code"
+            )
+        except Exception:  # noqa: BLE001 - 判定失敗は code 扱い
+            content_type = "code"
+        result = await precheck(ProductionRequest(
+            instruction=query, brief=self._brief, content_type=content_type,
+            output_target=self._output_target, session_id=self._session_id,
+        ))
+        if result is None or result.exit_kind != "blocked":
+            return None
+        question = result.question or msg("create.needs_input_question")
+        if on_step:
+            run_id = str(result.notes.get("run_id") or "")
+            if run_id:
+                await call_callback(on_step, {
+                    "type": "create_run", "run_id": run_id,
+                    "session_id": self._session_id,
+                })
+            await call_callback(on_step, {
+                "type": "needs_input", "detail": question, "status": "done",
+            })
+        self._production_result = result
+        self._needs_input_question = question
+        return result
+
+    async def _run_production_stage(
+        self, original_query: str, on_step,
+    ) -> "ProductionResult":
+        """``self._production_stage`` を 1 回だけ実行し、結果をキャッシュする (f_03 §4.4)。
+
+        2 回目以降の呼出し (同一 process() 内の後続 write タスク) はキャッシュを
+        そのまま返す — 二重生成しない。
+        """
+        from backend.free.generation.content_detector import detect_content_type
+        from backend.free.generation.models import ContentType
+        from backend.free.harness.production import ProductionEvent, ProductionRequest  # noqa: F401
+
+        if self._production_result is not None:
+            return self._production_result
+
+        try:
+            content_type = (
+                "code"
+                if detect_content_type(original_query, "create") == ContentType.CODE
+                else "text"
+            )
+        except Exception:
+            content_type = "code"
+
+        # 制作ステージの締切 = ターン締切 (process() 開始 + _total_timeout) − 90 秒
+        # (f_03 §4.4)。_turn_started_monotonic は _process_or_fallback が設定する。
+        deadline_monotonic = self._turn_started_monotonic + self._total_timeout - 90.0
+        req = ProductionRequest(
+            instruction=original_query,
+            brief=self._brief,
+            content_type=content_type,
+            output_target=self._output_target,
+            session_id=self._session_id,
+            deadline_monotonic=deadline_monotonic,
+        )
+
+        async def _on_event(evt: ProductionEvent) -> None:
+            # kind="step" の payload はそのまま on_step へ (chat_stream_meta の
+            # step_queue がそのまま SSE 化する)。"run_started" は create_run
+            # フレーム (再接続用 run_id 通知、f_10 §7) へ写す。それ以外は
+            # task_progress に丸める。
+            if on_step is None:
+                return
+            if evt.kind == "step":
+                await call_callback(on_step, evt.payload)
+            elif evt.kind == "run_started":
+                payload = evt.payload or {}
+                await call_callback(on_step, {
+                    "type": "create_run",
+                    "run_id": str(payload.get("run_id", "")),
+                    "session_id": str(payload.get("session_id", "")),
+                })
+            else:
+                detail = str((evt.payload or {}).get("detail", evt.kind))
+                await call_callback(on_step, {
+                    "type": "task_progress", "detail": detail, "status": "running",
+                })
+
+        def _is_cancelled() -> bool:
+            if not self._session_id:
+                return False
+            from backend.free.api.chat.chat_stream_common import cancel_requested
+            return cancel_requested(self._session_id)
+
+        result = await self._production_stage.run(
+            req, on_event=_on_event, is_cancelled=_is_cancelled,
+        )
+        self._production_result = result
+        return result
+
+    @staticmethod
+    def _fallback_artifact_filename(art: EditorArtifact, query: str) -> str:
+        """production_stage の artifact にファイル名が無いときの決定論フォールバック。"""
+        stem = derive_editor_filename_stem(hint=query, language=art.language)
+        ext = _LANGUAGE_EXT_MAP.get(art.language, "txt")
+        return f"{stem}.{ext}"
+
+    async def _execute_production_task(
+        self,
+        task: TaskItem,
+        original_query: str,
+        on_step,
+        *,
+        task_index: int,
+        total_tasks: int,
+        tools_registry=None,
+    ) -> tuple[str, list[dict]]:
+        """production_stage 経由の制作タスク実行 (f_03 §4.4)。
+
+        1 process() 呼出しにつき production_stage.run() は最大 1 回
+        (:attr:`_production_result` にキャッシュ)。以後の write タスクは
+        「書込み済み」として畳む (二重生成しない)。``output_target=="file"``
+        は既存の write 経路 (``_resolve_write_path`` 4 段 → ``write_file``
+        ツール) で 1 ファイルずつ書く。
+        """
+        prefix = f"[{task_index}/{total_tasks}]"
+        already_ran = self._production_result is not None
+        if on_step and not already_ran:
+            await call_callback(on_step, {
+                "type": "task_progress",
+                "detail": f"{prefix} 制作ステージを起動中...",
+                "status": "running",
+            })
+        result = await self._run_production_stage(original_query, on_step)
+        if not already_ran and result.truncated_steps:
+            # 制作ステージ内で切れたまま採用された生成は、応答の開示
+            # (``sse.output_truncated``) と経験記録の ``truncated`` に刻む。
+            self._truncated_steps.extend(result.truncated_steps)
+            if result.truncated_max_tokens is not None:
+                self._truncated_max_tokens = result.truncated_max_tokens
+        if already_ran:
+            if result.exit_kind == "blocked":
+                # 問い返し済み: 以後の write タスクは新規生成せず畳む (§4.4)。
+                return "問い返し中のため実行を保留しました", []
+            return (
+                f"Already generated {len(result.artifacts)} file(s) via "
+                "production stage", [],
+            )
+
+        if result.exit_kind == "blocked":
+            # 制作ステージが対象不明で問い返した (Phase 3b、f_03 §4.4)。
+            # task は失敗にせず、質問をそのまま最終応答にする。
+            question = result.question or msg("create.needs_input_question")
+            if on_step:
+                await call_callback(on_step, {
+                    "type": "needs_input", "detail": question, "status": "done",
+                })
+            self._needs_input_question = question
+            return question, []
+
+        if result.exit_kind != "done" and not result.artifacts:
+            detail = f"production stage exit_kind={result.exit_kind}"
+            if result.question:
+                detail += f": {result.question}"
+            logger.warning(
+                "Production stage produced no artifacts (exit_kind=%s)",
+                result.exit_kind,
+            )
+            return f"Error: {detail}", []
+
+        artifacts = result.artifacts
+        if self._output_target == "chat":
+            for art in artifacts:
+                self._chat_code_parts.append(f"```{art.language}\n{art.content}\n```")
+            return f"Generated {len(artifacts)} file(s)", []
+        if self._output_target == "editor":
+            self._editor_artifacts.extend(artifacts)
+            return f"Generated {len(artifacts)} file(s)", []
+
+        # file: 既存の write 経路で 1 ファイルずつ書く (staged 固有の錨付け問題を
+        # 構造的に消す、f_03 §4.4)。
+        if tools_registry is None:
+            logger.warning("Production stage: file output but tools_registry is None")
+            return "Error: tools_registry unavailable for production stage write", []
+        tool_calls: list[dict] = []
+        written = 0
+        written_paths: list[str] = []
+        for art in artifacts:
+            filename = art.filename or self._fallback_artifact_filename(
+                art, original_query,
+            )
+            file_path = self._resolve_write_path(
+                filename, original_query, task.description,
+            )
+            _text, entries = await self._write_file(
+                file_path, art.content, tools_registry, on_step, prefix,
+            )
+            tool_calls.extend(entries)
+            if entries and entries[-1].get("success"):
+                written += 1
+                written_paths.append(file_path)
+        if written == 0:
+            return "Error: production stage artifacts failed to write", tool_calls
+        self._record_write_impact(written_paths, result)
+        return f"Wrote {written} file(s) via production stage", tool_calls
+
+    def _record_write_impact(
+        self, written_paths: list[str], result: "ProductionResult",
+    ) -> None:
+        """書込み後の変更分類 (f_10 §8.1) を events.jsonl へ積む (best-effort)。
+
+        ``self._write_impact_classifier`` (composition 層が注入、ProjectMap
+        未配線なら None) と ``result.notes["workspace_root"]`` (run_staged_pipeline /
+        LongFormHarness が積む、f_10 §7) の両方が揃ったときだけ動く。map 自体は
+        更新しない (書き手は sleep-time Step 5.87 の 1 本のまま、ここは観測専用)。
+        """
+        if not written_paths or self._write_impact_classifier is None:
+            return
+        workspace_root = result.notes.get("workspace_root")
+        if not workspace_root:
+            return
+        try:
+            impacts = self._write_impact_classifier(written_paths)
+        except Exception as exc:  # noqa: BLE001 - 観測の失敗で書込み成功は覆さない
+            logger.warning("Production stage: write_impact classification failed: %s", exc)
+            return
+        if not impacts:
+            return
+        try:
+            from backend.free.loop.staged.run_record import RunEventLog
+
+            event_log = RunEventLog(Path(workspace_root))
+            for payload in impacts:
+                event_log.append("write_impact", payload)
+        except Exception as exc:  # noqa: BLE001 - 記録の失敗で書込み成功は覆さない
+            logger.warning("Production stage: write_impact event log append failed: %s", exc)
 
     async def _execute_editor_task(
         self,
@@ -932,13 +1239,28 @@ class MetaCognitiveAgent(
         *,
         task_index: int,
         total_tasks: int,
+        tools_registry=None,
     ) -> tuple[str, list[dict]]:
         """出力先パス未指定時のタスク実行: ディスク書込せずコードを生成する。
 
         ``output_target == "editor"`` なら ``editor_artifacts`` に蓄積し、
         ``"chat"`` ならコードフェンス付きで ``_chat_code_parts`` に蓄積する。
         ``write_file`` は一切呼ばない。戻り値の tool_calls は常に空。
+
+        ``self._production_stage`` が設定されているとき (create モードは常に
+        設定済み、f_03 §4.4) は :meth:`_execute_production_task` へ全面委譲する
+        — ``output_target=="file"`` でもこの入口を通り (呼出元 ``_run_tasks``
+        参照)、既存の write 経路 (``tools_registry`` 経由) でディスクへ書く。
+        ``production_stage`` 無し (chat モード) のときは従来の単一ショット
+        生成 (:meth:`_generate_content`) にそのまま落ちる — 3a-2 で撤去した
+        legacy の code_generator 委譲の代わりはこれになる。
         """
+        if self._production_stage is not None:
+            return await self._execute_production_task(
+                task, original_query, on_step,
+                task_index=task_index, total_tasks=total_tasks,
+                tools_registry=tools_registry,
+            )
         prefix = f"[{task_index}/{total_tasks}]"
         if on_step:
             await call_callback(on_step, {
@@ -946,19 +1268,6 @@ class MetaCognitiveAgent(
                 "detail": f"{prefix} コンテンツ生成中...",
                 "status": "running",
             })
-        # create モード: LongForm 細粒度生成へ委譲 (複数ファイル可)。空リスト
-        # (テキスト判定 / degraded / 失敗) なら従来の単一ショット生成へフォールバック。
-        if is_create_mode(self._mode):
-            artifacts = await self._delegate_code_generation(original_query, on_step)
-            if artifacts:
-                if self._output_target == "chat":
-                    for art in artifacts:
-                        self._chat_code_parts.append(
-                            f"```{art.language}\n{art.content}\n```"
-                        )
-                else:
-                    self._editor_artifacts.extend(artifacts)
-                return f"Generated {len(artifacts)} file(s)", []
         content = await self._generate_content(
             original_query, task.description, llm_client,
         )
@@ -1286,6 +1595,10 @@ class MetaCognitiveAgent(
             content=content,
             editor_artifacts=artifacts,
             steps=0,
+            production_metrics=(
+                dict(self._production_result.metrics)
+                if self._production_result is not None else {}
+            ),
         )
 
     async def _fallback_plain_llm(

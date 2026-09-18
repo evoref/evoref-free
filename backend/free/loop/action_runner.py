@@ -408,37 +408,10 @@ def _tail(text: str | None) -> str:
     return "...<truncated>...\n" + text[-OUTPUT_TAIL_BYTES:]
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# 設定ビルダ
-# ──────────────────────────────────────────────────────────────────────────
-
-
-def build_action_runner_config(
-    raw_cfg: dict[str, object] | None,
-) -> ActionRunnerConfig:
-    """``config.yaml`` の ``loop.sandbox`` dict から ``ActionRunnerConfig`` を作る。
-
-    ``LoopSandboxConfig`` から生成される dict を想定。"""
-    cfg = raw_cfg or {}
-    roots = cfg.get("allowed_write_roots") or ["local/loop_sandbox"]
-    cmds = cfg.get("allowed_commands") or []
-    timeout = cfg.get("command_timeout_sec") or 120.0
-    if not isinstance(roots, list) or not all(isinstance(r, str) for r in roots):
-        raise ActionRunnerError("loop.sandbox.allowed_write_roots must be list[str]")
-    if not isinstance(cmds, list) or not all(isinstance(c, str) for c in cmds):
-        raise ActionRunnerError("loop.sandbox.allowed_commands must be list[str]")
-    return ActionRunnerConfig(
-        allowed_write_roots=tuple(Path(r) for r in roots),
-        allowed_commands=tuple(cmds),
-        command_timeout_sec=float(timeout),
-    )
-
-
 __all__ = [
     "ActionRunner",
     "ActionRunnerConfig",
     "ActionRunnerError",
-    "build_action_runner_config",
 ]
 
 # mypy / type: ignore 要請用 (未使用 Literal を警告させないため)

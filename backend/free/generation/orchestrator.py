@@ -45,6 +45,8 @@ from backend.free.generation.rolling_context import RollingContext
 from backend.free.generation.strategy_cogwriter import CogWriterStrategy, ReviewIssue
 from backend.free.generation.strategy_common import resolve_generation_order
 from backend.free.generation.strategy_recurrent import RecurrentStrategy
+from backend.free.generation.text_fabrication import find_unit_issues
+from backend.free.generation.text_skeleton import TextSkeleton
 from backend.free.generation.token_budget import TokenBudget, truncate_tail
 from backend.free.generation.validators import (
     ValidationError,
@@ -69,6 +71,39 @@ logger = logging.getLogger("backend.free.generation.orchestrator")
 RAG_MAX_CHUNKS = 3
 RAG_CHUNK_CHAR_CAP = 300
 RAG_TOTAL_TOKEN_BUDGET = 256
+
+#: 計画の ``global_context`` にこの印があれば創作文書とみなす (c_17 §3.7)。
+#: 創作文書では ``text_unit_fabrication`` の捏造候補判定を見送る (矛盾は見送らない)。
+_FICTION_RE = re.compile(r"物語|小説|フィクション|創作|story|fiction|novel", re.IGNORECASE)
+
+
+def _is_fiction_plan(plan: Any) -> bool:
+    """計画が創作文書 (物語・小説等) かを判定する (純粋関数)。"""
+    return bool(_FICTION_RE.search(getattr(plan, "global_context", "") or ""))
+
+
+#: 見出し行 (``# ...`` 〜 ``###### ...``) を拾う正規表現。outline_drift の
+#: missing/extra 判定に使う (f_08 §2.3)。
+_HEADING_LINE_RE = re.compile(r"^#{1,6}\s+(.+)$", re.MULTILINE)
+
+
+def _document_gate_summary(
+    plan_headings: list[str], units: list[str], issues: list[ReviewIssue],
+) -> dict[str, Any]:
+    """``evaluate_document`` の結果から outline_drift 事象の payload を組む。
+
+    計画上の見出し (``plan_headings``) と生成済み本文中の見出し行を突き合わせ、
+    欠落 (``missing``) / 過剰 (``extra``) を決定論で数える (LLM 不使用)。
+    """
+    found = {
+        m.group(1).strip()
+        for text in units
+        for m in _HEADING_LINE_RE.finditer(text or "")
+    }
+    planned = {h.strip() for h in plan_headings if h and h.strip()}
+    missing = [h for h in plan_headings if h.strip() and h.strip() not in found]
+    extra = sorted(found - planned)
+    return {"missing": missing, "extra": extra, "issues": len(issues)}
 
 
 def _lexical_overlap(query: str, text: str) -> float:
@@ -259,9 +294,10 @@ class LongFormOrchestrator:
         self.last_code_files: dict[str, str] = {}
         # 直近生成の検証で残った error 行。CODE は post-repair の AST 検証
         # (severity=error のみ)、TEXT は品質ゲート (_validate_generated_text)。
-        # CODE では配信側 (make_code_artifact_generator) が「壊れたコードを成功
-        # として渡さない」ためユーザーへ提示する (TEXT は artifact を持たないので
-        # 当該経路には乗らず、chat_streaming の警告ステップ側で surface される)。
+        # CODE では配信側 (production_stage 経由の LongFormHarness / meta の
+        # 単一ショット生成) が「壊れたコードを成功として渡さない」ため
+        # ユーザーへ提示する (TEXT は artifact を持たないので当該経路には乗らず、
+        # chat_streaming の警告ステップ側で surface される)。
         self.last_validation_errors: list[str] = []
         # 直近 generate() の TEXT 確定本文 (document_quality_enabled 時のみ、改稿済み
         # generated_units から組む)。chat_streaming の finalize が file/editor 出力に
@@ -270,6 +306,10 @@ class LongFormOrchestrator:
         self.last_text_output: str | None = None
         # 直近 generate() の出力先拡張子 (document_quality ゲートの形式判定に使う)。
         self._target_format: str = ""
+        # 直近 document_gate (evaluate_document) の決定論サマリ (Phase 4、f_08 §2.3)。
+        # ``LongFormHarness`` が ``outline_drift`` 事象として events.jsonl へ積む。
+        # document_quality_enabled=false / 非 TEXT では None のまま。
+        self.last_document_gate: dict[str, Any] | None = None
         # 直近 generate() が主題不明で確認質問を返した (ユニット生成を行わなかった)
         # かどうか。chat_streaming の finalize はこの場合 write_file を呼ばない
         # (確認質問をファイルへ書き込んでしまうことを防ぐ)。
@@ -278,6 +318,9 @@ class LongFormOrchestrator:
         # 残数。TEXT の品質判定 (_validate_generated_text) が参照する。
         self._last_review_issue_count: int = 0
         self._last_unaddressed_issue_count: int = 0
+        # text_unit_fabrication (c_17 §3.7) が計上した捏造候補 (棄権のみ、
+        # error にはしない)。_validate_generated_text の warning に載る。
+        self._fabrication_warnings: list[str] = []
 
         # Recurrent も計画 / 要約再帰を補助タスクで実行する
         # ため ``aux_client`` を渡す。``None`` の場合は Recurrent 内部で
@@ -391,17 +434,27 @@ class LongFormOrchestrator:
         budget: TokenBudget,
         content_type: ContentType,
         existing_content: str,
+        brief: str = "",
     ) -> RollingContext:
         """RollingContext を構築し、追記モード時は既存テキスト末尾を short_term に設定する。"""
-        rolling = RollingContext(plan=plan, budget=budget)
+        rolling = RollingContext(plan=plan, budget=budget, brief=brief or "")
         if content_type == ContentType.CODE:
             rolling.skeleton = CodeSkeleton([], [], [], [], [])
+        elif content_type == ContentType.TEXT:
+            rolling.text_skeleton = TextSkeleton.from_plan(plan)
         if existing_content and content_type == ContentType.TEXT:
             rolling.short_term = self._fit_short_term(
                 truncate_tail(existing_content, rolling.budget.short_term),
             )
             rolling.has_existing_context = True
         return rolling
+
+    @staticmethod
+    def _ensure_text_skeleton(rolling: RollingContext) -> TextSkeleton:
+        """``rolling.text_skeleton`` が無ければ ``from_plan`` で用意する (防御的)。"""
+        if not isinstance(rolling.text_skeleton, TextSkeleton):
+            rolling.text_skeleton = TextSkeleton.from_plan(rolling.plan)
+        return rolling.text_skeleton
 
     @staticmethod
     def _emit_plan_step(on_step, plan: Any, content_type: ContentType) -> None:
@@ -436,6 +489,16 @@ class LongFormOrchestrator:
         """
         self._last_review_issue_count = 0
         self._last_unaddressed_issue_count = 0
+
+        # text_unit_fabrication (c_17 §3.7) の計上は、チャット表示応答 (この後
+        # early return する経路) でも log_decision だけは走らせる — 判定点の
+        # 観測を出力先の有無に依存させない。
+        fabrication_issues: list[ReviewIssue] = []
+        if content_type == ContentType.TEXT:
+            fabrication_issues, self._fabrication_warnings = (
+                self._collect_fabrication_issues(rolling)
+            )
+
         if not isinstance(self.strategy, CogWriterStrategy):
             return
         # チャット表示応答 (ファイル/エディタ出力でない TEXT) は、ストリームした
@@ -474,6 +537,9 @@ class LongFormOrchestrator:
             gate_issues = evaluate_document(
                 rolling.generated_units, plan_headings, self._target_format,
             )
+            self.last_document_gate = _document_gate_summary(
+                plan_headings, rolling.generated_units, gate_issues,
+            )
             if on_step:
                 _call_step(on_step, {
                     "type": "long_form_document_gate",
@@ -481,6 +547,10 @@ class LongFormOrchestrator:
                     "status": "done",
                 })
             revisions = gate_issues + revisions
+
+        # 決定論の矛盾指摘 (text_unit_fabrication) を document_gate と同じ位置
+        # (先頭) へ合成する (f_08 §3.4)。
+        revisions = fabrication_issues + revisions
 
         # 検出数と「予算内で改稿しきれなかった残数」を記録する。残issueは出力に
         # 残ったままなので、TEXT の成否判定 (_validate_generated_text) が error として
@@ -491,6 +561,54 @@ class LongFormOrchestrator:
         for rev in revisions[:max_revisions]:
             async for token in self.strategy.revise_unit(rev, rolling, content_type):
                 yield token
+
+    @staticmethod
+    def _known_text_for_fabrication(rolling: RollingContext) -> str:
+        """``text_unit_fabrication`` の ``known`` に使う参照テキストを組む。
+
+        brief + 計画 (global_context / title / 全 unit の key_points) +
+        unit_rag を連結する (c_17 §3.7: 「brief + 計画 + skeleton + unit_rag の
+        逐語集合」)。skeleton 側は :meth:`~backend.free.generation.text_skeleton.
+        TextSkeleton.known_values` が別途供給するため、ここでは含めない。
+        """
+        plan = rolling.plan
+        parts = [
+            rolling.brief,
+            getattr(plan, "global_context", "") or "",
+            getattr(plan, "title", "") or "",
+        ]
+        for u in getattr(plan, "units", None) or []:
+            if isinstance(u, SectionPlan):
+                parts.extend(u.key_points)
+        parts.append(rolling.unit_rag)
+        return "\n".join(p for p in parts if p)
+
+    def _collect_fabrication_issues(
+        self, rolling: RollingContext,
+    ) -> tuple[list[ReviewIssue], list[str]]:
+        """全 ``generated_units`` を ``text_unit_fabrication`` へ通す。
+
+        skeleton は生成ループ中に逐次更新済み (unit ごとの値は skeleton に
+        永続する = pinned_values は最初の値を保持し続ける) なので、確定後に
+        まとめて再走査しても各 unit が「自分より前の unit の値」と矛盾するかを
+        正しく判定できる。
+        """
+        skeleton = (
+            rolling.text_skeleton
+            if isinstance(rolling.text_skeleton, TextSkeleton) else None
+        )
+        is_fiction = _is_fiction_plan(rolling.plan)
+        known_text = self._known_text_for_fabrication(rolling)
+        issues: list[ReviewIssue] = []
+        warnings: list[str] = []
+        for idx, unit_text in enumerate(rolling.generated_units):
+            unit_issues, fabricated = find_unit_issues(
+                idx, unit_text,
+                skeleton=skeleton, known_text=known_text, is_fiction=is_fiction,
+            )
+            issues.extend(unit_issues)
+            warnings.extend(fabricated)
+        return issues, warnings
 
     async def _repair_generated_code(
         self,
@@ -720,6 +838,15 @@ class LongFormOrchestrator:
                 f"(>={_NEAR_DUP_SIMILARITY:.2f} similarity)",
             )
 
+        # text_unit_fabrication (c_17 §3.7) の捏造候補は棄権のみで計上する
+        # (error にはしない — 初版では検出器の分布をまず見る、f_08 §3.4)。
+        if self._fabrication_warnings:
+            preview = ", ".join(self._fabrication_warnings[:5])
+            warnings.append(
+                f"fabricated value candidates: {len(self._fabrication_warnings)}"
+                f" ({preview})",
+            )
+
         self.last_validation_errors = list(errors)
         if on_step:
             _call_step(on_step, {
@@ -864,6 +991,7 @@ class LongFormOrchestrator:
         file_context_block: str | None = None,
         content_type_override: "ContentType | None" = None,
         target_format: str | None = None,
+        brief: str | None = None,
     ) -> AsyncIterator[str]:
         """長文生成のエントリポイント。トークンを yield する。
 
@@ -888,6 +1016,9 @@ class LongFormOrchestrator:
             target_format: 出力先拡張子 (``.docx`` / ``.pptx`` / ``.xlsx`` 等)。
                 ``document_quality_enabled`` の決定論ドキュメント品質ゲートが対象
                 形式を判定するために使う。未指定/非ドキュメント形式ではゲート非適用。
+            brief: ProductionBrief (f_08 §2.2)。ターン入口で 1 回だけ組んだ
+                byte 不変のテキストブロック。指定時は全 unit プロンプトの
+                user 先頭 (plan プロンプトの先頭) に同じ bytes を置く。
 
         Yields:
             生成トークン文字列
@@ -903,6 +1034,7 @@ class LongFormOrchestrator:
         # 前回 generate() の確定本文が残ると finalize が古い本文を配信し得るため、
         # リクエスト冒頭で None に戻す (現状は per-request インスタンスだが防御的に)。
         self.last_text_output = None
+        self.last_document_gate = None
 
         # 1. コンテンツ種別判定 (override 指定時は検出をスキップ)
         content_type = content_type_override or detect_content_type(instruction, mode)
@@ -919,6 +1051,9 @@ class LongFormOrchestrator:
             file_context_block=file_context_block,
             mode=mode,
         )
+        # ProductionBrief (f_08 §2.2)。空なら plan プロンプト / unit プロンプトの
+        # どちらにも何も足さない (下流は空文字を素通しする)。
+        context["brief"] = brief or ""
         if existing_content:
             context["existing_content"] = existing_content
         # 出力モード (EXPAND / SPLIT 等) は strategy.create_plan() に
@@ -950,7 +1085,7 @@ class LongFormOrchestrator:
 
         # 6. ローリングコンテキスト初期化
         rolling = self._init_rolling_context(
-            plan, budget, content_type, existing_content,
+            plan, budget, content_type, existing_content, brief=brief or "",
         )
 
         total_tokens = 0
@@ -1070,6 +1205,10 @@ class LongFormOrchestrator:
             # 見出し込みで比較すると、見出しだけ違う同一本文が重複と見なされず
             # 退化ガードをすり抜ける。
             rolling.generated_units.append(heading_md + text if heading_md else text)
+            if content_type == ContentType.TEXT:
+                skeleton = self._ensure_text_skeleton(rolling)
+                heading_for_skeleton = unit.heading if isinstance(unit, SectionPlan) else ""
+                skeleton.update(i, heading_for_skeleton, text)
             await self._update_rolling_context(rolling, text, content_type)
             unit_tokens = estimate_tokens(text)
             total_tokens += unit_tokens
@@ -1333,6 +1472,9 @@ class LongFormOrchestrator:
                         "types_count": len(rolling.skeleton.type_definitions),
                     })
         else:
+            # テキスト: TextSkeleton (f_08 §3.3.1) が無ければ用意する (防御的。
+            # 通常は _init_rolling_context / 呼出元ループで既に用意済み)。
+            self._ensure_text_skeleton(rolling)
             # テキスト: 要約更新
             if isinstance(self.strategy, RecurrentStrategy):
                 # Recurrent: LLMで要約更新

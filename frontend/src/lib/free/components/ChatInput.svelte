@@ -28,6 +28,7 @@
 	import { chatStream, cancelChat } from '$lib/free/api';
 	import { get } from 'svelte/store';
 	import { themeSlots } from '$lib/free/stores/theme';
+	import { setActiveCreateRun, clearActiveCreateRun } from '$lib/free/stores/createRun';
 	import { addToast } from '$lib/free/stores/toast';
 	import FileUpload from './FileUpload.svelte';
 	import FilePreview from './FilePreview.svelte';
@@ -42,6 +43,8 @@
 	let sawPartialEditor = false;
 	/** このターンでエディタへコードを出力したか (editor_code 受信)。完了通知の発火条件 */
 	let sawEditorCode = false;
+	/** このターンで needs_input を受信したか (再接続用 run 記録を残すかの判定) */
+	let sawNeedsInput = false;
 
 	/** long_form ユニットステップの detail ("[3/9] GameGrid: 803 tokens") を進捗に分解する */
 	function parseLongFormProgress(detail: string, done: boolean) {
@@ -83,6 +86,7 @@
 		clearStreamingEditorCode();
 		sawPartialEditor = false;
 		sawEditorCode = false;
+		sawNeedsInput = false;
 		isStreaming.set(true);
 		cancelled = false;
 		abortController = new AbortController();
@@ -109,9 +113,21 @@
 					activeRequestId = event.request_id;
 				} else if (event.type === 'token_info' && event.token_info) {
 					tokenInfo.set(event.token_info);
+				} else if (event.type === 'create_run' && event.run_id && event.session_id) {
+					// staged クリエイトの run 識別子。localStorage へ永続し、リロード後の
+					// 再接続 (createReattach.ts) の手掛かりにする (f_05 §4.5)。
+					setActiveCreateRun({
+						session_id: event.session_id,
+						run_id: event.run_id,
+						started_at: new Date().toISOString()
+					});
 				} else if (event.type === 'step' && event.step) {
 					if (import.meta.env.DEV) {
 						console.debug('[Chat Step]', event.step.type, event.step.status, event.step.detail?.slice(0, 120));
+					}
+					if (event.step.type === 'needs_input') {
+						// blocked のまま次ターンで再開するので、run 記録はここでは消さない。
+						sawNeedsInput = true;
 					}
 					if (event.step.type === 'task_result') {
 						// Meta-Cognitive 最終タスク結果 → 結果ボックスのみ
@@ -190,6 +206,11 @@
 			isStreaming.set(false);
 			abortController = null;
 			activeRequestId = undefined;
+			// ターンが終端 (完了 / キャンセル) に達したら再接続用の run 記録を消す。
+			// needs_input で止まった run は次ターンで再開するため残す。
+			if (mode === 'create' && !sawNeedsInput) {
+				clearActiveCreateRun();
+			}
 		}
 	}
 

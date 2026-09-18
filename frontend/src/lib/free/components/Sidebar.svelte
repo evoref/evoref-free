@@ -55,10 +55,10 @@
 				</div>
 				<a href="/history" class="nav-item" class:active={isActive('/history')}>{$t('sidebar.history')}</a>
 				<a href="/cartridge" class="nav-item" class:active={isActive('/cartridge')}>{$t('sidebar.cartridges')}</a>
-				<a href="/themes" class="nav-item" class:active={isActive('/themes')}>{$t('sidebar.themes')}</a>
 				{#if isPro}
-					<a href="/loop" class="nav-item" class:active={isActive('/loop')}>{$t('sidebar.loop')}</a>
+					<a href="/knowledge" class="nav-item" class:active={isActive('/knowledge')}>{$t('sidebar.knowledge_sources')}</a>
 				{/if}
+				<a href="/themes" class="nav-item" class:active={isActive('/themes')}>{$t('sidebar.themes')}</a>
 				<a href="/dashboard" class="nav-item" class:active={isActive('/dashboard')}>{$t('sidebar.dashboard')}</a>
 				<a href="/learning" class="nav-item" class:active={isActive('/learning')}>{$t('sidebar.fewshot')}</a>
 				<a href="/settings" class="nav-item" class:active={isActive('/settings')}>{$t('sidebar.settings')}</a>

@@ -35,6 +35,7 @@ from backend.free.generation.models import (
     extract_target_chars,
 )
 from backend.free.generation.spec_renderer import render_spec_for_prompt
+from backend.free.generation.text_skeleton import TextSkeleton
 from backend.free.llm.json_schemas import CodePlan, TextPlan
 from backend.i18n_helper import prose_language_name
 
@@ -78,6 +79,25 @@ CODE_UNIT_USER = """\
 
 コードのみ出力してください:"""
 
+#: 利用者が示していない実務上の固有値を本文・計画で補わせない規則 (本文と計画で共有)。
+#:
+#: 「生成すべき具体的な内容を書く」「短すぎる出力は不可」という圧だけがあると、
+#: 案内文のような実務文書でモデルは日時・会場・接続先を **それらしく埋める**。
+#: 2026-09-17 監査: 「新人向けセキュリティ研修の案内文」に「来月10日（水）」
+#: (実在しない曜日)・「本社5階の第3会議室」・Zoom が書かれた。チャット経路の
+#: system には同じ禁止があるが、長文のユニット生成は別の system を使うため
+#: 届いていなかった。物語などの創作の中の出来事は対象外。
+UNSPECIFIED_FACTS_RULE = (
+    "ユーザー指示・参考情報に無い実務上の固有値（日時・曜日・場所・連絡先・URL・"
+    "金額・担当者名など）は創作しないでください。案内・通知・招待・メール等の"
+    "実務文書でそれらが必要な箇所は「〇月〇日（〇）」「【会場】」のような空欄で"
+    "示してください。物語などの創作文書の中の出来事はこの限りではありません。"
+)
+
+#: unit 依存 (unit_target_chars / 継続指示) を含まない system テンプレート。
+#: system は run 中 byte 固定でなければならない (接頭辞 KV の再利用、f_08 §2.2 /
+#: §8 禁則 10) — unit ごとに変わる文言は :func:`build_text_unit_messages` が
+#: user 側 (:data:`_UNIT_LENGTH_INSTRUCTION_HEADER` 経由) に置く。
 TEXT_UNIT_SYSTEM = """\
 以下の計画に従い、指定セクションの本文を生成してください。
 - 見出し行（# や ## など）は出力しないでください。本文のみを出力してください。
@@ -86,8 +106,7 @@ TEXT_UNIT_SYSTEM = """\
 執筆意図・方針・プロセスの説明などメタ的な記述は一切含めないでください。
 - 特に指定が無い限り、本文は{output_language}で書いてください\
 （見出し・要点が別言語ならその言語に合わせる）。
-- このセクションの目標文字数は約{unit_target_chars}文字です。必ずこの文字数に近い量を生成してください。\
-短すぎる出力は不可です。
+- """ + UNSPECIFIED_FACTS_RULE + """
 {global_context}"""
 
 TEXT_UNIT_CONTINUATION_SYSTEM = """\
@@ -98,8 +117,7 @@ TEXT_UNIT_CONTINUATION_SYSTEM = """\
 - 見出し行（# や ## など）は出力しないでください。
 - 文章は自然な段落で区切り、1文ごとに改行を入れないでください。
 - 「直前テキスト末尾」から自然に繋がるように書いてください。
-- このセクションの目標文字数は約{unit_target_chars}文字です。必ずこの文字数に近い量を生成してください。\
-短すぎる出力は不可です。
+- """ + UNSPECIFIED_FACTS_RULE + """
 {global_context}"""
 
 
@@ -113,13 +131,21 @@ TEXT_UNIT_CONTINUATION_SYSTEM = """\
 # 妥当な最大単一セクション規模を大きく超えた値なので安全に切り詰める。
 _ESTIMATED_TOKENS_MAX = 20_000
 
-#: 分割された続きユニット (``SectionPlan.sub_index > 0``) の system プロンプトへ
+#: 分割された続きユニット (``SectionPlan.sub_index > 0``) の user プロンプトへ
 #: 追記する継続指示。以前は key_points 側に入れていたため「本文に含めるべき要点」
-#: として扱われ、冒頭宣言文の再掲を促していた (2026-07-25)。
+#: として扱われ、冒頭宣言文の再掲を促していた (2026-07-25)。system は run 中
+#: byte 固定でなければならないため、以前 system に足していたこの注記も
+#: unit_target_chars と同じ理由で user 側へ移した (2026-09-18、f_08 §2.2)。
 _CONTINUATION_SYSTEM_NOTE = (
     "これは直前セクションの続きです。見出し・件名・宛名・挨拶などの"
     "冒頭部分は既に書かれているので繰り返さず、直前の文章の続きだけを書いてください。"
     "既に書いた文の再掲も禁止です。"
+)
+
+#: 両テンプレート (``_TEXT_UNIT_USER`` / recurrent 側の同名定数) が末尾に持つ
+#: 共通の最終指示。unit 依存の分量・継続指示をこの直前へ挿入する目印にする。
+_FINAL_INSTRUCTION_MARKER = (
+    "本文のみを出力してください（見出し行・メタ解説・執筆意図の説明は不要）:"
 )
 
 
@@ -407,7 +433,11 @@ def build_code_unit_messages(
             f"{system_text}\n\n# モジュール構成図 (Mermaid)\n"
             f"```mermaid\n{plan.code_flowchart}\n```"
         )
-    system = budget.fit_content("system_prompt", system_text)
+    # CODE の system (CODE_UNIT_SYSTEM + spec 契約 + 構成図) は予算外
+    # (f_08 §3.3.1、2026-09-18)。system は run 中 byte 不変で接頭辞 KV に
+    # 乗るため窓を圧迫しない。以前は system_prompt スロットで head 切りし
+    # 「BINDING CONTRACT」宣言を欠落させていた。
+    system = system_text
     user = CODE_UNIT_USER.format(
         file_path=unit.file_path,
         unit_names=unit_names,
@@ -420,6 +450,10 @@ def build_code_unit_messages(
         depends_on=", ".join(unit.depends_on) or "(なし)",
         rag_context=budget.fit_content("rag_chunks", rolling.unit_rag) or "(なし)",
     )
+    # ProductionBrief (f_08 §2.2): user の先頭に置く (system は brief を含まず
+    # run 中 byte 固定のまま)。
+    if rolling.brief:
+        user = f"{rolling.brief}\n\n{user}"
 
     return [
         {"role": "system", "content": system},
@@ -711,17 +745,13 @@ def build_text_unit_messages(
         if rolling.has_existing_context
         else TEXT_UNIT_SYSTEM
     )
+    # unit_target_chars / 継続指示は unit ごとに値が変わるため system には含め
+    # ない (system は run 中 byte 固定 — f_08 §2.2 / §8 禁則 10)。user 側
+    # (_FINAL_INSTRUCTION_MARKER の直前) へ置く。
     system_text = system_template.format(
         global_context=plan.global_context,
-        unit_target_chars=unit_target_chars,
         output_language=prose_language_name(),
     )
-    # 分割で生まれた続きユニットには再掲禁止を **system 側** で与える。
-    # key_points (=「本文に含めるべき要点」) に混ぜると制約が本文の一部として
-    # 提示され、見出し・冒頭の宣言文ごと再生成される (2026-07-25 実測: 同一文が
-    # 34 回反復し「件名：」が 4 回出るメールになった)。
-    if getattr(unit, "sub_index", 0):
-        system_text += "\n" + _CONTINUATION_SYSTEM_NOTE
     system = budget.fit_content(
         # output_language は新規生成テンプレートのみが持つ (継続テンプレートは
         # 既存テキストの言語追従が正のため指示しない。余剰 kwarg は無害)
@@ -749,6 +779,40 @@ def build_text_unit_messages(
             "# 直前セクション末尾",
             "# 直前テキスト末尾（この直後に自然に続く文章を書いてください）",
         )
+
+    # 分量指示 (unit ごとに変わる) + 分割続きユニットの再掲禁止。以前は
+    # system 側に足していたため unit ごとに system の bytes が変わり、接頭辞
+    # KV キャッシュが unit 毎に 0 になっていた (2026-09-18 監査、f_08 §2.2)。
+    unit_instructions = (
+        f"このセクションの目標文字数は約{unit_target_chars}文字です。"
+        "必ずこの文字数に近い量を生成してください。短すぎる出力は不可です。"
+    )
+    if getattr(unit, "sub_index", 0):
+        unit_instructions += "\n" + _CONTINUATION_SYSTEM_NOTE
+    if _FINAL_INSTRUCTION_MARKER in user:
+        user = user.replace(
+            _FINAL_INSTRUCTION_MARKER,
+            f"# 分量・継続の指示\n{unit_instructions}\n\n{_FINAL_INSTRUCTION_MARKER}",
+        )
+    elif user:
+        user = f"{user}\n\n# 分量・継続の指示\n{unit_instructions}"
+    else:
+        user = unit_instructions
+
+    # ProductionBrief (brief) + TextSkeleton (状態) を user の先頭へ置く
+    # (f_08 §2.2 の配置順: brief → 状態 → 窓 → 参考資料 → 指示)。
+    prefix_parts: list[str] = []
+    if rolling.brief:
+        prefix_parts.append(rolling.brief)
+    skeleton = rolling.text_skeleton
+    if isinstance(skeleton, TextSkeleton):
+        skeleton_text = budget.fit_content(
+            "skeleton_or_summary", skeleton.to_prompt(budget.skeleton_or_summary),
+        )
+        if skeleton_text:
+            prefix_parts.append(f"# 文書の状態\n{skeleton_text}")
+    if prefix_parts:
+        user = "\n\n".join([*prefix_parts, user])
 
     return [
         {"role": "system", "content": system},

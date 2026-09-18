@@ -14,7 +14,7 @@ from backend.free.cli.renderer import render_error
 logger = get_logger("cli.command_parser")
 
 # 非同期コマンド（handle_command ではなく handle_async_command で処理）
-ASYNC_COMMANDS = {"/history", "/learn", "/page", "/status", "/cartridge", "/migrate-model", "/web", "/theme", "/reindex", "/pin", "/unpin", "/pinned", "/loop", "/tasks", "/private"}
+ASYNC_COMMANDS = {"/history", "/learn", "/page", "/status", "/cartridge", "/migrate-model", "/web", "/theme", "/reindex", "/pin", "/unpin", "/pinned", "/private"}
 
 
 @dataclass
@@ -148,7 +148,6 @@ async def handle_async_command(
         _cmd_cartridge,
         _cmd_history,
         _cmd_learn,
-        _cmd_loop,
         _cmd_migrate_model,
         _cmd_page,
         _cmd_pin,
@@ -156,7 +155,6 @@ async def handle_async_command(
         _cmd_private,
         _cmd_reindex,
         _cmd_status,
-        _cmd_tasks,
         _cmd_theme,
         _cmd_unpin,
         _cmd_web,
@@ -189,9 +187,5 @@ async def handle_async_command(
         return await _cmd_theme(args, state, console)
     if cmd == "/reindex":
         return await _cmd_reindex(args, state, console)
-    if cmd == "/loop":
-        return await _cmd_loop(args, state, console)
-    if cmd == "/tasks":
-        return await _cmd_tasks(args, state, console)
     render_error(console, f"Unknown async command: {cmd}")
     return CommandResult(handled=True)

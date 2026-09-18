@@ -1001,7 +1001,19 @@ class MemoryInjector:
             # 勝って「武蔵野市です」と答えた。数値ラベル版の同じ対処
             # (``core.inference._drop_superseded_context``) を属性スロットへ
             # 一般化したもの。
-            if not profile_fact and self._slot_restated_in_session(fact, restated):
+            #
+            # **並列多値スロット (family / schedule / employer …) は抑止しない**
+            # (不変則 #13 の読み出し側)。ファクトは発話単位なので、1 人ぶんの
+            # 述べ直しでスロットごと落とすと無関係な兄弟が消える — 2026-09-17
+            # 監査: 「娘は中学2年ではなく中学3年です」の後の「家族構成を
+            # まとめて」で「夫と中学2年の娘がいます」が抑止され、夫が消えて
+            # 「ご自身と娘さんの 2 人」と答えた。抑止し損ねの代償 (古い値が
+            # 並ぶ) は上の非対称の議論どおり小さい。
+            if (
+                not profile_fact
+                and not self._is_multi_valued(fact.subject)
+                and self._slot_restated_in_session(fact, restated)
+            ):
                 filtered_out += 1
                 continue
             # 問いだけのファクトは主張を含まないのに「(personal_fact)

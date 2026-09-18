@@ -440,6 +440,20 @@ class KnowledgeClaimList(_StrictModel):
     claims: list[KnowledgeClaim]
 
 
+# ── know.* 本文の段落選別 (knowledge_passage_select) ──
+
+
+class KnowledgePassageSelection(_StrictModel):
+    """`backend/pro/knowledge/passage_select.py` の段落選別結果。
+
+    事実抽出に渡す上限を超えた本文から、読む価値のある段落の番号を重要な順に
+    返させる。番号の範囲外・重複は呼出側で捨てる。
+    """
+
+    #: ``passage_select.MAX_SELECTED`` と揃える (grammar の maxItems)。
+    indices: list[int] = Field(max_length=20)
+
+
 # ── 一人称発話の属性分割 (personal_fact_split) ──
 
 
@@ -540,6 +554,7 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "fewshot_quality_score": FewShotQualityJudgement,
     "prompt_candidate_judge": PromptCandidateJudgement,
     "knowledge_claim_extract": KnowledgeClaimList,
+    "knowledge_passage_select": KnowledgePassageSelection,
     "personal_fact_split": PersonalFactSplit,
     "correction_verify": CorrectionVerdict,
     "date_intent": DateIntent,
@@ -692,6 +707,7 @@ __all__ = [
     "UrlRelevanceJudgement",
     "KnowledgeClaim",
     "KnowledgeClaimList",
+    "KnowledgePassageSelection",
     "KnowledgeClaimValue",
     "SpecRevisionJudgement",
     "PURPOSE_SCHEMAS",

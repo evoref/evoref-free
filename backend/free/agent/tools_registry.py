@@ -196,10 +196,14 @@ def _summarize_args_for_log(kwargs: dict[str, Any]) -> str:
 
 
 #: ファイルシステムに触れるツール。タスク計画層のメニューから、質問がファイル系の
-#: 語彙を持たないときに外す (``intent_vocab.mentions_filesystem``)。
+#: 語彙を持たないときに外す (``intent_vocab.mentions_filesystem``)。``project_map``
+#: はファイルを直接読まないが、コード構造の問いにしか使い道が無い点は同じで、
+#: 除外しないと無関係な質問にも毎タスク載って list_directory と同じ汚染を起こす
+#: (2026-09-05 F-08)。``mentions_filesystem`` の語彙は「コード」「コードベース」
+#: 「プロジェクト構成/構造」等を含み、コード構造の問いも概ね拾う (c_16 §4.4)。
 FILESYSTEM_TOOL_NAMES: frozenset[str] = frozenset({
     "read_file", "write_file", "search_code", "list_directory", "apply_diff",
-    "verify_syntax",
+    "verify_syntax", "project_map",
 })
 
 class ToolsRegistry:

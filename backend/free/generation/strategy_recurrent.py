@@ -33,6 +33,7 @@ from backend.free.generation.strategy_common import (
     generate_plan_json,
     parse_plan,
     resolve_max_units,
+    UNSPECIFIED_FACTS_RULE,
 )
 from backend.free.generation.token_budget import TokenBudget
 from backend.free.llm.utils import extract_content
@@ -96,7 +97,8 @@ _TEXT_FORMAT = """\
 
 global_context には文書の種類と文体を具体的に記述してください。
 key_points には、生成すべき具体的な内容を書いてください。
-「〜について書く」のようなメタ的な記述ではなく、実際に含める内容を指定してください。"""
+「〜について書く」のようなメタ的な記述ではなく、実際に含める内容を指定してください。
+""" + UNSPECIFIED_FACTS_RULE
 
 _CONTINUATION_PLAN_PROMPT = """\
 既存テキストに基づき、ユーザー指示に沿った計画をJSON形式で生成してください。
