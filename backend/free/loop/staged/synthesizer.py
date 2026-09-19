@@ -22,6 +22,7 @@ import re
 import sys
 from typing import TYPE_CHECKING
 
+from backend.free.core.code_syntax import is_python_path
 from backend.free.loop.driver import make_task_fact
 from backend.free.memory.types import SemanticFact
 from backend.i18n_helper import prose_language_name
@@ -569,7 +570,8 @@ async def synthesize_create_task_graph_with_plan(
             source_path=fp,
             stage="code",
         ))
-        if include_tests:
+        # 生成テストは pytest なので Python のモジュールだけ (f_10 §4.2)。
+        if include_tests and is_python_path(fp):
             test_slug = _unique(f"test_{_slug(fp)}", seen_ids)
             facts.append(make_task_fact(
                 project_id=project_id,

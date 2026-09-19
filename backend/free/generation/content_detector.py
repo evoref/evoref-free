@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
+from backend.free.core.intent_vocab import EXPLICIT_WINDOWS_PATH_RE
 from backend.free.core.locale_patterns import matches_either
 from backend.free.core.session_mode import is_create_mode
 from backend.free.document_nouns import (
@@ -93,6 +95,27 @@ _NEGATED_CODE_RE_EN = re.compile(
 )
 
 
+def _mask_input_file_paths(instruction: str) -> str:
+    """出力先が別に名指しされているとき、入力として参照される既存ファイルのパスを伏せる。
+
+    ``.md`` 等の拡張子は「出力先が文書」の手掛かりだが、「X/DESIGN.md の設計に
+    基づいて、Python でプログラムを X に作成」の ``DESIGN.md`` は読む側で、
+    これで TEXT に倒すとコードの代わりに散文が生成される (2026-09-19 ライブ監査)。
+    パスが 1 つだけなら (「notes.md を更新して」) それが出力先なので伏せない。
+    """
+    paths = EXPLICIT_WINDOWS_PATH_RE.findall(instruction)
+    if len(set(paths)) < 2:
+        return instruction
+    for path in paths:
+        try:
+            is_input = Path(path).is_file()
+        except OSError:
+            is_input = False
+        if is_input:
+            instruction = instruction.replace(path, " ")
+    return instruction
+
+
 def detect_content_type(instruction: str, mode: str) -> ContentType:
     """コンテンツ種別を判定
 
@@ -110,7 +133,8 @@ def detect_content_type(instruction: str, mode: str) -> ContentType:
         return ContentType.TEXT
 
     if is_create_mode(mode):
-        if any(re.search(p, instruction) for p in TEXT_PATTERNS_ALL):
+        text_view = _mask_input_file_paths(instruction)
+        if any(re.search(p, text_view) for p in TEXT_PATTERNS_ALL):
             return ContentType.TEXT
         return ContentType.CODE
 

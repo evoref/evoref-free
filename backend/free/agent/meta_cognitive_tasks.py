@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from backend.free.agent.meta_cognitive_utils import is_tool_error
 from backend.log_config import get_logger
-from backend.free.core.intent_vocab import WRITE_VERB_RE
+from backend.free.core.intent_vocab import EXPLICIT_WINDOWS_PATH_RE, WRITE_VERB_RE
 
 if TYPE_CHECKING:
     from backend.free.agent.credit_assigner import StepCredit
@@ -87,7 +87,10 @@ def task_expects_write(description: str) -> bool:
     注: ファイルパスの有無は問わない。パスなしでも「書き込み期待」は成立する
     （determine_task_status でのステータス判定で使用）。
     """
-    return bool(_WRITE_PATTERN.search(description))
+    # パス中の語 (``E:\tmp\create_01\DESIGN.md`` の ``create``) を動詞と数えない
+    # (2026-09-19 ライブ監査: 「Read ...create_01_todo_cli\DESIGN.md」が書込み
+    # タスク扱いで production stage を消費し、本来の生成タスクが飛ばされた)。
+    return bool(_WRITE_PATTERN.search(EXPLICIT_WINDOWS_PATH_RE.sub(" ", description)))
 
 
 def determine_task_status(

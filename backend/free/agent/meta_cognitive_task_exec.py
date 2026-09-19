@@ -37,7 +37,7 @@ from backend.free.api.chat.chat_constants import (
     TOOL_RESULT_OMISSION_CHARS,
 )
 from backend.free.core.inference import build_messages_for_loop
-from backend.free.core.intent_vocab import mentions_filesystem
+from backend.free.core.intent_vocab import EXPLICIT_WINDOWS_PATH_RE, mentions_filesystem
 from backend.utils import estimate_tokens as _estimate_tokens
 
 from backend.free.agent.meta_cognitive_defs import (
@@ -119,6 +119,22 @@ def truncate_tool_result(text: str, max_chars: int = TOOL_RESULT_MAX_CHARS) -> s
         + f"\n\n... ({omitted} chars omitted) ...\n\n"
         + text[-tail_size:]
     )
+
+
+def _explicit_existing_dir(query: str) -> Path | None:
+    """クエリが明示した既存ディレクトリ (最後に現れたもの) を返す (無ければ ``None``)。
+
+    ファイルパスは入力でありうるので対象外。存在確認するのは、日本語が続いて
+    区切れない表記 (``E:\\tmp\\xフォルダに``) を誤ってディレクトリと読まないため。
+    """
+    for raw in reversed(EXPLICIT_WINDOWS_PATH_RE.findall(query)):
+        candidate = Path(raw.rstrip("。、,.\\/"))
+        try:
+            if candidate.is_dir():
+                return candidate
+        except OSError:
+            continue
+    return None
 
 
 def _fast_path_miss_context(tool_name: str | None, text: str) -> str:
@@ -693,6 +709,13 @@ class _TaskExecutionMixin:
             return resolved
         p = Path(file_path)
         if str(p.parent) in ("", "."):  # ディレクトリ成分の無い bare ファイル名
+            # クエリが出力先ディレクトリを明示していればそこへ置く。先頭の明示パスが
+            # 入力ファイル (「X\DESIGN.md の設計に基づいて … を X に作成」) だと
+            # 以下の分岐では名指しの index.html 等が outputs_dir へ落ちた
+            # (2026-09-19 ライブ監査 K05)。
+            out_dir = _explicit_existing_dir(query)
+            if out_dir is not None:
+                return str(out_dir / p.name)
             qpath = _extract_file_path(query)
             if qpath and ("\\" in qpath or "/" in qpath):
                 qp = Path(qpath)

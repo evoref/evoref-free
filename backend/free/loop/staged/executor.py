@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from backend.free.core.code_syntax import is_python_path, language_label, syntax_error_detail
 from backend.free.core.dependency_constraint import (
     find_third_party_imports,
     requires_stdlib_only,
@@ -673,6 +674,48 @@ def _flow_language_constraint() -> str:
     return (
         f'\nWrite "label" and "condition" text in {_prose_language()}; keep '
         f"file paths, exception class names, and code identifiers as-is."
+    )
+
+
+def _type_fidelity_clause(source_path: str) -> str:
+    """コード指示の型忠実性の一文 (Python は従来文、それ以外は宣言名の厳守)。"""
+    if is_python_path(source_path):
+        return (
+            "Use the EXACT Python types stated in the shared design specification's "
+            "data structures — do NOT substitute a different type that merely behaves "
+            "similarly (e.g. if a field is specified as holding `int` values, it must "
+            "hold real `int`s, not `bool`). Output only this file's code."
+        )
+    lang = language_label(source_path)
+    return (
+        f"This file is {lang}, not Python: write idiomatic {lang} and use EXACTLY the "
+        f"names, ids, classes, selectors, keys and file references declared in the "
+        f"shared design specification so the files work together. Output only this "
+        f"file's {lang} code."
+    )
+
+
+_SOURCE_PATH_RE = re.compile(r"[\w./\\-]+\.([A-Za-z0-9]{1,5})\b")
+
+
+def _non_python_spec_note(description: str) -> str:
+    """設計に Python 以外のモジュールがあるとき spec に足す注記 (無ければ空)。
+
+    spec テンプレートは Python の ``def`` / ``class`` 行と型で書かせる。HTML / CSS /
+    JavaScript のモジュールにそれを当てると契約が意味を成さない (2026-09-19 K05)。
+    """
+    langs = sorted({
+        language_label(f"x.{ext}") for ext in _SOURCE_PATH_RE.findall(description)
+        if ext.lower() in ("js", "mjs", "cjs", "jsx", "ts", "tsx", "html", "htm", "css")
+    })
+    if not langs:
+        return ""
+    return (
+        "\n\nSome modules are not Python (" + ", ".join(langs) + "). For those "
+        "modules, write the Signature lines in that module's own language (e.g. a "
+        "JavaScript `function name(arg)` line), state types in that language's terms, "
+        "and for HTML/CSS describe the structure instead of def/class lines: element "
+        "ids/classes, the script/stylesheet files they reference, and CSS selectors."
     )
 
 
@@ -1412,6 +1455,7 @@ class StagedCreateExecutor:
         msgs = [{"role": "user", "content":
                  self._brief_prefix()
                  + _SPEC_PROMPT.format(description=description) + os_constraint()
+                 + _non_python_spec_note(description)
                  + _spec_language_constraint() + extra_constraint}]
         try:
             timeout = self._stage_timeout(self.spec_timeout_sec, "create_spec_doc")
@@ -1725,11 +1769,8 @@ class StagedCreateExecutor:
             f"Produce the COMPLETE, fully working contents of the single file "
             f"`{source_path}` implementing the above with real logic — do NOT leave "
             f"function/method bodies as stubs (no bare `pass`, `# TODO`/`...` "
-            f"placeholders, or NotImplementedError). Use the EXACT Python types "
-            f"stated in the shared design specification's data structures — do "
-            f"NOT substitute a different type that merely behaves similarly "
-            f"(e.g. if a field is specified as holding `int` values, it must "
-            f"hold real `int`s, not `bool`). Output only this file's code."
+            f"placeholders, or NotImplementedError). "
+            f"{_type_fidelity_clause(source_path)}"
             + os_constraint()
             + self._dependency_constraint()
             + _code_language_constraint()
@@ -1777,7 +1818,10 @@ class StagedCreateExecutor:
         # 失敗時は code="" のまま従来の単発生成へフォールバックする。
         code = ""
         part_notes: dict[str, str] = {}
-        if self.part_codegen is not None and self.part_assembler is not None:
+        if (
+            self.part_codegen is not None and self.part_assembler is not None
+            and is_python_path(source_path)
+        ):
             plan = plan_file_parts(spec, source_path, max_parts=self.part_max_parts)
             if plan is not None:
                 code, part_notes = await self._generate_in_parts(
@@ -1838,8 +1882,8 @@ class StagedCreateExecutor:
         # Python」になった)。repair 経路 (_write_source_if_valid) は旧ファイルとの
         # 縮小率ガードが後段にあるが、code 工程には比較対象が無い。ここでは
         # 「ほぼ全量が残った場合だけ前置き除去とみなす」で同じ役割を果たす。
-        detail = _compile_error_detail(code)
-        if detail is not None:
+        detail = syntax_error_detail(code, source_path)
+        if detail is not None and is_python_path(source_path):
             salvaged = _salvage_python_code(code)
             if (
                 salvaged is not None
@@ -1855,7 +1899,7 @@ class StagedCreateExecutor:
                 detail = None
         if detail is not None:
             logger.warning(
-                "staged code stage produced invalid Python for %s: %s",
+                "staged code stage produced a syntax error for %s: %s",
                 source_path, detail,
             )
             self._fail_task(task, f"syntax error: {detail}")
@@ -2550,6 +2594,8 @@ class StagedCreateExecutor:
             f"PUBLIC API by calling its functions/classes. Do NOT redefine or copy its "
             f"classes, types, constants, or dataclasses — import them from `{stem}`.\n"
             f"- The file MUST contain at least one `def test_...` function with asserts.\n"
+            f"- Write at most 10 focused test functions (cover the most important "
+            f"behaviors first; do not enumerate every variation).\n"
             f"- Use only runnable Python; never subscript typing.TypedDict.\n"
             f"- Derive the test cases from the specification's Behavior numbered "
             f"steps, Errors and Invariants bullets — verify the DECLARED behavior, "
@@ -3164,7 +3210,14 @@ class StagedCreateExecutor:
         非コード (markdown 等) や、機能を削ったスタブ (例: 175 行→49 行) で動作する
         生成コードを破壊する事故を防ぐ。書き込んだら True、ガード棄却なら False。
         """
-        if not _is_valid_python(code):
+        if not is_python_path(source_path):
+            if syntax_error_detail(code, source_path) is not None:
+                logger.warning(
+                    "repair returned invalid %s for %s; keeping existing code",
+                    language_label(source_path), source_path,
+                )
+                return False
+        elif not _is_valid_python(code):
             salvaged = _salvage_python_code(code)
             if salvaged is None:
                 logger.warning(

@@ -84,6 +84,36 @@ def _salvage_code_from_reasoning(reasoning_content: str) -> str:
     return ""
 
 
+def _is_test_file(file_path: str) -> bool:
+    name = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+    return name.startswith("test_") and name.endswith(".py")
+
+
+def _complete_test_prefix(code: str) -> str:
+    """切断されたテストコードから、構文的に完結した先頭部分を返す (無ければ空)。
+
+    トップレベル文の境界 (インデント無しの行) を末尾から遡り、``ast.parse`` が
+    通って ``def test_`` を 1 つ以上含む最長の接頭辞を採る。
+    """
+    lines = code.splitlines()
+    for end in range(len(lines) - 1, 0, -1):
+        line = lines[end]
+        if not line or line[0].isspace() or line.startswith(("#", ")", "]", "}")):
+            continue
+        prefix = "\n".join(lines[:end]).rstrip() + "\n"
+        try:
+            tree = ast.parse(prefix)
+        except (SyntaxError, ValueError):
+            continue
+        if any(
+            isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test_")
+            or isinstance(n, ast.ClassDef) and n.name.startswith("Test")
+            for n in tree.body
+        ):
+            return prefix
+    return ""
+
+
 def _extract_code(resp: dict, file_path: str) -> tuple[str, bool]:
     """応答からコードを取り出す。戻り値は ``(code, from_salvage)``。
 
@@ -155,6 +185,19 @@ async def generate_single_file(
         return {}
 
     code, code_from_salvage = _extract_code(resp, file_path)
+
+    # 切断されたテストファイルは、完結した test 関数までを採る (倍額再生成しない)。
+    # テストは列挙が止まらず 4096 → 8192 とも上限まで伸び、約 20 分を使って
+    # 破棄されていた (2026-09-19 ライブ監査で 4/4 テーマ)。
+    if _finish_reason(resp) == "length" and not code_from_salvage and _is_test_file(file_path):
+        complete = _complete_test_prefix(code)
+        if complete:
+            logger.warning(
+                "direct codegen truncated at max_tokens=%d for %s; kept the "
+                "complete test functions (%d chars) instead of regenerating",
+                max_tokens, file_path, len(complete),
+            )
+            return {file_path: complete}
 
     # reasoning から検証済みで救出できた場合は、切断されていても完成コードと
     # して信頼できるため、費用のかかる倍額再生成をスキップする (2026-07-23

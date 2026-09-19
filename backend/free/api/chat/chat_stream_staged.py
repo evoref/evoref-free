@@ -258,6 +258,7 @@ def _staged_postprocess(
         check_coherence,
         check_cross_module_imports,
         check_entrypoint,
+        check_main_invoked,
         normalize_relative_imports,
     )
 
@@ -278,7 +279,7 @@ def _staged_postprocess(
     # 重複定義/未定義名 (coherence) + 起動経路の未定義メソッド参照 (entrypoint) +
     # 生成物間 from-import の名前欠落 (cross_module_imports) を終端でも必ず検査する
     # (工程内スモークが starve された / 外部依存欠落で import スモークが盲目化した場合の保険)。
-    for fn in (check_coherence, check_entrypoint, check_cross_module_imports):
+    for fn in (check_coherence, check_entrypoint, check_main_invoked, check_cross_module_imports):
         try:
             issues += list(fn(final_py))
         except Exception as exc:
@@ -393,6 +394,7 @@ async def run_staged_pipeline(
         check_coherence,
         check_cross_module_imports,
         check_entrypoint,
+        check_main_invoked,
         run_entry_smoke,
         run_import_smoke,
     )
@@ -543,7 +545,7 @@ async def run_staged_pipeline(
             internal_names=_staged_internal_names(ws),
         )
         extra_errors: list[str] = []
-        for fn in (check_coherence, check_entrypoint, check_cross_module_imports):
+        for fn in (check_coherence, check_entrypoint, check_main_invoked, check_cross_module_imports):
             try:
                 extra_errors += list(fn(files))
             except Exception as exc:

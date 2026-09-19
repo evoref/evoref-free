@@ -188,7 +188,7 @@ class LlamaConfig(BaseModel):
     # 0 = 上限を config で決めない。ただし **無制限では投げない** —
     # ``LocalClient._build_payload`` が context_size からプロンプト推定を引いた
     # 残量 (下限 256) へクランプして送る。
-    max_tokens: int = Field(default=1024, ge=0)
+    max_tokens: int = Field(default=2048, ge=0)
     lora_target: str = "auto"
     # None = 未指定 (arch プロファイルの reasoning.enable_thinking / 能力判定で決定。
     # 非対応 arch には送らない)。True/False = ユーザー明示でプロファイルを上書き。

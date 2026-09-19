@@ -305,6 +305,42 @@ def check_entrypoint(
     return sorted(errors)
 
 
+def check_main_invoked(files: dict[str, str]) -> list[str]:
+    """``main.py`` が ``main()`` を定義するのに誰も呼ばない (起動しても何もしない) を検出する。
+
+    import スモークも ``check_entrypoint`` (クラスが無ければ早期 return) も通るため、
+    ``python main.py`` が無言で終了する生成物が「起動可能性チェック合格」になった
+    (2026-09-19 ライブ監査 K02)。対象は ``main.py`` だけに絞る — 他モジュールの
+    ``main`` は後続のエントリから呼ばれうる (未生成の段階で誤検知しない)。
+    """
+    errors: list[str] = []
+    for path, code in files.items():
+        if os.path.basename(path) != "main.py":
+            continue
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            continue  # validate_python 側が扱う
+        defines_main = any(
+            isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "main"
+            for n in tree.body
+        )
+        invoked = any(
+            _is_main_guard(n)
+            or (
+                isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+                and isinstance(n.value.func, ast.Name) and n.value.func.id == "main"
+            )
+            for n in tree.body
+        )
+        if defines_main and not invoked:
+            errors.append(
+                f"{path}: main() が定義されているが呼ばれない "
+                "(if __name__ == '__main__': main() が無く、起動しても何もしない)"
+            )
+    return errors
+
+
 def _looks_like_entry(code: str) -> bool:
     """``main`` の top-level 定義か ``__main__`` ガードを持つか (エントリ推論用)。"""
     try:
