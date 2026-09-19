@@ -1632,6 +1632,9 @@ class CorpusStore:
         """chunker 版が現行より古いパッケージ id (f_01 §3.3 の 6)。"""
         out: list[str] = []
         for package_id, package in self._packages.items():
+            # ProjectMap は docs/ の chunker ではなく Step 5.87 が作り直す (c_16 §4.4)。
+            if package.is_project_map:
+                continue
             try:
                 version = int(package.store.manifest.chunker_version)
             except (AttributeError, TypeError, ValueError):

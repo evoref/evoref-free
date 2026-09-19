@@ -1094,6 +1094,27 @@ class MetaCognitiveAgent(
         return result
 
     @staticmethod
+    def _named_new_file_target(query: str) -> str:
+        """クエリが名指しした **未作成の** ファイル (拡張子付き) を返す (無ければ空)。
+
+        名前の無い成果物 (longform TEXT) はクエリの語から名前を作っていたため、
+        「X フォルダに ... DESIGN.md として作成」が ``tmp_create_01_todo_cli_todo.txt``
+        へ書かれた (2026-09-19 ライブ監査)。既存ファイルは入力でありうるので対象外
+        (上書きは従来どおり ``_resolve_write_path`` の判断に任せる)。
+        """
+        from backend.free.agent.tool_judge_args import _extract_file_path_literal
+
+        target = _extract_file_path_literal(query)
+        if not target or not Path(target).suffix:
+            return ""
+        try:
+            if Path(target).exists():
+                return ""
+        except OSError:
+            return ""
+        return target
+
+    @staticmethod
     def _fallback_artifact_filename(art: EditorArtifact, query: str) -> str:
         """production_stage の artifact にファイル名が無いときの決定論フォールバック。"""
         stem = derive_editor_filename_stem(hint=query, language=art.language)
@@ -1137,6 +1158,9 @@ class MetaCognitiveAgent(
             if result.exit_kind == "blocked":
                 # 問い返し済み: 以後の write タスクは新規生成せず畳む (§4.4)。
                 return "問い返し中のため実行を保留しました", []
+            incomplete = self._production_incomplete_reason(result)
+            if incomplete:
+                return f"Error: production stage incomplete ({incomplete})", []
             return (
                 f"Already generated {len(result.artifacts)} file(s) via "
                 "production stage", [],
@@ -1180,8 +1204,11 @@ class MetaCognitiveAgent(
         tool_calls: list[dict] = []
         written = 0
         written_paths: list[str] = []
+        named_target = (
+            self._named_new_file_target(original_query) if len(artifacts) == 1 else ""
+        )
         for art in artifacts:
-            filename = art.filename or self._fallback_artifact_filename(
+            filename = art.filename or named_target or self._fallback_artifact_filename(
                 art, original_query,
             )
             file_path = self._resolve_write_path(
@@ -1197,7 +1224,33 @@ class MetaCognitiveAgent(
         if written == 0:
             return "Error: production stage artifacts failed to write", tool_calls
         self._record_write_impact(written_paths, result)
+        incomplete = self._production_incomplete_reason(result)
+        if incomplete:
+            # 書けた分は残すが、タスクは失敗として数える (成功と報告しない)。
+            return (
+                f"Error: production stage incomplete ({incomplete}); "
+                f"wrote {written} file(s)", tool_calls,
+            )
         return f"Wrote {written} file(s) via production stage", tool_calls
+
+    @staticmethod
+    def _production_incomplete_reason(result: "ProductionResult") -> str:
+        """制作ステージが依頼を満たさずに終わった理由 (満たしていれば空)。
+
+        staged は打ち切り / コードタスク失敗でも SPEC.md 等を成果物に持つため、
+        成果物の有無だけでは完了と区別できない。以前は ``exit_kind="done"`` の
+        まま HTML/JS が 1 本も無い run や、全体タイムアウトの run が
+        「すべて完了しました」と報告された (2026-09-19 ライブ監査 K02/K04/K05)。
+        """
+        if result.exit_kind == "timeout":
+            return "timed out"
+        notes = result.notes or {}
+        failed = int(notes.get("tasks_failed") or 0)
+        if failed:
+            return f"{failed} task(s) failed"
+        if "code_files" in notes and not notes["code_files"]:
+            return "no code files were produced"
+        return ""
 
     def _record_write_impact(
         self, written_paths: list[str], result: "ProductionResult",
@@ -1386,7 +1439,12 @@ class MetaCognitiveAgent(
 
         max_retries = min(2, self.max_steps - steps)
         for idx, (i, task) in enumerate(failed_writes[:max_retries]):
-            if task.result and "Content generation failed" in task.result:
+            if task.result and (
+                "Content generation failed" in task.result
+                # 制作ステージは予算内で走り切った結果。単発の書込み経路で作り直すと
+                # 予算外の再生成になり、書けた成果物も上書きしうる。
+                or "production stage incomplete" in task.result
+            ):
                 logger.info(
                     "Skipping retry for content generation failure: %s",
                     task.description[:80],

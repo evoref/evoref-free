@@ -137,7 +137,11 @@ class StagedCodeHarness:
             artifacts=artifacts,
             exit_kind=str(result_payload.get("exit_kind", "done")),
             metrics=dict(result_payload.get("metrics") or {}),
-            notes=dict(result_payload.get("notes") or {}),
+            notes={
+                **dict(result_payload.get("notes") or {}),
+                "tasks_failed": int(result_payload.get("tasks_failed") or 0),
+                "code_files": len(result_payload.get("code_map") or {}),
+            },
             truncated_steps=tuple(result_payload.get("truncated_steps") or ()),
             truncated_max_tokens=result_payload.get("truncated_max_tokens"),
         )

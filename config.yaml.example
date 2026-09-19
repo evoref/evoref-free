@@ -164,7 +164,7 @@ llama:
   checkpoint_min_step: 256        # --checkpoint-min-step / checkpoint 間の最小トークン間隔。上流既定 8192 だと context_size=8192 で
                                   #   中間 checkpoint が生まれず、prompt が前回の最終 user 位置より手前で分岐すると system prompt ごと全量 re-prefill。
                                   #   256 なら user ターンごとに 1 つ置かれ、分岐コストは最後に一致したターン以降の窓だけになる
-  max_tokens: 1024               # チャット応答の最大トークン数（0=無制限、暴走防止に設定推奨）
+  max_tokens: 2048               # チャット応答の最大トークン数（0=無制限、暴走防止に設定推奨）
   lora_target: auto               # LoRA ターゲット自動判定: auto | "q_proj,v_proj" | "linear_proj" 等（Pro 専用）
   enable_thinking: false          # 思考トークン制御。true/false=明示（プロファイルを上書き）
                                   # 未設定/コメントアウト時は arch プロファイル (models/profiles/<arch>.yaml)

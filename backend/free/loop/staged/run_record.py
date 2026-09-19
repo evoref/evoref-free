@@ -352,6 +352,9 @@ def list_runs(
             continue
         if not is_valid_run_id(entry.name):
             continue
+        # run.json の無い作業場は run record 導入前の workspace で、壊れた run ではない。
+        if not (entry / RUN_FILE).is_file():
+            continue
         loaded = _load_run(entry, stale_after_sec=stale_after_sec)
         if loaded is None:
             skipped += 1
@@ -372,7 +375,7 @@ def load_run(
     """1 run の記録 + 導出状態。存在しない / 不正 id / 壊れている場合は ``None``。"""
     if not is_valid_run_id(run_id):
         return None
-    return _load_run(Path(create_dir, stale_after_sec=stale_after_sec) / run_id)
+    return _load_run(Path(create_dir) / run_id, stale_after_sec=stale_after_sec)
 
 
 def read_events(

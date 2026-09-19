@@ -16,7 +16,7 @@ config.yaml のデフォルト値として使われるものと、
 DEFAULT_CONTEXT_SIZE: int = 8192
 
 #: config.yaml llama.max_tokens のフォールバック値
-DEFAULT_MAX_TOKENS: int = 1024
+DEFAULT_MAX_TOKENS: int = 2048
 
 #: build_messages の generation_reserve デフォルト
 DEFAULT_GENERATION_RESERVE: int = 512
@@ -54,7 +54,7 @@ DEFAULT_KEEPALIVE_INTERVAL_SEC: float = 15.0
 REACTIVE_LIGHT_HISTORY_TURNS: int = 6
 
 #: 軽量パスの max_tokens 上限。reactive 分類は短文応答前提で、reasoning 暴走の上限も兼ねる
-REACTIVE_LIGHT_MAX_TOKENS: int = 512
+REACTIVE_LIGHT_MAX_TOKENS: int = 1024
 
 # ---------------------------------------------------------------------------
 # Deliberative 層
