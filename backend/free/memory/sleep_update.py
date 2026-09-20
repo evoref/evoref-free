@@ -1139,11 +1139,14 @@ class SleepTimeWorker:
         )
 
         quiet = quiet_seconds(self.config)
+        corpus = getattr(self.cartridge_manager, "corpus", None)
+        language_overlay = corpus.language_overlay() if corpus is not None else None
         return await update_project_map(
             config=self.config,
             resolver=resolver,
             is_cancelled=self._check_cancelled,
             should_pause=lambda: self._chat_recent(quiet),
+            language_overlay=language_overlay,
         )
 
     async def _step5_9_pseudo_queries(self, llm_client) -> int:

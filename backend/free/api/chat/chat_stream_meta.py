@@ -232,14 +232,22 @@ def _meta_cognitive_body_text(resp) -> str:
         return body
     done = sum(1 for t in resp.tasks if t.status == "done")
     failed = sum(1 for t in resp.tasks if t.status == "failed")
-    if failed and not done:
-        return msg("agent.tasks_all_failed")
-    if failed:
-        return msg("agent.tasks_partially_done", done=done, failed=failed)
     # 書込みで完結したターンは「何を書いたか」を出す。「タスクを完了しました。」
     # だけだと、ユーザーは書き込まれた先を確認する手掛かりが本文に無い
     # (2026-08-09 ライブ監査で指摘)。
     written = _written_paths(resp.tasks)
+    if failed and written:
+        # 成果物は配信済みなのに「失敗しました」だけを返さない (f_10 §5-4 の
+        # 警告付き配信)。2026-09-20 実機: 参考テストが赤いだけで 4 ファイルは
+        # 依頼フォルダへ配信済みだったのに、本文が書込み先に触れなかった。
+        return msg(
+            "agent.files_written_with_failures",
+            paths="、".join(written), failed=failed,
+        )
+    if failed and not done:
+        return msg("agent.tasks_all_failed")
+    if failed:
+        return msg("agent.tasks_partially_done", done=done, failed=failed)
     if written:
         return msg("agent.files_written", paths="、".join(written))
     if done == 1:
@@ -266,11 +274,15 @@ def _truncate_step_description(description: str) -> str:
 
 
 def _written_paths(tasks) -> list[str]:
-    """完了タスクの結果から書込み先パスを重複なく取り出す (純粋関数)。"""
+    """タスク結果から書込み先パスを重複なく取り出す (純粋関数)。
+
+    失敗タスクも対象にする — ``Written N bytes to X`` はツールが成功したときだけ
+    返るので、タスク自体が後で失敗しても書込みは起きている (2026-09-20 実機:
+    参考テストが赤く task=failed になり、配信済み 4 ファイルのパスが本文から
+    消えていた)。
+    """
     paths: list[str] = []
     for task in tasks or []:
-        if getattr(task, "status", None) != "done":
-            continue
         for match in _WRITTEN_PATH_RE.finditer(str(getattr(task, "result", "") or "")):
             path = match.group(1).strip()
             if path and path not in paths:
@@ -397,6 +409,10 @@ def _finalize_meta_cognitive_stream(
     content = meta_cognitive_recorded_text(resp)
     step_credits = resp.step_credits if resp else []
     estimated_tokens = max(1, _estimate_tokens(content))
+    # production stage (staged/longform) が構成テンプレートで seed した場合の
+    # 来歴 (f_08 §3.1.1)。体裁の継承 / 帳票の穴埋めは write_file の contextvar
+    # 経由で ``_active_gen_config`` が別途拾う。
+    production_metrics = getattr(resp, "production_metrics", None) or {}
     record_meta_cognitive_response(
         state, content, messages, session_id,
         query, mode, estimated_tokens, step_credits,
@@ -409,6 +425,7 @@ def _finalize_meta_cognitive_stream(
         cancelled=cancelled,
         # 内部生成の切断は経験へ刻む (deliberative の ``truncated=`` と同じ)。
         truncated=bool(getattr(resp, "truncated", False)),
+        template=str(production_metrics.get("template") or ""),
         **meta_last_command_call(resp),
     )
 

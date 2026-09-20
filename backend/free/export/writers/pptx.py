@@ -7,6 +7,7 @@ python-pptx を使用。設計書: [docs/f_11_file_export.md](../../../../docs/f
 from __future__ import annotations
 
 import io
+from pathlib import Path
 
 from backend.export._writer_base import BytesWriterBase
 from backend.export.base import ContentBlock, ExportContent
@@ -17,6 +18,72 @@ from backend.export.media import (
 )
 from backend.export.shapes import normalize_shapes, rgb_tuple
 from backend.export.slide_splitter import Slide, split_into_slides
+from backend.log_config import get_logger
+
+logger = get_logger("export.writers.pptx")
+
+
+def _resolve_pptx_template(content: ExportContent) -> Path | None:
+    """``metadata["template_base"]`` を検査して継承元パスを返す (無ければ ``None``)。
+
+    出力の拡張子と ``base`` の拡張子が違えば継承しない (f_11 §9.1)。この
+    writer は常に ``.pptx`` を書くので、``base`` も ``.pptx`` の場合だけ使う。
+    """
+    base = (content.metadata or {}).get("template_base")
+    if not base:
+        return None
+    path = Path(base)
+    if path.suffix.lower() != ".pptx":
+        return None
+    if not path.is_file():
+        logger.warning("pptx template base not found: %s", path)
+        return None
+    return path
+
+
+def _remove_all_slides(prs) -> None:
+    """既存スライドを全て外す (python-pptx に削除の公開 API が無い、f_11 §9.1)。"""
+    from pptx.oxml.ns import qn
+
+    xml_slides = prs.slides._sldIdLst
+    for sld in list(xml_slides):
+        rid = sld.get(qn("r:id"))
+        prs.part.drop_rel(rid)
+        xml_slides.remove(sld)
+
+
+def _layout_placeholder_types(layout) -> set:
+    types = set()
+    for placeholder in layout.placeholders:
+        try:
+            types.add(placeholder.placeholder_format.type)
+        except (AttributeError, ValueError):
+            continue
+    return types
+
+
+def _find_cover_layout(prs):
+    """title を持つ最初のレイアウト (f_11 §9.1: 名前ではなく placeholder の型で選ぶ)。"""
+    from pptx.enum.shapes import PP_PLACEHOLDER
+
+    title_types = {PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE}
+    for layout in prs.slide_layouts:
+        if _layout_placeholder_types(layout) & title_types:
+            return layout
+    return None
+
+
+def _find_content_layout(prs):
+    """title + body/object を持つ最初のレイアウト。"""
+    from pptx.enum.shapes import PP_PLACEHOLDER
+
+    title_types = {PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE}
+    body_types = {PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT}
+    for layout in prs.slide_layouts:
+        types = _layout_placeholder_types(layout)
+        if (types & title_types) and (types & body_types):
+            return layout
+    return None
 
 
 class _BodyText:
@@ -53,8 +120,8 @@ def _add_block_to_body(body: _BodyText, block: ContentBlock) -> None:
             run.font.bold = True
 
     elif block.type == "list":
-        for item in block.items:
-            body.add(item, level=1)
+        for text, level, _ordered in block.iter_items():
+            body.add(text, level=min(1 + level, 8))
 
     elif block.type == "code":
         para = body.add(block.content)
@@ -153,9 +220,38 @@ def _build_pptx(content: ExportContent) -> bytes:
     """ExportContent を PPTX バイトデータに変換"""
     from pptx import Presentation
 
-    prs = Presentation()
-    layout_title = prs.slide_layouts[0]    # タイトルスライド
-    layout_content = prs.slide_layouts[1]  # タイトル + コンテンツ
+    prs = None
+    layout_title = layout_content = None
+    template_path = _resolve_pptx_template(content)
+    if template_path is not None:
+        try:
+            candidate = Presentation(str(template_path))
+        except Exception as e:  # noqa: BLE001 - 壊れた base は白紙へ縮退する
+            logger.warning(
+                "pptx template base %s could not be opened; writing without "
+                "inheritance: %s", template_path, e,
+            )
+            candidate = None
+        if candidate is not None:
+            cover = _find_cover_layout(candidate)
+            body = _find_content_layout(candidate)
+            if cover is None or body is None:
+                logger.warning(
+                    "pptx template base %s has no usable title/body layout; "
+                    "writing without inheritance", template_path,
+                )
+                content.metadata["template_applied"] = False
+            else:
+                _remove_all_slides(candidate)
+                prs, layout_title, layout_content = candidate, cover, body
+                content.metadata["template_applied"] = True
+        else:
+            content.metadata["template_applied"] = False
+
+    if prs is None:
+        prs = Presentation()
+        layout_title = prs.slide_layouts[0]    # タイトルスライド
+        layout_content = prs.slide_layouts[1]  # タイトル + コンテンツ
 
     deck = split_into_slides(content)
     base_dir = export_base_dir(content)

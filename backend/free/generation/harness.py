@@ -97,10 +97,15 @@ def _base_notes(recorder: "RunRecorder | None", run_id: str) -> dict[str, str]:
     return {"run_id": run_id, "workspace_root": str(recorder.root)}
 
 
-def _finish_recorder(recorder: "RunRecorder", exit_kind: str) -> None:
-    """run 終端を記録する (失敗しても生成結果は返す)。"""
+def _finish_recorder(
+    recorder: "RunRecorder", exit_kind: str, *, template: str = "",
+) -> None:
+    """run 終端を記録する (失敗しても生成結果は返す)。
+
+    ``template`` は構成テンプレートで seed した場合の来歴鍵 (c_05 §0.6)。
+    """
     try:
-        recorder.finish(exit_kind)
+        recorder.finish(exit_kind, template=template)
     except Exception as exc:  # noqa: BLE001 - 後始末の失敗で応答は壊さない
         logger.warning("longform run recorder finish(%s) failed: %s", exit_kind, exc)
 
@@ -309,7 +314,8 @@ class LongFormHarness:
                     )
 
         if recorder is not None:
-            _finish_recorder(recorder, exit_kind)
+            template = str(getattr(orchestrator, "last_metrics", {}).get("template") or "")
+            _finish_recorder(recorder, exit_kind, template=template)
 
         return ProductionResult(
             artifacts=artifacts,

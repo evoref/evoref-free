@@ -258,6 +258,7 @@ class ActionRunner:
                 timeout=self.config.command_timeout_sec,
                 check=False,
                 shell=False,
+                env=action.env,
             )
         except subprocess.TimeoutExpired as exc:
             return ActionResult(

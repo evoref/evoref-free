@@ -75,14 +75,22 @@ async def export_file(req: ExportFileRequest) -> Response:
             },
         )
 
+    # テンプレート継承 (c_16 §4.5.2) は corpus の版ディレクトリ内という前提の
+    # 上に立つ (f_11 §9.1)。この API はリクエスト由来の任意パスを受けるので、
+    # 呼出元が ``metadata`` に紛れ込ませても素通りさせない (任意ファイルを
+    # サーバに開かせない)。
+    metadata = {
+        k: v for k, v in req.metadata.items() if k not in ("template_base", "template")
+    }
+
     # ExportContent を構築
     if req.data is not None:
-        content = ContentConverter.from_data(req.data, title=req.title, **req.metadata)
+        content = ContentConverter.from_data(req.data, title=req.title, **metadata)
         # raw_markdown もあれば保持
         if req.content:
             content.raw_markdown = req.content
     elif req.content:
-        content = ContentConverter.from_markdown(req.content, title=req.title, **req.metadata)
+        content = ContentConverter.from_markdown(req.content, title=req.title, **metadata)
     else:
         raise HTTPException(
             status_code=400,

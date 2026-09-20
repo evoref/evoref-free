@@ -8,12 +8,24 @@ grammar が読めない場合は :func:`extract_file` が ``None`` を返す —
 WARNING 1 行で読み飛ばす。
 
 同じ入力から同じ出力にするため、LLM は一切使わない決定論抽出。
+
+言語パック (c_16 §4.5.3) 由来の言語は同梱の言語表 (``queries.py``) に無いため
+:class:`PackLanguage` を ``extract_file`` の呼出しごとに渡して補う (呼出側が
+``CorpusStore.language_overlay()`` から作る)。フィールド名が言語ごとに
+違う定義名 / 基底名 / 呼出し名の抽出は既知言語だけの表なので、パック言語は
+:func:`_deepest_identifier` を使った汎用抽出 (``name`` / ``function`` フィールド
+の識別子を拾うだけ) に落ちる。import 指定子の抽出だけは段階 C-2 (c_16 §4.5.3)
+で ``imports.specifier`` (閉じた語彙、``ImportRule``) を使った汎用抽出に対応する
+(:func:`_pack_import_spec`) — ノード型の固定集合を pre-order で探すだけで、
+フィールド名には依存しない。
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
+from backend.free.rag.corpus.language import ImportRule
 from backend.free.rag.projectmap.extractors.queries import LANGUAGE_QUERIES, LanguageQuery
 from backend.free.rag.projectmap.graph import ExtractedFile, Node, RawCall
 from backend.free.rag.projectmap.ids import code_node_id
@@ -21,11 +33,28 @@ from backend.log_config import get_logger
 
 logger = get_logger("rag.projectmap.treesitter")
 
-#: 言語 → (parser, 構築済み Query)。構築に失敗した言語は ``None`` を持つ
-#: (次回以降の再試行 / 再警告をしない)。
-_PARSER_CACHE: dict[str, tuple[Any, Any] | None] = {}
+#: キャッシュ鍵 → (parser, 構築済み Query)。構築に失敗した言語は ``None`` を持つ
+#: (次回以降の再試行 / 再警告をしない)。鍵は同梱言語なら言語名、言語パック
+#: (c_16 §4.5.3) 由来なら ``(言語 id, grammar, クエリ文字列)`` — パックを新しい版へ
+#: 入れ替えると同じ言語 id のままクエリが変わるので、言語 id だけを鍵にすると
+#: プロセスを再起動するまで古いクエリで抽出し続ける。
+_PARSER_CACHE: dict[Any, tuple[Any, Any] | None] = {}
 _WARNED_LANGS: set[str] = set()
 _TREE_SITTER_AVAILABLE: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PackLanguage:
+    """言語パック (c_16 §4.5.3) の 1 言語ぶんの抽出定義。
+
+    ``grammar`` は tree-sitter-language-pack に渡す名前、``query`` は
+    :class:`LanguageQuery` (同梱言語と同じ形)。
+    """
+
+    grammar: str
+    query: LanguageQuery
+    #: 検証済み (段階 C-2)。``None`` なら import 指定子を抽出しない。
+    imports: ImportRule | None = None
 
 _COMMENT_TYPES: frozenset[str] = frozenset({"comment", "line_comment", "block_comment"})
 _STRING_PREFIXES: tuple[str, ...] = ("r", "R", "b", "B", "f", "F", "u", "U")
@@ -45,26 +74,40 @@ def is_available() -> bool:
     return _TREE_SITTER_AVAILABLE
 
 
-def _get_parser_and_query(lang: str) -> tuple[Any, Any] | None:
-    """言語の parser + 構築済み Query (キャッシュ、失敗は 1 度だけ警告)。"""
-    if lang in _PARSER_CACHE:
-        return _PARSER_CACHE[lang]
-    result: tuple[Any, Any] | None = None
+def _get_parser_and_query(
+    lang: str, pack_language: "PackLanguage | None" = None,
+) -> tuple[Any, Any] | None:
+    """言語の parser + 構築済み Query (キャッシュ、失敗は 1 度だけ警告)。
+
+    ``lang`` が同梱言語表に無ければ ``pack_language`` (言語パック、
+    c_16 §4.5.3) の grammar / クエリを使う。パック言語のキャッシュ鍵はクエリ
+    文字列まで含む (:data:`_PARSER_CACHE`) ので、パックを入れ替えれば新しい
+    クエリで構築し直す。
+    """
     lang_query = LANGUAGE_QUERIES.get(lang)
+    grammar_name = lang
+    cache_key: Any = lang
+    if lang_query is None and pack_language is not None:
+        lang_query = pack_language.query
+        grammar_name = pack_language.grammar
+        cache_key = (lang, grammar_name, lang_query.query)
+    if cache_key in _PARSER_CACHE:
+        return _PARSER_CACHE[cache_key]
+    result: tuple[Any, Any] | None = None
     if is_available() and lang_query is not None:
         try:
             import tree_sitter
             from tree_sitter_language_pack import get_language, get_parser
 
-            parser = get_parser(lang)  # type: ignore[arg-type]
-            language = get_language(lang)  # type: ignore[arg-type]
+            parser = get_parser(grammar_name)  # type: ignore[arg-type]
+            language = get_language(grammar_name)  # type: ignore[arg-type]
             query = tree_sitter.Query(language, lang_query.query)
             result = (parser, query)
         except Exception as e:  # noqa: BLE001 — 1 言語の失敗で全体の走査を止めない
             if lang not in _WARNED_LANGS:
                 _WARNED_LANGS.add(lang)
                 logger.warning("tree-sitter unavailable for language %s: %s", lang, e)
-    _PARSER_CACHE[lang] = result
+    _PARSER_CACHE[cache_key] = result
     return result
 
 
@@ -146,6 +189,24 @@ def _doc_line(node: Any, lang: str, source: bytes) -> str:
 # ── 言語別: 定義ノードの名前 ────────────────────────────────────────────
 
 
+def _deepest_identifier(node: Any | None) -> Any | None:
+    """``node`` がそのまま identifier ならそれを、member 系ノードなら末尾の
+    識別子を返す。
+
+    フィールド名が分からない言語パック (c_16 §4.5.3) 向けの汎用抽出 —
+    ``a.b`` / ``a:b`` のような入れ子ノードから最後の識別子だけを拾う。
+    """
+    if node is None:
+        return None
+    if node.type.endswith("identifier"):
+        return node
+    for field_name in ("field", "method", "property", "attribute", "name"):
+        sub = node.child_by_field_name(field_name)
+        if sub is not None and sub.type.endswith("identifier"):
+            return sub
+    return None
+
+
 def _definition_name(node: Any, lang: str) -> Any | None:
     if lang in ("c", "cpp") and node.type == "function_definition":
         declarator = node.child_by_field_name("declarator")
@@ -157,7 +218,15 @@ def _definition_name(node: Any, lang: str) -> Any | None:
             if child.type in ("type_identifier", "simple_identifier"):
                 return child
         return None
-    return node.child_by_field_name("name")
+    name = node.child_by_field_name("name")
+    if lang in LANGUAGE_QUERIES:
+        # 同梱言語は name フィールドをそのまま使う。**identifier とは限らない**
+        # (Ruby のクラス名は ``constant``、PHP は ``name``) ので、汎用抽出へ
+        # 通すと名前が取れずに定義ごと落ちる (2026-09-20 に実際に踏んだ)。
+        return name
+    # 言語パック (c_16 §4.5.3) は ``Foo.bar`` のような member 系ノードにも
+    # なりうるので、末尾の識別子まで降りる。
+    return _deepest_identifier(name)
 
 
 # ── 言語別: 基底クラス ──────────────────────────────────────────────────
@@ -282,6 +351,15 @@ def _call_name(node: Any, lang: str) -> Any | None:
             if child.type == "simple_identifier":
                 return child
         return None
+    # 未知の言語 (言語パック、c_16 §4.5.3) 向けの汎用抽出。よくあるフィールド
+    # 名を順に試し、member 系ノードなら末尾の識別子まで降りる。
+    for field_name in ("function", "name", "callee"):
+        candidate = node.child_by_field_name(field_name)
+        if candidate is None:
+            continue
+        resolved = _deepest_identifier(candidate)
+        if resolved is not None:
+            return resolved
     return None
 
 
@@ -296,7 +374,72 @@ _PHP_INCLUDE_LIKE_TYPES: frozenset[str] = frozenset({
 })
 
 
-def _import_specs(node: Any, lang: str, source: bytes) -> list[str]:
+#: 言語パック (c_16 §4.5.3、段階 C-2) の ``specifier: "string_literal"`` が
+#: 探すノード型の閉じた集合。**引用符を含まない中身** を直接持つ型 (これが
+#: 見つかれば最優先 — Lua / Bash の ``string_content``、JS の
+#: ``string_fragment``、Go の ``interpreted_string_literal_content`` のように
+#: grammar ごとに名前が違うので複数登録する)。実際に Lua / Bash の grammar を
+#: パースして確認した名前 (2026-09-20)。
+_PACK_STRING_CONTENT_TYPES: frozenset[str] = frozenset({
+    "string_content", "string_fragment", "interpreted_string_literal_content",
+    "raw_string_literal_content", "template_string_content",
+})
+#: 引用符付きのまま (中身の子ノードが取れなかったときのフォールバック)。
+_PACK_STRING_WRAPPER_TYPES: frozenset[str] = frozenset({
+    "string", "string_literal", "interpreted_string_literal", "raw_string_literal",
+    "template_string",
+})
+#: ``specifier: "dotted_name"`` が優先的に探すノード型 (`.` / `::` 区切りの
+#: 複合名をひとまとまりのノードで持つ grammar 向け)。
+_PACK_DOTTED_NAME_TYPES: frozenset[str] = frozenset({
+    "dotted_name", "scoped_identifier", "qualified_identifier",
+})
+
+
+def _first_descendant_of_types(node: Any, types: frozenset[str]) -> Any | None:
+    """``node`` 自身を含めて pre-order (文書順) で最初に型が一致するノードを返す。
+
+    親を遡らない (:func:`_leading_comment` と同じ理由で子方向だけを辿る)。
+    """
+    if node.type in types:
+        return node
+    for child in node.children:
+        found = _first_descendant_of_types(child, types)
+        if found is not None:
+            return found
+    return None
+
+
+def _pack_import_spec(node: Any, source: bytes, rule: ImportRule) -> str | None:
+    """言語パック (c_16 §4.5.3、段階 C-2) の import 指定子を汎用抽出する。
+
+    ``rule.specifier`` の閉じた語彙ごとに、固定のノード型集合を ``import.stmt``
+    捕獲ノードの部分木から pre-order で探すだけ — フィールド名には依存しない
+    (パック言語は既知言語表に無く、``child_by_field_name`` の規約が読めない)。
+    見つからなければ ``None`` (その import.stmt からは指定子を出さない)。
+    """
+    if rule.specifier == "string_literal":
+        content = _first_descendant_of_types(node, _PACK_STRING_CONTENT_TYPES)
+        if content is not None:
+            return _text(content, source)
+        wrapper = _first_descendant_of_types(node, _PACK_STRING_WRAPPER_TYPES)
+        if wrapper is not None:
+            return _text(wrapper, source).strip("'\"`")
+        return None
+    if rule.specifier == "dotted_name":
+        dotted = _first_descendant_of_types(node, _PACK_DOTTED_NAME_TYPES)
+        if dotted is not None:
+            return _text(dotted, source)
+        ident = _first_descendant_of_types(node, frozenset({"identifier"}))
+        if ident is not None:
+            return _text(ident, source)
+        return None
+    return None
+
+
+def _import_specs(
+    node: Any, lang: str, source: bytes, *, pack_language: "PackLanguage | None" = None,
+) -> list[str]:
     if lang == "python":
         field = "name" if node.type == "import_statement" else "module_name"
         out = []
@@ -376,6 +519,11 @@ def _import_specs(node: Any, lang: str, source: bytes) -> list[str]:
             if child.type == "identifier":
                 return [_text(child, source)]
         return []
+    # 未知の言語 (言語パック、c_16 §4.5.3、段階 C-2) — ``imports`` が宣言
+    # されていれば、その ``specifier`` の閉じた語彙で汎用抽出する。
+    if pack_language is not None and pack_language.imports is not None:
+        spec = _pack_import_spec(node, source, pack_language.imports)
+        return [spec] if spec else []
     return []
 
 
@@ -406,18 +554,28 @@ def _containing_depth(key: tuple[int, int], def_keys: set[tuple[int, int]]) -> i
     )
 
 
-def extract_file(path: str, lang: str, source: bytes) -> ExtractedFile | None:
+def extract_file(
+    path: str, lang: str, source: bytes, *, pack_language: "PackLanguage | None" = None,
+) -> ExtractedFile | None:
     """1 ファイルを tree-sitter で抽出する。
 
     言語のクエリが構築できない (tree-sitter 不在 / grammar 未対応 / クエリ
     不正) 場合は ``None``。呼出側 (``builder.py``) が Python ならこの後で
     :mod:`python_ast` へ縮退し、他言語は読み飛ばして件数を警告する。
+
+    ``lang`` が同梱言語表に無い場合、``pack_language`` (言語パック、
+    c_16 §4.5.3) を渡すとその grammar / クエリで抽出する。渡さなければ
+    ``None`` (呼出側が読み飛ばす)。
     """
-    resolved = _get_parser_and_query(lang)
+    resolved = _get_parser_and_query(lang, pack_language)
     if resolved is None:
         return None
     parser, query = resolved
-    lang_query: LanguageQuery = LANGUAGE_QUERIES[lang]
+    lang_query = LANGUAGE_QUERIES.get(lang) or (
+        pack_language.query if pack_language is not None else None
+    )
+    if lang_query is None:
+        return None
 
     import tree_sitter
 
@@ -509,7 +667,7 @@ def extract_file(path: str, lang: str, source: bytes) -> ExtractedFile | None:
 
     imports: list[str] = []
     for imp_node in import_ts:
-        for spec in _import_specs(imp_node, lang, source):
+        for spec in _import_specs(imp_node, lang, source, pack_language=pack_language):
             spec = spec.strip()
             if spec:
                 imports.append(spec)
@@ -537,4 +695,4 @@ def extract_file(path: str, lang: str, source: bytes) -> ExtractedFile | None:
     )
 
 
-__all__ = ["extract_file", "is_available"]
+__all__ = ["PackLanguage", "extract_file", "is_available"]

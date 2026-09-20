@@ -41,6 +41,10 @@ def _build_export_data(content: ExportContent) -> object:
             elif block.type == "list":
                 section["ordered"] = block.ordered
                 section["items"] = block.items
+                if block.item_levels and block.item_ordered:
+                    # 入れ子があるブロックにだけ足す (無ければ従来と byte 一致)。
+                    section["levels"] = block.item_levels
+                    section["ordered_flags"] = block.item_ordered
             elif block.type == "image":
                 section["src"] = block.src
             elif block.type == "shapes":

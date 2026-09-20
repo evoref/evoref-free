@@ -116,6 +116,27 @@ class TextPlan(_StrictModel):
     clarification_question: str = ""
 
 
+# ── 構成テンプレートによる計画の seed (f_08 §3.1.1) ──
+#
+# 章立ては outline から決定論で組むため、補助タスクへは見出しを持たない
+# 縮小 schema を渡す。返り値に heading が無いので、見出しの追加・削除・
+# 並べ替えは schema の上で起こせない。
+
+class TextPlanSeededUnitNote(_StrictModel):
+    """seed 済み unit への追加要点 (outline の key_points を補う)。"""
+
+    index: int
+    extra_key_points: list[str] = Field(default_factory=list)
+
+
+class TextPlanSeeded(_StrictModel):
+    """構成テンプレートで章立てを固定した計画の縮小 schema。"""
+
+    global_context: str = ""
+    target_length: int = 0
+    unit_notes: list[TextPlanSeededUnitNote] = Field(default_factory=list)
+
+
 # ── コード設計仕様 (code_spec_synthesis) ──
 #
 # コード生成の「事前準備」段階で合成する、ファイル横断の共有契約。
@@ -699,6 +720,8 @@ __all__ = [
     "SectionUnitPlan",
     "CodePlan",
     "TextPlan",
+    "TextPlanSeeded",
+    "TextPlanSeededUnitNote",
     "ReviewIssueItem",
     "ReviewIssues",
     "MetaCognitivePlan",

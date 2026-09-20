@@ -23,15 +23,68 @@
 		currentMode,
 		modeRestartStatus,
 		attachedFiles,
-		clearFiles, corpusMode
+		clearFiles, corpusMode, selectedTemplate, templatesRevision, templateHint
 	} from '$lib/free/stores/chat';
-	import { chatStream, cancelChat } from '$lib/free/api';
+	import { chatStream, cancelChat, listTemplates, type TemplateSummary } from '$lib/free/api';
+	import { handleApiCall } from '$lib/free/utils/error';
 	import { get } from 'svelte/store';
 	import { themeSlots } from '$lib/free/stores/theme';
 	import { setActiveCreateRun, clearActiveCreateRun } from '$lib/free/stores/createRun';
 	import { addToast } from '$lib/free/stores/toast';
 	import FileUpload from './FileUpload.svelte';
 	import FilePreview from './FilePreview.svelte';
+
+	/** インストール済みの文書テンプレート一覧 (0 件なら選択 UI 自体を出さない) */
+	let templates = $state<TemplateSummary[]>([]);
+	let selectedTemplateInfo = $derived(
+		templates.find((tpl) => tpl.key === $selectedTemplate) ?? null
+	);
+
+	// 起動時と、選べる様式の集合が変わったとき (カートリッジの install / 削除 /
+	// 様式の登録 = templatesRevision) に取り直す。消えた様式を選んだままにしない。
+	$effect(() => {
+		void $templatesRevision;
+		let cancelled = false;
+		handleApiCall(() => listTemplates(), { silent: true, fallback: [] }).then((result) => {
+			if (cancelled) return;
+			templates = result ?? [];
+			const current = get(selectedTemplate);
+			if (current !== null && !templates.some((tpl) => tpl.key === current)) {
+				selectedTemplate.set(null);
+			}
+		});
+		return () => {
+			cancelled = true;
+		};
+	});
+
+	/** 選択中テンプレートが持つ部品 (体裁 / 構成 / 帳票) の表示ラベル */
+	function templatePartsLabel(tpl: { has_base: boolean; has_outline: boolean; has_fields: boolean }): string {
+		const parts: string[] = [];
+		if (tpl.has_base) parts.push($t('chat.template_part_base'));
+		if (tpl.has_outline) parts.push($t('chat.template_part_outline'));
+		if (tpl.has_fields) parts.push($t('chat.template_part_fields'));
+		return parts.join(' / ');
+	}
+
+	/**
+	 * 「使える様式がある」通知 (`template_hint`) のうち、インストール済み一覧
+	 * にまだ存在する候補だけ (削除済みの様式を選ばせない)。0 件なら通知自体を
+	 * 出さない。
+	 */
+	let visibleTemplateHints = $derived(
+		($templateHint?.templates ?? []).filter((entry) => templates.some((tpl) => tpl.key === entry.key))
+	);
+
+	/** 通知のボタンから様式を選ぶ (自動送信はしない — 依頼文は改めて送る) */
+	function useTemplateHint(key: string): void {
+		selectedTemplate.set(key);
+		templateHint.set(null);
+	}
+
+	function dismissTemplateHint(): void {
+		templateHint.set(null);
+	}
 
 	let inputText = $state('');
 	let textarea: HTMLTextAreaElement | undefined = $state();
@@ -71,6 +124,9 @@
 		if ($modeRestartStatus === 'restarting') return;
 
 		const files = get(attachedFiles).map((f) => f.name);
+		// 選択中のテンプレートはこのターンにだけ効かせる (先に読み、送信後は
+		// 「なし」へ戻す。c_16 §4.5.2 — 貼り付いたまま別の依頼に効くのを防ぐ)。
+		const templateKey = get(selectedTemplate);
 
 		addMessage({
 			id: nextMessageId(),
@@ -82,6 +138,8 @@
 
 		inputText = '';
 		clearFiles();
+		selectedTemplate.set(null);
+		templateHint.set(null);
 		clearGeneratedEditorCode();
 		clearStreamingEditorCode();
 		sawPartialEditor = false;
@@ -106,7 +164,7 @@
 		});
 
 		try {
-			for await (const event of chatStream(text, mode, turnSessionId, files, abortController.signal, get(corpusMode))) {
+			for await (const event of chatStream(text, mode, turnSessionId, files, abortController.signal, get(corpusMode), templateKey)) {
 				if (event.type === 'token' && event.token) {
 					appendToLastAssistant(event.token);
 				} else if (event.type === 'agent_layer') {
@@ -161,6 +219,8 @@
 					setRagDebugToLastAssistant(event.rag_debug);
 				} else if (event.type === 'sources' && event.sources) {
 					setSourcesToLastAssistant(event.sources);
+				} else if (event.type === 'template_hint' && event.template_hint) {
+					templateHint.set(event.template_hint);
 				} else if (event.type === 'editor_route' && event.editor_route) {
 					setEditorRouteToLastAssistant(event.editor_route.target);
 				} else if (event.type === 'editor_code' && event.editor_code) {
@@ -267,6 +327,59 @@
 
 <div class="chat-input-area">
 	<FilePreview />
+	{#if templates.length > 0}
+		<div class="template-row">
+			<label for="template-select" class="template-label">{$t('chat.template_label')}</label>
+			<select
+				id="template-select"
+				class="template-select"
+				value={$selectedTemplate ?? ''}
+				onchange={(e) => {
+					const v = e.currentTarget.value;
+					selectedTemplate.set(v === '' ? null : v);
+				}}
+			>
+				<option value="">{$t('chat.template_none')}</option>
+				{#each templates as tpl (tpl.key)}
+					<option value={tpl.key}>{tpl.doc_type}</option>
+				{/each}
+			</select>
+			{#if selectedTemplateInfo}
+				<span class="template-parts">{templatePartsLabel(selectedTemplateInfo)}</span>
+			{/if}
+		</div>
+	{/if}
+	{#if visibleTemplateHints.length > 0}
+		<div class="template-hint" role="status">
+			{#if visibleTemplateHints.length === 1}
+				<span class="template-hint-text">
+					{$t('chat.template_hint_single', { doc_type: visibleTemplateHints[0].doc_type })}
+				</span>
+				<button
+					type="button"
+					class="template-hint-use"
+					onclick={() => useTemplateHint(visibleTemplateHints[0].key)}
+				>
+					{$t('chat.template_hint_use')}
+				</button>
+			{:else}
+				<span class="template-hint-text">{$t('chat.template_hint_multiple')}</span>
+				{#each visibleTemplateHints as entry (entry.key)}
+					<button type="button" class="template-hint-use" onclick={() => useTemplateHint(entry.key)}>
+						{entry.doc_type}
+					</button>
+				{/each}
+			{/if}
+			<button
+				type="button"
+				class="template-hint-dismiss"
+				onclick={dismissTemplateHint}
+				aria-label={$t('chat.template_hint_dismiss')}
+			>
+				×
+			</button>
+		</div>
+	{/if}
 	<div class="input-row">
 		<FileUpload />
 		<textarea
@@ -365,5 +478,61 @@
 	}
 	.cancel-btn:hover {
 		opacity: 0.85;
+	}
+	.template-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding-top: 8px;
+		font-size: 12px;
+		color: var(--text-secondary);
+	}
+	.template-select {
+		font-size: 12px;
+		padding: 2px 6px;
+		border: 0.5px solid var(--input-border);
+		border-radius: 4px;
+		background: var(--input-bg);
+		color: var(--text-primary);
+	}
+	.template-parts {
+		opacity: 0.8;
+	}
+	.template-hint {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 8px;
+		padding-top: 8px;
+		font-size: 12px;
+		color: var(--text-secondary);
+	}
+	.template-hint-text {
+		white-space: nowrap;
+	}
+	.template-hint-use {
+		padding: 2px 10px;
+		font-size: 12px;
+		background: var(--input-bg);
+		color: var(--accent);
+		border: 0.5px solid var(--accent);
+		border-radius: 4px;
+		cursor: pointer;
+	}
+	.template-hint-use:hover {
+		opacity: 0.85;
+	}
+	.template-hint-dismiss {
+		margin-left: auto;
+		padding: 0 4px;
+		font-size: 14px;
+		line-height: 1;
+		background: transparent;
+		color: var(--text-secondary);
+		border: none;
+		cursor: pointer;
+	}
+	.template-hint-dismiss:hover {
+		color: var(--text-primary);
 	}
 </style>

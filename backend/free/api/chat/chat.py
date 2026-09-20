@@ -4,6 +4,7 @@ import asyncio
 import re
 from dataclasses import dataclass, field, replace
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -30,7 +31,17 @@ from backend.free.api.chat.chat_constants import (
 from backend.free.api.schemas import (
     CancelRequest, CancelResponse, ChatRequest, ChatResponse, TokenInfo,
 )
+from backend.free.api._error_responses import api_error
 from backend.free.api.chat._editor_routing import detect_editor_route
+from backend.free.api.chat import _template_select
+from backend.export.template_context import (
+    SelectedTemplate,
+    clear_selected_template,
+    get_template_hint,
+    mark_template_applied,
+    set_selected_template,
+    set_template_hint,
+)
 from backend.free.agent.router import indicates_write_destination
 from backend.free.agent.tool_call_judge import (
     _extract_file_path,
@@ -151,6 +162,9 @@ async def _with_chat_in_flight(client, inner_gen, lease=None):
     finally:
         if lease is not None:
             lease.release()
+        # ターン終了 (切断を含む) で選択済みテンプレートを必ず捨てる
+        # (c_16 §4.5.2)。次のターンへ持ち越さない。
+        clear_selected_template()
 
 
 # session_id のフォーマット: 英数字・ハイフンのみ、8-64文字
@@ -271,6 +285,26 @@ def _history_budget(cfg: dict) -> tuple[int, int]:
     )
 
 
+async def _prepend_template_hint(gen: AsyncIterator[str]) -> AsyncIterator[str]:
+    """様式候補通知 (``template_hint``) をストリーム冒頭へ 1 回だけ挿す
+    (c_16 §4.5.2 / c_17 §3.8)。
+
+    層ごとの ``wrapper`` (検索エラー通知 / 出典 / 切り詰め通知、
+    ``_build_messages_with_search`` の ``_wrapper``) とは独立に、``_respond``
+    を通る全ディスパッチ (reactive_light / deliberative / meta_cognitive /
+    long_form / continuation) で同じ場所から出す。``_try_reactive_layer``
+    (即応答、LLM を呼ばない) と ``_dispatch_template_fill`` (様式が既に
+    確定済みで hint は構造的に ``None``) は ``_respond`` を経由しないため
+    対象外 — どちらも書き出しの意図を持たない/様式選択済みのターンなので
+    hint が意味を持たない。
+    """
+    hint = get_template_hint()
+    if hint is not None:
+        yield SSEFrameBuilder.template_hint(hint)
+    async for frame in gen:
+        yield frame
+
+
 async def _respond(
     req: ChatRequest,
     client,
@@ -287,6 +321,9 @@ async def _respond(
     実装は廃止)。どちらも ``chat_in_flight()`` の中で走らせる (LLMClient に
     ユーザー応答進行中であることを通知し、背景処理が協調的に yield できる
     ようにする)。``wrapper`` は検索エラー通知等をストリーム冒頭へ挿す中間関数。
+    様式候補通知 (``template_hint``、:func:`_prepend_template_hint`) は
+    ``wrapper`` とは別に、ここが唯一の差込み口 (ストリーミング / 非
+    ストリーミングの両方が同じ ``gen`` を消費する)。
 
     Trigger A (sleep-time Light、f_02 §4.3) もここで 1 回だけ撃つ。Light は
     LLM を呼ばず埋め込みサーバだけを使うので、どの層の生成とも並走できる。
@@ -299,6 +336,7 @@ async def _respond(
     gen = stream_factory()
     if wrapper is not None:
         gen = wrapper(gen)
+    gen = _prepend_template_hint(gen)
     if req.stream:
         lease = current_turn_lease()
         if lease is not None:
@@ -306,8 +344,12 @@ async def _respond(
         return StreamingResponse(
             _with_chat_in_flight(client, gen, lease), media_type="text/event-stream",
         )
-    async with client.chat_in_flight():
-        return await collect_chat_response(gen, session_id=session_id)
+    try:
+        async with client.chat_in_flight():
+            return await collect_chat_response(gen, session_id=session_id)
+    finally:
+        # 非ストリーミング経路もストリーミングと同じくターン終了で必ず捨てる。
+        clear_selected_template()
 
 
 def _resolve_system_prompt(
@@ -961,6 +1003,10 @@ class RoutePlan:
     output_target: str = "chat"
     #: create モードで UI へ通知する出力先 (``editor_route`` フレーム)。
     editor_route: str | None = None
+    #: ``fields`` を持つ様式への帳票穴埋め (f_11 §9.2) に分岐するか。``True``
+    #: の間、``layer`` による通常のディスパッチ (meta_cognitive / deliberative)
+    #: は使わない (``_route_for_template_fields`` が判定)。
+    route_to_template_fill: bool = False
 
     @property
     def speculate_judge(self) -> bool:
@@ -978,6 +1024,216 @@ class RoutePlan:
         self.escalated_from = self.layer if self.layer == "reactive" else self.escalated_from
         self.layer = layer
         self.reason = reason
+
+
+def _selected_template_from_lookup(lookup) -> SelectedTemplate | None:
+    """``TemplateLookup`` から ``SelectedTemplate`` を組む。
+
+    ``base`` / ``outline`` のどちらか一方でもあれば選択を成立させる
+    (c_16 §4.5.2 の表: outline だけの様式は「構成だけ決める」)。``fields`` を
+    持つエントリは ``outline`` を持たない (corpus 側で無効化/無視済み) ので、
+    帳票 (f_11 §9.2) と構成テンプレート (f_08 §3.1.1) の経路は排他になる。
+    """
+    outline_path = (
+        None if lookup.entry.outline is None
+        else lookup.section_dir / lookup.entry.outline
+    )
+    if lookup.base_path is None and outline_path is None:
+        return None
+    return SelectedTemplate(
+        base_path=lookup.base_path,
+        provenance_key=lookup.provenance_key,
+        outline_path=outline_path,
+        fields=lookup.entry.fields,
+    )
+
+
+def _route_for_template_outline(
+    req: ChatRequest,
+    selected: SelectedTemplate | None,
+    layer: str,
+    reason: str,
+    is_long_form: bool,
+) -> tuple[str, str, bool]:
+    """構成テンプレート (outline) が選ばれたターンの経路を決める (f_08 §3.1.1)。
+
+    outline を読むのは長文の計画段だけなので、router が別の層へ振ると様式が
+    黙って使われない。**明示指定** (``req.template``) した chat モードのターンは
+    長文経路へ確定する。字句判定 (``template_select``) で選ばれただけのターンは
+    強制しない — 「提案書のテンプレートの構成を教えて」のような様式についての
+    問いまで長文生成にしてしまう。その場合は使われなかったことをログに残す。
+    create モードは meta_cognitive/deliberative の層分岐そのものには触らない
+    — 触るのは production_stage 内部の staged/longform 選択で、
+    ``make_production_stage`` の ``force_longform`` (呼出側 ``_dispatch`` が
+    outline 付き様式の選択から立てる) が別途処理する (2026-09-20、f_08 §3.1.1)。
+    """
+    if selected is None or selected.outline_path is None or is_create_mode(req.mode):
+        return layer, reason, is_long_form
+    if req.template:
+        return "meta_cognitive", "template_outline", True
+    if not (layer == "meta_cognitive" and is_long_form):
+        logger.info(
+            "Template outline selected but the turn is not long-form (layer=%s); "
+            "outline will not be used: %s", layer, selected.provenance_key,
+        )
+    return layer, reason, is_long_form
+
+
+def _route_for_template_fields(
+    req: ChatRequest,
+    selected: SelectedTemplate | None,
+    *,
+    output_target: str,
+    write_intent_hint: bool | None,
+    is_long_form: bool,
+) -> bool:
+    """帳票の穴埋め (``fields``) への分岐判定 (f_11 §9.2、純関数)。
+
+    ``fields`` を持つ様式が **明示指定** (``req.template``)、または **字句判定
+    で選ばれた かつ そのターンに書き出し/制作の意図がある** ときだけ ``True``。
+    書き出し/制作の意図は chat モードでは ``output_target == "file"`` /
+    ``write_intent_hint`` / ``classifier.is_long_form`` のいずれか、create
+    モードは制作モードそのものが書き出し前提のため常に意図ありとみなす。
+    それ以外 (様式未選択 / outline のみ / 書き出し意図の無い雑談的な言及) は
+    ``False`` — 既存のディスパッチ (meta_cognitive / deliberative /
+    production_stage) をそのまま通す。**呼出側は問い返し (needs_input) 再開中の
+    ターンをこの結果より優先して弾く** (create モードのみ、f_10 §7 — 再開経路を
+    帳票穴埋めが横取りしないため)。
+    """
+    if selected is None or selected.fields is None:
+        return False
+    if req.template:
+        return True
+    if is_create_mode(req.mode):
+        return True
+    return output_target == "file" or bool(write_intent_hint) or is_long_form
+
+
+@dataclass
+class _TemplateResolution:
+    """``_resolve_template_resolution`` の結果 (選択 + hint 用の判定材料)。
+
+    ``verdict`` / ``candidates`` は判定点 ``template_select`` を **1 回だけ**
+    呼んだ結果を hint 計算 (``_build_template_hint``) と共有するためのもの —
+    hint 用に判定点を再度呼ぶと ``decision.jsonl`` の記録が二重になる。
+    明示指定 (``req.template``) のターンは判定点を経由しないため両方とも空。
+    """
+
+    selected: SelectedTemplate | None
+    verdict: "Verdict | None" = None
+    candidates: tuple["TemplateCandidate", ...] = ()
+
+
+def _resolve_template_resolution(
+    req: ChatRequest, state: AppState,
+) -> _TemplateResolution:
+    """このターンで適用する文書テンプレートを決める (c_16 §4.5.2 / c_17 §3.8)。
+
+    明示指定 (``req.template``) は判定を経ずに確定する。存在しない鍵は 400。
+    未指定なら、インストール済みテンプレートが 1 件以上あるときだけ判定点
+    ``template_select`` を呼ぶ (0 件は判定点自体を呼ばない、記録も出さない)。
+    """
+    manager = getattr(state, "cartridge_manager", None)
+
+    if req.template:
+        lookup = manager.get_template(req.template) if manager is not None else None
+        selected = _selected_template_from_lookup(lookup) if lookup else None
+        if selected is None:
+            raise api_error(
+                400, "E0400", f"Template not found: {req.template}",
+                "api.template_not_found", template_key=req.template,
+            )
+        return _TemplateResolution(selected=selected)
+
+    if manager is None:
+        return _TemplateResolution(selected=None)
+    candidates = tuple(manager.template_candidates())
+    if not candidates:
+        return _TemplateResolution(selected=None)
+    verdict = _template_select.select_template(req.message, candidates)
+    if verdict.band != "fire" or not isinstance(verdict.value, str):
+        return _TemplateResolution(selected=None, verdict=verdict, candidates=candidates)
+    lookup = manager.get_template(verdict.value)
+    if lookup is None:
+        return _TemplateResolution(selected=None, verdict=verdict, candidates=candidates)
+    return _TemplateResolution(
+        selected=_selected_template_from_lookup(lookup),
+        verdict=verdict, candidates=candidates,
+    )
+
+
+def _resolve_selected_template(
+    req: ChatRequest, state: AppState,
+) -> SelectedTemplate | None:
+    """``_resolve_template_resolution`` の選択結果だけを返す薄いラッパ。
+
+    hint 用の verdict / candidates が要らない呼出側 (既存テスト含む) 向け。
+    """
+    return _resolve_template_resolution(req, state).selected
+
+
+def _template_hint_entries(
+    text: str, candidates: "Sequence[TemplateCandidate]",
+) -> list[dict]:
+    """指名に該当したエントリを最大 5 件、``template_hint`` フレーム用の形にする
+    (c_16 §4.5.2 / c_17 §3.8)。``matches_naming`` は判定点内部で使うのと同じ
+    純粋な字句照合 (副作用も判定記録も無い) なので、ここで再計算してよい。
+    """
+    named = [c for c in candidates if c.matches_naming(text)]
+    return [
+        {
+            "key": c.label,
+            "doc_type": c.entry.doc_type,
+            "has_base": c.entry.base is not None,
+            "has_outline": c.entry.outline is not None,
+            "has_fields": c.entry.fields is not None,
+        }
+        for c in named[:5]
+    ]
+
+
+def _build_template_hint(
+    req: ChatRequest,
+    selected: SelectedTemplate | None,
+    verdict: "Verdict | None",
+    candidates: "Sequence[TemplateCandidate]",
+    *,
+    output_target: str,
+    write_intent_hint: bool | None,
+    is_long_form: bool,
+) -> dict | None:
+    """``template_hint`` フレームの中身を決める (純関数、c_16 §4.5.2 B-0 残件 /
+    c_17 §3.8)。
+
+    3 条件が揃ったときだけ辞書を返す: (a) このターンで様式が選ばれていない
+    (明示指定も判定点の ``fire`` も無い、``selected is None``) (b) 判定点
+    ``template_select`` が ``abstain`` (``candidate`` / ``ambiguous``) (c) その
+    ターンに書き出し/制作の意図がある (create モードは常に意図ありとみなす、
+    ``_route_for_template_fields`` と同じ基準)。雑談で様式語を伴わず言及した
+    だけのターンや、書き出しの意図が無いターンには出さない。
+    """
+    if selected is not None or verdict is None or verdict.band != "abstain":
+        return None
+    if verdict.evidence not in (
+        _template_select.CANDIDATE_EVIDENCE, _template_select.AMBIGUOUS_EVIDENCE,
+    ):
+        return None
+    has_write_intent = (
+        is_create_mode(req.mode)
+        or output_target == "file"
+        or bool(write_intent_hint)
+        or is_long_form
+    )
+    if not has_write_intent:
+        return None
+    templates = _template_hint_entries(req.message, candidates)
+    if not templates:
+        return None
+    kind = (
+        "candidate" if verdict.evidence == _template_select.CANDIDATE_EVIDENCE
+        else "ambiguous"
+    )
+    return {"kind": kind, "templates": templates}
 
 
 def _plan_output_target(req: ChatRequest) -> tuple[str, str | None]:
@@ -1504,6 +1760,188 @@ async def _dispatch_long_form(
     )
 
 
+def _unique_output_path(path: Path) -> Path:
+    """既存ファイルを上書きしない (f_11 §5.2)。衝突したら ``_2`` から連番。"""
+    if not path.exists():
+        return path
+    candidate = path
+    n = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}_{n}{path.suffix}")
+        n += 1
+    return candidate
+
+
+def _resolve_template_fill_output_path(
+    req: ChatRequest, selected: SelectedTemplate, ext: str,
+) -> Path:
+    """帳票の書き出し先を決める (f_11 §9.2「出力」)。
+
+    宛先の指定があれば通常の書き出しと同じ保護経路 (``_resolve_long_form_
+    target_path``、既存ディレクトリ/READ 参照ファイルの保護、f_11 §5.2) を
+    通す。無ければ ``local_paths.outputs_dir`` 配下に ``<entry_id>_<UTC>``
+    (拡張子は ``base`` と同じ)。
+    """
+    from backend.config import resolve_outputs_dir
+    from backend.free.api.chat.chat_stream_output import _resolve_long_form_target_path
+    from backend.utils import utc_compact_stamp
+
+    explicit = _extract_file_path(req.message)
+    if explicit:
+        candidate = Path(_resolve_long_form_target_path(explicit, req.message))
+        if candidate.suffix.lower() != ext:
+            candidate = candidate.with_suffix(ext)
+    else:
+        entry_id = selected.provenance_key.rsplit(":", 1)[-1]
+        candidate = resolve_outputs_dir() / f"{entry_id}_{utc_compact_stamp()}{ext}"
+    return _unique_output_path(candidate)
+
+
+def _format_template_fill_summary(path: Path, field_specs, values: dict) -> str:
+    """書いた場所 + 入れた値の一覧 (確認用、f_11 §9.2)。"""
+    from backend.i18n_helper import msg
+
+    lines = [msg("api.template_fill_written", path=str(path))]
+    for f in field_specs:
+        if f.repeat:
+            rows = values.get(f.name) or []
+            lines.append(f"- {f.name}: {len(rows)} 件")
+            continue
+        value = values.get(f.name)
+        if value is None:
+            continue
+        lines.append(f"- {f.name}: {value}")
+    return "\n".join(lines)
+
+
+async def _run_template_fill(
+    req: ChatRequest, state: AppState, selected: SelectedTemplate, history: list,
+) -> str:
+    """値の決定 (文法制約 JSON 1 回) → 検証 → 書込みまでを行い、応答文を返す。
+
+    書けなかった場合 (項目不足 / 書込み失敗) も例外を投げず、その旨のテキスト
+    を返す (呼出側がそのままユーザー応答にする)。
+    """
+    from backend.export.template_fill import decide_template_values
+    from backend.export.template_writer import (
+        TemplateFillError,
+        compute_values,
+        fill_template,
+        parse_field_specs,
+        validate_values,
+    )
+    from backend.i18n_helper import msg
+
+    field_specs = parse_field_specs(selected.fields or ())
+    if field_specs is None or selected.base_path is None:
+        # install 済みのはずが実行時に壊れている (縮退) — 安全側へ倒す。
+        logger.warning(
+            "template_fill: selected template has no usable fields/base "
+            "(provenance=%s)", selected.provenance_key,
+        )
+        return msg("api.template_fields_invalid")
+
+    aux_client = getattr(state, "aux_client", None)
+    file_text = "\n\n".join(
+        f"[{fc.filename}]\n" + "\n".join(fc.chunks) for fc in req.file_contexts
+    )
+    raw_values = await decide_template_values(
+        aux_client, field_specs,
+        instruction=req.message,
+        history_text=_recent_dialogue_text(history),
+        file_text=file_text,
+    )
+    ok, missing, coerced = validate_values(field_specs, raw_values)
+    # 値そのものは DEBUG にだけ出す (private のターンは出さない)。形だけでは
+    # 「モデルが何を返して検査のどこで落ちたか」が追えない (2026-09-20 実機確認)。
+    logger.debug(
+        "template_fill: decided values (%s): %s",
+        selected.provenance_key, "[PRIVATE]" if req.private else raw_values,
+    )
+    logger.info(
+        "template_fill: %s ok=%s missing=%s",
+        selected.provenance_key, ok, [f.name for f in missing],
+    )
+    if not ok:
+        names = "、".join(f.description or f.name for f in missing)
+        return msg("api.template_fill_needs_input", fields=names)
+
+    coerced.update(compute_values(field_specs, coerced))
+    ext = Path(selected.base_path).suffix.lower()
+    out_path = _resolve_template_fill_output_path(req, selected, ext)
+    try:
+        fill_template(
+            selected.base_path, field_specs, coerced, out_path,
+            provenance=selected.provenance_key,
+        )
+    except TemplateFillError as e:
+        logger.warning("template_fill: write failed (%s): %s", selected.provenance_key, e)
+        return msg("api.template_fill_failed", error=str(e))
+    # 実際に書けたターンだけ来歴を運ぶ (c_05 §0.6)。
+    mark_template_applied()
+    return _format_template_fill_summary(out_path, field_specs, coerced)
+
+
+async def _dispatch_template_fill(
+    req: ChatRequest,
+    state: AppState,
+    session_id: str,
+    instance_name: str,
+    context_size: int,
+    selected: SelectedTemplate,
+    history: list,
+) -> StreamingResponse | ChatResponse:
+    """帳票の穴埋め (f_11 §9.2 / c_16 §4.5.2、段階 B-1b) へのディスパッチ。
+
+    値の決定 (文法制約 JSON 1 回、CLAUDE.md §6 #1) と書込みだけで完結する
+    — meta_cognitive / deliberative / production_stage の生成経路は一切
+    使わない。ストリーミング / 非ストリーミング・履歴への記録は
+    ``_try_reactive_layer`` と同じ作法 (新しい SSE イベント種別は作らない、
+    既存の ``token`` / ``token_info`` / ``done`` フレームだけで完結する)。
+    chat / create の両モードで呼ばれる (``_route_for_template_fields``、
+    2026-09-20 に create も対象化)。create モードでも staged/longform の
+    run (``RunRecordStore``) は起こさない — 値の決定と書込みだけの短い経路に
+    run の概念を持ち込むと、途中経過の無い run が 1 件だけ並ぶことになり
+    Phase 3b の再接続 UI が扱いに困る。呼出側 (``_dispatch``) が問い返し
+    (needs_input) 再開中のターンをこの経路より優先して弾く。
+    """
+    from backend.free.api.chat.chat_stream_common import agent_layer_frame
+
+    try:
+        text = await _run_template_fill(req, state, selected, history)
+        # 来歴 (mark_template_applied 済みなら) を経験へ刻む。clear より前に
+        # 呼ぶ必要がある — このディスパッチは _respond を経由しないため、
+        # 通常経路 (ストリーム終了時の clear) より先に record_response が走る。
+        record_response(
+            state, text, [], session_id, req.message, req.mode, 0,
+            private=req.private,
+        )
+    finally:
+        # ターン終了で必ず捨てる (c_16 §4.5.1)。このディスパッチは _respond を
+        # 経由しないので、ここで明示的に呼ぶ。
+        clear_selected_template()
+
+    if req.stream:
+        sse = SSEFrameBuilder()
+
+        async def _gen():
+            yield agent_layer_frame("meta_cognitive")
+            yield sse.token(text)
+            yield sse.token_info({
+                "used": 0, "limit": context_size, "pct": 0,
+                "instance_name": instance_name,
+            })
+            yield sse.done()
+
+        return StreamingResponse(_gen(), media_type="text/event-stream")
+    return ChatResponse(
+        response=text,
+        token_info=TokenInfo(used=0, limit=context_size, pct=0, instance_name=instance_name),
+        session_id=session_id,
+        agent_layer="meta_cognitive",
+    )
+
+
 def make_staged_codegen_delegate(client, cfg: dict, *, max_tokens: int | None = None):
     """base クリエイトモデル経由の codegen 委譲を作る
     ((instruction, file_path) -> {path: code})。
@@ -1573,19 +2011,25 @@ class _ProductionStageSelector:
     種類) が無く、かつ再開ターンでもなければ問い返し (``blocked``、Phase 3b)
     へ倒す。対象がある / 再開ターンなら従来どおり longform へ委譲する
     (legacy の ``fallback_factory`` と同じ役目)。
+
+    ``force_longform=True`` (outline を持つ様式が選ばれたターン、f_08 §3.1.1)
+    は content_type 判定を経ずに longform へ確定する — staged (コード生成)
+    に振られると outline が使われないため。様式は「計画そのもの」として
+    扱う契約なので、問い返し前提の判定 (:meth:`precheck`) も skip する。
     """
 
     name = "production"
 
     def __init__(
         self, *, staged_factory, longform_factory, staged_base_enabled: bool,
-        resume_of: str | None = None,
+        resume_of: str | None = None, force_longform: bool = False,
     ) -> None:
         self._staged_factory = staged_factory
         self._longform_factory = longform_factory
         self._staged_base_enabled = staged_base_enabled
         self._resume_of = resume_of
         self._resume_finished = False
+        self._force_longform = force_longform
 
     async def precheck(self, req):
         """計画の前に決定論で問い返すか (f_03 §4.4、2026-09-19)。
@@ -1593,6 +2037,8 @@ class _ProductionStageSelector:
         対象 (パス / 言語 / 成果物名詞、``names_creation_target``) が無く再開でも
         なければ、LLM を 1 回も呼ばずに ``blocked`` を返す。run は
         ``project_id="needs_input"`` の workspace を起こしてそこに置く (f_10 §7)。
+        様式の選択 (``force_longform``) は対象の指名と同じ扱い — 様式そのもの
+        が何を作るかを既に決めているため問い返さない (f_08 §3.1.1)。
         """
         from pathlib import Path
         from types import SimpleNamespace
@@ -1600,7 +2046,10 @@ class _ProductionStageSelector:
 
         from backend.free.loop.staged import WorkspaceManager
 
-        if req.resume_of or self._resume_of or names_creation_target(req.instruction):
+        if (
+            req.resume_of or self._resume_of or self._force_longform
+            or names_creation_target(req.instruction)
+        ):
             return None
         run_id = uuid4().hex[:12]
         create_dir = Path(get_path_resolver().resolve_local("create_workspace_dir"))
@@ -1624,7 +2073,7 @@ class _ProductionStageSelector:
             # 制作ステージが走り出したら旧 (blocked) run を終端する (1 回だけ、f_10 §7)。
             self._resume_finished = True
             self._finish_resumed_run(req.resume_of)
-        use_staged = self._staged_base_enabled
+        use_staged = self._staged_base_enabled and not self._force_longform
         if use_staged:
             try:
                 use_staged = (
@@ -1708,6 +2157,7 @@ def make_production_stage(
     client, state: AppState, cfg: dict, gen_params: dict, session_id: str,
     *, brief: str, mode: str, output_target: str,  # noqa: ARG001 - 現状は ProductionRequest 側が持つため未使用 (署名は f_03 §4.4 と一致させる)
     resume_of: str | None = None,
+    force_longform: bool = False,
 ) -> _ProductionStageSelector:
     """create.dispatch=meta 用の制作ステージを組み立てる (composition 層、f_03 §4.4)。
 
@@ -1718,7 +2168,9 @@ def make_production_stage(
 
     ``resume_of`` は問い返し (``needs_input``、Phase 3b) から再開する元
     run_id — 呼出側 (``_dispatch``) が直前ターンの ``blocked`` run を見つけた
-    ときだけ渡す。
+    ときだけ渡す。``force_longform`` は構成テンプレート (outline) を持つ様式
+    が選ばれたターン (f_08 §3.1.1) — content_type 判定を経ずに longform へ
+    確定する。
     """
     staged_base_enabled = _staged_stage_base_enabled(mode, cfg, state)
 
@@ -1761,6 +2213,7 @@ def make_production_stage(
     return _ProductionStageSelector(
         staged_factory=_staged_factory, longform_factory=_longform_factory,
         staged_base_enabled=staged_base_enabled, resume_of=resume_of,
+        force_longform=force_longform,
     )
 
 
@@ -2109,27 +2562,55 @@ async def _chat_turn(req: ChatRequest, state: AppState):
             logger.warning("Write intent gate failed, falling back: %s", e)
 
     output_target, editor_route = _plan_output_target(req)
+    # このターンで write_file が使う体裁継承テンプレート (c_16 §4.5.2)。
+    # ツール引数は増やさず、ターンスコープの contextvar (f_11 §9.1) で運ぶ。
+    # 判定点 template_select は 1 回だけ評価し (verdict / candidates を
+    # hint 計算 (_build_template_hint) と共有、decision.jsonl の二重記録を避ける)。
+    template_resolution = _resolve_template_resolution(req, state)
+    selected_template = template_resolution.selected
+    set_selected_template(selected_template)
     layer = classifier.classify(
         req.message, mode=req.mode,
         context=lambda: _recent_dialogue_text(history),
         write_intent_hint=write_intent_hint,
     )
     reason = getattr(classifier, "_last_classify_reason", "default")
-    if (
-        is_create_mode(req.mode)
-        and layer != "meta_cognitive"
-        and _find_needs_input_run(session_id) is not None
-    ):
-        # 問い返し (needs_input) 中のセッションの次の発話は回答なので、router
-        # の層に関わらず meta (再開) へ回す。短い「…に保存して」が deliberative
-        # に振られて再開経路を通らず、旧 run が blocked のまま残った (2026-09-19)。
+    # 問い返し (needs_input、Phase 3b) 再開中のセッションかどうか。層の上書き
+    # (下記) と帳票穴埋めへの分岐抑止 (f_10 §7、再開経路を横取りしない) の
+    # 両方がこの 1 回の判定を使う。
+    needs_input_pending = (
+        is_create_mode(req.mode) and _find_needs_input_run(session_id) is not None
+    )
+    if layer != "meta_cognitive" and needs_input_pending:
+        # 問い返し中のセッションの次の発話は回答なので、router の層に関わらず
+        # meta (再開) へ回す。短い「…に保存して」が deliberative に振られて
+        # 再開経路を通らず、旧 run が blocked のまま残った (2026-09-19)。
         layer, reason = "meta_cognitive", "needs_input_resume"
+    layer, reason, is_long_form = _route_for_template_outline(
+        req, selected_template, layer, reason, bool(classifier.is_long_form),
+    )
+    route_to_template_fill = _route_for_template_fields(
+        req, selected_template,
+        output_target=output_target,
+        write_intent_hint=write_intent_hint,
+        is_long_form=is_long_form,
+    ) and not needs_input_pending
+    # 様式候補通知 (c_16 §4.5.2 B-0 残件 / c_17 §3.8)。ストリーム冒頭への
+    # 実際の差込みは _respond (_prepend_template_hint) が行う。
+    set_template_hint(_build_template_hint(
+        req, selected_template, template_resolution.verdict,
+        template_resolution.candidates,
+        output_target=output_target,
+        write_intent_hint=write_intent_hint,
+        is_long_form=is_long_form,
+    ))
     plan = RoutePlan(
         layer=layer,
         reason=reason,
-        is_long_form=bool(classifier.is_long_form),
+        is_long_form=is_long_form,
         output_target=output_target,
         editor_route=editor_route,
+        route_to_template_fill=route_to_template_fill,
     )
     logger.info(
         "Agent layer: %s (mode=%s) for query: %s",
@@ -2148,6 +2629,23 @@ async def _chat_turn(req: ChatRequest, state: AppState):
             reason=plan.reason,
             context={"mode": req.mode},
             scope="request",
+        )
+        # 帳票穴埋め (f_11 §9.2) への分岐可否。判定点ではなく経路の記録
+        # (字句判定 `template_select` は既に確定済み) — 様式に fields が
+        # あるターンだけ出す (0 件は他の判定点と同じく出さない)。
+        if selected_template is not None and selected_template.fields is not None:
+            dl.log_decision(
+                decision_point="template_fill_route",
+                chosen="fill" if route_to_template_fill else "skip",
+                candidates=["fill", "skip"],
+                reason="explicit" if req.template else plan.reason,
+                context={"mode": req.mode},
+                scope="request",
+            )
+    if route_to_template_fill and selected_template is not None:
+        return await _dispatch_template_fill(
+            req, state, session_id, instance_name, context_size,
+            selected_template, history,
         )
 
     # 事例ゲートとの shadow 比較。**挙動は変えない** — 不一致だけを
@@ -2334,6 +2832,13 @@ async def _chat_turn(req: ChatRequest, state: AppState):
                         client, state, cfg, gen_params, session_id,
                         brief=brief, mode=req.mode, output_target=plan.output_target,
                         resume_of=resume_of,
+                        # outline を持つ様式が選ばれたターンは longform/TEXT に
+                        # 確定する (staged に振られると outline が使われない、
+                        # f_08 §3.1.1)。
+                        force_longform=(
+                            selected_template is not None
+                            and selected_template.outline_path is not None
+                        ),
                     )
                 elif plan.is_long_form:
                     return await _dispatch_long_form(

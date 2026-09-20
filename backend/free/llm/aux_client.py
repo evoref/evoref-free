@@ -131,6 +131,9 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # ユーザ体感を阻害するため、失敗時は単一タスクへ倒して先へ進む。
     "meta_cognitive_plan": 90.0,
     "create_task_graph": 120.0,
+    # 帳票の穴埋め (f_11 §9.2、段階 B-1b)。chat 応答パスで同期発火する
+    # (CLAUDE.md §6 #1)。失敗時は needs_input へ倒すだけなので短く打ち切る。
+    "template_fill": 60.0,
     # spec.md の生成 / 節深化。実効値は executor が config の
     # ``create.staged.spec_timeout_sec`` を明示指定するためそちらが優先
     # (本値は整合目的)。
@@ -213,6 +216,7 @@ CHAT_PATH_PURPOSES: frozenset[str] = frozenset({
     "tool_summarize",         # agent/tools/builtin (deliberative のツール実行)
     "tool_translate",
     "tool_draft_document",
+    "template_fill",          # export/template_fill (帳票の穴埋め、f_11 §9.2)
 })
 
 #: **チャットがアイドルになるまで dispatch を待つ** purpose (sleep-time / 学習)。
@@ -711,8 +715,13 @@ class AuxClient:
         response_schema: type[BaseModel] | None = None,
         telemetry: dict | None = None,
         deferrable: bool | None = None,
+        system: str | None = None,
     ) -> dict:
         """JSON 出力を生成してパースする。パース不能時は空 dict を返す。
+
+        ``system`` は呼出を跨いで共有する文脈 (ProductionBrief 等) を別メッセージで
+        渡すためのもの。1 通の user に連結すると同じスロットの連続呼出でも接頭辞 KV
+        が再利用されない (hybrid recurrent はメッセージ境界でしか戻れない、f_08 §2.2)。
 
         ``finish_reason=length`` (max_tokens 到達で JSON が途中で切れた) は
         **修復しない**。``json_repair`` は ``[0, 1,`` を ``[0, 1]`` に閉じるので、
@@ -720,8 +729,9 @@ class AuxClient:
         gate なら関連チャンクが落ちる)。空 dict で呼出側のフォールバックへ倒し、
         ``telemetry["json_truncated"] = True`` で観測できるようにする。
         """
+        head = [{"role": "system", "content": system}] if system else []
         result = await self.generate(
-            [{"role": "user", "content": prompt}],
+            [*head, {"role": "user", "content": prompt}],
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,

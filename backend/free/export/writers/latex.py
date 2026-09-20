@@ -8,7 +8,13 @@ from __future__ import annotations
 from typing import override
 
 from backend.export._writer_base import BytesWriterBase
-from backend.export.base import ContentBlock, ExportContent
+from backend.export.base import (
+    ContentBlock,
+    ExportContent,
+    ListItemNode,
+    build_item_tree,
+    sibling_runs,
+)
 from backend.export.markdown_patterns import (
     RE_BOLD as _RE_BOLD,
     RE_INLINE_CODE as _RE_CODE_INLINE,
@@ -81,6 +87,24 @@ def _inline_latex(text: str) -> str:
     return text
 
 
+def _list_latex_lines(nodes: list[ListItemNode], indent: str = "") -> list[str]:
+    """入れ子ツリーを ``itemize``/``enumerate`` の行列にする。
+
+    平らな (子を持たない) ノードだけなら従来と同じ行列になる。
+    """
+    lines: list[str] = []
+    item_indent = indent + "  "
+    for run in sibling_runs(nodes):
+        env = "enumerate" if run[0].ordered else "itemize"
+        lines.append(rf"{indent}\begin{{{env}}}")
+        for node in run:
+            parts = [_inline_latex(part) for part in node.text.split("\n")]
+            lines.append(rf"{item_indent}\item " + r" \\ ".join(parts))
+            lines.extend(_list_latex_lines(node.children, item_indent + "  "))
+        lines.append(rf"{indent}\end{{{env}}}")
+    return lines
+
+
 def _blocks_to_latex(blocks: list[ContentBlock], title: str) -> str:
     """ContentBlock リストを完全な LaTeX 文書に変換"""
     parts: list[str] = [_PREAMBLE]
@@ -129,11 +153,7 @@ def _blocks_to_latex(blocks: list[ContentBlock], title: str) -> str:
                 parts.append("")
 
         elif block.type == "list":
-            env = "enumerate" if block.ordered else "itemize"
-            parts.append(rf"\begin{{{env}}}")
-            for item in block.items:
-                parts.append(rf"  \item {_inline_latex(item)}")
-            parts.append(rf"\end{{{env}}}")
+            parts.extend(_list_latex_lines(build_item_tree(block)))
             parts.append("")
 
         elif block.type == "quote":

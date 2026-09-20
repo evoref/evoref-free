@@ -357,8 +357,11 @@ CLAIM_SOURCE_KINDS: frozenset[str] = frozenset(
 #: note の ``attrs.mode``。
 NOTE_MODES: frozenset[str] = frozenset({"chat", "coding"})
 
-#: code_node の ``attrs.node_type`` に許す値 (c_16 §3.5)。
-CODE_NODE_TYPES: frozenset[str] = frozenset({"file", "class", "function", "method"})
+#: code_node の ``attrs.node_type`` に許す値 (c_16 §3.5)。``component`` は
+#: マークアップ / SFC (Svelte / Vue) の単一ファイルコンポーネント (c_16 §4.4)。
+CODE_NODE_TYPES: frozenset[str] = frozenset({
+    "file", "class", "function", "method", "component",
+})
 
 
 def validate_attrs(kind: str, attrs: dict[str, Any]) -> None:

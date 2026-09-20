@@ -36,9 +36,12 @@ from backend.free.rag.corpus.store import (
     CorpusInstallCancelled,
     CorpusPackage,
     CorpusStore,
+    LanguageOverlay,
+    TemplateLookup,
     merge_rag_evidence_config,
     resolve_cartridge_gate_threshold,
 )
+from backend.free.rag.corpus.templates import TemplateCandidate
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -65,8 +68,8 @@ class CartridgeInstallCancelled(CorpusInstallCancelled):
 class CartridgeInfo:
     """API / CLI に返すパッケージの見え方 (`PackageMeta` + 実行時の状態)。
 
-    ``priority`` / ``needs_rebuild`` / ``docs_digest`` / ``kind`` は無い
-    (c_16 §8)。
+    ``priority`` / ``needs_rebuild`` / ``docs_digest`` は無い (c_16 §8)。
+    ``kind`` / ``provides`` はセクション化 (c_16 §4.3) の読み取り専用フィールド。
     """
 
     id: str
@@ -91,9 +94,18 @@ class CartridgeInfo:
     embedding_model_id: str = ""
     embedding_dim: int = 0
     schema_version: int = 1
+    #: 所有と生まれ方 (``package`` / ``project_map``、c_16 §4.3)。
+    kind: str = "package"
+    #: 運ぶセクション名の列 (``docs`` / ``templates`` / ``language``)。
+    provides: list[str] = field(default_factory=list)
+    #: ``language/`` セクションの各エントリの有効/無効と理由 (c_16 §4.5.3)。
+    #: ``get_cartridge`` (詳細) だけが埋める — 一覧では計算しない。
+    language_pack: list[dict] = field(default_factory=list)
 
 
-def cartridge_info_of(package: CorpusPackage) -> CartridgeInfo:
+def cartridge_info_of(
+    package: CorpusPackage, *, language_pack: list[dict] | None = None,
+) -> CartridgeInfo:
     """:class:`CorpusPackage` を :class:`CartridgeInfo` にする。"""
     meta: PackageMeta = package.meta
     return CartridgeInfo(
@@ -117,6 +129,9 @@ def cartridge_info_of(package: CorpusPackage) -> CartridgeInfo:
         embedding_model_id=package.embedding_model_id,
         embedding_dim=package.embedding_dim,
         schema_version=meta.schema_version,
+        kind=meta.kind,
+        provides=list(meta.provides),
+        language_pack=list(language_pack or []),
     )
 
 
@@ -155,6 +170,11 @@ class CartridgeManager:
     def corpus(self) -> CorpusStore:
         """実体の :class:`CorpusStore`。"""
         return self._corpus
+
+    @property
+    def max_package_bytes(self) -> int:
+        """`.evocart` zip 本体のサイズ上限 (``rag.packages.max_package_bytes``)。"""
+        return self._corpus.max_package_bytes
 
     def set_embedder(self, embedder: "EmbeddingBackend | None") -> None:
         """埋め込みバックエンドを差し替える。"""
@@ -239,7 +259,11 @@ class CartridgeManager:
 
     def get_cartridge(self, cartridge_id: str) -> CartridgeInfo | None:
         package = self._corpus.get(cartridge_id)
-        return None if package is None else cartridge_info_of(package)
+        if package is None:
+            return None
+        return cartridge_info_of(
+            package, language_pack=self._corpus.language_report(cartridge_id),
+        )
 
     @property
     def loaded(self) -> dict[str, CorpusPackage]:
@@ -259,6 +283,22 @@ class CartridgeManager:
 
     def get_tool_hints(self) -> list[dict]:
         return self._corpus.get_tool_hints()
+
+    # ── templates (c_16 §4.5.2) ──
+
+    def list_templates(self) -> list[dict]:
+        return self._corpus.list_templates()
+
+    def get_template(self, key: str) -> TemplateLookup | None:
+        return self._corpus.get_template(key)
+
+    def template_candidates(self) -> list[TemplateCandidate]:
+        return self._corpus.template_candidates()
+
+    # ── language (c_16 §4.5.3) ──
+
+    def language_overlay(self) -> LanguageOverlay:
+        return self._corpus.language_overlay()
 
     def get_loaded_stores(self) -> dict[str, "VectorStore"]:
         """空 dict を返す (corpus パッケージは不変なので追記対象が無い)。

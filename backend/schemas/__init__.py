@@ -43,7 +43,7 @@ from backend.schemas._common import (
     WidgetProxyConfig,
 )
 from backend.schemas._root import EvorefConfig, validate_config
-from backend.schemas.create import CreateConfig, CreateStagedConfig
+from backend.schemas.create import CreateConfig, CreateStagedConfig, StagedVerifyConfig
 from backend.schemas.learning import (
     FeedbackPipeConfig,
     LearningConfig,
@@ -128,6 +128,7 @@ __all__ = [
     "SemMemLimitsConfig",
     "SemMemProjectConfig",
     "ServerConfig",
+    "StagedVerifyConfig",
     "StreamingConfig",
     "SubjectDictionaryConfig",
     "ThemeConfig",

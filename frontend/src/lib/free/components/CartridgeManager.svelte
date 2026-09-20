@@ -15,12 +15,14 @@
 	} from '$lib/free/api';
 	import { handleApiCall } from '$lib/free/utils/error';
 	import { formatSize } from '$lib/free/utils/format';
+	import { templatesRevision } from '$lib/free/stores/chat';
 	import CartridgeDetailDialog from './CartridgeDetailDialog.svelte';
 	import CartridgeProgressView, {
 		type PhaseSpec,
 		type ProgressState
 	} from './CartridgeProgressView.svelte';
 	import DialogShell from './DialogShell.svelte';
+	import RegisterTemplateDialog from './RegisterTemplateDialog.svelte';
 
 	// エディション固有 UI (Pro 等) は親 route から snippet として注入する。
 	// Free 配下のコンポーネントが $lib/pro を直接参照すると境界違反になるため、
@@ -35,6 +37,7 @@
 	let fileInput: HTMLInputElement | undefined = $state();
 	let errorMessage = $state('');
 	let selectedDetail = $state<CartridgeDetail | null>(null);
+	let showRegisterTemplate = $state(false);
 
 	// インストール進捗状態
 	const INSTALL_PHASES: PhaseSpec[] = [
@@ -64,6 +67,9 @@
 			fallback: []
 		});
 		cartridges = result ?? [];
+		// 一覧を取り直すのは install / 削除 / 様式の登録の後 — どれも選べる様式の
+		// 集合を変えうるので、チャット入力の選択肢にも取り直しを知らせる。
+		templatesRevision.update((n) => n + 1);
 	}
 
 	function _resetProgress() {
@@ -230,6 +236,9 @@
 		<button class="install-btn" onclick={() => fileInput?.click()} disabled={progressDialogOpen}>
 			{$t('cartridge.install')}
 		</button>
+		<button class="install-btn template-register-btn" onclick={() => (showRegisterTemplate = true)}>
+			{$t('cartridge.template_register')}
+		</button>
 		<input
 			bind:this={fileInput}
 			type="file"
@@ -248,33 +257,44 @@
 	{:else}
 		<ul class="cartridge-list">
 			{#each cartridges as cart}
+				<!-- 索引 (読み込み / 取外し / 再構築) は docs セクションの操作。様式や言語
+				     パックだけのパッケージには出さない (provides が無い旧応答は従来どおり) -->
+				{@const hasDocs = !cart.provides || cart.provides.includes('docs')}
 				<li class="cartridge-item" class:loaded={cart.status === 'loaded'}>
 					<button class="info" onclick={() => handleShowDetail(cart.id)}>
 						<span class="name">{cart.name}</span>
 						<span class="desc">{cart.description}</span>
 						<span class="meta">
-							v{cart.version} / {cart.chunks} chunks / {formatSize(cart.size_mb)}
+							{#if hasDocs}
+								v{cart.version} / {cart.chunks} chunks / {formatSize(cart.size_mb)}
+							{:else}
+								v{cart.version} / {(cart.provides ?? [])
+									.map((p) => $t(`cartridge.provides_${p}`))
+									.join(' / ')}
+							{/if}
 						</span>
 					</button>
 					<div class="actions">
-						{#if cart.status === 'loaded'}
-							<button class="action-btn unload" onclick={() => handleUnload(cart.id)}>
-								{$t('cartridge.unload')}
-							</button>
-						{:else}
-							<button class="action-btn primary" onclick={() => handleLoad(cart.id)}>
-								{$t('cartridge.load')}
+						{#if hasDocs}
+							{#if cart.status === 'loaded'}
+								<button class="action-btn unload" onclick={() => handleUnload(cart.id)}>
+									{$t('cartridge.unload')}
+								</button>
+							{:else}
+								<button class="action-btn primary" onclick={() => handleLoad(cart.id)}>
+									{$t('cartridge.load')}
+								</button>
+							{/if}
+							<button
+								class="action-btn"
+								disabled={rebuildingId !== null}
+								onclick={() => handleRebuild(cart.id)}
+							>
+								{rebuildingId === cart.id
+									? $t('cartridge.rebuilding')
+									: $t('cartridge.rebuild')}
 							</button>
 						{/if}
-						<button
-							class="action-btn"
-							disabled={rebuildingId !== null}
-							onclick={() => handleRebuild(cart.id)}
-						>
-							{rebuildingId === cart.id
-								? $t('cartridge.rebuilding')
-								: $t('cartridge.rebuild')}
-						</button>
 						<button class="action-btn danger" onclick={() => handleDelete(cart.id)}>
 							{$t('cartridge.uninstall')}
 						</button>
@@ -290,6 +310,13 @@
 		detail={selectedDetail}
 		onClose={handleDetailClose}
 		onUpdated={handleDetailUpdated}
+	/>
+{/if}
+
+{#if showRegisterTemplate}
+	<RegisterTemplateDialog
+		onClose={() => (showRegisterTemplate = false)}
+		onRegistered={refreshCartridges}
 	/>
 {/if}
 

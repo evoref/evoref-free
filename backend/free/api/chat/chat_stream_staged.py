@@ -568,6 +568,39 @@ async def run_staged_pipeline(
 
     from backend.free.generation.spec_conformance import check_spec_conformance
     from backend.free.generation.test_value_repair import repair_literal_assertions
+    from backend.free.loop.staged.language_verify import VerifyCommand as _LoopVerifyCommand
+
+    # 言語パックの検証コマンド (c_16 §4.5.4、段階 C-3、既定 OFF)。corpus 側の
+    # 宣言 (LanguageOverlayEntry.verify) を loop pillar 自身の型へ変換する —
+    # Loop は corpus を import できないため、この api 層が唯一の変換点
+    # (store.py の PROJECT_MAP_PACKAGE_KIND と同じ複製の作法)。
+    verify_cfg = staged_cfg.get("verify", {}) or {}
+    verify_enabled = bool(verify_cfg.get("enabled", False))
+    # 承認単位は argv 全体 (実行ファイル名だけでは無い、2026-09-20 レビュー) —
+    # schema (StagedVerifyConfig) が起動時に各 argv の形を検証済み。
+    verify_commands = tuple(
+        tuple(str(a) for a in argv) for argv in (verify_cfg.get("commands") or [])
+    )
+    verify_timeout_sec = float(verify_cfg.get("timeout_sec", 60.0))
+
+    language_verify_lookup = None
+    if verify_enabled and state.cartridge_manager is not None:
+        _cartridge_manager = state.cartridge_manager
+
+        def language_verify_lookup(source_path: str) -> tuple[_LoopVerifyCommand, ...]:
+            from pathlib import Path as _Path
+
+            ext = _Path(source_path).suffix.lower()
+            entry = _cartridge_manager.language_overlay().by_extension.get(ext)
+            if entry is None or not entry.verify:
+                return ()
+            return tuple(
+                _LoopVerifyCommand(
+                    id=v.id, executable=v.executable, args=v.args,
+                    timeout_sec=v.timeout_sec, success_exit_codes=v.success_exit_codes,
+                )
+                for v in entry.verify
+            )
 
     _executor_kwargs: dict[str, Any] = dict(
         workspace=ws, aux_client=state.aux_client, codegen=codegen,
@@ -590,6 +623,10 @@ async def run_staged_pipeline(
         part_assembler=part_assembler,
         coherence_checker=check_coherence,
         part_max_parts=int(staged_cfg.get("part_max_parts", 4)),
+        language_verify_lookup=language_verify_lookup,
+        verify_enabled=verify_enabled,
+        verify_commands=verify_commands,
+        verify_timeout_sec=verify_timeout_sec,
         event_bus=event_bus,
         debug_logger=state.debug_logger,
         brief=brief,

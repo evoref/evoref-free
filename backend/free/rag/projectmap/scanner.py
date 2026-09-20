@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import fnmatch
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+from backend.free.rag.projectmap.aliases import ALIAS_CONFIG_BASENAMES
 
 #: 既定の除外ディレクトリ (c_16 §4.4)。
 DEFAULT_EXCLUDED_DIRS: frozenset[str] = frozenset({
@@ -46,6 +48,12 @@ LANGUAGE_EXTENSIONS: dict[str, str] = {
     ".kt": "kotlin",
     ".kts": "kotlin",
     ".swift": "swift",
+    ".html": "html",
+    ".htm": "html",
+    ".css": "css",
+    ".scss": "scss",
+    ".svelte": "svelte",
+    ".vue": "vue",
 }
 
 #: 既定のバイト上限 (c_16 §9)。
@@ -90,11 +98,25 @@ def scan_project(
     *,
     exclude_globs: Sequence[str] = (),
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+    extra_language_extensions: Mapping[str, str] | None = None,
+    config_paths_out: list[str] | None = None,
 ) -> list[ScannedFile]:
     """``root`` 配下を走査し、対応言語のファイルを path 昇順で返す。
 
     除外は :data:`DEFAULT_EXCLUDED_DIRS` + ``exclude_globs`` (ディレクトリ名 /
     相対パスの両方に掛ける) + ``max_file_bytes`` + バイナリ判定 (NUL バイト)。
+
+    ``extra_language_extensions`` は言語パック (c_16 §4.5.3) が足す
+    ``{拡張子: 言語 id}``。:data:`LANGUAGE_EXTENSIONS` (同梱) が優先し、
+    同じ拡張子が両方にあれば同梱側を使う (呼出側で既に衝突を弾いているが、
+    防御的に同梱を優先する)。
+
+    ``config_paths_out`` を渡すと、この同じ走査の中で
+    :data:`~backend.free.rag.projectmap.aliases.ALIAS_CONFIG_BASENAMES`
+    (``svelte.config.js``/``.ts``、``tsconfig.json``/``jsconfig.json``) に
+    一致するファイルの相対 posix パスを path 昇順で追記する (c_16 §4.4 の
+    エイリアス解決)。これらはファイルノードにはしない — 言語判定と無関係に
+    拾うだけで、``ScannedFile`` には含めない。
     """
     base = Path(root)
     if not base.is_dir():
@@ -109,10 +131,15 @@ def scan_project(
         )
         rel_dir = Path(dirpath).relative_to(base)
         for filename in filenames:
-            lang = LANGUAGE_EXTENSIONS.get(Path(filename).suffix.lower())
+            rel_posix = (rel_dir / filename).as_posix() if rel_dir.parts else filename
+            if config_paths_out is not None and filename in ALIAS_CONFIG_BASENAMES:
+                config_paths_out.append(rel_posix)
+            suffix = Path(filename).suffix.lower()
+            lang = LANGUAGE_EXTENSIONS.get(suffix)
+            if lang is None and extra_language_extensions:
+                lang = extra_language_extensions.get(suffix)
             if lang is None:
                 continue
-            rel_posix = (rel_dir / filename).as_posix() if rel_dir.parts else filename
             if _matches_exclude_glob(rel_posix, exclude_globs):
                 continue
             path = Path(dirpath) / filename
@@ -126,6 +153,8 @@ def scan_project(
                 continue
             out.append(ScannedFile(path=rel_posix, lang=lang))
     out.sort(key=lambda f: f.path)
+    if config_paths_out is not None:
+        config_paths_out.sort()
     return out
 
 

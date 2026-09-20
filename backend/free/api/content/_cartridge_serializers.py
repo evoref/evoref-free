@@ -26,7 +26,10 @@ if TYPE_CHECKING:
 def cartridge_summary_dict(info: CartridgeInfo) -> dict[str, Any]:
     """カートリッジ一覧表示用の薄い dict (`list_cartridges` 用)。
 
-    含むフィールド: id, name, version, description, status, chunks, size_mb
+    含むフィールド: id, name, version, description, status, chunks, size_mb,
+    provides。``provides`` は一覧の操作ボタンを決めるのに要る — ``docs`` を
+    持たないパッケージ (様式 / 言語パックだけ) に索引の操作 (読み込み / 取外し /
+    再構築) を出さない (c_16 §4.3)。
     """
     return {
         "id": info.id,
@@ -36,6 +39,7 @@ def cartridge_summary_dict(info: CartridgeInfo) -> dict[str, Any]:
         "status": info.status,
         "chunks": info.chunks,
         "size_mb": info.size_mb,
+        "provides": info.provides,
     }
 
 
@@ -68,6 +72,11 @@ def cartridge_detail_dict(info: CartridgeInfo) -> dict[str, Any]:
         "content_digest": info.content_digest,
         "embedding_model_id": info.embedding_model_id,
         "embedding_dim": info.embedding_dim,
+        "kind": info.kind,
+        "provides": info.provides,
+        # 言語パック (c_16 §4.5.3) の各エントリの有効/無効と理由。既存の
+        # "language" (docs の ISO 言語コード) と衝突しないよう別キーにする。
+        "language_pack": info.language_pack,
     }
 
 

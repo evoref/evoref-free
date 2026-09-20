@@ -56,10 +56,14 @@ def find_third_party_imports(
     except (SyntaxError, ValueError):
         return []
 
+    local_paths = [str(m).replace("\\", "/") for m in local_modules]
     allowed = set(sys.stdlib_module_names) | _ALWAYS_ALLOWED | {
         # ``pkg/mod.py`` どちらの書き方でも兄弟を許すため stem で持つ
-        str(m).rsplit("/", 1)[-1].removesuffix(".py")
-        for m in local_modules
+        m.rsplit("/", 1)[-1].removesuffix(".py")
+        for m in local_paths
+    } | {
+        # ネストした兄弟は ``from pkg.mod import x`` の先頭 ``pkg`` で現れる
+        m.split("/", 1)[0] for m in local_paths if "/" in m
     }
     found: list[str] = []
     for node in ast.walk(tree):

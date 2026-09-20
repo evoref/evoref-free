@@ -21,6 +21,7 @@ import ast
 import logging
 import re
 
+from backend.free.core.prompt_blocks import split_shared_context
 from backend.free.generation.validators import remove_code_fences
 from backend.free.llm.utils import extract_content
 
@@ -29,7 +30,9 @@ logger = logging.getLogger("backend.free.generation.direct_codegen")
 _SYSTEM_PROMPT = (
     "You are an expert programmer. Follow the design specification and "
     "instructions in the user message exactly and completely. Output ONLY the "
-    "source code for the requested file."
+    "source code for the requested file. The program must work on a first run "
+    "in an empty directory: create parent directories before writing a file, "
+    "and initialize missing data files instead of failing."
 )
 
 # 切断時の再生成で許す max_tokens 上限。
@@ -150,7 +153,8 @@ async def generate_single_file(
             を持つ)。
         instruction: 呼出側 (staged executor) が組み立てた完全な生成指示
             (spec.md 全文 + flowchart + 契約ブロックを含む)。加工・再合成せず
-            そのままユーザーメッセージへ渡す。
+            渡す。``SHARED_CONTEXT_BOUNDARY`` があればその前を system に、後を
+            user に置く (無ければ全文を user へ)。
         file_path: 生成対象のファイル論理パス。戻り値の辞書キーに使う
             (呼出側は常にこのキーで結果を取得できる)。
         max_tokens: 初回生成の最大トークン。
@@ -168,9 +172,13 @@ async def generate_single_file(
     応答が ``finish_reason == "length"`` (max_tokens 切断) の場合のみ、予算を倍に
     広げて 1 回だけ再生成する (``staged.executor._generate_spec_doc`` と同じ方針)。
     """
+    # 境界の前 (run 内で共有する brief + spec) は system へ載せ、同じスロットの
+    # 連続呼出で接頭辞 KV を再利用させる。system は文脈ガードでも捨てられない。
+    shared, task_instruction = split_shared_context(instruction)
     messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user", "content": instruction},
+        {"role": "system",
+         "content": f"{_SYSTEM_PROMPT}\n\n{shared}" if shared else _SYSTEM_PROMPT},
+        {"role": "user", "content": task_instruction},
     ]
     try:
         resp = await client.generate(

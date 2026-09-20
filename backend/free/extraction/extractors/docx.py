@@ -73,6 +73,22 @@ class DocxExtractor(BinarySourceExtractorBase):
                     return 0
         return 0
 
+    @staticmethod
+    def _list_indent_level(style_name: str) -> int:
+        """スタイル名末尾の数字から入れ子の段を読む (0 始まり)。
+
+        ``List Bullet``/``List Number`` (docx writer の 0 段目) は 0、
+        ``List Bullet 2``/``List Number 2`` (f_11 入れ子対応) は 1、
+        ``... 3`` は 2。既定 (末尾に数字が無い/日本語スタイル) は 0。
+        """
+        name = (style_name or "").strip()
+        for prefix in ("List Bullet ", "List Number "):
+            if name.startswith(prefix):
+                suffix = name[len(prefix):].strip()
+                if suffix.isdigit():
+                    return max(0, int(suffix) - 1)
+        return 0
+
     @classmethod
     def _paragraph_line(cls, para) -> str:
         """1 段落を Markdown 行にする。
@@ -81,6 +97,11 @@ class DocxExtractor(BinarySourceExtractorBase):
         「既存文書に 1 節だけ足す」依頼の素材でもあり、素のテキストで返すと
         レベルが失われて書き戻しのたびに構造が崩れる (実測: ``Heading 2``
         の節が追記後に ``Heading 1`` へ落ちた)。
+
+        **リストは段に応じて 2 スペースずつ字下げする** (2026-09-21、
+        docs/f_11 入れ子リスト対応)。``List Bullet``/``List Number`` は
+        番号の別に関わらず ``- `` へ落ちる (既存の簡略化。この読み戻しでは
+        ordered/unordered の区別自体を持たない)。
         """
         text = para.text.strip()
         if not text:
@@ -92,8 +113,14 @@ class DocxExtractor(BinarySourceExtractorBase):
         level = cls._heading_level(style_name)
         if level:
             return f"{'#' * level} {text}"
-        if style_name in ("List Bullet", "List Number", "リスト段落"):
-            return f"- {text}"
+        if style_name in ("List Bullet", "List Number", "リスト段落") or (
+            style_name.startswith(("List Bullet ", "List Number "))
+        ):
+            indent = "  " * cls._list_indent_level(style_name)
+            # 段落内改行 (項目の題名 + 説明) は字下げして返す。字下げが無いと
+            # 再パースでリストがそこで切れる (f_11 §2.3)。
+            head, *rest = [part.strip() for part in text.split("\n") if part.strip()]
+            return "\n".join([f"{indent}- {head}", *(f"{indent}  {part}" for part in rest)])
         return text
 
     @staticmethod

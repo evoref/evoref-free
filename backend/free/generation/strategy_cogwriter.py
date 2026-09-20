@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
@@ -480,6 +481,104 @@ _REVISE_PROMPT = """\
 
 修正後のコードのみ出力してください:"""
 
+#: TEXT の unit の改稿。コード用の ``_REVISE_PROMPT`` を TEXT にも使っていた頃は、
+#: プロンプトに依頼の文脈も形式の指定も無く、レビューの指摘が 1 件出るだけで
+#: 箇条書きの初稿が 1 段落の散文に書き直されていた (2026-09-20 実機確認:
+#: 「見出しと箇条書きで」の依頼が 887 文字の 1 段落になった)。
+_TEXT_REVISE_PROMPT = """\
+以下のセクション本文を、修正指示の箇所だけ直してください。
+
+# 文書
+タイトル: {title}
+全体の方針: {global_context}
+制約: {constraints}
+依頼の原文: {request}
+
+# このセクション
+見出し: {heading}
+含めるべき要点: {key_points}
+
+【元の本文】
+{original}
+
+【修正指示】
+{fix_instruction}
+
+守ること:
+- 元の本文の形式 (箇条書き・番号リスト・小見出し・表・段落の分け方) と分量を保つ。\
+箇条書きを散文にまとめ直さない。
+- 修正指示に関係のない箇所は書き換えない。
+- 本文のみを出力する (セクションの見出し行・メタ解説・修正の説明は不要)。"""
+
+
+_SHAPE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("list items", re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+\S")),
+    ("headings", re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+\S")),
+    ("table rows", re.compile(r"^[ \t]*\|.*\|[ \t]*$")),
+)
+_FENCE_LINE_RE = re.compile(r"^[ \t]{0,3}(?:```|~~~)")
+
+
+def _markdown_shape(text: str) -> dict[str, int]:
+    """箇条書き / 見出し / 表の行数を数える (コードフェンスの中は数えない)。"""
+    counts = {name: 0 for name, _ in _SHAPE_PATTERNS}
+    in_fence = False
+    for line in text.splitlines():
+        if _FENCE_LINE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        for name, pattern in _SHAPE_PATTERNS:
+            if pattern.match(line):
+                counts[name] += 1
+                break
+    return counts
+
+
+_LEADING_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+\S")
+
+
+def split_leading_headings(text: str) -> tuple[str, str]:
+    """先頭に並ぶ見出し行 (と、その間・直後の空行) を本文から切り離す。
+
+    Returns ``(見出し部, 本文)``。``見出し部 + 本文 == text``。見出しが無ければ
+    見出し部は空文字列。
+    """
+    lines = text.splitlines(keepends=True)
+    cut = 0
+    for index, line in enumerate(lines):
+        if _LEADING_HEADING_RE.match(line):
+            cut = index + 1
+        elif line.strip():
+            break
+    if cut == 0:
+        return "", text
+    # 見出しの直後の空行までを見出し部に含める (付け直したときに同じ形になる)。
+    while cut < len(lines) and not lines[cut].strip():
+        cut += 1
+    return "".join(lines[:cut]), "".join(lines[cut:])
+
+
+def revision_shape_loss(original: str, revised: str) -> str | None:
+    """改稿が元の本文の形式・分量を壊していれば理由を返す (問題なければ ``None``)。
+
+    レビューの指摘は局所的な修正 (事実の食い違い / 重複) なので、改稿で
+    箇条書きや表が半分未満に減る・分量が半分未満になるのは「直した」のではなく
+    「書き直した」結果。その改稿は採らず元の本文を残す (コード側の縮小ガードと
+    同じ考え方)。元の本文に 2 つ以上あった形式だけを見る — 1 つだけの要素が
+    消えるのは正当な修正でありうる。
+    """
+    if not revised.strip():
+        return "empty revision"
+    if len(revised.strip()) * 2 < len(original.strip()):
+        return f"shrunk from {len(original.strip())} to {len(revised.strip())} chars"
+    before, after = _markdown_shape(original), _markdown_shape(revised)
+    for name, count in before.items():
+        if count >= 2 and after[name] * 2 < count:
+            return f"lost {name}: {count} -> {after[name]}"
+    return None
+
 
 # ── レビュー結果 ──
 
@@ -908,7 +1007,7 @@ class CogWriterStrategy:
         self,
         issue: ReviewIssue,
         rolling: RollingContext,
-        content_type: ContentType,  # noqa: ARG002
+        content_type: ContentType,
     ) -> AsyncIterator[str]:
         """修正指示に基づくリライト（最大1回）"""
         if issue.unit_idx >= len(rolling.generated_units):
@@ -919,6 +1018,13 @@ class CogWriterStrategy:
         # リライト時も元のユニットのトークン数に応じた上限を設定
         from backend.utils import estimate_tokens as _est
         unit_max_tokens = max(config_max, int(_est(original) * 1.5))
+
+        if content_type == ContentType.TEXT:
+            async for token in self._revise_text_unit(
+                issue, rolling, original, unit_max_tokens,
+            ):
+                yield token
+            return
 
         # 設計仕様 (契約) / フローチャートを同梱しないと、リライトが
         # 「issue.fix の指示に従うこと」だけを目標にでき、契約 (モジュール名 /
@@ -962,6 +1068,73 @@ class CogWriterStrategy:
             rolling.generated_units[issue.unit_idx] = revised_text
         except Exception as e:
             logger.warning("Revision failed for unit %d: %s", issue.unit_idx, e)
+
+    async def _revise_text_unit(
+        self,
+        issue: ReviewIssue,
+        rolling: RollingContext,
+        original: str,
+        unit_max_tokens: int,
+    ) -> AsyncIterator[str]:
+        """TEXT の unit の改稿。形式を壊した改稿は採らず、元の本文を残す。
+
+        確定本文の先頭には orchestrator が決定論で付けた見出し行 (文書タイトル /
+        セクション見出し) が入っている。改稿には本文だけを渡し、見出し行は改稿後に
+        そのまま付け直す — 改稿のプロンプトは「本文のみ出力」を課すので、見出しごと
+        渡すと改稿のたびにそのセクションの見出しが消える。
+        """
+        heading_prefix, original = split_leading_headings(original)
+        plan = rolling.plan
+        unit = plan.units[issue.unit_idx] if issue.unit_idx < len(plan.units) else None
+        prompt = _TEXT_REVISE_PROMPT.format(
+            title=plan.title,
+            global_context=plan.global_context or "(なし)",
+            constraints="、".join(plan.constraints) if plan.constraints else "(なし)",
+            request=(getattr(plan, "instruction", "") or "(なし)")[:600],
+            heading=getattr(unit, "heading", "") or "(なし)",
+            key_points="、".join(getattr(unit, "key_points", None) or []) or "(なし)",
+            original=original,
+            fix_instruction=issue.fix,
+        )
+        # ProductionBrief はターン中の全 LLM 呼出の先頭に同じ bytes で置く (f_08 §2.2)。
+        if rolling.brief:
+            prompt = f"{rolling.brief}\n\n{prompt}"
+        messages = [{"role": "user", "content": prompt}]
+
+        try:
+            stream = await self.main_client.generate(
+                messages,
+                stream=True,
+                temperature=0.5,
+                max_tokens=unit_max_tokens,
+                id_slot=self.main_client.longform_slot,
+            )
+            revised_text = ""
+            async for token in stream:
+                revised_text += token
+                yield token
+            self._note_truncation(stream)
+        except Exception as e:
+            logger.warning("Revision failed for unit %d: %s", issue.unit_idx, e)
+            return
+
+        # モデルが見出し行を付け直して返した場合は落とす (二重に付けない)。
+        revised_text = split_leading_headings(revised_text)[1]
+        rejection = revision_shape_loss(original, revised_text)
+        if rejection is not None:
+            logger.warning(
+                "Revision of text unit %d discarded (%s); keeping the original",
+                issue.unit_idx, rejection,
+            )
+            if self._debug_logger:
+                self._debug_logger.log_long_form_event({
+                    "phase": "revision_rejected",
+                    "strategy": "cogwriter",
+                    "unit_idx": issue.unit_idx,
+                    "reason": rejection,
+                })
+            return
+        rolling.generated_units[issue.unit_idx] = heading_prefix + revised_text
 
     # ── プロンプト構築 ──
 

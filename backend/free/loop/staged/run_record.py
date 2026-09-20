@@ -83,6 +83,9 @@ class RunRecord:
     exit_kind: ExitKind | None = None
     last_event_seq: int = 0
     brief_tokens: int = 0
+    #: 構成テンプレートで seed した場合の来歴鍵 (``<package_id>@<version>:
+    #: <entry_id>``、c_05 §0.6 / c_16 §4.5.2)。seed していない run は空文字。
+    template: str = ""
     #: 未知キー退避 (c_05 §0.5.2)。次の保存で原形のままトップレベルへ復元する。
     _extra: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
@@ -158,14 +161,21 @@ class RunRecordStore(JsonStateFile):
         self.record._extra["question"] = question
         self.save()
 
-    def finish(self, exit_kind: ExitKind, *, last_event_seq: int = 0) -> None:
-        """run 終端を記録し即座に永続化する。``start`` 未実行なら no-op。"""
+    def finish(
+        self, exit_kind: ExitKind, *, last_event_seq: int = 0, template: str = "",
+    ) -> None:
+        """run 終端を記録し即座に永続化する。``start`` 未実行なら no-op。
+
+        ``template`` は構成テンプレートで seed した場合の来歴鍵 (c_05 §0.6)。
+        """
         if self.record is None:
             return
         self.record.ended_at = utc_now()
         self.record.activity_state = "exited"
         self.record.exit_kind = exit_kind
         self.record.last_event_seq = int(last_event_seq)
+        if template:
+            self.record.template = template
         self.save()
 
     # ── JsonStateFile 抽象メソッド ──────────────────────────────────────

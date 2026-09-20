@@ -23,6 +23,18 @@ export interface Cartridge {
 	status: string;
 	chunks: number;
 	size_mb: number;
+	/** 運ぶセクション (`docs` / `templates` / `language`)。`docs` が無ければ索引の操作は出さない */
+	provides?: string[];
+}
+
+/** 言語パック (c_16 §4.5.3) 1 エントリの有効/無効と理由 */
+export interface LanguagePackEntry {
+	id: string;
+	grammar: string;
+	extensions: string[];
+	enabled: boolean;
+	/** 無効時の理由 (バックエンドの技術的な英語メッセージ。i18n されない) */
+	reason: string;
 }
 
 /** カートリッジ詳細情報（全フィールド）
@@ -52,6 +64,12 @@ export interface CartridgeDetail {
 	content_digest: string;
 	embedding_model_id: string;
 	embedding_dim: number;
+	/** パッケージの所有と生まれ方 ("package" | "project_map"、c_16 §4.3) */
+	kind: string;
+	/** 運ぶセクション名の列 ("docs" / "templates" / "language") */
+	provides: string[];
+	/** "language/" セクションの各エントリの有効/無効と理由 (c_16 §4.5.3) */
+	language_pack: LanguagePackEntry[];
 }
 
 /** カートリッジ再構築結果 */

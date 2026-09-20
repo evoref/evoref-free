@@ -23,6 +23,7 @@ from backend.trace_context import run_in_executor_with_context
 
 if TYPE_CHECKING:
     from backend.config import PathResolver
+    from backend.free.rag.corpus.store import LanguageOverlay
 
 logger = get_logger("memory.sleep.project_map")
 
@@ -78,6 +79,7 @@ async def update_project_map(
     resolver: "PathResolver",
     is_cancelled: Callable[[], bool] | None = None,
     should_pause: Callable[[], bool] | None = None,
+    language_overlay: "LanguageOverlay | None" = None,
 ) -> int:
     """Step 5.87 本体。新しい版を積んだ root (パッケージ) の数を返す。
 
@@ -87,6 +89,8 @@ async def update_project_map(
         is_cancelled: ``True`` ならサイクル全体を打ち切る。
         should_pause: ``True`` を返したら root 境界で打ち切る (チャット開始
             への協調 yield)。残りは次サイクルで拾う。
+        language_overlay: 言語パック (c_16 §4.5.3)。``CartridgeManager.corpus
+            .language_overlay()`` から作る。``None`` なら同梱言語だけで走る。
     """
     cfg = _pm_config(config)
     if not bool(cfg.get("enabled", True)):
@@ -114,7 +118,9 @@ async def update_project_map(
                 logger.info("Step 5.87: paused/cancelled after %d root(s)", updated)
                 break
             root = (resolver.root / root_rel).resolve()
-            builder = ProjectMapBuilder(corpus_dir, root, rag_config=rag_config)
+            builder = ProjectMapBuilder(
+                corpus_dir, root, rag_config=rag_config, language_overlay=language_overlay,
+            )
 
             def _run_in_worker(b: ProjectMapBuilder = builder) -> Any:
                 # 走査 + tree-sitter 抽出 + 38k 件級の put は同期処理で、初回は 2 分級。

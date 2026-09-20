@@ -23,14 +23,16 @@ from __future__ import annotations
 import ast
 import asyncio
 import re
+import sys
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from backend.free.core.code_syntax import is_python_path, language_label, syntax_error_detail
+from backend.free.core.prompt_blocks import join_shared_context
 from backend.free.core.dependency_constraint import (
     find_third_party_imports,
     requires_stdlib_only,
@@ -77,9 +79,13 @@ from backend.free.loop.staged.spec_parts import (
     replace_flow_section,
     replace_module_section,
 )
+from backend.free.loop.staged.language_verify import (
+    LanguageVerifyLookup,
+    evaluate_verify_commands,
+)
 from backend.free.loop.staged.synthesizer import MODULE_LIST_MARKER, os_constraint
 from backend.free.loop.staged.test_runner import StagedTestRunner
-from backend.free.loop.staged.workspace import WorkspaceManager, StageTestResult
+from backend.free.loop.staged.workspace import WorkspaceManager, StageTestResult, _safe_rel
 from backend.i18n_helper import prose_language_name
 from backend.log_config import get_logger
 
@@ -300,11 +306,12 @@ Design specification for this phase:
 {spec}
 """
 
-_SPEC_DEEPEN_PROMPT = """\
-Below is one module section of a software design specification, together with \
-the document's Overview and shared data structures for context. Rewrite the \
-COMPLETE module section, ADDING implementation-level detail so a developer \
-can code it without making any design decision of their own:
+#: 深化の **モジュール非依存**部分 (指示 + 参照文脈)。モジュールごとの呼出で
+#: 同じ bytes を system に置き、背景スロットの接頭辞 KV を共有する (f_08 §2.2)。
+_SPEC_DEEPEN_SYSTEM = """\
+You rewrite one module section of a software design specification, ADDING \
+implementation-level detail so a developer can code it without making any \
+design decision of their own:
 
 - For each class: the full `__init__` signature, EVERY instance attribute as \
 `name: type` with a short purpose, and for EACH public method 2-4 numbered \
@@ -319,16 +326,22 @@ HARD RULES:
 Component name. Do NOT add or remove `### Component:` subsections (only when \
 the section is an empty placeholder may you introduce its components). Only \
 ADD detail.
-- Keep the exact heading `## Module: {file_path}` and every existing \
-`### Component:` heading verbatim.
-- Your response MUST start DIRECTLY with the `## Module: {file_path}` \
-heading and contain ONLY that one module section. Do NOT restate, copy, or \
-summarize the reference context below — it is given only so you can check \
-consistency against it, not to be repeated. Do NOT output `## Overview`, \
-`## Shared data structures`, `## Entry point`, or any other section.
+- Do NOT restate, copy, or summarize the reference context below — it is \
+given only so you can check consistency against it, not to be repeated. Do \
+NOT output `## Overview`, `## Shared data structures`, `## Entry point`, or \
+any other section.
 
 >>> REFERENCE CONTEXT (for consistency checks only — do NOT copy or restate) >>>
 {context}
+"""
+
+_SPEC_DEEPEN_PROMPT = """\
+Rewrite the COMPLETE module section below, following the rules above.
+
+- Keep the exact heading `## Module: {file_path}` and every existing \
+`### Component:` heading verbatim.
+- Your response MUST start DIRECTLY with the `## Module: {file_path}` \
+heading and contain ONLY that one module section.
 
 >>> MODULE SECTION TO REWRITE (return this one section, expanded, and nothing else) >>>
 {section}
@@ -931,33 +944,70 @@ def _compile_error_detail(code: str) -> str | None:
 
 
 _PYTEST_USAGE_RE = re.compile(r"\bpytest\.\w+")
+_STDLIB_MODULE_NAMES: frozenset[str] = frozenset(getattr(sys, "stdlib_module_names", ()))
 _PYTEST_IMPORT_RE = re.compile(
     r"^\s*(import\s+pytest\b|from\s+pytest\s+import\b)", re.MULTILINE,
 )
 
 
+def _module_import_line(source_path: str) -> str:
+    """生成テストが対象モジュールを stem 名で束縛する import 文を返す。
+
+    テストの conftest が sys.path に足すのは ``src/`` だけなので、ネストした
+    モジュール (``idtool/idgen.py``) はパッケージ経由でしか import できない。
+    ``from idtool import idgen`` は ``import idgen`` と同じく ``idgen`` を束縛する。
+    """
+    pure = PurePosixPath(source_path.replace("\\", "/"))
+    package = ".".join(pure.parts[:-1])
+    return f"from {package} import {pure.stem}" if package else f"import {pure.stem}"
+
+
 def _ensure_module_import(test_code: str, source_path: str) -> str:
-    """``<module>.<attr>`` を使うのに import 忘れの生成テストへ import を補う。
+    """生成テストの対象モジュール import を、実際に import できる形へ揃える。
 
     2026-07-27 live: brackets.py のテストが ``brackets.is_balanced("([)]")`` を
     ``import brackets`` 無しで呼び、収集時の ``NameError`` で失敗した (同型の
     失敗は wordcount.py でも記録済み)。``_ensure_pytest_import`` と同じ方針で、
     構文的に確証できる欠落だけを機械的に補う (既に import 済みなら何もしない)。
+
+    ネストしたモジュールでは、自モジュールを平置きの名前で import する行
+    (``import idgen`` / ``from idgen import x``) をパッケージ経由へ書き換える
+    (2026-09-18 live: idtool/idgen.py・idtool/cli.py のテストが平置き import で
+    収集エラーになり、spec の欠陥ではないのに spec 見直しが走った)。
+    stdlib と同名の stem は stdlib を指している可能性があるので書き換えない。
     """
-    stem = Path(source_path).stem
+    pure = PurePosixPath(source_path.replace("\\", "/"))
+    stem = pure.stem
+    package_parts = pure.parts[:-1]
     if not stem or not stem.isidentifier():
         return test_code
-    if not re.search(rf"\b{re.escape(stem)}\.\w", test_code):
+    if not all(p.isidentifier() for p in package_parts):
+        return test_code
+    esc = re.escape(stem)
+    if package_parts and stem not in _STDLIB_MODULE_NAMES:
+        package = ".".join(package_parts)
+        test_code = re.sub(
+            rf"^(\s*)import\s+{esc}[ \t]*$",
+            rf"\1from {package} import {stem}",
+            test_code, flags=re.MULTILINE,
+        )
+        test_code = re.sub(
+            rf"^(\s*)from\s+{esc}\s+import\b",
+            rf"\1from {package}.{stem} import",
+            test_code, flags=re.MULTILINE,
+        )
+    if not re.search(rf"\b{esc}\.\w", test_code):
         return test_code
     already = re.search(
-        rf"^\s*(?:import\s+{re.escape(stem)}\b"
-        rf"|from\s+{re.escape(stem)}\s+import\b"
-        rf"|import\s+.*\bas\s+{re.escape(stem)}\b)",
+        rf"^\s*(?:import\s+{esc}\b"
+        rf"|from\s+{esc}\s+import\b"
+        rf"|from\s+[\w.]+\s+import\s+(?:.*,\s*)?{esc}\b"
+        rf"|import\s+.*\bas\s+{esc}\b)",
         test_code, re.MULTILINE,
     )
     if already:
         return test_code
-    return f"import {stem}\n{test_code}"
+    return f"{_module_import_line(source_path)}\n{test_code}"
 
 
 def _ensure_pytest_import(test_code: str) -> str:
@@ -1100,6 +1150,20 @@ class StagedCreateExecutor:
     # すり抜けタイムアウトで未修正のまま出荷された問題への対策)。
     coherence_checker: "Callable[[dict[str, str]], list[str]] | None" = None
     part_max_parts: int = 4
+    # 言語パックの検証コマンド (c_16 §4.5.4、既定 OFF)。source_path (拡張子) ->
+    # 検証コマンド列。api 層 (chat_stream_staged.py) が corpus の
+    # ``CorpusStore.language_overlay()`` から組んで注入する (loop→corpus の
+    # 越境回避、store.py の PROJECT_MAP_PACKAGE_KIND と同じ複製の作法)。
+    # ``None`` または verify_enabled=False なら検証は一切走らない (既存動作維持)。
+    language_verify_lookup: "LanguageVerifyLookup | None" = None
+    verify_enabled: bool = False
+    #: ``create.staged.verify.commands`` (config 側の承認済み argv の
+    #: allow-list、各要素は ``(executable, *args)``)。パックの宣言では
+    #: 増やせない — 承認単位は実行ファイル名ではなく argv 全体
+    #: (2026-09-20 レビュー、旧 ``verify_executables`` から改称)。
+    verify_commands: tuple[tuple[str, ...], ...] = ()
+    #: ``create.staged.verify.timeout_sec`` (宣言側 timeout_sec の上限)。
+    verify_timeout_sec: float = 60.0
     event_bus: "LoopEventBus | None" = None
     debug_logger: "DebugLogger | None" = None
     name: str = "staged_create"
@@ -1167,6 +1231,37 @@ class StagedCreateExecutor:
         ``self.brief`` が空なら ``""`` (何も足さない)。
         """
         return f"{self.brief}\n\n" if self.brief else ""
+
+    def _with_brief(self, task_instruction: str) -> str:
+        """codegen の instruction: brief を共有文脈 (system 側) に、指示を user 側に置く。"""
+        return join_shared_context(self.brief, task_instruction)
+
+    def _brief_messages(self, content: str, *, shared: str = "") -> list[dict]:
+        """補助タスクの messages: brief を system に分け、接頭辞 KV を段を跨いで再利用させる。
+
+        ``shared`` は呼出を跨いで byte 不変な追加文脈 (深化の指示 + 参照文脈など)。
+        brief と同じ system メッセージへ入れる — 別の user にすると文脈ガードが
+        丸ごと落としうる。
+        """
+        parts = [p for p in (self.brief, shared) if p and p.strip()]
+        head = [{"role": "system", "content": "\n\n".join(parts)}] if parts else []
+        return [*head, {"role": "user", "content": content}]
+
+    def _shared_spec_context(self, spec: str, flowchart: str) -> str:
+        """code / test 生成で byte 一致させる共有文脈 (brief + spec 全文 + 構成図)。
+
+        モジュール固有の文言 (依頼文 / 兄弟 API / 対象パス) は入れない — 入れると
+        連続する codegen の共有文脈がずれて接頭辞 KV が再利用されない。
+        """
+        flow_block = (
+            f"## Module architecture diagram\n```mermaid\n{flowchart}\n```\n\n"
+            if flowchart.strip() else ""
+        )
+        return (
+            f"{self._brief_prefix()}"
+            f"## Shared design specification\n{spec}\n\n"
+            f"{flow_block}"
+        )
 
     def _emit(self, stage: str, detail: str, status: str, task_id: str) -> None:
         """工程内サブステップ進捗を event_bus へ発行する (null-safe)。"""
@@ -1452,11 +1547,11 @@ class StagedCreateExecutor:
         self._spec_doc_truncated = False
         if self.aux_client is None:
             return ""
-        msgs = [{"role": "user", "content":
-                 self._brief_prefix()
-                 + _SPEC_PROMPT.format(description=description) + os_constraint()
-                 + _non_python_spec_note(description)
-                 + _spec_language_constraint() + extra_constraint}]
+        msgs = self._brief_messages(
+            _SPEC_PROMPT.format(description=description) + os_constraint()
+            + _non_python_spec_note(description)
+            + _spec_language_constraint() + extra_constraint,
+        )
         try:
             timeout = self._stage_timeout(self.spec_timeout_sec, "create_spec_doc")
             resp = await self.aux_client.generate(
@@ -1515,11 +1610,12 @@ class StagedCreateExecutor:
         """
         if self.aux_client is None:
             return None, False
-        msgs = [{"role": "user", "content":
-                 self._brief_prefix()
-                 + _SPEC_DEEPEN_PROMPT.format(
-                     file_path=module_path, context=context, section=section,
-                 ) + os_constraint() + _deepen_language_constraint()}]
+        # 指示 + 参照文脈 + 静的制約は全モジュール共通なので system へ (接頭辞 KV)。
+        msgs = self._brief_messages(
+            _SPEC_DEEPEN_PROMPT.format(file_path=module_path, section=section),
+            shared=_SPEC_DEEPEN_SYSTEM.format(context=context)
+            + os_constraint() + _deepen_language_constraint(),
+        )
         try:
             timeout = self._stage_timeout(self.spec_timeout_sec, "create_spec_deepen")
             resp = await self.aux_client.generate(
@@ -1605,7 +1701,7 @@ class StagedCreateExecutor:
             try:
                 timeout = self._stage_timeout(300.0, "flow_spec_synthesis")
                 data = await self.aux_client.generate_json(
-                    self._brief_prefix() + prompt,
+                    prompt, system=self.brief or None,
                     max_tokens=_FLOW_MAX_TOKENS, temperature=0.2,
                     purpose="flow_spec_synthesis", telemetry=telemetry,
                     # 出力予算 3072 tok は iGPU 実測 (7-13 t/s) で purpose 既定
@@ -1676,7 +1772,7 @@ class StagedCreateExecutor:
 
         units: list[list[FlowStep]] = []
         for i, (module_path, unit_spec) in enumerate(units_specs, start=1):
-            prompt = self._brief_prefix() + _FLOW_PART_PROMPT.format(
+            prompt = _FLOW_PART_PROMPT.format(
                 module_path=module_path,
                 step_lo=_FLOW_PART_STEP_LO, step_hi=_FLOW_PART_STEP_HI,
                 spec=unit_spec,
@@ -1686,7 +1782,8 @@ class StagedCreateExecutor:
                 try:
                     timeout = self._stage_timeout(60.0, "flow_spec_part_synthesis")
                     data = await self.aux_client.generate_json(
-                        prompt, max_tokens=768, temperature=0.2,
+                        prompt, system=self.brief or None,
+                        max_tokens=768, temperature=0.2,
                         purpose="flow_spec_part_synthesis", timeout=timeout,
                     )
                 except Exception as exc:
@@ -1749,15 +1846,9 @@ class StagedCreateExecutor:
         """
         if len(spec) > _CODE_SPEC_MAX_CHARS:
             spec = _condensed_code_spec(spec, source_path)
-        flow_block = (
-            f"## Module architecture diagram\n```mermaid\n{flowchart}\n```\n\n"
-            if flowchart.strip() else ""
-        )
-        return (
-            f"{self._brief_prefix()}"
+        return join_shared_context(
+            self._shared_spec_context(spec, flowchart),
             f"{description}\n\n"
-            f"## Shared design specification\n{spec}\n\n"
-            f"{flow_block}"
             f"{self._sibling_contract_block(source_path)}"
             f"The design specification above is a BINDING CONTRACT: implement "
             f"EVERY `### Component:` of `{source_path}` with EXACTLY the "
@@ -1800,14 +1891,62 @@ class StagedCreateExecutor:
         )
 
     def _local_module_names(self, source_path: str) -> set[str]:
-        """生成物の兄弟モジュール名 (import 検証で自作扱いにする集合)。"""
-        names = {Path(source_path).stem}
+        """生成物の兄弟モジュールの論理パス (import 検証で自作扱いにする集合)。
+
+        stem ではなくパスで渡す — ネストした兄弟 (``ledger/store.py``) は
+        ``from ledger.store import ...`` と先頭のパッケージ名で import される。
+        """
+        names = {source_path}
         try:
             files = self.workspace.read_manifest().get("files") or {}
-            names |= {Path(p).stem for p in files}
+            names |= {str(p) for p in files}
         except Exception:
             pass
         return names
+
+    def _verify_scratch_path(self, source_path: str) -> Path:
+        """検証専用のスクラッチ置き場 (ワークスペース内、``src/`` とは別)。
+
+        検証コマンドは実プロセスを起動するので実ファイルが要るが、
+        コミット前のコードを検証する必要がある (失敗時に既存の src を
+        保つため — 構文検査と同じ扱い、f_10 §4.3)。``.verify_scratch/``
+        は manifest に載らない使い捨てで、検証後に削除する。
+        """
+        return self.workspace.root / ".verify_scratch" / _safe_rel(source_path)
+
+    async def _run_language_verify(self, source_path: str, code: str) -> str | None:
+        """言語パックの verify コマンドを走らせる (c_16 §4.5.4、段階 C-3)。
+
+        ``language_verify_lookup`` 未注入 / ``verify_enabled=False`` /
+        当該拡張子の宣言が無い、のいずれかなら即座に ``None`` (何もしない
+        — 既存動作を変えない)。失敗の detail、または通過/未検査で ``None``。
+        """
+        if not self.verify_enabled or self.language_verify_lookup is None:
+            return None
+        commands = self.language_verify_lookup(source_path)
+        if not commands:
+            return None
+        scratch = self._verify_scratch_path(source_path)
+        scratch.parent.mkdir(parents=True, exist_ok=True)
+        scratch.write_text(code, encoding="utf-8", newline="\n")
+        try:
+            return await asyncio.to_thread(
+                evaluate_verify_commands,
+                commands,
+                language_id=language_label(source_path),
+                enabled=self.verify_enabled,
+                approved_commands=self.verify_commands,
+                timeout_cap_sec=self.verify_timeout_sec,
+                workspace_root=self.workspace.root,
+                target_file=scratch,
+                debug_logger=self.debug_logger,
+                scope="request",
+            )
+        finally:
+            try:
+                scratch.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     async def _run_code(self, task: "TaskFactView") -> ExecutionOutcome:
         source_path = task.source_path or f"{task.task_id}.py"
@@ -1938,6 +2077,24 @@ class StagedCreateExecutor:
                     error=f"third-party import despite stdlib-only request: {detail}",
                     notes={"executor": self.name, "stage": "code", **part_notes},
                 )
+        # 言語パックの verify (c_16 §4.5.4、既定 OFF)。構文検査の後、コミット前
+        # (失敗は構文エラーと同じ経路 — task を失敗させて driver retry で
+        # 再生成する。実行できない場合は検査しない、f_10 §4.3)。
+        verify_detail = await self._run_language_verify(source_path, code)
+        if verify_detail is not None:
+            logger.warning(
+                "staged code stage failed language verify for %s: %s",
+                source_path, verify_detail,
+            )
+            self._fail_task(task, f"verify failed: {verify_detail}")
+            self._emit(
+                "code", f"コード生成失敗 (検証コマンド): {source_path} — {verify_detail}",
+                "failed", task.task_id,
+            )
+            return ExecutionOutcome(
+                status="failure", error=f"verify failed: {verify_detail}",
+                notes={"executor": self.name, "stage": "code", **part_notes},
+            )
         wf = self.workspace.write_file(
             source_path, code, kind="src", stage="code", task_id=task.task_id,
         )
@@ -2006,8 +2163,7 @@ class StagedCreateExecutor:
                 )
             prior_block = f"{prior_head}```python\n{joined}\n```\n\n"
         n = len(plan.groups)
-        return (
-            f"{self._brief_prefix()}"
+        return self._with_brief(
             f"{description}\n\n"
             f"## Design specification for `{source_path}` (this module) — "
             f"implement faithfully\n{plan.module_section.strip()}\n\n"
@@ -2427,8 +2583,7 @@ class StagedCreateExecutor:
                 f"{api_block}\n\n"
                 if api_block else ""
             )
-            repair_instr = (
-                f"{self._brief_prefix()}"
+            repair_instr = self._with_brief(
                 f"The generated module(s) failed an import smoke test.\n\n"
                 f"## Smoke errors\n" + "\n".join(f"- {e}" for e in errors) + "\n\n"
                 f"{spec_block}"
@@ -2447,7 +2602,7 @@ class StagedCreateExecutor:
                 + _code_language_constraint()
             )
             fixed = await self._safe_codegen(repair_instr, source_path)
-            wrote = self._apply_source_fixes(fixed, source_path, task.task_id)
+            wrote = await self._apply_source_fixes(fixed, source_path, task.task_id)
             if not wrote:
                 # 修復応答が空 / 非 Python / 縮小ガード棄却 = モデルが修復不能の
                 # シグナル。src が不変のまま再スモーク・追加修復を回しても結果は
@@ -2577,22 +2732,18 @@ class StagedCreateExecutor:
         src_code = self.workspace.read_file(source_path, kind="src") or ""
         test_logical = _test_logical_for(source_path)
         stem = Path(source_path).stem
-        flow_block = (
-            f"## Module architecture diagram\n```mermaid\n{flowchart}\n```\n\n"
-            if flowchart.strip() else ""
-        )
+        import_line = _module_import_line(source_path)
         self._emit("test", f"ユニットテスト生成 (参考): {test_logical}",
                    "running", task.task_id)
-        gen_instr = (
-            f"{self._brief_prefix()}"
-            f"## Shared design specification\n{spec}\n\n"
-            f"{flow_block}"
+        gen_instr = join_shared_context(
+            self._shared_spec_context(spec, flowchart),
             f"## Source file `{source_path}`\n```python\n{src_code}\n```\n\n"
             f"Write pytest tests in a single file `{test_logical}`.\n"
             f"REQUIREMENTS:\n"
-            f"- `import {stem}` (it is importable as a top-level module) and test its "
-            f"PUBLIC API by calling its functions/classes. Do NOT redefine or copy its "
-            f"classes, types, constants, or dataclasses — import them from `{stem}`.\n"
+            f"- `{import_line}` (the source root is on sys.path; use exactly this "
+            f"import) and test its PUBLIC API by calling its functions/classes. Do NOT "
+            f"redefine or copy its classes, types, constants, or dataclasses — access "
+            f"them through `{stem}`.\n"
             f"- The file MUST contain at least one `def test_...` function with asserts.\n"
             f"- Write at most 10 focused test functions (cover the most important "
             f"behaviors first; do not enumerate every variation).\n"
@@ -2627,8 +2778,7 @@ class StagedCreateExecutor:
             regen += 1
             self._emit("test", f"テスト整合性チェック: {len(violations)} 件 → "
                        f"再生成 (試行 {regen})", "running", task.task_id)
-            fix_instr = (
-                f"{self._brief_prefix()}"
+            fix_instr = self._with_brief(
                 f"The generated tests do NOT match the ACTUAL public API of "
                 f"`{source_path}`.\n\n## Contract violations\n"
                 + "\n".join(f"- {v}" for v in violations) + "\n\n"
@@ -2636,7 +2786,8 @@ class StagedCreateExecutor:
                 f"```python\n{src_code}\n```\n\n"
                 f"Rewrite `{test_logical}`: call the ACTUAL signatures/attributes shown "
                 f"above (do NOT invent methods/attributes; do NOT redefine src symbols; "
-                f"import them from `{stem}`). At least one `def test_...` with asserts. "
+                f"import the module with `{import_line}`). At least one `def test_...` "
+                f"with asserts. "
                 f"Output only the test file's code."
                 + _NO_PROSE_OUTPUT_CONSTRAINT
                 + _code_language_constraint()
@@ -2881,7 +3032,7 @@ class StagedCreateExecutor:
         src_head = (
             self.workspace.read_file(source_path, kind="src") or ""
         )[:_REVISION_SRC_HEAD_CHARS]
-        prompt = self._brief_prefix() + _SPEC_REVISION_PROMPT.format(
+        prompt = _SPEC_REVISION_PROMPT.format(
             source_path=source_path,
             section=section.strip(),
             entry_section=extract_entry_point_section(spec).strip() or "(none)",
@@ -2899,7 +3050,7 @@ class StagedCreateExecutor:
                 "spec_revision_judge",
             )
             data = await self.aux_client.generate_json(
-                prompt, purpose="spec_revision_judge",
+                prompt, purpose="spec_revision_judge", system=self.brief or None,
                 max_tokens=1536, temperature=0.2, telemetry=judge_telemetry,
                 timeout=timeout,
             )
@@ -3053,7 +3204,7 @@ class StagedCreateExecutor:
             )
             return False
         # 劣化ガードに弾かれて書き戻せなかった場合は False (再検証は不要)
-        return self._write_source_if_valid(source_path, code, task.task_id)
+        return await self._write_source_if_valid(source_path, code, task.task_id)
 
     async def _advisory_retest(
         self, task: "TaskFactView", source_path: str,
@@ -3072,9 +3223,8 @@ class StagedCreateExecutor:
         violations = self._contract_violations(source_path, test_code)
         if violations:
             src_code = self.workspace.read_file(source_path, kind="src") or ""
-            stem = Path(source_path).stem
-            fix_instr = (
-                f"{self._brief_prefix()}"
+            import_line = _module_import_line(source_path)
+            fix_instr = self._with_brief(
                 f"The tests no longer match the ACTUAL public API of "
                 f"`{source_path}` (the module was just regenerated from a revised "
                 f"spec).\n\n## Contract violations\n"
@@ -3083,7 +3233,7 @@ class StagedCreateExecutor:
                 f"```python\n{src_code}\n```\n\n"
                 f"Rewrite `{test_logical}`: call the ACTUAL signatures/attributes "
                 f"shown above (do NOT invent methods/attributes; do NOT redefine "
-                f"src symbols; import them from `{stem}`). At least one "
+                f"src symbols; import the module with `{import_line}`). At least one "
                 f"`def test_...` with asserts. Output only the test file's code."
                 + _NO_PROSE_OUTPUT_CONSTRAINT
                 + _code_language_constraint()
@@ -3185,7 +3335,7 @@ class StagedCreateExecutor:
             logger.warning("staged codegen failed: %s", exc)
             return {}, str(exc)
 
-    def _apply_source_fixes(
+    async def _apply_source_fixes(
         self, files: dict[str, str], source_path: str, task_id: str,
     ) -> bool:
         """スモーク修正生成物から source のみを書き戻す (ガード付き・test には触れない)。
@@ -3201,14 +3351,16 @@ class StagedCreateExecutor:
                 continue
             name = Path(path).name
             if path == source_path or name == src_name or len(files) == 1:
-                wrote = self._write_source_if_valid(source_path, code, task_id) or wrote
+                wrote = await self._write_source_if_valid(source_path, code, task_id) or wrote
         return wrote
 
-    def _write_source_if_valid(self, source_path: str, code: str, task_id: str) -> bool:
+    async def _write_source_if_valid(self, source_path: str, code: str, task_id: str) -> bool:
         """source 上書きは (a) 有効な Python かつ (b) 極端に縮小しない ときのみ。
 
         非コード (markdown 等) や、機能を削ったスタブ (例: 175 行→49 行) で動作する
         生成コードを破壊する事故を防ぐ。書き込んだら True、ガード棄却なら False。
+        言語パックの verify (c_16 §4.5.4) も同じ「旧コードを保つ」扱い — 失敗
+        したら書き戻さず False を返す。
         """
         if not is_python_path(source_path):
             if syntax_error_detail(code, source_path) is not None:
@@ -3236,6 +3388,13 @@ class StagedCreateExecutor:
             logger.warning(
                 "repair drastically shrank %s (%d -> %d chars); keeping existing code",
                 source_path, len(old), len(code),
+            )
+            return False
+        verify_detail = await self._run_language_verify(source_path, code)
+        if verify_detail is not None:
+            logger.warning(
+                "repair failed language verify for %s: %s; keeping existing code",
+                source_path, verify_detail,
             )
             return False
         self.workspace.write_file(

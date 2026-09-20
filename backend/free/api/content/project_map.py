@@ -12,8 +12,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
+from backend.app_state import AppState, get_app_state
 from backend.config import get_config, get_path_resolver
 from backend.free.api.content._rag_helpers import rag_error
 from backend.free.rag.corpus import (
@@ -116,7 +117,9 @@ async def get_project_map_status() -> dict[str, Any]:
 
 
 @router.post("/update")
-async def trigger_project_map_update() -> dict[str, Any]:
+async def trigger_project_map_update(
+    state: AppState = Depends(get_app_state),
+) -> dict[str, Any]:
     """ProjectMap を手動で更新する (c_16 §4.4)。
 
     走査 + tree-sitter 抽出は数分掛かりうるため、reindex と同様に同期で待つ。
@@ -143,7 +146,11 @@ async def trigger_project_map_update() -> dict[str, Any]:
         )
 
     resolver = get_path_resolver()
-    updated = await update_project_map(config=config, resolver=resolver)
+    corpus = getattr(state.cartridge_manager, "corpus", None)
+    language_overlay = corpus.language_overlay() if corpus is not None else None
+    updated = await update_project_map(
+        config=config, resolver=resolver, language_overlay=language_overlay,
+    )
     logger.info("Manual ProjectMap update: %d root(s) updated", updated)
     return {"updated_roots": updated, "running": False}
 

@@ -486,8 +486,7 @@ async def synthesize_create_task_graph_with_plan(
         raise ValueError("project_id must be non-empty")
 
     prompt = (
-        (f"{brief}\n\n" if brief else "")
-        + _SYNTHESIS_PROMPT.format(request=request.strip())
+        _SYNTHESIS_PROMPT.format(request=request.strip())
         + os_constraint()
         + _graph_language_constraint()
     )
@@ -500,6 +499,8 @@ async def synthesize_create_task_graph_with_plan(
             max_tokens=1536,
             temperature=0.3,
             telemetry=graph_telemetry,
+            # brief は system で渡す (同じスロットの後続段と接頭辞 KV を共有する)
+            system=brief or None,
             **timeout_kwargs,
         )
     except Exception as exc:

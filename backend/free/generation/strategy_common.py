@@ -34,9 +34,10 @@ from backend.free.generation.models import (
     detect_line_limit_chars,
     extract_target_chars,
 )
+from backend.free.generation.outline_seed import ParsedOutline
 from backend.free.generation.spec_renderer import render_spec_for_prompt
 from backend.free.generation.text_skeleton import TextSkeleton
-from backend.free.llm.json_schemas import CodePlan, TextPlan
+from backend.free.llm.json_schemas import CodePlan, TextPlan, TextPlanSeeded
 from backend.i18n_helper import prose_language_name
 
 logger = logging.getLogger("backend.free.generation.strategy_common")
@@ -119,6 +120,39 @@ TEXT_UNIT_CONTINUATION_SYSTEM = """\
 - 「直前テキスト末尾」から自然に繋がるように書いてください。
 - """ + UNSPECIFIED_FACTS_RULE + """
 {global_context}"""
+
+
+#: unit の system に入れる依頼の原文の上限 (文字)。添付の本文などが混ざった長い
+#: 依頼で system を膨らませない。
+_PLAN_REQUEST_MAX_CHARS = 600
+
+
+def plan_context_block(plan: GenerationPlan) -> str:
+    """unit の system に入れる計画の文脈 (``global_context`` + ``constraints`` + 依頼の原文)。
+
+    ``constraints`` は計画が「守るべき条件」を退避する欄 (計画プロンプトが、依頼に
+    含まれる形式・件数・対象読者などを constraints に retain せよと指示している)
+    なのに、2026-09-20 まで **本文生成のどこにも渡っていなかった** — 「3 点、
+    箇条書きで」の依頼に箇条書きが 15 個出た (実機)。
+
+    ただし constraints に何が写るかは計画 (LLM) 次第で、同じ依頼でも件数が写る回と
+    写らない回がある (constraints を渡した後も 5 個 → 13 個と振れた)。条件を語彙で
+    拾う規則を足すのではなく、**依頼の原文をそのまま見せる**。どれも計画単位で
+    不変なので system に置いても run 中の byte は変わらない (f_08 §2.2)。
+    """
+    parts = [plan.global_context or ""]
+    constraints = [c.strip() for c in (plan.constraints or []) if c and c.strip()]
+    if constraints:
+        lines = "\n".join(f"- {c}" for c in constraints)
+        parts.append(f"# 制約 (必ず守る)\n{lines}")
+    request = (getattr(plan, "instruction", "") or "").strip()
+    if request:
+        parts.append(
+            "# 依頼の原文 (件数・形式・対象読者などの条件を守るために参照する。"
+            "保存先やファイル形式の指示は配信の話なので本文には書かない)\n"
+            + request[:_PLAN_REQUEST_MAX_CHARS]
+        )
+    return "\n\n".join(p for p in parts if p).strip()
 
 
 # ── 計画パース ──
@@ -347,6 +381,136 @@ def fallback_plan(
         constraints=[],
         units=[unit],
         code_spec=code_spec,
+    )
+
+
+# ── 構成テンプレートによる計画の seed (f_08 §3.1.1) ──
+
+_TEXT_PLAN_SEED_PROMPT = """\
+以下の構成 (見出しと順序は固定、変更できません) に沿って文書を書きます。
+文書全体の背景 (global_context) と目標文字数 (target_length)、各セクションへの
+追加要点 (unit_notes、無ければ空配列) だけを JSON で返してください。
+
+# ユーザー指示
+{instruction}
+
+# 構成 (見出しは変更不可、0 始まりの番号は unit_notes.index に対応)
+{outline}
+"""
+
+#: seed 計画の目標文字数の既定値 (unit 1 個あたり)。ユーザー指定も補助タスクの
+#: 提案も無いときの最終フォールバック。
+_SEEDED_DEFAULT_CHARS_PER_UNIT = 500
+
+
+async def generate_seeded_plan_json(
+    aux_client: AuxClient | None,
+    instruction: str,
+    outline: ParsedOutline,
+    *,
+    telemetry: dict | None = None,
+) -> dict:
+    """縮小 schema (``TextPlanSeeded``) で補助タスクを呼ぶ (f_08 §3.1.1)。
+
+    ``aux_client is None`` (degraded) / 例外時は空 dict を返し、呼出側
+    (:func:`build_seeded_plan`) は outline だけで計画を組む。
+    """
+    if aux_client is None:
+        return {}
+    numbered = "\n".join(
+        f"{i}. {u.heading}" + (f" — {', '.join(u.key_points)}" if u.key_points else "")
+        for i, u in enumerate(outline.units)
+    )
+    prompt = _TEXT_PLAN_SEED_PROMPT.format(instruction=instruction, outline=numbered)
+    try:
+        return await aux_client.generate_json(
+            prompt,
+            max_tokens=768,
+            temperature=0.3,
+            purpose="long_form_planning",
+            response_schema=TextPlanSeeded,
+            telemetry=telemetry,
+        )
+    except Exception as e:
+        logger.warning("Seeded plan generation failed: %s", e)
+        return {}
+
+
+def build_seeded_plan(
+    outline: ParsedOutline,
+    instruction: str,
+    aux_data: dict,
+) -> GenerationPlan:
+    """outline + 補助タスク結果 (縮小 schema) から計画を組む (純粋関数)。
+
+    ``units`` の heading と順序は outline がそのまま決める。補助タスクの
+    返り値は heading を持たないため、見出しの追加・削除・並べ替えは
+    起こり得ない。``aux_data`` が空 (degraded / 失敗) なら outline と
+    ユーザー指示だけで組む。
+    """
+    aux_ok = bool(aux_data)
+
+    user_target = extract_target_chars(instruction, default=0)
+    brevity_cap = 0
+    if user_target <= 0:
+        brevity_cap = detect_brevity_cap(instruction)
+        line_cap = detect_line_limit_chars(instruction)
+        if line_cap > 0:
+            brevity_cap = line_cap if brevity_cap <= 0 else min(brevity_cap, line_cap)
+
+    aux_target = _to_int(aux_data.get("target_length"), 0) if aux_ok else 0
+    if user_target > 0:
+        target_length = user_target
+    elif brevity_cap > 0:
+        target_length = brevity_cap
+    elif aux_target > 0:
+        target_length = aux_target
+    else:
+        target_length = max(
+            len(outline.units) * _SEEDED_DEFAULT_CHARS_PER_UNIT,
+            _SEEDED_DEFAULT_CHARS_PER_UNIT,
+        )
+
+    global_context = str(aux_data.get("global_context") or "") if aux_ok else ""
+    if not global_context:
+        global_context = instruction
+
+    notes_by_index: dict[int, list[str]] = {}
+    if aux_ok:
+        for raw_note in aux_data.get("unit_notes") or []:
+            if not isinstance(raw_note, dict):
+                continue
+            idx = _to_int(raw_note.get("index"), -1)
+            if idx < 0 or idx >= len(outline.units):
+                logger.warning(
+                    "Seeded plan: unit_notes index %r out of range (units=%d); "
+                    "dropped", raw_note.get("index"), len(outline.units),
+                )
+                continue
+            extra = _declarative_key_points(raw_note.get("extra_key_points"))
+            if extra:
+                notes_by_index.setdefault(idx, []).extend(extra)
+
+    total_units = len(outline.units) or 1
+    per_unit_tokens = max(int(chars_to_tokens(target_length) / total_units), 200)
+
+    units: list[SectionPlan] = [
+        SectionPlan(
+            heading=ou.heading,
+            key_points=list(ou.key_points) + notes_by_index.get(idx, []),
+            estimated_tokens=per_unit_tokens,
+            verbatim=ou.verbatim,
+        )
+        for idx, ou in enumerate(outline.units)
+    ]
+
+    return GenerationPlan(
+        content_type=ContentType.TEXT,
+        title=outline.title,
+        target_length=target_length,
+        global_context=global_context,
+        constraints=[],
+        units=units,
     )
 
 
@@ -749,7 +913,7 @@ def build_text_unit_messages(
     # ない (system は run 中 byte 固定 — f_08 §2.2 / §8 禁則 10)。user 側
     # (_FINAL_INSTRUCTION_MARKER の直前) へ置く。
     system_text = system_template.format(
-        global_context=plan.global_context,
+        global_context=plan_context_block(plan),
         output_language=prose_language_name(),
     )
     system = budget.fit_content(
@@ -787,8 +951,25 @@ def build_text_unit_messages(
         f"このセクションの目標文字数は約{unit_target_chars}文字です。"
         "必ずこの文字数に近い量を生成してください。短すぎる出力は不可です。"
     )
+    if (getattr(plan, "instruction", "") or "").strip():
+        # 分量の指示は user の最後に置く最も強い指示なので、依頼が「3 点」と言って
+        # いても、モデルは文字数に届かせるために項目を増やす (実機 2026-09-21:
+        # 同じ依頼で 3 個の回と 13 個の回に割れた)。優先順位と、両立のさせ方を明示する。
+        unit_instructions += (
+            "\nただし、依頼の原文に件数や形式の指定 (「3 点」「箇条書きで」「表で」等) が"
+            "あれば、文字数の目安よりもそちらを優先してください。項目を増やして文字数を"
+            "稼がず、足りない分は各項目の説明を厚くしてください。"
+        )
     if getattr(unit, "sub_index", 0):
         unit_instructions += "\n" + _CONTINUATION_SYSTEM_NOTE
+    # 構成テンプレートの引用ブロック由来の固定文 (f_08 §3.1.1)。ここでは
+    # 「含めてほしい」と指示するだけで、逐語一致の担保は生成後の決定論検査
+    # (orchestrator.ensure_verbatim_sentence) が行う (再生成しない)。
+    if getattr(unit, "verbatim", None):
+        unit_instructions += (
+            "\n次の一文をそのまま逐語で（一字一句変えずに）本文に含めてください:\n"
+            f"「{unit.verbatim}」"
+        )
     if _FINAL_INSTRUCTION_MARKER in user:
         user = user.replace(
             _FINAL_INSTRUCTION_MARKER,
