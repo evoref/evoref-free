@@ -200,6 +200,10 @@ class SectionPlan:
     # プロンプトのセクション一覧経由で本文へ漏出していた (2026-07-25)。
     # 分割は構造データで持ち、heading は親と同一に保つ。
     sub_index: int = 0
+    # 構成テンプレートの引用ブロックから来た、このセクションに逐語で含める
+    # べき固定文 (f_08 §3.1.1)。``None`` = 固定文なし。生成させず、生成後に
+    # 逐語一致を検査して無ければ決定論で末尾へ差し込む (再生成しない)。
+    verbatim: str | None = None
 
 
 @dataclass
@@ -225,3 +229,8 @@ class GenerationPlan:
     # (2026-07-22 ライブ検証で判明した長文トピック混入バグの対策)。
     needs_clarification: bool = False
     clarification_question: str = ""
+    # 依頼の原文。計画は依頼を title / global_context / constraints / key_points へ
+    # 分解するが、件数・形式・対象読者などの条件がそのどれにも写らないことがある
+    # (2026-09-21 実機: 「3 点」の依頼に箇条書きが 13 個)。本文生成が原文を直接
+    # 参照できるよう、orchestrator が計画の確定後に入れる。
+    instruction: str = ""

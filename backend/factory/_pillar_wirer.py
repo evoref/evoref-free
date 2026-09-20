@@ -2499,6 +2499,11 @@ async def _build_learn_pillar(
 
     create_target_gate.bind_debug_logger(debug_logger)
 
+    # 文書テンプレートの選択判定 (c_16 §4.5.2 / c_17 §3.8) も字句段だけ。
+    from backend.free.api.chat import _template_select
+
+    _template_select.bind_debug_logger(debug_logger)
+
     with _timed(timings, "component_wiring"):
         _wire_sleep_scheduler_models(
             state, mem.sleep_scheduler, learning_scheduler, resolver,

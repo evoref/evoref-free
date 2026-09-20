@@ -96,6 +96,9 @@ class StagedRunRecorder:
             path, content, kind="src", stage="code", task_id="longform",
         )
 
-    def finish(self, exit_kind: str) -> None:
+    def finish(self, exit_kind: str, *, template: str = "") -> None:
         """run 終端を記録し即座に永続化する。"""
-        self._run_store.finish(exit_kind, last_event_seq=max(0, self._event_log.last_seq))
+        self._run_store.finish(
+            exit_kind, last_event_seq=max(0, self._event_log.last_seq),
+            template=template,
+        )

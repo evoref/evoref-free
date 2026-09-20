@@ -33,6 +33,10 @@ class ChatRequest(BaseModel):
     # 引かない (記憶 = episodic / semantic は影響しない)。ロード状態はグローバル
     # なので、雑談中に大きなコーパスへ毎ターン払わないための問い単位の制御。
     corpus_mode: Literal["auto", "on", "off"] = "auto"
+    # 文書テンプレートの明示指定 (c_16 §4.5.2)。``<package_id>:<entry_id>``。
+    # 指定すると判定点 (``template_select``) を経由せず、このターンへそのまま
+    # 適用する。未指定なら判定点が発話から選ぶ (0 件なら判定しない)。
+    template: str | None = None
 
 
 class TokenInfo(BaseModel):
@@ -47,6 +51,9 @@ class ChatResponse(BaseModel):
     token_info: TokenInfo
     session_id: str
     agent_layer: str = "reactive"
+    # 様式候補通知 (c_16 §4.5.2 / c_17 §3.8)。条件を満たさないターンは
+    # ``None`` のまま (SSE の ``template_hint`` フレームと同じ形)。
+    template_hint: dict | None = None
 
 
 class CancelRequest(BaseModel):

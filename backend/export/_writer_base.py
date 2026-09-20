@@ -82,7 +82,22 @@ class BytesWriterBase(ABC):
         logger.debug(
             "%s: %s -> %d bytes", type(self).__name__, path.name, size,
         )
-        return WriteResult(path=path, size_bytes=size)
+        # テンプレート継承の来歴 (c_16 §4.5.2 / f_11 §9.1)。テンプレート未使用の
+        # ときは何も足さない。選ばれていたのに writer が継承を宣言しなかった場合
+        # (拡張子の不一致 / 継承に対応しない形式) は ``template_applied=False`` に
+        # 倒す — 「選ばれたが効かなかった」を「未使用」と区別できなくしない。
+        result_metadata: dict[str, object] = {}
+        # ``template_applied`` は **体裁の継承元 (template_base) が渡されたとき**の
+        # 成否。構成だけの様式 (outline のみ) は ``template`` の来歴だけを持つ。
+        if "template" in content.metadata:
+            result_metadata["template"] = content.metadata["template"]
+        if "template_base" in content.metadata:
+            result_metadata["template_applied"] = (
+                content.metadata.get("template_applied") is True
+            )
+        elif "template_applied" in content.metadata:
+            result_metadata["template_applied"] = content.metadata["template_applied"]
+        return WriteResult(path=path, size_bytes=size, metadata=result_metadata)
 
     def write_to_bytes(self, content: ExportContent, ext: str) -> bytes:
         """バイトデータとして書き出す (API ダウンロード用)"""

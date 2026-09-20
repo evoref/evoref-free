@@ -42,10 +42,17 @@ class RunCommandAction:
     """シェルコマンド実行 action。
 
     ``command`` は引数列。シェル文字列としての展開を避けるため list[str] に固定。
+    ``env`` は ``None`` (既定) ならサーバプロセスの環境を丸ごと継承する
+    (``subprocess.run`` の既定動作、従来どおり)。値を渡すと子プロセスの
+    環境をそれだけに絞る (verify のような最小環境実行用、
+    ``backend.free.loop.staged.language_verify`` が使う)。**LLM が発行する
+    action JSON からは設定できない** — :func:`action_from_dict` は ``env``
+    キーを読まない (信頼できない入力から環境変数を注入させないため)。
     """
 
     command: tuple[str, ...]
     cwd: str | None = None
+    env: dict[str, str] | None = None
     kind: Literal["run_command"] = "run_command"
 
 

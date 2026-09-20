@@ -41,9 +41,18 @@ from backend.free.generation.models import (
     detect_structure_directive,
     extract_target_chars,
 )
+from backend.free.generation.outline_seed import (
+    ParsedOutline,
+    ensure_verbatim_sentence,
+    parse_outline_markdown,
+)
 from backend.free.generation.rolling_context import RollingContext
 from backend.free.generation.strategy_cogwriter import CogWriterStrategy, ReviewIssue
-from backend.free.generation.strategy_common import resolve_generation_order
+from backend.free.generation.strategy_common import (
+    build_seeded_plan,
+    generate_seeded_plan_json,
+    resolve_generation_order,
+)
 from backend.free.generation.strategy_recurrent import RecurrentStrategy
 from backend.free.generation.text_fabrication import find_unit_issues
 from backend.free.generation.text_skeleton import TextSkeleton
@@ -321,6 +330,12 @@ class LongFormOrchestrator:
         # text_unit_fabrication (c_17 §3.7) が計上した捏造候補 (棄権のみ、
         # error にはしない)。_validate_generated_text の warning に載る。
         self._fabrication_warnings: list[str] = []
+        # 構成テンプレートによる計画の seed (f_08 §3.1.1)。選択済みテンプレートに
+        # outline が無い通常経路では ``None`` のまま (``plan_seeded`` イベントを
+        # 出さない)。
+        self._seed_template_key: str | None = None
+        self._seed_aux_ok: bool | None = None
+        self._seed_verbatim_inserted: int = 0
 
         # Recurrent も計画 / 要約再帰を補助タスクで実行する
         # ため ``aux_client`` を渡す。``None`` の場合は Recurrent 内部で
@@ -354,6 +369,63 @@ class LongFormOrchestrator:
     def truncated_units(self) -> int:
         return int(getattr(self.strategy, "truncated_units", 0) or 0)
 
+    def _resolve_outline_seed(
+        self, long_form_mode: LongFormMode,
+    ) -> tuple[ParsedOutline | None, str | None]:
+        """選択済みテンプレートに outline があれば読み込んでパースする (f_08 §3.1.1)。
+
+        ターンスコープの contextvar (``backend.export.template_context``) 経由。
+        SPLIT (機能ごと個別ファイル出力) は「1 文書 = 1 構成」の outline と
+        両立しないため無視し WARNING を出す。outline が読めない / unit が
+        0 個の場合も ``(None, None)`` (呼出側は通常の計画生成へフォールバック)。
+        """
+        from backend.export.template_context import get_selected_template
+
+        selected = get_selected_template()
+        if selected is None or selected.outline_path is None:
+            return None, None
+        if long_form_mode == LongFormMode.SPLIT:
+            logger.warning(
+                "long_form: template outline is ignored for SPLIT output mode "
+                "(template=%s)", selected.provenance_key,
+            )
+            return None, None
+        try:
+            text = selected.outline_path.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning(
+                "long_form: failed to read template outline %s: %s",
+                selected.outline_path, e,
+            )
+            return None, None
+        outline = parse_outline_markdown(text)
+        if outline is None:
+            logger.warning(
+                "long_form: template outline %s has no sections; not seeding",
+                selected.outline_path,
+            )
+            return None, None
+        return outline, selected.provenance_key
+
+    def _enforce_seeded_verbatim(self, rolling: RollingContext) -> None:
+        """seed 済み unit の固定文が最終本文に残っているか確認する (f_08 §3.1.1)。
+
+        レビュー & 改稿 (§3.4) が完了した後の ``generated_units`` に対して行う
+        (改稿がまとめて上書きしても固定文が生き残るように)。無ければ再生成
+        せず決定論で unit 末尾へ差し込む。
+        """
+        units = rolling.plan.units
+        for idx, generated in enumerate(rolling.generated_units):
+            if idx >= len(units):
+                break
+            verbatim = getattr(units[idx], "verbatim", None)
+            if not verbatim:
+                continue
+            fixed, inserted = ensure_verbatim_sentence(generated, verbatim)
+            if inserted:
+                rolling.generated_units[idx] = fixed
+                self._seed_verbatim_inserted += 1
+
     def _effective_context_size(self) -> int:
         """1 リクエストが使える実効コンテキストサイズを返す。
 
@@ -380,8 +452,12 @@ class LongFormOrchestrator:
         context: dict,
         content_type: ContentType,
         mode: str,
+        outline_seed: ParsedOutline | None = None,
     ) -> tuple[Any, TokenBudget]:
         """TokenBudget 算出 → 計画生成 → テキストユニット自動分割 → 依存順ソート。
+
+        ``outline_seed`` 指定時は ``strategy.create_plan`` を呼ばず、構成
+        テンプレートから決定論で組んだ計画を使う (f_08 §3.1.1)。
 
         計画オブジェクトと算出済み TokenBudget のタプルを返す。
         """
@@ -393,9 +469,28 @@ class LongFormOrchestrator:
         )
         budget.adjust_for_small_context()
 
-        plan = await self.strategy.create_plan(
-            instruction, context, content_type, budget,
-        )
+        if outline_seed is not None:
+            telemetry: dict = {}
+            aux_data = await generate_seeded_plan_json(
+                self.aux_client, instruction, outline_seed, telemetry=telemetry,
+            )
+            self._seed_aux_ok = bool(aux_data)
+            plan = build_seeded_plan(outline_seed, instruction, aux_data)
+            # unit 数は outline が勝つ。max_units を超えても切らない
+            # (様式どおりの節を黙って落とすと「様式どおり」が成り立たない)。
+            max_units = self.config.get("long_form", {}).get("max_units", 20)
+            if len(plan.units) > max_units:
+                logger.warning(
+                    "Seeded plan has %d units (> max_units=%d); keeping all "
+                    "(outline wins, f_08 §3.1.1)",
+                    len(plan.units), max_units,
+                )
+        else:
+            plan = await self.strategy.create_plan(
+                instruction, context, content_type, budget,
+            )
+
+        plan.instruction = instruction or ""
 
         # ユーザーが明示した書式 (箇条書き / 表) は plan の key_points にも
         # unit プロンプトにも載らないため、そのままでは散文で返る。global_context
@@ -977,6 +1072,10 @@ class LongFormOrchestrator:
             "budget_used_pct": round(total_tokens / max(context_size, 1) * 100, 1),
             "total_tokens": total_tokens,
             "elapsed_sec": round(elapsed, 3),
+            # 構成テンプレートで seed した場合の来歴 (c_05 §0.6)。plan_seeded
+            # イベントと同じ条件 (9.7、この関数の直前) — 選ばれただけで
+            # seed しなかったターンは空文字のまま。
+            "template": self._seed_template_key or "",
         }
 
     async def generate(
@@ -1035,6 +1134,22 @@ class LongFormOrchestrator:
         # リクエスト冒頭で None に戻す (現状は per-request インスタンスだが防御的に)。
         self.last_text_output = None
         self.last_document_gate = None
+        self._seed_template_key = None
+        self._seed_aux_ok = None
+        self._seed_verbatim_inserted = 0
+
+        # 構成テンプレートによる計画の seed (f_08 §3.1.1)。選択済みテンプレートに
+        # outline があれば content_type を TEXT に確定し、戦略を CogWriter に
+        # 固定する (CogWriterStrategy は aux_client=None でも内部で degrade する)。
+        outline_seed, seed_template_key = self._resolve_outline_seed(long_form_mode)
+        if outline_seed is not None:
+            self._seed_template_key = seed_template_key
+            content_type_override = ContentType.TEXT
+            if not isinstance(self.strategy, CogWriterStrategy):
+                self.strategy = CogWriterStrategy(
+                    self.main_client, self.aux_client, self.config,
+                    self._debug_logger, generation_params=self._generation_params,
+                )
 
         # 1. コンテンツ種別判定 (override 指定時は検出をスキップ)
         content_type = content_type_override or detect_content_type(instruction, mode)
@@ -1062,7 +1177,7 @@ class LongFormOrchestrator:
 
         # 3-5. 計画 + 予算算出 + 依存順ソート
         plan, budget = await self._build_plan_for_generation(
-            instruction, context, content_type, mode,
+            instruction, context, content_type, mode, outline_seed,
         )
 
         # 指示単独では主題が決定できず、計画側が確認を求めた場合はユニット生成
@@ -1146,6 +1261,13 @@ class LongFormOrchestrator:
             heading_md = _unit_heading_markdown(
                 unit, plan, content_type, long_form_mode,
             )
+            if i == 0:
+                # ファイルへ書く文書には先頭にタイトルを置く (単一セクションの計画は
+                # セクション見出しを持たないので、これが無いと表題の無い文書になる)。
+                heading_md = _document_title_markdown(
+                    plan, content_type, long_form_mode,
+                    self._target_format, rolling.has_existing_context,
+                ) + heading_md
             if heading_md:
                 yield heading_md
 
@@ -1263,6 +1385,12 @@ class LongFormOrchestrator:
             ):
                 yield token
 
+            # 8.05 構成テンプレートの固定文 (f_08 §3.1.1) が改稿で失われていない
+            # か最終確認する。レビューの改稿対象には含めない (再生成しない) ため
+            # 全ユニット確定後にここで 1 回だけ検査・補完する。
+            if content_type == ContentType.TEXT:
+                self._enforce_seeded_verbatim(rolling)
+
             # 8.1 改稿済みユニットから確定本文を組み直す。生ストリーム
             # (full_response) は revise トークンを末尾に二重追記するため
             # file/editor 出力には使えない。CODE の last_code_output と対称の
@@ -1295,6 +1423,16 @@ class LongFormOrchestrator:
 
         # 9.6 設計仕様を SPEC.md 成果物として添付 (CODE のみ)。
         self._attach_spec_artifact(rolling, content_type, on_step)
+
+        # 9.7 構成テンプレートで seed した場合のみ記録 (f_08 §3.1.1)。
+        if self._seed_template_key and self._debug_logger:
+            self._debug_logger.log_long_form_event({
+                "phase": "plan_seeded",
+                "template": self._seed_template_key,
+                "units_count": len(plan.units),
+                "aux_schema_ok": bool(self._seed_aux_ok),
+                "verbatim_inserted": self._seed_verbatim_inserted,
+            })
 
         # 10. メトリクス確定
         elapsed = time.monotonic() - t_start
@@ -1736,6 +1874,42 @@ def _unit_heading_markdown(
     return f"## {heading}\n\n"
 
 
+#: 文書タイトル (``# …``) を先頭に置く出力先。表形式 (.xlsx / .csv) は見出しが
+#: 行になってしまうので含めない。
+_TITLED_FORMATS = frozenset({".docx", ".odt", ".odp", ".md", ".pptx"})
+
+
+def _document_title_markdown(
+    plan: Any,
+    content_type: ContentType,
+    long_form_mode: LongFormMode,
+    target_format: str,
+    has_existing_context: bool,
+) -> str:
+    """ファイルへ書く文書の先頭に置くタイトル行を返す (不要なら空文字列、純粋関数)。
+
+    :func:`_unit_heading_markdown` は単一セクションの計画に見出しを付けない —
+    チャット本文への短い応答に表題が付くのを避けるため。だが同じ規則が
+    **ファイルへ書く文書**にも当たり、1 セクションの計画で書いた ``.docx`` には
+    表題すら無かった (2026-09-20 実機確認)。複数セクションの文書も ``##`` だけで
+    タイトルが無い (``.pptx`` は ``#`` が表紙スライドになる、f_11 §6)。
+
+    付けない条件:
+      - CODE 生成 / SPLIT モード (ファイルごとに呼出側が構成する)
+      - 出力先がファイルの文書形式でない (チャット本文・``.txt``・表形式)
+      - 既存の内容への継続 / 追記 (既に表題がある文書の途中に表題を差し込まない)
+      - 計画にタイトルが無い
+    """
+    if content_type != ContentType.TEXT or long_form_mode == LongFormMode.SPLIT:
+        return ""
+    if (target_format or "").lower() not in _TITLED_FORMATS or has_existing_context:
+        return ""
+    title = (getattr(plan, "title", "") or "").lstrip("#").strip()
+    if not title:
+        return ""
+    return f"# {title}\n\n"
+
+
 def _chunk_evenly(items: list[str], n: int) -> list[list[str]]:
     """リストを n 個の連続チャンクにほぼ等分する (先頭側が大きい)。"""
     if n <= 1:
@@ -1828,6 +2002,11 @@ def _split_oversized_text_units(
                     sub_index=i + 1,
                 )
             new_units.append(sub)
+
+        # 構成テンプレートの固定文 (f_08 §3.1.1) は分割後も最後のサブユニット
+        # (= セクションの実際の末尾) にだけ持たせ、二重に差し込まれないようにする。
+        if unit.verbatim:
+            new_units[-1].verbatim = unit.verbatim
 
         logger.info(
             "Split oversized unit '%s': %d tokens -> %d sub-units x %d tokens",

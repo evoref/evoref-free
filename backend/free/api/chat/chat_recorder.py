@@ -1107,6 +1107,31 @@ def _active_gen_config(
     if rag_meta is not None:
         ref.corpus_gated = rag_meta["corpus_gated"]
         ref.pseudo_derived_count = rag_meta["pseudo_derived"]
+    # 体裁の継承 (write_file が WriteResult.metadata へ載せた場合) / 帳票の
+    # 穴埋め (書込み成功時) の来歴。session_id を持たないツール境界
+    # (write_file) から運ばれるため、TurnRecord ではなく専用 contextvar 経由
+    # (c_16 §4.5.2)。plan_seed (長文の構成テンプレート) はこの経路を通らない
+    # 呼出元 (record_long_form_response / record_meta_cognitive_response) が
+    # 明示的に上書きする。
+    from backend.export.template_context import applied_template_key
+
+    ref.template = applied_template_key()
+    return ref
+
+
+def _gen_config_with_template(
+    state: AppState, mode: str, session_id: str, template: str,
+) -> "GenerationConfigRef":
+    """``_active_gen_config`` に、呼出元が明示した来歴鍵があれば上書きして返す。
+
+    長文の構成テンプレート seed (``plan_seeded``) は ``write_file`` の
+    contextvar を経由しないため、呼出元 (``record_long_form_response`` /
+    ``record_meta_cognitive_response``) が ``metrics`` / ``production_metrics``
+    から読んだ値をここで明示的に渡す。
+    """
+    ref = _active_gen_config(state, mode, session_id)
+    if template:
+        ref.template = template
     return ref
 
 
@@ -1261,6 +1286,7 @@ def _record_turn(
     generation_failed: bool,
     experience_kwargs: dict,
     keep_artifact: bool = False,
+    template: str = "",
 ) -> None:
     """``record_*`` 3 経路の共通本体 (WM → 成果物 → デバッグログ → 経験 → 帳簿)。
 
@@ -1269,6 +1295,11 @@ def _record_turn(
     3 経路が同じ手順を写経しており、meta_cognitive / long_form だけ経験へ
     ``turn_id`` (ID 連鎖、c_05 §0.6) を刻まず、抑止応答の疑似クエリ種
     (:func:`record_pq_misses_if_abstained`) も積んでいなかった。
+
+    ``template`` は呼出元が明示的に確定した来歴鍵 (長文の構成テンプレート
+    seed 等、``write_file`` の contextvar を経由しない経路)。指定が無ければ
+    ``_active_gen_config`` が読む contextvar (体裁の継承 / 帳票の穴埋め) に
+    委ねる。
     """
     # メモリに応答を記録
     assistant_turn_id = _record_assistant_turn_to_memory(
@@ -1337,9 +1368,17 @@ def _record_turn(
                 generation_failed=generation_failed or not body.strip(),
                 session_id=session_id,
                 turn_id=assistant_turn_id,
-                gen_config=_active_gen_config(state, mode, session_id),
+                gen_config=_gen_config_with_template(state, mode, session_id, template),
                 **experience_kwargs,
             )
+            # 長文経路は経験を記録してからファイルを書くので、体裁の継承を適用したか
+            # どうかはこの時点でまだ決まっていない。来歴の入れ先を預けておき、
+            # write_file が適用した時点で埋めさせる (様式が無いターンは no-op)。
+            from backend.export.template_context import defer_template_provenance
+
+            gen_config = getattr(entry, "gen_config", None)
+            if gen_config is not None:
+                defer_template_provenance(gen_config)
             record_pq_misses_if_abstained(state, entry, session_id, user_query)
         except Exception as e:
             # 経験記録の失敗でチャットを壊さない方針は維持するが、**握り潰さない**。
@@ -1377,6 +1416,7 @@ def record_meta_cognitive_response(
     cancelled: bool = False,
     truncated: bool = False,
     generation_failed: bool = False,
+    template: str = "",
 ) -> None:
     """Meta-Cognitive 層の応答をメモリ・経験バッファに記録（クレジット付き）
 
@@ -1391,6 +1431,11 @@ def record_meta_cognitive_response(
     相当する印だが、meta 経路にはそれを出す判定層が無い (ツールはタスク計画
     から呼ばれ、「撃てるツールが無い」はタスク failed として現れる)。呼出側が
     導けなければ ``None`` のまま = 矛盾検出のこの入力は使わない。
+
+    ``template`` は production stage (staged/longform、f_03 §4.4) の
+    ``MetaCognitiveResponse.production_metrics`` から呼出側が読んだ来歴鍵
+    (長文の構成テンプレート seed。体裁の継承 / 帳票の穴埋めは write_file の
+    contextvar 経由で ``_active_gen_config`` が拾うのでここでは渡さない)。
     """
     credits_dicts = [
         {"step_index": c.step_index, "action": c.action, "credit": c.credit}
@@ -1410,6 +1455,7 @@ def record_meta_cognitive_response(
         cancelled=cancelled,
         truncated=truncated,
         generation_failed=generation_failed,
+        template=template,
         experience_kwargs={
             "agent_loops": agent_loops,
             "rag_used": rag_used,
@@ -1469,6 +1515,9 @@ def record_long_form_response(
         truncated=truncated,
         generation_failed=generation_failed,
         keep_artifact=True,
+        # 構成テンプレートで seed した場合の来歴 (f_08 §3.1.1)。orchestrator が
+        # plan_seeded 時だけ ``last_metrics["template"]`` を持つ (c_05 §0.6)。
+        template=str(metrics.get("template") or ""),
         experience_kwargs={
             "long_form_used": True,
             "long_form_content_type": metrics.get("content_type"),

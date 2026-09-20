@@ -25,7 +25,8 @@ export const SSE_FRAME_TYPES = [
 	'sources',
 	'error',
 	'result',
-	'create_run'
+	'create_run',
+	'template_hint'
 ] as const;
 
 export type SSEFrameType = (typeof SSE_FRAME_TYPES)[number];

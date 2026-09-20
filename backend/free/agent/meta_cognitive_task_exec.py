@@ -121,6 +121,16 @@ def truncate_tool_result(text: str, max_chars: int = TOOL_RESULT_MAX_CHARS) -> s
     )
 
 
+def _is_unanchored_relative(file_path: str) -> bool:
+    """ディレクトリ成分を持つ錨の無い相対パスか (``./`` ``../`` ``~`` / 絶対パスは除く)。"""
+    normalized = file_path.replace("\\", "/")
+    if normalized.startswith(("./", "../", "~", "/")):
+        return False
+    if len(file_path) > 1 and file_path[1] == ":":
+        return False
+    return "/" in normalized.strip("/")
+
+
 def _explicit_existing_dir(query: str) -> Path | None:
     """クエリが明示した既存ディレクトリ (最後に現れたもの) を返す (無ければ ``None``)。
 
@@ -740,6 +750,28 @@ class _TaskExecutionMixin:
                         "query path %s", file_path, qpath,
                     )
                     return str(qp.parent / p.name)
+        elif _is_unanchored_relative(file_path):
+            # ``ledger/store.py`` のような相対サブパスも、依頼が出力フォルダを
+            # 指していればその配下へ置く (2026-09-20 実機: 裸名の SPEC.md は依頼
+            # フォルダへ、ledger/store.py は outputs_dir へ割れた)。入力ファイルしか
+            # 指していない依頼は従来どおり outputs_dir へ。
+            out_dir = _explicit_existing_dir(query)
+            if out_dir is not None:
+                return str(out_dir / p)
+            qpath = _extract_file_path(query)
+            if qpath and ("\\" in qpath or "/" in qpath):
+                qp = Path(qpath)
+                if qp.is_dir() or not qp.suffix:
+                    return str(qp / p)
+                # ファイル形 (依頼文のモジュール名が付いた ``<folder>\store.py``) は
+                # 裸名と同じく親を作業ディレクトリとみなす。親の末尾が相対パスの
+                # ディレクトリ成分と重なるなら (``...\ledger\store.py`` と
+                # ``ledger/cli.py``) 重複させない。
+                base = qp.parent
+                tail = p.parent.parts
+                if base.parts[-len(tail):] == tail:
+                    base = Path(*base.parts[:-len(tail)])
+                return str(base / p)
         return file_path
 
     async def _emit_loop_tool_running(

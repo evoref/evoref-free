@@ -11,7 +11,13 @@ import re
 from typing import override
 
 from backend.export._writer_base import BytesWriterBase
-from backend.export.base import ContentBlock, ExportContent
+from backend.export.base import (
+    ContentBlock,
+    ExportContent,
+    ListItemNode,
+    build_item_tree,
+    sibling_runs,
+)
 from backend.export.markdown_patterns import (
     RE_BOLD as _RE_BOLD,
     RE_INLINE_CODE as _RE_CODE,
@@ -31,6 +37,25 @@ def _strip_inline_formatting(text: str) -> str:
     text = _RE_ITALIC.sub(lambda m: m.group(1) or m.group(2), text)
     text = _RE_CODE.sub(r"\1", text)
     return text
+
+
+def _list_plaintext_lines(nodes: list[ListItemNode], depth: int = 0) -> list[str]:
+    """入れ子ツリーを 2 スペース字下げの行列にする。
+
+    番号付きは段ごと・親ごとに 1 から数える。平らな (depth=0 のみ) 入力
+    では、従来の ``enumerate(items, 1)`` と同じ行になる。
+    """
+    lines: list[str] = []
+    indent = "  " * depth
+    for run in sibling_runs(nodes):
+        for counter, node in enumerate(run, 1):
+            prefix = f"{counter}." if node.ordered else "-"
+            head, *rest = _strip_inline_formatting(node.text).split("\n")
+            lines.append(f"{indent}  {prefix} {head}")
+            hang = " " * (len(indent) + 2 + len(prefix) + 1)
+            lines.extend(f"{hang}{cont}" for cont in rest)
+            lines.extend(_list_plaintext_lines(node.children, depth + 1))
+    return lines
 
 
 def _blocks_to_plaintext(blocks: list[ContentBlock]) -> str:
@@ -62,9 +87,7 @@ def _blocks_to_plaintext(blocks: list[ContentBlock]) -> str:
             parts.append("")
 
         elif block.type == "list":
-            for idx, item in enumerate(block.items, 1):
-                prefix = f"{idx}." if block.ordered else "-"
-                parts.append(f"  {prefix} {_strip_inline_formatting(item)}")
+            parts.extend(_list_plaintext_lines(build_item_tree(block)))
             parts.append("")
 
         elif block.type == "quote":

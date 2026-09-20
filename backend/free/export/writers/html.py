@@ -9,7 +9,13 @@ import html
 from typing import override
 
 from backend.export._writer_base import BytesWriterBase
-from backend.export.base import ContentBlock, ExportContent
+from backend.export.base import (
+    ContentBlock,
+    ExportContent,
+    ListItemNode,
+    build_item_tree,
+    sibling_runs,
+)
 from backend.log_config import get_logger
 
 logger = get_logger("export.writers.html")
@@ -40,6 +46,33 @@ def _inline_html(text: str) -> str:
     text = _RE_CODE.sub(r"<code>\1</code>", text)
     text = _RE_LINK.sub(r'<a href="\2">\1</a>', text)
     return text
+
+
+def _item_html(text: str) -> str:
+    """リスト項目のテキスト。項目の中の改行 (題名 + 説明) は ``<br>`` にする。"""
+    return "<br>".join(_inline_html(part) for part in text.split("\n"))
+
+
+def _list_html_lines(nodes: list[ListItemNode]) -> list[str]:
+    """入れ子ツリーを ``<ul>``/``<ol>`` の行列にする。
+
+    平らな (子を持たない) ノードだけなら、各 ``<li>`` を独立した行として
+    積む従来の構造とそのまま一致する。
+    """
+    lines: list[str] = []
+    for run in sibling_runs(nodes):
+        tag = "ol" if run[0].ordered else "ul"
+        lines.append(f"<{tag}>")
+        for node in run:
+            child_lines = _list_html_lines(node.children)
+            if child_lines:
+                lines.append(f"<li>{_item_html(node.text)}")
+                lines.extend(child_lines)
+                lines.append("</li>")
+            else:
+                lines.append(f"<li>{_item_html(node.text)}</li>")
+        lines.append(f"</{tag}>")
+    return lines
 
 
 def _blocks_to_html(blocks: list[ContentBlock], title: str) -> str:
@@ -76,11 +109,7 @@ def _blocks_to_html(blocks: list[ContentBlock], title: str) -> str:
             parts.append("</table>")
 
         elif block.type == "list":
-            list_tag = "ol" if block.ordered else "ul"
-            parts.append(f"<{list_tag}>")
-            for item in block.items:
-                parts.append(f"<li>{_inline_html(item)}</li>")
-            parts.append(f"</{list_tag}>")
+            parts.extend(_list_html_lines(build_item_tree(block)))
 
         elif block.type == "quote":
             parts.append(f"<blockquote><p>{_inline_html(block.content)}</p></blockquote>")

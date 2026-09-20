@@ -466,6 +466,11 @@ rag:
   max_loaded_cartridges: 20       # 同時 loaded 可能なカートリッジ上限 (0 以下で無制限)。超過時は LRU で最古参を unload
   large_cartridge_warn_chunks: 50000  # load 時にチャンク数がこの閾値以上なら WARNING ログを出す
   cartridge_search_timeout_ms: 3000   # カートリッジ検索全体のタイムアウト (ms)。超過時は空結果を返しチャット応答を止めない (0 で無効)
+  # corpus パッケージ install の入口検査 (c_16 §4.3)。展開前に zip 本体を、
+  # 展開後に合計サイズ (zip bomb 対策) を検査する。超過は install を拒否する。
+  packages:
+    max_package_bytes: 268435456    # .evocart zip 本体のサイズ上限 (既定 256MiB)
+    max_unpacked_bytes: 1073741824  # 展開後の合計サイズ上限 (既定 1GiB)
   # Cartridge Gate: centroid 事前フィルタ。多数カートリッジ装着時に無関係な cart をベクトル検索前にスキップ
   cartridge_gate:
     enabled: true                     # 有効化。centroid 未構築 cart は常に通過するため既存環境でも安全
@@ -1220,6 +1225,10 @@ create:
     part_max_tokens: 1536            # 部分 1 個の生成 max_tokens。切断時のみ倍に広げ再生成
     part_max_parts: 4                # 1 ファイルの最大部分数 (超過 component は spec 順に決定論併合)
     max_spec_revision_rounds: 1      # test 不合格時の spec 見直しサイクル上限 (ワークスペース全体, 0 で無効)
+    verify:                          # 言語パックの検証コマンド (c_16 §4.5.4)。既定 OFF
+      enabled: false                 # true にした PC だけが実行する。false では宣言を読みもしない
+      commands: []                   # 承認済み argv の allow-list (例: [["node", "--check", "{file}"]])。パックは承認済みのコマンドを選ぶだけで、引数も増やせない
+      timeout_sec: 60                # 宣言側の timeout_sec の上限 (実際は min(宣言値, これ))
   brief:
     # ProductionBrief (f_08 §2.2): create ターン入口で1回だけ組む不変ブリーフの予算。
     # 全 LLM 呼出 (計画/spec/深化/フロー/code/test/修復/見直し/unit/レビュー) のプロンプト先頭に同じ bytes を置く

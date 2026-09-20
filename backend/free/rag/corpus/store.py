@@ -48,18 +48,26 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from backend.free.rag.corpus.chunking import CHUNKER_VERSION, chunk_documents
+from backend.free.rag.corpus.office_inspect import inspect_office_file
 from backend.free.rag.corpus.package import (
     DOCS_DIR,
+    LANGUAGE_DIR,
+    LANGUAGE_VERIFY_FEATURE,
     PACKAGE_FILE,
     PREBUILT_DIR,
     PREBUILT_EMBEDDINGS_DIR,
+    TEMPLATES_DIR,
     PackageError,
     PackageMeta,
     PrebuiltInfo,
     compute_content_digest,
+    compute_section_digests,
+    discover_sections,
+    has_any_section_content,
     iter_prebuilt_chunks,
     meta_from_record,
     read_package,
+    validate_requires,
     write_package_meta,
     write_prebuilt_build,
     write_prebuilt_chunks,
@@ -71,7 +79,23 @@ from backend.free.rag.corpus.calibration import (
     load_corpus_calibration,
     save_corpus_calibration,
 )
+from backend.free.rag.corpus.language import (
+    BUNDLED_EXTENSIONS,
+    BUNDLED_GRAMMAR_NAMES,
+    ImportRule,
+    LanguageEntry,
+    VerifyCommand,
+    load_language_for_package,
+    resolve_pack_language_entry,
+    validate_language_install,
+)
 from backend.free.rag.corpus.pseudo_queries import PSEUDO_QUERIES_DIR, PseudoQueryIndex
+from backend.free.rag.corpus.templates import (
+    TemplateCandidate,
+    TemplateEntry,
+    load_templates_for_package,
+    validate_templates_install,
+)
 from backend.free.rag.evidence._json_state import JsonStateFile
 from backend.free.rag.evidence.config import merge_rag_evidence_config
 from backend.free.rag.evidence.ranking import RankColumns, score_rows
@@ -117,14 +141,31 @@ DEFAULT_CARTRIDGE_GATE_THRESHOLD = 0.3
 #: 保持するパッケージ版数 (c_16 §5.4)。
 DEFAULT_VERSIONS_KEEP = 2
 
+#: ``rag.packages.max_package_bytes`` / ``max_unpacked_bytes`` が未指定のときの既定
+#: (c_16 §4.3 の install 入口検査)。
+DEFAULT_MAX_PACKAGE_BYTES = 268_435_456
+DEFAULT_MAX_UNPACKED_BYTES = 1_073_741_824
+
 #: 版 GC の改名先の接頭辞 (c_16 §5.4)。``installed_versions`` はこれを版として数えない。
 TRASH_PREFIX = ".trash-"
 
-#: ``package.json._extra.kind`` が ProjectMap のパッケージ (c_16 §4.4)。
-#: SSOT は ``backend.free.rag.projectmap.ids.PROJECT_MAP_KIND`` — ここでは
+#: ``package.json`` の第一級フィールド ``kind`` が ProjectMap のパッケージ
+#: (c_16 §4.4)。SSOT は ``backend.free.rag.projectmap.ids.PROJECT_MAP_KIND``
+#: (= ``backend.free.rag.corpus.package.PACKAGE_KINDS`` の一員) — ここでは
 #: import しない (projectmap は corpus に依存する側なので、逆方向の import は
 #: 循環になる)。値を変えるときは両方を合わせて直す。
 PROJECT_MAP_PACKAGE_KIND = "project_map"
+
+#: 検索に載らないセクション (c_16 §4.5) を索引 (chunk / centroid / 疑似クエリ) の
+#: 対象外にするため、``docs/`` が提供されているかの判定に使う拡張子集合。
+_OFFICE_TEMPLATE_SUFFIXES = frozenset({".docx", ".pptx", ".xlsx"})
+#: ``templates/`` に置けない Office 形式 (c_16 §4.5.2)。テンプレート形式は
+#: python-docx / python-pptx が content-type の不一致で開けず (2026-09-20 実測)、
+#: マクロ有効形式は中身を見るまでもなく受け付けない。
+_REJECTED_TEMPLATE_SUFFIXES = frozenset({
+    ".dotx", ".potx", ".xltx",
+    ".docm", ".dotm", ".xlsm", ".xltm", ".pptm", ".potm",
+})
 
 
 # ── centroid ゲートの閾値解決 (旧 cartridge_manager から移設) ──────────
@@ -278,6 +319,13 @@ class CorpusPackage:
     loaded: bool = False
     #: 疑似クエリ索引 (f_01 §6)。版ディレクトリ配下の独立した EvidenceStore。
     pseudo_queries: PseudoQueryIndex | None = None
+    #: ``templates/`` セクションのエントリ (c_16 §4.5.2)。open / install 時に
+    #: 常駐させる (応答パスで JSON を読み直さない、c_16 §4.5.1)。
+    templates: tuple[TemplateEntry, ...] = ()
+    #: ``language/`` セクションのエントリ (c_16 §4.5.3)。構造検証済みの生の
+    #: エントリ (tree-sitter 込みの有効性は :meth:`CorpusStore.language_overlay`
+    #: が全 active パッケージを横断して判定する)。
+    language_entries: tuple[LanguageEntry, ...] = ()
 
     @property
     def id(self) -> str:
@@ -308,7 +356,70 @@ class CorpusPackage:
         一覧 (:meth:`CorpusStore.list_packages`) / ``manifest.active`` / GC
         には引き続き載る。
         """
-        return self.meta._extra.get("kind") == PROJECT_MAP_PACKAGE_KIND
+        return self.meta.kind == PROJECT_MAP_PACKAGE_KIND
+
+
+@dataclass(frozen=True, slots=True)
+class TemplateLookup:
+    """``get_template`` の戻り値 (c_16 §4.5.2)。"""
+
+    package_id: str
+    version: str
+    entry: TemplateEntry
+    section_dir: Path
+
+    @property
+    def key(self) -> str:
+        """参照鍵 (``<package_id>:<entry_id>``)。"""
+        return f"{self.package_id}:{self.entry.id}"
+
+    @property
+    def provenance_key(self) -> str:
+        """来歴に刻む版込みの鍵 (``<package_id>@<version>:<entry_id>``、c_05 §0.6)。"""
+        return f"{self.package_id}@{self.version}:{self.entry.id}"
+
+    @property
+    def base_path(self) -> Path | None:
+        """``base`` の絶対パス (無ければ ``None``)。"""
+        return None if self.entry.base is None else self.section_dir / self.entry.base
+
+
+@dataclass(frozen=True, slots=True)
+class LanguageOverlayEntry:
+    """有効な言語パックエントリ 1 件 (c_16 §4.5.3)。拡張子 → この形で引く。"""
+
+    package_id: str
+    version: str
+    entry_id: str
+    #: tree-sitter-language-pack の言語名。
+    grammar: str
+    #: ``.scm`` の中身 (無ければ ``None`` — ProjectMap の抽出には使えないが、
+    #: 構文検査には ``grammar`` だけで足りる)。
+    query: str | None
+    class_ancestor_types: tuple[str, ...]
+    #: 検証済み (c_16 §4.5.3、段階 C-2)。``None`` = imports 辺を張らない。
+    imports: ImportRule | None = None
+    #: 構造検証済み、かつパッケージが ``language.verify/1`` を requires して
+    #: いるときだけ (c_16 §4.5.4、段階 C-3)。フラグが無ければ常に空。
+    verify: tuple[VerifyCommand, ...] = ()
+
+    @property
+    def provenance(self) -> str:
+        """来歴に刻む版込みの鍵 (``<package_id>@<version>:<entry_id>``)。"""
+        return f"{self.package_id}@{self.version}:{self.entry_id}"
+
+
+@dataclass(frozen=True, slots=True)
+class LanguageOverlay:
+    """``CorpusStore.language_overlay()`` の戻り値 (c_16 §4.5.3)。"""
+
+    by_extension: dict[str, LanguageOverlayEntry] = field(default_factory=dict)
+    #: 有効なエントリを 1 件以上持つパックの ``section_digests["language"]``
+    #: (ProjectMap の ``extractor_version`` に混ぜる、sorted / 重複排除済み)。
+    pack_digests: tuple[str, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.by_extension)
 
 
 @dataclass(slots=True, frozen=True)
@@ -420,6 +531,14 @@ class CorpusStore:
         self._max_loaded = int(self._top("max_loaded_cartridges", 20))
         self._large_warn_chunks = int(self._top("large_cartridge_warn_chunks", 50000))
 
+        packages_cfg = self._section("packages")
+        self._max_package_bytes = int(
+            self._get(packages_cfg, "max_package_bytes", DEFAULT_MAX_PACKAGE_BYTES),
+        )
+        self._max_unpacked_bytes = int(
+            self._get(packages_cfg, "max_unpacked_bytes", DEFAULT_MAX_UNPACKED_BYTES),
+        )
+
         #: id → パッケージ (active 版のみ)。OrderedDict の末尾 = 最近使用。
         self._packages: OrderedDict[str, CorpusPackage] = OrderedDict()
         #: 原文の見出し階層 ``[(深さ, 題)]`` (``heading_path`` 用、文書ごと)。
@@ -481,6 +600,18 @@ class CorpusStore:
         else:
             self.manifest.store_prior_overrides[package_id] = float(prior)
         self.manifest.save()
+
+    # ── install の入口検査 (c_16 §4.3) ──
+
+    @property
+    def max_package_bytes(self) -> int:
+        """`.evocart` zip 本体のサイズ上限 (``rag.packages.max_package_bytes``)。"""
+        return self._max_package_bytes
+
+    @property
+    def max_unpacked_bytes(self) -> int:
+        """展開後の合計サイズ上限 (``rag.packages.max_unpacked_bytes``、zip bomb 対策)。"""
+        return self._max_unpacked_bytes
 
     # ── 埋め込みバックエンド ──
 
@@ -552,12 +683,18 @@ class CorpusStore:
             len(self._packages), sum(1 for p in self._packages.values() if p.loaded),
             self.corpus_dir,
         )
+        self._push_language_overlay()
 
     def _open_package(self, directory: Path) -> CorpusPackage:
         """版ディレクトリを開いて :class:`CorpusPackage` にする。"""
         meta = meta_from_record(
             json.loads((directory / PACKAGE_FILE).read_text(encoding="utf-8")),
         )
+        if not meta.provides:
+            # セクション化 (c_16 §4.3) 以前の package.json は provides を
+            # 宣言していない。ディスクには書き戻さず、実行時の判定
+            # (outdated_package_ids 等) のためだけにディレクトリの実在から補う。
+            meta = replace(meta, provides=discover_sections(directory))
         store = self._make_store(directory, meta.id)
         store.load()
         return CorpusPackage(
@@ -570,6 +707,8 @@ class CorpusStore:
             size_mb=_dir_size_mb(directory / EMBEDDINGS_DIR),
             installed_at=_installed_at(directory),
             pseudo_queries=self._open_pseudo_queries(directory, meta.id, store),
+            templates=load_templates_for_package(directory, meta.id),
+            language_entries=load_language_for_package(directory, meta.id),
         )
 
     def _open_pseudo_queries(
@@ -647,6 +786,235 @@ class CorpusStore:
             if package.loaded and not package.is_project_map:
                 hints.extend(package.tool_hints)
         return hints
+
+    # ── templates (c_16 §4.5.2) ──
+
+    def list_templates(self) -> list[dict[str, Any]]:
+        """インストール済み (active 版) の全テンプレートエントリの一覧。
+
+        ``load`` / ``unload`` (検索対象の LRU) には関わらない — templates は
+        統合検索に載らない資材で、active であれば常に指名して使える。
+        """
+        rows: list[dict[str, Any]] = []
+        for package_id in sorted(self._packages):
+            package = self._packages[package_id]
+            for entry in package.templates:
+                rows.append({
+                    "key": f"{package_id}:{entry.id}",
+                    "doc_type": entry.doc_type,
+                    "aliases": list(entry.aliases),
+                    "lang": entry.lang,
+                    "description": entry.description,
+                    "package": package_id,
+                    "version": package.version,
+                    "has_base": entry.base is not None,
+                    "has_outline": entry.outline is not None,
+                    "has_fields": entry.fields is not None,
+                })
+        return rows
+
+    def get_template(self, key: str) -> TemplateLookup | None:
+        """``<package_id>:<entry_id>`` から 1 エントリを引く (active 版のみ)。"""
+        package_id, sep, entry_id = key.partition(":")
+        if not sep or not entry_id:
+            return None
+        package = self._packages.get(package_id)
+        if package is None:
+            return None
+        for entry in package.templates:
+            if entry.id == entry_id:
+                return TemplateLookup(
+                    package_id=package_id,
+                    version=package.version,
+                    entry=entry,
+                    section_dir=package.directory / TEMPLATES_DIR,
+                )
+        return None
+
+    def template_candidates(self) -> list[TemplateCandidate]:
+        """``template_select`` 判定点へ渡す命名材料 (c_16 §4.5.1 の先勝ち規則)。
+
+        パッケージ id 昇順で走査し、``doc_type`` / ``aliases`` の語を先に
+        登録したパッケージが取り合いに勝つ (WARNING を出し、後発のエントリは
+        命名の対象から外れる。参照鍵での直接指名や一覧には引き続き載る)。
+        """
+        claimed: dict[str, str] = {}
+        candidates: list[TemplateCandidate] = []
+        for package_id in sorted(self._packages):
+            package = self._packages[package_id]
+            for entry in package.templates:
+                terms = [t.strip().lower() for t in (entry.doc_type, *entry.aliases) if t.strip()]
+                conflict_with = next(
+                    (claimed[t] for t in terms if t in claimed and claimed[t] != package_id),
+                    None,
+                )
+                if conflict_with is not None:
+                    logger.warning(
+                        "corpus templates naming conflict: package %s entry %s "
+                        "shares doc_type/alias already claimed by package %s; "
+                        "excluded from template_select (first-registered wins)",
+                        package_id, entry.id, conflict_with,
+                    )
+                    continue
+                for term in terms:
+                    claimed.setdefault(term, package_id)
+                candidates.append(TemplateCandidate(
+                    package_id=package_id, version=package.version, entry=entry,
+                ))
+        return candidates
+
+    # ── language (c_16 §4.5.3) ──
+
+    def _compute_language_overlay(
+        self,
+    ) -> tuple[dict[str, "LanguageOverlayEntry"], dict[str, dict[str, tuple[bool, str]]]]:
+        """拡張子 → 有効エントリ、と (package_id, entry_id) → (有効か, 理由) を計算する。
+
+        パッケージ id 昇順で走査し、同梱の拡張子・グラマ名との衝突、パック
+        同士の拡張子の取り合い (先勝ち)、tree-sitter 込みの実行可能性
+        (:func:`resolve_pack_language_entry`) の順に確認する。1 エントリの
+        失敗は他のエントリ・他の言語・同梱言語を止めない (c_16 §4.5.3)。
+        """
+        by_extension: dict[str, LanguageOverlayEntry] = {}
+        status: dict[str, dict[str, tuple[bool, str]]] = {}
+        claimed_ext: dict[str, str] = {}
+        for package_id in sorted(self._packages):
+            package = self._packages[package_id]
+            pkg_status = status.setdefault(package_id, {})
+            if not package.language_entries:
+                continue
+            section_dir = package.directory / LANGUAGE_DIR
+            for entry in package.language_entries:
+                if entry.grammar in BUNDLED_GRAMMAR_NAMES or entry.id in BUNDLED_GRAMMAR_NAMES:
+                    reason = f"grammar/id {entry.grammar!r} conflicts with a bundled language"
+                    pkg_status[entry.id] = (False, reason)
+                    logger.warning(
+                        "corpus package %s: language entry %s disabled: %s",
+                        package_id, entry.id, reason,
+                    )
+                    continue
+                bundled_ext = next(
+                    (ext for ext in entry.extensions if ext in BUNDLED_EXTENSIONS), None,
+                )
+                if bundled_ext is not None:
+                    reason = f"extension {bundled_ext} is already a bundled language"
+                    pkg_status[entry.id] = (False, reason)
+                    logger.warning(
+                        "corpus package %s: language entry %s disabled: %s",
+                        package_id, entry.id, reason,
+                    )
+                    continue
+                conflict_with = next(
+                    (
+                        claimed_ext[ext] for ext in entry.extensions
+                        if ext in claimed_ext and claimed_ext[ext] != package_id
+                    ),
+                    None,
+                )
+                if conflict_with is not None:
+                    reason = f"extension already claimed by package {conflict_with}"
+                    pkg_status[entry.id] = (False, reason)
+                    logger.warning(
+                        "corpus package %s: language entry %s disabled: %s "
+                        "(first-registered wins)", package_id, entry.id, reason,
+                    )
+                    continue
+                resolved, reason = resolve_pack_language_entry(entry, section_dir)
+                if resolved is None:
+                    pkg_status[entry.id] = (False, reason or "invalid language entry")
+                    logger.warning(
+                        "corpus package %s: language entry %s disabled: %s",
+                        package_id, entry.id, reason,
+                    )
+                    continue
+                verify_commands: tuple[VerifyCommand, ...] = ()
+                if LANGUAGE_VERIFY_FEATURE in package.meta.requires:
+                    verify_commands = tuple(
+                        v.command for v in entry.verify if v.command is not None
+                    )
+                overlay_entry = LanguageOverlayEntry(
+                    package_id=package_id,
+                    version=package.version,
+                    entry_id=entry.id,
+                    grammar=resolved.grammar,
+                    query=resolved.query_text,
+                    class_ancestor_types=resolved.class_ancestor_types,
+                    imports=resolved.imports,
+                    verify=verify_commands,
+                )
+                for ext in entry.extensions:
+                    claimed_ext[ext] = package_id
+                    by_extension[ext] = overlay_entry
+                pkg_status[entry.id] = (True, "")
+        return by_extension, status
+
+    def language_overlay(self) -> "LanguageOverlay":
+        """全 active パッケージの ``language/`` を重ねた表 (c_16 §4.5.3)。
+
+        同梱テーブルの上に読み手 (構文検査 / ProjectMap) が重ねて引く。
+        tree-sitter が無い環境では空になる (縮退)。
+        """
+        by_extension, _status = self._compute_language_overlay()
+        pack_digests = sorted({
+            self._packages[pid].meta.section_digests.get("language", "")
+            for pid in {entry.package_id for entry in by_extension.values()}
+            if self._packages[pid].meta.section_digests.get("language")
+        })
+        return LanguageOverlay(by_extension=by_extension, pack_digests=tuple(pack_digests))
+
+    def language_report(self, package_id: str) -> list[dict[str, Any]]:
+        """1 パッケージの言語エントリの有効/無効と理由 (``GET /api/cartridges/{id}`` 用)。
+
+        ``verify`` (c_16 §4.5.4、段階 C-3) は言語の有効/無効と独立に、
+        構造検証の結果 + ``language.verify/1`` の requires 有無を理由付きで返す
+        (実行時 config の allow-list / which 解決は含まない — それは
+        リクエストスコープの判断で、パッケージ詳細には出さない)。
+        """
+        package = self._packages.get(package_id)
+        if package is None:
+            return []
+        _by_extension, status = self._compute_language_overlay()
+        entry_status = status.get(package_id, {})
+        has_verify_flag = LANGUAGE_VERIFY_FEATURE in package.meta.requires
+        rows: list[dict[str, Any]] = []
+        for entry in package.language_entries:
+            enabled, reason = entry_status.get(entry.id, (False, "unknown"))
+            verify_rows: list[dict[str, Any]] = []
+            for v in entry.verify:
+                if not has_verify_flag:
+                    verify_rows.append({
+                        "id": v.id, "enabled": False,
+                        "reason": f"package does not require {LANGUAGE_VERIFY_FEATURE!r}",
+                    })
+                elif v.command is None:
+                    verify_rows.append({"id": v.id, "enabled": False, "reason": v.reason})
+                else:
+                    verify_rows.append({"id": v.id, "enabled": True, "reason": ""})
+            rows.append({
+                "id": entry.id,
+                "grammar": entry.grammar,
+                "extensions": list(entry.extensions),
+                "enabled": enabled,
+                "reason": reason,
+                "verify": verify_rows,
+            })
+        return rows
+
+    def _push_language_overlay(self) -> None:
+        """言語パックの拡張子表を ``core.code_syntax`` へ押し込む (c_16 §4.5.3)。
+
+        ``core`` は corpus を import できないので、押し込み口
+        (:func:`backend.free.core.code_syntax.set_language_overlay`) 経由が
+        唯一の配線。install / uninstall / 版切替 (= install) / 起動時の open
+        (``_discover``) のたびに呼ぶ。
+        """
+        from backend.free.core.code_syntax import set_language_overlay
+
+        overlay = self.language_overlay()
+        set_language_overlay({
+            ext: (entry.grammar, entry.entry_id)
+            for ext, entry in overlay.by_extension.items()
+        })
 
     def on_change(self, callback: Callable[[str, str], None]) -> None:
         """``(event, package_id)`` を受けるコールバックを登録する。
@@ -752,29 +1120,42 @@ class CorpusStore:
 
         手順 (順序が意味を持つ):
 
-        1. 版ディレクトリへ展開する
+        1. 入口検査 (zip / 展開後サイズ上限、zip slip は :func:`read_package` 側) を
+           経て版ディレクトリへ展開する
         2. ``docs/`` から ``content_digest`` を計算し直し、宣言値と突き合わせる
-        3. ``prebuilt/`` の ``chunker_version`` と埋め込みモデルが両方一致すれば
+        3. ``provides`` / ``section_digests`` / ``requires`` を実際のディレクトリと
+           突き合わせる (§4.3 セクション化)。``templates/`` の Office ファイルは
+           拡張子でなく中身で検査する (§4.5.2)
+        4. ``prebuilt/`` の ``chunker_version`` と埋め込みモデルが両方一致すれば
            チャンクと埋め込みをそのまま取り込む。違えば ``docs/`` から作り直す
-        4. ``EvidenceStore.put`` → ``create_snapshot()`` で索引を組む
-        5. ``centroid.npy`` を書く
-        6. **最後に** ``manifest.active[id] = version`` を書く
+           (``docs/`` が無ければ索引は作らない)
+        5. ``EvidenceStore.put`` → ``create_snapshot()`` で索引を組む
+        6. ``centroid.npy`` を書く
+        7. **最後に** ``manifest.active[id] = version`` を書く
 
-        6 を最後にするのは、途中で落ちても manifest が「完成している版」を
+        7 を最後にするのは、途中で落ちても manifest が「完成している版」を
         指したままにするため。
         """
         source = Path(zip_path)
         await _emit(progress_cb, {"phase": "extract", "status": "running"})
         _check_cancel(cancel_check)
 
-        contents = read_package(source)
+        contents = read_package(
+            source,
+            max_package_bytes=self._max_package_bytes,
+            max_unpacked_bytes=self._max_unpacked_bytes,
+        )
         meta = contents.meta
         directory = self.package_dir(meta.id, meta.version)
         if directory.exists():
             # 未完成の版が残っている / 同じ版の入れ直し。active は最後まで
             # 旧版を指しているので、ここで消しても検索は生きている。
             shutil.rmtree(str(directory), ignore_errors=True)
-        contents = read_package(source, directory)
+        contents = read_package(
+            source, directory,
+            max_package_bytes=self._max_package_bytes,
+            max_unpacked_bytes=self._max_unpacked_bytes,
+        )
         meta = contents.meta
         await _emit(
             progress_cb,
@@ -783,9 +1164,6 @@ class CorpusStore:
 
         docs_dir = directory / DOCS_DIR
         actual_digest = compute_content_digest(docs_dir)
-        if not actual_digest:
-            shutil.rmtree(str(directory), ignore_errors=True)
-            raise PackageError(f"package '{meta.id}' has no documents")
         if meta.content_digest and meta.content_digest != actual_digest:
             shutil.rmtree(str(directory), ignore_errors=True)
             raise PackageError(
@@ -793,6 +1171,59 @@ class CorpusStore:
                 f"{meta.content_digest[:16]}…, actual {actual_digest[:16]}…",
             )
         meta = replace(meta, content_digest=actual_digest)
+
+        if not has_any_section_content(directory):
+            shutil.rmtree(str(directory), ignore_errors=True)
+            raise PackageError(
+                f"package '{meta.id}' has no documents and no other sections",
+            )
+
+        actual_sections = discover_sections(directory)
+        if meta.provides:
+            if sorted(meta.provides) != actual_sections:
+                shutil.rmtree(str(directory), ignore_errors=True)
+                raise PackageError(
+                    f"package '{meta.id}' declares provides={sorted(meta.provides)} "
+                    f"but the archive actually has sections={actual_sections}",
+                )
+        else:
+            meta = replace(meta, provides=actual_sections)
+
+        actual_section_digests = compute_section_digests(directory)
+        if meta.section_digests:
+            if meta.section_digests != actual_section_digests:
+                shutil.rmtree(str(directory), ignore_errors=True)
+                raise PackageError(
+                    f"package '{meta.id}' section_digests mismatch: declared "
+                    f"{sorted(meta.section_digests)}, actual "
+                    f"{sorted(actual_section_digests)}",
+                )
+        else:
+            meta = replace(meta, section_digests=actual_section_digests)
+
+        try:
+            validate_requires(meta.requires)
+        except PackageError:
+            shutil.rmtree(str(directory), ignore_errors=True)
+            raise
+
+        rejection = self._inspect_templates(directory)
+        if rejection is not None:
+            shutil.rmtree(str(directory), ignore_errors=True)
+            raise PackageError(f"package '{meta.id}' rejected: {rejection}")
+
+        try:
+            validate_templates_install(directory, meta.id)
+        except PackageError:
+            shutil.rmtree(str(directory), ignore_errors=True)
+            raise
+
+        try:
+            validate_language_install(directory, meta.id)
+        except PackageError:
+            shutil.rmtree(str(directory), ignore_errors=True)
+            raise
+
         write_package_meta(directory, meta)
 
         result = await self._build_version(
@@ -812,6 +1243,7 @@ class CorpusStore:
         self._packages[meta.id] = package
         self._packages.move_to_end(meta.id)
         self._warn_if_large(package)
+        self._push_language_overlay()
 
         logger.info(
             "Installed corpus package %s v%s (was %s): %d docs, %d chunks, "
@@ -820,6 +1252,33 @@ class CorpusStore:
             package.chunk_count, "reused" if result.reused_prebuilt else "rebuilt",
         )
         return result
+
+    @staticmethod
+    def _inspect_templates(directory: Path) -> str | None:
+        """``templates/`` 配下の Office ファイルを中身で検査する (c_16 §4.5.2)。
+
+        拒否理由 (相対パス付き) を返す。安全なら ``None``。拡張子は信用しない
+        — ``.docx`` / ``.pptx`` / ``.xlsx`` に絞って開き、マクロや外部
+        テンプレート参照を弾く。
+        """
+        templates_dir = directory / TEMPLATES_DIR
+        if not templates_dir.is_dir():
+            return None
+        for path in sorted(
+            (p for p in templates_dir.rglob("*") if p.is_file()),
+            key=lambda p: p.relative_to(templates_dir).as_posix(),
+        ):
+            suffix = path.suffix.lower()
+            if suffix in _REJECTED_TEMPLATE_SUFFIXES:
+                rel = path.relative_to(directory).as_posix()
+                return f"{rel}: {suffix} is not accepted (use .docx / .pptx / .xlsx)"
+            if suffix not in _OFFICE_TEMPLATE_SUFFIXES:
+                continue
+            reason = inspect_office_file(path)
+            if reason is not None:
+                rel = path.relative_to(directory).as_posix()
+                return f"{rel}: {reason}"
+        return None
 
     async def _build_version(
         self,
@@ -830,8 +1289,37 @@ class CorpusStore:
         progress_cb: ProgressCallback | None = None,
         cancel_check: CancelCheck | None = None,
     ) -> InstallResult:
-        """展開済みの版ディレクトリに snapshot / 埋め込み / centroid を作る。"""
+        """展開済みの版ディレクトリに snapshot / 埋め込み / centroid を作る。
+
+        ``docs/`` を持たないパッケージ (``templates/`` / ``language/`` だけの
+        構成) は索引を作らない (c_16 §4.3 / §4.5.1) — ``chunk_count=0`` の
+        空ストアを返し、検索対象にもならない。
+        """
         docs_dir = directory / DOCS_DIR
+        has_docs = docs_dir.is_dir() and any(p.is_file() for p in docs_dir.rglob("*"))
+        if not has_docs:
+            await _emit(
+                progress_cb,
+                {"phase": "chunk_embed", "status": "done", "current": 0, "total": 0},
+            )
+            await _emit(progress_cb, {"phase": "index", "status": "done"})
+            store = self._make_store(directory, meta.id)
+            store.load()
+            package = CorpusPackage(
+                meta=meta,
+                directory=directory,
+                store=store,
+                centroid=None,
+                doc_count=0,
+                chunk_count=0,
+                size_mb=_dir_size_mb(directory / EMBEDDINGS_DIR),
+                installed_at=utc_now(),
+                pseudo_queries=self._open_pseudo_queries(directory, meta.id, store),
+                templates=load_templates_for_package(directory, meta.id),
+                language_entries=load_language_for_package(directory, meta.id),
+            )
+            return InstallResult(package=package, reused_prebuilt=False, embedded=0)
+
         model_id = self.embedding_model_id
         reused = self._adopt_prebuilt(directory, prebuilt, model_id)
 
@@ -894,6 +1382,8 @@ class CorpusStore:
             size_mb=_dir_size_mb(directory / EMBEDDINGS_DIR),
             installed_at=utc_now(),
             pseudo_queries=self._open_pseudo_queries(directory, meta.id, store),
+            templates=load_templates_for_package(directory, meta.id),
+            language_entries=load_language_for_package(directory, meta.id),
         )
         return InstallResult(
             package=package,
@@ -975,6 +1465,8 @@ class CorpusStore:
 
         ``package.json`` と ``docs/`` は残し、派生物 (snapshot / 索引 /
         埋め込み / centroid / EvidenceStore manifest) だけを捨ててから組み直す。
+        ``docs/`` を持たないパッケージ (``templates/`` / ``language/`` だけの
+        構成) は rebuild の対象が無いので no-op (c_16 §4.3 / §4.5.1)。
         """
         package = self._packages.get(package_id)
         if package is None:
@@ -982,7 +1474,11 @@ class CorpusStore:
         directory = package.directory
         docs_dir = directory / DOCS_DIR
         if not docs_dir.is_dir() or not any(p.is_file() for p in docs_dir.rglob("*")):
-            raise PackageError(f"No documents found for corpus package '{package_id}'")
+            logger.info(
+                "Corpus package %s has no docs/ section; rebuild is a no-op",
+                package_id,
+            )
+            return InstallResult(package=package, reused_prebuilt=False, embedded=0)
 
         was_loaded = package.loaded
         try:
@@ -1046,6 +1542,7 @@ class CorpusStore:
         if package_id in self.manifest.loaded:
             self.manifest.loaded.remove(package_id)
         self.manifest.save()
+        self._push_language_overlay()
         logger.info("Uninstalled corpus package %s", package_id)
         self._notify("uninstall", package_id)
 
@@ -1635,6 +2132,10 @@ class CorpusStore:
             # ProjectMap は docs/ の chunker ではなく Step 5.87 が作り直す (c_16 §4.4)。
             if package.is_project_map:
                 continue
+            # docs/ を持たないパッケージ (templates/ / language/ だけ) は
+            # チャンクを作らないので chunker 版の意味を持たない (c_16 §4.5.1)。
+            if DOCS_DIR not in package.meta.provides:
+                continue
             try:
                 version = int(package.store.manifest.chunker_version)
             except (AttributeError, TypeError, ValueError):
@@ -1943,6 +2444,9 @@ __all__ = [
     "CorpusPackage",
     "CorpusStore",
     "InstallResult",
+    "LanguageOverlay",
+    "LanguageOverlayEntry",
+    "TemplateLookup",
     "adapt_embedding_backend",
     "embedding_model_id_of",
     "merge_rag_evidence_config",

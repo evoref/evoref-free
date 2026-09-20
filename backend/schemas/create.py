@@ -11,7 +11,51 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+#: verify の承認済み argv で許す置換プレースホルダ (c_16 §4.5.4)。要素単位の
+#: 一致だけを許し、文字列連結 (``--out={file}``) は受けない — manifest 側の
+#: ``verify.args`` 検証 (``backend/free/rag/corpus/language.py`` の
+#: ``VERIFY_ARG_PLACEHOLDERS``) と同じ語彙を、config 側でも複製する
+#: (schemas は corpus [EvorefGen pillar] を import しない層のため)。
+_VERIFY_ARG_PLACEHOLDERS = frozenset({"{file}", "{workspace}"})
+
+
+def _is_bare_command_name(name: str) -> bool:
+    """パス区切り・``:``・``.``・空白を含まない素の名前か (manifest の
+    ``verify.executable`` 検証と同じ規則の複製)。"""
+    return bool(name) and name == name.strip() and not any(c in name for c in "/\\:. ")
+
+
+def _validate_verify_command(argv: object) -> list[str]:
+    """``create.staged.verify.commands`` の 1 件を検証する。
+
+    argv[0] は manifest の ``executable`` と同じ「素の名前」規則、残りの
+    要素は ``{file}``/``{workspace}`` とちょうど一致するか中括弧を含まない
+    文字列のどちらか。違反は起動時に ``ValueError`` (pydantic が
+    ``ValidationError`` へ包む)。
+    """
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+        raise ValueError(
+            f"create.staged.verify.commands entry must be a non-empty list of "
+            f"strings: {argv!r}",
+        )
+    executable, *args = argv
+    if not _is_bare_command_name(executable):
+        raise ValueError(
+            "create.staged.verify.commands entry's first element (executable) "
+            f"must be a bare name without path separators, ':', '.', or "
+            f"whitespace: {executable!r}",
+        )
+    for a in args:
+        if a in _VERIFY_ARG_PLACEHOLDERS:
+            continue
+        if "{" in a or "}" in a:
+            raise ValueError(
+                f"create.staged.verify.commands argument {a!r} must be exactly "
+                "{file}/{workspace} or contain no braces (no string concatenation)",
+            )
+    return [executable, *args]
 
 #: c_16 の ``_REMOVED_MEMORY_KEYS_REJECTED`` と同じ作法 (CLAUDE.md §7):
 #: 機能ごと消えたキーは黙って捨てず、理由付きで起動時に拒否する。
@@ -24,6 +68,46 @@ _REMOVED_CREATE_KEYS_REJECTED: dict[str, str] = {
         "stream_staged_create) was removed"
     ),
 }
+
+
+class StagedVerifyConfig(BaseModel):
+    """言語パックの検証コマンド (c_16 §4.5.4)。既定 OFF。
+
+    パッケージ由来の宣言でプロセスを起動する唯一の経路 — ``enabled`` を
+    明示的に ``true`` にした PC だけが実行し、``commands`` に無い argv は
+    パックが宣言していても無視される。**承認単位は実行ファイル名ではなく
+    argv 全体** — 実行ファイル名だけを allow-list にすると、PC の持ち主が
+    ``python`` や ``node`` を許可した瞬間、パックはその処理系の ``-c`` /
+    ``-e`` 経由で任意コードを実行する verify を宣言できてしまう
+    (2026-09-20 レビューで指摘)。パックは承認済みのコマンド (argv) を
+    選ぶだけで、引数も増やせない。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description="言語パックの verify コマンドを実行する。false (既定) では"
+                    "install は通るが verify の宣言を一切読まない",
+    )
+    commands: list[list[str]] = Field(
+        default_factory=list,
+        description="実行を許す argv (コマンド全体) の allow-list "
+                    "(例: [[\"node\", \"--check\", \"{file}\"], [\"cargo\", \"check\"]])。"
+                    "パック側の宣言は、承認済み argv のどれかと完全一致した"
+                    "ときだけ実行される。PC の持ち主だけが広げられる",
+    )
+
+    @field_validator("commands")
+    @classmethod
+    def _validate_commands(cls, value: list[list[str]]) -> list[list[str]]:
+        return [_validate_verify_command(argv) for argv in value]
+
+    timeout_sec: float = Field(
+        default=60.0, gt=0.0, le=600.0,
+        description="宣言側の timeout_sec の上限。実際のタイムアウトは "
+                    "min(宣言値, これ)",
+    )
 
 
 class CreateStagedConfig(BaseModel):
@@ -143,6 +227,7 @@ class CreateStagedConfig(BaseModel):
         description="リクエスト完了時に temp ワークスペースを削除する。"
                     "false で継続ターン/デバッグのため保持",
     )
+    verify: StagedVerifyConfig = Field(default_factory=StagedVerifyConfig)
 
 
 class BriefConfig(BaseModel):

@@ -13,6 +13,7 @@ export * from './mode';
 export * from './chat';
 export * from './theme';
 export * from './cartridge';
+export * from './templates';
 export * from './rag';
 export * from './sse_progress';
 export * from './prompt';

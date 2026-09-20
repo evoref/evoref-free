@@ -18,6 +18,7 @@ from backend.export.base import (
     ContentBlock,
     ExportContent,
     ExportError,
+    build_item_tree,
     coerce_cell_value,
 )
 from backend.export.media import (
@@ -63,6 +64,27 @@ def _resolve_blocks(content: ExportContent) -> list[ContentBlock]:
     return ContentConverter().convert(content.raw_markdown)
 
 
+def _build_list_element(block: ContentBlock):
+    """入れ子の ``List`` / ``ListItem`` を組む (odt / odp 共通)。
+
+    odfdo は ``ListItem`` の中に子 ``List`` を置く形で入れ子を表す
+    (f_11 §「odt/odp の入れ子リスト」)。平らなリスト (nesting 無し) では
+    ``List`` 直下に ``ListItem`` を並べるだけになり、従来と同じ構造になる。
+    """
+    from odfdo import List, ListItem, Paragraph
+
+    def render(nodes) -> "List":
+        lst = List()
+        for node in nodes:
+            item = ListItem(Paragraph(node.text))
+            if node.children:
+                item.append(render(node.children))
+            lst.append(item)
+        return lst
+
+    return render(build_item_tree(block))
+
+
 def _table_element(rows: list[list[str]], name: str = "Table"):
     """``rows`` から odfdo の Table を組む。"""
     from odfdo import Cell, Row, Table
@@ -78,7 +100,7 @@ def _table_element(rows: list[list[str]], name: str = "Table"):
 
 def _build_odt(content: ExportContent) -> bytes:
     """ExportContent を ODT バイトデータに変換"""
-    from odfdo import Document, Header, List, ListItem, Paragraph, Style
+    from odfdo import Document, Header, Paragraph, Style
 
     doc = Document("text")
     doc.insert_style(
@@ -108,10 +130,7 @@ def _build_odt(content: ExportContent) -> bytes:
                 body.append(_table_element(block.rows))
 
         elif block.type == "list":
-            lst = List()
-            for item in block.items:
-                lst.append(ListItem(Paragraph(item)))
-            body.append(lst)
+            body.append(_build_list_element(block))
 
         elif block.type == "quote":
             body.append(Paragraph(f'"{block.content}"'))
@@ -181,13 +200,22 @@ def _build_ods(content: ExportContent) -> bytes:
 
 
 def _slide_body_paragraphs(slide: Slide) -> list:
-    """スライド本文をテキスト段落へ落とす (table / image / shapes を除く)。"""
+    """スライド本文をテキスト段落へ落とす (table / image / shapes を除く)。
+
+    ``list`` は平らな (入れ子の無い) ときだけ従来どおり ``• `` 接頭の
+    段落へ展開する。入れ子があれば odfdo の ``List``/``ListItem`` 構造
+    (:func:`_build_list_element`) を段落列に混ぜて返す — ``Frame.text_frame``
+    は ``Paragraph`` と ``List`` が混在した列をそのまま受け付ける。
+    """
     from odfdo import Paragraph
 
     paragraphs = []
     for block in slide.blocks:
         if block.type == "list":
-            paragraphs.extend(Paragraph(f"• {item}") for item in block.items)
+            if block.has_nested_items():
+                paragraphs.append(_build_list_element(block))
+            else:
+                paragraphs.extend(Paragraph(f"• {item}") for item in block.items)
         elif block.type == "heading":
             # level<=2 はスライド分割で消費済み。残るのは小見出し。
             paragraphs.append(Paragraph(block.content))

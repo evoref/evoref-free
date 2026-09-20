@@ -64,3 +64,24 @@ _EXPLICIT_DATE_PRECEDENCE = (
     "ユーザーが月や日付を明示している場合は、その指定を最優先で使い、"
     "この基準日で置き換えないこと。"
 )
+
+
+#: staged の生成指示を「run 内で共有する文脈」(ProductionBrief + 共有 spec) と
+#: 「呼出ごとの指示」に分ける境界。出す側は ``loop.staged.executor``、分ける側は
+#: ``generation.direct_codegen`` (共有文脈を system に載せる)。hybrid recurrent
+#: モデルの接頭辞 KV はメッセージ境界でしか再利用されないため、1 通の user に
+#: まとめると連続する呼出で共有文脈を毎回 prefill し直す (f_08 §2.2)。
+SHARED_CONTEXT_BOUNDARY = "\n\n<<<END OF SHARED CONTEXT>>>\n\n"
+
+
+def join_shared_context(shared: str, task: str) -> str:
+    """共有文脈と呼出固有の指示を境界付きで 1 本の instruction にする (空なら task のみ)。"""
+    if not shared.strip():
+        return task
+    return f"{shared.rstrip()}{SHARED_CONTEXT_BOUNDARY}{task}"
+
+
+def split_shared_context(instruction: str) -> tuple[str, str]:
+    """``join_shared_context`` の逆。境界が無ければ ``("", instruction)``。"""
+    shared, sep, task = instruction.partition(SHARED_CONTEXT_BOUNDARY)
+    return (shared, task) if sep else ("", instruction)

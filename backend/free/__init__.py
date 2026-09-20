@@ -31,6 +31,7 @@ def setup_free(app: FastAPI) -> None:
     from backend.free.api.model.model import router as model_router
     from backend.free.api.config.config_api import router as config_router
     from backend.free.api.content.cartridges import router as cartridges_router
+    from backend.free.api.content.templates import router as templates_router
     from backend.free.api.system.files import router as files_router
     from backend.free.api.model.prompts import router as prompts_router
     from backend.free.api.model.aux_prompts import router as aux_prompts_router
@@ -57,6 +58,7 @@ def setup_free(app: FastAPI) -> None:
     app.include_router(model_router)
     app.include_router(config_router)
     app.include_router(cartridges_router)
+    app.include_router(templates_router)
     app.include_router(files_router)
     app.include_router(prompts_router)
     app.include_router(aux_prompts_router)
@@ -81,4 +83,4 @@ def setup_free(app: FastAPI) -> None:
     import backend.free.export  # noqa: F401
 
     register_free()
-    logger.info("Free edition initialized: 25 routers registered")
+    logger.info("Free edition initialized: 26 routers registered")

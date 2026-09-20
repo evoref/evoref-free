@@ -8,25 +8,36 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from backend.free.rag.corpus.package import PackageMeta, write_package_meta
-from backend.free.rag.corpus.store import PACKAGES_DIR, CorpusManifest
+from backend.free.rag.corpus.language import ImportRule
+from backend.free.rag.corpus.package import (
+    PackageError,
+    PackageMeta,
+    meta_from_record,
+    write_package_meta,
+)
+from backend.free.rag.corpus.store import PACKAGES_DIR, CorpusManifest, LanguageOverlay
 from backend.free.rag.evidence.store import EvidenceStore
 from backend.free.rag.evidence.types import Evidence
 from backend.free.rag.projectmap import graph_io
+from backend.free.rag.projectmap.aliases import build_alias_config
 from backend.free.rag.projectmap.classify import (
     UPDATE_SKIP,
     UpdateThresholds,
     classify_update,
 )
-from backend.free.rag.projectmap.extractors import python_ast, treesitter
+from backend.free.rag.projectmap.extractors import markup, python_ast, sfc, treesitter
+from backend.free.rag.projectmap.extractors.queries import LanguageQuery
 from backend.free.rag.projectmap.fingerprint import (
+    compute_fingerprint,
     compute_fingerprints,
     load_fingerprint_store,
     load_fingerprints,
@@ -49,8 +60,13 @@ from backend.utils import utc_now
 
 logger = get_logger("rag.projectmap.builder")
 
-#: 抽出規則の版 (§4.4)。分割の結果が変わる変更で上げる。
-EXTRACTOR_VERSION = 1
+#: 抽出規則の版 (§4.4)。分割の結果が変わる変更で上げる。skip 判定は
+#: fingerprint (ファイル内容) だけを見るため、既存パッケージの前版がこの値と
+#: 食い違えば ``update()`` が old_fingerprints を空とみなして強制的に全再抽出
+#: する (2 → HTML/CSS/SCSS/Svelte/Vue の追加、3 → $lib / tsconfig・jsconfig
+#: paths のエイリアス解決の追加、4 → svelte.config.js/.ts の kit.alias
+#: (文字列リテラルのみ、tree-sitter で静的に読む) の追加、c_16 §4.4)。
+EXTRACTOR_VERSION = 4
 
 #: 対応する ``update_kind`` (c_16 §4.4)。
 UPDATE_INITIAL = "initial"
@@ -100,6 +116,7 @@ class ProjectMapBuilder:
         *,
         rag_config: dict,
         now_provider: Callable[[], str] | None = None,
+        language_overlay: LanguageOverlay | None = None,
     ) -> None:
         self.corpus_dir = Path(corpus_dir)
         self.root = Path(root)
@@ -107,6 +124,13 @@ class ProjectMapBuilder:
         self._now = now_provider or utc_now
         self.package_id = project_map_package_id(self.root)
         self._packages_dir = self.corpus_dir / PACKAGES_DIR
+        #: 言語パック (c_16 §4.5.3)。extension → id は :meth:`_scan` が使い、
+        #: id → 抽出定義は :meth:`_extract_one` が使う。
+        self._language_overlay = language_overlay
+        self._pack_by_lang = (
+            {entry.entry_id: entry for entry in language_overlay.by_extension.values()}
+            if language_overlay is not None else {}
+        )
 
     # ── 設定 ──
 
@@ -136,7 +160,7 @@ class ProjectMapBuilder:
 
     # ── 走査 ──
 
-    def _scan(self) -> list[ScannedFile]:
+    def _scan(self) -> tuple[list[ScannedFile], list[str]]:
         """``self.root`` を走査する。
 
         ``rag.project_map.roots`` (複数のプロジェクトルート) は
@@ -144,12 +168,68 @@ class ProjectMapBuilder:
         (``package_id`` も root から導出、c_16 §4.4) で、複数 root を回すのは
         呼出元 (sleep-time Step 5.87) の責務。ここで ``roots`` も読むと、
         同じ設定を渡された全 root のビルダーが互いの root まで多重に走査する。
+
+        戻り値の第 2 要素は、同じ 1 回の走査で拾ったエイリアス設定ファイル
+        (``svelte.config.js``/``.ts``、``tsconfig.json``/``jsconfig.json``、
+        c_16 §4.4) の相対 posix パス。
         """
-        return scan_project(
+        extra_extensions = (
+            {ext: entry.entry_id for ext, entry in self._language_overlay.by_extension.items()}
+            if self._language_overlay is not None else None
+        )
+        config_paths: list[str] = []
+        scanned = scan_project(
             self.root,
             exclude_globs=self._exclude_globs(),
             max_file_bytes=self._max_file_bytes(),
+            extra_language_extensions=extra_extensions,
+            config_paths_out=config_paths,
         )
+        return scanned, config_paths
+
+    def _config_fingerprints(self, config_paths: Sequence[str]) -> dict[str, str]:
+        """エイリアス設定ファイルの ``{path: sha256}`` (c_16 §4.4)。
+
+        通常の fingerprint 辞書へ混ぜ込むことで、設定ファイルだけが変わった
+        (ソースファイルは無変更) 場合でも ``classify_update`` が ``skip`` を
+        返さないようにする — エイリアス解決はグラフの辺に影響するため。
+        読めないファイルはそのファイルだけ飛ばす (``compute_fingerprints`` と
+        同じ寛容さ)。
+        """
+        out: dict[str, str] = {}
+        for path in config_paths:
+            try:
+                out[path] = compute_fingerprint(self.root / path)
+            except OSError:
+                continue
+        return out
+
+    def _pack_language_for(self, lang: str) -> treesitter.PackLanguage | None:
+        """言語パック (c_16 §4.5.3) の抽出定義。クエリを持たないエントリは
+        構文検査 (``core/code_syntax``) だけに使い、ProjectMap 抽出はしない。
+        """
+        entry = self._pack_by_lang.get(lang)
+        if entry is None or entry.query is None:
+            return None
+        return treesitter.PackLanguage(
+            grammar=entry.grammar,
+            query=LanguageQuery(
+                query=entry.query, class_ancestor_types=frozenset(entry.class_ancestor_types),
+            ),
+            imports=entry.imports,
+        )
+
+    def _pack_import_rules(self) -> dict[str, ImportRule]:
+        """``lang_id -> ImportRule`` (c_16 §4.5.3、段階 C-2)。
+
+        ``imports`` を宣言していないエントリは含めない — :func:`graph.build_graph`
+        側は未登録の ``lang`` を常に未解決 (external) 扱いにする。
+        """
+        return {
+            entry_id: entry.imports
+            for entry_id, entry in self._pack_by_lang.items()
+            if entry.imports is not None
+        }
 
     def _extract_one(self, scanned: ScannedFile) -> ExtractedFile | None:
         try:
@@ -157,7 +237,16 @@ class ProjectMapBuilder:
         except OSError as e:
             logger.warning("projectmap: failed to read %s: %s", scanned.path, e)
             return None
-        result = treesitter.extract_file(scanned.path, scanned.lang, source_bytes)
+        if scanned.lang == "html":
+            return markup.extract_html(scanned.path, source_bytes)
+        if scanned.lang in ("css", "scss"):
+            return markup.extract_style(scanned.path, scanned.lang, source_bytes)
+        if scanned.lang in ("svelte", "vue"):
+            return sfc.extract_file(scanned.path, scanned.lang, source_bytes)
+        result = treesitter.extract_file(
+            scanned.path, scanned.lang, source_bytes,
+            pack_language=self._pack_language_for(scanned.lang),
+        )
         if result is not None:
             return result
         if scanned.lang == "python":
@@ -183,6 +272,44 @@ class ProjectMapBuilder:
         state = load_fingerprint_store(self._package_dir(version))
         return dict(state.shapes), state.node_count, state.edge_count
 
+    def _old_extractor_version(self, version: str) -> int | str | None:
+        """旧版の ``package.json._extra.extractor_version`` (読めなければ ``None``)。
+
+        言語パック (c_16 §4.5.3) が 1 件以上有効なときは ``"<int>+lang:<digest>"``
+        の文字列になる (:meth:`_extractor_signature`) ので、無理に ``int`` へ
+        丸めない — 丸めると文字列版が常に ``None`` に落ち、パック無しに戻った
+        版との比較で誤って毎回全再抽出になる。
+        """
+        path = self._package_dir(version) / "package.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            meta = meta_from_record(data)
+        except (OSError, ValueError, PackageError):
+            return None
+        value = meta._extra.get("extractor_version")
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str):
+            return value
+        return None
+
+    def _extractor_signature(self) -> int | str:
+        """今回の抽出規則の版 (c_16 §4.5.3)。
+
+        言語パックが 1 件も無ければ従来どおり :data:`EXTRACTOR_VERSION`
+        (既存パッケージを無駄に再構築させない)。有効なパックが 1 件以上
+        あれば、その ``section_digests.language`` を混ぜた文字列にする —
+        パックを入替えたのに fingerprint が無変更で skip される事故を防ぐ。
+        """
+        if self._language_overlay is None or not self._language_overlay.pack_digests:
+            return EXTRACTOR_VERSION
+        combined = hashlib.sha256(
+            "|".join(self._language_overlay.pack_digests).encode("utf-8"),
+        ).hexdigest()[:12]
+        return f"{EXTRACTOR_VERSION}+lang:{combined}"
+
     # ── 更新 ──
 
     async def update(
@@ -195,8 +322,10 @@ class ProjectMapBuilder:
         if self._should_stop(is_cancelled, should_pause):
             return self._paused()
 
-        scanned = self._scan()
+        scanned, config_paths = self._scan()
         new_fingerprints = compute_fingerprints(self.root, scanned)
+        new_fingerprints.update(self._config_fingerprints(config_paths))
+        alias_config = build_alias_config(self.root, config_paths)
 
         manifest = CorpusManifest(self.corpus_dir)
         manifest.load()
@@ -214,8 +343,21 @@ class ProjectMapBuilder:
         old_node_count = 0
         old_edge_count = 0
         if old_version:
-            old_fingerprints = load_fingerprints(self._package_dir(old_version))
-            old_nodes_by_path, old_node_count, old_edge_count = self._load_old_state(old_version)
+            if self._old_extractor_version(old_version) != self._extractor_signature():
+                # 抽出規則が変わった (例: 新言語の追加) 版からの更新。skip 判定は
+                # fingerprint (ファイル内容) だけを見るため、内容が無変更の
+                # ファイルは新しい抽出規則を適用しないまま「変更なし」に落ちて
+                # しまう — old_fingerprints を空とみなし、全ファイルを新規扱いに
+                # して必ず再抽出させる (c_16 §4.4)。
+                logger.info(
+                    "projectmap: extractor_version changed for %s; forcing full re-extract",
+                    self.package_id,
+                )
+            else:
+                old_fingerprints = load_fingerprints(self._package_dir(old_version))
+                old_nodes_by_path, old_node_count, old_edge_count = (
+                    self._load_old_state(old_version)
+                )
 
         if self._should_stop(is_cancelled, should_pause):
             return self._paused()
@@ -283,7 +425,11 @@ class ProjectMapBuilder:
             return paused
         extracted = [extracted_by_path[f.path] for f in scanned if f.path in extracted_by_path]
 
-        graph = build_graph(extracted, fingerprints=new_fingerprints)
+        graph = build_graph(
+            extracted, fingerprints=new_fingerprints,
+            pack_import_rules=self._pack_import_rules(),
+            alias_config=alias_config,
+        )
         violations = validate_graph(graph)
         if violations:
             for line in violations[:20]:
@@ -434,11 +580,11 @@ class ProjectMapBuilder:
             name=self.root.name or self.package_id,
             version=version,
             language="",
+            kind=PROJECT_MAP_KIND,
             _extra={
-                "kind": PROJECT_MAP_KIND,
                 "root": self.root.as_posix(),
                 "languages": dict(graph.languages),
-                "extractor_version": EXTRACTOR_VERSION,
+                "extractor_version": self._extractor_signature(),
                 "update_kind": update_kind,
             },
         )

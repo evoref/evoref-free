@@ -309,6 +309,7 @@ def _write_rich_document(p: Path, content: str) -> str:
     """
     from backend.export import get_writer_registry
     from backend.export.content_converter import ContentConverter
+    from backend.export.template_context import get_selected_template, mark_template_applied
 
     ext = p.suffix.lower()
     registry = get_writer_registry()
@@ -324,7 +325,17 @@ def _write_rich_document(p: Path, content: str) -> str:
         # (no_table_data になる)。ContentConverter で markdown を構造化ブロック
         # (table 等) に変換して渡す。from_markdown は raw_markdown も保持するため
         # docx/odt 等のプローズ系 writer は従来どおり動作する。
-        export_content = ContentConverter.from_markdown(content)
+        template_metadata: dict[str, str] = {}
+        selected_template = get_selected_template()
+        if selected_template is not None:
+            # writer 側 (docx / pptx) が拡張子と体裁の可否を判定する。ここでは
+            # 「このターンで選ばれたテンプレート」を渡すだけ (c_16 §4.5.2)。
+            # outline だけの様式 (構成テンプレート、f_08 §3.1.1) は継承元が無い
+            # ので template_base は渡さない (来歴鍵だけ渡す)。
+            if selected_template.base_path is not None:
+                template_metadata["template_base"] = str(selected_template.base_path)
+            template_metadata["template"] = selected_template.provenance_key
+        export_content = ContentConverter.from_markdown(content, **template_metadata)
         guard_error = _reject_unrenderable_rich_content(ext, content, export_content)
         if guard_error:
             return guard_error
@@ -332,7 +343,17 @@ def _write_rich_document(p: Path, content: str) -> str:
         if calendar_error:
             return calendar_error
         result = registry.write(export_content, p)
-        return f"Written {result.size_bytes} bytes to {p}"
+        if "template" in result.metadata:
+            # 実際に書けたターンだけ来歴を運ぶ (c_05 §0.6)。選ばれただけで
+            # guard_error 等で書込みに至らなかったターンはここへ来ない。
+            mark_template_applied()
+        note = ""
+        # outline だけの様式 (template_base 無し) はそもそも継承する体裁が無いので
+        # 「継承できなかった」note の対象にしない (f_08 §3.1.1)。
+        if "template_base" in template_metadata and result.metadata.get("template_applied") is False:
+            # 体裁が崩れた文書を成功として黙って出さない (f_11 §9.1)。
+            note = " (template style could not be applied; wrote without inherited formatting)"
+        return f"Written {result.size_bytes} bytes to {p}{note}"
     except Exception as e:
         return f"Error: {e}"
 

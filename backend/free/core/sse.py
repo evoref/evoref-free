@@ -195,6 +195,19 @@ class SSEFrameBuilder:
         })
 
     @staticmethod
+    def template_hint(payload: dict) -> str:
+        """様式候補フレーム: 判定点 ``template_select`` が棄権 (``candidate`` /
+        ``ambiguous``) した様式候補をユーザーへ知らせる (ストリーム冒頭で 1 度、
+        c_16 §4.5.2 / c_17 §3.8)。
+
+        Args:
+            payload: {"kind": "candidate" | "ambiguous",
+                      "templates": [{"key", "doc_type", "has_base",
+                                     "has_outline", "has_fields"}, ...]}
+        """
+        return _frame("template_hint", {"template_hint": payload})
+
+    @staticmethod
     def sources(items: list[dict]) -> str:
         """出典フレーム: この応答の ``[参考情報]`` に注入した根拠 (常時送信)。
 
@@ -267,5 +280,5 @@ class SSEFrameBuilder:
 FRAME_TYPES: tuple[str, ...] = (
     "token", "step", "agent_layer", "editor_route", "editor_code",
     "create_run", "token_info", "input_truncated", "output_truncated",
-    "rag_debug", "sources", "error", "result",
+    "rag_debug", "sources", "template_hint", "error", "result",
 )

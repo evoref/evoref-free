@@ -28,6 +28,20 @@ class CartridgeGateConfig(BaseModel):
     fallback_when_empty: bool = False
 
 
+class PackagesConfig(BaseModel):
+    """corpus パッケージ install の入口検査 (c_16 §4.3)。
+
+    展開前の zip 本体サイズと、展開後の合計サイズ (zip bomb 対策) を検査する。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # .evocart zip 本体のサイズ上限 (バイト)。既定 256MiB。
+    max_package_bytes: int = Field(default=268_435_456, ge=1)
+    # 展開後の合計サイズ上限 (バイト)。既定 1GiB。
+    max_unpacked_bytes: int = Field(default=1_073_741_824, ge=1)
+
+
 class ClusterIndexConfig(BaseModel):
     """Cluster Index (IVF-KMeans) 設定"""
 
@@ -304,6 +318,8 @@ class RAGConfig(BaseModel):
     # カートリッジ検索全体のタイムアウト (ミリ秒)。超過時は途中結果を返す。
     # 0 以下でタイムアウト無効。
     cartridge_search_timeout_ms: int = Field(default=3000, ge=0)
+    # --- corpus パッケージ install の入口検査 (c_16 §4.3) ---
+    packages: PackagesConfig = Field(default_factory=PackagesConfig)
     # Cartridge Gate: centroid ベースの事前フィルタ
     cartridge_gate: CartridgeGateConfig = Field(default_factory=CartridgeGateConfig)
     # Cluster Index: IVF-KMeans による大規模 VectorStore 高速化

@@ -5,18 +5,23 @@ zip の中身は次の形に固定する:
 
 ```
 <id>-<version>.evocart (zip)
-├── package.json      # PackageMeta
-├── docs/             # 原本 (md / txt / 変換済み text)。これが真実
-└── prebuilt/         # 任意 (作成側が現在の埋め込みモデルで作っておく)
-    ├── build.json    # {chunker_version, embedding_model_id, embedding_dim}
-    ├── chunks.jsonl  # doc_chunk の Evidence
-    └── embeddings/<model_id>/   # VectorStore 形式
+├── package.json      # PackageMeta {id, name, version, kind, provides, requires,
+│                     #  content_digest, section_digests, ...}
+├── docs/             # 任意。原本 (md / txt / 変換済み text)。これが真実。検索に載るのはここだけ
+├── prebuilt/         # 任意 (docs/ の派生物。作成側が現在の埋め込みモデルで作っておく)
+│   ├── build.json    # {chunker_version, embedding_model_id, embedding_dim}
+│   ├── chunks.jsonl  # doc_chunk の Evidence
+│   └── embeddings/<model_id>/   # VectorStore 形式
+├── templates/        # 任意。文書テンプレート (c_16 §4.5.2)。索引に載せない
+└── language/         # 任意。言語パック (c_16 §4.5.3)。索引に載せない
 ```
 
 `docs/` が真実で、`prebuilt/` は再現可能な派生物にすぎない。``content_digest``
 (docs の sha256) と ``chunker_version`` があれば同じチャンクを決定論で再生成
 できるため、旧カートリッジの ``needs_rebuild`` / ``docs_digest`` は持たない
-(c_16 §8)。
+(c_16 §8)。``docs/`` は任意 — 1 枚のパッケージは ``docs`` / ``templates`` /
+``language`` のセクションを 1 つ以上持てばよく (``provides`` が宣言する)、
+``docs/`` を持たないパッケージは索引を作らない (c_16 §4.3 / §4.5)。
 
 ## zip を扱うときの規約
 
@@ -34,7 +39,7 @@ import hashlib
 import json
 import re
 import zipfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -56,6 +61,33 @@ PREBUILT_DIR = "prebuilt"
 PREBUILT_BUILD_FILE = "build.json"
 PREBUILT_CHUNKS_FILE = "chunks.jsonl"
 PREBUILT_EMBEDDINGS_DIR = "embeddings"
+#: 検索に載らないセクション (c_16 §4.5)。索引 (snapshot / 埋め込み /
+#: centroid / 疑似クエリ) は作らず、指名して使う資材として読む。
+TEMPLATES_DIR = "templates"
+LANGUAGE_DIR = "language"
+#: ``provides`` に載る既知のセクション名 (この 3 つ + 将来のセクション)。
+SECTION_DIRS = (DOCS_DIR, TEMPLATES_DIR, LANGUAGE_DIR)
+
+#: ``kind`` の既知値 (c_16 §4.3)。``package`` = 配布物 (既定)、
+#: ``project_map`` = 機械生成 (c_16 §4.4)。
+PACKAGE_KIND_DEFAULT = "package"
+PACKAGE_KINDS = frozenset({PACKAGE_KIND_DEFAULT, "project_map"})
+
+#: ``requires`` の既知の機能フラグ (c_16 §4.3)。``templates/1`` は段階 B-0 で
+#: 追加 (c_16 §4.5.6)。``language/1`` は段階 C-1 で追加。``language.verify/1``
+#: は段階 C-3 で追加 — install を通すだけで、実行を有効にするのは
+#: ``create.staged.verify.enabled`` (既定 OFF、c_16 §4.5.4)。このフラグを
+#: requires していないパッケージの ``verify`` 宣言は構造検証は受けるが
+#: 実行時は全部無視される (フラグを宣言せずに verify を運ばせない)。
+KNOWN_FEATURES: frozenset[str] = frozenset({
+    "templates/1", "language/1", "language.verify/1",
+})
+
+#: ``language.verify/1`` を ``requires`` に持つパッケージだけが、宣言した
+#: verify コマンドを実行時に有効化できる (c_16 §4.5.4)。
+LANGUAGE_VERIFY_FEATURE = "language.verify/1"
+#: ``edition/pro`` だけは固定集合に置かず動的に評価する (``backend.edition.is_pro()``)。
+EDITION_PRO_FEATURE = "edition/pro"
 
 #: パッケージ id。ディレクトリ名・シャード名・検索結果の接頭辞に素で入るので
 #: 小文字英数 + ``_`` / ``-`` だけに絞る (2〜64 文字)。
@@ -88,6 +120,15 @@ class PackageMeta:
     id: str
     name: str
     version: str = "1.0.0"
+    #: 所有と生まれ方だけを表す (c_16 §4.3)。``package`` (配布物) /
+    #: ``project_map`` (機械生成、c_16 §4.4)。中身の種類は :attr:`provides` が表す。
+    kind: str = PACKAGE_KIND_DEFAULT
+    #: 運ぶセクション名の列 (``docs`` / ``templates`` / ``language``)。宣言が
+    #: 無ければ install 時にディレクトリの実在から導出する。
+    provides: list[str] = field(default_factory=list)
+    #: 機能フラグの列 (``"templates/1"`` / ``"edition/pro"`` 等)。install は
+    #: 知らないフラグを拒否する (:data:`KNOWN_FEATURES`)。
+    requires: list[str] = field(default_factory=list)
     author: str = ""
     license: str = ""
     language: str = "ja"
@@ -97,6 +138,9 @@ class PackageMeta:
     compatibility: str = ">=0.1.0"
     #: ``docs/`` の内容ダイジェスト (:func:`compute_content_digest`)。
     content_digest: str = ""
+    #: ``docs/`` / ``prebuilt/`` 以外のセクションディレクトリのダイジェスト
+    #: (:func:`compute_section_digests`)。``{section: sha256}``。
+    section_digests: dict[str, str] = field(default_factory=dict)
     schema_version: int = PACKAGE_SCHEMA_VERSION
     #: 未知キーの退避先 (前方互換)。
     _extra: dict[str, Any] = field(default_factory=dict)
@@ -107,6 +151,11 @@ class PackageMeta:
         キーは :func:`dataclasses.fields` から機械生成する。**手書きで列挙
         しないこと** — フィールドを足したときに書き漏れて値が消える
         (c_05 §0.5)。``_extra`` は展開して戻す。
+
+        第一級フィールドが常に勝つ。``_extra`` に同名のキーがあっても書き出さない
+        — 検証済みの値 (``kind`` / ``requires`` / ``content_digest`` …) を、検証を
+        通っていない ``_extra`` の値で上書きさせないため。読み取り側
+        (:func:`meta_from_record`) も既知名を ``_extra`` に残さない。
         """
         record = {
             f.name: getattr(self, f.name)
@@ -170,10 +219,45 @@ def meta_from_record(data: Any) -> PackageMeta:
     if not isinstance(tool_hints, list):
         raise PackageError("package.json tool_hints must be a list")
 
+    # 旧形の読み取り互換 (c_16 §4.3): `kind` がまだ第一級フィールドでは
+    # なかった頃の package.json は `_extra` 経由で読まれていた (開発機に
+    # 残った旧 ProjectMap パッケージがこの形)。トップレベルに無ければ
+    # そちらを持ち上げる。持ち上げたら `_extra` 側には残さない (二重持ち防止)。
+    legacy_kind = extra.get("kind")
+    # 既知のフィールド名は `_extra` に残さない (to_record は第一級フィールドを
+    # 優先するので、残しても書き出されず黙って消える)。
+    for name in known:
+        extra.pop(name, None)
+    kind = data.get("kind") or legacy_kind
+    kind = str(kind) if kind else PACKAGE_KIND_DEFAULT
+    if kind not in PACKAGE_KINDS:
+        logger.warning(
+            "package.json %s declares unknown kind %r; treating as %r",
+            package_id, kind, PACKAGE_KIND_DEFAULT,
+        )
+        kind = PACKAGE_KIND_DEFAULT
+
+    provides = data.get("provides")
+    if provides is None:
+        provides = []
+    elif not isinstance(provides, list):
+        raise PackageError("package.json provides must be a list")
+
+    requires = data.get("requires") or []
+    if not isinstance(requires, list):
+        raise PackageError("package.json requires must be a list")
+
+    section_digests = data.get("section_digests") or {}
+    if not isinstance(section_digests, dict):
+        raise PackageError("package.json section_digests must be an object")
+
     return PackageMeta(
         id=package_id,
         name=str(data.get("name") or package_id),
         version=version,
+        kind=kind,
+        provides=[str(p) for p in provides],
+        requires=[str(r) for r in requires],
         author=str(data.get("author") or ""),
         license=str(data.get("license") or ""),
         language=str(data.get("language") or "ja"),
@@ -182,6 +266,7 @@ def meta_from_record(data: Any) -> PackageMeta:
         tool_hints=[dict(h) for h in tool_hints if isinstance(h, dict)],
         compatibility=str(data.get("compatibility") or ">=0.1.0"),
         content_digest=str(data.get("content_digest") or ""),
+        section_digests={str(k): str(v) for k, v in section_digests.items()},
         schema_version=schema_version,
         _extra=extra,
     )
@@ -225,18 +310,17 @@ def prebuilt_from_record(data: Any) -> PrebuiltInfo | None:
 # ── content_digest ──────────────────────────────────────────────────────
 
 
-def compute_content_digest(docs_dir: Path | str) -> str:
-    """``docs/`` の内容ダイジェスト (相対パス + 本文の sha256)。
+def _dir_content_digest(root: Path) -> str:
+    """ディレクトリの内容ダイジェスト (相対パス + 本文の sha256)。
 
-    旧 ``compute_docs_digest`` は「相対パス + サイズ + mtime」だった。mtime は
-    zip 展開・コピー・チェックアウトのたびに変わるので、**中身が同じでも別物
-    と判定される**。ここでは本文そのものを食わせ、同じ ``docs/`` なら別 PC で
-    展開しても必ず同じ値になるようにする。チャンクの evidence id はこの値から
-    導出するので (``chunking.py``)、再インストールで id が変わらない。
+    :func:`compute_content_digest` (``docs/``) と :func:`compute_section_digests`
+    (その他のセクション) が共有する方式。mtime は zip 展開・コピー・
+    チェックアウトのたびに変わるので、**中身が同じでも別物と判定される**
+    旧方式 (相対パス + サイズ + mtime) は使わない。本文そのものを食わせ、
+    同じディレクトリなら別 PC で展開しても必ず同じ値になるようにする。
 
     ディレクトリが無い / 空なら空文字 (「未計算」と「空」は区別しない)。
     """
-    root = Path(docs_dir)
     if not root.is_dir():
         return ""
     digest = hashlib.sha256()
@@ -256,6 +340,94 @@ def compute_content_digest(docs_dir: Path | str) -> str:
         digest.update(b"\x00")
         counted += 1
     return digest.hexdigest() if counted else ""
+
+
+def compute_content_digest(docs_dir: Path | str) -> str:
+    """``docs/`` の内容ダイジェスト (:func:`_dir_content_digest`)。
+
+    チャンクの evidence id はこの値から導出するので (``chunking.py``)、
+    再インストールで id が変わらない。``docs/`` 以外を混ぜると意味が変わる
+    ため、対象は常に ``docs/`` だけ (c_16 §4.3)。
+    """
+    return _dir_content_digest(Path(docs_dir))
+
+
+def discover_sections(root: Path | str) -> list[str]:
+    """展開済みパッケージのうち、ファイルを持つ既知セクション名を返す (昇順)。
+
+    ``provides`` の宣言が無い旧 package.json (c_16 §4.3) の補完、および
+    install 時の宣言との突き合わせに使う。
+    """
+    root = Path(root)
+    found = []
+    for name in SECTION_DIRS:
+        section = root / name
+        if section.is_dir() and any(p.is_file() for p in section.rglob("*")):
+            found.append(name)
+    return sorted(found)
+
+
+def has_any_section_content(root: Path | str) -> bool:
+    """``prebuilt/`` を除く、ファイルを持つトップレベルディレクトリが 1 つでもあるか。
+
+    ``docs/`` も他のセクション (未知のものを含む) も無いパッケージは
+    install / write を拒否する根拠 (c_16 §4.3)。
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return False
+    for child in root.iterdir():
+        if not child.is_dir() or child.name == PREBUILT_DIR:
+            continue
+        if any(p.is_file() for p in child.rglob("*")):
+            return True
+    return False
+
+
+def compute_section_digests(root: Path | str) -> dict[str, str]:
+    """``docs/`` / ``prebuilt/`` 以外のトップレベルディレクトリのダイジェスト。
+
+    セクションごとに :func:`_dir_content_digest` と同じ方式 (相対パス + バイト列)
+    の sha256 を計算する。ファイルの無いディレクトリは含めない。
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return {}
+    digests: dict[str, str] = {}
+    for child in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name):
+        if child.name in (DOCS_DIR, PREBUILT_DIR):
+            continue
+        digest = _dir_content_digest(child)
+        if digest:
+            digests[child.name] = digest
+    return digests
+
+
+def validate_requires(requires: Sequence[str]) -> None:
+    """``requires`` の機能フラグを検査する (c_16 §4.3)。
+
+    ``edition/pro`` だけは動的に評価する (:func:`backend.edition.is_pro`)。
+    それ以外は :data:`KNOWN_FEATURES` に無ければ拒否する — 段階 A では
+    空集合なので、``edition/pro`` 以外の全フラグが未知として拒否される
+    (後続段階が自分のフラグをここに足す)。
+    """
+    from backend.edition import is_pro
+
+    unknown: list[str] = []
+    for flag in requires:
+        if flag == EDITION_PRO_FEATURE:
+            if not is_pro():
+                raise PackageError(
+                    f"package requires {EDITION_PRO_FEATURE!r} but this is not "
+                    "the Pro edition",
+                )
+            continue
+        if flag not in KNOWN_FEATURES:
+            unknown.append(flag)
+    if unknown:
+        raise PackageError(
+            f"package requires unknown feature flag(s): {', '.join(unknown)}",
+        )
 
 
 # ── 読み込み ────────────────────────────────────────────────────────────
@@ -322,27 +494,48 @@ def _strip_single_root(members: list[PurePosixPath]) -> list[PurePosixPath]:
 
 
 def read_package(
-    zip_path: Path | str, extract_to: Path | str | None = None,
+    zip_path: Path | str,
+    extract_to: Path | str | None = None,
+    *,
+    max_package_bytes: int | None = None,
+    max_unpacked_bytes: int | None = None,
 ) -> PackageContents:
     """`.evocart` を読む (``extract_to`` 指定時は展開もする)。
 
     Args:
         zip_path: パッケージ zip。
         extract_to: 展開先。``None`` ならメタデータと目録だけ返す。
+        max_package_bytes: zip 本体のサイズ上限 (``rag.packages.max_package_bytes``)。
+            ``None`` で無検査。
+        max_unpacked_bytes: 展開後の合計サイズ上限 (zip bomb 対策)。``None`` で無検査。
 
     Raises:
         PackageError: zip でない / ``package.json`` が無い / id・版が不正 /
-            zip slip を検出した。
+            zip slip を検出した / サイズ上限を超えた。
     """
     path = Path(zip_path)
     if not path.exists():
         raise FileNotFoundError(f"package not found: {path}")
+    if max_package_bytes is not None:
+        actual_bytes = path.stat().st_size
+        if actual_bytes > max_package_bytes:
+            raise PackageError(
+                f"package exceeds max_package_bytes: {actual_bytes} > "
+                f"{max_package_bytes}",
+            )
     if not zipfile.is_zipfile(str(path)):
         raise PackageError(f"not a zip archive: {path}")
 
     destination = Path(extract_to) if extract_to is not None else None
 
     with zipfile.ZipFile(str(path), "r") as zf:
+        if max_unpacked_bytes is not None:
+            unpacked = sum(info.file_size for info in zf.infolist())
+            if unpacked > max_unpacked_bytes:
+                raise PackageError(
+                    f"package unpacks to more than max_unpacked_bytes: "
+                    f"{unpacked} > {max_unpacked_bytes}",
+                )
         members: list[PurePosixPath] = []
         source_names: list[str] = []
         for raw_name in zf.namelist():
@@ -519,12 +712,19 @@ def write_package(
     validate_version(meta.version)
 
     docs_dir = root / DOCS_DIR
-    if not docs_dir.is_dir() or not any(p.is_file() for p in docs_dir.rglob("*")):
-        raise PackageError(f"package has no documents under {docs_dir}")
+    if not has_any_section_content(root):
+        raise PackageError(
+            f"package has no documents and no other sections under {root}",
+        )
 
     from dataclasses import replace
 
-    meta = replace(meta, content_digest=compute_content_digest(docs_dir))
+    meta = replace(
+        meta,
+        content_digest=compute_content_digest(docs_dir),
+        section_digests=compute_section_digests(root),
+        provides=meta.provides or discover_sections(root),
+    )
     write_package_meta(root, meta)
 
     with AtomicWriter(output, mode="wb") as raw:
@@ -553,26 +753,38 @@ def package_filename(meta: PackageMeta) -> str:
 
 __all__ = [
     "DOCS_DIR",
+    "EDITION_PRO_FEATURE",
+    "KNOWN_FEATURES",
+    "LANGUAGE_DIR",
+    "LANGUAGE_VERIFY_FEATURE",
     "PACKAGE_FILE",
     "PACKAGE_ID_RE",
+    "PACKAGE_KIND_DEFAULT",
+    "PACKAGE_KINDS",
     "PACKAGE_SCHEMA_VERSION",
     "PACKAGE_SUFFIX",
     "PREBUILT_BUILD_FILE",
     "PREBUILT_CHUNKS_FILE",
     "PREBUILT_DIR",
     "PREBUILT_EMBEDDINGS_DIR",
+    "SECTION_DIRS",
     "SEMVER_RE",
+    "TEMPLATES_DIR",
     "PackageContents",
     "PackageError",
     "PackageMeta",
     "PrebuiltInfo",
     "compute_content_digest",
+    "compute_section_digests",
+    "discover_sections",
+    "has_any_section_content",
     "iter_prebuilt_chunks",
     "meta_from_record",
     "package_filename",
     "prebuilt_from_record",
     "read_package",
     "validate_package_id",
+    "validate_requires",
     "validate_version",
     "write_package",
     "write_package_meta",

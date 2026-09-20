@@ -264,6 +264,16 @@ class GenerationConfigRef:
     ``rag_usage_rate`` はここに ``corpus:`` があるかで数える。
     """
 
+    template: str = ""
+    """このターンに **実際に適用した** 文書テンプレートの来歴鍵
+    (``"<package_id>@<version>:<entry_id>"``、c_16 §4.5.2 / c_05 §0.6)。
+
+    体裁の継承 (``write_file`` が ``WriteResult.metadata`` に載せた場合) /
+    構成テンプレートによる計画の seed (``plan_seeded``) / 帳票の穴埋め
+    (書込み成功時) のいずれかで適用されたターンだけ埋まる。選ばれただけで
+    未適用のターンは空文字のまま (``None`` で埋めない既定と同じ扱い)。
+    """
+
 
 @dataclass
 class ExperienceEntry:

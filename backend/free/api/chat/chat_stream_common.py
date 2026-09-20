@@ -644,6 +644,7 @@ async def collect_chat_response(
     - ``error`` は 503 (``HTTPException``) に写す。ストリーム側で結末と
       失敗経験は記録済み
     - ``token_info`` / ``agent_layer`` はそのまま応答へ
+    - ``template_hint`` はそのまま応答へ (無ければ ``None``、c_17 §3.8)
     """
     text_parts: list[str] = []
     token_info: dict | None = None
@@ -651,6 +652,7 @@ async def collect_chat_response(
     error: str | None = None
     last_result: str | None = None
     editor_blocks: list[str] = []
+    template_hint: dict | None = None
     async for frame in frames:
         if not frame.startswith("data: "):
             continue  # keepalive コメント
@@ -686,6 +688,8 @@ async def collect_chat_response(
                 editor_blocks.append(
                     "```" + lang + "\n" + str(ec.get("content") or "") + "\n```",
                 )
+        elif "template_hint" in obj and isinstance(obj["template_hint"], dict):
+            template_hint = obj["template_hint"]
     if error is not None:
         raise HTTPException(status_code=503, detail=error)
     text = "".join(text_parts)
@@ -700,4 +704,5 @@ async def collect_chat_response(
         token_info=TokenInfo(**info),
         session_id=session_id,
         agent_layer=agent_layer,
+        template_hint=template_hint,
     )

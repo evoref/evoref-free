@@ -90,6 +90,22 @@ def _get_embedder(state: AppState):
     return embedder
 
 
+def _check_upload_size(content: bytes, mgr) -> None:
+    """アップロードされたパッケージのサイズを入口検査する (c_16 §4.3)。
+
+    展開前後のサイズ上限は :class:`CorpusStore.install` 側でも検査するが、
+    zip 本体は一時ファイルへ書く前に弾いた方が安い。
+    """
+    max_bytes = mgr.max_package_bytes
+    if len(content) > max_bytes:
+        raise _cartridge_error(
+            413, "E0513",
+            f"Package too large: {len(content)} bytes (max {max_bytes})",
+            i18n_key="api.cartridge_package_too_large",
+            size=str(len(content)), max_size=str(max_bytes),
+        )
+
+
 @router.post("/install", status_code=201)
 async def install_cartridge(
     state: AppState = Depends(get_app_state),
@@ -100,9 +116,11 @@ async def install_cartridge(
     mgr = _get_manager(state)
     embedder = _get_embedder(state)
 
+    content = await file.read()
+    _check_upload_size(content, mgr)
+
     # 一時ファイルに保存
     with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-        content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
     logger.debug("Saved upload to temp: %s (%d bytes)", tmp_path, len(content))
@@ -260,9 +278,11 @@ async def install_cartridge_stream(
     mgr = _get_manager(state)
     embedder = _get_embedder(state)
 
+    content = await file.read()
+    _check_upload_size(content, mgr)
+
     # アップロードを一時ファイルに保存（mgr.install は Path を要求）
     with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-        content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
 

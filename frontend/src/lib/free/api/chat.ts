@@ -69,6 +69,26 @@ export interface OutputTruncatedInfo {
 	max_tokens: number | null;
 }
 
+/** `template_hint` フレーム 1 件分の様式候補 */
+export interface TemplateHintEntry {
+	/** `<package_id>:<entry_id>` (`selectedTemplate` / `POST /api/chat` の `template` にそのまま渡す) */
+	key: string;
+	doc_type: string;
+	has_base: boolean;
+	has_outline: boolean;
+	has_fields: boolean;
+}
+
+/**
+ * 「使える様式がある」通知 (依頼が様式を指名したが自動適用しなかった場合の
+ * 副チャネル)。`candidate` = 単一の様式を指名 (「テンプレートで」等が無かった
+ * ため自動適用しなかった)。`ambiguous` = 複数の様式が該当し決められなかった。
+ */
+export interface TemplateHint {
+	kind: 'candidate' | 'ambiguous';
+	templates: TemplateHintEntry[];
+}
+
 export interface ChatStreamEvent {
 	type:
 		| 'token'
@@ -83,7 +103,8 @@ export interface ChatStreamEvent {
 		| 'editor_code'
 		| 'input_truncated'
 		| 'output_truncated'
-		| 'create_run';
+		| 'create_run'
+		| 'template_hint';
 	token?: string;
 	token_info?: TokenInfo;
 	error?: string;
@@ -101,6 +122,7 @@ export interface ChatStreamEvent {
 	/** staged クリエイトの run 識別子 (再接続用、f_05 §4.5)。run 開始直後に 1 回 */
 	run_id?: string;
 	session_id?: string;
+	template_hint?: TemplateHint;
 }
 
 /** 文書 (corpus パッケージ) の参加モード。auto = 問いと較正で決める / on = 問い側の抑止を掛けない / off = このターンは引かない */
@@ -113,7 +135,9 @@ export async function* chatStream(
 	sessionId?: string,
 	files?: string[],
 	signal?: AbortSignal,
-	corpusMode: CorpusMode = 'auto'
+	corpusMode: CorpusMode = 'auto',
+	/** 選択中の文書テンプレート鍵 (`<package_id>:<entry_id>`)。このターンだけ効く */
+	template: string | null = null
 ): AsyncGenerator<ChatStreamEvent> {
 	const streamStart = IS_DEV ? performance.now() : 0;
 	const eventCounts: Record<string, number> = IS_DEV
@@ -133,7 +157,8 @@ export async function* chatStream(
 				mode,
 				session_id: sessionId,
 				files,
-				corpus_mode: corpusMode
+				corpus_mode: corpusMode,
+				template
 			}),
 			signal
 		});
@@ -269,9 +294,37 @@ export function toChatStreamEvent(parsed: Record<string, unknown>): ChatStreamEv
 				run_id: typeof parsed.run_id === 'string' ? parsed.run_id : undefined,
 				session_id: typeof parsed.session_id === 'string' ? parsed.session_id : undefined
 			};
+		case 'template_hint': {
+			const hint = parseTemplateHint(parsed.template_hint);
+			return hint ? { type: 'template_hint', template_hint: hint } : null;
+		}
 		default:
 			return null;
 	}
+}
+
+/** `template_hint` の本体を検証する。形が壊れていれば `null` (フレームごと無視) */
+function parseTemplateHint(value: unknown): TemplateHint | null {
+	if (!value || typeof value !== 'object') return null;
+	const kind = (value as { kind?: unknown }).kind;
+	if (kind !== 'candidate' && kind !== 'ambiguous') return null;
+	const rawTemplates = (value as { templates?: unknown }).templates;
+	if (!Array.isArray(rawTemplates)) return null;
+	const templates = rawTemplates.filter(isTemplateHintEntry);
+	if (templates.length === 0) return null;
+	return { kind, templates };
+}
+
+function isTemplateHintEntry(entry: unknown): entry is TemplateHintEntry {
+	if (!entry || typeof entry !== 'object') return false;
+	const e = entry as Record<string, unknown>;
+	return (
+		typeof e.key === 'string' &&
+		typeof e.doc_type === 'string' &&
+		typeof e.has_base === 'boolean' &&
+		typeof e.has_outline === 'boolean' &&
+		typeof e.has_fields === 'boolean'
+	);
 }
 
 /** `type` を持たない旧フレームの種別を本体キーから推定する */

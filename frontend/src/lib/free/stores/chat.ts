@@ -1,5 +1,5 @@
 import { writable, derived, get } from 'svelte/store';
-import type { TokenInfo, RagDebugInfo, SourcesInfo, EditorCodeArtifact, CorpusMode } from '$lib/free/api';
+import type { TokenInfo, RagDebugInfo, SourcesInfo, EditorCodeArtifact, CorpusMode, TemplateHint } from '$lib/free/api';
 import { switchModeApi } from '$lib/free/api';
 import { MODE_RESTART_STATUS_TIMEOUT_MS } from '$lib/free/constants';
 
@@ -97,6 +97,31 @@ corpusMode.subscribe((v) => {
 		/* private window 等: 保持できなくても動作は変えない */
 	}
 });
+
+/**
+ * 選択中の文書テンプレート鍵 (`<package_id>:<entry_id>`)。
+ *
+ * corpusMode と異なり **次の 1 回の送信にだけ効く** (c_16 §4.5.2)。選んだ
+ * テンプレートが別の依頼にも貼り付いたままだと誤適用になるため、送信の
+ * たびに `null` へ戻す (`ChatInput.handleSend`)。localStorage には持たない。
+ */
+export const selectedTemplate = writable<string | null>(null);
+
+/**
+ * インストール済みテンプレートの集合が変わった合図 (カートリッジの install /
+ * 削除 / 様式の登録のたびに増やす)。チャット入力の選択肢はこれを見て
+ * 取り直す — 起動時に 1 回読むだけだと、登録した様式がリロードまで選べない。
+ */
+export const templatesRevision = writable(0);
+
+/**
+ * 「使える様式がある」通知 (`template_hint` SSE フレーム、次の 1 ターンだけ表示)。
+ *
+ * ストリーム冒頭で届いた内容をそのまま持つ。次の送信を開始した時点、および
+ * 会話 / モードの切替時に `null` へ戻す (古い通知が別の依頼に貼り付いたまま
+ * 残らないようにする)。localStorage には持たない。
+ */
+export const templateHint = writable<TemplateHint | null>(null);
 
 /** セッションID */
 export const sessionId = writable<string>(modeSessions.chat);
@@ -335,6 +360,7 @@ export async function switchMode(newMode: string): Promise<void> {
 		currentMode.set(newMode);
 		messages.set(modeMessages[newMode] ?? []);
 		sessionId.set(modeSessions[newMode] ?? crypto.randomUUID());
+		templateHint.set(null);
 
 		// base の再起動が必要だったが完了しなかった場合は failed。
 		// 両方とも変更なし、または変更があった分は全て再起動完了していれば ready。
@@ -373,6 +399,7 @@ export function clearMessages(): void {
 	modeSessions[current] = newSessionId;
 	tokenInfo.set({ used: 0, limit: 4096, pct: 0, instance_name: 'evoref' });
 	sessionId.set(newSessionId);
+	templateHint.set(null);
 }
 
 /**
@@ -389,6 +416,7 @@ export function restoreSession(sid: string, restored: ChatMessage[]): void {
 	modeSessions[current] = sid;
 	messages.set(restored);
 	sessionId.set(sid);
+	templateHint.set(null);
 }
 
 /** 添付ファイル追加 */
