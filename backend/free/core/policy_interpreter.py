@@ -286,13 +286,22 @@ def _default_policies() -> dict[str, dict]:
                 "max_extend_rounds": {"min": 1, "max": 50, "type": "int"},
             },
         },
+        # NOTE: ここの値は ``config.yaml`` の ``learning.*`` を **上書きする**。
+        # ``LearningScheduler._lp`` は policy を先に引き、失敗したときだけ config を
+        # 見るため、同名キーを持つ限り config 側は一度も効かない。**schema
+        # (backend/schemas/learning.py) の既定値と必ず揃えること** — 揃っていないと
+        # 「config.yaml を書き換えたのに挙動が変わらない」状態になる (2026-09-21 の
+        # 実機テストで level1_min_experiences が 8 に下がらず発覚)。
+        # 一致は test_policy_interpreter.py が検証する。
         "learning": {
             "version": 1,
             "domain": "learning",
             "params": {
                 "_default": {
-                    "level1_min_experiences": 20,
-                    "level1_generations": 10,
+                    "level1_min_experiences": 8,
+                    # schema は 2026-09-14 に 5 へ下げていたが、policy が 10 の
+                    # ままだったので一度も効いていなかった (上の NOTE の実例)。
+                    "level1_generations": 5,
                     "level1_population_size": 5,
                     "level1_idle_minutes": 30,
                 },

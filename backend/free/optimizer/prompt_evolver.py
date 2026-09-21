@@ -30,7 +30,11 @@ from backend.log_config import get_logger
 
 if TYPE_CHECKING:
     from backend.free.learning.critique_synthesizer import CritiqueSynthesizer
-from backend.free.learning.fitness import DEFECT_WEIGHTS, defect_rate_fitness
+from backend.free.learning.fitness import (
+    DEFECT_WEIGHTS,
+    defect_rate_fitness,
+    signal_is_defect,
+)
 from backend.free.learning.level1_session import Level1Session
 
 logger = get_logger("optimizer.prompt_evolver")
@@ -52,25 +56,22 @@ _CONTEXT_SAFETY_MARGIN = 256
 _TEXT_SIMILARITY_THRESHOLD = 0.97
 _TEXT_LEN_DELTA = 5
 
-#: base prompt 進化の欠陥重み: 共有表 (fitness.DEFECT_WEIGHTS) に、prompt 固有の
-#: 派生欠陥 2 種を足す。``turn_outcome=failed`` は出力が壊れていたターンの SSOT
-#: (2026-07-28 調査: 無罰点のまま壊れた応答を生むプロンプトが採用され続けた)。
-#: long_form 検証失敗は create モードの主要な失敗シグナル (2026-07-17 実データで
-#: rephrase/correction が 21 件中 0 件)。``conversation_ended`` は **主項に置かない**
-#: (読み込み時に全件へ立つため恒真、docs/f_04 §8 禁則 7)。
-#: ``user_negative`` (ユーザーの 👎、f_04 §3.2.3) は **本人が失敗と言った唯一の
-#: 信号** なので訂正と同じ 1.0。これを入れないと、明示評価はケース選定にしか
-#: 効かず、(a) 進化の fitness に選択圧を作れない、(b) 採用後のロールバック判定
-#: (``_check_prompt_adoptions`` は同じ欠陥率を見る) が「👎 が増えた」ことを
-#: 観測できない — つまり 👎 で悪化を訴えても採用済みプロンプトが戻らない
-#: (2026-09-14 監査 F-11)。policy / generation param 側の共有表
-#: (:data:`DEFECT_WEIGHTS`) には入れない (f_04 §3.2.3 の「policy 進化の圧には
-#: 使わない」を維持する)。
+#: base prompt 進化の欠陥重み: 共有表 (fitness.DEFECT_WEIGHTS) を土台に、
+#: **プロンプトが責任を持つ失敗**を重くする。指示違反 (``outcome_instruction``:
+#: 文字数 / 箇条書きの件数 / ユーザー文のオウム返し) と本文の矛盾
+#: (``outcome_contradiction``) はプロンプトの書き方で直る側で、逆に実行の失敗
+#: (``outcome_execution``: ルーティング / step credit) はプロンプトを変えても
+#: 直らないので土台のまま据え置く。
+#:
+#: 2026-09-21 にラベルの出どころを検証器チャネルへ寄せた (fitness モジュールの
+#: docstring)。旧 ``turn_outcome_failed`` (0.8) は失敗を 1 次元に潰しており、
+#: 実測 13 件の内訳 (指示違反 6 / 出力崩れ 3 / 矛盾 2 / 実行 2) が見えなかった。
+#: ``conversation_ended`` は **主項に置かない** (読み込み時に全件へ立つため
+#: 恒真、docs/f_04 §8 禁則 7)。
 PROMPT_DEFECT_WEIGHTS: dict[str, float] = {
     **DEFECT_WEIGHTS,
-    "turn_outcome_failed": 0.8,
-    "long_form_failed": 0.5,
-    "user_negative": 1.0,
+    "outcome_instruction": 1.0,
+    "outcome_contradiction": 1.0,
 }
 
 #: 候補長のハードゲート: 現行の ``LENGTH_GATE_RATIO`` 倍か ``+LENGTH_GATE_SLACK_CHARS``
@@ -473,12 +474,9 @@ class PromptEvolver:
         """経験バッファに基づく適応度計算
 
         欠陥率ベース (:func:`backend.free.learning.fitness.defect_rate_fitness`、
-        重みは :data:`PROMPT_DEFECT_WEIGHTS`):
-        - turn_outcome="failed" → 失敗（出力が壊れていたターンの SSOT）
-        - rephrased_query=True → 失敗（ユーザーが言い直した）
-        - user_correction → 失敗（ユーザーが訂正した）
-        - long_form_used かつ long_form_success=False → 失敗（生成物が検証エラー）
-        - ``conversation_ended`` は使わない (読み込み時に全件へ立つ恒真信号)
+        重みは :data:`PROMPT_DEFECT_WEIGHTS`)。失敗ラベルの語彙は重み表が
+        SSOT で、内訳は ``fitness`` モジュールの docstring を見ること
+        (``conversation_ended`` は読み込み時に全件へ立つ恒真信号なので使わない)。
 
         候補テキスト由来の項は 2 つだけ:
         - 長さゲート: ``max_candidate_len(reference_len)`` 超は 0.0 (棄却)
@@ -503,24 +501,30 @@ class PromptEvolver:
         if base_score is None:
             return 0.5
 
+        # 欠陥ゼロの窓では base_score が 1.0 になり、clamp で全候補が 1.0 へ
+        # 潰れてタイブレークが死ぬ — 「進化を no-op にしない」という本来の
+        # 役目を、いちばん必要な場面で果たせていなかった。上端に常に
+        # tiebreak 分の余地を残す (2026-09-21)。
+        base_score = min(base_score, 1.0 - COVERAGE_TIEBREAK_MAX)
+
         # 1 回の進化ランでは experiences が固定なので base_score は全候補で同一に
         # なる。候補間の識別は失敗クエリ語カバー率のタイブレークで与える
         # (無いと strict > 置換が一度も発火せず進化が no-op 化する)。ただし
         # 上限は base_score を覆さない大きさに留める (L-A3)。
+        #
+        # 失敗の判定は **重み表を SSOT にする** (2026-09-21)。旧実装は
+        # ``rephrased_query`` / ``user_correction`` / ``user_negative`` /
+        # long_form 検証落ちを直に列挙しており、``turn_outcome == "failed"``
+        # のターンが 1 件も失敗語に入っていなかった。実データ 161 件では前者
+        # 3 つが 0 件・後者が 13 件なので、カバー率は **ほぼ常に空集合**で、
+        # タイブレーク自体が発火していなかった。
         candidate_lower = candidate.lower()
         bonus = 0.0
         failure_keywords: set[str] = set()
         for exp in experiences:
             signals = exp.get("signals", {})
-            is_long_form_failure = (
-                signals.get("long_form_used")
-                and signals.get("long_form_success") is False
-            )
-            if (
-                signals.get("rephrased_query")
-                or signals.get("user_correction")
-                or signals.get("user_negative") is True
-                or is_long_form_failure
+            if any(
+                signal_is_defect(signals, key) for key in PROMPT_DEFECT_WEIGHTS
             ):
                 failure_keywords.update(
                     _extract_query_terms(str(exp.get("query", ""))),

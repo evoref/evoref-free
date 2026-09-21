@@ -2655,32 +2655,69 @@ class LearningScheduler:
     # correction 機構ごと廃止した (feedback._detect_correction docstring 参照)。
     # phase 番号は欠番のまま維持する (phase6/7 のリネームは行わない)。
 
-    def _level1_phase6_generation_params(
+    async def _level1_phase6_generation_params(
         self,
         experiences: list[dict],
         results: dict[str, dict],
         phase_durations: dict[str, float],
     ) -> None:
-        """生成パラメータ進化"""
+        """生成パラメータ進化 (実測ゲート付き、f_04 §4.7)。
+
+        評価器 (``compare_generation_params``) が注入されていれば、候補デルタを
+        失敗ケースで実生成して現行と比べ、雑音フロアを超えた場合だけ採用する。
+        評価器が無い構成では従来どおり ``evolve`` の skip を記録する
+        (でっち上げの改善を作らない)。
+        """
         if self._cancelled or self._generation_param_evolver is None:
             return
+        from backend.free.optimizer.prompt_eval import select_prompt_eval_cases
+
+        def _base_generation_params(mode: str) -> dict:
+            """config の既定 sampling (学習デルタ適用 **前**)。未ロードなら空。"""
+            try:
+                from backend.config import get_mode_generation_params
+
+                return get_mode_generation_params(mode)
+            except Exception as exc:  # noqa: BLE001 - config 未ロードは空で縮退
+                logger.debug("base generation params unavailable: %r", exc)
+                return {}
+
         tp = time.monotonic()
+        measured = callable(
+            getattr(self._prompt_eval, "compare_generation_params", None),
+        )
         for mode in self.MODES:
             if self._cancelled:
                 break
             mode_exp = [e for e in experiences if e.get("mode") == mode]
-            if len(mode_exp) >= self.min_experiences // 2:
+            if len(mode_exp) < self.min_experiences // 2:
+                logger.debug(
+                    "Level 1 generation params skipped for %s: %d experiences < %d",
+                    mode, len(mode_exp), self.min_experiences // 2,
+                )
+                continue
+            if measured:
+                max_cases, _, _ = self._prompt_gate_config()
+                cases = select_prompt_eval_cases(
+                    mode_exp, mode, max(1, max_cases),
+                    sample_cases=self._sample_cases(),
+                )
+                gen_result = await self._generation_param_evolver.evolve_measured(
+                    mode,
+                    mode_exp,
+                    base_params=_base_generation_params(mode),
+                    prompt_text=self.prompt_manager.get_prompt_static(mode),
+                    evaluator=self._prompt_eval,
+                    cases=cases,
+                    min_net_wins=self._min_net_wins(),
+                )
+            else:
                 gen_result = self._generation_param_evolver.evolve(
                     mode=mode,
                     experiences=mode_exp,
                     population_size=self.population_size,
                 )
-                results[f"generation_params_{mode}"] = gen_result
-            else:
-                logger.debug(
-                    "Level 1 generation params skipped for %s: %d experiences < %d",
-                    mode, len(mode_exp), self.min_experiences // 2,
-                )
+            results[f"generation_params_{mode}"] = gen_result
         phase_durations["phase6_generation_params"] = round(time.monotonic() - tp, 3)
 
     def _level1_phase7_tool_routing(

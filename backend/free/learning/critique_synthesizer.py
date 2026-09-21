@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from backend.free.learning.fitness import DEFECT_WEIGHTS, signal_is_defect
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -25,7 +26,7 @@ logger = get_logger("learning.critique_synthesizer")
 
 # ルールベース閾値
 _CORRECTION_RATE_THRESHOLD = 0.3   # 訂正率がこれ以上なら「明確性の問題」
-_REPHRASE_RATE_THRESHOLD = 0.3     # 言い直し率がこれ以上なら「理解の問題」
+_CHANNEL_RATE_THRESHOLD = 0.3      # 支配的な失敗チャネルがこれ以上なら報告
 _CONSECUTIVE_DECLINE_N = 3         # fitness 連続低下の検出閾値
 _HIGH_AGENT_LOOPS = 3              # エージェントループ数の警告閾値
 
@@ -45,6 +46,59 @@ _CAPABILITY_CONTRADICTION_RE = re.compile(
 def _hint_contradicts_capabilities(hint: str) -> bool:
     """改善ヒントがシステム能力 (ローカル書込可) と矛盾するかを判定する。"""
     return bool(_CAPABILITY_CONTRADICTION_RE.search(hint))
+
+
+def _is_failure(experience: dict) -> bool:
+    """批評の母集団に入れる失敗か (語彙は共有の重み表が SSOT)。
+
+    旧実装は ``rephrased_query`` / ``user_correction`` / ``turn_outcome`` の
+    3 条件を手で並べていた。``rephrased_query`` は 2026-09-21 に重み表から
+    外した字句判定 (実データ 161 件で発火 0 件)、``long_form`` の検証落ちは
+    そもそも見ていなかった — create の失敗の大半がこれなのに、批評の
+    母集団に 1 件も入らない状態だった (docs/f_04 §3.2.4)。
+    """
+    return any(
+        signal_is_defect(experience.get("signals") or {}, key)
+        for key in DEFECT_WEIGHTS
+    )
+
+
+#: 失敗チャネル → (パターン文, 改善ヒント)。``OUTCOME_REASON_CHANNELS`` が
+#: 畳んだ 4 分類に一対一で対応する。旧実装の「言い直し率」分析は
+#: ``rephrased_query`` の発火が 0 なので恒に不発だった。代わりに
+#: **どのチャネルの失敗が支配的か** を見る (原因の別で処方が変わるため)。
+_CHANNEL_CRITIQUE: dict[str, tuple[str, str]] = {
+    "outcome_instruction": (
+        "instruction violations dominate: explicit constraints in the request "
+        "(character count, item count, output form) are not being honored",
+        "Add instruction: 'When the request states an exact count, length or "
+        "output form, satisfy it literally and verify before answering.'",
+    ),
+    "outcome_contradiction": (
+        "self-contradictions dominate: the answer disagrees with its own "
+        "calculations, with tool results, or with values already supplied",
+        "Add instruction: 'Before concluding, re-read the numbers and tool "
+        "results you were given and make sure the conclusion uses them.'",
+    ),
+    "outcome_broken_output": (
+        "broken output dominates: responses are cut off or contain "
+        "malformed / foreign-language fragments",
+        "Keep responses within a length the model can finish; prefer a short "
+        "complete answer over a long truncated one.",
+    ),
+    "outcome_execution": (
+        "execution failures dominate: the requested action did not run or "
+        "was routed to the wrong handler",
+        "Add instruction: 'If an action cannot be completed, say so plainly "
+        "instead of describing it as done.'",
+    ),
+    "long_form_failed": (
+        "long-form deliverables fail validation: generated documents do not "
+        "pass the structural checks",
+        "Add instruction: 'For documents, follow the requested heading "
+        "structure exactly and keep every section non-empty.'",
+    ),
+}
 
 
 @dataclass
@@ -96,28 +150,40 @@ def _analyze_correction_rate(
     return pattern, hint, correction_count
 
 
-def _analyze_rephrase_rate(
+def failure_channels(failures: list[dict]) -> dict[str, int]:
+    """失敗チャネルごとの件数 (``_CHANNEL_CRITIQUE`` のキーのみ)。
+
+    ``turn_outcome`` 由来の 4 チャネルは排他だが、``long_form_failed`` は
+    それらと独立に立つので同じターンが 2 つ数えられうる。件数は「どの原因が
+    支配的か」を見るためのもので、合計を失敗件数と一致させる意図はない。
+    """
+    counts: dict[str, int] = {}
+    for f in failures:
+        signals = f.get("signals") or {}
+        for key in _CHANNEL_CRITIQUE:
+            if signal_is_defect(signals, key):
+                counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _analyze_failure_channels(
     failures: list[dict], total: int,
-) -> tuple[str | None, str | None, int]:
-    """言い直し率を分析。`(pattern, hint, rephrase_count)` を返す。"""
-    rephrase_count = sum(
-        1 for f in failures
-        if f.get("signals", {}).get("rephrased_query")
-    )
-    if total == 0:
-        return None, None, rephrase_count
-    rate = rephrase_count / total
-    if rate < _REPHRASE_RATE_THRESHOLD:
-        return None, None, rephrase_count
-    pattern = (
-        f"High rephrase rate ({rate:.0%}): "
-        "user queries are misunderstood"
-    )
-    hint = (
-        "Add instruction: 'If the user\\'s request is ambiguous, "
-        "ask a clarifying question before providing a full response.'"
-    )
-    return pattern, hint, rephrase_count
+) -> tuple[str | None, str | None, dict[str, int]]:
+    """支配的な失敗チャネルを分析。``(pattern, hint, counts)`` を返す。
+
+    旧「言い直し率」分析の置き換え (2026-09-21)。``rephrased_query`` は
+    重み表から外した字句判定で発火が 0 件だったため、この分析は恒に不発
+    だった。検証器が既に **なぜ失敗したか** を持っているので、そちらを見る。
+    """
+    counts = failure_channels(failures)
+    if total == 0 or not counts:
+        return None, None, counts
+    channel, count = max(counts.items(), key=lambda kv: kv[1])
+    rate = count / total
+    if rate < _CHANNEL_RATE_THRESHOLD:
+        return None, None, counts
+    description, hint = _CHANNEL_CRITIQUE[channel]
+    return f"{rate:.0%} of turns — {description}", hint, counts
 
 
 def _analyze_high_agent_loops(
@@ -208,14 +274,16 @@ def _format_critique_summary(
     failures: list[dict],
     total: int,
     correction_count: int,
-    rephrase_count: int,
+    channel_counts: dict[str, int],
 ) -> str:
     """批評結果の summary 文字列を構築する。"""
     parts = [f"{len(failures)}/{total} failures analyzed"]
     if correction_count:
         parts.append(f"{correction_count} corrections")
-    if rephrase_count:
-        parts.append(f"{rephrase_count} rephrases")
+    for channel, count in sorted(
+        channel_counts.items(), key=lambda kv: (-kv[1], kv[0]),
+    ):
+        parts.append(f"{count} {channel.removeprefix('outcome_')}")
     return ", ".join(parts)
 
 
@@ -250,13 +318,7 @@ class CritiqueSynthesizer:
         Returns:
             構造化された批評結果
         """
-        failures = [
-            e for e in experiences
-            if (e.get("signals", {}).get("rephrased_query")
-                or e.get("signals", {}).get("user_correction") is not None
-                # turn_outcome SSOT ([failed] マーカー等から導出) も失敗として扱う
-                or e.get("signals", {}).get("turn_outcome") == "failed")
-        ]
+        failures = [e for e in experiences if _is_failure(e)]
 
         if not failures:
             return CritiqueResult(
@@ -306,19 +368,36 @@ class CritiqueSynthesizer:
 
         失敗経験を構造化して LLM に渡し、根本原因と改善提案を得る。
         """
-        # 失敗経験のサマリを構築（最大10件）
+        # 失敗経験のサマリを構築（最大10件）。
+        #
+        # **検証器が記録した理由をそのまま渡す** (2026-09-21)。旧実装は
+        # "turn failed (deliverable not produced)" という原因を含まない一文
+        # しか渡しておらず、批評 LLM は「何が悪かったか」を推測するしか
+        # なかった。``turn_outcome_reason`` には
+        # "length constraint: asked for exactly 100 chars but the answer is 71"
+        # のような具体が既に入っている。
         failure_summaries = []
         for f in failures[:10]:
             signals = f.get("signals", {})
             entry = f"- query: \"{f.get('query', '')[:100]}\""
             if signals.get("user_correction"):
                 entry += f", correction: \"{signals['user_correction'][:100]}\""
-            if signals.get("rephrased_query"):
-                entry += ", user rephrased the query"
             if signals.get("agent_loops", 0) > 1:
                 entry += f", agent_loops: {signals['agent_loops']}"
             if signals.get("turn_outcome") == "failed":
-                entry += ", turn failed (deliverable not produced)"
+                reason = str(signals.get("turn_outcome_reason") or "").strip()
+                entry += (
+                    f", verifier flagged: {reason[:160]}" if reason
+                    else ", turn failed (no reason recorded)"
+                )
+            if (
+                signals.get("long_form_used")
+                and signals.get("long_form_success") is False
+            ):
+                errors = signals.get("long_form_validation_errors") or 0
+                entry += (
+                    f", long-form document failed validation ({errors} error(s))"
+                )
             failure_summaries.append(entry)
 
         total = len(all_experiences)
@@ -327,10 +406,13 @@ class CritiqueSynthesizer:
             1 for f in failures
             if f.get("signals", {}).get("user_correction") is not None
         )
-        rephrase_count = sum(
-            1 for f in failures
-            if f.get("signals", {}).get("rephrased_query")
-        )
+        channel_counts = failure_channels(failures)
+        channel_line = ", ".join(
+            f"{count} {channel.removeprefix('outcome_')}"
+            for channel, count in sorted(
+                channel_counts.items(), key=lambda kv: (-kv[1], kv[0]),
+            )
+        ) or "no channel breakdown"
 
         prompt = (
             "You are analyzing failure patterns in an AI assistant's interactions "
@@ -340,7 +422,8 @@ class CritiqueSynthesizer:
             "(write_file tool), read files, and run commands. Do NOT suggest that "
             "the assistant acknowledge inability to access the local system.\n\n"
             f"Statistics: {failure_count} failures out of {total} total interactions. "
-            f"{correction_count} user corrections, {rephrase_count} rephrases.\n\n"
+            f"{correction_count} user corrections. "
+            f"Failure causes by category: {channel_line}.\n\n"
             f"Failure examples:\n"
             + "\n".join(failure_summaries) + "\n\n"
             "Analyze the root causes of these failures and suggest specific "
@@ -401,7 +484,7 @@ class CritiqueSynthesizer:
             patterns.append(pat)
             hints.append(hint)
 
-        pat, hint, rephrase_count = _analyze_rephrase_rate(failures, total)
+        pat, hint, channel_counts = _analyze_failure_channels(failures, total)
         if pat:
             patterns.append(pat)
             hints.append(hint)
@@ -435,7 +518,7 @@ class CritiqueSynthesizer:
             failure_patterns=patterns,
             improvement_hints=hints,
             summary=_format_critique_summary(
-                failures, total, correction_count, rephrase_count,
+                failures, total, correction_count, channel_counts,
             ),
             source="rule_based",
         )

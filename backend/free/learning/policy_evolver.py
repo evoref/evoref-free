@@ -130,7 +130,13 @@ DEGENERATE_WINDOW: int = 4
 #:     コサイン + 深掘り除外)。この信号は :data:`DEFECT_WEIGHTS` の最大寄与項で、
 #:     同じ経験 136 件で発火が 17 → 1 件に減る。fitness 関数自体は同じでも
 #:     **入力の尺度が変わる**ので、旧尺度の best_fitness を基準として残さない。
-FITNESS_SCHEMA_VERSION: int = 4
+#: v5: 欠陥ラベルの出どころを字句ブールから **検証器のチャネル** へ置換
+#:     (2026-09-21)。旧 5 キーは実データ 161 件で全て 0 件で、
+#:     ``has_defect_signal`` が恒に False を返すため policy / generation param
+#:     進化は ``skipped_no_signal`` から一度も出られなかった。置換後の同じ
+#:     161 件で fitness は 1.0 → 0.886 (chat 0.873 / create 0.924)。
+#:     ``_calc_fitness_router`` の手書き部分集合も共有表へ寄せた。
+FITNESS_SCHEMA_VERSION: int = 5
 
 #: fitness に占めるコスト項の重み。``fitness = (1-w) * 品質 + w * (1 - コスト)``。
 #:
@@ -1374,20 +1380,18 @@ def calc_fitness(domain: str, experiences: list[dict]) -> float | None:
 
 
 def _calc_fitness_router(experiences: list[dict]) -> float | None:
-    """router fitness: ルーティング精度（ユーザー修正率の逆数）
+    """router fitness: 観測された欠陥の率 (1.0 = 欠陥なし)。
 
-    修正・言い換えが少ないほど高スコア。サンプル不足は評価不能 (None)。
+    旧実装は ``user_correction`` と ``rephrased_query`` だけを数える手書きの
+    部分集合だった。``rephrased_query`` は 2026-09-21 に共有の重み表から外した
+    (bigram cosine の閾値判定で、実データ 161 件の発火が 0 件) ため、ここだけ
+    古い語彙を読み続けると **同じ判定の読み手が 2 つ** になる。共有表へ寄せる。
+
+    サンプル不足は評価不能 (None)。
     """
-    total = len(experiences)
-    if total < MIN_FITNESS_SAMPLES:
+    if len(experiences) < MIN_FITNESS_SAMPLES:
         return None
-
-    bad = sum(
-        1 for e in experiences
-        if (e.get("signals", {}).get("user_correction")
-            or e.get("signals", {}).get("rephrased_query"))
-    )
-    return 1.0 - (bad / total)
+    return _defect_rate_fitness(experiences)
 
 
 def _calc_fitness_memory(experiences: list[dict]) -> float | None:

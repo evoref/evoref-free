@@ -108,13 +108,22 @@ class LearningConfig(BaseModel):
     #   切替レイテンシを最優先したい場合のレガシー互換値。
     level2_adapter_partition: Literal["model", "model_mode"] = "model_mode"
 
-    level1_min_experiences: int = Field(default=20, ge=1)
+    #: Level 1 の起動に要る経験数。前回実行以降の **新規** 件数にも同じ値が
+    #: 掛かる (``LearningScheduler.has_enough_new_experiences``)。
+    #: 20 は実運用の蓄積速度に対して大きすぎた — 実測 161 件 / 約 2 か月に対し
+    #: ``Level 1 loop: skipped, not enough NEW experiences`` が 2228 回、起動は
+    #: 46 回。ライブ監査 1 回 (30〜50 ターン) で 4〜6 サイクル回る値へ下げる
+    #: (2026-09-21)。緩めた分の安全装置は採用ゲート側 (``PromptCandidateEval``)。
+    level1_min_experiences: int = Field(default=8, ge=1)
     #: 欠陥率 fitness が平坦なモードでは停滞 3 世代で打ち切られ、10 世代の
     #: 予定が毎回 3 世代で終わっていた (2026-09-14 実測)。選択圧は採用ゲート
     #: 側にあるので、変異生成は少数で足りる。
     level1_generations: int = Field(default=5, ge=1)
     level1_population_size: int = Field(default=5, ge=1)
-    level2_min_failures: int = Field(default=50, ge=1)
+    #: 実測の失敗率は chat 16/120 = 13% / create 5/41 = 12% (2026-09-21、
+    #: 失敗プールを共有の欠陥表へ寄せた後)。50 件は約 400 ターンを要し、
+    #: 初期状態からの実機テストでは到達しない。
+    level2_min_failures: int = Field(default=25, ge=1)
     # モード別の Level 2 発火閾値。未指定のモードは level2_min_failures に
     # フォールバックする。create は経験が溜まりにくく (2026-07-26 実測: chat 180 件に対し
     # create 2 件)、chat と同じ閾値では「chat が回るたびに create も無駄に評価される」か
@@ -167,7 +176,8 @@ class LearningConfig(BaseModel):
     level2_bootstrap_enabled: bool = False
     level2_bootstrap_rank: int = Field(default=8, ge=1, le=256)
     level2_bootstrap_init_sigma: float = Field(default=1e-4, ge=0.0)
-    level2_bootstrap_min_failures: int = Field(default=20, ge=1)
+    #: 初回 bootstrap は本学習よりさらに低く置く (13% の失敗率で約 60 ターン)。
+    level2_bootstrap_min_failures: int = Field(default=8, ge=1)
     # Level 2 base=C: ベースモデルの自己進化を control vector (残差ストリーム操舵) で行う。
     # llama-cvector-generator (forward-only) で生成し、llama-server --control-vector-scaled
     # で次回起動時に適用する。'cvector' 指定が enable (Pro 限定)。既定 'lora' の SPSA 改良は

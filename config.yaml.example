@@ -911,15 +911,15 @@ learning:
   # base モデルの自己学習データを (base モデル識別子 × モード) で分離する。
   partition_by_base_model: true   # true: local/learning/<base_model_stem>/ 配下へ分離しモデル切替で差し替え（未知モデルはゼロから学習）。false: レガシー flat（即ロールバック用）
   level2_adapter_partition: model_mode # LoRA限定(cvectorは常にモデル単位・対象外)。model_mode（既定=chat/createで別アダプタ・切替時にLoRAパスが変わればサーバ再起動、partition_by_base_model=true必須）/ model（レガシー=モデル単位でchat/create共有・mode切替で再起動なし）
-  level1_min_experiences: 20      # Level 1 トリガーに必要な最小経験数
+  level1_min_experiences: 8       # Level 1 トリガーに必要な最小経験数 (前回実行以降の新規件数にも同じ値)
   level1_generations: 5           # Level 1 の世代数 (停滞 3 世代で打ち切り。選択圧は採用ゲート側)
   level1_population_size: 5       # Level 1 の集団サイズ
-  level2_min_failures: 50         # Level 2 トリガーに必要な最小失敗数
+  level2_min_failures: 25         # Level 2 トリガーに必要な最小失敗数
   # モード別の Level 2 発火閾値。未指定のモードは level2_min_failures を使う。
   # create は経験が溜まりにくいため個別に下げる用途を想定。
   level2_min_failures_by_mode:
-    chat: 50
-    create: 20
+    chat: 25
+    create: 12
   # アイドル判定タイマー
   full_idle_minutes: 10           # Trigger B: sleep-time Full の起動アイドル時間（分）
   full_max_defer_minutes: 30      # Trigger B: アイドルを待つ上限（分）。会話が続くと
@@ -942,7 +942,7 @@ learning:
   level2_bootstrap_enabled: false # 初回 full-train（初期 LoRA 生成）。実 llama-server ロード検証後に true 推奨
   level2_bootstrap_rank: 8        # bootstrap LoRA の rank
   level2_bootstrap_init_sigma: 0.0001  # lora_a 初期ガウス標準偏差（lora_b=0）
-  level2_bootstrap_min_failures: 20    # 初回 bootstrap の最小失敗数（本学習 50 より低め）
+  level2_bootstrap_min_failures: 8     # 初回 bootstrap の最小失敗数（本学習 25 より低め）
   # Level 2 base=C: ベースモデルを control vector で操舵 (Pro 限定)。実 --control-vector ロード検証後に cvector へ
   level2_base_method: lora             # lora（既定=base は #3a で trigger-skip、何も起動しない）/ cvector（base 実学習）
   cvector_method: pca                  # pca / mean (llama-cvector-generator --method)

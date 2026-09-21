@@ -4,6 +4,7 @@ import uuid
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
+from backend.free.learning.fitness import DEFECT_WEIGHTS, signal_is_defect
 from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
 from backend.log_config import get_logger
 from backend.utils import utc_now
@@ -19,6 +20,16 @@ RESPONSE_SUMMARY_CAP = 200
 #: より長い全文を文境界で切り詰めて保持する。experience.json 肥大を避けるため
 #: 青天井にはしない (cap × MAX_ENTRIES が永続化サイズの上限)。
 RESPONSE_FULL_CAP = 4000
+
+
+def _has_defect(signals: "FeedbackSignals") -> bool:
+    """共有の重み表 (:data:`DEFECT_WEIGHTS`) のどれかが立っているか。
+
+    ``vars()`` で十分 (``FeedbackSignals`` はスカラだけのフラットな dataclass で、
+    ``asdict`` の再帰コピーは要らない)。
+    """
+    raw = vars(signals)
+    return any(signal_is_defect(raw, key) for key in DEFECT_WEIGHTS)
 
 
 def used_corpus_evidence(experience: dict) -> bool:
@@ -449,15 +460,21 @@ class ExperienceBuffer(JsonStateStore):
         return None
 
     def get_failures(self, mode: str | None = None) -> list[ExperienceEntry]:
-        """失敗エントリ抽出 (言い直し / ユーザー訂正 / 決定論の失敗判定)。
+        """失敗エントリ抽出 (Level 2 の失敗プール / 訂正ペアの母集団)。
 
-        訂正は ``user_correction`` = **検証済みのものだけ** を数える
-        (``correction_candidate`` 止まりの字句候補は含めない、F-03)。
+        失敗の語彙は :data:`backend.free.learning.fitness.DEFECT_WEIGHTS` を
+        SSOT にする (2026-09-21)。旧実装はここに 4 条件を手で並べており、
+        Level 1 の重み表と **食い違っていた**:
 
-        ``turn_outcome == "failed"`` を含めないと、Level 2 の失敗プールは
-        「ユーザーが言い直した or 訂正した」ターンだけになり、算術の破綻・
-        ツール結果の不使用・自己矛盾のような **システムが自分で検出した失敗** が
-        1 件も入らない (2026-09-05 ライブ監査 F-11: 100 ターンで 3 件)。
+        - ``rephrased_query`` を数えていた (重み表からは外した字句判定。実データ
+          161 件で発火 0 件)。
+        - ``long_form`` の検証落ちを数えていなかった。create の失敗の大半は
+          これで、実測 19 件中 15 件。そのため Level 2 の create プールは
+          **2 件** しか集まらず (``Bootstrap skipped: not enough failures
+          (2 < 20)``)、閾値をいくら下げても発火しなかった。
+
+        共有表へ寄せると、検証器が立てた失敗 (算術の破綻 / ツール結果の不使用 /
+        指示違反 / 出力の崩れ) と長文の検証落ちが同じ 1 本の定義で入る。
 
         Args:
             mode: 指定時はそのモード ("chat"/"create") のエントリのみに絞る。
@@ -465,15 +482,7 @@ class ExperienceBuffer(JsonStateStore):
         """
         result = [
             e for e in self.entries
-            if (
-                e.signals.rephrased_query
-                or e.signals.user_correction is not None
-                or e.signals.turn_outcome == "failed"
-                # 明示評価の 👎 (f_04 §3.2.3)。本人が失敗と言ったターンが
-                # Level 2 の失敗プールに入らないと、最も確かな失敗データが
-                # 学習の目的関数に一度も届かない (2026-09-14 監査 F-11)。
-                or e.signals.user_negative is True
-            )
+            if _has_defect(e.signals)
             # max_tokens で切れた応答は「モデルの失敗」ではなく設定由来の
             # 打ち切りで、正しい答えも持たない。2026-09-07 ライブ監査では
             # 失敗プール 6 件中 5 件がこれで、Level 2 の目的関数がほぼ打ち切りで
