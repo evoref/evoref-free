@@ -34,6 +34,11 @@ logger = get_logger("llm.prompt_candidate_eval")
 
 #: 再生成の応答上限。チャット応答の典型長で足り、judge への入力も抑える。
 _RESPONSE_MAX_TOKENS = 512
+
+#: 再生成へ引き渡す sampling パラメータ。``GenerationParamEvolver`` が動かす
+#: 軸と **一致させること** — ここに無い軸の候補は現行と同じ生成になり、
+#: 「測っていない差」を採用してしまう。
+_SAMPLING_KEYS = ("temperature", "top_p", "top_k", "presence_penalty")
 _RESPONSE_EXCERPT_CHARS = 1500
 _QUERY_EXCERPT_CHARS = 600
 _HINT_EXCERPT_CHARS = 400
@@ -183,6 +188,41 @@ class PromptCandidateEval:
         cand = await self._regenerate_all(candidate_text, cases, "regenerate:candidate")
         return self._verdicts(cases, cur_a, cand), self._verdicts(cases, cur_a, cur_b)
 
+    async def compare_generation_params(
+        self,
+        prompt_text: str,
+        current_params: dict[str, float],
+        candidate_params: dict[str, float],
+        cases: list[Any],
+    ) -> tuple[dict[str, int], dict[str, int]]:
+        """**同じ system prompt** を sampling パラメータだけ変えて比べる。
+
+        ``compare_with_noise_floor`` の姉妹で、変数が prompt ではなく
+        temperature / top_p / top_k になる。生成パラメータは候補が prompt と
+        違って「経験レコードに残っていなくても再現できる」ので、記録済みの
+        fitness を当てにせず **その場で両方生成して**比べられる
+        (docs/f_04 §4.7 の L-A2 が候補生成を止めていた理由がここで解ける)。
+
+        雑音フロアは **現行パラメータ同士** で採る。temperature > 0 の現行なら
+        分岐は大きく、そのぶんフロアも高く出る — 候補がその揺れを超えたときだけ
+        採用する、という不等式が温度に依らず成立する。
+
+        Returns:
+            ``(候補の勝敗, カナリアの勝敗)``。``compare_prompts`` と同じ形。
+        """
+        if not cases or not prompt_text.strip():
+            return {}, {}
+        cur_a = await self._regenerate_all(
+            prompt_text, cases, "regenerate:current", params=current_params,
+        )
+        cur_b = await self._regenerate_all(
+            prompt_text, cases, "regenerate:canary", params=current_params,
+        )
+        cand = await self._regenerate_all(
+            prompt_text, cases, "regenerate:candidate", params=candidate_params,
+        )
+        return self._verdicts(cases, cur_a, cand), self._verdicts(cases, cur_a, cur_b)
+
     @staticmethod
     def _verdicts(
         cases: list[Any], base: dict[str, str | None], other: dict[str, str | None],
@@ -212,22 +252,46 @@ class PromptCandidateEval:
         return True
 
     async def _regenerate_all(
-        self, prompt_text: str, cases: list[Any], stage: str,
+        self,
+        prompt_text: str,
+        cases: list[Any],
+        stage: str,
+        *,
+        params: dict[str, float] | None = None,
     ) -> dict[str, str | None]:
         """同じ system prompt で全ケースを続けて再生成する (接頭辞 KV を保つ)。
 
         ケース間で ``should_abort`` を見て中断する。中断した残りは ``None``
         (呼出側は両側が揃ったケースだけを judge に回す)。
+
+        Args:
+            params: sampling パラメータ (``temperature`` / ``top_p`` / ``top_k``)。
+                省略時は greedy (prompt 候補の比較は変数を prompt だけに絞る)。
         """
         outs: dict[str, str | None] = {}
         for case in cases:
             if self._aborted(len(outs), len(cases), stage):
                 break
-            outs[case.case_id] = await self._regenerate(prompt_text, case.query)
+            outs[case.case_id] = await self._regenerate(
+                prompt_text, case.query, params=params,
+            )
         return outs
 
-    async def _regenerate(self, prompt_text: str, query: str) -> str | None:
-        """候補 system prompt で query を再生成する (greedy、背景スロット)。"""
+    async def _regenerate(
+        self,
+        prompt_text: str,
+        query: str,
+        *,
+        params: dict[str, float] | None = None,
+    ) -> str | None:
+        """``prompt_text`` で query を再生成する (既定は greedy、背景スロット)。"""
+        sampling: dict[str, float] = {"temperature": 0.0}
+        if params:
+            sampling = {
+                k: v for k, v in params.items()
+                if k in _SAMPLING_KEYS and v is not None
+            }
+            sampling.setdefault("temperature", 0.0)
         try:
             result = await self._llm_client.generate(
                 messages=[
@@ -235,9 +299,9 @@ class PromptCandidateEval:
                     {"role": "user", "content": query},
                 ],
                 stream=False,
-                temperature=0.0,
                 max_tokens=_RESPONSE_MAX_TOKENS,
                 id_slot=getattr(self._llm_client, "background_slot", -1),
+                **sampling,
             )
         except Exception as exc:  # noqa: BLE001 - 1 ケースの失敗は欠測にする
             logger.warning("prompt candidate regenerate failed: %r", exc)
