@@ -13,6 +13,9 @@ from backend.free.agent.router import (
     asks_directory_listing,
 )
 from backend.free.core.intent_vocab import (
+    COMMAND_EXECUTION_RE,
+    QUESTION_TAIL_RE,
+    TOPIC_REFERENCE_RE,
     CALCULATE_TERM,
     CODE_SEARCH_PATTERNS,
     WEB_REFERENCE_RE,
@@ -178,7 +181,7 @@ _DATETIME_SIGNAL_RE_EN = re.compile(DATETIME_SIGNAL_TERMS_EN, re.IGNORECASE)
 # 「日付型」のガードが片方にしか入っていなかった。
 _TOOL_PATTERNS = [
     re.compile(r"(?:ファイル|file).*(?:読|書|開|作成|削除)", re.IGNORECASE),
-    re.compile(r"(?:コマンド|command).*(?:実行|run)", re.IGNORECASE),
+    COMMAND_EXECUTION_RE,
     # コード/ファイル検索: 汎用「検索」は知識質問にマッチするため除外。
     # ASCII トークンは単語境界必須 ("crossencoder" の 'code' 等への部分一致誤爆対策、
     # CPU/RAM 境界ガードと同じ理由)。日本語側 (コード/ファイル/ソース/検索) は対象外。
@@ -211,7 +214,7 @@ _TOOL_PATTERNS_EN = [
         r"|\b(?:read|open|write|modify|change|update|delete|remove|edit)\b.*\bfile\b",
         re.IGNORECASE,
     ),
-    re.compile(r"(?:コマンド|command).*(?:実行|run)", re.IGNORECASE),
+    COMMAND_EXECUTION_RE,
     *_CODE_SEARCH_PATTERNS,
     _WEB_REFERENCE_RE,
     _CALCULATE_RE,
@@ -372,8 +375,8 @@ _READ_PATH_TOOLS: frozenset[str] = frozenset({
 # ``_KNOWLEDGE_PATTERNS_ALL``) 後は EN 側の同義エントリと二重になる。先頭の
 # 境界が無いぶん EN 側より弱く、残す理由が無い。
 _KNOWLEDGE_PATTERNS = [
-    re.compile(r"(?:教えて|おしえて|とは|って何|ですか|でしょうか|ありますか)", re.IGNORECASE),
-    re.compile(r"(?:について|に関して|に関する)", re.IGNORECASE),
+    QUESTION_TAIL_RE,
+    TOPIC_REFERENCE_RE,
     re.compile(r"(?:知りたい|確認したい|調べたい)", re.IGNORECASE),
     re.compile(r"(?:説明して|使い分け)", re.IGNORECASE),
 ]

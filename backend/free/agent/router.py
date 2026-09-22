@@ -11,6 +11,8 @@ from backend.free.agent.context_budget import resolve_meta_cognitive_loop_budget
 from backend.free.agent.meta_cognitive_text import assigns_file_content
 from backend.free.agent.safety_patterns import strip_command_literals
 from backend.free.core.intent_vocab import (
+    COMMAND_EXECUTION_RE,
+    TOPIC_REFERENCE_RE,
     CALCULATE_TOOL_TERM,
     CODE_SEARCH_PATTERNS,
     EXECUTABLE_QUERY_PATTERNS_EN,
@@ -46,6 +48,11 @@ from backend.free.document_nouns import (
 )
 from backend.log_config import get_logger
 from backend.policy_helpers import get_policy_value
+from backend.free.core.script_ranges import (
+    KANA_BLOCKS,
+    KANJI,
+    KANJI_EXT_A,
+)
 
 if TYPE_CHECKING:
     from backend.free.agent.learned_patterns import LearnedPatternStore
@@ -192,7 +199,7 @@ _FILE_WRITE_INTENT_RE = re.compile(
 # 振る。long_form (文書系名詞) にも _is_url_write_intent にも当たらないデータ成果物
 # (カレンダー/一覧表等) を拾い、deliberative のディレクトリ書込み除外による拒否を防ぐ。
 # CJK (ひらがな / カタカナ / 漢字) の検出。クエリ長判定の分岐に使う。
-_CJK_CHAR_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿]")
+_CJK_CHAR_RE = re.compile(f"[{KANA_BLOCKS}{KANJI_EXT_A}{KANJI}]")
 # ローカルファイルパス (Windows ドライブ / Unix) の存在検出。
 _LOCAL_PATH_RE = re.compile(
     # Windows ドライブパス (C:\ / C:/)。先頭境界が無いと "http://x" の
@@ -583,7 +590,7 @@ META_KEYWORDS_EN_PATTERNS = [
 # 瞬間に除外対象が黙って別のパターンへすり替わる。
 _KNOWLEDGE_QUERY_STRICT_PATTERNS = [
     QUESTION_TAIL_RE,
-    re.compile(r"(?:について|に関して|に関する)", re.IGNORECASE),
+    TOPIC_REFERENCE_RE,
     re.compile(r"(?:知りたい|確認したい|調べたい|わかる|分かる)", re.IGNORECASE),
     re.compile(r"(?:what is|tell me|explain|describe|how does)\b", re.IGNORECASE),
 ]
@@ -781,7 +788,7 @@ _TOOL_PATTERNS_SHARED = [
 TOOL_PATTERNS = [
     # ファイル操作: 読み取り+変更など複合操作のみ（単一操作は Deliberative で処理）
     re.compile(r"(?:ファイル|file).*(?:読|開).*(?:書|修正|変更|削除|追加)", re.IGNORECASE),
-    re.compile(r"(?:コマンド|command).*(?:実行|run)", re.IGNORECASE),
+    COMMAND_EXECUTION_RE,
     *_TOOL_PATTERNS_SHARED,
 ]
 

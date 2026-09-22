@@ -111,6 +111,8 @@ export interface Level2Status {
 /** スケジューラ状態（バックエンド SchedulerStatusModel 準拠） */
 export interface SchedulerStatus {
 	running: boolean;
+	/** `--no-learning` 起動中かどうか (true の間は Level 1/2 が no-op) */
+	is_disabled?: boolean;
 	experience_count: number;
 	new_experience_count: number;
 	min_experiences: number;
@@ -139,6 +141,12 @@ export interface SchedulerStatus {
 	rag_gated_rate?: number;
 	rag_pseudo_derived_rate?: number;
 	rag_abstain_rate?: number;
+	/** phase3 (embed_instruction) 部分集合の件数 */
+	rag_score_experience_count?: number;
+	/** phase4 (token_budget) 部分集合の件数 */
+	long_form_experience_count?: number;
+	/** 上 2 つの部分集合条件のしきい値 */
+	phase_subset_min_experiences?: number;
 	level1_run_count: number;
 	last_level1_results: Record<string, Level1ResultEntry>;
 	executed_phases: string[];

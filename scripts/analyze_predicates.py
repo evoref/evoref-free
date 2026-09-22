@@ -188,13 +188,19 @@ def collect_exemplar_gates(embedder: Any) -> dict[str, Any]:
     発話でしか発火していない」ことが検出できる。
     """
     from backend.free.agent.layer_shadow import LayerClassificationShadow
+    from backend.free.agent.write_intent_gate import WriteIntentGate
+    from backend.free.learning.context_bound_gate import ContextBoundGate
     from backend.free.memory.notes.attribute_gate import AttributeSlotGate
     from backend.free.rag.retrieval_skip_gate import RetrievalSkipGate
 
+    # **ここに載せ忘れるとその判定点は解析から消える** (静かに。エラーにならない)。
+    # 網羅性は backend/tests/test_predicate_analyzer_coverage.py が固定する。
     return {
         "gate.fact_attribute_slot": AttributeSlotGate(embedder),
         "gate.retrieval_skip": RetrievalSkipGate(embedder),
         "gate.layer_classification_shadow": LayerClassificationShadow(embedder),
+        "gate.local_write_intent": WriteIntentGate(embedder),
+        "gate.fewshot_context_bound": ContextBoundGate(embedder),
     }
 
 

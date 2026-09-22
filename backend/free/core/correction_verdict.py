@@ -32,6 +32,10 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Literal
+from backend.free.core.script_ranges import (
+    KANJI,
+    KATAKANA_WORD,
+)
 
 #: 引用として扱う開き / 閉じの対。内側は発話者本人の主張ではない。
 QUOTE_PAIRS: tuple[tuple[str, str], ...] = (
@@ -120,7 +124,7 @@ _DISPUTE_MARKER_RE = re.compile(
     r"\s*[」』）)]?\s*(?:ではなく|ではありません|ではない|じゃなく|とは限らず"
     r"|は誤り|は間違|というのは誤|は正しくあり|is\s+not|isn't|incorrect)",
 )
-_CONTENT_RUN_RE = re.compile(r"[一-龥ァ-ヶーA-Za-z0-9]{2,}")
+_CONTENT_RUN_RE = re.compile(f"[{KANJI}{KATAKANA_WORD}A-Za-z0-9]{{2,}}")
 #: 値の内容語の直後 (この文字数以内) に否定標識があれば否定とみなす。
 _DISPUTE_WINDOW = 14
 

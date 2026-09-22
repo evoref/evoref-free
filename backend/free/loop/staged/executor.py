@@ -83,7 +83,16 @@ from backend.free.loop.staged.language_verify import (
     LanguageVerifyLookup,
     evaluate_verify_commands,
 )
-from backend.free.loop.staged.synthesizer import MODULE_LIST_MARKER, os_constraint
+from backend.free.loop.staged.js_modules import (
+    is_js_module,
+    js_export_summary,
+    missing_js_imports,
+)
+from backend.free.loop.staged.synthesizer import (
+    MODULE_LIST_MARKER,
+    os_constraint,
+    reference_doc_section,
+)
 from backend.free.loop.staged.test_runner import StagedTestRunner
 from backend.free.loop.staged.workspace import WorkspaceManager, StageTestResult, _safe_rel
 from backend.i18n_helper import prose_language_name
@@ -700,12 +709,60 @@ def _type_fidelity_clause(source_path: str) -> str:
             "hold real `int`s, not `bool`). Output only this file's code."
         )
     lang = language_label(source_path)
-    return (
+    clause = (
         f"This file is {lang}, not Python: write idiomatic {lang} and use EXACTLY the "
         f"names, ids, classes, selectors, keys and file references declared in the "
         f"shared design specification so the files work together. Output only this "
         f"file's {lang} code."
     )
+    if Path(source_path).suffix.lower() in _SAMPLE_DATA_SUFFIXES:
+        # 20 問のクイズの正解がすべて 1 番目の選択肢だった (2026-09-22 実機)。
+        clause += (
+            " It is sample data: make the records realistic and varied — do not "
+            "give every record the same value in a field (e.g. every answer at "
+            "the same position) unless the specification requires it. Keep it "
+            "small (about 20 records at most) unless the specification states a "
+            "count — the file must be complete, not cut off."
+        )
+    return clause
+
+
+def _close_truncated_json_array(code: str) -> str | None:
+    """出力上限で切れた JSON 配列を、完結した要素までで閉じて返す (純粋関数)。
+
+    サンプルデータの生成が問題を 55 問以上書き続けて max_tokens で切れ、構文
+    エラーとして 12 分ぶんを丸ごと捨てた (2026-09-22 実機 K06、完結した 54 問は
+    有効だった)。トップレベルが配列で、要素を 1 つ以上読めたときだけ返す。
+    完全に読める JSON や配列でない JSON には ``None`` (触らない)。
+    """
+    import json
+
+    text = (code or "").strip()
+    if not text.startswith("["):
+        return None
+    try:
+        json.loads(text)
+        return None
+    except ValueError:
+        pass
+    decoder = json.JSONDecoder()
+    items: list = []
+    pos = 1
+    while True:
+        while pos < len(text) and text[pos] in " \t\r\n,":
+            pos += 1
+        try:
+            item, pos = decoder.raw_decode(text, pos)
+        except ValueError:
+            break
+        items.append(item)
+    if not items:
+        return None
+    return json.dumps(items, ensure_ascii=False, indent=2) + "\n"
+
+
+#: サンプルデータとして生成されるファイルの拡張子 (:func:`_type_fidelity_clause`)。
+_SAMPLE_DATA_SUFFIXES = frozenset({".json", ".csv", ".yaml", ".yml", ".tsv"})
 
 
 _SOURCE_PATH_RE = re.compile(r"[\w./\\-]+\.([A-Za-z0-9]{1,5})\b")
@@ -893,6 +950,17 @@ def build_sibling_api_block(
     """
     parts: list[str] = []
     for path, code in files.items():
+        if is_js_module(path):
+            # JS の兄弟は AST 要約が空になり、export を知らないまま import を
+            # 書いていた (2026-09-22 実機 K04、js_modules の docstring)。
+            summary = js_export_summary(code or "")
+            if not summary:
+                continue
+            parts.append(
+                f"### `{path}` (import from `./{Path(path).name}` — only these "
+                f"names are exported)\n```javascript\n{summary}\n```"
+            )
+            continue
         summary = summarize_module_api(code or "")
         if not summary:
             continue
@@ -1176,6 +1244,21 @@ class StagedCreateExecutor:
     #: ``t_start + stage_budget`` を渡す。``None`` (既定) なら無制限 — 従来通り
     #: 各呼出は既定 timeout をそのまま使う。
     deadline_monotonic: float | None = None
+    #: ステージ予算の総量 (秒)。``code_stage_min_share`` の枠を秒に直すのに使う
+    #: (``deadline_monotonic`` と同じく呼出側が渡す。``None`` なら枠を持たない)。
+    stage_budget_sec: float | None = None
+    #: ステージ予算のうち code 以降に残す割合 (f_10 §3、2026-09-22)。spec 工程が
+    #: この枠に食い込んだら、残りモジュールの深化と flow の LLM 合成を省く。
+    code_stage_min_share: float = 0.0
+    #: 依頼文が名指しした設計書の本文 (縮約済み、f_10 §2 / §3)。spec 本文の
+    #: 生成にだけ渡す。
+    reference_doc: str = ""
+    #: 予算の枠で省いた spec 工程の段 (observability、コンストラクタ引数ではない)。
+    _spec_budget_skipped: list[str] = field(default_factory=list, init=False, repr=False)
+    #: 任意の段の直近の実測所要 (秒、段の種類ごと)。次の試行の見込みに使う。
+    _spec_extra_seconds: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    #: import 不一致で 1 回失敗にした JS モジュール (2 回目は警告付きで受け入れる)。
+    _js_import_retried: set[str] = field(default_factory=set, init=False, repr=False)
     #: 直近の :meth:`execute` 呼出中に :class:`_StageBudgetExhausted` が
     #: 発生したか (observability 用の内部フラグ、コンストラクタ引数ではない)。
     #: ``execute()`` の先頭でタスクごとにリセットする。
@@ -1189,6 +1272,30 @@ class StagedCreateExecutor:
         if self.deadline_monotonic is None:
             return None
         return self.deadline_monotonic - time.monotonic()
+
+    def _spec_extra_allowed(self, what: str, kind: str = "") -> bool:
+        """spec 工程の任意の段 (深化 / flow の LLM 合成) を走らせる余地があるか。
+
+        code 以降に残す枠 (``stage_budget_sec × code_stage_min_share``) に、残り予算
+        から **この段の見込み所要** (同じ種類の段の直近の実測、未実測なら 0) を
+        引いた値が食い込むなら False を返し、省いた段を記録する。spec が予算の
+        82% を使い、3 モジュール目の code に 3 分しか残らなかった (2026-09-21 K04)。
+        開始前の残りだけで判定すると、開始時に余裕があった flow 合成 (2 試行で
+        9 分) が枠に食い込んだ (2026-09-22 実機)。
+        """
+        remaining = self.remaining_budget_sec()
+        if remaining is None or not self.stage_budget_sec or self.code_stage_min_share <= 0:
+            return True
+        reserve = self.stage_budget_sec * self.code_stage_min_share
+        expected = self._spec_extra_seconds.get(kind or what, 0.0)
+        if remaining - expected > reserve:
+            return True
+        logger.info(
+            "spec %s skipped: %.0fs left (next step expected %.0fs), reserving "
+            "%.0fs for the code stage", what, remaining, expected, reserve,
+        )
+        self._spec_budget_skipped.append(what)
+        return False
 
     def _stage_timeout(self, default: float, what: str) -> float:
         """aux 呼出の timeout を ``min(default, 残りステージ予算)`` に丸める。
@@ -1383,6 +1490,8 @@ class StagedCreateExecutor:
             ):
                 context = _deepen_context(final_spec)
                 for path in module_paths:
+                    if not self._spec_extra_allowed(f"deepen:{path}", "deepen"):
+                        break
                     found = extract_module_section(final_spec, path)
                     if found is None:
                         continue
@@ -1403,9 +1512,11 @@ class StagedCreateExecutor:
                         "spec", f"仕様を詳細化中: {path}", "running",
                         task.task_id,
                     )
+                    t_deepen = time.monotonic()
                     deepened, abort = await self._deepen_module_section(
                         path, section, context, taken,
                     )
+                    self._spec_extra_seconds["deepen"] = time.monotonic() - t_deepen
                     if abort:
                         # aux 劣化 (タイムアウト/接続断)。残りモジュールへ
                         # 直列で挑み続けるとウォールクロック予算を無成果に
@@ -1516,6 +1627,14 @@ class StagedCreateExecutor:
             notes["spec_deepen"] = (
                 f"{deepen_applied}/{deepen_applied + deepen_rejected}"
             )
+        if self._spec_budget_skipped:
+            notes["spec_budget_skipped"] = ",".join(self._spec_budget_skipped)
+            self._emit(
+                "spec",
+                "コード工程の時間を確保するため省略: "
+                + ", ".join(self._spec_budget_skipped),
+                "done", task.task_id,
+            )
         # ExecutionOutcome.notes は成功時 LoopDriver に読まれず manifest にも
         # 保存されないため (失敗時のみ一部キーが参照される)、観測用の値は
         # ここで INFO ログへ明示的に出す (--develop 不要、既定で backend.log
@@ -1548,7 +1667,9 @@ class StagedCreateExecutor:
         if self.aux_client is None:
             return ""
         msgs = self._brief_messages(
-            _SPEC_PROMPT.format(description=description) + os_constraint()
+            _SPEC_PROMPT.format(description=description)
+            + reference_doc_section(self.reference_doc)
+            + os_constraint()
             + _non_python_spec_note(description)
             + _spec_language_constraint() + extra_constraint,
         )
@@ -1688,6 +1809,8 @@ class StagedCreateExecutor:
 
         violations: list[str] = []
         for attempt in ("llm", "llm_retry"):
+            if not self._spec_extra_allowed(f"flow:{attempt}", "flow"):
+                break
             prompt = base_prompt
             if violations:
                 prompt = (
@@ -1698,6 +1821,7 @@ class StagedCreateExecutor:
                     "problem.\n\n"
                 ) + base_prompt
             telemetry: dict = {}
+            t_flow = time.monotonic()
             try:
                 timeout = self._stage_timeout(300.0, "flow_spec_synthesis")
                 data = await self.aux_client.generate_json(
@@ -1714,6 +1838,8 @@ class StagedCreateExecutor:
                                attempt, exc)
                 violations = []
                 continue
+            finally:
+                self._spec_extra_seconds["flow"] = time.monotonic() - t_flow
             if telemetry.get("truncated"):
                 # json_repair が切断 JSON を閉じて素通りし、途中欠けの steps を
                 # 妥当と誤認しうるため、切断応答は全体を不信として棄却する。
@@ -1736,7 +1862,10 @@ class StagedCreateExecutor:
                 "flow spec validation failed (%s): %s",
                 attempt, "; ".join(violations[:6]),
             )
-        if self.flow_part_synthesis_enabled and module_paths:
+        if (
+            self.flow_part_synthesis_enabled and module_paths
+            and self._spec_extra_allowed("flow:parts", "flow")
+        ):
             parts_steps = await self._synthesize_flow_parts(module_paths, spec)
             if parts_steps is not None:
                 return renumber_steps(parts_steps), "parts"
@@ -1914,6 +2043,24 @@ class StagedCreateExecutor:
         """
         return self.workspace.root / ".verify_scratch" / _safe_rel(source_path)
 
+    def _keep_rejected_code(self, source_path: str, code: str) -> Path | None:
+        """構文エラーで捨てたコードをワークスペースの ``.rejected/`` に残す。
+
+        捨てたコードはどこにも残らず、構文エラーの行番号しか分からなかった
+        (2026-09-21 ライブ監査 K07 / K09: 2 回とも構文エラーで配信ゼロ、原因の
+        行を確かめられなかった)。manifest に載らない診断用で、試行ごとに番号を振る。
+        """
+        base = self.workspace.root / ".rejected" / _safe_rel(source_path)
+        try:
+            base.parent.mkdir(parents=True, exist_ok=True)
+            n = len(list(base.parent.glob(f"{base.name}.*"))) + 1
+            path = base.with_name(f"{base.name}.{n}")
+            path.write_text(code, encoding="utf-8", newline="\n")
+        except OSError as exc:
+            logger.warning("could not keep rejected code for %s: %s", source_path, exc)
+            return None
+        return path
+
     async def _run_language_verify(self, source_path: str, code: str) -> str | None:
         """言語パックの verify コマンドを走らせる (c_16 §4.5.4、段階 C-3)。
 
@@ -2036,10 +2183,21 @@ class StagedCreateExecutor:
                 )
                 code = salvaged
                 detail = None
+        if detail is not None and source_path.lower().endswith(".json"):
+            closed = _close_truncated_json_array(code)
+            if closed is not None:
+                logger.warning(
+                    "staged code stage returned a truncated JSON array for %s; "
+                    "kept the complete elements (%d -> %d chars)",
+                    source_path, len(code), len(closed),
+                )
+                code = closed
+                detail = None
         if detail is not None:
+            rejected = self._keep_rejected_code(source_path, code)
             logger.warning(
-                "staged code stage produced a syntax error for %s: %s",
-                source_path, detail,
+                "staged code stage produced a syntax error for %s: %s (kept at %s)",
+                source_path, detail, rejected,
             )
             self._fail_task(task, f"syntax error: {detail}")
             self._emit(
@@ -2050,6 +2208,34 @@ class StagedCreateExecutor:
                 status="failure", error=f"syntax error: {detail}",
                 notes={"executor": self.name, "stage": "code", **part_notes},
             )
+        # JS の名前付き import が兄弟の export に実在するか (js_modules の docstring)。
+        # 1 回目は失敗にして再生成させる (再生成時は兄弟の export が指示に載る)。
+        # 2 回目も合わなければ警告付きで受け入れる — 失敗のままだとファイル自体が
+        # 配信されない。
+        if is_js_module(source_path):
+            mismatched = missing_js_imports(code, self._sibling_src(source_path))
+            if mismatched and source_path not in self._js_import_retried:
+                self._js_import_retried.add(source_path)
+                detail = "; ".join(mismatched[:4])
+                self._keep_rejected_code(source_path, code)
+                logger.warning(
+                    "staged code stage produced imports that siblings do not "
+                    "export for %s: %s", source_path, detail,
+                )
+                self._fail_task(task, f"import mismatch: {detail}")
+                self._emit(
+                    "code", f"コード生成失敗 (import 不一致): {source_path} — {detail}",
+                    "failed", task.task_id,
+                )
+                return ExecutionOutcome(
+                    status="failure", error=f"import mismatch: {detail}",
+                    notes={"executor": self.name, "stage": "code", **part_notes},
+                )
+            if mismatched:
+                logger.warning(
+                    "import mismatch remains for %s after a retry; keeping it: %s",
+                    source_path, "; ".join(mismatched[:4]),
+                )
         # ユーザーが明示した依存制約の検証。import スモークは「その環境で import
         # できるか」しか見ないため、pandas が入っている開発機では
         # 「標準ライブラリのみ」違反が合格として通ってしまう (実インシデント

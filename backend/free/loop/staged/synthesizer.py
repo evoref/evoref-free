@@ -98,6 +98,51 @@ Request:
 Output the JSON object and nothing else."""
 
 
+def _split_requested_tests(modules: list[dict], out: list[str]) -> list[dict]:
+    """planner がモジュールとして挙げた ``test_*.py`` を外し、``out`` へ積む。
+
+    計画がテストファイルをコードのモジュールとして組み込み、一度も実行されない
+    テストが配信された (2026-09-22 実機 K06: 8 件中 3 件が失敗するテストを同梱し、
+    応答は test 工程の別のテストの「合格」を報告した)。テスト以外が残らない
+    (全部テスト) なら外さない。
+    """
+    tests = [
+        m for m in modules
+        if is_python_path(m["file_path"])
+        and _file_name(m["file_path"]).startswith("test_")
+    ]
+    if not tests or len(tests) == len(modules):
+        return modules
+    dropped = {m["file_path"] for m in tests}
+    out.extend(m["file_path"] for m in tests)
+    kept = [m for m in modules if m["file_path"] not in dropped]
+    for m in kept:
+        m["depends_on"] = [d for d in m["depends_on"] if d not in dropped]
+    logger.info(
+        "create_task_graph: test module(s) %s left to the test stage", sorted(dropped),
+    )
+    return kept
+
+
+def reference_doc_section(reference_doc: str) -> str:
+    """依頼文が名指しした設計書の本文をプロンプトへ運ぶ節 (f_10 §2 / §3)。
+
+    依頼文は「X/DESIGN.md の設計に基づいて…作成」の 1 行だけで、設計書の中身が
+    planner にも spec にも届かず、要求機能が黙って落ちた (2026-09-21 ライブ監査、
+    4/10 テーマ)。空なら何も足さない (既存のプロンプトと同一)。
+    """
+    doc = (reference_doc or "").strip()
+    if not doc:
+        return ""
+    return (
+        "\n\nReference design document (written by the user for this request; "
+        "implement EVERY feature, data item, rule and command it specifies, and "
+        "follow its module / file structure when it defines one):\n<<<\n"
+        + doc
+        + "\n>>>"
+    )
+
+
 def os_constraint() -> str:
     """planner/spec/code 生成に注入する実行 OS 制約 (OS 非対応 stdlib の生成を抑止)。
 
@@ -412,6 +457,7 @@ async def synthesize_create_task_graph(
     debug_logger: "DebugLogger | None" = None,
     brief: str = "",
     timeout: float | None = None,
+    reference_doc: str = "",
 ) -> list[SemanticFact]:
     """クリエイト要求を spec/code/test の task ファクト群へ分解する。
 
@@ -421,7 +467,7 @@ async def synthesize_create_task_graph(
     facts, _module_deps = await synthesize_create_task_graph_with_plan(
         request=request, project_id=project_id, aux_client=aux_client,
         include_tests=include_tests, debug_logger=debug_logger, brief=brief,
-        timeout=timeout,
+        timeout=timeout, reference_doc=reference_doc,
     )
     return facts
 
@@ -435,6 +481,8 @@ async def synthesize_create_task_graph_with_plan(
     debug_logger: "DebugLogger | None" = None,
     brief: str = "",
     timeout: float | None = None,
+    reference_doc: str = "",
+    requested_tests_out: list[str] | None = None,
 ) -> tuple[list[SemanticFact], dict[str, list[str]]]:
     """クリエイト要求を spec/code/test の task ファクト群 + planner の依存グラフへ分解する。
 
@@ -448,6 +496,12 @@ async def synthesize_create_task_graph_with_plan(
             aux 利用可否判定を ``create_task_graph_synthesis_path`` として
             構造化記録する (任意)。
         brief: ProductionBrief (f_08 §2.2)。空でなければプロンプト先頭に置く。
+        requested_tests_out: 渡されたら、planner がモジュールとして挙げたテスト
+            ファイル (``test_*.py``) をコード工程から外してここへ積む (f_10 §5)。
+            test 工程が検証済みのテストを作るので、未検証のテストをコードとして
+            生成・配信しない。``None`` なら従来どおりコードとして扱う。
+        reference_doc: 依頼文が名指しした設計書の本文 (縮約済み、f_10 §2)。
+            空でなければ Request の後に「Reference design document」節として置く。
         timeout: 呼出予算 (f_10 §3)。``None`` (既定) は purpose 既定
             (``create_task_graph`` の反応的較正) に委ねる。呼出側 (staged
             起動時のターン予算計算) が残りステージ予算を渡せる。
@@ -487,6 +541,7 @@ async def synthesize_create_task_graph_with_plan(
 
     prompt = (
         _SYNTHESIS_PROMPT.format(request=request.strip())
+        + reference_doc_section(reference_doc)
         + os_constraint()
         + _graph_language_constraint()
     )
@@ -524,6 +579,8 @@ async def synthesize_create_task_graph_with_plan(
     summary, modules = annotate_os_unavailable_modules(summary, modules)
     # 実在しないモジュールへの依存 (planner の自己矛盾) を決定論解決する。
     modules = resolve_unknown_dependencies(modules)
+    if include_tests and requested_tests_out is not None:
+        modules = _split_requested_tests(modules, requested_tests_out)
     module_deps = {m["file_path"]: list(m["depends_on"]) for m in modules}
 
     facts: list[SemanticFact] = []

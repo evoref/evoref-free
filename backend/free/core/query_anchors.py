@@ -20,10 +20,16 @@
 from __future__ import annotations
 
 import re
+from backend.free.core.script_ranges import (
+    KANJI,
+    KATAKANA_WORD,
+)
 
 #: クエリから取り出す **内容語**。2 文字以上の漢字 / カタカナ / 英数字の連なり。
 #: 1 文字を採らないのは助詞・接辞の断片が全文にマッチしてしまうため。
-QUERY_ANCHOR_RE = re.compile(r"[一-鿿]{2,}|[ァ-ヴー]{2,}|[A-Za-z0-9]{2,}")
+QUERY_ANCHOR_RE = re.compile(
+    f"[{KANJI}]{{2,}}|[{KATAKANA_WORD}]{{2,}}|[A-Za-z0-9]{{2,}}",
+)
 
 #: 想起の **足場語**。どの想起クエリにも現れるので、これが一致しても
 #: 「その話題だ」とは言えない。アンカーから除く。

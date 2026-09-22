@@ -78,6 +78,7 @@ from backend.free.memory.protocols import SemanticFactStoreProtocol
 from backend.free.memory.semantic.namespaces import namespace_of, policy_for
 from backend.free.memory.types import SemanticFact
 from backend.log_config import get_logger
+from backend.free.core.inference import SUMMARY_TAIL_RE
 
 logger = get_logger("memory.semantic.conflict")
 
@@ -109,7 +110,6 @@ DEFAULT_ATTRIBUTE_SIMILARITY_THRESHOLD = 0.55
 
 #: ``compress_turn(style="summary")`` の圧縮マークと末尾の元文字数。
 _SUMMARY_MARK = "[要約] "
-_SUMMARY_TAIL_RE = re.compile(r"…（\d+文字）\s*$")
 
 
 def normalize_object_for_conflict(text: str) -> str:
@@ -126,7 +126,7 @@ def normalize_object_for_conflict(text: str) -> str:
     body = (text or "").strip()
     if body.startswith(_SUMMARY_MARK):
         body = body[len(_SUMMARY_MARK):]
-    body = _SUMMARY_TAIL_RE.sub("", body)
+    body = SUMMARY_TAIL_RE.sub("", body)
     return "".join(body.split())
 
 
@@ -142,7 +142,7 @@ def _truncation_marked(text: str) -> bool:
     t = (text or "").strip()
     return (
         t.startswith(_SUMMARY_MARK)
-        or bool(_SUMMARY_TAIL_RE.search(t))
+        or bool(SUMMARY_TAIL_RE.search(t))
         or t.endswith("…")
     )
 

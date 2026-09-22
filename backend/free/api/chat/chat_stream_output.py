@@ -12,6 +12,7 @@ from pathlib import Path
 from backend.app_state import AppState
 from backend.free.agent.meta_cognitive_utils import is_tool_error
 from backend.free.agent.tool_call_judge import _extract_file_path
+from backend.free.core.intent_vocab import EXPLICIT_WINDOWS_PATH_RE
 from backend.free.agent.output_format import (
     anchor_relative_output_path,
     infer_output_extension,
@@ -20,6 +21,7 @@ from backend.free.generation.document_gate import is_document_format
 from backend.free.generation.validators import remove_code_fences
 from backend.utils import utc_compact_stamp
 
+from backend.free.agent.output_format import MD_HINT_RE
 from backend.free.api.chat.chat_stream_common import (
     logger,
 )
@@ -104,6 +106,46 @@ async def read_existing_for_append(
         return ""
 
 
+_REFERENCE_DOC_SUFFIXES = frozenset({".md", ".markdown", ".txt", ".rst"})
+_READ_FILE_META_RE = re.compile(r"^\[file: [^\]\n]*\]\n?")
+
+
+async def read_reference_design_doc(query: str, state: AppState) -> str:
+    """依頼文が設計の根拠として名指しした既存文書の本文を返す (f_10 §2)。
+
+    依頼文に明示パスが 2 本以上あり、そのうち実在するテキスト文書があれば、それは
+    **入力** (出力先は別に名指しされている) — ``content_detector._mask_input_file_paths``
+    と同じ構造の判定で、語彙 (「に基づいて」「をもとに」) に依存しない。以前は
+    staged の計画にも spec にも設計書の中身が 1 文字も届かず、要求機能が黙って
+    落ちた (2026-09-21 ライブ監査、4/10 テーマ)。パスが 1 本だけの依頼は従来の
+    :func:`read_existing_for_append` の判定に委ねる。読めなければ空文字列。
+    """
+    paths = list(dict.fromkeys(EXPLICIT_WINDOWS_PATH_RE.findall(query or "")))
+    if len(paths) < 2:
+        content = await read_existing_for_append(query, state)
+        return _READ_FILE_META_RE.sub("", content, count=1)
+    registry = state.tools_registry
+    if registry is None or not registry.has("read_file"):
+        return ""
+    for raw in paths:
+        path = Path(raw)
+        try:
+            if path.suffix.lower() not in _REFERENCE_DOC_SUFFIXES or not path.is_file():
+                continue
+        except OSError:
+            continue
+        try:
+            content = await registry.execute("read_file", file_path=raw)
+        except Exception as e:  # noqa: BLE001 - 読めなければ参照なしで続ける
+            logger.warning("Failed to read reference document %s: %s", raw, e)
+            continue
+        if is_tool_error(content):
+            continue
+        logger.info("Read reference design document: %d chars from %s", len(content), raw)
+        return _READ_FILE_META_RE.sub("", content, count=1)
+    return ""
+
+
 def clean_generated_text(text: str) -> str:
     """LLM 生成テキストからファイル出力に不要な要素を除去する"""
     # Markdown 見出し行（# 本文 等）を除去
@@ -163,15 +205,6 @@ def _normalize_editor_text(text: str) -> str:
 
 
 # Markdown 出力意図を示すヒント。``md 形式`` / ``.md ファイル`` / ``markdown`` 等。
-_MD_EXT_HINT_RE = re.compile(
-    r"(?:"
-    r"\.md(?:\b|ファイル|形式|で|に|を)"  # 「.md ファイル」「.md 形式」など
-    r"|md[\s ]?(?:形式|ファイル|で出力|で保存|で書)"  # 「md 形式」「md ファイル」
-    r"|markdown"
-    r"|マークダウン"
-    r")",
-    re.IGNORECASE,
-)
 
 def _infer_output_extension(query: str, default: str = ".txt") -> str:
     """ユーザー指示文から出力ファイルの拡張子を推論する (agent 層に委譲)。
@@ -209,7 +242,7 @@ def _resolve_editor_output_format(query: str, is_code: bool) -> tuple[str, str]:
     markdown (.md) を返す。``_infer_output_extension`` は ``.py`` を判定
     できないため、コード生成が markdown 扱いになる問題をここで補正する。
     """
-    if _MD_EXT_HINT_RE.search(query):
+    if MD_HINT_RE.search(query):
         return ".md", "markdown"
     if is_code:
         return ".py", "python"

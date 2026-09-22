@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from backend.aux_telemetry import aux_failure_scope, aux_failure_signals
+from backend.liveness import ledger as liveness_ledger
+from backend.free.memory.sleep_update import FULL_COMPLETED_KEY, INPUT_SUFFIX
 from backend.log_config import get_logger
 from backend.trace_context import generate_trace_id, trace_id_var
 from backend.utils import utc_now_dt
@@ -22,6 +24,95 @@ if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
 
 logger = get_logger("memory.scheduler")
+
+
+#: 補助タスクの「失敗」に数えない理由。チャットに枠を譲ったのは正常動作。
+_AUX_NON_FAILURE_REASONS = frozenset({"preempted_by_chat"})
+
+
+def observe_sleep_liveness(
+    worker: object,
+    kind: str,
+    result: dict | None,
+    *,
+    aux_failures: list[dict] | None = None,
+) -> None:
+    """sleep-time 1 サイクルの到達・効果を死活監視の台帳へ (c_07 §7.1)。
+
+    各段に手を入れず、``run_light`` / ``run_full`` が返す結果辞書を読む:
+    **キーの有無が到達、整数値が効果** (真偽値は 0/1)。
+
+    - Full では、以前届いていた段が今回の結果に無ければ ``missed`` として数える
+      (チャット割り込みの早期 return で後段まで届かない、を ``starved`` にする)。
+      ``full_completed`` の印で Full の完走そのものも ``sleep.full`` として数える。
+      タスクごとキャンセルされ結果が無い回は、段単位の到達が分からないので完走
+      だけを未達として数える。
+    - 補助タスクの失敗は Full のサイクル単位で、用途ごとに 1 回だけ数える
+      (1 サイクルで 3 回タイムアウトしても「連続 3 サイクル」にはしない)。
+      失敗しなかった用途は連続失敗を切る。Light は補助タスクをほとんど使わない
+      ので数えない — Light の回で Full 専用の用途の streak を切ってしまうため。
+    - 観測の失敗で sleep-time を止めない。
+    """
+    ledger = liveness_ledger()
+    try:
+        prefix = f"sleep.{kind}."
+        if isinstance(result, dict):
+            reached: set[str] = set()
+            for key, value in result.items():
+                # 完走の印と入力件数は段ではない (段 <key> の付属情報)。
+                if key == FULL_COMPLETED_KEY or key.endswith(INPUT_SUFFIX):
+                    continue
+                stage = prefix + key
+                reached.add(stage)
+                if isinstance(value, bool):
+                    effect: int | None = int(value)
+                elif isinstance(value, int):
+                    effect = value
+                else:
+                    effect = None
+                raw_input = result.get(key + INPUT_SUFFIX)
+                input_count = (
+                    raw_input
+                    if isinstance(raw_input, int) and not isinstance(raw_input, bool)
+                    else None
+                )
+                ledger.record_run(stage, effect=effect, input_count=input_count)
+            if kind == "full":
+                # 走り切った Full に以前の段が無い = 中断ではなく **段が無くなった**
+                # (削除・改名・条件付きで今回は不要)。数え続けると永久に starved を
+                # 出すので台帳から消す。未到達として数えるのは途中で切られた回だけ
+                # (2026-09-21 の実機: 旧コードが段として残した印のキーが、そのまま
+                # では 5 サイクル後に starved の誤報になっていた)。
+                completed = bool(result.get(FULL_COMPLETED_KEY))
+                for stage in ledger.stages():
+                    if stage.startswith(prefix) and stage not in reached:
+                        if completed:
+                            ledger.forget(stage)
+                        else:
+                            ledger.record_missed(stage)
+        if kind == "full":
+            if isinstance(result, dict) and result.get(FULL_COMPLETED_KEY):
+                ledger.record_run("sleep.full")
+            else:
+                ledger.record_missed("sleep.full")
+            failed: dict[str, str] = {}
+            for entry in aux_failures or ():
+                reason = str(entry.get("reason") or "unknown")
+                if reason in _AUX_NON_FAILURE_REASONS:
+                    continue
+                purpose = str(entry.get("purpose") or "<unspecified>")
+                failed.setdefault(f"aux.{purpose}", reason)
+            for stage, reason in failed.items():
+                ledger.record_error(stage, code=reason, failure_class="transient")
+            for stage in ledger.stages():
+                if stage.startswith("aux.") and stage not in failed:
+                    ledger.clear_errors(stage)
+        episodic = getattr(worker, "episodic", None)
+        if episodic is not None:
+            ledger.record_size("store.episodic", len(episodic))
+        ledger.flush()
+    except Exception as e:  # noqa: BLE001 - 観測で sleep-time を落とさない
+        logger.warning("Liveness observation failed (%s): %s", kind, e)
 
 #: Trigger B のアイドル待ちの下限 (秒)。上限超過で残り 0 になっても、応答直後に
 #: 0 秒で起きると生成がまだ in-flight のまま ``chat_in_flight`` で弾かれ、次の応答が
@@ -481,6 +572,7 @@ class SleepTimeScheduler:
         success = False
         cancelled = False
         aux_failures: list[dict] = []
+        light_result: dict | None = None
         try:
             if self._worker is None:
                 success = True  # no-op は成功扱い
@@ -489,7 +581,7 @@ class SleepTimeScheduler:
             logger.info("Trigger A: starting Light sleep-time update (on_llm_start)")
             self._running = True
             with aux_failure_scope() as aux_failures:
-                await self._worker.run_light()
+                light_result = await self._worker.run_light()
             success = True
         except asyncio.CancelledError:
             logger.debug("Light task cancelled")
@@ -508,6 +600,8 @@ class SleepTimeScheduler:
                 extra={"cancelled": cancelled},
                 aux_failures=aux_failures,
             )
+            if self._worker is not None:
+                observe_sleep_liveness(self._worker, "light", light_result)
             trace_id_var.reset(token)
 
     def _full_deferred_seconds(self) -> float:
@@ -759,6 +853,7 @@ class SleepTimeScheduler:
         waiting_for_generation = False
         skipped_reason: str | None = None
         aux_failures: list[dict] = []
+        full_result: dict | None = None
         #: 後続タスクへ引き継いだか (引き継いだ側が完了通知を解決する)。
         handed_off = False
         try:
@@ -887,7 +982,7 @@ class SleepTimeScheduler:
             # None を渡し、run_full が Step 5.8-10 をクリーンスキップする。
             llm_for_sleep = self.resolve_sleep_client()
             with aux_failure_scope() as aux_failures:
-                await self._worker.run_full(llm_for_sleep)
+                full_result = await self._worker.run_full(llm_for_sleep)
             success = True
 
         except asyncio.CancelledError:
@@ -947,6 +1042,10 @@ class SleepTimeScheduler:
                 extra=extra,
                 aux_failures=aux_failures,
             )
+            if executed:
+                observe_sleep_liveness(
+                    self._worker, "full", full_result, aux_failures=aux_failures,
+                )
             trace_id_var.reset(token)
 
     # ── Level 1 独立常駐ループ (f_04 §5.3) ───────

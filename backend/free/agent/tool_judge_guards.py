@@ -160,6 +160,9 @@ class JudgeCall(GuardContext):
     #: 分類器ゲート (``_gate_allows``) の判定と kNN 票数。同じく context へ載せ、
     #: ゲートの較正を decision.jsonl だけで事後検証できるようにする。
     gate_diag: dict[str, Any] = field(default_factory=dict)
+    #: 規則層が ``calculate`` を選んだが式が取れず降格した (「BMIを計算して」)。
+    #: 層 5.95 の式合成が、クエリに数値が無くても会話の数値で式を組む手掛かり。
+    calculate_requested: bool = False
     #: ``_extract_file_path`` は fs stat を伴い、1 判定で最大 4 回同じ文字列に
     #: 対して呼ばれていた。引数文字列ごとに 1 度だけ引く。
     _file_paths: dict[str, str] = field(default_factory=dict, repr=False)

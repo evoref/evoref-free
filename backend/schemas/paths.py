@@ -143,6 +143,9 @@ class LocalPathsConfig(BaseModel):
     # 補助タスク purpose 別 timeout の反応的自己較正値 (model-keyed)。
     # AuxClient がタイムアウト観測から引き上げた天井を永続化する。
     aux_calibration_file: str = "local/aux_calibration.json"
+    # 効果の死活監視の台帳 (c_07 §7.1)。段ごとの到達・効果・失敗・判定の streak を
+    # 再起動を跨いで保つ。base モデルに依存しない運用状態なので resolve_local。
+    liveness_file: str = "local/liveness.json"
     lora_archive_dir: str = "local/lora_archive/"
     embed_lora_adapter: str = Field(
         default="local/models/embed_adapter.gguf",

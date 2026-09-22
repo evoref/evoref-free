@@ -16,13 +16,22 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable, Sequence
+from backend.free.core.script_ranges import (
+    HALFWIDTH_KATAKANA,
+    HIRAGANA,
+    JAPANESE,
+    KANA_BLOCKS,
+    KANJI,
+    KANJI_MARKS,
+    KATAKANA_WORD,
+)
 
 #: 日本語の語間に混じった空白。
 #:
 #: 正常な日本語では和文文字が空白で分かたれることはない (実測: Qwen3.5-9B 時代の
 #: 応答 96 件中 0 件)。一方 gemma-4-12b では 76〜83% に混入し、``temperature=0.0``
 #: の貪欲法でも再現した — サンプリングではなく出力分布そのものの性質。
-_JA_INTERWORD_SPACE_RE = re.compile(r"[ぁ-んァ-ヶ一-龥][ 　]+[ぁ-んァ-ヶ一-龥]")
+_JA_INTERWORD_SPACE_RE = re.compile(f"[{JAPANESE}][ 　]+[{JAPANESE}]")
 
 #: 語間空白を数える単位 (文 / 行)。
 #:
@@ -52,7 +61,7 @@ _JA_INTERWORD_SPACE_MIN_PER_SENTENCE = 2
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 
 #: 和文文字。応答が日本語かどうかの判定に使う。
-_JA_CHAR_RE = re.compile(r"[ぁ-んァ-ヶ一-龥]")
+_JA_CHAR_RE = re.compile(f"[{JAPANESE}]")
 
 #: 日本語判定の下限。これ未満の和文文字しか無い応答は英語応答等とみなし、
 #: 語間空白チェックの母数から外す (英文の空白を誤検出しないため)。
@@ -177,17 +186,30 @@ def has_chinese_token_leak(text: str) -> bool:
 _HEDGE_BEFORE_NUMBER = r"(?:[、,]\s*)?(?:およそ|約|おおよそ|ほぼ|だいたい|概ね)?\s*"
 
 _LABELED_NUMBER_RE = re.compile(
-    r"(?P<label>[0-9A-Za-z_ぁ-んァ-ヶーｦ-ﾟ一-龥]{2,24})"
+    f"(?P<label>[0-9A-Za-z_{HIRAGANA}{KATAKANA_WORD}"
+    f"{HALFWIDTH_KATAKANA}{KANJI}]{{2,24}})"
     r"\s*(?:は|が|＝|=|:|：|\bis\b|\bwas\b|\bwere\b|\bare\b)\s*"
     + _HEDGE_BEFORE_NUMBER
     + r"(?P<num>[0-9０-９][0-9０-９,，.]*)",
     re.IGNORECASE,
 )
 
+#: 助詞の無い「<ラベル><数値><単位>」(「身長172cm、体重78kgです」)。ユーザーは
+#: 自分の測定値をこの形で言うのが普通で、「<ラベル>は<数値>」しか拾わないと
+#: 会話中の値が 1 件も取れず、記憶の古い値が現在値として残った (2026-09-22
+#: ライブ監査の再検証)。量を担う単位に限るので「40代」「週3回」「第3章」は
+#: 当たらない。ラベルは語の文字だけ (数字・英字を含めない)。
+_LABELED_UNIT_NUMBER_RE = re.compile(
+    f"(?P<label>[{HIRAGANA}{KATAKANA_WORD}{HALFWIDTH_KATAKANA}{KANJI}]{{2,24}})"
+    r"(?P<num>[0-9０-９][0-9０-９,，.]*)\s*(?:kg|cm|mm|kcal|℃|度)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
 #: 「<ラベル>はいくらですか」型の問い。値は**次の応答**に現れるので、ラベルと
 #: 数値がメッセージをまたいで分かれる (実インシデントがまさにこの形だった)。
 _LABEL_QUESTION_RE = re.compile(
-    r"(?P<label>[0-9A-Za-z_ぁ-んァ-ヶーｦ-ﾟ一-龥]{2,24})"
+    f"(?P<label>[0-9A-Za-z_{HIRAGANA}{KATAKANA_WORD}"
+    f"{HALFWIDTH_KATAKANA}{KANJI}]{{2,24}})"
     r"\s*(?:は|が)\s*(?:いくつ|いくら|何|どれ(?:くらい|ほど)?|どのくらい)",
 )
 
@@ -291,9 +313,35 @@ def labeled_numeric_claims(text: str) -> dict[str, set[str]]:
     ラベルが数字だけのものは捨てる (「2026 は 8」のような偶発一致を拾わない)。
     """
     claims: dict[str, set[str]] = {}
-    for m in _LABELED_NUMBER_RE.finditer(_CODE_FENCE_RE.sub("\n", text or "")):
-        _add_claim(claims, m.group("label"), _normalize_number(m.group("num")))
+    body = _CODE_FENCE_RE.sub("\n", text or "")
+    for m in _LABELED_NUMBER_RE.finditer(body):
+        number = _adopted_number(body, m.end(), m.group("num"))
+        if number is not None:
+            _add_claim(claims, m.group("label"), number)
+    # 助詞の無い「体重78kg」。単位が量を担う場合に限る (「40代」「週3回」は拾わない)。
+    for m in _LABELED_UNIT_NUMBER_RE.finditer(body):
+        if all(_script_of(ch) == "hira" for ch in m.group("label")):
+            continue  # 「ではなく82kg」の「ではなく」は語ではない
+        number = _adopted_number(body, m.end(), m.group("num"))
+        if number is not None:
+            _add_claim(claims, m.group("label"), number)
     return claims
+
+
+def _adopted_number(body: str, end: int, raw: str) -> str | None:
+    """値の直後が打ち消しなら、打ち消しの後ろの値 (無ければ ``None``) を返す。
+
+    「体重は78kgではなく82kgでした」から 78 を確定値として拾い、訂正後の 82 を
+    捨てていた (2026-09-21 ライブ監査の再検証)。打ち消しは値の直後 (単位を挟む
+    だけ) に限る — 離れた位置の「ではない」は別の述語。
+    """
+    tail = body[end:end + 40]
+    rejected = _REJECTED_TAIL_RE.match(tail)
+    if rejected is None:
+        return _normalize_number(raw)
+    sentence = re.split(r"[。\n]", tail[rejected.end():], maxsplit=1)[0]
+    following = _FIRST_NUMBER_RE.search(sentence)
+    return _normalize_number(following.group(0)) if following else None
 
 
 def conversational_numeric_claims(
@@ -311,11 +359,18 @@ def conversational_numeric_claims(
     値は assistant 側にしか無かった。単文の抽出だけでは 1 件も拾えない。
     """
     claims: dict[str, set[str]] = {}
+    # ユーザーが自分で述べた値は、同じラベルのアシスタント側の値に勝ち、後の
+    # 発言が前の発言を置き換える。アシスタントが記憶を引いて「記録上は体重が
+    # 82kg」と触れただけで、ユーザーがこの会話で言った 78kg を押しのけて
+    # 「現在値」になっていた (2026-09-22 ライブ監査の再検証)。
+    user_claims: dict[str, set[str]] = {}
     pairs = list(messages or ())
     for role, content in pairs:
         if role != "system":
             for label, values in labeled_numeric_claims(content).items():
                 claims.setdefault(label, set()).update(values)
+                if role == "user":
+                    user_claims[label] = set(values)
     for (role, content), (next_role, next_content) in zip(pairs, pairs[1:]):
         if role != "user" or next_role != "assistant":
             continue
@@ -325,6 +380,7 @@ def conversational_numeric_claims(
         number = _normalize_number(answer.group(0))
         for m in _LABEL_QUESTION_RE.finditer(content or ""):
             _add_claim(claims, m.group("label"), number)
+    claims.update(user_claims)
     return claims
 
 
@@ -335,6 +391,12 @@ def conversational_numeric_claims(
 VALUE_REJECTION_RE = re.compile(
     r"(?:では?あり?ま?せん|ではなく|では無く|は誤り|は間違|"
     r"正しくありません|事実と異な|正確ではあ|ではないです|ではない)",
+)
+
+
+#: 値の直後 (単位など数文字を挟むだけ) に続く打ち消し。:func:`_adopted_number` 用。
+_REJECTED_TAIL_RE = re.compile(
+    r"[^0-9０-９、。,\n]{0,6}?(?:" + VALUE_REJECTION_RE.pattern + ")",
 )
 
 
@@ -886,7 +948,8 @@ _REQUEST_ENDING_RE = re.compile(
     # かったため、これらが依頼と判定されず ``(過去の記録)`` としてそのまま
     # 注入されていた (2026-09-04 ライブ監査 T06#1: 名前と趣味の想起に
     # 「3 つ目のケースが特に重要な理由を 2 文で。」が混入)。
-    r"|(?<=を)[一-龥ァ-ヶーA-Za-z0-9０-９々〆ヵヶ・ー\s]{1,12}[でに]"
+    rf"|(?<=を)[{KANJI}{KATAKANA_WORD}A-Za-z0-9０-９"
+    rf"{KANJI_MARKS}・\s]{{1,12}}[でに]"
     r"[。．.！!\s\"'」』）)]*\s*$"
     # 同じ形で **読点を挟む** もの (「〜を、それぞれ一言で。」)。目的語の
     # ``を`` の直後に読点が来る = 述語が省略された依頼で、副詞句 (それぞれ /
@@ -1362,7 +1425,7 @@ def fabricated_household_count(
 #: 語形を足す方向で塞いでよい (不変則 #12 / #14 の対象は開いた語彙)。
 _WRITE_CLAIM_RE = re.compile(
     r"(?P<path>(?:[A-Za-z]:[\\/])?[^\s、。「」『』（）()\[\]]*"
-    r"[A-Za-z0-9_\-぀-ヿ一-鿿][.][A-Za-z0-9]{1,8})"
+    rf"[A-Za-z0-9_\-{KANA_BLOCKS}{KANJI}][.][A-Za-z0-9]{{1,8}})"
     r"\s*(?:[をへに]|に対して)\s*"
     r"(?:[^\s、。]{0,8})?"
     r"(?:書き込|書き出|書きだ|保存|出力|作成|生成|エクスポート|セーブ)"
@@ -1691,6 +1754,39 @@ def ignores_calculate_result(response: str, result: float | None) -> str | None:
     return f"calculate result {result:g} does not appear in the answer"
 
 
+def misrounded_result_values(text: str, result: float | None) -> list[str]:
+    """``text`` の数値のうち、計算結果の近くにあるのに **その桁で丸めても一致しない** もの。
+
+    :func:`ignores_calculate_result` は 5% の幅で「使った」とみなすので、結果
+    27.7177 に対する「約27.8」は素通りする。実インシデント (2026-09-22 ライブ
+    監査の再検証): 前ターンに暗算で「BMIは約27.8」と答え、訂正後のターンで
+    calculate が 27.7177 を返しても、同じ「約27.8」を一字一句繰り返した。
+    値の桁 (小数 1 桁なら 0.1) で丸めた結果と比べるので、「約28」「27.7」は
+    一致扱い。対象は結果から最小桁 1 つぶん以内の数だけ — それより離れた数は
+    別の量 (「標準は25未満」) か、:func:`ignores_calculate_result` が扱う大外れ。
+
+    Returns:
+        丸めが合わない数値の原文 (出現順、重複なし)。
+    """
+    if result is None or result != result or result == 0:
+        return []
+    out: list[str] = []
+    for m in _RESPONSE_NUMBER_RE.finditer(_CODE_FENCE_RE.sub("\n", text or "")):
+        if m.group("unit"):
+            continue
+        raw = m.group("num")
+        try:
+            value = float(raw.replace(",", ""))
+        except ValueError:
+            continue
+        decimals = len(raw.split(".", 1)[1]) if "." in raw else 0
+        if abs(value - result) > 10 ** -decimals:
+            continue  # 最小桁 1 つぶんより離れた数は別の量 (基準値の 25 等)
+        if round(result, decimals) != round(value, decimals) and raw not in out:
+            out.append(raw)
+    return out
+
+
 def degenerate_correction(text: str) -> str | None:
     """「A と答えたが正しくは A」型の **成立していない訂正** を検出する。
 
@@ -1862,11 +1958,11 @@ _BANNED_SCRIPT_RE = re.compile(
 
 #: 文字種名 → その文字種にマッチする正規表現。
 _SCRIPT_PATTERNS: dict[str, "re.Pattern[str]"] = {
-    "カタカナ": re.compile(r"[ァ-ヶー]"),
-    "片仮名": re.compile(r"[ァ-ヶー]"),
-    "ひらがな": re.compile(r"[ぁ-ゖ]"),
-    "平仮名": re.compile(r"[ぁ-ゖ]"),
-    "漢字": re.compile(r"[一-鿿]"),
+    "カタカナ": re.compile(f"[{KATAKANA_WORD}]"),
+    "片仮名": re.compile(f"[{KATAKANA_WORD}]"),
+    "ひらがな": re.compile(f"[{HIRAGANA}]"),
+    "平仮名": re.compile(f"[{HIRAGANA}]"),
+    "漢字": re.compile(f"[{KANJI}]"),
     "英語": re.compile(r"[A-Za-z]"),
     "アルファベット": re.compile(r"[A-Za-z]"),
 }

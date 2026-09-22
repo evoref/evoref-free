@@ -18,6 +18,9 @@ from __future__ import annotations
 import re
 from collections import Counter
 from math import sqrt
+from backend.free.core.script_ranges import (
+    HIRAGANA,
+)
 
 
 def char_bigrams(text: str) -> Counter:
@@ -85,7 +88,7 @@ def bigram_coverage(base: str, other: str) -> float:
 #: 完全に分離する (真 0.866〜1.000 / 偽 0.000〜0.333)。
 #: ``ー`` (長音) は落とさない — カタカナ語の一部で、内容語側の情報を持つ。
 _JA_FUNCTION_CHARS_RE = re.compile(
-    r"[ぁ-ん\s、。，．！？!?…「」『』（）()・:：;；,.\-–—]+",
+    rf"[{HIRAGANA}\s、。，．！？!?…「」『』（）()・:：;；,.\-–—]+",
 )
 
 

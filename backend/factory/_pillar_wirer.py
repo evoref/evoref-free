@@ -2821,6 +2821,24 @@ async def _setup_pro_knowledge(state: AppState, cfg: dict) -> None:
         logger.warning("Pro knowledge setup failed: %s", e)
 
 
+def _bind_liveness_ledger(base: Any) -> None:
+    """保存先付きの死活監視台帳を読み込み、プロセス既定へ差し替える。
+
+    前回の streak を読み戻すので「何サイクル効果ゼロか」が再起動を跨いで続く。
+    読み込みの失敗 (壊れたファイル / 未対応の新しい版) は JsonStateStore が
+    WARNING を出して空で始める — 監視の失敗で起動は止めない。
+    """
+    from backend.liveness import LivenessLedger, bind_ledger
+
+    path = base.resolver.resolve_local("liveness_file")
+    ledger = LivenessLedger(path)
+    ledger.load_from_disk()
+    bind_ledger(ledger)
+    logger.info(
+        "Liveness ledger bound: %s (%d stage(s) restored)", path, len(ledger.stages()),
+    )
+
+
 async def wire_pillars(
     state: AppState, project_root: Path,
 ) -> tuple[_LifespanContext, dict[str, float]]:
@@ -2845,6 +2863,10 @@ async def wire_pillars(
     # Base (横断基盤)
     with _timed(timings, "pillar_base"):
         base = await _build_base_context(state, project_root, timings)
+
+    # 効果の死活監視の台帳 (c_07 §7.1)。どの pillar の構築より前に差し替える —
+    # 判定点の warmup や sleep-time の初回サイクルの記録も保存先付きの台帳へ入る。
+    _bind_liveness_ledger(base)
 
     # 旧モード名 "coding" → "create" の一度きり移行。パーティション有効化より前に
     # 行い、以降のパス解決 (prompts/<mode>.md や <stem>/<mode>/) が現行名で当たる

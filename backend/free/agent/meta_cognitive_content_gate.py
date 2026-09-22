@@ -23,6 +23,10 @@ from backend.free.agent.meta_cognitive_scaffold import (
     _TASK_SCAFFOLD_LINE_RE,
     looks_like_task_log_echo,
 )
+from backend.free.core.script_ranges import (
+    KANA_BLOCKS,
+    KANJI,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +89,7 @@ _PATH_ONLY_RE = re.compile(
     r"[\"'`]?$",
 )
 #: パス判定から除外する文字 (日本語が含まれていれば散文と見なす)。
-_CJK_RE = re.compile(r"[぀-ヿ一-鿿]")
+_CJK_RE = re.compile(f"[{KANA_BLOCKS}{KANJI}]")
 
 
 def looks_like_path_not_content(content: str, file_path: str) -> bool:

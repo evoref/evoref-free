@@ -54,6 +54,7 @@ from backend.free.core.text_quality import (
     has_broken_ja_spacing,
     has_chinese_token_leak,
     ignores_calculate_result,
+    misrounded_result_values,
     is_cut_off_answer,
     retracts_own_conclusion,
     value_was_adopted,
@@ -1403,6 +1404,15 @@ class FeedbackCollector:
         if ignored is not None:
             logger.info("Turn marked failed (%s)", ignored)
             return "failed", f"tool result ignored: {ignored}"
+        # 5% の幅では「約27.8」(結果 27.7177) が「使った」扱いになる。丸め違いの
+        # 値は前ターンの暗算の複写で、成功として学習させない (2026-09-22)。
+        misrounded = misrounded_result_values(text, calculate_result)
+        if misrounded:
+            logger.info("Turn marked failed (calculate result misrounded: %s)", misrounded)
+            return "failed", (
+                f"tool result ignored: {', '.join(misrounded)} does not round "
+                f"from {calculate_result:g}"
+            )
         # date_intent が組んだツール結果 (``target:`` 行) を渡したのに本文が
         # 別の日付を述べている = calculate と同じ構造の矛盾。ツールが向きの
         # 補正 (逆算) を正しく踏んでも、モデルが結果を暗算で差し替える経路は

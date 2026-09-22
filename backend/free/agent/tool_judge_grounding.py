@@ -70,7 +70,9 @@ def _ungrounded_numbers(
     known = _known_numbers(query) | _known_numbers(context)
     known.update(_UNIT_SYSTEM_CONSTANTS)
     seen: list[str] = []
-    for n in _NUMBER_LITERAL_RE.findall(expression):
+    # 冪の指数 (``x ** 2``) は式の構造が要求する値で、対話の数値ではない
+    # (BMI = 体重 / 身長 ** 2。2026-09-21 ライブ監査の再検証で棄却されていた)。
+    for n in _NUMBER_LITERAL_RE.findall(_POWER_EXPONENT_RE.sub("", expression)):
         if n not in known and n not in seen:
             seen.append(n)
     return tuple(seen)
@@ -128,6 +130,14 @@ _MYRIAD_SEQUENCE_RE = re.compile(
 )
 
 _WEEKDAY_ORDER = "月火水木金土日"
+#: SI 接頭辞付きの長さ / 質量 (``172cm`` / ``500g`` / ``3km`` は対象外 — km は
+#: 基本単位への換算が乗算になり、式側でも 1000 を使うので定数で足りる)。
+_METRIC_PREFIX_DIVISORS: dict[str, float] = {"cm": 100.0, "mm": 1000.0, "g": 1000.0}
+_METRIC_PREFIXED_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(cm|mm|g)(?![a-zA-Z])", re.IGNORECASE)
+
+#: ``** 2`` のような冪の指数 (整数リテラル)。
+_POWER_EXPONENT_RE = re.compile(r"\*\*\s*\d+")
+
 _WEEKDAY_RANGE_RE = re.compile(
     r"([月火水木金土日])\s*(?:曜日?)?\s*(?:〜|～|-|–|から)\s*([月火水木金土日])\s*(?:曜日?)?",
 )
@@ -161,7 +171,24 @@ def _known_numbers(text: str) -> set[str]:
             known.add(f"{value:.2f}")
     known.update(_duration_derived_numbers(text))
     known.update(_myriad_derived_numbers(text))
+    known.update(_metric_prefix_derived_numbers(text))
     return known
+
+
+def _metric_prefix_derived_numbers(text: str) -> set[str]:
+    """SI 接頭辞付きの量を基本単位へ直した値を集める (純粋関数)。
+
+    ``172cm`` → ``1.72`` (m)。BMI の式は身長を m で使うので、式に現れるのは
+    クエリに書かれた 172 ではない (2026-09-21 ライブ監査の再検証で
+    ``82 / (1.72 ** 2)`` が ungrounded として棄却された)。センチ = 1/100 は
+    接頭辞の **定義** で、``_UNIT_SYSTEM_CONSTANTS`` の ``0.01`` と同じ扱い。
+    """
+    derived: set[str] = set()
+    for num, unit in _METRIC_PREFIXED_RE.findall(text):
+        value = float(num) / _METRIC_PREFIX_DIVISORS[unit.lower()]
+        derived.add(f"{value:g}")
+        derived.add(f"{value:.2f}")
+    return derived
 
 
 def _myriad_derived_numbers(text: str) -> set[str]:

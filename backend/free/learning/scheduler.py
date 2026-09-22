@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from backend.i18n_helper import msg
 from backend.io import atomic_write_text
+from backend.liveness import ledger as liveness_ledger
 from backend.log_config import get_logger
 from backend.policy_helpers import get_policy_value
 from backend.utils import utc_now
@@ -643,6 +644,15 @@ class LearningScheduler:
                 self._level2_no_improve_streak.get(target, 0) + 1
             )
         self._save_state()
+        # 死活監視 (c_07 §7.1)。判定不能 (None = early return / 例外) は失敗として
+        # 数える — cvector 生成がクラッシュし続けても成功扱いのまま気づけなかった。
+        ledger = liveness_ledger()
+        stage = f"learn.level2.{target}"
+        if improved is None:
+            ledger.record_error(stage, code="no_outcome")
+        else:
+            ledger.record_run(stage, effect=1 if improved else 0)
+        ledger.flush()
 
     def defer_level2(self, target: str = "base", *, seconds: float = 3600.0) -> None:
         """target の Level 2 を ``seconds`` 後まで見送る (環境不調の短い再試行間隔)。
@@ -1362,6 +1372,20 @@ class LearningScheduler:
             **{k: v for k, v in side_results.items() if k == "policy_params"},
         }
         self._save_state()
+        # 死活監視 (c_07 §7.1)。この経路は _level1_finalize を通らないので、ここで
+        # 記録しないと「全モードで選択圧ゼロ」が台帳から見えない — 過去の監査で
+        # 繰り返し出た「Level 1 が空回りする」はまさにこの経路 (2026-09-21 実機:
+        # 経験 21 件を消費して実行時刻だけ進み、台帳には何も残らなかった)。
+        self._record_level1_liveness(
+            session.experience_snapshot,
+            {
+                **{
+                    mode: info for mode, info in skipped.items()
+                    if isinstance(info, dict)
+                },
+                **{k: v for k, v in side_results.items() if k == "policy_params"},
+            },
+        )
         logger.info(
             "Level 1 skipped: no selection pressure in any mode (%s); "
             "%d experience(s) consumed, few-shot pool updated",
@@ -1455,6 +1479,10 @@ class LearningScheduler:
             )
             skipped[mode] = {
                 "improved": False, "skipped": True, "reason": reason,
+                # モード別の経験数。死活監視の入力件数に使う — 全モード合計を
+                # 入れると、経験 0 件のモード (create を使わない利用者) まで
+                # 「入力があるのに効果ゼロ」に数えて stalled を誤報する。
+                "experiences": len(mode_exp),
             }
         return kept, skipped
 
@@ -2929,6 +2957,48 @@ class LearningScheduler:
         self._append_fitness_history(results)
         self._snapshot_rates(experiences)
         self._save_state()
+        self._record_level1_liveness(experiences, results)
+
+    @staticmethod
+    def _record_level1_liveness(
+        experiences: list[dict], results: dict[str, dict],
+    ) -> None:
+        """フェーズごとの効果を死活監視の台帳へ (c_07 §7.1)。
+
+        入力 = 経験件数、効果 = 改善を採用したか。``skipped`` (対象が無くて何も
+        していない) も効果 0 として数える — 2026-09-21 に generation param 進化が
+        経験 161 件で一度も発火していなかったのは、毎回 skipped だったから。
+        ``_`` で始まるキーと、``improved`` / ``skipped`` を持たない付随記録
+        (``fewshot_gc`` 等) はフェーズではないので数えない。``policy_params`` の
+        ようにドメイン別に 1 段入れ子になった結果は、ドメインごとの段にする。
+        """
+        ledger = liveness_ledger()
+        for phase, val in results.items():
+            if phase.startswith("_") or not isinstance(val, dict):
+                continue
+            if "improved" in val or val.get("skipped"):
+                entries = {f"learn.level1.{phase}": val}
+            else:
+                entries = {
+                    f"learn.level1.{phase}.{sub}": child
+                    for sub, child in val.items()
+                    if isinstance(child, dict)
+                    and ("improved" in child or child.get("skipped"))
+                }
+            for stage, entry in entries.items():
+                reason = entry.get("reason")
+                # 段がモード別の経験数を持っていればそれを入力件数にする
+                # (``_drop_modes_without_selection_pressure`` の skipped 記録)。
+                per_mode = entry.get("experiences")
+                ledger.record_run(
+                    stage,
+                    effect=1 if entry.get("improved") else 0,
+                    input_count=(
+                        per_mode if isinstance(per_mode, int) else len(experiences)
+                    ),
+                    reason=str(reason) if reason else None,
+                )
+        ledger.flush()
 
     def _level1_log_debug(
         self,

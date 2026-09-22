@@ -639,18 +639,61 @@ def excerpt_continuation_content(existing: str) -> str:
 
 
 def excerpt_for_expand(existing_content: str) -> str:
-    """EXPAND/SPLIT モード用に既存テキストを抜粋する (冒頭 2000 + 末尾 2000 char)。
+    """EXPAND/SPLIT モード用に既存テキストを抜粋する (4000 char 上限、見出し単位で均等)。
 
     継続モード (500+800=1300) より広く取り、planner が機能境界を識別できる
     解像度を確保する。plan ``max_tokens=1024`` 制約とのバランスで 4000 char 上限。
+    以前は冒頭 2000 + 末尾 2000 字で、中盤の節 (データモデル / 入力検証) が
+    ちょうど落ちた (2026-09-21 ライブ監査 K01、f_08 §2.2)。
     """
-    if len(existing_content) <= 4000:
-        return existing_content
-    return (
-        existing_content[:2000]
-        + "\n\n[...中略...]\n\n"
-        + existing_content[-2000:]
-    )
+    return condense_design_doc(existing_content, 4000)
+
+
+_MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}\s", re.MULTILINE)
+_CONDENSED_MARK = "\n…(中略)…"
+
+
+def condense_design_doc(text: str, max_chars: int) -> str:
+    """設計書を ``max_chars`` 以内へ **見出し単位で均等に** 縮める (純粋関数)。
+
+    見出し行はすべて残し、本文の予算を節の数で割る。短い節が使い切らなかった
+    分は長い節へ回す (水位の均等化)。冒頭 + 末尾だけを残す切り方だと中盤の
+    節が丸ごと消える (f_10 §2 / f_08 §2.2)。見出しが無い文書は先頭から切る。
+    """
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    starts = [m.start() for m in _MARKDOWN_HEADING_RE.finditer(text)]
+    if not starts:
+        return text[:max_chars]
+    if starts[0] != 0:
+        starts.insert(0, 0)
+    chunks = [text[a:b] for a, b in zip(starts, [*starts[1:], len(text)])]
+    heads: list[str] = []
+    bodies: list[str] = []
+    for chunk in chunks:
+        if _MARKDOWN_HEADING_RE.match(chunk):
+            head, _, body = chunk.partition("\n")
+            heads.append(head + "\n")
+            bodies.append(body)
+        else:
+            heads.append("")
+            bodies.append(chunk)
+    budget = max_chars - sum(len(h) for h in heads) - len(chunks) * len(_CONDENSED_MARK)
+    if budget <= 0:
+        return "".join(heads)[:max_chars]
+    alloc = [0] * len(bodies)
+    remaining = len(bodies)
+    for i in sorted(range(len(bodies)), key=lambda k: len(bodies[k])):
+        share = budget // remaining
+        alloc[i] = min(len(bodies[i]), share)
+        budget -= alloc[i]
+        remaining -= 1
+    out = []
+    for head, body, n in zip(heads, bodies, alloc):
+        kept = body if n >= len(body) else body[:n].rstrip() + _CONDENSED_MARK + "\n\n"
+        out.append(head + kept)
+    return "".join(out)
 
 
 # ── 計画の最大ユニット数 / 生成順序 ──

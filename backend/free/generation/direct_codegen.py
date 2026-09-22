@@ -22,7 +22,7 @@ import logging
 import re
 
 from backend.free.core.prompt_blocks import split_shared_context
-from backend.free.generation.validators import remove_code_fences
+from backend.free.generation.validators import is_degenerate_repetition, remove_code_fences
 from backend.free.llm.utils import extract_content
 
 logger = logging.getLogger("backend.free.generation.direct_codegen")
@@ -37,6 +37,19 @@ _SYSTEM_PROMPT = (
 
 # 切断時の再生成で許す max_tokens 上限。
 _MAX_TOKENS_CEILING = 16384
+
+#: 反復ループで切れた出力を作り直すときの温度の下限。
+_LOOP_RETRY_TEMPERATURE = 0.6
+
+#: 反復の判定から外す拡張子 (データ / 文書は正当な反復構造を持つ)。
+_REPETITIVE_BY_NATURE_SUFFIXES = (".json", ".csv", ".tsv", ".yaml", ".yml", ".md", ".txt", ".svg")
+
+
+def _looping(code: str, file_path: str) -> bool:
+    """切れた出力が反復ループか (データ / 文書ファイルは判定しない)。"""
+    if file_path.lower().endswith(_REPETITIVE_BY_NATURE_SUFFIXES):
+        return False
+    return is_degenerate_repetition(code)
 
 # 非ストリーミング呼び出しの per-request タイムアウト算出パラメータ。
 # LocalClient の既定タイムアウト (120s) は decode 速度の速い環境向けで、iGPU 等
@@ -215,15 +228,29 @@ async def generate_single_file(
     # 最終的に「コードが生成されませんでした」まで至っていた)。
     if _finish_reason(resp) == "length" and not code_from_salvage:
         retry_tokens = min(max_tokens * 2, _MAX_TOKENS_CEILING)
-        if retry_tokens > max_tokens:
+        retry_temperature = temperature
+        if _looping(code, file_path):
+            # 反復ループで上限に達した出力。倍の上限で作り直すとループが倍の時間
+            # 続きうるので、同じ上限・高めの温度で 1 回だけ作り直す (2026-09-22
+            # 実機 K04: storage.js が 4096 トークンぶん 7.9 分ループした。同じ
+            # プロンプトでもループは再現しなかったので、作り直し自体は有効)。
+            retry_tokens = max_tokens
+            retry_temperature = max(temperature, _LOOP_RETRY_TEMPERATURE)
+            logger.warning(
+                "direct codegen hit max_tokens=%d in a repetition loop for %s; "
+                "regenerating at the same budget with temperature %.1f",
+                max_tokens, file_path, retry_temperature,
+            )
+        elif retry_tokens > max_tokens:
             logger.warning(
                 "direct codegen truncated at max_tokens=%d for %s; "
                 "regenerating at %d", max_tokens, file_path, retry_tokens,
             )
+        if retry_tokens > max_tokens or retry_temperature != temperature:
             try:
                 resp2 = await client.generate(
                     messages, stream=False, max_tokens=retry_tokens,
-                    temperature=temperature, id_slot=client.longform_slot,
+                    temperature=retry_temperature, id_slot=client.longform_slot,
                     request_timeout=request_timeout,
                 )
                 retry_code, retry_from_salvage = _extract_code(resp2, file_path)
@@ -242,7 +269,11 @@ async def generate_single_file(
                         retry_tokens, file_path,
                     )
                     return {}
-                if retry_code and len(retry_code) > len(code):
+                # 作り直しが完結したら長さに関係なくそれを採る。「長い方」を
+                # 採っていたため、切れたループ出力 (9942 字) が正常終了した
+                # 作り直し (5947 字) に勝ち、構文エラーで捨てられた (2026-09-22
+                # 実機 K04)。
+                if retry_code.strip():
                     code = retry_code
             except Exception as exc:
                 logger.warning(

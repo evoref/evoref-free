@@ -36,6 +36,13 @@ from backend.free.learning.fitness import (
     signal_is_defect,
 )
 from backend.free.learning.level1_session import Level1Session
+from backend.free.core.script_ranges import (
+    HIRAGANA_BLOCK,
+    KANA_BLOCKS,
+    KANJI,
+    KANJI_COMPAT,
+    KANJI_EXT_A,
+)
 
 logger = get_logger("optimizer.prompt_evolver")
 
@@ -290,8 +297,10 @@ def _apply_prompt_edit(current: str, op: str, anchor: str, text: str) -> str | N
 # 漢字・カタカナを含む内容語だけを残す。
 _ASCII_WORD_RE = re.compile(r"[a-z0-9_]{3,}")
 # U+3040-30FF (ひらがな/カタカナ) U+3400-4DBF U+4E00-9FFF (漢字) U+F900-FAFF (互換漢字)
-_CJK_RUN_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿]+")
-_HIRAGANA_ONLY_RE = re.compile(r"^[぀-ゟ]+$")
+_CJK_RUN_RE = re.compile(
+    f"[{KANA_BLOCKS}{KANJI_EXT_A}{KANJI}{KANJI_COMPAT}]+",
+)
+_HIRAGANA_ONLY_RE = re.compile(f"^[{HIRAGANA_BLOCK}]+$")
 
 
 def _extract_query_terms(text: str) -> set[str]:

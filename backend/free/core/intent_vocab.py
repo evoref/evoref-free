@@ -21,6 +21,13 @@ import できない) を越えずに済むよう、どの pillar にも属さな
 from __future__ import annotations
 
 import re
+from backend.free.core.script_ranges import (
+    HALFWIDTH_KATAKANA,
+    HIRAGANA,
+    KANJI,
+    KATAKANA,
+    KATAKANA_WORD,
+)
 
 # ─────────────────────────────────────────────────────────────────────
 # ファイルパス
@@ -128,7 +135,7 @@ _REQUEST_TAIL_RE = re.compile(
     # 撥音便・イ音便のテ形は「で」で終わる (「読んで」「繋いで」)。取りこぼすと
     # 依頼文が候補から落ちる — 依頼を **広めに拾う** 方が安全側 (絞りすぎると
     # 既存の意図検出が沈黙する)。
-    r"|[ぁ-んァ-ヴ一-龥][てで])"
+    f"|[{HIRAGANA}{KATAKANA}{KANJI}][てで])"
     r"[ねよな]?[。．！？!?、,]?\s*$",
 )
 _REQUEST_HEAD_EN_RE = re.compile(
@@ -464,7 +471,7 @@ SESSION_ANCHOR_JA = (
     # 経緯も指すので、従来どおり会話名詞との組でだけアンカーにする。
     r"(?:この会話|このやり取り|このセッション|この対話"
     r"|(?:今|ここ|これ)までの(?:会話|やり取り|対話|セッション)"
-    r"|ここまで(?:の|で)"
+    r"|ここまで(?:の|で|を)"
     r"|今日の(?:追加分の)?会話|今回の(?:追加分の)?会話)"
 )
 
@@ -1278,7 +1285,8 @@ def names_file_target(query: str) -> bool:
 #: 数値として確定しているかどうかは呼出側が実データに問い合わせて決める。
 _ESTABLISHED_QUANTITY_REF_RE = re.compile(
     r"(?:同じ|その|この|先ほどの|さっきの|上記の)\s*"
-    r"(?P<quantity>[ぁ-んァ-ヶーｦ-ﾟ一-龥A-Za-z]{2,12}?)\s*(?:を|で|に|は|が)",
+    rf"(?P<quantity>[{HIRAGANA}{KATAKANA_WORD}{HALFWIDTH_KATAKANA}{KANJI}"
+    rf"A-Za-z]{{2,12}}?)\s*(?:を|で|に|は|が)",
 )
 
 
@@ -1701,13 +1709,14 @@ CALCULATION_CUE_RE = re.compile(
     # ありま`` だけでは受からなかった (実インシデント 2026-08-08 ライブ監査:
     # 「時速240kmで2時間30分走ると何km進みますか。」が手掛かり語なしと判定
     # され、base の暗算で 540km と誤答。正解は 600km)。
-    r"|何[ぁ-んァ-ヴーA-Za-z一-龥%％]{0,6}?(?:です|でしょ|になり|かかり|ありま|ます)"
+    f"|何[{HIRAGANA}{KATAKANA_WORD}A-Za-z{KANJI}%％]{{0,6}}?"
+    f"(?:です|でしょ|になり|かかり|ありま|ます)"
     # 丁寧形を列挙しても辞書形が漏れる。「何<単位>...？」と疑問符で閉じる形は
     # 文末表現に依らず受ける (実インシデント 2026-08-12 ライブ監査:
     # 「時速72km で 45 分走ると何 km 進む？」が手掛かり語なしと判定され、
     # ツール判定に一度も到達せず base の暗算で 6km と誤答。正解は 54km)。
     # 数値ゼロのクエリ (「これは何？」) は後段の数値チェックで落ちる。
-    r"|何[ぁ-んァ-ヴーA-Za-z一-龥%％\s]{0,8}?[?？]"
+    rf"|何[{HIRAGANA}{KATAKANA_WORD}A-Za-z{KANJI}%％\s]{{0,8}}?[?？]"
     r"|合計|総額|平均|割合|求め|計算"
     r"|(?<![A-Za-z])how\s+(?:much|many)(?![A-Za-z])"
     r"|(?<![A-Za-z])what\s+is(?![A-Za-z])|(?<![A-Za-z])total(?![A-Za-z]))",
@@ -2333,7 +2342,7 @@ DATETIME_QUERY_RE = re.compile(
     # 日付であって今日ではない (同 (g): 「発表の日付とテーマを確認させて
     # ください」で now-only コマンドが撃たれ、答えの隣にツール結果が並んだ)。
     # 「今日の / 本日の / 現在の / 今の / いまの」だけを例外にする。
-    r"|(?:(?<![一-鿿の])|(?<=現在)|(?<=本日)|(?<=今)"
+    f"|(?:(?<![{KANJI}の])|(?<=現在)|(?<=本日)|(?<=今)"
     r"|(?<=今日の)|(?<=本日の)|(?<=現在の)|(?<=今の)|(?<=いまの)|(?<=todayの)|(?<=today の))"
     r"(?:日時|日付)(?!型|形式|フォーマット|カラム|列)|時刻(?!表)"
     # 「何日間」は ``何日(?!間)`` で意図的に外している (「有給は何日間？」の
@@ -2839,6 +2848,20 @@ EXECUTABLE_QUERY_TERM_GROUPS_EN: tuple = (
 )
 
 #: グループごとの compile 済みパターン列 (``_TOOL_PATTERNS`` / router 用)。
+#: 「コマンドを実行して」系。router の ``TOOL_PATTERNS`` と tool_judge_signals の
+#: ``_TOOL_PATTERNS`` / ``_TOOL_PATTERNS_EN`` が同じ literal を 3 箇所へ書き写して
+#: いた (2026-09-21)。片方だけ語を足すと判定がずれるので、ここを SSOT にする。
+#: 「〜について」系の話題提示。router の知識質問ゲートと tool_judge_signals の
+#: 参照シグナルが同じ literal を書き写していた (2026-09-21)。
+TOPIC_REFERENCE_RE: re.Pattern = re.compile(r"(?:について|に関して|に関する)", re.IGNORECASE)
+
+#: 数量の手掛かり (算用数字 or 漢数字)。日付演算の意図判定 (agent) と
+#: 想起側の日付演算スキップ (memory) が同じ literal を持っていた
+#: (2026-09-21)。漢数字を片方にだけ足すと、判定が非対称になる。
+NUMERAL_HINT_RE: re.Pattern = re.compile(r"\d|[一二三四五六七八九十百千]")
+
+COMMAND_EXECUTION_RE: re.Pattern = re.compile(r"(?:コマンド|command).*(?:実行|run)", re.IGNORECASE)
+
 EXECUTABLE_QUERY_PATTERNS_JA: list[re.Pattern] = _compile_groups(
     EXECUTABLE_QUERY_TERM_GROUPS_JA,
 )

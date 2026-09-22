@@ -56,6 +56,48 @@ _RUNAWAY_TOKEN_RE = re.compile(
 )
 
 
+#: 退化反復の判定 (:func:`is_degenerate_repetition`)。窓の増分圧縮比 (それまでの
+#: 出力を辞書にしたときの新しい窓 1 バイトあたりの増分) がこれ未満の窓が
+#: ``_DEGENERATE_WINDOWS`` 個続けば反復ループ。実測 (2026-09-23): ループした
+#: storage.js 0.02、正常な生成物 83 件の最小 0.058 (spec.md)、コード / テストは
+#: 0.079 以上。
+_DEGENERATE_RATIO = 0.04
+_DEGENERATE_WINDOW = 2000
+_DEGENERATE_STEP = 500
+_DEGENERATE_WINDOWS = 3
+_DEGENERATE_MIN_CHARS = 3000
+
+
+def is_degenerate_repetition(text: str) -> bool:
+    """出力の末尾が反復ループ (同じ内容の言い換えの繰り返し) に陥っているか。
+
+    行単位の :func:`collapse_runaway_repetition` は完全一致の行しか拾わず、
+    ``PAYLOAD_TYPE_CAMEL_UPPER9`` のように少しずつ違う行の繰り返しを見逃す
+    (2026-09-22 実機 K04: storage.js が出力上限まで 7.9 分ループした)。
+    窓単体の圧縮比は周期が窓より長いループを見逃し、日本語の多いデータで
+    誤検知するため、それまでの出力を辞書にした **増分** 圧縮比で見る。
+    データファイル (JSON / CSV 等) は正当な反復構造なので呼出側で対象外にする。
+    """
+    import zlib
+
+    if not text or len(text) < _DEGENERATE_MIN_CHARS:
+        return False
+    data = text.encode("utf-8")
+
+    def size(b: bytes) -> int:
+        return len(zlib.compress(b, 9))
+
+    ends = [len(data) - k * _DEGENERATE_STEP for k in range(_DEGENERATE_WINDOWS)]
+    for end in ends:
+        start = end - _DEGENERATE_WINDOW
+        if start <= 0:
+            return False
+        ratio = (size(data[:end]) - size(data[:start])) / (end - start)
+        if ratio >= _DEGENERATE_RATIO:
+            return False
+    return True
+
+
 def collapse_runaway_repetition(text: str) -> str:
     """LLM の退化出力 (反復暴走) を切除する。
 

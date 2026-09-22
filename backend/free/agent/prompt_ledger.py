@@ -35,6 +35,10 @@ from backend.free.agent.prompt_utils import PROTECTED_CLOSE, PROTECTED_OPEN
 from backend.io import atomic_write_text
 from backend.log_config import get_logger
 from backend.utils import estimate_tokens
+from backend.free.core.script_ranges import (
+    KANA_BLOCKS,
+    KANJI,
+)
 
 logger = get_logger("agent.prompt_ledger")
 
@@ -102,7 +106,7 @@ def normalize_text(text: str) -> str:
 
 
 def _slug(text: str) -> str:
-    base = re.sub(r"[^0-9A-Za-z぀-ヿ一-鿿]+", "_", text or "").strip("_")
+    base = re.sub(f"[^0-9A-Za-z{KANA_BLOCKS}{KANJI}]+", "_", text or "").strip("_")
     return base[:24] or "x"
 
 

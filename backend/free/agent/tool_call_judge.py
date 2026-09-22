@@ -36,6 +36,7 @@ from backend.free.core.date_math_cue import (
     conversation_has_date_math_cue,
     last_user_query,
 )
+from backend.free.core.correction_target import wrong_side_spans
 from backend.free.core.locale_patterns import select_locale_variant
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.safety_patterns import (
@@ -224,6 +225,7 @@ from backend.free.agent.tool_judge_history import (
     history_day_window,
 )
 from backend.free.agent import tool_judge_guards as guards
+from backend.free.core.intent_vocab import NUMERAL_HINT_RE
 from backend.free.agent.tool_judge_guards import (
     _COMMAND_TOOL_NAMES,
     _MODE_CAPABILITY_SIBLINGS,
@@ -292,7 +294,6 @@ _DATE_INTENT_UNAVAILABLE = object()
 _DATE_INTENT_LITERAL_DATE_RE = re.compile(
     r"\d{1,2}\s*月\s*\d{1,2}\s*日|(?<![\d/-])\d{1,2}/\d{1,2}(?![\d/-])|\d{4}-\d{2}-\d{2}",
 )
-_DATE_INTENT_QUANTITY_RE = re.compile(r"\d|[一二三四五六七八九十百千]")
 _DATE_INTENT_CONTEXT_CHARS = 300
 
 
@@ -342,6 +343,21 @@ def _first_quoted_span(query: str) -> str | None:
 
 #: 「今日の会話」を日付窓で引くときの件数上限 (1 日のセッション数に足りる数)。
 _HISTORY_DAY_SCOPE_LIMIT = 30
+
+
+def _replaces_dialogue_value(query: str, dialogue: str) -> bool:
+    """クエリが会話に既出の数値を「誤り」として差し替えているか (純粋関数)。
+
+    「誤りの側」は訂正宛先と同じ :func:`wrong_side_spans` で取る (判定の同一性)。
+    その区間の数値が会話に書かれていれば、クエリの数値は旧値と新値の組で、
+    計算の被演算子は会話側にもある。
+    """
+    known = _known_numbers(dialogue.replace(query, ""))
+    return any(
+        n in known
+        for span in wrong_side_spans(query)
+        for n in NUMBER_LITERAL_RE.findall(span)
+    )
 
 
 class ToolCallJudge:
@@ -837,12 +853,12 @@ class ToolCallJudge:
             # 数量が無く、ここで落ちて暗算 (10/16、正 10/19) に残った
             # (2026-09-09 ライブ監査 (e) E-03)。
             quantity_source = call.query or ""
-            if not _DATE_INTENT_QUANTITY_RE.search(quantity_source):
+            if not NUMERAL_HINT_RE.search(quantity_source):
                 quantity_source += " " + last_user_query(
                     call.conversation, before=call.query or "",
                 )
             # 「来月の営業日数は」は数字を持たないが月そのものが数量 (F-01)。
-            if not _DATE_INTENT_QUANTITY_RE.search(quantity_source) and (
+            if not NUMERAL_HINT_RE.search(quantity_source) and (
                 month_business_days_from_query(
                     call.query or "", utc_now_dt().astimezone().date(),
                 ) is None
@@ -982,7 +998,7 @@ class ToolCallJudge:
         fresh_computation = bool(
             query_has_date_math_cue(query_text)
             and (
-                _DATE_INTENT_QUANTITY_RE.search(query_text)
+                NUMERAL_HINT_RE.search(query_text)
                 or month_count is not None
                 or nth_weekday is not None
             )
@@ -1309,6 +1325,7 @@ class ToolCallJudge:
         if result.tool_needed and result.tool_name:
             await self._maybe_recall_url(result, query, mode=mode)
             self._maybe_scope_session_search(result, query, session_id)
+            call.calculate_requested = result.tool_name == "calculate"
             result = self._finalize(result, call=call)
             if result.tool_needed:
                 self._log_tool_decision(result, "rule_pattern_matched", call)
@@ -1671,13 +1688,28 @@ class ToolCallJudge:
         # tool_grounded 無し。2026-09-10 ライブ監査 (i) I-06)。数値が 2 つ
         # 未満なら会話側の被演算子が要るので合成に回す。会話に無い数値は
         # ``_ungrounded_numbers`` が捨てるので、範囲を広げても捏造は通らない。
+        #
+        # ただし訂正で値を差し替える問い (「体重は78kgではなく82kgでした。BMIを
+        # 計算し直して」) は、クエリの数値が「旧値と新値」で、残りの被演算子
+        # (身長) は会話にしかない。分類器は no_tool を返して暗算に落ち、BMI・
+        # 貯金可能額・総勉強時間をそれぞれ誤答した (2026-09-21 ライブ監査
+        # C03/C07/C09 の訂正ターン)。
         query_numbers = NUMBER_LITERAL_RE.findall(query)
-        if len(query_numbers) >= 2:
+        if len(query_numbers) >= 2 and not _replaces_dialogue_value(
+            query, call.dialogue_text,
+        ):
             return None
-        if not query_numbers and not ANAPHORIC_OPERAND_RE.search(query):
-            return None
-        if not looks_like_numeric_question(query, call.recent_dialogue_text):
-            return None
+        # 規則層が計算の依頼と判定したのに式が取れなかった問い (「BMIを計算して」)
+        # は、数値も照応語も無いが被演算子はすべて会話にある。暗算で 26.34 と
+        # 誤答した (2026-09-22 実機、正しくは 26.37)。会話に数値があるときだけ。
+        requested = call.calculate_requested and bool(
+            NUMBER_LITERAL_RE.search(call.recent_dialogue_text),
+        )
+        if not requested:
+            if not query_numbers and not ANAPHORIC_OPERAND_RE.search(query):
+                return None
+            if not looks_like_numeric_question(query, call.recent_dialogue_text):
+                return None
         client = self._llm_client
         if client is None or not hasattr(client, "generate_constrained"):
             return None
