@@ -147,6 +147,15 @@ def _explicit_existing_dir(query: str) -> Path | None:
     return None
 
 
+def _explicit_path_named(query: str, name: str) -> str | None:
+    """クエリの明示パスのうち、末尾名が ``name`` のもの (最初の 1 件) を返す。"""
+    for raw in EXPLICIT_WINDOWS_PATH_RE.findall(query):
+        candidate = raw.rstrip("。、,.\\/")
+        if Path(candidate).name == name:
+            return candidate
+    return None
+
+
 def _fast_path_miss_context(tool_name: str | None, text: str) -> str:
     """空振りしたツール結果を、回答ではなく文脈として渡すための 1 行。"""
     return (
@@ -719,6 +728,13 @@ class _TaskExecutionMixin:
             return resolved
         p = Path(file_path)
         if str(p.parent) in ("", "."):  # ディレクトリ成分の無い bare ファイル名
+            # 依頼が同名のファイルを絶対パスで名指ししていれば、それがそのファイル
+            # 自身。先頭の明示パスだけを見ていたため、「X\DESIGN.md の設計に従って
+            # X\logmon.py を作成」の logmon.py が outputs_dir へ落ちた
+            # (2026-09-21 ライブ監査 K03)。
+            named = _explicit_path_named(query, p.name)
+            if named is not None:
+                return named
             # クエリが出力先ディレクトリを明示していればそこへ置く。先頭の明示パスが
             # 入力ファイル (「X\DESIGN.md の設計に基づいて … を X に作成」) だと
             # 以下の分岐では名指しの index.html 等が outputs_dir へ落ちた

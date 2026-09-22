@@ -18,6 +18,10 @@ from backend.free.agent.learned_pattern_store import LearnedPatternRepository
 from backend.free.agent.learned_patterns_types import LearnedPattern
 from backend.free.document_nouns import DOCUMENT_NOUN_LEARNABLE_JA
 from backend.log_config import get_logger
+from backend.free.core.script_ranges import (
+    KANJI,
+    KATAKANA_BLOCK,
+)
 
 if TYPE_CHECKING:
     from backend.free.core.policy_interpreter import PolicyInterpreter
@@ -44,12 +48,12 @@ PATTERN_DECAY_INTERVAL_SEC = 6 * 3600
 # 意図キーワード抽出用パターン（動詞・指示語を重点抽出）
 _INTENT_PATTERNS = [
     # 日本語動詞・指示語（「〜して」「〜しろ」「〜してください」等の語幹）
-    re.compile(r"([\u4e00-\u9fff]{1,4})[しさせ]て"),
-    re.compile(r"([\u4e00-\u9fff]{1,4})[しさせ]ろ"),
-    re.compile(r"([\u4e00-\u9fff]{1,4})[しさせ]てください"),
+    re.compile(f"([{KANJI}]{{1,4}})[しさせ]て"),
+    re.compile(f"([{KANJI}]{{1,4}})[しさせ]ろ"),
+    re.compile(f"([{KANJI}]{{1,4}})[しさせ]てください"),
     # カタカナ動作語
-    re.compile(r"([\u30a0-\u30ff]{2,})して"),
-    re.compile(r"([\u30a0-\u30ff]{2,})する"),
+    re.compile(f"([{KATAKANA_BLOCK}]{{2,}})して"),
+    re.compile(f"([{KATAKANA_BLOCK}]{{2,}})する"),
     # 英語動詞（先頭の動詞を抽出）
     re.compile(r"\b(add|remove|delete|update|fix|change|create|append|insert|replace|move|copy|rename|merge)\b", re.IGNORECASE),
 ]
@@ -57,8 +61,8 @@ _INTENT_PATTERNS = [
 # 汎用キーワード抽出（NoteBuilder 互換）
 _KEYWORD_PATTERNS = [
     re.compile(r"[A-Za-z][A-Za-z0-9_.-]+"),
-    re.compile(r"[\u4e00-\u9fff]{2,8}"),
-    re.compile(r"[\u30a0-\u30ff]{2,}"),
+    re.compile(f"[{KANJI}]{{2,8}}"),
+    re.compile(f"[{KATAKANA_BLOCK}]{{2,}}"),
 ]
 
 # ストップワード（パターンとして学習しない一般的な語）

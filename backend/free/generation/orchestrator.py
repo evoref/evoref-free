@@ -24,7 +24,9 @@ from backend.free.generation.document_gate import (
     is_document_format,
 )
 from backend.free.generation.smoke_validator import (
+    check_cross_module_imports,
     check_integrity,
+    check_main_invoked,
     dedup_top_level_defs,
     normalize_relative_imports,
     run_import_smoke,
@@ -986,6 +988,10 @@ class LongFormOrchestrator:
         spec = rolling.plan.code_spec
 
         issues = check_integrity(files, spec)
+        # staged の静的ゲートと同じ 2 本。この経路には無く、自己 import と
+        # 未定義属性を持つ K01 が「OK」で配信された (2026-09-21 ライブ監査)。
+        issues.extend(check_main_invoked(files))
+        issues.extend(check_cross_module_imports(files))
 
         lf = self.config.get("long_form", {})
         warnings: list[str] = []

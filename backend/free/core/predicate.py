@@ -40,6 +40,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 import numpy as np
 
+from backend.liveness import ledger as liveness_ledger
 from backend.log_config import get_logger
 
 logger = get_logger("core.predicate")
@@ -976,6 +977,11 @@ class CascadePredicate:
         agreed: bool | None,
         shadow: Verdict | None = None,
     ) -> None:
+        # 死活監視は debug logger の有無と無関係に数える (c_07 §7.1)。通常起動
+        # (debug logger 無効) の利用者環境こそ、恒真・恒偽に気づく手段が無い。
+        liveness_ledger().record_decision(
+            f"gate.{self.name}", band=verdict.band, label=_chosen_label(verdict),
+        )
         if self._debug_logger is None:
             return
         context = verdict.as_context()

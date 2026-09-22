@@ -44,6 +44,10 @@ SemanticStoreInvalidator = Callable[[str], None]
 コールバック型。Step 10 のアーカイブ後に AppState 側の
 キャッシュをクリアするため。"""
 
+FULL_COMPLETED_KEY = "full_completed"
+#: 結果辞書で「段 <key> の入力件数」を表す接尾辞 (死活監視の約束、c_07 §7.1)。
+INPUT_SUFFIX = "_input"
+
 logger = get_logger("memory.sleep_update")
 
 #: ``_save_state`` 用の 1 スレッド executor。保存を直列化して順序を保つ
@@ -672,6 +676,29 @@ class SleepTimeWorker:
             )
             return result
 
+        # Step 8-9: 未要約セッションの要約生成 + 埋め込み。
+        # Full の LLM 版の **先頭** に置く — 手前に corpus 再構築 (5.85) /
+        # ProjectMap 更新 (5.87) / 競合解決 (6) / ノート進化 (7) / 訂正検証
+        # (8.0) / 各 curator (8.3-8.6) / 知識取得 (8.7) を挟むと、チャット
+        # 割り込みによる早期 return (``_check_cancelled``) がここまで届かない
+        # ことが多かった (実測: 4 回中 3 回未達)。要約は light パスの
+        # ``_step_e3_summarize_sessions`` (ノートを要約へ畳む) と Full の
+        # ``_step9_promote_summaries_to_semmem`` の入力なので、届かないと
+        # 記憶の畳み込みと昇格がまとめて止まる。依存先は ``llm_client`` /
+        # ``self.embedder`` / 履歴ストア (``HistoryManager``) のみで、
+        # 手前の各段の出力には依存しない (:mod:`backend.free.memory.sleep.summarize`)。
+        ts = time.monotonic()
+        # 入力件数 (要約待ちのセッション数)。死活監視が「待ちがあるのに 0 件」を
+        # stalled として拾う (c_07 §7.1)。チャットへ枠を譲る中断 (preempted) が
+        # 毎サイクル続くと、要約が永久に作られないまま成功で終わるため。
+        from backend.free.memory.sleep.summarize import count_sessions_needing_summary
+
+        result["summaries_generated_input"] = count_sessions_needing_summary()
+        result["summaries_generated"] = await self._step8_9_summarize_sessions(llm_client)
+        step_durations["step8_9_summarize"] = round(time.monotonic() - ts, 3)
+        if self._check_cancelled():
+            return result
+
         # Step 5.85: chunker 版が古い corpus パッケージの作り直し (f_01 §3.3 の 6)。
         # 埋め込み 1000 チャンク級で数分 GPU を使うので静穏窓でだけ、1 サイクル 1 つ。
         ts = time.monotonic()
@@ -758,8 +785,8 @@ class SleepTimeWorker:
             return result
 
         # Step 8: SemanticFact Extractor
-        # 既存 _step8_9_summarize_sessions は Step 9 に再配置される想定。
-        # メソッド名を変えずに前段に Step 8 を挿入する形で共存させる。
+        # (2026-09-21) _step8_9_summarize_sessions は Full 冒頭 (Step 5.85 の
+        # 前) へ移設済み。メソッド名は互換のため変えていない。
         ts = time.monotonic()
         result["attribute_hints"] = await self._step8_prepare_attribute_hints()
         result["facts_extracted"] = self._step8_extract_facts(
@@ -843,13 +870,6 @@ class SleepTimeWorker:
         if self._check_cancelled():
             return result
 
-        # Step 8-9: 未要約セッションの要約生成 + 埋め込み
-        ts = time.monotonic()
-        result["summaries_generated"] = await self._step8_9_summarize_sessions(llm_client)
-        step_durations["step8_9_summarize"] = round(time.monotonic() - ts, 3)
-        if self._check_cancelled():
-            return result
-
         # Step 9: 履歴要約を SemMem に decision/commitment として昇格
         ts = time.monotonic()
         result["semmem_promoted"] = self._step9_promote_summaries_to_semmem()
@@ -929,6 +949,9 @@ class SleepTimeWorker:
 
         await self._save_state_async()
         elapsed = round(time.monotonic() - t0, 3)
+        # 最後まで走り切った印。死活監視 (c_07 §7.1) が Full の完走を数える —
+        # 最終段のキーで判定すると、段を並べ替えたときに黙って壊れる。
+        result[FULL_COMPLETED_KEY] = True
         self._log_full_completion(result, started_at, elapsed, step_durations)
         return result
 

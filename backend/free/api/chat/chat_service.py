@@ -790,15 +790,21 @@ def build_semmem_injection(
     「記憶の競合」セクションを末尾に連結する (Tier 予算の drop 対象に
     しないことで毎ターンの注入を保証する)。
 
-    **埋め込みが取れなかったターンは facts / notes を注入しない。**
-    ``MemoryInjector`` は ``query_embedding=None`` を「関連度ゲート無効」と
-    解釈して全候補を通す (``_is_relevant`` 冒頭)。これは embedder 自体が無い
-    構成のための後方互換だが、embedder はあるのに埋め込みが失敗 / デッドライン
-    超過したターンでも同じ経路に落ちるため、**ゲートが最も要る場面で全店注入に
-    切り替わる**。予算 800 トークンが無関係な記憶で埋まり、弱い base モデルが
-    それを回答対象と誤解する — 関連度ゲートを入れた元の事象そのもの。
-    embedder があるのに ``query_vec`` が無い = そのターンの埋め込みが失敗した、
-    と判定して注入を見送る (競合セクションは関連度と無関係なので出す)。
+    **埋め込みが取れなかったターンは、コサインの棒が要る facts / notes を
+    注入しない。** ``MemoryInjector`` は ``query_embedding=None`` を「関連度
+    ゲート無効」と解釈して全候補を通す (``_is_relevant`` 冒頭)。これは embedder
+    自体が無い構成のための後方互換だが、embedder はあるのに埋め込みが失敗 /
+    デッドライン超過したターンでも同じ経路に落ちると、**ゲートが最も要る
+    場面で全店注入に切り替わる**。予算 800 トークンが無関係な記憶で埋まり、
+    弱い base モデルがそれを回答対象と誤解する — 関連度ゲートを入れた元の
+    事象そのもの。embedder があるのに ``query_vec`` が無い場合は
+    ``embedding_unavailable=True`` を ``MemoryInjector.inject`` へ渡し、
+    ``_asked_attributes`` / 語彙アンカーで免除された候補 (コサインを使わない
+    決定論判定) と ``pinned`` だけを通す — 「候補ごとに埋め込みが無い」のと
+    同じ扱いにする (2026-09-21 実機監査: 全体 skip だと asked_attrs が正しく
+    解決していたファクトまで道連れになり「確認できていません」と回答した)。
+    競合セクションはこの免除経路を持たないため、埋め込み失敗ターンは従来
+    どおり見送る (無関係な矛盾を毎ターン出さないため)。
 
     ``covered_attributes`` を渡すと、**実際に注入されたファクト** の属性スロット名を
     その場で書き込む (``InjectionPlan.covered_attributes``)。呼出側が
@@ -823,14 +829,22 @@ def build_semmem_injection(
         return None
     inj_mode = normalize_session_mode(mode)
     rendered: str | None = None
-    if state.embedder is not None and query_vec is None:
+    # embedder はあるのにこのターンの埋め込みが失敗 / デッドライン超過した
+    # (``state.embedder is None`` = そもそも embedder が無い構成とは区別する)。
+    # 以前はここで全体を skip していたが、``_asked_attributes`` / 語彙アンカー
+    # による免除は埋め込みを使わない決定論判定なので、それらまで一緒に
+    # 落とす必要はない。``injector.inject(embedding_unavailable=True)`` に
+    # 伝え、コサインの棒が要る候補だけを落とす (実機監査 2026-09-21:
+    # 埋め込みが 3 秒デッドラインを超え、asked_attrs=['location'] まで
+    # 正しく解決していたファクトごと注入全体が skip されて
+    # 「確認できていません」と回答した)。
+    embedding_unavailable = state.embedder is not None and query_vec is None
+    if embedding_unavailable:
         logger.info(
-            "semmem injection skipped: query embedding unavailable this turn "
-            "(the relevance gate would be bypassed and inject the whole store)",
+            "semmem injection degraded: query embedding unavailable this turn "
+            "(cosine relevance gate disabled; only attribute/anchor-exempt "
+            "facts are still considered)",
         )
-        # 競合セクションも同じ理由で見送る。ゲートを掛けられないターンに
-        # 出すと、クエリと無関係な矛盾がプロンプトへ入る。
-        return None
     # このターンの MemoryInjector は 1 個。競合セクションのゲートも同じ
     # インスタンス・同じ事前計算スコアで判定する (別インスタンスで
     # スコア無しに判定し直すと、埋め込み無しのファクトが素通りしていた)。
@@ -921,6 +935,7 @@ def build_semmem_injection(
                 fact_relevance_scores=fact_scores or None,
                 fact_rank_scores=fact_ranks or None,
                 previous_values=previous_values or None,
+                embedding_unavailable=embedding_unavailable,
             )
             rendered = plan.render() or None
             if covered_attributes is not None:
@@ -931,7 +946,11 @@ def build_semmem_injection(
         logger.warning("semmem injection skipped: %s", e)
         rendered = None
 
-    conflict_block = _render_conflict_section(
+    # 競合セクションは ``query_vec=None`` を「ゲート無効 (素通し)」と読む
+    # (``_render_conflict_section`` の docstring)。埋め込み失敗ターンに
+    # 素通しすると無関係な矛盾がプロンプトへ入るので、こちらは従来どおり
+    # 見送る (facts 側だけ ``embedding_unavailable`` で救済する)。
+    conflict_block = None if embedding_unavailable else _render_conflict_section(
         cfg, conflict_ctx, query_vec=query_vec,
         fact_scores=fact_scores or None, injector=injector,
     )

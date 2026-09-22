@@ -20,6 +20,10 @@ from typing import TYPE_CHECKING
 from backend.log_config import get_logger
 from backend.policy_helpers import get_policy_value
 from backend.utils import estimate_tokens
+from backend.free.core.script_ranges import (
+    KANA_BLOCKS,
+    KANJI,
+)
 
 if TYPE_CHECKING:
     from backend.free.core.policy_interpreter import PolicyInterpreter
@@ -46,7 +50,7 @@ _ENTITY_PATTERN = re.compile(
 )
 
 # 単語トークナイズパターン
-_WORD_PATTERN = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff\u3040-\u30ff]")
+_WORD_PATTERN = re.compile(f"[A-Za-z0-9_]+|[{KANJI}{KANA_BLOCKS}]")
 
 
 class SalienceRanker:

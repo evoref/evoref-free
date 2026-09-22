@@ -42,6 +42,10 @@ from backend.free.core.correction_verdict import (
 from backend.free.core.relative_date import annotate_relative_dates
 from backend.free.core.text_quality import detect_lang
 from backend.log_config import get_logger
+from backend.free.core.script_ranges import (
+    HIRAGANA,
+    PROLONGED,
+)
 
 logger = get_logger("memory.extractors.base")
 
@@ -96,7 +100,7 @@ _VALUE_UPDATE_RE = re.compile(
 )
 
 #: ひらがなだけの span。1 文字の旧値を採るかの判定に使う (下記参照)。
-_HIRAGANA_ONLY_RE = re.compile(r"^[ぁ-ゖー]+$")
+_HIRAGANA_ONLY_RE = re.compile(f"^[{HIRAGANA}{PROLONGED}]+$")
 
 
 def value_update_spans(content: str) -> tuple[str, str] | None:

@@ -59,6 +59,7 @@ class PathResolver:
         "cvector_work_dir": "local/cvector/",
         "aux_prompts_dir": "local/aux_prompts/",
         "aux_calibration_file": "local/aux_calibration.json",
+        "liveness_file": "local/liveness.json",
         "lora_archive_dir": "local/lora_archive/",
         "embed_lora_adapter": "local/models/embed_adapter.gguf",
         "embed_lora_versions_dir": "local/models/embed_lora_versions/",

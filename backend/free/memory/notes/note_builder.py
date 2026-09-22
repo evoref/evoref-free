@@ -39,6 +39,10 @@ from backend.free.core.session_mode import is_create_mode
 from backend.free.core.text_quality import states_no_user_value
 from backend.free.memory.types import MemoryMode, NoteSource
 from backend.log_config import get_logger
+from backend.free.core.script_ranges import (
+    KANJI,
+    KATAKANA_BLOCK,
+)
 
 logger = get_logger("memory.note_builder")
 
@@ -1308,8 +1312,8 @@ class NoteBuilder:
     # 日本語キーワード抽出: 形態素解析不要の軽量版
     KEYWORD_PATTERNS = [
         re.compile(r"[A-Za-z][A-Za-z0-9_.-]+"),   # 英数字トークン
-        re.compile(r"[\u4e00-\u9fff]{2,8}"),        # 漢字2-8文字
-        re.compile(r"[\u30a0-\u30ff]{2,}"),          # カタカナ2文字以上
+        re.compile(f"[{KANJI}]{{2,8}}"),        # 漢字2-8文字
+        re.compile(f"[{KATAKANA_BLOCK}]{{2,}}"),          # カタカナ2文字以上
     ]
 
     # 自動タグ: キーワードからルールベースで付与（汎用）

@@ -64,6 +64,11 @@ from backend.free.memory.episodic.note import MemoryNote
 from backend.free.memory.notes.subject_ns import make_mem_subject
 from backend.free.memory.types import FactType, SemanticFact
 from backend.log_config import get_logger
+from backend.free.core.inference import SUMMARY_TAIL_RE
+from backend.free.core.script_ranges import (
+    KANJI,
+    KATAKANA_BLOCK,
+)
 
 logger = get_logger("memory.extractors.chat")
 
@@ -249,7 +254,7 @@ def _mentions_any(sentence: str, words: tuple[str, ...]) -> bool:
 #: ひらがなを入れないのは、述語 (「変わりました」「しています」) が全部
 #: ひらがなで、値の有無を弁別できなくなるため。
 _CONTENT_RUN_RE = re.compile(
-    r"[一-鿿゠-ヿA-Za-z0-9][一-鿿゠-ヿA-Za-z0-9]+"
+    f"[{KANJI}{KATAKANA_BLOCK}A-Za-z0-9][{KANJI}{KATAKANA_BLOCK}A-Za-z0-9]+"
 )
 
 
@@ -789,7 +794,6 @@ _STATEMENT_STRIP_PASSES = 3
 
 #: ``compress_turn(style="summary")`` の圧縮マークと末尾の元文字数。
 _SUMMARY_MARK = "[要約] "
-_SUMMARY_TAIL_RE = re.compile(r"…（\d+文字）\s*$")
 
 #: 文末の断定辞と句点。命題には要らないので落とす。
 #: ``になりました`` 等の複合述語は **落とさない** — 値の一部を運んでいる
@@ -1044,7 +1048,7 @@ def normalize_statement(
     # これを落とすと原文と [要約] が同じ命題に畳まれ、競合・重複判定でも揃う。
     if kept.startswith(_SUMMARY_MARK):
         kept = kept[len(_SUMMARY_MARK):].strip()
-    kept = _SUMMARY_TAIL_RE.sub("", kept).strip()
+    kept = SUMMARY_TAIL_RE.sub("", kept).strip()
     # 談話標識と一人称主題は入れ子になる (「ところで、私は…」「私、実は…」)。
     # 変化が無くなるまで繰り返し剥がす。
     for _ in range(_STATEMENT_STRIP_PASSES):
@@ -1238,7 +1242,7 @@ _CORRECTION_MARKER_ANCHORS = frozenset({
 _VALUE_ANCHOR_MIN_KANJI_CHARS = 3
 
 #: 漢字だけで構成された内容語か。
-_KANJI_ONLY_RUN_RE = re.compile(r"^[一-鿿]+$")
+_KANJI_ONLY_RUN_RE = re.compile(f"^[{KANJI}]+$")
 
 
 def _value_anchors(value: str) -> tuple[str, ...]:

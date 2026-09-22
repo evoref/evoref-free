@@ -79,6 +79,10 @@ from backend.free.core.query_anchors import (
 )
 from backend.log_config import get_logger
 from backend.utils import estimate_tokens
+from backend.free.core.script_ranges import (
+    KANJI,
+    KATAKANA_WORD,
+)
 
 logger = get_logger("memory.injector")
 
@@ -350,7 +354,7 @@ _EVENT_ANCHOR_STOPWORDS = frozenset({
 def _event_anchors(text: str) -> set[str]:
     """多値スロットの 1 行から事象の内容語 (漢字 / カタカナの連なり) を取る (純粋関数)。"""
     return {
-        w for w in re.findall(r"[一-龥ァ-ヶー]{2,}", text or "")
+        w for w in re.findall(f"[{KANJI}{KATAKANA_WORD}]{{2,}}", text or "")
         if w not in _EVENT_ANCHOR_STOPWORDS and not re.fullmatch(r"[〇一二三四五六七八九十百千]+", w)
     }
 
@@ -830,6 +834,7 @@ class MemoryInjector:
         fact_relevance_scores: "dict[str, float] | None" = None,
         fact_rank_scores: "dict[str, float] | None" = None,
         previous_values: "dict[str, str] | None" = None,
+        embedding_unavailable: bool = False,
     ) -> InjectionPlan:
         """注入計画を構築する。
 
@@ -837,6 +842,21 @@ class MemoryInjector:
             mode: ``"chat"`` または ``"create"``。
             facts: 候補 ``SemanticFact`` の集合 (global / project 混在可)。
             stm_notes: 候補 ``MemoryNote`` の集合 (Tier 2 配置)。
+            embedding_unavailable: このターンのクエリ埋め込みが取れなかった
+                (embedder はあるがタイムアウト / 失敗した) ことを示す。
+                ``query_embedding=None`` は本来「embedder が無い構成」の
+                後方互換シグナルで、``_is_relevant`` はコサインの棒ごと
+                無効化して **全候補を通す** (下の ``query_embedding`` の説明
+                参照)。埋め込みが失敗しただけのターンに同じ経路へ落とすと、
+                ゲートが最も要る場面で全店注入に切り替わってしまう
+                (``chat_service.build_semmem_injection`` の docstring 参照)。
+                ``True`` を渡すと、``_asked_attributes`` / 語彙アンカーで
+                免除された候補と ``pinned`` はそのまま通しつつ、それ以外は
+                コサイン判定不能として **落とす** — 「候補ごとに埋め込みが
+                無い」のと同じ扱いにする (2026-09-21 実機監査: 「私がどこに
+                住んでいるか覚えていますか」で埋め込みが 3 秒デッドラインを
+                超え、``asked_attrs=['location']`` まで正しく解決していたのに
+                注入全体が skip されて「確認できていません」と回答した)。
             current_project_id: クリエイトモードで「現在プロジェクト」と
                 見なすプロジェクト ID。``None`` の場合 project ファクトは
                 すべて他プロジェクト扱いになる。
@@ -1086,6 +1106,7 @@ class MemoryInjector:
                 # していたため、Light 更新直後の別セッション想起 (「私が住んで
                 # いるのは？」) が次の Full snapshot まで必ず空振りした (2026-09-11)。
                 require_embedding=True,
+                gate_blocked=embedding_unavailable,
             ):
                 filtered_out += 1
                 gate_rejected += 1
@@ -1240,6 +1261,7 @@ class MemoryInjector:
                 pinned=pinned,
                 scores=note_scores,
                 require_embedding=True,
+                gate_blocked=embedding_unavailable,
             ):
                 filtered_out += 1
                 gate_rejected += 1
@@ -1441,15 +1463,23 @@ class MemoryInjector:
         pinned: bool,
         scores: "dict[int, float]",
         require_embedding: bool = False,
+        gate_blocked: bool = False,
     ) -> bool:
         """事前計算したスコアで関連度ゲートを判定する。
 
         スコアが引けている候補はその場で閾値比較し、引けなかった候補
         (埋め込み無し / 次元不一致 / ゼロベクトル) だけ :meth:`_is_relevant`
         の分岐へ落とす。判定の意味は :meth:`_is_relevant` と同一。
+
+        ``gate_blocked`` (= :meth:`inject` の ``embedding_unavailable``) が
+        ``True`` のときは ``query_vec is None`` を「ゲート無効 (素通し)」で
+        はなく「判定不能 (``pinned`` 以外は落とす)」と読む。呼出側
+        (``inject`` の per-fact/per-note ループ) は既に ``asked_attrs`` /
+        語彙アンカーで免除した候補をここへ回さないので、ここに来るのは
+        「決定論の根拠が無い候補」だけ。
         """
         if query_vec is None:
-            return True
+            return bool(pinned) if gate_blocked else True
         score = scores.get(id(item))
         if score is None:
             return self._is_relevant(

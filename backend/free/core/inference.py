@@ -1086,8 +1086,12 @@ def _inject_rag_fallback(
 #: 別チャンクとして両方ヒットするため、``[参考情報]`` のスロットを二重に食う。
 _SUMMARY_MARK = "[要約] "
 
-#: 要約側の末尾に付く元文字数 (``…（1234文字）``)。重複判定では無視する。
-_SUMMARY_TAIL_RE = re.compile(r"…（\d+文字）\s*$")
+#: 要約側の末尾に付く元文字数 (``…（1234文字）`` / ``…(1234 chars)``)。重複判定では無視する。
+#: 生成側 (``backend.utils.compress_turn``) は ja 固定だが、locale 切替で剥がし漏れを
+#: 起こさないよう **両方** を剥がす (search_pipeline が先に採っていた形を SSOT にした)。
+SUMMARY_TAIL_RE = re.compile(
+    r"…(?:（\d+文字）|\(\d+ chars\))\s*$",
+)
 
 
 def _dedup_key_for_rag(text: str) -> str:
@@ -1100,7 +1104,7 @@ def _dedup_key_for_rag(text: str) -> str:
     body = text.strip()
     if body.startswith(_SUMMARY_MARK):
         body = body[len(_SUMMARY_MARK):]
-    body = _SUMMARY_TAIL_RE.sub("", body)
+    body = SUMMARY_TAIL_RE.sub("", body)
     return "".join(body.split())
 
 

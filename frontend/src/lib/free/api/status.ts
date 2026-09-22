@@ -58,11 +58,27 @@ export interface CapabilityInfo {
 	probed_at: string;
 }
 
+/**
+ * 効果の死活監視で立っている警告 (docs/c_07 §7.1)。
+ * kind: starved (以前届いていた段が届かない) / stalled (入力があるのに効果ゼロが続く) /
+ * degenerate (判定点の発火率が 0% か 100%) / failing (連続失敗) / emptied (ストアが空になった)。
+ * detail は英語 (ログと同じ文)。
+ */
+export interface LivenessAlert {
+	stage: string;
+	kind: 'starved' | 'stalled' | 'degenerate' | 'failing' | 'emptied' | string;
+	since: string;
+	detail: string;
+}
+
 export interface StatusResponse {
 	status: string;
 	edition: string;
 	instance_name: string;
 	version: string;
+	free_version?: string;
+	pro_version?: string | null;
+	schema_version?: number;
 	uptime_seconds: number;
 	llama_server: LlamaServerInfo;
 	model?: ModelInfo;
@@ -71,6 +87,8 @@ export interface StatusResponse {
 	cartridges_loaded: number;
 	debug: DebugStatusInfo;
 	capabilities?: CapabilityInfo[];
+	/** 効果の死活監視の警告。空なら異常なし */
+	liveness?: LivenessAlert[];
 }
 
 /** ステータス取得 */

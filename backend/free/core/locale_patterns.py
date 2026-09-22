@@ -32,6 +32,9 @@ import re
 from typing import TYPE_CHECKING, TypeVar
 
 from backend.i18n_helper import get_locale
+from backend.free.core.script_ranges import (
+    JAPANESE,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -82,7 +85,7 @@ def matches_any_either(
 #: 和文文字 (ひらがな / カタカナ / 漢字)。``text_quality._JA_CHAR_RE`` と同じ範囲。
 #: あちらは「応答が日本語か」を 20 文字の下限付きで測る品質判定用なので、
 #: 短いクエリの字種判定には使えない (別定義にしている理由)。
-_JA_SCRIPT_RE = re.compile(r"[ぁ-んァ-ヶ一-龥]")
+_JA_SCRIPT_RE = re.compile(f"[{JAPANESE}]")
 
 
 def has_japanese_script(text: str) -> bool:

@@ -310,12 +310,24 @@ def check_main_invoked(files: dict[str, str]) -> list[str]:
 
     import スモークも ``check_entrypoint`` (クラスが無ければ早期 return) も通るため、
     ``python main.py`` が無言で終了する生成物が「起動可能性チェック合格」になった
-    (2026-09-19 ライブ監査 K02)。対象は ``main.py`` だけに絞る — 他モジュールの
-    ``main`` は後続のエントリから呼ばれうる (未生成の段階で誤検知しない)。
+    (2026-09-19 ライブ監査 K02)。対象は ``main.py`` と、モジュールが 1 本だけの
+    ときのそれ — 他モジュールの ``main`` は後続のエントリから呼ばれうる
+    (未生成の段階で誤検知しない)。
     """
     errors: list[str] = []
+    modules = [
+        p for p in files
+        if p.endswith(".py")
+        and not os.path.basename(p).startswith("test_")
+        and os.path.basename(p) != "conftest.py"
+    ]
+    # main.py に加え、**モジュールが 1 本だけ** ならそれが起点 (単一ファイルの
+    # quiz_game.py が main() を呼ばず、無言で終了した。2026-09-21 ライブ監査
+    # K06)。複数あるうちの main.py 以外は、後続のエントリから呼ばれうる
+    # (staged は全モジュールが揃う前にも検査する)。
+    sole = modules[0] if len(modules) == 1 else None
     for path, code in files.items():
-        if os.path.basename(path) != "main.py":
+        if os.path.basename(path) != "main.py" and path != sole:
             continue
         try:
             tree = ast.parse(code)
@@ -614,7 +626,51 @@ def check_cross_module_imports(files: dict[str, str]) -> list[str]:
                         f"{path}: '{a.name}' を '{sibling}' から import できない "
                         f"({sibling} に定義が無い)"
                     )
+        errors.extend(_missing_module_attrs(path, tree, own_stem, exports, dynamic_stems))
     return sorted(set(errors))
+
+
+def _missing_module_attrs(
+    path: str, tree: ast.Module, own_stem: str,
+    exports: dict[str, set[str]], dynamic_stems: set[str],
+) -> list[str]:
+    """``import <sibling>`` 経由の ``<sibling>.<name>`` 参照で、定義が無いものを返す。
+
+    from-import だけを照合していたため、``import db`` → ``db.delete_item()`` の
+    未定義参照が静的検査を素通りし、実行時に AttributeError で落ちた
+    (2026-09-21 ライブ監査 K08: db.py に delete_item が無かった)。
+    """
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                sibling = a.name.rsplit(".", 1)[-1]
+                if a.asname is None and "." in a.name:
+                    continue  # ``import pkg.mod`` の参照は ``pkg.mod.x`` になる
+                if sibling != own_stem and sibling in exports and sibling not in dynamic_stems:
+                    aliases[a.asname or sibling] = sibling
+    if not aliases:
+        return []
+    # 別名へ代入し直すファイルは束縛が追えないので対象外。
+    rebound = {
+        t.id for node in ast.walk(tree) if isinstance(node, ast.Assign)
+        for t in node.targets if isinstance(t, ast.Name)
+    }
+    errors: list[str] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)
+            and isinstance(node.value, ast.Name) and node.value.id in aliases
+            and node.value.id not in rebound
+        ):
+            continue
+        sibling = aliases[node.value.id]
+        if node.attr.startswith("__") or node.attr in exports[sibling]:
+            continue
+        errors.append(
+            f"{path}: '{sibling}.{node.attr}' を参照するが {sibling} に定義が無い"
+        )
+    return errors
 
 
 def dedup_top_level_defs(code: str) -> str:

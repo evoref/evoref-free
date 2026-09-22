@@ -17,6 +17,12 @@ from backend.free.core.intent_vocab import (
     matched_history_keywords,
 )
 from backend.free.core.locale_patterns import has_japanese_script
+from backend.free.core.script_ranges import (
+    HIRAGANA,
+    KANJI,
+    KANJI_MARKS,
+    KATAKANA_BLOCK,
+)
 
 # 時系列順序指定を含む履歴クエリの検出 (「一番最初に」「最後に」等)。
 # aux が合成する小さい limit (例: limit=1) は字句スコア最上位への
@@ -69,8 +75,9 @@ _ORDER_QUERY_SCAFFOLD_RE = re.compile(
 # 含めると「私が今日」「見た映画」のような **別語の融合** が起き、上のコメントが
 # 警告している害 (照合の定足数が落ちる) がそのまま出る。
 _ORDER_QUERY_CONTENT_RE = re.compile(
-    r"[一-鿿゠-ヿ々〆a-zA-Z0-9]+"
-    r"(?:(?![がはをにへとでのもやかねよたてだん])[ぁ-ん][一-鿿゠-ヿ々〆]+)*",
+    f"[{KANJI}{KATAKANA_BLOCK}{KANJI_MARKS}a-zA-Z0-9]+"
+    f"(?:(?![がはをにへとでのもやかねよたてだん])[{HIRAGANA}]"
+    f"[{KANJI}{KATAKANA_BLOCK}{KANJI_MARKS}]+)*",
 )
 
 #: 格助詞。1 文字ランの直後に来れば、そのランは動詞語幹ではなく名詞

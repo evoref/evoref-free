@@ -6,6 +6,7 @@
 """
 
 from __future__ import annotations
+from backend.free.agent.output_format import MD_HINT_RE
 
 from backend.free.api.chat.chat_stream_common import (
     _cancel_flags,
@@ -34,7 +35,6 @@ from backend.free.api.chat.chat_stream_output import (
     _HEADING_LINE_RE,
     _infer_output_extension,
     long_form_write_file,
-    _MD_EXT_HINT_RE,
     _NEEDS_EXISTING_RE,
     _normalize_editor_text,
     read_existing_for_append,

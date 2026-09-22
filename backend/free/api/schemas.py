@@ -95,6 +95,20 @@ class ComponentStatus(BaseModel):
     connected: bool = False
 
 
+class LivenessAlertModel(BaseModel):
+    """効果の死活監視で立っている警告 1 件 (c_07 §7.1)。
+
+    ``kind``: ``starved`` (以前届いていた段が届かない) / ``stalled`` (入力が
+    あるのに効果ゼロが続く) / ``degenerate`` (判定点の発火率が 0% か 100%) /
+    ``failing`` (連続失敗) / ``emptied`` (ストアが空になった)。``detail`` は
+    英語 (ログと同じ文)。UI は ``kind`` を i18n キーにして組み立てる。
+    """
+    stage: str
+    kind: str
+    since: str = ""
+    detail: str = ""
+
+
 class LearningBriefStatus(BaseModel):
     """学習サイクルの概要ステータス（デバッグオーバーレイ用）"""
     running: bool = False
@@ -152,6 +166,8 @@ class StatusResponse(BaseModel):
     cartridges_loaded: int = 0
     debug: DebugStatusInfo = Field(default_factory=DebugStatusInfo)
     capabilities: list[CapabilityInfo] = Field(default_factory=list)
+    #: 効果の死活監視で現在立っている警告 (c_07 §7.1)。空なら異常なし。
+    liveness: list[LivenessAlertModel] = Field(default_factory=list)
 
 
 # ===== Aux Model =====

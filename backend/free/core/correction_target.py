@@ -47,6 +47,12 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from backend.free.core.script_ranges import (
+    KANJI,
+    KANJI_MARKS,
+    KATAKANA,
+    KATAKANA_WORD,
+)
 
 #: 桁区切り・小数付きの数値。
 NUMBER_LITERAL_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?")
@@ -58,8 +64,8 @@ QUOTED_RE = re.compile(r"[「『]([^」』]{1,40})[」』]")
 #: 取れない**。2026-09-06 の実データでは、「もう 1 つは 月曜:佐々木、火曜:川島…」
 #: という訂正が (人名も曜日も拾えず) 全候補スコア 0 になり、宛先を直近ターンへ
 #: 落としていた。漢字列 2 文字以上とカタカナ列 3 文字以上を内容語とみなす。
-KANJI_RUN_RE = re.compile(r"[一-龥々]{2,}")
-KATAKANA_RUN_RE = re.compile(r"[ァ-ヴ][ァ-ヴー]{2,}")
+KANJI_RUN_RE = re.compile(f"[{KANJI}{KANJI_MARKS}]{{2,}}")
+KATAKANA_RUN_RE = re.compile(f"[{KATAKANA}][{KATAKANA_WORD}]{{2,}}")
 #: 英字 1〜2 文字 + 数字の短い記号 (``D7`` / ``E7`` / ``v2`` / ``T01``)。
 #: ``IDENTIFIER_RE`` は 3 文字以上を要求するので、コードネームや版番号のような
 #: 2 文字の答えが証拠から漏れていた (2026-09-07 ライブ監査: 「先ほどの D7 という

@@ -41,7 +41,7 @@ _PPTX_HINT_RE = re.compile(
 # CSV 出力意図。
 _CSV_HINT_RE = re.compile(r"(?:csv|カンマ区切り)", re.IGNORECASE)
 # Markdown 出力意図。``.md`` 指定に加え、ドット無しの「md 形式」「md ファイル」も拾う。
-_MD_HINT_RE = re.compile(
+MD_HINT_RE = re.compile(
     r"(?:"
     r"\.md(?:\b|ファイル|形式|で|に|を)"
     r"|md[\s ]?(?:形式|ファイル|で出力|で保存|で書)"
@@ -90,7 +90,7 @@ def infer_output_extension(query: str, default: str = ".txt") -> str:
         return ".pptx"
     if _CSV_HINT_RE.search(query):
         return ".csv"
-    if _MD_HINT_RE.search(query):
+    if MD_HINT_RE.search(query):
         return ".md"
     return default
 

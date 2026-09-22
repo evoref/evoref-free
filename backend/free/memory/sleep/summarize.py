@@ -32,6 +32,33 @@ RESUMMARIZE_MIN_TURNS = 10
 _SUMMARY_TURN_WINDOW = 20
 
 
+def needs_summary(entry: object) -> bool:
+    """要約の対象か: 未要約、または要約後に ``RESUMMARIZE_MIN_TURNS`` 以上伸びた。
+
+    選別・持ち越し件数のログ・死活監視の入力件数が **同じ条件** を見る。以前は
+    持ち越し件数だけ「1 ターンでも伸びたら対象」で数えており、選別 (10 ターン
+    以上) と食い違ってログの件数が過大に出ていた (2026-09-21)。
+    """
+    summary = getattr(entry, "summary", None)
+    if summary is None:
+        return True
+    turn_count = int(getattr(entry, "turn_count", 0) or 0)
+    summary_turn_count = int(getattr(entry, "summary_turn_count", 0) or 0)
+    return turn_count - summary_turn_count >= RESUMMARIZE_MIN_TURNS
+
+
+def count_sessions_needing_summary() -> int:
+    """要約の対象になっているセッション数 (Step 8-9 の入力件数)。失敗時は 0。"""
+    from backend.free.history.history_manager import get_history_manager
+
+    try:
+        index = get_history_manager()._load_index()
+    except Exception as exc:  # noqa: BLE001 - 観測のための読み出しで落とさない
+        logger.debug("Failed to count sessions needing summary: %s", exc)
+        return 0
+    return sum(1 for entry in index.sessions if needs_summary(entry))
+
+
 async def summarize_unsummarized_sessions(
     llm_client: Any,
     embedder: "EmbeddingBackend",
@@ -82,10 +109,7 @@ async def summarize_unsummarized_sessions(
     index = mgr._load_index()
     summarized = 0
     #: should_pause 発火時に「まだ要約が必要な件数」を報告するための分母。
-    pending_total = sum(
-        1 for e in index.sessions
-        if e.summary is None or e.turn_count > e.summary_turn_count
-    )
+    pending_total = sum(1 for e in index.sessions if needs_summary(e))
     attempted = 0
 
     for entry in index.sessions:
@@ -108,9 +132,7 @@ async def summarize_unsummarized_sessions(
         # 恒久化すると後半の訂正が要約に載らず、search_history 経由で訂正前の値が
         # 「独立した根拠」として再注入される (2026-07-26 ライブ検証: 火曜→水曜と
         # 訂正済みの予約が過去セッションの要約から火曜へ巻き戻った)。
-        if entry.summary is not None and (
-            entry.turn_count - entry.summary_turn_count < RESUMMARIZE_MIN_TURNS
-        ):
+        if not needs_summary(entry):
             # 1〜2 ターン伸びるたびに作り直さない — 同じセッションが 20 サイクルで
             # 26 回要約されていた (2026-09-12 実測、入力は末尾 20 ターン固定)。
             continue

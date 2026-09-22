@@ -16,7 +16,7 @@ from backend.i18n_helper import prompt_locale
 from backend.log_config import get_logger
 from backend.free.core.date_math_cue import query_has_date_math_cue
 from backend.free.core.inference import eligible_rag_indices
-from backend.free.core.intent_vocab import refers_to_previous_output
+from backend.free.core.intent_vocab import refers_to_ongoing_session, refers_to_previous_output
 from backend.free.memory.corrections import corrections_by_target
 from backend.trace_context import run_in_executor_with_context
 from backend.utils import utc_now_dt
@@ -27,6 +27,8 @@ from backend.free.constants import (
 )
 from backend.free.rag.chunk_content_gate import ChunkContentGate, GateConfig
 from backend.free.rag.evidence.types import compute_claim_key
+from backend.free.core.inference import SUMMARY_TAIL_RE
+from backend.free.core.intent_vocab import NUMERAL_HINT_RE
 from backend.free.rag.self_rag_judge import (
     QualityThresholds,
     RetrievalNecessityJudge,
@@ -185,7 +187,6 @@ def _resolve_search_params(
 #: 生成側 (``backend.utils.compress_turn``) は ja 固定なので、こちらは両方を
 #: 剥がせるようにしておく (locale 切替で剥がし漏れを起こさないため)。
 _SUMMARY_MARKS: tuple[str, ...] = ("[要約] ", "[summary] ")
-_SUMMARY_TAIL_RE = re.compile(r"…(?:（\d+文字）|\(\d+ chars\))\s*$")
 
 #: 「同じ質問の繰り返し」と見なす最小文字数。短い相槌 (「ありがとう」「はい」) は
 #: 何度でも出るので、これを繰り返し扱いにすると assistant ノートを不当に落とす。
@@ -199,7 +200,7 @@ def _normalize_utterance(text: str) -> str:
         if body.startswith(mark):
             body = body[len(mark):]
             break
-    body = _SUMMARY_TAIL_RE.sub("", body)
+    body = SUMMARY_TAIL_RE.sub("", body)
     return "".join(body.split())
 
 
@@ -479,6 +480,19 @@ async def _search_episodic_layer(
         ", ".join(f"{e[1]:.3f}" for e in entries),
     )
     return entries
+
+
+def episodic_session_scope(query: str, session_id: str) -> str | None:
+    """エピソード検索を自セッションに閉じるべき問いなら、そのセッション id を返す。
+
+    自分の直前の出力を指す問いは、それを出したセッションの外に根拠を持たない。
+    進行中の会話を指す問い (「ここまでをまとめて」) も同じ — 別セッションの
+    回答が似ていると、それを丸写しした (2026-09-21 ライブ監査 C10: セキュリティ
+    の会話のまとめに、別セッションの Docker 本番チェックリストが返った)。
+    """
+    if refers_to_previous_output(query) or refers_to_ongoing_session(query):
+        return session_id
+    return None
 
 
 def _hit_session(hit) -> str:
@@ -1375,8 +1389,7 @@ async def unified_search(
     )
     if on_topic_bar is None:
         on_topic_bar = corpus_thresholds.confidence
-    # 自分の直前の出力を指す問いは、それを出したセッションの外に根拠を持たない。
-    own_session = session_id if refers_to_previous_output(query) else None
+    own_session = episodic_session_scope(query, session_id)
     # 日付演算の問い (営業日 / 日目 / 週間後…) はツールが答える。文書側に根拠は
     # 無く、設計書に同じ例文があると cosine では区別できない (2026-09-14: 09-12
     # の corpus 誤射 8/46 のうち 6 件がこれで、1 ターン 1088 tok の prefill)。
@@ -1777,7 +1790,6 @@ async def _empty_pseudo_layer() -> tuple[list[StoreEntry], set[str]]:
 
 
 #: 日付演算が閉じている印 (数字 / 漢数字)。agent 側の同名判定と同じ文字集合。
-_DATE_MATH_QUANTITY_RE = re.compile(r"\d|[一二三四五六七八九十百千]")
 
 
 async def _empty_corpus_layer() -> list[StoreEntry]:
@@ -1794,7 +1806,7 @@ def corpus_layer_skipped_for_query(query: str) -> bool:
     扱いをどう決めていますか」) は文書への問いでありうるので切らない。
     """
     text = query or ""
-    return query_has_date_math_cue(text) and bool(_DATE_MATH_QUANTITY_RE.search(text))
+    return query_has_date_math_cue(text) and bool(NUMERAL_HINT_RE.search(text))
 
 
 def _record_corpus_hits(

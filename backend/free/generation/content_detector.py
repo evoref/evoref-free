@@ -57,6 +57,17 @@ TEXT_PATTERNS: list[str] = [
 # TEXT_PATTERNS の英語版。detect_content_type() は re.search() を flags 無しで
 # 呼ぶため、大文字小文字を無視するには各パターン先頭に (?i) インライン修飾子を
 # 明示する必要がある (文頭大文字化が頻出する英語の実用性のため)。
+_OUTPUT_EXTENSION_PATTERN = r"(?i)\.(md|txt|csv|docx|pptx|xlsx)\b"
+
+#: プログラミング言語を実装手段として指す言い方 (「Python で」「JavaScript を使って」)。
+#: create モードで、文書拡張子の付いた **添え物** (「サンプルの sales.csv も」) と
+#: 並んだときだけ見る (:func:`_extension_only_on_bare_names`)。
+_IMPLEMENTATION_LANGUAGE_RE = re.compile(
+    r"(?i)\b(?:python|javascript|typescript|java|go|rust|ruby|php|kotlin|swift|c\+\+|c#)"
+    # 「Python 標準ライブラリで」のように修飾が挟まる (K10)。句読点は越えない。
+    r"\b[^。、,.\n]{0,12}?(?:で|を使|により|による)",
+)
+
 TEXT_PATTERNS_EN: list[str] = [
     rf"(?i)\b(?:write|draft|create|compose|prepare|put\s+together)\b"
     rf".*\b(?:{'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX_EN)})\b"
@@ -65,7 +76,7 @@ TEXT_PATTERNS_EN: list[str] = [
     rf"(?i)\b(?:{'|'.join(DOCUMENT_NOUNS_STANDALONE_EN)})\b",
     # 出力先が文書/データ拡張子ならテキスト成果物 (CODE_PATTERNS の
     # コード拡張子パターンと対称)。言語に依らないので EN 側に 1 本だけ置く。
-    r"(?i)\.(md|txt|csv|docx|pptx|xlsx)\b",
+    _OUTPUT_EXTENSION_PATTERN,
 ]
 
 #: JA / EN 双方を **locale に関わらず** 評価する union。GUI locale は UI の言語で
@@ -116,6 +127,27 @@ def _mask_input_file_paths(instruction: str) -> str:
     return instruction
 
 
+def _extension_only_on_bare_names(hits: list[str], text: str) -> bool:
+    """文書判定の根拠が「コード依頼に添えたデータ/文書ファイルの裸名」だけか。
+
+    「X\\DESIGN.md をもとに Python でツールを X に作成し、サンプルの sales.csv も
+    用意して」は ``.csv`` の拡張子パターンだけで TEXT に倒れ、コードの代わりに
+    実装の解説文が書かれた (2026-09-21 ライブ監査 K05)。拡張子が **明示パスの
+    出力先** に付いているなら (「C:\\tmp\\notes.md にサンプルコードを書いて」)
+    それが成果物なので従来どおり TEXT。
+    """
+    if hits != [_OUTPUT_EXTENSION_PATTERN]:
+        return False
+    if not _IMPLEMENTATION_LANGUAGE_RE.search(text) and not any(
+        re.search(p, text, re.IGNORECASE) for p in CODE_PATTERNS
+    ):
+        return False
+    return not any(
+        re.search(_OUTPUT_EXTENSION_PATTERN, path)
+        for path in EXPLICIT_WINDOWS_PATH_RE.findall(text)
+    )
+
+
 def detect_content_type(instruction: str, mode: str) -> ContentType:
     """コンテンツ種別を判定
 
@@ -134,7 +166,8 @@ def detect_content_type(instruction: str, mode: str) -> ContentType:
 
     if is_create_mode(mode):
         text_view = _mask_input_file_paths(instruction)
-        if any(re.search(p, text_view) for p in TEXT_PATTERNS_ALL):
+        hits = [p for p in TEXT_PATTERNS_ALL if re.search(p, text_view)]
+        if hits and not _extension_only_on_bare_names(hits, text_view):
             return ContentType.TEXT
         return ContentType.CODE
 

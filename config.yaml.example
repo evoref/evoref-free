@@ -371,6 +371,7 @@ local_paths:
   eval_core_file: local/eval_core.json               # ベースモデル コア評価セット
   aux_prompts_dir: local/aux_prompts/                # 補助タスクのタスク別プロンプト (partition 有効時は base モデル配下へ rebase)
   aux_calibration_file: local/aux_calibration.json   # 補助タスク purpose 別 timeout の反応的自己較正値 (モデル切替後に自動調整)
+  liveness_file: local/liveness.json                 # 効果の死活監視 (段ごとの到達・効果・失敗の streak、c_07 §7.1)
   learned_patterns_file: local/learned_patterns.json # 学習済みパターン検出キーワード
   generation_deltas_file: local/generation_deltas.json # Level 1 生成パラメータデルタ (base モデル別パーティション配下へ配置)
   log_ingestor_file: local/state/log_ingestor.json  # develop=evolve の LogIngestor 進捗
@@ -1224,6 +1225,7 @@ create:
     part_generation_enabled: false   # code 工程をコンポーネント部分生成→決定論結合で行う (spec 構造がある時のみ発動、無ければ単発へ自動フォールバック)
     part_max_tokens: 1536            # 部分 1 個の生成 max_tokens。切断時のみ倍に広げ再生成
     part_max_parts: 4                # 1 ファイルの最大部分数 (超過 component は spec 順に決定論併合)
+    code_stage_min_share: 0.4        # ステージ予算のうち code 以降に残す割合。spec 工程が食い込んだら残りの深化と flow の LLM 合成を省く (f_10 §3、0 で無効)
     max_spec_revision_rounds: 1      # test 不合格時の spec 見直しサイクル上限 (ワークスペース全体, 0 で無効)
     verify:                          # 言語パックの検証コマンド (c_16 §4.5.4)。既定 OFF
       enabled: false                 # true にした PC だけが実行する。false では宣言を読みもしない

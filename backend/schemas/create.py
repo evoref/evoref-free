@@ -213,6 +213,11 @@ class CreateStagedConfig(BaseModel):
         description="1 ファイルの最大部分数。超過 component は spec 順の連続グループ"
                     "へ決定論的に併合する",
     )
+    code_stage_min_share: float = Field(
+        default=0.4, ge=0.0, le=0.8,
+        description="ステージ予算のうち code 以降に残す割合 (f_10 §3)。spec 工程が"
+                    "この枠に食い込んだら残りの深化と flow の LLM 合成を省く。0 で無効",
+    )
     max_spec_revision_rounds: int = Field(
         default=1, ge=0, le=3,
         description="test 不合格時に spec 該当節を LLM で点検・改訂して再生成する"

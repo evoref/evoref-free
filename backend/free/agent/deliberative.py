@@ -58,6 +58,7 @@ from backend.free.core.intent_vocab import (
     unverified_claim_numbers,
 )
 from backend.free.core.inference import messages_carry_evidence
+from backend.free.core.text_quality import misrounded_result_values
 from backend.free.core.turn_text import TOOL_RESULT_HEADER, append_to_last_user
 from backend.config import resolve_context_size_for_mode
 from backend.i18n_helper import prompt_locale
@@ -1519,6 +1520,7 @@ class DeliberativeAgent:
             grounding = _localized(_SEARCH_HISTORY_RESULT_GUIDANCES)
         elif tool_name == "calculate":
             grounding = _localized(_CALCULATE_RESULT_GUIDANCES)
+            grounding += _stale_previous_answer_note(messages, tool_result_text)
             if unexplained_numbers:
                 grounding += _unexplained_numbers_note(unexplained_numbers)
             if expression_issues:
@@ -3199,6 +3201,45 @@ def _recent_context_messages(
         picked.append({"role": m["role"], "content": content})
         used += len(content)
     return list(reversed(picked))
+
+
+#: 直前の自分の回答に、計算結果と丸めが合わない値があるときの注記。
+_STALE_PREVIOUS_ANSWER_NOTES: dict[str, str] = {
+    "ja": (
+        "\n直前のあなたの回答にある {stale} はこの計算結果と一致しない (誤り)。"
+        "繰り返さず、計算結果 ({rounded}) を使って答え直すこと。"
+    ),
+    "en": (
+        "\nThe value {stale} in your previous answer does not match this result "
+        "(it was wrong). Do not repeat it; answer again using the result ({rounded})."
+    ),
+}
+
+
+def _stale_previous_answer_note(messages: list[dict], tool_result_text: str) -> str:
+    """直前のアシスタント発言が計算結果と丸めの合わない値を述べていれば注記を返す。
+
+    暗算の誤答 (「BMIは約27.8」) が履歴に残ったまま、訂正後のターンで
+    calculate が 27.7177 を返しても、同じ文を一字一句繰り返した (2026-09-22
+    ライブ監査の再検証)。「ツール結果を使え」だけでは直前の自分の値に
+    引きずられるので、その値を名指しで無効にする。
+    """
+    try:
+        result = float(str(tool_result_text).strip().replace(",", ""))
+    except ValueError:
+        return ""
+    previous = next(
+        (str(m.get("content") or "") for m in reversed(messages)
+         if m.get("role") == "assistant"),
+        "",
+    )
+    stale = misrounded_result_values(previous, result)
+    if not stale:
+        return ""
+    decimals = len(stale[0].split(".", 1)[1]) if "." in stale[0] else 0
+    return _localized(_STALE_PREVIOUS_ANSWER_NOTES).format(
+        stale=", ".join(stale), rounded=f"{result:.{decimals}f}",
+    )
 
 
 def _truncate_tool_result(text: str, max_chars: int) -> str:

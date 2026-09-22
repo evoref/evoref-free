@@ -684,10 +684,15 @@ class DebugLogger:
     ) -> None:
         """決定根拠と分岐を ``decision.jsonl`` に構造化記録する
 
-        ``evolve`` レベル限定で書き込まれる loop driver 自己学習用因果ログ。
+        ``investigate`` / ``evolve`` で書き込まれる判定の根拠ログ。
         ``trace_id`` で同一スコープの ``outcome.jsonl`` エントリと causal join
-        できる (``schema_version=1`` 付与)。``debug`` / ``investigate``
-        レベルでは ``self.log_decisions=False`` のため no-op。
+        できる (``schema_version=1`` 付与)。``debug`` レベルと通常起動では
+        ``self.log_decisions=False`` のため no-op。
+
+        **``evolve`` 限定ではない** — 判定点の記録は較正と replay の唯一の材料で、
+        ``evolve`` は Develop 限定なので、そこに閉じると実ユーザーの環境で根拠が
+        一切貯まらない (``DEVELOP_LEVELS["investigate"]["categories"]`` 参照)。
+        対になる ``outcome`` の方は ``evolve`` 限定のまま。
 
         Args:
             decision_point: 分岐点の識別子 (例: ``"aux_health_fallback"``,

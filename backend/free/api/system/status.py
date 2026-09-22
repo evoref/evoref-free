@@ -16,6 +16,7 @@ from backend.free.api.schemas import (
     CapabilityInfo,
     ComponentStatus,
     DebugStatusInfo,
+    LivenessAlertModel,
     LlamaServerInfo,
     MemoryStats,
     ModelInfo,
@@ -26,6 +27,7 @@ from backend.free.core.system_info import (
     PROCESS_START_TIME as _PROCESS_START_TIME,
 )
 from backend.edition import current_edition
+from backend.liveness import ledger as liveness_ledger
 from backend.log_config import get_logger
 from backend.version import get_runtime_version, get_version_info
 
@@ -298,4 +300,8 @@ async def get_status(state: AppState = Depends(get_app_state)):
         memory=memory,
         debug=debug_info,
         capabilities=_collect_capabilities(state),
+        liveness=[
+            LivenessAlertModel(**alert.as_dict())
+            for alert in liveness_ledger().alerts()
+        ],
     )

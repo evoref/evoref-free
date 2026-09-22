@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
+from pathlib import Path
 
 from dataclasses import dataclass, field
 from typing import (
@@ -62,11 +63,21 @@ def _supports_kwarg(target: Callable, name: str) -> bool:
 #: (``create.turn_timeout_sec``、f_10 §3 予算の 3 層 — ターン予算)。
 _TURN_TIMEOUT_DEFAULT_SEC = 3600.0
 
+#: 計画と spec 本文へ渡す参照設計書の上限 (文字)。見出し単位で均等に縮める
+#: (f_10 §2)。6000 字 ≒ 呼出 2 回ぶんの prefill 増で、モジュールごとには乗らない。
+_REFERENCE_DOC_MAX_CHARS = 6000
+
 #: ステージ予算 (create.staged.total_timeout_sec) をターン予算から確保する下限。
 _STAGE_BUDGET_FLOOR_SEC = 300.0
 
 #: 呼出予算 (task グラフ合成 1 回) の既定上限。
 _GRAPH_SYNTHESIS_TIMEOUT_DEFAULT_SEC = 120.0
+
+#: 参照設計書 1 文字あたりに足す合成の呼出予算 (秒)。参照なしでも合成は実測
+#: 51〜100 秒で 120 秒に張り付いており、4000 字の設計書を足した 2 回とも 120 秒で
+#: 打ち切られて longform へ落ちた (2026-09-22 実機)。落ちると計画からやり直しで
+#: 数十分を失うので、prefill の増分 (≒ 0.8 tok/字) に余裕を持たせて延ばす。
+_REFERENCE_DOC_SYNTHESIS_SEC_PER_CHAR = 0.05
 
 
 def _emit_check(
@@ -225,6 +236,29 @@ _STAGED_PROJECT_ID = "staged"
 #: (:class:`backend.schemas.create.StagedCreateConfig` と一致させる)。
 #: 打ち切りメッセージで「設定値が既定より低い」ことを示すために参照する。
 _STAGED_TOTAL_TIMEOUT_DEFAULT_SEC = 2400.0
+
+
+def _requested_test_files(ws, requested: list[str]) -> dict[str, str]:
+    """依頼されたテストファイルの名前で、test 工程が生成・実行したテストを返す (f_10 §5)。
+
+    計画がテストファイルをコードのモジュールとして組み込み、一度も実行されない
+    テストを配信していた (2026-09-22 実機 K06)。同名の検証済みテストがあれば
+    それを、無くても検証済みテストが 1 本だけならそれをその名前で配信する。
+    """
+    if not requested:
+        return {}
+    tests = {Path(wf.logical_path).name: wf.logical_path for wf in ws.list_files(kind="test")}
+    out: dict[str, str] = {}
+    for path in requested:
+        logical = tests.get(Path(path).name)
+        if logical is None and len(tests) == 1:
+            logical = next(iter(tests.values()))
+        content = ws.read_file(logical, kind="test") if logical else None
+        if content:
+            out[path] = content
+        else:
+            logger.info("staged create: no verified test to deliver as %s", path)
+    return out
 
 
 def _staged_remaining_units(ws) -> int:
@@ -461,6 +495,22 @@ async def run_staged_pipeline(
         "detail": "タスクグラフ (仕様書/コード/テスト) を合成中…",
         "status": "running",
     }}
+    # 依頼文が名指しした設計書の本文 (f_10 §2)。計画と spec 本文にだけ渡す。
+    reference_doc = ""
+    try:
+        from backend.free.api.chat.chat_stream_output import read_reference_design_doc
+        from backend.free.generation.strategy_common import condense_design_doc
+
+        reference_doc = condense_design_doc(
+            await read_reference_design_doc(query, state), _REFERENCE_DOC_MAX_CHARS,
+        )
+    except Exception as exc:  # noqa: BLE001 - 読めなければ参照なしで続ける
+        logger.warning("staged create: reference design document unavailable: %s", exc)
+    if reference_doc:
+        logger.info(
+            "staged create: passing a reference design document (%d chars) "
+            "to planning and spec", len(reference_doc),
+        )
     _synth_kwargs: dict[str, Any] = dict(
         request=query, project_id=_STAGED_PROJECT_ID,
         aux_client=state.aux_client,
@@ -471,9 +521,19 @@ async def run_staged_pipeline(
         debug_logger=state.debug_logger,
         brief=brief,
     )
+    if reference_doc and _supports_kwarg(synthesize_create_task_graph_with_plan, "reference_doc"):
+        _synth_kwargs["reference_doc"] = reference_doc
+    # planner が挙げたテストファイルは test 工程の検証済みテストで配信する (f_10 §5)。
+    requested_tests: list[str] = []
+    if _supports_kwarg(synthesize_create_task_graph_with_plan, "requested_tests_out"):
+        _synth_kwargs["requested_tests_out"] = requested_tests
     if _supports_kwarg(synthesize_create_task_graph_with_plan, "timeout"):
         _remaining = max(0.0, deadline_monotonic - time.monotonic())
-        _synth_kwargs["timeout"] = min(_GRAPH_SYNTHESIS_TIMEOUT_DEFAULT_SEC, _remaining)
+        _synth_kwargs["timeout"] = min(
+            _GRAPH_SYNTHESIS_TIMEOUT_DEFAULT_SEC
+            + len(reference_doc) * _REFERENCE_DOC_SYNTHESIS_SEC_PER_CHAR,
+            _remaining,
+        )
     facts, module_deps = await synthesize_create_task_graph_with_plan(**_synth_kwargs)
     if not facts:
         logger.info("staged create: empty task graph (pipeline)")
@@ -633,6 +693,12 @@ async def run_staged_pipeline(
     )
     if _supports_kwarg(StagedCreateExecutor, "deadline_monotonic"):
         _executor_kwargs["deadline_monotonic"] = deadline_monotonic
+    if _supports_kwarg(StagedCreateExecutor, "code_stage_min_share"):
+        _executor_kwargs["stage_budget_sec"] = staged_total_timeout_sec
+        _executor_kwargs["code_stage_min_share"] = float(
+            staged_cfg.get("code_stage_min_share", 0.4),
+        )
+        _executor_kwargs["reference_doc"] = reference_doc
     executor = StagedCreateExecutor(**_executor_kwargs)
     artifact_hook = make_loop_artifact_hook(_staged_view)
     max_iter = int(staged_cfg.get("max_iterations", 60))
@@ -659,7 +725,15 @@ async def run_staged_pipeline(
     disconnected = False
     try:
         while True:
-            if time.monotonic() - t_start >= staged_total_timeout_sec:
+            # 打ち切るのはドライバがまだ走っている間だけ。ドライバも同じ予算で
+            # 止まるので、全タスク成功で終わった同じ秒にここが先に上限を見て
+            # 「タイムアウト・失敗」と表示していた (2026-09-21 ライブ監査 K02:
+            # success=3 failure=0 の直後に hard cutoff)。終わっていれば残りの
+            # イベントを流し切り、未完了の判定はループの後で行う。
+            if (
+                not run_task.done()
+                and time.monotonic() - t_start >= staged_total_timeout_sec
+            ):
                 logger.warning(
                     "staged create: hard wall-time cutoff reached (%.0fs); "
                     "cancelling run_task (pipeline)",
@@ -718,6 +792,13 @@ async def run_staged_pipeline(
             except Exception as exc:  # noqa: BLE001
                 logger.debug("staged create: semmem close failed: %s", exc)
 
+    if (
+        not (timed_out or cancelled)
+        and time.monotonic() - t_start >= staged_total_timeout_sec
+        and _staged_remaining_units(ws)
+    ):
+        # ドライバ自身が同じ予算で止まり、未完了のタスクが残った。
+        timed_out = True
     if timed_out:
         remaining = _staged_remaining_units(ws)
         suggested = max(
@@ -759,6 +840,7 @@ async def run_staged_pipeline(
         c = ws.read_file(wf.logical_path, kind="src")
         if c:
             code_map[wf.logical_path] = c
+    code_map.update(_requested_test_files(ws, requested_tests))
     checks = _StagedFinalizeChecks(code_map=code_map)
     exit_kind = "timeout" if timed_out else "cancelled" if cancelled else "done"
     try:
